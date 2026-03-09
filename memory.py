@@ -285,11 +285,14 @@ def _render_memory_table(
 
 
 def _render_memory_row(db_client: Client, memory: dict, show_confirm: bool) -> None:
+    import html as _html
     col1, col2, col3, col4 = st.columns([5, 1, 1, 1])
     with col1:
+        safe_content = _html.escape(memory['content'])
+        safe_source = _html.escape(memory.get('source_feedback', '')[:30])
         st.markdown(
-            f"{memory['content']} "
-            f"<small style='color:grey'>（来源：{memory.get('source_feedback','')[:30]}）</small>",
+            f"{safe_content} "
+            f"<small style='color:grey'>（来源：{safe_source}）</small>",
             unsafe_allow_html=True,
         )
     with col2:

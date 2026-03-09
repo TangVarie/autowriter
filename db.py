@@ -327,23 +327,26 @@ def get_batch_item_counts(client: Client, batch_ids: list[str]) -> dict:
 
 
 def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
-    """Fetch recent approved/pending version titles for deduplication across batches."""
-    # Get recent batches for this project
+    """Fetch recent version titles for deduplication across batches (single query)."""
+    # Get recent batch IDs
     batches = list_batches(client, project_id, limit=10)
     if not batches:
         return []
     batch_ids = [b["id"] for b in batches]
 
+    # Single query: items for all batches, then their versions' titles
+    res = (
+        client.table("items")
+        .select("id, batch_id, versions(title)")
+        .in_("batch_id", batch_ids)
+        .execute()
+    )
     titles: list[str] = []
-    for bid in batch_ids:
-        items = list_items(client, bid)
-        for item in items:
-            for v in item.get("versions", []):
-                t = v.get("title", "")
-                if t and t != "（解析失败）":
-                    titles.append(t)
-        if len(titles) >= limit:
-            break
+    for item in (res.data or []):
+        for v in item.get("versions", []):
+            t = v.get("title", "")
+            if t and t != "（解析失败）":
+                titles.append(t)
     return titles[:limit]
 
 

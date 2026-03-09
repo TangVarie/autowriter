@@ -7,6 +7,7 @@ Entry point: streamlit run app.py
 
 from __future__ import annotations
 
+import html as _html
 import json
 import re
 from datetime import datetime, timezone, timedelta
@@ -106,8 +107,9 @@ user_id: str = current_user["id"]
 # ── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
     # User info + logout
+    safe_email = _html.escape(current_user['email'])
     st.markdown(
-        f"**👤 {current_user['email']}**  \n"
+        f"**👤 {safe_email}**  \n"
         f"<small style='color:grey'>v{config.APP_VERSION}</small>",
         unsafe_allow_html=True,
     )
@@ -398,7 +400,9 @@ def page_review(project: dict) -> None:
 
     with col_exp:
         approved_items = _collect_approved_items(items)
-        if approved_items:
+        if not approved_items:
+            st.caption("暂无已通过稿件可导出。")
+        else:
             try:
                 xlsx_bytes = exporter.build_excel_document(
                     items=approved_items,
@@ -525,7 +529,6 @@ def _render_item_card(
 
 def _normalise_keywords(raw) -> list[str]:
     """Ensure keywords is always a clean list of strings."""
-    import json as _json
     if raw is None:
         return []
     if isinstance(raw, list):
@@ -533,7 +536,7 @@ def _normalise_keywords(raw) -> list[str]:
     if isinstance(raw, str):
         # Could be a JSON string like '["k1","k2"]' or plain comma-separated
         try:
-            parsed = _json.loads(raw)
+            parsed = json.loads(raw)
             if isinstance(parsed, list):
                 return [str(k).strip() for k in parsed if str(k).strip()]
         except Exception:
@@ -551,7 +554,6 @@ def _render_single_version(version: dict) -> None:
     title_len = len(title)
     title_color = "green" if 15 <= title_len <= 22 else "orange"
     # Escape HTML to prevent XSS from AI-generated content
-    import html as _html
     safe_title = _html.escape(title)
     st.markdown(
         f"<div class='copy-title'>{safe_title}</div>"
@@ -560,7 +562,7 @@ def _render_single_version(version: dict) -> None:
     )
     st.markdown(body.replace("\n", "  \n"))
     if keywords:
-        kw_html = " ".join(f"<span class='tag'>#{k}</span>" for k in keywords)
+        kw_html = " ".join(f"<span class='tag'>#{_html.escape(k)}</span>" for k in keywords)
         st.markdown(kw_html, unsafe_allow_html=True)
 
     # Debug: show raw AI output if parsing failed

@@ -393,7 +393,9 @@ def get_engine(engine_name: str):
     return _ENGINE_CACHE[engine_name]
 
 
-AVAILABLE_ENGINES: list[str] = ["claude"] + (["gemini"] if _GEMINI_AVAILABLE else [])
+AVAILABLE_ENGINES: list[str] = ["claude"] + (
+    ["gemini"] if _GEMINI_AVAILABLE and config.GOOGLE_API_KEY else []
+)
 
 
 # ── Batch generation ───────────────────────────────────────────────────────
@@ -412,7 +414,8 @@ def _build_dedup_instruction(
 
     if generated_summaries:
         lines.append("【本批次已生成的文案，你必须选择完全不同的切入角度、场景和标题风格】")
-        for s in generated_summaries:
+        # Only keep recent summaries to control prompt size
+        for s in generated_summaries[-20:]:
             lines.append(f"- {s}")
 
     if not lines:
@@ -523,16 +526,32 @@ def build_iteration_messages(
 
     versions is a list of {"version_num": int, "body": str, "title": str}
     sorted ascending by version_num.
+
+    Ensures strict user/assistant alternation for API compatibility.
     """
     messages: list[dict] = []
 
-    for v in sorted(versions, key=lambda x: x.get("version_num", 0)):
-        if v.get("feedback"):
-            # User gave feedback before this version
-            messages.append({"role": "user", "content": v["feedback"]})
+    sorted_versions = sorted(versions, key=lambda x: x.get("version_num", 0))
+
+    for i, v in enumerate(sorted_versions):
+        # Determine user message for this version
+        if i == 0:
+            # First version always uses original prompt
+            user_content = original_user_prompt
+        elif v.get("feedback"):
+            user_content = v["feedback"]
         else:
-            # First version: use the original generation prompt
-            messages.append({"role": "user", "content": original_user_prompt})
+            # Subsequent version without feedback — skip to avoid
+            # consecutive assistant messages
+            continue
+
+        # Only add user message if it won't create consecutive same-role messages
+        if not messages or messages[-1]["role"] != "user":
+            messages.append({"role": "user", "content": user_content})
+        else:
+            # Merge with previous user message to avoid consecutive user turns
+            messages[-1]["content"] += "\n\n" + user_content
+
         # AI response for this version
         assistant_text = json.dumps(
             {
@@ -547,11 +566,11 @@ def build_iteration_messages(
     # New user turn with the current feedback
     messages.append({"role": "user", "content": feedback})
 
-    # Trim if context is getting too long (keep last 2 rounds + new feedback)
-    MAX_ROUNDS = 3  # each round = 2 messages
+    # Trim if context is getting too long (keep first round + last N rounds + new feedback)
+    MAX_ROUNDS = 3  # each round = 2 messages (user + assistant)
     if len(messages) > MAX_ROUNDS * 2 + 1:
-        # Keep the first user message (original prompt) + last N rounds
-        messages = messages[:1] + messages[-(MAX_ROUNDS * 2):]
+        # Keep first user+assistant pair + last rounds + final user message
+        messages = messages[:2] + messages[-(MAX_ROUNDS * 2 - 1):]
 
     return messages
 
