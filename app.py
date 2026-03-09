@@ -64,35 +64,438 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-/* Copy card styles */
-.copy-card {
-    border: 1px solid #e0e0e0;
-    border-radius: 12px;
-    padding: 16px;
-    margin-bottom: 12px;
-    background: #fafafa;
+/* ═══════════════════════════════════════════
+   Design tokens
+   ═══════════════════════════════════════════ */
+:root {
+  --accent:        #D4412A;
+  --accent-soft:   #FDF1EF;
+  --accent-border: #F2C4BB;
+  --bg:            #F7F6F3;
+  --card:          #FFFFFF;
+  --border:        #E8E4DF;
+  --border-mid:    #D5D0C9;
+  --text-1:        #1A1714;
+  --text-2:        #5C5752;
+  --text-3:        #9E9992;
+  --green:         #16A34A;
+  --green-soft:    #F0FDF4;
+  --amber:         #D97706;
+  --amber-soft:    #FFFBEB;
+  --slate:         #64748B;
+  --slate-soft:    #F8FAFC;
+  --shadow-xs:     0 1px 3px rgba(0,0,0,.06);
+  --shadow-sm:     0 2px 8px rgba(0,0,0,.07), 0 1px 3px rgba(0,0,0,.05);
+  --shadow-md:     0 4px 16px rgba(0,0,0,.08), 0 2px 6px rgba(0,0,0,.05);
+  --r-sm:  8px;
+  --r-md:  12px;
+  --r-lg:  16px;
+  --r-xl:  20px;
 }
+
+/* ── App background ── */
+.stApp, .stApp > .main {
+  background: var(--bg) !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI",
+               Helvetica, Arial, sans-serif;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+  background: #FFFFFF !important;
+  border-right: 1.5px solid var(--border) !important;
+}
+[data-testid="stSidebar"] .stMarkdown p,
+[data-testid="stSidebar"] .stMarkdown small,
+[data-testid="stSidebar"] label {
+  color: var(--text-2) !important;
+  font-size: 0.8125rem !important;
+}
+[data-testid="stSidebar"] .stRadio label {
+  font-size: 0.875rem !important;
+  font-weight: 500;
+  color: var(--text-1) !important;
+}
+
+/* ── Sidebar nav pills ── */
+[data-testid="stSidebar"] [data-testid="stRadio"] > div {
+  gap: 2px;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label {
+  border-radius: var(--r-sm) !important;
+  padding: 8px 12px !important;
+  transition: background 0.15s;
+  cursor: pointer;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
+  background: var(--bg) !important;
+}
+
+/* ── Main content area ── */
+.main .block-container {
+  padding-top: 2rem !important;
+  padding-bottom: 4rem !important;
+  max-width: 1100px !important;
+}
+
+/* ── Headings ── */
+h1 { font-size: 1.75rem !important; font-weight: 700 !important;
+     color: var(--text-1) !important; letter-spacing: -0.02em; }
+h2 { font-size: 1.375rem !important; font-weight: 600 !important;
+     color: var(--text-1) !important; letter-spacing: -0.01em; }
+h3 { font-size: 1.125rem !important; font-weight: 600 !important;
+     color: var(--text-1) !important; }
+
+/* ── Buttons ── */
+.stButton > button {
+  border-radius: var(--r-sm) !important;
+  font-size: 0.875rem !important;
+  font-weight: 500 !important;
+  padding: 0.5rem 1rem !important;
+  border: 1.5px solid var(--border) !important;
+  background: var(--card) !important;
+  color: var(--text-1) !important;
+  box-shadow: var(--shadow-xs) !important;
+  transition: all 0.15s ease !important;
+}
+.stButton > button:hover {
+  border-color: var(--border-mid) !important;
+  box-shadow: var(--shadow-sm) !important;
+  background: #FAFAF8 !important;
+}
+/* Primary / type=primary button */
+.stButton > button[kind="primary"] {
+  background: var(--text-1) !important;
+  border-color: var(--text-1) !important;
+  color: #FFFFFF !important;
+  box-shadow: var(--shadow-sm) !important;
+}
+.stButton > button[kind="primary"]:hover {
+  background: #2D2926 !important;
+  border-color: #2D2926 !important;
+  box-shadow: var(--shadow-md) !important;
+}
+
+/* ── Inputs, textareas, selects ── */
+.stTextInput > div > div > input,
+.stTextArea > div > div > textarea,
+.stSelectbox > div > div > div {
+  border-radius: var(--r-sm) !important;
+  border: 1.5px solid var(--border) !important;
+  background: var(--card) !important;
+  font-size: 0.875rem !important;
+  color: var(--text-1) !important;
+  box-shadow: var(--shadow-xs) !important;
+  transition: border-color 0.15s !important;
+}
+.stTextInput > div > div > input:focus,
+.stTextArea > div > div > textarea:focus {
+  border-color: var(--border-mid) !important;
+  box-shadow: 0 0 0 3px rgba(212,65,42,.08) !important;
+  outline: none !important;
+}
+
+/* ── Sliders ── */
+[data-testid="stSlider"] .stSlider div[role="slider"] {
+  background: var(--text-1) !important;
+}
+
+/* ── Expanders (copy cards) ── */
+.stExpander {
+  border: 1.5px solid var(--border) !important;
+  border-radius: var(--r-md) !important;
+  background: var(--card) !important;
+  box-shadow: var(--shadow-xs) !important;
+  margin-bottom: 10px !important;
+  overflow: hidden;
+  transition: box-shadow 0.2s, border-color 0.2s;
+}
+.stExpander:hover {
+  box-shadow: var(--shadow-sm) !important;
+  border-color: var(--border-mid) !important;
+}
+[data-testid="stExpander"] > details > summary {
+  padding: 14px 16px !important;
+  background: var(--card) !important;
+  font-size: 0.9rem !important;
+  font-weight: 500 !important;
+  color: var(--text-1) !important;
+  border-radius: var(--r-md) !important;
+}
+[data-testid="stExpander"] > details[open] > summary {
+  border-bottom: 1.5px solid var(--border) !important;
+  border-radius: var(--r-md) var(--r-md) 0 0 !important;
+  background: #FBFAF8 !important;
+}
+[data-testid="stExpander"] > details > div {
+  padding: 16px !important;
+  background: var(--card) !important;
+}
+
+/* ── Tabs ── */
+.stTabs [data-testid="stTab"] {
+  border-radius: var(--r-sm) var(--r-sm) 0 0 !important;
+  font-size: 0.875rem !important;
+  font-weight: 500 !important;
+  color: var(--text-2) !important;
+}
+.stTabs [aria-selected="true"] {
+  color: var(--text-1) !important;
+  border-bottom: 2.5px solid var(--text-1) !important;
+}
+
+/* ── Info / warning / error / success boxes ── */
+[data-testid="stAlert"] {
+  border-radius: var(--r-md) !important;
+  border: 1.5px solid transparent !important;
+  font-size: 0.875rem !important;
+}
+
+/* ── Dividers ── */
+hr {
+  border: none !important;
+  border-top: 1.5px solid var(--border) !important;
+  margin: 1.25rem 0 !important;
+}
+
+/* ── Metrics ── */
+[data-testid="stMetric"] {
+  background: var(--card) !important;
+  border: 1.5px solid var(--border) !important;
+  border-radius: var(--r-md) !important;
+  padding: 16px 20px !important;
+  box-shadow: var(--shadow-xs) !important;
+}
+[data-testid="stMetricLabel"] {
+  font-size: 0.75rem !important;
+  font-weight: 600 !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.06em !important;
+  color: var(--text-3) !important;
+}
+[data-testid="stMetricValue"] {
+  font-size: 1.75rem !important;
+  font-weight: 700 !important;
+  color: var(--text-1) !important;
+  line-height: 1.2 !important;
+}
+
+/* ── Checkboxes & radios ── */
+.stCheckbox label, .stRadio label {
+  font-size: 0.875rem !important;
+}
+
+/* ── Progress bar ── */
+.stProgress > div > div > div {
+  background: var(--text-1) !important;
+  border-radius: 99px !important;
+}
+.stProgress > div > div {
+  border-radius: 99px !important;
+  background: var(--border) !important;
+}
+
+/* ── Multiselect ── */
+.stMultiSelect > div > div {
+  border-radius: var(--r-sm) !important;
+  border: 1.5px solid var(--border) !important;
+  background: var(--card) !important;
+  font-size: 0.875rem !important;
+}
+.stMultiSelect span[data-baseweb="tag"] {
+  background: var(--bg) !important;
+  border: 1px solid var(--border-mid) !important;
+  border-radius: 6px !important;
+  font-size: 0.78rem !important;
+  color: var(--text-1) !important;
+}
+
+/* ── Spinner ── */
+.stSpinner > div {
+  border-top-color: var(--text-1) !important;
+}
+
+/* ── Download button ── */
+.stDownloadButton > button {
+  border-radius: var(--r-sm) !important;
+  border: 1.5px solid var(--border) !important;
+  background: var(--card) !important;
+  font-size: 0.875rem !important;
+  font-weight: 500 !important;
+  box-shadow: var(--shadow-xs) !important;
+}
+
+/* ════════════════════════════════════════════
+   App-specific custom components
+   ════════════════════════════════════════════ */
+
+/* ── Page header band ── */
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1.5px solid var(--border);
+}
+.page-header-icon {
+  font-size: 1.5rem;
+  width: 44px; height: 44px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: var(--r-md);
+}
+.page-header-text h1 { margin: 0 !important; font-size: 1.5rem !important; }
+.page-header-text p  { margin: 0 !important; font-size: 0.8125rem !important;
+                       color: var(--text-2) !important; margin-top: 2px !important; }
+
+/* ── Stat badge row ── */
+.stat-row {
+  display: flex; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+}
+.stat-badge {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--card);
+  border: 1.5px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 10px 16px;
+  min-width: 100px;
+  box-shadow: var(--shadow-xs);
+}
+.stat-badge .sb-num {
+  font-size: 1.375rem; font-weight: 700; color: var(--text-1); line-height: 1;
+}
+.stat-badge .sb-lbl {
+  font-size: 0.71rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--text-3);
+}
+.stat-badge.green  { border-color: #BBF7D0; }
+.stat-badge.amber  { border-color: #FDE68A; }
+.stat-badge.slate  { border-color: var(--border); }
+.stat-badge.accent { border-color: var(--accent-border); }
+
+/* ── Status pill ── */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  border-radius: 99px; font-size: 0.72rem; font-weight: 600;
+  padding: 3px 10px; line-height: 1.4;
+  letter-spacing: 0.02em;
+}
+.status-pill.approved {
+  background: var(--green-soft); color: var(--green);
+  border: 1px solid #BBF7D0;
+}
+.status-pill.revision {
+  background: var(--amber-soft); color: var(--amber);
+  border: 1px solid #FDE68A;
+}
+.status-pill.pending {
+  background: var(--slate-soft); color: var(--slate);
+  border: 1px solid #CBD5E1;
+}
+
+/* ── Copy content ── */
 .copy-title {
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: #1a1a1a;
+  font-size: 1.0625rem; font-weight: 700;
+  color: var(--text-1); line-height: 1.4;
+  margin-bottom: 4px;
 }
 .copy-meta {
-    font-size: 0.75rem;
-    color: #888;
-    margin-top: 2px;
+  font-size: 0.74rem; color: var(--text-3);
+  margin-bottom: 10px;
+  display: flex; align-items: center; gap: 8px;
 }
+.copy-meta .len-ok  { color: var(--green); font-weight: 600; }
+.copy-meta .len-bad { color: var(--amber); font-weight: 600; }
+.copy-body {
+  font-size: 0.9rem; line-height: 1.75;
+  color: var(--text-1); white-space: pre-wrap;
+  border-left: 3px solid var(--border);
+  padding-left: 14px; margin: 10px 0;
+}
+
+/* ── Keyword tags ── */
 .tag {
-    display: inline-block;
-    background: #f0f0f0;
-    border-radius: 4px;
-    padding: 2px 8px;
-    font-size: 0.75rem;
-    margin-right: 4px;
+  display: inline-flex; align-items: center;
+  background: var(--bg);
+  border: 1px solid var(--border-mid);
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 0.74rem; font-weight: 500;
+  color: var(--text-2);
+  margin-right: 5px; margin-bottom: 4px;
+  transition: all 0.1s;
 }
-.status-approved { color: #22c55e; font-weight: 600; }
-.status-revision { color: #f59e0b; font-weight: 600; }
-.status-pending  { color: #94a3b8; font-weight: 600; }
+.tag:hover { border-color: var(--border-mid); background: var(--card); }
+
+/* ── Engine badge ── */
+.engine-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--text-1); color: #fff;
+  border-radius: 5px; padding: 2px 8px;
+  font-size: 0.68rem; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.engine-badge.gemini {
+  background: linear-gradient(135deg, #1A73E8, #0F47AF);
+}
+.engine-badge.claude {
+  background: linear-gradient(135deg, #C96442, #A0522D);
+}
+
+/* ── Section label ── */
+.section-label {
+  font-size: 0.74rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--text-3); margin-bottom: 8px;
+}
+
+/* ── Memory row ── */
+.mem-card {
+  background: var(--card); border: 1.5px solid var(--border);
+  border-radius: var(--r-md); padding: 12px 16px;
+  margin-bottom: 8px; box-shadow: var(--shadow-xs);
+  font-size: 0.875rem; color: var(--text-1);
+}
+
+/* ── Sidebar user block ── */
+.user-block {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg); border-radius: var(--r-md);
+  border: 1.5px solid var(--border);
+  margin-bottom: 8px;
+}
+.user-avatar {
+  width: 32px; height: 32px;
+  background: var(--text-1); color: #fff;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.875rem; font-weight: 700;
+  flex-shrink: 0;
+}
+.user-email { font-size: 0.8rem; font-weight: 500; color: var(--text-1); }
+.user-ver   { font-size: 0.7rem; color: var(--text-3); }
+
+/* ── Brand header in sidebar ── */
+.brand-header {
+  display: flex; align-items: center; gap: 10px;
+  padding: 16px 0 12px;
+  border-bottom: 1.5px solid var(--border);
+  margin-bottom: 12px;
+}
+.brand-logo {
+  font-size: 1.5rem; line-height: 1;
+}
+.brand-name {
+  font-size: 0.9375rem; font-weight: 700;
+  color: var(--text-1); line-height: 1.2;
+}
+.brand-sub {
+  font-size: 0.7rem; color: var(--text-3);
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -106,11 +509,24 @@ user_id: str = current_user["id"]
 
 # ── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
-    # User info + logout
-    safe_email = _html.escape(current_user['email'])
+    # Brand header
     st.markdown(
-        f"**👤 {safe_email}**  \n"
-        f"<small style='color:grey'>v{config.APP_VERSION}</small>",
+        "<div class='brand-header'>"
+        "<div class='brand-logo'>🍵</div>"
+        "<div><div class='brand-name'>内容工作台</div>"
+        f"<div class='brand-sub'>XHS Workstation · v{config.APP_VERSION}</div></div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # User block
+    safe_email = _html.escape(current_user['email'])
+    avatar_char = _html.escape(current_user['email'][0].upper())
+    st.markdown(
+        f"<div class='user-block'>"
+        f"<div class='user-avatar'>{avatar_char}</div>"
+        f"<div><div class='user-email'>{safe_email}</div></div>"
+        f"</div>",
         unsafe_allow_html=True,
     )
     if st.button("退出登录", use_container_width=True):
@@ -121,14 +537,22 @@ with st.sidebar:
 # Project switcher (also rendered in sidebar via projects module)
 selected_project = proj_module.render_project_switcher(db_client, user_id)
 
+_NAV_ITEMS = {
+    "✍️  生成": "生成工作台",
+    "🔍  审核": "审核与迭代",
+    "🧠  记忆": "记忆管理",
+    "⚙️  项目": "项目设置",
+    "📋  历史": "批次历史",
+}
+
 with st.sidebar:
     st.divider()
-    # Navigation
-    page = st.radio(
+    _nav_choice = st.radio(
         "导航",
-        ["生成工作台", "审核与迭代", "记忆管理", "项目设置", "批次历史"],
+        list(_NAV_ITEMS.keys()),
         label_visibility="collapsed",
     )
+    page = _NAV_ITEMS[_nav_choice]
 
 
 # ── Route to pages ─────────────────────────────────────────────────────────
@@ -142,8 +566,20 @@ if selected_project is None and page not in ("项目设置",):
 # PAGE: 生成工作台
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _page_header(icon: str, title: str, subtitle: str = "") -> None:
+    sub_html = f"<p>{_html.escape(subtitle)}</p>" if subtitle else ""
+    st.markdown(
+        f"<div class='page-header'>"
+        f"<div class='page-header-icon'>{icon}</div>"
+        f"<div class='page-header-text'><h1>{_html.escape(title)}</h1>{sub_html}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def page_generate(project: dict) -> None:
-    st.title("✍️ 生成工作台")
+    pname = _html.escape(project.get("name", ""))
+    _page_header("✍️", "生成工作台", f"项目：{pname}")
 
     project_name = project.get("name", "")
     brand = project.get("brand", "")
@@ -374,7 +810,8 @@ QUICK_FEEDBACK_TAGS = [
 
 
 def page_review(project: dict) -> None:
-    st.title("🔍 审核与迭代")
+    pname = _html.escape(project.get("name", ""))
+    _page_header("🔍", "审核与迭代", f"项目：{pname}")
 
     # Batch selector
     batches = db.list_batches(db_client, project["id"])
@@ -409,29 +846,37 @@ def page_review(project: dict) -> None:
         st.info("该批次暂无文案。")
         return
 
-    # Summary stats
-    pending = sum(1 for it in items if it["status"] == "pending")
+    pending  = sum(1 for it in items if it["status"] == "pending")
     approved = sum(1 for it in items if it["status"] == "approved")
     revision = sum(1 for it in items if it["status"] == "needs_revision")
 
-    # Status filter tabs
-    filter_options = [
-        f"全部 ({len(items)})",
-        f"⏳ 待审核 ({pending})",
-        f"✅ 已通过 ({approved})",
-        f"✏️ 待修改 ({revision})",
-    ]
+    # Stats row
+    st.markdown(
+        f"<div class='stat-row'>"
+        f"<div class='stat-badge slate'>"
+        f"  <div><div class='sb-num'>{len(items)}</div><div class='sb-lbl'>总计</div></div>"
+        f"</div>"
+        f"<div class='stat-badge amber'>"
+        f"  <div><div class='sb-num'>{pending}</div><div class='sb-lbl'>待审核</div></div>"
+        f"</div>"
+        f"<div class='stat-badge green'>"
+        f"  <div><div class='sb-num'>{approved}</div><div class='sb-lbl'>已通过</div></div>"
+        f"</div>"
+        f"<div class='stat-badge accent'>"
+        f"  <div><div class='sb-num'>{revision}</div><div class='sb-lbl'>待修改</div></div>"
+        f"</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    filter_options = ["全部", "⏳ 待审核", "✅ 已通过", "✏️ 待修改"]
     selected_filter = st.radio(
         "筛选状态", filter_options, horizontal=True, label_visibility="collapsed",
     )
 
-    # Determine which items to show
-    if "待审核" in selected_filter:
-        filtered_items = [it for it in items if it["status"] == "pending"]
-    elif "已通过" in selected_filter:
-        filtered_items = [it for it in items if it["status"] == "approved"]
-    elif "待修改" in selected_filter:
-        filtered_items = [it for it in items if it["status"] == "needs_revision"]
+    _fmap = {"⏳ 待审核": "pending", "✅ 已通过": "approved", "✏️ 待修改": "needs_revision"}
+    if selected_filter in _fmap:
+        filtered_items = [it for it in items if it["status"] == _fmap[selected_filter]]
     else:
         filtered_items = items
 
@@ -460,7 +905,7 @@ def page_review(project: dict) -> None:
 
     # ── Batch actions ──────────────────────────────────────────────────
     st.divider()
-    st.markdown("### 批量操作 & 导出")
+    st.markdown("<div class='section-label'>批量操作 &amp; 导出</div>", unsafe_allow_html=True)
 
     col_exp, col_feishu, col_mem = st.columns(3)
 
@@ -527,17 +972,25 @@ def _render_item_card(
     else:
         display_version = versions[-1]
 
-    status_icon = {"pending": "⏳", "approved": "✅", "needs_revision": "✏️"}.get(status, "⏳")
-    status_label = {"pending": "待审核", "approved": "已通过", "needs_revision": "待修改"}.get(
-        status, "待审核"
-    )
+    status_icon  = {"pending": "⏳", "approved": "✅", "needs_revision": "✏️"}.get(status, "⏳")
+    status_label = {"pending": "待审核", "approved": "已通过", "needs_revision": "待修改"}.get(status, "待审核")
+    engine_raw = display_version.get("ai_engine", "")
+    engine_short = engine_raw.split("/")[0].lower() if engine_raw else ""
+    ver_num = display_version.get("version_num", 1)
+    title_str = display_version.get("title", "（无标题）") or "（无标题）"
 
-    with st.expander(
-        f"{status_icon} {display_version.get('title', '（无标题）')}  "
-        f"— {status_label}  ·  v{display_version.get('version_num', 1)}  "
-        f"·  {display_version.get('ai_engine', '').upper()}",
-        expanded=(status in ("pending", "needs_revision")),
-    ):
+    expander_label = (
+        f"{status_icon} {title_str[:60]}{'…' if len(title_str) > 60 else ''}  "
+        f"— {status_label} · v{ver_num}"
+    )
+    with st.expander(expander_label, expanded=(status in ("pending", "needs_revision"))):
+        # Engine badge
+        eng_cls = engine_short if engine_short in ("claude", "gemini") else ""
+        st.markdown(
+            f"<span class='engine-badge {eng_cls}'>{_html.escape(engine_raw.upper())}</span>",
+            unsafe_allow_html=True,
+        )
+
         # Multi-version comparison (if multiple engines were used)
         if len(versions) > 1:
             _render_version_comparison(versions, item_id)
@@ -557,7 +1010,7 @@ def _render_item_card(
 
         # Feedback & iteration
         if status in ("pending", "needs_revision"):
-            st.markdown("**修改意见：**")
+            st.markdown("<div class='section-label' style='margin-top:12px'>修改意见</div>", unsafe_allow_html=True)
 
             # Quick tags
             selected_tags = st.multiselect(
@@ -612,26 +1065,28 @@ def _normalise_keywords(raw) -> list[str]:
 
 
 def _render_single_version(version: dict) -> None:
-    title = version.get("title", "") or ""
-    body = version.get("body", "") or ""
+    title    = version.get("title", "") or ""
+    body     = version.get("body", "") or ""
     keywords = _normalise_keywords(version.get("keywords"))
     raw_text = version.get("raw_text", "")
 
     title_len = len(title)
-    title_color = "green" if 15 <= title_len <= 22 else "orange"
-    # Escape HTML to prevent XSS from AI-generated content
+    len_cls   = "len-ok" if 15 <= title_len <= 22 else "len-bad"
+    len_tip   = "✓ 长度适中" if 15 <= title_len <= 22 else f"⚠ {title_len} 字（建议 15-22）"
+
     safe_title = _html.escape(title)
+    safe_body  = _html.escape(body)
+
     st.markdown(
         f"<div class='copy-title'>{safe_title}</div>"
-        f"<div class='copy-meta'>标题字数：<span style='color:{title_color}'>{title_len}字</span></div>",
+        f"<div class='copy-meta'><span class='{len_cls}'>{len_tip}</span></div>"
+        f"<div class='copy-body'>{safe_body}</div>",
         unsafe_allow_html=True,
     )
-    st.markdown(body.replace("\n", "  \n"))
     if keywords:
         kw_html = " ".join(f"<span class='tag'>#{_html.escape(k)}</span>" for k in keywords)
         st.markdown(kw_html, unsafe_allow_html=True)
 
-    # Debug: show raw AI output if parsing failed
     if not title and raw_text:
         with st.expander("⚠️ 解析失败 — 查看原始 AI 输出", expanded=True):
             st.code(raw_text, language=None)
@@ -650,10 +1105,15 @@ def _render_version_comparison(versions: list[dict], item_id: str) -> None:
 
     for col_idx, (col, engine) in enumerate(zip(cols, engine_list)):
         with col:
-            st.markdown(f"**{engine.upper()} 版本**")
+            eng_cls = engine.split("/")[0].lower()
+            eng_cls = eng_cls if eng_cls in ("claude", "gemini") else ""
+            st.markdown(
+                f"<span class='engine-badge {eng_cls}'>{_html.escape(engine.upper())}</span>",
+                unsafe_allow_html=True,
+            )
             latest = sorted(by_engine[engine], key=lambda x: x.get("version_num", 0))[-1]
             _render_single_version(latest)
-            if st.button(f"选为最佳（{engine.upper()}）", key=f"best_{item_id}_{engine}"):
+            if st.button(f"选为最佳", key=f"best_{item_id}_{engine}"):
                 db.update_item_status(
                     db_client, item_id, "approved",
                     best_version_id=latest["id"]
@@ -783,6 +1243,7 @@ def page_project_settings(project: Optional[dict]) -> None:
     if project is None:
         st.info("请先在左侧创建或选择一个项目。")
         return
+    _page_header("⚙️", "项目设置", project.get("name", ""))
     proj_module.render_project_settings(db_client, project, user_id)
 
 
@@ -791,8 +1252,9 @@ def page_project_settings(project: Optional[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def page_memory(project: Optional[dict]) -> None:
-    pid = project["id"] if project else None
+    pid   = project["id"] if project else None
     pname = project.get("name", "") if project else ""
+    _page_header("🧠", "记忆管理", pname)
     mem_module.render_memory_manager(db_client, user_id, project_id=pid, project_name=pname)
 
 
@@ -801,7 +1263,7 @@ def page_memory(project: Optional[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def page_history(project: dict) -> None:
-    st.title("📋 批次历史")
+    _page_header("📋", "批次历史", f"项目：{project.get('name', '')}")
 
     batches = db.list_batches(db_client, project["id"], limit=50)
     if not batches:
