@@ -2,6 +2,7 @@
 Export module for XHS Content Workstation.
 
 Features:
+  - Generate a formatted Excel (.xlsx) file from approved copy items
   - Generate a formatted Word (.docx) document from approved copy items
   - Push copy to Feishu (Lark) via Webhook
 """
@@ -18,7 +19,90 @@ from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    _OPENPYXL_AVAILABLE = True
+except ImportError:
+    _OPENPYXL_AVAILABLE = False
+
 import config
+
+
+# ── Excel Export ──────────────────────────────────────────────────────────
+
+def build_excel_document(
+    items: list[dict],
+    project_name: str,
+    brand: str,
+    tactic: str,
+    generated_at: Optional[str] = None,
+) -> bytes:
+    """
+    Build an Excel file from approved copy items.
+    Columns: 序号, 标题, 正文, 关键词, AI引擎, 版本
+    Optimized for copy-paste into Feishu spreadsheet.
+    """
+    if not _OPENPYXL_AVAILABLE:
+        raise RuntimeError("openpyxl 未安装，请运行 pip install openpyxl")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "稿件内容"
+
+    # Header style
+    header_font = Font(bold=True, size=12, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+
+    # Headers
+    headers = ["序号", "标题", "正文", "关键词", "AI引擎", "版本"]
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    # Data rows
+    body_alignment = Alignment(vertical="top", wrap_text=True)
+    for row_idx, item in enumerate(items, 2):
+        keywords = item.get("keywords", [])
+        if isinstance(keywords, list):
+            kw_str = " ".join(f"#{k}" for k in keywords)
+        else:
+            kw_str = str(keywords)
+
+        row_data = [
+            row_idx - 1,
+            item.get("title", ""),
+            item.get("body", ""),
+            kw_str,
+            item.get("ai_engine", "").upper(),
+            f"v{item.get('version_num', 1)}",
+        ]
+        for col_idx, value in enumerate(row_data, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = body_alignment
+            cell.border = thin_border
+
+    # Column widths
+    ws.column_dimensions["A"].width = 6   # 序号
+    ws.column_dimensions["B"].width = 30  # 标题
+    ws.column_dimensions["C"].width = 80  # 正文
+    ws.column_dimensions["D"].width = 25  # 关键词
+    ws.column_dimensions["E"].width = 10  # AI引擎
+    ws.column_dimensions["F"].width = 8   # 版本
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 # ── Word Export ────────────────────────────────────────────────────────────

@@ -94,18 +94,44 @@ def _make_user_prompt(
 def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
     """
     Extract and parse JSON from AI output.
-    Handles: raw JSON, ```json blocks, partial wrapping text.
+    Handles: raw JSON, ```json blocks, partial wrapping text,
+    JSON wrapped in quotes, trailing whitespace/quotes.
     """
     # Step 1: strip markdown code fences
     stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
+
+    # Step 1.5: strip outer quotes if the whole thing is a quoted string
+    # e.g. '"{  \"title\": ...}  "'
+    for candidate in (stripped, text.strip()):
+        if (candidate.startswith('"') and candidate.endswith('"')) or \
+           (candidate.startswith("'") and candidate.endswith("'")):
+            unquoted = candidate[1:-1].strip()
+            # Try to parse the unquoted version
+            try:
+                data = json.loads(unquoted)
+                if isinstance(data, dict):
+                    keywords = data.get("keywords", [])
+                    if isinstance(keywords, str):
+                        keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
+                    return GenerationResult(
+                        title=str(data.get("title", "")).strip(),
+                        body=str(data.get("body", "")).strip(),
+                        keywords=keywords,
+                        ai_engine=ai_engine,
+                        raw_text=text,
+                    )
+            except (json.JSONDecodeError, ValueError):
+                pass
 
     # Step 2: try each candidate source for a JSON object
     for src in (stripped, text):
         start = src.find('{')
         end = src.rfind('}')
         if start != -1 and end > start:
+            json_str = src[start:end + 1]
+            # Try parsing directly
             try:
-                data = json.loads(src[start:end + 1])
+                data = json.loads(json_str)
                 keywords = data.get("keywords", [])
                 if isinstance(keywords, str):
                     keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
@@ -117,7 +143,23 @@ def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
                     raw_text=text,
                 )
             except (json.JSONDecodeError, ValueError):
-                continue
+                # Try fixing common issues: escaped quotes, control chars
+                try:
+                    # Replace escaped newlines that aren't properly escaped
+                    fixed = json_str.replace('\r\n', '\\n').replace('\r', '\\n')
+                    data = json.loads(fixed)
+                    keywords = data.get("keywords", [])
+                    if isinstance(keywords, str):
+                        keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
+                    return GenerationResult(
+                        title=str(data.get("title", "")).strip(),
+                        body=str(data.get("body", "")).strip(),
+                        keywords=keywords,
+                        ai_engine=ai_engine,
+                        raw_text=text,
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    continue
 
     # Step 3: fallback — extract fields from plain Chinese text
     title_match = re.search(r'标题[：:「【]\s*(.+?)[\n」】]', text)

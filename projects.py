@@ -72,13 +72,8 @@ def render_project_switcher(client: Client, user_id: str) -> Optional[dict]:
         selected_project = projects[selected_idx]
         set_current_project(selected_project["id"])
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("⚙️ 项目设置", use_container_width=True):
-                st.session_state["show_project_settings"] = True
-        with col2:
-            if st.button("➕ 新建项目", use_container_width=True):
-                st.session_state["show_new_project_form"] = True
+        if st.button("➕ 新建项目", use_container_width=True):
+            st.session_state["show_new_project_form"] = True
 
         if st.session_state.get("show_new_project_form"):
             _render_new_project_form(client, user_id)
@@ -171,7 +166,7 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
 
 def _render_tactics_settings(client: Client, project: dict) -> None:
     tactics = _parse_json_field(project.get("tactics"), [])
-    st.markdown("配置本项目可用的战术方向。每个方向可附加独立的 Prompt 补充说明。")
+    st.markdown("配置本项目可用的战术方向。每个方向可附加独立的 Prompt 补充说明。可以删除全部战术方向，生成时将不使用战术方向。")
 
     updated_tactics = []
     for i, tactic in enumerate(tactics):
@@ -183,14 +178,26 @@ def _render_tactics_settings(client: Client, project: dict) -> None:
                 f"Prompt 补充 {i+1}", value=tactic.get("prompt_suffix", ""), key=f"t_prompt_{i}"
             )
         with col3:
-            remove = st.button("✕", key=f"t_rm_{i}")
-        if not remove:
-            updated_tactics.append({"name": tname, "prompt_suffix": tprompt})
+            if st.button("🗑️", key=f"t_rm_{i}"):
+                # Auto-save with this tactic removed
+                remaining = [
+                    {"name": t.get("name", ""), "prompt_suffix": t.get("prompt_suffix", "")}
+                    for j, t in enumerate(tactics) if j != i
+                ]
+                db.update_project(client, project["id"], {"tactics": json.dumps(remaining)})
+                st.success(f"已删除战术方向「{tactic.get('name', '')}」")
+                st.rerun()
+        updated_tactics.append({"name": tname, "prompt_suffix": tprompt})
+
+    if not tactics:
+        st.info("暂无战术方向。生成时将不应用任何战术方向。")
 
     col_add, col_save = st.columns(2)
     with col_add:
         if st.button("➕ 添加战术方向"):
-            updated_tactics.append({"name": "新战术方向", "prompt_suffix": ""})
+            new_tactics = updated_tactics + [{"name": "新战术方向", "prompt_suffix": ""}]
+            db.update_project(client, project["id"], {"tactics": json.dumps(new_tactics)})
+            st.rerun()
     with col_save:
         if st.button("💾 保存战术方向"):
             db.update_project(client, project["id"], {"tactics": json.dumps(updated_tactics)})
@@ -242,9 +249,9 @@ def _render_file_settings(client: Client, project: dict, user_id: str) -> None:
 # ── Tactic helpers ─────────────────────────────────────────────────────────
 
 def get_tactic_names(project: dict) -> list[str]:
+    """Return list of tactic names. Empty list means no tactics configured."""
     tactics = _parse_json_field(project.get("tactics"), [])
-    names = [t.get("name", "") for t in tactics if t.get("name")]
-    return names or ["默认战术"]
+    return [t.get("name", "") for t in tactics if t.get("name")]
 
 
 def get_tactic_prompt_suffix(project: dict, tactic_name: str) -> str:

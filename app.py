@@ -8,6 +8,8 @@ Entry point: streamlit run app.py
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import streamlit as st
@@ -20,6 +22,36 @@ import memory as mem_module
 import generator as gen_module
 import image_handler
 import exporter
+
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _format_batch_label(batch: dict, project_name: str = "") -> str:
+    """Format a batch label consistently: project · tactic · date · time (Beijing)."""
+    tactic = batch.get("tactic", "通用")
+    created_at = batch.get("created_at", "")
+    # Parse and convert to Beijing time
+    try:
+        # Supabase returns ISO format like "2024-03-09T14:30:00+00:00" or "2024-03-09T14:30:00"
+        dt_str = created_at.replace("Z", "+00:00")
+        if "+" not in dt_str and len(dt_str) > 19:
+            dt_str = dt_str[:19]
+        dt = datetime.fromisoformat(dt_str[:26])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        beijing_dt = dt.astimezone(_BEIJING_TZ)
+        time_str = beijing_dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        time_str = created_at[:16] if created_at else "未知时间"
+
+    parts = []
+    if project_name:
+        parts.append(project_name)
+    if tactic:
+        parts.append(tactic)
+    parts.append(time_str)
+    return " · ".join(parts)
+
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -122,7 +154,13 @@ def page_generate(project: dict) -> None:
     with st.sidebar:
         st.markdown("### 生成参数")
 
-        tactic = st.selectbox("战术方向", tactic_names)
+        if tactic_names:
+            tactic = st.selectbox("战术方向", ["（不使用战术方向）"] + tactic_names)
+            if tactic == "（不使用战术方向）":
+                tactic = ""
+        else:
+            st.caption("未配置战术方向，将不应用战术方向。")
+            tactic = ""
         count = st.slider("生成数量", 1, config.MAX_GENERATION_COUNT, config.DEFAULT_GENERATION_COUNT)
 
         engine_mode = st.radio(
@@ -169,7 +207,7 @@ def page_generate(project: dict) -> None:
             st.stop()
 
         # Build full system prompt
-        tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic)
+        tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
         full_system_prompt = mem_module.build_system_prompt(
             base_prompt=base_prompt,
             global_memories=global_mems,
@@ -187,7 +225,7 @@ def page_generate(project: dict) -> None:
         batch = db.create_batch(
             db_client, user_id,
             project_id=project["id"],
-            tactic=tactic,
+            tactic=tactic or "通用",
             params=batch_params,
             ai_engines=engines,
         )
@@ -274,8 +312,9 @@ def page_review(project: dict) -> None:
         st.info("暂无批次，请先在「生成工作台」生成内容。")
         return
 
+    project_name = project.get("name", "")
     batch_options = {
-        f"{b['tactic']} · {b['created_at'][:10]} ({b['id'][:8]})": b["id"]
+        _format_batch_label(b, project_name): b["id"]
         for b in batches
     }
     default_key = None
@@ -304,19 +343,37 @@ def page_review(project: dict) -> None:
     approved = sum(1 for it in items if it["status"] == "approved")
     revision = sum(1 for it in items if it["status"] == "needs_revision")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("总篇数", len(items))
-    col2.metric("待审核", pending)
-    col3.metric("已通过", approved)
-    col4.metric("待修改", revision)
+    # Status filter tabs
+    filter_options = [
+        f"全部 ({len(items)})",
+        f"⏳ 待审核 ({pending})",
+        f"✅ 已通过 ({approved})",
+        f"✏️ 待修改 ({revision})",
+    ]
+    selected_filter = st.radio(
+        "筛选状态", filter_options, horizontal=True, label_visibility="collapsed",
+    )
+
+    # Determine which items to show
+    if "待审核" in selected_filter:
+        filtered_items = [it for it in items if it["status"] == "pending"]
+    elif "已通过" in selected_filter:
+        filtered_items = [it for it in items if it["status"] == "approved"]
+    elif "待修改" in selected_filter:
+        filtered_items = [it for it in items if it["status"] == "needs_revision"]
+    else:
+        filtered_items = items
 
     st.divider()
 
     # Collect all feedbacks for memory ingestion
     new_feedbacks_this_session: list[str] = []
 
+    if not filtered_items:
+        st.info("当前筛选条件下没有文案。")
+
     # ── Item cards ─────────────────────────────────────────────────────
-    for item in items:
+    for item in filtered_items:
         versions = sorted(item.get("versions", []), key=lambda v: v.get("version_num", 0))
         if not versions:
             continue
@@ -333,20 +390,23 @@ def page_review(project: dict) -> None:
 
     with col_exp:
         approved_items = _collect_approved_items(items)
-        if approved_items and st.button("📄 导出 Word", use_container_width=True):
-            docx_bytes = exporter.build_word_document(
-                items=approved_items,
-                project_name=project.get("name", ""),
-                brand=project.get("brand", ""),
-                tactic=selected_batch.get("tactic", ""),
-            )
-            st.download_button(
-                label="⬇️ 下载 Word 文件",
-                data=docx_bytes,
-                file_name=f"xhs_{project.get('brand','')}_稿件.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-            )
+        if approved_items:
+            try:
+                xlsx_bytes = exporter.build_excel_document(
+                    items=approved_items,
+                    project_name=project.get("name", ""),
+                    brand=project.get("brand", ""),
+                    tactic=selected_batch.get("tactic", ""),
+                )
+                st.download_button(
+                    label="📊 导出 Excel",
+                    data=xlsx_bytes,
+                    file_name=f"xhs_{project.get('brand','')}_稿件.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except RuntimeError as e:
+                st.error(str(e))
 
     with col_feishu:
         if st.button("🔔 推送到飞书", use_container_width=True):
@@ -671,9 +731,9 @@ def page_history(project: dict) -> None:
         pending = sum(1 for i in items if i["status"] == "pending")
         revision = sum(1 for i in items if i["status"] == "needs_revision")
 
+        batch_label = _format_batch_label(batch, project.get("name", ""))
         with st.expander(
-            f"📦 {batch['tactic']}  ·  {batch['created_at'][:16]}  "
-            f"·  共{len(items)}篇（✅{approved} ⏳{pending} ✏️{revision}）"
+            f"📦 {batch_label}  ·  共{len(items)}篇（✅{approved} ⏳{pending} ✏️{revision}）"
         ):
             col1, col2 = st.columns(2)
             with col1:

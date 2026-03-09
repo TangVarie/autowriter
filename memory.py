@@ -10,6 +10,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import io
 import json
 from typing import Optional
 
@@ -198,6 +199,63 @@ def render_memory_manager(
         )
         st.success("记忆已添加。")
         st.rerun()
+
+    # Export / Import
+    st.divider()
+    st.markdown("#### 📦 记忆导出 & 导入")
+
+    col_export, col_import = st.columns(2)
+
+    with col_export:
+        all_memories = db.list_memories(db_client, user_id)
+        if all_memories:
+            export_data = []
+            for m in all_memories:
+                export_data.append({
+                    "scope": m.get("scope", ""),
+                    "content": m.get("content", ""),
+                    "source_feedback": m.get("source_feedback", ""),
+                    "frequency": m.get("frequency", 1),
+                    "status": m.get("status", "candidate"),
+                })
+            export_json = json.dumps(export_data, ensure_ascii=False, indent=2)
+            st.download_button(
+                label="⬇️ 导出记忆 (JSON)",
+                data=export_json.encode("utf-8"),
+                file_name="memories_export.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        else:
+            st.caption("暂无记忆可导出。")
+
+    with col_import:
+        uploaded = st.file_uploader("导入记忆 (JSON)", type=["json"], key="mem_import")
+        if uploaded and st.button("📥 开始导入", use_container_width=True):
+            try:
+                import_data = json.loads(uploaded.read().decode("utf-8"))
+                if not isinstance(import_data, list):
+                    st.error("JSON 格式错误：需要一个数组。")
+                else:
+                    imported = 0
+                    for m in import_data:
+                        scope = m.get("scope", "project")
+                        if scope not in ("project", "global"):
+                            scope = "project"
+                        pid = project_id if scope == "project" else None
+                        db.upsert_memory(
+                            db_client, user_id,
+                            scope=scope,
+                            content=m.get("content", ""),
+                            source_feedback=m.get("source_feedback", "导入"),
+                            project_id=pid,
+                            auto_confirm_threshold=1,
+                        )
+                        imported += 1
+                    st.success(f"已导入 {imported} 条记忆。")
+                    st.rerun()
+            except json.JSONDecodeError:
+                st.error("JSON 解析失败，请检查文件格式。")
 
 
 def _render_memory_table(
