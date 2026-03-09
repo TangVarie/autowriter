@@ -219,9 +219,15 @@ def page_generate(project: dict) -> None:
 
         # Persist to DB
         saved_count = 0
+        error_messages: list[str] = []
         for slot in generation_results:
             item = db.create_item(db_client, user_id, batch_id)
             for version_result in slot["versions"]:
+                if version_result.error and not version_result.title:
+                    error_messages.append(
+                        f"[{version_result.ai_engine.upper()}] {version_result.error}"
+                    )
+                    continue
                 db.create_version(
                     db_client,
                     item_id=item["id"],
@@ -234,7 +240,13 @@ def page_generate(project: dict) -> None:
                 saved_count += 1
 
         progress_bar.progress(1.0, text="生成完成！")
-        st.success(f"✅ 生成完成！共 {len(generation_results)} 篇，{saved_count} 个版本。")
+        if error_messages:
+            unique_errors = list(dict.fromkeys(error_messages))
+            st.error("部分内容生成失败：\n" + "\n".join(f"• {e}" for e in unique_errors))
+        if saved_count > 0:
+            st.success(f"✅ 生成完成！共 {len(generation_results)} 篇，{saved_count} 个版本。")
+        elif not error_messages:
+            st.warning("生成完成，但没有内容被保存，请检查配置。")
 
         # Store batch_id for review page
         st.session_state["review_batch_id"] = batch_id

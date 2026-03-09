@@ -1,26 +1,40 @@
 """
 Configuration module for XHS Content Workstation.
-Loads settings from environment variables.
+Loads settings from environment variables, with fallback to st.secrets
+when running on Streamlit Cloud.
 """
 
 import os
 
+
+def _get_secret(key: str, default: str = "") -> str:
+    """Read from env var first, then fall back to st.secrets if available."""
+    val = os.environ.get(key, "")
+    if not val:
+        try:
+            import streamlit as st
+            val = str(st.secrets.get(key, ""))
+        except Exception:
+            pass
+    return val or default
+
+
 # ── Anthropic ──────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY: str = _get_secret("ANTHROPIC_API_KEY")
 
 # Default Claude model for content generation
-CLAUDE_MODEL: str = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"
 
 # ── Google Gemini ──────────────────────────────────────────────────────────
-GOOGLE_API_KEY: str = os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL: str = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
+GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-2.0-flash"
 
 # ── Supabase ───────────────────────────────────────────────────────────────
-SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
-SUPABASE_ANON_KEY: str = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_URL: str = _get_secret("SUPABASE_URL")
+SUPABASE_ANON_KEY: str = _get_secret("SUPABASE_ANON_KEY")
 
 # ── Feishu (Lark) Webhook ──────────────────────────────────────────────────
-FEISHU_WEBHOOK_URL: str = os.environ.get("FEISHU_WEBHOOK_URL", "")
+FEISHU_WEBHOOK_URL: str = _get_secret("FEISHU_WEBHOOK_URL")
 
 # ── Memory system thresholds ───────────────────────────────────────────────
 # Number of times a feedback pattern must appear before auto-confirming
