@@ -22,15 +22,30 @@ def _get_secret(key: str, default: str = "") -> str:
 # ── Anthropic ──────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = _get_secret("ANTHROPIC_API_KEY")
 
-# Default Claude model for content generation
-CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"
+# Available Claude models: model_id -> display label
+# All three support Extended Thinking; Opus 4.6 uses "effort", others use "budget_tokens"
+CLAUDE_MODELS: dict[str, str] = {
+    "claude-opus-4-6":           "Opus 4.6（最强，深度思考 effort=high）",
+    "claude-sonnet-4-6":         "Sonnet 4.6（均衡，深度思考 budget_tokens）",
+    "claude-haiku-4-5-20251001": "Haiku 4.5（最快，深度思考 budget_tokens）",
+}
 
-# Claude model used when Extended Thinking is enabled
-CLAUDE_THINKING_MODEL: str = _get_secret("CLAUDE_THINKING_MODEL") or "claude-3-7-sonnet-20250219"
+# Default model (can be overridden via env var)
+CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"
 
 # ── Google Gemini ──────────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
-GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-2.5-pro"
+
+# Available Gemini models: model_id -> display label
+# 3.1 series: thinking enabled by default; 2.5 Pro: opt-in via ThinkingConfig
+GEMINI_MODELS: dict[str, str] = {
+    "gemini-3.1-pro-preview":        "Gemini 3.1 Pro（最新，思考默认开）",
+    "gemini-3.1-flash-lite-preview":  "Gemini 3.1 Flash Lite（最快）",
+    "gemini-2.5-pro":                 "Gemini 2.5 Pro（稳定版）",
+}
+
+# Default model (can be overridden via env var)
+GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-3.1-pro-preview"
 
 # ── Supabase ───────────────────────────────────────────────────────────────
 SUPABASE_URL: str = _get_secret("SUPABASE_URL")
@@ -40,7 +55,6 @@ SUPABASE_ANON_KEY: str = _get_secret("SUPABASE_ANON_KEY")
 FEISHU_WEBHOOK_URL: str = _get_secret("FEISHU_WEBHOOK_URL")
 
 # ── Memory system thresholds ───────────────────────────────────────────────
-# Number of times a feedback pattern must appear before auto-confirming
 MEMORY_AUTO_CONFIRM_THRESHOLD: int = int(
     os.environ.get("MEMORY_AUTO_CONFIRM_THRESHOLD", "3")
 )
@@ -52,7 +66,7 @@ SUPPORTED_IMAGE_FORMATS: list[str] = ["jpg", "jpeg", "png", "webp"]
 # ── Generation defaults ────────────────────────────────────────────────────
 DEFAULT_GENERATION_COUNT: int = 10
 MAX_GENERATION_COUNT: int = 50
-MAX_ITERATION_ROUNDS: int = 3  # Maximum context rounds per item
+MAX_ITERATION_ROUNDS: int = 3
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"

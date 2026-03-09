@@ -170,14 +170,10 @@ def page_generate(project: dict) -> None:
         )
 
         if engine_mode == "单引擎":
-            engine_labels = {
-                "claude": f"Claude ({config.CLAUDE_MODEL})",
-                "gemini": f"Gemini ({config.GEMINI_MODEL})",
-            }
             selected_engine_raw = st.selectbox(
-                "选择引擎",
+                "引擎",
                 gen_module.AVAILABLE_ENGINES,
-                format_func=lambda e: engine_labels.get(e, e.upper()),
+                format_func=lambda e: "Claude" if e == "claude" else "Gemini",
             )
             engines = [selected_engine_raw]
         else:
@@ -186,19 +182,58 @@ def page_generate(project: dict) -> None:
                 st.warning("Gemini 未配置，将仅使用 Claude。")
                 engines = ["claude"]
 
-        # Extended Thinking — only for Claude
-        use_thinking = False
+        # Per-engine model selectors
+        engine_models: dict[str, str] = {}
+
+        if "claude" in engines:
+            claude_model = st.selectbox(
+                "Claude 模型",
+                list(config.CLAUDE_MODELS.keys()),
+                index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
+                      if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
+                format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
+            )
+            engine_models["claude"] = claude_model
+
+        if "gemini" in engines:
+            gemini_model = st.selectbox(
+                "Gemini 模型",
+                list(config.GEMINI_MODELS.keys()),
+                index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
+                      if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
+                format_func=lambda m: config.GEMINI_MODELS.get(m, m),
+            )
+            engine_models["gemini"] = gemini_model
+
+        # Thinking mode toggles
+        use_thinking = False         # Claude Extended Thinking
+        gemini_use_thinking = False  # Gemini ThinkingConfig
+
         if "claude" in engines:
             use_thinking = st.checkbox(
-                "启用 Extended Thinking",
+                "Claude：启用 Extended Thinking",
                 value=False,
                 help=(
-                    f"开启后使用 {config.CLAUDE_THINKING_MODEL} 模型进行深度推理，"
-                    "生成质量更高但速度慢、费用更高。"
+                    "Opus 4.6 → effort=high (max 32k tokens)；"
+                    "Sonnet 4.6 / Haiku 4.5 → budget_tokens=8000 (max 16k)。"
+                    "速度慢、费用高，适合需要高质量的场景。"
                 ),
             )
             if use_thinking:
-                st.caption(f"模型: `{config.CLAUDE_THINKING_MODEL}`，max_tokens=16000")
+                sel = engine_models.get("claude", "")
+                hint = "effort=high, max_tokens=32000" if "opus-4-6" in sel else "budget_tokens=8000, max_tokens=16000"
+                st.caption(f"`{sel}` — {hint}")
+
+        if "gemini" in engines:
+            gemini_use_thinking = st.checkbox(
+                "Gemini：启用思考模式",
+                value=False,
+                help=(
+                    "启用 ThinkingConfig(thinking_budget=-1) 动态分配思考 token。"
+                    "Gemini 3.1 Pro 默认已开启思考，此开关对其无明显额外效果；"
+                    "对 2.5 Pro 有明显提升。"
+                ),
+            )
 
         with st.expander("⚙️ 高级参数"):
             target_audience = st.text_input("目标人群", placeholder="例：25-35岁职场女性")
@@ -240,6 +275,8 @@ def page_generate(project: dict) -> None:
             "tone": tone,
             "extra_instructions": extra_instructions,
             "use_thinking": use_thinking,
+            "gemini_use_thinking": gemini_use_thinking,
+            "engine_models": engine_models,
         }
         batch = db.create_batch(
             db_client, user_id,
@@ -261,6 +298,13 @@ def page_generate(project: dict) -> None:
 
         # Generate
         try:
+            # For multi-engine, each engine uses its own thinking flag
+            # We'll store per-engine thinking in engine_models so generate_batch
+            # can decide; for simplicity pass use_thinking for Claude only,
+            # and re-use gemini_use_thinking by temporarily fusing it via engine_models.
+            # Actually generate_batch already calls engine.generate() per engine;
+            # Gemini thinking is controlled by passing use_thinking when engine=="gemini".
+            # Patch: pass a combined flag; generator checks engine_name=="claude" etc.
             generation_results = gen_module.generate_batch(
                 system_prompt=full_system_prompt,
                 tactic=tactic,
@@ -274,6 +318,8 @@ def page_generate(project: dict) -> None:
                 progress_callback=update_progress,
                 historical_titles=historical_titles or None,
                 use_thinking=use_thinking,
+                engine_models=engine_models or None,
+                gemini_use_thinking=gemini_use_thinking,
             )
         except Exception as e:
             st.error(f"生成失败：{e}")
@@ -646,15 +692,20 @@ def _run_iteration(
 
     original_user_prompt = gen_module.reconstruct_user_prompt(batch_params, tactic)
 
-    iter_use_thinking = batch_params.get("use_thinking", False) if isinstance(batch_params, dict) else False
-    with st.spinner(f"正在用 {engine_name.upper()}{'（深度思考）' if iter_use_thinking and engine_name == 'claude' else ''} 迭代…"):
+    _bp = batch_params if isinstance(batch_params, dict) else {}
+    iter_use_thinking = _bp.get("use_thinking", False)
+    iter_gemini_thinking = _bp.get("gemini_use_thinking", False)
+    iter_model = (_bp.get("engine_models") or {}).get(engine_name, "")
+    thinking_flag = iter_use_thinking if engine_name == "claude" else (iter_gemini_thinking if engine_name == "gemini" else False)
+    with st.spinner(f"正在用 {engine_name.upper()}{' (深度思考)' if thinking_flag else ''} 迭代…"):
         result = gen_module.iterate_copy(
             system_prompt=full_system_prompt,
             original_user_prompt=original_user_prompt,
             version_history=versions,
             feedback=feedback,
             engine_name=engine_name,
-            use_thinking=iter_use_thinking,
+            use_thinking=thinking_flag,
+            model=iter_model,
         )
 
     if result.error:

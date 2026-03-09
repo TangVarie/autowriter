@@ -242,6 +242,25 @@ def _extract_text_from_response(response) -> str:
     return ""
 
 
+def _claude_thinking_params(model: str) -> dict:
+    """
+    Build the extended-thinking parameters for a Claude model.
+
+    - claude-opus-4-6 dropped budget_tokens in favour of the "effort" parameter.
+    - All other current models (Sonnet 4.6, Haiku 4.5) still use budget_tokens.
+    """
+    if "opus-4-6" in model:
+        return {
+            "max_tokens": 32000,
+            "thinking": {"type": "enabled", "effort": "high"},
+        }
+    else:
+        return {
+            "max_tokens": 16000,
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+        }
+
+
 class ClaudeEngine:
     def __init__(self) -> None:
         if not config.ANTHROPIC_API_KEY:
@@ -265,17 +284,10 @@ class ClaudeEngine:
         content.append({"type": "text", "text": text})
         return content
 
-    def _make_params(self, use_thinking: bool) -> dict:
+    def _make_params(self, model: str, use_thinking: bool) -> dict:
         if use_thinking:
-            return {
-                "model": config.CLAUDE_THINKING_MODEL,
-                "max_tokens": 16000,
-                "thinking": {"type": "enabled", "budget_tokens": 8000},
-            }
-        return {
-            "model": config.CLAUDE_MODEL,
-            "max_tokens": 2048,
-        }
+            return {"model": model, **_claude_thinking_params(model)}
+        return {"model": model, "max_tokens": 2048}
 
     def generate(
         self,
@@ -283,8 +295,10 @@ class ClaudeEngine:
         user_prompt: str,
         images: Optional[list[dict]] = None,
         use_thinking: bool = False,
+        model: str = "",
     ) -> GenerationResult:
-        params = self._make_params(use_thinking)
+        model = model or config.CLAUDE_MODEL
+        params = self._make_params(model, use_thinking)
         def _call():
             return self._client.messages.create(
                 **params,
@@ -294,7 +308,7 @@ class ClaudeEngine:
         try:
             response = _call_with_retry(_call)
             text = _extract_text_from_response(response)
-            result = _parse_copy_json(text, "claude")
+            result = _parse_copy_json(text, f"claude/{model}")
             result.token_usage = {
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
@@ -302,7 +316,7 @@ class ClaudeEngine:
             return result
         except anthropic.APIError as e:
             return GenerationResult(
-                title="", body="", keywords=[], ai_engine="claude",
+                title="", body="", keywords=[], ai_engine=f"claude/{model}",
                 error=f"Claude API错误: {e}"
             )
 
@@ -312,14 +326,16 @@ class ClaudeEngine:
         system_prompt: str,
         images: Optional[list[dict]] = None,
         use_thinking: bool = False,
+        model: str = "",
     ) -> GenerationResult:
         """Continue a multi-turn conversation for iterative refinement."""
+        model = model or config.CLAUDE_MODEL
         messages = [m.copy() for m in messages]
         if images and messages and messages[-1]["role"] == "user":
             last_content = messages[-1]["content"]
             if isinstance(last_content, str):
                 messages[-1]["content"] = self._build_content(last_content, images)
-        params = self._make_params(use_thinking)
+        params = self._make_params(model, use_thinking)
         def _call():
             return self._client.messages.create(
                 **params,
@@ -329,7 +345,7 @@ class ClaudeEngine:
         try:
             response = _call_with_retry(_call)
             text = _extract_text_from_response(response)
-            result = _parse_copy_json(text, "claude")
+            result = _parse_copy_json(text, f"claude/{model}")
             result.token_usage = {
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
@@ -337,7 +353,7 @@ class ClaudeEngine:
             return result
         except anthropic.APIError as e:
             return GenerationResult(
-                title="", body="", keywords=[], ai_engine="claude",
+                title="", body="", keywords=[], ai_engine=f"claude/{model}",
                 error=f"Claude迭代错误: {e}"
             )
 
@@ -365,34 +381,58 @@ class GeminiEngine:
         parts.append(text)
         return parts
 
+    def _make_generate_config(self, use_thinking: bool) -> "genai_types.GenerateContentConfig":
+        """
+        Build GenerateContentConfig.
+
+        Gemini 3.x series: thinking is on by default; use ThinkingConfig to
+        request dynamic budget (-1) or disable it (budget=0).
+        Gemini 2.5 series: thinking opt-in via ThinkingConfig(thinking_budget>0).
+        """
+        kwargs: dict = {"max_output_tokens": 8192}
+        try:
+            if use_thinking:
+                kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=-1)
+            else:
+                kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+        except AttributeError:
+            # Older SDK versions without ThinkingConfig — ignore
+            pass
+        return genai_types.GenerateContentConfig(**kwargs)
+
+    def _parse_gemini_response(self, response, model: str) -> GenerationResult:
+        text = response.text or ""
+        result = _parse_copy_json(text, f"gemini/{model}")
+        usage = getattr(response, "usage_metadata", None)
+        if usage:
+            result.token_usage = {
+                "input": getattr(usage, "prompt_token_count", 0),
+                "output": getattr(usage, "candidates_token_count", 0),
+                "thinking": getattr(usage, "thoughts_token_count", 0),
+            }
+        return result
+
     def generate(
         self,
         system_prompt: str,
         user_prompt: str,
         images: Optional[list[dict]] = None,
-        use_thinking: bool = False,  # accepted but ignored for Gemini
+        use_thinking: bool = False,
+        model: str = "",
     ) -> GenerationResult:
+        model = model or config.GEMINI_MODEL
+        gen_config = self._make_generate_config(use_thinking)
+        gen_config.system_instruction = system_prompt
         try:
             response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
+                model=model,
                 contents=self._build_parts(user_prompt, images),
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    max_output_tokens=4096,
-                ),
+                config=gen_config,
             )
-            text = response.text or ""
-            result = _parse_copy_json(text, "gemini")
-            usage = getattr(response, "usage_metadata", None)
-            if usage:
-                result.token_usage = {
-                    "input": getattr(usage, "prompt_token_count", 0),
-                    "output": getattr(usage, "candidates_token_count", 0),
-                }
-            return result
+            return self._parse_gemini_response(response, model)
         except Exception as e:
             return GenerationResult(
-                title="", body="", keywords=[], ai_engine="gemini",
+                title="", body="", keywords=[], ai_engine=f"gemini/{model}",
                 error=f"Gemini API错误: {e}"
             )
 
@@ -401,9 +441,13 @@ class GeminiEngine:
         messages: list[dict],
         system_prompt: str,
         images: Optional[list[dict]] = None,
-        use_thinking: bool = False,  # accepted but ignored for Gemini
+        use_thinking: bool = False,
+        model: str = "",
     ) -> GenerationResult:
         """Convert messages history to Gemini multi-turn format and continue."""
+        model = model or config.GEMINI_MODEL
+        gen_config = self._make_generate_config(use_thinking)
+        gen_config.system_instruction = system_prompt
         try:
             history = []
             for msg in messages[:-1]:
@@ -423,25 +467,14 @@ class GeminiEngine:
                 )
 
             response = self._client.models.generate_content(
-                model=config.GEMINI_MODEL,
+                model=model,
                 contents=history + [{"role": "user", "parts": self._build_parts(last_text, images)}],
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    max_output_tokens=4096,
-                ),
+                config=gen_config,
             )
-            text = response.text or ""
-            result = _parse_copy_json(text, "gemini")
-            usage = getattr(response, "usage_metadata", None)
-            if usage:
-                result.token_usage = {
-                    "input": getattr(usage, "prompt_token_count", 0),
-                    "output": getattr(usage, "candidates_token_count", 0),
-                }
-            return result
+            return self._parse_gemini_response(response, model)
         except Exception as e:
             return GenerationResult(
-                title="", body="", keywords=[], ai_engine="gemini",
+                title="", body="", keywords=[], ai_engine=f"gemini/{model}",
                 error=f"Gemini迭代错误: {e}"
             )
 
@@ -513,7 +546,13 @@ def generate_batch(
     progress_callback=None,
     historical_titles: list[str] | None = None,
     use_thinking: bool = False,
+    engine_models: dict[str, str] | None = None,
+    gemini_use_thinking: bool = False,
 ) -> list[dict]:
+    """
+    engine_models: optional per-engine model override, e.g.
+        {"claude": "claude-opus-4-6", "gemini": "gemini-3.1-pro-preview"}
+    """
     """
     Generate `count` copy items using specified engines.
 
@@ -556,11 +595,17 @@ def generate_batch(
         for engine_name in engines:
             try:
                 engine = get_engine(engine_name)
+                model_override = (engine_models or {}).get(engine_name, "")
+                thinking_flag = (
+                    use_thinking if engine_name == "claude"
+                    else (gemini_use_thinking if engine_name == "gemini" else False)
+                )
                 result = engine.generate(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     images=images,
-                    use_thinking=(use_thinking and engine_name == "claude"),
+                    use_thinking=thinking_flag,
+                    model=model_override,
                 )
             except Exception as e:
                 result = GenerationResult(
@@ -655,6 +700,7 @@ def iterate_copy(
     engine_name: str = "claude",
     images: Optional[list[dict]] = None,
     use_thinking: bool = False,
+    model: str = "",
 ) -> GenerationResult:
     """Refine a copy item based on feedback."""
     messages = build_iteration_messages(
@@ -667,6 +713,7 @@ def iterate_copy(
             system_prompt=system_prompt,
             images=images,
             use_thinking=(use_thinking and engine_name == "claude"),
+            model=model,
         )
     except Exception as e:
         return GenerationResult(
