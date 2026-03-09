@@ -59,6 +59,22 @@ def get_authenticated_client() -> Optional[Client]:
     return db.get_client(access_token=token)
 
 
+def _try_refresh_session() -> bool:
+    """Attempt to refresh the Supabase session using the stored refresh token."""
+    session = st.session_state.get("supabase_session")
+    if not session or not hasattr(session, "refresh_token") or not session.refresh_token:
+        return False
+    try:
+        client = get_supabase_client()
+        res = client.auth.refresh_session(session.refresh_token)
+        if res.session and res.user:
+            _store_session({"session": res.session, "user": res.user})
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def require_auth() -> tuple[Client, dict]:
     """
     Enforce authentication. If the user is not logged in, show the login
@@ -71,8 +87,13 @@ def require_auth() -> tuple[Client, dict]:
         st.stop()
     client = get_authenticated_client()
     if client is None:
-        _render_login_page()
-        st.stop()
+        # Try refreshing the token before forcing re-login
+        if _try_refresh_session():
+            client = get_authenticated_client()
+        if client is None:
+            sign_out()
+            _render_login_page()
+            st.stop()
     return client, st.session_state["current_user"]
 
 

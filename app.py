@@ -32,11 +32,9 @@ def _format_batch_label(batch: dict, project_name: str = "") -> str:
     created_at = batch.get("created_at", "")
     # Parse and convert to Beijing time
     try:
-        # Supabase returns ISO format like "2024-03-09T14:30:00+00:00" or "2024-03-09T14:30:00"
+        # Supabase returns ISO format like "2024-03-09T14:30:00.123456+00:00"
         dt_str = created_at.replace("Z", "+00:00")
-        if "+" not in dt_str and len(dt_str) > 19:
-            dt_str = dt_str[:19]
-        dt = datetime.fromisoformat(dt_str[:26])
+        dt = datetime.fromisoformat(dt_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         beijing_dt = dt.astimezone(_BEIJING_TZ)
@@ -317,8 +315,9 @@ def page_review(project: dict) -> None:
         return
 
     project_name = project.get("name", "")
+    # Use batch ID suffix to ensure uniqueness in case of same tactic+time
     batch_options = {
-        _format_batch_label(b, project_name): b["id"]
+        f"{_format_batch_label(b, project_name)} ({b['id'][:6]})": b["id"]
         for b in batches
     }
     default_key = None
@@ -370,9 +369,6 @@ def page_review(project: dict) -> None:
 
     st.divider()
 
-    # Collect all feedbacks for memory ingestion
-    new_feedbacks_this_session: list[str] = []
-
     if not filtered_items:
         st.info("当前筛选条件下没有文案。")
 
@@ -381,10 +377,18 @@ def page_review(project: dict) -> None:
         versions = sorted(item.get("versions", []), key=lambda v: v.get("version_num", 0))
         if not versions:
             continue
-        _render_item_card(
-            item, versions, selected_batch, project,
-            new_feedbacks_this_session,
-        )
+        _render_item_card(item, versions, selected_batch, project)
+
+    # ── Quick batch actions ────────────────────────────────────────────
+    if pending > 0 or revision > 0:
+        st.divider()
+        col_approve_all, col_spacer = st.columns([1, 3])
+        with col_approve_all:
+            if st.button("✅ 全部通过", key="approve_all_btn", use_container_width=True):
+                for it in items:
+                    if it["status"] in ("pending", "needs_revision"):
+                        db.update_item_status(db_client, it["id"], "approved")
+                st.rerun()
 
     # ── Batch actions ──────────────────────────────────────────────────
     st.divider()
@@ -431,7 +435,7 @@ def page_review(project: dict) -> None:
 
     with col_mem:
         if st.button("💾 沉淀反馈记忆", use_container_width=True):
-            _ingest_all_feedbacks(project, new_feedbacks_this_session)
+            _ingest_all_feedbacks(project, batch_id)
 
 
 def _render_item_card(
@@ -439,7 +443,6 @@ def _render_item_card(
     versions: list[dict],
     batch: dict,
     project: dict,
-    feedback_collector: list[str],
 ) -> None:
     """Render a single copy item card with review controls."""
     item_id = item["id"]
@@ -505,9 +508,6 @@ def _render_item_card(
                 + ("；" + feedback_text if feedback_text else "")
             ).strip("、；")
 
-            if combined_feedback:
-                feedback_collector.append(combined_feedback)
-
             # Engine selector for iteration
             iter_engine = st.selectbox(
                 "用哪个引擎重新生成",
@@ -550,8 +550,11 @@ def _render_single_version(version: dict) -> None:
 
     title_len = len(title)
     title_color = "green" if 15 <= title_len <= 22 else "orange"
+    # Escape HTML to prevent XSS from AI-generated content
+    import html as _html
+    safe_title = _html.escape(title)
     st.markdown(
-        f"<div class='copy-title'>{title}</div>"
+        f"<div class='copy-title'>{safe_title}</div>"
         f"<div class='copy-meta'>标题字数：<span style='color:{title_color}'>{title_len}字</span></div>",
         unsafe_allow_html=True,
     )
@@ -674,10 +677,18 @@ def _collect_approved_items(items: list[dict]) -> list[dict]:
     return result
 
 
-def _ingest_all_feedbacks(project: dict, feedbacks: list[str]) -> None:
-    """Persist feedbacks as memory candidates."""
+def _ingest_all_feedbacks(project: dict, batch_id: str) -> None:
+    """Collect all feedbacks from this batch's versions and persist as memory candidates."""
+    # Collect feedbacks from DB (not from session state, which resets on rerun)
+    items = db.list_items(db_client, batch_id)
+    feedbacks: list[str] = []
+    for item in items:
+        for v in item.get("versions", []):
+            fb = v.get("feedback")
+            if fb and fb.strip():
+                feedbacks.append(fb.strip())
     if not feedbacks:
-        st.info("本次没有新的反馈需要沉淀。")
+        st.info("本批次没有反馈记录需要沉淀。")
         return
     unique = list(dict.fromkeys(feedbacks))
     with st.spinner("正在分析并沉淀反馈记忆…"):
@@ -722,6 +733,9 @@ def page_history(project: dict) -> None:
         st.info("暂无历史批次。")
         return
 
+    # Pre-load item counts for all batches to avoid N+1 queries
+    batch_item_counts = db.get_batch_item_counts(db_client, [b["id"] for b in batches])
+
     for batch in batches:
         batch_params = batch.get("params") or {}
         if isinstance(batch_params, str):
@@ -730,14 +744,12 @@ def page_history(project: dict) -> None:
             except Exception:
                 batch_params = {}
 
-        items = db.list_items(db_client, batch["id"])
-        approved = sum(1 for i in items if i["status"] == "approved")
-        pending = sum(1 for i in items if i["status"] == "pending")
-        revision = sum(1 for i in items if i["status"] == "needs_revision")
+        counts = batch_item_counts.get(batch["id"], {"total": 0, "approved": 0, "pending": 0, "needs_revision": 0})
 
         batch_label = _format_batch_label(batch, project.get("name", ""))
         with st.expander(
-            f"📦 {batch_label}  ·  共{len(items)}篇（✅{approved} ⏳{pending} ✏️{revision}）"
+            f"📦 {batch_label}  ·  共{counts['total']}篇"
+            f"（✅{counts['approved']} ⏳{counts['pending']} ✏️{counts['needs_revision']}）"
         ):
             col1, col2 = st.columns(2)
             with col1:
@@ -753,7 +765,7 @@ def page_history(project: dict) -> None:
                 st.markdown(f"**目标人群：** {batch_params.get('target_audience', '—')}")
                 st.markdown(f"**核心卖点：** {batch_params.get('key_messages', '—')}")
 
-            if items:
+            if counts['total'] > 0:
                 if st.button("查看此批次", key=f"view_batch_{batch['id']}"):
                     st.session_state["review_batch_id"] = batch["id"]
                     st.rerun()

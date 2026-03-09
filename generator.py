@@ -74,7 +74,9 @@ def _make_user_prompt(
     tone: str = "",
     extra: str = "",
 ) -> str:
-    parts: list[str] = [f"战术方向：{tactic}"]
+    parts: list[str] = []
+    if tactic:
+        parts.append(f"战术方向：{tactic}")
     if target_audience:
         parts.append(f"目标人群：{target_audience}")
     if key_messages:
@@ -253,6 +255,8 @@ class ClaudeEngine:
         images: Optional[list[dict]] = None,
     ) -> GenerationResult:
         """Continue a multi-turn conversation for iterative refinement."""
+        # Make a shallow copy to avoid mutating caller's data
+        messages = [m.copy() for m in messages]
         # Append images to last user message if provided
         if images and messages and messages[-1]["role"] == "user":
             last_content = messages[-1]["content"]

@@ -301,6 +301,31 @@ def get_latest_version(client: Client, item_id: str) -> Optional[dict]:
     return res.data[0] if res.data else None
 
 
+def get_batch_item_counts(client: Client, batch_ids: list[str]) -> dict:
+    """
+    Fetch item counts by status for multiple batches in a single query.
+    Returns {batch_id: {"total": N, "approved": N, "pending": N, "needs_revision": N}}
+    """
+    if not batch_ids:
+        return {}
+    res = (
+        client.table("items")
+        .select("batch_id, status")
+        .in_("batch_id", batch_ids)
+        .execute()
+    )
+    counts: dict[str, dict] = {}
+    for row in (res.data or []):
+        bid = row["batch_id"]
+        if bid not in counts:
+            counts[bid] = {"total": 0, "approved": 0, "pending": 0, "needs_revision": 0}
+        counts[bid]["total"] += 1
+        status = row.get("status", "pending")
+        if status in counts[bid]:
+            counts[bid][status] += 1
+    return counts
+
+
 def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
     """Fetch recent approved/pending version titles for deduplication across batches."""
     # Get recent batches for this project
