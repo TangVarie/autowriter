@@ -170,10 +170,14 @@ def page_generate(project: dict) -> None:
         )
 
         if engine_mode == "单引擎":
+            engine_labels = {
+                "claude": f"Claude ({config.CLAUDE_MODEL})",
+                "gemini": f"Gemini ({config.GEMINI_MODEL})",
+            }
             selected_engine_raw = st.selectbox(
                 "选择引擎",
                 gen_module.AVAILABLE_ENGINES,
-                format_func=lambda e: e.upper(),
+                format_func=lambda e: engine_labels.get(e, e.upper()),
             )
             engines = [selected_engine_raw]
         else:
@@ -181,6 +185,20 @@ def page_generate(project: dict) -> None:
             if len(engines) < 2:
                 st.warning("Gemini 未配置，将仅使用 Claude。")
                 engines = ["claude"]
+
+        # Extended Thinking — only for Claude
+        use_thinking = False
+        if "claude" in engines:
+            use_thinking = st.checkbox(
+                "启用 Extended Thinking",
+                value=False,
+                help=(
+                    f"开启后使用 {config.CLAUDE_THINKING_MODEL} 模型进行深度推理，"
+                    "生成质量更高但速度慢、费用更高。"
+                ),
+            )
+            if use_thinking:
+                st.caption(f"模型: `{config.CLAUDE_THINKING_MODEL}`，max_tokens=16000")
 
         with st.expander("⚙️ 高级参数"):
             target_audience = st.text_input("目标人群", placeholder="例：25-35岁职场女性")
@@ -221,6 +239,7 @@ def page_generate(project: dict) -> None:
             "key_messages": key_messages,
             "tone": tone,
             "extra_instructions": extra_instructions,
+            "use_thinking": use_thinking,
         }
         batch = db.create_batch(
             db_client, user_id,
@@ -254,6 +273,7 @@ def page_generate(project: dict) -> None:
                 images=encoded_images or None,
                 progress_callback=update_progress,
                 historical_titles=historical_titles or None,
+                use_thinking=use_thinking,
             )
         except Exception as e:
             st.error(f"生成失败：{e}")
@@ -626,13 +646,15 @@ def _run_iteration(
 
     original_user_prompt = gen_module.reconstruct_user_prompt(batch_params, tactic)
 
-    with st.spinner(f"正在用 {engine_name.upper()} 迭代…"):
+    iter_use_thinking = batch_params.get("use_thinking", False) if isinstance(batch_params, dict) else False
+    with st.spinner(f"正在用 {engine_name.upper()}{'（深度思考）' if iter_use_thinking and engine_name == 'claude' else ''} 迭代…"):
         result = gen_module.iterate_copy(
             system_prompt=full_system_prompt,
             original_user_prompt=original_user_prompt,
             version_history=versions,
             feedback=feedback,
             engine_name=engine_name,
+            use_thinking=iter_use_thinking,
         )
 
     if result.error:

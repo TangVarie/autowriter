@@ -91,84 +91,124 @@ def _make_user_prompt(
     return _BASE_USER_PROMPT.format(extra_instructions=extra_text)
 
 
+# ── Anthropic retry helper ─────────────────────────────────────────────────
+
+def _call_with_retry(call_fn, max_retries: int = 4):
+    """
+    Call an Anthropic API callable with exponential backoff.
+    Retries on rate-limit (429) and overload (529) errors.
+    """
+    delay = 2
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            return call_fn()
+        except anthropic.RateLimitError as e:
+            last_error = e
+        except anthropic.APIStatusError as e:
+            if e.status_code in (529, 503):  # overload / service unavailable
+                last_error = e
+            else:
+                raise
+        if attempt < max_retries:
+            time.sleep(delay)
+            delay = min(delay * 2, 32)
+    raise last_error  # type: ignore[misc]
+
+
 # ── JSON parsing helper ────────────────────────────────────────────────────
+
+def _fix_json_newlines(s: str) -> str:
+    """Escape bare newlines/tabs inside JSON string values (common AI output bug)."""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in s:
+        if escaped:
+            result.append(ch)
+            escaped = False
+        elif ch == '\\' and in_string:
+            result.append(ch)
+            escaped = True
+        elif ch == '"':
+            result.append(ch)
+            in_string = not in_string
+        elif in_string and ch == '\n':
+            result.append('\\n')
+        elif in_string and ch == '\r':
+            result.append('\\r')
+        elif in_string and ch == '\t':
+            result.append('\\t')
+        else:
+            result.append(ch)
+    return ''.join(result)
+
+
+def _try_parse_dict(s: str, ai_engine: str, raw_text: str) -> Optional["GenerationResult"]:
+    """Attempt to parse a string as a JSON dict into a GenerationResult. Returns None on failure."""
+    try:
+        data = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        # Try fixing bare newlines inside string values
+        try:
+            data = json.loads(_fix_json_newlines(s))
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(data, dict):
+        return None
+    keywords = data.get("keywords", [])
+    if isinstance(keywords, str):
+        keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
+    return GenerationResult(
+        title=str(data.get("title", "")).strip(),
+        body=str(data.get("body", "")).strip(),
+        keywords=keywords,
+        ai_engine=ai_engine,
+        raw_text=raw_text,
+    )
+
 
 def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
     """
     Extract and parse JSON from AI output.
     Handles: raw JSON, ```json blocks, partial wrapping text,
-    JSON wrapped in quotes, trailing whitespace/quotes.
+    JSON wrapped in outer quotes, bare newlines inside string values.
     """
     # Step 1: strip markdown code fences
     stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
 
-    # Step 1.5: strip outer quotes if the whole thing is a quoted string
-    # e.g. '"{  \"title\": ...}  "'
-    for candidate in (stripped, text.strip()):
-        if (candidate.startswith('"') and candidate.endswith('"')) or \
-           (candidate.startswith("'") and candidate.endswith("'")):
-            unquoted = candidate[1:-1].strip()
-            # Try to parse the unquoted version
-            try:
-                data = json.loads(unquoted)
-                if isinstance(data, dict):
-                    keywords = data.get("keywords", [])
-                    if isinstance(keywords, str):
-                        keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
-                    return GenerationResult(
-                        title=str(data.get("title", "")).strip(),
-                        body=str(data.get("body", "")).strip(),
-                        keywords=keywords,
-                        ai_engine=ai_engine,
-                        raw_text=text,
-                    )
-            except (json.JSONDecodeError, ValueError):
-                pass
-
-    # Step 2: try each candidate source for a JSON object
+    # Step 2: extract the {...} block and try to parse it (with and without newline fix)
     for src in (stripped, text):
         start = src.find('{')
         end = src.rfind('}')
-        if start != -1 and end > start:
-            json_str = src[start:end + 1]
-            # Try parsing directly
-            try:
-                data = json.loads(json_str)
-                keywords = data.get("keywords", [])
-                if isinstance(keywords, str):
-                    keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
-                return GenerationResult(
-                    title=str(data.get("title", "")).strip(),
-                    body=str(data.get("body", "")).strip(),
-                    keywords=keywords,
-                    ai_engine=ai_engine,
-                    raw_text=text,
-                )
-            except (json.JSONDecodeError, ValueError):
-                # Try fixing common issues: escaped quotes, control chars
-                try:
-                    # Replace escaped newlines that aren't properly escaped
-                    fixed = json_str.replace('\r\n', '\\n').replace('\r', '\\n')
-                    data = json.loads(fixed)
-                    keywords = data.get("keywords", [])
-                    if isinstance(keywords, str):
-                        keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
-                    return GenerationResult(
-                        title=str(data.get("title", "")).strip(),
-                        body=str(data.get("body", "")).strip(),
-                        keywords=keywords,
-                        ai_engine=ai_engine,
-                        raw_text=text,
-                    )
-                except (json.JSONDecodeError, ValueError):
-                    continue
+        if start == -1 or end <= start:
+            # No {} block found — maybe outer quotes wrap everything
+            # Strip one level of outer quotes and retry
+            for q in ('"', "'"):
+                s = src.strip()
+                if s.startswith(q) and s.endswith(q) and len(s) > 1:
+                    inner = s[1:-1].strip()
+                    inner_start = inner.find('{')
+                    inner_end = inner.rfind('}')
+                    if inner_start != -1 and inner_end > inner_start:
+                        src = inner
+                        start = inner_start
+                        end = inner_end
+                        break
+            else:
+                continue
+
+        json_str = src[start:end + 1]
+        result = _try_parse_dict(json_str, ai_engine, text)
+        if result is not None:
+            return result
 
     # Step 3: fallback — extract fields from plain Chinese text
     title_match = re.search(r'标题[：:「【]\s*(.+?)[\n」】]', text)
     body_match = re.search(r'正文[：:「【]\s*([\s\S]+?)(?:关键词[：:]|$)', text)
     kw_match = re.search(r'关键词[：:「【]\s*(.+)', text)
     if title_match or body_match:
-        keywords = []
+        keywords: list[str] = []
         if kw_match:
             kw_raw = kw_match.group(1).strip()
             keywords = [k.lstrip('#').strip() for k in re.split(r'[,，、\s#]+', kw_raw) if k.strip()]
@@ -194,6 +234,14 @@ def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
 
 # ── Claude engine ──────────────────────────────────────────────────────────
 
+def _extract_text_from_response(response) -> str:
+    """Extract the first text block, skipping thinking blocks."""
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    return ""
+
+
 class ClaudeEngine:
     def __init__(self) -> None:
         if not config.ANTHROPIC_API_KEY:
@@ -217,25 +265,35 @@ class ClaudeEngine:
         content.append({"type": "text", "text": text})
         return content
 
+    def _make_params(self, use_thinking: bool) -> dict:
+        if use_thinking:
+            return {
+                "model": config.CLAUDE_THINKING_MODEL,
+                "max_tokens": 16000,
+                "thinking": {"type": "enabled", "budget_tokens": 8000},
+            }
+        return {
+            "model": config.CLAUDE_MODEL,
+            "max_tokens": 2048,
+        }
+
     def generate(
         self,
         system_prompt: str,
         user_prompt: str,
         images: Optional[list[dict]] = None,
+        use_thinking: bool = False,
     ) -> GenerationResult:
-        try:
-            response = self._client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=2048,
+        params = self._make_params(use_thinking)
+        def _call():
+            return self._client.messages.create(
+                **params,
                 system=system_prompt,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": self._build_content(user_prompt, images),
-                    }
-                ],
+                messages=[{"role": "user", "content": self._build_content(user_prompt, images)}],
             )
-            text = response.content[0].text
+        try:
+            response = _call_with_retry(_call)
+            text = _extract_text_from_response(response)
             result = _parse_copy_json(text, "claude")
             result.token_usage = {
                 "input": response.usage.input_tokens,
@@ -253,23 +311,24 @@ class ClaudeEngine:
         messages: list[dict],
         system_prompt: str,
         images: Optional[list[dict]] = None,
+        use_thinking: bool = False,
     ) -> GenerationResult:
         """Continue a multi-turn conversation for iterative refinement."""
-        # Make a shallow copy to avoid mutating caller's data
         messages = [m.copy() for m in messages]
-        # Append images to last user message if provided
         if images and messages and messages[-1]["role"] == "user":
             last_content = messages[-1]["content"]
             if isinstance(last_content, str):
                 messages[-1]["content"] = self._build_content(last_content, images)
-        try:
-            response = self._client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=2048,
+        params = self._make_params(use_thinking)
+        def _call():
+            return self._client.messages.create(
+                **params,
                 system=system_prompt,
                 messages=messages,
             )
-            text = response.content[0].text
+        try:
+            response = _call_with_retry(_call)
+            text = _extract_text_from_response(response)
             result = _parse_copy_json(text, "claude")
             result.token_usage = {
                 "input": response.usage.input_tokens,
@@ -311,6 +370,7 @@ class GeminiEngine:
         system_prompt: str,
         user_prompt: str,
         images: Optional[list[dict]] = None,
+        use_thinking: bool = False,  # accepted but ignored for Gemini
     ) -> GenerationResult:
         try:
             response = self._client.models.generate_content(
@@ -318,11 +378,17 @@ class GeminiEngine:
                 contents=self._build_parts(user_prompt, images),
                 config=genai_types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=2048,
+                    max_output_tokens=4096,
                 ),
             )
             text = response.text or ""
             result = _parse_copy_json(text, "gemini")
+            usage = getattr(response, "usage_metadata", None)
+            if usage:
+                result.token_usage = {
+                    "input": getattr(usage, "prompt_token_count", 0),
+                    "output": getattr(usage, "candidates_token_count", 0),
+                }
             return result
         except Exception as e:
             return GenerationResult(
@@ -335,22 +401,20 @@ class GeminiEngine:
         messages: list[dict],
         system_prompt: str,
         images: Optional[list[dict]] = None,
+        use_thinking: bool = False,  # accepted but ignored for Gemini
     ) -> GenerationResult:
         """Convert messages history to Gemini multi-turn format and continue."""
         try:
-            # Build Gemini conversation history
             history = []
             for msg in messages[:-1]:
                 role = "user" if msg["role"] == "user" else "model"
                 content = msg["content"]
                 if isinstance(content, list):
-                    # Extract text from content blocks
                     content = " ".join(
                         b.get("text", "") for b in content if b.get("type") == "text"
                     )
                 history.append({"role": role, "parts": [content]})
 
-            # Last message is the current user turn
             last_msg = messages[-1]
             last_text = last_msg["content"]
             if isinstance(last_text, list):
@@ -363,11 +427,17 @@ class GeminiEngine:
                 contents=history + [{"role": "user", "parts": self._build_parts(last_text, images)}],
                 config=genai_types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    max_output_tokens=2048,
+                    max_output_tokens=4096,
                 ),
             )
             text = response.text or ""
             result = _parse_copy_json(text, "gemini")
+            usage = getattr(response, "usage_metadata", None)
+            if usage:
+                result.token_usage = {
+                    "input": getattr(usage, "prompt_token_count", 0),
+                    "output": getattr(usage, "candidates_token_count", 0),
+                }
             return result
         except Exception as e:
             return GenerationResult(
@@ -442,6 +512,7 @@ def generate_batch(
     images: Optional[list[dict]] = None,
     progress_callback=None,
     historical_titles: list[str] | None = None,
+    use_thinking: bool = False,
 ) -> list[dict]:
     """
     Generate `count` copy items using specified engines.
@@ -489,6 +560,7 @@ def generate_batch(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     images=images,
+                    use_thinking=(use_thinking and engine_name == "claude"),
                 )
             except Exception as e:
                 result = GenerationResult(
@@ -582,6 +654,7 @@ def iterate_copy(
     feedback: str,
     engine_name: str = "claude",
     images: Optional[list[dict]] = None,
+    use_thinking: bool = False,
 ) -> GenerationResult:
     """Refine a copy item based on feedback."""
     messages = build_iteration_messages(
@@ -589,7 +662,12 @@ def iterate_copy(
     )
     try:
         engine = get_engine(engine_name)
-        return engine.iterate(messages, system_prompt=system_prompt, images=images)
+        return engine.iterate(
+            messages,
+            system_prompt=system_prompt,
+            images=images,
+            use_thinking=(use_thinking and engine_name == "claude"),
+        )
     except Exception as e:
         return GenerationResult(
             title="", body="", keywords=[], ai_engine=engine_name,

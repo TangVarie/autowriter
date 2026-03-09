@@ -25,9 +25,12 @@ ANTHROPIC_API_KEY: str = _get_secret("ANTHROPIC_API_KEY")
 # Default Claude model for content generation
 CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"
 
+# Claude model used when Extended Thinking is enabled
+CLAUDE_THINKING_MODEL: str = _get_secret("CLAUDE_THINKING_MODEL") or "claude-3-7-sonnet-20250219"
+
 # ── Google Gemini ──────────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
-GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-2.0-flash"
+GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-2.5-pro"
 
 # ── Supabase ───────────────────────────────────────────────────────────────
 SUPABASE_URL: str = _get_secret("SUPABASE_URL")
