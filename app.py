@@ -237,6 +237,9 @@ def page_generate(project: dict) -> None:
         def update_progress(pct: float, msg: str) -> None:
             progress_bar.progress(pct, text=msg)
 
+        # Load historical titles for cross-batch dedup
+        historical_titles = db.get_recent_titles(db_client, project["id"])
+
         # Generate
         try:
             generation_results = gen_module.generate_batch(
@@ -250,6 +253,7 @@ def page_generate(project: dict) -> None:
                 extra_instructions=extra_instructions,
                 images=encoded_images or None,
                 progress_callback=update_progress,
+                historical_titles=historical_titles or None,
             )
         except Exception as e:
             st.error(f"生成失败：{e}")

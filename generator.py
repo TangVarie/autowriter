@@ -394,6 +394,35 @@ AVAILABLE_ENGINES: list[str] = ["claude"] + (["gemini"] if _GEMINI_AVAILABLE els
 
 # ── Batch generation ───────────────────────────────────────────────────────
 
+def _build_dedup_instruction(
+    generated_summaries: list[str],
+    historical_titles: list[str] | None = None,
+) -> str:
+    """Build a dedup instruction listing previously generated angles to avoid."""
+    lines: list[str] = []
+
+    if historical_titles:
+        lines.append("【历史已有文案标题（跨批次），请避免相似角度】")
+        for t in historical_titles[-20:]:  # limit to last 20
+            lines.append(f"- {t}")
+
+    if generated_summaries:
+        lines.append("【本批次已生成的文案，你必须选择完全不同的切入角度、场景和标题风格】")
+        for s in generated_summaries:
+            lines.append(f"- {s}")
+
+    if not lines:
+        return ""
+
+    lines.append(
+        "\n⚠️ 重要：以上每一篇都是已有内容。"
+        "你这次必须用全新的场景、情绪、人物、标题句式来写，"
+        "不要重复任何已有的角度、开头方式或叙事结构。"
+        "尽量差异化。"
+    )
+    return "\n".join(lines)
+
+
 def generate_batch(
     system_prompt: str,
     tactic: str,
@@ -405,6 +434,7 @@ def generate_batch(
     extra_instructions: str = "",
     images: Optional[list[dict]] = None,
     progress_callback=None,
+    historical_titles: list[str] | None = None,
 ) -> list[dict]:
     """
     Generate `count` copy items using specified engines.
@@ -412,13 +442,16 @@ def generate_batch(
     For multi-engine mode (len(engines) > 1), each slot gets one version
     per engine. For single-engine mode, each slot gets one version.
 
+    Uses accumulated context to ensure each piece differs from previous ones
+    within the batch and optionally from historical titles.
+
     Returns a list of dicts, each with:
         {
           "versions": [GenerationResult, ...],  # one per engine
           "tactic": str,
         }
     """
-    user_prompt = _make_user_prompt(
+    base_user_prompt = _make_user_prompt(
         tactic=tactic,
         target_audience=target_audience,
         key_messages=key_messages,
@@ -430,7 +463,17 @@ def generate_batch(
     total = count * len(engines)
     done = 0
 
+    # Accumulate summaries of what we've generated so far for dedup
+    generated_summaries: list[str] = []
+
     for i in range(count):
+        # Build dedup-enhanced prompt
+        dedup_block = _build_dedup_instruction(generated_summaries, historical_titles)
+        if dedup_block:
+            user_prompt = base_user_prompt + "\n\n" + dedup_block
+        else:
+            user_prompt = base_user_prompt
+
         slot_versions: list[GenerationResult] = []
         for engine_name in engines:
             try:
@@ -451,6 +494,13 @@ def generate_batch(
                 progress_callback(done / total, f"正在生成第 {i+1}/{count} 篇…")
             # Small delay to avoid rate limiting
             time.sleep(0.2)
+
+        # Record what we generated for dedup in subsequent pieces
+        for v in slot_versions:
+            if v.success and v.title:
+                # title + first ~30 chars of body as angle summary
+                body_preview = v.body[:50].split("\n")[0] if v.body else ""
+                generated_summaries.append(f"「{v.title}」— {body_preview}")
 
         results.append({"versions": slot_versions, "tactic": tactic})
 

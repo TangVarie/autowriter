@@ -301,6 +301,27 @@ def get_latest_version(client: Client, item_id: str) -> Optional[dict]:
     return res.data[0] if res.data else None
 
 
+def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
+    """Fetch recent approved/pending version titles for deduplication across batches."""
+    # Get recent batches for this project
+    batches = list_batches(client, project_id, limit=10)
+    if not batches:
+        return []
+    batch_ids = [b["id"] for b in batches]
+
+    titles: list[str] = []
+    for bid in batch_ids:
+        items = list_items(client, bid)
+        for item in items:
+            for v in item.get("versions", []):
+                t = v.get("title", "")
+                if t and t != "（解析失败）":
+                    titles.append(t)
+        if len(titles) >= limit:
+            break
+    return titles[:limit]
+
+
 # ── Memory CRUD ────────────────────────────────────────────────────────────
 
 def list_memories(
