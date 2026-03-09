@@ -10,6 +10,7 @@ from __future__ import annotations
 import html as _html
 import json
 import re
+import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -25,6 +26,174 @@ import image_handler
 import exporter
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+# ── Generation Queue ────────────────────────────────────────────────────────
+
+def _queue_worker(
+    plans: list[dict],
+    user_id: str,
+    db_client,
+    status: dict,
+    stop_event: threading.Event,
+) -> None:
+    """Background daemon thread: executes queued generation plans sequentially."""
+    status["running"] = True
+    status["done"] = False
+    status["total"] = len(plans)
+    status.setdefault("completed", [])
+    status.setdefault("errors", [])
+
+    for idx, plan in enumerate(plans):
+        if stop_event.is_set():
+            status["message"] = f"已停止（完成 {len(status['completed'])}/{len(plans)}）"
+            break
+
+        proj_name = plan.get("project_name", f"计划{idx+1}")
+        tactic    = plan.get("tactic", "")
+        status["current"] = idx
+        status["message"] = f"计划 {idx+1}/{len(plans)} — {proj_name} · {tactic or '通用'}"
+
+        try:
+            project_id = plan["project_id"]
+            all_projects = db.list_projects(db_client, user_id)
+            project = next((p for p in all_projects if p["id"] == project_id), None)
+            if not project:
+                status["errors"].append(f"计划 {idx+1}：找不到项目 {project_id}")
+                continue
+
+            base_prompt = project.get("system_prompt", "")
+            if not base_prompt.strip():
+                status["errors"].append(f"计划 {idx+1}：项目未配置 System Prompt")
+                continue
+
+            tactic_suffix  = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
+            global_mems, project_mems = db.get_confirmed_memories(
+                db_client, user_id, project_id=project_id
+            )
+            full_system_prompt = mem_module.build_system_prompt(
+                base_prompt=base_prompt,
+                global_memories=global_mems,
+                project_memories=project_mems,
+                tactic_suffix=tactic_suffix,
+            )
+
+            engines          = plan.get("engines", ["claude"])
+            count            = plan.get("count", 1)
+            engine_models    = plan.get("engine_models", {})
+            use_thinking     = plan.get("use_thinking", False)
+            gemini_thinking  = plan.get("gemini_use_thinking", False)
+            extra_instr      = plan.get("extra_instructions", "")
+
+            batch_params = {
+                "target_audience":  plan.get("target_audience", ""),
+                "key_messages":     plan.get("key_messages", ""),
+                "tone":             plan.get("tone", ""),
+                "extra_instructions": extra_instr,
+                "use_thinking":     use_thinking,
+                "gemini_use_thinking": gemini_thinking,
+                "engine_models":    engine_models,
+            }
+            batch = db.create_batch(
+                db_client, user_id,
+                project_id=project_id,
+                tactic=tactic or "通用",
+                params=batch_params,
+                ai_engines=engines,
+            )
+            batch_id = batch["id"]
+            historical_titles = db.get_recent_titles(db_client, project_id)
+
+            _total   = count * len(engines)
+            _done_n  = [0]
+            def _progress(pct: float, msg: str, _idx=idx, _n=len(plans), _t=_total) -> None:
+                status["message"] = f"计划 {_idx+1}/{_n} — {msg}"
+
+            generation_results = gen_module.generate_batch(
+                system_prompt=full_system_prompt,
+                tactic=tactic,
+                count=count,
+                engines=engines,
+                target_audience=plan.get("target_audience", ""),
+                key_messages=plan.get("key_messages", ""),
+                tone=plan.get("tone", ""),
+                extra_instructions=extra_instr,
+                images=None,
+                progress_callback=_progress,
+                historical_titles=historical_titles or None,
+                use_thinking=use_thinking,
+                engine_models=engine_models or None,
+                gemini_use_thinking=gemini_thinking,
+            )
+
+            saved = 0
+            for slot in generation_results:
+                item = db.create_item(db_client, user_id, batch_id)
+                for vr in slot["versions"]:
+                    if vr.error and not vr.title:
+                        continue
+                    db.create_version(
+                        db_client,
+                        item_id=item["id"],
+                        ai_engine=vr.ai_engine,
+                        title=vr.title,
+                        body=vr.body,
+                        keywords=vr.keywords,
+                        token_usage=vr.token_usage,
+                    )
+                    saved += 1
+
+            status["completed"].append({
+                "plan_idx":    idx,
+                "batch_id":    batch_id,
+                "project_name": proj_name,
+                "saved":       saved,
+            })
+
+        except Exception as exc:
+            status["errors"].append(f"计划 {idx+1}：{exc}")
+
+    status["running"] = False
+    status["done"]    = True
+    if not stop_event.is_set():
+        n_ok  = len(status["completed"])
+        n_err = len(status["errors"])
+        status["message"] = f"全部完成 ✓ {n_ok} 计划成功" + (f"，{n_err} 失败" if n_err else "")
+
+
+def _queue_banner() -> None:
+    """Render a sticky progress banner when a queue is running or just finished."""
+    qs = st.session_state.get("queue_state")
+    if not qs:
+        return
+    completed = len(qs.get("completed", []))
+    total     = qs.get("total", 0)
+    msg       = qs.get("message", "")
+    errors    = qs.get("errors", [])
+
+    if qs.get("running"):
+        banner = st.container()
+        with banner:
+            bcol_txt, bcol_btn = st.columns([5, 1])
+            with bcol_txt:
+                st.info(f"🔄 队列生成中 ({completed}/{total}) — {msg}")
+            with bcol_btn:
+                if st.button("⏹ 停止", key="global_stop_queue", use_container_width=True):
+                    evt = st.session_state.get("queue_stop_event")
+                    if evt:
+                        evt.set()
+    elif qs.get("done"):
+        bcol_txt, bcol_btn = st.columns([5, 1])
+        with bcol_txt:
+            if errors:
+                st.warning(f"✅ 队列完成 — {completed}/{total} 成功，{len(errors)} 失败：" + "；".join(errors))
+            else:
+                st.success(f"✅ 队列完成！{completed} 个批次已保存 — {msg}")
+        with bcol_btn:
+            if st.button("清除", key="clear_queue_status", use_container_width=True):
+                st.session_state.pop("queue_state", None)
+                st.session_state.pop("queue_stop_event", None)
+                st.rerun()
 
 
 def _format_batch_label(batch: dict, project_name: str = "") -> str:
@@ -555,6 +724,9 @@ with st.sidebar:
     page = _NAV_ITEMS[_nav_choice]
 
 
+# ── Global queue banner ────────────────────────────────────────────────────
+_queue_banner()
+
 # ── Route to pages ─────────────────────────────────────────────────────────
 
 if selected_project is None and page not in ("项目设置",):
@@ -577,16 +749,197 @@ def _page_header(icon: str, title: str, subtitle: str = "") -> None:
     )
 
 
+def _render_queue_tab() -> None:
+    """Render the batch queue builder and executor UI."""
+    st.markdown(
+        "<div class='section-label'>批次队列</div>"
+        "<p style='font-size:0.85rem;color:var(--text-2);margin-top:4px;margin-bottom:16px'>"
+        "添加多个生成计划，点击「启动队列」后在后台依次执行，切换页面不影响生成。</p>",
+        unsafe_allow_html=True,
+    )
+
+    # Load projects for the dropdown
+    all_projects = db.list_projects(db_client, user_id)
+    if not all_projects:
+        st.info("暂无项目，请先在「项目设置」中创建项目。")
+        return
+
+    proj_id_to_obj  = {p["id"]: p for p in all_projects}
+    proj_id_to_name = {p["id"]: p.get("name", "未命名") for p in all_projects}
+    proj_ids        = list(proj_id_to_obj.keys())
+
+    # Session state
+    st.session_state.setdefault("gen_queue_plans", [])
+    plans: list[dict] = st.session_state["gen_queue_plans"]
+    qs = st.session_state.get("queue_state", {})
+    is_running = qs.get("running", False)
+
+    # ── Plan list ──────────────────────────────────────────────────────
+    plans_to_delete: list[int] = []
+    for i, plan in enumerate(plans):
+        with st.expander(
+            f"计划 {i+1} — {plan.get('project_name', '?')} · "
+            f"{plan.get('tactic', '通用') or '通用'} · "
+            f"{'/'.join(e.upper() for e in plan.get('engines', ['claude']))} · "
+            f"{plan.get('count', 1)} 篇",
+            expanded=(i == len(plans) - 1),
+        ):
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                sel_pid = st.selectbox(
+                    "项目", proj_ids,
+                    format_func=lambda pid: proj_id_to_name.get(pid, pid),
+                    index=proj_ids.index(plan["project_id"]) if plan["project_id"] in proj_ids else 0,
+                    key=f"qp_proj_{i}",
+                )
+                plan["project_id"]   = sel_pid
+                plan["project_name"] = proj_id_to_name.get(sel_pid, "")
+
+                sel_proj = proj_id_to_obj.get(sel_pid, {})
+                plan_tactic_names = proj_module.get_tactic_names(sel_proj)
+                tactic_opts = ["（无）"] + plan_tactic_names
+                t_idx = tactic_opts.index(plan.get("tactic", "（无）")) if plan.get("tactic", "（无）") in tactic_opts else 0
+                sel_tactic = st.selectbox("战术方向", tactic_opts, index=t_idx, key=f"qp_tactic_{i}")
+                plan["tactic"] = "" if sel_tactic == "（无）" else sel_tactic
+
+            with pc2:
+                plan["count"] = st.number_input(
+                    "篇数", min_value=1, max_value=config.MAX_GENERATION_COUNT,
+                    value=plan.get("count", 3), key=f"qp_count_{i}",
+                )
+                q_eng_mode = st.radio(
+                    "引擎", ["单引擎", "多引擎"], horizontal=True, key=f"qp_eng_mode_{i}",
+                )
+                if q_eng_mode == "单引擎":
+                    q_eng = st.selectbox(
+                        "选择引擎", gen_module.AVAILABLE_ENGINES,
+                        format_func=lambda e: "Claude" if e == "claude" else "Gemini",
+                        key=f"qp_eng_{i}",
+                    )
+                    plan["engines"] = [q_eng]
+                else:
+                    plan["engines"] = gen_module.AVAILABLE_ENGINES[:2] or ["claude"]
+
+            q_em: dict[str, str] = {}
+            qm1, qm2 = st.columns(2)
+            if "claude" in plan["engines"]:
+                with qm1:
+                    q_em["claude"] = st.selectbox(
+                        "Claude 模型", list(config.CLAUDE_MODELS.keys()),
+                        format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
+                        index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
+                              if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
+                        key=f"qp_cm_{i}",
+                    )
+            if "gemini" in plan["engines"]:
+                with qm2:
+                    q_em["gemini"] = st.selectbox(
+                        "Gemini 模型", list(config.GEMINI_MODELS.keys()),
+                        format_func=lambda m: config.GEMINI_MODELS.get(m, m),
+                        index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
+                              if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
+                        key=f"qp_gm_{i}",
+                    )
+            plan["engine_models"] = q_em
+
+            qt1, qt2 = st.columns(2)
+            with qt1:
+                plan["use_thinking"] = st.checkbox(
+                    "Claude Thinking", value=plan.get("use_thinking", False), key=f"qp_think_{i}"
+                )
+            with qt2:
+                plan["gemini_use_thinking"] = st.checkbox(
+                    "Gemini 思考", value=plan.get("gemini_use_thinking", False), key=f"qp_gthink_{i}"
+                )
+
+            plan["extra_instructions"] = st.text_input(
+                "补充说明", value=plan.get("extra_instructions", ""),
+                placeholder="可选", key=f"qp_extra_{i}",
+            )
+
+            if st.button("🗑 删除此计划", key=f"qp_del_{i}"):
+                plans_to_delete.append(i)
+
+    for idx in sorted(plans_to_delete, reverse=True):
+        plans.pop(idx)
+    if plans_to_delete:
+        st.rerun()
+
+    # ── Controls ───────────────────────────────────────────────────────
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        if st.button("➕ 添加计划", use_container_width=True, disabled=is_running):
+            default_pid = proj_ids[0]
+            plans.append({
+                "project_id":       default_pid,
+                "project_name":     proj_id_to_name.get(default_pid, ""),
+                "tactic":           "",
+                "engines":          ["claude"],
+                "engine_models":    {"claude": config.CLAUDE_MODEL},
+                "count":            3,
+                "use_thinking":     False,
+                "gemini_use_thinking": False,
+                "extra_instructions": "",
+            })
+            st.rerun()
+
+    with btn_col2:
+        if not is_running:
+            if st.button(
+                "🚀 启动队列", type="primary", use_container_width=True,
+                disabled=(not plans),
+            ):
+                stop_evt = threading.Event()
+                status: dict = {
+                    "running": False, "done": False, "total": 0,
+                    "current": 0, "message": "准备中…",
+                    "completed": [], "errors": [],
+                }
+                st.session_state["queue_state"]      = status
+                st.session_state["queue_stop_event"] = stop_evt
+                t = threading.Thread(
+                    target=_queue_worker,
+                    args=(list(plans), user_id, db_client, status, stop_evt),
+                    daemon=True,
+                )
+                t.start()
+                st.rerun()
+        else:
+            if st.button("⏹ 停止队列", use_container_width=True):
+                evt = st.session_state.get("queue_stop_event")
+                if evt:
+                    evt.set()
+                st.rerun()
+
+    # Live status within tab
+    if is_running:
+        completed = len(qs.get("completed", []))
+        total     = qs.get("total", 0)
+        st.progress(
+            completed / total if total else 0,
+            text=qs.get("message", "生成中…"),
+        )
+        st.caption("生成在后台运行，可切换到其他页面。")
+
+    # Completed results summary
+    if qs.get("done") and qs.get("completed"):
+        st.markdown("<div class='section-label' style='margin-top:16px'>已完成的批次</div>", unsafe_allow_html=True)
+        for item in qs["completed"]:
+            st.success(
+                f"✅ {item['project_name']} · 批次 {item['batch_id'][:8]}… · "
+                f"已保存 {item['saved']} 个版本"
+            )
+
+
 def page_generate(project: dict) -> None:
     pname = _html.escape(project.get("name", ""))
     _page_header("✍️", "生成工作台", f"项目：{pname}")
 
     project_name = project.get("name", "")
-    brand = project.get("brand", "")
-    base_prompt = project.get("system_prompt", "")
+    base_prompt  = project.get("system_prompt", "")
     tactic_names = proj_module.get_tactic_names(project)
 
-    # ── Left panel: generation controls ────────────────────────────────
+    # ── Sidebar: quick-generate controls ──────────────────────────────
     with st.sidebar:
         st.markdown("### 生成参数")
 
@@ -604,197 +957,174 @@ def page_generate(project: dict) -> None:
             ["单引擎", "多引擎比稿"],
             help="多引擎比稿会同时用 Claude 和 Gemini 生成，便于对比。",
         )
-
         if engine_mode == "单引擎":
-            selected_engine_raw = st.selectbox(
-                "引擎",
-                gen_module.AVAILABLE_ENGINES,
+            engines = [st.selectbox(
+                "引擎", gen_module.AVAILABLE_ENGINES,
                 format_func=lambda e: "Claude" if e == "claude" else "Gemini",
-            )
-            engines = [selected_engine_raw]
+            )]
         else:
             engines = gen_module.AVAILABLE_ENGINES[:2]
             if len(engines) < 2:
                 st.warning("Gemini 未配置，将仅使用 Claude。")
                 engines = ["claude"]
 
-        # Per-engine model selectors
         engine_models: dict[str, str] = {}
-
         if "claude" in engines:
-            claude_model = st.selectbox(
-                "Claude 模型",
-                list(config.CLAUDE_MODELS.keys()),
+            engine_models["claude"] = st.selectbox(
+                "Claude 模型", list(config.CLAUDE_MODELS.keys()),
                 index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
                       if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
                 format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
             )
-            engine_models["claude"] = claude_model
-
         if "gemini" in engines:
-            gemini_model = st.selectbox(
-                "Gemini 模型",
-                list(config.GEMINI_MODELS.keys()),
+            engine_models["gemini"] = st.selectbox(
+                "Gemini 模型", list(config.GEMINI_MODELS.keys()),
                 index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
                       if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
                 format_func=lambda m: config.GEMINI_MODELS.get(m, m),
             )
-            engine_models["gemini"] = gemini_model
 
-        # Thinking mode toggles
-        use_thinking = False         # Claude Extended Thinking
-        gemini_use_thinking = False  # Gemini ThinkingConfig
-
+        use_thinking = False
+        gemini_use_thinking = False
         if "claude" in engines:
             use_thinking = st.checkbox(
-                "Claude：启用 Extended Thinking",
-                value=False,
-                help=(
-                    "Opus 4.6 → effort=high (max 32k tokens)；"
-                    "Sonnet 4.6 / Haiku 4.5 → budget_tokens=8000 (max 16k)。"
-                    "速度慢、费用高，适合需要高质量的场景。"
-                ),
+                "Claude：Extended Thinking",
+                help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
             )
             if use_thinking:
                 sel = engine_models.get("claude", "")
-                hint = "effort=high, max_tokens=32000" if "opus-4-6" in sel else "budget_tokens=8000, max_tokens=16000"
-                st.caption(f"`{sel}` — {hint}")
-
+                st.caption("effort=high, max 32k" if "opus-4-6" in sel else "budget=8k, max 16k")
         if "gemini" in engines:
             gemini_use_thinking = st.checkbox(
-                "Gemini：启用思考模式",
-                value=False,
-                help=(
-                    "启用 ThinkingConfig(thinking_budget=-1) 动态分配思考 token。"
-                    "Gemini 3.1 Pro 默认已开启思考，此开关对其无明显额外效果；"
-                    "对 2.5 Pro 有明显提升。"
-                ),
+                "Gemini：思考模式",
+                help="thinking_budget=-1 动态分配；对 2.5 Pro 效果明显。",
             )
 
         with st.expander("⚙️ 高级参数"):
-            target_audience = st.text_input("目标人群", placeholder="例：25-35岁职场女性")
-            key_messages = st.text_input("核心卖点/关键词", placeholder="例：低度数、清爽、派对感")
-            tone = st.text_input("语气偏好", placeholder="例：活泼口语化、朋友间分享")
+            target_audience   = st.text_input("目标人群", placeholder="例：25-35岁职场女性")
+            key_messages      = st.text_input("核心卖点/关键词", placeholder="例：低度数、清爽、派对感")
+            tone              = st.text_input("语气偏好", placeholder="例：活泼口语化、朋友间分享")
             extra_instructions = st.text_area("补充说明", height=80, placeholder="其他要求...")
 
-    # ── Image upload ──────────────────────────────────────────────────
-    st.markdown("#### 参考图片（可选）")
-    encoded_images = image_handler.render_image_uploader()
+    # ── Main area: tabs ────────────────────────────────────────────────
+    tab_quick, tab_queue = st.tabs(["✍️  快速生成", "📋  批次队列"])
 
-    # ── Memory status ─────────────────────────────────────────────────
-    global_mems, project_mems = db.get_confirmed_memories(
-        db_client, user_id, project_id=project["id"]
-    )
-    mem_count = len(global_mems) + len(project_mems)
-    if mem_count > 0:
-        st.info(f"🧠 已载入 {mem_count} 条确认记忆（{len(global_mems)} 通用 + {len(project_mems)} 项目）")
-
-    # ── Generate button ────────────────────────────────────────────────
-    if st.button("🚀 开始生成", type="primary", use_container_width=True):
-        if not base_prompt.strip():
-            st.warning("⚠️ 当前项目尚未配置 System Prompt，请先在「项目设置」中填写。")
-            st.stop()
-
-        # Build full system prompt
-        tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
-        full_system_prompt = mem_module.build_system_prompt(
-            base_prompt=base_prompt,
-            global_memories=global_mems,
-            project_memories=project_mems,
-            tactic_suffix=tactic_suffix,
-        )
-
-        # Create batch record
-        batch_params = {
-            "target_audience": target_audience,
-            "key_messages": key_messages,
-            "tone": tone,
-            "extra_instructions": extra_instructions,
-            "use_thinking": use_thinking,
-            "gemini_use_thinking": gemini_use_thinking,
-            "engine_models": engine_models,
-        }
-        batch = db.create_batch(
-            db_client, user_id,
-            project_id=project["id"],
-            tactic=tactic or "通用",
-            params=batch_params,
-            ai_engines=engines,
-        )
-        batch_id = batch["id"]
-
-        # Progress UI
-        progress_bar = st.progress(0.0, text="正在初始化…")
-
-        def update_progress(pct: float, msg: str) -> None:
-            progress_bar.progress(pct, text=msg)
-
-        # Load historical titles for cross-batch dedup
-        historical_titles = db.get_recent_titles(db_client, project["id"])
-
-        # Generate
-        try:
-            # For multi-engine, each engine uses its own thinking flag
-            # We'll store per-engine thinking in engine_models so generate_batch
-            # can decide; for simplicity pass use_thinking for Claude only,
-            # and re-use gemini_use_thinking by temporarily fusing it via engine_models.
-            # Actually generate_batch already calls engine.generate() per engine;
-            # Gemini thinking is controlled by passing use_thinking when engine=="gemini".
-            # Patch: pass a combined flag; generator checks engine_name=="claude" etc.
-            generation_results = gen_module.generate_batch(
-                system_prompt=full_system_prompt,
-                tactic=tactic,
-                count=count,
-                engines=engines,
-                target_audience=target_audience,
-                key_messages=key_messages,
-                tone=tone,
-                extra_instructions=extra_instructions,
-                images=encoded_images or None,
-                progress_callback=update_progress,
-                historical_titles=historical_titles or None,
-                use_thinking=use_thinking,
-                engine_models=engine_models or None,
-                gemini_use_thinking=gemini_use_thinking,
+    # ── TAB 1: Quick generate ──────────────────────────────────────────
+    with tab_quick:
+        st.markdown("<div class='section-label' style='margin-bottom:6px'>参考图片（可选）</div>", unsafe_allow_html=True)
+        encoded_images = image_handler.render_image_uploader()
+        image_prompt = ""
+        if encoded_images:
+            image_prompt = st.text_area(
+                "图片提示词",
+                placeholder="说明图片内容或用途。例：这是品牌产品实拍图，请参考图片视觉风格和产品细节进行创作。",
+                height=80,
+                key="image_prompt_input",
+                help="上传图片后填写，可显著提升 AI 对图片的利用率。",
             )
-        except Exception as e:
-            st.error(f"生成失败：{e}")
-            return
 
-        # Persist to DB
-        saved_count = 0
-        error_messages: list[str] = []
-        for slot in generation_results:
-            item = db.create_item(db_client, user_id, batch_id)
-            for version_result in slot["versions"]:
-                if version_result.error and not version_result.title:
-                    error_messages.append(
-                        f"[{version_result.ai_engine.upper()}] {version_result.error}"
-                    )
-                    continue
-                db.create_version(
-                    db_client,
-                    item_id=item["id"],
-                    ai_engine=version_result.ai_engine,
-                    title=version_result.title,
-                    body=version_result.body,
-                    keywords=version_result.keywords,
-                    token_usage=version_result.token_usage,
+        global_mems, project_mems = db.get_confirmed_memories(
+            db_client, user_id, project_id=project["id"]
+        )
+        mem_count = len(global_mems) + len(project_mems)
+        if mem_count > 0:
+            st.info(f"🧠 已载入 {mem_count} 条确认记忆（{len(global_mems)} 通用 + {len(project_mems)} 项目）")
+
+        if st.button("🚀 开始生成", type="primary", use_container_width=True):
+            if not base_prompt.strip():
+                st.warning("⚠️ 当前项目尚未配置 System Prompt，请先在「项目设置」中填写。")
+                st.stop()
+
+            tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
+            full_system_prompt = mem_module.build_system_prompt(
+                base_prompt=base_prompt,
+                global_memories=global_mems,
+                project_memories=project_mems,
+                tactic_suffix=tactic_suffix,
+            )
+
+            combined_extra = extra_instructions
+            if image_prompt:
+                combined_extra = (combined_extra + "\n\n【参考图片说明】\n" + image_prompt).strip()
+
+            batch_params = {
+                "target_audience": target_audience,
+                "key_messages": key_messages,
+                "tone": tone,
+                "extra_instructions": extra_instructions,
+                "use_thinking": use_thinking,
+                "gemini_use_thinking": gemini_use_thinking,
+                "engine_models": engine_models,
+            }
+            batch = db.create_batch(
+                db_client, user_id,
+                project_id=project["id"],
+                tactic=tactic or "通用",
+                params=batch_params,
+                ai_engines=engines,
+            )
+            batch_id = batch["id"]
+
+            progress_bar = st.progress(0.0, text="正在初始化…")
+
+            def update_progress(pct: float, msg: str) -> None:
+                progress_bar.progress(pct, text=msg)
+
+            historical_titles = db.get_recent_titles(db_client, project["id"])
+
+            try:
+                generation_results = gen_module.generate_batch(
+                    system_prompt=full_system_prompt,
+                    tactic=tactic,
+                    count=count,
+                    engines=engines,
+                    target_audience=target_audience,
+                    key_messages=key_messages,
+                    tone=tone,
+                    extra_instructions=combined_extra,
+                    images=encoded_images or None,
+                    progress_callback=update_progress,
+                    historical_titles=historical_titles or None,
+                    use_thinking=use_thinking,
+                    engine_models=engine_models or None,
+                    gemini_use_thinking=gemini_use_thinking,
                 )
-                saved_count += 1
+            except Exception as e:
+                st.error(f"生成失败：{e}")
+                return
 
-        progress_bar.progress(1.0, text="生成完成！")
-        if error_messages:
-            unique_errors = list(dict.fromkeys(error_messages))
-            st.error("部分内容生成失败：\n" + "\n".join(f"• {e}" for e in unique_errors))
-        if saved_count > 0:
-            st.success(f"✅ 生成完成！共 {len(generation_results)} 篇，{saved_count} 个版本。")
-        elif not error_messages:
-            st.warning("生成完成，但没有内容被保存，请检查配置。")
+            saved_count = 0
+            error_messages: list[str] = []
+            for slot in generation_results:
+                item = db.create_item(db_client, user_id, batch_id)
+                for version_result in slot["versions"]:
+                    if version_result.error and not version_result.title:
+                        error_messages.append(f"[{version_result.ai_engine.upper()}] {version_result.error}")
+                        continue
+                    db.create_version(
+                        db_client,
+                        item_id=item["id"],
+                        ai_engine=version_result.ai_engine,
+                        title=version_result.title,
+                        body=version_result.body,
+                        keywords=version_result.keywords,
+                        token_usage=version_result.token_usage,
+                    )
+                    saved_count += 1
 
-        # Store batch_id for review page
-        st.session_state["review_batch_id"] = batch_id
-        st.info("👉 前往「审核与迭代」页面查看结果。")
+            progress_bar.progress(1.0, text="生成完成！")
+            if error_messages:
+                st.error("部分内容生成失败：\n" + "\n".join(f"• {e}" for e in list(dict.fromkeys(error_messages))))
+            if saved_count > 0:
+                st.success(f"✅ 生成完成！共 {len(generation_results)} 篇，{saved_count} 个版本。")
+            elif not error_messages:
+                st.warning("生成完成，但没有内容被保存，请检查配置。")
+            st.session_state["review_batch_id"] = batch_id
+            st.info("👉 前往「审核与迭代」页面查看结果。")
+
+    # ── TAB 2: Batch Queue ─────────────────────────────────────────────
+    with tab_queue:
+        _render_queue_tab()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1031,19 +1361,40 @@ def _render_item_card(
                 + ("；" + feedback_text if feedback_text else "")
             ).strip("、；")
 
-            # Engine selector for iteration
-            iter_engine = st.selectbox(
-                "用哪个引擎重新生成",
-                gen_module.AVAILABLE_ENGINES,
-                format_func=lambda e: f"{e.upper()} 重新生成",
-                key=f"iter_engine_{item_id}",
-            )
+            # Engine + model selector for iteration
+            iter_col_eng, iter_col_mod = st.columns(2)
+            with iter_col_eng:
+                iter_engine = st.selectbox(
+                    "引擎",
+                    gen_module.AVAILABLE_ENGINES,
+                    format_func=lambda e: "Claude" if e == "claude" else "Gemini",
+                    key=f"iter_engine_{item_id}",
+                )
+            with iter_col_mod:
+                if iter_engine == "claude":
+                    iter_model = st.selectbox(
+                        "模型",
+                        list(config.CLAUDE_MODELS.keys()),
+                        format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
+                        key=f"iter_model_{item_id}",
+                        index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
+                              if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
+                    )
+                else:
+                    iter_model = st.selectbox(
+                        "模型",
+                        list(config.GEMINI_MODELS.keys()),
+                        format_func=lambda m: config.GEMINI_MODELS.get(m, m),
+                        key=f"iter_model_{item_id}",
+                        index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
+                              if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
+                    )
 
             if st.button("🔄 重新生成", key=f"regen_{item_id}", use_container_width=True):
                 if not combined_feedback:
                     st.warning("请先填写修改意见或选择快捷标签。")
                 else:
-                    _run_iteration(item, versions, batch, project, combined_feedback, iter_engine)
+                    _run_iteration(item, versions, batch, project, combined_feedback, iter_engine, iter_model)
 
 
 def _normalise_keywords(raw) -> list[str]:
@@ -1128,6 +1479,7 @@ def _run_iteration(
     project: dict,
     feedback: str,
     engine_name: str,
+    model_override: str = "",
 ) -> None:
     """Run one iteration for an item and save the new version."""
     base_prompt = project.get("system_prompt", "")
@@ -1155,7 +1507,8 @@ def _run_iteration(
     _bp = batch_params if isinstance(batch_params, dict) else {}
     iter_use_thinking = _bp.get("use_thinking", False)
     iter_gemini_thinking = _bp.get("gemini_use_thinking", False)
-    iter_model = (_bp.get("engine_models") or {}).get(engine_name, "")
+    # Use explicitly selected model, fall back to batch-saved model
+    iter_model = model_override or (_bp.get("engine_models") or {}).get(engine_name, "")
     thinking_flag = iter_use_thinking if engine_name == "claude" else (iter_gemini_thinking if engine_name == "gemini" else False)
     with st.spinner(f"正在用 {engine_name.upper()}{' (深度思考)' if thinking_flag else ''} 迭代…"):
         result = gen_module.iterate_copy(

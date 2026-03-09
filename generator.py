@@ -144,16 +144,52 @@ def _fix_json_newlines(s: str) -> str:
     return ''.join(result)
 
 
+def _escape_inner_quotes(s: str) -> str:
+    """Escape all unescaped ASCII double-quotes within a JSON string value body."""
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == '\\' and i + 1 < len(s):
+            out.append(c); out.append(s[i + 1]); i += 2
+        elif c == '"':
+            out.append('\\"'); i += 1
+        else:
+            out.append(c); i += 1
+    return ''.join(out)
+
+
+def _repair_json_field_quotes(s: str) -> str:
+    """
+    Repair unescaped ASCII double-quotes inside 'title' and 'body' field values.
+    Handles the common Claude output pattern where dialogue / emphasis uses
+    plain " chars inside the JSON string, breaking json.loads().
+    Field order assumed: title → body → keywords (matches our prompt schema).
+    """
+    # Fix title field: content between  "title": "..."  and  ","body"
+    tm = re.search(r'("title"\s*:\s*")(.*?)(",\s*"body")', s, re.DOTALL)
+    if tm:
+        s = s[:tm.start(2)] + _escape_inner_quotes(tm.group(2)) + s[tm.end(2):]
+    # Fix body field: content between  "body": "..."  and  ","keywords"
+    bm = re.search(r'("body"\s*:\s*")(.*?)(",\s*"keywords")', s, re.DOTALL)
+    if bm:
+        s = s[:bm.start(2)] + _escape_inner_quotes(bm.group(2)) + s[bm.end(2):]
+    return s
+
+
 def _try_parse_dict(s: str, ai_engine: str, raw_text: str) -> Optional["GenerationResult"]:
     """Attempt to parse a string as a JSON dict into a GenerationResult. Returns None on failure."""
     try:
         data = json.loads(s)
     except (json.JSONDecodeError, ValueError):
-        # Try fixing bare newlines inside string values
         try:
             data = json.loads(_fix_json_newlines(s))
         except (json.JSONDecodeError, ValueError):
-            return None
+            # Last resort: repair unescaped quotes inside field values (e.g. dialogue "...")
+            try:
+                data = json.loads(_repair_json_field_quotes(_fix_json_newlines(s)))
+            except (json.JSONDecodeError, ValueError):
+                return None
     if not isinstance(data, dict):
         return None
     keywords = data.get("keywords", [])
@@ -617,7 +653,7 @@ def generate_batch(
             if progress_callback:
                 progress_callback(done / total, f"正在生成第 {i+1}/{count} 篇…")
             # Small delay to avoid rate limiting
-            time.sleep(0.2)
+            time.sleep(0.05)
 
         # Record what we generated for dedup in subsequent pieces
         for v in slot_versions:
