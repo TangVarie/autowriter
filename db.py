@@ -190,8 +190,8 @@ def create_batch(
     data = {
         "project_id": project_id,
         "tactic": tactic,
-        "params": json.dumps(params),
-        "ai_engines": json.dumps(ai_engines),
+        "params": params,
+        "ai_engines": ai_engines,
         "user_id": user_id,
     }
     res = client.table("batches").insert(data).execute()
@@ -269,10 +269,10 @@ def create_version(
         "ai_engine": ai_engine,
         "title": title,
         "body": body,
-        "keywords": json.dumps(keywords or []),
+        "keywords": keywords or [],
         "feedback": feedback,
-        "images": json.dumps(images or []),
-        "token_usage": json.dumps(token_usage or {}),
+        "images": images or [],
+        "token_usage": token_usage or {},
     }
     res = client.table("versions").insert(data).execute()
     return res.data[0]

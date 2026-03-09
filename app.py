@@ -447,10 +447,30 @@ def _render_item_card(
                     _run_iteration(item, versions, batch, project, combined_feedback, iter_engine)
 
 
+def _normalise_keywords(raw) -> list[str]:
+    """Ensure keywords is always a clean list of strings."""
+    import json as _json
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(k).strip() for k in raw if str(k).strip()]
+    if isinstance(raw, str):
+        # Could be a JSON string like '["k1","k2"]' or plain comma-separated
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(k).strip() for k in parsed if str(k).strip()]
+        except Exception:
+            pass
+        return [k.strip() for k in re.split(r'[,，、\s]+', raw) if k.strip()]
+    return []
+
+
 def _render_single_version(version: dict) -> None:
-    title = version.get("title", "")
-    body = version.get("body", "")
-    keywords = version.get("keywords", [])
+    title = version.get("title", "") or ""
+    body = version.get("body", "") or ""
+    keywords = _normalise_keywords(version.get("keywords"))
+    raw_text = version.get("raw_text", "")
 
     title_len = len(title)
     title_color = "green" if 15 <= title_len <= 22 else "orange"
@@ -463,6 +483,11 @@ def _render_single_version(version: dict) -> None:
     if keywords:
         kw_html = " ".join(f"<span class='tag'>#{k}</span>" for k in keywords)
         st.markdown(kw_html, unsafe_allow_html=True)
+
+    # Debug: show raw AI output if parsing failed
+    if not title and raw_text:
+        with st.expander("⚠️ 解析失败 — 查看原始 AI 输出", expanded=True):
+            st.code(raw_text, language=None)
 
 
 def _render_version_comparison(versions: list[dict], item_id: str) -> None:

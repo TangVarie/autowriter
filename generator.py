@@ -92,22 +92,52 @@ def _make_user_prompt(
 # ── JSON parsing helper ────────────────────────────────────────────────────
 
 def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
-    """Extract and parse the JSON block from AI output."""
-    # Try to extract JSON object from text
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group())
-            return GenerationResult(
-                title=data.get("title", "").strip(),
-                body=data.get("body", "").strip(),
-                keywords=data.get("keywords", []),
-                ai_engine=ai_engine,
-                raw_text=text,
-            )
-        except json.JSONDecodeError:
-            pass
-    # Fallback: use the raw text as body
+    """
+    Extract and parse JSON from AI output.
+    Handles: raw JSON, ```json blocks, partial wrapping text.
+    """
+    # Step 1: strip markdown code fences
+    stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
+
+    # Step 2: try each candidate source for a JSON object
+    for src in (stripped, text):
+        start = src.find('{')
+        end = src.rfind('}')
+        if start != -1 and end > start:
+            try:
+                data = json.loads(src[start:end + 1])
+                keywords = data.get("keywords", [])
+                if isinstance(keywords, str):
+                    keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
+                return GenerationResult(
+                    title=str(data.get("title", "")).strip(),
+                    body=str(data.get("body", "")).strip(),
+                    keywords=keywords,
+                    ai_engine=ai_engine,
+                    raw_text=text,
+                )
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    # Step 3: fallback — extract fields from plain Chinese text
+    title_match = re.search(r'标题[：:「【]\s*(.+?)[\n」】]', text)
+    body_match = re.search(r'正文[：:「【]\s*([\s\S]+?)(?:关键词[：:]|$)', text)
+    kw_match = re.search(r'关键词[：:「【]\s*(.+)', text)
+    if title_match or body_match:
+        keywords = []
+        if kw_match:
+            kw_raw = kw_match.group(1).strip()
+            keywords = [k.lstrip('#').strip() for k in re.split(r'[,，、\s#]+', kw_raw) if k.strip()]
+        return GenerationResult(
+            title=(title_match.group(1).strip() if title_match else ""),
+            body=(body_match.group(1).strip() if body_match else text),
+            keywords=keywords,
+            ai_engine=ai_engine,
+            raw_text=text,
+            error="非JSON格式，已尝试提取字段",
+        )
+
+    # Step 4: complete fallback
     return GenerationResult(
         title="（解析失败）",
         body=text,
