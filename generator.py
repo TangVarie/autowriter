@@ -20,13 +20,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 import config
-
-# Global semaphore to stay under the API provider's concurrent-request limit.
-# Set to 4 to leave headroom below the provider's cap of 5.
-_API_SEMAPHORE = threading.Semaphore(4)
 
 # Gemini import (graceful fallback if not installed)
 try:
@@ -103,10 +100,6 @@ def _call_with_retry(call_fn, max_retries: int = 5):
     """
     Call an Anthropic API callable with exponential backoff.
 
-    Acquires the global _API_SEMAPHORE before each attempt so that the total
-    number of in-flight requests never exceeds the semaphore limit (4), staying
-    safely below the provider's concurrent-request cap (5).
-
     Retries on:
       - RateLimitError (429)
       - APIStatusError with transient codes: 429, 502, 503, 529
@@ -115,20 +108,19 @@ def _call_with_retry(call_fn, max_retries: int = 5):
     delay = 2
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
-        with _API_SEMAPHORE:
-            try:
-                return call_fn()
-            except anthropic.RateLimitError as e:
+        try:
+            return call_fn()
+        except anthropic.RateLimitError as e:
+            last_error = e
+        except anthropic.APIStatusError as e:
+            if e.status_code in (429, 502, 503, 529):
                 last_error = e
-            except anthropic.APIStatusError as e:
-                if e.status_code in (429, 502, 503, 529):
-                    last_error = e
-                    if e.status_code == 429:
-                        delay = max(delay, 5)
-                else:
-                    raise
-            except anthropic.APIConnectionError as e:
-                last_error = e
+                if e.status_code == 429:
+                    delay = max(delay, 5)
+            else:
+                raise
+        except anthropic.APIConnectionError as e:
+            last_error = e
         if attempt < max_retries:
             time.sleep(delay)
             delay = min(delay * 2, 60)
@@ -652,21 +644,17 @@ def generate_batch(
         extra=extra_instructions,
     )
 
-    results: list[dict] = []
+    # Build dedup prompt once upfront using only historical titles.
+    # All items in the batch share the same dedup context so they can
+    # run in parallel; the within-batch summaries are no longer needed.
+    dedup_block = _build_dedup_instruction([], historical_titles)
+    user_prompt = base_user_prompt + ("\n\n" + dedup_block if dedup_block else "")
+
     total = count * len(engines)
-    done = 0
+    done_count = [0]
+    lock = threading.Lock()
 
-    # Accumulate summaries of what we've generated so far for dedup
-    generated_summaries: list[str] = []
-
-    for i in range(count):
-        # Build dedup-enhanced prompt
-        dedup_block = _build_dedup_instruction(generated_summaries, historical_titles)
-        if dedup_block:
-            user_prompt = base_user_prompt + "\n\n" + dedup_block
-        else:
-            user_prompt = base_user_prompt
-
+    def _generate_slot(i: int) -> tuple[int, list[GenerationResult]]:
         slot_versions: list[GenerationResult] = []
         for engine_name in engines:
             try:
@@ -689,20 +677,18 @@ def generate_batch(
                     error=str(e)
                 )
             slot_versions.append(result)
-            done += 1
-            if progress_callback:
-                progress_callback(done / total, f"正在生成第 {i+1}/{count} 篇…")
-            # Small delay to avoid rate limiting
-            time.sleep(0.05)
+            with lock:
+                done_count[0] += 1
+                if progress_callback:
+                    progress_callback(done_count[0] / total, f"正在生成第 {i+1}/{count} 篇…")
+        return i, slot_versions
 
-        # Record what we generated for dedup in subsequent pieces
-        for v in slot_versions:
-            if v.success and v.title:
-                # title + first ~30 chars of body as angle summary
-                body_preview = v.body[:50].split("\n")[0] if v.body else ""
-                generated_summaries.append(f"「{v.title}」— {body_preview}")
-
-        results.append({"versions": slot_versions, "tactic": tactic})
+    results: list[dict] = [{}] * count
+    with ThreadPoolExecutor(max_workers=count) as executor:
+        futures = {executor.submit(_generate_slot, i): i for i in range(count)}
+        for future in as_completed(futures):
+            i, slot_versions = future.result()
+            results[i] = {"versions": slot_versions, "tactic": tactic}
 
     return results
 
