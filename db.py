@@ -327,26 +327,56 @@ def get_batch_item_counts(client: Client, batch_ids: list[str]) -> dict:
 
 
 def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
-    """Fetch recent version titles for deduplication across batches (single query)."""
-    # Get recent batch IDs
+    """
+    Fetch one representative title per content item for cross-batch deduplication.
+
+    Strategy (per item):
+    - Approved items with a chosen best version → use that version's title
+    - Everything else → use the latest version's title (highest version_num)
+
+    This ensures each item contributes exactly one title (its current "angle"),
+    not every intermediate iteration version.
+    """
     batches = list_batches(client, project_id, limit=10)
     if not batches:
         return []
     batch_ids = [b["id"] for b in batches]
 
-    # Single query: items for all batches, then their versions' titles
     res = (
         client.table("items")
-        .select("id, batch_id, versions(title)")
+        .select("id, status, best_version_id, versions(id, title, version_num)")
         .in_("batch_id", batch_ids)
         .execute()
     )
+
     titles: list[str] = []
     for item in (res.data or []):
-        for v in item.get("versions", []):
-            t = v.get("title", "")
+        versions = item.get("versions", [])
+        if not versions:
+            continue
+
+        chosen_title: Optional[str] = None
+
+        # Approved items: use the designated best version if set
+        best_vid = item.get("best_version_id")
+        if best_vid:
+            for v in versions:
+                if v.get("id") == best_vid:
+                    t = (v.get("title") or "").strip()
+                    if t and t != "（解析失败）":
+                        chosen_title = t
+                    break
+
+        # Fallback: use the latest version by version_num
+        if not chosen_title:
+            latest = max(versions, key=lambda v: v.get("version_num", 0))
+            t = (latest.get("title") or "").strip()
             if t and t != "（解析失败）":
-                titles.append(t)
+                chosen_title = t
+
+        if chosen_title:
+            titles.append(chosen_title)
+
     return titles[:limit]
 
 

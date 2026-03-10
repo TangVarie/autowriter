@@ -1396,6 +1396,40 @@ def _render_item_card(
                 else:
                     _run_iteration(item, versions, batch, project, combined_feedback, iter_engine, iter_model)
 
+        # ── Manual edit ───────────────────────────────────────────────
+        with st.expander("✏️ 手动精修", expanded=False):
+            cur_title    = display_version.get("title", "") or ""
+            cur_body     = display_version.get("body", "") or ""
+            cur_keywords = _normalise_keywords(display_version.get("keywords"))
+
+            edit_title = st.text_input(
+                "标题", value=cur_title, key=f"edit_title_{item_id}",
+            )
+            edit_body = st.text_area(
+                "正文", value=cur_body, height=300, key=f"edit_body_{item_id}",
+            )
+            edit_kw_raw = st.text_input(
+                "关键词（逗号分隔）",
+                value="，".join(cur_keywords),
+                key=f"edit_kw_{item_id}",
+                placeholder="关键词1，关键词2，关键词3",
+            )
+
+            if st.button("💾 保存手动修改并通过", key=f"save_edit_{item_id}", use_container_width=True):
+                new_kw = [k.strip() for k in re.split(r"[,，、\s]+", edit_kw_raw) if k.strip()]
+                db.create_version(
+                    db_client,
+                    item_id=item_id,
+                    ai_engine="manual",
+                    title=edit_title.strip(),
+                    body=edit_body.strip(),
+                    keywords=new_kw,
+                    feedback="手动精修",
+                )
+                db.update_item_status(db_client, item_id, "approved")
+                st.success("已保存修改并标记为通过。")
+                st.rerun()
+
 
 def _normalise_keywords(raw) -> list[str]:
     """Ensure keywords is always a clean list of strings."""
