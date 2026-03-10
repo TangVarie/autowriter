@@ -218,6 +218,28 @@ def list_batches(client: Client, project_id: str, limit: int = 20) -> list[dict]
     return res.data or []
 
 
+def delete_batch(client: Client, batch_id: str) -> None:
+    """Delete a batch and all its items/versions (cascade order)."""
+    # 1. Collect item ids
+    items_res = (
+        client.table("items")
+        .select("id")
+        .eq("batch_id", batch_id)
+        .execute()
+    )
+    item_ids = [r["id"] for r in (items_res.data or [])]
+
+    # 2. Delete versions
+    if item_ids:
+        client.table("versions").delete().in_("item_id", item_ids).execute()
+
+    # 3. Delete items
+    client.table("items").delete().eq("batch_id", batch_id).execute()
+
+    # 4. Delete batch
+    client.table("batches").delete().eq("id", batch_id).execute()
+
+
 # ── Item CRUD ──────────────────────────────────────────────────────────────
 
 def create_item(client: Client, user_id: str, batch_id: str) -> dict:
@@ -336,14 +358,9 @@ def get_batch_item_counts(client: Client, batch_ids: list[str]) -> dict:
 
 def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
     """
-    Fetch one representative title per content item for cross-batch deduplication.
-
-    Strategy (per item):
-    - Approved items with a chosen best version → use that version's title
-    - Everything else → use the latest version's title (highest version_num)
-
-    This ensures each item contributes exactly one title (its current "angle"),
-    not every intermediate iteration version.
+    Fetch one representative title per *approved* content item for cross-batch
+    deduplication.  Only approved items are included so that unadopted /
+    pending content does not permanently block angles for future generation.
     """
     batches = list_batches(client, project_id, limit=10)
     if not batches:
@@ -354,6 +371,7 @@ def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list
         client.table("items")
         .select("id, status, best_version_id, versions(id, title, version_num)")
         .in_("batch_id", batch_ids)
+        .eq("status", "approved")
         .execute()
     )
 
@@ -365,7 +383,7 @@ def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list
 
         chosen_title: Optional[str] = None
 
-        # Approved items: use the designated best version if set
+        # Use the designated best version if set
         best_vid = item.get("best_version_id")
         if best_vid:
             for v in versions:
@@ -375,7 +393,7 @@ def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list
                         chosen_title = t
                     break
 
-        # Fallback: use the latest version by version_num
+        # Fallback: latest version by version_num
         if not chosen_title:
             latest = max(versions, key=lambda v: v.get("version_num", 0))
             t = (latest.get("title") or "").strip()

@@ -1913,10 +1913,31 @@ def page_history(project: dict) -> None:
                 st.markdown(f"**目标人群：** {batch_params.get('target_audience', '—')}")
                 st.markdown(f"**核心卖点：** {batch_params.get('key_messages', '—')}")
 
-            if counts['total'] > 0:
-                if st.button("查看此批次", key=f"view_batch_{batch['id']}"):
-                    st.session_state["review_batch_id"] = batch["id"]
-                    st.rerun()
+            btn_col, del_col = st.columns([3, 1])
+            with btn_col:
+                if counts['total'] > 0:
+                    if st.button("查看此批次", key=f"view_batch_{batch['id']}"):
+                        st.session_state["review_batch_id"] = batch["id"]
+                        st.rerun()
+            with del_col:
+                confirm_key = f"confirm_del_{batch['id']}"
+                if st.session_state.get(confirm_key):
+                    st.warning("确认删除？此操作不可撤销。")
+                    yes_col, no_col = st.columns(2)
+                    with yes_col:
+                        if st.button("确认删除", key=f"do_del_{batch['id']}", type="primary"):
+                            db.delete_batch(db_client, batch["id"])
+                            st.session_state.pop(confirm_key, None)
+                            st.success("已删除")
+                            st.rerun()
+                    with no_col:
+                        if st.button("取消", key=f"cancel_del_{batch['id']}"):
+                            st.session_state.pop(confirm_key, None)
+                            st.rerun()
+                else:
+                    if st.button("🗑️ 删除批次", key=f"del_batch_{batch['id']}"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
