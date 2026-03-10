@@ -7,6 +7,7 @@ Entry point: streamlit run app.py
 
 from __future__ import annotations
 
+import copy
 import html as _html
 import json
 import re
@@ -131,6 +132,9 @@ def _queue_worker(
                 item = db.create_item(db_client, user_id, batch_id)
                 for vr in slot["versions"]:
                     if vr.error and not vr.title:
+                        status["errors"].append(
+                            f"计划 {idx+1}（{proj_name}）· {vr.ai_engine}：{vr.error}"
+                        )
                         continue
                     db.create_version(
                         db_client,
@@ -823,35 +827,49 @@ def _render_queue_tab() -> None:
 
             q_em: dict[str, str] = {}
             qm1, qm2 = st.columns(2)
+            _saved_em = plan.get("engine_models") or {}
             if "claude" in plan["engines"]:
+                _saved_cm = _saved_em.get("claude", config.CLAUDE_MODEL)
+                _cm_keys = list(config.CLAUDE_MODELS.keys())
                 with qm1:
                     q_em["claude"] = st.selectbox(
-                        "Claude 模型", list(config.CLAUDE_MODELS.keys()),
+                        "Claude 模型", _cm_keys,
                         format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
-                        index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
-                              if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
+                        index=_cm_keys.index(_saved_cm) if _saved_cm in _cm_keys else 0,
                         key=f"qp_cm_{i}",
                     )
             if "gemini" in plan["engines"]:
+                _saved_gm = _saved_em.get("gemini", config.GEMINI_MODEL)
+                _gm_keys = list(config.GEMINI_MODELS.keys())
                 with qm2:
                     q_em["gemini"] = st.selectbox(
-                        "Gemini 模型", list(config.GEMINI_MODELS.keys()),
+                        "Gemini 模型", _gm_keys,
                         format_func=lambda m: config.GEMINI_MODELS.get(m, m),
-                        index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
-                              if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
+                        index=_gm_keys.index(_saved_gm) if _saved_gm in _gm_keys else 0,
                         key=f"qp_gm_{i}",
                     )
             plan["engine_models"] = q_em
 
-            qt1, qt2 = st.columns(2)
-            with qt1:
-                plan["use_thinking"] = st.checkbox(
-                    "Claude Thinking", value=plan.get("use_thinking", False), key=f"qp_think_{i}"
-                )
-            with qt2:
-                plan["gemini_use_thinking"] = st.checkbox(
-                    "Gemini 思考", value=plan.get("gemini_use_thinking", False), key=f"qp_gthink_{i}"
-                )
+            # Only show thinking toggles for the engines actually selected
+            _think_cols = [e for e in plan["engines"] if e in ("claude", "gemini")]
+            if _think_cols:
+                think_col_widgets = st.columns(len(_think_cols))
+                for _tc, _eng in zip(think_col_widgets, _think_cols):
+                    with _tc:
+                        if _eng == "claude":
+                            plan["use_thinking"] = st.checkbox(
+                                "Claude Thinking",
+                                value=plan.get("use_thinking", False),
+                                key=f"qp_think_{i}",
+                                help="Opus 4.6 → effort=high；其他 → budget_tokens=8000",
+                            )
+                        else:
+                            plan["gemini_use_thinking"] = st.checkbox(
+                                "Gemini 思考模式",
+                                value=plan.get("gemini_use_thinking", False),
+                                key=f"qp_gthink_{i}",
+                                help="thinking_budget=-1 动态分配（Gemini 3.x 默认开启思考）",
+                            )
 
             plan["extra_instructions"] = st.text_input(
                 "补充说明", value=plan.get("extra_instructions", ""),
@@ -900,7 +918,7 @@ def _render_queue_tab() -> None:
                 st.session_state["queue_stop_event"] = stop_evt
                 t = threading.Thread(
                     target=_queue_worker,
-                    args=(list(plans), user_id, db_client, status, stop_evt),
+                    args=(copy.deepcopy(plans), user_id, db_client, status, stop_evt),
                     daemon=True,
                 )
                 t.start()
@@ -1286,20 +1304,34 @@ def _render_item_card(
     ver_num = display_version.get("version_num", 1)
     title_str = display_version.get("title", "（无标题）") or "（无标题）"
 
+    # Resolve thinking flag from batch params for the badge
+    _bp = batch.get("params") or {}
+    if isinstance(_bp, str):
+        try:
+            _bp = json.loads(_bp)
+        except Exception:
+            _bp = {}
+    _thinking_on = (
+        _bp.get("use_thinking", False) if engine_short == "claude"
+        else _bp.get("gemini_use_thinking", False)
+    )
+
     expander_label = (
         f"{status_icon} {title_str[:60]}{'…' if len(title_str) > 60 else ''}  "
         f"— {status_label} · v{ver_num}"
     )
     with st.expander(expander_label, expanded=(status in ("pending", "needs_revision"))):
-        # Engine badge
+        # Engine badge: show full model name + thinking indicator
         eng_cls = engine_short if engine_short in ("claude", "gemini") else ""
+        thinking_tag = "&nbsp;🧠" if _thinking_on else ""
         st.markdown(
-            f"<span class='engine-badge {eng_cls}'>{_html.escape(engine_raw.upper())}</span>",
+            f"<span class='engine-badge {eng_cls}'>{_html.escape(engine_raw.upper())}{thinking_tag}</span>",
             unsafe_allow_html=True,
         )
 
         # Multi-version comparison (if multiple engines were used)
-        if len(versions) > 1:
+        unique_engines = {v.get("ai_engine", "").split("/")[0] for v in versions}
+        if len(unique_engines) > 1:
             _render_version_comparison(versions, item_id)
         else:
             _render_single_version(display_version)
@@ -1367,11 +1399,27 @@ def _render_item_card(
                               if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
                     )
 
+            # Thinking toggle — only meaningful for Claude
+            if iter_engine == "claude":
+                _default_thinking = _bp.get("use_thinking", False) if isinstance(_bp, dict) else False
+                iter_use_thinking = st.checkbox(
+                    "深度思考（Extended Thinking）",
+                    value=_default_thinking,
+                    key=f"iter_think_{item_id}",
+                    help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
+                )
+            else:
+                iter_use_thinking = False
+
             if st.button("🔄 重新生成", key=f"regen_{item_id}", use_container_width=True):
                 if not combined_feedback:
                     st.warning("请先填写修改意见或选择快捷标签。")
                 else:
-                    _run_iteration(item, versions, batch, project, combined_feedback, iter_engine, iter_model)
+                    _run_iteration(
+                        item, versions, batch, project,
+                        combined_feedback, iter_engine, iter_model,
+                        use_thinking_override=iter_use_thinking,
+                    )
 
         # ── Manual edit ───────────────────────────────────────────────
         with st.expander("✏️ 手动精修", expanded=False):
@@ -1491,6 +1539,7 @@ def _run_iteration(
     feedback: str,
     engine_name: str,
     model_override: str = "",
+    use_thinking_override: bool | None = None,
 ) -> None:
     """Run one iteration for an item and save the new version."""
     base_prompt = project.get("system_prompt", "")
@@ -1520,7 +1569,11 @@ def _run_iteration(
     iter_gemini_thinking = _bp.get("gemini_use_thinking", False)
     # Use explicitly selected model, fall back to batch-saved model
     iter_model = model_override or (_bp.get("engine_models") or {}).get(engine_name, "")
-    thinking_flag = iter_use_thinking if engine_name == "claude" else (iter_gemini_thinking if engine_name == "gemini" else False)
+    # If caller passes an explicit thinking override, honour it; else fall back to batch setting
+    if use_thinking_override is not None:
+        thinking_flag = use_thinking_override
+    else:
+        thinking_flag = iter_use_thinking if engine_name == "claude" else (iter_gemini_thinking if engine_name == "gemini" else False)
     with st.spinner(f"正在用 {engine_name.upper()}{' (深度思考)' if thinking_flag else ''} 迭代…"):
         result = gen_module.iterate_copy(
             system_prompt=full_system_prompt,
