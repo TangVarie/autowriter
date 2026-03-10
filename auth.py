@@ -19,12 +19,21 @@ def get_supabase_client() -> Client:
 
 
 def sign_up(email: str, password: str) -> dict:
-    """Register a new user. Raises on error."""
+    """
+    Register a new user.
+    Returns {"user": ..., "session": ..., "email_confirmation_required": bool}.
+    Raises on hard errors (e.g. email already registered, rate limit).
+    """
     client = get_supabase_client()
     res = client.auth.sign_up({"email": email, "password": password})
     if res.user is None:
-        raise ValueError("Registration failed. Please try again.")
-    return {"user": res.user, "session": res.session}
+        raise ValueError("注册失败，请稍后重试。")
+    email_confirmation_required = res.session is None
+    return {
+        "user": res.user,
+        "session": res.session,
+        "email_confirmation_required": email_confirmation_required,
+    }
 
 
 def sign_in(email: str, password: str) -> dict:
@@ -32,7 +41,7 @@ def sign_in(email: str, password: str) -> dict:
     client = get_supabase_client()
     res = client.auth.sign_in_with_password({"email": email, "password": password})
     if res.user is None:
-        raise ValueError("Invalid email or password.")
+        raise ValueError("邮箱或密码不正确。")
     return {"user": res.user, "session": res.session}
 
 
@@ -97,6 +106,29 @@ def require_auth() -> tuple[Client, dict]:
     return client, st.session_state["current_user"]
 
 
+def _friendly_auth_error(exc: Exception) -> str:
+    """Convert a Supabase auth exception into a human-readable Chinese message."""
+    msg = str(exc).lower()
+    if "email not confirmed" in msg or "email_not_confirmed" in msg:
+        return (
+            "邮箱尚未验证。请检查您的收件箱（含垃圾邮件），点击确认链接后再登录。\n\n"
+            "如果一直未收到邮件，请联系管理员在 Supabase 后台手动确认账号。"
+        )
+    if "invalid login credentials" in msg or "invalid email or password" in msg:
+        return "邮箱或密码不正确，请重试。"
+    if "user already registered" in msg or "already been registered" in msg:
+        return "该邮箱已注册，请直接登录，或使用忘记密码功能。"
+    if "email rate limit" in msg or "rate limit" in msg or "over_email_send_rate_limit" in msg:
+        return (
+            "系统邮件发送已达上限（Supabase 免费额度限制）。\n\n"
+            "请联系管理员在 Supabase 控制台手动确认该账号，或稍等一段时间再试。"
+        )
+    if "password" in msg and ("weak" in msg or "short" in msg or "length" in msg):
+        return "密码强度不足，请使用至少 6 位包含字母和数字的密码。"
+    # fallback: return raw message
+    return str(exc)
+
+
 def _render_login_page() -> None:
     """Render the login / registration form."""
     st.title(f"🍵 {config.APP_TITLE}")
@@ -126,14 +158,15 @@ def _render_login_page() -> None:
                 _store_session(result)
                 st.rerun()
             except Exception as exc:
-                st.error(f"登录失败：{exc}")
+                st.error(_friendly_auth_error(exc))
 
     with tab_signup:
         with st.form("signup_form"):
-            new_email = st.text_input("邮箱", key="signup_email")
-            new_password = st.text_input("密码", type="password", key="signup_pw")
+            new_email    = st.text_input("邮箱", key="signup_email")
+            new_password = st.text_input("密码（至少 6 位）", type="password", key="signup_pw")
             new_password2 = st.text_input("确认密码", type="password", key="signup_pw2")
             submitted2 = st.form_submit_button("注册", use_container_width=True)
+
         if submitted2:
             if not new_email or not new_password:
                 st.error("请填写邮箱和密码。")
@@ -143,11 +176,20 @@ def _render_login_page() -> None:
                 return
             try:
                 result = sign_up(new_email, new_password)
-                _store_session(result)
-                st.success("注册成功！")
-                st.rerun()
+                if result.get("email_confirmation_required"):
+                    # Supabase email confirmation is enabled — do NOT start a session yet.
+                    st.success(
+                        "注册申请已提交！\n\n"
+                        "请检查您的收件箱（**含垃圾邮件夹**），点击确认链接完成验证后即可登录。\n\n"
+                        "如果长时间未收到邮件，请联系管理员手动激活账号。"
+                    )
+                else:
+                    # Email confirmation is disabled — session is immediately available.
+                    _store_session(result)
+                    st.success("注册成功！")
+                    st.rerun()
             except Exception as exc:
-                st.error(f"注册失败：{exc}")
+                st.error(f"注册失败：{_friendly_auth_error(exc)}")
 
 
 def _store_session(result: dict) -> None:
