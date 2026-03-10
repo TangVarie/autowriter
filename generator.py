@@ -722,22 +722,26 @@ def generate_batch(
           "tactic": str,
         }
     """
-    user_prompt = _make_user_prompt(
+    base_prompt = _make_user_prompt(
         tactic=tactic,
         target_audience=target_audience,
         key_messages=key_messages,
         tone=tone,
         extra=extra_instructions,
-        count=count,
+        count=1,
     )
-
     dedup_block = _build_dedup_instruction([], historical_titles)
-    if dedup_block:
-        user_prompt += "\n\n" + dedup_block
 
-    # One API call per engine, each returning `count` items.
-    # For multi-engine: run engines in parallel (ThreadPoolExecutor).
-    def _call_engine(engine_name: str) -> tuple[str, list[GenerationResult]]:
+    def _slot_prompt(slot_idx: int) -> str:
+        p = base_prompt
+        if count > 1:
+            p += f"\n\n（注意：这是同批次第 {slot_idx + 1} 篇，请在角度、场景和句式上与同批次其他篇明显不同。）"
+        if dedup_block:
+            p += "\n\n" + dedup_block
+        return p
+
+    # Each (slot, engine) pair is one independent API call; all run in parallel.
+    def _call_single(engine_name: str, slot_idx: int) -> tuple[str, int, GenerationResult]:
         try:
             engine = get_engine(engine_name)
             model_override = (engine_models or {}).get(engine_name, "")
@@ -747,33 +751,44 @@ def generate_batch(
             )
             items = engine.generate(
                 system_prompt=system_prompt,
-                user_prompt=user_prompt,
+                user_prompt=_slot_prompt(slot_idx),
                 images=images,
                 use_thinking=thinking_flag,
                 model=model_override,
-                count=count,
+                count=1,
+            )
+            result = items[0] if items else GenerationResult(
+                title="", body="", keywords=[], ai_engine=engine_name, error="空结果"
             )
         except Exception as e:
-            items = [GenerationResult(
+            result = GenerationResult(
                 title="", body="", keywords=[], ai_engine=engine_name, error=str(e)
-            )] * count
-        return engine_name, items
+            )
+        return engine_name, slot_idx, result
 
-    engine_results: dict[str, list[GenerationResult]] = {}
-    with ThreadPoolExecutor(max_workers=len(engines)) as executor:
-        futures = {executor.submit(_call_engine, eng): eng for eng in engines}
-        total = len(engines)
-        done = 0
+    total = count * len(engines)
+    done = 0
+    slot_engine_results: dict[tuple[str, int], GenerationResult] = {}
+
+    with ThreadPoolExecutor(max_workers=min(total, 8)) as executor:
+        futures = {
+            executor.submit(_call_single, eng, slot_i): (eng, slot_i)
+            for slot_i in range(count)
+            for eng in engines
+        }
         for future in as_completed(futures):
-            eng, items = future.result()
-            engine_results[eng] = items
+            eng, slot_i, result = future.result()
+            slot_engine_results[(eng, slot_i)] = result
             done += 1
             if progress_callback:
-                progress_callback(done / total, f"已完成 {done}/{total} 个引擎…")
+                progress_callback(
+                    done / total,
+                    f"已完成 {done}/{total}（{count} 篇 × {len(engines)} 引擎）",
+                )
 
     # Assemble: slot i gets one version per engine
     return [
-        {"versions": [engine_results[eng][i] for eng in engines], "tactic": tactic}
+        {"versions": [slot_engine_results[(eng, i)] for eng in engines], "tactic": tactic}
         for i in range(count)
     ]
 
