@@ -72,11 +72,16 @@ def _queue_worker(
             global_mems, project_mems = db.get_confirmed_memories(
                 db_client, user_id, project_id=project_id
             )
+            pos_examples = db.list_example_items(db_client, project_id, "positive", limit=5)
+            neg_examples = db.list_example_items(db_client, project_id, "negative", limit=3)
             full_system_prompt = mem_module.build_system_prompt(
                 base_prompt=base_prompt,
                 global_memories=global_mems,
                 project_memories=project_mems,
                 tactic_suffix=tactic_suffix,
+                calibration_notes=project.get("calibration_notes") or "",
+                positive_examples=pos_examples or None,
+                negative_examples=neg_examples or None,
             )
 
             engines          = plan.get("engines", ["claude"])
@@ -1045,9 +1050,22 @@ def page_generate(project: dict) -> None:
         global_mems, project_mems = db.get_confirmed_memories(
             db_client, user_id, project_id=project["id"]
         )
+        pos_examples = db.list_example_items(db_client, project["id"], "positive", limit=5)
+        neg_examples = db.list_example_items(db_client, project["id"], "negative", limit=3)
+        calibration_notes = project.get("calibration_notes") or ""
+
+        context_parts = []
         mem_count = len(global_mems) + len(project_mems)
         if mem_count > 0:
-            st.info(f"🧠 已载入 {mem_count} 条确认记忆（{len(global_mems)} 通用 + {len(project_mems)} 项目）")
+            context_parts.append(f"🧠 {mem_count} 条记忆")
+        if calibration_notes.strip():
+            context_parts.append("📝 调校笔记")
+        if pos_examples:
+            context_parts.append(f"⭐ {len(pos_examples)} 个正案例")
+        if neg_examples:
+            context_parts.append(f"👎 {len(neg_examples)} 个反案例")
+        if context_parts:
+            st.info("已载入上下文：" + " · ".join(context_parts))
 
         if st.button("🚀 开始生成", type="primary", use_container_width=True):
             if not base_prompt.strip():
@@ -1060,6 +1078,9 @@ def page_generate(project: dict) -> None:
                 global_memories=global_mems,
                 project_memories=project_mems,
                 tactic_suffix=tactic_suffix,
+                calibration_notes=calibration_notes,
+                positive_examples=pos_examples or None,
+                negative_examples=neg_examples or None,
             )
 
             combined_extra = extra_instructions
@@ -1346,6 +1367,34 @@ def _render_item_card(
             if st.button("✏️ 需修改", key=f"revise_{item_id}", use_container_width=True):
                 db.update_item_status(db_client, item_id, "needs_revision")
                 st.rerun()
+
+        # Example label controls
+        example_label = item.get("example_label")
+        ex_col1, ex_col2, ex_col3 = st.columns(3)
+        with ex_col1:
+            is_pos = example_label == "positive"
+            if st.button(
+                "⭐ 正案例" if not is_pos else "⭐ 已标为正案例",
+                key=f"pos_ex_{item_id}",
+                use_container_width=True,
+                type="primary" if is_pos else "secondary",
+            ):
+                db.set_item_example_label(db_client, item_id, None if is_pos else "positive")
+                st.rerun()
+        with ex_col2:
+            is_neg = example_label == "negative"
+            if st.button(
+                "👎 反案例" if not is_neg else "👎 已标为反案例",
+                key=f"neg_ex_{item_id}",
+                use_container_width=True,
+                type="primary" if is_neg else "secondary",
+            ):
+                db.set_item_example_label(db_client, item_id, None if is_neg else "negative")
+                st.rerun()
+        with ex_col3:
+            if example_label:
+                label_text = "⭐ 正案例" if example_label == "positive" else "👎 反案例"
+                st.caption(f"已标记：{label_text}")
 
         # Feedback & iteration
         if status in ("pending", "needs_revision"):

@@ -53,6 +53,9 @@ CREATE POLICY IF NOT EXISTS projects_owner ON projects
 -- Migration: add dual-prompt columns if upgrading from older schema
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_tone TEXT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_exec TEXT;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS calibration_notes TEXT;
+-- Migration: add example_label to items for positive/negative example marking
+ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT CHECK (example_label IN ('positive', 'negative'));
 
 -- Batches
 CREATE TABLE IF NOT EXISTS batches (
@@ -465,6 +468,62 @@ def update_memory(client: Client, memory_id: str, updates: dict) -> dict:
 
 def delete_memory(client: Client, memory_id: str) -> None:
     client.table("memories").delete().eq("id", memory_id).execute()
+
+
+def set_item_example_label(
+    client: Client, item_id: str, label: Optional[str]
+) -> dict:
+    """Set or clear the example_label on an item ('positive', 'negative', or None)."""
+    res = (
+        client.table("items")
+        .update({"example_label": label})
+        .eq("id", item_id)
+        .execute()
+    )
+    return res.data[0]
+
+
+def list_example_items(
+    client: Client, project_id: str, label: str, limit: int = 5
+) -> list[dict]:
+    """
+    Return recent items marked with the given label ('positive' or 'negative').
+    Each dict has {title, body} from the item's best or latest version.
+    """
+    batches = list_batches(client, project_id, limit=50)
+    if not batches:
+        return []
+    batch_ids = [b["id"] for b in batches]
+
+    res = (
+        client.table("items")
+        .select("id, best_version_id, versions(id, title, body, version_num)")
+        .in_("batch_id", batch_ids)
+        .eq("example_label", label)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    examples: list[dict] = []
+    for item in (res.data or []):
+        item_versions = item.get("versions", [])
+        if not item_versions:
+            continue
+        best_vid = item.get("best_version_id")
+        chosen = None
+        if best_vid:
+            for v in item_versions:
+                if v.get("id") == best_vid:
+                    chosen = v
+                    break
+        if not chosen:
+            chosen = max(item_versions, key=lambda v: v.get("version_num", 0))
+        title = (chosen.get("title") or "").strip()
+        body = (chosen.get("body") or "").strip()
+        if title or body:
+            examples.append({"title": title, "body": body})
+    return examples
 
 
 def get_confirmed_memories(

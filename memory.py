@@ -29,6 +29,9 @@ def build_system_prompt(
     global_memories: list[dict],
     project_memories: list[dict],
     tactic_suffix: str = "",
+    calibration_notes: str = "",
+    positive_examples: Optional[list[dict]] = None,
+    negative_examples: Optional[list[dict]] = None,
 ) -> str:
     """
     Assemble the final system prompt in the documented order:
@@ -36,6 +39,9 @@ def build_system_prompt(
       2. Tactic-specific suffix (if any)
       3. Global memories
       4. Project memories
+      5. Calibration notes (qualitative observations, not rules)
+      6. Positive examples (few-shot: what good looks like)
+      7. Negative examples (few-shot: what to avoid)
     """
     parts: list[str] = [base_prompt.strip()]
 
@@ -49,6 +55,29 @@ def build_system_prompt(
     if project_memories:
         bullets = "\n".join(f"• {m['content']}" for m in project_memories)
         parts.append(f"\n---项目记忆---\n{bullets}")
+
+    if calibration_notes and calibration_notes.strip():
+        parts.append(f"\n---调校笔记---\n{calibration_notes.strip()}")
+
+    if positive_examples:
+        ex_blocks = []
+        for ex in positive_examples[:5]:
+            body_preview = (ex.get("body") or "")[:200].split("\n")[0]
+            ex_blocks.append(f"标题：{ex['title']}\n正文节选：{body_preview}")
+        parts.append(
+            "\n---优质正案例（学习这些文案的风格、结构和切入角度，这是我们想要的方向）---\n"
+            + "\n\n".join(ex_blocks)
+        )
+
+    if negative_examples:
+        ex_blocks = []
+        for ex in negative_examples[:3]:
+            body_preview = (ex.get("body") or "")[:120].split("\n")[0]
+            ex_blocks.append(f"标题：{ex['title']}\n正文节选：{body_preview}")
+        parts.append(
+            "\n---反面案例（分析这些文案存在的问题，生成时主动规避）---\n"
+            + "\n\n".join(ex_blocks)
+        )
 
     return "\n".join(parts)
 

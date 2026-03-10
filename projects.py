@@ -232,6 +232,31 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
         })
         st.success("System Prompt 已保存。生成时将使用合并后的完整版本。")
 
+    # ── 调校笔记 ──────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("#### 📝 调校笔记")
+    st.caption(
+        "记录迭代过程中的感受、观察和校准方向——不需要是规则，是你对这个项目的「品味积累」。"
+        "每次生成时会原文注入 System Prompt，让 AI 理解你的审美偏好。"
+    )
+    st.session_state.setdefault("calibration_notes_textarea", project.get("calibration_notes") or "")
+    calibration_text = st.text_area(
+        "调校笔记",
+        height=200,
+        placeholder=(
+            "例：\n"
+            "- 上次几篇结尾太生硬，感觉像广告收尾，要更自然\n"
+            "- 场景感强的比干讲卖点的效果好很多\n"
+            "- 用「你」比用「大家」更有代入感\n"
+            "- 标题带具体数字的点击率明显更好"
+        ),
+        key="calibration_notes_textarea",
+        label_visibility="collapsed",
+    )
+    if st.button("💾 保存调校笔记", use_container_width=True):
+        db.update_project(client, project["id"], {"calibration_notes": calibration_text})
+        st.success("调校笔记已保存，下次生成时生效。")
+
 
 def _render_tactics_settings(client: Client, project: dict) -> None:
     tactics = _parse_json_field(project.get("tactics"), [])
