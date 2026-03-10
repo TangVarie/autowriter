@@ -180,6 +180,25 @@ def _escape_inner_quotes(s: str) -> str:
     return ''.join(out)
 
 
+def _repair_json_list_field_quotes(s: str) -> str:
+    """
+    Repair unescaped ASCII double-quotes inside 'title' and 'body' field values
+    across *all* elements in a JSON array (uses re.sub for global replacement).
+    """
+    def _fix(m: re.Match) -> str:
+        return m.group(1) + _escape_inner_quotes(m.group(2)) + m.group(3)
+
+    s = re.sub(
+        r'("title"\s*:\s*")(.*?)(",\s*"body")',
+        _fix, s, flags=re.DOTALL,
+    )
+    s = re.sub(
+        r'("body"\s*:\s*")(.*?)(",\s*"keywords")',
+        _fix, s, flags=re.DOTALL,
+    )
+    return s
+
+
 def _repair_json_field_quotes(s: str) -> str:
     """
     Repair unescaped ASCII double-quotes inside 'title' and 'body' field values.
@@ -303,7 +322,13 @@ def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[Generat
             continue
         json_str = src[start:end + 1]
         data = None
-        for candidate in (json_str, _fix_json_newlines(json_str)):
+        repaired = _repair_json_list_field_quotes(json_str)
+        for candidate in (
+            json_str,
+            _fix_json_newlines(json_str),
+            repaired,
+            _fix_json_newlines(repaired),
+        ):
             try:
                 data = json.loads(candidate)
                 break
@@ -722,26 +747,22 @@ def generate_batch(
           "tactic": str,
         }
     """
-    base_prompt = _make_user_prompt(
+    user_prompt = _make_user_prompt(
         tactic=tactic,
         target_audience=target_audience,
         key_messages=key_messages,
         tone=tone,
         extra=extra_instructions,
-        count=1,
+        count=count,
     )
+
     dedup_block = _build_dedup_instruction([], historical_titles)
+    if dedup_block:
+        user_prompt += "\n\n" + dedup_block
 
-    def _slot_prompt(slot_idx: int) -> str:
-        p = base_prompt
-        if count > 1:
-            p += f"\n\n（注意：这是同批次第 {slot_idx + 1} 篇，请在角度、场景和句式上与同批次其他篇明显不同。）"
-        if dedup_block:
-            p += "\n\n" + dedup_block
-        return p
-
-    # Each (slot, engine) pair is one independent API call; all run in parallel.
-    def _call_single(engine_name: str, slot_idx: int) -> tuple[str, int, GenerationResult]:
+    # One API call per engine, each returning `count` items in a single response.
+    # Engines run in parallel via ThreadPoolExecutor.
+    def _call_engine(engine_name: str) -> tuple[str, list[GenerationResult]]:
         try:
             engine = get_engine(engine_name)
             model_override = (engine_models or {}).get(engine_name, "")
@@ -751,44 +772,33 @@ def generate_batch(
             )
             items = engine.generate(
                 system_prompt=system_prompt,
-                user_prompt=_slot_prompt(slot_idx),
+                user_prompt=user_prompt,
                 images=images,
                 use_thinking=thinking_flag,
                 model=model_override,
-                count=1,
-            )
-            result = items[0] if items else GenerationResult(
-                title="", body="", keywords=[], ai_engine=engine_name, error="空结果"
+                count=count,
             )
         except Exception as e:
-            result = GenerationResult(
+            items = [GenerationResult(
                 title="", body="", keywords=[], ai_engine=engine_name, error=str(e)
-            )
-        return engine_name, slot_idx, result
+            )] * count
+        return engine_name, items
 
-    total = count * len(engines)
-    done = 0
-    slot_engine_results: dict[tuple[str, int], GenerationResult] = {}
-
-    with ThreadPoolExecutor(max_workers=min(total, 8)) as executor:
-        futures = {
-            executor.submit(_call_single, eng, slot_i): (eng, slot_i)
-            for slot_i in range(count)
-            for eng in engines
-        }
+    engine_results: dict[str, list[GenerationResult]] = {}
+    with ThreadPoolExecutor(max_workers=len(engines)) as executor:
+        futures = {executor.submit(_call_engine, eng): eng for eng in engines}
+        total = len(engines)
+        done = 0
         for future in as_completed(futures):
-            eng, slot_i, result = future.result()
-            slot_engine_results[(eng, slot_i)] = result
+            eng, items = future.result()
+            engine_results[eng] = items
             done += 1
             if progress_callback:
-                progress_callback(
-                    done / total,
-                    f"已完成 {done}/{total}（{count} 篇 × {len(engines)} 引擎）",
-                )
+                progress_callback(done / total, f"已完成 {done}/{total} 个引擎…")
 
     # Assemble: slot i gets one version per engine
     return [
-        {"versions": [slot_engine_results[(eng, i)] for eng in engines], "tactic": tactic}
+        {"versions": [engine_results[eng][i] for eng in engines], "tactic": tactic}
         for i in range(count)
     ]
 
