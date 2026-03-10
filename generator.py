@@ -96,7 +96,7 @@ def _make_user_prompt(
 def _call_with_retry(call_fn, max_retries: int = 4):
     """
     Call an Anthropic API callable with exponential backoff.
-    Retries on rate-limit (429) and overload (529) errors.
+    Retries on rate-limit (429), overload (529), and gateway errors (502/503).
     """
     delay = 2
     last_error: Exception | None = None
@@ -106,13 +106,16 @@ def _call_with_retry(call_fn, max_retries: int = 4):
         except anthropic.RateLimitError as e:
             last_error = e
         except anthropic.APIStatusError as e:
-            if e.status_code in (529, 503):  # overload / service unavailable
+            if e.status_code in (429, 502, 503, 529):
                 last_error = e
+                # Concurrent-limit 429 needs a longer pause before retrying
+                if e.status_code == 429:
+                    delay = max(delay, 5)
             else:
                 raise
         if attempt < max_retries:
             time.sleep(delay)
-            delay = min(delay * 2, 32)
+            delay = min(delay * 2, 60)
     raise last_error  # type: ignore[misc]
 
 
