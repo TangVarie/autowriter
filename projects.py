@@ -172,6 +172,7 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     if tone_upload is not None:
         try:
             tone_default = tone_upload.read().decode("utf-8")
+            st.session_state["tone_textarea"] = tone_default
             st.success(f"已读取：{tone_upload.name}（{len(tone_default)} 字符）")
         except Exception as e:
             st.error(f"读取失败：{e}")
@@ -198,6 +199,7 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     if exec_upload is not None:
         try:
             exec_default = exec_upload.read().decode("utf-8")
+            st.session_state["exec_textarea"] = exec_default
             st.success(f"已读取：{exec_upload.name}（{len(exec_default)} 字符）")
         except Exception as e:
             st.error(f"读取失败：{e}")
