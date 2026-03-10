@@ -93,10 +93,13 @@ def _make_user_prompt(
 
 # ── Anthropic retry helper ─────────────────────────────────────────────────
 
-def _call_with_retry(call_fn, max_retries: int = 4):
+def _call_with_retry(call_fn, max_retries: int = 5):
     """
     Call an Anthropic API callable with exponential backoff.
-    Retries on rate-limit (429), overload (529), and gateway errors (502/503).
+    Retries on:
+      - RateLimitError (429)
+      - APIStatusError with transient codes: 429, 502, 503, 529
+      - APIConnectionError / APITimeoutError (connection dropped, nginx 502 HTML response)
     """
     delay = 2
     last_error: Exception | None = None
@@ -108,11 +111,14 @@ def _call_with_retry(call_fn, max_retries: int = 4):
         except anthropic.APIStatusError as e:
             if e.status_code in (429, 502, 503, 529):
                 last_error = e
-                # Concurrent-limit 429 needs a longer pause before retrying
                 if e.status_code == 429:
                     delay = max(delay, 5)
             else:
                 raise
+        except anthropic.APIConnectionError as e:
+            # Covers APITimeoutError (subclass) and raw connection drops
+            # (e.g. nginx 502 returning HTML that the SDK cannot parse as JSON)
+            last_error = e
         if attempt < max_retries:
             time.sleep(delay)
             delay = min(delay * 2, 60)
