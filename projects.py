@@ -148,20 +148,87 @@ def _render_basic_settings(client: Client, project: dict) -> None:
 
 def _render_prompt_settings(client: Client, project: dict) -> None:
     st.markdown(
-        "在此粘贴或输入项目的战术框架 Prompt（System Prompt）。"
-        "生成时会自动注入记忆。"
+        "系统提示词由两个模块组成，生成时会自动拼接（语态 → 执行），并注入项目记忆。"
+        "每个模块都可以直接粘贴文本，也可以上传 `.md` 文件。"
     )
-    with st.form("prompt_settings"):
-        prompt = st.text_area(
-            "System Prompt",
-            value=project.get("system_prompt", ""),
-            height=400,
-            placeholder="在此粘贴您的战术框架提示词...",
-        )
-        submitted = st.form_submit_button("保存 System Prompt")
-    if submitted:
-        db.update_project(client, project["id"], {"system_prompt": prompt})
-        st.success("System Prompt 已保存。")
+
+    # ── Backward-compat: if new fields are empty but legacy field has content,
+    #    pre-fill execution module from the legacy field so existing projects
+    #    don't lose their prompts on first open.
+    tone_default = project.get("system_prompt_tone") or ""
+    exec_default = project.get("system_prompt_exec") or ""
+    if not tone_default and not exec_default:
+        exec_default = project.get("system_prompt") or ""
+
+    # ── 语态校准模块 ───────────────────────────────────────────────────────
+    st.markdown("#### 🎙️ 语态校准模块")
+    st.caption("定义品牌语气、人设、句式风格等语言层面的校准规则。")
+
+    tone_upload = st.file_uploader(
+        "从 .md 文件导入语态模块",
+        type=["md", "txt"],
+        key="tone_md_upload",
+    )
+    if tone_upload is not None:
+        try:
+            tone_default = tone_upload.read().decode("utf-8")
+            st.success(f"已读取：{tone_upload.name}（{len(tone_default)} 字符）")
+        except Exception as e:
+            st.error(f"读取失败：{e}")
+
+    tone_text = st.text_area(
+        "语态校准提示词",
+        value=tone_default,
+        height=280,
+        placeholder="在此粘贴语态校准 Prompt，或通过上方上传 .md 文件...",
+        key="tone_textarea",
+    )
+
+    st.divider()
+
+    # ── 执行模块 ──────────────────────────────────────────────────────────
+    st.markdown("#### 🎯 执行模块")
+    st.caption("定义内容结构、选题逻辑、具体写作指令等内容层面的执行规则。")
+
+    exec_upload = st.file_uploader(
+        "从 .md 文件导入执行模块",
+        type=["md", "txt"],
+        key="exec_md_upload",
+    )
+    if exec_upload is not None:
+        try:
+            exec_default = exec_upload.read().decode("utf-8")
+            st.success(f"已读取：{exec_upload.name}（{len(exec_default)} 字符）")
+        except Exception as e:
+            st.error(f"读取失败：{e}")
+
+    exec_text = st.text_area(
+        "执行模块提示词",
+        value=exec_default,
+        height=280,
+        placeholder="在此粘贴执行模块 Prompt，或通过上方上传 .md 文件...",
+        key="exec_textarea",
+    )
+
+    # ── Preview of combined prompt ────────────────────────────────────────
+    combined = ""
+    if tone_text.strip() and exec_text.strip():
+        combined = tone_text.strip() + "\n\n" + exec_text.strip()
+    elif tone_text.strip():
+        combined = tone_text.strip()
+    else:
+        combined = exec_text.strip()
+
+    with st.expander(f"👁️ 预览完整 System Prompt（{len(combined)} 字符）", expanded=False):
+        st.code(combined, language="markdown")
+
+    if st.button("💾 保存 System Prompt", use_container_width=True, type="primary"):
+        db.update_project(client, project["id"], {
+            "system_prompt_tone": tone_text,
+            "system_prompt_exec": exec_text,
+            "system_prompt": combined,
+        })
+        st.success("System Prompt 已保存。生成时将使用合并后的完整版本。")
 
 
 def _render_tactics_settings(client: Client, project: dict) -> None:
@@ -206,11 +273,12 @@ def _render_tactics_settings(client: Client, project: dict) -> None:
 
 
 def _render_file_settings(client: Client, project: dict, user_id: str) -> None:
-    st.markdown("上传参考文件（产品图、竞品截图等）存储在云端，供生成时使用。")
+    st.markdown("上传参考文件（产品图、竞品截图、数据表格、文档等）存储在云端，供生成时参考。")
 
     uploaded = st.file_uploader(
-        "上传参考图片",
-        type=["jpg", "jpeg", "png", "webp", "pdf"],
+        "上传参考文件",
+        type=["jpg", "jpeg", "png", "webp", "pdf", "txt", "md",
+              "csv", "xlsx", "xls", "docx", "doc", "zip"],
         accept_multiple_files=True,
     )
     if uploaded and st.button("📤 上传所选文件"):
@@ -235,8 +303,15 @@ def _render_file_settings(client: Client, project: dict, user_id: str) -> None:
         st.markdown("**已上传的参考文件：**")
         for idx, rf in enumerate(ref_files):
             col1, col2 = st.columns([5, 1])
+            _ft = rf.get("name", "").rsplit(".", 1)[-1].lower()
+            _icon = {
+                "jpg": "🖼️", "jpeg": "🖼️", "png": "🖼️", "webp": "🖼️",
+                "pdf": "📄", "txt": "📝", "md": "📝",
+                "csv": "📊", "xlsx": "📊", "xls": "📊",
+                "docx": "📃", "doc": "📃", "zip": "🗜️",
+            }.get(_ft, "📎")
             with col1:
-                st.markdown(f"📎 [{rf['name']}]({rf['url']})")
+                st.markdown(f"{_icon} [{rf['name']}]({rf['url']})")
             with col2:
                 if st.button("删除", key=f"del_ref_{idx}"):
                     ref_files.pop(idx)

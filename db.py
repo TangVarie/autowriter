@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS projects (
     name         TEXT NOT NULL,
     brand        TEXT,
     system_prompt TEXT,
+    system_prompt_tone TEXT,
+    system_prompt_exec TEXT,
     tactics      JSONB DEFAULT '[]'::jsonb,
     reference_files JSONB DEFAULT '[]'::jsonb,
     default_params  JSONB DEFAULT '{}'::jsonb,
@@ -48,6 +50,9 @@ CREATE TABLE IF NOT EXISTS projects (
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 CREATE POLICY IF NOT EXISTS projects_owner ON projects
     USING (owner_id = auth.uid());
+-- Migration: add dual-prompt columns if upgrading from older schema
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_tone TEXT;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_exec TEXT;
 
 -- Batches
 CREATE TABLE IF NOT EXISTS batches (
