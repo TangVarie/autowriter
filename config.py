@@ -21,6 +21,10 @@ def _get_secret(key: str, default: str = "") -> str:
 
 # ── Anthropic ──────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY: str = _get_secret("ANTHROPIC_API_KEY")
+# Optional: set to a proxy base URL (e.g. https://vip.aipro.love) to route
+# Claude requests through a third-party API gateway. Leave empty to use the
+# official Anthropic endpoint.
+ANTHROPIC_BASE_URL: str = _get_secret("ANTHROPIC_BASE_URL")
 
 # Available Claude models: model_id -> display label
 # All three support Extended Thinking; Opus 4.6 uses "effort", others use "budget_tokens"

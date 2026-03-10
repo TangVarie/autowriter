@@ -301,7 +301,10 @@ class ClaudeEngine:
     def __init__(self) -> None:
         if not config.ANTHROPIC_API_KEY:
             raise RuntimeError("ANTHROPIC_API_KEY 未配置")
-        self._client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
+        if config.ANTHROPIC_BASE_URL:
+            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
+        self._client = anthropic.Anthropic(**client_kwargs)
 
     def _build_content(
         self, text: str, images: Optional[list[dict]] = None

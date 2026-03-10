@@ -80,7 +80,10 @@ def classify_feedback(
         return "project", feedback_text
 
     try:
-        client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
+        if config.ANTHROPIC_BASE_URL:
+            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
+        client = anthropic.Anthropic(**client_kwargs)
         user_msg = feedback_text
         if project_name:
             user_msg = f"[当前项目：{project_name}]\n反馈：{feedback_text}"
