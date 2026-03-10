@@ -179,6 +179,85 @@ def ingest_batch_feedbacks(
     return results
 
 
+# ── AI-generated calibration notes ────────────────────────────────────────
+
+_CALIBRATION_SYSTEM = """\
+你是一个内容策划顾问，负责帮创作者形成对 AI 的「品味校准」。
+
+你会收到一批内容创作的互动记录（原始生成、用户反馈、迭代修改、最终通过情况），以及之前已有的调教笔记（如有）。
+
+你的任务是生成/更新「调教笔记」。调教笔记的特点：
+- 不是规则列表，而是感受性的观察（例："用户喜欢有温度的收尾，而不是 call-to-action 式结尾"）
+- 关注「为什么这样被接受/拒绝」，而不是「什么词不能用」（那是记忆的职责）
+- 捕捉用户说不清楚但行为里体现出来的隐性审美偏好
+- 适当保留之前笔记中仍然成立的观察，融入新的发现
+
+输出格式：纯文本，每条观察用「-」开头，不超过 15 条，总长不超过 600 字。
+只输出调教笔记正文，不要有任何标题或前缀说明。"""
+
+
+def generate_calibration_notes(
+    project_name: str,
+    existing_notes: str,
+    items_with_versions: list[dict],
+) -> str:
+    """
+    Generate/update calibration notes by analysing iteration history.
+
+    items_with_versions: list of item dicts, each with a 'versions' list
+    (sorted ascending by version_num; each version has title, body, feedback).
+    Returns updated calibration notes as plain text.
+    """
+    sections: list[str] = []
+
+    approved = [it for it in items_with_versions if it.get("status") == "approved"]
+    iterated = [it for it in items_with_versions if len(it.get("versions", [])) > 1]
+
+    if approved:
+        parts = []
+        for i, item in enumerate(approved[:8], 1):
+            vs = item.get("versions", [])
+            final = vs[-1] if vs else {}
+            title = final.get("title", "")
+            body = (final.get("body", "") or "")[:200].split("\n")[0]
+            parts.append(f"{i}. 标题：{title}\n   正文节选：{body}")
+        sections.append("【已通过文案】\n" + "\n\n".join(parts))
+
+    if iterated:
+        chains = []
+        for item in iterated[:6]:
+            vs = sorted(item.get("versions", []), key=lambda v: v.get("version_num", 0))
+            steps = []
+            for v in vs:
+                fb = v.get("feedback", "")
+                title = v.get("title", "")
+                body = (v.get("body", "") or "")[:100].split("\n")[0]
+                vn = v.get("version_num", "?")
+                if fb:
+                    steps.append(f"  v{vn}《{title}》\n  → 反馈：{fb}")
+                else:
+                    steps.append(f"  v{vn}《{title}》正文：{body}")
+            chains.append("\n".join(steps))
+        sections.append("【迭代过程记录】\n" + "\n\n---\n".join(chains))
+
+    if not sections:
+        return existing_notes  # 没有足够数据，保持原样
+
+    user_content = f"项目名称：{project_name}\n\n"
+    if existing_notes and existing_notes.strip():
+        user_content += f"现有调教笔记：\n{existing_notes.strip()}\n\n"
+    user_content += "本次互动记录：\n" + "\n\n".join(sections) + "\n\n请生成更新后的调教笔记。"
+
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    resp = client.messages.create(
+        model=config.CLAUDE_MODEL,
+        max_tokens=1024,
+        system=_CALIBRATION_SYSTEM,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    return resp.content[0].text.strip()
+
+
 # ── Streamlit memory management UI ────────────────────────────────────────
 
 def render_memory_manager(

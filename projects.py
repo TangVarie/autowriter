@@ -234,28 +234,24 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
 
     # ── 调校笔记 ──────────────────────────────────────────────────────────
     st.divider()
-    st.markdown("#### 📝 调校笔记")
+    st.markdown("#### 📝 调教笔记")
     st.caption(
-        "记录迭代过程中的感受、观察和校准方向——不需要是规则，是你对这个项目的「品味积累」。"
-        "每次生成时会原文注入 System Prompt，让 AI 理解你的审美偏好。"
+        "AI 基于你每轮审稿互动（通过了什么、改掉了什么、怎么改的）自动提炼的品味积累，"
+        "不是你手写的规则，而是 AI 对你审美倾向的内化认知。"
+        "在「审核与迭代」页点击「🧠 更新调教笔记」自动生成，每次生成时原文注入 System Prompt。"
+        "也可在此手动补充或微调。"
     )
     st.session_state.setdefault("calibration_notes_textarea", project.get("calibration_notes") or "")
     calibration_text = st.text_area(
-        "调校笔记",
+        "调教笔记",
         height=200,
-        placeholder=(
-            "例：\n"
-            "- 上次几篇结尾太生硬，感觉像广告收尾，要更自然\n"
-            "- 场景感强的比干讲卖点的效果好很多\n"
-            "- 用「你」比用「大家」更有代入感\n"
-            "- 标题带具体数字的点击率明显更好"
-        ),
+        placeholder="（空白时由审稿页「🧠 更新调教笔记」自动生成）",
         key="calibration_notes_textarea",
         label_visibility="collapsed",
     )
-    if st.button("💾 保存调校笔记", use_container_width=True):
+    if st.button("💾 保存调教笔记", use_container_width=True):
         db.update_project(client, project["id"], {"calibration_notes": calibration_text})
-        st.success("调校笔记已保存，下次生成时生效。")
+        st.success("调教笔记已保存，下次生成时生效。")
 
 
 def _render_tactics_settings(client: Client, project: dict) -> None:

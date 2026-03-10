@@ -1278,7 +1278,7 @@ def page_review(project: dict) -> None:
     st.markdown("<div class='section-label'>批量操作</div>", unsafe_allow_html=True)
     st.caption("多批次合并导出请前往「📤 导出中心」页面。")
 
-    col_feishu, col_mem = st.columns(2)
+    col_feishu, col_mem, col_calib = st.columns(3)
 
     with col_feishu:
         if st.button("🔔 推送本批次到飞书", use_container_width=True):
@@ -1297,6 +1297,34 @@ def page_review(project: dict) -> None:
     with col_mem:
         if st.button("💾 沉淀反馈记忆", use_container_width=True):
             _ingest_all_feedbacks(project, batch_id)
+
+    with col_calib:
+        if st.button("🧠 更新调教笔记", use_container_width=True):
+            _generate_calibration_notes_ui(project, batch_id, items)
+
+    # 调教笔记预览 + 确认保存
+    calib_key = f"pending_calibration_{batch_id}"
+    if calib_key in st.session_state:
+        st.markdown("---")
+        st.markdown("<div class='section-label'>调教笔记预览（可编辑后保存）</div>", unsafe_allow_html=True)
+        edited = st.text_area(
+            "调教笔记",
+            value=st.session_state[calib_key],
+            height=240,
+            key=f"calib_edit_{batch_id}",
+            label_visibility="collapsed",
+        )
+        save_col, discard_col = st.columns(2)
+        with save_col:
+            if st.button("💾 保存到项目设置", key=f"save_calib_{batch_id}", use_container_width=True):
+                db.update_project(db_client, project["id"], {"calibration_notes": edited})
+                del st.session_state[calib_key]
+                st.success("调教笔记已保存，下次生成时生效。")
+                st.rerun()
+        with discard_col:
+            if st.button("✕ 放弃", key=f"discard_calib_{batch_id}", use_container_width=True):
+                del st.session_state[calib_key]
+                st.rerun()
 
 
 def _render_item_card(
@@ -1780,6 +1808,23 @@ def _ingest_all_feedbacks(project: dict, batch_id: str) -> None:
             project_name=project.get("name", ""),
         )
     st.success(f"已沉淀 {len(results)} 条反馈记忆。前往「记忆管理」查看。")
+
+
+def _generate_calibration_notes_ui(project: dict, batch_id: str, items: list[dict]) -> None:
+    """Ask AI to reflect on this batch and generate updated calibration notes."""
+    calib_key = f"pending_calibration_{batch_id}"
+    existing = project.get("calibration_notes") or ""
+    with st.spinner("AI 正在分析本批次互动，生成调教笔记…"):
+        try:
+            notes = mem_module.generate_calibration_notes(
+                project_name=project.get("name", ""),
+                existing_notes=existing,
+                items_with_versions=items,
+            )
+            st.session_state[calib_key] = notes
+            st.rerun()
+        except Exception as e:
+            st.error(f"生成失败：{e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
