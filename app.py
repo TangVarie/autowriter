@@ -709,6 +709,7 @@ selected_project = proj_module.render_project_switcher(db_client, user_id)
 _NAV_ITEMS = {
     "✍️  生成": "生成工作台",
     "🔍  审核": "审核与迭代",
+    "📤  导出": "导出中心",
     "🧠  记忆": "记忆管理",
     "⚙️  项目": "项目设置",
     "📋  历史": "批次历史",
@@ -1235,34 +1236,13 @@ def page_review(project: dict) -> None:
 
     # ── Batch actions ──────────────────────────────────────────────────
     st.divider()
-    st.markdown("<div class='section-label'>批量操作 &amp; 导出</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-label'>批量操作</div>", unsafe_allow_html=True)
+    st.caption("多批次合并导出请前往「📤 导出中心」页面。")
 
-    col_exp, col_feishu, col_mem = st.columns(3)
-
-    with col_exp:
-        approved_items = _collect_approved_items(items)
-        if not approved_items:
-            st.caption("暂无已通过稿件可导出。")
-        else:
-            try:
-                xlsx_bytes = exporter.build_excel_document(
-                    items=approved_items,
-                    project_name=project.get("name", ""),
-                    brand=project.get("brand", ""),
-                    tactic=selected_batch.get("tactic", ""),
-                )
-                st.download_button(
-                    label="📊 导出 Excel",
-                    data=xlsx_bytes,
-                    file_name=f"xhs_{project.get('brand','')}_稿件.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            except RuntimeError as e:
-                st.error(str(e))
+    col_feishu, col_mem = st.columns(2)
 
     with col_feishu:
-        if st.button("🔔 推送到飞书", use_container_width=True):
+        if st.button("🔔 推送本批次到飞书", use_container_width=True):
             if not config.FEISHU_WEBHOOK_URL:
                 st.warning("飞书 Webhook 未配置（FEISHU_WEBHOOK_URL）。")
             else:
@@ -1273,10 +1253,7 @@ def page_review(project: dict) -> None:
                     brand=project.get("brand", ""),
                     tactic=selected_batch.get("tactic", ""),
                 )
-                if ok:
-                    st.success("已推送到飞书。")
-                else:
-                    st.error("飞书推送失败，请检查 Webhook 配置。")
+                st.success("已推送到飞书。") if ok else st.error("飞书推送失败，请检查 Webhook 配置。")
 
     with col_mem:
         if st.button("💾 沉淀反馈记忆", use_container_width=True):
@@ -1623,6 +1600,151 @@ def _ingest_all_feedbacks(project: dict, batch_id: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# PAGE: 导出中心
+# ═══════════════════════════════════════════════════════════════════════════
+
+def page_export(project: dict) -> None:
+    pname = _html.escape(project.get("name", ""))
+    _page_header("📤", "导出中心", f"项目：{pname}")
+
+    batches = db.list_batches(db_client, project["id"], limit=50)
+    if not batches:
+        st.info("暂无批次，请先在「生成工作台」生成内容。")
+        return
+
+    st.markdown(
+        "<p style='font-size:0.875rem;color:var(--text-2);margin-bottom:16px'>"
+        "勾选要导出的批次，点击「生成导出文件」统一输出为 Excel。"
+        "每篇内容独占一个单元格，格式为：标题 / 正文 / 关键词。</p>",
+        unsafe_allow_html=True,
+    )
+
+    project_name = project.get("name", "")
+
+    # ── Batch selector table ────────────────────────────────────────────
+    # Pre-load approved counts for all batches in bulk (one query per batch,
+    # acceptable for ≤50 batches; can be optimised later with a view).
+    batch_meta: list[dict] = []
+    for batch in batches:
+        items = db.list_items(db_client, batch["id"])
+        approved = sum(1 for it in items if it["status"] == "approved")
+        total    = len(items)
+        batch_meta.append({
+            "batch":    batch,
+            "items":    items,
+            "approved": approved,
+            "total":    total,
+        })
+
+    batch_selections: dict[str, bool] = {}
+    for meta in batch_meta:
+        batch    = meta["batch"]
+        approved = meta["approved"]
+        total    = meta["total"]
+        label    = _format_batch_label(batch, project_name)
+        tactic   = batch.get("tactic", "通用") or "通用"
+
+        col_ck, col_info = st.columns([1, 11])
+        with col_ck:
+            checked = st.checkbox(
+                "选择", key=f"exp_batch_{batch['id']}",
+                label_visibility="collapsed",
+                value=st.session_state.get(f"exp_batch_{batch['id']}", False),
+            )
+        with col_info:
+            badge_color = "green" if approved == total and total > 0 else "amber"
+            st.markdown(
+                f"<span style='font-size:0.9rem;font-weight:500'>{_html.escape(label)}</span>"
+                f"&nbsp;&nbsp;<span style='font-size:0.8rem;color:var(--text-3)'>"
+                f"{tactic} · {approved}/{total} 篇已通过</span>",
+                unsafe_allow_html=True,
+            )
+        batch_selections[batch["id"]] = checked
+
+    selected_ids = [bid for bid, v in batch_selections.items() if v]
+    n_selected   = len(selected_ids)
+
+    # Quick-select buttons
+    qcol1, qcol2, _ = st.columns([2, 2, 8])
+    with qcol1:
+        if st.button("全选", key="exp_select_all"):
+            for meta in batch_meta:
+                st.session_state[f"exp_batch_{meta['batch']['id']}"] = True
+            st.rerun()
+    with qcol2:
+        if st.button("取消全选", key="exp_deselect_all"):
+            for meta in batch_meta:
+                st.session_state[f"exp_batch_{meta['batch']['id']}"] = False
+            st.rerun()
+
+    st.divider()
+
+    # ── Export controls ─────────────────────────────────────────────────
+    # Show previously generated export if available
+    exp_state = st.session_state.get("export_center_result")
+    if exp_state:
+        st.success(f"文件已就绪，共 {exp_state['count']} 篇内容，来自 {exp_state['n_batches']} 个批次。")
+        dl_col, clr_col = st.columns([3, 1])
+        with dl_col:
+            st.download_button(
+                label=f"📊 下载 Excel（{exp_state['count']} 篇）",
+                data=exp_state["bytes"],
+                file_name=exp_state["filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+        with clr_col:
+            if st.button("清除", key="exp_clear", use_container_width=True):
+                del st.session_state["export_center_result"]
+                st.rerun()
+
+    # Map batch_id → items for fast lookup (already loaded above)
+    batch_items_map = {meta["batch"]["id"]: meta["items"] for meta in batch_meta}
+
+    gen_label = f"📥 生成导出文件（{n_selected} 个批次）" if n_selected else "📥 生成导出文件"
+    if st.button(gen_label, type="primary", disabled=(n_selected == 0), use_container_width=True):
+        all_items: list[dict] = []
+        for bid in selected_ids:
+            all_items.extend(_collect_approved_items(batch_items_map.get(bid, [])))
+
+        if not all_items:
+            st.warning("选中的批次中没有已通过的内容，请先在「审核与迭代」中通过稿件。")
+        else:
+            try:
+                xlsx_bytes = exporter.build_combined_excel(all_items)
+                brand = project.get("brand", "") or project_name
+                filename = f"xhs_{brand}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+                st.session_state["export_center_result"] = {
+                    "bytes":    xlsx_bytes,
+                    "count":    len(all_items),
+                    "n_batches": n_selected,
+                    "filename": filename,
+                }
+                st.rerun()
+            except RuntimeError as e:
+                st.error(str(e))
+
+    # ── Feishu push (multi-batch) ───────────────────────────────────────
+    if config.FEISHU_WEBHOOK_URL and n_selected > 0:
+        st.divider()
+        if st.button("🔔 推送选中批次到飞书", use_container_width=True):
+            all_items = []
+            for bid in selected_ids:
+                all_items.extend(_collect_approved_items(batch_items_map.get(bid, [])))
+            if not all_items:
+                st.warning("选中的批次中没有已通过的内容。")
+            else:
+                ok = exporter.push_to_feishu(
+                    items=all_items,
+                    project_name=project_name,
+                    brand=project.get("brand", ""),
+                    tactic="混合批次",
+                )
+                st.success("已推送到飞书。") if ok else st.error("飞书推送失败，请检查 Webhook 配置。")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # PAGE: 项目设置
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1705,6 +1827,9 @@ if page == "生成工作台":
 elif page == "审核与迭代":
     if selected_project:
         page_review(selected_project)
+elif page == "导出中心":
+    if selected_project:
+        page_export(selected_project)
 elif page == "记忆管理":
     page_memory(selected_project)
 elif page == "项目设置":

@@ -29,7 +29,59 @@ except ImportError:
 import config
 
 
-# ── Excel Export ──────────────────────────────────────────────────────────
+# ── Combined single-column Excel ───────────────────────────────────────────
+
+def build_combined_excel(items: list[dict]) -> bytes:
+    """
+    Build a single-column Excel where every piece of copy occupies one cell.
+
+    Cell format (newline-separated within the cell):
+        标题：[title]
+        正文：[body]
+        #keyword1 #keyword2 #keyword3
+
+    Designed for copy-paste into Feishu / Notion tables or direct posting.
+    """
+    if not _OPENPYXL_AVAILABLE:
+        raise RuntimeError("openpyxl 未安装，请运行 pip install openpyxl")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "内容"
+
+    cell_align = Alignment(vertical="top", wrap_text=True)
+
+    for row_idx, item in enumerate(items, 1):
+        title = (item.get("title") or "").strip()
+        body  = (item.get("body")  or "").strip()
+
+        keywords = item.get("keywords", [])
+        if isinstance(keywords, str):
+            try:
+                keywords = json.loads(keywords)
+            except Exception:
+                keywords = [k.strip() for k in keywords.split(",") if k.strip()]
+        kw_str = " ".join(f"#{k}" for k in keywords if k) if keywords else ""
+
+        parts: list[str] = []
+        if title:
+            parts.append(f"标题：{title}")
+        if body:
+            parts.append(f"正文：{body}")
+        if kw_str:
+            parts.append(kw_str)
+
+        cell = ws.cell(row=row_idx, column=1, value="\n".join(parts))
+        cell.alignment = cell_align
+
+    ws.column_dimensions["A"].width = 80
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── Legacy multi-column Excel ───────────────────────────────────────────────
 
 def build_excel_document(
     items: list[dict],
