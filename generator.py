@@ -517,26 +517,34 @@ class GeminiEngine:
         gen_config = self._make_generate_config(use_thinking, model)
         gen_config.system_instruction = system_prompt
         try:
-            history = []
-            for msg in messages[:-1]:
-                role = "user" if msg["role"] == "user" else "model"
-                content = msg["content"]
+            def _msg_to_str(content) -> str:
                 if isinstance(content, list):
-                    content = " ".join(
+                    return " ".join(
                         b.get("text", "") for b in content if b.get("type") == "text"
                     )
-                history.append({"role": role, "parts": [content]})
+                return str(content)
 
-            last_msg = messages[-1]
-            last_text = last_msg["content"]
-            if isinstance(last_text, list):
-                last_text = " ".join(
-                    b.get("text", "") for b in last_text if b.get("type") == "text"
+            history = [
+                genai_types.Content(
+                    role="user" if msg["role"] == "user" else "model",
+                    parts=[genai_types.Part.from_text(text=_msg_to_str(msg["content"]))],
                 )
+                for msg in messages[:-1]
+            ]
+
+            last_text = _msg_to_str(messages[-1]["content"])
+            import base64
+            last_parts = [
+                genai_types.Part.from_bytes(
+                    data=base64.b64decode(img["data"]),
+                    mime_type=img["media_type"],
+                )
+                for img in (images or [])
+            ] + [genai_types.Part.from_text(text=last_text)]
 
             response = self._client.models.generate_content(
                 model=model,
-                contents=history + [{"role": "user", "parts": self._build_parts(last_text, images)}],
+                contents=history + [genai_types.Content(role="user", parts=last_parts)],
                 config=gen_config,
             )
             return self._parse_gemini_response(response, model)
