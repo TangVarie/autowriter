@@ -1352,12 +1352,19 @@ def _render_item_card(
 
         # Multi-version comparison (if multiple engines were used)
         unique_engines = {v.get("ai_engine", "").split("/")[0] for v in versions}
-        if len(unique_engines) > 1:
-            _render_version_comparison(versions, item_id)
-        else:
-            _render_single_version(display_version)
+        is_multi_engine = len(unique_engines) > 1
+        best_vid = item.get("best_version_id")
 
-        # Status controls
+        if is_multi_engine and not best_vid:
+            # 对比模式：两引擎并排，各自独立改写，全局迭代区隐藏
+            _render_version_comparison(versions, item_id, item, batch, project, _bp)
+            show_global_iteration = False
+        else:
+            # 单篇模式（单引擎 或 已选最佳）
+            _render_single_version(display_version)
+            show_global_iteration = True
+
+        # Status controls（始终显示）
         col_approve, col_revise = st.columns(2)
         with col_approve:
             if st.button("✅ 通过", key=f"approve_{item_id}", use_container_width=True):
@@ -1396,8 +1403,8 @@ def _render_item_card(
                 label_text = "⭐ 正案例" if example_label == "positive" else "👎 反案例"
                 st.caption(f"已标记：{label_text}")
 
-        # Feedback & iteration
-        if status in ("pending", "needs_revision"):
+        # Feedback & iteration（对比模式未选最佳时隐藏，由各引擎列内部处理）
+        if show_global_iteration and status in ("pending", "needs_revision"):
             st.markdown("<div class='section-label' style='margin-top:12px'>修改意见</div>", unsafe_allow_html=True)
 
             # Quick tags
@@ -1464,8 +1471,14 @@ def _render_item_card(
                 if not combined_feedback:
                     st.warning("请先填写修改意见或选择快捷标签。")
                 else:
+                    # 已选最佳时只用该引擎的版本作历史，避免跨引擎混淆
+                    disp_engine_short = display_version.get("ai_engine", "").split("/")[0]
+                    iter_versions = (
+                        [v for v in versions if v.get("ai_engine", "").split("/")[0] == disp_engine_short]
+                        if best_vid else versions
+                    )
                     _run_iteration(
-                        item, versions, batch, project,
+                        item, iter_versions, batch, project,
                         combined_feedback, iter_engine, iter_model,
                         use_thinking_override=iter_use_thinking,
                     )
@@ -1551,9 +1564,15 @@ def _render_single_version(version: dict) -> None:
             st.code(raw_text, language=None)
 
 
-def _render_version_comparison(versions: list[dict], item_id: str) -> None:
-    """Side-by-side multi-engine version comparison."""
-    # Group by engine
+def _render_version_comparison(
+    versions: list[dict],
+    item_id: str,
+    item: dict,
+    batch: dict,
+    project: dict,
+    _bp: dict,
+) -> None:
+    """Side-by-side multi-engine version comparison with per-engine iteration."""
     by_engine: dict[str, list[dict]] = {}
     for v in versions:
         engine = v.get("ai_engine", "unknown")
@@ -1561,23 +1580,85 @@ def _render_version_comparison(versions: list[dict], item_id: str) -> None:
 
     cols = st.columns(len(by_engine))
     engine_list = list(by_engine.keys())
+    status = item["status"]
 
-    for col_idx, (col, engine) in enumerate(zip(cols, engine_list)):
+    for col, engine in zip(cols, engine_list):
         with col:
-            eng_cls = engine.split("/")[0].lower()
-            eng_cls = eng_cls if eng_cls in ("claude", "gemini") else ""
+            eng_short = engine.split("/")[0].lower()
+            eng_cls = eng_short if eng_short in ("claude", "gemini") else ""
             st.markdown(
                 f"<span class='engine-badge {eng_cls}'>{_html.escape(engine.upper())}</span>",
                 unsafe_allow_html=True,
             )
             latest = sorted(by_engine[engine], key=lambda x: x.get("version_num", 0))[-1]
             _render_single_version(latest)
-            if st.button(f"选为最佳", key=f"best_{item_id}_{engine}"):
+
+            # 选为最佳：只记录 best_version_id，不直接通过
+            if st.button("选为最佳", key=f"best_{item_id}_{engine}"):
                 db.update_item_status(
-                    db_client, item_id, "approved",
-                    best_version_id=latest["id"]
+                    db_client, item_id, status,
+                    best_version_id=latest["id"],
                 )
                 st.rerun()
+
+            # 每引擎独立迭代入口
+            if status in ("pending", "needs_revision"):
+                with st.expander("🔄 改写此版", expanded=False):
+                    eng_versions = [
+                        v for v in versions
+                        if v.get("ai_engine", "").split("/")[0] == eng_short
+                    ]
+                    sel_tags = st.multiselect(
+                        "快捷标签",
+                        QUICK_FEEDBACK_TAGS,
+                        key=f"tags_{item_id}_{engine}",
+                        label_visibility="collapsed",
+                    )
+                    fb_text = st.text_area(
+                        "详细反馈（可选）",
+                        key=f"feedback_{item_id}_{engine}",
+                        height=68,
+                        placeholder="修改意见...",
+                    )
+                    combined_fb = (
+                        "、".join(sel_tags) + ("；" + fb_text if fb_text else "")
+                    ).strip("、；")
+
+                    if eng_short == "claude":
+                        iter_model = st.selectbox(
+                            "模型",
+                            list(config.CLAUDE_MODELS.keys()),
+                            format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
+                            key=f"iter_model_{item_id}_{engine}",
+                            index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
+                                  if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
+                        )
+                        _default_thinking = _bp.get("use_thinking", False) if isinstance(_bp, dict) else False
+                        iter_think = st.checkbox(
+                            "深度思考",
+                            value=_default_thinking,
+                            key=f"iter_think_{item_id}_{engine}",
+                        )
+                    else:
+                        iter_model = st.selectbox(
+                            "模型",
+                            list(config.GEMINI_MODELS.keys()),
+                            format_func=lambda m: config.GEMINI_MODELS.get(m, m),
+                            key=f"iter_model_{item_id}_{engine}",
+                            index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
+                                  if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
+                        )
+                        iter_think = False
+
+                    if st.button("🔄 改写", key=f"regen_{item_id}_{engine}", use_container_width=True):
+                        if not combined_fb:
+                            st.warning("请先填写修改意见或选择快捷标签。")
+                        else:
+                            _run_iteration(
+                                item, eng_versions, batch, project,
+                                combined_fb, eng_short, iter_model,
+                                use_thinking_override=iter_think,
+                            )
 
 
 def _run_iteration(
