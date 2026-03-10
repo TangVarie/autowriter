@@ -53,29 +53,13 @@ class GenerationResult:
 
 # ── Prompt templates ───────────────────────────────────────────────────────
 
-_BASE_USER_PROMPT = """请根据以上系统提示词，生成一篇小红书文案。
-
-要求：
-- 标题：15–22字，吸引眼球，可以带数字或疑问句
-- 正文：300–500字，口语化，有场景感
-- 关键词：3–5个，用于标签
-
-以如下 JSON 格式输出（只返回 JSON，不要有其他内容）：
-{{
-  "title": "文案标题",
-  "body": "文案正文（换行用\\n）",
-  "keywords": ["关键词1", "关键词2", "关键词3"]
-}}
-
-{extra_instructions}"""
-
-
 def _make_user_prompt(
     tactic: str,
     target_audience: str = "",
     key_messages: str = "",
     tone: str = "",
     extra: str = "",
+    count: int = 1,
 ) -> str:
     parts: list[str] = []
     if tactic:
@@ -86,12 +70,38 @@ def _make_user_prompt(
         parts.append(f"核心卖点/关键词：{key_messages}")
     if tone:
         parts.append(f"语气偏好：{tone}")
-
-    extra_text = "\n".join(parts)
     if extra:
-        extra_text += f"\n补充说明：{extra}"
+        parts.append(f"补充说明：{extra}")
 
-    return _BASE_USER_PROMPT.format(extra_instructions=extra_text)
+    context = "\n".join(parts)
+    if context:
+        context += "\n\n"
+
+    if count == 1:
+        return (
+            f"{context}请根据以上系统提示词，生成一篇小红书文案。\n\n"
+            "要求：\n"
+            "- 标题：15–22字，吸引眼球，可以带数字或疑问句\n"
+            "- 正文：300–500字，口语化，有场景感\n"
+            "- 关键词：3–5个，用于标签\n\n"
+            "以如下 JSON 格式输出（只返回 JSON，不要有其他内容）：\n"
+            '{\n  "title": "文案标题",\n  "body": "文案正文（换行用\\n）",\n'
+            '  "keywords": ["关键词1", "关键词2", "关键词3"]\n}'
+        )
+    else:
+        return (
+            f"{context}请根据以上系统提示词，生成 {count} 篇风格各异的小红书文案。\n\n"
+            "要求：\n"
+            "- 每篇标题：15–22字，吸引眼球，可以带数字或疑问句\n"
+            "- 每篇正文：300–500字，口语化，有场景感\n"
+            "- 每篇关键词：3–5个，用于标签\n"
+            f"- {count} 篇之间必须角度各异、场景不同、标题句式有差异，不能重复\n\n"
+            f"以如下 JSON 数组格式输出（只返回包含 {count} 个元素的 JSON 数组，不要有其他内容）：\n"
+            "[\n"
+            '  {"title": "文案标题", "body": "文案正文（换行用\\n）", "keywords": ["关键词1", "关键词2"]},\n'
+            "  ...\n"
+            "]"
+        )
 
 
 # ── Anthropic retry helper ─────────────────────────────────────────────────
@@ -279,6 +289,64 @@ def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
     )
 
 
+def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[GenerationResult]:
+    """
+    Parse a JSON array of N copy items from AI output.
+    Falls back to single-item parse if the array can't be found.
+    """
+    stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
+
+    for src in (stripped, text):
+        start = src.find('[')
+        end = src.rfind(']')
+        if start == -1 or end <= start:
+            continue
+        json_str = src[start:end + 1]
+        data = None
+        for candidate in (json_str, _fix_json_newlines(json_str)):
+            try:
+                data = json.loads(candidate)
+                break
+            except (json.JSONDecodeError, ValueError):
+                pass
+        if not isinstance(data, list):
+            continue
+
+        results: list[GenerationResult] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            keywords = item.get("keywords", [])
+            if isinstance(keywords, str):
+                keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
+            results.append(GenerationResult(
+                title=str(item.get("title", "")).strip(),
+                body=str(item.get("body", "")).strip(),
+                keywords=keywords,
+                ai_engine=ai_engine,
+                raw_text=text,
+            ))
+        if results:
+            # Pad if AI returned fewer items than requested
+            while len(results) < count:
+                results.append(GenerationResult(
+                    title="", body="", keywords=[], ai_engine=ai_engine,
+                    raw_text=text,
+                    error=f"AI仅返回了{len(results)}篇（期望{count}篇）",
+                ))
+            return results[:count]
+
+    # Fallback: single-item parse
+    single = _parse_copy_json(text, ai_engine)
+    results = [single]
+    while len(results) < count:
+        results.append(GenerationResult(
+            title="", body="", keywords=[], ai_engine=ai_engine,
+            error="无法解析多篇格式，仅返回1篇",
+        ))
+    return results
+
+
 # ── Claude engine ──────────────────────────────────────────────────────────
 
 def _extract_text_from_response(response) -> str:
@@ -334,10 +402,10 @@ class ClaudeEngine:
         content.append({"type": "text", "text": text})
         return content
 
-    def _make_params(self, model: str, use_thinking: bool) -> dict:
+    def _make_params(self, model: str, use_thinking: bool, count: int = 1) -> dict:
         if use_thinking:
             return {"model": model, **_claude_thinking_params(model)}
-        return {"model": model, "max_tokens": 2048}
+        return {"model": model, "max_tokens": max(2048, count * 1500)}
 
     def generate(
         self,
@@ -346,9 +414,10 @@ class ClaudeEngine:
         images: Optional[list[dict]] = None,
         use_thinking: bool = False,
         model: str = "",
-    ) -> GenerationResult:
+        count: int = 1,
+    ) -> list[GenerationResult]:
         model = model or config.CLAUDE_MODEL
-        params = self._make_params(model, use_thinking)
+        params = self._make_params(model, use_thinking, count)
         def _call():
             with self._client.messages.stream(
                 **params,
@@ -359,17 +428,20 @@ class ClaudeEngine:
         try:
             response = _call_with_retry(_call)
             text = _extract_text_from_response(response)
-            result = _parse_copy_json(text, f"claude/{model}")
-            result.token_usage = {
+            token_usage = {
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
             }
-            return result
+            results = _parse_copy_json_list(text, count, f"claude/{model}") if count > 1 \
+                else [_parse_copy_json(text, f"claude/{model}")]
+            for r in results:
+                r.token_usage = token_usage
+            return results
         except anthropic.APIError as e:
-            return GenerationResult(
+            return [GenerationResult(
                 title="", body="", keywords=[], ai_engine=f"claude/{model}",
                 error=f"Claude API错误: {e}"
-            )
+            )] * count
 
     def iterate(
         self,
@@ -433,7 +505,7 @@ class GeminiEngine:
         parts.append(text)
         return parts
 
-    def _make_generate_config(self, use_thinking: bool, model: str = "") -> "genai_types.GenerateContentConfig":
+    def _make_generate_config(self, use_thinking: bool, model: str = "", count: int = 1) -> "genai_types.GenerateContentConfig":
         """
         Build GenerateContentConfig.
 
@@ -446,7 +518,7 @@ class GeminiEngine:
         When use_thinking=False we only set budget=0 for models that support it
         (Gemini 2.5). For Gemini 3.x we leave ThinkingConfig out entirely.
         """
-        kwargs: dict = {"max_output_tokens": 8192}
+        kwargs: dict = {"max_output_tokens": max(8192, count * 2000)}
         is_gemini3 = "gemini-3" in model
         try:
             if use_thinking:
@@ -479,9 +551,10 @@ class GeminiEngine:
         images: Optional[list[dict]] = None,
         use_thinking: bool = False,
         model: str = "",
-    ) -> GenerationResult:
+        count: int = 1,
+    ) -> list[GenerationResult]:
         model = model or config.GEMINI_MODEL
-        gen_config = self._make_generate_config(use_thinking, model)
+        gen_config = self._make_generate_config(use_thinking, model, count)
         gen_config.system_instruction = system_prompt
         try:
             response = self._client.models.generate_content(
@@ -489,12 +562,25 @@ class GeminiEngine:
                 contents=self._build_parts(user_prompt, images),
                 config=gen_config,
             )
-            return self._parse_gemini_response(response, model)
+            text = response.text or ""
+            usage = getattr(response, "usage_metadata", None)
+            token_usage = {}
+            if usage:
+                token_usage = {
+                    "input": getattr(usage, "prompt_token_count", 0),
+                    "output": getattr(usage, "candidates_token_count", 0),
+                    "thinking": getattr(usage, "thoughts_token_count", 0),
+                }
+            results = _parse_copy_json_list(text, count, f"gemini/{model}") if count > 1 \
+                else [_parse_copy_json(text, f"gemini/{model}")]
+            for r in results:
+                r.token_usage = token_usage
+            return results
         except Exception as e:
-            return GenerationResult(
+            return [GenerationResult(
                 title="", body="", keywords=[], ai_engine=f"gemini/{model}",
                 error=f"Gemini API错误: {e}"
-            )
+            )] * count
 
     def iterate(
         self,
@@ -636,61 +722,60 @@ def generate_batch(
           "tactic": str,
         }
     """
-    base_user_prompt = _make_user_prompt(
+    user_prompt = _make_user_prompt(
         tactic=tactic,
         target_audience=target_audience,
         key_messages=key_messages,
         tone=tone,
         extra=extra_instructions,
+        count=count,
     )
 
-    # Build dedup prompt once upfront using only historical titles.
-    # All items in the batch share the same dedup context so they can
-    # run in parallel; the within-batch summaries are no longer needed.
     dedup_block = _build_dedup_instruction([], historical_titles)
-    user_prompt = base_user_prompt + ("\n\n" + dedup_block if dedup_block else "")
+    if dedup_block:
+        user_prompt += "\n\n" + dedup_block
 
-    total = count * len(engines)
-    done_count = [0]
-    lock = threading.Lock()
+    # One API call per engine, each returning `count` items.
+    # For multi-engine: run engines in parallel (ThreadPoolExecutor).
+    def _call_engine(engine_name: str) -> tuple[str, list[GenerationResult]]:
+        try:
+            engine = get_engine(engine_name)
+            model_override = (engine_models or {}).get(engine_name, "")
+            thinking_flag = (
+                use_thinking if engine_name == "claude"
+                else (gemini_use_thinking if engine_name == "gemini" else False)
+            )
+            items = engine.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                images=images,
+                use_thinking=thinking_flag,
+                model=model_override,
+                count=count,
+            )
+        except Exception as e:
+            items = [GenerationResult(
+                title="", body="", keywords=[], ai_engine=engine_name, error=str(e)
+            )] * count
+        return engine_name, items
 
-    def _generate_slot(i: int) -> tuple[int, list[GenerationResult]]:
-        slot_versions: list[GenerationResult] = []
-        for engine_name in engines:
-            try:
-                engine = get_engine(engine_name)
-                model_override = (engine_models or {}).get(engine_name, "")
-                thinking_flag = (
-                    use_thinking if engine_name == "claude"
-                    else (gemini_use_thinking if engine_name == "gemini" else False)
-                )
-                result = engine.generate(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    images=images,
-                    use_thinking=thinking_flag,
-                    model=model_override,
-                )
-            except Exception as e:
-                result = GenerationResult(
-                    title="", body="", keywords=[], ai_engine=engine_name,
-                    error=str(e)
-                )
-            slot_versions.append(result)
-            with lock:
-                done_count[0] += 1
-                if progress_callback:
-                    progress_callback(done_count[0] / total, f"正在生成第 {i+1}/{count} 篇…")
-        return i, slot_versions
-
-    results: list[dict] = [{}] * count
-    with ThreadPoolExecutor(max_workers=count) as executor:
-        futures = {executor.submit(_generate_slot, i): i for i in range(count)}
+    engine_results: dict[str, list[GenerationResult]] = {}
+    with ThreadPoolExecutor(max_workers=len(engines)) as executor:
+        futures = {executor.submit(_call_engine, eng): eng for eng in engines}
+        total = len(engines)
+        done = 0
         for future in as_completed(futures):
-            i, slot_versions = future.result()
-            results[i] = {"versions": slot_versions, "tactic": tactic}
+            eng, items = future.result()
+            engine_results[eng] = items
+            done += 1
+            if progress_callback:
+                progress_callback(done / total, f"已完成 {done}/{total} 个引擎…")
 
-    return results
+    # Assemble: slot i gets one version per engine
+    return [
+        {"versions": [engine_results[eng][i] for eng in engines], "tactic": tactic}
+        for i in range(count)
+    ]
 
 
 # ── Iterative refinement ───────────────────────────────────────────────────
