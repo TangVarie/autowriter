@@ -164,6 +164,8 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     st.markdown("#### 🎙️ 语态校准模块")
     st.caption("定义品牌语气、人设、句式风格等语言层面的校准规则。")
 
+    st.session_state.setdefault("tone_textarea", tone_default)
+
     tone_upload = st.file_uploader(
         "从 .md 文件导入语态模块",
         type=["md", "txt"],
@@ -171,15 +173,13 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     )
     if tone_upload is not None:
         try:
-            tone_default = tone_upload.read().decode("utf-8")
-            st.session_state["tone_textarea"] = tone_default
-            st.success(f"已读取：{tone_upload.name}（{len(tone_default)} 字符）")
+            st.session_state["tone_textarea"] = tone_upload.read().decode("utf-8")
+            st.success(f"已读取：{tone_upload.name}（{len(st.session_state['tone_textarea'])} 字符）")
         except Exception as e:
             st.error(f"读取失败：{e}")
 
     tone_text = st.text_area(
         "语态校准提示词",
-        value=tone_default,
         height=280,
         placeholder="在此粘贴语态校准 Prompt，或通过上方上传 .md 文件...",
         key="tone_textarea",
@@ -191,6 +191,8 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     st.markdown("#### 🎯 执行模块")
     st.caption("定义内容结构、选题逻辑、具体写作指令等内容层面的执行规则。")
 
+    st.session_state.setdefault("exec_textarea", exec_default)
+
     exec_upload = st.file_uploader(
         "从 .md 文件导入执行模块",
         type=["md", "txt"],
@@ -198,15 +200,13 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     )
     if exec_upload is not None:
         try:
-            exec_default = exec_upload.read().decode("utf-8")
-            st.session_state["exec_textarea"] = exec_default
-            st.success(f"已读取：{exec_upload.name}（{len(exec_default)} 字符）")
+            st.session_state["exec_textarea"] = exec_upload.read().decode("utf-8")
+            st.success(f"已读取：{exec_upload.name}（{len(st.session_state['exec_textarea'])} 字符）")
         except Exception as e:
             st.error(f"读取失败：{e}")
 
     exec_text = st.text_area(
         "执行模块提示词",
-        value=exec_default,
         height=280,
         placeholder="在此粘贴执行模块 Prompt，或通过上方上传 .md 文件...",
         key="exec_textarea",
