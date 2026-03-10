@@ -19,8 +19,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+import threading
+
 import anthropic
 import config
+
+# Global semaphore to stay under the API provider's concurrent-request limit.
+# Set to 4 to leave headroom below the provider's cap of 5.
+_API_SEMAPHORE = threading.Semaphore(4)
 
 # Gemini import (graceful fallback if not installed)
 try:
@@ -96,29 +102,33 @@ def _make_user_prompt(
 def _call_with_retry(call_fn, max_retries: int = 5):
     """
     Call an Anthropic API callable with exponential backoff.
+
+    Acquires the global _API_SEMAPHORE before each attempt so that the total
+    number of in-flight requests never exceeds the semaphore limit (4), staying
+    safely below the provider's concurrent-request cap (5).
+
     Retries on:
       - RateLimitError (429)
       - APIStatusError with transient codes: 429, 502, 503, 529
-      - APIConnectionError / APITimeoutError (connection dropped, nginx 502 HTML response)
+      - APIConnectionError / APITimeoutError (connection dropped, nginx 502)
     """
     delay = 2
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
-        try:
-            return call_fn()
-        except anthropic.RateLimitError as e:
-            last_error = e
-        except anthropic.APIStatusError as e:
-            if e.status_code in (429, 502, 503, 529):
+        with _API_SEMAPHORE:
+            try:
+                return call_fn()
+            except anthropic.RateLimitError as e:
                 last_error = e
-                if e.status_code == 429:
-                    delay = max(delay, 5)
-            else:
-                raise
-        except anthropic.APIConnectionError as e:
-            # Covers APITimeoutError (subclass) and raw connection drops
-            # (e.g. nginx 502 returning HTML that the SDK cannot parse as JSON)
-            last_error = e
+            except anthropic.APIStatusError as e:
+                if e.status_code in (429, 502, 503, 529):
+                    last_error = e
+                    if e.status_code == 429:
+                        delay = max(delay, 5)
+                else:
+                    raise
+            except anthropic.APIConnectionError as e:
+                last_error = e
         if attempt < max_retries:
             time.sleep(delay)
             delay = min(delay * 2, 60)
