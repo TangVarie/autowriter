@@ -339,11 +339,12 @@ class ClaudeEngine:
         model = model or config.CLAUDE_MODEL
         params = self._make_params(model, use_thinking)
         def _call():
-            return self._client.messages.create(
+            with self._client.messages.stream(
                 **params,
                 system=system_prompt,
                 messages=[{"role": "user", "content": self._build_content(user_prompt, images)}],
-            )
+            ) as stream:
+                return stream.get_final_message()
         try:
             response = _call_with_retry(_call)
             text = _extract_text_from_response(response)
@@ -376,11 +377,12 @@ class ClaudeEngine:
                 messages[-1]["content"] = self._build_content(last_content, images)
         params = self._make_params(model, use_thinking)
         def _call():
-            return self._client.messages.create(
+            with self._client.messages.stream(
                 **params,
                 system=system_prompt,
                 messages=messages,
-            )
+            ) as stream:
+                return stream.get_final_message()
         try:
             response = _call_with_retry(_call)
             text = _extract_text_from_response(response)
@@ -420,22 +422,30 @@ class GeminiEngine:
         parts.append(text)
         return parts
 
-    def _make_generate_config(self, use_thinking: bool) -> "genai_types.GenerateContentConfig":
+    def _make_generate_config(self, use_thinking: bool, model: str = "") -> "genai_types.GenerateContentConfig":
         """
         Build GenerateContentConfig.
 
-        Gemini 3.x series: thinking is on by default; use ThinkingConfig to
-        request dynamic budget (-1) or disable it (budget=0).
+        Gemini 3.x series (e.g. gemini-3.1-*): thinking is on by default and
+        cannot be disabled with budget=0 — omit ThinkingConfig to use the
+        model's own default (thinking on).
         Gemini 2.5 series: thinking opt-in via ThinkingConfig(thinking_budget>0).
+
+        When use_thinking=True we explicitly request dynamic budget (-1).
+        When use_thinking=False we only set budget=0 for models that support it
+        (Gemini 2.5). For Gemini 3.x we leave ThinkingConfig out entirely.
         """
         kwargs: dict = {"max_output_tokens": 8192}
+        is_gemini3 = "gemini-3" in model
         try:
             if use_thinking:
                 kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=-1)
-            else:
+            elif not is_gemini3:
+                # Only pass budget=0 for 2.5 series; 3.x rejects this value
                 kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+            # For Gemini 3.x with use_thinking=False: omit ThinkingConfig,
+            # let the model run with its built-in default (thinking enabled)
         except AttributeError:
-            # Older SDK versions without ThinkingConfig — ignore
             pass
         return genai_types.GenerateContentConfig(**kwargs)
 
@@ -460,7 +470,7 @@ class GeminiEngine:
         model: str = "",
     ) -> GenerationResult:
         model = model or config.GEMINI_MODEL
-        gen_config = self._make_generate_config(use_thinking)
+        gen_config = self._make_generate_config(use_thinking, model)
         gen_config.system_instruction = system_prompt
         try:
             response = self._client.models.generate_content(
@@ -485,7 +495,7 @@ class GeminiEngine:
     ) -> GenerationResult:
         """Convert messages history to Gemini multi-turn format and continue."""
         model = model or config.GEMINI_MODEL
-        gen_config = self._make_generate_config(use_thinking)
+        gen_config = self._make_generate_config(use_thinking, model)
         gen_config.system_instruction = system_prompt
         try:
             history = []
