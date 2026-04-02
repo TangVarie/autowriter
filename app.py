@@ -92,6 +92,8 @@ def _queue_worker(
             gemini_thinking  = plan.get("gemini_use_thinking", False)
             extra_instr      = plan.get("extra_instructions", "")
             use_multi_role   = plan.get("use_multi_role", False)
+            n_roles          = plan.get("n_roles", 3)
+            custom_roles     = proj_module._parse_json_field(project.get("custom_roles"), []) or None
 
             batch_params = {
                 "target_audience":  plan.get("target_audience", ""),
@@ -134,6 +136,8 @@ def _queue_worker(
                     historical_titles=historical_titles or None,
                     use_thinking=use_thinking,
                     gemini_use_thinking=gemini_thinking,
+                    custom_roles=custom_roles,
+                    n_roles=n_roles,
                 )
             else:
                 generation_results = gen_module.generate_batch(
@@ -801,9 +805,11 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         use_thinking    = plan.get("use_thinking", False)
         gemini_thinking = plan.get("gemini_use_thinking", False)
         use_multi_role  = plan.get("use_multi_role", False)
+        n_roles         = plan.get("n_roles", 3)
         extra_instr     = plan.get("extra_instructions", "")
         image_prompt    = plan.get("image_prompt", "")
         images          = plan.get("images") or None
+        custom_roles    = proj_module._parse_json_field(project.get("custom_roles"), []) or None
 
         global_mems, project_mems = db.get_confirmed_memories(
             db_client, user_id, project_id=project_id
@@ -870,6 +876,8 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 historical_titles=historical_titles or None,
                 use_thinking=use_thinking,
                 gemini_use_thinking=gemini_thinking,
+                custom_roles=custom_roles,
+                n_roles=n_roles,
             )
         else:
             generation_results = gen_module.generate_batch(
@@ -1007,6 +1015,11 @@ def _render_queue_tab() -> None:
                         key=f"qp_mr_eng_{i}",
                     )
                     plan["engines"] = q_mr_eng or ["claude"]
+                    plan["n_roles"] = st.slider(
+                        "抽取角色数", min_value=2, max_value=6,
+                        value=plan.get("n_roles", 3), key=f"qp_nroles_{i}",
+                        help="每次从角色池中随机抽取，数量越多并行路数越多",
+                    )
 
             q_em: dict[str, str] = {}
             qm1, qm2 = st.columns(2)
@@ -1082,6 +1095,7 @@ def _render_queue_tab() -> None:
                 "use_thinking":        False,
                 "gemini_use_thinking": False,
                 "use_multi_role":      False,
+                "n_roles":             3,
                 "extra_instructions":  "",
             })
             st.rerun()
@@ -1159,20 +1173,26 @@ def page_generate(project: dict) -> None:
 
         use_multi_role = st.toggle(
             "🎭 多角色起草（三省法）",
-            help="叙事角、洞察角、共情角三个视角并行起草，AI 自动评选最优版并附评审意见。"
+            help="从角色池中随机抽取 N 个视角并行起草，AI 自动评选最优版并附评审意见。"
                  "质量下限更高，延迟与单次生成基本相同。与多引擎比稿互斥。",
         )
 
         engine_models: dict[str, str] = {}
 
         if use_multi_role:
+            _proj_custom_roles = proj_module._parse_json_field(project.get("custom_roles"), [])
+            _role_pool_size = len(_proj_custom_roles) if _proj_custom_roles else len(gen_module.CREATIVE_ROLES_POOL)
+            n_roles = st.slider(
+                "抽取角色数", min_value=2, max_value=min(_role_pool_size, 6), value=3,
+                help=f"每次从角色池（{_role_pool_size} 个）中随机抽取，引入不可预测性。角色池可在「项目设置 → 角色池」中配置。",
+            )
             # Multi-role mode: choose which engines participate
             engines = st.multiselect(
                 "参与角色起草的引擎",
                 gen_module.AVAILABLE_ENGINES,
                 default=["claude"],
                 format_func=lambda e: "Claude" if e == "claude" else "Gemini",
-                help="选两个引擎：3角色×2引擎=6路并行，差异性最大",
+                help=f"选两个引擎：{n_roles}角色×2引擎={n_roles*2}路并行，差异性最大",
             ) or ["claude"]
             if "claude" in engines:
                 engine_models["claude"] = st.selectbox(
@@ -1343,6 +1363,7 @@ def page_generate(project: dict) -> None:
                     "use_thinking":     use_thinking,
                     "gemini_use_thinking": gemini_use_thinking,
                     "use_multi_role":   use_multi_role,
+                    "n_roles":          n_roles if use_multi_role else 3,
                     "target_audience":  target_audience,
                     "key_messages":     key_messages,
                     "tone":             tone,

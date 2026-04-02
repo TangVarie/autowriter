@@ -18,6 +18,7 @@ import streamlit as st
 from supabase import Client
 
 import db
+import generator as gen_module
 
 
 # ── Streamlit session helpers ──────────────────────────────────────────────
@@ -107,8 +108,8 @@ def render_project_settings(client: Client, project: dict, user_id: str) -> None
     """Full-page project settings editor."""
     st.header(f"⚙️ 项目设置 — {project['name']}")
 
-    tab_basic, tab_prompt, tab_tactics, tab_files = st.tabs(
-        ["基本信息", "System Prompt", "战术方向", "参考文件"]
+    tab_basic, tab_prompt, tab_tactics, tab_roles, tab_files = st.tabs(
+        ["基本信息", "System Prompt", "战术方向", "角色池", "参考文件"]
     )
 
     with tab_basic:
@@ -119,6 +120,9 @@ def render_project_settings(client: Client, project: dict, user_id: str) -> None
 
     with tab_tactics:
         _render_tactics_settings(client, project)
+
+    with tab_roles:
+        _render_roles_settings(client, project)
 
     with tab_files:
         _render_file_settings(client, project, user_id)
@@ -342,6 +346,66 @@ def _render_file_settings(client: Client, project: dict, user_id: str) -> None:
                         client, project["id"], {"reference_files": json.dumps(ref_files)}
                     )
                     st.rerun()
+
+
+def _render_roles_settings(client: Client, project: dict) -> None:
+    st.markdown(
+        "配置三省法中书省使用的**角色池**。每次生成时从池中随机抽取 N 个角色起草，"
+        "角色越多样、描述越具体，产出差异性越大。"
+    )
+
+    custom = _parse_json_field(project.get("custom_roles"), [])
+    # If project has no custom roles configured, show the default pool as reference
+    using_default = not custom
+    pool = custom if custom else gen_module.CREATIVE_ROLES_POOL
+
+    if using_default:
+        st.info("当前使用默认角色池（6个内置角色）。修改后将覆盖默认配置，仅对此项目生效。")
+
+    updated_roles = []
+    for i, role in enumerate(pool):
+        col1, col2, col3 = st.columns([2, 5, 1])
+        with col1:
+            rname = st.text_input(f"角色名 {i+1}", value=role.get("name", ""), key=f"r_name_{i}")
+        with col2:
+            rprompt = st.text_area(
+                f"角色 Prompt {i+1}",
+                value=role.get("prompt_suffix", ""),
+                height=80,
+                key=f"r_prompt_{i}",
+            )
+        with col3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🗑️", key=f"r_rm_{i}"):
+                remaining = [
+                    {"id": r.get("id", f"role_{j}"), "name": r.get("name", ""), "prompt_suffix": r.get("prompt_suffix", "")}
+                    for j, r in enumerate(pool) if j != i
+                ]
+                db.update_project(client, project["id"], {"custom_roles": json.dumps(remaining)})
+                st.success(f"已删除角色「{role.get('name', '')}」")
+                st.rerun()
+        updated_roles.append({
+            "id": role.get("id", f"role_{i}"),
+            "name": rname,
+            "prompt_suffix": rprompt,
+        })
+
+    col_add, col_save, col_reset = st.columns(3)
+    with col_add:
+        if st.button("➕ 添加角色", use_container_width=True):
+            new_roles = updated_roles + [{"id": f"custom_{len(updated_roles)}", "name": "新角色", "prompt_suffix": ""}]
+            db.update_project(client, project["id"], {"custom_roles": json.dumps(new_roles)})
+            st.rerun()
+    with col_save:
+        if st.button("💾 保存角色池", use_container_width=True):
+            db.update_project(client, project["id"], {"custom_roles": json.dumps(updated_roles)})
+            st.success("角色池已保存。")
+            st.rerun()
+    with col_reset:
+        if st.button("↩️ 恢复默认池", use_container_width=True):
+            db.update_project(client, project["id"], {"custom_roles": json.dumps([])})
+            st.success("已恢复为默认角色池。")
+            st.rerun()
 
 
 # ── Tactic helpers ─────────────────────────────────────────────────────────

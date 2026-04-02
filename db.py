@@ -54,6 +54,7 @@ CREATE POLICY IF NOT EXISTS projects_owner ON projects
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_tone TEXT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_exec TEXT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS calibration_notes TEXT;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS custom_roles JSONB DEFAULT '[]'::jsonb;
 -- Migration: add example_label to items for positive/negative example marking
 ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT CHECK (example_label IN ('positive', 'negative'));
 

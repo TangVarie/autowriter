@@ -14,6 +14,7 @@ Each engine implements a common interface:
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -805,7 +806,7 @@ def generate_batch(
 
 # ── Multi-role drafting (三省法 · 中书省) ──────────────────────────────────
 
-CREATIVE_ROLES: list[dict] = [
+CREATIVE_ROLES_POOL: list[dict] = [
     {
         "id": "narrative",
         "name": "叙事角",
@@ -833,14 +834,52 @@ CREATIVE_ROLES: list[dict] = [
             "让读者觉得「这说的就是我」，然后才自然引出产品/品牌。"
         ),
     },
+    {
+        "id": "contrast",
+        "name": "对比角",
+        "prompt_suffix": (
+            "\n\n【本篇创作角度：对比】"
+            "以「之前 vs 之后」「有它 vs 没它」「以为 vs 实际」等对比结构切入，"
+            "让改变或差异成为文案的核心张力。对比要具体可感，不要抽象泛泛。"
+        ),
+    },
+    {
+        "id": "tips",
+        "name": "干货角",
+        "prompt_suffix": (
+            "\n\n【本篇创作角度：干货】"
+            "以实用信息、技巧或方法论为主轴，产品/品牌作为解决方案自然嵌入。"
+            "读者应该能带走具体可操作的内容，而不只是情绪感受。"
+        ),
+    },
+    {
+        "id": "occasion",
+        "name": "场合角",
+        "prompt_suffix": (
+            "\n\n【本篇创作角度：场合】"
+            "锁定一个具体的使用时刻、场合或生活节点（如下班后、周末早晨、聚会前夜），"
+            "让产品/品牌成为那个时刻的专属搭档。场合越具体，代入感越强。"
+        ),
+    },
 ]
+
+# Default 3 kept for backward compatibility (first three cover the widest angles)
+CREATIVE_ROLES = CREATIVE_ROLES_POOL[:3]
 
 _SELECT_SYSTEM = """\
 你是一位资深小红书内容编辑，负责从多组草稿中评选最优版本。
 
 你会收到若干组草稿，每组包含来自不同创作角度和/或不同 AI 模型的多个版本。
 
-对每一组，选出最适合发布的一篇（综合考量：开头吸引力、内容真实感、品牌融入自然度、读者代入感），并给出1-2句评审意见，说明选择理由及潜在改进点。
+对每一组，选出最适合发布的一篇。评选标准（按优先级）：
+1. 开头吸引力：前两行能否让人停下来继续读
+2. 内容真实感：读起来像真人在说话，而不是广告稿
+3. 品牌融入自然度：产品信息不突兀，不破坏阅读流
+4. 读者代入感：目标用户能否在文中找到自己
+
+多样性参考（软性）：如果多组草稿中某几篇开头方式或整体结构高度相似，在质量相近时可以倾向选更有差异的那篇——但质量明显更高的草稿应当优先入选，不必为了差异化而放弃更好的内容。
+
+给出1-2句评审意见，说明选择理由及潜在改进点。
 
 以 JSON 数组格式回复，顺序与输入完全一致：
 [{"best_index": <整数>, "notes": "评审意见"}, ...]
@@ -986,6 +1025,7 @@ def generate_batch_multi_role(
     use_thinking: bool = False,
     gemini_use_thinking: bool = False,
     custom_roles: list[dict] | None = None,
+    n_roles: int = 3,
 ) -> list[dict]:
     """
     Generate `count` items using multi-role × multi-engine parallel drafting (三省法).
@@ -994,10 +1034,14 @@ def generate_batch_multi_role(
     = 6 concurrent API calls, same wall-clock time as a single call.
     One lightweight Claude selection call then picks the best draft per slot.
 
+    custom_roles: if set, used as the role pool instead of CREATIVE_ROLES_POOL
+    n_roles: how many roles to randomly sample from the pool each run (default 3)
     engines: list of engine names to use, default ["claude"]
     engine_models: per-engine model override, e.g. {"claude": "claude-opus-4-6"}
     """
-    roles = custom_roles or CREATIVE_ROLES
+    pool = custom_roles if custom_roles else CREATIVE_ROLES_POOL
+    k = min(n_roles, len(pool))
+    roles = random.sample(pool, k) if k < len(pool) else list(pool)
     _engines = engines or ["claude"]
     _models = engine_models or {}
 
