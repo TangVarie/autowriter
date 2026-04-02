@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS items (
     user_id         UUID NOT NULL,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_review_notes TEXT;
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY IF NOT EXISTS items_owner ON items
     USING (user_id = auth.uid());
@@ -242,8 +243,15 @@ def delete_batch(client: Client, batch_id: str) -> None:
 
 # ── Item CRUD ──────────────────────────────────────────────────────────────
 
-def create_item(client: Client, user_id: str, batch_id: str) -> dict:
-    data = {"batch_id": batch_id, "user_id": user_id}
+def create_item(
+    client: Client,
+    user_id: str,
+    batch_id: str,
+    ai_review_notes: Optional[str] = None,
+) -> dict:
+    data: dict[str, Any] = {"batch_id": batch_id, "user_id": user_id}
+    if ai_review_notes:
+        data["ai_review_notes"] = ai_review_notes
     res = client.table("items").insert(data).execute()
     return res.data[0]
 

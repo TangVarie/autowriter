@@ -803,6 +803,195 @@ def generate_batch(
     ]
 
 
+# ── Multi-role drafting (三省法 · 中书省) ──────────────────────────────────
+
+CREATIVE_ROLES: list[dict] = [
+    {
+        "id": "narrative",
+        "name": "叙事角",
+        "prompt_suffix": (
+            "\n\n【本篇创作角度：叙事】"
+            "以一个具体的生活场景或真实故事切入，产品/品牌自然融入叙事，不要开篇就讲卖点。"
+            "让读者先被情境带入，再自然意识到这是什么。"
+        ),
+    },
+    {
+        "id": "insight",
+        "name": "洞察角",
+        "prompt_suffix": (
+            "\n\n【本篇创作角度：洞察】"
+            "从一个反直觉、出乎意料或被大多数人忽视的角度切入，制造认知惊喜或反转。"
+            "让读者产生「哦原来是这样」或「这我没想到」的感受。避免常规切入方式。"
+        ),
+    },
+    {
+        "id": "empathy",
+        "name": "共情角",
+        "prompt_suffix": (
+            "\n\n【本篇创作角度：共情】"
+            "从目标用户当下最真实的情绪或生活状态出发，情绪共鸣先于产品信息。"
+            "让读者觉得「这说的就是我」，然后才自然引出产品/品牌。"
+        ),
+    },
+]
+
+_SELECT_SYSTEM = """\
+你是一位资深小红书内容编辑，负责从多组草稿中评选最优版本。
+
+你会收到若干组草稿，每组来自同一创作任务的3个角度：叙事角、洞察角、共情角。
+
+对每一组，选出最适合发布的一篇（综合考量：开头吸引力、内容真实感、品牌融入自然度、读者代入感），并给出1-2句评审意见，说明选择理由及潜在改进点。
+
+以 JSON 数组格式回复，顺序与输入完全一致：
+[{"best_index": 0|1|2, "notes": "评审意见"}, ...]
+只返回 JSON 数组，不要任何其他文字。"""
+
+
+def _select_best_drafts_batch(
+    brief: str,
+    all_slot_drafts: list[list[GenerationResult]],
+) -> list[tuple[int, str]]:
+    """
+    One Claude call evaluates all slots at once.
+    Returns [(best_index, notes), ...] in slot order.
+    """
+    slot_blocks: list[str] = []
+    for i, slot_drafts in enumerate(all_slot_drafts, 1):
+        lines = [f"第{i}组："]
+        for j, (role, draft) in enumerate(zip(CREATIVE_ROLES, slot_drafts)):
+            body_preview = (draft.body or "")[:200].split("\n")[0]
+            lines.append(f"  草稿{j+1}（{role['name']}）：标题：{draft.title}  正文节选：{body_preview}")
+        slot_blocks.append("\n".join(lines))
+
+    user_content = f"创作任务简报：\n{brief}\n\n" + "\n\n".join(slot_blocks)
+
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    resp = client.messages.create(
+        model=config.CLAUDE_MODEL,
+        max_tokens=512,
+        system=_SELECT_SYSTEM,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    raw = resp.content[0].text.strip()
+    try:
+        data = json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip())
+        if isinstance(data, list):
+            return [
+                (int(item.get("best_index", 0)), str(item.get("notes", "")))
+                for item in data
+            ]
+    except Exception:
+        pass
+    # Fallback: default to index 0 with no notes
+    return [(0, "") for _ in all_slot_drafts]
+
+
+def generate_batch_multi_role(
+    system_prompt: str,
+    tactic: str = "",
+    target_audience: str = "",
+    key_messages: str = "",
+    tone: str = "",
+    extra_instructions: str = "",
+    count: int = 5,
+    images: list | None = None,
+    progress_callback=None,
+    historical_titles: list[str] | None = None,
+    engine_name: str = "claude",
+    model: str = "",
+    use_thinking: bool = False,
+    custom_roles: list[dict] | None = None,
+) -> list[dict]:
+    """
+    Generate `count` items using multi-role parallel drafting (三省法).
+
+    For each slot, 3 creative roles (narrative / insight / empathy) each produce
+    a full draft in parallel, then a single lightweight Claude call picks the best
+    per slot and writes brief review notes.
+
+    Returns same list[dict] format as generate_batch, but each item also carries
+    an 'ai_review_notes' key with the editor's evaluation.
+    """
+    roles = custom_roles or CREATIVE_ROLES
+    engine = get_engine(engine_name)
+
+    base_prompt = _make_user_prompt(
+        tactic=tactic,
+        target_audience=target_audience,
+        key_messages=key_messages,
+        tone=tone,
+        extra=extra_instructions,
+        count=count,
+    )
+    dedup_block = _build_dedup_instruction([], historical_titles)
+    if dedup_block:
+        base_prompt += "\n\n" + dedup_block
+
+    if progress_callback:
+        progress_callback(0.05, f"三个角色并行起草中（{count}篇 × {len(roles)}角色）…")
+
+    # Step 1: All roles generate in parallel — same latency as a single call
+    def _call_role(role: dict) -> tuple[str, list[GenerationResult]]:
+        role_prompt = base_prompt + role["prompt_suffix"]
+        items = engine.generate(
+            system_prompt=system_prompt,
+            user_prompt=role_prompt,
+            images=images,
+            use_thinking=use_thinking,
+            model=model,
+            count=count,
+        )
+        return role["id"], items
+
+    role_results: dict[str, list[GenerationResult]] = {}
+    with ThreadPoolExecutor(max_workers=len(roles)) as executor:
+        futures = {executor.submit(_call_role, role): role["id"] for role in roles}
+        for future in as_completed(futures):
+            role_id, items = future.result()
+            role_results[role_id] = items
+
+    if progress_callback:
+        progress_callback(0.85, "AI 编辑评选最优版本…")
+
+    # Step 2: One selection call covers all slots
+    brief = _make_user_prompt(
+        tactic=tactic,
+        target_audience=target_audience,
+        key_messages=key_messages,
+        tone=tone,
+        extra=extra_instructions,
+        count=1,
+    )
+    all_slot_drafts = [
+        [role_results[role["id"]][i] for role in roles]
+        for i in range(count)
+    ]
+    selections = _select_best_drafts_batch(brief, all_slot_drafts)
+
+    if progress_callback:
+        progress_callback(1.0, "完成")
+
+    results = []
+    for i, (best_idx, notes) in enumerate(selections):
+        best_draft = all_slot_drafts[i][best_idx]
+        # Tag the winning version with which role won
+        best_draft = GenerationResult(
+            title=best_draft.title,
+            body=best_draft.body,
+            keywords=best_draft.keywords,
+            ai_engine=best_draft.ai_engine,
+            raw_text=best_draft.raw_text,
+            error=best_draft.error,
+            token_usage=best_draft.token_usage,
+        )
+        results.append({
+            "versions": [best_draft],
+            "tactic": tactic,
+            "ai_review_notes": f"【{roles[best_idx]['name']}胜出】{notes}".strip(),
+        })
+    return results
+
+
 # ── Iterative refinement ───────────────────────────────────────────────────
 
 def build_iteration_messages(

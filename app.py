@@ -115,26 +115,47 @@ def _queue_worker(
             def _progress(pct: float, msg: str, _idx=idx, _n=len(plans), _t=_total) -> None:
                 status["message"] = f"计划 {_idx+1}/{_n} — {msg}"
 
-            generation_results = gen_module.generate_batch(
-                system_prompt=full_system_prompt,
-                tactic=tactic,
-                count=count,
-                engines=engines,
-                target_audience=plan.get("target_audience", ""),
-                key_messages=plan.get("key_messages", ""),
-                tone=plan.get("tone", ""),
-                extra_instructions=extra_instr,
-                images=None,
-                progress_callback=_progress,
-                historical_titles=historical_titles or None,
-                use_thinking=use_thinking,
-                engine_models=engine_models or None,
-                gemini_use_thinking=gemini_thinking,
-            )
+            use_multi_role = batch_params.get("use_multi_role", False)
+            if use_multi_role:
+                generation_results = gen_module.generate_batch_multi_role(
+                    system_prompt=full_system_prompt,
+                    tactic=tactic,
+                    count=count,
+                    engine_name=engines[0] if engines else "claude",
+                    model=(engine_models or {}).get(engines[0] if engines else "claude", ""),
+                    target_audience=plan.get("target_audience", ""),
+                    key_messages=plan.get("key_messages", ""),
+                    tone=plan.get("tone", ""),
+                    extra_instructions=extra_instr,
+                    images=None,
+                    progress_callback=_progress,
+                    historical_titles=historical_titles or None,
+                    use_thinking=use_thinking,
+                )
+            else:
+                generation_results = gen_module.generate_batch(
+                    system_prompt=full_system_prompt,
+                    tactic=tactic,
+                    count=count,
+                    engines=engines,
+                    target_audience=plan.get("target_audience", ""),
+                    key_messages=plan.get("key_messages", ""),
+                    tone=plan.get("tone", ""),
+                    extra_instructions=extra_instr,
+                    images=None,
+                    progress_callback=_progress,
+                    historical_titles=historical_titles or None,
+                    use_thinking=use_thinking,
+                    engine_models=engine_models or None,
+                    gemini_use_thinking=gemini_thinking,
+                )
 
             saved = 0
             for slot in generation_results:
-                item = db.create_item(db_client, user_id, batch_id)
+                item = db.create_item(
+                    db_client, user_id, batch_id,
+                    ai_review_notes=slot.get("ai_review_notes") or None,
+                )
                 for vr in slot["versions"]:
                     if vr.error and not vr.title:
                         status["errors"].append(
@@ -976,53 +997,80 @@ def page_generate(project: dict) -> None:
             tactic = ""
         count = st.slider("生成数量", 1, config.MAX_GENERATION_COUNT, config.DEFAULT_GENERATION_COUNT)
 
-        engine_mode = st.radio(
-            "AI 引擎模式",
-            ["单引擎", "多引擎比稿"],
-            help="多引擎比稿会同时用 Claude 和 Gemini 生成，便于对比。",
+        use_multi_role = st.toggle(
+            "🎭 多角色起草（三省法）",
+            help="叙事角、洞察角、共情角三个视角并行起草，AI 自动评选最优版并附评审意见。"
+                 "质量下限更高，延迟与单次生成基本相同。与多引擎比稿互斥。",
         )
-        if engine_mode == "单引擎":
-            engines = [st.selectbox(
-                "引擎", gen_module.AVAILABLE_ENGINES,
-                format_func=lambda e: "Claude" if e == "claude" else "Gemini",
-            )]
-        else:
-            engines = gen_module.AVAILABLE_ENGINES[:2]
-            if len(engines) < 2:
-                st.warning("Gemini 未配置，将仅使用 Claude。")
-                engines = ["claude"]
 
         engine_models: dict[str, str] = {}
-        if "claude" in engines:
+
+        if use_multi_role:
+            # Multi-role mode: Claude only, 3 roles run in parallel
+            engines = ["claude"]
             engine_models["claude"] = st.selectbox(
-                "Claude 模型", list(config.CLAUDE_MODELS.keys()),
+                "Claude 模型",
+                list(config.CLAUDE_MODELS.keys()),
                 index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
                       if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
                 format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
             )
-        if "gemini" in engines:
-            engine_models["gemini"] = st.selectbox(
-                "Gemini 模型", list(config.GEMINI_MODELS.keys()),
-                index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
-                      if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
-                format_func=lambda m: config.GEMINI_MODELS.get(m, m),
-            )
-
-        use_thinking = False
-        gemini_use_thinking = False
-        if "claude" in engines:
             use_thinking = st.checkbox(
-                "Claude：Extended Thinking",
+                "Extended Thinking",
                 help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
             )
             if use_thinking:
                 sel = engine_models.get("claude", "")
                 st.caption("effort=high, max 32k" if "opus-4-6" in sel else "budget=8k, max 16k")
-        if "gemini" in engines:
-            gemini_use_thinking = st.checkbox(
-                "Gemini：思考模式",
-                help="thinking_budget=-1 动态分配；对 2.5 Pro 效果明显。",
+            gemini_use_thinking = False
+        else:
+            # Standard mode: single or multi-engine
+            engine_mode = st.radio(
+                "AI 引擎模式",
+                ["单引擎", "多引擎比稿"],
+                help="多引擎比稿会同时用 Claude 和 Gemini 生成，便于对比。",
             )
+            if engine_mode == "单引擎":
+                engines = [st.selectbox(
+                    "引擎", gen_module.AVAILABLE_ENGINES,
+                    format_func=lambda e: "Claude" if e == "claude" else "Gemini",
+                )]
+            else:
+                engines = gen_module.AVAILABLE_ENGINES[:2]
+                if len(engines) < 2:
+                    st.warning("Gemini 未配置，将仅使用 Claude。")
+                    engines = ["claude"]
+
+            if "claude" in engines:
+                engine_models["claude"] = st.selectbox(
+                    "Claude 模型", list(config.CLAUDE_MODELS.keys()),
+                    index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
+                          if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
+                    format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
+                )
+            if "gemini" in engines:
+                engine_models["gemini"] = st.selectbox(
+                    "Gemini 模型", list(config.GEMINI_MODELS.keys()),
+                    index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
+                          if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
+                    format_func=lambda m: config.GEMINI_MODELS.get(m, m),
+                )
+
+            use_thinking = False
+            gemini_use_thinking = False
+            if "claude" in engines:
+                use_thinking = st.checkbox(
+                    "Claude：Extended Thinking",
+                    help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
+                )
+                if use_thinking:
+                    sel = engine_models.get("claude", "")
+                    st.caption("effort=high, max 32k" if "opus-4-6" in sel else "budget=8k, max 16k")
+            if "gemini" in engines:
+                gemini_use_thinking = st.checkbox(
+                    "Gemini：思考模式",
+                    help="thinking_budget=-1 动态分配；对 2.5 Pro 效果明显。",
+                )
 
         with st.expander("⚙️ 高级参数"):
             target_audience   = st.text_input("目标人群", placeholder="例：25-35岁职场女性")
@@ -1095,6 +1143,7 @@ def page_generate(project: dict) -> None:
                 "use_thinking": use_thinking,
                 "gemini_use_thinking": gemini_use_thinking,
                 "engine_models": engine_models,
+                "use_multi_role": use_multi_role,
             }
             batch = db.create_batch(
                 db_client, user_id,
@@ -1113,22 +1162,39 @@ def page_generate(project: dict) -> None:
             historical_titles = db.get_recent_titles(db_client, project["id"])
 
             try:
-                generation_results = gen_module.generate_batch(
-                    system_prompt=full_system_prompt,
-                    tactic=tactic,
-                    count=count,
-                    engines=engines,
-                    target_audience=target_audience,
-                    key_messages=key_messages,
-                    tone=tone,
-                    extra_instructions=combined_extra,
-                    images=encoded_images or None,
-                    progress_callback=update_progress,
-                    historical_titles=historical_titles or None,
-                    use_thinking=use_thinking,
-                    engine_models=engine_models or None,
-                    gemini_use_thinking=gemini_use_thinking,
-                )
+                if use_multi_role:
+                    generation_results = gen_module.generate_batch_multi_role(
+                        system_prompt=full_system_prompt,
+                        tactic=tactic,
+                        count=count,
+                        engine_name=engines[0] if engines else "claude",
+                        model=engine_models.get(engines[0] if engines else "claude", ""),
+                        target_audience=target_audience,
+                        key_messages=key_messages,
+                        tone=tone,
+                        extra_instructions=combined_extra,
+                        images=encoded_images or None,
+                        progress_callback=update_progress,
+                        historical_titles=historical_titles or None,
+                        use_thinking=use_thinking,
+                    )
+                else:
+                    generation_results = gen_module.generate_batch(
+                        system_prompt=full_system_prompt,
+                        tactic=tactic,
+                        count=count,
+                        engines=engines,
+                        target_audience=target_audience,
+                        key_messages=key_messages,
+                        tone=tone,
+                        extra_instructions=combined_extra,
+                        images=encoded_images or None,
+                        progress_callback=update_progress,
+                        historical_titles=historical_titles or None,
+                        use_thinking=use_thinking,
+                        engine_models=engine_models or None,
+                        gemini_use_thinking=gemini_use_thinking,
+                    )
             except Exception as e:
                 st.error(f"生成失败：{e}")
                 return
@@ -1136,7 +1202,10 @@ def page_generate(project: dict) -> None:
             saved_count = 0
             error_messages: list[str] = []
             for slot in generation_results:
-                item = db.create_item(db_client, user_id, batch_id)
+                item = db.create_item(
+                    db_client, user_id, batch_id,
+                    ai_review_notes=slot.get("ai_review_notes") or None,
+                )
                 for version_result in slot["versions"]:
                     if version_result.error and not version_result.title:
                         error_messages.append(f"[{version_result.ai_engine.upper()}] {version_result.error}")
@@ -1377,6 +1446,12 @@ def _render_item_card(
             f"<span class='engine-badge {eng_cls}'>{_html.escape(engine_raw.upper())}{thinking_tag}</span>",
             unsafe_allow_html=True,
         )
+
+        # AI review notes (from multi-role drafting)
+        ai_notes = item.get("ai_review_notes", "")
+        if ai_notes:
+            with st.expander("🔍 AI 评审意见", expanded=False):
+                st.caption(ai_notes)
 
         # Multi-version comparison (if multiple engines were used)
         unique_engines = {v.get("ai_engine", "").split("/")[0] for v in versions}
