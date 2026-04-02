@@ -888,6 +888,88 @@ def _select_best_drafts_batch(
     return [(0, "") for _ in all_slot_drafts]
 
 
+
+# ── 尚书省 · 六部精炼 ──────────────────────────────────────────────────────
+
+_REFINE_SYSTEM_SUFFIX = """
+
+---【尚书省六部精炼指令】---
+你已进入六部精炼阶段。结合上方的创作任务背景，对草稿依次执行六部审查并输出精炼后的版本：
+
+• 礼部（格式规范）：正文600-1500字之间，段落间空行，末尾可加1-3个话题标签
+• 工部（结构优化）：开头2-3行钩子必须够强，段落节奏流畅，收尾自然
+• 户部（价值密度）：删除套话和无效铺垫，每段都有实质内容
+• 吏部（受众校准）：用目标受众真实说话的方式，不用品牌发布腔
+• 兵部（角度差异）：若开头方式过于常见，做一次微调使其更独特
+• 刑部（品牌安全）：不出现夸大宣传、竞品对比、绝对化表述
+
+核心要求：保留草稿的创意内核和角色风格，只做必要精炼，不改变内容方向。
+
+输出精炼后的版本（JSON）：
+{"title": "...", "body": "...", "keywords": [...]}
+只返回 JSON，不要任何前缀或说明。"""
+
+
+def _refine_drafts_batch(
+    system_prompt: str,
+    brief: str,
+    drafts: list[GenerationResult],
+    model: str = "",
+) -> list[GenerationResult]:
+    """
+    Run 六部 structured refinement on all winning drafts in parallel.
+    Uses the project system_prompt as brand context + _REFINE_SYSTEM_SUFFIX as instructions.
+    Falls back to original draft on any failure.
+    """
+    if not drafts:
+        return drafts
+
+    refine_system = system_prompt.strip() + _REFINE_SYSTEM_SUFFIX
+
+    def _refine_one(idx: int, draft: GenerationResult) -> tuple[int, GenerationResult]:
+        user_content = (
+            f"创作任务简报：\n{brief}\n\n"
+            f"待精炼草稿：\n"
+            f"标题：{draft.title}\n\n"
+            f"正文：{draft.body}\n\n"
+            f"关键词：{json.dumps(draft.keywords or [], ensure_ascii=False)}"
+        )
+        try:
+            client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+            resp = client.messages.create(
+                model=model or config.CLAUDE_MODEL,
+                max_tokens=2048,
+                system=refine_system,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            raw = resp.content[0].text.strip()
+            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+            refined = _try_parse_dict(cleaned, draft.ai_engine, raw)
+            if refined and (refined.title or refined.body):
+                return idx, GenerationResult(
+                    title=refined.title or draft.title,
+                    body=refined.body or draft.body,
+                    keywords=refined.keywords or draft.keywords,
+                    ai_engine=draft.ai_engine,
+                    raw_text=raw,
+                    token_usage={
+                        "input_tokens": resp.usage.input_tokens,
+                        "output_tokens": resp.usage.output_tokens,
+                    },
+                )
+        except Exception:
+            pass
+        return idx, draft  # fallback to original
+
+    result_list: list[GenerationResult] = list(drafts)  # pre-fill with originals
+    with ThreadPoolExecutor(max_workers=len(drafts)) as executor:
+        futures = {executor.submit(_refine_one, i, d): i for i, d in enumerate(drafts)}
+        for future in as_completed(futures):
+            i, refined = future.result()
+            result_list[i] = refined
+    return result_list
+
+
 def generate_batch_multi_role(
     system_prompt: str,
     tactic: str = "",
@@ -978,16 +1060,30 @@ def generate_batch_multi_role(
     selections = _select_best_drafts_batch(brief, all_slot_drafts, draft_labels)
 
     if progress_callback:
+        progress_callback(0.90, f"尚书省六部精炼中（{count}篇并行）…")
+
+    # Step 3: 六部精炼 — parallel refinement of all winning drafts
+    winning_drafts = [
+        all_slot_drafts[i][best_idx]
+        for i, (best_idx, _) in enumerate(selections)
+    ]
+    refined_drafts = _refine_drafts_batch(
+        system_prompt=system_prompt,
+        brief=brief,
+        drafts=winning_drafts,
+        model=_models.get("claude", ""),
+    )
+
+    if progress_callback:
         progress_callback(1.0, "完成")
 
     results = []
     for i, (best_idx, notes) in enumerate(selections):
-        best_draft = all_slot_drafts[i][best_idx]
         winner_label = draft_labels[best_idx] if best_idx < len(draft_labels) else "?"
         results.append({
-            "versions": [best_draft],
+            "versions": [refined_drafts[i]],
             "tactic": tactic,
-            "ai_review_notes": f"【{winner_label}胜出】{notes}".strip(),
+            "ai_review_notes": f"【{winner_label}胜出·六部精炼】{notes}".strip(),
         })
     return results
 

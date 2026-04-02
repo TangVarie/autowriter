@@ -1369,6 +1369,13 @@ def page_review(project: dict) -> None:
             continue
         _render_item_card(item, versions, selected_batch, project)
 
+    # ── 太子自动学习：全部通过时静默更新调教笔记 ──────────────────────────
+    _taizi_key = f"taizi_{batch_id}"
+    if (items and all(it["status"] == "approved" for it in items)
+            and not st.session_state.get(_taizi_key)):
+        st.session_state[_taizi_key] = True
+        _auto_update_calibration_notes(project, batch_id, items)
+
     # ── Quick batch actions ────────────────────────────────────────────
     if pending > 0 or revision > 0:
         st.divider()
@@ -1921,6 +1928,25 @@ def _ingest_all_feedbacks(project: dict, batch_id: str) -> None:
             project_name=project.get("name", ""),
         )
     st.success(f"已沉淀 {len(results)} 条反馈记忆。前往「记忆管理」查看。")
+
+
+def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dict]) -> None:
+    """
+    太子自动学习：批次全部通过后静默生成并保存调教笔记，无需人工确认。
+    失败时静默跳过，不打断用户操作。
+    """
+    existing = project.get("calibration_notes") or ""
+    try:
+        with st.spinner("🧠 太子学习中…"):
+            notes = mem_module.generate_calibration_notes(
+                project_name=project.get("name", ""),
+                existing_notes=existing,
+                items_with_versions=items,
+            )
+            db.update_project(db_client, project["id"], {"calibration_notes": notes})
+            st.toast("🧠 调教笔记已自动更新（太子学习完成）")
+    except Exception:
+        pass  # 静默失败，不影响主流程
 
 
 def _generate_calibration_notes_ui(project: dict, batch_id: str, items: list[dict]) -> None:
