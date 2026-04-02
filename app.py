@@ -12,6 +12,7 @@ import html as _html
 import json
 import re
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -90,6 +91,7 @@ def _queue_worker(
             use_thinking     = plan.get("use_thinking", False)
             gemini_thinking  = plan.get("gemini_use_thinking", False)
             extra_instr      = plan.get("extra_instructions", "")
+            use_multi_role   = plan.get("use_multi_role", False)
 
             batch_params = {
                 "target_audience":  plan.get("target_audience", ""),
@@ -99,6 +101,7 @@ def _queue_worker(
                 "use_thinking":     use_thinking,
                 "gemini_use_thinking": gemini_thinking,
                 "engine_models":    engine_models,
+                "use_multi_role":   use_multi_role,
             }
             batch = db.create_batch(
                 db_client, user_id,
@@ -115,7 +118,6 @@ def _queue_worker(
             def _progress(pct: float, msg: str, _idx=idx, _n=len(plans), _t=_total) -> None:
                 status["message"] = f"计划 {_idx+1}/{_n} — {msg}"
 
-            use_multi_role = batch_params.get("use_multi_role", False)
             if use_multi_role:
                 generation_results = gen_module.generate_batch_multi_role(
                     system_prompt=full_system_prompt,
@@ -781,6 +783,147 @@ def _page_header(icon: str, title: str, subtitle: str = "") -> None:
     )
 
 
+def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None:
+    """Background worker for quick generate (single batch, mirrors _queue_worker)."""
+    try:
+        status["running"] = True
+        status["message"] = "正在构建提示词…"
+
+        project_id = plan["project_id"]
+        project    = db.get_project(db_client, project_id)
+        if not project:
+            raise RuntimeError("项目不存在")
+
+        tactic          = plan.get("tactic", "")
+        engines         = plan.get("engines", ["claude"])
+        engine_models   = plan.get("engine_models", {})
+        count           = plan.get("count", 3)
+        use_thinking    = plan.get("use_thinking", False)
+        gemini_thinking = plan.get("gemini_use_thinking", False)
+        use_multi_role  = plan.get("use_multi_role", False)
+        extra_instr     = plan.get("extra_instructions", "")
+        image_prompt    = plan.get("image_prompt", "")
+        images          = plan.get("images") or None
+
+        global_mems, project_mems = db.get_confirmed_memories(
+            db_client, user_id, project_id=project_id
+        )
+        pos_examples      = db.list_example_items(db_client, project_id, "positive", limit=5)
+        neg_examples      = db.list_example_items(db_client, project_id, "negative", limit=3)
+        calibration_notes = project.get("calibration_notes") or ""
+
+        tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
+        full_system_prompt = mem_module.build_system_prompt(
+            base_prompt=project.get("system_prompt", ""),
+            global_memories=global_mems,
+            project_memories=project_mems,
+            tactic_suffix=tactic_suffix,
+            calibration_notes=calibration_notes,
+            positive_examples=pos_examples or None,
+            negative_examples=neg_examples or None,
+        )
+
+        combined_extra = extra_instr
+        if image_prompt:
+            combined_extra = (combined_extra + "\n\n【参考图片说明】\n" + image_prompt).strip()
+
+        batch = db.create_batch(
+            db_client, user_id,
+            project_id=project_id,
+            tactic=tactic or "通用",
+            params={
+                "target_audience":    plan.get("target_audience", ""),
+                "key_messages":       plan.get("key_messages", ""),
+                "tone":               plan.get("tone", ""),
+                "extra_instructions": extra_instr,
+                "use_thinking":       use_thinking,
+                "gemini_use_thinking": gemini_thinking,
+                "engine_models":      engine_models,
+                "use_multi_role":     use_multi_role,
+            },
+            ai_engines=engines,
+        )
+        batch_id = batch["id"]
+        status["batch_id"] = batch_id
+
+        historical_titles = db.get_recent_titles(db_client, project_id)
+
+        def _progress(pct: float, msg: str) -> None:
+            status["progress"] = pct
+            status["message"]  = msg
+
+        status["message"] = "正在生成内容…"
+
+        if use_multi_role:
+            generation_results = gen_module.generate_batch_multi_role(
+                system_prompt=full_system_prompt,
+                tactic=tactic,
+                count=count,
+                engines=engines,
+                engine_models=engine_models or None,
+                target_audience=plan.get("target_audience", ""),
+                key_messages=plan.get("key_messages", ""),
+                tone=plan.get("tone", ""),
+                extra_instructions=combined_extra,
+                images=images,
+                progress_callback=_progress,
+                historical_titles=historical_titles or None,
+                use_thinking=use_thinking,
+                gemini_use_thinking=gemini_thinking,
+            )
+        else:
+            generation_results = gen_module.generate_batch(
+                system_prompt=full_system_prompt,
+                tactic=tactic,
+                count=count,
+                engines=engines,
+                target_audience=plan.get("target_audience", ""),
+                key_messages=plan.get("key_messages", ""),
+                tone=plan.get("tone", ""),
+                extra_instructions=combined_extra,
+                images=images,
+                progress_callback=_progress,
+                historical_titles=historical_titles or None,
+                use_thinking=use_thinking,
+                engine_models=engine_models or None,
+                gemini_use_thinking=gemini_thinking,
+            )
+
+        saved_count = 0
+        errors: list[str] = []
+        for slot in generation_results:
+            item = db.create_item(
+                db_client, user_id, batch_id,
+                ai_review_notes=slot.get("ai_review_notes") or None,
+            )
+            for vr in slot["versions"]:
+                if vr.error and not vr.title:
+                    errors.append(f"[{vr.ai_engine.upper()}] {vr.error}")
+                    continue
+                db.create_version(
+                    db_client,
+                    item_id=item["id"],
+                    ai_engine=vr.ai_engine,
+                    title=vr.title,
+                    body=vr.body,
+                    keywords=vr.keywords,
+                    token_usage=vr.token_usage,
+                )
+                saved_count += 1
+
+        status["saved_count"] = saved_count
+        status["n_results"]   = len(generation_results)
+        status["errors"]      = errors
+        status["message"]     = f"生成完成！{len(generation_results)} 篇，{saved_count} 个版本已保存。"
+
+    except Exception as exc:
+        status.setdefault("errors", []).append(str(exc))
+        status["message"] = f"生成失败：{exc}"
+
+    status["running"] = False
+    status["done"]    = True
+
+
 def _render_queue_tab() -> None:
     """Render the batch queue builder and executor UI."""
     st.markdown(
@@ -980,6 +1123,8 @@ def _render_queue_tab() -> None:
             text=qs.get("message", "生成中…"),
         )
         st.caption("生成在后台运行，可切换到其他页面。")
+        time.sleep(1.5)
+        st.rerun()
 
     # Completed results summary
     if qs.get("done") and qs.get("completed"):
@@ -1152,122 +1297,72 @@ def page_generate(project: dict) -> None:
         if context_parts:
             st.info("已载入上下文：" + " · ".join(context_parts))
 
-        if st.button("🚀 开始生成", type="primary", use_container_width=True):
-            if not base_prompt.strip():
-                st.warning("⚠️ 当前项目尚未配置 System Prompt，请先在「项目设置」中填写。")
-                st.stop()
+        qgs        = st.session_state.get("quick_gen_state")
+        qg_running = bool(qgs and qgs.get("running"))
+        qg_done    = bool(qgs and qgs.get("done"))
 
-            tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
-            full_system_prompt = mem_module.build_system_prompt(
-                base_prompt=base_prompt,
-                global_memories=global_mems,
-                project_memories=project_mems,
-                tactic_suffix=tactic_suffix,
-                calibration_notes=calibration_notes,
-                positive_examples=pos_examples or None,
-                negative_examples=neg_examples or None,
-            )
-
-            combined_extra = extra_instructions
-            if image_prompt:
-                combined_extra = (combined_extra + "\n\n【参考图片说明】\n" + image_prompt).strip()
-
-            batch_params = {
-                "target_audience": target_audience,
-                "key_messages": key_messages,
-                "tone": tone,
-                "extra_instructions": extra_instructions,
-                "use_thinking": use_thinking,
-                "gemini_use_thinking": gemini_use_thinking,
-                "engine_models": engine_models,
-                "use_multi_role": use_multi_role,
-            }
-            batch = db.create_batch(
-                db_client, user_id,
-                project_id=project["id"],
-                tactic=tactic or "通用",
-                params=batch_params,
-                ai_engines=engines,
-            )
-            batch_id = batch["id"]
-
-            progress_bar = st.progress(0.0, text="正在初始化…")
-
-            def update_progress(pct: float, msg: str) -> None:
-                progress_bar.progress(pct, text=msg)
-
-            historical_titles = db.get_recent_titles(db_client, project["id"])
-
-            try:
-                if use_multi_role:
-                    generation_results = gen_module.generate_batch_multi_role(
-                        system_prompt=full_system_prompt,
-                        tactic=tactic,
-                        count=count,
-                        engines=engines,
-                        engine_models=engine_models or None,
-                        target_audience=target_audience,
-                        key_messages=key_messages,
-                        tone=tone,
-                        extra_instructions=combined_extra,
-                        images=encoded_images or None,
-                        progress_callback=update_progress,
-                        historical_titles=historical_titles or None,
-                        use_thinking=use_thinking,
-                        gemini_use_thinking=gemini_use_thinking,
-                    )
-                else:
-                    generation_results = gen_module.generate_batch(
-                        system_prompt=full_system_prompt,
-                        tactic=tactic,
-                        count=count,
-                        engines=engines,
-                        target_audience=target_audience,
-                        key_messages=key_messages,
-                        tone=tone,
-                        extra_instructions=combined_extra,
-                        images=encoded_images or None,
-                        progress_callback=update_progress,
-                        historical_titles=historical_titles or None,
-                        use_thinking=use_thinking,
-                        engine_models=engine_models or None,
-                        gemini_use_thinking=gemini_use_thinking,
-                    )
-            except Exception as e:
-                st.error(f"生成失败：{e}")
-                return
-
-            saved_count = 0
-            error_messages: list[str] = []
-            for slot in generation_results:
-                item = db.create_item(
-                    db_client, user_id, batch_id,
-                    ai_review_notes=slot.get("ai_review_notes") or None,
-                )
-                for version_result in slot["versions"]:
-                    if version_result.error and not version_result.title:
-                        error_messages.append(f"[{version_result.ai_engine.upper()}] {version_result.error}")
-                        continue
-                    db.create_version(
-                        db_client,
-                        item_id=item["id"],
-                        ai_engine=version_result.ai_engine,
-                        title=version_result.title,
-                        body=version_result.body,
-                        keywords=version_result.keywords,
-                        token_usage=version_result.token_usage,
-                    )
-                    saved_count += 1
-
-            progress_bar.progress(1.0, text="生成完成！")
-            if error_messages:
-                st.error("部分内容生成失败：\n" + "\n".join(f"• {e}" for e in list(dict.fromkeys(error_messages))))
-            if saved_count > 0:
-                st.success(f"✅ 生成完成！共 {len(generation_results)} 篇，{saved_count} 个版本。")
-            elif not error_messages:
+        if qg_running:
+            pct = qgs.get("progress", 0.0)
+            msg = qgs.get("message", "生成中…")
+            st.progress(pct, text=msg)
+            st.caption("生成在后台运行，可切换到其他页面。")
+            time.sleep(1.5)
+            st.rerun()
+        elif qg_done:
+            errors_list = qgs.get("errors", [])
+            if errors_list:
+                st.error("部分内容生成失败：\n" + "\n".join(
+                    f"• {e}" for e in list(dict.fromkeys(errors_list))
+                ))
+            saved = qgs.get("saved_count", 0)
+            n_res = qgs.get("n_results", 0)
+            if saved > 0:
+                st.success(f"✅ 生成完成！共 {n_res} 篇，{saved} 个版本。")
+            elif not errors_list:
                 st.warning("生成完成，但没有内容被保存，请检查配置。")
-            st.session_state["review_batch_id"] = batch_id
-            st.info("👉 前往「审核与迭代」页面查看结果。")
+            bid = qgs.get("batch_id")
+            if bid:
+                st.session_state["review_batch_id"] = bid
+                st.info("👉 前往「审核与迭代」页面查看结果。")
+            if st.button("🔄 再次生成", use_container_width=True):
+                st.session_state.pop("quick_gen_state", None)
+                st.rerun()
+        else:
+            if st.button("🚀 开始生成", type="primary", use_container_width=True,
+                         disabled=not base_prompt.strip()):
+                if not base_prompt.strip():
+                    st.warning("⚠️ 当前项目尚未配置 System Prompt，请先在「项目设置」中填写。")
+                    st.stop()
+
+                qg_plan = {
+                    "project_id":       project["id"],
+                    "tactic":           tactic,
+                    "engines":          engines,
+                    "engine_models":    engine_models,
+                    "count":            count,
+                    "use_thinking":     use_thinking,
+                    "gemini_use_thinking": gemini_use_thinking,
+                    "use_multi_role":   use_multi_role,
+                    "target_audience":  target_audience,
+                    "key_messages":     key_messages,
+                    "tone":             tone,
+                    "extra_instructions": extra_instructions,
+                    "image_prompt":     image_prompt,
+                    "images":           encoded_images or [],
+                }
+                qg_status: dict = {
+                    "running": False, "done": False,
+                    "message": "准备中…", "progress": 0.0,
+                    "batch_id": None, "saved_count": 0,
+                    "n_results": 0, "errors": [],
+                }
+                st.session_state["quick_gen_state"] = qg_status
+                threading.Thread(
+                    target=_quick_gen_worker,
+                    args=(qg_plan, user_id, db_client, qg_status),
+                    daemon=True,
+                ).start()
+                st.rerun()
 
     # ── TAB 2: Batch Queue ─────────────────────────────────────────────
     with tab_queue:
