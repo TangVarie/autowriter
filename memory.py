@@ -50,14 +50,14 @@ def build_system_prompt(
 
     if global_memories:
         bullets = "\n".join(f"• {m['content']}" for m in global_memories)
-        parts.append(f"\n---通用记忆---\n{bullets}")
+        parts.append(f"\n---通用记忆（必须执行，每条都要主动检查）---\n{bullets}")
 
     if project_memories:
         bullets = "\n".join(f"• {m['content']}" for m in project_memories)
-        parts.append(f"\n---项目记忆---\n{bullets}")
+        parts.append(f"\n---项目记忆（必须执行，每条都要主动检查）---\n{bullets}")
 
     if calibration_notes and calibration_notes.strip():
-        parts.append(f"\n---调校笔记---\n{calibration_notes.strip()}")
+        parts.append(f"\n---调校笔记（理解并内化这些审美偏好，生成内容时主动应用）---\n{calibration_notes.strip()}")
 
     if positive_examples:
         ex_blocks = []
