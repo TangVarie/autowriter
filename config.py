@@ -42,13 +42,14 @@ GOOGLE_BASE_URL: str = _get_secret("GOOGLE_BASE_URL")  # optional proxy, e.g. ht
 # Available Gemini models: model_id -> display label
 # All three are GA stable as of 2025; 2.5 Flash is best price/performance
 GEMINI_MODELS: dict[str, str] = {
-    "gemini-2.5-pro":        "Gemini 2.5 Pro（最强，复杂推理）",
-    "gemini-2.5-flash":      "Gemini 2.5 Flash（均衡，高吞吐）",
-    "gemini-2.5-flash-lite": "Gemini 2.5 Flash-Lite（最快最省）",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro Preview（最新）",
+    "gemini-2.5-pro":         "Gemini 2.5 Pro（GA 稳定版）",
+    "gemini-2.5-flash":       "Gemini 2.5 Flash（均衡，高吞吐）",
+    "gemini-2.5-flash-lite":  "Gemini 2.5 Flash-Lite（最快最省）",
 }
 
 # Default model (can be overridden via env var)
-GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-2.5-flash"
+GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-3.1-pro-preview"
 
 # ── Supabase ───────────────────────────────────────────────────────────────
 SUPABASE_URL: str = _get_secret("SUPABASE_URL")
