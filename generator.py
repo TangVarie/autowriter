@@ -516,7 +516,10 @@ class GeminiEngine:
             raise RuntimeError("google-genai 未安装，请运行 pip install google-genai")
         if not config.GOOGLE_API_KEY:
             raise RuntimeError("GOOGLE_API_KEY 未配置")
-        self._client = google_genai.Client(api_key=config.GOOGLE_API_KEY)
+        client_kwargs: dict = {"api_key": config.GOOGLE_API_KEY}
+        if config.GOOGLE_BASE_URL:
+            client_kwargs["http_options"] = {"base_url": config.GOOGLE_BASE_URL}
+        self._client = google_genai.Client(**client_kwargs)
 
     def _build_parts(
         self, text: str, images: Optional[list[dict]] = None
