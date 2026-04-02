@@ -838,29 +838,32 @@ CREATIVE_ROLES: list[dict] = [
 _SELECT_SYSTEM = """\
 你是一位资深小红书内容编辑，负责从多组草稿中评选最优版本。
 
-你会收到若干组草稿，每组来自同一创作任务的3个角度：叙事角、洞察角、共情角。
+你会收到若干组草稿，每组包含来自不同创作角度和/或不同 AI 模型的多个版本。
 
 对每一组，选出最适合发布的一篇（综合考量：开头吸引力、内容真实感、品牌融入自然度、读者代入感），并给出1-2句评审意见，说明选择理由及潜在改进点。
 
 以 JSON 数组格式回复，顺序与输入完全一致：
-[{"best_index": 0|1|2, "notes": "评审意见"}, ...]
+[{"best_index": <整数>, "notes": "评审意见"}, ...]
 只返回 JSON 数组，不要任何其他文字。"""
 
 
 def _select_best_drafts_batch(
     brief: str,
     all_slot_drafts: list[list[GenerationResult]],
+    draft_labels: list[str],
 ) -> list[tuple[int, str]]:
     """
     One Claude call evaluates all slots at once.
+    draft_labels: human-readable label per draft, e.g. ["叙事角·Claude", "洞察角·Gemini", ...]
     Returns [(best_index, notes), ...] in slot order.
     """
     slot_blocks: list[str] = []
     for i, slot_drafts in enumerate(all_slot_drafts, 1):
         lines = [f"第{i}组："]
-        for j, (role, draft) in enumerate(zip(CREATIVE_ROLES, slot_drafts)):
+        for j, draft in enumerate(slot_drafts):
+            label = draft_labels[j] if j < len(draft_labels) else f"草稿{j+1}"
             body_preview = (draft.body or "")[:200].split("\n")[0]
-            lines.append(f"  草稿{j+1}（{role['name']}）：标题：{draft.title}  正文节选：{body_preview}")
+            lines.append(f"  草稿{j+1}（{label}）：标题：{draft.title}  正文节选：{body_preview}")
         slot_blocks.append("\n".join(lines))
 
     user_content = f"创作任务简报：\n{brief}\n\n" + "\n\n".join(slot_blocks)
@@ -882,7 +885,6 @@ def _select_best_drafts_batch(
             ]
     except Exception:
         pass
-    # Fallback: default to index 0 with no notes
     return [(0, "") for _ in all_slot_drafts]
 
 
@@ -897,23 +899,25 @@ def generate_batch_multi_role(
     images: list | None = None,
     progress_callback=None,
     historical_titles: list[str] | None = None,
-    engine_name: str = "claude",
-    model: str = "",
+    engines: list[str] | None = None,
+    engine_models: dict[str, str] | None = None,
     use_thinking: bool = False,
+    gemini_use_thinking: bool = False,
     custom_roles: list[dict] | None = None,
 ) -> list[dict]:
     """
-    Generate `count` items using multi-role parallel drafting (三省法).
+    Generate `count` items using multi-role × multi-engine parallel drafting (三省法).
 
-    For each slot, 3 creative roles (narrative / insight / empathy) each produce
-    a full draft in parallel, then a single lightweight Claude call picks the best
-    per slot and writes brief review notes.
+    All combinations of (role × engine) run in parallel — e.g. 3 roles × 2 engines
+    = 6 concurrent API calls, same wall-clock time as a single call.
+    One lightweight Claude selection call then picks the best draft per slot.
 
-    Returns same list[dict] format as generate_batch, but each item also carries
-    an 'ai_review_notes' key with the editor's evaluation.
+    engines: list of engine names to use, default ["claude"]
+    engine_models: per-engine model override, e.g. {"claude": "claude-opus-4-6"}
     """
     roles = custom_roles or CREATIVE_ROLES
-    engine = get_engine(engine_name)
+    _engines = engines or ["claude"]
+    _models = engine_models or {}
 
     base_prompt = _make_user_prompt(
         tactic=tactic,
@@ -927,46 +931,51 @@ def generate_batch_multi_role(
     if dedup_block:
         base_prompt += "\n\n" + dedup_block
 
+    tasks = [(role, eng) for role in roles for eng in _engines]
+    n_tasks = len(tasks)
     if progress_callback:
-        progress_callback(0.05, f"三个角色并行起草中（{count}篇 × {len(roles)}角色）…")
+        progress_callback(0.05, f"并行起草中（{len(roles)}角色 × {len(_engines)}引擎 = {n_tasks}路）…")
 
-    # Step 1: All roles generate in parallel — same latency as a single call
-    def _call_role(role: dict) -> tuple[str, list[GenerationResult]]:
-        role_prompt = base_prompt + role["prompt_suffix"]
+    # Step 1: All (role × engine) combinations run in parallel
+    def _call_task(role: dict, eng_name: str) -> tuple[str, str, list[GenerationResult]]:
+        engine = get_engine(eng_name)
+        thinking = use_thinking if eng_name == "claude" else (gemini_use_thinking if eng_name == "gemini" else False)
         items = engine.generate(
             system_prompt=system_prompt,
-            user_prompt=role_prompt,
+            user_prompt=base_prompt + role["prompt_suffix"],
             images=images,
-            use_thinking=use_thinking,
-            model=model,
+            use_thinking=thinking,
+            model=_models.get(eng_name, ""),
             count=count,
         )
-        return role["id"], items
+        return role["id"], eng_name, items
 
-    role_results: dict[str, list[GenerationResult]] = {}
-    with ThreadPoolExecutor(max_workers=len(roles)) as executor:
-        futures = {executor.submit(_call_role, role): role["id"] for role in roles}
+    # key: (role_id, eng_name) → list[GenerationResult]
+    task_results: dict[tuple[str, str], list[GenerationResult]] = {}
+    with ThreadPoolExecutor(max_workers=n_tasks) as executor:
+        futures = {executor.submit(_call_task, role, eng): (role["id"], eng) for role, eng in tasks}
         for future in as_completed(futures):
-            role_id, items = future.result()
-            role_results[role_id] = items
+            role_id, eng_name, items = future.result()
+            task_results[(role_id, eng_name)] = items
 
     if progress_callback:
         progress_callback(0.85, "AI 编辑评选最优版本…")
 
-    # Step 2: One selection call covers all slots
-    brief = _make_user_prompt(
-        tactic=tactic,
-        target_audience=target_audience,
-        key_messages=key_messages,
-        tone=tone,
-        extra=extra_instructions,
-        count=1,
-    )
+    # Assemble per-slot draft lists and labels (order: roles first, engines second)
+    draft_labels = [
+        f"{role['name']}·{eng.capitalize()}"
+        for role in roles for eng in _engines
+    ]
     all_slot_drafts = [
-        [role_results[role["id"]][i] for role in roles]
+        [task_results[(role["id"], eng)][i] for role in roles for eng in _engines]
         for i in range(count)
     ]
-    selections = _select_best_drafts_batch(brief, all_slot_drafts)
+
+    brief = _make_user_prompt(
+        tactic=tactic, target_audience=target_audience,
+        key_messages=key_messages, tone=tone, extra=extra_instructions, count=1,
+    )
+    selections = _select_best_drafts_batch(brief, all_slot_drafts, draft_labels)
 
     if progress_callback:
         progress_callback(1.0, "完成")
@@ -974,20 +983,11 @@ def generate_batch_multi_role(
     results = []
     for i, (best_idx, notes) in enumerate(selections):
         best_draft = all_slot_drafts[i][best_idx]
-        # Tag the winning version with which role won
-        best_draft = GenerationResult(
-            title=best_draft.title,
-            body=best_draft.body,
-            keywords=best_draft.keywords,
-            ai_engine=best_draft.ai_engine,
-            raw_text=best_draft.raw_text,
-            error=best_draft.error,
-            token_usage=best_draft.token_usage,
-        )
+        winner_label = draft_labels[best_idx] if best_idx < len(draft_labels) else "?"
         results.append({
             "versions": [best_draft],
             "tactic": tactic,
-            "ai_review_notes": f"【{roles[best_idx]['name']}胜出】{notes}".strip(),
+            "ai_review_notes": f"【{winner_label}胜出】{notes}".strip(),
         })
     return results
 

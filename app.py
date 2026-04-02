@@ -121,8 +121,8 @@ def _queue_worker(
                     system_prompt=full_system_prompt,
                     tactic=tactic,
                     count=count,
-                    engine_name=engines[0] if engines else "claude",
-                    model=(engine_models or {}).get(engines[0] if engines else "claude", ""),
+                    engines=engines,
+                    engine_models=engine_models or None,
                     target_audience=plan.get("target_audience", ""),
                     key_messages=plan.get("key_messages", ""),
                     tone=plan.get("tone", ""),
@@ -131,6 +131,7 @@ def _queue_worker(
                     progress_callback=_progress,
                     historical_titles=historical_titles or None,
                     use_thinking=use_thinking,
+                    gemini_use_thinking=gemini_thinking,
                 )
             else:
                 generation_results = gen_module.generate_batch(
@@ -839,17 +840,30 @@ def _render_queue_tab() -> None:
                     value=plan.get("count", 3), key=f"qp_count_{i}",
                 )
                 q_eng_mode = st.radio(
-                    "引擎", ["单引擎", "多引擎"], horizontal=True, key=f"qp_eng_mode_{i}",
+                    "模式", ["单引擎", "多引擎比稿", "🎭 三省法"],
+                    horizontal=True, key=f"qp_eng_mode_{i}",
+                    index=2 if plan.get("use_multi_role") else (1 if len(plan.get("engines", [])) > 1 else 0),
                 )
+                plan["use_multi_role"] = (q_eng_mode == "🎭 三省法")
                 if q_eng_mode == "单引擎":
                     q_eng = st.selectbox(
-                        "选择引擎", gen_module.AVAILABLE_ENGINES,
+                        "引擎", gen_module.AVAILABLE_ENGINES,
                         format_func=lambda e: "Claude" if e == "claude" else "Gemini",
                         key=f"qp_eng_{i}",
                     )
                     plan["engines"] = [q_eng]
-                else:
+                elif q_eng_mode == "多引擎比稿":
                     plan["engines"] = gen_module.AVAILABLE_ENGINES[:2] or ["claude"]
+                else:
+                    # 三省法：默认 Claude，可选加 Gemini 增加多样性
+                    q_mr_eng = st.multiselect(
+                        "参与角色起草的引擎",
+                        gen_module.AVAILABLE_ENGINES,
+                        default=plan.get("engines", ["claude"]),
+                        format_func=lambda e: "Claude" if e == "claude" else "Gemini",
+                        key=f"qp_mr_eng_{i}",
+                    )
+                    plan["engines"] = q_mr_eng or ["claude"]
 
             q_em: dict[str, str] = {}
             qm1, qm2 = st.columns(2)
@@ -916,15 +930,16 @@ def _render_queue_tab() -> None:
         if st.button("➕ 添加计划", use_container_width=True, disabled=is_running):
             default_pid = proj_ids[0]
             plans.append({
-                "project_id":       default_pid,
-                "project_name":     proj_id_to_name.get(default_pid, ""),
-                "tactic":           "",
-                "engines":          ["claude"],
-                "engine_models":    {"claude": config.CLAUDE_MODEL},
-                "count":            3,
-                "use_thinking":     False,
+                "project_id":          default_pid,
+                "project_name":        proj_id_to_name.get(default_pid, ""),
+                "tactic":              "",
+                "engines":             ["claude"],
+                "engine_models":       {"claude": config.CLAUDE_MODEL},
+                "count":               3,
+                "use_thinking":        False,
                 "gemini_use_thinking": False,
-                "extra_instructions": "",
+                "use_multi_role":      False,
+                "extra_instructions":  "",
             })
             st.rerun()
 
@@ -1006,23 +1021,45 @@ def page_generate(project: dict) -> None:
         engine_models: dict[str, str] = {}
 
         if use_multi_role:
-            # Multi-role mode: Claude only, 3 roles run in parallel
-            engines = ["claude"]
-            engine_models["claude"] = st.selectbox(
-                "Claude 模型",
-                list(config.CLAUDE_MODELS.keys()),
-                index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
-                      if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
-                format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
-            )
-            use_thinking = st.checkbox(
-                "Extended Thinking",
-                help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
-            )
-            if use_thinking:
-                sel = engine_models.get("claude", "")
-                st.caption("effort=high, max 32k" if "opus-4-6" in sel else "budget=8k, max 16k")
+            # Multi-role mode: choose which engines participate
+            engines = st.multiselect(
+                "参与角色起草的引擎",
+                gen_module.AVAILABLE_ENGINES,
+                default=["claude"],
+                format_func=lambda e: "Claude" if e == "claude" else "Gemini",
+                help="选两个引擎：3角色×2引擎=6路并行，差异性最大",
+            ) or ["claude"]
+            if "claude" in engines:
+                engine_models["claude"] = st.selectbox(
+                    "Claude 模型",
+                    list(config.CLAUDE_MODELS.keys()),
+                    index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
+                          if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
+                    format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
+                )
+            if "gemini" in engines:
+                engine_models["gemini"] = st.selectbox(
+                    "Gemini 模型",
+                    list(config.GEMINI_MODELS.keys()),
+                    index=list(config.GEMINI_MODELS.keys()).index(config.GEMINI_MODEL)
+                          if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
+                    format_func=lambda m: config.GEMINI_MODELS.get(m, m),
+                )
+            use_thinking = False
             gemini_use_thinking = False
+            if "claude" in engines:
+                use_thinking = st.checkbox(
+                    "Claude Extended Thinking",
+                    help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
+                )
+                if use_thinking:
+                    sel = engine_models.get("claude", "")
+                    st.caption("effort=high, max 32k" if "opus-4-6" in sel else "budget=8k, max 16k")
+            if "gemini" in engines:
+                gemini_use_thinking = st.checkbox(
+                    "Gemini 思考模式",
+                    help="thinking_budget=-1 动态分配；对 2.5 Pro 效果明显。",
+                )
         else:
             # Standard mode: single or multi-engine
             engine_mode = st.radio(
@@ -1167,8 +1204,8 @@ def page_generate(project: dict) -> None:
                         system_prompt=full_system_prompt,
                         tactic=tactic,
                         count=count,
-                        engine_name=engines[0] if engines else "claude",
-                        model=engine_models.get(engines[0] if engines else "claude", ""),
+                        engines=engines,
+                        engine_models=engine_models or None,
                         target_audience=target_audience,
                         key_messages=key_messages,
                         tone=tone,
@@ -1177,6 +1214,7 @@ def page_generate(project: dict) -> None:
                         progress_callback=update_progress,
                         historical_titles=historical_titles or None,
                         use_thinking=use_thinking,
+                        gemini_use_thinking=gemini_use_thinking,
                     )
                 else:
                     generation_results = gen_module.generate_batch(
