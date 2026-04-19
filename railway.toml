@@ -1,0 +1,13 @@
+# Railway deployment config for the Feishu-backed AutoWriter backend.
+# Deploys `server.main:app` (FastAPI) — not the legacy Streamlit app.
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "pip install --upgrade pip && pip install -r requirements-server.txt"
+
+[deploy]
+startCommand = "uvicorn server.main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/healthz"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
