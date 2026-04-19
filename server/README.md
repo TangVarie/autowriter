@@ -6,20 +6,27 @@
 
 ```
 飞书多维表格 (UI + 主库)
-   │  状态=待生成 → 飞书自动化 → POST /generate
-   │  反馈填好后   → 飞书自动化 → POST /iterate
+   │  状态=待生成          → POST /generate
+   │  Items 反馈+状态=需修改 → POST /iterate
+   │  状态=沉淀反馈         → POST /ingest-feedback
+   │  状态=更新调教笔记     → POST /refresh-calibration (触发在 Projects 表)
    ▼
-本服务 (部署在 Railway,FastAPI)
-   │
-   ├ /generate ── 读 Batches → 项目 + 参数
-   │              读 Projects → system_prompt + 调教笔记 + 战术后缀 + 正/负例 + 参考图片
-   │              读 Items → 最近标题(跨批次去重) + 已通过/标正例的作为 live examples
-   │              读 Memories (启用 + 作用域过滤)
-   │              并发调 Claude / Gemini → 批量写入 Items + 更新 Batches 状态
-   │
-   └ /iterate ── 读 Items[record_id] → 反馈 + 上一版
-                 读 Project / Batches → 组装同一套 system prompt
-                 多轮对话让 LLM 基于反馈重写 → 更新该行 + 版本+1
+本服务 (Railway · FastAPI)
+
+  /generate  读 Batches+Projects+Memories+Items → 拼 prompt
+             → 根据 生成模式 分支:
+               • 单模式 → generate_batch (一次 Claude/Gemini 调用)
+               • 三省六部 → generate_batch_multi_role
+                 (N 角度×N 引擎并发 → AI 评选 → 六部精炼)
+             → 批量写入 Items
+
+  /iterate   读 Items.反馈 + 上一版 → 多轮对话重写 → 原地更新+版本+1
+
+  /ingest-feedback  扫批次内所有 Items.反馈 → LLM 分类
+                    → upsert 到 Memories (频次+候选/确认)
+
+  /refresh-calibration  扫项目所有已通过/已迭代 Items
+                        → Claude 总结审美偏好 → 写 Projects.调教笔记
 ```
 
 ---
@@ -33,8 +40,9 @@
 | 名称 | 文本 | ✔ | 项目名(主字段) |
 | 品牌 | 文本 | | |
 | `system_prompt` | 多行文本 | ✔ | 基础系统提示词 |
-| 调教笔记 | 多行文本 | | 审美偏好描述,注入 prompt(纯手动,不再 AI 生成) |
+| 调教笔记 | 多行文本 | | 审美偏好描述,注入 prompt;可手动编辑,也可触发 `/refresh-calibration` 让 AI 根据已通过/已迭代的文案自动更新 |
 | 战术配置 | 多行文本 | | JSON,按战术名配 suffix(见下方格式) |
+| 自定义角色 | 多行文本 | | JSON list,三省六部模式下替代默认的 6 角色池(见下方格式) |
 | 正面示例 | 多行文本 | | 见下方"示例字段格式" |
 | 负面示例 | 多行文本 | | 同上 |
 | 参考图片 | 附件 | | 上传的图片会作为 vision 输入传给 Claude/Gemini(最多 4 张) |
@@ -71,6 +79,15 @@
 ]
 ```
 
+**自定义角色 JSON 格式**(仅三省六部模式下用到,留空即用默认 6 角色池:叙事/洞察/共情/对比/干货/场合):
+
+```json
+[
+  {"name": "叙事角", "prompt_suffix": "\n【本篇创作角度:叙事】以具体生活场景或真实故事切入..."},
+  {"name": "洞察角", "prompt_suffix": "\n【本篇创作角度:洞察】从反直觉、出乎意料的角度..."}
+]
+```
+
 ### 2. Batches
 
 | 字段名 | 类型 | 必填 | 说明 |
@@ -81,12 +98,14 @@
 | 数量 | 数字 | | 每个引擎生成多少条(1–50,默认 1) |
 | 引擎 | 多选 | | 选项:`claude` / `gemini`,默认 claude |
 | 目标人群 / 核心卖点 / 语气 / 补充说明 | 多行文本 | | 可选 |
+| 生成模式 | 单选 | | 选项:单模式(默认) / 三省六部;三省六部开启多角色+评选+六部精炼,Token 成本约 10×,适合新项目/要多样性 |
+| 角色数 | 数字 | | 仅三省六部用,默认 3,范围 1–6 |
 | Claude模型 | 单选 | | 如 `claude-opus-4-6` / `claude-sonnet-4-6`,不填用默认 |
 | Gemini模型 | 单选 | | 如 `gemini-3.1-pro-preview` / `gemini-2.5-pro` |
 | Claude深度思考 | 复选框 | | 开启 extended thinking |
 | Gemini深度思考 | 复选框 | | 开启 Gemini thinking |
-| 状态 | 单选 | | 选项:待生成 / 生成中 / 完成 / 失败 |
-| 错误信息 | 多行文本 | | 服务写入 |
+| 状态 | 单选 | | 选项:待生成 / 生成中 / 完成 / 失败 / 沉淀反馈中 |
+| 错误信息 | 多行文本 | | 服务写入(完成/失败时也会写入提示性信息) |
 
 ### 3. Items
 
@@ -99,6 +118,7 @@
 | 版本 | 数字 | | 服务写入,每次 `/iterate` 后 +1 |
 | 状态 | 单选 | | 选项:待审核 / 生成中 / 已通过 / 需修改 |
 | 反馈 | 多行文本 | | **审核时填写**,触发 `/iterate` 重写;重写完会被清空 |
+| AI评审意见 | 多行文本 | | 仅三省六部模式下由服务写入,说明哪个角色胜出、评审理由 |
 | 示例标记 | 单选 | | 选项:正例 / 负例(留空即不作示例) |
 | 审核人 | 人员 | | 多维表格原生 |
 | 图片 | 附件 | | 可选,方便素材协同 |
@@ -114,8 +134,11 @@
 | 范围 | 单选 | ✔ | 选项:全局 / 项目 |
 | 项目 | 关联 → Projects | | 范围=项目 时必填 |
 | 启用 | 复选框 | | 只有打勾的记忆才会注入 prompt |
+| 频次 | 数字 | | 被反馈沉淀命中次数,`/ingest-feedback` 维护 |
+| 状态 | 单选 | | 选项:候选 / 确认;`/ingest-feedback` 在频次 ≥ 3 时自动置为"确认" |
+| 来源反馈 | 多行文本 | | `/ingest-feedback` 写入,保留原始反馈文本 |
 
-> 没有 LLM 反馈分类 —— 用户审核时把反馈写进 Items.反馈,自己决定要不要新增到 Memories。
+手动加的记忆只填"内容 / 范围 / 项目 / 启用"即可;后面三个字段由 `/ingest-feedback` 维护。
 
 ---
 
@@ -202,7 +225,20 @@ curl -X POST localhost:8000/generate \
      - Body:`{"item_record_id": "{{记录ID}}"}`
    - 保存并启用
 
-> 飞书暂不支持多维表格的"按钮字段"直接触发 webhook —— 统一用"状态字段变化"作为触发条件:新建/重跑 Batches 行时改状态=待生成,Items 行要重写时填写反馈并改状态=需修改。
+5. **Batches 表自动化(沉淀反馈到 Memories)**
+   - 触发条件:字段"状态" 变为 "沉淀反馈"
+   - URL:`/ingest-feedback`
+   - Body:`{"batch_record_id": "{{记录ID}}"}`
+   - 使用:审核完一整批后,手动把 Batches.状态 改成"沉淀反馈"即触发
+
+6. **Projects 表自动化(更新调教笔记)**
+   - 在 Projects 加一个 单选 字段 `操作`(选项:空 / 更新调教笔记)
+   - 触发条件:字段"操作" 变为 "更新调教笔记"
+   - URL:`/refresh-calibration`
+   - Body:`{"project_record_id": "{{记录ID}}"}`
+   - 服务处理完不会回写"操作"字段,你自己改回空值即可
+
+> 飞书暂不支持多维表格的"按钮字段"直接触发 webhook —— 统一用"单选字段值变化"作为触发条件。
 
 ---
 
@@ -225,7 +261,9 @@ curl -X POST localhost:8000/generate \
 | 参考图片(vision) | Projects.参考图片 附件,`/generate` 自动下载 base64 传给 Claude/Gemini |
 | Excel / Word 导出 | Bitable 原生"导出"按钮即可 |
 | Feishu webhook 推送 | 数据已经在飞书,不需要再推 |
-| 三省法 / 六部精炼 / AI 自动生成调教笔记 / LLM 反馈分类 | **明确取消**,按用户决定通过"改 prompt + 反馈"替代 |
+| 三省法 + 六部精炼 | Batches.生成模式 = 三省六部 启用;默认关(单模式),需要多样性/新项目时手动切换 |
+| LLM 反馈分类(自动整理记忆) | `/ingest-feedback` 端点,批次审核后触发,自动 classify + upsert 到 Memories |
+| AI 自动生成调教笔记 | `/refresh-calibration` 端点,读该项目已通过/已迭代 Items → Claude 总结 → 写回 Projects.调教笔记 |
 
 ## 常见问题
 

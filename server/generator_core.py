@@ -85,6 +85,69 @@ def run_generation(
     return flat
 
 
+def run_multi_role(
+    *,
+    system_prompt: str,
+    tactic: str,
+    count: int,
+    engines: list[str],
+    target_audience: str = "",
+    key_messages: str = "",
+    tone: str = "",
+    extra_instructions: str = "",
+    claude_model: str = "",
+    gemini_model: str = "",
+    claude_thinking: bool = False,
+    gemini_thinking: bool = False,
+    historical_titles: list[str] | None = None,
+    images: list[dict] | None = None,
+    custom_roles: list[dict] | None = None,
+    n_roles: int = 3,
+) -> list[dict[str, Any]]:
+    """三省六部 pipeline — multi-role × multi-engine parallel drafting,
+    AI selection of the best per slot, then 六部 structured refinement.
+
+    Returns a flat list of ``count`` result dicts (one per slot after
+    selection + refinement) augmented with ``ai_review_notes`` from the
+    evaluator. See ``generator.generate_batch_multi_role`` for the
+    underlying implementation.
+    """
+    engine_models: dict[str, str] = {}
+    if claude_model:
+        engine_models["claude"] = claude_model
+    if gemini_model:
+        engine_models["gemini"] = gemini_model
+
+    slots = _gen.generate_batch_multi_role(
+        system_prompt=system_prompt,
+        tactic=tactic,
+        target_audience=target_audience,
+        key_messages=key_messages,
+        tone=tone,
+        extra_instructions=extra_instructions,
+        count=count,
+        images=images,
+        historical_titles=historical_titles or [],
+        engines=engines,
+        engine_models=engine_models or None,
+        use_thinking=claude_thinking,
+        gemini_use_thinking=gemini_thinking,
+        custom_roles=custom_roles,
+        n_roles=n_roles,
+    )
+
+    results: list[dict[str, Any]] = []
+    for slot in slots:
+        versions = slot.get("versions", [])
+        if not versions:
+            continue
+        winner = versions[0]
+        entry = result_to_dict(winner)
+        entry["ai_review_notes"] = slot.get("ai_review_notes", "") or ""
+        results.append(entry)
+    return results
+
+
 def run_iteration(
     *,
     system_prompt: str,

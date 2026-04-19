@@ -1,13 +1,17 @@
 """FastAPI app that Feishu Bitable automations can POST to.
 
 Endpoint surface:
-  GET  /healthz           — liveness probe (for Railway / uptime pingers)
-  POST /generate          — trigger a batch (body: {"batch_record_id": "..."})
-  POST /iterate           — re-draft one item using its feedback
-                           (body: {"item_record_id": "..."})
+  GET  /healthz             — liveness probe (for Railway / uptime pingers)
+  POST /generate            — trigger a batch (body: {"batch_record_id": "..."})
+  POST /iterate             — re-draft one item using its feedback
+                              (body: {"item_record_id": "..."})
+  POST /ingest-feedback     — classify all Items.反馈 in a batch into
+                              Memories (body: {"batch_record_id": "..."})
+  POST /refresh-calibration — AI-generate calibration notes for a project
+                              (body: {"project_record_id": "..."})
 
-Both mutating endpoints return 202 immediately and run the actual LLM call
-in a BackgroundTask, so Feishu automation never hits the webhook timeout.
+All mutating endpoints return 202 immediately and run the actual LLM call
+in a BackgroundTask so Feishu automation never hits the webhook timeout.
 Status + errors are written back to the relevant row in Bitable.
 
 Auth: if WEBHOOK_SHARED_SECRET is set, incoming requests must carry it in
@@ -34,7 +38,8 @@ from .feishu_bitable import (
     single_select_of,
     text_of,
 )
-from .generator_core import run_generation, run_iteration
+from .generator_core import run_generation, run_iteration, run_multi_role
+from .memory_helpers import classify_feedback, generate_calibration_notes
 from .prompt_builder import build_system_prompt, lookup_tactic_suffix, parse_examples_text
 
 log = logging.getLogger("autowriter.server")
@@ -52,6 +57,14 @@ class GenerateRequest(BaseModel):
 
 class IterateRequest(BaseModel):
     item_record_id: str = Field(..., description="Record ID in the Items table")
+
+
+class IngestFeedbackRequest(BaseModel):
+    batch_record_id: str = Field(..., description="Record ID in the Batches table")
+
+
+class RefreshCalibrationRequest(BaseModel):
+    project_record_id: str = Field(..., description="Record ID in the Projects table")
 
 
 # ── Routes ──────────────────────────────────────────────────────────────
@@ -90,6 +103,28 @@ def iterate(
     _check_auth(x_autowriter_token)
     background.add_task(_run_iterate, req.item_record_id)
     return {"accepted": True, "item_record_id": req.item_record_id}
+
+
+@app.post("/ingest-feedback", status_code=202)
+def ingest_feedback(
+    req: IngestFeedbackRequest,
+    background: BackgroundTasks,
+    x_autowriter_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _check_auth(x_autowriter_token)
+    background.add_task(_run_ingest_feedback, req.batch_record_id)
+    return {"accepted": True, "batch_record_id": req.batch_record_id}
+
+
+@app.post("/refresh-calibration", status_code=202)
+def refresh_calibration(
+    req: RefreshCalibrationRequest,
+    background: BackgroundTasks,
+    x_autowriter_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _check_auth(x_autowriter_token)
+    background.add_task(_run_refresh_calibration, req.project_record_id)
+    return {"accepted": True, "project_record_id": req.project_record_id}
 
 
 # ── Shared field / status constants ─────────────────────────────────────
@@ -155,13 +190,16 @@ def _run_batch(batch_record_id: str) -> None:
         tone = text_of(batch_fields.get("语气"))
         extra = text_of(batch_fields.get("补充说明"))
 
+        mode = single_select_of(batch_fields.get("生成模式")) or "单模式"
+        custom_roles, n_roles = _role_config(project_fields, batch_fields)
+
         log.info(
-            "batch %s: project=%s tactic=%s count=%d engines=%s images=%d history=%d",
-            batch_record_id, project_id, tactic, count, engines,
+            "batch %s: project=%s tactic=%s count=%d engines=%s mode=%s images=%d history=%d",
+            batch_record_id, project_id, tactic, count, engines, mode,
             len(images), len(historical_titles),
         )
 
-        results = run_generation(
+        shared_kwargs: dict[str, Any] = dict(
             system_prompt=full_system_prompt,
             tactic=tactic,
             count=count,
@@ -177,6 +215,14 @@ def _run_batch(batch_record_id: str) -> None:
             historical_titles=historical_titles,
             images=images or None,
         )
+        if mode == "三省六部":
+            results = run_multi_role(
+                **shared_kwargs,
+                custom_roles=custom_roles,
+                n_roles=n_roles,
+            )
+        else:
+            results = run_generation(**shared_kwargs)
 
         records = _results_to_item_records(
             results=results,
@@ -306,6 +352,219 @@ def _run_iterate(item_record_id: str) -> None:
         })
 
 
+# ── Memory ingestion (LLM-classified feedback → Memories) ──────────────
+
+def _run_ingest_feedback(batch_record_id: str) -> None:
+    """Sweep all Items in a batch that have non-empty feedback, classify each,
+    and upsert a Memories row (project or global scope) for each.
+
+    Frequency + confirmation mirrors the original memory system: a freshly
+    classified memory starts as 候选(frequency=1, status=candidate); if the
+    same 内容 already exists it just increments frequency, and when frequency
+    crosses the threshold the status flips to confirmed.
+    """
+    try:
+        _mark_batch(batch_record_id, "沉淀反馈中", error="")
+
+        batch_row = _client.get_record(config.FEISHU_TABLE_BATCHES, batch_record_id)
+        batch_fields = batch_row.get("fields", {}) or {}
+
+        project_ids = link_ids_of(batch_fields.get("项目"))
+        if not project_ids:
+            raise ValueError("批次未关联项目")
+        project_id = project_ids[0]
+        project_row = _client.get_record(config.FEISHU_TABLE_PROJECTS, project_id)
+        project_name = text_of(project_row.get("fields", {}).get("名称"))
+
+        # Collect all Items in this batch with non-empty feedback
+        try:
+            all_items = _client.list_records(config.FEISHU_TABLE_ITEMS, page_size=100)
+        except Exception as e:
+            raise RuntimeError(f"读取 Items 失败: {e}") from e
+
+        feedbacks: list[str] = []
+        for row in all_items:
+            f = row.get("fields", {}) or {}
+            if batch_record_id not in link_ids_of(f.get("批次")):
+                continue
+            fb = text_of(f.get("反馈")).strip()
+            if fb:
+                feedbacks.append(fb)
+
+        if not feedbacks:
+            _mark_batch(batch_record_id, "完成", error="没有可沉淀的反馈")
+            return
+
+        ingested = 0
+        for fb in feedbacks:
+            scope, content = classify_feedback(fb, project_name=project_name)
+            if not content.strip():
+                continue
+            _upsert_memory(
+                scope=scope,
+                content=content.strip(),
+                source_feedback=fb,
+                project_id=project_id if scope == "project" else None,
+            )
+            ingested += 1
+
+        _mark_batch(
+            batch_record_id, "完成",
+            error=f"已沉淀 {ingested}/{len(feedbacks)} 条反馈" if ingested else "没有可沉淀的反馈",
+        )
+
+    except Exception as e:  # noqa: BLE001
+        log.exception("ingest_feedback %s failed: %s", batch_record_id, e)
+        _mark_batch(
+            batch_record_id, "失败",
+            error=f"沉淀反馈失败：{type(e).__name__}: {e}",
+        )
+
+
+def _upsert_memory(
+    *,
+    scope: str,
+    content: str,
+    source_feedback: str,
+    project_id: str | None,
+) -> None:
+    """Find an existing Memories row with matching (scope, content, project);
+    increment its frequency (auto-confirming at threshold). If none exists,
+    create a fresh candidate row.
+    """
+    try:
+        existing = _client.list_records(config.FEISHU_TABLE_MEMORIES, page_size=100)
+    except Exception as e:
+        log.warning("upsert_memory: list failed: %s", e)
+        existing = []
+
+    scope_label = "全局" if scope == "global" else "项目"
+    threshold = 3
+
+    match_id: str | None = None
+    match_fields: dict[str, Any] = {}
+    for row in existing:
+        f = row.get("fields", {}) or {}
+        if text_of(f.get("内容")).strip() != content:
+            continue
+        row_scope = single_select_of(f.get("范围"))
+        if row_scope != scope_label:
+            continue
+        row_project = link_ids_of(f.get("项目"))
+        if scope == "project":
+            if not project_id or project_id not in row_project:
+                continue
+        else:
+            if row_project:
+                continue
+        match_id = row.get("record_id") or row.get("id")
+        match_fields = f
+        break
+
+    if match_id:
+        prev_freq = int(match_fields.get("频次") or 1)
+        new_freq = prev_freq + 1
+        prev_status = single_select_of(match_fields.get("状态")) or "候选"
+        new_status = "确认" if new_freq >= threshold else prev_status
+        update: dict[str, Any] = {
+            "频次": new_freq,
+            "状态": new_status,
+        }
+        try:
+            _client.update_record(config.FEISHU_TABLE_MEMORIES, match_id, update)
+        except Exception as e:
+            log.warning("upsert_memory: update failed: %s", e)
+        return
+
+    fields: dict[str, Any] = {
+        "内容": content,
+        "范围": scope_label,
+        "启用": True,
+        "频次": 1,
+        "状态": "候选",
+        "来源反馈": source_feedback[:500],
+    }
+    if scope == "project" and project_id:
+        fields["项目"] = [project_id]
+    try:
+        _client.batch_create(config.FEISHU_TABLE_MEMORIES, [{"fields": fields}])
+    except Exception as e:
+        log.warning("upsert_memory: create failed: %s", e)
+
+
+# ── Calibration notes (AI-regenerated) ─────────────────────────────────
+
+def _run_refresh_calibration(project_record_id: str) -> None:
+    try:
+        project_row = _client.get_record(config.FEISHU_TABLE_PROJECTS, project_record_id)
+        project_fields = project_row.get("fields", {}) or {}
+        project_name = text_of(project_fields.get("名称"))
+        existing_notes = text_of(project_fields.get("调教笔记"))
+
+        # Collect project items — approved (taste signal) + iterated (feedback signal)
+        try:
+            all_items = _client.list_records(config.FEISHU_TABLE_ITEMS, page_size=200)
+        except Exception as e:
+            raise RuntimeError(f"读取 Items 失败: {e}") from e
+
+        approved: list[dict] = []
+        iterated: list[dict] = []
+        for row in all_items:
+            f = row.get("fields", {}) or {}
+            if project_record_id not in link_ids_of(f.get("项目")):
+                continue
+            title = text_of(f.get("标题"))
+            body = text_of(f.get("正文"))
+            if not title and not body:
+                continue
+            status = single_select_of(f.get("状态"))
+            version_num = f.get("版本") or 1
+            feedback = text_of(f.get("反馈"))
+
+            version_entry = {
+                "version_num": int(version_num) if str(version_num).isdigit() else 1,
+                "title": title,
+                "body": body,
+                "feedback": feedback,
+            }
+            entry = {
+                "title": title,
+                "body": body,
+                "versions": [version_entry],
+            }
+            if status == "已通过":
+                approved.append(entry)
+            if (version_entry["version_num"] or 0) > 1:
+                iterated.append(entry)
+
+        if not approved and not iterated:
+            log.info(
+                "refresh_calibration %s: no approved/iterated items, skipping",
+                project_record_id,
+            )
+            return
+
+        new_notes = generate_calibration_notes(
+            project_name=project_name,
+            existing_notes=existing_notes,
+            approved_items=approved,
+            iterated_items=iterated,
+        )
+
+        if new_notes and new_notes.strip() and new_notes.strip() != existing_notes.strip():
+            _client.update_record(
+                config.FEISHU_TABLE_PROJECTS,
+                project_record_id,
+                {"调教笔记": new_notes},
+            )
+            log.info("refresh_calibration %s: updated (len=%d)", project_record_id, len(new_notes))
+        else:
+            log.info("refresh_calibration %s: no change", project_record_id)
+
+    except Exception as e:  # noqa: BLE001
+        log.exception("refresh_calibration %s failed: %s", project_record_id, e)
+
+
 # ── Shared helpers ─────────────────────────────────────────────────────
 
 def _load_project_from_batch(batch_fields: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -362,6 +621,44 @@ def _engine_overrides(
     claude_thinking = bool(batch_fields.get("Claude深度思考"))
     gemini_thinking = bool(batch_fields.get("Gemini深度思考"))
     return claude_model, gemini_model, claude_thinking, gemini_thinking
+
+
+def _role_config(
+    project_fields: dict[str, Any],
+    batch_fields: dict[str, Any],
+) -> tuple[list[dict] | None, int]:
+    """Read custom_roles (project-level) + n_roles (batch-level) for 三省六部.
+
+    Projects.自定义角色 format: JSON list of {"id", "name", "prompt_suffix"}.
+    Empty / malformed → returns (None, ...), letting generator fall back to
+    CREATIVE_ROLES_POOL.
+    """
+    import json as _json
+
+    raw = text_of(project_fields.get("自定义角色")).strip()
+    custom_roles: list[dict] | None = None
+    if raw:
+        try:
+            data = _json.loads(raw)
+            if isinstance(data, list):
+                custom_roles = [
+                    {
+                        "id": str(item.get("id") or item.get("name") or f"role_{i}"),
+                        "name": str(item.get("name") or item.get("id") or f"角色{i+1}"),
+                        "prompt_suffix": str(item.get("prompt_suffix") or item.get("suffix") or ""),
+                    }
+                    for i, item in enumerate(data)
+                    if isinstance(item, dict) and (item.get("prompt_suffix") or item.get("suffix"))
+                ] or None
+        except (ValueError, TypeError):
+            custom_roles = None
+
+    try:
+        n_roles = int(batch_fields.get("角色数") or 3)
+    except (TypeError, ValueError):
+        n_roles = 3
+    n_roles = max(1, min(n_roles, 6))
+    return custom_roles, n_roles
 
 
 def _parse_engines(raw: Any) -> list[str]:
@@ -494,6 +791,8 @@ def _results_to_item_records(
             "批次": [batch_record_id],
             "项目": [project_id],
         }
+        if r.get("ai_review_notes"):
+            fields["AI评审意见"] = str(r["ai_review_notes"])
         if r.get("error"):
             fields[_ITEM_ERROR] = str(r["error"])
         records.append({"fields": fields})
