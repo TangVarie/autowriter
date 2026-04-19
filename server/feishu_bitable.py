@@ -166,6 +166,29 @@ class BitableClient:
         )
         return data.get("record", {})
 
+    # ── Attachments ──────────────────────────────────────────────────────
+
+    def download_attachment(self, file_token: str) -> bytes:
+        """Download the raw bytes of a Bitable attachment.
+
+        Uses /drive/v1/medias/{file_token}/download with the ``extra`` param
+        that scopes the tenant_access_token to this Bitable.
+        """
+        import json as _json
+        extra = _json.dumps({"bitable": {"app_token": self.app_token}}, ensure_ascii=False)
+        resp = requests.get(
+            f"{_BASE}/drive/v1/medias/{file_token}/download",
+            headers={"Authorization": f"Bearer {self._tenant_token()}"},
+            params={"extra": extra},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            raise BitableError(
+                f"download attachment {file_token} failed: "
+                f"status={resp.status_code} body={resp.text[:200]}"
+            )
+        return resp.content
+
 
 # ── Field helpers ────────────────────────────────────────────────────────
 
@@ -227,3 +250,59 @@ def link_ids_of(field_value: Any) -> list[str]:
                 ids.append(item)
         return ids
     return []
+
+
+def attachment_tokens_of(field_value: Any) -> list[dict[str, str]]:
+    """Extract {file_token, mime_type, name} from an attachment-field value.
+
+    Attachment field shape:
+      [{"file_token": "boxcn...", "name": "1.jpg", "type": "image/jpeg",
+        "size": 12345, "url": "...", ...}, ...]
+    """
+    if not field_value:
+        return []
+    results: list[dict[str, str]] = []
+    items = field_value if isinstance(field_value, list) else [field_value]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        token = item.get("file_token") or item.get("token")
+        if not token:
+            continue
+        mime = item.get("type") or item.get("mime_type") or "image/jpeg"
+        name = item.get("name") or ""
+        results.append({"file_token": token, "mime_type": mime, "name": name})
+    return results
+
+
+_SUPPORTED_IMAGE_MIMES = {
+    "image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif",
+}
+
+
+def encode_attachments_as_images(
+    client: BitableClient,
+    attachments: list[dict[str, str]],
+    *,
+    max_images: int = 4,
+) -> list[dict[str, str]]:
+    """Download up to ``max_images`` attachments and return LLM-ready image
+    dicts: [{"media_type": "image/jpeg", "data": "<base64>"}, ...].
+    Non-image attachments are silently skipped.
+    """
+    import base64
+
+    results: list[dict[str, str]] = []
+    for att in attachments[:max_images]:
+        mime = att.get("mime_type", "").lower()
+        if mime not in _SUPPORTED_IMAGE_MIMES:
+            continue
+        try:
+            raw = client.download_attachment(att["file_token"])
+        except Exception:
+            continue
+        results.append({
+            "media_type": mime,
+            "data": base64.b64encode(raw).decode("ascii"),
+        })
+    return results

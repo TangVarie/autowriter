@@ -2,9 +2,9 @@
 
 Port of the pure-Python logic from memory.build_system_prompt (memory.py:27-83)
 — reproduced here so the server module does not import streamlit/supabase.
-The calibration_notes and custom_roles branches from the original are dropped
-per the plan; the rest of the layout (order, headings, bullet formatting) is
-preserved exactly so generation quality stays comparable.
+Layout (order, headings, bullet formatting) matches the original so
+generation quality stays comparable. Calibration notes are kept (manually
+maintained by the user), only the AI-generation side is dropped.
 
 Examples are expected as dicts with {"title": str, "body": str}.
 Memories as dicts with {"content": str}.
@@ -12,12 +12,15 @@ Memories as dicts with {"content": str}.
 
 from __future__ import annotations
 
+import json
+
 
 def build_system_prompt(
     base_prompt: str,
     global_memories: list[dict] | None = None,
     project_memories: list[dict] | None = None,
     tactic_suffix: str = "",
+    calibration_notes: str = "",
     positive_examples: list[dict] | None = None,
     negative_examples: list[dict] | None = None,
 ) -> str:
@@ -39,6 +42,12 @@ def build_system_prompt(
             parts.append(
                 "\n---项目记忆（必须执行，每条都要主动检查）---\n" + bullets
             )
+
+    if calibration_notes and calibration_notes.strip():
+        parts.append(
+            "\n---调教笔记（理解并内化这些审美偏好，生成内容时主动应用）---\n"
+            + calibration_notes.strip()
+        )
 
     if positive_examples:
         ex_blocks = []
@@ -65,6 +74,32 @@ def build_system_prompt(
         )
 
     return "\n".join(parts)
+
+
+def lookup_tactic_suffix(tactic: str, tactics_config_raw: str) -> str:
+    """Given a free-form tactic label and the project's tactic-config JSON text,
+    return the matching suffix (or empty string).
+
+    tactics_config accepts either:
+      • JSON array: [{"name": "种草", "suffix": "..."}, ...]
+      • JSON object: {"种草": "...", "测评": "..."}
+      • Empty string → no suffix.
+    """
+    if not tactic or not tactics_config_raw:
+        return ""
+    try:
+        data = json.loads(tactics_config_raw)
+    except (ValueError, TypeError):
+        return ""
+    if isinstance(data, dict):
+        return str(data.get(tactic, "") or "")
+    if isinstance(data, list):
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("name") == tactic or entry.get("tactic") == tactic:
+                return str(entry.get("suffix") or entry.get("prompt_suffix") or "")
+    return ""
 
 
 def parse_examples_text(raw: str) -> list[dict]:

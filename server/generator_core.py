@@ -12,7 +12,6 @@ bare ``except Exception``, so running without streamlit installed is safe.
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Any
 
 import generator as _gen
@@ -45,12 +44,17 @@ def run_generation(
     claude_thinking: bool = False,
     gemini_thinking: bool = False,
     historical_titles: list[str] | None = None,
+    images: list[dict] | None = None,
 ) -> list[dict[str, Any]]:
     """Run a single generation round and return a flat list of result dicts.
 
-    generate_batch returns ``count`` slots, each holding one version per engine.
-    We flatten that into ``count * len(engines)`` rows so each result becomes
-    one record in the Bitable Items table.
+    ``generate_batch`` returns ``count`` slots, each holding one version per
+    engine. We flatten that into ``count * len(engines)`` rows so each result
+    becomes one record in the Bitable Items table.
+
+    ``images``: list of {"media_type": str, "data": base64-str} — passed to
+    both Claude and Gemini as vision input (applied to every call in this
+    batch; set once per project/batch).
     """
     engine_models: dict[str, str] = {}
     if claude_model:
@@ -67,7 +71,7 @@ def run_generation(
         key_messages=key_messages,
         tone=tone,
         extra_instructions=extra_instructions,
-        images=None,
+        images=images,
         historical_titles=historical_titles or [],
         use_thinking=claude_thinking,
         engine_models=engine_models or None,
@@ -79,3 +83,60 @@ def run_generation(
         for version in slot.get("versions", []):
             flat.append(result_to_dict(version))
     return flat
+
+
+def run_iteration(
+    *,
+    system_prompt: str,
+    prior_title: str,
+    prior_body: str,
+    prior_keywords: list[str],
+    feedback: str,
+    engine: str = "claude",
+    claude_model: str = "",
+    gemini_model: str = "",
+    claude_thinking: bool = False,
+    gemini_thinking: bool = False,
+    images: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Re-draft a single item using the prior version + user feedback.
+
+    Builds a two-turn conversation: assistant's prior JSON output, then the
+    user's revision request. Calls ``engine.iterate`` and returns a result
+    dict in the same shape as ``run_generation`` entries.
+    """
+    import json as _json
+
+    prior_json = _json.dumps(
+        {"title": prior_title, "body": prior_body, "keywords": prior_keywords or []},
+        ensure_ascii=False,
+    )
+    feedback_msg = (
+        f"请根据以下反馈重写这篇文案（保持 JSON 格式输出，只返回 JSON）：\n\n"
+        f"{feedback.strip()}\n\n"
+        "重写要求：\n"
+        "- 保留系统提示词中的所有记忆与调教要求\n"
+        "- 针对反馈做实质性改动，不要小修小补\n"
+        "- 仍然输出 {\"title\":..., \"body\":..., \"keywords\":[...]} 这个 JSON"
+    )
+    messages = [
+        {"role": "user", "content": "请生成一篇小红书文案。"},
+        {"role": "assistant", "content": prior_json},
+        {"role": "user", "content": feedback_msg},
+    ]
+
+    engine_key = engine.lower().split("/")[0]
+    if engine_key not in ("claude", "gemini"):
+        engine_key = "claude"
+    eng = _gen.get_engine(engine_key)
+    model_override = claude_model if engine_key == "claude" else gemini_model
+    thinking = claude_thinking if engine_key == "claude" else gemini_thinking
+
+    result = eng.iterate(
+        messages=messages,
+        system_prompt=system_prompt,
+        images=images,
+        use_thinking=thinking,
+        model=model_override,
+    )
+    return result_to_dict(result)
