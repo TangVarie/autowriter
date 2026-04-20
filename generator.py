@@ -309,13 +309,85 @@ def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
     )
 
 
+def _item_dict_to_result(item: dict, ai_engine: str, raw_text: str) -> GenerationResult:
+    keywords = item.get("keywords", [])
+    if isinstance(keywords, str):
+        keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
+    return GenerationResult(
+        title=str(item.get("title", "")).strip(),
+        body=str(item.get("body", "")).strip(),
+        keywords=keywords,
+        ai_engine=ai_engine,
+        raw_text=raw_text,
+    )
+
+
+def _extract_json_objects(text: str) -> list[dict]:
+    """Scan text for balanced top-level {...} blocks and json.loads each.
+
+    Tolerant of arbitrary garbage between objects (e.g. stray chars from
+    model output corruption like Gemini's "}f{" glitch). Tracks string
+    state to avoid treating `{` / `}` inside strings as object boundaries.
+    """
+    results: list[dict] = []
+    depth = 0
+    start = -1
+    in_string = False
+    escape = False
+    for i, c in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if in_string and c == '\\':
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == '}':
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    chunk = text[start:i + 1]
+                    data = None
+                    for candidate in (
+                        chunk,
+                        _fix_json_newlines(chunk),
+                        _repair_json_list_field_quotes(chunk),
+                        _fix_json_newlines(_repair_json_list_field_quotes(chunk)),
+                    ):
+                        try:
+                            parsed = json.loads(candidate)
+                            if isinstance(parsed, dict):
+                                data = parsed
+                                break
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    if data is not None:
+                        results.append(data)
+                    start = -1
+    return results
+
+
 def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[GenerationResult]:
     """
     Parse a JSON array of N copy items from AI output.
-    Falls back to single-item parse if the array can't be found.
+
+    Strategy:
+      1. Slice [...] and json.loads the whole array (with repair passes).
+      2. If that fails, brace-match individual {...} objects — tolerates
+         mid-array corruption (stray chars, missing commas).
+      3. Last resort: single-item parse on the whole text.
     """
     stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
 
+    # --- 1. Whole-array parse ------------------------------------------
     for src in (stripped, text):
         start = src.find('[')
         end = src.rfind(']')
@@ -340,20 +412,9 @@ def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[Generat
 
         results: list[GenerationResult] = []
         for item in data:
-            if not isinstance(item, dict):
-                continue
-            keywords = item.get("keywords", [])
-            if isinstance(keywords, str):
-                keywords = [k.strip() for k in re.split(r'[,，、\s]+', keywords) if k.strip()]
-            results.append(GenerationResult(
-                title=str(item.get("title", "")).strip(),
-                body=str(item.get("body", "")).strip(),
-                keywords=keywords,
-                ai_engine=ai_engine,
-                raw_text=text,
-            ))
+            if isinstance(item, dict):
+                results.append(_item_dict_to_result(item, ai_engine, text))
         if results:
-            # Pad if AI returned fewer items than requested
             while len(results) < count:
                 results.append(GenerationResult(
                     title="", body="", keywords=[], ai_engine=ai_engine,
@@ -362,13 +423,47 @@ def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[Generat
                 ))
             return results[:count]
 
-    # Fallback: single-item parse
+    # --- 2. Per-object brace match (tolerates malformed separators) ----
+    objects = _extract_json_objects(stripped) or _extract_json_objects(text)
+    if objects:
+        results = [_item_dict_to_result(obj, ai_engine, text) for obj in objects]
+        if len(results) < count:
+            truncated = ('[' in text) and (']' not in text)
+            tail = text[-80:].replace('\n', ' ').replace('\r', ' ')
+            if truncated:
+                err = (
+                    f"输出在数组中途被截断（已抽取 {len(results)}/{count} 篇，"
+                    f"raw_text={len(text)} 字，未见闭合 ']'；末尾: …{tail}）。"
+                    f"请减少生成数量或换更强模型。"
+                )
+            else:
+                err = (
+                    f"JSON 部分损坏，按对象抽取 {len(results)}/{count} 篇"
+                    f"（raw_text={len(text)} 字）"
+                )
+            while len(results) < count:
+                results.append(GenerationResult(
+                    title="", body="", keywords=[], ai_engine=ai_engine,
+                    raw_text=text, error=err,
+                ))
+        return results[:count]
+
+    # --- 3. Single-item fallback ---------------------------------------
     single = _parse_copy_json(text, ai_engine)
     results = [single]
+    truncated = ('[' in text) and (']' not in text)
+    tail = text[-80:].replace('\n', ' ').replace('\r', ' ')
+    if truncated:
+        err = (
+            f"输出在数组中途被截断（仅解出 1 篇，raw_text={len(text)} 字，"
+            f"未见闭合 ']'；末尾: …{tail}）。请减少生成数量或换更强模型。"
+        )
+    else:
+        err = f"无法解析多篇格式，仅返回1篇（raw_text={len(text)} 字）"
     while len(results) < count:
         results.append(GenerationResult(
             title="", body="", keywords=[], ai_engine=ai_engine,
-            error="无法解析多篇格式，仅返回1篇",
+            error=err,
         ))
     return results
 
@@ -446,19 +541,15 @@ class ClaudeEngine:
                 "output": response.usage.output_tokens,
             }
             stop_reason = getattr(response, "stop_reason", None)
-            truncated = stop_reason == "max_tokens"
             results = _parse_copy_json_list(text, count, f"claude/{model}") if count > 1 \
                 else [_parse_copy_json(text, f"claude/{model}")]
-            if truncated:
-                trunc_msg = (
-                    f"输出达到 max_tokens 上限被截断（模型 {model} 本次预算 "
-                    f"{params['max_tokens']} tokens，实际输出 {token_usage['output']}）。"
-                    f"请减小生成数量或换支持更大输出的模型。"
-                )
-                for r in results:
-                    if r.error or not (r.title or r.body):
-                        r.error = trunc_msg
+            diag = (
+                f" [stop_reason={stop_reason}, output_tokens="
+                f"{token_usage['output']}, budget={params['max_tokens']}]"
+            )
             for r in results:
+                if r.error:
+                    r.error += diag
                 r.token_usage = token_usage
             return results
         except anthropic.APIError as e:
@@ -498,12 +589,18 @@ class ClaudeEngine:
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
             }
-            if getattr(response, "stop_reason", None) == "max_tokens":
-                result.error = (
-                    f"输出达到 max_tokens 上限被截断（模型 {model} 本次预算 "
-                    f"{params['max_tokens']} tokens，实际输出 "
-                    f"{result.token_usage['output']}）。请换支持更大输出的模型。"
+            stop_reason = getattr(response, "stop_reason", None)
+            if result.error or stop_reason == "max_tokens":
+                diag = (
+                    f" [stop_reason={stop_reason}, output_tokens="
+                    f"{result.token_usage['output']}, budget={params['max_tokens']}]"
                 )
+                if result.error:
+                    result.error += diag
+                elif stop_reason == "max_tokens":
+                    result.error = (
+                        f"输出被截断{diag}。请换支持更大输出的模型。"
+                    )
             return result
         except anthropic.APIError as e:
             return GenerationResult(
@@ -605,7 +702,18 @@ class GeminiEngine:
                 }
             results = _parse_copy_json_list(text, count, f"gemini/{model}") if count > 1 \
                 else [_parse_copy_json(text, f"gemini/{model}")]
+            finish_reason = None
+            candidates = getattr(response, "candidates", None)
+            if candidates:
+                finish_reason = getattr(candidates[0], "finish_reason", None)
+            diag = (
+                f" [finish_reason={finish_reason}, output_tokens="
+                f"{token_usage.get('output', 0)}, thinking_tokens="
+                f"{token_usage.get('thinking', 0)}]"
+            )
             for r in results:
+                if r.error:
+                    r.error += diag
                 r.token_usage = token_usage
             return results
         except Exception as e:
