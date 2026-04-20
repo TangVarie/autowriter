@@ -383,25 +383,6 @@ def _extract_text_from_response(response) -> str:
     return ""
 
 
-def _claude_thinking_params(model: str) -> dict:
-    """
-    Build the extended-thinking parameters for a Claude model.
-
-    - claude-opus-4-6 dropped budget_tokens in favour of the "effort" parameter.
-    - All other current models (Sonnet 4.6, Haiku 4.5) still use budget_tokens.
-    """
-    if "opus-4-6" in model:
-        return {
-            "max_tokens": 32000,
-            "thinking": {"type": "enabled", "effort": "high"},
-        }
-    else:
-        return {
-            "max_tokens": 16000,
-            "thinking": {"type": "enabled", "budget_tokens": 8000},
-        }
-
-
 class ClaudeEngine:
     def __init__(self) -> None:
         if not config.ANTHROPIC_API_KEY:
@@ -428,9 +409,10 @@ class ClaudeEngine:
         content.append({"type": "text", "text": text})
         return content
 
-    def _make_params(self, model: str, use_thinking: bool, count: int = 1) -> dict:
-        if use_thinking:
-            return {"model": model, **_claude_thinking_params(model)}
+    def _make_params(self, model: str, use_thinking: bool = False, count: int = 1) -> dict:
+        # Thinking mode is selected via model name (e.g. *-thinking) through the
+        # proxy, not via the `thinking` API parameter. The flag is kept in the
+        # signature only for call-site compatibility.
         return {"model": model, "max_tokens": max(2048, count * 1500)}
 
     def generate(

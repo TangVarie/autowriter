@@ -1046,26 +1046,15 @@ def _render_queue_tab() -> None:
                     )
             plan["engine_models"] = q_em
 
-            # Only show thinking toggles for the engines actually selected
-            _think_cols = [e for e in plan["engines"] if e in ("claude", "gemini")]
-            if _think_cols:
-                think_col_widgets = st.columns(len(_think_cols))
-                for _tc, _eng in zip(think_col_widgets, _think_cols):
-                    with _tc:
-                        if _eng == "claude":
-                            plan["use_thinking"] = st.checkbox(
-                                "Claude Thinking",
-                                value=plan.get("use_thinking", False),
-                                key=f"qp_think_{i}",
-                                help="Opus 4.6 → effort=high；其他 → budget_tokens=8000",
-                            )
-                        else:
-                            plan["gemini_use_thinking"] = st.checkbox(
-                                "Gemini 思考模式",
-                                value=plan.get("gemini_use_thinking", False),
-                                key=f"qp_gthink_{i}",
-                                help="thinking_budget=-1 动态分配（Gemini 3.x 默认开启思考）",
-                            )
+            # Claude thinking is now selected via model name (-thinking suffix);
+            # only Gemini keeps a runtime toggle.
+            if "gemini" in plan["engines"]:
+                plan["gemini_use_thinking"] = st.checkbox(
+                    "Gemini 思考模式",
+                    value=plan.get("gemini_use_thinking", False),
+                    key=f"qp_gthink_{i}",
+                    help="thinking_budget=-1 动态分配（Gemini 3.x 默认开启思考）",
+                )
 
             plan["extra_instructions"] = st.text_input(
                 "补充说明", value=plan.get("extra_instructions", ""),
@@ -1212,14 +1201,6 @@ def page_generate(project: dict) -> None:
                 )
             use_thinking = False
             gemini_use_thinking = False
-            if "claude" in engines:
-                use_thinking = st.checkbox(
-                    "Claude Extended Thinking",
-                    help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
-                )
-                if use_thinking:
-                    sel = engine_models.get("claude", "")
-                    st.caption("effort=high, max 32k" if "opus-4-6" in sel else "budget=8k, max 16k")
             if "gemini" in engines:
                 gemini_use_thinking = st.checkbox(
                     "Gemini 思考模式",
@@ -1260,14 +1241,6 @@ def page_generate(project: dict) -> None:
 
             use_thinking = False
             gemini_use_thinking = False
-            if "claude" in engines:
-                use_thinking = st.checkbox(
-                    "Claude：Extended Thinking",
-                    help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
-                )
-                if use_thinking:
-                    sel = engine_models.get("claude", "")
-                    st.caption("effort=high, max 32k" if "opus-4-6" in sel else "budget=8k, max 16k")
             if "gemini" in engines:
                 gemini_use_thinking = st.checkbox(
                     "Gemini：思考模式",
@@ -1719,17 +1692,8 @@ def _render_item_card(
                               if config.GEMINI_MODEL in config.GEMINI_MODELS else 0,
                     )
 
-            # Thinking toggle — only meaningful for Claude
-            if iter_engine == "claude":
-                _default_thinking = _bp.get("use_thinking", False) if isinstance(_bp, dict) else False
-                iter_use_thinking = st.checkbox(
-                    "深度思考（Extended Thinking）",
-                    value=_default_thinking,
-                    key=f"iter_think_{item_id}",
-                    help="Opus 4.6 → effort=high；其他模型 → budget_tokens=8000。速度明显变慢。",
-                )
-            else:
-                iter_use_thinking = False
+            # Claude thinking is selected via model name; no runtime toggle.
+            iter_use_thinking = False
 
             if st.button("🔄 重新生成", key=f"regen_{item_id}", use_container_width=True):
                 if not combined_feedback:
@@ -1897,12 +1861,7 @@ def _render_version_comparison(
                             index=list(config.CLAUDE_MODELS.keys()).index(config.CLAUDE_MODEL)
                                   if config.CLAUDE_MODEL in config.CLAUDE_MODELS else 0,
                         )
-                        _default_thinking = _bp.get("use_thinking", False) if isinstance(_bp, dict) else False
-                        iter_think = st.checkbox(
-                            "深度思考",
-                            value=_default_thinking,
-                            key=f"iter_think_{item_id}_{engine}",
-                        )
+                        iter_think = False
                     else:
                         iter_model = st.selectbox(
                             "模型",

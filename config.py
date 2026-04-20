@@ -27,13 +27,25 @@ ANTHROPIC_API_KEY: str = _get_secret("ANTHROPIC_API_KEY")
 ANTHROPIC_BASE_URL: str = _get_secret("ANTHROPIC_BASE_URL")
 
 # Available Claude models: model_id -> display label
+# Thinking mode is selected via model name (-thinking suffix); proxy does not
+# accept the `thinking` API parameter.
 CLAUDE_MODELS: dict[str, str] = {
-    "claude-opus-4-6":   "Opus 4.6（最强，深度思考 effort=high）",
-    "claude-sonnet-4-6": "Sonnet 4.6（均衡，深度思考 budget_tokens）",
+    "claude-3-sonnet-20240229":            "Sonnet 3（默认）",
+    "claude-3-5-sonnet-20240620":          "Sonnet 3.5（首版）",
+    "claude-3-5-sonnet-20241022":          "Sonnet 3.5 v2",
+    "claude-3-7-sonnet-20250219":          "Sonnet 3.7",
+    "claude-3-7-sonnet-20250219-thinking": "Sonnet 3.7（思考）",
+    "claude-sonnet-4-20250514":            "Sonnet 4",
+    "claude-sonnet-4-20250514-thinking":   "Sonnet 4（思考）",
+    "claude-sonnet-4-5-20250929":          "Sonnet 4.5",
+    "claude-sonnet-4-5-20250929-thinking": "Sonnet 4.5（思考）",
+    "claude-sonnet-4-6":                   "Sonnet 4.6",
+    "claude-opus-4-7":                     "Opus 4.7",
+    "claude-opus-4.6-thinking":            "Opus 4.6（思考）",
 }
 
 # Default model (can be overridden via env var)
-CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"
+CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-3-sonnet-20240229"
 
 # ── Google Gemini ──────────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
@@ -49,7 +61,7 @@ GEMINI_MODELS: dict[str, str] = {
 }
 
 # Default model (can be overridden via env var)
-GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-3.1-pro-preview"
+GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-2.5-pro"
 
 # ── Supabase ───────────────────────────────────────────────────────────────
 SUPABASE_URL: str = _get_secret("SUPABASE_URL")
