@@ -520,25 +520,24 @@ class GeminiEngine:
         """
         Build GenerateContentConfig.
 
-        Gemini 3.x series (e.g. gemini-3.1-*): thinking is on by default and
-        cannot be disabled with budget=0 — omit ThinkingConfig to use the
-        model's own default (thinking on).
-        Gemini 2.5 series: thinking opt-in via ThinkingConfig(thinking_budget>0).
+        Thinking-only models (Gemini 3.x, Gemini 2.5 Pro): thinking is always
+        on; they reject ThinkingConfig(thinking_budget=0). We omit
+        ThinkingConfig to let the model run with its built-in default when
+        the caller turns the toggle off.
+        Gemini 2.5 Flash / Flash-Lite: thinking can be disabled with
+        ThinkingConfig(thinking_budget=0).
 
-        When use_thinking=True we explicitly request dynamic budget (-1).
-        When use_thinking=False we only set budget=0 for models that support it
-        (Gemini 2.5). For Gemini 3.x we leave ThinkingConfig out entirely.
+        When use_thinking=True we always request dynamic budget (-1).
         """
         kwargs: dict = {"max_output_tokens": max(8192, count * 2000)}
-        is_gemini3 = "gemini-3" in model
+        thinking_only = ("gemini-3" in model) or ("2.5-pro" in model)
         try:
             if use_thinking:
                 kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=-1)
-            elif not is_gemini3:
-                # Only pass budget=0 for 2.5 series; 3.x rejects this value
+            elif not thinking_only:
+                # Only flash / flash-lite accept budget=0; pro / 3.x reject it
                 kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
-            # For Gemini 3.x with use_thinking=False: omit ThinkingConfig,
-            # let the model run with its built-in default (thinking enabled)
+            # thinking_only + use_thinking=False: omit ThinkingConfig entirely
         except AttributeError:
             pass
         return genai_types.GenerateContentConfig(**kwargs)
