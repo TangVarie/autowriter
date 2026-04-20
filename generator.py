@@ -384,6 +384,15 @@ def _extract_text_from_response(response) -> str:
 
 
 class ClaudeEngine:
+    # Hard caps on max_tokens for older Claude models whose single-response
+    # output limit is much lower than the heuristic count*1500 request.
+    # Missing entries default to the heuristic (modern models all ≥64k).
+    _OUTPUT_CAPS: dict[str, int] = {
+        "claude-3-sonnet-20240229":   4096,
+        "claude-3-5-sonnet-20240620": 8192,
+        "claude-3-5-sonnet-20241022": 8192,
+    }
+
     def __init__(self) -> None:
         if not config.ANTHROPIC_API_KEY:
             raise RuntimeError("ANTHROPIC_API_KEY 未配置")
@@ -413,7 +422,10 @@ class ClaudeEngine:
         # Thinking mode is selected via model name (e.g. *-thinking) through the
         # proxy, not via the `thinking` API parameter. The flag is kept in the
         # signature only for call-site compatibility.
-        return {"model": model, "max_tokens": max(2048, count * 1500)}
+        requested = max(2048, count * 1500)
+        cap = self._OUTPUT_CAPS.get(model) or self._OUTPUT_CAPS.get(model.removesuffix("-thinking"))
+        max_tokens = min(requested, cap) if cap else requested
+        return {"model": model, "max_tokens": max_tokens}
 
     def generate(
         self,
@@ -440,8 +452,19 @@ class ClaudeEngine:
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
             }
+            stop_reason = getattr(response, "stop_reason", None)
+            truncated = stop_reason == "max_tokens"
             results = _parse_copy_json_list(text, count, f"claude/{model}") if count > 1 \
                 else [_parse_copy_json(text, f"claude/{model}")]
+            if truncated:
+                trunc_msg = (
+                    f"输出达到 max_tokens 上限被截断（模型 {model} 本次预算 "
+                    f"{params['max_tokens']} tokens，实际输出 {token_usage['output']}）。"
+                    f"请减小生成数量或换支持更大输出的模型。"
+                )
+                for r in results:
+                    if r.error or not (r.title or r.body):
+                        r.error = trunc_msg
             for r in results:
                 r.token_usage = token_usage
             return results
@@ -482,6 +505,12 @@ class ClaudeEngine:
                 "input": response.usage.input_tokens,
                 "output": response.usage.output_tokens,
             }
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                result.error = (
+                    f"输出达到 max_tokens 上限被截断（模型 {model} 本次预算 "
+                    f"{params['max_tokens']} tokens，实际输出 "
+                    f"{result.token_usage['output']}）。请换支持更大输出的模型。"
+                )
             return result
         except anthropic.APIError as e:
             return GenerationResult(
