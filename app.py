@@ -361,14 +361,22 @@ st.markdown(
 }
 
 /* ── Sidebar nav — hard-edge chapter list (full-width rows) ── */
-[data-testid="stSidebar"] [data-testid="stRadio"] > div {
+/* Force every ancestor container to the full sidebar width */
+[data-testid="stSidebar"] [data-testid="stRadio"],
+[data-testid="stSidebar"] [data-testid="stRadio"] > div,
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"],
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > div {
+  width: 100% !important;
+  max-width: 100% !important;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] {
   display: flex !important;
   flex-direction: column !important;
-  width: 100% !important;
   gap: 0 !important;
-  border-top: var(--line-thin) solid var(--border);
+  border-top: var(--line-thin) solid var(--border) !important;
 }
-[data-testid="stSidebar"] [data-testid="stRadio"] label {
+/* Item label = a full-width row */
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label {
   display: flex !important;
   align-items: center !important;
   width: 100% !important;
@@ -381,29 +389,28 @@ st.markdown(
   border: none !important;
   border-bottom: var(--line-thin) solid var(--border) !important;
   border-left: 3px solid transparent !important;
-  position: relative;
   letter-spacing: 0.01em;
 }
-[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label:hover {
   background: var(--bg-soft) !important;
 }
 /* Hide the default radio dot */
-[data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child {
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label > div:first-child {
   display: none !important;
 }
-/* Make the text element span the whole row */
-[data-testid="stSidebar"] [data-testid="stRadio"] label > div:last-child,
-[data-testid="stSidebar"] [data-testid="stRadio"] label > div:last-child > p {
+/* Text element spans the whole row */
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label > div:last-child,
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label > div:last-child > p {
   width: 100% !important;
   margin: 0 !important;
 }
 /* Selected nav item — lime left rail + bold label */
-[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) {
   background: var(--bg-soft) !important;
   border-left: 3px solid var(--accent) !important;
 }
-[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) p,
-[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) div {
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) p,
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) div {
   color: var(--text-1) !important;
   font-weight: 700 !important;
 }
