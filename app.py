@@ -365,15 +365,21 @@ st.markdown(
 [data-testid="stSidebar"] [data-testid="stRadio"],
 [data-testid="stSidebar"] [data-testid="stRadio"] > div,
 [data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"],
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > div {
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > div,
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > * {
   width: 100% !important;
   max-width: 100% !important;
 }
+/* Switch the radiogroup from its default flex-wrap (which sizes
+   each item to its content) to simple block stacking */
 [data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] {
-  display: flex !important;
-  flex-direction: column !important;
-  gap: 0 !important;
+  display: block !important;
   border-top: var(--line-thin) solid var(--border) !important;
+}
+/* BaseWeb wraps every radio in a div that defaults to inline width.
+   Force it to block so the label inside can span 100% */
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > * {
+  display: block !important;
 }
 /* Item label = a full-width row */
 [data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label {
