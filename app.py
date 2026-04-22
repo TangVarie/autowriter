@@ -361,6 +361,16 @@ st.markdown(
 }
 
 /* ── Sidebar nav — hard-edge chapter list (full-width rows) ── */
+/* Nuclear: BaseWeb renders each radio option inside
+   <div data-baseweb="radio"> which defaults to inline-block
+   (content-width). Target those attribute wrappers directly. */
+[data-testid="stSidebar"] [data-baseweb="radio-group"],
+[data-testid="stSidebar"] [data-baseweb="radio"] {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+}
 /* Force every ancestor container to the full sidebar width */
 [data-testid="stSidebar"] [data-testid="stRadio"],
 [data-testid="stSidebar"] [data-testid="stRadio"] > div,
@@ -853,64 +863,73 @@ hr {
 .stat-badge.accent .sb-num { border-bottom: 2px solid var(--accent-2); padding-bottom: 2px; }
 
 /* ── Stat-filter button row (review page) ─────────────────────
-   Buttons after the .review-stat-filters marker render with a
-   big number on top and a monospace label below. Scoped via
-   :has() + adjacent sibling so it doesn't touch other buttons. */
+   Four clickable KPI cards. Each shows a mono label on top and
+   a big number below. Cards are colour-coded via a 3px top rule
+   (slate / amber / green / accent). Active = solid black with
+   lime rule. Scoped via :has() + adjacent sibling so it doesn't
+   touch other buttons on the page. */
 .element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button {
   height: auto !important;
-  min-height: 84px !important;
-  padding: 16px 18px !important;
+  min-height: 88px !important;
+  padding: 14px 16px 16px !important;
   text-align: left !important;
   border: var(--line) solid var(--border-mid) !important;
   background: var(--card) !important;
   color: var(--text-1) !important;
   border-radius: 0 !important;
-  border-bottom: 2px solid var(--text-1) !important;
-  transition: background 0.12s;
+  border-top: 3px solid var(--text-3) !important;
+  transition: background 0.12s, border-color 0.12s;
   display: flex !important;
   flex-direction: column !important;
   align-items: flex-start !important;
-  justify-content: flex-start !important;
+  justify-content: space-between !important;
   white-space: normal !important;
+  gap: 8px;
 }
 .element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button:hover {
   background: var(--bg-soft) !important;
-  border-color: var(--text-1) !important;
+  border-color: var(--border-mid) !important;
   color: var(--text-1) !important;
 }
-/* Active filter — solid black with lime bottom rule */
+/* Per-column top-rule colour: slate / amber / green / lime */
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] > div:nth-child(1) .stButton > button { border-top-color: var(--text-3) !important; }
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] > div:nth-child(2) .stButton > button { border-top-color: var(--amber)  !important; }
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] > div:nth-child(3) .stButton > button { border-top-color: var(--green)  !important; }
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] > div:nth-child(4) .stButton > button { border-top-color: var(--accent-2) !important; }
+/* Active filter — solid black card with lime top rule */
 .element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button[kind="primary"] {
   background: var(--text-1) !important;
   color: var(--text-on-dark) !important;
   border-color: var(--text-1) !important;
-  border-bottom: 3px solid var(--accent) !important;
+  border-top: 3px solid var(--accent) !important;
 }
 .element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button[kind="primary"]:hover {
   background: var(--text-1) !important;
   color: var(--text-on-dark) !important;
 }
-/* First paragraph = the number */
+/* First paragraph = the label (small, monospace, uppercase) */
 .element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button p:first-child {
-  font-size: 1.85rem !important;
-  font-weight: 700 !important;
-  letter-spacing: -0.03em !important;
-  line-height: 1 !important;
-  margin: 0 0 6px 0 !important;
-  font-variant-numeric: tabular-nums;
-}
-/* Second paragraph = the label */
-.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button p:last-child {
   font-family: var(--font-mono) !important;
   font-size: var(--fs-tag) !important;
   font-weight: 600 !important;
-  letter-spacing: 0.12em !important;
+  letter-spacing: 0.14em !important;
   text-transform: uppercase !important;
   color: var(--text-3) !important;
   margin: 0 !important;
   line-height: 1.2 !important;
 }
-.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button[kind="primary"] p:last-child {
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button[kind="primary"] p:first-child {
   color: var(--accent) !important;
+}
+/* Second paragraph = the number (big) */
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button p:last-child {
+  font-size: 2.15rem !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.03em !important;
+  line-height: 1 !important;
+  margin: 0 !important;
+  font-variant-numeric: tabular-nums;
+  align-self: flex-end;
 }
 
 /* ── Status tag (square, monospace) ── */
@@ -1936,10 +1955,11 @@ def page_review(project: dict) -> None:
         ("needs_revision", "待修改", revision),
     ]
     _cols = st.columns(4, gap="small")
+    # Label on top (small, monospace, uppercase), number below (big)
     for _col, (_key, _label, _num) in zip(_cols, _stat_defs):
         with _col:
             if st.button(
-                f"{_num}\n\n{_label}",
+                f"{_label}\n\n{_num}",
                 key=f"rf_{_key}",
                 use_container_width=True,
                 type="primary" if current_filter == _key else "secondary",
