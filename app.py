@@ -376,10 +376,14 @@ st.markdown(
   display: block !important;
   border-top: var(--line-thin) solid var(--border) !important;
 }
-/* BaseWeb wraps every radio in a div that defaults to inline width.
-   Force it to block so the label inside can span 100% */
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > * {
+/* BaseWeb wraps radio items 2 levels deep; force EVERY div inside
+   the radiogroup to full-width block so the final <label> actually
+   resolves width:100% against the sidebar, not a content-sized
+   wrapper */
+[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] div {
   display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
 }
 /* Item label = a full-width row */
 [data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] label {
@@ -847,6 +851,67 @@ hr {
 .stat-badge.amber  .sb-num { border-bottom: 2px solid var(--amber); padding-bottom: 2px; }
 .stat-badge.slate  .sb-num { border-bottom: 2px solid var(--text-3); padding-bottom: 2px; }
 .stat-badge.accent .sb-num { border-bottom: 2px solid var(--accent-2); padding-bottom: 2px; }
+
+/* ── Stat-filter button row (review page) ─────────────────────
+   Buttons after the .review-stat-filters marker render with a
+   big number on top and a monospace label below. Scoped via
+   :has() + adjacent sibling so it doesn't touch other buttons. */
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button {
+  height: auto !important;
+  min-height: 84px !important;
+  padding: 16px 18px !important;
+  text-align: left !important;
+  border: var(--line) solid var(--border-mid) !important;
+  background: var(--card) !important;
+  color: var(--text-1) !important;
+  border-radius: 0 !important;
+  border-bottom: 2px solid var(--text-1) !important;
+  transition: background 0.12s;
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: flex-start !important;
+  justify-content: flex-start !important;
+  white-space: normal !important;
+}
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button:hover {
+  background: var(--bg-soft) !important;
+  border-color: var(--text-1) !important;
+  color: var(--text-1) !important;
+}
+/* Active filter — solid black with lime bottom rule */
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button[kind="primary"] {
+  background: var(--text-1) !important;
+  color: var(--text-on-dark) !important;
+  border-color: var(--text-1) !important;
+  border-bottom: 3px solid var(--accent) !important;
+}
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button[kind="primary"]:hover {
+  background: var(--text-1) !important;
+  color: var(--text-on-dark) !important;
+}
+/* First paragraph = the number */
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button p:first-child {
+  font-size: 1.85rem !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.03em !important;
+  line-height: 1 !important;
+  margin: 0 0 6px 0 !important;
+  font-variant-numeric: tabular-nums;
+}
+/* Second paragraph = the label */
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button p:last-child {
+  font-family: var(--font-mono) !important;
+  font-size: var(--fs-tag) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.12em !important;
+  text-transform: uppercase !important;
+  color: var(--text-3) !important;
+  margin: 0 !important;
+  line-height: 1.2 !important;
+}
+.element-container:has(.review-stat-filters) + [data-testid="stHorizontalBlock"] .stButton > button[kind="primary"] p:last-child {
+  color: var(--accent) !important;
+}
 
 /* ── Status tag (square, monospace) ── */
 .status-pill {
@@ -1854,35 +1919,38 @@ def page_review(project: dict) -> None:
     approved = sum(1 for it in items if it["status"] == "approved")
     revision = sum(1 for it in items if it["status"] == "needs_revision")
 
-    # Stats row
+    # Stat-filter row — 4 clickable cards, the active one acts as
+    # the current filter. Replaces the old stat-row + radio pair.
+    current_filter = st.session_state.setdefault("review_filter", "all")
+
+    # Marker used by CSS (:has() adjacent selector) to scope the
+    # big-number button treatment to this one block only.
     st.markdown(
-        f"<div class='stat-row'>"
-        f"<div class='stat-badge slate'>"
-        f"  <div><div class='sb-num'>{len(items)}</div><div class='sb-lbl'>总计</div></div>"
-        f"</div>"
-        f"<div class='stat-badge amber'>"
-        f"  <div><div class='sb-num'>{pending}</div><div class='sb-lbl'>待审核</div></div>"
-        f"</div>"
-        f"<div class='stat-badge green'>"
-        f"  <div><div class='sb-num'>{approved}</div><div class='sb-lbl'>已通过</div></div>"
-        f"</div>"
-        f"<div class='stat-badge accent'>"
-        f"  <div><div class='sb-num'>{revision}</div><div class='sb-lbl'>待修改</div></div>"
-        f"</div>"
-        f"</div>",
+        "<div class='review-stat-filters' style='display:none'></div>",
         unsafe_allow_html=True,
     )
+    _stat_defs = [
+        ("all",            "总计",   len(items)),
+        ("pending",        "待审核", pending),
+        ("approved",       "已通过", approved),
+        ("needs_revision", "待修改", revision),
+    ]
+    _cols = st.columns(4, gap="small")
+    for _col, (_key, _label, _num) in zip(_cols, _stat_defs):
+        with _col:
+            if st.button(
+                f"{_num}\n\n{_label}",
+                key=f"rf_{_key}",
+                use_container_width=True,
+                type="primary" if current_filter == _key else "secondary",
+            ):
+                st.session_state["review_filter"] = _key
+                st.rerun()
 
-    filter_options = ["全部", "⏳ 待审核", "✅ 已通过", "✏️ 待修改"]
-    selected_filter = st.radio(
-        "筛选状态", filter_options, horizontal=True, label_visibility="collapsed",
-    )
-
-    _fmap = {"⏳ 待审核": "pending", "✅ 已通过": "approved", "✏️ 待修改": "needs_revision"}
-    if selected_filter in _fmap:
-        filtered_items = [it for it in items if it["status"] == _fmap[selected_filter]]
-    else:
+    if current_filter == "all":
         filtered_items = items
+    else:
+        filtered_items = [it for it in items if it["status"] == current_filter]
 
     st.divider()
 
