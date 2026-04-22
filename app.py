@@ -270,12 +270,16 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 /* ═══════════════════════════════════════════
-   Design tokens — modern agency (lime + mono)
+   Design tokens — Studio-grade (hard-edge + lime)
+   No rounded corners. Lines are the primary
+   structural element. Lime accent only for
+   focus / active / chapter numbering.
    ═══════════════════════════════════════════ */
 :root {
+  /* Palette */
   --accent:        #C6F75C;
   --accent-2:      #A8E028;
   --accent-soft:   #E9FBB8;
@@ -287,37 +291,62 @@ st.markdown(
   --text-2:        #5A5A5A;
   --text-3:        #9A9A9A;
   --text-on-dark:  #FFFFFF;
-  --border:        #EDEDE9;
-  --border-mid:    #D6D6D0;
-  --border-dark:   #1A1A1A;
+  --border:        #E5E5E2;
+  --border-mid:    #C9C9C3;
+  --border-strong: #0A0A0A;
   --green:         #16A34A;
   --green-soft:    #F0FDF4;
   --amber:         #D97706;
   --amber-soft:    #FFFBEB;
   --slate:         #64748B;
   --slate-soft:    #F8FAFC;
-  --shadow-xs:     0 1px 2px rgba(10,10,10,.04);
-  --shadow-sm:     0 2px 10px rgba(10,10,10,.05), 0 1px 2px rgba(10,10,10,.04);
-  --shadow-md:     0 8px 24px rgba(10,10,10,.08), 0 2px 6px rgba(10,10,10,.04);
-  --r-sm:   10px;
-  --r-md:   16px;
-  --r-lg:   22px;
-  --r-xl:   28px;
-  --r-pill: 999px;
+
+  /* Shadows — kept extremely subtle; studio style relies on lines not depth */
+  --shadow-sm:     0 1px 0 rgba(10,10,10,.04);
+  --shadow-md:     0 2px 0 rgba(10,10,10,.06);
+
+  /* Radii — hard edges */
+  --r-sm:   0px;
+  --r-md:   2px;
+  --r-lg:   0px;
+  --r-pill: 0px;
+
+  /* Line weights */
+  --line-thin:   1px;
+  --line:        1.5px;
+  --line-heavy:  2px;
+
+  /* Font sizes (type scale) */
+  --fs-hero:    3.25rem;
+  --fs-title:   1.75rem;
+  --fs-card:    1.125rem;
+  --fs-body:    0.9375rem;
+  --fs-meta:    0.75rem;
+  --fs-tag:     0.72rem;
+
+  /* Spacing rhythm */
+  --sp-section: 3.5rem;
+  --sp-block:   1.75rem;
+  --sp-card:    1rem;
+  --sp-line:    0.5rem;
+
+  /* Fonts */
+  --font-sans: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Inter",
+               "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 /* ── App background & typography ── */
 .stApp, .stApp > .main {
   background: var(--bg) !important;
-  font-family: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Inter",
-               "Segoe UI", Helvetica, Arial, sans-serif;
+  font-family: var(--font-sans);
   color: var(--text-1);
 }
 
-/* ── Sidebar ── */
+/* ── Sidebar — left rail with chapter nav ── */
 [data-testid="stSidebar"] {
   background: var(--bg) !important;
-  border-right: 1px solid var(--border) !important;
+  border-right: var(--line) solid var(--border-strong) !important;
 }
 [data-testid="stSidebar"] .stMarkdown p,
 [data-testid="stSidebar"] .stMarkdown small,
@@ -331,17 +360,20 @@ st.markdown(
   color: var(--text-1) !important;
 }
 
-/* ── Sidebar nav (radio group) pills ── */
+/* ── Sidebar nav — hard-edge chapter list ── */
 [data-testid="stSidebar"] [data-testid="stRadio"] > div {
-  gap: 4px;
+  gap: 0;
+  border-top: var(--line-thin) solid var(--border);
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label {
-  border-radius: var(--r-pill) !important;
-  padding: 10px 16px !important;
-  transition: all 0.15s;
+  border-radius: 0 !important;
+  padding: 12px 14px 12px 18px !important;
+  transition: background 0.12s;
   cursor: pointer;
-  border: 1px solid transparent !important;
+  border: none !important;
+  border-bottom: var(--line-thin) solid var(--border) !important;
   position: relative;
+  letter-spacing: 0.01em;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
   background: var(--bg-soft) !important;
@@ -350,140 +382,143 @@ st.markdown(
 [data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child {
   display: none !important;
 }
-/* Selected nav item — black pill */
-[data-testid="stSidebar"] [data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked),
+/* Selected nav item — lime left rail + bold label */
 [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
-  background: var(--text-1) !important;
-  color: var(--text-on-dark) !important;
+  background: var(--bg-soft) !important;
+  border-left: 3px solid var(--accent) !important;
+  padding-left: 15px !important;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) p,
 [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) div {
-  color: var(--text-on-dark) !important;
+  color: var(--text-1) !important;
+  font-weight: 700 !important;
 }
 
 /* ── Main content area ── */
 .main .block-container {
   padding-top: 2.5rem !important;
-  padding-bottom: 4rem !important;
-  max-width: 1120px !important;
+  padding-bottom: 5rem !important;
+  max-width: 1180px !important;
 }
 
 /* ── Headings ── */
-h1 { font-size: 2rem !important; font-weight: 700 !important;
+h1 { font-size: var(--fs-title) !important; font-weight: 700 !important;
      color: var(--text-1) !important; letter-spacing: -0.03em;
      line-height: 1.1 !important; }
-h2 { font-size: 1.5rem !important; font-weight: 700 !important;
+h2 { font-size: 1.375rem !important; font-weight: 700 !important;
      color: var(--text-1) !important; letter-spacing: -0.02em; }
-h3 { font-size: 1.15rem !important; font-weight: 600 !important;
+h3 { font-size: 1.05rem !important; font-weight: 600 !important;
      color: var(--text-1) !important; letter-spacing: -0.01em; }
 
-/* ── Buttons ── */
+/* ── Buttons — hard-edge square ── */
 .stButton > button {
-  border-radius: var(--r-pill) !important;
+  border-radius: 0 !important;
   font-size: 0.875rem !important;
   font-weight: 500 !important;
-  padding: 0.55rem 1.2rem !important;
-  border: 1.5px solid var(--text-1) !important;
+  padding: 0.6rem 1.1rem !important;
+  border: var(--line) solid var(--text-1) !important;
   background: var(--card) !important;
   color: var(--text-1) !important;
   box-shadow: none !important;
-  transition: all 0.18s ease !important;
+  transition: background 0.12s, color 0.12s !important;
+  letter-spacing: 0.005em;
 }
 .stButton > button:hover {
   background: var(--text-1) !important;
   color: var(--text-on-dark) !important;
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-sm) !important;
+  transform: none;
+  box-shadow: none !important;
 }
-/* Primary / type=primary button — black pill (like "Book a consultation") */
+/* Primary / type=primary button — solid black square */
 .stButton > button[kind="primary"] {
   background: var(--text-1) !important;
   border-color: var(--text-1) !important;
   color: var(--text-on-dark) !important;
-  box-shadow: var(--shadow-sm) !important;
-  padding: 0.6rem 1.4rem !important;
+  box-shadow: none !important;
+  padding: 0.65rem 1.3rem !important;
 }
 .stButton > button[kind="primary"]:hover {
   background: var(--accent) !important;
-  border-color: var(--accent) !important;
+  border-color: var(--text-1) !important;
   color: var(--text-1) !important;
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-md) !important;
 }
 /* Form submit buttons inherit primary treatment */
 [data-testid="stFormSubmitButton"] > button {
   background: var(--text-1) !important;
-  border: 1.5px solid var(--text-1) !important;
+  border: var(--line) solid var(--text-1) !important;
   color: var(--text-on-dark) !important;
-  border-radius: var(--r-pill) !important;
-  padding: 0.6rem 1.4rem !important;
+  border-radius: 0 !important;
+  padding: 0.65rem 1.3rem !important;
   font-weight: 500 !important;
 }
 [data-testid="stFormSubmitButton"] > button:hover {
   background: var(--accent) !important;
-  border-color: var(--accent) !important;
+  border-color: var(--text-1) !important;
   color: var(--text-1) !important;
 }
 
-/* ── Inputs, textareas, selects ── */
+/* ── Inputs, textareas, selects — hard-edge ── */
 .stTextInput > div > div > input,
 .stTextArea > div > div > textarea,
 .stSelectbox > div > div > div,
 .stNumberInput > div > div > input,
 .stDateInput > div > div > input {
-  border-radius: var(--r-sm) !important;
-  border: 1.5px solid var(--border) !important;
+  border-radius: 0 !important;
+  border: var(--line) solid var(--border-mid) !important;
   background: var(--card) !important;
   font-size: 0.9rem !important;
   color: var(--text-1) !important;
   box-shadow: none !important;
-  transition: all 0.15s !important;
+  transition: border-color 0.15s !important;
 }
 .stTextInput > div > div > input:focus,
 .stTextArea > div > div > textarea:focus,
 .stNumberInput > div > div > input:focus {
   border-color: var(--text-1) !important;
-  box-shadow: 0 0 0 3px rgba(198,247,92,.40) !important;
+  box-shadow: 0 0 0 3px rgba(198,247,92,.50) !important;
   outline: none !important;
 }
 
 /* ── Sliders ── */
 [data-testid="stSlider"] .stSlider div[role="slider"] {
   background: var(--text-1) !important;
+  border-radius: 0 !important;
 }
 [data-testid="stSlider"] [data-baseweb="slider"] > div > div > div {
   background: var(--accent) !important;
 }
 
-/* ── Expanders (copy cards, info blocks) ── */
+/* ── Expanders — hard-edge card ── */
 .stExpander {
-  border: 1.5px solid var(--border) !important;
-  border-radius: var(--r-lg) !important;
+  border: var(--line) solid var(--border-strong) !important;
+  border-radius: 0 !important;
   background: var(--card) !important;
   box-shadow: none !important;
-  margin-bottom: 12px !important;
+  margin-bottom: 0 !important;
+  margin-top: -1.5px !important;  /* collapse shared borders */
   overflow: hidden;
-  transition: all 0.2s;
+  transition: none;
 }
 .stExpander:hover {
-  box-shadow: var(--shadow-sm) !important;
-  border-color: var(--border-mid) !important;
+  box-shadow: none !important;
+  border-color: var(--border-strong) !important;
 }
 [data-testid="stExpander"] > details > summary {
-  padding: 16px 20px !important;
+  padding: 18px 22px !important;
   background: var(--card) !important;
   font-size: 0.95rem !important;
   font-weight: 500 !important;
   color: var(--text-1) !important;
-  border-radius: var(--r-lg) !important;
+  border-radius: 0 !important;
+  letter-spacing: -0.005em;
 }
 [data-testid="stExpander"] > details[open] > summary {
-  border-bottom: 1px solid var(--border) !important;
-  border-radius: var(--r-lg) var(--r-lg) 0 0 !important;
+  border-bottom: var(--line-thin) solid var(--border-strong) !important;
+  border-radius: 0 !important;
   background: var(--card) !important;
 }
 [data-testid="stExpander"] > details > div {
-  padding: 18px 20px !important;
+  padding: 22px !important;
   background: var(--card) !important;
 }
 
@@ -530,64 +565,69 @@ h3 { font-size: 1.15rem !important; font-weight: 600 !important;
   border-color: var(--accent) !important;
 }
 
-/* ── Tabs ── */
+/* ── Tabs — hard-edge ── */
 .stTabs [data-baseweb="tab-list"] {
-  gap: 4px !important;
-  border-bottom: 1.5px solid var(--border) !important;
+  gap: 0 !important;
+  border-bottom: var(--line) solid var(--border-strong) !important;
 }
 .stTabs [data-testid="stTab"] {
-  border-radius: var(--r-pill) var(--r-pill) 0 0 !important;
-  font-size: 0.9rem !important;
-  font-weight: 500 !important;
-  color: var(--text-2) !important;
-  padding: 10px 18px !important;
+  border-radius: 0 !important;
+  font-size: 0.82rem !important;
+  font-weight: 600 !important;
+  color: var(--text-3) !important;
+  padding: 12px 18px !important;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-right: var(--line-thin) solid var(--border) !important;
 }
 .stTabs [aria-selected="true"] {
   color: var(--text-1) !important;
-  font-weight: 600 !important;
+  font-weight: 700 !important;
   border-bottom: 3px solid var(--accent) !important;
+  background: var(--bg-soft) !important;
 }
 
 /* ── Info / warning / error / success boxes ── */
 [data-testid="stAlert"] {
-  border-radius: var(--r-md) !important;
-  border: 1.5px solid transparent !important;
+  border-radius: 0 !important;
+  border: var(--line) solid var(--border-strong) !important;
   font-size: 0.875rem !important;
 }
 
-/* ── Dividers ── */
+/* ── Dividers — use thin lines, large rhythm ── */
 hr {
   border: none !important;
-  border-top: 1px solid var(--border) !important;
-  margin: 1.25rem 0 !important;
+  border-top: var(--line-thin) solid var(--border) !important;
+  margin: 1.5rem 0 !important;
 }
 
-/* ── Metrics ── */
+/* ── Metrics — numbers over a black underline ── */
 [data-testid="stMetric"] {
-  background: var(--card) !important;
-  border: 1.5px solid var(--border) !important;
-  border-radius: var(--r-lg) !important;
-  padding: 18px 22px !important;
+  background: transparent !important;
+  border: none !important;
+  border-bottom: var(--line-heavy) solid var(--text-1) !important;
+  border-radius: 0 !important;
+  padding: 14px 0 10px !important;
   box-shadow: none !important;
-  transition: all 0.2s;
+  transition: none;
 }
 [data-testid="stMetric"]:hover {
-  border-color: var(--text-1) !important;
-  box-shadow: var(--shadow-sm) !important;
+  box-shadow: none !important;
 }
 [data-testid="stMetricLabel"] {
-  font-size: 0.7rem !important;
+  font-size: var(--fs-tag) !important;
   font-weight: 600 !important;
   text-transform: uppercase !important;
-  letter-spacing: 0.08em !important;
+  letter-spacing: 0.12em !important;
   color: var(--text-3) !important;
 }
 [data-testid="stMetricValue"] {
-  font-size: 2rem !important;
+  font-size: 2.25rem !important;
   font-weight: 700 !important;
   color: var(--text-1) !important;
-  line-height: 1.1 !important;
-  letter-spacing: -0.02em;
+  line-height: 1 !important;
+  letter-spacing: -0.03em;
+  margin-top: 4px;
 }
 
 /* ── Checkboxes & radios ── */
@@ -595,281 +635,445 @@ hr {
   font-size: 0.875rem !important;
 }
 
-/* ── Progress bar (lime fill) ── */
+/* ── Progress bar — lime fill, hard edges ── */
 .stProgress > div > div > div {
   background: var(--accent) !important;
-  border-radius: var(--r-pill) !important;
+  border-radius: 0 !important;
 }
 .stProgress > div > div {
-  border-radius: var(--r-pill) !important;
+  border-radius: 0 !important;
   background: var(--border) !important;
+  height: 4px !important;
 }
 
-/* ── Multiselect ── */
+/* ── Multiselect — hard-edge lime tag ── */
 .stMultiSelect > div > div {
-  border-radius: var(--r-sm) !important;
-  border: 1.5px solid var(--border) !important;
+  border-radius: 0 !important;
+  border: var(--line) solid var(--border-mid) !important;
   background: var(--card) !important;
   font-size: 0.875rem !important;
 }
 .stMultiSelect span[data-baseweb="tag"] {
-  background: var(--accent-soft) !important;
-  border: 1px solid var(--accent-2) !important;
-  border-radius: var(--r-pill) !important;
-  font-size: 0.78rem !important;
-  font-weight: 500 !important;
+  background: var(--accent) !important;
+  border: var(--line-thin) solid var(--text-1) !important;
+  border-radius: 0 !important;
+  font-size: 0.75rem !important;
+  font-weight: 600 !important;
   color: var(--text-1) !important;
+  letter-spacing: 0.01em;
 }
 
 /* ── Spinner ── */
 .stSpinner > div {
-  border-top-color: var(--accent-2) !important;
+  border-top-color: var(--text-1) !important;
 }
 
-/* ── Download button ── */
+/* ── Download button — hard-edge ── */
 .stDownloadButton > button {
-  border-radius: var(--r-pill) !important;
-  border: 1.5px solid var(--text-1) !important;
+  border-radius: 0 !important;
+  border: var(--line) solid var(--text-1) !important;
   background: var(--card) !important;
   font-size: 0.875rem !important;
   font-weight: 500 !important;
   color: var(--text-1) !important;
-  padding: 0.55rem 1.2rem !important;
+  padding: 0.6rem 1.1rem !important;
 }
 .stDownloadButton > button:hover {
-  background: var(--accent) !important;
-  border-color: var(--accent) !important;
+  background: var(--text-1) !important;
+  color: var(--text-on-dark) !important;
 }
 
 /* ════════════════════════════════════════════
-   App-specific custom components
+   Studio-grade custom components
    ════════════════════════════════════════════ */
 
-/* ── Page header band (hero-style) ── */
-.page-header {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  margin-bottom: 2rem;
-  padding-bottom: 1.25rem;
-  border-bottom: 1px solid var(--border);
+/* ── Hero page header (chapter + title + deco) ── */
+.hero {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: start;
+  gap: 2rem;
+  margin-bottom: 2.5rem;
+  padding-bottom: 2rem;
+  border-bottom: var(--line-heavy) solid var(--text-1);
 }
-.page-header-icon {
-  font-size: 1.5rem;
-  width: 52px; height: 52px;
-  display: flex; align-items: center; justify-content: center;
+.hero-inner { min-width: 0; }
+.hero-tag {
+  font-family: var(--font-mono);
+  font-size: var(--fs-tag);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-1);
+  margin-bottom: 1.25rem;
+  display: inline-flex; align-items: baseline; gap: 0.4em;
+}
+.hero-tag .hero-tag-num {
+  color: var(--text-1);
   background: var(--accent);
-  border: 1.5px solid var(--text-1);
-  border-radius: var(--r-md);
+  border: var(--line-thin) solid var(--text-1);
+  padding: 3px 8px;
+  line-height: 1;
+}
+.hero-tag .hero-tag-name {
   color: var(--text-1);
 }
-.page-header-text h1 {
-  margin: 0 !important;
-  font-size: 2rem !important;
+.hero-title {
+  font-size: var(--fs-hero) !important;
   font-weight: 700 !important;
-  letter-spacing: -0.03em !important;
+  letter-spacing: -0.04em !important;
+  line-height: 0.98 !important;
+  margin: 0 !important;
+  color: var(--text-1);
 }
-.page-header-text p  {
-  margin: 6px 0 0 0 !important;
-  font-size: 0.9rem !important;
-  color: var(--text-2) !important;
+.hero-sub {
+  margin-top: 1rem;
+  font-size: 0.95rem;
+  color: var(--text-2);
+  max-width: 48ch;
+  line-height: 1.5;
+}
+.hero-deco {
+  font-size: 4.5rem;
+  line-height: 1;
+  color: var(--text-1);
+  font-weight: 700;
+  align-self: start;
+  padding-top: 0.5rem;
+  user-select: none;
 }
 
-/* ── Stat badge row ── */
+/* ── Section tag (▸ NUM / NAME) ── */
+.section-tag {
+  font-family: var(--font-mono);
+  font-size: var(--fs-tag);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-1);
+  margin: 0 0 0.75rem 0;
+  display: inline-flex; align-items: center; gap: 0.5em;
+}
+.section-tag::before {
+  content: "▸";
+  color: var(--accent-2);
+  font-size: 1em;
+}
+.section-divider {
+  border: none !important;
+  border-top: var(--line-thin) solid var(--text-1) !important;
+  margin: var(--sp-section) 0 2rem !important;
+  opacity: 1 !important;
+}
+
+/* ── Stat row (row of underlined numbers) ── */
 .stat-row {
-  display: flex; gap: 10px; flex-wrap: wrap;
-  margin-bottom: 1.5rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0;
+  margin: 0 0 2rem 0;
+  border-top: var(--line-thin) solid var(--text-1);
+  border-bottom: var(--line-heavy) solid var(--text-1);
 }
 .stat-badge {
-  display: flex; align-items: center; gap: 10px;
-  background: var(--card);
-  border: 1.5px solid var(--border);
-  border-radius: var(--r-lg);
-  padding: 12px 18px;
-  min-width: 110px;
-  transition: all 0.18s;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+  background: transparent;
+  border: none;
+  border-right: var(--line-thin) solid var(--border);
+  border-radius: 0;
+  padding: 14px 18px;
+  min-width: 0;
+  transition: background 0.12s;
 }
+.stat-badge:last-child { border-right: none; }
 .stat-badge:hover {
-  border-color: var(--text-1);
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-sm);
+  background: var(--bg-soft);
+  border-color: var(--border);
+  transform: none;
+  box-shadow: none;
 }
 .stat-badge .sb-num {
-  font-size: 1.5rem; font-weight: 700; color: var(--text-1); line-height: 1;
-  letter-spacing: -0.02em;
+  font-size: 2rem; font-weight: 700; color: var(--text-1); line-height: 1;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
 }
 .stat-badge .sb-lbl {
-  font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
-  letter-spacing: 0.06em; color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-tag); font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.12em;
+  color: var(--text-3);
 }
-.stat-badge.green  { border-color: #BBF7D0; }
-.stat-badge.amber  { border-color: #FDE68A; }
-.stat-badge.slate  { border-color: var(--border); }
-.stat-badge.accent { background: var(--accent); border-color: var(--text-1); }
-.stat-badge.accent .sb-lbl { color: var(--text-1); }
+.stat-badge.green  .sb-num { border-bottom: 2px solid var(--green); padding-bottom: 2px; }
+.stat-badge.amber  .sb-num { border-bottom: 2px solid var(--amber); padding-bottom: 2px; }
+.stat-badge.slate  .sb-num { border-bottom: 2px solid var(--text-3); padding-bottom: 2px; }
+.stat-badge.accent .sb-num { border-bottom: 2px solid var(--accent-2); padding-bottom: 2px; }
 
-/* ── Status pill ── */
+/* ── Status tag (square, monospace) ── */
 .status-pill {
   display: inline-flex; align-items: center; gap: 5px;
-  border-radius: var(--r-pill); font-size: 0.72rem; font-weight: 600;
-  padding: 4px 12px; line-height: 1.4;
-  letter-spacing: 0.02em;
+  font-family: var(--font-mono);
+  border-radius: 0;
+  font-size: var(--fs-tag); font-weight: 600;
+  padding: 3px 10px; line-height: 1.5;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 .status-pill.approved {
   background: var(--accent); color: var(--text-1);
-  border: 1px solid var(--text-1);
+  border: var(--line-thin) solid var(--text-1);
 }
 .status-pill.revision {
   background: var(--amber-soft); color: var(--amber);
-  border: 1px solid #FDE68A;
+  border: var(--line-thin) solid var(--amber);
 }
 .status-pill.pending {
-  background: var(--slate-soft); color: var(--slate);
-  border: 1px solid #CBD5E1;
+  background: var(--bg-soft); color: var(--text-2);
+  border: var(--line-thin) solid var(--border-mid);
 }
 
 /* ── Copy content ── */
 .copy-title {
-  font-size: 1.125rem; font-weight: 700;
-  color: var(--text-1); line-height: 1.35;
+  font-size: var(--fs-card); font-weight: 700;
+  color: var(--text-1); line-height: 1.3;
   margin-bottom: 6px;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.02em;
 }
 .copy-meta {
-  font-size: 0.75rem; color: var(--text-3);
-  margin-bottom: 12px;
-  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta); color: var(--text-3);
+  margin-bottom: 14px;
+  display: flex; align-items: center; gap: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 .copy-meta .len-ok  { color: var(--green); font-weight: 600; }
 .copy-meta .len-bad { color: var(--amber); font-weight: 600; }
 .copy-body {
-  font-size: 0.925rem; line-height: 1.75;
+  font-size: 0.94rem; line-height: 1.75;
   color: var(--text-1); white-space: pre-wrap;
-  border-left: 3px solid var(--accent);
-  padding-left: 16px; margin: 12px 0;
+  border-left: 2px solid var(--text-1);
+  padding-left: 18px; margin: 14px 0;
 }
 
-/* ── Keyword tags (lime pill) ── */
+/* ── Keyword tags — square lime chips ── */
 .tag {
   display: inline-flex; align-items: center;
   background: var(--accent-soft);
-  border: 1px solid var(--accent-2);
-  border-radius: var(--r-pill);
-  padding: 4px 12px;
-  font-size: 0.75rem; font-weight: 500;
+  border: var(--line-thin) solid var(--text-1);
+  border-radius: 0;
+  padding: 3px 10px;
+  font-size: 0.72rem; font-weight: 600;
   color: var(--text-1);
-  margin-right: 5px; margin-bottom: 4px;
-  transition: all 0.15s;
+  margin-right: 6px; margin-bottom: 5px;
+  letter-spacing: 0.01em;
+  transition: background 0.12s;
 }
-.tag:hover { background: var(--accent); border-color: var(--text-1); }
+.tag:hover { background: var(--accent); }
 
-/* ── Engine badge (black pill, white text) ── */
+/* ── Engine badge — monospace, black/accent ── */
 .engine-badge {
   display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--font-mono);
   background: var(--text-1); color: var(--text-on-dark);
-  border-radius: var(--r-pill); padding: 3px 10px;
-  font-size: 0.68rem; font-weight: 700;
-  letter-spacing: 0.05em; text-transform: uppercase;
+  border-radius: 0; padding: 3px 8px;
+  font-size: var(--fs-tag); font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase;
 }
 .engine-badge.gemini,
-.engine-badge.claude {
-  background: var(--text-1);
-}
+.engine-badge.claude { background: var(--text-1); }
 
-/* ── Section label (lime pill — like "Services" / "Case study") ── */
+/* ── Section label (▸ TEXT — hard-edge studio tag) ── */
 .section-label {
   display: inline-flex; align-items: center;
-  background: var(--accent);
+  font-family: var(--font-mono);
+  background: transparent;
   color: var(--text-1);
-  border: 1px solid var(--text-1);
-  border-radius: var(--r-pill);
-  padding: 4px 12px;
-  font-size: 0.75rem; font-weight: 600;
-  letter-spacing: 0.01em;
-  margin-bottom: 10px;
-  text-transform: none;
+  border: none;
+  border-left: 3px solid var(--accent);
+  border-radius: 0;
+  padding: 2px 0 2px 10px;
+  font-size: var(--fs-tag); font-weight: 700;
+  letter-spacing: 0.14em;
+  margin: 1rem 0 0.75rem;
+  text-transform: uppercase;
 }
 
-/* ── Memory row ── */
+/* ── Memory row — hard-edge list item ── */
 .mem-card {
-  background: var(--card); border: 1.5px solid var(--border);
-  border-radius: var(--r-lg); padding: 14px 18px;
-  margin-bottom: 10px;
-  font-size: 0.9rem; color: var(--text-1);
-  transition: all 0.18s;
+  background: var(--card);
+  border: none;
+  border-bottom: var(--line-thin) solid var(--border);
+  border-radius: 0;
+  padding: 14px 4px;
+  margin-bottom: 0;
+  font-size: 0.9rem;
+  color: var(--text-1);
+  transition: background 0.12s;
 }
 .mem-card:hover {
-  border-color: var(--text-1);
-  box-shadow: var(--shadow-sm);
+  background: var(--bg-soft);
+  border-color: var(--border);
+  box-shadow: none;
 }
 
 /* ── Sidebar user block ── */
 .user-block {
   display: flex; align-items: center; gap: 10px;
-  padding: 12px 14px;
-  background: var(--bg-soft); border-radius: var(--r-lg);
-  border: 1px solid var(--border);
+  padding: 10px 12px;
+  background: var(--bg-soft);
+  border-radius: 0;
+  border: var(--line-thin) solid var(--border);
   margin-bottom: 10px;
 }
 .user-avatar {
-  width: 34px; height: 34px;
+  width: 32px; height: 32px;
   background: var(--text-1); color: var(--accent);
-  border-radius: 50%;
+  border-radius: 0;
   display: flex; align-items: center; justify-content: center;
-  font-size: 0.9rem; font-weight: 700;
+  font-family: var(--font-mono);
+  font-size: 0.85rem; font-weight: 700;
   flex-shrink: 0;
 }
-.user-email { font-size: 0.8rem; font-weight: 500; color: var(--text-1); }
-.user-ver   { font-size: 0.7rem; color: var(--text-3); }
+.user-email { font-size: 0.78rem; font-weight: 500; color: var(--text-1); word-break: break-all; }
+.user-ver   { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-3); letter-spacing: 0.06em; }
 
-/* ── Brand header in sidebar ── */
+/* ── Brand header in sidebar — studio wordmark ── */
 .brand-header {
-  display: flex; align-items: center; gap: 10px;
-  padding: 8px 0 16px;
-  border-bottom: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0 16px;
+  border-bottom: var(--line) solid var(--text-1);
   margin-bottom: 14px;
 }
 .brand-logo {
-  font-size: 1.75rem; line-height: 1;
+  font-size: 1.6rem; line-height: 1;
   color: var(--text-1);
   font-weight: 700;
+  width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--text-1); color: var(--accent);
 }
 .brand-name {
-  font-size: 1rem; font-weight: 700;
+  font-size: 0.95rem; font-weight: 700;
   color: var(--text-1); line-height: 1.2;
   letter-spacing: -0.02em;
+  text-transform: uppercase;
 }
 .brand-sub {
-  font-size: 0.7rem; color: var(--text-3);
-  letter-spacing: 0.04em;
+  font-family: var(--font-mono);
+  font-size: 0.65rem; color: var(--text-3);
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 
-/* ── Login hero (auth page) ── */
+/* ── Chapter list in sidebar (nav header) ── */
+.nav-heading {
+  font-family: var(--font-mono);
+  font-size: var(--fs-tag);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-3);
+  margin: 1.5rem 0 0.5rem;
+  padding-left: 4px;
+}
+
+/* ── CTA square (36px arrow button) ── */
+.cta-square {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 36px; height: 36px;
+  background: var(--text-1); color: var(--text-on-dark);
+  border: var(--line) solid var(--text-1);
+  border-radius: 0;
+  font-size: 1.05rem;
+  line-height: 1;
+  transition: background 0.12s, color 0.12s;
+  user-select: none;
+}
+.cta-square:hover {
+  background: var(--accent);
+  color: var(--text-1);
+}
+
+/* ── Login — studio two-column landing ── */
+.login-wrap {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 4rem;
+  align-items: center;
+  min-height: 70vh;
+  padding: 2rem 0;
+}
+@media (max-width: 860px) {
+  .login-wrap { grid-template-columns: 1fr; gap: 2rem; }
+}
 .login-hero {
-  text-align: center;
-  padding: 2.5rem 0 1.5rem;
+  text-align: left;
+  padding: 0;
 }
 .login-hero .lh-mark {
-  font-size: 2.25rem; font-weight: 700; color: var(--text-1);
-  margin-bottom: 0.75rem;
+  display: inline-flex;
+  align-items: center; justify-content: center;
+  width: 44px; height: 44px;
+  background: var(--text-1); color: var(--accent);
+  font-size: 1.6rem; font-weight: 700;
+  margin-bottom: 1.75rem;
 }
 .login-hero .lh-badge {
   display: inline-block;
-  background: var(--accent); color: var(--text-1);
-  border: 1px solid var(--text-1);
-  border-radius: var(--r-pill);
-  padding: 4px 14px;
-  font-size: 0.75rem; font-weight: 600;
-  margin-bottom: 14px;
+  font-family: var(--font-mono);
+  background: var(--accent);
+  color: var(--text-1);
+  border: var(--line-thin) solid var(--text-1);
+  border-radius: 0;
+  padding: 3px 10px;
+  font-size: var(--fs-tag); font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 1.25rem;
 }
 .login-hero .lh-title {
-  font-size: 2.25rem; font-weight: 700;
-  color: var(--text-1); letter-spacing: -0.03em;
-  line-height: 1.1; margin-bottom: 0.5rem;
+  font-size: 3rem; font-weight: 700;
+  color: var(--text-1); letter-spacing: -0.04em;
+  line-height: 0.98; margin: 0 0 0.75rem 0;
 }
 .login-hero .lh-sub {
   color: var(--text-2); font-size: 0.95rem;
+  line-height: 1.5;
+  max-width: 40ch;
+}
+.login-hero .lh-meta {
+  margin-top: 2rem;
+  display: flex; flex-wrap: wrap; gap: 1.5rem;
+  padding-top: 1rem;
+  border-top: var(--line-thin) solid var(--text-1);
+  font-family: var(--font-mono);
+  font-size: 0.68rem; color: var(--text-3);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.login-hero .lh-meta b {
+  color: var(--text-1);
+  font-weight: 700;
+  margin-right: 4px;
+}
+.login-frame {
+  padding: 2rem;
+  border: var(--line) solid var(--text-1);
+  background: var(--card);
+}
+.login-frame-head {
+  font-family: var(--font-mono);
+  font-size: var(--fs-tag);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-1);
+  margin-bottom: 1.25rem;
+  padding-bottom: 0.75rem;
+  border-bottom: var(--line-thin) solid var(--text-1);
 }
 </style>
 """,
@@ -884,7 +1088,7 @@ user_id: str = current_user["id"]
 
 # ── Sidebar ────────────────────────────────────────────────────────────────
 with st.sidebar:
-    # Brand header
+    # Brand header — studio wordmark
     st.markdown(
         "<div class='brand-header'>"
         "<div class='brand-logo'>✦</div>"
@@ -900,29 +1104,28 @@ with st.sidebar:
     st.markdown(
         f"<div class='user-block'>"
         f"<div class='user-avatar'>{avatar_char}</div>"
-        f"<div><div class='user-email'>{safe_email}</div></div>"
+        f"<div><div class='user-email'>{safe_email}</div><div class='user-ver'>SIGNED IN</div></div>"
         f"</div>",
         unsafe_allow_html=True,
     )
     if st.button("退出登录", use_container_width=True):
         auth.sign_out()
         st.rerun()
-    st.divider()
 
 # Project switcher (also rendered in sidebar via projects module)
 selected_project = proj_module.render_project_switcher(db_client, user_id)
 
 _NAV_ITEMS = {
-    "✍️  生成": "生成工作台",
-    "🔍  审核": "审核与迭代",
-    "📤  导出": "导出中心",
-    "🧠  记忆": "记忆管理",
-    "⚙️  项目": "项目设置",
-    "📋  历史": "批次历史",
+    "01 · 生成":  "生成工作台",
+    "02 · 审核":  "审核与迭代",
+    "03 · 导出":  "导出中心",
+    "04 · 记忆":  "记忆管理",
+    "05 · 设置":  "项目设置",
+    "06 · 历史":  "批次历史",
 }
 
 with st.sidebar:
-    st.divider()
+    st.markdown("<div class='nav-heading'>▸ CHAPTERS</div>", unsafe_allow_html=True)
     _nav_choice = st.radio(
         "导航",
         list(_NAV_ITEMS.keys()),
@@ -945,15 +1148,38 @@ if selected_project is None and page not in ("项目设置",):
 # PAGE: 生成工作台
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _page_header(icon: str, title: str, subtitle: str = "") -> None:
-    sub_html = f"<p>{_html.escape(subtitle)}</p>" if subtitle else ""
+def _hero_header(chapter: str, title: str, subtitle: str = "") -> None:
+    """Render a studio-grade page hero.
+
+    chapter  — "01 / GENERATE" (number is split on first '/' to style it)
+    title    — big hero sentence
+    subtitle — small gray description (optional)
+    """
+    if " / " in chapter:
+        num, name = chapter.split(" / ", 1)
+    else:
+        num, name = chapter, ""
+    tag_html = (
+        f"<span class='hero-tag-num'>{_html.escape(num)}</span>"
+        + (f"<span class='hero-tag-name'>/ {_html.escape(name)}</span>" if name else "")
+    )
+    sub_html = f"<div class='hero-sub'>{_html.escape(subtitle)}</div>" if subtitle else ""
     st.markdown(
-        f"<div class='page-header'>"
-        f"<div class='page-header-icon'>{icon}</div>"
-        f"<div class='page-header-text'><h1>{_html.escape(title)}</h1>{sub_html}</div>"
-        f"</div>",
+        f"<section class='hero'>"
+        f"<div class='hero-inner'>"
+        f"<div class='hero-tag'>{tag_html}</div>"
+        f"<h1 class='hero-title'>{_html.escape(title)}</h1>"
+        f"{sub_html}"
+        f"</div>"
+        f"<div class='hero-deco'>✦</div>"
+        f"</section>",
         unsafe_allow_html=True,
     )
+
+
+def _section_divider() -> None:
+    """Hard-edge section divider (heavy black horizontal line)."""
+    st.markdown("<hr class='section-divider' />", unsafe_allow_html=True)
 
 
 def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None:
@@ -1310,7 +1536,7 @@ def _render_queue_tab() -> None:
 
 def page_generate(project: dict) -> None:
     pname = _html.escape(project.get("name", ""))
-    _page_header("✍️", "生成工作台", f"项目：{pname}")
+    _hero_header("01 / GENERATE", "构思你的下一个爆款。", f"项目 · {pname}")
 
     project_name = project.get("name", "")
     base_prompt  = project.get("system_prompt", "")
@@ -1546,7 +1772,7 @@ QUICK_FEEDBACK_TAGS = [
 
 def page_review(project: dict) -> None:
     pname = _html.escape(project.get("name", ""))
-    _page_header("🔍", "审核与迭代", f"项目：{pname}")
+    _hero_header("02 / REVIEW", "打磨每一篇成稿。", f"项目 · {pname}")
 
     # Batch selector
     batches = db.list_batches(db_client, project["id"])
@@ -2222,7 +2448,7 @@ def _generate_calibration_notes_ui(project: dict, batch_id: str, items: list[dic
 
 def page_export(project: dict) -> None:
     pname = _html.escape(project.get("name", ""))
-    _page_header("📤", "导出中心", f"项目：{pname}")
+    _hero_header("03 / EXPORT", "装箱发货。", f"项目 · {pname}")
 
     batches = db.list_batches(db_client, project["id"], limit=50)
     if not batches:
@@ -2369,7 +2595,7 @@ def page_project_settings(project: Optional[dict]) -> None:
     if project is None:
         st.info("请先在左侧创建或选择一个项目。")
         return
-    _page_header("⚙️", "项目设置", project.get("name", ""))
+    _hero_header("05 / SETTINGS", "配置你的工作流。", project.get("name", ""))
     proj_module.render_project_settings(db_client, project, user_id)
 
 
@@ -2380,7 +2606,7 @@ def page_project_settings(project: Optional[dict]) -> None:
 def page_memory(project: Optional[dict]) -> None:
     pid   = project["id"] if project else None
     pname = project.get("name", "") if project else ""
-    _page_header("🧠", "记忆管理", pname)
+    _hero_header("04 / MEMORY", "训练你的风格。", pname)
     mem_module.render_memory_manager(db_client, user_id, project_id=pid, project_name=pname)
 
 
@@ -2389,7 +2615,7 @@ def page_memory(project: Optional[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def page_history(project: dict) -> None:
-    _page_header("📋", "批次历史", f"项目：{project.get('name', '')}")
+    _hero_header("06 / HISTORY", "回顾每一次生成。", f"项目 · {project.get('name', '')}")
 
     batches = db.list_batches(db_client, project["id"], limit=50)
     if not batches:

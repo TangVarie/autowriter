@@ -130,75 +130,99 @@ def _friendly_auth_error(exc: Exception) -> str:
 
 
 def _render_login_page() -> None:
-    """Render the login / registration form."""
-    st.markdown(
-        f"""
-        <div class='login-hero'>
-          <div class='lh-mark'>✦</div>
-          <div class='lh-badge'>Welcome</div>
-          <div class='lh-title'>{config.APP_TITLE}</div>
-          <div class='lh-sub'>AutoWriter · v{config.APP_VERSION}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    """Render the login / registration form — studio two-column landing."""
+    st.markdown("<div class='login-wrap'>", unsafe_allow_html=True)
+    col_hero, col_frame = st.columns([1.1, 1], gap="large")
 
-    missing = config.validate_config()
-    if missing:
-        st.error(
-            f"⚠️ Missing environment variables: {', '.join(missing)}\n\n"
-            "Please configure them before using the app."
+    with col_hero:
+        st.markdown(
+            f"""
+            <div class='login-hero'>
+              <div class='lh-mark'>✦</div>
+              <div class='lh-badge'>▸ Workstation</div>
+              <div class='lh-title'>{config.APP_TITLE}</div>
+              <div class='lh-sub'>
+                一个为小红书内容创作者打造的自动化工作台。
+                生成、审核、导出、沉淀风格记忆,一气呵成。
+              </div>
+              <div class='lh-meta'>
+                <span><b>VERSION</b> {config.APP_VERSION}</span>
+                <span><b>ENGINES</b> Claude · Gemini</span>
+                <span><b>STATUS</b> ● READY</span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        return
 
-    tab_login, tab_signup = st.tabs(["登录", "注册"])
+    with col_frame:
+        st.markdown("<div class='login-frame'>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='login-frame-head'>▸ ACCESS</div>",
+            unsafe_allow_html=True,
+        )
 
-    with tab_login:
-        with st.form("login_form"):
-            email = st.text_input("邮箱")
-            password = st.text_input("密码", type="password")
-            submitted = st.form_submit_button("登录", use_container_width=True)
-        if submitted:
-            if not email or not password:
-                st.error("请填写邮箱和密码。")
-                return
-            try:
-                result = sign_in(email, password)
-                _store_session(result)
-                st.rerun()
-            except Exception as exc:
-                st.error(_friendly_auth_error(exc))
+        missing = config.validate_config()
+        if missing:
+            st.error(
+                f"⚠️ Missing environment variables: {', '.join(missing)}\n\n"
+                "Please configure them before using the app."
+            )
+            st.markdown("</div></div>", unsafe_allow_html=True)
+            return
 
-    with tab_signup:
-        with st.form("signup_form"):
-            new_email    = st.text_input("邮箱", key="signup_email")
-            new_password = st.text_input("密码（至少 6 位）", type="password", key="signup_pw")
-            new_password2 = st.text_input("确认密码", type="password", key="signup_pw2")
-            submitted2 = st.form_submit_button("注册", use_container_width=True)
+        tab_login, tab_signup = st.tabs(["登录", "注册"])
 
-        if submitted2:
-            if not new_email or not new_password:
-                st.error("请填写邮箱和密码。")
-                return
-            if new_password != new_password2:
-                st.error("两次密码不一致。")
-                return
-            try:
-                result = sign_up(new_email, new_password)
-                if result.get("email_confirmation_required"):
-                    # Supabase email confirmation is enabled — do NOT start a session yet.
-                    st.success(
-                        "注册申请已提交！\n\n"
-                        "请检查您的收件箱（**含垃圾邮件夹**），点击确认链接完成验证后即可登录。\n\n"
-                        "如果长时间未收到邮件，请联系管理员手动激活账号。"
-                    )
-                else:
-                    # Email confirmation is disabled — session is immediately available.
+        with tab_login:
+            with st.form("login_form"):
+                email = st.text_input("邮箱")
+                password = st.text_input("密码", type="password")
+                submitted = st.form_submit_button("登录", use_container_width=True)
+            if submitted:
+                if not email or not password:
+                    st.error("请填写邮箱和密码。")
+                    return
+                try:
+                    result = sign_in(email, password)
                     _store_session(result)
-                    st.success("注册成功！")
                     st.rerun()
-            except Exception as exc:
-                st.error(f"注册失败：{_friendly_auth_error(exc)}")
+                except Exception as exc:
+                    st.error(_friendly_auth_error(exc))
+
+        with tab_signup:
+            with st.form("signup_form"):
+                new_email    = st.text_input("邮箱", key="signup_email")
+                new_password = st.text_input("密码（至少 6 位）", type="password", key="signup_pw")
+                new_password2 = st.text_input("确认密码", type="password", key="signup_pw2")
+                submitted2 = st.form_submit_button("注册", use_container_width=True)
+
+            if submitted2:
+                if not new_email or not new_password:
+                    st.error("请填写邮箱和密码。")
+                    return
+                if new_password != new_password2:
+                    st.error("两次密码不一致。")
+                    return
+                try:
+                    result = sign_up(new_email, new_password)
+                    if result.get("email_confirmation_required"):
+                        # Supabase email confirmation is enabled — do NOT start a session yet.
+                        st.success(
+                            "注册申请已提交！\n\n"
+                            "请检查您的收件箱（**含垃圾邮件夹**），点击确认链接完成验证后即可登录。\n\n"
+                            "如果长时间未收到邮件，请联系管理员手动激活账号。"
+                        )
+                    else:
+                        # Email confirmation is disabled — session is immediately available.
+                        _store_session(result)
+                        st.success("注册成功！")
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"注册失败：{_friendly_auth_error(exc)}")
+
+        st.markdown("</div>", unsafe_allow_html=True)  # close .login-frame
+
+    st.markdown("</div>", unsafe_allow_html=True)  # close .login-wrap
 
 
 def _store_session(result: dict) -> None:
