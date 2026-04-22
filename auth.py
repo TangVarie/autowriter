@@ -131,7 +131,12 @@ def _friendly_auth_error(exc: Exception) -> str:
 
 def _render_login_page() -> None:
     """Render the login / registration form — studio two-column landing."""
-    st.markdown("<div class='login-wrap'>", unsafe_allow_html=True)
+    # Trim page top padding for the login screen only
+    st.markdown(
+        "<style>.main .block-container{padding-top:1.25rem !important}</style>",
+        unsafe_allow_html=True,
+    )
+
     col_hero, col_frame = st.columns([1.1, 1], gap="large")
 
     with col_hero:
@@ -156,9 +161,8 @@ def _render_login_page() -> None:
         )
 
     with col_frame:
-        st.markdown("<div class='login-frame'>", unsafe_allow_html=True)
         st.markdown(
-            "<div class='login-frame-head'>▸ ACCESS</div>",
+            "<div class='section-label' style='margin-top:0'>Access</div>",
             unsafe_allow_html=True,
         )
 
@@ -168,7 +172,6 @@ def _render_login_page() -> None:
                 f"⚠️ Missing environment variables: {', '.join(missing)}\n\n"
                 "Please configure them before using the app."
             )
-            st.markdown("</div></div>", unsafe_allow_html=True)
             return
 
         tab_login, tab_signup = st.tabs(["登录", "注册"])
@@ -219,10 +222,6 @@ def _render_login_page() -> None:
                         st.rerun()
                 except Exception as exc:
                     st.error(f"注册失败：{_friendly_auth_error(exc)}")
-
-        st.markdown("</div>", unsafe_allow_html=True)  # close .login-frame
-
-    st.markdown("</div>", unsafe_allow_html=True)  # close .login-wrap
 
 
 def _store_session(result: dict) -> None:

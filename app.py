@@ -360,18 +360,27 @@ st.markdown(
   color: var(--text-1) !important;
 }
 
-/* ── Sidebar nav — hard-edge chapter list ── */
+/* ── Sidebar nav — hard-edge chapter list (full-width rows) ── */
 [data-testid="stSidebar"] [data-testid="stRadio"] > div {
-  gap: 0;
+  display: flex !important;
+  flex-direction: column !important;
+  width: 100% !important;
+  gap: 0 !important;
   border-top: var(--line-thin) solid var(--border);
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label {
+  display: flex !important;
+  align-items: center !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
   border-radius: 0 !important;
   padding: 12px 14px 12px 18px !important;
+  margin: 0 !important;
   transition: background 0.12s;
   cursor: pointer;
   border: none !important;
   border-bottom: var(--line-thin) solid var(--border) !important;
+  border-left: 3px solid transparent !important;
   position: relative;
   letter-spacing: 0.01em;
 }
@@ -382,16 +391,34 @@ st.markdown(
 [data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child {
   display: none !important;
 }
+/* Make the text element span the whole row */
+[data-testid="stSidebar"] [data-testid="stRadio"] label > div:last-child,
+[data-testid="stSidebar"] [data-testid="stRadio"] label > div:last-child > p {
+  width: 100% !important;
+  margin: 0 !important;
+}
 /* Selected nav item — lime left rail + bold label */
 [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
   background: var(--bg-soft) !important;
   border-left: 3px solid var(--accent) !important;
-  padding-left: 15px !important;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) p,
 [data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) div {
   color: var(--text-1) !important;
   font-weight: 700 !important;
+}
+
+/* ── Forms — hard-edge bordered frame ── */
+[data-testid="stForm"] {
+  border: var(--line) solid var(--text-1) !important;
+  border-radius: 0 !important;
+  padding: 1.5rem !important;
+  background: var(--card) !important;
+}
+/* Forms inside the sidebar stay borderless to save width */
+[data-testid="stSidebar"] [data-testid="stForm"] {
+  border: none !important;
+  padding: 0 !important;
 }
 
 /* ── Main content area ── */
@@ -1544,7 +1571,10 @@ def page_generate(project: dict) -> None:
 
     # ── Sidebar: quick-generate controls ──────────────────────────────
     with st.sidebar:
-        st.markdown("### 生成参数")
+        st.markdown(
+            "<div class='nav-heading'>▸ QUICK GEN</div>",
+            unsafe_allow_html=True,
+        )
 
         if tactic_names:
             tactic = st.selectbox("战术方向", ["（不使用战术方向）"] + tactic_names)

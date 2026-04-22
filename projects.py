@@ -48,7 +48,10 @@ def render_project_switcher(client: Client, user_id: str) -> Optional[dict]:
     projects = db.list_projects(client, user_id)
 
     with st.sidebar:
-        st.markdown("### 📂 项目")
+        st.markdown(
+            "<div class='nav-heading'>▸ PROJECT</div>",
+            unsafe_allow_html=True,
+        )
 
         if not projects:
             st.info("暂无项目，请创建第一个项目。")
@@ -84,7 +87,10 @@ def render_project_switcher(client: Client, user_id: str) -> Optional[dict]:
 
 def _render_new_project_form(client: Client, user_id: str) -> None:
     with st.form("new_project_form", clear_on_submit=True):
-        st.markdown("#### 新建项目")
+        st.markdown(
+            "<div class='nav-heading' style='margin:0 0 0.5rem'>▸ NEW PROJECT</div>",
+            unsafe_allow_html=True,
+        )
         name = st.text_input("项目名称 *", placeholder="例：RIO轻享 Q2")
         brand = st.text_input("品牌名称", placeholder="例：RIO")
         submitted = st.form_submit_button("创建", use_container_width=True)
