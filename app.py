@@ -261,7 +261,7 @@ def _format_batch_label(batch: dict, project_name: str = "") -> str:
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=config.APP_TITLE,
-    page_icon="🍵",
+    page_icon="✦",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -270,46 +270,54 @@ st.set_page_config(
 st.markdown(
     """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
 /* ═══════════════════════════════════════════
-   Design tokens
+   Design tokens — modern agency (lime + mono)
    ═══════════════════════════════════════════ */
 :root {
-  --accent:        #D4412A;
-  --accent-soft:   #FDF1EF;
-  --accent-border: #F2C4BB;
-  --bg:            #F7F6F3;
+  --accent:        #C6F75C;
+  --accent-2:      #A8E028;
+  --accent-soft:   #E9FBB8;
+  --bg:            #FFFFFF;
+  --bg-soft:       #F5F5F3;
   --card:          #FFFFFF;
-  --border:        #E8E4DF;
-  --border-mid:    #D5D0C9;
-  --text-1:        #1A1714;
-  --text-2:        #5C5752;
-  --text-3:        #9E9992;
+  --card-inverse:  #0A0A0A;
+  --text-1:        #0A0A0A;
+  --text-2:        #5A5A5A;
+  --text-3:        #9A9A9A;
+  --text-on-dark:  #FFFFFF;
+  --border:        #EDEDE9;
+  --border-mid:    #D6D6D0;
+  --border-dark:   #1A1A1A;
   --green:         #16A34A;
   --green-soft:    #F0FDF4;
   --amber:         #D97706;
   --amber-soft:    #FFFBEB;
   --slate:         #64748B;
   --slate-soft:    #F8FAFC;
-  --shadow-xs:     0 1px 3px rgba(0,0,0,.06);
-  --shadow-sm:     0 2px 8px rgba(0,0,0,.07), 0 1px 3px rgba(0,0,0,.05);
-  --shadow-md:     0 4px 16px rgba(0,0,0,.08), 0 2px 6px rgba(0,0,0,.05);
-  --r-sm:  8px;
-  --r-md:  12px;
-  --r-lg:  16px;
-  --r-xl:  20px;
+  --shadow-xs:     0 1px 2px rgba(10,10,10,.04);
+  --shadow-sm:     0 2px 10px rgba(10,10,10,.05), 0 1px 2px rgba(10,10,10,.04);
+  --shadow-md:     0 8px 24px rgba(10,10,10,.08), 0 2px 6px rgba(10,10,10,.04);
+  --r-sm:   10px;
+  --r-md:   16px;
+  --r-lg:   22px;
+  --r-xl:   28px;
+  --r-pill: 999px;
 }
 
-/* ── App background ── */
+/* ── App background & typography ── */
 .stApp, .stApp > .main {
   background: var(--bg) !important;
-  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI",
-               Helvetica, Arial, sans-serif;
+  font-family: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Inter",
+               "Segoe UI", Helvetica, Arial, sans-serif;
+  color: var(--text-1);
 }
 
 /* ── Sidebar ── */
 [data-testid="stSidebar"] {
-  background: #FFFFFF !important;
-  border-right: 1.5px solid var(--border) !important;
+  background: var(--bg) !important;
+  border-right: 1px solid var(--border) !important;
 }
 [data-testid="stSidebar"] .stMarkdown p,
 [data-testid="stSidebar"] .stMarkdown small,
@@ -318,86 +326,124 @@ st.markdown(
   font-size: 0.8125rem !important;
 }
 [data-testid="stSidebar"] .stRadio label {
-  font-size: 0.875rem !important;
+  font-size: 0.9rem !important;
   font-weight: 500;
   color: var(--text-1) !important;
 }
 
-/* ── Sidebar nav pills ── */
+/* ── Sidebar nav (radio group) pills ── */
 [data-testid="stSidebar"] [data-testid="stRadio"] > div {
-  gap: 2px;
+  gap: 4px;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label {
-  border-radius: var(--r-sm) !important;
-  padding: 8px 12px !important;
-  transition: background 0.15s;
+  border-radius: var(--r-pill) !important;
+  padding: 10px 16px !important;
+  transition: all 0.15s;
   cursor: pointer;
+  border: 1px solid transparent !important;
+  position: relative;
 }
 [data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
-  background: var(--bg) !important;
+  background: var(--bg-soft) !important;
+}
+/* Hide the default radio dot */
+[data-testid="stSidebar"] [data-testid="stRadio"] label > div:first-child {
+  display: none !important;
+}
+/* Selected nav item — black pill */
+[data-testid="stSidebar"] [data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked),
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) {
+  background: var(--text-1) !important;
+  color: var(--text-on-dark) !important;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) p,
+[data-testid="stSidebar"] [data-testid="stRadio"] label:has(input:checked) div {
+  color: var(--text-on-dark) !important;
 }
 
 /* ── Main content area ── */
 .main .block-container {
-  padding-top: 2rem !important;
+  padding-top: 2.5rem !important;
   padding-bottom: 4rem !important;
-  max-width: 1100px !important;
+  max-width: 1120px !important;
 }
 
 /* ── Headings ── */
-h1 { font-size: 1.75rem !important; font-weight: 700 !important;
+h1 { font-size: 2rem !important; font-weight: 700 !important;
+     color: var(--text-1) !important; letter-spacing: -0.03em;
+     line-height: 1.1 !important; }
+h2 { font-size: 1.5rem !important; font-weight: 700 !important;
      color: var(--text-1) !important; letter-spacing: -0.02em; }
-h2 { font-size: 1.375rem !important; font-weight: 600 !important;
+h3 { font-size: 1.15rem !important; font-weight: 600 !important;
      color: var(--text-1) !important; letter-spacing: -0.01em; }
-h3 { font-size: 1.125rem !important; font-weight: 600 !important;
-     color: var(--text-1) !important; }
 
 /* ── Buttons ── */
 .stButton > button {
-  border-radius: var(--r-sm) !important;
+  border-radius: var(--r-pill) !important;
   font-size: 0.875rem !important;
   font-weight: 500 !important;
-  padding: 0.5rem 1rem !important;
-  border: 1.5px solid var(--border) !important;
+  padding: 0.55rem 1.2rem !important;
+  border: 1.5px solid var(--text-1) !important;
   background: var(--card) !important;
   color: var(--text-1) !important;
-  box-shadow: var(--shadow-xs) !important;
-  transition: all 0.15s ease !important;
+  box-shadow: none !important;
+  transition: all 0.18s ease !important;
 }
 .stButton > button:hover {
-  border-color: var(--border-mid) !important;
+  background: var(--text-1) !important;
+  color: var(--text-on-dark) !important;
+  transform: translateY(-1px);
   box-shadow: var(--shadow-sm) !important;
-  background: #FAFAF8 !important;
 }
-/* Primary / type=primary button */
+/* Primary / type=primary button — black pill (like "Book a consultation") */
 .stButton > button[kind="primary"] {
   background: var(--text-1) !important;
   border-color: var(--text-1) !important;
-  color: #FFFFFF !important;
+  color: var(--text-on-dark) !important;
   box-shadow: var(--shadow-sm) !important;
+  padding: 0.6rem 1.4rem !important;
 }
 .stButton > button[kind="primary"]:hover {
-  background: #2D2926 !important;
-  border-color: #2D2926 !important;
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
+  color: var(--text-1) !important;
+  transform: translateY(-1px);
   box-shadow: var(--shadow-md) !important;
+}
+/* Form submit buttons inherit primary treatment */
+[data-testid="stFormSubmitButton"] > button {
+  background: var(--text-1) !important;
+  border: 1.5px solid var(--text-1) !important;
+  color: var(--text-on-dark) !important;
+  border-radius: var(--r-pill) !important;
+  padding: 0.6rem 1.4rem !important;
+  font-weight: 500 !important;
+}
+[data-testid="stFormSubmitButton"] > button:hover {
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
+  color: var(--text-1) !important;
 }
 
 /* ── Inputs, textareas, selects ── */
 .stTextInput > div > div > input,
 .stTextArea > div > div > textarea,
-.stSelectbox > div > div > div {
+.stSelectbox > div > div > div,
+.stNumberInput > div > div > input,
+.stDateInput > div > div > input {
   border-radius: var(--r-sm) !important;
   border: 1.5px solid var(--border) !important;
   background: var(--card) !important;
-  font-size: 0.875rem !important;
+  font-size: 0.9rem !important;
   color: var(--text-1) !important;
-  box-shadow: var(--shadow-xs) !important;
-  transition: border-color 0.15s !important;
+  box-shadow: none !important;
+  transition: all 0.15s !important;
 }
 .stTextInput > div > div > input:focus,
-.stTextArea > div > div > textarea:focus {
-  border-color: var(--border-mid) !important;
-  box-shadow: 0 0 0 3px rgba(212,65,42,.08) !important;
+.stTextArea > div > div > textarea:focus,
+.stNumberInput > div > div > input:focus {
+  border-color: var(--text-1) !important;
+  box-shadow: 0 0 0 3px rgba(198,247,92,.40) !important;
   outline: none !important;
 }
 
@@ -405,49 +451,101 @@ h3 { font-size: 1.125rem !important; font-weight: 600 !important;
 [data-testid="stSlider"] .stSlider div[role="slider"] {
   background: var(--text-1) !important;
 }
+[data-testid="stSlider"] [data-baseweb="slider"] > div > div > div {
+  background: var(--accent) !important;
+}
 
-/* ── Expanders (copy cards) ── */
+/* ── Expanders (copy cards, info blocks) ── */
 .stExpander {
   border: 1.5px solid var(--border) !important;
-  border-radius: var(--r-md) !important;
+  border-radius: var(--r-lg) !important;
   background: var(--card) !important;
-  box-shadow: var(--shadow-xs) !important;
-  margin-bottom: 10px !important;
+  box-shadow: none !important;
+  margin-bottom: 12px !important;
   overflow: hidden;
-  transition: box-shadow 0.2s, border-color 0.2s;
+  transition: all 0.2s;
 }
 .stExpander:hover {
   box-shadow: var(--shadow-sm) !important;
   border-color: var(--border-mid) !important;
 }
 [data-testid="stExpander"] > details > summary {
-  padding: 14px 16px !important;
+  padding: 16px 20px !important;
   background: var(--card) !important;
-  font-size: 0.9rem !important;
+  font-size: 0.95rem !important;
   font-weight: 500 !important;
   color: var(--text-1) !important;
-  border-radius: var(--r-md) !important;
+  border-radius: var(--r-lg) !important;
 }
 [data-testid="stExpander"] > details[open] > summary {
-  border-bottom: 1.5px solid var(--border) !important;
-  border-radius: var(--r-md) var(--r-md) 0 0 !important;
-  background: #FBFAF8 !important;
+  border-bottom: 1px solid var(--border) !important;
+  border-radius: var(--r-lg) var(--r-lg) 0 0 !important;
+  background: var(--card) !important;
 }
 [data-testid="stExpander"] > details > div {
-  padding: 16px !important;
+  padding: 18px 20px !important;
   background: var(--card) !important;
 }
 
+/* ── Dark copy card (approved status) ── */
+.card-status-marker { display: none; }
+.element-container:has(.card-status-marker) { height: 0; margin: 0 !important; padding: 0 !important; }
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] {
+  background: var(--card-inverse) !important;
+  border-color: var(--card-inverse) !important;
+}
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] summary,
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] summary * {
+  background: var(--card-inverse) !important;
+  color: var(--text-on-dark) !important;
+}
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] > details[open] > summary {
+  border-bottom-color: #2A2A2A !important;
+}
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] > details > div {
+  background: var(--card-inverse) !important;
+  color: var(--text-on-dark) !important;
+}
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] .copy-title,
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] .copy-body,
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] p,
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] h1,
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] h2,
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] h3,
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] label,
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] span {
+  color: var(--text-on-dark) !important;
+}
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] .copy-body {
+  border-left-color: var(--accent) !important;
+}
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] .stButton > button {
+  border-color: #FFFFFF !important;
+  color: var(--text-on-dark) !important;
+  background: transparent !important;
+}
+.element-container:has(.card-approved) + .element-container [data-testid="stExpander"] .stButton > button:hover {
+  background: var(--accent) !important;
+  color: var(--text-1) !important;
+  border-color: var(--accent) !important;
+}
+
 /* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] {
+  gap: 4px !important;
+  border-bottom: 1.5px solid var(--border) !important;
+}
 .stTabs [data-testid="stTab"] {
-  border-radius: var(--r-sm) var(--r-sm) 0 0 !important;
-  font-size: 0.875rem !important;
+  border-radius: var(--r-pill) var(--r-pill) 0 0 !important;
+  font-size: 0.9rem !important;
   font-weight: 500 !important;
   color: var(--text-2) !important;
+  padding: 10px 18px !important;
 }
 .stTabs [aria-selected="true"] {
   color: var(--text-1) !important;
-  border-bottom: 2.5px solid var(--text-1) !important;
+  font-weight: 600 !important;
+  border-bottom: 3px solid var(--accent) !important;
 }
 
 /* ── Info / warning / error / success boxes ── */
@@ -460,7 +558,7 @@ h3 { font-size: 1.125rem !important; font-weight: 600 !important;
 /* ── Dividers ── */
 hr {
   border: none !important;
-  border-top: 1.5px solid var(--border) !important;
+  border-top: 1px solid var(--border) !important;
   margin: 1.25rem 0 !important;
 }
 
@@ -468,22 +566,28 @@ hr {
 [data-testid="stMetric"] {
   background: var(--card) !important;
   border: 1.5px solid var(--border) !important;
-  border-radius: var(--r-md) !important;
-  padding: 16px 20px !important;
-  box-shadow: var(--shadow-xs) !important;
+  border-radius: var(--r-lg) !important;
+  padding: 18px 22px !important;
+  box-shadow: none !important;
+  transition: all 0.2s;
+}
+[data-testid="stMetric"]:hover {
+  border-color: var(--text-1) !important;
+  box-shadow: var(--shadow-sm) !important;
 }
 [data-testid="stMetricLabel"] {
-  font-size: 0.75rem !important;
+  font-size: 0.7rem !important;
   font-weight: 600 !important;
   text-transform: uppercase !important;
-  letter-spacing: 0.06em !important;
+  letter-spacing: 0.08em !important;
   color: var(--text-3) !important;
 }
 [data-testid="stMetricValue"] {
-  font-size: 1.75rem !important;
+  font-size: 2rem !important;
   font-weight: 700 !important;
   color: var(--text-1) !important;
-  line-height: 1.2 !important;
+  line-height: 1.1 !important;
+  letter-spacing: -0.02em;
 }
 
 /* ── Checkboxes & radios ── */
@@ -491,13 +595,13 @@ hr {
   font-size: 0.875rem !important;
 }
 
-/* ── Progress bar ── */
+/* ── Progress bar (lime fill) ── */
 .stProgress > div > div > div {
-  background: var(--text-1) !important;
-  border-radius: 99px !important;
+  background: var(--accent) !important;
+  border-radius: var(--r-pill) !important;
 }
 .stProgress > div > div {
-  border-radius: 99px !important;
+  border-radius: var(--r-pill) !important;
   background: var(--border) !important;
 }
 
@@ -509,89 +613,111 @@ hr {
   font-size: 0.875rem !important;
 }
 .stMultiSelect span[data-baseweb="tag"] {
-  background: var(--bg) !important;
-  border: 1px solid var(--border-mid) !important;
-  border-radius: 6px !important;
+  background: var(--accent-soft) !important;
+  border: 1px solid var(--accent-2) !important;
+  border-radius: var(--r-pill) !important;
   font-size: 0.78rem !important;
+  font-weight: 500 !important;
   color: var(--text-1) !important;
 }
 
 /* ── Spinner ── */
 .stSpinner > div {
-  border-top-color: var(--text-1) !important;
+  border-top-color: var(--accent-2) !important;
 }
 
 /* ── Download button ── */
 .stDownloadButton > button {
-  border-radius: var(--r-sm) !important;
-  border: 1.5px solid var(--border) !important;
+  border-radius: var(--r-pill) !important;
+  border: 1.5px solid var(--text-1) !important;
   background: var(--card) !important;
   font-size: 0.875rem !important;
   font-weight: 500 !important;
-  box-shadow: var(--shadow-xs) !important;
+  color: var(--text-1) !important;
+  padding: 0.55rem 1.2rem !important;
+}
+.stDownloadButton > button:hover {
+  background: var(--accent) !important;
+  border-color: var(--accent) !important;
 }
 
 /* ════════════════════════════════════════════
    App-specific custom components
    ════════════════════════════════════════════ */
 
-/* ── Page header band ── */
+/* ── Page header band (hero-style) ── */
 .page-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 1.5rem;
-  padding-bottom: 1rem;
-  border-bottom: 1.5px solid var(--border);
+  gap: 16px;
+  margin-bottom: 2rem;
+  padding-bottom: 1.25rem;
+  border-bottom: 1px solid var(--border);
 }
 .page-header-icon {
   font-size: 1.5rem;
-  width: 44px; height: 44px;
+  width: 52px; height: 52px;
   display: flex; align-items: center; justify-content: center;
-  background: var(--bg);
-  border: 1.5px solid var(--border);
+  background: var(--accent);
+  border: 1.5px solid var(--text-1);
   border-radius: var(--r-md);
+  color: var(--text-1);
 }
-.page-header-text h1 { margin: 0 !important; font-size: 1.5rem !important; }
-.page-header-text p  { margin: 0 !important; font-size: 0.8125rem !important;
-                       color: var(--text-2) !important; margin-top: 2px !important; }
+.page-header-text h1 {
+  margin: 0 !important;
+  font-size: 2rem !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.03em !important;
+}
+.page-header-text p  {
+  margin: 6px 0 0 0 !important;
+  font-size: 0.9rem !important;
+  color: var(--text-2) !important;
+}
 
 /* ── Stat badge row ── */
 .stat-row {
   display: flex; gap: 10px; flex-wrap: wrap;
-  margin-bottom: 1.25rem;
+  margin-bottom: 1.5rem;
 }
 .stat-badge {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: 10px;
   background: var(--card);
   border: 1.5px solid var(--border);
-  border-radius: var(--r-md);
-  padding: 10px 16px;
-  min-width: 100px;
-  box-shadow: var(--shadow-xs);
+  border-radius: var(--r-lg);
+  padding: 12px 18px;
+  min-width: 110px;
+  transition: all 0.18s;
+}
+.stat-badge:hover {
+  border-color: var(--text-1);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
 }
 .stat-badge .sb-num {
-  font-size: 1.375rem; font-weight: 700; color: var(--text-1); line-height: 1;
+  font-size: 1.5rem; font-weight: 700; color: var(--text-1); line-height: 1;
+  letter-spacing: -0.02em;
 }
 .stat-badge .sb-lbl {
-  font-size: 0.71rem; font-weight: 600; text-transform: uppercase;
-  letter-spacing: 0.05em; color: var(--text-3);
+  font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--text-3);
 }
 .stat-badge.green  { border-color: #BBF7D0; }
 .stat-badge.amber  { border-color: #FDE68A; }
 .stat-badge.slate  { border-color: var(--border); }
-.stat-badge.accent { border-color: var(--accent-border); }
+.stat-badge.accent { background: var(--accent); border-color: var(--text-1); }
+.stat-badge.accent .sb-lbl { color: var(--text-1); }
 
 /* ── Status pill ── */
 .status-pill {
   display: inline-flex; align-items: center; gap: 5px;
-  border-radius: 99px; font-size: 0.72rem; font-weight: 600;
-  padding: 3px 10px; line-height: 1.4;
+  border-radius: var(--r-pill); font-size: 0.72rem; font-weight: 600;
+  padding: 4px 12px; line-height: 1.4;
   letter-spacing: 0.02em;
 }
 .status-pill.approved {
-  background: var(--green-soft); color: var(--green);
-  border: 1px solid #BBF7D0;
+  background: var(--accent); color: var(--text-1);
+  border: 1px solid var(--text-1);
 }
 .status-pill.revision {
   background: var(--amber-soft); color: var(--amber);
@@ -604,82 +730,93 @@ hr {
 
 /* ── Copy content ── */
 .copy-title {
-  font-size: 1.0625rem; font-weight: 700;
-  color: var(--text-1); line-height: 1.4;
-  margin-bottom: 4px;
+  font-size: 1.125rem; font-weight: 700;
+  color: var(--text-1); line-height: 1.35;
+  margin-bottom: 6px;
+  letter-spacing: -0.01em;
 }
 .copy-meta {
-  font-size: 0.74rem; color: var(--text-3);
-  margin-bottom: 10px;
+  font-size: 0.75rem; color: var(--text-3);
+  margin-bottom: 12px;
   display: flex; align-items: center; gap: 8px;
 }
 .copy-meta .len-ok  { color: var(--green); font-weight: 600; }
 .copy-meta .len-bad { color: var(--amber); font-weight: 600; }
 .copy-body {
-  font-size: 0.9rem; line-height: 1.75;
+  font-size: 0.925rem; line-height: 1.75;
   color: var(--text-1); white-space: pre-wrap;
-  border-left: 3px solid var(--border);
-  padding-left: 14px; margin: 10px 0;
+  border-left: 3px solid var(--accent);
+  padding-left: 16px; margin: 12px 0;
 }
 
-/* ── Keyword tags ── */
+/* ── Keyword tags (lime pill) ── */
 .tag {
   display: inline-flex; align-items: center;
-  background: var(--bg);
-  border: 1px solid var(--border-mid);
-  border-radius: 6px;
-  padding: 3px 9px;
-  font-size: 0.74rem; font-weight: 500;
-  color: var(--text-2);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-2);
+  border-radius: var(--r-pill);
+  padding: 4px 12px;
+  font-size: 0.75rem; font-weight: 500;
+  color: var(--text-1);
   margin-right: 5px; margin-bottom: 4px;
-  transition: all 0.1s;
+  transition: all 0.15s;
 }
-.tag:hover { border-color: var(--border-mid); background: var(--card); }
+.tag:hover { background: var(--accent); border-color: var(--text-1); }
 
-/* ── Engine badge ── */
+/* ── Engine badge (black pill, white text) ── */
 .engine-badge {
   display: inline-flex; align-items: center; gap: 4px;
-  background: var(--text-1); color: #fff;
-  border-radius: 5px; padding: 2px 8px;
+  background: var(--text-1); color: var(--text-on-dark);
+  border-radius: var(--r-pill); padding: 3px 10px;
   font-size: 0.68rem; font-weight: 700;
-  letter-spacing: 0.04em; text-transform: uppercase;
+  letter-spacing: 0.05em; text-transform: uppercase;
 }
-.engine-badge.gemini {
-  background: linear-gradient(135deg, #1A73E8, #0F47AF);
-}
+.engine-badge.gemini,
 .engine-badge.claude {
-  background: linear-gradient(135deg, #C96442, #A0522D);
+  background: var(--text-1);
 }
 
-/* ── Section label ── */
+/* ── Section label (lime pill — like "Services" / "Case study") ── */
 .section-label {
-  font-size: 0.74rem; font-weight: 700;
-  text-transform: uppercase; letter-spacing: 0.07em;
-  color: var(--text-3); margin-bottom: 8px;
+  display: inline-flex; align-items: center;
+  background: var(--accent);
+  color: var(--text-1);
+  border: 1px solid var(--text-1);
+  border-radius: var(--r-pill);
+  padding: 4px 12px;
+  font-size: 0.75rem; font-weight: 600;
+  letter-spacing: 0.01em;
+  margin-bottom: 10px;
+  text-transform: none;
 }
 
 /* ── Memory row ── */
 .mem-card {
   background: var(--card); border: 1.5px solid var(--border);
-  border-radius: var(--r-md); padding: 12px 16px;
-  margin-bottom: 8px; box-shadow: var(--shadow-xs);
-  font-size: 0.875rem; color: var(--text-1);
+  border-radius: var(--r-lg); padding: 14px 18px;
+  margin-bottom: 10px;
+  font-size: 0.9rem; color: var(--text-1);
+  transition: all 0.18s;
+}
+.mem-card:hover {
+  border-color: var(--text-1);
+  box-shadow: var(--shadow-sm);
 }
 
 /* ── Sidebar user block ── */
 .user-block {
   display: flex; align-items: center; gap: 10px;
-  padding: 10px 12px;
-  background: var(--bg); border-radius: var(--r-md);
-  border: 1.5px solid var(--border);
-  margin-bottom: 8px;
+  padding: 12px 14px;
+  background: var(--bg-soft); border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  margin-bottom: 10px;
 }
 .user-avatar {
-  width: 32px; height: 32px;
-  background: var(--text-1); color: #fff;
+  width: 34px; height: 34px;
+  background: var(--text-1); color: var(--accent);
   border-radius: 50%;
   display: flex; align-items: center; justify-content: center;
-  font-size: 0.875rem; font-weight: 700;
+  font-size: 0.9rem; font-weight: 700;
   flex-shrink: 0;
 }
 .user-email { font-size: 0.8rem; font-weight: 500; color: var(--text-1); }
@@ -688,19 +825,51 @@ hr {
 /* ── Brand header in sidebar ── */
 .brand-header {
   display: flex; align-items: center; gap: 10px;
-  padding: 16px 0 12px;
-  border-bottom: 1.5px solid var(--border);
-  margin-bottom: 12px;
+  padding: 8px 0 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 14px;
 }
 .brand-logo {
-  font-size: 1.5rem; line-height: 1;
+  font-size: 1.75rem; line-height: 1;
+  color: var(--text-1);
+  font-weight: 700;
 }
 .brand-name {
-  font-size: 0.9375rem; font-weight: 700;
+  font-size: 1rem; font-weight: 700;
   color: var(--text-1); line-height: 1.2;
+  letter-spacing: -0.02em;
 }
 .brand-sub {
   font-size: 0.7rem; color: var(--text-3);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* ── Login hero (auth page) ── */
+.login-hero {
+  text-align: center;
+  padding: 2.5rem 0 1.5rem;
+}
+.login-hero .lh-mark {
+  font-size: 2.25rem; font-weight: 700; color: var(--text-1);
+  margin-bottom: 0.75rem;
+}
+.login-hero .lh-badge {
+  display: inline-block;
+  background: var(--accent); color: var(--text-1);
+  border: 1px solid var(--text-1);
+  border-radius: var(--r-pill);
+  padding: 4px 14px;
+  font-size: 0.75rem; font-weight: 600;
+  margin-bottom: 14px;
+}
+.login-hero .lh-title {
+  font-size: 2.25rem; font-weight: 700;
+  color: var(--text-1); letter-spacing: -0.03em;
+  line-height: 1.1; margin-bottom: 0.5rem;
+}
+.login-hero .lh-sub {
+  color: var(--text-2); font-size: 0.95rem;
 }
 </style>
 """,
@@ -718,9 +887,9 @@ with st.sidebar:
     # Brand header
     st.markdown(
         "<div class='brand-header'>"
-        "<div class='brand-logo'>🍵</div>"
-        "<div><div class='brand-name'>内容工作台</div>"
-        f"<div class='brand-sub'>XHS Workstation · v{config.APP_VERSION}</div></div>"
+        "<div class='brand-logo'>✦</div>"
+        "<div><div class='brand-name'>AutoWriter</div>"
+        f"<div class='brand-sub'>XHS · v{config.APP_VERSION}</div></div>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1571,6 +1740,12 @@ def _render_item_card(
     expander_label = (
         f"{status_icon} {title_str[:60]}{'…' if len(title_str) > 60 else ''}  "
         f"— {status_label} · v{ver_num}"
+    )
+    # Status marker: CSS uses :has() on this sibling to style the following
+    # expander (approved → dark card; other statuses → default white card).
+    st.markdown(
+        f"<div class='card-status-marker card-{status}'></div>",
+        unsafe_allow_html=True,
     )
     with st.expander(expander_label, expanded=(status in ("pending", "needs_revision"))):
         # Engine badge: show full model name + thinking indicator

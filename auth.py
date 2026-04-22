@@ -131,8 +131,17 @@ def _friendly_auth_error(exc: Exception) -> str:
 
 def _render_login_page() -> None:
     """Render the login / registration form."""
-    st.title(f"🍵 {config.APP_TITLE}")
-    st.caption(f"v{config.APP_VERSION}")
+    st.markdown(
+        f"""
+        <div class='login-hero'>
+          <div class='lh-mark'>✦</div>
+          <div class='lh-badge'>Welcome</div>
+          <div class='lh-title'>{config.APP_TITLE}</div>
+          <div class='lh-sub'>AutoWriter · v{config.APP_VERSION}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     missing = config.validate_config()
     if missing:
