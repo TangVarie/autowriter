@@ -30,6 +30,7 @@ ANTHROPIC_BASE_URL: str = _get_secret("ANTHROPIC_BASE_URL")
 # Thinking mode is selected via model name (-thinking suffix); proxy does not
 # accept the `thinking` API parameter.
 CLAUDE_MODELS: dict[str, str] = {
+    # ── Sonnet series ──
     "claude-3-sonnet-20240229":            "Sonnet 3（默认）",
     "claude-3-5-sonnet-20240620":          "Sonnet 3.5（首版）",
     "claude-3-5-sonnet-20241022":          "Sonnet 3.5 v2",
@@ -40,8 +41,17 @@ CLAUDE_MODELS: dict[str, str] = {
     "claude-sonnet-4-5-20250929":          "Sonnet 4.5",
     "claude-sonnet-4-5-20250929-thinking": "Sonnet 4.5（思考）",
     "claude-sonnet-4-6":                   "Sonnet 4.6",
-    "claude-opus-4-7":                     "Opus 4.7",
+    # ── Opus series ──
+    "claude-3-opus-20240229":              "Opus 3",
+    "claude-opus-4-20250514":              "Opus 4",
+    "claude-opus-4-20250514-thinking":     "Opus 4（思考）",
+    "claude-opus-4-1-20250805":            "Opus 4.1",
+    "claude-opus-4-1-20250805-thinking":   "Opus 4.1（思考）",
+    "claude-opus-4-5-20251101":            "Opus 4.5",
+    "claude-opus-4-5-20251101-thinking":   "Opus 4.5（思考）",
+    "claude-opus-4-6":                     "Opus 4.6",
     "claude-opus-4.6-thinking":            "Opus 4.6（思考）",
+    "claude-opus-4-7":                     "Opus 4.7",
 }
 
 # Default model (can be overridden via env var)
