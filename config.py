@@ -109,7 +109,7 @@ MAX_ITERATION_ROUNDS: int = 3
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
-APP_VERSION: str = "2.4.0-studio"
+APP_VERSION: str = "2.4.1-studio"
 
 
 def validate_config() -> list[str]:

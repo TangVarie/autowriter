@@ -5,12 +5,93 @@ Provides sign-up, sign-in, sign-out, and session management helpers.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+
 import streamlit as st
 from supabase import Client
 
 import config
 import db
+
+try:
+    import extra_streamlit_components as stx
+    _COOKIES_AVAILABLE = True
+except ImportError:
+    _COOKIES_AVAILABLE = False
+
+
+# ── Cookie-backed session persistence ─────────────────────────────────────
+# Streamlit session_state lives in the websocket connection; F5 resets it.
+# We persist the Supabase refresh token in a browser cookie so that after a
+# refresh we can re-derive an access token without making the user re-login.
+_COOKIE_NAME = "xhs_rt"
+_COOKIE_TTL_DAYS = 7
+
+
+def _cookie_manager():
+    """
+    Return the single per-session CookieManager instance.  ``extra-streamlit-
+    components`` uses a stable component key so repeat calls don't create
+    duplicate iframes.  Returns None if the library isn't installed (graceful
+    degradation — auth still works, just not persistent across refresh).
+    """
+    if not _COOKIES_AVAILABLE:
+        return None
+    return stx.CookieManager(key="xhs_auth_cm")
+
+
+def _persist_refresh_token(refresh_token: str) -> None:
+    cm = _cookie_manager()
+    if not cm or not refresh_token:
+        return
+    try:
+        cm.set(
+            _COOKIE_NAME,
+            refresh_token,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=_COOKIE_TTL_DAYS),
+            key="xhs_set_rt",
+        )
+    except Exception:
+        pass
+
+
+def _clear_refresh_cookie() -> None:
+    cm = _cookie_manager()
+    if not cm:
+        return
+    try:
+        cm.delete(_COOKIE_NAME, key="xhs_del_rt")
+    except Exception:
+        pass
+
+
+def _restore_from_cookie() -> bool:
+    """
+    Re-hydrate the session from the refresh token cookie, if present.  Called
+    when ``st.session_state`` is empty (typically right after a browser
+    refresh).  Returns True if a session was successfully restored.
+    """
+    cm = _cookie_manager()
+    if not cm:
+        return False
+    try:
+        token = cm.get(_COOKIE_NAME)
+    except Exception:
+        return False
+    if not token:
+        return False
+    try:
+        client = get_supabase_client()
+        res = client.auth.refresh_session(token)
+        if res.session and res.user:
+            _store_session({"session": res.session, "user": res.user})
+            return True
+    except Exception:
+        pass
+    # Cookie is stale / refresh token revoked — clear it so we don't retry.
+    _clear_refresh_cookie()
+    return False
 
 
 def get_supabase_client() -> Client:
@@ -46,13 +127,14 @@ def sign_in(email: str, password: str) -> dict:
 
 
 def sign_out() -> None:
-    """Sign out the current user and clear Streamlit session state."""
+    """Sign out the current user and clear Streamlit session state + cookie."""
     if "supabase_session" in st.session_state:
         try:
             client = get_supabase_client()
             client.auth.sign_out()
         except Exception:
             pass
+    _clear_refresh_cookie()
     for key in ("supabase_session", "current_user", "access_token", "current_project_id"):
         st.session_state.pop(key, None)
 
@@ -89,14 +171,19 @@ def require_auth() -> tuple[Client, dict]:
     Enforce authentication. If the user is not logged in, show the login
     UI and stop page rendering via st.stop().
 
+    On first request after a browser refresh, session_state is empty; we try
+    to restore from the refresh-token cookie before falling back to login.
+
     Returns (authenticated_client, user_dict).
     """
     if "current_user" not in st.session_state:
-        _render_login_page()
-        st.stop()
+        # Cookie restore is a no-op if the cookie is absent or expired.
+        if not _restore_from_cookie():
+            _render_login_page()
+            st.stop()
     client = get_authenticated_client()
     if client is None:
-        # Try refreshing the token before forcing re-login
+        # Access token likely expired — try refreshing before kicking the user out.
         if _try_refresh_session():
             client = get_authenticated_client()
         if client is None:
@@ -225,12 +312,18 @@ def _render_login_page() -> None:
 
 
 def _store_session(result: dict) -> None:
-    """Persist auth result into Streamlit session state."""
+    """Persist auth result into Streamlit session state and the cookie jar."""
     session = result.get("session")
     user = result.get("user")
     if session:
         st.session_state["access_token"] = session.access_token
         st.session_state["supabase_session"] = session
+        # Rotate the cookie on every session write so newly-issued refresh
+        # tokens replace the old one (Supabase revokes refresh tokens after
+        # use in rotation mode).
+        rt = getattr(session, "refresh_token", None)
+        if rt:
+            _persist_refresh_token(rt)
     if user:
         st.session_state["current_user"] = {
             "id": user.id,
