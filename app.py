@@ -2035,7 +2035,7 @@ def page_review(project: dict) -> None:
     st.markdown("<div class='section-label'>批量操作</div>", unsafe_allow_html=True)
     st.caption("多批次合并导出请前往「📤 导出中心」页面。")
 
-    col_feishu, col_mem, col_calib = st.columns(3)
+    col_feishu, col_calib = st.columns(2)
 
     with col_feishu:
         if st.button("🔔 推送本批次到飞书", use_container_width=True):
@@ -2051,13 +2051,10 @@ def page_review(project: dict) -> None:
                 )
                 st.success("已推送到飞书。") if ok else st.error("飞书推送失败，请检查 Webhook 配置。")
 
-    with col_mem:
-        if st.button("💾 沉淀反馈记忆", use_container_width=True):
-            _ingest_all_feedbacks(project, batch_id)
-
     with col_calib:
         if st.button("🧠 更新调教笔记", use_container_width=True):
             _generate_calibration_notes_ui(project, batch_id, items)
+        st.caption("对整个批次做整体反思；日常每次迭代已自动增量更新。")
 
     # 调教笔记预览 + 确认保存
     calib_key = f"pending_calibration_{batch_id}"
@@ -2575,29 +2572,6 @@ def _collect_approved_items(items: list[dict]) -> list[dict]:
             "version_num": v.get("version_num", 1),
         })
     return result
-
-
-def _ingest_all_feedbacks(project: dict, batch_id: str) -> None:
-    """Collect all feedbacks from this batch's versions and persist as memory candidates."""
-    # Collect feedbacks from DB (not from session state, which resets on rerun)
-    items = db.list_items(db_client, batch_id)
-    feedbacks: list[str] = []
-    for item in items:
-        for v in item.get("versions", []):
-            fb = v.get("feedback")
-            if fb and fb.strip():
-                feedbacks.append(fb.strip())
-    if not feedbacks:
-        st.info("本批次没有反馈记录需要沉淀。")
-        return
-    unique = list(dict.fromkeys(feedbacks))
-    with st.spinner("正在分析并沉淀反馈记忆…"):
-        results = mem_module.ingest_batch_feedbacks(
-            db_client, user_id, unique,
-            project_id=project["id"],
-            project_name=project.get("name", ""),
-        )
-    st.success(f"已沉淀 {len(results)} 条反馈记忆。前往「记忆管理」查看。")
 
 
 def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dict]) -> None:
