@@ -85,6 +85,16 @@ MEMORY_AUTO_CONFIRM_THRESHOLD: int = int(
     os.environ.get("MEMORY_AUTO_CONFIRM_THRESHOLD", "3")
 )
 
+# When True (default), user-typed feedback / extra_instructions are routed
+# through an AI classifier that decides per input whether it's a merge
+# candidate for an existing rule, a brand-new rule, a taste observation
+# (→ calibration notes), or a one-off session instruction (24h TTL).
+# Turn off to fall back to the legacy "write-straight-to-session-memory"
+# behavior introduced in 2.4.0.
+ENABLE_MEMORY_MERGE: bool = (
+    os.environ.get("ENABLE_MEMORY_MERGE", "1") not in ("0", "false", "False")
+)
+
 # ── Compliance recheck ────────────────────────────────────────────────────
 # When True, generate_batch runs a second Claude call after generation to
 # verify each version respected the active project memories and session
@@ -109,7 +119,7 @@ MAX_ITERATION_ROUNDS: int = 3
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
-APP_VERSION: str = "2.4.1-studio"
+APP_VERSION: str = "2.5.0-studio"
 
 
 def validate_config() -> list[str]:

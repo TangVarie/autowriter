@@ -117,9 +117,11 @@ def _queue_worker(
             batch_id = batch["id"]
 
             if extra_instr and extra_instr.strip():
-                mem_module.record_session_instruction(
+                mem_module.ingest_user_instruction(
                     db_client, user_id, extra_instr,
-                    project_id=project_id, batch_id=batch_id,
+                    project_id=project_id,
+                    project_name=project.get("name", ""),
+                    batch_id=batch_id,
                 )
 
             historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
@@ -1384,12 +1386,15 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         batch_id = batch["id"]
         status["batch_id"] = batch_id
 
-        # Capture any ad-hoc instructions the user typed into extra_instructions
-        # so they persist into session memory for future generations this day.
+        # Route extra_instructions through the AI merger so useful rules sink
+        # into permanent memory (or calibration notes) and one-offs stay in
+        # the 24h session layer.
         if extra_instr and extra_instr.strip():
-            mem_module.record_session_instruction(
+            mem_module.ingest_user_instruction(
                 db_client, user_id, extra_instr,
-                project_id=project_id, batch_id=batch_id,
+                project_id=project_id,
+                project_name=project.get("name", ""),
+                batch_id=batch_id,
             )
 
         historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
@@ -2453,12 +2458,14 @@ def _run_iteration(
     project_id = project["id"]
     batch_id   = batch.get("id")
 
-    # Persist this iteration's feedback as a session-level instruction so it
-    # survives the Streamlit rerun and carries forward into the next batch.
+    # Route iteration feedback through the AI merger so it lands in the right
+    # layer (merge / new rule / taste → calibration note / session).
     if feedback and feedback.strip():
-        mem_module.record_session_instruction(
+        mem_module.ingest_user_instruction(
             db_client, user_id, feedback,
-            project_id=project_id, batch_id=batch_id,
+            project_id=project_id,
+            project_name=project.get("name", ""),
+            batch_id=batch_id,
         )
 
     base_prompt = project.get("system_prompt", "")
@@ -2521,6 +2528,25 @@ def _run_iteration(
         feedback=feedback,
         token_usage=result.token_usage,
     )
+
+    # Incrementally update calibration notes from this single iteration.
+    # Every correction the user makes carries a "why" — capture it now rather
+    # than waiting for the whole batch to go green.  Runs silently; failure
+    # does not block the main flow.
+    try:
+        prev_version = versions[-1] if versions else {}
+        mem_module.update_calibration_from_iteration(
+            db_client,
+            project_id=project_id,
+            old_title=prev_version.get("title", "") or "",
+            old_body=prev_version.get("body", "") or "",
+            feedback=feedback or "",
+            new_title=result.title or "",
+            new_body=result.body or "",
+        )
+    except Exception:
+        pass
+
     # Reset item to pending so it gets reviewed again
     db.update_item_status(db_client, item["id"], "pending")
     st.success("迭代成功！")

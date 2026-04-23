@@ -106,12 +106,9 @@ def record_session_instruction(
     ttl_hours: int = 24,
 ) -> Optional[dict]:
     """
-    Persist an ad-hoc conversational instruction as a session-level memory.
-
-    Session memories are directly ``confirmed`` (no frequency threshold) because
-    the user explicitly said it; they carry an ``expires_at`` so they don't
-    pollute future batches forever.  Returns None if the schema migration for
-    session-level memories hasn't been applied yet.
+    Low-level helper: write a session-level memory directly, bypassing the
+    merger.  Kept for imports that may still reference it; prefer
+    :func:`ingest_user_instruction` for all new call sites.
     """
     clean = (text or "").strip()
     if not clean:
@@ -125,6 +122,227 @@ def record_session_instruction(
         source_batch_id=batch_id,
         ttl_hours=ttl_hours,
     )
+
+
+# ── AI-driven merger: classify a user instruction and route it ───────────
+
+_MERGER_SYSTEM = """你是一个内容运营的记忆整理助手。你要帮用户把一条刚输入的反馈/指令，分流到最合适的记忆层。
+
+四种动作，严格四选一：
+1. "merge" —— 新反馈和现有某条硬规则属于同一件事（即使措辞不同），把它合并到那条。输出该条的 id。
+2. "rule"  —— 一条全新的硬性规则，可精确执行（例："标题不要带数字"、"RIO 不用'微醉'"）。
+3. "taste" —— 审美偏好、感受性观察，不是可精确执行的规则（例："喜欢有温度的收尾"、"不要太说教口吻"）。这类走调教笔记。
+4. "session" —— 仅适用于本次或近期生成的临时上下文（例："本次突出柑橘口味"、"这批主打周五场景"），或实验性试探（"试试数字开头"）。不值得永久保留。
+
+判定提示：
+- 一般性 / 未来也成立 → rule
+- 长期审美但难量化 → taste
+- 仅本次有效 / 一次性试探 → session
+- 已有同义硬规则 → merge
+
+若是 rule：判断 scope。与某个品牌/产品强相关 → "project"；对所有小红书文案普遍成立 → "global"。
+若是 taste：把观察浓缩成一句，方便追加进调教笔记。
+所有 content 字段都要规范化成 ≤ 50 字的中文短句。
+
+严格输出 JSON，无其他文字：
+{
+  "action": "merge" | "rule" | "taste" | "session",
+  "target_id": "<仅 merge 时有；现有记忆的 id>",
+  "scope": "project" | "global",    // 仅 rule 时有
+  "content": "<规范化后的短句>",
+  "reason": "<不超过 20 字的判定依据>"
+}"""
+
+
+def classify_and_merge_feedback(
+    db_client: Client,
+    user_id: str,
+    feedback_text: str,
+    project_id: Optional[str] = None,
+    project_name: str = "",
+) -> dict:
+    """
+    Ask Claude to route the feedback into one of four buckets (merge / rule /
+    taste / session).  Returns the parsed JSON dict (with sane fallbacks on
+    error).  Caller is responsible for applying the routing decision.
+    """
+    clean = (feedback_text or "").strip()
+    if not clean:
+        return {"action": "session", "content": "", "reason": "empty"}
+
+    fallback = {
+        "action": "session",
+        "content": clean[:50],
+        "reason": "classifier fallback",
+    }
+    if not config.ANTHROPIC_API_KEY:
+        return fallback
+
+    # Pull existing confirmed rules so the merger can spot semantic duplicates.
+    global_mems, project_mems = db.get_confirmed_memories(
+        db_client, user_id, project_id=project_id
+    )
+    existing_lines: list[str] = []
+    for m in project_mems[:30]:
+        existing_lines.append(f"- [id={m['id']}] (项目) {m['content']}")
+    for m in global_mems[:30]:
+        existing_lines.append(f"- [id={m['id']}] (通用) {m['content']}")
+    existing_block = "\n".join(existing_lines) if existing_lines else "(无)"
+
+    user_msg = (
+        (f"[当前项目：{project_name}]\n" if project_name else "")
+        + f"现有硬规则（仅供 merge 判定）：\n{existing_block}\n\n"
+        + f"用户刚输入：\n{clean}"
+    )
+
+    try:
+        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
+        if config.ANTHROPIC_BASE_URL:
+            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
+        client = anthropic.Anthropic(**client_kwargs)
+        resp = client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=400,
+            system=_MERGER_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = resp.content[0].text.strip()
+        # strip ```json fences if the model wrapped them
+        import re as _re
+        cleaned = _re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+        data = json.loads(cleaned)
+    except Exception:
+        return fallback
+
+    action = data.get("action")
+    if action not in ("merge", "rule", "taste", "session"):
+        return fallback
+    out: dict = {
+        "action": action,
+        "content": (data.get("content") or clean)[:80].strip(),
+        "reason": (data.get("reason") or "")[:60].strip(),
+        "source_feedback": clean,
+    }
+    if action == "merge":
+        out["target_id"] = str(data.get("target_id") or "").strip()
+        if not out["target_id"]:
+            # merger said merge but gave no id — safer to treat as rule
+            out["action"] = "rule"
+            out["scope"] = "project"
+    if out["action"] == "rule":
+        scope = data.get("scope")
+        out["scope"] = "global" if scope == "global" else "project"
+    return out
+
+
+def ingest_user_instruction(
+    db_client: Client,
+    user_id: str,
+    feedback_text: str,
+    project_id: Optional[str] = None,
+    project_name: str = "",
+    batch_id: Optional[str] = None,
+    session_ttl_hours: int = 24,
+) -> dict:
+    """
+    The one capture pipeline for every user-typed instruction (Quick Generate
+    extra_instructions, iteration feedback, manual memory add).  Routes through
+    the merger into: merge existing rule / new rule / taste calibration note /
+    session memory.  Returns ``{"action": ..., "result": <raw row or note>}``.
+    """
+    clean = (feedback_text or "").strip()
+    if not clean:
+        return {"action": "skip", "reason": "empty"}
+
+    # Feature flag — fall back to legacy session-only write if disabled.
+    if not getattr(config, "ENABLE_MEMORY_MERGE", True):
+        row = record_session_instruction(
+            db_client, user_id, clean,
+            project_id=project_id, batch_id=batch_id, ttl_hours=session_ttl_hours,
+        )
+        return {"action": "session", "result": row, "reason": "merger disabled"}
+
+    decision = classify_and_merge_feedback(
+        db_client, user_id, clean,
+        project_id=project_id, project_name=project_name,
+    )
+    action = decision["action"]
+
+    if action == "merge":
+        try:
+            row = db.increment_memory_frequency(db_client, decision["target_id"])
+            return {"action": "merge", "result": row, "reason": decision.get("reason", "")}
+        except Exception:
+            # Fall back to creating a new rule if the target id is stale
+            action = "rule"
+            decision.setdefault("scope", "project")
+
+    if action == "rule":
+        scope = decision.get("scope", "project")
+        pid = project_id if scope == "project" else None
+        row = db.upsert_memory(
+            db_client,
+            user_id=user_id,
+            scope=scope,
+            content=decision["content"],
+            source_feedback=clean,
+            project_id=pid,
+            auto_confirm_threshold=1,  # a single utterance is enough
+            force_confirmed=True,
+        )
+        return {"action": "rule", "result": row, "reason": decision.get("reason", "")}
+
+    if action == "taste":
+        note = (decision.get("content") or clean).strip()
+        if note and project_id:
+            _append_taste_to_calibration(db_client, project_id, note)
+        return {"action": "taste", "result": note, "reason": decision.get("reason", "")}
+
+    # session (default)
+    row = record_session_instruction(
+        db_client, user_id, decision.get("content") or clean,
+        project_id=project_id, batch_id=batch_id, ttl_hours=session_ttl_hours,
+    )
+    return {"action": "session", "result": row, "reason": decision.get("reason", "")}
+
+
+def _append_taste_to_calibration(
+    db_client: Client,
+    project_id: str,
+    observation: str,
+) -> None:
+    """Append a single taste observation to the project's calibration notes.
+
+    Keeps the notes bounded (≤ 600 characters total) by deduping near-exact
+    matches and trimming the oldest entries once capacity is exceeded.
+    """
+    try:
+        proj = db.get_project(db_client, project_id)
+    except Exception:
+        return
+    if not proj:
+        return
+
+    existing = (proj.get("calibration_notes") or "").rstrip()
+    line = f"- {observation.lstrip('-• ').strip()}"
+
+    # Skip if the observation already appears (case-insensitive, whitespace-collapsed).
+    existing_norm = " ".join(existing.split())
+    if observation[:20] and observation[:20] in existing_norm:
+        return
+
+    merged = (existing + "\n" + line) if existing else line
+    if len(merged) > 800:
+        # Drop oldest lines until we fit.  Lines are stored newest-last.
+        lines = merged.split("\n")
+        while lines and len("\n".join(lines)) > 800:
+            lines.pop(0)
+        merged = "\n".join(lines)
+
+    try:
+        db.update_project(db_client, project_id, {"calibration_notes": merged})
+    except Exception:
+        pass
 
 
 # ── AI-based feedback classification ──────────────────────────────────────
@@ -212,15 +430,26 @@ def ingest_batch_feedbacks(
     project_id: Optional[str] = None,
     project_name: str = "",
 ) -> list[dict]:
-    """Process a list of feedback strings (from a full review round)."""
+    """
+    Process a list of feedback strings (typically from the manual "沉淀反馈
+    记忆" button after review).  Routes each feedback through the AI merger
+    when enabled; falls back to the legacy classifier otherwise.
+    """
     results = []
     for fb in feedbacks:
-        if fb and fb.strip():
+        if not fb or not fb.strip():
+            continue
+        if getattr(config, "ENABLE_MEMORY_MERGE", True):
+            result = ingest_user_instruction(
+                db_client, user_id, fb.strip(),
+                project_id=project_id, project_name=project_name,
+            )
+        else:
             result = ingest_feedback(
                 db_client, user_id, fb.strip(),
-                project_id=project_id, project_name=project_name
+                project_id=project_id, project_name=project_name,
             )
-            results.append(result)
+        results.append(result)
     return results
 
 
@@ -301,6 +530,88 @@ def generate_calibration_notes(
         messages=[{"role": "user", "content": user_content}],
     )
     return resp.content[0].text.strip()
+
+
+# Incremental calibration update: runs after every iteration, not only on
+# full-batch approval.  Every iteration carries a "why" signal — we don't
+# want to wait until the whole batch is approved to learn from it.
+_CALIB_INCREMENTAL_SYSTEM = """\
+你是内容策划顾问，负责维护调教笔记（项目级的感受性偏好集合）。
+
+收到一条新的迭代记录（原版 → 用户反馈 → 迭代后版本），以及现有调教笔记。
+你要判断：
+1. 这条迭代里是否包含值得进调教笔记的审美/偏好信号？
+   - 有 → 把该信号浓缩成一条（≤ 40 字）加进现有笔记；如果和现有某条同义则不新增，保持不动
+   - 没有（例如只是明显的事实性修改、错别字、个人一次性上下文）→ 直接返回现有笔记原文
+2. 如果现有笔记已有明显冲突/陈旧的观察，可以精简或替换；但保守优先，除非新信号很强
+
+输出格式：纯文本调教笔记全文，每条用「-」开头，总长不超过 600 字。
+不要解释、不要前缀、不要 JSON，只输出笔记正文。"""
+
+
+def update_calibration_from_iteration(
+    db_client: Client,
+    project_id: str,
+    old_title: str,
+    old_body: str,
+    feedback: str,
+    new_title: str,
+    new_body: str,
+) -> Optional[str]:
+    """
+    Incrementally update the project's calibration notes from a single
+    iteration triple (old → feedback → new).  Called after every successful
+    iteration, so every user correction has a chance to teach the system.
+
+    Returns the updated notes string, or None if the call failed / there was
+    nothing to update (notes are persisted as a side effect on success).
+    """
+    if not (feedback or "").strip():
+        return None
+    if not config.ANTHROPIC_API_KEY:
+        return None
+    try:
+        proj = db.get_project(db_client, project_id)
+    except Exception:
+        return None
+    if not proj:
+        return None
+    existing = (proj.get("calibration_notes") or "").strip()
+
+    old_body_preview = (old_body or "")[:180].split("\n")[0]
+    new_body_preview = (new_body or "")[:180].split("\n")[0]
+    user_content = (
+        f"项目：{proj.get('name','')}\n\n"
+        + (f"现有调教笔记：\n{existing}\n\n" if existing else "现有调教笔记：(空)\n\n")
+        + "本次迭代：\n"
+        + f"  v旧 《{old_title}》 {old_body_preview}\n"
+        + f"  反馈：{feedback.strip()}\n"
+        + f"  v新 《{new_title}》 {new_body_preview}\n\n"
+        + "请按系统提示更新调教笔记。"
+    )
+
+    try:
+        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
+        if config.ANTHROPIC_BASE_URL:
+            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
+        client = anthropic.Anthropic(**client_kwargs)
+        resp = client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=900,
+            system=_CALIB_INCREMENTAL_SYSTEM,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        updated = resp.content[0].text.strip()
+    except Exception:
+        return None
+
+    if not updated or updated == existing:
+        return None
+    try:
+        db.update_project(db_client, project_id, {"calibration_notes": updated})
+    except Exception:
+        return None
+    return updated
 
 
 # ── Streamlit memory management UI ────────────────────────────────────────

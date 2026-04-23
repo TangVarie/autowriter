@@ -463,10 +463,14 @@ def upsert_memory(
     source_feedback: str,
     project_id: Optional[str] = None,
     auto_confirm_threshold: int = 3,
+    force_confirmed: bool = False,
 ) -> dict:
     """
     Insert a new memory candidate or increment frequency of an existing one.
-    Auto-promotes to 'confirmed' when frequency reaches the threshold.
+
+    ``force_confirmed`` (used by the AI merger) creates the row already in the
+    ``confirmed`` state, skipping the frequency threshold — callers that set
+    this flag have already decided the rule is intentional.
     """
     # Try to find an existing memory with the same content
     q = (
@@ -483,7 +487,10 @@ def upsert_memory(
     if existing.data:
         row = existing.data[0]
         new_freq = row["frequency"] + 1
-        new_status = "confirmed" if new_freq >= auto_confirm_threshold else row["status"]
+        if force_confirmed or new_freq >= auto_confirm_threshold:
+            new_status = "confirmed"
+        else:
+            new_status = row["status"]
         res = (
             client.table("memories")
             .update({"frequency": new_freq, "status": new_status})
@@ -498,12 +505,33 @@ def upsert_memory(
             "source_feedback": source_feedback,
             "user_id": user_id,
             "frequency": 1,
-            "status": "candidate",
+            "status": "confirmed" if force_confirmed else "candidate",
         }
         if project_id:
             data["project_id"] = project_id
         res = client.table("memories").insert(data).execute()
         return res.data[0]
+
+
+def increment_memory_frequency(client: Client, memory_id: str) -> dict:
+    """
+    Bump an existing memory's frequency counter and mark it confirmed.  Used
+    by the AI merger's ``merge`` path when a new feedback is deemed semantically
+    equivalent to an existing rule.
+    """
+    row = (
+        client.table("memories").select("*").eq("id", memory_id).execute()
+    )
+    if not row.data:
+        raise ValueError(f"memory {memory_id} not found")
+    cur = row.data[0]
+    res = (
+        client.table("memories")
+        .update({"frequency": cur.get("frequency", 1) + 1, "status": "confirmed"})
+        .eq("id", memory_id)
+        .execute()
+    )
+    return res.data[0]
 
 
 def update_memory(client: Client, memory_id: str, updates: dict) -> dict:
