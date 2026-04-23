@@ -13,11 +13,13 @@ Each engine implements a common interface:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 import threading
@@ -91,13 +93,22 @@ def _make_user_prompt(
         )
     else:
         return (
-            f"{context}请根据以上系统提示词，生成 {count} 篇风格各异的小红书文案。\n\n"
+            f"{context}请根据以上系统提示词，生成 {count} 篇的小红书文案。\n\n"
             "要求：\n"
             "- 每篇标题：15–22字，吸引眼球，可以带数字或疑问句\n"
             "- 每篇正文：300–500字，口语化，有场景感\n"
-            "- 每篇关键词：3–5个，用于标签\n"
-            f"- {count} 篇之间必须角度各异、场景不同、标题句式有差异，不能重复\n\n"
-            f"以如下 JSON 数组格式输出（只返回包含 {count} 个元素的 JSON 数组，不要有其他内容）：\n"
+            "- 每篇关键词：3–5个，用于标签\n\n"
+            "【批次内多样性硬约束 — 每条必须逐项自检】\n"
+            f"- {count} 篇之间的标题句式骨架必须全部不同\n"
+            "  （骨架 = 疑问／数字清单／对比反转／场景直述／第一人称自白／比喻起手／感叹共鸣／对白引语 等）\n"
+            f"- {count} 篇之间的切入角度必须全部不同（叙事／洞察／共情／对比／干货／场合 等维度）\n"
+            "- 任意两篇的核心名词/动词重合 ≤ 1 个\n"
+            "- 任意两篇的正文前 20 字切入方式不得高度相似\n\n"
+            "【正文多样性软约束】\n"
+            "正文可以谈相同主题、相同卖点；但必须换不同的开场视角、比喻系统或结尾方式。\n"
+            "换的是「怎么说」，不必刻意换「说什么」。\n\n"
+            f"如果某一篇无法同时满足以上硬约束，宁可少出一条也不要硬出重复项（数组可短于 {count}）。\n\n"
+            f"以如下 JSON 数组格式输出（只返回 JSON 数组，不要有其他内容）：\n"
             "[\n"
             '  {"title": "文案标题", "body": "文案正文（换行用\\n）", "keywords": ["关键词1", "关键词2"]},\n'
             "  ...\n"
@@ -795,35 +806,169 @@ AVAILABLE_ENGINES: list[str] = ["claude"] + (
 )
 
 
+# ── Per-account diversity seed + slot coordinates ─────────────────────────
+
+TITLE_STRUCTURE_MATRIX: list[str] = [
+    "疑问句",
+    "数字清单",
+    "对比反转",
+    "场景直述",
+    "第一人称自白",
+    "比喻起手",
+    "感叹共鸣",
+    "对白引语",
+]
+
+WORD_TILTS: list[str] = [
+    "克制",
+    "口语",
+    "反差",
+    "感性",
+    "理性",
+    "文艺",
+    "冷静",
+    "自嘲",
+]
+
+
+def _user_style_seed(
+    user_id: str = "",
+    project_id: str = "",
+    day_bucket: str = "",
+    nonce: int = 0,
+) -> int:
+    """
+    Deterministic-but-varied per-account seed.
+
+    Stable within a (user, project, day) triple so an account has a recognisable
+    style footprint for the day, but shifts across users/projects/days and
+    across per-click nonces.
+    """
+    if not day_bucket:
+        day_bucket = datetime.now(timezone.utc).strftime("%Y%m%d")
+    key = f"{user_id}:{project_id}:{day_bucket}:{nonce}"
+    return int(hashlib.blake2s(key.encode("utf-8"), digest_size=8).hexdigest(), 16)
+
+
+def _assign_slot_coordinates(
+    count: int,
+    seed: int,
+    role_pool: Optional[list[dict]] = None,
+) -> list[dict]:
+    """
+    Assign one (role, title-structure, word-tilt) triple per slot, so each of
+    the ``count`` items in a batch has a distinct creative coordinate.
+
+    - role: sampled without replacement from ``role_pool`` (defaults to
+      ``CREATIVE_ROLES_POOL``), wrapping around if count exceeds pool size
+    - structure: same, from ``TITLE_STRUCTURE_MATRIX``
+    - tilt: one daily-stable choice from ``WORD_TILTS`` (same for all slots —
+      it's the account's "mood of the day", not a per-slot axis)
+
+    Determinism: same seed → same output, so a user's same-day clicks stay
+    consistent within a generation but vary across days / across users.
+    """
+    rng = random.Random(seed)
+    pool = list(role_pool or CREATIVE_ROLES_POOL)
+
+    def _seeded_sample(items: list, k: int) -> list:
+        if k <= 0 or not items:
+            return []
+        shuffled = items[:]
+        rng.shuffle(shuffled)
+        if k <= len(shuffled):
+            return shuffled[:k]
+        # Wrap around: cycle the shuffled order until we have k items
+        out = []
+        while len(out) < k:
+            out.extend(shuffled[: min(k - len(out), len(shuffled))])
+        return out[:k]
+
+    roles = _seeded_sample(pool, count)
+    structures = _seeded_sample(TITLE_STRUCTURE_MATRIX, count)
+    tilt = rng.choice(WORD_TILTS) if WORD_TILTS else ""
+
+    return [
+        {
+            "role_name": roles[i].get("name", "") if isinstance(roles[i], dict) else str(roles[i]),
+            "role_id": roles[i].get("id", "") if isinstance(roles[i], dict) else "",
+            "structure": structures[i],
+            "tilt": tilt,
+        }
+        for i in range(count)
+    ]
+
+
+def _build_slot_coordinates_block(coords: list[dict]) -> str:
+    """Render the per-slot creative coordinates as a prompt block."""
+    if not coords:
+        return ""
+    lines = ["【本批次每篇的创作坐标（必须按编号对应）】"]
+    for i, c in enumerate(coords, 1):
+        role = c.get("role_name") or "(默认)"
+        structure = c.get("structure") or ""
+        tilt = c.get("tilt") or ""
+        lines.append(
+            f"第{i}篇：切入角度={role}  · 标题句式={structure} · 词感倾向={tilt}"
+        )
+    lines.append("以上坐标为硬约束：每一篇的角度与标题句式必须与编号一致，不得互换。")
+    return "\n".join(lines)
+
+
 # ── Batch generation ───────────────────────────────────────────────────────
 
 def _build_dedup_instruction(
     generated_summaries: list[str],
-    historical_titles: list[str] | None = None,
+    historical: list[dict] | list[str] | None = None,
 ) -> str:
-    """Build a dedup instruction listing previously generated angles to avoid."""
+    """
+    Build a dedup block separating HARD title constraints from SOFT body
+    constraints.
+
+    ``historical`` accepts either a list of plain title strings (legacy
+    callers) or dicts ``{"title","opening"}`` — the dict form enables the much
+    stronger anti-repetition check on opening lines.
+    """
     lines: list[str] = []
 
-    if historical_titles:
-        lines.append("【历史已有文案标题（跨批次），请避免相似角度】")
-        for t in historical_titles[-20:]:  # limit to last 20
-            lines.append(f"- {t}")
+    hist_norm: list[dict] = []
+    if historical:
+        for h in historical[-20:]:
+            if isinstance(h, dict):
+                hist_norm.append({
+                    "title": (h.get("title") or "").strip(),
+                    "opening": (h.get("opening") or "").strip(),
+                })
+            else:
+                hist_norm.append({"title": str(h).strip(), "opening": ""})
+        hist_norm = [h for h in hist_norm if h["title"]]
+
+    if hist_norm:
+        lines.append("【标题多样性硬约束 — 每条必须逐项自检】")
+        lines.append("近期已有或已生成条目（标题 + 正文开头）：")
+        for h in hist_norm:
+            if h["opening"]:
+                lines.append(f"- 《{h['title']}》开头：{h['opening']}")
+            else:
+                lines.append(f"- 《{h['title']}》")
+        lines.append("")
+        lines.append("你生成的每一条都必须同时满足：")
+        lines.append("  · 核心名词/动词与任一历史条目重合 ≤ 1 个")
+        lines.append("  · 句式骨架不得与最近 5 条相同（骨架 = 疑问／清单／反转／场景／共鸣／对白／比喻／感叹）")
+        lines.append("  · 正文前 20 字切入方式不得与任一历史开头高度相似")
+        lines.append("若某一条无法通过以上检查，宁可少出一条也不要硬出重复项。")
+        lines.append("")
+        lines.append("【正文多样性软约束】")
+        lines.append("正文可以谈相同主题、相同卖点；但必须换不同的开场视角、比喻系统或结尾方式。")
+        lines.append("换的是「怎么说」，不必刻意换「说什么」。")
 
     if generated_summaries:
-        lines.append("【本批次已生成的文案，你必须选择完全不同的切入角度、场景和标题风格】")
-        # Only keep recent summaries to control prompt size
+        if lines:
+            lines.append("")
+        lines.append("【本批次已选取的其他文案（同样适用上述硬约束）】")
         for s in generated_summaries[-20:]:
             lines.append(f"- {s}")
 
-    if not lines:
-        return ""
-
-    lines.append(
-        "\n⚠️ 重要：以上每一篇都是已有内容。"
-        "你这次必须用全新的场景、情绪、人物、标题句式来写，"
-        "不要重复任何已有的角度、开头方式或叙事结构。"
-        "尽量差异化。"
-    )
     return "\n".join(lines)
 
 
@@ -838,29 +983,28 @@ def generate_batch(
     extra_instructions: str = "",
     images: Optional[list[dict]] = None,
     progress_callback=None,
-    historical_titles: list[str] | None = None,
+    historical_titles: list[dict] | list[str] | None = None,
     use_thinking: bool = False,
     engine_models: dict[str, str] | None = None,
     gemini_use_thinking: bool = False,
+    user_id: str = "",
+    project_id: str = "",
 ) -> list[dict]:
-    """
-    engine_models: optional per-engine model override, e.g.
-        {"claude": "claude-opus-4-6", "gemini": "gemini-3.1-pro-preview"}
-    """
     """
     Generate `count` copy items using specified engines.
 
     For multi-engine mode (len(engines) > 1), each slot gets one version
     per engine. For single-engine mode, each slot gets one version.
 
-    Uses accumulated context to ensure each piece differs from previous ones
-    within the batch and optionally from historical titles.
+    Injects per-slot creative coordinates (role / title-structure / word-tilt)
+    derived from a per-account seed, so different users generating the same
+    brand/tactic on the same day get distinct angles, and the same account's
+    consecutive clicks still drift via a per-call nonce.
 
-    Returns a list of dicts, each with:
-        {
-          "versions": [GenerationResult, ...],  # one per engine
-          "tactic": str,
-        }
+    ``engine_models``: optional per-engine model override, e.g.
+        {"claude": "claude-opus-4-6", "gemini": "gemini-3.1-pro-preview"}
+
+    Returns a list of dicts: ``{"versions": [GenerationResult, ...], "tactic": str}``.
     """
     user_prompt = _make_user_prompt(
         tactic=tactic,
@@ -870,6 +1014,17 @@ def generate_batch(
         extra=extra_instructions,
         count=count,
     )
+
+    if count > 1:
+        seed = _user_style_seed(
+            user_id=user_id,
+            project_id=project_id,
+            nonce=int(time.time()) & 0xFFFF,
+        )
+        slot_coords = _assign_slot_coordinates(count, seed)
+        coords_block = _build_slot_coordinates_block(slot_coords)
+        if coords_block:
+            user_prompt += "\n\n" + coords_block
 
     dedup_block = _build_dedup_instruction([], historical_titles)
     if dedup_block:
@@ -912,10 +1067,102 @@ def generate_batch(
                 progress_callback(done / total, f"已完成 {done}/{total} 个引擎…")
 
     # Assemble: slot i gets one version per engine
-    return [
+    slots = [
         {"versions": [engine_results[eng][i] for eng in engines], "tactic": tactic}
         for i in range(count)
     ]
+
+    if (
+        getattr(config, "ENABLE_COMPLIANCE_CHECK", True)
+        and _has_compliance_rules(system_prompt)
+    ):
+        _apply_compliance_recheck(slots, system_prompt)
+
+    return slots
+
+
+# ── Compliance recheck ────────────────────────────────────────────────────
+
+_COMPLIANCE_SYSTEM = """\
+你是一个小红书文案合规复核员。你会收到：
+1. 本次生成的 System Prompt（含项目记忆、通用记忆、会话临时指令）
+2. 一批生成出的版本列表（标题 + 正文节选）
+
+任务：逐条检查每个版本是否违反了 System Prompt 中「项目记忆」「通用记忆」「当前会话临时指令」这三个段落里的任何硬性要求。只看这三类规则，不评判文案好坏。
+
+以 JSON 对象回复：
+{"violations": [{"index": <版本序号，从0开始>, "rule": "<被违反的规则原文>", "reason": "<简短说明>"}]}
+若无违规，回复 {"violations": []}。只返回 JSON，不要任何其他文字。"""
+
+
+def _has_compliance_rules(system_prompt: str) -> bool:
+    """Cheap check: does the assembled system prompt contain rule-type blocks?"""
+    markers = ("---项目记忆", "---通用记忆", "---当前会话临时指令")
+    return any(marker in system_prompt for marker in markers)
+
+
+def _apply_compliance_recheck(slots: list[dict], system_prompt: str) -> None:
+    """
+    Flag (and optionally regenerate) versions that violate the System Prompt's
+    memory / session-instruction rules.
+
+    Tags are written to ``version.token_usage["compliance_violation"]`` for the
+    UI to render. Regeneration only happens when ``COMPLIANCE_AUTO_REGEN`` is
+    enabled; otherwise this is a cheap, cost-bounded advisory pass.
+    """
+    # Flatten (slot_idx, engine, version) pairs
+    flat: list[tuple[int, str, GenerationResult]] = []
+    for si, slot in enumerate(slots):
+        for v in slot.get("versions", []):
+            if v.success:
+                flat.append((si, v.ai_engine, v))
+
+    if not flat:
+        return
+
+    lines = []
+    for i, (si, eng, v) in enumerate(flat):
+        body_preview = (v.body or "")[:180].split("\n")[0]
+        lines.append(f"[{i}] slot={si} engine={eng} 标题：{v.title}  正文节选：{body_preview}")
+    user_content = (
+        "【本次生成的 System Prompt】\n" + system_prompt.strip() + "\n\n"
+        "【需要复核的版本列表】\n" + "\n".join(lines)
+    )
+
+    try:
+        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
+        if config.ANTHROPIC_BASE_URL:
+            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
+        client = anthropic.Anthropic(**client_kwargs)
+        resp = _call_with_retry(lambda: client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=800,
+            system=_COMPLIANCE_SYSTEM,
+            messages=[{"role": "user", "content": user_content}],
+        ))
+        raw = resp.content[0].text.strip()
+        cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+        data = json.loads(cleaned)
+        violations = data.get("violations", []) if isinstance(data, dict) else []
+    except Exception:
+        return
+
+    for viol in violations:
+        try:
+            idx = int(viol.get("index", -1))
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= idx < len(flat):
+            continue
+        _, _, v = flat[idx]
+        tag = {
+            "rule": str(viol.get("rule", "")).strip(),
+            "reason": str(viol.get("reason", "")).strip(),
+        }
+        if isinstance(v.token_usage, dict):
+            v.token_usage["compliance_violation"] = tag
+        else:
+            v.token_usage = {"compliance_violation": tag}
 
 
 # ── Multi-role drafting (三省法 · 中书省) ──────────────────────────────────
@@ -1133,7 +1380,7 @@ def generate_batch_multi_role(
     count: int = 5,
     images: list | None = None,
     progress_callback=None,
-    historical_titles: list[str] | None = None,
+    historical_titles: list[dict] | list[str] | None = None,
     engines: list[str] | None = None,
     engine_models: dict[str, str] | None = None,
     use_thinking: bool = False,

@@ -106,7 +106,7 @@ CREATE POLICY IF NOT EXISTS versions_owner ON versions
         item_id IN (SELECT id FROM items WHERE user_id = auth.uid())
     );
 
--- Memories (project-level or global)
+-- Memories (project-level or account-level — 'global' scope is per-user across projects)
 CREATE TABLE IF NOT EXISTS memories (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     scope           TEXT NOT NULL CHECK (scope IN ('project','global')),
@@ -118,6 +118,18 @@ CREATE TABLE IF NOT EXISTS memories (
     user_id         UUID NOT NULL,
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
+-- Additive schema upgrades for session-level instructions + memory typing.
+-- Idempotent so existing deployments can re-run this block safely.
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS memory_type TEXT NOT NULL DEFAULT 'rule'
+        CHECK (memory_type IN ('rule','note','session'));
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS source_batch_id UUID REFERENCES batches(id) ON DELETE SET NULL;
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;
+CREATE INDEX IF NOT EXISTS memories_session_idx
+    ON memories(user_id, memory_type, expires_at)
+    WHERE memory_type = 'session';
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
 CREATE POLICY IF NOT EXISTS memories_owner ON memories
     USING (user_id = auth.uid());
@@ -365,54 +377,62 @@ def get_batch_item_counts(client: Client, batch_ids: list[str]) -> dict:
     return counts
 
 
-def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
+def get_recent_titles_and_openings(
+    client: Client, project_id: str, limit: int = 150
+) -> list[dict]:
     """
-    Fetch one representative title per *approved* content item for cross-batch
-    deduplication.  Only approved items are included so that unadopted /
-    pending content does not permanently block angles for future generation.
+    Fetch title + first-line opening of each content item across a wide recent
+    window, for cross-batch deduplication.
+
+    Covers the last 40 batches and all items regardless of status — rejected/
+    pending items still pollute future output if we let the model re-invent the
+    same angles.  Each entry is ``{"title": str, "opening": str}`` where opening
+    is the first non-empty line of the body, truncated to 25 characters.
     """
-    batches = list_batches(client, project_id, limit=10)
+    batches = list_batches(client, project_id, limit=40)
     if not batches:
         return []
     batch_ids = [b["id"] for b in batches]
 
     res = (
         client.table("items")
-        .select("id, status, best_version_id, versions(id, title, version_num)")
+        .select("id, status, best_version_id, versions(id, title, body, version_num)")
         .in_("batch_id", batch_ids)
-        .eq("status", "approved")
         .execute()
     )
 
-    titles: list[str] = []
+    out: list[dict] = []
     for item in (res.data or []):
         versions = item.get("versions", [])
         if not versions:
             continue
 
-        chosen_title: Optional[str] = None
-
-        # Use the designated best version if set
+        chosen = None
         best_vid = item.get("best_version_id")
         if best_vid:
             for v in versions:
                 if v.get("id") == best_vid:
-                    t = (v.get("title") or "").strip()
-                    if t and t != "（解析失败）":
-                        chosen_title = t
+                    chosen = v
                     break
+        if not chosen:
+            chosen = max(versions, key=lambda v: v.get("version_num", 0))
 
-        # Fallback: latest version by version_num
-        if not chosen_title:
-            latest = max(versions, key=lambda v: v.get("version_num", 0))
-            t = (latest.get("title") or "").strip()
-            if t and t != "（解析失败）":
-                chosen_title = t
+        title = (chosen.get("title") or "").strip()
+        if not title or title == "（解析失败）":
+            continue
 
-        if chosen_title:
-            titles.append(chosen_title)
+        body = (chosen.get("body") or "").strip()
+        first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
+        opening = first_line.strip()[:25]
 
-    return titles[:limit]
+        out.append({"title": title, "opening": opening})
+
+    return out[:limit]
+
+
+def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
+    """Backwards-compatible wrapper returning just titles."""
+    return [t["title"] for t in get_recent_titles_and_openings(client, project_id, limit=limit)]
 
 
 # ── Memory CRUD ────────────────────────────────────────────────────────────
@@ -553,6 +573,13 @@ def list_example_items(
     return examples
 
 
+def _is_rule_memory(row: dict) -> bool:
+    """True if a memory row should be treated as a durable rule (default for
+    rows predating the ``memory_type`` column)."""
+    mt = row.get("memory_type")
+    return mt is None or mt == "rule"
+
+
 def get_confirmed_memories(
     client: Client,
     user_id: str,
@@ -560,13 +587,95 @@ def get_confirmed_memories(
 ) -> tuple[list[dict], list[dict]]:
     """
     Returns (global_memories, project_memories) both filtered to 'confirmed'.
+
+    Session-typed memories are excluded — they load through
+    :func:`get_session_instructions` into a separate high-priority prompt slot.
     """
-    global_mems = list_memories(
-        client, user_id, scope="global", status="confirmed"
-    )
+    global_mems = [
+        m for m in list_memories(client, user_id, scope="global", status="confirmed")
+        if _is_rule_memory(m)
+    ]
     project_mems: list[dict] = []
     if project_id:
-        project_mems = list_memories(
-            client, user_id, scope="project", project_id=project_id, status="confirmed"
-        )
+        project_mems = [
+            m for m in list_memories(
+                client, user_id, scope="project",
+                project_id=project_id, status="confirmed",
+            )
+            if _is_rule_memory(m)
+        ]
     return global_mems, project_mems
+
+
+def get_session_instructions(
+    client: Client,
+    user_id: str,
+    project_id: Optional[str] = None,
+) -> list[dict]:
+    """
+    Fetch unexpired session-level instructions for the current user/project.
+
+    Session memories carry ad-hoc instructions that the user gave mid-flow
+    ("from now on avoid numbers in titles") — they live outside the frequency/
+    candidate/confirmed pipeline and inject at the highest priority of the
+    system prompt.  Returns [] if the ``memory_type`` column isn't present yet
+    (i.e. schema migration hasn't been run), so the feature degrades cleanly.
+    """
+    try:
+        q = (
+            client.table("memories")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("memory_type", "session")
+        )
+        if project_id:
+            q = q.or_(f"project_id.eq.{project_id},project_id.is.null")
+        res = q.order("created_at", desc=True).execute()
+    except Exception:
+        return []
+
+    rows = res.data or []
+    now_iso = datetime.utcnow().isoformat()
+    fresh: list[dict] = []
+    for row in rows:
+        expires = row.get("expires_at")
+        if expires and expires < now_iso:
+            continue
+        fresh.append(row)
+    return fresh
+
+
+def insert_session_instruction(
+    client: Client,
+    user_id: str,
+    content: str,
+    source_feedback: str = "",
+    project_id: Optional[str] = None,
+    source_batch_id: Optional[str] = None,
+    ttl_hours: int = 24,
+) -> Optional[dict]:
+    """
+    Insert a session-level memory row.  Returns None if the schema migration
+    hasn't run yet (so callers can silently skip the feature).
+    """
+    from datetime import timedelta
+    expires_at = (datetime.utcnow() + timedelta(hours=max(1, ttl_hours))).isoformat()
+    payload: dict[str, Any] = {
+        "scope": "project" if project_id else "global",
+        "content": content.strip(),
+        "source_feedback": source_feedback or "会话指令",
+        "user_id": user_id,
+        "frequency": 1,
+        "status": "confirmed",
+        "memory_type": "session",
+        "expires_at": expires_at,
+    }
+    if project_id:
+        payload["project_id"] = project_id
+    if source_batch_id:
+        payload["source_batch_id"] = source_batch_id
+    try:
+        res = client.table("memories").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception:
+        return None

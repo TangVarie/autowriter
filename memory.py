@@ -32,16 +32,22 @@ def build_system_prompt(
     calibration_notes: str = "",
     positive_examples: Optional[list[dict]] = None,
     negative_examples: Optional[list[dict]] = None,
+    session_instructions: Optional[list[dict]] = None,
 ) -> str:
     """
-    Assemble the final system prompt in the documented order:
+    Assemble the final system prompt.
+
+    Assembly order (lowest priority first, highest priority last — so the most
+    authoritative instructions are the last thing the model reads):
       1. Base system prompt (tactical framework)
       2. Tactic-specific suffix (if any)
-      3. Global memories
-      4. Project memories
+      3. Account-level memories (``scope='global'`` — per user, across projects)
+      4. Project-level memories
       5. Calibration notes (qualitative observations, not rules)
       6. Positive examples (few-shot: what good looks like)
       7. Negative examples (few-shot: what to avoid)
+      8. Session-level instructions — ad-hoc rules from the current conversation;
+         the highest priority tier, supersedes any lower-priority memory
     """
     parts: list[str] = [base_prompt.strip()]
 
@@ -79,7 +85,46 @@ def build_system_prompt(
             + "\n\n".join(ex_blocks)
         )
 
+    if session_instructions:
+        bullets = "\n".join(f"• {m['content']}" for m in session_instructions if m.get("content"))
+        if bullets:
+            parts.append(
+                "\n---当前会话临时指令（本轮最高优先级，高于项目记忆与通用记忆）---\n"
+                "这些是用户在本次对话中刚刚提出的要求；本轮所有产出必须严格遵守，直到用户改口。\n"
+                + bullets
+            )
+
     return "\n".join(parts)
+
+
+def record_session_instruction(
+    db_client: Client,
+    user_id: str,
+    text: str,
+    project_id: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    ttl_hours: int = 24,
+) -> Optional[dict]:
+    """
+    Persist an ad-hoc conversational instruction as a session-level memory.
+
+    Session memories are directly ``confirmed`` (no frequency threshold) because
+    the user explicitly said it; they carry an ``expires_at`` so they don't
+    pollute future batches forever.  Returns None if the schema migration for
+    session-level memories hasn't been applied yet.
+    """
+    clean = (text or "").strip()
+    if not clean:
+        return None
+    return db.insert_session_instruction(
+        db_client,
+        user_id=user_id,
+        content=clean,
+        source_feedback=clean,
+        project_id=project_id,
+        source_batch_id=batch_id,
+        ttl_hours=ttl_hours,
+    )
 
 
 # ── AI-based feedback classification ──────────────────────────────────────

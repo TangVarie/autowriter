@@ -85,6 +85,19 @@ MEMORY_AUTO_CONFIRM_THRESHOLD: int = int(
     os.environ.get("MEMORY_AUTO_CONFIRM_THRESHOLD", "3")
 )
 
+# ── Compliance recheck ────────────────────────────────────────────────────
+# When True, generate_batch runs a second Claude call after generation to
+# verify each version respected the active project memories and session
+# instructions. Violations are tagged in token_usage["compliance_violation"]
+# for UI surfacing — versions are NOT automatically regenerated unless
+# COMPLIANCE_AUTO_REGEN is also enabled (default off to control cost).
+ENABLE_COMPLIANCE_CHECK: bool = (
+    os.environ.get("ENABLE_COMPLIANCE_CHECK", "1") not in ("0", "false", "False")
+)
+COMPLIANCE_AUTO_REGEN: bool = (
+    os.environ.get("COMPLIANCE_AUTO_REGEN", "0") not in ("0", "false", "False")
+)
+
 # ── Image handling ─────────────────────────────────────────────────────────
 MAX_IMAGE_DIMENSION: int = int(os.environ.get("MAX_IMAGE_DIMENSION", "1568"))
 SUPPORTED_IMAGE_FORMATS: list[str] = ["jpg", "jpeg", "png", "webp"]

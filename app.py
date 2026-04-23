@@ -73,8 +73,9 @@ def _queue_worker(
             global_mems, project_mems = db.get_confirmed_memories(
                 db_client, user_id, project_id=project_id
             )
-            pos_examples = db.list_example_items(db_client, project_id, "positive", limit=5)
-            neg_examples = db.list_example_items(db_client, project_id, "negative", limit=3)
+            pos_examples  = db.list_example_items(db_client, project_id, "positive", limit=5)
+            neg_examples  = db.list_example_items(db_client, project_id, "negative", limit=3)
+            session_instr = db.get_session_instructions(db_client, user_id, project_id=project_id)
             full_system_prompt = mem_module.build_system_prompt(
                 base_prompt=base_prompt,
                 global_memories=global_mems,
@@ -83,6 +84,7 @@ def _queue_worker(
                 calibration_notes=project.get("calibration_notes") or "",
                 positive_examples=pos_examples or None,
                 negative_examples=neg_examples or None,
+                session_instructions=session_instr or None,
             )
 
             engines          = plan.get("engines", ["claude"])
@@ -113,7 +115,14 @@ def _queue_worker(
                 ai_engines=engines,
             )
             batch_id = batch["id"]
-            historical_titles = db.get_recent_titles(db_client, project_id)
+
+            if extra_instr and extra_instr.strip():
+                mem_module.record_session_instruction(
+                    db_client, user_id, extra_instr,
+                    project_id=project_id, batch_id=batch_id,
+                )
+
+            historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
 
             _total   = count * len(engines)
             _done_n  = [0]
@@ -155,6 +164,8 @@ def _queue_worker(
                     use_thinking=use_thinking,
                     engine_models=engine_models or None,
                     gemini_use_thinking=gemini_thinking,
+                    user_id=user_id,
+                    project_id=project_id,
                 )
 
             saved = 0
@@ -1336,6 +1347,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         pos_examples      = db.list_example_items(db_client, project_id, "positive", limit=5)
         neg_examples      = db.list_example_items(db_client, project_id, "negative", limit=3)
         calibration_notes = project.get("calibration_notes") or ""
+        session_instr     = db.get_session_instructions(db_client, user_id, project_id=project_id)
 
         tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
         full_system_prompt = mem_module.build_system_prompt(
@@ -1346,6 +1358,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             calibration_notes=calibration_notes,
             positive_examples=pos_examples or None,
             negative_examples=neg_examples or None,
+            session_instructions=session_instr or None,
         )
 
         combined_extra = extra_instr
@@ -1371,7 +1384,15 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         batch_id = batch["id"]
         status["batch_id"] = batch_id
 
-        historical_titles = db.get_recent_titles(db_client, project_id)
+        # Capture any ad-hoc instructions the user typed into extra_instructions
+        # so they persist into session memory for future generations this day.
+        if extra_instr and extra_instr.strip():
+            mem_module.record_session_instruction(
+                db_client, user_id, extra_instr,
+                project_id=project_id, batch_id=batch_id,
+            )
+
+        historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
 
         def _progress(pct: float, msg: str) -> None:
             status["progress"] = pct
@@ -1414,6 +1435,8 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 use_thinking=use_thinking,
                 engine_models=engine_models or None,
                 gemini_use_thinking=gemini_thinking,
+                user_id=user_id,
+                project_id=project_id,
             )
 
         saved_count = 0
@@ -2427,10 +2450,22 @@ def _run_iteration(
     use_thinking_override: bool | None = None,
 ) -> None:
     """Run one iteration for an item and save the new version."""
+    project_id = project["id"]
+    batch_id   = batch.get("id")
+
+    # Persist this iteration's feedback as a session-level instruction so it
+    # survives the Streamlit rerun and carries forward into the next batch.
+    if feedback and feedback.strip():
+        mem_module.record_session_instruction(
+            db_client, user_id, feedback,
+            project_id=project_id, batch_id=batch_id,
+        )
+
     base_prompt = project.get("system_prompt", "")
     global_mems, project_mems = db.get_confirmed_memories(
-        db_client, user_id, project_id=project["id"]
+        db_client, user_id, project_id=project_id
     )
+    session_instr = db.get_session_instructions(db_client, user_id, project_id=project_id)
     tactic = batch.get("tactic", "")
     tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic)
     full_system_prompt = mem_module.build_system_prompt(
@@ -2438,6 +2473,8 @@ def _run_iteration(
         global_memories=global_mems,
         project_memories=project_mems,
         tactic_suffix=tactic_suffix,
+        calibration_notes=project.get("calibration_notes") or "",
+        session_instructions=session_instr or None,
     )
 
     batch_params = batch.get("params") or {}
