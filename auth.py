@@ -31,14 +31,19 @@ _COOKIE_TTL_DAYS = 7
 
 def _cookie_manager():
     """
-    Return the single per-session CookieManager instance.  ``extra-streamlit-
-    components`` uses a stable component key so repeat calls don't create
-    duplicate iframes.  Returns None if the library isn't installed (graceful
-    degradation — auth still works, just not persistent across refresh).
+    Return the per-session CookieManager instance.  Streamlit raises a
+    "duplicate key" error if ``stx.CookieManager(key=...)`` is called more than
+    once with the same key during a single rerun, so we cache the instance in
+    ``st.session_state`` and reuse it across helpers.  The object is safe to
+    reuse across reruns — its methods re-register the component each call.
     """
     if not _COOKIES_AVAILABLE:
         return None
-    return stx.CookieManager(key="xhs_auth_cm")
+    cm = st.session_state.get("_xhs_cookie_mgr")
+    if cm is None:
+        cm = stx.CookieManager(key="xhs_auth_cm")
+        st.session_state["_xhs_cookie_mgr"] = cm
+    return cm
 
 
 def _persist_refresh_token(refresh_token: str) -> None:
