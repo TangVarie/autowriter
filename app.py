@@ -2634,14 +2634,25 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
 def _generate_calibration_notes_ui(project: dict, batch_id: str, items: list[dict]) -> None:
     """Ask AI to reflect on this batch and generate updated calibration notes."""
     calib_key = f"pending_calibration_{batch_id}"
-    existing = project.get("calibration_notes") or ""
+    existing = (project.get("calibration_notes") or "").strip()
+    approved_count = sum(1 for it in items if it.get("status") == "approved")
+    iterated_count = sum(1 for it in items if len(it.get("versions") or []) > 1)
+    if approved_count + iterated_count < 2:
+        st.info(
+            "本批次样本不足（需要至少 2 条已通过或已迭代的文案），"
+            "调教笔记保持不变。先完成更多审核 / 迭代再试。"
+        )
+        return
     with st.spinner("AI 正在分析本批次互动，生成调教笔记…"):
         try:
-            notes = mem_module.generate_calibration_notes(
+            notes = (mem_module.generate_calibration_notes(
                 project_name=project.get("name", ""),
                 existing_notes=existing,
                 items_with_versions=items,
-            )
+            ) or "").strip()
+            if not notes or notes == existing:
+                st.info("本批次未发现新的偏好信号，调教笔记保持不变。")
+                return
             st.session_state[calib_key] = notes
             st.rerun()
         except Exception as e:

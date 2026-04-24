@@ -313,7 +313,7 @@ def ingest_user_instruction(
     return {"action": "session", "result": row, "reason": decision.get("reason", "")}
 
 
-def _dedup_calibration_lines(text: str, max_chars: int = 800) -> str:
+def _dedup_calibration_lines(text: str, max_chars: int = 1200) -> str:
     """
     Line-level dedup for calibration notes.
 
@@ -514,6 +514,11 @@ _CALIBRATION_SYSTEM = """\
 - 捕捉用户说不清楚但行为里体现出来的隐性审美偏好
 - 适当保留之前笔记中仍然成立的观察，融入新的发现
 
+重要的保守原则：
+- 没有清晰信号的观察一律不加；宁可让笔记变短也不要凑字数
+- 样本不足、或看不出明显偏好时，直接返回输入里的「现有调教笔记」原文即可
+- 绝对不要基于单条文案就做通用性的风格判断，那是过拟合
+
 输出格式：纯文本，每条观察用「-」开头，不超过 15 条，总长不超过 600 字。
 只输出调教笔记正文，不要有任何标题或前缀说明。"""
 
@@ -534,6 +539,13 @@ def generate_calibration_notes(
 
     approved = [it for it in items_with_versions if it.get("status") == "approved"]
     iterated = [it for it in items_with_versions if len(it.get("versions", [])) > 1]
+
+    # Sample-size guard: refuse to generalise from too little data.  With
+    # fewer than two approved-or-iterated items in the batch, Claude tends
+    # to overfit (and fill to the 15-observation cap) on a single draft.
+    # Return existing notes unchanged so UI can surface "sample too small".
+    if len(approved) + len(iterated) < 2:
+        return existing_notes
 
     if approved:
         parts = []
