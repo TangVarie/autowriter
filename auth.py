@@ -253,6 +253,40 @@ def _friendly_auth_error(exc: Exception) -> str:
     return str(exc)
 
 
+def _auth_debug_lines(cm) -> list[str]:
+    """Return a bullet list describing the current state of the cookie-based
+    session restore pipeline.  Surfaced on the login page whenever the user
+    finds themselves bounced to it, so the root cause is visible without
+    trawling logs."""
+    lines: list[str] = []
+    lines.append(f"• cookie 库：{'已安装' if _COOKIES_AVAILABLE else '未安装（刷新就会掉登录）'}")
+    if not _COOKIES_AVAILABLE:
+        lines.append("  → 请确认 requirements.txt 里有 extra-streamlit-components，并在 Streamlit Cloud 上重新部署")
+        return lines
+    if cm is None:
+        lines.append("• cm 实例：为 None（异常）")
+        return lines
+    try:
+        cookies = cm.get_all()
+    except Exception as e:
+        lines.append(f"• cm.get_all() 抛错：{type(e).__name__}")
+        return lines
+    if cookies is None:
+        lines.append("• cookies 状态：iframe 还没回传（正常情况下会自动再 rerun 一次）")
+        return lines
+    if not cookies:
+        lines.append("• cookies 状态：空（浏览器里没存过 refresh token，或首次登录）")
+        return lines
+    lines.append(f"• cookies 状态：已就绪，共 {len(cookies)} 个")
+    rt = cookies.get(_COOKIE_NAME)
+    if not rt:
+        lines.append(f"• {_COOKIE_NAME}：未找到（上次登录写 cookie 失败了？）")
+    else:
+        lines.append(f"• {_COOKIE_NAME}：存在（首 8 字：{str(rt)[:8]}…）")
+        lines.append("  → refresh_session 应该能恢复，但失败了。可能是 token 已被 Supabase 撤销")
+    return lines
+
+
 def _render_login_page(cm) -> None:
     """Render the login / registration form — studio two-column landing."""
     # Trim page top padding for the login screen only
@@ -346,6 +380,12 @@ def _render_login_page(cm) -> None:
                         st.rerun()
                 except Exception as exc:
                     st.error(f"注册失败：{_friendly_auth_error(exc)}")
+
+    # Diagnostic panel — why did we end up on the login page?  Visible under
+    # an expander so it doesn't clutter the normal first-login experience.
+    with st.expander("🔧 登录持久化诊断（刷新后掉登录？展开看原因）", expanded=False):
+        for line in _auth_debug_lines(cm):
+            st.caption(line)
 
 
 def _store_session(result: dict, cm=None) -> None:
