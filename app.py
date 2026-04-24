@@ -2356,15 +2356,13 @@ def _render_single_version(version: dict) -> None:
     raw_text = version.get("raw_text", "")
 
     title_len = len(title)
-    len_cls   = "len-ok" if 15 <= title_len <= 22 else "len-bad"
-    len_tip   = "✓ 长度适中" if 15 <= title_len <= 22 else f"⚠ {title_len} 字（建议 15-22）"
 
     safe_title = _html.escape(title)
     safe_body  = _html.escape(body)
 
     st.markdown(
         f"<div class='copy-title'>{safe_title}</div>"
-        f"<div class='copy-meta'><span class='{len_cls}'>{len_tip}</span></div>"
+        f"<div class='copy-meta'><span class='len-neutral'>{title_len} 字</span></div>"
         f"<div class='copy-body'>{safe_body}</div>",
         unsafe_allow_html=True,
     )
