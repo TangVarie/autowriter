@@ -295,9 +295,13 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
         with c1:
             if st.button("✅ 用整理后的版本替换", use_container_width=True):
                 mem_module.save_calibration_notes(client, project["id"], preview)
-                # reset the textarea seed so the saved value shows on next render
-                st.session_state["calibration_notes_textarea"] = preview
-                del st.session_state[tidy_key]
+                # Drop the textarea's cached state — Streamlit forbids
+                # assigning to a widget's session_state key after the widget
+                # has already rendered in this run.  Popping is allowed, and
+                # the next rerun will repopulate via ``setdefault`` using the
+                # freshly-saved project.calibration_notes value.
+                st.session_state.pop("calibration_notes_textarea", None)
+                st.session_state.pop(tidy_key, None)
                 st.success("已替换并保存。")
                 st.rerun()
         with c2:
