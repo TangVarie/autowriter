@@ -2071,7 +2071,7 @@ def page_review(project: dict) -> None:
         save_col, discard_col = st.columns(2)
         with save_col:
             if st.button("💾 保存到项目设置", key=f"save_calib_{batch_id}", use_container_width=True):
-                db.update_project(db_client, project["id"], {"calibration_notes": edited})
+                mem_module.save_calibration_notes(db_client, project["id"], edited)
                 del st.session_state[calib_key]
                 st.success("调教笔记已保存，下次生成时生效。")
                 st.rerun()
@@ -2369,13 +2369,18 @@ def _render_single_version(version: dict) -> None:
     # code-block copy icon gives one-click copy of everything at once.
     if title or body:
         with st.expander("📋 复制全文（标题 + 正文 + 标签）", expanded=False):
-            kw_line = " ".join(f"#{k}" for k in keywords) if keywords else ""
-            combined = title
+            parts: list[str] = []
+            if title:
+                parts.append(f"【标题】\n{title}")
             if body:
-                combined = f"{combined}\n\n{body}" if combined else body
-            if kw_line:
-                combined = f"{combined}\n\n{kw_line}" if combined else kw_line
-            st.code(combined, language=None)
+                kw_line = " ".join(f"#{k}" for k in keywords) if keywords else ""
+                body_block = f"【正文】\n{body}"
+                if kw_line:
+                    body_block += f"\n\n{kw_line}"
+                parts.append(body_block)
+            elif keywords:
+                parts.append(" ".join(f"#{k}" for k in keywords))
+            st.code("\n\n".join(parts), language=None)
 
     if not title and raw_text:
         with st.expander("⚠️ 解析失败 — 查看原始 AI 输出", expanded=True):
@@ -2620,7 +2625,7 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
                 existing_notes=existing,
                 items_with_versions=items,
             )
-            db.update_project(db_client, project["id"], {"calibration_notes": notes})
+            mem_module.save_calibration_notes(db_client, project["id"], notes)
             st.toast("🧠 调教笔记已自动更新（太子学习完成）")
     except Exception:
         pass  # 静默失败，不影响主流程

@@ -313,6 +313,63 @@ def ingest_user_instruction(
     return {"action": "session", "result": row, "reason": decision.get("reason", "")}
 
 
+def _dedup_calibration_lines(text: str, max_chars: int = 800) -> str:
+    """
+    Line-level dedup for calibration notes.
+
+    Multiple writers can add observations (manual-refine auto update, per-
+    iteration incremental, full-batch reflection, merger's taste path, user's
+    manual save); each path believes it's "merging" but without guarantees.
+    This normalises every persisted copy: strip bullet prefixes, drop near-
+    exact duplicates (first 15 normalised chars as the key), cap at
+    ``max_chars`` by dropping the oldest survivors.
+    """
+    if not text:
+        return ""
+    lines = text.split("\n")
+    seen: set[str] = set()
+    clean_lines: list[str] = []
+    for raw in lines:
+        stripped = raw.strip().lstrip("-•·*· ").strip()
+        if not stripped:
+            continue
+        key = " ".join(stripped.split())[:15].lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        clean_lines.append(f"- {stripped}")
+
+    if not clean_lines:
+        return ""
+
+    joined = "\n".join(clean_lines)
+    while len(joined) > max_chars and len(clean_lines) > 1:
+        clean_lines.pop(0)  # drop oldest
+        joined = "\n".join(clean_lines)
+    return joined
+
+
+def save_calibration_notes(
+    db_client: Client,
+    project_id: str,
+    notes: str,
+) -> str:
+    """
+    Single choke point for writing ``projects.calibration_notes``.  Runs
+    ``_dedup_calibration_lines`` first so any writer gets the same invariant
+    enforced regardless of whether it's the merger's taste path, the per-
+    iteration incremental update, the diff-from-manual-edit path, the full-
+    batch reflection, or a user's manual save from the preview editor.
+    Returns the deduped text that was persisted.
+    """
+    deduped = _dedup_calibration_lines(notes or "")
+    try:
+        db.update_project(db_client, project_id, {"calibration_notes": deduped})
+    except Exception:
+        pass
+    return deduped
+
+
 def _append_taste_to_calibration(
     db_client: Client,
     project_id: str,
@@ -320,7 +377,7 @@ def _append_taste_to_calibration(
 ) -> None:
     """Append a single taste observation to the project's calibration notes.
 
-    Keeps the notes bounded (≤ 600 characters total) by deduping near-exact
+    Keeps the notes bounded (≤ 800 characters total) by deduping near-exact
     matches and trimming the oldest entries once capacity is exceeded.
     """
     try:
@@ -331,25 +388,12 @@ def _append_taste_to_calibration(
         return
 
     existing = (proj.get("calibration_notes") or "").rstrip()
-    line = f"- {observation.lstrip('-• ').strip()}"
-
-    # Skip if the observation already appears (case-insensitive, whitespace-collapsed).
-    existing_norm = " ".join(existing.split())
-    if observation[:20] and observation[:20] in existing_norm:
+    line = observation.lstrip("-•· ").strip()
+    if not line:
         return
 
-    merged = (existing + "\n" + line) if existing else line
-    if len(merged) > 800:
-        # Drop oldest lines until we fit.  Lines are stored newest-last.
-        lines = merged.split("\n")
-        while lines and len("\n".join(lines)) > 800:
-            lines.pop(0)
-        merged = "\n".join(lines)
-
-    try:
-        db.update_project(db_client, project_id, {"calibration_notes": merged})
-    except Exception:
-        pass
+    merged = (existing + "\n- " + line) if existing else f"- {line}"
+    save_calibration_notes(db_client, project_id, merged)
 
 
 # ── AI-based feedback classification ──────────────────────────────────────
@@ -609,7 +653,7 @@ def update_calibration_from_iteration(
     if not updated or updated == existing:
         return None
     try:
-        db.update_project(db_client, project_id, {"calibration_notes": updated})
+        updated = save_calibration_notes(db_client, project_id, updated)
     except Exception:
         return None
     return updated
@@ -689,7 +733,7 @@ def update_calibration_from_manual_edit(
     if not updated or updated == existing:
         return None
     try:
-        db.update_project(db_client, project_id, {"calibration_notes": updated})
+        updated = save_calibration_notes(db_client, project_id, updated)
     except Exception:
         return None
     return updated
