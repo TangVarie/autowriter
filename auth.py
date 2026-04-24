@@ -76,6 +76,11 @@ def _load_cookies_once(cm):
 
 
 def _persist_refresh_token(cm, refresh_token: str) -> None:
+    """Write the refresh token cookie.  ``cm.set()`` is asynchronous: it posts
+    to an iframe which then calls ``document.cookie = ...``; if the Streamlit
+    script reruns before the iframe finishes, the write is aborted and the
+    cookie is silently dropped.  Callers should pair this with
+    :func:`wait_for_cookie_write` before any ``st.rerun()``."""
     if cm is None or not refresh_token:
         return
     try:
@@ -87,6 +92,14 @@ def _persist_refresh_token(cm, refresh_token: str) -> None:
         )
     except Exception:
         pass
+
+
+def wait_for_cookie_write(seconds: float = 0.6) -> None:
+    """Block briefly so the stx iframe's JS can finish writing the cookie
+    before the Streamlit script reruns.  600 ms is long enough on typical
+    connections without being noticeable to the user."""
+    import time
+    time.sleep(max(0.1, seconds))
 
 
 def _clear_refresh_cookie(cm) -> None:
@@ -343,6 +356,7 @@ def _render_login_page(cm, cookies=None) -> None:
                 try:
                     result = sign_in(email, password)
                     _store_session(result, cm=cm)
+                    wait_for_cookie_write()
                     st.rerun()
                 except Exception as exc:
                     st.error(_friendly_auth_error(exc))
@@ -373,6 +387,7 @@ def _render_login_page(cm, cookies=None) -> None:
                     else:
                         # Email confirmation is disabled — session is immediately available.
                         _store_session(result, cm=cm)
+                        wait_for_cookie_write()
                         st.success("注册成功！")
                         st.rerun()
                 except Exception as exc:
