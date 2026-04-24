@@ -797,8 +797,9 @@ def render_memory_manager(
 
     cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 40) or 40)
     st.caption(
-        f"每次生成会注入每个范围下最多 {cap} 条已确认规则（按使用频次 + 近期性排序）。"
-        f"超出部分仍在下方列表里可查可删，只是暂不参与当次生成。"
+        f"每次生成会向 AI 注入每个范围下最多 {cap} 条规则："
+        f"最近 7 天新增的规则必入，剩余名额按使用频次填充老规则。"
+        f"列表里看到但没进 prompt 的不会丢失，只是暂不参与当次生成。"
     )
 
     tab_global, tab_project = st.tabs(["通用记忆", f"项目记忆（{project_name or '当前项目'}）"])

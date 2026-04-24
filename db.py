@@ -611,21 +611,45 @@ def _is_rule_memory(row: dict) -> bool:
 def _rank_memories_for_injection(mems: list[dict], cap: int) -> list[dict]:
     """Rank rule memories for System Prompt injection.
 
-    Sorted by ``frequency DESC`` (strong, oft-repeated rules win) with
-    ``created_at DESC`` as tiebreaker so a new frequency-1 rule still beats
-    an equally old stale one.  Returned list is truncated to ``cap`` items;
-    values ≤ 0 disable the cap entirely.
+    Two-tier selection so that fresh captures — especially the frequency=1
+    rules created by the merger's ``rule`` path — are never starved by a
+    backlog of older high-frequency rules:
+
+      1. Rules created within the last 7 days are always included (newest
+         first).  This guarantees "I just said it → it took effect".
+      2. Remaining slots (cap - len(recent)) are filled from older rules by
+         ``frequency DESC`` then ``created_at DESC``.
+
+    Hard ceiling at ``cap``: in the pathological case where the user creates
+    more than ``cap`` rules in a week, we still truncate (newest kept).
     """
     if not mems:
         return mems
-    ordered = sorted(
-        mems,
+    if not cap or cap <= 0:
+        return sorted(
+            mems,
+            key=lambda m: (int(m.get("frequency") or 0), str(m.get("created_at") or "")),
+            reverse=True,
+        )
+
+    from datetime import datetime, timezone, timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+    recent: list[dict] = []
+    older: list[dict] = []
+    for m in mems:
+        created = str(m.get("created_at") or "")
+        (recent if created >= cutoff else older).append(m)
+
+    recent.sort(key=lambda m: str(m.get("created_at") or ""), reverse=True)
+    older.sort(
         key=lambda m: (int(m.get("frequency") or 0), str(m.get("created_at") or "")),
         reverse=True,
     )
-    if cap and cap > 0:
-        return ordered[:cap]
-    return ordered
+
+    recent = recent[:cap]
+    remaining = max(0, cap - len(recent))
+    return recent + older[:remaining]
 
 
 def get_confirmed_memories(
