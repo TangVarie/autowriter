@@ -46,27 +46,33 @@ def _make_cookie_manager():
     return stx.CookieManager(key="xhs_auth_cm")
 
 
-def _cookie_is_loading(cm) -> bool:
-    """True when stx's iframe has yet to respond with the browser's cookie
-    jar.  On first render after a browser refresh, ``cm.cookies`` is ``None``
-    until the custom component posts back; the post triggers an automatic
-    rerun, at which point cookies become readable."""
-    if cm is None:
-        return False
-    try:
-        # stx exposes the full dict via get_all(); None ⇒ iframe not yet responded.
-        return cm.get_all() is None
-    except Exception:
-        return False
+# Sentinel returned by ``_load_cookies_once`` when the iframe hasn't posted
+# back yet — callers treat this as "wait, don't show login".
+_COOKIES_LOADING = object()
 
 
-def _read_refresh_cookie(cm) -> Optional[str]:
+def _load_cookies_once(cm):
+    """Call ``cm.get_all()`` **exactly once** per rerun and return the cached
+    result.
+
+    stx's ``get_all`` / ``get`` / ``set`` / ``delete`` each register a
+    component with Streamlit; calling ``get_all`` twice in one rerun raises
+    StreamlitDuplicateElementKey.  We stash the dict on the cm object itself
+    (``_xhs_cookies_cache``) so helpers further down the request can reuse it
+    without re-triggering the component."""
     if cm is None:
-        return None
+        return {}
+    cached = getattr(cm, "_xhs_cookies_cache", None)
+    if cached is not None:
+        return cached
     try:
-        return cm.get(_COOKIE_NAME)
+        cookies = cm.get_all()
     except Exception:
-        return None
+        cookies = {}
+    if cookies is None:
+        return _COOKIES_LOADING
+    setattr(cm, "_xhs_cookies_cache", cookies)
+    return cookies
 
 
 def _persist_refresh_token(cm, refresh_token: str) -> None:
@@ -170,17 +176,14 @@ def _try_refresh_session(cm) -> bool:
     return False
 
 
-def _try_cookie_restore(cm) -> bool:
-    """Re-hydrate the session from the refresh token cookie.  Assumes the
-    caller has already decided cookies are ready (``_cookie_is_loading`` is
-    False) — this just reads the token and attempts a refresh.  Returns True
-    iff a session was successfully restored."""
-    token = _read_refresh_cookie(cm)
-    if not token:
+def _try_cookie_restore(cm, refresh_token: Optional[str]) -> bool:
+    """Re-hydrate the session from a refresh-token string already read out of
+    the cookies dict.  Returns True iff a session was successfully restored."""
+    if not refresh_token:
         return False
     try:
         client = get_supabase_client()
-        res = client.auth.refresh_session(token)
+        res = client.auth.refresh_session(refresh_token)
         if res.session and res.user:
             _store_session({"session": res.session, "user": res.user}, cm=cm)
             return True
@@ -203,19 +206,18 @@ def require_auth() -> tuple[Client, dict]:
     Returns (authenticated_client, user_dict).
     """
     cm = _make_cookie_manager()
+    cookies = _load_cookies_once(cm)
 
     if "current_user" not in st.session_state:
-        if _cookie_is_loading(cm):
-            # The stx iframe hasn't posted back yet.  Show a placeholder and
-            # stop — when the component responds Streamlit will rerun the
-            # script and cookies will be readable.  Critically, we do NOT
-            # render the login page here; otherwise the user sees login
-            # flash every refresh even though cookie restore is about to
-            # succeed.
+        if cookies is _COOKIES_LOADING:
+            # stx's iframe hasn't posted back yet; Streamlit will rerun after
+            # the component responds.  Show a placeholder instead of flashing
+            # the login page — otherwise every refresh looks like a logout.
             st.caption("正在恢复登录状态…")
             st.stop()
-        if not _try_cookie_restore(cm):
-            _render_login_page(cm)
+        refresh_token = cookies.get(_COOKIE_NAME) if isinstance(cookies, dict) else None
+        if not _try_cookie_restore(cm, refresh_token):
+            _render_login_page(cm, cookies)
             st.stop()
 
     client = get_authenticated_client()
@@ -225,7 +227,7 @@ def require_auth() -> tuple[Client, dict]:
             client = get_authenticated_client()
         if client is None:
             sign_out()
-            _render_login_page(cm)
+            _render_login_page(cm, cookies)
             st.stop()
     return client, st.session_state["current_user"]
 
@@ -253,11 +255,11 @@ def _friendly_auth_error(exc: Exception) -> str:
     return str(exc)
 
 
-def _auth_debug_lines(cm) -> list[str]:
+def _auth_debug_lines(cm, cookies) -> list[str]:
     """Return a bullet list describing the current state of the cookie-based
-    session restore pipeline.  Surfaced on the login page whenever the user
-    finds themselves bounced to it, so the root cause is visible without
-    trawling logs."""
+    session restore pipeline.  ``cookies`` is the already-loaded dict from
+    ``_load_cookies_once`` (never call ``cm.get_all`` again here — we'd hit
+    stx's duplicate-key guard)."""
     lines: list[str] = []
     lines.append(f"• cookie 库：{'已安装' if _COOKIES_AVAILABLE else '未安装（刷新就会掉登录）'}")
     if not _COOKIES_AVAILABLE:
@@ -266,15 +268,10 @@ def _auth_debug_lines(cm) -> list[str]:
     if cm is None:
         lines.append("• cm 实例：为 None（异常）")
         return lines
-    try:
-        cookies = cm.get_all()
-    except Exception as e:
-        lines.append(f"• cm.get_all() 抛错：{type(e).__name__}")
-        return lines
-    if cookies is None:
+    if cookies is _COOKIES_LOADING:
         lines.append("• cookies 状态：iframe 还没回传（正常情况下会自动再 rerun 一次）")
         return lines
-    if not cookies:
+    if not isinstance(cookies, dict) or not cookies:
         lines.append("• cookies 状态：空（浏览器里没存过 refresh token，或首次登录）")
         return lines
     lines.append(f"• cookies 状态：已就绪，共 {len(cookies)} 个")
@@ -283,11 +280,11 @@ def _auth_debug_lines(cm) -> list[str]:
         lines.append(f"• {_COOKIE_NAME}：未找到（上次登录写 cookie 失败了？）")
     else:
         lines.append(f"• {_COOKIE_NAME}：存在（首 8 字：{str(rt)[:8]}…）")
-        lines.append("  → refresh_session 应该能恢复，但失败了。可能是 token 已被 Supabase 撤销")
+        lines.append("  → refresh_session 尝试失败。可能是 token 已被 Supabase 撤销")
     return lines
 
 
-def _render_login_page(cm) -> None:
+def _render_login_page(cm, cookies=None) -> None:
     """Render the login / registration form — studio two-column landing."""
     # Trim page top padding for the login screen only
     st.markdown(
@@ -384,7 +381,7 @@ def _render_login_page(cm) -> None:
     # Diagnostic panel — why did we end up on the login page?  Visible under
     # an expander so it doesn't clutter the normal first-login experience.
     with st.expander("🔧 登录持久化诊断（刷新后掉登录？展开看原因）", expanded=False):
-        for line in _auth_debug_lines(cm):
+        for line in _auth_debug_lines(cm, cookies):
             st.caption(line)
 
 
