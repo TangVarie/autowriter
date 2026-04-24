@@ -2632,17 +2632,33 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
 
 
 def _generate_calibration_notes_ui(project: dict, batch_id: str, items: list[dict]) -> None:
-    """Ask AI to reflect on this batch and generate updated calibration notes."""
+    """Ask AI to reflect on this batch's *explicit* user signals and update
+    calibration notes.  Only iteration feedback and manual-edit diffs count —
+    bare "approved" drafts are ignored by the generator."""
     calib_key = f"pending_calibration_{batch_id}"
     existing = (project.get("calibration_notes") or "").strip()
-    approved_count = sum(1 for it in items if it.get("status") == "approved")
-    iterated_count = sum(1 for it in items if len(it.get("versions") or []) > 1)
-    if approved_count + iterated_count < 2:
+
+    # Count explicit signals for the pre-flight message.
+    signal_count = 0
+    for it in items:
+        versions = sorted(it.get("versions") or [], key=lambda v: v.get("version_num", 0))
+        if len(versions) < 2:
+            continue
+        has_feedback = any(
+            (v.get("feedback") or "").strip() and v.get("feedback") != "手动精修"
+            for v in versions[1:]
+        )
+        has_manual_edit = (versions[-1].get("ai_engine") or "").lower() == "manual"
+        if has_feedback or has_manual_edit:
+            signal_count += 1
+
+    if signal_count == 0:
         st.info(
-            "本批次样本不足（需要至少 2 条已通过或已迭代的文案），"
-            "调教笔记保持不变。先完成更多审核 / 迭代再试。"
+            "本批次没有可学习的显式信号（需要至少 1 条带文字反馈的迭代，"
+            "或一次手动精修）。调教笔记保持不变。"
         )
         return
+
     with st.spinner("AI 正在分析本批次互动，生成调教笔记…"):
         try:
             notes = (mem_module.generate_calibration_notes(
@@ -2651,7 +2667,7 @@ def _generate_calibration_notes_ui(project: dict, batch_id: str, items: list[dic
                 items_with_versions=items,
             ) or "").strip()
             if not notes or notes == existing:
-                st.info("本批次未发现新的偏好信号，调教笔记保持不变。")
+                st.info("本批次的显式信号与现有笔记一致，调教笔记保持不变。")
                 return
             st.session_state[calib_key] = notes
             st.rerun()

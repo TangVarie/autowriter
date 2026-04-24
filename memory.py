@@ -504,23 +504,24 @@ def ingest_batch_feedbacks(
 # ── AI-generated calibration notes ────────────────────────────────────────
 
 _CALIBRATION_SYSTEM = """\
-你是一个内容策划顾问，负责帮创作者形成对 AI 的「品味校准」。
+你是一个内容策划顾问，负责维护项目的「调教笔记」。调教笔记是项目级感受性偏好的集合。
 
-你会收到一批内容创作的互动记录（原始生成、用户反馈、迭代修改、最终通过情况），以及之前已有的调教笔记（如有）。
+你会收到现有调教笔记，以及来自本批次的用户显式信号（仅限两类）：
+  1. 迭代反馈：用户在改写某条时写下的反馈文字 + 前后版本
+  2. 手动精修差异：AI 原版 vs 用户手动改后的版本
 
-你的任务是生成/更新「调教笔记」。调教笔记的特点：
-- 不是规则列表，而是感受性的观察（例："用户喜欢有温度的收尾，而不是 call-to-action 式结尾"）
-- 关注「为什么这样被接受/拒绝」，而不是「什么词不能用」（那是记忆的职责）
-- 捕捉用户说不清楚但行为里体现出来的隐性审美偏好
-- 适当保留之前笔记中仍然成立的观察，融入新的发现
+你的任务是更新调教笔记。硬约束：
 
-重要的保守原则：
+- **只能**从上述两类显式信号里提炼观察
+- **不能**从单纯的"已通过"文案里推断风格偏好（通过只等于"可用"，不等于"用户喜欢这个风格"）
+- **不能**对用户没有改、没有反馈、没有提及的细节下结论
+- **不能**泛化"小红书通用经验"，调教笔记只记录这个用户/项目特有的偏好
 - 没有清晰信号的观察一律不加；宁可让笔记变短也不要凑字数
-- 样本不足、或看不出明显偏好时，直接返回输入里的「现有调教笔记」原文即可
-- 绝对不要基于单条文案就做通用性的风格判断，那是过拟合
+- 若本批次信号与现有笔记冲突，以新信号为准；若与现有某条同义，不新增
+- 若本批次没有足够强的信号，直接返回「现有调教笔记」原文，不要硬凑
 
-输出格式：纯文本，每条观察用「-」开头，不超过 15 条，总长不超过 600 字。
-只输出调教笔记正文，不要有任何标题或前缀说明。"""
+输出格式：纯文本，每条观察用「-」开头，最多 15 条，总长 ≤ 600 字。
+只输出调教笔记正文，不要有任何标题、前言、解释、JSON 或 Markdown。"""
 
 
 def generate_calibration_notes(
@@ -535,52 +536,76 @@ def generate_calibration_notes(
     (sorted ascending by version_num; each version has title, body, feedback).
     Returns updated calibration notes as plain text.
     """
-    sections: list[str] = []
+    # Only feed Claude explicit user signals — things the user has demonstrably
+    # reacted to.  Feeding unchanged-and-unreferenced "approved" drafts invites
+    # Claude to invent style rules from incidental choices.  Two signal types:
+    #   1. iteration chains that carry feedback text between versions
+    #   2. manual-edit diffs (latest version has ai_engine='manual')
+    iterated_with_feedback: list[dict] = []
+    manual_edits: list[tuple[dict, dict]] = []
 
-    approved = [it for it in items_with_versions if it.get("status") == "approved"]
-    iterated = [it for it in items_with_versions if len(it.get("versions", [])) > 1]
+    for item in items_with_versions:
+        versions = sorted(item.get("versions") or [], key=lambda v: v.get("version_num", 0))
+        if len(versions) < 2:
+            continue
+        # Iteration chain with at least one non-manual feedback line
+        non_manual_feedback = [
+            v for v in versions[1:]
+            if v.get("feedback") and v.get("feedback").strip() and v.get("feedback") != "手动精修"
+        ]
+        if non_manual_feedback:
+            iterated_with_feedback.append(item)
+        # Manual edit: latest version is user-authored, preceded by an AI version
+        last = versions[-1]
+        if (last.get("ai_engine") or "").lower() == "manual":
+            prev = versions[-2]
+            manual_edits.append((prev, last))
 
-    # Sample-size guard: refuse to generalise from too little data.  With
-    # fewer than two approved-or-iterated items in the batch, Claude tends
-    # to overfit (and fill to the 15-observation cap) on a single draft.
-    # Return existing notes unchanged so UI can surface "sample too small".
-    if len(approved) + len(iterated) < 2:
+    if not iterated_with_feedback and not manual_edits:
+        # No explicit signals → leave notes untouched.  Unchanged drafts and
+        # bare "approved" marks don't count as teaching material.
         return existing_notes
 
-    if approved:
-        parts = []
-        for i, item in enumerate(approved[:8], 1):
-            vs = item.get("versions", [])
-            final = vs[-1] if vs else {}
-            title = final.get("title", "")
-            body = (final.get("body", "") or "")[:200].split("\n")[0]
-            parts.append(f"{i}. 标题：{title}\n   正文节选：{body}")
-        sections.append("【已通过文案】\n" + "\n\n".join(parts))
+    sections: list[str] = []
 
-    if iterated:
+    if iterated_with_feedback:
         chains = []
-        for item in iterated[:6]:
-            vs = sorted(item.get("versions", []), key=lambda v: v.get("version_num", 0))
+        for item in iterated_with_feedback[:6]:
+            vs = sorted(item.get("versions") or [], key=lambda v: v.get("version_num", 0))
             steps = []
             for v in vs:
-                fb = v.get("feedback", "")
+                fb = (v.get("feedback") or "").strip()
                 title = v.get("title", "")
                 body = (v.get("body", "") or "")[:100].split("\n")[0]
                 vn = v.get("version_num", "?")
-                if fb:
-                    steps.append(f"  v{vn}《{title}》\n  → 反馈：{fb}")
+                if fb and fb != "手动精修":
+                    steps.append(f"  v{vn}《{title}》\n  → 用户反馈：{fb}")
                 else:
-                    steps.append(f"  v{vn}《{title}》正文：{body}")
+                    steps.append(f"  v{vn}《{title}》正文节选：{body}")
             chains.append("\n".join(steps))
-        sections.append("【迭代过程记录】\n" + "\n\n---\n".join(chains))
+        sections.append("【用户显式反馈 · 迭代链】\n" + "\n\n---\n".join(chains))
 
-    if not sections:
-        return existing_notes  # 没有足够数据，保持原样
+    if manual_edits:
+        diffs = []
+        for prev, last in manual_edits[:6]:
+            diffs.append(
+                "AI 原版：\n"
+                f"  标题：{prev.get('title','')}\n"
+                f"  正文：{(prev.get('body','') or '')[:180].split(chr(10))[0]}\n"
+                "用户手动版：\n"
+                f"  标题：{last.get('title','')}\n"
+                f"  正文：{(last.get('body','') or '')[:180].split(chr(10))[0]}"
+            )
+        sections.append("【用户显式改写 · 精修差异】\n" + "\n\n---\n".join(diffs))
 
     user_content = f"项目名称：{project_name}\n\n"
     if existing_notes and existing_notes.strip():
         user_content += f"现有调教笔记：\n{existing_notes.strip()}\n\n"
-    user_content += "本次互动记录：\n" + "\n\n".join(sections) + "\n\n请生成更新后的调教笔记。"
+    user_content += (
+        "本批次的显式用户信号：\n"
+        + "\n\n".join(sections)
+        + "\n\n按系统提示更新调教笔记；只能基于上述显式信号做观察。"
+    )
 
     client = _make_anthropic_client()
     resp = client.messages.create(
