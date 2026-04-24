@@ -2296,7 +2296,7 @@ def _render_item_card(
                 new_kw = [k.strip() for k in re.split(r"[,，、\s]+", edit_kw_raw) if k.strip()]
                 new_title = edit_title.strip()
                 new_body  = edit_body.strip()
-                db.create_version(
+                new_version = db.create_version(
                     db_client,
                     item_id=item_id,
                     ai_engine="manual",
@@ -2319,7 +2319,14 @@ def _render_item_card(
                     )
                 except Exception:
                     pass
-                db.update_item_status(db_client, item_id, "approved")
+                # Mark the item approved AND point best_version_id at the
+                # newly-written manual version — so the card header, copy
+                # block and any subsequent "display_version" reads show the
+                # manual text, not the earlier AI draft.
+                db.update_item_status(
+                    db_client, item_id, "approved",
+                    best_version_id=new_version["id"],
+                )
                 st.success("已保存修改并标记为通过。调教笔记已同步更新。")
                 st.rerun()
 
@@ -2495,13 +2502,15 @@ def _run_iteration(
 
     # Route iteration feedback through the AI merger so it lands in the right
     # layer (merge / new rule / taste → calibration note / session).
+    ingest_action: Optional[str] = None
     if feedback and feedback.strip():
-        mem_module.ingest_user_instruction(
+        ingest_result = mem_module.ingest_user_instruction(
             db_client, user_id, feedback,
             project_id=project_id,
             project_name=project.get("name", ""),
             batch_id=batch_id,
         )
+        ingest_action = (ingest_result or {}).get("action")
 
     base_prompt = project.get("system_prompt", "")
     global_mems, project_mems = db.get_confirmed_memories(
@@ -2584,6 +2593,19 @@ def _run_iteration(
 
     # Reset item to pending so it gets reviewed again
     db.update_item_status(db_client, item["id"], "pending")
+
+    # Surface the merger's routing decision so the user can see whether
+    # their feedback became a permanent rule, a taste note, or a 24h
+    # session instruction — otherwise it feels like typed reasons vanish.
+    ingest_label = {
+        "rule":    "📌 反馈已沉淀为永久规则（记忆管理里可查）",
+        "merge":   "📌 反馈并入了已有规则（使用次数 +1）",
+        "taste":   "🎨 反馈已追加到调教笔记",
+        "session": "⏳ 反馈已加入 24h 会话指令",
+    }.get(ingest_action or "")
+    if ingest_label:
+        st.toast(ingest_label, icon="✅")
+
     st.success("迭代成功！")
     st.rerun()
 
