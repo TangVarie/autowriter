@@ -608,17 +608,43 @@ def _is_rule_memory(row: dict) -> bool:
     return mt is None or mt == "rule"
 
 
+def _rank_memories_for_injection(mems: list[dict], cap: int) -> list[dict]:
+    """Rank rule memories for System Prompt injection.
+
+    Sorted by ``frequency DESC`` (strong, oft-repeated rules win) with
+    ``created_at DESC`` as tiebreaker so a new frequency-1 rule still beats
+    an equally old stale one.  Returned list is truncated to ``cap`` items;
+    values ≤ 0 disable the cap entirely.
+    """
+    if not mems:
+        return mems
+    ordered = sorted(
+        mems,
+        key=lambda m: (int(m.get("frequency") or 0), str(m.get("created_at") or "")),
+        reverse=True,
+    )
+    if cap and cap > 0:
+        return ordered[:cap]
+    return ordered
+
+
 def get_confirmed_memories(
     client: Client,
     user_id: str,
     project_id: Optional[str] = None,
+    cap_per_scope: Optional[int] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Returns (global_memories, project_memories) both filtered to 'confirmed'.
+    Returns (global_memories, project_memories), both filtered to 'confirmed'
+    and capped at ``cap_per_scope`` items per scope (default pulled from
+    ``config.MAX_INJECTED_MEMORIES_PER_SCOPE``).
 
     Session-typed memories are excluded — they load through
     :func:`get_session_instructions` into a separate high-priority prompt slot.
     """
+    if cap_per_scope is None:
+        cap_per_scope = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 40) or 40)
+
     global_mems = [
         m for m in list_memories(client, user_id, scope="global", status="confirmed")
         if _is_rule_memory(m)
@@ -632,7 +658,10 @@ def get_confirmed_memories(
             )
             if _is_rule_memory(m)
         ]
-    return global_mems, project_mems
+    return (
+        _rank_memories_for_injection(global_mems, cap_per_scope),
+        _rank_memories_for_injection(project_mems, cap_per_scope),
+    )
 
 
 def get_session_instructions(

@@ -506,13 +506,19 @@ def ingest_batch_feedbacks(
 _CALIBRATION_SYSTEM = """\
 你是一个内容策划顾问，负责维护项目的「调教笔记」。调教笔记是项目级感受性偏好的集合。
 
-你会收到现有调教笔记，以及来自本批次的用户显式信号（仅限两类）：
-  1. 迭代反馈：用户在改写某条时写下的反馈文字 + 前后版本
-  2. 手动精修差异：AI 原版 vs 用户手动改后的版本
+你会收到现有调教笔记，以及来自本批次的用户显式信号（仅限两类，按权重从高到低）：
 
-你的任务是更新调教笔记。硬约束：
+  【信号 A · 最高权重】手动精修差异：AI 原版 vs 用户手动改后的版本
+    - 这是金标准：用户亲手把 AI 的写法改成他要的样子，每一处差异都是意图明确的偏好
+    - 重点提炼：改动的方向（加 / 删 / 换）、改的部位（标题 / 开头 / 结尾 / 句式 / 用词 / 标点）
+
+  【信号 B · 次要权重】迭代反馈：用户改写某条时写下的反馈文字 + 前后版本
+    - 用户的反馈可能表达含糊或带情绪，仅作辅助参考
+
+硬约束：
 
 - **只能**从上述两类显式信号里提炼观察
+- 同一条现象若 A 和 B 都有覆盖，以 A（手动差异）为准；若冲突，信 A 不信 B
 - **不能**从单纯的"已通过"文案里推断风格偏好（通过只等于"可用"，不等于"用户喜欢这个风格"）
 - **不能**对用户没有改、没有反馈、没有提及的细节下结论
 - **不能**泛化"小红书通用经验"，调教笔记只记录这个用户/项目特有的偏好
@@ -568,6 +574,21 @@ def generate_calibration_notes(
 
     sections: list[str] = []
 
+    # Signal A (highest-weight) first: manual精修 diffs.
+    if manual_edits:
+        diffs = []
+        for prev, last in manual_edits[:6]:
+            diffs.append(
+                "AI 原版：\n"
+                f"  标题：{prev.get('title','')}\n"
+                f"  正文：{(prev.get('body','') or '')[:220].split(chr(10))[0]}\n"
+                "用户手动版：\n"
+                f"  标题：{last.get('title','')}\n"
+                f"  正文：{(last.get('body','') or '')[:220].split(chr(10))[0]}"
+            )
+        sections.append("【信号 A · 手动精修差异（最高权重）】\n" + "\n\n---\n".join(diffs))
+
+    # Signal B (secondary): iteration feedback chains.
     if iterated_with_feedback:
         chains = []
         for item in iterated_with_feedback[:6]:
@@ -583,20 +604,7 @@ def generate_calibration_notes(
                 else:
                     steps.append(f"  v{vn}《{title}》正文节选：{body}")
             chains.append("\n".join(steps))
-        sections.append("【用户显式反馈 · 迭代链】\n" + "\n\n---\n".join(chains))
-
-    if manual_edits:
-        diffs = []
-        for prev, last in manual_edits[:6]:
-            diffs.append(
-                "AI 原版：\n"
-                f"  标题：{prev.get('title','')}\n"
-                f"  正文：{(prev.get('body','') or '')[:180].split(chr(10))[0]}\n"
-                "用户手动版：\n"
-                f"  标题：{last.get('title','')}\n"
-                f"  正文：{(last.get('body','') or '')[:180].split(chr(10))[0]}"
-            )
-        sections.append("【用户显式改写 · 精修差异】\n" + "\n\n---\n".join(diffs))
+        sections.append("【信号 B · 迭代反馈链（次要权重）】\n" + "\n\n---\n".join(chains))
 
     user_content = f"项目名称：{project_name}\n\n"
     if existing_notes and existing_notes.strip():
@@ -786,6 +794,12 @@ def render_memory_manager(
 ) -> None:
     """Render the full memory management page."""
     st.header("🧠 记忆管理")
+
+    cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 40) or 40)
+    st.caption(
+        f"每次生成会注入每个范围下最多 {cap} 条已确认规则（按使用频次 + 近期性排序）。"
+        f"超出部分仍在下方列表里可查可删，只是暂不参与当次生成。"
+    )
 
     tab_global, tab_project = st.tabs(["通用记忆", f"项目记忆（{project_name or '当前项目'}）"])
 

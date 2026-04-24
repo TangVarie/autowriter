@@ -98,6 +98,17 @@ ENABLE_MEMORY_MERGE: bool = (
     os.environ.get("ENABLE_MEMORY_MERGE", "1") not in ("0", "false", "False")
 )
 
+# Maximum number of confirmed rule-memories injected into each generation's
+# System Prompt per scope (global / project).  Projects that accrete hundreds
+# of rules over time would otherwise blow up every request and drown the
+# model's attention.  Memory Manager still shows all rules — this cap only
+# affects what the backend feeds the model.  Ranked: frequency DESC, then
+# created_at DESC so heavyweight rules stay in and recent additions are
+# prioritised over older low-frequency stragglers.
+MAX_INJECTED_MEMORIES_PER_SCOPE: int = int(
+    os.environ.get("MAX_INJECTED_MEMORIES_PER_SCOPE", "40")
+)
+
 # ── Compliance recheck ────────────────────────────────────────────────────
 # When True, generate_batch runs a second Claude call after generation to
 # verify each version respected the active project memories and session
@@ -122,7 +133,7 @@ MAX_ITERATION_ROUNDS: int = 3
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
-APP_VERSION: str = "2.5.6-studio"
+APP_VERSION: str = "2.6.0-studio"
 
 
 def validate_config() -> list[str]:
