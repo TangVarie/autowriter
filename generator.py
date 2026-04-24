@@ -1268,7 +1268,10 @@ def _select_best_drafts_batch(
 
     user_content = f"创作任务简报：\n{brief}\n\n" + "\n\n".join(slot_blocks)
 
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    _ck: dict = {"api_key": config.ANTHROPIC_API_KEY}
+    if config.ANTHROPIC_BASE_URL:
+        _ck["base_url"] = config.ANTHROPIC_BASE_URL
+    client = anthropic.Anthropic(**_ck)
     resp = client.messages.create(
         model=config.CLAUDE_MODEL,
         max_tokens=512,
@@ -1335,7 +1338,10 @@ def _refine_drafts_batch(
             f"关键词：{json.dumps(draft.keywords or [], ensure_ascii=False)}"
         )
         try:
-            client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+            _ck: dict = {"api_key": config.ANTHROPIC_API_KEY}
+            if config.ANTHROPIC_BASE_URL:
+                _ck["base_url"] = config.ANTHROPIC_BASE_URL
+            client = anthropic.Anthropic(**_ck)
             resp = client.messages.create(
                 model=model or config.CLAUDE_MODEL,
                 max_tokens=2048,

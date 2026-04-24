@@ -22,6 +22,16 @@ import config
 import db
 
 
+def _make_anthropic_client() -> anthropic.Anthropic:
+    """One consistent Anthropic client factory — always honours
+    ANTHROPIC_BASE_URL so backend utility calls route through the same proxy
+    as generation calls."""
+    client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
+    if config.ANTHROPIC_BASE_URL:
+        client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
+    return anthropic.Anthropic(**client_kwargs)
+
+
 # ── Prompt assembly ────────────────────────────────────────────────────────
 
 def build_system_prompt(
@@ -196,10 +206,7 @@ def classify_and_merge_feedback(
     )
 
     try:
-        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
-        if config.ANTHROPIC_BASE_URL:
-            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
-        client = anthropic.Anthropic(**client_kwargs)
+        client = _make_anthropic_client()
         resp = client.messages.create(
             model=config.CLAUDE_MODEL,
             max_tokens=400,
@@ -372,10 +379,7 @@ def classify_feedback(
         return "project", feedback_text
 
     try:
-        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
-        if config.ANTHROPIC_BASE_URL:
-            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
-        client = anthropic.Anthropic(**client_kwargs)
+        client = _make_anthropic_client()
         user_msg = feedback_text
         if project_name:
             user_msg = f"[当前项目：{project_name}]\n反馈：{feedback_text}"
@@ -522,7 +526,7 @@ def generate_calibration_notes(
         user_content += f"现有调教笔记：\n{existing_notes.strip()}\n\n"
     user_content += "本次互动记录：\n" + "\n\n".join(sections) + "\n\n请生成更新后的调教笔记。"
 
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    client = _make_anthropic_client()
     resp = client.messages.create(
         model=config.CLAUDE_MODEL,
         max_tokens=1024,
@@ -591,14 +595,91 @@ def update_calibration_from_iteration(
     )
 
     try:
-        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
-        if config.ANTHROPIC_BASE_URL:
-            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
-        client = anthropic.Anthropic(**client_kwargs)
+        client = _make_anthropic_client()
         resp = client.messages.create(
             model=config.CLAUDE_MODEL,
             max_tokens=900,
             system=_CALIB_INCREMENTAL_SYSTEM,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        updated = resp.content[0].text.strip()
+    except Exception:
+        return None
+
+    if not updated or updated == existing:
+        return None
+    try:
+        db.update_project(db_client, project_id, {"calibration_notes": updated})
+    except Exception:
+        return None
+    return updated
+
+
+# Diff-driven calibration: when a user manually rewrites an AI draft we
+# can't ask "what changed and why" — we can only compare the two texts.
+# Ask Claude to read both and extract any taste signals worth keeping.
+_CALIB_MANUAL_EDIT_SYSTEM = """\
+你是内容策划顾问，负责维护调教笔记。
+
+你收到一条 AI 原版文案 + 用户手动精修后的版本，以及现有调教笔记。
+不是简单的改错 —— 两者之间的每一处差异都反映了用户的隐性审美偏好。
+
+你要做的：
+1. 逐项对比：标题用词 / 开头切入 / 句式 / 结尾 / 标点 / 段落结构 / 情绪强度
+2. 把差异里可归纳的偏好提炼成 ≤ 40 字的观察，加进现有笔记
+3. 若与现有某条同义，不新增；若无显著信号，保留现有笔记原文
+
+输出纯文本的更新后调教笔记全文，每条用「-」开头，总长 ≤ 600 字。
+不要解释、不要前缀、不要 JSON，只输出笔记正文。"""
+
+
+def update_calibration_from_manual_edit(
+    db_client: Client,
+    project_id: str,
+    ai_title: str,
+    ai_body: str,
+    manual_title: str,
+    manual_body: str,
+) -> Optional[str]:
+    """
+    Diff an AI-generated draft against a user's hand-edited version and let
+    Claude extract taste signals into the project's calibration notes.
+
+    Called silently after the user saves a manual edit; failure returns None
+    and does not break the save flow.
+    """
+    if not config.ANTHROPIC_API_KEY:
+        return None
+    # Skip the call if there's effectively no change — not worth a token spend.
+    if (ai_title or "").strip() == (manual_title or "").strip() and \
+       (ai_body or "").strip() == (manual_body or "").strip():
+        return None
+    try:
+        proj = db.get_project(db_client, project_id)
+    except Exception:
+        return None
+    if not proj:
+        return None
+    existing = (proj.get("calibration_notes") or "").strip()
+
+    user_content = (
+        f"项目：{proj.get('name','')}\n\n"
+        + (f"现有调教笔记：\n{existing}\n\n" if existing else "现有调教笔记：(空)\n\n")
+        + "AI 原版：\n"
+        + f"  标题：{ai_title}\n"
+        + f"  正文：{(ai_body or '')[:400]}\n\n"
+        + "用户手动精修后：\n"
+        + f"  标题：{manual_title}\n"
+        + f"  正文：{(manual_body or '')[:400]}\n\n"
+        + "请对比差异，按系统提示更新调教笔记。"
+    )
+
+    try:
+        client = _make_anthropic_client()
+        resp = client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=900,
+            system=_CALIB_MANUAL_EDIT_SYSTEM,
             messages=[{"role": "user", "content": user_content}],
         )
         updated = resp.content[0].text.strip()

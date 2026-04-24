@@ -55,7 +55,10 @@ CLAUDE_MODELS: dict[str, str] = {
 }
 
 # Default model (can be overridden via env var)
-CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-3-sonnet-20240229"
+# claude-3-sonnet-20240229 was retired from most proxies; default to the
+# latest Sonnet GA so backend utility calls (memory merger / calibration /
+# compliance) keep working without manual config.
+CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-5-20250929"
 
 # ── Google Gemini ──────────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
@@ -119,7 +122,7 @@ MAX_ITERATION_ROUNDS: int = 3
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
-APP_VERSION: str = "2.5.2-studio"
+APP_VERSION: str = "2.5.3-studio"
 
 
 def validate_config() -> list[str]:
