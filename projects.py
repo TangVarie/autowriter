@@ -19,6 +19,7 @@ from supabase import Client
 
 import db
 import generator as gen_module
+import memory as mem_module
 
 
 # ── Streamlit session helpers ──────────────────────────────────────────────
@@ -259,9 +260,50 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
         key="calibration_notes_textarea",
         label_visibility="collapsed",
     )
-    if st.button("💾 保存调教笔记", use_container_width=True):
-        db.update_project(client, project["id"], {"calibration_notes": calibration_text})
-        st.success("调教笔记已保存，下次生成时生效。")
+
+    col_save, col_tidy = st.columns([1, 1])
+    with col_save:
+        if st.button("💾 保存调教笔记", use_container_width=True):
+            mem_module.save_calibration_notes(client, project["id"], calibration_text)
+            st.success("调教笔记已保存，下次生成时生效。")
+    with col_tidy:
+        if st.button(
+            "🧹 让 AI 整理（抽象化机械条目）",
+            use_container_width=True,
+            help="把'X → Y'这种机械替换条目重写成「方向 + 例子 + 原因」三层结构的方向性观察。预览后可选择保存。",
+        ):
+            with st.spinner("AI 正在整理笔记…"):
+                cleaned = mem_module.simplify_calibration_notes(calibration_text)
+            if not cleaned:
+                st.info("没有明显可抽象的条目，笔记保持不变。")
+            else:
+                st.session_state["_calib_tidy_preview"] = cleaned
+                st.rerun()
+
+    tidy_key = "_calib_tidy_preview"
+    if tidy_key in st.session_state:
+        st.markdown("---")
+        st.markdown("<div class='section-label'>整理后预览（可编辑再保存）</div>", unsafe_allow_html=True)
+        preview = st.text_area(
+            "整理后的调教笔记",
+            value=st.session_state[tidy_key],
+            height=240,
+            key=f"calib_tidy_edit_{project['id']}",
+            label_visibility="collapsed",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ 用整理后的版本替换", use_container_width=True):
+                mem_module.save_calibration_notes(client, project["id"], preview)
+                # reset the textarea seed so the saved value shows on next render
+                st.session_state["calibration_notes_textarea"] = preview
+                del st.session_state[tidy_key]
+                st.success("已替换并保存。")
+                st.rerun()
+        with c2:
+            if st.button("✕ 放弃整理结果", use_container_width=True):
+                del st.session_state[tidy_key]
+                st.rerun()
 
 
 def _render_tactics_settings(client: Client, project: dict) -> None:
