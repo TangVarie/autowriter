@@ -150,9 +150,9 @@ def sign_out() -> None:
     """
     Sign out the current user and clear Streamlit session state + cookie.
 
-    Called from the sidebar logout button (a separate rerun), so a fresh
-    CookieManager is safe to instantiate locally here.  If the lib isn't
-    available the cookie delete is a no-op.
+    Reuses the rerun-cached CookieManager from ``require_auth`` to clear
+    the cookie — instantiating a fresh one here would collide on the
+    ``xhs_auth_cm`` key in the same script run.
     """
     if "supabase_session" in st.session_state:
         try:
@@ -160,7 +160,8 @@ def sign_out() -> None:
             client.auth.sign_out()
         except Exception:
             pass
-    _clear_refresh_cookie(_make_cookie_manager())
+    cm = st.session_state.get("_xhs_auth_cm_ref")
+    _clear_refresh_cookie(cm)
     for key in ("supabase_session", "current_user", "access_token", "current_project_id"):
         st.session_state.pop(key, None)
 
@@ -244,6 +245,11 @@ def require_auth() -> tuple[Client, dict]:
     Returns (authenticated_client, user_dict).
     """
     cm = _make_cookie_manager()
+    # Stash so other helpers in the same rerun (notably ``sign_out`` from the
+    # sidebar logout button) can reuse this exact instance instead of
+    # constructing a second CookieManager with the same key, which would
+    # trigger a StreamlitDuplicateElementKey error.
+    st.session_state["_xhs_auth_cm_ref"] = cm
     cookies = _load_cookies_once(cm)
 
     if "current_user" not in st.session_state:
@@ -264,15 +270,19 @@ def require_auth() -> tuple[Client, dict]:
     # validity remain so the next call sees a fresh JWT.
     ttl = _access_token_seconds_to_expiry()
     if ttl is not None and ttl < 60:
-        if _try_refresh_session(cm):
-            pass  # session_state.access_token is now fresh
-        else:
+        refreshed = _try_refresh_session(cm)
+        if not refreshed:
             # In-memory refresh token is dead — fall back to the cookie.
             cookie_token = cookies.get(_COOKIE_NAME) if isinstance(cookies, dict) else None
-            if cookie_token and not _try_cookie_restore(cm, cookie_token):
-                sign_out()
-                _render_login_page(cm, cookies)
-                st.stop()
+            if cookie_token:
+                refreshed = _try_cookie_restore(cm, cookie_token)
+        if not refreshed:
+            # Both refresh paths failed; the existing JWT is expired and
+            # cannot be revived.  Force re-login instead of silently falling
+            # through to a doomed get_authenticated_client() call.
+            sign_out()
+            _render_login_page(cm, cookies)
+            st.stop()
 
     client = get_authenticated_client()
     if client is None:
