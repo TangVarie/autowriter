@@ -2281,6 +2281,23 @@ def _render_item_card(
                 st.session_state[feedback_key] = saved_draft
                 st.caption("📌 已自动恢复你上次没保存成功的反馈")
 
+            # Auto-save: on every rerun, if the textarea / tags state differs
+            # from what's in DB, persist it.  Doesn't trigger any extra rerun
+            # itself — just piggybacks on whatever rerun the user already
+            # caused (clicking around, switching tabs, etc.) so an unexpected
+            # crash mid-typing doesn't lose the draft.
+            _auto_tags = st.session_state.get(f"tags_{item_id}", [])
+            _auto_text = st.session_state.get(feedback_key, "")
+            _auto_combined = (
+                "、".join(_auto_tags)
+                + ("；" + _auto_text if _auto_text else "")
+            ).strip("、；")
+            if _auto_combined and _auto_combined != saved_draft:
+                try:
+                    db.save_feedback_draft(db_client, item_id, _auto_combined)
+                except Exception:
+                    pass
+
             # Quick tags
             selected_tags = st.multiselect(
                 "快捷反馈标签",
@@ -2525,6 +2542,22 @@ def _render_version_comparison(
                     eng_feedback_key = f"feedback_{item_id}_{engine}"
                     if eng_saved_draft and eng_feedback_key not in st.session_state:
                         st.session_state[eng_feedback_key] = eng_saved_draft
+
+                    # Auto-save: persist draft on every rerun if it's diverged
+                    # from DB.  Same rationale as the global iteration form —
+                    # piggyback on existing reruns, no extra UI cost.
+                    _eng_auto_tags = st.session_state.get(f"tags_{item_id}_{engine}", [])
+                    _eng_auto_text = st.session_state.get(eng_feedback_key, "")
+                    _eng_auto_combined = (
+                        "、".join(_eng_auto_tags)
+                        + ("；" + _eng_auto_text if _eng_auto_text else "")
+                    ).strip("、；")
+                    if _eng_auto_combined and _eng_auto_combined != eng_saved_draft:
+                        try:
+                            db.save_feedback_draft(db_client, item_id, _eng_auto_combined)
+                        except Exception:
+                            pass
+
                     sel_tags = st.multiselect(
                         "快捷标签",
                         QUICK_FEEDBACK_TAGS,
