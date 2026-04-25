@@ -1249,8 +1249,78 @@ with st.sidebar:
         auth.sign_out()
         st.rerun()
 
-# Project switcher (also rendered in sidebar via projects module)
-selected_project = proj_module.render_project_switcher(db_client, user_id)
+def _render_error_panel(err: Exception) -> None:
+    """Surface a real error message + remediation hints instead of letting
+    Streamlit show its redacted red box.  Used by the auth-step and router-
+    step error boundaries below."""
+    import traceback as _traceback
+    import postgrest.exceptions as _pg_exc
+
+    st.error("⚠️ 页面渲染时发生错误。原始信息：")
+    err_repr = repr(err)
+    err_msg = str(err)
+    is_pg = isinstance(err, _pg_exc.APIError)
+    pg_detail: dict = {}
+    if is_pg:
+        try:
+            arg = err.args[0] if err.args else {}
+            if isinstance(arg, dict):
+                pg_detail = arg
+        except Exception:
+            pass
+        st.code(
+            "PostgREST APIError\n"
+            f"message: {pg_detail.get('message', err_msg)}\n"
+            f"code:    {pg_detail.get('code', '')}\n"
+            f"hint:    {pg_detail.get('hint', '')}\n"
+            f"details: {pg_detail.get('details', '')}",
+            language="text",
+        )
+    else:
+        st.code(err_repr, language="text")
+
+    with st.expander("🔍 完整 traceback（截图发给开发者最有用）", expanded=False):
+        st.code(_traceback.format_exc(), language="text")
+
+    st.markdown("**常见排查方向**：")
+    if is_pg:
+        msg_lower = (str(pg_detail.get("message", "")) + " " + err_msg).lower()
+        code_str = str(pg_detail.get("code", "")).strip()
+        if "column" in msg_lower and ("does not exist" in msg_lower or "not found" in msg_lower):
+            st.markdown(
+                "- 看起来数据库少一列。最近版本（2.7.3）需要 `ALTER TABLE items "
+                "ADD COLUMN IF NOT EXISTS feedback_draft TEXT;`，去 Supabase SQL Editor 跑一下。"
+            )
+        if "jwt" in msg_lower or "expired" in msg_lower or "401" in code_str or "401" in msg_lower:
+            st.markdown("- token 过期或无效。点击下方「🔄 重置会话」按钮重登一次即可。")
+        if "row level security" in msg_lower or "permission" in msg_lower or "rls" in msg_lower or code_str.startswith("42"):
+            st.markdown(
+                "- RLS 策略阻止了访问。确认登录的账号和数据所属账号一致；"
+                "新建项目失败时常见此错。"
+            )
+        if "could not connect" in msg_lower or "timeout" in msg_lower:
+            st.markdown(
+                "- 数据库连不上。检查 Supabase 项目是否被自动暂停（免费版闲置一段时间会暂停），"
+                "去 Supabase Dashboard 唤醒一下。"
+            )
+    st.markdown(
+        "- 在 Streamlit Cloud 控制台右下角点 **Manage app** → **Logs** "
+        "可看到完整 stderr，比这里的截图更详细。"
+    )
+
+    if st.button("🔄 重置会话并重登"):
+        auth.sign_out()
+        st.rerun()
+    st.stop()
+
+
+# Project switcher (also rendered in sidebar via projects module).  Wrapped
+# because list_projects can hit RLS / schema / token issues right at app
+# entry, which would otherwise be redacted by Streamlit's red box.
+try:
+    selected_project = proj_module.render_project_switcher(db_client, user_id)
+except Exception as _switcher_err:
+    _render_error_panel(_switcher_err)
 
 _NAV_ITEMS = {
     "01 · 生成":  "生成工作台",
@@ -2962,19 +3032,29 @@ def page_history(project: dict) -> None:
 # ROUTER
 # ═══════════════════════════════════════════════════════════════════════════
 
-if page == "生成工作台":
-    if selected_project:
-        page_generate(selected_project)
-elif page == "审核与迭代":
-    if selected_project:
-        page_review(selected_project)
-elif page == "导出中心":
-    if selected_project:
-        page_export(selected_project)
-elif page == "记忆管理":
-    page_memory(selected_project)
-elif page == "项目设置":
-    page_project_settings(selected_project)
-elif page == "批次历史":
-    if selected_project:
-        page_history(selected_project)
+def _render_page() -> None:
+    """Dispatch to the selected page.  Wrapped by an error boundary below
+    so unhandled DB / API errors don't show Streamlit's redacted red box —
+    the user sees the actual cause and can recover without re-logging in."""
+    if page == "生成工作台":
+        if selected_project:
+            page_generate(selected_project)
+    elif page == "审核与迭代":
+        if selected_project:
+            page_review(selected_project)
+    elif page == "导出中心":
+        if selected_project:
+            page_export(selected_project)
+    elif page == "记忆管理":
+        page_memory(selected_project)
+    elif page == "项目设置":
+        page_project_settings(selected_project)
+    elif page == "批次历史":
+        if selected_project:
+            page_history(selected_project)
+
+
+try:
+    _render_page()
+except Exception as _err:
+    _render_error_panel(_err)
