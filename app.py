@@ -2201,6 +2201,16 @@ def _render_item_card(
         if show_global_iteration and status in ("pending", "needs_revision"):
             st.markdown("<div class='section-label' style='margin-top:12px'>修改意见</div>", unsafe_allow_html=True)
 
+            # Restore any previously-typed feedback that didn't make it through
+            # iteration (token expiry, server error, etc.) so the user doesn't
+            # have to re-type. Saved by db.save_feedback_draft on submit, cleared
+            # by db.clear_feedback_draft on iteration success.
+            saved_draft = (item.get("feedback_draft") or "").strip()
+            feedback_key = f"feedback_{item_id}"
+            if saved_draft and feedback_key not in st.session_state:
+                st.session_state[feedback_key] = saved_draft
+                st.caption("📌 已自动恢复你上次没保存成功的反馈")
+
             # Quick tags
             selected_tags = st.multiselect(
                 "快捷反馈标签",
@@ -2210,7 +2220,7 @@ def _render_item_card(
             )
             feedback_text = st.text_area(
                 "详细反馈（可选）",
-                key=f"feedback_{item_id}",
+                key=feedback_key,
                 height=80,
                 placeholder="在此填写具体修改意见...",
             )
@@ -2256,6 +2266,10 @@ def _render_item_card(
                 if not combined_feedback:
                     st.warning("请先填写修改意见或选择快捷标签。")
                 else:
+                    # Persist the typed feedback BEFORE the AI call so it
+                    # survives any failure during iteration (token expiry,
+                    # server error, network drop).  Cleared on success.
+                    db.save_feedback_draft(db_client, item_id, combined_feedback)
                     # 已选最佳时只用该引擎的版本作历史，避免跨引擎混淆
                     disp_engine_short = display_version.get("ai_engine", "").split("/")[0]
                     iter_versions = (
@@ -2436,6 +2450,11 @@ def _render_version_comparison(
                         v for v in versions
                         if v.get("ai_engine", "").split("/")[0] == eng_short
                     ]
+                    # Restore last-saved draft (shared per-item across engines)
+                    eng_saved_draft = (item.get("feedback_draft") or "").strip()
+                    eng_feedback_key = f"feedback_{item_id}_{engine}"
+                    if eng_saved_draft and eng_feedback_key not in st.session_state:
+                        st.session_state[eng_feedback_key] = eng_saved_draft
                     sel_tags = st.multiselect(
                         "快捷标签",
                         QUICK_FEEDBACK_TAGS,
@@ -2444,7 +2463,7 @@ def _render_version_comparison(
                     )
                     fb_text = st.text_area(
                         "详细反馈（可选）",
-                        key=f"feedback_{item_id}_{engine}",
+                        key=eng_feedback_key,
                         height=68,
                         placeholder="修改意见...",
                     )
@@ -2477,6 +2496,7 @@ def _render_version_comparison(
                         if not combined_fb:
                             st.warning("请先填写修改意见或选择快捷标签。")
                         else:
+                            db.save_feedback_draft(db_client, item_id, combined_fb)
                             _run_iteration(
                                 item, eng_versions, batch, project,
                                 combined_fb, eng_short, iter_model,
@@ -2591,6 +2611,10 @@ def _run_iteration(
 
     # Reset item to pending so it gets reviewed again
     db.update_item_status(db_client, item["id"], "pending")
+
+    # Iteration succeeded — drop the saved draft so the textarea doesn't
+    # auto-restore it on the next render.
+    db.clear_feedback_draft(db_client, item["id"])
 
     # Surface the merger's routing decision so the user can see whether
     # their feedback became a permanent rule, a taste note, or a 24h

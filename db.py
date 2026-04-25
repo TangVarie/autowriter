@@ -82,6 +82,10 @@ CREATE TABLE IF NOT EXISTS items (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_review_notes TEXT;
+-- Persist a user's typed iteration feedback BEFORE running the AI call so
+-- it survives crashes (token expiry, network drop, server error).  Cleared
+-- on successful iteration; restored into the textarea on next render.
+ALTER TABLE items ADD COLUMN IF NOT EXISTS feedback_draft TEXT;
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY IF NOT EXISTS items_owner ON items
     USING (user_id = auth.uid());
@@ -288,6 +292,38 @@ def update_item_status(
         updates["best_version_id"] = best_version_id
     res = client.table("items").update(updates).eq("id", item_id).execute()
     return res.data[0]
+
+
+def save_feedback_draft(client: Client, item_id: str, draft: str) -> None:
+    """Persist a user's in-progress iteration feedback before the AI call.
+    Used to recover the typed text if anything goes wrong mid-iteration."""
+    if not item_id:
+        return
+    try:
+        (
+            client.table("items")
+            .update({"feedback_draft": (draft or "")})
+            .eq("id", item_id)
+            .execute()
+        )
+    except Exception:
+        # Best-effort save — never block the iteration on a draft write
+        pass
+
+
+def clear_feedback_draft(client: Client, item_id: str) -> None:
+    """Clear a previously-saved iteration feedback draft (call on success)."""
+    if not item_id:
+        return
+    try:
+        (
+            client.table("items")
+            .update({"feedback_draft": None})
+            .eq("id", item_id)
+            .execute()
+        )
+    except Exception:
+        pass
 
 
 # ── Version CRUD ───────────────────────────────────────────────────────────
