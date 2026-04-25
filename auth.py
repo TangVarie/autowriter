@@ -5,6 +5,9 @@ Provides sign-up, sign-in, sign-out, and session management helpers.
 
 from __future__ import annotations
 
+import base64
+import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -173,6 +176,28 @@ def get_authenticated_client() -> Optional[Client]:
     return db.get_client(access_token=token)
 
 
+def _access_token_seconds_to_expiry() -> Optional[int]:
+    """Decode the JWT in session_state and return seconds until ``exp``.
+
+    Supabase access tokens last ~1 hour by default; once expired, every
+    PostgREST query 401s and Streamlit shows a redacted APIError page.  We
+    use this to refresh proactively before the token actually dies."""
+    token = st.session_state.get("access_token")
+    if not token:
+        return None
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        # JWT payload is base64url-encoded JSON; pad for the decoder
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        exp = int(payload.get("exp", 0))
+        return exp - int(time.time())
+    except Exception:
+        return None
+
+
 def _try_refresh_session(cm) -> bool:
     """Attempt to refresh the Supabase session using the stored refresh token."""
     session = st.session_state.get("supabase_session")
@@ -233,9 +258,25 @@ def require_auth() -> tuple[Client, dict]:
             _render_login_page(cm, cookies)
             st.stop()
 
+    # Proactive refresh: Supabase access tokens last ~1h.  If the user has
+    # been working past that, the client we'd hand back is technically present
+    # but every DB op blows up with PostgREST 401.  Refresh when < 60 s of
+    # validity remain so the next call sees a fresh JWT.
+    ttl = _access_token_seconds_to_expiry()
+    if ttl is not None and ttl < 60:
+        if _try_refresh_session(cm):
+            pass  # session_state.access_token is now fresh
+        else:
+            # In-memory refresh token is dead — fall back to the cookie.
+            cookie_token = cookies.get(_COOKIE_NAME) if isinstance(cookies, dict) else None
+            if cookie_token and not _try_cookie_restore(cm, cookie_token):
+                sign_out()
+                _render_login_page(cm, cookies)
+                st.stop()
+
     client = get_authenticated_client()
     if client is None:
-        # Access token likely expired — try refreshing before kicking the user out.
+        # Access token missing entirely — try refreshing before kicking the user out.
         if _try_refresh_session(cm):
             client = get_authenticated_client()
         if client is None:
