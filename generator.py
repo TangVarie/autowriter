@@ -1015,16 +1015,15 @@ def generate_batch(
         count=count,
     )
 
-    if count > 1:
-        seed = _user_style_seed(
-            user_id=user_id,
-            project_id=project_id,
-            nonce=int(time.time()) & 0xFFFF,
-        )
-        slot_coords = _assign_slot_coordinates(count, seed)
-        coords_block = _build_slot_coordinates_block(slot_coords)
-        if coords_block:
-            user_prompt += "\n\n" + coords_block
+    # NOTE: per-slot creative coordinates (role/structure/tilt) used to be
+    # injected here, but they conflicted with project system_prompts that
+    # already define their own role/persona schemas — LLMs would lock onto
+    # the more concrete platform labels and demote the project's roles to
+    # mere "style hints".  Removed; the helpers (_assign_slot_coordinates,
+    # _build_slot_coordinates_block, _user_style_seed) are kept in case a
+    # future iteration wants them back behind a per-project opt-in flag.
+    # Per-batch diversity is still enforced via the Wave A dedup block
+    # (40-batch history + sentence-skeleton self-check).
 
     dedup_block = _build_dedup_instruction([], historical_titles)
     if dedup_block:
