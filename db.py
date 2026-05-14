@@ -141,6 +141,25 @@ CREATE INDEX IF NOT EXISTS memories_session_idx
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
 CREATE POLICY IF NOT EXISTS memories_owner ON memories
     USING (user_id = auth.uid());
+
+-- ── Data API grants ──────────────────────────────────────────────────────
+-- Forward-compat for Supabase's May/Oct 2026 change: new tables in "public"
+-- will no longer be auto-exposed to PostgREST/supabase-js/GraphQL without an
+-- explicit GRANT.  Existing tables keep their pre-change grants forever, so
+-- running this block on the current project is a harmless idempotent
+-- re-grant; a fresh provisioning of a new Supabase project after the cutoff
+-- gets working grants out of the box.
+--
+-- We grant nothing to ``anon`` — every row in every table is user-scoped and
+-- gated by RLS, and there's no public-read use case in this app.  ``service_
+-- role`` keeps full access for any admin scripts; ``authenticated`` gets the
+-- standard CRUD set and RLS does the per-user filtering.
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    projects, batches, items, versions, memories
+    TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    projects, batches, items, versions, memories
+    TO service_role;
 """
 
 
