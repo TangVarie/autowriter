@@ -86,6 +86,10 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS ai_review_notes TEXT;
 -- it survives crashes (token expiry, network drop, server error).  Cleared
 -- on successful iteration; restored into the textarea on next render.
 ALTER TABLE items ADD COLUMN IF NOT EXISTS feedback_draft TEXT;
+-- Same idea for the "✏️ 手动精修" form: {title, body, keywords_raw,
+-- base_version_id} so we can restore precisely against the version the
+-- user was editing and not against an unrelated newly-selected best.
+ALTER TABLE items ADD COLUMN IF NOT EXISTS manual_edit_draft JSONB;
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY IF NOT EXISTS items_owner ON items
     USING (user_id = auth.uid());
@@ -319,6 +323,40 @@ def clear_feedback_draft(client: Client, item_id: str) -> None:
         (
             client.table("items")
             .update({"feedback_draft": None})
+            .eq("id", item_id)
+            .execute()
+        )
+    except Exception:
+        pass
+
+
+def save_manual_edit_draft(client: Client, item_id: str, payload: dict) -> None:
+    """Persist a user's in-progress manual-refine edits (title / body /
+    keywords + the version they were editing).  Stored as JSONB so we can
+    overwrite atomically; restoration only applies when ``base_version_id``
+    matches the currently-displayed version, so switching the "best" pick
+    doesn't surface a stale draft against the wrong baseline."""
+    if not item_id or not isinstance(payload, dict):
+        return
+    try:
+        (
+            client.table("items")
+            .update({"manual_edit_draft": payload})
+            .eq("id", item_id)
+            .execute()
+        )
+    except Exception:
+        pass
+
+
+def clear_manual_edit_draft(client: Client, item_id: str) -> None:
+    """Drop the manual-refine draft, e.g. after a successful save."""
+    if not item_id:
+        return
+    try:
+        (
+            client.table("items")
+            .update({"manual_edit_draft": None})
             .eq("id", item_id)
             .execute()
         )

@@ -2374,26 +2374,81 @@ def _render_item_card(
             cur_title    = display_version.get("title", "") or ""
             cur_body     = display_version.get("body", "") or ""
             cur_keywords = _normalise_keywords(display_version.get("keywords"))
+            base_kw_str  = "，".join(cur_keywords)
 
             # Widget keys include the version id so that switching the "best"
             # pick in multi-engine compare mode gives us a fresh widget (else
             # Streamlit keeps the session_state value from the first render
             # and ignores the new ``value=`` prop).
             vid = display_version.get("id", "latest")
+            title_key = f"edit_title_{item_id}_{vid}"
+            body_key  = f"edit_body_{item_id}_{vid}"
+            kw_key    = f"edit_kw_{item_id}_{vid}"
+            save_key  = f"save_edit_{item_id}_{vid}"
+
+            # Load any saved manual-edit draft for this exact version.  A
+            # draft is only used as the initial widget value if it was
+            # captured against the same base version_id we're showing — that
+            # way switching the "best" pick doesn't surface stale text.
+            raw_draft = item.get("manual_edit_draft")
+            saved_draft: dict = {}
+            if isinstance(raw_draft, dict):
+                saved_draft = raw_draft
+            elif isinstance(raw_draft, str) and raw_draft.strip():
+                try:
+                    saved_draft = json.loads(raw_draft)
+                except Exception:
+                    saved_draft = {}
+
+            draft_applies = saved_draft.get("base_version_id") == display_version.get("id")
+            restored = False
+            if draft_applies:
+                if title_key not in st.session_state and saved_draft.get("title") is not None:
+                    st.session_state[title_key] = saved_draft.get("title", "")
+                    restored = True
+                if body_key not in st.session_state and saved_draft.get("body") is not None:
+                    st.session_state[body_key] = saved_draft.get("body", "")
+                    restored = True
+                if kw_key not in st.session_state and saved_draft.get("keywords_raw") is not None:
+                    st.session_state[kw_key] = saved_draft.get("keywords_raw", "")
+                    restored = True
+            if restored:
+                st.caption("📌 已自动恢复你上次没保存成功的手动精修")
+
+            # Auto-save: any divergence from the base version → write to DB.
+            # Piggybacks on existing reruns, no extra UI cost (see 2.7.6).
+            _cur_title_in_state = st.session_state.get(title_key, cur_title)
+            _cur_body_in_state  = st.session_state.get(body_key, cur_body)
+            _cur_kw_in_state    = st.session_state.get(kw_key, base_kw_str)
+            if (_cur_title_in_state != cur_title
+                or _cur_body_in_state != cur_body
+                or _cur_kw_in_state != base_kw_str):
+                payload = {
+                    "title": _cur_title_in_state,
+                    "body":  _cur_body_in_state,
+                    "keywords_raw": _cur_kw_in_state,
+                    "base_version_id": display_version.get("id"),
+                }
+                if payload != saved_draft:
+                    try:
+                        db.save_manual_edit_draft(db_client, item_id, payload)
+                    except Exception:
+                        pass
+
             edit_title = st.text_input(
-                "标题", value=cur_title, key=f"edit_title_{item_id}_{vid}",
+                "标题", value=cur_title, key=title_key,
             )
             edit_body = st.text_area(
-                "正文", value=cur_body, height=300, key=f"edit_body_{item_id}_{vid}",
+                "正文", value=cur_body, height=300, key=body_key,
             )
             edit_kw_raw = st.text_input(
                 "关键词（逗号分隔）",
-                value="，".join(cur_keywords),
-                key=f"edit_kw_{item_id}_{vid}",
+                value=base_kw_str,
+                key=kw_key,
                 placeholder="关键词1，关键词2，关键词3",
             )
 
-            if st.button("💾 保存手动修改并通过", key=f"save_edit_{item_id}_{vid}", use_container_width=True):
+            if st.button("💾 保存手动修改并通过", key=save_key, use_container_width=True):
                 new_kw = [k.strip() for k in re.split(r"[,，、\s]+", edit_kw_raw) if k.strip()]
                 new_title = edit_title.strip()
                 new_body  = edit_body.strip()
@@ -2406,9 +2461,6 @@ def _render_item_card(
                     keywords=new_kw,
                     feedback="手动精修",
                 )
-                # Diff the manual edit against the AI version the user started
-                # from and let the AI extract taste signals.  Runs silently;
-                # failure does not block the save.
                 try:
                     mem_module.update_calibration_from_manual_edit(
                         db_client,
@@ -2420,14 +2472,15 @@ def _render_item_card(
                     )
                 except Exception:
                     pass
-                # Mark the item approved AND point best_version_id at the
-                # newly-written manual version — so the card header, copy
-                # block and any subsequent "display_version" reads show the
-                # manual text, not the earlier AI draft.
                 db.update_item_status(
                     db_client, item_id, "approved",
                     best_version_id=new_version["id"],
                 )
+                # Drop the auto-saved draft now that the user committed.
+                try:
+                    db.clear_manual_edit_draft(db_client, item_id)
+                except Exception:
+                    pass
                 st.success("已保存修改并标记为通过。调教笔记已同步更新。")
                 st.rerun()
 
