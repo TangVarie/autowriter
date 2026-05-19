@@ -1,0 +1,196 @@
+"""
+硬约束（severity=hard）生成后自动校验
+─────────────────────────────────────────────────────────────────────────
+
+之前 P0 硬规则只在 system_prompt 里以"必须 100% 满足"的措辞要求模型，
+但没有任何确定性兜底——模型偶尔失忆就会漏掉。本模块从 P0 规则文本里
+抽取 deterministic 检查（regex / 字符串包含 / 字符数限制），生成后
+对每个版本逐条比对。
+
+这是 generator._apply_compliance_recheck 的轻量级兄弟：
+  - LLM 复检：覆盖面广（语义层判断），但每批多花一次 Claude 调用 + token
+  - 本模块：覆盖面窄（只抓出能模式化的规则），但是 0 成本、确定性
+
+设计上两者互补：本模块抓得到的违规直接触发重生 / needs_revision，
+抓不到的（如"语气太正式"）继续靠 LLM 复检兜底。
+
+支持的规则模式（按优先级匹配）：
+  1. **禁用词 / 片段**："禁止 X" / "不要 X" / "不得 X" / "别用 X" /
+     "避免 X" → 检查 title+body 是否含 X
+  2. **字符上限**："标题不超过 N 字" / "标题最多 N 字" → 检查长度
+  3. **必须包含**："必须包含 X" / "必须出现 X" → 检查 title+body 含 X
+  4. 其它没法机械化的规则被跳过（不视为违规，留给 LLM 复检）
+
+调用方式：
+::
+
+    hits = validator.check_hard_rules(
+        hard_rules=[{"content": "禁止出现'最'字"}, ...],
+        title="...", body="...",
+    )
+    # hits: [{"rule": "...", "kind": "forbidden_word", "match": "最"}]
+
+返回为空列表说明全部通过；非空则按 hit 一一对应。
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 规则解析：从中文短句里抽出可执行的断言
+# ─────────────────────────────────────────────────────────────────────────
+
+# "禁止 X" 类否定词（不抓出来）
+_NEG_PREFIXES = (
+    "禁止", "严禁", "不得", "不要", "别用", "别出现", "避免",
+    "不能用", "不能出现", "不能", "杜绝",
+)
+
+# "必须 X" 类肯定词
+_POS_PREFIXES = ("必须包含", "必须出现", "必须带", "需要包含", "需要出现")
+
+# 字符上限模式 "X不超过/最多N字" 或 "X≤N字"
+_LEN_PATTERN = re.compile(
+    r"(?P<scope>标题|正文|开头|结尾|关键词)\s*(?:不超过|最多|≤|<=|不能超过)\s*(?P<n>\d+)\s*字"
+)
+
+
+def _extract_target(rule: str, prefix: str) -> Optional[str]:
+    """从规则文本里抠出 prefix 之后的目标字符串。
+
+    支持三种写法：带中文引号、带英文引号、不带引号（取到逗号/句号止）。
+    返回 None 表示抓不出来，调用方应跳过这条规则。
+    """
+    if prefix not in rule:
+        return None
+    after = rule.split(prefix, 1)[1].lstrip(" :：")
+    if not after:
+        return None
+    # 去掉常见的连接动词，让 "不要出现 X" / "禁止使用 X" 等也能正确抠出 X
+    after = re.sub(r"^(出现|使用|用|带|含有|包含|有|说)\s*", "", after)
+    # 优先抓中文引号
+    m = re.search(r"['\"‘’“”「」『』]([^'\"‘’“”「」『』]{1,20})['\"‘’“”「」『』]", after)
+    if m:
+        return m.group(1).strip()
+    # 否则取到下一个标点或行末（限 ≤ 12 字，避免抓到一整句话）
+    m = re.match(r"([^，。,.\n;；]{1,12})", after)
+    if m:
+        target = m.group(1).strip()
+        # 排除明显的副词/介词残留（如"任何"、"过多"）
+        if target and not target.startswith(("任何", "过多", "太多", "一些")):
+            return target
+    return None
+
+
+def _parse_rule(rule_content: str) -> Optional[dict]:
+    """把一条规则文本编译成可执行的 predicate spec。
+
+    返回 None 表示这条规则无法被机械化（例如"语气要轻盈"这种感受性
+    描述）；调用方应忽略它，让 LLM 复检兜底。
+
+    Spec dict 形如：
+      - {"kind": "forbidden_word",   "target": "最"}
+      - {"kind": "required_phrase",  "target": "认证"}
+      - {"kind": "max_len",          "scope": "标题", "n": 20}
+    """
+    if not rule_content or not rule_content.strip():
+        return None
+    text = rule_content.strip()
+
+    # 长度规则优先（"标题不超过 20 字" 不会和下面的关键词模式冲突）
+    m = _LEN_PATTERN.search(text)
+    if m:
+        return {"kind": "max_len", "scope": m.group("scope"), "n": int(m.group("n"))}
+
+    # 禁用词：抓"禁止 X" / "不要 X" 等
+    for prefix in _NEG_PREFIXES:
+        target = _extract_target(text, prefix)
+        if target:
+            return {"kind": "forbidden_word", "target": target}
+
+    # 必须出现：抓"必须包含 X" 等
+    for prefix in _POS_PREFIXES:
+        target = _extract_target(text, prefix)
+        if target:
+            return {"kind": "required_phrase", "target": target}
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 实际执行：对单条版本做检查
+# ─────────────────────────────────────────────────────────────────────────
+
+def check_hard_rules(
+    hard_rules: list[dict],
+    title: str,
+    body: str,
+) -> list[dict]:
+    """对一条版本逐条比对硬规则；返回违反清单。
+
+    ``hard_rules`` 是 db.get_confirmed_memories 返回结构的子集，
+    需要带 ``content`` 字段（规则文本）。
+
+    返回列表里每个元素 ``{"rule", "kind", "match"}``：
+      - ``rule``  ：原始规则文本（用于警告里告诉用户违反了什么）
+      - ``kind``  ：违反类型（forbidden_word / required_phrase / max_len）
+      - ``match`` ：具体命中内容（违禁词 / 缺失词 / 超长统计）
+    """
+    if not hard_rules:
+        return []
+    title = (title or "").strip()
+    body  = (body  or "").strip()
+    combined = title + "\n" + body
+
+    out: list[dict] = []
+    for rule in hard_rules:
+        spec = _parse_rule(rule.get("content", ""))
+        if not spec:
+            continue
+        kind = spec["kind"]
+        if kind == "forbidden_word":
+            t = spec["target"]
+            if t and t in combined:
+                out.append({
+                    "rule":  rule["content"],
+                    "kind":  kind,
+                    "match": t,
+                })
+        elif kind == "required_phrase":
+            t = spec["target"]
+            if t and t not in combined:
+                out.append({
+                    "rule":  rule["content"],
+                    "kind":  kind,
+                    "match": t,  # 这里 match = 缺失的词
+                })
+        elif kind == "max_len":
+            scope = spec["scope"]
+            n     = spec["n"]
+            target_text = {
+                "标题": title,
+                "正文": body,
+                "开头": (body.splitlines() or [""])[0],
+            }.get(scope, "")
+            if target_text and len(target_text) > n:
+                out.append({
+                    "rule":  rule["content"],
+                    "kind":  kind,
+                    "match": f"实际 {len(target_text)} 字 > 限定 {n} 字",
+                })
+    return out
+
+
+def filter_hard(memories: list[dict]) -> list[dict]:
+    """从混合的 (hard + soft) 记忆里挑出 severity='hard' 的子集。
+
+    调用方便利：worker 一般持有完整 global+project memories，本函数
+    省去重复写 list comprehension。
+    """
+    return [
+        m for m in (memories or [])
+        if (m.get("severity") or "soft").lower() == "hard"
+    ]

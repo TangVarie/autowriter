@@ -28,6 +28,7 @@ import image_handler
 import exporter
 import dedup as dedup_module
 import telemetry
+import validator
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -139,6 +140,61 @@ def _save_batch_results(
         errors_sink.append(f"{error_prefix}批量写入 versions 失败 — {exc}")
 
     return inserted_items, inserted_versions, produced_titles
+
+
+def _run_hard_constraint_check(
+    db_client,
+    inserted_versions: list[dict],
+    hard_rules: list[dict],
+    error_prefix: str,
+    errors_sink: list,
+    metrics,
+) -> None:
+    """对刚保存的每条版本跑确定性硬约束校验（B3）。
+
+    校验项由 ``validator.check_hard_rules`` 从硬规则文本里抽取
+    （禁用词 / 必须出现 / 字数上限）。命中违规时：
+      - 计入 ``metrics["hard_rule_violations"]``
+      - 写一行警告到 ``errors_sink``（用户复审时能看到）
+      - 把 item.status 改成 ``needs_revision``（不删数据，由用户决定怎么处理）
+
+    抓不出 deterministic pattern 的规则（例如"语气要轻盈"）不会在这里
+    判违规——交给 generator._apply_compliance_recheck 的 LLM 复检兜底。
+
+    与自动重生的关系：B3 第一版只检测 + 标记，不触发重生（重生本身有
+    成本，且违反硬约束的根因通常是 prompt 没传达清楚，重生改善有限）。
+    后续可加 ``ENABLE_HARD_RULE_REGEN`` flag 来开启。
+    """
+    if not hard_rules or not inserted_versions:
+        return
+    for iv in inserted_versions:
+        if not iv:
+            continue
+        hits = validator.check_hard_rules(
+            hard_rules,
+            title=iv.get("title", ""),
+            body=iv.get("body", ""),
+        )
+        if not hits:
+            continue
+        metrics.incr("hard_rule_violations", len(hits))
+        # 标记 needs_revision；不重复标记同一 item
+        try:
+            if iv.get("item_id"):
+                db.update_item_status(db_client, iv["item_id"], "needs_revision")
+        except Exception:
+            pass
+        for hit in hits:
+            kind_label = {
+                "forbidden_word":  "禁用词",
+                "required_phrase": "缺必含词",
+                "max_len":         "超长",
+            }.get(hit["kind"], hit["kind"])
+            errors_sink.append(
+                f"{error_prefix}硬约束违反（{kind_label}）：《{iv.get('title', '')}》"
+                f" — 规则「{hit['rule']}」匹配到「{hit['match']}」"
+                f"；已标记 needs_revision"
+            )
 
 
 def _try_regen_one(
@@ -686,6 +742,15 @@ def _queue_worker(
                 queue_embeddings, project_id, error_prefix,
                 status["errors"], metrics, regen_ctx=regen_ctx,
             )
+
+            # ── 硬约束确定性校验（B3）：在 dedup 之后跑，命中标 needs_revision ──
+            hard_rules_all = validator.filter_hard(global_mems_for_plan) \
+                           + validator.filter_hard(project_mems_for_plan)
+            _run_hard_constraint_check(
+                db_client, inserted_versions, hard_rules_all,
+                error_prefix, status["errors"], metrics,
+            )
+
             _set_phase_progress(status, "embedding", intra=1.0)
 
             # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）
@@ -2149,6 +2214,14 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             error_prefix="", errors_sink=errors, metrics=metrics,
             regen_ctx=regen_ctx,
         )
+
+        # ── 硬约束确定性校验（B3，与 _queue_worker 一致）──────────────
+        hard_rules_all = validator.filter_hard(global_mems) + validator.filter_hard(project_mems)
+        _run_hard_constraint_check(
+            db_client, inserted_versions, hard_rules_all,
+            error_prefix="", errors_sink=errors, metrics=metrics,
+        )
+
         _set_phase_progress(status, "embedding", intra=1.0)
 
         status["saved_count"] = saved_count
