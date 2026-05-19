@@ -45,62 +45,98 @@ def build_system_prompt(
     session_instructions: Optional[list[dict]] = None,
 ) -> str:
     """
-    Assemble the final system prompt.
+    Assemble the final system prompt as a three-tier priority stack so the
+    model can distinguish a non-negotiable rule from a soft preference.
 
-    Assembly order (lowest priority first, highest priority last — so the most
-    authoritative instructions are the last thing the model reads):
-      1. Base system prompt (tactical framework)
-      2. Tactic-specific suffix (if any)
-      3. Account-level memories (``scope='global'`` — per user, across projects)
-      4. Project-level memories
-      5. Calibration notes (qualitative observations, not rules)
-      6. Positive examples (few-shot: what good looks like)
-      7. Negative examples (few-shot: what to avoid)
-      8. Session-level instructions — ad-hoc rules from the current conversation;
-         the highest priority tier, supersedes any lower-priority memory
+    Tiers (highest priority last so the model reads them most recently):
+      P0 — hard constraints: ``severity='hard'`` memories (compliance / brand
+           lines) + base_prompt + tactic_suffix.  Must be 100% respected.
+      P1 — soft preferences: ``severity='soft'`` memories + calibration notes
+           + positive/negative few-shots.  Applied when relevant; defer if
+           they conflict with the current batch's tactic or key messages.
+      P2 — session-only instructions: ad-hoc rules valid for this batch only.
+
+    This replaces the previous flat "必须执行，每条都要主动检查" wall that
+    drowned hard requirements in soft preferences and pushed the model to
+    apply unrelated rules out of context.
+
+    Memories without a ``severity`` field (legacy rows) default to ``soft``.
     """
+    def _is_hard(m: dict) -> bool:
+        return (m.get("severity") or "soft").lower() == "hard"
+
+    hard_global   = [m for m in (global_memories  or []) if _is_hard(m)]
+    soft_global   = [m for m in (global_memories  or []) if not _is_hard(m)]
+    hard_project  = [m for m in (project_memories or []) if _is_hard(m)]
+    soft_project  = [m for m in (project_memories or []) if not _is_hard(m)]
+
     parts: list[str] = [base_prompt.strip()]
 
     if tactic_suffix.strip():
         parts.append(f"\n{tactic_suffix.strip()}")
 
-    if global_memories:
-        bullets = "\n".join(f"• {m['content']}" for m in global_memories)
-        parts.append(f"\n---通用记忆（必须执行，每条都要主动检查）---\n{bullets}")
+    # ── P0 ────────────────────────────────────────────────────────────────
+    p0_lines: list[str] = []
+    if hard_global:
+        p0_lines.append("[通用硬约束]")
+        p0_lines.extend(f"• {m['content']}" for m in hard_global)
+    if hard_project:
+        if p0_lines:
+            p0_lines.append("")
+        p0_lines.append("[项目硬约束]")
+        p0_lines.extend(f"• {m['content']}" for m in hard_project)
+    if p0_lines:
+        parts.append(
+            "\n---【P0 · 不可违反的硬约束】---\n"
+            "本节每一条都必须 100% 满足；若与下方偏好冲突，以此节为准。\n\n"
+            + "\n".join(p0_lines)
+        )
 
-    if project_memories:
-        bullets = "\n".join(f"• {m['content']}" for m in project_memories)
-        parts.append(f"\n---项目记忆（必须执行，每条都要主动检查）---\n{bullets}")
-
+    # ── P1 ────────────────────────────────────────────────────────────────
+    p1_sections: list[str] = []
+    if soft_global:
+        bullets = "\n".join(f"• {m['content']}" for m in soft_global)
+        p1_sections.append(f"[通用偏好]\n{bullets}")
+    if soft_project:
+        bullets = "\n".join(f"• {m['content']}" for m in soft_project)
+        p1_sections.append(f"[项目偏好]\n{bullets}")
     if calibration_notes and calibration_notes.strip():
-        parts.append(f"\n---调校笔记（理解并内化这些审美偏好，生成内容时主动应用）---\n{calibration_notes.strip()}")
-
+        p1_sections.append(f"[调校笔记 · 感受性观察]\n{calibration_notes.strip()}")
     if positive_examples:
         ex_blocks = []
         for ex in positive_examples[:5]:
             body_preview = (ex.get("body") or "")[:200].split("\n")[0]
             ex_blocks.append(f"标题：{ex['title']}\n正文节选：{body_preview}")
-        parts.append(
-            "\n---优质正案例（学习这些文案的风格、结构和切入角度，这是我们想要的方向）---\n"
+        p1_sections.append(
+            "[优质正案例 · 学习风格/结构/切入]\n"
+            "严禁直接复用例子里的标题主干、开场句、具体比喻；只可借鉴节奏与角度。\n"
             + "\n\n".join(ex_blocks)
         )
-
     if negative_examples:
         ex_blocks = []
         for ex in negative_examples[:3]:
             body_preview = (ex.get("body") or "")[:120].split("\n")[0]
             ex_blocks.append(f"标题：{ex['title']}\n正文节选：{body_preview}")
-        parts.append(
-            "\n---反面案例（分析这些文案存在的问题，生成时主动规避）---\n"
+        p1_sections.append(
+            "[反面案例 · 主动规避]\n"
             + "\n\n".join(ex_blocks)
         )
+    if p1_sections:
+        parts.append(
+            "\n---【P1 · 项目调性偏好】---\n"
+            "请理解每条意图、在本批 tactic / 关键卖点适用时再应用；明显不适用时可以让位，"
+            "不必为了套用规则扭曲文案。与 P0 冲突时以 P0 为准。\n\n"
+            + "\n\n".join(p1_sections)
+        )
 
+    # ── P2 ────────────────────────────────────────────────────────────────
     if session_instructions:
         bullets = "\n".join(f"• {m['content']}" for m in session_instructions if m.get("content"))
         if bullets:
             parts.append(
-                "\n---当前会话临时指令（本轮最高优先级，高于项目记忆与通用记忆）---\n"
-                "这些是用户在本次对话中刚刚提出的要求；本轮所有产出必须严格遵守，直到用户改口。\n"
+                "\n---【P2 · 本次会话临时指令】---\n"
+                "用户在本次对话中提出的要求，本批生成期间严格遵守；过期失效。"
+                "与 P0 冲突时仍以 P0 为准。\n"
                 + bullets
             )
 
@@ -146,13 +182,17 @@ _MERGER_SYSTEM = """你是一个内容运营的记忆整理助手。你要帮用
 
 关键判定准则：
 
-A. **包含"不要 / 别 / 避免 / 禁止 / 不能 / 少用 / 多用"等约束型措辞的反馈，一律归为 rule**，
-   即使里面含有"太多"、"太少"、"过于"等模糊量词 —— 用户意图明确，且可以作为生成时的自检点。
+A. 含"不要 / 别 / 避免 / 禁止 / 不能 / 少用 / 多用"等约束型措辞、**且未出现"本次 / 这批 / 这次 /
+   试试 / 临时"等时限词** 的反馈，归为 rule。**只要句子里出现任何一个时限词就降级为 session，
+   不进永久 rule 库**，避免把一次性建议硬化为长期约束。
    例：
-   - "不要使用太多个人情绪自述性文字" → rule
-   - "标题避免数字开头" → rule
-   - "少用感叹号" → rule
-   - "别用'微醉'" → rule
+   - "不要使用太多个人情绪自述性文字"           → rule（无时限词）
+   - "本次不要使用太多个人情绪自述性文字"        → session（"本次"）
+   - "标题避免数字开头"                          → rule
+   - "这批标题避免数字开头"                      → session
+   - "少用感叹号"                                → rule
+   - "试试少用感叹号"                            → session
+   - "别用'微醉'"                                → rule
 
 B. 正向的具体要求（带可操作主语/宾语）也归为 rule。
    例："标题要带场景感" → rule；"开头先讲故事再讲产品" → rule

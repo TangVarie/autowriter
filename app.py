@@ -46,6 +46,29 @@ def _queue_worker(
     status.setdefault("completed", [])
     status.setdefault("errors", [])
 
+    # Prefetch once per queue run so we don't hammer Supabase per plan.  The
+    # project list rarely changes mid-queue; per-project memories / examples /
+    # session instructions stay stable for the life of one run.  These dicts
+    # are populated lazily on first sight of a project_id.
+    try:
+        all_projects = db.list_projects(db_client, user_id)
+    except Exception as exc:
+        status["errors"].append(f"预取项目列表失败：{exc}")
+        all_projects = []
+    project_by_id = {p["id"]: p for p in all_projects}
+    mem_cache: dict[str, tuple] = {}      # project_id → (global_mems, project_mems)
+    example_cache: dict[str, tuple] = {}  # project_id → (pos, neg)
+    session_cache: dict[str, list] = {}   # project_id → session_instructions
+
+    # Cross-batch dedup pool — keyed by project_id so different projects don't
+    # bleed into each other's title constraints.  Each entry is the same
+    # {"title", "opening"} dict shape that ``_build_dedup_instruction`` accepts.
+    # This is the fix for "30/40 duplicates when running 4 batches of 10":
+    # historical_titles from DB lags behind because earlier batches in the same
+    # queue haven't been persisted yet (or only partially); the in-memory pool
+    # lets each new batch see what previous batches just produced.
+    queue_titles: dict[str, list[dict]] = {}
+
     for idx, plan in enumerate(plans):
         if stop_event.is_set():
             status["message"] = f"已停止（完成 {len(status['completed'])}/{len(plans)}）"
@@ -58,8 +81,7 @@ def _queue_worker(
 
         try:
             project_id = plan["project_id"]
-            all_projects = db.list_projects(db_client, user_id)
-            project = next((p for p in all_projects if p["id"] == project_id), None)
+            project = project_by_id.get(project_id)
             if not project:
                 status["errors"].append(f"计划 {idx+1}：找不到项目 {project_id}")
                 continue
@@ -70,12 +92,22 @@ def _queue_worker(
                 continue
 
             tactic_suffix  = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
-            global_mems, project_mems = db.get_confirmed_memories(
-                db_client, user_id, project_id=project_id
-            )
-            pos_examples  = db.list_example_items(db_client, project_id, "positive", limit=5)
-            neg_examples  = db.list_example_items(db_client, project_id, "negative", limit=3)
-            session_instr = db.get_session_instructions(db_client, user_id, project_id=project_id)
+            if project_id not in mem_cache:
+                mem_cache[project_id] = db.get_confirmed_memories(
+                    db_client, user_id, project_id=project_id
+                )
+            global_mems, project_mems = mem_cache[project_id]
+            if project_id not in example_cache:
+                example_cache[project_id] = (
+                    db.list_example_items(db_client, project_id, "positive", limit=5),
+                    db.list_example_items(db_client, project_id, "negative", limit=3),
+                )
+            pos_examples, neg_examples = example_cache[project_id]
+            if project_id not in session_cache:
+                session_cache[project_id] = db.get_session_instructions(
+                    db_client, user_id, project_id=project_id
+                )
+            session_instr = session_cache[project_id]
             full_system_prompt = mem_module.build_system_prompt(
                 base_prompt=base_prompt,
                 global_memories=global_mems,
@@ -124,7 +156,20 @@ def _queue_worker(
                     batch_id=batch_id,
                 )
 
-            historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
+            db_titles = db.get_recent_titles_and_openings(db_client, project_id)
+            # Merge the in-memory queue pool first so the *latest* in-flight
+            # batches outweigh older DB rows when the dedup block truncates to
+            # the last N entries.  Dict-keyed dedup on (title, opening) to keep
+            # the prompt budget tight when queues are long.
+            pool = list(queue_titles.get(project_id, []))
+            seen = {(p["title"], p.get("opening", "")) for p in pool}
+            for h in (db_titles or []):
+                key = (h.get("title", ""), h.get("opening", ""))
+                if key in seen:
+                    continue
+                pool.append(h)
+                seen.add(key)
+            historical_titles = pool
 
             _total   = count * len(engines)
             _done_n  = [0]
@@ -171,6 +216,7 @@ def _queue_worker(
                 )
 
             saved = 0
+            produced_titles: list[dict] = []
             for slot in generation_results:
                 item = db.create_item(
                     db_client, user_id, batch_id,
@@ -192,6 +238,19 @@ def _queue_worker(
                         token_usage=vr.token_usage,
                     )
                     saved += 1
+                    opening = ""
+                    body = (vr.body or "").strip()
+                    if body:
+                        first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
+                        opening = first_line.strip()[:25]
+                    if vr.title:
+                        produced_titles.append({"title": vr.title.strip(), "opening": opening})
+
+            # Append to the cross-batch dedup pool so the next plan touching
+            # this project sees what we just produced, regardless of whether
+            # the DB writes are visible yet to ``get_recent_titles_and_openings``.
+            if produced_titles:
+                queue_titles.setdefault(project_id, []).extend(produced_titles)
 
             status["completed"].append({
                 "plan_idx":    idx,

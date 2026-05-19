@@ -164,6 +164,20 @@ def sign_out() -> None:
     _clear_refresh_cookie(cm)
     for key in ("supabase_session", "current_user", "access_token", "current_project_id"):
         st.session_state.pop(key, None)
+    # Drop every cached read so the next signed-in user sees their own rows
+    # rather than the previous user's snapshot.
+    for fn in (
+        db.list_projects, db.list_batches, db.list_example_items,
+        db.get_confirmed_memories, db.get_session_instructions,
+    ):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+    try:
+        db._make_client_cached.clear()
+    except Exception:
+        pass
 
 
 def get_authenticated_client() -> Optional[Client]:

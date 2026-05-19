@@ -18,13 +18,62 @@ from datetime import datetime
 from supabase import create_client, Client
 import config
 
+try:
+    import streamlit as st
+    _HAS_ST = True
+except Exception:
+    _HAS_ST = False
 
-def get_client(access_token: Optional[str] = None) -> Client:
-    """Return a Supabase client, optionally authenticated with the user JWT."""
-    client = create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
+
+def _cache_data(**kwargs):
+    """Streamlit cache_data shim — no-op decorator when Streamlit isn't loaded
+    (e.g. unit-test imports), and otherwise delegate to ``st.cache_data``.
+
+    Callers pass the underlying Client positionally as a ``_client`` parameter
+    so Streamlit's hasher skips it (leading underscore == unhashable).  Cache
+    invalidation is done by writers calling ``<reader>.clear()`` after mutating
+    the underlying row.
+    """
+    if _HAS_ST:
+        return st.cache_data(**kwargs)
+    def passthrough(fn):
+        fn.clear = lambda: None  # match cache_data API for unconditional callers
+        return fn
+    return passthrough
+
+
+def _cache_resource(**kwargs):
+    """Same shim, for objects whose identity matters (e.g. Supabase Client)."""
+    if _HAS_ST:
+        return st.cache_resource(**kwargs)
+    def passthrough(fn):
+        fn.clear = lambda: None
+        return fn
+    return passthrough
+
+
+@_cache_resource(show_spinner=False)
+def _make_client_cached(supabase_url: str, anon_key: str, access_token: str) -> Client:
+    """Per-token Supabase client singleton.  Keyed on the token so each
+    authenticated user gets their own client; ``access_token=""`` returns the
+    anonymous client.  Cleared on sign-out via ``_make_client_cached.clear()``.
+    """
+    client = create_client(supabase_url, anon_key)
     if access_token:
         client.postgrest.auth(access_token)
     return client
+
+
+def get_client(access_token: Optional[str] = None) -> Client:
+    """Return a Supabase client, optionally authenticated with the user JWT.
+
+    Cached per-token via ``_make_client_cached`` so each Streamlit rerun
+    reuses the same Client (and underlying httpx connection pool) instead of
+    rebuilding it.  Falls back to a fresh client when Streamlit isn't loaded.
+    """
+    return _make_client_cached(
+        config.SUPABASE_URL, config.SUPABASE_ANON_KEY, access_token or ""
+    )
 
 
 # ── DDL helpers (run once during setup) ───────────────────────────────────
@@ -165,9 +214,10 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
 
 # ── Project CRUD ──────────────────────────────────────────────────────────
 
-def list_projects(client: Client, user_id: str) -> list[dict]:
+@_cache_data(ttl=60, show_spinner=False)
+def list_projects(_client: Client, user_id: str) -> list[dict]:
     res = (
-        client.table("projects")
+        _client.table("projects")
         .select("*")
         .eq("owner_id", user_id)
         .order("created_at", desc=True)
@@ -205,6 +255,7 @@ def create_project(
         "owner_id": user_id,
     }
     res = client.table("projects").insert(data).execute()
+    list_projects.clear()
     return res.data[0]
 
 
@@ -219,11 +270,13 @@ def update_project(client: Client, project_id: str, updates: dict) -> dict:
         .eq("id", project_id)
         .execute()
     )
+    list_projects.clear()
     return res.data[0]
 
 
 def delete_project(client: Client, project_id: str) -> None:
     client.table("projects").delete().eq("id", project_id).execute()
+    list_projects.clear()
 
 
 # ── Batch CRUD ─────────────────────────────────────────────────────────────
@@ -244,12 +297,14 @@ def create_batch(
         "user_id": user_id,
     }
     res = client.table("batches").insert(data).execute()
+    list_batches.clear()
     return res.data[0]
 
 
-def list_batches(client: Client, project_id: str, limit: int = 20) -> list[dict]:
+@_cache_data(ttl=30, show_spinner=False)
+def list_batches(_client: Client, project_id: str, limit: int = 20) -> list[dict]:
     res = (
-        client.table("batches")
+        _client.table("batches")
         .select("*")
         .eq("project_id", project_id)
         .order("created_at", desc=True)
@@ -279,6 +334,7 @@ def delete_batch(client: Client, batch_id: str) -> None:
 
     # 4. Delete batch
     client.table("batches").delete().eq("id", batch_id).execute()
+    list_batches.clear()
 
 
 # ── Item CRUD ──────────────────────────────────────────────────────────────
@@ -548,6 +604,16 @@ def list_memories(
     return res.data or []
 
 
+def _invalidate_memory_caches() -> None:
+    """Drop every memory-related cache after a write so the next read pulls fresh
+    rows.  Called from every memory mutator."""
+    for fn in (get_confirmed_memories, get_session_instructions, list_example_items):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+
+
 def upsert_memory(
     client: Client,
     user_id: str,
@@ -590,6 +656,7 @@ def upsert_memory(
             .eq("id", row["id"])
             .execute()
         )
+        _invalidate_memory_caches()
         return res.data[0]
     else:
         data: dict[str, Any] = {
@@ -603,6 +670,7 @@ def upsert_memory(
         if project_id:
             data["project_id"] = project_id
         res = client.table("memories").insert(data).execute()
+        _invalidate_memory_caches()
         return res.data[0]
 
 
@@ -624,6 +692,7 @@ def increment_memory_frequency(client: Client, memory_id: str) -> dict:
         .eq("id", memory_id)
         .execute()
     )
+    _invalidate_memory_caches()
     return res.data[0]
 
 
@@ -631,11 +700,13 @@ def update_memory(client: Client, memory_id: str, updates: dict) -> dict:
     res = (
         client.table("memories").update(updates).eq("id", memory_id).execute()
     )
+    _invalidate_memory_caches()
     return res.data[0]
 
 
 def delete_memory(client: Client, memory_id: str) -> None:
     client.table("memories").delete().eq("id", memory_id).execute()
+    _invalidate_memory_caches()
 
 
 def set_item_example_label(
@@ -648,23 +719,28 @@ def set_item_example_label(
         .eq("id", item_id)
         .execute()
     )
+    try:
+        list_example_items.clear()
+    except Exception:
+        pass
     return res.data[0]
 
 
+@_cache_data(ttl=120, show_spinner=False)
 def list_example_items(
-    client: Client, project_id: str, label: str, limit: int = 5
+    _client: Client, project_id: str, label: str, limit: int = 5
 ) -> list[dict]:
     """
     Return recent items marked with the given label ('positive' or 'negative').
     Each dict has {title, body} from the item's best or latest version.
     """
-    batches = list_batches(client, project_id, limit=50)
+    batches = list_batches(_client, project_id, limit=50)
     if not batches:
         return []
     batch_ids = [b["id"] for b in batches]
 
     res = (
-        client.table("items")
+        _client.table("items")
         .select("id, best_version_id, versions(id, title, body, version_num)")
         .in_("batch_id", batch_ids)
         .eq("example_label", label)
@@ -745,8 +821,9 @@ def _rank_memories_for_injection(mems: list[dict], cap: int) -> list[dict]:
     return recent + older[:remaining]
 
 
+@_cache_data(ttl=60, show_spinner=False)
 def get_confirmed_memories(
-    client: Client,
+    _client: Client,
     user_id: str,
     project_id: Optional[str] = None,
     cap_per_scope: Optional[int] = None,
@@ -763,14 +840,14 @@ def get_confirmed_memories(
         cap_per_scope = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 40) or 40)
 
     global_mems = [
-        m for m in list_memories(client, user_id, scope="global", status="confirmed")
+        m for m in list_memories(_client, user_id, scope="global", status="confirmed")
         if _is_rule_memory(m)
     ]
     project_mems: list[dict] = []
     if project_id:
         project_mems = [
             m for m in list_memories(
-                client, user_id, scope="project",
+                _client, user_id, scope="project",
                 project_id=project_id, status="confirmed",
             )
             if _is_rule_memory(m)
@@ -781,8 +858,9 @@ def get_confirmed_memories(
     )
 
 
+@_cache_data(ttl=30, show_spinner=False)
 def get_session_instructions(
-    client: Client,
+    _client: Client,
     user_id: str,
     project_id: Optional[str] = None,
 ) -> list[dict]:
@@ -797,7 +875,7 @@ def get_session_instructions(
     """
     try:
         q = (
-            client.table("memories")
+            _client.table("memories")
             .select("*")
             .eq("user_id", user_id)
             .eq("memory_type", "session")
@@ -850,6 +928,7 @@ def insert_session_instruction(
         payload["source_batch_id"] = source_batch_id
     try:
         res = client.table("memories").insert(payload).execute()
+        _invalidate_memory_caches()
         return (res.data or [None])[0]
     except Exception:
         return None
