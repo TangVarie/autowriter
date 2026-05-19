@@ -97,7 +97,9 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at   TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS projects_owner ON projects
+-- PostgreSQL 不支持 CREATE POLICY IF NOT EXISTS；用 DROP + CREATE 实现幂等
+DROP POLICY IF EXISTS projects_owner ON projects;
+CREATE POLICY projects_owner ON projects
     USING (owner_id = auth.uid());
 -- Migration: add dual-prompt columns if upgrading from older schema
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_tone TEXT;
@@ -118,7 +120,8 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at     TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE batches ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS batches_owner ON batches
+DROP POLICY IF EXISTS batches_owner ON batches;
+CREATE POLICY batches_owner ON batches
     USING (user_id = auth.uid());
 
 -- Items (one per generated copy slot)
@@ -140,7 +143,8 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS feedback_draft TEXT;
 -- user was editing and not against an unrelated newly-selected best.
 ALTER TABLE items ADD COLUMN IF NOT EXISTS manual_edit_draft JSONB;
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS items_owner ON items
+DROP POLICY IF EXISTS items_owner ON items;
+CREATE POLICY items_owner ON items
     USING (user_id = auth.uid());
 
 -- Versions (each AI generation or iteration)
@@ -158,7 +162,8 @@ CREATE TABLE IF NOT EXISTS versions (
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE versions ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS versions_owner ON versions
+DROP POLICY IF EXISTS versions_owner ON versions;
+CREATE POLICY versions_owner ON versions
     USING (
         item_id IN (SELECT id FROM items WHERE user_id = auth.uid())
     );
@@ -229,14 +234,16 @@ CREATE TABLE IF NOT EXISTS calibration_note_audit (
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE calibration_note_audit ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS calibration_note_audit_owner ON calibration_note_audit
+DROP POLICY IF EXISTS calibration_note_audit_owner ON calibration_note_audit;
+CREATE POLICY calibration_note_audit_owner ON calibration_note_audit
     USING (
         project_id IN (SELECT id FROM projects WHERE owner_id = auth.uid())
     );
 CREATE INDEX IF NOT EXISTS calibration_note_audit_project_idx
     ON calibration_note_audit(project_id, created_at DESC);
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
-CREATE POLICY IF NOT EXISTS memories_owner ON memories
+DROP POLICY IF EXISTS memories_owner ON memories;
+CREATE POLICY memories_owner ON memories
     USING (user_id = auth.uid());
 
 -- ── Data API grants ──────────────────────────────────────────────────────
