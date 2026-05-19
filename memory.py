@@ -20,6 +20,7 @@ from supabase import Client
 
 import config
 import db
+import telemetry
 
 
 def _make_anthropic_client() -> anthropic.Anthropic:
@@ -457,7 +458,11 @@ def _line_key(raw: str) -> str:
     return _normalize_line(raw)
 
 
-def _dedup_calibration_lines(text: str, max_chars: int = 4000) -> str:
+def _dedup_calibration_lines(
+    text: str,
+    max_chars: int = 4000,
+    dropped_sink: Optional[list[str]] = None,
+) -> str:
     """对调教笔记做行级去重 + 软上限截断。
 
     多个写入入口（手动精修自动更新 / 每次迭代增量 / 整批反思 / 反馈分类
@@ -469,6 +474,10 @@ def _dedup_calibration_lines(text: str, max_chars: int = 4000) -> str:
     字，太紧——LLM 重写路径在容量压力下会静默删旧观察。生成时如果还需要
     进一步裁剪，通过 ``filter_soft_by_relevance`` / 调用方 cap 处理，不在
     这里加硬限制。
+
+    被窗口淘汰的旧行不会真正消失：写入路径会把完整 before_text 落到
+    ``calibration_note_audit`` 表，UI 的历史查看器可以回看到。``dropped_sink``
+    给调用方一个直接拿到本次淘汰行的入口，用于埋点/告知用户。
     """
     if not text:
         return ""
@@ -490,7 +499,9 @@ def _dedup_calibration_lines(text: str, max_chars: int = 4000) -> str:
 
     joined = "\n".join(clean_lines)
     while len(joined) > max_chars and len(clean_lines) > 1:
-        clean_lines.pop(0)  # drop oldest
+        dropped = clean_lines.pop(0)
+        if dropped_sink is not None:
+            dropped_sink.append(dropped)
         joined = "\n".join(clean_lines)
     return joined
 
@@ -582,14 +593,24 @@ def _append_new_observations(
         return None
     try:
         proj = db.get_project(db_client, project_id)
-    except Exception:
+    except Exception as exc:
+        telemetry.log_event(
+            "calibration_update_read_failed",
+            project_id=project_id, source=source, error=str(exc)[:200],
+        )
         return None
     if not proj:
         return None
     merged = _merge_new_observations(proj.get("calibration_notes") or "", new_lines)
     if not merged or merged == (proj.get("calibration_notes") or "").rstrip():
         return None
-    return save_calibration_notes(db_client, project_id, merged, source=source)
+    try:
+        return save_calibration_notes(db_client, project_id, merged, source=source)
+    except Exception:
+        # save_calibration_notes has already logged the error;
+        # this caller is the iteration/incremental background path so we
+        # swallow here to avoid blowing up the queue worker.
+        return None
 
 
 def save_calibration_notes(
@@ -612,21 +633,41 @@ def save_calibration_notes(
 
     每次写入都会同步往 ``calibration_note_audit`` 表插一条 before / append /
     after 记录（C1 审计闭环）。审计失败不会影响主写入。
+
+    数据完整性原则（2026-05 Day 1）：``update_project`` 失败属于数据丢失
+    点，会向上抛；本函数的所有上层调用都被包在 try/except + UI 告警里，
+    不再有"看似成功实际失败"的状态。
     """
-    deduped = _dedup_calibration_lines(notes or "")
+    dropped: list[str] = []
+    deduped = _dedup_calibration_lines(notes or "", dropped_sink=dropped)
 
     # 先读旧值用于 audit before；与下面 update_project 是同一次会话窗口
     before_text = ""
     try:
         proj = db.get_project(db_client, project_id)
         before_text = (proj.get("calibration_notes") or "") if proj else ""
-    except Exception:
-        pass
+    except Exception as exc:
+        # 读旧值只是为了 audit before，失败不阻塞写入主流程，
+        # 但要留痕方便排错
+        telemetry.log_event(
+            "calibration_before_read_failed",
+            project_id=project_id, source=source, error=str(exc)[:200],
+        )
 
     try:
         db.update_project(db_client, project_id, {"calibration_notes": deduped})
-    except Exception:
-        pass
+    except Exception as exc:
+        telemetry.log_event(
+            "calibration_save_error",
+            project_id=project_id, source=source, error=str(exc)[:200],
+        )
+        raise
+
+    if dropped:
+        telemetry.log_event(
+            "calibration_window_dropped",
+            project_id=project_id, source=source, count=len(dropped),
+        )
 
     # 计算本次新增的观察行：deduped 中存在但 before 中不存在的（按 _line_key 比对）
     before_keys = {
@@ -664,7 +705,11 @@ def _append_taste_to_calibration(
     """
     try:
         proj = db.get_project(db_client, project_id)
-    except Exception:
+    except Exception as exc:
+        telemetry.log_event(
+            "calibration_taste_read_failed",
+            project_id=project_id, error=str(exc)[:200],
+        )
         return
     if not proj:
         return
@@ -675,7 +720,12 @@ def _append_taste_to_calibration(
         return
 
     merged = (existing + "\n- " + line) if existing else f"- {line}"
-    save_calibration_notes(db_client, project_id, merged, source="merger_taste")
+    try:
+        save_calibration_notes(db_client, project_id, merged, source="merger_taste")
+    except Exception:
+        # save_calibration_notes already logged; this is a best-effort taste
+        # append called from the feedback classifier, don't block the caller.
+        pass
 
 
 # ── AI-based feedback classification ──────────────────────────────────────

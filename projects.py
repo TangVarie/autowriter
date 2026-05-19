@@ -264,10 +264,13 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     col_save, col_tidy = st.columns([1, 1])
     with col_save:
         if st.button("💾 保存调教笔记", use_container_width=True):
-            mem_module.save_calibration_notes(
-                client, project["id"], calibration_text, source="user_manual",
-            )
-            st.success("调教笔记已保存，下次生成时生效。")
+            try:
+                mem_module.save_calibration_notes(
+                    client, project["id"], calibration_text, source="user_manual",
+                )
+                st.success("调教笔记已保存，下次生成时生效。")
+            except Exception as exc:
+                st.error(f"保存失败：{exc}。请稍后重试，或查看日志定位问题。")
     with col_tidy:
         if st.button(
             "🧹 让 AI 整理（抽象化机械条目）",
@@ -296,33 +299,55 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ 用整理后的版本替换", use_container_width=True):
-                mem_module.save_calibration_notes(
-                    client, project["id"], preview, source="user_manual",
-                )
-                # Drop the textarea's cached state — Streamlit forbids
-                # assigning to a widget's session_state key after the widget
-                # has already rendered in this run.  Popping is allowed, and
-                # the next rerun will repopulate via ``setdefault`` using the
-                # freshly-saved project.calibration_notes value.
-                st.session_state.pop("calibration_notes_textarea", None)
-                st.session_state.pop(tidy_key, None)
-                st.success("已替换并保存。")
-                st.rerun()
+                try:
+                    mem_module.save_calibration_notes(
+                        client, project["id"], preview, source="user_manual",
+                    )
+                except Exception as exc:
+                    st.error(f"保存失败：{exc}。整理后的内容保留在预览区，可重试。")
+                else:
+                    # Drop the textarea's cached state — Streamlit forbids
+                    # assigning to a widget's session_state key after the widget
+                    # has already rendered in this run.  Popping is allowed, and
+                    # the next rerun will repopulate via ``setdefault`` using the
+                    # freshly-saved project.calibration_notes value.
+                    st.session_state.pop("calibration_notes_textarea", None)
+                    st.session_state.pop(tidy_key, None)
+                    st.success("已替换并保存。")
+                    st.rerun()
         with c2:
             if st.button("✕ 放弃整理结果", use_container_width=True):
                 del st.session_state[tidy_key]
                 st.rerun()
 
-    # ── 审计：最近 30 次调教笔记的写入历史（C1）─────────────────────────
+    # ── 审计：调教笔记的写入历史（C1 + 2026-05 分页）─────────────────────
     # 用途：当用户怀疑"为什么这条观察突然不见了 / 多出来了"时，可以
     # 直接看 before/after diff 定位是哪个入口（迭代反馈 / 手动精修 /
     # 批次反思 / 用户手动保存）写入的。
-    with st.expander("📜 查看变更历史（最近 30 次）", expanded=False):
-        audit_rows = db.list_calibration_audit(client, project["id"], limit=30)
-        if not audit_rows:
-            st.caption("尚无历史记录（启用审计后从下次写入开始累积）。")
+    #
+    # 2026-05 改造：分页 + 总数指示，从根本上消除"窗口截断 → 看似丢失"
+    # 的体感问题——被 4000 字软上限淘汰的旧行依然保留在历史的 before_text
+    # 里，用户可以按时间滚回去看。
+    pid = project["id"]
+    total = db.count_calibration_audit(client, pid)
+    page_size = 30
+    cursor_key = f"_calib_hist_cursor_{pid}"
+    accum_key = f"_calib_hist_accum_{pid}"
+
+    label_suffix = f"（共 {total} 条）" if total else "（启用审计后累积）"
+    with st.expander(f"📜 查看变更历史{label_suffix}", expanded=False):
+        if total == 0:
+            st.caption("尚无历史记录。")
         else:
-            for row in audit_rows:
+            accumulated: list[dict] = st.session_state.get(accum_key, [])
+            if not accumulated:
+                accumulated = db.list_calibration_audit(client, pid, limit=page_size)
+                st.session_state[accum_key] = accumulated
+                st.session_state[cursor_key] = (
+                    accumulated[-1].get("created_at") if accumulated else None
+                )
+
+            for row in accumulated:
                 source_label = {
                     "iteration":        "迭代反馈",
                     "manual_edit":      "手动精修",
@@ -330,8 +355,11 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
                     "merger_taste":     "反馈分类为 taste",
                     "user_manual":      "用户手动保存",
                 }.get(row.get("source"), row.get("source") or "未知")
-                created = row.get("created_at", "")[:19].replace("T", " ")
+                created = (row.get("created_at") or "")[:19].replace("T", " ")
                 appended = row.get("append_lines") or []
+                before_text = row.get("before_text") or ""
+                after_text = row.get("after_text") or ""
+
                 st.markdown(
                     f"**{created}** · _{source_label}_ · 新增 {len(appended)} 条观察"
                 )
@@ -340,7 +368,45 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
                         st.markdown(f"  - {line}")
                     if len(appended) > 5:
                         st.caption(f"…还有 {len(appended) - 5} 条")
+
+                # 计算 before 中存在但 after 已无的行 —— 这就是窗口淘汰的旧行
+                before_lines = {
+                    l.strip().lstrip("-•·*· ").strip()
+                    for l in before_text.splitlines() if l.strip()
+                }
+                after_lines = {
+                    l.strip().lstrip("-•·*· ").strip()
+                    for l in after_text.splitlines() if l.strip()
+                }
+                window_dropped = before_lines - after_lines
+                if window_dropped:
+                    with st.expander(
+                        f"⏏ 本次被窗口淘汰 {len(window_dropped)} 条（仍可在更早的历史中回看）",
+                        expanded=False,
+                    ):
+                        for line in list(window_dropped)[:20]:
+                            st.markdown(f"  - {line}")
+                        if len(window_dropped) > 20:
+                            st.caption(f"…还有 {len(window_dropped) - 20} 条")
                 st.divider()
+
+            if len(accumulated) < total:
+                if st.button(
+                    f"⬇ 加载更早历史（已加载 {len(accumulated)} / {total}）",
+                    key=f"calib_hist_more_{pid}",
+                    use_container_width=True,
+                ):
+                    cursor = st.session_state.get(cursor_key)
+                    older = db.list_calibration_audit(
+                        client, pid, limit=page_size, before_ts=cursor,
+                    )
+                    if older:
+                        accumulated.extend(older)
+                        st.session_state[accum_key] = accumulated
+                        st.session_state[cursor_key] = (
+                            older[-1].get("created_at") or cursor
+                        )
+                        st.rerun()
 
 
 def _render_tactics_settings(client: Client, project: dict) -> None:

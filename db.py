@@ -17,6 +17,7 @@ from datetime import datetime
 
 from supabase import create_client, Client
 import config
+import telemetry
 
 try:
     import streamlit as st
@@ -449,39 +450,53 @@ def update_version_content(
 
 def update_version_embedding(
     client: Client, version_id: str, vec: list[float]
-) -> None:
+) -> bool:
     """Persist a 768-dim embedding for a single version row.  Tolerant of
     older deployments where the pgvector column hasn't been added yet —
     fails silently so the generation path doesn't blow up on a missing
-    column."""
+    column.  Returns True on success, False on failure."""
     if not vec:
-        return
+        return False
     try:
         client.table("versions").update({"embedding": vec}).eq("id", version_id).execute()
-    except Exception:
-        pass
+        return True
+    except Exception as exc:
+        telemetry.log_event(
+            "embedding_row_update_failed",
+            version_id=version_id, error=str(exc)[:200],
+        )
+        return False
 
 
 def bulk_update_version_embeddings(
-    client: Client, rows: list[dict]
+    client: Client,
+    rows: list[dict],
+    failed_sink: Optional[list[str]] = None,
 ) -> None:
     """Persist many version embeddings in one round trip.  Each row needs
     ``{"id": <version_id>, "embedding": [..]}``.  Falls back to per-row
     UPDATE if upsert isn't allowed by RLS for this user.
 
     Best-effort: errors are swallowed so an embedding failure never blocks
-    the user's batch.
+    the user's batch — but with full telemetry so累积衰减可以被发现.
+    ``failed_sink`` 给调用方一个直接拿到本次失败 version_id 列表的入口，
+    UI 可以在批次完成后展示"⚠ N 条版本缺少向量"提示。
     """
     if not rows:
         return
     try:
         client.table("versions").upsert(rows).execute()
         return
-    except Exception:
-        pass
+    except Exception as exc:
+        telemetry.log_event(
+            "embedding_upsert_fallback",
+            count=len(rows), error=str(exc)[:200],
+        )
     # Per-row fallback
     for r in rows:
-        update_version_embedding(client, r.get("id", ""), r.get("embedding") or [])
+        ok = update_version_embedding(client, r.get("id", ""), r.get("embedding") or [])
+        if not ok and failed_sink is not None:
+            failed_sink.append(r.get("id", ""))
 
 
 def get_recent_titles_openings_with_embeddings(
@@ -988,23 +1003,49 @@ def insert_calibration_audit(
 
 
 def list_calibration_audit(
-    client: Client, project_id: str, limit: int = 30
+    client: Client,
+    project_id: str,
+    limit: int = 30,
+    before_ts: Optional[str] = None,
 ) -> list[dict]:
-    """查看某个项目最近 N 次调教笔记的写入记录（UI 排障用）。"""
+    """查看某个项目调教笔记的写入历史（UI 排障用）。
+
+    ``before_ts`` 给分页用：传入上一页最旧一条的 ``created_at`` 字符串，
+    返回结果会严格早于该时间戳。不传则返回最新 ``limit`` 条。
+    """
     if not project_id:
         return []
     try:
-        res = (
+        q = (
             client.table("calibration_note_audit")
             .select("*")
             .eq("project_id", project_id)
             .order("created_at", desc=True)
             .limit(limit)
-            .execute()
         )
+        if before_ts:
+            q = q.lt("created_at", before_ts)
+        res = q.execute()
         return res.data or []
     except Exception:
         return []
+
+
+def count_calibration_audit(client: Client, project_id: str) -> int:
+    """项目调教笔记历史的总条数。UI 用于显示 "X / Y 条" 标签。"""
+    if not project_id:
+        return 0
+    try:
+        res = (
+            client.table("calibration_note_audit")
+            .select("id", count="exact")
+            .eq("project_id", project_id)
+            .limit(1)
+            .execute()
+        )
+        return int(getattr(res, "count", 0) or 0)
+    except Exception:
+        return 0
 
 
 def backfill_memory_embeddings(
@@ -1332,5 +1373,9 @@ def insert_session_instruction(
         res = client.table("memories").insert(payload).execute()
         _invalidate_memory_caches()
         return (res.data or [None])[0]
-    except Exception:
+    except Exception as exc:
+        telemetry.log_event(
+            "session_instruction_insert_failed",
+            project_id=project_id, error=str(exc)[:200],
+        )
         return None

@@ -182,8 +182,11 @@ def _run_hard_constraint_check(
         try:
             if iv.get("item_id"):
                 db.update_item_status(db_client, iv["item_id"], "needs_revision")
-        except Exception:
-            pass
+        except Exception as exc:
+            telemetry.log_event(
+                "hard_rule_status_update_failed",
+                item_id=iv.get("item_id"), error=str(exc)[:200],
+            )
         for hit in hits:
             kind_label = {
                 "forbidden_word":  "禁用词",
@@ -320,8 +323,11 @@ def _try_regen_one(
     if item_id:
         try:
             db.update_item_status(db_client, item_id, "needs_revision")
-        except Exception:
-            pass
+        except Exception as exc:
+            telemetry.log_event(
+                "regen_status_update_failed",
+                item_id=item_id, error=str(exc)[:200],
+            )
     errors_sink.append(
         f"{error_prefix}《{titles_in_order[dup_idx]}》重试 {max_retries} 次仍重复，"
         f"已标记 needs_revision；建议人工处理或删除。"
@@ -634,8 +640,14 @@ def _queue_worker(
                     ]
                     if seed:
                         queue_embeddings[project_id] = seed
-                except Exception:
-                    pass
+                except Exception as exc:
+                    telemetry.log_event(
+                        "embedding_prime_failed",
+                        project_id=project_id, error=str(exc)[:200],
+                    )
+                    status.setdefault("warnings", []).append(
+                        f"项目历史向量加载失败：{str(exc)[:120]}（去重池为空，本次队列重复率可能上升）"
+                    )
 
             # 优先取内存池里的最新批次，再补 DB 历史（按 title+opening 去重），
             # 控制 prompt 的总长度 — _build_dedup_instruction 内部会截到最近 N 条
@@ -2829,12 +2841,16 @@ def page_review(project: dict) -> None:
         save_col, discard_col = st.columns(2)
         with save_col:
             if st.button("💾 保存到项目设置", key=f"save_calib_{batch_id}", use_container_width=True):
-                mem_module.save_calibration_notes(
-                    db_client, project["id"], edited, source="user_manual"
-                )
-                del st.session_state[calib_key]
-                st.success("调教笔记已保存，下次生成时生效。")
-                st.rerun()
+                try:
+                    mem_module.save_calibration_notes(
+                        db_client, project["id"], edited, source="user_manual"
+                    )
+                except Exception as exc:
+                    st.error(f"保存失败：{exc}。预览内容保留，可重试。")
+                else:
+                    del st.session_state[calib_key]
+                    st.success("调教笔记已保存，下次生成时生效。")
+                    st.rerun()
         with discard_col:
             if st.button("✕ 放弃", key=f"discard_calib_{batch_id}", use_container_width=True):
                 del st.session_state[calib_key]
@@ -3505,7 +3521,7 @@ def _collect_approved_items(items: list[dict]) -> list[dict]:
 def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dict]) -> None:
     """
     太子自动学习：批次全部通过后静默生成并保存调教笔记，无需人工确认。
-    失败时静默跳过，不打断用户操作。
+    失败时不打断用户操作，但会埋点 + toast 提示一次，避免"看似学习了实际没存"。
     """
     existing = (project.get("calibration_notes") or "").rstrip()
     try:
@@ -3524,8 +3540,12 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
                     db_client, project["id"], notes, source="batch_reflection",
                 )
                 st.toast("🧠 调教笔记已新增观察（太子学习完成）")
-    except Exception:
-        pass  # 静默失败，不影响主流程
+    except Exception as exc:
+        telemetry.log_event(
+            "batch_reflection_save_failed",
+            project_id=project.get("id"), batch_id=batch_id, error=str(exc)[:200],
+        )
+        st.toast("⚠ 太子学习失败，已记录日志（不影响主流程）")
 
 
 def _generate_calibration_notes_ui(project: dict, batch_id: str, items: list[dict]) -> None:

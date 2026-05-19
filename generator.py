@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
 import config
+import telemetry
 
 # Gemini import (graceful fallback if not installed)
 try:
@@ -1185,7 +1186,10 @@ def _apply_compliance_recheck(slots: list[dict], system_prompt: str) -> None:
         cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
         data = json.loads(cleaned)
         violations = data.get("violations", []) if isinstance(data, dict) else []
-    except Exception:
+    except Exception as exc:
+        telemetry.log_event(
+            "compliance_recheck_failed", error=str(exc)[:200],
+        )
         return
 
     for viol in violations:
@@ -1327,8 +1331,10 @@ def _select_best_drafts_batch(
                 (int(item.get("best_index", 0)), str(item.get("notes", "")))
                 for item in data
             ]
-    except Exception:
-        pass
+    except Exception as exc:
+        telemetry.log_event(
+            "draft_select_parse_failed", error=str(exc)[:200],
+        )
     return [(0, "") for _ in all_slot_drafts]
 
 
@@ -1404,8 +1410,10 @@ def _refine_drafts_batch(
                         "output_tokens": resp.usage.output_tokens,
                     },
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            telemetry.log_event(
+                "refine_failed", index=idx, engine=draft.ai_engine, error=str(exc)[:200],
+            )
         return idx, draft  # fallback to original
 
     result_list: list[GenerationResult] = list(drafts)  # pre-fill with originals
