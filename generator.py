@@ -1029,9 +1029,17 @@ def generate_batch(
     if dedup_block:
         user_prompt += "\n\n" + dedup_block
 
-    # One API call per engine, each returning `count` items in a single response.
-    # Engines run in parallel via ThreadPoolExecutor.
-    def _call_engine(engine_name: str) -> tuple[str, list[GenerationResult]]:
+    # One API call per engine, each returning `count` items in a single
+    # response.  For single-engine batches (the common path) we still run the
+    # ThreadPoolExecutor below for code-path symmetry — the pool just has one
+    # worker.  For multi-engine batches we run engines **sequentially** so the
+    # second/third engine sees the first engine's already-produced titles in
+    # its dedup block; otherwise two parallel engines would each produce 10
+    # items blind to the other, doubling the in-batch duplicate rate.
+
+    def _engine_call(
+        engine_name: str, user_prompt_for_engine: str
+    ) -> tuple[str, list[GenerationResult]]:
         try:
             engine = get_engine(engine_name)
             model_override = (engine_models or {}).get(engine_name, "")
@@ -1041,7 +1049,7 @@ def generate_batch(
             )
             items = engine.generate(
                 system_prompt=system_prompt,
-                user_prompt=user_prompt,
+                user_prompt=user_prompt_for_engine,
                 images=images,
                 use_thinking=thinking_flag,
                 model=model_override,
@@ -1054,16 +1062,50 @@ def generate_batch(
         return engine_name, items
 
     engine_results: dict[str, list[GenerationResult]] = {}
-    with ThreadPoolExecutor(max_workers=len(engines)) as executor:
-        futures = {executor.submit(_call_engine, eng): eng for eng in engines}
-        total = len(engines)
-        done = 0
-        for future in as_completed(futures):
+
+    if len(engines) <= 1:
+        # Fast path: single engine, no cross-engine dedup needed.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_engine_call, engines[0], user_prompt)
             eng, items = future.result()
             engine_results[eng] = items
-            done += 1
             if progress_callback:
-                progress_callback(done / total, f"已完成 {done}/{total} 个引擎…")
+                progress_callback(1.0, "已完成 1/1 个引擎…")
+    else:
+        # Sequential path: each subsequent engine's prompt embeds the
+        # previously-produced titles as additional "do not duplicate" entries.
+        produced: list[dict] = []  # {"title", "opening"} accumulated across engines
+        for i, eng in enumerate(engines):
+            # Augment dedup block with what previous engines already wrote.
+            extra_dedup = _build_dedup_instruction(
+                generated_summaries=[],
+                historical=list(historical_titles or []) + produced,
+            )
+            prompt_for_this_engine = _make_user_prompt(
+                tactic=tactic,
+                target_audience=target_audience,
+                key_messages=key_messages,
+                tone=tone,
+                extra=extra_instructions,
+                count=count,
+            )
+            if extra_dedup:
+                prompt_for_this_engine += "\n\n" + extra_dedup
+            _eng_name, items = _engine_call(eng, prompt_for_this_engine)
+            engine_results[_eng_name] = items
+            # Feed only successful items into the cross-engine pool.
+            for it in items:
+                if it.error or not it.title:
+                    continue
+                opening = ""
+                body = (it.body or "").strip()
+                if body:
+                    line = next((ln for ln in body.splitlines() if ln.strip()), "")
+                    opening = line.strip()[:25]
+                produced.append({"title": it.title.strip(), "opening": opening})
+            if progress_callback:
+                progress_callback((i + 1) / len(engines),
+                                  f"已完成 {i+1}/{len(engines)} 个引擎…")
 
     # Assemble: slot i gets one version per engine
     slots = [

@@ -26,6 +26,7 @@ import memory as mem_module
 import generator as gen_module
 import image_handler
 import exporter
+import dedup as dedup_module
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -39,12 +40,54 @@ def _queue_worker(
     status: dict,
     stop_event: threading.Event,
 ) -> None:
-    """Background daemon thread: executes queued generation plans sequentially."""
+    """后台 daemon 线程：顺序执行队列里的所有生成计划。
+
+    ─────────────────────────────────────────────────────────────────────
+    每个 plan 的处理流程分 5 步：
+      [A] 取项目配置 + 记忆 + 示例 + 会话指令（首次访问该项目时查 DB，
+          后续从内存 cache 取，避免 N 个 plan 查 N 次）
+      [B] 按本次 tactic + key_messages 过滤 soft 规则的相关性
+      [C] 合并历史标题池（DB 历史 + 本队列已生成）→ 喂给 generator
+      [D] 调用 generator.generate_batch（或 generate_batch_multi_role）
+      [E] 批量保存 items + versions；如果开启了 embedding 服务，
+          同步算 embedding + 跨批语义查重
+
+    顶层有 4 个 in-memory 缓存，全部按 project_id 分桶：
+      - mem_cache / example_cache / session_cache：避免重复查 Supabase
+      - queue_titles：本队列已生成的标题，让下一批的去重指令立刻看到
+      - queue_embeddings：本队列累积的标题 + 768d embedding，
+        让下一批的语义查重立刻看到（首次访问项目时预热）
+    ─────────────────────────────────────────────────────────────────────
+    """
     status["running"] = True
     status["done"] = False
     status["total"] = len(plans)
     status.setdefault("completed", [])
     status.setdefault("errors", [])
+
+    # ── [A 预热] 队列开始前查一次项目列表，循环里按 id 取，省去 per-plan 查询 ──
+    try:
+        all_projects = db.list_projects(db_client, user_id)
+    except Exception as exc:
+        status["errors"].append(f"预取项目列表失败：{exc}")
+        all_projects = []
+    project_by_id = {p["id"]: p for p in all_projects}
+    mem_cache: dict[str, tuple] = {}      # project_id → (global_mems, project_mems)
+    example_cache: dict[str, tuple] = {}  # project_id → (pos_examples, neg_examples)
+    session_cache: dict[str, list] = {}   # project_id → session_instructions
+
+    # ── 跨批去重池（文本匹配版）─────────────────────────────────────────
+    # 修复"4 批 × 10 篇 → 30 篇重复"的核心：之前每批只能看 DB 里已经写入的标题，
+    # 同队列前面批次的内容可能还没落库或刚落库，下一批看不到 → 还会撞角度。
+    # 这里在内存里累积，每批生成完立刻 append，下一批 prompt 直接看到。
+    queue_titles: dict[str, list[dict]] = {}  # project_id → [{title, opening}, ...]
+
+    # ── 跨批去重池（语义版）────────────────────────────────────────────
+    # 同 queue_titles 的设计，但带 768d Gemini embedding，能识别"换字不换义"
+    # 的近似重复（例：'炫耀' 改 '展示' 文本匹配抓不到）。
+    # 每个 project_id 首次出现时从 DB 拉历史 embedding 预热一次。
+    queue_embeddings: dict[str, list[dict]] = {}  # project_id → [{title, embedding}, ...]
+    primed_projects: set[str] = set()
 
     for idx, plan in enumerate(plans):
         if stop_event.is_set():
@@ -58,8 +101,7 @@ def _queue_worker(
 
         try:
             project_id = plan["project_id"]
-            all_projects = db.list_projects(db_client, user_id)
-            project = next((p for p in all_projects if p["id"] == project_id), None)
+            project = project_by_id.get(project_id)
             if not project:
                 status["errors"].append(f"计划 {idx+1}：找不到项目 {project_id}")
                 continue
@@ -69,17 +111,42 @@ def _queue_worker(
                 status["errors"].append(f"计划 {idx+1}：项目未配置 System Prompt")
                 continue
 
+            # ── [A 取数] 项目配置/记忆/示例/会话指令（带 per-project 缓存）──
             tactic_suffix  = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
-            global_mems, project_mems = db.get_confirmed_memories(
-                db_client, user_id, project_id=project_id
-            )
-            pos_examples  = db.list_example_items(db_client, project_id, "positive", limit=5)
-            neg_examples  = db.list_example_items(db_client, project_id, "negative", limit=3)
-            session_instr = db.get_session_instructions(db_client, user_id, project_id=project_id)
+            if project_id not in mem_cache:
+                mem_cache[project_id] = db.get_confirmed_memories(
+                    db_client, user_id, project_id=project_id
+                )
+            global_mems, project_mems = mem_cache[project_id]
+            if project_id not in example_cache:
+                example_cache[project_id] = (
+                    db.list_example_items(db_client, project_id, "positive", limit=5),
+                    db.list_example_items(db_client, project_id, "negative", limit=3),
+                )
+            pos_examples, neg_examples = example_cache[project_id]
+            if project_id not in session_cache:
+                session_cache[project_id] = db.get_session_instructions(
+                    db_client, user_id, project_id=project_id
+                )
+            session_instr = session_cache[project_id]
+
+            # ── [B 相关性筛选] 用本批 tactic+卖点过滤 soft 规则 ────────────
+            # 把明显不相关的 soft 规则丢掉（例如生成酒类文案时，"标题别用数字"
+            # 这种通用偏好可能与本次无关）。Hard 规则永远全部注入；老规则没有
+            # embedding 时直接放行（不丢失）。
+            context_text = " ".join(filter(None, [
+                tactic,
+                plan.get("key_messages", ""),
+                plan.get("target_audience", ""),
+                plan.get("extra_instructions", ""),
+            ])).strip()
+            global_mems_for_plan  = mem_module.filter_soft_by_relevance(global_mems,  context_text)
+            project_mems_for_plan = mem_module.filter_soft_by_relevance(project_mems, context_text)
+
             full_system_prompt = mem_module.build_system_prompt(
                 base_prompt=base_prompt,
-                global_memories=global_mems,
-                project_memories=project_mems,
+                global_memories=global_mems_for_plan,
+                project_memories=project_mems_for_plan,
                 tactic_suffix=tactic_suffix,
                 calibration_notes=project.get("calibration_notes") or "",
                 positive_examples=pos_examples or None,
@@ -124,8 +191,40 @@ def _queue_worker(
                     batch_id=batch_id,
                 )
 
-            historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
+            # ── [C 合并历史] DB 历史 + 本队列已生成的内存池 ─────────────────
+            db_titles = db.get_recent_titles_and_openings(db_client, project_id)
 
+            # 项目首次出现：拉一次历史 embedding 预热语义查重池
+            if (project_id not in primed_projects
+                and dedup_module.embeddings_available()):
+                primed_projects.add(project_id)
+                try:
+                    hist_rows = db.get_recent_titles_openings_with_embeddings(
+                        db_client, project_id
+                    )
+                    seed = [
+                        {"title": h["title"], "embedding": h["embedding"]}
+                        for h in hist_rows
+                        if h.get("embedding") and h.get("title")
+                    ]
+                    if seed:
+                        queue_embeddings[project_id] = seed
+                except Exception:
+                    pass
+
+            # 优先取内存池里的最新批次，再补 DB 历史（按 title+opening 去重），
+            # 控制 prompt 的总长度 — _build_dedup_instruction 内部会截到最近 N 条
+            pool = list(queue_titles.get(project_id, []))
+            seen = {(p["title"], p.get("opening", "")) for p in pool}
+            for h in (db_titles or []):
+                key = (h.get("title", ""), h.get("opening", ""))
+                if key in seen:
+                    continue
+                pool.append(h)
+                seen.add(key)
+            historical_titles = pool
+
+            # ── [D 生成] 调用 generator；多引擎模式内部会串行复用 dedup pool ──
             _total   = count * len(engines)
             _done_n  = [0]
             def _progress(pct: float, msg: str, _idx=idx, _n=len(plans), _t=_total) -> None:
@@ -170,28 +269,110 @@ def _queue_worker(
                     project_id=project_id,
                 )
 
+            # ── [E 保存] 批量写 items + versions，再补 embedding 查重 ───────
+            # 保存改为两次批量 INSERT（items 一次 + versions 一次），比之前
+            # 逐条 INSERT 节省 ~30 次 round trip（10 篇 × 2 引擎的批次）
             saved = 0
+            produced_titles: list[dict] = []
+            item_rows: list[dict] = []
             for slot in generation_results:
-                item = db.create_item(
-                    db_client, user_id, batch_id,
-                    ai_review_notes=slot.get("ai_review_notes") or None,
-                )
+                item_rows.append({
+                    "batch_id": batch_id,
+                    "user_id":  user_id,
+                    **({"ai_review_notes": slot["ai_review_notes"]}
+                       if slot.get("ai_review_notes") else {}),
+                })
+            try:
+                inserted_items = db.bulk_create_items(db_client, item_rows)
+            except Exception as exc:
+                status["errors"].append(f"计划 {idx+1}：批量写入 items 失败 — {exc}")
+                inserted_items = []
+
+            version_rows: list[dict] = []
+            for slot, item in zip(generation_results, inserted_items):
                 for vr in slot["versions"]:
                     if vr.error and not vr.title:
                         status["errors"].append(
                             f"计划 {idx+1}（{proj_name}）· {vr.ai_engine}：{vr.error}"
                         )
                         continue
-                    db.create_version(
-                        db_client,
-                        item_id=item["id"],
-                        ai_engine=vr.ai_engine,
-                        title=vr.title,
-                        body=vr.body,
-                        keywords=vr.keywords,
-                        token_usage=vr.token_usage,
-                    )
-                    saved += 1
+                    version_rows.append({
+                        "item_id":     item["id"],
+                        "ai_engine":   vr.ai_engine,
+                        "title":       vr.title,
+                        "body":        vr.body,
+                        "keywords":    vr.keywords,
+                        "token_usage": vr.token_usage,
+                    })
+                    opening = ""
+                    body = (vr.body or "").strip()
+                    if body:
+                        first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
+                        opening = first_line.strip()[:25]
+                    if vr.title:
+                        produced_titles.append({"title": vr.title.strip(), "opening": opening})
+            inserted_versions: list[dict] = []
+            try:
+                inserted_versions = db.bulk_create_initial_versions(db_client, version_rows)
+                saved = len(inserted_versions)
+            except Exception as exc:
+                status["errors"].append(f"计划 {idx+1}：批量写入 versions 失败 — {exc}")
+
+            # ── 语义查重（仅在配置了 GOOGLE_API_KEY 时启用）──────────────────
+            # 文本去重只能抓字面重复；同义改写（"炫耀"→"展示"）能绕过。
+            # 这一步：把刚保存的标题各算一次 768d embedding，
+            #   1. 写入 versions.embedding 列（供后续批次复用）
+            #   2. 对照本队列历史池：cos ≥ 0.92 视为近似重复 → 警告
+            #   3. 对照本批内：例如多引擎模式下 Claude 和 Gemini 撞角度 → 警告
+            #   4. 累积到 queue_embeddings，下一批就能用
+            # 没配 GOOGLE_API_KEY 时整段跳过，主流程不受影响。
+            if inserted_versions and dedup_module.embeddings_available():
+                titles_in_order = [r.get("title", "") for r in version_rows]
+                new_vecs = dedup_module.embed_texts(titles_in_order)
+                if new_vecs:
+                    # 步骤 1：把 embedding 持久化到 versions 表
+                    embed_rows = []
+                    for i, iv in enumerate(inserted_versions):
+                        if i < len(new_vecs):
+                            embed_rows.append({
+                                "id":        iv.get("id"),
+                                "embedding": new_vecs[i],
+                            })
+                    if embed_rows:
+                        db.bulk_update_version_embeddings(db_client, embed_rows)
+
+                    # 步骤 2：与历史池对比（DB 历史 + 本队列前面批次）
+                    hist_pool = queue_embeddings.get(project_id, [])
+                    if hist_pool:
+                        h_vecs   = [h["embedding"] for h in hist_pool]
+                        h_titles = [h["title"]     for h in hist_pool]
+                        hits = dedup_module.find_near_duplicates(
+                            new_vecs, titles_in_order,
+                            h_vecs, h_titles,
+                        )
+                        for hit in hits:
+                            status["errors"].append(
+                                f"计划 {idx+1}（{proj_name}）· 近似重复：《{hit['title']}》"
+                                f" ↔ 历史《{hit['best_match']}》（相似度 {hit['score']:.2f}）"
+                            )
+
+                    # 步骤 3：本批内查重（主要针对多引擎模式的撞车）
+                    intra = dedup_module.cross_batch_pairs(new_vecs, titles_in_order)
+                    for pair in intra:
+                        status["errors"].append(
+                            f"计划 {idx+1}（{proj_name}）· 本批内近似：《{pair['title_i']}》"
+                            f" ↔ 《{pair['title_j']}》（相似度 {pair['score']:.2f}）"
+                        )
+
+                    # 步骤 4：累积进 queue_embeddings，给下一批用
+                    pool = queue_embeddings.setdefault(project_id, [])
+                    for i, t in enumerate(titles_in_order):
+                        if i < len(new_vecs) and t:
+                            pool.append({"title": t, "embedding": new_vecs[i]})
+
+            # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）
+            if produced_titles:
+                queue_titles.setdefault(project_id, []).extend(produced_titles)
 
             status["completed"].append({
                 "plan_idx":    idx,
@@ -211,8 +392,15 @@ def _queue_worker(
         status["message"] = f"全部完成 ✓ {n_ok} 计划成功" + (f"，{n_err} 失败" if n_err else "")
 
 
-def _queue_banner() -> None:
-    """Render a sticky progress banner when a queue is running or just finished."""
+# Streamlit's @st.fragment auto-reruns only the decorated block, leaving
+# the rest of the page alone.  Available since Streamlit 1.33; we fall back
+# to the plain function on older versions.
+_FRAGMENT = getattr(st, "fragment", None)
+
+
+def _queue_banner_body() -> None:
+    """The actual banner content.  Factored out so the same code runs both
+    in fragment mode and as a normal function on Streamlit < 1.33."""
     qs = st.session_state.get("queue_state")
     if not qs:
         return
@@ -244,6 +432,61 @@ def _queue_banner() -> None:
                 st.session_state.pop("queue_state", None)
                 st.session_state.pop("queue_stop_event", None)
                 st.rerun()
+
+
+if _FRAGMENT is not None:
+    # When a queue is running, this fragment auto-reruns every 2 s without
+    # forcing the rest of the page to re-execute.  Massive perceived-perf
+    # win: pre-fragment, every 2 s the entire 3000+ line script re-ran just
+    # to update the progress bar, which is why other UI felt frozen during
+    # batch runs.
+    _queue_banner = _FRAGMENT(run_every=2.0)(_queue_banner_body)
+else:
+    _queue_banner = _queue_banner_body
+
+
+def _running_snapshot_body(qs_key: str = "queue_state") -> None:
+    """Live progress bar that polls queue state via fragment refresh.
+
+    ``qs_key`` is the session_state key to read (queue tab uses queue_state;
+    the quick-generate path uses queue_state_qg).
+    """
+    qs = st.session_state.get(qs_key)
+    if not qs or not qs.get("running"):
+        return
+    completed = len(qs.get("completed", []))
+    total     = qs.get("total", 0)
+    progress  = qs.get("progress")
+    if progress is None and total:
+        progress = completed / total
+    elif progress is None:
+        progress = 0.0
+    st.progress(progress, text=qs.get("message", "生成中…"))
+    st.caption("生成在后台运行，可切换到其他页面。")
+
+
+if _FRAGMENT is not None:
+    _render_running_snapshot = _FRAGMENT(run_every=2.0)(_running_snapshot_body)
+else:
+    _render_running_snapshot = _running_snapshot_body
+
+
+def _quick_gen_snapshot_body() -> None:
+    """Live progress for the quick-generate path, mirrors _running_snapshot_body
+    but reads from the separate ``quick_gen_state`` key."""
+    qgs = st.session_state.get("quick_gen_state")
+    if not qgs or not qgs.get("running"):
+        return
+    pct = qgs.get("progress", 0.0)
+    msg = qgs.get("message", "生成中…")
+    st.progress(pct, text=msg)
+    st.caption("生成在后台运行，可切换到其他页面。")
+
+
+if _FRAGMENT is not None:
+    _render_quick_gen_snapshot = _FRAGMENT(run_every=2.0)(_quick_gen_snapshot_body)
+else:
+    _render_quick_gen_snapshot = _quick_gen_snapshot_body
 
 
 def _format_batch_label(batch: dict, project_name: str = "") -> str:
@@ -1736,15 +1979,13 @@ def _render_queue_tab() -> None:
 
     # Live status within tab
     if is_running:
-        completed = len(qs.get("completed", []))
-        total     = qs.get("total", 0)
-        st.progress(
-            completed / total if total else 0,
-            text=qs.get("message", "生成中…"),
-        )
-        st.caption("生成在后台运行，可切换到其他页面。")
-        time.sleep(1.5)
-        st.rerun()
+        # The fragment-based _queue_banner already auto-refreshes the
+        # progress info every 2 s without re-running the whole page.
+        # Keep a static snapshot here for users on the queue tab, but no
+        # longer time.sleep + st.rerun — that was the main cause of the
+        # 1.5 s "click and wait" lag during batch runs (every interaction
+        # was racing the next forced rerun).
+        _render_running_snapshot()
 
     # Completed results summary
     if qs.get("done") and qs.get("completed"):
@@ -1915,12 +2156,10 @@ def page_generate(project: dict) -> None:
         qg_done    = bool(qgs and qgs.get("done"))
 
         if qg_running:
-            pct = qgs.get("progress", 0.0)
-            msg = qgs.get("message", "生成中…")
-            st.progress(pct, text=msg)
-            st.caption("生成在后台运行，可切换到其他页面。")
-            time.sleep(1.5)
-            st.rerun()
+            # Fragment-driven polling replaces the old sleep+rerun loop;
+            # the quick-generate path now refreshes the progress bar
+            # without forcing the whole script to re-execute.
+            _render_quick_gen_snapshot()
         elif qg_done:
             errors_list = qgs.get("errors", [])
             if errors_list:
@@ -2817,7 +3056,7 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
     太子自动学习：批次全部通过后静默生成并保存调教笔记，无需人工确认。
     失败时静默跳过，不打断用户操作。
     """
-    existing = project.get("calibration_notes") or ""
+    existing = (project.get("calibration_notes") or "").rstrip()
     try:
         with st.spinner("🧠 太子学习中…"):
             notes = mem_module.generate_calibration_notes(
@@ -2825,8 +3064,13 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
                 existing_notes=existing,
                 items_with_versions=items,
             )
-            mem_module.save_calibration_notes(db_client, project["id"], notes)
-            st.toast("🧠 调教笔记已自动更新（太子学习完成）")
+            # Append-only contract: generate_calibration_notes returns the
+            # existing text plus any newly appended observations.  Skip the
+            # save when nothing changed so the row's timestamp / dedup ordering
+            # stays untouched.
+            if notes and notes.rstrip() != existing:
+                mem_module.save_calibration_notes(db_client, project["id"], notes)
+                st.toast("🧠 调教笔记已新增观察（太子学习完成）")
     except Exception:
         pass  # 静默失败，不影响主流程
 

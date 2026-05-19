@@ -98,15 +98,18 @@ ENABLE_MEMORY_MERGE: bool = (
     os.environ.get("ENABLE_MEMORY_MERGE", "1") not in ("0", "false", "False")
 )
 
-# Maximum number of confirmed rule-memories injected into each generation's
-# System Prompt per scope (global / project).  Projects that accrete hundreds
-# of rules over time would otherwise blow up every request and drown the
-# model's attention.  Memory Manager still shows all rules — this cap only
-# affects what the backend feeds the model.  Ranked: frequency DESC, then
-# created_at DESC so heavyweight rules stay in and recent additions are
-# prioritised over older low-frequency stragglers.
+# Maximum number of ``severity='soft'`` rule-memories injected per scope
+# (global / project).  Hard rules (compliance / brand lines) are NOT
+# subject to this cap — they always feed the P0 tier in full.
+#
+# Lowered from 40 → 12 in 2026-05: at 40 the system prompt routinely
+# carried 80+ "必须执行" lines (40 global + 40 project + calibration +
+# few-shots + session), which drowned model attention and caused the
+# user-reported "hard requirements not being respected" — there were so
+# many same-priority "rules" the model couldn't tell which ones were
+# non-negotiable.
 MAX_INJECTED_MEMORIES_PER_SCOPE: int = int(
-    os.environ.get("MAX_INJECTED_MEMORIES_PER_SCOPE", "40")
+    os.environ.get("MAX_INJECTED_MEMORIES_PER_SCOPE", "12")
 )
 
 # ── Compliance recheck ────────────────────────────────────────────────────
