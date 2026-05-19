@@ -40,17 +40,32 @@ def _queue_worker(
     status: dict,
     stop_event: threading.Event,
 ) -> None:
-    """Background daemon thread: executes queued generation plans sequentially."""
+    """后台 daemon 线程：顺序执行队列里的所有生成计划。
+
+    ─────────────────────────────────────────────────────────────────────
+    每个 plan 的处理流程分 5 步：
+      [A] 取项目配置 + 记忆 + 示例 + 会话指令（首次访问该项目时查 DB，
+          后续从内存 cache 取，避免 N 个 plan 查 N 次）
+      [B] 按本次 tactic + key_messages 过滤 soft 规则的相关性
+      [C] 合并历史标题池（DB 历史 + 本队列已生成）→ 喂给 generator
+      [D] 调用 generator.generate_batch（或 generate_batch_multi_role）
+      [E] 批量保存 items + versions；如果开启了 embedding 服务，
+          同步算 embedding + 跨批语义查重
+
+    顶层有 4 个 in-memory 缓存，全部按 project_id 分桶：
+      - mem_cache / example_cache / session_cache：避免重复查 Supabase
+      - queue_titles：本队列已生成的标题，让下一批的去重指令立刻看到
+      - queue_embeddings：本队列累积的标题 + 768d embedding，
+        让下一批的语义查重立刻看到（首次访问项目时预热）
+    ─────────────────────────────────────────────────────────────────────
+    """
     status["running"] = True
     status["done"] = False
     status["total"] = len(plans)
     status.setdefault("completed", [])
     status.setdefault("errors", [])
 
-    # Prefetch once per queue run so we don't hammer Supabase per plan.  The
-    # project list rarely changes mid-queue; per-project memories / examples /
-    # session instructions stay stable for the life of one run.  These dicts
-    # are populated lazily on first sight of a project_id.
+    # ── [A 预热] 队列开始前查一次项目列表，循环里按 id 取，省去 per-plan 查询 ──
     try:
         all_projects = db.list_projects(db_client, user_id)
     except Exception as exc:
@@ -58,24 +73,20 @@ def _queue_worker(
         all_projects = []
     project_by_id = {p["id"]: p for p in all_projects}
     mem_cache: dict[str, tuple] = {}      # project_id → (global_mems, project_mems)
-    example_cache: dict[str, tuple] = {}  # project_id → (pos, neg)
+    example_cache: dict[str, tuple] = {}  # project_id → (pos_examples, neg_examples)
     session_cache: dict[str, list] = {}   # project_id → session_instructions
 
-    # Cross-batch dedup pool — keyed by project_id so different projects don't
-    # bleed into each other's title constraints.  Each entry is the same
-    # {"title", "opening"} dict shape that ``_build_dedup_instruction`` accepts.
-    # This is the fix for "30/40 duplicates when running 4 batches of 10":
-    # historical_titles from DB lags behind because earlier batches in the same
-    # queue haven't been persisted yet (or only partially); the in-memory pool
-    # lets each new batch see what previous batches just produced.
-    queue_titles: dict[str, list[dict]] = {}
+    # ── 跨批去重池（文本匹配版）─────────────────────────────────────────
+    # 修复"4 批 × 10 篇 → 30 篇重复"的核心：之前每批只能看 DB 里已经写入的标题，
+    # 同队列前面批次的内容可能还没落库或刚落库，下一批看不到 → 还会撞角度。
+    # 这里在内存里累积，每批生成完立刻 append，下一批 prompt 直接看到。
+    queue_titles: dict[str, list[dict]] = {}  # project_id → [{title, opening}, ...]
 
-    # Semantic dedup pool: same key/scope as queue_titles, but holds the
-    # 768-dim Gemini embedding alongside the title so subsequent batches can
-    # detect paraphrase-style duplicates that text-matching misses.
-    # Pre-seeded lazily per project from DB historical embeddings the first
-    # time we touch that project_id.
-    queue_embeddings: dict[str, list[dict]] = {}
+    # ── 跨批去重池（语义版）────────────────────────────────────────────
+    # 同 queue_titles 的设计，但带 768d Gemini embedding，能识别"换字不换义"
+    # 的近似重复（例：'炫耀' 改 '展示' 文本匹配抓不到）。
+    # 每个 project_id 首次出现时从 DB 拉历史 embedding 预热一次。
+    queue_embeddings: dict[str, list[dict]] = {}  # project_id → [{title, embedding}, ...]
     primed_projects: set[str] = set()
 
     for idx, plan in enumerate(plans):
@@ -100,6 +111,7 @@ def _queue_worker(
                 status["errors"].append(f"计划 {idx+1}：项目未配置 System Prompt")
                 continue
 
+            # ── [A 取数] 项目配置/记忆/示例/会话指令（带 per-project 缓存）──
             tactic_suffix  = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
             if project_id not in mem_cache:
                 mem_cache[project_id] = db.get_confirmed_memories(
@@ -118,9 +130,10 @@ def _queue_worker(
                 )
             session_instr = session_cache[project_id]
 
-            # Relevance filter: drop obviously-unrelated soft rules per-plan
-            # based on this batch's tactic + key_messages.  Hard rules and
-            # rules without embeddings (legacy) pass through unchanged.
+            # ── [B 相关性筛选] 用本批 tactic+卖点过滤 soft 规则 ────────────
+            # 把明显不相关的 soft 规则丢掉（例如生成酒类文案时，"标题别用数字"
+            # 这种通用偏好可能与本次无关）。Hard 规则永远全部注入；老规则没有
+            # embedding 时直接放行（不丢失）。
             context_text = " ".join(filter(None, [
                 tactic,
                 plan.get("key_messages", ""),
@@ -178,13 +191,10 @@ def _queue_worker(
                     batch_id=batch_id,
                 )
 
+            # ── [C 合并历史] DB 历史 + 本队列已生成的内存池 ─────────────────
             db_titles = db.get_recent_titles_and_openings(db_client, project_id)
 
-            # First time we see this project_id in this queue run, prime the
-            # embedding pool with whatever historical embeddings the DB has
-            # so the first batch already has cross-batch semantic dedup.
-            # Versions that don't yet have an embedding column populated are
-            # skipped (backfill is opportunistic, not blocking).
+            # 项目首次出现：拉一次历史 embedding 预热语义查重池
             if (project_id not in primed_projects
                 and dedup_module.embeddings_available()):
                 primed_projects.add(project_id)
@@ -202,10 +212,8 @@ def _queue_worker(
                 except Exception:
                     pass
 
-            # Merge the in-memory queue pool first so the *latest* in-flight
-            # batches outweigh older DB rows when the dedup block truncates to
-            # the last N entries.  Dict-keyed dedup on (title, opening) to keep
-            # the prompt budget tight when queues are long.
+            # 优先取内存池里的最新批次，再补 DB 历史（按 title+opening 去重），
+            # 控制 prompt 的总长度 — _build_dedup_instruction 内部会截到最近 N 条
             pool = list(queue_titles.get(project_id, []))
             seen = {(p["title"], p.get("opening", "")) for p in pool}
             for h in (db_titles or []):
@@ -216,6 +224,7 @@ def _queue_worker(
                 seen.add(key)
             historical_titles = pool
 
+            # ── [D 生成] 调用 generator；多引擎模式内部会串行复用 dedup pool ──
             _total   = count * len(engines)
             _done_n  = [0]
             def _progress(pct: float, msg: str, _idx=idx, _n=len(plans), _t=_total) -> None:
@@ -260,15 +269,11 @@ def _queue_worker(
                     project_id=project_id,
                 )
 
+            # ── [E 保存] 批量写 items + versions，再补 embedding 查重 ───────
+            # 保存改为两次批量 INSERT（items 一次 + versions 一次），比之前
+            # 逐条 INSERT 节省 ~30 次 round trip（10 篇 × 2 引擎的批次）
             saved = 0
             produced_titles: list[dict] = []
-
-            # ── Bulk save ─────────────────────────────────────────────────
-            # First insert all items in one round trip, then all versions
-            # in another.  Previously this was 1+N round trips per slot
-            # (1 create_item + 1 SELECT version_num + 1 INSERT per version),
-            # so a 10-item batch with 2 engines was ~30 round trips.  The
-            # bulk path collapses it to 2.
             item_rows: list[dict] = []
             for slot in generation_results:
                 item_rows.append({
@@ -313,18 +318,19 @@ def _queue_worker(
             except Exception as exc:
                 status["errors"].append(f"计划 {idx+1}：批量写入 versions 失败 — {exc}")
 
-            # ── Semantic dedup pass ────────────────────────────────────────
-            # Synonym/paraphrase repeats slip past the text-only dedup block
-            # (same angle, different wording).  Embed each newly-saved title
-            # and compare against historical embeddings + earlier batches in
-            # this queue; tag matches above HARD_DUPLICATE_THRESHOLD in the
-            # error log so the user notices on review.  Skipped silently when
-            # embeddings aren't configured (no GOOGLE_API_KEY).
+            # ── 语义查重（仅在配置了 GOOGLE_API_KEY 时启用）──────────────────
+            # 文本去重只能抓字面重复；同义改写（"炫耀"→"展示"）能绕过。
+            # 这一步：把刚保存的标题各算一次 768d embedding，
+            #   1. 写入 versions.embedding 列（供后续批次复用）
+            #   2. 对照本队列历史池：cos ≥ 0.92 视为近似重复 → 警告
+            #   3. 对照本批内：例如多引擎模式下 Claude 和 Gemini 撞角度 → 警告
+            #   4. 累积到 queue_embeddings，下一批就能用
+            # 没配 GOOGLE_API_KEY 时整段跳过，主流程不受影响。
             if inserted_versions and dedup_module.embeddings_available():
                 titles_in_order = [r.get("title", "") for r in version_rows]
                 new_vecs = dedup_module.embed_texts(titles_in_order)
                 if new_vecs:
-                    # 1. Persist new embeddings
+                    # 步骤 1：把 embedding 持久化到 versions 表
                     embed_rows = []
                     for i, iv in enumerate(inserted_versions):
                         if i < len(new_vecs):
@@ -335,7 +341,7 @@ def _queue_worker(
                     if embed_rows:
                         db.bulk_update_version_embeddings(db_client, embed_rows)
 
-                    # 2. Compare against historical pool
+                    # 步骤 2：与历史池对比（DB 历史 + 本队列前面批次）
                     hist_pool = queue_embeddings.get(project_id, [])
                     if hist_pool:
                         h_vecs   = [h["embedding"] for h in hist_pool]
@@ -350,7 +356,7 @@ def _queue_worker(
                                 f" ↔ 历史《{hit['best_match']}》（相似度 {hit['score']:.2f}）"
                             )
 
-                    # 3. Cross-batch within this batch (e.g. multi-engine)
+                    # 步骤 3：本批内查重（主要针对多引擎模式的撞车）
                     intra = dedup_module.cross_batch_pairs(new_vecs, titles_in_order)
                     for pair in intra:
                         status["errors"].append(
@@ -358,15 +364,13 @@ def _queue_worker(
                             f" ↔ 《{pair['title_j']}》（相似度 {pair['score']:.2f}）"
                         )
 
-                    # 4. Accumulate for the *next* batch's pool
+                    # 步骤 4：累积进 queue_embeddings，给下一批用
                     pool = queue_embeddings.setdefault(project_id, [])
                     for i, t in enumerate(titles_in_order):
                         if i < len(new_vecs) and t:
                             pool.append({"title": t, "embedding": new_vecs[i]})
 
-            # Append to the cross-batch dedup pool so the next plan touching
-            # this project sees what we just produced, regardless of whether
-            # the DB writes are visible yet to ``get_recent_titles_and_openings``.
+            # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）
             if produced_titles:
                 queue_titles.setdefault(project_id, []).extend(produced_titles)
 

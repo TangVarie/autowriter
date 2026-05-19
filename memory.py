@@ -1115,34 +1115,59 @@ def simplify_calibration_notes(existing_notes: str) -> Optional[str]:
 
 # ── Streamlit memory management UI ────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────
+# 记忆管理页面
+# ─────────────────────────────────────────────────────────────────────────
+#
+# 页面分四段（从上到下）：
+#   1. 标题 + 一句话总览
+#   2. "本次会注入哪些规则" 折叠预览（默认收起）
+#   3. 通用记忆 / 项目记忆 两个 tab，列出所有规则
+#   4. 手动添加 + 导入导出 + 补算 embedding（折叠到底部工具区）
+#
+# 单条规则行的设计原则：
+#   - 主屏幕只显示「内容 + 频率 + 删除按钮 + 候选才有的"确认"按钮」。
+#   - 进阶操作（severity 切换 / 静音 / 转调校笔记）收纳到行末的 ⚙ 弹出框，
+#     避免主列表被一排按钮挤花。
+#   - 旁边的 emoji badge（🔒/🔕/标签）替代文字说明，扫一眼就能区分。
+#
+# 修改入口：render_memory_manager → 4 个内部 helper（_render_inject_preview
+# / _render_memory_table / _render_memory_row / _render_bottom_tools）。
+
 def render_memory_manager(
     db_client: Client,
     user_id: str,
     project_id: Optional[str] = None,
     project_name: str = "",
 ) -> None:
-    """Render the full memory management page."""
+    """记忆管理页面的入口。
+
+    Streamlit 调用方式：在主菜单点 "🧠 记忆管理" 时执行。会渲染：
+    总览 → 注入预览（折叠）→ 通用/项目两个 tab → 底部工具区。
+    """
     st.header("🧠 记忆管理")
 
     cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 12) or 12)
-    st.caption(
-        f"系统按优先级分层注入：**P0 硬约束**（severity=hard 规则）无数量上限，"
-        f"必须 100% 满足；**P1 偏好**（severity=soft）每个范围最多 {cap} 条，"
-        f"近 7 天新增必入，其余按频次填充。列表里看到但未注入的规则只是暂不参与本次生成，"
-        f"不会丢失。被静音（muted_until 未过期）的规则会被跳过。"
-    )
+    # 一句话告诉用户：硬约束必入；偏好按数量上限挑；静音的不会被用。
+    # 详细规则在下面的 expander 里，不在主屏占用空间。
+    st.caption(f"硬约束每条必用 · 偏好最多注入 {cap} 条/范围 · 静音的暂不参与生成")
+    with st.expander("📘 完整规则说明", expanded=False):
+        st.markdown(
+            "- **硬约束（🔒）**：合规底线、品牌禁忌。每条都必须 100% 满足，没有数量上限。\n"
+            f"- **偏好**：风格、用词倾向。每个范围最多注入 {cap} 条（近 7 天新增必入，其余按频次）。\n"
+            "- **静音（🔕）**：临时禁用 24 小时，不删除；倒计时结束自动恢复。\n"
+            "- 列表里看到但未注入的规则不会丢失，只是本次没参与。"
+        )
 
-    # Inject-preview: show exactly what the next generation will see
+    # 注入预览：让用户看到「本次生成实际会注入哪些规则」，不用看 prompt 也能 debug
     _render_inject_preview(db_client, user_id, project_id, project_name)
 
     tab_global, tab_project = st.tabs(["通用记忆", f"项目记忆（{project_name or '当前项目'}）"])
-
     with tab_global:
         _render_memory_table(
             db_client, user_id, scope="global", project_id=None,
             label="通用记忆", current_project_id=project_id,
         )
-
     with tab_project:
         if not project_id:
             st.info("请先选择一个项目。")
@@ -1153,112 +1178,115 @@ def render_memory_manager(
                 current_project_id=project_id,
             )
 
-    # Embedding backfill — populate the embedding column on legacy rows
-    # in batches of 50 per click.  Hidden if embeddings aren't configured,
-    # so users without GOOGLE_API_KEY don't see a dead button.
+    # 底部工具区：手动添加 / 导入导出 / 补算 embedding 都折叠在这
+    _render_bottom_tools(db_client, user_id, project_id)
+
+
+def _render_bottom_tools(
+    db_client: Client, user_id: str, project_id: Optional[str]
+) -> None:
+    """底部工具区：3 个折叠卡片 = 手动添加 / 导入导出 / 补算 embedding。
+
+    刻意全部折叠默认收起，避免日常使用看记忆列表时被工具按钮干扰。
+    """
+    st.divider()
+
+    # 卡片 1：手动添加单条记忆
+    with st.expander("➕ 手动添加记忆", expanded=False):
+        with st.form("add_memory_form", clear_on_submit=True):
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                scope_choice = st.selectbox("类型", ["项目记忆", "通用记忆"])
+            with col2:
+                content = st.text_input("记忆内容", placeholder="例：标题带数字点击率更高")
+            add_submitted = st.form_submit_button("添加", use_container_width=True)
+        if add_submitted and content.strip():
+            scope = "project" if scope_choice == "项目记忆" else "global"
+            pid = project_id if scope == "project" else None
+            db.upsert_memory(
+                db_client, user_id,
+                scope=scope,
+                content=content.strip(),
+                source_feedback="手动添加",
+                project_id=pid,
+                auto_confirm_threshold=1,
+            )
+            st.success("记忆已添加。")
+            st.rerun()
+
+    # 卡片 2：导出 / 导入 JSON
+    with st.expander("📦 导出 / 导入（JSON）", expanded=False):
+        col_export, col_import = st.columns(2)
+        with col_export:
+            all_memories = db.list_memories(db_client, user_id)
+            if all_memories:
+                export_data = [
+                    {
+                        "scope":           m.get("scope", ""),
+                        "content":         m.get("content", ""),
+                        "source_feedback": m.get("source_feedback", ""),
+                        "frequency":       m.get("frequency", 1),
+                        "status":          m.get("status", "candidate"),
+                    }
+                    for m in all_memories
+                ]
+                st.download_button(
+                    label="⬇️ 导出全部记忆",
+                    data=json.dumps(export_data, ensure_ascii=False, indent=2).encode("utf-8"),
+                    file_name="memories_export.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("暂无记忆可导出。")
+        with col_import:
+            uploaded = st.file_uploader("上传 JSON 文件", type=["json"], key="mem_import")
+            if uploaded and st.button("📥 开始导入", use_container_width=True):
+                try:
+                    import_data = json.loads(uploaded.read().decode("utf-8"))
+                    if not isinstance(import_data, list):
+                        st.error("JSON 格式错误：需要一个数组。")
+                    else:
+                        imported = 0
+                        for m in import_data:
+                            scope = m.get("scope", "project")
+                            if scope not in ("project", "global"):
+                                scope = "project"
+                            pid = project_id if scope == "project" else None
+                            db.upsert_memory(
+                                db_client, user_id,
+                                scope=scope,
+                                content=m.get("content", ""),
+                                source_feedback=m.get("source_feedback", "导入"),
+                                project_id=pid,
+                                auto_confirm_threshold=1,
+                            )
+                            imported += 1
+                        st.success(f"已导入 {imported} 条记忆。")
+                        st.rerun()
+                except json.JSONDecodeError:
+                    st.error("JSON 解析失败，请检查文件格式。")
+
+    # 卡片 3：embedding 补算（仅在配置了 GOOGLE_API_KEY 时显示）
     try:
         import dedup as _dedup
         embedding_ready = _dedup.embeddings_available()
     except Exception:
         embedding_ready = False
     if embedding_ready:
-        st.divider()
-        col_bf1, col_bf2 = st.columns([3, 1])
-        with col_bf1:
+        with st.expander("🔄 给老规则补算 embedding（相关性筛选用）", expanded=False):
             st.caption(
-                "📐 旧记忆没有 embedding 时，相关性筛选只能放行；点右侧按钮分批补算。"
-                "每次最多 50 条，可重复点击直到全部补完。"
+                "新建/迭代得到的规则会自动算 embedding。系统升级之前的老规则没有 embedding，"
+                "相关性筛选时会全部放行（不会丢失）。点下面的按钮分批补算，"
+                "每次最多 50 条，可以重复点击。"
             )
-        with col_bf2:
-            if st.button("🔄 补算 embedding", use_container_width=True, key="backfill_mem_embed"):
+            if st.button("立即补算（最多 50 条）", use_container_width=True, key="backfill_mem_embed"):
                 count = db.backfill_memory_embeddings(db_client, user_id, max_rows=50)
                 if count > 0:
                     st.success(f"已补算 {count} 条。")
                 else:
-                    st.info("没有需要补算的记忆，或 embedding 服务暂时不可用。")
+                    st.info("没有需要补算的记忆。")
                 st.rerun()
-
-    # Manual add
-    st.divider()
-    st.markdown("#### ➕ 手动添加记忆")
-    with st.form("add_memory_form", clear_on_submit=True):
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            scope_choice = st.selectbox("类型", ["项目记忆", "通用记忆"])
-        with col2:
-            content = st.text_input("记忆内容", placeholder="例：标题带数字点击率更高")
-        add_submitted = st.form_submit_button("添加", use_container_width=True)
-
-    if add_submitted and content.strip():
-        scope = "project" if scope_choice == "项目记忆" else "global"
-        pid = project_id if scope == "project" else None
-        db.upsert_memory(
-            db_client, user_id,
-            scope=scope,
-            content=content.strip(),
-            source_feedback="手动添加",
-            project_id=pid,
-            auto_confirm_threshold=1,  # manual → immediately confirmed
-        )
-        st.success("记忆已添加。")
-        st.rerun()
-
-    # Export / Import
-    st.divider()
-    st.markdown("#### 📦 记忆导出 & 导入")
-
-    col_export, col_import = st.columns(2)
-
-    with col_export:
-        all_memories = db.list_memories(db_client, user_id)
-        if all_memories:
-            export_data = []
-            for m in all_memories:
-                export_data.append({
-                    "scope": m.get("scope", ""),
-                    "content": m.get("content", ""),
-                    "source_feedback": m.get("source_feedback", ""),
-                    "frequency": m.get("frequency", 1),
-                    "status": m.get("status", "candidate"),
-                })
-            export_json = json.dumps(export_data, ensure_ascii=False, indent=2)
-            st.download_button(
-                label="⬇️ 导出记忆 (JSON)",
-                data=export_json.encode("utf-8"),
-                file_name="memories_export.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-        else:
-            st.caption("暂无记忆可导出。")
-
-    with col_import:
-        uploaded = st.file_uploader("导入记忆 (JSON)", type=["json"], key="mem_import")
-        if uploaded and st.button("📥 开始导入", use_container_width=True):
-            try:
-                import_data = json.loads(uploaded.read().decode("utf-8"))
-                if not isinstance(import_data, list):
-                    st.error("JSON 格式错误：需要一个数组。")
-                else:
-                    imported = 0
-                    for m in import_data:
-                        scope = m.get("scope", "project")
-                        if scope not in ("project", "global"):
-                            scope = "project"
-                        pid = project_id if scope == "project" else None
-                        db.upsert_memory(
-                            db_client, user_id,
-                            scope=scope,
-                            content=m.get("content", ""),
-                            source_feedback=m.get("source_feedback", "导入"),
-                            project_id=pid,
-                            auto_confirm_threshold=1,
-                        )
-                        imported += 1
-                    st.success(f"已导入 {imported} 条记忆。")
-                    st.rerun()
-            except json.JSONDecodeError:
-                st.error("JSON 解析失败，请检查文件格式。")
 
 
 def _render_memory_table(
@@ -1269,16 +1297,17 @@ def _render_memory_table(
     label: str,
     current_project_id: Optional[str] = None,
 ) -> None:
-    """List the rules in this scope, sorted with hard rules first so the user
-    can immediately spot the critical ones; mutes / candidates roll up at the
-    bottom."""
+    """列出某个范围（通用 / 项目）下的全部规则。
+
+    布局：已确认 → 候选 两个分段；已确认行按 hard-first 排序，让最重要的
+    硬约束总是出现在最上面。
+    """
     memories = db.list_memories(db_client, user_id, scope=scope, project_id=project_id)
     if not memories:
         st.info(f"暂无{label}。")
         return
 
-    # Sort confirmed: hard severity first, then most-frequent, then newest.
-    confirmed = [m for m in memories if m["status"] == "confirmed"]
+    confirmed  = [m for m in memories if m["status"] == "confirmed"]
     candidates = [m for m in memories if m["status"] == "candidate"]
     confirmed.sort(
         key=lambda m: (
@@ -1297,7 +1326,7 @@ def _render_memory_table(
             )
 
     if candidates:
-        st.markdown("**⏳ 候选中（出现次数不足）**")
+        st.markdown("**⏳ 候选中**（出现次数不足，未生效）")
         for m in candidates:
             _render_memory_row(
                 db_client, m, show_confirm=True,
@@ -1308,15 +1337,15 @@ def _render_memory_table(
 def _safe_update_memory(
     db_client: Client, memory_id: str, updates: dict
 ) -> tuple[bool, str]:
-    """Wrapper that tolerates older Supabase deployments missing the new
-    columns (severity / applicability / muted_until).  Returns
-    (success, hint_message).  The hint lets the UI surface a one-time
-    nudge to run the schema migration without crashing the page."""
+    """对 db.update_memory 的兼容封装：旧部署可能还没运行新列迁移。
+
+    返回 (是否成功, 提示文案)。若新列不存在，会剥离新列重试，让基础操作
+    仍然成功，并把提示文案显示给用户（让 ta 知道要去 Supabase 跑迁移）。
+    """
     try:
         db.update_memory(db_client, memory_id, updates)
         return True, ""
     except Exception as exc:
-        # Strip the new columns and retry so basic edits still work.
         msg = str(exc)
         new_cols = {"severity", "applicability", "muted_until"}
         if any(col in msg for col in new_cols):
@@ -1326,8 +1355,12 @@ def _safe_update_memory(
                     db.update_memory(db_client, memory_id, stripped)
                 except Exception:
                     pass
-            return False, "数据库尚未运行新列迁移（severity / applicability / muted_until）"
+            return False, "数据库还没运行新列迁移（severity / applicability / muted_until）"
         return False, msg[:120]
+
+
+# popover 是 Streamlit 1.32+ 的能力；旧版本回退到 expander
+_POPOVER = getattr(st, "popover", None)
 
 
 def _render_memory_row(
@@ -1336,6 +1369,19 @@ def _render_memory_row(
     show_confirm: bool,
     current_project_id: Optional[str] = None,
 ) -> None:
+    """渲染一条记忆。主视觉：徽章 + 内容 + 频率 + 主操作按钮。
+
+    主操作（直接显示在行尾）：
+      - "✓" 确认  （仅候选行）
+      - "🗑" 删除  （所有行）
+
+    进阶操作（收纳在行末 "⚙" popover 里，平时不占空间）：
+      - severity 硬↔偏 切换
+      - 24h 静音 / 解除
+      - 转为调校笔记（仅项目记忆 + 项目上下文存在时）
+
+    徽章用 emoji + 颜色块，扫一眼就能区分；不用文字 badge 是为了节省横向空间。
+    """
     import html as _html
     from datetime import datetime, timedelta, timezone
 
@@ -1343,88 +1389,118 @@ def _render_memory_row(
     severity = (memory.get("severity") or "soft").lower()
     applicability = (memory.get("applicability") or "").strip()
     muted_until = memory.get("muted_until")
-    is_muted = False
-    if muted_until:
-        try:
-            is_muted = str(muted_until) > datetime.utcnow().isoformat()
-        except Exception:
-            is_muted = False
+    is_muted = bool(muted_until and str(muted_until) > datetime.utcnow().isoformat())
 
-    # Top row: badges + content
+    # ── 渲染主行：徽章 + 内容 + 频率 + 主操作按钮 ─────────────────────
     badge_html = ""
     if severity == "hard":
-        badge_html += "<span style='background:#FFE4E1;color:#B22222;padding:1px 6px;border-radius:3px;font-size:11px;margin-right:6px'>🔒 硬约束</span>"
-    else:
-        badge_html += "<span style='background:#F0F8FF;color:#4682B4;padding:1px 6px;border-radius:3px;font-size:11px;margin-right:6px'>偏好</span>"
+        badge_html += (
+            "<span style='background:#FFE4E1;color:#B22222;padding:1px 6px;"
+            "border-radius:3px;font-size:11px;margin-right:6px'>🔒 硬</span>"
+        )
     if applicability:
-        badge_html += f"<span style='background:#F5F5F5;color:#666;padding:1px 6px;border-radius:3px;font-size:11px;margin-right:6px'>{_html.escape(applicability)}</span>"
+        badge_html += (
+            f"<span style='background:#F5F5F5;color:#666;padding:1px 6px;"
+            f"border-radius:3px;font-size:11px;margin-right:6px'>"
+            f"{_html.escape(applicability)}</span>"
+        )
     if is_muted:
-        badge_html += "<span style='background:#FFF8DC;color:#8B4513;padding:1px 6px;border-radius:3px;font-size:11px;margin-right:6px'>🔕 已静音</span>"
+        badge_html += (
+            "<span style='background:#FFF8DC;color:#8B4513;padding:1px 6px;"
+            "border-radius:3px;font-size:11px;margin-right:6px'>🔕 静音</span>"
+        )
 
-    col_main, col_freq = st.columns([6, 1])
+    col_main, col_freq, col_more, col_confirm, col_del = st.columns([8, 1, 1, 1, 1])
     with col_main:
         safe_content = _html.escape(memory["content"])
         safe_source = _html.escape((memory.get("source_feedback") or "")[:30])
         st.markdown(
             f"{badge_html}{safe_content} "
-            f"<small style='color:grey'>（来源：{safe_source}）</small>",
+            f"<small style='color:grey'>· 来源：{safe_source}</small>",
             unsafe_allow_html=True,
         )
     with col_freq:
         st.caption(f"×{memory['frequency']}")
+    with col_more:
+        _render_advanced_actions(
+            db_client, memory, severity, is_muted, current_project_id
+        )
+    with col_confirm:
+        if show_confirm:
+            if st.button("✓", key=f"confirm_{mem_id}", help="确认这条候选规则，使其生效"):
+                db.update_memory(db_client, mem_id, {"status": "confirmed"})
+                st.rerun()
+    with col_del:
+        if st.button("🗑", key=f"del_mem_{mem_id}", help="永久删除这条规则"):
+            db.delete_memory(db_client, mem_id)
+            st.rerun()
 
-    # Action row: severity toggle, mute toggle, candidate-only (confirm / convert to taste), delete
-    btn_cols = st.columns([1, 1, 1, 1, 1, 1])
-    with btn_cols[0]:
-        # Severity toggle — show the OTHER state as the button label, so it's
-        # an action ("make this hard") rather than a status display.
+
+def _render_advanced_actions(
+    db_client: Client,
+    memory: dict,
+    severity: str,
+    is_muted: bool,
+    current_project_id: Optional[str],
+) -> None:
+    """单条记忆的进阶操作菜单（"⚙" popover）。
+
+    包含 3 个不常用但偶尔需要的功能：升降 severity、24h 静音、转调校笔记。
+    这些之前散在主行里 5 个按钮一字排开，太挤；折叠后只有点开才出现。
+    """
+    from datetime import datetime, timedelta, timezone
+    mem_id = memory["id"]
+
+    # 旧版 Streamlit 没有 popover 时回退到 expander，效果稍逊但功能不变
+    container_factory = (
+        _POPOVER("⚙", help="进阶设置") if _POPOVER is not None
+        else st.expander("⚙ 设置", expanded=False)
+    )
+    with container_factory:
+        # ── severity 切换 ────────────────────────────────────────────
         if severity == "hard":
-            if st.button("↓改为偏好", key=f"sev_soft_{mem_id}", help="降级为 P1 软偏好"):
+            st.caption("当前为 🔒 硬约束（每条必须 100% 满足）")
+            if st.button("降级为偏好", key=f"sev_soft_{mem_id}", use_container_width=True):
                 ok, hint = _safe_update_memory(db_client, mem_id, {"severity": "soft"})
                 if not ok and hint:
                     st.warning(hint)
                 st.rerun()
         else:
-            if st.button("↑标记硬约束", key=f"sev_hard_{mem_id}", help="升级为 P0 硬约束（合规 / 品牌底线，每条必须 100% 满足）"):
+            st.caption("当前为偏好（按相关性 + 数量上限注入）")
+            if st.button("升级为 🔒 硬约束", key=f"sev_hard_{mem_id}", use_container_width=True,
+                         help="标为硬约束后会进入 P0 优先级，每条必满足；只用于合规/品牌底线"):
                 ok, hint = _safe_update_memory(db_client, mem_id, {"severity": "hard"})
                 if not ok and hint:
                     st.warning(hint)
                 st.rerun()
-    with btn_cols[1]:
+
+        st.divider()
+
+        # ── 24h 静音 ────────────────────────────────────────────────
         if is_muted:
-            if st.button("解除静音", key=f"unmute_{mem_id}"):
+            if st.button("🔔 解除静音", key=f"unmute_{mem_id}", use_container_width=True):
                 ok, hint = _safe_update_memory(db_client, mem_id, {"muted_until": None})
                 if not ok and hint:
                     st.warning(hint)
                 st.rerun()
         else:
-            if st.button("🔕 静音 24h", key=f"mute_{mem_id}", help="临时禁用此规则 24 小时；不删除"):
+            if st.button("🔕 静音 24 小时", key=f"mute_{mem_id}", use_container_width=True,
+                         help="临时禁用 24 小时（不删除；倒计时结束自动恢复）"):
                 until = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
                 ok, hint = _safe_update_memory(db_client, mem_id, {"muted_until": until})
                 if not ok and hint:
                     st.warning(hint)
                 st.rerun()
-    with btn_cols[2]:
-        if show_confirm:
-            if st.button("✓ 确认", key=f"confirm_{mem_id}"):
-                db.update_memory(db_client, mem_id, {"status": "confirmed"})
-                st.rerun()
-    with btn_cols[3]:
-        # Convert to taste (calibration observation) — for rules the
-        # classifier mistakenly hardened from a one-off comment.
+
+        # ── 转为调校笔记（误归 rule 的反馈降级到 taste）────────────────
         if current_project_id:
-            if st.button("→ 调校笔记", key=f"to_taste_{mem_id}",
-                         help="把这条规则降级为调校笔记里的一条感受性观察，从规则库移除"):
+            st.divider()
+            if st.button("→ 转为调校笔记", key=f"to_taste_{mem_id}", use_container_width=True,
+                         help="如果这条更像感受性偏好而不是硬规则，可以转到调校笔记。会从规则库移除。"):
                 _append_new_observations(db_client, current_project_id, [memory["content"]])
                 db.delete_memory(db_client, mem_id)
                 st.success("已转为调校笔记。")
                 st.rerun()
-    with btn_cols[4]:
-        pass
-    with btn_cols[5]:
-        if st.button("🗑 删除", key=f"del_mem_{mem_id}"):
-            db.delete_memory(db_client, mem_id)
-            st.rerun()
 
 
 def _render_inject_preview(
@@ -1433,10 +1509,11 @@ def _render_inject_preview(
     project_id: Optional[str],
     project_name: str,
 ) -> None:
-    """Expander that shows exactly which memories will be injected on the
-    next generation for this project, broken down by P0 / P1 tier.  Lets
-    the user spot "why is this rule being applied?" without having to
-    inspect the actual system_prompt."""
+    """折叠预览：本次生成实际会注入哪些规则。
+
+    用途：当模型表现不符合预期时（"为什么这条规则没生效？"或"它怎么又用了这条？"），
+    展开这块就能看到 P0/P1/P2 三层各有哪些条目。不需要去翻 system_prompt。
+    """
     with st.expander("📋 预览本次会注入的规则", expanded=False):
         if not project_id:
             st.caption("选择一个项目后才能预览。")
@@ -1453,6 +1530,7 @@ def _render_inject_preview(
             st.warning(f"读取记忆失败：{exc}")
             return
 
+        # 按 severity 拆分：hard 进 P0、soft 进 P1；session 单独是 P2
         def _split(mems: list[dict]) -> tuple[list[dict], list[dict]]:
             hard = [m for m in mems if (m.get("severity") or "soft").lower() == "hard"]
             soft = [m for m in mems if (m.get("severity") or "soft").lower() != "hard"]
@@ -1460,30 +1538,29 @@ def _render_inject_preview(
 
         hg, sg = _split(global_mems)
         hp, sp = _split(project_mems)
-        total_hard = len(hg) + len(hp)
-        total_soft = len(sg) + len(sp)
+        total_hard    = len(hg) + len(hp)
+        total_soft    = len(sg) + len(sp)
         total_session = len([s for s in (session_instr or []) if s.get("content")])
 
         st.caption(
             f"P0 硬约束 {total_hard} 条 · P1 偏好 {total_soft} 条 · "
-            f"P2 会话指令 {total_session} 条 · "
-            f"项目调校笔记可在「项目设置」单独查看"
+            f"P2 会话指令 {total_session} 条"
         )
 
         if total_hard:
-            st.markdown("**🔒 P0 硬约束（100% 必须满足）**")
+            st.markdown("**🔒 P0 硬约束**（100% 必须满足）")
             for m in hg:
                 st.markdown(f"- 〔通用〕{m['content']}")
             for m in hp:
                 st.markdown(f"- 〔项目〕{m['content']}")
         if total_soft:
-            st.markdown("**P1 软偏好（相关时应用）**")
+            st.markdown("**P1 软偏好**（相关时应用）")
             for m in sg:
                 st.markdown(f"- 〔通用〕{m['content']}")
             for m in sp:
                 st.markdown(f"- 〔项目〕{m['content']}")
         if total_session:
-            st.markdown("**⏱ P2 会话临时指令（本批次有效）**")
+            st.markdown("**⏱ P2 会话临时指令**（本批次有效）")
             for s in session_instr or []:
                 if s.get("content"):
                     st.markdown(f"- {s['content']}")
