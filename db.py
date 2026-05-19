@@ -162,6 +162,14 @@ CREATE POLICY IF NOT EXISTS versions_owner ON versions
     USING (
         item_id IN (SELECT id FROM items WHERE user_id = auth.uid())
     );
+-- Semantic-similarity embedding for cross-batch duplicate detection.
+-- Requires the pgvector extension (Supabase: Database → Extensions → enable
+-- "vector" once).  Nullable so legacy rows stay readable; a backfill helper
+-- populates them lazily.
+CREATE EXTENSION IF NOT EXISTS vector;
+ALTER TABLE versions ADD COLUMN IF NOT EXISTS embedding vector(768);
+CREATE INDEX IF NOT EXISTS versions_embedding_idx
+    ON versions USING ivfflat (embedding vector_cosine_ops);
 
 -- Memories (project-level or account-level — 'global' scope is per-user across projects)
 CREATE TABLE IF NOT EXISTS memories (
@@ -376,6 +384,118 @@ def bulk_create_items(client: Client, rows: list[dict]) -> list[dict]:
         return []
     res = client.table("items").insert(rows).execute()
     return res.data or []
+
+
+def update_version_embedding(
+    client: Client, version_id: str, vec: list[float]
+) -> None:
+    """Persist a 768-dim embedding for a single version row.  Tolerant of
+    older deployments where the pgvector column hasn't been added yet —
+    fails silently so the generation path doesn't blow up on a missing
+    column."""
+    if not vec:
+        return
+    try:
+        client.table("versions").update({"embedding": vec}).eq("id", version_id).execute()
+    except Exception:
+        pass
+
+
+def bulk_update_version_embeddings(
+    client: Client, rows: list[dict]
+) -> None:
+    """Persist many version embeddings in one round trip.  Each row needs
+    ``{"id": <version_id>, "embedding": [..]}``.  Falls back to per-row
+    UPDATE if upsert isn't allowed by RLS for this user.
+
+    Best-effort: errors are swallowed so an embedding failure never blocks
+    the user's batch.
+    """
+    if not rows:
+        return
+    try:
+        client.table("versions").upsert(rows).execute()
+        return
+    except Exception:
+        pass
+    # Per-row fallback
+    for r in rows:
+        update_version_embedding(client, r.get("id", ""), r.get("embedding") or [])
+
+
+def get_recent_titles_openings_with_embeddings(
+    client: Client, project_id: str, limit: int = 150
+) -> list[dict]:
+    """Like ``get_recent_titles_and_openings`` but also returns the stored
+    embedding when present.  Used by the embedding-based dedup path; if a
+    historical version doesn't have an embedding yet, the entry's
+    ``embedding`` key is None and the caller can decide to skip it or
+    backfill on demand.
+
+    Returns ``{"version_id", "title", "opening", "embedding"}`` per item.
+    """
+    batches = list_batches(client, project_id, limit=40)
+    if not batches:
+        return []
+    batch_ids = [b["id"] for b in batches]
+
+    items_res = (
+        client.table("items")
+        .select("id, best_version_id")
+        .in_("batch_id", batch_ids)
+        .execute()
+    )
+    items = items_res.data or []
+    if not items:
+        return []
+    item_ids = [it["id"] for it in items]
+
+    try:
+        versions_res = (
+            client.table("versions")
+            .select("id, item_id, title, body, version_num, embedding")
+            .in_("item_id", item_ids)
+            .execute()
+        )
+    except Exception:
+        # embedding column not yet migrated — degrade gracefully
+        versions_res = (
+            client.table("versions")
+            .select("id, item_id, title, body, version_num")
+            .in_("item_id", item_ids)
+            .execute()
+        )
+    versions_by_item: dict[str, list[dict]] = {}
+    for v in (versions_res.data or []):
+        versions_by_item.setdefault(v["item_id"], []).append(v)
+
+    out: list[dict] = []
+    for item in items:
+        versions = versions_by_item.get(item["id"], [])
+        if not versions:
+            continue
+        chosen = None
+        best_vid = item.get("best_version_id")
+        if best_vid:
+            for v in versions:
+                if v.get("id") == best_vid:
+                    chosen = v
+                    break
+        if not chosen:
+            chosen = max(versions, key=lambda v: v.get("version_num", 0))
+        title = (chosen.get("title") or "").strip()
+        if not title or title == "（解析失败）":
+            continue
+        body = (chosen.get("body") or "").strip()
+        first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
+        opening = first_line.strip()[:25]
+        out.append({
+            "version_id": chosen.get("id"),
+            "title":      title,
+            "opening":    opening,
+            "embedding":  chosen.get("embedding"),
+        })
+    return out[:limit]
 
 
 def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]:

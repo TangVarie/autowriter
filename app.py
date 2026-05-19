@@ -26,6 +26,7 @@ import memory as mem_module
 import generator as gen_module
 import image_handler
 import exporter
+import dedup as dedup_module
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -68,6 +69,14 @@ def _queue_worker(
     # queue haven't been persisted yet (or only partially); the in-memory pool
     # lets each new batch see what previous batches just produced.
     queue_titles: dict[str, list[dict]] = {}
+
+    # Semantic dedup pool: same key/scope as queue_titles, but holds the
+    # 768-dim Gemini embedding alongside the title so subsequent batches can
+    # detect paraphrase-style duplicates that text-matching misses.
+    # Pre-seeded lazily per project from DB historical embeddings the first
+    # time we touch that project_id.
+    queue_embeddings: dict[str, list[dict]] = {}
+    primed_projects: set[str] = set()
 
     for idx, plan in enumerate(plans):
         if stop_event.is_set():
@@ -157,6 +166,29 @@ def _queue_worker(
                 )
 
             db_titles = db.get_recent_titles_and_openings(db_client, project_id)
+
+            # First time we see this project_id in this queue run, prime the
+            # embedding pool with whatever historical embeddings the DB has
+            # so the first batch already has cross-batch semantic dedup.
+            # Versions that don't yet have an embedding column populated are
+            # skipped (backfill is opportunistic, not blocking).
+            if (project_id not in primed_projects
+                and dedup_module.embeddings_available()):
+                primed_projects.add(project_id)
+                try:
+                    hist_rows = db.get_recent_titles_openings_with_embeddings(
+                        db_client, project_id
+                    )
+                    seed = [
+                        {"title": h["title"], "embedding": h["embedding"]}
+                        for h in hist_rows
+                        if h.get("embedding") and h.get("title")
+                    ]
+                    if seed:
+                        queue_embeddings[project_id] = seed
+                except Exception:
+                    pass
+
             # Merge the in-memory queue pool first so the *latest* in-flight
             # batches outweigh older DB rows when the dedup block truncates to
             # the last N entries.  Dict-keyed dedup on (title, opening) to keep
@@ -261,11 +293,63 @@ def _queue_worker(
                         opening = first_line.strip()[:25]
                     if vr.title:
                         produced_titles.append({"title": vr.title.strip(), "opening": opening})
+            inserted_versions: list[dict] = []
             try:
                 inserted_versions = db.bulk_create_initial_versions(db_client, version_rows)
                 saved = len(inserted_versions)
             except Exception as exc:
                 status["errors"].append(f"计划 {idx+1}：批量写入 versions 失败 — {exc}")
+
+            # ── Semantic dedup pass ────────────────────────────────────────
+            # Synonym/paraphrase repeats slip past the text-only dedup block
+            # (same angle, different wording).  Embed each newly-saved title
+            # and compare against historical embeddings + earlier batches in
+            # this queue; tag matches above HARD_DUPLICATE_THRESHOLD in the
+            # error log so the user notices on review.  Skipped silently when
+            # embeddings aren't configured (no GOOGLE_API_KEY).
+            if inserted_versions and dedup_module.embeddings_available():
+                titles_in_order = [r.get("title", "") for r in version_rows]
+                new_vecs = dedup_module.embed_texts(titles_in_order)
+                if new_vecs:
+                    # 1. Persist new embeddings
+                    embed_rows = []
+                    for i, iv in enumerate(inserted_versions):
+                        if i < len(new_vecs):
+                            embed_rows.append({
+                                "id":        iv.get("id"),
+                                "embedding": new_vecs[i],
+                            })
+                    if embed_rows:
+                        db.bulk_update_version_embeddings(db_client, embed_rows)
+
+                    # 2. Compare against historical pool
+                    hist_pool = queue_embeddings.get(project_id, [])
+                    if hist_pool:
+                        h_vecs   = [h["embedding"] for h in hist_pool]
+                        h_titles = [h["title"]     for h in hist_pool]
+                        hits = dedup_module.find_near_duplicates(
+                            new_vecs, titles_in_order,
+                            h_vecs, h_titles,
+                        )
+                        for hit in hits:
+                            status["errors"].append(
+                                f"计划 {idx+1}（{proj_name}）· 近似重复：《{hit['title']}》"
+                                f" ↔ 历史《{hit['best_match']}》（相似度 {hit['score']:.2f}）"
+                            )
+
+                    # 3. Cross-batch within this batch (e.g. multi-engine)
+                    intra = dedup_module.cross_batch_pairs(new_vecs, titles_in_order)
+                    for pair in intra:
+                        status["errors"].append(
+                            f"计划 {idx+1}（{proj_name}）· 本批内近似：《{pair['title_i']}》"
+                            f" ↔ 《{pair['title_j']}》（相似度 {pair['score']:.2f}）"
+                        )
+
+                    # 4. Accumulate for the *next* batch's pool
+                    pool = queue_embeddings.setdefault(project_id, [])
+                    for i, t in enumerate(titles_in_order):
+                        if i < len(new_vecs) and t:
+                            pool.append({"title": t, "embedding": new_vecs[i]})
 
             # Append to the cross-batch dedup pool so the next plan touching
             # this project sees what we just produced, regardless of whether
