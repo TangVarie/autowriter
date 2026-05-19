@@ -366,7 +366,7 @@ def ingest_user_instruction(
     return {"action": "session", "result": row, "reason": decision.get("reason", "")}
 
 
-def _dedup_calibration_lines(text: str, max_chars: int = 1200) -> str:
+def _dedup_calibration_lines(text: str, max_chars: int = 4000) -> str:
     """
     Line-level dedup for calibration notes.
 
@@ -376,6 +376,11 @@ def _dedup_calibration_lines(text: str, max_chars: int = 1200) -> str:
     This normalises every persisted copy: strip bullet prefixes, drop near-
     exact duplicates (first 15 normalised chars as the key), cap at
     ``max_chars`` by dropping the oldest survivors.
+
+    The cap is intentionally loose (4000 chars ≈ 30-50 observations) — the
+    pre-2026-05 default of 1200 was tight enough that the LLM-rewrite path
+    silently deleted older observations under capacity pressure.  At-injection
+    time we'll trim further by relevance once the embedding path lands.
     """
     if not text:
         return ""
@@ -400,6 +405,102 @@ def _dedup_calibration_lines(text: str, max_chars: int = 1200) -> str:
         clean_lines.pop(0)  # drop oldest
         joined = "\n".join(clean_lines)
     return joined
+
+
+def _parse_new_observations(raw: str) -> list[str]:
+    """
+    Extract candidate "new observation" lines from the LLM's response under
+    the append-only contract: every line beginning with ``-`` is an
+    observation, the literal token ``NONE`` (case-insensitive) means no new
+    observation, blank lines and prose explanations are ignored.
+
+    Returns the cleaned observation strings (no leading bullet), preserving
+    order.  Empty list = nothing to append.
+    """
+    if not raw:
+        return []
+    cleaned = raw.strip()
+    if not cleaned or cleaned.upper() == "NONE":
+        return []
+    out: list[str] = []
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith(("-", "•", "*", "·")):
+            # ignore prose ("以下是新观察：...") — only honour bullet lines
+            continue
+        text = line.lstrip("-•·* ").strip()
+        if not text or text.upper() == "NONE":
+            continue
+        if len(text) > 120:  # safety: drop monologue lines that slipped through
+            continue
+        out.append(text)
+    return out
+
+
+def _merge_new_observations(existing: str, new_lines: list[str]) -> str:
+    """
+    Pure function: produce a single calibration-notes text that contains every
+    existing line plus the subset of ``new_lines`` not already covered (15-char
+    normalised dedup key).  Never removes an existing line.
+    """
+    existing = (existing or "").rstrip()
+    if not new_lines:
+        return existing
+
+    existing_keys: set[str] = set()
+    for raw in existing.splitlines():
+        stripped = raw.strip().lstrip("-•·*· ").strip()
+        if not stripped:
+            continue
+        existing_keys.add(" ".join(stripped.split())[:15].lower())
+
+    appended: list[str] = []
+    for line in new_lines:
+        line = line.strip()
+        if not line:
+            continue
+        key = " ".join(line.split())[:15].lower()
+        if not key or key in existing_keys:
+            continue
+        existing_keys.add(key)
+        appended.append(f"- {line}")
+
+    if not appended:
+        return existing
+    return (existing + "\n" + "\n".join(appended)) if existing else "\n".join(appended)
+
+
+def _append_new_observations(
+    db_client: Client,
+    project_id: str,
+    new_lines: list[str],
+) -> Optional[str]:
+    """
+    Read the project's current calibration_notes, append ``new_lines`` (deduped
+    against what's already there), persist the result.  Returns the persisted
+    text or None on failure / no-op.
+
+    This is the choke point that replaces the LLM-rewrite path: callers that
+    used to ask Claude for the whole new notes text now ask Claude for a list
+    of new lines and let this helper merge them.  No older observation is
+    ever removed by an append — only the user's explicit edit or the soft
+    ``max_chars`` cap (4000) inside ``_dedup_calibration_lines`` can drop a
+    line.
+    """
+    if not new_lines:
+        return None
+    try:
+        proj = db.get_project(db_client, project_id)
+    except Exception:
+        return None
+    if not proj:
+        return None
+    merged = _merge_new_observations(proj.get("calibration_notes") or "", new_lines)
+    if not merged or merged == (proj.get("calibration_notes") or "").rstrip():
+        return None
+    return save_calibration_notes(db_client, project_id, merged)
 
 
 def save_calibration_notes(
@@ -557,50 +658,40 @@ def ingest_batch_feedbacks(
 # ── AI-generated calibration notes ────────────────────────────────────────
 
 _CALIBRATION_SYSTEM = """\
-你是一个内容策划顾问，负责维护项目的「调教笔记」。调教笔记是项目级感受性偏好的集合。
+你是一个内容策划顾问，负责往项目的「调教笔记」追加新的观察。
 
-你会收到现有调教笔记，以及来自本批次的用户显式信号（仅限两类，按权重从高到低）：
+调教笔记是越滚越大的偏好集合，**绝对不允许重写、压缩或删除任何既有条目**。
+你只负责判断：本批次的显式信号里，是否包含**现有笔记尚未覆盖**的新观察？
 
-  【信号 A · 最高权重】手动精修差异：AI 原版 vs 用户手动改后的版本
-    - 这是金标准：用户亲手把 AI 的写法改成他要的样子，每一处差异都是意图明确的偏好
-    - 重点提炼：改动的方向（加 / 删 / 换）、改的部位（标题 / 开头 / 结尾 / 句式 / 用词 / 标点）
-
-  【信号 B · 次要权重】迭代反馈：用户改写某条时写下的反馈文字 + 前后版本
-    - 用户的反馈可能表达含糊或带情绪，仅作辅助参考
+你会收到：
+  • 现有调教笔记全文（仅供查重；你**不要**对它做任何改写）
+  • 本批次用户显式信号（两类按权重从高到低）：
+    【信号 A · 最高权重】手动精修差异：AI 原版 vs 用户手动改后的版本
+      - 这是金标准：用户亲手把 AI 的写法改成他要的样子，每一处差异都是明确偏好
+      - 重点提炼：改动方向（加 / 删 / 换）、改的部位（标题 / 开头 / 结尾 / 句式 / 用词 / 标点）
+    【信号 B · 次要权重】迭代反馈：用户改写某条时写下的反馈文字 + 前后版本
+      - 用户反馈可能含糊或带情绪，仅作辅助参考
 
 硬约束：
-
 - **只能**从上述两类显式信号里提炼观察
-- 同一条现象若 A 和 B 都有覆盖，以 A（手动差异）为准；若冲突，信 A 不信 B
-- **不能**从单纯的"已通过"文案里推断风格偏好（通过只等于"可用"，不等于"用户喜欢这个风格"）
-- **不能**对用户没有改、没有反馈、没有提及的细节下结论
-- **不能**泛化"小红书通用经验"，调教笔记只记录这个用户/项目特有的偏好
-- 没有清晰信号的观察一律不加；宁可让笔记变短也不要凑字数
-- 若本批次信号与现有笔记冲突，以新信号为准；若与现有某条同义，不新增
-- 若本批次没有足够强的信号，直接返回「现有调教笔记」原文，不要硬凑
+- 同一现象 A 和 B 冲突时信 A
+- **不能**从单纯的"已通过"文案里推断偏好（通过 ≠ 喜欢这个风格）
+- **不能**对用户没改过、没反馈过的细节下结论
+- **不能**泛化"小红书通用经验"
+- 若本批次信号在现有笔记里已有同义条目（哪怕措辞不同），**不要重复添加**
+- 若本批次信号弱、或全部已被现有笔记覆盖，**直接输出 NONE**
 
-观察格式（极重要 —— 三层结构）：
-每条观察应由三部分组成：**方向 + 例子 + 为什么/风格关联**。
-- 方向：抽象描述用户偏好的类别（如"标题偏好…"、"结尾倾向…"、"开头避免…"）
-- 例子：用简短的原文片段作为佐证，放括号里（一次迭代里最显著的那 1-2 处）
-- 为什么：一句话解释这个偏好呼应的调性/场景（可选，但强烈建议）
+观察格式（每条 ≤ 40 字）—— 三层结构：方向 + 例子（括号内）+ 为什么/风格关联。
+- 不好（仅例子）：「'3个真相' → '真相'」
+- 不好（仅方向）：「标题偏好不带量化修饰」
+- 好：「标题偏好不带量化修饰（如'3个真相' → '真相'），呼应不张扬基调」
+- 好：「拒绝解释性过渡（删除'说人话就是'等），希望结论直给不啰嗦」
 
-好坏对比：
-- 不好（仅例子，读起来像机械替换指令）：
-  · "'3个真相' → '真相'"
-  · "删除'说人话就是'等解释性过渡句"
-- 不好（仅方向，读起来像空泛口号）：
-  · "标题偏好不带量化修饰"
-  · "拒绝解释性过渡"
-- 好（方向 + 例子 + 为什么）：
-  · "标题偏好不带量化修饰（如'3个真相' → '真相'），呼应用户不张扬的低调基调"
-  · "拒绝解释性过渡（删除'说人话就是'等），希望结论直给不啰嗦"
-  · "开头偏好不经意发现式的低姿态叙事（'深夜查文献我发现' → '查文献一不小心发现'），弱化自我专业感"
-
-每条观察应该能独立作用于**任何一篇新文案**，不只解释这一次的改动。
-
-输出格式：纯文本，每条观察用「-」开头，最多 15 条，总长 ≤ 600 字。
-只输出调教笔记正文，不要有任何标题、前言、解释、JSON 或 Markdown。"""
+输出格式（极重要）：
+- 仅输出本批次需要**新追加**的观察行，每条以「-」开头，每行一条
+- 最多 5 条新观察（信号通常没那么多）
+- 若没有新观察可加：输出单独一行 NONE
+- 不要前言、解释、JSON、Markdown、不要重复现有笔记里的任何条目"""
 
 
 def generate_calibration_notes(
@@ -681,44 +772,53 @@ def generate_calibration_notes(
 
     user_content = f"项目名称：{project_name}\n\n"
     if existing_notes and existing_notes.strip():
-        user_content += f"现有调教笔记：\n{existing_notes.strip()}\n\n"
+        user_content += f"现有调教笔记（仅供查重，不要改写）：\n{existing_notes.strip()}\n\n"
+    else:
+        user_content += "现有调教笔记：(空)\n\n"
     user_content += (
         "本批次的显式用户信号：\n"
         + "\n\n".join(sections)
-        + "\n\n按系统提示更新调教笔记；只能基于上述显式信号做观察。"
+        + "\n\n按系统提示，仅输出本批次新追加的观察（或单独一行 NONE）。"
     )
 
     client = _make_anthropic_client()
     resp = client.messages.create(
         model=config.CLAUDE_MODEL,
-        max_tokens=1024,
+        max_tokens=512,
         system=_CALIBRATION_SYSTEM,
         messages=[{"role": "user", "content": user_content}],
     )
-    return resp.content[0].text.strip()
+    raw = resp.content[0].text.strip()
+    new_lines = _parse_new_observations(raw)
+    merged = _merge_new_observations(existing_notes or "", new_lines)
+    # Returning the unchanged existing text would cause the caller to overwrite
+    # the row with itself; signal "no change" with the original string so the
+    # caller's no-op check (notes == existing) catches it.
+    return merged
 
 
 # Incremental calibration update: runs after every iteration, not only on
 # full-batch approval.  Every iteration carries a "why" signal — we don't
 # want to wait until the whole batch is approved to learn from it.
 _CALIB_INCREMENTAL_SYSTEM = """\
-你是内容策划顾问，负责维护调教笔记（项目级的感受性偏好集合）。
+你是内容策划顾问，负责往调教笔记**追加**新观察（绝不允许删除或改写既有条目）。
 
-收到一条新的迭代记录（原版 → 用户反馈 → 迭代后版本），以及现有调教笔记。
-你要判断：
-1. 这条迭代里是否包含值得进调教笔记的审美/偏好信号？
-   - 有 → 把该信号**抽象成一条方向性观察**（≤ 40 字）加进现有笔记；如果和现有某条同义则不新增，保持不动
-   - 没有（例如只是明显的事实性修改、错别字、个人一次性上下文）→ 直接返回现有笔记原文
-2. 如果现有笔记已有明显冲突/陈旧的观察，可以精简或替换；但保守优先，除非新信号很强
+收到一条新的迭代记录（原版 → 用户反馈 → 迭代后版本），以及现有调教笔记全文。
+你的唯一任务：判断这条迭代是否包含**现有笔记尚未覆盖**的新偏好信号。
 
-观察格式（三层结构）：
-每条观察 = 方向 + 例子（括号内原文佐证）+ 为什么/风格关联。
-- 不好（仅例子）："'3个真相' → '真相'"
-- 不好（仅方向）："标题偏好不带量化修饰"
-- 好："标题偏好不带量化修饰（如'3个真相' → '真相'），呼应用户不张扬的低调基调"
+判定规则：
+- 是显著新信号 → 输出 1 条新观察（≤ 40 字，三层结构：方向 + 例子 + 为什么）
+- 信号弱、是事实性修改、错别字、一次性上下文、或已被现有笔记覆盖 → 输出单独一行 NONE
 
-输出格式：纯文本调教笔记全文，每条用「-」开头，总长不超过 600 字。
-不要解释、不要前缀、不要 JSON，只输出笔记正文。"""
+观察格式示例：
+- 不好（仅例子）：「'3个真相' → '真相'」
+- 不好（仅方向）：「标题偏好不带量化修饰」
+- 好：「标题偏好不带量化修饰（如'3个真相' → '真相'），呼应不张扬基调」
+
+输出格式（极重要）：
+- 仅输出本次需要追加的 1 条新观察行，以「-」开头
+- 若没有：输出单独一行 NONE
+- 严禁重复现有笔记里的任何条目；严禁输出已有笔记的全文或片段；严禁前言、解释、JSON、Markdown"""
 
 
 def update_calibration_from_iteration(
@@ -754,59 +854,64 @@ def update_calibration_from_iteration(
     new_body_preview = (new_body or "")[:180].split("\n")[0]
     user_content = (
         f"项目：{proj.get('name','')}\n\n"
-        + (f"现有调教笔记：\n{existing}\n\n" if existing else "现有调教笔记：(空)\n\n")
+        + (
+            f"现有调教笔记（仅供查重，不要改写）：\n{existing}\n\n"
+            if existing else "现有调教笔记：(空)\n\n"
+        )
         + "本次迭代：\n"
         + f"  v旧 《{old_title}》 {old_body_preview}\n"
         + f"  反馈：{feedback.strip()}\n"
         + f"  v新 《{new_title}》 {new_body_preview}\n\n"
-        + "请按系统提示更新调教笔记。"
+        + "按系统提示输出 1 条新观察（或 NONE）。"
     )
 
     try:
         client = _make_anthropic_client()
         resp = client.messages.create(
             model=config.CLAUDE_MODEL,
-            max_tokens=900,
+            max_tokens=200,
             system=_CALIB_INCREMENTAL_SYSTEM,
             messages=[{"role": "user", "content": user_content}],
         )
-        updated = resp.content[0].text.strip()
+        raw = resp.content[0].text.strip()
     except Exception:
         return None
 
-    if not updated or updated == existing:
+    new_lines = _parse_new_observations(raw)
+    if not new_lines:
         return None
     try:
-        updated = save_calibration_notes(db_client, project_id, updated)
+        return _append_new_observations(db_client, project_id, new_lines)
     except Exception:
         return None
-    return updated
 
 
 # Diff-driven calibration: when a user manually rewrites an AI draft we
 # can't ask "what changed and why" — we can only compare the two texts.
 # Ask Claude to read both and extract any taste signals worth keeping.
 _CALIB_MANUAL_EDIT_SYSTEM = """\
-你是内容策划顾问，负责维护调教笔记。
+你是内容策划顾问，负责往调教笔记**追加**新观察（绝不允许删除或改写既有条目）。
 
-你收到一条 AI 原版文案 + 用户手动精修后的版本，以及现有调教笔记。
-不是简单的改错 —— 两者之间的每一处差异都反映了用户的隐性审美偏好。
+你收到一条 AI 原版文案 + 用户手动精修后的版本 + 现有调教笔记全文。
+两者之间的每一处差异都反映了用户的隐性审美偏好。
 
 你要做的：
-1. 逐项对比：标题用词 / 开头切入 / 句式 / 结尾 / 标点 / 段落结构 / 情绪强度
-2. 把差异里可归纳的偏好**抽象**成 ≤ 40 字的观察，加进现有笔记
-3. 若与现有某条同义，不新增；若无显著信号，保留现有笔记原文
+1. 逐项对比差异点：标题用词 / 开头切入 / 句式 / 结尾 / 标点 / 段落结构 / 情绪强度
+2. 把可归纳的偏好抽象成 ≤ 40 字的观察（手动 diff 最容易诱导你只写"X 改为 Y"，一定要抽象起来）
+3. 严格按现有笔记查重，**已被覆盖的偏好不要重复添加**
+4. 若无显著新信号、或所有差异都已被现有笔记覆盖 → 输出单独一行 NONE
 
-观察格式（三层结构，手动 diff 最容易诱导你只写"X 改为 Y"，一定要抽象起来）：
-每条观察 = 方向 + 例子（括号内保留原文片段作佐证）+ 为什么/风格关联。
-- 不好（仅例子）："删除'说人话就是'等解释性过渡句"
-- 不好（仅方向）："拒绝解释性过渡"
-- 好："拒绝解释性过渡（删除'说人话就是'等），希望结论直给不啰嗦"
-- 好："结尾偏好留白（在'它是天然存在于…'处截断），营造未完成感"
-- 好："倾向口语连接词（'然鹅''嘛'等）带出随意感"
+观察格式（三层结构）：方向 + 例子（括号内）+ 为什么/风格关联。
+- 不好（仅例子）：「删除'说人话就是'等解释性过渡句」
+- 不好（仅方向）：「拒绝解释性过渡」
+- 好：「拒绝解释性过渡（删除'说人话就是'等），希望结论直给不啰嗦」
+- 好：「结尾偏好留白（'它是天然存在于…'处截断），营造未完成感」
+- 好：「倾向口语连接词（'然鹅''嘛'等）带出随意感」
 
-输出纯文本的更新后调教笔记全文，每条用「-」开头，总长 ≤ 600 字。
-不要解释、不要前缀、不要 JSON，只输出笔记正文。"""
+输出格式（极重要）：
+- 仅输出本次需要追加的新观察行，每条以「-」开头，每行一条，最多 3 条
+- 若没有新观察：输出单独一行 NONE
+- 严禁重复现有笔记里的任何条目；严禁输出已有笔记的全文或片段；严禁前言、解释、JSON、Markdown"""
 
 
 def update_calibration_from_manual_edit(
@@ -840,35 +945,38 @@ def update_calibration_from_manual_edit(
 
     user_content = (
         f"项目：{proj.get('name','')}\n\n"
-        + (f"现有调教笔记：\n{existing}\n\n" if existing else "现有调教笔记：(空)\n\n")
+        + (
+            f"现有调教笔记（仅供查重，不要改写）：\n{existing}\n\n"
+            if existing else "现有调教笔记：(空)\n\n"
+        )
         + "AI 原版：\n"
         + f"  标题：{ai_title}\n"
         + f"  正文：{(ai_body or '')[:400]}\n\n"
         + "用户手动精修后：\n"
         + f"  标题：{manual_title}\n"
         + f"  正文：{(manual_body or '')[:400]}\n\n"
-        + "请对比差异，按系统提示更新调教笔记。"
+        + "对比差异，按系统提示输出 0-3 条新观察（或 NONE）。"
     )
 
     try:
         client = _make_anthropic_client()
         resp = client.messages.create(
             model=config.CLAUDE_MODEL,
-            max_tokens=900,
+            max_tokens=400,
             system=_CALIB_MANUAL_EDIT_SYSTEM,
             messages=[{"role": "user", "content": user_content}],
         )
-        updated = resp.content[0].text.strip()
+        raw = resp.content[0].text.strip()
     except Exception:
         return None
 
-    if not updated or updated == existing:
+    new_lines = _parse_new_observations(raw)
+    if not new_lines:
         return None
     try:
-        updated = save_calibration_notes(db_client, project_id, updated)
+        return _append_new_observations(db_client, project_id, new_lines)
     except Exception:
         return None
-    return updated
 
 
 # One-shot cleanup: compress mechanical "X → Y" lines accumulated under older

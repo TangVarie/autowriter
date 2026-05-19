@@ -2876,7 +2876,7 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
     太子自动学习：批次全部通过后静默生成并保存调教笔记，无需人工确认。
     失败时静默跳过，不打断用户操作。
     """
-    existing = project.get("calibration_notes") or ""
+    existing = (project.get("calibration_notes") or "").rstrip()
     try:
         with st.spinner("🧠 太子学习中…"):
             notes = mem_module.generate_calibration_notes(
@@ -2884,8 +2884,13 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
                 existing_notes=existing,
                 items_with_versions=items,
             )
-            mem_module.save_calibration_notes(db_client, project["id"], notes)
-            st.toast("🧠 调教笔记已自动更新（太子学习完成）")
+            # Append-only contract: generate_calibration_notes returns the
+            # existing text plus any newly appended observations.  Skip the
+            # save when nothing changed so the row's timestamp / dedup ordering
+            # stays untouched.
+            if notes and notes.rstrip() != existing:
+                mem_module.save_calibration_notes(db_client, project["id"], notes)
+                st.toast("🧠 调教笔记已新增观察（太子学习完成）")
     except Exception:
         pass  # 静默失败，不影响主流程
 
