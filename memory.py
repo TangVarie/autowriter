@@ -549,6 +549,7 @@ def _append_new_observations(
     db_client: Client,
     project_id: str,
     new_lines: list[str],
+    source: str = "unknown",
 ) -> Optional[str]:
     """
     Read the project's current calibration_notes, append ``new_lines`` (deduped
@@ -561,6 +562,8 @@ def _append_new_observations(
     ever removed by an append — only the user's explicit edit or the soft
     ``max_chars`` cap (4000) inside ``_dedup_calibration_lines`` can drop a
     line.
+
+    ``source`` 透传给 ``save_calibration_notes`` 给审计表用。
     """
     if not new_lines:
         return None
@@ -573,13 +576,14 @@ def _append_new_observations(
     merged = _merge_new_observations(proj.get("calibration_notes") or "", new_lines)
     if not merged or merged == (proj.get("calibration_notes") or "").rstrip():
         return None
-    return save_calibration_notes(db_client, project_id, merged)
+    return save_calibration_notes(db_client, project_id, merged, source=source)
 
 
 def save_calibration_notes(
     db_client: Client,
     project_id: str,
     notes: str,
+    source: str = "unknown",
 ) -> str:
     """
     Single choke point for writing ``projects.calibration_notes``.  Runs
@@ -588,12 +592,51 @@ def save_calibration_notes(
     iteration incremental update, the diff-from-manual-edit path, the full-
     batch reflection, or a user's manual save from the preview editor.
     Returns the deduped text that was persisted.
+
+    ``source`` 标记触发本次写入的入口（``iteration`` / ``manual_edit`` /
+    ``batch_reflection`` / ``merger_taste`` / ``user_manual``），仅用于
+    审计表追踪；不影响写入逻辑。
+
+    每次写入都会同步往 ``calibration_note_audit`` 表插一条 before / append /
+    after 记录（C1 审计闭环）。审计失败不会影响主写入。
     """
     deduped = _dedup_calibration_lines(notes or "")
+
+    # 先读旧值用于 audit before；与下面 update_project 是同一次会话窗口
+    before_text = ""
+    try:
+        proj = db.get_project(db_client, project_id)
+        before_text = (proj.get("calibration_notes") or "") if proj else ""
+    except Exception:
+        pass
+
     try:
         db.update_project(db_client, project_id, {"calibration_notes": deduped})
     except Exception:
         pass
+
+    # 计算本次新增的观察行：deduped 中存在但 before 中不存在的（按归一化 key 比对）
+    def _normalized_key(line: str) -> str:
+        stripped = line.strip().lstrip("-•·*· ").strip()
+        return " ".join(stripped.split()).lower()
+    before_keys = {
+        _normalized_key(l) for l in before_text.splitlines() if l.strip()
+    }
+    append_lines = []
+    for l in deduped.splitlines():
+        key = _normalized_key(l)
+        if key and key not in before_keys:
+            append_lines.append(l.strip())
+
+    # 只在内容真的变化时记审计，避免空操作刷屏
+    if before_text != deduped:
+        db.insert_calibration_audit(
+            db_client, project_id, source,
+            before_text=before_text,
+            append_lines=append_lines,
+            after_text=deduped,
+        )
+
     return deduped
 
 
@@ -620,7 +663,7 @@ def _append_taste_to_calibration(
         return
 
     merged = (existing + "\n- " + line) if existing else f"- {line}"
-    save_calibration_notes(db_client, project_id, merged)
+    save_calibration_notes(db_client, project_id, merged, source="merger_taste")
 
 
 # ── AI-based feedback classification ──────────────────────────────────────
@@ -954,7 +997,9 @@ def update_calibration_from_iteration(
     if not new_lines:
         return None
     try:
-        return _append_new_observations(db_client, project_id, new_lines)
+        return _append_new_observations(
+            db_client, project_id, new_lines, source="iteration"
+        )
     except Exception:
         return None
 
@@ -1047,7 +1092,9 @@ def update_calibration_from_manual_edit(
     if not new_lines:
         return None
     try:
-        return _append_new_observations(db_client, project_id, new_lines)
+        return _append_new_observations(
+            db_client, project_id, new_lines, source="manual_edit"
+        )
     except Exception:
         return None
 
@@ -1497,7 +1544,10 @@ def _render_advanced_actions(
             st.divider()
             if st.button("→ 转为调校笔记", key=f"to_taste_{mem_id}", use_container_width=True,
                          help="如果这条更像感受性偏好而不是硬规则，可以转到调校笔记。会从规则库移除。"):
-                _append_new_observations(db_client, current_project_id, [memory["content"]])
+                _append_new_observations(
+                    db_client, current_project_id, [memory["content"]],
+                    source="user_manual",
+                )
                 db.delete_memory(db_client, mem_id)
                 st.success("已转为调校笔记。")
                 st.rerun()

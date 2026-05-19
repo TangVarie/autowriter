@@ -264,7 +264,9 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     col_save, col_tidy = st.columns([1, 1])
     with col_save:
         if st.button("💾 保存调教笔记", use_container_width=True):
-            mem_module.save_calibration_notes(client, project["id"], calibration_text)
+            mem_module.save_calibration_notes(
+                client, project["id"], calibration_text, source="user_manual",
+            )
             st.success("调教笔记已保存，下次生成时生效。")
     with col_tidy:
         if st.button(
@@ -294,7 +296,9 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ 用整理后的版本替换", use_container_width=True):
-                mem_module.save_calibration_notes(client, project["id"], preview)
+                mem_module.save_calibration_notes(
+                    client, project["id"], preview, source="user_manual",
+                )
                 # Drop the textarea's cached state — Streamlit forbids
                 # assigning to a widget's session_state key after the widget
                 # has already rendered in this run.  Popping is allowed, and
@@ -308,6 +312,35 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
             if st.button("✕ 放弃整理结果", use_container_width=True):
                 del st.session_state[tidy_key]
                 st.rerun()
+
+    # ── 审计：最近 30 次调教笔记的写入历史（C1）─────────────────────────
+    # 用途：当用户怀疑"为什么这条观察突然不见了 / 多出来了"时，可以
+    # 直接看 before/after diff 定位是哪个入口（迭代反馈 / 手动精修 /
+    # 批次反思 / 用户手动保存）写入的。
+    with st.expander("📜 查看变更历史（最近 30 次）", expanded=False):
+        audit_rows = db.list_calibration_audit(client, project["id"], limit=30)
+        if not audit_rows:
+            st.caption("尚无历史记录（启用审计后从下次写入开始累积）。")
+        else:
+            for row in audit_rows:
+                source_label = {
+                    "iteration":        "迭代反馈",
+                    "manual_edit":      "手动精修",
+                    "batch_reflection": "批次反思",
+                    "merger_taste":     "反馈分类为 taste",
+                    "user_manual":      "用户手动保存",
+                }.get(row.get("source"), row.get("source") or "未知")
+                created = row.get("created_at", "")[:19].replace("T", " ")
+                appended = row.get("append_lines") or []
+                st.markdown(
+                    f"**{created}** · _{source_label}_ · 新增 {len(appended)} 条观察"
+                )
+                if appended:
+                    for line in appended[:5]:
+                        st.markdown(f"  - {line}")
+                    if len(appended) > 5:
+                        st.caption(f"…还有 {len(appended) - 5} 条")
+                st.divider()
 
 
 def _render_tactics_settings(client: Client, project: dict) -> None:

@@ -2829,7 +2829,9 @@ def page_review(project: dict) -> None:
         save_col, discard_col = st.columns(2)
         with save_col:
             if st.button("💾 保存到项目设置", key=f"save_calib_{batch_id}", use_container_width=True):
-                mem_module.save_calibration_notes(db_client, project["id"], edited)
+                mem_module.save_calibration_notes(
+                    db_client, project["id"], edited, source="user_manual"
+                )
                 del st.session_state[calib_key]
                 st.success("调教笔记已保存，下次生成时生效。")
                 st.rerun()
@@ -3518,7 +3520,9 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
             # save when nothing changed so the row's timestamp / dedup ordering
             # stays untouched.
             if notes and notes.rstrip() != existing:
-                mem_module.save_calibration_notes(db_client, project["id"], notes)
+                mem_module.save_calibration_notes(
+                    db_client, project["id"], notes, source="batch_reflection",
+                )
                 st.toast("🧠 调教笔记已新增观察（太子学习完成）")
     except Exception:
         pass  # 静默失败，不影响主流程

@@ -216,6 +216,25 @@ CREATE INDEX IF NOT EXISTS memories_session_idx
 -- semantically far from the current generation context; rows without an
 -- embedding (legacy / backfill-pending) pass through unchanged.
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(768);
+
+-- 调教笔记审计：每次写入都留底（before / append_lines / after），方便
+-- 排查"为什么这条观察突然出现/消失了"。RLS 按 project_id 关联到用户。
+CREATE TABLE IF NOT EXISTS calibration_note_audit (
+    id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id    UUID REFERENCES projects(id) ON DELETE CASCADE,
+    source        TEXT,                    -- iteration / manual_edit / batch_reflection / merger_taste / user_manual / unknown
+    before_text   TEXT,                    -- 写入前的全文
+    append_lines  JSONB DEFAULT '[]'::jsonb, -- 本次新增的观察行列表
+    after_text    TEXT,                    -- 写入后的全文
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE calibration_note_audit ENABLE ROW LEVEL SECURITY;
+CREATE POLICY IF NOT EXISTS calibration_note_audit_owner ON calibration_note_audit
+    USING (
+        project_id IN (SELECT id FROM projects WHERE owner_id = auth.uid())
+    );
+CREATE INDEX IF NOT EXISTS calibration_note_audit_project_idx
+    ON calibration_note_audit(project_id, created_at DESC);
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
 CREATE POLICY IF NOT EXISTS memories_owner ON memories
     USING (user_id = auth.uid());
@@ -933,6 +952,52 @@ def upsert_memory(
             res = client.table("memories").insert(data).execute()
         _invalidate_memory_caches()
         return res.data[0]
+
+
+def insert_calibration_audit(
+    client: Client,
+    project_id: str,
+    source: str,
+    before_text: str,
+    append_lines: list[str],
+    after_text: str,
+) -> None:
+    """记录一次调教笔记的写入。失败时静默——审计不能拖死主流程。
+
+    旧部署没运行新表迁移时，会被 ``except`` 接住静默丢弃，调用方无感。
+    """
+    if not project_id:
+        return
+    try:
+        client.table("calibration_note_audit").insert({
+            "project_id":   project_id,
+            "source":       (source or "unknown")[:32],
+            "before_text":  before_text or "",
+            "append_lines": append_lines or [],
+            "after_text":   after_text or "",
+        }).execute()
+    except Exception:
+        pass
+
+
+def list_calibration_audit(
+    client: Client, project_id: str, limit: int = 30
+) -> list[dict]:
+    """查看某个项目最近 N 次调教笔记的写入记录（UI 排障用）。"""
+    if not project_id:
+        return []
+    try:
+        res = (
+            client.table("calibration_note_audit")
+            .select("*")
+            .eq("project_id", project_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
 
 
 def backfill_memory_embeddings(
