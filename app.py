@@ -34,6 +34,147 @@ _BEIJING_TZ = timezone(timedelta(hours=8))
 
 # ── Generation Queue ────────────────────────────────────────────────────────
 
+def _save_batch_results(
+    db_client,
+    batch_id: str,
+    user_id: str,
+    generation_results: list[dict],
+    error_prefix: str,
+    errors_sink: list,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """两个 worker 共用的批量保存逻辑（修 R1：Quick Generate 之前逐条 INSERT）。
+
+    一次 bulk_create_items + 一次 bulk_create_initial_versions，把
+    ~30 次 round trip 收敛成 2 次。返回三元组：
+
+      - inserted_items   ：批量插入后的 items 行（含生成的 id）
+      - inserted_versions：批量插入后的 versions 行
+      - produced_titles  ：[{"title", "opening"}, ...]，用来喂跨批文本去重池
+
+    生成失败的版本（vr.error & 空 title）按引擎名写到 ``errors_sink``，
+    并跳过保存。``error_prefix`` 控制日志前缀，例如 "计划 3（项目 A）"。
+    """
+    # 步骤 1：拼 items 的批量行，每个 slot 一条
+    item_rows: list[dict] = []
+    for slot in generation_results:
+        item_rows.append({
+            "batch_id": batch_id,
+            "user_id":  user_id,
+            **({"ai_review_notes": slot["ai_review_notes"]}
+               if slot.get("ai_review_notes") else {}),
+        })
+    try:
+        inserted_items = db.bulk_create_items(db_client, item_rows)
+    except Exception as exc:
+        errors_sink.append(f"{error_prefix}批量写入 items 失败 — {exc}")
+        inserted_items = []
+
+    # 步骤 2：从生成结果里抽 versions 行 + 顺便构造文本去重池要的 opening
+    version_rows: list[dict] = []
+    produced_titles: list[dict] = []
+    for slot, item in zip(generation_results, inserted_items):
+        for vr in slot["versions"]:
+            if vr.error and not vr.title:
+                errors_sink.append(f"{error_prefix}· {vr.ai_engine}：{vr.error}")
+                continue
+            version_rows.append({
+                "item_id":     item["id"],
+                "ai_engine":   vr.ai_engine,
+                "title":       vr.title,
+                "body":        vr.body,
+                "keywords":    vr.keywords,
+                "token_usage": vr.token_usage,
+            })
+            opening = ""
+            body = (vr.body or "").strip()
+            if body:
+                first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
+                opening = first_line.strip()[:25]
+            if vr.title:
+                produced_titles.append({"title": vr.title.strip(), "opening": opening})
+
+    # 步骤 3：批量插 versions
+    inserted_versions: list[dict] = []
+    try:
+        inserted_versions = db.bulk_create_initial_versions(db_client, version_rows)
+    except Exception as exc:
+        errors_sink.append(f"{error_prefix}批量写入 versions 失败 — {exc}")
+
+    return inserted_items, inserted_versions, produced_titles
+
+
+def _run_semantic_dedup_pass(
+    db_client,
+    inserted_versions: list[dict],
+    version_rows: list[dict],
+    queue_embeddings: dict,
+    project_id: str,
+    error_prefix: str,
+    errors_sink: list,
+    metrics,
+) -> None:
+    """两个 worker 共用的语义查重 + embedding 持久化（修 R3 的前置）。
+
+    流程：
+      1. 给所有新标题算 768d embedding（一次 API 调用，批量请求）
+      2. 写入 versions.embedding 列
+      3. 与历史池对比，cos ≥ 0.92 视为近似重复 → 写到 errors_sink
+      4. 本批内对比（多引擎撞车场景）→ 写到 errors_sink
+      5. 累积进 queue_embeddings，下一批能立刻看到
+
+    ``queue_embeddings`` 是 worker 自己维护的字典，按 project_id 分桶。
+    Quick Generate 也建一份只有一个项目的字典。
+    没配 GOOGLE_API_KEY 时整段跳过，不影响主流程。
+    """
+    if not inserted_versions or not dedup_module.embeddings_available():
+        return
+    metrics.start_phase("embedding")
+    try:
+        titles_in_order = [r.get("title", "") for r in version_rows]
+        new_vecs = dedup_module.embed_texts(titles_in_order)
+        if not new_vecs:
+            return
+        # 步骤 2：持久化 embedding
+        embed_rows = []
+        for i, iv in enumerate(inserted_versions):
+            if i < len(new_vecs):
+                embed_rows.append({"id": iv.get("id"), "embedding": new_vecs[i]})
+        if embed_rows:
+            db.bulk_update_version_embeddings(db_client, embed_rows)
+
+        # 步骤 3：对照历史池
+        hist_pool = queue_embeddings.get(project_id, [])
+        if hist_pool:
+            hits = dedup_module.find_near_duplicates(
+                new_vecs, titles_in_order,
+                [h["embedding"] for h in hist_pool],
+                [h["title"]     for h in hist_pool],
+            )
+            metrics.incr("dedup_semantic_hits", len(hits))
+            for hit in hits:
+                errors_sink.append(
+                    f"{error_prefix}近似重复：《{hit['title']}》 ↔ "
+                    f"历史《{hit['best_match']}》（相似度 {hit['score']:.2f}）"
+                )
+
+        # 步骤 4：本批内查重
+        intra = dedup_module.cross_batch_pairs(new_vecs, titles_in_order)
+        metrics.incr("dedup_semantic_hits", len(intra))
+        for pair in intra:
+            errors_sink.append(
+                f"{error_prefix}本批内近似：《{pair['title_i']}》 ↔ "
+                f"《{pair['title_j']}》（相似度 {pair['score']:.2f}）"
+            )
+
+        # 步骤 5：累积给下一批用
+        pool = queue_embeddings.setdefault(project_id, [])
+        for i, t in enumerate(titles_in_order):
+            if i < len(new_vecs) and t:
+                pool.append({"title": t, "embedding": new_vecs[i]})
+    finally:
+        metrics.stop_phase("embedding")
+
+
 def _queue_worker(
     plans: list[dict],
     user_id: str,
@@ -287,112 +428,27 @@ def _queue_worker(
 
             metrics.stop_phase("llm")
 
-            # ── [E 保存] 批量写 items + versions，再补 embedding 查重 ───────
-            # 保存改为两次批量 INSERT（items 一次 + versions 一次），比之前
-            # 逐条 INSERT 节省 ~30 次 round trip（10 篇 × 2 引擎的批次）
+            # ── [E 保存] 批量写 items + versions（统一服务 _save_batch_results）──
             metrics.start_phase("db_save")
-            saved = 0
-            produced_titles: list[dict] = []
-            item_rows: list[dict] = []
-            for slot in generation_results:
-                item_rows.append({
-                    "batch_id": batch_id,
-                    "user_id":  user_id,
-                    **({"ai_review_notes": slot["ai_review_notes"]}
-                       if slot.get("ai_review_notes") else {}),
-                })
-            try:
-                inserted_items = db.bulk_create_items(db_client, item_rows)
-            except Exception as exc:
-                status["errors"].append(f"计划 {idx+1}：批量写入 items 失败 — {exc}")
-                inserted_items = []
-
-            version_rows: list[dict] = []
-            for slot, item in zip(generation_results, inserted_items):
-                for vr in slot["versions"]:
-                    if vr.error and not vr.title:
-                        status["errors"].append(
-                            f"计划 {idx+1}（{proj_name}）· {vr.ai_engine}：{vr.error}"
-                        )
-                        continue
-                    version_rows.append({
-                        "item_id":     item["id"],
-                        "ai_engine":   vr.ai_engine,
-                        "title":       vr.title,
-                        "body":        vr.body,
-                        "keywords":    vr.keywords,
-                        "token_usage": vr.token_usage,
-                    })
-                    opening = ""
-                    body = (vr.body or "").strip()
-                    if body:
-                        first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
-                        opening = first_line.strip()[:25]
-                    if vr.title:
-                        produced_titles.append({"title": vr.title.strip(), "opening": opening})
-            inserted_versions: list[dict] = []
-            try:
-                inserted_versions = db.bulk_create_initial_versions(db_client, version_rows)
-                saved = len(inserted_versions)
-            except Exception as exc:
-                status["errors"].append(f"计划 {idx+1}：批量写入 versions 失败 — {exc}")
+            error_prefix = f"计划 {idx+1}（{proj_name}）："
+            inserted_items, inserted_versions, produced_titles = _save_batch_results(
+                db_client, batch_id, user_id, generation_results,
+                error_prefix, status["errors"],
+            )
+            # version_rows 是 _save_batch_results 内部构造的临时变量；
+            # 我们在这里通过 inserted_versions 的顺序还原它（embedding 流程要用）
+            version_rows = [
+                {"title": v.get("title", "")} for v in inserted_versions
+            ]
+            saved = len(inserted_versions)
             metrics.stop_phase("db_save")
 
-            # ── 语义查重（仅在配置了 GOOGLE_API_KEY 时启用）──────────────────
-            # 文本去重只能抓字面重复；同义改写（"炫耀"→"展示"）能绕过。
-            # 这一步：把刚保存的标题各算一次 768d embedding，
-            #   1. 写入 versions.embedding 列（供后续批次复用）
-            #   2. 对照本队列历史池：cos ≥ 0.92 视为近似重复 → 警告
-            #   3. 对照本批内：例如多引擎模式下 Claude 和 Gemini 撞角度 → 警告
-            #   4. 累积到 queue_embeddings，下一批就能用
-            # 没配 GOOGLE_API_KEY 时整段跳过，主流程不受影响。
-            if inserted_versions and dedup_module.embeddings_available():
-                metrics.start_phase("embedding")
-                titles_in_order = [r.get("title", "") for r in version_rows]
-                new_vecs = dedup_module.embed_texts(titles_in_order)
-                if new_vecs:
-                    # 步骤 1：把 embedding 持久化到 versions 表
-                    embed_rows = []
-                    for i, iv in enumerate(inserted_versions):
-                        if i < len(new_vecs):
-                            embed_rows.append({
-                                "id":        iv.get("id"),
-                                "embedding": new_vecs[i],
-                            })
-                    if embed_rows:
-                        db.bulk_update_version_embeddings(db_client, embed_rows)
-
-                    # 步骤 2：与历史池对比（DB 历史 + 本队列前面批次）
-                    hist_pool = queue_embeddings.get(project_id, [])
-                    if hist_pool:
-                        h_vecs   = [h["embedding"] for h in hist_pool]
-                        h_titles = [h["title"]     for h in hist_pool]
-                        hits = dedup_module.find_near_duplicates(
-                            new_vecs, titles_in_order,
-                            h_vecs, h_titles,
-                        )
-                        metrics.incr("dedup_semantic_hits", len(hits))
-                        for hit in hits:
-                            status["errors"].append(
-                                f"计划 {idx+1}（{proj_name}）· 近似重复：《{hit['title']}》"
-                                f" ↔ 历史《{hit['best_match']}》（相似度 {hit['score']:.2f}）"
-                            )
-
-                    # 步骤 3：本批内查重（主要针对多引擎模式的撞车）
-                    intra = dedup_module.cross_batch_pairs(new_vecs, titles_in_order)
-                    metrics.incr("dedup_semantic_hits", len(intra))
-                    for pair in intra:
-                        status["errors"].append(
-                            f"计划 {idx+1}（{proj_name}）· 本批内近似：《{pair['title_i']}》"
-                            f" ↔ 《{pair['title_j']}》（相似度 {pair['score']:.2f}）"
-                        )
-
-                    # 步骤 4：累积进 queue_embeddings，给下一批用
-                    pool = queue_embeddings.setdefault(project_id, [])
-                    for i, t in enumerate(titles_in_order):
-                        if i < len(new_vecs) and t:
-                            pool.append({"title": t, "embedding": new_vecs[i]})
-                metrics.stop_phase("embedding")
+            # ── 语义查重（统一服务 _run_semantic_dedup_pass）──────────────────
+            _run_semantic_dedup_pass(
+                db_client, inserted_versions, version_rows,
+                queue_embeddings, project_id, error_prefix,
+                status["errors"], metrics,
+            )
 
             # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）
             if produced_titles:
@@ -1806,29 +1862,30 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             )
 
         metrics.stop_phase("llm")
+
+        # ── 批量保存：复用与 _queue_worker 完全相同的 _save_batch_results ──
+        # （修 R1：之前是 create_item / create_version 逐条 INSERT，
+        #  ~30 round trip；改批量后收敛为 2 次）
         metrics.start_phase("db_save")
-        saved_count = 0
         errors: list[str] = []
-        for slot in generation_results:
-            item = db.create_item(
-                db_client, user_id, batch_id,
-                ai_review_notes=slot.get("ai_review_notes") or None,
-            )
-            for vr in slot["versions"]:
-                if vr.error and not vr.title:
-                    errors.append(f"[{vr.ai_engine.upper()}] {vr.error}")
-                    continue
-                db.create_version(
-                    db_client,
-                    item_id=item["id"],
-                    ai_engine=vr.ai_engine,
-                    title=vr.title,
-                    body=vr.body,
-                    keywords=vr.keywords,
-                    token_usage=vr.token_usage,
-                )
-                saved_count += 1
+        inserted_items, inserted_versions, _produced_titles = _save_batch_results(
+            db_client, batch_id, user_id, generation_results,
+            error_prefix="",  # Quick Generate 不需要 "计划 N（项目）：" 前缀
+            errors_sink=errors,
+        )
+        version_rows = [{"title": v.get("title", "")} for v in inserted_versions]
+        saved_count = len(inserted_versions)
         metrics.stop_phase("db_save")
+
+        # ── 语义查重（同 _queue_worker 走 _run_semantic_dedup_pass）─────
+        # Quick Generate 只跑一个批次，所以 queue_embeddings 是个只有当前
+        # project_id 的临时字典；命中重复直接写到 errors 数组里。
+        quick_queue_embeddings: dict[str, list[dict]] = {}
+        _run_semantic_dedup_pass(
+            db_client, inserted_versions, version_rows,
+            quick_queue_embeddings, project_id,
+            error_prefix="", errors_sink=errors, metrics=metrics,
+        )
 
         status["saved_count"] = saved_count
         status["n_results"]   = len(generation_results)
