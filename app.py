@@ -117,10 +117,23 @@ def _queue_worker(
                     db_client, user_id, project_id=project_id
                 )
             session_instr = session_cache[project_id]
+
+            # Relevance filter: drop obviously-unrelated soft rules per-plan
+            # based on this batch's tactic + key_messages.  Hard rules and
+            # rules without embeddings (legacy) pass through unchanged.
+            context_text = " ".join(filter(None, [
+                tactic,
+                plan.get("key_messages", ""),
+                plan.get("target_audience", ""),
+                plan.get("extra_instructions", ""),
+            ])).strip()
+            global_mems_for_plan  = mem_module.filter_soft_by_relevance(global_mems,  context_text)
+            project_mems_for_plan = mem_module.filter_soft_by_relevance(project_mems, context_text)
+
             full_system_prompt = mem_module.build_system_prompt(
                 base_prompt=base_prompt,
-                global_memories=global_mems,
-                project_memories=project_mems,
+                global_memories=global_mems_for_plan,
+                project_memories=project_mems_for_plan,
                 tactic_suffix=tactic_suffix,
                 calibration_notes=project.get("calibration_notes") or "",
                 positive_examples=pos_examples or None,

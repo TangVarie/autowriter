@@ -34,6 +34,59 @@ def _make_anthropic_client() -> anthropic.Anthropic:
 
 # ── Prompt assembly ────────────────────────────────────────────────────────
 
+def filter_soft_by_relevance(
+    memories: list[dict],
+    context_text: str,
+    threshold: float = 0.45,
+) -> list[dict]:
+    """
+    Drop ``severity='soft'`` rules whose embedding is semantically far from
+    ``context_text`` (the current generation's tactic + key_messages + extra
+    instructions).  Hard rules pass through unchanged.  Rules without a
+    stored embedding (legacy / backfill-pending) also pass through so the
+    feature degrades cleanly on un-migrated deployments.
+
+    ``threshold`` is intentionally low (0.45 default): the goal is to drop
+    obviously-irrelevant rules ("不要数字开头" when generating an emoji
+    batch), not to be precise.  False negatives (keeping a marginal rule)
+    are much cheaper than false positives (silently dropping a relevant
+    one the user expects to be active).
+
+    Returns the filtered list in the same order.  No-op (returns the input)
+    when embeddings aren't configured or ``context_text`` is empty.
+    """
+    if not memories or not context_text or not context_text.strip():
+        return memories
+    try:
+        import dedup as _dedup
+    except Exception:
+        return memories
+    if not _dedup.embeddings_available():
+        return memories
+    ctx_vecs = _dedup.embed_texts([context_text.strip()])
+    if not ctx_vecs or not ctx_vecs[0]:
+        return memories
+    ctx = ctx_vecs[0]
+    out: list[dict] = []
+    for m in memories:
+        if (m.get("severity") or "soft").lower() == "hard":
+            out.append(m)
+            continue
+        vec = m.get("embedding")
+        if not vec:
+            out.append(m)  # legacy: no embedding stored ⇒ keep
+            continue
+        try:
+            score = _dedup.cosine_similarity(ctx, vec)
+        except Exception:
+            out.append(m)
+            continue
+        if score >= threshold:
+            out.append(m)
+        # else: dropped silently — user can still see it in the manager
+    return out
+
+
 def build_system_prompt(
     base_prompt: str,
     global_memories: list[dict],
@@ -1099,6 +1152,31 @@ def render_memory_manager(
                 project_id=project_id, label="项目记忆",
                 current_project_id=project_id,
             )
+
+    # Embedding backfill — populate the embedding column on legacy rows
+    # in batches of 50 per click.  Hidden if embeddings aren't configured,
+    # so users without GOOGLE_API_KEY don't see a dead button.
+    try:
+        import dedup as _dedup
+        embedding_ready = _dedup.embeddings_available()
+    except Exception:
+        embedding_ready = False
+    if embedding_ready:
+        st.divider()
+        col_bf1, col_bf2 = st.columns([3, 1])
+        with col_bf1:
+            st.caption(
+                "📐 旧记忆没有 embedding 时，相关性筛选只能放行；点右侧按钮分批补算。"
+                "每次最多 50 条，可重复点击直到全部补完。"
+            )
+        with col_bf2:
+            if st.button("🔄 补算 embedding", use_container_width=True, key="backfill_mem_embed"):
+                count = db.backfill_memory_embeddings(db_client, user_id, max_rows=50)
+                if count > 0:
+                    st.success(f"已补算 {count} 条。")
+                else:
+                    st.info("没有需要补算的记忆，或 embedding 服务暂时不可用。")
+                st.rerun()
 
     # Manual add
     st.divider()

@@ -211,6 +211,11 @@ ALTER TABLE memories
 CREATE INDEX IF NOT EXISTS memories_session_idx
     ON memories(user_id, memory_type, expires_at)
     WHERE memory_type = 'session';
+-- Embedding for soft-rule relevance filtering.  The injection ranker
+-- keeps every hard rule and only filters soft rules whose embedding is
+-- semantically far from the current generation context; rows without an
+-- embedding (legacy / backfill-pending) pass through unchanged.
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(768);
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
 CREATE POLICY IF NOT EXISTS memories_owner ON memories
     USING (user_id = auth.uid());
@@ -874,14 +879,79 @@ def upsert_memory(
             data["severity"] = severity.lower()
         if applicability:
             data["applicability"] = applicability[:32]
+
+        # Compute the embedding once at write time so the relevance ranker
+        # can use it without paying an API call per generation.  Only soft
+        # rules are filtered; hard rules always inject, but we still embed
+        # so the data is uniform.  Embedding failure is non-fatal.
+        try:
+            import dedup as _dedup
+            if _dedup.embeddings_available():
+                vecs = _dedup.embed_texts([content])
+                if vecs and vecs[0]:
+                    data["embedding"] = vecs[0]
+        except Exception:
+            pass
+
         try:
             res = client.table("memories").insert(data).execute()
         except Exception:
+            # New columns missing from older deployments — strip and retry
             data.pop("severity", None)
             data.pop("applicability", None)
+            data.pop("embedding", None)
             res = client.table("memories").insert(data).execute()
         _invalidate_memory_caches()
         return res.data[0]
+
+
+def backfill_memory_embeddings(
+    client: Client, user_id: str, max_rows: int = 50
+) -> int:
+    """Best-effort backfill: find up to ``max_rows`` memories owned by
+    ``user_id`` that have no embedding stored, compute them, and write back.
+    Returns the number of rows successfully embedded.
+
+    Called from the memory manager UI button.  Bounded per call to keep the
+    user's click responsive and to amortise embedding API spend across
+    sessions.
+    """
+    try:
+        import dedup as _dedup
+    except Exception:
+        return 0
+    if not _dedup.embeddings_available():
+        return 0
+    try:
+        res = (
+            client.table("memories")
+            .select("id, content, embedding")
+            .eq("user_id", user_id)
+            .is_("embedding", "null")
+            .limit(max_rows)
+            .execute()
+        )
+    except Exception:
+        return 0
+    rows = res.data or []
+    if not rows:
+        return 0
+    texts = [r.get("content", "") for r in rows]
+    vecs = _dedup.embed_texts(texts)
+    if not vecs or len(vecs) != len(rows):
+        return 0
+    updated = 0
+    for r, v in zip(rows, vecs):
+        if not v:
+            continue
+        try:
+            client.table("memories").update({"embedding": v}).eq("id", r["id"]).execute()
+            updated += 1
+        except Exception:
+            pass
+    if updated:
+        _invalidate_memory_caches()
+    return updated
 
 
 def increment_memory_frequency(client: Client, memory_id: str) -> dict:
