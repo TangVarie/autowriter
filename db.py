@@ -368,6 +368,43 @@ def create_item(
     return res.data[0]
 
 
+def bulk_create_items(client: Client, rows: list[dict]) -> list[dict]:
+    """Insert N item rows in a single round trip; returns the inserted rows
+    with their generated ``id`` columns in input order.  Each row should
+    carry ``batch_id``, ``user_id``, and optionally ``ai_review_notes``."""
+    if not rows:
+        return []
+    res = client.table("items").insert(rows).execute()
+    return res.data or []
+
+
+def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]:
+    """Insert a batch of first-version rows (``version_num=1``) in one
+    round trip.  Each row should carry ``item_id``, ``ai_engine``, ``title``,
+    ``body``, and optionally ``keywords`` / ``token_usage``.
+
+    Used by the batch-generation save path; iteration / manual-edit paths
+    still go through ``create_version`` because they need the next available
+    version_num for an existing item."""
+    if not rows:
+        return []
+    payload = []
+    for r in rows:
+        payload.append({
+            "item_id":     r["item_id"],
+            "version_num": 1,
+            "ai_engine":   r["ai_engine"],
+            "title":       r.get("title", ""),
+            "body":        r.get("body", ""),
+            "keywords":    r.get("keywords") or [],
+            "feedback":    r.get("feedback"),
+            "images":      r.get("images") or [],
+            "token_usage": r.get("token_usage") or {},
+        })
+    res = client.table("versions").insert(payload).execute()
+    return res.data or []
+
+
 def list_items(client: Client, batch_id: str) -> list[dict]:
     res = (
         client.table("items")
@@ -553,22 +590,44 @@ def get_recent_titles_and_openings(
     pending items still pollute future output if we let the model re-invent the
     same angles.  Each entry is ``{"title": str, "opening": str}`` where opening
     is the first non-empty line of the body, truncated to 25 characters.
+
+    Two-query implementation: first pull items (id + best_version_id), then
+    pull their versions in one batched ``in_`` call.  Replaces the previous
+    nested ``select("..., versions(*)")`` which was N+1-ish on a wide window
+    (postgrest expanded the embedded select per item server-side) and
+    returned an order of magnitude more data than needed.
     """
     batches = list_batches(client, project_id, limit=40)
     if not batches:
         return []
     batch_ids = [b["id"] for b in batches]
 
-    res = (
+    items_res = (
         client.table("items")
-        .select("id, status, best_version_id, versions(id, title, body, version_num)")
+        .select("id, status, best_version_id")
         .in_("batch_id", batch_ids)
         .execute()
     )
+    items = items_res.data or []
+    if not items:
+        return []
+    item_ids = [it["id"] for it in items]
+
+    # Pull every version for these items in one shot; we only need the three
+    # columns used for picking the canonical version.
+    versions_res = (
+        client.table("versions")
+        .select("id, item_id, title, body, version_num")
+        .in_("item_id", item_ids)
+        .execute()
+    )
+    versions_by_item: dict[str, list[dict]] = {}
+    for v in (versions_res.data or []):
+        versions_by_item.setdefault(v["item_id"], []).append(v)
 
     out: list[dict] = []
-    for item in (res.data or []):
-        versions = item.get("versions", [])
+    for item in items:
+        versions = versions_by_item.get(item["id"], [])
         if not versions:
             continue
 

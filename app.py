@@ -217,27 +217,43 @@ def _queue_worker(
 
             saved = 0
             produced_titles: list[dict] = []
+
+            # ── Bulk save ─────────────────────────────────────────────────
+            # First insert all items in one round trip, then all versions
+            # in another.  Previously this was 1+N round trips per slot
+            # (1 create_item + 1 SELECT version_num + 1 INSERT per version),
+            # so a 10-item batch with 2 engines was ~30 round trips.  The
+            # bulk path collapses it to 2.
+            item_rows: list[dict] = []
             for slot in generation_results:
-                item = db.create_item(
-                    db_client, user_id, batch_id,
-                    ai_review_notes=slot.get("ai_review_notes") or None,
-                )
+                item_rows.append({
+                    "batch_id": batch_id,
+                    "user_id":  user_id,
+                    **({"ai_review_notes": slot["ai_review_notes"]}
+                       if slot.get("ai_review_notes") else {}),
+                })
+            try:
+                inserted_items = db.bulk_create_items(db_client, item_rows)
+            except Exception as exc:
+                status["errors"].append(f"计划 {idx+1}：批量写入 items 失败 — {exc}")
+                inserted_items = []
+
+            version_rows: list[dict] = []
+            for slot, item in zip(generation_results, inserted_items):
                 for vr in slot["versions"]:
                     if vr.error and not vr.title:
                         status["errors"].append(
                             f"计划 {idx+1}（{proj_name}）· {vr.ai_engine}：{vr.error}"
                         )
                         continue
-                    db.create_version(
-                        db_client,
-                        item_id=item["id"],
-                        ai_engine=vr.ai_engine,
-                        title=vr.title,
-                        body=vr.body,
-                        keywords=vr.keywords,
-                        token_usage=vr.token_usage,
-                    )
-                    saved += 1
+                    version_rows.append({
+                        "item_id":     item["id"],
+                        "ai_engine":   vr.ai_engine,
+                        "title":       vr.title,
+                        "body":        vr.body,
+                        "keywords":    vr.keywords,
+                        "token_usage": vr.token_usage,
+                    })
                     opening = ""
                     body = (vr.body or "").strip()
                     if body:
@@ -245,6 +261,11 @@ def _queue_worker(
                         opening = first_line.strip()[:25]
                     if vr.title:
                         produced_titles.append({"title": vr.title.strip(), "opening": opening})
+            try:
+                inserted_versions = db.bulk_create_initial_versions(db_client, version_rows)
+                saved = len(inserted_versions)
+            except Exception as exc:
+                status["errors"].append(f"计划 {idx+1}：批量写入 versions 失败 — {exc}")
 
             # Append to the cross-batch dedup pool so the next plan touching
             # this project sees what we just produced, regardless of whether
@@ -270,8 +291,15 @@ def _queue_worker(
         status["message"] = f"全部完成 ✓ {n_ok} 计划成功" + (f"，{n_err} 失败" if n_err else "")
 
 
-def _queue_banner() -> None:
-    """Render a sticky progress banner when a queue is running or just finished."""
+# Streamlit's @st.fragment auto-reruns only the decorated block, leaving
+# the rest of the page alone.  Available since Streamlit 1.33; we fall back
+# to the plain function on older versions.
+_FRAGMENT = getattr(st, "fragment", None)
+
+
+def _queue_banner_body() -> None:
+    """The actual banner content.  Factored out so the same code runs both
+    in fragment mode and as a normal function on Streamlit < 1.33."""
     qs = st.session_state.get("queue_state")
     if not qs:
         return
@@ -303,6 +331,61 @@ def _queue_banner() -> None:
                 st.session_state.pop("queue_state", None)
                 st.session_state.pop("queue_stop_event", None)
                 st.rerun()
+
+
+if _FRAGMENT is not None:
+    # When a queue is running, this fragment auto-reruns every 2 s without
+    # forcing the rest of the page to re-execute.  Massive perceived-perf
+    # win: pre-fragment, every 2 s the entire 3000+ line script re-ran just
+    # to update the progress bar, which is why other UI felt frozen during
+    # batch runs.
+    _queue_banner = _FRAGMENT(run_every=2.0)(_queue_banner_body)
+else:
+    _queue_banner = _queue_banner_body
+
+
+def _running_snapshot_body(qs_key: str = "queue_state") -> None:
+    """Live progress bar that polls queue state via fragment refresh.
+
+    ``qs_key`` is the session_state key to read (queue tab uses queue_state;
+    the quick-generate path uses queue_state_qg).
+    """
+    qs = st.session_state.get(qs_key)
+    if not qs or not qs.get("running"):
+        return
+    completed = len(qs.get("completed", []))
+    total     = qs.get("total", 0)
+    progress  = qs.get("progress")
+    if progress is None and total:
+        progress = completed / total
+    elif progress is None:
+        progress = 0.0
+    st.progress(progress, text=qs.get("message", "生成中…"))
+    st.caption("生成在后台运行，可切换到其他页面。")
+
+
+if _FRAGMENT is not None:
+    _render_running_snapshot = _FRAGMENT(run_every=2.0)(_running_snapshot_body)
+else:
+    _render_running_snapshot = _running_snapshot_body
+
+
+def _quick_gen_snapshot_body() -> None:
+    """Live progress for the quick-generate path, mirrors _running_snapshot_body
+    but reads from the separate ``quick_gen_state`` key."""
+    qgs = st.session_state.get("quick_gen_state")
+    if not qgs or not qgs.get("running"):
+        return
+    pct = qgs.get("progress", 0.0)
+    msg = qgs.get("message", "生成中…")
+    st.progress(pct, text=msg)
+    st.caption("生成在后台运行，可切换到其他页面。")
+
+
+if _FRAGMENT is not None:
+    _render_quick_gen_snapshot = _FRAGMENT(run_every=2.0)(_quick_gen_snapshot_body)
+else:
+    _render_quick_gen_snapshot = _quick_gen_snapshot_body
 
 
 def _format_batch_label(batch: dict, project_name: str = "") -> str:
@@ -1795,15 +1878,13 @@ def _render_queue_tab() -> None:
 
     # Live status within tab
     if is_running:
-        completed = len(qs.get("completed", []))
-        total     = qs.get("total", 0)
-        st.progress(
-            completed / total if total else 0,
-            text=qs.get("message", "生成中…"),
-        )
-        st.caption("生成在后台运行，可切换到其他页面。")
-        time.sleep(1.5)
-        st.rerun()
+        # The fragment-based _queue_banner already auto-refreshes the
+        # progress info every 2 s without re-running the whole page.
+        # Keep a static snapshot here for users on the queue tab, but no
+        # longer time.sleep + st.rerun — that was the main cause of the
+        # 1.5 s "click and wait" lag during batch runs (every interaction
+        # was racing the next forced rerun).
+        _render_running_snapshot()
 
     # Completed results summary
     if qs.get("done") and qs.get("completed"):
@@ -1974,12 +2055,10 @@ def page_generate(project: dict) -> None:
         qg_done    = bool(qgs and qgs.get("done"))
 
         if qg_running:
-            pct = qgs.get("progress", 0.0)
-            msg = qgs.get("message", "生成中…")
-            st.progress(pct, text=msg)
-            st.caption("生成在后台运行，可切换到其他页面。")
-            time.sleep(1.5)
-            st.rerun()
+            # Fragment-driven polling replaces the old sleep+rerun loop;
+            # the quick-generate path now refreshes the progress bar
+            # without forcing the whole script to re-execute.
+            _render_quick_gen_snapshot()
         elif qg_done:
             errors_list = qgs.get("errors", [])
             if errors_list:
