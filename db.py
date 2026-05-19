@@ -391,6 +391,36 @@ def bulk_create_items(client: Client, rows: list[dict]) -> list[dict]:
     return res.data or []
 
 
+def update_version_content(
+    client: Client,
+    version_id: str,
+    title: str,
+    body: str,
+    keywords: Optional[list] = None,
+    token_usage: Optional[dict] = None,
+    embedding: Optional[list[float]] = None,
+) -> None:
+    """重写一条 version 的内容（用于自动重生场景）。
+
+    只更新传入的字段；id / item_id / version_num / ai_engine / created_at 不动。
+    embedding 单独可选，失败时静默——pgvector 列没迁移的部署还能用。
+    """
+    updates: dict[str, Any] = {"title": title, "body": body}
+    if keywords is not None:
+        updates["keywords"] = keywords
+    if token_usage is not None:
+        updates["token_usage"] = token_usage
+    try:
+        client.table("versions").update(updates).eq("id", version_id).execute()
+    except Exception:
+        pass
+    if embedding is not None:
+        try:
+            client.table("versions").update({"embedding": embedding}).eq("id", version_id).execute()
+        except Exception:
+            pass
+
+
 def update_version_embedding(
     client: Client, version_id: str, vec: list[float]
 ) -> None:

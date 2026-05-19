@@ -112,6 +112,24 @@ MAX_INJECTED_MEMORIES_PER_SCOPE: int = int(
     os.environ.get("MAX_INJECTED_MEMORIES_PER_SCOPE", "12")
 )
 
+# ── 去重自动重生硬闸门（Stage B1+B2）─────────────────────────────────────
+# 当文本或语义去重命中时，是否自动让单条文案重新生成？
+#   ENABLE_DEDUP_REGEN=true  → 命中后调一次 1-item 生成调用避开；
+#   失败次数超过 DEDUP_REGEN_MAX_RETRIES → 标记 item.status='needs_revision'
+# 默认 OFF：自动重生会增加 token 成本和耗时；先用埋点观察基线，
+# 再决定是否开启。
+ENABLE_DEDUP_REGEN: bool = (
+    os.environ.get("ENABLE_DEDUP_REGEN", "0") not in ("0", "false", "False")
+)
+DEDUP_REGEN_MAX_RETRIES: int = int(
+    os.environ.get("DEDUP_REGEN_MAX_RETRIES", "2")
+)
+# 触发自动重生的语义相似度阈值（cos similarity）；与 dedup.HARD_DUPLICATE_THRESHOLD
+# 同步默认 0.92，但允许通过环境变量收紧到 0.88 等更激进的值。
+DEDUP_SEMANTIC_THRESHOLD: float = float(
+    os.environ.get("DEDUP_SEMANTIC_THRESHOLD", "0.92")
+)
+
 # ── Compliance recheck ────────────────────────────────────────────────────
 # When True, generate_batch runs a second Claude call after generation to
 # verify each version respected the active project memories and session

@@ -141,6 +141,138 @@ def _save_batch_results(
     return inserted_items, inserted_versions, produced_titles
 
 
+def _try_regen_one(
+    *,
+    db_client,
+    project_id: str,
+    dup_idx: int,
+    inserted_versions: list[dict],
+    version_rows: list[dict],
+    titles_in_order: list[str],
+    new_vecs: list[list[float]],
+    queue_pool: list[dict],
+    regen_ctx: dict,
+    threshold: float,
+    metrics,
+    error_prefix: str,
+    errors_sink: list,
+) -> bool:
+    """对单个被判定重复的版本做"避开重复 + 再生一次"的尝试。
+
+    最多重试 ``DEDUP_REGEN_MAX_RETRIES`` 次。成功（新标题不再触发任何
+    cos ≥ threshold 的命中）→ UPDATE versions 行 + 同步 titles/new_vecs/
+    queue_pool；失败 → ``items.status = 'needs_revision'``、写警告。
+
+    返回 True 表示重生成功；False 表示重试用尽。
+    """
+    if dup_idx >= len(inserted_versions) or dup_idx >= len(version_rows):
+        return False
+    iv = inserted_versions[dup_idx]
+    if not iv or not iv.get("id"):
+        return False
+    version_id = iv["id"]
+    item_id    = iv.get("item_id")
+    engine     = (version_rows[dup_idx].get("ai_engine") or "claude")
+
+    max_retries = int(regen_ctx.get("max_retries", 2))
+
+    # 已生成池 = 原 historical + 本批其他成功标题（除自己以外）
+    base_historical = list(regen_ctx.get("historical_titles") or [])
+    sibling_titles = [
+        {"title": t, "opening": ""}
+        for i, t in enumerate(titles_in_order)
+        if i != dup_idx and t
+    ]
+
+    avoid_extra = (
+        (regen_ctx.get("extra_instructions") or "")
+        + "\n\n【本次自动避让】请务必避开以下标题的任何角度、卖点和句式："
+        + " / ".join(
+            f"《{x['title']}》" for x in (base_historical + sibling_titles)[-15:]
+        )
+    ).strip()
+
+    for attempt in range(1, max_retries + 1):
+        metrics.incr("regen_attempts")
+        try:
+            results = gen_module.generate_batch(
+                system_prompt=regen_ctx.get("system_prompt", ""),
+                tactic=regen_ctx.get("tactic", ""),
+                count=1,
+                engines=[engine],
+                target_audience=regen_ctx.get("target_audience", ""),
+                key_messages=regen_ctx.get("key_messages", ""),
+                tone=regen_ctx.get("tone", ""),
+                extra_instructions=avoid_extra,
+                images=None,
+                progress_callback=None,
+                historical_titles=base_historical + sibling_titles,
+                use_thinking=regen_ctx.get("use_thinking", False),
+                engine_models=regen_ctx.get("engine_models") or None,
+                gemini_use_thinking=regen_ctx.get("gemini_use_thinking", False),
+                user_id=regen_ctx.get("user_id", ""),
+                project_id=project_id,
+            )
+        except Exception as exc:
+            errors_sink.append(f"{error_prefix}重生异常：{exc}")
+            continue
+
+        if not results:
+            continue
+        new_version = results[0]["versions"][0] if results[0].get("versions") else None
+        if not new_version or new_version.error or not new_version.title:
+            continue
+
+        # 给新标题算 embedding，比较是否还触发命中
+        new_vec_list = dedup_module.embed_texts([new_version.title])
+        if not new_vec_list or not new_vec_list[0]:
+            continue
+        candidate_vec = new_vec_list[0]
+
+        # 对照 queue_pool + 本批其他标题
+        siblings_for_check = [
+            (titles_in_order[i], new_vecs[i])
+            for i in range(len(titles_in_order))
+            if i != dup_idx and titles_in_order[i]
+        ]
+        check_titles = [h["title"]     for h in queue_pool] + [t for t, _ in siblings_for_check]
+        check_vecs   = [h["embedding"] for h in queue_pool] + [v for _, v in siblings_for_check]
+        still_hit = dedup_module.find_near_duplicates(
+            [candidate_vec], [new_version.title],
+            check_vecs, check_titles,
+            threshold=threshold,
+        )
+        if still_hit:
+            # 仍然撞车，继续重试
+            continue
+
+        # ── 重生成功：写 DB + 原地更新内存结构 ─────────────────────────
+        db.update_version_content(
+            db_client, version_id,
+            title=new_version.title,
+            body=new_version.body,
+            keywords=new_version.keywords,
+            token_usage=new_version.token_usage,
+            embedding=candidate_vec,
+        )
+        titles_in_order[dup_idx] = new_version.title.strip()
+        new_vecs[dup_idx]        = candidate_vec
+        version_rows[dup_idx]["title"] = new_version.title  # 给后面 queue_titles 用
+        return True
+
+    # 重试用尽 → 标记 needs_revision
+    if item_id:
+        try:
+            db.update_item_status(db_client, item_id, "needs_revision")
+        except Exception:
+            pass
+    errors_sink.append(
+        f"{error_prefix}《{titles_in_order[dup_idx]}》重试 {max_retries} 次仍重复，"
+        f"已标记 needs_revision；建议人工处理或删除。"
+    )
+    return False
+
+
 def _run_semantic_dedup_pass(
     db_client,
     inserted_versions: list[dict],
@@ -150,20 +282,29 @@ def _run_semantic_dedup_pass(
     error_prefix: str,
     errors_sink: list,
     metrics,
+    regen_ctx: Optional[dict] = None,
 ) -> None:
-    """两个 worker 共用的语义查重 + embedding 持久化（修 R3 的前置）。
+    """两个 worker 共用的语义查重 + embedding 持久化（修 R3）。
 
     流程：
       1. 给所有新标题算 768d embedding（一次 API 调用，批量请求）
       2. 写入 versions.embedding 列
-      3. 与历史池对比，cos ≥ 0.92 视为近似重复 → 写到 errors_sink
-      4. 本批内对比（多引擎撞车场景）→ 写到 errors_sink
+      3. 与历史池对比，cos ≥ DEDUP_SEMANTIC_THRESHOLD 视为近似重复
+      4. 本批内对比（多引擎撞车场景）
       5. 累积进 queue_embeddings，下一批能立刻看到
+
+    若 ``regen_ctx`` 非空且 ``regen_ctx["enabled"]`` 为 True，会对每个命中
+    的版本调用 _try_regen_one 自动重生：
+      - 重生成功 → UPDATE versions 行、刷新 pool、不写警告
+      - 重试 max_retries 仍命中 → 把 item.status 改成 needs_revision，并
+        写警告到 ``errors_sink``
+      - 重生功能关闭时，所有命中只写警告，不改 DB
 
     ``queue_embeddings`` 是 worker 自己维护的字典，按 project_id 分桶。
     Quick Generate 也建一份只有一个项目的字典。
     没配 GOOGLE_API_KEY 时整段跳过，不影响主流程。
     """
+    regen_enabled = bool(regen_ctx and regen_ctx.get("enabled"))
     if not inserted_versions or not dedup_module.embeddings_available():
         return
     metrics.start_phase("embedding")
@@ -181,33 +322,70 @@ def _run_semantic_dedup_pass(
             db.bulk_update_version_embeddings(db_client, embed_rows)
 
         # 步骤 3：对照历史池
+        threshold = float(getattr(config, "DEDUP_SEMANTIC_THRESHOLD", 0.92))
         hist_pool = queue_embeddings.get(project_id, [])
+        hits = []
         if hist_pool:
             hits = dedup_module.find_near_duplicates(
                 new_vecs, titles_in_order,
                 [h["embedding"] for h in hist_pool],
                 [h["title"]     for h in hist_pool],
+                threshold=threshold,
             )
-            metrics.incr("dedup_semantic_hits", len(hits))
+
+        # 步骤 4：本批内查重
+        intra = dedup_module.cross_batch_pairs(
+            new_vecs, titles_in_order, threshold=threshold,
+        )
+
+        # 把"哪些 index 是重复"汇总成一个集合（去重 + 排序），方便自动重生用
+        duplicate_indices: set[int] = set()
+        for hit in hits:
+            duplicate_indices.add(hit["index"])
+        for pair in intra:
+            # 本批内冲突时把后一个（j）当作要重生的；前一个先留着
+            duplicate_indices.add(pair["j"])
+
+        # 没开启自动重生：直接写警告
+        if not regen_enabled:
+            metrics.incr("dedup_semantic_hits", len(hits) + len(intra))
             for hit in hits:
                 errors_sink.append(
                     f"{error_prefix}近似重复：《{hit['title']}》 ↔ "
                     f"历史《{hit['best_match']}》（相似度 {hit['score']:.2f}）"
                 )
+            for pair in intra:
+                errors_sink.append(
+                    f"{error_prefix}本批内近似：《{pair['title_i']}》 ↔ "
+                    f"《{pair['title_j']}》（相似度 {pair['score']:.2f}）"
+                )
+        else:
+            # 自动重生：对每个 duplicate index 调一次 1-item 生成，更新 DB
+            for dup_idx in sorted(duplicate_indices):
+                ok = _try_regen_one(
+                    db_client=db_client,
+                    project_id=project_id,
+                    dup_idx=dup_idx,
+                    inserted_versions=inserted_versions,
+                    version_rows=version_rows,
+                    titles_in_order=titles_in_order,
+                    new_vecs=new_vecs,
+                    queue_pool=queue_embeddings.setdefault(project_id, []),
+                    regen_ctx=regen_ctx,
+                    threshold=threshold,
+                    metrics=metrics,
+                    error_prefix=error_prefix,
+                    errors_sink=errors_sink,
+                )
+                if ok:
+                    metrics.incr("regen_success")
+                # 不论成功失败都计入 attempts（_try_regen_one 内部记录每次尝试）
 
-        # 步骤 4：本批内查重
-        intra = dedup_module.cross_batch_pairs(new_vecs, titles_in_order)
-        metrics.incr("dedup_semantic_hits", len(intra))
-        for pair in intra:
-            errors_sink.append(
-                f"{error_prefix}本批内近似：《{pair['title_i']}》 ↔ "
-                f"《{pair['title_j']}》（相似度 {pair['score']:.2f}）"
-            )
-
-        # 步骤 5：累积给下一批用
+        # 步骤 5：累积给下一批用（regen 路径可能已经原地改过 new_vecs）
         pool = queue_embeddings.setdefault(project_id, [])
         for i, t in enumerate(titles_in_order):
             if i < len(new_vecs) and t:
+                # 跳过 pool 里已经有的（regen 时会原地替换）
                 pool.append({"title": t, "embedding": new_vecs[i]})
     finally:
         metrics.stop_phase("embedding")
@@ -477,19 +655,36 @@ def _queue_worker(
                 error_prefix, status["errors"],
             )
             # version_rows 是 _save_batch_results 内部构造的临时变量；
-            # 我们在这里通过 inserted_versions 的顺序还原它（embedding 流程要用）
+            # 在这里从 inserted_versions 还原（embedding / 自动重生流程要用）
             version_rows = [
-                {"title": v.get("title", "")} for v in inserted_versions
+                {"title": v.get("title", ""), "ai_engine": v.get("ai_engine", "")}
+                for v in inserted_versions
             ]
             saved = len(inserted_versions)
             metrics.stop_phase("db_save")
 
             # ── 语义查重（统一服务 _run_semantic_dedup_pass）──────────────────
             _set_phase_progress(status, "embedding")
+            regen_ctx = {
+                "enabled":             bool(getattr(config, "ENABLE_DEDUP_REGEN", False)),
+                "max_retries":         int(getattr(config, "DEDUP_REGEN_MAX_RETRIES", 2)),
+                "system_prompt":       full_system_prompt,
+                "tactic":              tactic,
+                "engines":             engines,
+                "engine_models":       engine_models,
+                "target_audience":     plan.get("target_audience", ""),
+                "key_messages":        plan.get("key_messages", ""),
+                "tone":                plan.get("tone", ""),
+                "extra_instructions":  extra_instr,
+                "use_thinking":        use_thinking,
+                "gemini_use_thinking": gemini_thinking,
+                "historical_titles":   historical_titles,
+                "user_id":             user_id,
+            }
             _run_semantic_dedup_pass(
                 db_client, inserted_versions, version_rows,
                 queue_embeddings, project_id, error_prefix,
-                status["errors"], metrics,
+                status["errors"], metrics, regen_ctx=regen_ctx,
             )
             _set_phase_progress(status, "embedding", intra=1.0)
 
@@ -1920,7 +2115,10 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             error_prefix="",  # Quick Generate 不需要 "计划 N（项目）：" 前缀
             errors_sink=errors,
         )
-        version_rows = [{"title": v.get("title", "")} for v in inserted_versions]
+        version_rows = [
+            {"title": v.get("title", ""), "ai_engine": v.get("ai_engine", "")}
+            for v in inserted_versions
+        ]
         saved_count = len(inserted_versions)
         metrics.stop_phase("db_save")
 
@@ -1929,10 +2127,27 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # project_id 的临时字典；命中重复直接写到 errors 数组里。
         _set_phase_progress(status, "embedding")
         quick_queue_embeddings: dict[str, list[dict]] = {}
+        regen_ctx = {
+            "enabled":             bool(getattr(config, "ENABLE_DEDUP_REGEN", False)),
+            "max_retries":         int(getattr(config, "DEDUP_REGEN_MAX_RETRIES", 2)),
+            "system_prompt":       full_system_prompt,
+            "tactic":              tactic,
+            "engines":             engines,
+            "engine_models":       engine_models,
+            "target_audience":     plan.get("target_audience", ""),
+            "key_messages":        plan.get("key_messages", ""),
+            "tone":                plan.get("tone", ""),
+            "extra_instructions":  combined_extra,
+            "use_thinking":        use_thinking,
+            "gemini_use_thinking": gemini_thinking,
+            "historical_titles":   historical_titles,
+            "user_id":             user_id,
+        }
         _run_semantic_dedup_pass(
             db_client, inserted_versions, version_rows,
             quick_queue_embeddings, project_id,
             error_prefix="", errors_sink=errors, metrics=metrics,
+            regen_ctx=regen_ctx,
         )
         _set_phase_progress(status, "embedding", intra=1.0)
 
