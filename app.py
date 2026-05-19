@@ -27,6 +27,7 @@ import generator as gen_module
 import image_handler
 import exporter
 import dedup as dedup_module
+import telemetry
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -111,8 +112,18 @@ def _queue_worker(
                 status["errors"].append(f"计划 {idx+1}：项目未配置 System Prompt")
                 continue
 
+            # 单批次指标：用于事后分析"慢/卡/重"出在哪一段，对应阶段名：
+            # setup（取数）/ llm（生成）/ db_save（落库）/ embedding（语义查重）
+            metrics = telemetry.BatchMetrics(
+                project_id=project_id,
+                mode="queue",
+                engines=list(plan.get("engines", [])),
+                count=int(plan.get("count", 0)),
+            )
+
             # ── [A 取数] 项目配置/记忆/示例/会话指令（带 per-project 缓存）──
-            tactic_suffix  = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
+            metrics.start_phase("setup")
+            tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
             if project_id not in mem_cache:
                 mem_cache[project_id] = db.get_confirmed_memories(
                     db_client, user_id, project_id=project_id
@@ -223,13 +234,18 @@ def _queue_worker(
                 pool.append(h)
                 seen.add(key)
             historical_titles = pool
+            metrics.stop_phase("setup")
 
             # ── [D 生成] 调用 generator；多引擎模式内部会串行复用 dedup pool ──
             _total   = count * len(engines)
             _done_n  = [0]
             def _progress(pct: float, msg: str, _idx=idx, _n=len(plans), _t=_total) -> None:
-                status["message"] = f"计划 {_idx+1}/{_n} — {msg}"
+                # 同时同步 message 和 progress（之前只更新 message，进度条看上去没动）
+                status["message"]  = f"计划 {_idx+1}/{_n} — {msg}"
+                status["progress"] = pct
 
+            metrics.start_phase("llm")
+            metrics.incr("llm_calls", len(engines))
             if use_multi_role:
                 generation_results = gen_module.generate_batch_multi_role(
                     system_prompt=full_system_prompt,
@@ -269,9 +285,12 @@ def _queue_worker(
                     project_id=project_id,
                 )
 
+            metrics.stop_phase("llm")
+
             # ── [E 保存] 批量写 items + versions，再补 embedding 查重 ───────
             # 保存改为两次批量 INSERT（items 一次 + versions 一次），比之前
             # 逐条 INSERT 节省 ~30 次 round trip（10 篇 × 2 引擎的批次）
+            metrics.start_phase("db_save")
             saved = 0
             produced_titles: list[dict] = []
             item_rows: list[dict] = []
@@ -317,6 +336,7 @@ def _queue_worker(
                 saved = len(inserted_versions)
             except Exception as exc:
                 status["errors"].append(f"计划 {idx+1}：批量写入 versions 失败 — {exc}")
+            metrics.stop_phase("db_save")
 
             # ── 语义查重（仅在配置了 GOOGLE_API_KEY 时启用）──────────────────
             # 文本去重只能抓字面重复；同义改写（"炫耀"→"展示"）能绕过。
@@ -327,6 +347,7 @@ def _queue_worker(
             #   4. 累积到 queue_embeddings，下一批就能用
             # 没配 GOOGLE_API_KEY 时整段跳过，主流程不受影响。
             if inserted_versions and dedup_module.embeddings_available():
+                metrics.start_phase("embedding")
                 titles_in_order = [r.get("title", "") for r in version_rows]
                 new_vecs = dedup_module.embed_texts(titles_in_order)
                 if new_vecs:
@@ -350,6 +371,7 @@ def _queue_worker(
                             new_vecs, titles_in_order,
                             h_vecs, h_titles,
                         )
+                        metrics.incr("dedup_semantic_hits", len(hits))
                         for hit in hits:
                             status["errors"].append(
                                 f"计划 {idx+1}（{proj_name}）· 近似重复：《{hit['title']}》"
@@ -358,6 +380,7 @@ def _queue_worker(
 
                     # 步骤 3：本批内查重（主要针对多引擎模式的撞车）
                     intra = dedup_module.cross_batch_pairs(new_vecs, titles_in_order)
+                    metrics.incr("dedup_semantic_hits", len(intra))
                     for pair in intra:
                         status["errors"].append(
                             f"计划 {idx+1}（{proj_name}）· 本批内近似：《{pair['title_i']}》"
@@ -369,6 +392,7 @@ def _queue_worker(
                     for i, t in enumerate(titles_in_order):
                         if i < len(new_vecs) and t:
                             pool.append({"title": t, "embedding": new_vecs[i]})
+                metrics.stop_phase("embedding")
 
             # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）
             if produced_titles:
@@ -380,9 +404,18 @@ def _queue_worker(
                 "project_name": proj_name,
                 "saved":       saved,
             })
+            # 收尾：写一行 JSON 到 stdout + 挂到 status["metrics_list"] 给 UI
+            metrics.batch_id = batch_id
+            metrics.set_meta("saved", saved)
+            metrics.close(status)
 
         except Exception as exc:
             status["errors"].append(f"计划 {idx+1}：{exc}")
+            try:
+                metrics.set_meta("error", str(exc)[:120])
+                metrics.close(status)
+            except Exception:
+                pass
 
     status["running"] = False
     status["done"]    = True
@@ -1633,7 +1666,19 @@ def _section_divider() -> None:
 
 
 def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None:
-    """Background worker for quick generate (single batch, mirrors _queue_worker)."""
+    """快速生成的后台 worker（单批次版的 _queue_worker）。
+
+    现在也产出 telemetry.BatchMetrics 一致的指标日志（setup / llm /
+    db_save / embedding 四个阶段 + dedup/regen 计数器），方便和队列模式
+    做对比。
+    """
+    metrics = telemetry.BatchMetrics(
+        project_id=plan.get("project_id", ""),
+        mode="quick",
+        engines=list(plan.get("engines", [])),
+        count=int(plan.get("count", 0)),
+    )
+    metrics.start_phase("setup")
     try:
         status["running"] = True
         status["message"] = "正在构建提示词…"
@@ -1711,12 +1756,15 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             )
 
         historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
+        metrics.stop_phase("setup")
 
         def _progress(pct: float, msg: str) -> None:
             status["progress"] = pct
             status["message"]  = msg
 
         status["message"] = "正在生成内容…"
+        metrics.start_phase("llm")
+        metrics.incr("llm_calls", len(engines))
 
         if use_multi_role:
             generation_results = gen_module.generate_batch_multi_role(
@@ -1757,6 +1805,8 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 project_id=project_id,
             )
 
+        metrics.stop_phase("llm")
+        metrics.start_phase("db_save")
         saved_count = 0
         errors: list[str] = []
         for slot in generation_results:
@@ -1778,16 +1828,21 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                     token_usage=vr.token_usage,
                 )
                 saved_count += 1
+        metrics.stop_phase("db_save")
 
         status["saved_count"] = saved_count
         status["n_results"]   = len(generation_results)
         status["errors"]      = errors
         status["message"]     = f"生成完成！{len(generation_results)} 篇，{saved_count} 个版本已保存。"
+        metrics.batch_id = batch_id
+        metrics.set_meta("saved", saved_count)
 
     except Exception as exc:
         status.setdefault("errors", []).append(str(exc))
         status["message"] = f"生成失败：{exc}"
+        metrics.set_meta("error", str(exc)[:120])
 
+    metrics.close(status)
     status["running"] = False
     status["done"]    = True
 
