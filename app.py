@@ -34,6 +34,44 @@ _BEIJING_TZ = timezone(timedelta(hours=8))
 
 # ── Generation Queue ────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────
+# 进度条阶段权重（A3 修复：批次内的进度条之前只在 LLM 阶段动，setup /
+# db_save / embedding 三个阶段什么都不显示，给用户"卡住了"的错觉）
+#
+# 用法：在每个阶段开始时调用 _set_phase_progress(status, "<phase>")；
+# LLM 阶段的 _progress 回调通过 _llm_intra_progress 把 [0,1] 映射到 LLM
+# 段的实际占比，避免覆盖前面阶段的进度。
+# ─────────────────────────────────────────────────────────────────────────
+
+_PHASE_WEIGHTS = {
+    "setup":     (0.00, 0.05),   #  0% → 5%   读 DB / 拼 prompt
+    "llm":       (0.05, 0.75),   #  5% → 75%  生成（占绝大部分时间）
+    "db_save":   (0.75, 0.90),   # 75% → 90%  批量落库
+    "embedding": (0.90, 1.00),   # 90% → 100% 语义查重 + embedding 持久化
+}
+
+
+def _set_phase_progress(status: dict, phase: str, intra: float = 0.0) -> None:
+    """把 status["progress"] 设置到指定阶段的某个内部进度。
+
+    ``phase`` 必须是 _PHASE_WEIGHTS 里的 key；``intra`` ∈ [0, 1] 表示
+    该阶段内部的完成度（默认 0 = 阶段刚开始）。出参写到 status，不返回。
+    """
+    if phase not in _PHASE_WEIGHTS:
+        return
+    lo, hi = _PHASE_WEIGHTS[phase]
+    intra = max(0.0, min(1.0, intra))
+    status["progress"] = lo + (hi - lo) * intra
+
+
+def _llm_intra_progress(status: dict, pct: float, msg: str) -> None:
+    """LLM 引擎的 progress_callback 适配器：把引擎层的 [0,1] 映射到
+    LLM 阶段在整批的占比，避免把 db_save / embedding 那部分覆盖掉。"""
+    _set_phase_progress(status, "llm", pct)
+    if msg:
+        status["message"] = msg
+
+
 def _save_batch_results(
     db_client,
     batch_id: str,
@@ -264,6 +302,7 @@ def _queue_worker(
 
             # ── [A 取数] 项目配置/记忆/示例/会话指令（带 per-project 缓存）──
             metrics.start_phase("setup")
+            _set_phase_progress(status, "setup")
             tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
             if project_id not in mem_cache:
                 mem_cache[project_id] = db.get_confirmed_memories(
@@ -381,11 +420,12 @@ def _queue_worker(
             _total   = count * len(engines)
             _done_n  = [0]
             def _progress(pct: float, msg: str, _idx=idx, _n=len(plans), _t=_total) -> None:
-                # 同时同步 message 和 progress（之前只更新 message，进度条看上去没动）
-                status["message"]  = f"计划 {_idx+1}/{_n} — {msg}"
-                status["progress"] = pct
+                # 把引擎层的 [0,1] 映射到 LLM 阶段在整批的占比（5%-75%），
+                # 同时附上 "计划 X/Y" 前缀方便用户知道当前在跑哪一批
+                _llm_intra_progress(status, pct, f"计划 {_idx+1}/{_n} — {msg}")
 
             metrics.start_phase("llm")
+            _set_phase_progress(status, "llm")
             metrics.incr("llm_calls", len(engines))
             if use_multi_role:
                 generation_results = gen_module.generate_batch_multi_role(
@@ -430,6 +470,7 @@ def _queue_worker(
 
             # ── [E 保存] 批量写 items + versions（统一服务 _save_batch_results）──
             metrics.start_phase("db_save")
+            _set_phase_progress(status, "db_save")
             error_prefix = f"计划 {idx+1}（{proj_name}）："
             inserted_items, inserted_versions, produced_titles = _save_batch_results(
                 db_client, batch_id, user_id, generation_results,
@@ -444,11 +485,13 @@ def _queue_worker(
             metrics.stop_phase("db_save")
 
             # ── 语义查重（统一服务 _run_semantic_dedup_pass）──────────────────
+            _set_phase_progress(status, "embedding")
             _run_semantic_dedup_pass(
                 db_client, inserted_versions, version_rows,
                 queue_embeddings, project_id, error_prefix,
                 status["errors"], metrics,
             )
+            _set_phase_progress(status, "embedding", intra=1.0)
 
             # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）
             if produced_titles:
@@ -1738,6 +1781,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
     try:
         status["running"] = True
         status["message"] = "正在构建提示词…"
+        _set_phase_progress(status, "setup")
 
         project_id = plan["project_id"]
         project    = db.get_project(db_client, project_id)
@@ -1815,11 +1859,13 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         metrics.stop_phase("setup")
 
         def _progress(pct: float, msg: str) -> None:
-            status["progress"] = pct
-            status["message"]  = msg
+            # 把引擎层 [0,1] 映射到 LLM 阶段在整批的占比，
+            # 不会覆盖后续 db_save / embedding 阶段
+            _llm_intra_progress(status, pct, msg)
 
         status["message"] = "正在生成内容…"
         metrics.start_phase("llm")
+        _set_phase_progress(status, "llm")
         metrics.incr("llm_calls", len(engines))
 
         if use_multi_role:
@@ -1867,6 +1913,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # （修 R1：之前是 create_item / create_version 逐条 INSERT，
         #  ~30 round trip；改批量后收敛为 2 次）
         metrics.start_phase("db_save")
+        _set_phase_progress(status, "db_save")
         errors: list[str] = []
         inserted_items, inserted_versions, _produced_titles = _save_batch_results(
             db_client, batch_id, user_id, generation_results,
@@ -1880,12 +1927,14 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # ── 语义查重（同 _queue_worker 走 _run_semantic_dedup_pass）─────
         # Quick Generate 只跑一个批次，所以 queue_embeddings 是个只有当前
         # project_id 的临时字典；命中重复直接写到 errors 数组里。
+        _set_phase_progress(status, "embedding")
         quick_queue_embeddings: dict[str, list[dict]] = {}
         _run_semantic_dedup_pass(
             db_client, inserted_versions, version_rows,
             quick_queue_embeddings, project_id,
             error_prefix="", errors_sink=errors, metrics=metrics,
         )
+        _set_phase_progress(status, "embedding", intra=1.0)
 
         status["saved_count"] = saved_count
         status["n_results"]   = len(generation_results)
