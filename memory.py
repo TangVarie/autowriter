@@ -439,21 +439,36 @@ def ingest_user_instruction(
     return {"action": "session", "result": row, "reason": decision.get("reason", "")}
 
 
-def _dedup_calibration_lines(text: str, max_chars: int = 4000) -> str:
+def _normalize_line(raw: str) -> str:
+    """归一化一行观察文本：剥前缀符号、压缩空白、转小写。
+    用作 dedup key 的输入（C2：用归一化全文比对，避免前缀相同就误判重复）。
     """
-    Line-level dedup for calibration notes.
+    stripped = (raw or "").strip().lstrip("-•·*· ").strip()
+    return " ".join(stripped.split()).lower()
 
-    Multiple writers can add observations (manual-refine auto update, per-
-    iteration incremental, full-batch reflection, merger's taste path, user's
-    manual save); each path believes it's "merging" but without guarantees.
-    This normalises every persisted copy: strip bullet prefixes, drop near-
-    exact duplicates (first 15 normalised chars as the key), cap at
-    ``max_chars`` by dropping the oldest survivors.
 
-    The cap is intentionally loose (4000 chars ≈ 30-50 observations) — the
-    pre-2026-05 default of 1200 was tight enough that the LLM-rewrite path
-    silently deleted older observations under capacity pressure.  At-injection
-    time we'll trim further by relevance once the embedding path lands.
+def _line_key(raw: str) -> str:
+    """单行的精确去重 key：归一化全文。
+
+    C2 修复：之前用前 15 字符作为 key，会把"标题偏好不带量化修饰（如3个真相）"
+    和"标题偏好不带量化修饰（如5个步骤）"误判为同一条。改为归一化全文后
+    任何后缀差异都会保留。
+    """
+    return _normalize_line(raw)
+
+
+def _dedup_calibration_lines(text: str, max_chars: int = 4000) -> str:
+    """对调教笔记做行级去重 + 软上限截断。
+
+    多个写入入口（手动精修自动更新 / 每次迭代增量 / 整批反思 / 反馈分类
+    走 taste / 用户手动保存）都会通过 ``save_calibration_notes``，最终都
+    会调到这里。每条观察按 _line_key（归一化全文 hash）去重；超过
+    ``max_chars`` 时丢最旧的观察。
+
+    上限 4000 字是软上限，对应大约 30-50 条观察；2026-05 之前默认是 1200
+    字，太紧——LLM 重写路径在容量压力下会静默删旧观察。生成时如果还需要
+    进一步裁剪，通过 ``filter_soft_by_relevance`` / 调用方 cap 处理，不在
+    这里加硬限制。
     """
     if not text:
         return ""
@@ -464,7 +479,7 @@ def _dedup_calibration_lines(text: str, max_chars: int = 4000) -> str:
         stripped = raw.strip().lstrip("-•·*· ").strip()
         if not stripped:
             continue
-        key = " ".join(stripped.split())[:15].lower()
+        key = _line_key(stripped)
         if not key or key in seen:
             continue
         seen.add(key)
@@ -513,28 +528,26 @@ def _parse_new_observations(raw: str) -> list[str]:
 
 
 def _merge_new_observations(existing: str, new_lines: list[str]) -> str:
-    """
-    Pure function: produce a single calibration-notes text that contains every
-    existing line plus the subset of ``new_lines`` not already covered (15-char
-    normalised dedup key).  Never removes an existing line.
+    """Pure function：把 ``new_lines`` 合并到 ``existing`` 末尾。
+
+    去重 key = 归一化全文（C2：从前 15 字升级为全文，前缀相同但内容不同
+    的观察不再被误判为重复）。已存在的观察永远不会被删除。
     """
     existing = (existing or "").rstrip()
     if not new_lines:
         return existing
 
-    existing_keys: set[str] = set()
-    for raw in existing.splitlines():
-        stripped = raw.strip().lstrip("-•·*· ").strip()
-        if not stripped:
-            continue
-        existing_keys.add(" ".join(stripped.split())[:15].lower())
+    existing_keys: set[str] = {
+        _line_key(raw) for raw in existing.splitlines() if raw.strip()
+    }
+    existing_keys.discard("")
 
     appended: list[str] = []
     for line in new_lines:
         line = line.strip()
         if not line:
             continue
-        key = " ".join(line.split())[:15].lower()
+        key = _line_key(line)
         if not key or key in existing_keys:
             continue
         existing_keys.add(key)
@@ -615,16 +628,14 @@ def save_calibration_notes(
     except Exception:
         pass
 
-    # 计算本次新增的观察行：deduped 中存在但 before 中不存在的（按归一化 key 比对）
-    def _normalized_key(line: str) -> str:
-        stripped = line.strip().lstrip("-•·*· ").strip()
-        return " ".join(stripped.split()).lower()
+    # 计算本次新增的观察行：deduped 中存在但 before 中不存在的（按 _line_key 比对）
     before_keys = {
-        _normalized_key(l) for l in before_text.splitlines() if l.strip()
+        _line_key(l) for l in before_text.splitlines() if l.strip()
     }
+    before_keys.discard("")
     append_lines = []
     for l in deduped.splitlines():
-        key = _normalized_key(l)
+        key = _line_key(l)
         if key and key not in before_keys:
             append_lines.append(l.strip())
 
@@ -645,10 +656,11 @@ def _append_taste_to_calibration(
     project_id: str,
     observation: str,
 ) -> None:
-    """Append a single taste observation to the project's calibration notes.
+    """往项目的调教笔记追加一条感受性观察。
 
-    Keeps the notes bounded (≤ 800 characters total) by deduping near-exact
-    matches and trimming the oldest entries once capacity is exceeded.
+    走的是同一个 ``save_calibration_notes`` 入口，因此自动享受 _line_key 全文去重、
+    ``_dedup_calibration_lines`` 的软上限（4000 字，约 30-50 条）、以及
+    审计表写入。``source="merger_taste"`` 标记来自分类器的 taste 路径。
     """
     try:
         proj = db.get_project(db_client, project_id)

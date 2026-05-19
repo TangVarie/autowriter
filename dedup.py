@@ -4,9 +4,9 @@ Semantic-duplication detection via Gemini text embeddings.
 The text-only dedup pass in ``generator._build_dedup_instruction`` catches
 verbatim and near-verbatim title overlap but is fooled by synonyms, paraphrases,
 and stylistic rewrites (the model can rename "炫耀" → "展示" and slip past the
-"15-char first-line" check).  This module adds a second pass that operates on
-sentence embeddings: high cosine similarity between two titles flags them as
-the same "angle" regardless of wording.
+"前 20 字开头 + 核心名词重合" check).  This module adds a second pass that
+operates on sentence embeddings: high cosine similarity between two titles
+flags them as the same "angle" regardless of wording.
 
 Design choices:
 - Uses the project's existing ``google-genai`` dependency (no new package).
