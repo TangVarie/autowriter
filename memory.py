@@ -1071,19 +1071,23 @@ def render_memory_manager(
     """Render the full memory management page."""
     st.header("🧠 记忆管理")
 
-    cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 40) or 40)
+    cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 12) or 12)
     st.caption(
-        f"每次生成会向 AI 注入每个范围下最多 {cap} 条规则："
-        f"最近 7 天新增的规则必入，剩余名额按使用频次填充老规则。"
-        f"列表里看到但没进 prompt 的不会丢失，只是暂不参与当次生成。"
+        f"系统按优先级分层注入：**P0 硬约束**（severity=hard 规则）无数量上限，"
+        f"必须 100% 满足；**P1 偏好**（severity=soft）每个范围最多 {cap} 条，"
+        f"近 7 天新增必入，其余按频次填充。列表里看到但未注入的规则只是暂不参与本次生成，"
+        f"不会丢失。被静音（muted_until 未过期）的规则会被跳过。"
     )
+
+    # Inject-preview: show exactly what the next generation will see
+    _render_inject_preview(db_client, user_id, project_id, project_name)
 
     tab_global, tab_project = st.tabs(["通用记忆", f"项目记忆（{project_name or '当前项目'}）"])
 
     with tab_global:
         _render_memory_table(
             db_client, user_id, scope="global", project_id=None,
-            label="通用记忆"
+            label="通用记忆", current_project_id=project_id,
         )
 
     with tab_project:
@@ -1092,7 +1096,8 @@ def render_memory_manager(
         else:
             _render_memory_table(
                 db_client, user_id, scope="project",
-                project_id=project_id, label="项目记忆"
+                project_id=project_id, label="项目记忆",
+                current_project_id=project_id,
             )
 
     # Manual add
@@ -1184,45 +1189,225 @@ def _render_memory_table(
     scope: str,
     project_id: Optional[str],
     label: str,
+    current_project_id: Optional[str] = None,
 ) -> None:
+    """List the rules in this scope, sorted with hard rules first so the user
+    can immediately spot the critical ones; mutes / candidates roll up at the
+    bottom."""
     memories = db.list_memories(db_client, user_id, scope=scope, project_id=project_id)
     if not memories:
         st.info(f"暂无{label}。")
         return
 
+    # Sort confirmed: hard severity first, then most-frequent, then newest.
     confirmed = [m for m in memories if m["status"] == "confirmed"]
     candidates = [m for m in memories if m["status"] == "candidate"]
+    confirmed.sort(
+        key=lambda m: (
+            0 if (m.get("severity") or "soft").lower() == "hard" else 1,
+            -int(m.get("frequency") or 0),
+            str(m.get("created_at") or ""),
+        )
+    )
 
     if confirmed:
         st.markdown("**✅ 已确认**")
         for m in confirmed:
-            _render_memory_row(db_client, m, show_confirm=False)
+            _render_memory_row(
+                db_client, m, show_confirm=False,
+                current_project_id=current_project_id,
+            )
 
     if candidates:
         st.markdown("**⏳ 候选中（出现次数不足）**")
         for m in candidates:
-            _render_memory_row(db_client, m, show_confirm=True)
+            _render_memory_row(
+                db_client, m, show_confirm=True,
+                current_project_id=current_project_id,
+            )
 
 
-def _render_memory_row(db_client: Client, memory: dict, show_confirm: bool) -> None:
+def _safe_update_memory(
+    db_client: Client, memory_id: str, updates: dict
+) -> tuple[bool, str]:
+    """Wrapper that tolerates older Supabase deployments missing the new
+    columns (severity / applicability / muted_until).  Returns
+    (success, hint_message).  The hint lets the UI surface a one-time
+    nudge to run the schema migration without crashing the page."""
+    try:
+        db.update_memory(db_client, memory_id, updates)
+        return True, ""
+    except Exception as exc:
+        # Strip the new columns and retry so basic edits still work.
+        msg = str(exc)
+        new_cols = {"severity", "applicability", "muted_until"}
+        if any(col in msg for col in new_cols):
+            stripped = {k: v for k, v in updates.items() if k not in new_cols}
+            if stripped:
+                try:
+                    db.update_memory(db_client, memory_id, stripped)
+                except Exception:
+                    pass
+            return False, "数据库尚未运行新列迁移（severity / applicability / muted_until）"
+        return False, msg[:120]
+
+
+def _render_memory_row(
+    db_client: Client,
+    memory: dict,
+    show_confirm: bool,
+    current_project_id: Optional[str] = None,
+) -> None:
     import html as _html
-    col1, col2, col3, col4 = st.columns([5, 1, 1, 1])
-    with col1:
-        safe_content = _html.escape(memory['content'])
-        safe_source = _html.escape(memory.get('source_feedback', '')[:30])
+    from datetime import datetime, timedelta, timezone
+
+    mem_id = memory["id"]
+    severity = (memory.get("severity") or "soft").lower()
+    applicability = (memory.get("applicability") or "").strip()
+    muted_until = memory.get("muted_until")
+    is_muted = False
+    if muted_until:
+        try:
+            is_muted = str(muted_until) > datetime.utcnow().isoformat()
+        except Exception:
+            is_muted = False
+
+    # Top row: badges + content
+    badge_html = ""
+    if severity == "hard":
+        badge_html += "<span style='background:#FFE4E1;color:#B22222;padding:1px 6px;border-radius:3px;font-size:11px;margin-right:6px'>🔒 硬约束</span>"
+    else:
+        badge_html += "<span style='background:#F0F8FF;color:#4682B4;padding:1px 6px;border-radius:3px;font-size:11px;margin-right:6px'>偏好</span>"
+    if applicability:
+        badge_html += f"<span style='background:#F5F5F5;color:#666;padding:1px 6px;border-radius:3px;font-size:11px;margin-right:6px'>{_html.escape(applicability)}</span>"
+    if is_muted:
+        badge_html += "<span style='background:#FFF8DC;color:#8B4513;padding:1px 6px;border-radius:3px;font-size:11px;margin-right:6px'>🔕 已静音</span>"
+
+    col_main, col_freq = st.columns([6, 1])
+    with col_main:
+        safe_content = _html.escape(memory["content"])
+        safe_source = _html.escape((memory.get("source_feedback") or "")[:30])
         st.markdown(
-            f"{safe_content} "
+            f"{badge_html}{safe_content} "
             f"<small style='color:grey'>（来源：{safe_source}）</small>",
             unsafe_allow_html=True,
         )
-    with col2:
+    with col_freq:
         st.caption(f"×{memory['frequency']}")
-    with col3:
-        if show_confirm:
-            if st.button("确认", key=f"confirm_{memory['id']}"):
-                db.update_memory(db_client, memory["id"], {"status": "confirmed"})
+
+    # Action row: severity toggle, mute toggle, candidate-only (confirm / convert to taste), delete
+    btn_cols = st.columns([1, 1, 1, 1, 1, 1])
+    with btn_cols[0]:
+        # Severity toggle — show the OTHER state as the button label, so it's
+        # an action ("make this hard") rather than a status display.
+        if severity == "hard":
+            if st.button("↓改为偏好", key=f"sev_soft_{mem_id}", help="降级为 P1 软偏好"):
+                ok, hint = _safe_update_memory(db_client, mem_id, {"severity": "soft"})
+                if not ok and hint:
+                    st.warning(hint)
                 st.rerun()
-    with col4:
-        if st.button("删除", key=f"del_mem_{memory['id']}"):
-            db.delete_memory(db_client, memory["id"])
+        else:
+            if st.button("↑标记硬约束", key=f"sev_hard_{mem_id}", help="升级为 P0 硬约束（合规 / 品牌底线，每条必须 100% 满足）"):
+                ok, hint = _safe_update_memory(db_client, mem_id, {"severity": "hard"})
+                if not ok and hint:
+                    st.warning(hint)
+                st.rerun()
+    with btn_cols[1]:
+        if is_muted:
+            if st.button("解除静音", key=f"unmute_{mem_id}"):
+                ok, hint = _safe_update_memory(db_client, mem_id, {"muted_until": None})
+                if not ok and hint:
+                    st.warning(hint)
+                st.rerun()
+        else:
+            if st.button("🔕 静音 24h", key=f"mute_{mem_id}", help="临时禁用此规则 24 小时；不删除"):
+                until = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+                ok, hint = _safe_update_memory(db_client, mem_id, {"muted_until": until})
+                if not ok and hint:
+                    st.warning(hint)
+                st.rerun()
+    with btn_cols[2]:
+        if show_confirm:
+            if st.button("✓ 确认", key=f"confirm_{mem_id}"):
+                db.update_memory(db_client, mem_id, {"status": "confirmed"})
+                st.rerun()
+    with btn_cols[3]:
+        # Convert to taste (calibration observation) — for rules the
+        # classifier mistakenly hardened from a one-off comment.
+        if current_project_id:
+            if st.button("→ 调校笔记", key=f"to_taste_{mem_id}",
+                         help="把这条规则降级为调校笔记里的一条感受性观察，从规则库移除"):
+                _append_new_observations(db_client, current_project_id, [memory["content"]])
+                db.delete_memory(db_client, mem_id)
+                st.success("已转为调校笔记。")
+                st.rerun()
+    with btn_cols[4]:
+        pass
+    with btn_cols[5]:
+        if st.button("🗑 删除", key=f"del_mem_{mem_id}"):
+            db.delete_memory(db_client, mem_id)
             st.rerun()
+
+
+def _render_inject_preview(
+    db_client: Client,
+    user_id: str,
+    project_id: Optional[str],
+    project_name: str,
+) -> None:
+    """Expander that shows exactly which memories will be injected on the
+    next generation for this project, broken down by P0 / P1 tier.  Lets
+    the user spot "why is this rule being applied?" without having to
+    inspect the actual system_prompt."""
+    with st.expander("📋 预览本次会注入的规则", expanded=False):
+        if not project_id:
+            st.caption("选择一个项目后才能预览。")
+            return
+
+        try:
+            global_mems, project_mems = db.get_confirmed_memories(
+                db_client, user_id, project_id=project_id
+            )
+            session_instr = db.get_session_instructions(
+                db_client, user_id, project_id=project_id
+            )
+        except Exception as exc:
+            st.warning(f"读取记忆失败：{exc}")
+            return
+
+        def _split(mems: list[dict]) -> tuple[list[dict], list[dict]]:
+            hard = [m for m in mems if (m.get("severity") or "soft").lower() == "hard"]
+            soft = [m for m in mems if (m.get("severity") or "soft").lower() != "hard"]
+            return hard, soft
+
+        hg, sg = _split(global_mems)
+        hp, sp = _split(project_mems)
+        total_hard = len(hg) + len(hp)
+        total_soft = len(sg) + len(sp)
+        total_session = len([s for s in (session_instr or []) if s.get("content")])
+
+        st.caption(
+            f"P0 硬约束 {total_hard} 条 · P1 偏好 {total_soft} 条 · "
+            f"P2 会话指令 {total_session} 条 · "
+            f"项目调校笔记可在「项目设置」单独查看"
+        )
+
+        if total_hard:
+            st.markdown("**🔒 P0 硬约束（100% 必须满足）**")
+            for m in hg:
+                st.markdown(f"- 〔通用〕{m['content']}")
+            for m in hp:
+                st.markdown(f"- 〔项目〕{m['content']}")
+        if total_soft:
+            st.markdown("**P1 软偏好（相关时应用）**")
+            for m in sg:
+                st.markdown(f"- 〔通用〕{m['content']}")
+            for m in sp:
+                st.markdown(f"- 〔项目〕{m['content']}")
+        if total_session:
+            st.markdown("**⏱ P2 会话临时指令（本批次有效）**")
+            for s in session_instr or []:
+                if s.get("content"):
+                    st.markdown(f"- {s['content']}")
+        if not (total_hard or total_soft or total_session):
+            st.caption("当前没有任何规则会被注入。")
