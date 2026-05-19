@@ -184,6 +184,22 @@ ALTER TABLE memories
     ADD COLUMN IF NOT EXISTS source_batch_id UUID REFERENCES batches(id) ON DELETE SET NULL;
 ALTER TABLE memories
     ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;
+-- Severity: hard rules feed the P0 tier of the system prompt (100% must
+-- satisfy: compliance / brand lines), soft rules feed P1 (apply when
+-- relevant).  Legacy rows default to 'soft' so they keep being injected
+-- but no longer drown the P0 tier.
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'soft'
+        CHECK (severity IN ('hard','soft'));
+-- Applicability: short free-text hint about where the rule applies
+-- ("标题" / "正文开头" / "全局" / specific tactic name).  Used by the
+-- ranker to skip rules unrelated to the current generation.
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS applicability TEXT NULL;
+-- Optional silence flag: user-driven temporary mute (24h tag).  NULL
+-- means no mute; future-dated value means "skip injection until then".
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ NULL;
 CREATE INDEX IF NOT EXISTS memories_session_idx
     ON memories(user_id, memory_type, expires_at)
     WHERE memory_type = 'session';
@@ -623,6 +639,8 @@ def upsert_memory(
     project_id: Optional[str] = None,
     auto_confirm_threshold: int = 3,
     force_confirmed: bool = False,
+    severity: str = "soft",
+    applicability: Optional[str] = None,
 ) -> dict:
     """
     Insert a new memory candidate or increment frequency of an existing one.
@@ -669,7 +687,20 @@ def upsert_memory(
         }
         if project_id:
             data["project_id"] = project_id
-        res = client.table("memories").insert(data).execute()
+        # Severity / applicability are new columns added by the additive
+        # migration block in CREATE_TABLES_SQL.  Try with them first; if the
+        # column doesn't exist yet (older deployment), retry without so the
+        # write still succeeds and the row degrades to "soft / global".
+        if severity and severity.lower() in ("hard", "soft"):
+            data["severity"] = severity.lower()
+        if applicability:
+            data["applicability"] = applicability[:32]
+        try:
+            res = client.table("memories").insert(data).execute()
+        except Exception:
+            data.pop("severity", None)
+            data.pop("applicability", None)
+            res = client.table("memories").insert(data).execute()
         _invalidate_memory_caches()
         return res.data[0]
 
@@ -829,33 +860,53 @@ def get_confirmed_memories(
     cap_per_scope: Optional[int] = None,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Returns (global_memories, project_memories), both filtered to 'confirmed'
-    and capped at ``cap_per_scope`` items per scope (default pulled from
-    ``config.MAX_INJECTED_MEMORIES_PER_SCOPE``).
+    Returns (global_memories, project_memories), both filtered to 'confirmed'.
+
+    Hard rules (``severity='hard'``) bypass ``cap_per_scope`` and are always
+    injected in full — they're compliance / brand lines.  Soft rules are
+    ranked (recent first, then frequency) and capped per scope.
 
     Session-typed memories are excluded — they load through
     :func:`get_session_instructions` into a separate high-priority prompt slot.
+
+    Rows with a future ``muted_until`` are filtered out so the user can
+    temporarily silence a rule without deleting it.
     """
     if cap_per_scope is None:
-        cap_per_scope = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 40) or 40)
+        cap_per_scope = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 12) or 12)
 
-    global_mems = [
-        m for m in list_memories(_client, user_id, scope="global", status="confirmed")
-        if _is_rule_memory(m)
-    ]
+    def _split_and_rank(mems: list[dict]) -> list[dict]:
+        rule_mems = [m for m in mems if _is_rule_memory(m) and not _is_muted(m)]
+        hard = [m for m in rule_mems if (m.get("severity") or "soft").lower() == "hard"]
+        soft = [m for m in rule_mems if (m.get("severity") or "soft").lower() != "hard"]
+        return hard + _rank_memories_for_injection(soft, cap_per_scope)
+
+    global_mems = _split_and_rank(
+        list_memories(_client, user_id, scope="global", status="confirmed")
+    )
     project_mems: list[dict] = []
     if project_id:
-        project_mems = [
-            m for m in list_memories(
+        project_mems = _split_and_rank(
+            list_memories(
                 _client, user_id, scope="project",
                 project_id=project_id, status="confirmed",
             )
-            if _is_rule_memory(m)
-        ]
-    return (
-        _rank_memories_for_injection(global_mems, cap_per_scope),
-        _rank_memories_for_injection(project_mems, cap_per_scope),
-    )
+        )
+    return global_mems, project_mems
+
+
+def _is_muted(memory_row: dict) -> bool:
+    """True if the memory has a ``muted_until`` timestamp in the future."""
+    muted = memory_row.get("muted_until")
+    if not muted:
+        return False
+    try:
+        # Both ISO strings and datetime objects show up here depending on the
+        # Supabase driver; compare as strings since they're all UTC-ISO.
+        now_iso = datetime.utcnow().isoformat()
+        return str(muted) > now_iso
+    except Exception:
+        return False
 
 
 @_cache_data(ttl=30, show_spinner=False)

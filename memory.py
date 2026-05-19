@@ -205,13 +205,23 @@ D. 本次 / 这批 / 这次 / 试试 / 临时 等明显时限词 → session。
 E. 已经和现有硬规则表达同一件事 → merge（输出现有那条的 id）。
 
 若是 rule：判断 scope。与某个品牌/产品强相关 → "project"；对所有小红书文案普遍成立 → "global"。
+若是 rule：还要判断 severity（仅 rule 时输出）：
+   - "hard" —— 合规、底线、品牌禁忌（违反会出大问题，例："不得宣称疗效"、"严禁出现竞品名"、"禁止使用'最'字"）。
+                hard 规则会进入 P0 优先级，每条都必须 100% 满足。**谨慎使用：宁可漏判也不要把一般偏好判为 hard。**
+   - "soft" —— 一般风格/语气/结构偏好（违反会影响品质但不致命，例："标题偏短"、"少用感叹号"、"避免数字开头"）。
+                soft 规则进入 P1 优先级，会被模型在合适时应用。**默认就归 soft。**
+
+若是 rule：可选输出 applicability（≤ 16 字，描述规则适用的部位）：
+   "标题"、"正文开头"、"正文结尾"、"关键词"、"全局"、或具体 tactic 名。
 content 字段规范化成 ≤ 50 字的中文短句。
 
 严格输出 JSON，无其他文字：
 {
   "action": "merge" | "rule" | "taste" | "session",
   "target_id": "<仅 merge 时有；现有记忆的 id>",
-  "scope": "project" | "global",    // 仅 rule 时有
+  "scope": "project" | "global",     // 仅 rule 时有
+  "severity": "hard" | "soft",       // 仅 rule 时有；默认 "soft"
+  "applicability": "<可选；≤16字>",  // 仅 rule 时；不填 = 全局
   "content": "<规范化后的短句>",
   "reason": "<不超过 20 字的判定依据>"
 }"""
@@ -292,6 +302,14 @@ def classify_and_merge_feedback(
     if out["action"] == "rule":
         scope = data.get("scope")
         out["scope"] = "global" if scope == "global" else "project"
+        # Hard vs soft tier: hard requires the classifier to have explicitly
+        # said so AND the source text to carry compliance-style cues.  Default
+        # to soft so the P0 tier only contains genuine non-negotiables.
+        severity = (data.get("severity") or "soft").lower()
+        out["severity"] = "hard" if severity == "hard" else "soft"
+        applicability = (data.get("applicability") or "").strip()
+        if applicability:
+            out["applicability"] = applicability[:32]
     return out
 
 
@@ -349,6 +367,8 @@ def ingest_user_instruction(
             project_id=pid,
             auto_confirm_threshold=1,  # a single utterance is enough
             force_confirmed=True,
+            severity=decision.get("severity", "soft"),
+            applicability=decision.get("applicability"),
         )
         return {"action": "rule", "result": row, "reason": decision.get("reason", "")}
 
