@@ -15,11 +15,19 @@
 抓不到的（如"语气太正式"）继续靠 LLM 复检兜底。
 
 支持的规则模式（按优先级匹配）：
-  1. **禁用词 / 片段**："禁止 X" / "不要 X" / "不得 X" / "别用 X" /
+  1. **结构化字段**（2026-05 Day 3）：``rule_kind`` + ``rule_payload`` 直接
+     给定可执行的 spec，比正则抽取更稳定。支持的 kind：
+       - ``forbidden_word`` ：``{"target": "X"}``
+       - ``required_phrase``：``{"target": "X"}``
+       - ``max_len``        ：``{"scope": "标题"|"正文"|"开头", "n": N}``
+       - ``forbidden_regex``：``{"pattern": "..."}`` ─ 用 re.search，
+         可用内联标志 ``(?i)`` 不区分大小写
+     不传 ``rule_kind`` 或传 ``"free_text"`` 时退回到下面的正则抽取。
+  2. **禁用词 / 片段**："禁止 X" / "不要 X" / "不得 X" / "别用 X" /
      "避免 X" → 检查 title+body 是否含 X
-  2. **字符上限**："标题不超过 N 字" / "标题最多 N 字" → 检查长度
-  3. **必须包含**："必须包含 X" / "必须出现 X" → 检查 title+body 含 X
-  4. 其它没法机械化的规则被跳过（不视为违规，留给 LLM 复检）
+  3. **字符上限**："标题不超过 N 字" / "标题最多 N 字" → 检查长度
+  4. **必须包含**："必须包含 X" / "必须出现 X" → 检查 title+body 含 X
+  5. 其它没法机械化的规则被跳过（不视为违规，留给 LLM 复检）
 
 调用方式：
 ::
@@ -85,6 +93,45 @@ def _extract_target(rule: str, prefix: str) -> Optional[str]:
     return None
 
 
+def _spec_from_structured(rule: dict) -> Optional[dict]:
+    """从结构化字段读 spec（Day 3）。
+
+    如果规则带了 ``rule_kind`` 且不是 ``free_text``，直接用 ``rule_payload``
+    构造可执行 spec，跳过下面的正则抽取——这是用户在 UI 里"填表"录入
+    的规则，可判定性最高。
+
+    返回 None 表示这条规则没有结构化数据，调用方应回退到 ``_parse_rule``。
+    """
+    kind = (rule.get("rule_kind") or "").strip()
+    if not kind or kind == "free_text":
+        return None
+    payload = rule.get("rule_payload") or {}
+    if isinstance(payload, str):
+        # 老部署可能把 JSONB 当字符串存了，兜底解析一下
+        try:
+            import json as _json
+            payload = _json.loads(payload)
+        except Exception:
+            payload = {}
+    if kind == "forbidden_word":
+        target = str(payload.get("target", "")).strip()
+        return {"kind": kind, "target": target} if target else None
+    if kind == "required_phrase":
+        target = str(payload.get("target", "")).strip()
+        return {"kind": kind, "target": target} if target else None
+    if kind == "max_len":
+        scope = str(payload.get("scope", "标题")).strip() or "标题"
+        try:
+            n = int(payload.get("n", 0))
+        except (TypeError, ValueError):
+            n = 0
+        return {"kind": kind, "scope": scope, "n": n} if n > 0 else None
+    if kind == "forbidden_regex":
+        pattern = str(payload.get("pattern", "")).strip()
+        return {"kind": kind, "pattern": pattern} if pattern else None
+    return None
+
+
 def _parse_rule(rule_content: str) -> Optional[dict]:
     """把一条规则文本编译成可执行的 predicate spec。
 
@@ -147,7 +194,8 @@ def check_hard_rules(
 
     out: list[dict] = []
     for rule in hard_rules:
-        spec = _parse_rule(rule.get("content", ""))
+        # Day 3: 优先用结构化字段，回退到正则抽取
+        spec = _spec_from_structured(rule) or _parse_rule(rule.get("content", ""))
         if not spec:
             continue
         kind = spec["kind"]
@@ -181,6 +229,19 @@ def check_hard_rules(
                     "kind":  kind,
                     "match": f"实际 {len(target_text)} 字 > 限定 {n} 字",
                 })
+        elif kind == "forbidden_regex":
+            pattern = spec["pattern"]
+            try:
+                m = re.search(pattern, combined)
+                if m:
+                    out.append({
+                        "rule":  rule["content"],
+                        "kind":  kind,
+                        "match": m.group(0)[:60],
+                    })
+            except re.error:
+                # 正则编译失败不算违规，留给 UI 阶段提示用户
+                continue
     return out
 
 

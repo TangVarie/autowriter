@@ -1301,27 +1301,122 @@ def _render_bottom_tools(
     st.divider()
 
     # 卡片 1：手动添加单条记忆
+    # Day 3：硬规则支持结构化录入（禁用词 / 必含词 / 最大字数 / 禁用正则）。
+    # 这里不用 st.form——form 内无法根据 selectbox 当前选项条件渲染 payload
+    # 字段（form 只在 submit 时回传所有状态），改用 plain widgets + button。
     with st.expander("➕ 手动添加记忆", expanded=False):
-        with st.form("add_memory_form", clear_on_submit=True):
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                scope_choice = st.selectbox("类型", ["项目记忆", "通用记忆"])
-            with col2:
-                content = st.text_input("记忆内容", placeholder="例：标题带数字点击率更高")
-            add_submitted = st.form_submit_button("添加", use_container_width=True)
-        if add_submitted and content.strip():
-            scope = "project" if scope_choice == "项目记忆" else "global"
-            pid = project_id if scope == "project" else None
-            db.upsert_memory(
-                db_client, user_id,
-                scope=scope,
-                content=content.strip(),
-                source_feedback="手动添加",
-                project_id=pid,
-                auto_confirm_threshold=1,
+        col_scope, col_sev = st.columns([1, 1])
+        with col_scope:
+            scope_choice = st.selectbox(
+                "类型", ["项目记忆", "通用记忆"], key="add_mem_scope",
             )
-            st.success("记忆已添加。")
-            st.rerun()
+        with col_sev:
+            severity_choice = st.selectbox(
+                "严格程度",
+                ["软规则（偏好）", "硬规则（必须执行）"],
+                key="add_mem_severity",
+                help="软规则只在与当前生成上下文相关时注入；硬规则永远注入，结构化 kind 会被确定性校验。",
+            )
+        is_hard = severity_choice.startswith("硬")
+
+        rule_kind = None
+        rule_payload: Optional[dict] = None
+        auto_content = ""
+        if is_hard:
+            kind_choice = st.selectbox(
+                "硬规则类型",
+                ["自由文本", "禁用词 (forbidden_word)", "必含词 (required_phrase)",
+                 "最大字数 (max_len)", "禁用正则 (forbidden_regex)"],
+                key="add_mem_kind",
+                help="结构化类型可被确定性校验（命中后标 needs_revision）；自由文本走正则抽取兜底。",
+            )
+            if kind_choice.startswith("禁用词"):
+                rule_kind = "forbidden_word"
+                target = st.text_input("目标词", key="add_mem_target_fw").strip()
+                if target:
+                    rule_payload = {"target": target}
+                    auto_content = f"禁止出现「{target}」"
+            elif kind_choice.startswith("必含词"):
+                rule_kind = "required_phrase"
+                target = st.text_input("目标词", key="add_mem_target_rp").strip()
+                if target:
+                    rule_payload = {"target": target}
+                    auto_content = f"必须包含「{target}」"
+            elif kind_choice.startswith("最大字数"):
+                rule_kind = "max_len"
+                col_s, col_n = st.columns([1, 1])
+                with col_s:
+                    scope_target = st.selectbox(
+                        "作用范围", ["标题", "正文", "开头"], key="add_mem_scope_target",
+                    )
+                with col_n:
+                    n_chars = st.number_input(
+                        "字数上限", min_value=1, max_value=2000, value=20,
+                        step=1, key="add_mem_n",
+                    )
+                rule_payload = {"scope": scope_target, "n": int(n_chars)}
+                auto_content = f"{scope_target}不超过 {int(n_chars)} 字"
+            elif kind_choice.startswith("禁用正则"):
+                rule_kind = "forbidden_regex"
+                pattern = st.text_input(
+                    "正则表达式",
+                    key="add_mem_pattern",
+                    help="可用内联标志：(?i) 不区分大小写。例：(?i)\\d{4}年",
+                ).strip()
+                if st.button(
+                    "🧪 测试编译", key="add_mem_pattern_test", use_container_width=True,
+                ):
+                    if not pattern:
+                        st.warning("请先填正则。")
+                    else:
+                        try:
+                            import re as _re
+                            _re.compile(pattern)
+                            st.success("正则编译通过。")
+                        except _re.error as exc:
+                            st.error(f"正则编译失败：{exc}")
+                if pattern:
+                    rule_payload = {"pattern": pattern}
+                    auto_content = f"禁止匹配正则「{pattern}」"
+            else:
+                rule_kind = "free_text"
+
+        # 内容字段：结构化 kind 已自动生成可读描述，用户可覆盖；自由文本/软规则必填
+        content_default = auto_content if auto_content else ""
+        content = st.text_input(
+            "记忆内容（可读描述）",
+            value=content_default,
+            placeholder="例：标题带数字点击率更高",
+            key="add_mem_content",
+        )
+
+        if st.button("➕ 添加", key="add_mem_submit", use_container_width=True):
+            if not content.strip():
+                st.warning("请填写记忆内容。")
+            elif is_hard and rule_kind not in (None, "free_text") and rule_payload is None:
+                st.warning("结构化硬规则的目标字段不能为空。")
+            else:
+                scope = "project" if scope_choice == "项目记忆" else "global"
+                pid = project_id if scope == "project" else None
+                db.upsert_memory(
+                    db_client, user_id,
+                    scope=scope,
+                    content=content.strip(),
+                    source_feedback="手动添加",
+                    project_id=pid,
+                    auto_confirm_threshold=1,
+                    severity="hard" if is_hard else "soft",
+                    rule_kind=rule_kind if is_hard else None,
+                    rule_payload=rule_payload if is_hard else None,
+                )
+                st.success("记忆已添加。")
+                # 清掉本次填的字段，下次进入是干净状态
+                for k in (
+                    "add_mem_content", "add_mem_target_fw", "add_mem_target_rp",
+                    "add_mem_pattern", "add_mem_kind",
+                ):
+                    st.session_state.pop(k, None)
+                st.rerun()
 
     # 卡片 2：导出 / 导入 JSON
     with st.expander("📦 导出 / 导入（JSON）", expanded=False):
@@ -1456,7 +1551,10 @@ def _safe_update_memory(
         return True, ""
     except Exception as exc:
         msg = str(exc)
-        new_cols = {"severity", "applicability", "muted_until"}
+        new_cols = {
+            "severity", "applicability", "muted_until",
+            "rule_kind", "rule_payload",
+        }
         if any(col in msg for col in new_cols):
             stripped = {k: v for k, v in updates.items() if k not in new_cols}
             if stripped:
@@ -1464,7 +1562,7 @@ def _safe_update_memory(
                     db.update_memory(db_client, memory_id, stripped)
                 except Exception:
                     pass
-            return False, "数据库还没运行新列迁移（severity / applicability / muted_until）"
+            return False, "数据库还没运行新列迁移（severity / applicability / muted_until / rule_kind / rule_payload）"
         return False, msg[:120]
 
 

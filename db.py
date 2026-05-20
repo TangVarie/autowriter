@@ -231,6 +231,15 @@ CREATE INDEX IF NOT EXISTS memories_session_idx
 -- embedding (legacy / backfill-pending) pass through unchanged.
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(768);
 
+-- 2026-05 Day 3: 硬规则结构化字段（rule_kind 决定 rule_payload 的解释）
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS
+    rule_kind TEXT NULL
+    CHECK (rule_kind IS NULL OR rule_kind IN
+        ('forbidden_word','required_phrase','max_len','forbidden_regex','free_text'));
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS rule_payload JSONB NULL;
+CREATE INDEX IF NOT EXISTS memories_rule_kind_idx
+    ON memories(user_id, rule_kind) WHERE rule_kind IS NOT NULL;
+
 -- 调教笔记审计：每次写入都留底（before / append_lines / after），方便
 -- 排查"为什么这条观察突然出现/消失了"。RLS 按 project_id 关联到用户。
 CREATE TABLE IF NOT EXISTS calibration_note_audit (
@@ -904,6 +913,8 @@ def upsert_memory(
     force_confirmed: bool = False,
     severity: str = "soft",
     applicability: Optional[str] = None,
+    rule_kind: Optional[str] = None,
+    rule_payload: Optional[dict] = None,
 ) -> dict:
     """
     Insert a new memory candidate or increment frequency of an existing one.
@@ -911,6 +922,10 @@ def upsert_memory(
     ``force_confirmed`` (used by the AI merger) creates the row already in the
     ``confirmed`` state, skipping the frequency threshold — callers that set
     this flag have already decided the rule is intentional.
+
+    Day 3 新增：``rule_kind`` + ``rule_payload`` 用于结构化硬规则
+    （``forbidden_word`` / ``required_phrase`` / ``max_len`` / ``forbidden_regex``）。
+    迁移未跑的老部署 insert 失败后会自动 strip 这两列重试，保持向后兼容。
     """
     # Try to find an existing memory with the same content
     q = (
@@ -958,6 +973,13 @@ def upsert_memory(
             data["severity"] = severity.lower()
         if applicability:
             data["applicability"] = applicability[:32]
+        if rule_kind and rule_kind in (
+            "forbidden_word", "required_phrase", "max_len",
+            "forbidden_regex", "free_text",
+        ):
+            data["rule_kind"] = rule_kind
+        if rule_payload is not None:
+            data["rule_payload"] = rule_payload
 
         # Compute the embedding once at write time so the relevance ranker
         # can use it without paying an API call per generation.  Only soft
@@ -979,6 +1001,8 @@ def upsert_memory(
             data.pop("severity", None)
             data.pop("applicability", None)
             data.pop("embedding", None)
+            data.pop("rule_kind", None)
+            data.pop("rule_payload", None)
             res = client.table("memories").insert(data).execute()
         _invalidate_memory_caches()
         return res.data[0]
