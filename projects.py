@@ -150,9 +150,90 @@ def _render_basic_settings(client: Client, project: dict) -> None:
     with st.form("basic_settings"):
         name = st.text_input("项目名称", value=project.get("name", ""))
         brand = st.text_input("品牌名称", value=project.get("brand", ""))
+
+        st.markdown("---")
+        st.markdown("**跨批去重严格度**")
+        st.caption(
+            "三档预设覆盖大多数场景。新品类/同质化任务建议先用「严格」压重复，"
+            "稳定后再放宽。未设置（NULL）时回退到全局默认（环境变量 `DEDUP_SEMANTIC_THRESHOLD`，标准 0.92）。"
+        )
+        cur_threshold = project.get("semantic_dedup_threshold")
+        preset_options = ["项目默认", "宽松 0.88", "标准 0.92", "严格 0.95", "自定义"]
+        if cur_threshold is None:
+            cur_preset = "项目默认"
+        elif abs(cur_threshold - 0.88) < 1e-6:
+            cur_preset = "宽松 0.88"
+        elif abs(cur_threshold - 0.92) < 1e-6:
+            cur_preset = "标准 0.92"
+        elif abs(cur_threshold - 0.95) < 1e-6:
+            cur_preset = "严格 0.95"
+        else:
+            cur_preset = "自定义"
+        preset = st.radio(
+            "严格度预设",
+            preset_options,
+            index=preset_options.index(cur_preset),
+            horizontal=True,
+            key=f"sdt_preset_{project['id']}",
+            label_visibility="collapsed",
+        )
+        custom_threshold = None
+        if preset == "自定义":
+            custom_threshold = st.slider(
+                "自定义阈值",
+                min_value=0.85, max_value=0.95,
+                value=float(cur_threshold) if cur_threshold is not None else 0.92,
+                step=0.01,
+                key=f"sdt_slider_{project['id']}",
+            )
+
+        st.markdown("---")
+        st.markdown("**队列默认策略**")
+        st.caption(
+            "稳定优先：阈值上调至 0.95、自动重生开启、重试 3 次（重复率最低，速度慢）。"
+            "吞吐优先：默认阈值、自动重生关闭（速度最快，重复率可能上升）。"
+            "未设置时单条计划可在队列页临时覆盖。"
+        )
+        strategy_options = ["未设置", "稳定优先 (stable)", "吞吐优先 (throughput)"]
+        cur_strategy = project.get("queue_strategy")
+        if cur_strategy == "stable":
+            strategy_idx = 1
+        elif cur_strategy == "throughput":
+            strategy_idx = 2
+        else:
+            strategy_idx = 0
+        strategy = st.selectbox(
+            "队列策略",
+            strategy_options,
+            index=strategy_idx,
+            key=f"qs_default_{project['id']}",
+            label_visibility="collapsed",
+        )
+
         submitted = st.form_submit_button("保存基本信息")
     if submitted:
-        db.update_project(client, project["id"], {"name": name, "brand": brand})
+        if preset == "项目默认":
+            resolved_threshold = None
+        elif preset == "宽松 0.88":
+            resolved_threshold = 0.88
+        elif preset == "标准 0.92":
+            resolved_threshold = 0.92
+        elif preset == "严格 0.95":
+            resolved_threshold = 0.95
+        else:
+            resolved_threshold = float(custom_threshold) if custom_threshold else None
+
+        resolved_strategy = (
+            None if strategy == "未设置"
+            else ("stable" if strategy.startswith("稳定") else "throughput")
+        )
+
+        db.update_project(client, project["id"], {
+            "name": name,
+            "brand": brand,
+            "semantic_dedup_threshold": resolved_threshold,
+            "queue_strategy": resolved_strategy,
+        })
         st.success("已保存。")
         st.rerun()
 

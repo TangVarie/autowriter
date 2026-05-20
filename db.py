@@ -107,6 +107,14 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_tone TEXT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_exec TEXT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS calibration_notes TEXT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS custom_roles JSONB DEFAULT '[]'::jsonb;
+-- 2026-05 Day 2: 项目级语义去重阈值与队列策略（NULL = 用 config 全局默认）
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS
+    semantic_dedup_threshold REAL NULL
+    CHECK (semantic_dedup_threshold IS NULL
+           OR (semantic_dedup_threshold >= 0.80 AND semantic_dedup_threshold <= 0.99));
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS
+    queue_strategy TEXT NULL
+    CHECK (queue_strategy IS NULL OR queue_strategy IN ('stable','throughput'));
 -- Migration: add example_label to items for positive/negative example marking
 ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT CHECK (example_label IN ('positive', 'negative'));
 

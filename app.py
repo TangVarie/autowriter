@@ -345,13 +345,15 @@ def _run_semantic_dedup_pass(
     errors_sink: list,
     metrics,
     regen_ctx: Optional[dict] = None,
+    project: Optional[dict] = None,
+    status: Optional[dict] = None,
 ) -> None:
     """两个 worker 共用的语义查重 + embedding 持久化（修 R3）。
 
     流程：
       1. 给所有新标题算 768d embedding（一次 API 调用，批量请求）
       2. 写入 versions.embedding 列
-      3. 与历史池对比，cos ≥ DEDUP_SEMANTIC_THRESHOLD 视为近似重复
+      3. 与历史池对比，cos ≥ 阈值视为近似重复
       4. 本批内对比（多引擎撞车场景）
       5. 累积进 queue_embeddings，下一批能立刻看到
 
@@ -362,12 +364,29 @@ def _run_semantic_dedup_pass(
         写警告到 ``errors_sink``
       - 重生功能关闭时，所有命中只写警告，不改 DB
 
+    阈值解析优先级（Day 2）：
+      1. ``regen_ctx["threshold_override"]``（队列策略覆盖）
+      2. ``project["semantic_dedup_threshold"]`` （项目级配置）
+      3. ``config.DEDUP_SEMANTIC_THRESHOLD`` （全局默认）
+
     ``queue_embeddings`` 是 worker 自己维护的字典，按 project_id 分桶。
     Quick Generate 也建一份只有一个项目的字典。
-    没配 GOOGLE_API_KEY 时整段跳过，不影响主流程。
+    没配 GOOGLE_API_KEY 时整段跳过，但会把降级原因写到 ``status["warnings"]``，
+    UI 能看到"本批次已降级为纯文本去重"——不再静默。
     """
     regen_enabled = bool(regen_ctx and regen_ctx.get("enabled"))
-    if not inserted_versions or not dedup_module.embeddings_available():
+    if not inserted_versions:
+        return
+    if not dedup_module.embeddings_available():
+        telemetry.log_event(
+            "dedup_degraded_no_embedding",
+            project_id=project_id, version_count=len(inserted_versions),
+        )
+        metrics.set_meta("dedup_mode", "text_only")
+        if status is not None:
+            status.setdefault("warnings", []).append(
+                f"项目 {project_id[:8] if project_id else '?'}：本批次语义去重已降级为纯文本（embedding 不可用）"
+            )
         return
     metrics.start_phase("embedding")
     try:
@@ -375,16 +394,28 @@ def _run_semantic_dedup_pass(
         new_vecs = dedup_module.embed_texts(titles_in_order)
         if not new_vecs:
             return
-        # 步骤 2：持久化 embedding
+        # 步骤 2：持久化 embedding（失败的 version_id 累到 status["embedding_missing"]）
         embed_rows = []
         for i, iv in enumerate(inserted_versions):
             if i < len(new_vecs):
                 embed_rows.append({"id": iv.get("id"), "embedding": new_vecs[i]})
+        failed_embed_ids: list[str] = []
         if embed_rows:
-            db.bulk_update_version_embeddings(db_client, embed_rows)
+            db.bulk_update_version_embeddings(
+                db_client, embed_rows, failed_sink=failed_embed_ids,
+            )
+        if failed_embed_ids and status is not None:
+            status.setdefault("embedding_missing", []).extend(failed_embed_ids)
+            metrics.incr("embedding_missing", len(failed_embed_ids))
 
-        # 步骤 3：对照历史池
-        threshold = float(getattr(config, "DEDUP_SEMANTIC_THRESHOLD", 0.92))
+        # 步骤 3：解析阈值（队列策略 > 项目级 > 全局默认）
+        if regen_ctx and regen_ctx.get("threshold_override") is not None:
+            threshold = float(regen_ctx["threshold_override"])
+        elif project and project.get("semantic_dedup_threshold") is not None:
+            threshold = float(project["semantic_dedup_threshold"])
+        else:
+            threshold = float(getattr(config, "DEDUP_SEMANTIC_THRESHOLD", 0.92))
+        metrics.set_meta("dedup_threshold", threshold)
         hist_pool = queue_embeddings.get(project_id, [])
         hits = []
         if hist_pool:
@@ -484,6 +515,8 @@ def _queue_worker(
     status["total"] = len(plans)
     status.setdefault("completed", [])
     status.setdefault("errors", [])
+    status.setdefault("warnings", [])
+    status.setdefault("embedding_missing", [])
 
     # ── [A 预热] 队列开始前查一次项目列表，循环里按 id 取，省去 per-plan 查询 ──
     try:
@@ -753,6 +786,7 @@ def _queue_worker(
                 db_client, inserted_versions, version_rows,
                 queue_embeddings, project_id, error_prefix,
                 status["errors"], metrics, regen_ctx=regen_ctx,
+                project=project, status=status,
             )
 
             # ── 硬约束确定性校验（B3）：在 dedup 之后跑，命中标 needs_revision ──
@@ -836,6 +870,25 @@ def _queue_banner_body() -> None:
                 st.session_state.pop("queue_state", None)
                 st.session_state.pop("queue_stop_event", None)
                 st.rerun()
+
+        # ── 非阻塞警告（embedding 降级 / 历史向量加载失败等）─────────────
+        warnings_list = qs.get("warnings") or []
+        embedding_missing = qs.get("embedding_missing") or []
+        if warnings_list or embedding_missing:
+            with st.expander(
+                f"⚠ 本次队列运行警告 ({len(warnings_list) + (1 if embedding_missing else 0)})",
+                expanded=False,
+            ):
+                for w in warnings_list[:20]:
+                    st.markdown(f"- {w}")
+                if len(warnings_list) > 20:
+                    st.caption(f"…还有 {len(warnings_list) - 20} 条")
+                if embedding_missing:
+                    st.markdown(
+                        f"- **{len(embedding_missing)} 条版本缺少向量**："
+                        "Supabase upsert/update 失败，本次写入未存到 versions.embedding 列；"
+                        "后续跨批次去重会读不到这些向量，可能导致重复率上升。"
+                    )
 
 
 if _FRAGMENT is not None:
@@ -2053,6 +2106,8 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
     try:
         status["running"] = True
         status["message"] = "正在构建提示词…"
+        status.setdefault("warnings", [])
+        status.setdefault("embedding_missing", [])
         _set_phase_progress(status, "setup")
 
         project_id = plan["project_id"]
@@ -2225,6 +2280,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             quick_queue_embeddings, project_id,
             error_prefix="", errors_sink=errors, metrics=metrics,
             regen_ctx=regen_ctx,
+            project=project, status=status,
         )
 
         # ── 硬约束确定性校验（B3，与 _queue_worker 一致）──────────────
@@ -2633,6 +2689,21 @@ def page_generate(project: dict) -> None:
                 st.success(f"✅ 生成完成！共 {n_res} 篇，{saved} 个版本。")
             elif not errors_list:
                 st.warning("生成完成，但没有内容被保存，请检查配置。")
+            # Day 2: 降级 / 缺向量等非阻塞告警
+            qg_warnings = qgs.get("warnings") or []
+            qg_missing = qgs.get("embedding_missing") or []
+            if qg_warnings or qg_missing:
+                with st.expander(
+                    f"⚠ 运行警告 ({len(qg_warnings) + (1 if qg_missing else 0)})",
+                    expanded=False,
+                ):
+                    for w in qg_warnings[:20]:
+                        st.markdown(f"- {w}")
+                    if qg_missing:
+                        st.markdown(
+                            f"- **{len(qg_missing)} 条版本缺少向量**："
+                            "embedding 写入失败，本次去重已退化，后续跨批次去重可能受影响。"
+                        )
             bid = qgs.get("batch_id")
             if bid:
                 st.session_state["review_batch_id"] = bid
