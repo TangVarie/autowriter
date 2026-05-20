@@ -178,6 +178,10 @@ def _render_basic_settings(client: Client, project: dict) -> None:
             label_visibility="collapsed",
         )
         custom_threshold = None
+        # 切回非自定义档时清掉残留的 slider 值，否则下次再切回"自定义"会显示
+        # 上次手填的数字（不是 DB 里的 cur_threshold），用户以为没保存。
+        if preset != "自定义":
+            st.session_state.pop(f"sdt_slider_{project['id']}", None)
         if preset == "自定义":
             custom_threshold = st.slider(
                 "自定义阈值",
@@ -421,7 +425,17 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
             st.caption("尚无历史记录。")
         else:
             accumulated: list[dict] = st.session_state.get(accum_key, [])
-            if not accumulated:
+            # 缓存失效：当 DB 总数 > 已缓存累积，说明本次访问期间有新写入
+            # （别的入口保存了笔记 / 太子学习落库等），重新拉第一页。否则
+            # 用户保存完笔记后看不到"为什么我刚加的不见了"，因为"加载更早"
+            # 的游标只往 created_at 更小走，新写入永远拉不进来。
+            if accumulated and len(accumulated) < total:
+                accumulated = db.list_calibration_audit(client, pid, limit=page_size)
+                st.session_state[accum_key] = accumulated
+                st.session_state[cursor_key] = (
+                    accumulated[-1].get("created_at") if accumulated else None
+                )
+            elif not accumulated:
                 accumulated = db.list_calibration_audit(client, pid, limit=page_size)
                 st.session_state[accum_key] = accumulated
                 st.session_state[cursor_key] = (

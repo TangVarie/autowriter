@@ -40,6 +40,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import time
@@ -134,7 +135,13 @@ class BatchMetrics:
 
     # ── 结束 ─────────────────────────────────────────────────────────
     def to_dict(self) -> dict:
-        """打平成一个 dict，方便序列化 / 比较 / 测试。"""
+        """打平成一个 dict，方便序列化 / 比较 / 测试。
+
+        meta 走 deepcopy：调用方常把 ``inject_report`` dict 引用挂进
+        ``meta["injection"]``，且 worker 线程在后续 plan 里仍会写 inject_report。
+        如果只浅拷贝，主线程渲染看板时读到的是一份正在被改的 dict，可能命中
+        list 迭代中 size 变化或 setdefault append 半成品。
+        """
         total_ms = (time.monotonic() - self._started_at) * 1000.0
         return {
             "batch_id":   self.batch_id,
@@ -145,7 +152,7 @@ class BatchMetrics:
             "total_ms":   round(total_ms, 1),
             "phase_ms":   {k: round(v, 1) for k, v in self.phase_ms.items()},
             "counters":   dict(self.counters),
-            "meta":       dict(self.meta),
+            "meta":       copy.deepcopy(self.meta),
         }
 
     def close(

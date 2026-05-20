@@ -1421,8 +1421,19 @@ def _render_bottom_tools(
             else:
                 rule_kind = "free_text"
 
-        # 内容字段：结构化 kind 已自动生成可读描述，用户可覆盖；自由文本/软规则必填
+        # 内容字段：结构化 kind 已自动生成可读描述。Streamlit 的 keyed widget
+        # 一旦写入 session_state 就会忽略后续的 value=，所以这里在渲染前主动
+        # 同步：当用户切换 kind / 改 payload 导致 auto_content 变化时，把新值
+        # 灌进 session_state["add_mem_content"]，避免 content 与 rule_payload
+        # 长期错位（比如 payload 改成"新"但 content 还显示"禁止『最』"）。
         content_default = auto_content if auto_content else ""
+        _last_auto_key = "_add_mem_auto_content_last"
+        if auto_content and st.session_state.get(_last_auto_key) != auto_content:
+            st.session_state["add_mem_content"] = auto_content
+            st.session_state[_last_auto_key] = auto_content
+        elif not auto_content:
+            # 切回自由文本时让用户继续手填
+            st.session_state.pop(_last_auto_key, None)
         content = st.text_input(
             "记忆内容（可读描述）",
             value=content_default,
@@ -1431,32 +1442,50 @@ def _render_bottom_tools(
         )
 
         if st.button("➕ 添加", key="add_mem_submit", use_container_width=True):
+            _do_save_memory = False
             if not content.strip():
                 st.warning("请填写记忆内容。")
             elif is_hard and rule_kind not in (None, "free_text") and rule_payload is None:
                 st.warning("结构化硬规则的目标字段不能为空。")
+            elif is_hard and rule_kind == "forbidden_regex":
+                # 保存前再编译一次：用户可能没点"测试编译"就直接提交。否则
+                # 入库后 validator.check_hard_rules 只会 silent continue（参见
+                # validator.py:233），硬规则永久失效但用户无感知。
+                import re as _re
+                try:
+                    _re.compile((rule_payload or {}).get("pattern", ""))
+                    _do_save_memory = True
+                except _re.error as exc:
+                    st.error(f"正则无法编译，请先在「🧪 测试编译」里修复：{exc}")
             else:
+                _do_save_memory = True
+
+            if _do_save_memory:
                 scope = "project" if scope_choice == "项目记忆" else "global"
                 pid = project_id if scope == "project" else None
-                db.upsert_memory(
-                    db_client, user_id,
-                    scope=scope,
-                    content=content.strip(),
-                    source_feedback="手动添加",
-                    project_id=pid,
-                    auto_confirm_threshold=1,
-                    severity="hard" if is_hard else "soft",
-                    rule_kind=rule_kind if is_hard else None,
-                    rule_payload=rule_payload if is_hard else None,
-                )
-                st.success("记忆已添加。")
-                # 清掉本次填的字段，下次进入是干净状态
-                for k in (
-                    "add_mem_content", "add_mem_target_fw", "add_mem_target_rp",
-                    "add_mem_pattern", "add_mem_kind",
-                ):
-                    st.session_state.pop(k, None)
-                st.rerun()
+                try:
+                    db.upsert_memory(
+                        db_client, user_id,
+                        scope=scope,
+                        content=content.strip(),
+                        source_feedback="手动添加",
+                        project_id=pid,
+                        auto_confirm_threshold=1,
+                        severity="hard" if is_hard else "soft",
+                        rule_kind=rule_kind if is_hard else None,
+                        rule_payload=rule_payload if is_hard else None,
+                    )
+                except Exception as exc:
+                    st.error(f"保存失败：{exc}")
+                else:
+                    st.success("记忆已添加。")
+                    # 清掉本次填的字段，下次进入是干净状态。所有 add_mem_*
+                    # 前缀都要清，否则 severity / scope / n / 上次 auto_content
+                    # 会残留串到下一次添加。
+                    for k in list(st.session_state.keys()):
+                        if k.startswith("add_mem_") or k == _last_auto_key:
+                            st.session_state.pop(k, None)
+                    st.rerun()
 
     # 卡片 2：导出 / 导入 JSON
     with st.expander("📦 导出 / 导入（JSON）", expanded=False):
@@ -1595,7 +1624,15 @@ def _safe_update_memory(
             "severity", "applicability", "muted_until",
             "rule_kind", "rule_payload",
         }
-        if any(col in msg for col in new_cols):
+        # 只有错误消息里**同时**出现 PostgREST 列缺失的明确信号（"column ..."
+        # 或 "does not exist"）且包含新列名时才剥列重试。之前裸 substring 命中
+        # 会把权限/网络/序列化错误也当作"老部署没迁移"，剥掉用户实际填的字段
+        # 后悄悄写一半。
+        looks_like_schema_drift = (
+            ("column" in msg.lower() or "does not exist" in msg.lower())
+            and any(col in msg for col in new_cols)
+        )
+        if looks_like_schema_drift:
             stripped = {k: v for k, v in updates.items() if k not in new_cols}
             if stripped:
                 try:

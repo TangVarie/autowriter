@@ -239,8 +239,21 @@ def check_hard_rules(
                         "kind":  kind,
                         "match": m.group(0)[:60],
                     })
-            except re.error:
-                # 正则编译失败不算违规，留给 UI 阶段提示用户
+            except re.error as exc:
+                # 正则编译失败不算违规——但要埋一行日志，否则用户在 UI 里
+                # 看到"硬规则未命中"会以为规则生效了，实际 validator 一直
+                # silent skip。memory.py 的添加路径已在保存前做 re.compile
+                # 校验，这里兜底覆盖"老规则 + 老部署"的情形。
+                try:
+                    import telemetry as _tm
+                    _tm.log_event(
+                        "hard_rule_regex_failed",
+                        rule=rule.get("content", "")[:80],
+                        pattern=pattern[:80],
+                        error=str(exc)[:120],
+                    )
+                except Exception:
+                    pass
                 continue
     return out
 

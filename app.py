@@ -13,6 +13,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -542,6 +543,45 @@ def _queue_worker(
     status: dict,
     stop_event: threading.Event,
 ) -> None:
+    """外层 shim：保证状态机在任何异常路径下都能落回 done。
+
+    历史上 _queue_worker_impl 的尾部已经有 with lock: status[done]=True 的收尾，
+    但只覆盖正常流；如果预取项目失败之后的代码（如 dict 构造）意外抛 SystemExit
+    或线程被打断，phase 会永久卡在 "running"，UI 启动+停止按钮全 disabled，用户
+    没有逃生口。这个 finally 保险确保不论怎样 phase 都能回 done。
+    """
+    try:
+        _queue_worker_impl(plans, user_id, db_client, status, stop_event)
+    except BaseException as exc:
+        # 不让异常被静默吞：埋点 + 写一行 status.errors 让用户看到
+        try:
+            status.setdefault("errors", []).append(f"队列异常退出：{exc}")
+            telemetry.log_event(
+                "queue_worker_unexpected_exit",
+                error=str(exc)[:200],
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            with (status.get("_lock") or _NULL_LOCK):
+                status["running"] = False
+                status["done"]    = True
+                if status.get("phase") not in ("done",):
+                    status["phase"] = "done"
+        except Exception:
+            status["running"] = False
+            status["done"]    = True
+            status["phase"]   = "done"
+
+
+def _queue_worker_impl(
+    plans: list[dict],
+    user_id: str,
+    db_client,
+    status: dict,
+    stop_event: threading.Event,
+) -> None:
     """后台 daemon 线程：顺序执行队列里的所有生成计划。
 
     ─────────────────────────────────────────────────────────────────────
@@ -936,6 +976,25 @@ def _queue_banner_body() -> None:
     msg       = qs.get("message", "")
     errors    = qs.get("errors", [])
 
+    # 状态卡死逃生口：phase 在 starting / stopping 过渡态停留太久（worker 异常
+    # 退出 + finally 未及时跑完）会让启动 / 停止按钮全 disabled，用户除了重启
+    # 浏览器没有出路。这里给一个手动重置入口。is_running=False 时如果 phase
+    # 还卡在 starting/stopping 就显示。
+    cur_phase_b = qs.get("phase")
+    if (not qs.get("running")) and cur_phase_b in ("starting", "stopping"):
+        bcol_warn, bcol_reset = st.columns([5, 1])
+        with bcol_warn:
+            st.warning(
+                f"⚠ 队列状态卡在「{cur_phase_b}」。worker 可能已经退出。"
+                "点击右侧重置以恢复操作。"
+            )
+        with bcol_reset:
+            if st.button("🔄 重置", key="reset_stuck_queue", use_container_width=True):
+                st.session_state.pop("queue_state", None)
+                st.session_state.pop("queue_stop_event", None)
+                st.rerun()
+        return
+
     if qs.get("running"):
         banner = st.container()
         with banner:
@@ -944,6 +1003,14 @@ def _queue_banner_body() -> None:
                 st.info(f"🔄 队列生成中 ({completed}/{total}) — {msg}")
             with bcol_btn:
                 if st.button("⏹ 停止", key="global_stop_queue", use_container_width=True):
+                    # 与 tab 内的"停止队列"按钮保持一致：先写 phase=stopping 让
+                    # 其它按钮立刻 disabled，再发 stop_event。否则两个入口的状态
+                    # 不一致，用户在 tab 内/banner 上各点一次就乱掉。
+                    try:
+                        with (qs.get("_lock") or _NULL_LOCK):
+                            qs["phase"] = "stopping"
+                    except Exception:
+                        qs["phase"] = "stopping"
                     evt = st.session_state.get("queue_stop_event")
                     if evt:
                         evt.set()
@@ -2281,14 +2348,16 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
     db_save / embedding 四个阶段 + dedup/regen 计数器），方便和队列模式
     做对比。
     """
+    # metrics 必须在 try 块外创建，否则 except / finally 引用 metrics 会
+    # UnboundLocalError；这两行实例化几乎不可能抛错（纯 dataclass init）。
     metrics = telemetry.BatchMetrics(
         project_id=plan.get("project_id", ""),
         mode="quick",
         engines=list(plan.get("engines", [])),
         count=int(plan.get("count", 0)),
     )
-    metrics.start_phase("setup")
     try:
+        metrics.start_phase("setup")
         qlock = status.get("_lock")
         if qlock is None:
             qlock = threading.Lock()
@@ -2505,32 +2574,46 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
     except Exception as exc:
         status.setdefault("errors", []).append(str(exc))
         status["message"] = f"生成失败：{exc}"
-        metrics.set_meta("error", str(exc)[:120])
-
-    # Day 5：持久化批次指标（quick gen 也走同一张表，模式由 d["mode"] 区分）
-    _quick_batch_id = status.get("batch_id") or metrics.batch_id
-    _quick_project_id = plan.get("project_id", "")
-    metrics.close(
-        status,
-        persist=(
-            (lambda d: db.insert_batch_metrics(
-                db_client,
-                batch_id=d.get("batch_id") or _quick_batch_id,
-                project_id=_quick_project_id,
-                user_id=user_id,
-                phase_ms=d.get("phase_ms") or {},
-                counters=d.get("counters") or {},
-                meta={k: v for k, v in (d.get("meta") or {}).items()
-                      if k != "injection"},
-                injection=(d.get("meta") or {}).get("injection") or {},
-            ))
-            if _quick_batch_id and _quick_project_id else None
-        ),
-    )
-    with (status.get("_lock") or _NULL_LOCK):
-        status["running"] = False
-        status["done"]    = True
-        status["phase"]   = "done"
+        try:
+            metrics.set_meta("error", str(exc)[:120])
+        except Exception:
+            pass
+    finally:
+        # Day 5：持久化批次指标（quick gen 也走同一张表，模式由 d["mode"] 区分）。
+        # 放到 finally：即使 try 内意外抛 BaseException（SystemExit / 内存错误）
+        # 也要把 status 状态机拨回 done，否则 UI 启动/停止按钮永远 disabled。
+        try:
+            _quick_batch_id = status.get("batch_id") or metrics.batch_id
+            _quick_project_id = plan.get("project_id", "")
+            metrics.close(
+                status,
+                persist=(
+                    (lambda d: db.insert_batch_metrics(
+                        db_client,
+                        batch_id=d.get("batch_id") or _quick_batch_id,
+                        project_id=_quick_project_id,
+                        user_id=user_id,
+                        phase_ms=d.get("phase_ms") or {},
+                        counters=d.get("counters") or {},
+                        meta={k: v for k, v in (d.get("meta") or {}).items()
+                              if k != "injection"},
+                        injection=(d.get("meta") or {}).get("injection") or {},
+                    ))
+                    if _quick_batch_id and _quick_project_id else None
+                ),
+            )
+        except Exception:
+            pass
+        try:
+            with (status.get("_lock") or _NULL_LOCK):
+                status["running"] = False
+                status["done"]    = True
+                status["phase"]   = "done"
+        except Exception:
+            # 最后兜底：连锁都拿不到也要确保 phase=done
+            status["running"] = False
+            status["done"]    = True
+            status["phase"]   = "done"
 
 
 def _render_queue_tab() -> None:
@@ -2558,9 +2641,17 @@ def _render_queue_tab() -> None:
     qs = st.session_state.get("queue_state", {})
     is_running = qs.get("running", False)
 
+    # 给每个 plan 一个稳定的 _id（uuid），widget key 用 _id 而不是 list index。
+    # 否则用户删除中间某条计划后，后面所有 plan 的 index 漂移，session_state
+    # 里旧 index 的 widget 值会被新位置的 plan 误用（"明明改了又跳回原值"）。
+    for _p in plans:
+        if not _p.get("_id"):
+            _p["_id"] = uuid.uuid4().hex[:12]
+
     # ── Plan list ──────────────────────────────────────────────────────
     plans_to_delete: list[int] = []
     for i, plan in enumerate(plans):
+        pid_key = plan["_id"]
         with st.expander(
             f"计划 {i+1} — {plan.get('project_name', '?')} · "
             f"{plan.get('tactic', '通用') or '通用'} · "
@@ -2574,7 +2665,7 @@ def _render_queue_tab() -> None:
                     "项目", proj_ids,
                     format_func=lambda pid: proj_id_to_name.get(pid, pid),
                     index=proj_ids.index(plan["project_id"]) if plan["project_id"] in proj_ids else 0,
-                    key=f"qp_proj_{i}",
+                    key=f"qp_proj_{pid_key}",
                 )
                 plan["project_id"]   = sel_pid
                 plan["project_name"] = proj_id_to_name.get(sel_pid, "")
@@ -2583,17 +2674,17 @@ def _render_queue_tab() -> None:
                 plan_tactic_names = proj_module.get_tactic_names(sel_proj)
                 tactic_opts = ["（无）"] + plan_tactic_names
                 t_idx = tactic_opts.index(plan.get("tactic", "（无）")) if plan.get("tactic", "（无）") in tactic_opts else 0
-                sel_tactic = st.selectbox("战术方向", tactic_opts, index=t_idx, key=f"qp_tactic_{i}")
+                sel_tactic = st.selectbox("战术方向", tactic_opts, index=t_idx, key=f"qp_tactic_{pid_key}")
                 plan["tactic"] = "" if sel_tactic == "（无）" else sel_tactic
 
             with pc2:
                 plan["count"] = st.number_input(
                     "篇数", min_value=1, max_value=config.MAX_GENERATION_COUNT,
-                    value=plan.get("count", 3), key=f"qp_count_{i}",
+                    value=plan.get("count", 3), key=f"qp_count_{pid_key}",
                 )
                 q_eng_mode = st.radio(
                     "模式", ["单引擎", "多引擎比稿", "🎭 三省法"],
-                    horizontal=True, key=f"qp_eng_mode_{i}",
+                    horizontal=True, key=f"qp_eng_mode_{pid_key}",
                     index=2 if plan.get("use_multi_role") else (1 if len(plan.get("engines", [])) > 1 else 0),
                 )
                 plan["use_multi_role"] = (q_eng_mode == "🎭 三省法")
@@ -2601,7 +2692,7 @@ def _render_queue_tab() -> None:
                     q_eng = st.selectbox(
                         "引擎", gen_module.AVAILABLE_ENGINES,
                         format_func=lambda e: "Claude" if e == "claude" else "Gemini",
-                        key=f"qp_eng_{i}",
+                        key=f"qp_eng_{pid_key}",
                     )
                     plan["engines"] = [q_eng]
                 elif q_eng_mode == "多引擎比稿":
@@ -2613,12 +2704,12 @@ def _render_queue_tab() -> None:
                         gen_module.AVAILABLE_ENGINES,
                         default=plan.get("engines", ["claude"]),
                         format_func=lambda e: "Claude" if e == "claude" else "Gemini",
-                        key=f"qp_mr_eng_{i}",
+                        key=f"qp_mr_eng_{pid_key}",
                     )
                     plan["engines"] = q_mr_eng or ["claude"]
                     plan["n_roles"] = st.slider(
                         "抽取角色数", min_value=2, max_value=6,
-                        value=plan.get("n_roles", 3), key=f"qp_nroles_{i}",
+                        value=plan.get("n_roles", 3), key=f"qp_nroles_{pid_key}",
                         help="每次从角色池中随机抽取，数量越多并行路数越多",
                     )
 
@@ -2633,7 +2724,7 @@ def _render_queue_tab() -> None:
                         "Claude 模型", _cm_keys,
                         format_func=lambda m: config.CLAUDE_MODELS.get(m, m),
                         index=_cm_keys.index(_saved_cm) if _saved_cm in _cm_keys else 0,
-                        key=f"qp_cm_{i}",
+                        key=f"qp_cm_{pid_key}",
                     )
             if "gemini" in plan["engines"]:
                 _saved_gm = _saved_em.get("gemini", config.GEMINI_MODEL)
@@ -2643,7 +2734,7 @@ def _render_queue_tab() -> None:
                         "Gemini 模型", _gm_keys,
                         format_func=lambda m: config.GEMINI_MODELS.get(m, m),
                         index=_gm_keys.index(_saved_gm) if _saved_gm in _gm_keys else 0,
-                        key=f"qp_gm_{i}",
+                        key=f"qp_gm_{pid_key}",
                     )
             plan["engine_models"] = q_em
 
@@ -2653,13 +2744,13 @@ def _render_queue_tab() -> None:
                 plan["gemini_use_thinking"] = st.checkbox(
                     "Gemini 思考模式",
                     value=plan.get("gemini_use_thinking", False),
-                    key=f"qp_gthink_{i}",
+                    key=f"qp_gthink_{pid_key}",
                     help="thinking_budget=-1 动态分配（Gemini 3.x 默认开启思考）",
                 )
 
             plan["extra_instructions"] = st.text_input(
                 "补充说明", value=plan.get("extra_instructions", ""),
-                placeholder="可选", key=f"qp_extra_{i}",
+                placeholder="可选", key=f"qp_extra_{pid_key}",
             )
 
             # Day 5：本计划策略（覆盖项目默认）
@@ -2675,7 +2766,7 @@ def _render_queue_tab() -> None:
                 "本计划策略",
                 strategy_options,
                 index=cur_idx,
-                key=f"qp_strategy_{i}",
+                key=f"qp_strategy_{pid_key}",
                 help="覆盖项目默认队列策略。「稳定」更严格，重复率低但慢；「吞吐」更快但重复率可能上升。",
             )
             if strategy_choice == "项目默认":
@@ -2685,7 +2776,7 @@ def _render_queue_tab() -> None:
             elif strategy_choice.startswith("吞吐"):
                 plan["strategy"] = "throughput"
 
-            if st.button("🗑 删除此计划", key=f"qp_del_{i}"):
+            if st.button("🗑 删除此计划", key=f"qp_del_{pid_key}"):
                 plans_to_delete.append(i)
 
     for idx in sorted(plans_to_delete, reverse=True):
@@ -2699,6 +2790,7 @@ def _render_queue_tab() -> None:
         if st.button("➕ 添加计划", use_container_width=True, disabled=is_running):
             default_pid = proj_ids[0]
             plans.append({
+                "_id":                 uuid.uuid4().hex[:12],
                 "project_id":          default_pid,
                 "project_name":        proj_id_to_name.get(default_pid, ""),
                 "tactic":              "",
@@ -4116,7 +4208,9 @@ def page_history(project: dict) -> None:
     batch_item_counts = db.get_batch_item_counts(db_client, [b["id"] for b in batches])
 
     # Day 5: 批次指标快照（性能 / 去重 / 注入），与 batches 一同预加载
-    metrics_rows = db.list_batch_metrics(db_client, project["id"], limit=200)
+    metrics_rows = db.list_batch_metrics(
+        db_client, project["id"], limit=200, user_id=user_id,
+    )
     metrics_by_batch = {m.get("batch_id"): m for m in metrics_rows if m.get("batch_id")}
 
     for batch in batches:

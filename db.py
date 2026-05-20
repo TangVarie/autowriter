@@ -525,10 +525,26 @@ def bulk_update_version_embeddings(
         client.table("versions").upsert(rows).execute()
         return
     except Exception as exc:
+        err_msg = str(exc)
         telemetry.log_event(
             "embedding_upsert_fallback",
-            count=len(rows), error=str(exc)[:200],
+            count=len(rows), error=err_msg[:200],
         )
+        # 如果错误明确指向"列不存在"（pgvector 迁移没跑），不再逐行重试 N 次：
+        # 直接把所有 id 标记 failed，省 N-1 次必败的 round trip + 日志风暴。
+        low = err_msg.lower()
+        if (
+            "embedding" in low
+            and ("column" in low or "does not exist" in low or "schema" in low)
+        ):
+            telemetry.log_event(
+                "embedding_column_missing",
+                hint="run versions.embedding pgvector migration",
+            )
+            if failed_sink is not None:
+                for r in rows:
+                    failed_sink.append(r.get("id", ""))
+            return
     # Per-row fallback
     for r in rows:
         ok = update_version_embedding(client, r.get("id", ""), r.get("embedding") or [])
@@ -1016,13 +1032,21 @@ def upsert_memory(
 
         try:
             res = client.table("memories").insert(data).execute()
-        except Exception:
-            # New columns missing from older deployments — strip and retry
-            data.pop("severity", None)
-            data.pop("applicability", None)
-            data.pop("embedding", None)
-            data.pop("rule_kind", None)
-            data.pop("rule_payload", None)
+        except Exception as exc:
+            # 仅在错误明确指向"新列缺失"（未跑迁移）时才剥列重试；其它错误
+            # 抛回去让调用方/UI 看见。之前裸 except 会把 RLS 拒绝、唯一冲突、
+            # 网络中断都当成"老部署"，导致 rule_kind / rule_payload 静默丢失。
+            msg = str(exc)
+            new_cols = ("severity", "applicability", "embedding",
+                        "rule_kind", "rule_payload")
+            if not any(col in msg for col in new_cols):
+                raise
+            telemetry.log_event(
+                "upsert_memory_schema_fallback",
+                error=msg[:200],
+            )
+            for col in new_cols:
+                data.pop(col, None)
             res = client.table("memories").insert(data).execute()
         _invalidate_memory_caches()
         return res.data[0]
@@ -1119,9 +1143,14 @@ def insert_batch_metrics(
 
 @_cache_data(ttl=60, show_spinner=False)
 def list_batch_metrics(
-    _client: Client, project_id: str, limit: int = 50
+    _client: Client, project_id: str, limit: int = 50,
+    user_id: Optional[str] = None,
 ) -> list[dict]:
-    """读最近 N 条批次指标。历史页用，60s 缓存避免重复查询。"""
+    """读最近 N 条批次指标。历史页用，60s 缓存避免重复查询。
+
+    ``user_id`` 仅作为缓存 key 用（RLS 已经按行过滤）。不传也能用，但同
+    一会话内多账户切换时可能拿到上一个账户缓存的结果——所以建议传。
+    """
     if not project_id:
         return []
     try:
