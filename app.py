@@ -3306,11 +3306,17 @@ def page_review(project: dict) -> None:
         st.info("当前筛选条件下没有文案。")
 
     # ── Item cards ─────────────────────────────────────────────────────
+    # 包 fragment：点单个卡片的"通过/打回/迭代/标记案例"等按钮只 rerun 那
+    # 一个卡片，不重渲染整页（不重查 list_items、不重渲染其它卡片、不重
+    # 跑 sidebar）。审核页 N=10+ 卡片时按钮响应明显变快。
+    # Trade-off：顶部 stat row 的"待审 X 篇"数字在卡片状态变后不立刻更新，
+    # 等下次自然 page rerun（切批次 / 切 tab / 刷页）才刷新。可接受 —— 用户
+    # 最关心的是"我点了通过那张卡片变了没"，统计数字延迟无感。
     for item in filtered_items:
         versions = sorted(item.get("versions", []), key=lambda v: v.get("version_num", 0))
         if not versions:
             continue
-        _render_item_card(item, versions, selected_batch, project)
+        _render_item_card_fragment(item, versions, selected_batch, project)
 
     # ── 太子自动学习：全部通过时静默更新调教笔记 ──────────────────────────
     _taizi_key = f"taizi_{batch_id}"
@@ -3719,6 +3725,14 @@ def _render_item_card(
                     pass
                 st.success("已保存修改并标记为通过。调教笔记已同步更新。")
                 st.rerun()
+
+
+# 包成 fragment：每个卡片独立 rerun，按钮点击不再触发整页重渲染。
+# Streamlit < 1.33 没有 fragment 时退化到普通函数（与 page-rerun 行为相同）。
+if _FRAGMENT is not None:
+    _render_item_card_fragment = _FRAGMENT(_render_item_card)
+else:
+    _render_item_card_fragment = _render_item_card
 
 
 def _normalise_keywords(raw) -> list[str]:
@@ -4299,7 +4313,14 @@ def page_memory(project: Optional[dict]) -> None:
 
 def page_history(project: dict) -> None:
     _hero_header("06 / HISTORY", "回顾每一次生成。", f"项目 · {project.get('name', '')}")
+    # 主体内容包 fragment：删除批次、点"查看此批次"等操作触发 fragment-only
+    # rerun，不重渲染 sidebar / header（50 个 batch 重渲染本身就慢，再叠 page
+    # rerun 整体感觉就是卡）。Fragment 内的 ``_force_page`` + ``_rerun_app``
+    # 仍然能跳转到审核页，因为这两个都是显式 app-scope rerun。
+    _page_history_body(project)
 
+
+def _page_history_body_impl(project: dict) -> None:
     batches = db.list_batches(db_client, project["id"], limit=50)
     if not batches:
         st.info("暂无历史批次。")
@@ -4347,11 +4368,12 @@ def page_history(project: dict) -> None:
             with btn_col:
                 if counts['total'] > 0:
                     if st.button("查看此批次", key=f"view_batch_{batch['id']}"):
-                        # 真正跳转到审核页：之前只 set review_batch_id 但 page
-                        # 还是"批次历史"，用户感觉"点了没反应"。
+                        # 跳转审核页需要 app-scope rerun（让 sidebar radio 重渲染
+                        # 并切到审核页）。fragment-only rerun 不会触发 sidebar，
+                        # 用户会看到 _force_page 被 set 但页面不切。
                         st.session_state["review_batch_id"] = batch["id"]
                         st.session_state["_force_page"] = "审核与迭代"
-                        st.rerun()
+                        _rerun_app()
             with del_col:
                 confirm_key = f"confirm_del_{batch['id']}"
                 if st.session_state.get(confirm_key):
@@ -4444,6 +4466,16 @@ def page_history(project: dict) -> None:
                             badges.append(f"去重 {dmode}")
                         if badges:
                             st.caption(" · ".join(badges))
+
+
+# 包成 fragment（与 _render_queue_tab 同模式）：批次列表的删除 / "查看此批次"
+# 等点击只 rerun 本 fragment，避免重渲染整页（50 个 expander + cached 但仍
+# 占重的查询）。``_force_page`` 内部用 ``_rerun_app`` 切到审核页，那是显式
+# app-scope rerun，跨 fragment 边界正常生效。
+if _FRAGMENT is not None:
+    _page_history_body = _FRAGMENT(_page_history_body_impl)
+else:
+    _page_history_body = _page_history_body_impl
 
 
 # ═══════════════════════════════════════════════════════════════════════════

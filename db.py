@@ -504,6 +504,12 @@ def delete_batch(client: Client, batch_id: str) -> None:
     # 4. Delete batch
     client.table("batches").delete().eq("id", batch_id).execute()
     list_batches.clear()
+    # list_items 也要 invalidate（cache key 含 batch_id；这里宽口径全 clear，
+    # cache 体积小成本可忽略）
+    try:
+        list_items.clear()
+    except Exception:
+        pass
 
 
 # ── Item CRUD ──────────────────────────────────────────────────────────────
@@ -528,6 +534,10 @@ def bulk_create_items(client: Client, rows: list[dict]) -> list[dict]:
     if not rows:
         return []
     res = client.table("items").insert(rows).execute()
+    try:
+        list_items.clear()
+    except Exception:
+        pass
     return res.data or []
 
 
@@ -552,6 +562,10 @@ def update_version_content(
         updates["token_usage"] = token_usage
     try:
         client.table("versions").update(updates).eq("id", version_id).execute()
+    except Exception:
+        pass
+    try:
+        list_items.clear()
     except Exception:
         pass
     if embedding is not None:
@@ -713,6 +727,11 @@ def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]
     version_num for an existing item."""
     if not rows:
         return []
+    # 写入新 version 后 list_items 的 versions(*) 嵌套结果就过时了
+    try:
+        list_items.clear()
+    except Exception:
+        pass
     payload = []
     for r in rows:
         payload.append({
@@ -730,9 +749,24 @@ def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]
     return res.data or []
 
 
-def list_items(client: Client, batch_id: str) -> list[dict]:
+@_cache_data(ttl=30, show_spinner=False)
+def list_items(_client: Client, batch_id: str) -> list[dict]:
+    """List items + their versions for one batch.
+
+    30s cache：审核页用户连续点"通过/打回/迭代"按钮时不重复查 DB。所有写
+    items / versions 的路径都要在写入后调用 ``list_items.clear()``——这种
+    write-through invalidation 是手动的，遗漏点会让 UI 显示旧状态。已知调
+    用点（必须 clear）：
+      - update_item_status                — items.status
+      - set_item_example_label            — items.example_label
+      - delete_batch                      — cascade 删 items
+      - bulk_create_initial_versions      — 新建 versions（影响 list_items 的 versions(*) 嵌套）
+      - bulk_create_items                  — 新建 items
+      - update_version_content            — versions.title/body/keywords
+    cache 失败回原始查询（_cache_data shim 在 no-streamlit 环境是 no-op）。
+    """
     res = (
-        client.table("items")
+        _client.table("items")
         .select("*, versions(*)")
         .eq("batch_id", batch_id)
         .order("created_at")
@@ -784,6 +818,10 @@ def update_item_status(
     if best_version_id:
         updates["best_version_id"] = best_version_id
     res = client.table("items").update(updates).eq("id", item_id).execute()
+    try:
+        list_items.clear()
+    except Exception:
+        pass
     return res.data[0]
 
 
@@ -889,6 +927,10 @@ def create_version(
         "token_usage": token_usage or {},
     }
     res = client.table("versions").insert(data).execute()
+    try:
+        list_items.clear()
+    except Exception:
+        pass
     return res.data[0]
 
 
@@ -1467,6 +1509,10 @@ def set_item_example_label(
     )
     try:
         list_example_items.clear()
+    except Exception:
+        pass
+    try:
+        list_items.clear()
     except Exception:
         pass
     return res.data[0]
