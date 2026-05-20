@@ -399,10 +399,18 @@ def classify_and_merge_feedback(
     if out["action"] == "rule":
         scope = data.get("scope")
         out["scope"] = "global" if scope == "global" else "project"
-        # Hard vs soft tier: hard requires the classifier to have explicitly
-        # said so AND the source text to carry compliance-style cues.  Default
-        # to soft so the P0 tier only contains genuine non-negotiables.
+        # Hard vs soft tier：合规级硬规则不能因 merger 回退（merge → rule）而被
+        # 静默降级为 soft。merger 在判 ``merge`` 时往往不返回 severity（因为本意
+        # 是累加旧规则），一旦目标 id 缺失回退到 rule，若仅看 ``data.get("severity")``
+        # 就只能拿到默认 soft——用户写了"严禁/必须"也丢到 P1，P0 兜底失效。
+        # 这里额外做一次原文文本探测，含合规级触发词时强制升回 hard。
         severity = (data.get("severity") or "soft").lower()
+        _HARD_CUES = (
+            "禁止", "严禁", "不得", "必须", "杜绝", "不能出现",
+            "绝对不要", "一律不", "违反法规", "合规",
+        )
+        if severity != "hard" and any(cue in clean for cue in _HARD_CUES):
+            severity = "hard"
         out["severity"] = "hard" if severity == "hard" else "soft"
         applicability = (data.get("applicability") or "").strip()
         if applicability:

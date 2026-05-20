@@ -548,10 +548,17 @@ class ClaudeEngine:
                 r.token_usage = token_usage
             return results
         except anthropic.APIError as e:
-            return [GenerationResult(
-                title="", body="", keywords=[], ai_engine=f"claude/{model}",
-                error=f"Claude API错误: {e}"
-            )] * count
+            # 必须用列表推导生成独立实例：``[GR(...)] * count`` 会把同一对象
+            # 引用复制 count 份，后续任何位置改 token_usage / 标签都会污染整批
+            # 失败位（典型表现：一条版本打了 compliance_violation 标，其它失败位
+            # 也"被动跟着"挂上同一条违规）。
+            return [
+                GenerationResult(
+                    title="", body="", keywords=[], ai_engine=f"claude/{model}",
+                    error=f"Claude API错误: {e}",
+                )
+                for _ in range(count)
+            ]
 
     def iterate(
         self,
@@ -714,10 +721,14 @@ class GeminiEngine:
                 r.token_usage = token_usage
             return results
         except Exception as e:
-            return [GenerationResult(
-                title="", body="", keywords=[], ai_engine=f"gemini/{model}",
-                error=f"Gemini API错误: {e}"
-            )] * count
+            # 同上：必须列表推导，``list * count`` 是共享引用陷阱。
+            return [
+                GenerationResult(
+                    title="", body="", keywords=[], ai_engine=f"gemini/{model}",
+                    error=f"Gemini API错误: {e}",
+                )
+                for _ in range(count)
+            ]
 
     def iterate(
         self,
@@ -1070,9 +1081,20 @@ def generate_batch(
         produced: list[dict] = []  # {"title", "opening"} accumulated across engines
         for i, eng in enumerate(engines):
             # Augment dedup block with what previous engines already wrote.
+            # 用 dict 按 title 去重，避免 historical 与 produced 出现同标题条目
+            # 浪费 token 并稀释 dedup 信号（用户跨批触发时常见）。
+            _combined: dict[str, dict] = {}
+            for _h in (historical_titles or []):
+                _t = (_h.get("title") or "").strip() if isinstance(_h, dict) else ""
+                if _t and _t not in _combined:
+                    _combined[_t] = _h
+            for _p in produced:
+                _t = (_p.get("title") or "").strip() if isinstance(_p, dict) else ""
+                if _t and _t not in _combined:
+                    _combined[_t] = _p
             extra_dedup = _build_dedup_instruction(
                 generated_summaries=[],
-                historical=list(historical_titles or []) + produced,
+                historical=list(_combined.values()),
             )
             prompt_for_this_engine = _make_user_prompt(
                 tactic=tactic,
@@ -1604,8 +1626,9 @@ def build_iteration_messages(
         if not messages or messages[-1]["role"] != "user":
             messages.append({"role": "user", "content": user_content})
         else:
-            # Merge with previous user message to avoid consecutive user turns
-            messages[-1]["content"] += "\n\n" + user_content
+            # 合并到前一条 user 消息时插入明确分隔符——避免原始 prompt 与后续
+            # 反馈被无标记拼成一长串，模型看到的 context 含义会糊掉。
+            messages[-1]["content"] += "\n\n--- 后续反馈 ---\n" + user_content
 
         # AI response for this version
         assistant_text = json.dumps(
@@ -1624,10 +1647,25 @@ def build_iteration_messages(
     # Trim if context is getting too long (keep first round + last N rounds + new feedback)
     MAX_ROUNDS = 3  # each round = 2 messages (user + assistant)
     if len(messages) > MAX_ROUNDS * 2 + 1:
-        # Keep first user+assistant pair + last rounds + final user message
-        messages = messages[:2] + messages[-(MAX_ROUNDS * 2 - 1):]
+        # 保留首轮 (user + assistant) + 最近 N-1 轮 (偶数条) + 末尾新 feedback (user)。
+        # 之前用 ``messages[-(MAX_ROUNDS*2-1):]`` 会拿到奇数条尾巴，与首轮拼起来
+        # 出现 [user, assistant, assistant, ...] 不交替，Anthropic API 直接拒。
+        # 这里改成偶数条尾巴 (MAX_ROUNDS-1 轮 = 2*(MAX_ROUNDS-1) 条) + 末尾新 user。
+        tail_pairs = (MAX_ROUNDS - 1) * 2
+        messages = messages[:2] + messages[-(tail_pairs + 1):]
 
-    return messages
+    # 安全网：扫一遍合并任何相邻同角色消息——防止上游传入的 history 本身就有
+    # 不交替的情况（例如某次 assistant 返回失败，外层在 history 里塞了两个连续
+    # user 占位）。这里宁可多合并不可让 API 直接 400。
+    fixed: list[dict] = []
+    for m in messages:
+        if fixed and fixed[-1]["role"] == m["role"]:
+            fixed[-1]["content"] = (
+                f"{fixed[-1]['content']}\n\n--- 续 ---\n{m['content']}"
+            )
+        else:
+            fixed.append(m)
+    return fixed
 
 
 def iterate_copy(

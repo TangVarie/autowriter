@@ -1162,6 +1162,9 @@ def upsert_memory(
     迁移未跑的老部署 insert 失败后会自动 strip 这两列重试，保持向后兼容。
     """
     # Try to find an existing memory with the same content
+    # scope 隔离很重要：``project_id=None`` 的 global 反馈必须只匹配 project_id IS NULL
+    # 的行——之前漏了 IS NULL 过滤，导致 global 反馈会去匹配并 +1 某个项目级同
+    # 文本规则的 frequency，scope 边界被打穿。
     q = (
         client.table("memories")
         .select("*")
@@ -1171,6 +1174,8 @@ def upsert_memory(
     )
     if project_id:
         q = q.eq("project_id", project_id)
+    else:
+        q = q.is_("project_id", "null")
     existing = q.execute()
 
     if existing.data:
@@ -1467,10 +1472,40 @@ def increment_memory_frequency(client: Client, memory_id: str) -> dict:
     Bump an existing memory's frequency counter and mark it confirmed.  Used
     by the AI merger's ``merge`` path when a new feedback is deemed semantically
     equivalent to an existing rule.
+
+    用乐观并发（CAS）替代原本的 read-then-write：UPDATE 时 WHERE 同时匹配旧
+    frequency，0 行受影响说明被别人抢先 +1 了，重读重试。这样队列 worker / UI
+    同时给同一规则反馈不会丢更新——之前两个连接都读到 freq=5、都写 6 会少
+    一次增量，``MEMORY_AUTO_CONFIRM_THRESHOLD=3`` 这种小阈值下"自动确认"行为
+    被悄悄拖慢。
     """
-    row = (
-        client.table("memories").select("*").eq("id", memory_id).execute()
+    MAX_CAS_RETRIES = 5
+    for _attempt in range(MAX_CAS_RETRIES):
+        row = (
+            client.table("memories").select("*").eq("id", memory_id).execute()
+        )
+        if not row.data:
+            raise ValueError(f"memory {memory_id} not found")
+        cur = row.data[0]
+        cur_freq = cur.get("frequency", 1)
+        res = (
+            client.table("memories")
+            .update({"frequency": cur_freq + 1, "status": "confirmed"})
+            .eq("id", memory_id)
+            .eq("frequency", cur_freq)  # CAS：旧值变了 → 0 行受影响 → 重试
+            .execute()
+        )
+        if res.data:
+            _invalidate_memory_caches()
+            return res.data[0]
+        # CAS 失败：被别的事务抢先；下一次循环重读再试
+    # 重试上限——极端并发或行被删时落到这里。回退到无 CAS 的最后一次写入，
+    # 至少保证 frequency 不倒退（写入值取最新读到的 +1）。
+    telemetry.log_event(
+        "memory_increment_cas_exhausted",
+        memory_id=memory_id, retries=MAX_CAS_RETRIES,
     )
+    row = client.table("memories").select("*").eq("id", memory_id).execute()
     if not row.data:
         raise ValueError(f"memory {memory_id} not found")
     cur = row.data[0]
@@ -1734,11 +1769,28 @@ def get_session_instructions(
         return []
 
     rows = res.data or []
-    now_iso = datetime.utcnow().isoformat()
+    # 用 timezone-aware 比对：之前 ``datetime.utcnow()`` 返回 naive，而 PG 的
+    # TIMESTAMPTZ 字符串带 ``+00:00`` 偏移，按字典序字符串比较在边界微秒/格式
+    # 略差时不可靠（最坏会让已过期的 session_instruction 仍然注入 prompt，
+    # 24h TTL 名存实亡）。改成解析为 aware datetime 后比较。
+    now_aware = datetime.now(timezone.utc)
     fresh: list[dict] = []
     for row in rows:
         expires = row.get("expires_at")
-        if expires and expires < now_iso:
+        if not expires:
+            fresh.append(row)
+            continue
+        try:
+            # PG 常见格式：``2026-05-20T11:00:00+00:00`` 或带 ``.123456``。
+            # fromisoformat 在 3.11+ 接受 ``Z`` 后缀，3.10 不支持 → 兜底替换。
+            expires_aware = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+            if expires_aware.tzinfo is None:
+                expires_aware = expires_aware.replace(tzinfo=timezone.utc)
+        except Exception:
+            # 解析失败时保守保留——比误删用户当前会话的临时指令体感好
+            fresh.append(row)
+            continue
+        if expires_aware < now_aware:
             continue
         fresh.append(row)
     return fresh
@@ -1758,7 +1810,8 @@ def insert_session_instruction(
     hasn't run yet (so callers can silently skip the feature).
     """
     from datetime import timedelta
-    expires_at = (datetime.utcnow() + timedelta(hours=max(1, ttl_hours))).isoformat()
+    # timezone-aware：写入端与 ``get_session_instructions`` 的过期判定保持同口径
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=max(1, ttl_hours))).isoformat()
     payload: dict[str, Any] = {
         "scope": "project" if project_id else "global",
         "content": content.strip(),
