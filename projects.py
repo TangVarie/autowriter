@@ -30,7 +30,20 @@ def get_current_project_id() -> Optional[str]:
 
 
 def set_current_project(project_id: str) -> None:
-    st.session_state["current_project_id"] = project_id
+    """切换当前项目。
+
+    UI 侧的 selectbox 只展示用户名下的项目，所以正常路径不会出现越权。
+    但 ``set_current_project`` 是公开入口（其它代码也会调），加一次最小成本
+    的安全网：如果传进来的 project_id 看起来不像 UUID，直接拒；最终 DB 读
+    会由 Supabase RLS 兜底。"""
+    pid = (project_id or "").strip()
+    # 粗略 UUID 形态校验，过滤掉空串/明显垃圾输入。
+    if not pid:
+        return
+    if len(pid) != 36 or pid.count("-") != 4:
+        # 不是 UUID 形态 — 大概率是错调用。不抛错，保持调用方简单。
+        return
+    st.session_state["current_project_id"] = pid
 
 
 def get_current_project(client: Client) -> Optional[dict]:

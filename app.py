@@ -447,11 +447,25 @@ def _run_semantic_dedup_pass(
             )
         return
     metrics.start_phase("embedding")
+    # 进度细化：embedding 阶段在整批占 90%→100%，把这 10% 再切成 5 步：
+    #   0.0   嵌入计算开始
+    #   0.2   嵌入计算完成
+    #   0.4   embedding 落库完成
+    #   0.6   去重对比完成
+    #   ?     regen 循环按 idx 占 0.6→0.9
+    #   1.0   pool 写回完成
+    # 之前从 0% → 100% 中间没刷过——dedup 触发自动重生时进度会卡 90% 数十秒，
+    # 用户以为系统挂了去手动重启队列，触发重复生成。
+    def _emb_progress(intra: float):
+        if status is not None:
+            _set_phase_progress(status, "embedding", intra=intra)
     try:
+        _emb_progress(0.0)
         titles_in_order = [r.get("title", "") for r in version_rows]
         new_vecs = dedup_module.embed_texts(titles_in_order)
         if not new_vecs:
             return
+        _emb_progress(0.2)
         # 步骤 2：持久化 embedding（失败的 version_id 累到 status["embedding_missing"]）
         embed_rows = []
         for i, iv in enumerate(inserted_versions):
@@ -465,6 +479,7 @@ def _run_semantic_dedup_pass(
         if failed_embed_ids and status is not None:
             status.setdefault("embedding_missing", []).extend(failed_embed_ids)
             metrics.incr("embedding_missing", len(failed_embed_ids))
+        _emb_progress(0.4)
 
         # 步骤 3：解析阈值（队列策略 > 项目级 > 全局默认）
         if regen_ctx and regen_ctx.get("threshold_override") is not None:
@@ -496,6 +511,7 @@ def _run_semantic_dedup_pass(
         for pair in intra:
             # 本批内冲突时把后一个（j）当作要重生的；前一个先留着
             duplicate_indices.add(pair["j"])
+        _emb_progress(0.6)
 
         # 没开启自动重生：直接写警告
         if not regen_enabled:
@@ -512,7 +528,9 @@ def _run_semantic_dedup_pass(
                 )
         else:
             # 自动重生：对每个 duplicate index 调一次 1-item 生成，更新 DB
-            for dup_idx in sorted(duplicate_indices):
+            _dup_list = sorted(duplicate_indices)
+            _n_dups = len(_dup_list) or 1  # 避免除零
+            for _i, dup_idx in enumerate(_dup_list):
                 ok = _try_regen_one(
                     db_client=db_client,
                     project_id=project_id,
@@ -531,6 +549,8 @@ def _run_semantic_dedup_pass(
                 if ok:
                     metrics.incr("regen_success")
                 # 不论成功失败都计入 attempts（_try_regen_one 内部记录每次尝试）
+                # regen 循环占 0.6 → 0.9，按完成比例线性插值
+                _emb_progress(0.6 + 0.3 * (_i + 1) / _n_dups)
 
         # 步骤 5：累积给下一批用（regen 路径可能已经原地改过 new_vecs）
         # 加去重 + 滑窗上限：长队列下 pool 会一直 append 同项目历史，O(n^2)
@@ -2353,10 +2373,22 @@ _NAV_ITEMS = {
 # 在 widget 渲染前修改 session_state[key] 来设置该 widget 的当前值。
 _FORCED_NAV = st.session_state.pop("_force_page", None)
 if _FORCED_NAV:
+    _was_already_on = (
+        st.session_state.get("xhs_nav_radio") in {
+            k for k, v in _NAV_ITEMS.items() if v == _FORCED_NAV
+        }
+    )
     for _nav_key, _page_name in _NAV_ITEMS.items():
         if _page_name == _FORCED_NAV:
             st.session_state["xhs_nav_radio"] = _nav_key
             break
+    # 当目标页就是当前页时 radio 不会有视觉变化，用户以为按钮失效。
+    # 用 toast 给出一行可见反馈（比 st.success 自动消失更轻量）。
+    if _was_already_on:
+        try:
+            st.toast(f"已跳转到「{_FORCED_NAV}」（已在该页）", icon="✅")
+        except Exception:
+            pass
 
 with st.sidebar:
     st.markdown("<div class='nav-heading'>▸ CHAPTERS</div>", unsafe_allow_html=True)
