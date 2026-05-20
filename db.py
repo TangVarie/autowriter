@@ -129,6 +129,13 @@ CREATE TABLE IF NOT EXISTS batches (
     user_id        UUID NOT NULL,
     created_at     TIMESTAMPTZ DEFAULT NOW()
 );
+-- 2026-05 Day 14: 太子自动学习的批次维度幂等标记。NULL = 这批次从没被
+-- "全部通过 → 自动调教笔记反思" 触发过；非 NULL = 已经反思过（带时间戳便于
+-- 审计 / 调试）。审核页用它来决定要不要再跑一次，避免每次刷新都重复学习
+-- 同一批次（之前只用 st.session_state，浏览器刷新 / 重登就丢，重新打开同一
+-- 批次又会再跑一次 generate_calibration_notes，每次都是一次 Claude 调用）。
+ALTER TABLE batches
+    ADD COLUMN IF NOT EXISTS auto_calibrated_at TIMESTAMPTZ NULL;
 ALTER TABLE batches ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS batches_owner ON batches;
 CREATE POLICY batches_owner ON batches
@@ -483,6 +490,40 @@ def list_batches(_client: Client, project_id: str, limit: int = 20) -> list[dict
         .execute()
     )
     return res.data or []
+
+
+def mark_batch_auto_calibrated(client: Client, batch_id: str) -> bool:
+    """把批次标记为"已被太子学习过"。
+
+    审核页全部通过时触发自动调教笔记反思后调用，记一个时间戳到
+    ``batches.auto_calibrated_at``。再次打开同一批次时，gate 检查这一列就
+    能跳过重复学习，省一次 Claude 调用 + token。
+
+    返回 True 表示写入成功，False 表示失败（列缺失 / 网络）—— 调用方据此
+    决定要不要在 UI 上提示一次。
+    """
+    try:
+        client.table("batches").update({
+            "auto_calibrated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", batch_id).execute()
+        try:
+            list_batches.clear()
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        msg = str(exc)
+        if "auto_calibrated_at" in msg:
+            telemetry.log_event(
+                "mark_batch_auto_calibrated_missing_column",
+                hint="run additive ALTER on batches.auto_calibrated_at",
+            )
+        else:
+            telemetry.log_event(
+                "mark_batch_auto_calibrated_failed",
+                batch_id=batch_id, error=msg[:200],
+            )
+        return False
 
 
 def delete_batch(client: Client, batch_id: str) -> None:

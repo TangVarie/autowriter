@@ -3432,8 +3432,14 @@ def page_review(project: dict) -> None:
         _render_item_card_fragment(item, versions, selected_batch, project)
 
     # ── 太子自动学习：全部通过时静默更新调教笔记 ──────────────────────────
+    # 双闸门：(1) 持久化的 batches.auto_calibrated_at — 这批次历史上反思过没？
+    #          浏览器刷新 / 重登都不会让它重跑（之前的 bug：只看 session_state，
+    #          切回审核页又会重新跑一次 Claude，浪费 token + 让用户等 spinner）；
+    #         (2) session 内的 _taizi_key — 防止同一次 page rerun 里重复触发。
     _taizi_key = f"taizi_{batch_id}"
+    already_calibrated = bool(selected_batch.get("auto_calibrated_at"))
     if (items and all(it["status"] == "approved" for it in items)
+            and not already_calibrated
             and not st.session_state.get(_taizi_key)):
         st.session_state[_taizi_key] = True
         _auto_update_calibration_notes(project, batch_id, items)
@@ -4181,6 +4187,10 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
     """
     太子自动学习：批次全部通过后静默生成并保存调教笔记，无需人工确认。
     失败时不打断用户操作，但会埋点 + toast 提示一次，避免"看似学习了实际没存"。
+
+    成功路径（包括 LLM 返回但无新观察）会把 ``batches.auto_calibrated_at`` 标记
+    为本次时间戳，确保下次打开同一批次（甚至换浏览器 / 重登）不再重复反思。
+    失败路径不打标记 — 下次进来还会再试一次。
     """
     existing = (project.get("calibration_notes") or "").rstrip()
     try:
@@ -4199,6 +4209,8 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
                     db_client, project["id"], notes, source="batch_reflection",
                 )
                 st.toast("🧠 调教笔记已新增观察（太子学习完成）")
+            # 不论这次有没有新观察，标记"已学过"；下次同样的批次没必要再花 token
+            db.mark_batch_auto_calibrated(db_client, batch_id)
     except Exception as exc:
         telemetry.log_event(
             "batch_reflection_save_failed",
