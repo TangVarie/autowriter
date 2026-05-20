@@ -45,7 +45,7 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 
 # stdout 日志前缀；用于在大量日志里 grep 一行的指标摘要
@@ -148,12 +148,19 @@ class BatchMetrics:
             "meta":       dict(self.meta),
         }
 
-    def close(self, status: Optional[dict] = None) -> dict:
+    def close(
+        self,
+        status: Optional[dict] = None,
+        persist: Optional[Callable[[dict], None]] = None,
+    ) -> dict:
         """把指标写到 stdout 一行 JSON，并挂到 status["metrics_list"]。
 
         ``status`` 可以是 _queue_worker / _quick_gen_worker 的状态字典；
         多批次的队列会在 status["metrics_list"] 累积每批的快照，供
         UI 渲染一个简单的"本次队列耗时构成"卡片。
+
+        Day 5：``persist`` 是可选的持久化钩子（典型是 lambda d: db.insert_batch_metrics(...)），
+        在 stdout + status 写入完成后调用。失败不抛——埋点掉链子不能拖死生成主流程。
         """
         data = self.to_dict()
         # 1. stdout 一行 JSON（生产环境会被 Streamlit / 容器日志捕获）
@@ -169,6 +176,13 @@ class BatchMetrics:
                 lst.append(data)
                 status["last_metrics"] = data
             except Exception:
+                pass
+        # 3. 可选：落库持久化
+        if persist is not None:
+            try:
+                persist(data)
+            except Exception:
+                # persist 内部已自己埋点；这里再吞一层避免上调用方需要 try
                 pass
         return data
 

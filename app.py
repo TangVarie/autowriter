@@ -49,6 +49,41 @@ class _NullLock:
 _NULL_LOCK = _NullLock()
 
 
+def _resolve_queue_strategy(plan: dict, project: dict) -> dict:
+    """根据"计划级 > 项目级 > 全局默认"优先级解析队列策略 (Day 5)。
+
+    返回 dict 给 _run_semantic_dedup_pass 的 regen_ctx 覆盖用：
+      - ``enabled``           — 是否开启自动重生
+      - ``max_retries``       — 重生最多重试次数
+      - ``threshold_override``— 阈值覆盖（None 表示用项目级或全局默认）
+
+    策略含义：
+      - ``stable``     ：阈值 0.95、重生开启、重试 3 次 → 重复率最低，速度慢
+      - ``throughput`` ：阈值不覆盖、重生关闭 → 速度最快，重复率可能上升
+      - ``None`` / 未配置：用 config 默认值（与改造前完全一致）
+    """
+    s = (plan or {}).get("strategy")
+    if not s or s == "default":
+        s = (project or {}).get("queue_strategy")
+    if s == "stable":
+        return {
+            "enabled":            True,
+            "max_retries":        3,
+            "threshold_override": 0.95,
+        }
+    if s == "throughput":
+        return {
+            "enabled":            False,
+            "max_retries":        int(getattr(config, "DEDUP_REGEN_MAX_RETRIES", 2)),
+            "threshold_override": None,
+        }
+    return {
+        "enabled":            bool(getattr(config, "ENABLE_DEDUP_REGEN", False)),
+        "max_retries":        int(getattr(config, "DEDUP_REGEN_MAX_RETRIES", 2)),
+        "threshold_override": None,
+    }
+
+
 # ── Generation Queue ────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -797,9 +832,16 @@ def _queue_worker(
 
             # ── 语义查重（统一服务 _run_semantic_dedup_pass）──────────────────
             _set_phase_progress(status, "embedding")
+            # Day 5：解析队列策略（计划级 > 项目级 > config 默认）
+            strategy_ctx = _resolve_queue_strategy(plan, project)
+            metrics.set_meta(
+                "queue_strategy",
+                plan.get("strategy") or (project or {}).get("queue_strategy") or "default",
+            )
             regen_ctx = {
-                "enabled":             bool(getattr(config, "ENABLE_DEDUP_REGEN", False)),
-                "max_retries":         int(getattr(config, "DEDUP_REGEN_MAX_RETRIES", 2)),
+                "enabled":             strategy_ctx["enabled"],
+                "max_retries":         strategy_ctx["max_retries"],
+                "threshold_override":  strategy_ctx["threshold_override"],
                 "system_prompt":       full_system_prompt,
                 "tactic":              tactic,
                 "engines":             engines,
@@ -840,10 +882,24 @@ def _queue_worker(
                 "project_name": proj_name,
                 "saved":       saved,
             })
-            # 收尾：写一行 JSON 到 stdout + 挂到 status["metrics_list"] 给 UI
+            # 收尾：写一行 JSON 到 stdout + 挂到 status["metrics_list"] 给 UI +
+            # Day 5: 持久化到 batch_metrics 表，给历史页 / 性能看板用
             metrics.batch_id = batch_id
             metrics.set_meta("saved", saved)
-            metrics.close(status)
+            metrics.close(
+                status,
+                persist=lambda d: db.insert_batch_metrics(
+                    db_client,
+                    batch_id=d.get("batch_id") or batch_id,
+                    project_id=project_id,
+                    user_id=user_id,
+                    phase_ms=d.get("phase_ms") or {},
+                    counters=d.get("counters") or {},
+                    meta={k: v for k, v in (d.get("meta") or {}).items()
+                          if k != "injection"},
+                    injection=(d.get("meta") or {}).get("injection") or {},
+                ),
+            )
 
         except Exception as exc:
             status["errors"].append(f"计划 {idx+1}：{exc}")
@@ -2399,9 +2455,16 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # project_id 的临时字典；命中重复直接写到 errors 数组里。
         _set_phase_progress(status, "embedding")
         quick_queue_embeddings: dict[str, list[dict]] = {}
+        # Day 5：quick gen 也支持策略覆盖（plan 字段同 queue）
+        strategy_ctx = _resolve_queue_strategy(plan, project)
+        metrics.set_meta(
+            "queue_strategy",
+            plan.get("strategy") or (project or {}).get("queue_strategy") or "default",
+        )
         regen_ctx = {
-            "enabled":             bool(getattr(config, "ENABLE_DEDUP_REGEN", False)),
-            "max_retries":         int(getattr(config, "DEDUP_REGEN_MAX_RETRIES", 2)),
+            "enabled":             strategy_ctx["enabled"],
+            "max_retries":         strategy_ctx["max_retries"],
+            "threshold_override":  strategy_ctx["threshold_override"],
             "system_prompt":       full_system_prompt,
             "tactic":              tactic,
             "engines":             engines,
@@ -2444,7 +2507,26 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         status["message"] = f"生成失败：{exc}"
         metrics.set_meta("error", str(exc)[:120])
 
-    metrics.close(status)
+    # Day 5：持久化批次指标（quick gen 也走同一张表，模式由 d["mode"] 区分）
+    _quick_batch_id = status.get("batch_id") or metrics.batch_id
+    _quick_project_id = plan.get("project_id", "")
+    metrics.close(
+        status,
+        persist=(
+            (lambda d: db.insert_batch_metrics(
+                db_client,
+                batch_id=d.get("batch_id") or _quick_batch_id,
+                project_id=_quick_project_id,
+                user_id=user_id,
+                phase_ms=d.get("phase_ms") or {},
+                counters=d.get("counters") or {},
+                meta={k: v for k, v in (d.get("meta") or {}).items()
+                      if k != "injection"},
+                injection=(d.get("meta") or {}).get("injection") or {},
+            ))
+            if _quick_batch_id and _quick_project_id else None
+        ),
+    )
     with (status.get("_lock") or _NULL_LOCK):
         status["running"] = False
         status["done"]    = True
@@ -2579,6 +2661,29 @@ def _render_queue_tab() -> None:
                 "补充说明", value=plan.get("extra_instructions", ""),
                 placeholder="可选", key=f"qp_extra_{i}",
             )
+
+            # Day 5：本计划策略（覆盖项目默认）
+            strategy_options = ["项目默认", "稳定优先 (stable)", "吞吐优先 (throughput)"]
+            cur_s = plan.get("strategy")
+            if cur_s == "stable":
+                cur_idx = 1
+            elif cur_s == "throughput":
+                cur_idx = 2
+            else:
+                cur_idx = 0
+            strategy_choice = st.selectbox(
+                "本计划策略",
+                strategy_options,
+                index=cur_idx,
+                key=f"qp_strategy_{i}",
+                help="覆盖项目默认队列策略。「稳定」更严格，重复率低但慢；「吞吐」更快但重复率可能上升。",
+            )
+            if strategy_choice == "项目默认":
+                plan["strategy"] = None
+            elif strategy_choice.startswith("稳定"):
+                plan["strategy"] = "stable"
+            elif strategy_choice.startswith("吞吐"):
+                plan["strategy"] = "throughput"
 
             if st.button("🗑 删除此计划", key=f"qp_del_{i}"):
                 plans_to_delete.append(i)
@@ -4010,6 +4115,10 @@ def page_history(project: dict) -> None:
     # Pre-load item counts for all batches to avoid N+1 queries
     batch_item_counts = db.get_batch_item_counts(db_client, [b["id"] for b in batches])
 
+    # Day 5: 批次指标快照（性能 / 去重 / 注入），与 batches 一同预加载
+    metrics_rows = db.list_batch_metrics(db_client, project["id"], limit=200)
+    metrics_by_batch = {m.get("batch_id"): m for m in metrics_rows if m.get("batch_id")}
+
     for batch in batches:
         batch_params = batch.get("params") or {}
         if isinstance(batch_params, str):
@@ -4064,6 +4173,79 @@ def page_history(project: dict) -> None:
                     if st.button("🗑️ 删除批次", key=f"del_batch_{batch['id']}"):
                         st.session_state[confirm_key] = True
                         st.rerun()
+
+            # Day 5: 性能 / 去重 / 注入指标（如果该批次曾被新代码记录过）
+            m = metrics_by_batch.get(batch["id"])
+            if m:
+                with st.expander("📊 性能指标"):
+                    phase_ms = m.get("phase_ms") or {}
+                    if isinstance(phase_ms, str):
+                        try:
+                            phase_ms = json.loads(phase_ms)
+                        except Exception:
+                            phase_ms = {}
+                    pcols = st.columns(4)
+                    for col, (k, label) in zip(pcols, [
+                        ("setup", "setup"),
+                        ("llm", "llm"),
+                        ("db_save", "db_save"),
+                        ("embedding", "embedding"),
+                    ]):
+                        with col:
+                            st.metric(label, f"{(phase_ms.get(k) or 0) / 1000:.1f} s")
+
+                    counters = m.get("counters") or {}
+                    if isinstance(counters, str):
+                        try:
+                            counters = json.loads(counters)
+                        except Exception:
+                            counters = {}
+                    counter_keys = [
+                        ("dedup_text_hits", "文本去重"),
+                        ("dedup_semantic_hits", "语义去重"),
+                        ("regen_attempts", "重生"),
+                        ("regen_success", "重生成功"),
+                        ("hard_rule_violations", "硬规则违反"),
+                        ("embedding_missing", "缺向量"),
+                    ]
+                    ccols = st.columns(len(counter_keys))
+                    for col, (k, label) in zip(ccols, counter_keys):
+                        with col:
+                            st.metric(label, counters.get(k, 0))
+
+                    injection = m.get("injection") or {}
+                    if isinstance(injection, str):
+                        try:
+                            injection = json.loads(injection)
+                        except Exception:
+                            injection = {}
+                    meta = m.get("meta") or {}
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except Exception:
+                            meta = {}
+                    if injection or meta:
+                        badges = []
+                        hard_n = injection.get("hard_global", 0) + injection.get("hard_project", 0)
+                        soft_n = injection.get("soft_global", 0) + injection.get("soft_project", 0)
+                        if hard_n or soft_n or injection.get("session"):
+                            badges.append(
+                                f"注入：硬 {hard_n} / 软 {soft_n} / 会话 {injection.get('session', 0)}"
+                            )
+                        if injection.get("calibration_chars"):
+                            badges.append(f"调校 {injection['calibration_chars']} 字")
+                        filtered = injection.get("filtered") or []
+                        if filtered:
+                            badges.append(f"过滤 {len(filtered)} 条")
+                        thr = meta.get("dedup_threshold")
+                        if thr is not None:
+                            badges.append(f"阈值 {float(thr):.2f}")
+                        dmode = meta.get("dedup_mode")
+                        if dmode and dmode != "vector":
+                            badges.append(f"去重 {dmode}")
+                        if badges:
+                            st.caption(" · ".join(badges))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

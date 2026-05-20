@@ -264,6 +264,26 @@ DROP POLICY IF EXISTS memories_owner ON memories;
 CREATE POLICY memories_owner ON memories
     USING (user_id = auth.uid());
 
+-- 2026-05 Day 5: 批次指标持久化（phase_ms / counters / injection summary）
+-- 历史页查"哪一批慢/重/违规多"，免去每次都翻 stdout 日志。
+CREATE TABLE IF NOT EXISTS batch_metrics (
+    id           UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    batch_id     UUID REFERENCES batches(id) ON DELETE CASCADE,
+    project_id   UUID REFERENCES projects(id) ON DELETE CASCADE,
+    user_id      UUID NOT NULL,
+    phase_ms     JSONB DEFAULT '{}'::jsonb,
+    counters     JSONB DEFAULT '{}'::jsonb,
+    meta         JSONB DEFAULT '{}'::jsonb,
+    injection    JSONB DEFAULT '{}'::jsonb,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE batch_metrics ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS batch_metrics_owner ON batch_metrics;
+CREATE POLICY batch_metrics_owner ON batch_metrics
+    USING (user_id = auth.uid());
+CREATE INDEX IF NOT EXISTS batch_metrics_project_idx
+    ON batch_metrics(project_id, created_at DESC);
+
 -- ── Data API grants ──────────────────────────────────────────────────────
 -- Forward-compat for Supabase's May/Oct 2026 change: new tables in "public"
 -- will no longer be auto-exposed to PostgREST/supabase-js/GraphQL without an
@@ -277,10 +297,10 @@ CREATE POLICY memories_owner ON memories
 -- role`` keeps full access for any admin scripts; ``authenticated`` gets the
 -- standard CRUD set and RLS does the per-user filtering.
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-    projects, batches, items, versions, memories
+    projects, batches, items, versions, memories, batch_metrics
     TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-    projects, batches, items, versions, memories
+    projects, batches, items, versions, memories, batch_metrics
     TO service_role;
 """
 
@@ -1058,6 +1078,61 @@ def list_calibration_audit(
         if before_ts:
             q = q.lt("created_at", before_ts)
         res = q.execute()
+        return res.data or []
+    except Exception:
+        return []
+
+
+def insert_batch_metrics(
+    client: Client,
+    batch_id: str,
+    project_id: str,
+    user_id: str,
+    phase_ms: dict,
+    counters: dict,
+    meta: dict,
+    injection: dict,
+) -> None:
+    """落一条本批次的指标快照到 ``batch_metrics`` 表。
+
+    Day 5：批次完成后调用，让历史页可以离线查"哪一批慢/重/违规多"，
+    不依赖刷 stdout 日志。失败不抛——埋点掉链子不能拖死生成主流程。
+    """
+    if not batch_id:
+        return
+    try:
+        client.table("batch_metrics").insert({
+            "batch_id":   batch_id,
+            "project_id": project_id,
+            "user_id":    user_id,
+            "phase_ms":   phase_ms or {},
+            "counters":   counters or {},
+            "meta":       meta or {},
+            "injection":  injection or {},
+        }).execute()
+    except Exception as exc:
+        telemetry.log_event(
+            "batch_metrics_persist_failed",
+            batch_id=batch_id, error=str(exc)[:200],
+        )
+
+
+@_cache_data(ttl=60, show_spinner=False)
+def list_batch_metrics(
+    _client: Client, project_id: str, limit: int = 50
+) -> list[dict]:
+    """读最近 N 条批次指标。历史页用，60s 缓存避免重复查询。"""
+    if not project_id:
+        return []
+    try:
+        res = (
+            _client.table("batch_metrics")
+            .select("*")
+            .eq("project_id", project_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
         return res.data or []
     except Exception:
         return []
