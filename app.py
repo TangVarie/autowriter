@@ -2188,6 +2188,46 @@ hr {
   padding-bottom: 0.75rem;
   border-bottom: var(--line-thin) solid var(--text-1);
 }
+
+/* Tab-like horizontal radio (replaces st.tabs which loses active state on rerun).
+   Scoped via the radio's label="main_tab" — only this one block gets the
+   tab look, other radios in the app remain normal. */
+div[role="radiogroup"]:has(> label[data-baseweb="radio"]:first-child input[type="radio"][value="✍️ 快速生成"]),
+div[role="radiogroup"]:has(> label[data-baseweb="radio"]:first-child input[type="radio"][value="📋 批次队列"]) {
+  display: flex;
+  gap: 0;
+  border-bottom: var(--line-thin) solid var(--text-2);
+  margin-bottom: 1rem;
+}
+div[role="radiogroup"]:has(input[type="radio"][value^="✍️"]) > label,
+div[role="radiogroup"]:has(input[type="radio"][value^="📋"]) > label {
+  flex: 0 0 auto;
+  padding: 0.55rem 1.25rem;
+  margin: 0 -1px 0 0;
+  cursor: pointer;
+  border: var(--line-thin) solid var(--text-2);
+  border-bottom: none;
+  background: var(--bg);
+  font-weight: 500;
+  font-size: 0.92rem;
+  letter-spacing: 0.02em;
+  transition: background 0.12s;
+}
+div[role="radiogroup"]:has(input[type="radio"][value^="✍️"]) > label:hover,
+div[role="radiogroup"]:has(input[type="radio"][value^="📋"]) > label:hover {
+  background: var(--bg-2);
+}
+div[role="radiogroup"]:has(input[type="radio"][value^="✍️"]) > label:has(input:checked),
+div[role="radiogroup"]:has(input[type="radio"][value^="📋"]) > label:has(input:checked) {
+  background: var(--text-1);
+  color: var(--bg);
+  border-color: var(--text-1);
+}
+/* Hide the actual radio dot, we use background-color for active indication */
+div[role="radiogroup"]:has(input[type="radio"][value^="✍️"]) > label > div:first-child,
+div[role="radiogroup"]:has(input[type="radio"][value^="📋"]) > label > div:first-child {
+  display: none;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -2722,12 +2762,22 @@ def _render_queue_tab_body() -> None:
             f"{'/'.join(e.upper() for e in plan.get('engines', ['claude']))} · "
             f"{plan.get('count', 1)} 篇"
         )
-        if pid_key == _just_added_id:
-            # 刚加的这条强制展开一次；后续 rerun _just_added_id 已 pop，
-            # 走 else 分支不传 expanded，用户的手动状态保留。
-            _expander_ctx = st.expander(expander_label, expanded=True)
-        else:
-            _expander_ctx = st.expander(expander_label)
+        # expander 加 ``key`` 参数（Streamlit 1.43+）让展开状态按 key 持久化。
+        # 这彻底解决"选 Claude 模型后 expander 折叠"问题——之前 selectbox
+        # change → fragment rerun → expander 重新挂载 → client 展开状态丢失。
+        # 老 Streamlit 不支持 key 时 fallback 到没 key 的写法。
+        _exp_key = f"plan_exp_{pid_key}"
+        try:
+            if pid_key == _just_added_id:
+                _expander_ctx = st.expander(expander_label, expanded=True, key=_exp_key)
+            else:
+                _expander_ctx = st.expander(expander_label, key=_exp_key)
+        except TypeError:
+            # Streamlit < 1.43: st.expander 没 key 参数
+            if pid_key == _just_added_id:
+                _expander_ctx = st.expander(expander_label, expanded=True)
+            else:
+                _expander_ctx = st.expander(expander_label)
         with _expander_ctx:
             pc1, pc2 = st.columns(2)
             with pc1:
@@ -3075,11 +3125,23 @@ def page_generate(project: dict) -> None:
             tone              = st.text_input("语气偏好", placeholder="例：活泼口语化、朋友间分享")
             extra_instructions = st.text_area("补充说明", height=80, placeholder="其他要求...")
 
-    # ── Main area: tabs ────────────────────────────────────────────────
-    tab_quick, tab_queue = st.tabs(["✍️  快速生成", "📋  批次队列"])
+    # ── Main area: tab switcher ────────────────────────────────────────
+    # 之前用 ``st.tabs``，但它没有 ``key`` 参数 —— active tab 是 client-side
+    # state，rerun 后（即使 fragment scope）只要 widget tree 长度变化到某个
+    # 阈值（实测加第 3、4 个 plan 时必现）Streamlit 内部就会重置回第一个
+    # tab。换用 radio + session_state key 持久化 active tab，任何 rerun 都
+    # 不会重置；CSS 已经把这个 radio 渲染成 tab 外观。
+    _MAIN_TABS = ["✍️ 快速生成", "📋 批次队列"]
+    _active_main_tab = st.radio(
+        "main_tab",
+        _MAIN_TABS,
+        horizontal=True,
+        key="_main_gen_tab",
+        label_visibility="collapsed",
+    )
 
     # ── TAB 1: Quick generate ──────────────────────────────────────────
-    with tab_quick:
+    if _active_main_tab == _MAIN_TABS[0]:
         st.markdown("<div class='section-label' style='margin-bottom:6px'>参考图片（可选）</div>", unsafe_allow_html=True)
         encoded_images = image_handler.render_image_uploader()
         image_prompt = ""
@@ -3209,7 +3271,7 @@ def page_generate(project: dict) -> None:
                 st.rerun()
 
     # ── TAB 2: Batch Queue ─────────────────────────────────────────────
-    with tab_queue:
+    elif _active_main_tab == _MAIN_TABS[1]:
         _render_queue_tab()
 
 
