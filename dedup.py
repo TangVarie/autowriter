@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-import config
+import clients
 
 
 # Cosine similarity above this between two titles ⇒ same angle (hard repeat).
@@ -39,38 +39,20 @@ EMBEDDING_DIM: int = 768
 EMBEDDING_MODEL: str = "text-embedding-004"
 
 
-try:
-    from google import genai as _google_genai
-    _GOOGLE_AVAILABLE = True
-except Exception:
-    _GOOGLE_AVAILABLE = False
-
-
-_client = None  # lazily built
-
-
 def _get_client():
     """Return a singleton Gemini client for embeddings, or None when the
-    SDK is unavailable / unconfigured."""
-    global _client
-    if _client is not None:
-        return _client
-    if not _GOOGLE_AVAILABLE or not config.GOOGLE_API_KEY:
-        return None
-    kwargs = {"api_key": config.GOOGLE_API_KEY}
-    if getattr(config, "GOOGLE_BASE_URL", ""):
-        kwargs["http_options"] = {"base_url": config.GOOGLE_BASE_URL}
-    try:
-        _client = _google_genai.Client(**kwargs)
-    except Exception:
-        _client = None
-    return _client
+    SDK is unavailable / unconfigured.
+
+    转发到 ``clients.get_genai_client()`` — 模块级单例在 clients.py 集中维护，
+    避免本模块与 generator.py 各自持一份 _client。
+    """
+    return clients.get_genai_client()
 
 
 def embeddings_available() -> bool:
     """True if we can currently produce embeddings — used by callers that
     need to choose between the embedding path and the legacy text path."""
-    return _get_client() is not None
+    return clients.genai_available()
 
 
 def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:

@@ -305,6 +305,41 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     projects, batches, items, versions, memories, batch_metrics
     TO service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 服务端聚合 RPC：batch_item_counts
+--
+-- 历史上 ``get_batch_item_counts`` 走 PostgREST 的 ``select("batch_id, status")
+-- .in_("batch_id", batch_ids)``，把全部行拉到 client 在 Python 里 GROUP BY。
+-- N 个 batch × 平均 5 个 item = 5N 行 payload；进入历史页时每次 rerun 都拉一
+-- 次，浪费明显。改走 RPC 让 PG 服务端做 GROUP BY，只回 N 行聚合结果。
+--
+-- SECURITY INVOKER（默认）：函数以调用者身份执行，RLS 自动按 user_id 过滤；
+-- 不需要在 SQL 里显式写 ``WHERE user_id = auth.uid()``。
+-- ``STABLE``：同一事务内多次调用同参返回相同结果，PG 优化器可以缓存。
+CREATE OR REPLACE FUNCTION batch_item_counts(batch_ids UUID[])
+RETURNS TABLE(
+    batch_id        UUID,
+    total           BIGINT,
+    approved        BIGINT,
+    pending         BIGINT,
+    needs_revision  BIGINT
+)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+AS $$
+    SELECT
+        i.batch_id,
+        COUNT(*)                                                AS total,
+        COUNT(*) FILTER (WHERE i.status = 'approved')           AS approved,
+        COUNT(*) FILTER (WHERE i.status = 'pending')            AS pending,
+        COUNT(*) FILTER (WHERE i.status = 'needs_revision')     AS needs_revision
+    FROM items i
+    WHERE i.batch_id = ANY(batch_ids)
+    GROUP BY i.batch_id;
+$$;
+GRANT EXECUTE ON FUNCTION batch_item_counts(UUID[]) TO authenticated, service_role;
 """
 
 
@@ -810,25 +845,69 @@ def get_batch_item_counts(client: Client, batch_ids: list[str]) -> dict:
     """
     Fetch item counts by status for multiple batches in a single query.
     Returns {batch_id: {"total": N, "approved": N, "pending": N, "needs_revision": N}}
+
+    优先走 PG RPC ``batch_item_counts``（服务端 GROUP BY，只回 N 行聚合结果）；
+    RPC 不存在（老部署没跑新迁移）或网络错误时 fallback 到 client-side 聚合，
+    保证可用性不退化。
     """
     if not batch_ids:
         return {}
-    res = (
-        client.table("items")
-        .select("batch_id, status")
-        .in_("batch_id", batch_ids)
-        .execute()
-    )
-    counts: dict[str, dict] = {}
-    for row in (res.data or []):
-        bid = row["batch_id"]
-        if bid not in counts:
-            counts[bid] = {"total": 0, "approved": 0, "pending": 0, "needs_revision": 0}
-        counts[bid]["total"] += 1
-        status = row.get("status", "pending")
-        if status in counts[bid]:
-            counts[bid][status] += 1
-    return counts
+    # 路径 A：RPC 服务端聚合
+    try:
+        res = client.rpc(
+            "batch_item_counts", {"batch_ids": batch_ids}
+        ).execute()
+        rows = res.data or []
+        if rows:
+            counts: dict[str, dict] = {}
+            for row in rows:
+                bid = row.get("batch_id")
+                if not bid:
+                    continue
+                counts[bid] = {
+                    "total":          int(row.get("total") or 0),
+                    "approved":       int(row.get("approved") or 0),
+                    "pending":        int(row.get("pending") or 0),
+                    "needs_revision": int(row.get("needs_revision") or 0),
+                }
+            # 即使某些 batch_id 在 items 里完全没行（边界情况），RPC 也不会回
+            # 那一行；用 0 填回去保持 caller 看到的语义不变。
+            for bid in batch_ids:
+                counts.setdefault(bid, {
+                    "total": 0, "approved": 0,
+                    "pending": 0, "needs_revision": 0,
+                })
+            return counts
+        # rows 为空也是合法结果（所有 batch 都没 item），直接返回 0-填充
+        return {
+            bid: {"total": 0, "approved": 0, "pending": 0, "needs_revision": 0}
+            for bid in batch_ids
+        }
+    except Exception as exc:
+        # 路径 B：fallback —— 老部署 / RPC 函数不存在 / 网络错误
+        msg = str(exc)
+        telemetry.log_event(
+            "batch_item_counts_rpc_fallback", error=msg[:200],
+        )
+        try:
+            res = (
+                client.table("items")
+                .select("batch_id, status")
+                .in_("batch_id", batch_ids)
+                .execute()
+            )
+        except Exception:
+            return {}
+        counts = {}
+        for row in (res.data or []):
+            bid = row["batch_id"]
+            if bid not in counts:
+                counts[bid] = {"total": 0, "approved": 0, "pending": 0, "needs_revision": 0}
+            counts[bid]["total"] += 1
+            status = row.get("status", "pending")
+            if status in counts[bid]:
+                counts[bid][status] += 1
+        return counts
 
 
 def get_recent_titles_and_openings(

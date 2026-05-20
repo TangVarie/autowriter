@@ -19,6 +19,7 @@ import streamlit as st
 from supabase import Client
 
 import config
+import clients
 import db
 import telemetry
 
@@ -26,11 +27,13 @@ import telemetry
 def _make_anthropic_client() -> anthropic.Anthropic:
     """One consistent Anthropic client factory — always honours
     ANTHROPIC_BASE_URL so backend utility calls route through the same proxy
-    as generation calls."""
-    client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
-    if config.ANTHROPIC_BASE_URL:
-        client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
-    return anthropic.Anthropic(**client_kwargs)
+    as generation calls.
+
+    现在转发到 ``clients.get_anthropic_client()`` 拿到 process-global 单例：
+    之前 6 个调用点每次都新建 anthropic.Anthropic(...) 重建 httpx 连接池，
+    多角色并行 + 队列模式下浪费明显。函数签名保留兼容老代码。
+    """
+    return clients.get_anthropic_client()
 
 
 # ── Prompt assembly ────────────────────────────────────────────────────────

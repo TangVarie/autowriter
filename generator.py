@@ -26,6 +26,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import anthropic
+import clients
 import config
 import telemetry
 
@@ -118,36 +119,19 @@ def _make_user_prompt(
 
 
 # ── Anthropic retry helper ─────────────────────────────────────────────────
+# 历史上这里是一份独立的 retry 实现。已抽到 ``clients.with_anthropic_retry``
+# 作为通用 retry middleware 的特化版本。本函数保留为 thin wrapper 维持调用
+# 点的签名兼容（外部模块如 memory.py 也直接 import 这个名字）。
 
 def _call_with_retry(call_fn, max_retries: int = 5):
-    """
-    Call an Anthropic API callable with exponential backoff.
+    """Call an Anthropic API callable with exponential backoff.
 
     Retries on:
       - RateLimitError (429)
       - APIStatusError with transient codes: 429, 502, 503, 529
       - APIConnectionError / APITimeoutError (connection dropped, nginx 502)
     """
-    delay = 2
-    last_error: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            return call_fn()
-        except anthropic.RateLimitError as e:
-            last_error = e
-        except anthropic.APIStatusError as e:
-            if e.status_code in (429, 502, 503, 529):
-                last_error = e
-                if e.status_code == 429:
-                    delay = max(delay, 5)
-            else:
-                raise
-        except anthropic.APIConnectionError as e:
-            last_error = e
-        if attempt < max_retries:
-            time.sleep(delay)
-            delay = min(delay * 2, 60)
-    raise last_error  # type: ignore[misc]
+    return clients.with_anthropic_retry(call_fn, max_retries=max_retries)
 
 
 # ── JSON parsing helper ────────────────────────────────────────────────────
@@ -494,10 +478,9 @@ class ClaudeEngine:
     def __init__(self) -> None:
         if not config.ANTHROPIC_API_KEY:
             raise RuntimeError("ANTHROPIC_API_KEY 未配置")
-        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
-        if config.ANTHROPIC_BASE_URL:
-            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
-        self._client = anthropic.Anthropic(**client_kwargs)
+        # 复用 process-global 单例。之前每个 ClaudeEngine 实例都新建一个
+        # Anthropic client（重建 httpx 连接池），多角色并行时一批就 new 多个。
+        self._client = clients.get_anthropic_client()
 
     def _build_content(
         self, text: str, images: Optional[list[dict]] = None
@@ -629,10 +612,12 @@ class GeminiEngine:
             raise RuntimeError("google-genai 未安装，请运行 pip install google-genai")
         if not config.GOOGLE_API_KEY:
             raise RuntimeError("GOOGLE_API_KEY 未配置")
-        client_kwargs: dict = {"api_key": config.GOOGLE_API_KEY}
-        if config.GOOGLE_BASE_URL:
-            client_kwargs["http_options"] = {"base_url": config.GOOGLE_BASE_URL}
-        self._client = google_genai.Client(**client_kwargs)
+        # 复用 process-global 单例（clients.get_genai_client 已处理 base_url）。
+        self._client = clients.get_genai_client()
+        if self._client is None:
+            # 防御性：clients 层因任何原因返回 None 时也别让 attribute access
+            # 满天炸。理论上 GOOGLE_API_KEY 已存在不会到这里。
+            raise RuntimeError("google-genai client 初始化失败")
 
     def _build_parts(
         self, text: str, images: Optional[list[dict]] = None
@@ -1193,10 +1178,7 @@ def _apply_compliance_recheck(slots: list[dict], system_prompt: str) -> None:
     )
 
     try:
-        client_kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
-        if config.ANTHROPIC_BASE_URL:
-            client_kwargs["base_url"] = config.ANTHROPIC_BASE_URL
-        client = anthropic.Anthropic(**client_kwargs)
+        client = clients.get_anthropic_client()
         resp = _call_with_retry(lambda: client.messages.create(
             model=config.CLAUDE_MODEL,
             max_tokens=800,
@@ -1334,10 +1316,7 @@ def _select_best_drafts_batch(
 
     user_content = f"创作任务简报：\n{brief}\n\n" + "\n\n".join(slot_blocks)
 
-    _ck: dict = {"api_key": config.ANTHROPIC_API_KEY}
-    if config.ANTHROPIC_BASE_URL:
-        _ck["base_url"] = config.ANTHROPIC_BASE_URL
-    client = anthropic.Anthropic(**_ck)
+    client = clients.get_anthropic_client()
     resp = client.messages.create(
         model=config.CLAUDE_MODEL,
         max_tokens=512,
@@ -1406,10 +1385,7 @@ def _refine_drafts_batch(
             f"关键词：{json.dumps(draft.keywords or [], ensure_ascii=False)}"
         )
         try:
-            _ck: dict = {"api_key": config.ANTHROPIC_API_KEY}
-            if config.ANTHROPIC_BASE_URL:
-                _ck["base_url"] = config.ANTHROPIC_BASE_URL
-            client = anthropic.Anthropic(**_ck)
+            client = clients.get_anthropic_client()
             resp = client.messages.create(
                 model=model or config.CLAUDE_MODEL,
                 max_tokens=2048,
