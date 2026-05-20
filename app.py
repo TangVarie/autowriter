@@ -1224,10 +1224,24 @@ else:
     _render_running_snapshot = _running_snapshot_body
 
 
+def _qg_key(project_id: Optional[str] = None) -> str:
+    """``quick_gen_state`` 的 session_state 键。按项目隔离，避免在项目 A 跑生成
+    后切到项目 B，B 的「生成」tab 顶部还在显示 A 的「✅ 生成完成」横幅，把 A
+    的 batch_id 误塞给 B 的「前往审核」按钮。"""
+    pid = project_id or st.session_state.get("current_project_id", "")
+    return f"quick_gen_state_{pid}" if pid else "quick_gen_state"
+
+
+def _rb_key(project_id: Optional[str] = None) -> str:
+    """``review_batch_id`` 的 session_state 键，同样按项目隔离。"""
+    pid = project_id or st.session_state.get("current_project_id", "")
+    return f"review_batch_id_{pid}" if pid else "review_batch_id"
+
+
 def _quick_gen_snapshot_body() -> None:
     """Live progress for the quick-generate path, mirrors _running_snapshot_body
-    but reads from the separate ``quick_gen_state`` key."""
-    qgs = st.session_state.get("quick_gen_state")
+    but reads from the per-project ``quick_gen_state_<pid>`` key."""
+    qgs = st.session_state.get(_qg_key())
     if not qgs or not qgs.get("running"):
         return
     pct = qgs.get("progress", 0.0)
@@ -3206,7 +3220,10 @@ def page_generate(project: dict) -> None:
         if context_parts:
             st.info("已载入上下文：" + " · ".join(context_parts))
 
-        qgs        = st.session_state.get("quick_gen_state")
+        # 按项目隔离 quick_gen_state — 跨项目切换不会串数据
+        qg_key     = _qg_key(project["id"])
+        rb_key     = _rb_key(project["id"])
+        qgs        = st.session_state.get(qg_key)
         qg_running = bool(qgs and qgs.get("running"))
         qg_done    = bool(qgs and qgs.get("done"))
         qg_phase   = (qgs or {}).get("phase", "idle")
@@ -3245,7 +3262,7 @@ def page_generate(project: dict) -> None:
                         )
             bid = qgs.get("batch_id")
             if bid:
-                st.session_state["review_batch_id"] = bid
+                st.session_state[rb_key] = bid
                 go_col, regen_col = st.columns(2)
                 with go_col:
                     if st.button("👉 前往审核页", type="primary", use_container_width=True):
@@ -3253,11 +3270,11 @@ def page_generate(project: dict) -> None:
                         st.rerun()
                 with regen_col:
                     if st.button("🔄 再次生成", use_container_width=True):
-                        st.session_state.pop("quick_gen_state", None)
+                        st.session_state.pop(qg_key, None)
                         st.rerun()
             else:
                 if st.button("🔄 再次生成", use_container_width=True):
-                    st.session_state.pop("quick_gen_state", None)
+                    st.session_state.pop(qg_key, None)
                     st.rerun()
         else:
             if st.button(
@@ -3294,7 +3311,7 @@ def page_generate(project: dict) -> None:
                     "phase": "starting",
                     "_lock": threading.Lock(),
                 }
-                st.session_state["quick_gen_state"] = qg_status
+                st.session_state[qg_key] = qg_status
                 threading.Thread(
                     target=_quick_gen_worker,
                     args=(qg_plan, user_id, db_client, qg_status),
@@ -3336,7 +3353,9 @@ def page_review(project: dict) -> None:
         for b in batches
     }
     default_key = None
-    stored_bid = st.session_state.get("review_batch_id")
+    # 按项目读 review_batch_id；老的全局 key 同时检查一遍以兼容迁移前的存量
+    stored_bid = st.session_state.get(_rb_key(project["id"])) \
+        or st.session_state.get("review_batch_id")
     for k, v in batch_options.items():
         if v == stored_bid:
             default_key = k
@@ -3478,12 +3497,14 @@ def page_review(project: dict) -> None:
                 except Exception as exc:
                     st.error(f"保存失败：{exc}。预览内容保留，可重试。")
                 else:
-                    del st.session_state[calib_key]
+                    # .pop 而不是 del：fragment + 并发 rerun 下 calib_key 可能已被
+                    # 别的 path 清掉，del 会 KeyError 让按钮看起来"点了报错"。
+                    st.session_state.pop(calib_key, None)
                     st.success("调教笔记已保存，下次生成时生效。")
                     st.rerun()
         with discard_col:
             if st.button("✕ 放弃", key=f"discard_calib_{batch_id}", use_container_width=True):
-                del st.session_state[calib_key]
+                st.session_state.pop(calib_key, None)
                 st.rerun()
 
 
@@ -4330,7 +4351,7 @@ def page_export(project: dict) -> None:
             )
         with clr_col:
             if st.button("清除", key="exp_clear", use_container_width=True):
-                del st.session_state["export_center_result"]
+                st.session_state.pop("export_center_result", None)
                 st.rerun()
 
     # Map batch_id → items for fast lookup (already loaded above)
@@ -4465,7 +4486,7 @@ def _page_history_body_impl(project: dict) -> None:
                         # 跳转审核页需要 app-scope rerun（让 sidebar radio 重渲染
                         # 并切到审核页）。fragment-only rerun 不会触发 sidebar，
                         # 用户会看到 _force_page 被 set 但页面不切。
-                        st.session_state["review_batch_id"] = batch["id"]
+                        st.session_state[_rb_key(project["id"])] = batch["id"]
                         st.session_state["_force_page"] = "审核与迭代"
                         _rerun_app()
             with del_col:

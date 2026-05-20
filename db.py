@@ -11,8 +11,10 @@ Tables:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import threading
 from typing import Any, Optional
 from datetime import datetime, timezone
 
@@ -1136,6 +1138,26 @@ def _invalidate_memory_caches() -> None:
             pass
 
 
+# 进程内 per-content 锁：AI 合并器并发分类反馈时，多个 worker 线程会对同一条
+# 规则 (user_id, scope, content_hash, project_id) 同时调 upsert_memory。原先的
+# select→update 不原子：两边都读到 freq=5 后都写 freq=6，frequency 计数器丢一次
+# 增量；select→insert 同样可双插重复行污染 dedup。schema 上没有 UNIQUE 约束
+# （会和历史脏数据冲突无法添加），所以用 app 层的 keyed lock 兜底单进程部署。
+# 多 worker / 多 instance 场景仍有残余竞态，但 UPDATE 走 CAS 至少能检测出冲突
+# 并重试。
+_MEMORY_UPSERT_LOCKS: dict[str, threading.Lock] = {}
+_MEMORY_UPSERT_LOCKS_GUARD = threading.Lock()
+
+
+def _get_memory_upsert_lock(key: str) -> threading.Lock:
+    with _MEMORY_UPSERT_LOCKS_GUARD:
+        lk = _MEMORY_UPSERT_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _MEMORY_UPSERT_LOCKS[key] = lk
+        return lk
+
+
 def upsert_memory(
     client: Client,
     user_id: str,
@@ -1160,27 +1182,68 @@ def upsert_memory(
     Day 3 新增：``rule_kind`` + ``rule_payload`` 用于结构化硬规则
     （``forbidden_word`` / ``required_phrase`` / ``max_len`` / ``forbidden_regex``）。
     迁移未跑的老部署 insert 失败后会自动 strip 这两列重试，保持向后兼容。
+
+    并发安全（2026-05）：
+      - 进程内 keyed lock 串行化同一 (user, scope, content, project_id) 的并发调用
+      - UPDATE 路径用 CAS（match old frequency），冲突时重读重试最多 3 次
     """
+    lock_key = hashlib.sha256(
+        f"{user_id}|{scope}|{project_id or ''}|{content}".encode("utf-8")
+    ).hexdigest()
+    with _get_memory_upsert_lock(lock_key):
+        return _upsert_memory_locked(
+            client, user_id, scope, content, source_feedback,
+            project_id=project_id,
+            auto_confirm_threshold=auto_confirm_threshold,
+            force_confirmed=force_confirmed,
+            severity=severity,
+            applicability=applicability,
+            rule_kind=rule_kind,
+            rule_payload=rule_payload,
+        )
+
+
+def _upsert_memory_locked(
+    client: Client,
+    user_id: str,
+    scope: str,
+    content: str,
+    source_feedback: str,
+    project_id: Optional[str] = None,
+    auto_confirm_threshold: int = 3,
+    force_confirmed: bool = False,
+    severity: str = "soft",
+    applicability: Optional[str] = None,
+    rule_kind: Optional[str] = None,
+    rule_payload: Optional[dict] = None,
+) -> dict:
     # Try to find an existing memory with the same content
     # scope 隔离很重要：``project_id=None`` 的 global 反馈必须只匹配 project_id IS NULL
     # 的行——之前漏了 IS NULL 过滤，导致 global 反馈会去匹配并 +1 某个项目级同
     # 文本规则的 frequency，scope 边界被打穿。
-    q = (
-        client.table("memories")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("scope", scope)
-        .eq("content", content)
-    )
-    if project_id:
-        q = q.eq("project_id", project_id)
-    else:
-        q = q.is_("project_id", "null")
-    existing = q.execute()
+    def _read_existing() -> Optional[dict]:
+        q = (
+            client.table("memories")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("scope", scope)
+            .eq("content", content)
+        )
+        if project_id:
+            q = q.eq("project_id", project_id)
+        else:
+            q = q.is_("project_id", "null")
+        rows = q.execute().data or []
+        return rows[0] if rows else None
 
-    if existing.data:
-        row = existing.data[0]
-        new_freq = row["frequency"] + 1
+    # CAS UPDATE 循环：每轮读最新 frequency，写时用 .eq("frequency", old) 兜底。
+    # 0 行受影响 → 别的并发已经改了这一行，重读重试。
+    for attempt in range(3):
+        row = _read_existing()
+        if row is None:
+            break  # 转入下方 INSERT 路径
+        old_freq = row["frequency"]
+        new_freq = old_freq + 1
         if force_confirmed or new_freq >= auto_confirm_threshold:
             new_status = "confirmed"
         else:
@@ -1189,77 +1252,108 @@ def upsert_memory(
             client.table("memories")
             .update({"frequency": new_freq, "status": new_status})
             .eq("id", row["id"])
+            .eq("frequency", old_freq)  # CAS：仅当 frequency 未变时才写
             .execute()
         )
-        _invalidate_memory_caches()
-        return res.data[0]
+        if res.data:
+            _invalidate_memory_caches()
+            return res.data[0]
+        # 冲突：别的 worker 抢先改了 frequency，下一轮重读
+        telemetry.log_event(
+            "upsert_memory_cas_retry",
+            attempt=attempt + 1, scope=scope,
+            content_preview=content[:60],
+        )
     else:
-        data: dict[str, Any] = {
-            "scope": scope,
-            "content": content,
-            "source_feedback": source_feedback,
-            "user_id": user_id,
-            "frequency": 1,
-            "status": "confirmed" if force_confirmed else "candidate",
-        }
-        if project_id:
-            data["project_id"] = project_id
-        # Severity / applicability are new columns added by the additive
-        # migration block in CREATE_TABLES_SQL.  Try with them first; if the
-        # column doesn't exist yet (older deployment), retry without so the
-        # write still succeeds and the row degrades to "soft / global".
-        if severity and severity.lower() in ("hard", "soft"):
-            data["severity"] = severity.lower()
-        if applicability:
-            data["applicability"] = applicability[:32]
-        if rule_kind and rule_kind in (
-            "forbidden_word", "required_phrase", "max_len",
-            "forbidden_regex", "free_text",
-        ):
-            data["rule_kind"] = rule_kind
-        if rule_payload is not None:
-            data["rule_payload"] = rule_payload
-
-        # Compute the embedding once at write time so the relevance ranker
-        # can use it without paying an API call per generation.  Only soft
-        # rules are filtered; hard rules always inject, but we still embed
-        # so the data is uniform.  Embedding failure is non-fatal.
-        try:
-            import dedup as _dedup
-            if _dedup.embeddings_available():
-                vecs = _dedup.embed_texts([content])
-                if vecs and vecs[0]:
-                    data["embedding"] = vecs[0]
-        except Exception as exc:
-            # 之前 silent pass。本路径非致命（规则没向量也能注入），但持续
-            # 失败会导致 soft-rule 相关性筛选完全降级为"全部注入"——用户
-            # 看到 system_prompt 暴涨却不知所以。埋一行让运维能查。
-            telemetry.log_event(
-                "memory_embedding_compute_failed",
-                content_preview=content[:60],
-                error=str(exc)[:200],
+        # 3 次 CAS 都冲突，best-effort 强写一次避免完全失败
+        telemetry.log_event(
+            "upsert_memory_cas_exhausted",
+            scope=scope, content_preview=content[:60],
+        )
+        latest = _read_existing()
+        if latest is not None:
+            new_freq = latest["frequency"] + 1
+            new_status = (
+                "confirmed" if force_confirmed or new_freq >= auto_confirm_threshold
+                else latest["status"]
             )
-
-        try:
-            res = client.table("memories").insert(data).execute()
-        except Exception as exc:
-            # 仅在错误明确指向"新列缺失"（未跑迁移）时才剥列重试；其它错误
-            # 抛回去让调用方/UI 看见。之前裸 except 会把 RLS 拒绝、唯一冲突、
-            # 网络中断都当成"老部署"，导致 rule_kind / rule_payload 静默丢失。
-            msg = str(exc)
-            new_cols = ("severity", "applicability", "embedding",
-                        "rule_kind", "rule_payload")
-            if not any(col in msg for col in new_cols):
-                raise
-            telemetry.log_event(
-                "upsert_memory_schema_fallback",
-                error=msg[:200],
+            res = (
+                client.table("memories")
+                .update({"frequency": new_freq, "status": new_status})
+                .eq("id", latest["id"])
+                .execute()
             )
-            for col in new_cols:
-                data.pop(col, None)
-            res = client.table("memories").insert(data).execute()
-        _invalidate_memory_caches()
-        return res.data[0]
+            _invalidate_memory_caches()
+            return res.data[0] if res.data else latest
+        # 兜底落空（不该发生），继续走 INSERT
+
+    # INSERT 路径：row 为 None，需要创建新规则
+    data: dict[str, Any] = {
+        "scope": scope,
+        "content": content,
+        "source_feedback": source_feedback,
+        "user_id": user_id,
+        "frequency": 1,
+        "status": "confirmed" if force_confirmed else "candidate",
+    }
+    if project_id:
+        data["project_id"] = project_id
+    # Severity / applicability are new columns added by the additive
+    # migration block in CREATE_TABLES_SQL.  Try with them first; if the
+    # column doesn't exist yet (older deployment), retry without so the
+    # write still succeeds and the row degrades to "soft / global".
+    if severity and severity.lower() in ("hard", "soft"):
+        data["severity"] = severity.lower()
+    if applicability:
+        data["applicability"] = applicability[:32]
+    if rule_kind and rule_kind in (
+        "forbidden_word", "required_phrase", "max_len",
+        "forbidden_regex", "free_text",
+    ):
+        data["rule_kind"] = rule_kind
+    if rule_payload is not None:
+        data["rule_payload"] = rule_payload
+
+    # Compute the embedding once at write time so the relevance ranker
+    # can use it without paying an API call per generation.  Only soft
+    # rules are filtered; hard rules always inject, but we still embed
+    # so the data is uniform.  Embedding failure is non-fatal.
+    try:
+        import dedup as _dedup
+        if _dedup.embeddings_available():
+            vecs = _dedup.embed_texts([content])
+            if vecs and vecs[0]:
+                data["embedding"] = vecs[0]
+    except Exception as exc:
+        # 之前 silent pass。本路径非致命（规则没向量也能注入），但持续
+        # 失败会导致 soft-rule 相关性筛选完全降级为"全部注入"——用户
+        # 看到 system_prompt 暴涨却不知所以。埋一行让运维能查。
+        telemetry.log_event(
+            "memory_embedding_compute_failed",
+            content_preview=content[:60],
+            error=str(exc)[:200],
+        )
+
+    try:
+        res = client.table("memories").insert(data).execute()
+    except Exception as exc:
+        # 仅在错误明确指向"新列缺失"（未跑迁移）时才剥列重试；其它错误
+        # 抛回去让调用方/UI 看见。之前裸 except 会把 RLS 拒绝、唯一冲突、
+        # 网络中断都当成"老部署"，导致 rule_kind / rule_payload 静默丢失。
+        msg = str(exc)
+        new_cols = ("severity", "applicability", "embedding",
+                    "rule_kind", "rule_payload")
+        if not any(col in msg for col in new_cols):
+            raise
+        telemetry.log_event(
+            "upsert_memory_schema_fallback",
+            error=msg[:200],
+        )
+        for col in new_cols:
+            data.pop(col, None)
+        res = client.table("memories").insert(data).execute()
+    _invalidate_memory_caches()
+    return res.data[0]
 
 
 def insert_calibration_audit(

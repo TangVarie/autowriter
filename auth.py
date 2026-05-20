@@ -174,6 +174,15 @@ def sign_out() -> None:
     _clear_refresh_cookie(cm)
     for key in ("supabase_session", "current_user", "access_token", "current_project_id"):
         st.session_state.pop(key, None)
+    # 清掉本会话所有按项目隔离的状态 — quick_gen_state_<pid> / review_batch_id_<pid>
+    # 以及历史上的全局 key，避免下一个登录的用户看到前一个用户的"生成完成"横幅
+    # 或被预选错批次。snapshot keys() 防止 dict mutation during iteration。
+    for key in [k for k in list(st.session_state.keys())
+                if k.startswith("quick_gen_state")
+                or k.startswith("review_batch_id")
+                or k.startswith("pending_calibration_")
+                or k.startswith("taizi_")]:
+        st.session_state.pop(key, None)
     # Drop every cached read so the next signed-in user sees their own rows
     # rather than the previous user's snapshot.
     for fn in (

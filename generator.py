@@ -690,10 +690,15 @@ class GeminiEngine:
         gen_config = self._make_generate_config(use_thinking, model, count)
         gen_config.system_instruction = system_prompt
         try:
-            response = self._client.models.generate_content(
-                model=model,
-                contents=self._build_parts(user_prompt, images),
-                config=gen_config,
+            # ``with_gemini_retry`` 覆盖 429 / 5xx / timeout / connection 抖动，
+            # 4 次指数退避。和 Claude 路径保持对称——之前 Gemini 裸调一次失败
+            # 就把整槽位置空，用户看到「Gemini API错误」红条。
+            response = clients.with_gemini_retry(
+                lambda: self._client.models.generate_content(
+                    model=model,
+                    contents=self._build_parts(user_prompt, images),
+                    config=gen_config,
+                ),
             )
             text = response.text or ""
             usage = getattr(response, "usage_metadata", None)
@@ -768,10 +773,12 @@ class GeminiEngine:
                 for img in (images or [])
             ] + [genai_types.Part.from_text(text=last_text)]
 
-            response = self._client.models.generate_content(
-                model=model,
-                contents=history + [genai_types.Content(role="user", parts=last_parts)],
-                config=gen_config,
+            response = clients.with_gemini_retry(
+                lambda: self._client.models.generate_content(
+                    model=model,
+                    contents=history + [genai_types.Content(role="user", parts=last_parts)],
+                    config=gen_config,
+                ),
             )
             return self._parse_gemini_response(response, model)
         except Exception as e:

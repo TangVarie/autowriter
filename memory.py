@@ -639,29 +639,56 @@ def _append_new_observations(
     line.
 
     ``source`` 透传给 ``save_calibration_notes`` 给审计表用。
+
+    并发安全（2026-05）：read → merge → write 是 lost-update 高发路径。
+    多 worker 同时迭代不同 item 会同时跑到这里，原先用一份过期 snapshot 作为
+    基线 → 后写的覆盖先写的，观察行静默丢。这里用 CAS 重试：每轮重读最新文本，
+    把 new_lines 合到最新基线，仅当文本未被并发改动时才写。冲突 → 重试。
     """
     if not new_lines:
         return None
-    try:
-        proj = db.get_project(db_client, project_id)
-    except Exception as exc:
-        telemetry.log_event(
-            "calibration_update_read_failed",
-            project_id=project_id, source=source, error=str(exc)[:200],
-        )
-        return None
-    if not proj:
-        return None
-    merged = _merge_new_observations(proj.get("calibration_notes") or "", new_lines)
-    if not merged or merged == (proj.get("calibration_notes") or "").rstrip():
-        return None
-    try:
-        return save_calibration_notes(db_client, project_id, merged, source=source)
-    except Exception:
-        # save_calibration_notes has already logged the error;
-        # this caller is the iteration/incremental background path so we
-        # swallow here to avoid blowing up the queue worker.
-        return None
+    for attempt in range(3):
+        try:
+            proj = db.get_project(db_client, project_id)
+        except Exception as exc:
+            telemetry.log_event(
+                "calibration_update_read_failed",
+                project_id=project_id, source=source, error=str(exc)[:200],
+            )
+            return None
+        if not proj:
+            return None
+        before_text = proj.get("calibration_notes") or ""
+        merged = _merge_new_observations(before_text, new_lines)
+        if not merged or merged == before_text.rstrip():
+            return None
+        try:
+            saved = save_calibration_notes(
+                db_client, project_id, merged,
+                source=source,
+                expected_before_text=before_text,
+            )
+        except _CalibrationCASConflict:
+            telemetry.log_event(
+                "calibration_cas_retry",
+                project_id=project_id, source=source, attempt=attempt + 1,
+            )
+            continue
+        except Exception:
+            # save_calibration_notes 已经埋点；后台增量路径不向上抛
+            return None
+        return saved
+    telemetry.log_event(
+        "calibration_cas_exhausted",
+        project_id=project_id, source=source,
+    )
+    return None
+
+
+class _CalibrationCASConflict(Exception):
+    """Raised by ``save_calibration_notes`` when ``expected_before_text`` doesn't
+    match the row's current ``calibration_notes`` — signal for callers to
+    re-read and retry the merge."""
 
 
 def save_calibration_notes(
@@ -669,6 +696,7 @@ def save_calibration_notes(
     project_id: str,
     notes: str,
     source: str = "unknown",
+    expected_before_text: Optional[str] = None,
 ) -> str:
     """
     Single choke point for writing ``projects.calibration_notes``.  Runs
@@ -688,6 +716,12 @@ def save_calibration_notes(
     数据完整性原则（2026-05 Day 1）：``update_project`` 失败属于数据丢失
     点，会向上抛；本函数的所有上层调用都被包在 try/except + UI 告警里，
     不再有"看似成功实际失败"的状态。
+
+    并发安全（2026-05）：``expected_before_text`` 给读-合-写的调用方一个 CAS
+    witness。传入时，本函数用 ``.eq("calibration_notes", expected_before_text)``
+    限定更新条件；并发改动后 0 行受影响 → 抛 ``_CalibrationCASConflict`` 让
+    调用方重读重试。不传则走传统覆盖写（用户手动编辑保存场景，意图明确为
+    "我想要这份文本"）。
     """
     dropped: list[str] = []
     deduped = _dedup_calibration_lines(notes or "", dropped_sink=dropped)
@@ -706,7 +740,23 @@ def save_calibration_notes(
         )
 
     try:
-        db.update_project(db_client, project_id, {"calibration_notes": deduped})
+        if expected_before_text is not None:
+            # CAS 路径：直接走 supabase client 加 .eq 约束，绕过 update_project
+            # 的 schema-fallback（calibration_notes 是稳定列，不在 fallback 名单）
+            res = (
+                db_client.table("projects")
+                .update({"calibration_notes": deduped})
+                .eq("id", project_id)
+                .eq("calibration_notes", expected_before_text)
+                .execute()
+            )
+            if not res.data:
+                # 0 行受影响：并发已经改了 calibration_notes
+                raise _CalibrationCASConflict()
+        else:
+            db.update_project(db_client, project_id, {"calibration_notes": deduped})
+    except _CalibrationCASConflict:
+        raise
     except Exception as exc:
         telemetry.log_event(
             "calibration_save_error",
@@ -753,30 +803,47 @@ def _append_taste_to_calibration(
     走的是同一个 ``save_calibration_notes`` 入口，因此自动享受 _line_key 全文去重、
     ``_dedup_calibration_lines`` 的软上限（4000 字，约 30-50 条）、以及
     审计表写入。``source="merger_taste"`` 标记来自分类器的 taste 路径。
-    """
-    try:
-        proj = db.get_project(db_client, project_id)
-    except Exception as exc:
-        telemetry.log_event(
-            "calibration_taste_read_failed",
-            project_id=project_id, error=str(exc)[:200],
-        )
-        return
-    if not proj:
-        return
 
-    existing = (proj.get("calibration_notes") or "").rstrip()
+    并发：和 ``_append_new_observations`` 一样走 CAS 重试，避免和 iteration 路径
+    互相覆盖。
+    """
     line = observation.lstrip("-•· ").strip()
     if not line:
         return
-
-    merged = (existing + "\n- " + line) if existing else f"- {line}"
-    try:
-        save_calibration_notes(db_client, project_id, merged, source="merger_taste")
-    except Exception:
-        # save_calibration_notes already logged; this is a best-effort taste
-        # append called from the feedback classifier, don't block the caller.
-        pass
+    for attempt in range(3):
+        try:
+            proj = db.get_project(db_client, project_id)
+        except Exception as exc:
+            telemetry.log_event(
+                "calibration_taste_read_failed",
+                project_id=project_id, error=str(exc)[:200],
+            )
+            return
+        if not proj:
+            return
+        before_text = proj.get("calibration_notes") or ""
+        existing = before_text.rstrip()
+        merged = (existing + "\n- " + line) if existing else f"- {line}"
+        try:
+            save_calibration_notes(
+                db_client, project_id, merged,
+                source="merger_taste",
+                expected_before_text=before_text,
+            )
+            return
+        except _CalibrationCASConflict:
+            telemetry.log_event(
+                "calibration_cas_retry",
+                project_id=project_id, source="merger_taste", attempt=attempt + 1,
+            )
+            continue
+        except Exception:
+            # save_calibration_notes 已经埋点；taste append 是 best-effort
+            return
+    telemetry.log_event(
+        "calibration_cas_exhausted",
+        project_id=project_id, source="merger_taste",
+    )
 
 
 # ── AI-based feedback classification ──────────────────────────────────────
@@ -1526,30 +1593,50 @@ def _render_bottom_tools(
         with col_import:
             uploaded = st.file_uploader("上传 JSON 文件", type=["json"], key="mem_import")
             if uploaded and st.button("📥 开始导入", use_container_width=True):
-                try:
-                    import_data = json.loads(uploaded.read().decode("utf-8"))
-                    if not isinstance(import_data, list):
-                        st.error("JSON 格式错误：需要一个数组。")
-                    else:
-                        imported = 0
-                        for m in import_data:
-                            scope = m.get("scope", "project")
-                            if scope not in ("project", "global"):
-                                scope = "project"
-                            pid = project_id if scope == "project" else None
-                            db.upsert_memory(
-                                db_client, user_id,
-                                scope=scope,
-                                content=m.get("content", ""),
-                                source_feedback=m.get("source_feedback", "导入"),
-                                project_id=pid,
-                                auto_confirm_threshold=1,
+                # 大小限制：5MB 足够装上千条规则；超出几乎肯定是误传整库 dump，
+                # ``json.loads`` 解出的嵌套结构会膨胀 10x+，直接 OOM Streamlit 进程。
+                MAX_IMPORT_BYTES = 5 * 1024 * 1024
+                if uploaded.size and uploaded.size > MAX_IMPORT_BYTES:
+                    st.error(
+                        f"文件超过 5MB（实际 {uploaded.size / 1024 / 1024:.1f}MB），"
+                        "请拆分后上传，避免解析时占用过多内存。"
+                    )
+                else:
+                    try:
+                        import_data = json.loads(uploaded.read().decode("utf-8"))
+                        if not isinstance(import_data, list):
+                            st.error("JSON 格式错误：需要一个数组。")
+                        elif len(import_data) > 5000:
+                            # 条目数硬上限：即便文件不大，5k+ 条 upsert 会让 UI
+                            # 卡死好几分钟（每条都要 DB 往返 + embedding 计算）。
+                            st.error(
+                                f"导入条目数 {len(import_data)} 超过上限 5000；"
+                                "请拆分多次导入。"
                             )
-                            imported += 1
-                        st.success(f"已导入 {imported} 条记忆。")
-                        st.rerun()
-                except json.JSONDecodeError:
-                    st.error("JSON 解析失败，请检查文件格式。")
+                        else:
+                            imported = 0
+                            for m in import_data:
+                                scope = m.get("scope", "project")
+                                if scope not in ("project", "global"):
+                                    scope = "project"
+                                pid = project_id if scope == "project" else None
+                                db.upsert_memory(
+                                    db_client, user_id,
+                                    scope=scope,
+                                    content=m.get("content", ""),
+                                    source_feedback=m.get("source_feedback", "导入"),
+                                    project_id=pid,
+                                    auto_confirm_threshold=1,
+                                )
+                                imported += 1
+                            st.success(f"已导入 {imported} 条记忆。")
+                            st.rerun()
+                    except json.JSONDecodeError:
+                        st.error("JSON 解析失败，请检查文件格式。")
+                    except UnicodeDecodeError:
+                        st.error("文件编码错误：请保存为 UTF-8。")
+                    except MemoryError:
+                        st.error("文件解析时内存不足，请拆分后重试。")
 
     # 卡片 3：embedding 补算（仅在配置了 GOOGLE_API_KEY 时显示）
     try:

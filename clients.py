@@ -203,3 +203,66 @@ def with_anthropic_retry(
         max_delay=60.0,
         is_retryable=_is_anthropic_transient,
     )
+
+
+# ── Gemini 重试 ───────────────────────────────────────────────────────────
+# google-genai SDK 的错误层级在不同版本里漂得比较厉害：旧版直接抛 ValueError /
+# RuntimeError；新版引入 ``google.genai.errors`` 模块带 ``APIError`` /
+# ``ClientError`` / ``ServerError`` / ``FailedPreconditionError`` 等。本函数同时
+# 兼容两套：能 import ``errors`` 就按状态码 / 类型精细过滤；不能就退化到看
+# 异常消息中的关键词（``429`` / ``rate``/``timeout``/``unavailable``/``5xx``）。
+
+_GEMINI_TRANSIENT_PATTERNS = (
+    "429", "rate limit", "rate_limit", "ratelimit",
+    "500", "502", "503", "504", "529",
+    "internal error", "service unavailable", "deadline exceeded",
+    "timeout", "timed out", "connection",
+    "resource exhausted", "resource_exhausted",
+)
+
+
+def _is_gemini_transient(exc: BaseException) -> bool:
+    """判断 Gemini SDK 抛出的异常是不是可重试的暂时性错误。"""
+    # 优先用 SDK 自带的错误类型
+    try:
+        from google.genai import errors as _genai_errors  # type: ignore
+        # ClientError 通常是 4xx；只在 429 重试
+        if isinstance(exc, getattr(_genai_errors, "ClientError", ())):
+            code = getattr(exc, "code", None)
+            if code in (429,):
+                return True
+            return False
+        # ServerError = 5xx，全部重试
+        if isinstance(exc, getattr(_genai_errors, "ServerError", ())):
+            return True
+        # APIError 兜底（其它已知 API 错误）
+        if isinstance(exc, getattr(_genai_errors, "APIError", ())):
+            code = getattr(exc, "code", None)
+            if code in (429, 500, 502, 503, 504, 529):
+                return True
+    except Exception:
+        pass
+    # 退化：消息里关键词匹配
+    msg = str(exc).lower()
+    return any(pat in msg for pat in _GEMINI_TRANSIENT_PATTERNS)
+
+
+def with_gemini_retry(
+    fn: Callable[[], T],
+    *,
+    max_retries: int = 4,
+) -> T:
+    """``with_retry`` 的 Gemini 特化版本。
+
+    Retries on transient errors (429, 5xx, timeout, connection).  Non-retryable
+    errors (400 InvalidArgument, 403, content blocked) are raised immediately
+    so the user sees a real failure instead of waiting through 4 backoffs.
+    """
+    return with_retry(
+        fn,
+        retryable=(Exception,),  # Gemini SDK 错误层级不稳，用 is_retryable 收口
+        max_retries=max_retries,
+        base_delay=2.0,
+        max_delay=30.0,
+        is_retryable=_is_gemini_transient,
+    )
