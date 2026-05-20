@@ -22,6 +22,12 @@ from supabase import Client
 
 import config
 
+# 解压缩炸弹防护：PIL 默认 ``MAX_IMAGE_PIXELS`` 是 ~89M，但仍偏大；恶意/损坏的
+# PNG/TIFF 可让 PIL 在 ``Image.open`` 后解压时申请数十 GB 内存把进程打挂。
+# 我们的主流程图最大也就 4096×4096 = 16.7M 像素，给 100M 留足两倍余量。
+# 超出该上限时 PIL 抛 ``Image.DecompressionBombError``，下面 wrap 起来转成可读异常。
+Image.MAX_IMAGE_PIXELS = 100_000_000
+
 # Max dimension per side (pixels) — keeps images under ~1000 tokens each
 MAX_DIM = config.MAX_IMAGE_DIMENSION
 SUPPORTED_MIME: dict[str, str] = {
@@ -81,8 +87,21 @@ def compress_image(raw_bytes: bytes, max_dim: int = MAX_DIM) -> tuple[bytes, str
     """
     Resize the image so neither dimension exceeds max_dim.
     Returns (compressed_bytes, mime_type).
+
+    Raises ``ValueError`` 时调用方应捕获并 surface 给 UI——避免一张异常图把
+    整个 Streamlit 进程拖死。
     """
-    img = Image.open(io.BytesIO(raw_bytes))
+    # max_dim 必须是正整数；外部允许通过环境变量配置，错配（0/负数）会让
+    # 下面的 ratio 计算除零或返回 inf。这里兜底到一个合理默认值。
+    if not isinstance(max_dim, int) or max_dim <= 0:
+        max_dim = 1568
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        # 强制立即 load 一次：``Image.open`` 是 lazy 的，bomb 要等到 resize 时
+        # 才触发；这里提前触发以便在统一 try/except 里捕获。
+        img.load()
+    except Image.DecompressionBombError as exc:
+        raise ValueError(f"图片像素数超过安全上限：{exc}") from exc
 
     # Determine output format
     fmt = img.format or "JPEG"

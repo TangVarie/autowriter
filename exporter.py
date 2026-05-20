@@ -29,6 +29,26 @@ except ImportError:
 import config
 
 
+# ── 公式注入防护 ───────────────────────────────────────────────────────────
+# Excel/WPS/LibreOffice 打开 .xlsx 时，单元格首字符为 ``=`` / ``+`` / ``-`` /
+# ``@`` 会被当作公式解析。即便是内部团队也可能误把 CSV/Excel 内容贴去其它
+# 系统进而触发 DDE/macro。这里在写入前统一加前缀单引号转义。
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_cell_value(value):
+    """对要写入 Excel 单元格的字符串做公式触发字符的转义。
+
+    非字符串（数字、日期）直接返回；字符串以触发字符开头时前置单引号——
+    Excel 会把它当成字面量字符串显示，单引号本身不显示。
+    """
+    if not isinstance(value, str):
+        return value
+    if value and value[0] in _FORMULA_TRIGGERS:
+        return "'" + value
+    return value
+
+
 # ── Combined single-column Excel ───────────────────────────────────────────
 
 def build_combined_excel(items: list[dict]) -> bytes:
@@ -71,7 +91,7 @@ def build_combined_excel(items: list[dict]) -> bytes:
         if kw_str:
             parts.append(kw_str)
 
-        cell = ws.cell(row=row_idx, column=1, value="\n".join(parts))
+        cell = ws.cell(row=row_idx, column=1, value=_safe_cell_value("\n".join(parts)))
         cell.alignment = cell_align
 
     ws.column_dimensions["A"].width = 80
@@ -140,7 +160,7 @@ def build_excel_document(
             f"v{item.get('version_num', 1)}",
         ]
         for col_idx, value in enumerate(row_data, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell = ws.cell(row=row_idx, column=col_idx, value=_safe_cell_value(value))
             cell.alignment = body_alignment
             cell.border = thin_border
 

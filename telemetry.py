@@ -43,6 +43,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -76,6 +77,13 @@ class BatchMetrics:
     meta:       dict             = field(default_factory=dict)
 
     _started_at: float = field(default_factory=time.monotonic)
+    # ``incr`` / ``start_phase`` / ``stop_phase`` 可能在 ThreadPoolExecutor 的多个
+    # worker 里并发触发（generate_batch_multi_role 把角色分发到线程池）。GIL 不
+    # 保证 ``dict.get + setitem`` 复合操作的原子性，所以加一把轻量锁。
+    # repr=False / compare=False：Lock 不可比较 / repr 没意义，避免污染 __eq__/__repr__。
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False,
+    )
 
     # ── 阶段计时 ─────────────────────────────────────────────────────
     # 提供两种用法：
@@ -93,17 +101,19 @@ class BatchMetrics:
         不抛错，确保埋点本身不会拖垮主流程。
         """
         try:
-            self._running_phases[name] = time.monotonic()
+            with self._lock:
+                self._running_phases[name] = time.monotonic()
         except Exception:
             pass
 
     def stop_phase(self, name: str) -> None:
         """结束一个 start_phase 开的阶段；耗时累加到 phase_ms[name]。"""
         try:
-            t0 = self._running_phases.pop(name, None)
-            if t0 is None:
-                return
-            self.phase_ms[name] = self.phase_ms.get(name, 0.0) + (time.monotonic() - t0) * 1000.0
+            with self._lock:
+                t0 = self._running_phases.pop(name, None)
+                if t0 is None:
+                    return
+                self.phase_ms[name] = self.phase_ms.get(name, 0.0) + (time.monotonic() - t0) * 1000.0
         except Exception:
             pass
 
@@ -120,16 +130,23 @@ class BatchMetrics:
 
     # ── 计数器 ───────────────────────────────────────────────────────
     def incr(self, key: str, n: int = 1) -> None:
-        """累加计数器；不存在的 key 会从 0 起算。"""
+        """累加计数器；不存在的 key 会从 0 起算。
+
+        多线程 worker 同时 incr 同一个 key 时，``dict.get + setitem`` 不是原子的
+        （GIL 只保证单字节码原子），不加锁会偶发丢更新。``threading.Lock`` 开销
+        在埋点路径可忽略。
+        """
         try:
-            self.counters[key] = self.counters.get(key, 0) + int(n)
+            with self._lock:
+                self.counters[key] = self.counters.get(key, 0) + int(n)
         except Exception:
             pass
 
     def set_meta(self, key: str, value) -> None:
         """挂任意元数据（例如 ``saved=10``、``had_errors=True``）。"""
         try:
-            self.meta[key] = value
+            with self._lock:
+                self.meta[key] = value
         except Exception:
             pass
 
@@ -141,8 +158,14 @@ class BatchMetrics:
         ``meta["injection"]``，且 worker 线程在后续 plan 里仍会写 inject_report。
         如果只浅拷贝，主线程渲染看板时读到的是一份正在被改的 dict，可能命中
         list 迭代中 size 变化或 setdefault append 半成品。
+
+        快照期间取锁，确保和 ``incr``/``stop_phase`` 看到的是一致瞬时值。
         """
         total_ms = (time.monotonic() - self._started_at) * 1000.0
+        with self._lock:
+            phase_ms_snapshot = dict(self.phase_ms)
+            counters_snapshot = dict(self.counters)
+            meta_snapshot     = copy.deepcopy(self.meta)
         return {
             "batch_id":   self.batch_id,
             "project_id": self.project_id,
@@ -150,9 +173,9 @@ class BatchMetrics:
             "count":      self.count,
             "engines":    list(self.engines),
             "total_ms":   round(total_ms, 1),
-            "phase_ms":   {k: round(v, 1) for k, v in self.phase_ms.items()},
-            "counters":   dict(self.counters),
-            "meta":       copy.deepcopy(self.meta),
+            "phase_ms":   {k: round(v, 1) for k, v in phase_ms_snapshot.items()},
+            "counters":   counters_snapshot,
+            "meta":       meta_snapshot,
         }
 
     def close(
