@@ -261,17 +261,26 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     st.markdown("#### 🎙️ 语态校准模块")
     st.caption("定义品牌语气、人设、句式风格等语言层面的校准规则。")
 
-    st.session_state.setdefault("tone_textarea", tone_default)
+    # session_state key 带 project_id 防止跨项目串数据。之前 ``tone_textarea``
+    # / ``exec_textarea`` 是全局 key，setdefault 切项目不重新初始化 → 用户看
+    # 到"原有信息被清空"（实际是别的项目的内容覆盖了显示，DB 里没动）。
+    _pid = project["id"]
+    _tone_key = f"tone_textarea_{_pid}"
+    _exec_key = f"exec_textarea_{_pid}"
+    _tone_upload_key = f"tone_md_upload_{_pid}"
+    _exec_upload_key = f"exec_md_upload_{_pid}"
+
+    st.session_state.setdefault(_tone_key, tone_default)
 
     tone_upload = st.file_uploader(
         "从 .md 文件导入语态模块",
         type=["md", "txt"],
-        key="tone_md_upload",
+        key=_tone_upload_key,
     )
     if tone_upload is not None:
         try:
-            st.session_state["tone_textarea"] = tone_upload.read().decode("utf-8")
-            st.success(f"已读取：{tone_upload.name}（{len(st.session_state['tone_textarea'])} 字符）")
+            st.session_state[_tone_key] = tone_upload.read().decode("utf-8")
+            st.success(f"已读取：{tone_upload.name}（{len(st.session_state[_tone_key])} 字符）")
         except Exception as e:
             st.error(f"读取失败：{e}")
 
@@ -279,7 +288,7 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
         "语态校准提示词",
         height=280,
         placeholder="在此粘贴语态校准 Prompt，或通过上方上传 .md 文件...",
-        key="tone_textarea",
+        key=_tone_key,
     )
 
     st.divider()
@@ -288,17 +297,17 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     st.markdown("#### 🎯 执行模块")
     st.caption("定义内容结构、选题逻辑、具体写作指令等内容层面的执行规则。")
 
-    st.session_state.setdefault("exec_textarea", exec_default)
+    st.session_state.setdefault(_exec_key, exec_default)
 
     exec_upload = st.file_uploader(
         "从 .md 文件导入执行模块",
         type=["md", "txt"],
-        key="exec_md_upload",
+        key=_exec_upload_key,
     )
     if exec_upload is not None:
         try:
-            st.session_state["exec_textarea"] = exec_upload.read().decode("utf-8")
-            st.success(f"已读取：{exec_upload.name}（{len(st.session_state['exec_textarea'])} 字符）")
+            st.session_state[_exec_key] = exec_upload.read().decode("utf-8")
+            st.success(f"已读取：{exec_upload.name}（{len(st.session_state[_exec_key])} 字符）")
         except Exception as e:
             st.error(f"读取失败：{e}")
 
@@ -306,7 +315,7 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
         "执行模块提示词",
         height=280,
         placeholder="在此粘贴执行模块 Prompt，或通过上方上传 .md 文件...",
-        key="exec_textarea",
+        key=_exec_key,
     )
 
     # ── Preview of combined prompt ────────────────────────────────────────
@@ -321,13 +330,24 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
     with st.expander(f"👁️ 预览完整 System Prompt（{len(combined)} 字符）", expanded=False):
         st.code(combined, language="markdown")
 
-    if st.button("💾 保存 System Prompt", use_container_width=True, type="primary"):
-        db.update_project(client, project["id"], {
-            "system_prompt_tone": tone_text,
-            "system_prompt_exec": exec_text,
-            "system_prompt": combined,
-        })
-        st.success("System Prompt 已保存。生成时将使用合并后的完整版本。")
+    # 保护：tone + exec 都为空时禁用保存按钮，防止误点把原 system_prompt 写空。
+    _both_empty = not tone_text.strip() and not exec_text.strip()
+    if _both_empty:
+        st.caption("⚠ 语态模块和执行模块都是空白，保存会清掉项目的 System Prompt。")
+    if st.button(
+        "💾 保存 System Prompt",
+        use_container_width=True, type="primary",
+        disabled=_both_empty,
+    ):
+        try:
+            db.update_project(client, project["id"], {
+                "system_prompt_tone": tone_text,
+                "system_prompt_exec": exec_text,
+                "system_prompt": combined,
+            })
+            st.success("System Prompt 已保存。生成时将使用合并后的完整版本。")
+        except Exception as exc:
+            st.error(f"保存失败：{exc}")
 
     # ── 调校笔记 ──────────────────────────────────────────────────────────
     st.divider()
@@ -338,12 +358,18 @@ def _render_prompt_settings(client: Client, project: dict) -> None:
         "在「审核与迭代」页点击「🧠 更新调教笔记」自动生成，每次生成时原文注入 System Prompt。"
         "也可在此手动补充或微调。"
     )
-    st.session_state.setdefault("calibration_notes_textarea", project.get("calibration_notes") or "")
+    # session_state key 必须带 project_id —— 之前 ``calibration_notes_textarea``
+    # 是全局 key，切项目时 setdefault 看到已存在不更新，导致项目 B 的笔记框
+    # 显示项目 A 的内容（A 是空就显示空），而下方"变更历史"是直接查 audit
+    # 表的，显示项目 B 真实的历史 —— 用户看到"框空但历史有 N 条"的诡异状态，
+    # 实际 DB 里数据完好，只是 UI 串了。其它"原有信息被清空"投诉同理。
+    _calib_key = f"calibration_notes_textarea_{project['id']}"
+    st.session_state.setdefault(_calib_key, project.get("calibration_notes") or "")
     calibration_text = st.text_area(
         "调教笔记",
         height=200,
         placeholder="（空白时由审稿页「🧠 更新调教笔记」自动生成）",
-        key="calibration_notes_textarea",
+        key=_calib_key,
         label_visibility="collapsed",
     )
 

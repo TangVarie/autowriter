@@ -1557,11 +1557,34 @@ def _render_bottom_tools(
                 "每次最多 50 条，可以重复点击。"
             )
             if st.button("立即补算（最多 50 条）", use_container_width=True, key="backfill_mem_embed"):
-                count = db.backfill_memory_embeddings(db_client, user_id, max_rows=50)
-                if count > 0:
-                    st.success(f"已补算 {count} 条。")
+                # backfill_memory_embeddings 现在返回 dict，能区分"无需补"和
+                # 各种真错误（schema 缺列 / 查询失败 / 没配 SDK）。之前一律
+                # 显示"没有需要补算的记忆"，schema 缺列时用户也看到这个，
+                # 还以为"点了没反应"。
+                result = db.backfill_memory_embeddings(db_client, user_id, max_rows=50)
+                status_code = result.get("status")
+                if status_code == "ok":
+                    n = result.get("updated", 0)
+                    if n > 0:
+                        st.success(f"已补算 {n} 条。")
+                    else:
+                        st.info("查到候选记忆但补算 0 条（embedding API 返回为空）。")
+                elif status_code == "noop":
+                    st.info("没有需要补算的记忆——所有记忆都已有 embedding。")
+                elif status_code == "no_embedding_sdk":
+                    st.warning("Embedding SDK 不可用（未配 GOOGLE_API_KEY 或 google-genai 未安装）。")
+                elif status_code == "schema_missing":
+                    st.error(
+                        f"⚠ {result.get('hint', '数据库缺列')}。\n\n"
+                        "去 Supabase SQL Editor 运行：\n"
+                        "```sql\n"
+                        "CREATE EXTENSION IF NOT EXISTS vector;\n"
+                        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding vector(768);\n"
+                        "ALTER TABLE versions ADD COLUMN IF NOT EXISTS embedding vector(768);\n"
+                        "```"
+                    )
                 else:
-                    st.info("没有需要补算的记忆。")
+                    st.error(f"补算失败：{result.get('error', '未知错误')}")
                 st.rerun()
 
 

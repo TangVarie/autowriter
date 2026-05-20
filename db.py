@@ -396,12 +396,49 @@ def update_project(client: Client, project_id: str, updates: dict) -> dict:
     for key in ("tactics", "default_params", "reference_files"):
         if key in updates and not isinstance(updates[key], str):
             updates[key] = json.dumps(updates[key])
-    res = (
-        client.table("projects")
-        .update(updates)
-        .eq("id", project_id)
-        .execute()
+
+    # 列缺失精确兜底：用户的 Supabase 部署可能没运行 Day 2 / Day 3 / Day 5 等
+    # ALTER TABLE 迁移；这时往 ``queue_strategy`` / ``semantic_dedup_threshold``
+    # / ``system_prompt_tone`` 等"新列"里写值会撞 PGRST204
+    # "Could not find the 'X' column of 'projects' in the schema cache"。
+    # 之前是直接红屏让用户保存不了项目设置；现在剥掉缺失列后重试一次，让
+    # name / brand 等核心字段照常保存，新列只是不生效，并埋一行 telemetry
+    # 提醒运维去跑迁移。
+    _NEW_COLUMNS = (
+        "semantic_dedup_threshold", "queue_strategy",
+        "system_prompt_tone", "system_prompt_exec",
+        "custom_roles", "calibration_notes",
     )
+    try:
+        res = (
+            client.table("projects")
+            .update(updates)
+            .eq("id", project_id)
+            .execute()
+        )
+    except Exception as exc:
+        msg = str(exc)
+        # 只在错误明确指向"列缺失"且涉及已知新列时才剥列重试
+        hit_cols = [c for c in _NEW_COLUMNS if c in msg and c in updates]
+        if not hit_cols:
+            raise
+        telemetry.log_event(
+            "update_project_schema_fallback",
+            project_id=project_id,
+            missing_columns=hit_cols,
+            error=msg[:200],
+        )
+        stripped = {k: v for k, v in updates.items() if k not in hit_cols}
+        if not stripped:
+            # 这次写入的全部字段都是"新列"，剥完什么都没了，直接返回当前行
+            cur = client.table("projects").select("*").eq("id", project_id).execute()
+            return (cur.data or [{}])[0]
+        res = (
+            client.table("projects")
+            .update(stripped)
+            .eq("id", project_id)
+            .execute()
+        )
     list_projects.clear()
     return res.data[0]
 
@@ -1312,21 +1349,27 @@ def count_calibration_audit(client: Client, project_id: str) -> int:
 
 def backfill_memory_embeddings(
     client: Client, user_id: str, max_rows: int = 50
-) -> int:
+) -> dict:
     """Best-effort backfill: find up to ``max_rows`` memories owned by
     ``user_id`` that have no embedding stored, compute them, and write back.
-    Returns the number of rows successfully embedded.
 
-    Called from the memory manager UI button.  Bounded per call to keep the
-    user's click responsive and to amortise embedding API spend across
-    sessions.
+    Returns a status dict instead of a bare int so UI can tell apart these
+    scenarios that all used to collapse to "0":
+      - ``{"status": "ok", "updated": N}``        — 正常补算了 N 条
+      - ``{"status": "noop"}``                    — 没有缺向量的记忆需要补
+      - ``{"status": "no_embedding_sdk"}``        — 未配 GOOGLE_API_KEY
+      - ``{"status": "schema_missing", "hint": …}`` — pgvector 列没建 / 迁移未跑
+      - ``{"status": "query_failed", "error": …}`` — 网络 / RLS / 其它
+
+    之前一律返回 int 0，按钮点了显示"没有需要补算的记忆"既包含真正无需补的
+    情况，也包含 schema 缺失等真错误，用户无从判断为什么"没反应"。
     """
     try:
         import dedup as _dedup
-    except Exception:
-        return 0
+    except Exception as exc:
+        return {"status": "no_embedding_sdk", "error": str(exc)[:200]}
     if not _dedup.embeddings_available():
-        return 0
+        return {"status": "no_embedding_sdk"}
     try:
         res = (
             client.table("memories")
@@ -1336,15 +1379,30 @@ def backfill_memory_embeddings(
             .limit(max_rows)
             .execute()
         )
-    except Exception:
-        return 0
+    except Exception as exc:
+        msg = str(exc)
+        telemetry.log_event(
+            "backfill_memory_embeddings_query_failed",
+            user_id=user_id, error=msg[:200],
+        )
+        low = msg.lower()
+        if (
+            "embedding" in low
+            and ("column" in low or "does not exist" in low or "schema" in low)
+        ):
+            return {
+                "status": "schema_missing",
+                "hint": "memories.embedding 列不存在，需要先跑 pgvector 迁移",
+                "error": msg[:200],
+            }
+        return {"status": "query_failed", "error": msg[:200]}
     rows = res.data or []
     if not rows:
-        return 0
+        return {"status": "noop"}
     texts = [r.get("content", "") for r in rows]
     vecs = _dedup.embed_texts(texts)
     if not vecs or len(vecs) != len(rows):
-        return 0
+        return {"status": "query_failed", "error": "embed_texts 返回长度不匹配"}
     updated = 0
     for r, v in zip(rows, vecs):
         if not v:
@@ -1352,11 +1410,14 @@ def backfill_memory_embeddings(
         try:
             client.table("memories").update({"embedding": v}).eq("id", r["id"]).execute()
             updated += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            telemetry.log_event(
+                "backfill_memory_row_failed",
+                memory_id=r.get("id"), error=str(exc)[:200],
+            )
     if updated:
         _invalidate_memory_caches()
-    return updated
+    return {"status": "ok", "updated": updated}
 
 
 def increment_memory_frequency(client: Client, memory_id: str) -> dict:

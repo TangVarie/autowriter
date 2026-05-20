@@ -2307,12 +2307,24 @@ _NAV_ITEMS = {
     "06 · 历史":  "批次历史",
 }
 
+# 程序化跳转入口：其它页面（如 page_history 的「查看此批次」按钮、
+# Quick gen 完成后的"前往审核"提示）写 ``_force_page`` 让 sidebar radio
+# 在下次 rerun 时把选项切到指定页。要在 radio 渲染前生效 —— Streamlit 允许
+# 在 widget 渲染前修改 session_state[key] 来设置该 widget 的当前值。
+_FORCED_NAV = st.session_state.pop("_force_page", None)
+if _FORCED_NAV:
+    for _nav_key, _page_name in _NAV_ITEMS.items():
+        if _page_name == _FORCED_NAV:
+            st.session_state["xhs_nav_radio"] = _nav_key
+            break
+
 with st.sidebar:
     st.markdown("<div class='nav-heading'>▸ CHAPTERS</div>", unsafe_allow_html=True)
     _nav_choice = st.radio(
         "导航",
         list(_NAV_ITEMS.keys()),
         label_visibility="collapsed",
+        key="xhs_nav_radio",
     )
     page = _NAV_ITEMS[_nav_choice]
 
@@ -3087,10 +3099,19 @@ def page_generate(project: dict) -> None:
             bid = qgs.get("batch_id")
             if bid:
                 st.session_state["review_batch_id"] = bid
-                st.info("👉 前往「审核与迭代」页面查看结果。")
-            if st.button("🔄 再次生成", use_container_width=True):
-                st.session_state.pop("quick_gen_state", None)
-                st.rerun()
+                go_col, regen_col = st.columns(2)
+                with go_col:
+                    if st.button("👉 前往审核页", type="primary", use_container_width=True):
+                        st.session_state["_force_page"] = "审核与迭代"
+                        st.rerun()
+                with regen_col:
+                    if st.button("🔄 再次生成", use_container_width=True):
+                        st.session_state.pop("quick_gen_state", None)
+                        st.rerun()
+            else:
+                if st.button("🔄 再次生成", use_container_width=True):
+                    st.session_state.pop("quick_gen_state", None)
+                    st.rerun()
         else:
             if st.button(
                 "🚀 开始生成", type="primary", use_container_width=True,
@@ -4273,7 +4294,10 @@ def page_history(project: dict) -> None:
             with btn_col:
                 if counts['total'] > 0:
                     if st.button("查看此批次", key=f"view_batch_{batch['id']}"):
+                        # 真正跳转到审核页：之前只 set review_batch_id 但 page
+                        # 还是"批次历史"，用户感觉"点了没反应"。
                         st.session_state["review_batch_id"] = batch["id"]
+                        st.session_state["_force_page"] = "审核与迭代"
                         st.rerun()
             with del_col:
                 confirm_key = f"confirm_del_{batch['id']}"
