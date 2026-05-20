@@ -2652,8 +2652,30 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             status["phase"]   = "done"
 
 
-def _render_queue_tab() -> None:
-    """Render the batch queue builder and executor UI."""
+def _rerun_app() -> None:
+    """Trigger an app-level rerun even when called from inside an ``@st.fragment``.
+
+    Streamlit 1.37+ 支持 ``st.rerun(scope="app")``，可以从 fragment 内部触发
+    完整页面重跑（让 sidebar / banner / tab 状态都更新）。旧版本退化到默认
+    rerun ——在 fragment 内是 fragment-scope rerun，但 banner 是独立 fragment
+    每 2s 自动刷新，体验差异可接受。
+    """
+    try:
+        st.rerun(scope="app")
+    except TypeError:
+        st.rerun()
+
+
+def _render_queue_tab_body() -> None:
+    """Render the batch queue builder and executor UI.
+
+    抽成独立函数后用 ``@st.fragment`` 包装（见底部 ``_render_queue_tab`` 赋值）。
+    fragment 让"加/删/改 plan"等高频操作只触发本 fragment 局部 rerun，不再
+    导致：
+      - 外层 ``st.tabs`` 重置 active tab（用户加批次时"跳回快速生成"）
+      - 整页 100+ widget 全部重渲染（多 plan 时调参数明显卡）
+      - 上次未交互的 expander 被强制按 ``expanded=(i==len-1)`` 折叠
+    """
     st.markdown(
         "<div class='section-label'>批次队列</div>"
         "<p style='font-size:0.85rem;color:var(--text-2);margin-top:4px;margin-bottom:16px'>"
@@ -2684,17 +2706,29 @@ def _render_queue_tab() -> None:
         if not _p.get("_id"):
             _p["_id"] = uuid.uuid4().hex[:12]
 
+    # 取出本轮"刚加的 plan id"——只有那一个 expander 强制 expanded=True 显示
+    # 给用户。其它 plan 不传 expanded 参数，让 Streamlit 客户端保留用户上次
+    # 手动点开/折叠的状态（之前用 ``expanded=(i==len-1)`` 会在每次 rerun 把
+    # 用户已展开的中间项强制折叠）。
+    _just_added_id = st.session_state.pop("_queue_just_added_plan_id", None)
+
     # ── Plan list ──────────────────────────────────────────────────────
     plans_to_delete: list[int] = []
     for i, plan in enumerate(plans):
         pid_key = plan["_id"]
-        with st.expander(
+        expander_label = (
             f"计划 {i+1} — {plan.get('project_name', '?')} · "
             f"{plan.get('tactic', '通用') or '通用'} · "
             f"{'/'.join(e.upper() for e in plan.get('engines', ['claude']))} · "
-            f"{plan.get('count', 1)} 篇",
-            expanded=(i == len(plans) - 1),
-        ):
+            f"{plan.get('count', 1)} 篇"
+        )
+        if pid_key == _just_added_id:
+            # 刚加的这条强制展开一次；后续 rerun _just_added_id 已 pop，
+            # 走 else 分支不传 expanded，用户的手动状态保留。
+            _expander_ctx = st.expander(expander_label, expanded=True)
+        else:
+            _expander_ctx = st.expander(expander_label)
+        with _expander_ctx:
             pc1, pc2 = st.columns(2)
             with pc1:
                 sel_pid = st.selectbox(
@@ -2818,6 +2852,7 @@ def _render_queue_tab() -> None:
     for idx in sorted(plans_to_delete, reverse=True):
         plans.pop(idx)
     if plans_to_delete:
+        # fragment 内 rerun 就够：只重渲染本 fragment，外层 tabs / sidebar 不动
         st.rerun()
 
     # ── Controls ───────────────────────────────────────────────────────
@@ -2825,8 +2860,9 @@ def _render_queue_tab() -> None:
     with btn_col1:
         if st.button("➕ 添加计划", use_container_width=True, disabled=is_running):
             default_pid = proj_ids[0]
+            new_id = uuid.uuid4().hex[:12]
             plans.append({
-                "_id":                 uuid.uuid4().hex[:12],
+                "_id":                 new_id,
                 "project_id":          default_pid,
                 "project_name":        proj_id_to_name.get(default_pid, ""),
                 "tactic":              "",
@@ -2839,6 +2875,9 @@ def _render_queue_tab() -> None:
                 "n_roles":             3,
                 "extra_instructions":  "",
             })
+            # 让本次新增的 plan 在下次渲染时强制 expanded=True（一次性）；
+            # 其它已存在 plan 保留客户端展开/折叠状态。
+            st.session_state["_queue_just_added_plan_id"] = new_id
             st.rerun()
 
     with btn_col2:
@@ -2872,7 +2911,9 @@ def _render_queue_tab() -> None:
                     daemon=True,
                 )
                 t.start()
-                st.rerun()
+                # 启动队列要让 banner（独立 fragment）立刻出现，外层 page 状态
+                # 也要刷新，所以触发 app-level rerun 而不是 fragment-only。
+                _rerun_app()
         else:
             if st.button(
                 "⏹ 停止队列", use_container_width=True,
@@ -2883,7 +2924,7 @@ def _render_queue_tab() -> None:
                 evt = st.session_state.get("queue_stop_event")
                 if evt:
                     evt.set()
-                st.rerun()
+                _rerun_app()
 
     # Live status within tab
     if is_running:
@@ -2903,6 +2944,18 @@ def _render_queue_tab() -> None:
                 f"✅ {item['project_name']} · 批次 {item['batch_id'][:8]}… · "
                 f"已保存 {item['saved']} 个版本"
             )
+
+
+# 包成 fragment：高频交互（加/删/改 plan）只 rerun 本 fragment 而不是整页，
+# 解决三个 UX 痛点：
+#   1. 加批次时 ``st.tabs`` 不再被重置（之前 page rerun 会跳回"快速生成"）
+#   2. 改字段时只重渲染队列 tab 内部，多 plan 时不卡
+#   3. expander 的客户端展开状态不被强制重置
+# Streamlit < 1.33 没有 fragment 时退化到普通函数，行为与旧版完全一致。
+if _FRAGMENT is not None:
+    _render_queue_tab = _FRAGMENT(_render_queue_tab_body)
+else:
+    _render_queue_tab = _render_queue_tab_body
 
 
 def page_generate(project: dict) -> None:
