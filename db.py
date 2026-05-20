@@ -115,8 +115,6 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS
     queue_strategy TEXT NULL
     CHECK (queue_strategy IS NULL OR queue_strategy IN ('stable','throughput'));
--- Migration: add example_label to items for positive/negative example marking
-ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT CHECK (example_label IN ('positive', 'negative'));
 
 -- Batches
 CREATE TABLE IF NOT EXISTS batches (
@@ -151,6 +149,11 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS feedback_draft TEXT;
 -- base_version_id} so we can restore precisely against the version the
 -- user was editing and not against an unrelated newly-selected best.
 ALTER TABLE items ADD COLUMN IF NOT EXISTS manual_edit_draft JSONB;
+-- Marks an item as a positive / negative example for the project. Must be
+-- declared AFTER items CREATE TABLE, otherwise冷启动新库会跑到这里时表还
+-- 不存在 → "relation items does not exist" → 整段 DDL 中断。
+ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT
+    CHECK (example_label IN ('positive', 'negative'));
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS items_owner ON items;
 CREATE POLICY items_owner ON items

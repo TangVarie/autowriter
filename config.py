@@ -50,7 +50,7 @@ CLAUDE_MODELS: dict[str, str] = {
     "claude-opus-4-5-20251101":            "Opus 4.5",
     "claude-opus-4-5-20251101-thinking":   "Opus 4.5（思考）",
     "claude-opus-4-6":                     "Opus 4.6",
-    "claude-opus-4.6-thinking":            "Opus 4.6（思考）",
+    "claude-opus-4-6-thinking":            "Opus 4.6（思考）",
     "claude-opus-4-7":                     "Opus 4.7",
 }
 
@@ -154,7 +154,7 @@ MAX_ITERATION_ROUNDS: int = 3
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
-APP_VERSION: str = "2.10.0-studio"
+APP_VERSION: str = "2.10.1-studio"
 
 
 def validate_config() -> list[str]:

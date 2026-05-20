@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import re
 from typing import Optional
 
 from PIL import Image
@@ -29,6 +30,49 @@ SUPPORTED_MIME: dict[str, str] = {
     "png": "image/png",
     "webp": "image/webp",
 }
+
+# 反向映射：MIME → 默认扩展名，用于原始文件名没有后缀或后缀对不上时兜底
+_MIME_TO_EXT: dict[str, str] = {
+    "image/jpeg": "jpg",
+    "image/png":  "png",
+    "image/webp": "webp",
+}
+
+
+def _safe_storage_name(filename: str, mime_type: Optional[str] = None) -> str:
+    """构造一个对 Supabase Storage 安全且不重复的对象名。
+
+    - 去掉路径分隔符 / 反斜杠以防越权写到其它前缀
+    - 仅保留 [A-Za-z0-9._-]，其它字符替换为 ``_``（含中文）
+    - 追加 8-hex 随机后缀防止同名冲突
+    - 没有合法扩展名时按 mime_type 兜底（推断 jpg/png/webp，否则 .bin）
+
+    例：``"产品图.jpg"`` + 随机 → ``"____.a1b2c3d4.jpg"``。原始 name 保留在
+    metadata.name 字段供 UI 展示，对象名只是存储 key。
+    """
+    raw = (filename or "").replace("/", "_").replace("\\", "_").strip() or "file"
+    # 扩展名只认 1-6 位字母数字（典型 .jpg / .jpeg / .webp / .heic）。否则
+    # 把整个 raw 当 stem，避免诸如 "../../etc/passwd" 被 rsplit 当成
+    # ext="_etc_passwd" 这种荒谬切分。
+    _ext_match = re.search(r"\.([A-Za-z0-9]{1,6})$", raw)
+    if _ext_match:
+        ext = _ext_match.group(1).lower()
+        stem = raw[: _ext_match.start()]
+    else:
+        ext = ""
+        stem = raw
+    # 仅保留安全字符；不允许的字符（含中文）转为 _，多个连续 _ 收敛
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem).strip("._") or "file"
+    safe_stem = re.sub(r"_{2,}", "_", safe_stem)[:64]
+    # 扩展名兜底：从 SUPPORTED_MIME 反查；都没有就按 mime 推断；最后落到 bin
+    if ext not in SUPPORTED_MIME:
+        ext = _MIME_TO_EXT.get((mime_type or "").lower(), "")
+        if not ext and mime_type and mime_type.startswith("image/"):
+            ext = mime_type.split("/", 1)[1].lower()
+    suffix = os.urandom(4).hex()
+    if ext:
+        return f"{safe_stem}.{suffix}.{ext}"
+    return f"{safe_stem}.{suffix}"
 
 
 # ── Core compression & encoding ────────────────────────────────────────────
@@ -112,9 +156,13 @@ def upload_image_to_storage(
 ) -> str:
     """
     Upload image to Supabase Storage and return the public URL.
+
+    对象名通过 ``_safe_storage_name`` 转义并追加随机后缀，避免同名冲突触发
+    Supabase Storage 的 409 Duplicate，且不暴露原始路径字符（/ \\）。
     """
     compressed, mime = compress_image(raw_bytes)
-    path = f"projects/{project_id}/images/{filename}"
+    storage_name = _safe_storage_name(filename, mime_type=mime)
+    path = f"projects/{project_id}/images/{storage_name}"
     client.storage.from_(bucket).upload(
         path,
         compressed,

@@ -175,11 +175,15 @@ def check_hard_rules(
     hard_rules: list[dict],
     title: str,
     body: str,
+    keywords: Optional[list] = None,
 ) -> list[dict]:
     """对一条版本逐条比对硬规则；返回违反清单。
 
     ``hard_rules`` 是 db.get_confirmed_memories 返回结构的子集，
     需要带 ``content`` 字段（规则文本）。
+
+    ``keywords`` 是该版本的关键词列表（小红书 #tag），用于 max_len 的
+    "关键词" scope；不传则该 scope 退化为空字符串（保持向后兼容）。
 
     返回列表里每个元素 ``{"rule", "kind", "match"}``：
       - ``rule``  ：原始规则文本（用于警告里告诉用户违反了什么）
@@ -191,6 +195,7 @@ def check_hard_rules(
     title = (title or "").strip()
     body  = (body  or "").strip()
     combined = title + "\n" + body
+    keywords_text = " ".join(str(k) for k in (keywords or []) if k)
 
     out: list[dict] = []
     for rule in hard_rules:
@@ -218,10 +223,18 @@ def check_hard_rules(
         elif kind == "max_len":
             scope = spec["scope"]
             n     = spec["n"]
+            # _LEN_PATTERN 接受 5 种 scope（标题|正文|开头|结尾|关键词），所以
+            # 这里映射也要补齐 5 种；之前缺「结尾」/「关键词」会让用户配的规则
+            # 走到 .get("","") fallback，永远命不中，硬规则形同虚设。
+            # - 结尾：取正文最后一段非空行（与「开头」对称）
+            # - 关键词：keywords 列表拼接后计长（"总长度"口径）
+            body_lines = [l for l in body.splitlines() if l.strip()]
             target_text = {
-                "标题": title,
-                "正文": body,
-                "开头": (body.splitlines() or [""])[0],
+                "标题":   title,
+                "正文":   body,
+                "开头":   body_lines[0]  if body_lines else "",
+                "结尾":   body_lines[-1] if body_lines else "",
+                "关键词": keywords_text,
             }.get(scope, "")
             if target_text and len(target_text) > n:
                 out.append({

@@ -19,6 +19,7 @@ from supabase import Client
 
 import db
 import generator as gen_module
+import image_handler
 import memory as mem_module
 
 
@@ -558,12 +559,23 @@ def _render_file_settings(client: Client, project: dict, user_id: str) -> None:
         ref_files = _parse_json_field(project.get("reference_files"), [])
         for f in uploaded:
             try:
-                path = f"projects/{project['id']}/{f.name}"
+                # 用与 image_handler 相同的安全策略：转义 + 随机后缀，避免同名
+                # 重复上传时撞 Supabase Storage 的 409。原始 name 仍保留在
+                # metadata.name 供 UI 展示，storage_name 用于后续清理 / 审计。
+                storage_name = image_handler._safe_storage_name(
+                    f.name, mime_type=f.type,
+                )
+                path = f"projects/{project['id']}/{storage_name}"
                 client.storage.from_("reference-files").upload(
                     path, f.read(), file_options={"content-type": f.type}
                 )
                 public_url = client.storage.from_("reference-files").get_public_url(path)
-                ref_files.append({"name": f.name, "url": public_url, "type": f.type})
+                ref_files.append({
+                    "name":         f.name,
+                    "storage_name": storage_name,
+                    "url":          public_url,
+                    "type":         f.type,
+                })
                 st.success(f"✅ {f.name}")
             except Exception as e:
                 st.error(f"上传失败：{f.name} — {e}")

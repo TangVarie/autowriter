@@ -1057,9 +1057,16 @@ def generate_batch(
                 count=count,
             )
         except Exception as e:
-            items = [GenerationResult(
-                title="", body="", keywords=[], ai_engine=engine_name, error=str(e)
-            )] * count
+            # 必须用列表推导生成独立实例：``[GR(...)] * count`` 会把同一对象
+            # 引用复制 count 份，后续任何位置改 token_usage / 标签都会污染整批
+            # 失败位（典型表现：一条版本打了 compliance_violation 标，其它失败位
+            # 也"被动跟着"挂上同一条违规）。
+            items = [
+                GenerationResult(
+                    title="", body="", keywords=[], ai_engine=engine_name, error=str(e)
+                )
+                for _ in range(count)
+            ]
         return engine_name, items
 
     engine_results: dict[str, list[GenerationResult]] = {}
@@ -1138,19 +1145,33 @@ _COMPLIANCE_SYSTEM = """\
 
 
 def _has_compliance_rules(system_prompt: str) -> bool:
-    """Cheap check: does the assembled system prompt contain rule-type blocks?"""
-    markers = ("---项目记忆", "---通用记忆", "---当前会话临时指令")
+    """Cheap check: does the assembled system prompt contain rule-type blocks?
+
+    memory.build_system_prompt 自从 2025-Q4 改造已将旧的「---项目记忆 / ---通用
+    记忆 / ---当前会话临时指令」段落重写为 P0/P1/P2 三层结构（``---【P0 · 不可
+    违反的硬约束】---`` 等）。这里同时认两套标记，老 prompt 走老路径，新
+    prompt 也能触发合规复检——之前只匹配旧标记导致 ENABLE_COMPLIANCE_CHECK
+    打开了实际从不执行。
+    """
+    markers = (
+        # 新标记：P0/P1/P2 分层（memory.py:184/220/231）
+        "---【P0", "---【P1", "---【P2",
+        # 老标记：向后兼容（如有自定义 prompt 拼装路径仍用老格式）
+        "---项目记忆", "---通用记忆", "---当前会话临时指令",
+    )
     return any(marker in system_prompt for marker in markers)
 
 
 def _apply_compliance_recheck(slots: list[dict], system_prompt: str) -> None:
     """
-    Flag (and optionally regenerate) versions that violate the System Prompt's
-    memory / session-instruction rules.
+    Flag versions that violate the System Prompt's memory / session-instruction
+    rules.
 
     Tags are written to ``version.token_usage["compliance_violation"]`` for the
-    UI to render. Regeneration only happens when ``COMPLIANCE_AUTO_REGEN`` is
-    enabled; otherwise this is a cheap, cost-bounded advisory pass.
+    UI to render. **本函数只标记不重生** —— 早期注释里提到的"可选重生 +
+    COMPLIANCE_AUTO_REGEN" 从未实装；硬规则的重生路径在 _run_semantic_dedup_pass
+    via regen_ctx 里走（按相似度），confirmance violation 重生需要另设管线。
+    保留注释一致性，避免运维误以为"打开 flag 就能重生"。
     """
     # Flatten (slot_idx, engine, version) pairs
     flat: list[tuple[int, str, GenerationResult]] = []
@@ -1482,14 +1503,25 @@ def generate_batch_multi_role(
     def _call_task(role: dict, eng_name: str) -> tuple[str, str, list[GenerationResult]]:
         engine = get_engine(eng_name)
         thinking = use_thinking if eng_name == "claude" else (gemini_use_thinking if eng_name == "gemini" else False)
-        items = engine.generate(
-            system_prompt=system_prompt,
-            user_prompt=base_prompt + role["prompt_suffix"],
-            images=images,
-            use_thinking=thinking,
-            model=_models.get(eng_name, ""),
-            count=count,
-        )
+        try:
+            items = engine.generate(
+                system_prompt=system_prompt,
+                user_prompt=base_prompt + role["prompt_suffix"],
+                images=images,
+                use_thinking=thinking,
+                model=_models.get(eng_name, ""),
+                count=count,
+            )
+        except Exception as e:
+            # 任一路失败不该拖垮整批：填占位 GenerationResult 让该路在后续
+            # 评选时被自然过滤（success=False / error 字段非空）。用列表推导
+            # 而不是 * count，防止失败位共享同一对象引用被串改 token_usage。
+            items = [
+                GenerationResult(
+                    title="", body="", keywords=[], ai_engine=eng_name, error=str(e),
+                )
+                for _ in range(count)
+            ]
         return role["id"], eng_name, items
 
     # key: (role_id, eng_name) → list[GenerationResult]
@@ -1497,7 +1529,20 @@ def generate_batch_multi_role(
     with ThreadPoolExecutor(max_workers=n_tasks) as executor:
         futures = {executor.submit(_call_task, role, eng): (role["id"], eng) for role, eng in tasks}
         for future in as_completed(futures):
-            role_id, eng_name, items = future.result()
+            try:
+                role_id, eng_name, items = future.result()
+            except Exception as e:
+                # _call_task 已自吞 engine.generate 异常；走到这里说明 future 自身
+                # 异常（如线程取消 / 内部断言）。仍然不让整批失败：通过 futures
+                # 字典拿到这条任务的 (role_id, eng) 信息，填占位。
+                role_id, eng_name = futures[future]
+                items = [
+                    GenerationResult(
+                        title="", body="", keywords=[], ai_engine=eng_name,
+                        error=f"future error: {e}",
+                    )
+                    for _ in range(count)
+                ]
             task_results[(role_id, eng_name)] = items
 
     if progress_callback:

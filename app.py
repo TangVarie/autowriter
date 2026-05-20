@@ -103,6 +103,11 @@ _PHASE_WEIGHTS = {
     "embedding": (0.90, 1.00),   # 90% → 100% 语义查重 + embedding 持久化
 }
 
+# 跨批语义去重池的滑窗上限。长队列下同一项目会持续 append，O(n) 比较成本
+# 与重复条目噪声都会上升；2000 条对应一个项目近期约 1-2 周的产出，足够
+# "下一批别和最近 X 批撞" 的语义而不至于让 pool 变成全表扫描。
+_QUEUE_POOL_MAX = 2000
+
 
 def _set_phase_progress(status: dict, phase: str, intra: float = 0.0) -> None:
     """把 status["progress"] 设置到指定阶段的某个内部进度。
@@ -226,6 +231,7 @@ def _run_hard_constraint_check(
             hard_rules,
             title=iv.get("title", ""),
             body=iv.get("body", ""),
+            keywords=iv.get("keywords") or [],
         )
         if not hits:
             continue
@@ -527,11 +533,19 @@ def _run_semantic_dedup_pass(
                 # 不论成功失败都计入 attempts（_try_regen_one 内部记录每次尝试）
 
         # 步骤 5：累积给下一批用（regen 路径可能已经原地改过 new_vecs）
+        # 加去重 + 滑窗上限：长队列下 pool 会一直 append 同项目历史，O(n^2)
+        # 相似度比较 + 重复条目让命中解释噪声变大。
+        # - 去重：按 title 精确匹配（embedding 一致的近似重复语义层已被合并，
+        #   再用文本 key 兜底防止 worker 内部 regen 写两次）
+        # - 滑窗：保留最近 _QUEUE_POOL_MAX 条；超出从队首丢（保留近期上下文）
         pool = queue_embeddings.setdefault(project_id, [])
+        existing_titles = {entry.get("title") for entry in pool}
         for i, t in enumerate(titles_in_order):
-            if i < len(new_vecs) and t:
-                # 跳过 pool 里已经有的（regen 时会原地替换）
+            if i < len(new_vecs) and t and t not in existing_titles:
                 pool.append({"title": t, "embedding": new_vecs[i]})
+                existing_titles.add(t)
+        if len(pool) > _QUEUE_POOL_MAX:
+            del pool[: len(pool) - _QUEUE_POOL_MAX]
     finally:
         metrics.stop_phase("embedding")
 
@@ -912,9 +926,19 @@ def _queue_worker_impl(
 
             _set_phase_progress(status, "embedding", intra=1.0)
 
-            # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）
+            # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）。
+            # 同步加去重 + 滑窗（与 queue_embeddings 一致），避免长队列下成本
+            # 飙升与重复噪声污染下一批的 dedup_instruction。
             if produced_titles:
-                queue_titles.setdefault(project_id, []).extend(produced_titles)
+                tpool = queue_titles.setdefault(project_id, [])
+                seen_titles = {entry.get("title") for entry in tpool}
+                for entry in produced_titles:
+                    t = entry.get("title") if isinstance(entry, dict) else None
+                    if t and t not in seen_titles:
+                        tpool.append(entry)
+                        seen_titles.add(t)
+                if len(tpool) > _QUEUE_POOL_MAX:
+                    del tpool[: len(tpool) - _QUEUE_POOL_MAX]
 
             status["completed"].append({
                 "plan_idx":    idx,
