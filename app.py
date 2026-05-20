@@ -3431,14 +3431,21 @@ def page_review(project: dict) -> None:
             continue
         _render_item_card_fragment(item, versions, selected_batch, project)
 
-    # ── 太子自动学习：全部通过时静默更新调教笔记 ──────────────────────────
+    # ── 太子自动学习：批次审完后静默更新调教笔记 ──────────────────────────
+    # 触发条件：本批次没有任何 pending 项（用户对每一条都做了决定 —— 不论是
+    # 采纳 / 打回 / 修改），且这批次历史上还没自动反思过。"全部通过" 不是
+    # 必要条件 —— 用户标 needs_revision 表示"这条不要这种调性"也是有效信号
+    # （generate_calibration_notes 内部按 iteration feedback 和 manual edit 选信号，
+    # 单纯 approved / needs_revision 状态本身不会污染笔记，无信号时会自动空跑）。
+    #
     # 双闸门：(1) 持久化的 batches.auto_calibrated_at — 这批次历史上反思过没？
     #          浏览器刷新 / 重登都不会让它重跑（之前的 bug：只看 session_state，
     #          切回审核页又会重新跑一次 Claude，浪费 token + 让用户等 spinner）；
     #         (2) session 内的 _taizi_key — 防止同一次 page rerun 里重复触发。
     _taizi_key = f"taizi_{batch_id}"
     already_calibrated = bool(selected_batch.get("auto_calibrated_at"))
-    if (items and all(it["status"] == "approved" for it in items)
+    batch_fully_handled = bool(items) and all(it["status"] != "pending" for it in items)
+    if (batch_fully_handled
             and not already_calibrated
             and not st.session_state.get(_taizi_key)):
         st.session_state[_taizi_key] = True
