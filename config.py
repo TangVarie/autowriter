@@ -134,13 +134,14 @@ DEDUP_SEMANTIC_THRESHOLD: float = float(
 # When True, generate_batch runs a second Claude call after generation to
 # verify each version respected the active project memories and session
 # instructions. Violations are tagged in token_usage["compliance_violation"]
-# for UI surfacing — versions are NOT automatically regenerated unless
-# COMPLIANCE_AUTO_REGEN is also enabled (default off to control cost).
+# for UI surfacing — versions are NOT automatically regenerated.
+#
+# 历史上这里还有一个 ``COMPLIANCE_AUTO_REGEN`` flag 暗示"打开后自动重生违规
+# 版本"，但 ``_apply_compliance_recheck`` 内部从未实装重生逻辑，开关存在但
+# 不生效。已删除以免运维误以为打开就能用——硬规则违规的重生路径走
+# ``_run_semantic_dedup_pass`` 的 ``regen_ctx`` 管线（按相似度阈值触发）。
 ENABLE_COMPLIANCE_CHECK: bool = (
     os.environ.get("ENABLE_COMPLIANCE_CHECK", "1") not in ("0", "false", "False")
-)
-COMPLIANCE_AUTO_REGEN: bool = (
-    os.environ.get("COMPLIANCE_AUTO_REGEN", "0") not in ("0", "false", "False")
 )
 
 # ── Image handling ─────────────────────────────────────────────────────────
@@ -154,7 +155,7 @@ MAX_ITERATION_ROUNDS: int = 3
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
-APP_VERSION: str = "2.11.0-studio"
+APP_VERSION: str = "2.11.1-studio"
 
 
 def validate_config() -> list[str]:

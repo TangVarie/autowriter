@@ -4071,11 +4071,14 @@ def page_export(project: dict) -> None:
     project_name = project.get("name", "")
 
     # ── Batch selector table ────────────────────────────────────────────
-    # Pre-load approved counts for all batches in bulk (one query per batch,
-    # acceptable for ≤50 batches; can be optimised later with a view).
+    # Bulk-load items for all batches in ONE round trip. 之前是按 batch 循环
+    # list_items（50 个批次 = 50 次 RT），导出页随批次增加越来越慢。改成
+    # 单次 in_(batch_ids) 查询 + client 侧分桶。
+    batch_ids = [b["id"] for b in batches]
+    items_by_batch = db.list_items_for_batches(db_client, batch_ids)
     batch_meta: list[dict] = []
     for batch in batches:
-        items = db.list_items(db_client, batch["id"])
+        items    = items_by_batch.get(batch["id"], [])
         approved = sum(1 for it in items if it["status"] == "approved")
         total    = len(items)
         batch_meta.append({

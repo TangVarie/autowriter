@@ -12,8 +12,9 @@ Tables:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from supabase import create_client, Client
 import config
@@ -703,6 +704,42 @@ def list_items(client: Client, batch_id: str) -> list[dict]:
     return res.data or []
 
 
+def list_items_for_batches(
+    client: Client, batch_ids: list[str]
+) -> dict[str, list[dict]]:
+    """Bulk-fetch items for many batches in one round trip.
+
+    Returns ``{batch_id: [items]}``. 给 page_export 这种需要遍历多个 batch
+    的入口用，消除 N+1 — 之前每个 batch 一次 query，50 个 batch 就要 50
+    次 RT。现在一次 ``in_(batch_ids)`` 拿回全部，client 侧按 batch_id 分桶。
+
+    Streamlit cache 不做这里：export 页交互低频，但 batch_ids 集合频繁
+    变化（用户勾选），cache_data 反而命中率低。
+    """
+    if not batch_ids:
+        return {}
+    try:
+        res = (
+            client.table("items")
+            .select("*, versions(*)")
+            .in_("batch_id", batch_ids)
+            .order("created_at")
+            .execute()
+        )
+    except Exception as exc:
+        telemetry.log_event(
+            "list_items_for_batches_failed",
+            n_batches=len(batch_ids), error=str(exc)[:200],
+        )
+        return {bid: [] for bid in batch_ids}
+    grouped: dict[str, list[dict]] = {bid: [] for bid in batch_ids}
+    for item in (res.data or []):
+        bid = item.get("batch_id")
+        if bid in grouped:
+            grouped[bid].append(item)
+    return grouped
+
+
 def update_item_status(
     client: Client, item_id: str, status: str, best_version_id: Optional[str] = None
 ) -> dict:
@@ -1109,8 +1146,15 @@ def upsert_memory(
                 vecs = _dedup.embed_texts([content])
                 if vecs and vecs[0]:
                     data["embedding"] = vecs[0]
-        except Exception:
-            pass
+        except Exception as exc:
+            # 之前 silent pass。本路径非致命（规则没向量也能注入），但持续
+            # 失败会导致 soft-rule 相关性筛选完全降级为"全部注入"——用户
+            # 看到 system_prompt 暴涨却不知所以。埋一行让运维能查。
+            telemetry.log_event(
+                "memory_embedding_compute_failed",
+                content_preview=content[:60],
+                error=str(exc)[:200],
+            )
 
         try:
             res = client.table("memories").insert(data).execute()
@@ -1505,18 +1549,53 @@ def get_confirmed_memories(
     return global_mems, project_mems
 
 
-def _is_muted(memory_row: dict) -> bool:
-    """True if the memory has a ``muted_until`` timestamp in the future."""
-    muted = memory_row.get("muted_until")
-    if not muted:
+def is_memory_muted_now(muted_until) -> bool:
+    """True iff ``muted_until`` (raw column value) is in the future, UTC.
+
+    历史上 db._is_muted 和 memory.py 的 UI 各持一份字符串字典序比较，且写入
+    端用 aware ISO（``...+00:00``）而读取端用 naive ISO（无 tz 后缀）。当
+    两个字符串前缀相同时 ``+`` (43) < 任何数字 → aware 字符串恒大于 naive，
+    边界条件下静音的"刚到期"瞬间会判错。
+
+    本函数把 ``muted_until`` 统一解析为 aware UTC datetime 后用 datetime
+    比较，对以下输入都鲁棒：
+      - datetime 对象（aware 或 naive，naive 默认按 UTC 解释）
+      - ISO 字符串带 ``+00:00`` 或 ``Z``
+      - ISO 字符串无 tz 后缀（兼容老数据）
+
+    Failure-safe：解析失败一律返回 False（"未静音"）—— 用户看到一条规则
+    生效，比"明明设置静音但不生效"的反向 bug 影响小。
+    """
+    if not muted_until:
         return False
     try:
-        # Both ISO strings and datetime objects show up here depending on the
-        # Supabase driver; compare as strings since they're all UTC-ISO.
-        now_iso = datetime.utcnow().isoformat()
-        return str(muted) > now_iso
+        if isinstance(muted_until, datetime):
+            mu = muted_until
+        else:
+            s = str(muted_until).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                mu = datetime.fromisoformat(s)
+            except ValueError:
+                # 进一步兜底：截掉小数秒后再试（某些 PG client 把 7 位微秒
+                # 返回成字符串，fromisoformat 只接受最多 6 位）
+                s2 = re.sub(r"\.(\d{6})\d+", r".\1", s)
+                mu = datetime.fromisoformat(s2)
+        if mu.tzinfo is None:
+            mu = mu.replace(tzinfo=timezone.utc)
+        return mu > datetime.now(timezone.utc)
     except Exception:
         return False
+
+
+def _is_muted(memory_row: dict) -> bool:
+    """Backcompat shim — delegate to ``is_memory_muted_now``.
+
+    保留旧名字让 db.py 内部其它调用点（如 ``get_confirmed_memories``）继续
+    工作，新代码应直接用 ``is_memory_muted_now``。
+    """
+    return is_memory_muted_now(memory_row.get("muted_until"))
 
 
 @_cache_data(ttl=30, show_spinner=False)

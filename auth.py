@@ -93,8 +93,14 @@ def _persist_refresh_token(cm, refresh_token: str) -> None:
             expires_at=datetime.now(timezone.utc) + timedelta(days=_COOKIE_TTL_DAYS),
             key="xhs_set_rt",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # cookie 写入失败用户感知就是"刷新后掉登录"。之前 silent pass 让
+        # 这个症状完全没有线索可查；现在埋一行让运维能 grep。
+        try:
+            import telemetry as _tm
+            _tm.log_event("auth_cookie_write_failed", error=str(exc)[:200])
+        except Exception:
+            pass
 
 
 def wait_for_cookie_write(seconds: float = 0.6) -> None:
@@ -110,8 +116,12 @@ def _clear_refresh_cookie(cm) -> None:
         return
     try:
         cm.delete(_COOKIE_NAME, key="xhs_del_rt")
-    except Exception:
-        pass
+    except Exception as exc:
+        try:
+            import telemetry as _tm
+            _tm.log_event("auth_cookie_clear_failed", error=str(exc)[:200])
+        except Exception:
+            pass
 
 
 def get_supabase_client() -> Client:

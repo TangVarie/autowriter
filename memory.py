@@ -1675,8 +1675,11 @@ def _render_memory_row(
     mem_id = memory["id"]
     severity = (memory.get("severity") or "soft").lower()
     applicability = (memory.get("applicability") or "").strip()
-    muted_until = memory.get("muted_until")
-    is_muted = bool(muted_until and str(muted_until) > datetime.utcnow().isoformat())
+    # 用 db.is_memory_muted_now 统一判断（解析 aware UTC datetime 后比较）。
+    # 之前 UI 用 ``str(muted_until) > datetime.utcnow().isoformat()`` 字符串
+    # 字典序比较，写入端是 aware ISO 而读取端是 naive ISO，边界条件下静音
+    # "刚到期"会判错；与 db._is_muted 也不完全一致。
+    is_muted = db.is_memory_muted_now(memory.get("muted_until"))
 
     # ── 渲染主行：徽章 + 内容 + 频率 + 主操作按钮 ─────────────────────
     badge_html = ""
