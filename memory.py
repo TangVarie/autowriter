@@ -39,6 +39,7 @@ def filter_soft_by_relevance(
     memories: list[dict],
     context_text: str,
     threshold: float = 0.45,
+    report_sink: Optional[dict] = None,
 ) -> list[dict]:
     """
     Drop ``severity='soft'`` rules whose embedding is semantically far from
@@ -55,7 +56,22 @@ def filter_soft_by_relevance(
 
     Returns the filtered list in the same order.  No-op (returns the input)
     when embeddings aren't configured or ``context_text`` is empty.
+
+    Day 4：``report_sink`` 给调用方留一份"哪些规则被滤掉、为什么"，UI
+    可以渲染成"本次注入了 X 条偏好规则，过滤了 Y 条（below_threshold /
+    no_embedding / no_embedding_api）"。
     """
+    def _record_drop(m: dict, reason: str, score: Optional[float] = None) -> None:
+        if report_sink is None:
+            return
+        entry = {
+            "reason": reason,
+            "content": (m.get("content") or "")[:80],
+        }
+        if score is not None:
+            entry["score"] = round(float(score), 3)
+        report_sink.setdefault("filtered", []).append(entry)
+
     if not memories or not context_text or not context_text.strip():
         return memories
     try:
@@ -63,11 +79,19 @@ def filter_soft_by_relevance(
     except Exception:
         return memories
     if not _dedup.embeddings_available():
+        # 整体降级：所有 soft 规则都按"无 embedding API"通过，但记一条总账
+        if report_sink is not None:
+            report_sink["soft_filter_mode"] = "no_embedding_api"
         return memories
     ctx_vecs = _dedup.embed_texts([context_text.strip()])
     if not ctx_vecs or not ctx_vecs[0]:
+        if report_sink is not None:
+            report_sink["soft_filter_mode"] = "ctx_embed_failed"
         return memories
     ctx = ctx_vecs[0]
+    if report_sink is not None:
+        report_sink["soft_filter_mode"] = "active"
+        report_sink["soft_filter_threshold"] = threshold
     out: list[dict] = []
     for m in memories:
         if (m.get("severity") or "soft").lower() == "hard":
@@ -84,7 +108,8 @@ def filter_soft_by_relevance(
             continue
         if score >= threshold:
             out.append(m)
-        # else: dropped silently — user can still see it in the manager
+        else:
+            _record_drop(m, "below_threshold", score=score)
     return out
 
 
@@ -97,6 +122,7 @@ def build_system_prompt(
     positive_examples: Optional[list[dict]] = None,
     negative_examples: Optional[list[dict]] = None,
     session_instructions: Optional[list[dict]] = None,
+    report_sink: Optional[dict] = None,
 ) -> str:
     """
     Assemble the final system prompt as a three-tier priority stack so the
@@ -115,6 +141,10 @@ def build_system_prompt(
     apply unrelated rules out of context.
 
     Memories without a ``severity`` field (legacy rows) default to ``soft``.
+
+    Day 4：``report_sink`` 收集本次实际注入了多少条各类型规则，
+    队列 worker 会把它挂到 metrics.set_meta("injection", ...)，UI 显示
+    "硬 N / 软 M / 会话 K / 调校 X 字" 徽章。
     """
     def _is_hard(m: dict) -> bool:
         return (m.get("severity") or "soft").lower() == "hard"
@@ -123,6 +153,16 @@ def build_system_prompt(
     soft_global   = [m for m in (global_memories  or []) if not _is_hard(m)]
     hard_project  = [m for m in (project_memories or []) if _is_hard(m)]
     soft_project  = [m for m in (project_memories or []) if not _is_hard(m)]
+
+    if report_sink is not None:
+        report_sink["hard_global"]      = len(hard_global)
+        report_sink["soft_global"]      = len(soft_global)
+        report_sink["hard_project"]     = len(hard_project)
+        report_sink["soft_project"]     = len(soft_project)
+        report_sink["session"]          = len(session_instructions or [])
+        report_sink["calibration_chars"] = len((calibration_notes or "").strip())
+        report_sink["pos_examples"]     = len(positive_examples or [])
+        report_sink["neg_examples"]     = len(negative_examples or [])
 
     parts: list[str] = [base_prompt.strip()]
 

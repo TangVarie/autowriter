@@ -33,6 +33,22 @@ import validator
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
 
+class _NullLock:
+    """无操作的 context manager，用于老 session_state 没装 _lock 时的兜底。
+
+    Day 4 加的线程态硬化里，启动后才会往 status["_lock"] 写真锁；如果用户
+    在升级前的旧 session 里点了"清除"再点"启动"，过渡期可能读不到锁。
+    用这个 placeholder 让 `with x or _NULL_LOCK:` 永远不报错。
+    """
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc) -> None:
+        return None
+
+
+_NULL_LOCK = _NullLock()
+
+
 # ── Generation Queue ────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -510,8 +526,15 @@ def _queue_worker(
         让下一批的语义查重立刻看到（首次访问项目时预热）
     ─────────────────────────────────────────────────────────────────────
     """
-    status["running"] = True
-    status["done"] = False
+    # Day 4: 用锁保护状态机三态写入；UI 通过 phase 守卫按钮，避免高频点击竞态
+    queue_lock = status.get("_lock")
+    if queue_lock is None:
+        queue_lock = threading.Lock()
+        status["_lock"] = queue_lock
+    with queue_lock:
+        status["running"] = True
+        status["done"] = False
+        status["phase"] = "running"
     status["total"] = len(plans)
     status.setdefault("completed", [])
     status.setdefault("errors", [])
@@ -604,8 +627,14 @@ def _queue_worker(
                 plan.get("target_audience", ""),
                 plan.get("extra_instructions", ""),
             ])).strip()
-            global_mems_for_plan  = mem_module.filter_soft_by_relevance(global_mems,  context_text)
-            project_mems_for_plan = mem_module.filter_soft_by_relevance(project_mems, context_text)
+            # Day 4: 注入可视化 ─ 记录本批"硬/软/会话各注入多少、过滤掉哪些"
+            inject_report: dict = {"filtered": []}
+            global_mems_for_plan  = mem_module.filter_soft_by_relevance(
+                global_mems,  context_text, report_sink=inject_report,
+            )
+            project_mems_for_plan = mem_module.filter_soft_by_relevance(
+                project_mems, context_text, report_sink=inject_report,
+            )
 
             full_system_prompt = mem_module.build_system_prompt(
                 base_prompt=base_prompt,
@@ -616,7 +645,9 @@ def _queue_worker(
                 positive_examples=pos_examples or None,
                 negative_examples=neg_examples or None,
                 session_instructions=session_instr or None,
+                report_sink=inject_report,
             )
+            metrics.set_meta("injection", inject_report)
 
             engines          = plan.get("engines", ["claude"])
             count            = plan.get("count", 1)
@@ -822,8 +853,10 @@ def _queue_worker(
             except Exception:
                 pass
 
-    status["running"] = False
-    status["done"]    = True
+    with (status.get("_lock") or _NULL_LOCK):
+        status["running"] = False
+        status["done"]    = True
+        status["phase"]   = "done"
     if not stop_event.is_set():
         n_ok  = len(status["completed"])
         n_err = len(status["errors"])
@@ -889,6 +922,102 @@ def _queue_banner_body() -> None:
                         "Supabase upsert/update 失败，本次写入未存到 versions.embedding 列；"
                         "后续跨批次去重会读不到这些向量，可能导致重复率上升。"
                     )
+
+        # Day 4：去重 + 注入指标看板（每批一张卡）
+        _render_queue_dashboard(qs)
+
+
+def _render_queue_dashboard(qs: dict) -> None:
+    """渲染本次队列每个批次的指标卡：阶段计时 + 去重/重生/违规计数 + 注入摘要。
+
+    数据源是 ``metrics.close()`` 落到 ``qs["metrics_list"]`` 的每批快照；
+    本函数只读、纯展示，不做任何 DB I/O，调用频率与刷新成本都可忽略。
+    """
+    metrics_list = qs.get("metrics_list") or []
+    if not metrics_list:
+        return
+    with st.expander(f"📊 本次队列指标（{len(metrics_list)} 批）", expanded=False):
+        for idx, m in enumerate(metrics_list):
+            engines = ", ".join(m.get("engines") or []) or "?"
+            st.markdown(
+                f"**批次 {idx + 1}** · "
+                f"`{(m.get('batch_id') or '')[:8]}…` · "
+                f"{m.get('count', 0)} 条 · 引擎 {engines} · "
+                f"总耗时 **{m.get('total_ms', 0) / 1000:.1f} s**"
+            )
+
+            phase_ms = m.get("phase_ms") or {}
+            cols = st.columns(4)
+            for col, (k, label) in zip(cols, [
+                ("setup", "setup"),
+                ("llm", "llm"),
+                ("db_save", "db_save"),
+                ("embedding", "embedding"),
+            ]):
+                with col:
+                    st.metric(label, f"{phase_ms.get(k, 0) / 1000:.1f} s")
+
+            counters = m.get("counters") or {}
+            counter_keys = [
+                ("dedup_text_hits", "文本去重命中"),
+                ("dedup_semantic_hits", "语义去重命中"),
+                ("regen_attempts", "重生尝试"),
+                ("regen_success", "重生成功"),
+                ("hard_rule_violations", "硬规则违反"),
+                ("embedding_missing", "缺向量"),
+            ]
+            ccols = st.columns(len(counter_keys))
+            for col, (k, label) in zip(ccols, counter_keys):
+                with col:
+                    st.metric(label, counters.get(k, 0))
+
+            meta = m.get("meta") or {}
+            injection = meta.get("injection") or {}
+            dedup_mode = meta.get("dedup_mode", "vector")
+            dedup_threshold = meta.get("dedup_threshold")
+            if injection or dedup_mode != "vector" or dedup_threshold is not None:
+                hard_n = (injection.get("hard_global", 0) + injection.get("hard_project", 0))
+                soft_n = (injection.get("soft_global", 0) + injection.get("soft_project", 0))
+                sess_n = injection.get("session", 0)
+                calib_chars = injection.get("calibration_chars", 0)
+                filtered = injection.get("filtered") or []
+                badges = [
+                    f"硬 {hard_n}", f"软 {soft_n}", f"会话 {sess_n}",
+                    f"调校 {calib_chars} 字", f"过滤 {len(filtered)} 条",
+                ]
+                if dedup_threshold is not None:
+                    badges.append(f"阈值 {dedup_threshold:.2f}")
+                if dedup_mode != "vector":
+                    badges.append(f"去重 {dedup_mode}")
+                st.caption(" · ".join(badges))
+
+                if filtered:
+                    with st.expander(
+                        f"查看本批被过滤的 {len(filtered)} 条规则",
+                        expanded=False,
+                    ):
+                        by_reason: dict[str, list[dict]] = {}
+                        for f in filtered:
+                            by_reason.setdefault(f.get("reason", "?"), []).append(f)
+                        for reason, items in by_reason.items():
+                            reason_label = {
+                                "below_threshold": "相关度低于阈值",
+                                "muted": "已静音",
+                                "capped": "超过条数上限",
+                                "no_embedding": "缺 embedding",
+                            }.get(reason, reason)
+                            st.markdown(f"**{reason_label}** ({len(items)} 条)")
+                            for item in items[:10]:
+                                score = item.get("score")
+                                score_text = (
+                                    f" (相似度 {score:.2f})" if score is not None else ""
+                                )
+                                st.markdown(f"- {item.get('content', '')}{score_text}")
+                            if len(items) > 10:
+                                st.caption(f"…还有 {len(items) - 10} 条")
+
+            if idx < len(metrics_list) - 1:
+                st.divider()
 
 
 if _FRAGMENT is not None:
@@ -2104,7 +2233,13 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
     )
     metrics.start_phase("setup")
     try:
-        status["running"] = True
+        qlock = status.get("_lock")
+        if qlock is None:
+            qlock = threading.Lock()
+            status["_lock"] = qlock
+        with qlock:
+            status["running"] = True
+            status["phase"]   = "running"
         status["message"] = "正在构建提示词…"
         status.setdefault("warnings", [])
         status.setdefault("embedding_missing", [])
@@ -2137,6 +2272,9 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         session_instr     = db.get_session_instructions(db_client, user_id, project_id=project_id)
 
         tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
+
+        # Day 4：注入可视化（quick gen 与 queue worker 行为一致）
+        inject_report: dict = {"filtered": []}
         full_system_prompt = mem_module.build_system_prompt(
             base_prompt=project.get("system_prompt", ""),
             global_memories=global_mems,
@@ -2146,7 +2284,9 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             positive_examples=pos_examples or None,
             negative_examples=neg_examples or None,
             session_instructions=session_instr or None,
+            report_sink=inject_report,
         )
+        metrics.set_meta("injection", inject_report)
 
         combined_extra = extra_instr
         if image_prompt:
@@ -2305,8 +2445,10 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         metrics.set_meta("error", str(exc)[:120])
 
     metrics.close(status)
-    status["running"] = False
-    status["done"]    = True
+    with (status.get("_lock") or _NULL_LOCK):
+        status["running"] = False
+        status["done"]    = True
+        status["phase"]   = "done"
 
 
 def _render_queue_tab() -> None:
@@ -2467,16 +2609,27 @@ def _render_queue_tab() -> None:
             st.rerun()
 
     with btn_col2:
-        if not is_running:
+        # Day 4: 用 phase 状态机替代直接读 running 标志位，避免高频点击竞态。
+        # 状态机：idle → starting → running → stopping → done → idle（点击"清除"）
+        cur_phase = (qs.get("phase") or ("running" if is_running else "idle"))
+        is_transitional = cur_phase in ("starting", "stopping")
+        if cur_phase in ("idle", "done") and not is_running:
             if st.button(
                 "🚀 启动队列", type="primary", use_container_width=True,
-                disabled=(not plans),
+                disabled=(not plans or is_transitional),
             ):
+                # 关键：在 thread.start() 之前就把 running=True / phase=starting
+                # 写到 session_state，下一次 rerun 不会再走进这个分支创建第二个
+                # worker。
                 stop_evt = threading.Event()
+                queue_lock = threading.Lock()
                 status: dict = {
-                    "running": False, "done": False, "total": 0,
+                    "running": True, "done": False, "total": 0,
                     "current": 0, "message": "准备中…",
                     "completed": [], "errors": [],
+                    "warnings": [], "embedding_missing": [],
+                    "phase": "starting",
+                    "_lock": queue_lock,
                 }
                 st.session_state["queue_state"]      = status
                 st.session_state["queue_stop_event"] = stop_evt
@@ -2488,7 +2641,12 @@ def _render_queue_tab() -> None:
                 t.start()
                 st.rerun()
         else:
-            if st.button("⏹ 停止队列", use_container_width=True):
+            if st.button(
+                "⏹ 停止队列", use_container_width=True,
+                disabled=is_transitional,
+            ):
+                with (qs.get("_lock") or _NULL_LOCK):
+                    qs["phase"] = "stopping"
                 evt = st.session_state.get("queue_stop_event")
                 if evt:
                     evt.set()
@@ -2671,6 +2829,7 @@ def page_generate(project: dict) -> None:
         qgs        = st.session_state.get("quick_gen_state")
         qg_running = bool(qgs and qgs.get("running"))
         qg_done    = bool(qgs and qgs.get("done"))
+        qg_phase   = (qgs or {}).get("phase", "idle")
 
         if qg_running:
             # Fragment-driven polling replaces the old sleep+rerun loop;
@@ -2712,8 +2871,10 @@ def page_generate(project: dict) -> None:
                 st.session_state.pop("quick_gen_state", None)
                 st.rerun()
         else:
-            if st.button("🚀 开始生成", type="primary", use_container_width=True,
-                         disabled=not base_prompt.strip()):
+            if st.button(
+                "🚀 开始生成", type="primary", use_container_width=True,
+                disabled=(not base_prompt.strip()) or qg_phase == "starting",
+            ):
                 if not base_prompt.strip():
                     st.warning("⚠️ 当前项目尚未配置 System Prompt，请先在「项目设置」中填写。")
                     st.stop()
@@ -2736,10 +2897,13 @@ def page_generate(project: dict) -> None:
                     "images":           encoded_images or [],
                 }
                 qg_status: dict = {
-                    "running": False, "done": False,
+                    "running": True, "done": False,
                     "message": "准备中…", "progress": 0.0,
                     "batch_id": None, "saved_count": 0,
                     "n_results": 0, "errors": [],
+                    "warnings": [], "embedding_missing": [],
+                    "phase": "starting",
+                    "_lock": threading.Lock(),
                 }
                 st.session_state["quick_gen_state"] = qg_status
                 threading.Thread(
