@@ -440,6 +440,7 @@ def _render_login_page(cm, cookies=None) -> None:
                 try:
                     result = sign_in(email, password)
                     _store_session(result, cm=cm)
+                    _record_login_event(result)
                     wait_for_cookie_write()
                     st.rerun()
                 except Exception as exc:
@@ -482,6 +483,40 @@ def _render_login_page(cm, cookies=None) -> None:
     with st.expander("🔧 登录持久化诊断（刷新后掉登录？展开看原因）", expanded=False):
         for line in _auth_debug_lines(cm, cookies):
             st.caption(line)
+
+
+def _capture_client_info() -> tuple[Optional[str], Optional[str]]:
+    """从 Streamlit 请求头读客户端真实 IP + UA。
+
+    Streamlit Cloud 在反代后，``X-Forwarded-For`` 第一项是客户端 IP。
+    ``st.context.headers`` 需要 Streamlit ≥ 1.34；旧版返回 (None, None)。
+    """
+    try:
+        headers = st.context.headers
+    except Exception:
+        return None, None
+    xff = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for") or ""
+    ip = xff.split(",")[0].strip() if xff else None
+    ua = headers.get("User-Agent") or headers.get("user-agent") or None
+    return ip, ua
+
+
+def _record_login_event(result: dict) -> None:
+    """登录成功后落一行 user_logins，用于"一号多人共享"检测。
+
+    用刚签发的 JWT 起 client，RLS ``auth.uid() = user_id`` 自然通过。
+    任何异常静默——审计不能拖垮登录流程。
+    """
+    try:
+        session = result.get("session")
+        user = result.get("user")
+        if not session or not user:
+            return
+        ip, ua = _capture_client_info()
+        client = db.get_client(session.access_token)
+        db.record_user_login(client, user.id, ip, ua)
+    except Exception:
+        pass
 
 
 def _store_session(result: dict, cm=None) -> None:
