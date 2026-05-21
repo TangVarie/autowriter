@@ -65,9 +65,11 @@ GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
 GOOGLE_BASE_URL: str = _get_secret("GOOGLE_BASE_URL")  # optional proxy, e.g. https://your-relay.com
 
 # Available Gemini models: model_id -> display label
-# All three are GA stable as of 2025; 2.5 Flash is best price/performance
+# 3.5 Flash launched GA at Google I/O 2026 (2026-05-19); 2.5 Flash remains
+# the cheapest stable option.
 GEMINI_MODELS: dict[str, str] = {
-    "gemini-3.1-pro-preview": "Gemini 3.1 Pro Preview（最新）",
+    "gemini-3.5-flash":       "Gemini 3.5 Flash（最新，GA）",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro Preview",
     "gemini-2.5-pro":         "Gemini 2.5 Pro（GA 稳定版）",
     "gemini-2.5-flash":       "Gemini 2.5 Flash（均衡，高吞吐）",
     "gemini-2.5-flash-lite":  "Gemini 2.5 Flash-Lite（最快最省）",
