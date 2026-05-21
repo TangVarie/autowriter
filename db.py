@@ -191,8 +191,17 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label_proposal TEXT
         'negative_feedback_iter',    -- B: 用户给 feedback 后 AI 重生成过（中）
         'negative_batch_rejected'    -- C: 同 batch 有 approved，本 item 卡（低）
     ));
-CREATE UNIQUE INDEX IF NOT EXISTS items_external_source_uniq
-    ON items (external_source, external_source_id)
+-- 唯一索引必须按 user_id 分租户：UNIQUE 是表级约束，RLS 不参与判定。如果
+-- 索引键只有 (external_source, external_source_id)，两个用户同步同一条上游
+-- 记录时第二个会直接撞键失败，TV → autowriter 的跨租户 sync 整条断掉。
+-- 把 user_id 放在前缀既隔离了租户，又保留了 (user_id, external_source[, id])
+-- 的覆盖查询能力。
+-- 旧版（PR 初版）写过一个全局索引 items_external_source_uniq；这里显式
+-- DROP，否则 CREATE INDEX IF NOT EXISTS 同名时会原地跳过、保留错误的全局
+-- 约束。新名字 _per_user 让已部署环境的 operator 一眼看出迁移已生效。
+DROP INDEX IF EXISTS items_external_source_uniq;
+CREATE UNIQUE INDEX IF NOT EXISTS items_external_source_per_user_uniq
+    ON items (user_id, external_source, external_source_id)
     WHERE external_source IS NOT NULL;
 CREATE INDEX IF NOT EXISTS items_proposal_idx
     ON items (example_label_proposal)
