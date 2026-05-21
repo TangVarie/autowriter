@@ -134,7 +134,19 @@ def build_excel_document(
     )
 
     # Headers
-    headers = ["序号", "标题", "正文", "关键词", "AI引擎", "版本"]
+    # 2026-05-21: 末尾 6 列是隐藏 lineage，飞书整表导入会带过去，TV ingest
+    # 用 _source_autowriter_* 反向归因到具体 item / version。AI 引擎 / 版本
+    # 在前 6 列已经有展示用的格式 (.upper() / "v1")，lineage 列保留原值便于
+    # 程序消费。
+    headers = [
+        "序号", "标题", "正文", "关键词", "AI引擎", "版本",
+        "_source_autowriter_project_id",
+        "_source_autowriter_batch_id",
+        "_source_autowriter_item_id",
+        "_source_autowriter_version_id",
+        "_source_autowriter_ai_engine",
+        "_source_autowriter_version_num",
+    ]
     for col_idx, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font = header_font
@@ -158,6 +170,12 @@ def build_excel_document(
             kw_str,
             item.get("ai_engine", "").upper(),
             f"v{item.get('version_num', 1)}",
+            item.get("project_id", ""),
+            item.get("batch_id", ""),
+            item.get("item_id", ""),
+            item.get("version_id", ""),
+            item.get("ai_engine", ""),     # 不带 .upper()，保留原值供 TV ingest
+            item.get("version_num", 1),
         ]
         for col_idx, value in enumerate(row_data, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=_safe_cell_value(value))
@@ -171,6 +189,10 @@ def build_excel_document(
     ws.column_dimensions["D"].width = 25  # 关键词
     ws.column_dimensions["E"].width = 10  # AI引擎
     ws.column_dimensions["F"].width = 8   # 版本
+    # 隐藏 lineage 列：G–L 设宽 30，hidden=True
+    for col_letter in ("G", "H", "I", "J", "K", "L"):
+        ws.column_dimensions[col_letter].hidden = True
+        ws.column_dimensions[col_letter].width = 30
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -264,6 +286,19 @@ def build_word_document(
             kw_para = doc.add_paragraph()
             kw_para.add_run("关键词：").bold = True
             kw_para.add_run("  ".join(f"#{k}" for k in keywords))
+
+        # 2026-05-21: lineage footnote for TV reverse-attribution.
+        # 6pt 灰字，肉眼几乎看不见但 TV ingest 可解析。
+        item_uuid = item.get("item_id") or ""
+        version_uuid = item.get("version_id") or ""
+        if item_uuid or version_uuid:
+            footnote = doc.add_paragraph()
+            run = footnote.add_run(
+                f"source_autowriter_item_id={item_uuid} "
+                f"version_id={version_uuid}"
+            )
+            run.font.size = Pt(6)
+            run.font.color.rgb = RGBColor(0xAA, 0xAA, 0xAA)
 
         doc.add_page_break()
 

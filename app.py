@@ -3474,7 +3474,12 @@ def page_review(project: dict) -> None:
             if not config.FEISHU_WEBHOOK_URL:
                 st.warning("飞书 Webhook 未配置（FEISHU_WEBHOOK_URL）。")
             else:
-                approved_items = _collect_approved_items(items)
+                # Stamp project_id (items 表无此列) — _collect_approved_items
+                # 会读取来挂 lineage。用 comprehension 不动 list_items 缓存。
+                _pid = selected_batch.get("project_id")
+                approved_items = _collect_approved_items(
+                    [{**it, "_project_id": _pid} for it in items]
+                )
                 ok = exporter.push_to_feishu(
                     items=approved_items,
                     project_name=project.get("name", ""),
@@ -4167,7 +4172,14 @@ def _run_iteration(
 
 
 def _collect_approved_items(items: list[dict]) -> list[dict]:
-    """Build a flat list of approved items for export."""
+    """Build a flat list of approved items for export.
+
+    2026-05-21：每条 dict 额外带 4 个 lineage id (project / batch / item /
+    version)，给 exporter 把 ``_source_autowriter_*`` 列写进 Excel / Word，
+    供 TV ingest 反向归因。``project_id`` 不在 items 表里——调用方在传入前
+    要把 batch.project_id stamp 到 ``_project_id`` 上（见 list_items 各
+    caller）。
+    """
     result = []
     for item in items:
         if item["status"] != "approved":
@@ -4186,6 +4198,11 @@ def _collect_approved_items(items: list[dict]) -> list[dict]:
             "keywords": v.get("keywords", []),
             "ai_engine": v.get("ai_engine", ""),
             "version_num": v.get("version_num", 1),
+            # lineage for TV reverse-attribution
+            "project_id": item.get("project_id") or item.get("_project_id"),
+            "batch_id":   item.get("batch_id"),
+            "item_id":    item.get("id"),
+            "version_id": v.get("id"),
         })
     return result
 
@@ -4376,11 +4393,17 @@ def page_export(project: dict) -> None:
     # Map batch_id → items for fast lookup (already loaded above)
     batch_items_map = {meta["batch"]["id"]: meta["items"] for meta in batch_meta}
 
+    # 导出页是单 project scope，所有 batch 共用同一个 project_id。
+    # _collect_approved_items 用它给 export 行挂 lineage。
+    _pid = project.get("id")
+
     gen_label = f"📥 生成导出文件（{n_selected} 个批次）" if n_selected else "📥 生成导出文件"
     if st.button(gen_label, type="primary", disabled=(n_selected == 0), use_container_width=True):
         all_items: list[dict] = []
         for bid in selected_ids:
-            all_items.extend(_collect_approved_items(batch_items_map.get(bid, [])))
+            all_items.extend(_collect_approved_items(
+                [{**it, "_project_id": _pid} for it in batch_items_map.get(bid, [])]
+            ))
 
         if not all_items:
             st.warning("选中的批次中没有已通过的内容，请先在「审核与迭代」中通过稿件。")
@@ -4405,7 +4428,9 @@ def page_export(project: dict) -> None:
         if st.button("🔔 推送选中批次到飞书", use_container_width=True):
             all_items = []
             for bid in selected_ids:
-                all_items.extend(_collect_approved_items(batch_items_map.get(bid, [])))
+                all_items.extend(_collect_approved_items(
+                    [{**it, "_project_id": _pid} for it in batch_items_map.get(bid, [])]
+                ))
             if not all_items:
                 st.warning("选中的批次中没有已通过的内容。")
             else:

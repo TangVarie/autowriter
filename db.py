@@ -164,6 +164,21 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS manual_edit_draft JSONB;
 -- 不存在 → "relation items does not exist" → 整段 DDL 中断。
 ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT
     CHECK (example_label IN ('positive', 'negative'));
+-- 2026-05-21: TV 飞轮接入相关列。等价于 autowriter-migrations/002+003 的
+-- bootstrap 路径——operator 在已部署 Supabase 上跑迁移即可；fresh 部署直接
+-- 走这段 DDL 就有列。
+--   external_source / external_source_id：标记从 TV 同步进来的 item
+--     (external_source='truth_vault' + external_source_id=<TV uuid>)，
+--     配合下面的 UNIQUE INDEX 防止重复 ingest。
+--   example_label_proposal：TV 推荐的标签，由人工在 autowriter 审核页
+--     确认后才会写到正式的 example_label，避免污染飞轮 prompt。
+ALTER TABLE items ADD COLUMN IF NOT EXISTS external_source TEXT;
+ALTER TABLE items ADD COLUMN IF NOT EXISTS external_source_id TEXT;
+ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label_proposal TEXT
+    CHECK (example_label_proposal IN ('positive', 'negative'));
+CREATE UNIQUE INDEX IF NOT EXISTS items_external_source_uniq
+    ON items (external_source, external_source_id)
+    WHERE external_source IS NOT NULL;
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS items_owner ON items;
 CREATE POLICY items_owner ON items
@@ -1695,16 +1710,20 @@ def list_example_items(
     """
     Return recent items marked with the given label ('positive' or 'negative').
     Each dict has {title, body} from the item's best or latest version.
-    """
-    batches = list_batches(_client, project_id, limit=50)
-    if not batches:
-        return []
-    batch_ids = [b["id"] for b in batches]
 
+    2026-05-21：原实现取最近 50 个 batch 再 ``in_(batch_ids)`` 过滤，TV
+    同步进来的 special-batch 一旦滚出 50-batch 窗口就读不到——飞轮中断。
+    改用 PostgREST embedded inner join：``batches!inner(project_id)`` 让
+    外层 items 行按 batches.project_id 直接过滤，不依赖窗口位置。
+    """
     res = (
         _client.table("items")
-        .select("id, best_version_id, versions(id, title, body, version_num)")
-        .in_("batch_id", batch_ids)
+        .select(
+            "id, best_version_id, created_at, "
+            "versions(id, title, body, version_num), "
+            "batches!inner(project_id)"
+        )
+        .eq("batches.project_id", project_id)
         .eq("example_label", label)
         .order("created_at", desc=True)
         .limit(limit)
