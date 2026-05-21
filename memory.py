@@ -1389,22 +1389,23 @@ def render_memory_manager(
     # 注入预览：让用户看到「本次生成实际会注入哪些规则」，不用看 prompt 也能 debug
     _render_inject_preview(db_client, user_id, project_id, project_name)
 
-    # 负例候选数量挂到 tab 标题上，让用户一眼能看到"有东西要审"；失败兜底成 0 不
-    # 阻塞主流程（DB 抽风时记忆管理本身要能继续渲染）。
-    neg_count = 0
+    # 待审核数挂到 tab 标题上让用户一眼看到"有东西要审"；DB 失败兜底成 0 不
+    # 阻塞主流程。已确认的不挂到 tab 标题（数量稳定后不需要日常关注）。
+    pending_count = 0
     if project_id:
         try:
-            neg_count = len(db.list_negative_proposals(db_client, project_id))
+            pending_count = len(db.list_negative_proposals(db_client, project_id))
         except Exception:
-            neg_count = 0
-    neg_tab_label = (
-        f"🔻 负例候选审核（{neg_count}）" if neg_count else "🔻 负例候选审核"
+            pending_count = 0
+    pool_tab_label = (
+        f"🎯 飞轮 example 池（{pending_count}）" if pending_count
+        else "🎯 飞轮 example 池"
     )
 
-    tab_global, tab_project, tab_neg = st.tabs([
+    tab_global, tab_project, tab_pool = st.tabs([
         "通用记忆",
         f"项目记忆（{project_name or '当前项目'}）",
-        neg_tab_label,
+        pool_tab_label,
     ])
     with tab_global:
         _render_memory_table(
@@ -1420,11 +1421,11 @@ def render_memory_manager(
                 project_id=project_id, label="项目记忆",
                 current_project_id=project_id,
             )
-    with tab_neg:
+    with tab_pool:
         if not project_id:
-            st.info("请先选择一个项目。负例候选按项目维度审核。")
+            st.info("请先选择一个项目。example 池按项目维度管理。")
         else:
-            _render_negative_proposal_review(db_client, project_id, project_name)
+            _render_example_pool_tab(db_client, project_id, project_name)
 
     # 底部工具区：手动添加 / 导入导出 / 补算 embedding 都折叠在这
     _render_bottom_tools(db_client, user_id, project_id)
@@ -1442,14 +1443,21 @@ _SOURCE_LABELS: dict[str, str] = {
 }
 
 
-def _render_negative_proposal_review(
+def _render_example_pool_tab(
     db_client: Client, project_id: str, project_name: str,
 ) -> None:
-    """渲染待审核的负例候选列表 + 确认 / 驳回操作。"""
-    st.subheader("待审核的负例候选")
+    """飞轮 example 池管理 tab：两段——待审核候选 + 已确认池。"""
+    _render_pending_proposals(db_client, project_id)
+    st.divider()
+    _render_labeled_pool(db_client, project_id)
+
+
+def _render_pending_proposals(db_client: Client, project_id: str) -> None:
+    """段 1：待审核的负例候选 + 确认 / 驳回。"""
+    st.subheader("📥 待审核候选")
     st.caption(
-        "外部源（Truth Vault 等）会把可疑的负例案例写到这里。"
-        "**确认**后才会进入飞轮 prompt 的 negative pool，**驳回**则只清掉候选标记不动 item。"
+        "外部源（Truth Vault 等）写入的候选负例。**确认**后进入飞轮 prompt "
+        "的 negative pool；**驳回**只清掉候选标记不动 item 本身。"
     )
 
     try:
@@ -1469,7 +1477,6 @@ def _render_negative_proposal_review(
         body = (p.get("body") or "").strip()
         source = _SOURCE_LABELS.get(p.get("proposal") or "", p.get("proposal") or "未知")
         tactic = p.get("tactic") or "—"
-        # 折叠每一条避免长列表撑屏；标题截 40 字符，预览展开后才看全文
         title_short = title[:40] + ("…" if len(title) > 40 else "")
         with st.expander(f"📄 {title_short}  ·  {source}", expanded=False):
             st.caption(f"批次方向：{tactic}")
@@ -1505,6 +1512,75 @@ def _render_negative_proposal_review(
                         st.rerun()
                     except Exception as exc:
                         st.error(f"驳回失败：{exc}")
+
+
+def _render_labeled_pool(db_client: Client, project_id: str) -> None:
+    """段 2：已确认的 example 池——撤销 / 切换标签。"""
+    st.subheader("🎯 已确认 example 池")
+    st.caption(
+        "正在被 build_system_prompt 注入的 example。"
+        "**移出池**清掉标签 item 回归普通；**切换** 在 ⭐ ↔ 👎 之间翻转（标错了可救）。"
+    )
+
+    try:
+        labeled = db.list_labeled_items(db_client, project_id)
+    except Exception as e:
+        st.error(f"读取 example 池失败：{e}")
+        return
+
+    if not labeled:
+        st.info("这个项目还没有任何已确认的 example。")
+        return
+
+    pos = sum(1 for x in labeled if x.get("label") == "positive")
+    neg = sum(1 for x in labeled if x.get("label") == "negative")
+    st.caption(f"共 {len(labeled)} 条 · ⭐ 正例 {pos} · 👎 反例 {neg}")
+
+    for item in labeled:
+        item_id = item.get("item_id")
+        title = (item.get("title") or "(无标题)").strip()
+        body = (item.get("body") or "").strip()
+        label = item.get("label")
+        tactic = item.get("tactic") or "—"
+        badge = "⭐ 正例" if label == "positive" else "👎 反例"
+        title_short = title[:40] + ("…" if len(title) > 40 else "")
+        with st.expander(f"{badge}  ·  {title_short}", expanded=False):
+            st.caption(f"批次方向：{tactic}")
+            if title:
+                st.markdown(f"**标题：** {title}")
+            if body:
+                st.markdown("**正文预览：**")
+                preview = body[:500] + ("…" if len(body) > 500 else "")
+                st.text(preview)
+            col_flip, col_clear = st.columns(2)
+            with col_flip:
+                # 切换：positive ↔ negative。type=secondary 避免和"移出"抢
+                # 视觉，撤销才是常见操作。
+                flip_target = "negative" if label == "positive" else "positive"
+                flip_label = "🔄 切到 👎 反例" if label == "positive" else "🔄 切到 ⭐ 正例"
+                if st.button(
+                    flip_label,
+                    key=f"pool_flip_{item_id}",
+                    use_container_width=True,
+                ):
+                    try:
+                        db.set_item_example_label(db_client, item_id, flip_target)
+                        st.toast(f"已切换为{flip_target}", icon="🔄")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"切换失败：{exc}")
+            with col_clear:
+                if st.button(
+                    "🗑️ 移出池",
+                    key=f"pool_clear_{item_id}",
+                    use_container_width=True,
+                ):
+                    try:
+                        db.set_item_example_label(db_client, item_id, None)
+                        st.toast("已移出 example 池", icon="🗑️")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"移出失败：{exc}")
 
 
 def _render_bottom_tools(
