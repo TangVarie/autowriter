@@ -19,6 +19,7 @@ from typing import Any, Optional
 from datetime import datetime, timezone
 
 from supabase import create_client, Client
+from supabase.client import ClientOptions
 import config
 import telemetry
 
@@ -61,8 +62,17 @@ def _make_client_cached(supabase_url: str, anon_key: str, access_token: str) -> 
     """Per-token Supabase client singleton.  Keyed on the token so each
     authenticated user gets their own client; ``access_token=""`` returns the
     anonymous client.  Cleared on sign-out via ``_make_client_cached.clear()``.
+
+    2026-05-21: schema='autowriter' 让所有 ``client.table("items")`` 等调用
+    透明指向 ``autowriter.items``（共享 Supabase + schema 隔离，避免和
+    sanshengliubu 在 public 里冲突）。前置条件：autowriter-migrations 已跑
+    且 Supabase Dashboard → Settings → API → Exposed schemas 已包含
+    ``autowriter``。
     """
-    client = create_client(supabase_url, anon_key)
+    client = create_client(
+        supabase_url, anon_key,
+        options=ClientOptions(schema="autowriter"),
+    )
     if access_token:
         client.postgrest.auth(access_token)
     return client
@@ -170,15 +180,23 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT
 --   external_source / external_source_id：标记从 TV 同步进来的 item
 --     (external_source='truth_vault' + external_source_id=<TV uuid>)，
 --     配合下面的 UNIQUE INDEX 防止重复 ingest。
---   example_label_proposal：TV 推荐的标签，由人工在 autowriter 审核页
---     确认后才会写到正式的 example_label，避免污染飞轮 prompt。
+--   example_label_proposal：TV 推荐的负例标签（3 个来源置信度等级），由人工在
+--     autowriter Memory Manager 审核 → 升级写到正式的 example_label，避免污
+--     染飞轮 prompt。build_system_prompt 只读 example_label，不读 proposal。
 ALTER TABLE items ADD COLUMN IF NOT EXISTS external_source TEXT;
 ALTER TABLE items ADD COLUMN IF NOT EXISTS external_source_id TEXT;
 ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label_proposal TEXT
-    CHECK (example_label_proposal IN ('positive', 'negative'));
+    CHECK (example_label_proposal IS NULL OR example_label_proposal IN (
+        'negative_manual_rewrite',   -- A: 用户手动重写过 AI 版（高置信）
+        'negative_feedback_iter',    -- B: 用户给 feedback 后 AI 重生成过（中）
+        'negative_batch_rejected'    -- C: 同 batch 有 approved，本 item 卡（低）
+    ));
 CREATE UNIQUE INDEX IF NOT EXISTS items_external_source_uniq
     ON items (external_source, external_source_id)
     WHERE external_source IS NOT NULL;
+CREATE INDEX IF NOT EXISTS items_proposal_idx
+    ON items (example_label_proposal)
+    WHERE example_label_proposal IS NOT NULL;
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS items_owner ON items;
 CREATE POLICY items_owner ON items
