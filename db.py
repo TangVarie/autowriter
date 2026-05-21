@@ -19,6 +19,7 @@ from typing import Any, Optional
 from datetime import datetime, timezone
 
 from supabase import create_client, Client
+from supabase.client import ClientOptions
 import config
 import telemetry
 
@@ -61,8 +62,17 @@ def _make_client_cached(supabase_url: str, anon_key: str, access_token: str) -> 
     """Per-token Supabase client singleton.  Keyed on the token so each
     authenticated user gets their own client; ``access_token=""`` returns the
     anonymous client.  Cleared on sign-out via ``_make_client_cached.clear()``.
+
+    2026-05-21: schema='autowriter' 让所有 ``client.table("items")`` 等调用
+    透明指向 ``autowriter.items``（共享 Supabase + schema 隔离，避免和
+    sanshengliubu 在 public 里冲突）。前置条件：autowriter-migrations 已跑
+    且 Supabase Dashboard → Settings → API → Exposed schemas 已包含
+    ``autowriter``。
     """
-    client = create_client(supabase_url, anon_key)
+    client = create_client(
+        supabase_url, anon_key,
+        options=ClientOptions(schema="autowriter"),
+    )
     if access_token:
         client.postgrest.auth(access_token)
     return client
