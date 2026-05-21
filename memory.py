@@ -1389,7 +1389,23 @@ def render_memory_manager(
     # 注入预览：让用户看到「本次生成实际会注入哪些规则」，不用看 prompt 也能 debug
     _render_inject_preview(db_client, user_id, project_id, project_name)
 
-    tab_global, tab_project = st.tabs(["通用记忆", f"项目记忆（{project_name or '当前项目'}）"])
+    # 负例候选数量挂到 tab 标题上，让用户一眼能看到"有东西要审"；失败兜底成 0 不
+    # 阻塞主流程（DB 抽风时记忆管理本身要能继续渲染）。
+    neg_count = 0
+    if project_id:
+        try:
+            neg_count = len(db.list_negative_proposals(db_client, project_id))
+        except Exception:
+            neg_count = 0
+    neg_tab_label = (
+        f"🔻 负例候选审核（{neg_count}）" if neg_count else "🔻 负例候选审核"
+    )
+
+    tab_global, tab_project, tab_neg = st.tabs([
+        "通用记忆",
+        f"项目记忆（{project_name or '当前项目'}）",
+        neg_tab_label,
+    ])
     with tab_global:
         _render_memory_table(
             db_client, user_id, scope="global", project_id=None,
@@ -1404,9 +1420,91 @@ def render_memory_manager(
                 project_id=project_id, label="项目记忆",
                 current_project_id=project_id,
             )
+    with tab_neg:
+        if not project_id:
+            st.info("请先选择一个项目。负例候选按项目维度审核。")
+        else:
+            _render_negative_proposal_review(db_client, project_id, project_name)
 
     # 底部工具区：手动添加 / 导入导出 / 补算 embedding 都折叠在这
     _render_bottom_tools(db_client, user_id, project_id)
+
+
+# ── 负例候选审核 tab ──────────────────────────────────────────────────────
+# TV 飞轮把候选负例写到 items.example_label_proposal，build_system_prompt
+# 不会读 proposal（只读 example_label），所以这一步人工 review 是飞轮闭环
+# 的强制门——确认后才升级，避免 TV 自动抓出来的可疑案例污染 prompt。
+
+_SOURCE_LABELS: dict[str, str] = {
+    "negative_manual_rewrite": "🟥 手动重写（高置信）",
+    "negative_feedback_iter":  "🟧 反馈迭代（中）",
+    "negative_batch_rejected": "🟨 批次卡（低）",
+}
+
+
+def _render_negative_proposal_review(
+    db_client: Client, project_id: str, project_name: str,
+) -> None:
+    """渲染待审核的负例候选列表 + 确认 / 驳回操作。"""
+    st.subheader("待审核的负例候选")
+    st.caption(
+        "外部源（Truth Vault 等）会把可疑的负例案例写到这里。"
+        "**确认**后才会进入飞轮 prompt 的 negative pool，**驳回**则只清掉候选标记不动 item。"
+    )
+
+    try:
+        proposals = db.list_negative_proposals(db_client, project_id)
+    except Exception as e:
+        st.error(f"读取候选失败：{e}")
+        return
+
+    if not proposals:
+        st.info("当前没有待审核的负例候选。")
+        return
+
+    st.caption(f"共 {len(proposals)} 条 · 按 created_at 倒序")
+    for p in proposals:
+        item_id = p.get("item_id")
+        title = (p.get("title") or "(无标题)").strip()
+        body = (p.get("body") or "").strip()
+        source = _SOURCE_LABELS.get(p.get("proposal") or "", p.get("proposal") or "未知")
+        tactic = p.get("tactic") or "—"
+        # 折叠每一条避免长列表撑屏；标题截 40 字符，预览展开后才看全文
+        title_short = title[:40] + ("…" if len(title) > 40 else "")
+        with st.expander(f"📄 {title_short}  ·  {source}", expanded=False):
+            st.caption(f"批次方向：{tactic}")
+            if title:
+                st.markdown(f"**标题：** {title}")
+            if body:
+                st.markdown("**正文预览：**")
+                preview = body[:500] + ("…" if len(body) > 500 else "")
+                st.text(preview)
+            col_ok, col_skip = st.columns(2)
+            with col_ok:
+                if st.button(
+                    "✓ 确认为负例",
+                    key=f"neg_confirm_{item_id}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    try:
+                        db.confirm_negative_proposal(db_client, item_id)
+                        st.toast("✓ 已升级为负例，下次生成会进入 negative pool", icon="✅")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"确认失败：{exc}")
+            with col_skip:
+                if st.button(
+                    "✕ 驳回",
+                    key=f"neg_dismiss_{item_id}",
+                    use_container_width=True,
+                ):
+                    try:
+                        db.dismiss_negative_proposal(db_client, item_id)
+                        st.toast("已驳回这条候选", icon="🗑️")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"驳回失败：{exc}")
 
 
 def _render_bottom_tools(
