@@ -61,6 +61,10 @@ def build_combined_excel(items: list[dict]) -> bytes:
         #keyword1 #keyword2 #keyword3
 
     Designed for copy-paste into Feishu / Notion tables or direct posting.
+
+    2026-05-21：A 列保持单列粘付飞书的用法不变；B 列写一个 JSON 的 lineage
+    包并把整列 hidden=True，给 TV 反向归因用。用户粘付时按列选 A 不会带到
+    B；要做反向归因的脚本读 B 列即可。
     """
     if not _OPENPYXL_AVAILABLE:
         raise RuntimeError("openpyxl 未安装，请运行 pip install openpyxl")
@@ -94,7 +98,22 @@ def build_combined_excel(items: list[dict]) -> bytes:
         cell = ws.cell(row=row_idx, column=1, value=_safe_cell_value("\n".join(parts)))
         cell.alignment = cell_align
 
+        # B 列：lineage JSON。只在有任一 id 时写，避免给老接入方留下一片
+        # 空 JSON object 还要解析。json.dumps 保证 None / 缺失字段都安全。
+        lineage_keys = ("project_id", "batch_id", "item_id", "version_id",
+                        "ai_engine", "version_num")
+        lineage = {k: item.get(k) for k in lineage_keys if item.get(k) is not None}
+        if lineage:
+            b_cell = ws.cell(
+                row=row_idx, column=2,
+                value=_safe_cell_value(json.dumps(lineage, ensure_ascii=False)),
+            )
+            b_cell.alignment = cell_align
+
     ws.column_dimensions["A"].width = 80
+    # 隐藏 lineage 列：用户视角看不到，但 TV ingest / 数据脚本仍可读
+    ws.column_dimensions["B"].hidden = True
+    ws.column_dimensions["B"].width = 60
 
     buf = io.BytesIO()
     wb.save(buf)
