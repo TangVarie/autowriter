@@ -1835,6 +1835,95 @@ def list_example_items(
     return examples
 
 
+# ── 负例候选审核（example_label_proposal）─────────────────────────────────
+# TV 飞轮把候选负例写到 items.example_label_proposal，用户在 Memory Manager
+# 的"负例候选审核" tab 人工确认才升级为 example_label='negative'。这样
+# build_system_prompt 只读 example_label，候选不会污染 prompt 池。
+
+@_cache_data(ttl=30, show_spinner=False)
+def list_negative_proposals(
+    _client: Client, project_id: str, limit: int = 50,
+) -> list[dict]:
+    """List items with a pending example_label_proposal in this project.
+
+    Returns list of dicts with: item_id, title, body, proposal (3 个负例来源
+    label), batch_id, created_at. 用 batches!inner 跨所有 batch 取，不依赖
+    最近 N batch 窗口（同 list_example_items 的设计）。
+    """
+    res = (
+        _client.table("items")
+        .select(
+            "id, best_version_id, created_at, batch_id, "
+            "example_label_proposal, "
+            "versions(id, title, body, version_num), "
+            "batches!inner(project_id, tactic)"
+        )
+        .eq("batches.project_id", project_id)
+        .not_.is_("example_label_proposal", "null")
+        .is_("example_label", "null")  # 已经确认为 example 的不再列在候选里
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    out: list[dict] = []
+    for item in (res.data or []):
+        versions = item.get("versions") or []
+        if not versions:
+            continue
+        best_vid = item.get("best_version_id")
+        chosen = next((v for v in versions if v.get("id") == best_vid), None) \
+            or max(versions, key=lambda v: v.get("version_num", 0))
+        out.append({
+            "item_id":  item.get("id"),
+            "batch_id": item.get("batch_id"),
+            "tactic":   (item.get("batches") or {}).get("tactic"),
+            "title":    (chosen.get("title") or "").strip(),
+            "body":     (chosen.get("body") or "").strip(),
+            "proposal": item.get("example_label_proposal"),
+            "created_at": item.get("created_at"),
+        })
+    return out
+
+
+def confirm_negative_proposal(client: Client, item_id: str) -> dict:
+    """User 在 UI 上点"确认为负例"：写 example_label='negative'，清空 proposal。
+
+    清两份 cache：list_example_items（注入路径要立刻看到新增的负例）+
+    list_negative_proposals（审核 tab 要把这条移出候选列表）。
+    """
+    res = (
+        client.table("items")
+        .update({"example_label": "negative", "example_label_proposal": None})
+        .eq("id", item_id)
+        .execute()
+    )
+    for fn in (list_example_items, list_negative_proposals, list_items):
+        try:
+            fn.clear()
+        except Exception:
+            pass
+    return (res.data or [{}])[0]
+
+
+def dismiss_negative_proposal(client: Client, item_id: str) -> dict:
+    """User 点"驳回"：只清空 proposal，不写 example_label。
+
+    清 list_negative_proposals cache 让审核 tab 立刻把这条移出。
+    """
+    res = (
+        client.table("items")
+        .update({"example_label_proposal": None})
+        .eq("id", item_id)
+        .execute()
+    )
+    try:
+        list_negative_proposals.clear()
+    except Exception:
+        pass
+    return (res.data or [{}])[0]
+
+
 def _is_rule_memory(row: dict) -> bool:
     """True if a memory row should be treated as a durable rule (default for
     rows predating the ``memory_type`` column)."""
