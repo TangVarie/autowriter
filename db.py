@@ -312,6 +312,34 @@ CREATE POLICY batch_metrics_owner ON batch_metrics
 CREATE INDEX IF NOT EXISTS batch_metrics_project_idx
     ON batch_metrics(project_id, created_at DESC);
 
+-- 2026-05: 登录审计——识别"一号多人共享"
+-- 每次成功 sign_in 落一行；token_refresh / sign_up 不入表（避免噪音）。
+-- 客户端 IP / UA 由 Streamlit ``st.context.headers`` 抓取（X-Forwarded-For
+-- 经过 Streamlit Cloud 代理后保留真实客户端 IP）。
+-- 单账号短期出现多个 distinct IP/UA → 共享嫌疑。
+CREATE TABLE IF NOT EXISTS user_logins (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id     UUID NOT NULL,
+    ip          TEXT,
+    user_agent  TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE user_logins ENABLE ROW LEVEL SECURITY;
+-- 审计表 append-only：用户只能 SELECT/INSERT 自己的行，UPDATE/DELETE 一律
+-- 禁止——否则被检测出"一号多人"的用户能直接 DELETE 掉自己的登录历史，
+-- 整张表的可信度就没了。拆成两条独立 policy（FOR SELECT / FOR INSERT），
+-- 不写 UPDATE / DELETE policy = PG 默认 deny。GRANT 块里也单独把 user_logins
+-- 拎出来只授 SELECT, INSERT 给 authenticated（防 GRANT/RLS 双层失效）。
+DROP POLICY IF EXISTS user_logins_owner ON user_logins;
+DROP POLICY IF EXISTS user_logins_select_own ON user_logins;
+DROP POLICY IF EXISTS user_logins_insert_own ON user_logins;
+CREATE POLICY user_logins_select_own ON user_logins
+    FOR SELECT USING (user_id = auth.uid());
+CREATE POLICY user_logins_insert_own ON user_logins
+    FOR INSERT WITH CHECK (user_id = auth.uid());
+CREATE INDEX IF NOT EXISTS user_logins_user_idx
+    ON user_logins(user_id, created_at DESC);
+
 -- ── Data API grants ──────────────────────────────────────────────────────
 -- Forward-compat for Supabase's May/Oct 2026 change: new tables in "public"
 -- will no longer be auto-exposed to PostgREST/supabase-js/GraphQL without an
@@ -327,8 +355,11 @@ CREATE INDEX IF NOT EXISTS batch_metrics_project_idx
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     projects, batches, items, versions, memories, batch_metrics
     TO authenticated;
+-- user_logins 是审计表：only SELECT + INSERT for authenticated（append-only），
+-- 防止用户改/删自己的登录历史。service_role 走 SQL Editor 看全部 / 必要时清理。
+GRANT SELECT, INSERT ON user_logins TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-    projects, batches, items, versions, memories, batch_metrics
+    projects, batches, items, versions, memories, batch_metrics, user_logins
     TO service_role;
 
 -- ─────────────────────────────────────────────────────────────────────────
@@ -1498,6 +1529,32 @@ def insert_batch_metrics(
         telemetry.log_event(
             "batch_metrics_persist_failed",
             batch_id=batch_id, error=str(exc)[:200],
+        )
+
+
+def record_user_login(
+    client: Client,
+    user_id: str,
+    ip: Optional[str],
+    user_agent: Optional[str],
+) -> None:
+    """登录成功后落一行到 user_logins，用于"一号多人共享"检测。
+
+    失败静默（不能因为审计写入失败把登录流程拖死）。client 需要带新签发
+    的 JWT —— RLS 用 ``auth.uid() = user_id`` 校验。
+    """
+    if not user_id:
+        return
+    try:
+        client.table("user_logins").insert({
+            "user_id":    user_id,
+            "ip":         ip or None,
+            "user_agent": (user_agent or "")[:500] or None,
+        }).execute()
+    except Exception as exc:
+        telemetry.log_event(
+            "user_login_persist_failed",
+            user_id=user_id, error=str(exc)[:200],
         )
 
 
