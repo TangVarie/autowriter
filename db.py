@@ -310,9 +310,18 @@ CREATE TABLE IF NOT EXISTS user_logins (
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 ALTER TABLE user_logins ENABLE ROW LEVEL SECURITY;
+-- 审计表 append-only：用户只能 SELECT/INSERT 自己的行，UPDATE/DELETE 一律
+-- 禁止——否则被检测出"一号多人"的用户能直接 DELETE 掉自己的登录历史，
+-- 整张表的可信度就没了。拆成两条独立 policy（FOR SELECT / FOR INSERT），
+-- 不写 UPDATE / DELETE policy = PG 默认 deny。GRANT 块里也单独把 user_logins
+-- 拎出来只授 SELECT, INSERT 给 authenticated（防 GRANT/RLS 双层失效）。
 DROP POLICY IF EXISTS user_logins_owner ON user_logins;
-CREATE POLICY user_logins_owner ON user_logins
-    USING (user_id = auth.uid());
+DROP POLICY IF EXISTS user_logins_select_own ON user_logins;
+DROP POLICY IF EXISTS user_logins_insert_own ON user_logins;
+CREATE POLICY user_logins_select_own ON user_logins
+    FOR SELECT USING (user_id = auth.uid());
+CREATE POLICY user_logins_insert_own ON user_logins
+    FOR INSERT WITH CHECK (user_id = auth.uid());
 CREATE INDEX IF NOT EXISTS user_logins_user_idx
     ON user_logins(user_id, created_at DESC);
 
@@ -329,8 +338,11 @@ CREATE INDEX IF NOT EXISTS user_logins_user_idx
 -- role`` keeps full access for any admin scripts; ``authenticated`` gets the
 -- standard CRUD set and RLS does the per-user filtering.
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-    projects, batches, items, versions, memories, batch_metrics, user_logins
+    projects, batches, items, versions, memories, batch_metrics
     TO authenticated;
+-- user_logins 是审计表：only SELECT + INSERT for authenticated（append-only），
+-- 防止用户改/删自己的登录历史。service_role 走 SQL Editor 看全部 / 必要时清理。
+GRANT SELECT, INSERT ON user_logins TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     projects, batches, items, versions, memories, batch_metrics, user_logins
     TO service_role;
