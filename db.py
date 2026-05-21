@@ -1769,21 +1769,23 @@ def delete_memory(client: Client, memory_id: str) -> None:
 def set_item_example_label(
     client: Client, item_id: str, label: Optional[str]
 ) -> dict:
-    """Set or clear the example_label on an item ('positive', 'negative', or None)."""
+    """Set or clear the example_label on an item ('positive', 'negative', or None).
+
+    同时清掉 list_example_items / list_items / list_labeled_items 三处
+    cache，让"审核与迭代"卡片、Memory Manager 的"已确认"列表、注入路径
+    都立刻反映新状态。
+    """
     res = (
         client.table("items")
         .update({"example_label": label})
         .eq("id", item_id)
         .execute()
     )
-    try:
-        list_example_items.clear()
-    except Exception:
-        pass
-    try:
-        list_items.clear()
-    except Exception:
-        pass
+    for fn in (list_example_items, list_items, list_labeled_items):
+        try:
+            fn.clear()
+        except Exception:
+            pass
     return res.data[0]
 
 
@@ -1922,6 +1924,50 @@ def dismiss_negative_proposal(client: Client, item_id: str) -> dict:
     except Exception:
         pass
     return (res.data or [{}])[0]
+
+
+@_cache_data(ttl=30, show_spinner=False)
+def list_labeled_items(
+    _client: Client, project_id: str, limit: int = 50,
+) -> list[dict]:
+    """List items already in the example pool (example_label IS NOT NULL).
+
+    给 Memory Manager 的"已确认 example 管理"用，让用户能撤销 / 切换标签。
+    返回 item_id 等管理需要的字段，跟 list_example_items 区分（后者只供
+    prompt 注入用，没必要带 id）。
+    """
+    res = (
+        _client.table("items")
+        .select(
+            "id, batch_id, best_version_id, created_at, example_label, "
+            "versions(id, title, body, version_num), "
+            "batches!inner(project_id, tactic)"
+        )
+        .eq("batches.project_id", project_id)
+        .not_.is_("example_label", "null")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+
+    out: list[dict] = []
+    for item in (res.data or []):
+        versions = item.get("versions") or []
+        if not versions:
+            continue
+        best_vid = item.get("best_version_id")
+        chosen = next((v for v in versions if v.get("id") == best_vid), None) \
+            or max(versions, key=lambda v: v.get("version_num", 0))
+        out.append({
+            "item_id":  item.get("id"),
+            "batch_id": item.get("batch_id"),
+            "tactic":   (item.get("batches") or {}).get("tactic"),
+            "title":    (chosen.get("title") or "").strip(),
+            "body":     (chosen.get("body") or "").strip(),
+            "label":    item.get("example_label"),
+            "created_at": item.get("created_at"),
+        })
+    return out
 
 
 def _is_rule_memory(row: dict) -> bool:
