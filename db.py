@@ -1891,8 +1891,13 @@ def list_negative_proposals(
 def confirm_negative_proposal(client: Client, item_id: str) -> dict:
     """User 在 UI 上点"确认为负例"：写 example_label='negative'，清空 proposal。
 
-    清两份 cache：list_example_items（注入路径要立刻看到新增的负例）+
-    list_negative_proposals（审核 tab 要把这条移出候选列表）。
+    清四份 cache：
+    - list_example_items     注入路径要立刻看到新增的负例
+    - list_negative_proposals 审核 tab 要把这条移出"待审核"段
+    - list_items             审核与迭代页的卡片要立刻显示新 label
+    - list_labeled_items     "已确认 example 池"段要立刻看到新进池的这条
+                              （30s TTL 不清会让用户 rerun 后看不到自己刚
+                              确认的 item，flow 看起来不一致）
     """
     res = (
         client.table("items")
@@ -1900,7 +1905,7 @@ def confirm_negative_proposal(client: Client, item_id: str) -> dict:
         .eq("id", item_id)
         .execute()
     )
-    for fn in (list_example_items, list_negative_proposals, list_items):
+    for fn in (list_example_items, list_negative_proposals, list_items, list_labeled_items):
         try:
             fn.clear()
         except Exception:
