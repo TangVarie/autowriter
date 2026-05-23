@@ -747,7 +747,11 @@ def _queue_worker_impl(
                 project_mems, context_text, report_sink=inject_report,
             )
 
-            full_system_prompt = mem_module.build_system_prompt(
+            # Phase 1：用 layered builder 拿 5 段 dict（stable/tactic/p0/p1/p2），
+            # 直接传给 generator —— Claude 路径会按 cache_control 分层、
+            # Gemini 路径会拼回单字符串。跟 build_system_prompt 返回的字符串
+            # byte-identical（layered_system_prompt_to_string 验证过）。
+            full_system_prompt = mem_module.build_layered_system_prompt(
                 base_prompt=base_prompt,
                 global_memories=global_mems_for_plan,
                 project_memories=project_mems_for_plan,
@@ -2651,8 +2655,9 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
 
         # Day 4：注入可视化（quick gen 与 queue worker 行为一致）
+        # Phase 1：同 worker 路径，用 layered builder。
         inject_report: dict = {"filtered": []}
-        full_system_prompt = mem_module.build_system_prompt(
+        full_system_prompt = mem_module.build_layered_system_prompt(
             base_prompt=project.get("system_prompt", ""),
             global_memories=global_mems,
             project_memories=project_mems,
@@ -4209,7 +4214,9 @@ def _run_iteration(
     session_instr = db.get_session_instructions(db_client, user_id, project_id=project_id)
     tactic = batch.get("tactic", "")
     tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic)
-    full_system_prompt = mem_module.build_system_prompt(
+    # Phase 1：同 batch 生成路径，iterate 走 layered—— 跟同项目主生成共享
+    # cache（5 分钟 TTL 内）。
+    full_system_prompt = mem_module.build_layered_system_prompt(
         base_prompt=base_prompt,
         global_memories=global_mems,
         project_memories=project_mems,
