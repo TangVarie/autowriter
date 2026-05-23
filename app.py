@@ -330,6 +330,7 @@ def _try_regen_one(
                 user_id=regen_ctx.get("user_id", ""),
                 project_id=project_id,
                 metrics=metrics,
+                metrics_source="dedup_regen",
             )
         except Exception as exc:
             errors_sink.append(f"{error_prefix}重生异常：{exc}")
@@ -338,8 +339,6 @@ def _try_regen_one(
         if not results:
             continue
         new_version = results[0]["versions"][0] if results[0].get("versions") else None
-        if new_version and new_version.token_usage:
-            metrics.add_tokens(new_version.ai_engine, new_version.token_usage, source="dedup_regen")
         if not new_version or new_version.error or not new_version.title:
             continue
 
@@ -890,13 +889,9 @@ def _queue_worker_impl(
                 )
 
             metrics.stop_phase("llm")
-
-            # 累计主生成的 token_usage 到 metrics（compliance_recheck 由
-            # generator 内部直接挂 metrics，已经记好；这里只补"主"调用）。
-            for slot in generation_results or []:
-                for vr in slot.get("versions", []):
-                    if vr.token_usage:
-                        metrics.add_tokens(vr.ai_engine, vr.token_usage, source="main")
+            # token usage 累加在 generator 内部的 _engine_call 边界完成
+            # （一次 API 调用 = 一次累加），避免对 ``count`` 个共享同一份
+            # token_usage 的 version 重复加导致 count 倍膨胀。
 
             # ── [E 保存] 批量写 items + versions（统一服务 _save_batch_results）──
             metrics.start_phase("db_save")
@@ -1117,11 +1112,29 @@ def _fmt_tok(n: int) -> str:
     return str(int(n))
 
 
-def _render_token_panel(meta: dict) -> None:
+def _render_token_panel(meta) -> None:
     """渲染本批的 token 用量 + 估算费用 + cache 命中。两个面板（队列实时
-    / 历史回看）共享。``meta`` 来自 ``BatchMetrics.to_dict()["meta"]``。"""
-    totals = (meta or {}).get("token_totals") or {}
-    if not totals:
+    / 历史回看）共享。
+
+    ``meta`` 通常是 ``BatchMetrics.to_dict()["meta"]``，但历史页从 DB 取出的
+    JSONB 字段可能以字符串形态回来（同文件的 phase_ms / counters 都需要 json
+    解一次，meta 同样要做），所以这里再容错一层 JSON parse，确保历史 expander
+    不会因为 str.get 崩溃整页。
+    """
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    if not isinstance(meta, dict):
+        return
+    totals = meta.get("token_totals") or {}
+    if isinstance(totals, str):
+        try:
+            totals = json.loads(totals)
+        except Exception:
+            totals = {}
+    if not isinstance(totals, dict) or not totals:
         return
     cost = float(totals.get("cost_usd") or 0.0)
     by_model = totals.get("by_model") or {}
@@ -2698,11 +2711,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             )
 
         metrics.stop_phase("llm")
-
-        for slot in generation_results or []:
-            for vr in slot.get("versions", []):
-                if vr.token_usage:
-                    metrics.add_tokens(vr.ai_engine, vr.token_usage, source="main")
+        # token usage 累加在 generator 内部完成（见 _engine_call）
 
         # ── 批量保存：复用与 _queue_worker 完全相同的 _save_batch_results ──
         # （修 R1：之前是 create_item / create_version 逐条 INSERT，

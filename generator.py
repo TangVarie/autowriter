@@ -70,9 +70,12 @@ def _extract_claude_usage(usage) -> dict:
       ``cache_read_input_tokens``        从缓存命中读取的 token（计费 0.1×）
     总输入 = 三者之和；按这种语义把字段透传上去，``estimate_cost_usd`` 会
     按 family rate 分别计价。
+
+    ``usage`` 为 None（中转站没回 usage 字段 / SDK 升级前的旧响应）时
+    仍返回零填充字典——下游 diag 字符串会取 ``token_usage['output']``，
+    返回 ``{}`` 会让本来该走 ``"无 usage"`` 退化路径的请求触发 KeyError、
+    把一条本可成功的生成误标成错误。
     """
-    if usage is None:
-        return {}
     return {
         "input":        int(getattr(usage, "input_tokens", 0) or 0),
         "output":       int(getattr(usage, "output_tokens", 0) or 0),
@@ -87,9 +90,9 @@ def _extract_gemini_usage(usage) -> dict:
     Gemini 的 ``cached_content_token_count`` 是 ``prompt_token_count`` 的子集
     （Anthropic 是互斥），``estimate_cost_usd`` 会按 engine 类型识别这一差异。
     我们这里照原样存，不做减法——保留原始读数便于排查。
+
+    ``usage`` 为 None 时返回零填充而非空 dict，理由同 Claude 版。
     """
-    if usage is None:
-        return {}
     return {
         "input":      int(getattr(usage, "prompt_token_count", 0) or 0),
         "output":     int(getattr(usage, "candidates_token_count", 0) or 0),
@@ -1017,6 +1020,7 @@ def generate_batch(
     user_id: str = "",
     project_id: str = "",
     metrics: Optional["telemetry.BatchMetrics"] = None,
+    metrics_source: str = "main",
 ) -> list[dict]:
     """
     Generate `count` copy items using specified engines.
@@ -1094,6 +1098,15 @@ def generate_batch(
                 )
                 for _ in range(count)
             ]
+        # ``engine.generate(count=N)`` 是一次 API 调用返回 N 个 GenerationResult，
+        # 这 N 个共享同一个 ``token_usage`` dict 引用——上层若按 version 逐条累加
+        # 会把 input/output/cost 放大 N 倍（review #1 命中）。这里在 engine 调用
+        # 边界一次性归集，下游就不再 per-version 累加。
+        if metrics is not None and items:
+            head_usage = next((it.token_usage for it in items if it.token_usage), None)
+            if head_usage:
+                head_engine = next((it.ai_engine for it in items if it.ai_engine), engine_name)
+                metrics.add_tokens(head_engine, head_usage, source=metrics_source)
         return engine_name, items
 
     engine_results: dict[str, list[GenerationResult]] = {}
