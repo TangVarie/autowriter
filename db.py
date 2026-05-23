@@ -376,14 +376,19 @@ ALTER TABLE generation_sessions ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS generation_sessions_owner ON generation_sessions;
 CREATE POLICY generation_sessions_owner ON generation_sessions
     USING (user_id = auth.uid());
--- 路由查询索引: 找"项目 X 在模型 Y 上的 active session"是热路径
--- (每批生成开头都要查一次)。
-CREATE INDEX IF NOT EXISTS generation_sessions_route_idx
+-- 路由 UNIQUE partial index: 防止并发 worker 同时为同一 routing key 各自
+-- insert 一条 active session(后续 get_or_create_active_session 用 .limit(1)
+-- 无 order,可能交替绑到不同 session, 撕裂对话历史)。两个 insert race 时
+-- 一条会撞 23505 unique violation, helper 内部 catch 后重 lookup 拿到先
+-- 成功那条。已部署环境通过 ALTER 迁移过(旧版叫 generation_sessions_route
+-- _idx,这里用新名 _uniq 表达约束变化,部署脚本 DROP 旧名 + CREATE 新名)。
+CREATE UNIQUE INDEX IF NOT EXISTS generation_sessions_route_uniq
     ON generation_sessions(project_id, engine, model_id, base_prompt_hash)
     WHERE status = 'active';
--- 按项目列 session 的索引(UI 面板用)
+-- 按项目列 session 的索引(UI 面板用)。Key 用 last_used_at 跟 list_project
+-- _sessions 的 ORDER BY 一致, 避免 extra sort。
 CREATE INDEX IF NOT EXISTS generation_sessions_project_idx
-    ON generation_sessions(project_id, created_at DESC);
+    ON generation_sessions(project_id, last_used_at DESC);
 
 -- session_messages: 每条 turn 一行(user / assistant 交替)
 --
@@ -2324,10 +2329,22 @@ def get_or_create_active_session(
     """Find existing ``status='active'`` session matching the 4 routing keys,
     or insert one with ``window_limit`` snapshotted at creation time.
 
-    Returns the session row (含 id) or None if both lookup and insert fail.
+    Returns the session row (含 id) or None **only when both lookup and
+    insert paths exhaust without success**:
+
+      lookup OK + found      → return existing
+      lookup OK + not found  → insert; OK → return new; conflict → re-lookup
+      lookup FAILED          → still try insert (transient PostgREST GET
+                               errors shouldn't kill the routing); insert OK
+                               → return new; insert FAILED → re-lookup once
+                               more to recover if race partner just won
+
+    The route_uniq partial index (UNIQUE on project/engine/model/hash WHERE
+    status='active') makes the insert deterministic under concurrency —
+    second worker hits 23505, we catch and re-lookup to bind to the winner.
     """
-    try:
-        existing = (
+    def _lookup() -> Optional[dict]:
+        res = (
             client.table("generation_sessions")
             .select("*")
             .eq("project_id", project_id)
@@ -2338,19 +2355,23 @@ def get_or_create_active_session(
             .limit(1)
             .execute()
         )
-        if existing.data:
-            return existing.data[0]
+        return res.data[0] if res.data else None
+
+    # 1. Initial lookup — failure here doesn't short-circuit; insert path may
+    #    still succeed (or fail and we re-lookup as race recovery).
+    try:
+        existing = _lookup()
+        if existing is not None:
+            return existing
     except Exception as exc:
         telemetry.log_event(
             "generation_session_lookup_failed",
             project_id=project_id, engine=engine, model_id=model_id,
             error=str(exc)[:200],
         )
-        return None
+        # Continue to insert path
 
-    # No active session yet -> insert. 路由 index 上 status='active' 的部分
-    # 索引保证查询路径快;没加 unique 约束(允许并发同步 race 写入两条 active,
-    # 后续 reconcile 由 worker 自己处理 / 后续 PR 加 lock 决定)。
+    # 2. Insert. UNIQUE partial index makes this race-safe.
     try:
         payload = {
             "project_id":        project_id,
@@ -2362,14 +2383,24 @@ def get_or_create_active_session(
             "user_id":           user_id,
         }
         res = client.table("generation_sessions").insert(payload).execute()
-        return (res.data or [None])[0]
+        if res.data:
+            return res.data[0]
     except Exception as exc:
         telemetry.log_event(
             "generation_session_create_failed",
             project_id=project_id, engine=engine, model_id=model_id,
             error=str(exc)[:200],
         )
-        return None
+        # Insert failure most commonly = 23505 (another worker just won
+        # the race for this routing key). Re-lookup to bind to the winner.
+        try:
+            recovered = _lookup()
+            if recovered is not None:
+                return recovered
+        except Exception:
+            pass
+
+    return None
 
 
 def list_session_messages(client: Client, session_id: str) -> list[dict]:
@@ -2393,6 +2424,21 @@ def list_session_messages(client: Client, session_id: str) -> list[dict]:
         return []
 
 
+_APPEND_RETRY_MAX = 3
+_APPEND_RETRY_BASE_DELAY = 0.05  # seconds
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    """Heuristic detection of PostgreSQL 23505 unique_violation in Supabase
+    Python client errors. The SDK wraps everything in generic exceptions,
+    so we fall back to substring match on the error message — concrete
+    forms vary by client version but always contain '23505', 'duplicate',
+    or 'unique' somewhere.
+    """
+    s = str(exc).lower()
+    return "23505" in s or "duplicate key" in s or "unique constraint" in s
+
+
 def append_session_messages(
     client: Client,
     session_id: str,
@@ -2405,50 +2451,74 @@ def append_session_messages(
     ``turn_idx`` 由本函数自动计算(从当前 max + 1 开始递增,bulk insert)。
     ``batch_id`` 是触发本次 commit 的 batch(可空,但通常都有)。
 
-    返回成功插入的行数;失败返回 0。
+    Returns: 成功插入的行数;失败返回 0。
+
+    并发安全: read-max-then-insert 是 race-prone 的(两个 worker 同时往
+    一个 session 写会同时读到一样的 max → insert 时撞
+    ``session_messages_session_turn_uniq`` 23505),所以包了 retry loop。
+    碰到 unique violation 退避一下重新算 max + 重试,最多 N 次。其它
+    错误立即返回 0(transient 错误另外的层级会自然恢复;持久错误重试也
+    没用)。
+
+    实际使用: Phase 2.1+ 的 worker 是队列串行单线程,正常情况下不会有
+    并发追加同 session 的场景;此处加 retry 是防御性 + 给"未来允许并行
+    生成"留余地。
     """
     if not messages:
         return 0
-    try:
-        # 拿当前最大 turn_idx,新插入从 next_idx 起累加
-        cur = (
-            client.table("session_messages")
-            .select("turn_idx")
-            .eq("session_id", session_id)
-            .order("turn_idx", desc=True)
-            .limit(1)
-            .execute()
-        )
-        next_idx = ((cur.data[0]["turn_idx"] + 1) if cur.data else 0)
 
-        rows = []
-        for i, m in enumerate(messages):
-            role = (m.get("role") or "").lower()
-            if role not in ("user", "assistant"):
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_APPEND_RETRY_MAX):
+        try:
+            # 拿当前最大 turn_idx, 新插入从 next_idx 起累加
+            cur = (
+                client.table("session_messages")
+                .select("turn_idx")
+                .eq("session_id", session_id)
+                .order("turn_idx", desc=True)
+                .limit(1)
+                .execute()
+            )
+            next_idx = ((cur.data[0]["turn_idx"] + 1) if cur.data else 0)
+
+            rows = []
+            for i, m in enumerate(messages):
+                role = (m.get("role") or "").lower()
+                if role not in ("user", "assistant"):
+                    continue
+                content = m.get("content")
+                # content 必须是 JSON-serializable 的 dict/list — Supabase 会
+                # 拒绝裸字符串往 JSONB 列写。统一包成 {"text": str} 形式以兼容
+                # 调用方传 str 的便利写法。
+                if isinstance(content, str):
+                    content = {"text": content}
+                rows.append({
+                    "session_id":   session_id,
+                    "turn_idx":     next_idx + i,
+                    "role":         role,
+                    "content":      content,
+                    "batch_id":     batch_id,
+                })
+            if not rows:
+                return 0
+            res = client.table("session_messages").insert(rows).execute()
+            return len(res.data or [])
+        except Exception as exc:
+            last_exc = exc
+            if _is_unique_violation(exc) and attempt < _APPEND_RETRY_MAX - 1:
+                # 并发 race: 让对方先 commit 完,我们重读 max + 重试
+                import time as _time
+                _time.sleep(_APPEND_RETRY_BASE_DELAY * (attempt + 1))
                 continue
-            content = m.get("content")
-            # content 必须是 JSON-serializable 的 dict/list — Supabase 会
-            # 拒绝裸字符串往 JSONB 列写。统一包成 {"text": str} 形式以兼容
-            # 调用方传 str 的便利写法。
-            if isinstance(content, str):
-                content = {"text": content}
-            rows.append({
-                "session_id":   session_id,
-                "turn_idx":     next_idx + i,
-                "role":         role,
-                "content":      content,
-                "batch_id":     batch_id,
-            })
-        if not rows:
-            return 0
-        res = client.table("session_messages").insert(rows).execute()
-        return len(res.data or [])
-    except Exception as exc:
-        telemetry.log_event(
-            "session_messages_append_failed",
-            session_id=session_id, error=str(exc)[:200],
-        )
-        return 0
+            break
+
+    telemetry.log_event(
+        "session_messages_append_failed",
+        session_id=session_id,
+        error=str(last_exc)[:200] if last_exc else "unknown",
+        retries=_APPEND_RETRY_MAX,
+    )
+    return 0
 
 
 def add_session_running_tokens(client: Client, session_id: str, delta: int) -> None:
