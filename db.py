@@ -339,6 +339,83 @@ CREATE POLICY batch_metrics_owner ON batch_metrics
 CREATE INDEX IF NOT EXISTS batch_metrics_project_idx
     ON batch_metrics(project_id, created_at DESC);
 
+-- 2026-05 Phase 2: 跨批 prompt caching 的"对话会话"持久化
+--
+-- 设计动机：Phase 1 让 Claude 单批之内 / 5min 内连续生成命中 cache。Phase 2
+-- 把"已审核通过"的历史生成内容作为 conversation history (messages prefix)
+-- 喂给下一批,让模型基于自己的过往输出继续创作——比当前每批塞 20 条历史
+-- 标题进 user prompt 末尾(每批都变破坏 cache)信号强 N 倍。
+--
+-- session 切分维度: (project_id, engine, model_id, base_prompt_hash)。
+-- 同项目同模型在 base_prompt 不变时继续累积; 跨模型 / base 改了 / 撞窗口
+-- 才开新 session。RLS 跟 batches/items 一致按 user_id 隔离。
+CREATE TABLE IF NOT EXISTS generation_sessions (
+    id                    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id            UUID REFERENCES projects(id) ON DELETE CASCADE,
+    engine                TEXT NOT NULL,                    -- 'claude' / 'gemini'
+    model_id              TEXT NOT NULL,                    -- e.g. 'claude-sonnet-4-6'
+    base_prompt_hash      TEXT NOT NULL,                    -- sha256 of project.system_prompt
+    status                TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active','sealed','archived')),
+    seal_reason           TEXT
+        CHECK (seal_reason IS NULL OR seal_reason IN
+            ('window_full','context_error','base_changed','manual')),
+    -- 累积 input tokens(粗略): 每次 LLM 调用后追加 usage.input + cache_create
+    -- + cache_read。用于软警告(>= window_limit*0.8) + UI 进度条;不影响实际
+    -- API 调用——撞窗口的硬边界靠 API 返回 context_length_exceeded 兜底。
+    running_input_tokens  BIGINT NOT NULL DEFAULT 0,
+    -- session 建立时 snapshot 一份 model 的 context window(避免后续 config
+    -- 改了 window 数让本 session 进度条跳变)。
+    window_limit          BIGINT NOT NULL,
+    user_id               UUID NOT NULL,
+    created_at            TIMESTAMPTZ DEFAULT NOW(),
+    last_used_at          TIMESTAMPTZ DEFAULT NOW(),
+    sealed_at             TIMESTAMPTZ NULL
+);
+ALTER TABLE generation_sessions ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS generation_sessions_owner ON generation_sessions;
+CREATE POLICY generation_sessions_owner ON generation_sessions
+    USING (user_id = auth.uid());
+-- 路由查询索引: 找"项目 X 在模型 Y 上的 active session"是热路径
+-- (每批生成开头都要查一次)。
+CREATE INDEX IF NOT EXISTS generation_sessions_route_idx
+    ON generation_sessions(project_id, engine, model_id, base_prompt_hash)
+    WHERE status = 'active';
+-- 按项目列 session 的索引(UI 面板用)
+CREATE INDEX IF NOT EXISTS generation_sessions_project_idx
+    ON generation_sessions(project_id, created_at DESC);
+
+-- session_messages: 每条 turn 一行(user / assistant 交替)
+--
+-- ``content`` 用 JSONB 而不是 TEXT,为了承载 Claude/Gemini 的 multi-block
+-- 格式(list[{type,text}]) + 未来扩展(image / tool_use)。当前只用 text 块。
+-- user role: 本批的指令文本; assistant role: 本批通过审核的版本聚合。
+--
+-- ``batch_id`` ON DELETE SET NULL: 删 batch 不应级联删除已经入 session 的
+-- 消息——它已经是"模型对话历史"的一部分,删了反而让前缀错位。SET NULL 后
+-- 仍能从 session 走出"哪条 turn 来自哪个 batch"的回溯关系(NULL = 来源
+-- batch 已被删除)。
+CREATE TABLE IF NOT EXISTS session_messages (
+    id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id    UUID NOT NULL REFERENCES generation_sessions(id) ON DELETE CASCADE,
+    turn_idx      INTEGER NOT NULL,
+    role          TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    content       JSONB NOT NULL,
+    batch_id      UUID REFERENCES batches(id) ON DELETE SET NULL,
+    committed_at  TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE session_messages ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS session_messages_owner ON session_messages;
+-- 跟 versions 一样,通过外键到 generation_sessions.user_id 来做 RLS,避免
+-- 重复存 user_id(session 一改用户/被搬就乱套)。
+CREATE POLICY session_messages_owner ON session_messages
+    USING (
+        session_id IN (SELECT id FROM generation_sessions WHERE user_id = auth.uid())
+    );
+-- 按 (session, turn) 顺序读取是热路径(每批生成前要拉完整历史拼 prefix)。
+CREATE UNIQUE INDEX IF NOT EXISTS session_messages_session_turn_uniq
+    ON session_messages(session_id, turn_idx);
+
 -- 2026-05: 登录审计——识别"一号多人共享"
 -- 每次成功 sign_in 落一行；token_refresh / sign_up 不入表（避免噪音）。
 -- 客户端 IP / UA 由 Streamlit ``st.context.headers`` 抓取（X-Forwarded-For
@@ -380,13 +457,15 @@ CREATE INDEX IF NOT EXISTS user_logins_user_idx
 -- role`` keeps full access for any admin scripts; ``authenticated`` gets the
 -- standard CRUD set and RLS does the per-user filtering.
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-    projects, batches, items, versions, memories, batch_metrics
+    projects, batches, items, versions, memories, batch_metrics,
+    generation_sessions, session_messages
     TO authenticated;
 -- user_logins 是审计表：only SELECT + INSERT for authenticated（append-only），
 -- 防止用户改/删自己的登录历史。service_role 走 SQL Editor 看全部 / 必要时清理。
 GRANT SELECT, INSERT ON user_logins TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
-    projects, batches, items, versions, memories, batch_metrics, user_logins
+    projects, batches, items, versions, memories, batch_metrics, user_logins,
+    generation_sessions, session_messages
     TO service_role;
 
 -- ─────────────────────────────────────────────────────────────────────────
@@ -2214,3 +2293,240 @@ def insert_session_instruction(
             project_id=project_id, error=str(exc)[:200],
         )
         return None
+
+
+# ── Phase 2: Generation Session CRUD ──────────────────────────────────────
+# 跨批 prompt caching 的"对话会话"层。每个 session 按 (project, engine,
+# model, base_prompt_hash) 唯一; 工作流是:
+#
+#   batch 开始前 → get_or_create_active_session() 拿 session.id
+#                → list_session_messages(session.id) 拿历史 prefix
+#                → 把 prefix 拼到 LLM 调用的 messages 数组前面
+#                → 调用 + 累加 metrics + token tally 到 session
+#   batch 通过审核后 → append_session_messages(...) 把"本批 user 指令 +
+#                通过的 assistant 输出"写入 session_messages
+#   batch 撞窗口 / context error → seal_session(session.id, reason)
+#                → 下一批触发新 session 自动创建
+#
+# 本 PR 仅提供数据层 helpers,worker / app 接入留给后续 PR。完整 happy path
+# 测试在 Phase 2.1 接入业务时一起跑;现阶段 helpers 不被任何业务调用。
+
+
+def get_or_create_active_session(
+    client: Client,
+    project_id: str,
+    engine: str,
+    model_id: str,
+    base_prompt_hash: str,
+    user_id: str,
+    window_limit: int,
+) -> Optional[dict]:
+    """Find existing ``status='active'`` session matching the 4 routing keys,
+    or insert one with ``window_limit`` snapshotted at creation time.
+
+    Returns the session row (含 id) or None if both lookup and insert fail.
+    """
+    try:
+        existing = (
+            client.table("generation_sessions")
+            .select("*")
+            .eq("project_id", project_id)
+            .eq("engine", engine)
+            .eq("model_id", model_id)
+            .eq("base_prompt_hash", base_prompt_hash)
+            .eq("status", "active")
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return existing.data[0]
+    except Exception as exc:
+        telemetry.log_event(
+            "generation_session_lookup_failed",
+            project_id=project_id, engine=engine, model_id=model_id,
+            error=str(exc)[:200],
+        )
+        return None
+
+    # No active session yet -> insert. 路由 index 上 status='active' 的部分
+    # 索引保证查询路径快;没加 unique 约束(允许并发同步 race 写入两条 active,
+    # 后续 reconcile 由 worker 自己处理 / 后续 PR 加 lock 决定)。
+    try:
+        payload = {
+            "project_id":        project_id,
+            "engine":            engine,
+            "model_id":          model_id,
+            "base_prompt_hash":  base_prompt_hash,
+            "status":            "active",
+            "window_limit":      int(window_limit),
+            "user_id":           user_id,
+        }
+        res = client.table("generation_sessions").insert(payload).execute()
+        return (res.data or [None])[0]
+    except Exception as exc:
+        telemetry.log_event(
+            "generation_session_create_failed",
+            project_id=project_id, engine=engine, model_id=model_id,
+            error=str(exc)[:200],
+        )
+        return None
+
+
+def list_session_messages(client: Client, session_id: str) -> list[dict]:
+    """按 ``turn_idx`` 升序返回该 session 全部 messages。返回空 list 表示
+    新 session 或读取失败(看 stdout 日志区分)。
+    """
+    try:
+        res = (
+            client.table("session_messages")
+            .select("turn_idx, role, content, batch_id")
+            .eq("session_id", session_id)
+            .order("turn_idx", desc=False)
+            .execute()
+        )
+        return res.data or []
+    except Exception as exc:
+        telemetry.log_event(
+            "session_messages_list_failed",
+            session_id=session_id, error=str(exc)[:200],
+        )
+        return []
+
+
+def append_session_messages(
+    client: Client,
+    session_id: str,
+    messages: list[dict],
+    batch_id: Optional[str] = None,
+) -> int:
+    """批量追加 messages 到 session。
+
+    ``messages`` 形如 ``[{"role": "user", "content": {...}}, ...]``;
+    ``turn_idx`` 由本函数自动计算(从当前 max + 1 开始递增,bulk insert)。
+    ``batch_id`` 是触发本次 commit 的 batch(可空,但通常都有)。
+
+    返回成功插入的行数;失败返回 0。
+    """
+    if not messages:
+        return 0
+    try:
+        # 拿当前最大 turn_idx,新插入从 next_idx 起累加
+        cur = (
+            client.table("session_messages")
+            .select("turn_idx")
+            .eq("session_id", session_id)
+            .order("turn_idx", desc=True)
+            .limit(1)
+            .execute()
+        )
+        next_idx = ((cur.data[0]["turn_idx"] + 1) if cur.data else 0)
+
+        rows = []
+        for i, m in enumerate(messages):
+            role = (m.get("role") or "").lower()
+            if role not in ("user", "assistant"):
+                continue
+            content = m.get("content")
+            # content 必须是 JSON-serializable 的 dict/list — Supabase 会
+            # 拒绝裸字符串往 JSONB 列写。统一包成 {"text": str} 形式以兼容
+            # 调用方传 str 的便利写法。
+            if isinstance(content, str):
+                content = {"text": content}
+            rows.append({
+                "session_id":   session_id,
+                "turn_idx":     next_idx + i,
+                "role":         role,
+                "content":      content,
+                "batch_id":     batch_id,
+            })
+        if not rows:
+            return 0
+        res = client.table("session_messages").insert(rows).execute()
+        return len(res.data or [])
+    except Exception as exc:
+        telemetry.log_event(
+            "session_messages_append_failed",
+            session_id=session_id, error=str(exc)[:200],
+        )
+        return 0
+
+
+def add_session_running_tokens(client: Client, session_id: str, delta: int) -> None:
+    """累加 running_input_tokens + 更新 last_used_at。
+
+    Supabase Python client 不支持服务端 increment 表达式,所以 read-modify-
+    write。并发场景下偶尔丢更新可以接受——这个值只用于软警告 UI,精度不
+    关键(实际撞窗口靠 API 返回 context_length_exceeded 兜底)。
+    """
+    if delta <= 0:
+        return
+    try:
+        cur = (
+            client.table("generation_sessions")
+            .select("running_input_tokens")
+            .eq("id", session_id)
+            .single()
+            .execute()
+        )
+        cur_value = int((cur.data or {}).get("running_input_tokens") or 0)
+        client.table("generation_sessions").update({
+            "running_input_tokens": cur_value + int(delta),
+            "last_used_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", session_id).execute()
+    except Exception as exc:
+        telemetry.log_event(
+            "session_tokens_update_failed",
+            session_id=session_id, error=str(exc)[:200],
+        )
+
+
+def seal_session(client: Client, session_id: str, reason: str) -> bool:
+    """标记 session 为 sealed,记录 seal_reason + sealed_at。
+
+    幂等: 已 sealed 的 session 再调一次只是覆写 sealed_at 时间(无害),
+    不报错。reason 必须在 schema CHECK 列表内
+    (window_full / context_error / base_changed / manual),
+    否则 PG 拒绝。
+    """
+    try:
+        client.table("generation_sessions").update({
+            "status":      "sealed",
+            "seal_reason": reason,
+            "sealed_at":   datetime.now(timezone.utc).isoformat(),
+        }).eq("id", session_id).execute()
+        return True
+    except Exception as exc:
+        telemetry.log_event(
+            "session_seal_failed",
+            session_id=session_id, reason=reason, error=str(exc)[:200],
+        )
+        return False
+
+
+def list_project_sessions(
+    client: Client,
+    project_id: str,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """列出某项目的 session(UI session 进度面板用)。``status`` None 时
+    返回所有状态;给 'active' / 'sealed' 时过滤。
+    """
+    try:
+        q = (
+            client.table("generation_sessions")
+            .select("*")
+            .eq("project_id", project_id)
+            .order("last_used_at", desc=True)
+            .limit(limit)
+        )
+        if status:
+            q = q.eq("status", status)
+        res = q.execute()
+        return res.data or []
+    except Exception as exc:
+        telemetry.log_event(
+            "project_sessions_list_failed",
+            project_id=project_id, error=str(exc)[:200],
+        )
+        return []
