@@ -152,7 +152,7 @@ class BatchMetrics:
             with self._lock:
                 totals = self.meta.setdefault(
                     "token_totals",
-                    {"by_model": {}, "by_source": {}},
+                    {"by_model": {}, "by_source": {}, "by_source_model": {}},
                 )
                 for k in keys:
                     totals[k] = totals.get(k, 0) + int(usage.get(k) or 0)
@@ -167,6 +167,19 @@ class BatchMetrics:
                 for k in keys:
                     per_src[k] = per_src.get(k, 0) + int(usage.get(k) or 0)
                 per_src["cost_usd"] = per_src.get("cost_usd", 0.0) + cost
+
+                # Phase 2.1 review fix: by_source × by_model 二维交叉。
+                # ``_commit_session_tokens`` 只看 source='main' 的 token 累加到
+                # session.running_input_tokens —— compliance_recheck / multi_role
+                # _select / multi_role_refine / dedup_regen 这些不走 session
+                # prefix 的辅助调用本来就不该计入 session 窗口。原有 by_model
+                # 是各 source 总和, 不区分,精确归集需要二维 dict。
+                by_src_model = totals.setdefault("by_source_model", {})
+                src_models = by_src_model.setdefault(source, {})
+                per_sm = src_models.setdefault(model_full, {})
+                for k in keys:
+                    per_sm[k] = per_sm.get(k, 0) + int(usage.get(k) or 0)
+                per_sm["cost_usd"] = per_sm.get("cost_usd", 0.0) + cost
         except Exception:
             pass
 

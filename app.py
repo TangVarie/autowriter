@@ -653,31 +653,42 @@ def _commit_session_tokens(
     engine_session_ids: dict[str, str],
     metrics_meta: dict,
 ) -> None:
-    """从 ``metrics.meta['token_totals']['by_model']`` 拿每个 model 的 input
-    + cache_read + cache_create 总和,按 engine 前缀分组累加到对应 session
-    的 ``running_input_tokens``。
+    """累加本批 ``source='main'`` 的 input + cache_read + cache_create
+    到对应 engine 的 session.running_input_tokens。
 
-    按 (engine prefix, session_id) 一对一: 一个 batch 一个 engine 通常对应
-    一个 model, 但稳妥起见把同 engine 多 model 的 token 都加进去。
+    **必须只算 source='main' 的 token**: 同一 batch 还会有 compliance_recheck
+    / multi_role_select / multi_role_refine / dedup_regen 这些**不走 session
+    prefix 的辅助调用** —— 它们也会按 ``claude/<model>`` 落进 ``by_model``
+    总和, 如果直接读 by_model 会让 session.running_input_tokens 被无关请求
+    虚高, session 窗口判断 / UI 进度条都错位(早 PR review 命中)。
+
+    Phase 2.1+: telemetry 多记一个 ``by_source_model[source][model]`` 二维
+    维度, 这里精确读 ``by_source_model['main']`` 累加。fallback 到老
+    by_model(理论不会发生 —— 同一 BatchMetrics 实例 在内存里, 但稳妥起见
+    保留 fallback)。
     """
     if not engine_session_ids:
         return
     totals = (metrics_meta or {}).get("token_totals") or {}
-    by_model = totals.get("by_model") or {}
-    if not isinstance(by_model, dict):
+    by_src_model = totals.get("by_source_model") or {}
+    main_by_model = (by_src_model.get("main") or {}) if isinstance(by_src_model, dict) else {}
+    # Fallback: 老版 BatchMetrics 不写 by_source_model 时退到 by_model。
+    # 当批 metrics 是新版的话这条路不会走。
+    if not main_by_model:
+        main_by_model = totals.get("by_model") or {}
+    if not isinstance(main_by_model, dict):
         return
     for eng, session_id in engine_session_ids.items():
         delta = 0
         prefix = f"{eng}/"
-        for model_full, usage in by_model.items():
+        for model_full, usage in main_by_model.items():
             if not isinstance(usage, dict) or not model_full.startswith(prefix):
                 continue
             # 一次请求的总 input = input(非缓存) + cache_read + cache_create
-            # —— 这是 Anthropic 三互斥字段加起来才反映"用了多少 context"。
-            # Gemini 的 cache_read 是 input 子集, 加进去会重复; 但目前
-            # gemini cache_create 永远 0, cache_read 算 implicit hit 的 token,
-            # delta 多一点点的 over-counting 可接受(running_input_tokens 只用
-            # 于软警告,不影响计费 / 决策准确性)。
+            # —— Anthropic 三互斥字段加起来才反映"用了多少 context"。
+            # Gemini 的 cache_read 是 input 子集, 严格说会重复一次;
+            # 但 implicit cache 命中量本来就小, over-counting 不影响判断
+            # (running_input_tokens 只用于软警告 / UI 进度条)。
             delta += int(usage.get("input") or 0)
             delta += int(usage.get("cache_read") or 0)
             delta += int(usage.get("cache_create") or 0)
