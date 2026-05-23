@@ -1097,8 +1097,18 @@ def _queue_banner_body() -> None:
                         "后续跨批次去重会读不到这些向量，可能导致重复率上升。"
                     )
 
-        # Day 4：去重 + 注入指标看板（每批一张卡）
+    # Day 4：去重 + 注入指标看板（每批一张卡）
+    # 移到 if/elif 之外：队列还在跑时，每完成一批就 append 一条到
+    # metrics_list，fragment 每 2s rerun 一次，用户能实时看到已完成批次的
+    # 数据，不必等全部跑完才出现。``_render_queue_dashboard`` 内部已经做
+    # 了"空 metrics_list 直接 return"的判断。
+    try:
         _render_queue_dashboard(qs)
+    except Exception as exc:
+        # 任何渲染失败（数据形态异常 / DB roundtrip 字符串等）都不应让
+        # 整页变成 Streamlit 红色 ErrorBox——挂一行 caption 让用户知道
+        # 面板坏了但生成本身没受影响。
+        st.caption(f"⚠ 指标面板渲染失败：{exc}")
 
 
 def _fmt_tok(n: int) -> str:
@@ -1137,48 +1147,63 @@ def _render_token_panel(meta) -> None:
             totals = {}
     if not isinstance(totals, dict) or not totals:
         return
-    cost = float(totals.get("cost_usd") or 0.0)
-    by_model = totals.get("by_model") or {}
-    saved = config.estimate_cache_savings_usd(by_model)
+    try:
+        cost = float(totals.get("cost_usd") or 0.0)
+        by_model = totals.get("by_model") or {}
+        saved = config.estimate_cache_savings_usd(by_model) if isinstance(by_model, dict) else 0.0
 
-    cols = st.columns(5)
-    cols[0].metric("input",        _fmt_tok(totals.get("input", 0)))
-    cols[1].metric("cache_read",   _fmt_tok(totals.get("cache_read", 0)))
-    cols[2].metric("cache_create", _fmt_tok(totals.get("cache_create", 0)))
-    cols[3].metric("output",       _fmt_tok(totals.get("output", 0)))
-    cols[4].metric("≈ 成本",       f"${cost:.4f}")
+        cols = st.columns(5)
+        cols[0].metric("input",        _fmt_tok(int(totals.get("input") or 0)))
+        cols[1].metric("cache_read",   _fmt_tok(int(totals.get("cache_read") or 0)))
+        cols[2].metric("cache_create", _fmt_tok(int(totals.get("cache_create") or 0)))
+        cols[3].metric("output",       _fmt_tok(int(totals.get("output") or 0)))
+        cols[4].metric("≈ 成本",       f"${cost:.4f}")
 
-    extras: list[str] = []
-    if saved > 0:
-        extras.append(f"🟢 cache 已省 ≈ ${saved:.4f}")
-    if totals.get("thinking"):
-        extras.append(f"thinking {_fmt_tok(totals['thinking'])}")
-    if extras:
-        st.caption(" · ".join(extras))
+        extras: list[str] = []
+        if saved > 0:
+            extras.append(f"🟢 cache 已省 ≈ ${saved:.4f}")
+        thinking = int(totals.get("thinking") or 0)
+        if thinking:
+            extras.append(f"thinking {_fmt_tok(thinking)}")
+        if extras:
+            st.caption(" · ".join(extras))
 
-    if by_model:
-        per_lines = []
-        for mid, u in by_model.items():
-            mcost = float(u.get("cost_usd") or 0.0)
-            chunks = [f"in {_fmt_tok(u.get('input', 0))}"]
-            if u.get("cache_read"):
-                chunks.append(f"cache_r {_fmt_tok(u['cache_read'])}")
-            if u.get("cache_create"):
-                chunks.append(f"cache_w {_fmt_tok(u['cache_create'])}")
-            chunks.append(f"out {_fmt_tok(u.get('output', 0))}")
-            chunks.append(f"${mcost:.4f}")
-            per_lines.append(f"`{mid}` · " + " · ".join(chunks))
-        st.caption("分模型：\n\n" + "  \n".join(per_lines))
+        if isinstance(by_model, dict) and by_model:
+            per_lines = []
+            for mid, u in by_model.items():
+                if not isinstance(u, dict):
+                    continue
+                mcost = float(u.get("cost_usd") or 0.0)
+                chunks = [f"in {_fmt_tok(int(u.get('input') or 0))}"]
+                if u.get("cache_read"):
+                    chunks.append(f"cache_r {_fmt_tok(int(u['cache_read']))}")
+                if u.get("cache_create"):
+                    chunks.append(f"cache_w {_fmt_tok(int(u['cache_create']))}")
+                chunks.append(f"out {_fmt_tok(int(u.get('output') or 0))}")
+                chunks.append(f"${mcost:.4f}")
+                per_lines.append(f"`{mid}` · " + " · ".join(chunks))
+            if per_lines:
+                st.caption("分模型：\n\n" + "  \n".join(per_lines))
 
-    by_source = totals.get("by_source") or {}
-    if len(by_source) > 1 or "compliance_recheck" in by_source:
-        # 多个来源（主生成 + 合规复审等）时拆开展示，避免"main 占了多少 / 内部
-        # 辅助调用占了多少"被合并后看不出来。
-        src_lines = []
-        for src, u in by_source.items():
-            label = {"main": "主生成", "compliance_recheck": "合规复审"}.get(src, src)
-            src_lines.append(f"{label}: ${float(u.get('cost_usd') or 0):.4f}")
-        st.caption("分来源：" + " · ".join(src_lines))
+        by_source = totals.get("by_source") or {}
+        if isinstance(by_source, dict) and (len(by_source) > 1 or "compliance_recheck" in by_source):
+            # 多个来源（主生成 + 合规复审等）时拆开展示，避免"main 占了多少 / 内部
+            # 辅助调用占了多少"被合并后看不出来。
+            src_lines = []
+            for src, u in by_source.items():
+                if not isinstance(u, dict):
+                    continue
+                label = {"main": "主生成", "compliance_recheck": "合规复审",
+                         "dedup_regen": "去重重生",
+                         "multi_role_select": "三省选优",
+                         "multi_role_refine": "三省精修"}.get(src, src)
+                src_lines.append(f"{label}: ${float(u.get('cost_usd') or 0):.4f}")
+            if src_lines:
+                st.caption("分来源：" + " · ".join(src_lines))
+    except Exception as exc:
+        # token panel 本身崩了不要把整个批次卡片带下水；面板只是观测，
+        # 出错就降级成一行错误提示，让用户至少能看到耗时和去重数据。
+        st.caption(f"⚠ token 面板数据异常：{exc}")
 
 
 def _render_queue_dashboard(qs: dict) -> None:
@@ -1186,94 +1211,110 @@ def _render_queue_dashboard(qs: dict) -> None:
 
     数据源是 ``metrics.close()`` 落到 ``qs["metrics_list"]`` 的每批快照；
     本函数只读、纯展示，不做任何 DB I/O，调用频率与刷新成本都可忽略。
+
+    生成中默认展开（用户想看实时数据），完成后默认折叠（成功 banner 已经
+    在上面、不抢焦点）。每个批次卡片用 try/except 包，单批数据异常不会
+    让其余批次的卡片一起跟着崩。
     """
     metrics_list = qs.get("metrics_list") or []
     if not metrics_list:
         return
-    with st.expander(f"📊 本次队列指标（{len(metrics_list)} 批）", expanded=False):
+    is_running = bool(qs.get("running"))
+    with st.expander(
+        f"📊 本次队列指标（{len(metrics_list)} 批）",
+        expanded=is_running,
+    ):
         for idx, m in enumerate(metrics_list):
-            engines = ", ".join(m.get("engines") or []) or "?"
-            st.markdown(
-                f"**批次 {idx + 1}** · "
-                f"`{(m.get('batch_id') or '')[:8]}…` · "
-                f"{m.get('count', 0)} 条 · 引擎 {engines} · "
-                f"总耗时 **{m.get('total_ms', 0) / 1000:.1f} s**"
-            )
-
-            phase_ms = m.get("phase_ms") or {}
-            cols = st.columns(4)
-            for col, (k, label) in zip(cols, [
-                ("setup", "setup"),
-                ("llm", "llm"),
-                ("db_save", "db_save"),
-                ("embedding", "embedding"),
-            ]):
-                with col:
-                    st.metric(label, f"{phase_ms.get(k, 0) / 1000:.1f} s")
-
-            _render_token_panel(m.get("meta") or {})
-
-            counters = m.get("counters") or {}
-            counter_keys = [
-                ("dedup_text_hits", "文本去重命中"),
-                ("dedup_semantic_hits", "语义去重命中"),
-                ("regen_attempts", "重生尝试"),
-                ("regen_success", "重生成功"),
-                ("hard_rule_violations", "硬规则违反"),
-                ("embedding_missing", "缺向量"),
-            ]
-            ccols = st.columns(len(counter_keys))
-            for col, (k, label) in zip(ccols, counter_keys):
-                with col:
-                    st.metric(label, counters.get(k, 0))
-
-            meta = m.get("meta") or {}
-            injection = meta.get("injection") or {}
-            dedup_mode = meta.get("dedup_mode", "vector")
-            dedup_threshold = meta.get("dedup_threshold")
-            if injection or dedup_mode != "vector" or dedup_threshold is not None:
-                hard_n = (injection.get("hard_global", 0) + injection.get("hard_project", 0))
-                soft_n = (injection.get("soft_global", 0) + injection.get("soft_project", 0))
-                sess_n = injection.get("session", 0)
-                calib_chars = injection.get("calibration_chars", 0)
-                filtered = injection.get("filtered") or []
-                badges = [
-                    f"硬 {hard_n}", f"软 {soft_n}", f"会话 {sess_n}",
-                    f"调校 {calib_chars} 字", f"过滤 {len(filtered)} 条",
-                ]
-                if dedup_threshold is not None:
-                    badges.append(f"阈值 {dedup_threshold:.2f}")
-                if dedup_mode != "vector":
-                    badges.append(f"去重 {dedup_mode}")
-                st.caption(" · ".join(badges))
-
-                if filtered:
-                    with st.expander(
-                        f"查看本批被过滤的 {len(filtered)} 条规则",
-                        expanded=False,
-                    ):
-                        by_reason: dict[str, list[dict]] = {}
-                        for f in filtered:
-                            by_reason.setdefault(f.get("reason", "?"), []).append(f)
-                        for reason, items in by_reason.items():
-                            reason_label = {
-                                "below_threshold": "相关度低于阈值",
-                                "muted": "已静音",
-                                "capped": "超过条数上限",
-                                "no_embedding": "缺 embedding",
-                            }.get(reason, reason)
-                            st.markdown(f"**{reason_label}** ({len(items)} 条)")
-                            for item in items[:10]:
-                                score = item.get("score")
-                                score_text = (
-                                    f" (相似度 {score:.2f})" if score is not None else ""
-                                )
-                                st.markdown(f"- {item.get('content', '')}{score_text}")
-                            if len(items) > 10:
-                                st.caption(f"…还有 {len(items) - 10} 条")
-
+            try:
+                _render_batch_card(idx, m)
+            except Exception as exc:
+                st.caption(f"⚠ 批次 {idx + 1} 卡片渲染失败：{exc}")
             if idx < len(metrics_list) - 1:
                 st.divider()
+
+
+def _render_batch_card(idx: int, m: dict) -> None:
+    """单批指标卡片。提出来是为了让 _render_queue_dashboard 的 try/except
+    粒度落到"单卡片"——某一批数据形态异常时其它批照常展示。"""
+    engines = ", ".join(m.get("engines") or []) or "?"
+    st.markdown(
+        f"**批次 {idx + 1}** · "
+        f"`{(m.get('batch_id') or '')[:8]}…` · "
+        f"{m.get('count', 0)} 条 · 引擎 {engines} · "
+        f"总耗时 **{m.get('total_ms', 0) / 1000:.1f} s**"
+    )
+
+    phase_ms = m.get("phase_ms") or {}
+    cols = st.columns(4)
+    for col, (k, label) in zip(cols, [
+        ("setup", "setup"),
+        ("llm", "llm"),
+        ("db_save", "db_save"),
+        ("embedding", "embedding"),
+    ]):
+        with col:
+            st.metric(label, f"{phase_ms.get(k, 0) / 1000:.1f} s")
+
+    _render_token_panel(m.get("meta") or {})
+
+    counters = m.get("counters") or {}
+    counter_keys = [
+        ("dedup_text_hits", "文本去重命中"),
+        ("dedup_semantic_hits", "语义去重命中"),
+        ("regen_attempts", "重生尝试"),
+        ("regen_success", "重生成功"),
+        ("hard_rule_violations", "硬规则违反"),
+        ("embedding_missing", "缺向量"),
+    ]
+    ccols = st.columns(len(counter_keys))
+    for col, (k, label) in zip(ccols, counter_keys):
+        with col:
+            st.metric(label, counters.get(k, 0))
+
+    meta = m.get("meta") or {}
+    injection = meta.get("injection") or {}
+    dedup_mode = meta.get("dedup_mode", "vector")
+    dedup_threshold = meta.get("dedup_threshold")
+    if injection or dedup_mode != "vector" or dedup_threshold is not None:
+        hard_n = (injection.get("hard_global", 0) + injection.get("hard_project", 0))
+        soft_n = (injection.get("soft_global", 0) + injection.get("soft_project", 0))
+        sess_n = injection.get("session", 0)
+        calib_chars = injection.get("calibration_chars", 0)
+        filtered = injection.get("filtered") or []
+        badges = [
+            f"硬 {hard_n}", f"软 {soft_n}", f"会话 {sess_n}",
+            f"调校 {calib_chars} 字", f"过滤 {len(filtered)} 条",
+        ]
+        if dedup_threshold is not None:
+            badges.append(f"阈值 {dedup_threshold:.2f}")
+        if dedup_mode != "vector":
+            badges.append(f"去重 {dedup_mode}")
+        st.caption(" · ".join(badges))
+
+        if filtered:
+            with st.expander(
+                f"查看本批被过滤的 {len(filtered)} 条规则",
+                expanded=False,
+            ):
+                by_reason: dict[str, list[dict]] = {}
+                for f in filtered:
+                    by_reason.setdefault(f.get("reason", "?"), []).append(f)
+                for reason, items in by_reason.items():
+                    reason_label = {
+                        "below_threshold": "相关度低于阈值",
+                        "muted": "已静音",
+                        "capped": "超过条数上限",
+                        "no_embedding": "缺 embedding",
+                    }.get(reason, reason)
+                    st.markdown(f"**{reason_label}** ({len(items)} 条)")
+                    for item in items[:10]:
+                        score = item.get("score")
+                        score_text = (
+                            f" (相似度 {score:.2f})" if score is not None else ""
+                        )
+                        st.markdown(f"- {item.get('content', '')}{score_text}")
+                    if len(items) > 10:
+                        st.caption(f"…还有 {len(items) - 10} 条")
 
 
 if _FRAGMENT is not None:
