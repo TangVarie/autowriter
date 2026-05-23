@@ -572,6 +572,119 @@ def _run_semantic_dedup_pass(
         metrics.stop_phase("embedding")
 
 
+# ── Phase 2.1: session 路由 helper ────────────────────────────────────────
+# 跨批 prompt caching 的"对话会话"层接入点。worker 在 build_layered_system_
+# prompt 之后调 _resolve_engine_sessions 为每个 engine 拿到对应 active session
+# + 历史 messages prefix; 生成完成后调 _commit_session_tokens 把 input token
+# 累加到 session 的 running_input_tokens(UI 软警告进度条用)。
+#
+# Phase 2.1 范围: 只做读 + token 累加。"approved version → assistant turn
+# 写回 session_messages" 的 commit gate 留给 Phase 2.2; 在那之前 session
+# 历史一直为空, prior_messages 实际拼上去也是空(行为 byte-identical Phase 1),
+# 但数据通路是通的——下个 PR 接审核闸门, cache 命中自然开始生效。
+#
+# 所有失败都吞了走 fallback (空 session_ids + 空 prior_messages),保证
+# session 层的 hiccup 不会让批次生成挂掉。
+
+def _resolve_engine_sessions(
+    db_client,
+    project: dict,
+    engines: list[str],
+    engine_models: dict,
+    user_id: str,
+) -> tuple[dict[str, str], dict[str, list[dict]]]:
+    """为本批的每个 engine 路由/创建 active session + 拉历史 messages。
+
+    返回 ``(engine_session_ids, engine_prior_messages)``:
+      engine_session_ids:    {"claude": "<uuid>", "gemini": "<uuid>"} —— 后续
+                             token 累加 / commit 用。某 engine 路由失败时该
+                             key 不出现(下游按缺 key 跳过累加,不影响生成)。
+      engine_prior_messages: {"claude": [{role,content},...], "gemini": [...]}
+                             —— 传给 ``generate_batch(engine_prior_messages=)``。
+                             空 session(没有历史 turn)对应空 list。
+    """
+    base_prompt = (project.get("system_prompt") or "")
+    project_id = project.get("id") or ""
+    try:
+        base_hash = config.compute_base_prompt_hash(base_prompt)
+    except Exception as exc:
+        telemetry.log_event("session_route_hash_failed", error=str(exc)[:120])
+        return {}, {}
+
+    engine_session_ids: dict[str, str] = {}
+    engine_prior_messages: dict[str, list[dict]] = {}
+
+    for eng in engines or []:
+        # 解析该 engine 本批实际选用的 model(跟 generator._engine_call 同逻辑:
+        # plan.engine_models 优先, 否则 config 默认)
+        if eng == "claude":
+            model_used = (engine_models or {}).get("claude", "") or config.CLAUDE_MODEL
+        elif eng == "gemini":
+            model_used = (engine_models or {}).get("gemini", "") or config.GEMINI_MODEL
+        else:
+            continue
+        window = config.get_context_window(model_used)
+        sess = db.get_or_create_active_session(
+            db_client,
+            project_id=project_id,
+            engine=eng,
+            model_id=model_used,
+            base_prompt_hash=base_hash,
+            user_id=user_id,
+            window_limit=window,
+        )
+        if not sess or not sess.get("id"):
+            # 路由失败(DB 不可达 / 表不存在),静默 fallback 到空 prefix——
+            # generator 那边 prior_messages=[] 退化为 Phase 1 行为。
+            continue
+        engine_session_ids[eng] = sess["id"]
+        # 拉历史: 表里 content 是 JSONB,LLM SDK 那边由 GeminiEngine._msg_content
+        # _to_text / ClaudeEngine 的 _build_content 各自识别 dict/str/list 形态。
+        rows = db.list_session_messages(db_client, sess["id"]) or []
+        engine_prior_messages[eng] = [
+            {"role": r.get("role", "user"), "content": r.get("content")}
+            for r in rows
+        ]
+    return engine_session_ids, engine_prior_messages
+
+
+def _commit_session_tokens(
+    db_client,
+    engine_session_ids: dict[str, str],
+    metrics_meta: dict,
+) -> None:
+    """从 ``metrics.meta['token_totals']['by_model']`` 拿每个 model 的 input
+    + cache_read + cache_create 总和,按 engine 前缀分组累加到对应 session
+    的 ``running_input_tokens``。
+
+    按 (engine prefix, session_id) 一对一: 一个 batch 一个 engine 通常对应
+    一个 model, 但稳妥起见把同 engine 多 model 的 token 都加进去。
+    """
+    if not engine_session_ids:
+        return
+    totals = (metrics_meta or {}).get("token_totals") or {}
+    by_model = totals.get("by_model") or {}
+    if not isinstance(by_model, dict):
+        return
+    for eng, session_id in engine_session_ids.items():
+        delta = 0
+        prefix = f"{eng}/"
+        for model_full, usage in by_model.items():
+            if not isinstance(usage, dict) or not model_full.startswith(prefix):
+                continue
+            # 一次请求的总 input = input(非缓存) + cache_read + cache_create
+            # —— 这是 Anthropic 三互斥字段加起来才反映"用了多少 context"。
+            # Gemini 的 cache_read 是 input 子集, 加进去会重复; 但目前
+            # gemini cache_create 永远 0, cache_read 算 implicit hit 的 token,
+            # delta 多一点点的 over-counting 可接受(running_input_tokens 只用
+            # 于软警告,不影响计费 / 决策准确性)。
+            delta += int(usage.get("input") or 0)
+            delta += int(usage.get("cache_read") or 0)
+            delta += int(usage.get("cache_create") or 0)
+        if delta > 0:
+            db.add_session_running_tokens(db_client, session_id, delta)
+
+
 def _queue_worker(
     plans: list[dict],
     user_id: str,
@@ -839,6 +952,16 @@ def _queue_worker_impl(
                 pool.append(h)
                 seen.add(key)
             historical_titles = pool
+
+            # ── [C+] Phase 2.1: session 路由 — 为每个 engine 拿历史 prefix ──
+            # 失败时 (engine_session_ids 空 / engine_prior_messages 缺 key)
+            # 自动 fallback 为空 prefix, 生成行为不受影响。
+            engine_session_ids, engine_prior_messages = _resolve_engine_sessions(
+                db_client, project, engines, engine_models or {}, user_id,
+            )
+            if engine_session_ids:
+                metrics.set_meta("session_ids", engine_session_ids)
+
             metrics.stop_phase("setup")
 
             # ── [D 生成] 调用 generator；多引擎模式内部会串行复用 dedup pool ──
@@ -871,6 +994,7 @@ def _queue_worker_impl(
                     custom_roles=custom_roles,
                     n_roles=n_roles,
                     metrics=metrics,
+                    engine_prior_messages=engine_prior_messages,
                 )
             else:
                 generation_results = gen_module.generate_batch(
@@ -891,12 +1015,16 @@ def _queue_worker_impl(
                     user_id=user_id,
                     project_id=project_id,
                     metrics=metrics,
+                    engine_prior_messages=engine_prior_messages,
                 )
 
             metrics.stop_phase("llm")
             # token usage 累加在 generator 内部的 _engine_call 边界完成
             # （一次 API 调用 = 一次累加），避免对 ``count`` 个共享同一份
             # token_usage 的 version 重复加导致 count 倍膨胀。
+            # Phase 2.1: 把本批的 input + cache_read + cache_create token
+            # 累加到对应 engine 的 session 的 running_input_tokens(UI 进度条用)。
+            _commit_session_tokens(db_client, engine_session_ids, metrics.meta)
 
             # ── [E 保存] 批量写 items + versions（统一服务 _save_batch_results）──
             metrics.start_phase("db_save")
@@ -2739,6 +2867,14 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             )
 
         historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
+
+        # Phase 2.1: session 路由 — 同 _queue_worker_impl 逻辑
+        engine_session_ids, engine_prior_messages = _resolve_engine_sessions(
+            db_client, project, engines, engine_models or {}, user_id,
+        )
+        if engine_session_ids:
+            metrics.set_meta("session_ids", engine_session_ids)
+
         metrics.stop_phase("setup")
 
         def _progress(pct: float, msg: str) -> None:
@@ -2770,6 +2906,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 custom_roles=custom_roles,
                 n_roles=n_roles,
                 metrics=metrics,
+                engine_prior_messages=engine_prior_messages,
             )
         else:
             generation_results = gen_module.generate_batch(
@@ -2790,10 +2927,13 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 user_id=user_id,
                 project_id=project_id,
                 metrics=metrics,
+                engine_prior_messages=engine_prior_messages,
             )
 
         metrics.stop_phase("llm")
         # token usage 累加在 generator 内部完成（见 _engine_call）
+        # Phase 2.1: 累加 input/cache 到对应 session 的 running_input_tokens
+        _commit_session_tokens(db_client, engine_session_ids, metrics.meta)
 
         # ── 批量保存：复用与 _queue_worker 完全相同的 _save_batch_results ──
         # （修 R1：之前是 create_item / create_version 逐条 INSERT，
