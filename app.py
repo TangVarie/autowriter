@@ -329,6 +329,7 @@ def _try_regen_one(
                 gemini_use_thinking=regen_ctx.get("gemini_use_thinking", False),
                 user_id=regen_ctx.get("user_id", ""),
                 project_id=project_id,
+                metrics=metrics,
             )
         except Exception as exc:
             errors_sink.append(f"{error_prefix}重生异常：{exc}")
@@ -337,6 +338,8 @@ def _try_regen_one(
         if not results:
             continue
         new_version = results[0]["versions"][0] if results[0].get("versions") else None
+        if new_version and new_version.token_usage:
+            metrics.add_tokens(new_version.ai_engine, new_version.token_usage, source="dedup_regen")
         if not new_version or new_version.error or not new_version.title:
             continue
 
@@ -883,9 +886,17 @@ def _queue_worker_impl(
                     gemini_use_thinking=gemini_thinking,
                     user_id=user_id,
                     project_id=project_id,
+                    metrics=metrics,
                 )
 
             metrics.stop_phase("llm")
+
+            # 累计主生成的 token_usage 到 metrics（compliance_recheck 由
+            # generator 内部直接挂 metrics，已经记好；这里只补"主"调用）。
+            for slot in generation_results or []:
+                for vr in slot.get("versions", []):
+                    if vr.token_usage:
+                        metrics.add_tokens(vr.ai_engine, vr.token_usage, source="main")
 
             # ── [E 保存] 批量写 items + versions（统一服务 _save_batch_results）──
             metrics.start_phase("db_save")
@@ -1094,6 +1105,68 @@ def _queue_banner_body() -> None:
         _render_queue_dashboard(qs)
 
 
+def _fmt_tok(n: int) -> str:
+    """Token 数缩写：12345 → 12.3K，1234567 → 1.23M。卡片宽度有限，
+    全位数会换行；K/M 比"千/万"更国际、跟成本面板一致。"""
+    if not n:
+        return "0"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(int(n))
+
+
+def _render_token_panel(meta: dict) -> None:
+    """渲染本批的 token 用量 + 估算费用 + cache 命中。两个面板（队列实时
+    / 历史回看）共享。``meta`` 来自 ``BatchMetrics.to_dict()["meta"]``。"""
+    totals = (meta or {}).get("token_totals") or {}
+    if not totals:
+        return
+    cost = float(totals.get("cost_usd") or 0.0)
+    by_model = totals.get("by_model") or {}
+    saved = config.estimate_cache_savings_usd(by_model)
+
+    cols = st.columns(5)
+    cols[0].metric("input",        _fmt_tok(totals.get("input", 0)))
+    cols[1].metric("cache_read",   _fmt_tok(totals.get("cache_read", 0)))
+    cols[2].metric("cache_create", _fmt_tok(totals.get("cache_create", 0)))
+    cols[3].metric("output",       _fmt_tok(totals.get("output", 0)))
+    cols[4].metric("≈ 成本",       f"${cost:.4f}")
+
+    extras: list[str] = []
+    if saved > 0:
+        extras.append(f"🟢 cache 已省 ≈ ${saved:.4f}")
+    if totals.get("thinking"):
+        extras.append(f"thinking {_fmt_tok(totals['thinking'])}")
+    if extras:
+        st.caption(" · ".join(extras))
+
+    if by_model:
+        per_lines = []
+        for mid, u in by_model.items():
+            mcost = float(u.get("cost_usd") or 0.0)
+            chunks = [f"in {_fmt_tok(u.get('input', 0))}"]
+            if u.get("cache_read"):
+                chunks.append(f"cache_r {_fmt_tok(u['cache_read'])}")
+            if u.get("cache_create"):
+                chunks.append(f"cache_w {_fmt_tok(u['cache_create'])}")
+            chunks.append(f"out {_fmt_tok(u.get('output', 0))}")
+            chunks.append(f"${mcost:.4f}")
+            per_lines.append(f"`{mid}` · " + " · ".join(chunks))
+        st.caption("分模型：\n\n" + "  \n".join(per_lines))
+
+    by_source = totals.get("by_source") or {}
+    if len(by_source) > 1 or "compliance_recheck" in by_source:
+        # 多个来源（主生成 + 合规复审等）时拆开展示，避免"main 占了多少 / 内部
+        # 辅助调用占了多少"被合并后看不出来。
+        src_lines = []
+        for src, u in by_source.items():
+            label = {"main": "主生成", "compliance_recheck": "合规复审"}.get(src, src)
+            src_lines.append(f"{label}: ${float(u.get('cost_usd') or 0):.4f}")
+        st.caption("分来源：" + " · ".join(src_lines))
+
+
 def _render_queue_dashboard(qs: dict) -> None:
     """渲染本次队列每个批次的指标卡：阶段计时 + 去重/重生/违规计数 + 注入摘要。
 
@@ -1123,6 +1196,8 @@ def _render_queue_dashboard(qs: dict) -> None:
             ]):
                 with col:
                     st.metric(label, f"{phase_ms.get(k, 0) / 1000:.1f} s")
+
+            _render_token_panel(m.get("meta") or {})
 
             counters = m.get("counters") or {}
             counter_keys = [
@@ -2619,9 +2694,15 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 gemini_use_thinking=gemini_thinking,
                 user_id=user_id,
                 project_id=project_id,
+                metrics=metrics,
             )
 
         metrics.stop_phase("llm")
+
+        for slot in generation_results or []:
+            for vr in slot.get("versions", []):
+                if vr.token_usage:
+                    metrics.add_tokens(vr.ai_engine, vr.token_usage, source="main")
 
         # ── 批量保存：复用与 _queue_worker 完全相同的 _save_batch_results ──
         # （修 R1：之前是 create_item / create_version 逐条 INSERT，
@@ -4591,6 +4672,8 @@ def _page_history_body_impl(project: dict) -> None:
                     for col, (k, label) in zip(ccols, counter_keys):
                         with col:
                             st.metric(label, counters.get(k, 0))
+
+                    _render_token_panel(m.get("meta") or {})
 
                     injection = m.get("injection") or {}
                     if isinstance(injection, str):

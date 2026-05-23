@@ -56,6 +56,48 @@ class GenerationResult:
         return self.error is None and bool(self.title)
 
 
+# ── Token usage extraction ────────────────────────────────────────────────
+# Anthropic / Gemini 的 usage 字段语义不同，统一收敛成
+#   {"input", "output", "cache_read", "cache_create", "thinking"}
+# 五个键，便于上层聚合与计费。空字段一律 0，下游无须 None 判断。
+
+def _extract_claude_usage(usage) -> dict:
+    """Anthropic ``messages.usage`` → 统一 token dict.
+
+    Anthropic 把缓存命中拆成三段互斥的 token 计数：
+      ``input_tokens``                   非缓存输入
+      ``cache_creation_input_tokens``    本次写入缓存的 token（计费 1.25×）
+      ``cache_read_input_tokens``        从缓存命中读取的 token（计费 0.1×）
+    总输入 = 三者之和；按这种语义把字段透传上去，``estimate_cost_usd`` 会
+    按 family rate 分别计价。
+    """
+    if usage is None:
+        return {}
+    return {
+        "input":        int(getattr(usage, "input_tokens", 0) or 0),
+        "output":       int(getattr(usage, "output_tokens", 0) or 0),
+        "cache_read":   int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        "cache_create": int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+    }
+
+
+def _extract_gemini_usage(usage) -> dict:
+    """``google-genai usage_metadata`` → 统一 token dict.
+
+    Gemini 的 ``cached_content_token_count`` 是 ``prompt_token_count`` 的子集
+    （Anthropic 是互斥），``estimate_cost_usd`` 会按 engine 类型识别这一差异。
+    我们这里照原样存，不做减法——保留原始读数便于排查。
+    """
+    if usage is None:
+        return {}
+    return {
+        "input":      int(getattr(usage, "prompt_token_count", 0) or 0),
+        "output":     int(getattr(usage, "candidates_token_count", 0) or 0),
+        "cache_read": int(getattr(usage, "cached_content_token_count", 0) or 0),
+        "thinking":   int(getattr(usage, "thoughts_token_count", 0) or 0),
+    }
+
+
 # ── Prompt templates ───────────────────────────────────────────────────────
 
 def _make_user_prompt(
@@ -531,10 +573,7 @@ class ClaudeEngine:
         try:
             response = _call_with_retry(_call)
             text = _extract_text_from_response(response)
-            token_usage = {
-                "input": response.usage.input_tokens,
-                "output": response.usage.output_tokens,
-            }
+            token_usage = _extract_claude_usage(response.usage)
             stop_reason = getattr(response, "stop_reason", None)
             results = _parse_copy_json_list(text, count, f"claude/{model}") if count > 1 \
                 else [_parse_copy_json(text, f"claude/{model}")]
@@ -587,10 +626,7 @@ class ClaudeEngine:
             response = _call_with_retry(_call)
             text = _extract_text_from_response(response)
             result = _parse_copy_json(text, f"claude/{model}")
-            result.token_usage = {
-                "input": response.usage.input_tokens,
-                "output": response.usage.output_tokens,
-            }
+            result.token_usage = _extract_claude_usage(response.usage)
             stop_reason = getattr(response, "stop_reason", None)
             if result.error or stop_reason == "max_tokens":
                 diag = (
@@ -668,13 +704,7 @@ class GeminiEngine:
     def _parse_gemini_response(self, response, model: str) -> GenerationResult:
         text = response.text or ""
         result = _parse_copy_json(text, f"gemini/{model}")
-        usage = getattr(response, "usage_metadata", None)
-        if usage:
-            result.token_usage = {
-                "input": getattr(usage, "prompt_token_count", 0),
-                "output": getattr(usage, "candidates_token_count", 0),
-                "thinking": getattr(usage, "thoughts_token_count", 0),
-            }
+        result.token_usage = _extract_gemini_usage(getattr(response, "usage_metadata", None))
         return result
 
     def generate(
@@ -701,14 +731,7 @@ class GeminiEngine:
                 ),
             )
             text = response.text or ""
-            usage = getattr(response, "usage_metadata", None)
-            token_usage = {}
-            if usage:
-                token_usage = {
-                    "input": getattr(usage, "prompt_token_count", 0),
-                    "output": getattr(usage, "candidates_token_count", 0),
-                    "thinking": getattr(usage, "thoughts_token_count", 0),
-                }
+            token_usage = _extract_gemini_usage(getattr(response, "usage_metadata", None))
             results = _parse_copy_json_list(text, count, f"gemini/{model}") if count > 1 \
                 else [_parse_copy_json(text, f"gemini/{model}")]
             finish_reason = None
@@ -993,6 +1016,7 @@ def generate_batch(
     gemini_use_thinking: bool = False,
     user_id: str = "",
     project_id: str = "",
+    metrics: Optional["telemetry.BatchMetrics"] = None,
 ) -> list[dict]:
     """
     Generate `count` copy items using specified engines.
@@ -1139,7 +1163,7 @@ def generate_batch(
         getattr(config, "ENABLE_COMPLIANCE_CHECK", True)
         and _has_compliance_rules(system_prompt)
     ):
-        _apply_compliance_recheck(slots, system_prompt)
+        _apply_compliance_recheck(slots, system_prompt, metrics=metrics)
 
     return slots
 
@@ -1176,7 +1200,11 @@ def _has_compliance_rules(system_prompt: str) -> bool:
     return any(marker in system_prompt for marker in markers)
 
 
-def _apply_compliance_recheck(slots: list[dict], system_prompt: str) -> None:
+def _apply_compliance_recheck(
+    slots: list[dict],
+    system_prompt: str,
+    metrics: Optional["telemetry.BatchMetrics"] = None,
+) -> None:
     """
     Flag versions that violate the System Prompt's memory / session-instruction
     rules.
@@ -1214,6 +1242,10 @@ def _apply_compliance_recheck(slots: list[dict], system_prompt: str) -> None:
             system=_COMPLIANCE_SYSTEM,
             messages=[{"role": "user", "content": user_content}],
         ))
+        if metrics is not None:
+            metrics.add_tokens(f"claude/{config.CLAUDE_MODEL}",
+                               _extract_claude_usage(resp.usage),
+                               source="compliance_recheck")
         raw = resp.content[0].text.strip()
         cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
         data = json.loads(cleaned)

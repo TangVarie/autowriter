@@ -155,6 +155,110 @@ DEFAULT_GENERATION_COUNT: int = 10
 MAX_GENERATION_COUNT: int = 50
 MAX_ITERATION_ROUNDS: int = 3
 
+# ── Model pricing (per 1M tokens, USD) ────────────────────────────────────
+# 按 family 分档的官方公开定价（截至 2026-05）。中转站实际计费可能不同；
+# 这里的数字只用于 UI 上展示"理论成本 / 节省估算"，不是真实账单。
+#
+# Anthropic 的 input/cache_read/cache_create 三个 token 计数是**互斥的**
+#   总输入 token = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+# Gemini 的 cached_content_token_count 是 prompt_token_count 的**子集**
+#   非缓存输入 = prompt_token_count - cached_content_token_count
+# `estimate_cost_usd` 按 engine 类型分别处理这两种语义。
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    # Claude Sonnet 全家族（3.5 / 3.7 / 4.x / 4.5 / 4.6 / 4.7）
+    "claude-sonnet":     {"input": 3.0,  "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
+    # Claude Opus 全家族（3 / 4 / 4.1 / 4.5 / 4.6 / 4.7）
+    "claude-opus":       {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
+    # Gemini Pro (2.5 / 3.1 Pro)
+    "gemini-pro":        {"input": 1.25, "output": 10.0, "cache_write": 0.0,   "cache_read": 0.31},
+    # Gemini Flash (2.5 / 3.5 Flash)
+    "gemini-flash":      {"input": 0.30, "output": 2.50, "cache_write": 0.0,   "cache_read": 0.075},
+    # Gemini Flash-Lite
+    "gemini-flash-lite": {"input": 0.10, "output": 0.40, "cache_write": 0.0,   "cache_read": 0.025},
+}
+
+
+def get_pricing(model_id: str) -> dict[str, float]:
+    """Resolve a model id (eg ``claude-opus-4-7``) to its pricing family.
+
+    Falls back to ``claude-opus`` (the most expensive option) as a safe
+    upper-bound when the model id can't be classified — better to overestimate
+    cost in the UI than to silently miss new model strings.
+    """
+    mid = (model_id or "").lower()
+    if "opus" in mid:
+        return MODEL_PRICING["claude-opus"]
+    if "claude" in mid and "sonnet" in mid:
+        return MODEL_PRICING["claude-sonnet"]
+    if "flash-lite" in mid:
+        return MODEL_PRICING["gemini-flash-lite"]
+    if "flash" in mid:
+        return MODEL_PRICING["gemini-flash"]
+    if "gemini" in mid:
+        return MODEL_PRICING["gemini-pro"]
+    return MODEL_PRICING["claude-opus"]
+
+
+def estimate_cost_usd(model_id: str, usage: dict) -> float:
+    """Compute the USD cost of a single LLM call from its ``token_usage`` dict.
+
+    Engine identified by model id substring. The ``usage`` dict can contain
+    any subset of these keys (missing = 0):
+      - ``input``         (Anthropic: non-cached input; Gemini: full prompt incl. cached)
+      - ``output``        output tokens
+      - ``cache_read``    tokens served from cache
+      - ``cache_create``  tokens written into cache (Anthropic only; Gemini implicit cache has no write fee)
+      - ``thinking``      thinking tokens (Gemini 2.5+ / Claude thinking models — billed as output)
+    """
+    if not isinstance(usage, dict):
+        return 0.0
+    p = get_pricing(model_id)
+    mid = (model_id or "").lower()
+    is_gemini = "gemini" in mid
+
+    if is_gemini:
+        # Gemini: cached_content_token_count is a SUBSET of prompt_token_count.
+        # Avoid double-counting by subtracting from input before applying base rate.
+        cache_read = int(usage.get("cache_read") or 0)
+        regular_input = max(0, int(usage.get("input") or 0) - cache_read)
+        cost = (
+            regular_input          * p["input"]
+            + cache_read           * p["cache_read"]
+            + int(usage.get("output") or 0)   * p["output"]
+            + int(usage.get("thinking") or 0) * p["output"]
+        )
+    else:
+        # Anthropic: input / cache_read / cache_create are mutually exclusive.
+        cost = (
+            int(usage.get("input") or 0)         * p["input"]
+            + int(usage.get("cache_read") or 0)  * p["cache_read"]
+            + int(usage.get("cache_create") or 0) * p["cache_write"]
+            + int(usage.get("output") or 0)      * p["output"]
+            + int(usage.get("thinking") or 0)    * p["output"]
+        )
+    return cost / 1_000_000.0
+
+
+def estimate_cache_savings_usd(by_model: dict) -> float:
+    """估算"如果不开 cache、按 input 全价计费"会比当前多花多少 USD。
+
+    ``by_model`` 形如 ``{"claude/claude-opus-4-7": {"cache_read": N, ...}, ...}``，
+    通常来自 ``BatchMetrics.meta["token_totals"]["by_model"]``。
+    """
+    if not isinstance(by_model, dict):
+        return 0.0
+    saved = 0.0
+    for model_full, usage in by_model.items():
+        if not isinstance(usage, dict):
+            continue
+        p = get_pricing(model_full)
+        cache_read = int(usage.get("cache_read") or 0)
+        # cache_read 命中部分本来要按 input rate 收，现在按 cache_read rate 收，
+        # 差额就是省下来的钱。
+        saved += cache_read * (p["input"] - p["cache_read"]) / 1_000_000.0
+    return saved
+
+
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
 APP_VERSION: str = "2.14.0-studio"
