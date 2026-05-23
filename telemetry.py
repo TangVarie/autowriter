@@ -128,6 +128,48 @@ class BatchMetrics:
         finally:
             self.stop_phase(name)
 
+    # ── Token / cost 聚合 ────────────────────────────────────────────
+    # 每次 LLM 调用拿到 token_usage 后调用 add_tokens 累加；最终结果
+    # 挂在 meta["token_totals"]，结构：
+    #   {
+    #     "input": N, "output": N, "cache_read": N, "cache_create": N,
+    #     "thinking": N, "cost_usd": float,
+    #     "by_model": {"claude/claude-opus-4-7": {...}, "gemini/gemini-2.5-pro": {...}},
+    #     "by_source": {"main": {...}, "compliance_recheck": {...}, ...},
+    #   }
+    # ``source`` 区分主生成 vs 内部辅助调用（合规复审 / 选优 / 精修），
+    # 面板能分别展示"为本批生成花了多少 / 为合规检查花了多少"。
+    def add_tokens(self, model_full: str, usage: dict, source: str = "main") -> None:
+        if not isinstance(usage, dict) or not usage:
+            return
+        try:
+            import config as _config  # local import: telemetry has no top-level deps
+            cost = _config.estimate_cost_usd(model_full, usage)
+        except Exception:
+            cost = 0.0
+        keys = ("input", "output", "cache_read", "cache_create", "thinking")
+        try:
+            with self._lock:
+                totals = self.meta.setdefault(
+                    "token_totals",
+                    {"by_model": {}, "by_source": {}},
+                )
+                for k in keys:
+                    totals[k] = totals.get(k, 0) + int(usage.get(k) or 0)
+                totals["cost_usd"] = totals.get("cost_usd", 0.0) + cost
+
+                per_model = totals["by_model"].setdefault(model_full, {})
+                for k in keys:
+                    per_model[k] = per_model.get(k, 0) + int(usage.get(k) or 0)
+                per_model["cost_usd"] = per_model.get("cost_usd", 0.0) + cost
+
+                per_src = totals["by_source"].setdefault(source, {})
+                for k in keys:
+                    per_src[k] = per_src.get(k, 0) + int(usage.get(k) or 0)
+                per_src["cost_usd"] = per_src.get("cost_usd", 0.0) + cost
+        except Exception:
+            pass
+
     # ── 计数器 ───────────────────────────────────────────────────────
     def incr(self, key: str, n: int = 1) -> None:
         """累加计数器；不存在的 key 会从 0 起算。
