@@ -409,6 +409,11 @@ CREATE TABLE IF NOT EXISTS session_messages (
     batch_id      UUID REFERENCES batches(id) ON DELETE SET NULL,
     committed_at  TIMESTAMPTZ DEFAULT NOW()
 );
+-- Phase 2.2: item_id 标记"这条 turn 来自哪个已审核 item",懒同步时按
+-- item_id 去重(同一 approved item 只进 session 一次)。ON DELETE SET NULL:
+-- 删 item 不删历史(同 batch_id 哲学)。
+ALTER TABLE session_messages
+    ADD COLUMN IF NOT EXISTS item_id UUID REFERENCES items(id) ON DELETE SET NULL;
 ALTER TABLE session_messages ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS session_messages_owner ON session_messages;
 -- 跟 versions 一样,通过外键到 generation_sessions.user_id 来做 RLS,避免
@@ -420,6 +425,10 @@ CREATE POLICY session_messages_owner ON session_messages
 -- 按 (session, turn) 顺序读取是热路径(每批生成前要拉完整历史拼 prefix)。
 CREATE UNIQUE INDEX IF NOT EXISTS session_messages_session_turn_uniq
     ON session_messages(session_id, turn_idx);
+-- 懒同步幂等检查: "该 session 已 commit 了哪些 item"
+CREATE INDEX IF NOT EXISTS session_messages_item_idx
+    ON session_messages(session_id, item_id)
+    WHERE item_id IS NOT NULL;
 
 -- 2026-05: 登录审计——识别"一号多人共享"
 -- 每次成功 sign_in 落一行；token_refresh / sign_up 不入表（避免噪音）。
@@ -2424,6 +2433,104 @@ def list_session_messages(client: Client, session_id: str) -> list[dict]:
         return []
 
 
+def get_session_committed_item_ids(client: Client, session_id: str) -> set:
+    """返回该 session 已经 commit 过的 item_id 集合(Phase 2.2 懒同步幂等用)。
+    读取失败返回空 set —— 调用方会因此可能重复 commit,但 append 时
+    turn_idx 唯一约束 + 内容相同不会造成逻辑错误(最多多几条历史)。"""
+    try:
+        res = (
+            client.table("session_messages")
+            .select("item_id")
+            .eq("session_id", session_id)
+            .not_.is_("item_id", "null")
+            .execute()
+        )
+        return {r["item_id"] for r in (res.data or []) if r.get("item_id")}
+    except Exception as exc:
+        telemetry.log_event(
+            "session_committed_items_failed",
+            session_id=session_id, error=str(exc)[:200],
+        )
+        return set()
+
+
+def list_approved_versions_for_sync(
+    client: Client,
+    project_id: str,
+    engine_model: str,
+    limit: int = 50,
+) -> list[dict]:
+    """Phase 2.2 懒同步: 查该 project 下 status='approved' 的 items 的最优
+    版本, 且 version.ai_engine == ``engine_model``(形如 ``claude/claude-
+    sonnet-4-6``), 按 item 创建时间升序(老的在前, 符合对话历史顺序)。
+
+    返回 ``[{item_id, batch_id, title, body, keywords, created_at}, ...]``,
+    最多 ``limit`` 条(取最近的 limit 条 approved, 再按时间升序排)。
+
+    实现: 两步查询(避开 PostgREST 复杂 embedded join 的脆弱性)——
+      1. 该 project 最近 limit 条 approved items + 它们的 best_version_id
+         (用 batches!inner embedded filter 按 project_id 过滤)
+      2. 批量取这些 best_version 的内容, 内存里按 ai_engine 过滤 + 拼装
+    """
+    try:
+        # Step 1: 该 project 最近的 approved items(embedded inner join 到
+        # batches 按 project_id 过滤; 取 best_version_id 待会儿批量拉内容)
+        items_res = (
+            client.table("items")
+            .select("id, batch_id, best_version_id, created_at, batches!inner(project_id)")
+            .eq("batches.project_id", project_id)
+            .eq("status", "approved")
+            .not_.is_("best_version_id", "null")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        items = items_res.data or []
+        if not items:
+            return []
+
+        best_vids = [it["best_version_id"] for it in items if it.get("best_version_id")]
+        if not best_vids:
+            return []
+
+        # Step 2: 批量拉 best_version 内容
+        vers_res = (
+            client.table("versions")
+            .select("id, ai_engine, title, body, keywords")
+            .in_("id", best_vids)
+            .execute()
+        )
+        ver_by_id = {v["id"]: v for v in (vers_res.data or [])}
+
+        out = []
+        for it in items:
+            v = ver_by_id.get(it.get("best_version_id"))
+            if not v:
+                continue
+            # 只要 ai_engine 精确匹配本 session 的 engine/model 的版本
+            if (v.get("ai_engine") or "") != engine_model:
+                continue
+            out.append({
+                "item_id":    it["id"],
+                "batch_id":   it.get("batch_id"),
+                "title":      v.get("title", ""),
+                "body":       v.get("body", ""),
+                "keywords":   v.get("keywords", []),
+                "created_at": it.get("created_at"),
+            })
+        # items 是按 created_at 降序拉的(取最近 limit 条), 这里翻成升序
+        # 让对话历史按时间从老到新排列。
+        out.reverse()
+        return out
+    except Exception as exc:
+        telemetry.log_event(
+            "approved_versions_sync_query_failed",
+            project_id=project_id, engine_model=engine_model,
+            error=str(exc)[:200],
+        )
+        return []
+
+
 _APPEND_RETRY_MAX = 3
 _APPEND_RETRY_BASE_DELAY = 0.05  # seconds
 
@@ -2447,9 +2554,11 @@ def append_session_messages(
 ) -> int:
     """批量追加 messages 到 session。
 
-    ``messages`` 形如 ``[{"role": "user", "content": {...}}, ...]``;
+    ``messages`` 形如 ``[{"role": "user", "content": {...}, "item_id": ...}, ...]``;
     ``turn_idx`` 由本函数自动计算(从当前 max + 1 开始递增,bulk insert)。
     ``batch_id`` 是触发本次 commit 的 batch(可空,但通常都有)。
+    每条 message 可带可选 ``item_id`` / ``batch_id``(覆盖整批默认值),
+    Phase 2.2 懒同步用 item_id 标记 turn 来源 + 幂等去重。
 
     Returns: 成功插入的行数;失败返回 0。
 
@@ -2497,7 +2606,10 @@ def append_session_messages(
                     "turn_idx":     next_idx + i,
                     "role":         role,
                     "content":      content,
-                    "batch_id":     batch_id,
+                    # per-message item_id/batch_id 覆盖整批默认(懒同步一次写多
+                    # 个 item 的 turn, 各自带自己的 item_id/batch_id)
+                    "batch_id":     m.get("batch_id", batch_id),
+                    "item_id":      m.get("item_id"),
                 })
             if not rows:
                 return 0
