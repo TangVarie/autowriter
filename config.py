@@ -281,6 +281,72 @@ def estimate_cache_savings_usd(by_model: dict) -> float:
     return saved
 
 
+# ── Model context windows (Phase 2: session window management) ────────────
+# 每个 model 的 input + output 总 token 上限。session 累积 running_input_tokens
+# 接近这个值时(默认 80%)前端面板给软警告;API 真返回 context_length_exceeded
+# 才硬切到新 session(中转站给的实际余量经常比官方大,先看软警告再硬撞)。
+#
+# Claude Sonnet 4.6 官方支持 1M context beta header (anthropic-beta:
+# context-1m-2025-08), 但默认走 200K 档。这里取 200K 保守值——开 1M
+# 需要请求时带 beta header,目前 ClaudeEngine 没传,保持一致。
+#
+# Gemini 2.5 Pro 1M、Gemini Flash 1M; 中转站没显式说明窗口,按官方默认。
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-haiku-4-5":   200_000,
+    "claude-sonnet-4-6":  200_000,
+    "claude-opus-4-6":    200_000,
+    "claude-opus-4-7":    200_000,
+    "gemini-pro":         1_000_000,
+    "gemini-flash":       1_000_000,
+    "gemini-flash-lite":  1_000_000,
+}
+
+# 历史已下线 model 的窗口(给老数据回算用,跟 MODEL_PRICING 的 retired 价档
+# 同步保留)
+MODEL_CONTEXT_WINDOWS.update({
+    "claude-sonnet-4-5":  200_000,
+    "claude-opus-4-1":    200_000,
+    "claude-opus-4-5":    200_000,
+})
+
+
+def get_context_window(model_id: str) -> int:
+    """Resolve model id to context window via longest-prefix match.
+
+    跟 ``get_pricing`` 同套路: ``claude/`` 前缀剥离 + 最长 key 优先 +
+    Gemini 子串兜底 + unknown fallback 200K(保守)。
+    """
+    mid = (model_id or "").lower()
+    if mid.startswith("claude/"):
+        mid = mid[len("claude/"):]
+    claude_keys = [k for k in MODEL_CONTEXT_WINDOWS if k.startswith("claude-")]
+    for key in sorted(claude_keys, key=len, reverse=True):
+        if mid.startswith(key):
+            return MODEL_CONTEXT_WINDOWS[key]
+    if "flash-lite" in mid:
+        return MODEL_CONTEXT_WINDOWS["gemini-flash-lite"]
+    if "flash" in mid:
+        return MODEL_CONTEXT_WINDOWS["gemini-flash"]
+    if "gemini" in mid:
+        return MODEL_CONTEXT_WINDOWS["gemini-pro"]
+    return 200_000
+
+
+def compute_base_prompt_hash(base_prompt: str) -> str:
+    """sha256 hex digest of the normalized base_prompt — Phase 2 session
+    routing 用的 hash 维度。
+
+    只对 ``project.system_prompt`` (即"项目人格"那段最稳定的内容) 做 hash,
+    不含 memories / calibration / examples——那些每批可能变,如果让它们
+    参与 hash, session 几乎每批都得切, cache 复用就失效了。
+
+    用户每批产生新记忆或调校笔记是常态; 那些变化在分层 system prompt
+    里只让 P0/P1 层失效 cache, 不影响 session 路由身份。
+    """
+    import hashlib
+    return hashlib.sha256((base_prompt or "").strip().encode("utf-8")).hexdigest()
+
+
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
 APP_VERSION: str = "2.14.0-studio"
