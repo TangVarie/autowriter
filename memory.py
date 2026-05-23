@@ -250,19 +250,21 @@ def layered_system_prompt_to_string(layers: dict) -> str:
     legacy ``"\\n".join(parts)`` formatting so model behavior is identical
     to the pre-layered implementation.
 
-    Each non-empty layer (except ``stable``) gets a leading blank line to
-    visually separate sections — same as the old ``f"\\n{...}"`` prefix.
+    ``stable`` 这一层永远占 ``parts[0]``——即便它是空字符串。理由：旧
+    ``build_system_prompt`` 的 ``parts = [base_prompt.strip()]`` 永远写一项，
+    后续层都带 ``"\\n"`` 前缀，``"\\n".join(...)`` 时整段会有形如
+    ``"\\n\\ntactic..."`` 的前导空行。如果 stable 为空就把整层跳过，
+    serialize 出来跟 Phase 0 不一致（base_prompt 留空的项目首层会少
+    两个换行）——破坏 byte-identical 保证、还会让 Gemini implicit-cache
+    的前缀匹配错位。
     """
-    out_parts: list[str] = []
-    stable = (layers or {}).get("stable", "")
-    if stable:
-        out_parts.append(stable)
+    layers = layers or {}
+    parts: list[str] = [(layers.get("stable") or "").strip()]
     for key in ("tactic", "p0", "p1", "p2"):
-        chunk = (layers or {}).get(key, "")
+        chunk = (layers.get(key) or "").strip()
         if chunk:
-            # 第一个 layer 之前不加前导空行，后续层前面留一个空行以分隔。
-            out_parts.append("\n" + chunk if out_parts else chunk)
-    return "\n".join(out_parts)
+            parts.append("\n" + chunk)
+    return "\n".join(parts)
 
 
 def build_system_prompt(

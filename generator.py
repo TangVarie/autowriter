@@ -151,19 +151,22 @@ def _system_to_gemini_string(system_prompt) -> str:
 
     Gemini implicit caching 按前缀长度自动命中，前缀稳定就够；不需要像
     Claude 那样打 cache_control 标记。
+
+    ``stable`` 永远占 ``parts[0]``（即便为空）——理由同
+    ``memory.layered_system_prompt_to_string``：旧 ``build_system_prompt`` 的
+    ``parts = [base_prompt.strip()]`` 永远写一项，跳过会让 base_prompt 留空
+    的项目首层少两个换行，破坏 byte-identical 保证 + Gemini implicit cache
+    前缀错位。
     """
     if isinstance(system_prompt, str):
         return system_prompt
     if not isinstance(system_prompt, dict):
         return ""
-    parts: list[str] = []
-    stable = (system_prompt.get("stable") or "").strip()
-    if stable:
-        parts.append(stable)
+    parts: list[str] = [(system_prompt.get("stable") or "").strip()]
     for key in ("tactic", "p0", "p1", "p2"):
         chunk = (system_prompt.get(key) or "").strip()
         if chunk:
-            parts.append("\n" + chunk if parts else chunk)
+            parts.append("\n" + chunk)
     return "\n".join(parts)
 
 
