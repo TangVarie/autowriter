@@ -35,23 +35,17 @@ CLAUDE_MODELS: dict[str, str] = {
     # ── Haiku ─────────────────────────────────────────────
     "claude-haiku-4-5-20251001":           "Haiku 4.5（最快/最省）",
     # ── Sonnet ────────────────────────────────────────────
-    "claude-sonnet-4-5-20250929":          "Sonnet 4.5",
-    "claude-sonnet-4-5-20250929-thinking": "Sonnet 4.5（思考）",
     "claude-sonnet-4-6":                   "Sonnet 4.6",
     # ── Opus ──────────────────────────────────────────────
-    "claude-opus-4-1-20250805":            "Opus 4.1",
-    "claude-opus-4-1-20250805-thinking":   "Opus 4.1（思考）",
-    "claude-opus-4-5-20251101":            "Opus 4.5",
-    "claude-opus-4-5-20251101-thinking":   "Opus 4.5（思考）",
     "claude-opus-4-6":                     "Opus 4.6",
     "claude-opus-4-7":                     "Opus 4.7（最强）",
 }
 
 # Default model (can be overridden via env var)
-# claude-3-sonnet-20240229 was retired from most proxies; default to the
-# latest Sonnet GA so backend utility calls (memory merger / calibration /
-# compliance) keep working without manual config.
-CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-5-20250929"
+# Sonnet 4.6 是中转站当前支持的 Sonnet 唯一版本(Sonnet 4.5 2026-05 被分组
+# 下线),保持 backend utility calls(memory merger / calibration / compliance)
+# 默认值与中转站可用 model 同步,避免 worker 调内部辅助调用即 502。
+CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"
 
 # ── Google Gemini ──────────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
@@ -153,6 +147,13 @@ MAX_ITERATION_ROUNDS: int = 3
 # 不同 Opus 版本价差 3 倍（Opus 4.1 是 Opus 4.5+ 的 3 倍），所以必须按
 # model id 精细分档，不能用"family 一锅"。
 #
+# **Pricing keys ≠ selectable models**：``CLAUDE_MODELS`` 是 UI 下拉里
+# 可选的"当前还能用的 model"列表（只有 4 个）；本表是历史成本计算用，
+# 包含**已下线但 DB 里仍有 batch 记录的 retired model 价档**——历史回看
+# 面板算成本时需要按当时价精确路由，不然估算偏差很大（如 opus-4-1 实际
+# $27 vs 4.5+ $9，3 倍价差，被错误 fallback 到 4.7 价档会让历史成本
+# 低估 67%）。
+#
 # Anthropic 的 input/cache_read/cache_create 三个 token 计数**互斥**:
 #   总输入 token = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
 # Gemini 的 cached_content_token_count 是 prompt_token_count 的**子集**:
@@ -160,19 +161,21 @@ MAX_ITERATION_ROUNDS: int = 3
 # `estimate_cost_usd` 按 engine 类型分别处理这两种语义。
 #
 # 价格匹配采用"最长 model-id 前缀"策略（``get_pricing``），所以 dated
-# 全 id 与 alias 都能正确路由（``claude-sonnet-4-5-20250929-thinking``
-# 会按 ``claude-sonnet-4-5`` 匹配到 Sonnet 4.5 那档）。
+# 全 id 与 alias 都能正确路由（``claude-sonnet-4-6`` 直接命中 Sonnet 4.6
+# 那档）。
 #
 # Gemini 价格暂仍按 Google 官方公开价；中转站 Gemini 实际价待用户提供后再调。
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    # ── Claude（中转站价）─────────────────────────────────────────────
+    # ── Claude 当前可选（CLAUDE_MODELS 里有）──────────────────────────
     "claude-haiku-4-5":   {"input": 1.80, "output": 9.00,   "cache_write": 2.25,   "cache_read": 0.18},
-    "claude-sonnet-4-5":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
     "claude-sonnet-4-6":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
-    "claude-opus-4-1":    {"input": 27.00, "output": 135.00, "cache_write": 33.75, "cache_read": 2.70},
-    "claude-opus-4-5":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
     "claude-opus-4-6":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
     "claude-opus-4-7":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
+    # ── Claude 已下线但 DB 历史 batch 仍引用（仅用于成本回算）──────────
+    # 2026-05 中转站新分组下线; 用户的历史 batch 大量用这些 model id
+    "claude-sonnet-4-5":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
+    "claude-opus-4-1":    {"input": 27.00, "output": 135.00, "cache_write": 33.75, "cache_read": 2.70},
+    "claude-opus-4-5":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
     # ── Gemini（官方价，待中转站价格更新）──────────────────────────────
     "gemini-pro":         {"input": 1.25, "output": 10.00,  "cache_write": 0.0,    "cache_read": 0.31},
     "gemini-flash":       {"input": 0.30, "output": 2.50,   "cache_write": 0.0,    "cache_read": 0.075},
@@ -183,15 +186,16 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
 def get_pricing(model_id: str) -> dict[str, float]:
     """Resolve a model id to its pricing dict via **longest-prefix match**.
 
-    ``claude-sonnet-4-5-20250929-thinking`` → ``claude-sonnet-4-5`` 那一档；
-    ``claude-opus-4-7``                     → ``claude-opus-4-7`` 那一档。
-    遍历所有 key 按长度倒序，先匹到长 key 就返回——比 "opus" in mid 的
-    fuzzy 子串匹配精准 3 倍以上（Opus 4.1 vs 4.5+ 价差 3×，搞错就盘子
-    成本估算偏差 200%）。
+    ``claude-sonnet-4-6`` → ``claude-sonnet-4-6`` 那一档；
+    ``claude-opus-4-7``   → ``claude-opus-4-7`` 那一档。
+    遍历所有 key 按长度倒序，先匹到长 key 就返回——保留长度倒序逻辑是
+    为了将来如果加回 family-level fallback（如 ``claude-opus``）也不会
+    让前缀短的优先抢走精确的 model 价档。
 
     Gemini 走 substring 兜底（flash-lite / flash / pro 三档命名稳定）。
-    完全未知的 model id fallback 到最贵的 claude-opus-4-1，宁可高估也不
-    silently miss。
+    完全未知 / 已下线的 model id fallback 到最贵的 claude-opus-4-7，
+    宁可高估也不 silently miss（用户跑历史 batch 用了已 retire 的 model
+    时也能给出合理数字而不是 KeyError）。
     """
     mid = (model_id or "").lower()
     # 1. Claude: 按完整 model-id 前缀最长匹配（移除 ``claude/`` 路由前缀如有）
@@ -212,8 +216,9 @@ def get_pricing(model_id: str) -> dict[str, float]:
         return MODEL_PRICING["gemini-flash"]
     if "gemini" in mid:
         return MODEL_PRICING["gemini-pro"]
-    # 3. 未知：回退到最贵的（高估好过 silently miss）
-    return MODEL_PRICING["claude-opus-4-1"]
+    # 3. 未知：回退到最贵的（高估好过 silently miss）。Opus 4.7 是当前最贵档
+    #    （Opus 4.1 已下线后,4.5/4.6/4.7 同价、Opus 4.7 是 alias 也最稳）。
+    return MODEL_PRICING["claude-opus-4-7"]
 
 
 def estimate_cost_usd(model_id: str, usage: dict) -> float:
