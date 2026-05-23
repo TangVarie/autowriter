@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import re
 import time
@@ -171,6 +172,83 @@ def _system_to_gemini_string(system_prompt) -> str:
 
 
 # ── Prompt templates ───────────────────────────────────────────────────────
+
+
+# ── Claude cache-hit diagnostics ──────────────────────────────────────────
+# 临时诊断（Phase 1 部署后 Claude cache_create / cache_read 实测都是 0；
+# 中转站走 New API、文档兼容 Anthropic 官方，理论上应该命中）。
+# 每次 Claude 调用打一行 JSON 到 stdout，记录：
+#   1. 我们这边发出的 system 形态（list vs str，几个 block，每个 block 是否
+#      有 cache_control，每层字符数估算 token 量）
+#   2. SDK 收到的 response.usage 完整字段——用 model_dump / vars 兜底，
+#      漏掉了什么新字段（比如 1h cache 的 cache_creation 子分类）也能看见
+#
+# 受 DEBUG_CLAUDE_CACHE env var 控制；默认开（流量小，每 Claude 调用一行 JSON），
+# 诊断完成后用环境变量关掉。
+
+_DEBUG_CLAUDE_CACHE: bool = os.environ.get("DEBUG_CLAUDE_CACHE", "1") not in ("0", "false", "False")
+
+
+def _log_claude_call_diag(system_param, response, source: str) -> None:
+    """Dump system shape + raw response.usage to stdout for cache-miss diagnosis."""
+    if not _DEBUG_CLAUDE_CACHE:
+        return
+    sys_info: dict = {}
+    try:
+        if isinstance(system_param, list):
+            sys_info = {
+                "type":           "list",
+                "blocks":         len(system_param),
+                "cache_control":  sum(
+                    1 for b in system_param
+                    if isinstance(b, dict) and "cache_control" in b
+                ),
+                "per_block_chars": [
+                    len(b.get("text", "")) if isinstance(b, dict) else 0
+                    for b in system_param
+                ],
+            }
+        elif isinstance(system_param, str):
+            sys_info = {"type": "str", "chars": len(system_param)}
+        else:
+            sys_info = {"type": type(system_param).__name__}
+    except Exception as exc:
+        sys_info = {"error": str(exc)[:80]}
+
+    usage_info: dict = {}
+    raw_usage = getattr(response, "usage", None)
+    if raw_usage is not None:
+        try:
+            usage_info = raw_usage.model_dump(exclude_none=False)
+        except Exception:
+            # Fallback: 不是 pydantic model 时,扫一遍非 dunder/非 callable 属性
+            try:
+                usage_info = {
+                    a: getattr(raw_usage, a, None)
+                    for a in dir(raw_usage)
+                    if not a.startswith("_") and not callable(getattr(raw_usage, a, None))
+                }
+            except Exception as exc:
+                usage_info = {"error": str(exc)[:80]}
+
+    # 顺便看 response 上还有没有其他 cache 相关字段（个别 SDK 版本可能挂在
+    # response 本身而不是 .usage 上）
+    response_top_level_cache_attrs = []
+    try:
+        for a in dir(response):
+            if "cache" in a.lower() and not a.startswith("_"):
+                response_top_level_cache_attrs.append(a)
+    except Exception:
+        pass
+
+    telemetry.log_event(
+        "claude_cache_diag",
+        source=source,
+        system=sys_info,
+        usage=usage_info,
+        extra_cache_attrs=response_top_level_cache_attrs or None,
+    )
+
 
 def _make_user_prompt(
     tactic: str,
@@ -647,6 +725,7 @@ class ClaudeEngine:
                 return stream.get_final_message()
         try:
             response = _call_with_retry(_call)
+            _log_claude_call_diag(system_param, response, source="generate")
             text = _extract_text_from_response(response)
             token_usage = _extract_claude_usage(response.usage)
             stop_reason = getattr(response, "stop_reason", None)
@@ -701,6 +780,7 @@ class ClaudeEngine:
                 return stream.get_final_message()
         try:
             response = _call_with_retry(_call)
+            _log_claude_call_diag(system_param, response, source="iterate")
             text = _extract_text_from_response(response)
             result = _parse_copy_json(text, f"claude/{model}")
             result.token_usage = _extract_claude_usage(response.usage)
@@ -1377,6 +1457,7 @@ def _apply_compliance_recheck(
             system=system_param,
             messages=[{"role": "user", "content": user_content}],
         ))
+        _log_claude_call_diag(system_param, resp, source="compliance_recheck")
         if metrics is not None:
             metrics.add_tokens(f"claude/{config.CLAUDE_MODEL}",
                                _extract_claude_usage(resp.usage),
