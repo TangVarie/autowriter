@@ -866,6 +866,7 @@ def _queue_worker_impl(
                     gemini_use_thinking=gemini_thinking,
                     custom_roles=custom_roles,
                     n_roles=n_roles,
+                    metrics=metrics,
                 )
             else:
                 generation_results = gen_module.generate_batch(
@@ -2688,6 +2689,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 gemini_use_thinking=gemini_thinking,
                 custom_roles=custom_roles,
                 n_roles=n_roles,
+                metrics=metrics,
             )
         else:
             generation_results = gen_module.generate_batch(

@@ -1373,6 +1373,7 @@ def _select_best_drafts_batch(
     brief: str,
     all_slot_drafts: list[list[GenerationResult]],
     draft_labels: list[str],
+    metrics: Optional["telemetry.BatchMetrics"] = None,
 ) -> list[tuple[int, str]]:
     """
     One Claude call evaluates all slots at once.
@@ -1397,6 +1398,10 @@ def _select_best_drafts_batch(
         system=_SELECT_SYSTEM,
         messages=[{"role": "user", "content": user_content}],
     )
+    if metrics is not None:
+        metrics.add_tokens(f"claude/{config.CLAUDE_MODEL}",
+                           _extract_claude_usage(resp.usage),
+                           source="multi_role_select")
     raw = resp.content[0].text.strip()
     try:
         data = json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip())
@@ -1439,6 +1444,7 @@ def _refine_drafts_batch(
     brief: str,
     drafts: list[GenerationResult],
     model: str = "",
+    metrics: Optional["telemetry.BatchMetrics"] = None,
 ) -> list[GenerationResult]:
     """
     Run 六部 structured refinement on all winning drafts in parallel.
@@ -1466,20 +1472,25 @@ def _refine_drafts_batch(
                 system=refine_system,
                 messages=[{"role": "user", "content": user_content}],
             )
+            usage = _extract_claude_usage(resp.usage)
+            if metrics is not None:
+                metrics.add_tokens(f"claude/{model or config.CLAUDE_MODEL}",
+                                   usage, source="multi_role_refine")
             raw = resp.content[0].text.strip()
             cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
             refined = _try_parse_dict(cleaned, draft.ai_engine, raw)
             if refined and (refined.title or refined.body):
+                # 之前这里写的是 ``input_tokens``/``output_tokens``，跟主路径的
+                # ``input``/``output`` 键名不一致——任何按统一键聚合的下游
+                # （包括新 token 面板）都读不到这条数据。用 _extract_claude_usage
+                # 的标准化输出统一字段命名。
                 return idx, GenerationResult(
                     title=refined.title or draft.title,
                     body=refined.body or draft.body,
                     keywords=refined.keywords or draft.keywords,
                     ai_engine=draft.ai_engine,
                     raw_text=raw,
-                    token_usage={
-                        "input_tokens": resp.usage.input_tokens,
-                        "output_tokens": resp.usage.output_tokens,
-                    },
+                    token_usage=usage,
                 )
         except Exception as exc:
             telemetry.log_event(
@@ -1513,6 +1524,8 @@ def generate_batch_multi_role(
     gemini_use_thinking: bool = False,
     custom_roles: list[dict] | None = None,
     n_roles: int = 3,
+    metrics: Optional["telemetry.BatchMetrics"] = None,
+    metrics_source: str = "main",
 ) -> list[dict]:
     """
     Generate `count` items using multi-role × multi-engine parallel drafting (三省法).
@@ -1572,6 +1585,13 @@ def generate_batch_multi_role(
                 )
                 for _ in range(count)
             ]
+        # 一次 (role, engine) 调用 = 一次 API request，N 个 item 共享同一份
+        # token_usage 引用；同 _engine_call 的归集方式，按调用边界累加一次。
+        if metrics is not None and items:
+            head_usage = next((it.token_usage for it in items if it.token_usage), None)
+            if head_usage:
+                head_engine = next((it.ai_engine for it in items if it.ai_engine), eng_name)
+                metrics.add_tokens(head_engine, head_usage, source=metrics_source)
         return role["id"], eng_name, items
 
     # key: (role_id, eng_name) → list[GenerationResult]
@@ -1612,7 +1632,7 @@ def generate_batch_multi_role(
         tactic=tactic, target_audience=target_audience,
         key_messages=key_messages, tone=tone, extra=extra_instructions, count=1,
     )
-    selections = _select_best_drafts_batch(brief, all_slot_drafts, draft_labels)
+    selections = _select_best_drafts_batch(brief, all_slot_drafts, draft_labels, metrics=metrics)
 
     if progress_callback:
         progress_callback(0.90, f"尚书省六部精炼中（{count}篇并行）…")
@@ -1627,6 +1647,7 @@ def generate_batch_multi_role(
         brief=brief,
         drafts=winning_drafts,
         model=_models.get("claude", ""),
+        metrics=metrics,
     )
 
     if progress_callback:
