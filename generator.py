@@ -703,6 +703,42 @@ class ClaudeEngine:
         # truncated, stop_reason=="max_tokens" catches it downstream.
         return {"model": model, "max_tokens": max(2048, count * 2500)}
 
+    @staticmethod
+    def _normalize_prior_for_claude(prior_messages) -> list[dict]:
+        """把 session_messages 表里 JSONB content 拍扁成 Claude API 接受形态。
+
+        session_messages 表里 ``content`` 是 JSONB,实际形态可能是:
+        - ``{"text": str}``   ← ``append_session_messages`` 把裸 str 包成的形式
+        - 裸 str               ← 直接 dump 进 JSONB 时
+        - ``list[{type,text}]`` ← Anthropic block list 风格
+
+        Claude API ``messages[].content`` 只接受 ``str`` 或 ``list[TextBlockParam]``,
+        **不接受 ``{"text": str}`` 这种 dict**——直接发会在 SDK 验证层 422。
+
+        本函数把 dict/裸 str 统一拍成 str; list 形态原样透传(假设已是合法
+        block list)。非法 role / 空 content 跳过, 不让脏数据污染请求。
+        """
+        out: list[dict] = []
+        for m in prior_messages or []:
+            role = (m.get("role") or "").lower()
+            if role not in ("user", "assistant"):
+                continue
+            raw = m.get("content")
+            if isinstance(raw, list):
+                # 已经是 block list 形态,假设是 [{type,text},...] 直接透传
+                if raw:
+                    out.append({"role": role, "content": raw})
+                continue
+            text = ""
+            if isinstance(raw, str):
+                text = raw
+            elif isinstance(raw, dict):
+                text = raw.get("text") or ""
+            if not text:
+                continue
+            out.append({"role": role, "content": text})
+        return out
+
     def generate(
         self,
         system_prompt,
@@ -723,7 +759,7 @@ class ClaudeEngine:
         model = model or config.CLAUDE_MODEL
         params = self._make_params(model, use_thinking, count)
         system_param = _system_to_claude_param(system_prompt)
-        messages = list(prior_messages or [])
+        messages = self._normalize_prior_for_claude(prior_messages)
         messages.append({
             "role": "user",
             "content": self._build_content(user_prompt, images),
