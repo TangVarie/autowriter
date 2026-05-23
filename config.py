@@ -349,7 +349,7 @@ def compute_base_prompt_hash(base_prompt: str) -> str:
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
-APP_VERSION: str = "2.16.1-phase2.2"
+APP_VERSION: str = "2.16.2-phase2.2"
 
 
 def validate_config() -> list[str]:
