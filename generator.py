@@ -183,10 +183,11 @@ def _system_to_gemini_string(system_prompt) -> str:
 #   2. SDK 收到的 response.usage 完整字段——用 model_dump / vars 兜底，
 #      漏掉了什么新字段（比如 1h cache 的 cache_creation 子分类）也能看见
 #
-# 受 DEBUG_CLAUDE_CACHE env var 控制；默认开（流量小，每 Claude 调用一行 JSON），
-# 诊断完成后用环境变量关掉。
+# 受 DEBUG_CLAUDE_CACHE env var 控制。Phase 1 部署后 cache 已验证可工作,
+# 默认**关**减少 stdout 流量(每 Claude 调用一行 JSON 累计起来不少);
+# 重新排查 cache miss 时设 DEBUG_CLAUDE_CACHE=1 即可。
 
-_DEBUG_CLAUDE_CACHE: bool = os.environ.get("DEBUG_CLAUDE_CACHE", "1") not in ("0", "false", "False")
+_DEBUG_CLAUDE_CACHE: bool = os.environ.get("DEBUG_CLAUDE_CACHE", "0") in ("1", "true", "True")
 
 
 def _log_claude_call_diag(system_param, response, source: str) -> None:
