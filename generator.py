@@ -711,17 +711,28 @@ class ClaudeEngine:
         use_thinking: bool = False,
         model: str = "",
         count: int = 1,
+        prior_messages: Optional[list[dict]] = None,
     ) -> list[GenerationResult]:
         # Phase 1：``system_prompt`` 可以是 str 或 layered dict（stable/tactic/p0/p1/p2）；
         # dict 形态会被翻译成多 block + cache_control，str 直传维持向后兼容。
+        # Phase 2.1：``prior_messages`` 是 session 的对话历史(list[{role,content}]),
+        # 拼到当前 user turn 前面，让 Anthropic 把整段 prefix(system blocks +
+        # 历史对话)做 cache 命中。当前 user turn 末尾的小段动态内容(本批指令
+        # + 跨引擎避重提示等)放最后,不进 cache 但也不破坏前缀复用。
+        # 空 list / None → 行为跟 Phase 1 完全一致(单 user turn 调用)。
         model = model or config.CLAUDE_MODEL
         params = self._make_params(model, use_thinking, count)
         system_param = _system_to_claude_param(system_prompt)
+        messages = list(prior_messages or [])
+        messages.append({
+            "role": "user",
+            "content": self._build_content(user_prompt, images),
+        })
         def _call():
             with self._client.messages.stream(
                 **params,
                 system=system_param,
-                messages=[{"role": "user", "content": self._build_content(user_prompt, images)}],
+                messages=messages,
             ) as stream:
                 return stream.get_final_message()
         try:
@@ -865,6 +876,51 @@ class GeminiEngine:
         result.token_usage = _extract_gemini_usage(getattr(response, "usage_metadata", None))
         return result
 
+    @staticmethod
+    def _msg_content_to_text(content) -> str:
+        """统一把 message content 拍扁成一段文本(Gemini Part.from_text 只
+        接受 str)。
+
+        来源可能是:
+        - str: 直接 (Claude 用户传的 plain text)
+        - dict {"text": "..."}: session_messages 表里的封装形式
+        - list[{"type":"text","text":"..."}]: Anthropic block 风格
+        其它形态退化为 str()(避免崩,但模型可能看到诡异内容,日志里能查到)。
+        """
+        if isinstance(content, list):
+            return " ".join(
+                b.get("text", "") for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        if isinstance(content, dict):
+            return content.get("text", "") or str(content)
+        return str(content)
+
+    @classmethod
+    def _messages_to_contents(cls, messages: list[dict]) -> list:
+        """把统一 ``messages`` 列表转 Gemini ``Content`` 序列。``role='user'``
+        映射成 Gemini 的 user;其它(assistant / model)统一映射成 model。
+        空 / 非法条目跳过。"""
+        out = []
+        for m in messages or []:
+            role_in = (m.get("role") or "").lower()
+            if role_in == "user":
+                gem_role = "user"
+            elif role_in in ("assistant", "model"):
+                gem_role = "model"
+            else:
+                continue
+            text = cls._msg_content_to_text(m.get("content"))
+            if not text:
+                continue
+            out.append(
+                genai_types.Content(
+                    role=gem_role,
+                    parts=[genai_types.Part.from_text(text=text)],
+                )
+            )
+        return out
+
     def generate(
         self,
         system_prompt,
@@ -873,12 +929,26 @@ class GeminiEngine:
         use_thinking: bool = False,
         model: str = "",
         count: int = 1,
+        prior_messages: Optional[list[dict]] = None,
     ) -> list[GenerationResult]:
         # Phase 1：layered dict 进来时拼回单字符串发给 Gemini（implicit
         # caching 看前缀稳定性自动命中，跟 Claude 的显式 cache_control 不同）。
+        # Phase 2.1：``prior_messages`` 是 session 对话历史; 转 Content 序列
+        # 拼到当前 user turn 前面。Gemini implicit caching 看 contents 前缀
+        # 稳定性自动命中,跟 Claude 一样无需显式标记。
         model = model or config.GEMINI_MODEL
         gen_config = self._make_generate_config(use_thinking, model, count)
         gen_config.system_instruction = _system_to_gemini_string(system_prompt)
+        history = self._messages_to_contents(prior_messages or [])
+        current_parts = self._build_parts(user_prompt, images)
+        if history:
+            # 有历史时必须用 Content 列表(API 要求 multi-turn 用 typed Content)
+            contents = history + [
+                genai_types.Content(role="user", parts=current_parts)
+            ]
+        else:
+            # 无历史时保持 Phase 1 行为(直接传 parts list, SDK 接受)
+            contents = current_parts
         try:
             # ``with_gemini_retry`` 覆盖 429 / 5xx / timeout / connection 抖动，
             # 4 次指数退避。和 Claude 路径保持对称——之前 Gemini 裸调一次失败
@@ -886,7 +956,7 @@ class GeminiEngine:
             response = clients.with_gemini_retry(
                 lambda: self._client.models.generate_content(
                     model=model,
-                    contents=self._build_parts(user_prompt, images),
+                    contents=contents,
                     config=gen_config,
                 ),
             )
@@ -932,22 +1002,10 @@ class GeminiEngine:
         gen_config = self._make_generate_config(use_thinking, model)
         gen_config.system_instruction = _system_to_gemini_string(system_prompt)
         try:
-            def _msg_to_str(content) -> str:
-                if isinstance(content, list):
-                    return " ".join(
-                        b.get("text", "") for b in content if b.get("type") == "text"
-                    )
-                return str(content)
-
-            history = [
-                genai_types.Content(
-                    role="user" if msg["role"] == "user" else "model",
-                    parts=[genai_types.Part.from_text(text=_msg_to_str(msg["content"]))],
-                )
-                for msg in messages[:-1]
-            ]
-
-            last_text = _msg_to_str(messages[-1]["content"])
+            # 前 N-1 条转 Content 历史(复用 generate 那边的 helper); 最后一条
+            # user turn 单独拼 images + text(可能带图,history 不支持图)。
+            history = self._messages_to_contents(messages[:-1])
+            last_text = self._msg_content_to_text(messages[-1].get("content"))
             import base64
             last_parts = [
                 genai_types.Part.from_bytes(
@@ -1179,6 +1237,7 @@ def generate_batch(
     project_id: str = "",
     metrics: Optional["telemetry.BatchMetrics"] = None,
     metrics_source: str = "main",
+    engine_prior_messages: Optional[dict[str, list[dict]]] = None,
 ) -> list[dict]:
     """
     Generate `count` copy items using specified engines.
@@ -1237,6 +1296,10 @@ def generate_batch(
                 use_thinking if engine_name == "claude"
                 else (gemini_use_thinking if engine_name == "gemini" else False)
             )
+            # Phase 2.1: 每个 engine 各拿自己 session 的历史 prefix(没有就空 list)。
+            # ClaudeEngine / GeminiEngine 都接受 prior_messages 参数,空时退化为
+            # Phase 1 行为(单 user turn)。
+            prior = (engine_prior_messages or {}).get(engine_name, []) or []
             items = engine.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt_for_engine,
@@ -1244,6 +1307,7 @@ def generate_batch(
                 use_thinking=thinking_flag,
                 model=model_override,
                 count=count,
+                prior_messages=prior,
             )
         except Exception as e:
             # 必须用列表推导生成独立实例：``[GR(...)] * count`` 会把同一对象
@@ -1751,6 +1815,7 @@ def generate_batch_multi_role(
     n_roles: int = 3,
     metrics: Optional["telemetry.BatchMetrics"] = None,
     metrics_source: str = "main",
+    engine_prior_messages: Optional[dict[str, list[dict]]] = None,
 ) -> list[dict]:
     """
     Generate `count` items using multi-role × multi-engine parallel drafting (三省法).
@@ -1791,6 +1856,7 @@ def generate_batch_multi_role(
     def _call_task(role: dict, eng_name: str) -> tuple[str, str, list[GenerationResult]]:
         engine = get_engine(eng_name)
         thinking = use_thinking if eng_name == "claude" else (gemini_use_thinking if eng_name == "gemini" else False)
+        prior = (engine_prior_messages or {}).get(eng_name, []) or []
         try:
             items = engine.generate(
                 system_prompt=system_prompt,
@@ -1799,6 +1865,7 @@ def generate_batch_multi_role(
                 use_thinking=thinking,
                 model=_models.get(eng_name, ""),
                 count=count,
+                prior_messages=prior,
             )
         except Exception as e:
             # 任一路失败不该拖垮整批：填占位 GenerationResult 让该路在后续
