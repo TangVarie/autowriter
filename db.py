@@ -2442,6 +2442,12 @@ def get_session_committed_item_ids(client: Client, session_id: str) -> set:
     分页拉全(Phase 2.2 review #2): PostgREST 单次响应被 project max-rows
     (常见 1000)截断, session 超过那么多 committed turn 后单次 select 会漏,
     导致已同步的 item 被当成新的重复 append。这里用 .range() 翻页直到拉完。
+
+    **必须 .order() 才能安全分页**(review): 不指定排序时 PostgREST 跨页
+    返回顺序不确定, 可能某些 item_id 跨页被跳过 / 重复, committed set 不全 →
+    懒同步把已同步的当新 append, 重新引入重复。按主键 ``id``(绝对唯一稳定)
+    排序保证分页确定。
+
     读取失败返回空 set(调用方可能重复 commit, 但 DB 唯一约束
     session_messages_session_item_uniq 兜底防重复行)。
     """
@@ -2455,6 +2461,7 @@ def get_session_committed_item_ids(client: Client, session_id: str) -> set:
                 .select("item_id")
                 .eq("session_id", session_id)
                 .not_.is_("item_id", "null")
+                .order("id")
                 .range(offset, offset + page - 1)
                 .execute()
             )
