@@ -425,8 +425,11 @@ CREATE POLICY session_messages_owner ON session_messages
 -- 按 (session, turn) 顺序读取是热路径(每批生成前要拉完整历史拼 prefix)。
 CREATE UNIQUE INDEX IF NOT EXISTS session_messages_session_turn_uniq
     ON session_messages(session_id, turn_idx);
--- 懒同步幂等检查: "该 session 已 commit 了哪些 item"
-CREATE INDEX IF NOT EXISTS session_messages_item_idx
+-- 懒同步幂等 + 并发防重: (session_id, item_id) 唯一(item_id 非空)。
+-- 一个 approved item 在一个 session 只能有一条带 item_id 的 turn(assistant);
+-- user 占位 turn 的 item_id 为 NULL 不受约束。并发同步时第二个 insert 撞约束
+-- 失败 → 本次跳过, 不产生重复历史(Phase 2.2 review #4)。
+CREATE UNIQUE INDEX IF NOT EXISTS session_messages_session_item_uniq
     ON session_messages(session_id, item_id)
     WHERE item_id IS NOT NULL;
 
@@ -2435,46 +2438,71 @@ def list_session_messages(client: Client, session_id: str) -> list[dict]:
 
 def get_session_committed_item_ids(client: Client, session_id: str) -> set:
     """返回该 session 已经 commit 过的 item_id 集合(Phase 2.2 懒同步幂等用)。
-    读取失败返回空 set —— 调用方会因此可能重复 commit,但 append 时
-    turn_idx 唯一约束 + 内容相同不会造成逻辑错误(最多多几条历史)。"""
+
+    分页拉全(Phase 2.2 review #2): PostgREST 单次响应被 project max-rows
+    (常见 1000)截断, session 超过那么多 committed turn 后单次 select 会漏,
+    导致已同步的 item 被当成新的重复 append。这里用 .range() 翻页直到拉完。
+    读取失败返回空 set(调用方可能重复 commit, 但 DB 唯一约束
+    session_messages_session_item_uniq 兜底防重复行)。
+    """
+    out: set = set()
+    page = 1000
+    offset = 0
     try:
-        res = (
-            client.table("session_messages")
-            .select("item_id")
-            .eq("session_id", session_id)
-            .not_.is_("item_id", "null")
-            .execute()
-        )
-        return {r["item_id"] for r in (res.data or []) if r.get("item_id")}
+        while True:
+            res = (
+                client.table("session_messages")
+                .select("item_id")
+                .eq("session_id", session_id)
+                .not_.is_("item_id", "null")
+                .range(offset, offset + page - 1)
+                .execute()
+            )
+            rows = res.data or []
+            for r in rows:
+                if r.get("item_id"):
+                    out.add(r["item_id"])
+            if len(rows) < page:
+                break
+            offset += page
+        return out
     except Exception as exc:
         telemetry.log_event(
             "session_committed_items_failed",
             session_id=session_id, error=str(exc)[:200],
         )
-        return set()
+        return out
 
 
 def list_approved_versions_for_sync(
     client: Client,
     project_id: str,
-    engine_model: str,
+    engine: str,
     limit: int = 50,
 ) -> list[dict]:
     """Phase 2.2 懒同步: 查该 project 下 status='approved' 的 items 的最优
-    版本, 且 version.ai_engine == ``engine_model``(形如 ``claude/claude-
-    sonnet-4-6``), 按 item 创建时间升序(老的在前, 符合对话历史顺序)。
+    版本, 且 version.ai_engine 属于指定 ``engine``(前缀匹配 ``{engine}/*``,
+    **不限具体 model 版本**) —— 这样用户换过 model(如 sonnet-4-5 → 4-6)后,
+    新 session 仍能拿到老 model 的 claude 历史做避重(cache 命中只看 prefix
+    文本字节, 跟历史内容由哪个 model 产生无关)。
 
     返回 ``[{item_id, batch_id, title, body, keywords, created_at}, ...]``,
-    最多 ``limit`` 条(取最近的 limit 条 approved, 再按时间升序排)。
+    按 item 创建时间升序(老的在前, 符合对话历史顺序), 最多 ``limit`` 条。
 
-    实现: 两步查询(避开 PostgREST 复杂 embedded join 的脆弱性)——
-      1. 该 project 最近 limit 条 approved items + 它们的 best_version_id
-         (用 batches!inner embedded filter 按 project_id 过滤)
-      2. 批量取这些 best_version 的内容, 内存里按 ai_engine 过滤 + 拼装
+    Review #1: engine 过滤在 trim 到 limit **之前** —— 混合引擎项目里, 若
+    直接取最近 limit 条 approved 再过滤 engine, 可能全是另一引擎导致本 engine
+    同步 0 条。这里 step1 over-fetch 该 project 的 approved items(上限按
+    PostgREST max-rows), step2 join version 过滤 engine 后再 trim。
+
+    Review #3 (known limitation): 用 ``items.created_at`` 近似审核时间排序。
+    items 表没有 approved_at 字段, 延迟审核的老 item(创建早、审核晚)会按
+    创建时间排序, 极端情况(approved 数 > over-fetch 上限)可能漏。over-fetch
+    取到 1000 条缓解; 要精确需加 approved_at 列(后续 PR)。
     """
     try:
-        # Step 1: 该 project 最近的 approved items(embedded inner join 到
-        # batches 按 project_id 过滤; 取 best_version_id 待会儿批量拉内容)
+        # Step 1: over-fetch 该 project 的 approved items(带 best_version_id),
+        # 按 created_at desc。limit 取 PostgREST 上限附近, 覆盖绝大多数项目的
+        # 全部 approved(单项目通常远 < 1000)。
         items_res = (
             client.table("items")
             .select("id, batch_id, best_version_id, created_at, batches!inner(project_id)")
@@ -2482,7 +2510,7 @@ def list_approved_versions_for_sync(
             .eq("status", "approved")
             .not_.is_("best_version_id", "null")
             .order("created_at", desc=True)
-            .limit(limit)
+            .limit(1000)
             .execute()
         )
         items = items_res.data or []
@@ -2493,24 +2521,30 @@ def list_approved_versions_for_sync(
         if not best_vids:
             return []
 
-        # Step 2: 批量拉 best_version 内容
-        vers_res = (
-            client.table("versions")
-            .select("id, ai_engine, title, body, keywords")
-            .in_("id", best_vids)
-            .execute()
-        )
-        ver_by_id = {v["id"]: v for v in (vers_res.data or [])}
+        # Step 2: 批量取 best_version 内容(分批避免 in_ 列表过长)
+        ver_by_id: dict = {}
+        chunk = 200
+        for i in range(0, len(best_vids), chunk):
+            sub = best_vids[i:i + chunk]
+            vres = (
+                client.table("versions")
+                .select("id, ai_engine, title, body, keywords")
+                .in_("id", sub)
+                .execute()
+            )
+            for v in (vres.data or []):
+                ver_by_id[v["id"]] = v
 
-        out = []
-        for it in items:
+        engine_prefix = f"{engine}/"
+        matched = []
+        for it in items:  # items 已按 created_at desc
             v = ver_by_id.get(it.get("best_version_id"))
             if not v:
                 continue
-            # 只要 ai_engine 精确匹配本 session 的 engine/model 的版本
-            if (v.get("ai_engine") or "") != engine_model:
+            # engine 前缀匹配(claude/* 或 gemini/*), 过滤在 trim 之前(review #1)
+            if not (v.get("ai_engine") or "").startswith(engine_prefix):
                 continue
-            out.append({
+            matched.append({
                 "item_id":    it["id"],
                 "batch_id":   it.get("batch_id"),
                 "title":      v.get("title", ""),
@@ -2518,14 +2552,16 @@ def list_approved_versions_for_sync(
                 "keywords":   v.get("keywords", []),
                 "created_at": it.get("created_at"),
             })
-        # items 是按 created_at 降序拉的(取最近 limit 条), 这里翻成升序
-        # 让对话历史按时间从老到新排列。
-        out.reverse()
-        return out
+            if len(matched) >= limit:
+                break
+        # matched 是按 created_at desc 收集的最近 limit 条; 翻成升序让对话
+        # 历史从老到新。
+        matched.reverse()
+        return matched
     except Exception as exc:
         telemetry.log_event(
             "approved_versions_sync_query_failed",
-            project_id=project_id, engine_model=engine_model,
+            project_id=project_id, engine=engine,
             error=str(exc)[:200],
         )
         return []
