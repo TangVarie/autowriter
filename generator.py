@@ -877,7 +877,13 @@ class GeminiEngine:
             parts.append(
                 genai_types.Part.from_bytes(data=raw, mime_type=img["media_type"])
             )
-        parts.append(text)
+        # 必须用 Part.from_text 而不是裸 append(text): 单 turn 路径
+        # (contents=parts) 时 Google SDK 能容忍裸字符串自动包装, 但 Phase 2.1+
+        # 多轮路径把 parts 塞进 ``Content(role=, parts=parts)`` 时,
+        # ``Content.parts`` 要求 list[Part], 裸 str 会触发 pydantic
+        # "Input should be a valid dictionary or object" 验证错误。
+        # 统一成 Part 对象, 两条路径都合法。
+        parts.append(genai_types.Part.from_text(text=text))
         return parts
 
     def _make_generate_config(self, use_thinking: bool, model: str = "", count: int = 1) -> "genai_types.GenerateContentConfig":
