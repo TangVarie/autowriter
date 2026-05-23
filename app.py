@@ -1402,11 +1402,14 @@ def _render_token_panel(meta) -> None:
         st.caption(f"⚠ token 面板数据异常：{exc}")
 
 
-def _render_queue_dashboard(qs: dict) -> None:
-    """渲染本次队列每个批次的指标卡：阶段计时 + 去重/重生/违规计数 + 注入摘要。
+def _render_queue_dashboard(qs: dict, title: str = "本次队列指标") -> None:
+    """渲染队列 / 快速生成每个批次的指标卡：阶段计时 + 去重/重生/违规计数
+    + 注入摘要 + token/cost 面板。
 
     数据源是 ``metrics.close()`` 落到 ``qs["metrics_list"]`` 的每批快照；
     本函数只读、纯展示，不做任何 DB I/O，调用频率与刷新成本都可忽略。
+    队列 worker 和 quick-gen worker 都往各自 status 的 ``metrics_list`` 挂,
+    所以这个 dashboard 两条路径通用——``title`` 区分文案(队列/单次生成)。
 
     生成中默认展开（用户想看实时数据），完成后默认折叠（成功 banner 已经
     在上面、不抢焦点）。每个批次卡片用 try/except 包，单批数据异常不会
@@ -1417,7 +1420,7 @@ def _render_queue_dashboard(qs: dict) -> None:
         return
     is_running = bool(qs.get("running"))
     with st.expander(
-        f"📊 本次队列指标（{len(metrics_list)} 批）",
+        f"📊 {title}（{len(metrics_list)} 批）",
         expanded=is_running,
     ):
         for idx, m in enumerate(metrics_list):
@@ -3587,6 +3590,14 @@ def page_generate(project: dict) -> None:
                 st.success(f"✅ 生成完成！共 {n_res} 篇，{saved} 个版本。")
             elif not errors_list:
                 st.warning("生成完成，但没有内容被保存，请检查配置。")
+            # 快速生成的指标卡片(token/cache/cost/耗时/去重)——之前只有队列
+            # banner 渲染, quick gen 漏了, 导致"快速生成完没数据卡片"。
+            # qgs["metrics_list"] 由 _quick_gen_worker 的 metrics.close(status)
+            # 挂上, 跟队列共用 _render_queue_dashboard。
+            try:
+                _render_queue_dashboard(qgs, title="本次生成指标")
+            except Exception as exc:
+                st.caption(f"⚠ 指标面板渲染失败：{exc}")
             # Day 2: 降级 / 缺向量等非阻塞告警
             qg_warnings = qgs.get("warnings") or []
             qg_missing = qgs.get("embedding_missing") or []
