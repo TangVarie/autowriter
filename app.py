@@ -618,22 +618,29 @@ def _format_version_for_session(v: dict) -> str:
 
 
 def _sync_approved_to_session(
-    db_client, session_id: str, project_id: str, engine_model: str,
+    db_client, session_id: str, project_id: str, engine: str,
 ) -> int:
-    """把该 (project, engine_model) 下 approved 但还没进 session 的版本, 按时间
-    顺序补成 (user, assistant) 对话历史。幂等: 按 item_id 跳过已 commit 的。
+    """把该 (project, engine) 下 approved 但还没进 session 的版本, 按时间顺序
+    补成 (user, assistant) 对话历史。幂等: 按 item_id 跳过已 commit 的。
 
-    这一步是 Phase 2.2 的核心 —— 它同时实现了:
+    ``engine`` 是引擎名("claude"/"gemini"), 不限具体 model 版本 —— 用户换过
+    model(sonnet-4-5 → 4-6)后, 老 model 的 claude 历史仍能进新 session 做
+    避重(见 db.list_approved_versions_for_sync 的 engine 前缀匹配)。
+
+    这一步是 Phase 2.2 的核心 —— 同时实现:
       - 增量 commit: 每次生成前把新审核通过的内容补进 session
       - 历史补建(原 Phase 2.4): 新 session 首次同步就把最近 50 条历史灌入
 
-    返回新追加的 turn 对数(approved item 数)。失败静默返回 0(不影响生成,
-    最多这次没拿到完整历史 prefix)。
+    turn 结构: user 占位 turn item_id=NULL(不占唯一约束), assistant turn 带
+    item_id(幂等 + DB 唯一约束 session_messages_session_item_uniq 防并发重复)。
+
+    返回新追加的 turn 对数。失败静默返回 0(不影响生成, 最多这次没拿到完整
+    历史 prefix)。
     """
     try:
         committed = db.get_session_committed_item_ids(db_client, session_id)
         approved = db.list_approved_versions_for_sync(
-            db_client, project_id, engine_model, limit=_SESSION_SYNC_LIMIT,
+            db_client, project_id, engine, limit=_SESSION_SYNC_LIMIT,
         )
         new_msgs: list[dict] = []
         for v in approved:
@@ -643,14 +650,15 @@ def _sync_approved_to_session(
             assistant_text = _format_version_for_session(v)
             if not assistant_text:
                 continue
-            # 一对 (user 占位, assistant 真实内容), 都带 item_id 供幂等 + 回溯
-            common = {"item_id": iid, "batch_id": v.get("batch_id")}
+            bid = v.get("batch_id")
+            # user 占位: item_id=None(不参与 (session_id,item_id) 唯一约束);
+            # assistant: 带 item_id(幂等 + 唯一约束防并发重复同步)。
             new_msgs.append({"role": "user",
                              "content": {"text": _SESSION_USER_TURN_PLACEHOLDER},
-                             **common})
+                             "item_id": None, "batch_id": bid})
             new_msgs.append({"role": "assistant",
                              "content": {"text": assistant_text},
-                             **common})
+                             "item_id": iid, "batch_id": bid})
         if new_msgs:
             db.append_session_messages(db_client, session_id, new_msgs)
         return len(new_msgs) // 2
@@ -717,7 +725,7 @@ def _resolve_engine_sessions(
         # Phase 2.2: 先把 approved 但未进 session 的内容补成对话历史(懒同步),
         # 再拉完整历史。新 session 首次会补最近 50 条 approved 历史; 后续生成
         # 只补增量(新审核通过的)。失败不影响生成(prior 退化为已有部分)。
-        _sync_approved_to_session(db_client, sess["id"], project_id, f"{eng}/{model_used}")
+        _sync_approved_to_session(db_client, sess["id"], project_id, eng)
         # 拉历史: 表里 content 是 JSONB,LLM SDK 那边由 GeminiEngine._msg_content
         # _to_text / ClaudeEngine 的 _build_content 各自识别 dict/str/list 形态。
         rows = db.list_session_messages(db_client, sess["id"]) or []
