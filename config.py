@@ -147,6 +147,13 @@ MAX_ITERATION_ROUNDS: int = 3
 # 不同 Opus 版本价差 3 倍（Opus 4.1 是 Opus 4.5+ 的 3 倍），所以必须按
 # model id 精细分档，不能用"family 一锅"。
 #
+# **Pricing keys ≠ selectable models**：``CLAUDE_MODELS`` 是 UI 下拉里
+# 可选的"当前还能用的 model"列表（只有 4 个）；本表是历史成本计算用，
+# 包含**已下线但 DB 里仍有 batch 记录的 retired model 价档**——历史回看
+# 面板算成本时需要按当时价精确路由，不然估算偏差很大（如 opus-4-1 实际
+# $27 vs 4.5+ $9，3 倍价差，被错误 fallback 到 4.7 价档会让历史成本
+# 低估 67%）。
+#
 # Anthropic 的 input/cache_read/cache_create 三个 token 计数**互斥**:
 #   总输入 token = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
 # Gemini 的 cached_content_token_count 是 prompt_token_count 的**子集**:
@@ -159,11 +166,16 @@ MAX_ITERATION_ROUNDS: int = 3
 #
 # Gemini 价格暂仍按 Google 官方公开价；中转站 Gemini 实际价待用户提供后再调。
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    # ── Claude（中转站价，2026-05 sonnet 4.5 / opus 4.1 / 4.5 已下线）──
+    # ── Claude 当前可选（CLAUDE_MODELS 里有）──────────────────────────
     "claude-haiku-4-5":   {"input": 1.80, "output": 9.00,   "cache_write": 2.25,   "cache_read": 0.18},
     "claude-sonnet-4-6":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
     "claude-opus-4-6":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
     "claude-opus-4-7":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
+    # ── Claude 已下线但 DB 历史 batch 仍引用（仅用于成本回算）──────────
+    # 2026-05 中转站新分组下线; 用户的历史 batch 大量用这些 model id
+    "claude-sonnet-4-5":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
+    "claude-opus-4-1":    {"input": 27.00, "output": 135.00, "cache_write": 33.75, "cache_read": 2.70},
+    "claude-opus-4-5":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
     # ── Gemini（官方价，待中转站价格更新）──────────────────────────────
     "gemini-pro":         {"input": 1.25, "output": 10.00,  "cache_write": 0.0,    "cache_read": 0.31},
     "gemini-flash":       {"input": 0.30, "output": 2.50,   "cache_write": 0.0,    "cache_read": 0.075},
