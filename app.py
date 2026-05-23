@@ -1127,6 +1127,37 @@ def _fmt_tok(n: int) -> str:
     return str(int(n))
 
 
+def _short_model(model_full: str) -> str:
+    """``claude/claude-sonnet-4-5-20250929`` → ``claude · sonnet-4-5``。
+
+    去掉重复的引擎名前缀和末尾日期戳，让 metric 行标题不长。新模型自然兼容
+    （不依赖白名单），未知 id 直接原样返回。
+    """
+    if "/" not in (model_full or ""):
+        return model_full or "?"
+    eng, m = model_full.split("/", 1)
+    if m.startswith(eng + "-"):
+        m = m[len(eng) + 1:]
+    parts = m.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 8:
+        m = parts[0]
+    return f"{eng} · {m}"
+
+
+def _render_token_row(label: str, u: dict, cost_field: str = "cost_usd") -> None:
+    """渲染一行 5 列 token metric。``u`` 是 token usage dict（含 input /
+    cache_read / cache_create / output / cost_usd）；``label`` 在上面挂一行
+    caption。"""
+    if label:
+        st.caption(label)
+    cols = st.columns(5)
+    cols[0].metric("input",        _fmt_tok(int(u.get("input") or 0)))
+    cols[1].metric("cache_read",   _fmt_tok(int(u.get("cache_read") or 0)))
+    cols[2].metric("cache_create", _fmt_tok(int(u.get("cache_create") or 0)))
+    cols[3].metric("output",       _fmt_tok(int(u.get("output") or 0)))
+    cols[4].metric("≈ 成本",       f"${float(u.get(cost_field) or 0):.4f}")
+
+
 def _render_token_panel(meta) -> None:
     """渲染本批的 token 用量 + 估算费用 + cache 命中。两个面板（队列实时
     / 历史回看）共享。
@@ -1135,6 +1166,10 @@ def _render_token_panel(meta) -> None:
     JSONB 字段可能以字符串形态回来（同文件的 phase_ms / counters 都需要 json
     解一次，meta 同样要做），所以这里再容错一层 JSON parse，确保历史 expander
     不会因为 str.get 崩溃整页。
+
+    多引擎批次按引擎拆行（A 方案）——每个引擎独立一行 5 列 metric，下面挂
+    一行"合计" caption；单引擎/无 by_model 元数据时退化成单行聚合，跟旧行为
+    一致。
     """
     if isinstance(meta, str):
         try:
@@ -1156,12 +1191,28 @@ def _render_token_panel(meta) -> None:
         by_model = totals.get("by_model") or {}
         saved = config.estimate_cache_savings_usd(by_model) if isinstance(by_model, dict) else 0.0
 
-        cols = st.columns(5)
-        cols[0].metric("input",        _fmt_tok(int(totals.get("input") or 0)))
-        cols[1].metric("cache_read",   _fmt_tok(int(totals.get("cache_read") or 0)))
-        cols[2].metric("cache_create", _fmt_tok(int(totals.get("cache_create") or 0)))
-        cols[3].metric("output",       _fmt_tok(int(totals.get("output") or 0)))
-        cols[4].metric("≈ 成本",       f"${cost:.4f}")
+        per_model_rows: list[tuple[str, dict]] = []
+        if isinstance(by_model, dict):
+            for mid, u in by_model.items():
+                if isinstance(u, dict):
+                    per_model_rows.append((mid, u))
+
+        if len(per_model_rows) >= 2:
+            # 多引擎：按引擎一行 metric + 一行合计
+            # 排序按成本降序，最贵的引擎排最上面便于一眼看到主要支出
+            per_model_rows.sort(key=lambda x: float(x[1].get("cost_usd") or 0), reverse=True)
+            for mid, u in per_model_rows:
+                _render_token_row(f"**{_short_model(mid)}**", u)
+            st.caption(
+                f"**合计**　input {_fmt_tok(int(totals.get('input') or 0))} · "
+                f"cache_read {_fmt_tok(int(totals.get('cache_read') or 0))} · "
+                f"cache_create {_fmt_tok(int(totals.get('cache_create') or 0))} · "
+                f"output {_fmt_tok(int(totals.get('output') or 0))} · "
+                f"≈ ${cost:.4f}"
+            )
+        else:
+            # 单引擎或没 by_model 数据：直接显示聚合 totals
+            _render_token_row("", totals)
 
         extras: list[str] = []
         if saved > 0:
@@ -1171,23 +1222,6 @@ def _render_token_panel(meta) -> None:
             extras.append(f"thinking {_fmt_tok(thinking)}")
         if extras:
             st.caption(" · ".join(extras))
-
-        if isinstance(by_model, dict) and by_model:
-            per_lines = []
-            for mid, u in by_model.items():
-                if not isinstance(u, dict):
-                    continue
-                mcost = float(u.get("cost_usd") or 0.0)
-                chunks = [f"in {_fmt_tok(int(u.get('input') or 0))}"]
-                if u.get("cache_read"):
-                    chunks.append(f"cache_r {_fmt_tok(int(u['cache_read']))}")
-                if u.get("cache_create"):
-                    chunks.append(f"cache_w {_fmt_tok(int(u['cache_create']))}")
-                chunks.append(f"out {_fmt_tok(int(u.get('output') or 0))}")
-                chunks.append(f"${mcost:.4f}")
-                per_lines.append(f"`{mid}` · " + " · ".join(chunks))
-            if per_lines:
-                st.caption("分模型：\n\n" + "  \n".join(per_lines))
 
         by_source = totals.get("by_source") or {}
         if isinstance(by_source, dict) and (len(by_source) > 1 or "compliance_recheck" in by_source):
