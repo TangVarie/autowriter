@@ -586,6 +586,82 @@ def _run_semantic_dedup_pass(
 # 所有失败都吞了走 fallback (空 session_ids + 空 prior_messages),保证
 # session 层的 hiccup 不会让批次生成挂掉。
 
+# Phase 2.2: 懒同步 approved 内容到 session 的参数 + helper
+#
+# 每个 (project, engine, model) session 最多带最近 50 条 approved 内容作为
+# 对话历史(跟用户定的"半补建每 model 50 条"一致)。撞 context window 的
+# 滚动 / seal 留 Phase 2.3。
+_SESSION_SYNC_LIMIT = 50
+# 历史 user turn 占位: 所有历史 turn 用同一句, 高度可 cache。真正的"避重
+# 创作"指令在当前批的 user prompt(generate_batch 内部的 _make_user_prompt
+# + dedup_block)里, 历史 user turn 只是让对话合法 + 给 assistant 内容
+# (已 approved 的产出)一个挂载点, 让模型"看到"过往完整内容来避重。
+_SESSION_USER_TURN_PLACEHOLDER = "请基于项目调性创作一条小红书文案。"
+
+
+def _format_version_for_session(v: dict) -> str:
+    """把一个 approved version 拼成 assistant turn 文本——完整 title + body +
+    keywords(用户明确要完整内容做避重依据, 不是摘要)。"""
+    parts: list[str] = []
+    title = (v.get("title") or "").strip()
+    body = (v.get("body") or "").strip()
+    kws = v.get("keywords") or []
+    if title:
+        parts.append(f"标题：{title}")
+    if body:
+        parts.append(f"正文：{body}")
+    if kws:
+        kw_str = " ".join(str(k) for k in kws) if isinstance(kws, list) else str(kws)
+        if kw_str.strip():
+            parts.append(f"标签：{kw_str}")
+    return "\n".join(parts)
+
+
+def _sync_approved_to_session(
+    db_client, session_id: str, project_id: str, engine_model: str,
+) -> int:
+    """把该 (project, engine_model) 下 approved 但还没进 session 的版本, 按时间
+    顺序补成 (user, assistant) 对话历史。幂等: 按 item_id 跳过已 commit 的。
+
+    这一步是 Phase 2.2 的核心 —— 它同时实现了:
+      - 增量 commit: 每次生成前把新审核通过的内容补进 session
+      - 历史补建(原 Phase 2.4): 新 session 首次同步就把最近 50 条历史灌入
+
+    返回新追加的 turn 对数(approved item 数)。失败静默返回 0(不影响生成,
+    最多这次没拿到完整历史 prefix)。
+    """
+    try:
+        committed = db.get_session_committed_item_ids(db_client, session_id)
+        approved = db.list_approved_versions_for_sync(
+            db_client, project_id, engine_model, limit=_SESSION_SYNC_LIMIT,
+        )
+        new_msgs: list[dict] = []
+        for v in approved:
+            iid = v.get("item_id")
+            if not iid or iid in committed:
+                continue
+            assistant_text = _format_version_for_session(v)
+            if not assistant_text:
+                continue
+            # 一对 (user 占位, assistant 真实内容), 都带 item_id 供幂等 + 回溯
+            common = {"item_id": iid, "batch_id": v.get("batch_id")}
+            new_msgs.append({"role": "user",
+                             "content": {"text": _SESSION_USER_TURN_PLACEHOLDER},
+                             **common})
+            new_msgs.append({"role": "assistant",
+                             "content": {"text": assistant_text},
+                             **common})
+        if new_msgs:
+            db.append_session_messages(db_client, session_id, new_msgs)
+        return len(new_msgs) // 2
+    except Exception as exc:
+        telemetry.log_event(
+            "session_sync_failed",
+            session_id=session_id, error=str(exc)[:200],
+        )
+        return 0
+
+
 def _resolve_engine_sessions(
     db_client,
     project: dict,
@@ -638,6 +714,10 @@ def _resolve_engine_sessions(
             # generator 那边 prior_messages=[] 退化为 Phase 1 行为。
             continue
         engine_session_ids[eng] = sess["id"]
+        # Phase 2.2: 先把 approved 但未进 session 的内容补成对话历史(懒同步),
+        # 再拉完整历史。新 session 首次会补最近 50 条 approved 历史; 后续生成
+        # 只补增量(新审核通过的)。失败不影响生成(prior 退化为已有部分)。
+        _sync_approved_to_session(db_client, sess["id"], project_id, f"{eng}/{model_used}")
         # 拉历史: 表里 content 是 JSONB,LLM SDK 那边由 GeminiEngine._msg_content
         # _to_text / ClaudeEngine 的 _build_content 各自识别 dict/str/list 形态。
         rows = db.list_session_messages(db_client, sess["id"]) or []
