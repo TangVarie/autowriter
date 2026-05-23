@@ -618,14 +618,15 @@ def _format_version_for_session(v: dict) -> str:
 
 
 def _sync_approved_to_session(
-    db_client, session_id: str, project_id: str, engine: str,
+    db_client, session_id: str, project_id: str,
 ) -> int:
-    """把该 (project, engine) 下 approved 但还没进 session 的版本, 按时间顺序
-    补成 (user, assistant) 对话历史。幂等: 按 item_id 跳过已 commit 的。
+    """把该 project 下 approved 但还没进 session 的版本, 按时间顺序补成
+    (user, assistant) 对话历史。幂等: 按 item_id 跳过已 commit 的。
 
-    ``engine`` 是引擎名("claude"/"gemini"), 不限具体 model 版本 —— 用户换过
-    model(sonnet-4-5 → 4-6)后, 老 model 的 claude 历史仍能进新 session 做
-    避重(见 db.list_approved_versions_for_sync 的 engine 前缀匹配)。
+    **不分引擎/来源**(claude / gemini / manual 全要): 避重针对项目所有已产出
+    内容。每个 engine 的 session 都补"项目全部 approved", 内容相同分别发给
+    各自模型 —— 否则 claude session 看不到 gemini / manual(手动精修最终稿)
+    写过的, 避重就漏一大块(见 db.list_approved_versions_for_sync)。
 
     这一步是 Phase 2.2 的核心 —— 同时实现:
       - 增量 commit: 每次生成前把新审核通过的内容补进 session
@@ -640,7 +641,7 @@ def _sync_approved_to_session(
     try:
         committed = db.get_session_committed_item_ids(db_client, session_id)
         approved = db.list_approved_versions_for_sync(
-            db_client, project_id, engine, limit=_SESSION_SYNC_LIMIT,
+            db_client, project_id, limit=_SESSION_SYNC_LIMIT,
         )
         new_msgs: list[dict] = []
         for v in approved:
@@ -725,7 +726,7 @@ def _resolve_engine_sessions(
         # Phase 2.2: 先把 approved 但未进 session 的内容补成对话历史(懒同步),
         # 再拉完整历史。新 session 首次会补最近 50 条 approved 历史; 后续生成
         # 只补增量(新审核通过的)。失败不影响生成(prior 退化为已有部分)。
-        _sync_approved_to_session(db_client, sess["id"], project_id, eng)
+        _sync_approved_to_session(db_client, sess["id"], project_id)
         # 拉历史: 表里 content 是 JSONB,LLM SDK 那边由 GeminiEngine._msg_content
         # _to_text / ClaudeEngine 的 _build_content 各自识别 dict/str/list 形态。
         rows = db.list_session_messages(db_client, sess["id"]) or []

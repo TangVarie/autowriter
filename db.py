@@ -2477,32 +2477,27 @@ def get_session_committed_item_ids(client: Client, session_id: str) -> set:
 def list_approved_versions_for_sync(
     client: Client,
     project_id: str,
-    engine: str,
     limit: int = 50,
 ) -> list[dict]:
     """Phase 2.2 懒同步: 查该 project 下 status='approved' 的 items 的最优
-    版本, 且 version.ai_engine 属于指定 ``engine``(前缀匹配 ``{engine}/*``,
-    **不限具体 model 版本**) —— 这样用户换过 model(如 sonnet-4-5 → 4-6)后,
-    新 session 仍能拿到老 model 的 claude 历史做避重(cache 命中只看 prefix
-    文本字节, 跟历史内容由哪个 model 产生无关)。
+    版本 —— **不分引擎/来源**(claude / gemini / manual 手动精修 全要)。
+
+    为什么不按 engine 过滤: 避重应该针对项目所有已产出内容。如果 claude
+    session 只放 claude 写的, 就看不到 gemini 写的、更看不到用户手动精修
+    (ai_engine='manual')的最终稿 —— 而 manual 恰恰是最该避免重复的采纳内容。
+    每个 engine 的 session 都补"项目全部 approved", 内容相同、分别发给各自
+    模型, cache 各自命中(prefix 字节一致即可, 与内容由谁产生无关)。
 
     返回 ``[{item_id, batch_id, title, body, keywords, created_at}, ...]``,
     按 item 创建时间升序(老的在前, 符合对话历史顺序), 最多 ``limit`` 条。
 
-    Review #1: engine 过滤在 trim 到 limit **之前** —— 混合引擎项目里, 若
-    直接取最近 limit 条 approved 再过滤 engine, 可能全是另一引擎导致本 engine
-    同步 0 条。这里 step1 over-fetch 该 project 的 approved items(上限按
-    PostgREST max-rows), step2 join version 过滤 engine 后再 trim。
-
     Review #3 (known limitation): 用 ``items.created_at`` 近似审核时间排序。
     items 表没有 approved_at 字段, 延迟审核的老 item(创建早、审核晚)会按
-    创建时间排序, 极端情况(approved 数 > over-fetch 上限)可能漏。over-fetch
-    取到 1000 条缓解; 要精确需加 approved_at 列(后续 PR)。
+    创建时间排序; over-fetch 1000 缓解。要精确需加 approved_at 列(后续 PR)。
     """
     try:
-        # Step 1: over-fetch 该 project 的 approved items(带 best_version_id),
-        # 按 created_at desc。limit 取 PostgREST 上限附近, 覆盖绝大多数项目的
-        # 全部 approved(单项目通常远 < 1000)。
+        # 该 project 的 approved items(带 best_version), 按 created_at desc
+        # 取最近 limit 条(over-fetch 上限 1000 覆盖绝大多数项目全部 approved)。
         items_res = (
             client.table("items")
             .select("id, batch_id, best_version_id, created_at, batches!inner(project_id)")
@@ -2510,7 +2505,7 @@ def list_approved_versions_for_sync(
             .eq("status", "approved")
             .not_.is_("best_version_id", "null")
             .order("created_at", desc=True)
-            .limit(1000)
+            .limit(max(limit, 1))
             .execute()
         )
         items = items_res.data or []
@@ -2521,7 +2516,7 @@ def list_approved_versions_for_sync(
         if not best_vids:
             return []
 
-        # Step 2: 批量取 best_version 内容(分批避免 in_ 列表过长)
+        # 批量取 best_version 内容(分批避免 in_ 列表过长)
         ver_by_id: dict = {}
         chunk = 200
         for i in range(0, len(best_vids), chunk):
@@ -2535,14 +2530,10 @@ def list_approved_versions_for_sync(
             for v in (vres.data or []):
                 ver_by_id[v["id"]] = v
 
-        engine_prefix = f"{engine}/"
         matched = []
-        for it in items:  # items 已按 created_at desc
+        for it in items:  # items 已按 created_at desc, 最近 limit 条
             v = ver_by_id.get(it.get("best_version_id"))
             if not v:
-                continue
-            # engine 前缀匹配(claude/* 或 gemini/*), 过滤在 trim 之前(review #1)
-            if not (v.get("ai_engine") or "").startswith(engine_prefix):
                 continue
             matched.append({
                 "item_id":    it["id"],
@@ -2552,16 +2543,13 @@ def list_approved_versions_for_sync(
                 "keywords":   v.get("keywords", []),
                 "created_at": it.get("created_at"),
             })
-            if len(matched) >= limit:
-                break
-        # matched 是按 created_at desc 收集的最近 limit 条; 翻成升序让对话
-        # 历史从老到新。
+        # matched 按 created_at desc; 翻成升序让对话历史从老到新。
         matched.reverse()
         return matched
     except Exception as exc:
         telemetry.log_event(
             "approved_versions_sync_query_failed",
-            project_id=project_id, engine=engine,
+            project_id=project_id,
             error=str(exc)[:200],
         )
         return []
