@@ -101,6 +101,72 @@ def _extract_gemini_usage(usage) -> dict:
     }
 
 
+# ── Layered system prompt → Anthropic blocks ──────────────────────────────
+# Phase 1：``memory.build_layered_system_prompt`` 返回 5 段 layered dict
+# （stable / tactic / p0 / p1 / p2），下游 ClaudeEngine 在调用前用这个 helper
+# 翻译成 Anthropic API 的 system block 列表，给前 4 层打 cache_control，
+# p2 是 ephemeral session 指令、不缓存。
+#
+# 兼容性：``system_prompt`` 同时接受 str（老调用方）和 dict。str 直接透传，
+# 行为跟 Phase 0 一致，不命中 cache（也不会出错）。dict 才走分层缓存路径。
+#
+# Anthropic 限制：一次请求最多 4 个 ``cache_control`` breakpoint。我们正好
+# 用满 4 个（stable/tactic/p0/p1），p2 不打，留一个 buffer 给未来。空层
+# 会被跳过——避免 API 拒绝空 text block，也不会浪费 breakpoint 名额。
+
+def _system_to_claude_param(system_prompt) -> object:
+    """Translate ``system_prompt`` (str | layered dict) into the value
+    expected by ``client.messages.stream/create``'s ``system`` kwarg.
+
+    - str → return as-is (Anthropic SDK accepts bare strings)
+    - dict → list of text blocks; first 4 non-empty layers carry
+      ``cache_control: ephemeral``; p2 (session-only) is uncached
+    - anything else → empty string (safer than passing junk to SDK)
+    """
+    if isinstance(system_prompt, str):
+        return system_prompt
+    if not isinstance(system_prompt, dict):
+        return ""
+    blocks: list[dict] = []
+    for key in ("stable", "tactic", "p0", "p1"):
+        text = (system_prompt.get(key) or "").strip()
+        if not text:
+            continue
+        blocks.append({
+            "type": "text",
+            "text": text,
+            "cache_control": {"type": "ephemeral"},
+        })
+    p2 = (system_prompt.get("p2") or "").strip()
+    if p2:
+        blocks.append({"type": "text", "text": p2})
+    # 空 blocks 列表的话回退到空字符串，避免 API 报"system must be non-empty"。
+    return blocks if blocks else ""
+
+
+def _system_to_gemini_string(system_prompt) -> str:
+    """Gemini 的 ``system_instruction`` 只接受单字符串。layered dict 进来时
+    按 stable→tactic→p0→p1→p2 顺序拼成跟 ``memory.layered_system_prompt_to_string``
+    完全一致的字符串（双换行分段），保持跟 Phase 0 行为 byte-identical。
+
+    Gemini implicit caching 按前缀长度自动命中，前缀稳定就够；不需要像
+    Claude 那样打 cache_control 标记。
+    """
+    if isinstance(system_prompt, str):
+        return system_prompt
+    if not isinstance(system_prompt, dict):
+        return ""
+    parts: list[str] = []
+    stable = (system_prompt.get("stable") or "").strip()
+    if stable:
+        parts.append(stable)
+    for key in ("tactic", "p0", "p1", "p2"):
+        chunk = (system_prompt.get(key) or "").strip()
+        if chunk:
+            parts.append("\n" + chunk if parts else chunk)
+    return "\n".join(parts)
+
+
 # ── Prompt templates ───────────────────────────────────────────────────────
 
 def _make_user_prompt(
@@ -557,19 +623,22 @@ class ClaudeEngine:
 
     def generate(
         self,
-        system_prompt: str,
+        system_prompt,
         user_prompt: str,
         images: Optional[list[dict]] = None,
         use_thinking: bool = False,
         model: str = "",
         count: int = 1,
     ) -> list[GenerationResult]:
+        # Phase 1：``system_prompt`` 可以是 str 或 layered dict（stable/tactic/p0/p1/p2）；
+        # dict 形态会被翻译成多 block + cache_control，str 直传维持向后兼容。
         model = model or config.CLAUDE_MODEL
         params = self._make_params(model, use_thinking, count)
+        system_param = _system_to_claude_param(system_prompt)
         def _call():
             with self._client.messages.stream(
                 **params,
-                system=system_prompt,
+                system=system_param,
                 messages=[{"role": "user", "content": self._build_content(user_prompt, images)}],
             ) as stream:
                 return stream.get_final_message()
@@ -605,12 +674,13 @@ class ClaudeEngine:
     def iterate(
         self,
         messages: list[dict],
-        system_prompt: str,
+        system_prompt,
         images: Optional[list[dict]] = None,
         use_thinking: bool = False,
         model: str = "",
     ) -> GenerationResult:
         """Continue a multi-turn conversation for iterative refinement."""
+        # Phase 1：同 generate，``system_prompt`` 接受 str 或 layered dict。
         model = model or config.CLAUDE_MODEL
         messages = [m.copy() for m in messages]
         if images and messages and messages[-1]["role"] == "user":
@@ -618,10 +688,11 @@ class ClaudeEngine:
             if isinstance(last_content, str):
                 messages[-1]["content"] = self._build_content(last_content, images)
         params = self._make_params(model, use_thinking)
+        system_param = _system_to_claude_param(system_prompt)
         def _call():
             with self._client.messages.stream(
                 **params,
-                system=system_prompt,
+                system=system_param,
                 messages=messages,
             ) as stream:
                 return stream.get_final_message()
@@ -712,16 +783,18 @@ class GeminiEngine:
 
     def generate(
         self,
-        system_prompt: str,
+        system_prompt,
         user_prompt: str,
         images: Optional[list[dict]] = None,
         use_thinking: bool = False,
         model: str = "",
         count: int = 1,
     ) -> list[GenerationResult]:
+        # Phase 1：layered dict 进来时拼回单字符串发给 Gemini（implicit
+        # caching 看前缀稳定性自动命中，跟 Claude 的显式 cache_control 不同）。
         model = model or config.GEMINI_MODEL
         gen_config = self._make_generate_config(use_thinking, model, count)
-        gen_config.system_instruction = system_prompt
+        gen_config.system_instruction = _system_to_gemini_string(system_prompt)
         try:
             # ``with_gemini_retry`` 覆盖 429 / 5xx / timeout / connection 抖动，
             # 4 次指数退避。和 Claude 路径保持对称——之前 Gemini 裸调一次失败
@@ -764,15 +837,16 @@ class GeminiEngine:
     def iterate(
         self,
         messages: list[dict],
-        system_prompt: str,
+        system_prompt,
         images: Optional[list[dict]] = None,
         use_thinking: bool = False,
         model: str = "",
     ) -> GenerationResult:
         """Convert messages history to Gemini multi-turn format and continue."""
+        # Phase 1: 同 generate，layered dict 拼回单字符串。
         model = model or config.GEMINI_MODEL
         gen_config = self._make_generate_config(use_thinking, model)
-        gen_config.system_instruction = system_prompt
+        gen_config.system_instruction = _system_to_gemini_string(system_prompt)
         try:
             def _msg_to_str(content) -> str:
                 if isinstance(content, list):
@@ -1003,7 +1077,7 @@ def _build_dedup_instruction(
 
 
 def generate_batch(
-    system_prompt: str,
+    system_prompt,
     tactic: str,
     count: int,
     engines: list[str],
@@ -1195,7 +1269,7 @@ _COMPLIANCE_SYSTEM = """\
 若无违规，回复 {"violations": []}。只返回 JSON，不要任何其他文字。"""
 
 
-def _has_compliance_rules(system_prompt: str) -> bool:
+def _has_compliance_rules(system_prompt) -> bool:
     """Cheap check: does the assembled system prompt contain rule-type blocks?
 
     memory.build_system_prompt 自从 2025-Q4 改造已将旧的「---项目记忆 / ---通用
@@ -1203,7 +1277,18 @@ def _has_compliance_rules(system_prompt: str) -> bool:
     违反的硬约束】---`` 等）。这里同时认两套标记，老 prompt 走老路径，新
     prompt 也能触发合规复检——之前只匹配旧标记导致 ENABLE_COMPLIANCE_CHECK
     打开了实际从不执行。
+
+    Phase 1: ``system_prompt`` 可能是 layered dict，先拼成字符串再扫标记。
     """
+    if isinstance(system_prompt, dict):
+        # P0/P1/P2 是 layered dict 里独立的 key,有非空内容就说明有规则。
+        return bool(
+            (system_prompt.get("p0") or "").strip()
+            or (system_prompt.get("p1") or "").strip()
+            or (system_prompt.get("p2") or "").strip()
+        )
+    if not isinstance(system_prompt, str):
+        return False
     markers = (
         # 新标记：P0/P1/P2 分层（memory.py:184/220/231）
         "---【P0", "---【P1", "---【P2",
@@ -1215,7 +1300,7 @@ def _has_compliance_rules(system_prompt: str) -> bool:
 
 def _apply_compliance_recheck(
     slots: list[dict],
-    system_prompt: str,
+    system_prompt,
     metrics: Optional["telemetry.BatchMetrics"] = None,
 ) -> None:
     """
@@ -1227,6 +1312,15 @@ def _apply_compliance_recheck(
     COMPLIANCE_AUTO_REGEN" 从未实装；硬规则的重生路径在 _run_semantic_dedup_pass
     via regen_ctx 里走（按相似度），confirmance violation 重生需要另设管线。
     保留注释一致性，避免运维误以为"打开 flag 就能重生"。
+
+    Phase 1：如果 ``system_prompt`` 是 layered dict（主生成的同一份），复用
+    它的 stable/tactic/p0/p1 当作 system blocks（带 cache_control），合规指令
+    通过 p2 层追加 —— 这样前 4 层跟主生成 byte-identical，直接命中主生成刚
+    写入的 cache（5 分钟 TTL 内）。``_COMPLIANCE_SYSTEM`` 单独不够长达不到
+    Anthropic 1024 token 缓存阈值，借主生成 cache 是最划算的路径。
+
+    向后兼容：str 形态保持原样（把 system_prompt 贴在 user_content 里 + system
+    设为 _COMPLIANCE_SYSTEM），跟 Phase 0 行为完全一致。
     """
     # Flatten (slot_idx, engine, version) pairs
     flat: list[tuple[int, str, GenerationResult]] = []
@@ -1242,17 +1336,42 @@ def _apply_compliance_recheck(
     for i, (si, eng, v) in enumerate(flat):
         body_preview = (v.body or "")[:180].split("\n")[0]
         lines.append(f"[{i}] slot={si} engine={eng} 标题：{v.title}  正文节选：{body_preview}")
-    user_content = (
-        "【本次生成的 System Prompt】\n" + system_prompt.strip() + "\n\n"
-        "【需要复核的版本列表】\n" + "\n".join(lines)
-    )
+    versions_block = "【需要复核的版本列表】\n" + "\n".join(lines)
+
+    if isinstance(system_prompt, dict):
+        # 走 layered 路径：复用主生成的 stable/tactic/p0/p1 命中同一份 cache，
+        # _COMPLIANCE_SYSTEM 作为合规复审的任务指令并入 p2（不缓存）。
+        p2_orig = system_prompt.get("p2", "") or ""
+        compliance_layers = {
+            "stable": system_prompt.get("stable", ""),
+            "tactic": system_prompt.get("tactic", ""),
+            "p0":     system_prompt.get("p0", ""),
+            "p1":     system_prompt.get("p1", ""),
+            "p2":     (
+                (p2_orig.strip() + "\n\n" if p2_orig.strip() else "")
+                + "---【本次任务】---\n"
+                + _COMPLIANCE_SYSTEM
+            ),
+        }
+        system_param = _system_to_claude_param(compliance_layers)
+        # system 已经完整包含主生成的 prompt，user_content 不再贴一次
+        user_content = versions_block
+    else:
+        # 兼容路径：str 调用方按 Phase 0 行为，system_prompt 贴在 user_content
+        system_param = _COMPLIANCE_SYSTEM
+        user_content = (
+            "【本次生成的 System Prompt】\n"
+            + (system_prompt or "").strip()
+            + "\n\n"
+            + versions_block
+        )
 
     try:
         client = clients.get_anthropic_client()
         resp = _call_with_retry(lambda: client.messages.create(
             model=config.CLAUDE_MODEL,
             max_tokens=800,
-            system=_COMPLIANCE_SYSTEM,
+            system=system_param,
             messages=[{"role": "user", "content": user_content}],
         ))
         if metrics is not None:
@@ -1440,7 +1559,7 @@ _REFINE_SYSTEM_SUFFIX = """
 
 
 def _refine_drafts_batch(
-    system_prompt: str,
+    system_prompt,
     brief: str,
     drafts: list[GenerationResult],
     model: str = "",
@@ -1454,7 +1573,11 @@ def _refine_drafts_batch(
     if not drafts:
         return drafts
 
-    refine_system = system_prompt.strip() + _REFINE_SYSTEM_SUFFIX
+    # ``system_prompt`` 可能是 layered dict（Phase 1）或 str。这里要拼回字符串
+    # 再追加 _REFINE_SYSTEM_SUFFIX 作为合成指令；refine 调用 system 是
+    # 字符串形态、不分层、不打 cache_control（精修是低频路径，cache 收益有限）。
+    sys_str = _system_to_gemini_string(system_prompt) if isinstance(system_prompt, dict) else (system_prompt or "")
+    refine_system = sys_str.strip() + _REFINE_SYSTEM_SUFFIX
 
     def _refine_one(idx: int, draft: GenerationResult) -> tuple[int, GenerationResult]:
         user_content = (
@@ -1508,7 +1631,7 @@ def _refine_drafts_batch(
 
 
 def generate_batch_multi_role(
-    system_prompt: str,
+    system_prompt,
     tactic: str = "",
     target_audience: str = "",
     key_messages: str = "",
@@ -1742,7 +1865,7 @@ def build_iteration_messages(
 
 
 def iterate_copy(
-    system_prompt: str,
+    system_prompt,
     original_user_prompt: str,
     version_history: list[dict],
     feedback: str,
