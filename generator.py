@@ -1333,7 +1333,15 @@ def generate_batch(
         getattr(config, "ENABLE_COMPLIANCE_CHECK", True)
         and _has_compliance_rules(system_prompt)
     ):
-        _apply_compliance_recheck(slots, system_prompt, metrics=metrics)
+        # 把主生成实际用的 Claude 模型透传给合规复审,让它跟主生成 byte-identical
+        # → 共享主生成刚建立的 cache（Phase 1 设计前提）。
+        # engine_models 没指定时 fallback 到 config.CLAUDE_MODEL，跟旧行为兼容。
+        _claude_model_used = (engine_models or {}).get("claude", "") or config.CLAUDE_MODEL
+        _apply_compliance_recheck(
+            slots, system_prompt,
+            metrics=metrics,
+            claude_model=_claude_model_used,
+        )
 
     return slots
 
@@ -1385,6 +1393,7 @@ def _apply_compliance_recheck(
     slots: list[dict],
     system_prompt,
     metrics: Optional["telemetry.BatchMetrics"] = None,
+    claude_model: str = "",
 ) -> None:
     """
     Flag versions that violate the System Prompt's memory / session-instruction
@@ -1449,17 +1458,25 @@ def _apply_compliance_recheck(
             + versions_block
         )
 
+    # Phase 1 修正：复用主生成实际选用的 Claude 模型，让合规复审的
+    # (model_id, prefix_hash) 跟主生成 byte-identical —— 真正命中主生成
+    # 刚写入的 cache（Phase 1 的"合规搭便车"设计前提）。
+    # 之前硬编码 config.CLAUDE_MODEL 时:
+    #   1) 主生成用 sonnet-4-6,合规却用默认 sonnet-4-5 → cache 永远不命中
+    #      （Anthropic 按 model 隔离 cache）
+    #   2) by_model 里幽灵冒出一个"项目根本没选"的 sonnet-4-5 行,UI 混乱
+    used_model = claude_model or config.CLAUDE_MODEL
     try:
         client = clients.get_anthropic_client()
         resp = _call_with_retry(lambda: client.messages.create(
-            model=config.CLAUDE_MODEL,
+            model=used_model,
             max_tokens=800,
             system=system_param,
             messages=[{"role": "user", "content": user_content}],
         ))
         _log_claude_call_diag(system_param, resp, source="compliance_recheck")
         if metrics is not None:
-            metrics.add_tokens(f"claude/{config.CLAUDE_MODEL}",
+            metrics.add_tokens(f"claude/{used_model}",
                                _extract_claude_usage(resp.usage),
                                source="compliance_recheck")
         raw = resp.content[0].text.strip()
