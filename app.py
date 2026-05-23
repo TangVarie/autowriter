@@ -670,13 +670,32 @@ def _commit_session_tokens(
     if not engine_session_ids:
         return
     totals = (metrics_meta or {}).get("token_totals") or {}
-    by_src_model = totals.get("by_source_model") or {}
-    main_by_model = (by_src_model.get("main") or {}) if isinstance(by_src_model, dict) else {}
-    # Fallback: 老版 BatchMetrics 不写 by_source_model 时退到 by_model。
-    # 当批 metrics 是新版的话这条路不会走。
-    if not main_by_model:
+    # Phase 2.1 review #2: 只算 source='main' 的 token, 排除 compliance_recheck
+    # / multi_role_* / dedup_regen 等不走 session prefix 的辅助调用。
+    # Review #3: fallback gate **只在 ``by_source_model`` 整段缺失/非法时触发**,
+    # 不能在 main 桶存在但为空时退到 by_model — 那种情况意味着本批主调用
+    # 全部失败,只有辅助调用记了 token,这时正确行为是 delta=0(不动 session),
+    # 而不是把辅助调用 token 当成 session 的累加(那正是 review #2 要消除的
+    # leakage)。
+    has_by_source_model = (
+        "by_source_model" in totals
+        and isinstance(totals.get("by_source_model"), dict)
+    )
+    if has_by_source_model:
+        main_by_model = totals["by_source_model"].get("main") or {}
+        if not isinstance(main_by_model, dict):
+            main_by_model = {}
+    else:
+        # 老版 BatchMetrics 不写 by_source_model 时退到 by_model。
+        # 这条路只在 schema 升级期或 retro batch 重放时走;新批次都有
+        # by_source_model。
         main_by_model = totals.get("by_model") or {}
-    if not isinstance(main_by_model, dict):
+        if not isinstance(main_by_model, dict):
+            return
+    if not main_by_model:
+        # 主调用 token=0 + by_source_model 存在: 本批 main 没成功(全失败,
+        # 或者根本没调 main 比如 multi_role 只跑了 select/refine 没 main)
+        # → delta=0, session 不动。
         return
     for eng, session_id in engine_session_ids.items():
         delta = 0
