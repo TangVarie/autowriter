@@ -572,6 +572,238 @@ def _run_semantic_dedup_pass(
         metrics.stop_phase("embedding")
 
 
+# ── Phase 2.1: session 路由 helper ────────────────────────────────────────
+# 跨批 prompt caching 的"对话会话"层接入点。worker 在 build_layered_system_
+# prompt 之后调 _resolve_engine_sessions 为每个 engine 拿到对应 active session
+# + 历史 messages prefix; 生成完成后调 _commit_session_tokens 把 input token
+# 累加到 session 的 running_input_tokens(UI 软警告进度条用)。
+#
+# Phase 2.1 范围: 只做读 + token 累加。"approved version → assistant turn
+# 写回 session_messages" 的 commit gate 留给 Phase 2.2; 在那之前 session
+# 历史一直为空, prior_messages 实际拼上去也是空(行为 byte-identical Phase 1),
+# 但数据通路是通的——下个 PR 接审核闸门, cache 命中自然开始生效。
+#
+# 所有失败都吞了走 fallback (空 session_ids + 空 prior_messages),保证
+# session 层的 hiccup 不会让批次生成挂掉。
+
+# Phase 2.2: 懒同步 approved 内容到 session 的参数 + helper
+#
+# 每个 (project, engine, model) session 最多带最近 50 条 approved 内容作为
+# 对话历史(跟用户定的"半补建每 model 50 条"一致)。撞 context window 的
+# 滚动 / seal 留 Phase 2.3。
+_SESSION_SYNC_LIMIT = 50
+# 历史 user turn 占位: 所有历史 turn 用同一句, 高度可 cache。真正的"避重
+# 创作"指令在当前批的 user prompt(generate_batch 内部的 _make_user_prompt
+# + dedup_block)里, 历史 user turn 只是让对话合法 + 给 assistant 内容
+# (已 approved 的产出)一个挂载点, 让模型"看到"过往完整内容来避重。
+_SESSION_USER_TURN_PLACEHOLDER = "请基于项目调性创作一条小红书文案。"
+
+
+def _format_version_for_session(v: dict) -> str:
+    """把一个 approved version 拼成 assistant turn 文本——完整 title + body +
+    keywords(用户明确要完整内容做避重依据, 不是摘要)。"""
+    parts: list[str] = []
+    title = (v.get("title") or "").strip()
+    body = (v.get("body") or "").strip()
+    kws = v.get("keywords") or []
+    if title:
+        parts.append(f"标题：{title}")
+    if body:
+        parts.append(f"正文：{body}")
+    if kws:
+        kw_str = " ".join(str(k) for k in kws) if isinstance(kws, list) else str(kws)
+        if kw_str.strip():
+            parts.append(f"标签：{kw_str}")
+    return "\n".join(parts)
+
+
+def _sync_approved_to_session(
+    db_client, session_id: str, project_id: str,
+) -> int:
+    """把该 project 下 approved 但还没进 session 的版本, 按时间顺序补成
+    (user, assistant) 对话历史。幂等: 按 item_id 跳过已 commit 的。
+
+    **不分引擎/来源**(claude / gemini / manual 全要): 避重针对项目所有已产出
+    内容。每个 engine 的 session 都补"项目全部 approved", 内容相同分别发给
+    各自模型 —— 否则 claude session 看不到 gemini / manual(手动精修最终稿)
+    写过的, 避重就漏一大块(见 db.list_approved_versions_for_sync)。
+
+    这一步是 Phase 2.2 的核心 —— 同时实现:
+      - 增量 commit: 每次生成前把新审核通过的内容补进 session
+      - 历史补建(原 Phase 2.4): 新 session 首次同步就把最近 50 条历史灌入
+
+    turn 结构: user 占位 turn item_id=NULL(不占唯一约束), assistant turn 带
+    item_id(幂等 + DB 唯一约束 session_messages_session_item_uniq 防并发重复)。
+
+    返回新追加的 turn 对数。失败静默返回 0(不影响生成, 最多这次没拿到完整
+    历史 prefix)。
+    """
+    try:
+        committed = db.get_session_committed_item_ids(db_client, session_id)
+        approved = db.list_approved_versions_for_sync(
+            db_client, project_id, limit=_SESSION_SYNC_LIMIT,
+        )
+        new_msgs: list[dict] = []
+        for v in approved:
+            iid = v.get("item_id")
+            if not iid or iid in committed:
+                continue
+            assistant_text = _format_version_for_session(v)
+            if not assistant_text:
+                continue
+            bid = v.get("batch_id")
+            # user 占位: item_id=None(不参与 (session_id,item_id) 唯一约束);
+            # assistant: 带 item_id(幂等 + 唯一约束防并发重复同步)。
+            new_msgs.append({"role": "user",
+                             "content": {"text": _SESSION_USER_TURN_PLACEHOLDER},
+                             "item_id": None, "batch_id": bid})
+            new_msgs.append({"role": "assistant",
+                             "content": {"text": assistant_text},
+                             "item_id": iid, "batch_id": bid})
+        if new_msgs:
+            db.append_session_messages(db_client, session_id, new_msgs)
+        return len(new_msgs) // 2
+    except Exception as exc:
+        telemetry.log_event(
+            "session_sync_failed",
+            session_id=session_id, error=str(exc)[:200],
+        )
+        return 0
+
+
+def _resolve_engine_sessions(
+    db_client,
+    project: dict,
+    engines: list[str],
+    engine_models: dict,
+    user_id: str,
+) -> tuple[dict[str, str], dict[str, list[dict]]]:
+    """为本批的每个 engine 路由/创建 active session + 拉历史 messages。
+
+    返回 ``(engine_session_ids, engine_prior_messages)``:
+      engine_session_ids:    {"claude": "<uuid>", "gemini": "<uuid>"} —— 后续
+                             token 累加 / commit 用。某 engine 路由失败时该
+                             key 不出现(下游按缺 key 跳过累加,不影响生成)。
+      engine_prior_messages: {"claude": [{role,content},...], "gemini": [...]}
+                             —— 传给 ``generate_batch(engine_prior_messages=)``。
+                             空 session(没有历史 turn)对应空 list。
+    """
+    base_prompt = (project.get("system_prompt") or "")
+    project_id = project.get("id") or ""
+    try:
+        base_hash = config.compute_base_prompt_hash(base_prompt)
+    except Exception as exc:
+        telemetry.log_event("session_route_hash_failed", error=str(exc)[:120])
+        return {}, {}
+
+    engine_session_ids: dict[str, str] = {}
+    engine_prior_messages: dict[str, list[dict]] = {}
+
+    for eng in engines or []:
+        # 解析该 engine 本批实际选用的 model(跟 generator._engine_call 同逻辑:
+        # plan.engine_models 优先, 否则 config 默认)
+        if eng == "claude":
+            model_used = (engine_models or {}).get("claude", "") or config.CLAUDE_MODEL
+        elif eng == "gemini":
+            model_used = (engine_models or {}).get("gemini", "") or config.GEMINI_MODEL
+        else:
+            continue
+        window = config.get_context_window(model_used)
+        sess = db.get_or_create_active_session(
+            db_client,
+            project_id=project_id,
+            engine=eng,
+            model_id=model_used,
+            base_prompt_hash=base_hash,
+            user_id=user_id,
+            window_limit=window,
+        )
+        if not sess or not sess.get("id"):
+            # 路由失败(DB 不可达 / 表不存在),静默 fallback 到空 prefix——
+            # generator 那边 prior_messages=[] 退化为 Phase 1 行为。
+            continue
+        engine_session_ids[eng] = sess["id"]
+        # Phase 2.2: 先把 approved 但未进 session 的内容补成对话历史(懒同步),
+        # 再拉完整历史。新 session 首次会补最近 50 条 approved 历史; 后续生成
+        # 只补增量(新审核通过的)。失败不影响生成(prior 退化为已有部分)。
+        _sync_approved_to_session(db_client, sess["id"], project_id)
+        # 拉历史: 表里 content 是 JSONB,LLM SDK 那边由 GeminiEngine._msg_content
+        # _to_text / ClaudeEngine 的 _build_content 各自识别 dict/str/list 形态。
+        rows = db.list_session_messages(db_client, sess["id"]) or []
+        engine_prior_messages[eng] = [
+            {"role": r.get("role", "user"), "content": r.get("content")}
+            for r in rows
+        ]
+    return engine_session_ids, engine_prior_messages
+
+
+def _commit_session_tokens(
+    db_client,
+    engine_session_ids: dict[str, str],
+    metrics_meta: dict,
+) -> None:
+    """累加本批 ``source='main'`` 的 input + cache_read + cache_create
+    到对应 engine 的 session.running_input_tokens。
+
+    **必须只算 source='main' 的 token**: 同一 batch 还会有 compliance_recheck
+    / multi_role_select / multi_role_refine / dedup_regen 这些**不走 session
+    prefix 的辅助调用** —— 它们也会按 ``claude/<model>`` 落进 ``by_model``
+    总和, 如果直接读 by_model 会让 session.running_input_tokens 被无关请求
+    虚高, session 窗口判断 / UI 进度条都错位(早 PR review 命中)。
+
+    Phase 2.1+: telemetry 多记一个 ``by_source_model[source][model]`` 二维
+    维度, 这里精确读 ``by_source_model['main']`` 累加。fallback 到老
+    by_model(理论不会发生 —— 同一 BatchMetrics 实例 在内存里, 但稳妥起见
+    保留 fallback)。
+    """
+    if not engine_session_ids:
+        return
+    totals = (metrics_meta or {}).get("token_totals") or {}
+    # Phase 2.1 review #2: 只算 source='main' 的 token, 排除 compliance_recheck
+    # / multi_role_* / dedup_regen 等不走 session prefix 的辅助调用。
+    # Review #3: fallback gate **只在 ``by_source_model`` 整段缺失/非法时触发**,
+    # 不能在 main 桶存在但为空时退到 by_model — 那种情况意味着本批主调用
+    # 全部失败,只有辅助调用记了 token,这时正确行为是 delta=0(不动 session),
+    # 而不是把辅助调用 token 当成 session 的累加(那正是 review #2 要消除的
+    # leakage)。
+    has_by_source_model = (
+        "by_source_model" in totals
+        and isinstance(totals.get("by_source_model"), dict)
+    )
+    if has_by_source_model:
+        main_by_model = totals["by_source_model"].get("main") or {}
+        if not isinstance(main_by_model, dict):
+            main_by_model = {}
+    else:
+        # 老版 BatchMetrics 不写 by_source_model 时退到 by_model。
+        # 这条路只在 schema 升级期或 retro batch 重放时走;新批次都有
+        # by_source_model。
+        main_by_model = totals.get("by_model") or {}
+        if not isinstance(main_by_model, dict):
+            return
+    if not main_by_model:
+        # 主调用 token=0 + by_source_model 存在: 本批 main 没成功(全失败,
+        # 或者根本没调 main 比如 multi_role 只跑了 select/refine 没 main)
+        # → delta=0, session 不动。
+        return
+    for eng, session_id in engine_session_ids.items():
+        delta = 0
+        prefix = f"{eng}/"
+        for model_full, usage in main_by_model.items():
+            if not isinstance(usage, dict) or not model_full.startswith(prefix):
+                continue
+            # 一次请求的总 input = input(非缓存) + cache_read + cache_create
+            # —— Anthropic 三互斥字段加起来才反映"用了多少 context"。
+            # Gemini 的 cache_read 是 input 子集, 严格说会重复一次;
+            # 但 implicit cache 命中量本来就小, over-counting 不影响判断
+            # (running_input_tokens 只用于软警告 / UI 进度条)。
+            delta += int(usage.get("input") or 0)
+            delta += int(usage.get("cache_read") or 0)
+            delta += int(usage.get("cache_create") or 0)
+        if delta > 0:
+            db.add_session_running_tokens(db_client, session_id, delta)
+
+
 def _queue_worker(
     plans: list[dict],
     user_id: str,
@@ -747,7 +979,11 @@ def _queue_worker_impl(
                 project_mems, context_text, report_sink=inject_report,
             )
 
-            full_system_prompt = mem_module.build_system_prompt(
+            # Phase 1：用 layered builder 拿 5 段 dict（stable/tactic/p0/p1/p2），
+            # 直接传给 generator —— Claude 路径会按 cache_control 分层、
+            # Gemini 路径会拼回单字符串。跟 build_system_prompt 返回的字符串
+            # byte-identical（layered_system_prompt_to_string 验证过）。
+            full_system_prompt = mem_module.build_layered_system_prompt(
                 base_prompt=base_prompt,
                 global_memories=global_mems_for_plan,
                 project_memories=project_mems_for_plan,
@@ -835,6 +1071,16 @@ def _queue_worker_impl(
                 pool.append(h)
                 seen.add(key)
             historical_titles = pool
+
+            # ── [C+] Phase 2.1: session 路由 — 为每个 engine 拿历史 prefix ──
+            # 失败时 (engine_session_ids 空 / engine_prior_messages 缺 key)
+            # 自动 fallback 为空 prefix, 生成行为不受影响。
+            engine_session_ids, engine_prior_messages = _resolve_engine_sessions(
+                db_client, project, engines, engine_models or {}, user_id,
+            )
+            if engine_session_ids:
+                metrics.set_meta("session_ids", engine_session_ids)
+
             metrics.stop_phase("setup")
 
             # ── [D 生成] 调用 generator；多引擎模式内部会串行复用 dedup pool ──
@@ -866,6 +1112,8 @@ def _queue_worker_impl(
                     gemini_use_thinking=gemini_thinking,
                     custom_roles=custom_roles,
                     n_roles=n_roles,
+                    metrics=metrics,
+                    engine_prior_messages=engine_prior_messages,
                 )
             else:
                 generation_results = gen_module.generate_batch(
@@ -886,12 +1134,16 @@ def _queue_worker_impl(
                     user_id=user_id,
                     project_id=project_id,
                     metrics=metrics,
+                    engine_prior_messages=engine_prior_messages,
                 )
 
             metrics.stop_phase("llm")
             # token usage 累加在 generator 内部的 _engine_call 边界完成
             # （一次 API 调用 = 一次累加），避免对 ``count`` 个共享同一份
             # token_usage 的 version 重复加导致 count 倍膨胀。
+            # Phase 2.1: 把本批的 input + cache_read + cache_create token
+            # 累加到对应 engine 的 session 的 running_input_tokens(UI 进度条用)。
+            _commit_session_tokens(db_client, engine_session_ids, metrics.meta)
 
             # ── [E 保存] 批量写 items + versions（统一服务 _save_batch_results）──
             metrics.start_phase("db_save")
@@ -1096,8 +1348,18 @@ def _queue_banner_body() -> None:
                         "后续跨批次去重会读不到这些向量，可能导致重复率上升。"
                     )
 
-        # Day 4：去重 + 注入指标看板（每批一张卡）
+    # Day 4：去重 + 注入指标看板（每批一张卡）
+    # 移到 if/elif 之外：队列还在跑时，每完成一批就 append 一条到
+    # metrics_list，fragment 每 2s rerun 一次，用户能实时看到已完成批次的
+    # 数据，不必等全部跑完才出现。``_render_queue_dashboard`` 内部已经做
+    # 了"空 metrics_list 直接 return"的判断。
+    try:
         _render_queue_dashboard(qs)
+    except Exception as exc:
+        # 任何渲染失败（数据形态异常 / DB roundtrip 字符串等）都不应让
+        # 整页变成 Streamlit 红色 ErrorBox——挂一行 caption 让用户知道
+        # 面板坏了但生成本身没受影响。
+        st.caption(f"⚠ 指标面板渲染失败：{exc}")
 
 
 def _fmt_tok(n: int) -> str:
@@ -1112,6 +1374,37 @@ def _fmt_tok(n: int) -> str:
     return str(int(n))
 
 
+def _short_model(model_full: str) -> str:
+    """``claude/claude-sonnet-4-5-20250929`` → ``claude · sonnet-4-5``。
+
+    去掉重复的引擎名前缀和末尾日期戳，让 metric 行标题不长。新模型自然兼容
+    （不依赖白名单），未知 id 直接原样返回。
+    """
+    if "/" not in (model_full or ""):
+        return model_full or "?"
+    eng, m = model_full.split("/", 1)
+    if m.startswith(eng + "-"):
+        m = m[len(eng) + 1:]
+    parts = m.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) == 8:
+        m = parts[0]
+    return f"{eng} · {m}"
+
+
+def _render_token_row(label: str, u: dict, cost_field: str = "cost_usd") -> None:
+    """渲染一行 5 列 token metric。``u`` 是 token usage dict（含 input /
+    cache_read / cache_create / output / cost_usd）；``label`` 在上面挂一行
+    caption。"""
+    if label:
+        st.caption(label)
+    cols = st.columns(5)
+    cols[0].metric("input",        _fmt_tok(int(u.get("input") or 0)))
+    cols[1].metric("cache_read",   _fmt_tok(int(u.get("cache_read") or 0)))
+    cols[2].metric("cache_create", _fmt_tok(int(u.get("cache_create") or 0)))
+    cols[3].metric("output",       _fmt_tok(int(u.get("output") or 0)))
+    cols[4].metric("≈ 成本",       f"${float(u.get(cost_field) or 0):.4f}")
+
+
 def _render_token_panel(meta) -> None:
     """渲染本批的 token 用量 + 估算费用 + cache 命中。两个面板（队列实时
     / 历史回看）共享。
@@ -1120,6 +1413,10 @@ def _render_token_panel(meta) -> None:
     JSONB 字段可能以字符串形态回来（同文件的 phase_ms / counters 都需要 json
     解一次，meta 同样要做），所以这里再容错一层 JSON parse，确保历史 expander
     不会因为 str.get 崩溃整页。
+
+    多引擎批次按引擎拆行（A 方案）——每个引擎独立一行 5 列 metric，下面挂
+    一行"合计" caption；单引擎/无 by_model 元数据时退化成单行聚合，跟旧行为
+    一致。
     """
     if isinstance(meta, str):
         try:
@@ -1136,143 +1433,176 @@ def _render_token_panel(meta) -> None:
             totals = {}
     if not isinstance(totals, dict) or not totals:
         return
-    cost = float(totals.get("cost_usd") or 0.0)
-    by_model = totals.get("by_model") or {}
-    saved = config.estimate_cache_savings_usd(by_model)
+    try:
+        cost = float(totals.get("cost_usd") or 0.0)
+        by_model = totals.get("by_model") or {}
+        saved = config.estimate_cache_savings_usd(by_model) if isinstance(by_model, dict) else 0.0
 
-    cols = st.columns(5)
-    cols[0].metric("input",        _fmt_tok(totals.get("input", 0)))
-    cols[1].metric("cache_read",   _fmt_tok(totals.get("cache_read", 0)))
-    cols[2].metric("cache_create", _fmt_tok(totals.get("cache_create", 0)))
-    cols[3].metric("output",       _fmt_tok(totals.get("output", 0)))
-    cols[4].metric("≈ 成本",       f"${cost:.4f}")
+        per_model_rows: list[tuple[str, dict]] = []
+        if isinstance(by_model, dict):
+            for mid, u in by_model.items():
+                if isinstance(u, dict):
+                    per_model_rows.append((mid, u))
 
-    extras: list[str] = []
-    if saved > 0:
-        extras.append(f"🟢 cache 已省 ≈ ${saved:.4f}")
-    if totals.get("thinking"):
-        extras.append(f"thinking {_fmt_tok(totals['thinking'])}")
-    if extras:
-        st.caption(" · ".join(extras))
+        if len(per_model_rows) >= 2:
+            # 多引擎：按引擎一行 metric + 一行合计
+            # 排序按成本降序，最贵的引擎排最上面便于一眼看到主要支出
+            per_model_rows.sort(key=lambda x: float(x[1].get("cost_usd") or 0), reverse=True)
+            for mid, u in per_model_rows:
+                _render_token_row(f"**{_short_model(mid)}**", u)
+            st.caption(
+                f"**合计**　input {_fmt_tok(int(totals.get('input') or 0))} · "
+                f"cache_read {_fmt_tok(int(totals.get('cache_read') or 0))} · "
+                f"cache_create {_fmt_tok(int(totals.get('cache_create') or 0))} · "
+                f"output {_fmt_tok(int(totals.get('output') or 0))} · "
+                f"≈ ${cost:.4f}"
+            )
+        else:
+            # 单引擎或没 by_model 数据：直接显示聚合 totals
+            _render_token_row("", totals)
 
-    if by_model:
-        per_lines = []
-        for mid, u in by_model.items():
-            mcost = float(u.get("cost_usd") or 0.0)
-            chunks = [f"in {_fmt_tok(u.get('input', 0))}"]
-            if u.get("cache_read"):
-                chunks.append(f"cache_r {_fmt_tok(u['cache_read'])}")
-            if u.get("cache_create"):
-                chunks.append(f"cache_w {_fmt_tok(u['cache_create'])}")
-            chunks.append(f"out {_fmt_tok(u.get('output', 0))}")
-            chunks.append(f"${mcost:.4f}")
-            per_lines.append(f"`{mid}` · " + " · ".join(chunks))
-        st.caption("分模型：\n\n" + "  \n".join(per_lines))
+        extras: list[str] = []
+        if saved > 0:
+            extras.append(f"🟢 cache 已省 ≈ ${saved:.4f}")
+        thinking = int(totals.get("thinking") or 0)
+        if thinking:
+            extras.append(f"thinking {_fmt_tok(thinking)}")
+        if extras:
+            st.caption(" · ".join(extras))
 
-    by_source = totals.get("by_source") or {}
-    if len(by_source) > 1 or "compliance_recheck" in by_source:
-        # 多个来源（主生成 + 合规复审等）时拆开展示，避免"main 占了多少 / 内部
-        # 辅助调用占了多少"被合并后看不出来。
-        src_lines = []
-        for src, u in by_source.items():
-            label = {"main": "主生成", "compliance_recheck": "合规复审"}.get(src, src)
-            src_lines.append(f"{label}: ${float(u.get('cost_usd') or 0):.4f}")
-        st.caption("分来源：" + " · ".join(src_lines))
+        by_source = totals.get("by_source") or {}
+        if isinstance(by_source, dict) and (len(by_source) > 1 or "compliance_recheck" in by_source):
+            # 多个来源（主生成 + 合规复审等）时拆开展示，避免"main 占了多少 / 内部
+            # 辅助调用占了多少"被合并后看不出来。
+            src_lines = []
+            for src, u in by_source.items():
+                if not isinstance(u, dict):
+                    continue
+                label = {"main": "主生成", "compliance_recheck": "合规复审",
+                         "dedup_regen": "去重重生",
+                         "multi_role_select": "三省选优",
+                         "multi_role_refine": "三省精修"}.get(src, src)
+                src_lines.append(f"{label}: ${float(u.get('cost_usd') or 0):.4f}")
+            if src_lines:
+                st.caption("分来源：" + " · ".join(src_lines))
+    except Exception as exc:
+        # token panel 本身崩了不要把整个批次卡片带下水；面板只是观测，
+        # 出错就降级成一行错误提示，让用户至少能看到耗时和去重数据。
+        st.caption(f"⚠ token 面板数据异常：{exc}")
 
 
-def _render_queue_dashboard(qs: dict) -> None:
-    """渲染本次队列每个批次的指标卡：阶段计时 + 去重/重生/违规计数 + 注入摘要。
+def _render_queue_dashboard(qs: dict, title: str = "本次队列指标") -> None:
+    """渲染队列 / 快速生成每个批次的指标卡：阶段计时 + 去重/重生/违规计数
+    + 注入摘要 + token/cost 面板。
 
     数据源是 ``metrics.close()`` 落到 ``qs["metrics_list"]`` 的每批快照；
     本函数只读、纯展示，不做任何 DB I/O，调用频率与刷新成本都可忽略。
+    队列 worker 和 quick-gen worker 都往各自 status 的 ``metrics_list`` 挂,
+    所以这个 dashboard 两条路径通用——``title`` 区分文案(队列/单次生成)。
+
+    生成中默认展开（用户想看实时数据），完成后默认折叠（成功 banner 已经
+    在上面、不抢焦点）。每个批次卡片用 try/except 包，单批数据异常不会
+    让其余批次的卡片一起跟着崩。
     """
     metrics_list = qs.get("metrics_list") or []
     if not metrics_list:
         return
-    with st.expander(f"📊 本次队列指标（{len(metrics_list)} 批）", expanded=False):
+    is_running = bool(qs.get("running"))
+    with st.expander(
+        f"📊 {title}（{len(metrics_list)} 批）",
+        expanded=is_running,
+    ):
         for idx, m in enumerate(metrics_list):
-            engines = ", ".join(m.get("engines") or []) or "?"
-            st.markdown(
-                f"**批次 {idx + 1}** · "
-                f"`{(m.get('batch_id') or '')[:8]}…` · "
-                f"{m.get('count', 0)} 条 · 引擎 {engines} · "
-                f"总耗时 **{m.get('total_ms', 0) / 1000:.1f} s**"
-            )
-
-            phase_ms = m.get("phase_ms") or {}
-            cols = st.columns(4)
-            for col, (k, label) in zip(cols, [
-                ("setup", "setup"),
-                ("llm", "llm"),
-                ("db_save", "db_save"),
-                ("embedding", "embedding"),
-            ]):
-                with col:
-                    st.metric(label, f"{phase_ms.get(k, 0) / 1000:.1f} s")
-
-            _render_token_panel(m.get("meta") or {})
-
-            counters = m.get("counters") or {}
-            counter_keys = [
-                ("dedup_text_hits", "文本去重命中"),
-                ("dedup_semantic_hits", "语义去重命中"),
-                ("regen_attempts", "重生尝试"),
-                ("regen_success", "重生成功"),
-                ("hard_rule_violations", "硬规则违反"),
-                ("embedding_missing", "缺向量"),
-            ]
-            ccols = st.columns(len(counter_keys))
-            for col, (k, label) in zip(ccols, counter_keys):
-                with col:
-                    st.metric(label, counters.get(k, 0))
-
-            meta = m.get("meta") or {}
-            injection = meta.get("injection") or {}
-            dedup_mode = meta.get("dedup_mode", "vector")
-            dedup_threshold = meta.get("dedup_threshold")
-            if injection or dedup_mode != "vector" or dedup_threshold is not None:
-                hard_n = (injection.get("hard_global", 0) + injection.get("hard_project", 0))
-                soft_n = (injection.get("soft_global", 0) + injection.get("soft_project", 0))
-                sess_n = injection.get("session", 0)
-                calib_chars = injection.get("calibration_chars", 0)
-                filtered = injection.get("filtered") or []
-                badges = [
-                    f"硬 {hard_n}", f"软 {soft_n}", f"会话 {sess_n}",
-                    f"调校 {calib_chars} 字", f"过滤 {len(filtered)} 条",
-                ]
-                if dedup_threshold is not None:
-                    badges.append(f"阈值 {dedup_threshold:.2f}")
-                if dedup_mode != "vector":
-                    badges.append(f"去重 {dedup_mode}")
-                st.caption(" · ".join(badges))
-
-                if filtered:
-                    with st.expander(
-                        f"查看本批被过滤的 {len(filtered)} 条规则",
-                        expanded=False,
-                    ):
-                        by_reason: dict[str, list[dict]] = {}
-                        for f in filtered:
-                            by_reason.setdefault(f.get("reason", "?"), []).append(f)
-                        for reason, items in by_reason.items():
-                            reason_label = {
-                                "below_threshold": "相关度低于阈值",
-                                "muted": "已静音",
-                                "capped": "超过条数上限",
-                                "no_embedding": "缺 embedding",
-                            }.get(reason, reason)
-                            st.markdown(f"**{reason_label}** ({len(items)} 条)")
-                            for item in items[:10]:
-                                score = item.get("score")
-                                score_text = (
-                                    f" (相似度 {score:.2f})" if score is not None else ""
-                                )
-                                st.markdown(f"- {item.get('content', '')}{score_text}")
-                            if len(items) > 10:
-                                st.caption(f"…还有 {len(items) - 10} 条")
-
+            try:
+                _render_batch_card(idx, m)
+            except Exception as exc:
+                st.caption(f"⚠ 批次 {idx + 1} 卡片渲染失败：{exc}")
             if idx < len(metrics_list) - 1:
                 st.divider()
+
+
+def _render_batch_card(idx: int, m: dict) -> None:
+    """单批指标卡片。提出来是为了让 _render_queue_dashboard 的 try/except
+    粒度落到"单卡片"——某一批数据形态异常时其它批照常展示。"""
+    engines = ", ".join(m.get("engines") or []) or "?"
+    st.markdown(
+        f"**批次 {idx + 1}** · "
+        f"`{(m.get('batch_id') or '')[:8]}…` · "
+        f"{m.get('count', 0)} 条 · 引擎 {engines} · "
+        f"总耗时 **{m.get('total_ms', 0) / 1000:.1f} s**"
+    )
+
+    phase_ms = m.get("phase_ms") or {}
+    cols = st.columns(4)
+    for col, (k, label) in zip(cols, [
+        ("setup", "setup"),
+        ("llm", "llm"),
+        ("db_save", "db_save"),
+        ("embedding", "embedding"),
+    ]):
+        with col:
+            st.metric(label, f"{phase_ms.get(k, 0) / 1000:.1f} s")
+
+    _render_token_panel(m.get("meta") or {})
+
+    counters = m.get("counters") or {}
+    counter_keys = [
+        ("dedup_text_hits", "文本去重命中"),
+        ("dedup_semantic_hits", "语义去重命中"),
+        ("regen_attempts", "重生尝试"),
+        ("regen_success", "重生成功"),
+        ("hard_rule_violations", "硬规则违反"),
+        ("embedding_missing", "缺向量"),
+    ]
+    ccols = st.columns(len(counter_keys))
+    for col, (k, label) in zip(ccols, counter_keys):
+        with col:
+            st.metric(label, counters.get(k, 0))
+
+    meta = m.get("meta") or {}
+    injection = meta.get("injection") or {}
+    dedup_mode = meta.get("dedup_mode", "vector")
+    dedup_threshold = meta.get("dedup_threshold")
+    if injection or dedup_mode != "vector" or dedup_threshold is not None:
+        hard_n = (injection.get("hard_global", 0) + injection.get("hard_project", 0))
+        soft_n = (injection.get("soft_global", 0) + injection.get("soft_project", 0))
+        sess_n = injection.get("session", 0)
+        calib_chars = injection.get("calibration_chars", 0)
+        filtered = injection.get("filtered") or []
+        badges = [
+            f"硬 {hard_n}", f"软 {soft_n}", f"会话 {sess_n}",
+            f"调校 {calib_chars} 字", f"过滤 {len(filtered)} 条",
+        ]
+        if dedup_threshold is not None:
+            badges.append(f"阈值 {dedup_threshold:.2f}")
+        if dedup_mode != "vector":
+            badges.append(f"去重 {dedup_mode}")
+        st.caption(" · ".join(badges))
+
+        if filtered:
+            with st.expander(
+                f"查看本批被过滤的 {len(filtered)} 条规则",
+                expanded=False,
+            ):
+                by_reason: dict[str, list[dict]] = {}
+                for f in filtered:
+                    by_reason.setdefault(f.get("reason", "?"), []).append(f)
+                for reason, items in by_reason.items():
+                    reason_label = {
+                        "below_threshold": "相关度低于阈值",
+                        "muted": "已静音",
+                        "capped": "超过条数上限",
+                        "no_embedding": "缺 embedding",
+                    }.get(reason, reason)
+                    st.markdown(f"**{reason_label}** ({len(items)} 条)")
+                    for item in items[:10]:
+                        score = item.get("score")
+                        score_text = (
+                            f" (相似度 {score:.2f})" if score is not None else ""
+                        )
+                        st.markdown(f"- {item.get('content', '')}{score_text}")
+                    if len(items) > 10:
+                        st.caption(f"…还有 {len(items) - 10} 条")
 
 
 if _FRAGMENT is not None:
@@ -2609,8 +2939,9 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
 
         # Day 4：注入可视化（quick gen 与 queue worker 行为一致）
+        # Phase 1：同 worker 路径，用 layered builder。
         inject_report: dict = {"filtered": []}
-        full_system_prompt = mem_module.build_system_prompt(
+        full_system_prompt = mem_module.build_layered_system_prompt(
             base_prompt=project.get("system_prompt", ""),
             global_memories=global_mems,
             project_memories=project_mems,
@@ -2658,6 +2989,14 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             )
 
         historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
+
+        # Phase 2.1: session 路由 — 同 _queue_worker_impl 逻辑
+        engine_session_ids, engine_prior_messages = _resolve_engine_sessions(
+            db_client, project, engines, engine_models or {}, user_id,
+        )
+        if engine_session_ids:
+            metrics.set_meta("session_ids", engine_session_ids)
+
         metrics.stop_phase("setup")
 
         def _progress(pct: float, msg: str) -> None:
@@ -2688,6 +3027,8 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 gemini_use_thinking=gemini_thinking,
                 custom_roles=custom_roles,
                 n_roles=n_roles,
+                metrics=metrics,
+                engine_prior_messages=engine_prior_messages,
             )
         else:
             generation_results = gen_module.generate_batch(
@@ -2708,10 +3049,13 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 user_id=user_id,
                 project_id=project_id,
                 metrics=metrics,
+                engine_prior_messages=engine_prior_messages,
             )
 
         metrics.stop_phase("llm")
         # token usage 累加在 generator 内部完成（见 _engine_call）
+        # Phase 2.1: 累加 input/cache 到对应 session 的 running_input_tokens
+        _commit_session_tokens(db_client, engine_session_ids, metrics.meta)
 
         # ── 批量保存：复用与 _queue_worker 完全相同的 _save_batch_results ──
         # （修 R1：之前是 create_item / create_version 逐条 INSERT，
@@ -3335,6 +3679,14 @@ def page_generate(project: dict) -> None:
                 st.success(f"✅ 生成完成！共 {n_res} 篇，{saved} 个版本。")
             elif not errors_list:
                 st.warning("生成完成，但没有内容被保存，请检查配置。")
+            # 快速生成的指标卡片(token/cache/cost/耗时/去重)——之前只有队列
+            # banner 渲染, quick gen 漏了, 导致"快速生成完没数据卡片"。
+            # qgs["metrics_list"] 由 _quick_gen_worker 的 metrics.close(status)
+            # 挂上, 跟队列共用 _render_queue_dashboard。
+            try:
+                _render_queue_dashboard(qgs, title="本次生成指标")
+            except Exception as exc:
+                st.caption(f"⚠ 指标面板渲染失败：{exc}")
             # Day 2: 降级 / 缺向量等非阻塞告警
             qg_warnings = qgs.get("warnings") or []
             qg_missing = qgs.get("embedding_missing") or []
@@ -4166,7 +4518,9 @@ def _run_iteration(
     session_instr = db.get_session_instructions(db_client, user_id, project_id=project_id)
     tactic = batch.get("tactic", "")
     tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic)
-    full_system_prompt = mem_module.build_system_prompt(
+    # Phase 1：同 batch 生成路径，iterate 走 layered—— 跟同项目主生成共享
+    # cache（5 分钟 TTL 内）。
+    full_system_prompt = mem_module.build_layered_system_prompt(
         base_prompt=base_prompt,
         global_memories=global_mems,
         project_memories=project_mems,

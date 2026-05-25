@@ -116,7 +116,7 @@ def filter_soft_by_relevance(
     return out
 
 
-def build_system_prompt(
+def build_layered_system_prompt(
     base_prompt: str,
     global_memories: list[dict],
     project_memories: list[dict],
@@ -126,28 +126,22 @@ def build_system_prompt(
     negative_examples: Optional[list[dict]] = None,
     session_instructions: Optional[list[dict]] = None,
     report_sink: Optional[dict] = None,
-) -> str:
-    """
-    Assemble the final system prompt as a three-tier priority stack so the
-    model can distinguish a non-negotiable rule from a soft preference.
+) -> dict:
+    """Same content as ``build_system_prompt`` but returned as 5 separately
+    addressable layers, so callers (currently only ``ClaudeEngine``) can
+    apply ``cache_control`` per layer.
 
-    Tiers (highest priority last so the model reads them most recently):
-      P0 — hard constraints: ``severity='hard'`` memories (compliance / brand
-           lines) + base_prompt + tactic_suffix.  Must be 100% respected.
-      P1 — soft preferences: ``severity='soft'`` memories + calibration notes
-           + positive/negative few-shots.  Applied when relevant; defer if
-           they conflict with the current batch's tactic or key messages.
-      P2 — session-only instructions: ad-hoc rules valid for this batch only.
+    Returns a dict with keys ``stable / tactic / p0 / p1 / p2``; any layer
+    can be empty string. Stability ordering (most stable first):
 
-    This replaces the previous flat "必须执行，每条都要主动检查" wall that
-    drowned hard requirements in soft preferences and pushed the model to
-    apply unrelated rules out of context.
+      stable  — base prompt;每个项目的"人格"，几乎永不变
+      tactic  — 战术后缀;一组队列内通常同一个战术保持不变
+      p0      — 硬约束节;偶尔加规则
+      p1      — 软偏好 + 调校笔记 + 正反例;变化最频繁的"可缓存"层
+      p2      — 会话临时指令;按定义就是 ephemeral,不缓存
 
-    Memories without a ``severity`` field (legacy rows) default to ``soft``.
-
-    Day 4：``report_sink`` 收集本次实际注入了多少条各类型规则，
-    队列 worker 会把它挂到 metrics.set_meta("injection", ...)，UI 显示
-    "硬 N / 软 M / 会话 K / 调校 X 字" 徽章。
+    See ``build_system_prompt`` for the legacy single-string flavour;
+    that function is now a thin wrapper that joins the layers below.
     """
     def _is_hard(m: dict) -> bool:
         return (m.get("severity") or "soft").lower() == "hard"
@@ -167,12 +161,13 @@ def build_system_prompt(
         report_sink["pos_examples"]     = len(positive_examples or [])
         report_sink["neg_examples"]     = len(negative_examples or [])
 
-    parts: list[str] = [base_prompt.strip()]
+    # ── Layer 1: stable (base) ────────────────────────────────────────────
+    stable = base_prompt.strip()
 
-    if tactic_suffix.strip():
-        parts.append(f"\n{tactic_suffix.strip()}")
+    # ── Layer 2: tactic ───────────────────────────────────────────────────
+    tactic = tactic_suffix.strip()
 
-    # ── P0 ────────────────────────────────────────────────────────────────
+    # ── Layer 3: P0 (hard constraints) ───────────────────────────────────
     p0_lines: list[str] = []
     if hard_global:
         p0_lines.append("[通用硬约束]")
@@ -182,14 +177,15 @@ def build_system_prompt(
             p0_lines.append("")
         p0_lines.append("[项目硬约束]")
         p0_lines.extend(f"• {m['content']}" for m in hard_project)
+    p0 = ""
     if p0_lines:
-        parts.append(
-            "\n---【P0 · 不可违反的硬约束】---\n"
+        p0 = (
+            "---【P0 · 不可违反的硬约束】---\n"
             "本节每一条都必须 100% 满足；若与下方偏好冲突，以此节为准。\n\n"
             + "\n".join(p0_lines)
         )
 
-    # ── P1 ────────────────────────────────────────────────────────────────
+    # ── Layer 4: P1 (soft preferences + calibration + examples) ─────────
     p1_sections: list[str] = []
     if soft_global:
         bullets = "\n".join(f"• {m['content']}" for m in soft_global)
@@ -218,26 +214,92 @@ def build_system_prompt(
             "[反面案例 · 主动规避]\n"
             + "\n\n".join(ex_blocks)
         )
+    p1 = ""
     if p1_sections:
-        parts.append(
-            "\n---【P1 · 项目调性偏好】---\n"
+        p1 = (
+            "---【P1 · 项目调性偏好】---\n"
             "请理解每条意图、在本批 tactic / 关键卖点适用时再应用；明显不适用时可以让位，"
             "不必为了套用规则扭曲文案。与 P0 冲突时以 P0 为准。\n\n"
             + "\n\n".join(p1_sections)
         )
 
-    # ── P2 ────────────────────────────────────────────────────────────────
+    # ── Layer 5: P2 (session-only) ────────────────────────────────────────
+    p2 = ""
     if session_instructions:
         bullets = "\n".join(f"• {m['content']}" for m in session_instructions if m.get("content"))
         if bullets:
-            parts.append(
-                "\n---【P2 · 本次会话临时指令】---\n"
+            p2 = (
+                "---【P2 · 本次会话临时指令】---\n"
                 "用户在本次对话中提出的要求，本批生成期间严格遵守；过期失效。"
                 "与 P0 冲突时仍以 P0 为准。\n"
                 + bullets
             )
 
+    return {
+        "stable": stable,
+        "tactic": tactic,
+        "p0":     p0,
+        "p1":     p1,
+        "p2":     p2,
+    }
+
+
+def layered_system_prompt_to_string(layers: dict) -> str:
+    """Join a layered system prompt dict into the same single string that
+    ``build_system_prompt`` used to return. Layer separator matches the
+    legacy ``"\\n".join(parts)`` formatting so model behavior is identical
+    to the pre-layered implementation.
+
+    ``stable`` 这一层永远占 ``parts[0]``——即便它是空字符串。理由：旧
+    ``build_system_prompt`` 的 ``parts = [base_prompt.strip()]`` 永远写一项，
+    后续层都带 ``"\\n"`` 前缀，``"\\n".join(...)`` 时整段会有形如
+    ``"\\n\\ntactic..."`` 的前导空行。如果 stable 为空就把整层跳过，
+    serialize 出来跟 Phase 0 不一致（base_prompt 留空的项目首层会少
+    两个换行）——破坏 byte-identical 保证、还会让 Gemini implicit-cache
+    的前缀匹配错位。
+    """
+    layers = layers or {}
+    parts: list[str] = [(layers.get("stable") or "").strip()]
+    for key in ("tactic", "p0", "p1", "p2"):
+        chunk = (layers.get(key) or "").strip()
+        if chunk:
+            parts.append("\n" + chunk)
     return "\n".join(parts)
+
+
+def build_system_prompt(
+    base_prompt: str,
+    global_memories: list[dict],
+    project_memories: list[dict],
+    tactic_suffix: str = "",
+    calibration_notes: str = "",
+    positive_examples: Optional[list[dict]] = None,
+    negative_examples: Optional[list[dict]] = None,
+    session_instructions: Optional[list[dict]] = None,
+    report_sink: Optional[dict] = None,
+) -> str:
+    """Legacy single-string flavour.  Kept for any caller that still wants
+    the flat string; new callers should use ``build_layered_system_prompt``
+    + ``layered_system_prompt_to_string`` (or feed the layers directly into
+    ClaudeEngine for per-layer cache_control).
+
+    This wrapper produces byte-identical output to the previous
+    hand-assembled version — the layered builder mirrors the same section
+    ordering and headers; ``layered_system_prompt_to_string`` joins with
+    the same ``\\n`` separator the original ``"\\n".join(parts)`` used.
+    """
+    layers = build_layered_system_prompt(
+        base_prompt=base_prompt,
+        global_memories=global_memories,
+        project_memories=project_memories,
+        tactic_suffix=tactic_suffix,
+        calibration_notes=calibration_notes,
+        positive_examples=positive_examples,
+        negative_examples=negative_examples,
+        session_instructions=session_instructions,
+        report_sink=report_sink,
+    )
+    return layered_system_prompt_to_string(layers)
 
 
 def record_session_instruction(
