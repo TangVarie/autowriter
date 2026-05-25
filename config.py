@@ -332,6 +332,16 @@ def get_context_window(model_id: str) -> int:
     return 200_000
 
 
+# Phase 2.3：session 当前 prefix 占用达到 window_limit 的这个比例时自动封窗
+# （seal → 下一批路由到新 session，新 session 懒同步最近 50 条 approved 历史，
+# 避重自动接续 + dedup_block 照常注入，所以无需额外"摘要注入"）。
+# 取 0.8 留 20% 余量给输出 / thinking / 每批浮动的 memories·dedup_block——
+# 实际撞窗口的硬边界仍靠 API 返回 context_length_exceeded 兜底。
+SESSION_SEAL_THRESHOLD: float = float(
+    os.environ.get("SESSION_SEAL_THRESHOLD", "0.8")
+)
+
+
 def compute_base_prompt_hash(base_prompt: str) -> str:
     """sha256 hex digest of the normalized base_prompt — Phase 2 session
     routing 用的 hash 维度。
@@ -349,7 +359,7 @@ def compute_base_prompt_hash(base_prompt: str) -> str:
 
 # ── App ────────────────────────────────────────────────────────────────────
 APP_TITLE: str = "小红书内容自动化工作台"
-APP_VERSION: str = "2.16.3-phase2.2"
+APP_VERSION: str = "2.17.0-phase2.3"
 
 
 def validate_config() -> list[str]:

@@ -804,6 +804,68 @@ def _commit_session_tokens(
             db.add_session_running_tokens(db_client, session_id, delta)
 
 
+def _update_session_occupancy(
+    db_client,
+    engine_session_ids: dict[str, str],
+    metrics_meta: dict,
+) -> list[str]:
+    """SET 每个 engine session 的当前窗口占用 ``last_prefix_tokens``(= 本批
+    单次主调用的 prefix 大小), 达到 ``SESSION_SEAL_THRESHOLD × window_limit``
+    时自动封窗(seal, reason='window_full')。下一批会路由到新 session, 新
+    session 懒同步最近 50 条 approved 历史(避重自动接续)+ dedup_block 照常
+    注入, 所以无需额外"摘要注入"。
+
+    与 ``_commit_session_tokens`` 的分工:
+      - _commit_session_tokens → 累加 ``running_input_tokens``(跨批 SUM, 只做
+        "本会话累计消耗"统计)
+      - 这里 → SET ``last_prefix_tokens``(当前占用, 用于进度条 + 封窗判断)
+
+    占用口径按引擎不同(只取该 engine 单次主调用; 同 engine 多 model 取 max):
+      - claude: ``input + cache_read + cache_create``(三互斥字段相加才是真占用)
+      - gemini: ``input``(=prompt_token_count, 已含 cache_read 子集, 不重复加)
+
+    返回被自动封窗的 engine 名列表(供 UI 提示)。失败静默(埋点不抛)。
+    """
+    if not engine_session_ids:
+        return []
+    totals = (metrics_meta or {}).get("token_totals") or {}
+    bsm = totals.get("by_source_model")
+    main_by_model = (bsm.get("main") if isinstance(bsm, dict) else None) or {}
+    if not isinstance(main_by_model, dict) or not main_by_model:
+        return []
+    sealed: list[str] = []
+    for eng, session_id in engine_session_ids.items():
+        prefix_tokens = 0
+        pfx = f"{eng}/"
+        for model_full, usage in main_by_model.items():
+            if not isinstance(usage, dict) or not model_full.startswith(pfx):
+                continue
+            inp = int(usage.get("input") or 0)
+            if eng == "claude":
+                cand = (
+                    inp
+                    + int(usage.get("cache_read") or 0)
+                    + int(usage.get("cache_create") or 0)
+                )
+            else:
+                cand = inp
+            if cand > prefix_tokens:
+                prefix_tokens = cand
+        if prefix_tokens <= 0:
+            continue
+        window = db.set_session_prefix_tokens(db_client, session_id, prefix_tokens)
+        if window > 0 and prefix_tokens >= window * config.SESSION_SEAL_THRESHOLD:
+            if db.seal_session(db_client, session_id, "window_full"):
+                sealed.append(eng)
+                telemetry.log_event(
+                    "session_auto_sealed",
+                    session_id=session_id, engine=eng,
+                    prefix_tokens=prefix_tokens, window=window,
+                    threshold=config.SESSION_SEAL_THRESHOLD,
+                )
+    return sealed
+
+
 def _queue_worker(
     plans: list[dict],
     user_id: str,
@@ -1142,8 +1204,15 @@ def _queue_worker_impl(
             # （一次 API 调用 = 一次累加），避免对 ``count`` 个共享同一份
             # token_usage 的 version 重复加导致 count 倍膨胀。
             # Phase 2.1: 把本批的 input + cache_read + cache_create token
-            # 累加到对应 engine 的 session 的 running_input_tokens(UI 进度条用)。
+            # 累加到对应 engine 的 session 的 running_input_tokens(累计消耗统计)。
             _commit_session_tokens(db_client, engine_session_ids, metrics.meta)
+            # Phase 2.3: SET 当前窗口占用 + 达阈值自动封窗(下一批自动开新窗)。
+            sealed_engines = _update_session_occupancy(
+                db_client, engine_session_ids, metrics.meta,
+            )
+            if sealed_engines:
+                with (status.get("_lock") or _NULL_LOCK):
+                    status.setdefault("sealed_engines", []).extend(sealed_engines)
 
             # ── [E 保存] 批量写 items + versions（统一服务 _save_batch_results）──
             metrics.start_phase("db_save")
@@ -1328,6 +1397,14 @@ def _queue_banner_body() -> None:
                 st.session_state.pop("queue_state", None)
                 st.session_state.pop("queue_stop_event", None)
                 st.rerun()
+
+        # Phase 2.3: 本次运行有 session 因占满窗口被自动封窗(下批已自动开新窗)
+        sealed = sorted(set(qs.get("sealed_engines") or []))
+        if sealed:
+            st.caption(
+                f"🪟 {'、'.join(e.upper() for e in sealed)} 的会话窗口已满，已自动封窗并开新窗"
+                "（新窗自动继承最近 50 条已通过历史，避重不断）。"
+            )
 
         # ── 非阻塞警告（embedding 降级 / 历史向量加载失败等）─────────────
         warnings_list = qs.get("warnings") or []
@@ -3056,6 +3133,13 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # token usage 累加在 generator 内部完成（见 _engine_call）
         # Phase 2.1: 累加 input/cache 到对应 session 的 running_input_tokens
         _commit_session_tokens(db_client, engine_session_ids, metrics.meta)
+        # Phase 2.3: SET 当前窗口占用 + 达阈值自动封窗(下一批自动开新窗)。
+        sealed_engines = _update_session_occupancy(
+            db_client, engine_session_ids, metrics.meta,
+        )
+        if sealed_engines:
+            with (status.get("_lock") or _NULL_LOCK):
+                status.setdefault("sealed_engines", []).extend(sealed_engines)
 
         # ── 批量保存：复用与 _queue_worker 完全相同的 _save_batch_results ──
         # （修 R1：之前是 create_item / create_version 逐条 INSERT，
@@ -3679,6 +3763,13 @@ def page_generate(project: dict) -> None:
                 st.success(f"✅ 生成完成！共 {n_res} 篇，{saved} 个版本。")
             elif not errors_list:
                 st.warning("生成完成，但没有内容被保存，请检查配置。")
+            # Phase 2.3: session 占满窗口被自动封窗(下批已自动开新窗)
+            qg_sealed = sorted(set(qgs.get("sealed_engines") or []))
+            if qg_sealed:
+                st.caption(
+                    f"🪟 {'、'.join(e.upper() for e in qg_sealed)} 的会话窗口已满，"
+                    "已自动封窗并开新窗（新窗自动继承最近 50 条已通过历史，避重不断）。"
+                )
             # 快速生成的指标卡片(token/cache/cost/耗时/去重)——之前只有队列
             # banner 渲染, quick gen 漏了, 导致"快速生成完没数据卡片"。
             # qgs["metrics_list"] 由 _quick_gen_worker 的 metrics.close(status)
@@ -4923,7 +5014,63 @@ def page_history(project: dict) -> None:
     _page_history_body(project)
 
 
+def _render_session_window_panel(project: dict) -> None:
+    """Phase 2.3: 展示本项目各引擎「生成会话」(session)的窗口占用 + 手动封窗。
+
+    occupancy = ``last_prefix_tokens / window_limit``——last_prefix_tokens 是
+    最近一批单次主调用的 prefix 大小, 即"这个跨批对话现在多满"。占用达
+    ``SESSION_SEAL_THRESHOLD`` 会在生成后自动封窗; 这里也提供手动"封窗重开"。
+    封窗后下一批自动路由到新 session(懒同步最近 50 条 approved 历史, 避重
+    接续 + dedup_block 照常注入), 不会丢避重信号。
+    """
+    sessions = db.list_project_sessions(db_client, project["id"], status="active")
+    threshold = config.SESSION_SEAL_THRESHOLD
+    with st.expander(
+        f"🪟 生成会话窗口 · 缓存复用（{len(sessions)} 个活跃）", expanded=False,
+    ):
+        if not sessions:
+            st.caption("本项目还没有活跃的生成会话——生成一批内容后出现。")
+            return
+        st.caption(
+            f"占用达 {threshold:.0%} 自动封窗并开新窗；新窗自动继承最近 50 条已通过历史，"
+            "避重不断。也可手动封窗重开（例如刚大改了项目人格 / 想换个开局）。"
+        )
+        for s in sessions:
+            sid = s.get("id")
+            engine = s.get("engine", "?")
+            model_id = s.get("model_id", "")
+            window = int(s.get("window_limit") or 0) or 1
+            used = int(s.get("last_prefix_tokens") or 0)
+            pct = used / window
+            hist_pairs = db.count_session_messages(db_client, sid) // 2
+            near = pct >= threshold
+            icon = "🔴" if near else ("🟡" if pct >= threshold * 0.75 else "🟢")
+            label = _short_model(f"{engine}/{model_id}")
+            row, btn = st.columns([5, 1])
+            with row:
+                st.markdown(
+                    f"{icon} **{label}** — 占用 **{pct:.1%}**　"
+                    f"（{_fmt_tok(used)} / {_fmt_tok(window)}）· 约 {hist_pairs} 篇历史在复用"
+                )
+                st.progress(min(max(pct, 0.0), 1.0))
+                if near:
+                    st.caption("⚠️ 已接近上限，下一批会自动开新窗。")
+            with btn:
+                if st.button(
+                    "封窗重开", key=f"seal_sess_{sid}",
+                    help="封存当前窗口；下一批开新窗，自动继承最近 50 条已通过历史",
+                ):
+                    if db.seal_session(db_client, sid, "manual"):
+                        st.success("已封窗，下批将开新窗。")
+                        st.rerun()
+                    else:
+                        st.error("封窗失败，请重试。")
+
+
 def _page_history_body_impl(project: dict) -> None:
+    # Phase 2.3: session 窗口占用面板(总在最前, 即便还没有批次也显示)
+    _render_session_window_panel(project)
+
     batches = db.list_batches(db_client, project["id"], limit=50)
     if not batches:
         st.info("暂无历史批次。")
