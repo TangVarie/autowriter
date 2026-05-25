@@ -2534,19 +2534,33 @@ def list_approved_versions_for_sync(
         if not item_ids:
             return []
 
-        # 批量取这些 item 的全部 version(分批避免 in_ 列表过长), 按 item 分组。
+        # 批量取这些 item 的全部 version, 按 item 分组。
+        # item_id 列表分批(避免 in_ 列表过长); 每批内部再 .range() 翻页拉全——
+        # 否则单次 in_ 命中的 version 行数超过 project max-rows(常见 1000)会被
+        # 静默截断, _pick_version 可能漏掉 best_version_id 指向的行 / 回退到非
+        # 最新版本(同 get_session_committed_item_ids 的分页理由)。必须 .order
+        # ("id") 才能安全翻页(主键唯一稳定, 跨页不跳不重)。
         versions_by_item: dict = {}
-        chunk = 200
-        for i in range(0, len(item_ids), chunk):
-            sub = item_ids[i:i + chunk]
-            vres = (
-                client.table("versions")
-                .select("id, item_id, version_num, title, body, keywords, created_at")
-                .in_("item_id", sub)
-                .execute()
-            )
-            for v in (vres.data or []):
-                versions_by_item.setdefault(v.get("item_id"), []).append(v)
+        id_chunk = 200
+        page = 1000
+        for i in range(0, len(item_ids), id_chunk):
+            sub = item_ids[i:i + id_chunk]
+            offset = 0
+            while True:
+                vres = (
+                    client.table("versions")
+                    .select("id, item_id, version_num, title, body, keywords, created_at")
+                    .in_("item_id", sub)
+                    .order("id")
+                    .range(offset, offset + page - 1)
+                    .execute()
+                )
+                rows = vres.data or []
+                for v in rows:
+                    versions_by_item.setdefault(v.get("item_id"), []).append(v)
+                if len(rows) < page:
+                    break
+                offset += page
 
         def _pick_version(it: dict) -> Optional[dict]:
             """优先 best_version_id 指向的版本; 没有(或指向的版本已不存在)则
