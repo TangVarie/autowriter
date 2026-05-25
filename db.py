@@ -2492,7 +2492,7 @@ def list_approved_versions_for_sync(
     project_id: str,
     limit: int = 50,
 ) -> list[dict]:
-    """Phase 2.2 懒同步: 查该 project 下 status='approved' 的 items 的最优
+    """Phase 2.2 懒同步: 查该 project 下 status='approved' 的 items 的代表
     版本 —— **不分引擎/来源**(claude / gemini / manual 手动精修 全要)。
 
     为什么不按 engine 过滤: 避重应该针对项目所有已产出内容。如果 claude
@@ -2500,6 +2500,12 @@ def list_approved_versions_for_sync(
     (ai_engine='manual')的最终稿 —— 而 manual 恰恰是最该避免重复的采纳内容。
     每个 engine 的 session 都补"项目全部 approved", 内容相同、分别发给各自
     模型, cache 各自命中(prefix 字节一致即可, 与内容由谁产生无关)。
+
+    版本选择(Phase 2.3 修): 优先 ``best_version_id`` 指向的版本; **为空时
+    回退到该 item 最新(version_num 最大)的版本**。普通"通过"按钮不写
+    best_version_id(只有手动精修 / 显式"选为最佳"才写), 旧实现要求
+    best_version_id 非空, 项目级实测漏掉 ~46% 已通过内容。回退后所有
+    approved item 都进避重历史。
 
     返回 ``[{item_id, batch_id, title, body, keywords, created_at}, ...]``,
     按 item 创建时间升序(老的在前, 符合对话历史顺序), 最多 ``limit`` 条。
@@ -2509,14 +2515,13 @@ def list_approved_versions_for_sync(
     创建时间排序; over-fetch 1000 缓解。要精确需加 approved_at 列(后续 PR)。
     """
     try:
-        # 该 project 的 approved items(带 best_version), 按 created_at desc
-        # 取最近 limit 条(over-fetch 上限 1000 覆盖绝大多数项目全部 approved)。
+        # 该 project 下所有 status='approved' 的 items, 按 created_at desc 取最近
+        # limit 条。不再要求 best_version_id 非空(否则漏掉近一半已通过内容)。
         items_res = (
             client.table("items")
             .select("id, batch_id, best_version_id, created_at, batches!inner(project_id)")
             .eq("batches.project_id", project_id)
             .eq("status", "approved")
-            .not_.is_("best_version_id", "null")
             .order("created_at", desc=True)
             .limit(max(limit, 1))
             .execute()
@@ -2525,27 +2530,61 @@ def list_approved_versions_for_sync(
         if not items:
             return []
 
-        best_vids = [it["best_version_id"] for it in items if it.get("best_version_id")]
-        if not best_vids:
+        item_ids = [it["id"] for it in items if it.get("id")]
+        if not item_ids:
             return []
 
-        # 批量取 best_version 内容(分批避免 in_ 列表过长)
-        ver_by_id: dict = {}
-        chunk = 200
-        for i in range(0, len(best_vids), chunk):
-            sub = best_vids[i:i + chunk]
-            vres = (
-                client.table("versions")
-                .select("id, ai_engine, title, body, keywords")
-                .in_("id", sub)
-                .execute()
+        # 批量取这些 item 的全部 version, 按 item 分组。
+        # item_id 列表分批(避免 in_ 列表过长); 每批内部再 .range() 翻页拉全——
+        # 否则单次 in_ 命中的 version 行数超过 project max-rows(常见 1000)会被
+        # 静默截断, _pick_version 可能漏掉 best_version_id 指向的行 / 回退到非
+        # 最新版本(同 get_session_committed_item_ids 的分页理由)。必须 .order
+        # ("id") 才能安全翻页(主键唯一稳定, 跨页不跳不重)。
+        versions_by_item: dict = {}
+        id_chunk = 200
+        page = 1000
+        for i in range(0, len(item_ids), id_chunk):
+            sub = item_ids[i:i + id_chunk]
+            offset = 0
+            while True:
+                vres = (
+                    client.table("versions")
+                    .select("id, item_id, version_num, title, body, keywords, created_at")
+                    .in_("item_id", sub)
+                    .order("id")
+                    .range(offset, offset + page - 1)
+                    .execute()
+                )
+                rows = vres.data or []
+                for v in rows:
+                    versions_by_item.setdefault(v.get("item_id"), []).append(v)
+                if len(rows) < page:
+                    break
+                offset += page
+
+        def _pick_version(it: dict) -> Optional[dict]:
+            """优先 best_version_id 指向的版本; 没有(或指向的版本已不存在)则
+            回退到该 item 最新(version_num 最大 → created_at 最新)的版本。"""
+            cand = versions_by_item.get(it.get("id")) or []
+            if not cand:
+                return None
+            bvid = it.get("best_version_id")
+            if bvid:
+                for v in cand:
+                    if v.get("id") == bvid:
+                        return v
+            return max(
+                cand,
+                key=lambda v: (
+                    int(v.get("version_num") or 0),
+                    str(v.get("created_at") or ""),
+                    str(v.get("id") or ""),
+                ),
             )
-            for v in (vres.data or []):
-                ver_by_id[v["id"]] = v
 
         matched = []
         for it in items:  # items 已按 created_at desc, 最近 limit 条
-            v = ver_by_id.get(it.get("best_version_id"))
+            v = _pick_version(it)
             if not v:
                 continue
             matched.append({
