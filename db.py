@@ -360,10 +360,13 @@ CREATE TABLE IF NOT EXISTS generation_sessions (
     seal_reason           TEXT
         CHECK (seal_reason IS NULL OR seal_reason IN
             ('window_full','context_error','base_changed','manual')),
-    -- 累积 input tokens(粗略): 每次 LLM 调用后追加 usage.input + cache_create
-    -- + cache_read。用于软警告(>= window_limit*0.8) + UI 进度条;不影响实际
-    -- API 调用——撞窗口的硬边界靠 API 返回 context_length_exceeded 兜底。
+    -- 累积 input tokens(粗略,跨批 SUM): 每次 LLM 调用后追加 usage.input +
+    -- cache_create + cache_read。Phase 2.3 起它只当"本会话累计消耗"统计——
+    -- 因为是跨批累加,不能当"当前窗口占用"用(几批就虚高到接近上限)。
     running_input_tokens  BIGINT NOT NULL DEFAULT 0,
+    -- Phase 2.3: 当前窗口占用 = 最近一批单次主调用的 prefix 大小(SET 非累加)。
+    -- 这才是"这个 session 现在多满",用于 UI 进度条 + 自动封窗阈值判断。
+    last_prefix_tokens    BIGINT NOT NULL DEFAULT 0,
     -- session 建立时 snapshot 一份 model 的 context window(避免后续 config
     -- 改了 window 数让本 session 进度条跳变)。
     window_limit          BIGINT NOT NULL,
@@ -372,6 +375,9 @@ CREATE TABLE IF NOT EXISTS generation_sessions (
     last_used_at          TIMESTAMPTZ DEFAULT NOW(),
     sealed_at             TIMESTAMPTZ NULL
 );
+-- Phase 2.3: 给已部署环境补 last_prefix_tokens 列(当前窗口占用)。
+ALTER TABLE generation_sessions
+    ADD COLUMN IF NOT EXISTS last_prefix_tokens BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE generation_sessions ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS generation_sessions_owner ON generation_sessions;
 CREATE POLICY generation_sessions_owner ON generation_sessions
@@ -2693,6 +2699,39 @@ def add_session_running_tokens(client: Client, session_id: str, delta: int) -> N
         )
 
 
+def set_session_prefix_tokens(
+    client: Client, session_id: str, prefix_tokens: int,
+) -> int:
+    """SET ``last_prefix_tokens``(当前窗口占用,非累加)+ 更新 last_used_at。
+
+    跟 ``add_session_running_tokens`` 不同: 这里是 SET 覆盖, 因为它表示"本
+    session 当前 prefix 多大"——每批单次主调用的 prefix 大小, 不该累加。
+
+    返回该 session 的 ``window_limit``(供调用方做封窗阈值判断), 失败返回 0。
+    PostgREST update 默认回传被改的行, 顺便把 window_limit 带回来省一次 GET。
+    """
+    if prefix_tokens < 0:
+        return 0
+    try:
+        res = (
+            client.table("generation_sessions")
+            .update({
+                "last_prefix_tokens": int(prefix_tokens),
+                "last_used_at": datetime.now(timezone.utc).isoformat(),
+            })
+            .eq("id", session_id)
+            .execute()
+        )
+        if res.data:
+            return int(res.data[0].get("window_limit") or 0)
+    except Exception as exc:
+        telemetry.log_event(
+            "session_prefix_tokens_update_failed",
+            session_id=session_id, error=str(exc)[:200],
+        )
+    return 0
+
+
 def seal_session(client: Client, session_id: str, reason: str) -> bool:
     """标记 session 为 sealed,记录 seal_reason + sealed_at。
 
@@ -2743,3 +2782,26 @@ def list_project_sessions(
             project_id=project_id, error=str(exc)[:200],
         )
         return []
+
+
+def count_session_messages(client: Client, session_id: str) -> int:
+    """返回该 session 的 message 行数(UI 面板显示"历史轮数"用)。
+
+    用 PostgREST 的 ``count='exact'`` 只取计数, 不拉 content(JSONB 可能很大),
+    比 ``list_session_messages`` 轻得多。失败返回 0。
+    """
+    try:
+        res = (
+            client.table("session_messages")
+            .select("id", count="exact")
+            .eq("session_id", session_id)
+            .limit(1)
+            .execute()
+        )
+        return int(getattr(res, "count", 0) or 0)
+    except Exception as exc:
+        telemetry.log_event(
+            "session_messages_count_failed",
+            session_id=session_id, error=str(exc)[:200],
+        )
+        return 0
