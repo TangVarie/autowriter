@@ -530,6 +530,26 @@ AS $$
     GROUP BY i.batch_id;
 $$;
 GRANT EXECUTE ON FUNCTION batch_item_counts(UUID[]) TO authenticated, service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- R-029 (2026-05-22 audit · unindexed_foreign_keys): 给外键列补覆盖索引。
+-- FK 列无索引时, 父表删除的级联清理 + 按 FK 的 JOIN/过滤要全表扫描, 大表会
+-- 明显变慢。全部 IF NOT EXISTS 幂等。常用且基本非空的列用普通索引; 频繁为
+-- NULL 且 ON DELETE SET NULL 的列用 partial(WHERE ... IS NOT NULL)缩小体积,
+-- 仍覆盖"按该 FK 找引用行"的级联/JOIN 场景。
+-- 当时数据量小(items~3.7k / versions~4.4k)收益不大, 提前建防患于未然。
+CREATE INDEX IF NOT EXISTS batches_project_idx     ON batches(project_id);
+CREATE INDEX IF NOT EXISTS items_batch_idx         ON items(batch_id);
+CREATE INDEX IF NOT EXISTS versions_item_idx       ON versions(item_id);
+CREATE INDEX IF NOT EXISTS batch_metrics_batch_idx ON batch_metrics(batch_id);
+CREATE INDEX IF NOT EXISTS memories_project_idx
+    ON memories(project_id) WHERE project_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS memories_source_batch_idx
+    ON memories(source_batch_id) WHERE source_batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS session_messages_batch_idx
+    ON session_messages(batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS session_messages_item_idx
+    ON session_messages(item_id) WHERE item_id IS NOT NULL;
 """
 
 
