@@ -112,9 +112,14 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 -- PostgreSQL 不支持 CREATE POLICY IF NOT EXISTS；用 DROP + CREATE 实现幂等
+-- R-029 (2026-05-22 audit): 本文件所有 policy 里的 auth.uid() 都包成
+-- (select auth.uid())。PG 对 auth.uid() 这种 STABLE 函数, 直接写在 policy 里
+-- 会每行求值一次; 包成子查询后 planner 当 initplan 全表只算一次——消除
+-- Supabase auth_rls_initplan 告警, 大表显著更快。返回值与裸 auth.uid()
+-- 完全一致, 零行为改变。Supabase 上已即时修复; 这里同步源码防 bootstrap 覆盖回。
 DROP POLICY IF EXISTS projects_owner ON projects;
 CREATE POLICY projects_owner ON projects
-    USING (owner_id = auth.uid());
+    USING (owner_id = (select auth.uid()));
 -- Migration: add dual-prompt columns if upgrading from older schema
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_tone TEXT;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS system_prompt_exec TEXT;
@@ -149,7 +154,7 @@ ALTER TABLE batches
 ALTER TABLE batches ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS batches_owner ON batches;
 CREATE POLICY batches_owner ON batches
-    USING (user_id = auth.uid());
+    USING (user_id = (select auth.uid()));
 
 -- Items (one per generated copy slot)
 CREATE TABLE IF NOT EXISTS items (
@@ -209,7 +214,7 @@ CREATE INDEX IF NOT EXISTS items_proposal_idx
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS items_owner ON items;
 CREATE POLICY items_owner ON items
-    USING (user_id = auth.uid());
+    USING (user_id = (select auth.uid()));
 
 -- Versions (each AI generation or iteration)
 CREATE TABLE IF NOT EXISTS versions (
@@ -229,7 +234,7 @@ ALTER TABLE versions ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS versions_owner ON versions;
 CREATE POLICY versions_owner ON versions
     USING (
-        item_id IN (SELECT id FROM items WHERE user_id = auth.uid())
+        item_id IN (SELECT id FROM items WHERE user_id = (select auth.uid()))
     );
 -- Semantic-similarity embedding for cross-batch duplicate detection.
 -- Requires the pgvector extension (Supabase: Database → Extensions → enable
@@ -310,14 +315,14 @@ ALTER TABLE calibration_note_audit ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS calibration_note_audit_owner ON calibration_note_audit;
 CREATE POLICY calibration_note_audit_owner ON calibration_note_audit
     USING (
-        project_id IN (SELECT id FROM projects WHERE owner_id = auth.uid())
+        project_id IN (SELECT id FROM projects WHERE owner_id = (select auth.uid()))
     );
 CREATE INDEX IF NOT EXISTS calibration_note_audit_project_idx
     ON calibration_note_audit(project_id, created_at DESC);
 ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS memories_owner ON memories;
 CREATE POLICY memories_owner ON memories
-    USING (user_id = auth.uid());
+    USING (user_id = (select auth.uid()));
 
 -- 2026-05 Day 5: 批次指标持久化（phase_ms / counters / injection summary）
 -- 历史页查"哪一批慢/重/违规多"，免去每次都翻 stdout 日志。
@@ -335,7 +340,7 @@ CREATE TABLE IF NOT EXISTS batch_metrics (
 ALTER TABLE batch_metrics ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS batch_metrics_owner ON batch_metrics;
 CREATE POLICY batch_metrics_owner ON batch_metrics
-    USING (user_id = auth.uid());
+    USING (user_id = (select auth.uid()));
 CREATE INDEX IF NOT EXISTS batch_metrics_project_idx
     ON batch_metrics(project_id, created_at DESC);
 
@@ -381,7 +386,7 @@ ALTER TABLE generation_sessions
 ALTER TABLE generation_sessions ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS generation_sessions_owner ON generation_sessions;
 CREATE POLICY generation_sessions_owner ON generation_sessions
-    USING (user_id = auth.uid());
+    USING (user_id = (select auth.uid()));
 -- 路由 UNIQUE partial index: 防止并发 worker 同时为同一 routing key 各自
 -- insert 一条 active session(后续 get_or_create_active_session 用 .limit(1)
 -- 无 order,可能交替绑到不同 session, 撕裂对话历史)。两个 insert race 时
@@ -426,7 +431,7 @@ DROP POLICY IF EXISTS session_messages_owner ON session_messages;
 -- 重复存 user_id(session 一改用户/被搬就乱套)。
 CREATE POLICY session_messages_owner ON session_messages
     USING (
-        session_id IN (SELECT id FROM generation_sessions WHERE user_id = auth.uid())
+        session_id IN (SELECT id FROM generation_sessions WHERE user_id = (select auth.uid()))
     );
 -- 按 (session, turn) 顺序读取是热路径(每批生成前要拉完整历史拼 prefix)。
 CREATE UNIQUE INDEX IF NOT EXISTS session_messages_session_turn_uniq
@@ -461,9 +466,9 @@ DROP POLICY IF EXISTS user_logins_owner ON user_logins;
 DROP POLICY IF EXISTS user_logins_select_own ON user_logins;
 DROP POLICY IF EXISTS user_logins_insert_own ON user_logins;
 CREATE POLICY user_logins_select_own ON user_logins
-    FOR SELECT USING (user_id = auth.uid());
+    FOR SELECT USING (user_id = (select auth.uid()));
 CREATE POLICY user_logins_insert_own ON user_logins
-    FOR INSERT WITH CHECK (user_id = auth.uid());
+    FOR INSERT WITH CHECK (user_id = (select auth.uid()));
 CREATE INDEX IF NOT EXISTS user_logins_user_idx
     ON user_logins(user_id, created_at DESC);
 
@@ -525,6 +530,26 @@ AS $$
     GROUP BY i.batch_id;
 $$;
 GRANT EXECUTE ON FUNCTION batch_item_counts(UUID[]) TO authenticated, service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- R-029 (2026-05-22 audit · unindexed_foreign_keys): 给外键列补覆盖索引。
+-- FK 列无索引时, 父表删除的级联清理 + 按 FK 的 JOIN/过滤要全表扫描, 大表会
+-- 明显变慢。全部 IF NOT EXISTS 幂等。常用且基本非空的列用普通索引; 频繁为
+-- NULL 且 ON DELETE SET NULL 的列用 partial(WHERE ... IS NOT NULL)缩小体积,
+-- 仍覆盖"按该 FK 找引用行"的级联/JOIN 场景。
+-- 当时数据量小(items~3.7k / versions~4.4k)收益不大, 提前建防患于未然。
+CREATE INDEX IF NOT EXISTS batches_project_idx     ON batches(project_id);
+CREATE INDEX IF NOT EXISTS items_batch_idx         ON items(batch_id);
+CREATE INDEX IF NOT EXISTS versions_item_idx       ON versions(item_id);
+CREATE INDEX IF NOT EXISTS batch_metrics_batch_idx ON batch_metrics(batch_id);
+CREATE INDEX IF NOT EXISTS memories_project_idx
+    ON memories(project_id) WHERE project_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS memories_source_batch_idx
+    ON memories(source_batch_id) WHERE source_batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS session_messages_batch_idx
+    ON session_messages(batch_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS session_messages_item_idx
+    ON session_messages(item_id) WHERE item_id IS NOT NULL;
 """
 
 
@@ -575,6 +600,25 @@ def create_project(
     return res.data[0]
 
 
+def _record_schema_drift(missing_cols: list[str]) -> None:
+    """R-027: 把列漂移记到 ``st.session_state`` 让主页面渲染一次可见告警。
+
+    之前 ``update_project`` 撞"列不存在"只剥列 + telemetry，用户在 UI 改了
+    值、DB 没生效却没有任何提示。这里在有 Streamlit ScriptRunContext 时（即
+    UI 主线程）把缺失列塞进 session_state，``app.py`` 顶部统一 pop 出来
+    ``st.warning``。worker 线程没有 context，写入会抛 → 被吞掉（那边本来就
+    只能靠 telemetry）。
+    """
+    if not _HAS_ST or not missing_cols:
+        return
+    try:
+        import streamlit as st
+        prev = st.session_state.get("_schema_drift_cols") or []
+        st.session_state["_schema_drift_cols"] = sorted(set(list(prev) + list(missing_cols)))
+    except Exception:
+        pass
+
+
 def update_project(client: Client, project_id: str, updates: dict) -> dict:
     # Serialise JSON fields if passed as Python objects
     for key in ("tactics", "default_params", "reference_files"):
@@ -612,6 +656,8 @@ def update_project(client: Client, project_id: str, updates: dict) -> dict:
             missing_columns=hit_cols,
             error=msg[:200],
         )
+        # R-027: 不再静默——把缺失列塞 session_state 让主页面显式告警一次。
+        _record_schema_drift(hit_cols)
         stripped = {k: v for k, v in updates.items() if k not in hit_cols}
         if not stripped:
             # 这次写入的全部字段都是"新列"，剥完什么都没了，直接返回当前行
