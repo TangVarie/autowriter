@@ -27,6 +27,7 @@ jobs:
           python - <<'PY'
           import config, clients, telemetry, logger_utils, validator
           import dedup, db, generator, memory, image_handler, exporter, projects
+          import worker  # R-018: 后台 worker 入口(import 安全, main() 在 __main__ 守卫内)
           print("import graph OK")
           PY
       - name: supabase schema-aware client 契约 (TV 通道 2 sync 依赖)

@@ -68,6 +68,10 @@ GEMINI_MODEL: str = _get_secret("GEMINI_MODEL") or "gemini-2.5-pro"
 # ── Supabase ───────────────────────────────────────────────────────────────
 SUPABASE_URL: str = _get_secret("SUPABASE_URL")
 SUPABASE_ANON_KEY: str = _get_secret("SUPABASE_ANON_KEY")
+# R-018: service_role key —— 仅后台 worker (worker.py) 用, 绕 RLS 领取任意
+# 用户的 job。Streamlit app 路径绝不使用。从环境/secrets 注入, 不要硬编码;
+# 泄露立即在 Supabase Dashboard rotate。app 不配也能正常跑(只有 worker 需要)。
+SUPABASE_SERVICE_ROLE_KEY: str = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
 
 # ── Feishu (Lark) Webhook ──────────────────────────────────────────────────
 FEISHU_WEBHOOK_URL: str = _get_secret("FEISHU_WEBHOOK_URL")

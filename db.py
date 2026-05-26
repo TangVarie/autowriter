@@ -16,7 +16,7 @@ import json
 import re
 import threading
 from typing import Any, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from supabase import create_client, Client
 from supabase.client import ClientOptions
@@ -87,6 +87,29 @@ def get_client(access_token: Optional[str] = None) -> Client:
     """
     return _make_client_cached(
         config.SUPABASE_URL, config.SUPABASE_ANON_KEY, access_token or ""
+    )
+
+
+def get_service_client() -> Client:
+    """构造一个 service_role Supabase client（绕 RLS）。
+
+    **仅供后台 worker 进程（worker.py）使用** —— service_role 能读写所有用户
+    的数据, 绝不能在 Streamlit app 路径里调用。需要 ``SUPABASE_SERVICE_ROLE_KEY``
+    环境变量（见 config.py）; 未配时抛错而不是静默退化, 避免 worker 拿 anon key
+    走 RLS 永远领不到 job 还查不出原因。
+
+    不走 ``_make_client_cached``（那个按 anon_key + access_token 缓存）: service
+    client 是 worker 进程级单例, 由 worker.py 持有一份即可。
+    """
+    key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", "")
+    if not key:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY 未配置 —— worker 无法绕 RLS 领取 job。"
+            "请在 worker 主机的环境变量里设置（不要硬编码）。"
+        )
+    return create_client(
+        config.SUPABASE_URL, key,
+        options=ClientOptions(schema="autowriter"),
     )
 
 
@@ -550,6 +573,97 @@ CREATE INDEX IF NOT EXISTS session_messages_batch_idx
     ON session_messages(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS session_messages_item_idx
     ON session_messages(item_id) WHERE item_id IS NOT NULL;
+
+-- ═════════════════════════════════════════════════════════════════════════
+-- R-018 (2026-05-22 audit): DB-backed job 队列 —— 取代 Streamlit 进程内
+-- daemon thread。daemon thread 在进程 reload / 容器滚动 / OOM 被 kill 时会把
+-- 正在跑的 batch 丢掉（UI 显示 running 实际已死）。jobs 表 + 独立 worker 进程
+-- 让任务跨进程重启存活: worker 用 claim_one_job()（FOR UPDATE SKIP LOCKED）
+-- 原子领取, 心跳超时由 sweeper 退回重试。Phase 1 仅 'noop' handler 验证连通性,
+-- 'generate_batch' / 'quick_gen' 留 Phase 2。详见 worker.py。
+CREATE TABLE IF NOT EXISTS jobs (
+    id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    kind             TEXT NOT NULL,                  -- 'generate_batch' / 'quick_gen' / 'noop'
+    payload          JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status           TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending','claimed','running','success','failed','cancelled')),
+    priority         INTEGER NOT NULL DEFAULT 0,     -- 高优先先领（用户触发 > 后台任务）
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    max_attempts     INTEGER NOT NULL DEFAULT 3,
+    progress_pct     INTEGER NOT NULL DEFAULT 0,
+    progress_message TEXT,
+    result           JSONB,
+    error_text       TEXT,
+    claimed_by       TEXT,                           -- worker id
+    claimed_at       TIMESTAMPTZ,
+    started_at       TIMESTAMPTZ,
+    heartbeat_at     TIMESTAMPTZ,
+    finished_at      TIMESTAMPTZ,
+    next_retry_at    TIMESTAMPTZ,                    -- 退避重试: 早于此不领
+    -- user_id / project_id 是裸 UUID（不设 FK，同 R-012 跨表松耦合哲学）:
+    -- jobs 是瞬时表, 不需要随项目级联删; 也省掉又一个 FK-without-index。
+    user_id          UUID NOT NULL,
+    project_id       UUID,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS jobs_owner ON jobs;
+-- 用户只能看/插/改/删自己的 job（UI 取消 = UPDATE status='cancelled'）。
+-- worker 用 service_role 绕 RLS, 能领取任意用户的 pending job。
+-- auth.uid() 包成 (select ...) 同 R-029, 避免每行重算。
+CREATE POLICY jobs_owner ON jobs
+    USING (user_id = (select auth.uid()))
+    WITH CHECK (user_id = (select auth.uid()));
+-- 领取热路径: 只扫 pending, 按 priority 高→低、created_at 早→晚。
+CREATE INDEX IF NOT EXISTS jobs_pending_idx
+    ON jobs(priority DESC, created_at) WHERE status = 'pending';
+-- sweeper 扫心跳超时的 claimed/running 行。
+CREATE INDEX IF NOT EXISTS jobs_active_heartbeat_idx
+    ON jobs(heartbeat_at) WHERE status IN ('claimed','running');
+-- UI 列某用户的 job。
+CREATE INDEX IF NOT EXISTS jobs_user_idx ON jobs(user_id, created_at DESC);
+GRANT SELECT, INSERT, UPDATE, DELETE ON jobs TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON jobs TO service_role;
+
+-- claim_one_job: 原子领取一个待处理 job。FOR UPDATE SKIP LOCKED 保证多 worker
+-- 副本并发领取不会抢到同一行（撞锁的直接跳过该行往下找）。领到后置 running +
+-- attempts+1 + 记 worker / 时间戳。无可领时返回 0 行。
+-- 仅授予 service_role（worker 身份）; 普通用户不能领 job。
+CREATE OR REPLACE FUNCTION claim_one_job(_worker_id TEXT, _kinds TEXT[] DEFAULT NULL)
+RETURNS SETOF jobs
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_job jobs;
+BEGIN
+    SELECT * INTO v_job
+    FROM jobs
+    WHERE status = 'pending'
+      AND (next_retry_at IS NULL OR next_retry_at <= now())
+      AND (_kinds IS NULL OR kind = ANY(_kinds))
+    ORDER BY priority DESC, created_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    UPDATE jobs
+    SET status       = 'running',
+        attempts     = attempts + 1,
+        claimed_by   = _worker_id,
+        claimed_at   = now(),
+        started_at   = COALESCE(started_at, now()),
+        heartbeat_at = now()
+    WHERE id = v_job.id
+    RETURNING * INTO v_job;
+
+    RETURN NEXT v_job;
+END;
+$$;
+REVOKE ALL ON FUNCTION claim_one_job(TEXT, TEXT[]) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION claim_one_job(TEXT, TEXT[]) TO service_role;
 """
 
 
@@ -2890,3 +3004,188 @@ def count_session_messages(client: Client, session_id: str) -> int:
             session_id=session_id, error=str(exc)[:200],
         )
         return 0
+
+
+# ── Job queue (R-018) ──────────────────────────────────────────────────────
+# DB-backed job 队列的数据层。UI 侧用 insert_job / get_job / cancel_job /
+# list_user_jobs（走 authed client + RLS）; worker 侧用 claim_one_job /
+# heartbeat / progress / finish / sweep（走 service client 绕 RLS）。
+# 状态机: pending →(claim)→ running →(handler)→ success | failed;
+# 失败且未超 max_attempts → 回 pending + next_retry_at 退避; sweeper 把心跳
+# 超时的 running 行也退回。详见 worker.py。
+
+def _now_iso() -> str:
+    """UTC ISO 字符串(秒精度), 给 jobs 的时间戳列用。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def insert_job(
+    client: Client,
+    kind: str,
+    payload: dict,
+    user_id: str,
+    project_id: Optional[str] = None,
+    priority: int = 0,
+    max_attempts: int = 3,
+) -> dict:
+    """入队一个 job（UI 侧用 authed client; RLS 要求 user_id = auth.uid()）。"""
+    row: dict[str, Any] = {
+        "kind": kind,
+        "payload": payload or {},
+        "user_id": user_id,
+        "priority": int(priority),
+        "max_attempts": int(max_attempts),
+    }
+    if project_id:
+        row["project_id"] = project_id
+    res = client.table("jobs").insert(row).execute()
+    return res.data[0]
+
+
+def get_job(client: Client, job_id: str) -> Optional[dict]:
+    """读单个 job 行（UI 轮询进度用）。不存在 / 无权限时返回 None。"""
+    try:
+        res = client.table("jobs").select("*").eq("id", job_id).single().execute()
+        return res.data
+    except Exception:
+        return None
+
+
+def list_user_jobs(client: Client, user_id: str, limit: int = 20) -> list[dict]:
+    """列某用户最近的 job（UI 历史 / 队列面板用）。"""
+    res = (
+        client.table("jobs").select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+
+def cancel_job(client: Client, job_id: str) -> None:
+    """UI 取消: 仅当还在 pending/claimed/running 时置 cancelled（终态的不动）。"""
+    try:
+        (
+            client.table("jobs")
+            .update({"status": "cancelled", "finished_at": _now_iso()})
+            .eq("id", job_id)
+            .in_("status", ["pending", "claimed", "running"])
+            .execute()
+        )
+    except Exception as exc:
+        telemetry.log_event("job_cancel_failed", job_id=str(job_id), error=str(exc)[:200])
+
+
+def claim_one_job(
+    client: Client, worker_id: str, kinds: Optional[list[str]] = None
+) -> Optional[dict]:
+    """worker 领取一个待处理 job（走 claim_one_job RPC, service client）。
+
+    返回领到的 job 行（已置 running）或 None（队列空）。RPC 内部用
+    FOR UPDATE SKIP LOCKED, 多 worker 并发安全。
+    """
+    res = client.rpc(
+        "claim_one_job", {"_worker_id": worker_id, "_kinds": kinds}
+    ).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def update_job_progress(
+    client: Client, job_id: str, pct: int, message: Optional[str] = None
+) -> None:
+    """handler 更新进度; UI 轮询同一行即可看到。失败不抛（埋点）。"""
+    patch: dict[str, Any] = {"progress_pct": int(pct)}
+    if message is not None:
+        patch["progress_message"] = message
+    try:
+        client.table("jobs").update(patch).eq("id", job_id).execute()
+    except Exception as exc:
+        telemetry.log_event("job_progress_failed", job_id=str(job_id), error=str(exc)[:200])
+
+
+def heartbeat_job(client: Client, job_id: str) -> None:
+    """worker 心跳线程刷 heartbeat_at; sweeper 据此判断 worker 是否还活着。"""
+    try:
+        client.table("jobs").update({"heartbeat_at": _now_iso()}).eq("id", job_id).execute()
+    except Exception as exc:
+        telemetry.log_event("job_heartbeat_failed", job_id=str(job_id), error=str(exc)[:200])
+
+
+def finish_job_success(client: Client, job_id: str, result: Optional[dict] = None) -> None:
+    """handler 成功返回 → 置 success + 100% + 写 result。"""
+    client.table("jobs").update({
+        "status": "success",
+        "finished_at": _now_iso(),
+        "progress_pct": 100,
+        "result": result or {},
+    }).eq("id", job_id).execute()
+
+
+def mark_job_failed(client: Client, job_id: str, error_text: str) -> None:
+    """直接置 failed（无重试语义）。用于"无 handler"等不该重试的情形。"""
+    client.table("jobs").update({
+        "status": "failed",
+        "finished_at": _now_iso(),
+        "error_text": error_text,
+    }).eq("id", job_id).execute()
+
+
+def fail_or_requeue_job(client: Client, job: dict, error_text: str) -> str:
+    """handler 抛错后的处理: 还有重试次数 → 回 pending + 指数退避; 否则 failed。
+
+    退避 = 30 × 2^(attempts-1) 秒（30 / 60 / 120 …）。attempts 已在 claim 时
+    +1, 所以这里直接比 ``attempts >= max_attempts``。返回新 status。
+    """
+    attempts = int(job.get("attempts") or 0)
+    max_attempts = int(job.get("max_attempts") or 1)
+    if attempts >= max_attempts:
+        mark_job_failed(client, job["id"], error_text)
+        return "failed"
+    backoff = 30 * (2 ** max(0, attempts - 1))
+    next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
+    client.table("jobs").update({
+        "status": "pending",
+        "error_text": error_text,
+        "next_retry_at": next_retry,
+        # 清掉 claim 痕迹, 让它能被重新领取
+        "claimed_by": None,
+        "claimed_at": None,
+        "heartbeat_at": None,
+        "started_at": None,
+    }).eq("id", job["id"]).execute()
+    return "pending"
+
+
+def sweep_dead_jobs(client: Client, timeout_seconds: int) -> int:
+    """把心跳超时的 claimed/running job 退回重试 / 置 failed（超次数）。
+
+    worker 主循环 idle 时定期调一次。返回回收的 job 数。失败安全（埋点不抛）。
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)).isoformat(timespec="seconds")
+    try:
+        res = (
+            client.table("jobs").select("*")
+            .in_("status", ["claimed", "running"])
+            .lt("heartbeat_at", cutoff)
+            .execute()
+        )
+        dead = res.data or []
+    except Exception as exc:
+        telemetry.log_event("job_sweep_query_failed", error=str(exc)[:200])
+        return 0
+    recovered = 0
+    for job in dead:
+        try:
+            fail_or_requeue_job(
+                client, job,
+                f"heartbeat stale (cutoff={cutoff}); worker likely died, recovered by sweeper",
+            )
+            recovered += 1
+        except Exception as exc:
+            telemetry.log_event(
+                "job_sweep_recover_failed",
+                job_id=str(job.get("id")), error=str(exc)[:200],
+            )
+    return recovered
