@@ -575,6 +575,25 @@ def create_project(
     return res.data[0]
 
 
+def _record_schema_drift(missing_cols: list[str]) -> None:
+    """R-027: 把列漂移记到 ``st.session_state`` 让主页面渲染一次可见告警。
+
+    之前 ``update_project`` 撞"列不存在"只剥列 + telemetry，用户在 UI 改了
+    值、DB 没生效却没有任何提示。这里在有 Streamlit ScriptRunContext 时（即
+    UI 主线程）把缺失列塞进 session_state，``app.py`` 顶部统一 pop 出来
+    ``st.warning``。worker 线程没有 context，写入会抛 → 被吞掉（那边本来就
+    只能靠 telemetry）。
+    """
+    if not _HAS_ST or not missing_cols:
+        return
+    try:
+        import streamlit as st
+        prev = st.session_state.get("_schema_drift_cols") or []
+        st.session_state["_schema_drift_cols"] = sorted(set(list(prev) + list(missing_cols)))
+    except Exception:
+        pass
+
+
 def update_project(client: Client, project_id: str, updates: dict) -> dict:
     # Serialise JSON fields if passed as Python objects
     for key in ("tactics", "default_params", "reference_files"):
@@ -612,6 +631,8 @@ def update_project(client: Client, project_id: str, updates: dict) -> dict:
             missing_columns=hit_cols,
             error=msg[:200],
         )
+        # R-027: 不再静默——把缺失列塞 session_state 让主页面显式告警一次。
+        _record_schema_drift(hit_cols)
         stripped = {k: v for k, v in updates.items() if k not in hit_cols}
         if not stripped:
             # 这次写入的全部字段都是"新列"，剥完什么都没了，直接返回当前行

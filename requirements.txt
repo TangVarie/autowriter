@@ -1,9 +1,18 @@
-streamlit>=1.30.0
-anthropic>=0.40.0
-google-genai>=0.5.0
-supabase>=2.0.0
-python-docx>=1.0.0
-openpyxl>=3.1.0
-requests>=2.31.0
-Pillow>=10.0.0
-extra-streamlit-components>=0.1.70
+# R-017 (2026-05-22 audit): 每个依赖都锁到「下一个 major」之前。
+# 只有 >= 时, 任意 fresh deploy 都可能拉到 breaking 的新 major:
+#   streamlit 2.0 改 session_state · anthropic 1.0 改 Messages API 默认参数
+#   google-genai 1.0 改 client 入参 · supabase 3.0 可能动 PostgREST .schema() 链式 API
+# (TV 通道 2 sync 完全靠 supabase-py 的 schema-aware client + embedded join,
+#  supabase-py 升小版本就可能让这些查询 silently 失败。)
+#
+# 要升某个 major 之前: 看上游 changelog → staging 跑 smoke import (见
+# .github/workflows/ci.yml) → 一次只升一个, 不要堆一起。
+streamlit>=1.30.0,<2.0
+anthropic>=0.40.0,<1.0
+google-genai>=0.5.0,<1.0
+supabase>=2.0.0,<3.0
+python-docx>=1.0.0,<2.0
+openpyxl>=3.1.0,<4.0
+requests>=2.31.0,<3.0
+Pillow>=10.0.0,<12.0
+extra-streamlit-components>=0.1.70,<1.0

@@ -49,6 +49,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+import logger_utils  # R-023: stdout 日志写出前脱敏 secret
+
 
 # stdout 日志前缀；用于在大量日志里 grep 一行的指标摘要
 _LOG_PREFIX = "[BATCH_METRICS]"
@@ -250,8 +252,8 @@ class BatchMetrics:
         data = self.to_dict()
         # 1. stdout 一行 JSON（生产环境会被 Streamlit / 容器日志捕获）
         try:
-            print(f"{_LOG_PREFIX} {json.dumps(data, ensure_ascii=False)}",
-                  file=sys.stdout, flush=True)
+            _line = logger_utils.mask_secrets(json.dumps(data, ensure_ascii=False))
+            print(f"{_LOG_PREFIX} {_line}", file=sys.stdout, flush=True)
         except Exception:
             pass
         # 2. 挂到 status 上给 UI 用
@@ -280,7 +282,7 @@ def log_event(event: str, **fields) -> None:
     """
     try:
         payload = {"event": event, **fields}
-        print(f"{_LOG_PREFIX} {json.dumps(payload, ensure_ascii=False)}",
-              file=sys.stdout, flush=True)
+        line = logger_utils.mask_secrets(json.dumps(payload, ensure_ascii=False))
+        print(f"{_LOG_PREFIX} {line}", file=sys.stdout, flush=True)
     except Exception:
         pass

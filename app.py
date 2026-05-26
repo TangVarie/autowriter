@@ -30,6 +30,7 @@ import exporter
 import dedup as dedup_module
 import telemetry
 import validator
+import logger_utils  # R-023: 错误展示前脱敏 secret
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -2814,18 +2815,20 @@ def _render_error_panel(err: Exception) -> None:
         except Exception:
             pass
         st.code(
-            "PostgREST APIError\n"
-            f"message: {pg_detail.get('message', err_msg)}\n"
-            f"code:    {pg_detail.get('code', '')}\n"
-            f"hint:    {pg_detail.get('hint', '')}\n"
-            f"details: {pg_detail.get('details', '')}",
+            logger_utils.mask_secrets(
+                "PostgREST APIError\n"
+                f"message: {pg_detail.get('message', err_msg)}\n"
+                f"code:    {pg_detail.get('code', '')}\n"
+                f"hint:    {pg_detail.get('hint', '')}\n"
+                f"details: {pg_detail.get('details', '')}"
+            ),
             language="text",
         )
     else:
-        st.code(err_repr, language="text")
+        st.code(logger_utils.mask_secrets(err_repr), language="text")
 
     with st.expander("🔍 完整 traceback（截图发给开发者最有用）", expanded=False):
-        st.code(_traceback.format_exc(), language="text")
+        st.code(logger_utils.mask_secrets(_traceback.format_exc()), language="text")
 
     st.markdown("**常见排查方向**：")
     if is_pg:
@@ -2912,6 +2915,17 @@ with st.sidebar:
 
 # ── Global queue banner ────────────────────────────────────────────────────
 _queue_banner()
+
+# R-027: schema 漂移一次性告警。update_project 撞"列不存在"剥列后，由
+# db._record_schema_drift 把缺失列塞进 session_state；这里 pop 出来显式提示，
+# 避免"UI 改了值但 DB 没生效"无感。
+_drift_cols = st.session_state.pop("_schema_drift_cols", None)
+if _drift_cols:
+    st.warning(
+        "⚠️ 以下字段未能写入数据库（schema 滞后，已自动跳过这些列）："
+        f"`{', '.join(_drift_cols)}`。项目的其它字段已正常保存；"
+        "请运维确认 AutoWriter 的 ALTER TABLE 迁移是否已在 Supabase 跑过。"
+    )
 
 # ── Route to pages ─────────────────────────────────────────────────────────
 

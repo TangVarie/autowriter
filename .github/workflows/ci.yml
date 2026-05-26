@@ -1,0 +1,46 @@
+# R-017 (2026-05-22 audit): 依赖烟雾测试。
+# 目标不是跑业务逻辑(streamlit 需要 ScriptRunContext, 没法在 CI 裸跑),
+# 而是确保 pinned 依赖能装、能 import, 且 supabase-py 的 schema-aware
+# client 契约没被新版本破坏 —— TV 通道 2 sync 完全依赖它。
+# 哪天某个依赖出 breaking change, 这里先红, 比 fresh deploy 后线上崩好查。
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install pinned deps (lockfile)
+        run: pip install -r requirements.lock
+      - name: py_compile 所有模块 (抓语法错误, 不需要运行)
+        run: python -m compileall -q app.py *.py
+      - name: 真实 import 图 (抓依赖 API 漂移; 不 import app.py — 它会跑 streamlit 脚本)
+        run: |
+          python - <<'PY'
+          import config, clients, telemetry, logger_utils, validator
+          import dedup, db, generator, memory, image_handler, exporter, projects
+          print("import graph OK")
+          PY
+      - name: supabase schema-aware client 契约 (TV 通道 2 sync 依赖)
+        run: |
+          python - <<'PY'
+          # 复刻 db.py 的真实 import 路径与构造方式; 任何一处变了 CI 先红。
+          from supabase import create_client, Client
+          from supabase.client import ClientOptions
+          client = create_client(
+              "https://placeholder.supabase.co",
+              "sb_secret_placeholder",
+              options=ClientOptions(schema="autowriter"),
+          )
+          assert hasattr(client, "schema"), "supabase-py changed .schema() API"
+          assert hasattr(client, "table"), "supabase-py changed .table() API"
+          print("schema-aware client OK")
+          PY
