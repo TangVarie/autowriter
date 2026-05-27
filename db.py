@@ -3105,63 +3105,123 @@ def update_job_progress(
         telemetry.log_event("job_progress_failed", job_id=str(job_id), error=str(exc)[:200])
 
 
-def heartbeat_job(client: Client, job_id: str) -> None:
-    """worker 心跳线程刷 heartbeat_at; sweeper 据此判断 worker 是否还活着。"""
+def heartbeat_job(client: Client, job_id: str, worker_id: Optional[str] = None) -> None:
+    """worker 心跳线程刷 heartbeat_at; sweeper 据此判断 worker 是否还活着。
+
+    CAS: 传 worker_id 时只在 claimed_by 仍是本 worker 时刷新。否则一个心跳曾
+    失联、job 已被 sweeper 退回 + 他人重领的 stale worker, 其心跳线程会把别人的
+    行"续命", 让那行永远不被 sweeper 回收（僵尸保活）。
+    """
     try:
-        client.table("jobs").update({"heartbeat_at": _now_iso()}).eq("id", job_id).execute()
+        q = client.table("jobs").update({"heartbeat_at": _now_iso()}).eq("id", job_id)
+        if worker_id is not None:
+            q = q.eq("claimed_by", worker_id)
+        q.execute()
     except Exception as exc:
         telemetry.log_event("job_heartbeat_failed", job_id=str(job_id), error=str(exc)[:200])
 
 
-def finish_job_success(client: Client, job_id: str, result: Optional[dict] = None) -> None:
-    """handler 成功返回 → 置 success + 100% + 写 result。"""
-    client.table("jobs").update({
-        "status": "success",
-        "finished_at": _now_iso(),
-        "progress_pct": 100,
-        "result": result or {},
-    }).eq("id", job_id).execute()
+def finish_job_success(
+    client: Client, job_id: str, result: Optional[dict] = None,
+    worker_id: Optional[str] = None,
+) -> bool:
+    """handler 成功返回 → 置 success + 100% + 写 result。
+
+    CAS: 只在仍 ``status='running'`` 且（传了 worker_id 时）``claimed_by=worker_id``
+    时写。防止本 worker 心跳曾失联 → sweeper 退回 → 他人重领后, 这个 stale worker
+    迟到的成功覆盖掉新 attempt 的状态/结果, 或盖掉用户已取消的 job。
+    返回是否真的写入（False = 行已不归本 worker, 跳过）。
+    """
+    q = (
+        client.table("jobs")
+        .update({"status": "success", "finished_at": _now_iso(),
+                 "progress_pct": 100, "result": result or {}})
+        .eq("id", job_id).eq("status", "running")
+    )
+    if worker_id is not None:
+        q = q.eq("claimed_by", worker_id)
+    res = q.execute()
+    if not res.data:
+        telemetry.log_event("job_finish_skipped_not_owner", job_id=str(job_id), worker=worker_id)
+    return bool(res.data)
 
 
-def mark_job_failed(client: Client, job_id: str, error_text: str) -> None:
-    """直接置 failed（无重试语义）。用于"无 handler"等不该重试的情形。"""
-    client.table("jobs").update({
-        "status": "failed",
-        "finished_at": _now_iso(),
-        "error_text": error_text,
-    }).eq("id", job_id).execute()
+def mark_job_failed(
+    client: Client, job_id: str, error_text: str, worker_id: Optional[str] = None,
+) -> bool:
+    """直接置 failed（无重试语义）。用于"无 handler"等不该重试的情形。
+
+    CAS: 同 finish_job_success —— 只在 running +（可选）claimed_by 命中时写,
+    不覆盖已被重领/取消/完成的行。返回是否真的写入。
+    """
+    q = (
+        client.table("jobs")
+        .update({"status": "failed", "finished_at": _now_iso(), "error_text": error_text})
+        .eq("id", job_id).eq("status", "running")
+    )
+    if worker_id is not None:
+        q = q.eq("claimed_by", worker_id)
+    res = q.execute()
+    if not res.data:
+        telemetry.log_event("job_fail_skipped_not_owner", job_id=str(job_id), worker=worker_id)
+    return bool(res.data)
 
 
-def fail_or_requeue_job(client: Client, job: dict, error_text: str) -> str:
-    """handler 抛错后的处理: 还有重试次数 → 回 pending + 指数退避; 否则 failed。
+def fail_or_requeue_job(
+    client: Client, job: dict, error_text: str,
+    expected_claimed_by: Optional[str] = None,
+) -> str:
+    """handler 抛错 / sweeper 回收后的处理: 还有重试次数 → 回 pending + 指数退避;
+    否则 failed。退避 = 30 × 2^(attempts-1) 秒（30 / 60 / 120 …）。attempts 已在
+    claim 时 +1, 所以这里直接比 ``attempts >= max_attempts``。
 
-    退避 = 30 × 2^(attempts-1) 秒（30 / 60 / 120 …）。attempts 已在 claim 时
-    +1, 所以这里直接比 ``attempts >= max_attempts``。返回新 status。
+    CAS（防并发互踩, review #1/#3）: 只在行仍 active（claimed/running）且（传了
+    ``expected_claimed_by`` 时）claimed_by 仍是该值才写。
+      - worker 异常路径: ``expected_claimed_by`` = 本 WORKER_ID
+      - sweeper 路径: ``expected_claimed_by`` = 候选行的 claimed_by（那个疑似死掉
+        的 worker）
+    这样 sweeper 读候选后、写之前若行已被另一 worker 重领（claimed_by 变了）或已
+    完成/取消（status 变了）, CAS 落空跳过, 不会把别人的 running 打回 pending 造成
+    重复执行 / 丢进度。返回新 status: ``'failed'`` / ``'pending'`` / ``'skipped'``。
     """
     attempts = int(job.get("attempts") or 0)
     max_attempts = int(job.get("max_attempts") or 1)
     if attempts >= max_attempts:
-        mark_job_failed(client, job["id"], error_text)
-        return "failed"
-    backoff = 30 * (2 ** max(0, attempts - 1))
-    next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
-    client.table("jobs").update({
-        "status": "pending",
-        "error_text": error_text,
-        "next_retry_at": next_retry,
-        # 清掉 claim 痕迹, 让它能被重新领取
-        "claimed_by": None,
-        "claimed_at": None,
-        "heartbeat_at": None,
-        "started_at": None,
-    }).eq("id", job["id"]).execute()
-    return "pending"
+        patch: dict[str, Any] = {
+            "status": "failed", "finished_at": _now_iso(), "error_text": error_text,
+        }
+        target = "failed"
+    else:
+        backoff = 30 * (2 ** max(0, attempts - 1))
+        next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
+        patch = {
+            "status": "pending", "error_text": error_text, "next_retry_at": next_retry,
+            # 清掉 claim 痕迹, 让它能被重新领取
+            "claimed_by": None, "claimed_at": None, "heartbeat_at": None, "started_at": None,
+        }
+        target = "pending"
+    q = (
+        client.table("jobs").update(patch)
+        .eq("id", job["id"]).in_("status", ["claimed", "running"])
+    )
+    if expected_claimed_by is not None:
+        q = q.eq("claimed_by", expected_claimed_by)
+    res = q.execute()
+    if not res.data:
+        telemetry.log_event(
+            "job_requeue_skipped",
+            job_id=str(job.get("id")), expected_claimed_by=expected_claimed_by,
+        )
+        return "skipped"
+    return target
 
 
 def sweep_dead_jobs(client: Client, timeout_seconds: int) -> int:
     """把心跳超时的 claimed/running job 退回重试 / 置 failed（超次数）。
 
-    worker 主循环 idle 时定期调一次。返回回收的 job 数。失败安全（埋点不抛）。
+    worker 主循环定期调一次。返回回收的 job 数。失败安全（埋点不抛）。
+    每条退回都带 ``expected_claimed_by=候选行的 claimed_by`` 做 CAS, 防止读候选
+    后、写之前该行已被另一 worker 重领 —— 那种情况跳过, 不打断新 worker（review #3）。
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)).isoformat(timespec="seconds")
     try:
@@ -3178,11 +3238,13 @@ def sweep_dead_jobs(client: Client, timeout_seconds: int) -> int:
     recovered = 0
     for job in dead:
         try:
-            fail_or_requeue_job(
+            new_status = fail_or_requeue_job(
                 client, job,
                 f"heartbeat stale (cutoff={cutoff}); worker likely died, recovered by sweeper",
+                expected_claimed_by=job.get("claimed_by"),
             )
-            recovered += 1
+            if new_status != "skipped":
+                recovered += 1
         except Exception as exc:
             telemetry.log_event(
                 "job_sweep_recover_failed",

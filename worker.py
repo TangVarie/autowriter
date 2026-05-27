@@ -130,7 +130,7 @@ def _heartbeat_loop(sb, job_id: str, stop_event: threading.Event) -> None:
     重复执行。独立心跳线程让长调用期间心跳照常。
     """
     while not stop_event.is_set():
-        db.heartbeat_job(sb, job_id)
+        db.heartbeat_job(sb, job_id, worker_id=WORKER_ID)
         stop_event.wait(HEARTBEAT_INTERVAL)
 
 
@@ -141,7 +141,9 @@ def process_one(sb, job: dict) -> None:
     handler = HANDLERS.get(kind)
     if handler is None:
         # 无 handler 不该重试(重试也还是没 handler) → 直接 failed。
-        db.mark_job_failed(sb, job_id, f"no handler registered for kind={kind}")
+        db.mark_job_failed(
+            sb, job_id, f"no handler registered for kind={kind}", worker_id=WORKER_ID,
+        )
         telemetry.log_event("job_no_handler", job_id=str(job_id), kind=kind)
         return
 
@@ -152,13 +154,17 @@ def process_one(sb, job: dict) -> None:
     hb.start()
     try:
         result = handler(job, sb)
+        # worker_id 守 CAS: 若处理期间本 job 已被 sweeper 退回 + 他人重领,
+        # 这次成功会被跳过(不覆盖新 attempt)。
         db.finish_job_success(
             sb, job_id, result if isinstance(result, dict) else {"result": result},
+            worker_id=WORKER_ID,
         )
         telemetry.log_event("job_success", job_id=str(job_id), kind=kind, worker=WORKER_ID)
     except Exception:
         tb = traceback.format_exc()
-        new_status = db.fail_or_requeue_job(sb, job, tb)
+        # expected_claimed_by=本 worker: 仅当这行仍归我时才退回/置败。
+        new_status = db.fail_or_requeue_job(sb, job, tb, expected_claimed_by=WORKER_ID)
         telemetry.log_event(
             "job_error", job_id=str(job_id), kind=kind,
             status=new_status, error=tb[:300],
@@ -189,9 +195,12 @@ def main() -> None:
     telemetry.log_event("worker_start", worker=WORKER_ID, kinds=WORKER_KINDS or "ALL")
     while not _shutdown.is_set():
         try:
+            # review #2: sweep 放在领取之前、每轮都调用(内部按 SWEEP_INTERVAL
+            # 时间节流)。之前只在"队列空"分支扫, 持续 backlog 下永远不扫 →
+            # 崩掉的 worker 留下的 running 行得不到回收。
+            maybe_sweep(sb)
             job = db.claim_one_job(sb, WORKER_ID, WORKER_KINDS)
             if job is None:
-                maybe_sweep(sb)
                 _shutdown.wait(POLL_INTERVAL)
                 continue
             process_one(sb, job)
