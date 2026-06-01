@@ -27,10 +27,10 @@ ANTHROPIC_API_KEY: str = _get_secret("ANTHROPIC_API_KEY")
 ANTHROPIC_BASE_URL: str = _get_secret("ANTHROPIC_BASE_URL")
 
 # Available Claude models: model_id -> display label
-# 仅保留 Anthropic 官方当前 GA + 中转站实际支持的模型（截至 2026-05）。
+# 仅保留 Anthropic 官方当前 GA + 中转站实际支持的模型（截至 2026-06）。
 # Retired 已删（Claude 3 全系列、Sonnet/Opus 4.0 一代——后者 2026-04-20 下线）。
 # Thinking 模式仍走 -thinking 后缀（中转站约定，非官方 API 参数）；4-6 / 4-7
-# 系列中转站未提供 thinking 变体，故不列。
+# 系列中转站未提供 thinking 变体，故不列；4-8 中转站提供 thinking 变体，已列出。
 CLAUDE_MODELS: dict[str, str] = {
     # ── Haiku ─────────────────────────────────────────────
     "claude-haiku-4-5-20251001":           "Haiku 4.5（最快/最省）",
@@ -38,7 +38,9 @@ CLAUDE_MODELS: dict[str, str] = {
     "claude-sonnet-4-6":                   "Sonnet 4.6",
     # ── Opus ──────────────────────────────────────────────
     "claude-opus-4-6":                     "Opus 4.6",
-    "claude-opus-4-7":                     "Opus 4.7（最强）",
+    "claude-opus-4-7":                     "Opus 4.7",
+    "claude-opus-4-8":                     "Opus 4.8（最新，最强）",
+    "claude-opus-4-8-thinking":            "Opus 4.8 Thinking（深度推理）",
 }
 
 # Default model (can be overridden via env var)
@@ -175,6 +177,9 @@ MODEL_PRICING: dict[str, dict[str, float]] = {
     "claude-sonnet-4-6":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
     "claude-opus-4-6":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
     "claude-opus-4-7":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
+    # opus-4-8 与 4-5/4-6/4-7 同档（中转站 Opus 统一价）。``claude-opus-4-8-thinking``
+    # 经 get_pricing 最长前缀匹配命中本档，无需单列；若中转站对 4-8 单独定价，改这里。
+    "claude-opus-4-8":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
     # ── Claude 已下线但 DB 历史 batch 仍引用（仅用于成本回算）──────────
     # 2026-05 中转站新分组下线; 用户的历史 batch 大量用这些 model id
     "claude-sonnet-4-5":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
@@ -300,6 +305,7 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "claude-sonnet-4-6":  200_000,
     "claude-opus-4-6":    200_000,
     "claude-opus-4-7":    200_000,
+    "claude-opus-4-8":    200_000,
     "gemini-pro":         1_000_000,
     "gemini-flash":       1_000_000,
     "gemini-flash-lite":  1_000_000,
