@@ -1412,16 +1412,21 @@ def _queue_banner_body() -> None:
         n_total   = len(comp_list)
         n_empty   = sum(1 for c in comp_list if not c.get("saved"))
         n_content = n_total - n_empty
+        # 没进 completed 的计划 = 落库前就崩了 / setup 失败（缺 system prompt 等）/
+        # 被中途停掉 —— 它们只 append 到 errors、不进 completed。这些和"完成但 0 内容"
+        # 一样都算失败，不能当成绿色"提示"放过（review #39：否则崩在 append 之前的
+        # 计划会被 elif 分支伪装成 advisory ✅）。
+        n_no_content = n_empty + max(0, total - n_total)
         # 同一个 API 错误会按每条版本重复 N 次，去重后再展示，免得糊一整屏。
         uniq_errors = list(dict.fromkeys(errors))
         bcol_txt, bcol_btn = st.columns([5, 1])
         with bcol_txt:
-            if n_empty:
+            if n_no_content:
                 sample = "；".join(uniq_errors[:4])
                 more = f"…（另有 {len(uniq_errors) - 4} 条）" if len(uniq_errors) > 4 else ""
                 st.warning(
-                    f"⚠️ 队列完成：{n_content}/{n_total} 个批次有内容，"
-                    f"**{n_empty} 个批次 0 内容**（模型 API 报错或超额，未保存）。"
+                    f"⚠️ 队列完成：{n_content}/{total} 个批次有内容，"
+                    f"**{n_no_content} 个批次没产出内容**（模型 API 报错/超额，或计划失败/中断）。"
                     + (f"\n\n错误：{sample}{more}" if uniq_errors else "")
                 )
             elif uniq_errors:
