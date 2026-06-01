@@ -149,11 +149,35 @@ def _save_batch_results(
       - produced_titles  ：[{"title", "opening"}, ...]，用来喂跨批文本去重池
 
     生成失败的版本（vr.error & 空 title）按引擎名写到 ``errors_sink``，
-    并跳过保存。``error_prefix`` 控制日志前缀，例如 "计划 3（项目 A）"。
+    并跳过保存。某个 slot 的所有 version 都失败时，**不再为它创建 item** ——
+    避免审核页出现没有任何 version 的孤儿 item（统计卡显示"总计 N / 待审核 N"
+    却一条都点不开），把"整批生成失败"伪装成"成功但 0 内容"。
+    ``error_prefix`` 控制日志前缀，例如 "计划 3（项目 A）"。
     """
-    # 步骤 1：拼 items 的批量行，每个 slot 一条
-    item_rows: list[dict] = []
+    # 步骤 1：先按 slot 筛出有效 version（生成失败且无标题的丢弃 + 记错误）。
+    #   关键修复：只为"至少有一条有效 version"的 slot 建 item。否则当某个 slot 的
+    #   所有引擎都生成失败时（例如 Gemini 中转通道整批报错），旧逻辑仍会给它建一个
+    #   没有任何 version 的孤儿 item —— 审核页就会出现"总计 N / 待审核 N"却一条都点
+    #   不开（渲染时 item.versions 为空被 skip），用户看到的是"成功但没内容"。
+    valid_slots: list[tuple[dict, list]] = []
     for slot in generation_results:
+        valid_versions = []
+        for vr in slot["versions"]:
+            if vr.error and not vr.title:
+                errors_sink.append(f"{error_prefix}· {vr.ai_engine}：{vr.error}")
+                continue
+            valid_versions.append(vr)
+        if valid_versions:
+            valid_slots.append((slot, valid_versions))
+
+    # 整批没有任何有效内容：不建任何 item / version，直接返回空三元组。调用方据此
+    # 把 saved=0 当作"失败"展示（⚠️ 而不是绿色 ✅），且审核页不会被孤儿 item 污染。
+    if not valid_slots:
+        return [], [], []
+
+    # 步骤 2：只为有内容的 slot 批量建 item
+    item_rows: list[dict] = []
+    for slot, _ in valid_slots:
         item_rows.append({
             "batch_id": batch_id,
             "user_id":  user_id,
@@ -164,16 +188,13 @@ def _save_batch_results(
         inserted_items = db.bulk_create_items(db_client, item_rows)
     except Exception as exc:
         errors_sink.append(f"{error_prefix}批量写入 items 失败 — {exc}")
-        inserted_items = []
+        return [], [], []
 
-    # 步骤 2：从生成结果里抽 versions 行 + 顺便构造文本去重池要的 opening
+    # 步骤 3：从有效 version 抽 versions 行 + 顺便构造文本去重池要的 opening
     version_rows: list[dict] = []
     produced_titles: list[dict] = []
-    for slot, item in zip(generation_results, inserted_items):
-        for vr in slot["versions"]:
-            if vr.error and not vr.title:
-                errors_sink.append(f"{error_prefix}· {vr.ai_engine}：{vr.error}")
-                continue
+    for (slot, valid_versions), item in zip(valid_slots, inserted_items):
+        for vr in valid_versions:
             version_rows.append({
                 "item_id":     item["id"],
                 "ai_engine":   vr.ai_engine,
@@ -190,7 +211,7 @@ def _save_batch_results(
             if vr.title:
                 produced_titles.append({"title": vr.title.strip(), "opening": opening})
 
-    # 步骤 3：批量插 versions
+    # 步骤 4：批量插 versions
     inserted_versions: list[dict] = []
     try:
         inserted_versions = db.bulk_create_initial_versions(db_client, version_rows)
@@ -1387,12 +1408,30 @@ def _queue_banner_body() -> None:
                     if evt:
                         evt.set()
     elif qs.get("done"):
+        comp_list = qs.get("completed", [])
+        n_total   = len(comp_list)
+        n_empty   = sum(1 for c in comp_list if not c.get("saved"))
+        n_content = n_total - n_empty
+        # 同一个 API 错误会按每条版本重复 N 次，去重后再展示，免得糊一整屏。
+        uniq_errors = list(dict.fromkeys(errors))
         bcol_txt, bcol_btn = st.columns([5, 1])
         with bcol_txt:
-            if errors:
-                st.warning(f"✅ 队列完成 — {completed}/{total} 成功，{len(errors)} 失败：" + "；".join(errors))
+            if n_empty:
+                sample = "；".join(uniq_errors[:4])
+                more = f"…（另有 {len(uniq_errors) - 4} 条）" if len(uniq_errors) > 4 else ""
+                st.warning(
+                    f"⚠️ 队列完成：{n_content}/{n_total} 个批次有内容，"
+                    f"**{n_empty} 个批次 0 内容**（模型 API 报错或超额，未保存）。"
+                    + (f"\n\n错误：{sample}{more}" if uniq_errors else "")
+                )
+            elif uniq_errors:
+                # 有内容但带提示（去重命中 / 硬约束标记等）：如实展示，但不报成失败。
+                st.info(
+                    f"✅ 队列完成！{n_total} 个批次已保存，另有 {len(uniq_errors)} 条提示："
+                    + "；".join(uniq_errors[:4])
+                )
             else:
-                st.success(f"✅ 队列完成！{completed} 个批次已保存 — {msg}")
+                st.success(f"✅ 队列完成！{n_total} 个批次已保存 — {msg}")
         with bcol_btn:
             if st.button("清除", key="clear_queue_status", use_container_width=True):
                 st.session_state.pop("queue_state", None)
@@ -3568,10 +3607,17 @@ def _render_queue_tab_body() -> None:
     if qs.get("done") and qs.get("completed"):
         st.markdown("<div class='section-label' style='margin-top:16px'>已完成的批次</div>", unsafe_allow_html=True)
         for item in qs["completed"]:
-            st.success(
-                f"✅ {item['project_name']} · 批次 {item['batch_id'][:8]}… · "
-                f"已保存 {item['saved']} 个版本"
-            )
+            saved = item.get("saved", 0)
+            head = f"{item['project_name']} · 批次 {item['batch_id'][:8]}…"
+            if saved > 0:
+                st.success(f"✅ {head} · 已保存 {saved} 个版本")
+            else:
+                # saved==0 = 整批一条都没生成出来（模型 API 报错 / 超额）。绝不能再
+                # 显示绿色 ✅，否则用户以为成功了，去审核页却空空如也、还摸不着头脑。
+                st.warning(
+                    f"⚠️ {head} · 生成失败，0 个版本"
+                    "（模型 API 报错或超额，未保存任何内容；详见上方完成提示）"
+                )
 
 
 # 包成 fragment：高频交互（加/删/改 plan）只 rerun 本 fragment 而不是整页，
@@ -3972,11 +4018,27 @@ def page_review(project: dict) -> None:
     # Trade-off：顶部 stat row 的"待审 X 篇"数字在卡片状态变后不立刻更新，
     # 等下次自然 page rerun（切批次 / 切 tab / 刷页）才刷新。可接受 —— 用户
     # 最关心的是"我点了通过那张卡片变了没"，统计数字延迟无感。
+    rendered = 0
+    skipped_no_version = 0
     for item in filtered_items:
         versions = sorted(item.get("versions", []), key=lambda v: v.get("version_num", 0))
         if not versions:
+            # 没有任何 version 的孤儿 item —— 通常是生成时模型 API 整批报错留下的
+            # （例如 Gemini 中转通道挂掉/超额）。不渲染空卡片，但记下来：若整屏都是
+            # 这种，下面给一句明确解释，免得用户看到"总计 N / 待审核 N"却一条都点不
+            # 开，误以为是审核页坏了。
+            skipped_no_version += 1
             continue
         _render_item_card_fragment(item, versions, selected_batch, project)
+        rendered += 1
+
+    if rendered == 0 and skipped_no_version > 0:
+        st.warning(
+            f"⚠️ 本批次有 {skipped_no_version} 条记录，但**都没有生成出内容**"
+            "（生成时模型 API 报错或超额，没有保存任何版本）。\n\n"
+            "这批是空的，不是审核页的问题。建议：①换其它模型（如 Claude）重新生成；"
+            "②到「05 · 设置」确认该引擎的 API key / 中转额度是否正常。"
+        )
 
     # ── 太子自动学习：批次审完后静默更新调教笔记 ──────────────────────────
     # 触发条件：本批次没有任何 pending 项（用户对每一条都做了决定 —— 不论是
