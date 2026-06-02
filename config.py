@@ -78,6 +78,14 @@ SUPABASE_SERVICE_ROLE_KEY: str = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
 # ── Feishu (Lark) Webhook ──────────────────────────────────────────────────
 FEISHU_WEBHOOK_URL: str = _get_secret("FEISHU_WEBHOOK_URL")
 
+# ── Flywheel librarian (TV pull 馆员, R-032) ─────────────────────────────────
+# 写稿时向 TV 的 LLM 馆员服务借阅匹配的"真实爆款经验"注入 P2(见 docs/15 +
+# librarian_client.py)。URL/KEY 由 TV 侧给(部署在 Railway)。
+# 留空 = 不接飞轮:写稿照常, 只是少了"真实爆款参照"这一节(纯增强项, 非前置依赖)。
+LIBRARIAN_URL: str = _get_secret("LIBRARIAN_URL")       # 例 https://truth-vault-production.up.railway.app
+LIBRARIAN_API_KEY: str = _get_secret("LIBRARIAN_API_KEY")
+LIBRARIAN_TIMEOUT_SEC: float = float(_get_secret("LIBRARIAN_TIMEOUT_SEC") or "8")
+
 # ── Memory system thresholds ───────────────────────────────────────────────
 MEMORY_AUTO_CONFIRM_THRESHOLD: int = int(
     os.environ.get("MEMORY_AUTO_CONFIRM_THRESHOLD", "3")

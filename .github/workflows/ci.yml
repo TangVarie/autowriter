@@ -27,6 +27,7 @@ jobs:
           python - <<'PY'
           import config, clients, telemetry, logger_utils, validator
           import dedup, db, generator, memory, image_handler, exporter, projects
+          import librarian_client  # R-032: TV 飞轮馆员 pull 客户端(import 安全, 用 requests)
           import worker  # R-018: 后台 worker 入口(import 安全, main() 在 __main__ 守卫内)
           print("import graph OK")
           PY
