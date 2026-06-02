@@ -31,6 +31,7 @@ import dedup as dedup_module
 import telemetry
 import validator
 import logger_utils  # R-023: 错误展示前脱敏 secret
+import librarian_client  # R-032: TV 飞轮馆员 pull 客户端
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -1067,6 +1068,17 @@ def _queue_worker_impl(
             # 直接传给 generator —— Claude 路径会按 cache_control 分层、
             # Gemini 路径会拼回单字符串。跟 build_system_prompt 返回的字符串
             # byte-identical（layered_system_prompt_to_string 验证过）。
+            # ── R-032: 向 TV 飞轮馆员借阅"真实爆款经验"（pull 模型, docs/15）。
+            # 失败/超时/未配 → []，下面 P2 那节自动不出现，写稿照常用 owner 自有正例。
+            flywheel_lessons = librarian_client.fetch_flywheel_lessons(
+                librarian_client.build_brief(
+                    project,
+                    tactic=tactic,
+                    target_audience=plan.get("target_audience", ""),
+                    tone=plan.get("tone", ""),
+                    extra_instructions=plan.get("extra_instructions", ""),
+                )
+            )
             full_system_prompt = mem_module.build_layered_system_prompt(
                 base_prompt=base_prompt,
                 global_memories=global_mems_for_plan,
@@ -1076,6 +1088,7 @@ def _queue_worker_impl(
                 positive_examples=pos_examples or None,
                 negative_examples=neg_examples or None,
                 session_instructions=session_instr or None,
+                flywheel_lessons=flywheel_lessons or None,
                 report_sink=inject_report,
             )
             metrics.set_meta("injection", inject_report)
@@ -3076,6 +3089,16 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # Day 4：注入可视化（quick gen 与 queue worker 行为一致）
         # Phase 1：同 worker 路径，用 layered builder。
         inject_report: dict = {"filtered": []}
+        # ── R-032: 同 _queue_worker_impl —— 借阅飞轮经验注入 P2（fail-open 成 []）。
+        flywheel_lessons = librarian_client.fetch_flywheel_lessons(
+            librarian_client.build_brief(
+                project,
+                tactic=tactic,
+                target_audience=plan.get("target_audience", ""),
+                tone=plan.get("tone", ""),
+                extra_instructions=extra_instr,
+            )
+        )
         full_system_prompt = mem_module.build_layered_system_prompt(
             base_prompt=project.get("system_prompt", ""),
             global_memories=global_mems,
@@ -3085,6 +3108,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             positive_examples=pos_examples or None,
             negative_examples=neg_examples or None,
             session_instructions=session_instr or None,
+            flywheel_lessons=flywheel_lessons or None,
             report_sink=inject_report,
         )
         metrics.set_meta("injection", inject_report)
