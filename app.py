@@ -1074,6 +1074,7 @@ def _queue_worker_impl(
                 librarian_client.build_brief(
                     project,
                     tactic=tactic,
+                    key_messages=plan.get("key_messages", ""),
                     target_audience=plan.get("target_audience", ""),
                     tone=plan.get("tone", ""),
                     extra_instructions=plan.get("extra_instructions", ""),
@@ -3094,6 +3095,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             librarian_client.build_brief(
                 project,
                 tactic=tactic,
+                key_messages=plan.get("key_messages", ""),
                 target_audience=plan.get("target_audience", ""),
                 tone=plan.get("tone", ""),
                 extra_instructions=extra_instr,

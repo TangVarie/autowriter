@@ -266,8 +266,13 @@ def build_layered_system_prompt(
         for L in flywheel_lessons[:5]:
             if not isinstance(L, dict):
                 continue
+            # R-032 回执 §8.3:structure(结构)+ transferable_tactic(可迁移手法)
+            # 是经验卡核心(策展员就提炼这两样),一并注入。tier 不注入(轻量信号、
+            # 价值低),source_note_id 不注入(内部 id、对模型是噪音)。
             fw_blocks.append(
-                f"· 钩子：{L.get('hook_type') or '?'}｜为何有效：{L.get('why_it_worked') or ''}\n"
+                f"· 钩子：{L.get('hook_type') or '?'}｜结构：{L.get('structure') or '?'}"
+                f"｜为何有效：{L.get('why_it_worked') or ''}\n"
+                f"  可迁移手法：{L.get('transferable_tactic') or ''}\n"
                 f"  借这条的：{L.get('borrow_what') or ''}（相关性：{L.get('why_relevant') or ''}）\n"
                 f"  原文片段：{(L.get('excerpt') or '')[:200]}"
             )

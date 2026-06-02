@@ -46,6 +46,7 @@ def build_brief(
     project: dict,
     *,
     tactic: str = "",
+    key_messages: str = "",
     target_audience: str = "",
     tone: str = "",
     extra_instructions: str = "",
@@ -53,9 +54,10 @@ def build_brief(
 ) -> dict:
     """组装借阅 brief:项目级稳定字段(馆员会 prompt-cache 这部分)+ 本批 delta。
 
-    字段集严格对齐 docs/15 §0 的契约。``project`` 缺某列时对应值为 ``None``,
-    馆员服务会按缺失处理(不会 500)。``draft_topic`` 可选——有本次选题/主题
-    时填上,匹配更准;没有就不带这一键。
+    字段集对齐 docs/15 §0 契约(R-032 回执:delta 加了 ``key_messages``,馆员
+    按同卖点优先匹配)。``project`` 缺某列时对应值为 ``None``,馆员服务按缺失
+    处理(不会 500)。``draft_topic`` 可选——核心卖点走 ``key_messages`` 自己的
+    槽,与"选题"语义不同,aw 暂无真选题字段时不带这一键。
     """
     brief = {
         "consumer": "autowriter",
@@ -70,6 +72,7 @@ def build_brief(
         "calibration_notes": project.get("calibration_notes"),
         # —— 本次 batch 的 delta ——
         "tactic": tactic,
+        "key_messages": key_messages,
         "target_audience": target_audience,
         "tone": tone,
         "extra_instructions": extra_instructions,
