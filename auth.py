@@ -129,13 +129,35 @@ def get_supabase_client() -> Client:
     return db.get_client()
 
 
+def _fresh_auth_client() -> Client:
+    """R-037: 专供 auth 状态操作的一次性 client(不缓存、不共享)。
+
+    ``db.get_client()`` 返回 ``@st.cache_resource`` 的**进程级匿名单例**;
+    GoTrue 会把 sign_in / refresh 得到的 session 存进 client 实例 —— 多用户
+    并发时, 用户 A 的 ``sign_out()`` 吊销的是该共享实例上最后存的 session
+    (可能是用户 B 的), A 自己 cookie 里的 refresh token 反而留在服务端直到
+    过期。所有 auth 状态操作(sign_up / sign_in / refresh / sign_out)一律用
+    本函数的 throwaway client; 数据读写路径(per-token postgrest client)
+    不受影响、照旧走 ``db.get_client``。
+
+    ``auto_refresh_token=False``: 一次性 client 不需要 GoTrue 的后台刷新
+    定时器, 关掉避免 throwaway 对象留下 timer 引用。
+    """
+    from supabase import create_client
+    from supabase.client import ClientOptions
+    return create_client(
+        config.SUPABASE_URL, config.SUPABASE_ANON_KEY,
+        options=ClientOptions(schema="autowriter", auto_refresh_token=False),
+    )
+
+
 def sign_up(email: str, password: str) -> dict:
     """
     Register a new user.
     Returns {"user": ..., "session": ..., "email_confirmation_required": bool}.
     Raises on hard errors (e.g. email already registered, rate limit).
     """
-    client = get_supabase_client()
+    client = _fresh_auth_client()
     res = client.auth.sign_up({"email": email, "password": password})
     if res.user is None:
         raise ValueError("注册失败，请稍后重试。")
@@ -149,7 +171,7 @@ def sign_up(email: str, password: str) -> dict:
 
 def sign_in(email: str, password: str) -> dict:
     """Sign in with email/password. Raises on error."""
-    client = get_supabase_client()
+    client = _fresh_auth_client()
     res = client.auth.sign_in_with_password({"email": email, "password": password})
     if res.user is None:
         raise ValueError("邮箱或密码不正确。")
@@ -166,9 +188,20 @@ def sign_out() -> None:
     """
     if "supabase_session" in st.session_state:
         try:
-            client = get_supabase_client()
-            client.auth.sign_out()
+            # R-037: 把**本用户**的 session 装到一次性 client 上再 sign_out,
+            # 吊销的才是自己的 refresh token。旧实现在共享单例上裸调
+            # auth.sign_out() —— 吊销的是单例上最后存的 session(多用户下
+            # 可能注销掉别人), 而自己的 token 反而不被服务端吊销。
+            session = st.session_state.get("supabase_session")
+            at = getattr(session, "access_token", None) or st.session_state.get("access_token")
+            rt = getattr(session, "refresh_token", None)
+            if at and rt:
+                client = _fresh_auth_client()
+                client.auth.set_session(at, rt)
+                client.auth.sign_out()
         except Exception:
+            # 服务端吊销失败(网络/票据已过期)不阻塞本地登出 —— 与旧行为一致;
+            # cookie 与 session_state 在下方照常清理。
             pass
     cm = st.session_state.get("_xhs_auth_cm_ref")
     _clear_refresh_cookie(cm)
@@ -238,7 +271,9 @@ def _try_refresh_session(cm) -> bool:
     if not session or not hasattr(session, "refresh_token") or not session.refresh_token:
         return False
     try:
-        client = get_supabase_client()
+        # R-037: refresh 也走一次性 client —— 在共享单例上 refresh 会把本
+        # 用户的 session 存进单例, 污染其他用户的 auth 状态(见 _fresh_auth_client)。
+        client = _fresh_auth_client()
         res = client.auth.refresh_session(session.refresh_token)
         if res.session and res.user:
             _store_session({"session": res.session, "user": res.user}, cm=cm)
@@ -254,7 +289,8 @@ def _try_cookie_restore(cm, refresh_token: Optional[str]) -> bool:
     if not refresh_token:
         return False
     try:
-        client = get_supabase_client()
+        # R-037: 同 _try_refresh_session —— 一次性 client, 不污染共享单例。
+        client = _fresh_auth_client()
         res = client.auth.refresh_session(refresh_token)
         if res.session and res.user:
             _store_session({"session": res.session, "user": res.user}, cm=cm)
