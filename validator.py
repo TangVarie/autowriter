@@ -61,9 +61,17 @@ _NEG_PREFIXES = (
 _POS_PREFIXES = ("必须包含", "必须出现", "必须带", "需要包含", "需要出现")
 
 # 字符上限模式 "X不超过/最多N字" 或 "X≤N字"
+# R-041: 放宽常见中文变体 —— "不超过20个字"(量词 个)、"控制在20字以内"。
+# 锚点仍是 scope 词 + 数字 + 字, 无误报面。
 _LEN_PATTERN = re.compile(
-    r"(?P<scope>标题|正文|开头|结尾|关键词)\s*(?:不超过|最多|≤|<=|不能超过)\s*(?P<n>\d+)\s*字"
+    r"(?P<scope>标题|正文|开头|结尾|关键词)\s*"
+    r"(?:不超过|最多|≤|<=|不能超过|控制在)\s*(?P<n>\d+)\s*个?字(?:以内|之内)?"
 )
+
+# R-041: 无引号回退里的"性质描述"拦截 —— "标题不要太长"会被抠成字面禁用词
+# "太长"(文案里出现"太长"两个字即误报违规)。程度副词开头的目标是对性质的
+# 描述, 不是可字面匹配的词, 一律放弃机械化、留给 LLM 复检。
+_PROPERTY_TARGET = re.compile(r"^(太|过于|过|很|比较|偏)")
 
 
 def _extract_target(rule: str, prefix: str) -> Optional[str]:
@@ -86,10 +94,18 @@ def _extract_target(rule: str, prefix: str) -> Optional[str]:
     # 否则取到下一个标点或行末（限 ≤ 12 字，避免抓到一整句话）
     m = re.match(r"([^，。,.\n;；]{1,12})", after)
     if m:
-        target = m.group(1).strip()
+        # R-041: 剥掉边缘残留的引号字符 —— 配对引号在上面已处理, 落到这里
+        # 的单边引号(如 "'最'字" 截断后)是噪音, 留着会让字面匹配永不命中。
+        target = m.group(1).strip().strip("'\"‘’“”「」『』")
         # 排除明显的副词/介词残留（如"任何"、"过多"）
-        if target and not target.startswith(("任何", "过多", "太多", "一些")):
-            return target
+        if not target or target.startswith(("任何", "过多", "太多", "一些")):
+            return None
+        # R-041: 程度副词开头的目标是"性质描述"不是字面词("标题不要太长"
+        # 抠出"太长"后, 文案里出现这两个字就误报违规)。放弃机械化, 留给
+        # LLM 复检。
+        if _PROPERTY_TARGET.match(target):
+            return None
+        return target
     return None
 
 
@@ -152,17 +168,26 @@ def _parse_rule(rule_content: str) -> Optional[dict]:
     if m:
         return {"kind": "max_len", "scope": m.group("scope"), "n": int(m.group("n"))}
 
-    # 禁用词：抓"禁止 X" / "不要 X" 等
+    # R-041: 否定/肯定前缀按**在文本中的出现位置**选择, 不再按"否定列表优先"。
+    # 规则的领头动词决定意图 —— 旧实现先扫 _NEG_PREFIXES, "必须包含'不要熬夜'"
+    # 会被中间的"不要"抢先命中, 整条正向硬规则被静默反转成禁用词(且永不匹配)。
+    # 位置法下: "必须包含'不要熬夜'" → 必须包含@0 胜 → required_phrase ✓;
+    # "禁止使用'必须包含'话术" → 禁止@0 胜 → forbidden_word ✓;
+    # 复合规则("不要X,必须包含Y")仍按先出现者处理, 与旧行为一致。
+    # 同位置前缀重叠(如"不能用"含"不能")取更长者, 避免连接动词被劈半。
+    candidates: list[tuple[int, int, str, str]] = []  # (pos, -len, kind, prefix)
     for prefix in _NEG_PREFIXES:
-        target = _extract_target(text, prefix)
-        if target:
-            return {"kind": "forbidden_word", "target": target}
-
-    # 必须出现：抓"必须包含 X" 等
+        pos = text.find(prefix)
+        if pos != -1:
+            candidates.append((pos, -len(prefix), "forbidden_word", prefix))
     for prefix in _POS_PREFIXES:
+        pos = text.find(prefix)
+        if pos != -1:
+            candidates.append((pos, -len(prefix), "required_phrase", prefix))
+    for pos, _neg_len, kind, prefix in sorted(candidates):
         target = _extract_target(text, prefix)
         if target:
-            return {"kind": "required_phrase", "target": target}
+            return {"kind": kind, "target": target}
 
     return None
 
