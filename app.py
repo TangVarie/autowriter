@@ -3515,13 +3515,19 @@ def _render_queue_tab_body() -> None:
                     key=f"qp_gthink_{pid_key}",
                     help="thinking_budget=-1 动态分配（Gemini 3.x 默认开启思考）",
                 )
-                # R-033: google-genai 0.x 没有 thinking_budget 字段——开关会被
-                # runtime 降级忽略(不再像之前那样整批崩), 这里明示而不是静默。
-                if plan["gemini_use_thinking"] and not gen_module.gemini_thinking_supported():
+                # R-033: google-genai 0.x 没有 thinking_budget 字段 → thinking
+                # 控制(开 budget=-1 / 关 budget=0)都会被 runtime 降级忽略(不再
+                # 像之前那样整批崩)。两个方向都要明示, 不能只在"开"时提示:
+                # 关掉开关时, 默认开启思考的模型(2.5 Pro/Flash · 3.x)照样会跑
+                # 思考并产生 thinking token 费用——用户本想省钱却被静默忽略
+                # (PR #44 review 命中)。提示与开关状态无关, 只要 SDK 不支持就显示。
+                if not gen_module.gemini_thinking_supported():
                     st.caption(
-                        "⚠️ 当前部署的 google-genai SDK(<1.x)不支持 thinking 控制，"
-                        "此开关将被忽略、按模型默认行为运行。升级依赖后生效"
-                        "（见 requirements.txt 注释）。"
+                        "⚠️ 当前部署的 google-genai SDK(<1.x)不支持 thinking 控制："
+                        "「思考模式」开关无论开/关都会被忽略、模型按其默认行为运行。"
+                        "对默认开启思考的模型(2.5 Pro / 2.5 Flash / 3.x)，关掉开关也"
+                        "无法省下 thinking token 费用。升级 google-genai>=1.x 后此开关"
+                        "才生效(见 requirements.txt 注释)。"
                     )
 
             plan["extra_instructions"] = st.text_input(

@@ -1368,7 +1368,6 @@ def _topup_failed_slots(
     model: str = "",
     prior_messages: Optional[list[dict]] = None,
     metrics: Optional["telemetry.BatchMetrics"] = None,
-    metrics_source: str = "main",
 ) -> list[GenerationResult]:
     """对一次引擎调用里失败/缺失的槽位做一次补量调用(R-033)。
 
@@ -1434,13 +1433,19 @@ def _topup_failed_slots(
             "undercount_topup_error", engine=engine_name, error=str(exc)[:200],
         )
         return items
-    # 补量是独立的一次 API 调用, 与主调用同套路按"调用边界"归集一次 token
-    # (N 个结果共享同一 usage dict, 只加一次)。
+    # 补量是独立的一次 API 调用。**必须用专属 source 记账, 不能沿用 'main'**:
+    # app._update_session_occupancy / _commit_session_tokens 把
+    # by_source_model['main'][model] 当成"单次主调用的 prefix 大小"来判封窗 ——
+    # 补量与主调用共享同一段 system prefix, 若也记进 'main' 桶会让 prefix ≈ 翻倍,
+    # 即使两次请求单独都没超阈值也会提前封掉 cache session(PR #44 review 命中)。
+    # 专属 source 仍进 by_model / 总计(成本面板照常显示全部花费), 只是不参与
+    # session 窗口判断 —— 跟 compliance_recheck / multi_role_* / dedup_regen 等
+    # 辅助调用同一处理口径。
     if metrics is not None and topup:
         head_usage = next((t.token_usage for t in topup if t.token_usage), None)
         if head_usage:
             head_engine = next((t.ai_engine for t in topup if t.ai_engine), engine_name)
-            metrics.add_tokens(head_engine, head_usage, source=metrics_source)
+            metrics.add_tokens(head_engine, head_usage, source="undercount_topup")
     good = [t for t in topup if not t.error and (t.title or "").strip()]
     for slot_i, repl in zip(failed_idx, good):
         items[slot_i] = repl
@@ -1617,7 +1622,6 @@ def generate_batch(
                 model=model_override,
                 prior_messages=prior,
                 metrics=metrics,
-                metrics_source=metrics_source,
             )
         return engine_name, items
 
