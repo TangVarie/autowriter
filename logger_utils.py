@@ -34,8 +34,45 @@ _SECRET_PATTERNS: tuple[re.Pattern, ...] = (
 )
 
 
+# R-040: 值级脱敏。LIBRARIAN_API_KEY(TV 侧自定义格式)、飞书 webhook token
+# 段等没有可识别前缀, 形态正则抓不住 —— 一旦异常文本带上它们, 上面的模式集
+# 全部漏网。这里按"已知 secret 的具体值"做替换: 从 config 懒加载一次(config
+# 仅依赖 os, 无循环导入; 失败静默, 本模块保持可独立 import)。
+_VALUE_SECRETS: tuple[str, ...] | None = None
+
+
+def _load_value_secrets() -> tuple[str, ...]:
+    global _VALUE_SECRETS
+    if _VALUE_SECRETS is not None:
+        return _VALUE_SECRETS
+    vals: list[str] = []
+    try:
+        import config as _cfg
+        for name in (
+            "LIBRARIAN_API_KEY",
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "ANTHROPIC_API_KEY",
+            "GOOGLE_API_KEY",
+        ):
+            v = getattr(_cfg, name, "") or ""
+            # ≥8 字符才入表: 避免把过短占位值(如 "1"/"test")当 secret 误伤正文
+            if isinstance(v, str) and len(v) >= 8:
+                vals.append(v)
+        wh = getattr(_cfg, "FEISHU_WEBHOOK_URL", "") or ""
+        # 飞书 webhook 的鉴权就在 URL 路径里 —— 只脱 token 段, 保留域名便于排障
+        if "/hook/" in wh:
+            token = wh.split("/hook/", 1)[1].strip("/")
+            if len(token) >= 8:
+                vals.append(token)
+    except Exception:
+        pass
+    # 长值优先替换, 防止短值是长值子串时把长值劈成两半留尾巴
+    _VALUE_SECRETS = tuple(sorted(set(vals), key=len, reverse=True))
+    return _VALUE_SECRETS
+
+
 def mask_secrets(s):
-    """把字符串里已知形态的 secret 替换成 ``***REDACTED***``。
+    """把字符串里已知形态/已知值的 secret 替换成 ``***REDACTED***``。
 
     非字符串原样返回(调用方常传 ``str(exc)`` 但偶尔传别的类型, 不强转避免
     把 None / dict 变成 "None" 噪声)。脱敏失败时返回原值——脱敏本身不能
@@ -46,6 +83,9 @@ def mask_secrets(s):
     try:
         for pat in _SECRET_PATTERNS:
             s = pat.sub(_REDACTED, s)
+        for val in _load_value_secrets():
+            if val in s:
+                s = s.replace(val, _REDACTED)
     except Exception:
         return s
     return s

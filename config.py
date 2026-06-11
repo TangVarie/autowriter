@@ -86,6 +86,14 @@ LIBRARIAN_URL: str = _get_secret("LIBRARIAN_URL")       # 例 https://truth-vaul
 LIBRARIAN_API_KEY: str = _get_secret("LIBRARIAN_API_KEY")
 LIBRARIAN_TIMEOUT_SEC: float = float(_get_secret("LIBRARIAN_TIMEOUT_SEC") or "8")
 
+# ── Auth cookie (R-040) ─────────────────────────────────────────────────────
+# refresh token 走 stx CookieManager(JS 写入, 无法 HttpOnly —— 架构限制)。
+# 能做的加固: Secure 标志(仅 HTTPS 发送, 防中间人嗅探)。生产默认开;
+# 本地 http 开发 cookie 带 Secure 会写不进浏览器, 用 AUTH_COOKIE_SECURE=0 关。
+AUTH_COOKIE_SECURE: bool = (
+    os.environ.get("AUTH_COOKIE_SECURE", "1") not in ("0", "false", "False")
+)
+
 # ── Memory system thresholds ───────────────────────────────────────────────
 MEMORY_AUTO_CONFIRM_THRESHOLD: int = int(
     os.environ.get("MEMORY_AUTO_CONFIRM_THRESHOLD", "3")

@@ -2486,7 +2486,16 @@ def get_session_instructions(
             .eq("memory_type", "session")
         )
         if project_id:
-            q = q.or_(f"project_id.eq.{project_id},project_id.is.null")
+            # R-040: 全文件唯一一处 f-string 拼 PostgREST filter(其余都是参数化
+            # .eq)。project_id 当前全部来自 DB 返回的 UUID, 但作为防御边界先
+            # 真解析一次 —— 解析失败按"无项目过滤"处理(只取 global 会话指令),
+            # 不让构造串改写查询语义。
+            try:
+                import uuid as _uuid
+                _pid = str(_uuid.UUID(str(project_id)))
+                q = q.or_(f"project_id.eq.{_pid},project_id.is.null")
+            except (ValueError, AttributeError, TypeError):
+                q = q.is_("project_id", "null")
         res = q.order("created_at", desc=True).execute()
     except Exception:
         return []
