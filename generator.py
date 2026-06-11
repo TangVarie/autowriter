@@ -690,6 +690,24 @@ def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[Generat
 
 # ── Claude engine ──────────────────────────────────────────────────────────
 
+def _extract_json_payload(text: str, prefer: str = "object") -> str:
+    """从可能带前后杂讯的文本里切出最外层 JSON object/array 子串(R-035)。
+
+    主生成路径的 _parse_copy_json(_list) 自带括号切片所以容忍模型前言;
+    三个辅助调用(合规复审/选优/精修)却是整串 json.loads —— join 多 block
+    之后前言仍在开头, 不切片照样解析失败。本 helper 先剥 ``` 围栏再按
+    首末括号切片; 找不到时原样返回(调用方的 json.loads 失败走原兜底)。
+    """
+    stripped = re.sub(r'```(?:json)?\s*', '', text or '').replace('```', '').strip()
+    if prefer == "array":
+        start, end = stripped.find('['), stripped.rfind(']')
+    else:
+        start, end = stripped.find('{'), stripped.rfind('}')
+    if start != -1 and end > start:
+        return stripped[start:end + 1]
+    return stripped
+
+
 def _extract_text_from_response(response) -> str:
     """Join ALL text blocks, skipping thinking blocks.
 
@@ -1838,9 +1856,11 @@ def _apply_compliance_recheck(
             metrics.add_tokens(f"claude/{used_model}",
                                _extract_claude_usage(resp.usage),
                                source="compliance_recheck")
-        raw = resp.content[0].text.strip()
-        cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-        data = json.loads(cleaned)
+        # R-035: 与主生成同款 join 全部 text block(R-033 只修了主路径)——
+        # opus-4-8 经中转把前言与 JSON 拆两个 block 时, content[0] 只见前言
+        # → 复审静默失效。
+        raw = _extract_text_from_response(resp).strip()
+        data = json.loads(_extract_json_payload(raw, prefer="object"))
         violations = data.get("violations", []) if isinstance(data, dict) else []
     except Exception as exc:
         telemetry.log_event(
@@ -1860,8 +1880,13 @@ def _apply_compliance_recheck(
             "rule": str(viol.get("rule", "")).strip(),
             "reason": str(viol.get("reason", "")).strip(),
         }
+        # R-035: 同一次 API 调用的 N 个版本共享同一个 token_usage dict
+        # (engine.generate 统一赋同一引用)——原地写标签会"传染"给同调用的
+        # 全部版本, 一条违规整批带标落库(本文件 830-834 的注释早已识破此
+        # 陷阱, 但只修了失败路径)。copy-on-write: 仅给被标记的版本一份独立
+        # 拷贝, 其余版本继续共享原 dict; token 数值不变。
         if isinstance(v.token_usage, dict):
-            v.token_usage["compliance_violation"] = tag
+            v.token_usage = {**v.token_usage, "compliance_violation": tag}
         else:
             v.token_usage = {"compliance_violation": tag}
 
@@ -1983,14 +2008,38 @@ def _select_best_drafts_batch(
         metrics.add_tokens(f"claude/{config.CLAUDE_MODEL}",
                            _extract_claude_usage(resp.usage),
                            source="multi_role_select")
-    raw = resp.content[0].text.strip()
+    # R-035: join 全部 text block(同 R-033 主路径修复; 顺带消除旧
+    # ``resp.content[0]`` 在 try 之外、content 为空时 IndexError 炸整个
+    # plan 的问题 —— helper 对空 content 返回 "")。
+    raw = _extract_text_from_response(resp).strip()
     try:
-        data = json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip())
+        data = json.loads(_extract_json_payload(raw, prefer="array"))
         if isinstance(data, list):
-            return [
-                (int(item.get("best_index", 0)), str(item.get("notes", "")))
-                for item in data
-            ]
+            # R-035: 评选 JSON 是模型输出, "结构对但语义错"必须设防——
+            # 旧实现 best_index 无范围校验: 正向越界 → 上游
+            # all_slot_drafts[i][best_idx] IndexError 炸整 plan(N 路已花的
+            # 生成费作废); 负值被 Python 负索引静默选错; 返回条数短于槽位
+            # 数 → 整批静默缩水。逐槽 clamp + 截断/补齐到槽位数。
+            out: list[tuple[int, str]] = []
+            for slot_i, item in enumerate(data[:len(all_slot_drafts)]):
+                if not isinstance(item, dict):
+                    out.append((0, ""))
+                    continue
+                try:
+                    bi = int(item.get("best_index", 0))
+                except (TypeError, ValueError):
+                    bi = 0
+                n_drafts = len(all_slot_drafts[slot_i])
+                if not 0 <= bi < n_drafts:
+                    telemetry.log_event(
+                        "draft_select_index_out_of_range",
+                        slot=slot_i, best_index=bi, n_drafts=n_drafts,
+                    )
+                    bi = 0
+                out.append((bi, str(item.get("notes", ""))))
+            while len(out) < len(all_slot_drafts):
+                out.append((0, ""))
+            return out
     except Exception as exc:
         telemetry.log_event(
             "draft_select_parse_failed", error=str(exc)[:200],
@@ -2063,8 +2112,9 @@ def _refine_drafts_batch(
             if metrics is not None:
                 metrics.add_tokens(f"claude/{model or config.CLAUDE_MODEL}",
                                    usage, source="multi_role_refine")
-            raw = resp.content[0].text.strip()
-            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+            # R-035: join 全部 text block + 括号切片(同主路径的前言容忍)
+            raw = _extract_text_from_response(resp).strip()
+            cleaned = _extract_json_payload(raw, prefer="object")
             refined = _try_parse_dict(cleaned, draft.ai_engine, raw)
             if refined and (refined.title or refined.body):
                 # 之前这里写的是 ``input_tokens``/``output_tokens``，跟主路径的
