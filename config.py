@@ -133,6 +133,17 @@ DEDUP_SEMANTIC_THRESHOLD: float = float(
     os.environ.get("DEDUP_SEMANTIC_THRESHOLD", "0.92")
 )
 
+# ── 失败位补量(undercount top-up, R-033)──────────────────────────────────
+# 多样性硬约束明确允许模型"宁可少出一条也不要硬出重复项"(_make_user_prompt /
+# _build_dedup_instruction), 所以"要 10 篇只回 8 篇"是 prompt 授权的正常行为;
+# 个别槽位 JSON 损坏同理。开启时, 每次引擎调用结束后如有失败位, 把已产出标题
+# 加入避重清单后**恰好按缺口数**再调一次(每次调用最多补 1 刀, 不递归)。
+# 成本: 仅在出现缺口时多一次小调用; 仍补不满时保留原错误如实上报。
+# 整调用级 API 失败不补(retry middleware 已重试过)。
+ENABLE_UNDERCOUNT_TOPUP: bool = (
+    os.environ.get("ENABLE_UNDERCOUNT_TOPUP", "1") not in ("0", "false", "False")
+)
+
 # ── Compliance recheck ────────────────────────────────────────────────────
 # When True, generate_batch runs a second Claude call after generation to
 # verify each version respected the active project memories and session
