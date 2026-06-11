@@ -2250,13 +2250,32 @@ def _render_advanced_actions(
             st.divider()
             if st.button("→ 转为调校笔记", key=f"to_taste_{mem_id}", use_container_width=True,
                          help="如果这条更像感受性偏好而不是硬规则，可以转到调校笔记。会从规则库移除。"):
-                _append_new_observations(
+                # R-042: 旧逻辑无条件先追加后删除 —— 追加失败(项目读失败/CAS
+                # 耗尽)时规则文本两头落空(笔记里没有、规则库也删了)。返回 None
+                # 同时表示"失败"与"笔记里已有同义行"(no-op), 后者删规则是安全
+                # 的 —— 重读一次按 _line_key 判定再决定。
+                appended = _append_new_observations(
                     db_client, current_project_id, [memory["content"]],
                     source="user_manual",
                 )
-                db.delete_memory(db_client, mem_id)
-                st.success("已转为调校笔记。")
-                st.rerun()
+                converted = appended is not None
+                if not converted:
+                    try:
+                        proj_now = db.get_project(db_client, current_project_id)
+                        notes_now = (proj_now or {}).get("calibration_notes") or ""
+                        key = _line_key(memory["content"])
+                        converted = bool(key) and any(
+                            _line_key(l) == key
+                            for l in notes_now.splitlines() if l.strip()
+                        )
+                    except Exception:
+                        converted = False
+                if converted:
+                    db.delete_memory(db_client, mem_id)
+                    st.success("已转为调校笔记。")
+                    st.rerun()
+                else:
+                    st.error("转换失败：笔记未写入，规则已保留，可重试。")
 
 
 def _render_inject_preview(

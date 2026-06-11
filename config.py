@@ -235,7 +235,11 @@ def get_pricing(model_id: str) -> dict[str, float]:
     # 加回 family-level fallback 也不会被前缀短的优先抢走）
     claude_keys = [k for k in MODEL_PRICING if k.startswith("claude-")]
     for key in sorted(claude_keys, key=len, reverse=True):
-        if mid_stripped.startswith(key):
+        # R-042: 前缀匹配要求 key 后紧跟边界("-"或串尾) —— 否则将来出现
+        # claude-opus-4-10 会 startswith 命中 "claude-opus-4-1"($27 最贵档),
+        # 历史成本暴算 3 倍。dated 全 id(-20251001)与 -thinking 后缀都带
+        # "-" 边界, 不受影响。
+        if mid_stripped == key or mid_stripped.startswith(key + "-"):
             return MODEL_PRICING[key]
     # 2. Gemini: 命名稳定，子串匹配够用
     if "flash-lite" in mid:
@@ -350,7 +354,8 @@ def get_context_window(model_id: str) -> int:
         mid = mid[len("claude/"):]
     claude_keys = [k for k in MODEL_CONTEXT_WINDOWS if k.startswith("claude-")]
     for key in sorted(claude_keys, key=len, reverse=True):
-        if mid.startswith(key):
+        # R-042: 同 get_pricing —— 要求 "-" 或串尾边界, 防 4-1 误配未来 4-10
+        if mid == key or mid.startswith(key + "-"):
             return MODEL_CONTEXT_WINDOWS[key]
     if "flash-lite" in mid:
         return MODEL_CONTEXT_WINDOWS["gemini-flash-lite"]

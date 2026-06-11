@@ -218,6 +218,18 @@ def _save_batch_results(
         inserted_versions = db.bulk_create_initial_versions(db_client, version_rows)
     except Exception as exc:
         errors_sink.append(f"{error_prefix}批量写入 versions 失败 — {exc}")
+        # R-042: items 已插入而 versions 全军覆没 → 审核页会出现 N 张点不开的
+        # 幽灵卡(正是本函数 docstring 声称要消灭的孤儿 item, 旧修复只堵了
+        # "slot 全失败"路径)。best-effort 回收已建 items; produced_titles 也
+        # 不能返回 —— 这些标题根本不存在于 DB, 进队列标题池会让后续批次
+        # 避开"幽灵标题"。
+        try:
+            db.delete_items(db_client, [it["id"] for it in inserted_items])
+        except Exception as cleanup_exc:
+            errors_sink.append(
+                f"{error_prefix}孤儿 item 回收失败 — {cleanup_exc}（审核页可能出现空卡）"
+            )
+        return [], [], []
 
     return inserted_items, inserted_versions, produced_titles
 
@@ -410,6 +422,15 @@ def _try_regen_one(
         titles_in_order[dup_idx] = new_version.title.strip()
         new_vecs[dup_idx]        = candidate_vec
         version_rows[dup_idx]["title"] = new_version.title  # 给后面 queue_titles 用
+        # R-042: inserted_versions 与 version_rows 是两份独立 dict(后者由
+        # _save_batch_results 重建)。下游 _run_hard_constraint_check 读的是
+        # inserted_versions —— 不回写的话, 它校验的是重生**前**的旧内容:
+        # 旧文违规会把已换掉的 item 误标 needs_revision(假阳性), 新文却完全
+        # 没被硬规则查过(假阴性)。三个字段一并同步。
+        if dup_idx < len(inserted_versions) and isinstance(inserted_versions[dup_idx], dict):
+            inserted_versions[dup_idx]["title"]    = new_version.title
+            inserted_versions[dup_idx]["body"]     = new_version.body
+            inserted_versions[dup_idx]["keywords"] = new_version.keywords
         return True
 
     # 重试用尽 → 标记 needs_revision
@@ -4730,17 +4751,12 @@ def _run_iteration(
     project_id = project["id"]
     batch_id   = batch.get("id")
 
-    # Route iteration feedback through the AI merger so it lands in the right
-    # layer (merge / new rule / taste → calibration note / session).
+    # R-042: 反馈的记忆沉淀(ingest)挪到**迭代成功之后**(见函数尾部)。
+    # 旧顺序在 iterate 调用前就 ingest —— LLM 失败后用户重试同一条反馈会
+    # 二次沉淀(merge 计数虚增 / 重复 session 指令); 且失败路径上反馈已
+    # 变成规则, 与"迭代没发生"的事实不符。迭代 prompt 本身直接用 feedback
+    # 文本, 不依赖 ingest 结果, 挪动无行为影响。
     ingest_action: Optional[str] = None
-    if feedback and feedback.strip():
-        ingest_result = mem_module.ingest_user_instruction(
-            db_client, user_id, feedback,
-            project_id=project_id,
-            project_name=project.get("name", ""),
-            batch_id=batch_id,
-        )
-        ingest_action = (ingest_result or {}).get("action")
 
     base_prompt = project.get("system_prompt", "")
     global_mems, project_mems = db.get_confirmed_memories(
@@ -4833,6 +4849,31 @@ def _run_iteration(
     # Iteration succeeded — drop the saved draft so the textarea doesn't
     # auto-restore it on the next render.
     db.clear_feedback_draft(db_client, item["id"])
+
+    # R-042: 同步清掉本 item 的反馈 widget state(feedback_*/tags_*, 含比稿
+    # 模式的 _{engine} 变体)。只清 DB 草稿不清 widget 的话, 下一个 rerun
+    # 卡片的自动保存会拿 session_state 里的旧反馈把刚清掉的草稿"复活",
+    # textarea 留着旧反馈诱导误点二次迭代("成功即清"契约被确定性打破)。
+    _item_id = item["id"]
+    for _k in [k for k in list(st.session_state.keys())
+               if k.startswith(f"feedback_{_item_id}") or k.startswith(f"tags_{_item_id}")]:
+        st.session_state.pop(_k, None)
+
+    # R-042: 迭代确认成功后才沉淀反馈(旧逻辑在 LLM 调用前 ingest, 失败重试
+    # 会双沉淀)。ingest 自身异常不影响已成功的迭代 —— 吞掉只丢 toast。
+    if feedback and feedback.strip():
+        try:
+            ingest_result = mem_module.ingest_user_instruction(
+                db_client, user_id, feedback,
+                project_id=project_id,
+                project_name=project.get("name", ""),
+                batch_id=batch_id,
+            )
+            ingest_action = (ingest_result or {}).get("action")
+        except Exception as exc:
+            telemetry.log_event(
+                "iteration_ingest_failed", item_id=str(_item_id), error=str(exc)[:200],
+            )
 
     # Surface the merger's routing decision so the user can see whether
     # their feedback became a permanent rule, a taste note, or a 24h
