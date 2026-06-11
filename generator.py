@@ -1747,9 +1747,16 @@ def generate_batch(
         for i in range(count)
     ]
 
+    # R-038 review: 飞轮块迁出 system 后, 它自带的『严禁照抄』硬性要求也要
+    # 跟着进合规复审 —— gating 补上 user_context_block(迁移前"只有飞轮、无
+    # 任何记忆规则"的项目也会因 p2 非空触发复审, 迁移后不能静默跳过),
+    # 复审内部把块带回被审 prompt(见 _apply_compliance_recheck)。
     if (
         getattr(config, "ENABLE_COMPLIANCE_CHECK", True)
-        and _has_compliance_rules(system_prompt)
+        and (
+            _has_compliance_rules(system_prompt)
+            or bool((user_context_block or "").strip())
+        )
     ):
         # 把主生成实际用的 Claude 模型透传给合规复审,让它跟主生成 byte-identical
         # → 共享主生成刚建立的 cache（Phase 1 设计前提）。
@@ -1759,6 +1766,7 @@ def generate_batch(
             slots, system_prompt,
             metrics=metrics,
             claude_model=_claude_model_used,
+            user_context_block=user_context_block,
         )
 
     return slots
@@ -1812,6 +1820,7 @@ def _apply_compliance_recheck(
     system_prompt,
     metrics: Optional["telemetry.BatchMetrics"] = None,
     claude_model: str = "",
+    user_context_block: str = "",
 ) -> None:
     """
     Flag versions that violate the System Prompt's memory / session-instruction
@@ -1851,27 +1860,48 @@ def _apply_compliance_recheck(
     if isinstance(system_prompt, dict):
         # 走 layered 路径：复用主生成的 stable/tactic/p0/p1 命中同一份 cache，
         # _COMPLIANCE_SYSTEM 作为合规复审的任务指令并入 p2（不缓存）。
+        # R-038 review: 飞轮块已从 P2 迁到 user turn(防打穿历史缓存), 但
+        # 它自带的『严禁照抄原文的标题主干或具体句子』是硬性要求 —— 复审的
+        # "被审 prompt"必须把它带回来, 否则借鉴例子的照抄完全无人检查。
+        # 放回复审请求的 p2 与迁移前可见性等价(复审 p2 本就不缓存, 不影响
+        # 主生成 cache 前缀)。
+        _ucb = (user_context_block or "").strip()
+        task_text = _COMPLIANCE_SYSTEM
+        if _ucb:
+            task_text += (
+                "\n补充：上文「真实爆款参照」节中『严禁照抄原文的标题主干或"
+                "具体句子』同样是必须逐条检查的硬性要求。"
+            )
         p2_orig = system_prompt.get("p2", "") or ""
+        p2_parts = []
+        if p2_orig.strip():
+            p2_parts.append(p2_orig.strip())
+        if _ucb:
+            p2_parts.append(_ucb)
+        p2_parts.append("---【本次任务】---\n" + task_text)
         compliance_layers = {
             "stable": system_prompt.get("stable", ""),
             "tactic": system_prompt.get("tactic", ""),
             "p0":     system_prompt.get("p0", ""),
             "p1":     system_prompt.get("p1", ""),
-            "p2":     (
-                (p2_orig.strip() + "\n\n" if p2_orig.strip() else "")
-                + "---【本次任务】---\n"
-                + _COMPLIANCE_SYSTEM
-            ),
+            "p2":     "\n\n".join(p2_parts),
         }
         system_param = _system_to_claude_param(compliance_layers)
         # system 已经完整包含主生成的 prompt，user_content 不再贴一次
         user_content = versions_block
     else:
         # 兼容路径：str 调用方按 Phase 0 行为，system_prompt 贴在 user_content
+        _ucb = (user_context_block or "").strip()
         system_param = _COMPLIANCE_SYSTEM
+        if _ucb:
+            system_param = _COMPLIANCE_SYSTEM + (
+                "\n补充：被审 System Prompt 后附的「真实爆款参照」节中"
+                "『严禁照抄原文的标题主干或具体句子』同样是必须逐条检查的硬性要求。"
+            )
         user_content = (
             "【本次生成的 System Prompt】\n"
             + (system_prompt or "").strip()
+            + (("\n\n" + _ucb) if _ucb else "")
             + "\n\n"
             + versions_block
         )
@@ -2295,9 +2325,16 @@ def generate_batch_multi_role(
         all_slot_drafts[i][best_idx]
         for i, (best_idx, _) in enumerate(selections)
     ]
+    # R-038 review: 飞轮块迁出 system 后, 精修阶段(产出用户最终拿到的版本)
+    # 看不到借鉴材料与『严禁照抄』要求了 —— 迁移前它经 system_prompt P2 对
+    # 精修可见。把块并入精修 brief 恢复可见性(选优阶段迁移前后都不经
+    # 项目 system, 保持不变)。
+    refine_brief = brief + (
+        ("\n\n" + user_context_block) if user_context_block else ""
+    )
     refined_drafts = _refine_drafts_batch(
         system_prompt=system_prompt,
-        brief=brief,
+        brief=refine_brief,
         drafts=winning_drafts,
         model=_models.get("claude", ""),
         metrics=metrics,
