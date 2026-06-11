@@ -389,7 +389,11 @@ def _try_regen_one(
             continue
 
         # ── 重生成功：写 DB + 原地更新内存结构 ─────────────────────────
-        db.update_version_content(
+        # R-034: 必须确认 DB 写入成功才能更新内存池。旧逻辑无条件按成功
+        # 处理 —— UPDATE 失败时 DB 里仍是旧重复文案, 而内存池已登记新标题,
+        # 永久分叉(用户审到重复内容且零告警)。写失败按本次重试失败处理,
+        # 继续下一次 attempt(或耗尽后如实标 needs_revision)。
+        write_ok = db.update_version_content(
             db_client, version_id,
             title=new_version.title,
             body=new_version.body,
@@ -397,6 +401,12 @@ def _try_regen_one(
             token_usage=new_version.token_usage,
             embedding=candidate_vec,
         )
+        if not write_ok:
+            errors_sink.append(
+                f"{error_prefix}重生写入 DB 失败（已重试生成但未落库），"
+                f"内容保持原样。"
+            )
+            continue
         titles_in_order[dup_idx] = new_version.title.strip()
         new_vecs[dup_idx]        = candidate_vec
         version_rows[dup_idx]["title"] = new_version.title  # 给后面 queue_titles 用

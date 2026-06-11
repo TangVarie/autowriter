@@ -927,30 +927,50 @@ def update_version_content(
     keywords: Optional[list] = None,
     token_usage: Optional[dict] = None,
     embedding: Optional[list[float]] = None,
-) -> None:
-    """重写一条 version 的内容（用于自动重生场景）。
+) -> bool:
+    """重写一条 version 的内容（用于自动重生场景）。返回主 UPDATE 是否成功。
 
     只更新传入的字段；id / item_id / version_num / ai_engine / created_at 不动。
-    embedding 单独可选，失败时静默——pgvector 列没迁移的部署还能用。
+    R-034: 此前主 UPDATE 也被 ``except: pass`` 吞掉(docstring 只声称 embedding
+    静默)——调用方 ``_try_regen_one`` 按成功继续更新内存去重池, DB 瞬断时
+    DB 里仍是旧重复文案而内存认为已替换, 永久分叉且零告警。现在主写失败
+    返回 False + telemetry(仍不抛, daemon 线程里不让单条写失败炸整批);
+    embedding 子写保持 best-effort, 但主写失败时跳过(不给旧内容配新向量)。
     """
     updates: dict[str, Any] = {"title": title, "body": body}
     if keywords is not None:
         updates["keywords"] = keywords
     if token_usage is not None:
         updates["token_usage"] = token_usage
+    ok = True
     try:
-        client.table("versions").update(updates).eq("id", version_id).execute()
-    except Exception:
-        pass
+        res = client.table("versions").update(updates).eq("id", version_id).execute()
+        if not (getattr(res, "data", None) or []):
+            # R-034 review #2: PostgREST 对 0 行匹配的 UPDATE 不抛错(行已被
+            # 并发删除 / RLS 拦截), 返回空 data —— 同样必须按失败处理, 否则
+            # 调用方仍会以"已替换"更新内存去重池, 恰好复现本函数要消灭的
+            # DB/内存分叉。
+            ok = False
+            telemetry.log_event(
+                "version_content_update_no_match", version_id=version_id,
+            )
+    except Exception as exc:
+        ok = False
+        telemetry.log_event(
+            "version_content_update_failed",
+            version_id=version_id, error=str(exc)[:200],
+        )
     try:
         list_items.clear()
     except Exception:
         pass
-    if embedding is not None:
+    if ok and embedding is not None:
         try:
             client.table("versions").update({"embedding": embedding}).eq("id", version_id).execute()
         except Exception:
+            # embedding 列没迁移的部署还能用 —— 保持静默(仅向量缺失, 内容已对)
             pass
+    return ok
 
 
 def update_version_embedding(
@@ -1020,6 +1040,43 @@ def bulk_update_version_embeddings(
             failed_sink.append(r.get("id", ""))
 
 
+def _parse_pgvector(val) -> Optional[list[float]]:
+    """把 PostgREST 读回的 pgvector 值归一成 ``list[float]``(R-034)。
+
+    PostgREST 对 ``vector(768)`` 列的 JSON 序列化是**字符串** ``"[0.1,...]"``,
+    不是数组。此前全库无任何反序列化,下游 ``dedup.cosine_similarity`` 对
+    list-vs-str 因长度不等**静默返回 0.0** —— 后果是(a)已 backfill 向量的
+    soft 规则在 ``memory.filter_soft_by_relevance`` 里 score=0 全部被丢弃不
+    注入;(b)跨批语义查重的 DB 历史池(队列预热 + 重生避重)自上线起 0 命中。
+    本函数在 DB 读取边界统一归一: 已是 list 原样返回; None/空/解析失败返回
+    None(调用方按"无向量"处理, 与历史行为一致)。
+    """
+    if val is None or isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if s.startswith("[") and s.endswith("]"):
+            inner = s[1:-1].strip()
+            if not inner:
+                return None
+            try:
+                return [float(x) for x in inner.split(",")]
+            except ValueError:
+                return None
+    return None
+
+
+def _in_chunks(seq: list, size: int = 100):
+    """把 id 列表切成 ≤size 的块, 供 ``.in_()`` 分批查询(R-034)。
+
+    一次塞几百个 UUID 进 ``.in_()`` 会生成 10KB+ 的查询串(414 风险), 且
+    结果行数超过 PostgREST max-rows(默认 1000)时**静默截断**。同文件
+    ``get_session_committed_item_ids`` 已用同样的分块套路。
+    """
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def get_recent_titles_openings_with_embeddings(
     client: Client, project_id: str, limit: int = 150
 ) -> list[dict]:
@@ -1031,68 +1088,119 @@ def get_recent_titles_openings_with_embeddings(
 
     Returns ``{"version_id", "title", "opening", "embedding"}`` per item.
     """
+    pairs = _collect_recent_canonical_versions(
+        client, project_id, limit, with_embedding=True,
+    )
+    out: list[dict] = []
+    for _item, chosen in pairs:
+        body = (chosen.get("body") or "").strip()
+        first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
+        out.append({
+            "version_id": chosen.get("id"),
+            "title":      (chosen.get("title") or "").strip(),
+            "opening":    first_line.strip()[:25],
+            # R-034: pgvector 字符串归一成 list[float](见 _parse_pgvector)
+            "embedding":  _parse_pgvector(chosen.get("embedding")),
+        })
+    # R-034: 收集器返回新→旧; 反转成旧→新。消费方(_build_dedup_instruction
+    # 取 historical[-20:]、topup 的合并 dict 以尾部优先)都以"尾部=最新"为约定。
+    out.reverse()
+    return out
+
+
+def _collect_recent_canonical_versions(
+    client: Client,
+    project_id: str,
+    limit: int,
+    with_embedding: bool,
+) -> list[tuple[dict, dict]]:
+    """分页遍历最近 40 个 batch 的 items(新→旧), 为每个 item 选 canonical
+    version(best_version_id 优先, 否则最大 version_num), 跳过无版本/
+    ``（解析失败）``占位, **集齐 limit 条有效记录即停**。
+
+    R-034(review #1): 封顶必须发生在**过滤之后** —— 旧的 ``limit*2`` 预过滤
+    截断在"最近一段恰是失败批次"(正是触发本轮修复的事故场景)时, 会把窗口
+    内更早的有效标题永远挡在池外, 恰好削弱事故项目的去重。分页按需拉取,
+    多数情况第一页即集齐; 极端情况也最多遍历完 40-batch 窗口。
+
+    created_at 在 bulk insert 下大量并列(同一语句共享 NOW()), 以 id 作第二
+    排序键保证 ``.range()`` 分页不丢行/不重复。返回 (item, chosen_version)
+    列表, 顺序新→旧, 长度 ≤ limit。
+    """
     batches = list_batches(client, project_id, limit=40)
     if not batches:
         return []
     batch_ids = [b["id"] for b in batches]
 
-    items_res = (
-        client.table("items")
-        .select("id, best_version_id")
-        .in_("batch_id", batch_ids)
-        .execute()
-    )
-    items = items_res.data or []
-    if not items:
-        return []
-    item_ids = [it["id"] for it in items]
-
-    try:
-        versions_res = (
-            client.table("versions")
-            .select("id, item_id, title, body, version_num, embedding")
-            .in_("item_id", item_ids)
+    base_fields = "id, item_id, title, body, version_num"
+    out: list[tuple[dict, dict]] = []
+    page_size = max(limit, 100)
+    offset = 0
+    embedding_ok = with_embedding
+    while len(out) < limit:
+        items_res = (
+            client.table("items")
+            .select("id, best_version_id")
+            .in_("batch_id", batch_ids)
+            .order("created_at", desc=True)
+            .order("id", desc=True)
+            .range(offset, offset + page_size - 1)
             .execute()
         )
-    except Exception:
-        # embedding column not yet migrated — degrade gracefully
-        versions_res = (
-            client.table("versions")
-            .select("id, item_id, title, body, version_num")
-            .in_("item_id", item_ids)
-            .execute()
-        )
-    versions_by_item: dict[str, list[dict]] = {}
-    for v in (versions_res.data or []):
-        versions_by_item.setdefault(v["item_id"], []).append(v)
+        items = items_res.data or []
+        if not items:
+            break
+        offset += len(items)
+        item_ids = [it["id"] for it in items]
 
-    out: list[dict] = []
-    for item in items:
-        versions = versions_by_item.get(item["id"], [])
-        if not versions:
-            continue
-        chosen = None
-        best_vid = item.get("best_version_id")
-        if best_vid:
-            for v in versions:
-                if v.get("id") == best_vid:
-                    chosen = v
-                    break
-        if not chosen:
-            chosen = max(versions, key=lambda v: v.get("version_num", 0))
-        title = (chosen.get("title") or "").strip()
-        if not title or title == "（解析失败）":
-            continue
-        body = (chosen.get("body") or "").strip()
-        first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
-        opening = first_line.strip()[:25]
-        out.append({
-            "version_id": chosen.get("id"),
-            "title":      title,
-            "opening":    opening,
-            "embedding":  chosen.get("embedding"),
-        })
-    return out[:limit]
+        def _fetch_versions(fields: str) -> list[dict]:
+            rows: list[dict] = []
+            for chunk in _in_chunks(item_ids):
+                res = (
+                    client.table("versions")
+                    .select(fields)
+                    .in_("item_id", chunk)
+                    .execute()
+                )
+                rows.extend(res.data or [])
+            return rows
+
+        if embedding_ok:
+            try:
+                version_rows = _fetch_versions(base_fields + ", embedding")
+            except Exception:
+                # embedding column not yet migrated — 本页及后续页都降级
+                embedding_ok = False
+                version_rows = _fetch_versions(base_fields)
+        else:
+            version_rows = _fetch_versions(base_fields)
+
+        versions_by_item: dict[str, list[dict]] = {}
+        for v in version_rows:
+            versions_by_item.setdefault(v["item_id"], []).append(v)
+
+        for item in items:
+            versions = versions_by_item.get(item["id"], [])
+            if not versions:
+                continue
+            chosen = None
+            best_vid = item.get("best_version_id")
+            if best_vid:
+                for v in versions:
+                    if v.get("id") == best_vid:
+                        chosen = v
+                        break
+            if not chosen:
+                chosen = max(versions, key=lambda v: v.get("version_num", 0))
+            title = (chosen.get("title") or "").strip()
+            if not title or title == "（解析失败）":
+                continue
+            out.append((item, chosen))
+            if len(out) >= limit:
+                break
+        if len(items) < page_size:
+            break  # 40-batch 窗口已遍历完
+    return out
 
 
 def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]:
@@ -1416,67 +1524,25 @@ def get_recent_titles_and_openings(
     same angles.  Each entry is ``{"title": str, "opening": str}`` where opening
     is the first non-empty line of the body, truncated to 25 characters.
 
-    Two-query implementation: first pull items (id + best_version_id), then
-    pull their versions in one batched ``in_`` call.  Replaces the previous
-    nested ``select("..., versions(*)")`` which was N+1-ish on a wide window
-    (postgrest expanded the embedded select per item server-side) and
-    returned an order of magnitude more data than needed.
+    R-034: 经 ``_collect_recent_canonical_versions`` 分页收集 —— 按 created_at
+    desc 遍历、**过滤后**集齐 limit 条有效记录即停(预过滤封顶会在"最近一段
+    恰是失败批次"时把更早的有效标题挡在池外), versions 分块查防 max-rows
+    静默截断。输出旧→新(尾部=最新), 与 _build_dedup_instruction 取
+    historical[-20:] 的约定对齐。
     """
-    batches = list_batches(client, project_id, limit=40)
-    if not batches:
-        return []
-    batch_ids = [b["id"] for b in batches]
-
-    items_res = (
-        client.table("items")
-        .select("id, status, best_version_id")
-        .in_("batch_id", batch_ids)
-        .execute()
+    pairs = _collect_recent_canonical_versions(
+        client, project_id, limit, with_embedding=False,
     )
-    items = items_res.data or []
-    if not items:
-        return []
-    item_ids = [it["id"] for it in items]
-
-    # Pull every version for these items in one shot; we only need the three
-    # columns used for picking the canonical version.
-    versions_res = (
-        client.table("versions")
-        .select("id, item_id, title, body, version_num")
-        .in_("item_id", item_ids)
-        .execute()
-    )
-    versions_by_item: dict[str, list[dict]] = {}
-    for v in (versions_res.data or []):
-        versions_by_item.setdefault(v["item_id"], []).append(v)
-
     out: list[dict] = []
-    for item in items:
-        versions = versions_by_item.get(item["id"], [])
-        if not versions:
-            continue
-
-        chosen = None
-        best_vid = item.get("best_version_id")
-        if best_vid:
-            for v in versions:
-                if v.get("id") == best_vid:
-                    chosen = v
-                    break
-        if not chosen:
-            chosen = max(versions, key=lambda v: v.get("version_num", 0))
-
-        title = (chosen.get("title") or "").strip()
-        if not title or title == "（解析失败）":
-            continue
-
+    for _item, chosen in pairs:
         body = (chosen.get("body") or "").strip()
         first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
-        opening = first_line.strip()[:25]
-
-        out.append({"title": title, "opening": opening})
-
-    return out[:limit]
+        out.append({
+            "title":   (chosen.get("title") or "").strip(),
+            "opening": first_line.strip()[:25],
+        })
+    out.reverse()
+    return out
 
 
 def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
@@ -1501,7 +1567,14 @@ def list_memories(
     if status:
         q = q.eq("status", status)
     res = q.order("frequency", desc=True).execute()
-    return res.data or []
+    rows = res.data or []
+    # R-034: select("*") 会把 pgvector 的 embedding 列以字符串形态带回;
+    # 下游 memory.filter_soft_by_relevance 拿它算 cosine 得 0 分, 已 backfill
+    # 向量的 soft 规则会被全部静默过滤掉。在读取边界统一归一成 list[float]。
+    for r in rows:
+        if "embedding" in r:
+            r["embedding"] = _parse_pgvector(r.get("embedding"))
+    return rows
 
 
 def _invalidate_memory_caches() -> None:
