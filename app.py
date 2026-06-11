@@ -3114,11 +3114,15 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # 行为一致"的注释此前是假的: quick gen 把 soft 规则全量注入, 同一项目
         # 两条路 prompt 不同、注入可视化的"过滤 N 条"恒为 0。hard 规则不受
         # filter_soft_by_relevance 影响, 全量保留。
+        # PR #54 review: image_prompt 也要进相关性上下文 —— 它最终经
+        # combined_extra 发给模型, 不参与过滤的话, 图片相关的 soft 规则
+        # (如"产品图描述偏好")会因与 tactic/卖点语义距离远而被静默滤掉。
         _qg_context_text = " ".join(filter(None, [
             tactic,
             plan.get("key_messages", ""),
             plan.get("target_audience", ""),
             extra_instr,
+            image_prompt,
         ])).strip()
         global_mems = mem_module.filter_soft_by_relevance(
             global_mems, _qg_context_text, report_sink=inject_report,
@@ -3188,6 +3192,35 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             )
 
         historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
+
+        # R-039: 预热 DB 历史向量池(对齐 queue 的 primed_projects 逻辑)。
+        # 旧的空 dict 让 _run_semantic_dedup_pass 的"历史对比"整段跳过 ——
+        # quick gen 永远检不出与库内历史"换字不换义"的语义重复, 且零提示。
+        # PR #54 review: 必须在 _save_batch_results **之前**取 —— 保存后再取,
+        # 本批刚插入的版本(尚无 embedding)会按"最新"挤占 limit 名额, 再被
+        # 下面的 embedding 过滤丢掉 → 大批次能把真历史整段挤出查重池。
+        # queue 路径的预热同样发生在保存前(首见项目时), 此处对齐。
+        quick_queue_embeddings: dict[str, list[dict]] = {}
+        if dedup_module.embeddings_available():
+            try:
+                _hist_rows = db.get_recent_titles_openings_with_embeddings(
+                    db_client, project_id
+                )
+                _seed = [
+                    {"title": h["title"], "embedding": h["embedding"]}
+                    for h in _hist_rows
+                    if h.get("embedding") and h.get("title")
+                ]
+                if _seed:
+                    quick_queue_embeddings[project_id] = _seed
+            except Exception as _exc:
+                telemetry.log_event(
+                    "embedding_prime_failed",
+                    project_id=project_id, error=str(_exc)[:200],
+                )
+                status.setdefault("warnings", []).append(
+                    f"项目历史向量加载失败：{str(_exc)[:120]}（语义查重缺历史维度）"
+                )
 
         # Phase 2.1: session 路由 — 同 _queue_worker_impl 逻辑
         engine_session_ids, engine_prior_messages = _resolve_engine_sessions(
@@ -3291,31 +3324,9 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # Quick Generate 只跑一个批次，所以 queue_embeddings 是个只有当前
         # project_id 的临时字典；命中重复直接写到 errors 数组里。
         _set_phase_progress(status, "embedding")
-        # R-039: 预热 DB 历史向量池(对齐 queue 的 primed_projects 逻辑)。
-        # 旧的空 dict 让 _run_semantic_dedup_pass 的"历史对比"整段跳过 ——
-        # quick gen 永远检不出与库内历史"换字不换义"的语义重复(文本标题池
-        # 仍注入, 仅语义维度缺失), 且无任何降级提示。
-        quick_queue_embeddings: dict[str, list[dict]] = {}
-        if dedup_module.embeddings_available():
-            try:
-                _hist_rows = db.get_recent_titles_openings_with_embeddings(
-                    db_client, project_id
-                )
-                _seed = [
-                    {"title": h["title"], "embedding": h["embedding"]}
-                    for h in _hist_rows
-                    if h.get("embedding") and h.get("title")
-                ]
-                if _seed:
-                    quick_queue_embeddings[project_id] = _seed
-            except Exception as _exc:
-                telemetry.log_event(
-                    "embedding_prime_failed",
-                    project_id=project_id, error=str(_exc)[:200],
-                )
-                status.setdefault("warnings", []).append(
-                    f"项目历史向量加载失败：{str(_exc)[:120]}（语义查重缺历史维度）"
-                )
+        # (历史向量池 quick_queue_embeddings 已在保存批次**之前**预热 ——
+        #  见 historical_titles 取数处; PR #54 review: 在保存之后预热会让刚
+        #  落库的无向量版本挤占 limit 名额, 把真历史挤出语义查重池。)
         # Day 5：quick gen 也支持策略覆盖（plan 字段同 queue）
         strategy_ctx = _resolve_queue_strategy(plan, project)
         metrics.set_meta(
