@@ -1069,7 +1069,9 @@ def _queue_worker_impl(
             # Gemini 路径会拼回单字符串。跟 build_system_prompt 返回的字符串
             # byte-identical（layered_system_prompt_to_string 验证过）。
             # ── R-032: 向 TV 飞轮馆员借阅"真实爆款经验"（pull 模型, docs/15）。
-            # 失败/超时/未配 → []，下面 P2 那节自动不出现，写稿照常用 owner 自有正例。
+            # 失败/超时/未配 → []，飞轮块自动不出现，写稿照常用 owner 自有正例。
+            # R-038: 飞轮块不再进 system P2(每批必变会堵死 session 历史缓存),
+            # 改经 user_context_block 注入当前 user turn —— 模型看到的内容不变。
             flywheel_lessons = librarian_client.fetch_flywheel_lessons(
                 librarian_client.build_brief(
                     project,
@@ -1080,6 +1082,8 @@ def _queue_worker_impl(
                     extra_instructions=plan.get("extra_instructions", ""),
                 )
             )
+            flywheel_block = mem_module.render_flywheel_block(flywheel_lessons)
+            inject_report["flywheel_lessons"] = len(flywheel_lessons or [])
             full_system_prompt = mem_module.build_layered_system_prompt(
                 base_prompt=base_prompt,
                 global_memories=global_mems_for_plan,
@@ -1089,7 +1093,6 @@ def _queue_worker_impl(
                 positive_examples=pos_examples or None,
                 negative_examples=neg_examples or None,
                 session_instructions=session_instr or None,
-                flywheel_lessons=flywheel_lessons or None,
                 report_sink=inject_report,
             )
             metrics.set_meta("injection", inject_report)
@@ -1212,6 +1215,7 @@ def _queue_worker_impl(
                     n_roles=n_roles,
                     metrics=metrics,
                     engine_prior_messages=engine_prior_messages,
+                    user_context_block=flywheel_block,
                 )
             else:
                 generation_results = gen_module.generate_batch(
@@ -1233,6 +1237,7 @@ def _queue_worker_impl(
                     project_id=project_id,
                     metrics=metrics,
                     engine_prior_messages=engine_prior_messages,
+                    user_context_block=flywheel_block,
                 )
 
             metrics.stop_phase("llm")
@@ -3090,7 +3095,8 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # Day 4：注入可视化（quick gen 与 queue worker 行为一致）
         # Phase 1：同 worker 路径，用 layered builder。
         inject_report: dict = {"filtered": []}
-        # ── R-032: 同 _queue_worker_impl —— 借阅飞轮经验注入 P2（fail-open 成 []）。
+        # ── R-032: 同 _queue_worker_impl —— 借阅飞轮经验（fail-open 成 []）。
+        # R-038: 改经 user_context_block 注入 user turn, 不再进 system P2。
         flywheel_lessons = librarian_client.fetch_flywheel_lessons(
             librarian_client.build_brief(
                 project,
@@ -3101,6 +3107,8 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 extra_instructions=extra_instr,
             )
         )
+        flywheel_block = mem_module.render_flywheel_block(flywheel_lessons)
+        inject_report["flywheel_lessons"] = len(flywheel_lessons or [])
         full_system_prompt = mem_module.build_layered_system_prompt(
             base_prompt=project.get("system_prompt", ""),
             global_memories=global_mems,
@@ -3110,7 +3118,6 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             positive_examples=pos_examples or None,
             negative_examples=neg_examples or None,
             session_instructions=session_instr or None,
-            flywheel_lessons=flywheel_lessons or None,
             report_sink=inject_report,
         )
         metrics.set_meta("injection", inject_report)
@@ -3190,6 +3197,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 n_roles=n_roles,
                 metrics=metrics,
                 engine_prior_messages=engine_prior_messages,
+                user_context_block=flywheel_block,
             )
         else:
             generation_results = gen_module.generate_batch(
@@ -3211,6 +3219,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 project_id=project_id,
                 metrics=metrics,
                 engine_prior_messages=engine_prior_messages,
+                user_context_block=flywheel_block,
             )
 
         metrics.stop_phase("llm")

@@ -115,29 +115,39 @@ def _extract_gemini_usage(usage) -> dict:
 # 用满 4 个（stable/tactic/p0/p1），p2 不打，留一个 buffer 给未来。空层
 # 会被跳过——避免 API 拒绝空 text block，也不会浪费 breakpoint 名额。
 
-def _system_to_claude_param(system_prompt) -> object:
+def _system_to_claude_param(system_prompt, reserve_breakpoint: bool = False) -> object:
     """Translate ``system_prompt`` (str | layered dict) into the value
     expected by ``client.messages.stream/create``'s ``system`` kwarg.
 
     - str → return as-is (Anthropic SDK accepts bare strings)
-    - dict → list of text blocks; first 4 non-empty layers carry
-      ``cache_control: ephemeral``; p2 (session-only) is uncached
+    - dict → list of text blocks with ``cache_control: ephemeral``;
+      p2 (session-only) is uncached
     - anything else → empty string (safer than passing junk to SDK)
+
+    R-038: Anthropic 全请求最多 4 个 cache breakpoint。旧实现把 4 个全打在
+    system 层(stable/tactic/p0/p1), prior_messages(session 历史)落在最后
+    一个断点之后 —— Phase 2.1 "历史对话进 cache" 的承诺从未兑现, 每批历史
+    全价重算且随 session 增长线性涨价。``reserve_breakpoint=True``(调用方
+    要把第 4 个断点打到最后一条历史消息上时传入)让 system 只用 3 个:
+    stable / p0(断点顺带覆盖前缀里的 tactic)/ p1。无历史时保持旧 4 层
+    布局, 请求形态与历史版本完全一致。块文本本身两种布局下逐字节相同 ——
+    断点只是标记、不参与前缀内容匹配, 新旧布局可互相命中已写入的前缀。
     """
     if isinstance(system_prompt, str):
         return system_prompt
     if not isinstance(system_prompt, dict):
         return ""
+    cached_keys = ("stable", "p0", "p1") if reserve_breakpoint \
+        else ("stable", "tactic", "p0", "p1")
     blocks: list[dict] = []
     for key in ("stable", "tactic", "p0", "p1"):
         text = (system_prompt.get(key) or "").strip()
         if not text:
             continue
-        blocks.append({
-            "type": "text",
-            "text": text,
-            "cache_control": {"type": "ephemeral"},
-        })
+        block: dict = {"type": "text", "text": text}
+        if key in cached_keys:
+            block["cache_control"] = {"type": "ephemeral"}
+        blocks.append(block)
     p2 = (system_prompt.get("p2") or "").strip()
     if p2:
         blocks.append({"type": "text", "text": p2})
@@ -778,6 +788,37 @@ class ClaudeEngine:
             out.append({"role": role, "content": text})
         return out
 
+    @staticmethod
+    def _apply_prior_cache_breakpoint(messages: list[dict]) -> bool:
+        """给最后一条历史消息打 cache_control(R-038)。成功返回 True。
+
+        断点打在历史末尾 → 整段 prefix(system 3 块 + p2 + 全部历史)进
+        cache, 每批只对"当前 user turn"付全价。p2(仅 session 指令, 飞轮
+        已挪到 user turn)批间通常稳定, 变化时也只 miss 这一段, system 3 个
+        断点照常命中。content 形态不可识别时返回 False, 调用方退回旧的
+        4-system-breakpoint 布局 —— 永远不会超过 4 个断点上限。
+        不修改传入 block dict 本身(copy-on-write), 不污染上游 session 数据。
+        """
+        if not messages:
+            return False
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, str):
+            if not content:
+                return False
+            last["content"] = [{
+                "type": "text", "text": content,
+                "cache_control": {"type": "ephemeral"},
+            }]
+            return True
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            blk = dict(content[-1])
+            if blk.get("type") == "text" and blk.get("text"):
+                blk["cache_control"] = {"type": "ephemeral"}
+                last["content"] = list(content[:-1]) + [blk]
+                return True
+        return False
+
     def generate(
         self,
         system_prompt,
@@ -797,8 +838,13 @@ class ClaudeEngine:
         # 空 list / None → 行为跟 Phase 1 完全一致(单 user turn 调用)。
         model = model or config.CLAUDE_MODEL
         params = self._make_params(model, use_thinking, count)
-        system_param = _system_to_claude_param(system_prompt)
         messages = self._normalize_prior_for_claude(prior_messages)
+        # R-038: 有历史时把第 4 个 cache breakpoint 打在最后一条历史消息上
+        # (system 让出 1 个), 让 session 历史真正进 cache —— 旧布局 4 个断点
+        # 全在 system, 历史每批全价重算。无历史/形态不可识别时 prior_bp=False,
+        # system 保持旧 4 层布局, 请求与历史版本完全一致。
+        prior_bp = self._apply_prior_cache_breakpoint(messages)
+        system_param = _system_to_claude_param(system_prompt, reserve_breakpoint=prior_bp)
         messages.append({
             "role": "user",
             "content": self._build_content(user_prompt, images),
@@ -1476,12 +1522,19 @@ def generate_batch(
     metrics: Optional["telemetry.BatchMetrics"] = None,
     metrics_source: str = "main",
     engine_prior_messages: Optional[dict[str, list[dict]]] = None,
+    user_context_block: str = "",
 ) -> list[dict]:
     """
     Generate `count` copy items using specified engines.
 
     For multi-engine mode (len(engines) > 1), each slot gets one version
     per engine. For single-engine mode, each slot gets one version.
+
+    ``user_context_block`` (R-038): 每批变化的参考材料(目前是 TV 飞轮
+    [真实爆款参照] 块), 追加在 user prompt 末尾(避重块之后)。之前它注入
+    system P2 —— 因为每批必变, 任何打在其后的 cache breakpoint 永不命中,
+    把会话历史缓存(Phase 2.1)整个堵死; 挪到 user turn(缓存前缀之外)后,
+    模型看到的内容不变, prefix 复用恢复。
 
     Injects per-slot creative coordinates (role / title-structure / word-tilt)
     derived from a per-account seed, so different users generating the same
@@ -1515,6 +1568,8 @@ def generate_batch(
     dedup_block = _build_dedup_instruction([], historical_titles)
     if dedup_block:
         user_prompt += "\n\n" + dedup_block
+    if user_context_block:
+        user_prompt += "\n\n" + user_context_block
 
     # One API call per engine, each returning `count` items in a single
     # response.  For single-engine batches (the common path) we still run the
@@ -1556,6 +1611,8 @@ def generate_batch(
         block = _build_dedup_instruction([], list(combined.values()))
         if block:
             base += "\n\n" + block
+        if user_context_block:
+            base += "\n\n" + user_context_block
         base += (
             f"\n\n【补量说明】本批此前已产出 {len(produced_in_call)} 篇有效文案"
             f"(已计入上方避重清单); 现补足缺口, 请生成 {missing} 篇与清单全部"
@@ -1666,6 +1723,8 @@ def generate_batch(
             )
             if extra_dedup:
                 prompt_for_this_engine += "\n\n" + extra_dedup
+            if user_context_block:
+                prompt_for_this_engine += "\n\n" + user_context_block
             _eng_name, items = _engine_call(eng, prompt_for_this_engine)
             engine_results[_eng_name] = items
             # Feed only successful items into the cross-engine pool.
@@ -2114,6 +2173,7 @@ def generate_batch_multi_role(
     metrics: Optional["telemetry.BatchMetrics"] = None,
     metrics_source: str = "main",
     engine_prior_messages: Optional[dict[str, list[dict]]] = None,
+    user_context_block: str = "",
 ) -> list[dict]:
     """
     Generate `count` items using multi-role × multi-engine parallel drafting (三省法).
@@ -2144,6 +2204,9 @@ def generate_batch_multi_role(
     dedup_block = _build_dedup_instruction([], historical_titles)
     if dedup_block:
         base_prompt += "\n\n" + dedup_block
+    # R-038: 飞轮等每批变化的参考材料进 user prompt(见 generate_batch 同名参数)
+    if user_context_block:
+        base_prompt += "\n\n" + user_context_block
 
     tasks = [(role, eng) for role in roles for eng in _engines]
     n_tasks = len(tasks)
