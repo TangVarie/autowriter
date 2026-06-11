@@ -115,29 +115,39 @@ def _extract_gemini_usage(usage) -> dict:
 # 用满 4 个（stable/tactic/p0/p1），p2 不打，留一个 buffer 给未来。空层
 # 会被跳过——避免 API 拒绝空 text block，也不会浪费 breakpoint 名额。
 
-def _system_to_claude_param(system_prompt) -> object:
+def _system_to_claude_param(system_prompt, reserve_breakpoint: bool = False) -> object:
     """Translate ``system_prompt`` (str | layered dict) into the value
     expected by ``client.messages.stream/create``'s ``system`` kwarg.
 
     - str → return as-is (Anthropic SDK accepts bare strings)
-    - dict → list of text blocks; first 4 non-empty layers carry
-      ``cache_control: ephemeral``; p2 (session-only) is uncached
+    - dict → list of text blocks with ``cache_control: ephemeral``;
+      p2 (session-only) is uncached
     - anything else → empty string (safer than passing junk to SDK)
+
+    R-038: Anthropic 全请求最多 4 个 cache breakpoint。旧实现把 4 个全打在
+    system 层(stable/tactic/p0/p1), prior_messages(session 历史)落在最后
+    一个断点之后 —— Phase 2.1 "历史对话进 cache" 的承诺从未兑现, 每批历史
+    全价重算且随 session 增长线性涨价。``reserve_breakpoint=True``(调用方
+    要把第 4 个断点打到最后一条历史消息上时传入)让 system 只用 3 个:
+    stable / p0(断点顺带覆盖前缀里的 tactic)/ p1。无历史时保持旧 4 层
+    布局, 请求形态与历史版本完全一致。块文本本身两种布局下逐字节相同 ——
+    断点只是标记、不参与前缀内容匹配, 新旧布局可互相命中已写入的前缀。
     """
     if isinstance(system_prompt, str):
         return system_prompt
     if not isinstance(system_prompt, dict):
         return ""
+    cached_keys = ("stable", "p0", "p1") if reserve_breakpoint \
+        else ("stable", "tactic", "p0", "p1")
     blocks: list[dict] = []
     for key in ("stable", "tactic", "p0", "p1"):
         text = (system_prompt.get(key) or "").strip()
         if not text:
             continue
-        blocks.append({
-            "type": "text",
-            "text": text,
-            "cache_control": {"type": "ephemeral"},
-        })
+        block: dict = {"type": "text", "text": text}
+        if key in cached_keys:
+            block["cache_control"] = {"type": "ephemeral"}
+        blocks.append(block)
     p2 = (system_prompt.get("p2") or "").strip()
     if p2:
         blocks.append({"type": "text", "text": p2})
@@ -796,6 +806,37 @@ class ClaudeEngine:
             out.append({"role": role, "content": text})
         return out
 
+    @staticmethod
+    def _apply_prior_cache_breakpoint(messages: list[dict]) -> bool:
+        """给最后一条历史消息打 cache_control(R-038)。成功返回 True。
+
+        断点打在历史末尾 → 整段 prefix(system 3 块 + p2 + 全部历史)进
+        cache, 每批只对"当前 user turn"付全价。p2(仅 session 指令, 飞轮
+        已挪到 user turn)批间通常稳定, 变化时也只 miss 这一段, system 3 个
+        断点照常命中。content 形态不可识别时返回 False, 调用方退回旧的
+        4-system-breakpoint 布局 —— 永远不会超过 4 个断点上限。
+        不修改传入 block dict 本身(copy-on-write), 不污染上游 session 数据。
+        """
+        if not messages:
+            return False
+        last = messages[-1]
+        content = last.get("content")
+        if isinstance(content, str):
+            if not content:
+                return False
+            last["content"] = [{
+                "type": "text", "text": content,
+                "cache_control": {"type": "ephemeral"},
+            }]
+            return True
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            blk = dict(content[-1])
+            if blk.get("type") == "text" and blk.get("text"):
+                blk["cache_control"] = {"type": "ephemeral"}
+                last["content"] = list(content[:-1]) + [blk]
+                return True
+        return False
+
     def generate(
         self,
         system_prompt,
@@ -815,8 +856,13 @@ class ClaudeEngine:
         # 空 list / None → 行为跟 Phase 1 完全一致(单 user turn 调用)。
         model = model or config.CLAUDE_MODEL
         params = self._make_params(model, use_thinking, count)
-        system_param = _system_to_claude_param(system_prompt)
         messages = self._normalize_prior_for_claude(prior_messages)
+        # R-038: 有历史时把第 4 个 cache breakpoint 打在最后一条历史消息上
+        # (system 让出 1 个), 让 session 历史真正进 cache —— 旧布局 4 个断点
+        # 全在 system, 历史每批全价重算。无历史/形态不可识别时 prior_bp=False,
+        # system 保持旧 4 层布局, 请求与历史版本完全一致。
+        prior_bp = self._apply_prior_cache_breakpoint(messages)
+        system_param = _system_to_claude_param(system_prompt, reserve_breakpoint=prior_bp)
         messages.append({
             "role": "user",
             "content": self._build_content(user_prompt, images),
@@ -1494,12 +1540,19 @@ def generate_batch(
     metrics: Optional["telemetry.BatchMetrics"] = None,
     metrics_source: str = "main",
     engine_prior_messages: Optional[dict[str, list[dict]]] = None,
+    user_context_block: str = "",
 ) -> list[dict]:
     """
     Generate `count` copy items using specified engines.
 
     For multi-engine mode (len(engines) > 1), each slot gets one version
     per engine. For single-engine mode, each slot gets one version.
+
+    ``user_context_block`` (R-038): 每批变化的参考材料(目前是 TV 飞轮
+    [真实爆款参照] 块), 追加在 user prompt 末尾(避重块之后)。之前它注入
+    system P2 —— 因为每批必变, 任何打在其后的 cache breakpoint 永不命中,
+    把会话历史缓存(Phase 2.1)整个堵死; 挪到 user turn(缓存前缀之外)后,
+    模型看到的内容不变, prefix 复用恢复。
 
     Injects per-slot creative coordinates (role / title-structure / word-tilt)
     derived from a per-account seed, so different users generating the same
@@ -1533,6 +1586,8 @@ def generate_batch(
     dedup_block = _build_dedup_instruction([], historical_titles)
     if dedup_block:
         user_prompt += "\n\n" + dedup_block
+    if user_context_block:
+        user_prompt += "\n\n" + user_context_block
 
     # One API call per engine, each returning `count` items in a single
     # response.  For single-engine batches (the common path) we still run the
@@ -1574,6 +1629,8 @@ def generate_batch(
         block = _build_dedup_instruction([], list(combined.values()))
         if block:
             base += "\n\n" + block
+        if user_context_block:
+            base += "\n\n" + user_context_block
         base += (
             f"\n\n【补量说明】本批此前已产出 {len(produced_in_call)} 篇有效文案"
             f"(已计入上方避重清单); 现补足缺口, 请生成 {missing} 篇与清单全部"
@@ -1684,6 +1741,8 @@ def generate_batch(
             )
             if extra_dedup:
                 prompt_for_this_engine += "\n\n" + extra_dedup
+            if user_context_block:
+                prompt_for_this_engine += "\n\n" + user_context_block
             _eng_name, items = _engine_call(eng, prompt_for_this_engine)
             engine_results[_eng_name] = items
             # Feed only successful items into the cross-engine pool.
@@ -1706,9 +1765,16 @@ def generate_batch(
         for i in range(count)
     ]
 
+    # R-038 review: 飞轮块迁出 system 后, 它自带的『严禁照抄』硬性要求也要
+    # 跟着进合规复审 —— gating 补上 user_context_block(迁移前"只有飞轮、无
+    # 任何记忆规则"的项目也会因 p2 非空触发复审, 迁移后不能静默跳过),
+    # 复审内部把块带回被审 prompt(见 _apply_compliance_recheck)。
     if (
         getattr(config, "ENABLE_COMPLIANCE_CHECK", True)
-        and _has_compliance_rules(system_prompt)
+        and (
+            _has_compliance_rules(system_prompt)
+            or bool((user_context_block or "").strip())
+        )
     ):
         # 把主生成实际用的 Claude 模型透传给合规复审,让它跟主生成 byte-identical
         # → 共享主生成刚建立的 cache（Phase 1 设计前提）。
@@ -1718,6 +1784,7 @@ def generate_batch(
             slots, system_prompt,
             metrics=metrics,
             claude_model=_claude_model_used,
+            user_context_block=user_context_block,
         )
 
     return slots
@@ -1771,6 +1838,7 @@ def _apply_compliance_recheck(
     system_prompt,
     metrics: Optional["telemetry.BatchMetrics"] = None,
     claude_model: str = "",
+    user_context_block: str = "",
 ) -> None:
     """
     Flag versions that violate the System Prompt's memory / session-instruction
@@ -1810,27 +1878,48 @@ def _apply_compliance_recheck(
     if isinstance(system_prompt, dict):
         # 走 layered 路径：复用主生成的 stable/tactic/p0/p1 命中同一份 cache，
         # _COMPLIANCE_SYSTEM 作为合规复审的任务指令并入 p2（不缓存）。
+        # R-038 review: 飞轮块已从 P2 迁到 user turn(防打穿历史缓存), 但
+        # 它自带的『严禁照抄原文的标题主干或具体句子』是硬性要求 —— 复审的
+        # "被审 prompt"必须把它带回来, 否则借鉴例子的照抄完全无人检查。
+        # 放回复审请求的 p2 与迁移前可见性等价(复审 p2 本就不缓存, 不影响
+        # 主生成 cache 前缀)。
+        _ucb = (user_context_block or "").strip()
+        task_text = _COMPLIANCE_SYSTEM
+        if _ucb:
+            task_text += (
+                "\n补充：上文「真实爆款参照」节中『严禁照抄原文的标题主干或"
+                "具体句子』同样是必须逐条检查的硬性要求。"
+            )
         p2_orig = system_prompt.get("p2", "") or ""
+        p2_parts = []
+        if p2_orig.strip():
+            p2_parts.append(p2_orig.strip())
+        if _ucb:
+            p2_parts.append(_ucb)
+        p2_parts.append("---【本次任务】---\n" + task_text)
         compliance_layers = {
             "stable": system_prompt.get("stable", ""),
             "tactic": system_prompt.get("tactic", ""),
             "p0":     system_prompt.get("p0", ""),
             "p1":     system_prompt.get("p1", ""),
-            "p2":     (
-                (p2_orig.strip() + "\n\n" if p2_orig.strip() else "")
-                + "---【本次任务】---\n"
-                + _COMPLIANCE_SYSTEM
-            ),
+            "p2":     "\n\n".join(p2_parts),
         }
         system_param = _system_to_claude_param(compliance_layers)
         # system 已经完整包含主生成的 prompt，user_content 不再贴一次
         user_content = versions_block
     else:
         # 兼容路径：str 调用方按 Phase 0 行为，system_prompt 贴在 user_content
+        _ucb = (user_context_block or "").strip()
         system_param = _COMPLIANCE_SYSTEM
+        if _ucb:
+            system_param = _COMPLIANCE_SYSTEM + (
+                "\n补充：被审 System Prompt 后附的「真实爆款参照」节中"
+                "『严禁照抄原文的标题主干或具体句子』同样是必须逐条检查的硬性要求。"
+            )
         user_content = (
             "【本次生成的 System Prompt】\n"
             + (system_prompt or "").strip()
+            + (("\n\n" + _ucb) if _ucb else "")
             + "\n\n"
             + versions_block
         )
@@ -2164,6 +2253,7 @@ def generate_batch_multi_role(
     metrics: Optional["telemetry.BatchMetrics"] = None,
     metrics_source: str = "main",
     engine_prior_messages: Optional[dict[str, list[dict]]] = None,
+    user_context_block: str = "",
 ) -> list[dict]:
     """
     Generate `count` items using multi-role × multi-engine parallel drafting (三省法).
@@ -2194,6 +2284,9 @@ def generate_batch_multi_role(
     dedup_block = _build_dedup_instruction([], historical_titles)
     if dedup_block:
         base_prompt += "\n\n" + dedup_block
+    # R-038: 飞轮等每批变化的参考材料进 user prompt(见 generate_batch 同名参数)
+    if user_context_block:
+        base_prompt += "\n\n" + user_context_block
 
     tasks = [(role, eng) for role in roles for eng in _engines]
     n_tasks = len(tasks)
@@ -2282,9 +2375,16 @@ def generate_batch_multi_role(
         all_slot_drafts[i][best_idx]
         for i, (best_idx, _) in enumerate(selections)
     ]
+    # R-038 review: 飞轮块迁出 system 后, 精修阶段(产出用户最终拿到的版本)
+    # 看不到借鉴材料与『严禁照抄』要求了 —— 迁移前它经 system_prompt P2 对
+    # 精修可见。把块并入精修 brief 恢复可见性(选优阶段迁移前后都不经
+    # 项目 system, 保持不变)。
+    refine_brief = brief + (
+        ("\n\n" + user_context_block) if user_context_block else ""
+    )
     refined_drafts = _refine_drafts_batch(
         system_prompt=system_prompt,
-        brief=brief,
+        brief=refine_brief,
         drafts=winning_drafts,
         model=_models.get("claude", ""),
         metrics=metrics,

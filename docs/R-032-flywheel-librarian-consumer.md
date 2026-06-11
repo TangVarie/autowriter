@@ -113,11 +113,14 @@ autowriter 当前**读取并注入这 7 个字段**(`memory.build_layered_system
 
 ## 5. 注入位置与降级语义
 
-- **注入到 P2(会话层,`cache_control` 不缓存)**:`selected` 随 brief(tactic/选题)
-  每批变,放进缓存的 P1 会把 Anthropic/Gemini 的 prompt cache **每批打穿**;P2 本
-  就是 ephemeral 层,放这里不影响稳定前缀的缓存命中。
+- **注入到当前 user turn 末尾(R-038 起;此前在 system P2)**:`selected` 随
+  brief(tactic/选题)每批变 —— 放在 system 里(哪怕不缓存的 P2)也会让打在
+  其后的 cache breakpoint(session 历史缓存)永不命中。现在由
+  `memory.render_flywheel_block` 渲染、经 generator 的 `user_context_block`
+  追加到 user prompt(避重块之后);**模型看到的文本不变**,只是位置从 system
+  移到 user,稳定前缀(system 各层 + 会话历史)的缓存命中恢复。
 - **降级(fail-open)**:未配 URL/KEY、超时、网络错、4xx/5xx、返回非预期结构 →
-  `fetch_flywheel_lessons` 返回 `[]` → P2 那节不出现 → 写稿照常用 owner 自有正例。
+  `fetch_flywheel_lessons` 返回 `[]` → 该节不出现 → 写稿照常用 owner 自有正例。
   失败会打一条 telemetry:`flywheel_librarian_unavailable`(带 `project_id` +
   脱敏后的 error),不抛异常、不阻塞、不重试。
 - **空库期**:TV 书架还没有真·非 synthetic 爆款前,`selected` 基本都是 `[]`,

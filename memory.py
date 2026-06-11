@@ -137,7 +137,6 @@ def build_layered_system_prompt(
     positive_examples: Optional[list[dict]] = None,
     negative_examples: Optional[list[dict]] = None,
     session_instructions: Optional[list[dict]] = None,
-    flywheel_lessons: Optional[list[dict]] = None,
     report_sink: Optional[dict] = None,
 ) -> dict:
     """Same content as ``build_system_prompt`` but returned as 5 separately
@@ -151,11 +150,12 @@ def build_layered_system_prompt(
       tactic  — 战术后缀;一组队列内通常同一个战术保持不变
       p0      — 硬约束节;偶尔加规则
       p1      — 软偏好 + 调校笔记 + 正反例;变化最频繁的"可缓存"层
-      p2      — 会话临时指令 + 飞轮爆款参照;按定义就是 ephemeral,不缓存
+      p2      — 会话临时指令;按定义就是 ephemeral,不缓存
 
-    ``flywheel_lessons`` (R-032): TV 馆员按本次 brief 借来的真实爆款经验
-    (见 ``librarian_client``)。随 brief 每批变,只进 P2(不缓存),与 owner
-    主观 ``positive_examples`` 并列、不替代。``None`` / ``[]`` → 该节不出现。
+    R-038: 飞轮爆款参照(R-032)已从 P2 挪走 —— 它每批必变, 留在 system 会
+    让打在其后的 cache breakpoint(session 历史缓存)永不命中。现在由
+    ``render_flywheel_block`` 渲染、经 generator 的 ``user_context_block``
+    进当前 user turn; 模型看到的内容不变, 只是位置从 system 移到 user。
 
     See ``build_system_prompt`` for the legacy single-string flavour;
     that function is now a thin wrapper that joins the layers below.
@@ -177,7 +177,6 @@ def build_layered_system_prompt(
         report_sink["calibration_chars"] = len((calibration_notes or "").strip())
         report_sink["pos_examples"]     = len(positive_examples or [])
         report_sink["neg_examples"]     = len(negative_examples or [])
-        report_sink["flywheel_lessons"] = len(flywheel_lessons or [])
 
     # ── Layer 1: stable (base) ────────────────────────────────────────────
     # R-025: 在 base 最前面注入固定的输入安全声明。内容固定 → cache 前缀稳定。
@@ -257,32 +256,6 @@ def build_layered_system_prompt(
                 "与 P0 冲突时仍以 P0 为准。\n"
                 + bullets
             )
-    # R-032: TV 飞轮馆员按本次 brief 借来的"真实爆款经验"。必须放 P2(不缓存)——
-    # selected 随 brief(tactic/选题)每批变,放进缓存的 P1 会把 prompt cache 每批
-    # 打穿。与 owner 主观 [优质正案例] 并列、不替代(docs/14 §1 "owner 判断 ⊕
-    # 飞轮内容")。形状参考 P1 的 [优质正案例]。
-    if flywheel_lessons:
-        fw_blocks: list[str] = []
-        for L in flywheel_lessons[:5]:
-            if not isinstance(L, dict):
-                continue
-            # R-032 回执 §8.3:structure(结构)+ transferable_tactic(可迁移手法)
-            # 是经验卡核心(策展员就提炼这两样),一并注入。tier 不注入(轻量信号、
-            # 价值低),source_note_id 不注入(内部 id、对模型是噪音)。
-            fw_blocks.append(
-                f"· 钩子：{L.get('hook_type') or '?'}｜结构：{L.get('structure') or '?'}"
-                f"｜为何有效：{L.get('why_it_worked') or ''}\n"
-                f"  可迁移手法：{L.get('transferable_tactic') or ''}\n"
-                f"  借这条的：{L.get('borrow_what') or ''}（相关性：{L.get('why_relevant') or ''}）\n"
-                f"  原文片段：{(L.get('excerpt') or '')[:200]}"
-            )
-        if fw_blocks:
-            p2_sections.append(
-                "[真实爆款参照 · 系统按本次选题从帆谷飞轮库匹配]\n"
-                "下面是现实中真爆过 / 运营确认值得参考的帆谷笔记的提炼经验。"
-                "借鉴其钩子 / 结构 / 手法与角度，**严禁照抄原文的标题主干或具体句子**。\n"
-                + "\n\n".join(fw_blocks)
-            )
     p2 = "\n\n".join(p2_sections)
 
     return {
@@ -292,6 +265,43 @@ def build_layered_system_prompt(
         "p1":     p1,
         "p2":     p2,
     }
+
+
+def render_flywheel_block(flywheel_lessons: Optional[list[dict]]) -> str:
+    """渲染 TV 飞轮馆员借来的"真实爆款经验"块(R-032), 供 generator 的
+    ``user_context_block`` 注入当前 user turn。
+
+    R-038 前它注入 system P2 —— selected 随 brief 每批必变, 任何打在其后的
+    cache breakpoint(session 历史)永不命中, 把 Phase 2.1 整个堵死; 挪到
+    user turn 后模型看到的文本不变, 仅位置从 system 移到 user。
+    与 owner 主观 [优质正案例](P1)并列、不替代(docs/14 §1)。
+    空/无效输入返回 ""(该节不出现)。
+
+    字段口径(R-032 回执 §8.3): structure + transferable_tactic 是经验卡
+    核心, 一并注入; tier(轻量信号)/ source_note_id(内部 id 噪音)不注入;
+    excerpt 截 200 字。
+    """
+    if not flywheel_lessons:
+        return ""
+    fw_blocks: list[str] = []
+    for L in flywheel_lessons[:5]:
+        if not isinstance(L, dict):
+            continue
+        fw_blocks.append(
+            f"· 钩子：{L.get('hook_type') or '?'}｜结构：{L.get('structure') or '?'}"
+            f"｜为何有效：{L.get('why_it_worked') or ''}\n"
+            f"  可迁移手法：{L.get('transferable_tactic') or ''}\n"
+            f"  借这条的：{L.get('borrow_what') or ''}（相关性：{L.get('why_relevant') or ''}）\n"
+            f"  原文片段：{(L.get('excerpt') or '')[:200]}"
+        )
+    if not fw_blocks:
+        return ""
+    return (
+        "[真实爆款参照 · 系统按本次选题从帆谷飞轮库匹配]\n"
+        "下面是现实中真爆过 / 运营确认值得参考的帆谷笔记的提炼经验。"
+        "借鉴其钩子 / 结构 / 手法与角度，**严禁照抄原文的标题主干或具体句子**。\n"
+        + "\n\n".join(fw_blocks)
+    )
 
 
 def layered_system_prompt_to_string(layers: dict) -> str:
