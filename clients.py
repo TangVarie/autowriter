@@ -66,6 +66,11 @@ def get_anthropic_client() -> anthropic.Anthropic:
         kwargs: dict = {"api_key": config.ANTHROPIC_API_KEY}
         if config.ANTHROPIC_BASE_URL:
             kwargs["base_url"] = config.ANTHROPIC_BASE_URL
+        # R-042: 关掉 SDK 内置重试(默认 2 次)。所有调用点都包在
+        # with_anthropic_retry(外层至多 6 次尝试)里, 双层叠乘 = 持续 429 时
+        # 最多 ~18 个 HTTP 请求、内外退避相加可阻塞 daemon 线程数分钟。
+        # 收敛为单层: 重试策略只在 with_anthropic_retry 一处(500/504 已补)。
+        kwargs["max_retries"] = 0
         _anthropic_client = anthropic.Anthropic(**kwargs)
         return _anthropic_client
 
@@ -111,6 +116,17 @@ def reset_clients() -> None:
         _anthropic_client = None
     with _genai_lock:
         _genai_client = None
+    # R-042: generator._ENGINE_CACHE 里的引擎实例在构造时缓存了 client 引用,
+    # 只清本模块单例的话, 换 key/base_url 后所有生成仍走旧 client —— reset
+    # 语义对生成路径失效。经 sys.modules 清(不直接 import generator, 避免
+    # clients ↔ generator 循环导入)。
+    import sys
+    _gen = sys.modules.get("generator")
+    if _gen is not None:
+        try:
+            _gen._ENGINE_CACHE.clear()
+        except Exception:
+            pass
 
 
 # ── Retry middleware ──────────────────────────────────────────────────────
@@ -172,7 +188,9 @@ def _is_anthropic_transient(exc: BaseException) -> bool:
     if isinstance(exc, anthropic.RateLimitError):
         return True
     if isinstance(exc, anthropic.APIStatusError):
-        return exc.status_code in (429, 502, 503, 529)
+        # R-042: 补 500/504 —— Anthropic 文档视 5xx 为可重试; 旧表漏掉它们时
+        # 还有 SDK 内置重试兜底, 现在 SDK 层已关(max_retries=0), 必须补全。
+        return exc.status_code in (429, 500, 502, 503, 504, 529)
     if isinstance(exc, anthropic.APIConnectionError):
         return True
     return False

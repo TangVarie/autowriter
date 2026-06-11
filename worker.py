@@ -50,6 +50,11 @@ import threading
 import time
 import traceback
 
+# R-042: 必须在 import db **之前**设置 —— worker 进程里 streamlit 可 import,
+# db 的缓存 shim 会走真 st.cache_data(跨进程缓存, app 的 .clear() 失效不了它,
+# Phase 2 的 handler 会拿 30-60s 旧记忆/批次)。本进程禁用, 退化为直查。
+os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
+
 import config
 import db
 import telemetry

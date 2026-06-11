@@ -29,6 +29,15 @@ try:
 except Exception:
     _HAS_ST = False
 
+# R-042: worker.py 独立进程里 streamlit 同样可 import(同一份 requirements),
+# _HAS_ST=True 会让缓存 shim 走真 st.cache_data —— 跨进程缓存无法被 app 的
+# .clear() 失效, Phase 2 的 worker handler 一旦调 get_confirmed_memories 等
+# 就会拿 30-60s 旧数据(用户改完记忆立刻排队生成, worker 用旧记忆)。worker
+# 入口设 AW_DISABLE_ST_CACHE=1 让 shim 在该进程退化为透传。
+import os as _os
+if _os.environ.get("AW_DISABLE_ST_CACHE", "") in ("1", "true", "True"):
+    _HAS_ST = False
+
 
 def _cache_data(**kwargs):
     """Streamlit cache_data shim — no-op decorator when Streamlit isn't loaded
@@ -751,38 +760,44 @@ def update_project(client: Client, project_id: str, updates: dict) -> dict:
         "system_prompt_tone", "system_prompt_exec",
         "custom_roles", "calibration_notes",
     )
-    try:
-        res = (
-            client.table("projects")
-            .update(updates)
-            .eq("id", project_id)
-            .execute()
-        )
-    except Exception as exc:
-        msg = str(exc)
-        # 只在错误明确指向"列缺失"且涉及已知新列时才剥列重试
-        hit_cols = [c for c in _NEW_COLUMNS if c in msg and c in updates]
-        if not hit_cols:
-            raise
-        telemetry.log_event(
-            "update_project_schema_fallback",
-            project_id=project_id,
-            missing_columns=hit_cols,
-            error=msg[:200],
-        )
+    # R-042: PGRST204 每次只报**一个**缺失列名 —— 旧实现只剥一次且重试不在
+    # try 内, 同时缺 ≥2 个新列(未跑 Day2+Day3 迁移)时第二个缺列直接红屏,
+    # 恰是这段兜底要避免的结果。改成循环剥列: 每轮捕获 → 识别 → 剥 → 重试,
+    # 至多 len(_NEW_COLUMNS) 轮; 非缺列错误原样上抛。
+    payload = dict(updates)
+    all_missing: list[str] = []
+    res = None
+    for _ in range(len(_NEW_COLUMNS) + 1):
+        try:
+            res = (
+                client.table("projects")
+                .update(payload)
+                .eq("id", project_id)
+                .execute()
+            )
+            break
+        except Exception as exc:
+            msg = str(exc)
+            # 只在错误明确指向"列缺失"且涉及已知新列时才剥列重试
+            hit_cols = [c for c in _NEW_COLUMNS if c in msg and c in payload]
+            if not hit_cols:
+                raise
+            all_missing.extend(hit_cols)
+            telemetry.log_event(
+                "update_project_schema_fallback",
+                project_id=project_id,
+                missing_columns=hit_cols,
+                error=msg[:200],
+            )
+            payload = {k: v for k, v in payload.items() if k not in hit_cols}
+            if not payload:
+                # 这次写入的全部字段都是"新列"，剥完什么都没了，直接返回当前行
+                _record_schema_drift(all_missing)
+                cur = client.table("projects").select("*").eq("id", project_id).execute()
+                return (cur.data or [{}])[0]
+    if all_missing:
         # R-027: 不再静默——把缺失列塞 session_state 让主页面显式告警一次。
-        _record_schema_drift(hit_cols)
-        stripped = {k: v for k, v in updates.items() if k not in hit_cols}
-        if not stripped:
-            # 这次写入的全部字段都是"新列"，剥完什么都没了，直接返回当前行
-            cur = client.table("projects").select("*").eq("id", project_id).execute()
-            return (cur.data or [{}])[0]
-        res = (
-            client.table("projects")
-            .update(stripped)
-            .eq("id", project_id)
-            .execute()
-        )
+        _record_schema_drift(all_missing)
     list_projects.clear()
     return res.data[0]
 
@@ -903,6 +918,22 @@ def create_item(
         data["ai_review_notes"] = ai_review_notes
     res = client.table("items").insert(data).execute()
     return res.data[0]
+
+
+def delete_items(client: Client, item_ids: list[str]) -> None:
+    """按 id 批量删除 items(R-042: _save_batch_results 的孤儿回收用)。
+
+    versions 对 items 是 ON DELETE CASCADE(本场景下 versions 本就没插成功),
+    直接删 items 即可。分块防超长 .in_(); 删后清 list_items 缓存。"""
+    ids = [i for i in (item_ids or []) if i]
+    if not ids:
+        return
+    for i in range(0, len(ids), 100):
+        client.table("items").delete().in_("id", ids[i:i + 100]).execute()
+    try:
+        list_items.clear()
+    except Exception:
+        pass
 
 
 def bulk_create_items(client: Client, rows: list[dict]) -> list[dict]:
