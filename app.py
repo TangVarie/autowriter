@@ -4804,8 +4804,12 @@ def _run_iteration(
     except Exception:
         pass
 
-    # Reset item to pending so it gets reviewed again
-    db.update_item_status(db_client, item["id"], "pending")
+    # Reset item to pending so it gets reviewed again.
+    # R-036: 同时清掉 best_version_id —— 旧指针不清的话, 卡片的展示版本
+    # (_render_item_card 按 best_vid 选)和导出(_collect_approved_items 同
+    # 口径)会一直停在迭代前的旧版本, 用户看到"迭代成功!"但内容纹丝不动。
+    # 清掉后回到"无最佳 → 取最新版本"的默认行为, 新版本立即可见。
+    db.update_item_status(db_client, item["id"], "pending", clear_best_version=True)
 
     # Iteration succeeded — drop the saved draft so the textarea doesn't
     # auto-restore it on the next render.
@@ -4872,7 +4876,19 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
     为本次时间戳，确保下次打开同一批次（甚至换浏览器 / 重登）不再重复反思。
     失败路径不打标记 — 下次进来还会再试一次。
     """
-    existing = (project.get("calibration_notes") or "").rstrip()
+    # R-036: 基线必须现读 DB 行, 不能用页面渲染时的 project 快照 ——
+    # 快照来自 list_projects(ttl=60 缓存), "迭代几条 → 60 秒内全批审完"
+    # 这个常见流程里, 迭代刚 CAS 追加的笔记不在快照里; 反思以 stale 基线
+    # 生成全文再覆盖写, 刚追加的观察被静默抹掉(lost update)。
+    # 同时把原始列值(未 rstrip)留作 CAS witness —— save_calibration_notes
+    # 的 .eq() 比较的是原始值, 传 rstrip 过的会永远冲突。
+    fresh = None
+    try:
+        fresh = db.get_project(db_client, project["id"])
+    except Exception:
+        pass
+    raw_existing = ((fresh or project).get("calibration_notes") or "")
+    existing = raw_existing.rstrip()
     try:
         with st.spinner("🧠 太子学习中…"):
             notes = mem_module.generate_calibration_notes(
@@ -4885,8 +4901,13 @@ def _auto_update_calibration_notes(project: dict, batch_id: str, items: list[dic
             # save when nothing changed so the row's timestamp / dedup ordering
             # stays untouched.
             if notes and notes.rstrip() != existing:
+                # R-036: 带 CAS witness 写入 —— 反思期间(LLM 调用要几秒)若有
+                # 并发写(迭代沉淀/merger taste), CAS 冲突抛出 → 走下面 except:
+                # 本次不保存也不打 auto_calibrated 标记, 下次打开批次重试,
+                # 不再盲覆盖别人刚写的内容。
                 mem_module.save_calibration_notes(
                     db_client, project["id"], notes, source="batch_reflection",
+                    expected_before_text=raw_existing,
                 )
                 st.toast("🧠 调教笔记已新增观察（太子学习完成）")
             # 不论这次有没有新观察，标记"已学过"；下次同样的批次没必要再花 token

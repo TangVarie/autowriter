@@ -1190,11 +1190,21 @@ def list_items_for_batches(
 
 
 def update_item_status(
-    client: Client, item_id: str, status: str, best_version_id: Optional[str] = None
+    client: Client, item_id: str, status: str, best_version_id: Optional[str] = None,
+    clear_best_version: bool = False,
 ) -> dict:
+    """更新 item 状态; ``best_version_id`` truthy 时一并写入。
+
+    R-036: ``clear_best_version=True`` 显式把 best_version_id 置 NULL ——
+    此前全代码库没有任何清除路径(``if best_version_id`` 只在 truthy 时写),
+    迭代出新版本后旧的"最佳"指针仍指着老版本, 卡片/导出永远展示旧文。
+    仅在未同时传入新 best_version_id 时生效。
+    """
     updates: dict[str, Any] = {"status": status}
     if best_version_id:
         updates["best_version_id"] = best_version_id
+    elif clear_best_version:
+        updates["best_version_id"] = None
     res = client.table("items").update(updates).eq("id", item_id).execute()
     try:
         list_items.clear()
