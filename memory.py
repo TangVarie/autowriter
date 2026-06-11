@@ -874,15 +874,25 @@ def save_calibration_notes(
 
     try:
         if expected_before_text is not None:
-            # CAS 路径：直接走 supabase client 加 .eq 约束，绕过 update_project
+            # CAS 路径：直接走 supabase client 加约束，绕过 update_project
             # 的 schema-fallback（calibration_notes 是稳定列，不在 fallback 名单）
-            res = (
+            _q = (
                 db_client.table("projects")
                 .update({"calibration_notes": deduped})
                 .eq("id", project_id)
-                .eq("calibration_notes", expected_before_text)
-                .execute()
             )
+            if expected_before_text == "":
+                # R-036 review: calibration_notes 列 nullable 无默认 —— 从未写过
+                # 笔记的项目该列是 NULL, 不是 ""。witness 是 "" 时 .eq 匹配不到
+                # NULL 行 → 0 行被当成冲突 → 无笔记项目的"首次自动学习"永远存不
+                # 进、批次永不标记 calibrated(下次重试还冲突, 死循环)。空 witness
+                # 的语义是"我读到的是无既有笔记", NULL 与 "" 都属此态, 用 or 覆盖
+                # 两者 —— 既修首次学习回归, 又保留并发 lost-update 保护(若并发
+                # 已写入真笔记, 该行不再 null/空 → 0 行 → 仍判冲突)。
+                _q = _q.or_("calibration_notes.is.null,calibration_notes.eq.")
+            else:
+                _q = _q.eq("calibration_notes", expected_before_text)
+            res = _q.execute()
             if not res.data:
                 # 0 行受影响：并发已经改了 calibration_notes
                 raise _CalibrationCASConflict()
