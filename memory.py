@@ -485,49 +485,70 @@ def classify_and_merge_feedback(
             system=_MERGER_SYSTEM,
             messages=[{"role": "user", "content": user_msg}],
         ))
-        raw = resp.content[0].text.strip()
+        # R-036: join 全部 text block(R-033 同款 —— opus 系经中转可能把前言
+        # 与 JSON 拆成两个 text block, 只取 content[0] 会丢 JSON)+ 按首末
+        # 大括号切片容忍前言(本函数是整串 json.loads, 仅 join 不够)。
+        raw = "\n".join(
+            b.text for b in resp.content
+            if getattr(b, "type", None) == "text" and getattr(b, "text", "")
+        ).strip()
         # strip ```json fences if the model wrapped them
         import re as _re
         cleaned = _re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start != -1 and end > start:
+            cleaned = cleaned[start:end + 1]
         data = json.loads(cleaned)
+        if not isinstance(data, dict):
+            return fallback
     except Exception:
         return fallback
 
-    action = data.get("action")
-    if action not in ("merge", "rule", "taste", "session"):
-        return fallback
-    out: dict = {
-        "action": action,
-        "content": (data.get("content") or clean)[:80].strip(),
-        "reason": (data.get("reason") or "")[:60].strip(),
-        "source_feedback": clean,
-    }
-    if action == "merge":
-        out["target_id"] = str(data.get("target_id") or "").strip()
-        if not out["target_id"]:
-            # merger said merge but gave no id — safer to treat as rule
-            out["action"] = "rule"
-            out["scope"] = "project"
-    if out["action"] == "rule":
-        scope = data.get("scope")
-        out["scope"] = "global" if scope == "global" else "project"
-        # Hard vs soft tier：合规级硬规则不能因 merger 回退（merge → rule）而被
-        # 静默降级为 soft。merger 在判 ``merge`` 时往往不返回 severity（因为本意
-        # 是累加旧规则），一旦目标 id 缺失回退到 rule，若仅看 ``data.get("severity")``
-        # 就只能拿到默认 soft——用户写了"严禁/必须"也丢到 P1，P0 兜底失效。
-        # 这里额外做一次原文文本探测，含合规级触发词时强制升回 hard。
-        severity = (data.get("severity") or "soft").lower()
-        _HARD_CUES = (
-            "禁止", "严禁", "不得", "必须", "杜绝", "不能出现",
-            "绝对不要", "一律不", "违反法规", "合规",
+    # R-036: 解析后的字段处理同样要设防。此前 try 只包到 json.loads, 模型
+    # 返回"合法 JSON 但形状错"(content 是数字 / applicability 非 str 等)时
+    # TypeError 会从 ingest_user_instruction 一路炸到 per-plan except ——
+    # 用户的一条反馈让整个生成计划中止。逐字段 str 矫正 + 整段兜底。
+    try:
+        action = data.get("action")
+        if action not in ("merge", "rule", "taste", "session"):
+            return fallback
+        out: dict = {
+            "action": action,
+            "content": str(data.get("content") or clean)[:80].strip(),
+            "reason": str(data.get("reason") or "")[:60].strip(),
+            "source_feedback": clean,
+        }
+        if action == "merge":
+            out["target_id"] = str(data.get("target_id") or "").strip()
+            if not out["target_id"]:
+                # merger said merge but gave no id — safer to treat as rule
+                out["action"] = "rule"
+                out["scope"] = "project"
+        if out["action"] == "rule":
+            scope = data.get("scope")
+            out["scope"] = "global" if scope == "global" else "project"
+            # Hard vs soft tier：合规级硬规则不能因 merger 回退（merge → rule）而被
+            # 静默降级为 soft。merger 在判 ``merge`` 时往往不返回 severity（因为本意
+            # 是累加旧规则），一旦目标 id 缺失回退到 rule，若仅看 ``data.get("severity")``
+            # 就只能拿到默认 soft——用户写了"严禁/必须"也丢到 P1，P0 兜底失效。
+            # 这里额外做一次原文文本探测，含合规级触发词时强制升回 hard。
+            severity = str(data.get("severity") or "soft").lower()
+            _HARD_CUES = (
+                "禁止", "严禁", "不得", "必须", "杜绝", "不能出现",
+                "绝对不要", "一律不", "违反法规", "合规",
+            )
+            if severity != "hard" and any(cue in clean for cue in _HARD_CUES):
+                severity = "hard"
+            out["severity"] = "hard" if severity == "hard" else "soft"
+            applicability = str(data.get("applicability") or "").strip()
+            if applicability:
+                out["applicability"] = applicability[:32]
+        return out
+    except Exception as exc:
+        telemetry.log_event(
+            "merger_postprocess_failed", error=str(exc)[:200],
         )
-        if severity != "hard" and any(cue in clean for cue in _HARD_CUES):
-            severity = "hard"
-        out["severity"] = "hard" if severity == "hard" else "soft"
-        applicability = (data.get("applicability") or "").strip()
-        if applicability:
-            out["applicability"] = applicability[:32]
-    return out
+        return fallback
 
 
 def ingest_user_instruction(
@@ -853,18 +874,36 @@ def save_calibration_notes(
 
     try:
         if expected_before_text is not None:
-            # CAS 路径：直接走 supabase client 加 .eq 约束，绕过 update_project
+            # CAS 路径：直接走 supabase client 加约束，绕过 update_project
             # 的 schema-fallback（calibration_notes 是稳定列，不在 fallback 名单）
-            res = (
+            _q = (
                 db_client.table("projects")
                 .update({"calibration_notes": deduped})
                 .eq("id", project_id)
-                .eq("calibration_notes", expected_before_text)
-                .execute()
             )
+            if expected_before_text == "":
+                # R-036 review: calibration_notes 列 nullable 无默认 —— 从未写过
+                # 笔记的项目该列是 NULL, 不是 ""。witness 是 "" 时 .eq 匹配不到
+                # NULL 行 → 0 行被当成冲突 → 无笔记项目的"首次自动学习"永远存不
+                # 进、批次永不标记 calibrated(下次重试还冲突, 死循环)。空 witness
+                # 的语义是"我读到的是无既有笔记", NULL 与 "" 都属此态, 用 or 覆盖
+                # 两者 —— 既修首次学习回归, 又保留并发 lost-update 保护(若并发
+                # 已写入真笔记, 该行不再 null/空 → 0 行 → 仍判冲突)。
+                _q = _q.or_("calibration_notes.is.null,calibration_notes.eq.")
+            else:
+                _q = _q.eq("calibration_notes", expected_before_text)
+            res = _q.execute()
             if not res.data:
                 # 0 行受影响：并发已经改了 calibration_notes
                 raise _CalibrationCASConflict()
+            # R-036: CAS 路径绕过 db.update_project, 必须自己失效
+            # list_projects 缓存(ttl=60)。否则"迭代沉淀笔记 → 马上排队
+            # 下一批"时, 队列 worker 从缓存拿旧 project 行拼 prompt,
+            # 刚学的笔记看不到 —— 体感"学了没生效"。
+            try:
+                db.list_projects.clear()
+            except Exception:
+                pass
         else:
             db.update_project(db_client, project_id, {"calibration_notes": deduped})
     except _CalibrationCASConflict:
@@ -1835,6 +1874,12 @@ def _render_bottom_tools(
                         source_feedback="手动添加",
                         project_id=pid,
                         auto_confirm_threshold=1,
+                        # R-036: INSERT 路径的 status 只看 force_confirmed,
+                        # 不看 threshold —— 此前手动添加的规则落库为 candidate,
+                        # 显示"已添加"却永不注入 P0 / 不进 validator, 直到用户
+                        # 去候选列表再点一次确认。手动添加 = 用户明确要这条规则,
+                        # 直接 confirmed。
+                        force_confirmed=True,
                         severity="hard" if is_hard else "soft",
                         rule_kind=rule_kind if is_hard else None,
                         rule_payload=rule_payload if is_hard else None,
@@ -1913,6 +1958,10 @@ def _render_bottom_tools(
                                     source_feedback=m.get("source_feedback", "导入"),
                                     project_id=pid,
                                     auto_confirm_threshold=1,
+                                    # R-036: 同手动添加 —— 导入是用户的明确动作,
+                                    # 不传 force_confirmed 会全部落成永不注入的
+                                    # candidate(INSERT 路径不看 threshold)。
+                                    force_confirmed=True,
                                 )
                                 imported += 1
                             st.success(f"已导入 {imported} 条记忆。")
