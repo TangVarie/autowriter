@@ -1035,6 +1035,18 @@ def _queue_worker_impl(
         status["message"] = f"计划 {idx+1}/{len(plans)} — {proj_name} · {tactic or '通用'}"
 
         try:
+            # R-039: metrics 必须是 try 内**第一条**语句。旧位置在 project 取数
+            # 之后 —— 异常发生在创建之前时(plan 缺键 / system_prompt 为 NULL 的
+            # AttributeError 等), 首个 plan 的 except 里是 NameError(被内层 try
+            # 吞掉, 错误卡片直接丢失); 第 ≥2 个 plan 则对**上一个 plan 已 close
+            # 的** metrics 再 set_meta+close —— metrics_list 多出一张错误归因到
+            # 错批次的重复卡片(quick gen 路径早已用"创建前置"修过, queue 未回灌)。
+            metrics = telemetry.BatchMetrics(
+                project_id=str(plan.get("project_id") or ""),
+                mode="queue",
+                engines=list(plan.get("engines", [])),
+                count=int(plan.get("count", 0) or 0),
+            )
             project_id = plan["project_id"]
             project = project_by_id.get(project_id)
             if not project:
@@ -1046,16 +1058,9 @@ def _queue_worker_impl(
                 status["errors"].append(f"计划 {idx+1}：项目未配置 System Prompt")
                 continue
 
-            # 单批次指标：用于事后分析"慢/卡/重"出在哪一段，对应阶段名：
-            # setup（取数）/ llm（生成）/ db_save（落库）/ embedding（语义查重）
-            metrics = telemetry.BatchMetrics(
-                project_id=project_id,
-                mode="queue",
-                engines=list(plan.get("engines", [])),
-                count=int(plan.get("count", 0)),
-            )
-
             # ── [A 取数] 项目配置/记忆/示例/会话指令（带 per-project 缓存）──
+            # 单批次指标阶段名：setup（取数）/ llm（生成）/ db_save（落库）/
+            # embedding（语义查重）
             metrics.start_phase("setup")
             _set_phase_progress(status, "setup")
             tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic) if tactic else ""
@@ -3128,6 +3133,26 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # Day 4：注入可视化（quick gen 与 queue worker 行为一致）
         # Phase 1：同 worker 路径，用 layered builder。
         inject_report: dict = {"filtered": []}
+        # R-039: 补齐 queue 路径的 [B 相关性筛选] —— 上面那行"与 queue worker
+        # 行为一致"的注释此前是假的: quick gen 把 soft 规则全量注入, 同一项目
+        # 两条路 prompt 不同、注入可视化的"过滤 N 条"恒为 0。hard 规则不受
+        # filter_soft_by_relevance 影响, 全量保留。
+        # PR #54 review: image_prompt 也要进相关性上下文 —— 它最终经
+        # combined_extra 发给模型, 不参与过滤的话, 图片相关的 soft 规则
+        # (如"产品图描述偏好")会因与 tactic/卖点语义距离远而被静默滤掉。
+        _qg_context_text = " ".join(filter(None, [
+            tactic,
+            plan.get("key_messages", ""),
+            plan.get("target_audience", ""),
+            extra_instr,
+            image_prompt,
+        ])).strip()
+        global_mems = mem_module.filter_soft_by_relevance(
+            global_mems, _qg_context_text, report_sink=inject_report,
+        )
+        project_mems = mem_module.filter_soft_by_relevance(
+            project_mems, _qg_context_text, report_sink=inject_report,
+        )
         # ── R-032: 同 _queue_worker_impl —— 借阅飞轮经验（fail-open 成 []）。
         # R-038: 改经 user_context_block 注入 user turn, 不再进 system P2。
         flywheel_lessons = librarian_client.fetch_flywheel_lessons(
@@ -3190,6 +3215,35 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             )
 
         historical_titles = db.get_recent_titles_and_openings(db_client, project_id)
+
+        # R-039: 预热 DB 历史向量池(对齐 queue 的 primed_projects 逻辑)。
+        # 旧的空 dict 让 _run_semantic_dedup_pass 的"历史对比"整段跳过 ——
+        # quick gen 永远检不出与库内历史"换字不换义"的语义重复, 且零提示。
+        # PR #54 review: 必须在 _save_batch_results **之前**取 —— 保存后再取,
+        # 本批刚插入的版本(尚无 embedding)会按"最新"挤占 limit 名额, 再被
+        # 下面的 embedding 过滤丢掉 → 大批次能把真历史整段挤出查重池。
+        # queue 路径的预热同样发生在保存前(首见项目时), 此处对齐。
+        quick_queue_embeddings: dict[str, list[dict]] = {}
+        if dedup_module.embeddings_available():
+            try:
+                _hist_rows = db.get_recent_titles_openings_with_embeddings(
+                    db_client, project_id
+                )
+                _seed = [
+                    {"title": h["title"], "embedding": h["embedding"]}
+                    for h in _hist_rows
+                    if h.get("embedding") and h.get("title")
+                ]
+                if _seed:
+                    quick_queue_embeddings[project_id] = _seed
+            except Exception as _exc:
+                telemetry.log_event(
+                    "embedding_prime_failed",
+                    project_id=project_id, error=str(_exc)[:200],
+                )
+                status.setdefault("warnings", []).append(
+                    f"项目历史向量加载失败：{str(_exc)[:120]}（语义查重缺历史维度）"
+                )
 
         # Phase 2.1: session 路由 — 同 _queue_worker_impl 逻辑
         engine_session_ids, engine_prior_messages = _resolve_engine_sessions(
@@ -3272,7 +3326,11 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         #  ~30 round trip；改批量后收敛为 2 次）
         metrics.start_phase("db_save")
         _set_phase_progress(status, "db_save")
-        errors: list[str] = []
+        # R-039: 直接挂到 status —— 旧的本地 list 只在成功跑到结尾才赋给
+        # status["errors"], 中途任何一步抛异常(_save_batch_results 之后的
+        # dedup/硬约束/occupancy), 已收集的"某引擎生成失败"等全部丢失,
+        # 运行中 UI 也看不到(queue 路径从一开始就是直挂的)。
+        errors = status.setdefault("errors", [])
         inserted_items, inserted_versions, _produced_titles = _save_batch_results(
             db_client, batch_id, user_id, generation_results,
             error_prefix="",  # Quick Generate 不需要 "计划 N（项目）：" 前缀
@@ -3289,7 +3347,9 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # Quick Generate 只跑一个批次，所以 queue_embeddings 是个只有当前
         # project_id 的临时字典；命中重复直接写到 errors 数组里。
         _set_phase_progress(status, "embedding")
-        quick_queue_embeddings: dict[str, list[dict]] = {}
+        # (历史向量池 quick_queue_embeddings 已在保存批次**之前**预热 ——
+        #  见 historical_titles 取数处; PR #54 review: 在保存之后预热会让刚
+        #  落库的无向量版本挤占 limit 名额, 把真历史挤出语义查重池。)
         # Day 5：quick gen 也支持策略覆盖（plan 字段同 queue）
         strategy_ctx = _resolve_queue_strategy(plan, project)
         metrics.set_meta(
@@ -3332,7 +3392,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
 
         status["saved_count"] = saved_count
         status["n_results"]   = len(generation_results)
-        status["errors"]      = errors
+        # (errors 已实时挂在 status["errors"] 上, 无需结尾回写)
         status["message"]     = f"生成完成！{len(generation_results)} 篇，{saved_count} 个版本已保存。"
         metrics.batch_id = batch_id
         metrics.set_meta("saved", saved_count)
@@ -3789,6 +3849,13 @@ def page_generate(project: dict) -> None:
                     "Gemini 思考模式",
                     help="thinking_budget=-1 动态分配；对 2.5 Pro 效果明显。",
                 )
+                # R-039: 与队列 tab 的 R-033 提示对齐 —— quick gen 此前缺失,
+                # SDK<1.x 时开关被静默忽略(关也省不下 thinking 费用)。
+                if not gen_module.gemini_thinking_supported():
+                    st.caption(
+                        "⚠️ 当前 google-genai SDK(<1.x)不支持 thinking 控制：开关"
+                        "开/关都会被忽略、模型按默认行为运行(升级依赖后生效)。"
+                    )
         else:
             # Standard mode: single or multi-engine
             engine_mode = st.radio(
@@ -3829,12 +3896,31 @@ def page_generate(project: dict) -> None:
                     "Gemini：思考模式",
                     help="thinking_budget=-1 动态分配；对 2.5 Pro 效果明显。",
                 )
+                # R-039: 同上 —— SDK 能力提示补齐
+                if not gen_module.gemini_thinking_supported():
+                    st.caption(
+                        "⚠️ 当前 google-genai SDK(<1.x)不支持 thinking 控制：开关"
+                        "开/关都会被忽略、模型按默认行为运行(升级依赖后生效)。"
+                    )
 
         with st.expander("⚙️ 高级参数"):
-            target_audience   = st.text_input("目标人群", placeholder="例：25-35岁职场女性")
-            key_messages      = st.text_input("核心卖点/关键词", placeholder="例：低度数、清爽、派对感")
-            tone              = st.text_input("语气偏好", placeholder="例：活泼口语化、朋友间分享")
-            extra_instructions = st.text_area("补充说明", height=80, placeholder="其他要求...")
+            # R-039: 必须带 per-project key。无 key 时 Streamlit 按(类型+label+
+            # 参数)算 widget 身份, 切换项目后这些 proto 不变 → A 项目填的卖点
+            # 原样带进 B 项目的生成(本文件其余 widget 均已按 pid 隔离, 这四个
+            # 是漏网)。
+            _qpid = project["id"]
+            target_audience   = st.text_input(
+                "目标人群", placeholder="例：25-35岁职场女性",
+                key=f"qg_adv_aud_{_qpid}")
+            key_messages      = st.text_input(
+                "核心卖点/关键词", placeholder="例：低度数、清爽、派对感",
+                key=f"qg_adv_msg_{_qpid}")
+            tone              = st.text_input(
+                "语气偏好", placeholder="例：活泼口语化、朋友间分享",
+                key=f"qg_adv_tone_{_qpid}")
+            extra_instructions = st.text_area(
+                "补充说明", height=80, placeholder="其他要求...",
+                key=f"qg_adv_extra_{_qpid}")
 
     # ── Main area: tab switcher ────────────────────────────────────────
     # 之前用 ``st.tabs``，但它没有 ``key`` 参数 —— active tab 是 client-side
@@ -5115,7 +5201,11 @@ def page_export(project: dict) -> None:
 
     # ── Export controls ─────────────────────────────────────────────────
     # Show previously generated export if available
-    exp_state = st.session_state.get("export_center_result")
+    # R-039: 结果 key 按项目隔离 —— 全局 key 在切项目后仍显示上一项目的
+    # "文件已就绪"下载按钮(bytes/文件名都是旧项目的, 误下载风险)。
+    # _qg_key/_rb_key 同类问题早已修过, 这个漏了。
+    _exp_key = f"export_center_result_{project['id']}"
+    exp_state = st.session_state.get(_exp_key)
     if exp_state:
         st.success(f"文件已就绪，共 {exp_state['count']} 篇内容，来自 {exp_state['n_batches']} 个批次。")
         dl_col, clr_col = st.columns([3, 1])
@@ -5130,7 +5220,7 @@ def page_export(project: dict) -> None:
             )
         with clr_col:
             if st.button("清除", key="exp_clear", use_container_width=True):
-                st.session_state.pop("export_center_result", None)
+                st.session_state.pop(_exp_key, None)
                 st.rerun()
 
     # Map batch_id → items for fast lookup (already loaded above)
@@ -5155,7 +5245,7 @@ def page_export(project: dict) -> None:
                 xlsx_bytes = exporter.build_combined_excel(all_items)
                 brand = project.get("brand", "") or project_name
                 filename = f"xhs_{brand}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-                st.session_state["export_center_result"] = {
+                st.session_state[_exp_key] = {
                     "bytes":    xlsx_bytes,
                     "count":    len(all_items),
                     "n_batches": n_selected,
