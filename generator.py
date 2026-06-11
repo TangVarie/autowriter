@@ -691,11 +691,19 @@ def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[Generat
 # ── Claude engine ──────────────────────────────────────────────────────────
 
 def _extract_text_from_response(response) -> str:
-    """Extract the first text block, skipping thinking blocks."""
-    for block in response.content:
-        if getattr(block, "type", None) == "text":
-            return block.text
-    return ""
+    """Join ALL text blocks, skipping thinking blocks.
+
+    R-033: opus-4-8(经中转站)会把"思考前言"和正文 JSON 拆成**两个 text
+    block** 返回;旧实现只取第一个 block,后面的 JSON 整个丢失 → 解析层只
+    看到英文前言 → 整批(解析失败)。join 所有 text block 后,前言+JSON 同
+    在一段文本里,下游的括号配对抽取(_extract_json_objects / 数组切片)
+    本来就容忍前后杂讯,可正常解出。单 block 响应行为不变。
+    """
+    parts = [
+        block.text for block in response.content
+        if getattr(block, "type", None) == "text" and getattr(block, "text", "")
+    ]
+    return "\n".join(parts)
 
 
 class ClaudeEngine:
@@ -885,6 +893,56 @@ class ClaudeEngine:
 
 # ── Gemini engine ──────────────────────────────────────────────────────────
 
+def gemini_thinking_supported() -> bool:
+    """当前安装的 google-genai SDK 是否支持 ``thinking_budget``。
+
+    R-033: 该字段 1.x 起才有;0.x 的 ``ThinkingConfig``(pydantic
+    ``extra=forbid``)收到它直接 ValidationError。UI 用本函数在用户打开
+    Gemini thinking 开关时给出"开关无效"的明示,而不是静默忽略。
+    """
+    if not _GEMINI_AVAILABLE:
+        return False
+    fields = getattr(genai_types.ThinkingConfig, "model_fields", None)
+    if fields is not None:
+        return "thinking_budget" in fields
+    # 非 pydantic 形态的未来版本: 用试构造探测
+    try:
+        genai_types.ThinkingConfig(thinking_budget=0)
+        return True
+    except Exception:
+        return False
+
+
+_thinking_unsupported_warned = False
+
+
+def _build_thinking_config(budget: int):
+    """ThinkingConfig 兼容构造: 不支持/构造失败 → ``None`` + telemetry,绝不抛。
+
+    R-033 线上事故: ``ThinkingConfig(thinking_budget=-1)`` 在 google-genai
+    0.8.0(锁定版)上抛 pydantic ValidationError,且发生在 ``generate()`` 的
+    try 块之外 → 整个引擎调用炸掉、该批 Gemini 0 产出。注意 ``budget=0``
+    (flash 系关思考省钱的路径)在 0.x 上**同样炸**——即当时部署里 Gemini
+    只有 "2.5-pro/3.x + thinking 关" 一条路能活。本函数把两条路径都收敛为
+    "降级到模型默认行为",配置构造永远不杀死生成调用。
+    """
+    global _thinking_unsupported_warned
+    if not gemini_thinking_supported():
+        if not _thinking_unsupported_warned:
+            _thinking_unsupported_warned = True
+            telemetry.log_event(
+                "gemini_thinking_budget_unsupported",
+                budget=budget,
+                hint="google-genai<1.x 无 thinking_budget 字段, 已按模型默认行为降级",
+            )
+        return None
+    try:
+        return genai_types.ThinkingConfig(thinking_budget=budget)
+    except Exception as exc:
+        telemetry.log_event("gemini_thinking_config_error", error=str(exc)[:200])
+        return None
+
+
 class GeminiEngine:
     def __init__(self) -> None:
         if not _GEMINI_AVAILABLE:
@@ -929,18 +987,25 @@ class GeminiEngine:
         ThinkingConfig(thinking_budget=0).
 
         When use_thinking=True we always request dynamic budget (-1).
+
+        R-033: ThinkingConfig 构造走 ``_build_thinking_config``(SDK 不支持
+        thinking_budget 时降级为 None = 不传, 模型按默认行为跑)。此前直接
+        构造 + 只接 AttributeError, 真实抛的是 pydantic ValidationError 且
+        本方法在 ``generate()`` 的 try 之外被调 → 整批 Gemini 0 产出。
         """
         kwargs: dict = {"max_output_tokens": max(8192, count * 2000)}
         thinking_only = ("gemini-3" in model) or ("2.5-pro" in model)
-        try:
-            if use_thinking:
-                kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=-1)
-            elif not thinking_only:
-                # Only flash / flash-lite accept budget=0; pro / 3.x reject it
-                kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_budget=0)
+        budget: Optional[int] = None
+        if use_thinking:
+            budget = -1
+        elif not thinking_only:
+            # Only flash / flash-lite accept budget=0; pro / 3.x reject it.
             # thinking_only + use_thinking=False: omit ThinkingConfig entirely
-        except AttributeError:
-            pass
+            budget = 0
+        if budget is not None:
+            tc = _build_thinking_config(budget)
+            if tc is not None:
+                kwargs["thinking_config"] = tc
         return genai_types.GenerateContentConfig(**kwargs)
 
     def _parse_gemini_response(self, response, model: str) -> GenerationResult:
@@ -1291,6 +1356,101 @@ def _build_dedup_instruction(
     return "\n".join(lines)
 
 
+def _topup_failed_slots(
+    engine,
+    engine_name: str,
+    system_prompt,
+    items: list[GenerationResult],
+    make_topup_prompt,
+    *,
+    images: Optional[list[dict]] = None,
+    use_thinking: bool = False,
+    model: str = "",
+    prior_messages: Optional[list[dict]] = None,
+    metrics: Optional["telemetry.BatchMetrics"] = None,
+    metrics_source: str = "main",
+) -> list[GenerationResult]:
+    """对一次引擎调用里失败/缺失的槽位做一次补量调用(R-033)。
+
+    为什么会有失败位: 多样性硬约束明确允许模型"宁可少出一条也不要硬出
+    重复项"(见 ``_make_user_prompt`` / ``_build_dedup_instruction``)——
+    count=10 实际返回 8 篇是 **prompt 授权的正常行为**, 不是模型失误;
+    个别对象 JSON 损坏同理。此前这些缺口直接以错误条目报到 UI("AI仅返
+    回了8篇"), 用户拿到的内容数对不上。本函数把已产出标题喂进避重清单
+    后**恰好按缺口数**再调一次, 补量产物按原槽位回填; 仍补不满的部分保
+    留原错误如实上报。
+
+    ``make_topup_prompt(missing, produced_in_call) -> str`` 由调用方提供
+    (generate_batch 闭包), 负责按缺口数重建 user prompt + 合并避重清单。
+
+    安全边界:
+      - 每次引擎调用最多补一刀(无递归);
+      - 整调用级失败(所有槽位都带 "API错误" 前缀)不补 —— retry
+        middleware 已重试过, 再打大概率同样失败, 纯烧钱;
+      - 全失败但非 API 错误(整段解析崩)→ 按全量缺口补一次, 等价一次
+        重试 —— 这是"整批 0 内容"事故的最后兜底;
+      - 补量调用自身任何异常不向上抛, 原 items 原样返回。
+    """
+    if not getattr(config, "ENABLE_UNDERCOUNT_TOPUP", True):
+        return items
+    failed_idx = [
+        i for i, it in enumerate(items)
+        if it.error or not (it.title or "").strip()
+    ]
+    if not failed_idx:
+        return items
+    if len(failed_idx) == len(items) and any(
+        "API错误" in (it.error or "") for it in items
+    ):
+        return items
+    failed_set = set(failed_idx)
+    produced_in_call: list[dict] = []
+    for i, it in enumerate(items):
+        if i in failed_set:
+            continue
+        opening = ""
+        body = (it.body or "").strip()
+        if body:
+            line = next((ln for ln in body.splitlines() if ln.strip()), "")
+            opening = line.strip()[:25]
+        produced_in_call.append({"title": (it.title or "").strip(), "opening": opening})
+    missing = len(failed_idx)
+    telemetry.log_event(
+        "undercount_topup_start",
+        engine=engine_name, missing=missing, total=len(items),
+    )
+    try:
+        topup = engine.generate(
+            system_prompt=system_prompt,
+            user_prompt=make_topup_prompt(missing, produced_in_call),
+            images=images,
+            use_thinking=use_thinking,
+            model=model,
+            count=missing,
+            prior_messages=prior_messages,
+        )
+    except Exception as exc:
+        telemetry.log_event(
+            "undercount_topup_error", engine=engine_name, error=str(exc)[:200],
+        )
+        return items
+    # 补量是独立的一次 API 调用, 与主调用同套路按"调用边界"归集一次 token
+    # (N 个结果共享同一 usage dict, 只加一次)。
+    if metrics is not None and topup:
+        head_usage = next((t.token_usage for t in topup if t.token_usage), None)
+        if head_usage:
+            head_engine = next((t.ai_engine for t in topup if t.ai_engine), engine_name)
+            metrics.add_tokens(head_engine, head_usage, source=metrics_source)
+    good = [t for t in topup if not t.error and (t.title or "").strip()]
+    for slot_i, repl in zip(failed_idx, good):
+        items[slot_i] = repl
+    telemetry.log_event(
+        "undercount_topup_done",
+        engine=engine_name, requested=missing, recovered=len(good),
+    )
+    return items
+
+
 def generate_batch(
     system_prompt,
     tactic: str,
@@ -1359,20 +1519,61 @@ def generate_batch(
     # its dedup block; otherwise two parallel engines would each produce 10
     # items blind to the other, doubling the in-batch duplicate rate.
 
+    # 跨引擎已产出池({"title","opening"}): 顺序路径里后一个引擎避重用,
+    # R-033 起补量 prompt 也合并它(单引擎路径保持空)。
+    produced: list[dict] = []
+
+    def _mk_topup_prompt(missing: int, produced_in_call: list[dict]) -> str:
+        """R-033 补量 prompt: 按缺口数重建生成指令(count=missing, 让"生成
+        N 篇"与各处数字一致), 避重清单合并 DB 历史 + 跨引擎已产出 + 本次
+        调用已产出。dict 按 title 去重; _build_dedup_instruction 内部取
+        尾部 20 条, 插入顺序让"本调用产出"排最后 = 优先保留(对补量避重
+        最关键)。"""
+        base = _make_user_prompt(
+            tactic=tactic,
+            target_audience=target_audience,
+            key_messages=key_messages,
+            tone=tone,
+            extra=extra_instructions,
+            count=missing,
+        )
+        combined: dict[str, dict] = {}
+        for src_list in ((historical_titles or []), produced, produced_in_call):
+            for h in src_list:
+                if isinstance(h, dict):
+                    t = (h.get("title") or "").strip()
+                    entry = h
+                else:
+                    t = str(h).strip()
+                    entry = {"title": t}
+                if t and t not in combined:
+                    combined[t] = entry
+        block = _build_dedup_instruction([], list(combined.values()))
+        if block:
+            base += "\n\n" + block
+        base += (
+            f"\n\n【补量说明】本批此前已产出 {len(produced_in_call)} 篇有效文案"
+            f"(已计入上方避重清单); 现补足缺口, 请生成 {missing} 篇与清单全部"
+            f"不重复的新文案。"
+        )
+        return base
+
     def _engine_call(
         engine_name: str, user_prompt_for_engine: str
     ) -> tuple[str, list[GenerationResult]]:
+        engine = None
+        model_override = (engine_models or {}).get(engine_name, "")
+        thinking_flag = (
+            use_thinking if engine_name == "claude"
+            else (gemini_use_thinking if engine_name == "gemini" else False)
+        )
+        # Phase 2.1: 每个 engine 各拿自己 session 的历史 prefix(没有就空 list)。
+        # ClaudeEngine / GeminiEngine 都接受 prior_messages 参数,空时退化为
+        # Phase 1 行为(单 user turn)。
+        prior = (engine_prior_messages or {}).get(engine_name, []) or []
+        call_ok = False
         try:
             engine = get_engine(engine_name)
-            model_override = (engine_models or {}).get(engine_name, "")
-            thinking_flag = (
-                use_thinking if engine_name == "claude"
-                else (gemini_use_thinking if engine_name == "gemini" else False)
-            )
-            # Phase 2.1: 每个 engine 各拿自己 session 的历史 prefix(没有就空 list)。
-            # ClaudeEngine / GeminiEngine 都接受 prior_messages 参数,空时退化为
-            # Phase 1 行为(单 user turn)。
-            prior = (engine_prior_messages or {}).get(engine_name, []) or []
             items = engine.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt_for_engine,
@@ -1382,6 +1583,7 @@ def generate_batch(
                 count=count,
                 prior_messages=prior,
             )
+            call_ok = True
         except Exception as e:
             # 必须用列表推导生成独立实例：``[GR(...)] * count`` 会把同一对象
             # 引用复制 count 份，后续任何位置改 token_usage / 标签都会污染整批
@@ -1397,11 +1599,26 @@ def generate_batch(
         # 这 N 个共享同一个 ``token_usage`` dict 引用——上层若按 version 逐条累加
         # 会把 input/output/cost 放大 N 倍（review #1 命中）。这里在 engine 调用
         # 边界一次性归集，下游就不再 per-version 累加。
+        # R-033: 必须在补量**之前**归集主调用——补量产物带的是另一份 usage
+        # dict, 回填后首个非空 usage 可能属于补量调用, 归集会张冠李戴;
+        # 补量调用的 usage 由 _topup_failed_slots 内部单独归集一次。
         if metrics is not None and items:
             head_usage = next((it.token_usage for it in items if it.token_usage), None)
             if head_usage:
                 head_engine = next((it.ai_engine for it in items if it.ai_engine), engine_name)
                 metrics.add_tokens(head_engine, head_usage, source=metrics_source)
+        # R-033: 失败位补量。仅在 engine.generate 正常返回时跑(调用级异常
+        # 走上面 except, retry middleware 已重试过, 不再花钱补)。
+        if call_ok:
+            items = _topup_failed_slots(
+                engine, engine_name, system_prompt, items, _mk_topup_prompt,
+                images=images,
+                use_thinking=thinking_flag,
+                model=model_override,
+                prior_messages=prior,
+                metrics=metrics,
+                metrics_source=metrics_source,
+            )
         return engine_name, items
 
     engine_results: dict[str, list[GenerationResult]] = {}
@@ -1417,7 +1634,7 @@ def generate_batch(
     else:
         # Sequential path: each subsequent engine's prompt embeds the
         # previously-produced titles as additional "do not duplicate" entries.
-        produced: list[dict] = []  # {"title", "opening"} accumulated across engines
+        # (``produced`` 已上提到本函数顶部, 供补量 prompt 复用。)
         for i, eng in enumerate(engines):
             # Augment dedup block with what previous engines already wrote.
             # 用 dict 按 title 去重，避免 historical 与 produced 出现同标题条目
