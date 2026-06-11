@@ -92,6 +92,10 @@ def _persist_refresh_token(cm, refresh_token: str) -> None:
             refresh_token,
             expires_at=datetime.now(timezone.utc) + timedelta(days=_COOKIE_TTL_DAYS),
             key="xhs_set_rt",
+            # R-040: stx 的 same_site 默认已是 'strict'; 补 Secure(仅 HTTPS 发送)。
+            # JS 可读是 stx 方案的架构限制(无法 HttpOnly), 已在 XSS 面全量
+            # escape 上对冲; 本地 http 开发用 AUTH_COOKIE_SECURE=0 关闭。
+            secure=True if config.AUTH_COOKIE_SECURE else None,
         )
     except Exception as exc:
         # cookie 写入失败用户感知就是"刷新后掉登录"。之前 silent pass 让

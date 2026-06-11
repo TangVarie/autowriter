@@ -1447,7 +1447,9 @@ def _queue_banner_body() -> None:
         # 计划会被 elif 分支伪装成 advisory ✅）。
         n_no_content = n_empty + max(0, total - n_total)
         # 同一个 API 错误会按每条版本重复 N 次，去重后再展示，免得糊一整屏。
-        uniq_errors = list(dict.fromkeys(errors))
+        # R-040: worker 写进 errors 的是原始 str(exc) —— 渲染前统一脱敏,
+        # 不能只靠错误面板那一处(R-023 的目标是所有 UI 错误展示路径)。
+        uniq_errors = [logger_utils.mask_secrets(e) for e in dict.fromkeys(errors)]
         bcol_txt, bcol_btn = st.columns([5, 1])
         with bcol_txt:
             if n_no_content:
@@ -3878,8 +3880,10 @@ def page_generate(project: dict) -> None:
         elif qg_done:
             errors_list = qgs.get("errors", [])
             if errors_list:
+                # R-040: 渲染前脱敏(worker 写入的是原始 str(exc))
                 st.error("部分内容生成失败：\n" + "\n".join(
-                    f"• {e}" for e in list(dict.fromkeys(errors_list))
+                    f"• {logger_utils.mask_secrets(e)}"
+                    for e in list(dict.fromkeys(errors_list))
                 ))
             saved = qgs.get("saved_count", 0)
             n_res = qgs.get("n_results", 0)
@@ -4186,7 +4190,7 @@ def page_review(project: dict) -> None:
                         db_client, project["id"], edited, source="user_manual"
                     )
                 except Exception as exc:
-                    st.error(f"保存失败：{exc}。预览内容保留，可重试。")
+                    st.error(f"保存失败：{logger_utils.mask_secrets(str(exc))}。预览内容保留，可重试。")
                 else:
                     # .pop 而不是 del：fragment + 并发 rerun 下 calib_key 可能已被
                     # 别的 path 清掉，del 会 KeyError 让按钮看起来"点了报错"。
@@ -4791,7 +4795,7 @@ def _run_iteration(
         )
 
     if result.error:
-        st.error(f"迭代失败：{result.error}")
+        st.error(f"迭代失败：{logger_utils.mask_secrets(result.error)}")
         return
 
     db.create_version(
@@ -4980,7 +4984,7 @@ def _generate_calibration_notes_ui(project: dict, batch_id: str, items: list[dic
             st.session_state[calib_key] = notes
             st.rerun()
         except Exception as e:
-            st.error(f"生成失败：{e}")
+            st.error(f"生成失败：{logger_utils.mask_secrets(str(e))}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5043,7 +5047,9 @@ def page_export(project: dict) -> None:
             st.markdown(
                 f"<span style='font-size:0.9rem;font-weight:500'>{_html.escape(label)}</span>"
                 f"&nbsp;&nbsp;<span style='font-size:0.8rem;color:var(--text-3)'>"
-                f"{tactic} · {approved}/{total} 篇已通过</span>",
+                # R-040: tactic 来自用户自定义战术名 —— 全文件唯一漏 escape 的
+                # unsafe_allow_html 注入点(存储型自 XSS), 与同行 label 对齐处理。
+                f"{_html.escape(tactic)} · {approved}/{total} 篇已通过</span>",
                 unsafe_allow_html=True,
             )
         batch_selections[batch["id"]] = checked
@@ -5116,7 +5122,7 @@ def page_export(project: dict) -> None:
                 }
                 st.rerun()
             except RuntimeError as e:
-                st.error(str(e))
+                st.error(logger_utils.mask_secrets(str(e)))
 
     # ── Feishu push (multi-batch) ───────────────────────────────────────
     if config.FEISHU_WEBHOOK_URL and n_selected > 0:

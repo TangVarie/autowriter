@@ -37,11 +37,14 @@ def set_current_project(project_id: str) -> None:
     的安全网：如果传进来的 project_id 看起来不像 UUID，直接拒；最终 DB 读
     会由 Supabase RLS 兜底。"""
     pid = (project_id or "").strip()
-    # 粗略 UUID 形态校验，过滤掉空串/明显垃圾输入。
     if not pid:
         return
-    if len(pid) != 36 or pid.count("-") != 4:
-        # 不是 UUID 形态 — 大概率是错调用。不抛错，保持调用方简单。
+    # R-040: 旧校验"36 字符 + 4 个横线"形同虚设("---...---" 36 个横线也能过)。
+    # 用 uuid.UUID 真解析; 解析失败 = 错调用, 不抛错保持调用方简单。
+    try:
+        import uuid as _uuid
+        pid = str(_uuid.UUID(pid))
+    except (ValueError, AttributeError, TypeError):
         return
     st.session_state["current_project_id"] = pid
 
@@ -152,10 +155,17 @@ def render_project_settings(client: Client, project: dict, user_id: str) -> None
     st.divider()
     with st.expander("⚠️ 危险操作"):
         st.warning("删除后无法恢复，包含的所有批次和文案也将被删除。")
-        if st.button("🗑️ 删除此项目", type="primary"):
+        # R-040: 单击即永久删除(含全部批次/文案)误触代价太高 —— 加确认勾选,
+        # 未勾选时按钮禁用。勾选状态按项目隔离, 切项目不残留。
+        _del_ok = st.checkbox(
+            "我已知晓：删除不可恢复，且会连带删除该项目的全部批次与文案",
+            key=f"del_confirm_{project['id']}",
+        )
+        if st.button("🗑️ 删除此项目", type="primary", disabled=not _del_ok):
             db.delete_project(client, project["id"])
             st.session_state.pop("current_project_id", None)
             st.session_state.pop("show_project_settings", None)
+            st.session_state.pop(f"del_confirm_{project['id']}", None)
             st.success("项目已删除。")
             st.rerun()
 
@@ -596,7 +606,23 @@ def _render_file_settings(client: Client, project: dict, user_id: str) -> None:
     )
     if uploaded and st.button("📤 上传所选文件"):
         ref_files = _parse_json_field(project.get("reference_files"), [])
+        # R-040: file_uploader 的 type= 只是前端按扩展名过滤(客户端可绕),
+        # 且无大小上限 —— f.read() 全量入内存, 大文件可把 Streamlit 进程 OOM。
+        # 服务端双保险: 扩展名白名单 + 单文件 15MB 上限。
+        _ALLOWED_SUFFIXES = {
+            "jpg", "jpeg", "png", "webp", "pdf", "txt", "md",
+            "csv", "xlsx", "xls", "docx", "doc", "zip",
+        }
+        _MAX_REF_FILE_BYTES = 15 * 1024 * 1024
         for f in uploaded:
+            suffix = (f.name or "").rsplit(".", 1)[-1].lower()
+            if suffix not in _ALLOWED_SUFFIXES:
+                st.error(f"已跳过 {f.name}：不支持的文件类型 .{suffix}")
+                continue
+            f_size = getattr(f, "size", None)
+            if f_size and f_size > _MAX_REF_FILE_BYTES:
+                st.error(f"已跳过 {f.name}：超过 15MB 上限（{f_size / 1024 / 1024:.1f}MB）")
+                continue
             try:
                 # 用与 image_handler 相同的安全策略：转义 + 随机后缀，避免同名
                 # 重复上传时撞 Supabase Storage 的 409。原始 name 仍保留在
