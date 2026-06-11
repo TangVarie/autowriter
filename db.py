@@ -927,30 +927,41 @@ def update_version_content(
     keywords: Optional[list] = None,
     token_usage: Optional[dict] = None,
     embedding: Optional[list[float]] = None,
-) -> None:
-    """重写一条 version 的内容（用于自动重生场景）。
+) -> bool:
+    """重写一条 version 的内容（用于自动重生场景）。返回主 UPDATE 是否成功。
 
     只更新传入的字段；id / item_id / version_num / ai_engine / created_at 不动。
-    embedding 单独可选，失败时静默——pgvector 列没迁移的部署还能用。
+    R-034: 此前主 UPDATE 也被 ``except: pass`` 吞掉(docstring 只声称 embedding
+    静默)——调用方 ``_try_regen_one`` 按成功继续更新内存去重池, DB 瞬断时
+    DB 里仍是旧重复文案而内存认为已替换, 永久分叉且零告警。现在主写失败
+    返回 False + telemetry(仍不抛, daemon 线程里不让单条写失败炸整批);
+    embedding 子写保持 best-effort, 但主写失败时跳过(不给旧内容配新向量)。
     """
     updates: dict[str, Any] = {"title": title, "body": body}
     if keywords is not None:
         updates["keywords"] = keywords
     if token_usage is not None:
         updates["token_usage"] = token_usage
+    ok = True
     try:
         client.table("versions").update(updates).eq("id", version_id).execute()
-    except Exception:
-        pass
+    except Exception as exc:
+        ok = False
+        telemetry.log_event(
+            "version_content_update_failed",
+            version_id=version_id, error=str(exc)[:200],
+        )
     try:
         list_items.clear()
     except Exception:
         pass
-    if embedding is not None:
+    if ok and embedding is not None:
         try:
             client.table("versions").update({"embedding": embedding}).eq("id", version_id).execute()
         except Exception:
+            # embedding 列没迁移的部署还能用 —— 保持静默(仅向量缺失, 内容已对)
             pass
+    return ok
 
 
 def update_version_embedding(
@@ -1020,6 +1031,43 @@ def bulk_update_version_embeddings(
             failed_sink.append(r.get("id", ""))
 
 
+def _parse_pgvector(val) -> Optional[list[float]]:
+    """把 PostgREST 读回的 pgvector 值归一成 ``list[float]``(R-034)。
+
+    PostgREST 对 ``vector(768)`` 列的 JSON 序列化是**字符串** ``"[0.1,...]"``,
+    不是数组。此前全库无任何反序列化,下游 ``dedup.cosine_similarity`` 对
+    list-vs-str 因长度不等**静默返回 0.0** —— 后果是(a)已 backfill 向量的
+    soft 规则在 ``memory.filter_soft_by_relevance`` 里 score=0 全部被丢弃不
+    注入;(b)跨批语义查重的 DB 历史池(队列预热 + 重生避重)自上线起 0 命中。
+    本函数在 DB 读取边界统一归一: 已是 list 原样返回; None/空/解析失败返回
+    None(调用方按"无向量"处理, 与历史行为一致)。
+    """
+    if val is None or isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if s.startswith("[") and s.endswith("]"):
+            inner = s[1:-1].strip()
+            if not inner:
+                return None
+            try:
+                return [float(x) for x in inner.split(",")]
+            except ValueError:
+                return None
+    return None
+
+
+def _in_chunks(seq: list, size: int = 100):
+    """把 id 列表切成 ≤size 的块, 供 ``.in_()`` 分批查询(R-034)。
+
+    一次塞几百个 UUID 进 ``.in_()`` 会生成 10KB+ 的查询串(414 风险), 且
+    结果行数超过 PostgREST max-rows(默认 1000)时**静默截断**。同文件
+    ``get_session_committed_item_ids`` 已用同样的分块套路。
+    """
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def get_recent_titles_openings_with_embeddings(
     client: Client, project_id: str, limit: int = 150
 ) -> list[dict]:
@@ -1036,10 +1084,17 @@ def get_recent_titles_openings_with_embeddings(
         return []
     batch_ids = [b["id"] for b in batches]
 
+    # R-034: 显式按 created_at desc 取"最近的"items 并限量。旧实现不带
+    # .order() 却在末尾 out[:limit] 截断 —— 截掉谁完全取决于 PG 未定义的
+    # 返回顺序, 最近批次的标题可能被丢、陈旧的反而保留; 且全量 item_ids
+    # 一次 .in_() + versions 不分块, 行数超 PostgREST max-rows(1000)时
+    # 静默截断。取 2×limit 件留出"解析失败/无版本被跳过"的余量。
     items_res = (
         client.table("items")
         .select("id, best_version_id")
         .in_("batch_id", batch_ids)
+        .order("created_at", desc=True)
+        .limit(limit * 2)
         .execute()
     )
     items = items_res.data or []
@@ -1047,23 +1102,29 @@ def get_recent_titles_openings_with_embeddings(
         return []
     item_ids = [it["id"] for it in items]
 
+    version_rows: list[dict] = []
     try:
-        versions_res = (
-            client.table("versions")
-            .select("id, item_id, title, body, version_num, embedding")
-            .in_("item_id", item_ids)
-            .execute()
-        )
+        for chunk in _in_chunks(item_ids):
+            res = (
+                client.table("versions")
+                .select("id, item_id, title, body, version_num, embedding")
+                .in_("item_id", chunk)
+                .execute()
+            )
+            version_rows.extend(res.data or [])
     except Exception:
         # embedding column not yet migrated — degrade gracefully
-        versions_res = (
-            client.table("versions")
-            .select("id, item_id, title, body, version_num")
-            .in_("item_id", item_ids)
-            .execute()
-        )
+        version_rows = []
+        for chunk in _in_chunks(item_ids):
+            res = (
+                client.table("versions")
+                .select("id, item_id, title, body, version_num")
+                .in_("item_id", chunk)
+                .execute()
+            )
+            version_rows.extend(res.data or [])
     versions_by_item: dict[str, list[dict]] = {}
-    for v in (versions_res.data or []):
+    for v in version_rows:
         versions_by_item.setdefault(v["item_id"], []).append(v)
 
     out: list[dict] = []
@@ -1090,9 +1151,15 @@ def get_recent_titles_openings_with_embeddings(
             "version_id": chosen.get("id"),
             "title":      title,
             "opening":    opening,
-            "embedding":  chosen.get("embedding"),
+            # R-034: pgvector 字符串归一成 list[float](见 _parse_pgvector)
+            "embedding":  _parse_pgvector(chosen.get("embedding")),
         })
-    return out[:limit]
+    # R-034: items 按 created_at desc 取回 → out 此刻是新→旧; 反转成旧→新
+    # 再截尾。消费方(_build_dedup_instruction 取 historical[-20:]、topup 的
+    # 合并 dict 以尾部优先)都以"尾部=最新"为约定。
+    out = out[:limit]
+    out.reverse()
+    return out
 
 
 def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]:
@@ -1427,10 +1494,15 @@ def get_recent_titles_and_openings(
         return []
     batch_ids = [b["id"] for b in batches]
 
+    # R-034: 同 get_recent_titles_openings_with_embeddings —— 显式按
+    # created_at desc 限量(旧实现无 .order() 随机截断)+ versions 分块查
+    # (防 PostgREST max-rows 静默截断)。
     items_res = (
         client.table("items")
         .select("id, status, best_version_id")
         .in_("batch_id", batch_ids)
+        .order("created_at", desc=True)
+        .limit(limit * 2)
         .execute()
     )
     items = items_res.data or []
@@ -1438,16 +1510,19 @@ def get_recent_titles_and_openings(
         return []
     item_ids = [it["id"] for it in items]
 
-    # Pull every version for these items in one shot; we only need the three
-    # columns used for picking the canonical version.
-    versions_res = (
-        client.table("versions")
-        .select("id, item_id, title, body, version_num")
-        .in_("item_id", item_ids)
-        .execute()
-    )
+    # Pull versions for these items in chunked batches; we only need the
+    # three columns used for picking the canonical version.
+    version_rows: list[dict] = []
+    for chunk in _in_chunks(item_ids):
+        res = (
+            client.table("versions")
+            .select("id, item_id, title, body, version_num")
+            .in_("item_id", chunk)
+            .execute()
+        )
+        version_rows.extend(res.data or [])
     versions_by_item: dict[str, list[dict]] = {}
-    for v in (versions_res.data or []):
+    for v in version_rows:
         versions_by_item.setdefault(v["item_id"], []).append(v)
 
     out: list[dict] = []
@@ -1476,7 +1551,11 @@ def get_recent_titles_and_openings(
 
         out.append({"title": title, "opening": opening})
 
-    return out[:limit]
+    # R-034: 反转成旧→新(尾部=最新), 与 _build_dedup_instruction 取
+    # historical[-20:] 的约定对齐。
+    out = out[:limit]
+    out.reverse()
+    return out
 
 
 def get_recent_titles(client: Client, project_id: str, limit: int = 100) -> list[str]:
@@ -1501,7 +1580,14 @@ def list_memories(
     if status:
         q = q.eq("status", status)
     res = q.order("frequency", desc=True).execute()
-    return res.data or []
+    rows = res.data or []
+    # R-034: select("*") 会把 pgvector 的 embedding 列以字符串形态带回;
+    # 下游 memory.filter_soft_by_relevance 拿它算 cosine 得 0 分, 已 backfill
+    # 向量的 soft 规则会被全部静默过滤掉。在读取边界统一归一成 list[float]。
+    for r in rows:
+        if "embedding" in r:
+            r["embedding"] = _parse_pgvector(r.get("embedding"))
+    return rows
 
 
 def _invalidate_memory_caches() -> None:
