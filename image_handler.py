@@ -25,7 +25,9 @@ import config
 # 解压缩炸弹防护(R-040 收紧): 旧值 100M 比 PIL 默认(~89M)还高 —— 注释声称
 # "默认偏大"却实际放松了防线。主流程图最大 4096×4096 ≈ 16.7M 像素, 取 40M
 # 已是 2.4 倍余量; 100M 像素 RGBA 解压 ≈ 400MB 内存, 几张并发即可打挂进程。
-# 超上限时 PIL 抛 ``Image.DecompressionBombError``, compress_image 转成可读异常。
+# review 修正: Pillow 的语义是超 MAX_IMAGE_PIXELS 只发 DecompressionBomb
+# **Warning**, 超 2× 才抛 Error —— 仅设此值实际放行到 80M。compress_image
+# 里在 ``Image.open`` 之后(header 即有尺寸, 尚未解码)显式按 w*h 拦 40M。
 Image.MAX_IMAGE_PIXELS = 40_000_000
 
 # R-040: 解压前的第一道闸 —— 原始字节上限。高压缩比炸弹几 KB 就能顶满像素
@@ -107,10 +109,20 @@ def compress_image(raw_bytes: bytes, max_dim: int = MAX_DIM) -> tuple[bytes, str
         )
     try:
         img = Image.open(io.BytesIO(raw_bytes))
-        # 强制立即 load 一次：``Image.open`` 是 lazy 的，bomb 要等到 resize 时
-        # 才触发；这里提前触发以便在统一 try/except 里捕获。
+        # R-040 review: ``Image.open`` 只解析 header(此时已知尺寸、未解码像素),
+        # 在 load 之前显式按 w*h 拦 —— Pillow 自己的检查超上限只 Warning、
+        # 超 2×(80M)才抛 Error, 40-80M 的高压缩炸弹否则会被完整解码。
+        _w, _h = img.size
+        if _w * _h > Image.MAX_IMAGE_PIXELS:
+            raise ValueError(
+                f"图片像素数超过安全上限：{_w}×{_h} ≈ {_w * _h / 1e6:.0f}M "
+                f"> {Image.MAX_IMAGE_PIXELS / 1e6:.0f}M"
+            )
+        # 强制立即 load 一次：``Image.open`` 是 lazy 的，解码类异常要等到
+        # resize 时才触发；这里提前触发以便在统一 try/except 里捕获。
         img.load()
     except Image.DecompressionBombError as exc:
+        # 兜底: >2× 上限时 Pillow 在 open 阶段就自己抛(理论到不了, 上面已拦)
         raise ValueError(f"图片像素数超过安全上限：{exc}") from exc
 
     # Determine output format
