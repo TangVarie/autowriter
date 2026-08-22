@@ -91,18 +91,7 @@
         "通用"
       ],
       "exclusive_value": "通用",
-      "halflife_tier": {
-        "通用": "perpetual",
-        "时代语言范式": "era_idiom",
-        "平台话术": "era_idiom",
-        "特定IP引用": "short",
-        "行业事件": "short",
-        "当代流行词": "short",
-        "特定平台事件": "short",
-        "时事热点": "short",
-        "季节性事件": "short",
-        "节日": "short"
-      }
+      "$comment": "半衰期【不是】逐值属性, 见顶层 surface_decay —— 真实规则是组合依赖的(时代语言范式 只有在不含短期集时才拿 30 月)。别按值名直觉推。"
     },
     "content_format": {
       "doc_section": "§2",
@@ -214,6 +203,49 @@
       "虚荣撬动": "虚荣 = 让读者【现在就感到】自己优于某个对照群体(superiority, 现在时)。如果你写的是「成为你想成为的样子」那是造梦投射不是虚荣。",
       "造梦投射": "造梦 = 给读者描绘【他想成为的样子】(aspiration, 未来时)。如果你写的是「懂的人才知道, 别买错」那是虚荣撬动不是造梦。",
       "罪恶感撬动": "罪恶感 = 感到【现在做得不够】(对不起谁)。如果你写的是「将来会后悔」那是焦虑撬动不是罪恶感。"
+    }
+  },
+  "surface_decay": {
+    "$comment": [
+      "surface 层的半衰期规则。权威实现 = schemas/notes_v1_7_surface_three_tier_decay.sql,",
+      "伪代码 = docs/05-controlled-vocab.md 的衰减小节。",
+      "⚠️ 这是【按 trend_dependencies 组合求值的规则】, 不是逐值映射 ——",
+      "  「时代语言范式」只有在【不含任何短期集元素】时才拿 30 月; 与短期集共现时落 9 月。",
+      "⚠️ 「行业事件」和「平台话术」【不在】短期集, 单独出现时落 12 月默认档。",
+      "  按名字直觉给它们更短(短期)或更长(范式)的半衰期都是错的 —— v1_7 的注释专门点了这两个。",
+      "essence 半衰期固定 60 月、audience 30 月, 与本规则无关(见 docs/05)。"
+    ],
+    "authority": "schemas/notes_v1_7_surface_three_tier_decay.sql",
+    "short_term_set": [
+      "特定平台事件",
+      "特定IP引用",
+      "时事热点",
+      "季节性事件",
+      "节日",
+      "当代流行词"
+    ],
+    "rules_in_order": [
+      {
+        "when_contains": "通用",
+        "halflife_months": 60
+      },
+      {
+        "when_contains": "时代语言范式",
+        "and_none_of": "short_term_set",
+        "halflife_months": 30
+      },
+      {
+        "when_any_of": "short_term_set",
+        "halflife_months": 9
+      },
+      {
+        "otherwise": true,
+        "halflife_months": 12
+      }
+    ],
+    "other_layers": {
+      "essence_halflife_months": 60,
+      "audience_halflife_months": 30
     }
   }
 }

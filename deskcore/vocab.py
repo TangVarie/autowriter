@@ -72,7 +72,13 @@ TARGET_AUDIENCES = values("target_audience")
 INTENTS = values("intent")
 
 TREND_EXCLUSIVE: str = _SETS["trend_dependencies"]["exclusive_value"]
-TREND_HALFLIFE_TIER: dict[str, str] = dict(_SETS["trend_dependencies"]["halflife_tier"])
+
+# surface 半衰期【不是】逐值属性 —— 真实规则按 trend_dependencies 的【组合】求值
+# (「时代语言范式」只有在不含短期集元素时才拿 30 月; 「行业事件」「平台话术」不在
+# 短期集、落 12 月默认档)。此前 vendor 的 JSON 里导出成逐值 tier 映射是错的,
+# 已换成规则编码。deskcore 目前不消费衰减(发牌只用闭集), 保留入口备用。
+SURFACE_DECAY: dict = dict(_DATA.get("surface_decay") or {})
+SHORT_TERM_TRENDS: tuple[str, ...] = tuple(SURFACE_DECAY.get("short_term_set") or ())
 LEVER_TO_VALENCE: dict[str, str] = dict(_DATA["derivations"]["lever_to_valence"])
 LEVER_BOUNDARY_RULES: dict[str, str] = dict(_DATA["boundary_rules"]["rules"])
 
