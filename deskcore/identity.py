@@ -46,28 +46,65 @@ class AuthError(Exception):
     """鉴权失败。调用方应转成 401。"""
 
 
+class _MalformedKeyMap(Exception):
+    """DESKCORE_KEYS 配了但解析不了。【绝不能】退化成"没配"。"""
+
+
 def _key_map() -> dict[str, dict]:
+    """解析 DESKCORE_KEYS。配了但格式不对时抛 _MalformedKeyMap, 不返回空 map。
+
+    ⚠️ 这里曾经是 fail-open 的: JSON 写错 → 返回 {} → resolve() 看到"既没有
+    key map 也没有单 key" → 判定为 dev 模式 → 【放行所有请求】。生产上一个
+    逗号写错就等于把项目数据和全部写工具匿名开放出去。
+    显式配了就必须当成"打算开鉴权", 解析失败一律 401。
+    """
     raw = os.environ.get("DESKCORE_KEYS")
-    if not raw:
+    if not raw or not raw.strip():
         return {}
     try:
         parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        logger.error("DESKCORE_KEYS is not valid JSON; falling back to single-key mode")
-        return {}
+    except json.JSONDecodeError as exc:
+        raise _MalformedKeyMap(f"DESKCORE_KEYS is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
-        logger.error("DESKCORE_KEYS must be a JSON object")
-        return {}
+        raise _MalformedKeyMap("DESKCORE_KEYS must be a JSON object")
     return parsed
 
 
 def auth_configured() -> bool:
-    return bool(_key_map() or os.environ.get("DESKCORE_API_KEY"))
+    """鉴权是否已配置。配了但坏掉也算"已配"(会 401), 不算未配。"""
+    if (os.environ.get("DESKCORE_KEYS") or "").strip():
+        return True
+    return bool(os.environ.get("DESKCORE_API_KEY"))
+
+
+def auth_health() -> tuple[bool, str]:
+    """给 /health 用: 鉴权配置是否可用。配坏了要当场看得见。"""
+    try:
+        keys = _key_map()
+    except _MalformedKeyMap as exc:
+        return False, f"{exc} —— 所有请求都会 401, 服务实际不可用"
+    if keys:
+        missing = [k[:6] + "…" for k, v in keys.items()
+                   if not (v or {}).get("user_id", "").strip()]
+        if missing:
+            return False, f"DESKCORE_KEYS 有条目缺 user_id: {missing}"
+        return True, f"{len(keys)} key(s)"
+    if os.environ.get("DESKCORE_API_KEY"):
+        if not (os.environ.get("DESKCORE_DEFAULT_USER_ID") or "").strip():
+            return False, "配了 DESKCORE_API_KEY 但 DESKCORE_DEFAULT_USER_ID 为空"
+        return True, "single-key mode"
+    return False, "未配鉴权 = dev 模式全放行; 生产必须配"
 
 
 def resolve(provided: str | None) -> Caller:
     """把请求里的 key 解析成 Caller。未配鉴权 = dev 模式放行。"""
-    keys = _key_map()
+    try:
+        keys = _key_map()
+    except _MalformedKeyMap as exc:
+        # 配坏了 → 401, 【不是】dev 模式。见 _key_map 的说明。
+        logger.error("%s", exc)
+        raise AuthError(f"server auth misconfigured: {exc}") from exc
+
     single = os.environ.get("DESKCORE_API_KEY")
 
     if not keys and not single:

@@ -40,6 +40,7 @@ import logging
 import os
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from . import identity, tools, vocab
@@ -52,6 +53,10 @@ VERSION = "1"
 
 # 当前请求的调用者。MCP 的 ASGI 子应用拿不到 FastAPI 的依赖注入, 用 contextvar
 # 在中间件里塞、在工具里取, 是最省事且协程安全的做法。
+#
+# ⚠️ REST 路由把工具丢进线程池跑 —— starlette 的 run_in_threadpool 会把当前
+# contextvars 一并复制过去, 所以 _caller 在工作线程里取得到。若以后换成裸
+# threading.Thread, 必须自己 copy_context(), 否则身份会丢成 anonymous。
 _caller: contextvars.ContextVar[identity.Caller] = contextvars.ContextVar(
     "deskcore_caller", default=identity.Caller(None, "anonymous", False))
 
@@ -118,9 +123,10 @@ def health() -> dict:
 
     vocab_ok, vocab_note = vocab.vendor_checksum_ok()
     emb_ok = dedup.embeddings_available()
+    auth_ok, _auth_note = identity.auth_health()
 
     return {
-        "ok": db_ok and vocab_ok,
+        "ok": db_ok and vocab_ok and auth_ok,
         "service": SERVICE,
         "version": VERSION,
         "tools": sorted(tools.TOOLS),
@@ -141,12 +147,9 @@ def health() -> dict:
             },
             "librarian": {"configured": bool(os.environ.get("LIBRARIAN_URL")
                                              or getattr(config, "LIBRARIAN_URL", ""))},
-            "auth": {
-                "configured": identity.auth_configured(),
-                "note": ("ok" if identity.auth_configured() else
-                         "未配鉴权 = dev 模式全放行; 生产必须配 DESKCORE_KEYS "
-                         "或 DESKCORE_API_KEY"),
-            },
+            # auth_health 会把"配了但坏了"跟"没配"分开 —— 前者所有请求都 401,
+            # 服务实际不可用, 必须当场看得见(不能像以前那样静默退化成全放行)。
+            "auth": dict(zip(("ok", "note"), identity.auth_health())),
             "st_cache_disabled": os.environ.get("AW_DISABLE_ST_CACHE"),
         },
     }
@@ -176,7 +179,13 @@ async def rest_tool(name: str, request: Request):
     if not isinstance(args, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
     try:
-        return {"result": _call_tool(name, args)}
+        # ⚠️ 必须过线程池。工具里全是【同步】调用(Supabase / embedding, record_edit
+        # 还会打 Anthropic), 直接在 async 路由里跑会占住 uvicorn 唯一的事件循环 ——
+        # 一个慢请求把不相干的 REST / MCP / health 全部拖住。
+        # 本仓的 worker 服务踩过同一类坑(subprocess.run 堵死 asyncio → /health 失联
+        # → 平台健康检查超时重启容器 → 杀掉正在跑的任务)。
+        result = await run_in_threadpool(_call_tool, name, args)
+        return {"result": result}
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001

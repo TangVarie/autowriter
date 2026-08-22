@@ -60,8 +60,9 @@ def list_all_projects(sb) -> list[dict]:
 
 # ── 规则(共享层) ──────────────────────────────────────────────────────────
 
-def shared_memories(sb, project_id: str) -> tuple[list[dict], list[dict]]:
-    """项目的 confirmed 规则, 按 project_id 读【全量】, 不过滤 user_id。
+def shared_memories(sb, project_id: str,
+                    user_id: str | None = None) -> tuple[list[dict], list[dict]]:
+    """项目的 confirmed 规则。
 
     返回 (hard, soft)。muted_until 未到期的过滤掉(用户临时静音一条规则而不删)。
     同时带上 scope='global' 的通用规则。
@@ -80,7 +81,9 @@ def shared_memories(sb, project_id: str) -> tuple[list[dict], list[dict]]:
     cols = "id, content, severity, scope, rule_kind, rule_payload, muted_until, user_id"
     proj = _rows(sb.table("memories").select(cols)
                    .eq("project_id", project_id).eq("scope", "project"))
-    glob = _rows(sb.table("memories").select(cols).eq("scope", "global"))
+    glob = (_rows(sb.table("memories").select(cols)
+                    .eq("scope", "global").eq("user_id", user_id))
+            if user_id else [])
 
     now = datetime.now(timezone.utc)
 
@@ -274,11 +277,103 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> list[dict]:
     return rows
 
 
+def legacy_versions(sb, project_id: str, limit: int = 5000) -> list[dict]:
+    """项目历史成稿(items × versions), 供指纹回填。
+
+    为什么必须有这个: 迁移建的是【空表】, 而 check_drafts 只读这张表, 只有
+    commit_drafts 会往里写。也就是说刚上线那天, 号称"比对全量历史"的硬闸
+    实际上一条历史都没有 —— 老稿子的重复会原样放行(codex review P1)。
+
+    只取每个 item 的 best/最新版本(与 db.list_example_items 同口径), 因为中间
+    的迭代版本不是"发出去的东西", 拿它们当查重基线会误伤后续正常改写。
+    """
+    try:
+        res = (sb.table("items")
+                 .select("id, best_version_id, user_id, created_at, "
+                         "versions(id, title, body, version_num, embedding), "
+                         "batches!inner(project_id)")
+                 .eq("batches.project_id", project_id)
+                 .order("created_at", desc=True)
+                 .limit(limit).execute())
+    except Exception:
+        logger.exception("read legacy versions failed (project=%s)", project_id)
+        raise
+
+    out: list[dict] = []
+    for item in (res.data or []):
+        versions = item.get("versions") or []
+        if not versions:
+            continue
+        best = item.get("best_version_id")
+        chosen = next((v for v in versions if v.get("id") == best), None)
+        if chosen is None:
+            chosen = max(versions, key=lambda v: v.get("version_num") or 0)
+        title = (chosen.get("title") or "").strip()
+        body = (chosen.get("body") or "").strip()
+        if not (title or body):
+            continue
+        out.append({
+            "version_id": chosen.get("id"),
+            "user_id": item.get("user_id"),
+            "title": title,
+            "body": body,
+            "embedding": db._parse_pgvector(chosen.get("embedding")),
+        })
+    return out
+
+
+def existing_fingerprint_version_ids(sb, project_id: str) -> set[str]:
+    """已经有指纹的 version_id —— 回填要幂等, 重跑不能造重复行。"""
+    try:
+        res = (sb.table("draft_fingerprints").select("version_id")
+                 .eq("project_id", project_id)
+                 .not_.is_("version_id", "null").execute())
+        return {r["version_id"] for r in (res.data or []) if r.get("version_id")}
+    except Exception:
+        logger.exception("read existing fingerprint version_ids failed")
+        raise
+
+
 def write_fingerprints(sb, rows: list[dict]) -> int:
+    """直插指纹(不查重)。只给【回填】用 —— 回填的是已发生的历史, 本来就该原样入库。
+
+    定稿入库【不要】走这里, 走 commit_fingerprints_atomic。
+    """
     if not rows:
         return 0
     sb.table("draft_fingerprints").insert(rows).execute()
     return len(rows)
+
+
+def commit_fingerprints_atomic(sb, project_id: str, rows: list[dict],
+                               user_id: str | None,
+                               ngram_hard: float) -> list[dict] | None:
+    """定稿入库 + 【同一事务内重新查一遍】, 走 deskcore_commit_fingerprints RPC。
+
+    为什么不能直接 insert: check_drafts 和 commit_drafts 是两次独立调用。两个
+    队友各自 check 时都看到同一份旧指纹集、双双 pass, 然后各自 commit —— 两篇
+    撞车的稿子都进了库。发牌那边已经用 advisory lock 串行化了, 这边不能留着。
+
+    返回每条的 {idx, status, collided_with, detail}; RPC 不存在(迁移没跑)时
+    返回 None, 由调用方降级。
+    """
+    if not rows:
+        return []
+    try:
+        res = sb.rpc("deskcore_commit_fingerprints", {
+            "_project_id": project_id,
+            "_rows": rows,
+            "_user_id": user_id,
+            "_ngram_hard": ngram_hard,
+        }).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "could not find the function" in msg or "does not exist" in msg or "pgrst202" in msg:
+            logger.error("deskcore_commit_fingerprints RPC 不存在 —— migrations/001 "
+                         "还没跑? 本次降级为直插(并发 check/commit 可能撞车)。")
+            return None
+        raise
+    return res.data or []
 
 
 # ── 个人调校笔记 / 精修 diff(私有层) ──────────────────────────────────────

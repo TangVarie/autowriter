@@ -109,7 +109,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     if project is None:
         raise ValueError(f"project not found: {project_id}")
 
-    hard, soft = store.shared_memories(client, project_id)
+    hard, soft = store.shared_memories(client, project_id, user_id)
     pool = store.labeled_examples(client, project_id, "positive", user_id)
     positives, pos_mode = select_positive_examples(pool, brief)
     negatives = store.labeled_examples(client, project_id, "negative", user_id)[:MAX_NEGATIVE]
@@ -124,8 +124,19 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
                            + my_calib)
     calibration = "\n\n".join(calib_parts)
 
+    # 战术后缀: app.py 的队列/快速生成两条路径都调 get_tactic_prompt_suffix 并
+    # 把它作为独立一层注入(app.py:1066 / 3131 / 4857)。deskcore 不带的话, 项目
+    # 配好的战术专属写作指令会【静默丢失】—— 传了 tactic 名却只影响正例排序。
+    # (codex review P1)
+    tactic_name = (brief.get("tactic") or "").strip()
+    tactic_suffix = ""
+    if tactic_name:
+        import projects as proj_module   # 纯函数; CI 的 import 图冒烟已覆盖该模块
+        tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic_name) or ""
+
     layers = memory.build_layered_system_prompt(
         base_prompt=project.get("system_prompt") or "",
+        tactic_suffix=tactic_suffix,
         global_memories=[m for m in soft + hard if m.get("scope") == "global"],
         project_memories=[m for m in soft + hard if m.get("scope") != "global"],
         calibration_notes=calibration,
@@ -138,6 +149,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         "project_name": project.get("name") or "",
         "brand": project.get("brand") or "",
         "stable": layers.get("stable", ""),
+        "tactic_layer": layers.get("tactic", ""),
         "p0": layers.get("p0", ""),
         "p1": layers.get("p1", ""),
         "tactics": project.get("tactics") or [],
@@ -149,6 +161,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
             "negative_examples": len(negatives),
             "has_shared_calibration": bool(shared_calib),
             "has_personal_calibration": bool(my_calib),
+            "tactic_suffix_applied": bool(tactic_suffix),
         },
         "positive_selection_mode": pos_mode,
     }
@@ -306,10 +319,20 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
     grams = [set(fp.ngram_hashes(b)) for b in bodies]
 
     new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
-    degraded = new_vecs is None
+
+    # ⚠️ 降级判定不能只看"这批能不能算向量"(codex review P1)。
+    # 历史行的 title_embedding 可能是 NULL —— 当初 commit 时 embedding 服务不可用
+    # 就会这样, 而且没有回填路径。那种情况下 new_vecs 非空、看起来正常, 但每一条
+    # 历史都在下面被 `if not emb: continue` 跳过, 标题语义这一路【实际没跑】,
+    # 却报 semantic_degraded=false 让调用方以为全套硬闸都过了。
+    hist_with_vec = sum(1 for h in history if h.get("title_embedding"))
+    hist_missing_vec = len(history) - hist_with_vec
+    semantic_ran = bool(new_vecs) and (hist_with_vec > 0 or len(history) == 0)
+    degraded = not semantic_ran or hist_missing_vec > 0
     if degraded:
-        logger.warning("semantic dedup degraded to deterministic-only (project=%s)",
-                       project_id)
+        logger.warning("semantic dedup degraded (project=%s): new_vecs=%s "
+                       "history_with_vec=%d/%d",
+                       project_id, bool(new_vecs), hist_with_vec, len(history))
 
     hist_grams = [set(h.get("ngram_hashes") or []) for h in history]
     hist_open = {h.get("opening_hash"): h for h in history if h.get("opening_hash")}
@@ -366,12 +389,30 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
         "warn": sum(1 for r in results if r["status"] == "warn"),
         "reject": sum(1 for r in results if r["status"] == "reject"),
         "history_size": len(history),
+        "history_with_embedding": hist_with_vec,
+        "history_missing_embedding": hist_missing_vec,
         "semantic_degraded": degraded,
     }
+    # 指纹库是空的但项目其实有历史 = 没回填。硬闸背后什么都没有, 必须说出来,
+    # 不能让调用方以为"比对了全量历史然后没撞车"。
+    if not history:
+        summary["empty_history_warning"] = (
+            "指纹库里这个项目一条历史都没有。如果这不是全新项目, 说明【还没回填】——"
+            "本次查重实际只在本批内部比对, 跟历史稿的重复不会被发现。"
+            "跑 `python -m deskcore.cli backfill --project <id>` 补上。")
+
     if degraded:
+        why = []
+        if not new_vecs:
+            why.append("本批标题算不出向量(GOOGLE_API_KEY 未配或 embedding 调用失败)")
+        if hist_missing_vec:
+            why.append(f"{hist_missing_vec}/{len(history)} 条历史没有 title_embedding"
+                       f"(当初 commit 时 embedding 不可用, 且没有回填路径 —— "
+                       f"跑 `python -m deskcore.cli backfill --project <id>` 可补)")
         summary["degraded_note"] = (
-            "GOOGLE_API_KEY 未配或 embedding 调用失败, 本次只跑了确定性查重"
-            "(开头精确 + 四字串重合)。同角度换说法的标题可能漏过 —— 要告诉用户。")
+            "标题语义查重【没有完整跑】: " + "; ".join(why) +
+            "。确定性信号(开头精确 + 四字串重合)仍然有效, 但同角度换说法的标题"
+            "可能漏过 —— 要告诉用户。")
     return {"results": results, "summary": summary}
 
 
@@ -384,12 +425,17 @@ def _placeholder_version_id(seed: str) -> str:
 
 def commit_drafts(client, project_id: str, drafts: list[dict],
                   *, user_id: str | None = None) -> dict:
-    """定稿入库: 写指纹 + 给坐标销账。
+    """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
 
     只收真正定稿的 —— 指纹库脏了(把废稿也记进去)会让后续正常选题被误杀。
+
+    ⚠️ 入库【会再查一次重】。check_drafts 和本调用之间可能有别人先 commit 了
+    撞车的稿子(两人各自 check 时看到的是同一份旧指纹集), 那条竞态窗口只能在
+    写入的同一个事务里关掉。被判撞车的条目【不入库】, 在返回值的 rejected 里
+    列出来, 调用方要让用户重写。
     """
     if not drafts:
-        return {"written": 0, "consumed_angles": 0}
+        return {"written": 0, "consumed_angles": 0, "rejected": []}
 
     titles = [(d.get("title") or "").strip() for d in drafts]
     vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
@@ -397,29 +443,74 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     rows = []
     for i, d in enumerate(drafts):
         body = d.get("body") or ""
+        emb = vecs[i] if vecs and i < len(vecs) else None
         rows.append({
-            "project_id": project_id,
             "version_id": d.get("version_id"),
-            "user_id": user_id,
             "title": titles[i],
             "opening": fp.opening_of(body),
-            "title_embedding": vecs[i] if vecs and i < len(vecs) else None,
+            # RPC 侧按 text 转 vector, 这里给 pgvector 的字面量形式
+            "title_embedding": ("[" + ",".join(repr(float(x)) for x in emb) + "]") if emb else None,
             "opening_hash": fp.opening_hash(body),
             "ngram_hashes": fp.ngram_hashes(body),
             "angle_key": d.get("angle_key"),
         })
-    written = store.write_fingerprints(client, rows)
 
+    outcome = store.commit_fingerprints_atomic(
+        client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD)
+
+    atomic = outcome is not None
+    rejected: list[dict] = []
+    if atomic:
+        by_idx = {o["idx"]: o for o in outcome}
+        written = sum(1 for o in outcome if o.get("status") == "inserted")
+        for o in outcome:
+            if o.get("status") == "rejected":
+                rejected.append({
+                    "index": o["idx"],
+                    "title": titles[o["idx"]] if o["idx"] < len(titles) else "",
+                    "collided_with": o.get("collided_with") or "",
+                    "reason": o.get("detail") or "与库中已有稿件重复",
+                })
+    else:
+        # RPC 不在: 降级直插, 并明确标出这次没有关掉竞态窗口。
+        payload = []
+        for i, r in enumerate(rows):
+            payload.append({
+                "project_id": project_id, "user_id": user_id,
+                "version_id": r["version_id"], "title": r["title"],
+                "opening": r["opening"],
+                "title_embedding": vecs[i] if vecs and i < len(vecs) else None,
+                "opening_hash": r["opening_hash"],
+                "ngram_hashes": r["ngram_hashes"], "angle_key": r["angle_key"],
+            })
+        written = store.write_fingerprints(client, payload)
+
+    # 只给真的入了库的坐标销账 —— 被拒的那条角度还没产出成稿, 不该占坑。
+    inserted_idx = ({o["idx"] for o in outcome if o.get("status") == "inserted"}
+                    if atomic else set(range(len(drafts))))
     consumed = 0
-    for d in drafts:
+    for i, d in enumerate(drafts):
+        if i not in inserted_idx:
+            continue
         key = d.get("angle_key")
         if not key:
             continue
         vid = d.get("version_id") or _placeholder_version_id(key)
         if store.consume_angle(client, project_id, key, vid):
             consumed += 1
-    return {"written": written, "consumed_angles": consumed,
-            "embedded": bool(vecs)}
+
+    out = {"written": written, "consumed_angles": consumed,
+           "embedded": bool(vecs), "rejected": rejected,
+           "atomic_recheck": atomic}
+    if rejected:
+        out["note"] = (f"{len(rejected)} 条在入库时被判与库中已有稿件重复 —— "
+                       "多半是你 check 之后、commit 之前有人先提交了撞车的稿子。"
+                       "这几条没有入库, 要重写后重新走 check_drafts。")
+    if not atomic:
+        out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
+                          "不存在, migrations/001 可能没跑)。并发 check/commit 时"
+                          "可能有撞车的稿子一起进库。")
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -864,6 +864,104 @@ REVOKE ALL ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) FROM
 REVOKE ALL ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) FROM anon;
 REVOKE ALL ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) FROM authenticated;
 GRANT EXECUTE ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) TO service_role;
+
+-- ── deskcore 定稿入库的原子查重 ────────────────────────────────────────
+-- 为什么需要: check_drafts 和 commit_drafts 是两次独立调用。两个队友各自 check
+-- 时都看到同一份旧指纹集、双双 pass, 然后各自 commit —— 两篇撞车的稿子都进了库,
+-- 跨人硬闸形同虚设。发牌那边已经用 advisory lock 串行化了, 这边不能留着。
+--
+-- 本函数在同一个事务里【重新查一遍 + 插入】, 用与 draw 相同的 project 级
+-- advisory lock 串行化。只做【确定性】信号(开头精确 + 四字串 Jaccard)——
+-- 标题语义那一路要 pgvector 距离算子, 且历史行可能没有向量, 留在 Python 侧的
+-- check_drafts 里做; 这里挡住的是竞态窗口里最可能撞的那两类。
+--
+-- 返回每条的结果: inserted / rejected + 撞了谁。调用方据此告诉用户哪几条要重写。
+CREATE OR REPLACE FUNCTION deskcore_commit_fingerprints(
+    _project_id UUID,
+    _rows       JSONB,        -- [{title,opening,opening_hash,ngram_hashes,title_embedding,version_id,angle_key}, ...]
+    _user_id    UUID,
+    _ngram_hard NUMERIC DEFAULT 0.35
+)
+RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    r        JSONB;
+    i        INT := -1;
+    ng       TEXT[];
+    oh       TEXT;
+    hit      RECORD;
+    best_j   NUMERIC;
+    best_t   TEXT;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('deskcore_draw:' || _project_id::text));
+
+    FOR r IN SELECT * FROM jsonb_array_elements(_rows) LOOP
+        i := i + 1;
+        oh := r->>'opening_hash';
+        SELECT COALESCE(array_agg(x), '{}') INTO ng
+          FROM jsonb_array_elements_text(COALESCE(r->'ngram_hashes','[]'::jsonb)) x;
+
+        -- ① 开头精确撞车
+        SELECT f.title INTO best_t
+          FROM draft_fingerprints f
+         WHERE f.project_id = _project_id AND f.opening_hash = oh
+         LIMIT 1;
+        IF FOUND AND oh IS NOT NULL THEN
+            idx := i; status := 'rejected';
+            collided_with := best_t; detail := '正文开头与库中已有稿件完全一致';
+            RETURN NEXT;
+            CONTINUE;
+        END IF;
+
+        -- ② 四字串重合。先用 GIN 的 && 粗筛, 只对有交集的行算精确 Jaccard。
+        best_j := 0; best_t := NULL;
+        IF array_length(ng, 1) IS NOT NULL THEN
+            FOR hit IN
+                SELECT f.title,
+                       (SELECT count(*) FROM (SELECT unnest(ng) INTERSECT SELECT unnest(f.ngram_hashes)) s)::numeric
+                       / NULLIF((SELECT count(*) FROM (SELECT unnest(ng) UNION SELECT unnest(f.ngram_hashes)) u), 0) AS j
+                  FROM draft_fingerprints f
+                 WHERE f.project_id = _project_id
+                   AND f.ngram_hashes && ng
+            LOOP
+                IF hit.j IS NOT NULL AND hit.j > best_j THEN
+                    best_j := hit.j; best_t := hit.title;
+                END IF;
+            END LOOP;
+        END IF;
+        IF best_j >= _ngram_hard THEN
+            idx := i; status := 'rejected'; collided_with := best_t;
+            detail := format('正文与库中已有稿件大面积重合(四字串 Jaccard=%s)', round(best_j, 3));
+            RETURN NEXT;
+            CONTINUE;
+        END IF;
+
+        INSERT INTO draft_fingerprints
+            (project_id, version_id, user_id, title, opening,
+             title_embedding, opening_hash, ngram_hashes, angle_key)
+        VALUES (
+            _project_id,
+            NULLIF(r->>'version_id','')::uuid,
+            _user_id,
+            COALESCE(r->>'title',''),
+            COALESCE(r->>'opening',''),
+            CASE WHEN r->'title_embedding' IS NULL OR jsonb_typeof(r->'title_embedding') = 'null'
+                 THEN NULL ELSE (r->>'title_embedding')::vector END,
+            oh,
+            ng,
+            NULLIF(r->>'angle_key','')
+        );
+        idx := i; status := 'inserted'; collided_with := NULL; detail := NULL;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM PUBLIC;
+REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM anon;
+REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM authenticated;
+GRANT EXECUTE ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) TO service_role;
 """
 
 

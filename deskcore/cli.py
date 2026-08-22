@@ -7,6 +7,7 @@
   python -m deskcore.cli open  --project <uuid> [--tactic ...] [--user <uuid>]
   python -m deskcore.cli draw  --project <uuid> -n 20 [--block]
   python -m deskcore.cli check --project <uuid> --file drafts.json
+  python -m deskcore.cli backfill --project <uuid>   ← 部署时必跑一次
 """
 
 from __future__ import annotations
@@ -198,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--block", action="store_true", help="只打印可贴进 prompt 的坐标块")
 
+    p = sub.add_parser("backfill", help="把历史成稿补进指纹库(部署时必跑一次)")
+    p.add_argument("--project", required=True)
+    p.add_argument("--no-embeddings", action="store_true",
+                   help="只写确定性指纹(开头 + 四字串), 不算标题向量")
+
     p = sub.add_parser("check", help="查重")
     p.add_argument("--project", required=True)
     p.add_argument("--file", required=True,
@@ -230,6 +236,15 @@ def main(argv: list[str] | None = None) -> int:
                                avoid_days=args.avoid_days,
                                user_id=args.user, seed=args.seed)
         print(out["prompt_block"]) if args.block else _print(out)
+    elif args.cmd == "backfill":
+        def _prog(done, total):
+            print(f"  {done}/{total}", flush=True)
+        out = core.backfill_fingerprints(
+            sb, args.project, with_embeddings=not args.no_embeddings, progress=_prog)
+        _print(out)
+        if out["written"] == 0 and out["already"] == 0:
+            print("\n⚠️ 这个项目没有任何历史成稿 —— 如果不是全新项目, "
+                  "检查 project_id 是不是传错了。")
     elif args.cmd == "check":
         with open(args.file, encoding="utf-8") as fh:
             drafts = json.load(fh)

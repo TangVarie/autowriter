@@ -98,7 +98,18 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 
 **B. 查重比全量、比三个信号** → 标题语义 + 开头精确指纹 + 正文四字串 Jaccard。后两个是纯字符串运算，**没有 `GOOGLE_API_KEY` 也能跑**——原来只比标题向量，embedding 一挂整个失效。
 
-**C. 查重是硬闸** → `check_drafts` 是 deskcore **唯一不 fail-open** 的工具。其它读类工具出错返回带 `error` 的可用结构不阻塞写稿；查重出错必须抛。静默放行就是重演根因 1。
+**C. 查重是硬闸** → `check_drafts` 是 deskcore **唯一不 fail-open** 的读工具。其它读类工具出错返回带 `error` 的可用结构不阻塞写稿；查重出错必须抛。静默放行就是重演根因 1。
+
+**D. 两个并发点都交给数据库** → `check_drafts` 和 `commit_drafts` 是两次独立调用，两个队友各自 check 时看到同一份旧指纹集、双双 pass，然后各自 commit——撞车的稿子一起进库。发牌有同样的问题。两处都用 project 级事务 advisory lock 收进一个事务里解决：
+
+| RPC | 关掉的竞态 |
+|---|---|
+| `deskcore_reserve_angles` | 两人同时发牌拿到同一组角度坐标 |
+| `deskcore_commit_fingerprints` | 两人 check 后同时 commit 撞车的稿子 |
+
+思路同本仓已有的 `claim_one_job`——并发正确性交给数据库，不靠应用层自觉。commit 侧只在锁内做**确定性**信号（开头精确 + 四字串 Jaccard）；标题语义那一路留在 Python 的 `check_drafts` 里，因为历史行可能没有向量。被判撞车的条目**不入库**，在 `rejected` 里返回。
+
+两个 RPC 不存在时（迁移没跑）都会降级到非原子路径，并在返回值里显式标 `atomic=false` / `atomic_recheck=false` + warning——不会假装原子。
 
 ---
 
@@ -157,7 +168,19 @@ env：
 | `DESKCORE_MODEL` | 可选 | 不设走 `config.CLAUDE_MODEL` |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `borrow_lessons` 返回空 |
 
-先跑迁移：`migrations/001_deskcore.sql`（建议先在 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。
+### 4.1.1 部署两步，缺一不可
+
+**① 跑迁移** `migrations/001_deskcore.sql`（建议先在 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。
+
+**② 回填历史指纹**（**必做**）：
+
+```bash
+python -m deskcore.cli backfill --project <uuid>    # 每个项目跑一次
+```
+
+⚠️ 迁移建的是**空表**，而 `check_drafts` 只读这张表、只有 `commit_drafts` 会往里写。不回填的话，**刚上线那天号称"比对全量历史"的硬闸背后一条历史都没有**，老稿子的重复会原样放行。
+
+回填是幂等的（按 `version_id` 跳过已有的），可以反复跑。没回填时 `check_drafts` 的 summary 会带 `empty_history_warning`。
 
 ### 4.2 自测
 
@@ -202,7 +225,9 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
 **2. pgvector 反序列化（R-034）。** PostgREST 对 `vector(768)` 列的 JSON 序列化是**字符串** `"[0.1,...]"`，不是数组。不归一的话 `dedup.cosine_similarity` 因长度不等**静默返回 0.0** —— 查重变哑弹，一条都抓不到，而且不报错。所有读 embedding 的地方必须过 `db._parse_pgvector`（`store.py` 已经在读取边界统一处理）。
 
-**3. `user_id` 必须用库里已有的 UUID。** 不要新造。TV `autowriter-migrations/RUNBOOK.md:150-153` 记过：写了 service account 的 UUID 导致 RLS 屏蔽、`list_example_items` 永远 0 行、飞轮静默断开，查了很久。配 `DESKCORE_KEYS` 时从 `projects.owner_id` / `items.user_id` 里查出来抄。
+**3. 鉴权配坏了必须 fail closed。** `DESKCORE_KEYS` 的 JSON 写错时，早期实现会返回空 map → `resolve()` 判定为"没配鉴权" → **放行所有请求**。生产上一个逗号写错就等于把项目数据和全部写工具匿名开放。现在显式配了就必须当成"打算开鉴权"，解析失败一律 401，`/health` 的 `auth.ok` 会是 false。
+
+**4. `user_id` 必须用库里已有的 UUID。** 不要新造。TV `autowriter-migrations/RUNBOOK.md:150-153` 记过：写了 service account 的 UUID 导致 RLS 屏蔽、`list_example_items` 永远 0 行、飞轮静默断开，查了很久。配 `DESKCORE_KEYS` 时从 `projects.owner_id` / `items.user_id` 里查出来抄。
 
 ---
 
@@ -225,6 +250,8 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 1. **WorkBuddy 的 HTTP MCP 自定义鉴权头无权威文档。** 见 §4.3，已留两条退路，但必须最先验。
 2. **馆员选卡质量从未在真实规模验证过。** TV 书架现有 118 张卡 / 可借 201，但这个规模下的选卡准确率没人测过。
 3. **embedding 依赖 `GOOGLE_API_KEY`。** 存量 768 维向量都是 Gemini `text-embedding-004` 产的，换模型会让历史向量全部作废需重算。没有它时查重降级为纯确定性——仍能抓开头撞车和四字串重合（`selftest` 证明了这点），但同角度换说法的标题会漏。
-4. **查重目前在 Python 里逐对比。** `store.fingerprints` 有 4000 行上限。单项目到十万行量级时该改成 pgvector 服务端检索（`draft_fingerprints` 已建 ivfflat 索引，改起来不难）。
-5. **"个人风格私有"与团队协作的张力。** 同一项目两个人各自驯化，风格会分叉。指纹库共享（互相避重），调校笔记不共享。跑一段时间如果分叉太严重，可能需要"把我的调校笔记提升为项目基线"的操作。第一期不做。
-6. **native 正例的 essence 不可测。** 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，拿不到 `emotional_lever`，所以 TV 的饱和度监控对它们只能报"无法评估"。想让它可测需要给这些正例补 essence 标注。
+4. **查重目前在 Python 里逐对比。** `store.fingerprints` 有 4000 行上限。单项目到十万行量级时该改成 pgvector 服务端检索（`draft_fingerprints` 已建 ivfflat 索引，改起来不难）。commit 侧的原子重查已经在 SQL 里了，可以参照。
+
+5. **commit 的原子重查只覆盖确定性信号。** 开头精确 + 四字串 Jaccard 在锁内查；标题语义相似度没查（要 pgvector 距离算子，且历史行可能没向量）。也就是说竞态窗口里"标题换个说法的同角度稿"仍可能两条都进。要覆盖它得把向量比对也搬进 RPC——等 backfill 把历史向量补齐之后再做更合适。
+6. **"个人风格私有"与团队协作的张力。** 同一项目两个人各自驯化，风格会分叉。指纹库共享（互相避重），调校笔记不共享。跑一段时间如果分叉太严重，可能需要"把我的调校笔记提升为项目基线"的操作。第一期不做。
+7. **native 正例的 essence 不可测。** 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，拿不到 `emotional_lever`，所以 TV 的饱和度监控对它们只能报"无法评估"。想让它可测需要给这些正例补 essence 标注。
