@@ -65,15 +65,17 @@ def shared_memories(sb, project_id: str) -> tuple[list[dict], list[dict]]:
 
     返回 (hard, soft)。muted_until 未到期的过滤掉(用户临时静音一条规则而不删)。
     同时带上 scope='global' 的通用规则。
+
+    ⚠️ 【故意不吞异常】。这里读的是项目的强制合规规则(禁词/必含话术/绝对不能
+    提的内容)。查询失败若降级成空列表, build_writing_brief 会返回一个 p0 为空、
+    却没有任何错误标记的正常简报 —— 调用方照常开写, 而这一批稿子【不带任何
+    硬约束】。那正是这个服务存在的意义所在, 也是最坏的失败模式: 不报错、
+    看起来一切正常、产出的却是违规内容。宁可整个 open_project 报错。
     """
     def _rows(query):
-        try:
-            return (query.eq("status", "confirmed")
-                         .neq("memory_type", "session")
-                         .execute()).data or []
-        except Exception:
-            logger.exception("read memories failed (project=%s)", project_id)
-            return []
+        return (query.eq("status", "confirmed")
+                     .neq("memory_type", "session")
+                     .execute()).data or []
 
     cols = "id, content, severity, scope, rule_kind, rule_payload, muted_until, user_id"
     proj = _rows(sb.table("memories").select(cols)
@@ -150,22 +152,34 @@ def labeled_examples(sb, project_id: str, label: str,
     return out
 
 
+def item_owner(sb, item_id: str) -> str | None:
+    """item 归谁。label_example 校验归属用 —— service_role 绕了 RLS, 归属校验
+    必须自己做, 否则任何人都能改别人的正负例池。"""
+    res = sb.table("items").select("user_id").eq("id", item_id).limit(1).execute()
+    rows = res.data or []
+    return rows[0].get("user_id") if rows else None
+
+
 # ── 发牌台账 ──────────────────────────────────────────────────────────────
 
 def recent_angle_keys(sb, project_id: str, avoid_days: int) -> set[str]:
     """近期用过的角度组合。
 
     两档时效:
-      · 真出了稿的(consumed_version_id 非 NULL)按 avoid_days 算
-      · 只抽了没写的(占位)按 1 天算 —— 抽了不写不该长期占坑, 否则连点几次
-        发牌就把组合空间锁死了
+      · 真出了稿的(consumed_version_id 非 NULL)按 **consumed_at** 算 avoid_days
+      · 只抽了没写的(占位)按 drawn_at 算 1 天 —— 抽了不写不该长期占坑, 否则
+        连点几次发牌就把组合空间锁死了
+
+    ⚠️ consumed 那一档【必须按 consumed_at 而不是 drawn_at】: 审稿定稿常常拖
+    几天, 若按 drawn_at 算, 一条今天刚定稿、但上个月抽的角度会立刻不在避重集里
+    (drawn_at 已超窗), 下一批马上重用刚发出去的角度。avoid_days 调小时更明显。
     """
     keys: set[str] = set()
     try:
         used = (sb.table("angle_ledger").select("angle_key")
                   .eq("project_id", project_id)
                   .not_.is_("consumed_version_id", "null")
-                  .gte("drawn_at", iso_ago(avoid_days)).execute()).data or []
+                  .gte("consumed_at", iso_ago(avoid_days)).execute()).data or []
         keys.update(r["angle_key"] for r in used)
         held = (sb.table("angle_ledger").select("angle_key")
                   .eq("project_id", project_id)
@@ -178,8 +192,45 @@ def recent_angle_keys(sb, project_id: str, avoid_days: int) -> set[str]:
     return keys
 
 
+def reserve_angles(sb, project_id: str, candidates: list[dict],
+                   want: int, user_id: str | None,
+                   avoid_days: int) -> list[dict] | None:
+    """原子预留: 走 deskcore_reserve_angles RPC。
+
+    读避重集 + 挑 + 插入三步在一个事务里, 同项目由事务级 advisory lock 串行化。
+    不这样做的话, 两个队友同时发牌会各自读到"没用过"再各自插入, 同一个角度被
+    两批同时用掉, 而两边都报告成功。
+
+    candidates 过量供给(远多于 want), 函数取前 want 个可用的。
+    返回 [{"angle_key","dims"}, ...]; RPC 不存在(迁移没跑)时返回 None,
+    由调用方决定怎么降级。
+    """
+    if want <= 0 or not candidates:
+        return []
+    try:
+        res = sb.rpc("deskcore_reserve_angles", {
+            "_project_id": project_id,
+            "_candidates": candidates,
+            "_drawn_by": user_id,
+            "_want": want,
+            "_avoid_days": avoid_days,
+        }).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "could not find the function" in msg or "does not exist" in msg or "pgrst202" in msg:
+            logger.error("deskcore_reserve_angles RPC 不存在 —— migrations/001 还没跑? "
+                         "本次降级为非原子发牌(并发时可能撞车)。")
+            return None
+        raise
+    return [{"angle_key": r.get("reserved_key"), "dims": r.get("reserved_dims") or {}}
+            for r in (res.data or []) if r.get("reserved_key")]
+
+
 def record_draw(sb, project_id: str, angles: list[dict], user_id: str | None) -> None:
-    """写台账。失败不阻塞发牌, 但必须留痕 —— 否则下次避重静默失效。"""
+    """非原子降级路径: RPC 不可用时直接插台账。
+
+    失败不阻塞发牌, 但必须留痕 —— 否则下次避重静默失效。
+    """
     if not angles:
         return
     rows = [{"project_id": project_id, "angle_key": a["angle_key"],

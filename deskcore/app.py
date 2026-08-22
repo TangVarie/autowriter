@@ -198,7 +198,12 @@ def _register_mcp():
                        "(REST /tool/{name} still works)")
         return None
 
-    mcp = FastMCP(name="deskcore", stateless_http=True, json_response=True)
+    # ⚠️ streamable_http_path 必须设成 "/": FastMCP 的默认值是 "/mcp",
+    # 子应用自己就带 /mcp 路由; 再 app.mount("/mcp", ...) 会让真实端点变成
+    # /mcp/mcp —— 文档里给 WorkBuddy / Claude Code 的地址是 /mcp, 初始化请求
+    # 会打到空处, 而且不报错只是 404。(实测: 默认路由 ['/mcp'], 设 "/" 后 ['/'])
+    mcp = FastMCP(name="deskcore", stateless_http=True, json_response=True,
+                  streamable_http_path="/")
 
     def _wrap(fn, needs_user: bool):
         # 把 _user_id 从签名里摘掉再注册 —— 模型不该看到它, 也不该能传它。

@@ -52,18 +52,26 @@ def ngram_hashes(text: str, n: int = 4, cap: int = 200) -> list[str]:
     对齐 human-writing/scripts/check_prose.py 的跨篇四字串检测: 两篇共享大量
     四字串 = 模板化, 哪怕换了词也能抓出来。
 
-    cap 是防长文把行撑爆; 超了【均匀采样】而不是取前 cap 个 —— 取前 N 会让
-    所有长文只比开头, 后半篇随便抄都查不出来。
+    cap 是防长文把行撑爆。超了取【全局最小的 cap 个 hash】(bottom-k / MinHash
+    的标准做法), 不是按名次均匀采样。
+
+    ⚠️ 这一点很容易写错, 而且错了不报错: 按名次采样(step = len/cap 取第
+    i*step 个)【不是内容稳定的】—— 一个字的增删会改变整张排序表里所有元素的
+    名次, 两篇几乎相同的长文可能采出完全不同的子集, 算出来的 Jaccard 低到
+    连 0.22 的 warn 线都够不上, 直接从硬闸溜过去。
+
+    bottom-k 稳定是因为: 某个 4-gram 在不在结果里, 只取决于【它自己的 hash 值】
+    与第 k 小值的大小关系, 与文本长度和其它 gram 的名次无关。两篇共享的
+    gram 会一起进、一起出, Jaccard 近似无偏。
+
+    这也保证覆盖全文而不是只比开头 —— hash 值与 gram 在文中的位置无关。
     """
     norm = normalize(text)
     if len(norm) < n:
         return []
     grams = {norm[i:i + n] for i in range(len(norm) - n + 1)}
     hashed = sorted(sha16(g) for g in grams)
-    if len(hashed) <= cap:
-        return hashed
-    step = len(hashed) / cap
-    return [hashed[int(i * step)] for i in range(cap)]
+    return hashed[:cap]
 
 
 def jaccard(a: set[str], b: set[str]) -> float:
@@ -121,3 +129,52 @@ def angle_key(dims: dict) -> str:
                     ("emotional_lever", "human_truth_archetype",
                      "content_format", "title_structure"))
     return hashlib.sha256(core.encode("utf-8")).hexdigest()[:20]
+
+
+# ── 正例多样性限额 ────────────────────────────────────────────────────────
+
+def opening_shape(body: str, n: int = 12) -> str:
+    """开头形态指纹 —— 用于给正例分桶。"""
+    return sha16(normalize(opening_of(body, n)))
+
+
+def cap_by_shape(items: list[dict], limit: int,
+                 body_key: str = "body") -> list[dict]:
+    """按开头形态两趟贪心挑 limit 条: 第一趟每种形态只收一条, 第二趟补满
+    【但单一形态最多占 limit//2】。
+
+    为什么补满那趟也要限额: 不限的话, 当某一种开头形态在候选池里占绝对多数时,
+    它能占满全部 slot —— 正例池的趋同回路就等于没断, 改了白改。宁可少给几条。
+
+    思路来自 TV sync_truth_vault_baokuan_to_autowriter_items.py:211-269 的两趟
+    贪心, 但那边 min_levers 只是 advisory 不拒绝, 这里是真约束。
+    """
+    if limit <= 0 or not items:
+        return []
+    per_shape_cap = max(1, limit // 2)
+    counts: dict[str, int] = {}
+    first: list[dict] = []
+    rest: list[dict] = []
+    for it in items:
+        sh = opening_shape(it.get(body_key, "") or "")
+        if sh in counts:
+            rest.append(it)
+        else:
+            counts[sh] = 0
+            first.append(it)
+
+    picked: list[dict] = []
+    for it in first:
+        if len(picked) >= limit:
+            break
+        picked.append(it)
+        counts[opening_shape(it.get(body_key, "") or "")] += 1
+    for it in rest:
+        if len(picked) >= limit:
+            break
+        sh = opening_shape(it.get(body_key, "") or "")
+        if counts.get(sh, 0) >= per_shape_cap:
+            continue
+        picked.append(it)
+        counts[sh] = counts.get(sh, 0) + 1
+    return picked

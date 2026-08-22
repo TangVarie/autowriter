@@ -91,19 +91,9 @@ def select_positive_examples(candidates: list[dict], brief: dict,
             scored.sort(key=lambda t: t[0], reverse=True)
             ranked, mode = [c for _s, c in scored], "relevance"
 
-    # 多样性: 按开头形态分桶, 第一趟每桶只收一条, 再补满。
-    # 思路来自 TV sync_truth_vault_baokuan_to_autowriter_items.py:211-269 的两趟
-    # 贪心, 但那边 min_levers 只是 advisory 不拒绝, 这里是真约束。
-    seen: set[str] = set()
-    first, rest = [], []
-    for c in ranked:
-        shape = fp.sha16(fp.normalize(fp.opening_of(c.get("body", ""), 12)))
-        (rest if shape in seen else first).append(c)
-        seen.add(shape)
-    picked = first[:limit]
-    if len(picked) < limit:
-        picked += rest[: limit - len(picked)]
-    return picked, mode
+    # 多样性限额在 fingerprint.cap_by_shape —— 纯逻辑放无依赖模块, 让 selftest
+    # 能在裸环境里验它(这一条是趋同回路的最后一道闸, 值得单独回归)。
+    return fp.cap_by_shape(ranked, limit), mode
 
 
 def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
@@ -198,7 +188,6 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     pool_source = "project.custom_roles" if custom else "generator.CREATIVE_ROLES_POOL"
 
     rng = random.Random(seed) if seed is not None else random.Random()
-    avoid = store.recent_angle_keys(client, project_id, avoid_days)
 
     space = [(lev, arc, fmt, st)
              for lev in vocab.EMOTIONAL_LEVERS
@@ -207,25 +196,35 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
              for st in vocab.TITLE_STRUCTURES]
     rng.shuffle(space)
 
-    tilt = rng.choice(vocab.WORD_TILTS)  # 词感是"今天的心情", 全批一致
-    picked: list[dict] = []
-    used: set[str] = set()
-
-    for lev, arc, fmt, st in space:
-        if len(picked) >= n:
-            break
+    # 过量供给候选给 RPC —— 它在事务里逐个查避重集、取前 n 个可用的。
+    # 20 倍冗余(下限 500)足以覆盖"近期用掉很多"的项目。
+    cand_cap = min(len(space), max(n * 20, 500))
+    candidates = []
+    for lev, arc, fmt, st in space[:cand_cap]:
         dims = {"emotional_lever": lev, "human_truth_archetype": arc,
                 "content_format": fmt, "title_structure": st}
-        key = angle_key(dims)
-        if key in avoid or key in used:
-            continue
-        used.add(key)
+        candidates.append({"angle_key": angle_key(dims), "dims": dims})
+
+    reserved = store.reserve_angles(client, project_id, candidates, n,
+                                    user_id, avoid_days)
+    atomic = reserved is not None
+    if not atomic:
+        # RPC 不在(迁移没跑)。降级到旧的"读-挑-插"三步, 并明确告知不是原子的。
+        avoid = store.recent_angle_keys(client, project_id, avoid_days)
+        reserved = [c for c in candidates if c["angle_key"] not in avoid][:n]
+        store.record_draw(client, project_id, reserved, user_id)
+
+    tilt = rng.choice(vocab.WORD_TILTS)  # 词感是"今天的心情", 全批一致
+    picked: list[dict] = []
+    for r in reserved:
+        dims = r["dims"]
+        lev = dims.get("emotional_lever", "")
         angle = angles_pool[len(picked) % len(angles_pool)]
         trends = ([vocab.TREND_EXCLUSIVE] if perpetual_bias
                   else vocab.normalize_trends([rng.choice(vocab.TREND_DEPENDENCIES)]))
         picked.append({
             "slot": len(picked) + 1,
-            "angle_key": key,
+            "angle_key": r["angle_key"],
             "dims": dims,
             "emotional_valence": vocab.valence_of(lev),
             "emotional_intensity": rng.choice(vocab.EMOTIONAL_INTENSITIES),
@@ -237,19 +236,22 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
         })
 
     if len(picked) < n:
-        logger.warning("angle space exhausted (project=%s): asked %d got %d, "
-                       "avoid set=%d", project_id, n, len(picked), len(avoid))
+        logger.warning("angle space exhausted (project=%s): asked %d got %d",
+                       project_id, n, len(picked))
 
-    store.record_draw(client, project_id, picked, user_id)
     return {
         "angles": picked,
         "requested": n,
         "delivered": len(picked),
         "prompt_block": render_angles_block(picked),
         "angle_pool_source": pool_source,
+        "atomic_reservation": atomic,
         "combination_space": vocab.combination_space(),
         "note": ("发到的组合少于请求数, 说明近期用掉太多; 可以调小 avoid_days 或分批写。"
                  if len(picked) < n else ""),
+        "warning": ("" if atomic else
+                    "本次发牌不是原子的(deskcore_reserve_angles RPC 不存在, "
+                    "migrations/001 可能没跑)。并发发牌时可能与队友撞车。"),
     }
 
 
@@ -549,8 +551,14 @@ def distill_calibration(client, project_id: str, *, user_id: str,
     return notes
 
 
-def label_example(client, item_id: str, label: str | None) -> dict:
+def label_example(client, item_id: str, label: str | None,
+                  *, user_id: str | None = None) -> dict:
     """标正/负例。复用 db.set_item_example_label —— 它顺带清三处缓存。
+
+    ⚠️ 【必须校验归属】。items.example_label 是【个人】风格资产(私有层), 而
+    deskcore 持 service_role 绕 RLS —— 没有这道校验的话, 任何拿到别人 item
+    UUID 的调用方都能改别人的正负例池, 进而污染那个人的写作风格。
+    RLS 在 Streamlit 路径下挡住了这件事, 到了 service_role 路径就得自己挡。
 
     ⚠️ 负例【只取人工标注】。TV D-040 讲得很清楚: 「赢」需要真的好, 「输」有
     太多无辜理由(撞流量墙 / 账号限流 / 时机), 从数据反推负例会把被埋没的
@@ -558,6 +566,19 @@ def label_example(client, item_id: str, label: str | None) -> dict:
     """
     if label not in ("positive", "negative", None):
         raise ValueError("label must be 'positive', 'negative' or None")
+    if not user_id:
+        raise PermissionError(
+            "label_example 需要调用者身份 —— 正负例是个人资产, 不能匿名改。"
+            "服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID。")
+
+    owner = store.item_owner(client, item_id)
+    if owner is None:
+        raise ValueError(f"item not found: {item_id}")
+    if str(owner) != str(user_id):
+        raise PermissionError(
+            f"item {item_id} 属于别人, 不能改它的 example_label。"
+            "正负例是个人风格资产(私有层), 项目规则才是团队共享的。")
+
     db.set_item_example_label(client, item_id, label)
     return {"item_id": item_id, "example_label": label}
 

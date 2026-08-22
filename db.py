@@ -790,6 +790,80 @@ DROP TRIGGER IF EXISTS deskcore_items_updated_at ON items;
 CREATE TRIGGER deskcore_items_updated_at
     BEFORE UPDATE ON items
     FOR EACH ROW EXECUTE FUNCTION _deskcore_touch_updated_at();
+
+-- ── deskcore 发牌的原子预留 ──────────────────────────────────────────
+-- 为什么需要它: draw_angles 原本是"读避重集 → Python 里挑 → 插入"三步。
+-- 两个队友同时给同一项目发牌, 会各自读到"这个组合没用过"、各自插入成功,
+-- 同一个角度被两批同时用掉 —— 而两边都报告成功, 跨批次唯一性的承诺破了。
+-- 台账上只有非唯一索引, 拦不住。
+--
+-- 这里把三步收进一个事务, 用事务级 advisory lock 把【同一项目】的发牌串行化
+-- (不同项目互不阻塞, 事务结束自动释放)。与 claim_one_job 的
+-- FOR UPDATE SKIP LOCKED 是同一思路: 并发正确性交给数据库, 不靠应用层自觉。
+--
+-- _candidates: [{"angle_key": "...", "dims": {...}}, ...] 按优先级排好序,
+--              过量供给(调用方给远多于 _want 的候选), 函数取前 _want 个可用的。
+CREATE OR REPLACE FUNCTION deskcore_reserve_angles(
+    _project_id UUID,
+    _candidates JSONB,
+    _drawn_by   UUID,
+    _want       INT,
+    _avoid_days INT DEFAULT 30
+)
+RETURNS TABLE(reserved_key TEXT, reserved_dims JSONB)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    cand  JSONB;
+    k     TEXT;
+    taken INT := 0;
+BEGIN
+    IF _want <= 0 THEN
+        RETURN;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtext('deskcore_draw:' || _project_id::text));
+
+    FOR cand IN SELECT * FROM jsonb_array_elements(_candidates) LOOP
+        EXIT WHEN taken >= _want;
+        k := cand->>'angle_key';
+        CONTINUE WHEN k IS NULL OR k = '';
+
+        -- 已产出成稿且仍在避重窗内 → 跳过。按 consumed_at 而不是 drawn_at:
+        -- 审稿定稿常拖几天, 按 drawn_at 会让刚定稿的角度立刻可被重用。
+        CONTINUE WHEN EXISTS (
+            SELECT 1 FROM angle_ledger al
+             WHERE al.project_id = _project_id
+               AND al.angle_key  = k
+               AND al.consumed_version_id IS NOT NULL
+               AND al.consumed_at >= now() - make_interval(days => _avoid_days));
+
+        -- 抽了还没写的占位, 1 天内 → 跳过。占位不该长期占坑, 否则连点几次
+        -- 发牌就把组合空间锁死。
+        CONTINUE WHEN EXISTS (
+            SELECT 1 FROM angle_ledger al
+             WHERE al.project_id = _project_id
+               AND al.angle_key  = k
+               AND al.consumed_version_id IS NULL
+               AND al.drawn_at >= now() - interval '1 day');
+
+        INSERT INTO angle_ledger (project_id, angle_key, dims, drawn_by)
+        VALUES (_project_id, k, COALESCE(cand->'dims', '{}'::jsonb), _drawn_by);
+
+        taken         := taken + 1;
+        reserved_key  := k;
+        reserved_dims := COALESCE(cand->'dims', '{}'::jsonb);
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+-- 只给 service_role。deskcore 是唯一调用方; 不加约束的话任何能访问 PostgREST
+-- RPC 的角色都能往别人项目的台账里塞行(同 claim_one_job 的权限处理)。
+REVOKE ALL ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) FROM anon;
+REVOKE ALL ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) TO service_role;
 """
 
 

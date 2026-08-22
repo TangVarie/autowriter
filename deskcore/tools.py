@@ -155,8 +155,14 @@ def commit_drafts(project_id: str, drafts: list[dict],
     """把【定稿】的稿子入库, 让它们参与以后的查重, 并把用掉的坐标销账。
 
     只传真正要发的稿子。把废稿也记进去会让以后正常的选题被误杀。
+
+    这个工具出错会直接报错。入库失败必须让你知道 —— 稿子没进指纹库的话,
+    下次 check_drafts 会把同样的内容再放行一次。看到报错就重试, 别当没事。
     """
-    return _safe(core.commit_drafts, core.sb(), project_id, drafts, user_id=_user_id)
+    # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、
+    # 只带 error 字段的结果, 而写作台协议对 commit 没有强制重试 —— 于是定稿
+    # 静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
+    return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -206,10 +212,13 @@ def record_edit(project_id: str, ai_title: str, ai_body: str,
                  my_title=my_title, my_body=my_body, note=note or None)
 
 
-def label_example(item_id: str, label: str) -> dict:
+def label_example(item_id: str, label: str, _user_id: str | None = None) -> dict:
     """把某条历史稿标成正面案例或反面案例。
 
     label 传 "positive" / "negative" / "none"(撤销)。
+
+    只能标【自己的】稿子 —— 正负例是个人风格资产, 改别人的会污染那个人的文风。
+    标别人的会报错。
 
     正例会作为学习样本注入以后的写作; 负例作为「主动规避」的反面教材。
 
@@ -217,8 +226,12 @@ def label_example(item_id: str, label: str) -> dict:
     负例 —— 数据不好有太多与内容无关的原因(没进流量池、账号限流、时机不对),
     那样会把被埋没的好内容也标成垃圾。
     """
+    if not _user_id:
+        return {"error": "无法识别调用者身份, 不能标记正负例(那是个人资产)",
+                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
     return _safe(core.label_example, core.sb(), item_id,
-                 None if label in ("none", "", None) else label)
+                 None if label in ("none", "", None) else label,
+                 user_id=_user_id)
 
 
 def my_style(project_id: str, _user_id: str | None = None) -> dict:
@@ -244,6 +257,6 @@ TOOLS = {
     "commit_drafts":  (commit_drafts,  True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),
-    "label_example":  (label_example,  False),
+    "label_example":  (label_example,  True),
     "my_style":       (my_style,       True),
 }

@@ -81,10 +81,22 @@ def resolve(provided: str | None) -> Caller:
         entry = keys.get(provided)
         if entry is None:
             raise AuthError("invalid X-Deskcore-Key")
-        return Caller(entry.get("user_id") or None,
-                      name=entry.get("name") or "", authenticated=True)
+        uid = (entry.get("user_id") or "").strip()
+        if not uid:
+            # 配置错误不能降级成"共享一切"。user_id 为空时, 下游按 user 过滤的
+            # 查询(正负例/调校笔记)条件会失效 —— open_project 会把【所有人】的
+            # 私有写作样本一起返回。宁可 401 让人当场发现。
+            raise AuthError(
+                f"DESKCORE_KEYS entry for {entry.get('name') or 'this key'} has no "
+                "user_id; refusing to authenticate (a missing user_id would expose "
+                "every user's private examples). Fix the key map.")
+        return Caller(uid, name=entry.get("name") or "", authenticated=True)
 
     if provided != single:
         raise AuthError("invalid X-Deskcore-Key")
-    return Caller(os.environ.get("DESKCORE_DEFAULT_USER_ID") or None,
-                  name="default", authenticated=True)
+    default_uid = (os.environ.get("DESKCORE_DEFAULT_USER_ID") or "").strip()
+    if not default_uid:
+        raise AuthError(
+            "DESKCORE_API_KEY is set but DESKCORE_DEFAULT_USER_ID is empty; "
+            "refusing to authenticate (see above).")
+    return Caller(default_uid, name="default", authenticated=True)

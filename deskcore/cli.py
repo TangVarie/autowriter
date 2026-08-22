@@ -113,6 +113,50 @@ def selftest() -> int:
               f"ngram={j:.3f}  → 期望 {expect}  {mark}"
               + (f"\n           ↳ {reason}" if reason else ""))
 
+    # ── 2b. n-gram 截断必须内容稳定 (codex P1 回归) ──
+    # 按名次均匀采样(step=len/cap 取第 i*step 个)不是内容稳定的: 一个字的增删
+    # 会改变整张排序表的名次, 两篇几乎相同的长文可能采出完全不同的子集,
+    # Jaccard 掉到连 warn 线都够不上, 直接从硬闸溜过去。
+    # bottom-k(取全局最小的 cap 个 hash)稳定, 因为某个 gram 在不在结果里只取决于
+    # 它自己的 hash 值与第 k 小值的关系, 与文本长度、其它 gram 的名次无关。
+    import random as _rnd
+    _r = _rnd.Random(7)
+    _pool = "的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条只没结解问意建月公无系军很情者最立代想已通并提直题党程展五果料象员革位入常文总次品式活设及管特件长求老头基资边流路级少图山统接知较将组见计别她手角期根论运农指几九区强放决西被干做必战先回则任取据处队南给色光门即保治北造百规热领七海口东导器压志世金增争济阶油思术极交受联什认六共权收证改清己美再采转更单风切打白教速花带安场身车例真务具万每目至达走积示议声报斗完类八离华名确才科张信马节话米整空元况今集温传土许步群广石记需段研界拉林律叫且究观越织装影算低持音众书布复容儿须际商非验连断深难近矿千周委素技备半办青省列习响约支般史感劳便团往酸历市克何除消构府称太准精值号率族维划选标写存候毛亲快效斯院查江型眼王按格养易置派层片始却专状育厂京识适属圆包火住调满县局照参红细引听该铁价严龙飞"
+    _long = "".join(_r.choice(_pool) for _ in range(3000))
+    _edited = _long[:1500] + "×" + _long[1500:]          # 中间插一个字
+
+    def _all_grams(t):
+        nm = fp.normalize(t)
+        return {fp.sha16(nm[i:i + 4]) for i in range(len(nm) - 3)}
+
+    truth = fp.jaccard(_all_grams(_long), _all_grams(_edited))     # 不截断的地面真值
+    est = fp.jaccard(set(fp.ngram_hashes(_long)), set(fp.ngram_hashes(_edited)))
+    n_full = len(_all_grams(_long))
+    print(f"\nn-gram 截断稳定性（{n_full} grams，远超 cap=200）:")
+    print(f"  地面真值 J={truth:.3f}   截断后估计 J={est:.3f}   偏差 {abs(truth - est):.3f}")
+    if n_full <= 200:
+        print("  ✗ 测试文本没超过 cap，没测到截断路径")
+        ok = False
+    elif abs(truth - est) > 0.15:
+        print("  ✗ 截断后的估计偏离真值太多 —— 采样不是内容稳定的，"
+              "长文的近似重复会从硬闸溜过去")
+        ok = False
+    else:
+        print("  ok（bottom-k 采样，偏差在容忍范围内）")
+
+    # ── 2c. 正例多样性上限必须真的执行 (codex P2 回归) ──
+    # 全部候选共用同一个开头形态时, 补满那一趟若不限次数, 单一形态会占满
+    # 全部 slot —— 趋同回路等于没断。
+    same_shape = [{"title": f"t{i}", "body": "都用同一个开头这句话开场。\n然后各写各的" + str(i)}
+                  for i in range(10)]
+    picked = fp.cap_by_shape(same_shape, limit=5)
+    print(f"\n正例多样性上限: 10 条同开头候选 → 选出 {len(picked)} 条 (上限 5//2=2)")
+    if len(picked) > 2:
+        print("  ✗ 单一开头形态占了超过一半的 slot，多样性约束没生效")
+        ok = False
+    else:
+        print("  ok（宁可少给，不让单一形态占满）")
+
     # ── 3. 发牌指纹 ──
     from .fingerprint import angle_key
     d = {"emotional_lever": "焦虑撬动", "human_truth_archetype": "健康焦虑",
