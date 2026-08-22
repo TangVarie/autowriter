@@ -1,0 +1,219 @@
+{
+  "$comment": [
+    "受控词表的机器可读权威导出 (D-041)。",
+    "人类可读权威源 = docs/05-controlled-vocab.md; 本文件由 TV 的 CI 保证与它一致。",
+    "消费方(autowriter/deskcore 等)原样 vendor 本文件并记校验和, 不要手抄。",
+    "只导出 TV 拥有的层: essence 维度 + 跨仓共享分类。",
+    "表层的标题句式/词感/切入角度【不在此列】—— 那是各生产系统自己的东西",
+    "(半衰期 6-12 个月, 本来就该独立演进, 见 README 原则 2 的 Surface/Essence 分层)。"
+  ],
+  "version": "0.2",
+  "authority": "docs/05-controlled-vocab.md",
+  "layer": "essence + shared taxonomy",
+  "sets": {
+    "emotional_lever": {
+      "doc_section": "§3",
+      "multi": false,
+      "values": [
+        "焦虑撬动",
+        "羞耻撬动",
+        "恐惧撬动",
+        "愤怒撬动",
+        "罪恶感撬动",
+        "造梦投射",
+        "认同感建立",
+        "归属感建立",
+        "共鸣释放",
+        "虚荣撬动",
+        "好奇驱动",
+        "信息差利用"
+      ]
+    },
+    "emotional_valence": {
+      "doc_section": "§4",
+      "multi": false,
+      "values": [
+        "positive",
+        "negative",
+        "neutral"
+      ],
+      "derived_from": "emotional_lever",
+      "$comment": "由 lever 唯一决定, 不独立标注、不参与抽样"
+    },
+    "emotional_intensity": {
+      "doc_section": "§5",
+      "multi": false,
+      "values": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "human_truth_archetype": {
+      "doc_section": "§6",
+      "multi": true,
+      "max_select": 2,
+      "values": [
+        "同辈比较",
+        "伴侣关系",
+        "代际冲突",
+        "职场关系",
+        "宠物相关",
+        "自我形象维护",
+        "身份认同",
+        "时间流逝感",
+        "自由意志",
+        "阶层焦虑",
+        "经济焦虑",
+        "健康焦虑",
+        "育儿焦虑",
+        "情感缺位",
+        "归属缺失",
+        "认同缺失",
+        "控制感渴望",
+        "自我提升",
+        "消费愉悦"
+      ]
+    },
+    "trend_dependencies": {
+      "doc_section": "§7",
+      "multi": true,
+      "values": [
+        "特定平台事件",
+        "特定IP引用",
+        "时事热点",
+        "季节性事件",
+        "节日",
+        "行业事件",
+        "当代流行词",
+        "时代语言范式",
+        "平台话术",
+        "通用"
+      ],
+      "exclusive_value": "通用",
+      "halflife_tier": {
+        "通用": "perpetual",
+        "时代语言范式": "era_idiom",
+        "平台话术": "era_idiom",
+        "特定IP引用": "short",
+        "行业事件": "short",
+        "当代流行词": "short",
+        "特定平台事件": "short",
+        "时事热点": "short",
+        "季节性事件": "short",
+        "节日": "short"
+      }
+    },
+    "content_format": {
+      "doc_section": "§2",
+      "multi": false,
+      "values": [
+        "情感叙事",
+        "认知重构",
+        "横评对比",
+        "教程攻略",
+        "直给推荐",
+        "场景植入",
+        "提问求助",
+        "反差破圈"
+      ]
+    },
+    "target_audience": {
+      "doc_section": "§8",
+      "multi": true,
+      "values": [
+        "年轻女性",
+        "中年女性",
+        "银发女性",
+        "年轻男性",
+        "中年男性",
+        "银发男性",
+        "学生党",
+        "宝妈",
+        "伴侣家人",
+        "病患家属",
+        "通用"
+      ]
+    },
+    "intent": {
+      "doc_section": "§1",
+      "multi": false,
+      "values": [
+        "traffic",
+        "conversion",
+        "educational",
+        "mixed",
+        "other"
+      ]
+    },
+    "tier": {
+      "doc_section": "§10",
+      "multi": false,
+      "values": [
+        "大爆",
+        "爆",
+        "预备",
+        "参考",
+        "风控",
+        "趴",
+        "未知",
+        "删除",
+        "数据异常"
+      ]
+    },
+    "tier_source": {
+      "doc_section": "mapping",
+      "multi": false,
+      "values": [
+        "状态字段",
+        "备注字段"
+      ]
+    },
+    "category": {
+      "doc_section": "§9",
+      "multi": false,
+      "values": [
+        "处方药",
+        "OTC药",
+        "保健品",
+        "医疗器械",
+        "美妆",
+        "个护",
+        "酒类",
+        "食品饮料",
+        "母婴",
+        "3C数码",
+        "家居家电",
+        "服饰鞋包",
+        "教育",
+        "其他"
+      ]
+    }
+  },
+  "derivations": {
+    "lever_to_valence": {
+      "焦虑撬动": "negative",
+      "羞耻撬动": "negative",
+      "恐惧撬动": "negative",
+      "愤怒撬动": "negative",
+      "罪恶感撬动": "negative",
+      "造梦投射": "positive",
+      "认同感建立": "positive",
+      "归属感建立": "positive",
+      "共鸣释放": "positive",
+      "虚荣撬动": "positive",
+      "好奇驱动": "neutral",
+      "信息差利用": "neutral"
+    }
+  },
+  "boundary_rules": {
+    "$comment": "docs/05 §3 的三组易混判据。只给标签名模型会混, 抽到对应值时要连这段一起给。",
+    "rules": {
+      "焦虑撬动": "焦虑 = 偏「担心」: 对未来不确定性, 模糊、长程、未发生。如果你写的是具体已发生的威胁(具体诊断/具体某人说的话), 那是恐惧不是焦虑。标志词: 万一、以后、再不…就",
+      "恐惧撬动": "恐惧 = 偏「怕」: 对具体威胁的反应, 具体、即时、有对象。必须有一个具体已发生的事件或可指的对象(医生的诊断、某人当面说的话)。写成模糊的未来担心就变成焦虑了。标志词: 刚才、医生说、她当面说",
+      "虚荣撬动": "虚荣 = 让读者【现在就感到】自己优于某个对照群体(superiority, 现在时)。如果你写的是「成为你想成为的样子」那是造梦投射不是虚荣。",
+      "造梦投射": "造梦 = 给读者描绘【他想成为的样子】(aspiration, 未来时)。如果你写的是「懂的人才知道, 别买错」那是虚荣撬动不是造梦。",
+      "罪恶感撬动": "罪恶感 = 感到【现在做得不够】(对不起谁)。如果你写的是「将来会后悔」那是焦虑撬动不是罪恶感。"
+    }
+  }
+}

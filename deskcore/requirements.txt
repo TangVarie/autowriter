@@ -1,0 +1,6 @@
+# deskcore 相对 autowriter 主 requirements 的【增量】依赖。
+# 部署时两份都装: pip install -r requirements.lock -r deskcore/requirements.txt
+# 上限锁到下一个 major(与 R-017 同理念: 防 fresh install 拉到 breaking major)。
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+mcp>=1.2,<2.0

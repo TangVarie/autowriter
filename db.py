@@ -673,6 +673,123 @@ END;
 $$;
 REVOKE ALL ON FUNCTION claim_one_job(TEXT, TEXT[]) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION claim_one_job(TEXT, TEXT[]) TO service_role;
+
+-- ══════════════════════════════════════════════════════════════════════
+-- deskcore(写作台内核 MCP 服务)的四张表 —— TV D-041 / R-034
+--
+-- Streamlit 界面停用后, 写作能力经 deskcore 挂到 WorkBuddy / Claude Code /
+-- CodeBuddy。这四张表是外置后【新增】的能力, 现有 8 张表一行不动。
+-- 增量迁移见 migrations/001_deskcore.sql(给已存在的库)。
+-- ══════════════════════════════════════════════════════════════════════
+
+-- 发牌台账: 记录每个项目抽过哪些创作坐标组合, 供跨批次避重。
+-- 根因: generator._assign_slot_coordinates(:1301) 只在单批内去重, 且已被移除
+-- 成死代码(:1576-1584)。跨批次没有任何"用过没有"的持久记录 —— 模型是无状态的,
+-- 光靠提示词让它"注意不要重复"做不到。
+CREATE TABLE IF NOT EXISTS angle_ledger (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id          UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    angle_key           TEXT NOT NULL,
+    dims                JSONB NOT NULL DEFAULT '{}'::jsonb,
+    drawn_by            UUID,
+    drawn_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- NULL = 抽了但没写成稿(占位, 按时间自然过期);
+    -- 非 NULL = 真产出了稿子, 是"用掉了"的强证据。两者避重时效不同。
+    consumed_version_id UUID,
+    consumed_at         TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS angle_ledger_project_key_idx
+    ON angle_ledger (project_id, angle_key);
+CREATE INDEX IF NOT EXISTS angle_ledger_project_drawn_idx
+    ON angle_ledger (project_id, drawn_at DESC);
+ALTER TABLE angle_ledger ENABLE ROW LEVEL SECURITY;
+
+-- 成稿指纹库: 持久 / 全量 / 跨人 / 跨批次的查重底座。
+-- 根因: app.py:1024 的 queue_embeddings 是 worker 进程内的内存字典, 进程一重启
+-- 就空了(jobs 表那条迁移的存在本身就说明进程重启很频繁); 而且只比标题。
+CREATE TABLE IF NOT EXISTS draft_fingerprints (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    version_id      UUID,
+    user_id         UUID,
+    title           TEXT NOT NULL DEFAULT '',
+    opening         TEXT NOT NULL DEFAULT '',
+    -- 与 versions.embedding 同一个模型(Gemini text-embedding-004), 可互比
+    title_embedding vector(768),
+    -- 正文首个非空行前 25 字规范化后的 sha256 前 16 位。标题换了也能抓
+    opening_hash    TEXT,
+    -- 正文四字串 shingle 的 hash 采样, 抓"换了词还是同一篇"的换皮改写
+    ngram_hashes    TEXT[] NOT NULL DEFAULT '{}',
+    angle_key       TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS draft_fp_project_created_idx
+    ON draft_fingerprints (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS draft_fp_opening_hash_idx
+    ON draft_fingerprints (project_id, opening_hash) WHERE opening_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS draft_fp_ngram_gin_idx
+    ON draft_fingerprints USING GIN (ngram_hashes);
+CREATE INDEX IF NOT EXISTS draft_fp_embedding_idx
+    ON draft_fingerprints USING ivfflat (title_embedding vector_cosine_ops)
+    WITH (lists = 100);
+ALTER TABLE draft_fingerprints ENABLE ROW LEVEL SECURITY;
+
+-- 个人调校笔记(私有层)。projects.calibration_notes 保留为【项目级共享基线】,
+-- 本表是【个人叠加层】—— 隔离口径: 项目规则团队共享 + 个人风格私有。
+CREATE TABLE IF NOT EXISTS user_calibration_notes (
+    project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    user_id     UUID NOT NULL,
+    notes       TEXT NOT NULL DEFAULT '',
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (project_id, user_id)
+);
+ALTER TABLE user_calibration_notes ENABLE ROW LEVEL SECURITY;
+
+-- 手动精修 diff 的原始存放处(私有层)。
+-- 为什么存原始 diff 而不只存蒸馏后的笔记: memory.generate_calibration_notes(:1154)
+-- 的【信号 A · 手动精修差异】是最高权重信号。只留蒸馏结果的话, 换了蒸馏 prompt
+-- 或想重算就没有料了 —— 笔记是导出物, diff 才是事实。
+-- 只收【人真的动手改了】的对子; 未改就通过的稿子不算教学材料(memory.py:1191-1194
+-- 明确拒绝从那里学, 否则模型会从偶然选择里编造风格规则)。
+CREATE TABLE IF NOT EXISTS style_edits (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id  UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    user_id     UUID NOT NULL,
+    ai_title    TEXT NOT NULL DEFAULT '',
+    ai_body     TEXT NOT NULL DEFAULT '',
+    my_title    TEXT NOT NULL DEFAULT '',
+    my_body     TEXT NOT NULL DEFAULT '',
+    note        TEXT,
+    distilled   BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS style_edits_owner_idx
+    ON style_edits (project_id, user_id, created_at DESC);
+ALTER TABLE style_edits ENABLE ROW LEVEL SECURITY;
+
+-- items.updated_at: 人工决策(status / example_label)的最后变更时间。
+-- 补 TV scripts/sync_autowriter_decisions_to_prepublish.py:36-40 记的缺陷 ——
+-- 没这列只能按 created_at 过滤, 迟到的人工决策会漏收。
+ALTER TABLE items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS items_updated_at_idx ON items (updated_at DESC);
+
+CREATE OR REPLACE FUNCTION _deskcore_touch_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = '' AS $$
+BEGIN
+    NEW.updated_at := NOW();
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS deskcore_user_calib_updated_at ON user_calibration_notes;
+CREATE TRIGGER deskcore_user_calib_updated_at
+    BEFORE UPDATE ON user_calibration_notes
+    FOR EACH ROW EXECUTE FUNCTION _deskcore_touch_updated_at();
+
+DROP TRIGGER IF EXISTS deskcore_items_updated_at ON items;
+CREATE TRIGGER deskcore_items_updated_at
+    BEFORE UPDATE ON items
+    FOR EACH ROW EXECUTE FUNCTION _deskcore_touch_updated_at();
 """
 
 

@@ -21,7 +21,20 @@ jobs:
       - name: install pinned deps (lockfile)
         run: pip install -r requirements.lock
       - name: py_compile 所有模块 (抓语法错误, 不需要运行)
-        run: python -m compileall -q app.py *.py
+        run: python -m compileall -q app.py *.py deskcore/
+
+      - name: deskcore selftest (查重硬闸 + 发牌 + vendor 词表完整性)
+        run: |
+          # 刻意放在装依赖【之后】但不依赖它们 —— selftest 只用标准库。
+          # 查重与发牌是 deskcore 的两条命脉, 它们的回归必须在最便宜的环境
+          # 里就能跑, 不能被 supabase/anthropic/mcp SDK 的安装问题挡住。
+          #
+          # 验四件事:
+          #   1. vendor/controlled_vocab_v0_2.json 没被手改(sha256)
+          #   2. 开头精确撞车能拦 —— 标题完全不同也抓得到, 这是原来抓不到的
+          #   3. 换皮改写能拦 —— 换标题 + 换措辞, 靠正文四字串重合抓出来
+          #   4. 真正不同的稿子不误伤
+          python -m deskcore.cli selftest
       - name: 真实 import 图 (抓依赖 API 漂移; 不 import app.py — 它会跑 streamlit 脚本)
         run: |
           python - <<'PY'
@@ -29,6 +42,10 @@ jobs:
           import dedup, db, generator, memory, image_handler, exporter, projects
           import librarian_client  # R-032: TV 飞轮馆员 pull 客户端(import 安全, 用 requests)
           import worker  # R-018: 后台 worker 入口(import 安全, main() 在 __main__ 守卫内)
+          # deskcore: 逻辑层要能 import(它复用 db/memory/dedup/clients/librarian_client)。
+          # app.py 不 import —— 那个要 fastapi + mcp SDK, 属 deskcore/requirements.txt
+          # 的增量依赖, 主 lockfile 里没有。
+          from deskcore import core as deskcore_core, store as deskcore_store
           print("import graph OK")
           PY
       - name: supabase schema-aware client 契约 (TV 通道 2 sync 依赖)

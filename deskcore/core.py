@@ -1,0 +1,621 @@
+"""deskcore/core.py — 写作台内核的纯逻辑层。
+
+不 import FastAPI / MCP SDK —— cli.py 能直接调、能 selftest, 与 app.py 共用同一
+份逻辑(librarian 那边 core/CLI/HTTP 三个 adapter 是同一个形状)。
+
+【复用】本仓已有的东西, 不重写:
+    memory.build_layered_system_prompt   五层 + hard/soft 分级
+    db.get_service_client / get_project / set_item_example_label / upsert_memory
+    dedup.embed_texts / cosine_similarity / embeddings_available
+    clients.get_anthropic_client / with_anthropic_retry
+    librarian_client.build_brief / fetch_flywheel_lessons
+    db._parse_pgvector                   (R-034: PostgREST 把 pgvector 序列化成
+                                          字符串, 不归一的话 cosine 静默返回 0.0)
+
+【新增】的只有四样(其余全是薄封装):
+    1. 发牌 draw_angles + 跨批次台账
+    2. 查重硬闸 check_drafts + 持久全量指纹库
+    3. 正例按【相关性】选取, 取代 recency top-5(断掉趋同回路)
+    4. 个人调校笔记分层(项目共享基线 + 个人叠加)与从精修 diff 蒸馏
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import random
+
+import config
+import db
+import dedup
+import librarian_client
+import memory
+
+from . import fingerprint as fp
+from . import store, vocab
+
+logger = logging.getLogger("deskcore.core")
+
+MAX_POSITIVE = 5
+MAX_NEGATIVE = 3
+
+# 判定阈值与 angle_key 住在 fingerprint.py —— 那个模块只用标准库, 让 selftest
+# 能在不装 supabase/anthropic 的裸环境里跑(本模块顶层 import db, 拖整条依赖链)。
+angle_key = fp.angle_key
+verdict = fp.verdict
+
+
+def sb():
+    return store.client()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 写作简报
+# ══════════════════════════════════════════════════════════════════════
+
+def _brief_text(brief: dict) -> str:
+    parts = [brief.get(k) or "" for k in
+             ("tactic", "draft_topic", "key_messages", "target_audience",
+              "tone", "extra_instructions")]
+    return "\n".join(p for p in parts if p).strip()
+
+
+def select_positive_examples(candidates: list[dict], brief: dict,
+                             limit: int = MAX_POSITIVE) -> tuple[list[dict], str]:
+    """按相关性 + 多样性挑正例, 取代 db.list_example_items 的 created_at DESC 取 5。
+
+    为什么改: recency top-5 构成【趋同回路】—— 模型模仿最近 5 条 → 新稿被标
+    positive → 窗口滚动 → 语感越收越窄。而监控这件事的 TV
+    check_positive_saturation.py 只统计 external_source='truth_vault' 的行,
+    那列生产库里全 NULL, 所以它从上线起永远打印"没有正例" —— 这个回路
+    从来没被任何人看见过(TV D-041 / R-034 已修那个盲点)。
+
+    embedding 不可用时退化成 recency(与原行为一致, 不会更差)。
+    返回 (picked, mode)。
+    """
+    if not candidates:
+        return [], "empty"
+
+    ranked, mode = candidates, "recency_fallback"
+    text = _brief_text(brief)
+    if text and dedup.embeddings_available():
+        vecs = dedup.embed_texts([text])
+        if vecs:
+            bvec = vecs[0]
+            scored = []
+            for c in candidates:
+                emb = c.get("embedding")
+                # 没算过向量的排后面但【不丢弃】—— 否则新项目(向量还没回填)
+                # 会一条正例都取不到。
+                scored.append((dedup.cosine_similarity(bvec, emb) if emb else -1.0, c))
+            scored.sort(key=lambda t: t[0], reverse=True)
+            ranked, mode = [c for _s, c in scored], "relevance"
+
+    # 多样性: 按开头形态分桶, 第一趟每桶只收一条, 再补满。
+    # 思路来自 TV sync_truth_vault_baokuan_to_autowriter_items.py:211-269 的两趟
+    # 贪心, 但那边 min_levers 只是 advisory 不拒绝, 这里是真约束。
+    seen: set[str] = set()
+    first, rest = [], []
+    for c in ranked:
+        shape = fp.sha16(fp.normalize(fp.opening_of(c.get("body", ""), 12)))
+        (rest if shape in seen else first).append(c)
+        seen.add(shape)
+    picked = first[:limit]
+    if len(picked) < limit:
+        picked += rest[: limit - len(picked)]
+    return picked, mode
+
+
+def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
+                        brief: dict | None = None) -> dict:
+    """一次拿全写作上下文 —— 治「一个项目 5 个提示词要点 5 次」。
+
+    分层【直接复用 memory.build_layered_system_prompt】, 只在调用前把
+    calibration_notes 拼成「项目共享基线 + 我的个人叠加」两段 —— 这是 deskcore
+    唯一改动的语义(隔离口径: 项目规则团队共享 + 个人风格私有)。
+    """
+    brief = brief or {}
+    project = db.get_project(client, project_id)
+    if project is None:
+        raise ValueError(f"project not found: {project_id}")
+
+    hard, soft = store.shared_memories(client, project_id)
+    pool = store.labeled_examples(client, project_id, "positive", user_id)
+    positives, pos_mode = select_positive_examples(pool, brief)
+    negatives = store.labeled_examples(client, project_id, "negative", user_id)[:MAX_NEGATIVE]
+
+    shared_calib = (project.get("calibration_notes") or "").strip()
+    my_calib, _ = store.get_user_calibration(client, project_id, user_id) if user_id else ("", None)
+    calib_parts = []
+    if shared_calib:
+        calib_parts.append(f"[项目共享基线]\n{shared_calib}")
+    if my_calib:
+        calib_parts.append("[我的个人风格 —— 从我手动改稿里提炼; 与项目基线冲突时以本节为准]\n"
+                           + my_calib)
+    calibration = "\n\n".join(calib_parts)
+
+    layers = memory.build_layered_system_prompt(
+        base_prompt=project.get("system_prompt") or "",
+        global_memories=[m for m in soft + hard if m.get("scope") == "global"],
+        project_memories=[m for m in soft + hard if m.get("scope") != "global"],
+        calibration_notes=calibration,
+        positive_examples=positives,
+        negative_examples=negatives,
+    )
+
+    return {
+        "project_id": project_id,
+        "project_name": project.get("name") or "",
+        "brand": project.get("brand") or "",
+        "stable": layers.get("stable", ""),
+        "p0": layers.get("p0", ""),
+        "p1": layers.get("p1", ""),
+        "tactics": project.get("tactics") or [],
+        "counts": {
+            "hard_rules": len(hard),
+            "soft_rules": len(soft),
+            "positive_examples": len(positives),
+            "positive_pool": len(pool),
+            "negative_examples": len(negatives),
+            "has_shared_calibration": bool(shared_calib),
+            "has_personal_calibration": bool(my_calib),
+        },
+        "positive_selection_mode": pos_mode,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 发牌
+# ══════════════════════════════════════════════════════════════════════
+
+
+def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
+                user_id: str | None = None, seed: int | None = None,
+                perpetual_bias: bool = False) -> dict:
+    """发 n 张互不重复、且避开台账的创作坐标, 写入台账。
+
+    这是 generator._assign_slot_coordinates(:1301) 的复活版。当年移除
+    (generator.py:1576-1584)的理由是通用角度池跟项目自己的 role 设定打架 ——
+    LLM 会锁定更具体的平台标签、把项目的 role 降级成"风格提示"。修法照注释里
+    留的那条路: **切入角度优先用项目自己的 custom_roles**, 没配才用通用池。
+    """
+    if n <= 0:
+        return {"angles": [], "requested": 0, "delivered": 0}
+    project = db.get_project(client, project_id)
+    if project is None:
+        raise ValueError(f"project not found: {project_id}")
+
+    custom = project.get("custom_roles") or []
+    if isinstance(custom, str):
+        import json
+        try:
+            custom = json.loads(custom)
+        except (ValueError, TypeError):
+            custom = []
+    angles_pool = ([{"id": r.get("id", ""), "name": r.get("name", ""),
+                     "brief": (r.get("prompt_suffix") or "").strip()}
+                    for r in custom] if custom else vocab.default_angles())
+    pool_source = "project.custom_roles" if custom else "generator.CREATIVE_ROLES_POOL"
+
+    rng = random.Random(seed) if seed is not None else random.Random()
+    avoid = store.recent_angle_keys(client, project_id, avoid_days)
+
+    space = [(lev, arc, fmt, st)
+             for lev in vocab.EMOTIONAL_LEVERS
+             for arc in vocab.HUMAN_TRUTH_ARCHETYPES
+             for fmt in vocab.CONTENT_FORMATS
+             for st in vocab.TITLE_STRUCTURES]
+    rng.shuffle(space)
+
+    tilt = rng.choice(vocab.WORD_TILTS)  # 词感是"今天的心情", 全批一致
+    picked: list[dict] = []
+    used: set[str] = set()
+
+    for lev, arc, fmt, st in space:
+        if len(picked) >= n:
+            break
+        dims = {"emotional_lever": lev, "human_truth_archetype": arc,
+                "content_format": fmt, "title_structure": st}
+        key = angle_key(dims)
+        if key in avoid or key in used:
+            continue
+        used.add(key)
+        angle = angles_pool[len(picked) % len(angles_pool)]
+        trends = ([vocab.TREND_EXCLUSIVE] if perpetual_bias
+                  else vocab.normalize_trends([rng.choice(vocab.TREND_DEPENDENCIES)]))
+        picked.append({
+            "slot": len(picked) + 1,
+            "angle_key": key,
+            "dims": dims,
+            "emotional_valence": vocab.valence_of(lev),
+            "emotional_intensity": rng.choice(vocab.EMOTIONAL_INTENSITIES),
+            "trend_dependencies": trends,
+            "word_tilt": tilt,
+            "angle_name": angle.get("name") or angle.get("id") or "",
+            "angle_brief": angle.get("brief") or "",
+            "boundary_rule": vocab.boundary_rules_for(lev),
+        })
+
+    if len(picked) < n:
+        logger.warning("angle space exhausted (project=%s): asked %d got %d, "
+                       "avoid set=%d", project_id, n, len(picked), len(avoid))
+
+    store.record_draw(client, project_id, picked, user_id)
+    return {
+        "angles": picked,
+        "requested": n,
+        "delivered": len(picked),
+        "prompt_block": render_angles_block(picked),
+        "angle_pool_source": pool_source,
+        "combination_space": vocab.combination_space(),
+        "note": ("发到的组合少于请求数, 说明近期用掉太多; 可以调小 avoid_days 或分批写。"
+                 if len(picked) < n else ""),
+    }
+
+
+def render_angles_block(angles: list[dict]) -> str:
+    """渲染成可直接贴进 prompt 的硬约束块。
+
+    照 generator._build_slot_coordinates_block(:1350) 的形状, 但多带 essence
+    维度和边界判据 —— 光给标签名模型会混(docs/05 §3 花 40 行讲焦虑 vs 恐惧
+    怎么分是有原因的)。
+    """
+    if not angles:
+        return ""
+    lines = ["【本批次每篇的创作坐标（必须按编号对应，不得互换）】"]
+    for a in angles:
+        d = a["dims"]
+        lines.append(
+            f"第{a['slot']}篇：情绪杠杆={d['emotional_lever']}"
+            f"({a['emotional_valence']}/{a['emotional_intensity']})"
+            f" · 人性原型={d['human_truth_archetype']}"
+            f" · 内容形式={d['content_format']}"
+            f" · 标题句式={d['title_structure']}"
+            f" · 切入角度={a['angle_name']}")
+        if a.get("boundary_rule"):
+            lines.append(f"    ↳ 判据：{a['boundary_rule']}")
+        if a.get("angle_brief"):
+            lines.append(f"    ↳ 角度：{a['angle_brief']}")
+    lines.append(f"\n全批词感倾向：{angles[0].get('word_tilt', '')}")
+    lines.append("以上坐标为硬约束。写完后每一篇要能说出自己用的是哪一组，说不出就是没按坐标写。")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 查重硬闸
+# ══════════════════════════════════════════════════════════════════════
+
+
+def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
+    """比对全量历史 + 本批内互比。
+
+    ⚠️ deskcore 唯一【不 fail-open】的路径。其它读类工具出错返回可用结构不阻塞
+    写稿, 但查重挂了必须抛 —— 静默放行就是重演 config.py:132 那个
+    ENABLE_DEDUP_REGEN 默认 "0"、查重跑了但不拦的老问题。
+    """
+    if not drafts:
+        return {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
+
+    history = store.fingerprints(client, project_id)   # 故意让异常冒泡
+
+    titles = [(d.get("title") or "").strip() for d in drafts]
+    bodies = [d.get("body") or "" for d in drafts]
+    o_hashes = [fp.opening_hash(b) for b in bodies]
+    grams = [set(fp.ngram_hashes(b)) for b in bodies]
+
+    new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
+    degraded = new_vecs is None
+    if degraded:
+        logger.warning("semantic dedup degraded to deterministic-only (project=%s)",
+                       project_id)
+
+    hist_grams = [set(h.get("ngram_hashes") or []) for h in history]
+    hist_open = {h.get("opening_hash"): h for h in history if h.get("opening_hash")}
+
+    results = []
+    for i in range(len(drafts)):
+        best_sim, sim_hit = 0.0, None
+        if new_vecs and i < len(new_vecs):
+            for h in history:
+                emb = h.get("title_embedding")
+                if not emb:
+                    continue
+                s = dedup.cosine_similarity(new_vecs[i], emb)
+                if s > best_sim:
+                    best_sim, sim_hit = s, h
+
+        best_j, j_hit = 0.0, None
+        for hi, hg in enumerate(hist_grams):
+            j = fp.jaccard(grams[i], hg)
+            if j > best_j:
+                best_j, j_hit = j, history[hi]
+
+        exact = o_hashes[i] in hist_open
+        open_hit = hist_open.get(o_hashes[i])
+        intra = None
+
+        for k in range(i):   # 本批内互比: 同批两篇撞车同样要拦
+            if o_hashes[i] == o_hashes[k]:
+                exact, intra = True, titles[k]
+                break
+            jj = fp.jaccard(grams[i], grams[k])
+            if jj > best_j:
+                best_j, j_hit, intra = jj, None, titles[k]
+            if new_vecs:
+                s = dedup.cosine_similarity(new_vecs[i], new_vecs[k])
+                if s > best_sim:
+                    best_sim, sim_hit, intra = s, None, titles[k]
+
+        status, reason = verdict(best_sim, exact, best_j)
+        collided = (intra or (open_hit or {}).get("title")
+                    or (sim_hit or {}).get("title") or (j_hit or {}).get("title") or "")
+        results.append({
+            "index": i, "title": titles[i], "status": status, "reason": reason,
+            "collided_with": collided,
+            "collided_scope": "本批内" if intra else ("历史" if collided else ""),
+            "signals": {"title_similarity": round(best_sim, 4),
+                        "opening_exact_match": exact,
+                        "body_ngram_jaccard": round(best_j, 4)},
+        })
+
+    summary = {
+        "total": len(results),
+        "pass": sum(1 for r in results if r["status"] == "pass"),
+        "warn": sum(1 for r in results if r["status"] == "warn"),
+        "reject": sum(1 for r in results if r["status"] == "reject"),
+        "history_size": len(history),
+        "semantic_degraded": degraded,
+    }
+    if degraded:
+        summary["degraded_note"] = (
+            "GOOGLE_API_KEY 未配或 embedding 调用失败, 本次只跑了确定性查重"
+            "(开头精确 + 四字串重合)。同角度换说法的标题可能漏过 —— 要告诉用户。")
+    return {"results": results, "summary": summary}
+
+
+def _placeholder_version_id(seed: str) -> str:
+    """没有真实 version_id 时(稿子在 WorkBuddy 里写, 不落 autowriter.versions)
+    造一个确定性 UUID, 只为把 consumed_version_id 置成非 NULL 表示"用掉了"。"""
+    h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+def commit_drafts(client, project_id: str, drafts: list[dict],
+                  *, user_id: str | None = None) -> dict:
+    """定稿入库: 写指纹 + 给坐标销账。
+
+    只收真正定稿的 —— 指纹库脏了(把废稿也记进去)会让后续正常选题被误杀。
+    """
+    if not drafts:
+        return {"written": 0, "consumed_angles": 0}
+
+    titles = [(d.get("title") or "").strip() for d in drafts]
+    vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
+
+    rows = []
+    for i, d in enumerate(drafts):
+        body = d.get("body") or ""
+        rows.append({
+            "project_id": project_id,
+            "version_id": d.get("version_id"),
+            "user_id": user_id,
+            "title": titles[i],
+            "opening": fp.opening_of(body),
+            "title_embedding": vecs[i] if vecs and i < len(vecs) else None,
+            "opening_hash": fp.opening_hash(body),
+            "ngram_hashes": fp.ngram_hashes(body),
+            "angle_key": d.get("angle_key"),
+        })
+    written = store.write_fingerprints(client, rows)
+
+    consumed = 0
+    for d in drafts:
+        key = d.get("angle_key")
+        if not key:
+            continue
+        vid = d.get("version_id") or _placeholder_version_id(key)
+        if store.consume_angle(client, project_id, key, vid):
+            consumed += 1
+    return {"written": written, "consumed_angles": consumed,
+            "embedded": bool(vecs)}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 反馈学习
+# ══════════════════════════════════════════════════════════════════════
+
+def record_rule(client, project_id: str, content: str, *, severity: str = "soft",
+                scope: str = "project", user_id: str | None = None) -> dict:
+    """沉淀一条规则(团队共享)。severity='hard' 的下次进 P0。
+
+    复用 db.upsert_memory —— 它带并发安全(keyed lock + CAS 重试)和
+    rule_kind/rule_payload 的向后兼容 strip, 别绕过它自己 insert。
+    force_confirmed=True: 这条路径是用户明确说「以后都这样」才走的, 不需要
+    频次阈值(那是给自动抽取的候选留人工复核用的)。
+    """
+    content = (content or "").strip()
+    if not content:
+        raise ValueError("rule content must not be empty")
+    severity = (severity or "soft").lower()
+    if severity not in ("hard", "soft"):
+        raise ValueError("severity must be 'hard' or 'soft'")
+    if scope not in ("project", "global"):
+        raise ValueError("scope must be 'project' or 'global'")
+
+    row = db.upsert_memory(
+        client, user_id=user_id, scope=scope, content=content,
+        source_feedback="deskcore",
+        project_id=project_id if scope == "project" else None,
+        force_confirmed=True, severity=severity,
+    )
+    return {"memory_id": (row or {}).get("id"), "severity": severity,
+            "scope": scope, "content": content}
+
+
+_CALIB_SYSTEM = """\
+你在维护一份「个人写作调校笔记」。输入是同一个人对 AI 初稿做的手动精修 —— \
+左边是 AI 写的，右边是这个人改成的样子。
+
+你的任务：从这些改动里提炼出【这个人的语感偏好】，写成可执行的短句。
+
+铁律：
+1. 只写从改动里【看得出来】的偏好。看不出来就不写，宁可少写。
+2. 不要复述具体内容（"把郁可唯改成了别的明星"没有价值）；要写模式\
+（"倾向去掉明星名，用泛指的场景代替"）。
+3. 每条一行，以动词开头，可以直接当写作指令用。
+4. 合并同类项。新观察和已有笔记说的是一件事，就改写已有那条让它更准，\
+不要并列两条。
+5. 与已有笔记冲突时以新观察为准（人的偏好会变）。
+6. 总长度控制在 20 行以内。超了就合并最弱的几条。
+
+只输出笔记正文，不要解释，不要 markdown 标题。"""
+
+
+def record_edit(client, project_id: str, *, user_id: str,
+                ai_title: str = "", ai_body: str = "",
+                my_title: str = "", my_body: str = "",
+                note: str | None = None, distill: bool = True) -> dict:
+    """喂一条手动精修 diff —— 【信号 A, 最高权重】, "裂变"的入口。
+
+    口径照 memory.generate_calibration_notes(:1154-1210): 只收人真的动手改了的
+    对子。没改就通过的稿子【不算教学材料】—— memory.py:1191-1194 明确拒绝从
+    那里学, 理由是模型会从偶然选择里编造风格规则。
+    """
+    if not (my_title or my_body):
+        raise ValueError("my_title/my_body must not both be empty")
+    if ((ai_title or "").strip() == (my_title or "").strip()
+            and (ai_body or "").strip() == (my_body or "").strip()):
+        return {"stored": False,
+                "reason": "AI 版与手改版完全一致, 不是有效信号, 未入库"}
+
+    store.add_style_edit(client, project_id, user_id,
+                         ai_title=ai_title or "", ai_body=ai_body or "",
+                         my_title=my_title or "", my_body=my_body or "", note=note)
+    if not distill:
+        return {"stored": True, "distilled": False}
+    try:
+        return {"stored": True, "distilled": True,
+                "notes": distill_calibration(client, project_id, user_id=user_id)}
+    except Exception:
+        # 存下来了就没白费; 蒸馏失败下次 record_edit 会连这条一起重算。
+        logger.exception("calibration distillation failed (edit is stored)")
+        return {"stored": True, "distilled": False,
+                "warning": "diff 已入库, 但本次笔记蒸馏失败; 下次 record_edit 会一并重算"}
+
+
+def distill_calibration(client, project_id: str, *, user_id: str,
+                        max_edits: int = 8) -> str:
+    """把最近的精修 diff 蒸馏成个人调校笔记。
+
+    复用 clients 的 Anthropic 客户端与重试(R-026: 辅助 LLM 调用一律包重试,
+    别让瞬时 429/5xx 白白丢一次)。
+    """
+    import clients
+
+    edits = store.recent_style_edits(client, project_id, user_id, max_edits)
+    if not edits:
+        return ""
+    existing, _ = store.get_user_calibration(client, project_id, user_id)
+
+    blocks = []
+    for e in edits:
+        b = ("AI 原版：\n"
+             f"  标题：{e.get('ai_title','')}\n"
+             f"  正文：{(e.get('ai_body') or '')[:400]}\n"
+             "手改版：\n"
+             f"  标题：{e.get('my_title','')}\n"
+             f"  正文：{(e.get('my_body') or '')[:400]}")
+        if e.get("note"):
+            b += f"\n  本人备注：{e['note']}"
+        blocks.append(b)
+
+    prompt = ((f"【已有笔记】\n{existing}\n\n" if existing else "【已有笔记】（空，这是第一次）\n\n")
+              + "【本次要吸收的手动精修】\n" + "\n\n---\n".join(blocks)
+              + "\n\n请输出更新后的完整笔记。")
+
+    model = getattr(config, "DESKCORE_MODEL", "") or config.CLAUDE_MODEL
+    ac = clients.get_anthropic_client()
+    resp = clients.with_anthropic_retry(lambda: ac.messages.create(
+        model=model, max_tokens=1500, system=_CALIB_SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+    ))
+    notes = "".join(getattr(b, "text", "") for b in resp.content
+                    if getattr(b, "type", "") == "text").strip()
+    if not notes:
+        raise RuntimeError("distillation returned empty notes")
+
+    store.save_user_calibration(client, project_id, user_id, notes)
+    store.mark_edits_distilled(client, project_id, user_id)
+    return notes
+
+
+def label_example(client, item_id: str, label: str | None) -> dict:
+    """标正/负例。复用 db.set_item_example_label —— 它顺带清三处缓存。
+
+    ⚠️ 负例【只取人工标注】。TV D-040 讲得很清楚: 「赢」需要真的好, 「输」有
+    太多无辜理由(撞流量墙 / 账号限流 / 时机), 从数据反推负例会把被埋没的
+    好内容也标成垃圾, 污染负面特征库。
+    """
+    if label not in ("positive", "negative", None):
+        raise ValueError("label must be 'positive', 'negative' or None")
+    db.set_item_example_label(client, item_id, label)
+    return {"item_id": item_id, "example_label": label}
+
+
+def my_style(client, project_id: str, *, user_id: str) -> dict:
+    """我在这个项目上的风格资产。"""
+    project = db.get_project(client, project_id)
+    shared = (project or {}).get("calibration_notes") or ""
+    mine, updated = store.get_user_calibration(client, project_id, user_id)
+    return {
+        "project_id": project_id,
+        "shared_calibration": shared.strip(),
+        "my_calibration": mine,
+        "my_calibration_updated_at": updated,
+        "edits_fed": store.count_style_edits(client, project_id, user_id),
+        "my_positive_examples": len(store.labeled_examples(client, project_id, "positive", user_id)),
+        "my_negative_examples": len(store.labeled_examples(client, project_id, "negative", user_id)),
+    }
+
+
+def set_my_style(client, project_id: str, *, user_id: str, notes: str) -> dict:
+    """手动改写个人调校笔记(蒸馏结果不满意时直接改)。"""
+    store.save_user_calibration(client, project_id, user_id, notes)
+    return {"project_id": project_id, "notes": notes.strip()}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 飞轮经验卡(转调 TV 馆员)
+# ══════════════════════════════════════════════════════════════════════
+
+def borrow_lessons(client, project_id: str, **delta) -> dict:
+    """复用 librarian_client 的 build_brief + fetch_flywheel_lessons(R-032)。
+
+    那边已经处理好 fail-open(超时/非 200/未配 → [], 绝不阻塞写稿)和 brief 的
+    字段集对齐(docs/15 §0 契约)。这里只做项目查询 + 转发。
+    """
+    project = db.get_project(client, project_id)
+    if project is None:
+        raise ValueError(f"project not found: {project_id}")
+    brief = librarian_client.build_brief(project, **delta)
+    brief["consumer"] = "deskcore"
+    selected = librarian_client.fetch_flywheel_lessons(brief)
+    return {"lessons": selected, "count": len(selected)}
+
+
+def list_projects(client) -> list[dict]:
+    """项目清单 + 每个项目手上有多少料。"""
+    out = []
+    for p in store.list_all_projects(client):
+        pid = p["id"]
+        hard, soft = store.shared_memories(client, pid)
+        try:
+            fps = (client.table("draft_fingerprints").select("id", count="exact")
+                     .eq("project_id", pid).limit(1).execute()).count or 0
+        except Exception:
+            fps = 0
+        out.append({"project_id": pid, "name": p.get("name") or "",
+                    "brand": p.get("brand") or "", "owner_id": p.get("owner_id"),
+                    "hard_rules": len(hard), "soft_rules": len(soft),
+                    "fingerprint_count": fps})
+    return out

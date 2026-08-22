@@ -1,0 +1,249 @@
+"""deskcore/tools.py — MCP 工具面。
+
+十个工具, 按写稿的三个阶段分组。设计原则是【一次调用拿全】—— 治员工反馈里
+那条「一个项目一般有 5 个提示词要重复操作 5 次, 我的工作台至少有几十个提示词」。
+
+每个工具的 docstring 就是模型看到的说明, 所以写给模型看; 维护者要看的原因
+写在 core.py 的注释里。
+
+降级口径:
+  · 读类工具出错 → 返回带 error 的可用结构, 不抛(不阻塞写稿)
+  · check_drafts 是【唯一例外】→ 出错必须抛。静默放行就是重演
+    config.py:132 那个 ENABLE_DEDUP_REGEN 默认关着的老问题。
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from . import core, vocab
+
+logger = logging.getLogger("deskcore.tools")
+
+
+def _safe(fn, *args, **kwargs) -> Any:
+    """读类工具的统一降级包装 —— 返回可用结构 + 【必须留痕】。
+
+    留痕这条是硬要求: TV docs/19:180-200 记过一次事故, librarian 的模型 env
+    变量名配错, 每次 LLM 调用失败被 except 吞掉降级成 [], 外面看永远 200,
+    查了很久。
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — 故意兜底
+        logger.exception("%s failed", getattr(fn, "__name__", fn))
+        return {"error": f"{type(exc).__name__}: {exc}"[:300],
+                "hint": "写稿可以继续, 但这次没拿到这部分数据; 服务端日志有完整堆栈"}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 写稿前
+# ══════════════════════════════════════════════════════════════════════
+
+def list_projects() -> dict:
+    """列出所有可写作的项目, 以及每个项目手上有多少积累。
+
+    返回 project_id / 名称 / 品牌 / 已沉淀的硬规则与软偏好条数 / 历史成稿指纹数。
+    不知道要写哪个项目时先调这个。
+    """
+    return _safe(lambda: {"projects": core.list_projects(core.sb())})
+
+
+def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
+                 key_messages: str = "", target_audience: str = "",
+                 tone: str = "", extra_instructions: str = "",
+                 _user_id: str | None = None) -> dict:
+    """打开一个项目, 一次拿到写这个项目需要的【全部】上下文。
+
+    动笔前必须先调这个。返回:
+      · stable —— 项目人格/定位, 照抄进你的写作上下文
+      · p0 —— 【不可违反的硬约束】, 必须 100% 满足, 与任何偏好冲突时以它为准
+      · p1 —— 项目调性偏好 + 调校笔记 + 正反案例, 理解意图后按适用性应用
+      · tactics —— 这个项目配置好的战术方向清单
+
+    传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
+    而不是按时间倒序 —— 后者会让文风越写越窄。所以知道要写什么就传。
+
+    返回的 counts.hard_rules 是 0 而用户以前明明定过规则, 多半是 project_id
+    传错了, 问一句。
+    """
+    brief = {"tactic": tactic, "draft_topic": draft_topic,
+             "key_messages": key_messages, "target_audience": target_audience,
+             "tone": tone, "extra_instructions": extra_instructions}
+    return _safe(core.build_writing_brief, core.sb(), project_id,
+                 user_id=_user_id, brief=brief)
+
+
+def draw_angles(project_id: str, n: int, avoid_days: int = 30,
+                perpetual_bias: bool = False, _user_id: str | None = None) -> dict:
+    """发牌: 给本批 n 篇稿子各分配一组互不相同的创作坐标。
+
+    批量写稿前必须先调这个, 然后【每一篇严格按分到的那组坐标写, 不得互换】。
+
+    每组坐标含: 情绪杠杆 / 人性原型 / 内容形式 / 标题句式 / 切入角度, 外加
+    情绪强度、词感倾向, 以及易混维度的判别指令(比如抽到「焦虑撬动」会告诉你
+    它和「恐惧撬动」怎么分 —— 前者是模糊的未来担心, 后者要有具体已发生的威胁)。
+
+    这些组合会避开本项目最近 avoid_days 天已经用过的 —— 这是跨批次不重复的
+    根本保证。光靠提示词让模型「注意不要重复」做不到: 模型是无状态的, 它不知道
+    自己上个月写过什么。
+
+    perpetual_bias=True 偏向抽「不依赖任何时效元素」的组合, 写出来更能穿越周期
+    (但会少掉当下感)。默认 False。
+
+    返回里的 prompt_block 可以直接贴进生成提示词。
+    """
+    return _safe(core.draw_angles, core.sb(), project_id, n,
+                 avoid_days=avoid_days, user_id=_user_id,
+                 perpetual_bias=perpetual_bias)
+
+
+def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
+                   key_messages: str = "", target_audience: str = "",
+                   tone: str = "") -> dict:
+    """向帆谷飞轮图书馆借几张【真实爆款】的经验卡。
+
+    这些卡来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
+    结构骨架 / 为什么有效 / 可迁移手法」。写稿时可以借它的钩子或结构。
+
+    ⚠️ 严禁照抄卡里的标题主干或具体句子 —— 只借手法。
+    ⚠️ 标了 synthetic=true 的卡表示【指标未经验证】(疑似人工刷量), 只能凭内容
+       判断借鉴, 不要把它的数据当依据。
+
+    库里没有合适的卡时返回空列表, 这不是错误, 照常写就行。
+    """
+    return _safe(core.borrow_lessons, core.sb(), project_id,
+                 tactic=tactic, draft_topic=draft_topic,
+                 key_messages=key_messages, target_audience=target_audience,
+                 tone=tone)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 写稿后
+# ══════════════════════════════════════════════════════════════════════
+
+def check_drafts(project_id: str, drafts: list[dict]) -> dict:
+    """查重硬闸。成稿后【必须】调这个才能交付。
+
+    drafts 传 [{"title": "...", "body": "...", "angle_key": "..."}, ...]
+    (angle_key 是 draw_angles 给的, 有就带上)。
+
+    比对本项目【全部】历史成稿 + 本批内互比, 三个信号:
+      · 标题语义相似度
+      · 正文开头是否精确撞车(标题换了也能抓)
+      · 正文四字串重合度(抓换皮的模板化写法)
+
+    每条返回 pass / warn / reject:
+      · reject —— 必须重写。不允许「少出一条」糊弄过去。reason 里说了是哪个
+        信号命中: 撞开头就换开场视角, 撞正文就换比喻系统或叙事路径。
+        只改标题没用。重写完再跑一次。
+      · warn —— 可疑, 建议换个切入再交。
+      · pass —— 可以交付, 记得调 commit_drafts 入库。
+
+    summary.semantic_degraded 为 true 时说明 embedding 不可用, 这次只跑了确定性
+    查重, 同角度换说法的标题可能漏过 —— 【要告诉用户这件事】, 别默默交付。
+
+    这个工具出错会直接报错而不是放行 —— 查重挂了必须停下来, 不能当作通过。
+    """
+    # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。
+    return core.check_drafts(core.sb(), project_id, drafts)
+
+
+def commit_drafts(project_id: str, drafts: list[dict],
+                  _user_id: str | None = None) -> dict:
+    """把【定稿】的稿子入库, 让它们参与以后的查重, 并把用掉的坐标销账。
+
+    只传真正要发的稿子。把废稿也记进去会让以后正常的选题被误杀。
+    """
+    return _safe(core.commit_drafts, core.sb(), project_id, drafts, user_id=_user_id)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 反馈学习
+# ══════════════════════════════════════════════════════════════════════
+
+def record_rule(project_id: str, content: str, severity: str = "soft",
+                scope: str = "project", _user_id: str | None = None) -> dict:
+    """把一条规则永久记住。团队共享 —— 队友写这个项目时也会守。
+
+    什么时候调: 用户说的是「以后都这样」而不是「这次这样」。分不清就问一句。
+
+    severity:
+      · "hard" —— 不可违反的硬约束, 以后每次生成都会顶在最前面要求 100% 满足。
+        用于: 禁词、必须包含的合规话术、绝对不能提的内容。
+      · "soft" —— 调性偏好, 适用时应用、不适用可以让位。用于: 风格倾向、语气
+        偏好、结构习惯。
+      拿不准就用 soft 并问用户要不要设成硬约束 —— hard 设多了会把文案写死,
+      二十条互相打架时模型只能写出四不像。
+
+    scope: "project" 只对本项目生效; "global" 对所有项目生效(慎用)。
+    """
+    return _safe(core.record_rule, core.sb(), project_id, content,
+                 severity=severity, scope=scope, user_id=_user_id)
+
+
+def record_edit(project_id: str, ai_title: str, ai_body: str,
+                my_title: str, my_body: str, note: str = "",
+                _user_id: str | None = None) -> dict:
+    """用户手动改了稿子时调这个 —— 这是让文风变得像本人的【最强信号】。
+
+    传 AI 原版和用户改成的样子。系统会从这些改动里提炼这个人的语感偏好, 写进
+    他的个人调校笔记, 以后写这个项目自动带上。
+
+    个人笔记【只对本人生效】, 不影响队友。
+
+    note 可选, 传用户自己说的原因(比如"太夸张了")会让提炼更准。
+
+    ⚠️ 只在用户【真的动手改了】的时候调。用户没改就通过的稿子不要传进来 ——
+    从「没改」里推不出偏好, 硬推会让系统编造出根本不存在的风格规则。
+    """
+    if not _user_id:
+        return {"error": "无法识别调用者身份, 个人风格功能不可用",
+                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    return _safe(core.record_edit, core.sb(), project_id, user_id=_user_id,
+                 ai_title=ai_title, ai_body=ai_body,
+                 my_title=my_title, my_body=my_body, note=note or None)
+
+
+def label_example(item_id: str, label: str) -> dict:
+    """把某条历史稿标成正面案例或反面案例。
+
+    label 传 "positive" / "negative" / "none"(撤销)。
+
+    正例会作为学习样本注入以后的写作; 负例作为「主动规避」的反面教材。
+
+    ⚠️ 负例只标【你看了内容、判定它就是差】的稿子。不要因为某条数据不好就标
+    负例 —— 数据不好有太多与内容无关的原因(没进流量池、账号限流、时机不对),
+    那样会把被埋没的好内容也标成垃圾。
+    """
+    return _safe(core.label_example, core.sb(), item_id,
+                 None if label in ("none", "", None) else label)
+
+
+def my_style(project_id: str, _user_id: str | None = None) -> dict:
+    """看我在这个项目上积累的风格资产: 个人调校笔记、喂过多少次精修、正负例数。
+
+    也用于回答「你现在记住了我什么」这类问题。注意区分: 项目规则是团队共享的,
+    别把它说成是这个人的个人偏好。
+    """
+    if not _user_id:
+        return {"error": "无法识别调用者身份",
+                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    return _safe(core.my_style, core.sb(), project_id, user_id=_user_id)
+
+
+# 工具注册表 —— app.py 和 cli.py 共用。
+# 值 = (函数, 是否需要服务端注入调用者身份)
+TOOLS = {
+    "list_projects":  (list_projects,  False),
+    "open_project":   (open_project,   True),
+    "draw_angles":    (draw_angles,    True),
+    "borrow_lessons": (borrow_lessons, False),
+    "check_drafts":   (check_drafts,   False),
+    "commit_drafts":  (commit_drafts,  True),
+    "record_rule":    (record_rule,    True),
+    "record_edit":    (record_edit,    True),
+    "label_example":  (label_example,  False),
+    "my_style":       (my_style,       True),
+}

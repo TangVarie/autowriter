@@ -1,0 +1,14 @@
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "//": "deskcore 写作台内核的部署配置 (TV D-041 / R-034)。与 worker.py 同为 autowriter 仓的独立 service; root = repo 根, 让 deskcore 包能 import db/memory/dedup。",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements.lock -r deskcore/requirements.txt"
+  },
+  "deploy": {
+    "startCommand": "uvicorn deskcore.app:app --host 0.0.0.0 --port $PORT",
+    "healthcheckPath": "/health",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
+  }
+}
