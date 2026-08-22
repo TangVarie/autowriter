@@ -43,7 +43,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-from . import identity, tools, vocab
+from . import core, identity, tools, vocab
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deskcore")
@@ -111,7 +111,6 @@ def health() -> dict:
     失败降级成 [], 外面看永远 200, 查了很久(TV docs/19:180-200)。
     让配错当场可见。
     """
-    import config
     import db
     import dedup
 
@@ -131,7 +130,11 @@ def health() -> dict:
         "version": VERSION,
         "tools": sorted(tools.TOOLS),
         "config": {
-            "model": os.environ.get("DESKCORE_MODEL") or config.CLAUDE_MODEL,
+            # ⚠️ 必须走 core.resolve_model() —— 回显只有和【真正发起调用的地方】
+            # 同源才叫回显。这里曾经自己读一遍 env, 而 core 那边读的是
+            # config.DESKCORE_MODEL(不存在的属性), 两边永远不一致。见
+            # core.resolve_model 的说明。
+            "model": core.resolve_model(),
             "anthropic_base_url": os.environ.get("ANTHROPIC_BASE_URL") or "(official)",
             "supabase": {"ok": db_ok, "note": db_note},
             "embeddings": {

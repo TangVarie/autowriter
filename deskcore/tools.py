@@ -23,11 +23,28 @@ logger = logging.getLogger("deskcore.tools")
 
 
 def _safe(fn, *args, **kwargs) -> Any:
-    """读类工具的统一降级包装 —— 返回可用结构 + 【必须留痕】。
+    """**可降级的读**的统一包装 —— 返回可用结构 + 【必须留痕】。
 
     留痕这条是硬要求: TV docs/19:180-200 记过一次事故, librarian 的模型 env
     变量名配错, 每次 LLM 调用失败被 except 吞掉降级成 [], 外面看永远 200,
     查了很久。
+
+    ⚠️ 【什么能包、什么绝不能包】—— 加新工具前先读这段。
+    本包装会把异常变成一个**看起来成功**、只多一个 error 字段的结果, 而 hint
+    里明写着"写稿可以继续"。所以它只适用于:【读】+【拿不到也只是少点参考】。
+    目前只有三个: list_projects / borrow_lessons / my_style。
+
+    绝不能包的两类, 各有各的失败模式:
+      · **合规读**(open_project) —— 拿不到 P0 硬约束就照常开写, 产出的是违规
+        内容, 而调用方看到的是一份 p0 为空的正常简报。store.shared_memories()
+        专门为此【故意不吞异常】, 外面再包一层 _safe 等于把那个设计原样抵消掉。
+      · **写**(draw_angles / commit_drafts / record_rule / record_edit /
+        label_example) —— 写作台协议对这些没有强制重试步骤。一条用户明确说
+        「以后都这样」的 hard 合规规则写失败, 会静默缺席之后的每一份简报;
+        发牌没落台账, 同一个角度下批还能再抽出来。
+
+    判据: 失败之后【调用方还会不会当作成功继续往下走】。会 → 不能包。
+    (codex review round-5 P1 ×2: open_project 与 record_rule 都踩了这一条)
     """
     try:
         return fn(*args, **kwargs)
@@ -67,12 +84,17 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
 
     返回的 counts.hard_rules 是 0 而用户以前明明定过规则, 多半是 project_id
     传错了, 问一句。
+
+    这个工具出错会直接报错, 不会返回半份简报。报错就【停下来】, 不要凭记忆
+    或常识补一份约束继续写 —— 这个项目的硬约束是什么, 只有库里那份算数。
     """
     brief = {"tactic": tactic, "draft_topic": draft_topic,
              "key_messages": key_messages, "target_audience": target_audience,
              "tone": tone, "extra_instructions": extra_instructions}
-    return _safe(core.build_writing_brief, core.sb(), project_id,
-                 user_id=_user_id, brief=brief)
+    # 故意不包 _safe: 见 _safe 文档「合规读」。P0 拿不到必须停, 不能给一份
+    # p0 为空却看起来正常的简报。
+    return core.build_writing_brief(core.sb(), project_id,
+                                    user_id=_user_id, brief=brief)
 
 
 def draw_angles(project_id: str, n: int, avoid_days: int = 30,
@@ -94,7 +116,9 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
 
     返回里的 prompt_block 可以直接贴进生成提示词。
     """
-    return _safe(core.draw_angles, core.sb(), project_id, n,
+    # 故意不包 _safe: 发牌要写台账。写失败却报成功, 同一个角度下批还能再抽,
+    # 跨批次唯一性的承诺就破了(而且没人看得见)。
+    return core.draw_angles(core.sb(), project_id, n,
                  avoid_days=avoid_days, user_id=_user_id,
                  perpetual_bias=perpetual_bias)
 
@@ -194,8 +218,10 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
 
     scope: "project" 只对本项目生效; "global" 对所有项目生效(慎用)。
     """
-    return _safe(core.record_rule, core.sb(), project_id, content,
-                 severity=severity, scope=scope, user_id=_user_id)
+    # 故意不包 _safe: 这是【写】操作, 且写的可能是 hard 合规规则。写失败若
+    # 报成功, 这条规则会静默缺席之后的每一份简报 —— 而用户以为已经记住了。
+    return core.record_rule(core.sb(), project_id, content,
+                            severity=severity, scope=scope, user_id=_user_id)
 
 
 def record_edit(project_id: str, ai_title: str, ai_body: str,
@@ -216,9 +242,11 @@ def record_edit(project_id: str, ai_title: str, ai_body: str,
     if not _user_id:
         return {"error": "无法识别调用者身份, 个人风格功能不可用",
                 "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
-    return _safe(core.record_edit, core.sb(), project_id, user_id=_user_id,
-                 ai_title=ai_title, ai_body=ai_body,
-                 my_title=my_title, my_body=my_body, note=note or None)
+    # 故意不包 _safe: 写。这是"裂变"的唯一入口, 静默失败 = 文风永远长不出来。
+    return core.record_edit(core.sb(), project_id, user_id=_user_id,
+                            ai_title=ai_title, ai_body=ai_body,
+                            my_title=my_title, my_body=my_body,
+                            note=note or None)
 
 
 def label_example(item_id: str, label: str, _user_id: str | None = None) -> dict:
@@ -238,9 +266,10 @@ def label_example(item_id: str, label: str, _user_id: str | None = None) -> dict
     if not _user_id:
         return {"error": "无法识别调用者身份, 不能标记正负例(那是个人资产)",
                 "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
-    return _safe(core.label_example, core.sb(), item_id,
-                 None if label in ("none", "", None) else label,
-                 user_id=_user_id)
+    # 故意不包 _safe: 写。标记没落库却报成功, 用户不会再标第二次。
+    return core.label_example(core.sb(), item_id,
+                              None if label in ("none", "", None) else label,
+                              user_id=_user_id)
 
 
 def my_style(project_id: str, _user_id: str | None = None) -> dict:

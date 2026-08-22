@@ -786,10 +786,17 @@ CREATE TRIGGER deskcore_user_calib_updated_at
     BEFORE UPDATE ON user_calibration_notes
     FOR EACH ROW EXECUTE FUNCTION _deskcore_touch_updated_at();
 
+-- WHEN 条件必须和 migrations/001_deskcore.sql 保持一致(那边有完整理由):
+-- items 上还有 save_feedback_draft/save_manual_edit_draft 这类【打字即写】的
+-- 路径, 无条件触发会让 updated_at 变成"最后一次自动存草稿", 而不是这一列
+-- 定义的"人工决策最后变更时间"。
 DROP TRIGGER IF EXISTS deskcore_items_updated_at ON items;
 CREATE TRIGGER deskcore_items_updated_at
     BEFORE UPDATE ON items
-    FOR EACH ROW EXECUTE FUNCTION _deskcore_touch_updated_at();
+    FOR EACH ROW
+    WHEN (OLD.status IS DISTINCT FROM NEW.status
+       OR OLD.example_label IS DISTINCT FROM NEW.example_label)
+    EXECUTE FUNCTION _deskcore_touch_updated_at();
 
 -- ── deskcore 发牌的原子预留 ──────────────────────────────────────────
 -- 为什么需要它: draw_angles 原本是"读避重集 → Python 里挑 → 插入"三步。
@@ -1947,6 +1954,7 @@ def upsert_memory(
     auto_confirm_threshold: int = 3,
     force_confirmed: bool = False,
     severity: str = "soft",
+    update_severity: bool = False,
     applicability: Optional[str] = None,
     rule_kind: Optional[str] = None,
     rule_payload: Optional[dict] = None,
@@ -1957,6 +1965,15 @@ def upsert_memory(
     ``force_confirmed`` (used by the AI merger) creates the row already in the
     ``confirmed`` state, skipping the frequency threshold — callers that set
     this flag have already decided the rule is intentional.
+
+    ``update_severity`` (2026-08, codex review round-5 P1) —— 命中已存在的
+    规则时，是否把 ``severity`` 也写回去。默认 **False**，因为绝大多数调用方
+    是自动抽取（``memory.py`` 的 merger / 反馈链），它们传的 severity 是
+    **猜的**；打开会让一次自动抽取把用户手动设过的 hard 规则悄悄降回 soft。
+    只有【用户明确指定严重级别】的路径才该传 True —— 目前只有 deskcore 的
+    ``record_rule``（用户说"以后都这样"并选了 hard/soft）。不传的话，把一条
+    已存在的 soft 规则改成 hard 会**返回成功但库里还是 soft**，于是它继续待在
+    P1 而不是 P0，用户以为设成硬约束了、其实没有。
 
     Day 3 新增：``rule_kind`` + ``rule_payload`` 用于结构化硬规则
     （``forbidden_word`` / ``required_phrase`` / ``max_len`` / ``forbidden_regex``）。
@@ -1976,6 +1993,7 @@ def upsert_memory(
             auto_confirm_threshold=auto_confirm_threshold,
             force_confirmed=force_confirmed,
             severity=severity,
+            update_severity=update_severity,
             applicability=applicability,
             rule_kind=rule_kind,
             rule_payload=rule_payload,
@@ -1992,6 +2010,7 @@ def _upsert_memory_locked(
     auto_confirm_threshold: int = 3,
     force_confirmed: bool = False,
     severity: str = "soft",
+    update_severity: bool = False,
     applicability: Optional[str] = None,
     rule_kind: Optional[str] = None,
     rule_payload: Optional[dict] = None,
@@ -2027,9 +2046,15 @@ def _upsert_memory_locked(
             new_status = "confirmed"
         else:
             new_status = row["status"]
+        # update_severity 打开时把 severity 一起写回 —— 否则把已存在的 soft
+        # 规则提升成 hard 会"返回成功但库里还是 soft"，那条规则继续待在 P1
+        # 而不是 P0（codex review round-5 P1）。默认关闭的理由见公开签名文档。
+        patch = {"frequency": new_freq, "status": new_status}
+        if update_severity:
+            patch["severity"] = severity
         res = (
             client.table("memories")
-            .update({"frequency": new_freq, "status": new_status})
+            .update(patch)
             .eq("id", row["id"])
             .eq("frequency", old_freq)  # CAS：仅当 frequency 未变时才写
             .execute()
@@ -2056,9 +2081,12 @@ def _upsert_memory_locked(
                 "confirmed" if force_confirmed or new_freq >= auto_confirm_threshold
                 else latest["status"]
             )
+            patch = {"frequency": new_freq, "status": new_status}
+            if update_severity:
+                patch["severity"] = severity
             res = (
                 client.table("memories")
-                .update({"frequency": new_freq, "status": new_status})
+                .update(patch)
                 .eq("id", latest["id"])
                 .execute()
             )

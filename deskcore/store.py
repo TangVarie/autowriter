@@ -73,12 +73,26 @@ def shared_memories(sb, project_id: str,
     硬约束】。那正是这个服务存在的意义所在, 也是最坏的失败模式: 不报错、
     看起来一切正常、产出的却是违规内容。宁可整个 open_project 报错。
     """
+    # ⚠️ 判据必须和 db._is_rule_memory 一致: memory_type IS NULL(老行) 或
+    # 'rule'。原来写的是 `neq('session')` —— 那只排掉了 session, 于是
+    # memory_type='note' 的行会被当成规则按 severity 塞进 P0/P1。note 不是
+    # 写作规则, autowriter 自己的 db.get_confirmed_memories 一直是按
+    # _is_rule_memory 过的。服务端先用 or_ 收窄, 拉回来再用 db._is_rule_memory
+    # 复核一遍 —— 判据只有一个定义, 以后新增 memory_type 也不会漏。
+    # (codex review round-5 P2)
     def _rows(query):
-        return (query.eq("status", "confirmed")
-                     .neq("memory_type", "session")
+        rows = (query.eq("status", "confirmed")
+                     .or_("memory_type.is.null,memory_type.eq.rule")
                      .execute()).data or []
+        return [r for r in rows if db._is_rule_memory(r)]
 
-    cols = "id, content, severity, scope, rule_kind, rule_payload, muted_until, user_id"
+    # embedding: 给 memory.filter_soft_by_relevance 用。
+    # ⚠️ R-034 —— PostgREST 把 pgvector 列当【字符串】回, 直接喂
+    # dedup.cosine_similarity 会静默得 0.0, 于是【每一条】soft 规则都低于阈值
+    # 被滤掉。必须过 db._parse_pgvector(autowriter 自己的 list_memories:1901-1906
+    # 就是这么做的)。这个坑不修比不加相关性过滤更糟。
+    cols = ("id, content, severity, scope, rule_kind, rule_payload, "
+            "muted_until, user_id, memory_type, created_at, frequency, embedding")
     proj = _rows(sb.table("memories").select(cols)
                    .eq("project_id", project_id).eq("scope", "project"))
     glob = (_rows(sb.table("memories").select(cols)
@@ -97,6 +111,9 @@ def shared_memories(sb, project_id: str,
             return True
 
     rows = [m for m in (glob + proj) if _active(m) and (m.get("content") or "").strip()]
+    for r in rows:
+        if "embedding" in r:
+            r["embedding"] = db._parse_pgvector(r.get("embedding"))   # R-034, 见上
     hard = [m for m in rows if (m.get("severity") or "soft").lower() == "hard"]
     soft = [m for m in rows if (m.get("severity") or "soft").lower() != "hard"]
     return hard, soft
@@ -246,15 +263,28 @@ def record_draw(sb, project_id: str, angles: list[dict], user_id: str | None) ->
 
 
 def consume_angle(sb, project_id: str, angle_key: str, version_id: str) -> bool:
+    """把台账里这个角度标成已消耗。返回【是否真的改到了行】。
+
+    ⚠️ 必须看受影响行数, 不能只看"没抛异常"。没有匹配的未消耗行时(最典型:
+    非原子降级路径里 record_draw 的插入失败了, 台账根本没这一行), PostgREST
+    照样返回成功、data 为空 —— 直接 return True 会让 commit_drafts 报告
+    "已消耗", 而这个角度在台账上并不存在, 下一批立刻能再抽到同一个坐标。
+    避重静默失效, 且没有任何痕迹。(codex review round-5 P2)
+    """
     try:
-        (sb.table("angle_ledger")
-           .update({"consumed_version_id": version_id, "consumed_at": iso_now()})
-           .eq("project_id", project_id).eq("angle_key", angle_key)
-           .is_("consumed_version_id", "null").execute())
-        return True
+        res = (sb.table("angle_ledger")
+                 .update({"consumed_version_id": version_id, "consumed_at": iso_now()})
+                 .eq("project_id", project_id).eq("angle_key", angle_key)
+                 .is_("consumed_version_id", "null").execute())
     except Exception:
         logger.exception("mark angle consumed failed: %s", angle_key)
         return False
+    if not (res.data or []):
+        logger.warning(
+            "angle %s (project=%s) had no unconsumed ledger row to mark; "
+            "cross-batch avoidance will not see it as used", angle_key, project_id)
+        return False
+    return True
 
 
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────

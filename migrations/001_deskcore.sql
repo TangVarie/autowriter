@@ -165,10 +165,23 @@ CREATE TRIGGER deskcore_user_calib_updated_at
     BEFORE UPDATE ON autowriter.user_calibration_notes
     FOR EACH ROW EXECUTE FUNCTION autowriter._deskcore_touch_updated_at();
 
+-- ⚠️ items 的触发器带 WHEN 条件, 只在【人工决策列】真的变了时才刷时间戳。
+-- 这一列的定义就是"人工决策(status/example_label)最后变更时间", 而 items 上
+-- 还有别的高频写入路径: save_feedback_draft() / save_manual_edit_draft()
+-- (db.py:1644/1676) 在用户【打字过程中】就往同一张表写草稿。无条件触发的话,
+-- 每敲一次键都会把 updated_at 推到现在, TV 的增量同步
+-- (sync_autowriter_decisions_to_prepublish.py) 会把一堆决策没变的行当成"刚
+-- 改过"反复捞回去 —— 而真正迟到的那些决策依旧混在噪声里, 这一列就白加了。
+-- IS DISTINCT FROM 而不是 <>: 决策列可以是 NULL(未决策/未标注), <> 遇 NULL
+-- 得 NULL 即不触发, 于是"第一次标正例"(NULL → 'positive')反而不刷时间戳。
+-- (codex review round-5 P2)
 DROP TRIGGER IF EXISTS deskcore_items_updated_at ON autowriter.items;
 CREATE TRIGGER deskcore_items_updated_at
     BEFORE UPDATE ON autowriter.items
-    FOR EACH ROW EXECUTE FUNCTION autowriter._deskcore_touch_updated_at();
+    FOR EACH ROW
+    WHEN (OLD.status IS DISTINCT FROM NEW.status
+       OR OLD.example_label IS DISTINCT FROM NEW.example_label)
+    EXECUTE FUNCTION autowriter._deskcore_touch_updated_at();
 
 -- ── deskcore 发牌的原子预留 ──────────────────────────────────────────
 -- 为什么需要它: draw_angles 原本是"读避重集 → Python 里挑 → 插入"三步。

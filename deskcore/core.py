@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import random
 
 import config
@@ -134,6 +135,31 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         import projects as proj_module   # 纯函数; CI 的 import 图冒烟已覆盖该模块
         tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic_name) or ""
 
+    # ── soft 规则: 相关性过滤 + 封顶 ────────────────────────────────
+    # hard 全量保留(合规, 不能因为"跟本次不相关"就丢)。soft 要过一遍
+    # autowriter 生产路径同样的两道(app.py:1096/3150 + db.get_confirmed_memories
+    # 的 cap_per_scope), 否则 P1 会被历史偏好堆爆:
+    #   · deskcore 的规则是【团队共享】的 —— 池子比 autowriter 单人视角大得多,
+    #     这一层不做, 二十条互相打架的旧偏好会一起进 P1, 模型只能写出四不像;
+    #   · 排序用 db._rank_memories_for_injection: 7 天内的新规则永远不被老的
+    #     高频规则挤掉("我刚说过 → 立刻生效"), 这是工作台"规则不忘"的一部分。
+    # (codex review round-5 P2)
+    soft_ctx = " ".join(filter(None, [
+        brief.get("tactic", ""), brief.get("draft_topic", ""),
+        brief.get("key_messages", ""), brief.get("target_audience", ""),
+        brief.get("tone", ""), brief.get("extra_instructions", ""),
+    ])).strip()
+    soft_report: dict = {}
+    soft_all = len(soft)
+    if soft_ctx:
+        soft = memory.filter_soft_by_relevance(soft, soft_ctx, report_sink=soft_report)
+    soft_cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 12) or 12)
+    soft_by_scope = {"global": [], "project": []}
+    for m in soft:
+        soft_by_scope["global" if m.get("scope") == "global" else "project"].append(m)
+    soft = (db._rank_memories_for_injection(soft_by_scope["global"], soft_cap)
+            + db._rank_memories_for_injection(soft_by_scope["project"], soft_cap))
+
     layers = memory.build_layered_system_prompt(
         base_prompt=project.get("system_prompt") or "",
         tactic_suffix=tactic_suffix,
@@ -156,6 +182,11 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         "counts": {
             "hard_rules": len(hard),
             "soft_rules": len(soft),
+            # 说清楚"注入了几条 / 池子里共几条", 否则用户定过的偏好没生效时
+            # 完全看不出是被滤掉了还是根本没存进去。
+            "soft_rules_pool": soft_all,
+            "soft_filter_mode": soft_report.get("soft_filter_mode", "off"),
+            "soft_rules_cap_per_scope": soft_cap,
             "positive_examples": len(positives),
             "positive_pool": len(pool),
             "negative_examples": len(negatives),
@@ -489,12 +520,14 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     inserted_idx = ({o["idx"] for o in outcome if o.get("status") == "inserted"}
                     if atomic else set(range(len(drafts))))
     consumed = 0
+    attempted = 0
     for i, d in enumerate(drafts):
         if i not in inserted_idx:
             continue
         key = d.get("angle_key")
         if not key:
             continue
+        attempted += 1
         vid = d.get("version_id") or _placeholder_version_id(key)
         if store.consume_angle(client, project_id, key, vid):
             consumed += 1
@@ -502,6 +535,13 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     out = {"written": written, "consumed_angles": consumed,
            "embedded": bool(vecs), "rejected": rejected,
            "atomic_recheck": atomic}
+    if attempted and consumed < attempted:
+        # consume_angle 现在会在"台账里根本没这一行"时返回 False(见 store 里的
+        # 说明)。差额必须说出来 —— 这些坐标下一批还会被抽到, 悄悄少算等于
+        # 避重失效了却没人知道。
+        out["angle_ledger_warning"] = (
+            f"{attempted - consumed}/{attempted} 个坐标没能在台账上销账(多半是发牌时"
+            "台账没写进去)。这些坐标下一批可能被重复抽到, 服务端日志有明细。")
     if rejected:
         out["note"] = (f"{len(rejected)} 条在入库时被判与库中已有稿件重复 —— "
                        "多半是你 check 之后、commit 之前有人先提交了撞车的稿子。"
@@ -516,6 +556,26 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
 # ══════════════════════════════════════════════════════════════════════
 # 反馈学习
 # ══════════════════════════════════════════════════════════════════════
+
+def resolve_model() -> str:
+    """本服务实际会用的 Anthropic 模型名。
+
+    ⚠️ /health 和真正发起调用的地方【必须共用这一个函数】。原来是两处各写各的:
+    /health 读 os.environ["DESKCORE_MODEL"], 而 distill_calibration 读
+    getattr(config, "DESKCORE_MODEL", "") —— config.py 里【根本没有】这个属性,
+    getattr 永远回 ""、永远落到 config.CLAUDE_MODEL。于是只配了 DESKCORE_MODEL
+    的部署里, /health 信心满满地回显着一个从未被调用过的模型名。
+
+    这正是 /health 那段注释想防的事故(三个 Railway 服务模型 env 名各不相同,
+    librarian 配错查了很久), 只是这次错得更隐蔽: 回显做了, 但回显的和实际用的
+    不是同一个来源, 所以配错依然当场看不见 —— 回显只有和真值同源才叫回显。
+    (codex review round-5 P2)
+    """
+    return (os.environ.get("DESKCORE_MODEL", "").strip()
+            or getattr(config, "DESKCORE_MODEL", "")
+            or config.CLAUDE_MODEL)
+
+
 
 def record_rule(client, project_id: str, content: str, *, severity: str = "soft",
                 scope: str = "project", user_id: str | None = None) -> dict:
@@ -540,9 +600,22 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
         source_feedback="deskcore",
         project_id=project_id if scope == "project" else None,
         force_confirmed=True, severity=severity,
+        # 用户是【明确指定】了 hard/soft 才走到这里的, 所以命中已存在的规则时
+        # 要把 severity 也写回去。db.upsert_memory 默认不写(自动抽取传的
+        # severity 是猜的, 会把手设的 hard 降回 soft), 这条路径必须显式打开 ——
+        # 否则"把这条改成硬约束"会返回成功但库里还是 soft, 继续待在 P1。
+        # (codex review round-5 P1)
+        update_severity=True,
     )
-    return {"memory_id": (row or {}).get("id"), "severity": severity,
-            "scope": scope, "content": content}
+    # 以【库里实际的值】为准回报, 别回报入参 —— 回报入参正是上面那个 bug 之所以
+    # 看不见的原因: 库里没改, 返回值却说改了。
+    stored = (row or {}).get("severity") or severity
+    out = {"memory_id": (row or {}).get("id"), "severity": stored,
+           "scope": scope, "content": content}
+    if stored != severity:
+        out["warning"] = (f"请求 severity={severity}, 但库里这条现在是 {stored} —— "
+                          "以库里的为准, 请把这个差异告诉用户")
+    return out
 
 
 _CALIB_SYSTEM = """\
@@ -626,10 +699,9 @@ def distill_calibration(client, project_id: str, *, user_id: str,
               + "【本次要吸收的手动精修】\n" + "\n\n---\n".join(blocks)
               + "\n\n请输出更新后的完整笔记。")
 
-    model = getattr(config, "DESKCORE_MODEL", "") or config.CLAUDE_MODEL
     ac = clients.get_anthropic_client()
     resp = clients.with_anthropic_retry(lambda: ac.messages.create(
-        model=model, max_tokens=1500, system=_CALIB_SYSTEM,
+        model=resolve_model(), max_tokens=1500, system=_CALIB_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     ))
     notes = "".join(getattr(b, "text", "") for b in resp.content

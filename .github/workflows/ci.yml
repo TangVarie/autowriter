@@ -35,6 +35,178 @@ jobs:
           #   3. 换皮改写能拦 —— 换标题 + 换措辞, 靠正文四字串重合抓出来
           #   4. 真正不同的稿子不误伤
           python -m deskcore.cli selftest
+      - name: deskcore round-5 回归 (fail-closed / 规则口径 / 触发器条件)
+        run: |
+          python - <<'PY'
+          # round-5 codex review 的回归测试。全部用假对象, 不联网。
+          import os, sys, types
+
+          os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
+
+          # ── 1. _safe 的适用范围是结构性约定, 直接钉死 ────────────────────────
+          import deskcore.tools as T
+          import inspect
+          src = inspect.getsource(T)
+          SAFE_OK = {"list_projects", "borrow_lessons", "my_style"}
+          wrapped = set()
+          for name in T.TOOLS:
+              body = inspect.getsource(T.TOOLS[name][0])
+              if "_safe(" in body:
+                  wrapped.add(name)
+          assert wrapped == SAFE_OK, f"_safe 包装范围变了: {wrapped} != {SAFE_OK}"
+          print(f"  ✓ _safe 只包三个可降级的读: {sorted(SAFE_OK)}")
+          for name in ("open_project", "record_rule", "record_edit", "label_example",
+                       "draw_angles", "check_drafts", "commit_drafts"):
+              assert name not in wrapped, f"{name} 不能包 _safe(合规读/写, 失败必须冒泡)"
+          print("  ✓ 合规读与全部写操作都不吞异常")
+
+          # ── 2. consume_angle: 0 行受影响必须返回 False ───────────────────────
+          import deskcore.store as S
+
+          class _Resp:
+              def __init__(self, data): self.data = data
+          class _Q:
+              def __init__(self, data): self._d = data
+              def update(self, *a, **k): return self
+              def eq(self, *a, **k): return self
+              def is_(self, *a, **k): return self
+              def execute(self): return _Resp(self._d)
+          class _SB:
+              def __init__(self, data): self._d = data
+              def table(self, *a, **k): return _Q(self._d)
+
+          assert S.consume_angle(_SB([]), "p", "k", "v") is False, "没改到行还报 True"
+          assert S.consume_angle(_SB([{"id": 1}]), "p", "k", "v") is True
+          print("  ✓ consume_angle 看受影响行数, 空结果 → False")
+
+          # ── 3. shared_memories: note 类记忆不许进规则 ────────────────────────
+          ROWS = [
+              {"id": "1", "content": "禁止提竞品", "severity": "hard", "scope": "project",
+               "memory_type": "rule", "created_at": "2026-01-01", "frequency": 3},
+              {"id": "2", "content": "这是一条笔记", "severity": "hard", "scope": "project",
+               "memory_type": "note", "created_at": "2026-01-01", "frequency": 1},
+              {"id": "3", "content": "老行没有 memory_type", "severity": "soft", "scope": "project",
+               "memory_type": None, "created_at": "2026-01-01", "frequency": 1},
+              {"id": "4", "content": "会话临时", "severity": "soft", "scope": "project",
+               "memory_type": "session", "created_at": "2026-01-01", "frequency": 1},
+          ]
+          class _MQ:
+              def __init__(self, rows): self._r = rows
+              def select(self, *a, **k): return self
+              def eq(self, *a, **k): return self
+              def neq(self, *a, **k): return self
+              def or_(self, *a, **k): return self
+              def execute(self): return _Resp(self._r)
+          class _MSB:
+              def __init__(self, rows): self._r = rows
+              def table(self, *a, **k): return _MQ(self._r)
+
+          hard, soft = S.shared_memories(_MSB(ROWS), "proj-1")
+          got = {m["id"] for m in hard + soft}
+          assert got == {"1", "3"}, f"note/session 泄漏进规则: {got}"
+          print("  ✓ 只有 memory_type ∈ {rule, NULL} 进规则; note 和 session 都被挡住")
+
+          # ── 4. record_rule: severity 以【库里实际值】回报 ────────────────────
+          import deskcore.core as C
+          import db as _db
+
+          calls = {}
+          def _fake_upsert(client, **kw):
+              calls.update(kw)
+              # 模拟 db 的 UPDATE 路径: update_severity 关着时 severity 不生效
+              stored = kw["severity"] if kw.get("update_severity") else "soft"
+              return {"id": "mem-1", "severity": stored}
+          _orig = _db.upsert_memory
+          _db.upsert_memory = _fake_upsert
+          try:
+              out = C.record_rule(None, "proj-1", "以后一律不许用感叹号", severity="hard")
+              assert calls.get("update_severity") is True, "record_rule 没打开 update_severity"
+              assert out["severity"] == "hard", out
+              assert "warning" not in out, out
+              print("  ✓ record_rule 打开 update_severity, 提升为 hard 真的落库")
+
+              # 反证: update_severity 没生效时, 必须报 warning 而不是谎报成功
+              def _stubborn(client, **kw): return {"id": "mem-1", "severity": "soft"}
+              _db.upsert_memory = _stubborn
+              out = C.record_rule(None, "proj-1", "同一条", severity="hard")
+              assert out["severity"] == "soft" and "warning" in out, out
+              print("  ✓ 库里没改成 hard 时, 回报 soft 并带 warning(不谎报入参)")
+          finally:
+              _db.upsert_memory = _orig
+
+          # ── 5. db.upsert_memory 的 update_severity 默认必须是 False ──────────
+          sig = inspect.signature(_orig)
+          assert sig.parameters["update_severity"].default is False, \
+              "默认打开会让自动抽取把用户手设的 hard 降回 soft"
+          print("  ✓ db.upsert_memory(update_severity=False) 默认关闭, 自动抽取不会降级手设规则")
+
+          # ── 6. resolve_model: /health 与真实调用同源 ─────────────────────────
+          import config
+          os.environ["DESKCORE_MODEL"] = "claude-test-model"
+          assert C.resolve_model() == "claude-test-model", C.resolve_model()
+          os.environ.pop("DESKCORE_MODEL")
+          assert C.resolve_model() == config.CLAUDE_MODEL
+          print("  ✓ resolve_model 真的读 env; 不设时落回 config.CLAUDE_MODEL")
+          assert "core.resolve_model()" in open("deskcore/app.py", encoding="utf-8").read(), \
+              "/health 必须走同一个 resolve_model, 否则回显和实际用的又会分叉"
+          print("  ✓ /health 与 distill_calibration 共用同一个解析器")
+
+          # ── 7. 两份 SQL 里的触发器 WHEN 条件必须一致 ─────────────────────────
+          WHEN = ("WHEN (OLD.status IS DISTINCT FROM NEW.status\n"
+                  "       OR OLD.example_label IS DISTINCT FROM NEW.example_label)")
+          for f in ("migrations/001_deskcore.sql", "db.py"):
+              t = open(f, encoding="utf-8").read()
+              assert WHEN in t, f"{f} 里 items 触发器缺 WHEN 条件(或两份不一致)"
+          print("  ✓ items 触发器的 WHEN 条件在 migrations 与 CREATE_TABLES_SQL 里一致")
+
+          # ── 8. R-034: memories.embedding 必须被解析成 list[float] ────────────
+          # 这是取 embedding 顺带引入的地雷: PostgREST 把 pgvector 当【字符串】回,
+          # 不解析的话 dedup.cosine_similarity 静默得 0.0 → filter_soft_by_relevance
+          # 把【每一条】soft 规则都判成不相关滤掉。比不做相关性过滤更糟, 且无声。
+          VEC = "[" + ",".join(["0.1"] * 8) + "]"
+          EMB_ROWS = [
+              {"id": "e1", "content": "带向量的软规则", "severity": "soft", "scope": "project",
+               "memory_type": "rule", "created_at": "2026-01-01", "frequency": 1,
+               "embedding": VEC},
+              {"id": "e2", "content": "老行没向量", "severity": "soft", "scope": "project",
+               "memory_type": "rule", "created_at": "2026-01-01", "frequency": 1,
+               "embedding": None},
+          ]
+          _h, _s = S.shared_memories(_MSB(EMB_ROWS), "proj-1")
+          by_id = {m["id"]: m for m in _h + _s}
+          e1 = by_id["e1"]["embedding"]
+          assert isinstance(e1, list) and len(e1) == 8 and isinstance(e1[0], float), \
+              f"embedding 没被 _parse_pgvector 解析, 拿到的是 {type(e1).__name__}: {e1!r}"
+          assert by_id["e2"]["embedding"] in (None, []), by_id["e2"]["embedding"]
+          import dedup as _dedup
+          assert _dedup.cosine_similarity(e1, e1) > 0.99, "解析后的向量算不出相似度"
+          # 反证真实失败模式: 上下文向量(768 维 list) vs 【未解析的字符串】。
+          # dedup.cosine_similarity 的 len(a) != len(b) 分支会静默 return 0.0 ——
+          # 不抛异常, 所以 filter_soft_by_relevance 的 try/except 兜不住, 直接判成
+          # "与本次不相关" 丢掉。每一条带向量的 soft 规则都会这样消失, 且无声。
+          _ctx = [0.1] * 768
+          assert _dedup.cosine_similarity(_ctx, VEC) == 0.0, \
+              "前提变了: 未解析的字符串向量本应静默得 0.0 —— 这正是本用例要防的失败模式"
+          assert _dedup.cosine_similarity(_ctx, e1 * 96) > 0.99, \
+              "解析后的向量(8 维 ×96 = 768)应该能正常算出相似度"
+          print("  ✓ memories.embedding 过 _parse_pgvector; 未解析时确实静默得 0.0 而不是报错")
+
+          # ── 9. soft 规则确实过了相关性过滤 + 分 scope 封顶 ───────────────────
+          brief_src = inspect.getsource(C.build_writing_brief)
+          assert "filter_soft_by_relevance" in brief_src, "soft 规则没过相关性过滤"
+          assert "_rank_memories_for_injection" in brief_src, "soft 规则没封顶"
+          assert brief_src.index("soft = memory.filter_soft_by_relevance") < \
+                 brief_src.index("layers = memory.build_layered_system_prompt"), \
+              "过滤必须在组装 prompt 之前"
+          # hard 不能被过滤/封顶 —— 合规规则全量保留
+          assert "_rank_memories_for_injection(hard" not in brief_src, "hard 规则被封顶了"
+          ranked = _db._rank_memories_for_injection(
+              [{"id": str(i), "frequency": 1, "created_at": "2020-01-01"} for i in range(40)], 12)
+          assert len(ranked) == 12, len(ranked)
+          print("  ✓ soft 过相关性过滤并按 scope 封顶(12/scope); hard 全量保留")
+
+          print("\ndeskcore round-5 回归: 9/9 通过")
+          PY
       - name: 真实 import 图 (抓依赖 API 漂移; 不 import app.py — 它会跑 streamlit 脚本)
         run: |
           python - <<'PY'

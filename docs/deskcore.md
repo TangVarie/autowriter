@@ -98,7 +98,21 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 
 **B. 查重比全量、比三个信号** → 标题语义 + 开头精确指纹 + 正文四字串 Jaccard。后两个是纯字符串运算，**没有 `GOOGLE_API_KEY` 也能跑**——原来只比标题向量，embedding 一挂整个失效。
 
-**C. 查重是硬闸** → `check_drafts` 是 deskcore **唯一不 fail-open** 的读工具。其它读类工具出错返回带 `error` 的可用结构不阻塞写稿；查重出错必须抛。静默放行就是重演根因 1。
+**C. 查重是硬闸** → `check_drafts` 出错必须抛，静默放行就是重演根因 1。
+
+fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` / `my_style`——读，且拿不到只是少点参考。判据是「失败之后调用方还会不会当作成功继续往下走」，会就不能吞：
+
+| 工具 | 出错行为 | 为什么不能吞 |
+|---|---|---|
+| `open_project` | 抛 | 拿不到 P0 就照常开写，产出违规内容，而调用方看到的是一份 `p0` 为空的正常简报 |
+| `check_drafts` | 抛 | 硬闸静默放行 |
+| `commit_drafts` | 抛 | 定稿缺席指纹库，同样的稿子以后能再过一次闸 |
+| `draw_angles` | 抛 | 没落台账，同一个角度下批还能再抽 |
+| `record_rule` | 抛 | 用户明确说"以后都这样"的 hard 合规规则静默缺席之后每一份简报 |
+| `record_edit` | 抛 | "裂变"的唯一入口，静默失败 = 文风永远长不出来 |
+| `label_example` | 抛 | 标记没落库却报成功，用户不会再标第二次 |
+
+（codex review round-5：`open_project` 和 `record_rule` 原来都包了 `_safe`。前者尤其糟——`store.shared_memories()` 为此专门**故意不吞异常**，外面再包一层等于把那个设计原样抵消掉。）
 
 **D. 两个并发点都交给数据库** → `check_drafts` 和 `commit_drafts` 是两次独立调用，两个队友各自 check 时看到同一份旧指纹集、双双 pass，然后各自 commit——撞车的稿子一起进库。发牌有同样的问题。两处都用 project 级事务 advisory lock 收进一个事务里解决：
 
@@ -195,6 +209,8 @@ curl -sS -X POST "$DESKCORE_URL/tool/list_projects" \
 ```
 
 `/health` 会回显实际解析到的模型名、embedding 可用性、vendor 词表校验和、鉴权是否配置——**配错当场可见**。这是刻意的：TV `docs/19:180-200` 记过一次事故，librarian 的模型 env 变量名配错，每次 LLM 调用失败降级成 `[]`，外面看永远 200，查了很久。
+
+⚠️ 回显只有和**真正发起调用的地方同源**才叫回显。第一版这里就翻过一次车：`/health` 读 `os.environ["DESKCORE_MODEL"]`，而 `distill_calibration` 读 `getattr(config, "DESKCORE_MODEL", "")`——`config.py` 里根本没这个属性，永远落回 `config.CLAUDE_MODEL`。于是只配了 `DESKCORE_MODEL` 的部署里，`/health` 信心满满地回显着一个从未被调用过的模型名，配错依然当场看不见。现在两边共用 `core.resolve_model()`。加新配置回显时照这个来。
 
 ### 4.3 挂到 WorkBuddy
 
