@@ -7,6 +7,45 @@
 
 ---
 
+## 0. 修复进度
+
+| 批次 | 条目 | 状态 |
+|---|---|---|
+| 第 1 批 · 止血 | ROB-003 · COR-003 · COR-007 · COR-010 · COR-005/006 | ✅ **已修**(见下) |
+| 第 2 批 · 数据一致性 | COR-002 · COR-004 · COR-008 · COR-009 · COR-011 · COR-020 · COR-021 · COR-022 · ROB-009 · ROB-018 | 待做 |
+| 第 3 批 · 性能与成本 | SUP-001 · SUP-002 · SUP-003 · SUP-004 · SUP-005 · SUP-007 · SUP-008 · ROB-004 · ROB-011 · ROB-013 | 待做 |
+| 第 4 批 · 结构性 | ROB-001 · ROB-002 · SUP-011 · SUP-012 · SUP-024 · SUP-010 · COR-014 · COR-015 | 待做 |
+
+### 第 1 批的实现说明与**两处与本报告的偏差**
+
+行号引用仍指审计当时的版本; 修复后的位置以 CI 的 `审计第一批止血回归` 一步为准。
+
+| 条目 | 怎么修的 |
+|---|---|
+| ROB-003 | `deskcore/identity.py:resolve` 改 fail-closed: 未配 key 一律 401, 免 key 跑要显式 `DESKCORE_ALLOW_ANONYMOUS=1`。`/health` 增回显 `config.anonymous_allowed`, 并把 `auth_health()` 从两次调用收敛成一次(否则 `ok` 与 note 可能对不上) |
+| COR-003 | 新增 `update_calibration_notes_cas` RPC(`migrations/002_calibration_cas.sql` + `db.py::CREATE_TABLES_SQL` 两边同步), witness 压成 md5 进 body。`memory.save_calibration_notes` 改走它; RPC 未部署时退回 `_legacy_cas_update` 并埋 `calibration_cas_rpc_missing` |
+| COR-007 | `deskcore/store.shared_memories` 改调 `db.is_memory_muted_now` |
+| COR-010 | 新增 `db.WriteReturnedNoRow` + `db._first_row()`, 覆盖全部写入点 |
+| COR-005/006 | `deskcore/store._paged()` 助手(空页收工 + offset 按实收前进), 应用到 `existing_fingerprint_version_ids` / `legacy_versions` / `fingerprints_missing_vectors` |
+
+**偏差 1 — ROB-003 没有把 `/health` 改成 503。** 报告 §9 第 1 条写的是"`/health` 在 `ok=False` 时返 503"。实施时否掉了这一半:
+
+- CI 里有一条带完整理由的断言把 200 定为硬要求(`ci.yml` 的 app 冒烟步): 库瞬断这类**可恢复**故障不该把整个部署卡住, 而 Railway 的 healthcheck 只看状态码。翻转它会让一次 Supabase 抖动挡住正常发布。
+- 更重要的是: 真正的危险来自 `resolve()` 的 fail-open, 不是状态码。根因堵死之后, 未配鉴权的部署会对每个工具调用返 401 —— 起得来但什么也不做、且当场可见, 不再泄露任何数据。再用状态码兜第二遍属于拿部署可用性换一个已经不存在的风险。
+
+所以 ROB-003 按"修根因、留状态码"处理, 并在 `docs/deskcore.md` §3b 记下这个取舍。**若日后仍希望 `/health` 对配置类故障返 503**, 那是一个独立的、可讨论的运维决策, 不在本批。
+
+**偏差 2 — COR-010 实际是 11 处, 不是 7 处。** 报告正文只列了 7 个代表位置。逐个核过之后另有 4 处同类:
+`update_project`(`db.py:1114`)、`_upsert_memory_locked` 的 INSERT 返回(`:2217`)、
+`increment_memory_frequency` 的兜底写(`:2500`)、`update_memory`(`:2508`)。全部一并修了。
+CI 用 AST 遍历 `db.py` 钉死"不许再出现无守卫的 `return <x>.data[0]`"—— 按行文本匹配会把
+`if res.data: return res.data[0]` 和 `return res.data[0] if res.data else None` 一起误报。
+
+**过程中新发现的一处**: `memory.save_calibration_notes` 的 docstring 仍在描述已被替换的
+`.eq("calibration_notes", ...)` 机制(注释与实现不一致), 由新加的 CI 断言当场抓到, 已一并改。
+
+---
+
 ## 1. 执行摘要
 
 | 项 | 数 |

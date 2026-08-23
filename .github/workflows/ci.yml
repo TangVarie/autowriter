@@ -631,6 +631,265 @@ jobs:
           print("\ndeskcore round-8 回归: 5/5 通过")
           PY
 
+      - name: 审计第一批止血回归 (COR-003/005/006/007/010 · 2026-08-23)
+        run: |
+          python - <<'PY'
+          # docs/audit-2026-08-23-full.md 第 1 批(止血)的回归。全部假件, 不联网。
+          # ROB-003(deskcore fail-closed)在下面 "app 冒烟" 那一步里测, 因为它要真起服务。
+          import os, hashlib, inspect
+          os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
+          import db, memory as M, deskcore.store as S
+
+          class _R:
+              def __init__(s, d): s.data = d
+
+          # ══ COR-010: 写入返回 0 行必须是可读异常, 不是 IndexError ══════════
+          # PostgREST 对"匹配 0 行"的 UPDATE 不报错、只回空 data(行被并发删 /
+          # RLS 拦下)。裸 res.data[0] 会抛 IndexError, 在 Streamlit 上是一片红屏,
+          # 既看不出哪一步也不知道怎么办。
+          class _Q0:
+              def __init__(s, out): s.out = out; s.mode = None
+              def insert(s,*a,**k): s.mode="ins"; return s
+              def update(s,*a,**k): s.mode="upd"; return s
+              def select(s,*a,**k): s.mode="sel"; return s
+              def eq(s,*a,**k): return s
+              def order(s,*a,**k): return s
+              def limit(s,*a,**k): return s
+              def execute(s):
+                  if s.mode == "sel": return _R([{"version_num": 3}])
+                  return _R(s.out)
+          class _SB0:
+              def __init__(s, out): s.out = out
+              def table(s,*a,**k): return _Q0(s.out)
+
+          WRITES = [
+              ("创建项目",     lambda c: db.create_project(c, "u", "n")),
+              ("创建批次",     lambda c: db.create_batch(c, "u", "p", "t", {}, ["claude"])),
+              ("创建条目",     lambda c: db.create_item(c, "u", "b")),
+              ("创建版本",     lambda c: db.create_version(c, "i", "claude", "t", "b")),
+              ("更新条目状态", lambda c: db.update_item_status(c, "i", "approved")),
+              ("标记正负例",   lambda c: db.set_item_example_label(c, "i", "positive")),
+              ("更新记忆",     lambda c: db.update_memory(c, "m", {"content": "x"})),
+              ("入队任务",     lambda c: db.insert_job(c, "noop", {}, "u")),
+          ]
+          for name, fn in WRITES:
+              try:
+                  fn(_SB0([]))
+                  raise AssertionError(f"{name}: 0 行居然没报错")
+              except IndexError:
+                  raise AssertionError(f"{name}: 仍抛 IndexError(红屏), 没走 _first_row")
+              except db.WriteReturnedNoRow as e:
+                  assert name in str(e) and "RLS" in str(e), str(e)
+              assert fn(_SB0([{"id": "x1"}])) == {"id": "x1"}, name
+          # res=None 也不能炸成 AttributeError
+          try:
+              db._first_row(None, "假操作"); raise AssertionError
+          except db.WriteReturnedNoRow: pass
+          # 全库不该再留【无守卫】的 return <x>.data[0]。
+          # 用 AST 而不是文本匹配: `if res.data: return res.data[0]` 和
+          # `return res.data[0] if res.data else None` 都是安全的, 按行 grep
+          # 会把它们一起误报(round-5 §6 已经为"文本匹配不可靠"写过理由)。
+          import ast as _ast
+          _tree = _ast.parse(open("db.py", encoding="utf-8").read())
+          _parent = {}
+          for _n in _ast.walk(_tree):
+              for _c in _ast.iter_child_nodes(_n):
+                  _parent[_c] = _n
+
+          def _is_data_index(n):
+              return (isinstance(n, _ast.Subscript)
+                      and isinstance(n.value, _ast.Attribute) and n.value.attr == "data"
+                      and isinstance(n.value.value, _ast.Name)
+                      and isinstance(getattr(n.slice, "value", None), int))
+
+          def _has_data_guard(n):
+              p = _parent.get(n)
+              while p is not None and not isinstance(p, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                  if isinstance(p, _ast.If) and any(
+                          isinstance(a, _ast.Attribute) and a.attr == "data"
+                          for a in _ast.walk(p.test)):
+                      return True
+                  p = _parent.get(p)
+              return False
+
+          bare = [n.lineno for n in _ast.walk(_tree)
+                  if isinstance(n, _ast.Return) and n.value is not None
+                  and _is_data_index(n.value) and not _has_data_guard(n)]
+          assert not bare, (
+              f"db.py:{bare} 还有无守卫的 return <x>.data[0] —— 0 行匹配时会抛 "
+              "IndexError 红屏; 走 _first_row() 或自己判空")
+          print(f"  ✓ COR-010 {len(WRITES)} 个写入点 0 行 → WriteReturnedNoRow(可读); 无裸 res.data[0] 残留")
+
+          # ══ COR-003: 调教笔记 CAS 的 witness 不许进 URL ════════════════════
+          # 旧写法 .eq("calibration_notes", <全文>) 把最长 4000 字的笔记塞进
+          # PostgREST 的 query string(中文 URL-encode 后 ×9 ≈ 36KB), 越过网关
+          # 请求行上限后每次写入都失败, 并被上层 except 吞掉 —— 四条自动学习
+          # 路径静默停摆, 且笔记越长越先坏。
+          def _md5(t): return hashlib.md5((t or "").encode(), usedforsecurity=False).hexdigest()
+          LONG = "- " + "很长的观察行" * 700          # ~4200 字, 贴着软上限
+          seen = {}
+          class _RpcSB:
+              def __init__(s, ret=None, missing=False): s.ret, s.missing = ret, missing
+              def rpc(s, name, params):
+                  if s.missing:
+                      class _X:
+                          def execute(_): raise Exception("PGRST202 Could not find the function")
+                      return _X()
+                  seen.update(name=name, params=params)
+                  class _X:
+                      def execute(_): return _R(s.ret)
+                  return _X()
+              def table(s,*a,**k):
+                  raise AssertionError("RPC 可用时不该再走 .table() 全文过滤")
+          row = db.update_calibration_notes_cas(
+              _RpcSB([{"id": "p1", "calibration_notes": "new"}]), "p1", LONG, "new")
+          assert row["id"] == "p1"
+          assert seen["name"] == "update_calibration_notes_cas"
+          assert seen["params"]["_expected_md5"] == _md5(LONG)
+          assert len(seen["params"]["_expected_md5"]) == 32
+          assert LONG not in "".join(map(str, seen["params"].values())), "全文还是进了请求"
+          assert db.update_calibration_notes_cas(_RpcSB([]), "p", LONG, "n") is None, \
+              "RPC 回 0 行应表示 CAS 冲突"
+          # 空 witness: COALESCE 让 NULL 与 '' 同态, R-036 的 or_ 特例不再需要
+          db.update_calibration_notes_cas(_RpcSB([{"id": "p"}]), "p", "", "x")
+          assert seen["params"]["_expected_md5"] == _md5("")
+          # RPC 没部署 → 专用异常(调用方降级); 其它错误必须原样上抛
+          try:
+              db.update_calibration_notes_cas(_RpcSB(missing=True), "p", "", "x")
+              raise AssertionError
+          except db.CalibrationCasRpcMissing: pass
+          class _BoomRpc:
+              def rpc(s,*a,**k):
+                  class _X:
+                      def execute(_): raise Exception("permission denied for function")
+                  return _X()
+          try:
+              db.update_calibration_notes_cas(_BoomRpc(), "p", "", "x"); raise AssertionError
+          except db.CalibrationCasRpcMissing:
+              raise AssertionError("权限错误被误判成 RPC 不存在 → 会静默降级")
+          except Exception as e:
+              assert "permission denied" in str(e)
+          # memory 侧: CAS 主路径不许再出现全文过滤。
+          # 同样必须走 AST —— 上面那段 docstring 里就引用了旧写法来解释为什么
+          # 换掉它, 文本匹配会把它当成"还在用"(round-5 §6 同一个教训)。
+          _fn = next(n for n in _ast.walk(_ast.parse(open("memory.py", encoding="utf-8").read()))
+                     if isinstance(n, _ast.FunctionDef) and n.name == "save_calibration_notes")
+          _calls = [n for n in _ast.walk(_fn) if isinstance(n, _ast.Call)]
+          def _called(name):
+              return any(isinstance(c.func, _ast.Attribute) and c.func.attr == name
+                         or isinstance(c.func, _ast.Name) and c.func.id == name
+                         for c in _calls)
+          assert _called("update_calibration_notes_cas"), "save 没接 md5 RPC"
+          assert _called("_legacy_cas_update"), "缺未迁移部署的降级退路"
+          _bad_eq = [c for c in _calls
+                     if isinstance(c.func, _ast.Attribute) and c.func.attr == "eq"
+                     and c.args and isinstance(c.args[0], _ast.Constant)
+                     and c.args[0].value == "calibration_notes"]
+          assert not _bad_eq, "CAS 主路径还在把笔记全文塞进 .eq() 过滤"
+          # 两份 SQL 的语义必须一致(限定写法本来就不同, 对齐判据/授权三处)
+          for f in ("migrations/002_calibration_cas.sql", "db.py"):
+              t = open(f, encoding="utf-8").read()
+              assert "update_calibration_notes_cas" in t, f"{f} 缺 CAS 函数"
+              assert "md5(COALESCE(p.calibration_notes, '')) = _expected_md5" in t, \
+                  f"{f} 的 CAS 判据不一致"
+              assert "TO authenticated, service_role" in t, f"{f} 授权不一致"
+              assert "FROM anon" in t, f"{f} 没 REVOKE anon"
+          print(f"  ✓ COR-003 {len(LONG)} 字笔记的 witness 压成 32 字节 md5; 冲突/未部署/权限错三态分清; 两份 SQL 判据一致")
+
+          # ══ COR-007: 静音判定必须复用 db.is_memory_muted_now ═══════════════
+          # 本地那版对 naive ISO 和 7 位微秒会抛异常 → except 返 True →
+          # 【被静音的规则照常注入 P0/P1】。
+          class _MQ:
+              def __init__(s, rows): s.r = rows
+              def select(s,*a,**k): return s
+              def eq(s,*a,**k): return s
+              def or_(s,*a,**k): return s
+              def execute(s): return _R(s.r)
+          class _MSB:
+              def __init__(s, rows): s.r = rows
+              def table(s,*a,**k): return _MQ(s.r)
+          base = dict(severity="soft", scope="project", memory_type="rule",
+                      created_at="2026-01-01", frequency=1)
+          rows = [
+              dict(base, id="naive", content="naive 静音", muted_until="2099-01-01T00:00:00"),
+              dict(base, id="us7",   content="7us 静音",   muted_until="2099-01-01T00:00:00.1234567+00:00"),
+              dict(base, id="aware", content="aware 静音", muted_until="2099-01-01T00:00:00+00:00"),
+              dict(base, id="past",  content="静音已过期", muted_until="2000-01-01T00:00:00+00:00"),
+              dict(base, id="none",  content="从未静音",   muted_until=None),
+          ]
+          h, s_ = S.shared_memories(_MSB(rows), "p")
+          got = {m["id"] for m in h + s_}
+          assert got == {"past", "none"}, f"静音规则泄漏进注入: {sorted(got)}"
+          assert "is_memory_muted_now" in inspect.getsource(S.shared_memories), \
+              "又在 store 里自己写了一份静音判定"
+          print("  ✓ COR-007 naive / 7位微秒 / aware 三种未来静音都挡住(旧实现前两种会漏)")
+
+          # ══ COR-005 / COR-006: deskcore 三处必须翻页 ═══════════════════════
+          # PostgREST 的 db-max-rows(默认 1000)会把 .limit(5000) 静默钳短。
+          # existing_fingerprint_version_ids 是 backfill 幂等所依赖的那个集合 ——
+          # 它读不全, 幂等就是假的: 重跑会给超出的行再插一遍指纹。
+          class _PQ:
+              def __init__(s, store, log, cap):
+                  s.s, s.log, s.cap, s.orders = store, log, cap, []
+              def select(s,*a,**k): return s
+              def eq(s,*a,**k): return s
+              def neq(s,*a,**k): return s
+              def is_(s,*a,**k): return s
+              @property
+              def not_(s): return s
+              def order(s,c,**k): s.orders.append(c); return s
+              def range(s,lo,hi): s.lo, s.hi = lo, hi; return s
+              def execute(s):
+                  page = s.s[s.lo:s.hi+1]
+                  if s.cap is not None: page = page[:s.cap]
+                  s.log.append({"order": list(s.orders), "range": (s.lo, s.hi)})
+                  return _R(page)
+          class _PSB:
+              # table() 每次返回新 builder —— postgrest-py 就是这样, 复用会让
+              # .order() 累积、.range() 偏移叠加。
+              def __init__(s, store, cap=None): s.s, s.log, s.cap = store, [], cap
+              def table(s,*a,**k): return _PQ(s.s, s.log, s.cap)
+
+          fp = [{"version_id": f"v{i}"} for i in range(2500)]
+          sb = _PSB(fp)
+          assert len(S.existing_fingerprint_version_ids(sb, "p")) == 2500, "幂等集合没取全"
+          assert sb.log[0]["order"] == ["id"], sb.log[0]
+          # 服务端钳短(max-rows < page_size)时也要取全, 且 offset 按实收前进 ——
+          # 按 page_size 跳会漏掉中间那段, 按"短页收工"会第一页就返回。
+          sb2 = _PSB(fp, cap=137)
+          assert len(S.existing_fingerprint_version_ids(sb2, "p")) == 2500, "钳短时漏行"
+          assert sb2.log[1]["range"][0] == 137, sb2.log[1]
+
+          mv = [{"id": f"f{i}", "title": f"t{i}"} for i in range(2500)]
+          sb3 = _PSB(mv, cap=137)
+          assert len(S.fingerprints_missing_vectors(sb3, "p")) == 2000, "hard_cap 失效"
+          assert sb3.log[0]["order"] == ["created_at", "id"], sb3.log[0]
+
+          items = [{"id": f"i{n}", "best_version_id": None, "user_id": "u",
+                    "created_at": "2026-01-01",
+                    "versions": [{"id": f"v{n}", "title": f"t{n}", "body": "b",
+                                  "version_num": 1, "embedding": None}]}
+                   for n in range(2500)]
+          sb4 = _PSB(items, cap=137)
+          assert len(S.legacy_versions(sb4, "p")) == 2500, "backfill 源数据漏行"
+          assert sb4.log[0]["order"] == ["created_at", "id"], sb4.log[0]
+
+          assert S.existing_fingerprint_version_ids(_PSB([]), "p") == set()
+          assert S.legacy_versions(_PSB([]), "p") == []
+          assert S.fingerprints_missing_vectors(_PSB([]), "p") == []
+          sb5 = _PSB([{"id": f"f{i}", "title": "t"} for i in range(5000)])
+          S.fingerprints_missing_vectors(sb5, "p", limit=2000)
+          assert len(sb5.log) == 2, f"hard_cap 到顶还在多打请求: {len(sb5.log)}"
+          # 别再退回裸 .limit()
+          for fn in (S.legacy_versions, S.existing_fingerprint_version_ids,
+                     S.fingerprints_missing_vectors):
+              body = inspect.getsource(fn)
+              assert "_paged(" in body, f"{fn.__name__} 没走翻页"
+          print("  ✓ COR-005/006 三处翻页: 钳到 137/页仍取全 2500; hard_cap 到顶即停; 空库不死循环")
+
+          print("\n审计第一批止血回归: 5/5 通过 (ROB-003 见下方 app 冒烟)")
+          PY
+
       - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
         run: |
           # ⚠️ 这一步存在的理由: /health 里一个 `getattr(config, ...)` 因为
@@ -674,11 +933,33 @@ jobs:
           assert body["tools"], "/health 没回显工具清单"
           print(f"  ✓ /health 200, llm=none, tools={len(body['tools'])} 个")
 
-          # 未配鉴权 = dev 模式放行(与 librarian/onboarder/worker 同口径, 刻意的)。
-          # 但 /health 必须把它标成【不健康】—— 生产忘配就等于匿名开放。
-          assert cfg["auth"]["ok"] is False and "dev" in cfg["auth"]["note"], cfg["auth"]
+          # 未配鉴权 = 【拒绝所有请求】(2026-08-23 审计 ROB-003)。
+          # 这里原来断言的是"放行但标 auth.ok=false" —— 那个口径是危险的:
+          # deskcore 持 service_role 绕 RLS, 漏配一个环境变量就等于把全部租户
+          # 的数据和十一个工具(含写)匿名开放到公网; 而 /health 返 200,
+          # Railway 的 healthcheck 只看状态码, 一个彻底敞开的部署照样上线。
+          assert cfg["auth"]["ok"] is False, cfg["auth"]
+          assert "401" in cfg["auth"]["note"], cfg["auth"]["note"]
           assert body["ok"] is False, "未配鉴权时整体 ok 不该是 true"
-          print("  ✓ 未配鉴权: 放行但 /health 标 auth.ok=false + 整体 ok=false")
+          assert cfg["anonymous_allowed"] is False, cfg["anonymous_allowed"]
+          # ⚠️ 这条才是真正的护栏, 老 CI 从来没测过: 未配鉴权时打一个真工具。
+          r = c.post("/tool/list_projects", json={})
+          assert r.status_code == 401, f"未配鉴权却放行了工具调用: {r.status_code}"
+          print("  ✓ 未配鉴权: 工具调用 401(fail-closed) + /health 标 auth.ok=false")
+
+          # /health 仍然返 200 —— 【刻意保留】。Railway 只看状态码, 而库瞬断
+          # 这类可恢复故障不该把整个部署卡住(上面那条 200 断言就是为此存在)。
+          # 越权风险已经在 identity.resolve 那层堵死, 不该再用状态码兜第二遍。
+
+          # 本地开发的逃生口必须是【显式】的, 且要在 /health 上看得见。
+          os.environ["DESKCORE_ALLOW_ANONYMOUS"] = "1"
+          h = c.get("/health").json()
+          assert h["config"]["anonymous_allowed"] is True, h["config"]
+          assert "dev" in h["config"]["auth"]["note"], h["config"]["auth"]["note"]
+          assert c.post("/tool/list_projects", json={}).status_code != 401
+          os.environ.pop("DESKCORE_ALLOW_ANONYMOUS")
+          assert c.post("/tool/list_projects", json={}).status_code == 401
+          print("  ✓ DESKCORE_ALLOW_ANONYMOUS=1 才放行, 且 /health 回显; 去掉即恢复 401")
 
           # 配坏了(DESKCORE_KEYS 不是合法 JSON) → 必须 401, 【不能】退化成 dev 放行。
           # 生产上一个逗号写错就等于把项目数据和全部写工具匿名开放出去。

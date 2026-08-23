@@ -985,7 +985,84 @@ REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) 
 REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM anon;
 REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM authenticated;
 GRANT EXECUTE ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) TO service_role;
+
+-- ── 调教笔记的 CAS 写入（审计 COR-003 / migrations/002）────────────────────
+-- 为什么必须是 RPC: memory.save_calibration_notes 的乐观并发原本写成
+--   .eq("calibration_notes", expected_before_text)
+-- PostgREST 把过滤条件放在 **URL query string** 里, 而 calibration_notes 的软
+-- 上限是 4000 字(memory.py:_dedup_calibration_lines)。中文 URL-encode 后一个字
+-- 变 9 个字符 —— 4000 字 ≈ 36KB 的查询串, 远超网关(nginx/Kong)对单行请求头的
+-- 上限。越线之后每一次 CAS 写入都 414/400, 而 memory._append_new_observations
+-- 的 `except Exception: return None` 把它吞掉:
+--   迭代 / 手动精修 / 整批反思 / merger_taste 四条自动学习路径【全部静默停写】,
+--   用户以为在学、其实笔记早就不动了, 且没有任何告警。
+--
+-- 改成把 witness 压成 md5 送进 body: 请求大小与笔记长度解耦, 32 字节定长。
+-- md5 在这里【只做变更检测】, 不是安全用途 —— 冲突的后果是多重试一轮。
+--
+-- 空 witness 的语义是"我读到的是没有笔记": COALESCE 让 NULL 与 '' 都落到
+-- md5('') 上, 顺带把 R-036 那个 `.eq("", ...)` 匹配不到 NULL 行的特例消掉了
+-- (从未写过笔记的项目该列是 NULL 而不是 '')。
+--
+-- SECURITY INVOKER(默认): 以调用者身份跑, projects_owner 那条 RLS 照常生效,
+-- 用户改不了别人的项目。search_path 固定, 同 deskcore 两个 RPC 的处理。
+CREATE OR REPLACE FUNCTION update_calibration_notes_cas(
+    _project_id   UUID,
+    _expected_md5 TEXT,
+    _notes        TEXT
+)
+RETURNS TABLE(id UUID, calibration_notes TEXT)
+LANGUAGE sql
+SECURITY INVOKER
+SET search_path = pg_catalog, autowriter
+AS $$
+    UPDATE autowriter.projects p
+       SET calibration_notes = _notes
+     WHERE p.id = _project_id
+       AND md5(COALESCE(p.calibration_notes, '')) = _expected_md5
+    RETURNING p.id, p.calibration_notes;
+$$;
+REVOKE ALL ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT) FROM anon;
+GRANT EXECUTE ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT)
+    TO authenticated, service_role;
 """
+
+
+# ── 写入返回 0 行的统一处理（审计 COR-010）────────────────────────────────
+
+class WriteReturnedNoRow(RuntimeError):
+    """一次 INSERT/UPDATE 期望回一行、实际 0 行。
+
+    PostgREST 对"匹配 0 行"的 UPDATE **不报错**, 只返回空 data(行已被并发删除 /
+    被 RLS 拦下 / id 根本不存在)。全库有十余处直接 ``res.data[0]`` ——
+    那会抛 ``IndexError: list index out of range``, 在 Streamlit 上表现为一片
+    红屏, 既看不出是哪一步、也不知道该怎么办。
+
+    ``update_version_content``(:1291-1299) 早就为同一个问题做过处理, 但只修了
+    那一个函数。本异常 + ``_first_row`` 把口径推广到全部写入点。
+    """
+
+
+def _first_row(res, op: str, **ctx) -> dict:
+    """取写入返回的第一行; 0 行时抛 ``WriteReturnedNoRow``(带可读上下文)。
+
+    ``res`` 允许为 None —— 调用方的重试循环理论上总会给它赋值, 但真为 None 时
+    抛本异常也比 ``AttributeError`` 有用。
+    """
+    rows = getattr(res, "data", None) or []
+    if rows:
+        return rows[0]
+    ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items() if v)
+    telemetry.log_event(
+        "write_returned_no_row", op=op,
+        **{k: str(v)[:80] for k, v in ctx.items() if v},
+    )
+    raise WriteReturnedNoRow(
+        f"{op} 没有返回任何行（{ctx_str or '无上下文'}）。"
+        "常见原因：这行已被并发删除、或当前登录账号无权改它（RLS）。"
+        "刷新页面后重试；仍失败请把这条信息发给开发者。"
+    )
 
 
 # ── Project CRUD ──────────────────────────────────────────────────────────
@@ -1032,7 +1109,7 @@ def create_project(
     }
     res = client.table("projects").insert(data).execute()
     list_projects.clear()
-    return res.data[0]
+    return _first_row(res, "创建项目", name=name, user_id=user_id)
 
 
 def _record_schema_drift(missing_cols: list[str]) -> None:
@@ -1111,12 +1188,68 @@ def update_project(client: Client, project_id: str, updates: dict) -> dict:
         # R-027: 不再静默——把缺失列塞 session_state 让主页面显式告警一次。
         _record_schema_drift(all_missing)
     list_projects.clear()
-    return res.data[0]
+    return _first_row(res, "保存项目设置", project_id=project_id)
 
 
 def delete_project(client: Client, project_id: str) -> None:
     client.table("projects").delete().eq("id", project_id).execute()
     list_projects.clear()
+
+
+class CalibrationCasRpcMissing(RuntimeError):
+    """``update_calibration_notes_cas`` RPC 还没部署(migrations/002 没跑)。
+
+    调用方据此退回旧的全文 witness 路径 —— 那条路在笔记短时是好的, 只有超过
+    网关 URL 上限才会失败。硬失败会让未迁移的部署彻底学不动, 比现状更糟。
+    """
+
+
+def update_calibration_notes_cas(
+    client: Client,
+    project_id: str,
+    expected_before_text: str,
+    notes: str,
+) -> Optional[dict]:
+    """带 CAS 的 calibration_notes 写入 —— witness 走 md5, 不进 URL(COR-003)。
+
+    返回被更新的行; **返回 None 表示 CAS 冲突**(别的写入抢先改了这一列, 调用方
+    应重读重试)。RPC 不存在时抛 ``CalibrationCasRpcMissing``。
+
+    为什么不能沿用 ``.eq("calibration_notes", <全文>)``: PostgREST 把过滤条件放
+    在 URL query string 里, 而这一列的软上限是 4000 字。中文 URL-encode 后一个
+    字变 9 个字符, 越过网关的请求行上限之后**每一次**自动学习写入都失败, 并被
+    上层 ``except Exception: return None`` 吞掉。详见 CREATE_TABLES_SQL 里
+    ``update_calibration_notes_cas`` 那段注释。
+
+    md5 在这里只做变更检测(冲突的代价是多重试一轮), 不是安全用途。
+    """
+    expected_md5 = hashlib.md5(
+        (expected_before_text or "").encode("utf-8"), usedforsecurity=False,
+    ).hexdigest()
+    try:
+        res = client.rpc("update_calibration_notes_cas", {
+            "_project_id":   project_id,
+            "_expected_md5": expected_md5,
+            "_notes":        notes,
+        }).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if ("could not find the function" in msg
+                or "does not exist" in msg
+                or "pgrst202" in msg):
+            raise CalibrationCasRpcMissing(str(exc)[:200]) from exc
+        raise
+    rows = res.data or []
+    if not rows:
+        return None          # CAS 冲突: 并发已经改过这一列
+    # RPC 绕过 db.update_project, 必须自己失效 list_projects(ttl=60)。否则
+    # "刚沉淀完笔记就排下一批"时, 队列 worker 从缓存拿旧 project 行拼 prompt,
+    # 刚学的笔记看不到 —— 体感"学了没生效"。(R-036 同款理由)
+    try:
+        list_projects.clear()
+    except Exception:
+        pass
+    return rows[0]
 
 
 # ── Batch CRUD ─────────────────────────────────────────────────────────────
@@ -1138,7 +1271,7 @@ def create_batch(
     }
     res = client.table("batches").insert(data).execute()
     list_batches.clear()
-    return res.data[0]
+    return _first_row(res, "创建批次", project_id=project_id, user_id=user_id)
 
 
 @_cache_data(ttl=30, show_spinner=False)
@@ -1229,7 +1362,7 @@ def create_item(
     if ai_review_notes:
         data["ai_review_notes"] = ai_review_notes
     res = client.table("items").insert(data).execute()
-    return res.data[0]
+    return _first_row(res, "创建条目", batch_id=batch_id, user_id=user_id)
 
 
 def delete_items(client: Client, item_ids: list[str]) -> None:
@@ -1699,7 +1832,7 @@ def update_item_status(
         list_items.clear()
     except Exception:
         pass
-    return res.data[0]
+    return _first_row(res, "更新条目状态", item_id=item_id, status=status)
 
 
 def save_feedback_draft(client: Client, item_id: str, draft: str) -> None:
@@ -1808,7 +1941,7 @@ def create_version(
         list_items.clear()
     except Exception:
         pass
-    return res.data[0]
+    return _first_row(res, "创建版本", item_id=item_id, version_num=next_num)
 
 
 def list_versions(client: Client, item_id: str) -> list[dict]:
@@ -2214,7 +2347,7 @@ def _upsert_memory_locked(
             data.pop(col, None)
         res = client.table("memories").insert(data).execute()
     _invalidate_memory_caches()
-    return res.data[0]
+    return _first_row(res, "写入记忆", scope=scope, content=content[:60])
 
 
 def insert_calibration_audit(
@@ -2497,7 +2630,7 @@ def increment_memory_frequency(client: Client, memory_id: str) -> dict:
         .execute()
     )
     _invalidate_memory_caches()
-    return res.data[0]
+    return _first_row(res, "累加记忆频次", memory_id=memory_id)
 
 
 def update_memory(client: Client, memory_id: str, updates: dict) -> dict:
@@ -2505,7 +2638,7 @@ def update_memory(client: Client, memory_id: str, updates: dict) -> dict:
         client.table("memories").update(updates).eq("id", memory_id).execute()
     )
     _invalidate_memory_caches()
-    return res.data[0]
+    return _first_row(res, "更新记忆", memory_id=memory_id)
 
 
 def delete_memory(client: Client, memory_id: str) -> None:
@@ -2533,7 +2666,7 @@ def set_item_example_label(
             fn.clear()
         except Exception:
             pass
-    return res.data[0]
+    return _first_row(res, "标记正负例", item_id=item_id, label=label)
 
 
 @_cache_data(ttl=120, show_spinner=False)
@@ -3533,7 +3666,7 @@ def insert_job(
     if project_id:
         row["project_id"] = project_id
     res = client.table("jobs").insert(row).execute()
-    return res.data[0]
+    return _first_row(res, "入队任务", kind=kind, user_id=user_id)
 
 
 def get_job(client: Client, job_id: str) -> Optional[dict]:

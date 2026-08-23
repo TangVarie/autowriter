@@ -99,18 +99,19 @@ def shared_memories(sb, project_id: str,
                     .eq("scope", "global").eq("user_id", user_id))
             if user_id else [])
 
-    now = datetime.now(timezone.utc)
-
-    def _active(m: dict) -> bool:
-        mu = m.get("muted_until")
-        if not mu:
-            return True
-        try:
-            return datetime.fromisoformat(str(mu).replace("Z", "+00:00")) < now
-        except (ValueError, TypeError):
-            return True
-
-    rows = [m for m in (glob + proj) if _active(m) and (m.get("content") or "").strip()]
+    # ⚠️ 静音判定必须复用 db.is_memory_muted_now, 不能在这里自己写一份
+    # (审计 COR-007)。本地那版直接 datetime.fromisoformat 后与 aware now 比较,
+    # 遇到两类真实数据会抛 TypeError/ValueError 被 except 吞掉 → 返回 True →
+    # 【被静音的规则照常注入 P0/P1】:
+    #   · muted_until 存成 naive ISO(无时区后缀)  → naive < aware 抛 TypeError
+    #   · 某些 PG client 回 7 位微秒               → fromisoformat 只吃 6 位
+    # db.is_memory_muted_now(:2819-2856) 正是为这两种输入写的, 它把 naive 按
+    # UTC 解释、截掉多余微秒, 并在解析失败时保守返回"未静音"。判据只留一处。
+    rows = [
+        m for m in (glob + proj)
+        if not db.is_memory_muted_now(m.get("muted_until"))
+        and (m.get("content") or "").strip()
+    ]
     for r in rows:
         if "embedding" in r:
             r["embedding"] = db._parse_pgvector(r.get("embedding"))   # R-034, 见上
@@ -292,6 +293,38 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str) -> bool:
 PAGE = 1000        # PostgREST 默认 max-rows, 见下方说明
 
 
+def _paged(build, *, page: int = PAGE, hard_cap: int | None = None) -> list[dict]:
+    """按 offset 翻页拉全一个查询的结果(审计 COR-005 / COR-006)。
+
+    ``build(offset, limit)`` 必须**每次从 sb.table(...) 重新构造** query ——
+    postgrest-py 复用同一个 builder 时 ``.order()`` 会追加、``.range()`` 的偏移
+    会叠加(db.py 的 list_items_for_batches 回归用例专门盯着这一点)。
+
+    ⚠️ 终止判据是【空页】而不是【短页】。PostgREST 的 ``db-max-rows`` 会把请求
+    钳短: 服务端上限低于 ``page`` 时**每一页都是短页**, 但后面明明还有行 ——
+    按短页收工就是又一次静默截断, 正是本函数要根治的东西
+    (db.py:1657-1665 为同一个坑留过完整说明)。代价只是末尾多发一次拿到空页
+    的请求。
+
+    offset 按【实收行数】前进, 不是按 ``page``: 服务端钳短时按 page 跳会直接
+    漏掉中间那一段。
+
+    ``hard_cap`` 非空时最多取这么多行(调用方的上界), 到顶即停。
+    """
+    out: list[dict] = []
+    offset = 0
+    while True:
+        want = page if hard_cap is None else min(page, hard_cap - len(out))
+        if want <= 0:
+            break
+        rows = build(offset, want).execute().data or []
+        out.extend(rows)
+        if not rows:
+            break
+        offset += len(rows)
+    return out
+
+
 def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bool]:
     """项目【全量】历史指纹。返回 (rows, truncated)。
 
@@ -347,21 +380,33 @@ def legacy_versions(sb, project_id: str, limit: int = 5000) -> list[dict]:
 
     只取每个 item 的 best/最新版本(与 db.list_example_items 同口径), 因为中间
     的迭代版本不是"发出去的东西", 拿它们当查重基线会误伤后续正常改写。
+
+    ⚠️ 必须翻页(审计 COR-006)。原来是裸 ``.limit(5000)`` —— 而 PostgREST 的
+    ``db-max-rows`` 默认 1000, 服务端会把它**静默钳到 1000**。于是回填只覆盖
+    最近 1000 条 item, 却报出一个看起来像全量的 total: 更老的稿子从来没进过
+    指纹库, 跟它们的重复永远查不出来。而"比对全量历史"正是这套硬闸的卖点。
+    ``id`` 做次级排序键: bulk insert 下 created_at 大量并列, 只按它翻页会漏行。
     """
     try:
-        res = (sb.table("items")
-                 .select("id, best_version_id, user_id, created_at, "
-                         "versions(id, title, body, version_num, embedding), "
-                         "batches!inner(project_id)")
-                 .eq("batches.project_id", project_id)
-                 .order("created_at", desc=True)
-                 .limit(limit).execute())
+        rows = _paged(
+            lambda off, lim: (
+                sb.table("items")
+                  .select("id, best_version_id, user_id, created_at, "
+                          "versions(id, title, body, version_num, embedding), "
+                          "batches!inner(project_id)")
+                  .eq("batches.project_id", project_id)
+                  .order("created_at", desc=True)
+                  .order("id", desc=True)
+                  .range(off, off + lim - 1)
+            ),
+            hard_cap=limit,
+        )
     except Exception:
         logger.exception("read legacy versions failed (project=%s)", project_id)
         raise
 
     out: list[dict] = []
-    for item in (res.data or []):
+    for item in rows:
         versions = item.get("versions") or []
         if not versions:
             continue
@@ -384,12 +429,24 @@ def legacy_versions(sb, project_id: str, limit: int = 5000) -> list[dict]:
 
 
 def existing_fingerprint_version_ids(sb, project_id: str) -> set[str]:
-    """已经有指纹的 version_id —— 回填要幂等, 重跑不能造重复行。"""
+    """已经有指纹的 version_id —— 回填要幂等, 重跑不能造重复行。
+
+    ⚠️ 必须翻页(审计 COR-005)。这是**幂等性本身所依赖的那个集合**: 原来是一次
+    裸 select 无 limit 无翻页, 被 PostgREST 的 ``db-max-rows``(默认 1000)静默
+    截断之后, 超出的 version_id 看起来"还没有指纹" —— 重跑 backfill 会给它们
+    **再插一遍**。而重复指纹会抬高后续 Jaccard / 余弦, 把正常选题误判成撞车。
+    幂等的读一旦不全, 幂等就是假的, 且没有任何报错。
+    ``id`` 做排序键保证翻页确定(主键唯一稳定)。
+    """
     try:
-        res = (sb.table("draft_fingerprints").select("version_id")
-                 .eq("project_id", project_id)
-                 .not_.is_("version_id", "null").execute())
-        return {r["version_id"] for r in (res.data or []) if r.get("version_id")}
+        rows = _paged(lambda off, lim: (
+            sb.table("draft_fingerprints").select("version_id")
+              .eq("project_id", project_id)
+              .not_.is_("version_id", "null")
+              .order("id")
+              .range(off, off + lim - 1)
+        ))
+        return {r["version_id"] for r in rows if r.get("version_id")}
     except Exception:
         logger.exception("read existing fingerprint version_ids failed")
         raise
@@ -401,14 +458,24 @@ def fingerprints_missing_vectors(sb, project_id: str, limit: int = 2000) -> list
     为什么不能靠 backfill 补: backfill 扫的是 items × versions, 而 WorkBuddy
     写的稿子 version_id 是空的、根本不在 autowriter.versions 里。欠费那几天
     commit 进来的行, backfill 永远看不到 —— 只能从指纹表这一侧修。
+
+    ⚠️ 同 legacy_versions: 裸 ``.limit(2000)`` 会被服务端钳到 db-max-rows,
+    reembed 一次只修最近的那批却报"补完了"(审计 COR-006)。翻页取全, ``id``
+    做次级键。整批读完之后才开始写(set_fingerprint_vector), 所以翻页期间
+    过滤条件不会被自己改动影响。
     """
-    res = (sb.table("draft_fingerprints").select("id, title")
-             .eq("project_id", project_id)
-             .is_("title_embedding", "null")
-             .neq("title", "")
-             .order("created_at", desc=True)
-             .limit(limit).execute())
-    return res.data or []
+    return _paged(
+        lambda off, lim: (
+            sb.table("draft_fingerprints").select("id, title")
+              .eq("project_id", project_id)
+              .is_("title_embedding", "null")
+              .neq("title", "")
+              .order("created_at", desc=True)
+              .order("id", desc=True)
+              .range(off, off + lim - 1)
+        ),
+        hard_cap=limit,
+    )
 
 
 def set_fingerprint_vector(sb, row_id: str, vec: list[float], model: str) -> bool:

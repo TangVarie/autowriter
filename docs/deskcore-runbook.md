@@ -87,11 +87,12 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 |---|---|---|
 | `SUPABASE_URL` | ✅ | 与主服务同一套 |
 | `SUPABASE_SERVICE_ROLE_KEY` | ✅ | service_role，绕 RLS |
-| `DESKCORE_KEYS` | ✅ 生产必需 | 见下方格式 |
+| `DESKCORE_KEYS` | ✅ **必需** | 见下方格式。不配 = 所有请求 401（ROB-003 起 fail-closed，不再匿名放行） |
 | `GOOGLE_API_KEY` | 强烈建议 | 没有的话查重降级成纯确定性，同角度换说法的标题会漏 |
 | `LIBRARIAN_URL` | 建议 | `https://truth-vault-production.up.railway.app`（已验活） |
 | `LIBRARIAN_API_KEY` | 建议 | = TV librarian 那把 key |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔；设了才开 MCP 的 Host 校验 |
+| `DESKCORE_ALLOW_ANONYMOUS` | ⛔ 仅本地 | 设 `1` 才允许免 key 访问。**生产绝不能设** —— service_role 绕 RLS，匿名 = 全租户数据开放 |
 
 `DESKCORE_KEYS` 格式（**一人一把**，key 映射成 `user_id`，这是"个人风格私有"的前提）：
 

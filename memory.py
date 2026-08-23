@@ -834,6 +834,45 @@ class _CalibrationCASConflict(Exception):
     re-read and retry the merge."""
 
 
+def _legacy_cas_update(
+    db_client: Client,
+    project_id: str,
+    expected_before_text: str,
+    deduped: str,
+) -> Optional[dict]:
+    """migrations/002 未跑时的 CAS 退路：全文 witness 走 PostgREST 过滤。
+
+    返回被更新的行；None = CAS 冲突。**已知缺陷**（正是 COR-003 / migrations/002
+    要消灭的那个）：witness 进 URL query，笔记长到一定程度后网关直接拒收，
+    此处会抛异常而不是返回 None —— 由 ``save_calibration_notes`` 的 except
+    捕获并埋 ``calibration_save_error``。
+
+    R-036: 空 witness 的语义是"我读到的是无既有笔记"。``calibration_notes``
+    nullable 无默认，从未写过笔记的项目该列是 NULL 而不是 ""，``.eq("")``
+    匹配不到 NULL 行 → 0 行被当成冲突 → 首次自动学习永远存不进（下次重试还
+    冲突，死循环）。用 or 同时覆盖 NULL 与 ''；并发若已写入真笔记，该行不再
+    null/空 → 仍正确判为冲突。
+    （md5 RPC 路径靠 ``COALESCE(...,'')`` 天然覆盖这两态，不需要这个特例。）
+    """
+    q = (
+        db_client.table("projects")
+        .update({"calibration_notes": deduped})
+        .eq("id", project_id)
+    )
+    if expected_before_text == "":
+        q = q.or_("calibration_notes.is.null,calibration_notes.eq.")
+    else:
+        q = q.eq("calibration_notes", expected_before_text)
+    rows = q.execute().data or []
+    if not rows:
+        return None
+    try:
+        db.list_projects.clear()
+    except Exception:
+        pass
+    return rows[0]
+
+
 def save_calibration_notes(
     db_client: Client,
     project_id: str,
@@ -861,10 +900,18 @@ def save_calibration_notes(
     不再有"看似成功实际失败"的状态。
 
     并发安全（2026-05）：``expected_before_text`` 给读-合-写的调用方一个 CAS
-    witness。传入时，本函数用 ``.eq("calibration_notes", expected_before_text)``
-    限定更新条件；并发改动后 0 行受影响 → 抛 ``_CalibrationCASConflict`` 让
-    调用方重读重试。不传则走传统覆盖写（用户手动编辑保存场景，意图明确为
+    witness。传入时，本函数把 witness 压成 md5 后走 ``update_calibration_notes_cas``
+    RPC 限定更新条件；并发改动后 0 行受影响 → 抛 ``_CalibrationCASConflict``
+    让调用方重读重试。不传则走传统覆盖写（用户手动编辑保存场景，意图明确为
     "我想要这份文本"）。
+
+    witness 为什么走 md5 而不是原文（2026-08-23 审计 COR-003）：原实现是
+    ``.eq("calibration_notes", expected_before_text)``，而 PostgREST 把过滤条件
+    放进 **URL query string**，这一列的软上限却有 4000 字。中文 URL-encode 后
+    一个字变 9 个字符，越过网关请求行上限之后**每一次**自动学习写入都失败，
+    并被 ``_append_new_observations`` 的 ``except`` 吞掉——四条学习路径静默
+    停摆，笔记越有价值（越长）越先坏。压成 32 字节 md5 后请求大小与笔记长度
+    彻底解耦。RPC 未部署（migrations/002 没跑）时退回 ``_legacy_cas_update``。
     """
     dropped: list[str] = []
     deduped = _dedup_calibration_lines(notes or "", dropped_sink=dropped)
@@ -884,36 +931,31 @@ def save_calibration_notes(
 
     try:
         if expected_before_text is not None:
-            # CAS 路径：直接走 supabase client 加约束，绕过 update_project
-            # 的 schema-fallback（calibration_notes 是稳定列，不在 fallback 名单）
-            _q = (
-                db_client.table("projects")
-                .update({"calibration_notes": deduped})
-                .eq("id", project_id)
-            )
-            if expected_before_text == "":
-                # R-036 review: calibration_notes 列 nullable 无默认 —— 从未写过
-                # 笔记的项目该列是 NULL, 不是 ""。witness 是 "" 时 .eq 匹配不到
-                # NULL 行 → 0 行被当成冲突 → 无笔记项目的"首次自动学习"永远存不
-                # 进、批次永不标记 calibrated(下次重试还冲突, 死循环)。空 witness
-                # 的语义是"我读到的是无既有笔记", NULL 与 "" 都属此态, 用 or 覆盖
-                # 两者 —— 既修首次学习回归, 又保留并发 lost-update 保护(若并发
-                # 已写入真笔记, 该行不再 null/空 → 0 行 → 仍判冲突)。
-                _q = _q.or_("calibration_notes.is.null,calibration_notes.eq.")
-            else:
-                _q = _q.eq("calibration_notes", expected_before_text)
-            res = _q.execute()
-            if not res.data:
+            # CAS 路径：witness 走 md5 RPC，**不再把全文塞进 URL query**。
+            # 审计 COR-003: 旧写法是 .eq("calibration_notes", <全文>)，而这一列
+            # 的软上限是 4000 字；中文 URL-encode 后 ≈36KB 的查询串越过网关上限，
+            # 之后每一次自动学习写入都失败并被上层静默吞掉。详见
+            # db.update_calibration_notes_cas 与 CREATE_TABLES_SQL 里的说明。
+            try:
+                row = db.update_calibration_notes_cas(
+                    db_client, project_id, expected_before_text, deduped,
+                )
+            except db.CalibrationCasRpcMissing:
+                # migrations/002 还没跑：退回旧的全文 witness。短笔记照常工作，
+                # 长笔记仍会撞上原来的坑 —— 所以要留痕提醒运维去跑迁移，而不是
+                # 让它继续无声。
+                telemetry.log_event(
+                    "calibration_cas_rpc_missing",
+                    project_id=project_id, source=source,
+                    hint="run migrations/002_calibration_cas.sql",
+                    witness_chars=len(expected_before_text),
+                )
+                row = _legacy_cas_update(
+                    db_client, project_id, expected_before_text, deduped,
+                )
+            if row is None:
                 # 0 行受影响：并发已经改了 calibration_notes
                 raise _CalibrationCASConflict()
-            # R-036: CAS 路径绕过 db.update_project, 必须自己失效
-            # list_projects 缓存(ttl=60)。否则"迭代沉淀笔记 → 马上排队
-            # 下一批"时, 队列 worker 从缓存拿旧 project 行拼 prompt,
-            # 刚学的笔记看不到 —— 体感"学了没生效"。
-            try:
-                db.list_projects.clear()
-            except Exception:
-                pass
         else:
             db.update_project(db_client, project_id, {"calibration_notes": deduped})
     except _CalibrationCASConflict:

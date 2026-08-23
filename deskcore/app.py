@@ -24,6 +24,9 @@
   env:    SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY   (service_role, 绕 RLS)
           GOOGLE_API_KEY          embedding; 不设则查重降级为纯确定性
           DESKCORE_KEYS 或 DESKCORE_API_KEY + DESKCORE_DEFAULT_USER_ID
+          ⚠️ 【必填】。都不配时所有请求 401(ROB-003 起 fail-closed) —— 本服务
+             持 service_role 绕 RLS, 匿名放行等于开放全部租户数据。本地开发
+             要免 key 跑, 显式设 DESKCORE_ALLOW_ANONYMOUS=1。
           LIBRARIAN_URL / LIBRARIAN_API_KEY          借爆款经验卡; 不设则跳过
           DESKCORE_ALLOWED_HOSTS  可选, 逗号分隔; 设了才开 MCP 的 Host 校验
           ⚠️ 【不需要】ANTHROPIC_API_KEY / DESKCORE_MODEL —— deskcore 不调 LLM,
@@ -168,7 +171,9 @@ def health() -> dict:
 
     vocab_ok, vocab_note = vocab.vendor_checksum_ok()
     emb_ok = dedup.embeddings_available()
-    auth_ok, _auth_note = identity.auth_health()
+    # 只调一次 —— 之前顶上算 auth_ok、下面回显时又调了一遍, 两次之间 env 若
+    # 被改过, 回显的 note 和参与 ok 的判断会对不上。
+    auth_ok, auth_note = identity.auth_health()
 
     return {
         "ok": db_ok and vocab_ok and auth_ok,
@@ -197,9 +202,14 @@ def health() -> dict:
             },
             "librarian": {"configured": bool(os.environ.get("LIBRARIAN_URL")
                                              or getattr(config, "LIBRARIAN_URL", ""))},
-            # auth_health 会把"配了但坏了"跟"没配"分开 —— 前者所有请求都 401,
-            # 服务实际不可用, 必须当场看得见(不能像以前那样静默退化成全放行)。
-            "auth": dict(zip(("ok", "note"), identity.auth_health())),
+            # auth_health 把三态分开: 配好了 / 配了但坏了(全 401) / 没配。
+            # ROB-003 之后"没配"也是全 401 —— 不再静默放行, 只有显式设了
+            # DESKCORE_ALLOW_ANONYMOUS=1 才放行(那时 note 里会写明是 dev 模式)。
+            # 注意 /health 本身仍返 200: Railway 只看状态码, 而库瞬断这种可恢复
+            # 故障不该把整个部署卡住。真正的越权风险已经在 identity.resolve
+            # 那一层 fail-closed 掉了, 不靠状态码兜。
+            "auth": {"ok": auth_ok, "note": auth_note},
+            "anonymous_allowed": identity.anonymous_allowed(),
             "st_cache_disabled": os.environ.get("AW_DISABLE_ST_CACHE"),
         },
     }
