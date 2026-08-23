@@ -126,7 +126,7 @@ def get_service_client() -> Client:
 
 CREATE_TABLES_SQL = """
 -- Enable UUID extension
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA extensions;
 
 -- Projects
 CREATE TABLE IF NOT EXISTS projects (
@@ -272,7 +272,7 @@ CREATE POLICY versions_owner ON versions
 -- Requires the pgvector extension (Supabase: Database → Extensions → enable
 -- "vector" once).  Nullable so legacy rows stay readable; a backfill helper
 -- populates them lazily.
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
 ALTER TABLE versions ADD COLUMN IF NOT EXISTS embedding vector(768);
 CREATE INDEX IF NOT EXISTS versions_embedding_idx
     ON versions USING ivfflat (embedding vector_cosine_ops);
@@ -829,6 +829,11 @@ CREATE OR REPLACE FUNCTION deskcore_reserve_angles(
 )
 RETURNS TABLE(reserved_key TEXT, reserved_dims JSONB)
 LANGUAGE plpgsql
+-- 与 migrations/001_deskcore.sql 保持一致。fresh install 走本文件、已有库走
+-- migrations/ —— 只改一边的话, 新建的库照旧 function_search_path_mutable
+-- 且保留可变 search_path。(codex aw#57 review; migrations/README 也写了
+-- "加表/加列必须两边都改", 函数同理)
+SET search_path = pg_catalog, extensions
 AS $$
 DECLARE
     cand  JSONB;
@@ -901,6 +906,7 @@ CREATE OR REPLACE FUNCTION deskcore_commit_fingerprints(
 )
 RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, extensions   -- 见上; ::vector 需要 extensions
 AS $$
 DECLARE
     r        JSONB;
@@ -1648,7 +1654,13 @@ def list_items_for_batches(
             break
         page = res.data or []
         _bucket_items(page, grouped)
-        if len(page) < page_size:
+        # ⚠️ 终止判据是【空页】而不是【短页】。PostgREST 的 max-rows 会把请求
+        # 钳短: 服务端配的上限低于 page_size 时, 每一页都是"短页"但后面明明还有行。
+        # 按 len(page) < page_size 收工 = 又一次静默截断, 正是本函数要治的病。
+        # 代价只是末尾多发一次拿到空页的请求。
+        # offset 按【实拿到的行数】前进, 不是按 page_size —— 服务端钳短时按
+        # page_size 跳会直接漏掉中间那段。(codex aw#57 review)
+        if not page:
             break
         offset += len(page)
     return grouped

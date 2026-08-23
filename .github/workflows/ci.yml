@@ -782,22 +782,30 @@ jobs:
           import db
 
           class FakeQ:
-              def __init__(self, rows, log):
+              def __init__(self, rows, log, server_cap=None):
                   self.rows, self.log, self.orders = rows, log, []
+                  self.server_cap = server_cap
               def select(self, *a, **k): return self
               def in_(self, *a, **k): return self
               def order(self, c, **k): self.orders.append(c); return self
               def range(self, lo, hi): self._lo, self._hi = lo, hi; return self
               def execute(self):
                   self.log.append({"order": list(self.orders), "range": (self._lo, self._hi)})
+                  page = self.rows[self._lo:self._hi + 1]
+                  # server_cap 模拟 PostgREST max-rows: 服务端把请求钳短。
+                  # 假件没有这个能力的话,"按短页收工"那个 bug 根本测不出来
+                  # —— 上一版就是这么漏过去的。(codex aw#57 review)
+                  if self.server_cap is not None:
+                      page = page[:self.server_cap]
                   class R: pass
-                  r = R(); r.data = self.rows[self._lo:self._hi + 1]; return r
+                  r = R(); r.data = page; return r
 
           class FakeClient:
               # table() 每次返回【全新】builder —— 实测 postgrest-py 就是这样
               # (复用同一个 builder 时 .order() 会追加、.range() 的 offset 会累积)。
-              def __init__(self, rows): self.rows, self.log = rows, []
-              def table(self, *a, **k): return FakeQ(self.rows, self.log)
+              def __init__(self, rows, server_cap=None):
+                  self.rows, self.log, self.server_cap = rows, [], server_cap
+              def table(self, *a, **k): return FakeQ(self.rows, self.log, self.server_cap)
 
           rows = [{"id": f"i{n:05d}", "batch_id": f"b{n % 50}"} for n in range(1300)]
           c = FakeClient(rows)
@@ -818,6 +826,19 @@ jobs:
           out2 = db.list_items_for_batches(FakeClient(rows[:1000]), [f"b{i}" for i in range(50)])
           assert sum(len(v) for v in out2.values()) == 1000, "恰好 1000 行(旧上界)时丢行"
           print("  ✓ 恰好 1000 行(旧上界)也取全")
+
+          # 服务端把每页钳短(PostgREST max-rows 低于 page_size)时仍要取全 ——
+          # 按"短页收工"就会第一页返回, 正是本改动要治的那个静默截断。
+          c3 = FakeClient(rows, server_cap=137)   # 请求 500, 服务端只给 137
+          out3 = db.list_items_for_batches(c3, [f"b{i}" for i in range(50)])
+          assert sum(len(v) for v in out3.values()) == 1300, (
+              f"服务端钳短时只拿回 {sum(len(v) for v in out3.values())} 行(应 1300)"
+          )
+          # offset 必须按实收行数前进, 否则钳短时会跳过中间那段
+          assert c3.log[1]["range"][0] == 137, (
+              f"第二页从 offset={c3.log[1]['range'][0]} 起(应 137) —— 按 page_size 跳会漏行"
+          )
+          print(f"  ✓ 服务端每页钳到 137 行时仍取全 1300({len(c3.log)} 次请求, offset 按实收前进)")
 
           assert db.list_items_for_batches(FakeClient([]), []) == {}
           print("  ✓ 空 batch_ids → {}")
