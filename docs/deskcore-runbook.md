@@ -205,6 +205,17 @@ WHEN (old.status IS DISTINCT FROM new.status
    OR old.example_label IS DISTINCT FROM new.example_label)
 ```
 
+**反向依赖**：`items.updated_at` 只有跑过本仓 `migrations/001_deskcore.sql` 的库才有——
+TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_schema.sql`
+里的 `items` 只有 `created_at`。TV 那个脚本对【且仅对】"没有这一列"降级回旧口径
+（只按 `created_at`）并大声告警，不会把归档链路打死；但降级之后迟到的人工决策
+会重新开始漏收。**所以新装一套库的时候，001_deskcore 要记得跑。**
+
+> 顺带记一笔口径：TV 那边打印的「创建后被动过」是按 `updated_at > created_at` 数的，
+> 因为上面那个 `WHEN` 对 `status` 和 `example_label` 都刷时间戳，**它不等于
+> 「迟到的审稿决定」有多少条**。库里没有 `status` 专属的时间戳，想要更细的口径
+> 得先加一个。
+
 ---
 
 ## 4. 待办
