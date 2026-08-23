@@ -2,7 +2,9 @@
 
 内容工作台的能力内核，做成 MCP 工具服务。**Streamlit 界面停用，库里的积累一条不迁。**
 
-完整设计与接入见 [`docs/deskcore.md`](../docs/deskcore.md)。决策在 truth-vault：`DECISIONS.md` D-041 / `docs/10-sister-repo-followups.md` R-034。
+完整设计见 [`docs/deskcore.md`](../docs/deskcore.md)；**上线手册 / 对接 / 待办 / 已知不一致**见 [`docs/deskcore-runbook.md`](../docs/deskcore-runbook.md)。决策在 truth-vault：`DECISIONS.md` D-041 / `docs/10-sister-repo-followups.md` R-034。
+
+> ⚠️ 截至 2026-08-23，**本服务尚未部署**，`draft_fingerprints` / `angle_ledger` / `user_calibration_notes` / `style_edits` 四张表都是 0 行。上线步骤看 runbook §2。
 
 ## 它解决什么
 
