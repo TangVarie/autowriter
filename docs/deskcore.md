@@ -235,7 +235,15 @@ curl -sS -X POST "$DESKCORE_URL/tool/list_projects" \
 
 skill 放 `~/.workbuddy/skills/bywood-writing-desk/SKILL.md`（本仓 `skills/` 下直接复制）。
 
-> ⚠️ **鉴权头的退路**：WorkBuddy 的 HTTP MCP 能不能配自定义 header，官方更新日志只说了支持 HTTP MCP 和 OAuth（v4.7.3），没有权威文档。所以 key **三种传法都收**：`X-Deskcore-Key` header / `Authorization: Bearer` / `?key=` 查询参数。**这一步必须最先验**——协议层不通的话整个形态要换。
+> ⚠️ **鉴权头的退路**：WorkBuddy 的 HTTP MCP 能不能配自定义 header，官方更新日志只说了支持 HTTP MCP 和 OAuth（v4.7.3），没有权威文档。所以 key **三种传法都收**，但**优先级不同**：
+>
+> 1. `X-Deskcore-Key` header —— 首选
+> 2. `Authorization: Bearer` —— 同样安全，平台不认自定义头时用
+> 3. `?key=` 查询参数 —— **最后的退路，能不用就不用**
+>
+> 第三种为什么排最后：**查询串会进日志。** CI 里那次冒烟测试的日志就原样打出了 `POST /tool/list_projects?key=k-good`——换成真 key，它会落进 Railway 的访问日志、中间代理日志、以及任何转发 URL 的地方，而且事后删不掉。真要用它，就当这个 key 已经半公开了：单独发一把、只给那一个平台、发现平台支持 header 之后立刻换掉并从 `DESKCORE_KEYS` 里删掉旧的。
+>
+> **这一步必须最先验**——协议层不通的话整个形态要换。
 
 Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-Deskcore-Key: k-xxx"`。CodeBuddy 同理。
 
