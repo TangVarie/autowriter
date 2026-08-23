@@ -490,10 +490,14 @@ def add_style_edit(sb, project_id: str, user_id: str, **fields) -> None:
 
 
 def recent_style_edits(sb, project_id: str, user_id: str, limit: int = 8) -> list[dict]:
+    """取最近的未吸收精修。**必须带 id** —— 销账要按这批的确切 id 来, 见
+    mark_edits_distilled 的说明。
+    """
     try:
         res = (sb.table("style_edits")
-                 .select("ai_title, ai_body, my_title, my_body, note")
+                 .select("id, ai_title, ai_body, my_title, my_body, note")
                  .eq("project_id", project_id).eq("user_id", user_id)
+                 .eq("distilled", False)
                  .order("created_at", desc=True).limit(limit).execute())
         return res.data or []
     except Exception:
@@ -501,13 +505,29 @@ def recent_style_edits(sb, project_id: str, user_id: str, limit: int = 8) -> lis
         return []
 
 
-def mark_edits_distilled(sb, project_id: str, user_id: str) -> None:
+def mark_edits_distilled(sb, project_id: str, user_id: str,
+                         edit_ids: list[str]) -> int:
+    """把【指定的这几条】精修标记为已吸收。返回真的改到了几行。
+
+    ⚠️ edit_ids 是必需的, 不能退回"把这个人所有未吸收的都标掉"。
+    蒸馏任务是一份【快照】(默认只取最近 8 条), 而笔记只覆盖了快照里那几条。
+    按 user+project 全量销账会吃掉两类不在快照里的行:
+      · 待吸收超过 8 条时, 第 9 条往后的从没进过任何一份笔记
+      · 从"拿到任务"到"写回笔记"之间新 record_edit 进来的那些
+    它们会从 pending_distillation 里消失, 却从来没影响过笔记 —— 用户喂了稿子,
+    计数归零看着正常, 而那几条精修等于白喂。(codex review #56 P1)
+    """
+    if not edit_ids:
+        return 0
     try:
-        (sb.table("style_edits").update({"distilled": True})
-           .eq("project_id", project_id).eq("user_id", user_id)
-           .eq("distilled", False).execute())
+        res = (sb.table("style_edits").update({"distilled": True})
+                 .eq("project_id", project_id).eq("user_id", user_id)
+                 .in_("id", list(edit_ids))
+                 .eq("distilled", False).execute())
+        return len(res.data or [])
     except Exception:
         logger.exception("mark style_edits distilled failed (notes are saved)")
+        return 0
 
 
 def count_pending_distillation(sb, project_id: str, user_id: str) -> int:

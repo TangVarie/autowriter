@@ -476,16 +476,25 @@ jobs:
               def __init__(self, tbl, st): self.t = tbl; self.st = st; self.filters = {}
               def select(self, *a, **k): self.cnt = k.get("count"); return self
               def eq(self, k, v): self.filters[k] = v; return self
+              def in_(self, k, v): self.ids = list(v); return self
               def order(self, *a, **k): return self
-              def limit(self, *a, **k): return self
+              def limit(self, n=None, *a, **k): self.n = n; return self
               def upsert(self, row, *a, **k): self.st.setdefault("saved", []).append(row); return self
-              def update(self, row, *a, **k): self.st["marked"] = True; return self
+              def update(self, row, *a, **k): self.upd = row; return self
               def insert(self, row, *a, **k): self.st.setdefault("edits", []).append(row); return self
               def execute(self):
                   if self.t == "style_edits":
-                      if self.filters.get("distilled") is False:
+                      if getattr(self, "upd", None):          # 销账
+                          ids = getattr(self, "ids", [])
+                          hit = [r for r in self.st.get("rows", []) if r["id"] in ids]
+                          self.st["marked_ids"] = self.st.get("marked_ids", []) + [r["id"] for r in hit]
+                          self.st["pending"] = max(0, self.st.get("pending", 0) - len(hit))
+                          return _Resp(hit)
+                      if getattr(self, "cnt", None) == "exact":
                           return _Resp([], self.st.get("pending", 0))
-                      return _Resp(self.st.get("rows", []), len(self.st.get("rows", [])))
+                      rows = self.st.get("rows", [])
+                      n = getattr(self, "n", None)      # insert 路径不调 limit()
+                      return _Resp(rows[:n] if n else rows, len(rows))
                   if self.t == "user_calibration_notes":
                       return _Resp([{"notes": self.st.get("notes", ""),
                                      "updated_at": "2026-01-01"}])
@@ -494,29 +503,41 @@ jobs:
               def __init__(self, st): self.st = st
               def table(self, t): return _Q(t, self.st)
 
-          EDIT = {"ai_title": "AI标题", "ai_body": "AI正文",
+          EDIT = {"id": "e1", "ai_title": "AI标题", "ai_body": "AI正文",
                   "my_title": "我改的标题", "my_body": "我改的正文", "note": "太夸张"}
 
           # ── 1. build_distillation_task 出材料, 【不调 LLM】 ───────────────────
-          st = {"rows": [EDIT], "notes": "已有笔记第一条"}
+          st = {"rows": [EDIT], "notes": "已有笔记第一条", "pending": 1}
           task = C.build_distillation_task(_SB(st), "p1", user_id="u1")
           for k in ("instruction", "existing_notes", "edits", "edit_count"):
               assert k in task, f"蒸馏任务少了 {k}: {task}"
           assert task["existing_notes"] == "已有笔记第一条"
           assert "我改的标题" in task["edits"] and "太夸张" in task["edits"]
           assert task["edit_count"] == 1
+          assert task["edit_ids"] == ["e1"], task.get("edit_ids")
           # 口径必须由服务端给, 不能让每个平台自己发挥
           assert "铁律" in task["instruction"] and len(task["instruction"]) > 100
-          print(f"  ✓ 蒸馏任务含 instruction/existing_notes/edits({task['edit_count']} 条)")
+          print(f"  ✓ 蒸馏任务含 instruction/existing_notes/edits/edit_ids({task['edit_count']} 条)")
           assert C.build_distillation_task(_SB({"rows": []}), "p1", user_id="u1") is None
           print("  ✓ 没有精修时返回 None(不硬造任务)")
 
+          # 待吸收多于一次快照时要明说, 别让人以为一次吸收完了
+          many = [dict(EDIT, id=f"e{i}") for i in range(12)]
+          t2 = C.build_distillation_task(_SB({"rows": many, "pending": 12, "notes": ""}),
+                                         "p1", user_id="u1", max_edits=8)
+          assert t2["edit_count"] == 8 and len(t2["edit_ids"]) == 8, t2["edit_count"]
+          assert t2.get("more_pending") == 4, t2.get("more_pending")
+          print("  ✓ 12 条待吸收 → 本批 8 条 + 明说还剩 4 条(more_pending)")
+
           # ── 2. record_edit 把任务交出去, 并【明说没做完】 ────────────────────
-          st = {"rows": [EDIT], "notes": ""}
-          out = C.record_edit(_SB(st), "p1", user_id="u1", **EDIT)
+          st = {"rows": [EDIT], "notes": "", "pending": 1}
+          # EDIT 带 id(那是库里的行), record_edit 的入参没有 id, splat 前摘掉
+          EDIT_IN = {k: v for k, v in EDIT.items() if k != "id"}
+          out = C.record_edit(_SB(st), "p1", user_id="u1", **EDIT_IN)
           assert out["stored"] is True
           assert "distillation_task" in out, out
           assert "save_my_style" in out["next_step"], out["next_step"]
+          assert "edit_ids" in out["next_step"], "next_step 要教把 edit_ids 传回来"
           assert "白喂" in out["next_step"] or "没做完" in out["next_step"], out["next_step"]
           print("  ✓ record_edit 返回任务 + 明确的 next_step(指名 save_my_style)")
           # AI 版与手改版一样 = 不是有效信号, 不该入库也不该发任务
@@ -525,14 +546,31 @@ jobs:
           assert out2["stored"] is False and "distillation_task" not in out2
           print("  ✓ 没真改的对子不入库、不发蒸馏任务")
 
-          # ── 3. save_my_style 写回 + 销账 ─────────────────────────────────────
-          st = {"rows": [EDIT], "notes": "旧"}
+          # ── 3. save_my_style 只销【传进来的那几条】的账 ──────────────────────
+          # ⚠️ 这是本 PR 第一版的 P1: 原来按 user+project 把所有未吸收的都标掉,
+          # 而笔记只覆盖了快照里那 8 条。快照外的行(第 9 条往后、以及拿到任务
+          # 之后新 record_edit 进来的)会从 pending 里消失却从没影响过笔记 ——
+          # 用户喂了稿子, 计数归零看着正常, 那几条等于白喂。
+          rows = [dict(EDIT, id=f"e{i}") for i in range(3)]
+          st = {"rows": rows, "notes": "旧", "pending": 3}
           sb = _SB(st)
-          r = C.save_my_style(sb, "p1", "新的完整笔记\n第二行", user_id="u1")
+          r = C.save_my_style(sb, "p1", "新的完整笔记\n第二行",
+                              user_id="u1", edit_ids=["e0", "e1"])
           assert r["saved"] is True and r["lines"] == 2, r
           assert st["saved"][0]["notes"] == "新的完整笔记\n第二行"
-          assert st.get("marked") is True, "没把 style_edits 标记成已吸收"
-          print("  ✓ save_my_style 写回完整笔记并把 diff 标记为已吸收")
+          assert sorted(st.get("marked_ids", [])) == ["e0", "e1"], st.get("marked_ids")
+          assert r["edits_absorbed"] == 2, r
+          assert r["pending_distillation"] == 1, r
+          assert "still_pending" in r, "还有没吸收的必须说出来"
+          print("  ✓ 只销掉传进来的 e0/e1; 第三条仍留在 pending 并被明确报出")
+
+          # 不传 edit_ids = 手动改笔记, 【不能】顺手把待处理的精修标掉
+          st2 = {"rows": rows, "notes": "旧", "pending": 3}
+          r2 = C.save_my_style(_SB(st2), "p1", "手动改的笔记", user_id="u1")
+          assert st2.get("marked_ids", []) == [], "手动改笔记不该销账"
+          assert r2["edits_absorbed"] == 0 and r2["pending_distillation"] == 3, r2
+          assert "note" in r2, "要提示这次没销账"
+          print("  ✓ 不传 edit_ids(手动改笔记) → 一条都不销, 待吸收原样保留")
           # 空笔记必须拒绝 —— 否则一次失手会把积累的个人风格清空
           for empty in ("", "   ", "\n\n"):
               try:
@@ -551,10 +589,35 @@ jobs:
           st = {"pending": 3, "rows": [], "notes": "n"}
           assert S.count_pending_distillation(_SB(st), "p1", "u1") == 3
           assert S.count_pending_distillation(_SB({"pending": 0}), "p1", "u1") == 0
-          print("  ✓ my_style 报 pending_distillation; 断点可见")
+          print("  ✓ 断点计数正确")
           assert "pending_distillation" in (T.my_style.__doc__ or ""), \
               "my_style 的说明里要教模型看这个数, 否则报了也没人看"
-          print("  ✓ my_style 的工具说明里教了怎么用这个数")
+
+          # ⚠️ 光报个数字不够(本 PR 第一版的 P2): 断点最典型的形态就是【会话没了】,
+          # 那时 record_edit 那次的返回值也一起丢了。只给数字的话调用方拿不回
+          # 材料和口径, 文档里写的"重新提炼一次写回"根本做不到, 除非让用户把
+          # 同一条精修再喂一遍(会造重复行)。所以 pending>0 时要把任务带上。
+          import db as _db2
+          _origp = _db2.get_project
+          _db2.get_project = lambda *a, **k: {"calibration_notes": "共享基线"}
+          try:
+              ms = C.my_style(_SB({"pending": 2, "rows": [EDIT], "notes": "我的笔记"}),
+                              "p1", user_id="u1")
+              assert ms["pending_distillation"] == 2, ms
+              task = ms.get("pending_distillation_task")
+              assert task, "pending>0 却没带上可恢复的任务"
+              for k in ("instruction", "existing_notes", "edits", "edit_ids"):
+                  assert k in task, f"恢复用的任务少了 {k}"
+              assert "save_my_style" in ms.get("next_step", "")
+              print("  ✓ pending>0 时 my_style 直接带上完整任务, 换个会话也能接着做")
+
+              clean = C.my_style(_SB({"pending": 0, "rows": [], "notes": "我的笔记"}),
+                                 "p1", user_id="u1")
+              assert clean["pending_distillation"] == 0
+              assert "pending_distillation_task" not in clean, "没积压时不该塞任务进来"
+              print("  ✓ 没积压时不带任务(my_style 是常用读, 不该平白塞几 KB diff)")
+          finally:
+              _db2.get_project = _origp
 
           # ── 5. 工具面: save_my_style 注册了, 且是不吞异常的写 ────────────────
           assert "save_my_style" in T.TOOLS and T.TOOLS["save_my_style"][1] is True, \

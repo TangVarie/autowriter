@@ -893,8 +893,8 @@ def record_edit(client, project_id: str, *, user_id: str,
     out["next_step"] = (
         "⚠️ 这一步【还没做完】。请按 distillation_task.instruction 的口径, "
         "拿 existing_notes 和 edits 提炼出【更新后的完整笔记】, 然后调用 "
-        "save_my_style 写回去。不写回去的话这次精修等于白喂 —— diff 存下来了, "
-        "但文风不会变。")
+        "save_my_style 写回去, 并把 distillation_task.edit_ids 原样传回。"
+        "不写回去的话这次精修等于白喂 —— diff 存下来了, 但文风不会变。")
     return out
 
 
@@ -930,28 +930,61 @@ def build_distillation_task(client, project_id: str, *, user_id: str,
             b += f"\n  本人备注：{e['note']}"
         blocks.append(b)
 
-    return {
+    total_pending = store.count_pending_distillation(client, project_id, user_id)
+    out = {
         "instruction": _CALIB_SYSTEM,
         "existing_notes": existing,
         "edits": "\n\n---\n".join(blocks),
         "edit_count": len(edits),
+        # ⚠️ 这批的确切 id。save_my_style 只销这几条的账 —— 见
+        # store.mark_edits_distilled 的说明(全量销账会吃掉快照外的行)。
+        "edit_ids": [e["id"] for e in edits if e.get("id")],
     }
+    if total_pending > len(edits):
+        out["more_pending"] = total_pending - len(edits)
+        out["note"] = (
+            f"这个人还有 {total_pending - len(edits)} 条精修没进本次快照"
+            f"(一次最多取 {max_edits} 条)。写回之后【再调一次 record_edit 或看 "
+            "my_style】会拿到下一批, 别以为一次就吸收完了。")
+    return out
 
 
-def save_my_style(client, project_id: str, notes: str, *, user_id: str) -> dict:
-    """把调用方模型蒸馏好的笔记写回, 并把对应的 diff 标记为已吸收。
+def save_my_style(client, project_id: str, notes: str, *, user_id: str,
+                  edit_ids: list[str] | None = None) -> dict:
+    """把调用方模型蒸馏好的笔记写回, 并把【这一批】diff 标记为已吸收。
 
     ⚠️ 只有【真的写回来】才算完成一次学习。record_edit 只是把 diff 存下来 +
-    把任务交出去; 中间断掉的话 diff 还在库里(下次会一并重算), 但笔记不会变 ——
+    把任务交出去; 中间断掉的话 diff 还在库里(下次还会拿到), 但笔记不会变 ——
     也就是"喂了稿子却没变得更像我"。my_style 的 pending_distillation 就是给
     这个断点用的可见性。
+
+    ⚠️ edit_ids 必须原样回传 record_edit 给的那一份。不传 = 只改笔记、不销任何
+    账 —— 这正是"用户说这条笔记不对, 直接改一下"那种用法应有的行为: 手动改写
+    笔记【不等于】吸收了那些待处理的精修, 顺手把它们标掉会让它们静默消失。
+    (codex review #56 P1)
     """
     notes = (notes or "").strip()
     if not notes:
         raise ValueError("notes 不能为空 —— 空笔记会把已有的个人风格清掉")
     store.save_user_calibration(client, project_id, user_id, notes)
-    store.mark_edits_distilled(client, project_id, user_id)
-    return {"saved": True, "notes": notes, "lines": len(notes.splitlines())}
+    marked = store.mark_edits_distilled(client, project_id, user_id, edit_ids or [])
+    out = {"saved": True, "notes": notes, "lines": len(notes.splitlines()),
+           "edits_absorbed": marked,
+           "pending_distillation": store.count_pending_distillation(
+               client, project_id, user_id)}
+    if edit_ids and marked < len(edit_ids):
+        out["warning"] = (
+            f"传了 {len(edit_ids)} 个 edit_id 但只销掉 {marked} 条 —— "
+            "多半是其中几条已经被别处吸收过了。笔记已保存。")
+    if not edit_ids:
+        out["note"] = ("没传 edit_ids, 所以只更新了笔记、没有销账。"
+                       "如果这是在吸收精修而不是手动改写笔记, "
+                       "要把 record_edit 返回的 edit_ids 原样传进来。")
+    if out["pending_distillation"]:
+        out["still_pending"] = (
+            f"还有 {out['pending_distillation']} 条精修没被吸收 —— "
+            "看 my_style 的 pending_distillation_task 接着做。")
+    return out
 
 
 def label_example(client, item_id: str, label: str | None,
@@ -991,7 +1024,8 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
     project = db.get_project(client, project_id)
     shared = (project or {}).get("calibration_notes") or ""
     mine, updated = store.get_user_calibration(client, project_id, user_id)
-    return {
+    pending = store.count_pending_distillation(client, project_id, user_id)
+    out = {
         "project_id": project_id,
         "shared_calibration": shared.strip(),
         "my_calibration": mine,
@@ -1003,9 +1037,23 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
         # 两步之间断掉 = diff 存了但笔记没更新, 也就是"喂了稿子却没变得更像我",
         # 而且【完全无声】。这个计数就是那个断点的可见性: 大于 0 说明有精修
         # 还没被吸收进笔记。
-        "pending_distillation": store.count_pending_distillation(
-            client, project_id, user_id),
+        "pending_distillation": pending,
     }
+    # ⚠️ 光报个数字不够 —— 断点最典型的形态就是【会话没了】(超时、换了个
+    # session), 那时 record_edit 那次的返回值也一起丢了。只给数字的话, 调用方
+    # 拿不回材料和口径, 我在 SKILL.md 里写的"重新提炼一次写回"根本做不到,
+    # 除非让用户把同一条精修再喂一遍(那会造重复行)。
+    # 所以 pending > 0 时把任务原样带上, 恢复就是自明的。
+    # (codex review #56 P2)
+    if pending:
+        task = build_distillation_task(client, project_id, user_id=user_id)
+        if task:
+            out["pending_distillation_task"] = task
+            out["next_step"] = (
+                "有精修还没被吸收进笔记。按 pending_distillation_task.instruction "
+                "提炼出更新后的完整笔记, 调 save_my_style 写回, "
+                "并把 task 里的 edit_ids 原样传回去。")
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════

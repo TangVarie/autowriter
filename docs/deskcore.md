@@ -139,9 +139,23 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 | | `commit_drafts` | 定稿入库：写指纹 + 给坐标销账 |
 | 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0 |
 | | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
-| | `save_my_style` | 把模型蒸馏好的笔记写回（`record_edit` 的第二步） |
+| | `save_my_style` | 把模型蒸馏好的笔记写回 + 按 `edit_ids` 销账（`record_edit` 的第二步） |
 | | `label_example` | 标正/负例 |
-| | `my_style` | 查看个人风格资产 |
+| | `my_style` | 查看个人风格资产；有积压时**直接带回可续做的蒸馏任务** |
+
+### 3.3 蒸馏的两步与它的失败模式
+
+`record_edit`（存 diff + 出任务）→ 调用方模型提炼 → `save_my_style`（写回 + 销账）。服务端**不调 LLM**。
+
+这个拆分引入了一个新的无声失败：两步之间断掉，diff 存着而笔记不变——"喂了稿子却没变得像我"。三道处理：
+
+| 风险 | 处理 |
+|---|---|
+| 模型拿到任务就忘了写回 | `record_edit` 的 `next_step` 明写"这一步还没做完"，指名 `save_my_style` |
+| 断点无声 | `my_style` 报 `pending_distillation` |
+| **会话没了，任务也丢了** | `pending > 0` 时 `my_style` 直接带回完整的 `pending_distillation_task`——材料、口径、`edit_ids` 都在，换个会话也能接着做，不必让用户重喂稿子 |
+
+⚠️ **销账必须按 `edit_ids` 精确销，不能按 user+project 全量销。** 蒸馏任务是一份快照（一次最多 8 条），笔记只覆盖快照里那些。全量销账会吃掉两类不在快照里的行——第 9 条往后的、以及拿到任务之后新 `record_edit` 进来的。它们会从 `pending_distillation` 里消失却从没影响过笔记：用户喂了稿子，计数归零看着正常，那几条等于白喂。同理，`save_my_style` 不传 `edit_ids`（手动改笔记）时**一条都不销**。
 
 工具的 docstring 就是模型看到的说明。
 

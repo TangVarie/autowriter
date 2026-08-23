@@ -286,8 +286,9 @@ def my_style(project_id: str, _user_id: str | None = None) -> dict:
     别把它说成是这个人的个人偏好。
 
     ⚠️ 看一眼 pending_distillation。大于 0 说明有精修【还没被吸收进笔记】——
-    多半是上次调了 record_edit 却没接着调 save_my_style。要告诉用户, 并可以
-    直接补做: 拿 record_edit 那次的 distillation_task 重新提炼后写回。
+    多半是上次调了 record_edit 却没接着调 save_my_style(比如会话中断了)。
+    这时返回值里会直接带上 pending_distillation_task, **材料和口径都在里面**,
+    照着提炼完调 save_my_style 就能补上, 不需要让用户把稿子再喂一遍。
     """
     if not _user_id:
         return {"error": "无法识别调用者身份",
@@ -296,6 +297,7 @@ def my_style(project_id: str, _user_id: str | None = None) -> dict:
 
 
 def save_my_style(project_id: str, notes: str,
+                  edit_ids: list[str] | None = None,
                   _user_id: str | None = None) -> dict:
     """把你提炼好的个人调校笔记写回去 —— record_edit 的【第二步】。
 
@@ -303,16 +305,24 @@ def save_my_style(project_id: str, notes: str,
     existing_notes 的基础上改写(合并同类项、冲突时以新观察为准), 别只写新增的
     那几条 —— 那样会把以前积累的偏好全丢掉。
 
-    写回之后, 对应的精修 diff 会被标记为已吸收, my_style 的
-    pending_distillation 归零。
+    edit_ids **原样传** distillation_task 里给你的那一份。它决定哪几条精修被
+    标记为"已吸收"。
+    ⚠️ 不传的话只更新笔记、不销任何账 —— 这正是「用户说这条笔记不对, 直接
+    改一下」应有的行为: 手动改写笔记不等于吸收了那些待处理的精修, 顺手把它们
+    标掉会让它们静默消失。所以两种用法泾渭分明:
+      · 吸收精修  → 传 edit_ids
+      · 手动改笔记 → 不传
 
-    也可以在用户说「这条笔记不对/删掉」时直接用来改笔记。
+    返回值里看两样: edits_absorbed(真销掉几条) 和 pending_distillation
+    (还剩几条)。剩的不为 0 说明没吸收完 —— 待吸收超过一次快照(8 条)时是正常
+    的, 接着做下一批。
     """
     if not _user_id:
         return {"error": "无法识别调用者身份, 个人风格功能不可用",
                 "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
     # 故意不包 _safe: 写。这是"裂变"闭环的最后一步, 静默失败 = 前面白做。
-    return core.save_my_style(core.sb(), project_id, notes, user_id=_user_id)
+    return core.save_my_style(core.sb(), project_id, notes,
+                              user_id=_user_id, edit_ids=edit_ids)
 
 
 # 工具注册表 —— app.py 和 cli.py 共用。
