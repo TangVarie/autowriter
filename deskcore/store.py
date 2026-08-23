@@ -510,6 +510,23 @@ def mark_edits_distilled(sb, project_id: str, user_id: str) -> None:
         logger.exception("mark style_edits distilled failed (notes are saved)")
 
 
+def count_pending_distillation(sb, project_id: str, user_id: str) -> int:
+    """还没被吸收进调校笔记的精修条数。
+
+    蒸馏搬到调用方模型之后, record_edit(存 diff, 交任务) 和 save_my_style(写回)
+    是两步。中间断掉的话 diff 还在、笔记没变 —— "喂了稿子却没变得更像我", 而且
+    没有任何报错。my_style 把这个数报出来, 断点才看得见。
+    """
+    try:
+        return (sb.table("style_edits").select("id", count="exact")
+                  .eq("project_id", project_id).eq("user_id", user_id)
+                  .eq("distilled", False)
+                  .limit(1).execute()).count or 0
+    except Exception:
+        logger.exception("count pending distillation failed")
+        return 0
+
+
 def count_style_edits(sb, project_id: str, user_id: str) -> int:
     try:
         return (sb.table("style_edits").select("id", count="exact")
