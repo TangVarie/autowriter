@@ -62,16 +62,21 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 
 ## 2. 上线四步（顺序不能换）
 
-### 第 0 步 · 先验协议能不能通
+### 第 0 步 · 先想清楚「协议不通怎么办」
 
 WorkBuddy 的 HTTP MCP 到底认不认自定义 header，官方只说了支持 HTTP MCP 和 OAuth
-（v4.7.3），**没有权威文档**。所以：
+（v4.7.3），**没有权威文档**。**这一步不通的话整个形态要换**，所以它是排在最前面
+的风险——但它**验不了**，因为那时候还没有可连的地址。
 
-1. 先在 **Claude Code** 里挂通（环境可控、报错看得见）
-2. 再进 WorkBuddy
+所以实际顺序是：**先部署（第 1 步，很便宜），部好立刻验协议（第 3 步的前半段），
+通了再往下走**。别把回填和铺开放在协议验证之前。
 
-**这一步不通的话整个形态要换**，所以放在最前面。key 支持三种传法，优先级见
-`docs/deskcore.md` §4.3——`?key=` 是最后的退路，因为查询串会进访问日志且删不掉。
+key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是最后的退路，
+因为查询串会进访问日志且删不掉。
+
+> 想在部署之前先摸一遍工具面：`uvicorn deskcore.app:app --port 8000` 本地起，
+> 打 `POST /tool/{name}`。但**这验不了 WorkBuddy 的协议**——那需要一个
+> WorkBuddy 够得着的公网地址。
 
 ### 第 1 步 · 部署 deskcore service
 
@@ -95,11 +100,22 @@ WorkBuddy 的 HTTP MCP 到底认不认自定义 header，官方只说了支持 H
  "k-xiaoyu-yyy": {"user_id": "<uuid>", "name": "小鱼"}}
 ```
 
-> ⚠️ **`user_id` 必须用库里已有的 UUID，不要新造。**
-> 造新的会被 RLS 屏蔽，`list_example_items` 永远 0 行，飞轮静默断开
-> （TV `autowriter-migrations/RUNBOOK.md:150-153` 记过一次，查了很久）。
+> ⚠️ **判据是「这把 key 背后是不是同一个人」，不是「UUID 在不在库里」。**
 >
-> 从库里查：
+> - **老人**（库里已有他的项目/稿子）→ **必须用他自己那个已有 UUID**，否则
+>   `open_project` 里的个人正负例、`my_style` 的调校笔记全都看不到，个人层等于关着。
+> - **新人**（库里没有任何历史）→ **可以给一个全新 UUID**，他从空的个人层开始积累，
+>   这是对的。
+> - ❌ **绝不能把两个人塞进同一个 UUID** —— 那等于把 A 的调校笔记和正负例交给 B 看，
+>   而且 B 能改 A 的标注（`label_example` 的归属校验是按 `user_id` 判的）。
+>
+> **为什么不是 RLS 的事**：deskcore 持 `service_role`，**绕过 RLS**，个人层是靠
+> `store.py` 里一串显式 `.eq("user_id", user_id)` 隔离的（:143 / :471 / :499 / :524 /
+> :542 / :553），`label_example` 还另做了一次归属校验（`core.py:990` 的 docstring 写了
+> 为什么）。TV `autowriter-migrations/RUNBOOK.md:150-153` 那次 RLS 屏蔽事故是
+> **TV sync + Streamlit** 那条路径上的，机制不同，别把结论搬过来。
+>
+> 查已有身份：
 > ```sql
 > select user_id, count(*) from autowriter.items group by user_id order by 2 desc;
 > select distinct owner_id from autowriter.projects;
@@ -116,8 +132,30 @@ WorkBuddy 的 HTTP MCP 到底认不认自定义 header，官方只说了支持 H
 curl -sS "$DESKCORE_URL/health" | jq
 ```
 
-逐项看 ok。`/health` 会回显 embedding 可用性、vendor 词表校验和、鉴权是否配置、
-librarian 通不通——**配错要当场可见**。
+⚠️ **别只看顶层 `ok`。** 它只由三项决定（`app.py:176`）：
+
+```python
+"ok": db_ok and vocab_ok and auth_ok
+```
+
+**embeddings 和 librarian 都不在里面**，而且这两项的回显只是「配没配」，不是「通不通」：
+
+| 字段 | 它真正说明的 | 它**不**说明的 |
+|---|---|---|
+| `config.embeddings.ok` | google-genai SDK 装了、client **构造得起来**（`clients.py:107` `get_genai_client() is not None`） | key 有没有效、有没有欠费、配额用没用尽。**这三种情况它照样 `true`** |
+| `config.librarian.configured` | `LIBRARIAN_URL` 这个环境变量非空 | 地址对不对、key 对不对、服务活没活 |
+
+也就是说：跟着 `/health` 全绿走下去，`borrow_lessons` 可能一直静默返回空列表，
+`backfill` 可能一条向量都没取到。所以这两项要**各自实打实探一次**：
+
+```bash
+# librarian 真的通不通 —— 看返回里有没有卡, 不是看 configured
+curl -sS -X POST "$DESKCORE_URL/tool/borrow_lessons" \
+  -H "X-Deskcore-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"project_id":"<uuid>","draft_topic":"测试"}' | jq
+
+# embedding 真的取得到 —— 看 backfill 的返回, 见第 2 步
+```
 
 ### 第 2 步 · 回填历史指纹（**不做等于没上查重**）
 
@@ -132,6 +170,31 @@ python -m deskcore.cli backfill --project <uuid>    # 每个项目跑一次
 **建议只回填你真要用的那两三个项目**，61 个全跑没必要。
 
 幂等（按 `version_id` 跳过），可以反复跑。
+
+**怎么算回填完了**——⚠️ **不能**看 `select count(*) from autowriter.draft_fingerprints > 0`，
+那是**全局**的；也不能看 `empty_history_warning` 消失，它的条件是
+`if not history`（`core.py:488`），**这个项目有第 1 条指纹它就不见了**。
+两个都会在「主力项目还差几百条」的时候报绿。
+
+按项目逐个比对**该项目应有的条数**：
+
+```sql
+-- 应有: 该项目每个 item 的最新版本 (与 backfill 的口径一致)
+with eligible as (
+  select distinct i.id
+    from autowriter.items i
+    join autowriter.batches b on b.id = i.batch_id
+    join autowriter.versions v on v.item_id = i.id
+   where b.project_id = '<uuid>'
+)
+select (select count(*) from eligible)                                as 应有,
+       (select count(*) from autowriter.draft_fingerprints f
+         where f.project_id = '<uuid>' and f.version_id is not null)  as 已回填;
+```
+
+两个数对上才算完。另外看 `backfill` 的返回值：`missing_embeddings` 不为 0
+就是**该有向量却没取到**（key 欠费/配额用尽——`embeddings_available()` 那时仍是
+`true`，见第 1 步），那批行只有确定性指纹，补好 key 之后要跑 `reembed`。
 
 > ⚠️ **先配好 `GOOGLE_API_KEY` 再回填。** 没配也能回填，但那批行没有标题向量、
 > 只参与确定性查重；补配之后重跑**不会**给已写入的行补向量（幂等是按 `version_id`
@@ -186,7 +249,8 @@ open_project → draw_angles(n=20) → borrow_lessons → 生成 20 篇
 | 方向 | 通道 | 谁调谁 | 配置 | 失败时 |
 |---|---|---|---|---|
 | TV → aw | `borrow_lessons` 借爆款经验卡 | deskcore 调 TV librarian `POST /librarian` | `LIBRARIAN_URL` + `LIBRARIAN_API_KEY` | 返回空列表，**照常写稿**。飞轮永远不是写稿的前置依赖 |
-| aw → TV | 人工审稿决定归档 | TV 的 `sync_autowriter_decisions_to_prepublish.py` 每天读 `autowriter.items` | TV 侧 secrets，本仓不用管 | TV 侧 daily-sync 报红发邮件 |
+| aw → TV | 人工审稿决定归档 | TV 的 `sync_autowriter_decisions_to_prepublish.py` 每天读 `autowriter.items` 的 `status` | TV 侧 secrets，本仓不用管 | TV 侧 daily-sync 报红发邮件 |
+| ⚠️ 同上 | **仅对 Streamlit 时期的存量成立** | deskcore **不写** `items.status` | — | 停了 Streamlit 就没有新决策进 TV，见下 |
 | 共库 | 同一个 Supabase 项目 `kduysqedr` | `truth_vault` / `autowriter` 两个 schema | — | — |
 
 **跨仓约定（重要）**：本仓如果改 `items` / `batches` / `versions` 的列，
@@ -204,6 +268,38 @@ PostgREST 报 `column does not exist`。
 WHEN (old.status IS DISTINCT FROM new.status
    OR old.example_label IS DISTINCT FROM new.example_label)
 ```
+
+### ⚠️ 停 Streamlit 会把 aw → TV 这条链路断掉
+
+把 deskcore 的**全部写操作**列出来（`store.py` 里所有 `.insert/.upsert/.update/.rpc`）：
+
+```
+angle_ledger · draft_fingerprints · user_calibration_notes · style_edits
+deskcore_reserve_angles · deskcore_commit_fingerprints
+items.example_label（只有 label_example 这一个，走 db.set_item_example_label）
+```
+
+**没有任何一个工具会创建 item/version，也没有任何一个会写 `items.status`。**
+而 TV 那条归档链路读的正是 `status ∈ (approved, needs_revision)`。
+
+所以 Streamlit 一停，新写的稿子既不进 `autowriter.items`，也不会产生
+approved/needs_revision —— `prepublish_evaluations` 从此不再有新行，
+**而 TV 那边不会报错**（查不到就是 0 条，跟"这几天没人审稿"长得一模一样）。
+
+顺带一个连带效应：停服之后 `items.updated_at` 唯一还会被刷的来源就是
+`label_example` 改正负例标注，于是 TV 打印的「创建后被动过」会**全部**是标注活动。
+
+**三条路，第一期之前必须选一条**（列进待办 #5 的前置）：
+
+| 选项 | 做什么 | 代价 |
+|---|---|---|
+| A · deskcore 补写回 | `commit_drafts` 时建 item/version，`check_drafts` 的 pass/reject 或一个新工具落 `status` | 要动 schema 口径与 TV 的对接契约 |
+| B · 换一条归档源 | 让 TV 改读 `draft_fingerprints` + 一个新的决策表 | TV 侧要改，跨仓 |
+| C · 明确接受断掉 | 把这一行标成 legacy-only，`prepublish_evaluations` 冻结在存量 598 条 | `v_evaluator_calibration` 从此不再增长 |
+
+**在选定之前不要停 Streamlit。**
+
+---
 
 **反向依赖**：`items.updated_at` 只有跑过本仓 `migrations/001_deskcore.sql` 的库才有——
 TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_schema.sql`
@@ -225,7 +321,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | # | 事 | 为什么 | 验收标准 |
 |---|---|---|---|
 | 1 | 部署 deskcore service | 现在根本没跑 | `curl $URL/health` 每项 ok |
-| 2 | 回填指纹（至少主力项目） | 不做的话硬闸背后 0 行历史 | `select count(*) from autowriter.draft_fingerprints` > 0，且 `check_drafts` 的 summary **不再带** `empty_history_warning` |
+| 2 | 回填指纹（至少主力项目） | 不做的话硬闸背后 0 行历史 | **逐项目**比对「应有 vs 已回填」（§2 第 2 步那条 SQL）两个数对上；且 `backfill` 返回的 `missing_embeddings` = 0。⚠️ **不能**拿全局 `count(*) > 0` 或「`empty_history_warning` 消失了」当验收——两个都会在主力项目还差几百条时报绿 |
 | 3 | 验 WorkBuddy 的鉴权头 | 不通就要换形态 | MCP 握手成功、错 key 返 401 |
 
 ### P1 · 上线后第一周
@@ -233,7 +329,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | # | 事 | 为什么 |
 |---|---|---|
 | 4 | **把真正的硬规则设成 `hard`** | 现在 303 条记忆**全是 soft**，P0 硬约束层是空的。"规则不忘"这个卖点在有 hard 规则之前等于没生效。先从禁词、合规话术这类开始 |
-| 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`） |
+| 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。**⚠️ 前置**：先在 §3「停 Streamlit 会把 aw → TV 这条链路断掉」的 A/B/C 三条里选一条 —— 否则人工审稿决定从此不再进 `prepublish_evaluations`，而且不报错 |
 | 6 | 观察 `borrow_lessons` 选卡质量 | TV 书架规模下的选卡准确率**从来没人测过**。不行就在 `librarian/core.py:33` 那个 `CANDIDATE_CAP=50` 的口子加 embedding 预筛 |
 | 7 | 让 `check_drafts` 的降级信号被人看见 | `semantic_degraded` / `empty_history_warning` 这两个字段没人盯的话，表现就是"查重跑了、全 pass、看着一切正常" |
 
@@ -241,7 +337,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 
 | # | 事 | 触发条件 |
 |---|---|---|
-| 8 | 查重搬到 pgvector 服务端 | 现在在 Python 里逐对比，`store.fingerprints` 有 4,000 行上限。单项目到十万行量级时改；`draft_fingerprints` 已建 ivfflat 索引 |
+| 8 | 查重搬到 pgvector 服务端 | **单项目逼近 4,000 条指纹时**（不是十万）。`store.fingerprints` 的 `limit` 就是 4,000（`store.py:295`），超过就只比最近的这些、返回里带 `history_truncated_warning`——也就是说**第 4,001 条起，「比对全量历史」这个说法就不成立了**。`draft_fingerprints` 已建 ivfflat 索引，改起来不难；来不及就先把 cap 调高 |
 | 9 | commit 的原子重查覆盖语义信号 | 现在锁内只查确定性信号（开头精确 + 四字串 Jaccard），标题语义相似度没查——竞态窗口里"换个说法的同角度稿"仍可能两条都进。等 backfill 把历史向量补齐之后再做 |
 | 10 | "把我的调校笔记提升为项目基线" | 同一项目两人各自驯化会让风格分叉。指纹库共享、笔记不共享。跑一段时间看分叉严重程度 |
 | 11 | 拆 `db.py` / `memory.py` / `app.py` | TV R-020，触发式延后。真在这些文件里频繁改动时才做 |
@@ -346,8 +442,19 @@ CLI 子命令、设计文档、PR 描述、连"部署必跑一次"的措辞都�
 
 ### 6.2 三条不能破的纪律
 
-1. **`check_drafts` 不 fail-open。** 其它读类工具出错返回带 `error` 的可用结构不阻塞写稿；
-   查重出错必须抛。理由见 §5.1。
+1. **fail-open 只有三个工具，别扩大。** `_safe()` 包装会把异常变成一个**看起来成功**、
+   只多一个 `error` 字段的结果，`hint` 里还写着"写稿可以继续"。目前只包了
+   `list_projects` / `borrow_lessons` / `my_style` —— 读，且拿不到只是少点参考。
+
+   **`open_project` 刻意没包**（`tools.py:25` 的 docstring 专门讲了原因）：拿不到 P0
+   硬约束就照常开写，产出的是违规内容，而调用方看到的是一份 `p0` 为空的**正常简报**。
+   `store.shared_memories()` 为此故意不吞异常，外面再包一层 `_safe` 等于把那个设计
+   原样抵消掉。**写类工具**（`draw_angles` / `commit_drafts` / `record_rule` /
+   `record_edit` / `label_example`）同理，全都不包。
+
+   `check_drafts` 更不能包 —— 查重出错必须抛，理由见 §5.1。
+
+   判据一句话：**失败之后调用方还会不会当作成功继续往下走。会 → 不能包。**
 2. **别在 `deskcore/__init__` 之前 import `db`。** 它要先设 `AW_DISABLE_ST_CACHE=1`
    （R-042，同 `worker.py:56`），否则 headless 进程会拿 `st.cache_data` 的 30-60s 旧数据。
 3. **读 embedding 必须过 `db._parse_pgvector`。** 不归一则 `cosine_similarity` 静默返回

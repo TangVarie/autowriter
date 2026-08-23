@@ -46,9 +46,11 @@ python -m deskcore.cli selftest    # 不装 supabase/anthropic 也能跑
 
 ## 三条纪律
 
-**`check_drafts` 不 fail-open。** 其它读类工具出错返回带 `error` 的可用结构不阻塞
-写稿；查重出错必须抛。静默放行就是重演 `config.py:132` 那个 `ENABLE_DEDUP_REGEN`
-默认关着、查重跑了但不拦的老问题。
+**fail-open 只有 `list_projects` / `borrow_lessons` / `my_style` 三个。**
+`open_project`（拿不到 P0 硬约束就照常开写 = 产出违规内容）和全部写类工具都**刻意
+没包** `_safe` —— 判据见 `tools.py:25` 的 docstring：失败之后调用方还会不会当作成功
+继续往下走，会就不能包。`check_drafts` 更不能，查重出错必须抛：静默放行就是重演
+`config.py:132` 那个 `ENABLE_DEDUP_REGEN` 默认关着、查重跑了但不拦的老问题。
 
 **别在 `deskcore/__init__` 之前 import db。** 它要先设 `AW_DISABLE_ST_CACHE=1`
 （R-042，同 `worker.py:56`），否则 headless 进程会拿 `st.cache_data` 的 30-60s 旧数据。
