@@ -1609,29 +1609,61 @@ def list_items_for_batches(
 
     Streamlit cache 不做这里：export 页交互低频，但 batch_ids 集合频繁
     变化（用户勾选），cache_data 反而命中率低。
+
+    ⚠️ 必须分页。调用方 (app.py page_export) 传的是 list_batches(limit=50) 的
+    全部批次，一批最多 20 条 item —— 上界正好 50×20 = 1000，**贴着 PostgREST
+    的 max-rows 上限**，零余量。一旦哪天 limit 或单批容量往上挪一格，这里就会
+    【静默截断】：导出页少几篇，不报错、不告警，跟"那几篇本来就没写"看起来一样。
+    (2026-08-23 审计: 当前最大项目 445 条, 还没撞上, 属于时间问题)
+
+    分页写法照搬本文件 _fetch_recent_titles(:1462) 那套：created_at 作主排序，
+    id 作【唯一且稳定】的次级键。少了次级键就不能翻页 —— created_at 在 bulk
+    insert 下大量并列(同一语句共享 NOW())，无序 OFFSET 跨页会漏行/重行。
     """
     if not batch_ids:
         return {}
-    try:
-        res = (
-            client.table("items")
-            .select("*, versions(*)")
-            .in_("batch_id", batch_ids)
-            .order("created_at")
-            .execute()
-        )
-    except Exception as exc:
-        telemetry.log_event(
-            "list_items_for_batches_failed",
-            n_batches=len(batch_ids), error=str(exc)[:200],
-        )
-        return {bid: [] for bid in batch_ids}
     grouped: dict[str, list[dict]] = {bid: [] for bid in batch_ids}
-    for item in (res.data or []):
+    page_size = 500
+    offset = 0
+    while True:
+        try:
+            res = (
+                client.table("items")
+                .select("*, versions(*)")
+                .in_("batch_id", batch_ids)
+                .order("created_at")
+                .order("id")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+        except Exception as exc:
+            telemetry.log_event(
+                "list_items_for_batches_failed",
+                n_batches=len(batch_ids), offset=offset, error=str(exc)[:200],
+            )
+            # 首页就失败 → 整体降级为空(维持原语义); 已经取到几页 → 保留已取的,
+            # 少几篇总比整页空白强, 且上面已留痕。
+            if offset == 0:
+                return {bid: [] for bid in batch_ids}
+            break
+        page = res.data or []
+        _bucket_items(page, grouped)
+        if len(page) < page_size:
+            break
+        offset += len(page)
+    return grouped
+
+
+def _bucket_items(page: list[dict], grouped: dict[str, list[dict]]) -> None:
+    """把一页 items 按 batch_id 分桶进 grouped(就地改)。
+
+    只收 grouped 里已有的 batch_id —— 那是调用方问的那批。PostgREST 的
+    in_() 不会回别的批次, 这层判断是防御性的, 保持原行为。
+    """
+    for item in page:
         bid = item.get("batch_id")
         if bid in grouped:
             grouped[bid].append(item)
-    return grouped
 
 
 def update_item_status(

@@ -218,6 +218,12 @@ CREATE OR REPLACE FUNCTION autowriter.deskcore_reserve_angles(
 )
 RETURNS TABLE(reserved_key TEXT, reserved_dims JSONB)
 LANGUAGE plpgsql
+-- 固定 search_path: 不设的话 Supabase advisor 报 function_search_path_mutable(WARN),
+-- 且调用方能通过改 search_path 影响函数内未限定名字的解析。
+-- 不能用 '' —— 下面 commit_fingerprints 有 ::vector 转型, vector 类型在 extensions;
+-- 表名本来就全限定成 autowriter.*, 所以 pg_catalog + extensions 就够。
+-- (2026-08-23 分支库验证: 加之前 2 条 WARN, 加之后归零, 两个 RPC 功能实测不受影响)
+SET search_path = pg_catalog, extensions
 AS $$
 DECLARE
     cand  JSONB;
@@ -289,6 +295,7 @@ CREATE OR REPLACE FUNCTION autowriter.deskcore_commit_fingerprints(
 )
 RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, extensions   -- 见上; ::vector 需要 extensions
 AS $$
 DECLARE
     r        JSONB;
