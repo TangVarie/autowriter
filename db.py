@@ -126,7 +126,7 @@ def get_service_client() -> Client:
 
 CREATE_TABLES_SQL = """
 -- Enable UUID extension
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA extensions;
 
 -- Projects
 CREATE TABLE IF NOT EXISTS projects (
@@ -272,7 +272,7 @@ CREATE POLICY versions_owner ON versions
 -- Requires the pgvector extension (Supabase: Database → Extensions → enable
 -- "vector" once).  Nullable so legacy rows stay readable; a backfill helper
 -- populates them lazily.
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
 ALTER TABLE versions ADD COLUMN IF NOT EXISTS embedding vector(768);
 CREATE INDEX IF NOT EXISTS versions_embedding_idx
     ON versions USING ivfflat (embedding vector_cosine_ops);
@@ -829,6 +829,11 @@ CREATE OR REPLACE FUNCTION deskcore_reserve_angles(
 )
 RETURNS TABLE(reserved_key TEXT, reserved_dims JSONB)
 LANGUAGE plpgsql
+-- 与 migrations/001_deskcore.sql 保持一致。fresh install 走本文件、已有库走
+-- migrations/ —— 只改一边的话, 新建的库照旧 function_search_path_mutable
+-- 且保留可变 search_path。(codex aw#57 review; migrations/README 也写了
+-- "加表/加列必须两边都改", 函数同理)
+SET search_path = pg_catalog, extensions
 AS $$
 DECLARE
     cand  JSONB;
@@ -901,6 +906,7 @@ CREATE OR REPLACE FUNCTION deskcore_commit_fingerprints(
 )
 RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, extensions   -- 见上; ::vector 需要 extensions
 AS $$
 DECLARE
     r        JSONB;
@@ -1609,29 +1615,67 @@ def list_items_for_batches(
 
     Streamlit cache 不做这里：export 页交互低频，但 batch_ids 集合频繁
     变化（用户勾选），cache_data 反而命中率低。
+
+    ⚠️ 必须分页。调用方 (app.py page_export) 传的是 list_batches(limit=50) 的
+    全部批次，一批最多 20 条 item —— 上界正好 50×20 = 1000，**贴着 PostgREST
+    的 max-rows 上限**，零余量。一旦哪天 limit 或单批容量往上挪一格，这里就会
+    【静默截断】：导出页少几篇，不报错、不告警，跟"那几篇本来就没写"看起来一样。
+    (2026-08-23 审计: 当前最大项目 445 条, 还没撞上, 属于时间问题)
+
+    分页写法照搬本文件 _fetch_recent_titles(:1462) 那套：created_at 作主排序，
+    id 作【唯一且稳定】的次级键。少了次级键就不能翻页 —— created_at 在 bulk
+    insert 下大量并列(同一语句共享 NOW())，无序 OFFSET 跨页会漏行/重行。
     """
     if not batch_ids:
         return {}
-    try:
-        res = (
-            client.table("items")
-            .select("*, versions(*)")
-            .in_("batch_id", batch_ids)
-            .order("created_at")
-            .execute()
-        )
-    except Exception as exc:
-        telemetry.log_event(
-            "list_items_for_batches_failed",
-            n_batches=len(batch_ids), error=str(exc)[:200],
-        )
-        return {bid: [] for bid in batch_ids}
     grouped: dict[str, list[dict]] = {bid: [] for bid in batch_ids}
-    for item in (res.data or []):
+    page_size = 500
+    offset = 0
+    while True:
+        try:
+            res = (
+                client.table("items")
+                .select("*, versions(*)")
+                .in_("batch_id", batch_ids)
+                .order("created_at")
+                .order("id")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+        except Exception as exc:
+            telemetry.log_event(
+                "list_items_for_batches_failed",
+                n_batches=len(batch_ids), offset=offset, error=str(exc)[:200],
+            )
+            # 首页就失败 → 整体降级为空(维持原语义); 已经取到几页 → 保留已取的,
+            # 少几篇总比整页空白强, 且上面已留痕。
+            if offset == 0:
+                return {bid: [] for bid in batch_ids}
+            break
+        page = res.data or []
+        _bucket_items(page, grouped)
+        # ⚠️ 终止判据是【空页】而不是【短页】。PostgREST 的 max-rows 会把请求
+        # 钳短: 服务端配的上限低于 page_size 时, 每一页都是"短页"但后面明明还有行。
+        # 按 len(page) < page_size 收工 = 又一次静默截断, 正是本函数要治的病。
+        # 代价只是末尾多发一次拿到空页的请求。
+        # offset 按【实拿到的行数】前进, 不是按 page_size —— 服务端钳短时按
+        # page_size 跳会直接漏掉中间那段。(codex aw#57 review)
+        if not page:
+            break
+        offset += len(page)
+    return grouped
+
+
+def _bucket_items(page: list[dict], grouped: dict[str, list[dict]]) -> None:
+    """把一页 items 按 batch_id 分桶进 grouped(就地改)。
+
+    只收 grouped 里已有的 batch_id —— 那是调用方问的那批。PostgREST 的
+    in_() 不会回别的批次, 这层判断是防御性的, 保持原行为。
+    """
+    for item in page:
         bid = item.get("batch_id")
         if bid in grouped:
             grouped[bid].append(item)
-    return grouped
 
 
 def update_item_status(

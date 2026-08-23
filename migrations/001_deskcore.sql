@@ -56,8 +56,32 @@ BEGIN;
 
 SET LOCAL search_path TO autowriter, extensions, public;
 
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS vector;
+-- ⚠️ WITH SCHEMA extensions 不能省。上面 SET LOCAL search_path 把 autowriter 放在
+-- 首位, 而 CREATE EXTENSION 不带 SCHEMA 时【装进 search_path 的第一个 schema】——
+-- 实测(PG 16): search_path = autowriter, extensions, public → pg_trgm 装进了 autowriter。
+-- 真装错了的后果不是这里报错, 而是下面 deskcore_commit_fingerprints 里那句
+-- ::vector 在【运行时】解析不到类型 —— 定稿入库整条路挂掉, 而且要等到真有人
+-- 提交稿子才发现。Supabase 预装在 extensions, IF NOT EXISTS 会跳过, 所以现有库
+-- 看不出问题; 全新库才踩。(codex aw#57 review)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA extensions;
+CREATE EXTENSION IF NOT EXISTS vector      WITH SCHEMA extensions;
+
+-- 兜底: 万一这个库早就把 vector 装在别处(IF NOT EXISTS 会静默跳过上面那句),
+-- 在【迁移时】就炸掉并说清怎么办, 而不是留给运行时。
+DO $guard$
+DECLARE ns TEXT;
+BEGIN
+    SELECT n.nspname INTO ns
+      FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+     WHERE e.extname = 'vector';
+    IF ns IS DISTINCT FROM 'extensions' THEN
+        RAISE EXCEPTION
+            'vector 扩展装在 %, 但两个 deskcore RPC 的 search_path 固定为 '
+            '(pg_catalog, extensions) —— ::vector 会在运行时解析不到。'
+            '请先 ALTER EXTENSION vector SET SCHEMA extensions; 再重跑本迁移。', ns;
+    END IF;
+END
+$guard$;
 
 -- ── 1. 发牌台账 (共享层) ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS autowriter.angle_ledger (
@@ -218,6 +242,12 @@ CREATE OR REPLACE FUNCTION autowriter.deskcore_reserve_angles(
 )
 RETURNS TABLE(reserved_key TEXT, reserved_dims JSONB)
 LANGUAGE plpgsql
+-- 固定 search_path: 不设的话 Supabase advisor 报 function_search_path_mutable(WARN),
+-- 且调用方能通过改 search_path 影响函数内未限定名字的解析。
+-- 不能用 '' —— 下面 commit_fingerprints 有 ::vector 转型, vector 类型在 extensions;
+-- 表名本来就全限定成 autowriter.*, 所以 pg_catalog + extensions 就够。
+-- (2026-08-23 分支库验证: 加之前 2 条 WARN, 加之后归零, 两个 RPC 功能实测不受影响)
+SET search_path = pg_catalog, extensions
 AS $$
 DECLARE
     cand  JSONB;
@@ -289,6 +319,7 @@ CREATE OR REPLACE FUNCTION autowriter.deskcore_commit_fingerprints(
 )
 RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
 LANGUAGE plpgsql
+SET search_path = pg_catalog, extensions   -- 见上; ::vector 需要 extensions
 AS $$
 DECLARE
     r        JSONB;
