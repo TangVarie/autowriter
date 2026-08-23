@@ -2,7 +2,9 @@
 
 内容工作台的能力内核，做成 MCP 工具服务。**Streamlit 界面停用，库里的积累一条不迁。**
 
-完整设计与接入见 [`docs/deskcore.md`](../docs/deskcore.md)。决策在 truth-vault：`DECISIONS.md` D-041 / `docs/10-sister-repo-followups.md` R-034。
+完整设计见 [`docs/deskcore.md`](../docs/deskcore.md)；**上线手册 / 对接 / 待办 / 已知不一致**见 [`docs/deskcore-runbook.md`](../docs/deskcore-runbook.md)。决策在 truth-vault：`DECISIONS.md` D-041 / `docs/10-sister-repo-followups.md` R-034。
+
+> ⚠️ 截至 2026-08-23，**本服务尚未部署**，`draft_fingerprints` / `angle_ledger` / `user_calibration_notes` / `style_edits` 四张表都是 0 行。上线步骤看 runbook §2。
 
 ## 它解决什么
 
@@ -44,9 +46,11 @@ python -m deskcore.cli selftest    # 不装 supabase/anthropic 也能跑
 
 ## 三条纪律
 
-**`check_drafts` 不 fail-open。** 其它读类工具出错返回带 `error` 的可用结构不阻塞
-写稿；查重出错必须抛。静默放行就是重演 `config.py:132` 那个 `ENABLE_DEDUP_REGEN`
-默认关着、查重跑了但不拦的老问题。
+**fail-open 只有 `list_projects` / `borrow_lessons` / `my_style` 三个。**
+`open_project`（拿不到 P0 硬约束就照常开写 = 产出违规内容）和全部写类工具都**刻意
+没包** `_safe` —— 判据见 `tools.py:25` 的 docstring：失败之后调用方还会不会当作成功
+继续往下走，会就不能包。`check_drafts` 更不能，查重出错必须抛：静默放行就是重演
+`config.py:132` 那个 `ENABLE_DEDUP_REGEN` 默认关着、查重跑了但不拦的老问题。
 
 **别在 `deskcore/__init__` 之前 import db。** 它要先设 `AW_DISABLE_ST_CACHE=1`
 （R-042，同 `worker.py:56`），否则 headless 进程会拿 `st.cache_data` 的 30-60s 旧数据。

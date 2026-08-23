@@ -1,5 +1,9 @@
 # deskcore · 写作台内核外置为 MCP
 
+> 本文讲**为什么这么设计**。要看**现在是什么状态、还差什么、下一步做什么**，
+> 去 [`deskcore-runbook.md`](deskcore-runbook.md)——上线手册、对接矩阵、待办清单，
+> 以及一份「文档与实际不一致」的登记表。
+
 > **给谁看**：要把写作能力挂到 WorkBuddy / Claude Code / CodeBuddy 的人；以及以后维护 deskcore 的人。
 >
 > **一句话**：Streamlit 界面停用，内核做成 MCP 工具继续用。库里几年的积累一条不迁。
@@ -225,7 +229,11 @@ python -m deskcore.cli backfill --project <uuid>    # 每个项目跑一次
 
 `commit_drafts` 现在会在「配了 embedding 却没取到向量」时返回 `embedding_warning`，不再只给一个 `embedded: false` 让人自己猜。没回填时 `check_drafts` 的 summary 会带 `empty_history_warning`。
 
-向量的取法：`versions.embedding` 存的就是**标题**向量（`app.py:520` 只对 title 取向量），与 `draft_fingerprints.title_embedding` 同义，所以历史行有向量就**直接复用**，只有缺的才补算——几千条重算既慢又费钱。返回值里 `reused_embeddings` / `computed_embeddings` / `missing_embeddings` 分开报。
+向量的取法：`versions.embedding` 存的就是**标题**向量（`app.py:520` 只对 title 取向量），与 `draft_fingerprints.title_embedding` 同义，所以历史行有向量就**直接复用**，只有缺的才补算。返回值里 `reused_embeddings` / `computed_embeddings` / `missing_embeddings` 分开报。
+
+> ⚠️ **但生产库里一条都复用不到。** 2026-08-23 实测：`autowriter.versions` 5,532 行，`embedding` 非空的是 **0 条**。所以 backfill 时 `reused_embeddings` 会是 0，标题向量全部现算（4,574 条，几分钟、几毛钱）。
+>
+> 一条都没有的原因是这条路径每一层都静默：`dedup.py:58` `embed_texts` 失败返回 `None` 不抛异常 → `app.py:522` `if not new_vecs: return` 整段跳过 → `db.py:1338` 落库「errors are swallowed」→ `db.py:1310` 直接 `except Exception: pass`。详见 [`deskcore-runbook.md`](deskcore-runbook.md) §5.1。
 
 ⚠️ **没配 `GOOGLE_API_KEY` 时也能回填**，但那批行没有标题向量，只参与确定性查重。补配之后重跑**不会**给已写入的行补向量（幂等是按 `version_id` 跳过的）——要补得先把这些行删掉再跑。所以顺序上**先配好 embedding 再回填**。
 

@@ -1622,7 +1622,7 @@ def list_items_for_batches(
     【静默截断】：导出页少几篇，不报错、不告警，跟"那几篇本来就没写"看起来一样。
     (2026-08-23 审计: 当前最大项目 445 条, 还没撞上, 属于时间问题)
 
-    分页写法照搬本文件 _fetch_recent_titles(:1462) 那套：created_at 作主排序，
+    分页写法照搬本文件 _collect_recent_canonical_versions(:1454) 那套：created_at 作主排序，
     id 作【唯一且稳定】的次级键。少了次级键就不能翻页 —— created_at 在 bulk
     insert 下大量并列(同一语句共享 NOW())，无序 OFFSET 跨页会漏行/重行。
     """
