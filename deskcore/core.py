@@ -266,11 +266,22 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
         store.record_draw(client, project_id, reserved, user_id)
 
     tilt = rng.choice(vocab.WORD_TILTS)  # 词感是"今天的心情", 全批一致
+
+    # ⚠️ 角度池要洗牌, 不能每次都从 0 号开始取。
+    # 原来是 angles_pool[len(picked) % len(angles_pool)] —— 每次发牌都从头数,
+    # 于是【每批要的篇数少于角度数时, 后面的角度永远轮不到】: 6 个角度、每次
+    # 只发 3 篇, 那就永远只用前 3 个, 另外 3 个一次都不会出现。其他维度都随机
+    # 了, 唯独这一维退化成常量, 而这正是"跨批次别老写同样切入"要治的东西。
+    # 用本次请求的 rng 洗牌: seed 相同则结果可复现(draw 支持 seed 参数)。
+    # (codex review)
+    angle_order = list(angles_pool)
+    rng.shuffle(angle_order)
+
     picked: list[dict] = []
     for r in reserved:
         dims = r["dims"]
         lev = dims.get("emotional_lever", "")
-        angle = angles_pool[len(picked) % len(angles_pool)]
+        angle = angle_order[len(picked) % len(angle_order)]
         trends = ([vocab.TREND_EXCLUSIVE] if perpetual_bias
                   else vocab.normalize_trends([rng.choice(vocab.TREND_DEPENDENCIES)]))
         picked.append({
@@ -358,7 +369,7 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
     if not drafts:
         return {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
 
-    history = store.fingerprints(client, project_id)   # 故意让异常冒泡
+    history, hist_truncated = store.fingerprints(client, project_id)  # 故意让异常冒泡
 
     titles = [(d.get("title") or "").strip() for d in drafts]
     bodies = [d.get("body") or "" for d in drafts]
@@ -416,7 +427,10 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
         open_best = ((open_hit or {}).get("title", ""), "历史") if open_hit else None
 
         for k in range(i):   # 本批内互比: 同批两篇撞车同样要拦
-            if o_hashes[i] == o_hashes[k]:
+            # o_hashes[i] 为空 = 这篇没有正文开头。空 == 空【不算撞车】——
+            # 否则两篇 title-only 的稿子会被判成开头完全一致(见
+            # fp.opening_hash 的说明)。
+            if o_hashes[i] and o_hashes[i] == o_hashes[k]:
                 exact, open_best = True, (titles[k], "本批内")
                 break
             jj = fp.jaccard(grams[i], grams[k])
@@ -460,8 +474,16 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
         "history_size": len(history),
         "history_with_embedding": hist_with_vec,
         "history_missing_embedding": hist_missing_vec,
+        "history_truncated": hist_truncated,
         "semantic_degraded": degraded,
     }
+    if hist_truncated:
+        # history_size 报的是【实际比过的条数】, 但项目的历史比这更多。
+        # 不说出来的话, "比对全量历史" 就成了一句假话。
+        summary["history_truncated_warning"] = (
+            f"这个项目的历史指纹超过 {len(history)} 条, 本次只比了最近的这些。"
+            "更老的稿子没参与查重, 跟它们的重复不会被发现 —— 要告诉用户。"
+            "长期解法是把比对下推到数据库(见 docs/deskcore.md §7)。")
     # 指纹库是空的但项目其实有历史 = 没回填。硬闸背后什么都没有, 必须说出来,
     # 不能让调用方以为"比对了全量历史然后没撞车"。
     if not history:
@@ -507,7 +529,18 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         return {"written": 0, "consumed_angles": 0, "rejected": []}
 
     titles = [(d.get("title") or "").strip() for d in drafts]
-    vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
+    # ⚠️ embeddings_available() 判的是【客户端对象能不能建起来】(有 key + SDK
+    # 装了), 不是调用能不能成功, 而且那个 client 是进程级单例、启动时就缓存了。
+    # 所以 key 欠费/被封/配额用尽之后它照样返回 True, 真正失败的是下面这次
+    # embed_texts —— 它 catch 住异常返回 None。
+    # 这两者必须分开记: configured 为真而 vecs 为空 = 【本该有向量却没拿到】,
+    # 那是故障不是"没配"。不区分的话, 欠费那几天入库的稿子会安静地只有确定性
+    # 指纹, 而且【补不回来】—— backfill 走的是 items×versions, WorkBuddy 写的
+    # 稿子 version_id 为空、根本不在 autowriter.versions 里, backfill 永远看不到。
+    # 结果就是查重从此对那批内容有个洞, 不报错、也没人知道。
+    embed_configured = dedup.embeddings_available()
+    vecs = dedup.embed_texts(titles) if embed_configured else None
+    embed_failed = embed_configured and not vecs
 
     rows = []
     for i, d in enumerate(drafts):
@@ -519,6 +552,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             "opening": fp.opening_of(body),
             # RPC 侧按 text 转 vector, 这里给 pgvector 的字面量形式
             "title_embedding": ("[" + ",".join(repr(float(x)) for x in emb) + "]") if emb else None,
+            "embedding_model": dedup.EMBEDDING_MODEL if emb else None,
             "opening_hash": fp.opening_hash(body),
             "ngram_hashes": fp.ngram_hashes(body),
             "angle_key": d.get("angle_key"),
@@ -549,6 +583,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 "version_id": r["version_id"], "title": r["title"],
                 "opening": r["opening"],
                 "title_embedding": vecs[i] if vecs and i < len(vecs) else None,
+                "embedding_model": r["embedding_model"],
                 "opening_hash": r["opening_hash"],
                 "ngram_hashes": r["ngram_hashes"], "angle_key": r["angle_key"],
             })
@@ -572,7 +607,19 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
 
     out = {"written": written, "consumed_angles": consumed,
            "embedded": bool(vecs), "rejected": rejected,
-           "atomic_recheck": atomic}
+           "atomic_recheck": atomic,
+           "embedding_model": dedup.EMBEDDING_MODEL if vecs else None}
+    if embed_failed and written:
+        # 配了 embedding 却没拿到向量 = 故障(欠费/配额/网络), 不是"没配"。
+        # 这几行【补不回来】: backfill 走 items×versions, 而这些稿子的
+        # version_id 多半是空的、根本不在那张表里。所以必须当场说, 让人
+        # 决定是先修 key 再 commit, 还是接受这批只有确定性指纹。
+        out["embedding_warning"] = (
+            f"配了 embedding 但本次取向量失败, {written} 条是【没有标题向量】入库的。"
+            "它们以后只参与确定性查重(开头精确 + 四字串重合), 同角度换说法的标题"
+            "比不出来。常见原因是 key 欠费/配额用尽/网络不通。"
+            "⚠️ backfill 补不了这些行(它只扫 autowriter.versions), 要补得用 "
+            "`python -m deskcore.cli reembed --project <id>`。")
     if attempted and consumed < attempted:
         # consume_angle 现在会在"台账里根本没这一行"时返回 False(见 store 里的
         # 说明)。差额必须说出来 —— 这些坐标下一批还会被抽到, 悄悄少算等于
@@ -588,6 +635,52 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
                           "不存在, migrations/001 可能没跑)。并发 check/commit 时"
                           "可能有撞车的稿子一起进库。")
+    return out
+
+
+def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
+                         progress=None) -> dict:
+    """给指纹库里缺标题向量的行补上向量。
+
+    **和 backfill 是两件事, 别混。** backfill 把 autowriter.versions 里的历史
+    成稿【搬进】指纹库; reembed 修的是【已经在指纹库里、但当时没取到向量】的行。
+    后者 backfill 够不着 —— 它扫的是 items × versions, 而 WorkBuddy 写的稿子
+    version_id 为空、不在那张表里。
+
+    典型触发场景: embedding 的 key 欠费/配额用尽那几天照常 commit 了稿子,
+    它们只有确定性指纹。补上 key 之后跑这个。
+    """
+    if not dedup.embeddings_available():
+        return {"error": "embedding 不可用(GOOGLE_API_KEY 未配或 SDK 缺失), 无法补向量",
+                "fixed": 0, "pending": None}
+
+    rows = store.fingerprints_missing_vectors(client, project_id)
+    if not rows:
+        return {"pending": 0, "fixed": 0, "failed": 0,
+                "note": "没有缺向量的行, 不用补。"}
+
+    fixed = failed = 0
+    for start in range(0, len(rows), chunk):
+        part = rows[start:start + chunk]
+        vecs = dedup.embed_texts([r.get("title") or "" for r in part])
+        if vecs is None:
+            failed += len(part)
+            logger.warning("reembed: embed_texts failed for chunk at %d", start)
+            continue
+        for r, v in zip(part, vecs):
+            if v and store.set_fingerprint_vector(client, r["id"], v,
+                                                  dedup.EMBEDDING_MODEL):
+                fixed += 1
+            else:
+                failed += 1
+        if progress:
+            progress(min(start + chunk, len(rows)), len(rows))
+
+    out = {"pending": len(rows), "fixed": fixed, "failed": failed,
+           "embedding_model": dedup.EMBEDDING_MODEL}
+    if failed:
+        out["note"] = (f"{failed} 条没补上(embedding 调用失败或行已被改动)。"
+                       "可以再跑一次, 已补好的不会重复处理。")
     return out
 
 
@@ -658,6 +751,9 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
                 "title": r.get("title") or "",
                 "opening": fp.opening_of(body),
                 "title_embedding": vec or None,
+                # 复用的历史向量也是同一个模型产的(versions.embedding 就是
+                # 标题向量), 所以两条路径记的是同一个名字。
+                "embedding_model": dedup.EMBEDDING_MODEL if vec else None,
                 "opening_hash": fp.opening_hash(body),
                 "ngram_hashes": fp.ngram_hashes(body),
                 "angle_key": None,   # 历史稿不是发牌产出的, 没有坐标

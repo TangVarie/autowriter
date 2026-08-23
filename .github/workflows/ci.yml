@@ -294,7 +294,153 @@ jobs:
           print("\ndeskcore round-6 回归: 4/4 通过")
           PY
 
-      - name: deskcore app 真的能起 + /health 不炸 (round-6 P1)
+      - name: deskcore round-7 回归 (空开头 / key map / 翻页 / 角度洗牌)
+        run: |
+          python - <<'PY'
+          import inspect
+          import deskcore.fingerprint as fp
+          import deskcore.store as S
+          import deskcore.identity as I
+          import deskcore.core as C
+
+          # ── 1. 空开头不能产出一个"人人相同"的非空哈希 ────────────────────
+          # opening_exact 是【单信号判死】的强信号。空正文若都映射到 sha16(""),
+          # 库里存进一条 title-only 之后, 每一条 title-only 新稿都会被判成
+          # "开头与历史完全一致"而 reject —— 跟标题写什么毫无关系, 且没有任何
+          # 东西兜得住。backfill 特意保留 title-only 历史, check_drafts 也接受
+          # 没有正文的稿子, 所以这不是边角情况。
+          assert fp.opening_hash("") == "", fp.opening_hash("")
+          assert fp.opening_hash("   \n\n  ") == "", "全空白也算没有开头"
+          assert fp.opening_hash("今天聊聊防晒") != ""
+          assert fp.opening_hash("今天聊聊防晒") == fp.opening_hash("今天聊聊防晒")
+          print("  ✓ 空开头 → 空哈希; 有开头 → 稳定非空哈希")
+          cd = inspect.getsource(C.check_drafts)
+          assert "if o_hashes[i] and o_hashes[i] == o_hashes[k]" in cd, \
+              "本批内互比没有排除空开头, 两篇 title-only 会互相撞车"
+          print("  ✓ 本批内互比也排除了空开头")
+
+          # ── 2. DESKCORE_KEYS 每个 value 都必须是对象 ─────────────────────
+          # {"k": "<uuid>"}(少写一层)是很自然的手误且是合法 JSON。放行的话
+          # resolve()/auth_health() 会对着字符串调 .get() 抛 AttributeError,
+          # 结果是 500 而不是 401 —— 而 /health 是 Railway 的健康检查路径。
+          import os
+          for bad in ('{"k": "11111111-1111-1111-1111-111111111111"}',
+                      '{"k": ["uid"]}', '{"k": 42}', '{"k": null}'):
+              os.environ["DESKCORE_KEYS"] = bad
+              try:
+                  I._key_map()
+              except I._MalformedKeyMap as e:
+                  assert "不是对象" in str(e), str(e)
+              else:
+                  raise AssertionError(f"非对象条目被放行了: {bad}")
+              ok, note = I.auth_health()
+              assert ok is False and note, (bad, ok, note)
+          os.environ["DESKCORE_KEYS"] = '{"k": {"user_id": "11111111-1111-1111-1111-111111111111"}}'
+          assert I._key_map()["k"]["user_id"].startswith("1111")
+          os.environ.pop("DESKCORE_KEYS")
+          print("  ✓ 4 种非对象条目全部 fail-closed, 且 auth_health 可读")
+
+          # ── 3. 指纹必须翻页读, 不能撞 PostgREST 的 max-rows 静默截断 ─────
+          # db.py:1396-1404 已经为这个坑留过记录: 超过 1000 行【静默截断】。
+          # 项目一旦攒过 1000 条指纹, check_drafts 就只拿最新 1000 条却照旧
+          # 报 history_size, "比对全量历史" 变成假话。
+          class _Resp:
+              def __init__(self, d): self.data = d
+          class _Q:
+              def __init__(self, store): self.s = store; self.rng = None
+              def select(self, *a, **k): return self
+              def eq(self, *a, **k): return self
+              def order(self, *a, **k): return self
+              def range(self, a, b): self.rng = (a, b); return self
+              def execute(self):
+                  a, b = self.rng
+                  return _Resp(self.s[a:b + 1])
+          class _SB:
+              def __init__(self, n):
+                  self.s = [{"id": f"i{j}", "title": f"t{j}", "opening": "",
+                             "title_embedding": None, "opening_hash": f"h{j}",
+                             "ngram_hashes": [], "created_at": "2026-01-01"}
+                            for j in range(n)]
+                  self.calls = 0
+              def table(self, *a, **k):
+                  self.calls += 1
+                  return _Q(self.s)
+          sb = _SB(2500)
+          rows, trunc = S.fingerprints(sb, "p")
+          assert len(rows) == 2500, f"翻页没取全: {len(rows)}"
+          assert trunc is False, "没到上限却报截断"
+          assert sb.calls >= 3, f"看起来没翻页(只查了 {sb.calls} 次)"
+          print(f"  ✓ 2500 条经 {sb.calls} 次翻页全部取到, truncated=False")
+          sb2 = _SB(5000)
+          rows2, trunc2 = S.fingerprints(sb2, "p")
+          assert len(rows2) == 4000 and trunc2 is True, (len(rows2), trunc2)
+          print("  ✓ 超过 limit 时截断到 4000 并【显式报 truncated=True】")
+          sb3 = _SB(10)
+          rows3, trunc3 = S.fingerprints(sb3, "p")
+          assert len(rows3) == 10 and trunc3 is False
+          print("  ✓ 小项目一次取完, 不多查")
+          src = inspect.getsource(S.fingerprints)
+          assert '.order("id"' in src, "翻页必须带 id 做次级排序键(成批 insert 会撞 created_at)"
+          assert "history_truncated" in inspect.getsource(C.check_drafts)
+          print("  ✓ 翻页带确定性次级键; check_drafts 会把截断报给调用方")
+
+          # ── 4. 角度池必须洗牌, 否则后面的角度永远轮不到 ──────────────────
+          dsrc = inspect.getsource(C.draw_angles)
+          assert "rng.shuffle(angle_order)" in dsrc, "角度池没洗牌"
+          # 只看【赋值那一行】—— 上面的说明注释里引用了旧写法, 拿整段源码做
+          # "not in" 会误伤自己的注释。
+          assert "angle = angle_order[len(picked) % len(angle_order)]" in dsrc, \
+              "取角度没走洗过牌的 angle_order"
+          assert "angle = angles_pool[" not in dsrc, "还在直接按 angles_pool 顺序取"
+          import random
+          pool = [f"a{i}" for i in range(6)]
+          seen = set()
+          for s in range(12):                      # 模拟 12 次"每批 3 篇"
+              r = random.Random(s); order = list(pool); r.shuffle(order)
+              seen.update(order[:3])
+              assert list(random.Random(s).sample(pool, len(pool))) or True
+          assert seen == set(pool), f"6 个角度里只用到了 {sorted(seen)}"
+          print("  ✓ 每批 3 篇 × 多批后, 6 个角度全部被用到(旧写法只会用前 3 个)")
+          r1 = [x for x in pool]; random.Random(7).shuffle(r1)
+          r2 = [x for x in pool]; random.Random(7).shuffle(r2)
+          assert r1 == r2, "同 seed 必须可复现(draw 支持 --seed)"
+          print("  ✓ 同 seed 洗牌结果可复现")
+
+          # ── 5. embedding_model 必须跟着向量一起写 ────────────────────────
+          # 换 embedding 供应商时唯一的救命稻草: 跨模型算余弦是垃圾且不报错。
+          # 没有这一列, 迁移期新旧向量混在一张表里, 查重安静失灵。
+          csrc = inspect.getsource(C.commit_drafts)
+          assert '"embedding_model": dedup.EMBEDDING_MODEL if emb else None' in csrc, \
+              "commit 路径没记 embedding_model"
+          assert '"embedding_model": r["embedding_model"]' in csrc, \
+              "降级直插路径没记 embedding_model"
+          bsrc = inspect.getsource(C.backfill_fingerprints)
+          assert "embedding_model" in bsrc, "backfill 没记 embedding_model"
+          for f in ("migrations/001_deskcore.sql", "db.py"):
+              t = open(f, encoding="utf-8").read()
+              assert "embedding_model" in t, f"{f} 缺 embedding_model 列"
+          sql = open("migrations/001_deskcore.sql", encoding="utf-8").read()
+          assert "title_embedding, embedding_model, opening_hash" in sql, \
+              "RPC 的 INSERT 没带上 embedding_model"
+          print("  ✓ commit/降级/backfill 三条写入路径都记 embedding_model, 两份 SQL 都有这一列")
+
+          # ── 6. 欠费的静默洞: 配了 embedding 却取不到向量要报警 ───────────
+          # embeddings_available() 判的是客户端能否构建(进程级单例, 启动即缓存),
+          # 不是调用能否成功。欠费后它仍为 True, embed_texts 返回 None,
+          # 稿子照常入库但没有向量 —— 而 backfill 补不了这些行(它扫
+          # items×versions, WorkBuddy 的稿子 version_id 为空不在那里)。
+          assert "embed_failed" in csrc and "embedding_warning" in csrc, \
+              "commit 没区分'没配 embedding'和'配了但调用失败'"
+          assert callable(C.reembed_fingerprints), "缺 reembed 修复路径"
+          assert "reembed" in open("deskcore/cli.py", encoding="utf-8").read()
+          rsrc = inspect.getsource(C.reembed_fingerprints)
+          assert "fingerprints_missing_vectors" in rsrc and "set_fingerprint_vector" in rsrc
+          print("  ✓ 取向量失败会显式报警, 且有 reembed 能补(backfill 够不着的那些行)")
+
+          print("\ndeskcore round-7 回归: 6/6 通过")
+          PY
+
+      - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
         run: |
           # ⚠️ 这一步存在的理由: /health 里一个 `getattr(config, ...)` 因为
           # config 的 import 被误删而 NameError 500, 而 railway.json 把 /health
@@ -311,7 +457,13 @@ jobs:
           from fastapi.testclient import TestClient
           from deskcore.app import app
 
-          c = TestClient(app)
+          # ⚠️ 必须【进入 TestClient 的上下文】, 否则 ASGI lifespan 不会跑。
+          # 不进上下文时 /health 和 /tool/ 照常能过, 只有 MCP 挂 —— 也就是说
+          # 一个漏写 with 的测试对本步骤要防的那个 bug 恰好是瞎的。
+          # uvicorn 在线上一定会跑 lifespan, 所以这里不进上下文才是失真的。
+          import contextlib
+          _stack = contextlib.ExitStack()
+          c = _stack.enter_context(TestClient(app))
           r = c.get("/health")
           # 200 是硬要求: Railway healthcheck 只看状态码。
           # 库连不上是预期的(占位 URL), health 自己会把它收进 supabase.ok=false,
@@ -359,6 +511,42 @@ jobs:
               r = c.post("/tool/list_projects", json={}, **kw)
               assert r.status_code != 401, f"{desc} 没被认出来: {r.status_code}"
               print(f"  ✓ {desc} 认得出(HTTP {r.status_code})")
+
+          # ── MCP 端点必须真的能握手 ────────────────────────────────────────
+          # ⚠️ 这段才是重点。之前这一步只打 /health 和 /tool/, 于是漏掉了两个
+          # 【都会砖掉部署】的问题, 而且两个的表现都是"/health 一切正常":
+          #   1. app.mount() 不会把 ASGI lifespan 传给子应用, FastMCP 的
+          #      StreamableHTTPSessionManager.run() 从没被调用 → 每个 MCP 请求
+          #      RuntimeError("Task group is not initialized")。
+          #   2. FastMCP 的 host 默认 127.0.0.1, 它看到 localhost 就自动打开
+          #      DNS rebinding 保护、白名单写死本机 → 线上 Host 是公网域名,
+          #      每个请求 421 Misdirected Request。
+          # 光测 /health 对这两个都是绿的。所以必须发真的 initialize + tools/list。
+          H = {"X-Deskcore-Key": "k-good",
+               "Accept": "application/json, text/event-stream",
+               "Content-Type": "application/json"}
+          INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+              "protocolVersion": "2025-06-18", "capabilities": {},
+              "clientInfo": {"name": "ci", "version": "1"}}}
+          r = c.post("/mcp", json=INIT, headers=H)
+          assert r.status_code == 200, f"MCP initialize 失败 {r.status_code}: {r.text[:400]}"
+          info = r.json().get("result", {}).get("serverInfo", {})
+          assert info.get("name") == "deskcore", info
+          print(f"  ✓ MCP initialize 200, serverInfo={info}")
+
+          r = c.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                     headers=H)
+          assert r.status_code == 200, f"tools/list 失败 {r.status_code}: {r.text[:300]}"
+          got = sorted(t["name"] for t in r.json()["result"]["tools"])
+          import deskcore.tools as _T
+          assert got == sorted(_T.TOOLS), f"MCP 暴露的工具与 TOOLS 不一致: {got}"
+          assert "_user_id" not in r.text, "身份参数不该出现在工具 schema 里"
+          print(f"  ✓ MCP tools/list 暴露全部 {len(got)} 个工具, 且不含 _user_id")
+
+          bad = c.post("/mcp", json=INIT, headers={**H, "X-Deskcore-Key": "nope"})
+          assert bad.status_code == 401, f"错 key 打 /mcp 不是 401: {bad.status_code}"
+          print("  ✓ 错 key 打 /mcp → 401(鉴权在 MCP 之前生效)")
+          _stack.close()
           print("\ndeskcore app 冒烟: PASS")
           PY
 

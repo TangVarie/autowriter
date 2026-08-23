@@ -43,7 +43,17 @@ def sha16(text: str) -> str:
 
 
 def opening_hash(body: str) -> str:
-    return sha16(normalize(opening_of(body)))
+    """正文开头的指纹。**没有开头就返回空串, 不返回 sha16("") 那个常量。**
+
+    ⚠️ 这个 early return 不是洁癖: 没有它, 所有"只有标题、正文为空"的行都会
+    拿到【同一个】非空哈希。而 backfill 特意保留了 title-only 的历史版本、
+    check_drafts 也接受没有正文的稿子 —— 于是库里只要存进一条 title-only,
+    之后每一条 title-only 新稿都会被判成"正文开头与历史稿完全一致"而 reject,
+    跟它标题写什么毫无关系。opening_exact 是【强信号、单独就判死】, 所以这个
+    误伤没有任何东西能兜住。空开头就该让位给标题语义去判。(codex review)
+    """
+    opening = normalize(opening_of(body))
+    return sha16(opening) if opening else ""
 
 
 def ngram_hashes(text: str, n: int = 4, cap: int = 200) -> list[str]:

@@ -67,6 +67,18 @@ def _key_map() -> dict[str, dict]:
         raise _MalformedKeyMap(f"DESKCORE_KEYS is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise _MalformedKeyMap("DESKCORE_KEYS must be a JSON object")
+    # ⚠️ 每个 value 也必须是对象。写成 {"k": "<uuid>"}(少写一层)是很自然的手误,
+    # 而它是【合法 JSON】—— 于是这里放行, resolve() 和 auth_health() 后面对着
+    # 一个字符串调 .get() 抛 AttributeError, 结果是 500 而不是 401 或一句能读懂
+    # 的配置错误。/health 是 Railway 的健康检查路径, 它 500 = 部署起不来。
+    # 配置错误必须在【解析这一步】就变成可读的 401, 不能漏到运行期。
+    # (codex review)
+    bad = [k for k, v in parsed.items() if not isinstance(v, dict)]
+    if bad:
+        preview = ", ".join(f"{k[:6]}…" for k in bad[:5])
+        raise _MalformedKeyMap(
+            f"DESKCORE_KEYS 有 {len(bad)} 个条目的值不是对象({preview}) —— "
+            '每个 key 要写成 {"<key>": {"user_id": "<uuid>", "name": "..."}}')
     return parsed
 
 

@@ -204,6 +204,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-embeddings", action="store_true",
                    help="只写确定性指纹(开头 + 四字串), 不算标题向量")
 
+    p = sub.add_parser("reembed",
+                       help="给指纹库里【缺标题向量】的行补向量(欠费恢复后跑)")
+    p.add_argument("--project", required=True)
+
     p = sub.add_parser("check", help="查重")
     p.add_argument("--project", required=True)
     p.add_argument("--file", required=True,
@@ -245,6 +249,10 @@ def main(argv: list[str] | None = None) -> int:
         if out["written"] == 0 and out["already"] == 0:
             print("\n⚠️ 这个项目没有任何历史成稿 —— 如果不是全新项目, "
                   "检查 project_id 是不是传错了。")
+    elif args.cmd == "reembed":
+        def _prog2(done, total):
+            print(f"  {done}/{total}", flush=True)
+        _print(core.reembed_fingerprints(sb, args.project, progress=_prog2))
     elif args.cmd == "check":
         with open(args.file, encoding="utf-8") as fh:
             drafts = json.load(fh)

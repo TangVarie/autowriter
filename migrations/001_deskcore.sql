@@ -89,13 +89,27 @@ CREATE TABLE IF NOT EXISTS autowriter.draft_fingerprints (
     title           TEXT NOT NULL DEFAULT '',
     opening         TEXT NOT NULL DEFAULT '',
     title_embedding vector(768),
+    embedding_model TEXT,
     opening_hash    TEXT,
     ngram_hashes    TEXT[] NOT NULL DEFAULT '{}',
     angle_key       TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- 已有库补列(本迁移可能在表已存在时重跑)
+ALTER TABLE autowriter.draft_fingerprints
+    ADD COLUMN IF NOT EXISTS embedding_model TEXT;
 COMMENT ON COLUMN autowriter.draft_fingerprints.title_embedding IS
     'Gemini text-embedding-004 768d, 与 versions.embedding 同模型可互比';
+COMMENT ON COLUMN autowriter.draft_fingerprints.embedding_model IS
+    '产出 title_embedding 的模型名(如 text-embedding-004)。NULL = 这行没有向量。'
+    '⚠️ 换 embedding 供应商时唯一的救命稻草: 跨模型算余弦相似度出来的数是垃圾, '
+    '而且【不报错】—— 没有这一列, 迁移期新旧向量混在一张表里, 查重会安静地失灵, '
+    '只能靠"写入时间早于某某"去猜哪些是旧的。有了它, 换模型从停机重算变成增量迁移: '
+    '比对时只在同模型内比, 两套并存互不污染, 新的补齐了再退役旧的。'
+    '这一列必须在写第一条向量之前就存在, 补写的成本高得多。';
+CREATE INDEX IF NOT EXISTS draft_fp_embedding_model_idx
+    ON autowriter.draft_fingerprints (project_id, embedding_model)
+    WHERE title_embedding IS NOT NULL;
 COMMENT ON COLUMN autowriter.draft_fingerprints.opening_hash IS
     '正文首个非空行前 25 字规范化后 sha256 前 16 位 —— 标题换了也能抓';
 COMMENT ON COLUMN autowriter.draft_fingerprints.ngram_hashes IS
@@ -284,6 +298,7 @@ DECLARE
     hit      RECORD;
     best_j   NUMERIC;
     best_t   TEXT;
+    open_hit BOOLEAN;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('deskcore_draw:' || _project_id::text));
 
@@ -294,11 +309,22 @@ BEGIN
           FROM jsonb_array_elements_text(COALESCE(r->'ngram_hashes','[]'::jsonb)) x;
 
         -- ① 开头精确撞车
-        SELECT f.title INTO best_t
-          FROM autowriter.draft_fingerprints f
-         WHERE f.project_id = _project_id AND f.opening_hash = oh
-         LIMIT 1;
-        IF FOUND AND oh IS NOT NULL THEN
+        -- ⚠️ 空开头(正文为空的 title-only 稿)不参与这一条。Python 侧
+        -- fp.opening_hash 现在对空开头返回空串, 这里把空串和 NULL 一起排除 ——
+        -- 否则所有 title-only 的行会互相"精确撞车", 而 opening_exact 是单独
+        -- 就判死的强信号, 没有任何东西兜得住这个误伤。(codex review)
+        open_hit := FALSE;
+        IF oh IS NOT NULL AND oh <> '' THEN
+            SELECT TRUE, f.title INTO open_hit, best_t
+              FROM autowriter.draft_fingerprints f
+             WHERE f.project_id = _project_id
+               AND f.opening_hash = oh
+               AND f.opening_hash <> ''
+             LIMIT 1;
+            -- 撞上的那行标题本身可能为空, 所以判据用 open_hit 而不是 best_t。
+            open_hit := COALESCE(open_hit, FALSE);
+        END IF;
+        IF open_hit THEN
             idx := i; status := 'rejected';
             collided_with := best_t; detail := '正文开头与库中已有稿件完全一致';
             RETURN NEXT;
@@ -330,7 +356,7 @@ BEGIN
 
         INSERT INTO autowriter.draft_fingerprints
             (project_id, version_id, user_id, title, opening,
-             title_embedding, opening_hash, ngram_hashes, angle_key)
+             title_embedding, embedding_model, opening_hash, ngram_hashes, angle_key)
         VALUES (
             _project_id,
             NULLIF(r->>'version_id','')::uuid,
@@ -339,6 +365,7 @@ BEGIN
             COALESCE(r->>'opening',''),
             CASE WHEN r->'title_embedding' IS NULL OR jsonb_typeof(r->'title_embedding') = 'null'
                  THEN NULL ELSE (r->>'title_embedding')::vector END,
+            NULLIF(r->>'embedding_model',''),
             oh,
             ng,
             NULLIF(r->>'angle_key','')

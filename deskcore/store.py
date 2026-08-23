@@ -289,22 +289,53 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str) -> bool:
 
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────
 
-def fingerprints(sb, project_id: str, limit: int = 4000) -> list[dict]:
-    """项目【全量】历史指纹。
+PAGE = 1000        # PostgREST 默认 max-rows, 见下方说明
+
+
+def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bool]:
+    """项目【全量】历史指纹。返回 (rows, truncated)。
 
     ⚠️ 故意不吞异常: 查重是硬闸, 读不到历史就不能放行。这是 deskcore 里唯一
     不 fail-open 的路径(其余读类工具出错返回可用结构不阻塞写稿)。
+
+    ⚠️ 必须【翻页】而不是 .limit(4000)。PostgREST 的 max-rows 默认 1000, 超过
+    的部分**静默截断**(db.py:1396-1404 已经为此踩过一次坑)。项目一旦攒过
+    1000 条指纹, check_drafts 就只拿到最新的 1000 条、却照旧报 history_size
+    说自己比了全量 —— 老稿子的重复从此原样放行, 而"比对全量历史"正是这套东西
+    相对老工作台的核心卖点。(codex review)
+
+    排序必须带 id 做次级键: 指纹是【整块 insert】的(commit/backfill 都成批写),
+    同一批的 created_at 完全相同。只按 created_at 排, 翻页时同值行的相对顺序
+    没有保证 —— 会漏行也会重复行, 而且不报错。
     """
-    res = (sb.table("draft_fingerprints")
-             .select("id, title, opening, title_embedding, opening_hash, "
-                     "ngram_hashes, created_at")
-             .eq("project_id", project_id)
-             .order("created_at", desc=True)
-             .limit(limit).execute())
-    rows = res.data or []
+    cols = ("id, title, opening, title_embedding, opening_hash, "
+            "ngram_hashes, created_at")
+    rows: list[dict] = []
+    truncated = False
+    while len(rows) < limit:
+        start = len(rows)
+        end = min(start + PAGE, limit) - 1
+        res = (sb.table("draft_fingerprints")
+                 .select(cols)
+                 .eq("project_id", project_id)
+                 .order("created_at", desc=True)
+                 .order("id", desc=True)
+                 .range(start, end).execute())
+        page = res.data or []
+        rows.extend(page)
+        if len(page) < (end - start + 1):
+            break                      # 取完了
+    else:
+        # 没 break = 撞到 limit。再探一行, 确认后面是不是还有。
+        probe = (sb.table("draft_fingerprints").select("id")
+                   .eq("project_id", project_id)
+                   .order("created_at", desc=True).order("id", desc=True)
+                   .range(limit, limit).execute())
+        truncated = bool(probe.data)
+
     for r in rows:
         r["title_embedding"] = db._parse_pgvector(r.get("title_embedding"))
-    return rows
+    return rows, truncated
 
 
 def legacy_versions(sb, project_id: str, limit: int = 5000) -> list[dict]:
@@ -362,6 +393,32 @@ def existing_fingerprint_version_ids(sb, project_id: str) -> set[str]:
     except Exception:
         logger.exception("read existing fingerprint version_ids failed")
         raise
+
+
+def fingerprints_missing_vectors(sb, project_id: str, limit: int = 2000) -> list[dict]:
+    """指纹库里【缺标题向量】的行。给 reembed 用。
+
+    为什么不能靠 backfill 补: backfill 扫的是 items × versions, 而 WorkBuddy
+    写的稿子 version_id 是空的、根本不在 autowriter.versions 里。欠费那几天
+    commit 进来的行, backfill 永远看不到 —— 只能从指纹表这一侧修。
+    """
+    res = (sb.table("draft_fingerprints").select("id, title")
+             .eq("project_id", project_id)
+             .is_("title_embedding", "null")
+             .neq("title", "")
+             .order("created_at", desc=True)
+             .limit(limit).execute())
+    return res.data or []
+
+
+def set_fingerprint_vector(sb, row_id: str, vec: list[float], model: str) -> bool:
+    """给一条已有指纹补上标题向量 + 记下是哪个模型产的。"""
+    res = (sb.table("draft_fingerprints")
+             .update({"title_embedding": vec, "embedding_model": model})
+             .eq("id", row_id)
+             .is_("title_embedding", "null")   # 别覆盖已有向量
+             .execute())
+    return bool(res.data)
 
 
 def write_fingerprints(sb, rows: list[dict]) -> int:

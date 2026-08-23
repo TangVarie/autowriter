@@ -194,7 +194,18 @@ python -m deskcore.cli backfill --project <uuid>    # 每个项目跑一次
 
 ⚠️ 迁移建的是**空表**，而 `check_drafts` 只读这张表、只有 `commit_drafts` 会往里写。不回填的话，**刚上线那天号称"比对全量历史"的硬闸背后一条历史都没有**，老稿子的重复会原样放行。
 
-回填是幂等的（按 `version_id` 跳过已有的），可以反复跑。没回填时 `check_drafts` 的 summary 会带 `empty_history_warning`。
+回填是幂等的（按 `version_id` 跳过已有的），可以反复跑。
+
+**`backfill` 和 `reembed` 是两件事，别混：**
+
+| | 干什么 | 够得着哪些行 |
+|---|---|---|
+| `backfill` | 把 `autowriter.versions` 里的历史成稿**搬进**指纹库 | 只有 `items × versions` 里的 |
+| `reembed` | 给**已经在指纹库里、但当时没取到向量**的行补向量 | 指纹表里所有缺向量的 |
+
+典型场景：embedding 的 key 欠费那几天照常 commit 了稿子，它们只有确定性指纹。那些行 **`backfill` 永远够不着**——它扫的是 `items × versions`，而 WorkBuddy 写的稿子 `version_id` 是空的、根本不在那张表里。补好 key 之后跑 `python -m deskcore.cli reembed --project <uuid>`。
+
+`commit_drafts` 现在会在「配了 embedding 却没取到向量」时返回 `embedding_warning`，不再只给一个 `embedded: false` 让人自己猜。没回填时 `check_drafts` 的 summary 会带 `empty_history_warning`。
 
 向量的取法：`versions.embedding` 存的就是**标题**向量（`app.py:520` 只对 title 取向量），与 `draft_fingerprints.title_embedding` 同义，所以历史行有向量就**直接复用**，只有缺的才补算——几千条重算既慢又费钱。返回值里 `reused_embeddings` / `computed_embeddings` / `missing_embeddings` 分开报。
 

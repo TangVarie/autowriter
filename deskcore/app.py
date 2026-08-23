@@ -35,6 +35,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 import os
@@ -83,7 +84,41 @@ def _call_tool(name: str, args: dict) -> object:
     return fn(**kwargs)
 
 
-app = FastAPI(title="deskcore · 写作台内核", version=VERSION)
+# ⚠️ _mcp 必须在 app 之前建好: FastAPI 的 lifespan 要在构造时传进去, 而
+# lifespan 里要用 _mcp.session_manager。_register_mcp 定义在文件更下面, 靠
+# 模块末尾的赋值太晚 —— 所以这里前置声明, 末尾再真正注册路由。
+_mcp = None
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """把 MCP 的 session manager 跑起来。
+
+    ⚠️ 这个不是可选的样板 —— 没有它 /mcp 【整个不能用】。
+    app.mount() 挂子应用时, ASGI 的 lifespan 事件【只发给顶层 app】, 不会往
+    被 mount 的子应用传。而 FastMCP 的 streamable_http_app() 把
+    StreamableHTTPSessionManager.run() 放在它自己的 lifespan 里。于是 session
+    manager 的 task group 永远没启动, 每个 MCP 请求在
+    streamable_http_manager.py 里抛
+    `RuntimeError: Task group is not initialized. Make sure to use run().`
+
+    最坏的地方是【/health 完全正常】: 库通、词表校验和对、鉴权也对, Railway
+    healthcheck 一路绿, 服务显示 healthy —— 然后每个 MCP 调用 500。
+    round-6 那个冒烟测试只打了 /health 和 /tool/, 正好绕过这里, 所以它一路绿
+    到 review。CI 现在会真发一次 initialize 握手。(codex review)
+
+    stateless_http=True 也救不了 —— 无状态指的是不保留跨请求会话, task group
+    照样要先起来。
+    """
+    if _mcp is None:
+        yield
+        return
+    async with _mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(title="deskcore · 写作台内核", version=VERSION,
+              lifespan=_lifespan)
 
 
 @app.middleware("http")
@@ -222,8 +257,29 @@ def _register_mcp():
     # 子应用自己就带 /mcp 路由; 再 app.mount("/mcp", ...) 会让真实端点变成
     # /mcp/mcp —— 文档里给 WorkBuddy / Claude Code 的地址是 /mcp, 初始化请求
     # 会打到空处, 而且不报错只是 404。(实测: 默认路由 ['/mcp'], 设 "/" 后 ['/'])
+    # ⚠️ transport_security 必须显式传, 否则 /mcp 在 Railway 上【每个请求 421】。
+    # FastMCP 的 host 默认是 "127.0.0.1", 而它看到 localhost 就【自动打开】
+    # DNS rebinding 保护, 白名单写死成 127.0.0.1:* / localhost:* / [::1]:*
+    # (fastmcp/server.py:180-185)。线上 Host 头是 Railway 的公网域名, 不在名单里
+    # → TransportSecurityMiddleware 回 421 Misdirected Request。
+    # 而 /health 一切正常, 所以又是一个"部署显示健康、功能整个不可用"。
+    #
+    # 这里默认【关掉】而不是猜一个白名单: DNS rebinding 防的是浏览器打本机
+    # 服务那种场景, 我们是带 key 的公网服务, 本来就靠 identity 那层挡;
+    # 而白名单写错的表现是 421, 看起来像客户端的问题, 极难查。
+    # 要收紧就配 DESKCORE_ALLOWED_HOSTS(逗号分隔, 支持 "host:*" 通配),
+    # /health 会回显当前生效的口径。
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    allowed = [h.strip() for h in
+               (os.environ.get("DESKCORE_ALLOWED_HOSTS") or "").split(",") if h.strip()]
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=bool(allowed),
+        allowed_hosts=allowed,
+        allowed_origins=allowed,
+    )
     mcp = FastMCP(name="deskcore", stateless_http=True, json_response=True,
-                  streamable_http_path="/")
+                  streamable_http_path="/", transport_security=security)
 
     def _wrap(fn, needs_user: bool):
         # 把 _user_id 从签名里摘掉再注册 —— 模型不该看到它, 也不该能传它。

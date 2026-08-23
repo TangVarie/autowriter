@@ -716,15 +716,25 @@ CREATE TABLE IF NOT EXISTS draft_fingerprints (
     opening         TEXT NOT NULL DEFAULT '',
     -- 与 versions.embedding 同一个模型(Gemini text-embedding-004), 可互比
     title_embedding vector(768),
-    -- 正文首个非空行前 25 字规范化后的 sha256 前 16 位。标题换了也能抓
+    -- 产出上面那个向量的模型名。NULL = 这行没有向量。
+    -- ⚠️ 换 embedding 供应商时唯一的救命稻草: 跨模型算余弦是垃圾且【不报错】,
+    -- 没有这一列, 迁移期新旧向量混在一张表里, 查重会安静地失灵。
+    -- 完整理由见 migrations/001_deskcore.sql 里这一列的 COMMENT。
+    embedding_model TEXT,
+    -- 正文首个非空行前 25 字规范化后的 sha256 前 16 位。标题换了也能抓。
+    -- 空开头存空串而不是 sha16("") —— 否则所有 title-only 的行会互相"精确撞车"。
     opening_hash    TEXT,
     -- 正文四字串 shingle 的 hash 采样, 抓"换了词还是同一篇"的换皮改写
     ngram_hashes    TEXT[] NOT NULL DEFAULT '{}',
     angle_key       TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE draft_fingerprints ADD COLUMN IF NOT EXISTS embedding_model TEXT;
 CREATE INDEX IF NOT EXISTS draft_fp_project_created_idx
     ON draft_fingerprints (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS draft_fp_embedding_model_idx
+    ON draft_fingerprints (project_id, embedding_model)
+    WHERE title_embedding IS NOT NULL;
 CREATE INDEX IF NOT EXISTS draft_fp_opening_hash_idx
     ON draft_fingerprints (project_id, opening_hash) WHERE opening_hash IS NOT NULL;
 CREATE INDEX IF NOT EXISTS draft_fp_ngram_gin_idx
