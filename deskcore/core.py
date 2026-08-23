@@ -129,11 +129,18 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # 把它作为独立一层注入(app.py:1066 / 3131 / 4857)。deskcore 不带的话, 项目
     # 配好的战术专属写作指令会【静默丢失】—— 传了 tactic 名却只影响正例排序。
     # (codex review P1)
+    import projects as proj_module   # 纯函数; CI 的 import 图冒烟已覆盖该模块
     tactic_name = (brief.get("tactic") or "").strip()
     tactic_suffix = ""
     if tactic_name:
-        import projects as proj_module   # 纯函数; CI 的 import 图冒烟已覆盖该模块
         tactic_suffix = proj_module.get_tactic_prompt_suffix(project, tactic_name) or ""
+
+    # ⚠️ tactics 必须解码再返回。db.create_project 和战术设置页都是用
+    # json.dumps 存的, PostgREST 原样带回一个【JSON 字符串】而不是 list ——
+    # 直接透传的话, MCP 调用方拿到的 tactics 是一坨字符串, 想枚举有哪些战术
+    # 只能自己猜着 json.loads。用 projects 里那个同款解析器
+    # (get_tactic_prompt_suffix 内部就是它), 口径保持一处。(codex review)
+    tactics = proj_module._parse_json_field(project.get("tactics"), []) or []
 
     # ── soft 规则: 相关性过滤 + 封顶 ────────────────────────────────
     # hard 全量保留(合规, 不能因为"跟本次不相关"就丢)。soft 要过一遍
@@ -178,7 +185,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         "tactic_layer": layers.get("tactic", ""),
         "p0": layers.get("p0", ""),
         "p1": layers.get("p1", ""),
-        "tactics": project.get("tactics") or [],
+        "tactics": tactics,
         "counts": {
             "hard_rules": len(hard),
             "soft_rules": len(soft),
@@ -318,6 +325,15 @@ def render_angles_block(angles: list[dict]) -> str:
             f" · 内容形式={d['content_format']}"
             f" · 标题句式={d['title_structure']}"
             f" · 切入角度={a['angle_name']}")
+        # ⚠️ 时效依赖必须渲进来。它是发牌时抽的(perpetual_bias=True 时强制抽
+        # 排他值「通用」), 但这个块才是文档让人贴进 prompt 的东西 —— 不渲染
+        # 的话模型根本收不到, perpetual_bias 这个开关等于没接线, 除非调用方
+        # 自己去翻原始 angles。(codex review)
+        trends = a.get("trend_dependencies") or []
+        if trends:
+            note = ("（排他值：全篇不得出现任何时事、节日、平台事件、流行词等"
+                    "时效元素）" if vocab.TREND_EXCLUSIVE in trends else "")
+            lines.append(f"    ↳ 时效依赖：{'、'.join(trends)}{note}")
         if a.get("boundary_rule"):
             lines.append(f"    ↳ 判据：{a['boundary_rule']}")
         if a.get("angle_brief"):
@@ -388,31 +404,53 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
 
         exact = o_hashes[i] in hist_open
         open_hit = hist_open.get(o_hashes[i])
-        intra = None
+
+        # ⚠️ 每个信号的最佳命中【各记各的】, 且各自记清楚是本批内还是历史。
+        # 原来共用一个 intra 变量, 只要任一信号的最佳命中来自本批内就无条件
+        # 认定"撞的是本批内那篇" —— 但真正让 verdict 判死的可能是另一个信号、
+        # 而那个信号的命中在历史里。于是报出去的 collided_with 是一条根本没
+        # 引发拒绝的稿子, 人对着它改, 改完还是过不了。(codex review)
+        # hit = (标题, 归属)  归属 ∈ {"本批内", "历史"}
+        sim_best = ((sim_hit or {}).get("title", ""), "历史") if sim_hit else None
+        j_best = ((j_hit or {}).get("title", ""), "历史") if j_hit else None
+        open_best = ((open_hit or {}).get("title", ""), "历史") if open_hit else None
 
         for k in range(i):   # 本批内互比: 同批两篇撞车同样要拦
             if o_hashes[i] == o_hashes[k]:
-                exact, intra = True, titles[k]
+                exact, open_best = True, (titles[k], "本批内")
                 break
             jj = fp.jaccard(grams[i], grams[k])
             if jj > best_j:
-                best_j, j_hit, intra = jj, None, titles[k]
+                best_j, j_best = jj, (titles[k], "本批内")
             if new_vecs:
                 s = dedup.cosine_similarity(new_vecs[i], new_vecs[k])
                 if s > best_sim:
-                    best_sim, sim_hit, intra = s, None, titles[k]
+                    best_sim, sim_best = s, (titles[k], "本批内")
 
-        status, reason = verdict(best_sim, exact, best_j)
-        collided = (intra or (open_hit or {}).get("title")
-                    or (sim_hit or {}).get("title") or (j_hit or {}).get("title") or "")
-        results.append({
+        status, reason, which = fp.deciding_signals(best_sim, exact, best_j)
+        by_signal = {"opening": open_best, "title": sim_best, "ngram": j_best}
+        # 按 verdict 实际依据的信号取命中; 两个弱信号并列时取第一个(它排在
+        # reason 的最前面, 与用户读到的解释对得上)。pass 时没有依据信号,
+        # 退回"最强的那个"只为让人知道最接近的是什么, 并注明是参考。
+        hit = next((by_signal[s] for s in which if by_signal.get(s)), None)
+        informational = False
+        if hit is None:
+            hit = open_best or sim_best or j_best
+            informational = hit is not None
+        collided, scope = hit if hit else ("", "")
+        row = {
             "index": i, "title": titles[i], "status": status, "reason": reason,
             "collided_with": collided,
-            "collided_scope": "本批内" if intra else ("历史" if collided else ""),
+            "collided_scope": scope,
+            "decided_by": which,
             "signals": {"title_similarity": round(best_sim, 4),
                         "opening_exact_match": exact,
                         "body_ngram_jaccard": round(best_j, 4)},
-        })
+        }
+        if informational:
+            row["collided_note"] = ("这条判定为通过, collided_with 只是最接近的"
+                                    "参照, 不是拦下它的原因。")
+        results.append(row)
 
     summary = {
         "total": len(results),
@@ -550,6 +588,99 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
                           "不存在, migrations/001 可能没跑)。并发 check/commit 时"
                           "可能有撞车的稿子一起进库。")
+    return out
+
+
+def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = True,
+                          chunk: int = 50, progress=None) -> dict:
+    """把项目的历史成稿补进指纹库。**部署后每个项目必跑一次。**
+
+    为什么必须有: migrations/001 建的是【空表】, 而 check_drafts 只读这张表、
+    只有 commit_drafts 会往里写。不回填的话, 上线第一天号称"比对全量历史"的
+    硬闸手里一条历史都没有 —— 几年的老稿子对它全是新的, 重复原样放行。
+    (codex review: 这条先被指出过一次, 我加了 CLI 子命令和文档却【没写这个
+    函数】, 于是 `deskcore.cli backfill` 每次都 AttributeError —— 等于回填这件
+    事从头到尾没存在过, 而文档和 PR 都写着它已经有了。)
+
+    幂等: 已经有指纹的 version_id 跳过, 重跑安全。
+
+    embedding 的取法有讲究: `versions.embedding` 存的就是**标题**向量
+    (app.py:520 只对 title 取向量), 与 draft_fingerprints.title_embedding 同义,
+    所以历史行有向量就【直接复用】, 不重新调 API —— 几千条重算既慢又费钱。
+    只有缺向量的才补算, 且 embedding 不可用时照常写入(向量留空), 确定性信号
+    不受影响。
+    """
+    rows = store.legacy_versions(client, project_id)
+    total = len(rows)
+    if not total:
+        return {"total": 0, "already": 0, "written": 0, "embedded": 0,
+                "reused_embeddings": 0, "missing_embeddings": 0}
+
+    done_ids = store.existing_fingerprint_version_ids(client, project_id)
+    todo = [r for r in rows if r.get("version_id") not in done_ids]
+    already = total - len(todo)
+    if not todo:
+        return {"total": total, "already": already, "written": 0, "embedded": 0,
+                "reused_embeddings": 0, "missing_embeddings": 0}
+
+    can_embed = with_embeddings and dedup.embeddings_available()
+    written = reused = computed = missing = 0
+
+    for start in range(0, len(todo), chunk):
+        part = todo[start:start + chunk]
+
+        # 缺向量的才补算, 有的直接复用(见 docstring)
+        need = [i for i, r in enumerate(part) if not r.get("embedding")]
+        fresh: list[list[float]] | None = None
+        if can_embed and need:
+            fresh = dedup.embed_texts([part[i]["title"] for i in need])
+            if fresh is None:
+                logger.warning("backfill: embed_texts failed for chunk at %d; "
+                               "writing those rows without vectors", start)
+
+        payload = []
+        for i, r in enumerate(part):
+            vec = r.get("embedding")
+            if vec:
+                reused += 1
+            elif fresh is not None:
+                pos = need.index(i)
+                vec = fresh[pos] if pos < len(fresh) else None
+                if vec:
+                    computed += 1
+            if not vec:
+                missing += 1
+            body = r.get("body") or ""
+            payload.append({
+                "project_id": project_id,
+                "user_id": r.get("user_id"),
+                "version_id": r.get("version_id"),
+                "title": r.get("title") or "",
+                "opening": fp.opening_of(body),
+                "title_embedding": vec or None,
+                "opening_hash": fp.opening_hash(body),
+                "ngram_hashes": fp.ngram_hashes(body),
+                "angle_key": None,   # 历史稿不是发牌产出的, 没有坐标
+            })
+
+        written += store.write_fingerprints(client, payload)
+        if progress:
+            progress(min(start + chunk, len(todo)), len(todo))
+
+    out = {
+        "total": total, "already": already, "written": written,
+        "embedded": reused + computed,
+        "reused_embeddings": reused, "computed_embeddings": computed,
+        "missing_embeddings": missing,
+    }
+    if missing:
+        out["note"] = (
+            f"{missing}/{written} 条没有标题向量"
+            + ("(GOOGLE_API_KEY 未配或 embedding 调用失败)。" if not can_embed or computed == 0
+               else "。")
+            + "这些历史稿只参与确定性查重(开头精确 + 四字串重合), "
+              "同角度换说法的标题比不出来。配好 embedding 后重跑本命令不会重复写入, "
+              "但也【不会】给已写入的行补向量 —— 要补得先删掉这些行。")
     return out
 
 

@@ -196,6 +196,12 @@ python -m deskcore.cli backfill --project <uuid>    # 每个项目跑一次
 
 回填是幂等的（按 `version_id` 跳过已有的），可以反复跑。没回填时 `check_drafts` 的 summary 会带 `empty_history_warning`。
 
+向量的取法：`versions.embedding` 存的就是**标题**向量（`app.py:520` 只对 title 取向量），与 `draft_fingerprints.title_embedding` 同义，所以历史行有向量就**直接复用**，只有缺的才补算——几千条重算既慢又费钱。返回值里 `reused_embeddings` / `computed_embeddings` / `missing_embeddings` 分开报。
+
+⚠️ **没配 `GOOGLE_API_KEY` 时也能回填**，但那批行没有标题向量，只参与确定性查重。补配之后重跑**不会**给已写入的行补向量（幂等是按 `version_id` 跳过的）——要补得先把这些行删掉再跑。所以顺序上**先配好 embedding 再回填**。
+
+> 这个函数曾经**根本不存在**。CLI 子命令、本文档、PR 描述、连"部署必跑一次"的措辞都写好了，唯独没写函数体，`deskcore.cli backfill` 每次都 `AttributeError` —— 也就是回填这件事从头到尾没发生过，而所有文字都写着它已经有了。`py_compile` 抓不到（属性错误是运行期），所以 CI 现在有一步反射 `cli.py` 里所有 `core.xxx(` 调用、逐个断言存在。
+
 ### 4.2 自测
 
 ```bash

@@ -207,6 +207,161 @@ jobs:
 
           print("\ndeskcore round-5 回归: 9/9 通过")
           PY
+
+      - name: deskcore round-6 回归 (回填函数存在 / 撞车归因 / 坐标块完整)
+        run: |
+          python - <<'PY'
+          import inspect
+          import deskcore.core as C
+          import deskcore.fingerprint as fp
+          import deskcore.cli as cli
+
+          # ── 1. CLI 调到的 core 函数必须真的存在 ──────────────────────────────
+          # 惨痛教训: backfill 子命令、文档、PR 描述、甚至"部署时必跑一次"的
+          # 说明全写好了, 但 core.backfill_fingerprints 【根本没写】——
+          # 每次调用都 AttributeError, 回填这件事从头到尾没存在过。
+          # py_compile 抓不到(属性错误是运行期), 于是一路绿到 review 才被发现。
+          src = inspect.getsource(cli)
+          called = sorted(set(__import__("re").findall(r"core\.([a-zA-Z_][a-zA-Z0-9_]*)\(", src)))
+          missing = [n for n in called if not callable(getattr(C, n, None))]
+          assert not missing, f"cli.py 调了 core 里不存在的函数: {missing}"
+          print(f"  ✓ cli.py 调用的 {len(called)} 个 core 函数全部存在: {called}")
+          assert callable(C.backfill_fingerprints), "backfill_fingerprints 必须存在"
+
+          # ── 2. 撞车归因: 必须跟着【定死结论的那个信号】走 ────────────────────
+          # 场景: 本批内有一条标题相似 0.85(够 warn 不够 hard), 历史有一条正文
+          # 四字串 0.40(过 HARD 线)。判死的是 ngram、命中在历史, 但老代码只要
+          # intra 非空就报"本批内 + 那条标题" —— 人对着一条没引发拒绝的稿子改。
+          st, why, which = fp.deciding_signals(0.85, False, 0.40)
+          assert st == "reject" and which == ["ngram"], (st, which)
+          print(f"  ✓ 标题 0.85 + 正文 0.40 → reject, 依据={which}(不是 title)")
+          st, why, which = fp.deciding_signals(0.95, False, 0.0)
+          assert st == "reject" and which == ["title"], (st, which)
+          st, why, which = fp.deciding_signals(0.0, True, 0.0)
+          assert st == "reject" and which == ["opening"], (st, which)
+          st, why, which = fp.deciding_signals(0.86, False, 0.25)
+          assert st == "reject" and which == ["title", "ngram"], (st, which)
+          st, why, which = fp.deciding_signals(0.86, False, 0.0)
+          assert st == "warn" and which == ["title"], (st, which)
+          st, why, which = fp.deciding_signals(0.1, False, 0.05)
+          assert st == "pass" and which == [], (st, which)
+          print("  ✓ deciding_signals 六种组合的依据信号都对")
+          # 两元组包装必须与三元组一致 —— cli 的 selftest 还在用它
+          for a, b, c in [(0.85, False, 0.40), (0.0, True, 0.0), (0.1, False, 0.05)]:
+              assert fp.verdict(a, b, c) == fp.deciding_signals(a, b, c)[:2]
+          print("  ✓ verdict() 包装与 deciding_signals 结论一致")
+          # check_drafts 必须真的用了归因, 而不是又退回 `intra or ...`
+          cd = inspect.getsource(C.check_drafts)
+          assert "deciding_signals" in cd, "check_drafts 没用归因结果"
+          assert "by_signal" in cd and "decided_by" in cd, "撞车归因没接上"
+          print("  ✓ check_drafts 按 decided_by 归因, 不再无条件优先本批内")
+
+          # ── 3. 坐标块必须把发牌抽到的维度【全部】渲进去 ──────────────────────
+          # trend_dependencies 漏渲过一次: perpetual_bias=True 强制抽了排他值
+          # 「通用」, 但它没进 prompt_block —— 而文档让人直接贴 prompt_block,
+          # 于是这个开关等于没接线。
+          import deskcore.vocab as V
+          ANG = [{
+              "slot": 1, "angle_key": "k",
+              "dims": {"emotional_lever": "焦虑撬动", "human_truth_archetype": "怕落后",
+                       "content_format": "测评", "title_structure": "疑问式"},
+              "emotional_valence": "负向", "emotional_intensity": "强",
+              "trend_dependencies": [V.TREND_EXCLUSIVE],
+              "word_tilt": "口语", "angle_name": "成本账", "angle_brief": "",
+              "boundary_rule": "",
+          }]
+          block = C.render_angles_block(ANG)
+          for field in ("焦虑撬动", "怕落后", "测评", "疑问式", "成本账", "口语",
+                        V.TREND_EXCLUSIVE):
+              assert field in block, f"坐标块漏了 {field}\n{block}"
+          assert "排他值" in block, "排他值「通用」必须带上不得出现时效元素的说明"
+          print(f"  ✓ prompt_block 覆盖全部发牌维度, 含 trend_dependencies({V.TREND_EXCLUSIVE})")
+          # 非排他值也要渲染, 但不该带排他说明
+          ANG[0]["trend_dependencies"] = ["季节性事件"]
+          block = C.render_angles_block(ANG)
+          assert "季节性事件" in block and "排他值" not in block, block
+          print("  ✓ 普通时效值照常渲染, 不误加排他说明")
+
+          # ── 4. tactics 必须解码成 list 再返回 ────────────────────────────────
+          bw = inspect.getsource(C.build_writing_brief)
+          assert '"tactics": tactics' in bw and "_parse_json_field" in bw, \
+              "tactics 没走 projects 的解析器, MCP 调用方会拿到 JSON 字符串"
+          import projects as P
+          assert P._parse_json_field('[{"name": "情感种草"}]', []) == [{"name": "情感种草"}]
+          assert P._parse_json_field(None, []) == []
+          print("  ✓ tactics 经 projects._parse_json_field 解码后返回")
+
+          print("\ndeskcore round-6 回归: 4/4 通过")
+          PY
+
+      - name: deskcore app 真的能起 + /health 不炸 (round-6 P1)
+        run: |
+          # ⚠️ 这一步存在的理由: /health 里一个 `getattr(config, ...)` 因为
+          # config 的 import 被误删而 NameError 500, 而 railway.json 把 /health
+          # 配成健康检查路径 —— 部署会永远起不来。
+          # py_compile 抓不到(运行期错误), 下面那步 import 图又刻意不 import
+          # app.py(它需要 fastapi + mcp, 不在主 lockfile 里)。于是 app.py 的
+          # 运行期问题在 CI 里【完全没有覆盖】。这里补上: 装增量依赖, 起
+          # TestClient 真打一次 /health。
+          pip install -r deskcore/requirements.txt httpx
+          python - <<'PY'
+          import os
+          os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
+          os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "sb_secret_placeholder")
+          from fastapi.testclient import TestClient
+          from deskcore.app import app
+
+          c = TestClient(app)
+          r = c.get("/health")
+          # 200 是硬要求: Railway healthcheck 只看状态码。
+          # 库连不上是预期的(占位 URL), health 自己会把它收进 supabase.ok=false,
+          # 不该让整个响应炸掉 —— 那正是这次的 bug。
+          assert r.status_code == 200, f"/health 返回 {r.status_code}: {r.text[:500]}"
+          body = r.json()
+          for k in ("service", "version", "tools", "config"):
+              assert k in body, f"/health 少了 {k}: {body}"
+          cfg = body["config"]
+          for k in ("model", "supabase", "embeddings", "vendored_vocab",
+                    "librarian", "auth", "st_cache_disabled"):
+              assert k in cfg, f"/health config 少了 {k}: {cfg}"
+          assert body["tools"], "/health 没回显工具清单"
+          print(f"  ✓ /health 200, model={cfg['model']}, tools={len(body['tools'])} 个")
+
+          # 未配鉴权 = dev 模式放行(与 librarian/onboarder/worker 同口径, 刻意的)。
+          # 但 /health 必须把它标成【不健康】—— 生产忘配就等于匿名开放。
+          assert cfg["auth"]["ok"] is False and "dev" in cfg["auth"]["note"], cfg["auth"]
+          assert body["ok"] is False, "未配鉴权时整体 ok 不该是 true"
+          print("  ✓ 未配鉴权: 放行但 /health 标 auth.ok=false + 整体 ok=false")
+
+          # 配坏了(DESKCORE_KEYS 不是合法 JSON) → 必须 401, 【不能】退化成 dev 放行。
+          # 生产上一个逗号写错就等于把项目数据和全部写工具匿名开放出去。
+          os.environ["DESKCORE_KEYS"] = "{这不是JSON"
+          r = c.post("/tool/list_projects", json={})
+          assert r.status_code == 401, f"key map 配坏了却不是 401: {r.status_code}"
+          h = c.get("/health").json()
+          assert h["config"]["auth"]["ok"] is False and "401" in h["config"]["auth"]["note"]
+          print("  ✓ DESKCORE_KEYS 非法 JSON → 401 + /health 当场可见(不退化成放行)")
+
+          # 正常配置: 错 key 401, 对 key 放行且服务端注入 user_id
+          os.environ["DESKCORE_KEYS"] = (
+              '{"k-good": {"user_id": "11111111-1111-1111-1111-111111111111",'
+              ' "name": "tester"}}')
+          assert c.post("/tool/list_projects", json={},
+                        headers={"X-Deskcore-Key": "k-bad"}).status_code == 401
+          print("  ✓ 错 key → 401")
+          h = c.get("/health").json()
+          assert h["config"]["auth"]["ok"] is True, h["config"]["auth"]
+          print(f"  ✓ 正常配置 → /health auth.ok=true ({h['config']['auth']['note']})")
+          # 三种 key 传法都要认(WorkBuddy 能不能配自定义头没有权威文档, 留了退路)
+          for desc, kw in (("X-Deskcore-Key 头", {"headers": {"X-Deskcore-Key": "k-good"}}),
+                           ("Authorization: Bearer", {"headers": {"Authorization": "Bearer k-good"}}),
+                           ("?key= 查询参数", {"params": {"key": "k-good"}})):
+              r = c.post("/tool/list_projects", json={}, **kw)
+              assert r.status_code != 401, f"{desc} 没被认出来: {r.status_code}"
+              print(f"  ✓ {desc} 认得出(HTTP {r.status_code})")
+          print("\ndeskcore app 冒烟: PASS")
+          PY
+
       - name: 真实 import 图 (抓依赖 API 漂移; 不 import app.py — 它会跑 streamlit 脚本)
         run: |
           python - <<'PY'

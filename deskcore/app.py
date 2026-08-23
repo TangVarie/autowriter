@@ -111,6 +111,14 @@ def health() -> dict:
     失败降级成 [], 外面看永远 200, 查了很久(TV docs/19:180-200)。
     让配错当场可见。
     """
+    # ⚠️ config 是给下面 librarian 那行的 getattr(config, "LIBRARIAN_URL", "") 用的。
+    # 它一度被删掉过: round-5 把 model 那行改成走 core.resolve_model() 之后, 我用
+    # `grep "config\."` 判定 config 没人用了 —— 那个模式匹配不到 getattr(config, ...)
+    # (config 后面没有点), 于是删了 import, /health 每次请求都 NameError 500。
+    # 而 railway.json 把 /health 配成健康检查路径, 服务永远不会 healthy。
+    # py_compile 抓不到(NameError 是运行期), CI 的 import 图又刻意不 import app.py。
+    # 现在 CI 有一步真的起 TestClient 打 /health, 这类问题才会当场红。
+    import config
     import db
     import dedup
 

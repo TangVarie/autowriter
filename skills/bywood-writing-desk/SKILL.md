@@ -63,6 +63,8 @@ description: 帆谷/BYWOOD 小红书种草文案的【写作台协议】。凡�
 - **warn** → 可疑。建议换个切入再交，用户坚持也可以放行。
 - **pass** → 可以交。
 
+`decided_by` 是这次判定所依据的信号（`opening` / `title` / `ngram`），`collided_with` + `collided_scope` 是**那个信号**撞上的那一条（`本批内` 或 `历史`）。三个信号各自的最接近命中可能来自三条不同的稿子，所以要照着 `decided_by` 指的那一条改才有用。`status` 是 pass 却仍带 `collided_with` 时会附 `collided_note`——那只是"最接近的参照"，不是拦截原因，别当成问题报给用户。
+
 如果 `summary.semantic_degraded` 是 true，说明 embedding 不可用，这次只跑了确定性查重，同角度换说法的标题可能漏过。**要告诉用户这件事**，别默默交付。
 
 这个工具报错就是查重真的挂了。**停下来告诉用户，不要当作通过。**

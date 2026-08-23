@@ -91,30 +91,44 @@ NGRAM_JACCARD_HARD = 0.35
 NGRAM_JACCARD_WARN = 0.22
 
 
-def verdict(title_sim: float, opening_exact: bool, ngram_j: float) -> tuple[str, str]:
-    """三个信号合议出结论。
+def deciding_signals(title_sim: float, opening_exact: bool,
+                     ngram_j: float) -> tuple[str, str, list[str]]:
+    """三个信号合议出结论, 并说清【是哪个信号定的】。
 
     为什么不是单信号判死: 阈值下调后单看标题会误伤合法的角度变体。所以要求
     「一个强信号」或「两个弱信号」才 reject。
+
+    第三个返回值是判定所依据的信号名(``opening`` / ``title`` / ``ngram``)。
+    调用方要靠它把"撞的是哪一条"归到对的来源上 —— 三个信号的最佳命中可能来自
+    三条不同的稿子(甚至分属本批内和历史), 归错了就会让人对着一条根本没引发
+    拒绝的稿子去改。(codex review)
     """
     if opening_exact:
-        return "reject", "正文开头与历史稿完全一致"
+        return "reject", "正文开头与历史稿完全一致", ["opening"]
     if title_sim >= TITLE_SIM_HARD:
-        return "reject", f"标题语义与历史稿高度重合(cos={title_sim:.3f})"
+        return "reject", f"标题语义与历史稿高度重合(cos={title_sim:.3f})", ["title"]
     if ngram_j >= NGRAM_JACCARD_HARD:
-        return "reject", f"正文与历史稿大面积重合(四字串 Jaccard={ngram_j:.3f})"
-    weak, why = 0, []
+        return "reject", f"正文与历史稿大面积重合(四字串 Jaccard={ngram_j:.3f})", ["ngram"]
+    weak, why, which = 0, [], []
     if title_sim >= TITLE_SIM_WARN:
         weak += 1
         why.append(f"标题接近(cos={title_sim:.3f})")
+        which.append("title")
     if ngram_j >= NGRAM_JACCARD_WARN:
         weak += 1
         why.append(f"正文用词接近(Jaccard={ngram_j:.3f})")
+        which.append("ngram")
     if weak >= 2:
-        return "reject", "；".join(why) + " —— 两项同时接近"
+        return "reject", "；".join(why) + " —— 两项同时接近", which
     if weak == 1:
-        return "warn", why[0]
-    return "pass", ""
+        return "warn", why[0], which
+    return "pass", "", []
+
+
+def verdict(title_sim: float, opening_exact: bool, ngram_j: float) -> tuple[str, str]:
+    """``deciding_signals`` 的两元组形式, 给只要结论不要归因的调用方。"""
+    status, reason, _ = deciding_signals(title_sim, opening_exact, ngram_j)
+    return status, reason
 
 
 # ── 发牌坐标指纹 ──────────────────────────────────────────────────────────
