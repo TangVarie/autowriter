@@ -140,16 +140,38 @@ jobs:
               "默认打开会让自动抽取把用户手设的 hard 降回 soft"
           print("  ✓ db.upsert_memory(update_severity=False) 默认关闭, 自动抽取不会降级手设规则")
 
-          # ── 6. resolve_model: /health 与真实调用同源 ─────────────────────────
-          import config
-          os.environ["DESKCORE_MODEL"] = "claude-test-model"
-          assert C.resolve_model() == "claude-test-model", C.resolve_model()
-          os.environ.pop("DESKCORE_MODEL")
-          assert C.resolve_model() == config.CLAUDE_MODEL
-          print("  ✓ resolve_model 真的读 env; 不设时落回 config.CLAUDE_MODEL")
-          assert "core.resolve_model()" in open("deskcore/app.py", encoding="utf-8").read(), \
-              "/health 必须走同一个 resolve_model, 否则回显和实际用的又会分叉"
-          print("  ✓ /health 与 distill_calibration 共用同一个解析器")
+          # ── 6. deskcore 【一次 LLM 调用都不能有】 ────────────────────────────
+          # 这一条取代了原来的 resolve_model 用例。蒸馏搬给调用方模型之后,
+          # 服务端不该再有任何 Anthropic 调用 —— 这既是方案自己的原则
+          # (推理归 WorkBuddy, MCP 只做数据操作), 也顺带消掉了一整类故障:
+          # 没有模型可配, 就没有"回显的模型和实际调用的不同源"那种坑。
+          # 用【AST】而不是文本匹配。文本匹配会把注释和文档字符串里的说明
+          # (这些名字在解释"为什么故意没有它"的段落里到处都是)误报成真调用;
+          # 反过来, 只过滤 `#` 开头的行又漏掉文档字符串。AST 天然只看代码 ——
+          # 字符串常量不会变成 Name/Attribute 节点。
+          # (这一课是现成的: round-5 用 `grep "config\."` 判定 import 没人用,
+          #  漏掉了 getattr(config, ...), 结果 /health 每次 NameError 500。)
+          import ast, pathlib
+          FORBIDDEN = {"get_anthropic_client", "with_anthropic_retry", "resolve_model"}
+          bad = []
+          for f in sorted(pathlib.Path("deskcore").glob("*.py")):
+              tree = ast.parse(f.read_text(encoding="utf-8"))
+              for n in ast.walk(tree):
+                  if isinstance(n, ast.Name) and n.id in FORBIDDEN:
+                      bad.append(f"{f}:{n.lineno} {n.id}")
+                  elif isinstance(n, ast.Attribute):
+                      if n.attr in FORBIDDEN:
+                          bad.append(f"{f}:{n.lineno} .{n.attr}")
+                      # anthropic 客户端的 messages.create(...)
+                      elif (n.attr == "create" and isinstance(n.value, ast.Attribute)
+                            and n.value.attr == "messages"):
+                          bad.append(f"{f}:{n.lineno} messages.create")
+          assert not bad, f"deskcore 不该调 LLM, 但发现: {bad}"
+          print("  ✓ deskcore 源码里没有任何 Anthropic 调用")
+          assert not hasattr(C, "resolve_model"), "resolve_model 该随蒸馏一起搬走了"
+          assert callable(C.build_distillation_task) and callable(C.save_my_style), \
+              "蒸馏应改为'服务端出材料 + 调用方模型提炼 + save_my_style 写回'"
+          print("  ✓ 蒸馏改为两步: build_distillation_task → (模型) → save_my_style")
 
           # ── 7. 两份 SQL 里的触发器 WHEN 条件必须一致 ─────────────────────────
           WHEN = ("WHEN (OLD.status IS DISTINCT FROM NEW.status\n"
@@ -440,6 +462,175 @@ jobs:
           print("\ndeskcore round-7 回归: 6/6 通过")
           PY
 
+      - name: deskcore round-8 回归 (蒸馏搬给调用方模型的两步闭环)
+        run: |
+          python - <<'PY'
+          import inspect
+          import deskcore.core as C
+          import deskcore.tools as T
+          import deskcore.store as S
+
+          class _Resp:
+              def __init__(self, d, c=None): self.data = d; self.count = c
+          class _Q:
+              def __init__(self, tbl, st): self.t = tbl; self.st = st; self.filters = {}
+              def select(self, *a, **k): self.cnt = k.get("count"); return self
+              def eq(self, k, v): self.filters[k] = v; return self
+              def in_(self, k, v): self.ids = list(v); return self
+              def order(self, *a, **k): return self
+              def limit(self, n=None, *a, **k): self.n = n; return self
+              def upsert(self, row, *a, **k): self.st.setdefault("saved", []).append(row); return self
+              def update(self, row, *a, **k): self.upd = row; return self
+              def insert(self, row, *a, **k): self.st.setdefault("edits", []).append(row); return self
+              def execute(self):
+                  if self.t == "style_edits":
+                      if getattr(self, "upd", None):          # 销账
+                          ids = getattr(self, "ids", [])
+                          hit = [r for r in self.st.get("rows", []) if r["id"] in ids]
+                          self.st["marked_ids"] = self.st.get("marked_ids", []) + [r["id"] for r in hit]
+                          self.st["pending"] = max(0, self.st.get("pending", 0) - len(hit))
+                          return _Resp(hit)
+                      if getattr(self, "cnt", None) == "exact":
+                          return _Resp([], self.st.get("pending", 0))
+                      rows = self.st.get("rows", [])
+                      n = getattr(self, "n", None)      # insert 路径不调 limit()
+                      return _Resp(rows[:n] if n else rows, len(rows))
+                  if self.t == "user_calibration_notes":
+                      return _Resp([{"notes": self.st.get("notes", ""),
+                                     "updated_at": "2026-01-01"}])
+                  return _Resp([])
+          class _SB:
+              def __init__(self, st): self.st = st
+              def table(self, t): return _Q(t, self.st)
+
+          EDIT = {"id": "e1", "ai_title": "AI标题", "ai_body": "AI正文",
+                  "my_title": "我改的标题", "my_body": "我改的正文", "note": "太夸张"}
+
+          # ── 1. build_distillation_task 出材料, 【不调 LLM】 ───────────────────
+          st = {"rows": [EDIT], "notes": "已有笔记第一条", "pending": 1}
+          task = C.build_distillation_task(_SB(st), "p1", user_id="u1")
+          for k in ("instruction", "existing_notes", "edits", "edit_count"):
+              assert k in task, f"蒸馏任务少了 {k}: {task}"
+          assert task["existing_notes"] == "已有笔记第一条"
+          assert "我改的标题" in task["edits"] and "太夸张" in task["edits"]
+          assert task["edit_count"] == 1
+          assert task["edit_ids"] == ["e1"], task.get("edit_ids")
+          # 口径必须由服务端给, 不能让每个平台自己发挥
+          assert "铁律" in task["instruction"] and len(task["instruction"]) > 100
+          print(f"  ✓ 蒸馏任务含 instruction/existing_notes/edits/edit_ids({task['edit_count']} 条)")
+          assert C.build_distillation_task(_SB({"rows": []}), "p1", user_id="u1") is None
+          print("  ✓ 没有精修时返回 None(不硬造任务)")
+
+          # 待吸收多于一次快照时要明说, 别让人以为一次吸收完了
+          many = [dict(EDIT, id=f"e{i}") for i in range(12)]
+          t2 = C.build_distillation_task(_SB({"rows": many, "pending": 12, "notes": ""}),
+                                         "p1", user_id="u1", max_edits=8)
+          assert t2["edit_count"] == 8 and len(t2["edit_ids"]) == 8, t2["edit_count"]
+          assert t2.get("more_pending") == 4, t2.get("more_pending")
+          print("  ✓ 12 条待吸收 → 本批 8 条 + 明说还剩 4 条(more_pending)")
+
+          # ── 2. record_edit 把任务交出去, 并【明说没做完】 ────────────────────
+          st = {"rows": [EDIT], "notes": "", "pending": 1}
+          # EDIT 带 id(那是库里的行), record_edit 的入参没有 id, splat 前摘掉
+          EDIT_IN = {k: v for k, v in EDIT.items() if k != "id"}
+          out = C.record_edit(_SB(st), "p1", user_id="u1", **EDIT_IN)
+          assert out["stored"] is True
+          assert "distillation_task" in out, out
+          assert "save_my_style" in out["next_step"], out["next_step"]
+          assert "edit_ids" in out["next_step"], "next_step 要教把 edit_ids 传回来"
+          assert "白喂" in out["next_step"] or "没做完" in out["next_step"], out["next_step"]
+          print("  ✓ record_edit 返回任务 + 明确的 next_step(指名 save_my_style)")
+          # AI 版与手改版一样 = 不是有效信号, 不该入库也不该发任务
+          same = {"ai_title": "同", "ai_body": "同", "my_title": "同", "my_body": "同"}
+          out2 = C.record_edit(_SB({"rows": []}), "p1", user_id="u1", **same)
+          assert out2["stored"] is False and "distillation_task" not in out2
+          print("  ✓ 没真改的对子不入库、不发蒸馏任务")
+
+          # ── 3. save_my_style 只销【传进来的那几条】的账 ──────────────────────
+          # ⚠️ 这是本 PR 第一版的 P1: 原来按 user+project 把所有未吸收的都标掉,
+          # 而笔记只覆盖了快照里那 8 条。快照外的行(第 9 条往后、以及拿到任务
+          # 之后新 record_edit 进来的)会从 pending 里消失却从没影响过笔记 ——
+          # 用户喂了稿子, 计数归零看着正常, 那几条等于白喂。
+          rows = [dict(EDIT, id=f"e{i}") for i in range(3)]
+          st = {"rows": rows, "notes": "旧", "pending": 3}
+          sb = _SB(st)
+          r = C.save_my_style(sb, "p1", "新的完整笔记\n第二行",
+                              user_id="u1", edit_ids=["e0", "e1"])
+          assert r["saved"] is True and r["lines"] == 2, r
+          assert st["saved"][0]["notes"] == "新的完整笔记\n第二行"
+          assert sorted(st.get("marked_ids", [])) == ["e0", "e1"], st.get("marked_ids")
+          assert r["edits_absorbed"] == 2, r
+          assert r["pending_distillation"] == 1, r
+          assert "still_pending" in r, "还有没吸收的必须说出来"
+          print("  ✓ 只销掉传进来的 e0/e1; 第三条仍留在 pending 并被明确报出")
+
+          # 不传 edit_ids = 手动改笔记, 【不能】顺手把待处理的精修标掉
+          st2 = {"rows": rows, "notes": "旧", "pending": 3}
+          r2 = C.save_my_style(_SB(st2), "p1", "手动改的笔记", user_id="u1")
+          assert st2.get("marked_ids", []) == [], "手动改笔记不该销账"
+          assert r2["edits_absorbed"] == 0 and r2["pending_distillation"] == 3, r2
+          assert "note" in r2, "要提示这次没销账"
+          print("  ✓ 不传 edit_ids(手动改笔记) → 一条都不销, 待吸收原样保留")
+          # 空笔记必须拒绝 —— 否则一次失手会把积累的个人风格清空
+          for empty in ("", "   ", "\n\n"):
+              try:
+                  C.save_my_style(_SB({}), "p1", empty, user_id="u1")
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(f"空笔记被接受了: {empty!r}")
+          print("  ✓ 空笔记被拒(不会把已有个人风格清掉)")
+
+          # ── 4. 两步之间断掉必须【看得见】 ────────────────────────────────────
+          # 这是本次改动引入的新失败模式: record_edit 调了、save_my_style 没调,
+          # diff 存着但笔记没变 —— "喂了稿子却没变得像我", 且完全无声。
+          # my_style 的 pending_distillation 就是那个断点的可见性。
+          assert "pending_distillation" in inspect.getsource(C.my_style)
+          st = {"pending": 3, "rows": [], "notes": "n"}
+          assert S.count_pending_distillation(_SB(st), "p1", "u1") == 3
+          assert S.count_pending_distillation(_SB({"pending": 0}), "p1", "u1") == 0
+          print("  ✓ 断点计数正确")
+          assert "pending_distillation" in (T.my_style.__doc__ or ""), \
+              "my_style 的说明里要教模型看这个数, 否则报了也没人看"
+
+          # ⚠️ 光报个数字不够(本 PR 第一版的 P2): 断点最典型的形态就是【会话没了】,
+          # 那时 record_edit 那次的返回值也一起丢了。只给数字的话调用方拿不回
+          # 材料和口径, 文档里写的"重新提炼一次写回"根本做不到, 除非让用户把
+          # 同一条精修再喂一遍(会造重复行)。所以 pending>0 时要把任务带上。
+          import db as _db2
+          _origp = _db2.get_project
+          _db2.get_project = lambda *a, **k: {"calibration_notes": "共享基线"}
+          try:
+              ms = C.my_style(_SB({"pending": 2, "rows": [EDIT], "notes": "我的笔记"}),
+                              "p1", user_id="u1")
+              assert ms["pending_distillation"] == 2, ms
+              task = ms.get("pending_distillation_task")
+              assert task, "pending>0 却没带上可恢复的任务"
+              for k in ("instruction", "existing_notes", "edits", "edit_ids"):
+                  assert k in task, f"恢复用的任务少了 {k}"
+              assert "save_my_style" in ms.get("next_step", "")
+              print("  ✓ pending>0 时 my_style 直接带上完整任务, 换个会话也能接着做")
+
+              clean = C.my_style(_SB({"pending": 0, "rows": [], "notes": "我的笔记"}),
+                                 "p1", user_id="u1")
+              assert clean["pending_distillation"] == 0
+              assert "pending_distillation_task" not in clean, "没积压时不该塞任务进来"
+              print("  ✓ 没积压时不带任务(my_style 是常用读, 不该平白塞几 KB diff)")
+          finally:
+              _db2.get_project = _origp
+
+          # ── 5. 工具面: save_my_style 注册了, 且是不吞异常的写 ────────────────
+          assert "save_my_style" in T.TOOLS and T.TOOLS["save_my_style"][1] is True, \
+              "save_my_style 必须注册且需要身份(个人资产)"
+          body = inspect.getsource(T.TOOLS["save_my_style"][0])
+          assert "_safe(" not in body, "写操作不能包 _safe"
+          assert "完整" in (T.save_my_style.__doc__ or ""), \
+              "要讲清 notes 是【完整笔记】不是增量, 否则模型只写新增的会丢掉积累"
+          print(f"  ✓ save_my_style 已注册({len(T.TOOLS)} 个工具), 不吞异常, 说明写清了全量语义")
+
+          print("\ndeskcore round-8 回归: 5/5 通过")
+          PY
+
       - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
         run: |
           # ⚠️ 这一步存在的理由: /health 里一个 `getattr(config, ...)` 因为
@@ -473,11 +664,15 @@ jobs:
           for k in ("service", "version", "tools", "config"):
               assert k in body, f"/health 少了 {k}: {body}"
           cfg = body["config"]
-          for k in ("model", "supabase", "embeddings", "vendored_vocab",
+          for k in ("llm", "supabase", "embeddings", "vendored_vocab",
                     "librarian", "auth", "st_cache_disabled"):
               assert k in cfg, f"/health config 少了 {k}: {cfg}"
+          # deskcore 不调 LLM, 所以这里【不该】有模型名可回显 —— 有的话说明
+          # 又有人把 LLM 调用加回服务端了。
+          assert "model" not in cfg, f"/health 又出现模型配置: {cfg.get('model')}"
+          assert cfg["llm"].startswith("none"), cfg["llm"]
           assert body["tools"], "/health 没回显工具清单"
-          print(f"  ✓ /health 200, model={cfg['model']}, tools={len(body['tools'])} 个")
+          print(f"  ✓ /health 200, llm=none, tools={len(body['tools'])} 个")
 
           # 未配鉴权 = dev 模式放行(与 librarian/onboarder/worker 同口径, 刻意的)。
           # 但 /health 必须把它标成【不健康】—— 生产忘配就等于匿名开放。

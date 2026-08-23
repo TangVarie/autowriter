@@ -229,12 +229,19 @@ def record_edit(project_id: str, ai_title: str, ai_body: str,
                 _user_id: str | None = None) -> dict:
     """用户手动改了稿子时调这个 —— 这是让文风变得像本人的【最强信号】。
 
-    传 AI 原版和用户改成的样子。系统会从这些改动里提炼这个人的语感偏好, 写进
-    他的个人调校笔记, 以后写这个项目自动带上。
-
-    个人笔记【只对本人生效】, 不影响队友。
+    传 AI 原版和用户改成的样子。个人笔记【只对本人生效】, 不影响队友。
 
     note 可选, 传用户自己说的原因(比如"太夸张了")会让提炼更准。
+
+    ⚠️⚠️ **这是两步里的第一步, 调完还没结束。**
+    返回值里的 distillation_task 是【交给你做】的: 按 instruction 的口径, 拿
+    existing_notes 和 edits 提炼出【更新后的完整笔记】, 然后调 save_my_style
+    写回去。不写回去的话这次精修等于白喂 —— diff 存下来了, 但文风不会变,
+    而且没有任何报错。
+
+    为什么让你做而不是服务端做: 蒸馏就是文本提炼, 你本来就在一个有模型的环境
+    里; 服务端自己调 LLM 会多一个 key、多一个故障点, 也违反"推理归平台、MCP
+    只做数据操作"的分工。
 
     ⚠️ 只在用户【真的动手改了】的时候调。用户没改就通过的稿子不要传进来 ——
     从「没改」里推不出偏好, 硬推会让系统编造出根本不存在的风格规则。
@@ -277,11 +284,45 @@ def my_style(project_id: str, _user_id: str | None = None) -> dict:
 
     也用于回答「你现在记住了我什么」这类问题。注意区分: 项目规则是团队共享的,
     别把它说成是这个人的个人偏好。
+
+    ⚠️ 看一眼 pending_distillation。大于 0 说明有精修【还没被吸收进笔记】——
+    多半是上次调了 record_edit 却没接着调 save_my_style(比如会话中断了)。
+    这时返回值里会直接带上 pending_distillation_task, **材料和口径都在里面**,
+    照着提炼完调 save_my_style 就能补上, 不需要让用户把稿子再喂一遍。
     """
     if not _user_id:
         return {"error": "无法识别调用者身份",
                 "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
     return _safe(core.my_style, core.sb(), project_id, user_id=_user_id)
+
+
+def save_my_style(project_id: str, notes: str,
+                  edit_ids: list[str] | None = None,
+                  _user_id: str | None = None) -> dict:
+    """把你提炼好的个人调校笔记写回去 —— record_edit 的【第二步】。
+
+    notes 传【完整的新笔记】, 不是增量。它会整个替换掉旧笔记, 所以要在
+    existing_notes 的基础上改写(合并同类项、冲突时以新观察为准), 别只写新增的
+    那几条 —— 那样会把以前积累的偏好全丢掉。
+
+    edit_ids **原样传** distillation_task 里给你的那一份。它决定哪几条精修被
+    标记为"已吸收"。
+    ⚠️ 不传的话只更新笔记、不销任何账 —— 这正是「用户说这条笔记不对, 直接
+    改一下」应有的行为: 手动改写笔记不等于吸收了那些待处理的精修, 顺手把它们
+    标掉会让它们静默消失。所以两种用法泾渭分明:
+      · 吸收精修  → 传 edit_ids
+      · 手动改笔记 → 不传
+
+    返回值里看两样: edits_absorbed(真销掉几条) 和 pending_distillation
+    (还剩几条)。剩的不为 0 说明没吸收完 —— 待吸收超过一次快照(8 条)时是正常
+    的, 接着做下一批。
+    """
+    if not _user_id:
+        return {"error": "无法识别调用者身份, 个人风格功能不可用",
+                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    # 故意不包 _safe: 写。这是"裂变"闭环的最后一步, 静默失败 = 前面白做。
+    return core.save_my_style(core.sb(), project_id, notes,
+                              user_id=_user_id, edit_ids=edit_ids)
 
 
 # 工具注册表 —— app.py 和 cli.py 共用。
@@ -295,6 +336,7 @@ TOOLS = {
     "commit_drafts":  (commit_drafts,  True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),
+    "save_my_style":  (save_my_style,  True),
     "label_example":  (label_example,  True),
     "my_style":       (my_style,       True),
 }

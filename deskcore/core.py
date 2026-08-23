@@ -7,7 +7,6 @@
     memory.build_layered_system_prompt   五层 + hard/soft 分级
     db.get_service_client / get_project / set_item_example_label / upsert_memory
     dedup.embed_texts / cosine_similarity / embeddings_available
-    clients.get_anthropic_client / with_anthropic_retry
     librarian_client.build_brief / fetch_flywheel_lessons
     db._parse_pgvector                   (R-034: PostgREST 把 pgvector 序列化成
                                           字符串, 不归一的话 cosine 静默返回 0.0)
@@ -16,14 +15,14 @@
     1. 发牌 draw_angles + 跨批次台账
     2. 查重硬闸 check_drafts + 持久全量指纹库
     3. 正例按【相关性】选取, 取代 recency top-5(断掉趋同回路)
-    4. 个人调校笔记分层(项目共享基线 + 个人叠加)与从精修 diff 蒸馏
+    4. 个人调校笔记分层(项目共享基线 + 个人叠加)。蒸馏本身【交给调用方模型做】,
+       服务端只出材料和口径 —— 见 build_distillation_task / save_my_style。
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import random
 
 import config
@@ -784,23 +783,19 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
 # 反馈学习
 # ══════════════════════════════════════════════════════════════════════
 
-def resolve_model() -> str:
-    """本服务实际会用的 Anthropic 模型名。
-
-    ⚠️ /health 和真正发起调用的地方【必须共用这一个函数】。原来是两处各写各的:
-    /health 读 os.environ["DESKCORE_MODEL"], 而 distill_calibration 读
-    getattr(config, "DESKCORE_MODEL", "") —— config.py 里【根本没有】这个属性,
-    getattr 永远回 ""、永远落到 config.CLAUDE_MODEL。于是只配了 DESKCORE_MODEL
-    的部署里, /health 信心满满地回显着一个从未被调用过的模型名。
-
-    这正是 /health 那段注释想防的事故(三个 Railway 服务模型 env 名各不相同,
-    librarian 配错查了很久), 只是这次错得更隐蔽: 回显做了, 但回显的和实际用的
-    不是同一个来源, 所以配错依然当场看不见 —— 回显只有和真值同源才叫回显。
-    (codex review round-5 P2)
-    """
-    return (os.environ.get("DESKCORE_MODEL", "").strip()
-            or getattr(config, "DESKCORE_MODEL", "")
-            or config.CLAUDE_MODEL)
+# ⚠️ 这里【故意没有】resolve_model / 任何 LLM 调用。
+#
+# deskcore 曾经自己拿 Anthropic 客户端做调校笔记蒸馏, 那违反了本方案自己的
+# 原则 ——「推理归 WorkBuddy, MCP 只做轻量数据操作」。蒸馏现在由调用方模型做
+# (见 build_distillation_task / save_my_style), 服务端只出材料和口径。
+#
+# 收益不只是"少一个依赖": deskcore 不再需要 ANTHROPIC_API_KEY / DESKCORE_MODEL,
+# 少一个中转站故障点, 也不再有"回显的模型和实际调用的模型不同源"这类问题 ——
+# 那个坑上一轮刚踩过(/health 读 env, core 读一个 config 里根本不存在的属性,
+# 于是回显着一个从未被调用过的模型名)。没有模型可配, 就没有配错的余地。
+#
+# ⚠️ 加新功能时别顺手把 LLM 调用加回来。要模型干活就把材料和指令交出去,
+# 让调用方的模型做 —— 它本来就跑在一个有模型的环境里。
 
 
 
@@ -884,30 +879,43 @@ def record_edit(client, project_id: str, *, user_id: str,
     store.add_style_edit(client, project_id, user_id,
                          ai_title=ai_title or "", ai_body=ai_body or "",
                          my_title=my_title or "", my_body=my_body or "", note=note)
+    out: dict = {"stored": True}
     if not distill:
-        return {"stored": True, "distilled": False}
-    try:
-        return {"stored": True, "distilled": True,
-                "notes": distill_calibration(client, project_id, user_id=user_id)}
-    except Exception:
-        # 存下来了就没白费; 蒸馏失败下次 record_edit 会连这条一起重算。
-        logger.exception("calibration distillation failed (edit is stored)")
-        return {"stored": True, "distilled": False,
-                "warning": "diff 已入库, 但本次笔记蒸馏失败; 下次 record_edit 会一并重算"}
+        out["next_step"] = ("本次没有要蒸馏(distill=false)。diff 已入库, "
+                            "下次蒸馏时会连它一起算。")
+        return out
+
+    task = build_distillation_task(client, project_id, user_id=user_id)
+    if task is None:                      # 理论上不会 —— 上面刚存了一条
+        out["next_step"] = "没有可蒸馏的材料。"
+        return out
+    out["distillation_task"] = task
+    out["next_step"] = (
+        "⚠️ 这一步【还没做完】。请按 distillation_task.instruction 的口径, "
+        "拿 existing_notes 和 edits 提炼出【更新后的完整笔记】, 然后调用 "
+        "save_my_style 写回去, 并把 distillation_task.edit_ids 原样传回。"
+        "不写回去的话这次精修等于白喂 —— diff 存下来了, 但文风不会变。")
+    return out
 
 
-def distill_calibration(client, project_id: str, *, user_id: str,
-                        max_edits: int = 8) -> str:
-    """把最近的精修 diff 蒸馏成个人调校笔记。
+def build_distillation_task(client, project_id: str, *, user_id: str,
+                            max_edits: int = 8) -> dict | None:
+    """把"该蒸馏什么"打包成一份【交给调用方模型做】的任务。返回 None 表示没料。
 
-    复用 clients 的 Anthropic 客户端与重试(R-026: 辅助 LLM 调用一律包重试,
-    别让瞬时 429/5xx 白白丢一次)。
+    ⚠️ 这里【不调 LLM】。deskcore 原来自己拿 Anthropic 客户端蒸馏, 那违反了本
+    方案自己的原则 ——「推理归 WorkBuddy, MCP 只做轻量数据操作」。搬走之后
+    deskcore 不再需要 ANTHROPIC_API_KEY / DESKCORE_MODEL, 也少一个中转站故障点;
+    而写作台本来就跑在一个有模型的环境里, 让它做这点文本提炼是顺手的事。
+
+    返回的三样东西调用方模型全都要用上:
+      existing_notes —— 已有笔记, 要在它基础上改写而不是另起一份
+      edits          —— 本次要吸收的手动精修对子
+      instruction    —— 提炼口径(原 _CALIB_SYSTEM), 口径留在服务端是刻意的:
+                        它是这套东西的一部分, 不该由每个平台各自发挥。
     """
-    import clients
-
     edits = store.recent_style_edits(client, project_id, user_id, max_edits)
     if not edits:
-        return ""
+        return None
     existing, _ = store.get_user_calibration(client, project_id, user_id)
 
     blocks = []
@@ -922,23 +930,61 @@ def distill_calibration(client, project_id: str, *, user_id: str,
             b += f"\n  本人备注：{e['note']}"
         blocks.append(b)
 
-    prompt = ((f"【已有笔记】\n{existing}\n\n" if existing else "【已有笔记】（空，这是第一次）\n\n")
-              + "【本次要吸收的手动精修】\n" + "\n\n---\n".join(blocks)
-              + "\n\n请输出更新后的完整笔记。")
+    total_pending = store.count_pending_distillation(client, project_id, user_id)
+    out = {
+        "instruction": _CALIB_SYSTEM,
+        "existing_notes": existing,
+        "edits": "\n\n---\n".join(blocks),
+        "edit_count": len(edits),
+        # ⚠️ 这批的确切 id。save_my_style 只销这几条的账 —— 见
+        # store.mark_edits_distilled 的说明(全量销账会吃掉快照外的行)。
+        "edit_ids": [e["id"] for e in edits if e.get("id")],
+    }
+    if total_pending > len(edits):
+        out["more_pending"] = total_pending - len(edits)
+        out["note"] = (
+            f"这个人还有 {total_pending - len(edits)} 条精修没进本次快照"
+            f"(一次最多取 {max_edits} 条)。写回之后【再调一次 record_edit 或看 "
+            "my_style】会拿到下一批, 别以为一次就吸收完了。")
+    return out
 
-    ac = clients.get_anthropic_client()
-    resp = clients.with_anthropic_retry(lambda: ac.messages.create(
-        model=resolve_model(), max_tokens=1500, system=_CALIB_SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-    ))
-    notes = "".join(getattr(b, "text", "") for b in resp.content
-                    if getattr(b, "type", "") == "text").strip()
+
+def save_my_style(client, project_id: str, notes: str, *, user_id: str,
+                  edit_ids: list[str] | None = None) -> dict:
+    """把调用方模型蒸馏好的笔记写回, 并把【这一批】diff 标记为已吸收。
+
+    ⚠️ 只有【真的写回来】才算完成一次学习。record_edit 只是把 diff 存下来 +
+    把任务交出去; 中间断掉的话 diff 还在库里(下次还会拿到), 但笔记不会变 ——
+    也就是"喂了稿子却没变得更像我"。my_style 的 pending_distillation 就是给
+    这个断点用的可见性。
+
+    ⚠️ edit_ids 必须原样回传 record_edit 给的那一份。不传 = 只改笔记、不销任何
+    账 —— 这正是"用户说这条笔记不对, 直接改一下"那种用法应有的行为: 手动改写
+    笔记【不等于】吸收了那些待处理的精修, 顺手把它们标掉会让它们静默消失。
+    (codex review #56 P1)
+    """
+    notes = (notes or "").strip()
     if not notes:
-        raise RuntimeError("distillation returned empty notes")
-
+        raise ValueError("notes 不能为空 —— 空笔记会把已有的个人风格清掉")
     store.save_user_calibration(client, project_id, user_id, notes)
-    store.mark_edits_distilled(client, project_id, user_id)
-    return notes
+    marked = store.mark_edits_distilled(client, project_id, user_id, edit_ids or [])
+    out = {"saved": True, "notes": notes, "lines": len(notes.splitlines()),
+           "edits_absorbed": marked,
+           "pending_distillation": store.count_pending_distillation(
+               client, project_id, user_id)}
+    if edit_ids and marked < len(edit_ids):
+        out["warning"] = (
+            f"传了 {len(edit_ids)} 个 edit_id 但只销掉 {marked} 条 —— "
+            "多半是其中几条已经被别处吸收过了。笔记已保存。")
+    if not edit_ids:
+        out["note"] = ("没传 edit_ids, 所以只更新了笔记、没有销账。"
+                       "如果这是在吸收精修而不是手动改写笔记, "
+                       "要把 record_edit 返回的 edit_ids 原样传进来。")
+    if out["pending_distillation"]:
+        out["still_pending"] = (
+            f"还有 {out['pending_distillation']} 条精修没被吸收 —— "
+            "看 my_style 的 pending_distillation_task 接着做。")
+    return out
 
 
 def label_example(client, item_id: str, label: str | None,
@@ -978,7 +1024,8 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
     project = db.get_project(client, project_id)
     shared = (project or {}).get("calibration_notes") or ""
     mine, updated = store.get_user_calibration(client, project_id, user_id)
-    return {
+    pending = store.count_pending_distillation(client, project_id, user_id)
+    out = {
         "project_id": project_id,
         "shared_calibration": shared.strip(),
         "my_calibration": mine,
@@ -986,13 +1033,27 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
         "edits_fed": store.count_style_edits(client, project_id, user_id),
         "my_positive_examples": len(store.labeled_examples(client, project_id, "positive", user_id)),
         "my_negative_examples": len(store.labeled_examples(client, project_id, "negative", user_id)),
+        # ⚠️ 蒸馏搬到调用方模型之后, record_edit 和 save_my_style 是两步。
+        # 两步之间断掉 = diff 存了但笔记没更新, 也就是"喂了稿子却没变得更像我",
+        # 而且【完全无声】。这个计数就是那个断点的可见性: 大于 0 说明有精修
+        # 还没被吸收进笔记。
+        "pending_distillation": pending,
     }
-
-
-def set_my_style(client, project_id: str, *, user_id: str, notes: str) -> dict:
-    """手动改写个人调校笔记(蒸馏结果不满意时直接改)。"""
-    store.save_user_calibration(client, project_id, user_id, notes)
-    return {"project_id": project_id, "notes": notes.strip()}
+    # ⚠️ 光报个数字不够 —— 断点最典型的形态就是【会话没了】(超时、换了个
+    # session), 那时 record_edit 那次的返回值也一起丢了。只给数字的话, 调用方
+    # 拿不回材料和口径, 我在 SKILL.md 里写的"重新提炼一次写回"根本做不到,
+    # 除非让用户把同一条精修再喂一遍(那会造重复行)。
+    # 所以 pending > 0 时把任务原样带上, 恢复就是自明的。
+    # (codex review #56 P2)
+    if pending:
+        task = build_distillation_task(client, project_id, user_id=user_id)
+        if task:
+            out["pending_distillation_task"] = task
+            out["next_step"] = (
+                "有精修还没被吸收进笔记。按 pending_distillation_task.instruction "
+                "提炼出更新后的完整笔记, 调 save_my_style 写回, "
+                "并把 task 里的 edit_ids 原样传回去。")
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════

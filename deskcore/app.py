@@ -23,10 +23,11 @@
   start:  uvicorn deskcore.app:app --host 0.0.0.0 --port $PORT
   env:    SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY   (service_role, 绕 RLS)
           GOOGLE_API_KEY          embedding; 不设则查重降级为纯确定性
-          ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL     (中转站)
-          DESKCORE_MODEL          可选, 不设走 config.CLAUDE_MODEL
           DESKCORE_KEYS 或 DESKCORE_API_KEY + DESKCORE_DEFAULT_USER_ID
           LIBRARIAN_URL / LIBRARIAN_API_KEY          借爆款经验卡; 不设则跳过
+          DESKCORE_ALLOWED_HOSTS  可选, 逗号分隔; 设了才开 MCP 的 Host 校验
+          ⚠️ 【不需要】ANTHROPIC_API_KEY / DESKCORE_MODEL —— deskcore 不调 LLM,
+             推理全部归调用方模型。见 core.py 里"故意没有 resolve_model"那段。
   见 deskcore/railway.json。
 
 ⚠️ import 顺序: 本模块通过包 __init__ 先设 AW_DISABLE_ST_CACHE=1 再 import db
@@ -44,7 +45,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-from . import core, identity, tools, vocab
+from . import identity, tools, vocab
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deskcore")
@@ -138,13 +139,15 @@ async def auth_middleware(request: Request, call_next):
 
 @app.get("/health")
 def health() -> dict:
-    """回显实际解析到的配置。
+    """回显实际解析到的配置 —— 让配错当场可见。
 
-    ⚠️ 这个回显是【刻意的】: 三个 Railway 服务的模型 env 变量名各不相同
-    (worker=ESSENCE_MODEL / librarian=FLYWHEEL_LIBRARIAN_MODEL /
-    autowriter=CLAUDE_MODEL), 已经害过一次 —— librarian 忘了配, 每次 LLM 调用
-    失败降级成 [], 外面看永远 200, 查了很久(TV docs/19:180-200)。
-    让配错当场可见。
+    ⚠️ 这个回显是【刻意的】: TV docs/19:180-200 记过一次事故, librarian 的模型
+    env 变量名配错, 每次 LLM 调用失败被 except 吞掉降级成 [], 外面看永远 200,
+    查了很久。
+
+    deskcore 现在一次 LLM 调用都没有(蒸馏搬给调用方模型了), 所以"模型配错"这个
+    故障类别已经不存在。剩下要回显的是库连通、embedding 可用性、vendor 词表
+    校验和、鉴权配置 —— 每一项都能独立地把服务变成"看着健康、实际残废"。
     """
     # ⚠️ config 是给下面 librarian 那行的 getattr(config, "LIBRARIAN_URL", "") 用的。
     # 它一度被删掉过: round-5 把 model 那行改成走 core.resolve_model() 之后, 我用
@@ -173,12 +176,13 @@ def health() -> dict:
         "version": VERSION,
         "tools": sorted(tools.TOOLS),
         "config": {
-            # ⚠️ 必须走 core.resolve_model() —— 回显只有和【真正发起调用的地方】
-            # 同源才叫回显。这里曾经自己读一遍 env, 而 core 那边读的是
-            # config.DESKCORE_MODEL(不存在的属性), 两边永远不一致。见
-            # core.resolve_model 的说明。
-            "model": core.resolve_model(),
-            "anthropic_base_url": os.environ.get("ANTHROPIC_BASE_URL") or "(official)",
+            # deskcore 【不调 LLM】。蒸馏搬给调用方模型之后, 服务端一次
+            # Anthropic 调用都没有了 —— 所以这里没有模型名可回显, 也就没有
+            # "配错模型" 这个故障类别了。见 core.py 里那段"故意没有 resolve_model"。
+            # 保留这个字段是为了让读 /health 的人当场知道这是【设计如此】,
+            # 而不是漏报了。
+            "llm": "none —— 推理归调用方模型(WorkBuddy/Claude Code), "
+                   "deskcore 只做数据操作, 不需要 ANTHROPIC_API_KEY / DESKCORE_MODEL",
             "supabase": {"ok": db_ok, "note": db_note},
             "embeddings": {
                 "ok": emb_ok,

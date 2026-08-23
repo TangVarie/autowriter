@@ -64,7 +64,6 @@ deskcore 是**薄的**。本仓已有的一律直接调：
 | service_role client（已带 `schema="autowriter"`） | `db.get_service_client` |
 | 项目读取 / 标正负例 / 写规则 | `db.get_project` / `set_item_example_label` / `upsert_memory` |
 | embedding 与余弦 | `dedup.embed_texts` / `cosine_similarity` |
-| Anthropic 客户端与重试 | `clients.get_anthropic_client` / `with_anthropic_retry` |
 | 借飞轮经验卡 | `librarian_client.build_brief` / `fetch_flywheel_lessons` |
 | pgvector 反序列化 | `db._parse_pgvector` ⚠️ 见 §5 |
 
@@ -109,7 +108,8 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 | `commit_drafts` | 抛 | 定稿缺席指纹库，同样的稿子以后能再过一次闸 |
 | `draw_angles` | 抛 | 没落台账，同一个角度下批还能再抽 |
 | `record_rule` | 抛 | 用户明确说"以后都这样"的 hard 合规规则静默缺席之后每一份简报 |
-| `record_edit` | 抛 | "裂变"的唯一入口，静默失败 = 文风永远长不出来 |
+| `record_edit` | 抛 | "裂变"的入口，静默失败 = 文风永远长不出来 |
+| `save_my_style` | 抛 | "裂变"闭环的最后一步，静默失败 = 前面全白做 |
 | `label_example` | 抛 | 标记没落库却报成功，用户不会再标第二次 |
 
 （codex review round-5：`open_project` 和 `record_rule` 原来都包了 `_safe`。前者尤其糟——`store.shared_memories()` 为此专门**故意不吞异常**，外面再包一层等于把那个设计原样抵消掉。）
@@ -127,7 +127,7 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 
 ---
 
-## 3. 工具面（10 个）
+## 3. 工具面（11 个）
 
 | 阶段 | 工具 | 说明 |
 |---|---|---|
@@ -138,9 +138,24 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
 | | `commit_drafts` | 定稿入库：写指纹 + 给坐标销账 |
 | 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0 |
-| | `record_edit` | 喂手动精修 diff（信号 A），自动更新个人调校笔记 |
+| | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
+| | `save_my_style` | 把模型蒸馏好的笔记写回 + 按 `edit_ids` 销账（`record_edit` 的第二步） |
 | | `label_example` | 标正/负例 |
-| | `my_style` | 查看个人风格资产 |
+| | `my_style` | 查看个人风格资产；有积压时**直接带回可续做的蒸馏任务** |
+
+### 3.3 蒸馏的两步与它的失败模式
+
+`record_edit`（存 diff + 出任务）→ 调用方模型提炼 → `save_my_style`（写回 + 销账）。服务端**不调 LLM**。
+
+这个拆分引入了一个新的无声失败：两步之间断掉，diff 存着而笔记不变——"喂了稿子却没变得像我"。三道处理：
+
+| 风险 | 处理 |
+|---|---|
+| 模型拿到任务就忘了写回 | `record_edit` 的 `next_step` 明写"这一步还没做完"，指名 `save_my_style` |
+| 断点无声 | `my_style` 报 `pending_distillation` |
+| **会话没了，任务也丢了** | `pending > 0` 时 `my_style` 直接带回完整的 `pending_distillation_task`——材料、口径、`edit_ids` 都在，换个会话也能接着做，不必让用户重喂稿子 |
+
+⚠️ **销账必须按 `edit_ids` 精确销，不能按 user+project 全量销。** 蒸馏任务是一份快照（一次最多 8 条），笔记只覆盖快照里那些。全量销账会吃掉两类不在快照里的行——第 9 条往后的、以及拿到任务之后新 `record_edit` 进来的。它们会从 `pending_distillation` 里消失却从没影响过笔记：用户喂了稿子，计数归零看着正常，那几条等于白喂。同理，`save_my_style` 不传 `edit_ids`（手动改笔记）时**一条都不销**。
 
 工具的 docstring 就是模型看到的说明。
 
@@ -178,9 +193,12 @@ env：
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | ✅ | service_role，绕 RLS |
 | `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<uuid>", "name": "Ziao"}}`，一人一把 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | ✅ | 调校笔记蒸馏。base_url = 中转站 |
-| `DESKCORE_MODEL` | 可选 | 不设走 `config.CLAUDE_MODEL` |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `borrow_lessons` 返回空 |
+| `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
+
+> ⚠️ **不需要 `ANTHROPIC_API_KEY` / `DESKCORE_MODEL`。** deskcore 一次 LLM 调用都没有——调校笔记的蒸馏交给调用方模型做（`record_edit` 出材料 → 模型提炼 → `save_my_style` 写回）。
+>
+> 这不只是省一个 key。方案自己的原则就是「推理归 WorkBuddy，MCP 只做轻量数据操作」，而服务端自己调 LLM 违反了它，还多一个中转站故障点。顺带消掉了一整类故障：上一轮刚踩过「`/health` 回显的模型名和实际调用的不同源，于是配错永远看不见」——**没有模型可配，就没有配错的余地**。
 
 ### 4.1.1 部署两步，缺一不可
 
@@ -227,7 +245,9 @@ curl -sS -X POST "$DESKCORE_URL/tool/list_projects" \
 
 `/health` 会回显实际解析到的模型名、embedding 可用性、vendor 词表校验和、鉴权是否配置——**配错当场可见**。这是刻意的：TV `docs/19:180-200` 记过一次事故，librarian 的模型 env 变量名配错，每次 LLM 调用失败降级成 `[]`，外面看永远 200，查了很久。
 
-⚠️ 回显只有和**真正发起调用的地方同源**才叫回显。第一版这里就翻过一次车：`/health` 读 `os.environ["DESKCORE_MODEL"]`，而 `distill_calibration` 读 `getattr(config, "DESKCORE_MODEL", "")`——`config.py` 里根本没这个属性，永远落回 `config.CLAUDE_MODEL`。于是只配了 `DESKCORE_MODEL` 的部署里，`/health` 信心满满地回显着一个从未被调用过的模型名，配错依然当场看不见。现在两边共用 `core.resolve_model()`。加新配置回显时照这个来。
+⚠️ **回显只有和真正用它的地方同源才叫回显。** 这里翻过一次车：`/health` 读 `os.environ["DESKCORE_MODEL"]`，而 `distill_calibration` 读 `getattr(config, "DESKCORE_MODEL", "")`——`config.py` 里根本没这个属性，永远落回 `config.CLAUDE_MODEL`。于是只配了 `DESKCORE_MODEL` 的部署里，`/health` 信心满满地回显着一个从未被调用过的模型名，配错依然当场看不见。
+
+模型那一项现在已经不存在了（蒸馏搬走，deskcore 不调 LLM），但这条教训对**剩下每一个回显项**都成立：加新回显时，取值必须走真正消费它的那个函数，不要在 `/health` 里另读一遍 env。
 
 ### 4.3 挂到 WorkBuddy
 
