@@ -138,9 +138,9 @@ def selftest() -> int:
     truth = fp.jaccard(_all_grams(_long), _all_grams(_edited))     # 不截断的地面真值
     est = fp.jaccard(set(fp.ngram_hashes(_long)), set(fp.ngram_hashes(_edited)))
     n_full = len(_all_grams(_long))
-    print(f"\nn-gram 截断稳定性（{n_full} grams，远超 cap=200）:")
+    print(f"\nn-gram 截断稳定性（{n_full} grams，远超 cap={fp.NGRAM_CAP}）:")
     print(f"  地面真值 J={truth:.3f}   截断后估计 J={est:.3f}   偏差 {abs(truth - est):.3f}")
-    if n_full <= 200:
+    if n_full <= fp.NGRAM_CAP:
         print("  ✗ 测试文本没超过 cap，没测到截断路径")
         ok = False
     elif abs(truth - est) > 0.15:

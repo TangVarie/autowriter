@@ -498,12 +498,17 @@ def fingerprint_stats(sb, project_id: str) -> tuple[int, int]:
 
 
 def check_drafts_sql(sb, project_id: str, rows: list[dict]) -> list[dict] | None:
-    """三路比对下推到库里(审计 SUP-002 / ROB-004 / ROB-011)。
+    """四路比对下推到库里(审计 SUP-002 / ROB-004 / ROB-011 / COR-014)。
 
     ``rows`` = [{opening_hash, ngram_hashes, title_embedding}, ...]，顺序即
-    结果的 ``idx``。返回每条的
-    ``{idx, best_sim, sim_title, best_j, j_title, open_exact, open_title}``；
+    结果的 ``idx``。返回每条的 ``{idx, best_sim, sim_title, best_j, j_title,
+    open_exact, open_title, best_c, c_title, c_sample}``；
     RPC 不存在(migrations/004 没跑)时返回 None, 由调用方降级回 Python 路径。
+
+    ⚠️ 后三列(``best_c`` / ``c_title`` / ``c_sample``)是 **migrations/005** 加的
+    包含度那一路。只跑过 004 的库回不出这三列 —— 那**不是错误**, 调用方按
+    "这一路没跑"处理(``c_sample`` 取不到就是 0, 包含度不发言), 并在 summary 里
+    报 ``containment_skipped_warning``。绝不能当成"包含度 = 0 = 没撞车"。
 
     为什么值得下推: 原来是把整个项目的指纹(4000 行 × 768 维)拉进 Python 再逐对
     算余弦 —— 百 MB 级传输 + 三千万次乘加, 单次数十秒, 且占着 uvicorn 线程池
@@ -678,7 +683,11 @@ def write_fingerprints(sb, rows: list[dict]) -> int:
 
 def commit_fingerprints_atomic(sb, project_id: str, rows: list[dict],
                                user_id: str | None,
-                               ngram_hard: float) -> list[dict] | None:
+                               ngram_hard: float,
+                               *,
+                               contain_hard: float | None = None,
+                               contain_min_sample: int | None = None,
+                               ) -> list[dict] | None:
     """定稿入库 + 【同一事务内重新查一遍】, 走 deskcore_commit_fingerprints RPC。
 
     为什么不能直接 insert: check_drafts 和 commit_drafts 是两次独立调用。两个
@@ -687,23 +696,67 @@ def commit_fingerprints_atomic(sb, project_id: str, rows: list[dict],
 
     返回每条的 {idx, status, collided_with, detail}; RPC 不存在(迁移没跑)时
     返回 None, 由调用方降级。
+
+    ⚠️ **两个版本的签名都要试**(审计 COR-014)。migrations/005 把这个函数从 4 参
+    改成了 6 参(多了包含度的两个阈值)。只跑过 001~004 的库上还是 4 参版本, 而
+    PostgREST 对"参数对不上"的报错文本里带 ``does not exist`` —— 那正好被
+    ``rpc_missing()`` 认成"迁移压根没跑", 于是**整条原子写入路径会静默退化成
+    直插**, check/commit 之间的竞态窗口重新打开, 而日志只说"migrations/001
+    还没跑?"(完全误导)。分两步升级的库上这一定会发生。
+
+    所以顺序是: 先按 6 参调; 只有它报"找不到"时才回退到 4 参再试一次;
+    两次都找不到才是真的没跑迁移。
     """
     if not rows:
         return []
-    try:
-        res = sb.rpc("deskcore_commit_fingerprints", {
-            "_project_id": project_id,
-            "_rows": rows,
-            "_user_id": user_id,
-            "_ngram_hard": ngram_hard,
-        }).execute()
-    except Exception as exc:
-        if rpc_missing(exc):
-            logger.error("deskcore_commit_fingerprints RPC 不存在 —— migrations/001 "
-                         "还没跑? 本次降级为直插(并发 check/commit 可能撞车)。")
+    base = {
+        "_project_id": project_id,
+        "_rows": rows,
+        "_user_id": user_id,
+        "_ngram_hard": ngram_hard,
+    }
+    attempts = []
+    if contain_hard is not None or contain_min_sample is not None:
+        wide = dict(base)
+        if contain_hard is not None:
+            wide["_contain_hard"] = contain_hard
+        if contain_min_sample is not None:
+            wide["_contain_min_sample"] = contain_min_sample
+        attempts.append(("005", wide))
+    attempts.append(("001", base))
+
+    for n, (tag, args) in enumerate(attempts):
+        try:
+            res = sb.rpc("deskcore_commit_fingerprints", args).execute()
+        except Exception as exc:
+            if not rpc_missing(exc):
+                raise
+            if n + 1 < len(attempts):
+                logger.warning(
+                    "deskcore_commit_fingerprints 没有 migrations/005 那版签名, "
+                    "回退到 4 参旧版 —— 写入侧仍会关竞态窗口, 但**不做包含度重查**"
+                    "(短稿照搬长稿在 commit 这一关拦不住)。跑 migrations/005 修好。")
+                continue
+            logger.error(
+                "deskcore_commit_fingerprints RPC 不存在(两种签名都试过) —— "
+                "migrations/001 还没跑? 本次降级为直插(并发 check/commit 可能撞车)。")
             return None
-        raise
-    return res.data or []
+        else:
+            if tag == "001" and len(attempts) > 1:
+                _rpc_missing_telemetry_commit_narrow()
+            return res.data or []
+    return None
+
+
+def _rpc_missing_telemetry_commit_narrow() -> None:
+    """回退到 4 参旧版时埋一行点。静默降级最怕的就是没人知道它降级了。"""
+    try:
+        import telemetry
+        telemetry.log_event("deskcore_rpc_signature_old",
+                            rpc="deskcore_commit_fingerprints",
+                            hint="跑 migrations/005_deskcore_containment.sql")
+    except Exception:
+        pass
 
 
 # ── 个人调校笔记 / 精修 diff(私有层) ──────────────────────────────────────

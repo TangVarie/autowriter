@@ -52,6 +52,25 @@ jobs:
           # -q 之外还要 -ra: strict xfail 一旦被人修好会变成 XPASS 失败,
           # 摘要里必须能一眼看到是哪条, 否则下一个人只看到"红了"。
           python -m pytest tests/ -q -ra
+
+      - name: 迁移在真 PostgreSQL 上跑得起来, 且与 Python 算得一样 (审计 COR-014)
+        run: |
+          # ⚠️ 这一步存在的理由很具体: 写 COR-014 那个迁移时, "读代码 + 肉眼
+          # review" 漏掉了两个 bug, 两个都是真跑一次就当场炸的 ——
+          #   ① WITH 的作用域只有一条语句(拆成两条 SELECT 读同一个 CTE 会报
+          #      relation "metrics" does not exist);
+          #   ② 两个 CTE 之间漏了逗号。
+          # plpgsql 的函数体对 Python 来说只是个字符串, 没有任何静态检查够得着
+          # 它, 而这些 SQL 是【查重硬闸】的实现。
+          #
+          # 比语法更重要的是: 下推路径(RPC)与 Python 兜底路径【算出来的数必须
+          # 一样】。两边不一致是最坏的失败形态 —— 各自看都正常, 只有对比才看得见。
+          sudo systemctl start postgresql || sudo service postgresql start
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          # 走 TCP, 免得纠结 peer 认证下的 socket 目录
+          PGPASSWORD=postgres python tests/sql_parity_check.py 127.0.0.1 5432
+        env:
+          PGPASSWORD: postgres
       - name: deskcore round-5 回归 (fail-closed / 规则口径 / 触发器条件)
         run: |
           python - <<'PY'

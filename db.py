@@ -991,7 +991,11 @@ CREATE OR REPLACE FUNCTION deskcore_commit_fingerprints(
     _project_id UUID,
     _rows       JSONB,        -- [{title,opening,opening_hash,ngram_hashes,title_embedding,version_id,angle_key}, ...]
     _user_id    UUID,
-    _ngram_hard NUMERIC DEFAULT 0.35
+    _ngram_hard NUMERIC DEFAULT 0.35,
+    -- 审计 COR-014: 写入侧的重查必须和 deskcore_check_drafts 同口径, 否则同一对
+    -- 稿子会在两道闸上得到相反的结论。阈值仍由 Python 侧统一持有, 不在 SQL 写死。
+    _contain_hard       NUMERIC DEFAULT 0.60,
+    _contain_min_sample INT     DEFAULT 15
 )
 RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
 LANGUAGE plpgsql
@@ -1003,10 +1007,15 @@ DECLARE
     r        JSONB;
     i        INT := -1;
     ng       TEXT[];
+    ng_max   TEXT;
     oh       TEXT;
     hit      RECORD;
     best_j   NUMERIC;
     best_t   TEXT;
+    best_c   NUMERIC;
+    best_ct  TEXT;
+    best_cs  INT;
+    open_hit BOOLEAN;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('deskcore_draw:' || _project_id::text));
 
@@ -1015,38 +1024,88 @@ BEGIN
         oh := r->>'opening_hash';
         SELECT COALESCE(array_agg(x), '{}') INTO ng
           FROM jsonb_array_elements_text(COALESCE(r->'ngram_hashes','[]'::jsonb)) x;
+        ng_max := (SELECT max(x) FROM unnest(ng) x);
 
         -- ① 开头精确撞车
-        SELECT f.title INTO best_t
-          FROM draft_fingerprints f
-         WHERE f.project_id = _project_id AND f.opening_hash = oh
-         LIMIT 1;
-        IF FOUND AND oh IS NOT NULL THEN
+        -- ⚠️ 空开头(正文为空的 title-only 稿)不参与。Python 侧 fp.opening_hash
+        -- 对空开头返回空串, 这里把空串和 NULL 一起排除 —— 否则所有 title-only
+        -- 的行会互相"精确撞车", 而这是单独就判死的强信号, 没东西兜得住。
+        -- (这段本来只改在 migrations/001 里, 本文件漏了 —— 两份 DDL 双写的
+        --  典型代价, 见审计 SUP-010。)
+        open_hit := FALSE;
+        IF oh IS NOT NULL AND oh <> '' THEN
+            SELECT TRUE, f.title INTO open_hit, best_t
+              FROM draft_fingerprints f
+             WHERE f.project_id = _project_id
+               AND f.opening_hash = oh
+               AND f.opening_hash <> ''
+             LIMIT 1;
+            open_hit := COALESCE(open_hit, FALSE);
+        END IF;
+        IF open_hit THEN
             idx := i; status := 'rejected';
             collided_with := best_t; detail := '正文开头与库中已有稿件完全一致';
             RETURN NEXT;
             CONTINUE;
         END IF;
 
-        -- ② 四字串重合。先用 GIN 的 && 粗筛, 只对有交集的行算精确 Jaccard。
+        -- ② 四字串: Jaccard 与包含度同一次扫描算完, 口径与 deskcore_check_drafts
+        --    完全一致(受限子域 + bottom-k 标准估计式)。见 migrations/005。
         best_j := 0; best_t := NULL;
-        IF array_length(ng, 1) IS NOT NULL THEN
+        best_c := 0; best_ct := NULL; best_cs := 0;
+        IF ng_max IS NOT NULL THEN
             FOR hit IN
-                SELECT f.title,
-                       (SELECT count(*) FROM (SELECT unnest(ng) INTERSECT SELECT unnest(f.ngram_hashes)) s)::numeric
-                       / NULLIF((SELECT count(*) FROM (SELECT unnest(ng) UNION SELECT unnest(f.ngram_hashes)) u), 0) AS j
-                  FROM draft_fingerprints f
-                 WHERE f.project_id = _project_id
-                   AND f.ngram_hashes && ng
+                SELECT c.title,
+                       m.inter::numeric / NULLIF(m.uni, 0)     AS j,
+                       m.inter::numeric / NULLIF(m.smaller, 0) AS c,
+                       m.smaller::int                          AS smaller
+                  FROM (
+                      SELECT f.title, f.ngram_hashes AS hs
+                        FROM draft_fingerprints f
+                       WHERE f.project_id = _project_id
+                         AND f.ngram_hashes && ng
+                         AND array_length(f.ngram_hashes, 1) IS NOT NULL
+                  ) c
+                  CROSS JOIN LATERAL (
+                      SELECT LEAST(ng_max, (SELECT max(x) FROM unnest(c.hs) x)) AS t
+                  ) tt
+                  CROSS JOIN LATERAL (
+                      SELECT count(*) FILTER (WHERE g.in_a AND g.in_b) AS inter,
+                             count(*)                                  AS uni,
+                             LEAST(count(*) FILTER (WHERE g.in_a),
+                                   count(*) FILTER (WHERE g.in_b))     AS smaller
+                        FROM (
+                            SELECT z.h, bool_or(z.src = 'a') AS in_a,
+                                        bool_or(z.src = 'b') AS in_b
+                              FROM (SELECT x AS h, 'a' AS src
+                                      FROM unnest(ng) x WHERE x <= tt.t
+                                    UNION ALL
+                                    SELECT y, 'b'
+                                      FROM unnest(c.hs) y WHERE y <= tt.t) z
+                             GROUP BY z.h
+                        ) g
+                  ) m
             LOOP
                 IF hit.j IS NOT NULL AND hit.j > best_j THEN
                     best_j := hit.j; best_t := hit.title;
+                END IF;
+                IF hit.c IS NOT NULL AND hit.c > best_c THEN
+                    best_c := hit.c; best_ct := hit.title; best_cs := hit.smaller;
                 END IF;
             END LOOP;
         END IF;
         IF best_j >= _ngram_hard THEN
             idx := i; status := 'rejected'; collided_with := best_t;
             detail := format('正文与库中已有稿件大面积重合(四字串 Jaccard=%s)', round(best_j, 3));
+            RETURN NEXT;
+            CONTINUE;
+        END IF;
+        -- 样本量不够就不发言 —— 与 Python 侧 CONTAIN_MIN_SAMPLE 同一口径, 刻意
+        -- fail-open(样本量小时无关稿子也能撞出高包含度, 按硬闸处理就是误杀)。
+        IF best_cs >= _contain_min_sample AND best_c >= _contain_hard THEN
+            idx := i; status := 'rejected'; collided_with := best_ct;
+            detail := format('正文有 %s%% 的四字串出现在库中已有稿件里(照搬长稿)',
+                             round(best_c * 100, 1));
             RETURN NEXT;
             CONTINUE;
         END IF;
@@ -1072,10 +1131,10 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM PUBLIC;
-REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM anon;
-REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM authenticated;
-GRANT EXECUTE ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) TO service_role;
+REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM anon;
+REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) TO service_role;
 
 -- ── deskcore 查重比对下推(审计 SUP-002 / ROB-004 / ROB-011) ─────────────
 -- 原来是把整个项目的指纹(4000 行 × 768 维)拉进 Python 再逐对算余弦: 百 MB 级
@@ -1099,7 +1158,10 @@ RETURNS TABLE(
     best_j     NUMERIC,
     j_title    TEXT,
     open_exact BOOLEAN,
-    open_title TEXT
+    open_title TEXT,
+    best_c     NUMERIC,      -- 四字串包含度(审计 COR-014)
+    c_title    TEXT,
+    c_sample   INT           -- 该次估计的有效样本量; 太小则调用方不采信
 )
 LANGUAGE plpgsql
 STABLE
@@ -1108,22 +1170,25 @@ SET search_path = pg_catalog, autowriter, extensions
 -- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
 AS $$
 DECLARE
-    r  JSONB;
-    i  INT := -1;
-    ng TEXT[];
-    oh TEXT;
-    v  vector;
+    r      JSONB;
+    i      INT := -1;
+    ng     TEXT[];
+    ng_max TEXT;
+    oh     TEXT;
+    v      vector;
 BEGIN
     FOR r IN SELECT * FROM jsonb_array_elements(_rows) LOOP
         i := i + 1;
         idx := i;
         best_sim := 0; sim_title := NULL;
         best_j := 0;   j_title := NULL;
+        best_c := 0;   c_title := NULL;  c_sample := 0;
         open_exact := FALSE; open_title := NULL;
 
         oh := NULLIF(r->>'opening_hash', '');
         SELECT COALESCE(array_agg(x), '{}') INTO ng
           FROM jsonb_array_elements_text(COALESCE(r->'ngram_hashes','[]'::jsonb)) x;
+        ng_max := (SELECT max(x) FROM unnest(ng) x);
         v := CASE WHEN r->'title_embedding' IS NULL
                     OR jsonb_typeof(r->'title_embedding') = 'null'
                   THEN NULL ELSE (r->>'title_embedding')::vector END;
@@ -1137,21 +1202,70 @@ BEGIN
             open_exact := open_title IS NOT NULL;
         END IF;
 
-        -- ② 四字串 Jaccard。GIN 的 && 粗筛后只对有交集的行精算。
-        IF array_length(ng, 1) IS NOT NULL THEN
-            SELECT t.title, t.j INTO j_title, best_j
-              FROM (
-                SELECT f.title,
-                       (SELECT count(*) FROM (SELECT unnest(ng) INTERSECT SELECT unnest(f.ngram_hashes)) s)::numeric
-                       / NULLIF((SELECT count(*) FROM (SELECT unnest(ng) UNION SELECT unnest(f.ngram_hashes)) u), 0) AS j
+        -- ② 四字串: Jaccard 与包含度同一次扫描算完, 各取各的最佳命中。
+        --    ngram_hashes 存的是 bottom-k **sketch** 不是完整集合, 所以两个
+        --    指标都只在【两个 sketch 都覆盖到的 hash 区间】上算:
+        --    t = min(两边最大值), 因为 v ≤ t 时"v ∈ 原集合" ⟺ "v ∈ sketch"。
+        --    直接对整个数组求交并比会系统性偏低(实测最大 0.125, 而硬闸线 0.35)。
+        --    包含度 |A∩B|/min(|A|,|B|) 专抓 Jaccard 结构上抓不到的形状:
+        --    短稿整段照搬长稿(那时 J 的真值就等于长度比, 再准也够不着阈值)。
+        --    完整推导与阈值的零分布见 migrations/005 + deskcore/fingerprint.py。
+        --    ⚠️ 逐行走 LATERAL, 不要拆成两个 CTE 再按 title join —— title 不唯一。
+        IF ng_max IS NOT NULL THEN
+            WITH cand AS (
+                SELECT f.title, f.ngram_hashes AS hs
                   FROM draft_fingerprints f
                  WHERE f.project_id = _project_id
                    AND f.ngram_hashes && ng
-              ) t
-             WHERE t.j IS NOT NULL
-             ORDER BY t.j DESC, t.title
-             LIMIT 1;
+                   AND array_length(f.ngram_hashes, 1) IS NOT NULL
+            ),
+            metrics AS (
+                SELECT c.title, m.inter::numeric AS inter,
+                       m.uni::numeric AS uni, m.smaller::numeric AS smaller
+                  FROM cand c
+                  CROSS JOIN LATERAL (
+                      SELECT LEAST(ng_max, (SELECT max(x) FROM unnest(c.hs) x)) AS t
+                  ) tt
+                  CROSS JOIN LATERAL (
+                      SELECT count(*) FILTER (WHERE g.in_a AND g.in_b) AS inter,
+                             count(*)                                  AS uni,
+                             LEAST(count(*) FILTER (WHERE g.in_a),
+                                   count(*) FILTER (WHERE g.in_b))     AS smaller
+                        FROM (
+                            SELECT z.h, bool_or(z.src = 'a') AS in_a,
+                                        bool_or(z.src = 'b') AS in_b
+                              FROM (SELECT x AS h, 'a' AS src
+                                      FROM unnest(ng) x WHERE x <= tt.t
+                                    UNION ALL
+                                    SELECT y, 'b'
+                                      FROM unnest(c.hs) y WHERE y <= tt.t) z
+                             GROUP BY z.h
+                        ) g
+                  ) m
+            ),
+            -- ⚠️ 两路的最佳命中必须在【同一条语句】里取完。WITH 的作用域只有
+            --    一条语句 —— 拆成两条 SELECT 的话第二条会报 relation "metrics"
+            --    does not exist。(在真 PostgreSQL 上跑才发现的; 光看代码
+            --    和 py_compile 都看不出来。)
+            jbest AS (
+                SELECT x.title, x.j FROM (
+                    SELECT m.title, m.inter / NULLIF(m.uni, 0) AS j FROM metrics m
+                ) x WHERE x.j IS NOT NULL ORDER BY x.j DESC, x.title LIMIT 1
+            ),
+            cbest AS (
+                SELECT x.title, x.c, x.smaller FROM (
+                    SELECT m.title, m.inter / NULLIF(m.smaller, 0) AS c,
+                           m.smaller::int AS smaller
+                      FROM metrics m
+                ) x WHERE x.c IS NOT NULL ORDER BY x.c DESC, x.title LIMIT 1
+            )
+            SELECT (SELECT b.j FROM jbest b), (SELECT b.title FROM jbest b),
+                   (SELECT b.c FROM cbest b), (SELECT b.title FROM cbest b),
+                   (SELECT b.smaller FROM cbest b)
+              INTO best_j, j_title, best_c, c_title, c_sample;
             best_j := COALESCE(best_j, 0);
+            best_c := COALESCE(best_c, 0);
+            c_sample := COALESCE(c_sample, 0);
         END IF;
 
         -- ③ 标题语义余弦(见上: 顺序扫描, 精确)。

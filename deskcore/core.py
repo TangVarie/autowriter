@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+from typing import NamedTuple
 
 import config
 import db
@@ -425,13 +426,29 @@ def render_angles_block(angles: list[dict]) -> str:
 # ══════════════════════════════════════════════════════════════════════
 
 
+class HistHit(NamedTuple):
+    """一篇草稿与历史比对的**逐信号**最佳命中。
+
+    每一路各记各的 —— 各路的最佳命中可能来自不同的历史稿, 混在一起报会让人
+    对着一条根本没引发拒绝的稿子去改(codex review 记过这一条)。
+    ``*_title`` 为 None 表示这一路没有命中(不是"命中了一条空标题")。
+    """
+    sim: float
+    sim_title: str | None
+    jac: float
+    j_title: str | None
+    open_exact: bool
+    open_title: str | None
+    contain: float                 # 审计 COR-014
+    contain_title: str | None
+    contain_sample: int            # 有效样本量, 低于阈值时这一路不发言
+
+
 def _history_probe(client, project_id: str, o_hashes: list[str],
                    grams: list[set], new_vecs):
     """返回 ``(probe, hist_size, hist_with_vec, hist_truncated)``。
 
-    ``probe(i)`` → ``(best_sim, sim_title, best_j, j_title, exact, open_title)``
-    —— 第 i 篇草稿与【历史】比对的三路最佳命中。title 为 None 表示这一路没有
-    命中(不是"命中了一条空标题")。
+    ``probe(i)`` → ``HistHit`` —— 第 i 篇草稿与【历史】比对的四路最佳命中。
 
     两条实现共用这一个形状:
 
@@ -469,7 +486,7 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                 f"(idx={missing[:5]}) —— 拒绝按'没撞车'放行")
         total, with_vec = store.fingerprint_stats(client, project_id)
 
-        def _probe(i: int):
+        def _probe(i: int) -> HistHit:
             r = by_idx.get(i) or {}
             # NUMERIC 在 PostgREST 上可能回数字也可能回字符串, float() 两种都吃。
             # open_exact 不看它自己的布尔值而是看 open_title 有没有 ——
@@ -477,13 +494,22 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             # opening_exact 是**单独就判死**的最强信号, 没有任何东西兜得住
             # 这个误伤。RPC 里那一列本来就是 `open_title IS NOT NULL` 算出来的,
             # 这么取口径完全一致, 只是不依赖布尔的传输形态。
-            return (
+            #
+            # ⚠️ best_c / c_title / c_sample 是 migrations/005 加的。老版本 RPC
+            # (只跑过 004)回不出这三列 —— 取不到就当**这一路没跑**(sample=0,
+            # 于是 deciding_signals 里 contain_ok 为 False, 包含度不发言),
+            # 而不是当成"包含度为 0 = 没撞车"。两者的差别在下面的
+            # contain_pushdown_missing 里报给调用方。(审计 COR-014)
+            return HistHit(
                 float(r.get("best_sim") or 0.0),
                 r.get("sim_title"),
                 float(r.get("best_j") or 0.0),
                 r.get("j_title"),
                 r.get("open_title") is not None,
                 r.get("open_title"),
+                float(r.get("best_c") or 0.0),
+                r.get("c_title"),
+                int(r.get("c_sample") or 0),
             )
 
         # 下推路径比的是【全量】—— 库里没有 4000 条那个上限, 所以永不截断。
@@ -500,7 +526,7 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
     hist_vecs = [h.get("title_embedding") for h in history]
     with_vec = sum(1 for v in hist_vecs if v)
 
-    def _probe_py(i: int):
+    def _probe_py(i: int) -> HistHit:
         best_sim, sim_hit = 0.0, None
         if new_vecs and i < len(new_vecs):
             for hi, emb in enumerate(hist_vecs):
@@ -510,16 +536,26 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                 if s > best_sim:
                     best_sim, sim_hit = s, history[hi]
         best_j, j_hit = 0.0, None
+        best_c, c_hit, c_sample = 0.0, None, 0
         for hi, hg in enumerate(hist_grams):
-            j = fp.jaccard(grams[i], hg)
+            # ⚠️ 两边都是 bottom-k **sketch**, 不是完整 gram 集 —— 必须走
+            # sketch_overlap, 直接 fp.jaccard 会系统性偏低(审计 COR-014)。
+            j, c, s = fp.sketch_overlap(grams[i], hg)
             if j > best_j:
                 best_j, j_hit = j, history[hi]
+            # 包含度**单独记它自己的最佳命中**: 抄袭源和"用词最像的那篇"经常
+            # 不是同一条, 归错了人会对着无关的稿子改。样本量跟着那一条走 ——
+            # 它决定这一路发不发言。
+            if c > best_c:
+                best_c, c_hit, c_sample = c, history[hi], s
         open_hit = hist_open.get(o_hashes[i]) if o_hashes[i] else None
-        return (
+        return HistHit(
             best_sim, (sim_hit or {}).get("title", "") if sim_hit else None,
             best_j, (j_hit or {}).get("title", "") if j_hit else None,
             open_hit is not None,
             (open_hit or {}).get("title", "") if open_hit else None,
+            best_c, (c_hit or {}).get("title", "") if c_hit else None,
+            c_sample,
         )
 
     return _probe_py, len(history), with_vec, truncated
@@ -560,7 +596,7 @@ def check_drafts(client, project_id: str, drafts: list[dict],
     new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
 
     # ── 与历史比对: 优先下推到库里(审计 SUP-002 / ROB-004 / ROB-011)──────
-    # ``hist`` 是一个「按 i 取三路最佳命中」的可调用对象, 两条路径共用同一个
+    # ``hist`` 是一个「按 i 取四路最佳命中」的可调用对象, 两条路径共用同一个
     # 形状, 下面拼 verdict 的代码因此完全不用分叉。
     hist, hist_size, hist_with_vec, hist_truncated = _history_probe(
         client, project_id, o_hashes, grams, new_vecs)
@@ -579,8 +615,12 @@ def check_drafts(client, project_id: str, drafts: list[dict],
                        project_id, bool(new_vecs), hist_with_vec, hist_size)
 
     results = []
+    contain_ran = False          # 有没有任何一篇真的跑过包含度这一路
     for i in range(len(drafts)):
-        best_sim, sim_hit, best_j, j_hit, exact, open_hit = hist(i)
+        h = hist(i)
+        best_sim, sim_hit, best_j, j_hit, exact, open_hit = (
+            h.sim, h.sim_title, h.jac, h.j_title, h.open_exact, h.open_title)
+        best_c, c_hit, c_sample = h.contain, h.contain_title, h.contain_sample
 
         # ⚠️ 每个信号的最佳命中【各记各的】, 且各自记清楚是本批内还是历史。
         # 原来共用一个 intra 变量, 只要任一信号的最佳命中来自本批内就无条件
@@ -591,6 +631,7 @@ def check_drafts(client, project_id: str, drafts: list[dict],
         sim_best = (sim_hit or "", "历史") if sim_hit is not None else None
         j_best = (j_hit or "", "历史") if j_hit is not None else None
         open_best = (open_hit or "", "历史") if open_hit is not None else None
+        c_best = (c_hit or "", "历史") if c_hit is not None else None
 
         for k in range(i):   # 本批内互比: 同批两篇撞车同样要拦
             # o_hashes[i] 为空 = 这篇没有正文开头。空 == 空【不算撞车】——
@@ -599,23 +640,30 @@ def check_drafts(client, project_id: str, drafts: list[dict],
             if o_hashes[i] and o_hashes[i] == o_hashes[k]:
                 exact, open_best = True, (titles[k], "本批内")
                 break
-            jj = fp.jaccard(grams[i], grams[k])
+            # 同上: 本批内两篇也都是 sketch, 而且同一批里长短稿并存很常见
+            # (一篇 300 字的短图文 + 一篇 1500 字的长测评)。(审计 COR-014)
+            jj, cc, ss = fp.sketch_overlap(grams[i], grams[k])
             if jj > best_j:
                 best_j, j_best = jj, (titles[k], "本批内")
+            if cc > best_c:
+                best_c, c_best, c_sample = cc, (titles[k], "本批内"), ss
             if new_vecs:
                 s = dedup.cosine_similarity(new_vecs[i], new_vecs[k])
                 if s > best_sim:
                     best_sim, sim_best = s, (titles[k], "本批内")
 
-        status, reason, which = fp.deciding_signals(best_sim, exact, best_j)
-        by_signal = {"opening": open_best, "title": sim_best, "ngram": j_best}
+        contain_ran = contain_ran or c_sample >= fp.CONTAIN_MIN_SAMPLE
+        status, reason, which = fp.deciding_signals(
+            best_sim, exact, best_j, best_c, c_sample)
+        by_signal = {"opening": open_best, "title": sim_best,
+                     "ngram": j_best, "contain": c_best}
         # 按 verdict 实际依据的信号取命中; 两个弱信号并列时取第一个(它排在
         # reason 的最前面, 与用户读到的解释对得上)。pass 时没有依据信号,
         # 退回"最强的那个"只为让人知道最接近的是什么, 并注明是参考。
         hit = next((by_signal[s] for s in which if by_signal.get(s)), None)
         informational = False
         if hit is None:
-            hit = open_best or sim_best or j_best
+            hit = open_best or sim_best or j_best or c_best
             informational = hit is not None
         collided, scope = hit if hit else ("", "")
         row = {
@@ -625,7 +673,12 @@ def check_drafts(client, project_id: str, drafts: list[dict],
             "decided_by": which,
             "signals": {"title_similarity": round(best_sim, 4),
                         "opening_exact_match": exact,
-                        "body_ngram_jaccard": round(best_j, 4)},
+                        "body_ngram_jaccard": round(best_j, 4),
+                        # 审计 COR-014。sample 一并报出去 —— 它低于
+                        # CONTAIN_MIN_SAMPLE 时 containment 这个数字**没有参考
+                        # 价值**, 不报的话看的人会拿一个纯噪声当结论。
+                        "body_ngram_containment": round(best_c, 4),
+                        "containment_sample": c_sample},
         }
         if informational:
             row["collided_note"] = ("这条判定为通过, collided_with 只是最接近的"
@@ -642,7 +695,18 @@ def check_drafts(client, project_id: str, drafts: list[dict],
         "history_missing_embedding": hist_missing_vec,
         "history_truncated": hist_truncated,
         "semantic_degraded": degraded,
+        "containment_checked": contain_ran,
     }
+    if hist_size and not contain_ran:
+        # 审计 COR-014: 包含度这一路一次都没真的发言。两种可能, 都要说出来 ——
+        # 静默不发言正是这条 finding 本身的形态(有个信号没跑, 而返回值看起来
+        # 一切正常)。
+        summary["containment_skipped_warning"] = (
+            "「短稿照搬长稿」这一路本次没有生效: 要么草稿太短、与历史稿的长度差"
+            "太大, 有效样本量不够(低于 "
+            f"{fp.CONTAIN_MIN_SAMPLE} 就不发言, 免得噪声误杀); 要么服务端只跑了 "
+            "migrations/004 而没跑 005(老版 RPC 回不出包含度)。"
+            "另外三路照常跑了, 但整段照搬一篇长稿的重复可能漏掉 —— 要告诉用户。")
     if hist_truncated:
         # history_size 报的是【实际比过的条数】, 但项目的历史比这更多。
         # 不说出来的话, "比对全量历史" 就成了一句假话。
@@ -728,7 +792,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         })
 
     outcome = store.commit_fingerprints_atomic(
-        client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD)
+        client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD,
+        # 阈值只在 fingerprint.py 里定义一处 —— SQL 里的 DEFAULT 只是兜底,
+        # 真正生效的是这里传下去的值。两边写死两份就迟早对不上。(审计 COR-014)
+        contain_hard=fp.NGRAM_CONTAIN_HARD,
+        contain_min_sample=fp.CONTAIN_MIN_SAMPLE)
 
     atomic = outcome is not None
     rejected: list[dict] = []

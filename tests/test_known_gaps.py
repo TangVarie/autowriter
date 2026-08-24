@@ -62,8 +62,27 @@ def test_sup006_small_count_is_sane_today():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# COR-014 · bottom-k 的 Jaccard 在长短稿之间系统性偏低
+# COR-014 —— 已修, 见 tests/test_dedup_containment.py
 # ══════════════════════════════════════════════════════════════════════
+#
+# 这里原来有一条 xfail(strict=True), 现在摘掉了 —— 但**它的 reason 写错了**,
+# 值得留个记录, 因为错的方式很典型。
+#
+# 那条 xfail 断言的是「短稿逐字抄自长稿时, fp.jaccard 应该 ≥ 0.35」, reason
+# 里写的修法是「改成标准 bottom-k 估计」。真去量之后发现:
+#
+#   · 估计确实有偏(直接对两个 sketch 求交并比, 偏差最大 0.125),
+#     改成标准估计式之后降到 0.045 —— 这一半是对的;
+#   · **但那条断言本身仍然不成立**。280 字的短稿整篇塞进 2800 字的长稿里,
+#     Jaccard 的**真值**就是 0.1。Jaccard = |A∩B|/|A∪B|, 分母被长稿撑大,
+#     这是定义决定的, 不是精度问题。再准的估计也够不着 0.35。
+#
+# 也就是说我当时给出的"修法"根本修不好我自己写的那条断言。真正缺的是
+# **另一个指标**: 包含度 |A∩B|/min(|A|,|B|)。合成对照 7/7 全拦下(原来 1/7)。
+#
+# 教训与 §0.4 那条是同一件事的第三面: **先量再改**。"bottom-k 用错了"这个
+# 诊断是对的, 但它只解释了一部分现象, 而我把它当成了全部, 还把它写进了
+# xfail 的 reason —— 下一个人照着做会发现改完测试还是红的。
 
 def _passage(seed: int, n_sentences: int) -> str:
     """造一段可控长度的中文正文。句式固定、词随 seed 变, 保证:
@@ -74,33 +93,21 @@ def _passage(seed: int, n_sentences: int) -> str:
     )
 
 
-def test_cor014_baseline_short_inside_long_is_detected_today():
-    """先把**当前**能力钉住: 长度相当的两篇, 抄了就该被抓到。
-
-    这条现在是绿的 —— 它存在是为了证明下面那条红的不是"整个机制都坏了",
-    而是**特定形状**(长短差距大)下的失真。
-    """
-    body = _passage(0, 12)
-    a = set(fp.ngram_hashes(body))
-    b = set(fp.ngram_hashes(body))
-    assert fp.jaccard(a, b) == 1.0, "同一篇自己跟自己都不是 1.0, 机制坏了"
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="COR-014 未修(本批第 13 项, 排在测试地基之后): ngram_hashes 对**每篇 "
-           "各自**取 bottom-200, 长短稿的第 200 小阈值差着量级 —— 短稿逐字抄自 "
-           "长稿时, 两个采样集几乎不相交, Jaccard 远低于 0.35 的硬闸线, 直接放行。"
-           "修法是改成标准 bottom-k 估计(对两个 sketch 的并集再取 bottom-k, "
-           "算其中同时属于两边的比例), 存量指纹不用重算。",
-)
-def test_cor014_short_copied_from_long_should_be_caught():
-    long_body = _passage(0, 120)          # 长稿
-    short_body = _passage(0, 12)          # 短稿 = 长稿开头的逐字一段
+def test_cor014_short_copied_from_long_is_caught_now():
+    """本条从 xfail(strict) 变成真回归。判据换成包含度 —— 见上面那段说明。"""
+    long_body = _passage(0, 120)
+    short_body = _passage(0, 12)          # 长稿开头的逐字一段
     assert short_body in long_body, "构造错了, 短稿不是长稿的子串"
 
     a = set(fp.ngram_hashes(short_body))
     b = set(fp.ngram_hashes(long_body))
-    assert fp.jaccard(a, b) >= fp.NGRAM_JACCARD_HARD, (
-        f"逐字抄袭被判为不重复: jaccard={fp.jaccard(a, b):.4f} "
-        f"< 硬闸线 {fp.NGRAM_JACCARD_HARD}")
+    j, contain, sample = fp.sketch_overlap(a, b)
+
+    assert sample >= fp.CONTAIN_MIN_SAMPLE, (
+        f"有效样本量只有 {sample}, 这个形状下包含度不该被采信")
+    assert contain >= fp.NGRAM_CONTAIN_HARD, (
+        f"逐字抄袭没被抓到: 包含度={contain:.4f} < {fp.NGRAM_CONTAIN_HARD}")
+    # 同时钉住"为什么不能靠 Jaccard": 它在这个形状下**本来就**够不着硬闸线。
+    assert j < fp.NGRAM_JACCARD_HARD, (
+        f"Jaccard={j:.4f} 居然够着硬闸线了 —— 那上面那段说明就得重写")
+    assert fp.deciding_signals(0.0, False, j, contain, sample)[0] == "reject"
