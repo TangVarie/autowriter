@@ -425,9 +425,17 @@ def _call_with_retry(call_fn, max_retries: int = 5, *, rebuild=None):
     try:
         return clients.with_anthropic_retry(call_fn, max_retries=max_retries)
     except anthropic.BadRequestError as exc:
-        if _cache_ttl_disabled or not _is_cache_ttl_rejection(exc):
+        # codex review 2026-08-24: 判据只看【这个异常是不是 ttl 被拒】, 不能再
+        # 与"全局开关是否已经关掉"合并成一个条件。
+        #
+        # 并发场景下会这样: 两个批次同时在飞, 第一个的 400 回来把
+        # _cache_ttl_disabled 置了 True; 第二个的 400 紧接着到达, 而它的请求体
+        # 是在开关翻转【之前】拼好的、里面还带着被拒的 ttl。旧写法看到开关已经
+        # 是 True 就直接上抛 —— 于是降级的那一瞬间, 除了第一个之外的每个在途
+        # 请求都白白失败一次, 而它们明明各自都带了 rebuild。
+        if not _is_cache_ttl_rejection(exc):
             raise
-        _disable_cache_ttl(str(exc))
+        _disable_cache_ttl(str(exc))   # 已经关过就是 no-op(它自己判幂等)
         if rebuild is None:
             raise
         rebuild()

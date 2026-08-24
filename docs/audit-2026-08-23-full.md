@@ -13,7 +13,7 @@
 |---|---|---|
 | 第 1 批 · 止血 | ROB-003 · COR-003 · COR-007 · COR-010 · COR-005/006 | ✅ **已修**(见下) |
 | 第 2 批 · 数据一致性 | COR-002 · COR-004 · COR-008 · COR-009 · COR-011 · COR-020 · COR-021 · COR-022 · ROB-009 · ROB-018 | ✅ **已修**(见 §0.2) |
-| 第 3 批 · 性能与成本 | SUP-001 · SUP-002 · SUP-003 · SUP-004 · SUP-005 · SUP-007 · SUP-008 · ROB-004 · ROB-011 · ROB-013 | ✅ **已修**(见 §0.3) |
+| 第 3 批 · 性能与成本 | SUP-001 · SUP-002 · SUP-003 · SUP-004 · SUP-005 · SUP-007 · SUP-008 · ROB-004 · ROB-011 · ROB-013 | ✅ **已修**(见 §0.3; codex review 的 6 条修正见 §0.4) |
 | 第 4 批 · 结构性 | ROB-001 · ROB-002 · SUP-011 · SUP-012 · SUP-024 · SUP-010 · COR-014 · COR-015 | 待做 |
 
 ### 0.1 第 1 批(止血)的实现说明与**两处与本报告的偏差**
@@ -128,6 +128,56 @@ RPC 里 `ORDER BY` 的是子查询算好的别名 `sim` 而不是 `title_embeddi
 
 **deskcore 依赖增量**: `deskcore/requirements.txt` 不需要改 —— 部署本来就是
 `pip install -r requirements.lock -r deskcore/requirements.txt`, numpy 在锁文件里。
+
+---
+
+### 0.4 codex review 的 6 条(2026-08-24)——**全部属实**
+
+第三批推上去之后叫了一轮 codex review，6 条 findings 逐条核实之后**没有一条是误报**。
+其中 3 条 P1，两条是我在这次审计里**自己引入**的回归。记在这里，因为它们暴露的是
+我判断方式上的问题，不只是几个 bug。
+
+| # | 严重度 | 是什么 | 修法 |
+|---|---|---|---|
+| 1 | P1 | `migrations/003` 的唯一索引会让**每一个多引擎批次**整批不落库 | `bulk_create_initial_versions` 改成同 item 内 1..N 编号 |
+| 2 | P1 | `CREATE_TABLES_SQL` 里 4 个 RPC 的 `search_path` 够不着自己引用的表 | 加 `autowriter` 进 search_path + CI 守卫 |
+| 3 | P1 | `/health` 那个"5 秒墙钟上限"**根本不生效** | `abandon_on_cancel=True` + 探测 client 配网络超时 |
+| 4 | P2 | 硬约束标记去重记早了，一次瞬时错误会让 item 停在原状态 | 写成功之后再记 |
+| 5 | P2 | 降级那一瞬间，除第一个之外的在途请求都白失败一次 | 判据与全局开关解耦 |
+| 6 | P2 | `rule_counts_bulk` 把几百个 UUID 塞进一个 `.in_()`（414）；无记忆项目白算 ctx 向量 | 走 `db._in_chunks`；两表都空时不算 |
+
+**第 1 条是这次审计里我犯的最严重的错误。** COR-004 的诊断（重复 `version_num` 让挑
+"代表版本"的 tie-break 静默选错）是对的，但我把成因锁死在"并发迭代"这个**罕见竞态**上，
+没有去查"重复号平时是怎么产生的"。实际上 `bulk_create_initial_versions` 给同一 item 的
+**每个引擎**都硬编码 `version_num=1` —— 多引擎批次是天天在跑的常规路径，重复号是**设计
+产物而不是竞态残留**。于是加上唯一索引之后：首版 insert 必撞 23505 → `_save_batch_results`
+的失败路径删掉已建 items → **整批生成完什么也不存**。
+
+教训不是"再仔细点"。是：**给一列加唯一约束之前，必须先枚举出所有往这一列写值的地方**，
+而不是只顺着"我怀疑的那条竞态路径"往下看。我当时只读了 `create_version`，
+没读同样写 `version_num` 的 `bulk_create_initial_versions`。
+
+**第 2 条也是同一类：只看了自己新加的东西，没看它所处的上下文。** 我确实注意到
+`CREATE_TABLES_SQL` 里表名不带前缀而函数固定了 `search_path`，当时判断"这是既有写法，
+不是我的问题"就放过了 —— 可我正在往这个块里**加两个同样写法的新函数**。而且失败方式极坏：
+报错文本里带 `does not exist`，正好被 `store.rpc_missing` 的判据认成"迁移没跑"，
+于是**静默**退回 Python 慢路径，永远不告警。顺带把旁边两个老函数一起修了。
+
+**第 3 条是"我以为我修好了，其实没有"。** 实测（回归里钉死了这个事实）：
+
+```
+with anyio.fail_after(0.3):
+    await to_thread.run_sync(sleep_1s2)   # 1.20s 后【返回了值】，没抛超时
+```
+
+`to_thread.run_sync` 默认 `abandon_on_cancel=False`，取消要等工作线程自己返回才生效。
+也就是说改之前 `/health` 在"库卡住不回"——**本条修复唯一针对的那个场景**——下照样会一直挂着。
+我写下"5 秒墙钟上限"时没有验证过它会不会触发。现在两层都上：`abandon_on_cancel=True`
+让 `/health` 按时应答，探测 client 的 `postgrest_client_timeout` 让被放弃的线程能自己收场。
+
+**关于回归**：6 条各补一条，且都先在 `git stash` 回到修复前的代码上跑过一遍、确认会红。
+`/health` 那条把 anyio 的坑本身写成了可执行断言（先证明默认值确实不生效，再证明我们用的
+写法生效）——下次有人"顺手"把参数去掉时，红的会是一条讲清楚了为什么的断言。
 
 ---
 

@@ -315,9 +315,14 @@ def _run_hard_constraint_check(
         metrics.incr("hard_rule_violations", len(hits))
         item_id = iv.get("item_id")
         if item_id and item_id not in marked_items:
-            marked_items.add(item_id)
+            # codex review 2026-08-24: 记进 marked_items 必须在**写成功之后**。
+            # 记在前面的话, 第一条违规版本遇到一次瞬时库错误, 同一 item 后面
+            # 几条违规版本就都被"已经标过了"跳过 —— item 停在原状态, 而
+            # errors_sink 里那几行还在跟用户说"已标记 needs_revision"。
+            # 说过的话和库里的状态对不上, 且没有任何报错。
             try:
                 db.update_item_status(db_client, item_id, "needs_revision")
+                marked_items.add(item_id)
             except Exception as exc:
                 telemetry.log_event(
                     "hard_rule_status_update_failed",
@@ -1138,7 +1143,13 @@ def _queue_worker_impl(
             inject_report: dict = {"filtered": []}
             # 审计 SUP-005: ctx 向量算【一次】给两遍过滤共用。以前两遍各算一次,
             # 同一段文本发了两次 embedding —— 调用数与这一步的延迟白白翻倍。
-            _soft_ctx = mem_module.prepare_soft_context(context_text)
+            #
+            # codex review 2026-08-24: 但两个记忆表**都空**时一次也不能算。
+            # filter_soft_by_relevance 开头就有 `if not memories: return`,
+            # 所以老写法在新项目 / 无记忆项目上是 0 次调用; 把 prepare 提到外面
+            # 之后反而变成每批都多打一次 embedding —— 本来要省的地方成了净增。
+            _soft_ctx = (mem_module.prepare_soft_context(context_text)
+                         if (global_mems or project_mems) else None)
             global_mems_for_plan  = mem_module.filter_soft_by_relevance(
                 global_mems,  context_text, report_sink=inject_report,
                 context=_soft_ctx,
@@ -3195,8 +3206,10 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             extra_instr,
             image_prompt,
         ])).strip()
-        # 审计 SUP-005: 同 _queue_worker_impl —— ctx 向量算一次给两遍共用。
-        _qg_soft_ctx = mem_module.prepare_soft_context(_qg_context_text)
+        # 审计 SUP-005: 同 _queue_worker_impl —— ctx 向量算一次给两遍共用,
+        # 且两个记忆表都空时一次也不算(codex review; 见那边的完整说明)。
+        _qg_soft_ctx = (mem_module.prepare_soft_context(_qg_context_text)
+                        if (global_mems or project_mems) else None)
         global_mems = mem_module.filter_soft_by_relevance(
             global_mems, _qg_context_text, report_sink=inject_report,
             context=_qg_soft_ctx,

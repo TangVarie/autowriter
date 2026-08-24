@@ -913,7 +913,16 @@ LANGUAGE plpgsql
 -- migrations/ —— 只改一边的话, 新建的库照旧 function_search_path_mutable
 -- 且保留可变 search_path。(codex aw#57 review; migrations/README 也写了
 -- "加表/加列必须两边都改", 函数同理)
-SET search_path = pg_catalog, extensions
+SET search_path = pg_catalog, autowriter, extensions
+-- ⚠️ autowriter 必须在里面(codex review 2026-08-24)。本文件里的表名一律**不带
+-- schema 前缀**(整段 SQL 靠 search_path 解析), 而函数自己的 SET search_path
+-- 会覆盖调用方的 —— 只写 pg_catalog+extensions 的话, 函数体里的 draft_fingerprints
+-- 在【运行时】解析不到, 报 relation ... does not exist。
+-- 最坏的是它怎么失败: 那句报错里带 "does not exist", 而 store.rpc_missing 的判据
+-- 正好认这个词 —— 于是 check_drafts 会把"函数在、只是找不到表"当成"迁移没跑",
+-- 静默退回 Python 慢路径, 永远不报警。
+-- (migrations/*.sql 走的是另一条路: 那边表名全限定成 autowriter.*, 所以只需
+--  pg_catalog+extensions。两边各自自洽即可, 但不能混。)
 AS $$
 DECLARE
     cand  JSONB;
@@ -986,7 +995,9 @@ CREATE OR REPLACE FUNCTION deskcore_commit_fingerprints(
 )
 RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
 LANGUAGE plpgsql
-SET search_path = pg_catalog, extensions   -- 见上; ::vector 需要 extensions
+SET search_path = pg_catalog, autowriter, extensions
+-- 固定 search_path 的三段各自的作用见上面 deskcore_reserve_angles 那段说明;
+-- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
 AS $$
 DECLARE
     r        JSONB;
@@ -1092,7 +1103,9 @@ RETURNS TABLE(
 )
 LANGUAGE plpgsql
 STABLE
-SET search_path = pg_catalog, extensions   -- ::vector 需要 extensions
+SET search_path = pg_catalog, autowriter, extensions
+-- 固定 search_path 的三段各自的作用见上面 deskcore_reserve_angles 那段说明;
+-- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
 AS $$
 DECLARE
     r  JSONB;
@@ -1174,7 +1187,9 @@ CREATE OR REPLACE FUNCTION deskcore_fingerprint_counts(_project_ids UUID[])
 RETURNS TABLE(project_id UUID, n BIGINT)
 LANGUAGE sql
 STABLE
-SET search_path = pg_catalog, extensions
+SET search_path = pg_catalog, autowriter, extensions
+-- 固定 search_path 的三段各自的作用见上面 deskcore_reserve_angles 那段说明;
+-- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
 AS $$
     SELECT f.project_id, count(*)::bigint
       FROM draft_fingerprints f
@@ -1923,20 +1938,41 @@ def _collect_recent_canonical_versions(
 
 
 def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]:
-    """Insert a batch of first-version rows (``version_num=1``) in one
-    round trip.  Each row should carry ``item_id``, ``ai_engine``, ``title``,
-    ``body``, and optionally ``keywords`` / ``token_usage``.
+    """Insert a batch of first-version rows in one round trip.  Each row
+    should carry ``item_id``, ``ai_engine``, ``title``, ``body``, and
+    optionally ``keywords`` / ``token_usage``.
 
     Used by the batch-generation save path; iteration / manual-edit paths
     still go through ``create_version`` because they need the next available
-    version_num for an existing item."""
+    version_num for an existing item.
+
+    ⚠️ ``version_num`` 在**每个 item 内**按入参顺序编 1..N, 不是全部写 1。
+    (codex review, 2026-08-24 —— 我在 COR-004 里把"同一 item 出现重复
+    version_num"当成罕见竞态, 其实**多引擎批次天生就这样**: 一个 item 有几个
+    引擎就有几条首版, 原来全部硬编码成 1。migrations/003 装上
+    ``UNIQUE(item_id, version_num)`` 之后, 每一个多引擎批次的这次 insert 都会
+    撞 23505; 而 app._save_batch_results 的失败路径会把已建的 items 删掉 ——
+    于是**整批生成完什么也没存下来**, 用户只看到一行"批量写入 versions 失败"。
+    这是本次审计自己引入的、最严重的一处回归。
+
+    编号口径与 migrations/003 的重编号一致(同 item 内按既有顺序从 1 连续排),
+    所以历史数据迁移后与新写入的数据是同一套语义。``create_version`` 之后
+    自然从 N+1 接着走。
+
+    副作用(可接受): 挑"代表版本"的 ``_pick_version`` 按 max(version_num) 取,
+    以前 N 条并列 1 时靠 (created_at, id) 做 tie-break —— 也就是**任意**一条;
+    现在会稳定取到入参里的最后一个引擎。从"不确定"变成"确定", 而真正要紧的
+    场合用户会在审核页显式指定 best_version_id。"""
     if not rows:
         return []
+    seq: dict[str, int] = {}
     payload = []
     for r in rows:
+        item_id = r["item_id"]
+        seq[item_id] = seq.get(item_id, 0) + 1
         payload.append({
-            "item_id":     r["item_id"],
-            "version_num": 1,
+            "item_id":     item_id,
+            "version_num": seq[item_id],
             "ai_engine":   r["ai_engine"],
             "title":       r.get("title", ""),
             "body":        r.get("body", ""),

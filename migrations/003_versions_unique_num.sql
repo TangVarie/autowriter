@@ -10,6 +10,16 @@
 -- 一直没有唯一约束。同一个 item 并发迭代(两个标签页; 或"AI 迭代"与"手动精修"
 -- 同时提交)会各自读到同一个 max, 双双写入同一个号。
 --
+-- ⚠️ 但重复号【绝大多数不是竞态来的】(codex review 2026-08-24 指出, 属实):
+-- db.bulk_create_initial_versions 原来给同一 item 的**每个引擎**都写
+-- version_num=1 —— 多引擎批次是天天在跑的常规路径, 一个 item 有几个引擎就有
+-- 几条并列的 1。所以:
+--   · 那个函数已改成同 item 内按 1..N 编号(否则装上本索引之后, 每一个多引擎
+--     批次的首版 insert 都会撞 23505, 而失败路径会删掉已建 items ——
+--     整批生成完什么也不存);
+--   · 下面 ① 的重编号不是"清理罕见脏数据", 而是**几乎每个多引擎 item 都要走
+--     一遍**。它按 (version_num, created_at, id) 稳定重排, 与新代码同一套口径。
+--
 -- 后果不是报错, 是**排序不确定**:
 --   db.list_approved_versions_for_sync 的 _pick_version 和
 --   deskcore/store.labeled_examples / legacy_versions 都按

@@ -157,18 +157,71 @@ async def auth_middleware(request: Request, call_next):
 # 额度 2 而不是 1: 平台的健康检查和人工 curl 可能同时打进来, 1 会让后者干等。
 _HEALTH_LIMITER = anyio.CapacityLimiter(2)
 
-# 单次探测的墙钟上限。库连接卡死(TCP 黑洞)时 supabase-py 没有默认超时, /health
-# 会一直挂着不返回 —— 平台照样判超时重启, 而且【没有任何信息】说明卡在哪。
-# 超时后线程还在后台跑(Python 没法中断阻塞的 socket 读), 所以额度要 > 1,
-# 否则连续几次超时会把私有池占满。
+# 单次探测的墙钟上限。库连接卡死(TCP 黑洞)时 /health 会一直挂着不返回 ——
+# 平台照样判超时重启, 而且【没有任何信息】说明卡在哪。
 _HEALTH_PROBE_TIMEOUT = float(os.environ.get("DESKCORE_HEALTH_PROBE_TIMEOUT", "5") or 5)
 
 
+_HEALTH_PROBE_CLIENT = None
+
+
+def _health_probe_client():
+    """/health 专用的 Supabase client: 带**网络层**超时。
+
+    ``db.get_service_client()`` 用的是 supabase-py 的默认超时口径, 对
+    "TCP 黑洞"这种连接建起来了、就是不回数据的情况可能一直等下去 —— 而那正是
+    ROB-004 要防的场景。这里显式把 postgrest 的超时压到探测预算之内, 让阻塞
+    调用**必然会结束**, 上面被放弃的线程才能收场而不是永久驻留。
+
+    留成模块级单例: /health 会被平台每隔几十秒打一次, 每次新建 client 就是
+    ROB-013 那个 FD 泄漏的翻版。
+    """
+    global _HEALTH_PROBE_CLIENT
+    if _HEALTH_PROBE_CLIENT is None:
+        import config
+        import db
+        from supabase import create_client
+        from supabase.client import ClientOptions
+        key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", "")
+        if not key:
+            # 没配 service_role 时退回原路径, 让 _db_probe 照常报出那条错。
+            return db.get_service_client()
+        _HEALTH_PROBE_CLIENT = create_client(
+            config.SUPABASE_URL, key,
+            options=ClientOptions(
+                schema="autowriter",
+                # 略小于墙钟预算: 让网络层先于 fail_after 收手, 这样常见情况下
+                # 我们拿到的是一条**有信息的**超时错误, 而不是被取消掉的空壳。
+                postgrest_client_timeout=max(1.0, _HEALTH_PROBE_TIMEOUT - 1.0),
+            ),
+        )
+    return _HEALTH_PROBE_CLIENT
+
+
 async def _probe(fn, fallback):
-    """在 /health 私有线程额度里跑一个阻塞探测, 超时返回 fallback。"""
+    """在 /health 私有线程额度里跑一个阻塞探测, 超时返回 fallback。
+
+    ⚠️ ``abandon_on_cancel=True`` 不是可有可无的调参, **没有它这个超时根本不
+    生效**(codex review 2026-08-24, 已实测)。``to_thread.run_sync`` 默认
+    ``abandon_on_cancel=False`` —— 取消要等工作线程自己返回才生效, 于是
+    ``fail_after`` 形同虚设:
+
+        with anyio.fail_after(0.3):
+            await to_thread.run_sync(sleep_1s2)   # 1.20s 后【返回了值】, 没抛超时
+
+    也就是说改之前, /health 在"库卡住不回"这个**本条修复唯一针对的场景**下
+    照样会一直挂着。设成 True 之后同一段代码 0.31s 抛 TimeoutError。
+
+    代价: 被放弃的线程还在后台跑(Python 没法中断阻塞的 socket 读)。实测 anyio
+    在取消时就把 limiter 名额还回来了, 所以放弃的线程不会占住私有额度; 但它
+    仍然占着一个 OS 线程和一条连接, 直到底层调用自己超时 —— 所以真正的兜底是
+    下面 ``_health_probe_client`` 给的**网络层**超时, 让那条调用必然会结束。
+    两层缺一不可: 网络超时保证线程能收场, ``fail_after`` 保证 /health 按时应答。
+    """
     try:
         with anyio.fail_after(_HEALTH_PROBE_TIMEOUT):
-            return await anyio.to_thread.run_sync(fn, limiter=_HEALTH_LIMITER)
+            return await anyio.to_thread.run_sync(
+                fn, limiter=_HEALTH_LIMITER, abandon_on_cancel=True)
     except TimeoutError:
         return fallback
     except Exception as exc:  # noqa: BLE001
@@ -201,7 +254,7 @@ async def health() -> dict:
 
     def _db_probe() -> tuple[bool, str]:
         try:
-            db.get_service_client().table("projects").select("id").limit(1).execute()
+            _health_probe_client().table("projects").select("id").limit(1).execute()
         except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"[:160]
         return True, "ok"

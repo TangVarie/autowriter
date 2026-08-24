@@ -1244,7 +1244,7 @@ jobs:
           print("\n审计第二批回归: 10/10 通过")
           PY
 
-      - name: 审计第三批回归 (性能与成本 · SUP-001/002/003/004/005/007/008 · ROB-004/011/013)
+      - name: 审计第三批回归 + codex review 6 条 (性能与成本 · SUP-001~008 / ROB-004/011/013)
         run: |
           python - <<'PY'
           import ast, inspect, os, random, textwrap, threading, time
@@ -1256,6 +1256,21 @@ jobs:
           import deskcore.core as C, deskcore.store as S
 
           FAIL = []
+
+          def _app_func_src(name):
+              """按名字从 app.py 里切出一个函数的源码。
+
+              app.py 不能 import —— 它一被 import 就开始跑 streamlit 脚本。所以读文本 +
+              走 ast 定位: 按缩进找边界会被**跨行的函数签名**骗到(那个 `) -> None:`
+              也顶格), 直接把函数截在签名处。
+              """
+              src = open("app.py", encoding="utf-8").read()
+              tree = ast.parse(src)
+              fn = next((n for n in tree.body
+                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                         and n.name == name), None)
+              assert fn is not None, f"app.py 里找不到顶层函数 {name}"
+              return "\n".join(src.splitlines()[fn.lineno - 1:fn.end_lineno])
 
 
           def check(name, fn):
@@ -1524,6 +1539,50 @@ jobs:
               assert r["status"] == "pass", r
               # NUMERIC 回字符串时也要能算
               assert r["signals"]["body_ngram_jaccard"] == 0.0, r
+
+
+          def t_codex_p1_rpc_search_path():
+              """CREATE_TABLES_SQL 里每个固定了 search_path 的函数, 都要够得着它引用的表。
+
+              codex review 2026-08-24: 新加的两个 RPC(以及旁边两个老的)写着
+              `SET search_path = pg_catalog, extensions`, 函数体里却裸用 draft_fingerprints
+              —— 运行时报 relation ... does not exist。而那句话里带 "does not exist",
+              正好被 store.rpc_missing 认成"迁移没跑", 于是静默退回 Python 慢路径。
+              坏得毫无声响, 这条断言就是为了让它不能再回来。
+              """
+              import re
+              sql = db.CREATE_TABLES_SQL
+              fns = list(re.finditer(r"CREATE OR REPLACE FUNCTION (\w+)\(", sql))
+              assert len(fns) >= 6, f"只找到 {len(fns)} 个函数, 正则可能失配了"
+              checked = 0
+              for i, m in enumerate(fns):
+                  end = fns[i + 1].start() if i + 1 < len(fns) else len(sql)
+                  body = sql[m.start():end]
+                  sp = re.search(r"SET search_path = ([^\n]*)", body)
+                  if not sp:
+                      continue           # 没固定 search_path = 跟随调用方, 不在本条管辖
+                  path = sp.group(1).split("--")[0]
+                  # 函数体里引用的表。只看 DML 关键字后面的裸标识符, 并排掉:
+                  #   · 后面跟 "(" 的     → 是函数调用(jsonb_array_elements 之类), 不是表
+                  #     ⚠️ 这里的量词必须是**占有型** `*+`(py3.11+): 贪婪的 `*` 会为了
+                  #     满足 (?!\s*\() 而回溯, 把 jsonb_array_elements( 匹配成
+                  #     "jsonb_array_element" 混进表名里。
+                  #   · REVOKE/GRANT 行的 → "FROM anon" 那种, 是角色不是表
+                  #   · INTO 后面的       → plpgsql 变量名, 不是表
+                  stmt = "\n".join(l for l in body.splitlines()
+                                   if not l.lstrip().upper().startswith(("REVOKE", "GRANT")))
+                  refs = {t for t in re.findall(
+                      r"(?:FROM|UPDATE|JOIN)\s+([a-z_][a-z0-9_]*+)(?!\s*\()", stmt)}
+                  qualified = set(re.findall(r"autowriter\.([a-z_][a-z0-9_]*)", body))
+                  bare = refs - qualified
+                  if not bare:
+                      continue
+                  checked += 1
+                  assert "autowriter" in path, (
+                      f"{m.group(1)} 固定了 search_path={path.strip()!r}, 却裸用表 "
+                      f"{sorted(bare)} —— 运行时找不到表, 而报错会被 rpc_missing 当成"
+                      f"'迁移没跑'静默降级")
+              assert checked >= 4, f"只校到 {checked} 个函数, 断言可能没在真的守东西"
 
 
           def t_sup002_no_fail_open():
@@ -1985,6 +2044,195 @@ jobs:
                   f"只有 {with_rebuild} 个调用点带 rebuild; generate / iterate / 合规复审都要带"
 
 
+          # ══════════════════════════════════════════════════════════════════
+          # codex review (2026-08-24) 的 6 条发现 —— 逐条核实为真, 逐条补回归
+          # ══════════════════════════════════════════════════════════════════
+          def t_codex_p1_multi_engine_version_num():
+              """多引擎批次: 同一 item 的每个引擎各一条首版, 版本号必须互不相同。
+
+              这是本次审计**自己引入**的最严重一处回归。migrations/003 装上
+              UNIQUE(item_id, version_num) 之后, 原来给每条都写 version_num=1 的
+              bulk_create_initial_versions 会让每一个多引擎批次的首版 insert 撞 23505;
+              而 app._save_batch_results 的失败路径会删掉已建的 items —— 整批生成完
+              什么也不存, 用户只看到一行"批量写入 versions 失败"。
+              """
+              seen = {}
+
+              class _Ins:
+                  def __init__(self, rows):
+                      self.rows = rows
+
+                  def execute(self):
+                      for r in self.rows:                       # 模拟唯一索引
+                          k = (r["item_id"], r["version_num"])
+                          assert k not in seen, f"撞唯一索引 {k} —— 整批会回滚"
+                          seen[k] = True
+                      return type("R", (), {"data": self.rows})()
+
+              class _T:
+                  def insert(self, rows):
+                      return _Ins(rows)
+
+              class _C:
+                  def table(self, _n):
+                      return _T()
+
+              rows = ([{"item_id": "i1", "ai_engine": f"e{k}", "title": f"t{k}", "body": "b"}
+                       for k in range(3)] +
+                      [{"item_id": "i2", "ai_engine": f"e{k}", "title": f"u{k}", "body": "b"}
+                       for k in range(2)])
+              out = db.bulk_create_initial_versions(_C(), rows)
+              nums = {}
+              for r in out:
+                  nums.setdefault(r["item_id"], []).append(r["version_num"])
+              assert nums == {"i1": [1, 2, 3], "i2": [1, 2]}, nums
+              # 引擎与号的对应关系必须按入参顺序, 不能被重排
+              assert [r["ai_engine"] for r in out if r["item_id"] == "i1"] == ["e0", "e1", "e2"]
+
+              # 单引擎(每 item 一条)仍然全是 1 —— 老数据的语义不变
+              seen.clear()
+              solo = db.bulk_create_initial_versions(
+                  _C(), [{"item_id": f"x{k}", "ai_engine": "e", "title": "t", "body": "b"}
+                         for k in range(4)])
+              assert {r["version_num"] for r in solo} == {1}, solo
+
+              # migrations/003 的重编号必须和上面同一套口径(同 item 内从 1 连续排)
+              sql = open("migrations/003_versions_unique_num.sql", encoding="utf-8").read()
+              assert "row_number() OVER (" in sql and "PARTITION BY v.item_id" in sql
+              assert "ORDER BY v.version_num, v.created_at, v.id" in sql, \
+                  "重编号的排序口径变了, 迁移后的历史数据会和新写入的对不上"
+
+
+          def t_codex_p1_health_timeout_actually_fires():
+              """/health 的墙钟上限必须真的会触发。
+
+              codex 指出并经实测确认: to_thread.run_sync 默认 abandon_on_cancel=False,
+              取消要等工作线程返回才生效 —— fail_after 形同虚设, 而"库卡住不回"正是
+              ROB-004 唯一针对的场景。这条断言把 anyio 的这个坑钉成可执行的知识:
+              先证明默认值确实不生效(否则下面那半就是废话), 再证明我们用的写法生效。
+              """
+              import time as _t
+              import anyio
+              import anyio.to_thread
+
+              def _slow():
+                  _t.sleep(0.8)
+                  return "finished-anyway"
+
+              async def _run(abandon):
+                  t0 = _t.monotonic()
+                  try:
+                      with anyio.fail_after(0.2):
+                          r = await anyio.to_thread.run_sync(_slow, abandon_on_cancel=abandon)
+                      return ("returned", r, _t.monotonic() - t0)
+                  except TimeoutError:
+                      return ("timeout", None, _t.monotonic() - t0)
+
+              kind, val, dt = anyio.run(_run, False)
+              assert kind == "returned" and dt > 0.6, (
+                  f"anyio 的行为变了({kind}, {dt:.2f}s) —— 下面那条断言的前提没了, 重新想")
+
+              kind, val, dt = anyio.run(_run, True)
+              assert kind == "timeout" and dt < 0.5, (kind, dt)
+
+              # 真正的守卫: /health 的探测必须传 abandon_on_cancel=True。
+              # 只读源码不 import —— deskcore/app.py 要 fastapi, 本步骤没装。
+              tree = ast.parse(open("deskcore/app.py", encoding="utf-8").read())
+              probe = next(n for n in ast.walk(tree)
+                           if isinstance(n, ast.AsyncFunctionDef) and n.name == "_probe")
+              kws = [k for n in ast.walk(probe) if isinstance(n, ast.Call) for k in n.keywords]
+              ok = any(k.arg == "abandon_on_cancel"
+                       and isinstance(k.value, ast.Constant) and k.value.value is True
+                       for k in kws)
+              assert ok, "_probe 没传 abandon_on_cancel=True —— 那个 fail_after 不会生效"
+
+              # 网络层兜底: 被放弃的线程要能自己收场, 否则线程和连接永久驻留
+              src = open("deskcore/app.py", encoding="utf-8").read()
+              assert "postgrest_client_timeout" in src, \
+                  "探测 client 没有网络超时, 被放弃的线程会一直挂着"
+
+
+          def t_codex_p2_marked_after_success():
+              """标记去重要在【写成功之后】记, 否则一次瞬时错误会让 item 停在原状态。"""
+              tree = ast.parse(_app_func_src("_run_hard_constraint_check"))
+              add = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "add"
+                     and isinstance(n.func.value, ast.Name) and n.func.value.id == "marked_items"]
+              assert len(add) == 1, f"marked_items.add 出现 {len(add)} 次"
+              # 那次 add 必须在 try 体里、且排在 update_item_status 之后
+              tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try)]
+              holder = [t for t in tries if any(a is c for c in ast.walk(t) for a in add)]
+              assert holder, "marked_items.add 不在 try 里 —— 写失败也会被记成'标过了'"
+              body_lines = [n.lineno for n in ast.walk(holder[0]) if isinstance(n, ast.Call)
+                            and getattr(n.func, "attr", "") == "update_item_status"]
+              assert body_lines and add[0].lineno > body_lines[0], \
+                  "marked_items.add 排在 update_item_status 之前, 等于没修"
+
+
+          def t_codex_p2_concurrent_ttl_rebuild():
+              """降级那一瞬间, 每个在途请求都要各自重拼 —— 不能因为开关已经翻了就上抛。"""
+              import anthropic
+
+              def _bad(msg):
+                  e = anthropic.BadRequestError.__new__(anthropic.BadRequestError)
+                  Exception.__init__(e, msg)
+                  e.message, e.status_code = msg, 400
+                  return e
+
+              G._cache_ttl_disabled = True          # 模拟"第一个请求已经把开关关了"
+              rebuilt = {"n": 0}
+              n = {"i": 0}
+
+              def _rebuild():
+                  rebuilt["n"] += 1
+
+              def _call():
+                  n["i"] += 1
+                  if n["i"] == 1:
+                      raise _bad("cache_control.ttl is not supported by this endpoint")
+                  return "ok"
+
+              try:
+                  assert G._call_with_retry(_call, rebuild=_rebuild) == "ok", \
+                      "开关已关时, 第二个在途请求被直接上抛了(codex P2)"
+                  assert rebuilt["n"] == 1, rebuilt
+              finally:
+                  G._cache_ttl_disabled = False
+
+
+          def t_codex_p2_in_chunks_and_empty_memories():
+              """两条小的: in_ 要分块; 两个记忆表都空时不算 ctx 向量。"""
+              # ① rule_counts_bulk 走 db._in_chunks
+              src = inspect.getsource(S.rule_counts_bulk)
+              assert "_in_chunks" in src, "几百个 UUID 塞进一个 .in_() 会 414"
+              N = 250
+              pids = [f"p{i}" for i in range(N)]
+              mems = [{"id": f"m{i}", "project_id": f"p{i}", "scope": "project",
+                       "status": "confirmed", "severity": "hard", "muted_until": None,
+                       "memory_type": "rule", "content": "禁词"} for i in range(N)]
+              sb = _SB(rows={"memories": mems})
+              got = S.rule_counts_bulk(sb, pids)
+              assert got["p7"] == (1, 0) and got["p249"] == (1, 0), (got["p7"], got["p249"])
+              biggest = max(len(c["filters"]["project_id"][1]) for c in sb.calls
+                            if isinstance(c["filters"].get("project_id"), tuple))
+              assert biggest <= 100, f"单次 .in_() 塞了 {biggest} 个 id"
+
+              # ② 两个记忆表都空 → 一次 embedding 都不发
+              src_app = open("app.py", encoding="utf-8").read()
+              tree = ast.parse(src_app)
+              calls = [n for n in ast.walk(tree)
+                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == "prepare_soft_context"]
+              assert len(calls) == 2, len(calls)
+              for c in calls:
+                  parent = next((n for n in ast.walk(tree)
+                                 if isinstance(n, ast.IfExp) and any(x is c for x in ast.walk(n))), None)
+                  assert parent is not None, \
+                      f"app.py:{c.lineno} 的 prepare_soft_context 是无条件调用的 —— " \
+                      "无记忆的项目每批都会白发一次 embedding(codex P2)"
+
+
           for name, fn in [
               ("SUP-003 矩阵乘与逐元素逐条一致; 零向量/nan 不会赢; 维度参差自动退回", t_sup003),
               ("SUP-002 查重下推后不再拉 4000 行×768 维; 结论由 RPC 驱动", t_sup002_pushdown),
@@ -1992,6 +2240,12 @@ jobs:
               ("SUP-002 权限错必须上抛 —— 查重不 fail-open", t_sup002_no_fail_open),
               ("SUP-002 回执缺行必须报错, 不能退化成 pass", t_sup002_partial_result),
               ("SUP-002 open_exact 不受布尔/数字的传输形态影响", t_sup002_bool_shape),
+              ("codex-P1 CREATE_TABLES_SQL 的 RPC 够得着自己引用的表", t_codex_p1_rpc_search_path),
+              ("codex-P1 多引擎批次的版本号互不相同(否则整批不落库)", t_codex_p1_multi_engine_version_num),
+              ("codex-P1 /health 的墙钟上限真的会触发(默认值不会)", t_codex_p1_health_timeout_actually_fires),
+              ("codex-P2 标记去重在写成功之后才记", t_codex_p2_marked_after_success),
+              ("codex-P2 降级瞬间每个在途请求各自重拼", t_codex_p2_concurrent_ttl_rebuild),
+              ("codex-P2 in_ 分块 + 无记忆项目不白算 ctx 向量", t_codex_p2_in_chunks_and_empty_memories),
               ("ROB-004 /health 走私有线程额度 + 墙钟上限, 不与工具抢池子", t_rob004_health_pool),
               ("ROB-011 回填逐页消费, 峰值与项目历史总量无关", t_rob011_streaming),
               ("SUP-004 list_projects 查询次数与项目数无关; 不再为计数拉向量", t_sup004),
@@ -2010,7 +2264,7 @@ jobs:
           print()
           if FAIL:
               raise SystemExit("审计第三批回归 FAILED:\n  - " + "\n  - ".join(FAIL))
-          print("审计第三批回归: 18/18 通过")
+          print("审计第三批回归 + codex review 6 条: 23/23 通过")
           PY
       - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
         run: |
@@ -2075,6 +2329,16 @@ jobs:
           assert app_mod._HEALTH_PROBE_TIMEOUT > 0
           print(f"  ✓ ROB-004 /health 私有线程额度={app_mod._HEALTH_LIMITER.total_tokens}, "
                 f"探测超时={app_mod._HEALTH_PROBE_TIMEOUT:g}s, 与默认池分离")
+
+          # codex review 2026-08-24: 探测 client 要有【网络层】超时, 否则被
+          # abandon_on_cancel 放弃掉的那个线程会永久驻留(连接也不还)。
+          _pc = app_mod._health_probe_client()
+          assert _pc is app_mod._health_probe_client(), "探测 client 不是单例 —— 每次 /health 新建一个就是 ROB-013 重演"
+          _t = _pc.postgrest.session.timeout
+          _read = getattr(_t, "read", _t)
+          assert _read is not None and float(_read) <= app_mod._HEALTH_PROBE_TIMEOUT, \
+              f"探测 client 的网络超时 {_read} 不小于墙钟预算 {app_mod._HEALTH_PROBE_TIMEOUT}"
+          print(f"  ✓ codex-P1 /health 探测 client 单例且带网络超时 read={_read}")
 
           # 未配鉴权 = 【拒绝所有请求】(2026-08-23 审计 ROB-003)。
           # 这里原来断言的是"放行但标 auth.ok=false" —— 那个口径是危险的:

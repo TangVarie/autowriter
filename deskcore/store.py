@@ -151,21 +151,27 @@ def rule_counts_bulk(sb, project_ids: list[str]) -> dict[str, tuple[int, int]]:
     + 非空 content), 只是不取 embedding、也不取 global scope ——
     list_projects 传的 user_id 本来就是 None, 那一路取的是空列表。
 
-    翻页走 _paged: 所有项目的规则加起来很容易越过 PostgREST 的 db-max-rows,
-    静默截断的话计数会偏小而没有任何提示(审计 COR-005 同款)。
+    两层都不能省:
+      · **按 id 分块**(``db._in_chunks``) —— 一次把几百个 UUID 塞进 ``.in_()``
+        会生成 10KB+ 的查询串, 网关直接 414, 而 list_projects 是模型开工调的
+        第一个工具(codex review 2026-08-24; db.py 里其它批量读早就这么做了)。
+      · **翻页**(``_paged``) —— 所有项目的规则加起来很容易越过 PostgREST 的
+        db-max-rows, 静默截断的话计数会偏小而没有任何提示(审计 COR-005 同款)。
     """
     out: dict[str, tuple[int, int]] = {pid: (0, 0) for pid in project_ids}
     if not project_ids:
         return out
     cols = "id, project_id, severity, muted_until, memory_type, content"
-    rows = _paged(lambda off, lim: (
-        sb.table("memories").select(cols)
-          .in_("project_id", list(project_ids))
-          .eq("scope", "project").eq("status", "confirmed")
-          .or_("memory_type.is.null,memory_type.eq.rule")
-          .order("id")
-          .range(off, off + lim - 1)
-    ))
+    rows: list[dict] = []
+    for chunk in db._in_chunks(list(project_ids)):
+        rows += _paged(lambda off, lim, _c=chunk: (
+            sb.table("memories").select(cols)
+              .in_("project_id", _c)
+              .eq("scope", "project").eq("status", "confirmed")
+              .or_("memory_type.is.null,memory_type.eq.rule")
+              .order("id")
+              .range(off, off + lim - 1)
+        ))
     for r in rows:
         if not db._is_rule_memory(r):
             continue
