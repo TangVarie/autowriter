@@ -1527,15 +1527,47 @@ jobs:
 
 
           def t_rob004_health_pool():
-              """/health 不能和工具抢同一个线程池。"""
-              import deskcore.app as A
-              assert isinstance(A._HEALTH_LIMITER, __import__("anyio").CapacityLimiter)
-              assert A._HEALTH_LIMITER.total_tokens >= 2, "额度 1 会让并发探测互相排队"
-              assert inspect.iscoroutinefunction(A.health), \
-                  "/health 若是同步路由就仍然占用 starlette 的默认线程池 —— ROB-004 没修掉"
-              src = inspect.getsource(A._probe)
-              assert "limiter=_HEALTH_LIMITER" in src, "探测没用私有 limiter"
-              assert "fail_after" in src, "探测没有墙钟上限, 库卡死时 /health 会一直挂着"
+              """/health 不能和工具抢同一个线程池。
+
+              ⚠️ 这条**只读源码不 import**。deskcore/app.py 需要 fastapi + mcp, 它们在
+              `deskcore/requirements.txt` 而不是主 lockfile 里 —— 本步骤刻意只装
+              lockfile(与前两批的回归步一致), import 会直接 ModuleNotFoundError。
+              真正起服务打 /health 的是下面那一步 app 冒烟。
+              """
+              tree = ast.parse(open("deskcore/app.py", encoding="utf-8").read())
+
+              fns = {n.name: n for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+              assert isinstance(fns.get("health"), ast.AsyncFunctionDef), \
+                  "/health 若是同步路由(def)就仍然占用 starlette 的默认线程池 —— ROB-004 没修掉"
+
+              # 私有额度: anyio.CapacityLimiter(N), N >= 2
+              lim = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == "_HEALTH_LIMITER"
+                             for t in n.targets)]
+              assert len(lim) == 1, "拿不到 _HEALTH_LIMITER 的定义"
+              call = lim[0].value
+              assert isinstance(call, ast.Call) and getattr(call.func, "attr", "") == "CapacityLimiter", \
+                  ast.dump(call)[:120]
+              assert isinstance(call.args[0], ast.Constant) and call.args[0].value >= 2, \
+                  "额度 1 会让平台健康检查和人工 curl 互相排队"
+
+              probe = fns.get("_probe")
+              assert isinstance(probe, ast.AsyncFunctionDef), "_probe 不见了"
+              kw = [k for n in ast.walk(probe) if isinstance(n, ast.Call) for k in n.keywords]
+              assert any(k.arg == "limiter" and isinstance(k.value, ast.Name)
+                         and k.value.id == "_HEALTH_LIMITER" for k in kw), \
+                  "探测没用私有 limiter —— 还是会排在工具后面"
+              assert any(getattr(n.func, "attr", "") == "fail_after"
+                         for n in ast.walk(probe) if isinstance(n, ast.Call)), \
+                  "探测没有墙钟上限, 库卡死(TCP 黑洞)时 /health 会一直挂着不返回"
+
+              # 工具那条路仍然走默认线程池 —— 两者必须是【不同】的池子, 否则等于没分
+              tool = fns.get("rest_tool")
+              assert any(getattr(n.func, "id", "") == "run_in_threadpool"
+                         for n in ast.walk(tool) if isinstance(n, ast.Call)), \
+                  "工具路由不再走 run_in_threadpool? 那这条断言的前提变了, 要重新想"
 
 
           def t_rob011_streaming():
@@ -1977,6 +2009,7 @@ jobs:
           os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
           os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "sb_secret_placeholder")
           from fastapi.testclient import TestClient
+          import deskcore.app as app_mod
           from deskcore.app import app
 
           # ⚠️ 必须【进入 TestClient 的上下文】, 否则 ASGI lifespan 不会跑。
@@ -2004,6 +2037,26 @@ jobs:
           assert cfg["llm"].startswith("none"), cfg["llm"]
           assert body["tools"], "/health 没回显工具清单"
           print(f"  ✓ /health 200, llm=none, tools={len(body['tools'])} 个")
+
+          # ── ROB-004 的运行期一半(审计第三批) ────────────────────────────
+          # 静态那一半在"审计第三批回归"步里(那一步只装 lockfile, import 不了
+          # fastapi, 所以只能读源码)。这里 fastapi 在, 补上真对象的检查。
+          import anyio
+          assert isinstance(app_mod._HEALTH_LIMITER, anyio.CapacityLimiter)
+          assert app_mod._HEALTH_LIMITER.total_tokens >= 2
+          # 关键: /health 的额度必须【不是】starlette 的默认线程池那一个,
+          # 否则"给它私有额度"只是句空话 —— 工具占满时它照样排队。
+          import anyio.to_thread
+
+          async def _default_limiter():
+              # current_default_thread_limiter() 要在事件循环里才拿得到
+              return anyio.to_thread.current_default_thread_limiter()
+
+          assert app_mod._HEALTH_LIMITER is not anyio.run(_default_limiter), \
+              "/health 用的还是默认线程池额度, ROB-004 没修掉"
+          assert app_mod._HEALTH_PROBE_TIMEOUT > 0
+          print(f"  ✓ ROB-004 /health 私有线程额度={app_mod._HEALTH_LIMITER.total_tokens}, "
+                f"探测超时={app_mod._HEALTH_PROBE_TIMEOUT:g}s, 与默认池分离")
 
           # 未配鉴权 = 【拒绝所有请求】(2026-08-23 审计 ROB-003)。
           # 这里原来断言的是"放行但标 auth.ok=false" —— 那个口径是危险的:
