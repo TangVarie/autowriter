@@ -1,32 +1,37 @@
-"""在**真的 PostgreSQL** 上跑一遍迁移, 并逐例比对 SQL 与 Python 的结果。
+"""在**真的 PostgreSQL** 上把整套 schema 跑一遍, 并逐例比对 SQL 与 Python。
 
 ⚠️ 这个文件**不是 pytest 用例**(所以没叫 test_*.py, pytest 不会收集它)。
 它需要一个活的 PostgreSQL, 由 CI 里那一步单独起。本地跑法见文件末尾。
 
-── 为什么值得单独有这么一个东西 ──────────────────────────────────────
+── 它验的三件事 ──────────────────────────────────────────────────────────
 
-写 COR-014 的迁移时, 光靠"读代码 + py_compile + 肉眼 review"漏掉了两个 bug,
-两个都是真跑一次就当场炸的:
+**① 基线 DDL 真的跑得起来**(审计 SUP-010)。``migrations/000_baseline.sql``
+原来是 db.py 里一个 1162 行的 Python 字符串, 从来没有任何代码执行过它 ——
+所以也从来没有任何东西验证过它。代价是真实发生过的: 修 COR-014 时发现它里面
+那份 ``deskcore_commit_fingerprints`` 还带着 ``migrations/001`` 早就修好的 bug,
+于是每个**新环境**都会带着一个老 bug 出生, 而没人会发现。
 
-  1. ``WITH`` 的作用域只有**一条语句**。把 Jaccard 和包含度拆成两条 SELECT
-     去读同一个 CTE, 第二条报 ``relation "metrics" does not exist``;
-  2. 两个 CTE 之间漏了逗号。
+**② 基线 + 增量迁移能叠在一起**。空库 → 000 → 001..005 全部执行成功。
+这才是"消双写"真正的意思: 不是只留一份, 而是**让两份必须对得上, 对不上就报错**。
 
-这两个都不是"想清楚就不会犯"的错 —— plpgsql 的函数体对 Python 来说只是一个
-字符串, 没有任何静态检查够得着它。而这些 SQL 是**查重硬闸**的实现。
+**③ 下推 SQL 与 Python 算出来的数一样**(审计 COR-014)。两条路径不一致是最坏的
+失败形态 —— 各自看都正常, 只有对比才看得见。
 
-比语法更重要的是第三件事: **两条路径算出来的数必须一样**。下推路径(RPC)和
-Python 兜底路径给同一对稿子相反的结论, 是最坏的失败形态 —— 两边各自看都
-"正常", 只有对比才看得见。
+写 COR-014 那个迁移时, "读代码 + 肉眼 review" 漏掉了两个 bug, 两个都是真跑一次
+就当场炸的: ``WITH`` 的作用域只有一条语句; 两个 CTE 之间漏了逗号。plpgsql 的
+函数体对 Python 来说只是个字符串, 没有任何静态检查够得着它。
 
-pgvector 在裸 PostgreSQL 上没有, 所以用一个最小 shim 让函数能建、能跑。
-标题余弦那一路本来就不在本文件的比对范围内。
+── Supabase shim ─────────────────────────────────────────────────────────
+裸 PostgreSQL 上没有 ``auth.uid()``、没有 ``anon``/``authenticated``/
+``service_role`` 三个角色、也没有 pgvector。这里给最小替身让 DDL 跑得动。
+**被 shim 掉的东西不算验过** —— 向量那一路本来就不在本文件的比对范围内。
 """
 
 from __future__ import annotations
 
 import json
 import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -55,10 +60,73 @@ def sql(text: str) -> str:
     return r.stdout.strip()
 
 
-def sql_file(path: Path) -> None:
-    r = subprocess.run(PSQL + ["-f", str(path)], capture_output=True, text=True)
+# 每次 psql 调用都是一个新 session, 所以 search_path 要**逐文件**带上。
+# Supabase 的 SQL Editor 默认就有 extensions 在 search_path 里, DDL 里那些
+# 不带前缀的 uuid_generate_v4() / 裸表名靠的正是它。这里对齐同一条件。
+_SEARCH_PATH = "SET search_path = autowriter, extensions, public;\n"
+
+
+def run_sql_text(text: str, label: str) -> None:
+    r = subprocess.run(PSQL, input=_SEARCH_PATH + text,
+                       capture_output=True, text=True)
     if r.returncode:
-        raise SystemExit(f"{path.name} 执行失败:\n{r.stderr[-4000:]}")
+        raise SystemExit(f"{label} 执行失败:\n{r.stderr[-4000:]}")
+
+
+def _shim(text: str) -> str:
+    """把 Supabase / pgvector 专有的东西换成裸 PG 上跑得动的最小替身。
+
+    ⚠️ 每一处替换都意味着**那一部分没有被真的验证**。所以只换到"能跑"为止,
+    不多换一行 —— 换得越多, 这个 harness 报的绿就越不值钱。
+    """
+    # pgvector: 装不了, 用 text 域顶替。带维度的 vector(768) 也一起换掉。
+    text = re.sub(r"CREATE EXTENSION IF NOT EXISTS vector[^;]*;", "", text)
+    text = re.sub(r"\bvector\(\d+\)", "extensions.vector", text)
+    # ivfflat 索引需要真的 pgvector, 整条去掉(余弦那一路不在比对范围内)
+    text = re.sub(r"CREATE INDEX[^;]*USING ivfflat[^;]*;", "", text)
+    # migrations/001 里有个 DO $guard$ 块, 检查 vector 扩展确实装在 extensions
+    # schema。**它是对的、而且很重要**(装错地方会让定稿入库在运行时才挂), 但这里
+    # 根本没装真的 pgvector, 所以它必然触发。整块拿掉。
+    # ⚠️ 也就是说"vector 装在哪"这件事**本 harness 验不了** —— 它只能靠真库上
+    #    跑迁移时那个 guard 自己把关。
+    text = re.sub(r"DO \$guard\$.*?\$guard\$;", "", text, flags=re.S)
+    return text
+
+
+SHIMS = """
+DO $r$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon')
+    THEN CREATE ROLE anon; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated')
+    THEN CREATE ROLE authenticated; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='service_role')
+    THEN CREATE ROLE service_role; END IF;
+END $r$;
+
+DROP SCHEMA IF EXISTS autowriter CASCADE;
+DROP SCHEMA IF EXISTS extensions CASCADE;
+DROP SCHEMA IF EXISTS auth CASCADE;
+CREATE SCHEMA autowriter;
+CREATE SCHEMA extensions;
+CREATE SCHEMA auth;
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA extensions;
+
+-- Supabase 的 auth.uid(): RLS policy 里到处在用。这里回 NULL 就够 ——
+-- 本 harness 全程用 superuser 跑, policy 不会被求值。
+CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE
+  AS $x$ SELECT NULL::uuid $x$;
+
+-- pgvector 的最小替身。**向量那一路因此不算验过**。
+CREATE DOMAIN extensions.vector AS text;
+CREATE FUNCTION extensions."<=>"(extensions.vector, extensions.vector)
+  RETURNS float8 LANGUAGE sql IMMUTABLE AS $x$ SELECT 1.0::float8 $x$;
+CREATE OPERATOR extensions.<=> (
+  LEFTARG = extensions.vector, RIGHTARG = extensions.vector,
+  FUNCTION = extensions."<=>");
+
+SET search_path = autowriter, extensions, public;
+"""
 
 
 def doc(rng: random.Random, n: int) -> str:
@@ -80,40 +148,44 @@ def payload(hs) -> str:
 
 
 def main() -> int:
-    # ── 最小骨架 ────────────────────────────────────────────────────────
-    sql("""
-    DO $r$ BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon')
-        THEN CREATE ROLE anon; END IF;
-      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='authenticated')
-        THEN CREATE ROLE authenticated; END IF;
-      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='service_role')
-        THEN CREATE ROLE service_role; END IF;
-    END $r$;
-    DROP SCHEMA IF EXISTS autowriter CASCADE;
-    DROP SCHEMA IF EXISTS extensions CASCADE;
-    CREATE SCHEMA autowriter;
-    CREATE SCHEMA extensions;
-    -- pgvector 的最小 shim: 只要能建函数、能跑通。余弦不在本文件的比对范围内。
-    CREATE DOMAIN extensions.vector AS text;
-    CREATE FUNCTION extensions."<=>"(extensions.vector, extensions.vector)
-      RETURNS float8 LANGUAGE sql IMMUTABLE AS $x$ SELECT 1.0::float8 $x$;
-    CREATE OPERATOR extensions.<=> (
-      LEFTARG = extensions.vector, RIGHTARG = extensions.vector,
-      FUNCTION = extensions."<=>");
-    CREATE TABLE autowriter.draft_fingerprints (
-      id bigserial primary key, project_id uuid not null, version_id uuid,
-      user_id uuid, title text not null default '', opening text not null default '',
-      title_embedding extensions.vector, embedding_model text,
-      opening_hash text, ngram_hashes text[], angle_key text,
-      created_at timestamptz default now());
-    CREATE INDEX ON autowriter.draft_fingerprints USING gin (ngram_hashes);
-    """)
-    print("  ✓ 骨架就位")
+    bad = 0
 
-    sql_file(REPO / "migrations" / "005_deskcore_containment.sql")
-    print("  ✓ migrations/005 执行通过(语法 + 类型 —— 这一关就抓到过两个 bug)")
+    # ── ① 基线 + ② 增量迁移 ────────────────────────────────────────────
+    run_sql_text(SHIMS, "Supabase shim")
+    print("  ✓ Supabase shim 就位(roles / auth.uid / uuid-ossp / vector 替身)")
 
+    files = sorted((REPO / "migrations").glob("*.sql"))
+    assert files, "migrations/ 下一个 .sql 都没有 —— 路径写错了?"
+    for f in files:
+        run_sql_text(_shim(f.read_text(encoding="utf-8")), f.name)
+        print(f"  ✓ {f.name}")
+    print(f"  ✓ 基线 + {len(files) - 1} 个增量迁移在空库上叠起来了(审计 SUP-010)")
+
+    # 抽查几张表 / 几个函数真的建出来了 —— 免得 shim 把整段吃掉还报绿
+    for tbl in ("projects", "items", "versions", "memories", "jobs",
+                "draft_fingerprints", "angle_ledger"):
+        n = sql("SELECT count(*) FROM information_schema.tables "
+                f"WHERE table_schema='autowriter' AND table_name='{tbl}';")
+        if n != "1":
+            print(f"  [FAIL] 表 {tbl} 没建出来")
+            bad += 1
+    for fn in ("deskcore_check_drafts", "deskcore_commit_fingerprints",
+               "deskcore_reserve_angles", "claim_one_job",
+               "update_calibration_notes_cas", "deskcore_fingerprint_counts"):
+        n = sql("SELECT count(*) FROM pg_proc p JOIN pg_namespace ns "
+                "ON ns.oid = p.pronamespace "
+                f"WHERE ns.nspname='autowriter' AND p.proname='{fn}';")
+        if n == "0":
+            print(f"  [FAIL] 函数 {fn} 没建出来")
+            bad += 1
+    if not bad:
+        print("  ✓ 抽查的 7 张表 + 6 个函数都在")
+
+    # ── ③ SQL 与 Python 算出来的数一样 ─────────────────────────────────
+    # 跑完整套 schema 之后 draft_fingerprints 上是有 FK 的, 先把 project 建出来。
+    # (这本身也是个信号: 之前那个手搭的最小骨架没有 FK, 也就测不到这一层。)
+    sql(f"INSERT INTO autowriter.projects (id, name, owner_id) "
+        f"VALUES ('{PID}', 'parity-check', '{UID}') ON CONFLICT (id) DO NOTHING;")
     rng = random.Random(4242)
     long_a, long_b, same, mixed = doc(rng, 120), doc(rng, 300), doc(rng, 60), doc(rng, 60)
     cases = [
@@ -126,7 +198,6 @@ def main() -> int:
         ("重名历史稿", long_a, prefix(long_a, 12)),
     ]
 
-    bad = 0
     for n, (label, hist_body, draft_body) in enumerate(cases):
         sql(f"DELETE FROM autowriter.draft_fingerprints WHERE project_id='{PID}';")
         hist_hs = fp.ngram_hashes(hist_body)
@@ -182,7 +253,12 @@ def main() -> int:
     else:
         print("  [ok  ] 被拒的没入库")
 
-    print(f"\nSQL/Python 一致性: {'全部通过' if not bad else f'{bad} 例不一致'}")
+    # ── 迁移必须幂等: 整套再跑一遍不能报错 ──────────────────────────────
+    for f in files:
+        run_sql_text(_shim(f.read_text(encoding="utf-8")), f"{f.name}(第二遍)")
+    print("  ✓ 整套迁移重复执行是干净 no-op(幂等)")
+
+    print(f"\nschema + SQL/Python 一致性: {'全部通过' if not bad else f'{bad} 项不通过'}")
     return 1 if bad else 0
 
 

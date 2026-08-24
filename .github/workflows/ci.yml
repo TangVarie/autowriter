@@ -230,10 +230,12 @@ jobs:
           # ── 7. 两份 SQL 里的触发器 WHEN 条件必须一致 ─────────────────────────
           WHEN = ("WHEN (OLD.status IS DISTINCT FROM NEW.status\n"
                   "       OR OLD.example_label IS DISTINCT FROM NEW.example_label)")
-          for f in ("migrations/001_deskcore.sql", "db.py"):
+          # 基线原来是 db.py 里的 CREATE_TABLES_SQL 字符串, 审计 SUP-010 之后
+          # 搬成了 migrations/000_baseline.sql。
+          for f in ("migrations/001_deskcore.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert WHEN in t, f"{f} 里 items 触发器缺 WHEN 条件(或两份不一致)"
-          print("  ✓ items 触发器的 WHEN 条件在 migrations 与 CREATE_TABLES_SQL 里一致")
+          print("  ✓ items 触发器的 WHEN 条件在增量迁移与基线里一致")
 
           # ── 8. R-034: memories.embedding 必须被解析成 list[float] ────────────
           # 这是取 embedding 顺带引入的地雷: PostgREST 把 pgvector 当【字符串】回,
@@ -492,7 +494,7 @@ jobs:
               "降级直插路径没记 embedding_model"
           bsrc = inspect.getsource(C.backfill_fingerprints)
           assert "embedding_model" in bsrc, "backfill 没记 embedding_model"
-          for f in ("migrations/001_deskcore.sql", "db.py"):
+          for f in ("migrations/001_deskcore.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert "embedding_model" in t, f"{f} 缺 embedding_model 列"
           sql = open("migrations/001_deskcore.sql", encoding="utf-8").read()
@@ -846,7 +848,7 @@ jobs:
                      and c.args[0].value == "calibration_notes"]
           assert not _bad_eq, "CAS 主路径还在把笔记全文塞进 .eq() 过滤"
           # 两份 SQL 的语义必须一致(限定写法本来就不同, 对齐判据/授权三处)
-          for f in ("migrations/002_calibration_cas.sql", "db.py"):
+          for f in ("migrations/002_calibration_cas.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert "update_calibration_notes_cas" in t, f"{f} 缺 CAS 函数"
               assert "md5(COALESCE(p.calibration_notes, '')) = _expected_md5" in t, \
@@ -1126,7 +1128,7 @@ jobs:
           except Exception as e:
               assert "permission denied" in str(e)
           # 唯一索引两份 SQL 都要有; 迁移必须先重编号(否则有历史重复时直接建索引会失败)
-          for f in ("migrations/003_versions_unique_num.sql", "db.py"):
+          for f in ("migrations/003_versions_unique_num.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert "versions_item_version_uniq" in t and "(item_id, version_num)" in t, f
           assert "row_number() OVER" in open("migrations/003_versions_unique_num.sql", encoding="utf-8").read()
@@ -1622,7 +1624,7 @@ jobs:
 
 
           def t_codex_p1_rpc_search_path():
-              """CREATE_TABLES_SQL 里每个固定了 search_path 的函数, 都要够得着它引用的表。
+              """基线里每个固定了 search_path 的函数, 都要够得着它引用的表。
 
               codex review 2026-08-24: 新加的两个 RPC(以及旁边两个老的)写着
               `SET search_path = pg_catalog, extensions`, 函数体里却裸用 draft_fingerprints
@@ -1631,7 +1633,8 @@ jobs:
               坏得毫无声响, 这条断言就是为了让它不能再回来。
               """
               import re
-              sql = db.CREATE_TABLES_SQL
+              # 审计 SUP-010: 基线从 db.CREATE_TABLES_SQL 搬成了 .sql 文件。
+              sql = open("migrations/000_baseline.sql", encoding="utf-8").read()
               fns = list(re.finditer(r"CREATE OR REPLACE FUNCTION (\w+)\(", sql))
               assert len(fns) >= 6, f"只找到 {len(fns)} 个函数, 正则可能失配了"
               checked = 0
@@ -2325,7 +2328,7 @@ jobs:
               ("SUP-002 权限错必须上抛 —— 查重不 fail-open", t_sup002_no_fail_open),
               ("SUP-002 回执缺行必须报错, 不能退化成 pass", t_sup002_partial_result),
               ("SUP-002 open_exact 不受布尔/数字的传输形态影响", t_sup002_bool_shape),
-              ("codex-P1 CREATE_TABLES_SQL 的 RPC 够得着自己引用的表", t_codex_p1_rpc_search_path),
+              ("codex-P1 基线里的 RPC 够得着自己引用的表", t_codex_p1_rpc_search_path),
               ("codex-P1 多引擎批次的版本号互不相同(否则整批不落库)", t_codex_p1_multi_engine_version_num),
               ("codex-P1 /health 的墙钟上限真的会触发(默认值不会)", t_codex_p1_health_timeout_actually_fires),
               ("codex-P2 标记去重在写成功之后才记", t_codex_p2_marked_after_success),

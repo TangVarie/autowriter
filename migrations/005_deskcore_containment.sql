@@ -53,6 +53,8 @@
 -- ════════════════════════════════════════════════════════════════════
 
 -- 返回列变了, CREATE OR REPLACE 会因签名冲突失败, 先 DROP。
+-- OUT 参数不算函数标识的一部分, 所以这一句对 004 那版(7 列)和本文件这版(10 列)
+-- 都有效 —— 重复执行时它把上一遍建的删掉, 下面再建一次, 干净 no-op。
 DROP FUNCTION IF EXISTS autowriter.deskcore_check_drafts(UUID, JSONB);
 
 CREATE FUNCTION autowriter.deskcore_check_drafts(
@@ -229,9 +231,12 @@ COMMENT ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB) IS
 --
 -- 参数多了两个(阈值仍然由 Python 侧统一持有, 不在 SQL 里写死), 所以同样要先
 -- DROP。旧的 4 参版本必须显式删掉 —— 留着会变成同名重载, 调用时报 ambiguous。
+-- 旧的 4 参版要显式删掉 —— 留着会和新的 6 参版变成同名重载, 调用时报 ambiguous。
 DROP FUNCTION IF EXISTS autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC);
-
-CREATE FUNCTION autowriter.deskcore_commit_fingerprints(
+-- 而 6 参版这边必须是 CREATE **OR REPLACE**: 本文件重复执行时(或者在已经装了
+-- 000_baseline 的新库上跑)那个函数已经在了, 裸 CREATE 会报 already exists。
+-- migrations/README.md 承诺"重复执行必须是干净 no-op", CI 每次都会真跑两遍来验。
+CREATE OR REPLACE FUNCTION autowriter.deskcore_commit_fingerprints(
     _project_id         UUID,
     _rows               JSONB,
     _user_id            UUID,

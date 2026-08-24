@@ -2,16 +2,35 @@
 
 给**已存在的库**打的增量 SQL。
 
-## 和 `db.py::CREATE_TABLES_SQL` 的关系
+## 基线与增量
 
 | | 作用 | 何时跑 |
 |---|---|---|
-| `db.py::CREATE_TABLES_SQL` | schema 的**源头**，fresh install 一把建全 | 新环境初始化 |
-| `migrations/*.sql` | 增量，把已有的库升到和源头一致 | 已有库升级 |
+| `000_baseline.sql` | schema 的**源头**，fresh install 一把建全 | 新环境初始化 |
+| `001+.sql` | 增量，把已有的库升到和源头一致 | 已有库升级 |
 
-**加表/加列必须两边都改。** 只改迁移 → 新环境缺东西；只改 `CREATE_TABLES_SQL`
-→ 生产库升不上去。两边都写成幂等（`IF NOT EXISTS` / `CREATE OR REPLACE` /
-`DROP TRIGGER IF EXISTS`），重复执行必须是干净 no-op。
+**加表/加列/改函数必须两边都改。** 只改增量 → 新环境缺东西；只改基线 →
+生产库升不上去。两边都写成幂等（`IF NOT EXISTS` / `CREATE OR REPLACE` /
+`DROP … IF EXISTS`），重复执行必须是干净 no-op。
+
+> ⚠️ **基线原来是 `db.py` 里一个 1162 行的 Python 字符串（`CREATE_TABLES_SQL`）。**
+> 审计 SUP-010 把它搬成了文件。搬的理由不是"db.py 太大"（虽然确实从 4438 行降到
+> 3280），而是**没有任何代码执行过它，所以也没有任何东西验证过它**。
+>
+> 代价是真实发生过的：2026-08-24 修 COR-014 时发现，`db.py` 里那份
+> `deskcore_commit_fingerprints` 还带着"空开头的 title-only 稿会互相精确撞车"这个
+> bug——而 `001` 里同一个函数早就修好了。也就是说**任何一个新环境都会带着一个老
+> bug 出生**，而没人会发现。
+>
+> 现在 `tests/sql_parity_check.py`（CI 每次跑）会在一个空库上真的执行：
+> 空库 → `000` → `001..005` → **再跑一遍全部**（验幂等）→ 抽查表与函数是否都在 →
+> 逐例比对下推 SQL 与 Python 算出来的数。**这才是"消双写"真正的意思：不是只留
+> 一份，而是让两份必须对得上、对不上就报错。**
+>
+> 这个 harness 上线当天就抓到两个真问题：`004` 的 `CREATE OR REPLACE` 在
+> 005-era 基线上会报 `cannot change return type`；`005` 里 6 参版的
+> `deskcore_commit_fingerprints` 用了裸 `CREATE FUNCTION`，重跑会报
+> `already exists`（也就是**不幂等**，而 README 这一节正好承诺了幂等）。
 
 ## 历史
 
@@ -33,6 +52,7 @@ Supabase SQL Editor 粘贴执行，或 MCP `apply_migration`。
 
 | | 内容 | 不跑会怎样 |
 |---|---|---|
+| `000_baseline.sql` | 全部 15 张表 + 8 个函数 + RLS policy + 索引 + 触发器 | 新环境什么都没有。**已有库不要跑它**——跑增量就够（它幂等，跑了也不坏） |
 | `001_deskcore.sql` | 发牌台账 / 成稿指纹 / 个人调校笔记 / 精修 diff 四张表 + 两个 RPC | deskcore 整个不可用 |
 | `002_calibration_cas.sql` | `update_calibration_notes_cas`（审计 COR-003） | 退回旧 CAS 路径并埋 `calibration_cas_rpc_missing`；长笔记（>4000 字级）的自动学习仍然静默停摆 |
 | `003_versions_unique_num.sql` | `UNIQUE(item_id, version_num)`（审计 COR-004） | 少了数据库层保护；应用层重试本身不依赖它。⚠️ 会先把历史重复对子重编号再建索引 |

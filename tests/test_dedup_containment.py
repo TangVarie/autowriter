@@ -340,22 +340,32 @@ def test_new_005_rpc_drives_the_verdict():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4 · 两份 SQL 必须同步(migrations/005 与 db.py::CREATE_TABLES_SQL)
+# 4 · 两份 SQL 必须同步(增量迁移 005 与基线 000)
 # ══════════════════════════════════════════════════════════════════════
 
 def _sql_sources():
+    """两份 SQL: 增量迁移, 与 fresh install 的基线。
+
+    ⚠️ 基线原来是 db.py 里的 ``CREATE_TABLES_SQL`` 字符串, 审计 SUP-010 之后
+    搬成了 ``migrations/000_baseline.sql`` —— 搬走的理由正是"没人执行过它,
+    所以没人验证过它", 而**这条用例就是当年该有的那个验证**。
+    """
     import pathlib
     root = pathlib.Path(__file__).resolve().parent.parent
-    mig = (root / "migrations" / "005_deskcore_containment.sql").read_text("utf-8")
-    import db
-    return {"migrations/005": mig, "db.py::CREATE_TABLES_SQL": db.CREATE_TABLES_SQL}
+    return {
+        "migrations/005": (root / "migrations"
+                           / "005_deskcore_containment.sql").read_text("utf-8"),
+        "migrations/000_baseline": (root / "migrations"
+                                    / "000_baseline.sql").read_text("utf-8"),
+    }
 
 
 def test_both_sql_copies_return_the_containment_columns():
     """加函数要两边都改 —— migrations/README.md 的规矩, 这里机械执行一遍。
 
-    只改一边的后果是**静默**的: fresh install 走 CREATE_TABLES_SQL, 存量库走
-    migrations, 两边行为不一样而没有任何地方会报错。
+    只改一边的后果是**静默**的: fresh install 走 000_baseline, 存量库走增量
+    迁移, 两边行为不一样而没有任何地方会报错 —— 这不是假设, COR-014 就是这么
+    发现 db.py 那份 commit RPC 还带着 001 早就修好的 bug 的。
     """
     for name, sql in _sql_sources().items():
         for col in ("best_c", "c_title", "c_sample"):

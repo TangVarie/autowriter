@@ -966,7 +966,7 @@ def save_calibration_notes(
             # 审计 COR-003: 旧写法是 .eq("calibration_notes", <全文>)，而这一列
             # 的软上限是 4000 字；中文 URL-encode 后 ≈36KB 的查询串越过网关上限，
             # 之后每一次自动学习写入都失败并被上层静默吞掉。详见
-            # db.update_calibration_notes_cas 与 CREATE_TABLES_SQL 里的说明。
+            # db.update_calibration_notes_cas 与 migrations/002 里的说明。
             try:
                 row = db.update_calibration_notes_cas(
                     db_client, project_id, expected_before_text, deduped,
