@@ -1,0 +1,15 @@
+# 只在开发 / CI 里用, 运行时用不到 —— 部署环境不要装这个文件。
+#
+# 为什么单独一份而不是塞进 requirements.txt: requirements.lock 是**部署**用的
+# 完整闭包(见 R-017), 往里加 pytest 会让线上多装一堆用不上的东西, 而且
+# 每次 relock 都得重新解释它为什么在那儿。
+#
+# 本地跑法:
+#   pip install -r requirements.lock -r requirements-dev.txt
+#   python -m pytest tests/ -q
+#
+# 版本按 R-017 的规矩钉到下一个 major 之前: pytest 9 会改 xfail(strict) 的
+# 默认值与 assert 重写的入口, 而 tests/test_known_gaps.py 正靠 strict xfail
+# 在"被人修好了就变红"上做文章 —— 那个语义变了必须是显式升级, 不能是某天
+# CI 自己拉到新版后悄悄失效。
+pytest>=8.0,<9.0

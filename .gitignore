@@ -2,3 +2,8 @@
 *.pyc
 __pycache__/
 .DS_Store
+
+# 本地跑测试留下的东西
+venv/
+.venv/
+.pytest_cache/

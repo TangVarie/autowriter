@@ -14,7 +14,7 @@
 | 第 1 批 · 止血 | ROB-003 · COR-003 · COR-007 · COR-010 · COR-005/006 | ✅ **已修**(见下) |
 | 第 2 批 · 数据一致性 | COR-002 · COR-004 · COR-008 · COR-009 · COR-011 · COR-020 · COR-021 · COR-022 · ROB-009 · ROB-018 | ✅ **已修**(见 §0.2) |
 | 第 3 批 · 性能与成本 | SUP-001 · SUP-002 · SUP-003 · SUP-004 · SUP-005 · SUP-007 · SUP-008 · ROB-004 · ROB-011 · ROB-013 | ✅ **已修**(见 §0.3; codex review 的 7 条修正见 §0.4) |
-| 第 4 批 · 结构性 | ROB-001 · ROB-002 · SUP-011 · SUP-012 · SUP-024 · SUP-010 · COR-014 · COR-015 | 待做 |
+| 第 4 批 · 结构性 | ROB-001 · ROB-002 · SUP-011 · SUP-012 · SUP-024 · SUP-010 · COR-014 · COR-015 | 🚧 **进行中**(见 §0.5) —— SUP-024 ✅ / 其余 7 条待做 |
 
 ### 0.1 第 1 批(止血)的实现说明与**两处与本报告的偏差**
 
@@ -181,6 +181,57 @@ with anyio.fail_after(0.3):
 写法生效）——下次有人"顺手"把参数去掉时，红的会是一条讲清楚了为什么的断言。
 
 ---
+
+### 0.5 第 4 批(结构性)的实现说明 —— **进行中**
+
+这批和前三批不一样：前三批是"改一处、证一处"，这批的主体（把生成编排从
+`app.py`/`worker.py` 抽成 `generation_service.py`）是**搬家**。搬家的风险不在于某一行写错，
+而在于搬完之后没人说得清"行为有没有变"。所以顺序被刻意打乱了：**SUP-024（测试地基）
+提到最前面做**，其余七条排在它后面。
+
+| 条目 | 状态 | 说明 |
+|---|---|---|
+| SUP-024 · 建 pytest 地基 | ✅ 已做 | 见下 |
+| COR-015 · deskcore 归属校验 | 待做 | 按 `projects.owner_id` 隔离（读写两侧都要） |
+| COR-014 · bottom-k 长短稿失真 | 待做 | 先量化现状漏检率，再改标准 bottom-k 估计 |
+| ROB-001/002 + SUP-011/012 · 抽 `generation_service.py` | 待做 | 搬家本体，靠上面的地基兜底 |
+| SUP-010 · DDL 挪出 `db.py` | 待做 | 侦察发现**没有任何代码执行 `CREATE_TABLES_SQL`**，比预想简单 |
+
+#### SUP-024 —— 为什么现在才有第一个 `tests/` 目录
+
+侦察时确认的事实：全仓在此之前**一个 pytest 文件都没有**。回归全部长在 `ci.yml` 的十几个
+`python - <<'PY'` heredoc 块里，每块自带一份假件、一套 env 设置。那些块是随着一次次
+review 长出来的，**它们仍然有效、也仍然在跑** —— `tests/` 不是去替换它们。
+
+之所以现在必须建，是因为下一步要搬家：heredoc 那种形态可以钉住"某条 bug 不复发"，
+但撑不住"同一批逻辑在两个地方要保持等价"这类需要反复加用例的场景。
+
+新增四个文件：
+
+| 文件 | 作用 |
+|---|---|
+| `tests/conftest.py` | 在 import 任何业务模块**之前**做两件事：`AW_DISABLE_ST_CACHE=1`（否则缓存会让"改了数据再读一次"的断言失真）、灌 Supabase 三个 env 占位值（`config.py` 是模块级读取，缺了在 import 期就抛） |
+| `tests/fakes.py` | **一份**共享 PostgREST 假件。刻意只实现真的被用到的那部分；`count` 在 `range` **之前**算（PostgREST 的真实行为，也是 `db.py` 多处翻页逻辑的前提）；`max_rows` 模拟服务端 `db-max-rows` 静默钳位 —— 本仓踩得最多的坑（COR-005/006/008 三条都是它），假件必须能重现 |
+| `tests/test_guardrails.py` | §7.1 的三组「护栏」：价档前缀匹配（R-042）、`validator._parse_rule` 的正负向优先级（R-041）、调校笔记的行级去重与软上限。共同点是**错了不报错** |
+| `tests/test_known_gaps.py` | §7.1 点名、但**不在本批八条范围内**的两条，用 `xfail(strict=True)` 立案 |
+
+CI 加一步 `pytest 用例目录`，位置在 `deskcore selftest` 之后、heredoc 群之前 ——
+它需要 `requirements.lock`，但**不**需要 `deskcore/requirements.txt` 的 fastapi·mcp
+（那些只在后面的 app 冒烟步里装）。第三批就在这个边界上栽过一次（`ModuleNotFoundError: fastapi`），
+所以这次在步骤注释里写死了。`pytest` 单独放 `requirements-dev.txt`，不进部署闭包。
+
+**关于 `xfail(strict=True)`**：`test_known_gaps.py` 里那两条现在是红的（SUP-006 的
+per-model 输出上限、COR-014 的长短稿失真）。直接让 CI 红等于把两条计划外的修复硬塞进本批；
+悄悄不写等于测试计划里最有价值的两条被静默跳过。`strict=True` 是关键 —— 一旦有人把它修好，
+xfail 会变成 **XPASS 失败**，逼下一个人把标记摘掉、变成真正的回归。CI 那步带 `-ra`，
+就是为了让这种 XPASS 在摘要里能一眼看到是哪条。
+
+**一个自己撞上的坑，值得记下来。** SUP-006 那条第一版写的是"断言 `max_tokens ≤ 128000`"，
+结果它 **XPASS 了** —— `count=50` 算出来是 125,000，恰好在阈值以下。也就是说那条断言从头到尾
+没在验 SUP-006，只是碰巧成立。真正缺的东西是【按模型查输出上限】这件事本身：`config` 里
+只有 `MODEL_CONTEXT_WINDOWS`（那是**输入**窗口），没有任何一张表记录 per-model 的 max output。
+改成断言那个缺失的前提之后才真的红。这和 §0.4 学到的是同一件事的另一面：
+**断言要钉住"被禁止的形态"，不是"我以为的当前数值"**。
 
 ---
 
@@ -461,6 +512,17 @@ MQ 消费者 (Kafka/RabbitMQ/SQS/RocketMQ/Pulsar)、asyncio 后台 task、事件
 
 工具: `pytest` + 一个 `FakePostgrest` (链式 `.table().select().eq()...execute()` 返回预设 data)。
 `AW_DISABLE_ST_CACHE=1` 让 `db.py` 缓存 shim 退化为透传 (`db.py:37-39` 已支持)。
+
+> **落地位置**(SUP-024 已做, 见 §0.5)。下表的行分散在两处, 不是一处:
+>
+> - **COR-002/004/005/006/007/008/009/010/020/021/022** —— 已在第 1、2 批随修随补, 长在
+>   `ci.yml` 的 `审计第一批止血回归` / `审计第二批回归` 两步里。**没有搬**: 它们每条都绑着
+>   一段"先复现失败模式"的构造, 挪个地方只会丢掉上下文。
+> - **三条护栏 + SUP-006 + COR-014** —— 新的 `tests/` 目录, 分别是
+>   `tests/test_guardrails.py` 与 `tests/test_known_gaps.py`。共享假件在 `tests/fakes.py`。
+>
+> SUP-006 与 COR-014 两条**当前是红的**, 用 `xfail(strict=True)` 立案 —— 理由与
+> "修好之后会自动变红逼人摘标记"的机制见 §0.5。
 
 | 目标 | 函数 | 场景 | 预期 |
 |---|---|---|---|

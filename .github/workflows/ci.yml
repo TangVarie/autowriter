@@ -35,6 +35,23 @@ jobs:
           #   3. 换皮改写能拦 —— 换标题 + 换措辞, 靠正文四字串重合抓出来
           #   4. 真正不同的稿子不误伤
           python -m deskcore.cli selftest
+
+      - name: pytest 用例目录 (审计 SUP-024 · 后续用例都往这儿加)
+        run: |
+          # 本仓在此之前一个 pytest 文件都没有 —— 回归全长在下面那十几个
+          # heredoc 块里, 每块自带一份假件和一套 env。那些块仍然有效、也仍然
+          # 在跑, 这一步**不替换**它们; 它存在是因为下一批要把生成编排抽成
+          # generation_service, 而"大搬家"没有能反复加用例的地方就是裸奔。
+          #
+          # 放在 selftest 之后、heredoc 群之前: 它需要 requirements.lock
+          # (config/generator/memory 都 import 得到 streamlit·anthropic),
+          # 但**不**需要 deskcore/requirements.txt 的 fastapi·mcp —— 那些
+          # 只在后面的 app-smoke 步骤里装。第三批就在这上面栽过一次
+          # (ModuleNotFoundError: fastapi), 所以这里明确写下边界。
+          pip install -r requirements-dev.txt
+          # -q 之外还要 -ra: strict xfail 一旦被人修好会变成 XPASS 失败,
+          # 摘要里必须能一眼看到是哪条, 否则下一个人只看到"红了"。
+          python -m pytest tests/ -q -ra
       - name: deskcore round-5 回归 (fail-closed / 规则口径 / 触发器条件)
         run: |
           python - <<'PY'
