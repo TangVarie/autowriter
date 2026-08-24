@@ -1136,11 +1136,16 @@ def _queue_worker_impl(
             ])).strip()
             # Day 4: 注入可视化 ─ 记录本批"硬/软/会话各注入多少、过滤掉哪些"
             inject_report: dict = {"filtered": []}
+            # 审计 SUP-005: ctx 向量算【一次】给两遍过滤共用。以前两遍各算一次,
+            # 同一段文本发了两次 embedding —— 调用数与这一步的延迟白白翻倍。
+            _soft_ctx = mem_module.prepare_soft_context(context_text)
             global_mems_for_plan  = mem_module.filter_soft_by_relevance(
                 global_mems,  context_text, report_sink=inject_report,
+                context=_soft_ctx,
             )
             project_mems_for_plan = mem_module.filter_soft_by_relevance(
                 project_mems, context_text, report_sink=inject_report,
+                context=_soft_ctx,
             )
 
             # Phase 1：用 layered builder 拿 5 段 dict（stable/tactic/p0/p1/p2），
@@ -3190,11 +3195,15 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             extra_instr,
             image_prompt,
         ])).strip()
+        # 审计 SUP-005: 同 _queue_worker_impl —— ctx 向量算一次给两遍共用。
+        _qg_soft_ctx = mem_module.prepare_soft_context(_qg_context_text)
         global_mems = mem_module.filter_soft_by_relevance(
             global_mems, _qg_context_text, report_sink=inject_report,
+            context=_qg_soft_ctx,
         )
         project_mems = mem_module.filter_soft_by_relevance(
             project_mems, _qg_context_text, report_sink=inject_report,
+            context=_qg_soft_ctx,
         )
         # ── R-032: 同 _queue_worker_impl —— 借阅飞轮经验（fail-open 成 []）。
         # R-038: 改经 user_context_block 注入 user turn, 不再进 system P2。

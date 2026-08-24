@@ -358,6 +358,111 @@ def render_angles_block(angles: list[dict]) -> str:
 # ══════════════════════════════════════════════════════════════════════
 
 
+def _history_probe(client, project_id: str, o_hashes: list[str],
+                   grams: list[set], new_vecs):
+    """返回 ``(probe, hist_size, hist_with_vec, hist_truncated)``。
+
+    ``probe(i)`` → ``(best_sim, sim_title, best_j, j_title, exact, open_title)``
+    —— 第 i 篇草稿与【历史】比对的三路最佳命中。title 为 None 表示这一路没有
+    命中(不是"命中了一条空标题")。
+
+    两条实现共用这一个形状:
+
+      A. 下推路径(审计 SUP-002 / ROB-004 / ROB-011, 需要 migrations/004)
+         整个比对在库里做完, 只回每篇一行结果。原来是把 4000 行 × 768 维拉进
+         Python 逐对算 —— 百 MB 传输 + 三千万次乘加 + 占满线程池。
+
+      B. Python 路径(migrations/004 没跑时)
+         与下推前完全一致, 包括 4000 条的上限和 history_truncated 的警告。
+
+    ⚠️ 只有"RPC 不存在"才降级到 B。查重是 deskcore 唯一不 fail-open 的路径,
+    其它异常(权限 / 库故障)一律冒泡。
+    """
+    payload = [
+        {
+            "opening_hash": o_hashes[i] or None,
+            "ngram_hashes": sorted(grams[i]),
+            # 本批算不出向量时传 null, 库里那一路直接跳过 —— 与 Python 路径的
+            # `if new_vecs and i < len(new_vecs)` 等价。
+            "title_embedding": (f"[{','.join(repr(float(x)) for x in new_vecs[i])}]"
+                                if new_vecs and i < len(new_vecs) else None),
+        }
+        for i in range(len(o_hashes))
+    ]
+    rows = store.check_drafts_sql(client, project_id, payload)   # 故意让异常冒泡
+    if rows is not None:
+        by_idx = {int(r.get("idx", -1)): r for r in rows}
+        # ⚠️ 回执必须每篇一行。少一行就意味着那一篇【根本没比过】, 而下面
+        # 取不到时会退化成全 0 信号 → 直接判 pass。查重是硬闸, 这种"静默放行"
+        # 正是它最不能有的失败模式, 宁可整个调用报错。
+        missing = [i for i in range(len(payload)) if i not in by_idx]
+        if missing:
+            raise RuntimeError(
+                f"deskcore_check_drafts 回执缺 {len(missing)}/{len(payload)} 篇"
+                f"(idx={missing[:5]}) —— 拒绝按'没撞车'放行")
+        total, with_vec = store.fingerprint_stats(client, project_id)
+
+        def _probe(i: int):
+            r = by_idx.get(i) or {}
+            return (
+                float(r.get("best_sim") or 0.0),
+                r.get("sim_title"),
+                float(r.get("best_j") or 0.0),
+                r.get("j_title"),
+                bool(r.get("open_exact")),
+                r.get("open_title"),
+            )
+
+        # 下推路径比的是【全量】—— 库里没有 4000 条那个上限, 所以永不截断。
+        return _probe, total, with_vec, False
+
+    logger.warning(
+        "deskcore_check_drafts RPC 不存在(migrations/004 没跑) —— 本次退回 "
+        "Python 逐对比对: 大项目会慢数十秒并占满线程池, 见审计 SUP-002/ROB-004。")
+    _rpc_missing_telemetry("deskcore_check_drafts", project_id)
+
+    history, truncated = store.fingerprints(client, project_id)
+    hist_grams = [set(h.get("ngram_hashes") or []) for h in history]
+    hist_open = {h.get("opening_hash"): h for h in history if h.get("opening_hash")}
+    hist_vecs = [h.get("title_embedding") for h in history]
+    with_vec = sum(1 for v in hist_vecs if v)
+
+    def _probe_py(i: int):
+        best_sim, sim_hit = 0.0, None
+        if new_vecs and i < len(new_vecs):
+            for hi, emb in enumerate(hist_vecs):
+                if not emb:
+                    continue
+                s = dedup.cosine_similarity(new_vecs[i], emb)
+                if s > best_sim:
+                    best_sim, sim_hit = s, history[hi]
+        best_j, j_hit = 0.0, None
+        for hi, hg in enumerate(hist_grams):
+            j = fp.jaccard(grams[i], hg)
+            if j > best_j:
+                best_j, j_hit = j, history[hi]
+        open_hit = hist_open.get(o_hashes[i]) if o_hashes[i] else None
+        return (
+            best_sim, (sim_hit or {}).get("title", "") if sim_hit else None,
+            best_j, (j_hit or {}).get("title", "") if j_hit else None,
+            open_hit is not None,
+            (open_hit or {}).get("title", "") if open_hit else None,
+        )
+
+    return _probe_py, len(history), with_vec, truncated
+
+
+def _rpc_missing_telemetry(name: str, project_id: str) -> None:
+    """把"迁移没跑"埋一行点。静默降级最怕的就是没人知道它降级了。"""
+    try:
+        import telemetry
+        telemetry.log_event("deskcore_rpc_missing", rpc=name,
+                            project_id=project_id[:8],
+                            hint="跑 migrations/004_deskcore_check_pushdown.sql")
+    except Exception:
+        pass
+
+
 def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
     """比对全量历史 + 本批内互比。
 
@@ -368,8 +473,6 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
     if not drafts:
         return {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
 
-    history, hist_truncated = store.fingerprints(client, project_id)  # 故意让异常冒泡
-
     titles = [(d.get("title") or "").strip() for d in drafts]
     bodies = [d.get("body") or "" for d in drafts]
     o_hashes = [fp.opening_hash(b) for b in bodies]
@@ -377,43 +480,28 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
 
     new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
 
+    # ── 与历史比对: 优先下推到库里(审计 SUP-002 / ROB-004 / ROB-011)──────
+    # ``hist`` 是一个「按 i 取三路最佳命中」的可调用对象, 两条路径共用同一个
+    # 形状, 下面拼 verdict 的代码因此完全不用分叉。
+    hist, hist_size, hist_with_vec, hist_truncated = _history_probe(
+        client, project_id, o_hashes, grams, new_vecs)
+
     # ⚠️ 降级判定不能只看"这批能不能算向量"(codex review P1)。
     # 历史行的 title_embedding 可能是 NULL —— 当初 commit 时 embedding 服务不可用
     # 就会这样, 而且没有回填路径。那种情况下 new_vecs 非空、看起来正常, 但每一条
-    # 历史都在下面被 `if not emb: continue` 跳过, 标题语义这一路【实际没跑】,
+    # 历史都在下面被跳过, 标题语义这一路【实际没跑】,
     # 却报 semantic_degraded=false 让调用方以为全套硬闸都过了。
-    hist_with_vec = sum(1 for h in history if h.get("title_embedding"))
-    hist_missing_vec = len(history) - hist_with_vec
-    semantic_ran = bool(new_vecs) and (hist_with_vec > 0 or len(history) == 0)
+    hist_missing_vec = hist_size - hist_with_vec
+    semantic_ran = bool(new_vecs) and (hist_with_vec > 0 or hist_size == 0)
     degraded = not semantic_ran or hist_missing_vec > 0
     if degraded:
         logger.warning("semantic dedup degraded (project=%s): new_vecs=%s "
                        "history_with_vec=%d/%d",
-                       project_id, bool(new_vecs), hist_with_vec, len(history))
-
-    hist_grams = [set(h.get("ngram_hashes") or []) for h in history]
-    hist_open = {h.get("opening_hash"): h for h in history if h.get("opening_hash")}
+                       project_id, bool(new_vecs), hist_with_vec, hist_size)
 
     results = []
     for i in range(len(drafts)):
-        best_sim, sim_hit = 0.0, None
-        if new_vecs and i < len(new_vecs):
-            for h in history:
-                emb = h.get("title_embedding")
-                if not emb:
-                    continue
-                s = dedup.cosine_similarity(new_vecs[i], emb)
-                if s > best_sim:
-                    best_sim, sim_hit = s, h
-
-        best_j, j_hit = 0.0, None
-        for hi, hg in enumerate(hist_grams):
-            j = fp.jaccard(grams[i], hg)
-            if j > best_j:
-                best_j, j_hit = j, history[hi]
-
-        exact = o_hashes[i] in hist_open
-        open_hit = hist_open.get(o_hashes[i])
+        best_sim, sim_hit, best_j, j_hit, exact, open_hit = hist(i)
 
         # ⚠️ 每个信号的最佳命中【各记各的】, 且各自记清楚是本批内还是历史。
         # 原来共用一个 intra 变量, 只要任一信号的最佳命中来自本批内就无条件
@@ -421,9 +509,9 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
         # 而那个信号的命中在历史里。于是报出去的 collided_with 是一条根本没
         # 引发拒绝的稿子, 人对着它改, 改完还是过不了。(codex review)
         # hit = (标题, 归属)  归属 ∈ {"本批内", "历史"}
-        sim_best = ((sim_hit or {}).get("title", ""), "历史") if sim_hit else None
-        j_best = ((j_hit or {}).get("title", ""), "历史") if j_hit else None
-        open_best = ((open_hit or {}).get("title", ""), "历史") if open_hit else None
+        sim_best = (sim_hit or "", "历史") if sim_hit is not None else None
+        j_best = (j_hit or "", "历史") if j_hit is not None else None
+        open_best = (open_hit or "", "历史") if open_hit is not None else None
 
         for k in range(i):   # 本批内互比: 同批两篇撞车同样要拦
             # o_hashes[i] 为空 = 这篇没有正文开头。空 == 空【不算撞车】——
@@ -470,7 +558,7 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
         "pass": sum(1 for r in results if r["status"] == "pass"),
         "warn": sum(1 for r in results if r["status"] == "warn"),
         "reject": sum(1 for r in results if r["status"] == "reject"),
-        "history_size": len(history),
+        "history_size": hist_size,
         "history_with_embedding": hist_with_vec,
         "history_missing_embedding": hist_missing_vec,
         "history_truncated": hist_truncated,
@@ -479,13 +567,15 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
     if hist_truncated:
         # history_size 报的是【实际比过的条数】, 但项目的历史比这更多。
         # 不说出来的话, "比对全量历史" 就成了一句假话。
+        # 下推路径不会走到这里(库里是全量比的, hist_truncated 恒为 False),
+        # 只有 migrations/004 没跑、退回 Python 路径时才可能命中。
         summary["history_truncated_warning"] = (
-            f"这个项目的历史指纹超过 {len(history)} 条, 本次只比了最近的这些。"
+            f"这个项目的历史指纹超过 {hist_size} 条, 本次只比了最近的这些。"
             "更老的稿子没参与查重, 跟它们的重复不会被发现 —— 要告诉用户。"
-            "长期解法是把比对下推到数据库(见 docs/deskcore.md §7)。")
+            "长期解法是把比对下推到数据库(migrations/004, 见 docs/deskcore.md §7)。")
     # 指纹库是空的但项目其实有历史 = 没回填。硬闸背后什么都没有, 必须说出来,
     # 不能让调用方以为"比对了全量历史然后没撞车"。
-    if not history:
+    if not hist_size:
         summary["empty_history_warning"] = (
             "指纹库里这个项目一条历史都没有。如果这不是全新项目, 说明【还没回填】——"
             "本次查重实际只在本批内部比对, 跟历史稿的重复不会被发现。"
@@ -496,7 +586,7 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
         if not new_vecs:
             why.append("本批标题算不出向量(GOOGLE_API_KEY 未配或 embedding 调用失败)")
         if hist_missing_vec:
-            why.append(f"{hist_missing_vec}/{len(history)} 条历史没有 title_embedding"
+            why.append(f"{hist_missing_vec}/{hist_size} 条历史没有 title_embedding"
                        f"(当初 commit 时 embedding 不可用, 且没有回填路径 —— "
                        f"跑 `python -m deskcore.cli backfill --project <id>` 可补)")
         summary["degraded_note"] = (
@@ -702,33 +792,33 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
     只有缺向量的才补算, 且 embedding 不可用时照常写入(向量留空), 确定性信号
     不受影响。
     """
-    rows = store.legacy_versions(client, project_id)
-    total = len(rows)
-    if not total:
-        return {"total": 0, "already": 0, "written": 0, "embedded": 0,
-                "reused_embeddings": 0, "missing_embeddings": 0}
-
+    # 审计 ROB-011: 逐页消费, 不再把整个项目的历史成稿(全文 + 每条 768 个
+    # Python float)同时留在内存。5000 条那一档原来是三四百 MB 峰值 —— 容器
+    # OOM 重启, 而这是"部署后每个项目必跑一次"的动作。
+    #
+    # done_ids 仍然一次取全: 它只是一串 UUID(几 MB 顶天), 而它是【幂等性本身
+    # 所依赖的那个集合】—— 分页判重会让跨页的重复漏过去(审计 COR-005 修的
+    # 就是它被静默截断的那一版)。
     done_ids = store.existing_fingerprint_version_ids(client, project_id)
-    todo = [r for r in rows if r.get("version_id") not in done_ids]
-    already = total - len(todo)
-    if not todo:
-        return {"total": total, "already": already, "written": 0, "embedded": 0,
-                "reused_embeddings": 0, "missing_embeddings": 0}
-
     can_embed = with_embeddings and dedup.embeddings_available()
-    written = reused = computed = missing = 0
+    total = already = written = reused = computed = missing = 0
+    todo_seen = processed = 0
+    pending: list[dict] = []
 
-    for start in range(0, len(todo), chunk):
-        part = todo[start:start + chunk]
-
+    def _flush() -> None:
+        nonlocal pending, written, reused, computed, missing, processed
+        if not pending:
+            return
+        part, pending = pending, []
+        processed += len(part)
         # 缺向量的才补算, 有的直接复用(见 docstring)
         need = [i for i, r in enumerate(part) if not r.get("embedding")]
         fresh: list[list[float]] | None = None
         if can_embed and need:
             fresh = dedup.embed_texts([part[i]["title"] for i in need])
             if fresh is None:
-                logger.warning("backfill: embed_texts failed for chunk at %d; "
-                               "writing those rows without vectors", start)
+                logger.warning("backfill: embed_texts failed for a chunk of %d; "
+                               "writing those rows without vectors", len(need))
 
         payload = []
         for i, r in enumerate(part):
@@ -757,10 +847,32 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
                 "ngram_hashes": fp.ngram_hashes(body),
                 "angle_key": None,   # 历史稿不是发牌产出的, 没有坐标
             })
-
         written += store.write_fingerprints(client, payload)
-        if progress:
-            progress(min(start + chunk, len(todo)), len(todo))
+
+    for page in store.legacy_version_pages(client, project_id):
+        total += len(page)
+        for r in page:
+            if r.get("version_id") in done_ids:
+                already += 1
+                continue
+            pending.append(r)
+            todo_seen += 1
+            if len(pending) >= chunk:
+                _flush()
+                if progress:
+                    # 流式下没有事先算好的分母 —— 报的是【已处理 / 已发现待回填】,
+                    # 分母会随着翻页往上走。CLI 那边的文案已经跟着改了。
+                    progress(processed, todo_seen)
+    _flush()
+    if progress and todo_seen:
+        progress(processed, todo_seen)
+
+    if not total:
+        return {"total": 0, "already": 0, "written": 0, "embedded": 0,
+                "reused_embeddings": 0, "missing_embeddings": 0}
+    if not todo_seen:
+        return {"total": total, "already": already, "written": 0, "embedded": 0,
+                "reused_embeddings": 0, "missing_embeddings": 0}
 
     out = {
         "total": total, "already": already, "written": written,
@@ -1076,18 +1188,44 @@ def borrow_lessons(client, project_id: str, **delta) -> dict:
 
 
 def list_projects(client) -> list[dict]:
-    """项目清单 + 每个项目手上有多少料。"""
+    """项目清单 + 每个项目手上有多少料。
+
+    审计 SUP-004: 原来每个项目发 2 次查询(规则一次 + 指纹 count 一次), 40 个
+    项目 = 81 次往返 —— 而这是模型最常调的第一个工具, 每次开工都要等它。
+    更亏的是规则那次走的是 shared_memories, 它为了给相关性过滤准备数据会把每条
+    规则的 **768 维 embedding** 一起拉回来, 而这里只用了两个 len()。
+
+    现在是【3 次固定查询】: 项目清单 + 规则批量计数 + 指纹批量计数, 与项目
+    个数无关。指纹计数走 migrations/004 的 RPC(PostgREST 不会 GROUP BY);
+    RPC 没部署时退回逐项目 count —— 慢, 但清单仍然是对的。
+    """
+    projects = store.list_all_projects(client)
+    if not projects:
+        return []
+    pids = [p["id"] for p in projects]
+
+    rule_counts = store.rule_counts_bulk(client, pids)
+    fp_counts = store.fingerprint_counts(client, pids)
+    if fp_counts is None:
+        # 迁移没跑: 退回 N 次 count。单个项目查失败按 0 计, 与旧行为一致 ——
+        # 计数只是清单上的提示, 不该让整个 list_projects 挂掉。
+        _rpc_missing_telemetry("deskcore_fingerprint_counts", pids[0])
+        fp_counts = {}
+        for pid in pids:
+            try:
+                fp_counts[pid] = (client.table("draft_fingerprints")
+                                    .select("id", count="exact")
+                                    .eq("project_id", pid).limit(1)
+                                    .execute()).count or 0
+            except Exception:
+                fp_counts[pid] = 0
+
     out = []
-    for p in store.list_all_projects(client):
+    for p in projects:
         pid = p["id"]
-        hard, soft = store.shared_memories(client, pid)
-        try:
-            fps = (client.table("draft_fingerprints").select("id", count="exact")
-                     .eq("project_id", pid).limit(1).execute()).count or 0
-        except Exception:
-            fps = 0
+        hard_n, soft_n = rule_counts.get(pid, (0, 0))
         out.append({"project_id": pid, "name": p.get("name") or "",
                     "brand": p.get("brand") or "", "owner_id": p.get("owner_id"),
-                    "hard_rules": len(hard), "soft_rules": len(soft),
-                    "fingerprint_count": fps})
+                    "hard_rules": hard_n, "soft_rules": soft_n,
+                    "fingerprint_count": int(fp_counts.get(pid, 0) or 0)})
     return out

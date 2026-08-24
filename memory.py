@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import io
 import json
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import anthropic
 import streamlit as st
@@ -38,11 +38,44 @@ def _make_anthropic_client() -> anthropic.Anthropic:
 
 # ── Prompt assembly ────────────────────────────────────────────────────────
 
+class SoftContext(NamedTuple):
+    """一次算好的相关性上下文, 供多次 ``filter_soft_by_relevance`` 复用。
+
+    ``vec`` 为 None 时 ``mode`` 说明原因(``no_embedding_api`` /
+    ``ctx_embed_failed``), 与旧的单次调用写进 report_sink 的口径一致。
+    """
+    vec: Optional[list]
+    mode: str
+
+
+def prepare_soft_context(context_text: str) -> SoftContext:
+    """把 ``context_text`` 算成向量, 只调一次 embedding(审计 SUP-005)。
+
+    调用方连着过两遍 soft 规则(global 一遍、project 一遍)是常态 ——
+    app.py 的队列路径和快速生成路径都是这么写的。每遍各自算一次 ctx 向量,
+    等于**同一段文本发两次 embedding 请求**: 调用数和这一步的延迟直接翻倍,
+    而两次的输入逐字相同。上层算一次传下来就没有这回事了。
+    """
+    if not context_text or not context_text.strip():
+        return SoftContext(None, "off")
+    try:
+        import dedup as _dedup
+    except Exception:
+        return SoftContext(None, "no_embedding_api")
+    if not _dedup.embeddings_available():
+        return SoftContext(None, "no_embedding_api")
+    vecs = _dedup.embed_texts([context_text.strip()])
+    if not vecs or not vecs[0]:
+        return SoftContext(None, "ctx_embed_failed")
+    return SoftContext(vecs[0], "active")
+
+
 def filter_soft_by_relevance(
     memories: list[dict],
     context_text: str,
     threshold: float = 0.45,
     report_sink: Optional[dict] = None,
+    context: Optional[SoftContext] = None,
 ) -> list[dict]:
     """
     Drop ``severity='soft'`` rules whose embedding is semantically far from
@@ -81,17 +114,15 @@ def filter_soft_by_relevance(
         import dedup as _dedup
     except Exception:
         return memories
-    if not _dedup.embeddings_available():
-        # 整体降级：所有 soft 规则都按"无 embedding API"通过，但记一条总账
+    # 审计 SUP-005: ``context`` 非空时复用上层算好的向量, 不再自己发一次
+    # embedding。不传时行为与以前完全一致(自己算一次)。
+    ctx_info = context if context is not None else prepare_soft_context(context_text)
+    if ctx_info.vec is None:
+        # 整体降级：所有 soft 规则都按原因码通过，但记一条总账
         if report_sink is not None:
-            report_sink["soft_filter_mode"] = "no_embedding_api"
+            report_sink["soft_filter_mode"] = ctx_info.mode
         return memories
-    ctx_vecs = _dedup.embed_texts([context_text.strip()])
-    if not ctx_vecs or not ctx_vecs[0]:
-        if report_sink is not None:
-            report_sink["soft_filter_mode"] = "ctx_embed_failed"
-        return memories
-    ctx = ctx_vecs[0]
+    ctx = ctx_info.vec
     if report_sink is not None:
         report_sink["soft_filter_mode"] = "active"
         report_sink["soft_filter_threshold"] = threshold

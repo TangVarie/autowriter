@@ -26,6 +26,29 @@ ANTHROPIC_API_KEY: str = _get_secret("ANTHROPIC_API_KEY")
 # official Anthropic endpoint.
 ANTHROPIC_BASE_URL: str = _get_secret("ANTHROPIC_BASE_URL")
 
+# prompt cache 的存活时间(审计 SUP-001)。"5m" = 官方默认, "1h" = 延长版。
+#
+# 账怎么算(以 base input 价为 1×):
+#   写入   5m = 1.25×   1h = 2×
+#   命中   两者都是 0.1×
+# 于是【一小时内跑 n 批】的总价:
+#   现状(5m, 批间隔 >5min 每批必 miss)  = 1.25n     ← 比不开缓存还贵 25%
+#   1h                                  = 2 + 0.1(n-1)
+#   不开缓存                            = n
+# n≥2 时 1h 就已经比现状便宜, n=10 时是 2.9 对 12.5。只有"一小时里孤零零
+# 跑一批"这种情况 1h 更亏(2 对 1.25)——那种用法本来也没有缓存可言。
+#
+# 默认选 1h: 这个工作台的实际节奏是"坐下来连着排几批", 批与批之间常常超过
+# 5 分钟但远小于 1 小时, 正好落在 5m 缓存最亏的区间里。
+#
+# ⚠️ 改之前先量基线: telemetry 里的 cache_create / (cache_create + cache_read)。
+# 那个比值长期 > 0.5 说明每批都在重写缓存, 正是 1h 能救的形状。
+# ⚠️ 中转站(ANTHROPIC_BASE_URL)若不认 ttl 字段, generator 会自动降级成 5m
+# 并埋一行 anthropic_cache_ttl_rejected —— 不会让整批生成挂掉。
+ANTHROPIC_CACHE_TTL: str = (_get_secret("ANTHROPIC_CACHE_TTL") or "1h").strip().lower()
+if ANTHROPIC_CACHE_TTL not in ("5m", "1h"):
+    ANTHROPIC_CACHE_TTL = "1h"
+
 # Available Claude models: model_id -> display label
 # 仅保留 Anthropic 官方当前 GA + 中转站实际支持的模型（截至 2026-06）。
 # Retired 已删（Claude 3 全系列、Sonnet/Opus 4.0 一代——后者 2026-04-20 下线）。

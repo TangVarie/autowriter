@@ -24,6 +24,19 @@ import db
 logger = logging.getLogger("deskcore.store")
 
 
+def rpc_missing(exc: Exception) -> bool:
+    """这个异常是不是"RPC 还没部署"?
+
+    判据从 commit_fingerprints_atomic 里提出来共用: 迁移没跑时降级、其余错误
+    (权限 / 参数 / 库故障)必须原样上抛。把两者混为一谈会让真故障被当成
+    "没迁移"静默降级 —— 那正是审计一直在追的那类问题。
+    """
+    msg = str(exc).lower()
+    return ("could not find the function" in msg
+            or "does not exist" in msg
+            or "pgrst202" in msg)
+
+
 def client():
     """service_role client（已带 ClientOptions(schema='autowriter')）。
 
@@ -50,12 +63,19 @@ def list_all_projects(sb) -> list[dict]:
     db.list_projects 是 .eq("owner_id", user_id) —— 那是 Streamlit 里「我的项目」
     的视角。deskcore 要让任何人都能打开任何项目(规则共享), 所以这里不过滤,
     但把 owner_id 带出去, 调用方需要时能显示归属。
+
+    ⚠️ 必须翻页。原来是裸 select 无 limit —— PostgREST 的 db-max-rows(默认
+    1000)会**静默截断**, 而这是"任何人都能打开任何项目"的那份清单: 越过 1000
+    个项目之后, 后面的项目在模型眼里【根本不存在】, 且没有任何提示
+    (审计 COR-005 同款, 判据同样是空页收工 + offset 按实收行数前进)。
+    ``name`` 有重名, 排序必须带 ``id`` 做次级键, 否则翻页会漏行也会重复行。
     """
-    res = (sb.table("projects")
-             .select("id, name, brand, owner_id")
-             .order("name")
-             .execute())
-    return res.data or []
+    return _paged(lambda off, lim: (
+        sb.table("projects")
+          .select("id, name, brand, owner_id")
+          .order("name").order("id")
+          .range(off, off + lim - 1)
+    ))
 
 
 # ── 规则(共享层) ──────────────────────────────────────────────────────────
@@ -118,6 +138,50 @@ def shared_memories(sb, project_id: str,
     hard = [m for m in rows if (m.get("severity") or "soft").lower() == "hard"]
     soft = [m for m in rows if (m.get("severity") or "soft").lower() != "hard"]
     return hard, soft
+
+
+def rule_counts_bulk(sb, project_ids: list[str]) -> dict[str, tuple[int, int]]:
+    """一次查全部项目的规则条数, 返回 ``{project_id: (hard, soft)}``(审计 SUP-004)。
+
+    list_projects 原来是每个项目调一次 shared_memories —— 40 个项目就是 40 次
+    往返, 而这是模型最常调的第一个工具。更亏的是: 它只用了 ``len(hard)`` /
+    ``len(soft)`` 两个数字, 却把每条规则的 **768 维 embedding** 一起拉了回来。
+
+    判据与 shared_memories 完全一致(``db._is_rule_memory`` + ``muted_until``
+    + 非空 content), 只是不取 embedding、也不取 global scope ——
+    list_projects 传的 user_id 本来就是 None, 那一路取的是空列表。
+
+    翻页走 _paged: 所有项目的规则加起来很容易越过 PostgREST 的 db-max-rows,
+    静默截断的话计数会偏小而没有任何提示(审计 COR-005 同款)。
+    """
+    out: dict[str, tuple[int, int]] = {pid: (0, 0) for pid in project_ids}
+    if not project_ids:
+        return out
+    cols = "id, project_id, severity, muted_until, memory_type, content"
+    rows = _paged(lambda off, lim: (
+        sb.table("memories").select(cols)
+          .in_("project_id", list(project_ids))
+          .eq("scope", "project").eq("status", "confirmed")
+          .or_("memory_type.is.null,memory_type.eq.rule")
+          .order("id")
+          .range(off, off + lim - 1)
+    ))
+    for r in rows:
+        if not db._is_rule_memory(r):
+            continue
+        if db.is_memory_muted_now(r.get("muted_until")):
+            continue
+        if not (r.get("content") or "").strip():
+            continue
+        pid = str(r.get("project_id") or "")
+        if pid not in out:
+            continue
+        hard, soft = out[pid]
+        if (r.get("severity") or "soft").lower() == "hard":
+            out[pid] = (hard + 1, soft)
+        else:
+            out[pid] = (hard, soft + 1)
+    return out
 
 
 # ── 正负例(个人层, 带向量) ────────────────────────────────────────────────
@@ -311,18 +375,29 @@ def _paged(build, *, page: int = PAGE, hard_cap: int | None = None) -> list[dict
 
     ``hard_cap`` 非空时最多取这么多行(调用方的上界), 到顶即停。
     """
-    out: list[dict] = []
+    return [r for pg in _paged_iter(build, page=page, hard_cap=hard_cap) for r in pg]
+
+
+def _paged_iter(build, *, page: int = PAGE, hard_cap: int | None = None):
+    """``_paged`` 的生成器形态: 逐页 yield, 调用方处理完一页就能让它被回收。
+
+    审计 ROB-011: 回填原来先把【全部】历史成稿(全文 + 768 维向量)攒成一个列表
+    再分块处理 —— 5000 条 × 768 个 Python float ≈ 三四百 MB 峰值, 容器 OOM
+    重启, 而回填是"部署后每个项目必跑一次"的动作。逐页消费之后峰值只和
+    ``page`` 有关, 与项目历史多大无关。
+    """
+    taken = 0
     offset = 0
     while True:
-        want = page if hard_cap is None else min(page, hard_cap - len(out))
+        want = page if hard_cap is None else min(page, hard_cap - taken)
         if want <= 0:
-            break
+            return
         rows = build(offset, want).execute().data or []
-        out.extend(rows)
         if not rows:
-            break
+            return
+        taken += len(rows)
         offset += len(rows)
-    return out
+        yield rows
 
 
 def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bool]:
@@ -375,6 +450,70 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
     return rows, truncated
 
 
+def fingerprint_stats(sb, project_id: str) -> tuple[int, int]:
+    """(总条数, 有 title_embedding 的条数) —— 两次 count, 不拉行。
+
+    下推之后 check_drafts 不再把指纹拉进内存, 但它报出去的 summary 仍然要说清
+    "比了多少条、其中多少条有向量"。后者尤其不能丢: ``hist_missing_vec > 0``
+    正是 semantic_degraded 的判据之一 —— 历史行的 title_embedding 为 NULL 时
+    标题语义这一路【实际没跑】, 不说出来调用方会以为全套硬闸都过了
+    (core.check_drafts:380-388 为这个坑留过完整说明)。
+
+    ⚠️ 故意不吞异常, 与 fingerprints 同理: 查重是硬闸, 读不到就不能放行。
+    """
+    total = (sb.table("draft_fingerprints").select("id", count="exact")
+               .eq("project_id", project_id).limit(1).execute()).count or 0
+    with_vec = (sb.table("draft_fingerprints").select("id", count="exact")
+                  .eq("project_id", project_id)
+                  .not_.is_("title_embedding", "null")
+                  .limit(1).execute()).count or 0
+    return int(total), int(with_vec)
+
+
+def check_drafts_sql(sb, project_id: str, rows: list[dict]) -> list[dict] | None:
+    """三路比对下推到库里(审计 SUP-002 / ROB-004 / ROB-011)。
+
+    ``rows`` = [{opening_hash, ngram_hashes, title_embedding}, ...]，顺序即
+    结果的 ``idx``。返回每条的
+    ``{idx, best_sim, sim_title, best_j, j_title, open_exact, open_title}``；
+    RPC 不存在(migrations/004 没跑)时返回 None, 由调用方降级回 Python 路径。
+
+    为什么值得下推: 原来是把整个项目的指纹(4000 行 × 768 维)拉进 Python 再逐对
+    算余弦 —— 百 MB 级传输 + 三千万次乘加, 单次数十秒, 且占着 uvicorn 线程池
+    的一个槽。三条审计发现(SUP-002 慢 / ROB-011 OOM / ROB-004 线程池饥饿)是
+    同一个根因。
+
+    ⚠️ 只有"RPC 不存在"才降级。权限错、参数错、库故障一律上抛 —— 查重是硬闸。
+    """
+    if not rows:
+        return []
+    try:
+        res = sb.rpc("deskcore_check_drafts", {
+            "_project_id": project_id,
+            "_rows": rows,
+        }).execute()
+    except Exception as exc:
+        if rpc_missing(exc):
+            return None
+        raise
+    return res.data or []
+
+
+def fingerprint_counts(sb, project_ids: list[str]) -> dict[str, int] | None:
+    """一次拿一批项目的指纹条数(审计 SUP-004)。RPC 不存在时返回 None。"""
+    if not project_ids:
+        return {}
+    try:
+        res = sb.rpc("deskcore_fingerprint_counts",
+                     {"_project_ids": list(project_ids)}).execute()
+    except Exception as exc:
+        if rpc_missing(exc):
+            return None
+        logger.exception("fingerprint counts failed")
+        return None
+    return {str(r["project_id"]): int(r.get("n") or 0) for r in (res.data or [])}
+
+
 def legacy_versions(sb, project_id: str, limit: int = 5000) -> list[dict]:
     """项目历史成稿(items × versions), 供指纹回填。
 
@@ -391,45 +530,52 @@ def legacy_versions(sb, project_id: str, limit: int = 5000) -> list[dict]:
     指纹库, 跟它们的重复永远查不出来。而"比对全量历史"正是这套硬闸的卖点。
     ``id`` 做次级排序键: bulk insert 下 created_at 大量并列, 只按它翻页会漏行。
     """
-    try:
-        rows = _paged(
-            lambda off, lim: (
-                sb.table("items")
+    return [r for pg in legacy_version_pages(sb, project_id, limit=limit) for r in pg]
+
+
+def legacy_version_pages(sb, project_id: str, limit: int = 5000, page: int = PAGE):
+    """``legacy_versions`` 的逐页形态(审计 ROB-011)。
+
+    回填该走这个: 一页处理完就丢, 内存峰值只跟 ``page`` 有关。攒成一个大列表
+    的话, 5000 条历史成稿的全文 + 每条 768 个 Python float 会同时在内存里 ——
+    容器 OOM 就是这么来的, 而回填偏偏是"部署后每个项目必跑一次"的动作。
+    """
+    def _build(off, lim):
+        return (sb.table("items")
                   .select("id, best_version_id, user_id, created_at, "
                           "versions(id, title, body, version_num, embedding), "
                           "batches!inner(project_id)")
                   .eq("batches.project_id", project_id)
                   .order("created_at", desc=True)
                   .order("id", desc=True)
-                  .range(off, off + lim - 1)
-            ),
-            hard_cap=limit,
-        )
+                  .range(off, off + lim - 1))
+
+    try:
+        for raw in _paged_iter(_build, page=page, hard_cap=limit):
+            out: list[dict] = []
+            for item in raw:
+                versions = item.get("versions") or []
+                if not versions:
+                    continue
+                best = item.get("best_version_id")
+                chosen = next((v for v in versions if v.get("id") == best), None)
+                if chosen is None:
+                    chosen = max(versions, key=lambda v: v.get("version_num") or 0)
+                title = (chosen.get("title") or "").strip()
+                body = (chosen.get("body") or "").strip()
+                if not (title or body):
+                    continue
+                out.append({
+                    "version_id": chosen.get("id"),
+                    "user_id": item.get("user_id"),
+                    "title": title,
+                    "body": body,
+                    "embedding": db._parse_pgvector(chosen.get("embedding")),
+                })
+            yield out
     except Exception:
         logger.exception("read legacy versions failed (project=%s)", project_id)
         raise
-
-    out: list[dict] = []
-    for item in rows:
-        versions = item.get("versions") or []
-        if not versions:
-            continue
-        best = item.get("best_version_id")
-        chosen = next((v for v in versions if v.get("id") == best), None)
-        if chosen is None:
-            chosen = max(versions, key=lambda v: v.get("version_num") or 0)
-        title = (chosen.get("title") or "").strip()
-        body = (chosen.get("body") or "").strip()
-        if not (title or body):
-            continue
-        out.append({
-            "version_id": chosen.get("id"),
-            "user_id": item.get("user_id"),
-            "title": title,
-            "body": body,
-            "embedding": db._parse_pgvector(chosen.get("embedding")),
-        })
-    return out
 
 
 def existing_fingerprint_version_ids(sb, project_id: str) -> set[str]:
@@ -525,8 +671,7 @@ def commit_fingerprints_atomic(sb, project_id: str, rows: list[dict],
             "_ngram_hard": ngram_hard,
         }).execute()
     except Exception as exc:
-        msg = str(exc).lower()
-        if "could not find the function" in msg or "does not exist" in msg or "pgrst202" in msg:
+        if rpc_missing(exc):
             logger.error("deskcore_commit_fingerprints RPC 不存在 —— migrations/001 "
                          "还没跑? 本次降级为直插(并发 check/commit 可能撞车)。")
             return None

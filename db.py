@@ -11,11 +11,13 @@ Tables:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Optional
 from datetime import datetime, timezone, timedelta
 
@@ -67,17 +69,36 @@ def _cache_resource(**kwargs):
     return passthrough
 
 
-@_cache_resource(show_spinner=False)
+# 审计 SUP-007 / ROB-013: 这个缓存原来【无上限、无过期】, 而 key 里带的
+# access_token 是**每小时轮换**的 —— 同一个人每小时就新增一个 Client, 每个
+# Client 自带 httpx 连接池和一把文件描述符, 而且永远不会被回收。跑得久一点就是
+# Supabase 连接数爬满 / Too many open files, 表现是所有查询突然开始超时。
+#
+# ttl 取 2 小时: 必须【大于】token 的有效期(约 1 小时), 否则活跃会话的 client
+# 会在用得正欢的时候被踢掉、每次重建连接池 —— 那是另一种浪费。
+# max_entries 是并发用户数的上限, 不是"最多缓存几个 token": 超出后 Streamlit
+# 按 LRU 淘汰, 被淘汰的人下次请求重建一个 —— 慢一点, 不会错。
+_CLIENT_CACHE_TTL = 7200
+_CLIENT_CACHE_MAX = 64
+
+
+@_cache_resource(show_spinner=False, ttl=_CLIENT_CACHE_TTL,
+                 max_entries=_CLIENT_CACHE_MAX)
 def _make_client_cached(supabase_url: str, anon_key: str, access_token: str) -> Client:
     """Per-token Supabase client singleton.  Keyed on the token so each
     authenticated user gets their own client; ``access_token=""`` returns the
-    anonymous client.  Cleared on sign-out via ``_make_client_cached.clear()``.
+    anonymous client.
 
     2026-05-21: schema='autowriter' 让所有 ``client.table("items")`` 等调用
     透明指向 ``autowriter.items``（共享 Supabase + schema 隔离，避免和
     sanshengliubu 在 public 里冲突）。前置条件：autowriter-migrations 已跑
     且 Supabase Dashboard → Settings → API → Exposed schemas 已包含
     ``autowriter``。
+
+    ⚠️ 登出【不要】调 ``.clear()``(审计 SUP-007)。``st.cache_resource`` 是
+    **进程级**的 —— clear() 会把所有在线用户的 client 一起清掉, 一个人点登出,
+    其他人下一次查询全部重建连接池。而且根本没必要: 这个缓存**按 token 分键**,
+    换个人登录本来就拿不到上一个人的 client。登出的人那一份留到 ttl 到期即可。
     """
     client = create_client(
         supabase_url, anon_key,
@@ -98,6 +119,54 @@ def get_client(access_token: Optional[str] = None) -> Client:
     return _make_client_cached(
         config.SUPABASE_URL, config.SUPABASE_ANON_KEY, access_token or ""
     )
+
+
+# supabase-py 的子客户端是【惰性】建的: client._postgrest / _storage /
+# _functions 在被访问之前都是 None(实测 supabase 2.30)。所以关连接必须走这几个
+# **私有**属性 —— 用 client.postgrest 这样的属性访问会把还不存在的子客户端
+# **现建一个**出来, 本意是释放描述符, 结果反而多占一个。
+_CLOSABLE_SUBCLIENTS = ("_postgrest", "_storage", "_functions")
+
+
+def close_client(client) -> None:
+    """尽力关掉一个一次性 Supabase client 底下的 httpx 连接(审计 ROB-013)。
+
+    supabase-py 没有统一的 ``close()``: postgrest 上叫 ``aclose``(名字带 a,
+    实际是同步的), auth 上叫 ``close``, storage / functions 则是各自的
+    ``_client`` 是个 httpx.Client。一次性 client 用完不关, 连接和文件描述符
+    要等 GC —— 而 ``auth._try_refresh_session`` / ``_try_cookie_restore``
+    是每次 rerun 都可能走的路径, 攒起来就是 Too many open files, 表现却是
+    "所有查询突然开始超时", 极难往这上面想。
+
+    ⚠️ 只用于 ``auth._fresh_auth_client()`` 那种一次性对象。
+    绝不能对 ``get_client()`` 返回的缓存 client 调 —— 那是别人还在用的。
+
+    每个子客户端单独 try: 关不掉一个不该拦住其余的。
+    """
+    targets = []
+    auth = client.__dict__.get("auth")     # auth 是 __init__ 里就建好的
+    if auth is not None:
+        targets.append(auth)
+    for attr in _CLOSABLE_SUBCLIENTS:
+        sub = getattr(client, attr, None)  # 已经建过才不是 None; 不触发惰性构造
+        if sub is not None:
+            targets.append(sub)
+
+    for sub in targets:
+        for holder in (sub, getattr(sub, "_client", None), getattr(sub, "session", None)):
+            if holder is None:
+                continue
+            fn = getattr(holder, "close", None) or getattr(holder, "aclose", None)
+            if not callable(fn):
+                continue
+            try:
+                res = fn()
+                # 万一哪天上游把它改成真的 async: 协程不 await 会留一条
+                # "coroutine was never awaited" 警告, 关掉它。
+                if hasattr(res, "close"):
+                    res.close()
+            except Exception:
+                pass
 
 
 def get_service_client() -> Client:
@@ -996,6 +1065,127 @@ REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) 
 REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM anon;
 REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM authenticated;
 GRANT EXECUTE ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) TO service_role;
+
+-- ── deskcore 查重比对下推(审计 SUP-002 / ROB-004 / ROB-011) ─────────────
+-- 原来是把整个项目的指纹(4000 行 × 768 维)拉进 Python 再逐对算余弦: 百 MB 级
+-- 传输 + 三千万次乘加, 单次数十秒, 而且占着 uvicorn 线程池的一个槽 ——
+-- 池子占满 /health 就跟着排队, 平台健康检查超时重启容器, 正在跑的调用全断。
+-- 三条审计发现是同一个根因。
+--
+-- ⚠️ 余弦这一路刻意【不走 draft_fp_embedding_idx】(上面那个 ivfflat)。
+-- ivfflat 是近似最近邻(默认 probes=1 只扫一个桶), 对查重硬闸是致命的 ——
+-- 漏掉的那条正是要拦下的重复稿, 且不报错。这里 ORDER BY 的是子查询算好的
+-- 别名 sim, 不是 `title_embedding <=> v` —— pgvector 的索引只认后一种形态,
+-- 换成前者规划器必然走顺序扫描, 精确且可预期。完整理由见 migrations/004。
+CREATE OR REPLACE FUNCTION deskcore_check_drafts(
+    _project_id UUID,
+    _rows       JSONB        -- [{opening_hash, ngram_hashes, title_embedding}, ...]
+)
+RETURNS TABLE(
+    idx        INT,
+    best_sim   NUMERIC,
+    sim_title  TEXT,
+    best_j     NUMERIC,
+    j_title    TEXT,
+    open_exact BOOLEAN,
+    open_title TEXT
+)
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog, extensions   -- ::vector 需要 extensions
+AS $$
+DECLARE
+    r  JSONB;
+    i  INT := -1;
+    ng TEXT[];
+    oh TEXT;
+    v  vector;
+BEGIN
+    FOR r IN SELECT * FROM jsonb_array_elements(_rows) LOOP
+        i := i + 1;
+        idx := i;
+        best_sim := 0; sim_title := NULL;
+        best_j := 0;   j_title := NULL;
+        open_exact := FALSE; open_title := NULL;
+
+        oh := NULLIF(r->>'opening_hash', '');
+        SELECT COALESCE(array_agg(x), '{}') INTO ng
+          FROM jsonb_array_elements_text(COALESCE(r->'ngram_hashes','[]'::jsonb)) x;
+        v := CASE WHEN r->'title_embedding' IS NULL
+                    OR jsonb_typeof(r->'title_embedding') = 'null'
+                  THEN NULL ELSE (r->>'title_embedding')::vector END;
+
+        -- ① 开头精确撞车。空开头不参与(否则 title-only 的稿子会互相撞车)。
+        IF oh IS NOT NULL THEN
+            SELECT f.title INTO open_title
+              FROM draft_fingerprints f
+             WHERE f.project_id = _project_id AND f.opening_hash = oh
+             LIMIT 1;
+            open_exact := open_title IS NOT NULL;
+        END IF;
+
+        -- ② 四字串 Jaccard。GIN 的 && 粗筛后只对有交集的行精算。
+        IF array_length(ng, 1) IS NOT NULL THEN
+            SELECT t.title, t.j INTO j_title, best_j
+              FROM (
+                SELECT f.title,
+                       (SELECT count(*) FROM (SELECT unnest(ng) INTERSECT SELECT unnest(f.ngram_hashes)) s)::numeric
+                       / NULLIF((SELECT count(*) FROM (SELECT unnest(ng) UNION SELECT unnest(f.ngram_hashes)) u), 0) AS j
+                  FROM draft_fingerprints f
+                 WHERE f.project_id = _project_id
+                   AND f.ngram_hashes && ng
+              ) t
+             WHERE t.j IS NOT NULL
+             ORDER BY t.j DESC, t.title
+             LIMIT 1;
+            best_j := COALESCE(best_j, 0);
+        END IF;
+
+        -- ③ 标题语义余弦(见上: 顺序扫描, 精确)。
+        IF v IS NOT NULL THEN
+            SELECT t.title, t.sim INTO sim_title, best_sim
+              FROM (
+                SELECT f.title, 1 - (f.title_embedding <=> v) AS sim
+                  FROM draft_fingerprints f
+                 WHERE f.project_id = _project_id
+                   AND f.title_embedding IS NOT NULL
+              ) t
+             ORDER BY t.sim DESC, t.title
+             LIMIT 1;
+            IF best_sim IS NULL OR best_sim <= 0 THEN
+                best_sim := 0; sim_title := NULL;
+            END IF;
+        END IF;
+
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM anon;
+REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM authenticated;
+GRANT EXECUTE ON FUNCTION deskcore_check_drafts(UUID, JSONB) TO service_role;
+
+-- ── list_projects 的指纹批量计数(审计 SUP-004) ──────────────────────────
+-- PostgREST 不会 GROUP BY, 没有这个函数就只能每个项目发一次 count=exact:
+-- 40 个项目 41 次往返, 而 list_projects 是模型最常调的第一个工具。
+CREATE OR REPLACE FUNCTION deskcore_fingerprint_counts(_project_ids UUID[])
+RETURNS TABLE(project_id UUID, n BIGINT)
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, extensions
+AS $$
+    SELECT f.project_id, count(*)::bigint
+      FROM draft_fingerprints f
+     WHERE f.project_id = ANY(_project_ids)
+     GROUP BY f.project_id;
+$$;
+
+REVOKE ALL ON FUNCTION deskcore_fingerprint_counts(UUID[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION deskcore_fingerprint_counts(UUID[]) FROM anon;
+REVOKE ALL ON FUNCTION deskcore_fingerprint_counts(UUID[]) FROM authenticated;
+GRANT EXECUTE ON FUNCTION deskcore_fingerprint_counts(UUID[]) TO service_role;
 
 -- ── 调教笔记的 CAS 写入（审计 COR-003 / migrations/002）────────────────────
 -- 为什么必须是 RPC: memory.save_calibration_notes 的乐观并发原本写成
@@ -2214,17 +2404,56 @@ def _invalidate_memory_caches() -> None:
 # （会和历史脏数据冲突无法添加），所以用 app 层的 keyed lock 兜底单进程部署。
 # 多 worker / 多 instance 场景仍有残余竞态，但 UPDATE 走 CAS 至少能检测出冲突
 # 并重试。
-_MEMORY_UPSERT_LOCKS: dict[str, threading.Lock] = {}
+#
+# 审计 SUP-008: 这个字典原来**永不删项** —— 每见过一条规则文本就永久留一把
+# Lock。规则是用户反馈驱动的、内容各不相同, 长跑进程里它只增不减。
+#
+# 加上限的做法有个坑必须避开: 【不能淘汰正在被人用的锁】。一旦把某个 key 的
+# Lock 换成新对象, 已经拿着旧锁的线程和随后拿到新锁的线程就不再互斥 ——
+# 而这把锁存在的全部意义就是互斥。所以这里按【引用计数】淘汰: 只有当前没有
+# 任何调用方持有或正准备持有(users == 0)的项才可能被清掉。
+#
+# 计数在拿锁【之前】就 +1(还没 acquire 时也算"正在用"), 否则会出现这个窗口:
+# 线程 A 取到锁对象但还没 acquire → 别的线程触发淘汰 → 线程 C 拿到一把新锁
+# → A 和 C 各锁各的。这个竞态很窄, 但后果正是 frequency 丢增量 / 双插重复行,
+# 而那正是本锁要防的东西。
+_MEMORY_UPSERT_LOCKS: "OrderedDict[str, list]" = OrderedDict()   # key -> [Lock, users]
 _MEMORY_UPSERT_LOCKS_GUARD = threading.Lock()
+_MEMORY_UPSERT_LOCKS_MAX = 512
 
 
-def _get_memory_upsert_lock(key: str) -> threading.Lock:
+@contextlib.contextmanager
+def _memory_upsert_lock(key: str):
+    """按 key 串行化, 锁池带上限(审计 SUP-008)。"""
     with _MEMORY_UPSERT_LOCKS_GUARD:
-        lk = _MEMORY_UPSERT_LOCKS.get(key)
-        if lk is None:
-            lk = threading.Lock()
-            _MEMORY_UPSERT_LOCKS[key] = lk
-        return lk
+        entry = _MEMORY_UPSERT_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _MEMORY_UPSERT_LOCKS[key] = entry
+        entry[1] += 1                       # 先占住, 再去 acquire
+        _MEMORY_UPSERT_LOCKS.move_to_end(key)
+        _evict_idle_memory_locks()
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _MEMORY_UPSERT_LOCKS_GUARD:
+            entry[1] -= 1
+
+
+def _evict_idle_memory_locks() -> None:
+    """把最久没用、且【当前没人用】的锁清掉。调用方必须已持有 GUARD。
+
+    从 LRU 端往新的方向扫, 跳过 users > 0 的项。全都在用时就不淘汰 ——
+    此刻字典确实超上限, 但那是真实并发量, 不是泄漏; 用完自然会掉下来。
+    """
+    if len(_MEMORY_UPSERT_LOCKS) <= _MEMORY_UPSERT_LOCKS_MAX:
+        return
+    for k in list(_MEMORY_UPSERT_LOCKS.keys()):
+        if len(_MEMORY_UPSERT_LOCKS) <= _MEMORY_UPSERT_LOCKS_MAX:
+            break
+        if _MEMORY_UPSERT_LOCKS[k][1] == 0:
+            del _MEMORY_UPSERT_LOCKS[k]
 
 
 def upsert_memory(
@@ -2269,7 +2498,7 @@ def upsert_memory(
     lock_key = hashlib.sha256(
         f"{user_id}|{scope}|{project_id or ''}|{content}".encode("utf-8")
     ).hexdigest()
-    with _get_memory_upsert_lock(lock_key):
+    with _memory_upsert_lock(lock_key):
         return _upsert_memory_locked(
             client, user_id, scope, content, source_feedback,
             project_id=project_id,

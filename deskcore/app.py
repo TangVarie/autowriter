@@ -44,6 +44,8 @@ import contextvars
 import logging
 import os
 
+import anyio
+import anyio.to_thread
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
@@ -140,8 +142,42 @@ async def auth_middleware(request: Request, call_next):
         _caller.reset(token)
 
 
+# /health 专用的线程额度(审计 ROB-004)。
+#
+# 事故形状: 工具调用全部走 starlette 的**默认** thread limiter(40 个额度),
+# 而 `def health()` 这种同步路由**也走同一个 limiter**。check_drafts 这类几十秒
+# 的调用一多, /health 就排在它们后面 —— 平台健康检查超时 → 重启容器 → 正在跑
+# 的调用全断。deskcore/app.py 下面那段注释描述的就是同款事故的另一半。
+#
+# 根因已经由 migrations/004 把比对下推到库里堵掉了(工具调用不再是几十秒),
+# 但"健康检查和业务抢同一个池子"这件事本身仍然是个雷: 换个慢查询就复发。
+# 给 /health 一个**私有** limiter, 它就永远不排在工具后面 —— anyio 的
+# to_thread.run_sync 只认传进去的 limiter, 不再碰默认那个。
+#
+# 额度 2 而不是 1: 平台的健康检查和人工 curl 可能同时打进来, 1 会让后者干等。
+_HEALTH_LIMITER = anyio.CapacityLimiter(2)
+
+# 单次探测的墙钟上限。库连接卡死(TCP 黑洞)时 supabase-py 没有默认超时, /health
+# 会一直挂着不返回 —— 平台照样判超时重启, 而且【没有任何信息】说明卡在哪。
+# 超时后线程还在后台跑(Python 没法中断阻塞的 socket 读), 所以额度要 > 1,
+# 否则连续几次超时会把私有池占满。
+_HEALTH_PROBE_TIMEOUT = float(os.environ.get("DESKCORE_HEALTH_PROBE_TIMEOUT", "5") or 5)
+
+
+async def _probe(fn, fallback):
+    """在 /health 私有线程额度里跑一个阻塞探测, 超时返回 fallback。"""
+    try:
+        with anyio.fail_after(_HEALTH_PROBE_TIMEOUT):
+            return await anyio.to_thread.run_sync(fn, limiter=_HEALTH_LIMITER)
+    except TimeoutError:
+        return fallback
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("health probe failed: %s", exc)
+        return fallback
+
+
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:
     """回显实际解析到的配置 —— 让配错当场可见。
 
     ⚠️ 这个回显是【刻意的】: TV docs/19:180-200 记过一次事故, librarian 的模型
@@ -163,11 +199,21 @@ def health() -> dict:
     import db
     import dedup
 
-    db_ok, db_note = True, "ok"
-    try:
-        db.get_service_client().table("projects").select("id").limit(1).execute()
-    except Exception as exc:  # noqa: BLE001
-        db_ok, db_note = False, f"{type(exc).__name__}: {exc}"[:160]
+    def _db_probe() -> tuple[bool, str]:
+        try:
+            db.get_service_client().table("projects").select("id").limit(1).execute()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"[:160]
+        return True, "ok"
+
+    # ROB-004: 这次探测是 /health 里唯一会打网络的一步, 放进私有线程额度 +
+    # 墙钟上限。超时按【不健康】报, 但要把"是超时"写进 note —— 报成
+    # "连不上"和报成"卡住了"是两种完全不同的排查方向。
+    db_ok, db_note = await _probe(
+        _db_probe,
+        (False, f"probe timeout >{_HEALTH_PROBE_TIMEOUT:g}s —— 库没有拒绝连接, "
+                f"是【卡住不回】(连接池耗尽 / 网络黑洞); 查 Supabase 连接数"),
+    )
 
     vocab_ok, vocab_note = vocab.vendor_checksum_ok()
     emb_ok = dedup.embeddings_available()
