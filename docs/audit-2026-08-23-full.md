@@ -12,7 +12,7 @@
 | 批次 | 条目 | 状态 |
 |---|---|---|
 | 第 1 批 · 止血 | ROB-003 · COR-003 · COR-007 · COR-010 · COR-005/006 | ✅ **已修**(见下) |
-| 第 2 批 · 数据一致性 | COR-002 · COR-004 · COR-008 · COR-009 · COR-011 · COR-020 · COR-021 · COR-022 · ROB-009 · ROB-018 | 待做 |
+| 第 2 批 · 数据一致性 | COR-002 · COR-004 · COR-008 · COR-009 · COR-011 · COR-020 · COR-021 · COR-022 · ROB-009 · ROB-018 | ✅ **已修**(见 §0.2) |
 | 第 3 批 · 性能与成本 | SUP-001 · SUP-002 · SUP-003 · SUP-004 · SUP-005 · SUP-007 · SUP-008 · ROB-004 · ROB-011 · ROB-013 | 待做 |
 | 第 4 批 · 结构性 | ROB-001 · ROB-002 · SUP-011 · SUP-012 · SUP-024 · SUP-010 · COR-014 · COR-015 | 待做 |
 
@@ -43,6 +43,37 @@ CI 用 AST 遍历 `db.py` 钉死"不许再出现无守卫的 `return <x>.data[0]
 
 **过程中新发现的一处**: `memory.save_calibration_notes` 的 docstring 仍在描述已被替换的
 `.eq("calibration_notes", ...)` 机制(注释与实现不一致), 由新加的 CI 断言当场抓到, 已一并改。
+
+### 0.2 第 2 批(数据一致性与并发)的实现说明
+
+回归在 CI 的 `审计第二批回归` 一步。每条都**先复现失败模式再证明修好** ——
+只断言"现在是对的"挡不住回退。
+
+| 条目 | 怎么修的 |
+|---|---|
+| COR-002 | `items.id` 改由客户端预生成并显式写进 INSERT(`uuid_generate_v4()` 只是 DEFAULT), slot ↔ item_id 由构造保证, 不再依赖任何返回顺序; 回执缺行时整批失败 + 回收已插的行 |
+| COR-004 | `migrations/003` 加 `UNIQUE(item_id, version_num)`(先把历史重复对子按 `(version_num, created_at, id)` 稳定重编号, 否则建索引直接失败); `create_version` 捕获 23505 后重读 max 重试 |
+| COR-008 | 新增 `db._paged_select()`(空页收工 + offset 按实收前进), 应用到 `get_session_committed_item_ids` / `list_approved_versions_for_sync` / `_collect_recent_canonical_versions` 的版本查询; `_collect_recent_canonical_versions` 删掉多余的短页判据; `deskcore/store.fingerprints` 同改 |
+| COR-009 | `list_items.clear()` 移到 INSERT 之后 |
+| COR-011 | 加 `marked_items` 集合去重, 警告仍逐条给用户 |
+| COR-020 | `content = rule.get("content","")` 读一次, 四条上报路径统一用它 |
+| COR-021 | 新增 `_strip_outer_code_fence()` 只剥最外层围栏, 替换三处全局 `re.sub` |
+| COR-022 | `engines = list(dict.fromkeys(engines))` 去重保序 |
+| ROB-009 | sweeper 增查 `heartbeat_at IS NULL` 的候选(按 `claimed_at` 判超时; 两者皆空视为僵尸), 分两次查而不是手拼 `or=` 过滤串 |
+| ROB-018 | `seal_session` / `update_job_progress` 看受影响行数; 四个草稿写入收进 `_best_effort_item_patch`(仍不抛, 但两种失败都留痕) |
+
+**顺带抽出的一处**: 新增 `db.parse_ts()` 统一 PG 时间戳解析(aware/naive/`Z`/7 位微秒),
+`is_memory_muted_now` 改调它, ROB-009 也用它。COR-007 的根因就是"各写一份 ISO 解析",
+本批修 ROB-009 时差点又用字符串字典序比时间戳 —— 带微秒与不带微秒混排会差一秒
+(`.` 的码位大于 `+`)。判据收成一处。
+
+**COR-008 的范围比报告写的多一处**: `_collect_recent_canonical_versions` 内部的
+`_fetch_versions` 是按 **item 数**分块(每块 100 个 item)而不是按行数, 一块里只要平均
+迭代过 10 版就能超过 max-rows —— 而那段注释声称已经处理了截断。一并改成翻页。
+
+**CI 断言写法**: 本批有三条断言第一版用文本匹配, 全都被自己写的解释性注释误报
+(注释里引用旧写法来说明为什么换掉它)。改成 AST 后才可靠 —— 这正是 round-5 §6
+记过的那一课, 一个批次里又踩了三次, 说明"钉死某个写法不许回来"的断言天然应该走 AST。
 
 ---
 

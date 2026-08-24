@@ -241,8 +241,13 @@ def check_hard_rules(
 
     out: list[dict] = []
     for rule in hard_rules:
+        # 审计 COR-020: 解析用 .get("content","") 而上报却用 rule["content"] ——
+        # 带 rule_kind 但没有 content 键的规则(结构化 spec 完全够用, content 只是
+        # 给人看的原文)会在**命中违规的那一刻**抛 KeyError, 从生成主流程冒出去。
+        # 只读一次, 后面统一用它。
+        content = rule.get("content", "")
         # Day 3: 优先用结构化字段，回退到正则抽取
-        spec = _spec_from_structured(rule) or _parse_rule(rule.get("content", ""))
+        spec = _spec_from_structured(rule) or _parse_rule(content)
         if not spec:
             continue
         kind = spec["kind"]
@@ -250,7 +255,7 @@ def check_hard_rules(
             t = spec["target"]
             if t and t in combined:
                 out.append({
-                    "rule":  rule["content"],
+                    "rule":  content,
                     "kind":  kind,
                     "match": t,
                 })
@@ -258,7 +263,7 @@ def check_hard_rules(
             t = spec["target"]
             if t and t not in combined:
                 out.append({
-                    "rule":  rule["content"],
+                    "rule":  content,
                     "kind":  kind,
                     "match": t,  # 这里 match = 缺失的词
                 })
@@ -280,7 +285,7 @@ def check_hard_rules(
             }.get(scope, "")
             if target_text and len(target_text) > n:
                 out.append({
-                    "rule":  rule["content"],
+                    "rule":  content,
                     "kind":  kind,
                     "match": f"实际 {len(target_text)} 字 > 限定 {n} 字",
                 })
@@ -290,7 +295,7 @@ def check_hard_rules(
                 m = re.search(pattern, combined)
                 if m:
                     out.append({
-                        "rule":  rule["content"],
+                        "rule":  content,
                         "kind":  kind,
                         "match": m.group(0)[:60],
                     })
@@ -303,7 +308,7 @@ def check_hard_rules(
                     import telemetry as _tm
                     _tm.log_event(
                         "hard_rule_regex_failed",
-                        rule=rule.get("content", "")[:80],
+                        rule=content[:80],
                         pattern=pattern[:80],
                         error=str(exc)[:120],
                     )

@@ -356,7 +356,11 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
                  .range(start, end).execute())
         page = res.data or []
         rows.extend(page)
-        if len(page) < (end - start + 1):
+        # 审计 COR-008: 判据必须是【空页】而不是【短页】。服务端 db-max-rows
+        # 低于 PAGE 时**每一页都是短页**, 按短页收工就只拿到第一页 —— 而
+        # check_drafts 照旧报 history_size, "比对全量历史" 变成假话。
+        # (本函数的 offset 本来就按 len(rows) 前进, 钳短不会漏中间那段。)
+        if not page:
             break                      # 取完了
     else:
         # 没 break = 撞到 limit。再探一行, 确认后面是不是还有。

@@ -370,6 +370,34 @@ def _call_with_retry(call_fn, max_retries: int = 5):
 
 # ── JSON parsing helper ────────────────────────────────────────────────────
 
+# 审计 COR-021: 只剥【最外层】的 markdown 围栏。
+#
+# 原来三处都写成 ``re.sub(r'```(?:json)?\s*', '', text).replace('```', '')`` ——
+# 那是**全局**替换, 会把出现在 JSON 字符串值内部(也就是文案正文里)的反引号一并
+# 抹掉。用户让模型在正文里写一段代码块、或写"```" 三个字符本身时, 内容在解析
+# 之前就被就地改写了: 即便后续 json.loads 成功, 存进库的也是被削过的正文,
+# 而且没有任何报错。
+#
+# 剥围栏本来只是为了让整串 json.loads 能过(_extract_json_payload 那三个辅助
+# 调用), 主生成路径的 find('{') / rfind('}') 切片本就容忍模型前言 —— 所以只需
+# 处理"整段被 ``` 包起来"这一种形态, 没有理由全局删。
+# 收尾缺失(输出被截断)时退化为只剥开栏, 与旧行为一致。
+_FENCE_WRAPPED_RE = re.compile(
+    r"^\s*```[A-Za-z0-9_+-]*[ \t]*\r?\n?(?P<body>.*?)\r?\n?[ \t]*```\s*$",
+    re.DOTALL,
+)
+_FENCE_OPEN_ONLY_RE = re.compile(r"^\s*```[A-Za-z0-9_+-]*[ \t]*\r?\n?")
+
+
+def _strip_outer_code_fence(text: str) -> str:
+    """剥掉整段外层的 ``` 围栏; 正文内部的反引号原样保留。"""
+    s = (text or "").strip()
+    m = _FENCE_WRAPPED_RE.match(s)
+    if m:
+        return m.group("body").strip()
+    return _FENCE_OPEN_ONLY_RE.sub("", s, count=1).strip()
+
+
 def _fix_json_newlines(s: str) -> str:
     """Escape bare newlines/tabs inside JSON string values (common AI output bug)."""
     result: list[str] = []
@@ -482,7 +510,7 @@ def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
     JSON wrapped in outer quotes, bare newlines inside string values.
     """
     # Step 1: strip markdown code fences
-    stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
+    stripped = _strip_outer_code_fence(text)
 
     # Step 2: extract the {...} block and try to parse it (with and without newline fix)
     for src in (stripped, text):
@@ -615,7 +643,7 @@ def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[Generat
          mid-array corruption (stray chars, missing commas).
       3. Last resort: single-item parse on the whole text.
     """
-    stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
+    stripped = _strip_outer_code_fence(text)
 
     # --- 1. Whole-array parse ------------------------------------------
     for src in (stripped, text):
@@ -708,7 +736,7 @@ def _extract_json_payload(text: str, prefer: str = "object") -> str:
     之后前言仍在开头, 不切片照样解析失败。本 helper 先剥 ``` 围栏再按
     首末括号切片; 找不到时原样返回(调用方的 json.loads 失败走原兜底)。
     """
-    stripped = re.sub(r'```(?:json)?\s*', '', text or '').replace('```', '').strip()
+    stripped = _strip_outer_code_fence(text)
     if prefer == "array":
         start, end = stripped.find('['), stripped.rfind(']')
     else:
@@ -1596,6 +1624,16 @@ def generate_batch(
     # second/third engine sees the first engine's already-produced titles in
     # its dedup block; otherwise two parallel engines would each produce 10
     # items blind to the other, doubling the in-batch duplicate rate.
+
+    # 审计 COR-022: engine_results 以 engine **名字**为键, 而 slots 组装又按
+    # `engines` 逐个取 —— 列表里出现重复名字(如 ["claude","claude"])时, 后一次
+    # 调用覆盖前一次, 同一个 slot 的两个"版本"指向【同一个 GenerationResult
+    # 对象】。之后任何原地打标(_apply_compliance_recheck 的违规标记)都会同时
+    # 显示在两处, 而本文件 :896-898 / :1696-1699 早就为同一个陷阱写过说明。
+    # 去重时保序, 单引擎(绝大多数)路径完全不受影响。
+    engines = list(dict.fromkeys(engines or []))
+    if not engines:
+        return []
 
     # 跨引擎已产出池({"title","opening"}): 顺序路径里后一个引擎避重用,
     # R-033 起补量 prompt 也合并它(单引擎路径保持空)。

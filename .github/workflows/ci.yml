@@ -890,6 +890,347 @@ jobs:
           print("\n审计第一批止血回归: 5/5 通过 (ROB-003 见下方 app 冒烟)")
           PY
 
+      - name: 审计第二批回归 (数据一致性与并发 · COR-002/004/008/009/011/020/021/022 · ROB-009/018)
+        run: |
+          python - <<'PY'
+          # docs/audit-2026-08-23-full.md 第 2 批。全部假件, 不联网。
+          # 每条都先复现【失败模式】再证明修好 —— 只断言"现在是对的"挡不住回退。
+          import os, ast, types, inspect
+          os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
+          import db, validator, telemetry, uuid
+          import generator as G
+
+          class _R:
+              def __init__(s, d): s.data = d
+
+          # 通用假件: 支持 range 翻页 + 模拟服务端 max-rows 钳短
+          class _PQ:
+              def __init__(s, store, log, cap):
+                  s.s, s.log, s.cap, s.orders = store, log, cap, []
+              def select(s, *a, **k): return s
+              def eq(s, *a, **k): return s
+              def in_(s, *a, **k): return s
+              @property
+              def not_(s): return s
+              def is_(s, *a, **k): return s
+              def order(s, c, **k): s.orders.append(c); return s
+              def range(s, lo, hi): s.lo, s.hi = lo, hi; return s
+              def execute(s):
+                  page = s.s[s.lo:s.hi + 1]
+                  if s.cap is not None: page = page[:s.cap]
+                  s.log.append({"order": list(s.orders), "range": (s.lo, s.hi)})
+                  return _R(page)
+          class _PSB:
+              # table() 每次返回新 builder —— postgrest-py 就是这样, 复用会让
+              # .order() 累积、.range() 偏移叠加。
+              def __init__(s, store, cap=None): s.s, s.log, s.cap = store, [], cap
+              def table(s, *a, **k): return _PQ(s.s, s.log, s.cap)
+
+          # ══ COR-008: 「短页收工」必须换成「空页收工」════════════════════════
+          # 服务端 db-max-rows 低于 page_size 时**每一页都是短页**, 按短页收工
+          # 就只拿第一页; offset 按 page_size 跳还会漏掉中间那段。两者都静默。
+          rows = [{"item_id": f"i{n}"} for n in range(2500)]
+          sb = _PSB(rows, cap=137)
+          got = db.get_session_committed_item_ids(sb, "s1")
+          assert len(got) == 2500, f"钳短时只拿到 {len(got)} —— committed set 不全会让懒同步重复 append"
+          assert sb.log[1]["range"][0] == 137, sb.log[1]
+          assert sb.log[0]["order"] == ["id"], "翻页缺唯一稳定次级键"
+          assert db.get_session_committed_item_ids(_PSB([]), "s") == set()
+          sb2 = _PSB([{"id": i} for i in range(3000)])
+          assert len(db._paged_select(lambda o, l: sb2.table().select().range(o, o + l - 1))) == 3000
+          assert len(sb2.log) == 4, f"空页收工应发 4 次(3 满页 + 1 空页), 实际 {len(sb2.log)}"
+          sb3 = _PSB([{"id": i} for i in range(3000)])
+          assert len(db._paged_select(lambda o, l: sb3.table().select().range(o, o + l - 1),
+                                      hard_cap=1500)) == 1500
+          # 别再退回裸的短页判据。必须走 AST —— 这几个函数的注释里就写着
+          # "原来是 len(rows) < page" 在解释为什么换掉它, 按行文本匹配会把
+          # 自己的注释当成回退(round-5 §6 记过这一课, 本批又踩了一次)。
+          import textwrap
+          def _has_short_page_break(fn) -> bool:
+              t = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+              for c in ast.walk(t):
+                  if (isinstance(c, ast.Compare) and len(c.ops) == 1
+                          and isinstance(c.ops[0], ast.Lt)
+                          and isinstance(c.left, ast.Call)
+                          and isinstance(c.left.func, ast.Name) and c.left.func.id == "len"
+                          and isinstance(c.comparators[0], ast.Name)
+                          and c.comparators[0].id in ("page", "page_size")):
+                      return True
+              return False
+          for fn in (db.get_session_committed_item_ids, db.list_approved_versions_for_sync,
+                     db._collect_recent_canonical_versions):
+              assert not _has_short_page_break(fn), f"{fn.__name__} 又出现短页收工判据"
+          import deskcore.store as S
+          assert "if not page:" in inspect.getsource(S.fingerprints), "store.fingerprints 还在按短页收工"
+          print("  ✓ COR-008 四处翻页统一成空页收工; 钳到 137/页仍取全 2500")
+
+          # ══ ROB-009: sweeper 必须看得见 NULL 心跳 ═══════════════════════════
+          # SQL 里 NULL < x 求值为 NULL 而不是 true —— heartbeat_at 为空的
+          # claimed/running 行永远进不了 .lt() 的结果集, 于是永久占位:
+          # 既不执行也不回收, 而队列面板上它一直显示"运行中"。
+          from datetime import datetime, timezone, timedelta
+          old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+          now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+          J = {
+              "stale":  {"id": "j1", "status": "running", "heartbeat_at": old,  "claimed_by": "w1", "attempts": 1, "max_attempts": 3},
+              "null_old": {"id": "j2", "status": "running", "heartbeat_at": None, "claimed_at": old, "claimed_by": "w2", "attempts": 1, "max_attempts": 3},
+              "null_new": {"id": "j3", "status": "claimed", "heartbeat_at": None, "claimed_at": now, "claimed_by": "w3", "attempts": 1, "max_attempts": 3},
+              "null_both": {"id": "j4", "status": "running", "heartbeat_at": None, "claimed_at": None, "claimed_by": None, "attempts": 1, "max_attempts": 3},
+          }
+          class _JQ:
+              def __init__(s): s.mode = None
+              def select(s, *a, **k): return s
+              def update(s, p, *a, **k): s.mode = "upd"; return s
+              def in_(s, c, v): return s
+              def lt(s, c, v): s.mode = "lt"; return s
+              def is_(s, c, v): s.mode = "null"; return s
+              def eq(s, *a, **k): return s
+              def execute(s):
+                  if s.mode == "lt":   return _R([J["stale"]])
+                  if s.mode == "null": return _R([J["null_old"], J["null_new"], J["null_both"]])
+                  if s.mode == "upd":  return _R([{"id": "x"}])
+                  return _R([])
+          class _JSB:
+              def table(s, *a, **k): return _JQ()
+          n = db.sweep_dead_jobs(_JSB(), 90)
+          assert n == 3, f"回收 {n} 条(应 3: 心跳超时 + NULL心跳且claimed久 + 两者皆空); 旧实现只回收 1 条"
+          src = inspect.getsource(db.sweep_dead_jobs)
+          assert 'is_("heartbeat_at", "null")' in src, "没查 NULL 心跳"
+          assert "parse_ts" in src, "还在拿字符串字典序比时间戳"
+          # parse_ts 归一四形态 + 反证字符串比较会判反
+          assert db.parse_ts("2026-01-01T00:00:00Z") == db.parse_ts("2026-01-01T00:00:00+00:00")
+          assert db.parse_ts("2026-01-01T00:00:00.1234567+00:00") is not None
+          assert db.parse_ts(None) is None and db.parse_ts("垃圾") is None
+          _c, _d = "2026-01-01T00:00:00", "2026-01-01T00:00:00+00:00"
+          assert _c < _d and db.parse_ts(_c) == db.parse_ts(_d), "naive vs aware 的字符串比较本就判反"
+          print("  ✓ ROB-009 NULL 心跳的僵尸行也能回收(3/3); 时间戳统一走 parse_ts")
+
+          # ══ COR-004: 版本号并发撞车要重试, 不是两条都写进去 ═════════════════
+          class _VQ:
+              def __init__(s, st): s.st = st; s.mode = None
+              def select(s, *a, **k): s.mode = "sel"; return s
+              def insert(s, d, *a, **k): s.mode = "ins"; s.data = d; return s
+              def eq(s, *a, **k): return s
+              def order(s, *a, **k): return s
+              def limit(s, *a, **k): return s
+              def execute(s):
+                  if s.mode == "sel":
+                      mx = max(s.st["nums"]) if s.st["nums"] else None
+                      return _R([{"version_num": mx}] if mx else [])
+                  n = s.data["version_num"]; s.st["attempts"].append(n)
+                  if n in s.st["nums"]:
+                      raise Exception('duplicate key value violates unique constraint "versions_item_version_uniq"')
+                  s.st["nums"].add(n); return _R([{"id": f"v{n}", "version_num": n}])
+          class _VSB:
+              def __init__(s, st): s.st = st
+              def table(s, *a, **k): return _VQ(s.st)
+          assert db.create_version(_VSB({"nums": set(), "attempts": []}), "i", "c", "t", "b")["version_num"] == 1
+          assert db.create_version(_VSB({"nums": {1, 2}, "attempts": []}), "i", "c", "t", "b")["version_num"] == 3
+          class _RaceSB(_VSB):
+              def __init__(s, st): super().__init__(st); s.first = True
+              def table(s, *a, **k):
+                  q = _VQ(s.st); orig = q.execute
+                  def ex():
+                      if q.mode == "ins" and s.first:
+                          s.first = False
+                          s.st["nums"].add(q.data["version_num"])      # 对手抢先占号
+                          s.st["attempts"].append(q.data["version_num"])
+                          raise Exception("23505 duplicate key value violates unique constraint")
+                      return orig()
+                  q.execute = ex; return q
+          st = {"nums": {1, 2}, "attempts": []}
+          assert db.create_version(_RaceSB(st), "i", "c", "t", "b")["version_num"] == 4
+          assert st["attempts"] == [3, 4], st["attempts"]
+          class _BoomSB(_VSB):
+              def table(s, *a, **k):
+                  q = _VQ(s.st); orig = q.execute
+                  def ex():
+                      if q.mode == "ins": raise Exception("permission denied for table versions")
+                      return orig()
+                  q.execute = ex; return q
+          try:
+              db.create_version(_BoomSB({"nums": set(), "attempts": []}), "i", "c", "t", "b")
+              raise AssertionError("非唯一冲突被吞了")
+          except Exception as e:
+              assert "permission denied" in str(e)
+          # 唯一索引两份 SQL 都要有; 迁移必须先重编号(否则有历史重复时直接建索引会失败)
+          for f in ("migrations/003_versions_unique_num.sql", "db.py"):
+              t = open(f, encoding="utf-8").read()
+              assert "versions_item_version_uniq" in t and "(item_id, version_num)" in t, f
+          assert "row_number() OVER" in open("migrations/003_versions_unique_num.sql", encoding="utf-8").read()
+          print("  ✓ COR-004 撞号→重读 max 重试(3→4); 非唯一冲突原样上抛; 两份 SQL 都有唯一索引")
+
+          # ══ COR-009: 缓存失效必须在 INSERT 之后 ════════════════════════════
+          _s = inspect.getsource(db.bulk_create_initial_versions)
+          assert _s.index("insert(payload).execute()") < _s.index("list_items.clear()"), \
+              "clear() 跑到 insert 前面 —— 并发读会把缓存回填成写入前的旧快照"
+          print("  ✓ COR-009 list_items.clear() 在 INSERT 之后")
+
+          # ══ ROB-018: UPDATE 0 行不再当成功 ═════════════════════════════════
+          class _ZQ:
+              def __init__(s, out): s.out = out
+              def update(s, *a, **k): return s
+              def eq(s, *a, **k): return s
+              def execute(s): return _R(s.out)
+          class _ZSB:
+              def __init__(s, out): s.out = out
+              def table(s, *a, **k): return _ZQ(s.out)
+          assert db.seal_session(_ZSB([]), "s", "window_full") is False, "0 行却报 seal 成功"
+          assert db.seal_session(_ZSB([{"id": "s"}]), "s", "window_full") is True
+          assert db._best_effort_item_patch(_ZSB([]), "i", {"x": 1}, "t") is False
+          assert db._best_effort_item_patch(_ZSB([{"id": "i"}]), "i", {"x": 1}, "t") is True
+          for fn in (db.save_feedback_draft, db.clear_feedback_draft,
+                     db.save_manual_edit_draft, db.clear_manual_edit_draft):
+              assert "_best_effort_item_patch" in inspect.getsource(fn), fn.__name__
+          print("  ✓ ROB-018 seal_session / 四个草稿写入都看受影响行数并留痕")
+
+          # ══ COR-020: 带 rule_kind 但缺 content 不再 KeyError ═══════════════
+          hits = validator.check_hard_rules(
+              [{"rule_kind": "forbidden_word", "rule_payload": {"target": "最"}}],
+              title="全网最低价", body="")
+          assert hits and hits[0]["match"] == "最" and hits[0]["rule"] == "", hits
+          for kind, payload, t, b in [("required_phrase", {"target": "认证"}, "标题", "正文"),
+                                      ("max_len", {"scope": "标题", "n": 2}, "很长的标题", ""),
+                                      ("forbidden_regex", {"pattern": "最."}, "最低价", "")]:
+              assert validator.check_hard_rules([{"rule_kind": kind, "rule_payload": payload}],
+                                                title=t, body=b), kind
+          assert validator.check_hard_rules([{"content": "禁止出现'最'字"}],
+                                            title="最低价", body="")[0]["rule"] == "禁止出现'最'字"
+          # 同样走 AST: 函数里的注释写着 rule["content"] 在解释为什么不能这么用。
+          _vt = ast.parse(textwrap.dedent(inspect.getsource(validator.check_hard_rules)))
+          assert not [
+              1 for _c in ast.walk(_vt)
+              if isinstance(_c, ast.Subscript) and isinstance(_c.value, ast.Name)
+              and _c.value.id == "rule" and isinstance(_c.slice, ast.Constant)
+              and _c.slice.value == "content"
+          ], "又出现 rule['content'] 直取 —— 缺 content 键的结构化规则命中时会 KeyError"
+          print("  ✓ COR-020 四种 kind 的上报路径都不再触碰 rule['content']")
+
+          # ══ COR-021: 只剥外层围栏, 正文里的反引号必须活下来 ═════════════════
+          import json as _json
+          f = G._strip_outer_code_fence
+          assert f('```json\n{"a":1}\n```') == '{"a":1}'
+          assert f('```\n{"a":1}\n```') == '{"a":1}'
+          assert f('{"a":1}') == '{"a":1}'
+          assert f('```json\n{"a":1}') == '{"a":1}'          # 输出截断: 只剥开栏
+          assert f('前言\n{"a":1}') == '前言\n{"a":1}'
+          body = "先看这段代码：\n```python\nprint(1)\n```\n就这样"
+          raw = '```json\n' + _json.dumps({"title": "t", "body": body, "keywords": ["k"]},
+                                          ensure_ascii=False) + '\n```'
+          r = G._parse_copy_json(raw, "claude/test")
+          assert r.error is None and r.body == body, f"正文被就地改写: {r.body!r}"
+          arr = '```json\n' + _json.dumps([{"title": "t1", "body": body, "keywords": []},
+                                           {"title": "t2", "body": "普通", "keywords": []}],
+                                          ensure_ascii=False) + '\n```'
+          rs = G._parse_copy_json_list(arr, 2, "claude/test")
+          assert len(rs) == 2 and rs[0].body == body and not rs[0].error
+          assert _json.loads(G._extract_json_payload('```json\n{"violations":[]}\n```')) == {"violations": []}
+          assert G._extract_json_payload('前言 {"a":1} 后记') == '{"a":1}'
+          # 反证旧的全局剥法
+          import re as _re
+          _old = _re.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
+          assert "```" not in _old and _old != f(raw), "前提变了: 旧写法本就会抹掉正文里的围栏"
+          print("  ✓ COR-021 正文内的 ```python 代码块原样保留(旧的全局剥法会抹掉)")
+
+          # ══ COR-022: 引擎名重复不再让两个"版本"指向同一个对象 ═══════════════
+          class _FakeEngine:
+              def generate(self, **kw):
+                  return [G.GenerationResult(title=f"t{i}", body="b", keywords=[],
+                                             ai_engine="claude/x") for i in range(kw["count"])]
+          _orig_ge = G.get_engine
+          G.get_engine = lambda name: _FakeEngine()
+          try:
+              slots = G.generate_batch(system_prompt="s", tactic="t", count=2,
+                                       engines=["claude", "claude"], metrics=None)
+              assert len(slots) == 2 and len(slots[0]["versions"]) == 1, \
+                  "重复引擎名没去重 —— 同一个 slot 会拿到同一个对象两份引用"
+              ids = {id(v) for s_ in slots for v in s_["versions"]}
+              assert len(ids) == 2, "不同 slot 共享了同一个 GenerationResult"
+              assert len(G.generate_batch(system_prompt="s", tactic="t", count=2,
+                                          engines=["claude"], metrics=None)) == 2
+              assert G.generate_batch(system_prompt="s", tactic="t", count=2,
+                                      engines=[], metrics=None) == []
+          finally:
+              G.get_engine = _orig_ge
+          print("  ✓ COR-022 engines 去重保序; 单引擎路径不变; 空 engines 不炸")
+
+          # ══ COR-002: slot ↔ item 配对不能靠返回顺序, 缺行不能静默丢 ═════════
+          # app.py 是 streamlit 脚本(顶层会跑 UI), 只把这两个纯函数取出来跑。
+          _tree = ast.parse(open("app.py", encoding="utf-8").read())
+          _mod = types.ModuleType("appfrag")
+          _mod.__dict__.update(db=db, validator=validator, telemetry=telemetry, uuid=uuid)
+          for _n in _tree.body:
+              if isinstance(_n, ast.FunctionDef) and _n.name in ("_save_batch_results",
+                                                                 "_run_hard_constraint_check"):
+                  exec(compile(ast.Module([_n], []), "app.py", "exec"), _mod.__dict__)
+          class GR:
+              def __init__(s, t, b):
+                  s.title, s.body, s.ai_engine, s.error = t, b, "claude/x", None
+                  s.keywords = []; s.token_usage = {}
+          class _ISB:
+              def __init__(s, mode="ok"): s.mode = mode; s.inserted = []; s.deleted = []
+              def table(s, t):
+                  outer = s
+                  class _Q:
+                      def __init__(_): _.t = t; _.op = None
+                      def insert(_, rows, *a, **k): _.op = "ins"; _.rows = rows; return _
+                      def delete(_, *a, **k): _.op = "del"; return _
+                      def in_(_, c, v): _.ids = v; return _
+                      def eq(_, *a, **k): return _
+                      def execute(_):
+                          class R: pass
+                          r = R()
+                          if _.op == "del":
+                              outer.deleted.extend(getattr(_, "ids", [])); r.data = []; return r
+                          rows = [dict(x) for x in _.rows]
+                          if _.t == "items":
+                              outer.inserted.extend(rows)
+                              if outer.mode == "reversed": rows = list(reversed(rows))
+                              if outer.mode == "short":    rows = rows[:-1]
+                          r.data = rows; return r
+                  return _Q()
+          slots_in = [{"versions": [GR(f"标题{i}", f"正文{i}")], "ai_review_notes": f"note{i}"}
+                      for i in range(3)]
+          errs = []; sb = _ISB("reversed")
+          items, vers, _ = _mod._save_batch_results(sb, "b1", "u1", slots_in, "P：", errs)
+          assert not errs and len(items) == 3 and len(vers) == 3, (errs, len(items), len(vers))
+          notes = {r["id"]: r.get("ai_review_notes") for r in sb.inserted}
+          for i, v in enumerate(vers):
+              assert v["title"] == f"标题{i}", (i, v["title"])
+              assert notes[v["item_id"]] == f"note{i}", \
+                  f"第 {i} 篇挂到了别的 item 上 —— 按位置 zip 的老毛病"
+          errs = []; sb = _ISB("short")
+          items, vers, titles = _mod._save_batch_results(sb, "b1", "u1", slots_in, "P：", errs)
+          assert items == [] and vers == [] and titles == [], "回执缺行却继续往下走"
+          assert errs and "只回执 2/3" in errs[0], errs
+          assert len(sb.deleted) == 2, f"没回收已插的行: {sb.deleted}"
+          errs = []
+          items, vers, _ = _mod._save_batch_results(_ISB("ok"), "b1", "u1", slots_in, "P：", errs)
+          assert len(items) == 3 and len(vers) == 3 and not errs
+          print("  ✓ COR-002 回执逆序仍配对正确; 缺行→整批失败+回收, 不静默丢尾部")
+
+          # ══ COR-011: 同一 item 的多个违规 version 只标记一次 ════════════════
+          class _M:
+              def __init__(s): s.n = 0
+              def incr(s, k, v=1): s.n += v
+          calls = []
+          _orig_us = db.update_item_status
+          db.update_item_status = lambda c, i, st: calls.append(i)
+          try:
+              ivs = [{"item_id": "A", "title": "全网最低价", "body": "最好", "keywords": []},
+                     {"item_id": "A", "title": "最强", "body": "最", "keywords": []},
+                     {"item_id": "B", "title": "最快", "body": "", "keywords": []}]
+              e = []
+              _mod._run_hard_constraint_check(None, ivs, [{"content": "禁止出现'最'字"}], "P：", e, _M())
+              assert calls == ["A", "B"], f"重复标记了: {calls}"
+              assert len(e) == 3, f"警告应逐条给出, 实际 {len(e)}"
+          finally:
+              db.update_item_status = _orig_us
+          print("  ✓ COR-011 同一 item 只标记一次(警告仍逐条); 不再反复击穿 list_items 缓存")
+
+          print("\n审计第二批回归: 10/10 通过")
+          PY
+
       - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
         run: |
           # ⚠️ 这一步存在的理由: /health 里一个 `getattr(config, ...)` 因为
