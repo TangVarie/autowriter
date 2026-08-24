@@ -33,12 +33,21 @@ Procfile 已加 ``worker: python worker.py`` —— Render / Railway / Heroku �
 那种部署要另起一台常驻主机 (systemd / supervisor)。Supabase Edge Functions
 也不适用 (Deno 上限 ~2 分钟, 单 batch 经常 >10 分钟)。
 
-进度 (Phase 1)
-──────────────
-当前只注册 ``noop`` handler 做部署连通性验证 (领取 → 成功 → 写回)。
-``generate_batch`` / ``quick_gen`` handler —— 把 app.py 的生成编排逻辑搬进
-worker —— 是 Phase 2; 在那之前 Streamlit UI 仍走原 daemon thread 路径, 本
-worker 不影响现有行为。Phase 2 接入点见下方 ``# Phase 2 TODO``。
+已注册的 handler
+────────────────
+``noop``            部署连通性验证 (领取 → 成功 → 写回)
+``generate_batch``  跑一整个队列(多个 plan)
+``quick_gen``       跑单个 plan
+
+后两个靠 ``generation_service``(审计 ROB-001/002/SUP-011 从 app.py 搬出来的
+生成编排)。它们**不幂等** —— 见各自的 docstring 与
+``db.NON_IDEMPOTENT_JOB_KINDS``。
+
+⚠️ **Streamlit UI 目前仍走原来的 daemon thread 路径**, 还没改成入队。也就是说
+ROB-001(进程重启丢批次) / ROB-002(JWT 中途过期)在 UI 那条路上**还没关掉** ——
+这一步只是把 worker 这一侧准备好: handler 有了、进度回得来、不幂等有保护。
+把 UI 切过来是下一步, 那是**行为变更**(生成从"页面开着才跑"变成"关了页面也跑"),
+要单独推、单独验。
 """
 
 from __future__ import annotations
@@ -58,6 +67,11 @@ os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
 import config
 import db
 import telemetry
+# ⚠️ 必须在上面那行 AW_DISABLE_ST_CACHE 之后 —— generation_service 会 import db,
+# 而 db 的缓存 shim 在 import 期就决定走不走真的 st.cache_data(R-042)。
+# 顶层 import 而不是在 handler 里懒加载: worker 存在的全部意义就是跑这些
+# handler, 它 import 不动的话应该**开机就炸**, 而不是等到领到第一个 job。
+import generation_service as gen_service
 
 
 # ── 配置（全部从环境读, 带默认值）────────────────────────────────────────
@@ -111,14 +125,149 @@ def _noop_handler(job: dict, sb) -> dict:
     return {"ok": True, "echo": job.get("payload"), "worker": WORKER_ID}
 
 
-# ── Phase 2 TODO ──────────────────────────────────────────────────────────
-# 在这里 @register("generate_batch") / @register("quick_gen") 真正的 handler。
-# 前置: 把 app.py 里的生成编排(_save_batch_results / _run_semantic_dedup_pass /
-# _resolve_engine_sessions / _commit_session_tokens / _run_hard_constraint_check
-# / _resolve_queue_strategy 等)抽到一个不依赖 streamlit 的模块(例如
-# generation_service.py), 让 handler 能在 worker 进程里 import 复用。handler 内
-# 用 _report_progress(sb, job["id"], pct, msg) 写进度, UI 轮询 jobs 行展示。
-# 这步与 R-020(拆 app.py)天然重叠, 放 Phase 2 一起做。
+# ── Phase 2: 生成 handler ─────────────────────────────────────────────────
+# 前置(已完成): 生成编排搬到 generation_service.py, 不再依赖 streamlit。
+# 审计 ROB-001 / ROB-002 / SUP-011 见那个模块的文件头。
+
+
+class _JobStatus(dict):
+    """把编排写进 ``status`` 的进度, 镜像到 ``jobs`` 行上。
+
+    生成编排是拿一个 dict 当"进度总线"写的 —— Streamlit 那边把同一个对象放进
+    ``session_state``, UI 直接轮询它。worker 进程里没有 session_state, 所以用
+    一个 dict 子类把 ``progress`` / ``message`` 的写入转成
+    ``db.update_job_progress``, UI 改轮询 jobs 行就能看到同样的东西。
+
+    **为什么是 dict 子类而不是改编排的签名**: 编排里有几十处 ``status[...] =``,
+    换成回调要动的地方太多, 而这一步的全部价值是"行为没变"。子类让编排一行
+    不用改 —— 它拿到的仍然是个普通 dict。
+
+    ⚠️ **必须节流**。LLM 的 progress_callback 会几十上百次地写 ``progress``,
+    每次发一条 UPDATE 就是拿数据库当日志用: 一次批量生成能打出几千条写请求,
+    而 jobs 行只有一个整数百分比有意义。这里的判据是"整数百分比真的变了, 或者
+    离上次上报超过 ``_PROGRESS_MIN_INTERVAL`` 秒"。
+    """
+
+    _PROGRESS_MIN_INTERVAL = 3.0
+
+    def __init__(self, sb, job_id: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._sb = sb
+        self._job_id = job_id
+        self._last_pct = -1
+        self._last_at = 0.0
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if key in ("progress", "message", "current"):
+            self._maybe_report()
+
+    def _maybe_report(self) -> None:
+        # progress 是 [0,1] 的浮点; 队列模式没写 progress 时退回 current/total。
+        raw = self.get("progress")
+        if raw is None:
+            total = self.get("total") or 0
+            raw = (self.get("current") or 0) / total if total else 0.0
+        try:
+            pct = int(max(0.0, min(1.0, float(raw))) * 100)
+        except (TypeError, ValueError):
+            return
+        now = time.time()
+        if pct == self._last_pct and (now - self._last_at) < self._PROGRESS_MIN_INTERVAL:
+            return
+        self._last_pct, self._last_at = pct, now
+        try:
+            _report_progress(self._sb, self._job_id, pct, self.get("message"))
+        except Exception:
+            # 进度上报失败绝不能把生成本身弄挂 —— 那是本末倒置。
+            # db.update_job_progress 自己已经埋点了。
+            pass
+
+
+def _fresh_status(sb, job_id: str, **extra) -> "_JobStatus":
+    """编排期望的初始 status —— 与 app.py 里 UI 起线程时构造的那份保持一致。
+
+    ⚠️ 少一个 key 的后果是安静的: 编排里多处 ``status.setdefault(...)`` 会兜住,
+    但 UI 侧读不到就只是"什么都不显示"。所以这里照抄一份完整的。
+    """
+    base = {
+        "running": True, "done": False, "total": 0, "current": 0,
+        "message": "准备中…", "completed": [], "errors": [],
+        "warnings": [], "embedding_missing": [],
+        "phase": "starting", "_lock": threading.Lock(),
+    }
+    base.update(extra)
+    return _JobStatus(sb, job_id, base)
+
+
+def _job_result(status: dict, **extra) -> dict:
+    """把 status 收敛成落进 ``jobs.result`` 的那份摘要。
+
+    ``_lock`` 不能进去 —— 它是个 ``threading.Lock``, json 序列化直接抛,
+    而那会让一次**成功**的生成在写回结果时失败。
+    """
+    out = {
+        "errors": list(status.get("errors") or []),
+        "warnings": list(status.get("warnings") or []),
+        "embedding_missing": list(status.get("embedding_missing") or []),
+        "message": status.get("message"),
+    }
+    out.update(extra)
+    return out
+
+
+@register("generate_batch")
+def _generate_batch_handler(job: dict, sb) -> dict:
+    """跑一整个队列(多个 plan)。
+
+    ⚠️ **这个 job 不是幂等的**。每个 plan 跑完就往 items/versions 落库了, 重试
+    会把已经成功的那几个 plan 再生成一遍 —— 用户看到的是凭空多出来的重复内容,
+    而且没有任何地方会报错。所以:
+
+      · 入队时 ``max_attempts`` 必须是 1 —— ``db.insert_job`` 对
+        ``NON_IDEMPOTENT_JOB_KINDS`` 里的 kind 会强制改成 1;
+      · handler **不因为个别 plan 失败就抛异常** —— 那些失败已经记在
+        ``status["errors"]`` 里, 抛出去只会触发整批重跑。
+        只有"整批一步都没走成"(payload 坏了)才抛。
+
+    停止信号复用 worker 的 ``_shutdown``: 收到 SIGTERM 时编排会在两个 plan 之间
+    收手, 而不是被硬切断。容器滚动发布正是靠这个不丢半个批次。
+    """
+    payload = job.get("payload") or {}
+    plans = payload.get("plans")
+    if not isinstance(plans, list) or not plans:
+        raise ValueError("generate_batch 的 payload 里没有 plans —— 无法执行")
+    user_id = job.get("user_id")
+    if not user_id:
+        raise ValueError("generate_batch 的 job 没有 user_id")
+
+    status = _fresh_status(sb, job["id"], total=len(plans))
+    # queue_worker 是那个"保证 phase 一定落回 done"的外层 shim, 它吞掉一切异常。
+    # 这里正是要它这个性质 —— 见上面关于不幂等的说明。
+    gen_service.queue_worker(plans, user_id, sb, status, _shutdown)
+
+    completed = list(status.get("completed") or [])
+    return _job_result(status, plans=len(plans), completed=len(completed),
+                       stopped_early=_shutdown.is_set())
+
+
+@register("quick_gen")
+def _quick_gen_handler(job: dict, sb) -> dict:
+    """跑单个 plan(快速生成)。不幂等的理由与 generate_batch 相同。"""
+    payload = job.get("payload") or {}
+    plan = payload.get("plan")
+    if not isinstance(plan, dict) or not plan:
+        raise ValueError("quick_gen 的 payload 里没有 plan —— 无法执行")
+    user_id = job.get("user_id")
+    if not user_id:
+        raise ValueError("quick_gen 的 job 没有 user_id")
+
+    status = _fresh_status(sb, job["id"], progress=0.0,
+                           batch_id=None, saved_count=0, n_results=0)
+    gen_service.quick_gen_worker(plan, user_id, sb, status)
+    return _job_result(status, batch_id=status.get("batch_id"),
+                       saved_count=status.get("saved_count"),
+                       n_results=status.get("n_results"))
 
 
 def _report_progress(sb, job_id: str, pct: int, message: str | None = None) -> None:

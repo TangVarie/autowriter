@@ -4139,6 +4139,15 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# 这些 kind 的 handler **不幂等**: 每个 plan 跑完就往 items/versions 落库了。
+# 重试会把已经成功的那部分再生成一遍 —— 用户看到的是凭空多出来的重复内容,
+# 而且没有任何地方会报错(job 那边看起来只是"重试了一次然后成功")。
+#
+# 所以入队时强制 max_attempts=1。真正的失败要人看见、由人决定重跑哪一段,
+# 不能由退避重试自动来。(审计 ROB-001 / SUP-011)
+NON_IDEMPOTENT_JOB_KINDS = frozenset({"generate_batch", "quick_gen"})
+
+
 def insert_job(
     client: Client,
     kind: str,
@@ -4148,7 +4157,11 @@ def insert_job(
     priority: int = 0,
     max_attempts: int = 3,
 ) -> dict:
-    """入队一个 job（UI 侧用 authed client; RLS 要求 user_id = auth.uid()）。"""
+    """入队一个 job（UI 侧用 authed client; RLS 要求 user_id = auth.uid()）。
+
+    ⚠️ ``kind`` 在 ``NON_IDEMPOTENT_JOB_KINDS`` 里时, ``max_attempts`` 会被
+    强制成 1 —— 理由见那个常量上面那段。
+    """
     row: dict[str, Any] = {
         "kind": kind,
         "payload": payload or {},
@@ -4158,6 +4171,13 @@ def insert_job(
     }
     if project_id:
         row["project_id"] = project_id
+    if kind in NON_IDEMPOTENT_JOB_KINDS and int(max_attempts) != 1:
+        # 见 NON_IDEMPOTENT_JOB_KINDS 的说明。这里【直接改掉】而不是抛错:
+        # 调用方多半只是没传 max_attempts, 用了签名上那个 3 的默认值; 为这个
+        # 拒绝入队会让生成整个用不了, 而重试的后果是凭空多出重复内容。
+        telemetry.log_event("job_max_attempts_forced", kind=kind,
+                            requested=int(max_attempts))
+        row["max_attempts"] = 1
     res = client.table("jobs").insert(row).execute()
     return _first_row(res, "入队任务", kind=kind, user_id=user_id)
 
