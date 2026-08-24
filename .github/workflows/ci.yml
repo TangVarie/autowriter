@@ -15,6 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 要历史: tests/test_generation_service.py 会 git show 搬迁前的 app.py,
+          # 逐字节比对"这次搬家真的没改逻辑"。默认的 depth=1 取不到父提交,
+          # 那条断言会 skip —— 而它恰好是这一步唯一有价值的那条。
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -1222,8 +1227,17 @@ jobs:
           print("  ✓ COR-022 engines 去重保序; 单引擎路径不变; 空 engines 不炸")
 
           # ══ COR-002: slot ↔ item 配对不能靠返回顺序, 缺行不能静默丢 ═════════
-          # app.py 是 streamlit 脚本(顶层会跑 UI), 只把这两个纯函数取出来跑。
-          _tree = ast.parse(open("app.py", encoding="utf-8").read())
+          # 这两个纯函数原来在 app.py, 审计 ROB-001/002 之后搬到了
+          # generation_service.py。不写死文件名 —— 在候选里找, 找不到就报错,
+          # 免得下次再搬的时候这条断言变成静默跳过。
+          def _srcfile(fn_name):
+              for _f in ("generation_service.py", "app.py"):
+                  _t = ast.parse(open(_f, encoding="utf-8").read())
+                  if any(isinstance(x, ast.FunctionDef) and x.name == fn_name
+                         for x in _t.body):
+                      return _f
+              raise AssertionError(f"哪个文件里都找不到顶层函数 {fn_name}")
+          _tree = ast.parse(open(_srcfile("_save_batch_results"), encoding="utf-8").read())
           _mod = types.ModuleType("appfrag")
           _mod.__dict__.update(db=db, validator=validator, telemetry=telemetry, uuid=uuid)
           for _n in _tree.body:
@@ -1312,19 +1326,25 @@ jobs:
           FAIL = []
 
           def _app_func_src(name):
-              """按名字从 app.py 里切出一个函数的源码。
+              """按名字切出一个顶层函数的源码。
 
               app.py 不能 import —— 它一被 import 就开始跑 streamlit 脚本。所以读文本 +
               走 ast 定位: 按缩进找边界会被**跨行的函数签名**骗到(那个 `) -> None:`
               也顶格), 直接把函数截在签名处。
+
+              生成编排在审计 ROB-001/002 之后搬去了 generation_service.py, 所以两个
+              文件都找一遍。找不到要报错, 不能静默返回空串 —— 那样下面每一条
+              `assert "xxx" in src` 都会变成假绿。
               """
-              src = open("app.py", encoding="utf-8").read()
-              tree = ast.parse(src)
-              fn = next((n for n in tree.body
-                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                         and n.name == name), None)
-              assert fn is not None, f"app.py 里找不到顶层函数 {name}"
-              return "\n".join(src.splitlines()[fn.lineno - 1:fn.end_lineno])
+              for path in ("generation_service.py", "app.py"):
+                  src = open(path, encoding="utf-8").read()
+                  tree = ast.parse(src)
+                  fn = next((n for n in tree.body
+                             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                             and n.name == name), None)
+                  if fn is not None:
+                      return "\n".join(src.splitlines()[fn.lineno - 1:fn.end_lineno])
+              raise AssertionError(f"app.py / generation_service.py 里都找不到顶层函数 {name}")
 
 
           def check(name, fn):
@@ -1832,16 +1852,19 @@ jobs:
 
 
           def t_sup005_callsites():
-              src = open("app.py", encoding="utf-8").read()
+              # 两个调用点在 _queue_worker_impl 与 _quick_gen_worker 里, 它们在
+              # 审计 ROB-001/002 之后搬去了 generation_service.py。
+              F = "generation_service.py"
+              src = open(F, encoding="utf-8").read()
               assert src.count("prepare_soft_context(") == 2, \
-                  "app.py 的两个调用点没有都改成复用一次算好的 ctx 向量"
+                  f"{F} 的两个调用点没有都改成复用一次算好的 ctx 向量"
               tree = ast.parse(src)
               for node in ast.walk(tree):
                   if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                           and node.func.attr == "filter_soft_by_relevance"):
                       kws = {k.arg for k in node.keywords}
                       assert "context" in kws, \
-                          f"app.py:{node.lineno} 的 filter_soft_by_relevance 没传 context, 又会多发一次 embedding"
+                          f"{F}:{node.lineno} 的 filter_soft_by_relevance 没传 context, 又会多发一次 embedding"
 
 
           # ══════════════════════════════════════════════════════════════════
@@ -2279,7 +2302,9 @@ jobs:
               assert biggest <= 100, f"单次 .in_() 塞了 {biggest} 个 id"
 
               # ② 两个记忆表都空 → 一次 embedding 都不发
-              src_app = open("app.py", encoding="utf-8").read()
+              # (调用点随 _queue_worker_impl / _quick_gen_worker 搬到了
+              #  generation_service.py, 审计 ROB-001/002)
+              src_app = open("generation_service.py", encoding="utf-8").read()
               tree = ast.parse(src_app)
               calls = [n for n in ast.walk(tree)
                        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -2289,7 +2314,7 @@ jobs:
                   parent = next((n for n in ast.walk(tree)
                                  if isinstance(n, ast.IfExp) and any(x is c for x in ast.walk(n))), None)
                   assert parent is not None, \
-                      f"app.py:{c.lineno} 的 prepare_soft_context 是无条件调用的 —— " \
+                      f"generation_service.py:{c.lineno} 的 prepare_soft_context 是无条件调用的 —— " \
                       "无记忆的项目每批都会白发一次 embedding(codex P2)"
 
 
@@ -2533,6 +2558,11 @@ jobs:
           import dedup, db, generator, memory, image_handler, exporter, projects
           import librarian_client  # R-032: TV 飞轮馆员 pull 客户端(import 安全, 用 requests)
           import worker  # R-018: 后台 worker 入口(import 安全, main() 在 __main__ 守卫内)
+          # 生成编排(审计 ROB-001/002/SUP-011/SUP-012 从 app.py 搬出来的)。
+          # 它能被这一步 import 本身就是那次搬迁的意义: app.py 一 import 就开始跑
+          # streamlit 脚本, 所以下面那行注释说"不 import app.py" —— 而编排逻辑
+          # 现在不在 app.py 里了, worker 进程才拿得到它。
+          import generation_service
           # deskcore: 逻辑层要能 import(它复用 db/memory/dedup/clients/librarian_client)。
           # app.py 不 import —— 那个要 fastapi + mcp SDK, 属 deskcore/requirements.txt
           # 的增量依赖, 主 lockfile 里没有。
