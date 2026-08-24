@@ -404,12 +404,18 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
 
         def _probe(i: int):
             r = by_idx.get(i) or {}
+            # NUMERIC 在 PostgREST 上可能回数字也可能回字符串, float() 两种都吃。
+            # open_exact 不看它自己的布尔值而是看 open_title 有没有 ——
+            # 万一布尔被序列化成字符串, `bool("false")` 是 True, 而
+            # opening_exact 是**单独就判死**的最强信号, 没有任何东西兜得住
+            # 这个误伤。RPC 里那一列本来就是 `open_title IS NOT NULL` 算出来的,
+            # 这么取口径完全一致, 只是不依赖布尔的传输形态。
             return (
                 float(r.get("best_sim") or 0.0),
                 r.get("sim_title"),
                 float(r.get("best_j") or 0.0),
                 r.get("j_title"),
-                bool(r.get("open_exact")),
+                r.get("open_title") is not None,
                 r.get("open_title"),
             )
 

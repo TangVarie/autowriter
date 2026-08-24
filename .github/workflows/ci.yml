@@ -1509,6 +1509,23 @@ jobs:
                   raise AssertionError("回执少一篇却按'没撞车'放行了 —— 查重不能这样 fail-open")
 
 
+          def t_sup002_bool_shape():
+              """open_exact 不看布尔的传输形态 —— `bool("false")` 是 True, 而开头精确
+              撞车是**单独就判死**的最强信号, 误伤没有任何东西兜得住。"""
+              def _rpc(a):
+                  return [{"idx": 0, "best_sim": 0, "sim_title": None,
+                           # 故意造成"字符串假值 + 没有命中标题"
+                           "best_j": "0", "j_title": None,
+                           "open_exact": "false", "open_title": None}]
+              sb = _SB(rows={"draft_fingerprints": [{"id": "f1", "project_id": "p1"}]},
+                       rpc_impl={"deskcore_check_drafts": _rpc})
+              r = C.check_drafts(sb, "p1", _DRAFTS)["results"][0]
+              assert r["signals"]["opening_exact_match"] is False, r
+              assert r["status"] == "pass", r
+              # NUMERIC 回字符串时也要能算
+              assert r["signals"]["body_ngram_jaccard"] == 0.0, r
+
+
           def t_sup002_no_fail_open():
               """查重是硬闸: 除了"RPC 不存在", 任何错误都必须上抛, 不能静默放行。"""
               class _Boom(_SB):
@@ -1974,6 +1991,7 @@ jobs:
               ("SUP-002 RPC 没部署时退回 Python 路径, 两条路径结论一致", t_sup002_fallback_equivalence),
               ("SUP-002 权限错必须上抛 —— 查重不 fail-open", t_sup002_no_fail_open),
               ("SUP-002 回执缺行必须报错, 不能退化成 pass", t_sup002_partial_result),
+              ("SUP-002 open_exact 不受布尔/数字的传输形态影响", t_sup002_bool_shape),
               ("ROB-004 /health 走私有线程额度 + 墙钟上限, 不与工具抢池子", t_rob004_health_pool),
               ("ROB-011 回填逐页消费, 峰值与项目历史总量无关", t_rob011_streaming),
               ("SUP-004 list_projects 查询次数与项目数无关; 不再为计数拉向量", t_sup004),
@@ -1992,7 +2010,7 @@ jobs:
           print()
           if FAIL:
               raise SystemExit("审计第三批回归 FAILED:\n  - " + "\n  - ".join(FAIL))
-          print("审计第三批回归: 17/17 通过")
+          print("审计第三批回归: 18/18 通过")
           PY
       - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
         run: |
