@@ -45,9 +45,17 @@ def _safe(fn, *args, **kwargs) -> Any:
 
     判据: 失败之后【调用方还会不会当作成功继续往下走】。会 → 不能包。
     (codex review round-5 P1 ×2: open_project 与 record_rule 都踩了这一条)
+
+    ⚠️ 【归属校验的拒绝不在兜底范围内】(审计 COR-015)。_safe 兜的是**瞬时**故障
+    —— 网络抖、服务没配、库慢, 少点参考不影响写稿。PermissionError 不是这一类:
+    它重试一万次也一样, 而包成"只多一个 error 字段的正常结果"会让调用方模型
+    继续拿同一个错 project_id 去试下一个工具, 也让 REST 层的 403 变得只对一部分
+    工具成立。所以原样上抛。
     """
     try:
         return fn(*args, **kwargs)
+    except PermissionError:
+        raise
     except Exception as exc:  # noqa: BLE001 — 故意兜底
         logger.exception("%s failed", getattr(fn, "__name__", fn))
         return {"error": f"{type(exc).__name__}: {exc}"[:300],
@@ -58,13 +66,16 @@ def _safe(fn, *args, **kwargs) -> Any:
 # 写稿前
 # ══════════════════════════════════════════════════════════════════════
 
-def list_projects() -> dict:
-    """列出所有可写作的项目, 以及每个项目手上有多少积累。
+def list_projects(_user_id: str | None = None) -> dict:
+    """列出【你名下】的项目, 以及每个项目手上有多少积累。
 
     返回 project_id / 名称 / 品牌 / 已沉淀的硬规则与软偏好条数 / 历史成稿指纹数。
     不知道要写哪个项目时先调这个。
+
+    这里看不到的项目就是不归你 —— 不要去猜别人的 project_id 试, 其它工具会拒绝。
     """
-    return _safe(lambda: {"projects": core.list_projects(core.sb())})
+    return _safe(lambda: {"projects": core.list_projects(core.sb(),
+                                                         user_id=_user_id)})
 
 
 def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
@@ -125,7 +136,7 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
 
 def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
                    key_messages: str = "", target_audience: str = "",
-                   tone: str = "") -> dict:
+                   tone: str = "", _user_id: str | None = None) -> dict:
     """向帆谷飞轮图书馆借几张【真实爆款】的经验卡。
 
     这些卡来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
@@ -137,7 +148,7 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
 
     库里没有合适的卡时返回空列表, 这不是错误, 照常写就行。
     """
-    return _safe(core.borrow_lessons, core.sb(), project_id,
+    return _safe(core.borrow_lessons, core.sb(), project_id, user_id=_user_id,
                  tactic=tactic, draft_topic=draft_topic,
                  key_messages=key_messages, target_audience=target_audience,
                  tone=tone)
@@ -147,7 +158,8 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
 # 写稿后
 # ══════════════════════════════════════════════════════════════════════
 
-def check_drafts(project_id: str, drafts: list[dict]) -> dict:
+def check_drafts(project_id: str, drafts: list[dict],
+                 _user_id: str | None = None) -> dict:
     """查重硬闸。成稿后【必须】调这个才能交付。
 
     drafts 传 [{"title": "...", "body": "...", "angle_key": "..."}, ...]
@@ -175,7 +187,7 @@ def check_drafts(project_id: str, drafts: list[dict]) -> dict:
     这个工具出错会直接报错而不是放行 —— 查重挂了必须停下来, 不能当作通过。
     """
     # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。
-    return core.check_drafts(core.sb(), project_id, drafts)
+    return core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id)
 
 
 def commit_drafts(project_id: str, drafts: list[dict],
@@ -327,12 +339,20 @@ def save_my_style(project_id: str, notes: str,
 
 # 工具注册表 —— app.py 和 cli.py 共用。
 # 值 = (函数, 是否需要服务端注入调用者身份)
+#
+# ⚠️ 审计 COR-015 之后【全部为 True】, 而且应该一直是 True。原来
+# list_projects / borrow_lessons / check_drafts 三个是 False —— 那不是省事,
+# 那是"这三个工具连调用者是谁都不问"的直接写照, 也正是越权读的入口:
+#   · list_projects  → 全库项目台账 + 一批可以拿去喂别的工具的 project_id
+#   · check_drafts   → 返回值回显撞车对象的标题, 等于一个历史标题读取接口
+#   · borrow_lessons → 发给馆员的 brief 是拿项目行拼的(品牌/定位/战术)
+# 新增工具时默认写 True; 想写 False 就得先说明它凭什么不需要知道是谁在调。
 TOOLS = {
-    "list_projects":  (list_projects,  False),
+    "list_projects":  (list_projects,  True),
     "open_project":   (open_project,   True),
     "draw_angles":    (draw_angles,    True),
-    "borrow_lessons": (borrow_lessons, False),
-    "check_drafts":   (check_drafts,   False),
+    "borrow_lessons": (borrow_lessons, True),
+    "check_drafts":   (check_drafts,   True),
     "commit_drafts":  (commit_drafts,  True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),

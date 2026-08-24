@@ -192,7 +192,7 @@ with anyio.fail_after(0.3):
 | 条目 | 状态 | 说明 |
 |---|---|---|
 | SUP-024 · 建 pytest 地基 | ✅ 已做 | 见下 |
-| COR-015 · deskcore 归属校验 | 待做 | 按 `projects.owner_id` 隔离（读写两侧都要） |
+| COR-015 · deskcore 归属校验 | ✅ 已做 | 按 `projects.owner_id` 隔离（读写两侧都校验），见下 |
 | COR-014 · bottom-k 长短稿失真 | 待做 | 先量化现状漏检率，再改标准 bottom-k 估计 |
 | ROB-001/002 + SUP-011/012 · 抽 `generation_service.py` | 待做 | 搬家本体，靠上面的地基兜底 |
 | SUP-010 · DDL 挪出 `db.py` | 待做 | 侦察发现**没有任何代码执行 `CREATE_TABLES_SQL`**，比预想简单 |
@@ -232,6 +232,39 @@ xfail 会变成 **XPASS 失败**，逼下一个人把标记摘掉、变成真正
 只有 `MODEL_CONTEXT_WINDOWS`（那是**输入**窗口），没有任何一张表记录 per-model 的 max output。
 改成断言那个缺失的前提之后才真的红。这和 §0.4 学到的是同一件事的另一面：
 **断言要钉住"被禁止的形态"，不是"我以为的当前数值"**。
+
+#### COR-015 —— deskcore 按 `owner_id` 隔离
+
+产品决策已定（2026-08-24）：**按 `projects.owner_id` 隔离，读写两侧都校验**。完整口径写在 `docs/deskcore.md` §2.2.1，这里只记实现上的判断。
+
+**这条的严重度不在"能读到别人的项目名"，在于三个 `needs_user=False`。** 十一个工具里，`list_projects` / `borrow_lessons` / `check_drafts` 连"调用者是谁"这个参数都没有——不是拿到了不用，是根本不问。它们串起来是一条完整的越权链：
+
+1. `list_projects` 返回**全库**项目台账，顺带给出一批可以喂给其它工具的 `project_id`；
+2. `check_drafts` 的返回值回显撞车对象的**标题**——拿一篇随便什么稿子去撞，就是一个可反复调用的历史标题读取接口；
+3. `borrow_lessons` 发给馆员的 brief 是拿项目行拼的（品牌 / 定位 / 战术）。
+
+而写侧（`commit_drafts` / `record_rule` / `draw_angles`）虽然拿到了 `user_id`，却只用它读个人层，从不核对项目归谁。
+
+**做法：判据只写一处。** `core.assert_project_access` 是唯一实现，九个项目级入口以它开头，`TOOLS` 里 `needs_user` 全部改成 True。收敛成一处不是洁癖——归属是**会变的产品决策**（今天按 owner，明天可能按团队成员表），散在十一个工具里意味着改口径要改十一处，而漏掉的那一处不会报错，只会继续放行。
+
+四个具体判断，都不是显然的：
+
+| 判断 | 为什么 |
+|---|---|
+| 校验函数**返回项目整行** | `build_writing_brief` / `draw_angles` / `my_style` / `borrow_lessons` 本来就要读项目行。只回 True/False 的话，这四条最热的路径每次多一个来回 |
+| 拒绝映射成 **403 而不是 500** | 500 对调用方的意思是"服务端坏了，待会儿重试"，于是模型会拿同一个错 `project_id` 一直试；而且正常的权限拒绝会去污染错误监控 |
+| `_safe` **不再吞** `PermissionError` | `_safe` 兜的是瞬时故障（少点参考不影响写稿）。权限拒绝重试一万次也一样，包成"只多一个 error 字段的正常结果"会让模型继续拿同一个错 id 试下一个工具，也让 403 只对一部分工具成立 |
+| CLI 的 `backfill` / `reembed` **刻意不校验** | 它们是运维命令，跑的人手里握着 service_role key（等价于直连库）。加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉。边界在 MCP/REST 那一面 |
+
+顺带修掉一处死代码：`db.get_project` 用的是 `.single()`，PostgREST 在 0 行时回 406、postgrest-py 抛 APIError——也就是说它**从不返回 None**，四个调用点里那句 `if project is None: raise ValueError("project not found")` 从来没执行过，传错 `project_id` 拿到的是一条看不懂的 406。归属校验必须区分"项目不存在"（可能只是 id 抄错）和"项目不是你的"，所以换成 `store.project_row`（`limit(1)`）+ 独立的 `ProjectNotFound`（`ValueError` 的子类，老的 `except ValueError` 不会漏接）。
+
+**回归写在 `tests/` 而不是新的 heredoc 块** —— 这是上一步建地基的第一次兑现。26 条用例分三组：判据本身、每个入口都过了闸、拒绝不会被吞掉。其中最有价值的一条是 AST 遍历：
+
+> 归属校验最典型的失效方式不是判据写错，而是**新加了个工具忘了加校验**——而那不会报错，只会继续放行。
+
+那条断言钉的是【被禁止的形态】（"一个项目级入口的 body 里找不到这个调用"），不是当前代码长什么样：加工具忘了校验会红，重构参数顺序不会误报。另外 403 的运行期断言放在 `ci.yml` 的 app 冒烟步——`app.py` 需要 fastapi，而跑 pytest 那一步只装 `requirements.lock`（§0.3 里那条边界）。
+
+**修完之后回头改了 11 处旧断言。** 那些块里的假件不带 `projects` 表、调用不传 `user_id`，全部变红——不是回归，是它们验的东西（SUP-002 的下推、SUP-004 的查询次数、round-8 的蒸馏闭环）本来就不涉及归属。给假件兜一行项目、给调用补上身份即可。这件事本身值得记：**一道横切所有入口的校验，代价就是所有既有测试的构造都要跟着变**——如果那个代价大到让人想跳过，多半说明校验加在了错误的层。
 
 ---
 

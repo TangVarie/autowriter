@@ -52,6 +52,11 @@ python -m deskcore.cli selftest    # 不装 supabase/anthropic 也能跑
 继续往下走，会就不能包。`check_drafts` 更不能，查重出错必须抛：静默放行就是重演
 `config.py:132` 那个 `ENABLE_DEDUP_REGEN` 默认关着、查重跑了但不拦的老问题。
 
+**归属拒绝不在 fail-open 范围内**（审计 COR-015）。`_safe` 兜的是瞬时故障；
+`PermissionError` 重试一万次也一样，包成"看起来成功"会让调用方模型继续拿同一个错
+`project_id` 去试下一个工具。REST 层把它映射成 **403**——401 = key 没过，
+403 = key 过了但项目不是你的，500 = 服务端真的坏了。
+
 **别在 `deskcore/__init__` 之前 import db。** 它要先设 `AW_DISABLE_ST_CACHE=1`
 （R-042，同 `worker.py:56`），否则 headless 进程会拿 `st.cache_data` 的 30-60s 旧数据。
 

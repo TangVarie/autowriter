@@ -50,6 +50,72 @@ def sb():
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 归属校验(审计 COR-015)
+# ══════════════════════════════════════════════════════════════════════
+
+class ProjectNotFound(ValueError):
+    """project_id 在库里没有这一行。多半是 id 抄错, 不是权限问题。
+
+    与 PermissionError 分开是有意的: 「不存在」和「不是你的」对调用方是两种
+    完全不同的下一步(改 id / 换项目), 混成一种会让人反复试同一个错 id。
+    """
+
+
+def assert_project_access(client, project_id: str, *,
+                          user_id: str | None) -> dict:
+    """**整套项目归属校验的唯一实现**。通过则返回项目整行。
+
+    审计 COR-015: 在此之前 deskcore 对 project_id 【没有任何归属校验】——
+    ``check_drafts`` / ``borrow_lessons`` / ``list_projects`` 连调用者是谁都不问,
+    其余工具虽然拿到了 user_id 却只用它读个人层, 从不核对项目归谁。于是任一
+    持有效 key 的调用方传入他人 project_id 就能:
+
+      · 读他人项目的全部成稿标题(``check_drafts`` 的 ``collided_with`` 会回显);
+      · 往他人项目写指纹、写角度台账、写团队共享的 hard 规则。
+
+    ``deskcore/store.py`` 原来明写着"不按 owner 过滤"是设计选择(项目规则团队
+    共享)。本条指出的不是那个选择本身错, 而是它的代价: 整套隔离就只剩 key 这
+    一层, 而 key 这一层有 ROB-003(配错就全开)。产品决策已定 —— **按
+    ``projects.owner_id`` 隔离**, 读写两侧都校验。
+
+    ── 为什么收敛成一个函数 ──────────────────────────────────────────
+    归属口径是**产品决策**, 会变(今天按 owner, 明天可能按团队成员表)。散在十
+    一个工具里就意味着改口径要改十一处, 而漏掉的那处不会报错, 只会继续放行。
+    所以: 判据只写在这里, 将来换模型**只改这个函数体** —— 加一张
+    ``project_members`` 表就是把下面那个 ``!=`` 换成一次成员查询, 调用方一行不动。
+
+    ── 为什么 user_id 缺失是拒绝而不是放行 ────────────────────────────
+    与 ROB-003 同一口径: 身份识别不出来时, "放行"意味着一个配置疏忽就等于把
+    全部租户的项目数据开放出去。匿名 dev 模式(``DESKCORE_ALLOW_ANONYMOUS=1``)
+    要能用就得同时配 ``DESKCORE_DEFAULT_USER_ID`` —— 那本来就是它该配的东西
+    (identity.py 的 ``resolve`` 就是这么回的), 否则个人层(正负例/调校笔记)一样
+    读不出东西。
+    """
+    if not project_id or not str(project_id).strip():
+        raise ProjectNotFound("project_id 不能为空")
+    if not user_id:
+        raise PermissionError(
+            "无法识别调用者身份, 拒绝访问项目数据 —— deskcore 持 service_role "
+            "绕过 RLS, 认不出人就等于对所有租户开放。服务端要配 DESKCORE_KEYS "
+            "(推荐)或 DESKCORE_API_KEY + DESKCORE_DEFAULT_USER_ID; 本地匿名 dev "
+            "模式也要配 DESKCORE_DEFAULT_USER_ID。")
+
+    project = store.project_row(client, project_id)
+    if project is None:
+        raise ProjectNotFound(f"project not found: {project_id}")
+
+    # ↓↓↓ 换归属模型时【只改这三行】↓↓↓
+    owner = project.get("owner_id")
+    if str(owner or "") != str(user_id):
+        raise PermissionError(
+            f"project {project_id} 不属于当前调用者, 拒绝访问。"
+            "deskcore 按 projects.owner_id 隔离 —— 项目规则在同一 owner 的项目"
+            "之间共享, 跨 owner 不共享。project_id 是不是传错了?")
+    # ↑↑↑ 换归属模型时【只改这三行】↑↑↑
+    return project
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 写作简报
 # ══════════════════════════════════════════════════════════════════════
 
@@ -105,9 +171,9 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     唯一改动的语义(隔离口径: 项目规则团队共享 + 个人风格私有)。
     """
     brief = brief or {}
-    project = db.get_project(client, project_id)
-    if project is None:
-        raise ValueError(f"project not found: {project_id}")
+    # 归属校验 + 取项目行一次搞定 —— 这里本来就要 db.get_project, 所以 COR-015
+    # 的校验在这条路径上【不多发一次查询】。
+    project = assert_project_access(client, project_id, user_id=user_id)
 
     hard, soft = store.shared_memories(client, project_id, user_id)
     pool = store.labeled_examples(client, project_id, "positive", user_id)
@@ -219,11 +285,12 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     LLM 会锁定更具体的平台标签、把项目的 role 降级成"风格提示"。修法照注释里
     留的那条路: **切入角度优先用项目自己的 custom_roles**, 没配才用通用池。
     """
+    # 归属校验放在 n<=0 的早返回【之前】: 每个项目级入口都以这一行开头, 才能在
+    # CI 里用一条断言把"有没有漏掉某个工具"验死。代价是 n=0 时多一次查询,
+    # 而 n=0 本来就是退化调用。(审计 COR-015)
+    project = assert_project_access(client, project_id, user_id=user_id)
     if n <= 0:
         return {"angles": [], "requested": 0, "delivered": 0}
-    project = db.get_project(client, project_id)
-    if project is None:
-        raise ValueError(f"project not found: {project_id}")
 
     custom = project.get("custom_roles") or []
     if isinstance(custom, str):
@@ -469,13 +536,19 @@ def _rpc_missing_telemetry(name: str, project_id: str) -> None:
         pass
 
 
-def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
+def check_drafts(client, project_id: str, drafts: list[dict],
+                 *, user_id: str | None = None) -> dict:
     """比对全量历史 + 本批内互比。
 
     ⚠️ deskcore 唯一【不 fail-open】的路径。其它读类工具出错返回可用结构不阻塞
     写稿, 但查重挂了必须抛 —— 静默放行就是重演 config.py:132 那个
     ENABLE_DEDUP_REGEN 默认 "0"、查重跑了但不拦的老问题。
+
+    ⚠️ 这是审计 COR-015 里【读侧最要命的那个】: 返回值的 ``collided_with`` 会回显
+    撞车对象的**标题**。没有归属校验时, 拿一篇随便什么稿子去撞别人的项目, 就是
+    一个可以反复调用的历史标题读取接口。所以 user_id 现在是必需的。
     """
+    assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
         return {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
 
@@ -620,6 +693,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     写入的同一个事务里关掉。被判撞车的条目【不入库】, 在返回值的 rejected 里
     列出来, 调用方要让用户重写。
     """
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
 
@@ -737,6 +811,11 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
                          progress=None) -> dict:
     """给指纹库里缺标题向量的行补上向量。
 
+    ⚠️ 【故意没有归属校验】(审计 COR-015)。它和 backfill 一样不是 MCP 工具 ——
+    只有 CLI 能调, 而跑 CLI 的人手里握着 service_role key(等价于直连库)。在这儿
+    加一道 owner 校验挡不住任何人, 只会挡住"帮同事补一下向量"这类正当运维,
+    还会给人一种"运维路径也隔离了"的错觉。隔离边界在 MCP/REST 那一面。
+
     **和 backfill 是两件事, 别混。** backfill 把 autowriter.versions 里的历史
     成稿【搬进】指纹库; reembed 修的是【已经在指纹库里、但当时没取到向量】的行。
     后者 backfill 够不着 —— 它扫的是 items × versions, 而 WorkBuddy 写的稿子
@@ -782,6 +861,8 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
 def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = True,
                           chunk: int = 50, progress=None) -> dict:
     """把项目的历史成稿补进指纹库。**部署后每个项目必跑一次。**
+
+    ⚠️ 【故意没有归属校验】—— 理由同 reembed_fingerprints, 见那边。
 
     为什么必须有: migrations/001 建的是【空表】, 而 check_drafts 只读这张表、
     只有 commit_drafts 会往里写。不回填的话, 上线第一天号称"比对全量历史"的
@@ -926,6 +1007,10 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     force_confirmed=True: 这条路径是用户明确说「以后都这样」才走的, 不需要
     频次阈值(那是给自动抽取的候选留人工复核用的)。
     """
+    # 审计 COR-015。scope='global' 时 project_id 其实不参与写入, 但照样校验 ——
+    # 规则是"每个项目级入口都以这一行开头", 留例外就等于留一个以后会被忘掉的
+    # 缺口, 而这里的代价只是一次主键查询。
+    assert_project_access(client, project_id, user_id=user_id)
     content = (content or "").strip()
     if not content:
         raise ValueError("rule content must not be empty")
@@ -987,6 +1072,7 @@ def record_edit(client, project_id: str, *, user_id: str,
     对子。没改就通过的稿子【不算教学材料】—— memory.py:1191-1194 明确拒绝从
     那里学, 理由是模型会从偶然选择里编造风格规则。
     """
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not (my_title or my_body):
         raise ValueError("my_title/my_body must not both be empty")
     if ((ai_title or "").strip() == (my_title or "").strip()
@@ -1081,6 +1167,7 @@ def save_my_style(client, project_id: str, notes: str, *, user_id: str,
     笔记【不等于】吸收了那些待处理的精修, 顺手把它们标掉会让它们静默消失。
     (codex review #56 P1)
     """
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     notes = (notes or "").strip()
     if not notes:
         raise ValueError("notes 不能为空 —— 空笔记会把已有的个人风格清掉")
@@ -1139,7 +1226,8 @@ def label_example(client, item_id: str, label: str | None,
 
 def my_style(client, project_id: str, *, user_id: str) -> dict:
     """我在这个项目上的风格资产。"""
-    project = db.get_project(client, project_id)
+    # 校验 + 取行一次搞定(原来这里就要 get_project)。审计 COR-015
+    project = assert_project_access(client, project_id, user_id=user_id)
     shared = (project or {}).get("calibration_notes") or ""
     mine, updated = store.get_user_calibration(client, project_id, user_id)
     pending = store.count_pending_distillation(client, project_id, user_id)
@@ -1178,23 +1266,31 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
 # 飞轮经验卡(转调 TV 馆员)
 # ══════════════════════════════════════════════════════════════════════
 
-def borrow_lessons(client, project_id: str, **delta) -> dict:
+def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
+                   **delta) -> dict:
     """复用 librarian_client 的 build_brief + fetch_flywheel_lessons(R-032)。
 
     那边已经处理好 fail-open(超时/非 200/未配 → [], 绝不阻塞写稿)和 brief 的
     字段集对齐(docs/15 §0 契约)。这里只做项目查询 + 转发。
+
+    ⚠️ 借来的经验卡本身是公司公共资产, 但**发给馆员的 brief 是拿项目行拼的**
+    (品牌 / 定位 / 战术), 所以入口照样要校验归属 —— 否则它就成了一个"用别人的
+    project_id 就能读出那个项目怎么定位"的接口。(审计 COR-015)
     """
-    project = db.get_project(client, project_id)
-    if project is None:
-        raise ValueError(f"project not found: {project_id}")
+    project = assert_project_access(client, project_id, user_id=user_id)
     brief = librarian_client.build_brief(project, **delta)
     brief["consumer"] = "deskcore"
     selected = librarian_client.fetch_flywheel_lessons(brief)
     return {"lessons": selected, "count": len(selected)}
 
 
-def list_projects(client) -> list[dict]:
-    """项目清单 + 每个项目手上有多少料。
+def list_projects(client, *, user_id: str | None = None) -> list[dict]:
+    """**我的**项目清单 + 每个项目手上有多少料。
+
+    审计 COR-015: 这个清单原来返回**全库所有项目**(名称/品牌/owner_id/规则条数/
+    指纹数), 而且是三个 needs_user=False 的工具之一 —— 也就是任一持有效 key 的
+    调用方都能把整个库的项目台账拉出来, 顺带拿到一批可以喂给其它工具的
+    project_id。现在按 owner 过滤, 判据收在 ``assert_project_access`` 的同一处口径。
 
     审计 SUP-004: 原来每个项目发 2 次查询(规则一次 + 指纹 count 一次), 40 个
     项目 = 81 次往返 —— 而这是模型最常调的第一个工具, 每次开工都要等它。
@@ -1202,10 +1298,15 @@ def list_projects(client) -> list[dict]:
     规则的 **768 维 embedding** 一起拉回来, 而这里只用了两个 len()。
 
     现在是【3 次固定查询】: 项目清单 + 规则批量计数 + 指纹批量计数, 与项目
-    个数无关。指纹计数走 migrations/004 的 RPC(PostgREST 不会 GROUP BY);
+    个数无关(加 owner 过滤不改变这个性质 —— 它只是第一次查询多一个 .eq)。
+    指纹计数走 migrations/004 的 RPC(PostgREST 不会 GROUP BY);
     RPC 没部署时退回逐项目 count —— 慢, 但清单仍然是对的。
     """
-    projects = store.list_all_projects(client)
+    if not user_id:
+        raise PermissionError(
+            "无法识别调用者身份, 不能列项目 —— 清单按 owner 隔离。"
+            "服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID。")
+    projects = store.list_all_projects(client, owner_id=user_id)
     if not projects:
         return []
     pids = [p["id"] for p in projects]

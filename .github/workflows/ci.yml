@@ -127,6 +127,17 @@ jobs:
           import deskcore.core as C
           import db as _db
 
+          # 审计 COR-015: record_rule 现在先过归属校验, 所以不能再传 client=None。
+          # 这里验的是 severity 回报口径, 不是归属 —— 归属在
+          # tests/test_deskcore_ownership.py, 这里只需要一个能回项目行的 client。
+          class _OwnQ:
+              def select(self, *a, **k): return self
+              def eq(self, *a, **k): return self
+              def limit(self, *a, **k): return self
+              def execute(self): return _Resp([{"id": "proj-1", "owner_id": "u1"}])
+          class _OwnSB:
+              def table(self, *a, **k): return _OwnQ()
+
           calls = {}
           def _fake_upsert(client, **kw):
               calls.update(kw)
@@ -136,7 +147,8 @@ jobs:
           _orig = _db.upsert_memory
           _db.upsert_memory = _fake_upsert
           try:
-              out = C.record_rule(None, "proj-1", "以后一律不许用感叹号", severity="hard")
+              out = C.record_rule(_OwnSB(), "proj-1", "以后一律不许用感叹号",
+                                  severity="hard", user_id="u1")
               assert calls.get("update_severity") is True, "record_rule 没打开 update_severity"
               assert out["severity"] == "hard", out
               assert "warning" not in out, out
@@ -145,7 +157,8 @@ jobs:
               # 反证: update_severity 没生效时, 必须报 warning 而不是谎报成功
               def _stubborn(client, **kw): return {"id": "mem-1", "severity": "soft"}
               _db.upsert_memory = _stubborn
-              out = C.record_rule(None, "proj-1", "同一条", severity="hard")
+              out = C.record_rule(_OwnSB(), "proj-1", "同一条",
+                                  severity="hard", user_id="u1")
               assert out["severity"] == "soft" and "warning" in out, out
               print("  ✓ 库里没改成 hard 时, 回报 soft 并带 warning(不谎报入参)")
           finally:
@@ -500,6 +513,11 @@ jobs:
               def update(self, row, *a, **k): self.upd = row; return self
               def insert(self, row, *a, **k): self.st.setdefault("edits", []).append(row); return self
               def execute(self):
+                  if self.t == "projects":
+                      # 审计 COR-015: record_edit / save_my_style / my_style 先过
+                      # 归属校验。本块验的是两步闭环, 不是归属 —— 兜一行 owner=u1。
+                      return _Resp([{"id": "p1", "owner_id": "u1",
+                                     "calibration_notes": ""}])
                   if self.t == "style_edits":
                       if getattr(self, "upd", None):          # 销账
                           ids = getattr(self, "ids", [])
@@ -1416,9 +1434,15 @@ jobs:
                   return self.sb._run(self)
 
 
+          OWNER = "u-owner"
+
           class _SB:
               def __init__(self, rows=None, rpc_impl=None):
-                  self.rows = rows or {}
+                  self.rows = dict(rows or {})
+                  # 审计 COR-015: core 的项目级入口现在先过归属校验。本块每条断言
+                  # 验的都【不是】归属(那些在 tests/test_deskcore_ownership.py),
+                  # 所以统一兜一行 owner=OWNER 的 p1, 免得每条用例各自重写一遍。
+                  self.rows.setdefault("projects", [{"id": "p1", "owner_id": OWNER}])
                   self.rpc_impl = rpc_impl or {}
                   self.calls, self.rpc_calls = [], []
 
@@ -1467,7 +1491,7 @@ jobs:
                            {"id": f"f{i}", "project_id": "p1", "title_embedding": "[0.1]"}
                            for i in range(4000)]},
                        rpc_impl={"deskcore_check_drafts": lambda a: [hit]})
-              out = C.check_drafts(sb, "p1", _DRAFTS)
+              out = C.check_drafts(sb, "p1", _DRAFTS, user_id=OWNER)
 
               # ① 结论由 RPC 驱动
               r = out["results"][0]
@@ -1506,7 +1530,7 @@ jobs:
                         "title_embedding": None, "opening_hash": C.fp.opening_hash(body),
                         "ngram_hashes": C.fp.ngram_hashes(body), "created_at": "2026-01-01"}
               sb_py = _SB(rows={"draft_fingerprints": [fp_row]})           # 无 rpc_impl
-              out_py = C.check_drafts(sb_py, "p1", _DRAFTS)
+              out_py = C.check_drafts(sb_py, "p1", _DRAFTS, user_id=OWNER)
               assert out_py["results"][0]["status"] == "reject", out_py["results"][0]
               assert out_py["results"][0]["collided_with"] == "去年那篇口红合集"
               assert out_py["summary"]["history_size"] == 1, out_py["summary"]
@@ -1521,7 +1545,7 @@ jobs:
                                {"idx": 0, "best_sim": 0, "sim_title": None,
                                 "best_j": j, "j_title": "去年那篇口红合集",
                                 "open_exact": True, "open_title": "去年那篇口红合集"}]})
-              out_sql = C.check_drafts(sb_sql, "p1", _DRAFTS)
+              out_sql = C.check_drafts(sb_sql, "p1", _DRAFTS, user_id=OWNER)
               assert out_sql["results"][0]["status"] == out_py["results"][0]["status"]
               assert out_sql["results"][0]["collided_with"] == out_py["results"][0]["collided_with"]
 
@@ -1534,7 +1558,7 @@ jobs:
                            {"idx": 0, "best_sim": 0, "sim_title": None, "best_j": 0,
                             "j_title": None, "open_exact": False, "open_title": None}]})
               try:
-                  C.check_drafts(sb, "p1", two)
+                  C.check_drafts(sb, "p1", two, user_id=OWNER)
               except RuntimeError as exc:
                   assert "回执缺" in str(exc), exc
               else:
@@ -1551,7 +1575,7 @@ jobs:
                            "open_exact": "false", "open_title": None}]
               sb = _SB(rows={"draft_fingerprints": [{"id": "f1", "project_id": "p1"}]},
                        rpc_impl={"deskcore_check_drafts": _rpc})
-              r = C.check_drafts(sb, "p1", _DRAFTS)["results"][0]
+              r = C.check_drafts(sb, "p1", _DRAFTS, user_id=OWNER)["results"][0]
               assert r["signals"]["opening_exact_match"] is False, r
               assert r["status"] == "pass", r
               # NUMERIC 回字符串时也要能算
@@ -1609,7 +1633,7 @@ jobs:
                       raise RuntimeError("permission denied for function deskcore_check_drafts")
 
               try:
-                  C.check_drafts(_Boom(), "p1", _DRAFTS)
+                  C.check_drafts(_Boom(), "p1", _DRAFTS, user_id=OWNER)
               except RuntimeError as exc:
                   assert "permission denied" in str(exc)
               else:
@@ -1702,7 +1726,7 @@ jobs:
               sb = _SB(rows={"projects": projects, "memories": mems},
                        rpc_impl={"deskcore_fingerprint_counts":
                                  lambda a: [{"project_id": "p3", "n": 7}]})
-              out = C.list_projects(sb)
+              out = C.list_projects(sb, user_id="o")
               assert len(out) == N, len(out)
               assert out[3]["hard_rules"] == 1 and out[3]["soft_rules"] == 1, out[3]
               assert out[3]["fingerprint_count"] == 7, out[3]
@@ -1719,7 +1743,7 @@ jobs:
               # ③ RPC 没部署 → 退回逐项目 count, 结果仍然对
               sb2 = _SB(rows={"projects": projects[:5], "memories": mems,
                               "draft_fingerprints": [{"id": "f1", "project_id": "p2"}]})
-              out2 = C.list_projects(sb2)
+              out2 = C.list_projects(sb2, user_id="o")
               assert [o["fingerprint_count"] for o in out2] == [0, 0, 1, 0, 0], out2
               assert len([c for c in sb2.calls if c["table"] == "draft_fingerprints"]) == 5
 
@@ -2381,6 +2405,39 @@ jobs:
           assert h["config"]["anonymous_allowed"] is True, h["config"]
           assert "dev" in h["config"]["auth"]["note"], h["config"]["auth"]["note"]
           assert c.post("/tool/list_projects", json={}).status_code != 401
+
+          # ── COR-015 的运行期一半(审计第四批) ──────────────────────────────
+          # 静态那一半在 tests/test_deskcore_ownership.py(那一步只装
+          # requirements.lock, import 不了 fastapi, 只能 AST 读源码)。这里
+          # fastapi 在, 验真的 HTTP 状态码。
+          #
+          # ① 匿名 dev 模式 + 没配 DESKCORE_DEFAULT_USER_ID = 认不出人 → 403。
+          #    注意它【不是】401: key 这一层是放行的(显式开了匿名), 拒绝发生在
+          #    归属校验那一层。两层分开才说得清该配哪个变量。
+          assert not (os.environ.get("DESKCORE_DEFAULT_USER_ID") or "").strip()
+          r = c.post("/tool/list_projects", json={})
+          assert r.status_code == 403, \
+              f"认不出调用者却不是 403: {r.status_code} {r.text[:200]}"
+          assert "DESKCORE_DEFAULT_USER_ID" in r.text, \
+              f"403 没告诉人该配什么: {r.text[:300]}"
+
+          # ② 归属拒绝【绝不能】掉进 500 兜底。500 对调用方的意思是"服务端坏了,
+          #    待会儿重试", 于是模型会拿同一个错 project_id 一直试; 而且正常的
+          #    权限拒绝会去污染错误监控。这里直接把工具替换成必抛 PermissionError,
+          #    只验 REST 层的映射, 不连库。
+          import deskcore.tools as _T
+          _orig_tool = _T.TOOLS["check_drafts"]
+          def _denied(project_id, drafts, _user_id=None):
+              raise PermissionError("project x 不属于当前调用者, 拒绝访问")
+          _T.TOOLS["check_drafts"] = (_denied, True)
+          try:
+              r = c.post("/tool/check_drafts", json={"project_id": "x", "drafts": []})
+              assert r.status_code == 403, \
+                  f"越权拒绝映射成了 {r.status_code}(应为 403): {r.text[:200]}"
+          finally:
+              _T.TOOLS["check_drafts"] = _orig_tool
+          print("  ✓ COR-015 认不出人/不是你的项目 → 403(不是 401, 更不是 500)")
+
           os.environ.pop("DESKCORE_ALLOW_ANONYMOUS")
           assert c.post("/tool/list_projects", json={}).status_code == 401
           print("  ✓ DESKCORE_ALLOW_ANONYMOUS=1 才放行, 且 /health 回显; 去掉即恢复 401")

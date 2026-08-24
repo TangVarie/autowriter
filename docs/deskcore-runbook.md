@@ -110,6 +110,11 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 > - ❌ **绝不能把两个人塞进同一个 UUID** —— 那等于把 A 的调校笔记和正负例交给 B 看，
 >   而且 B 能改 A 的标注（`label_example` 的归属校验是按 `user_id` 判的）。
 >
+> ⚠️ **2026-08-24 起还多一层**（审计 COR-015）：`user_id` 现在还决定**能打开哪些项目**——
+> 判据是 `projects.owner_id == user_id`，十一个工具全部校验。所以给新人发一个全新 UUID
+> 意味着他**一个项目都打不开**，得先让他自己建项目（或者把他要用的项目的 `owner_id`
+> 改成他）。口径与"改成团队共享要改哪儿"见 `docs/deskcore.md` §2.2.1。
+>
 > **为什么不是 RLS 的事**：deskcore 持 `service_role`，**绕过 RLS**，个人层是靠
 > `store.py` 里一串显式 `.eq("user_id", user_id)` 隔离的（:143 / :471 / :499 / :524 /
 > :542 / :553），`label_example` 还另做了一次归属校验（`core.py:990` 的 docstring 写了
@@ -432,11 +437,12 @@ CLI 子命令、设计文档、PR 描述、连"部署必跑一次"的措辞都�
 | 步骤 | 拦什么 |
 |---|---|
 | `deskcore selftest` | 查重硬闸 + 发牌 + vendor 词表完整性 |
+| `pytest tests/` | 护栏（价档前缀 / 规则解析 / 笔记去重）+ **归属校验**（含一条 AST 断言：新加工具忘了加校验会红）+ 两条 `xfail(strict)` 立案（SUP-006 / COR-014） |
 | round-5 回归 | fail-closed / 规则口径 / 触发器条件 |
 | round-6 回归 | **回填函数存在** / 撞车归因 / 坐标块完整 |
 | round-7 回归 | 空开头 / key map / 翻页 / 角度洗牌 |
 | round-8 回归 | 蒸馏搬给调用方模型的两步闭环 |
-| app 真的能起 | `/health` 不炸 + MCP 能握手 |
+| app 真的能起 | `/health` 不炸 + MCP 能握手 + 越权拒绝真的返 403 |
 | 真实 import 图 | 抓依赖 API 漂移（不 import `app.py`，它会跑 streamlit 脚本） |
 | supabase schema-aware client 契约 | TV 通道 2 sync 依赖 |
 | `list_items_for_batches` 必须分页 | 假件带 `server_cap`，模拟 PostgREST 把请求钳短 |
@@ -452,6 +458,11 @@ CLI 子命令、设计文档、PR 描述、连"部署必跑一次"的措辞都�
    `store.shared_memories()` 为此故意不吞异常，外面再包一层 `_safe` 等于把那个设计
    原样抵消掉。**写类工具**（`draw_angles` / `commit_drafts` / `record_rule` /
    `record_edit` / `label_example`）同理，全都不包。
+
+   ⚠️ **`PermissionError` 是 `_safe` 的显式例外**（审计 COR-015）：归属校验的拒绝
+   原样上抛，不包成降级结果。理由和上面同一条判据——权限拒绝不是"这次没拿到"，
+   重试也一样，而包住它会让调用方模型继续拿同一个错 `project_id` 试下一个工具。
+   REST 层映射成 **403**（401 = key 没过；403 = key 过了但项目不是你的；500 = 真故障）。
 
    `check_drafts` 更不能包 —— 查重出错必须抛，理由见 §5.1。
 

@@ -57,22 +57,43 @@ def iso_now() -> str:
 
 # ── 项目 ──────────────────────────────────────────────────────────────────
 
-def list_all_projects(sb) -> list[dict]:
-    """全部项目, 不按 owner 过滤。
+def project_row(sb, project_id: str) -> dict | None:
+    """项目整行; 不存在返回 None。
 
-    db.list_projects 是 .eq("owner_id", user_id) —— 那是 Streamlit 里「我的项目」
-    的视角。deskcore 要让任何人都能打开任何项目(规则共享), 所以这里不过滤,
-    但把 owner_id 带出去, 调用方需要时能显示归属。
+    ⚠️ 刻意不用 ``db.get_project`` —— 它用 ``.single()``, PostgREST 在 0 行时回
+    406, postgrest-py 把它抛成 APIError。也就是说 ``db.get_project`` 【从不返回
+    None】, 调用方那句 ``if project is None: raise ValueError("project not
+    found")`` 是死代码, 传错 project_id 拿到的是一条看不懂的 406 报错。归属校验
+    要区分"项目不存在"(可能只是 id 抄错)和"项目不是你的", 所以这里换成 limit(1)。
+    """
+    res = (sb.table("projects").select("*")
+             .eq("id", project_id).limit(1).execute())
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def list_all_projects(sb, *, owner_id: str) -> list[dict]:
+    """``owner_id`` 名下的项目。
+
+    ⚠️ 这里【曾经不按 owner 过滤】, 理由写的是"deskcore 要让任何人都能打开任何
+    项目(规则共享)"。审计 COR-015 指出那个选择的代价: 整套隔离就只剩 key 这一层,
+    而 key 这一层有 ROB-003(配错就全开)。归属口径已按 ``projects.owner_id`` 定下来
+    (与 db.py:224 那条 RLS policy `owner_id = auth.uid()` 同一判据)——
+    deskcore 持 service_role 绕过 RLS, 就得自己把同一条谓词执行一遍。
+
+    参数写成**关键字必填**是故意的: 将来若改成团队共享, 改的是
+    ``core.assert_project_access`` 一处; 而任何人想在这里"顺手去掉过滤",
+    都得先改签名, 改不动就不会不小心改回去。
 
     ⚠️ 必须翻页。原来是裸 select 无 limit —— PostgREST 的 db-max-rows(默认
-    1000)会**静默截断**, 而这是"任何人都能打开任何项目"的那份清单: 越过 1000
-    个项目之后, 后面的项目在模型眼里【根本不存在】, 且没有任何提示
-    (审计 COR-005 同款, 判据同样是空页收工 + offset 按实收行数前进)。
+    1000)会**静默截断**: 越过 1000 个项目之后, 后面的项目在模型眼里【根本不存在】,
+    且没有任何提示(审计 COR-005 同款, 判据同样是空页收工 + offset 按实收行数前进)。
     ``name`` 有重名, 排序必须带 ``id`` 做次级键, 否则翻页会漏行也会重复行。
     """
     return _paged(lambda off, lim: (
         sb.table("projects")
           .select("id, name, brand, owner_id")
+          .eq("owner_id", owner_id)
           .order("name").order("id")
           .range(off, off + lim - 1)
     ))

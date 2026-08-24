@@ -95,6 +95,24 @@ deskcore 自己只有六个模块：
 
 deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.get_confirmed_memories` 是按 `user_id` 过滤的（Streamlit 单用户视角），共享规则读不到，所以 `store.shared_memories` 按 `project_id` 读全量。
 
+#### 2.2.1 项目归属：按 `owner_id` 隔离（2026-08-24 拍板，审计 COR-015）
+
+上面那张表回答的是"一个项目的数据分几层"，**不回答"谁能打开这个项目"**。这两件事被混过一次：deskcore 原来对 `project_id` 没有任何归属校验，十一个工具里 `list_projects` / `borrow_lessons` / `check_drafts` 三个连调用者是谁都不问。于是任一持有效 key 的调用方传入他人 `project_id` 就能读他人成稿标题（`check_drafts` 的 `collided_with` 会回显）、往他人项目写规则和指纹。
+
+现在的口径：**`projects.owner_id == 调用者 user_id`**，读写两侧都校验。这与 `db.py` 里那条 RLS policy `owner_id = (select auth.uid())` 是同一条谓词——deskcore 绕过 RLS，就得自己把它执行一遍。
+
+| 谁 | 怎么执行 |
+|---|---|
+| 十一个 MCP 工具 | `TOOLS` 里 `needs_user` **全部为 True**；`core.assert_project_access` 是唯一实现，每个项目级入口以它开头 |
+| `label_example` | **按 `items.user_id` 校验**，比项目粒度更细——同一项目里 A 的正负例是 A 的个人资产 |
+| REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了 |
+| CLI 的 `projects` / `open` / `draw` / `check` | 走同一个 `core` 函数，所以 `--user` 从可选变成**必填** |
+| CLI 的 `backfill` / `reembed` | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
+
+**要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在十一个工具里意味着改口径要改十一处，而漏掉的那处不会报错，只会继续放行。
+
+回归在 `tests/test_deskcore_ownership.py`（含一条 AST 断言：每个项目级入口都必须调过这道闸——归属校验最典型的失效方式不是判据写错，而是**新加了个工具忘了加校验**）+ `ci.yml` app 冒烟步里的 403 运行期断言。
+
 ### 2.3 三处刻意的改动
 
 **A. 正例按相关性选** → `core.select_positive_examples`。有 brief 且 embedding 可用时按余弦排序，然后跑一遍开头形态多样性约束。embedding 不可用时退化成 recency（与原行为一致，不会更差）。这一条直接断掉 §1.1 根因 4 的趋同回路。
@@ -135,7 +153,7 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 
 | 阶段 | 工具 | 说明 |
 |---|---|---|
-| 写稿前 | `list_projects` | 项目清单 + 各自的规则数/指纹数 |
+| 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
 | | `borrow_lessons` | 转调 TV 馆员，借真实爆款经验卡 |
@@ -245,8 +263,11 @@ python -m deskcore.cli backfill --project <uuid>    # 每个项目跑一次
 
 ```bash
 python -m deskcore.cli selftest      # 不连库不联网, 只用标准库
-python -m deskcore.cli projects      # 需要 SUPABASE_* env
-python -m deskcore.cli draw --project <uuid> -n 20 --block
+python -m deskcore.cli projects --user <uuid>          # 需要 SUPABASE_* env
+python -m deskcore.cli draw --project <uuid> --user <uuid> -n 20 --block
+# ⚠️ --user 是必填(审计 COR-015): 归属校验在 core 层, CLI 与 MCP 同一个函数。
+#    传 projects.owner_id 里【已有的】那个 UUID, 与 DESKCORE_KEYS 里配的同源。
+#    backfill / reembed 是运维命令, 刻意不需要 --user。
 
 curl -sS "$DESKCORE_URL/health" | jq        # 每个依赖的 ok
 curl -sS -X POST "$DESKCORE_URL/tool/list_projects" \
@@ -339,4 +360,6 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
 5. **commit 的原子重查只覆盖确定性信号。** 开头精确 + 四字串 Jaccard 在锁内查；标题语义相似度没查（要 pgvector 距离算子，且历史行可能没向量）。也就是说竞态窗口里"标题换个说法的同角度稿"仍可能两条都进。要覆盖它得把向量比对也搬进 RPC——等 backfill 把历史向量补齐之后再做更合适。
 6. **"个人风格私有"与团队协作的张力。** 同一项目两个人各自驯化，风格会分叉。指纹库共享（互相避重），调校笔记不共享。跑一段时间如果分叉太严重，可能需要"把我的调校笔记提升为项目基线"的操作。第一期不做。
+
+   ⚠️ **按 `owner_id` 隔离之后这条张力换了形态**（见 §2.2.1）。原来的设想是"两个人打开同一个项目"，而现在一个项目只有一个 owner，跨人协作要么共用一个 `user_id`（那样个人层就退化没了），要么等真正的团队模型。真要做团队共享时，改的是 `core.assert_project_access` 一处——但那是个产品决策，不是顺手改。
 7. **native 正例的 essence 不可测。** 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，拿不到 `emotional_lever`，所以 TV 的饱和度监控对它们只能报"无法评估"。想让它可测需要给这些正例补 essence 标注。

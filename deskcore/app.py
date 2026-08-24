@@ -347,6 +347,14 @@ async def rest_tool(name: str, request: Request):
         return {"result": result}
     except HTTPException:
         raise
+    except PermissionError as exc:
+        # 归属校验拒绝(审计 COR-015) → 403, 【不是】500。
+        # 500 对调用方的意思是"服务端坏了, 待会儿重试", 于是模型会拿同一个错
+        # project_id 一直试; 403 才说得清是"这个项目不是你的"。顺带也别让越权
+        # 尝试去污染错误监控 —— 它是正常拒绝, 不是故障。
+        # 不打 exception 堆栈: 这不是 bug, 但要留一行可审计的痕迹。
+        logger.warning("tool %s denied: %s", name, exc)
+        raise HTTPException(status_code=403, detail=str(exc)[:300])
     except Exception as exc:  # noqa: BLE001
         # check_drafts 走到这里 = 查重真的挂了, 必须 500 不能装作没事。
         logger.exception("tool %s failed", name)
