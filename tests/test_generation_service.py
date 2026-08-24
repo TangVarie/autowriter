@@ -30,8 +30,20 @@ MOVED = [
     "_run_semantic_dedup_pass", "_format_version_for_session",
     "_sync_approved_to_session", "_resolve_engine_sessions",
     "_commit_session_tokens", "_update_session_occupancy",
-    "_queue_worker", "_queue_worker_impl", "_quick_gen_worker",
+    "_queue_worker",
 ]
+
+# ⚠️ ``_queue_worker_impl`` / ``_quick_gen_worker`` **不在上面那份清单里**。
+#
+# 它们在搬迁的那个 commit 里确实是逐字节的, 但紧接着的 SUP-012 把两处重复的
+# "调 generator"和"落库+查重+硬约束"抽成了 _call_generator / _persist_and_check
+# —— 那是**有意的改动**, 所以逐字节断言对它们不再成立。
+#
+# 把它们从这份清单里去掉**不是**放松要求, 而是换了个更强的守卫:
+# tests/test_generation_orchestration.py 用调用录音逐步钉住它们的行为(23 步
+# 主干 + 7 处已知差异 + 跨 plan 缓存 + 去重池身份)。逐字节只能证明"没动过",
+# 录音能证明"动了但行为没变" —— 后者才是重构需要的东西。
+CHANGED_BY_SUP012 = ["_queue_worker_impl", "_quick_gen_worker"]
 
 # 搬迁那一次的 commit 之前, app.py 里还有这些定义。用它取"搬走之前"的样子。
 _MOVE_PARENT = "5e95bfb"
@@ -95,8 +107,25 @@ def test_every_moved_definition_is_byte_identical():
 def test_app_no_longer_defines_them():
     """app.py 里不许留下重复定义 —— 两份会漂, 而且漂了不报错。"""
     cur = _top_level_sources((REPO / "app.py").read_text(encoding="utf-8"))
-    leftover = [n for n in MOVED if n in cur]
+    leftover = [n for n in MOVED + CHANGED_BY_SUP012 if n in cur]
     assert not leftover, f"app.py 里还留着: {leftover}"
+
+
+def test_the_two_orchestrators_are_still_there_and_guarded():
+    """被 SUP-012 改过的那两个仍然要在, 且**必须**有录音守着。
+
+    这条防的是"把逐字节断言里那两个名字删掉就绿了"这种走捷径 —— 删掉之后它们
+    就完全没人看着了。
+    """
+    gs = _top_level_sources(
+        (REPO / "generation_service.py").read_text(encoding="utf-8"))
+    for name in CHANGED_BY_SUP012:
+        assert name in gs, f"generation_service.py 里没有 {name}"
+    guard = (REPO / "tests" / "test_generation_orchestration.py")
+    assert guard.exists(), "特征化测试不见了 —— 那两个编排就没人看着了"
+    text = guard.read_text(encoding="utf-8")
+    for name in ("queue_worker_impl", "quick_gen_worker"):
+        assert name in text, f"特征化测试里没有覆盖 {name}"
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -987,6 +987,98 @@ def _update_session_occupancy(
     return sealed
 
 
+def _call_generator(*, multi_role: bool, system_prompt, tactic, count, engines,
+                    engine_models, plan, extra_instructions, images,
+                    progress_callback, historical_titles, use_thinking,
+                    gemini_thinking, custom_roles, n_roles, metrics,
+                    engine_prior_messages, user_context_block,
+                    user_id=None, project_id=None):
+    """两条编排调 generator 的那一段, 收成一处(审计 SUP-012)。
+
+    在此之前这段在 ``_queue_worker_impl`` 和 ``_quick_gen_worker`` 里各有一份,
+    每份又分 multi_role / 单角色两个分支 —— 同一组 ~18 个参数写了**四遍**。
+    加一个参数要改四处, 漏一处不会报错, 只会让两条路径的行为悄悄分叉。
+    这正是 SUP-012 说的"下次还会漂"。
+
+    ⚠️ 两条路径**保留的差异**在入参上显式表达, 不在函数体里判断:
+      · ``images`` —— 队列不支持图片(plan 里根本没这个键), 它传 None;
+      · ``user_id`` / ``project_id`` —— 只有单角色那一路要;
+      · ``progress_callback`` —— 队列的会带 "计划 X/Y" 前缀。
+    """
+    common = dict(
+        system_prompt=system_prompt,
+        tactic=tactic,
+        count=count,
+        engines=engines,
+        target_audience=plan.get("target_audience", ""),
+        key_messages=plan.get("key_messages", ""),
+        tone=plan.get("tone", ""),
+        extra_instructions=extra_instructions,
+        images=images,
+        progress_callback=progress_callback,
+        historical_titles=historical_titles or None,
+        use_thinking=use_thinking,
+        gemini_use_thinking=gemini_thinking,
+        metrics=metrics,
+        engine_prior_messages=engine_prior_messages,
+        user_context_block=user_context_block,
+    )
+    if multi_role:
+        return gen_module.generate_batch_multi_role(
+            engine_models=engine_models or None,
+            custom_roles=custom_roles,
+            n_roles=n_roles,
+            **common,
+        )
+    return gen_module.generate_batch(
+        engine_models=engine_models or None,
+        user_id=user_id,
+        project_id=project_id,
+        **common,
+    )
+
+
+def _persist_and_check(*, db_client, batch_id, user_id, generation_results,
+                       error_prefix, errors_sink, metrics, status,
+                       dedup_pool, project_id, project, regen_ctx,
+                       hard_rules):
+    """落库 → 语义查重 → 硬约束校验。两条编排的收尾段, 收成一处(审计 SUP-012)。
+
+    返回 ``(inserted_versions, produced_titles)``。
+
+    ⚠️ 三步的**顺序不能动**: 先落库拿到 version id, 再查重(命中要标 needs_revision
+    并可能触发重生), 最后跑硬约束(它也标 needs_revision)。查重放到硬约束后面的话,
+    重生出来的新内容不会再过一遍硬约束。
+    """
+    metrics.start_phase("db_save")
+    _set_phase_progress(status, "db_save")
+    inserted_items, inserted_versions, produced_titles = _save_batch_results(
+        db_client, batch_id, user_id, generation_results,
+        error_prefix, errors_sink,
+    )
+    # version_rows 是 _save_batch_results 内部构造的临时变量; 这里从
+    # inserted_versions 还原(embedding / 自动重生流程要用)。
+    version_rows = [
+        {"title": v.get("title", ""), "ai_engine": v.get("ai_engine", "")}
+        for v in inserted_versions
+    ]
+    metrics.stop_phase("db_save")
+
+    _set_phase_progress(status, "embedding")
+    _run_semantic_dedup_pass(
+        db_client, inserted_versions, version_rows,
+        dedup_pool, project_id, error_prefix,
+        errors_sink, metrics, regen_ctx=regen_ctx,
+        project=project, status=status,
+    )
+    _run_hard_constraint_check(
+        db_client, inserted_versions, hard_rules,
+        error_prefix, errors_sink, metrics,
+    )
+    _set_phase_progress(status, "embedding", intra=1.0)
+    return inserted_versions, produced_titles
+
+
 def _queue_worker(
     plans: list[dict],
     user_id: str,
@@ -1309,50 +1401,23 @@ def _queue_worker_impl(
             metrics.start_phase("llm")
             _set_phase_progress(status, "llm")
             metrics.incr("llm_calls", len(engines))
-            if use_multi_role:
-                generation_results = gen_module.generate_batch_multi_role(
-                    system_prompt=full_system_prompt,
-                    tactic=tactic,
-                    count=count,
-                    engines=engines,
-                    engine_models=engine_models or None,
-                    target_audience=plan.get("target_audience", ""),
-                    key_messages=plan.get("key_messages", ""),
-                    tone=plan.get("tone", ""),
-                    extra_instructions=extra_instr,
-                    images=None,
-                    progress_callback=_progress,
-                    historical_titles=historical_titles or None,
-                    use_thinking=use_thinking,
-                    gemini_use_thinking=gemini_thinking,
-                    custom_roles=custom_roles,
-                    n_roles=n_roles,
-                    metrics=metrics,
-                    engine_prior_messages=engine_prior_messages,
-                    user_context_block=flywheel_block,
-                )
-            else:
-                generation_results = gen_module.generate_batch(
-                    system_prompt=full_system_prompt,
-                    tactic=tactic,
-                    count=count,
-                    engines=engines,
-                    target_audience=plan.get("target_audience", ""),
-                    key_messages=plan.get("key_messages", ""),
-                    tone=plan.get("tone", ""),
-                    extra_instructions=extra_instr,
-                    images=None,
-                    progress_callback=_progress,
-                    historical_titles=historical_titles or None,
-                    use_thinking=use_thinking,
-                    engine_models=engine_models or None,
-                    gemini_use_thinking=gemini_thinking,
-                    user_id=user_id,
-                    project_id=project_id,
-                    metrics=metrics,
-                    engine_prior_messages=engine_prior_messages,
-                    user_context_block=flywheel_block,
-                )
+            generation_results = _call_generator(
+                multi_role=use_multi_role,
+                system_prompt=full_system_prompt, tactic=tactic, count=count,
+                engines=engines, engine_models=engine_models, plan=plan,
+                extra_instructions=extra_instr,
+                # 队列不支持图片 —— plan 字典里根本没有 image_prompt / images
+                # 两个键(见 app.py 里"添加计划"构造的那份)。这是产品上就没做,
+                # 不是漏传。
+                images=None,
+                progress_callback=_progress,
+                historical_titles=historical_titles,
+                use_thinking=use_thinking, gemini_thinking=gemini_thinking,
+                custom_roles=custom_roles, n_roles=n_roles, metrics=metrics,
+                engine_prior_messages=engine_prior_messages,
+                user_context_block=flywheel_block,
+                user_id=user_id, project_id=project_id,
+            )
 
             metrics.stop_phase("llm")
             # token usage 累加在 generator 内部的 _engine_call 边界完成
@@ -1370,25 +1435,11 @@ def _queue_worker_impl(
                     status.setdefault("sealed_engines", []).extend(sealed_engines)
 
             # ── [E 保存] 批量写 items + versions（统一服务 _save_batch_results）──
-            metrics.start_phase("db_save")
-            _set_phase_progress(status, "db_save")
             error_prefix = f"计划 {idx+1}（{proj_name}）："
-            inserted_items, inserted_versions, produced_titles = _save_batch_results(
-                db_client, batch_id, user_id, generation_results,
-                error_prefix, status["errors"],
-            )
-            # version_rows 是 _save_batch_results 内部构造的临时变量；
-            # 在这里从 inserted_versions 还原（embedding / 自动重生流程要用）
-            version_rows = [
-                {"title": v.get("title", ""), "ai_engine": v.get("ai_engine", "")}
-                for v in inserted_versions
-            ]
-            saved = len(inserted_versions)
-            metrics.stop_phase("db_save")
-
-            # ── 语义查重（统一服务 _run_semantic_dedup_pass）──────────────────
-            _set_phase_progress(status, "embedding")
             # Day 5：解析队列策略（计划级 > 项目级 > config 默认）
+            # ⚠️ 提到落库之前算 —— _resolve_queue_strategy 是纯函数(只读 plan /
+            # project / config, 不碰库), 所以位置无所谓; 挪上来是为了让
+            # _persist_and_check 能一次拿全参数。
             strategy_ctx = _resolve_queue_strategy(plan, project)
             metrics.set_meta(
                 "queue_strategy",
@@ -1411,22 +1462,18 @@ def _queue_worker_impl(
                 "historical_titles":   historical_titles,
                 "user_id":             user_id,
             }
-            _run_semantic_dedup_pass(
-                db_client, inserted_versions, version_rows,
-                queue_embeddings, project_id, error_prefix,
-                status["errors"], metrics, regen_ctx=regen_ctx,
-                project=project, status=status,
+            # ── [E 保存] + 语义查重 + 硬约束校验(统一走 _persist_and_check)──
+            inserted_versions, produced_titles = _persist_and_check(
+                db_client=db_client, batch_id=batch_id, user_id=user_id,
+                generation_results=generation_results,
+                error_prefix=error_prefix, errors_sink=status["errors"],
+                metrics=metrics, status=status,
+                dedup_pool=queue_embeddings, project_id=project_id,
+                project=project, regen_ctx=regen_ctx,
+                hard_rules=(validator.filter_hard(global_mems_for_plan)
+                            + validator.filter_hard(project_mems_for_plan)),
             )
-
-            # ── 硬约束确定性校验（B3）：在 dedup 之后跑，命中标 needs_revision ──
-            hard_rules_all = validator.filter_hard(global_mems_for_plan) \
-                           + validator.filter_hard(project_mems_for_plan)
-            _run_hard_constraint_check(
-                db_client, inserted_versions, hard_rules_all,
-                error_prefix, status["errors"], metrics,
-            )
-
-            _set_phase_progress(status, "embedding", intra=1.0)
+            saved = len(inserted_versions)
 
             # 累积本批的文本去重池，下一批立刻能看到（不依赖 DB 写入完成）。
             # 同步加去重 + 滑窗（与 queue_embeddings 一致），避免长队列下成本
@@ -1681,50 +1728,21 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         _set_phase_progress(status, "llm")
         metrics.incr("llm_calls", len(engines))
 
-        if use_multi_role:
-            generation_results = gen_module.generate_batch_multi_role(
-                system_prompt=full_system_prompt,
-                tactic=tactic,
-                count=count,
-                engines=engines,
-                engine_models=engine_models or None,
-                target_audience=plan.get("target_audience", ""),
-                key_messages=plan.get("key_messages", ""),
-                tone=plan.get("tone", ""),
-                extra_instructions=combined_extra,
-                images=images,
-                progress_callback=_progress,
-                historical_titles=historical_titles or None,
-                use_thinking=use_thinking,
-                gemini_use_thinking=gemini_thinking,
-                custom_roles=custom_roles,
-                n_roles=n_roles,
-                metrics=metrics,
-                engine_prior_messages=engine_prior_messages,
-                user_context_block=flywheel_block,
-            )
-        else:
-            generation_results = gen_module.generate_batch(
-                system_prompt=full_system_prompt,
-                tactic=tactic,
-                count=count,
-                engines=engines,
-                target_audience=plan.get("target_audience", ""),
-                key_messages=plan.get("key_messages", ""),
-                tone=plan.get("tone", ""),
-                extra_instructions=combined_extra,
-                images=images,
-                progress_callback=_progress,
-                historical_titles=historical_titles or None,
-                use_thinking=use_thinking,
-                engine_models=engine_models or None,
-                gemini_use_thinking=gemini_thinking,
-                user_id=user_id,
-                project_id=project_id,
-                metrics=metrics,
-                engine_prior_messages=engine_prior_messages,
-                user_context_block=flywheel_block,
-            )
+        generation_results = _call_generator(
+            multi_role=use_multi_role,
+            system_prompt=full_system_prompt, tactic=tactic, count=count,
+            engines=engines, engine_models=engine_models, plan=plan,
+            # combined_extra 里拼了 image_prompt —— 快速生成支持图片, 队列不支持。
+            extra_instructions=combined_extra,
+            images=images,
+            progress_callback=_progress,
+            historical_titles=historical_titles,
+            use_thinking=use_thinking, gemini_thinking=gemini_thinking,
+            custom_roles=custom_roles, n_roles=n_roles, metrics=metrics,
+            engine_prior_messages=engine_prior_messages,
+            user_context_block=flywheel_block,
+            user_id=user_id, project_id=project_id,
+        )
 
         metrics.stop_phase("llm")
         # token usage 累加在 generator 内部完成（见 _engine_call）
@@ -1741,24 +1759,11 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         # ── 批量保存：复用与 _queue_worker 完全相同的 _save_batch_results ──
         # （修 R1：之前是 create_item / create_version 逐条 INSERT，
         #  ~30 round trip；改批量后收敛为 2 次）
-        metrics.start_phase("db_save")
-        _set_phase_progress(status, "db_save")
         # R-039: 直接挂到 status —— 旧的本地 list 只在成功跑到结尾才赋给
         # status["errors"], 中途任何一步抛异常(_save_batch_results 之后的
         # dedup/硬约束/occupancy), 已收集的"某引擎生成失败"等全部丢失,
         # 运行中 UI 也看不到(queue 路径从一开始就是直挂的)。
         errors = status.setdefault("errors", [])
-        inserted_items, inserted_versions, _produced_titles = _save_batch_results(
-            db_client, batch_id, user_id, generation_results,
-            error_prefix="",  # Quick Generate 不需要 "计划 N（项目）：" 前缀
-            errors_sink=errors,
-        )
-        version_rows = [
-            {"title": v.get("title", ""), "ai_engine": v.get("ai_engine", "")}
-            for v in inserted_versions
-        ]
-        saved_count = len(inserted_versions)
-        metrics.stop_phase("db_save")
 
         # ── 语义查重（同 _queue_worker 走 _run_semantic_dedup_pass）─────
         # Quick Generate 只跑一个批次，所以 queue_embeddings 是个只有当前
@@ -1790,22 +1795,19 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             "historical_titles":   historical_titles,
             "user_id":             user_id,
         }
-        _run_semantic_dedup_pass(
-            db_client, inserted_versions, version_rows,
-            quick_queue_embeddings, project_id,
-            error_prefix="", errors_sink=errors, metrics=metrics,
-            regen_ctx=regen_ctx,
-            project=project, status=status,
+        # ── 落库 + 语义查重 + 硬约束校验(与 queue 走同一个 _persist_and_check)──
+        inserted_versions, _produced_titles = _persist_and_check(
+            db_client=db_client, batch_id=batch_id, user_id=user_id,
+            generation_results=generation_results,
+            # Quick Generate 只有一个批次, 不需要 "计划 N（项目）：" 前缀
+            error_prefix="", errors_sink=errors,
+            metrics=metrics, status=status,
+            dedup_pool=quick_queue_embeddings, project_id=project_id,
+            project=project, regen_ctx=regen_ctx,
+            hard_rules=(validator.filter_hard(global_mems)
+                        + validator.filter_hard(project_mems)),
         )
-
-        # ── 硬约束确定性校验（B3，与 _queue_worker 一致）──────────────
-        hard_rules_all = validator.filter_hard(global_mems) + validator.filter_hard(project_mems)
-        _run_hard_constraint_check(
-            db_client, inserted_versions, hard_rules_all,
-            error_prefix="", errors_sink=errors, metrics=metrics,
-        )
-
-        _set_phase_progress(status, "embedding", intra=1.0)
+        saved_count = len(inserted_versions)
 
         status["saved_count"] = saved_count
         status["n_results"]   = len(generation_results)

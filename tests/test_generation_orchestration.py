@@ -46,10 +46,18 @@ SHARED_PIPELINE = [
     "gen.generate_batch",
     "_commit_session_tokens",
     "_update_session_occupancy",
+    # ⚠️ 这两行在 SUP-012 抽 _persist_and_check 时**从下面挪到了这里**。
+    # 挪动的理由必须写下来, 否则这份"金序列"就退化成橡皮图章 —— 谁改红了就
+    # 顺手改一下, 那它就不再证明任何事情。
+    #
+    # 理由: validator.filter_hard 是一个**纯列表推导**(validator.py:321,
+    # 只按 severity 过滤, 不改入参、不碰库), 所以它算在落库之前还是之后,
+    # 语义上完全一样。它挪上来只是因为现在作为参数传给 _persist_and_check。
+    # 这是这次抽取里**唯一**一处顺序变化。
+    "validator.filter_hard",
+    "validator.filter_hard",
     "_save_batch_results",
     "_run_semantic_dedup_pass",
-    "validator.filter_hard",
-    "validator.filter_hard",
     "_run_hard_constraint_check",
     "db.insert_batch_metrics",
 ]
