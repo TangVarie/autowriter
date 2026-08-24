@@ -1244,7 +1244,7 @@ jobs:
           print("\n审计第二批回归: 10/10 通过")
           PY
 
-      - name: 审计第三批回归 + codex review 6 条 (性能与成本 · SUP-001~008 / ROB-004/011/013)
+      - name: 审计第三批回归 + codex review 7 条 (性能与成本 · SUP-001~008 / ROB-004/011/013)
         run: |
           python - <<'PY'
           import ast, inspect, os, random, textwrap, threading, time
@@ -2264,7 +2264,7 @@ jobs:
           print()
           if FAIL:
               raise SystemExit("审计第三批回归 FAILED:\n  - " + "\n  - ".join(FAIL))
-          print("审计第三批回归 + codex review 6 条: 23/23 通过")
+          print("审计第三批回归 + codex review 7 条: 23/23 通过")
           PY
       - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
         run: |
