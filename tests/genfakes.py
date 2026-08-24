@@ -275,16 +275,38 @@ def patched(monkeypatch, *, embeddings=False, n_results=2,
     def _prefix(a, k, pos):
         return k.get("error_prefix", a[pos] if len(a) > pos else None)
 
-    monkeypatch.setattr(gs, "_save_batch_results", lambda *a, **k: (
-        rec.log("_save_batch_results", _prefix(a, k, 4)),
-        ([{"id": "i1"}], [{"id": "v1", "title": "标题0", "ai_engine": "claude/x"}],
-         ["标题0"]))[1])
-    monkeypatch.setattr(gs, "_run_semantic_dedup_pass",
-                        lambda *a, **k: rec.log("_run_semantic_dedup_pass",
-                                                _prefix(a, k, 5)))
-    monkeypatch.setattr(gs, "_run_hard_constraint_check",
-                        lambda *a, **k: rec.log("_run_hard_constraint_check",
-                                                _prefix(a, k, 3)))
+    # ⚠️ 这几个内部步骤的**入参也要记**, 不能只记 error_prefix。合并的时候最容易
+    # 出的错就是"某个变量传串了"(比如把 quick 的临时向量池传成 queue 的共享池),
+    # 而那种错只有把入参记下来才看得见 —— 光看调用顺序是绿的。
+    def _sbr(*a, **k):
+        rec.log("_save_batch_results",
+                {"prefix": _prefix(a, k, 4), "batch_id": a[1] if len(a) > 1 else None,
+                 "n_results": len(a[3]) if len(a) > 3 else None})
+        return ([{"id": "i1"}],
+                [{"id": "v1", "title": "标题0", "ai_engine": "claude/x"}],
+                ["标题0"])
+
+    def _dedup_pass(*a, **k):
+        # 位置签名: (db_client, inserted_versions, version_rows, pool, project_id, ...)
+        pool = a[3] if len(a) > 3 else k.get("queue_embeddings")
+        rec.log("_run_semantic_dedup_pass", {
+            "prefix": _prefix(a, k, 5),
+            "project_id": a[4] if len(a) > 4 else None,
+            "pool_id": id(pool),                       # 同一个池 = 跨批共享
+            "pool_keys": sorted(pool) if isinstance(pool, dict) else None,
+            "has_regen": bool(k.get("regen_ctx")),
+            "n_versions": len(a[1]) if len(a) > 1 else None,
+        })
+
+    def _hard_check(*a, **k):
+        rec.log("_run_hard_constraint_check",
+                {"prefix": _prefix(a, k, 3),
+                 "n_rules": len(a[2]) if len(a) > 2 else None,
+                 "n_versions": len(a[1]) if len(a) > 1 else None})
+
+    monkeypatch.setattr(gs, "_save_batch_results", _sbr)
+    monkeypatch.setattr(gs, "_run_semantic_dedup_pass", _dedup_pass)
+    monkeypatch.setattr(gs, "_run_hard_constraint_check", _hard_check)
     monkeypatch.setattr(gs, "_resolve_engine_sessions",
                         lambda *a, **k: (rec.log("_resolve_engine_sessions"), ({}, {}))[1])
     monkeypatch.setattr(gs, "_commit_session_tokens",

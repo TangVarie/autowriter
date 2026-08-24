@@ -131,8 +131,8 @@ def test_difference_3_error_prefix(monkeypatch):
     """queue 要标出是第几个计划, quick 只有一个批次不需要。"""
     q_rec, _ = _run_quick(monkeypatch)
     k_rec, _ = _run_queue(monkeypatch)
-    assert q_rec.info("_save_batch_results") == [""]
-    assert k_rec.info("_save_batch_results")[0].startswith("计划 1")
+    assert q_rec.info("_save_batch_results")[0]["prefix"] == ""
+    assert k_rec.info("_save_batch_results")[0]["prefix"].startswith("计划 1")
 
 
 def test_difference_4_status_keys(monkeypatch):
@@ -226,6 +226,38 @@ def test_different_projects_do_not_share_caches(monkeypatch):
     n = rec.names()
     assert n.count("db.get_confirmed_memories") == 2, n
     assert n.count("db.get_session_instructions") == 2, n
+
+
+def test_queue_shares_one_dedup_pool_across_plans(monkeypatch):
+    """跨批语义去重池必须是**同一个对象**在 plan 之间传下去。
+
+    这是队列相对快速生成最核心的能力: "4 批 × 10 篇 → 30 篇重复"就是因为每批
+    只看得到 DB 里已落库的标题, 同队列前面批次的还没进去。合并时如果每个 plan
+    各建一个池, 功能全对、跨批去重悄悄失效 —— 而那**不会有任何断言变红**,
+    除非像这里一样把池的身份记下来。
+    """
+    rec, _ = _run_queue(monkeypatch, plans=[PLAN, dict(PLAN, tactic="战术B")])
+    pools = [i["pool_id"] for i in rec.info("_run_semantic_dedup_pass")]
+    assert len(pools) == 2 and pools[0] == pools[1], pools
+
+
+def test_quick_uses_its_own_throwaway_pool(monkeypatch):
+    """quick 只有一个批次, 用一个临时池 —— 但池里要**按 project_id 分桶**,
+    否则 _run_semantic_dedup_pass 取不到历史那一段。"""
+    rec, _ = _run_quick(monkeypatch, embeddings=True)
+    info = rec.info("_run_semantic_dedup_pass")[0]
+    assert info["project_id"] == "proj-1"
+    assert info["pool_keys"] is not None
+
+
+def test_hard_rules_come_from_both_scopes(monkeypatch):
+    """硬约束校验拿的是 global + project 两份 filter_hard 的**并集**。
+
+    只传一份的后果是安静的: 少的那半永远不校验, 而返回值看起来完全正常。
+    """
+    for rec in (_run_quick(monkeypatch)[0], _run_queue(monkeypatch)[0]):
+        assert rec.names().count("validator.filter_hard") == 2
+        assert rec.info("_run_hard_constraint_check")[0]["n_rules"] == 0
 
 
 def test_projects_are_prefetched_once_not_per_plan(monkeypatch):
