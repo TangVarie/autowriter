@@ -206,6 +206,17 @@ select (select count(*) from eligible)                                as 应有,
 > 只参与确定性查重；补配之后重跑**不会**给已写入的行补向量（幂等是按 `version_id`
 > 跳过的），得先把这些行删掉再跑。
 >
+> ⚠️ **2026-08-24 起还多一步。** `fingerprint.normalize` 的口径改了（原来不去中文
+> 弯引号 `“ ”` 和 `【】`，是一条能绕过查重的路子，审计 COR-014 后续）。如果这个
+> 项目**在那之前**已经回填过，必须补跑一次重算，否则新稿与老指纹的口径对不上：
+> ```bash
+> python -m deskcore.cli recompute-fingerprints --project <uuid>
+> ```
+> 从没回填过的项目不用管——`backfill` 本来就按当前口径算。
+> 返回值里 `ngram_unrecoverable` 不为 0 说明有些行的正文已经不在库里
+> （WorkBuddy 经 `commit_drafts` 写的，`version_id` 为空），那部分的四字串修不
+> 回来；开头指纹是全部修好的。
+>
 > 事后补救用 `reembed`（给**已在指纹库里、但当时没取到向量**的行补向量）：
 > ```bash
 > python -m deskcore.cli reembed --project <uuid>
@@ -437,6 +448,7 @@ CLI 子命令、设计文档、PR 描述、连"部署必跑一次"的措辞都�
 | 步骤 | 拦什么 |
 |---|---|
 | `deskcore selftest` | 查重硬闸 + 发牌 + vendor 词表完整性 |
+| 迁移在真 PostgreSQL 上跑 | 空库 → `000` → `001..005` → 再跑一遍验幂等 → 抽查表/函数 → 下推 SQL 与 Python 逐例比对（审计 SUP-010/COR-014） |
 | `pytest tests/` | 护栏（价档前缀 / 规则解析 / 笔记去重）+ **归属校验**（含一条 AST 断言：新加工具忘了加校验会红）+ 两条 `xfail(strict)` 立案（SUP-006 / COR-014） |
 | round-5 回归 | fail-closed / 规则口径 / 触发器条件 |
 | round-6 回归 | **回填函数存在** / 撞车归因 / 坐标块完整 |

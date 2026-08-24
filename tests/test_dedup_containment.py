@@ -51,38 +51,41 @@ def _all_grams(text: str, n: int = 4) -> set[str]:
 # 0 · normalize 的口径 —— 存量指纹全靠它, 动它等于让历史指纹作废
 # ══════════════════════════════════════════════════════════════════════
 
-def test_punct_pattern_is_byte_for_byte_what_it_always_was():
-    """``_PUNCT_RE`` 原来是两个字符串隐式拼接(后半截不是 raw), 现在改写成一个
-    完整的 raw 串把 DeprecationWarning 消掉 —— 但**编译结果必须一模一样**。
+def test_normalize_strips_every_punctuation_form():
+    """规范化的口径: **去掉所有标点与符号运算符, 保留文字与 emoji**。
 
-    为什么要钉到这个程度: ``normalize`` 是库里几千条存量指纹的计算口径。
-    它变一个字符, 新稿算出来的四字串就和历史对不上, 查重当场变弱, 而且
-    **不报错**。修一个 lint 警告顺手改宽了字符类, 是最容易发生的那种事故。
+    ⚠️ 这里原来是一行手写的字符类, 而且写坏了 —— 后半截不是 raw 串, 反斜杠塌了、
+    两个 ASCII 双引号被当成串边界吃掉。但真正的问题比手误大得多: **中文弯引号
+    “ ” ‘ ’ 从来就没写进去过**, 「」『』【】〈〉〔〕 也没有。当时数出 37 个常见
+    中文标点没被覆盖。
+
+    后果很具体: 同一篇稿子换个引号样式, Jaccard 掉到 0.35 硬闸线以下, 开头指纹
+    也对不上 —— 一条能绕过查重的路子, 而 【】 在小红书文案里遍地都是。
     """
-    assert fp._PUNCT_RE.pattern == (
-        "[\\s，。！？、；：''《》（）()\\[\\]…—~·,.!?;:'\"\\-_/\\|+*#@$%^&]+")
+    for a, b in [
+        ("他说“这个真的好用”，回购了三次。", '他说"这个真的好用"，回购了三次。'),
+        ("【实测】三个月后的真实感受", "实测三个月后的真实感受"),
+        ("「亲测」有效〈附对比图〉", "亲测有效附对比图"),
+        ("价格～ 129｜到手价＋赠品", "价格129到手价赠品"),
+        ("路径 a\\b 和 a/b", "路径ab和ab"),
+    ]:
+        assert fp.normalize(a) == fp.normalize(b), (a, b, fp.normalize(a), fp.normalize(b))
 
 
-def test_known_gap_curly_quotes_and_backslash_are_not_stripped():
-    """把**当前的缺口**钉成可执行的事实, 而不是留一句注释。
+def test_normalize_keeps_emoji_on_purpose():
+    """emoji 属 Unicode 的 So 类, **刻意保留**。
 
-    中文弯引号 “ ” 不在字符类里(原来那半截非 raw 串把 ASCII 双引号吃掉了,
-    弯引号则从来就没写进去)。后果很具体: 同一篇稿子换个引号样式, Jaccard
-    掉到 0.35 硬闸线以下, 开头指纹也对不上 —— 是一条能绕过查重的路子。
-
-    **这次刻意不修**: 改 normalize 会让库里存量指纹的口径与新稿不一致, 过渡期
-    查重反而更弱, 而 backfill 按 version_id 幂等跳过、不会重算已有行。要改必须
-    配一次全量重算。这条用例存在的意义是: 修的时候它会红, 逼人一起处理重算。
+    "换个 emoji 算不算同一篇"是产品问题, 不该由一个规范化函数顺手决定 ——
+    去掉它会让判定更严(换 emoji 不再能绕过), 但那是个要单独拍板的口径变更。
+    这条钉住"现在没顺手做那件事"。
     """
-    a = "他说“这个真的好用”，回购了三次。"
-    b = '他说"这个真的好用"，回购了三次。'      # 只有引号形态不同
-    assert fp.normalize(a) != fp.normalize(b), (
-        "弯引号已经被 normalize 掉了 —— 说明有人改了字符类。"
-        "那是对的方向, 但必须同时安排存量指纹重算, 否则查重在过渡期变弱。"
-        "改完请把这条用例改成断言相等。")
-    assert fp.jaccard(set(fp.ngram_hashes(a * 20)),
-                      set(fp.ngram_hashes(b * 20))) < fp.NGRAM_JACCARD_HARD
-    assert fp.normalize("a\\b") == "a\\b", "反斜杠现在不在字符类里"
+    assert fp.normalize("好用😍推荐🔥") == "好用😍推荐🔥"
+    assert fp.normalize("好用😍") != fp.normalize("好用🔥")
+
+
+def test_normalize_does_not_touch_the_actual_words():
+    """只去标点 —— 中英文数字必须原样留着, 否则查重就成了随机数。"""
+    assert fp.normalize("SK-II 神仙水 230ml，用了3个月") == "SKII神仙水230ml用了3个月"
 
 
 # ══════════════════════════════════════════════════════════════════════

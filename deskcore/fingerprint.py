@@ -17,34 +17,58 @@ autowriter 原来的查重只比标题向量(app.py:520), embedding 一挂就整
 from __future__ import annotations
 
 import hashlib
-import re
+import unicodedata
 
-# ⚠️ 这一行原来是【两个字符串隐式拼接】: `r"...："` 后面跟着两个 ASCII 双引号,
-# 于是 raw 串在那里就结束了, 剩下半截是**非 raw** 串。后果有三:
-#   · `\[` / `\-` 是非法转义 → DeprecationWarning(Python 3.12+ 起是 SyntaxWarning,
-#     再往后就是错误);
-#   · `\\` 在非 raw 串里塌成一个反斜杠, 于是它转义了后面的 `|` —— **反斜杠本身
-#     不在字符类里**, normalize 不去反斜杠;
-#   · 那两个 ASCII 双引号被当成串边界吃掉了。
-# 下面改写成一个完整的 raw 三引号串, **编译结果与改之前逐字节相同** —— 见
-# tests/test_dedup_containment.py 里那条把 pattern 钉死的用例。
+# ── 规范化 ────────────────────────────────────────────────────────────────
 #
-# ⚠️⚠️ 它还缺两类字符, 但**这次刻意不加**: 中文弯引号 “ ” ‘ ’ 和反斜杠。
-# 中文弯引号是小红书文案里最常见的形态, 不去掉的意思是"同一篇稿子换个引号
-# 样式就算另一篇" —— 实测只换引号形态的两篇 Jaccard 掉到 0.333, 正好在
-# 0.35 硬闸线之下, 开头指纹也对不上。
-# 不在本次改的理由: normalize 是**存量指纹的计算口径**。改了它, 新稿算出来的
-# 四字串与库里几千条历史指纹的口径就不一致了, 查重反而会在过渡期变弱, 而且
-# backfill 是按 version_id 幂等跳过的、不会重算已有行。要改必须配一次
-# 全量重算(新迁移 + 重跑 backfill), 那是独立一项, 见审计 §0.5 的记录。
-_PUNCT_RE = re.compile(
-    r"""[\s，。！？、；：''《》（）()\[\]…—~·,.!?;:'"\-_/\|+*#@$%^&]+"""
-)
+# 判据: **去掉所有标点与符号运算符, 保留文字与象形符号(emoji)**。
+# 具体是 Unicode 类别 Cc/Cf(控制/格式) · Zs/Zl/Zp(分隔) · Pc/Pd/Ps/Pe/Pi/Pf/Po
+# (全部标点) · Sm/Sc/Sk(数学/货币/修饰符号), 外加 str.isspace()。
+# **不去 So** —— emoji 属于那一类, "换个 emoji 算不算同一篇"是产品问题, 不该
+# 由一个规范化函数顺手决定。
+#
+# ── 为什么从字符类改成类别判定(审计 COR-014 的后续) ────────────────────
+# 原来是一行手写的字符类, 而且写坏了: `r"[...："` 后面跟着两个 ASCII 双引号,
+# raw 串在那里就结束了, 剩下半截是**非 raw** 串。后果有三 ——
+#   · `\[` / `\-` 是非法转义(Python 3.12+ 起会 SyntaxWarning);
+#   · `\\` 在非 raw 串里塌成一个反斜杠, 转义掉了后面的 `|`, 于是**反斜杠本身
+#     不在类里**;
+#   · 那两个 ASCII 双引号被当成串边界吃掉了。
+#
+# 但真正的问题比手误更大: **中文弯引号 “ ” ‘ ’ 从来就没写进去过**, 「」『』
+# 【】〈〉〔〕 也没有。实测同一篇稿子把 “” 换成 "", Jaccard 掉到 0.333 ——
+# 正好在 0.35 硬闸线之下, 开头指纹也对不上。那是一条**能绕过查重的路子**,
+# 而 【】 在小红书文案里遍地都是。逐个往字符类里补是补不完的(当时数出 37 个
+# 常见中文标点没被覆盖), 所以换成按类别判。
+#
+# 性能: 带 memo 的逐字判定比原来的正则慢约 8 倍, 但绝对值是 0.32ms / 3000 字,
+# 回填几千篇也就多一两秒。查重硬闸的正确性不该为这个让路。
+#
+# ⚠️⚠️ **改这里 = 让存量指纹作废。** 库里的 ngram_hashes / opening_hash 都是用
+# 当时的口径算出来的; 口径一变, 新稿算出来的四字串就和历史对不上, 查重在过渡期
+# **反而更弱**, 而且不报错。所以改完必须跑一次全量重算:
+#     python -m deskcore.cli recompute-fingerprints --project <id> --user <id>
+# 详见 docs/deskcore.md 与那个子命令的说明(它会告诉你有多少行**重算不了**)。
+_DROP_CATEGORIES = frozenset((
+    "Cc", "Cf",                                    # 控制符 / 格式符(含零宽连接)
+    "Zs", "Zl", "Zp",                              # 各种分隔符
+    "Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po",      # 全部标点
+    "Sm", "Sc", "Sk",                              # 数学 / 货币 / 修饰符号
+))
+_DROP_CACHE: dict[str, bool] = {}
+
+
+def _is_droppable(ch: str) -> bool:
+    hit = _DROP_CACHE.get(ch)
+    if hit is None:
+        hit = ch.isspace() or unicodedata.category(ch) in _DROP_CATEGORIES
+        _DROP_CACHE[ch] = hit
+    return hit
 
 
 def normalize(text: str) -> str:
-    """去标点空白后的规范化串。"""
-    return _PUNCT_RE.sub("", text or "")
+    """去标点 / 空白 / 符号运算符之后的规范化串。emoji 保留 —— 见上面的说明。"""
+    return "".join(c for c in (text or "") if not _is_droppable(c))
 
 
 def opening_of(body: str, n: int = 25) -> str:

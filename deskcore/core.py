@@ -926,6 +926,64 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
     return out
 
 
+def recompute_fingerprints(client, project_id: str, *, progress=None) -> dict:
+    """按**当前的** ``normalize`` 口径重算确定性指纹。审计 COR-014 的后续。
+
+    ⚠️ 什么时候需要跑: 只在 ``fingerprint.normalize`` 的口径变了之后。存量指纹的
+    ``opening_hash`` / ``ngram_hashes`` 是用**当时**的口径算的 —— 口径一变, 新稿
+    算出来的四字串就和历史对不上, 查重在过渡期反而更弱, 而且**不报错**。
+    ``backfill`` 补不了这个: 它按 ``version_id`` 幂等跳过, 只管"没有的行", 不重算
+    已有的行。
+
+    ── 能重算到什么程度 ──────────────────────────────────────────────────
+    指纹表**不存正文**(只有 ``title`` 和 ``opening`` 前 25 字), 所以:
+
+      · ``opening_hash`` —— **每一行都能重算**。它本来就是
+        ``sha16(normalize(opening))``, 而 ``opening`` 原样存着。这一路是
+        "单独就判死"的最强信号, 能全修回来是关键。
+      · ``ngram_hashes`` —— 只有 ``version_id`` 非空的行能重算(正文在
+        ``autowriter.versions`` 里)。WorkBuddy 经 ``commit_drafts`` 写进来的行
+        ``version_id`` 是空的, **正文已经不存在了**, 这一路修不回来。
+
+    返回值里的 ``ngram_unrecoverable`` 就是修不回来的行数。**它不为 0 就要告诉
+    用户**: 那些行的四字串仍然是旧口径, 与新稿比对会偏低。想彻底修只能把那些
+    稿子重新 commit 一遍。
+
+    幂等: 重复跑是同一个结果(纯函数重算), 只是白写一遍。
+    """
+    total = recomputed = unrecoverable = 0
+    for page in store.fingerprint_pages(client, project_id):
+        need_body = [r for r in page if r.get("version_id")]
+        bodies = (store.version_bodies(client, [r["version_id"] for r in need_body])
+                  if need_body else {})
+        for row in page:
+            total += 1
+            new_open = fp.sha16(fp.normalize(row.get("opening") or "")) \
+                if (row.get("opening") or "").strip() else ""
+            vid = row.get("version_id")
+            body = bodies.get(str(vid)) if vid else None
+            if body:
+                new_grams = fp.ngram_hashes(body)
+            else:
+                new_grams = None
+                unrecoverable += 1
+            store.update_fingerprint_hashes(
+                client, row["id"], opening_hash=new_open, ngram_hashes=new_grams)
+            recomputed += 1
+        if progress:
+            progress(recomputed, total)
+
+    out = {"scanned": total, "rewritten": recomputed,
+           "ngram_unrecoverable": unrecoverable}
+    if unrecoverable:
+        out["warning"] = (
+            f"{unrecoverable}/{total} 行的正文已经不在库里(version_id 为空, "
+            "多半是 WorkBuddy 经 commit_drafts 写进来的), 四字串那一路**没能重算** "
+            "—— 它们仍是旧的规范化口径, 与新稿比对会偏低。开头指纹已全部修好。"
+            "要彻底修只能把那些稿子重新 commit 一遍。")
+    return out
+
+
 def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = True,
                           chunk: int = 50, progress=None) -> dict:
     """把项目的历史成稿补进指纹库。**部署后每个项目必跑一次。**

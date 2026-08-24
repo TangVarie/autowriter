@@ -670,6 +670,52 @@ def set_fingerprint_vector(sb, row_id: str, vec: list[float], model: str) -> boo
     return bool(res.data)
 
 
+def fingerprint_pages(sb, project_id: str, page: int = PAGE):
+    """项目的全部指纹行, 逐页 yield。给"换了规范化口径之后重算"用。
+
+    只取重算需要的列: ``opening`` 能重算 opening_hash, ``version_id`` 决定
+    ngram_hashes 能不能重算(正文只在 autowriter.versions 里, 指纹表**不存正文**)。
+
+    逐页而不是一次拉全 —— 同 legacy_version_pages 的理由(审计 ROB-011)。
+    ``id`` 做次级排序键, 否则 created_at 大量并列时翻页会漏行。
+    """
+    return _paged_iter(
+        lambda off, lim: (
+            sb.table("draft_fingerprints")
+              .select("id, version_id, opening, opening_hash")
+              .eq("project_id", project_id)
+              .order("created_at").order("id")
+              .range(off, off + lim - 1)
+        ),
+        page=page,
+    )
+
+
+def version_bodies(sb, version_ids: list[str]) -> dict[str, str]:
+    """按 version_id 取正文。分块 + 翻页, 理由同 rule_counts_bulk。"""
+    out: dict[str, str] = {}
+    for chunk in db._in_chunks(list(version_ids)):
+        for row in _paged(lambda off, lim, _c=chunk: (
+                sb.table("versions").select("id, body")
+                  .in_("id", _c)
+                  .order("id")
+                  .range(off, off + lim - 1))):
+            out[str(row["id"])] = row.get("body") or ""
+    return out
+
+
+def update_fingerprint_hashes(sb, row_id: str, *, opening_hash: str,
+                              ngram_hashes: list[str] | None) -> bool:
+    """重写一行的确定性指纹。``ngram_hashes=None`` 表示这行的正文找不回来,
+    只更新 opening_hash, 四字串那一路保持原样(并由调用方报出去)。"""
+    patch: dict = {"opening_hash": opening_hash}
+    if ngram_hashes is not None:
+        patch["ngram_hashes"] = ngram_hashes
+    res = (sb.table("draft_fingerprints").update(patch)
+             .eq("id", row_id).execute())
+    return bool(res.data)
+
+
 def write_fingerprints(sb, rows: list[dict]) -> int:
     """直插指纹(不查重)。只给【回填】用 —— 回填的是已发生的历史, 本来就该原样入库。
 

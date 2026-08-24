@@ -8,6 +8,8 @@
   python -m deskcore.cli draw  --project <uuid> --user <uuid> -n 20 [--block]
   python -m deskcore.cli check --project <uuid> --user <uuid> --file drafts.json
   python -m deskcore.cli backfill --project <uuid>   ← 部署时必跑一次
+  python -m deskcore.cli recompute-fingerprints --project <uuid>
+                                                    ← 只在改了 normalize 之后跑
 
 ⚠️ ``--user`` 从可选变成必填(审计 COR-015): 归属校验在 core 层, CLI 与 MCP 走
 同一个函数, 不带身份的调用现在一律被拒。传的是 ``projects.owner_id`` 里【已有的】
@@ -221,6 +223,11 @@ def main(argv: list[str] | None = None) -> int:
                        help="给指纹库里【缺标题向量】的行补向量(欠费恢复后跑)")
     p.add_argument("--project", required=True)
 
+    p = sub.add_parser(
+        "recompute-fingerprints",
+        help="按当前 normalize 口径重算确定性指纹(**只在改了 normalize 之后跑**)")
+    p.add_argument("--project", required=True)
+
     p = sub.add_parser("check", help="查重")
     p.add_argument("--project", required=True)
     p.add_argument("--user", required=True)
@@ -270,6 +277,13 @@ def main(argv: list[str] | None = None) -> int:
         def _prog2(done, total):
             print(f"  {done}/{total}", flush=True)
         _print(core.reembed_fingerprints(sb, args.project, progress=_prog2))
+    elif args.cmd == "recompute-fingerprints":
+        def _prog3(done, total):
+            print(f"  已重算 {done} 行 / 已扫描 {total} 行", flush=True)
+        out = core.recompute_fingerprints(sb, args.project, progress=_prog3)
+        _print(out)
+        if out.get("ngram_unrecoverable"):
+            print("\n⚠️ " + out["warning"])
     elif args.cmd == "check":
         with open(args.file, encoding="utf-8") as fh:
             drafts = json.load(fh)
