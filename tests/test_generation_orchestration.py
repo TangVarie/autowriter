@@ -9,9 +9,14 @@
 关键入参是什么。替身与录音机在 tests/genfakes.py。
 
 ── 这份录音说明了什么 ──────────────────────────────────────────────────
-两条路径的主干是**逐步一致的 23 步**。真正的差异只有五处, 全部在下面
-``test_the_only_differences_are_these_five`` 里逐条钉住。**能合并的信心来自
-这份录音, 不是来自"读起来差不多"。**
+两条路径的主干是**逐步一致的 23 步**。差异有 7 处, 逐条钉在下面。
+
+⚠️ **第一版我数出来是 5 处, 那是错的** —— 因为录音机记得太粗: 它只记了
+``filter_soft_by_relevance`` 的 ``{n, has_context}``, 没记那段**文本本身**,
+于是"两条路径拿什么做相关性过滤"的差异完全测不到。把 text / extra_instructions
+原样记下来之后, 又多出两处。
+
+教训与整个审计一贯的那条一致: **录音机记得不够细, 得到的绿是假的。**
 """
 
 from __future__ import annotations
@@ -103,39 +108,93 @@ def test_both_paths_agree_step_for_step(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 2 · 差异只有这五处
+# 2 · 差异一共 7 处, 逐条钉住
 # ══════════════════════════════════════════════════════════════════════
 
-def test_the_only_differences_are_these_five(monkeypatch):
-    """把两条路径**全部**的差异逐条钉住。
-
-    合并的时候每一条都要有明确去向 —— 而不是"合完了跑跑看"。
-    """
-    q_rec, q_st = _run_quick(monkeypatch)
-    k_rec, k_st = _run_queue(monkeypatch)
-
-    # ① 取项目的方式: quick 逐个查, queue 批量预取(SUP-004 同款的 N+1 处理)
+def test_difference_1_how_the_project_is_fetched(monkeypatch):
+    """quick 逐个 get_project; queue 批量 list_projects 预取(SUP-004 同款)。"""
+    q_rec, _ = _run_quick(monkeypatch)
+    k_rec, _ = _run_queue(monkeypatch)
     assert "db.get_project" in q_rec.names() and "db.list_projects" not in q_rec.names()
     assert "db.list_projects" in k_rec.names() and "db.get_project" not in k_rec.names()
 
-    # ② 战术后缀的取用时机不同(与记忆读取之间没有数据依赖, 纯顺序差异)
-    q, k = q_rec.names(), k_rec.names()
+
+def test_difference_2_tactic_suffix_ordering(monkeypatch):
+    """取战术后缀的时机不同。与记忆读取之间没有数据依赖 —— 纯顺序差异。"""
+    q = _run_quick(monkeypatch)[0].names()
+    k = _run_queue(monkeypatch)[0].names()
     assert q.index("proj.get_tactic_prompt_suffix") > q.index("db.get_confirmed_memories")
     assert k.index("proj.get_tactic_prompt_suffix") < k.index("db.get_confirmed_memories")
 
-    # ③ 错误前缀: queue 要标出是第几个计划, quick 只有一个批次不需要
+
+def test_difference_3_error_prefix(monkeypatch):
+    """queue 要标出是第几个计划, quick 只有一个批次不需要。"""
+    q_rec, _ = _run_quick(monkeypatch)
+    k_rec, _ = _run_queue(monkeypatch)
     assert q_rec.info("_save_batch_results") == [""]
     assert k_rec.info("_save_batch_results")[0].startswith("计划 1")
 
-    # ④ status 的键不同 —— UI 那两个面板读的不是同一组
+
+def test_difference_4_status_keys(monkeypatch):
+    """UI 那两个面板读的不是同一组键。"""
+    _, q_st = _run_quick(monkeypatch)
+    _, k_st = _run_queue(monkeypatch)
     assert {"batch_id", "saved_count", "n_results"} <= set(q_st)
     assert {"total", "current", "completed"} <= set(k_st)
     assert k_st["completed"] == [{"plan_idx": 0, "batch_id": "batch-1",
                                   "project_name": "测试项目", "saved": 1}]
 
-    # ⑤ metrics 的 mode 不同(同一张表靠它区分两种模式)
-    assert q_st["last_metrics"]["mode"] == "quick"
-    assert k_st["last_metrics"]["mode"] == "queue"
+
+def test_difference_5_metrics_mode(monkeypatch):
+    """同一张 batch_metrics 表靠 mode 区分两种模式。"""
+    assert _run_quick(monkeypatch)[1]["last_metrics"]["mode"] == "quick"
+    assert _run_queue(monkeypatch)[1]["last_metrics"]["mode"] == "queue"
+
+
+def test_difference_6_queue_has_no_image_support(monkeypatch):
+    """**queue 完全不支持图片** —— 这不是漂移, 是产品上就没做。
+
+    队列的 plan 字典里根本没有 ``image_prompt`` / ``images`` 两个键(app.py 里
+    "添加计划"构造的那份), 而 ``_queue_worker_impl`` 是显式 ``images=None``。
+    quick 则会把 image_prompt 拼进 extra_instructions, 并让它参与 soft 规则的
+    相关性过滤。
+
+    合并的时候**不能想当然地"统一"** —— 给 queue 加上图片支持是产品变更,
+    不是重构。这条把"现状就是这样"钉住, 免得合并时顺手改了。
+    """
+    plan = dict(PLAN, image_prompt="一张产品图，白底")
+    q_rec, _ = _run_quick(monkeypatch, plan=plan)
+    k_rec, _ = _run_queue(monkeypatch, plans=[plan])
+
+    assert "参考图片说明" in (q_rec.info("gen.generate_batch")[0]["extra"] or "")
+    assert (k_rec.info("gen.generate_batch")[0]["extra"] or "") == ""
+
+    # 相关性过滤的上下文也跟着不同
+    assert "白底" in q_rec.info("mem.filter_soft_by_relevance")[0]["text"]
+    assert "白底" not in k_rec.info("mem.filter_soft_by_relevance")[0]["text"]
+
+
+def test_difference_7_empty_system_prompt_diverges(monkeypatch):
+    """**这一处是真正的行为分歧, 合并必须显式选边。**
+
+    项目的 system_prompt 是空的时候:
+      · queue —— 拒绝这个 plan, 写一条"项目未配置 System Prompt"的错误;
+      · quick —— **照常生成**, 拿一个空的 base_prompt 去调模型。
+
+    quick 那边等于"安静地产出一批不带项目人格的稿子"—— 正是本次审计一直在追的
+    那类失败。但改掉它是**用户可见的行为变更**(现在能跑的流程会开始报错),
+    所以合并时把它做成参数, 两边各自保留现状, 由人来拍板统一到哪一边。
+    """
+    import tests.genfakes as gf
+    monkeypatch.setitem(gf.PROJECT, "system_prompt", "   ")
+
+    q_rec, q_st = _run_quick(monkeypatch)
+    assert "gen.generate_batch" in q_rec.names(), "quick 现在是照常生成的"
+    assert q_st["errors"] == []
+
+    k_rec, k_st = _run_queue(monkeypatch)
+    assert "gen.generate_batch" not in k_rec.names(), "queue 现在是拒绝的"
+    assert any("System Prompt" in e for e in k_st["errors"]), k_st["errors"]
 
 
 # ══════════════════════════════════════════════════════════════════════

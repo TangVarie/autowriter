@@ -121,8 +121,13 @@ def _fake_mem(rec: Recorder):
 
         @staticmethod
         def filter_soft_by_relevance(mems, text, report_sink=None, context=None):
+            # ⚠️ **必须把 text 原样记下来**。第一版只记了 {n, has_context},
+            # 于是两条路径"拿什么文本做相关性过滤"的差异完全测不到 —— 而那
+            # 恰好是真实存在的一处漂移(queue 的 context 里没有 image_prompt)。
+            # 录音机记得太粗, 得到的绿是假的。
             rec.log("mem.filter_soft_by_relevance",
-                    {"n": len(mems or []), "has_context": context is not None})
+                    {"n": len(mems or []), "has_context": context is not None,
+                     "text": text})
             return list(mems or [])
 
         @staticmethod
@@ -132,7 +137,10 @@ def _fake_mem(rec: Recorder):
 
         @staticmethod
         def build_layered_system_prompt(**kw):
-            rec.log("mem.build_layered_system_prompt", sorted(kw))
+            rec.log("mem.build_layered_system_prompt",
+                    {k: (v if isinstance(v, (str, int, bool, type(None))) else
+                         f"<{type(v).__name__}:{len(v) if hasattr(v, '__len__') else '?'}>")
+                     for k, v in sorted(kw.items())})
             return "SYSTEM"
 
         @staticmethod
@@ -146,9 +154,16 @@ def _fake_gen(rec: Recorder, *, n=2):
     class _Gen:
         @staticmethod
         def generate_batch(**kw):
-            rec.log("gen.generate_batch",
-                    {"count": kw.get("count"), "engines": list(kw.get("engines") or []),
-                     "has_prior": bool(kw.get("engine_prior_messages"))})
+            rec.log("gen.generate_batch", {
+                "count": kw.get("count"), "engines": list(kw.get("engines") or []),
+                "has_prior": bool(kw.get("engine_prior_messages")),
+                # extra_instructions 里拼了 image_prompt, 是两条路径最容易漂的
+                # 地方之一 —— 原样记下来。
+                "extra": kw.get("extra_instructions"),
+                "tactic": kw.get("tactic"),
+                "audience": kw.get("target_audience"),
+                "images": bool(kw.get("images")),
+            })
             cb = kw.get("progress_callback")
             if cb:
                 cb(0.5, "half")
@@ -166,7 +181,7 @@ def _fake_librarian(rec: Recorder):
     class _Lib:
         @staticmethod
         def build_brief(project, **kw):
-            rec.log("lib.build_brief", sorted(kw))
+            rec.log("lib.build_brief", dict(kw))
             return {}
 
         @staticmethod
