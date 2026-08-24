@@ -11,10 +11,13 @@ Tables:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
 import threading
+import time
+from collections import OrderedDict
 from typing import Any, Optional
 from datetime import datetime, timezone, timedelta
 
@@ -66,17 +69,36 @@ def _cache_resource(**kwargs):
     return passthrough
 
 
-@_cache_resource(show_spinner=False)
+# 审计 SUP-007 / ROB-013: 这个缓存原来【无上限、无过期】, 而 key 里带的
+# access_token 是**每小时轮换**的 —— 同一个人每小时就新增一个 Client, 每个
+# Client 自带 httpx 连接池和一把文件描述符, 而且永远不会被回收。跑得久一点就是
+# Supabase 连接数爬满 / Too many open files, 表现是所有查询突然开始超时。
+#
+# ttl 取 2 小时: 必须【大于】token 的有效期(约 1 小时), 否则活跃会话的 client
+# 会在用得正欢的时候被踢掉、每次重建连接池 —— 那是另一种浪费。
+# max_entries 是并发用户数的上限, 不是"最多缓存几个 token": 超出后 Streamlit
+# 按 LRU 淘汰, 被淘汰的人下次请求重建一个 —— 慢一点, 不会错。
+_CLIENT_CACHE_TTL = 7200
+_CLIENT_CACHE_MAX = 64
+
+
+@_cache_resource(show_spinner=False, ttl=_CLIENT_CACHE_TTL,
+                 max_entries=_CLIENT_CACHE_MAX)
 def _make_client_cached(supabase_url: str, anon_key: str, access_token: str) -> Client:
     """Per-token Supabase client singleton.  Keyed on the token so each
     authenticated user gets their own client; ``access_token=""`` returns the
-    anonymous client.  Cleared on sign-out via ``_make_client_cached.clear()``.
+    anonymous client.
 
     2026-05-21: schema='autowriter' 让所有 ``client.table("items")`` 等调用
     透明指向 ``autowriter.items``（共享 Supabase + schema 隔离，避免和
     sanshengliubu 在 public 里冲突）。前置条件：autowriter-migrations 已跑
     且 Supabase Dashboard → Settings → API → Exposed schemas 已包含
     ``autowriter``。
+
+    ⚠️ 登出【不要】调 ``.clear()``(审计 SUP-007)。``st.cache_resource`` 是
+    **进程级**的 —— clear() 会把所有在线用户的 client 一起清掉, 一个人点登出,
+    其他人下一次查询全部重建连接池。而且根本没必要: 这个缓存**按 token 分键**,
+    换个人登录本来就拿不到上一个人的 client。登出的人那一份留到 ttl 到期即可。
     """
     client = create_client(
         supabase_url, anon_key,
@@ -97,6 +119,54 @@ def get_client(access_token: Optional[str] = None) -> Client:
     return _make_client_cached(
         config.SUPABASE_URL, config.SUPABASE_ANON_KEY, access_token or ""
     )
+
+
+# supabase-py 的子客户端是【惰性】建的: client._postgrest / _storage /
+# _functions 在被访问之前都是 None(实测 supabase 2.30)。所以关连接必须走这几个
+# **私有**属性 —— 用 client.postgrest 这样的属性访问会把还不存在的子客户端
+# **现建一个**出来, 本意是释放描述符, 结果反而多占一个。
+_CLOSABLE_SUBCLIENTS = ("_postgrest", "_storage", "_functions")
+
+
+def close_client(client) -> None:
+    """尽力关掉一个一次性 Supabase client 底下的 httpx 连接(审计 ROB-013)。
+
+    supabase-py 没有统一的 ``close()``: postgrest 上叫 ``aclose``(名字带 a,
+    实际是同步的), auth 上叫 ``close``, storage / functions 则是各自的
+    ``_client`` 是个 httpx.Client。一次性 client 用完不关, 连接和文件描述符
+    要等 GC —— 而 ``auth._try_refresh_session`` / ``_try_cookie_restore``
+    是每次 rerun 都可能走的路径, 攒起来就是 Too many open files, 表现却是
+    "所有查询突然开始超时", 极难往这上面想。
+
+    ⚠️ 只用于 ``auth._fresh_auth_client()`` 那种一次性对象。
+    绝不能对 ``get_client()`` 返回的缓存 client 调 —— 那是别人还在用的。
+
+    每个子客户端单独 try: 关不掉一个不该拦住其余的。
+    """
+    targets = []
+    auth = client.__dict__.get("auth")     # auth 是 __init__ 里就建好的
+    if auth is not None:
+        targets.append(auth)
+    for attr in _CLOSABLE_SUBCLIENTS:
+        sub = getattr(client, attr, None)  # 已经建过才不是 None; 不触发惰性构造
+        if sub is not None:
+            targets.append(sub)
+
+    for sub in targets:
+        for holder in (sub, getattr(sub, "_client", None), getattr(sub, "session", None)):
+            if holder is None:
+                continue
+            fn = getattr(holder, "close", None) or getattr(holder, "aclose", None)
+            if not callable(fn):
+                continue
+            try:
+                res = fn()
+                # 万一哪天上游把它改成真的 async: 协程不 await 会留一条
+                # "coroutine was never awaited" 警告, 关掉它。
+                if hasattr(res, "close"):
+                    res.close()
+            except Exception:
+                pass
 
 
 def get_service_client() -> Client:
@@ -268,6 +338,16 @@ CREATE POLICY versions_owner ON versions
     USING (
         item_id IN (SELECT id FROM items WHERE user_id = (select auth.uid()))
     );
+-- 审计 COR-004 / migrations/003: 版本号在同一个 item 内唯一。
+-- db.create_version 是「读 max → +1 → INSERT」, 并发迭代同一个 item 会双双
+-- 写入同一个号。那不会报错, 但挑"代表版本"的地方(list_approved_versions_for
+-- _sync 的 _pick_version、deskcore 的 labeled_examples / legacy_versions)都按
+-- max(version_num, created_at, id) 排序 —— 并列时选中哪条要看 tie-break,
+-- best 指针可能指向被覆盖的那一版, 导出与避重参照拿到的都是旧文, 全程无声。
+-- 有了这条约束, 并发写入必有一方撞 23505, create_version 捕获后重读 max 重试。
+-- (已有库走 migrations/003, 那边会先把历史重复对子重编号再建索引。)
+CREATE UNIQUE INDEX IF NOT EXISTS versions_item_version_uniq
+    ON versions (item_id, version_num);
 -- Semantic-similarity embedding for cross-batch duplicate detection.
 -- Requires the pgvector extension (Supabase: Database → Extensions → enable
 -- "vector" once).  Nullable so legacy rows stay readable; a backfill helper
@@ -833,7 +913,16 @@ LANGUAGE plpgsql
 -- migrations/ —— 只改一边的话, 新建的库照旧 function_search_path_mutable
 -- 且保留可变 search_path。(codex aw#57 review; migrations/README 也写了
 -- "加表/加列必须两边都改", 函数同理)
-SET search_path = pg_catalog, extensions
+SET search_path = pg_catalog, autowriter, extensions
+-- ⚠️ autowriter 必须在里面(codex review 2026-08-24)。本文件里的表名一律**不带
+-- schema 前缀**(整段 SQL 靠 search_path 解析), 而函数自己的 SET search_path
+-- 会覆盖调用方的 —— 只写 pg_catalog+extensions 的话, 函数体里的 draft_fingerprints
+-- 在【运行时】解析不到, 报 relation ... does not exist。
+-- 最坏的是它怎么失败: 那句报错里带 "does not exist", 而 store.rpc_missing 的判据
+-- 正好认这个词 —— 于是 check_drafts 会把"函数在、只是找不到表"当成"迁移没跑",
+-- 静默退回 Python 慢路径, 永远不报警。
+-- (migrations/*.sql 走的是另一条路: 那边表名全限定成 autowriter.*, 所以只需
+--  pg_catalog+extensions。两边各自自洽即可, 但不能混。)
 AS $$
 DECLARE
     cand  JSONB;
@@ -906,7 +995,9 @@ CREATE OR REPLACE FUNCTION deskcore_commit_fingerprints(
 )
 RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
 LANGUAGE plpgsql
-SET search_path = pg_catalog, extensions   -- 见上; ::vector 需要 extensions
+SET search_path = pg_catalog, autowriter, extensions
+-- 固定 search_path 的三段各自的作用见上面 deskcore_reserve_angles 那段说明;
+-- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
 AS $$
 DECLARE
     r        JSONB;
@@ -985,7 +1076,209 @@ REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) 
 REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM anon;
 REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) FROM authenticated;
 GRANT EXECUTE ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC) TO service_role;
+
+-- ── deskcore 查重比对下推(审计 SUP-002 / ROB-004 / ROB-011) ─────────────
+-- 原来是把整个项目的指纹(4000 行 × 768 维)拉进 Python 再逐对算余弦: 百 MB 级
+-- 传输 + 三千万次乘加, 单次数十秒, 而且占着 uvicorn 线程池的一个槽 ——
+-- 池子占满 /health 就跟着排队, 平台健康检查超时重启容器, 正在跑的调用全断。
+-- 三条审计发现是同一个根因。
+--
+-- ⚠️ 余弦这一路刻意【不走 draft_fp_embedding_idx】(上面那个 ivfflat)。
+-- ivfflat 是近似最近邻(默认 probes=1 只扫一个桶), 对查重硬闸是致命的 ——
+-- 漏掉的那条正是要拦下的重复稿, 且不报错。这里 ORDER BY 的是子查询算好的
+-- 别名 sim, 不是 `title_embedding <=> v` —— pgvector 的索引只认后一种形态,
+-- 换成前者规划器必然走顺序扫描, 精确且可预期。完整理由见 migrations/004。
+CREATE OR REPLACE FUNCTION deskcore_check_drafts(
+    _project_id UUID,
+    _rows       JSONB        -- [{opening_hash, ngram_hashes, title_embedding}, ...]
+)
+RETURNS TABLE(
+    idx        INT,
+    best_sim   NUMERIC,
+    sim_title  TEXT,
+    best_j     NUMERIC,
+    j_title    TEXT,
+    open_exact BOOLEAN,
+    open_title TEXT
+)
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog, autowriter, extensions
+-- 固定 search_path 的三段各自的作用见上面 deskcore_reserve_angles 那段说明;
+-- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
+AS $$
+DECLARE
+    r  JSONB;
+    i  INT := -1;
+    ng TEXT[];
+    oh TEXT;
+    v  vector;
+BEGIN
+    FOR r IN SELECT * FROM jsonb_array_elements(_rows) LOOP
+        i := i + 1;
+        idx := i;
+        best_sim := 0; sim_title := NULL;
+        best_j := 0;   j_title := NULL;
+        open_exact := FALSE; open_title := NULL;
+
+        oh := NULLIF(r->>'opening_hash', '');
+        SELECT COALESCE(array_agg(x), '{}') INTO ng
+          FROM jsonb_array_elements_text(COALESCE(r->'ngram_hashes','[]'::jsonb)) x;
+        v := CASE WHEN r->'title_embedding' IS NULL
+                    OR jsonb_typeof(r->'title_embedding') = 'null'
+                  THEN NULL ELSE (r->>'title_embedding')::vector END;
+
+        -- ① 开头精确撞车。空开头不参与(否则 title-only 的稿子会互相撞车)。
+        IF oh IS NOT NULL THEN
+            SELECT f.title INTO open_title
+              FROM draft_fingerprints f
+             WHERE f.project_id = _project_id AND f.opening_hash = oh
+             LIMIT 1;
+            open_exact := open_title IS NOT NULL;
+        END IF;
+
+        -- ② 四字串 Jaccard。GIN 的 && 粗筛后只对有交集的行精算。
+        IF array_length(ng, 1) IS NOT NULL THEN
+            SELECT t.title, t.j INTO j_title, best_j
+              FROM (
+                SELECT f.title,
+                       (SELECT count(*) FROM (SELECT unnest(ng) INTERSECT SELECT unnest(f.ngram_hashes)) s)::numeric
+                       / NULLIF((SELECT count(*) FROM (SELECT unnest(ng) UNION SELECT unnest(f.ngram_hashes)) u), 0) AS j
+                  FROM draft_fingerprints f
+                 WHERE f.project_id = _project_id
+                   AND f.ngram_hashes && ng
+              ) t
+             WHERE t.j IS NOT NULL
+             ORDER BY t.j DESC, t.title
+             LIMIT 1;
+            best_j := COALESCE(best_j, 0);
+        END IF;
+
+        -- ③ 标题语义余弦(见上: 顺序扫描, 精确)。
+        IF v IS NOT NULL THEN
+            SELECT t.title, t.sim INTO sim_title, best_sim
+              FROM (
+                SELECT f.title, 1 - (f.title_embedding <=> v) AS sim
+                  FROM draft_fingerprints f
+                 WHERE f.project_id = _project_id
+                   AND f.title_embedding IS NOT NULL
+              ) t
+             ORDER BY t.sim DESC, t.title
+             LIMIT 1;
+            IF best_sim IS NULL OR best_sim <= 0 THEN
+                best_sim := 0; sim_title := NULL;
+            END IF;
+        END IF;
+
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM anon;
+REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM authenticated;
+GRANT EXECUTE ON FUNCTION deskcore_check_drafts(UUID, JSONB) TO service_role;
+
+-- ── list_projects 的指纹批量计数(审计 SUP-004) ──────────────────────────
+-- PostgREST 不会 GROUP BY, 没有这个函数就只能每个项目发一次 count=exact:
+-- 40 个项目 41 次往返, 而 list_projects 是模型最常调的第一个工具。
+CREATE OR REPLACE FUNCTION deskcore_fingerprint_counts(_project_ids UUID[])
+RETURNS TABLE(project_id UUID, n BIGINT)
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, autowriter, extensions
+-- 固定 search_path 的三段各自的作用见上面 deskcore_reserve_angles 那段说明;
+-- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
+AS $$
+    SELECT f.project_id, count(*)::bigint
+      FROM draft_fingerprints f
+     WHERE f.project_id = ANY(_project_ids)
+     GROUP BY f.project_id;
+$$;
+
+REVOKE ALL ON FUNCTION deskcore_fingerprint_counts(UUID[]) FROM PUBLIC;
+REVOKE ALL ON FUNCTION deskcore_fingerprint_counts(UUID[]) FROM anon;
+REVOKE ALL ON FUNCTION deskcore_fingerprint_counts(UUID[]) FROM authenticated;
+GRANT EXECUTE ON FUNCTION deskcore_fingerprint_counts(UUID[]) TO service_role;
+
+-- ── 调教笔记的 CAS 写入（审计 COR-003 / migrations/002）────────────────────
+-- 为什么必须是 RPC: memory.save_calibration_notes 的乐观并发原本写成
+--   .eq("calibration_notes", expected_before_text)
+-- PostgREST 把过滤条件放在 **URL query string** 里, 而 calibration_notes 的软
+-- 上限是 4000 字(memory.py:_dedup_calibration_lines)。中文 URL-encode 后一个字
+-- 变 9 个字符 —— 4000 字 ≈ 36KB 的查询串, 远超网关(nginx/Kong)对单行请求头的
+-- 上限。越线之后每一次 CAS 写入都 414/400, 而 memory._append_new_observations
+-- 的 `except Exception: return None` 把它吞掉:
+--   迭代 / 手动精修 / 整批反思 / merger_taste 四条自动学习路径【全部静默停写】,
+--   用户以为在学、其实笔记早就不动了, 且没有任何告警。
+--
+-- 改成把 witness 压成 md5 送进 body: 请求大小与笔记长度解耦, 32 字节定长。
+-- md5 在这里【只做变更检测】, 不是安全用途 —— 冲突的后果是多重试一轮。
+--
+-- 空 witness 的语义是"我读到的是没有笔记": COALESCE 让 NULL 与 '' 都落到
+-- md5('') 上, 顺带把 R-036 那个 `.eq("", ...)` 匹配不到 NULL 行的特例消掉了
+-- (从未写过笔记的项目该列是 NULL 而不是 '')。
+--
+-- SECURITY INVOKER(默认): 以调用者身份跑, projects_owner 那条 RLS 照常生效,
+-- 用户改不了别人的项目。search_path 固定, 同 deskcore 两个 RPC 的处理。
+CREATE OR REPLACE FUNCTION update_calibration_notes_cas(
+    _project_id   UUID,
+    _expected_md5 TEXT,
+    _notes        TEXT
+)
+RETURNS TABLE(id UUID, calibration_notes TEXT)
+LANGUAGE sql
+SECURITY INVOKER
+SET search_path = pg_catalog, autowriter
+AS $$
+    UPDATE autowriter.projects p
+       SET calibration_notes = _notes
+     WHERE p.id = _project_id
+       AND md5(COALESCE(p.calibration_notes, '')) = _expected_md5
+    RETURNING p.id, p.calibration_notes;
+$$;
+REVOKE ALL ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT) FROM anon;
+GRANT EXECUTE ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT)
+    TO authenticated, service_role;
 """
+
+
+# ── 写入返回 0 行的统一处理（审计 COR-010）────────────────────────────────
+
+class WriteReturnedNoRow(RuntimeError):
+    """一次 INSERT/UPDATE 期望回一行、实际 0 行。
+
+    PostgREST 对"匹配 0 行"的 UPDATE **不报错**, 只返回空 data(行已被并发删除 /
+    被 RLS 拦下 / id 根本不存在)。全库有十余处直接 ``res.data[0]`` ——
+    那会抛 ``IndexError: list index out of range``, 在 Streamlit 上表现为一片
+    红屏, 既看不出是哪一步、也不知道该怎么办。
+
+    ``update_version_content``(:1291-1299) 早就为同一个问题做过处理, 但只修了
+    那一个函数。本异常 + ``_first_row`` 把口径推广到全部写入点。
+    """
+
+
+def _first_row(res, op: str, **ctx) -> dict:
+    """取写入返回的第一行; 0 行时抛 ``WriteReturnedNoRow``(带可读上下文)。
+
+    ``res`` 允许为 None —— 调用方的重试循环理论上总会给它赋值, 但真为 None 时
+    抛本异常也比 ``AttributeError`` 有用。
+    """
+    rows = getattr(res, "data", None) or []
+    if rows:
+        return rows[0]
+    ctx_str = " ".join(f"{k}={v}" for k, v in ctx.items() if v)
+    telemetry.log_event(
+        "write_returned_no_row", op=op,
+        **{k: str(v)[:80] for k, v in ctx.items() if v},
+    )
+    raise WriteReturnedNoRow(
+        f"{op} 没有返回任何行（{ctx_str or '无上下文'}）。"
+        "常见原因：这行已被并发删除、或当前登录账号无权改它（RLS）。"
+        "刷新页面后重试；仍失败请把这条信息发给开发者。"
+    )
 
 
 # ── Project CRUD ──────────────────────────────────────────────────────────
@@ -1032,7 +1325,7 @@ def create_project(
     }
     res = client.table("projects").insert(data).execute()
     list_projects.clear()
-    return res.data[0]
+    return _first_row(res, "创建项目", name=name, user_id=user_id)
 
 
 def _record_schema_drift(missing_cols: list[str]) -> None:
@@ -1111,12 +1404,68 @@ def update_project(client: Client, project_id: str, updates: dict) -> dict:
         # R-027: 不再静默——把缺失列塞 session_state 让主页面显式告警一次。
         _record_schema_drift(all_missing)
     list_projects.clear()
-    return res.data[0]
+    return _first_row(res, "保存项目设置", project_id=project_id)
 
 
 def delete_project(client: Client, project_id: str) -> None:
     client.table("projects").delete().eq("id", project_id).execute()
     list_projects.clear()
+
+
+class CalibrationCasRpcMissing(RuntimeError):
+    """``update_calibration_notes_cas`` RPC 还没部署(migrations/002 没跑)。
+
+    调用方据此退回旧的全文 witness 路径 —— 那条路在笔记短时是好的, 只有超过
+    网关 URL 上限才会失败。硬失败会让未迁移的部署彻底学不动, 比现状更糟。
+    """
+
+
+def update_calibration_notes_cas(
+    client: Client,
+    project_id: str,
+    expected_before_text: str,
+    notes: str,
+) -> Optional[dict]:
+    """带 CAS 的 calibration_notes 写入 —— witness 走 md5, 不进 URL(COR-003)。
+
+    返回被更新的行; **返回 None 表示 CAS 冲突**(别的写入抢先改了这一列, 调用方
+    应重读重试)。RPC 不存在时抛 ``CalibrationCasRpcMissing``。
+
+    为什么不能沿用 ``.eq("calibration_notes", <全文>)``: PostgREST 把过滤条件放
+    在 URL query string 里, 而这一列的软上限是 4000 字。中文 URL-encode 后一个
+    字变 9 个字符, 越过网关的请求行上限之后**每一次**自动学习写入都失败, 并被
+    上层 ``except Exception: return None`` 吞掉。详见 CREATE_TABLES_SQL 里
+    ``update_calibration_notes_cas`` 那段注释。
+
+    md5 在这里只做变更检测(冲突的代价是多重试一轮), 不是安全用途。
+    """
+    expected_md5 = hashlib.md5(
+        (expected_before_text or "").encode("utf-8"), usedforsecurity=False,
+    ).hexdigest()
+    try:
+        res = client.rpc("update_calibration_notes_cas", {
+            "_project_id":   project_id,
+            "_expected_md5": expected_md5,
+            "_notes":        notes,
+        }).execute()
+    except Exception as exc:
+        msg = str(exc).lower()
+        if ("could not find the function" in msg
+                or "does not exist" in msg
+                or "pgrst202" in msg):
+            raise CalibrationCasRpcMissing(str(exc)[:200]) from exc
+        raise
+    rows = res.data or []
+    if not rows:
+        return None          # CAS 冲突: 并发已经改过这一列
+    # RPC 绕过 db.update_project, 必须自己失效 list_projects(ttl=60)。否则
+    # "刚沉淀完笔记就排下一批"时, 队列 worker 从缓存拿旧 project 行拼 prompt,
+    # 刚学的笔记看不到 —— 体感"学了没生效"。(R-036 同款理由)
+    try:
+        list_projects.clear()
+    except Exception:
+        pass
+    return rows[0]
 
 
 # ── Batch CRUD ─────────────────────────────────────────────────────────────
@@ -1138,7 +1487,7 @@ def create_batch(
     }
     res = client.table("batches").insert(data).execute()
     list_batches.clear()
-    return res.data[0]
+    return _first_row(res, "创建批次", project_id=project_id, user_id=user_id)
 
 
 @_cache_data(ttl=30, show_spinner=False)
@@ -1229,7 +1578,7 @@ def create_item(
     if ai_review_notes:
         data["ai_review_notes"] = ai_review_notes
     res = client.table("items").insert(data).execute()
-    return res.data[0]
+    return _first_row(res, "创建条目", batch_id=batch_id, user_id=user_id)
 
 
 def delete_items(client: Client, item_ids: list[str]) -> None:
@@ -1409,6 +1758,39 @@ def _parse_pgvector(val) -> Optional[list[float]]:
     return None
 
 
+def _paged_select(build, *, page: int = 1000, hard_cap: Optional[int] = None) -> list[dict]:
+    """按 offset 翻页拉全一个查询的结果(审计 COR-008)。
+
+    ``build(offset, limit)`` 必须**每次从 client.table(...) 重新构造** query ——
+    postgrest-py 复用同一个 builder 时 ``.order()`` 会追加、``.range()`` 的偏移
+    会叠加(``list_items_for_batches`` 的回归用例专门盯着这一点)。
+
+    ⚠️ 终止判据是【空页】而不是【短页】。PostgREST 的 ``db-max-rows`` 会把请求
+    钳短: 服务端上限低于 ``page`` 时**每一页都是短页**, 但后面明明还有行 ——
+    按短页收工就是静默截断。``list_items_for_batches``(:1657-1665 起) 早就
+    为这个坑改过, 但同文件另外三处、以及 deskcore 那处都没跟上, 本函数把
+    口径收成一处。代价只是末尾多发一次拿到空页的请求。
+
+    offset 按【实收行数】前进, 不是按 ``page``: 服务端钳短时按 page 跳会直接
+    漏掉中间那一段。``hard_cap`` 非空时最多取这么多行。
+
+    与 ``deskcore/store._paged`` 是同一套语义(那边不能 import db 之外的东西,
+    保持两份薄实现比引入依赖更合适)。
+    """
+    out: list[dict] = []
+    offset = 0
+    while True:
+        want = page if hard_cap is None else min(page, hard_cap - len(out))
+        if want <= 0:
+            break
+        rows = build(offset, want).execute().data or []
+        out.extend(rows)
+        if not rows:
+            break
+        offset += len(rows)
+    return out
+
+
 def _in_chunks(seq: list, size: int = 100):
     """把 id 列表切成 ≤size 的块, 供 ``.in_()`` 分批查询(R-034)。
 
@@ -1499,13 +1881,19 @@ def _collect_recent_canonical_versions(
         def _fetch_versions(fields: str) -> list[dict]:
             rows: list[dict] = []
             for chunk in _in_chunks(item_ids):
-                res = (
-                    client.table("versions")
-                    .select(fields)
-                    .in_("item_id", chunk)
-                    .execute()
-                )
-                rows.extend(res.data or [])
+                # 审计 COR-008: 按 item 数分块**不等于**按行数分块 —— 一块 100
+                # 个 item, 只要平均迭代过 10 版就能超过 max-rows(常见 1000),
+                # 多出来的 version 静默丢掉, _pick 就可能选不到 best/最新那条。
+                # 每块内部再翻页; .order("id") 给翻页一个唯一稳定的次级键。
+                rows.extend(_paged_select(
+                    lambda off, lim, _c=chunk, _f=fields: (
+                        client.table("versions")
+                        .select(_f)
+                        .in_("item_id", _c)
+                        .order("id")
+                        .range(off, off + lim - 1)
+                    )
+                ))
             return rows
 
         if embedding_ok:
@@ -1541,31 +1929,50 @@ def _collect_recent_canonical_versions(
             out.append((item, chosen))
             if len(out) >= limit:
                 break
-        if len(items) < page_size:
-            break  # 40-batch 窗口已遍历完
+        # 审计 COR-008: 这里原来还有一句 `if len(items) < page_size: break`。
+        # 上面 :1660 已经按【空页】正确收工了, 这句是叠在它之上的【短页】判据 ——
+        # 服务端 db-max-rows 低于 page_size(默认 max(limit,100)=150) 时每一页
+        # 都是短页, 于是第一页就返回, 跨批去重的历史池被腰斩且无声。
+        # 删掉它: 代价是末尾多发一次拿到空页的请求。
     return out
 
 
 def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]:
-    """Insert a batch of first-version rows (``version_num=1``) in one
-    round trip.  Each row should carry ``item_id``, ``ai_engine``, ``title``,
-    ``body``, and optionally ``keywords`` / ``token_usage``.
+    """Insert a batch of first-version rows in one round trip.  Each row
+    should carry ``item_id``, ``ai_engine``, ``title``, ``body``, and
+    optionally ``keywords`` / ``token_usage``.
 
     Used by the batch-generation save path; iteration / manual-edit paths
     still go through ``create_version`` because they need the next available
-    version_num for an existing item."""
+    version_num for an existing item.
+
+    ⚠️ ``version_num`` 在**每个 item 内**按入参顺序编 1..N, 不是全部写 1。
+    (codex review, 2026-08-24 —— 我在 COR-004 里把"同一 item 出现重复
+    version_num"当成罕见竞态, 其实**多引擎批次天生就这样**: 一个 item 有几个
+    引擎就有几条首版, 原来全部硬编码成 1。migrations/003 装上
+    ``UNIQUE(item_id, version_num)`` 之后, 每一个多引擎批次的这次 insert 都会
+    撞 23505; 而 app._save_batch_results 的失败路径会把已建的 items 删掉 ——
+    于是**整批生成完什么也没存下来**, 用户只看到一行"批量写入 versions 失败"。
+    这是本次审计自己引入的、最严重的一处回归。
+
+    编号口径与 migrations/003 的重编号一致(同 item 内按既有顺序从 1 连续排),
+    所以历史数据迁移后与新写入的数据是同一套语义。``create_version`` 之后
+    自然从 N+1 接着走。
+
+    副作用(可接受): 挑"代表版本"的 ``_pick_version`` 按 max(version_num) 取,
+    以前 N 条并列 1 时靠 (created_at, id) 做 tie-break —— 也就是**任意**一条;
+    现在会稳定取到入参里的最后一个引擎。从"不确定"变成"确定", 而真正要紧的
+    场合用户会在审核页显式指定 best_version_id。"""
     if not rows:
         return []
-    # 写入新 version 后 list_items 的 versions(*) 嵌套结果就过时了
-    try:
-        list_items.clear()
-    except Exception:
-        pass
+    seq: dict[str, int] = {}
     payload = []
     for r in rows:
+        item_id = r["item_id"]
+        seq[item_id] = seq.get(item_id, 0) + 1
         payload.append({
-            "item_id":     r["item_id"],
-            "version_num": 1,
+            "item_id":     item_id,
+            "version_num": seq[item_id],
             "ai_engine":   r["ai_engine"],
             "title":       r.get("title", ""),
             "body":        r.get("body", ""),
@@ -1575,6 +1982,14 @@ def bulk_create_initial_versions(client: Client, rows: list[dict]) -> list[dict]
             "token_usage": r.get("token_usage") or {},
         })
     res = client.table("versions").insert(payload).execute()
+    # 审计 COR-009: 失效必须在 INSERT **之后**。原来 clear() 写在前面 ——
+    # clear 与 insert 之间任何并发读(另一个标签页 / 队列横幅那个 2s 自动刷新
+    # 的 fragment)都会把缓存回填成【写入前】的旧快照, 此后 30s 内审核页看不到
+    # 刚生成的版本, 而用户只会觉得"生成完了但卡片是空的"。
+    try:
+        list_items.clear()
+    except Exception:
+        pass
     return res.data or []
 
 
@@ -1699,7 +2114,35 @@ def update_item_status(
         list_items.clear()
     except Exception:
         pass
-    return res.data[0]
+    return _first_row(res, "更新条目状态", item_id=item_id, status=status)
+
+
+def _best_effort_item_patch(
+    client: Client, item_id: str, patch: dict, op: str,
+) -> bool:
+    """给 items 打一个**不阻塞主流程**的补丁; 返回是否真的改到了行。
+
+    审计 ROB-018: 这四个草稿写入原来只 ``except: pass``, 既吞异常也不看
+    受影响行数。PostgREST 对匹配 0 行的 UPDATE **不报错**(行已被并发删除 /
+    RLS 拦下), 于是"保存草稿"这件事可以从头到尾一次没成功过, 而它存在的
+    全部意义就是崩溃后能把用户打的字捞回来 —— 静默失效等于功能不存在。
+
+    仍然不抛(迭代不能被一次草稿写入拖住), 但两种失败都留痕, 可以 grep。
+    """
+    try:
+        res = (
+            client.table("items").update(patch).eq("id", item_id).execute()
+        )
+    except Exception as exc:
+        telemetry.log_event(
+            "item_draft_patch_failed", op=op, item_id=item_id,
+            error=str(exc)[:200],
+        )
+        return False
+    if not (getattr(res, "data", None) or []):
+        telemetry.log_event("item_draft_patch_no_match", op=op, item_id=item_id)
+        return False
+    return True
 
 
 def save_feedback_draft(client: Client, item_id: str, draft: str) -> None:
@@ -1707,31 +2150,18 @@ def save_feedback_draft(client: Client, item_id: str, draft: str) -> None:
     Used to recover the typed text if anything goes wrong mid-iteration."""
     if not item_id:
         return
-    try:
-        (
-            client.table("items")
-            .update({"feedback_draft": (draft or "")})
-            .eq("id", item_id)
-            .execute()
-        )
-    except Exception:
-        # Best-effort save — never block the iteration on a draft write
-        pass
+    _best_effort_item_patch(
+        client, item_id, {"feedback_draft": (draft or "")}, "save_feedback_draft",
+    )
 
 
 def clear_feedback_draft(client: Client, item_id: str) -> None:
     """Clear a previously-saved iteration feedback draft (call on success)."""
     if not item_id:
         return
-    try:
-        (
-            client.table("items")
-            .update({"feedback_draft": None})
-            .eq("id", item_id)
-            .execute()
-        )
-    except Exception:
-        pass
+    _best_effort_item_patch(
+        client, item_id, {"feedback_draft": None}, "clear_feedback_draft",
+    )
 
 
 def save_manual_edit_draft(client: Client, item_id: str, payload: dict) -> None:
@@ -1742,33 +2172,26 @@ def save_manual_edit_draft(client: Client, item_id: str, payload: dict) -> None:
     doesn't surface a stale draft against the wrong baseline."""
     if not item_id or not isinstance(payload, dict):
         return
-    try:
-        (
-            client.table("items")
-            .update({"manual_edit_draft": payload})
-            .eq("id", item_id)
-            .execute()
-        )
-    except Exception:
-        pass
+    _best_effort_item_patch(
+        client, item_id, {"manual_edit_draft": payload}, "save_manual_edit_draft",
+    )
 
 
 def clear_manual_edit_draft(client: Client, item_id: str) -> None:
     """Drop the manual-refine draft, e.g. after a successful save."""
     if not item_id:
         return
-    try:
-        (
-            client.table("items")
-            .update({"manual_edit_draft": None})
-            .eq("id", item_id)
-            .execute()
-        )
-    except Exception:
-        pass
+    _best_effort_item_patch(
+        client, item_id, {"manual_edit_draft": None}, "clear_manual_edit_draft",
+    )
 
 
 # ── Version CRUD ───────────────────────────────────────────────────────────
+
+# create_version 撞 (item_id, version_num) 唯一约束时的重试参数(审计 COR-004)。
+# 并发迭代同一个 item 是低频事件, 3 次足够; 退避很短, 因为冲突方已经写完了。
+_VERSION_NUM_RETRIES = 3
+_VERSION_NUM_RETRY_DELAY = 0.05  # seconds
 
 def create_version(
     client: Client,
@@ -1781,34 +2204,66 @@ def create_version(
     images: Optional[list] = None,
     token_usage: Optional[dict] = None,
 ) -> dict:
-    # Determine next version number
-    existing = (
-        client.table("versions")
-        .select("version_num")
-        .eq("item_id", item_id)
-        .order("version_num", desc=True)
-        .limit(1)
-        .execute()
-    )
-    next_num = (existing.data[0]["version_num"] + 1) if existing.data else 1
+    """给 item 追加一个版本, ``version_num`` = 当前最大值 + 1。
 
-    data = {
-        "item_id": item_id,
-        "version_num": next_num,
-        "ai_engine": ai_engine,
-        "title": title,
-        "body": body,
-        "keywords": keywords or [],
-        "feedback": feedback,
-        "images": images or [],
-        "token_usage": token_usage or {},
-    }
-    res = client.table("versions").insert(data).execute()
-    try:
-        list_items.clear()
-    except Exception:
-        pass
-    return res.data[0]
+    审计 COR-004: 这里是「读 max → +1 → 插入」, 而 ``(item_id, version_num)``
+    上原来**没有唯一约束**。同一个 item 并发迭代(两个标签页、或"AI 迭代"与
+    "手动精修"同时提交)会各自读到同一个 max, 双双写入同一个 version_num。
+    后果不是报错而是**排序不确定**: ``list_approved_versions_for_sync`` 和
+    ``_pick_version`` 都按 ``max(version_num, created_at, id)`` 挑代表版本,
+    并列时挑中哪条要看 tie-break, 于是 best 指针可能指向被覆盖的那一版,
+    导出和送模型避重的都是旧文。
+
+    修法两层:
+      · migrations/003 加 ``UNIQUE(item_id, version_num)`` —— 让数据库来保证,
+        并发写入必有一方撞 23505 而不是两条都进去;
+      · 这里捕获唯一冲突后重读 max 重试。唯一约束缺失(迁移没跑)时行为与
+        原来完全一致 —— 只是没有那道保护。
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_VERSION_NUM_RETRIES):
+        existing = (
+            client.table("versions")
+            .select("version_num")
+            .eq("item_id", item_id)
+            .order("version_num", desc=True)
+            .limit(1)
+            .execute()
+        )
+        next_num = (existing.data[0]["version_num"] + 1) if existing.data else 1
+
+        data = {
+            "item_id": item_id,
+            "version_num": next_num,
+            "ai_engine": ai_engine,
+            "title": title,
+            "body": body,
+            "keywords": keywords or [],
+            "feedback": feedback,
+            "images": images or [],
+            "token_usage": token_usage or {},
+        }
+        try:
+            res = client.table("versions").insert(data).execute()
+        except Exception as exc:
+            last_exc = exc
+            if _is_unique_violation(exc) and attempt < _VERSION_NUM_RETRIES - 1:
+                # 并发写入抢先占了这个号: 退避一下重读 max 再试
+                telemetry.log_event(
+                    "create_version_num_conflict",
+                    item_id=item_id, version_num=next_num, attempt=attempt + 1,
+                )
+                time.sleep(_VERSION_NUM_RETRY_DELAY * (attempt + 1))
+                continue
+            raise
+        try:
+            list_items.clear()
+        except Exception:
+            pass
+        return _first_row(res, "创建版本", item_id=item_id, version_num=next_num)
+    # 控制流到这里说明重试用尽且最后一次是唯一冲突
+    assert last_exc is not None
+    raise last_exc
 
 
 def list_versions(client: Client, item_id: str) -> list[dict]:
@@ -1985,17 +2440,56 @@ def _invalidate_memory_caches() -> None:
 # （会和历史脏数据冲突无法添加），所以用 app 层的 keyed lock 兜底单进程部署。
 # 多 worker / 多 instance 场景仍有残余竞态，但 UPDATE 走 CAS 至少能检测出冲突
 # 并重试。
-_MEMORY_UPSERT_LOCKS: dict[str, threading.Lock] = {}
+#
+# 审计 SUP-008: 这个字典原来**永不删项** —— 每见过一条规则文本就永久留一把
+# Lock。规则是用户反馈驱动的、内容各不相同, 长跑进程里它只增不减。
+#
+# 加上限的做法有个坑必须避开: 【不能淘汰正在被人用的锁】。一旦把某个 key 的
+# Lock 换成新对象, 已经拿着旧锁的线程和随后拿到新锁的线程就不再互斥 ——
+# 而这把锁存在的全部意义就是互斥。所以这里按【引用计数】淘汰: 只有当前没有
+# 任何调用方持有或正准备持有(users == 0)的项才可能被清掉。
+#
+# 计数在拿锁【之前】就 +1(还没 acquire 时也算"正在用"), 否则会出现这个窗口:
+# 线程 A 取到锁对象但还没 acquire → 别的线程触发淘汰 → 线程 C 拿到一把新锁
+# → A 和 C 各锁各的。这个竞态很窄, 但后果正是 frequency 丢增量 / 双插重复行,
+# 而那正是本锁要防的东西。
+_MEMORY_UPSERT_LOCKS: "OrderedDict[str, list]" = OrderedDict()   # key -> [Lock, users]
 _MEMORY_UPSERT_LOCKS_GUARD = threading.Lock()
+_MEMORY_UPSERT_LOCKS_MAX = 512
 
 
-def _get_memory_upsert_lock(key: str) -> threading.Lock:
+@contextlib.contextmanager
+def _memory_upsert_lock(key: str):
+    """按 key 串行化, 锁池带上限(审计 SUP-008)。"""
     with _MEMORY_UPSERT_LOCKS_GUARD:
-        lk = _MEMORY_UPSERT_LOCKS.get(key)
-        if lk is None:
-            lk = threading.Lock()
-            _MEMORY_UPSERT_LOCKS[key] = lk
-        return lk
+        entry = _MEMORY_UPSERT_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _MEMORY_UPSERT_LOCKS[key] = entry
+        entry[1] += 1                       # 先占住, 再去 acquire
+        _MEMORY_UPSERT_LOCKS.move_to_end(key)
+        _evict_idle_memory_locks()
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _MEMORY_UPSERT_LOCKS_GUARD:
+            entry[1] -= 1
+
+
+def _evict_idle_memory_locks() -> None:
+    """把最久没用、且【当前没人用】的锁清掉。调用方必须已持有 GUARD。
+
+    从 LRU 端往新的方向扫, 跳过 users > 0 的项。全都在用时就不淘汰 ——
+    此刻字典确实超上限, 但那是真实并发量, 不是泄漏; 用完自然会掉下来。
+    """
+    if len(_MEMORY_UPSERT_LOCKS) <= _MEMORY_UPSERT_LOCKS_MAX:
+        return
+    for k in list(_MEMORY_UPSERT_LOCKS.keys()):
+        if len(_MEMORY_UPSERT_LOCKS) <= _MEMORY_UPSERT_LOCKS_MAX:
+            break
+        if _MEMORY_UPSERT_LOCKS[k][1] == 0:
+            del _MEMORY_UPSERT_LOCKS[k]
 
 
 def upsert_memory(
@@ -2040,7 +2534,7 @@ def upsert_memory(
     lock_key = hashlib.sha256(
         f"{user_id}|{scope}|{project_id or ''}|{content}".encode("utf-8")
     ).hexdigest()
-    with _get_memory_upsert_lock(lock_key):
+    with _memory_upsert_lock(lock_key):
         return _upsert_memory_locked(
             client, user_id, scope, content, source_feedback,
             project_id=project_id,
@@ -2214,7 +2708,7 @@ def _upsert_memory_locked(
             data.pop(col, None)
         res = client.table("memories").insert(data).execute()
     _invalidate_memory_caches()
-    return res.data[0]
+    return _first_row(res, "写入记忆", scope=scope, content=content[:60])
 
 
 def insert_calibration_audit(
@@ -2497,7 +2991,7 @@ def increment_memory_frequency(client: Client, memory_id: str) -> dict:
         .execute()
     )
     _invalidate_memory_caches()
-    return res.data[0]
+    return _first_row(res, "累加记忆频次", memory_id=memory_id)
 
 
 def update_memory(client: Client, memory_id: str, updates: dict) -> dict:
@@ -2505,7 +2999,7 @@ def update_memory(client: Client, memory_id: str, updates: dict) -> dict:
         client.table("memories").update(updates).eq("id", memory_id).execute()
     )
     _invalidate_memory_caches()
-    return res.data[0]
+    return _first_row(res, "更新记忆", memory_id=memory_id)
 
 
 def delete_memory(client: Client, memory_id: str) -> None:
@@ -2533,7 +3027,7 @@ def set_item_example_label(
             fn.clear()
         except Exception:
             pass
-    return res.data[0]
+    return _first_row(res, "标记正负例", item_id=item_id, label=label)
 
 
 @_cache_data(ttl=120, show_spinner=False)
@@ -2816,6 +3310,42 @@ def get_confirmed_memories(
     return global_mems, project_mems
 
 
+def parse_ts(value) -> Optional[datetime]:
+    """把 PG 回来的时间戳统一解析成 **aware UTC** datetime; 解析不了返回 None。
+
+    容忍四种真实形态:
+      - ``datetime`` 对象(aware 或 naive; naive 按 UTC 解释)
+      - ISO 串带 ``+00:00``
+      - ISO 串带 ``Z``
+      - ISO 串**无时区后缀**(老数据), 以及 7 位微秒(某些 PG client 会这么回,
+        而 ``fromisoformat`` 只吃到 6 位)
+
+    ⚠️ 时间戳一律走这里, 不要在别处再写一份。用字符串字典序比较 ISO 串是
+    本仓反复踩过的坑: naive 与 aware 混排会判反(``+`` 的码位小于任何数字),
+    带微秒与不带微秒混排也会差一秒(``.`` 的码位大于 ``+``)。COR-007 就是
+    deskcore 自己写了一份判定, 对 naive 输入抛异常后 fail-open 成"没静音"。
+    """
+    if not value:
+        return None
+    try:
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            s = str(value).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(s)
+            except ValueError:
+                # 截掉超出 6 位的小数秒后重试
+                dt = datetime.fromisoformat(re.sub(r"\.(\d{6})\d+", r".\1", s))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
 def is_memory_muted_now(muted_until) -> bool:
     """True iff ``muted_until`` (raw column value) is in the future, UTC.
 
@@ -2833,27 +3363,10 @@ def is_memory_muted_now(muted_until) -> bool:
     Failure-safe：解析失败一律返回 False（"未静音"）—— 用户看到一条规则
     生效，比"明明设置静音但不生效"的反向 bug 影响小。
     """
-    if not muted_until:
+    mu = parse_ts(muted_until)
+    if mu is None:
         return False
-    try:
-        if isinstance(muted_until, datetime):
-            mu = muted_until
-        else:
-            s = str(muted_until).strip()
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            try:
-                mu = datetime.fromisoformat(s)
-            except ValueError:
-                # 进一步兜底：截掉小数秒后再试（某些 PG client 把 7 位微秒
-                # 返回成字符串，fromisoformat 只接受最多 6 位）
-                s2 = re.sub(r"\.(\d{6})\d+", r".\1", s)
-                mu = datetime.fromisoformat(s2)
-        if mu.tzinfo is None:
-            mu = mu.replace(tzinfo=timezone.utc)
-        return mu > datetime.now(timezone.utc)
-    except Exception:
-        return False
+    return mu > datetime.now(timezone.utc)
 
 
 def _is_muted(memory_row: dict) -> bool:
@@ -3112,26 +3625,20 @@ def get_session_committed_item_ids(client: Client, session_id: str) -> set:
     session_messages_session_item_uniq 兜底防重复行)。
     """
     out: set = set()
-    page = 1000
-    offset = 0
     try:
-        while True:
-            res = (
-                client.table("session_messages")
-                .select("item_id")
-                .eq("session_id", session_id)
-                .not_.is_("item_id", "null")
-                .order("id")
-                .range(offset, offset + page - 1)
-                .execute()
-            )
-            rows = res.data or []
-            for r in rows:
-                if r.get("item_id"):
-                    out.add(r["item_id"])
-            if len(rows) < page:
-                break
-            offset += page
+        # 审计 COR-008: 原来是「短页收工 + offset 按 page 跳」。服务端把每页
+        # 钳短时前者第一页就停、后者会跳过中间那一段 —— 两种都让 committed
+        # set 不全, 于是懒同步把已同步的 item 当成新的重复 append。
+        for r in _paged_select(lambda off, lim: (
+            client.table("session_messages")
+            .select("item_id")
+            .eq("session_id", session_id)
+            .not_.is_("item_id", "null")
+            .order("id")
+            .range(off, off + lim - 1)
+        )):
+            if r.get("item_id"):
+                out.add(r["item_id"])
         return out
     except Exception as exc:
         telemetry.log_event(
@@ -3194,27 +3701,21 @@ def list_approved_versions_for_sync(
         # 静默截断, _pick_version 可能漏掉 best_version_id 指向的行 / 回退到非
         # 最新版本(同 get_session_committed_item_ids 的分页理由)。必须 .order
         # ("id") 才能安全翻页(主键唯一稳定, 跨页不跳不重)。
+        # 审计 COR-008: 翻页改走 _paged_select —— 原来是「短页收工 + offset 按
+        # page 跳」, 服务端钳短时前者第一页就停、后者跳过中间那段, 恰好是上面
+        # 这段注释声称已经解决的那个静默截断。
         versions_by_item: dict = {}
         id_chunk = 200
-        page = 1000
         for i in range(0, len(item_ids), id_chunk):
             sub = item_ids[i:i + id_chunk]
-            offset = 0
-            while True:
-                vres = (
-                    client.table("versions")
-                    .select("id, item_id, version_num, title, body, keywords, created_at")
-                    .in_("item_id", sub)
-                    .order("id")
-                    .range(offset, offset + page - 1)
-                    .execute()
-                )
-                rows = vres.data or []
-                for v in rows:
-                    versions_by_item.setdefault(v.get("item_id"), []).append(v)
-                if len(rows) < page:
-                    break
-                offset += page
+            for v in _paged_select(lambda off, lim, _s=sub: (
+                client.table("versions")
+                .select("id, item_id, version_num, title, body, keywords, created_at")
+                .in_("item_id", _s)
+                .order("id")
+                .range(off, off + lim - 1)
+            )):
+                versions_by_item.setdefault(v.get("item_id"), []).append(v)
 
         def _pick_version(it: dict) -> Optional[dict]:
             """优先 best_version_id 指向的版本; 没有(或指向的版本已不存在)则
@@ -3432,20 +3933,31 @@ def seal_session(client: Client, session_id: str, reason: str) -> bool:
     不报错。reason 必须在 schema CHECK 列表内
     (window_full / context_error / base_changed / manual),
     否则 PG 拒绝。
+
+    审计 ROB-018: 必须看**受影响行数**, 不能只看"没抛异常"。0 行匹配时
+    PostgREST 照样返回成功 —— 而 seal 失败意味着这个 session 继续被路由到,
+    prefix 会一路涨过 window_limit 直到 API 真的返回 context_length_exceeded。
+    调用方 (_update_session_occupancy) 拿返回值决定要不要告诉用户"已封窗",
+    谎报成功就变成"提示说换了新窗、实际还在老窗上撞墙"。
     """
     try:
-        client.table("generation_sessions").update({
+        res = client.table("generation_sessions").update({
             "status":      "sealed",
             "seal_reason": reason,
             "sealed_at":   datetime.now(timezone.utc).isoformat(),
         }).eq("id", session_id).execute()
-        return True
     except Exception as exc:
         telemetry.log_event(
             "session_seal_failed",
             session_id=session_id, reason=reason, error=str(exc)[:200],
         )
         return False
+    if not (getattr(res, "data", None) or []):
+        telemetry.log_event(
+            "session_seal_no_match", session_id=session_id, reason=reason,
+        )
+        return False
+    return True
 
 
 def list_project_sessions(
@@ -3533,7 +4045,7 @@ def insert_job(
     if project_id:
         row["project_id"] = project_id
     res = client.table("jobs").insert(row).execute()
-    return res.data[0]
+    return _first_row(res, "入队任务", kind=kind, user_id=user_id)
 
 
 def get_job(client: Client, job_id: str) -> Optional[dict]:
@@ -3589,14 +4101,22 @@ def claim_one_job(
 def update_job_progress(
     client: Client, job_id: str, pct: int, message: Optional[str] = None
 ) -> None:
-    """handler 更新进度; UI 轮询同一行即可看到。失败不抛（埋点）。"""
+    """handler 更新进度; UI 轮询同一行即可看到。失败不抛（埋点）。
+
+    审计 ROB-018: 0 行匹配也要留痕。job 被取消 / 被 sweeper 退回重领之后,
+    stale worker 仍会一路刷进度, 每次都"成功"但一行没改 —— 进度条在 UI 上
+    冻住不动, 而日志里什么都没有。
+    """
     patch: dict[str, Any] = {"progress_pct": int(pct)}
     if message is not None:
         patch["progress_message"] = message
     try:
-        client.table("jobs").update(patch).eq("id", job_id).execute()
+        res = client.table("jobs").update(patch).eq("id", job_id).execute()
     except Exception as exc:
         telemetry.log_event("job_progress_failed", job_id=str(job_id), error=str(exc)[:200])
+        return
+    if not (getattr(res, "data", None) or []):
+        telemetry.log_event("job_progress_no_match", job_id=str(job_id), pct=int(pct))
 
 
 def heartbeat_job(client: Client, job_id: str, worker_id: Optional[str] = None) -> None:
@@ -3716,16 +4236,52 @@ def sweep_dead_jobs(client: Client, timeout_seconds: int) -> int:
     worker 主循环定期调一次。返回回收的 job 数。失败安全（埋点不抛）。
     每条退回都带 ``expected_claimed_by=候选行的 claimed_by`` 做 CAS, 防止读候选
     后、写之前该行已被另一 worker 重领 —— 那种情况跳过, 不打断新 worker（review #3）。
+
+    审计 ROB-009: 光靠 ``heartbeat_at < cutoff`` 会**永远漏掉 heartbeat_at 为
+    NULL 的行**。SQL 里 ``NULL < x`` 求值为 NULL 而不是 true, 所以那种行既不
+    满足条件、也不会被任何一轮 sweep 看到 —— 一条 claimed/running 但没有心跳的
+    job 就此永久占位, 既不执行也不回收, 而队列面板上它一直显示"运行中"。
+    claim_one_job 正常会写 heartbeat_at, 但手工改状态、或将来新增的领取路径
+    漏写, 都会造出这种行; sweeper 是最后一道回收闸, 不该对它盲。
+    NULL 心跳的行改用 ``claimed_at`` 判超时(两者都为 NULL 时无条件视为僵尸)。
+    分两次查而不是拼 or= 过滤串: 时间戳里的 ``+`` 在 query string 里会被解成
+    空格、``.`` 又是 PostgREST 过滤语法的分隔符, 手拼容易出隐蔽的错。
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)).isoformat(timespec="seconds")
     try:
-        res = (
+        stale = (
             client.table("jobs").select("*")
             .in_("status", ["claimed", "running"])
             .lt("heartbeat_at", cutoff)
             .execute()
-        )
-        dead = res.data or []
+        ).data or []
+        # 心跳为 NULL 的候选: 按 claimed_at 判超时
+        no_hb = (
+            client.table("jobs").select("*")
+            .in_("status", ["claimed", "running"])
+            .is_("heartbeat_at", "null")
+            .execute()
+        ).data or []
+        cutoff_dt = parse_ts(cutoff)
+        orphans = []
+        for j in no_hb:
+            claimed = parse_ts(j.get("claimed_at"))
+            # claimed_at 也为空 = 这行根本没走过正常领取路径, 无条件视为僵尸
+            if claimed is None or (cutoff_dt is not None and claimed < cutoff_dt):
+                orphans.append(j)
+        if orphans:
+            telemetry.log_event(
+                "job_sweep_null_heartbeat", count=len(orphans),
+                ids=",".join(str(j.get("id")) for j in orphans[:5]),
+            )
+        seen: set = set()
+        dead = []
+        for j in stale + orphans:
+            jid = j.get("id")
+            if jid in seen:
+                continue
+            seen.add(jid)
+            dead.append(j)
     except Exception as exc:
         telemetry.log_event("job_sweep_query_failed", error=str(exc)[:200])
         return 0

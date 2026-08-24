@@ -6,6 +6,7 @@ Provides sign-up, sign-in, sign-out, and session management helpers.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import time
 from datetime import datetime, timedelta, timezone
@@ -146,6 +147,9 @@ def _fresh_auth_client() -> Client:
 
     ``auto_refresh_token=False``: 一次性 client 不需要 GoTrue 的后台刷新
     定时器, 关掉避免 throwaway 对象留下 timer 引用。
+
+    ⚠️ 用完必须关。优先用下面的 ``_auth_client()`` 上下文管理器, 别直接调本
+    函数 —— 见 ROB-013。
     """
     from supabase import create_client
     from supabase.client import ClientOptions
@@ -155,14 +159,33 @@ def _fresh_auth_client() -> Client:
     )
 
 
+@contextlib.contextmanager
+def _auth_client():
+    """一次性 auth client, 出作用域即关连接(审计 ROB-013)。
+
+    原来四个调用点各自 ``create_client`` 之后【从不关闭】。每个 client 底下是
+    一组 httpx 连接池 + 文件描述符, 而 ``_try_refresh_session`` /
+    ``_try_cookie_restore`` 是**每次 rerun 都可能走**的路径 —— Streamlit 一个
+    进程跑几天, 描述符只增不减, 最后 Too many open files。真正难查的是它的
+    表现: 不是"登录失败", 是所有查询突然开始超时, 没人会往登录这边想。
+
+    关连接放在 finally: 服务端调用抛异常时更要关(那正是重试最频繁的时候)。
+    """
+    client = _fresh_auth_client()
+    try:
+        yield client
+    finally:
+        db.close_client(client)
+
+
 def sign_up(email: str, password: str) -> dict:
     """
     Register a new user.
     Returns {"user": ..., "session": ..., "email_confirmation_required": bool}.
     Raises on hard errors (e.g. email already registered, rate limit).
     """
-    client = _fresh_auth_client()
-    res = client.auth.sign_up({"email": email, "password": password})
+    with _auth_client() as client:
+        res = client.auth.sign_up({"email": email, "password": password})
     if res.user is None:
         raise ValueError("注册失败，请稍后重试。")
     email_confirmation_required = res.session is None
@@ -175,8 +198,8 @@ def sign_up(email: str, password: str) -> dict:
 
 def sign_in(email: str, password: str) -> dict:
     """Sign in with email/password. Raises on error."""
-    client = _fresh_auth_client()
-    res = client.auth.sign_in_with_password({"email": email, "password": password})
+    with _auth_client() as client:
+        res = client.auth.sign_in_with_password({"email": email, "password": password})
     if res.user is None:
         raise ValueError("邮箱或密码不正确。")
     return {"user": res.user, "session": res.session}
@@ -200,9 +223,9 @@ def sign_out() -> None:
             at = getattr(session, "access_token", None) or st.session_state.get("access_token")
             rt = getattr(session, "refresh_token", None)
             if at and rt:
-                client = _fresh_auth_client()
-                client.auth.set_session(at, rt)
-                client.auth.sign_out()
+                with _auth_client() as client:
+                    client.auth.set_session(at, rt)
+                    client.auth.sign_out()
         except Exception:
             # 服务端吊销失败(网络/票据已过期)不阻塞本地登出 —— 与旧行为一致;
             # cookie 与 session_state 在下方照常清理。
@@ -230,10 +253,13 @@ def sign_out() -> None:
             fn.clear()
         except Exception:
             pass
-    try:
-        db._make_client_cached.clear()
-    except Exception:
-        pass
+    # 审计 SUP-007: 这里**故意不再** db._make_client_cached.clear()。
+    # 那是 st.cache_resource, 进程级共享 —— 一个人点登出会把【所有在线用户】
+    # 的 client 一起清掉, 别人下一次查询全部重建连接池, 而且完全看不出原因。
+    # 也根本没必要: 那个缓存按 access_token 分键, 换个人登录本来就拿不到上一个
+    # 人的 client。登出这人自己那一份留到 ttl(2h)自然过期即可。
+    # 上面那一圈 fn.clear() 不一样, 必须保留 —— 那些 cache_data 的 key 里
+    # 【没有】user 维度, 不清的话下一个登录的人会看到上一个人的行。
 
 
 def get_authenticated_client() -> Optional[Client]:
@@ -277,8 +303,8 @@ def _try_refresh_session(cm) -> bool:
     try:
         # R-037: refresh 也走一次性 client —— 在共享单例上 refresh 会把本
         # 用户的 session 存进单例, 污染其他用户的 auth 状态(见 _fresh_auth_client)。
-        client = _fresh_auth_client()
-        res = client.auth.refresh_session(session.refresh_token)
+        with _auth_client() as client:
+            res = client.auth.refresh_session(session.refresh_token)
         if res.session and res.user:
             _store_session({"session": res.session, "user": res.user}, cm=cm)
             return True
@@ -294,8 +320,8 @@ def _try_cookie_restore(cm, refresh_token: Optional[str]) -> bool:
         return False
     try:
         # R-037: 同 _try_refresh_session —— 一次性 client, 不污染共享单例。
-        client = _fresh_auth_client()
-        res = client.auth.refresh_session(refresh_token)
+        with _auth_client() as client:
+            res = client.auth.refresh_session(refresh_token)
         if res.session and res.user:
             _store_session({"session": res.session, "user": res.user}, cm=cm)
             return True

@@ -631,6 +631,1641 @@ jobs:
           print("\ndeskcore round-8 回归: 5/5 通过")
           PY
 
+      - name: 审计第一批止血回归 (COR-003/005/006/007/010 · 2026-08-23)
+        run: |
+          python - <<'PY'
+          # docs/audit-2026-08-23-full.md 第 1 批(止血)的回归。全部假件, 不联网。
+          # ROB-003(deskcore fail-closed)在下面 "app 冒烟" 那一步里测, 因为它要真起服务。
+          import ast, os, hashlib, inspect, textwrap
+          os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
+          import db, memory as M, deskcore.store as S
+
+          class _R:
+              def __init__(s, d): s.data = d
+
+          # ══ COR-010: 写入返回 0 行必须是可读异常, 不是 IndexError ══════════
+          # PostgREST 对"匹配 0 行"的 UPDATE 不报错、只回空 data(行被并发删 /
+          # RLS 拦下)。裸 res.data[0] 会抛 IndexError, 在 Streamlit 上是一片红屏,
+          # 既看不出哪一步也不知道怎么办。
+          class _Q0:
+              def __init__(s, out): s.out = out; s.mode = None
+              def insert(s,*a,**k): s.mode="ins"; return s
+              def update(s,*a,**k): s.mode="upd"; return s
+              def select(s,*a,**k): s.mode="sel"; return s
+              def eq(s,*a,**k): return s
+              def order(s,*a,**k): return s
+              def limit(s,*a,**k): return s
+              def execute(s):
+                  if s.mode == "sel": return _R([{"version_num": 3}])
+                  return _R(s.out)
+          class _SB0:
+              def __init__(s, out): s.out = out
+              def table(s,*a,**k): return _Q0(s.out)
+
+          WRITES = [
+              ("创建项目",     lambda c: db.create_project(c, "u", "n")),
+              ("创建批次",     lambda c: db.create_batch(c, "u", "p", "t", {}, ["claude"])),
+              ("创建条目",     lambda c: db.create_item(c, "u", "b")),
+              ("创建版本",     lambda c: db.create_version(c, "i", "claude", "t", "b")),
+              ("更新条目状态", lambda c: db.update_item_status(c, "i", "approved")),
+              ("标记正负例",   lambda c: db.set_item_example_label(c, "i", "positive")),
+              ("更新记忆",     lambda c: db.update_memory(c, "m", {"content": "x"})),
+              ("入队任务",     lambda c: db.insert_job(c, "noop", {}, "u")),
+          ]
+          for name, fn in WRITES:
+              try:
+                  fn(_SB0([]))
+                  raise AssertionError(f"{name}: 0 行居然没报错")
+              except IndexError:
+                  raise AssertionError(f"{name}: 仍抛 IndexError(红屏), 没走 _first_row")
+              except db.WriteReturnedNoRow as e:
+                  assert name in str(e) and "RLS" in str(e), str(e)
+              assert fn(_SB0([{"id": "x1"}])) == {"id": "x1"}, name
+          # res=None 也不能炸成 AttributeError
+          try:
+              db._first_row(None, "假操作"); raise AssertionError
+          except db.WriteReturnedNoRow: pass
+          # 全库不该再留【无守卫】的 return <x>.data[0]。
+          # 用 AST 而不是文本匹配: `if res.data: return res.data[0]` 和
+          # `return res.data[0] if res.data else None` 都是安全的, 按行 grep
+          # 会把它们一起误报(round-5 §6 已经为"文本匹配不可靠"写过理由)。
+          import ast as _ast
+          _tree = _ast.parse(open("db.py", encoding="utf-8").read())
+          _parent = {}
+          for _n in _ast.walk(_tree):
+              for _c in _ast.iter_child_nodes(_n):
+                  _parent[_c] = _n
+
+          def _is_data_index(n):
+              return (isinstance(n, _ast.Subscript)
+                      and isinstance(n.value, _ast.Attribute) and n.value.attr == "data"
+                      and isinstance(n.value.value, _ast.Name)
+                      and isinstance(getattr(n.slice, "value", None), int))
+
+          def _has_data_guard(n):
+              p = _parent.get(n)
+              while p is not None and not isinstance(p, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                  if isinstance(p, _ast.If) and any(
+                          isinstance(a, _ast.Attribute) and a.attr == "data"
+                          for a in _ast.walk(p.test)):
+                      return True
+                  p = _parent.get(p)
+              return False
+
+          bare = [n.lineno for n in _ast.walk(_tree)
+                  if isinstance(n, _ast.Return) and n.value is not None
+                  and _is_data_index(n.value) and not _has_data_guard(n)]
+          assert not bare, (
+              f"db.py:{bare} 还有无守卫的 return <x>.data[0] —— 0 行匹配时会抛 "
+              "IndexError 红屏; 走 _first_row() 或自己判空")
+          print(f"  ✓ COR-010 {len(WRITES)} 个写入点 0 行 → WriteReturnedNoRow(可读); 无裸 res.data[0] 残留")
+
+          # ══ COR-003: 调教笔记 CAS 的 witness 不许进 URL ════════════════════
+          # 旧写法 .eq("calibration_notes", <全文>) 把最长 4000 字的笔记塞进
+          # PostgREST 的 query string(中文 URL-encode 后 ×9 ≈ 36KB), 越过网关
+          # 请求行上限后每次写入都失败, 并被上层 except 吞掉 —— 四条自动学习
+          # 路径静默停摆, 且笔记越长越先坏。
+          def _md5(t): return hashlib.md5((t or "").encode(), usedforsecurity=False).hexdigest()
+          LONG = "- " + "很长的观察行" * 700          # ~4200 字, 贴着软上限
+          seen = {}
+          class _RpcSB:
+              def __init__(s, ret=None, missing=False): s.ret, s.missing = ret, missing
+              def rpc(s, name, params):
+                  if s.missing:
+                      class _X:
+                          def execute(_): raise Exception("PGRST202 Could not find the function")
+                      return _X()
+                  seen.update(name=name, params=params)
+                  class _X:
+                      def execute(_): return _R(s.ret)
+                  return _X()
+              def table(s,*a,**k):
+                  raise AssertionError("RPC 可用时不该再走 .table() 全文过滤")
+          row = db.update_calibration_notes_cas(
+              _RpcSB([{"id": "p1", "calibration_notes": "new"}]), "p1", LONG, "new")
+          assert row["id"] == "p1"
+          assert seen["name"] == "update_calibration_notes_cas"
+          assert seen["params"]["_expected_md5"] == _md5(LONG)
+          assert len(seen["params"]["_expected_md5"]) == 32
+          assert LONG not in "".join(map(str, seen["params"].values())), "全文还是进了请求"
+          assert db.update_calibration_notes_cas(_RpcSB([]), "p", LONG, "n") is None, \
+              "RPC 回 0 行应表示 CAS 冲突"
+          # 空 witness: COALESCE 让 NULL 与 '' 同态, R-036 的 or_ 特例不再需要
+          db.update_calibration_notes_cas(_RpcSB([{"id": "p"}]), "p", "", "x")
+          assert seen["params"]["_expected_md5"] == _md5("")
+          # RPC 没部署 → 专用异常(调用方降级); 其它错误必须原样上抛
+          try:
+              db.update_calibration_notes_cas(_RpcSB(missing=True), "p", "", "x")
+              raise AssertionError
+          except db.CalibrationCasRpcMissing: pass
+          class _BoomRpc:
+              def rpc(s,*a,**k):
+                  class _X:
+                      def execute(_): raise Exception("permission denied for function")
+                  return _X()
+          try:
+              db.update_calibration_notes_cas(_BoomRpc(), "p", "", "x"); raise AssertionError
+          except db.CalibrationCasRpcMissing:
+              raise AssertionError("权限错误被误判成 RPC 不存在 → 会静默降级")
+          except Exception as e:
+              assert "permission denied" in str(e)
+          # memory 侧: CAS 主路径不许再出现全文过滤。
+          # 同样必须走 AST —— 上面那段 docstring 里就引用了旧写法来解释为什么
+          # 换掉它, 文本匹配会把它当成"还在用"(round-5 §6 同一个教训)。
+          _fn = next(n for n in _ast.walk(_ast.parse(open("memory.py", encoding="utf-8").read()))
+                     if isinstance(n, _ast.FunctionDef) and n.name == "save_calibration_notes")
+          _calls = [n for n in _ast.walk(_fn) if isinstance(n, _ast.Call)]
+          def _called(name):
+              return any(isinstance(c.func, _ast.Attribute) and c.func.attr == name
+                         or isinstance(c.func, _ast.Name) and c.func.id == name
+                         for c in _calls)
+          assert _called("update_calibration_notes_cas"), "save 没接 md5 RPC"
+          assert _called("_legacy_cas_update"), "缺未迁移部署的降级退路"
+          _bad_eq = [c for c in _calls
+                     if isinstance(c.func, _ast.Attribute) and c.func.attr == "eq"
+                     and c.args and isinstance(c.args[0], _ast.Constant)
+                     and c.args[0].value == "calibration_notes"]
+          assert not _bad_eq, "CAS 主路径还在把笔记全文塞进 .eq() 过滤"
+          # 两份 SQL 的语义必须一致(限定写法本来就不同, 对齐判据/授权三处)
+          for f in ("migrations/002_calibration_cas.sql", "db.py"):
+              t = open(f, encoding="utf-8").read()
+              assert "update_calibration_notes_cas" in t, f"{f} 缺 CAS 函数"
+              assert "md5(COALESCE(p.calibration_notes, '')) = _expected_md5" in t, \
+                  f"{f} 的 CAS 判据不一致"
+              assert "TO authenticated, service_role" in t, f"{f} 授权不一致"
+              assert "FROM anon" in t, f"{f} 没 REVOKE anon"
+          print(f"  ✓ COR-003 {len(LONG)} 字笔记的 witness 压成 32 字节 md5; 冲突/未部署/权限错三态分清; 两份 SQL 判据一致")
+
+          # ══ COR-007: 静音判定必须复用 db.is_memory_muted_now ═══════════════
+          # 本地那版对 naive ISO 和 7 位微秒会抛异常 → except 返 True →
+          # 【被静音的规则照常注入 P0/P1】。
+          class _MQ:
+              def __init__(s, rows): s.r = rows
+              def select(s,*a,**k): return s
+              def eq(s,*a,**k): return s
+              def or_(s,*a,**k): return s
+              def execute(s): return _R(s.r)
+          class _MSB:
+              def __init__(s, rows): s.r = rows
+              def table(s,*a,**k): return _MQ(s.r)
+          base = dict(severity="soft", scope="project", memory_type="rule",
+                      created_at="2026-01-01", frequency=1)
+          rows = [
+              dict(base, id="naive", content="naive 静音", muted_until="2099-01-01T00:00:00"),
+              dict(base, id="us7",   content="7us 静音",   muted_until="2099-01-01T00:00:00.1234567+00:00"),
+              dict(base, id="aware", content="aware 静音", muted_until="2099-01-01T00:00:00+00:00"),
+              dict(base, id="past",  content="静音已过期", muted_until="2000-01-01T00:00:00+00:00"),
+              dict(base, id="none",  content="从未静音",   muted_until=None),
+          ]
+          h, s_ = S.shared_memories(_MSB(rows), "p")
+          got = {m["id"] for m in h + s_}
+          assert got == {"past", "none"}, f"静音规则泄漏进注入: {sorted(got)}"
+          assert "is_memory_muted_now" in inspect.getsource(S.shared_memories), \
+              "又在 store 里自己写了一份静音判定"
+          print("  ✓ COR-007 naive / 7位微秒 / aware 三种未来静音都挡住(旧实现前两种会漏)")
+
+          # ══ COR-005 / COR-006: deskcore 三处必须翻页 ═══════════════════════
+          # PostgREST 的 db-max-rows(默认 1000)会把 .limit(5000) 静默钳短。
+          # existing_fingerprint_version_ids 是 backfill 幂等所依赖的那个集合 ——
+          # 它读不全, 幂等就是假的: 重跑会给超出的行再插一遍指纹。
+          class _PQ:
+              def __init__(s, store, log, cap):
+                  s.s, s.log, s.cap, s.orders = store, log, cap, []
+              def select(s,*a,**k): return s
+              def eq(s,*a,**k): return s
+              def neq(s,*a,**k): return s
+              def is_(s,*a,**k): return s
+              @property
+              def not_(s): return s
+              def order(s,c,**k): s.orders.append(c); return s
+              def range(s,lo,hi): s.lo, s.hi = lo, hi; return s
+              def execute(s):
+                  page = s.s[s.lo:s.hi+1]
+                  if s.cap is not None: page = page[:s.cap]
+                  s.log.append({"order": list(s.orders), "range": (s.lo, s.hi)})
+                  return _R(page)
+          class _PSB:
+              # table() 每次返回新 builder —— postgrest-py 就是这样, 复用会让
+              # .order() 累积、.range() 偏移叠加。
+              def __init__(s, store, cap=None): s.s, s.log, s.cap = store, [], cap
+              def table(s,*a,**k): return _PQ(s.s, s.log, s.cap)
+
+          fp = [{"version_id": f"v{i}"} for i in range(2500)]
+          sb = _PSB(fp)
+          assert len(S.existing_fingerprint_version_ids(sb, "p")) == 2500, "幂等集合没取全"
+          assert sb.log[0]["order"] == ["id"], sb.log[0]
+          # 服务端钳短(max-rows < page_size)时也要取全, 且 offset 按实收前进 ——
+          # 按 page_size 跳会漏掉中间那段, 按"短页收工"会第一页就返回。
+          sb2 = _PSB(fp, cap=137)
+          assert len(S.existing_fingerprint_version_ids(sb2, "p")) == 2500, "钳短时漏行"
+          assert sb2.log[1]["range"][0] == 137, sb2.log[1]
+
+          mv = [{"id": f"f{i}", "title": f"t{i}"} for i in range(2500)]
+          sb3 = _PSB(mv, cap=137)
+          assert len(S.fingerprints_missing_vectors(sb3, "p")) == 2000, "hard_cap 失效"
+          assert sb3.log[0]["order"] == ["created_at", "id"], sb3.log[0]
+
+          items = [{"id": f"i{n}", "best_version_id": None, "user_id": "u",
+                    "created_at": "2026-01-01",
+                    "versions": [{"id": f"v{n}", "title": f"t{n}", "body": "b",
+                                  "version_num": 1, "embedding": None}]}
+                   for n in range(2500)]
+          sb4 = _PSB(items, cap=137)
+          assert len(S.legacy_versions(sb4, "p")) == 2500, "backfill 源数据漏行"
+          assert sb4.log[0]["order"] == ["created_at", "id"], sb4.log[0]
+
+          assert S.existing_fingerprint_version_ids(_PSB([]), "p") == set()
+          assert S.legacy_versions(_PSB([]), "p") == []
+          assert S.fingerprints_missing_vectors(_PSB([]), "p") == []
+          sb5 = _PSB([{"id": f"f{i}", "title": "t"} for i in range(5000)])
+          S.fingerprints_missing_vectors(sb5, "p", limit=2000)
+          assert len(sb5.log) == 2, f"hard_cap 到顶还在多打请求: {len(sb5.log)}"
+          # 别再退回裸 .limit()。
+          #
+          # ⚠️ 这条原来写的是 `"_paged(" in body` —— 文本匹配。第三批把
+          # legacy_versions 改成委托给 legacy_version_pages(逐页 yield, 审计
+          # ROB-011)之后它当场误报"没走翻页", 而翻页明明还在, 只是深了一层。
+          # 这正是第二批记过的教训: 钉死写法的断言要走 AST 且钉【被禁的形态】,
+          # 不是钉【当前的写法】—— 后者每次合理重构都会假报警。
+          # 真正要禁的是"用一个常数 .limit(N) 冒充取全量"。翻页本身由上面
+          # 那些行为断言(钳到 137/页仍取全 2500)保证。
+          for fn in (S.legacy_versions, S.existing_fingerprint_version_ids,
+                     S.fingerprints_missing_vectors, S.list_all_projects):
+              tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+              bad = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "limit"
+                     and n.args and isinstance(n.args[0], ast.Constant)]
+              assert not bad, f"{fn.__name__} 又退回裸 .limit(常数) 了"
+          print("  ✓ COR-005/006 三处翻页: 钳到 137/页仍取全 2500; hard_cap 到顶即停; 空库不死循环")
+
+          print("\n审计第一批止血回归: 5/5 通过 (ROB-003 见下方 app 冒烟)")
+          PY
+
+      - name: 审计第二批回归 (数据一致性与并发 · COR-002/004/008/009/011/020/021/022 · ROB-009/018)
+        run: |
+          python - <<'PY'
+          # docs/audit-2026-08-23-full.md 第 2 批。全部假件, 不联网。
+          # 每条都先复现【失败模式】再证明修好 —— 只断言"现在是对的"挡不住回退。
+          import os, ast, types, inspect
+          os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
+          import db, validator, telemetry, uuid
+          import generator as G
+
+          class _R:
+              def __init__(s, d): s.data = d
+
+          # 通用假件: 支持 range 翻页 + 模拟服务端 max-rows 钳短
+          class _PQ:
+              def __init__(s, store, log, cap):
+                  s.s, s.log, s.cap, s.orders = store, log, cap, []
+              def select(s, *a, **k): return s
+              def eq(s, *a, **k): return s
+              def in_(s, *a, **k): return s
+              @property
+              def not_(s): return s
+              def is_(s, *a, **k): return s
+              def order(s, c, **k): s.orders.append(c); return s
+              def range(s, lo, hi): s.lo, s.hi = lo, hi; return s
+              def execute(s):
+                  page = s.s[s.lo:s.hi + 1]
+                  if s.cap is not None: page = page[:s.cap]
+                  s.log.append({"order": list(s.orders), "range": (s.lo, s.hi)})
+                  return _R(page)
+          class _PSB:
+              # table() 每次返回新 builder —— postgrest-py 就是这样, 复用会让
+              # .order() 累积、.range() 偏移叠加。
+              def __init__(s, store, cap=None): s.s, s.log, s.cap = store, [], cap
+              def table(s, *a, **k): return _PQ(s.s, s.log, s.cap)
+
+          # ══ COR-008: 「短页收工」必须换成「空页收工」════════════════════════
+          # 服务端 db-max-rows 低于 page_size 时**每一页都是短页**, 按短页收工
+          # 就只拿第一页; offset 按 page_size 跳还会漏掉中间那段。两者都静默。
+          rows = [{"item_id": f"i{n}"} for n in range(2500)]
+          sb = _PSB(rows, cap=137)
+          got = db.get_session_committed_item_ids(sb, "s1")
+          assert len(got) == 2500, f"钳短时只拿到 {len(got)} —— committed set 不全会让懒同步重复 append"
+          assert sb.log[1]["range"][0] == 137, sb.log[1]
+          assert sb.log[0]["order"] == ["id"], "翻页缺唯一稳定次级键"
+          assert db.get_session_committed_item_ids(_PSB([]), "s") == set()
+          sb2 = _PSB([{"id": i} for i in range(3000)])
+          assert len(db._paged_select(lambda o, l: sb2.table().select().range(o, o + l - 1))) == 3000
+          assert len(sb2.log) == 4, f"空页收工应发 4 次(3 满页 + 1 空页), 实际 {len(sb2.log)}"
+          sb3 = _PSB([{"id": i} for i in range(3000)])
+          assert len(db._paged_select(lambda o, l: sb3.table().select().range(o, o + l - 1),
+                                      hard_cap=1500)) == 1500
+          # 别再退回裸的短页判据。必须走 AST —— 这几个函数的注释里就写着
+          # "原来是 len(rows) < page" 在解释为什么换掉它, 按行文本匹配会把
+          # 自己的注释当成回退(round-5 §6 记过这一课, 本批又踩了一次)。
+          import textwrap
+          def _has_short_page_break(fn) -> bool:
+              t = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+              for c in ast.walk(t):
+                  if (isinstance(c, ast.Compare) and len(c.ops) == 1
+                          and isinstance(c.ops[0], ast.Lt)
+                          and isinstance(c.left, ast.Call)
+                          and isinstance(c.left.func, ast.Name) and c.left.func.id == "len"
+                          and isinstance(c.comparators[0], ast.Name)
+                          and c.comparators[0].id in ("page", "page_size")):
+                      return True
+              return False
+          for fn in (db.get_session_committed_item_ids, db.list_approved_versions_for_sync,
+                     db._collect_recent_canonical_versions):
+              assert not _has_short_page_break(fn), f"{fn.__name__} 又出现短页收工判据"
+          import deskcore.store as S
+          assert "if not page:" in inspect.getsource(S.fingerprints), "store.fingerprints 还在按短页收工"
+          print("  ✓ COR-008 四处翻页统一成空页收工; 钳到 137/页仍取全 2500")
+
+          # ══ ROB-009: sweeper 必须看得见 NULL 心跳 ═══════════════════════════
+          # SQL 里 NULL < x 求值为 NULL 而不是 true —— heartbeat_at 为空的
+          # claimed/running 行永远进不了 .lt() 的结果集, 于是永久占位:
+          # 既不执行也不回收, 而队列面板上它一直显示"运行中"。
+          from datetime import datetime, timezone, timedelta
+          old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+          now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+          J = {
+              "stale":  {"id": "j1", "status": "running", "heartbeat_at": old,  "claimed_by": "w1", "attempts": 1, "max_attempts": 3},
+              "null_old": {"id": "j2", "status": "running", "heartbeat_at": None, "claimed_at": old, "claimed_by": "w2", "attempts": 1, "max_attempts": 3},
+              "null_new": {"id": "j3", "status": "claimed", "heartbeat_at": None, "claimed_at": now, "claimed_by": "w3", "attempts": 1, "max_attempts": 3},
+              "null_both": {"id": "j4", "status": "running", "heartbeat_at": None, "claimed_at": None, "claimed_by": None, "attempts": 1, "max_attempts": 3},
+          }
+          class _JQ:
+              def __init__(s): s.mode = None
+              def select(s, *a, **k): return s
+              def update(s, p, *a, **k): s.mode = "upd"; return s
+              def in_(s, c, v): return s
+              def lt(s, c, v): s.mode = "lt"; return s
+              def is_(s, c, v): s.mode = "null"; return s
+              def eq(s, *a, **k): return s
+              def execute(s):
+                  if s.mode == "lt":   return _R([J["stale"]])
+                  if s.mode == "null": return _R([J["null_old"], J["null_new"], J["null_both"]])
+                  if s.mode == "upd":  return _R([{"id": "x"}])
+                  return _R([])
+          class _JSB:
+              def table(s, *a, **k): return _JQ()
+          n = db.sweep_dead_jobs(_JSB(), 90)
+          assert n == 3, f"回收 {n} 条(应 3: 心跳超时 + NULL心跳且claimed久 + 两者皆空); 旧实现只回收 1 条"
+          src = inspect.getsource(db.sweep_dead_jobs)
+          assert 'is_("heartbeat_at", "null")' in src, "没查 NULL 心跳"
+          assert "parse_ts" in src, "还在拿字符串字典序比时间戳"
+          # parse_ts 归一四形态 + 反证字符串比较会判反
+          assert db.parse_ts("2026-01-01T00:00:00Z") == db.parse_ts("2026-01-01T00:00:00+00:00")
+          assert db.parse_ts("2026-01-01T00:00:00.1234567+00:00") is not None
+          assert db.parse_ts(None) is None and db.parse_ts("垃圾") is None
+          _c, _d = "2026-01-01T00:00:00", "2026-01-01T00:00:00+00:00"
+          assert _c < _d and db.parse_ts(_c) == db.parse_ts(_d), "naive vs aware 的字符串比较本就判反"
+          print("  ✓ ROB-009 NULL 心跳的僵尸行也能回收(3/3); 时间戳统一走 parse_ts")
+
+          # ══ COR-004: 版本号并发撞车要重试, 不是两条都写进去 ═════════════════
+          class _VQ:
+              def __init__(s, st): s.st = st; s.mode = None
+              def select(s, *a, **k): s.mode = "sel"; return s
+              def insert(s, d, *a, **k): s.mode = "ins"; s.data = d; return s
+              def eq(s, *a, **k): return s
+              def order(s, *a, **k): return s
+              def limit(s, *a, **k): return s
+              def execute(s):
+                  if s.mode == "sel":
+                      mx = max(s.st["nums"]) if s.st["nums"] else None
+                      return _R([{"version_num": mx}] if mx else [])
+                  n = s.data["version_num"]; s.st["attempts"].append(n)
+                  if n in s.st["nums"]:
+                      raise Exception('duplicate key value violates unique constraint "versions_item_version_uniq"')
+                  s.st["nums"].add(n); return _R([{"id": f"v{n}", "version_num": n}])
+          class _VSB:
+              def __init__(s, st): s.st = st
+              def table(s, *a, **k): return _VQ(s.st)
+          assert db.create_version(_VSB({"nums": set(), "attempts": []}), "i", "c", "t", "b")["version_num"] == 1
+          assert db.create_version(_VSB({"nums": {1, 2}, "attempts": []}), "i", "c", "t", "b")["version_num"] == 3
+          class _RaceSB(_VSB):
+              def __init__(s, st): super().__init__(st); s.first = True
+              def table(s, *a, **k):
+                  q = _VQ(s.st); orig = q.execute
+                  def ex():
+                      if q.mode == "ins" and s.first:
+                          s.first = False
+                          s.st["nums"].add(q.data["version_num"])      # 对手抢先占号
+                          s.st["attempts"].append(q.data["version_num"])
+                          raise Exception("23505 duplicate key value violates unique constraint")
+                      return orig()
+                  q.execute = ex; return q
+          st = {"nums": {1, 2}, "attempts": []}
+          assert db.create_version(_RaceSB(st), "i", "c", "t", "b")["version_num"] == 4
+          assert st["attempts"] == [3, 4], st["attempts"]
+          class _BoomSB(_VSB):
+              def table(s, *a, **k):
+                  q = _VQ(s.st); orig = q.execute
+                  def ex():
+                      if q.mode == "ins": raise Exception("permission denied for table versions")
+                      return orig()
+                  q.execute = ex; return q
+          try:
+              db.create_version(_BoomSB({"nums": set(), "attempts": []}), "i", "c", "t", "b")
+              raise AssertionError("非唯一冲突被吞了")
+          except Exception as e:
+              assert "permission denied" in str(e)
+          # 唯一索引两份 SQL 都要有; 迁移必须先重编号(否则有历史重复时直接建索引会失败)
+          for f in ("migrations/003_versions_unique_num.sql", "db.py"):
+              t = open(f, encoding="utf-8").read()
+              assert "versions_item_version_uniq" in t and "(item_id, version_num)" in t, f
+          assert "row_number() OVER" in open("migrations/003_versions_unique_num.sql", encoding="utf-8").read()
+          print("  ✓ COR-004 撞号→重读 max 重试(3→4); 非唯一冲突原样上抛; 两份 SQL 都有唯一索引")
+
+          # ══ COR-009: 缓存失效必须在 INSERT 之后 ════════════════════════════
+          _s = inspect.getsource(db.bulk_create_initial_versions)
+          assert _s.index("insert(payload).execute()") < _s.index("list_items.clear()"), \
+              "clear() 跑到 insert 前面 —— 并发读会把缓存回填成写入前的旧快照"
+          print("  ✓ COR-009 list_items.clear() 在 INSERT 之后")
+
+          # ══ ROB-018: UPDATE 0 行不再当成功 ═════════════════════════════════
+          class _ZQ:
+              def __init__(s, out): s.out = out
+              def update(s, *a, **k): return s
+              def eq(s, *a, **k): return s
+              def execute(s): return _R(s.out)
+          class _ZSB:
+              def __init__(s, out): s.out = out
+              def table(s, *a, **k): return _ZQ(s.out)
+          assert db.seal_session(_ZSB([]), "s", "window_full") is False, "0 行却报 seal 成功"
+          assert db.seal_session(_ZSB([{"id": "s"}]), "s", "window_full") is True
+          assert db._best_effort_item_patch(_ZSB([]), "i", {"x": 1}, "t") is False
+          assert db._best_effort_item_patch(_ZSB([{"id": "i"}]), "i", {"x": 1}, "t") is True
+          for fn in (db.save_feedback_draft, db.clear_feedback_draft,
+                     db.save_manual_edit_draft, db.clear_manual_edit_draft):
+              assert "_best_effort_item_patch" in inspect.getsource(fn), fn.__name__
+          print("  ✓ ROB-018 seal_session / 四个草稿写入都看受影响行数并留痕")
+
+          # ══ COR-020: 带 rule_kind 但缺 content 不再 KeyError ═══════════════
+          hits = validator.check_hard_rules(
+              [{"rule_kind": "forbidden_word", "rule_payload": {"target": "最"}}],
+              title="全网最低价", body="")
+          assert hits and hits[0]["match"] == "最" and hits[0]["rule"] == "", hits
+          for kind, payload, t, b in [("required_phrase", {"target": "认证"}, "标题", "正文"),
+                                      ("max_len", {"scope": "标题", "n": 2}, "很长的标题", ""),
+                                      ("forbidden_regex", {"pattern": "最."}, "最低价", "")]:
+              assert validator.check_hard_rules([{"rule_kind": kind, "rule_payload": payload}],
+                                                title=t, body=b), kind
+          assert validator.check_hard_rules([{"content": "禁止出现'最'字"}],
+                                            title="最低价", body="")[0]["rule"] == "禁止出现'最'字"
+          # 同样走 AST: 函数里的注释写着 rule["content"] 在解释为什么不能这么用。
+          _vt = ast.parse(textwrap.dedent(inspect.getsource(validator.check_hard_rules)))
+          assert not [
+              1 for _c in ast.walk(_vt)
+              if isinstance(_c, ast.Subscript) and isinstance(_c.value, ast.Name)
+              and _c.value.id == "rule" and isinstance(_c.slice, ast.Constant)
+              and _c.slice.value == "content"
+          ], "又出现 rule['content'] 直取 —— 缺 content 键的结构化规则命中时会 KeyError"
+          print("  ✓ COR-020 四种 kind 的上报路径都不再触碰 rule['content']")
+
+          # ══ COR-021: 只剥外层围栏, 正文里的反引号必须活下来 ═════════════════
+          import json as _json
+          f = G._strip_outer_code_fence
+          assert f('```json\n{"a":1}\n```') == '{"a":1}'
+          assert f('```\n{"a":1}\n```') == '{"a":1}'
+          assert f('{"a":1}') == '{"a":1}'
+          assert f('```json\n{"a":1}') == '{"a":1}'          # 输出截断: 只剥开栏
+          assert f('前言\n{"a":1}') == '前言\n{"a":1}'
+          body = "先看这段代码：\n```python\nprint(1)\n```\n就这样"
+          raw = '```json\n' + _json.dumps({"title": "t", "body": body, "keywords": ["k"]},
+                                          ensure_ascii=False) + '\n```'
+          r = G._parse_copy_json(raw, "claude/test")
+          assert r.error is None and r.body == body, f"正文被就地改写: {r.body!r}"
+          arr = '```json\n' + _json.dumps([{"title": "t1", "body": body, "keywords": []},
+                                           {"title": "t2", "body": "普通", "keywords": []}],
+                                          ensure_ascii=False) + '\n```'
+          rs = G._parse_copy_json_list(arr, 2, "claude/test")
+          assert len(rs) == 2 and rs[0].body == body and not rs[0].error
+          assert _json.loads(G._extract_json_payload('```json\n{"violations":[]}\n```')) == {"violations": []}
+          assert G._extract_json_payload('前言 {"a":1} 后记') == '{"a":1}'
+          # 反证旧的全局剥法
+          import re as _re
+          _old = _re.sub(r'```(?:json)?\s*', '', raw).replace('```', '').strip()
+          assert "```" not in _old and _old != f(raw), "前提变了: 旧写法本就会抹掉正文里的围栏"
+          print("  ✓ COR-021 正文内的 ```python 代码块原样保留(旧的全局剥法会抹掉)")
+
+          # ══ COR-022: 引擎名重复不再让两个"版本"指向同一个对象 ═══════════════
+          class _FakeEngine:
+              def generate(self, **kw):
+                  return [G.GenerationResult(title=f"t{i}", body="b", keywords=[],
+                                             ai_engine="claude/x") for i in range(kw["count"])]
+          _orig_ge = G.get_engine
+          G.get_engine = lambda name: _FakeEngine()
+          try:
+              slots = G.generate_batch(system_prompt="s", tactic="t", count=2,
+                                       engines=["claude", "claude"], metrics=None)
+              assert len(slots) == 2 and len(slots[0]["versions"]) == 1, \
+                  "重复引擎名没去重 —— 同一个 slot 会拿到同一个对象两份引用"
+              ids = {id(v) for s_ in slots for v in s_["versions"]}
+              assert len(ids) == 2, "不同 slot 共享了同一个 GenerationResult"
+              assert len(G.generate_batch(system_prompt="s", tactic="t", count=2,
+                                          engines=["claude"], metrics=None)) == 2
+              assert G.generate_batch(system_prompt="s", tactic="t", count=2,
+                                      engines=[], metrics=None) == []
+          finally:
+              G.get_engine = _orig_ge
+          print("  ✓ COR-022 engines 去重保序; 单引擎路径不变; 空 engines 不炸")
+
+          # ══ COR-002: slot ↔ item 配对不能靠返回顺序, 缺行不能静默丢 ═════════
+          # app.py 是 streamlit 脚本(顶层会跑 UI), 只把这两个纯函数取出来跑。
+          _tree = ast.parse(open("app.py", encoding="utf-8").read())
+          _mod = types.ModuleType("appfrag")
+          _mod.__dict__.update(db=db, validator=validator, telemetry=telemetry, uuid=uuid)
+          for _n in _tree.body:
+              if isinstance(_n, ast.FunctionDef) and _n.name in ("_save_batch_results",
+                                                                 "_run_hard_constraint_check"):
+                  exec(compile(ast.Module([_n], []), "app.py", "exec"), _mod.__dict__)
+          class GR:
+              def __init__(s, t, b):
+                  s.title, s.body, s.ai_engine, s.error = t, b, "claude/x", None
+                  s.keywords = []; s.token_usage = {}
+          class _ISB:
+              def __init__(s, mode="ok"): s.mode = mode; s.inserted = []; s.deleted = []
+              def table(s, t):
+                  outer = s
+                  class _Q:
+                      def __init__(_): _.t = t; _.op = None
+                      def insert(_, rows, *a, **k): _.op = "ins"; _.rows = rows; return _
+                      def delete(_, *a, **k): _.op = "del"; return _
+                      def in_(_, c, v): _.ids = v; return _
+                      def eq(_, *a, **k): return _
+                      def execute(_):
+                          class R: pass
+                          r = R()
+                          if _.op == "del":
+                              outer.deleted.extend(getattr(_, "ids", [])); r.data = []; return r
+                          rows = [dict(x) for x in _.rows]
+                          if _.t == "items":
+                              outer.inserted.extend(rows)
+                              if outer.mode == "reversed": rows = list(reversed(rows))
+                              if outer.mode == "short":    rows = rows[:-1]
+                          r.data = rows; return r
+                  return _Q()
+          slots_in = [{"versions": [GR(f"标题{i}", f"正文{i}")], "ai_review_notes": f"note{i}"}
+                      for i in range(3)]
+          errs = []; sb = _ISB("reversed")
+          items, vers, _ = _mod._save_batch_results(sb, "b1", "u1", slots_in, "P：", errs)
+          assert not errs and len(items) == 3 and len(vers) == 3, (errs, len(items), len(vers))
+          notes = {r["id"]: r.get("ai_review_notes") for r in sb.inserted}
+          for i, v in enumerate(vers):
+              assert v["title"] == f"标题{i}", (i, v["title"])
+              assert notes[v["item_id"]] == f"note{i}", \
+                  f"第 {i} 篇挂到了别的 item 上 —— 按位置 zip 的老毛病"
+          errs = []; sb = _ISB("short")
+          items, vers, titles = _mod._save_batch_results(sb, "b1", "u1", slots_in, "P：", errs)
+          assert items == [] and vers == [] and titles == [], "回执缺行却继续往下走"
+          assert errs and "只回执 2/3" in errs[0], errs
+          assert len(sb.deleted) == 2, f"没回收已插的行: {sb.deleted}"
+          errs = []
+          items, vers, _ = _mod._save_batch_results(_ISB("ok"), "b1", "u1", slots_in, "P：", errs)
+          assert len(items) == 3 and len(vers) == 3 and not errs
+          print("  ✓ COR-002 回执逆序仍配对正确; 缺行→整批失败+回收, 不静默丢尾部")
+
+          # ══ COR-011: 同一 item 的多个违规 version 只标记一次 ════════════════
+          class _M:
+              def __init__(s): s.n = 0
+              def incr(s, k, v=1): s.n += v
+          calls = []
+          _orig_us = db.update_item_status
+          db.update_item_status = lambda c, i, st: calls.append(i)
+          try:
+              ivs = [{"item_id": "A", "title": "全网最低价", "body": "最好", "keywords": []},
+                     {"item_id": "A", "title": "最强", "body": "最", "keywords": []},
+                     {"item_id": "B", "title": "最快", "body": "", "keywords": []}]
+              e = []
+              _mod._run_hard_constraint_check(None, ivs, [{"content": "禁止出现'最'字"}], "P：", e, _M())
+              assert calls == ["A", "B"], f"重复标记了: {calls}"
+              assert len(e) == 3, f"警告应逐条给出, 实际 {len(e)}"
+          finally:
+              db.update_item_status = _orig_us
+          print("  ✓ COR-011 同一 item 只标记一次(警告仍逐条); 不再反复击穿 list_items 缓存")
+
+          print("\n审计第二批回归: 10/10 通过")
+          PY
+
+      - name: 审计第三批回归 + codex review 7 条 (性能与成本 · SUP-001~008 / ROB-004/011/013)
+        run: |
+          python - <<'PY'
+          import ast, inspect, os, random, textwrap, threading, time
+          os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
+          os.environ.setdefault("SUPABASE_URL", "https://x.supabase.co")
+          os.environ.setdefault("SUPABASE_ANON_KEY", "anon")
+          os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "svc")
+          import config, db, dedup, generator as G, memory as M
+          import deskcore.core as C, deskcore.store as S
+
+          FAIL = []
+
+          def _app_func_src(name):
+              """按名字从 app.py 里切出一个函数的源码。
+
+              app.py 不能 import —— 它一被 import 就开始跑 streamlit 脚本。所以读文本 +
+              走 ast 定位: 按缩进找边界会被**跨行的函数签名**骗到(那个 `) -> None:`
+              也顶格), 直接把函数截在签名处。
+              """
+              src = open("app.py", encoding="utf-8").read()
+              tree = ast.parse(src)
+              fn = next((n for n in tree.body
+                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                         and n.name == name), None)
+              assert fn is not None, f"app.py 里找不到顶层函数 {name}"
+              return "\n".join(src.splitlines()[fn.lineno - 1:fn.end_lineno])
+
+
+          def check(name, fn):
+              try:
+                  fn()
+                  print(f"  ✓ {name}")
+              except Exception as exc:
+                  FAIL.append(name)
+                  print(f"  ✗ {name}\n      {type(exc).__name__}: {exc}")
+
+
+          # ══════════════════════════════════════════════════════════════════
+          # SUP-003 · 成批余弦改矩阵乘, 结论必须与逐元素逐条一致
+          # ══════════════════════════════════════════════════════════════════
+          def t_sup003():
+              assert dedup.numpy_available(), "锁文件里有 numpy, 这条回归必须跑在矩阵路径上"
+
+              rnd = random.Random(20260824)
+              hist = [[rnd.gauss(0, 1) for _ in range(64)] for _ in range(120)]
+              new = [[rnd.gauss(0, 1) for _ in range(64)] for _ in range(8)]
+              # 造几条"改写"关系: 让部分新标题确实高度相似, 否则阈值以上一条都没有,
+              # 断言就退化成"两条路径都返回空", 什么也没验证。
+              for k in range(3):
+                  new[k] = [v + rnd.gauss(0, 0.02) for v in hist[k * 7]]
+              ht = [f"h{i}" for i in range(len(hist))]
+              nt = [f"n{i}" for i in range(len(new))]
+
+              def _slow_find(nv, ntl, hv, htl, th):
+                  out = []
+                  for i, v in enumerate(nv):
+                      best, bt = 0.0, ""
+                      for h, t in zip(hv, htl):
+                          s = dedup.cosine_similarity(v, h)
+                          if s > best:
+                              best, bt = s, t
+                      if best >= th:
+                          out.append({"index": i, "title": ntl[i], "best_match": bt, "score": best})
+                  return out
+
+              for th in (0.0001, 0.3, 0.85, 0.99):
+                  fast = dedup.find_near_duplicates(new, nt, hist, ht, threshold=th)
+                  slow = _slow_find(new, nt, hist, ht, th)
+                  assert len(fast) == len(slow), f"th={th}: {len(fast)} vs {len(slow)}"
+                  for a, b in zip(fast, slow):
+                      assert a["index"] == b["index"] and a["best_match"] == b["best_match"], (a, b)
+                      assert abs(a["score"] - b["score"]) < 1e-9, (a, b)
+              assert any(r["score"] >= 0.99 for r in
+                         dedup.find_near_duplicates(new, nt, hist, ht, threshold=0.9)), \
+                  "构造的改写对没被抓到, 这组数据验不出东西"
+
+              # 零向量: 余弦定义成 0.0, 不能变成 nan 然后在 argmax 里赢过所有真分数
+              z = dedup.similarity_matrix([[0.0] * 4], [[1.0, 0, 0, 0]])
+              assert float(z[0][0]) == 0.0, z
+              nan = float("nan")
+              dirty = dedup.find_near_duplicates(
+                  [[nan] * 4], ["x"], [[1.0, 0, 0, 0], [0.0, 1, 0, 0]], ["a", "b"], threshold=0.5)
+              assert dirty == [], f"nan 向量赢了 argmax: {dirty}"
+
+              # 维度参差 → 矩阵化不了, 必须退回逐元素而不是抛
+              assert dedup.similarity_matrix([[1.0, 2.0]], [[1.0, 2.0, 3.0]]) is None
+              mixed = dedup.find_near_duplicates([[1.0, 0.0]], ["x"],
+                                                 [[1.0, 0.0], [1.0, 0.0, 0.0]], ["a", "b"],
+                                                 threshold=0.9)
+              assert len(mixed) == 1 and mixed[0]["best_match"] == "a", mixed
+
+              # cross_batch_pairs: 顺序必须与双重循环逐字一致(调用方按顺序标记)
+              vs = [hist[0], [v + 0.001 for v in hist[0]], hist[5], [v + 0.001 for v in hist[5]]]
+              pairs = dedup.cross_batch_pairs(vs, ["a", "b", "c", "d"], threshold=0.9)
+              assert [(p["i"], p["j"]) for p in pairs] == [(0, 1), (2, 3)], pairs
+
+
+          # ══════════════════════════════════════════════════════════════════
+          # SUP-002 / ROB-004 / ROB-011 · 查重下推 pgvector
+          # ══════════════════════════════════════════════════════════════════
+          class _Res:
+              def __init__(self, data, count=None):
+                  self.data = data
+                  self.count = count
+
+
+          class _Q:
+              """够用的 PostgREST builder 假件: 记录调用, 支持 count 与 range 翻页。"""
+
+              def __init__(self, sb, table):
+                  self.sb, self.table = sb, table
+                  self.filters, self.cols, self.count_mode = {}, "", None
+                  self.rng = None
+
+              def select(self, cols, count=None):
+                  self.cols, self.count_mode = cols, count
+                  return self
+
+              def eq(self, k, v):
+                  self.filters[k] = v
+                  return self
+
+              def in_(self, k, v):
+                  self.filters[k] = ("in", tuple(v))
+                  return self
+
+              def or_(self, *a, **k):
+                  return self
+
+              def is_(self, k, v):
+                  self.filters[k] = ("isnot" if getattr(self, "_neg", False) else "is", v)
+                  self._neg = False
+                  return self
+
+              @property
+              def not_(self):
+                  self._neg = True
+                  return self
+
+              def order(self, *a, **k):  # noqa: F811
+                  return self
+
+              def limit(self, n):
+                  self.rng = (0, n - 1)
+                  return self
+
+              def range(self, a, b):
+                  self.rng = (a, b)
+                  return self
+
+              def execute(self):
+                  return self.sb._run(self)
+
+
+          class _SB:
+              def __init__(self, rows=None, rpc_impl=None):
+                  self.rows = rows or {}
+                  self.rpc_impl = rpc_impl or {}
+                  self.calls, self.rpc_calls = [], []
+
+              def table(self, name):
+                  return _Q(self, name)
+
+              def _run(self, q):
+                  self.calls.append({"table": q.table, "cols": q.cols,
+                                     "filters": dict(q.filters), "rng": q.rng,
+                                     "count": q.count_mode})
+                  data = list(self.rows.get(q.table, []))
+                  for k, v in q.filters.items():
+                      if isinstance(v, tuple) and v[0] == "in":
+                          data = [r for r in data if r.get(k) in v[1]]
+                      elif isinstance(v, tuple) and v[0] == "is":
+                          data = [r for r in data if r.get(k) is None]
+                      elif isinstance(v, tuple) and v[0] == "isnot":
+                          data = [r for r in data if r.get(k) is not None]
+                      else:
+                          data = [r for r in data if r.get(k) == v]
+                  n = len(data)
+                  if q.rng:
+                      data = data[q.rng[0]:q.rng[1] + 1]
+                  return _Res(data, count=n if q.count_mode == "exact" else None)
+
+              def rpc(self, name, args):
+                  self.rpc_calls.append((name, args))
+                  impl = self.rpc_impl.get(name)
+
+                  class _RpcQ:
+                      @staticmethod
+                      def execute():
+                          if impl is None:
+                              raise RuntimeError("PGRST202 Could not find the function")
+                          return _Res(impl(args))
+                  return _RpcQ()
+
+
+          _DRAFTS = [{"title": "夏天必囤的三支口红", "body": "第一支是豆沙色。" * 12}]
+
+
+          def t_sup002_pushdown():
+              hit = {"idx": 0, "best_sim": 0.97, "sim_title": "去年那篇口红合集",
+                     "best_j": 0.0, "j_title": None, "open_exact": False, "open_title": None}
+              sb = _SB(rows={"draft_fingerprints": [
+                           {"id": f"f{i}", "project_id": "p1", "title_embedding": "[0.1]"}
+                           for i in range(4000)]},
+                       rpc_impl={"deskcore_check_drafts": lambda a: [hit]})
+              out = C.check_drafts(sb, "p1", _DRAFTS)
+
+              # ① 结论由 RPC 驱动
+              r = out["results"][0]
+              assert r["status"] == "reject", r
+              assert r["collided_with"] == "去年那篇口红合集", r
+              assert r["collided_scope"] == "历史", r
+              assert abs(r["signals"]["title_similarity"] - 0.97) < 1e-9, r
+
+              # ② 关键: 没有把 4000 行指纹拉进内存。只允许 select id 做计数。
+              pulled = [c for c in sb.calls
+                        if c["table"] == "draft_fingerprints" and c["count"] != "exact"]
+              assert not pulled, f"下推之后还在拉指纹行: {pulled}"
+              heavy = [c for c in sb.calls if "title_embedding" in (c["cols"] or "")
+                       and c["count"] != "exact"]
+              assert not heavy, f"还在拉 768 维向量列: {heavy}"
+
+              # ③ 送进 RPC 的形态: 向量要序列化成 pgvector 认的 "[..]" 字符串。
+              #    传成 JSON 数组的话 (r->>'title_embedding')::vector 会带上空格而炸,
+              #    而这一路炸掉不会被看见 —— 上面的 rpc_missing 判据不认它, 会直接上抛。
+              rows_arg = sb.rpc_calls[0][1]["_rows"]
+              assert len(rows_arg) == 1, rows_arg
+              emb = rows_arg[0]["title_embedding"]
+              assert emb is None or (isinstance(emb, str) and emb.startswith("[")
+                                     and emb.endswith("]")), emb
+              assert isinstance(rows_arg[0]["ngram_hashes"], list), rows_arg[0]
+
+              # ④ summary 报的是【全量】而不是 4000 那个上限
+              assert out["summary"]["history_size"] == 4000, out["summary"]
+              assert out["summary"]["history_truncated"] is False, out["summary"]
+
+
+          def t_sup002_fallback_equivalence():
+              """RPC 没部署时退回 Python 路径, 且两条路径对同一份数据结论一致。"""
+              body = "第一支是豆沙色。" * 12
+              fp_row = {"id": "f1", "project_id": "p1", "title": "去年那篇口红合集", "opening": "",
+                        "title_embedding": None, "opening_hash": C.fp.opening_hash(body),
+                        "ngram_hashes": C.fp.ngram_hashes(body), "created_at": "2026-01-01"}
+              sb_py = _SB(rows={"draft_fingerprints": [fp_row]})           # 无 rpc_impl
+              out_py = C.check_drafts(sb_py, "p1", _DRAFTS)
+              assert out_py["results"][0]["status"] == "reject", out_py["results"][0]
+              assert out_py["results"][0]["collided_with"] == "去年那篇口红合集"
+              assert out_py["summary"]["history_size"] == 1, out_py["summary"]
+              # 退回路径必须真的把行拉回来了(否则就不是"等价降级"而是"没比")
+              assert any(c["table"] == "draft_fingerprints" and c["count"] != "exact"
+                         for c in sb_py.calls), "降级路径没读指纹?"
+
+              # 同一份数据走 RPC: 结论必须一样
+              j = C.fp.jaccard(set(C.fp.ngram_hashes(body)), set(fp_row["ngram_hashes"]))
+              sb_sql = _SB(rows={"draft_fingerprints": [fp_row]},
+                           rpc_impl={"deskcore_check_drafts": lambda a: [
+                               {"idx": 0, "best_sim": 0, "sim_title": None,
+                                "best_j": j, "j_title": "去年那篇口红合集",
+                                "open_exact": True, "open_title": "去年那篇口红合集"}]})
+              out_sql = C.check_drafts(sb_sql, "p1", _DRAFTS)
+              assert out_sql["results"][0]["status"] == out_py["results"][0]["status"]
+              assert out_sql["results"][0]["collided_with"] == out_py["results"][0]["collided_with"]
+
+
+          def t_sup002_partial_result():
+              """RPC 回执缺行 = 那几篇【根本没比过】。退化成 pass 就是静默放行。"""
+              two = _DRAFTS + [{"title": "另一篇", "body": "完全不同的正文。" * 12}]
+              sb = _SB(rows={"draft_fingerprints": [{"id": "f1", "project_id": "p1"}]},
+                       rpc_impl={"deskcore_check_drafts": lambda a: [
+                           {"idx": 0, "best_sim": 0, "sim_title": None, "best_j": 0,
+                            "j_title": None, "open_exact": False, "open_title": None}]})
+              try:
+                  C.check_drafts(sb, "p1", two)
+              except RuntimeError as exc:
+                  assert "回执缺" in str(exc), exc
+              else:
+                  raise AssertionError("回执少一篇却按'没撞车'放行了 —— 查重不能这样 fail-open")
+
+
+          def t_sup002_bool_shape():
+              """open_exact 不看布尔的传输形态 —— `bool("false")` 是 True, 而开头精确
+              撞车是**单独就判死**的最强信号, 误伤没有任何东西兜得住。"""
+              def _rpc(a):
+                  return [{"idx": 0, "best_sim": 0, "sim_title": None,
+                           # 故意造成"字符串假值 + 没有命中标题"
+                           "best_j": "0", "j_title": None,
+                           "open_exact": "false", "open_title": None}]
+              sb = _SB(rows={"draft_fingerprints": [{"id": "f1", "project_id": "p1"}]},
+                       rpc_impl={"deskcore_check_drafts": _rpc})
+              r = C.check_drafts(sb, "p1", _DRAFTS)["results"][0]
+              assert r["signals"]["opening_exact_match"] is False, r
+              assert r["status"] == "pass", r
+              # NUMERIC 回字符串时也要能算
+              assert r["signals"]["body_ngram_jaccard"] == 0.0, r
+
+
+          def t_codex_p1_rpc_search_path():
+              """CREATE_TABLES_SQL 里每个固定了 search_path 的函数, 都要够得着它引用的表。
+
+              codex review 2026-08-24: 新加的两个 RPC(以及旁边两个老的)写着
+              `SET search_path = pg_catalog, extensions`, 函数体里却裸用 draft_fingerprints
+              —— 运行时报 relation ... does not exist。而那句话里带 "does not exist",
+              正好被 store.rpc_missing 认成"迁移没跑", 于是静默退回 Python 慢路径。
+              坏得毫无声响, 这条断言就是为了让它不能再回来。
+              """
+              import re
+              sql = db.CREATE_TABLES_SQL
+              fns = list(re.finditer(r"CREATE OR REPLACE FUNCTION (\w+)\(", sql))
+              assert len(fns) >= 6, f"只找到 {len(fns)} 个函数, 正则可能失配了"
+              checked = 0
+              for i, m in enumerate(fns):
+                  end = fns[i + 1].start() if i + 1 < len(fns) else len(sql)
+                  body = sql[m.start():end]
+                  sp = re.search(r"SET search_path = ([^\n]*)", body)
+                  if not sp:
+                      continue           # 没固定 search_path = 跟随调用方, 不在本条管辖
+                  path = sp.group(1).split("--")[0]
+                  # 函数体里引用的表。只看 DML 关键字后面的裸标识符, 并排掉:
+                  #   · 后面跟 "(" 的     → 是函数调用(jsonb_array_elements 之类), 不是表
+                  #     ⚠️ 这里的量词必须是**占有型** `*+`(py3.11+): 贪婪的 `*` 会为了
+                  #     满足 (?!\s*\() 而回溯, 把 jsonb_array_elements( 匹配成
+                  #     "jsonb_array_element" 混进表名里。
+                  #   · REVOKE/GRANT 行的 → "FROM anon" 那种, 是角色不是表
+                  #   · INTO 后面的       → plpgsql 变量名, 不是表
+                  stmt = "\n".join(l for l in body.splitlines()
+                                   if not l.lstrip().upper().startswith(("REVOKE", "GRANT")))
+                  refs = {t for t in re.findall(
+                      r"(?:FROM|UPDATE|JOIN)\s+([a-z_][a-z0-9_]*+)(?!\s*\()", stmt)}
+                  qualified = set(re.findall(r"autowriter\.([a-z_][a-z0-9_]*)", body))
+                  bare = refs - qualified
+                  if not bare:
+                      continue
+                  checked += 1
+                  assert "autowriter" in path, (
+                      f"{m.group(1)} 固定了 search_path={path.strip()!r}, 却裸用表 "
+                      f"{sorted(bare)} —— 运行时找不到表, 而报错会被 rpc_missing 当成"
+                      f"'迁移没跑'静默降级")
+              assert checked >= 4, f"只校到 {checked} 个函数, 断言可能没在真的守东西"
+
+
+          def t_sup002_no_fail_open():
+              """查重是硬闸: 除了"RPC 不存在", 任何错误都必须上抛, 不能静默放行。"""
+              class _Boom(_SB):
+                  def rpc(self, name, args):
+                      raise RuntimeError("permission denied for function deskcore_check_drafts")
+
+              try:
+                  C.check_drafts(_Boom(), "p1", _DRAFTS)
+              except RuntimeError as exc:
+                  assert "permission denied" in str(exc)
+              else:
+                  raise AssertionError("权限错被当成'迁移没跑'静默降级了 —— 查重不能 fail-open")
+
+              assert S.rpc_missing(RuntimeError("PGRST202 Could not find the function")) is True
+              assert S.rpc_missing(RuntimeError("permission denied")) is False
+
+
+          def t_rob004_health_pool():
+              """/health 不能和工具抢同一个线程池。
+
+              ⚠️ 这条**只读源码不 import**。deskcore/app.py 需要 fastapi + mcp, 它们在
+              `deskcore/requirements.txt` 而不是主 lockfile 里 —— 本步骤刻意只装
+              lockfile(与前两批的回归步一致), import 会直接 ModuleNotFoundError。
+              真正起服务打 /health 的是下面那一步 app 冒烟。
+              """
+              tree = ast.parse(open("deskcore/app.py", encoding="utf-8").read())
+
+              fns = {n.name: n for n in ast.walk(tree)
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+              assert isinstance(fns.get("health"), ast.AsyncFunctionDef), \
+                  "/health 若是同步路由(def)就仍然占用 starlette 的默认线程池 —— ROB-004 没修掉"
+
+              # 私有额度: anyio.CapacityLimiter(N), N >= 2
+              lim = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == "_HEALTH_LIMITER"
+                             for t in n.targets)]
+              assert len(lim) == 1, "拿不到 _HEALTH_LIMITER 的定义"
+              call = lim[0].value
+              assert isinstance(call, ast.Call) and getattr(call.func, "attr", "") == "CapacityLimiter", \
+                  ast.dump(call)[:120]
+              assert isinstance(call.args[0], ast.Constant) and call.args[0].value >= 2, \
+                  "额度 1 会让平台健康检查和人工 curl 互相排队"
+
+              probe = fns.get("_probe")
+              assert isinstance(probe, ast.AsyncFunctionDef), "_probe 不见了"
+              kw = [k for n in ast.walk(probe) if isinstance(n, ast.Call) for k in n.keywords]
+              assert any(k.arg == "limiter" and isinstance(k.value, ast.Name)
+                         and k.value.id == "_HEALTH_LIMITER" for k in kw), \
+                  "探测没用私有 limiter —— 还是会排在工具后面"
+              assert any(getattr(n.func, "attr", "") == "fail_after"
+                         for n in ast.walk(probe) if isinstance(n, ast.Call)), \
+                  "探测没有墙钟上限, 库卡死(TCP 黑洞)时 /health 会一直挂着不返回"
+
+              # 工具那条路仍然走默认线程池 —— 两者必须是【不同】的池子, 否则等于没分
+              tool = fns.get("rest_tool")
+              assert any(getattr(n.func, "id", "") == "run_in_threadpool"
+                         for n in ast.walk(tool) if isinstance(n, ast.Call)), \
+                  "工具路由不再走 run_in_threadpool? 那这条断言的前提变了, 要重新想"
+
+
+          def t_rob011_streaming():
+              """回填逐页消费, 峰值不随项目历史总量增长。"""
+              items = [{"id": f"i{n}", "best_version_id": f"v{n}", "user_id": "u",
+                        "created_at": "2026-01-01", "batches.project_id": "p",
+                        "versions": [{"id": f"v{n}", "title": f"t{n}", "body": "b" * 40,
+                                      "version_num": 1, "embedding": None}]}
+                       for n in range(2500)]
+              sb = _SB(rows={"items": items})
+              pages = list(S.legacy_version_pages(sb, "p", page=500))
+              assert sum(len(p) for p in pages) == 2500, [len(p) for p in pages]
+              assert max(len(p) for p in pages) <= 500, "一页超过 page —— 没有真的分页"
+              assert len(pages) >= 5, len(pages)
+              # 生成器语义: 拿第一页时不能已经把全部请求打完
+              sb2 = _SB(rows={"items": items})
+              gen = S.legacy_version_pages(sb2, "p", page=500)
+              next(gen)
+              assert len(sb2.calls) == 1, f"第一页就打了 {len(sb2.calls)} 次请求, 不是流式"
+              # 列表形态保持兼容
+              assert len(S.legacy_versions(_SB(rows={"items": items}), "p")) == 2500
+
+
+          # ══════════════════════════════════════════════════════════════════
+          # SUP-004 · list_projects 的 N+1
+          # ══════════════════════════════════════════════════════════════════
+          def t_sup004():
+              N = 40
+              projects = [{"id": f"p{i}", "name": f"项目{i}", "brand": "b", "owner_id": "o"}
+                          for i in range(N)]
+              mems = []
+              for i in range(N):
+                  mems += [{"id": f"m{i}h", "project_id": f"p{i}", "scope": "project",
+                            "status": "confirmed", "severity": "hard", "muted_until": None,
+                            "memory_type": "rule", "content": "禁词", "embedding": "[0.1]"},
+                           {"id": f"m{i}s", "project_id": f"p{i}", "scope": "project",
+                            "status": "confirmed", "severity": "soft", "muted_until": None,
+                            "memory_type": None, "content": "偏好", "embedding": "[0.1]"}]
+              sb = _SB(rows={"projects": projects, "memories": mems},
+                       rpc_impl={"deskcore_fingerprint_counts":
+                                 lambda a: [{"project_id": "p3", "n": 7}]})
+              out = C.list_projects(sb)
+              assert len(out) == N, len(out)
+              assert out[3]["hard_rules"] == 1 and out[3]["soft_rules"] == 1, out[3]
+              assert out[3]["fingerprint_count"] == 7, out[3]
+              assert out[0]["fingerprint_count"] == 0, out[0]
+
+              # ① 查询次数与项目数【无关】。翻页会多打一次拿空页, 所以给一点余量。
+              assert len(sb.calls) <= 6, f"{N} 个项目发了 {len(sb.calls)} 次查询, 还是 N+1"
+              assert len(sb.rpc_calls) == 1, sb.rpc_calls
+
+              # ② 不再为了数两个数把 768 维向量拉回来
+              assert not [c for c in sb.calls if "embedding" in (c["cols"] or "")], \
+                  "计数路径还在拉 embedding 列"
+
+              # ③ RPC 没部署 → 退回逐项目 count, 结果仍然对
+              sb2 = _SB(rows={"projects": projects[:5], "memories": mems,
+                              "draft_fingerprints": [{"id": "f1", "project_id": "p2"}]})
+              out2 = C.list_projects(sb2)
+              assert [o["fingerprint_count"] for o in out2] == [0, 0, 1, 0, 0], out2
+              assert len([c for c in sb2.calls if c["table"] == "draft_fingerprints"]) == 5
+
+
+          def t_sup004_muted_and_type():
+              """批量计数的判据必须和 shared_memories 一样: 静音的不算, note 不算。"""
+              future = "2099-01-01T00:00:00"          # naive, COR-007 那两种形态之一
+              mems = [
+                  {"id": "a", "project_id": "p0", "scope": "project", "status": "confirmed",
+                   "severity": "hard", "muted_until": future, "memory_type": "rule",
+                   "content": "被静音的硬规则"},
+                  {"id": "b", "project_id": "p0", "scope": "project", "status": "confirmed",
+                   "severity": "hard", "muted_until": None, "memory_type": "note",
+                   "content": "这是笔记不是规则"},
+                  {"id": "c", "project_id": "p0", "scope": "project", "status": "confirmed",
+                   "severity": "soft", "muted_until": None, "memory_type": None,
+                   "content": "   "},
+                  {"id": "d", "project_id": "p0", "scope": "project", "status": "confirmed",
+                   "severity": "hard", "muted_until": None, "memory_type": "rule",
+                   "content": "真的硬规则"},
+              ]
+              got = S.rule_counts_bulk(_SB(rows={"memories": mems}), ["p0"])
+              assert got["p0"] == (1, 0), got
+
+
+          # ══════════════════════════════════════════════════════════════════
+          # SUP-005 · 同一段上下文只算一次 embedding
+          # ══════════════════════════════════════════════════════════════════
+          def t_sup005():
+              calls = []
+              real_embed, real_avail = dedup.embed_texts, dedup.embeddings_available
+              dedup.embed_texts = lambda ts: (calls.append(list(ts)) or [[1.0, 0.0]] * len(ts))
+              dedup.embeddings_available = lambda: True
+              try:
+                  ctx = "夏日口红 卖点A"
+                  g = [{"severity": "soft", "content": "g1", "embedding": [1.0, 0.0]}]
+                  p = [{"severity": "soft", "content": "p1", "embedding": [0.0, 1.0]}]
+
+                  # 旧写法: 两遍各算一次
+                  calls.clear()
+                  M.filter_soft_by_relevance(g, ctx)
+                  M.filter_soft_by_relevance(p, ctx)
+                  assert len(calls) == 2, f"基线不成立: {calls}"
+
+                  # 新写法: 算一次给两遍共用
+                  calls.clear()
+                  sc = M.prepare_soft_context(ctx)
+                  rep = {}
+                  keep_g = M.filter_soft_by_relevance(g, ctx, report_sink=rep, context=sc)
+                  keep_p = M.filter_soft_by_relevance(p, ctx, report_sink=rep, context=sc)
+                  assert len(calls) == 1, f"还是发了 {len(calls)} 次 embedding"
+                  assert rep["soft_filter_mode"] == "active", rep
+                  # 结论不能因为复用而改变: 与 ctx 同向的留下, 正交的滤掉
+                  assert len(keep_g) == 1 and keep_p == [], (keep_g, keep_p)
+
+                  # 降级三态照旧写进 report_sink
+                  dedup.embeddings_available = lambda: False
+                  rep2 = {}
+                  assert M.filter_soft_by_relevance(g, ctx, report_sink=rep2) == g
+                  assert rep2["soft_filter_mode"] == "no_embedding_api", rep2
+                  assert M.prepare_soft_context(ctx).mode == "no_embedding_api"
+                  dedup.embeddings_available = lambda: True
+                  dedup.embed_texts = lambda ts: None
+                  assert M.prepare_soft_context(ctx).mode == "ctx_embed_failed"
+              finally:
+                  dedup.embed_texts, dedup.embeddings_available = real_embed, real_avail
+
+
+          def t_sup005_callsites():
+              src = open("app.py", encoding="utf-8").read()
+              assert src.count("prepare_soft_context(") == 2, \
+                  "app.py 的两个调用点没有都改成复用一次算好的 ctx 向量"
+              tree = ast.parse(src)
+              for node in ast.walk(tree):
+                  if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                          and node.func.attr == "filter_soft_by_relevance"):
+                      kws = {k.arg for k in node.keywords}
+                      assert "context" in kws, \
+                          f"app.py:{node.lineno} 的 filter_soft_by_relevance 没传 context, 又会多发一次 embedding"
+
+
+          # ══════════════════════════════════════════════════════════════════
+          # SUP-007 / ROB-013 · 无界缓存 / 全局清空 / FD 泄漏
+          # ══════════════════════════════════════════════════════════════════
+          def t_sup007():
+              src = inspect.getsource(db)
+              assert "_CLIENT_CACHE_TTL" in src and "_CLIENT_CACHE_MAX" in src
+              assert db._CLIENT_CACHE_TTL > 3600, \
+                  "ttl 必须大于 access_token 的有效期(约 1h), 否则活跃会话会被反复踢掉重建"
+              assert 0 < db._CLIENT_CACHE_MAX <= 512, db._CLIENT_CACHE_MAX
+              # 装饰器真的把上限传下去了(而不是只定义了常量没用上)
+              dec = [n for n in ast.walk(ast.parse(textwrap.dedent(
+                  inspect.getsource(db._make_client_cached))))
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                  and n.func.id == "_cache_resource"]
+              assert dec, "拿不到 _make_client_cached 的装饰器"
+              kw = {k.arg for k in dec[0].keywords}
+              assert {"ttl", "max_entries"} <= kw, f"缓存还是无上限无过期: {kw}"
+
+              # 登出不许再清全局 client 缓存(会波及所有在线用户)
+              out = inspect.getsource(__import__("auth").sign_out)
+              tree = ast.parse(textwrap.dedent(out))
+              bad = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "clear"
+                     and isinstance(n.func.value, ast.Attribute)
+                     and n.func.value.attr == "_make_client_cached"]
+              assert not bad, "sign_out 又在清全局 client 缓存了(SUP-007)"
+              # 但按用户隔离的读缓存仍然要清 —— 别把这一条也顺手删了
+              assert "db.list_projects" in out and ".clear()" in out
+
+
+          def t_rob013_close():
+              closed = []
+
+              class _Sub:
+                  def __init__(self, tag):
+                      self.tag = tag
+
+                  def close(self):
+                      closed.append(self.tag)
+
+              class _Lazy:
+                  """惰性子客户端: 被【属性访问】就现建一个 —— 关连接时绝不能触发它。"""
+                  def __init__(self):
+                      self.built = 0
+                      self.auth = _Sub("auth")
+                      self._postgrest = _Sub("postgrest")
+                      self._storage = None          # 还没建过
+                      self._functions = None
+
+                  @property
+                  def storage(self):
+                      self.built += 1
+                      return _Sub("storage")
+
+                  @property
+                  def postgrest(self):
+                      self.built += 1
+                      return self._postgrest
+
+              c = _Lazy()
+              db.close_client(c)
+              assert "auth" in closed and "postgrest" in closed, closed
+              assert c.built == 0, "close_client 访问了属性, 把还没建的子客户端现建了出来"
+              assert "storage" not in closed, closed
+
+              # 一个子客户端关不掉, 不能拦住其余的
+              class _Bad(_Lazy):
+                  def __init__(self):
+                      super().__init__()
+                      self.auth = type("X", (), {"close": lambda s: (_ for _ in ()).throw(OSError("boom"))})()
+              closed.clear()
+              db.close_client(_Bad())
+              assert closed == ["postgrest"], closed
+
+              # auth 的一次性 client 必须走会关连接的上下文管理器
+              import auth as A
+              a_src = inspect.getsource(A)
+              tree = ast.parse(a_src)
+              fns = {"sign_up", "sign_in", "sign_out", "_try_refresh_session", "_try_cookie_restore"}
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.FunctionDef) and node.name in fns:
+                      raw = [n for n in ast.walk(node)
+                             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                             and n.func.id == "_fresh_auth_client"]
+                      assert not raw, f"{node.name} 还在裸调 _fresh_auth_client, 连接不会被关(ROB-013)"
+              assert "db.close_client(client)" in inspect.getsource(A._auth_client)
+
+
+          # ══════════════════════════════════════════════════════════════════
+          # SUP-008 · 锁池上限, 且绝不淘汰正在被持有的锁
+          # ══════════════════════════════════════════════════════════════════
+          def t_sup008():
+              db._MEMORY_UPSERT_LOCKS.clear()
+              old_max = db._MEMORY_UPSERT_LOCKS_MAX
+              db._MEMORY_UPSERT_LOCKS_MAX = 8
+              try:
+                  for i in range(200):
+                      with db._memory_upsert_lock(f"k{i}"):
+                          pass
+                  assert len(db._MEMORY_UPSERT_LOCKS) <= 8, \
+                      f"锁池无上限: {len(db._MEMORY_UPSERT_LOCKS)}(SUP-008 没修掉)"
+
+                  # 关键正确性: 正在被持有的 key 绝不能被淘汰 —— 换了锁对象就不再互斥
+                  held = threading.Event()
+                  release = threading.Event()
+
+                  def _holder():
+                      with db._memory_upsert_lock("HOT"):
+                          held.set()
+                          release.wait(5)
+
+                  t = threading.Thread(target=_holder, daemon=True)
+                  t.start()
+                  assert held.wait(5)
+                  hot_lock = db._MEMORY_UPSERT_LOCKS["HOT"][0]
+                  for i in range(200, 400):        # 疯狂制造淘汰压力
+                      with db._memory_upsert_lock(f"k{i}"):
+                          pass
+                  assert "HOT" in db._MEMORY_UPSERT_LOCKS, "把正在被持有的锁淘汰掉了 —— 互斥当场失效"
+                  assert db._MEMORY_UPSERT_LOCKS["HOT"][0] is hot_lock, "锁对象被换掉了"
+                  release.set()
+                  t.join(5)
+
+                  # 用完了才可以被淘汰
+                  for i in range(400, 600):
+                      with db._memory_upsert_lock(f"k{i}"):
+                          pass
+                  assert "HOT" not in db._MEMORY_UPSERT_LOCKS, "用完之后仍然赖着不走"
+
+                  # 真的互斥: 两个线程抢同一个 key 不会同时进临界区
+                  db._MEMORY_UPSERT_LOCKS_MAX = 1
+                  overlap, inside = [], []
+
+                  def _worker():
+                      with db._memory_upsert_lock("SAME"):
+                          inside.append(1)
+                          overlap.append(len(inside))
+                          time.sleep(0.01)
+                          inside.pop()
+
+                  ts = [threading.Thread(target=_worker) for _ in range(6)]
+                  [x.start() for x in ts]
+                  [x.join(5) for x in ts]
+                  assert max(overlap) == 1, f"同一个 key 上出现了并发: {overlap}"
+              finally:
+                  db._MEMORY_UPSERT_LOCKS_MAX = old_max
+                  db._MEMORY_UPSERT_LOCKS.clear()
+
+
+          # ══════════════════════════════════════════════════════════════════
+          # SUP-001 · prompt cache TTL
+          # ══════════════════════════════════════════════════════════════════
+          def t_sup001():
+              assert config.ANTHROPIC_CACHE_TTL in ("5m", "1h")
+              G._cache_ttl_disabled = False
+              cc = G._cache_control()
+              assert cc == {"type": "ephemeral", "ttl": "1h"}, cc
+
+              layers = {"stable": "S" * 50, "tactic": "T", "p0": "P0", "p1": "P1", "p2": "P2"}
+              blocks = G._system_to_claude_param(layers)
+              cached = [b for b in blocks if "cache_control" in b]
+              assert len(cached) == 4, len(cached)
+              assert all(b["cache_control"] == cc for b in cached), cached
+              assert "cache_control" not in blocks[-1], "p2 不该缓存"
+
+              msgs = [{"role": "user", "content": "历史"}]
+              assert G.ClaudeEngine._apply_prior_cache_breakpoint(msgs) is True
+              assert msgs[-1]["content"][0]["cache_control"] == cc, msgs
+
+              # 全仓只有一处构造 cache_control —— 分散写会让主生成和合规复审用上不同的
+              # ttl, 两者就不再共享同一份前缀, 而"合规搭便车"正是它省钱的全部理由。
+              gtree = ast.parse(open("generator.py", encoding="utf-8").read())
+
+              def _ephemeral_dicts(node):
+                  return [n for n in ast.walk(node)
+                          if isinstance(n, ast.Dict)
+                          and any(isinstance(k, ast.Constant) and k.value == "type" for k in n.keys)
+                          and any(isinstance(v, ast.Constant) and v.value == "ephemeral"
+                                  for v in n.values)]
+
+              all_lits = _ephemeral_dicts(gtree)
+              holder = next(n for n in ast.walk(gtree)
+                            if isinstance(n, ast.FunctionDef) and n.name == "_cache_control")
+              inside = _ephemeral_dicts(holder)
+              assert len(all_lits) == len(inside) == 2, (
+                  f"cache_control 字面量共 {len(all_lits)} 处, 其中只有 {len(inside)} 处在 "
+                  "_cache_control 里 —— 散落的那些不会跟着 ttl 走, 主生成和合规复审会用上"
+                  "不同的 cache_control, 两者就不再共享同一份缓存前缀")
+
+              # 判据: 认得出 ttl 被拒, 认不出普通 400
+              assert G._is_cache_ttl_rejection(Exception("cache_control.ttl: unsupported field"))
+              assert not G._is_cache_ttl_rejection(Exception("max_tokens must be positive"))
+              assert not G._is_cache_ttl_rejection(Exception("model not found"))
+
+
+          def t_sup001_fallback():
+              """中转站拒绝 ttl → 当场降级重试, 不能让整批生成挂掉。"""
+              import anthropic
+
+              def _bad_request(msg):
+                  # 不走 __init__: 它要一个真实的 httpx Response, 而底层 http 库在不同
+                  # SDK 版本里叫 httpx / httpx2。这里只需要类型 + str() + status_code。
+                  exc = anthropic.BadRequestError.__new__(anthropic.BadRequestError)
+                  Exception.__init__(exc, msg)
+                  exc.message = msg
+                  exc.status_code = 400
+                  return exc
+
+              G._cache_ttl_disabled = False
+              seen = []
+
+              def _rebuild():
+                  seen.append(G._cache_control())
+
+              n = {"i": 0}
+
+              def _call():
+                  n["i"] += 1
+                  if n["i"] == 1:
+                      raise _bad_request("cache_control.ttl is not supported by this endpoint")
+                  return "ok"
+
+              assert G._call_with_retry(_call, rebuild=_rebuild) == "ok", "没有降级重试"
+              assert G._cache_ttl_disabled is True, "被拒之后没关掉 ttl, 每一次请求都会再撞一遍"
+              assert seen == [{"type": "ephemeral"}], seen
+              assert n["i"] == 2, n
+
+              # 关掉之后所有构造点都不带 ttl 了
+              blocks = G._system_to_claude_param({"stable": "S", "p1": "P"})
+              assert all(b.get("cache_control") == {"type": "ephemeral"}
+                         for b in blocks if "cache_control" in b), blocks
+
+              # 普通 400 照旧上抛, 不能被当成 ttl 问题吞掉
+              G._cache_ttl_disabled = False
+              try:
+                  G._call_with_retry(lambda: (_ for _ in ()).throw(_bad_request("max_tokens invalid")),
+                                     rebuild=_rebuild)
+              except anthropic.BadRequestError:
+                  pass
+              else:
+                  raise AssertionError("普通 400 被当成 ttl 问题吞掉了")
+              assert G._cache_ttl_disabled is False
+              G._cache_ttl_disabled = False
+
+
+          def t_sup001_callsites():
+              """三个带缓存的调用点都要能重拼请求体, 否则降级重试还是发同一个被拒的体。"""
+              src = open("generator.py", encoding="utf-8").read()
+              tree = ast.parse(src)
+              with_rebuild = 0
+              for node in ast.walk(tree):
+                  if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                          and node.func.id == "_call_with_retry"):
+                      if any(k.arg == "rebuild" for k in node.keywords):
+                          with_rebuild += 1
+              assert with_rebuild == 3, \
+                  f"只有 {with_rebuild} 个调用点带 rebuild; generate / iterate / 合规复审都要带"
+
+
+          # ══════════════════════════════════════════════════════════════════
+          # codex review (2026-08-24) 的 6 条发现 —— 逐条核实为真, 逐条补回归
+          # ══════════════════════════════════════════════════════════════════
+          def t_codex_p1_multi_engine_version_num():
+              """多引擎批次: 同一 item 的每个引擎各一条首版, 版本号必须互不相同。
+
+              这是本次审计**自己引入**的最严重一处回归。migrations/003 装上
+              UNIQUE(item_id, version_num) 之后, 原来给每条都写 version_num=1 的
+              bulk_create_initial_versions 会让每一个多引擎批次的首版 insert 撞 23505;
+              而 app._save_batch_results 的失败路径会删掉已建的 items —— 整批生成完
+              什么也不存, 用户只看到一行"批量写入 versions 失败"。
+              """
+              seen = {}
+
+              class _Ins:
+                  def __init__(self, rows):
+                      self.rows = rows
+
+                  def execute(self):
+                      for r in self.rows:                       # 模拟唯一索引
+                          k = (r["item_id"], r["version_num"])
+                          assert k not in seen, f"撞唯一索引 {k} —— 整批会回滚"
+                          seen[k] = True
+                      return type("R", (), {"data": self.rows})()
+
+              class _T:
+                  def insert(self, rows):
+                      return _Ins(rows)
+
+              class _C:
+                  def table(self, _n):
+                      return _T()
+
+              rows = ([{"item_id": "i1", "ai_engine": f"e{k}", "title": f"t{k}", "body": "b"}
+                       for k in range(3)] +
+                      [{"item_id": "i2", "ai_engine": f"e{k}", "title": f"u{k}", "body": "b"}
+                       for k in range(2)])
+              out = db.bulk_create_initial_versions(_C(), rows)
+              nums = {}
+              for r in out:
+                  nums.setdefault(r["item_id"], []).append(r["version_num"])
+              assert nums == {"i1": [1, 2, 3], "i2": [1, 2]}, nums
+              # 引擎与号的对应关系必须按入参顺序, 不能被重排
+              assert [r["ai_engine"] for r in out if r["item_id"] == "i1"] == ["e0", "e1", "e2"]
+
+              # 单引擎(每 item 一条)仍然全是 1 —— 老数据的语义不变
+              seen.clear()
+              solo = db.bulk_create_initial_versions(
+                  _C(), [{"item_id": f"x{k}", "ai_engine": "e", "title": "t", "body": "b"}
+                         for k in range(4)])
+              assert {r["version_num"] for r in solo} == {1}, solo
+
+              # migrations/003 的重编号必须和上面同一套口径(同 item 内从 1 连续排)
+              sql = open("migrations/003_versions_unique_num.sql", encoding="utf-8").read()
+              assert "row_number() OVER (" in sql and "PARTITION BY v.item_id" in sql
+              assert "ORDER BY v.version_num, v.created_at, v.id" in sql, \
+                  "重编号的排序口径变了, 迁移后的历史数据会和新写入的对不上"
+
+
+          def t_codex_p1_health_timeout_actually_fires():
+              """/health 的墙钟上限必须真的会触发。
+
+              codex 指出并经实测确认: to_thread.run_sync 默认 abandon_on_cancel=False,
+              取消要等工作线程返回才生效 —— fail_after 形同虚设, 而"库卡住不回"正是
+              ROB-004 唯一针对的场景。这条断言把 anyio 的这个坑钉成可执行的知识:
+              先证明默认值确实不生效(否则下面那半就是废话), 再证明我们用的写法生效。
+              """
+              import time as _t
+              import anyio
+              import anyio.to_thread
+
+              def _slow():
+                  _t.sleep(0.8)
+                  return "finished-anyway"
+
+              async def _run(abandon):
+                  t0 = _t.monotonic()
+                  try:
+                      with anyio.fail_after(0.2):
+                          r = await anyio.to_thread.run_sync(_slow, abandon_on_cancel=abandon)
+                      return ("returned", r, _t.monotonic() - t0)
+                  except TimeoutError:
+                      return ("timeout", None, _t.monotonic() - t0)
+
+              kind, val, dt = anyio.run(_run, False)
+              assert kind == "returned" and dt > 0.6, (
+                  f"anyio 的行为变了({kind}, {dt:.2f}s) —— 下面那条断言的前提没了, 重新想")
+
+              kind, val, dt = anyio.run(_run, True)
+              assert kind == "timeout" and dt < 0.5, (kind, dt)
+
+              # 真正的守卫: /health 的探测必须传 abandon_on_cancel=True。
+              # 只读源码不 import —— deskcore/app.py 要 fastapi, 本步骤没装。
+              tree = ast.parse(open("deskcore/app.py", encoding="utf-8").read())
+              probe = next(n for n in ast.walk(tree)
+                           if isinstance(n, ast.AsyncFunctionDef) and n.name == "_probe")
+              kws = [k for n in ast.walk(probe) if isinstance(n, ast.Call) for k in n.keywords]
+              ok = any(k.arg == "abandon_on_cancel"
+                       and isinstance(k.value, ast.Constant) and k.value.value is True
+                       for k in kws)
+              assert ok, "_probe 没传 abandon_on_cancel=True —— 那个 fail_after 不会生效"
+
+              # 网络层兜底: 被放弃的线程要能自己收场, 否则线程和连接永久驻留
+              src = open("deskcore/app.py", encoding="utf-8").read()
+              assert "postgrest_client_timeout" in src, \
+                  "探测 client 没有网络超时, 被放弃的线程会一直挂着"
+
+
+          def t_codex_p2_marked_after_success():
+              """标记去重要在【写成功之后】记, 否则一次瞬时错误会让 item 停在原状态。"""
+              tree = ast.parse(_app_func_src("_run_hard_constraint_check"))
+              add = [n for n in ast.walk(tree)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                     and n.func.attr == "add"
+                     and isinstance(n.func.value, ast.Name) and n.func.value.id == "marked_items"]
+              assert len(add) == 1, f"marked_items.add 出现 {len(add)} 次"
+              # 那次 add 必须在 try 体里、且排在 update_item_status 之后
+              tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try)]
+              holder = [t for t in tries if any(a is c for c in ast.walk(t) for a in add)]
+              assert holder, "marked_items.add 不在 try 里 —— 写失败也会被记成'标过了'"
+              body_lines = [n.lineno for n in ast.walk(holder[0]) if isinstance(n, ast.Call)
+                            and getattr(n.func, "attr", "") == "update_item_status"]
+              assert body_lines and add[0].lineno > body_lines[0], \
+                  "marked_items.add 排在 update_item_status 之前, 等于没修"
+
+
+          def t_codex_p2_concurrent_ttl_rebuild():
+              """降级那一瞬间, 每个在途请求都要各自重拼 —— 不能因为开关已经翻了就上抛。"""
+              import anthropic
+
+              def _bad(msg):
+                  e = anthropic.BadRequestError.__new__(anthropic.BadRequestError)
+                  Exception.__init__(e, msg)
+                  e.message, e.status_code = msg, 400
+                  return e
+
+              G._cache_ttl_disabled = True          # 模拟"第一个请求已经把开关关了"
+              rebuilt = {"n": 0}
+              n = {"i": 0}
+
+              def _rebuild():
+                  rebuilt["n"] += 1
+
+              def _call():
+                  n["i"] += 1
+                  if n["i"] == 1:
+                      raise _bad("cache_control.ttl is not supported by this endpoint")
+                  return "ok"
+
+              try:
+                  assert G._call_with_retry(_call, rebuild=_rebuild) == "ok", \
+                      "开关已关时, 第二个在途请求被直接上抛了(codex P2)"
+                  assert rebuilt["n"] == 1, rebuilt
+              finally:
+                  G._cache_ttl_disabled = False
+
+
+          def t_codex_p2_in_chunks_and_empty_memories():
+              """两条小的: in_ 要分块; 两个记忆表都空时不算 ctx 向量。"""
+              # ① rule_counts_bulk 走 db._in_chunks
+              src = inspect.getsource(S.rule_counts_bulk)
+              assert "_in_chunks" in src, "几百个 UUID 塞进一个 .in_() 会 414"
+              N = 250
+              pids = [f"p{i}" for i in range(N)]
+              mems = [{"id": f"m{i}", "project_id": f"p{i}", "scope": "project",
+                       "status": "confirmed", "severity": "hard", "muted_until": None,
+                       "memory_type": "rule", "content": "禁词"} for i in range(N)]
+              sb = _SB(rows={"memories": mems})
+              got = S.rule_counts_bulk(sb, pids)
+              assert got["p7"] == (1, 0) and got["p249"] == (1, 0), (got["p7"], got["p249"])
+              biggest = max(len(c["filters"]["project_id"][1]) for c in sb.calls
+                            if isinstance(c["filters"].get("project_id"), tuple))
+              assert biggest <= 100, f"单次 .in_() 塞了 {biggest} 个 id"
+
+              # ② 两个记忆表都空 → 一次 embedding 都不发
+              src_app = open("app.py", encoding="utf-8").read()
+              tree = ast.parse(src_app)
+              calls = [n for n in ast.walk(tree)
+                       if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == "prepare_soft_context"]
+              assert len(calls) == 2, len(calls)
+              for c in calls:
+                  parent = next((n for n in ast.walk(tree)
+                                 if isinstance(n, ast.IfExp) and any(x is c for x in ast.walk(n))), None)
+                  assert parent is not None, \
+                      f"app.py:{c.lineno} 的 prepare_soft_context 是无条件调用的 —— " \
+                      "无记忆的项目每批都会白发一次 embedding(codex P2)"
+
+
+          for name, fn in [
+              ("SUP-003 矩阵乘与逐元素逐条一致; 零向量/nan 不会赢; 维度参差自动退回", t_sup003),
+              ("SUP-002 查重下推后不再拉 4000 行×768 维; 结论由 RPC 驱动", t_sup002_pushdown),
+              ("SUP-002 RPC 没部署时退回 Python 路径, 两条路径结论一致", t_sup002_fallback_equivalence),
+              ("SUP-002 权限错必须上抛 —— 查重不 fail-open", t_sup002_no_fail_open),
+              ("SUP-002 回执缺行必须报错, 不能退化成 pass", t_sup002_partial_result),
+              ("SUP-002 open_exact 不受布尔/数字的传输形态影响", t_sup002_bool_shape),
+              ("codex-P1 CREATE_TABLES_SQL 的 RPC 够得着自己引用的表", t_codex_p1_rpc_search_path),
+              ("codex-P1 多引擎批次的版本号互不相同(否则整批不落库)", t_codex_p1_multi_engine_version_num),
+              ("codex-P1 /health 的墙钟上限真的会触发(默认值不会)", t_codex_p1_health_timeout_actually_fires),
+              ("codex-P2 标记去重在写成功之后才记", t_codex_p2_marked_after_success),
+              ("codex-P2 降级瞬间每个在途请求各自重拼", t_codex_p2_concurrent_ttl_rebuild),
+              ("codex-P2 in_ 分块 + 无记忆项目不白算 ctx 向量", t_codex_p2_in_chunks_and_empty_memories),
+              ("ROB-004 /health 走私有线程额度 + 墙钟上限, 不与工具抢池子", t_rob004_health_pool),
+              ("ROB-011 回填逐页消费, 峰值与项目历史总量无关", t_rob011_streaming),
+              ("SUP-004 list_projects 查询次数与项目数无关; 不再为计数拉向量", t_sup004),
+              ("SUP-004 批量计数判据与 shared_memories 一致(静音/note/空内容)", t_sup004_muted_and_type),
+              ("SUP-005 两遍软规则过滤只发一次 embedding(旧路径两次)", t_sup005),
+              ("SUP-005 app.py 两个调用点都传了 context", t_sup005_callsites),
+              ("SUP-007 client 缓存带 ttl/上限; 登出不再清掉所有人的", t_sup007),
+              ("ROB-013 一次性 auth client 用完就关, 且不触发惰性子客户端构造", t_rob013_close),
+              ("SUP-008 锁池有上限, 但正在被持有的锁绝不淘汰(换锁=互斥失效)", t_sup008),
+              ("SUP-001 ttl=1h 打进四个断点与历史断点; cache_control 只有一处构造", t_sup001),
+              ("SUP-001 中转站拒 ttl → 当场降级重试; 普通 400 照旧上抛", t_sup001_fallback),
+              ("SUP-001 三个带缓存的调用点都能重拼请求体", t_sup001_callsites),
+          ]:
+              check(name, fn)
+
+          print()
+          if FAIL:
+              raise SystemExit("审计第三批回归 FAILED:\n  - " + "\n  - ".join(FAIL))
+          print("审计第三批回归 + codex review 7 条: 23/23 通过")
+          PY
       - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
         run: |
           # ⚠️ 这一步存在的理由: /health 里一个 `getattr(config, ...)` 因为
@@ -646,6 +2281,7 @@ jobs:
           os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
           os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "sb_secret_placeholder")
           from fastapi.testclient import TestClient
+          import deskcore.app as app_mod
           from deskcore.app import app
 
           # ⚠️ 必须【进入 TestClient 的上下文】, 否则 ASGI lifespan 不会跑。
@@ -674,11 +2310,63 @@ jobs:
           assert body["tools"], "/health 没回显工具清单"
           print(f"  ✓ /health 200, llm=none, tools={len(body['tools'])} 个")
 
-          # 未配鉴权 = dev 模式放行(与 librarian/onboarder/worker 同口径, 刻意的)。
-          # 但 /health 必须把它标成【不健康】—— 生产忘配就等于匿名开放。
-          assert cfg["auth"]["ok"] is False and "dev" in cfg["auth"]["note"], cfg["auth"]
+          # ── ROB-004 的运行期一半(审计第三批) ────────────────────────────
+          # 静态那一半在"审计第三批回归"步里(那一步只装 lockfile, import 不了
+          # fastapi, 所以只能读源码)。这里 fastapi 在, 补上真对象的检查。
+          import anyio
+          assert isinstance(app_mod._HEALTH_LIMITER, anyio.CapacityLimiter)
+          assert app_mod._HEALTH_LIMITER.total_tokens >= 2
+          # 关键: /health 的额度必须【不是】starlette 的默认线程池那一个,
+          # 否则"给它私有额度"只是句空话 —— 工具占满时它照样排队。
+          import anyio.to_thread
+
+          async def _default_limiter():
+              # current_default_thread_limiter() 要在事件循环里才拿得到
+              return anyio.to_thread.current_default_thread_limiter()
+
+          assert app_mod._HEALTH_LIMITER is not anyio.run(_default_limiter), \
+              "/health 用的还是默认线程池额度, ROB-004 没修掉"
+          assert app_mod._HEALTH_PROBE_TIMEOUT > 0
+          print(f"  ✓ ROB-004 /health 私有线程额度={app_mod._HEALTH_LIMITER.total_tokens}, "
+                f"探测超时={app_mod._HEALTH_PROBE_TIMEOUT:g}s, 与默认池分离")
+
+          # codex review 2026-08-24: 探测 client 要有【网络层】超时, 否则被
+          # abandon_on_cancel 放弃掉的那个线程会永久驻留(连接也不还)。
+          _pc = app_mod._health_probe_client()
+          assert _pc is app_mod._health_probe_client(), "探测 client 不是单例 —— 每次 /health 新建一个就是 ROB-013 重演"
+          _t = _pc.postgrest.session.timeout
+          _read = getattr(_t, "read", _t)
+          assert _read is not None and float(_read) <= app_mod._HEALTH_PROBE_TIMEOUT, \
+              f"探测 client 的网络超时 {_read} 不小于墙钟预算 {app_mod._HEALTH_PROBE_TIMEOUT}"
+          print(f"  ✓ codex-P1 /health 探测 client 单例且带网络超时 read={_read}")
+
+          # 未配鉴权 = 【拒绝所有请求】(2026-08-23 审计 ROB-003)。
+          # 这里原来断言的是"放行但标 auth.ok=false" —— 那个口径是危险的:
+          # deskcore 持 service_role 绕 RLS, 漏配一个环境变量就等于把全部租户
+          # 的数据和十一个工具(含写)匿名开放到公网; 而 /health 返 200,
+          # Railway 的 healthcheck 只看状态码, 一个彻底敞开的部署照样上线。
+          assert cfg["auth"]["ok"] is False, cfg["auth"]
+          assert "401" in cfg["auth"]["note"], cfg["auth"]["note"]
           assert body["ok"] is False, "未配鉴权时整体 ok 不该是 true"
-          print("  ✓ 未配鉴权: 放行但 /health 标 auth.ok=false + 整体 ok=false")
+          assert cfg["anonymous_allowed"] is False, cfg["anonymous_allowed"]
+          # ⚠️ 这条才是真正的护栏, 老 CI 从来没测过: 未配鉴权时打一个真工具。
+          r = c.post("/tool/list_projects", json={})
+          assert r.status_code == 401, f"未配鉴权却放行了工具调用: {r.status_code}"
+          print("  ✓ 未配鉴权: 工具调用 401(fail-closed) + /health 标 auth.ok=false")
+
+          # /health 仍然返 200 —— 【刻意保留】。Railway 只看状态码, 而库瞬断
+          # 这类可恢复故障不该把整个部署卡住(上面那条 200 断言就是为此存在)。
+          # 越权风险已经在 identity.resolve 那层堵死, 不该再用状态码兜第二遍。
+
+          # 本地开发的逃生口必须是【显式】的, 且要在 /health 上看得见。
+          os.environ["DESKCORE_ALLOW_ANONYMOUS"] = "1"
+          h = c.get("/health").json()
+          assert h["config"]["anonymous_allowed"] is True, h["config"]
+          assert "dev" in h["config"]["auth"]["note"], h["config"]["auth"]["note"]
+          assert c.post("/tool/list_projects", json={}).status_code != 401
+          os.environ.pop("DESKCORE_ALLOW_ANONYMOUS")
+          assert c.post("/tool/list_projects", json={}).status_code == 401
+          print("  ✓ DESKCORE_ALLOW_ANONYMOUS=1 才放行, 且 /health 回显; 去掉即恢复 401")
 
           # 配坏了(DESKCORE_KEYS 不是合法 JSON) → 必须 401, 【不能】退化成 dev 放行。
           # 生产上一个逗号写错就等于把项目数据和全部写工具匿名开放出去。

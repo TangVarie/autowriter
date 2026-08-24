@@ -7,6 +7,183 @@
 
 ---
 
+## 0. 修复进度
+
+| 批次 | 条目 | 状态 |
+|---|---|---|
+| 第 1 批 · 止血 | ROB-003 · COR-003 · COR-007 · COR-010 · COR-005/006 | ✅ **已修**(见下) |
+| 第 2 批 · 数据一致性 | COR-002 · COR-004 · COR-008 · COR-009 · COR-011 · COR-020 · COR-021 · COR-022 · ROB-009 · ROB-018 | ✅ **已修**(见 §0.2) |
+| 第 3 批 · 性能与成本 | SUP-001 · SUP-002 · SUP-003 · SUP-004 · SUP-005 · SUP-007 · SUP-008 · ROB-004 · ROB-011 · ROB-013 | ✅ **已修**(见 §0.3; codex review 的 7 条修正见 §0.4) |
+| 第 4 批 · 结构性 | ROB-001 · ROB-002 · SUP-011 · SUP-012 · SUP-024 · SUP-010 · COR-014 · COR-015 | 待做 |
+
+### 0.1 第 1 批(止血)的实现说明与**两处与本报告的偏差**
+
+行号引用仍指审计当时的版本; 修复后的位置以 CI 的 `审计第一批止血回归` 一步为准。
+
+| 条目 | 怎么修的 |
+|---|---|
+| ROB-003 | `deskcore/identity.py:resolve` 改 fail-closed: 未配 key 一律 401, 免 key 跑要显式 `DESKCORE_ALLOW_ANONYMOUS=1`。`/health` 增回显 `config.anonymous_allowed`, 并把 `auth_health()` 从两次调用收敛成一次(否则 `ok` 与 note 可能对不上) |
+| COR-003 | 新增 `update_calibration_notes_cas` RPC(`migrations/002_calibration_cas.sql` + `db.py::CREATE_TABLES_SQL` 两边同步), witness 压成 md5 进 body。`memory.save_calibration_notes` 改走它; RPC 未部署时退回 `_legacy_cas_update` 并埋 `calibration_cas_rpc_missing` |
+| COR-007 | `deskcore/store.shared_memories` 改调 `db.is_memory_muted_now` |
+| COR-010 | 新增 `db.WriteReturnedNoRow` + `db._first_row()`, 覆盖全部写入点 |
+| COR-005/006 | `deskcore/store._paged()` 助手(空页收工 + offset 按实收前进), 应用到 `existing_fingerprint_version_ids` / `legacy_versions` / `fingerprints_missing_vectors` |
+
+**偏差 1 — ROB-003 没有把 `/health` 改成 503。** 报告 §9 第 1 条写的是"`/health` 在 `ok=False` 时返 503"。实施时否掉了这一半:
+
+- CI 里有一条带完整理由的断言把 200 定为硬要求(`ci.yml` 的 app 冒烟步): 库瞬断这类**可恢复**故障不该把整个部署卡住, 而 Railway 的 healthcheck 只看状态码。翻转它会让一次 Supabase 抖动挡住正常发布。
+- 更重要的是: 真正的危险来自 `resolve()` 的 fail-open, 不是状态码。根因堵死之后, 未配鉴权的部署会对每个工具调用返 401 —— 起得来但什么也不做、且当场可见, 不再泄露任何数据。再用状态码兜第二遍属于拿部署可用性换一个已经不存在的风险。
+
+所以 ROB-003 按"修根因、留状态码"处理, 并在 `docs/deskcore.md` §3b 记下这个取舍。**若日后仍希望 `/health` 对配置类故障返 503**, 那是一个独立的、可讨论的运维决策, 不在本批。
+
+**偏差 2 — COR-010 实际是 11 处, 不是 7 处。** 报告正文只列了 7 个代表位置。逐个核过之后另有 4 处同类:
+`update_project`(`db.py:1114`)、`_upsert_memory_locked` 的 INSERT 返回(`:2217`)、
+`increment_memory_frequency` 的兜底写(`:2500`)、`update_memory`(`:2508`)。全部一并修了。
+CI 用 AST 遍历 `db.py` 钉死"不许再出现无守卫的 `return <x>.data[0]`"—— 按行文本匹配会把
+`if res.data: return res.data[0]` 和 `return res.data[0] if res.data else None` 一起误报。
+
+**过程中新发现的一处**: `memory.save_calibration_notes` 的 docstring 仍在描述已被替换的
+`.eq("calibration_notes", ...)` 机制(注释与实现不一致), 由新加的 CI 断言当场抓到, 已一并改。
+
+### 0.2 第 2 批(数据一致性与并发)的实现说明
+
+回归在 CI 的 `审计第二批回归` 一步。每条都**先复现失败模式再证明修好** ——
+只断言"现在是对的"挡不住回退。
+
+| 条目 | 怎么修的 |
+|---|---|
+| COR-002 | `items.id` 改由客户端预生成并显式写进 INSERT(`uuid_generate_v4()` 只是 DEFAULT), slot ↔ item_id 由构造保证, 不再依赖任何返回顺序; 回执缺行时整批失败 + 回收已插的行 |
+| COR-004 | `migrations/003` 加 `UNIQUE(item_id, version_num)`(先把历史重复对子按 `(version_num, created_at, id)` 稳定重编号, 否则建索引直接失败); `create_version` 捕获 23505 后重读 max 重试 |
+| COR-008 | 新增 `db._paged_select()`(空页收工 + offset 按实收前进), 应用到 `get_session_committed_item_ids` / `list_approved_versions_for_sync` / `_collect_recent_canonical_versions` 的版本查询; `_collect_recent_canonical_versions` 删掉多余的短页判据; `deskcore/store.fingerprints` 同改 |
+| COR-009 | `list_items.clear()` 移到 INSERT 之后 |
+| COR-011 | 加 `marked_items` 集合去重, 警告仍逐条给用户 |
+| COR-020 | `content = rule.get("content","")` 读一次, 四条上报路径统一用它 |
+| COR-021 | 新增 `_strip_outer_code_fence()` 只剥最外层围栏, 替换三处全局 `re.sub` |
+| COR-022 | `engines = list(dict.fromkeys(engines))` 去重保序 |
+| ROB-009 | sweeper 增查 `heartbeat_at IS NULL` 的候选(按 `claimed_at` 判超时; 两者皆空视为僵尸), 分两次查而不是手拼 `or=` 过滤串 |
+| ROB-018 | `seal_session` / `update_job_progress` 看受影响行数; 四个草稿写入收进 `_best_effort_item_patch`(仍不抛, 但两种失败都留痕) |
+
+**顺带抽出的一处**: 新增 `db.parse_ts()` 统一 PG 时间戳解析(aware/naive/`Z`/7 位微秒),
+`is_memory_muted_now` 改调它, ROB-009 也用它。COR-007 的根因就是"各写一份 ISO 解析",
+本批修 ROB-009 时差点又用字符串字典序比时间戳 —— 带微秒与不带微秒混排会差一秒
+(`.` 的码位大于 `+`)。判据收成一处。
+
+**COR-008 的范围比报告写的多一处**: `_collect_recent_canonical_versions` 内部的
+`_fetch_versions` 是按 **item 数**分块(每块 100 个 item)而不是按行数, 一块里只要平均
+迭代过 10 版就能超过 max-rows —— 而那段注释声称已经处理了截断。一并改成翻页。
+
+**CI 断言写法**: 本批有三条断言第一版用文本匹配, 全都被自己写的解释性注释误报
+(注释里引用旧写法来说明为什么换掉它)。改成 AST 后才可靠 —— 这正是 round-5 §6
+记过的那一课, 一个批次里又踩了三次, 说明"钉死某个写法不许回来"的断言天然应该走 AST。
+
+### 0.3 第 3 批(性能与成本)的实现说明
+
+回归在 CI 的 `审计第三批回归` 一步(16 条)。同样是**先复现失效再证明修好**。
+
+| 条目 | 怎么修的 |
+|---|---|
+| SUP-001 | 新增 `config.ANTHROPIC_CACHE_TTL`(默认 `1h`), `generator._cache_control()` 成为全仓**唯一**构造 `cache_control` 的地方。中转站若不认 `ttl`, `_call_with_retry(..., rebuild=)` 当场关掉 ttl、重拼请求体再试一次, 并埋 `anthropic_cache_ttl_rejected` |
+| SUP-002 | 新增 `deskcore_check_drafts` RPC(`migrations/004` + `db.py::CREATE_TABLES_SQL` 两边同步): 开头精确 / 四字串 Jaccard / 标题余弦三路全部在库里算完, 每篇只回一行。`core._history_probe` 把下推与 Python 两条路径收成同一个形状 |
+| SUP-003 | `dedup.similarity_matrix()` 用 numpy 做成批余弦, `find_near_duplicates` / `cross_batch_pairs` 改走它; numpy 缺失时退回逐元素。numpy 补进 `requirements.txt` 显式声明 |
+| SUP-004 | `list_projects` 由 `2N+1` 次查询变成固定 3 次: `rule_counts_bulk`(一次 `in_` 查全部项目的规则, 且**不再取 embedding 列**) + `deskcore_fingerprint_counts` RPC。RPC 未部署时退回逐项目 count |
+| SUP-005 | 新增 `memory.prepare_soft_context()`, `filter_soft_by_relevance` 接受 `context=` 复用。app.py 两个调用点(队列 / 快速生成)各自从两次 embedding 降到一次 |
+| SUP-007 | `_make_client_cached` 加 `ttl=7200` + `max_entries=64`; 登出**不再** `clear()` 全局 client 缓存 |
+| SUP-008 | `_MEMORY_UPSERT_LOCKS` 改成带**引用计数**的 LRU(上限 512), 只淘汰 `users == 0` 的项 |
+| ROB-004 | 根因随 SUP-002 消掉; 另给 `/health` 一个**私有** `anyio.CapacityLimiter` + 5 秒墙钟上限, 它不再和工具抢 starlette 的默认线程池 |
+| ROB-011 | 新增 `store._paged_iter()` / `legacy_version_pages()`, `backfill_fingerprints` 改为逐页消费; 请求路径那一半随 SUP-002 消掉 |
+| ROB-013 | 新增 `db.close_client()` + `auth._auth_client()` 上下文管理器, 五个一次性 auth client 用完即关 |
+
+**SUP-001 的账**(base input 价记作 1×; 写入 5m=1.25× / 1h=2×, 命中均 0.1×):
+
+| 一小时内的批数 | 现状(5m, 每批必 miss) | 1h TTL | 完全不开缓存 |
+|---|---|---|---|
+| 1 | 1.25 | 2.0 | 1.0 |
+| 2 | 2.5 | 2.1 | 2.0 |
+| 3 | 3.75 | 2.2 | 3.0 |
+| 10 | 12.5 | 2.9 | 10.0 |
+
+n≥2 起 1h 就比现状便宜, 只有"一小时里孤零零跑一批"更亏 —— 那种用法本来也无缓存可言。
+**注意现状那一列**: 批间隔一旦超过 5 分钟, 开着缓存比不开还贵 25%, 这正是 SUP-001 的实质。
+默认选 1h 是因为这个工作台的节奏(坐下来连排几批, 批间常常 >5min 但 ≪1h)正好落在 5m 最亏的区间。
+落地前建议先按 §7.6 量一次 `cache_create / (cache_create + cache_read)`, 长期 >0.5 就是这个形状。
+
+**SUP-002 刻意不走 ivfflat 索引**: `draft_fp_embedding_idx` 是近似最近邻(默认 `probes=1`
+只扫一个聚类桶), 对"推荐相似内容"够用, 对**查重硬闸**是致命的 —— 漏掉的那条正是要拦下的
+重复稿, 而且不报错; 叠加 `project_id` 过滤后更糟(先按向量取候选再过滤, 可能一条都不剩)。
+RPC 里 `ORDER BY` 的是子查询算好的别名 `sim` 而不是 `title_embedding <=> v`, 规划器因此
+必然走顺序扫描。索引留着不动, 将来做"找相似选题"这类容忍近似的功能仍然用得上。
+
+**下推带来的一个口径变化**: `history_size` 现在是**全量**条数, `history_truncated` 恒为
+`false` —— 原来的 4000 条上限和那条"更老的稿子没参与查重"的警告只在 `migrations/004`
+没跑、退回 Python 路径时才会出现。这是修好了一个已知的谎, 不是丢了信息。
+
+**SUP-008 的关键约束**: 加上限时**绝不能淘汰正在被持有的锁**。一旦把某个 key 的 Lock
+换成新对象, 已经拿着旧锁的线程和随后拿到新锁的线程就不再互斥 —— 而这把锁存在的全部
+意义就是互斥。引用计数在 `acquire` **之前**就 +1, 否则"取到锁对象但还没 acquire"那一瞬
+仍可能被淘汰。回归里专门有一条守着这件事。
+
+**又一次证明第 2 批那条教训**: 第 1 批留下的 `assert "_paged(" in body` 在本批把
+`legacy_versions` 改成委托给 `legacy_version_pages` 之后当场误报"没走翻页" —— 翻页明明
+还在, 只是深了一层。已改成 AST 且钉**被禁的形态**(常数 `.limit(N)`)而不是**当前的写法**。
+钉写法的断言每次合理重构都会假报警; 钉禁忌的不会。
+
+**deskcore 依赖增量**: `deskcore/requirements.txt` 不需要改 —— 部署本来就是
+`pip install -r requirements.lock -r deskcore/requirements.txt`, numpy 在锁文件里。
+
+---
+
+### 0.4 codex review 的 7 条(2026-08-24)——**全部属实**
+
+第三批推上去之后叫了一轮 codex review，7 条 findings 逐条核实之后**没有一条是误报**。
+其中 3 条 P1，两条是我在这次审计里**自己引入**的回归。记在这里，因为它们暴露的是
+我判断方式上的问题，不只是几个 bug。
+
+| # | 严重度 | 是什么 | 修法 |
+|---|---|---|---|
+| 1 | P1 | `migrations/003` 的唯一索引会让**每一个多引擎批次**整批不落库 | `bulk_create_initial_versions` 改成同 item 内 1..N 编号 |
+| 2 | P1 | `CREATE_TABLES_SQL` 里 4 个 RPC 的 `search_path` 够不着自己引用的表 | 加 `autowriter` 进 search_path + CI 守卫 |
+| 3 | P1 | `/health` 那个"5 秒墙钟上限"**根本不生效** | `abandon_on_cancel=True` + 探测 client 配网络超时 |
+| 4 | P2 | 硬约束标记去重记早了，一次瞬时错误会让 item 停在原状态 | 写成功之后再记 |
+| 5 | P2 | 降级那一瞬间，除第一个之外的在途请求都白失败一次 | 判据与全局开关解耦 |
+| 6 | P2 | `rule_counts_bulk` 把几百个 UUID 塞进一个 `.in_()`，几十 KB 查询串会被网关 414 | 走 `db._in_chunks` |
+| 7 | P2 | 无记忆的项目每批白发一次 ctx embedding —— 本来要省的地方成了净增 | 两个记忆表都空时不算 |
+
+**第 1 条是这次审计里我犯的最严重的错误。** COR-004 的诊断（重复 `version_num` 让挑
+"代表版本"的 tie-break 静默选错）是对的，但我把成因锁死在"并发迭代"这个**罕见竞态**上，
+没有去查"重复号平时是怎么产生的"。实际上 `bulk_create_initial_versions` 给同一 item 的
+**每个引擎**都硬编码 `version_num=1` —— 多引擎批次是天天在跑的常规路径，重复号是**设计
+产物而不是竞态残留**。于是加上唯一索引之后：首版 insert 必撞 23505 → `_save_batch_results`
+的失败路径删掉已建 items → **整批生成完什么也不存**。
+
+教训不是"再仔细点"。是：**给一列加唯一约束之前，必须先枚举出所有往这一列写值的地方**，
+而不是只顺着"我怀疑的那条竞态路径"往下看。我当时只读了 `create_version`，
+没读同样写 `version_num` 的 `bulk_create_initial_versions`。
+
+**第 2 条也是同一类：只看了自己新加的东西，没看它所处的上下文。** 我确实注意到
+`CREATE_TABLES_SQL` 里表名不带前缀而函数固定了 `search_path`，当时判断"这是既有写法，
+不是我的问题"就放过了 —— 可我正在往这个块里**加两个同样写法的新函数**。而且失败方式极坏：
+报错文本里带 `does not exist`，正好被 `store.rpc_missing` 的判据认成"迁移没跑"，
+于是**静默**退回 Python 慢路径，永远不告警。顺带把旁边两个老函数一起修了。
+
+**第 3 条是"我以为我修好了，其实没有"。** 实测（回归里钉死了这个事实）：
+
+```
+with anyio.fail_after(0.3):
+    await to_thread.run_sync(sleep_1s2)   # 1.20s 后【返回了值】，没抛超时
+```
+
+`to_thread.run_sync` 默认 `abandon_on_cancel=False`，取消要等工作线程自己返回才生效。
+也就是说改之前 `/health` 在"库卡住不回"——**本条修复唯一针对的那个场景**——下照样会一直挂着。
+我写下"5 秒墙钟上限"时没有验证过它会不会触发。现在两层都上：`abandon_on_cancel=True`
+让 `/health` 按时应答，探测 client 的 `postgrest_client_timeout` 让被放弃的线程能自己收场。
+
+**关于回归**：7 条各补一条，且都先在 `git stash` 回到修复前的代码上跑过一遍、确认会红。
+`/health` 那条把 anyio 的坑本身写成了可执行断言（先证明默认值确实不生效，再证明我们用的
+写法生效）——下次有人"顺手"把参数去掉时，红的会是一条讲清楚了为什么的断言。
+
+---
+
+---
+
 ## 1. 执行摘要
 
 | 项 | 数 |
@@ -389,7 +566,7 @@ MQ 消费者 (Kafka/RabbitMQ/SQS/RocketMQ/Pulsar)、asyncio 后台 task、事件
 
 ## 9. 下一步建议 (修复路线图)
 
-### 第 1 批 · 止血 (1-2 天, 收益/成本比最高)
+### 第 1 批 · 止血 (1-2 天, 收益/成本比最高) — ✅ 已完成, 实现说明见 §0.1
 
 按顺序:
 
@@ -399,7 +576,7 @@ MQ 消费者 (Kafka/RabbitMQ/SQS/RocketMQ/Pulsar)、asyncio 后台 task、事件
 4. **COR-010** — 统一 `res.data or []` 判空。7 处, 纯机械, 消掉一整类红屏。
 5. **COR-005 / COR-006** — deskcore 三个无翻页查询补翻页。backfill 的幂等性和覆盖面都建立在它们之上。
 
-### 第 2 批 · 数据一致性与并发 (3-5 天)
+### 第 2 批 · 数据一致性与并发 (3-5 天) — ✅ 已完成, 实现说明见 §0.2
 
 6. **COR-002** — bulk insert 顺序假设改成显式匹配。这是唯一一条"正文永久丢失且零告警"的路径。
 7. **COR-004** — `versions` 加 `UNIQUE(item_id, version_num)` + 撞键重试 (需要一条迁移, 两边都改)。
@@ -407,7 +584,7 @@ MQ 消费者 (Kafka/RabbitMQ/SQS/RocketMQ/Pulsar)、asyncio 后台 task、事件
 9. **COR-022 / COR-011 / COR-009 / COR-020 / COR-021** — 一批小改, 各自独立。
 10. **ROB-009 / ROB-018** — sweeper 的 NULL 心跳; UPDATE 0 行的统一检查。
 
-### 第 3 批 · 性能与成本 (1 周)
+### 第 3 批 · 性能与成本 (1 周) — ✅ 已完成, 实现说明见 §0.3
 
 11. **SUP-001** — cache TTL 改 1h。**这是纯配置改动, 但按当前 session 规模, 单项就能显著降本。** 改之前先用监控指标 `cache_create/(cache_create+cache_read)` 量出基线。
 12. **SUP-002 / SUP-003 / ROB-004 / ROB-011** — 相似度比对下推 pgvector。索引 (`db.py:742-744`) 和 SQL 版 Jaccard (`db.py:940-955`) 都已经在库里了, 主要是把 Python 侧换掉。同时解决 deskcore 的线程池饥饿与 OOM 风险。

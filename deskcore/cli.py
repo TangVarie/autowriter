@@ -242,7 +242,10 @@ def main(argv: list[str] | None = None) -> int:
         print(out["prompt_block"]) if args.block else _print(out)
     elif args.cmd == "backfill":
         def _prog(done, total):
-            print(f"  {done}/{total}", flush=True)
+            # 审计 ROB-011 之后回填是【流式】的 —— 分母是"目前为止发现的待回填
+            # 条数", 会随着翻页往上走, 不是一开始就算好的总数。写清楚免得看的人
+            # 以为进度条卡住或倒退。
+            print(f"  已回填 {done} 条 / 已发现 {total} 条待回填", flush=True)
         out = core.backfill_fingerprints(
             sb, args.project, with_embeddings=not args.no_embeddings, progress=_prog)
         _print(out)

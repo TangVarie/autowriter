@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import io
 import json
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import anthropic
 import streamlit as st
@@ -38,11 +38,44 @@ def _make_anthropic_client() -> anthropic.Anthropic:
 
 # ── Prompt assembly ────────────────────────────────────────────────────────
 
+class SoftContext(NamedTuple):
+    """一次算好的相关性上下文, 供多次 ``filter_soft_by_relevance`` 复用。
+
+    ``vec`` 为 None 时 ``mode`` 说明原因(``no_embedding_api`` /
+    ``ctx_embed_failed``), 与旧的单次调用写进 report_sink 的口径一致。
+    """
+    vec: Optional[list]
+    mode: str
+
+
+def prepare_soft_context(context_text: str) -> SoftContext:
+    """把 ``context_text`` 算成向量, 只调一次 embedding(审计 SUP-005)。
+
+    调用方连着过两遍 soft 规则(global 一遍、project 一遍)是常态 ——
+    app.py 的队列路径和快速生成路径都是这么写的。每遍各自算一次 ctx 向量,
+    等于**同一段文本发两次 embedding 请求**: 调用数和这一步的延迟直接翻倍,
+    而两次的输入逐字相同。上层算一次传下来就没有这回事了。
+    """
+    if not context_text or not context_text.strip():
+        return SoftContext(None, "off")
+    try:
+        import dedup as _dedup
+    except Exception:
+        return SoftContext(None, "no_embedding_api")
+    if not _dedup.embeddings_available():
+        return SoftContext(None, "no_embedding_api")
+    vecs = _dedup.embed_texts([context_text.strip()])
+    if not vecs or not vecs[0]:
+        return SoftContext(None, "ctx_embed_failed")
+    return SoftContext(vecs[0], "active")
+
+
 def filter_soft_by_relevance(
     memories: list[dict],
     context_text: str,
     threshold: float = 0.45,
     report_sink: Optional[dict] = None,
+    context: Optional[SoftContext] = None,
 ) -> list[dict]:
     """
     Drop ``severity='soft'`` rules whose embedding is semantically far from
@@ -81,17 +114,15 @@ def filter_soft_by_relevance(
         import dedup as _dedup
     except Exception:
         return memories
-    if not _dedup.embeddings_available():
-        # 整体降级：所有 soft 规则都按"无 embedding API"通过，但记一条总账
+    # 审计 SUP-005: ``context`` 非空时复用上层算好的向量, 不再自己发一次
+    # embedding。不传时行为与以前完全一致(自己算一次)。
+    ctx_info = context if context is not None else prepare_soft_context(context_text)
+    if ctx_info.vec is None:
+        # 整体降级：所有 soft 规则都按原因码通过，但记一条总账
         if report_sink is not None:
-            report_sink["soft_filter_mode"] = "no_embedding_api"
+            report_sink["soft_filter_mode"] = ctx_info.mode
         return memories
-    ctx_vecs = _dedup.embed_texts([context_text.strip()])
-    if not ctx_vecs or not ctx_vecs[0]:
-        if report_sink is not None:
-            report_sink["soft_filter_mode"] = "ctx_embed_failed"
-        return memories
-    ctx = ctx_vecs[0]
+    ctx = ctx_info.vec
     if report_sink is not None:
         report_sink["soft_filter_mode"] = "active"
         report_sink["soft_filter_threshold"] = threshold
@@ -834,6 +865,45 @@ class _CalibrationCASConflict(Exception):
     re-read and retry the merge."""
 
 
+def _legacy_cas_update(
+    db_client: Client,
+    project_id: str,
+    expected_before_text: str,
+    deduped: str,
+) -> Optional[dict]:
+    """migrations/002 未跑时的 CAS 退路：全文 witness 走 PostgREST 过滤。
+
+    返回被更新的行；None = CAS 冲突。**已知缺陷**（正是 COR-003 / migrations/002
+    要消灭的那个）：witness 进 URL query，笔记长到一定程度后网关直接拒收，
+    此处会抛异常而不是返回 None —— 由 ``save_calibration_notes`` 的 except
+    捕获并埋 ``calibration_save_error``。
+
+    R-036: 空 witness 的语义是"我读到的是无既有笔记"。``calibration_notes``
+    nullable 无默认，从未写过笔记的项目该列是 NULL 而不是 ""，``.eq("")``
+    匹配不到 NULL 行 → 0 行被当成冲突 → 首次自动学习永远存不进（下次重试还
+    冲突，死循环）。用 or 同时覆盖 NULL 与 ''；并发若已写入真笔记，该行不再
+    null/空 → 仍正确判为冲突。
+    （md5 RPC 路径靠 ``COALESCE(...,'')`` 天然覆盖这两态，不需要这个特例。）
+    """
+    q = (
+        db_client.table("projects")
+        .update({"calibration_notes": deduped})
+        .eq("id", project_id)
+    )
+    if expected_before_text == "":
+        q = q.or_("calibration_notes.is.null,calibration_notes.eq.")
+    else:
+        q = q.eq("calibration_notes", expected_before_text)
+    rows = q.execute().data or []
+    if not rows:
+        return None
+    try:
+        db.list_projects.clear()
+    except Exception:
+        pass
+    return rows[0]
+
+
 def save_calibration_notes(
     db_client: Client,
     project_id: str,
@@ -861,10 +931,18 @@ def save_calibration_notes(
     不再有"看似成功实际失败"的状态。
 
     并发安全（2026-05）：``expected_before_text`` 给读-合-写的调用方一个 CAS
-    witness。传入时，本函数用 ``.eq("calibration_notes", expected_before_text)``
-    限定更新条件；并发改动后 0 行受影响 → 抛 ``_CalibrationCASConflict`` 让
-    调用方重读重试。不传则走传统覆盖写（用户手动编辑保存场景，意图明确为
+    witness。传入时，本函数把 witness 压成 md5 后走 ``update_calibration_notes_cas``
+    RPC 限定更新条件；并发改动后 0 行受影响 → 抛 ``_CalibrationCASConflict``
+    让调用方重读重试。不传则走传统覆盖写（用户手动编辑保存场景，意图明确为
     "我想要这份文本"）。
+
+    witness 为什么走 md5 而不是原文（2026-08-23 审计 COR-003）：原实现是
+    ``.eq("calibration_notes", expected_before_text)``，而 PostgREST 把过滤条件
+    放进 **URL query string**，这一列的软上限却有 4000 字。中文 URL-encode 后
+    一个字变 9 个字符，越过网关请求行上限之后**每一次**自动学习写入都失败，
+    并被 ``_append_new_observations`` 的 ``except`` 吞掉——四条学习路径静默
+    停摆，笔记越有价值（越长）越先坏。压成 32 字节 md5 后请求大小与笔记长度
+    彻底解耦。RPC 未部署（migrations/002 没跑）时退回 ``_legacy_cas_update``。
     """
     dropped: list[str] = []
     deduped = _dedup_calibration_lines(notes or "", dropped_sink=dropped)
@@ -884,36 +962,31 @@ def save_calibration_notes(
 
     try:
         if expected_before_text is not None:
-            # CAS 路径：直接走 supabase client 加约束，绕过 update_project
-            # 的 schema-fallback（calibration_notes 是稳定列，不在 fallback 名单）
-            _q = (
-                db_client.table("projects")
-                .update({"calibration_notes": deduped})
-                .eq("id", project_id)
-            )
-            if expected_before_text == "":
-                # R-036 review: calibration_notes 列 nullable 无默认 —— 从未写过
-                # 笔记的项目该列是 NULL, 不是 ""。witness 是 "" 时 .eq 匹配不到
-                # NULL 行 → 0 行被当成冲突 → 无笔记项目的"首次自动学习"永远存不
-                # 进、批次永不标记 calibrated(下次重试还冲突, 死循环)。空 witness
-                # 的语义是"我读到的是无既有笔记", NULL 与 "" 都属此态, 用 or 覆盖
-                # 两者 —— 既修首次学习回归, 又保留并发 lost-update 保护(若并发
-                # 已写入真笔记, 该行不再 null/空 → 0 行 → 仍判冲突)。
-                _q = _q.or_("calibration_notes.is.null,calibration_notes.eq.")
-            else:
-                _q = _q.eq("calibration_notes", expected_before_text)
-            res = _q.execute()
-            if not res.data:
+            # CAS 路径：witness 走 md5 RPC，**不再把全文塞进 URL query**。
+            # 审计 COR-003: 旧写法是 .eq("calibration_notes", <全文>)，而这一列
+            # 的软上限是 4000 字；中文 URL-encode 后 ≈36KB 的查询串越过网关上限，
+            # 之后每一次自动学习写入都失败并被上层静默吞掉。详见
+            # db.update_calibration_notes_cas 与 CREATE_TABLES_SQL 里的说明。
+            try:
+                row = db.update_calibration_notes_cas(
+                    db_client, project_id, expected_before_text, deduped,
+                )
+            except db.CalibrationCasRpcMissing:
+                # migrations/002 还没跑：退回旧的全文 witness。短笔记照常工作，
+                # 长笔记仍会撞上原来的坑 —— 所以要留痕提醒运维去跑迁移，而不是
+                # 让它继续无声。
+                telemetry.log_event(
+                    "calibration_cas_rpc_missing",
+                    project_id=project_id, source=source,
+                    hint="run migrations/002_calibration_cas.sql",
+                    witness_chars=len(expected_before_text),
+                )
+                row = _legacy_cas_update(
+                    db_client, project_id, expected_before_text, deduped,
+                )
+            if row is None:
                 # 0 行受影响：并发已经改了 calibration_notes
                 raise _CalibrationCASConflict()
-            # R-036: CAS 路径绕过 db.update_project, 必须自己失效
-            # list_projects 缓存(ttl=60)。否则"迭代沉淀笔记 → 马上排队
-            # 下一批"时, 队列 worker 从缓存拿旧 project 行拼 prompt,
-            # 刚学的笔记看不到 —— 体感"学了没生效"。
-            try:
-                db.list_projects.clear()
-            except Exception:
-                pass
         else:
             db.update_project(db_client, project_id, {"calibration_notes": deduped})
     except _CalibrationCASConflict:

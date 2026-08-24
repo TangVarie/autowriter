@@ -13,7 +13,8 @@ WorkBuddy / Claude Code 那边没有统一的用户身份可透传, 所以用最
   DESKCORE_API_KEY=xxxx
   DESKCORE_DEFAULT_USER_ID=<uuid>
 
-两个都不设 = dev 模式, 放行且 user_id 为 None(此时个人层全部退化为共享层)。
+两个都不设 = **拒绝所有请求(401)**。本地开发要免 key 跑, 显式设
+``DESKCORE_ALLOW_ANONYMOUS=1`` —— 见 ``resolve`` 里那段的完整理由。
 
 ⚠️ user_id 要用 autowriter.projects.owner_id / items.user_id 里【已有的】
 那个 UUID, 不要新造 —— 否则历史正负例读不到(RUNBOOK.md:150-153 记过一次:
@@ -89,6 +90,11 @@ def auth_configured() -> bool:
     return bool(os.environ.get("DESKCORE_API_KEY"))
 
 
+def anonymous_allowed() -> bool:
+    """是否显式允许免 key 匿名访问(仅本地开发)。默认 False。"""
+    return os.environ.get("DESKCORE_ALLOW_ANONYMOUS", "") in ("1", "true", "True")
+
+
 def auth_health() -> tuple[bool, str]:
     """给 /health 用: 鉴权配置是否可用。配坏了要当场看得见。"""
     try:
@@ -105,7 +111,16 @@ def auth_health() -> tuple[bool, str]:
         if not (os.environ.get("DESKCORE_DEFAULT_USER_ID") or "").strip():
             return False, "配了 DESKCORE_API_KEY 但 DESKCORE_DEFAULT_USER_ID 为空"
         return True, "single-key mode"
-    return False, "未配鉴权 = dev 模式全放行; 生产必须配"
+    if anonymous_allowed():
+        return False, (
+            "未配鉴权, 且 DESKCORE_ALLOW_ANONYMOUS=1 显式开了匿名放行 —— "
+            "dev 模式。生产环境务必去掉这个变量并配 DESKCORE_KEYS"
+        )
+    return False, (
+        "未配鉴权 —— 所有请求都会 401, 服务实际不可用。"
+        "配 DESKCORE_KEYS(推荐)或 DESKCORE_API_KEY + DESKCORE_DEFAULT_USER_ID; "
+        "本地开发要免 key 跑就设 DESKCORE_ALLOW_ANONYMOUS=1"
+    )
 
 
 def resolve(provided: str | None) -> Caller:
@@ -120,6 +135,27 @@ def resolve(provided: str | None) -> Caller:
     single = os.environ.get("DESKCORE_API_KEY")
 
     if not keys and not single:
+        # ⚠️ 这里【曾经是无条件放行的】(审计 ROB-003)。deskcore 持
+        # service_role 绕 RLS, 部署时漏配 key 就等于把全部租户的项目数据和
+        # 十一个工具(含写)匿名开放到公网。
+        #
+        # 而 /health 发现不了: 它虽然会把 auth.ok 报成 false, 但函数正常返回
+        # → HTTP 200, 而 Railway 的 healthcheck 只看状态码 —— 一个彻底敞开的
+        # 部署照样判定为健康、照样上线。"配错就全开"加上"健康检查看不见",
+        # 两件事叠起来才是真正危险的地方。
+        #
+        # 现在改成 fail-closed: 没配就 401。免 key 跑必须【显式】声明意图,
+        # 与 _key_map() 对"配了但解析失败"的处理同一口径 —— 配置错误绝不
+        # 降级成放行。
+        if not anonymous_allowed():
+            raise AuthError(
+                "server auth not configured: 未配 DESKCORE_KEYS / DESKCORE_API_KEY。"
+                "deskcore 持 service_role 绕 RLS, 匿名放行等于开放全部租户数据, "
+                "因此默认拒绝。本地开发请显式设 DESKCORE_ALLOW_ANONYMOUS=1。"
+            )
+        logger.warning(
+            "DESKCORE_ALLOW_ANONYMOUS=1 —— 匿名放行已开启, 仅限本地开发; "
+            "生产环境请配 DESKCORE_KEYS 并去掉这个变量")
         return Caller(os.environ.get("DESKCORE_DEFAULT_USER_ID") or None,
                       name="dev", authenticated=False)
 

@@ -115,6 +115,56 @@ def _extract_gemini_usage(usage) -> dict:
 # 用满 4 个（stable/tactic/p0/p1），p2 不打，留一个 buffer 给未来。空层
 # 会被跳过——避免 API 拒绝空 text block，也不会浪费 breakpoint 名额。
 
+# ── cache_control 的唯一出处(审计 SUP-001) ────────────────────────────────
+# 断点原来写死成 {"type": "ephemeral"} = 官方默认的 5 分钟 TTL。这个工作台的
+# 节奏是"坐下来连着排几批", 批间隔常常超过 5 分钟 —— 于是每批都是 miss + 全量
+# 重写, 而写入要按 1.25× 计费: **比不开缓存还贵 25%**, 且 prefix 越长亏得越多。
+# ttl="1h" 把写入抬到 2× 但换来批间命中(0.1×), 一小时内 ≥2 批就已经更便宜。
+# 口径见 config.ANTHROPIC_CACHE_TTL 那段账。
+#
+# 这里是全仓【唯一】构造 cache_control 的地方: 分散写的话, 主生成和合规复审
+# 一旦用了不同的 ttl, 两者就不再共享同一份缓存前缀 —— 而"合规复审搭主生成
+# 便车"正是它省钱的全部理由。
+_cache_ttl_disabled = False
+
+
+def _cache_control() -> dict:
+    """当前该打的 cache_control。ttl 被中转站拒过就退回官方默认。"""
+    ttl = getattr(config, "ANTHROPIC_CACHE_TTL", "5m")
+    if _cache_ttl_disabled or ttl == "5m":
+        return {"type": "ephemeral"}
+    return {"type": "ephemeral", "ttl": ttl}
+
+
+def _is_cache_ttl_rejection(exc: Exception) -> bool:
+    """这个 400 是不是"服务端不认 cache_control.ttl"?
+
+    中转站走的是 New API, 文档说兼容官方但实测踩过坑(见下面
+    _log_claude_call_diag 那段: Phase 1 上线后 cache_read/create 实测都是 0)。
+    ttl 是较新的字段, 老网关可能原样拒绝 —— 而它出现在**每一次**生成请求里,
+    真被拒的话就是全站生成挂掉。所以这里认得出来就当场降级重来一次。
+    判据收窄到同时提到 ttl 和 cache: 别把普通的参数错误也当成这个。
+    """
+    msg = str(exc).lower()
+    return "ttl" in msg and ("cache" in msg or "cache_control" in msg)
+
+
+def _disable_cache_ttl(reason: str) -> None:
+    global _cache_ttl_disabled
+    if _cache_ttl_disabled:
+        return
+    _cache_ttl_disabled = True
+    try:
+        import telemetry
+        telemetry.log_event(
+            "anthropic_cache_ttl_rejected", ttl=getattr(config, "ANTHROPIC_CACHE_TTL", ""),
+            base_url=getattr(config, "ANTHROPIC_BASE_URL", "") or "official",
+            error=reason[:200],
+            hint="本进程后续请求退回 5 分钟 TTL; 要永久关掉设 ANTHROPIC_CACHE_TTL=5m")
+    except Exception:
+        pass
+
+
 def _system_to_claude_param(system_prompt, reserve_breakpoint: bool = False) -> object:
     """Translate ``system_prompt`` (str | layered dict) into the value
     expected by ``client.messages.stream/create``'s ``system`` kwarg.
@@ -146,7 +196,7 @@ def _system_to_claude_param(system_prompt, reserve_breakpoint: bool = False) -> 
             continue
         block: dict = {"type": "text", "text": text}
         if key in cached_keys:
-            block["cache_control"] = {"type": "ephemeral"}
+            block["cache_control"] = _cache_control()
         blocks.append(block)
     p2 = (system_prompt.get("p2") or "").strip()
     if p2:
@@ -357,18 +407,70 @@ def _make_user_prompt(
 # 作为通用 retry middleware 的特化版本。本函数保留为 thin wrapper 维持调用
 # 点的签名兼容（外部模块如 memory.py 也直接 import 这个名字）。
 
-def _call_with_retry(call_fn, max_retries: int = 5):
+def _call_with_retry(call_fn, max_retries: int = 5, *, rebuild=None):
     """Call an Anthropic API callable with exponential backoff.
 
     Retries on:
       - RateLimitError (429)
       - APIStatusError with transient codes: 429, 502, 503, 529
       - APIConnectionError / APITimeoutError (connection dropped, nginx 502)
+
+    ``rebuild``(审计 SUP-001): 服务端拒绝 ``cache_control.ttl`` 时的兜底。
+    ttl 出现在**每一次**带缓存的请求里 —— 中转站不认的话就是全站生成一起挂,
+    所以这里当场关掉 ttl、调 ``rebuild()`` 重新拼一遍请求体、再试一次。
+    ``rebuild`` 必须**重新构造** system / messages(它们在构造时就把
+    cache_control 内联进去了, 不重建的话重试的还是同一个被拒的请求体)。
+    不传 ``rebuild`` 的调用点仍会关掉 ttl(让后续请求不再撞), 但本次原样上抛。
     """
-    return clients.with_anthropic_retry(call_fn, max_retries=max_retries)
+    try:
+        return clients.with_anthropic_retry(call_fn, max_retries=max_retries)
+    except anthropic.BadRequestError as exc:
+        # codex review 2026-08-24: 判据只看【这个异常是不是 ttl 被拒】, 不能再
+        # 与"全局开关是否已经关掉"合并成一个条件。
+        #
+        # 并发场景下会这样: 两个批次同时在飞, 第一个的 400 回来把
+        # _cache_ttl_disabled 置了 True; 第二个的 400 紧接着到达, 而它的请求体
+        # 是在开关翻转【之前】拼好的、里面还带着被拒的 ttl。旧写法看到开关已经
+        # 是 True 就直接上抛 —— 于是降级的那一瞬间, 除了第一个之外的每个在途
+        # 请求都白白失败一次, 而它们明明各自都带了 rebuild。
+        if not _is_cache_ttl_rejection(exc):
+            raise
+        _disable_cache_ttl(str(exc))   # 已经关过就是 no-op(它自己判幂等)
+        if rebuild is None:
+            raise
+        rebuild()
+        return clients.with_anthropic_retry(call_fn, max_retries=max_retries)
 
 
 # ── JSON parsing helper ────────────────────────────────────────────────────
+
+# 审计 COR-021: 只剥【最外层】的 markdown 围栏。
+#
+# 原来三处都写成 ``re.sub(r'```(?:json)?\s*', '', text).replace('```', '')`` ——
+# 那是**全局**替换, 会把出现在 JSON 字符串值内部(也就是文案正文里)的反引号一并
+# 抹掉。用户让模型在正文里写一段代码块、或写"```" 三个字符本身时, 内容在解析
+# 之前就被就地改写了: 即便后续 json.loads 成功, 存进库的也是被削过的正文,
+# 而且没有任何报错。
+#
+# 剥围栏本来只是为了让整串 json.loads 能过(_extract_json_payload 那三个辅助
+# 调用), 主生成路径的 find('{') / rfind('}') 切片本就容忍模型前言 —— 所以只需
+# 处理"整段被 ``` 包起来"这一种形态, 没有理由全局删。
+# 收尾缺失(输出被截断)时退化为只剥开栏, 与旧行为一致。
+_FENCE_WRAPPED_RE = re.compile(
+    r"^\s*```[A-Za-z0-9_+-]*[ \t]*\r?\n?(?P<body>.*?)\r?\n?[ \t]*```\s*$",
+    re.DOTALL,
+)
+_FENCE_OPEN_ONLY_RE = re.compile(r"^\s*```[A-Za-z0-9_+-]*[ \t]*\r?\n?")
+
+
+def _strip_outer_code_fence(text: str) -> str:
+    """剥掉整段外层的 ``` 围栏; 正文内部的反引号原样保留。"""
+    s = (text or "").strip()
+    m = _FENCE_WRAPPED_RE.match(s)
+    if m:
+        return m.group("body").strip()
+    return _FENCE_OPEN_ONLY_RE.sub("", s, count=1).strip()
+
 
 def _fix_json_newlines(s: str) -> str:
     """Escape bare newlines/tabs inside JSON string values (common AI output bug)."""
@@ -482,7 +584,7 @@ def _parse_copy_json(text: str, ai_engine: str) -> GenerationResult:
     JSON wrapped in outer quotes, bare newlines inside string values.
     """
     # Step 1: strip markdown code fences
-    stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
+    stripped = _strip_outer_code_fence(text)
 
     # Step 2: extract the {...} block and try to parse it (with and without newline fix)
     for src in (stripped, text):
@@ -615,7 +717,7 @@ def _parse_copy_json_list(text: str, count: int, ai_engine: str) -> list[Generat
          mid-array corruption (stray chars, missing commas).
       3. Last resort: single-item parse on the whole text.
     """
-    stripped = re.sub(r'```(?:json)?\s*', '', text).replace('```', '').strip()
+    stripped = _strip_outer_code_fence(text)
 
     # --- 1. Whole-array parse ------------------------------------------
     for src in (stripped, text):
@@ -708,7 +810,7 @@ def _extract_json_payload(text: str, prefer: str = "object") -> str:
     之后前言仍在开头, 不切片照样解析失败。本 helper 先剥 ``` 围栏再按
     首末括号切片; 找不到时原样返回(调用方的 json.loads 失败走原兜底)。
     """
-    stripped = re.sub(r'```(?:json)?\s*', '', text or '').replace('```', '').strip()
+    stripped = _strip_outer_code_fence(text)
     if prefer == "array":
         start, end = stripped.find('['), stripped.rfind(']')
     else:
@@ -826,13 +928,13 @@ class ClaudeEngine:
                 return False
             last["content"] = [{
                 "type": "text", "text": content,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": _cache_control(),
             }]
             return True
         if isinstance(content, list) and content and isinstance(content[-1], dict):
             blk = dict(content[-1])
             if blk.get("type") == "text" and blk.get("text"):
-                blk["cache_control"] = {"type": "ephemeral"}
+                blk["cache_control"] = _cache_control()
                 last["content"] = list(content[:-1]) + [blk]
                 return True
         return False
@@ -856,17 +958,27 @@ class ClaudeEngine:
         # 空 list / None → 行为跟 Phase 1 完全一致(单 user turn 调用)。
         model = model or config.CLAUDE_MODEL
         params = self._make_params(model, use_thinking, count)
-        messages = self._normalize_prior_for_claude(prior_messages)
-        # R-038: 有历史时把第 4 个 cache breakpoint 打在最后一条历史消息上
-        # (system 让出 1 个), 让 session 历史真正进 cache —— 旧布局 4 个断点
-        # 全在 system, 历史每批全价重算。无历史/形态不可识别时 prior_bp=False,
-        # system 保持旧 4 层布局, 请求与历史版本完全一致。
-        prior_bp = self._apply_prior_cache_breakpoint(messages)
-        system_param = _system_to_claude_param(system_prompt, reserve_breakpoint=prior_bp)
-        messages.append({
-            "role": "user",
-            "content": self._build_content(user_prompt, images),
-        })
+
+        def _build():
+            # SUP-001 的兜底要能【重拼一遍请求体】—— cache_control 是在这里
+            # 内联进 system blocks 和历史消息里的, 不重建就还是同一个被拒的体。
+            nonlocal system_param, messages
+            messages = self._normalize_prior_for_claude(prior_messages)
+            # R-038: 有历史时把第 4 个 cache breakpoint 打在最后一条历史消息上
+            # (system 让出 1 个), 让 session 历史真正进 cache —— 旧布局 4 个断点
+            # 全在 system, 历史每批全价重算。无历史/形态不可识别时 prior_bp=False,
+            # system 保持旧 4 层布局, 请求与历史版本完全一致。
+            prior_bp = self._apply_prior_cache_breakpoint(messages)
+            system_param = _system_to_claude_param(system_prompt,
+                                                   reserve_breakpoint=prior_bp)
+            messages.append({
+                "role": "user",
+                "content": self._build_content(user_prompt, images),
+            })
+
+        system_param: object = ""
+        messages: list[dict] = []
+        _build()
         def _call():
             with self._client.messages.stream(
                 **params,
@@ -875,7 +987,7 @@ class ClaudeEngine:
             ) as stream:
                 return stream.get_final_message()
         try:
-            response = _call_with_retry(_call)
+            response = _call_with_retry(_call, rebuild=_build)
             _log_claude_call_diag(system_param, response, source="generate")
             text = _extract_text_from_response(response)
             token_usage = _extract_claude_usage(response.usage)
@@ -921,7 +1033,13 @@ class ClaudeEngine:
             if isinstance(last_content, str):
                 messages[-1]["content"] = self._build_content(last_content, images)
         params = self._make_params(model, use_thinking)
-        system_param = _system_to_claude_param(system_prompt)
+
+        def _build():
+            nonlocal system_param     # SUP-001 兜底: ttl 被拒时重拼 system
+            system_param = _system_to_claude_param(system_prompt)
+
+        system_param: object = ""
+        _build()
         def _call():
             with self._client.messages.stream(
                 **params,
@@ -930,7 +1048,7 @@ class ClaudeEngine:
             ) as stream:
                 return stream.get_final_message()
         try:
-            response = _call_with_retry(_call)
+            response = _call_with_retry(_call, rebuild=_build)
             _log_claude_call_diag(system_param, response, source="iterate")
             text = _extract_text_from_response(response)
             result = _parse_copy_json(text, f"claude/{model}")
@@ -1597,6 +1715,16 @@ def generate_batch(
     # its dedup block; otherwise two parallel engines would each produce 10
     # items blind to the other, doubling the in-batch duplicate rate.
 
+    # 审计 COR-022: engine_results 以 engine **名字**为键, 而 slots 组装又按
+    # `engines` 逐个取 —— 列表里出现重复名字(如 ["claude","claude"])时, 后一次
+    # 调用覆盖前一次, 同一个 slot 的两个"版本"指向【同一个 GenerationResult
+    # 对象】。之后任何原地打标(_apply_compliance_recheck 的违规标记)都会同时
+    # 显示在两处, 而本文件 :896-898 / :1696-1699 早就为同一个陷阱写过说明。
+    # 去重时保序, 单引擎(绝大多数)路径完全不受影响。
+    engines = list(dict.fromkeys(engines or []))
+    if not engines:
+        return []
+
     # 跨引擎已产出池({"title","opening"}): 顺序路径里后一个引擎避重用,
     # R-033 起补量 prompt 也合并它(单引擎路径保持空)。
     produced: list[dict] = []
@@ -1932,6 +2060,14 @@ def _apply_compliance_recheck(
     #      （Anthropic 按 model 隔离 cache）
     #   2) by_model 里幽灵冒出一个"项目根本没选"的 sonnet-4-5 行,UI 混乱
     used_model = claude_model or config.CLAUDE_MODEL
+
+    def _rebuild_system():
+        # SUP-001 兜底: ttl 被中转站拒了就用新的 cache_control 重拼一遍。
+        # str 形态(兼容路径)本来就不带 cache_control, 重拼是个 no-op。
+        nonlocal system_param
+        if isinstance(system_prompt, dict):
+            system_param = _system_to_claude_param(compliance_layers)
+
     try:
         client = clients.get_anthropic_client()
         resp = _call_with_retry(lambda: client.messages.create(
@@ -1939,7 +2075,7 @@ def _apply_compliance_recheck(
             max_tokens=800,
             system=system_param,
             messages=[{"role": "user", "content": user_content}],
-        ))
+        ), rebuild=_rebuild_system)
         _log_claude_call_diag(system_param, resp, source="compliance_recheck")
         if metrics is not None:
             metrics.add_tokens(f"claude/{used_model}",

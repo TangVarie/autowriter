@@ -206,7 +206,9 @@ env：
 
 ### 4.1.1 部署两步，缺一不可
 
-**① 跑迁移** `migrations/001_deskcore.sql`（建议先在 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。
+**① 跑迁移** `migrations/001_deskcore.sql`，以及后续的 `002` / `003` / `004`（建议先在 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。
+
+其中 `004_deskcore_check_pushdown.sql` 是 2026-08-23 审计 SUP-002/SUP-004/ROB-004/ROB-011 的落地：把 `check_drafts` 的三路比对和 `list_projects` 的指纹计数下推到库里。**不跑也不会坏** —— `check_drafts` 检测到 RPC 不存在会退回 Python 逐对比对（结论一致，只是慢，且回到 4000 条上限），并埋一行 `deskcore_rpc_missing`。但大项目上不跑就仍然会撞线程池饥饿和 OOM，所以别拖。
 
 **② 回填历史指纹**（**必做**）：
 
@@ -296,6 +298,18 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
 **3. 鉴权配坏了必须 fail closed。** `DESKCORE_KEYS` 的 JSON 写错时，早期实现会返回空 map → `resolve()` 判定为"没配鉴权" → **放行所有请求**。生产上一个逗号写错就等于把项目数据和全部写工具匿名开放。现在显式配了就必须当成"打算开鉴权"，解析失败一律 401，`/health` 的 `auth.ok` 会是 false。
 
+**3b. "没配鉴权"同样 fail closed（2026-08-23 审计 ROB-003）。** 上面那条只堵了"配了但写错"，"根本没配"当时仍然走 dev 模式放行——而 deskcore 持 service_role 绕 RLS，漏配一个环境变量就等于把全部租户的数据和十一个工具（含写）开放到公网。更糟的是**健康检查看不见**：`/health` 虽然会把 `auth.ok` 报成 false，但它返回的是 HTTP 200，而 Railway 的 healthcheck 只看状态码——一个彻底敞开的部署照样判定健康、照样上线。
+
+现在默认拒绝：没配 key 时每个请求都 401。本地开发要免 key 跑，显式设 `DESKCORE_ALLOW_ANONYMOUS=1`（`/health` 会把它回显在 `config.anonymous_allowed`，并在 `auth.note` 里写明是 dev 模式）。
+
+`/health` 仍然返 200 —— **这是刻意的**。Railway 只看状态码，而库瞬断这类可恢复故障不该把整个部署卡住（CI 里那条 "200 是硬要求" 的断言就是为此存在的）。越权风险已经在 `identity.resolve` 那一层堵死了，不该再用状态码兜第二遍。
+
+**3c. `/health` 不和工具抢线程池（2026-08-23 审计 ROB-004）。** 工具调用走 `run_in_threadpool`，而 `def health()` 这种**同步路由也走同一个 starlette 默认 limiter**（40 个额度）。`check_drafts` 那种几十秒的调用一多，`/health` 就排在它们后面 → 平台健康检查超时 → 重启容器 → 正在跑的调用全断。
+
+根因已经被 `migrations/004` 的下推堵掉了（工具调用不再是几十秒），但"健康检查和业务抢同一个池子"本身是个雷，换个慢查询就复发。所以 `/health` 现在是 `async def`，它唯一那次打网络的探测（库连通）走**私有** `anyio.CapacityLimiter(2)` + 5 秒墙钟上限（`DESKCORE_HEALTH_PROBE_TIMEOUT` 可调）。
+
+超时按不健康报，但 note 里会写明**是超时而不是连不上** —— 这是两种完全不同的排查方向：前者是连接池耗尽 / 网络黑洞，后者是配置或凭据。
+
 **4. `user_id` 必须用库里已有的 UUID。** 不要新造。TV `autowriter-migrations/RUNBOOK.md:150-153` 记过：写了 service account 的 UUID 导致 RLS 屏蔽、`list_example_items` 永远 0 行、飞轮静默断开，查了很久。配 `DESKCORE_KEYS` 时从 `projects.owner_id` / `items.user_id` 里查出来抄。
 
 ---
@@ -319,7 +333,9 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 1. **WorkBuddy 的 HTTP MCP 自定义鉴权头无权威文档。** 见 §4.3，已留两条退路，但必须最先验。
 2. **馆员选卡质量从未在真实规模验证过。** TV 书架现有 118 张卡 / 可借 201，但这个规模下的选卡准确率没人测过。
 3. **embedding 依赖 `GOOGLE_API_KEY`。** 存量 768 维向量都是 Gemini `text-embedding-004` 产的，换模型会让历史向量全部作废需重算。没有它时查重降级为纯确定性——仍能抓开头撞车和四字串重合（`selftest` 证明了这点），但同角度换说法的标题会漏。
-4. **查重目前在 Python 里逐对比。** `store.fingerprints` 有 4000 行上限。单项目到十万行量级时该改成 pgvector 服务端检索（`draft_fingerprints` 已建 ivfflat 索引，改起来不难）。commit 侧的原子重查已经在 SQL 里了，可以参照。
+4. ~~**查重目前在 Python 里逐对比。**~~ **已解决（2026-08-23 审计 SUP-002）**：`migrations/004` 的 `deskcore_check_drafts` 把三路信号全部下推，`check_drafts` 不再把指纹拉进内存，`history_size` 也从"最近 4000 条"变成全量。RPC 没部署时仍会退回老路径（带原来的上限和截断警告）。
+
+   ⚠️ **余弦那一路刻意不走 ivfflat 索引**。ivfflat 是近似最近邻（默认 `probes=1` 只扫一个聚类桶），对"推荐相似内容"够用，对**查重硬闸**是致命的：漏掉的那条正是要拦下的重复稿，而且不报错；叠加 `project_id` 过滤后更糟（先按向量取候选再过滤，命中本项目的可能一条都不剩）。RPC 里 `ORDER BY` 的是子查询算好的别名 `sim`，不是 `title_embedding <=> v` —— pgvector 的索引只认后一种形态，换成前者规划器必然走顺序扫描，精确且可预期。索引留着不动，将来做"找相似选题"这类容忍近似的功能仍然用得上。
 
 5. **commit 的原子重查只覆盖确定性信号。** 开头精确 + 四字串 Jaccard 在锁内查；标题语义相似度没查（要 pgvector 距离算子，且历史行可能没向量）。也就是说竞态窗口里"标题换个说法的同角度稿"仍可能两条都进。要覆盖它得把向量比对也搬进 RPC——等 backfill 把历史向量补齐之后再做更合适。
 6. **"个人风格私有"与团队协作的张力。** 同一项目两个人各自驯化，风格会分叉。指纹库共享（互相避重），调校笔记不共享。跑一段时间如果分叉太严重，可能需要"把我的调校笔记提升为项目基线"的操作。第一期不做。

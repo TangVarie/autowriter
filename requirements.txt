@@ -21,3 +21,9 @@ openpyxl>=3.1.0,<4.0
 requests>=2.31.0,<3.0
 Pillow>=10.0.0,<12.0
 extra-streamlit-components>=0.1.70,<1.0
+# 审计 SUP-003: dedup 的成批余弦走矩阵乘。numpy 本来就是 streamlit 的传递
+# 依赖(requirements.lock 里已经有), 这里【显式】声明是因为 dedup 属于查重硬闸
+# —— 依赖树一变(streamlit 换了后端、或某个部署只装 requirements.txt)就静默
+# 退回逐元素算法, 而那正是 SUP-003 要消掉的东西。dedup 里保留纯 Python 兜底,
+# 所以缺了它不会坏, 只会慢。
+numpy>=1.24,<3.0

@@ -24,6 +24,9 @@
   env:    SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY   (service_role, 绕 RLS)
           GOOGLE_API_KEY          embedding; 不设则查重降级为纯确定性
           DESKCORE_KEYS 或 DESKCORE_API_KEY + DESKCORE_DEFAULT_USER_ID
+          ⚠️ 【必填】。都不配时所有请求 401(ROB-003 起 fail-closed) —— 本服务
+             持 service_role 绕 RLS, 匿名放行等于开放全部租户数据。本地开发
+             要免 key 跑, 显式设 DESKCORE_ALLOW_ANONYMOUS=1。
           LIBRARIAN_URL / LIBRARIAN_API_KEY          借爆款经验卡; 不设则跳过
           DESKCORE_ALLOWED_HOSTS  可选, 逗号分隔; 设了才开 MCP 的 Host 校验
           ⚠️ 【不需要】ANTHROPIC_API_KEY / DESKCORE_MODEL —— deskcore 不调 LLM,
@@ -41,6 +44,8 @@ import contextvars
 import logging
 import os
 
+import anyio
+import anyio.to_thread
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
@@ -137,8 +142,95 @@ async def auth_middleware(request: Request, call_next):
         _caller.reset(token)
 
 
+# /health 专用的线程额度(审计 ROB-004)。
+#
+# 事故形状: 工具调用全部走 starlette 的**默认** thread limiter(40 个额度),
+# 而 `def health()` 这种同步路由**也走同一个 limiter**。check_drafts 这类几十秒
+# 的调用一多, /health 就排在它们后面 —— 平台健康检查超时 → 重启容器 → 正在跑
+# 的调用全断。deskcore/app.py 下面那段注释描述的就是同款事故的另一半。
+#
+# 根因已经由 migrations/004 把比对下推到库里堵掉了(工具调用不再是几十秒),
+# 但"健康检查和业务抢同一个池子"这件事本身仍然是个雷: 换个慢查询就复发。
+# 给 /health 一个**私有** limiter, 它就永远不排在工具后面 —— anyio 的
+# to_thread.run_sync 只认传进去的 limiter, 不再碰默认那个。
+#
+# 额度 2 而不是 1: 平台的健康检查和人工 curl 可能同时打进来, 1 会让后者干等。
+_HEALTH_LIMITER = anyio.CapacityLimiter(2)
+
+# 单次探测的墙钟上限。库连接卡死(TCP 黑洞)时 /health 会一直挂着不返回 ——
+# 平台照样判超时重启, 而且【没有任何信息】说明卡在哪。
+_HEALTH_PROBE_TIMEOUT = float(os.environ.get("DESKCORE_HEALTH_PROBE_TIMEOUT", "5") or 5)
+
+
+_HEALTH_PROBE_CLIENT = None
+
+
+def _health_probe_client():
+    """/health 专用的 Supabase client: 带**网络层**超时。
+
+    ``db.get_service_client()`` 用的是 supabase-py 的默认超时口径, 对
+    "TCP 黑洞"这种连接建起来了、就是不回数据的情况可能一直等下去 —— 而那正是
+    ROB-004 要防的场景。这里显式把 postgrest 的超时压到探测预算之内, 让阻塞
+    调用**必然会结束**, 上面被放弃的线程才能收场而不是永久驻留。
+
+    留成模块级单例: /health 会被平台每隔几十秒打一次, 每次新建 client 就是
+    ROB-013 那个 FD 泄漏的翻版。
+    """
+    global _HEALTH_PROBE_CLIENT
+    if _HEALTH_PROBE_CLIENT is None:
+        import config
+        import db
+        from supabase import create_client
+        from supabase.client import ClientOptions
+        key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", "")
+        if not key:
+            # 没配 service_role 时退回原路径, 让 _db_probe 照常报出那条错。
+            return db.get_service_client()
+        _HEALTH_PROBE_CLIENT = create_client(
+            config.SUPABASE_URL, key,
+            options=ClientOptions(
+                schema="autowriter",
+                # 略小于墙钟预算: 让网络层先于 fail_after 收手, 这样常见情况下
+                # 我们拿到的是一条**有信息的**超时错误, 而不是被取消掉的空壳。
+                postgrest_client_timeout=max(1.0, _HEALTH_PROBE_TIMEOUT - 1.0),
+            ),
+        )
+    return _HEALTH_PROBE_CLIENT
+
+
+async def _probe(fn, fallback):
+    """在 /health 私有线程额度里跑一个阻塞探测, 超时返回 fallback。
+
+    ⚠️ ``abandon_on_cancel=True`` 不是可有可无的调参, **没有它这个超时根本不
+    生效**(codex review 2026-08-24, 已实测)。``to_thread.run_sync`` 默认
+    ``abandon_on_cancel=False`` —— 取消要等工作线程自己返回才生效, 于是
+    ``fail_after`` 形同虚设:
+
+        with anyio.fail_after(0.3):
+            await to_thread.run_sync(sleep_1s2)   # 1.20s 后【返回了值】, 没抛超时
+
+    也就是说改之前, /health 在"库卡住不回"这个**本条修复唯一针对的场景**下
+    照样会一直挂着。设成 True 之后同一段代码 0.31s 抛 TimeoutError。
+
+    代价: 被放弃的线程还在后台跑(Python 没法中断阻塞的 socket 读)。实测 anyio
+    在取消时就把 limiter 名额还回来了, 所以放弃的线程不会占住私有额度; 但它
+    仍然占着一个 OS 线程和一条连接, 直到底层调用自己超时 —— 所以真正的兜底是
+    下面 ``_health_probe_client`` 给的**网络层**超时, 让那条调用必然会结束。
+    两层缺一不可: 网络超时保证线程能收场, ``fail_after`` 保证 /health 按时应答。
+    """
+    try:
+        with anyio.fail_after(_HEALTH_PROBE_TIMEOUT):
+            return await anyio.to_thread.run_sync(
+                fn, limiter=_HEALTH_LIMITER, abandon_on_cancel=True)
+    except TimeoutError:
+        return fallback
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("health probe failed: %s", exc)
+        return fallback
+
+
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:
     """回显实际解析到的配置 —— 让配错当场可见。
 
     ⚠️ 这个回显是【刻意的】: TV docs/19:180-200 记过一次事故, librarian 的模型
@@ -160,15 +252,27 @@ def health() -> dict:
     import db
     import dedup
 
-    db_ok, db_note = True, "ok"
-    try:
-        db.get_service_client().table("projects").select("id").limit(1).execute()
-    except Exception as exc:  # noqa: BLE001
-        db_ok, db_note = False, f"{type(exc).__name__}: {exc}"[:160]
+    def _db_probe() -> tuple[bool, str]:
+        try:
+            _health_probe_client().table("projects").select("id").limit(1).execute()
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"[:160]
+        return True, "ok"
+
+    # ROB-004: 这次探测是 /health 里唯一会打网络的一步, 放进私有线程额度 +
+    # 墙钟上限。超时按【不健康】报, 但要把"是超时"写进 note —— 报成
+    # "连不上"和报成"卡住了"是两种完全不同的排查方向。
+    db_ok, db_note = await _probe(
+        _db_probe,
+        (False, f"probe timeout >{_HEALTH_PROBE_TIMEOUT:g}s —— 库没有拒绝连接, "
+                f"是【卡住不回】(连接池耗尽 / 网络黑洞); 查 Supabase 连接数"),
+    )
 
     vocab_ok, vocab_note = vocab.vendor_checksum_ok()
     emb_ok = dedup.embeddings_available()
-    auth_ok, _auth_note = identity.auth_health()
+    # 只调一次 —— 之前顶上算 auth_ok、下面回显时又调了一遍, 两次之间 env 若
+    # 被改过, 回显的 note 和参与 ok 的判断会对不上。
+    auth_ok, auth_note = identity.auth_health()
 
     return {
         "ok": db_ok and vocab_ok and auth_ok,
@@ -197,9 +301,14 @@ def health() -> dict:
             },
             "librarian": {"configured": bool(os.environ.get("LIBRARIAN_URL")
                                              or getattr(config, "LIBRARIAN_URL", ""))},
-            # auth_health 会把"配了但坏了"跟"没配"分开 —— 前者所有请求都 401,
-            # 服务实际不可用, 必须当场看得见(不能像以前那样静默退化成全放行)。
-            "auth": dict(zip(("ok", "note"), identity.auth_health())),
+            # auth_health 把三态分开: 配好了 / 配了但坏了(全 401) / 没配。
+            # ROB-003 之后"没配"也是全 401 —— 不再静默放行, 只有显式设了
+            # DESKCORE_ALLOW_ANONYMOUS=1 才放行(那时 note 里会写明是 dev 模式)。
+            # 注意 /health 本身仍返 200: Railway 只看状态码, 而库瞬断这种可恢复
+            # 故障不该把整个部署卡住。真正的越权风险已经在 identity.resolve
+            # 那一层 fail-closed 掉了, 不靠状态码兜。
+            "auth": {"ok": auth_ok, "note": auth_note},
+            "anonymous_allowed": identity.anonymous_allowed(),
             "st_cache_disabled": os.environ.get("AW_DISABLE_ST_CACHE"),
         },
     }

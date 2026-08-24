@@ -177,9 +177,25 @@ def _save_batch_results(
         return [], [], []
 
     # 步骤 2：只为有内容的 slot 批量建 item
+    #
+    # 审计 COR-002: 原来是 `zip(valid_slots, inserted_items)` —— 把 slot 和
+    # 插入返回的行【按位置】配对。两个隐患:
+    #   1. 依赖 PostgREST 的返回顺序等于入参顺序。SQL 层面 INSERT ... RETURNING
+    #      没有这个保证, db.bulk_create_items 的 docstring 只是**断言**了它,
+    #      没有任何东西在校验。顺序一旦变化, version 会挂到别的 item 上、
+    #      ai_review_notes 也会张冠李戴, 而且完全无声。
+    #   2. 返回行数少于入参时 zip 会**静默截断**尾部 —— 那几篇的正文就此丢失,
+    #      既不报错也不告警, 看起来跟"模型本来就没写那几篇"一模一样。
+    # 改法: id 由客户端预先生成并显式写进 insert(items.id 的 uuid_generate_v4()
+    # 只是 DEFAULT, 给了值就用给的), 于是 slot ↔ item_id 由构造保证, 不再依赖
+    # 任何返回顺序; 再逐个核对回执, 缺行就显式失败而不是丢。
     item_rows: list[dict] = []
+    slot_item_ids: list[str] = []
     for slot, _ in valid_slots:
+        item_id = str(uuid.uuid4())
+        slot_item_ids.append(item_id)
         item_rows.append({
+            "id":       item_id,
             "batch_id": batch_id,
             "user_id":  user_id,
             **({"ai_review_notes": slot["ai_review_notes"]}
@@ -191,13 +207,33 @@ def _save_batch_results(
         errors_sink.append(f"{error_prefix}批量写入 items 失败 — {exc}")
         return [], [], []
 
+    returned_ids = {it.get("id") for it in inserted_items if isinstance(it, dict)}
+    missing_ids = [i for i in slot_item_ids if i not in returned_ids]
+    if missing_ids:
+        # 部分插入。宁可整批失败也不能带着"少了几篇"继续往下走 ——
+        # 后面 versions 会挂到不存在的 item 上, 审核页出现点不开的幽灵卡。
+        errors_sink.append(
+            f"{error_prefix}批量写入 items 只回执 {len(returned_ids)}/{len(slot_item_ids)} 行"
+            f"，已回滚本批；请重试。"
+        )
+        try:
+            db.delete_items(db_client, list(returned_ids))
+        except Exception as cleanup_exc:
+            errors_sink.append(
+                f"{error_prefix}孤儿 item 回收失败 — {cleanup_exc}（审核页可能出现空卡）"
+            )
+        return [], [], []
+    # 回执按我们给定的顺序重排, 让调用方拿到的 inserted_items 与 valid_slots 同序
+    _by_id = {it["id"]: it for it in inserted_items if isinstance(it, dict) and it.get("id")}
+    inserted_items = [_by_id[i] for i in slot_item_ids]
+
     # 步骤 3：从有效 version 抽 versions 行 + 顺便构造文本去重池要的 opening
     version_rows: list[dict] = []
     produced_titles: list[dict] = []
-    for (slot, valid_versions), item in zip(valid_slots, inserted_items):
+    for (slot, valid_versions), item_id in zip(valid_slots, slot_item_ids):
         for vr in valid_versions:
             version_rows.append({
-                "item_id":     item["id"],
+                "item_id":     item_id,
                 "ai_engine":   vr.ai_engine,
                 "title":       vr.title,
                 "body":        vr.body,
@@ -259,6 +295,12 @@ def _run_hard_constraint_check(
     """
     if not hard_rules or not inserted_versions:
         return
+    # 审计 COR-011: 「不重复标记同一 item」原来只写在注释里, 代码没有去重。
+    # 多引擎批次下同一个 item 有 N 个 version, 全违规就调 N 次
+    # update_item_status —— 每次都会 list_items.clear() 把**全局**缓存击穿,
+    # 且每次都触发 items 的 updated_at 触发器。状态本身是幂等的, 重复调用
+    # 只是浪费, 但缓存反复失效会让审核页在整批落库期间持续回源。
+    marked_items: set[str] = set()
     for iv in inserted_versions:
         if not iv:
             continue
@@ -271,15 +313,21 @@ def _run_hard_constraint_check(
         if not hits:
             continue
         metrics.incr("hard_rule_violations", len(hits))
-        # 标记 needs_revision；不重复标记同一 item
-        try:
-            if iv.get("item_id"):
-                db.update_item_status(db_client, iv["item_id"], "needs_revision")
-        except Exception as exc:
-            telemetry.log_event(
-                "hard_rule_status_update_failed",
-                item_id=iv.get("item_id"), error=str(exc)[:200],
-            )
+        item_id = iv.get("item_id")
+        if item_id and item_id not in marked_items:
+            # codex review 2026-08-24: 记进 marked_items 必须在**写成功之后**。
+            # 记在前面的话, 第一条违规版本遇到一次瞬时库错误, 同一 item 后面
+            # 几条违规版本就都被"已经标过了"跳过 —— item 停在原状态, 而
+            # errors_sink 里那几行还在跟用户说"已标记 needs_revision"。
+            # 说过的话和库里的状态对不上, 且没有任何报错。
+            try:
+                db.update_item_status(db_client, item_id, "needs_revision")
+                marked_items.add(item_id)
+            except Exception as exc:
+                telemetry.log_event(
+                    "hard_rule_status_update_failed",
+                    item_id=item_id, error=str(exc)[:200],
+                )
         for hit in hits:
             kind_label = {
                 "forbidden_word":  "禁用词",
@@ -1093,11 +1141,22 @@ def _queue_worker_impl(
             ])).strip()
             # Day 4: 注入可视化 ─ 记录本批"硬/软/会话各注入多少、过滤掉哪些"
             inject_report: dict = {"filtered": []}
+            # 审计 SUP-005: ctx 向量算【一次】给两遍过滤共用。以前两遍各算一次,
+            # 同一段文本发了两次 embedding —— 调用数与这一步的延迟白白翻倍。
+            #
+            # codex review 2026-08-24: 但两个记忆表**都空**时一次也不能算。
+            # filter_soft_by_relevance 开头就有 `if not memories: return`,
+            # 所以老写法在新项目 / 无记忆项目上是 0 次调用; 把 prepare 提到外面
+            # 之后反而变成每批都多打一次 embedding —— 本来要省的地方成了净增。
+            _soft_ctx = (mem_module.prepare_soft_context(context_text)
+                         if (global_mems or project_mems) else None)
             global_mems_for_plan  = mem_module.filter_soft_by_relevance(
                 global_mems,  context_text, report_sink=inject_report,
+                context=_soft_ctx,
             )
             project_mems_for_plan = mem_module.filter_soft_by_relevance(
                 project_mems, context_text, report_sink=inject_report,
+                context=_soft_ctx,
             )
 
             # Phase 1：用 layered builder 拿 5 段 dict（stable/tactic/p0/p1/p2），
@@ -3147,11 +3206,17 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
             extra_instr,
             image_prompt,
         ])).strip()
+        # 审计 SUP-005: 同 _queue_worker_impl —— ctx 向量算一次给两遍共用,
+        # 且两个记忆表都空时一次也不算(codex review; 见那边的完整说明)。
+        _qg_soft_ctx = (mem_module.prepare_soft_context(_qg_context_text)
+                        if (global_mems or project_mems) else None)
         global_mems = mem_module.filter_soft_by_relevance(
             global_mems, _qg_context_text, report_sink=inject_report,
+            context=_qg_soft_ctx,
         )
         project_mems = mem_module.filter_soft_by_relevance(
             project_mems, _qg_context_text, report_sink=inject_report,
+            context=_qg_soft_ctx,
         )
         # ── R-032: 同 _queue_worker_impl —— 借阅飞轮经验（fail-open 成 []）。
         # R-038: 改经 user_context_block 注入 user turn, 不再进 system P2。
