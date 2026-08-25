@@ -245,6 +245,37 @@ def test_partial_mint_reports_the_ones_that_made_it(monkeypatch):
     assert "batch-9" in w, "要告诉调用方已建成的那部分怎么导"
 
 
+def test_a_failed_version_insert_leaves_no_orphan_item():
+    """item 建完、version 没建成时, 那个 item 要被**收掉**。
+
+    留着的话它会出现在审核页上: 一条没有任何版本的空待审稿, 谁也不知道它是什么,
+    而且它会进回填、进正例池的候选。(codex review P1 的残留部分 —— 上一轮我只
+    修了"已建成的那部分要报出来", 没管这半条建了一半的。)
+
+    batch 本身**故意**留着: 它是已经建成的那几条的归属, 上一层要靠 batch_id 把
+    它们交回给调用方。
+    """
+    class _VersionsExplode(FakeClient):
+        def _execute(self, q):
+            if q.table_name == "versions" and q.op == "insert":
+                raise RuntimeError("versions 写不进去")
+            return super()._execute(q)
+
+    c = _VersionsExplode(rows=_client().rows)
+    c.rpc_impl["deskcore_commit_fingerprints"] = lambda args: [
+        {"idx": 0, "status": core.COMMIT_STATUS_INSERTED,
+         "collided_with": None, "detail": None}]
+
+    out = core.commit_drafts(c, PROJ, [DRAFT], user_id=ME)
+
+    assert out["written"] == 1, "指纹入了库, 不该报失败"
+    assert out["version_ids"] == []
+    assert "identity_warning" in out
+    assert not c.rows.get("items"), (
+        f"留下了没有版本的孤儿 item: {c.rows.get('items')} —— "
+        "它会出现在审核页上, 而谁也说不清它是什么")
+
+
 def test_identity_failure_does_not_raise():
     """整个调用不许因此抛错。
 

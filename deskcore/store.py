@@ -856,20 +856,36 @@ def _mint_entries(sb, batch_id: str, user_id: str, entries: list[dict],
                 f"建 item 之后没拿到 id(batch={batch_id}) —— PostgREST 没回插入行, "
                 "多半是 service client 的 returning 行为变了")
 
-        sb.table("versions").insert({
-            # ⚠️ 显式 id: 指纹行里写的就是它, 让数据库另发一个就等于两边对不上。
-            "id": e["version_id"],
-            "item_id": item_id,
-            "version_num": 1,     # 新建的 item, 不可能有并发的第二版
-            "ai_engine": e.get("ai_engine") or DESKCORE_AI_ENGINE,
-            "title": e.get("title") or "",
-            "body": e.get("body") or "",
-            "keywords": e.get("keywords") or [],
-        }).execute()
+        # ⚠️ item 建完、version 没建成的话, 那个 item 会**留在审核页上**: 一条没有
+        #    任何版本的空待审稿, 谁也不知道它是什么。所以这一步失败要把刚建的
+        #    item 收掉再上抛。(codex review P1 的残留部分)
+        #
+        #    没有做成事务 RPC: 那要新加一条迁移 + 一个 plpgsql 函数, 而这里真正会
+        #    留下垃圾的只有"item 建了 version 没建"这一种中间态, 补一次回收就够。
+        #    batch 本身留着是**有意的** —— 它是已经建成的那几条的归属, 上一层要靠
+        #    batch_id 把它们交回给调用方。
+        try:
+            sb.table("versions").insert({
+                # ⚠️ 显式 id: 指纹行里写的就是它, 让数据库另发一个就等于两边对不上。
+                "id": e["version_id"],
+                "item_id": item_id,
+                "version_num": 1,     # 新建的 item, 不可能有并发的第二版
+                "ai_engine": e.get("ai_engine") or DESKCORE_AI_ENGINE,
+                "title": e.get("title") or "",
+                "body": e.get("body") or "",
+                "keywords": e.get("keywords") or [],
+            }).execute()
 
-        # best_version_id 指向唯一那一版 —— 导出和"挑代表版本"都按它取。
-        sb.table("items").update(
-            {"best_version_id": e["version_id"]}).eq("id", item_id).execute()
+            # best_version_id 指向唯一那一版 —— 导出和"挑代表版本"都按它取。
+            sb.table("items").update(
+                {"best_version_id": e["version_id"]}).eq("id", item_id).execute()
+        except Exception:
+            try:
+                db.delete_items(sb, [item_id])
+            except Exception:
+                # 回收失败只记一行 —— 真正要往上报的是原始异常, 别被它顶掉。
+                logger.exception("orphan item %s cleanup failed", item_id)
+            raise
 
         # 三次写全成了才记 —— minted 是"真的有这一行"的凭据。
         minted[e["version_id"]] = item_id
@@ -890,51 +906,104 @@ def drafts_for_export(sb, project_id: str, *, batch_id: str | None = None,
 
     ``batches!inner(project_id)`` 这个 inner join 顺带把归属钉死: 别的项目的
     batch_id 传进来会查不到行, 而不是导出别人的稿子。
+
+    ⚠️ 出错**上抛**, 不返回空列表。空列表会被 core 报成 "没找到可导的稿子",
+       于是一次数据库故障和"这批确实没有"长得一模一样 —— 调用方看到一个像是
+       成功的 count: 0 就不会重试, 也不会报告故障。(codex review P2)
     """
-    if not batch_id and not version_ids:
-        return []
-
-    q = (sb.table("items")
-           .select("id, batch_id, best_version_id, created_at, "
-                   "versions(id, title, body, keywords, ai_engine, version_num), "
-                   "batches!inner(project_id)")
-           .eq("batches.project_id", project_id)
-           .order("created_at", desc=False)
-           .limit(limit))
+    if version_ids:
+        return _export_rows_by_version(sb, project_id, version_ids, limit)
     if batch_id:
-        q = q.eq("batch_id", batch_id)
+        return _export_rows_by_batch(sb, project_id, batch_id, limit)
+    return []
 
-    try:
-        res = q.execute()
-    except Exception:
-        logger.exception("read drafts for export failed (project=%s)", project_id)
-        return []
 
-    wanted = set(version_ids or [])
+def _export_rows_by_version(sb, project_id: str, version_ids: list[str],
+                            limit: int) -> list[dict]:
+    """点名了 version 就**从 versions 表查**, 过滤下推到数据库。
+
+    ⚠️ 原来这条路是"先取项目里最早的 200 个 item, 再在 Python 里挑 version"。
+       项目一旦超过 200 个 item, **刚 commit 的那一批永远落在窗口外** —— 拿它
+       返回的 version_id 原样去导出会得到"没找到可导的稿子", 而 id 明明是对的。
+       ``order(created_at)`` 还是升序(最早的在前), 所以最新的那批是第一个被挤掉
+       的。(codex review P1)
+
+    ``items!inner(...)`` 一路 inner 到 batches, 归属仍然由数据库钉死。
+    """
+    rows: list[dict] = []
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        res = (sb.table("versions")
+                 .select("id, title, body, keywords, ai_engine, version_num, "
+                         "items!inner(id, batch_id, batches!inner(project_id))")
+                 .in_("id", chunk)
+                 .eq("items.batches.project_id", project_id)
+                 .limit(limit)
+                 .execute())
+        for v in (res.data or []):
+            item = v.get("items") or {}
+            rows.append(_export_row(project_id, item, v))
+        if len(rows) >= limit:
+            break
+    return rows[:limit]
+
+
+def _export_rows_by_batch(sb, project_id: str, batch_id: str,
+                          limit: int) -> list[dict]:
+    """只给了 batch 就取每个 item 的**代表版本**(与导出中心同口径)。"""
+    res = (sb.table("items")
+             .select("id, batch_id, best_version_id, created_at, "
+                     "versions(id, title, body, keywords, ai_engine, version_num), "
+                     "batches!inner(project_id)")
+             .eq("batches.project_id", project_id)
+             .eq("batch_id", batch_id)
+             .order("created_at", desc=False)
+             .limit(limit)
+             .execute())
+
     out: list[dict] = []
     for item in (res.data or []):
-        for v in (item.get("versions") or []):
-            # 点名了 version 就只要点到的; 只给了 batch 就取代表版本。
-            if wanted:
-                if v.get("id") not in wanted:
-                    continue
-            else:
-                best = item.get("best_version_id")
-                if best and v.get("id") != best:
-                    continue
-            out.append({
-                "title": (v.get("title") or "").strip(),
-                "body": (v.get("body") or "").strip(),
-                "keywords": v.get("keywords") or [],
-                "ai_engine": v.get("ai_engine") or "",
-                "version_num": v.get("version_num") or 1,
-                # lineage —— 名字与 exporter.LINEAGE_COLUMNS 的取值 key 对应
-                "project_id": project_id,
-                "batch_id": item.get("batch_id"),
-                "item_id": item.get("id"),
-                "version_id": v.get("id"),
-            })
+        chosen = _representative_version(item)
+        if chosen is not None:
+            out.append(_export_row(project_id, item, chosen))
     return out
+
+
+def _representative_version(item: dict) -> dict | None:
+    """一个 item 导出**哪一版** —— 与 ``app._collect_approved_items`` 同一口径。
+
+    ⚠️ ``best_version_id`` 为空是**正常状态**, 不是异常: 每次「AI 迭代」都会
+       显式清掉这个指针(app.py 的 R-036 —— 不清的话卡片和导出会一直停在迭代前
+       的旧版本)。原来这里写的是 ``if best and v["id"] != best: continue``,
+       于是 best 为空时**每一版都会被 append** —— 导出的表里同一篇稿子出现好几
+       行, 新旧混在一起, 而每一行看上去都是合法的。用户照着它发, 发出去的可能
+       是被迭代掉的那一版。(codex review P1)
+
+    指针指向一个不在列表里的 version 时也回退到最新版 —— 与那边的
+    ``next(..., versions[-1])`` 一致。
+    """
+    versions = sorted(item.get("versions") or [],
+                      key=lambda v: v.get("version_num") or 0)
+    if not versions:
+        return None
+    best = item.get("best_version_id")
+    if best:
+        return next((v for v in versions if v.get("id") == best), versions[-1])
+    return versions[-1]
+
+
+def _export_row(project_id: str, item: dict, v: dict) -> dict:
+    """exporter 认的行形状。lineage 的 key 与 ``exporter.LINEAGE_COLUMNS`` 对应。"""
+    return {
+        "title": (v.get("title") or "").strip(),
+        "body": (v.get("body") or "").strip(),
+        "keywords": v.get("keywords") or [],
+        "ai_engine": v.get("ai_engine") or "",
+        "version_num": v.get("version_num") or 1,
+        "project_id": project_id,
+        "batch_id": item.get("batch_id"),
+        "item_id": item.get("id"),
+        "version_id": v.get("id"),
+    }
 
 
 def commit_fingerprints_atomic(sb, project_id: str, rows: list[dict],
