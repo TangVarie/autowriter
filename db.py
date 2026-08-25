@@ -1081,9 +1081,25 @@ def _bucket_items(page: list[dict], grouped: dict[str, list[dict]]) -> None:
             grouped[bid].append(item)
 
 
+# items.status 的**出处**。与 migrations/006 里那个 CHECK 是同一个闭集 ——
+# 加值必须两边一起加, 否则写进去会被数据库拒。
+class DecisionSource:
+    HUMAN = "human"                      # 人点了通过 / 打回
+    AUTO_HARD_RULE = "auto_hard_rule"    # 硬规则违规, 自动标 needs_revision
+    AUTO_DEDUP = "auto_dedup"            # 查重重生耗尽, 自动标 needs_revision
+    SYSTEM = "system"                    # 既非审稿也非检测(如迭代后重置 pending)
+
+
+_DECISION_SOURCES = frozenset({
+    DecisionSource.HUMAN, DecisionSource.AUTO_HARD_RULE,
+    DecisionSource.AUTO_DEDUP, DecisionSource.SYSTEM,
+})
+
+
 def update_item_status(
     client: Client, item_id: str, status: str, best_version_id: Optional[str] = None,
-    clear_best_version: bool = False,
+    clear_best_version: bool = False, *,
+    source: str, reviewer_id: Optional[str] = None,
 ) -> dict:
     """更新 item 状态; ``best_version_id`` truthy 时一并写入。
 
@@ -1091,8 +1107,39 @@ def update_item_status(
     此前全代码库没有任何清除路径(``if best_version_id`` 只在 truthy 时写),
     迭代出新版本后旧的"最佳"指针仍指着老版本, 卡片/导出永远展示旧文。
     仅在未同时传入新 best_version_id 时生效。
+
+    ── ``source`` 为什么是**必填**(审计 COR-004)────────────────────────────
+    这个字段一个人也别想省。原来 status 一个列同时装两件事:
+
+      · 人点了「通过」/「打回」        —— 人工审稿意见
+      · 硬规则违规 / 查重重生耗尽      —— 机器检测结果
+
+    写进去之后长得一模一样, 而 Truth Vault 的决策同步把**全部**当人工反馈
+    灌进 prepublish_evaluations 去校准评估模型 —— 机器自己的判定被当成人的
+    判断喂回给模型学, 训练标签污染, 且没有任何地方会报错。
+
+    做成**必填的关键字参数**而不是带默认值: 默认值意味着下一个新增的调用点
+    可以什么都不想就通过, 而它多半正是又一处需要区分的地方。少写一个参数会
+    当场 TypeError, 这正是想要的 —— 让"这次到底是谁在做决定"变成写代码时
+    躲不开的一个问题。
+
+    ``reviewer_id`` 只在 ``source='human'`` 时有意义。**不要**拿 item 的
+    owner 去兜底 —— "谁拥有"和"谁审的"是两件事, 混起来正是 COR-007 那个失真。
     """
-    updates: dict[str, Any] = {"status": status}
+    if source not in _DECISION_SOURCES:
+        raise ValueError(
+            f"未知的 decision_source: {source!r}; 允许的是 "
+            f"{sorted(_DECISION_SOURCES)}。加新值要同时改 migrations/006 的 CHECK。")
+    if reviewer_id and source != DecisionSource.HUMAN:
+        raise ValueError(
+            f"source={source!r} 不该带 reviewer_id —— 自动判定没有「人」。")
+
+    updates: dict[str, Any] = {
+        "status": status,
+        "decision_source": source,
+        "reviewer_id": reviewer_id or None,
+        "decided_at": datetime.now(timezone.utc).isoformat(),
+    }
     if best_version_id:
         updates["best_version_id"] = best_version_id
     elif clear_best_version:
@@ -1103,6 +1150,28 @@ def update_item_status(
     except Exception:
         pass
     return _first_row(res, "更新条目状态", item_id=item_id, status=status)
+
+
+def set_best_version(client: Client, item_id: str, version_id: str) -> dict:
+    """只改 ``best_version_id``, **不碰 status, 也不盖决策戳**。
+
+    为什么单独一个函数: UI 上的「选为最佳」是在挑展示/导出用哪一版, 它
+    **不是**一次审稿决定 —— 状态压根没变。原来它借 ``update_item_status``
+    把当前 status 原样写回一遍, 在只有 status 这一个字段时看不出问题;
+    补上 decision_source/decided_at 之后就不一样了: 每点一次「选为最佳」都会
+    盖上一枚新的人工决策戳, 把刚补进来的这份出处数据自己污染掉。
+
+    (这个问题是 ``source`` 做成必填之后**当场逼出来的** —— 参数带默认值的话
+    这里会安安静静地继续跑。)
+    """
+    res = (client.table("items")
+           .update({"best_version_id": version_id})
+           .eq("id", item_id).execute())
+    try:
+        list_items.clear()
+    except Exception:
+        pass
+    return _first_row(res, "选为最佳版本", item_id=item_id)
 
 
 def _best_effort_item_patch(

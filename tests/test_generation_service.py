@@ -26,7 +26,7 @@ MOVED = [
     "_NullLock", "_NULL_LOCK", "_PHASE_WEIGHTS", "_QUEUE_POOL_MAX",
     "_SESSION_SYNC_LIMIT", "_SESSION_USER_TURN_PLACEHOLDER",
     "_resolve_queue_strategy", "_set_phase_progress", "_llm_intra_progress",
-    "_save_batch_results", "_run_hard_constraint_check", "_try_regen_one",
+    "_save_batch_results",
     "_run_semantic_dedup_pass", "_format_version_for_session",
     "_resolve_engine_sessions",
     "_commit_session_tokens", "_update_session_occupancy",
@@ -53,6 +53,13 @@ CHANGED_SINCE_MOVE: dict[str, tuple[str, str]] = {
         "跨库审计 ROB-015: 原来丢弃 append_session_messages 的返回值, "
         "报的是「打算写几条」而不是「实际写进去几条」",
         "tests/test_session_sync_truthfulness.py"),
+    "_run_hard_constraint_check": (
+        "跨库审计 COR-004: 自动标 needs_revision 时要说明来源是 "
+        "auto_hard_rule, 否则 TV 会把机器判定当人工反馈去校准模型",
+        "tests/test_decision_provenance.py"),
+    "_try_regen_one": (
+        "同上; 查重重生耗尽的那条标成 auto_dedup",
+        "tests/test_decision_provenance.py"),
 }
 
 # 搬迁那一次的 commit 之前, app.py 里还有这些定义。用它取"搬走之前"的样子。

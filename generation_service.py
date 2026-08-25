@@ -340,7 +340,8 @@ def _run_hard_constraint_check(
             # errors_sink 里那几行还在跟用户说"已标记 needs_revision"。
             # 说过的话和库里的状态对不上, 且没有任何报错。
             try:
-                db.update_item_status(db_client, item_id, "needs_revision")
+                db.update_item_status(db_client, item_id, "needs_revision",
+                                      source=db.DecisionSource.AUTO_HARD_RULE)
                 marked_items.add(item_id)
             except Exception as exc:
                 telemetry.log_event(
@@ -503,7 +504,8 @@ def _try_regen_one(
     # 重试用尽 → 标记 needs_revision
     if item_id:
         try:
-            db.update_item_status(db_client, item_id, "needs_revision")
+            db.update_item_status(db_client, item_id, "needs_revision",
+                                  source=db.DecisionSource.AUTO_DEDUP)
         except Exception as exc:
             telemetry.log_event(
                 "regen_status_update_failed",
