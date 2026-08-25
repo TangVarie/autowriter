@@ -17,16 +17,58 @@ autowriter 原来的查重只比标题向量(app.py:520), embedding 一挂就整
 from __future__ import annotations
 
 import hashlib
-import re
+import unicodedata
 
-_PUNCT_RE = re.compile(
-    r"[\s，。！？、；：""''《》（）()\[\]…—~·,.!?;:'\"\-_/\\|+*#@$%^&]+"
-)
+# ── 规范化 ────────────────────────────────────────────────────────────────
+#
+# 判据: **去掉所有标点与符号运算符, 保留文字与象形符号(emoji)**。
+# 具体是 Unicode 类别 Cc/Cf(控制/格式) · Zs/Zl/Zp(分隔) · Pc/Pd/Ps/Pe/Pi/Pf/Po
+# (全部标点) · Sm/Sc/Sk(数学/货币/修饰符号), 外加 str.isspace()。
+# **不去 So** —— emoji 属于那一类, "换个 emoji 算不算同一篇"是产品问题, 不该
+# 由一个规范化函数顺手决定。
+#
+# ── 为什么从字符类改成类别判定(审计 COR-014 的后续) ────────────────────
+# 原来是一行手写的字符类, 而且写坏了: `r"[...："` 后面跟着两个 ASCII 双引号,
+# raw 串在那里就结束了, 剩下半截是**非 raw** 串。后果有三 ——
+#   · `\[` / `\-` 是非法转义(Python 3.12+ 起会 SyntaxWarning);
+#   · `\\` 在非 raw 串里塌成一个反斜杠, 转义掉了后面的 `|`, 于是**反斜杠本身
+#     不在类里**;
+#   · 那两个 ASCII 双引号被当成串边界吃掉了。
+#
+# 但真正的问题比手误更大: **中文弯引号 “ ” ‘ ’ 从来就没写进去过**, 「」『』
+# 【】〈〉〔〕 也没有。实测同一篇稿子把 “” 换成 "", Jaccard 掉到 0.333 ——
+# 正好在 0.35 硬闸线之下, 开头指纹也对不上。那是一条**能绕过查重的路子**,
+# 而 【】 在小红书文案里遍地都是。逐个往字符类里补是补不完的(当时数出 37 个
+# 常见中文标点没被覆盖), 所以换成按类别判。
+#
+# 性能: 带 memo 的逐字判定比原来的正则慢约 8 倍, 但绝对值是 0.32ms / 3000 字,
+# 回填几千篇也就多一两秒。查重硬闸的正确性不该为这个让路。
+#
+# ⚠️⚠️ **改这里 = 让存量指纹作废。** 库里的 ngram_hashes / opening_hash 都是用
+# 当时的口径算出来的; 口径一变, 新稿算出来的四字串就和历史对不上, 查重在过渡期
+# **反而更弱**, 而且不报错。所以改完必须跑一次全量重算:
+#     python -m deskcore.cli recompute-fingerprints --project <id> --user <id>
+# 详见 docs/deskcore.md 与那个子命令的说明(它会告诉你有多少行**重算不了**)。
+_DROP_CATEGORIES = frozenset((
+    "Cc", "Cf",                                    # 控制符 / 格式符(含零宽连接)
+    "Zs", "Zl", "Zp",                              # 各种分隔符
+    "Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po",      # 全部标点
+    "Sm", "Sc", "Sk",                              # 数学 / 货币 / 修饰符号
+))
+_DROP_CACHE: dict[str, bool] = {}
+
+
+def _is_droppable(ch: str) -> bool:
+    hit = _DROP_CACHE.get(ch)
+    if hit is None:
+        hit = ch.isspace() or unicodedata.category(ch) in _DROP_CATEGORIES
+        _DROP_CACHE[ch] = hit
+    return hit
 
 
 def normalize(text: str) -> str:
-    """去标点空白后的规范化串。"""
-    return _PUNCT_RE.sub("", text or "")
+    """去标点 / 空白 / 符号运算符之后的规范化串。emoji 保留 —— 见上面的说明。"""
+    return "".join(c for c in (text or "") if not _is_droppable(c))
 
 
 def opening_of(body: str, n: int = 25) -> str:
@@ -56,7 +98,34 @@ def opening_hash(body: str) -> str:
     return sha16(opening) if opening else ""
 
 
-def ngram_hashes(text: str, n: int = 4, cap: int = 200) -> list[str]:
+# sketch 的大小。**从 200 提到 400**(审计 COR-014)。
+#
+# 为什么要提: 包含度这一路的有效样本量 m 由长稿 sketch 的第 cap 小值决定 ——
+# cap 越小, 两个 sketch 共同覆盖的 hash 区间越窄。实测真阳性(短稿逐字抄长稿)
+# 的 m 分布:
+#
+#   形状            cap=200 的 m(p05/中位)   cap=400 的 m(p05/中位)
+#   8 句 ⊂ 80 句          14 / 19                 33 / 40
+#   12 句 ⊂ 120 句        12 / 21                 31 / 41
+#   20 句 ⊂ 200 句        13 / 22                 33 / 42
+#   30 句 ⊂ 300 句        14 / 22                 33 / 43
+#
+# CONTAIN_MIN_SAMPLE 是 15。也就是说 cap=200 时, **最常见的那几个形状有 5% 以上
+# 的概率样本量不够、这一路直接不发言** —— 抓不抓得到全看运气。cap=400 之后
+# p05 也在 30 以上。
+#
+# ── 兼容性: 不需要重算存量指纹 ────────────────────────────────────────
+# 新旧 sketch 混着比是**正确**的: sketch_overlap 取 t = min(两边最大值), 拿
+# cap=400 的新稿去比 cap=200 的老指纹时, t 由老的那边决定, 精度退回老水平 ——
+# 与今天完全一样, 不会更差。新稿之间的比对才享受到双倍分辨率, 随着库里新行
+# 增多自然变好。想让老行也升上来就重跑一次回填, 但那是可选的。
+#
+# 代价: 每行指纹的 ngram_hashes 从约 3.4KB 涨到约 6.8KB, GIN 索引同步变大。
+# 按现有体量(约 4600 条成稿)是几十 MB 级, 而这是查重硬闸的分辨率, 值这个价。
+NGRAM_CAP = 400
+
+
+def ngram_hashes(text: str, n: int = 4, cap: int = NGRAM_CAP) -> list[str]:
     """正文 n 字 shingle 的 hash 集合(去重、有上限)。
 
     对齐 human-writing/scripts/check_prose.py 的跨篇四字串检测: 两篇共享大量
@@ -74,6 +143,10 @@ def ngram_hashes(text: str, n: int = 4, cap: int = 200) -> list[str]:
     与第 k 小值的大小关系, 与文本长度和其它 gram 的名次无关。两篇共享的
     gram 会一起进、一起出, Jaccard 近似无偏。
 
+    ⚠️ 返回值是 **sketch 不是完整集合**。拿两个 sketch 比对时必须走
+    ``sketch_overlap``, 直接 ``jaccard(set(a), set(b))`` 会系统性偏低 ——
+    审计 COR-014 就是这一条, 完整推导在 ``sketch_overlap`` 的文档里。
+
     这也保证覆盖全文而不是只比开头 —— hash 值与 gram 在文中的位置无关。
     """
     norm = normalize(text)
@@ -85,9 +158,84 @@ def ngram_hashes(text: str, n: int = 4, cap: int = 200) -> list[str]:
 
 
 def jaccard(a: set[str], b: set[str]) -> float:
+    """两个**完整**集合的 Jaccard。
+
+    ⚠️ 对两个 bottom-k **sketch** 直接调这个是错的 —— 见 ``sketch_overlap``。
+    保留它是因为 selftest 里拿全量 gram 集算地面真值时要用。
+    """
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def sketch_overlap(sa: set[str], sb: set[str]) -> tuple[float, float, int]:
+    """两个 bottom-k sketch 的 (Jaccard, 包含度, 有效样本量)。审计 COR-014。
+
+    ── 为什么不能对两个 sketch 直接算 Jaccard ─────────────────────────────
+    ``ngram_hashes`` 给**每篇各自**取最小的 cap 个 hash。两篇长度差得多时,
+    它们的第 cap 小值差着量级 —— 短稿的 sketch 覆盖 hash 空间的一大片,
+    长稿的只覆盖很窄的一条。直接求交并, 短稿里那些"落在长稿 sketch 之外"的
+    hash 会被当成"长稿没有", 于是估计值系统性偏低。
+
+    实测(3000 次合成对照): 直接算的偏差最大 0.125, 换成下面这个做法之后
+    最大 0.045 —— 而 0.35 的硬闸线上, 0.125 的偏差足够让该拦的溜过去。
+
+    ── 做法: 只在【两个 sketch 都覆盖到的 hash 区间】上算 ──────────────────
+    令 ``t = min(max(S_A), max(S_B))``。对任意 ``v ≤ t``:
+
+        v ∈ A  ⟺  v ∈ S_A     (v ∈ A 且 v ≤ t ≤ max S_A ⇒ v 在 A 最小的 cap 个里)
+
+    也就是说在 ``[0, t]`` 这个子域上, **两边的成员判定都是精确的**。而 sha256
+    的输出均匀, 所以这个子域是全域的一个均匀随机样本 —— 在它上面算出来的比值
+    就是全域比值的无偏估计。这是 bottom-k / MinHash 的标准估计式。
+
+    **存量指纹不用重算**: 它只用已经存下来的两个 sketch, 不需要原文。
+
+    ── 为什么还要返回包含度 ───────────────────────────────────────────────
+    这是量化之后才看清的一件事: **改准了估计, 并不能抓住"短稿逐字抄长稿"**。
+    因为那个形状下 Jaccard 的**真值**本来就小 —— 短稿整篇塞进长稿里,
+    ``J = |A| / |B|``, 280 字抄进 2800 字的稿子里真值就是 0.1, 再准的估计
+    也够不着 0.35。Jaccard 天生对长度差敏感, 这不是精度问题, 是**指标选错了**。
+
+    包含度 ``|A∩B| / min(|A|,|B|)`` 问的是另一个问题:"短的那篇有多少比例出现在
+    长的那篇里"。逐字抄袭时它是 1.0, 与长度差无关。
+
+    ── 第三个返回值: 有效样本量 ───────────────────────────────────────────
+    ``min(|a|, |b|)`` —— 子域里较小的那一边有几个元素。它决定估计的噪声,
+    调用方**必须**拿它当闸: 样本量太小时包含度会剧烈抖动(实测 100 字草稿 vs
+    6000 字历史时子域只剩 4 个元素, 完全无关的两篇也能撞出包含度 1.0)。
+    见 ``CONTAIN_MIN_SAMPLE``。
+
+    ── Jaccard 也有它自己的样本量下限 ─────────────────────────────────────
+    受限子域这个手法对**两个**指标一视同仁: 子域小到一定程度, 谁都别说话。
+    包含度看 ``min(|a|,|b|)``, Jaccard 看 ``|a ∪ b|`` —— 两者不能混用:
+
+      · 短稿 vs 超长历史稿是**正常形态**(长稿的 sketch 被 NGRAM_CAP 截到最小
+        的 400 个, 它的 max 因此很小, 子域里短稿只剩两三个元素)。这时
+        ``min`` 只有 2-3 而 ``union`` 有 400, Jaccard 估出来接近 0 —— 是对的,
+        拿 ``min`` 去关 Jaccard 会把这条正常路径一起关掉。
+      · 而当**两边**在子域里都只剩一两个元素时(历史稿是条退化行: 正文只有
+        四五个字, 整个 sketch 就一个 hash, 且恰好小于本稿的最小值), union
+        也塌到 1, J 直接算出 1.0 —— 硬闸线是 0.35, 于是**误杀**。
+
+    实测 2550 对无关稿子(短稿 1 句到长稿 2000 句全排列): union 最小 37,
+    没有一对低于 15, J 最大 0.105。所以这个下限在自然形态上一次都不会触发,
+    它只切掉退化区。**沿用 CONTAIN_MIN_SAMPLE 这一个数**, 免得又多一个要
+    跨语言对齐的常量(SQL 侧 migrations/005 的 jbest 是同一条件)。
+    """
+    if not sa or not sb:
+        return 0.0, 0.0, 0
+    # sha16 是定长小写十六进制, 字典序 == 数值序, 直接比字符串即可
+    # (SQL 侧的同款实现靠的也是这一点)。
+    t = min(max(sa), max(sb))
+    a = {h for h in sa if h <= t}
+    b = {h for h in sb if h <= t}
+    inter = len(a & b)
+    union = len(a | b)
+    sample = min(len(a), len(b))
+    return (inter / union if union >= CONTAIN_MIN_SAMPLE else 0.0,
+            inter / sample if sample else 0.0,
+            sample)
 
 
 # ── 查重判定 ──────────────────────────────────────────────────────────────
@@ -100,25 +248,69 @@ TITLE_SIM_WARN = 0.84
 NGRAM_JACCARD_HARD = 0.35
 NGRAM_JACCARD_WARN = 0.22
 
+# 包含度(审计 COR-014)。阈值不是拍的, 是从**零分布**定的 —— 合成对照 6000 次,
+# 按【有效样本量 m】分桶(m 才是决定噪声的量, 句数只是间接因素):
+#
+#   m 区间   次数   完全无关两篇的包含度 p99 / max   误杀(≥0.60)
+#    0-4      265        1.000 / 1.000                 8   ← 完全不可用
+#    5-9      554        0.571 / 0.600                 5   ← 仍会误杀
+#   10-14     466        0.364 / 0.417                 0
+#   15-19    1054        0.278 / 0.316                 0
+#   20-24    1113        0.238 / 0.333                 0
+#   30-34     291        0.267 / 0.300                 0
+#   50-54     175        0.160 / 0.176                 0
+#  100-104     73        0.120 / 0.120                 0
+#
+# m ≥ 15 的 4707 次里, 无关稿子的包含度**最大 0.333** —— 离 0.60 有近一倍余量。
+# 真阳性(短稿逐字抄自长稿)在同样设置下**全部是 1.000**。所以两条线两边都很宽,
+# 真正的风险不是阈值定得高低, 而是**样本量太小时估计根本没意义**。
+NGRAM_CONTAIN_HARD = 0.60
+NGRAM_CONTAIN_WARN = 0.40
 
-def deciding_signals(title_sim: float, opening_exact: bool,
-                     ngram_j: float) -> tuple[str, str, list[str]]:
-    """三个信号合议出结论, 并说清【是哪个信号定的】。
+# 有效样本量低于这个数就【完全不发包含度信号】。15 这个数就是上表里"误杀归零、
+# 且尾部离硬闸线还有一倍余量"的那一档。
+#
+# ⚠️ 这里刻意 fail-open, 与本仓其它地方的 fail-closed 口径相反, 理由是具体的:
+# 样本量 4 的时候无关稿子也能撞出 1.0, 按硬闸处理就是**误杀正常稿子**。而误杀
+# 比漏检更难被发现 —— 漏检至少还有另外三路信号和人工复核, 误杀只会让用户觉得
+# "这系统老让我重写", 然后没人再信这个闸。样本量不够时其余三路照常跑, 而且
+# check_drafts 会在 summary 里明说这一路没生效(containment_skipped_warning)。
+#
+# ⚠️ 定成 30 会把**最常见的那个形状**排除掉: 280 字草稿 vs 2800 字历史稿的
+# m 大约是 20。第一版就是 30, 于是"修好了但最该抓的那档抓不到"。
+CONTAIN_MIN_SAMPLE = 15
+
+
+def deciding_signals(title_sim: float, opening_exact: bool, ngram_j: float,
+                     ngram_contain: float = 0.0,
+                     contain_sample: int = 0) -> tuple[str, str, list[str]]:
+    """四个信号合议出结论, 并说清【是哪个信号定的】。
 
     为什么不是单信号判死: 阈值下调后单看标题会误伤合法的角度变体。所以要求
     「一个强信号」或「两个弱信号」才 reject。
 
-    第三个返回值是判定所依据的信号名(``opening`` / ``title`` / ``ngram``)。
-    调用方要靠它把"撞的是哪一条"归到对的来源上 —— 三个信号的最佳命中可能来自
-    三条不同的稿子(甚至分属本批内和历史), 归错了就会让人对着一条根本没引发
-    拒绝的稿子去改。(codex review)
+    第三个返回值是判定所依据的信号名(``opening`` / ``title`` / ``ngram`` /
+    ``contain``)。调用方要靠它把"撞的是哪一条"归到对的来源上 —— 各路信号的最佳
+    命中可能来自不同的稿子(甚至分属本批内和历史), 归错了就会让人对着一条根本
+    没引发拒绝的稿子去改。(codex review)
+
+    ``ngram_contain`` / ``contain_sample`` 默认值让老调用方(只喂三路的)行为不变
+    —— 包含度为 0 就等于这一路没发言。
     """
+    contain_ok = contain_sample >= CONTAIN_MIN_SAMPLE
     if opening_exact:
         return "reject", "正文开头与历史稿完全一致", ["opening"]
     if title_sim >= TITLE_SIM_HARD:
         return "reject", f"标题语义与历史稿高度重合(cos={title_sim:.3f})", ["title"]
     if ngram_j >= NGRAM_JACCARD_HARD:
         return "reject", f"正文与历史稿大面积重合(四字串 Jaccard={ngram_j:.3f})", ["ngram"]
+    if contain_ok and ngram_contain >= NGRAM_CONTAIN_HARD:
+        # 这一路专抓 Jaccard **结构上抓不到**的形状: 短稿整段照搬长稿。
+        # 那种情况下 Jaccard 的真值就等于两篇的长度比, 本来就够不着硬闸线。
+        return "reject", (
+            f"正文有 {ngram_contain:.0%} 的四字串都出现在历史稿里 —— "
+            f"短稿照搬长稿的典型形态(Jaccard={ngram_j:.3f} 看不出来, "
+            f"因为它会被长度差稀释)"), ["contain"]
     weak, why, which = 0, [], []
     if title_sim >= TITLE_SIM_WARN:
         weak += 1
@@ -128,6 +320,10 @@ def deciding_signals(title_sim: float, opening_exact: bool,
         weak += 1
         why.append(f"正文用词接近(Jaccard={ngram_j:.3f})")
         which.append("ngram")
+    if contain_ok and ngram_contain >= NGRAM_CONTAIN_WARN:
+        weak += 1
+        why.append(f"正文有 {ngram_contain:.0%} 与历史稿重合")
+        which.append("contain")
     if weak >= 2:
         return "reject", "；".join(why) + " —— 两项同时接近", which
     if weak == 1:
@@ -135,9 +331,12 @@ def deciding_signals(title_sim: float, opening_exact: bool,
     return "pass", "", []
 
 
-def verdict(title_sim: float, opening_exact: bool, ngram_j: float) -> tuple[str, str]:
+def verdict(title_sim: float, opening_exact: bool, ngram_j: float,
+            ngram_contain: float = 0.0,
+            contain_sample: int = 0) -> tuple[str, str]:
     """``deciding_signals`` 的两元组形式, 给只要结论不要归因的调用方。"""
-    status, reason, _ = deciding_signals(title_sim, opening_exact, ngram_j)
+    status, reason, _ = deciding_signals(title_sim, opening_exact, ngram_j,
+                                         ngram_contain, contain_sample)
     return status, reason
 
 

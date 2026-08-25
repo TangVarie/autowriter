@@ -15,6 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # 要历史: tests/test_generation_service.py 会 git show 搬迁前的 app.py,
+          # 逐字节比对"这次搬家真的没改逻辑"。默认的 depth=1 取不到父提交,
+          # 那条断言会 skip —— 而它恰好是这一步唯一有价值的那条。
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -35,6 +40,42 @@ jobs:
           #   3. 换皮改写能拦 —— 换标题 + 换措辞, 靠正文四字串重合抓出来
           #   4. 真正不同的稿子不误伤
           python -m deskcore.cli selftest
+
+      - name: pytest 用例目录 (审计 SUP-024 · 后续用例都往这儿加)
+        run: |
+          # 本仓在此之前一个 pytest 文件都没有 —— 回归全长在下面那十几个
+          # heredoc 块里, 每块自带一份假件和一套 env。那些块仍然有效、也仍然
+          # 在跑, 这一步**不替换**它们; 它存在是因为下一批要把生成编排抽成
+          # generation_service, 而"大搬家"没有能反复加用例的地方就是裸奔。
+          #
+          # 放在 selftest 之后、heredoc 群之前: 它需要 requirements.lock
+          # (config/generator/memory 都 import 得到 streamlit·anthropic),
+          # 但**不**需要 deskcore/requirements.txt 的 fastapi·mcp —— 那些
+          # 只在后面的 app-smoke 步骤里装。第三批就在这上面栽过一次
+          # (ModuleNotFoundError: fastapi), 所以这里明确写下边界。
+          pip install -r requirements-dev.txt
+          # -q 之外还要 -ra: strict xfail 一旦被人修好会变成 XPASS 失败,
+          # 摘要里必须能一眼看到是哪条, 否则下一个人只看到"红了"。
+          python -m pytest tests/ -q -ra
+
+      - name: 迁移在真 PostgreSQL 上跑得起来, 且与 Python 算得一样 (审计 COR-014)
+        run: |
+          # ⚠️ 这一步存在的理由很具体: 写 COR-014 那个迁移时, "读代码 + 肉眼
+          # review" 漏掉了两个 bug, 两个都是真跑一次就当场炸的 ——
+          #   ① WITH 的作用域只有一条语句(拆成两条 SELECT 读同一个 CTE 会报
+          #      relation "metrics" does not exist);
+          #   ② 两个 CTE 之间漏了逗号。
+          # plpgsql 的函数体对 Python 来说只是个字符串, 没有任何静态检查够得着
+          # 它, 而这些 SQL 是【查重硬闸】的实现。
+          #
+          # 比语法更重要的是: 下推路径(RPC)与 Python 兜底路径【算出来的数必须
+          # 一样】。两边不一致是最坏的失败形态 —— 各自看都正常, 只有对比才看得见。
+          sudo systemctl start postgresql || sudo service postgresql start
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          # 走 TCP, 免得纠结 peer 认证下的 socket 目录
+          PGPASSWORD=postgres python tests/sql_parity_check.py 127.0.0.1 5432
+        env:
+          PGPASSWORD: postgres
       - name: deskcore round-5 回归 (fail-closed / 规则口径 / 触发器条件)
         run: |
           python - <<'PY'
@@ -110,6 +151,17 @@ jobs:
           import deskcore.core as C
           import db as _db
 
+          # 审计 COR-015: record_rule 现在先过归属校验, 所以不能再传 client=None。
+          # 这里验的是 severity 回报口径, 不是归属 —— 归属在
+          # tests/test_deskcore_ownership.py, 这里只需要一个能回项目行的 client。
+          class _OwnQ:
+              def select(self, *a, **k): return self
+              def eq(self, *a, **k): return self
+              def limit(self, *a, **k): return self
+              def execute(self): return _Resp([{"id": "proj-1", "owner_id": "u1"}])
+          class _OwnSB:
+              def table(self, *a, **k): return _OwnQ()
+
           calls = {}
           def _fake_upsert(client, **kw):
               calls.update(kw)
@@ -119,7 +171,8 @@ jobs:
           _orig = _db.upsert_memory
           _db.upsert_memory = _fake_upsert
           try:
-              out = C.record_rule(None, "proj-1", "以后一律不许用感叹号", severity="hard")
+              out = C.record_rule(_OwnSB(), "proj-1", "以后一律不许用感叹号",
+                                  severity="hard", user_id="u1")
               assert calls.get("update_severity") is True, "record_rule 没打开 update_severity"
               assert out["severity"] == "hard", out
               assert "warning" not in out, out
@@ -128,7 +181,8 @@ jobs:
               # 反证: update_severity 没生效时, 必须报 warning 而不是谎报成功
               def _stubborn(client, **kw): return {"id": "mem-1", "severity": "soft"}
               _db.upsert_memory = _stubborn
-              out = C.record_rule(None, "proj-1", "同一条", severity="hard")
+              out = C.record_rule(_OwnSB(), "proj-1", "同一条",
+                                  severity="hard", user_id="u1")
               assert out["severity"] == "soft" and "warning" in out, out
               print("  ✓ 库里没改成 hard 时, 回报 soft 并带 warning(不谎报入参)")
           finally:
@@ -176,10 +230,12 @@ jobs:
           # ── 7. 两份 SQL 里的触发器 WHEN 条件必须一致 ─────────────────────────
           WHEN = ("WHEN (OLD.status IS DISTINCT FROM NEW.status\n"
                   "       OR OLD.example_label IS DISTINCT FROM NEW.example_label)")
-          for f in ("migrations/001_deskcore.sql", "db.py"):
+          # 基线原来是 db.py 里的 CREATE_TABLES_SQL 字符串, 审计 SUP-010 之后
+          # 搬成了 migrations/000_baseline.sql。
+          for f in ("migrations/001_deskcore.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert WHEN in t, f"{f} 里 items 触发器缺 WHEN 条件(或两份不一致)"
-          print("  ✓ items 触发器的 WHEN 条件在 migrations 与 CREATE_TABLES_SQL 里一致")
+          print("  ✓ items 触发器的 WHEN 条件在增量迁移与基线里一致")
 
           # ── 8. R-034: memories.embedding 必须被解析成 list[float] ────────────
           # 这是取 embedding 顺带引入的地雷: PostgREST 把 pgvector 当【字符串】回,
@@ -438,7 +494,7 @@ jobs:
               "降级直插路径没记 embedding_model"
           bsrc = inspect.getsource(C.backfill_fingerprints)
           assert "embedding_model" in bsrc, "backfill 没记 embedding_model"
-          for f in ("migrations/001_deskcore.sql", "db.py"):
+          for f in ("migrations/001_deskcore.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert "embedding_model" in t, f"{f} 缺 embedding_model 列"
           sql = open("migrations/001_deskcore.sql", encoding="utf-8").read()
@@ -483,6 +539,11 @@ jobs:
               def update(self, row, *a, **k): self.upd = row; return self
               def insert(self, row, *a, **k): self.st.setdefault("edits", []).append(row); return self
               def execute(self):
+                  if self.t == "projects":
+                      # 审计 COR-015: record_edit / save_my_style / my_style 先过
+                      # 归属校验。本块验的是两步闭环, 不是归属 —— 兜一行 owner=u1。
+                      return _Resp([{"id": "p1", "owner_id": "u1",
+                                     "calibration_notes": ""}])
                   if self.t == "style_edits":
                       if getattr(self, "upd", None):          # 销账
                           ids = getattr(self, "ids", [])
@@ -787,7 +848,7 @@ jobs:
                      and c.args[0].value == "calibration_notes"]
           assert not _bad_eq, "CAS 主路径还在把笔记全文塞进 .eq() 过滤"
           # 两份 SQL 的语义必须一致(限定写法本来就不同, 对齐判据/授权三处)
-          for f in ("migrations/002_calibration_cas.sql", "db.py"):
+          for f in ("migrations/002_calibration_cas.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert "update_calibration_notes_cas" in t, f"{f} 缺 CAS 函数"
               assert "md5(COALESCE(p.calibration_notes, '')) = _expected_md5" in t, \
@@ -1067,7 +1128,7 @@ jobs:
           except Exception as e:
               assert "permission denied" in str(e)
           # 唯一索引两份 SQL 都要有; 迁移必须先重编号(否则有历史重复时直接建索引会失败)
-          for f in ("migrations/003_versions_unique_num.sql", "db.py"):
+          for f in ("migrations/003_versions_unique_num.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert "versions_item_version_uniq" in t and "(item_id, version_num)" in t, f
           assert "row_number() OVER" in open("migrations/003_versions_unique_num.sql", encoding="utf-8").read()
@@ -1168,8 +1229,17 @@ jobs:
           print("  ✓ COR-022 engines 去重保序; 单引擎路径不变; 空 engines 不炸")
 
           # ══ COR-002: slot ↔ item 配对不能靠返回顺序, 缺行不能静默丢 ═════════
-          # app.py 是 streamlit 脚本(顶层会跑 UI), 只把这两个纯函数取出来跑。
-          _tree = ast.parse(open("app.py", encoding="utf-8").read())
+          # 这两个纯函数原来在 app.py, 审计 ROB-001/002 之后搬到了
+          # generation_service.py。不写死文件名 —— 在候选里找, 找不到就报错,
+          # 免得下次再搬的时候这条断言变成静默跳过。
+          def _srcfile(fn_name):
+              for _f in ("generation_service.py", "app.py"):
+                  _t = ast.parse(open(_f, encoding="utf-8").read())
+                  if any(isinstance(x, ast.FunctionDef) and x.name == fn_name
+                         for x in _t.body):
+                      return _f
+              raise AssertionError(f"哪个文件里都找不到顶层函数 {fn_name}")
+          _tree = ast.parse(open(_srcfile("_save_batch_results"), encoding="utf-8").read())
           _mod = types.ModuleType("appfrag")
           _mod.__dict__.update(db=db, validator=validator, telemetry=telemetry, uuid=uuid)
           for _n in _tree.body:
@@ -1258,19 +1328,25 @@ jobs:
           FAIL = []
 
           def _app_func_src(name):
-              """按名字从 app.py 里切出一个函数的源码。
+              """按名字切出一个顶层函数的源码。
 
               app.py 不能 import —— 它一被 import 就开始跑 streamlit 脚本。所以读文本 +
               走 ast 定位: 按缩进找边界会被**跨行的函数签名**骗到(那个 `) -> None:`
               也顶格), 直接把函数截在签名处。
+
+              生成编排在审计 ROB-001/002 之后搬去了 generation_service.py, 所以两个
+              文件都找一遍。找不到要报错, 不能静默返回空串 —— 那样下面每一条
+              `assert "xxx" in src` 都会变成假绿。
               """
-              src = open("app.py", encoding="utf-8").read()
-              tree = ast.parse(src)
-              fn = next((n for n in tree.body
-                         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                         and n.name == name), None)
-              assert fn is not None, f"app.py 里找不到顶层函数 {name}"
-              return "\n".join(src.splitlines()[fn.lineno - 1:fn.end_lineno])
+              for path in ("generation_service.py", "app.py"):
+                  src = open(path, encoding="utf-8").read()
+                  tree = ast.parse(src)
+                  fn = next((n for n in tree.body
+                             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                             and n.name == name), None)
+                  if fn is not None:
+                      return "\n".join(src.splitlines()[fn.lineno - 1:fn.end_lineno])
+              raise AssertionError(f"app.py / generation_service.py 里都找不到顶层函数 {name}")
 
 
           def check(name, fn):
@@ -1399,9 +1475,15 @@ jobs:
                   return self.sb._run(self)
 
 
+          OWNER = "u-owner"
+
           class _SB:
               def __init__(self, rows=None, rpc_impl=None):
-                  self.rows = rows or {}
+                  self.rows = dict(rows or {})
+                  # 审计 COR-015: core 的项目级入口现在先过归属校验。本块每条断言
+                  # 验的都【不是】归属(那些在 tests/test_deskcore_ownership.py),
+                  # 所以统一兜一行 owner=OWNER 的 p1, 免得每条用例各自重写一遍。
+                  self.rows.setdefault("projects", [{"id": "p1", "owner_id": OWNER}])
                   self.rpc_impl = rpc_impl or {}
                   self.calls, self.rpc_calls = [], []
 
@@ -1450,7 +1532,7 @@ jobs:
                            {"id": f"f{i}", "project_id": "p1", "title_embedding": "[0.1]"}
                            for i in range(4000)]},
                        rpc_impl={"deskcore_check_drafts": lambda a: [hit]})
-              out = C.check_drafts(sb, "p1", _DRAFTS)
+              out = C.check_drafts(sb, "p1", _DRAFTS, user_id=OWNER)
 
               # ① 结论由 RPC 驱动
               r = out["results"][0]
@@ -1489,7 +1571,7 @@ jobs:
                         "title_embedding": None, "opening_hash": C.fp.opening_hash(body),
                         "ngram_hashes": C.fp.ngram_hashes(body), "created_at": "2026-01-01"}
               sb_py = _SB(rows={"draft_fingerprints": [fp_row]})           # 无 rpc_impl
-              out_py = C.check_drafts(sb_py, "p1", _DRAFTS)
+              out_py = C.check_drafts(sb_py, "p1", _DRAFTS, user_id=OWNER)
               assert out_py["results"][0]["status"] == "reject", out_py["results"][0]
               assert out_py["results"][0]["collided_with"] == "去年那篇口红合集"
               assert out_py["summary"]["history_size"] == 1, out_py["summary"]
@@ -1504,7 +1586,7 @@ jobs:
                                {"idx": 0, "best_sim": 0, "sim_title": None,
                                 "best_j": j, "j_title": "去年那篇口红合集",
                                 "open_exact": True, "open_title": "去年那篇口红合集"}]})
-              out_sql = C.check_drafts(sb_sql, "p1", _DRAFTS)
+              out_sql = C.check_drafts(sb_sql, "p1", _DRAFTS, user_id=OWNER)
               assert out_sql["results"][0]["status"] == out_py["results"][0]["status"]
               assert out_sql["results"][0]["collided_with"] == out_py["results"][0]["collided_with"]
 
@@ -1517,7 +1599,7 @@ jobs:
                            {"idx": 0, "best_sim": 0, "sim_title": None, "best_j": 0,
                             "j_title": None, "open_exact": False, "open_title": None}]})
               try:
-                  C.check_drafts(sb, "p1", two)
+                  C.check_drafts(sb, "p1", two, user_id=OWNER)
               except RuntimeError as exc:
                   assert "回执缺" in str(exc), exc
               else:
@@ -1534,7 +1616,7 @@ jobs:
                            "open_exact": "false", "open_title": None}]
               sb = _SB(rows={"draft_fingerprints": [{"id": "f1", "project_id": "p1"}]},
                        rpc_impl={"deskcore_check_drafts": _rpc})
-              r = C.check_drafts(sb, "p1", _DRAFTS)["results"][0]
+              r = C.check_drafts(sb, "p1", _DRAFTS, user_id=OWNER)["results"][0]
               assert r["signals"]["opening_exact_match"] is False, r
               assert r["status"] == "pass", r
               # NUMERIC 回字符串时也要能算
@@ -1542,7 +1624,7 @@ jobs:
 
 
           def t_codex_p1_rpc_search_path():
-              """CREATE_TABLES_SQL 里每个固定了 search_path 的函数, 都要够得着它引用的表。
+              """基线里每个固定了 search_path 的函数, 都要够得着它引用的表。
 
               codex review 2026-08-24: 新加的两个 RPC(以及旁边两个老的)写着
               `SET search_path = pg_catalog, extensions`, 函数体里却裸用 draft_fingerprints
@@ -1551,7 +1633,8 @@ jobs:
               坏得毫无声响, 这条断言就是为了让它不能再回来。
               """
               import re
-              sql = db.CREATE_TABLES_SQL
+              # 审计 SUP-010: 基线从 db.CREATE_TABLES_SQL 搬成了 .sql 文件。
+              sql = open("migrations/000_baseline.sql", encoding="utf-8").read()
               fns = list(re.finditer(r"CREATE OR REPLACE FUNCTION (\w+)\(", sql))
               assert len(fns) >= 6, f"只找到 {len(fns)} 个函数, 正则可能失配了"
               checked = 0
@@ -1592,7 +1675,7 @@ jobs:
                       raise RuntimeError("permission denied for function deskcore_check_drafts")
 
               try:
-                  C.check_drafts(_Boom(), "p1", _DRAFTS)
+                  C.check_drafts(_Boom(), "p1", _DRAFTS, user_id=OWNER)
               except RuntimeError as exc:
                   assert "permission denied" in str(exc)
               else:
@@ -1685,7 +1768,7 @@ jobs:
               sb = _SB(rows={"projects": projects, "memories": mems},
                        rpc_impl={"deskcore_fingerprint_counts":
                                  lambda a: [{"project_id": "p3", "n": 7}]})
-              out = C.list_projects(sb)
+              out = C.list_projects(sb, user_id="o")
               assert len(out) == N, len(out)
               assert out[3]["hard_rules"] == 1 and out[3]["soft_rules"] == 1, out[3]
               assert out[3]["fingerprint_count"] == 7, out[3]
@@ -1702,7 +1785,7 @@ jobs:
               # ③ RPC 没部署 → 退回逐项目 count, 结果仍然对
               sb2 = _SB(rows={"projects": projects[:5], "memories": mems,
                               "draft_fingerprints": [{"id": "f1", "project_id": "p2"}]})
-              out2 = C.list_projects(sb2)
+              out2 = C.list_projects(sb2, user_id="o")
               assert [o["fingerprint_count"] for o in out2] == [0, 0, 1, 0, 0], out2
               assert len([c for c in sb2.calls if c["table"] == "draft_fingerprints"]) == 5
 
@@ -1772,16 +1855,19 @@ jobs:
 
 
           def t_sup005_callsites():
-              src = open("app.py", encoding="utf-8").read()
+              # 两个调用点在 _queue_worker_impl 与 _quick_gen_worker 里, 它们在
+              # 审计 ROB-001/002 之后搬去了 generation_service.py。
+              F = "generation_service.py"
+              src = open(F, encoding="utf-8").read()
               assert src.count("prepare_soft_context(") == 2, \
-                  "app.py 的两个调用点没有都改成复用一次算好的 ctx 向量"
+                  f"{F} 的两个调用点没有都改成复用一次算好的 ctx 向量"
               tree = ast.parse(src)
               for node in ast.walk(tree):
                   if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                           and node.func.attr == "filter_soft_by_relevance"):
                       kws = {k.arg for k in node.keywords}
                       assert "context" in kws, \
-                          f"app.py:{node.lineno} 的 filter_soft_by_relevance 没传 context, 又会多发一次 embedding"
+                          f"{F}:{node.lineno} 的 filter_soft_by_relevance 没传 context, 又会多发一次 embedding"
 
 
           # ══════════════════════════════════════════════════════════════════
@@ -2219,7 +2305,9 @@ jobs:
               assert biggest <= 100, f"单次 .in_() 塞了 {biggest} 个 id"
 
               # ② 两个记忆表都空 → 一次 embedding 都不发
-              src_app = open("app.py", encoding="utf-8").read()
+              # (调用点随 _queue_worker_impl / _quick_gen_worker 搬到了
+              #  generation_service.py, 审计 ROB-001/002)
+              src_app = open("generation_service.py", encoding="utf-8").read()
               tree = ast.parse(src_app)
               calls = [n for n in ast.walk(tree)
                        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
@@ -2229,7 +2317,7 @@ jobs:
                   parent = next((n for n in ast.walk(tree)
                                  if isinstance(n, ast.IfExp) and any(x is c for x in ast.walk(n))), None)
                   assert parent is not None, \
-                      f"app.py:{c.lineno} 的 prepare_soft_context 是无条件调用的 —— " \
+                      f"generation_service.py:{c.lineno} 的 prepare_soft_context 是无条件调用的 —— " \
                       "无记忆的项目每批都会白发一次 embedding(codex P2)"
 
 
@@ -2240,7 +2328,7 @@ jobs:
               ("SUP-002 权限错必须上抛 —— 查重不 fail-open", t_sup002_no_fail_open),
               ("SUP-002 回执缺行必须报错, 不能退化成 pass", t_sup002_partial_result),
               ("SUP-002 open_exact 不受布尔/数字的传输形态影响", t_sup002_bool_shape),
-              ("codex-P1 CREATE_TABLES_SQL 的 RPC 够得着自己引用的表", t_codex_p1_rpc_search_path),
+              ("codex-P1 基线里的 RPC 够得着自己引用的表", t_codex_p1_rpc_search_path),
               ("codex-P1 多引擎批次的版本号互不相同(否则整批不落库)", t_codex_p1_multi_engine_version_num),
               ("codex-P1 /health 的墙钟上限真的会触发(默认值不会)", t_codex_p1_health_timeout_actually_fires),
               ("codex-P2 标记去重在写成功之后才记", t_codex_p2_marked_after_success),
@@ -2364,6 +2452,39 @@ jobs:
           assert h["config"]["anonymous_allowed"] is True, h["config"]
           assert "dev" in h["config"]["auth"]["note"], h["config"]["auth"]["note"]
           assert c.post("/tool/list_projects", json={}).status_code != 401
+
+          # ── COR-015 的运行期一半(审计第四批) ──────────────────────────────
+          # 静态那一半在 tests/test_deskcore_ownership.py(那一步只装
+          # requirements.lock, import 不了 fastapi, 只能 AST 读源码)。这里
+          # fastapi 在, 验真的 HTTP 状态码。
+          #
+          # ① 匿名 dev 模式 + 没配 DESKCORE_DEFAULT_USER_ID = 认不出人 → 403。
+          #    注意它【不是】401: key 这一层是放行的(显式开了匿名), 拒绝发生在
+          #    归属校验那一层。两层分开才说得清该配哪个变量。
+          assert not (os.environ.get("DESKCORE_DEFAULT_USER_ID") or "").strip()
+          r = c.post("/tool/list_projects", json={})
+          assert r.status_code == 403, \
+              f"认不出调用者却不是 403: {r.status_code} {r.text[:200]}"
+          assert "DESKCORE_DEFAULT_USER_ID" in r.text, \
+              f"403 没告诉人该配什么: {r.text[:300]}"
+
+          # ② 归属拒绝【绝不能】掉进 500 兜底。500 对调用方的意思是"服务端坏了,
+          #    待会儿重试", 于是模型会拿同一个错 project_id 一直试; 而且正常的
+          #    权限拒绝会去污染错误监控。这里直接把工具替换成必抛 PermissionError,
+          #    只验 REST 层的映射, 不连库。
+          import deskcore.tools as _T
+          _orig_tool = _T.TOOLS["check_drafts"]
+          def _denied(project_id, drafts, _user_id=None):
+              raise PermissionError("project x 不属于当前调用者, 拒绝访问")
+          _T.TOOLS["check_drafts"] = (_denied, True)
+          try:
+              r = c.post("/tool/check_drafts", json={"project_id": "x", "drafts": []})
+              assert r.status_code == 403, \
+                  f"越权拒绝映射成了 {r.status_code}(应为 403): {r.text[:200]}"
+          finally:
+              _T.TOOLS["check_drafts"] = _orig_tool
+          print("  ✓ COR-015 认不出人/不是你的项目 → 403(不是 401, 更不是 500)")
+
           os.environ.pop("DESKCORE_ALLOW_ANONYMOUS")
           assert c.post("/tool/list_projects", json={}).status_code == 401
           print("  ✓ DESKCORE_ALLOW_ANONYMOUS=1 才放行, 且 /health 回显; 去掉即恢复 401")
@@ -2440,6 +2561,11 @@ jobs:
           import dedup, db, generator, memory, image_handler, exporter, projects
           import librarian_client  # R-032: TV 飞轮馆员 pull 客户端(import 安全, 用 requests)
           import worker  # R-018: 后台 worker 入口(import 安全, main() 在 __main__ 守卫内)
+          # 生成编排(审计 ROB-001/002/SUP-011/SUP-012 从 app.py 搬出来的)。
+          # 它能被这一步 import 本身就是那次搬迁的意义: app.py 一 import 就开始跑
+          # streamlit 脚本, 所以下面那行注释说"不 import app.py" —— 而编排逻辑
+          # 现在不在 app.py 里了, worker 进程才拿得到它。
+          import generation_service
           # deskcore: 逻辑层要能 import(它复用 db/memory/dedup/clients/librarian_client)。
           # app.py 不 import —— 那个要 fastapi + mcp SDK, 属 deskcore/requirements.txt
           # 的增量依赖, 主 lockfile 里没有。

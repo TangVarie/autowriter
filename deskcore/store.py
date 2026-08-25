@@ -57,22 +57,43 @@ def iso_now() -> str:
 
 # ── 项目 ──────────────────────────────────────────────────────────────────
 
-def list_all_projects(sb) -> list[dict]:
-    """全部项目, 不按 owner 过滤。
+def project_row(sb, project_id: str) -> dict | None:
+    """项目整行; 不存在返回 None。
 
-    db.list_projects 是 .eq("owner_id", user_id) —— 那是 Streamlit 里「我的项目」
-    的视角。deskcore 要让任何人都能打开任何项目(规则共享), 所以这里不过滤,
-    但把 owner_id 带出去, 调用方需要时能显示归属。
+    ⚠️ 刻意不用 ``db.get_project`` —— 它用 ``.single()``, PostgREST 在 0 行时回
+    406, postgrest-py 把它抛成 APIError。也就是说 ``db.get_project`` 【从不返回
+    None】, 调用方那句 ``if project is None: raise ValueError("project not
+    found")`` 是死代码, 传错 project_id 拿到的是一条看不懂的 406 报错。归属校验
+    要区分"项目不存在"(可能只是 id 抄错)和"项目不是你的", 所以这里换成 limit(1)。
+    """
+    res = (sb.table("projects").select("*")
+             .eq("id", project_id).limit(1).execute())
+    rows = res.data or []
+    return rows[0] if rows else None
+
+
+def list_all_projects(sb, *, owner_id: str) -> list[dict]:
+    """``owner_id`` 名下的项目。
+
+    ⚠️ 这里【曾经不按 owner 过滤】, 理由写的是"deskcore 要让任何人都能打开任何
+    项目(规则共享)"。审计 COR-015 指出那个选择的代价: 整套隔离就只剩 key 这一层,
+    而 key 这一层有 ROB-003(配错就全开)。归属口径已按 ``projects.owner_id`` 定下来
+    (与 db.py:224 那条 RLS policy `owner_id = auth.uid()` 同一判据)——
+    deskcore 持 service_role 绕过 RLS, 就得自己把同一条谓词执行一遍。
+
+    参数写成**关键字必填**是故意的: 将来若改成团队共享, 改的是
+    ``core.assert_project_access`` 一处; 而任何人想在这里"顺手去掉过滤",
+    都得先改签名, 改不动就不会不小心改回去。
 
     ⚠️ 必须翻页。原来是裸 select 无 limit —— PostgREST 的 db-max-rows(默认
-    1000)会**静默截断**, 而这是"任何人都能打开任何项目"的那份清单: 越过 1000
-    个项目之后, 后面的项目在模型眼里【根本不存在】, 且没有任何提示
-    (审计 COR-005 同款, 判据同样是空页收工 + offset 按实收行数前进)。
+    1000)会**静默截断**: 越过 1000 个项目之后, 后面的项目在模型眼里【根本不存在】,
+    且没有任何提示(审计 COR-005 同款, 判据同样是空页收工 + offset 按实收行数前进)。
     ``name`` 有重名, 排序必须带 ``id`` 做次级键, 否则翻页会漏行也会重复行。
     """
     return _paged(lambda off, lim: (
         sb.table("projects")
           .select("id, name, brand, owner_id")
+          .eq("owner_id", owner_id)
           .order("name").order("id")
           .range(off, off + lim - 1)
     ))
@@ -476,13 +497,19 @@ def fingerprint_stats(sb, project_id: str) -> tuple[int, int]:
     return int(total), int(with_vec)
 
 
-def check_drafts_sql(sb, project_id: str, rows: list[dict]) -> list[dict] | None:
-    """三路比对下推到库里(审计 SUP-002 / ROB-004 / ROB-011)。
+def check_drafts_sql(sb, project_id: str, rows: list[dict],
+                     contain_min_sample: int | None = None) -> list[dict] | None:
+    """四路比对下推到库里(审计 SUP-002 / ROB-004 / ROB-011 / COR-014)。
 
     ``rows`` = [{opening_hash, ngram_hashes, title_embedding}, ...]，顺序即
-    结果的 ``idx``。返回每条的
-    ``{idx, best_sim, sim_title, best_j, j_title, open_exact, open_title}``；
+    结果的 ``idx``。返回每条的 ``{idx, best_sim, sim_title, best_j, j_title,
+    open_exact, open_title, best_c, c_title, c_sample}``；
     RPC 不存在(migrations/004 没跑)时返回 None, 由调用方降级回 Python 路径。
+
+    ⚠️ 后三列(``best_c`` / ``c_title`` / ``c_sample``)是 **migrations/005** 加的
+    包含度那一路。只跑过 004 的库回不出这三列 —— 那**不是错误**, 调用方按
+    "这一路没跑"处理(``c_sample`` 取不到就是 0, 包含度不发言), 并在 summary 里
+    报 ``containment_skipped_warning``。绝不能当成"包含度 = 0 = 没撞车"。
 
     为什么值得下推: 原来是把整个项目的指纹(4000 行 × 768 维)拉进 Python 再逐对
     算余弦 —— 百 MB 级传输 + 三千万次乘加, 单次数十秒, 且占着 uvicorn 线程池
@@ -490,19 +517,37 @@ def check_drafts_sql(sb, project_id: str, rows: list[dict]) -> list[dict] | None
     同一个根因。
 
     ⚠️ 只有"RPC 不存在"才降级。权限错、参数错、库故障一律上抛 —— 查重是硬闸。
+
+    ⚠️ 签名有两版, 与 ``commit_fingerprints`` 同一套路。``_contain_min_sample``
+    是修 Codex 那条 P1 时加的: 样本量必须在**取最大之前**过闸, 而阈值只能在
+    fingerprint.py 里定义一处、传下来。只跑过 004 的库没有这个参数, PostgREST
+    会报"找不到函数" —— 那不是故障, 所以先按 3 参调, 报找不到再按 2 参试一次,
+    两次都找不到才是真的没跑迁移。
     """
     if not rows:
         return []
-    try:
-        res = sb.rpc("deskcore_check_drafts", {
-            "_project_id": project_id,
-            "_rows": rows,
-        }).execute()
-    except Exception as exc:
-        if rpc_missing(exc):
+    base = {"_project_id": project_id, "_rows": rows}
+    attempts = []
+    if contain_min_sample is not None:
+        attempts.append(("005", {**base, "_contain_min_sample": contain_min_sample}))
+    attempts.append(("004", base))
+
+    for n, (tag, args) in enumerate(attempts):
+        try:
+            res = sb.rpc("deskcore_check_drafts", args).execute()
+        except Exception as exc:
+            if not rpc_missing(exc):
+                raise
+            if n + 1 < len(attempts):
+                logger.warning(
+                    "deskcore_check_drafts 没有 migrations/005 那版签名, 回退到 "
+                    "2 参旧版 —— 前三路照常, **包含度那一路不发言**"
+                    "(短稿照搬长稿在 check 这一关拦不住)。跑 migrations/005 修好。")
+                continue
             return None
-        raise
-    return res.data or []
+        else:
+            return res.data or []
+    return None
 
 
 def fingerprint_counts(sb, project_ids: list[str]) -> dict[str, int] | None:
@@ -644,6 +689,52 @@ def set_fingerprint_vector(sb, row_id: str, vec: list[float], model: str) -> boo
     return bool(res.data)
 
 
+def fingerprint_pages(sb, project_id: str, page: int = PAGE):
+    """项目的全部指纹行, 逐页 yield。给"换了规范化口径之后重算"用。
+
+    只取重算需要的列: ``opening`` 能重算 opening_hash, ``version_id`` 决定
+    ngram_hashes 能不能重算(正文只在 autowriter.versions 里, 指纹表**不存正文**)。
+
+    逐页而不是一次拉全 —— 同 legacy_version_pages 的理由(审计 ROB-011)。
+    ``id`` 做次级排序键, 否则 created_at 大量并列时翻页会漏行。
+    """
+    return _paged_iter(
+        lambda off, lim: (
+            sb.table("draft_fingerprints")
+              .select("id, version_id, opening, opening_hash")
+              .eq("project_id", project_id)
+              .order("created_at").order("id")
+              .range(off, off + lim - 1)
+        ),
+        page=page,
+    )
+
+
+def version_bodies(sb, version_ids: list[str]) -> dict[str, str]:
+    """按 version_id 取正文。分块 + 翻页, 理由同 rule_counts_bulk。"""
+    out: dict[str, str] = {}
+    for chunk in db._in_chunks(list(version_ids)):
+        for row in _paged(lambda off, lim, _c=chunk: (
+                sb.table("versions").select("id, body")
+                  .in_("id", _c)
+                  .order("id")
+                  .range(off, off + lim - 1))):
+            out[str(row["id"])] = row.get("body") or ""
+    return out
+
+
+def update_fingerprint_hashes(sb, row_id: str, *, opening_hash: str,
+                              ngram_hashes: list[str] | None) -> bool:
+    """重写一行的确定性指纹。``ngram_hashes=None`` 表示这行的正文找不回来,
+    只更新 opening_hash, 四字串那一路保持原样(并由调用方报出去)。"""
+    patch: dict = {"opening_hash": opening_hash}
+    if ngram_hashes is not None:
+        patch["ngram_hashes"] = ngram_hashes
+    res = (sb.table("draft_fingerprints").update(patch)
+             .eq("id", row_id).execute())
+    return bool(res.data)
+
+
 def write_fingerprints(sb, rows: list[dict]) -> int:
     """直插指纹(不查重)。只给【回填】用 —— 回填的是已发生的历史, 本来就该原样入库。
 
@@ -657,7 +748,11 @@ def write_fingerprints(sb, rows: list[dict]) -> int:
 
 def commit_fingerprints_atomic(sb, project_id: str, rows: list[dict],
                                user_id: str | None,
-                               ngram_hard: float) -> list[dict] | None:
+                               ngram_hard: float,
+                               *,
+                               contain_hard: float | None = None,
+                               contain_min_sample: int | None = None,
+                               ) -> list[dict] | None:
     """定稿入库 + 【同一事务内重新查一遍】, 走 deskcore_commit_fingerprints RPC。
 
     为什么不能直接 insert: check_drafts 和 commit_drafts 是两次独立调用。两个
@@ -666,23 +761,67 @@ def commit_fingerprints_atomic(sb, project_id: str, rows: list[dict],
 
     返回每条的 {idx, status, collided_with, detail}; RPC 不存在(迁移没跑)时
     返回 None, 由调用方降级。
+
+    ⚠️ **两个版本的签名都要试**(审计 COR-014)。migrations/005 把这个函数从 4 参
+    改成了 6 参(多了包含度的两个阈值)。只跑过 001~004 的库上还是 4 参版本, 而
+    PostgREST 对"参数对不上"的报错文本里带 ``does not exist`` —— 那正好被
+    ``rpc_missing()`` 认成"迁移压根没跑", 于是**整条原子写入路径会静默退化成
+    直插**, check/commit 之间的竞态窗口重新打开, 而日志只说"migrations/001
+    还没跑?"(完全误导)。分两步升级的库上这一定会发生。
+
+    所以顺序是: 先按 6 参调; 只有它报"找不到"时才回退到 4 参再试一次;
+    两次都找不到才是真的没跑迁移。
     """
     if not rows:
         return []
-    try:
-        res = sb.rpc("deskcore_commit_fingerprints", {
-            "_project_id": project_id,
-            "_rows": rows,
-            "_user_id": user_id,
-            "_ngram_hard": ngram_hard,
-        }).execute()
-    except Exception as exc:
-        if rpc_missing(exc):
-            logger.error("deskcore_commit_fingerprints RPC 不存在 —— migrations/001 "
-                         "还没跑? 本次降级为直插(并发 check/commit 可能撞车)。")
+    base = {
+        "_project_id": project_id,
+        "_rows": rows,
+        "_user_id": user_id,
+        "_ngram_hard": ngram_hard,
+    }
+    attempts = []
+    if contain_hard is not None or contain_min_sample is not None:
+        wide = dict(base)
+        if contain_hard is not None:
+            wide["_contain_hard"] = contain_hard
+        if contain_min_sample is not None:
+            wide["_contain_min_sample"] = contain_min_sample
+        attempts.append(("005", wide))
+    attempts.append(("001", base))
+
+    for n, (tag, args) in enumerate(attempts):
+        try:
+            res = sb.rpc("deskcore_commit_fingerprints", args).execute()
+        except Exception as exc:
+            if not rpc_missing(exc):
+                raise
+            if n + 1 < len(attempts):
+                logger.warning(
+                    "deskcore_commit_fingerprints 没有 migrations/005 那版签名, "
+                    "回退到 4 参旧版 —— 写入侧仍会关竞态窗口, 但**不做包含度重查**"
+                    "(短稿照搬长稿在 commit 这一关拦不住)。跑 migrations/005 修好。")
+                continue
+            logger.error(
+                "deskcore_commit_fingerprints RPC 不存在(两种签名都试过) —— "
+                "migrations/001 还没跑? 本次降级为直插(并发 check/commit 可能撞车)。")
             return None
-        raise
-    return res.data or []
+        else:
+            if tag == "001" and len(attempts) > 1:
+                _rpc_missing_telemetry_commit_narrow()
+            return res.data or []
+    return None
+
+
+def _rpc_missing_telemetry_commit_narrow() -> None:
+    """回退到 4 参旧版时埋一行点。静默降级最怕的就是没人知道它降级了。"""
+    try:
+        import telemetry
+        telemetry.log_event("deskcore_rpc_signature_old",
+                            rpc="deskcore_commit_fingerprints",
+                            hint="跑 migrations/005_deskcore_containment.sql")
+    except Exception:
+        pass
 
 
 # ── 个人调校笔记 / 精修 diff(私有层) ──────────────────────────────────────

@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+from typing import NamedTuple
 
 import config
 import db
@@ -47,6 +48,72 @@ verdict = fp.verdict
 
 def sb():
     return store.client()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 归属校验(审计 COR-015)
+# ══════════════════════════════════════════════════════════════════════
+
+class ProjectNotFound(ValueError):
+    """project_id 在库里没有这一行。多半是 id 抄错, 不是权限问题。
+
+    与 PermissionError 分开是有意的: 「不存在」和「不是你的」对调用方是两种
+    完全不同的下一步(改 id / 换项目), 混成一种会让人反复试同一个错 id。
+    """
+
+
+def assert_project_access(client, project_id: str, *,
+                          user_id: str | None) -> dict:
+    """**整套项目归属校验的唯一实现**。通过则返回项目整行。
+
+    审计 COR-015: 在此之前 deskcore 对 project_id 【没有任何归属校验】——
+    ``check_drafts`` / ``borrow_lessons`` / ``list_projects`` 连调用者是谁都不问,
+    其余工具虽然拿到了 user_id 却只用它读个人层, 从不核对项目归谁。于是任一
+    持有效 key 的调用方传入他人 project_id 就能:
+
+      · 读他人项目的全部成稿标题(``check_drafts`` 的 ``collided_with`` 会回显);
+      · 往他人项目写指纹、写角度台账、写团队共享的 hard 规则。
+
+    ``deskcore/store.py`` 原来明写着"不按 owner 过滤"是设计选择(项目规则团队
+    共享)。本条指出的不是那个选择本身错, 而是它的代价: 整套隔离就只剩 key 这
+    一层, 而 key 这一层有 ROB-003(配错就全开)。产品决策已定 —— **按
+    ``projects.owner_id`` 隔离**, 读写两侧都校验。
+
+    ── 为什么收敛成一个函数 ──────────────────────────────────────────
+    归属口径是**产品决策**, 会变(今天按 owner, 明天可能按团队成员表)。散在十
+    一个工具里就意味着改口径要改十一处, 而漏掉的那处不会报错, 只会继续放行。
+    所以: 判据只写在这里, 将来换模型**只改这个函数体** —— 加一张
+    ``project_members`` 表就是把下面那个 ``!=`` 换成一次成员查询, 调用方一行不动。
+
+    ── 为什么 user_id 缺失是拒绝而不是放行 ────────────────────────────
+    与 ROB-003 同一口径: 身份识别不出来时, "放行"意味着一个配置疏忽就等于把
+    全部租户的项目数据开放出去。匿名 dev 模式(``DESKCORE_ALLOW_ANONYMOUS=1``)
+    要能用就得同时配 ``DESKCORE_DEFAULT_USER_ID`` —— 那本来就是它该配的东西
+    (identity.py 的 ``resolve`` 就是这么回的), 否则个人层(正负例/调校笔记)一样
+    读不出东西。
+    """
+    if not project_id or not str(project_id).strip():
+        raise ProjectNotFound("project_id 不能为空")
+    if not user_id:
+        raise PermissionError(
+            "无法识别调用者身份, 拒绝访问项目数据 —— deskcore 持 service_role "
+            "绕过 RLS, 认不出人就等于对所有租户开放。服务端要配 DESKCORE_KEYS "
+            "(推荐)或 DESKCORE_API_KEY + DESKCORE_DEFAULT_USER_ID; 本地匿名 dev "
+            "模式也要配 DESKCORE_DEFAULT_USER_ID。")
+
+    project = store.project_row(client, project_id)
+    if project is None:
+        raise ProjectNotFound(f"project not found: {project_id}")
+
+    # ↓↓↓ 换归属模型时【只改这三行】↓↓↓
+    owner = project.get("owner_id")
+    if str(owner or "") != str(user_id):
+        raise PermissionError(
+            f"project {project_id} 不属于当前调用者, 拒绝访问。"
+            "deskcore 按 projects.owner_id 隔离 —— 项目规则在同一 owner 的项目"
+            "之间共享, 跨 owner 不共享。project_id 是不是传错了?")
+    # ↑↑↑ 换归属模型时【只改这三行】↑↑↑
+    return project
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -105,9 +172,9 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     唯一改动的语义(隔离口径: 项目规则团队共享 + 个人风格私有)。
     """
     brief = brief or {}
-    project = db.get_project(client, project_id)
-    if project is None:
-        raise ValueError(f"project not found: {project_id}")
+    # 归属校验 + 取项目行一次搞定 —— 这里本来就要 db.get_project, 所以 COR-015
+    # 的校验在这条路径上【不多发一次查询】。
+    project = assert_project_access(client, project_id, user_id=user_id)
 
     hard, soft = store.shared_memories(client, project_id, user_id)
     pool = store.labeled_examples(client, project_id, "positive", user_id)
@@ -219,11 +286,12 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     LLM 会锁定更具体的平台标签、把项目的 role 降级成"风格提示"。修法照注释里
     留的那条路: **切入角度优先用项目自己的 custom_roles**, 没配才用通用池。
     """
+    # 归属校验放在 n<=0 的早返回【之前】: 每个项目级入口都以这一行开头, 才能在
+    # CI 里用一条断言把"有没有漏掉某个工具"验死。代价是 n=0 时多一次查询,
+    # 而 n=0 本来就是退化调用。(审计 COR-015)
+    project = assert_project_access(client, project_id, user_id=user_id)
     if n <= 0:
         return {"angles": [], "requested": 0, "delivered": 0}
-    project = db.get_project(client, project_id)
-    if project is None:
-        raise ValueError(f"project not found: {project_id}")
 
     custom = project.get("custom_roles") or []
     if isinstance(custom, str):
@@ -358,13 +426,29 @@ def render_angles_block(angles: list[dict]) -> str:
 # ══════════════════════════════════════════════════════════════════════
 
 
+class HistHit(NamedTuple):
+    """一篇草稿与历史比对的**逐信号**最佳命中。
+
+    每一路各记各的 —— 各路的最佳命中可能来自不同的历史稿, 混在一起报会让人
+    对着一条根本没引发拒绝的稿子去改(codex review 记过这一条)。
+    ``*_title`` 为 None 表示这一路没有命中(不是"命中了一条空标题")。
+    """
+    sim: float
+    sim_title: str | None
+    jac: float
+    j_title: str | None
+    open_exact: bool
+    open_title: str | None
+    contain: float                 # 审计 COR-014
+    contain_title: str | None
+    contain_sample: int            # 有效样本量, 低于阈值时这一路不发言
+
+
 def _history_probe(client, project_id: str, o_hashes: list[str],
                    grams: list[set], new_vecs):
     """返回 ``(probe, hist_size, hist_with_vec, hist_truncated)``。
 
-    ``probe(i)`` → ``(best_sim, sim_title, best_j, j_title, exact, open_title)``
-    —— 第 i 篇草稿与【历史】比对的三路最佳命中。title 为 None 表示这一路没有
-    命中(不是"命中了一条空标题")。
+    ``probe(i)`` → ``HistHit`` —— 第 i 篇草稿与【历史】比对的四路最佳命中。
 
     两条实现共用这一个形状:
 
@@ -389,7 +473,9 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
         }
         for i in range(len(o_hashes))
     ]
-    rows = store.check_drafts_sql(client, project_id, payload)   # 故意让异常冒泡
+    # 阈值只在 fingerprint.py 里定义一处 —— SQL 里的 DEFAULT 只是兜底。
+    rows = store.check_drafts_sql(client, project_id, payload,   # 故意让异常冒泡
+                                  contain_min_sample=fp.CONTAIN_MIN_SAMPLE)
     if rows is not None:
         by_idx = {int(r.get("idx", -1)): r for r in rows}
         # ⚠️ 回执必须每篇一行。少一行就意味着那一篇【根本没比过】, 而下面
@@ -402,7 +488,7 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                 f"(idx={missing[:5]}) —— 拒绝按'没撞车'放行")
         total, with_vec = store.fingerprint_stats(client, project_id)
 
-        def _probe(i: int):
+        def _probe(i: int) -> HistHit:
             r = by_idx.get(i) or {}
             # NUMERIC 在 PostgREST 上可能回数字也可能回字符串, float() 两种都吃。
             # open_exact 不看它自己的布尔值而是看 open_title 有没有 ——
@@ -410,13 +496,22 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             # opening_exact 是**单独就判死**的最强信号, 没有任何东西兜得住
             # 这个误伤。RPC 里那一列本来就是 `open_title IS NOT NULL` 算出来的,
             # 这么取口径完全一致, 只是不依赖布尔的传输形态。
-            return (
+            #
+            # ⚠️ best_c / c_title / c_sample 是 migrations/005 加的。老版本 RPC
+            # (只跑过 004)回不出这三列 —— 取不到就当**这一路没跑**(sample=0,
+            # 于是 deciding_signals 里 contain_ok 为 False, 包含度不发言),
+            # 而不是当成"包含度为 0 = 没撞车"。两者的差别在下面的
+            # contain_pushdown_missing 里报给调用方。(审计 COR-014)
+            return HistHit(
                 float(r.get("best_sim") or 0.0),
                 r.get("sim_title"),
                 float(r.get("best_j") or 0.0),
                 r.get("j_title"),
                 r.get("open_title") is not None,
                 r.get("open_title"),
+                float(r.get("best_c") or 0.0),
+                r.get("c_title"),
+                int(r.get("c_sample") or 0),
             )
 
         # 下推路径比的是【全量】—— 库里没有 4000 条那个上限, 所以永不截断。
@@ -433,7 +528,7 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
     hist_vecs = [h.get("title_embedding") for h in history]
     with_vec = sum(1 for v in hist_vecs if v)
 
-    def _probe_py(i: int):
+    def _probe_py(i: int) -> HistHit:
         best_sim, sim_hit = 0.0, None
         if new_vecs and i < len(new_vecs):
             for hi, emb in enumerate(hist_vecs):
@@ -443,16 +538,32 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                 if s > best_sim:
                     best_sim, sim_hit = s, history[hi]
         best_j, j_hit = 0.0, None
+        best_c, c_hit, c_sample = 0.0, None, 0
         for hi, hg in enumerate(hist_grams):
-            j = fp.jaccard(grams[i], hg)
+            # ⚠️ 两边都是 bottom-k **sketch**, 不是完整 gram 集 —— 必须走
+            # sketch_overlap, 直接 fp.jaccard 会系统性偏低(审计 COR-014)。
+            j, c, s = fp.sketch_overlap(grams[i], hg)
             if j > best_j:
                 best_j, j_hit = j, history[hi]
+            # 包含度**单独记它自己的最佳命中**: 抄袭源和"用词最像的那篇"经常
+            # 不是同一条, 归错了人会对着无关的稿子改。
+            #
+            # ⚠️ 样本量的判据必须在**取最大之前**。原来是先按 c 取冠军、事后
+            # 才看冠军的样本量够不够 —— 一条毫不相关、只跟本稿撞上一个低位
+            # hash 的历史稿能拿到 c=1.0 / 样本量=1, 压过真正的抄袭源
+            # (c=0.9 / 样本量>=15); 冠军随后因样本量不足被丢掉, 而真命中
+            # 根本没进过决赛, 于是照搬长稿的稿子**两道闸都放行**。
+            # SQL 侧(migrations/005 的 cbest 与 commit 的 LOOP)同一口径。
+            if s >= fp.CONTAIN_MIN_SAMPLE and c > best_c:
+                best_c, c_hit, c_sample = c, history[hi], s
         open_hit = hist_open.get(o_hashes[i]) if o_hashes[i] else None
-        return (
+        return HistHit(
             best_sim, (sim_hit or {}).get("title", "") if sim_hit else None,
             best_j, (j_hit or {}).get("title", "") if j_hit else None,
             open_hit is not None,
             (open_hit or {}).get("title", "") if open_hit else None,
+            best_c, (c_hit or {}).get("title", "") if c_hit else None,
+            c_sample,
         )
 
     return _probe_py, len(history), with_vec, truncated
@@ -469,13 +580,19 @@ def _rpc_missing_telemetry(name: str, project_id: str) -> None:
         pass
 
 
-def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
+def check_drafts(client, project_id: str, drafts: list[dict],
+                 *, user_id: str | None = None) -> dict:
     """比对全量历史 + 本批内互比。
 
     ⚠️ deskcore 唯一【不 fail-open】的路径。其它读类工具出错返回可用结构不阻塞
     写稿, 但查重挂了必须抛 —— 静默放行就是重演 config.py:132 那个
     ENABLE_DEDUP_REGEN 默认 "0"、查重跑了但不拦的老问题。
+
+    ⚠️ 这是审计 COR-015 里【读侧最要命的那个】: 返回值的 ``collided_with`` 会回显
+    撞车对象的**标题**。没有归属校验时, 拿一篇随便什么稿子去撞别人的项目, 就是
+    一个可以反复调用的历史标题读取接口。所以 user_id 现在是必需的。
     """
+    assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
         return {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
 
@@ -487,7 +604,7 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
     new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
 
     # ── 与历史比对: 优先下推到库里(审计 SUP-002 / ROB-004 / ROB-011)──────
-    # ``hist`` 是一个「按 i 取三路最佳命中」的可调用对象, 两条路径共用同一个
+    # ``hist`` 是一个「按 i 取四路最佳命中」的可调用对象, 两条路径共用同一个
     # 形状, 下面拼 verdict 的代码因此完全不用分叉。
     hist, hist_size, hist_with_vec, hist_truncated = _history_probe(
         client, project_id, o_hashes, grams, new_vecs)
@@ -506,8 +623,12 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
                        project_id, bool(new_vecs), hist_with_vec, hist_size)
 
     results = []
+    contain_ran = False          # 有没有任何一篇真的跑过包含度这一路
     for i in range(len(drafts)):
-        best_sim, sim_hit, best_j, j_hit, exact, open_hit = hist(i)
+        h = hist(i)
+        best_sim, sim_hit, best_j, j_hit, exact, open_hit = (
+            h.sim, h.sim_title, h.jac, h.j_title, h.open_exact, h.open_title)
+        best_c, c_hit, c_sample = h.contain, h.contain_title, h.contain_sample
 
         # ⚠️ 每个信号的最佳命中【各记各的】, 且各自记清楚是本批内还是历史。
         # 原来共用一个 intra 变量, 只要任一信号的最佳命中来自本批内就无条件
@@ -518,6 +639,7 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
         sim_best = (sim_hit or "", "历史") if sim_hit is not None else None
         j_best = (j_hit or "", "历史") if j_hit is not None else None
         open_best = (open_hit or "", "历史") if open_hit is not None else None
+        c_best = (c_hit or "", "历史") if c_hit is not None else None
 
         for k in range(i):   # 本批内互比: 同批两篇撞车同样要拦
             # o_hashes[i] 为空 = 这篇没有正文开头。空 == 空【不算撞车】——
@@ -526,23 +648,31 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
             if o_hashes[i] and o_hashes[i] == o_hashes[k]:
                 exact, open_best = True, (titles[k], "本批内")
                 break
-            jj = fp.jaccard(grams[i], grams[k])
+            # 同上: 本批内两篇也都是 sketch, 而且同一批里长短稿并存很常见
+            # (一篇 300 字的短图文 + 一篇 1500 字的长测评)。(审计 COR-014)
+            jj, cc, ss = fp.sketch_overlap(grams[i], grams[k])
             if jj > best_j:
                 best_j, j_best = jj, (titles[k], "本批内")
+            # 样本量先过闸再比大小 —— 与上面对历史稿那一路同一条理由。
+            if ss >= fp.CONTAIN_MIN_SAMPLE and cc > best_c:
+                best_c, c_best, c_sample = cc, (titles[k], "本批内"), ss
             if new_vecs:
                 s = dedup.cosine_similarity(new_vecs[i], new_vecs[k])
                 if s > best_sim:
                     best_sim, sim_best = s, (titles[k], "本批内")
 
-        status, reason, which = fp.deciding_signals(best_sim, exact, best_j)
-        by_signal = {"opening": open_best, "title": sim_best, "ngram": j_best}
+        contain_ran = contain_ran or c_sample >= fp.CONTAIN_MIN_SAMPLE
+        status, reason, which = fp.deciding_signals(
+            best_sim, exact, best_j, best_c, c_sample)
+        by_signal = {"opening": open_best, "title": sim_best,
+                     "ngram": j_best, "contain": c_best}
         # 按 verdict 实际依据的信号取命中; 两个弱信号并列时取第一个(它排在
         # reason 的最前面, 与用户读到的解释对得上)。pass 时没有依据信号,
         # 退回"最强的那个"只为让人知道最接近的是什么, 并注明是参考。
         hit = next((by_signal[s] for s in which if by_signal.get(s)), None)
         informational = False
         if hit is None:
-            hit = open_best or sim_best or j_best
+            hit = open_best or sim_best or j_best or c_best
             informational = hit is not None
         collided, scope = hit if hit else ("", "")
         row = {
@@ -552,7 +682,12 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
             "decided_by": which,
             "signals": {"title_similarity": round(best_sim, 4),
                         "opening_exact_match": exact,
-                        "body_ngram_jaccard": round(best_j, 4)},
+                        "body_ngram_jaccard": round(best_j, 4),
+                        # 审计 COR-014。sample 一并报出去 —— 它低于
+                        # CONTAIN_MIN_SAMPLE 时 containment 这个数字**没有参考
+                        # 价值**, 不报的话看的人会拿一个纯噪声当结论。
+                        "body_ngram_containment": round(best_c, 4),
+                        "containment_sample": c_sample},
         }
         if informational:
             row["collided_note"] = ("这条判定为通过, collided_with 只是最接近的"
@@ -569,7 +704,18 @@ def check_drafts(client, project_id: str, drafts: list[dict]) -> dict:
         "history_missing_embedding": hist_missing_vec,
         "history_truncated": hist_truncated,
         "semantic_degraded": degraded,
+        "containment_checked": contain_ran,
     }
+    if hist_size and not contain_ran:
+        # 审计 COR-014: 包含度这一路一次都没真的发言。两种可能, 都要说出来 ——
+        # 静默不发言正是这条 finding 本身的形态(有个信号没跑, 而返回值看起来
+        # 一切正常)。
+        summary["containment_skipped_warning"] = (
+            "「短稿照搬长稿」这一路本次没有生效: 要么草稿太短、与历史稿的长度差"
+            "太大, 有效样本量不够(低于 "
+            f"{fp.CONTAIN_MIN_SAMPLE} 就不发言, 免得噪声误杀); 要么服务端只跑了 "
+            "migrations/004 而没跑 005(老版 RPC 回不出包含度)。"
+            "另外三路照常跑了, 但整段照搬一篇长稿的重复可能漏掉 —— 要告诉用户。")
     if hist_truncated:
         # history_size 报的是【实际比过的条数】, 但项目的历史比这更多。
         # 不说出来的话, "比对全量历史" 就成了一句假话。
@@ -609,6 +755,16 @@ def _placeholder_version_id(seed: str) -> str:
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
+# deskcore_commit_fingerprints 成功那一支返回的 status。**改这个字面量等于改
+# 一份跨语言契约**: SQL 侧写什么、这里数什么, 必须是同一个词。
+#
+# 之所以要给它一个名字: migrations/005 曾把 SQL 侧从 'inserted' 改成 'written',
+# 而这边照旧只数 'inserted' —— 后果不是报错, 是每次成功入库都报 written=0、
+# 角度台账一条都不销账(于是同一个坐标可以被无限次抽到)。全程没有任何异常。
+# 现在 tests/sql_parity_check.py 拿这个常量去比对 SQL 的真实返回值。
+COMMIT_STATUS_INSERTED = "inserted"
+
+
 def commit_drafts(client, project_id: str, drafts: list[dict],
                   *, user_id: str | None = None) -> dict:
     """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
@@ -620,6 +776,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     写入的同一个事务里关掉。被判撞车的条目【不入库】, 在返回值的 rejected 里
     列出来, 调用方要让用户重写。
     """
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
 
@@ -654,13 +811,18 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         })
 
     outcome = store.commit_fingerprints_atomic(
-        client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD)
+        client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD,
+        # 阈值只在 fingerprint.py 里定义一处 —— SQL 里的 DEFAULT 只是兜底,
+        # 真正生效的是这里传下去的值。两边写死两份就迟早对不上。(审计 COR-014)
+        contain_hard=fp.NGRAM_CONTAIN_HARD,
+        contain_min_sample=fp.CONTAIN_MIN_SAMPLE)
 
     atomic = outcome is not None
     rejected: list[dict] = []
     if atomic:
         by_idx = {o["idx"]: o for o in outcome}
-        written = sum(1 for o in outcome if o.get("status") == "inserted")
+        written = sum(1 for o in outcome
+                      if o.get("status") == COMMIT_STATUS_INSERTED)
         for o in outcome:
             if o.get("status") == "rejected":
                 rejected.append({
@@ -685,7 +847,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         written = store.write_fingerprints(client, payload)
 
     # 只给真的入了库的坐标销账 —— 被拒的那条角度还没产出成稿, 不该占坑。
-    inserted_idx = ({o["idx"] for o in outcome if o.get("status") == "inserted"}
+    inserted_idx = ({o["idx"] for o in outcome
+                     if o.get("status") == COMMIT_STATUS_INSERTED}
                     if atomic else set(range(len(drafts))))
     consumed = 0
     attempted = 0
@@ -737,6 +900,11 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
                          progress=None) -> dict:
     """给指纹库里缺标题向量的行补上向量。
 
+    ⚠️ 【故意没有归属校验】(审计 COR-015)。它和 backfill 一样不是 MCP 工具 ——
+    只有 CLI 能调, 而跑 CLI 的人手里握着 service_role key(等价于直连库)。在这儿
+    加一道 owner 校验挡不住任何人, 只会挡住"帮同事补一下向量"这类正当运维,
+    还会给人一种"运维路径也隔离了"的错觉。隔离边界在 MCP/REST 那一面。
+
     **和 backfill 是两件事, 别混。** backfill 把 autowriter.versions 里的历史
     成稿【搬进】指纹库; reembed 修的是【已经在指纹库里、但当时没取到向量】的行。
     后者 backfill 够不着 —— 它扫的是 items × versions, 而 WorkBuddy 写的稿子
@@ -779,9 +947,69 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
     return out
 
 
+def recompute_fingerprints(client, project_id: str, *, progress=None) -> dict:
+    """按**当前的** ``normalize`` 口径重算确定性指纹。审计 COR-014 的后续。
+
+    ⚠️ 什么时候需要跑: 只在 ``fingerprint.normalize`` 的口径变了之后。存量指纹的
+    ``opening_hash`` / ``ngram_hashes`` 是用**当时**的口径算的 —— 口径一变, 新稿
+    算出来的四字串就和历史对不上, 查重在过渡期反而更弱, 而且**不报错**。
+    ``backfill`` 补不了这个: 它按 ``version_id`` 幂等跳过, 只管"没有的行", 不重算
+    已有的行。
+
+    ── 能重算到什么程度 ──────────────────────────────────────────────────
+    指纹表**不存正文**(只有 ``title`` 和 ``opening`` 前 25 字), 所以:
+
+      · ``opening_hash`` —— **每一行都能重算**。它本来就是
+        ``sha16(normalize(opening))``, 而 ``opening`` 原样存着。这一路是
+        "单独就判死"的最强信号, 能全修回来是关键。
+      · ``ngram_hashes`` —— 只有 ``version_id`` 非空的行能重算(正文在
+        ``autowriter.versions`` 里)。WorkBuddy 经 ``commit_drafts`` 写进来的行
+        ``version_id`` 是空的, **正文已经不存在了**, 这一路修不回来。
+
+    返回值里的 ``ngram_unrecoverable`` 就是修不回来的行数。**它不为 0 就要告诉
+    用户**: 那些行的四字串仍然是旧口径, 与新稿比对会偏低。想彻底修只能把那些
+    稿子重新 commit 一遍。
+
+    幂等: 重复跑是同一个结果(纯函数重算), 只是白写一遍。
+    """
+    total = recomputed = unrecoverable = 0
+    for page in store.fingerprint_pages(client, project_id):
+        need_body = [r for r in page if r.get("version_id")]
+        bodies = (store.version_bodies(client, [r["version_id"] for r in need_body])
+                  if need_body else {})
+        for row in page:
+            total += 1
+            new_open = fp.sha16(fp.normalize(row.get("opening") or "")) \
+                if (row.get("opening") or "").strip() else ""
+            vid = row.get("version_id")
+            body = bodies.get(str(vid)) if vid else None
+            if body:
+                new_grams = fp.ngram_hashes(body)
+            else:
+                new_grams = None
+                unrecoverable += 1
+            store.update_fingerprint_hashes(
+                client, row["id"], opening_hash=new_open, ngram_hashes=new_grams)
+            recomputed += 1
+        if progress:
+            progress(recomputed, total)
+
+    out = {"scanned": total, "rewritten": recomputed,
+           "ngram_unrecoverable": unrecoverable}
+    if unrecoverable:
+        out["warning"] = (
+            f"{unrecoverable}/{total} 行的正文已经不在库里(version_id 为空, "
+            "多半是 WorkBuddy 经 commit_drafts 写进来的), 四字串那一路**没能重算** "
+            "—— 它们仍是旧的规范化口径, 与新稿比对会偏低。开头指纹已全部修好。"
+            "要彻底修只能把那些稿子重新 commit 一遍。")
+    return out
+
+
 def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = True,
                           chunk: int = 50, progress=None) -> dict:
     """把项目的历史成稿补进指纹库。**部署后每个项目必跑一次。**
+
+    ⚠️ 【故意没有归属校验】—— 理由同 reembed_fingerprints, 见那边。
 
     为什么必须有: migrations/001 建的是【空表】, 而 check_drafts 只读这张表、
     只有 commit_drafts 会往里写。不回填的话, 上线第一天号称"比对全量历史"的
@@ -926,6 +1154,10 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     force_confirmed=True: 这条路径是用户明确说「以后都这样」才走的, 不需要
     频次阈值(那是给自动抽取的候选留人工复核用的)。
     """
+    # 审计 COR-015。scope='global' 时 project_id 其实不参与写入, 但照样校验 ——
+    # 规则是"每个项目级入口都以这一行开头", 留例外就等于留一个以后会被忘掉的
+    # 缺口, 而这里的代价只是一次主键查询。
+    assert_project_access(client, project_id, user_id=user_id)
     content = (content or "").strip()
     if not content:
         raise ValueError("rule content must not be empty")
@@ -987,6 +1219,7 @@ def record_edit(client, project_id: str, *, user_id: str,
     对子。没改就通过的稿子【不算教学材料】—— memory.py:1191-1194 明确拒绝从
     那里学, 理由是模型会从偶然选择里编造风格规则。
     """
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not (my_title or my_body):
         raise ValueError("my_title/my_body must not both be empty")
     if ((ai_title or "").strip() == (my_title or "").strip()
@@ -1081,6 +1314,7 @@ def save_my_style(client, project_id: str, notes: str, *, user_id: str,
     笔记【不等于】吸收了那些待处理的精修, 顺手把它们标掉会让它们静默消失。
     (codex review #56 P1)
     """
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     notes = (notes or "").strip()
     if not notes:
         raise ValueError("notes 不能为空 —— 空笔记会把已有的个人风格清掉")
@@ -1139,7 +1373,8 @@ def label_example(client, item_id: str, label: str | None,
 
 def my_style(client, project_id: str, *, user_id: str) -> dict:
     """我在这个项目上的风格资产。"""
-    project = db.get_project(client, project_id)
+    # 校验 + 取行一次搞定(原来这里就要 get_project)。审计 COR-015
+    project = assert_project_access(client, project_id, user_id=user_id)
     shared = (project or {}).get("calibration_notes") or ""
     mine, updated = store.get_user_calibration(client, project_id, user_id)
     pending = store.count_pending_distillation(client, project_id, user_id)
@@ -1178,23 +1413,31 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
 # 飞轮经验卡(转调 TV 馆员)
 # ══════════════════════════════════════════════════════════════════════
 
-def borrow_lessons(client, project_id: str, **delta) -> dict:
+def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
+                   **delta) -> dict:
     """复用 librarian_client 的 build_brief + fetch_flywheel_lessons(R-032)。
 
     那边已经处理好 fail-open(超时/非 200/未配 → [], 绝不阻塞写稿)和 brief 的
     字段集对齐(docs/15 §0 契约)。这里只做项目查询 + 转发。
+
+    ⚠️ 借来的经验卡本身是公司公共资产, 但**发给馆员的 brief 是拿项目行拼的**
+    (品牌 / 定位 / 战术), 所以入口照样要校验归属 —— 否则它就成了一个"用别人的
+    project_id 就能读出那个项目怎么定位"的接口。(审计 COR-015)
     """
-    project = db.get_project(client, project_id)
-    if project is None:
-        raise ValueError(f"project not found: {project_id}")
+    project = assert_project_access(client, project_id, user_id=user_id)
     brief = librarian_client.build_brief(project, **delta)
     brief["consumer"] = "deskcore"
     selected = librarian_client.fetch_flywheel_lessons(brief)
     return {"lessons": selected, "count": len(selected)}
 
 
-def list_projects(client) -> list[dict]:
-    """项目清单 + 每个项目手上有多少料。
+def list_projects(client, *, user_id: str | None = None) -> list[dict]:
+    """**我的**项目清单 + 每个项目手上有多少料。
+
+    审计 COR-015: 这个清单原来返回**全库所有项目**(名称/品牌/owner_id/规则条数/
+    指纹数), 而且是三个 needs_user=False 的工具之一 —— 也就是任一持有效 key 的
+    调用方都能把整个库的项目台账拉出来, 顺带拿到一批可以喂给其它工具的
+    project_id。现在按 owner 过滤, 判据收在 ``assert_project_access`` 的同一处口径。
 
     审计 SUP-004: 原来每个项目发 2 次查询(规则一次 + 指纹 count 一次), 40 个
     项目 = 81 次往返 —— 而这是模型最常调的第一个工具, 每次开工都要等它。
@@ -1202,10 +1445,15 @@ def list_projects(client) -> list[dict]:
     规则的 **768 维 embedding** 一起拉回来, 而这里只用了两个 len()。
 
     现在是【3 次固定查询】: 项目清单 + 规则批量计数 + 指纹批量计数, 与项目
-    个数无关。指纹计数走 migrations/004 的 RPC(PostgREST 不会 GROUP BY);
+    个数无关(加 owner 过滤不改变这个性质 —— 它只是第一次查询多一个 .eq)。
+    指纹计数走 migrations/004 的 RPC(PostgREST 不会 GROUP BY);
     RPC 没部署时退回逐项目 count —— 慢, 但清单仍然是对的。
     """
-    projects = store.list_all_projects(client)
+    if not user_id:
+        raise PermissionError(
+            "无法识别调用者身份, 不能列项目 —— 清单按 owner 隔离。"
+            "服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID。")
+    projects = store.list_all_projects(client, owner_id=user_id)
     if not projects:
         return []
     pids = [p["id"] for p in projects]

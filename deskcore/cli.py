@@ -3,11 +3,18 @@
 用法:
   python -m deskcore.cli selftest                 ← 不连库不联网, 验查重/发牌/词表
   python -m deskcore.cli health
-  python -m deskcore.cli projects
-  python -m deskcore.cli open  --project <uuid> [--tactic ...] [--user <uuid>]
-  python -m deskcore.cli draw  --project <uuid> -n 20 [--block]
-  python -m deskcore.cli check --project <uuid> --file drafts.json
+  python -m deskcore.cli projects --user <uuid>
+  python -m deskcore.cli open  --project <uuid> --user <uuid> [--tactic ...]
+  python -m deskcore.cli draw  --project <uuid> --user <uuid> -n 20 [--block]
+  python -m deskcore.cli check --project <uuid> --user <uuid> --file drafts.json
   python -m deskcore.cli backfill --project <uuid>   ← 部署时必跑一次
+  python -m deskcore.cli recompute-fingerprints --project <uuid>
+                                                    ← 只在改了 normalize 之后跑
+
+⚠️ ``--user`` 从可选变成必填(审计 COR-015): 归属校验在 core 层, CLI 与 MCP 走
+同一个函数, 不带身份的调用现在一律被拒。传的是 ``projects.owner_id`` 里【已有的】
+那个 UUID —— 与 DESKCORE_KEYS 里配的是同一个, 别新造。
+backfill / reembed 没有 ``--user``: 见 main() 里那段说明。
 """
 
 from __future__ import annotations
@@ -133,9 +140,9 @@ def selftest() -> int:
     truth = fp.jaccard(_all_grams(_long), _all_grams(_edited))     # 不截断的地面真值
     est = fp.jaccard(set(fp.ngram_hashes(_long)), set(fp.ngram_hashes(_edited)))
     n_full = len(_all_grams(_long))
-    print(f"\nn-gram 截断稳定性（{n_full} grams，远超 cap=200）:")
+    print(f"\nn-gram 截断稳定性（{n_full} grams，远超 cap={fp.NGRAM_CAP}）:")
     print(f"  地面真值 J={truth:.3f}   截断后估计 J={est:.3f}   偏差 {abs(truth - est):.3f}")
-    if n_full <= 200:
+    if n_full <= fp.NGRAM_CAP:
         print("  ✗ 测试文本没超过 cap，没测到截断路径")
         ok = False
     elif abs(truth - est) > 0.15:
@@ -183,19 +190,27 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("selftest", help="不连库验查重/发牌/词表")
     sub.add_parser("health", help="回显配置与依赖可用性")
-    sub.add_parser("projects", help="列项目")
+
+    # ⚠️ 审计 COR-015 之后, 凡是走 MCP 工具那条路的子命令都要 --user: 归属校验
+    # 在 core 层, CLI 和 MCP 走的是同一个函数, 不带身份一样会被拒。
+    # backfill / reembed **刻意不要** —— 它们不是工具, 是运维命令, 跑它们的人
+    # 手里已经握着 service_role key(等价于直连库), 在这儿加一道校验只会挡住
+    # "帮同事补一下指纹"这类正当操作, 换不到任何隔离(能跑 CLI 的人本来就能
+    # psql)。安全边界在 MCP/REST 那一面, 不在这儿。
+    p = sub.add_parser("projects", help="列项目(仅 --user 名下)")
+    p.add_argument("--user", required=True)
 
     p = sub.add_parser("open", help="打开项目, 打印完整写作简报")
     p.add_argument("--project", required=True)
     p.add_argument("--tactic", default="")
     p.add_argument("--topic", default="")
-    p.add_argument("--user", default=None)
+    p.add_argument("--user", required=True)
 
     p = sub.add_parser("draw", help="发牌")
     p.add_argument("--project", required=True)
     p.add_argument("-n", type=int, default=10)
     p.add_argument("--avoid-days", type=int, default=30)
-    p.add_argument("--user", default=None)
+    p.add_argument("--user", required=True)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--block", action="store_true", help="只打印可贴进 prompt 的坐标块")
 
@@ -208,8 +223,14 @@ def main(argv: list[str] | None = None) -> int:
                        help="给指纹库里【缺标题向量】的行补向量(欠费恢复后跑)")
     p.add_argument("--project", required=True)
 
+    p = sub.add_parser(
+        "recompute-fingerprints",
+        help="按当前 normalize 口径重算确定性指纹(**只在改了 normalize 之后跑**)")
+    p.add_argument("--project", required=True)
+
     p = sub.add_parser("check", help="查重")
     p.add_argument("--project", required=True)
+    p.add_argument("--user", required=True)
     p.add_argument("--file", required=True,
                    help='JSON 文件: [{"title": "...", "body": "..."}, ...]')
 
@@ -230,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sb = core.sb()
     if args.cmd == "projects":
-        _print(core.list_projects(sb))
+        _print(core.list_projects(sb, user_id=args.user))
     elif args.cmd == "open":
         _print(core.build_writing_brief(
             sb, args.project, user_id=args.user,
@@ -256,10 +277,17 @@ def main(argv: list[str] | None = None) -> int:
         def _prog2(done, total):
             print(f"  {done}/{total}", flush=True)
         _print(core.reembed_fingerprints(sb, args.project, progress=_prog2))
+    elif args.cmd == "recompute-fingerprints":
+        def _prog3(done, total):
+            print(f"  已重算 {done} 行 / 已扫描 {total} 行", flush=True)
+        out = core.recompute_fingerprints(sb, args.project, progress=_prog3)
+        _print(out)
+        if out.get("ngram_unrecoverable"):
+            print("\n⚠️ " + out["warning"])
     elif args.cmd == "check":
         with open(args.file, encoding="utf-8") as fh:
             drafts = json.load(fh)
-        _print(core.check_drafts(sb, args.project, drafts))
+        _print(core.check_drafts(sb, args.project, drafts, user_id=args.user))
     return 0
 
 

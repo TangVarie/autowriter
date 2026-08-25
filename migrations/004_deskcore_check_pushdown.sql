@@ -43,6 +43,15 @@
 -- ════════════════════════════════════════════════════════════════════
 
 -- ① 查重比对: 每篇草稿回一行三路信号的最佳命中
+--
+-- ⚠️ 先 DROP 再 CREATE, 不能只写 CREATE OR REPLACE。migrations/005 把这个函数的
+--    返回列从 7 个加到 10 个, 而 000_baseline.sql 里存的是 005 之后那一版 ——
+--    于是"空库 → 000 → 001..005 依序跑一遍"这个流程走到这里会报
+--    `cannot change return type of existing function`。
+--    (OUT 参数不算函数标识的一部分, 所以这个 DROP 对新旧两版都有效。)
+--    这个流程不是假想: migrations/README.md 承诺过"重复执行必须是干净 no-op",
+--    而 tests/sql_parity_check.py 每次 CI 都会真跑一遍来验这句话。
+DROP FUNCTION IF EXISTS autowriter.deskcore_check_drafts(UUID, JSONB);
 CREATE OR REPLACE FUNCTION autowriter.deskcore_check_drafts(
     _project_id UUID,
     -- [{opening_hash, ngram_hashes, title_embedding}, ...]

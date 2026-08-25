@@ -81,6 +81,8 @@ description: 帆谷/BYWOOD 小红书种草文案的【写作台协议】。凡�
 
 只有 `list_projects` / `borrow_lessons` / `my_style` 三个在出错时返回带 `error` 的降级结果——它们拿不到只是少点参考，可以继续写。
 
+**例外：403 / "不属于当前调用者" 不在降级范围内。** 那不是"这次没拿到"，是 `project_id` 传错了或者这个项目不归你——重试一万次也一样。`list_projects` 里看不到的项目就是不归你，**不要猜别人的 `project_id` 去试**。看到这类报错就停下来问用户要对的 `project_id`。
+
 如果 `check_drafts` 的 summary 带了 `empty_history_warning`，说明这个项目还没回填历史指纹，本次只在本批内部比过。要如实告诉用户，别说成"跟历史比过了没撞车"。
 
 ### 三、收反馈
