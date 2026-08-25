@@ -61,3 +61,50 @@ def test_not_found_and_denied_are_not_the_same_status(client, monkeypatch):
     b = client.post("/tool/check_drafts", json={}, headers=AUTH).status_code
     assert a != b, f"两者都是 {a} —— 分了异常却没分状态码"
     assert 400 <= a < 500 and 400 <= b < 500, (a, b)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# live / ready 必须分开（跨库审计 2026-08-24 ROB-005）
+# ══════════════════════════════════════════════════════════════════════
+
+def _force_health(monkeypatch, ok: bool):
+    """把健康计算按住, 只留下 ok 这一个变量。
+
+    不去真的打库 —— 这几条测的是"状态码怎么跟着 ok 走", 不是"探测准不准"。
+    """
+    async def _fake():
+        return {"ok": ok, "service": "deskcore", "config": {}}
+    monkeypatch.setattr(A, "_collect_health", _fake)
+
+
+def test_health_is_liveness_and_stays_200_even_when_degraded(monkeypatch, client):
+    """``/health`` 是 liveness, 残废时也必须 200。
+
+    它是 railway.json 的 healthcheckPath, 而 Railway 对健康检查失败的反应是
+    **重启容器**。库瞬断重启一遍既治不好也救不回来, 只会变成重启风暴。
+    这条断言的是**被禁止的形态**（跟着 ok 变码），不是当前写法。
+    """
+    _force_health(monkeypatch, ok=False)
+    r = client.get("/health")
+    assert r.status_code == 200, "liveness 跟着 ok 变码了 —— 会引发重启风暴"
+    assert r.json()["ok"] is False, "200 不代表可以谎报 ok"
+
+
+def test_ready_is_503_when_not_ok(monkeypatch, client):
+    """``/ready`` 不 ready 就必须是 503, 否则编排摘不掉流量。"""
+    _force_health(monkeypatch, ok=False)
+    assert client.get("/ready").status_code == 503
+
+
+def test_ready_is_200_when_ok(monkeypatch, client):
+    _force_health(monkeypatch, ok=True)
+    r = client.get("/ready")
+    assert r.status_code == 200 and r.json()["ok"] is True
+
+
+def test_both_endpoints_report_the_same_ok(monkeypatch, client):
+    """两个端点的 body 必须来自同一份计算 —— 各算一次迟早判据写岔。"""
+    for ok in (True, False):
+        _force_health(monkeypatch, ok=ok)
+        assert client.get("/health").json()["ok"] is ok
+        assert client.get("/ready").json()["ok"] is ok

@@ -127,10 +127,19 @@ app = FastAPI(title="deskcore · 写作台内核", version=VERSION,
               lifespan=_lifespan)
 
 
+# 免鉴权的探针路径。平台的 liveness/readiness 探测**不会**带 key, 所以这两个
+# 必须在这里放行 —— 否则 /ready 一律 401, 编排读到的永远是"不健康"。
+#
+# ⚠️ 它们的返回体是有信息量的(库连通、鉴权配没配、词表校验和)。这是刻意的
+# 取舍: 配错要当场可见。但**不许**再往里加任何业务数据或租户信息 —— 这两条
+# 路径没有调用者身份, 加什么就等于对全世界公开什么。
+_UNAUTHENTICATED_PATHS = frozenset({"/health", "/ready", ""})
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if request.url.path.rstrip("/") in ("/health", ""):
-        return await call_next(request)     # 健康检查不带 key
+    if request.url.path.rstrip("/") in _UNAUTHENTICATED_PATHS:
+        return await call_next(request)     # 健康检查/就绪探测不带 key
     try:
         caller = identity.resolve(_extract_key(request))
     except identity.AuthError as exc:
@@ -229,9 +238,11 @@ async def _probe(fn, fallback):
         return fallback
 
 
-@app.get("/health")
-async def health() -> dict:
-    """回显实际解析到的配置 —— 让配错当场可见。
+async def _collect_health() -> dict:
+    """算出那份健康回显。``/health`` 与 ``/ready`` **共用这一份**。
+
+    分成两个端点但只有一份计算, 是为了让它们不可能漂: 两边各算一次的话,
+    迟早出现"live 说好、ready 说坏"却是因为判据写岔了, 而不是真的状态不同。
 
     ⚠️ 这个回显是【刻意的】: TV docs/19:180-200 记过一次事故, librarian 的模型
     env 变量名配错, 每次 LLM 调用失败被 except 吞掉降级成 [], 外面看永远 200,
@@ -304,14 +315,47 @@ async def health() -> dict:
             # auth_health 把三态分开: 配好了 / 配了但坏了(全 401) / 没配。
             # ROB-003 之后"没配"也是全 401 —— 不再静默放行, 只有显式设了
             # DESKCORE_ALLOW_ANONYMOUS=1 才放行(那时 note 里会写明是 dev 模式)。
-            # 注意 /health 本身仍返 200: Railway 只看状态码, 而库瞬断这种可恢复
-            # 故障不该把整个部署卡住。真正的越权风险已经在 identity.resolve
-            # 那一层 fail-closed 掉了, 不靠状态码兜。
+            # 注意 ``/health`` 本身仍返 200(见该端点的说明); 要一个**状态码**能
+            # 反映 ok 的, 用 ``/ready`` —— 它不 ready 时返 503。
             "auth": {"ok": auth_ok, "note": auth_note},
             "anonymous_allowed": identity.anonymous_allowed(),
             "st_cache_disabled": os.environ.get("AW_DISABLE_ST_CACHE"),
         },
     }
+
+
+@app.get("/health")
+async def health() -> dict:
+    """**liveness** —— 进程还在、路由还通。永远 200。
+
+    为什么它不跟着 ``ok`` 变状态码(这是刻意的, 别顺手改):
+    ``deskcore/railway.json`` 把它配成 healthcheckPath, 而 Railway 对健康检查
+    失败的反应是**重启容器**。库瞬断、Supabase 连接数打满这类可恢复故障, 重启
+    一遍既治不好也救不回来, 只会把一个还能服务一部分请求的实例变成重启风暴。
+
+    要一个能反映"现在能不能好好干活"的**状态码**, 用 ``/ready``。
+    body 里的 ``ok`` 和各项 note 在两个端点上是同一份数据。
+    """
+    return await _collect_health()
+
+
+@app.get("/ready")
+async def ready():
+    """**readiness** —— 库通不通、鉴权配没配好、vendor 词表校验过没有。
+
+    不 ready 时返 **503**(跨库审计 2026-08-24 ROB-005)。这条是给编排/网关用的:
+    ``ok=false`` 却回 200, 平台就会继续把流量送给一个"看着健康、实际残废"的
+    实例, 而用户侧只看到一串失败。
+
+    ⚠️ ``railway.json`` 目前仍指向 ``/health``(liveness)。要不要把
+    healthcheckPath 换成这里, 是**部署行为的变更** —— 换了之后, 部署时如果库
+    刚好不通, 这次发布会判失败而不是上线后带病运行。那是个产品决定, 不在这次
+    改动范围内。
+    """
+    payload = await _collect_health()
+    if payload.get("ok"):
+        return payload
+    return JSONResponse(payload, status_code=503)
 
 
 @app.get("/tools")
