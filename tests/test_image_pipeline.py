@@ -101,3 +101,48 @@ def test_rgba_is_flattened_for_jpeg():
     out, _fmt = IH.compress_image(buf.getvalue(), max_dim=1024)
     assert out
     assert Image.open(io.BytesIO(out)).mode in ("RGB", "RGBA", "P")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SSRF: 本文件不许再出现裸的出站请求
+# ══════════════════════════════════════════════════════════════════════
+
+def test_image_handler_makes_no_bare_outbound_requests():
+    """``image_handler`` 里不许出现 ``requests.get`` / ``httpx.get`` 这类裸调用。
+
+    这里曾经有个 ``url_to_b64``: 拿用户给的 URL 直接 ``requests.get`` 再
+    encode —— 不限 scheme、不挡私网、跟随重定向、先整个读进内存。标准的
+    SSRF sink(云元数据端点、内网探测)兼内存耗尽路径。两次审计各记过一笔。
+
+    它被**删掉**而不是加固，因为全仓一个调用方都没有。这条用例守的是"别再
+    长回来"：下一个需要按 URL 取图的人，会先撞上这条断言，而不是撞上一个
+    看起来能用、实际裸着的旧函数。
+
+    判据刻意是**被禁止的形态**(本模块自己发出站请求)，不是"某个函数还在不
+    在" —— 换个名字、换个库照样管用。真要做，就把请求放到一个有白名单和
+    IP 检查的专门模块里，那时这条断言仍然是对的。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(IH.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    banned_mods = {"requests", "httpx", "urllib", "urllib3", "aiohttp"}
+    banned_verbs = {"get", "post", "put", "patch", "delete", "request",
+                    "urlopen", "urlretrieve"}
+
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if (isinstance(fn, ast.Attribute) and fn.attr in banned_verbs
+                and isinstance(fn.value, ast.Name)
+                and fn.value.id in banned_mods):
+            hits.append(f"{fn.value.id}.{fn.attr} (行 {node.lineno})")
+
+    assert not hits, (
+        f"image_handler 里又出现了裸的出站请求: {hits} —— "
+        "这正是被删掉的 url_to_b64 那条 SSRF 路径。要按 URL 取图, 先做 "
+        "https + 域名白名单 + 解析后 IP 复查 + 不跟随重定向 + 流式大小上限。")
