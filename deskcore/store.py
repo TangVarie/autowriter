@@ -497,7 +497,8 @@ def fingerprint_stats(sb, project_id: str) -> tuple[int, int]:
     return int(total), int(with_vec)
 
 
-def check_drafts_sql(sb, project_id: str, rows: list[dict]) -> list[dict] | None:
+def check_drafts_sql(sb, project_id: str, rows: list[dict],
+                     contain_min_sample: int | None = None) -> list[dict] | None:
     """四路比对下推到库里(审计 SUP-002 / ROB-004 / ROB-011 / COR-014)。
 
     ``rows`` = [{opening_hash, ngram_hashes, title_embedding}, ...]，顺序即
@@ -516,19 +517,37 @@ def check_drafts_sql(sb, project_id: str, rows: list[dict]) -> list[dict] | None
     同一个根因。
 
     ⚠️ 只有"RPC 不存在"才降级。权限错、参数错、库故障一律上抛 —— 查重是硬闸。
+
+    ⚠️ 签名有两版, 与 ``commit_fingerprints`` 同一套路。``_contain_min_sample``
+    是修 Codex 那条 P1 时加的: 样本量必须在**取最大之前**过闸, 而阈值只能在
+    fingerprint.py 里定义一处、传下来。只跑过 004 的库没有这个参数, PostgREST
+    会报"找不到函数" —— 那不是故障, 所以先按 3 参调, 报找不到再按 2 参试一次,
+    两次都找不到才是真的没跑迁移。
     """
     if not rows:
         return []
-    try:
-        res = sb.rpc("deskcore_check_drafts", {
-            "_project_id": project_id,
-            "_rows": rows,
-        }).execute()
-    except Exception as exc:
-        if rpc_missing(exc):
+    base = {"_project_id": project_id, "_rows": rows}
+    attempts = []
+    if contain_min_sample is not None:
+        attempts.append(("005", {**base, "_contain_min_sample": contain_min_sample}))
+    attempts.append(("004", base))
+
+    for n, (tag, args) in enumerate(attempts):
+        try:
+            res = sb.rpc("deskcore_check_drafts", args).execute()
+        except Exception as exc:
+            if not rpc_missing(exc):
+                raise
+            if n + 1 < len(attempts):
+                logger.warning(
+                    "deskcore_check_drafts 没有 migrations/005 那版签名, 回退到 "
+                    "2 参旧版 —— 前三路照常, **包含度那一路不发言**"
+                    "(短稿照搬长稿在 check 这一关拦不住)。跑 migrations/005 修好。")
+                continue
             return None
-        raise
-    return res.data or []
+        else:
+            return res.data or []
+    return None
 
 
 def fingerprint_counts(sb, project_ids: list[str]) -> dict[str, int] | None:

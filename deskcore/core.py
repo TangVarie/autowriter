@@ -473,7 +473,9 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
         }
         for i in range(len(o_hashes))
     ]
-    rows = store.check_drafts_sql(client, project_id, payload)   # 故意让异常冒泡
+    # 阈值只在 fingerprint.py 里定义一处 —— SQL 里的 DEFAULT 只是兜底。
+    rows = store.check_drafts_sql(client, project_id, payload,   # 故意让异常冒泡
+                                  contain_min_sample=fp.CONTAIN_MIN_SAMPLE)
     if rows is not None:
         by_idx = {int(r.get("idx", -1)): r for r in rows}
         # ⚠️ 回执必须每篇一行。少一行就意味着那一篇【根本没比过】, 而下面
@@ -544,9 +546,15 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             if j > best_j:
                 best_j, j_hit = j, history[hi]
             # 包含度**单独记它自己的最佳命中**: 抄袭源和"用词最像的那篇"经常
-            # 不是同一条, 归错了人会对着无关的稿子改。样本量跟着那一条走 ——
-            # 它决定这一路发不发言。
-            if c > best_c:
+            # 不是同一条, 归错了人会对着无关的稿子改。
+            #
+            # ⚠️ 样本量的判据必须在**取最大之前**。原来是先按 c 取冠军、事后
+            # 才看冠军的样本量够不够 —— 一条毫不相关、只跟本稿撞上一个低位
+            # hash 的历史稿能拿到 c=1.0 / 样本量=1, 压过真正的抄袭源
+            # (c=0.9 / 样本量>=15); 冠军随后因样本量不足被丢掉, 而真命中
+            # 根本没进过决赛, 于是照搬长稿的稿子**两道闸都放行**。
+            # SQL 侧(migrations/005 的 cbest 与 commit 的 LOOP)同一口径。
+            if s >= fp.CONTAIN_MIN_SAMPLE and c > best_c:
                 best_c, c_hit, c_sample = c, history[hi], s
         open_hit = hist_open.get(o_hashes[i]) if o_hashes[i] else None
         return HistHit(
@@ -645,7 +653,8 @@ def check_drafts(client, project_id: str, drafts: list[dict],
             jj, cc, ss = fp.sketch_overlap(grams[i], grams[k])
             if jj > best_j:
                 best_j, j_best = jj, (titles[k], "本批内")
-            if cc > best_c:
+            # 样本量先过闸再比大小 —— 与上面对历史稿那一路同一条理由。
+            if ss >= fp.CONTAIN_MIN_SAMPLE and cc > best_c:
                 best_c, c_best, c_sample = cc, (titles[k], "本批内"), ss
             if new_vecs:
                 s = dedup.cosine_similarity(new_vecs[i], new_vecs[k])
@@ -746,6 +755,16 @@ def _placeholder_version_id(seed: str) -> str:
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
+# deskcore_commit_fingerprints 成功那一支返回的 status。**改这个字面量等于改
+# 一份跨语言契约**: SQL 侧写什么、这里数什么, 必须是同一个词。
+#
+# 之所以要给它一个名字: migrations/005 曾把 SQL 侧从 'inserted' 改成 'written',
+# 而这边照旧只数 'inserted' —— 后果不是报错, 是每次成功入库都报 written=0、
+# 角度台账一条都不销账(于是同一个坐标可以被无限次抽到)。全程没有任何异常。
+# 现在 tests/sql_parity_check.py 拿这个常量去比对 SQL 的真实返回值。
+COMMIT_STATUS_INSERTED = "inserted"
+
+
 def commit_drafts(client, project_id: str, drafts: list[dict],
                   *, user_id: str | None = None) -> dict:
     """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
@@ -802,7 +821,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     rejected: list[dict] = []
     if atomic:
         by_idx = {o["idx"]: o for o in outcome}
-        written = sum(1 for o in outcome if o.get("status") == "inserted")
+        written = sum(1 for o in outcome
+                      if o.get("status") == COMMIT_STATUS_INSERTED)
         for o in outcome:
             if o.get("status") == "rejected":
                 rejected.append({
@@ -827,7 +847,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         written = store.write_fingerprints(client, payload)
 
     # 只给真的入了库的坐标销账 —— 被拒的那条角度还没产出成稿, 不该占坑。
-    inserted_idx = ({o["idx"] for o in outcome if o.get("status") == "inserted"}
+    inserted_idx = ({o["idx"] for o in outcome
+                     if o.get("status") == COMMIT_STATUS_INSERTED}
                     if atomic else set(range(len(drafts))))
     consumed = 0
     attempted = 0

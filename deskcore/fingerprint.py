@@ -205,6 +205,23 @@ def sketch_overlap(sa: set[str], sb: set[str]) -> tuple[float, float, int]:
     调用方**必须**拿它当闸: 样本量太小时包含度会剧烈抖动(实测 100 字草稿 vs
     6000 字历史时子域只剩 4 个元素, 完全无关的两篇也能撞出包含度 1.0)。
     见 ``CONTAIN_MIN_SAMPLE``。
+
+    ── Jaccard 也有它自己的样本量下限 ─────────────────────────────────────
+    受限子域这个手法对**两个**指标一视同仁: 子域小到一定程度, 谁都别说话。
+    包含度看 ``min(|a|,|b|)``, Jaccard 看 ``|a ∪ b|`` —— 两者不能混用:
+
+      · 短稿 vs 超长历史稿是**正常形态**(长稿的 sketch 被 NGRAM_CAP 截到最小
+        的 400 个, 它的 max 因此很小, 子域里短稿只剩两三个元素)。这时
+        ``min`` 只有 2-3 而 ``union`` 有 400, Jaccard 估出来接近 0 —— 是对的,
+        拿 ``min`` 去关 Jaccard 会把这条正常路径一起关掉。
+      · 而当**两边**在子域里都只剩一两个元素时(历史稿是条退化行: 正文只有
+        四五个字, 整个 sketch 就一个 hash, 且恰好小于本稿的最小值), union
+        也塌到 1, J 直接算出 1.0 —— 硬闸线是 0.35, 于是**误杀**。
+
+    实测 2550 对无关稿子(短稿 1 句到长稿 2000 句全排列): union 最小 37,
+    没有一对低于 15, J 最大 0.105。所以这个下限在自然形态上一次都不会触发,
+    它只切掉退化区。**沿用 CONTAIN_MIN_SAMPLE 这一个数**, 免得又多一个要
+    跨语言对齐的常量(SQL 侧 migrations/005 的 jbest 是同一条件)。
     """
     if not sa or not sb:
         return 0.0, 0.0, 0
@@ -216,7 +233,7 @@ def sketch_overlap(sa: set[str], sb: set[str]) -> tuple[float, float, int]:
     inter = len(a & b)
     union = len(a | b)
     sample = min(len(a), len(b))
-    return (inter / union if union else 0.0,
+    return (inter / union if union >= CONTAIN_MIN_SAMPLE else 0.0,
             inter / sample if sample else 0.0,
             sample)
 

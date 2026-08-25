@@ -40,6 +40,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from deskcore import fingerprint as fp     # noqa: E402
+from deskcore import core                 # noqa: E402
 
 PGHOST = sys.argv[1] if len(sys.argv) > 1 else "/tmp/awpg"
 PGPORT = sys.argv[2] if len(sys.argv) > 2 else "55432"
@@ -252,6 +253,72 @@ def main() -> int:
         bad += 1
     else:
         print("  [ok  ] 被拒的没入库")
+
+    # ── 成功那一支的 status 字面量, 必须正是 core.py 数的那个 ────────────
+    # ⚠️ 这一条是补上来的, 而它补的正是本 harness 自己的洞: 上面只断言了
+    #    **rejected** 分支, 于是 005 把成功分支从 'inserted' 写成 'written'
+    #    时整套测试照绿。core.py 按 'inserted' 计数并销角度台账, 结果是
+    #    「每次成功 commit 都报 written=0, 一条角度都不销账」—— 静默的。
+    #
+    #    测有意思的分支、放过无聊的分支, 而契约恰恰长在无聊的那条上。
+    sql(f"DELETE FROM autowriter.draft_fingerprints WHERE project_id='{PID}';")
+    clean = json.dumps([{"title": "干净的稿子", "opening": "y", "opening_hash": "ohk",
+                         "ngram_hashes": sorted(fp.ngram_hashes(doc(rng, 40))),
+                         "title_embedding": None, "version_id": "", "angle_key": ""}],
+                       ensure_ascii=False)
+    st = sql("SELECT status FROM "
+             f"autowriter.deskcore_commit_fingerprints('{PID}'::uuid, '{clean}'::jsonb, "
+             f"'{UID}'::uuid, {fp.NGRAM_JACCARD_HARD}, "
+             f"{fp.NGRAM_CONTAIN_HARD}, {fp.CONTAIN_MIN_SAMPLE});")
+    if st != core.COMMIT_STATUS_INSERTED:
+        print(f"  [FAIL] 成功分支返回 {st!r}, 而 core.py 只认 "
+              f"{core.COMMIT_STATUS_INSERTED!r} —— written 会永远是 0, "
+              f"角度台账永远不销账")
+        bad += 1
+    else:
+        print(f"  [ok  ] 成功分支返回 {st!r}, 与 core.py 的计数口径一致")
+
+    # ── 样本量不够的命中不许挤掉真命中 ──────────────────────────────────
+    # 场景: 库里同时有「被照搬的长稿」(c 高、样本量够) 和一条毫不相关、只跟
+    # 本稿撞上**一个**低位 hash 的稿子。后者的 c 是 1.0 但样本量只有 1。
+    # 若先按 c 取最大再看样本量, 冠军是那条无关的, 随后因样本量不够被丢掉,
+    # 真正的抄袭源根本没进过决赛 —— 两道闸都会放行。
+    sql(f"DELETE FROM autowriter.draft_fingerprints WHERE project_id='{PID}';")
+    src = doc(rng, 120)
+    copied = prefix(src, 12) + doc(rng, 2)          # 照搬 + 掺一点自己的 → c<1
+    d_hs = sorted(fp.ngram_hashes(copied))
+    sql("INSERT INTO autowriter.draft_fingerprints"
+        "(project_id,title,opening_hash,ngram_hashes) VALUES"
+        f"('{PID}','被照搬的长稿','ohL','{pg_array(fp.ngram_hashes(src))}');")
+    # 诱饵: 只有一个 hash, 取本稿最小的那个 → 受限子域里两边都只剩它 →
+    # c=1.0 而样本量=1。
+    sql("INSERT INTO autowriter.draft_fingerprints"
+        "(project_id,title,opening_hash,ngram_hashes) VALUES"
+        f"('{PID}','无关的诱饵','ohD','{{{d_hs[0]}}}');")
+
+    out = sql("SELECT best_c, c_title, c_sample FROM "
+              f"autowriter.deskcore_check_drafts('{PID}'::uuid, "
+              f"'{payload(d_hs)}'::jsonb);").split("|")
+    if out[1] != "被照搬的长稿" or int(out[2]) < fp.CONTAIN_MIN_SAMPLE:
+        print(f"  [FAIL] check 侧被诱饵挤掉了: c={out[0]} 归因={out[1]!r} "
+              f"样本量={out[2]}(下限 {fp.CONTAIN_MIN_SAMPLE})")
+        bad += 1
+    else:
+        print(f"  [ok  ] check 侧跳过样本量不足的诱饵, 归因到 {out[1]!r} "
+              f"(c={float(out[0]):.3f} 样本量={out[2]})")
+
+    rows = json.dumps([{"title": "照搬的那篇", "opening": "z", "opening_hash": "ohz",
+                        "ngram_hashes": d_hs, "title_embedding": None,
+                        "version_id": "", "angle_key": ""}], ensure_ascii=False)
+    res = sql("SELECT status, coalesce(collided_with,'-') FROM "
+              f"autowriter.deskcore_commit_fingerprints('{PID}'::uuid, '{rows}'::jsonb, "
+              f"'{UID}'::uuid, {fp.NGRAM_JACCARD_HARD}, "
+              f"{fp.NGRAM_CONTAIN_HARD}, {fp.CONTAIN_MIN_SAMPLE});")
+    if res != "rejected|被照搬的长稿":
+        print(f"  [FAIL] commit 侧也被诱饵挤掉了: {res}")
+        bad += 1
+    else:
+        print("  [ok  ] commit 侧同样跳过诱饵, 拦住并归因到被照搬的那篇")
 
     # ── 迁移必须幂等: 整套再跑一遍不能报错 ──────────────────────────────
     for f in files:

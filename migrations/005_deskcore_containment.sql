@@ -39,9 +39,14 @@
 -- ── c_sample 是干什么的 ───────────────────────────────────────────────
 -- 子域里较小那边的元素个数, 也就是这次估计的**有效样本量**。调用方必须拿它
 -- 当闸: 样本量太小时包含度会剧烈抖动(100 字草稿 vs 6000 字历史时子域只剩 4
--- 个元素, 完全无关的两篇也能撞出 1.0)。Python 侧低于 CONTAIN_MIN_SAMPLE=30
--- 就完全不发包含度信号 —— 这一路刻意 fail-open, 因为误杀正常稿子比漏检更难
--- 被发现。阈值本身是从零分布定的, 见 deskcore/fingerprint.py 里那张表。
+-- 个元素, 完全无关的两篇也能撞出 1.0)。低于 ``CONTAIN_MIN_SAMPLE``(=15, 定义在
+-- deskcore/fingerprint.py, 由 Python 侧作为 _contain_min_sample 传下来)就完全
+-- 不发包含度信号 —— 这一路刻意 fail-open, 因为误杀正常稿子比漏检更难被发现。
+-- 阈值本身是从零分布定的, 见 deskcore/fingerprint.py 里那张表。
+--
+-- ⚠️ 样本量是**候选资格**, 不是事后复核。够不着下限的命中根本不许参与
+--    "取最大" —— 否则一条只撞上一个低位 hash 的无关稿以 c=1.0/样本量=1
+--    当选, 把真正的抄袭源挤出决赛, 随后自己又因样本量不足被放行。
 --
 -- ── 为什么包含度也要 ORDER BY 自己那一路的最佳命中 ────────────────────
 -- 抄袭源和"用词最像的那篇"经常不是同一条。共用一个 title 会让人对着一条根本
@@ -56,12 +61,19 @@
 -- OUT 参数不算函数标识的一部分, 所以这一句对 004 那版(7 列)和本文件这版(10 列)
 -- 都有效 —— 重复执行时它把上一遍建的删掉, 下面再建一次, 干净 no-op。
 DROP FUNCTION IF EXISTS autowriter.deskcore_check_drafts(UUID, JSONB);
+-- 本文件自己那版(3 参)也要能被重复执行。加了 _contain_min_sample 之后
+-- 参数表变了, CREATE OR REPLACE 顶不掉 2 参那版, 所以两个签名都 DROP。
+DROP FUNCTION IF EXISTS autowriter.deskcore_check_drafts(UUID, JSONB, INT);
 
 CREATE FUNCTION autowriter.deskcore_check_drafts(
     _project_id UUID,
     -- [{opening_hash, ngram_hashes, title_embedding}, ...]
     -- title_embedding 可以是 null(本批算不出向量), 那一路直接跳过。
-    _rows       JSONB
+    _rows       JSONB,
+    -- 包含度那一路的有效样本量下限。真正生效的值由 Python 侧传下来
+    -- (fingerprint.CONTAIN_MIN_SAMPLE), 这里的 DEFAULT 只是让手动在 SQL
+    -- 控制台里调用时不至于报缺参 —— 两边写死两份就迟早对不上。
+    _contain_min_sample INT DEFAULT 15
 )
 RETURNS TABLE(
     idx          INT,
@@ -163,17 +175,29 @@ BEGIN
             --    一条语句 —— 拆成两条 SELECT 的话第二条会报 relation "metrics"
             --    does not exist。(在真 PostgreSQL 上跑才发现的; 光看代码
             --    和 py_compile 都看不出来。)
+            -- Jaccard 自己的样本量下限是**并集**大小(而不是包含度用的
+            -- min(|a|,|b|)) —— 两者不能混用, 理由见 fingerprint.sketch_overlap
+            -- 的注释: 短稿 vs 超长历史稿时 min 只有两三个但 union 有几百,
+            -- 那是正常形态; 真正不可用的是**两边都塌到个位数**的时候。
             jbest AS (
                 SELECT x.title, x.j FROM (
-                    SELECT m.title, m.inter / NULLIF(m.uni, 0) AS j FROM metrics m
+                    SELECT m.title, m.inter / NULLIF(m.uni, 0) AS j
+                      FROM metrics m WHERE m.uni >= _contain_min_sample
                 ) x WHERE x.j IS NOT NULL ORDER BY x.j DESC, x.title LIMIT 1
             ),
+            -- ⚠️ 样本量的判据必须在 ORDER BY 之前。原来是先按 c 取冠军、把
+            --    冠军的样本量一起返回给调用方事后判断 —— 一条毫不相关、只跟
+            --    本稿撞上一个低位 hash 的历史稿能拿到 c=1.0 / 样本量=1, 压过
+            --    真正的抄袭源(c=0.9 / 样本量>=15); 冠军随后因样本量不足被丢掉,
+            --    真命中根本没进过决赛, 照搬长稿的稿子就这么放行了。
+            --    Python 侧 core.py 的两处 `if s >= CONTAIN_MIN_SAMPLE` 同口径。
             cbest AS (
                 SELECT x.title, x.c, x.smaller FROM (
                     SELECT m.title, m.inter / NULLIF(m.smaller, 0) AS c,
                            m.smaller::int AS smaller
                       FROM metrics m
-                ) x WHERE x.c IS NOT NULL ORDER BY x.c DESC, x.title LIMIT 1
+                ) x WHERE x.c IS NOT NULL AND x.smaller >= _contain_min_sample
+                  ORDER BY x.c DESC, x.title LIMIT 1
             )
             SELECT (SELECT b.j FROM jbest b), (SELECT b.title FROM jbest b),
                    (SELECT b.c FROM cbest b), (SELECT b.title FROM cbest b),
@@ -208,12 +232,12 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB) FROM PUBLIC;
-REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB) FROM anon;
-REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB) FROM authenticated;
-GRANT EXECUTE ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB) TO service_role;
+REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) TO service_role;
 
-COMMENT ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB) IS
+COMMENT ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) IS
     'check_drafts 的四路比对(开头精确 / 四字串 Jaccard / 四字串包含度 / 标题余弦), '
     '下推到库里一次算完。Jaccard 与包含度都走 bottom-k 的标准估计式(只在两个 '
     'sketch 都覆盖到的 hash 区间上算), 存量指纹不用重算。包含度专抓 Jaccard '
@@ -303,7 +327,8 @@ BEGIN
                 SELECT c.title,
                        m.inter::numeric / NULLIF(m.uni, 0)     AS j,
                        m.inter::numeric / NULLIF(m.smaller, 0) AS c,
-                       m.smaller::int                          AS smaller
+                       m.smaller::int                          AS smaller,
+                       m.uni::int                              AS uni
                   FROM (
                       SELECT f.title, f.ngram_hashes AS hs
                         FROM autowriter.draft_fingerprints f
@@ -331,12 +356,20 @@ BEGIN
                         ) g
                   ) m
             LOOP
-                IF hit.j IS NOT NULL AND hit.j > best_j THEN
+                -- Jaccard 看并集样本量, 包含度看 min —— 两个下限用同一个数,
+                -- 但量的是不同的东西。见 check 侧 jbest 上面那段注释。
+                IF hit.j IS NOT NULL AND hit.uni >= _contain_min_sample
+                   AND hit.j > best_j THEN
                     best_j := hit.j; best_t := hit.title;
                 END IF;
                 -- 包含度记它自己的最佳命中: 抄袭源和"用词最像的那篇"经常不是
                 -- 同一条, 报错时要指对人。
-                IF hit.c IS NOT NULL AND hit.c > best_c THEN
+                -- ⚠️ 样本量先过闸再比大小(与 check 侧的 cbest、Python 侧
+                --    core.py 同一口径)。否则一条只撞上一个低位 hash 的无关
+                --    历史稿会以 c=1.0/样本量=1 当选, 把真正的抄袭源挤掉,
+                --    随后又因样本量不足被下面那个 IF 放行。
+                IF hit.c IS NOT NULL AND hit.smaller >= _contain_min_sample
+                   AND hit.c > best_c THEN
                     best_c := hit.c; best_ct := hit.title; best_cs := hit.smaller;
                 END IF;
             END LOOP;
@@ -375,7 +408,12 @@ BEGIN
             NULLIF(r->>'angle_key','')
         );
 
-        idx := i; status := 'written'; collided_with := NULL; detail := NULL;
+        -- ⚠️ 这个字面量是**跨语言契约**: deskcore/core.py 按
+        --    COMMIT_STATUS_INSERTED('inserted') 数 written、并据此给角度台账
+        --    销账。曾经这里写成 'written', 后果不是报错 —— 是每次成功入库都
+        --    报 written=0、一条角度都不销账(同一坐标可以被无限次抽到), 全程
+        --    没有任何异常。改这个词之前先改 core.py 的那个常量。
+        idx := i; status := 'inserted'; collided_with := NULL; detail := NULL;
         RETURN NEXT;
     END LOOP;
 END;
