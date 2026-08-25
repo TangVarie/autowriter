@@ -36,7 +36,7 @@ click==8.4.1
     #   pyiceberg
     #   streamlit
     #   uvicorn
-cryptography==48.0.0
+cryptography==50.0.0
     # via
     #   google-auth
     #   pyjwt
@@ -56,7 +56,7 @@ fsspec==2026.4.0
     # via pyiceberg
 gitdb==4.0.12
     # via gitpython
-gitpython==3.1.50
+gitpython==3.1.59
     # via streamlit
 google-auth==2.53.0
     # via google-genai
@@ -66,9 +66,9 @@ h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-h2==4.3.0
+h2==4.4.1
     # via httpx
-hpack==4.1.0
+hpack==4.2.0
     # via h2
 httpcore==1.0.9
     # via httpx
@@ -118,6 +118,7 @@ narwhals==2.21.2
     # via altair
 numpy==2.4.6
     # via
+    #   -r requirements.txt
     #   pandas
     #   pydeck
     #   streamlit
@@ -142,7 +143,7 @@ protobuf==7.35.0
     # via streamlit
 pyarrow==24.0.0
     # via streamlit
-pyasn1==0.6.3
+pyasn1==0.6.4
     # via pyasn1-modules
 pyasn1-modules==0.4.2
     # via google-auth
@@ -177,7 +178,7 @@ python-dateutil==2.9.0.post0
     #   strictyaml
 python-docx==1.2.0
     # via -r requirements.txt
-python-multipart==0.0.29
+python-multipart==0.0.32
     # via streamlit
 realtime==2.30.0
     # via supabase
@@ -203,7 +204,7 @@ smmap==5.0.3
     # via gitdb
 sniffio==1.3.1
     # via anthropic
-starlette==1.1.0
+starlette==1.6.0
     # via streamlit
 storage3==2.30.0
     # via supabase
