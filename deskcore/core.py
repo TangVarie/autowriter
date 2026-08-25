@@ -896,8 +896,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
 
     # ── 给真的入了库的那几条建身份 ──────────────────────────────────────
     # 只建 inserted 的: 被判撞车的那几条没有交付, 不该在 items 里留一行。
-    identity_error = None
-    minted = {"batch_id": None, "versions": {}}
+    # mint_draft_identity 不抛: 指纹已经进库了, 这次 commit 的**主要目的**(让这些
+    # 稿子参与以后的查重)已经达成。把整个调用报成失败会让调用方去重试, 而重试会被
+    # 自己刚写进去的指纹判成撞车 —— 一次故障变成一句"你的稿子重复了", 现场完全对
+    # 不上。它半途失败时会把**已经建成的那部分**连同 error 一起回来。
+    minted = {"batch_id": None, "versions": {}, "error": None}
     to_mint = [
         {"version_id": minted_ids[i], "title": titles[i],
          "body": drafts[i].get("body") or "",
@@ -905,15 +908,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         for i in sorted(inserted_idx) if i in minted_ids
     ]
     if to_mint:
-        try:
-            minted = store.mint_draft_identity(
-                client, project_id, str(user_id), "", to_mint)
-        except Exception as exc:            # noqa: BLE001
-            # 不上抛: 指纹已经进库了, 这次 commit 的**主要目的**(让这些稿子参与
-            # 以后的查重)已经达成, 把整个调用报成失败会让调用方去重试, 而重试
-            # 会被自己刚写进去的指纹判成撞车。这里降级 + 明说。
-            logger.exception("mint draft identity failed: project=%s", project_id)
-            identity_error = f"{type(exc).__name__}: {exc}"
+        minted = store.mint_draft_identity(
+            client, project_id, str(user_id), "", to_mint)
+    identity_error = minted.get("error")
 
     consumed = 0
     attempted = 0
@@ -946,12 +943,19 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
            "version_ids": [minted_ids[i] for i in sorted(inserted_idx)
                            if minted_ids.get(i) in minted.get("versions", {})]}
     if identity_error:
-        # 说清楚**丢的是什么**: 查重没事, 断的是"发出去之后能不能归因回来"。
+        # 说清楚**丢的是哪几条**: 查重没事, 断的是"发出去之后能不能归因回来"。
+        # ⚠️ 报的是**实际没建成的条数**, 不是 len(to_mint) —— 半途失败时前面几条
+        #    是真建成了的, 说"全都没建成"会让人去重做已经做完的事。
+        done = len(out["version_ids"])
         out["identity_warning"] = (
-            f"{len(to_mint)} 条稿子的指纹已入库, 但 items/versions 没建成 "
-            f"({identity_error})。查重不受影响; 受影响的是导出的 lineage —— "
-            "这几条导出时不会有 version_id, Truth Vault 那边归因不回来 "
-            "(v_model_comparison 就 JOIN 在这个 id 上)。服务端日志有堆栈。")
+            f"{len(to_mint)} 条稿子的指纹都入了库, 但只有 {done} 条建成了 "
+            f"items/versions({identity_error})。查重不受影响; 受影响的是导出的 "
+            f"lineage —— 没建成的那 {len(to_mint) - done} 条不在 version_ids 里, "
+            "导出时不会有 version_id, Truth Vault 那边归因不回来"
+            "(v_model_comparison 就 JOIN 在这个 id 上)。"
+            + (f"已建成的那 {done} 条照常可以 export_drafts(batch_id="
+               f"{out['batch_id']})。" if done else "")
+            + "服务端日志有堆栈。")
     if embed_failed and written:
         # 配了 embedding 却没拿到向量 = 故障(欠费/配额/网络), 不是"没配"。
         # 必须当场说, 让人决定是先修 key 再 commit, 还是接受这批只有确定性指纹。
@@ -1019,18 +1023,45 @@ def export_drafts(client, project_id: str, *, batch_id: str | None = None,
         client, project_id, batch_id=batch_id, version_ids=version_ids,
         limit=MAX_EXPORT_DRAFTS)
     if not items:
+        # 键的形状和成功那一支保持一致 —— 调用方不该为了空结果写第二套解析。
         return {"count": 0, "columns": [], "filename": None, "xlsx_base64": None,
-                "preview": [],
+                "preview": [], "missing_version_ids": sorted(version_ids or []),
+                "truncated": False, "exported_at": None,
                 "note": ("没找到可导的稿子。要么 batch_id / version_ids 不属于这个"
                          "项目, 要么那一批还没 commit_drafts —— 只有入了库的稿子"
                          "才有身份可导。")}
+
+    # ── 少导了就必须说 ──────────────────────────────────────────────────
+    # 本仓的审计里"静默截断"是反复出现的一类(COR-006 / ROB-011 都是它), 而导出
+    # 这条路上它尤其阴: 少导几条 = 那几篇稿子发出去之后归因不回来, 而返回值看起来
+    # 完全正常, 没有任何人会发现。所以两种少法都点名:
+    #
+    #   · 点名要了某些 version 却没找到 —— id 打错、不属于这个项目、或者还没 commit;
+    #   · 命中数顶到上限 —— 后面可能还有, 这一次没导全。
+    missing = sorted(set(version_ids or []) - {r["version_id"] for r in items})
+    truncated = len(items) >= MAX_EXPORT_DRAFTS
 
     exported_at = datetime.now().isoformat(timespec="seconds")
     blob = exporter.build_combined_excel(items, exported_at=exported_at)
     stamp = exported_at.replace("-", "").replace(":", "").replace("T", "_")[:13]
 
+    notes = ["把 xlsx_base64 解码写成 filename 那个文件, 打开、整片选中、粘进飞书表。"
+             "⚠️ 飞书表要先有 columns 里的那几列, 列名逐字相同 —— 对不上的列会让 "
+             "Truth Vault 把整行 quarantine。"]
+    if missing:
+        notes.append(
+            f"⚠️ 点名的 {len(missing)} 个 version_id 没找到, **不在这个表里**: "
+            f"{missing[:10]}{' …' if len(missing) > 10 else ''}。"
+            "多半是 id 打错、不属于这个项目、或者那几条还没 commit_drafts。")
+    if truncated:
+        notes.append(
+            f"⚠️ 命中数顶到上限 {MAX_EXPORT_DRAFTS} 条, 后面可能还有没导出来的。"
+            "分批用 version_ids 点名导, 别把这一次当全量。")
+
     return {
         "count": len(items),
+        "missing_version_ids": missing,
+        "truncated": truncated,
         # 明着回一份列名: 运营要照着它在飞书表里建列, 而且对不上会整行被
         # quarantine(TV 的 D-021)。让它出现在返回值里, 不必去翻文档。
         "columns": [exporter.CONTENT_HEADER, *exporter.LINEAGE_HEADERS],
@@ -1039,9 +1070,7 @@ def export_drafts(client, project_id: str, *, batch_id: str | None = None,
         "preview": [{"title": r["title"], "version_id": r["version_id"]}
                     for r in items],
         "exported_at": exported_at,
-        "note": ("把 xlsx_base64 解码写成 filename 那个文件, 打开、整片选中、"
-                 "粘进飞书表。⚠️ 飞书表要先有 columns 里的那几列, 列名逐字相同 —— "
-                 "对不上的列会让 Truth Vault 把整行 quarantine。"),
+        "note": " ".join(notes),
     }
 
 

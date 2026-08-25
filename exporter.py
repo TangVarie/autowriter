@@ -22,6 +22,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 try:
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
     _OPENPYXL_AVAILABLE = True
 except ImportError:
     _OPENPYXL_AVAILABLE = False
@@ -182,10 +183,11 @@ def build_combined_excel(items: list[dict],
             lc.alignment = cell_align
 
     ws.column_dimensions["A"].width = 80
+    # 列号→字母走 get_column_letter。手写 chr(ord("B")+i) 在第 26 列之后会算出
+    # "[" 这种非列名的字符, 而 openpyxl 只是往 column_dimensions 里塞个没人用的
+    # 键 —— **不报错**, 表照样存得下来, 只是那几列的宽度设置默默没生效。
     for offset in range(len(LINEAGE_COLUMNS)):
-        # 2=B, 3=C … openpyxl 的列字母换算走 get_column_letter, 这里列数固定
-        # 且很小, 直接用 chr 更省一个 import。
-        ws.column_dimensions[chr(ord("B") + offset)].width = 38
+        ws.column_dimensions[get_column_letter(2 + offset)].width = 38
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -279,10 +281,10 @@ def build_excel_document(
     ws.column_dimensions["D"].width = 25  # 关键词
     ws.column_dimensions["E"].width = 10  # AI引擎
     ws.column_dimensions["F"].width = 8   # 版本
-    # lineage 列 G 起。**不隐藏** —— 隐藏列只有"整表导入"才跟着走, 复制可见列
-    # 粘进飞书就丢了(同 build_combined_excel 的说明)。
+    # lineage 列从第 7 列(G)起。**不隐藏** —— 隐藏列只有"整表导入"才跟着走,
+    # 复制可见列粘进飞书就丢了(同 build_combined_excel 的说明)。
     for offset in range(len(LINEAGE_COLUMNS)):
-        ws.column_dimensions[chr(ord("G") + offset)].width = 30
+        ws.column_dimensions[get_column_letter(7 + offset)].width = 30
 
     buf = io.BytesIO()
     wb.save(buf)

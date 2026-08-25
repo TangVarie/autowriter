@@ -203,10 +203,10 @@ def test_identity_failure_is_reported_and_no_ids_are_claimed(monkeypatch):
     报出去的话调用方会拿它去导出, 而 TV 那边 JOIN 不到任何东西 —— 比不报更坏:
     表面上 lineage 齐全, 实际归因永远落空, 且没有任何地方会报错。
     """
-    def _boom(*a, **kw):
-        raise RuntimeError("versions 表写不进去")
-
-    monkeypatch.setattr(store, "mint_draft_identity", _boom)
+    monkeypatch.setattr(
+        store, "mint_draft_identity",
+        lambda *a, **kw: {"batch_id": None, "versions": {},
+                          "error": "RuntimeError: versions 表写不进去"})
     c = _client()
     out = _commit(c, [DRAFT])
 
@@ -214,6 +214,35 @@ def test_identity_failure_is_reported_and_no_ids_are_claimed(monkeypatch):
     assert out["version_ids"] == []
     assert "identity_warning" in out
     assert "version_id" in out["identity_warning"]
+
+
+def test_partial_mint_reports_the_ones_that_made_it(monkeypatch):
+    """半途失败时, **已经建成的那几条要报出来**。
+
+    5 条里前 2 条的 items/versions 已经在库里了。把整次 mint 当作没发生、连
+    batch_id 一起丢掉的话, 那两条谁也找不回来 —— 它们的指纹指向真实存在的
+    version, 却没有任何人知道该去导出它们。行在库里而调用方以为没有, 比
+    "报了个建不成的 id"更难查。
+
+    同时: 报出去的条数必须是**实际建成的**, 不是"这次打算建几条"。
+    """
+    good = "aaaa1111-0000-0000-0000-00000000aaaa"
+    monkeypatch.setattr(
+        store, "mint_draft_identity",
+        lambda sb, pid, uid, tactic, entries: {
+            "batch_id": "batch-9",
+            # 只有第一条建成了
+            "versions": {entries[0]["version_id"]: "item-1"},
+            "error": "RuntimeError: 第二条炸了"})
+
+    c = _client()
+    out = _commit(c, [DRAFT, {"title": "标题二", "body": "另一篇正文"}])
+
+    assert out["batch_id"] == "batch-9", "batch_id 丢了就等于那几条找不回来"
+    assert len(out["version_ids"]) == 1
+    w = out["identity_warning"]
+    assert "只有 1 条建成" in w, w
+    assert "batch-9" in w, "要告诉调用方已建成的那部分怎么导"
 
 
 def test_identity_failure_does_not_raise():

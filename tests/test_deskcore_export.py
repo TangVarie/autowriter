@@ -134,6 +134,46 @@ def test_nothing_found_says_why():
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 2b · 少导了必须说
+# ══════════════════════════════════════════════════════════════════════
+
+def test_missing_version_ids_are_named():
+    """点名要了却没找到的, 要**点名报回来**。
+
+    静默少导是本仓审计反复出现的一类(COR-006 / ROB-011 都是它), 而在导出这条路上
+    它尤其阴: 少导几条 = 那几篇稿子发出去之后归因不回来, 返回值却完全正常。
+    """
+    ghost = "00000000-dead-dead-dead-000000000000"
+    out = core.export_drafts(_client(), PROJ, version_ids=[VER, ghost], user_id=ME)
+    assert out["count"] == 1
+    assert out["missing_version_ids"] == [ghost]
+    assert ghost in out["note"]
+
+
+def test_hitting_the_cap_is_announced(monkeypatch):
+    """命中数顶到上限 = 后面可能还有。不说的话这一次会被当成全量。"""
+    monkeypatch.setattr(core, "MAX_EXPORT_DRAFTS", 1)
+    out = core.export_drafts(_client(), PROJ, batch_id=BATCH, user_id=ME)
+    assert out["truncated"] is True
+    assert "上限" in out["note"]
+
+
+def test_a_full_export_is_not_flagged():
+    """没少导就不许报警 —— 每次都带个警告等于没有警告。"""
+    out = core.export_drafts(_client(), PROJ, batch_id=BATCH, user_id=ME)
+    assert out["truncated"] is False
+    assert out["missing_version_ids"] == []
+    assert "⚠️ 点名" not in out["note"] and "上限" not in out["note"]
+
+
+def test_empty_result_keeps_the_same_key_shape():
+    """空结果和成功结果的键要一样 —— 调用方不该为空结果写第二套解析。"""
+    ok = core.export_drafts(_client(), PROJ, batch_id=BATCH, user_id=ME)
+    empty = core.export_drafts(_client(), PROJ, batch_id="没有这个批次", user_id=ME)
+    assert set(ok) - set(empty) == set(), sorted(set(ok) - set(empty))
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 3 · 和 commit_drafts 接得上
 # ══════════════════════════════════════════════════════════════════════
 

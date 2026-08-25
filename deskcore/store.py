@@ -802,19 +802,45 @@ def mint_draft_identity(sb, project_id: str, user_id: str, tactic: str,
     每次调用建**一个** batch —— 一次 commit 就是一次交付, 这是最自然的分组,
     也让"这批是写作台写的"在 UI 里一眼可见。
 
-    失败就上抛。调用方负责说清楚"指纹进了但身份没建"这个中间态 —— 静默吞掉的话,
-    lineage 会指向一个不存在的 version, 而那和完全没有 lineage 长得一模一样。
+    ── 半途失败要**报出已经建成的那部分** ──────────────────────────────
+    返回 ``{"batch_id", "versions", "error"}``; ``error`` 非空 = 没建完。
+
+    这里刻意不上抛。上抛的话调用方只能把整次 mint 当作没发生 —— 而 5 条里前 2 条
+    的 items/versions **已经在库里了**, 连 batch_id 一起丢掉之后, 那两条谁也找不
+    回来: 它们的指纹指向真实存在的 version, 却没有任何人知道该去导出它们。
+    行在库里而调用方以为没有, 是比"报了个建不成的 id"更难查的一种不一致。
+
+    ⚠️ 但**绝不**把没建成的 id 混进 ``versions`` —— 那个字典是"真的有这一行"的
+    唯一凭据, 调用方拿它去导出。宁可少报, 不可多报。
     """
     if not entries:
-        return {"batch_id": None, "versions": {}}
-
-    batch = db.create_batch(
-        sb, user_id=user_id, project_id=project_id, tactic=tactic or "",
-        params={"source": "deskcore"},
-        ai_engines=[DESKCORE_AI_ENGINE])
-    batch_id = batch["id"]
+        return {"batch_id": None, "versions": {}, "error": None}
 
     minted: dict[str, str] = {}
+    batch_id = None
+    try:
+        batch = db.create_batch(
+            sb, user_id=user_id, project_id=project_id, tactic=tactic or "",
+            params={"source": "deskcore"},
+            ai_engines=[DESKCORE_AI_ENGINE])
+        batch_id = batch["id"]
+        _mint_entries(sb, batch_id, user_id, entries, minted)
+    except Exception as exc:                    # noqa: BLE001
+        logger.exception("mint draft identity failed (project=%s, batch=%s, "
+                         "已建成 %d/%d)", project_id, batch_id,
+                         len(minted), len(entries))
+        return {"batch_id": batch_id, "versions": minted,
+                "error": f"{type(exc).__name__}: {exc}"}
+    return {"batch_id": batch_id, "versions": minted, "error": None}
+
+
+def _mint_entries(sb, batch_id: str, user_id: str, entries: list[dict],
+                  minted: dict[str, str]) -> None:
+    """逐条建 item + version, 建成一条就往 ``minted`` 里记一条。
+
+    ``minted`` 是**传进来的**而不是返回的 —— 中途抛异常时, 上面那层要拿到已经
+    建成的那部分。
+    """
     for e in entries:
         item = (sb.table("items").insert({
             "batch_id": batch_id,
@@ -845,9 +871,8 @@ def mint_draft_identity(sb, project_id: str, user_id: str, tactic: str,
         sb.table("items").update(
             {"best_version_id": e["version_id"]}).eq("id", item_id).execute()
 
+        # 三次写全成了才记 —— minted 是"真的有这一行"的凭据。
         minted[e["version_id"]] = item_id
-
-    return {"batch_id": batch_id, "versions": minted}
 
 
 def drafts_for_export(sb, project_id: str, *, batch_id: str | None = None,
