@@ -1354,9 +1354,19 @@ class GeminiEngine:
 
 _ENGINE_CACHE: dict[str, object] = {}
 
+# 这个进程**认得**的引擎名。与 AVAILABLE_ENGINES 不是一回事: 后者是"这次部署
+# 配齐了 key 因而现在能用的", 前者是"这个名字合不合法"。
+#
+# worker 的 payload 校验要的是后者 —— 它挡的是"往 jobs 里塞一串垃圾引擎名把
+# 线程池撑爆"(池大小 = 角色数 × 引擎数)。拿 AVAILABLE_ENGINES 去挡会把
+# "这台 worker 没配 Gemini key" 和 "这个引擎名是编的" 混成同一种错误。
+KNOWN_ENGINES: frozenset[str] = frozenset({"claude", "gemini"})
+
 
 def get_engine(engine_name: str):
     """Return a cached engine instance, creating it on first use."""
+    if engine_name not in KNOWN_ENGINES:
+        raise ValueError(f"未知引擎：{engine_name}")
     if engine_name not in _ENGINE_CACHE:
         if engine_name == "claude":
             _ENGINE_CACHE["claude"] = ClaudeEngine()

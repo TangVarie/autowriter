@@ -57,6 +57,15 @@ def _fake_db(rec: Recorder, *, project: dict, extra_ids=("proj-1",)):
             return dict(project, id=pid)
 
         @staticmethod
+        def get_project_owned(client, pid, user_id):
+            # ⚠️ 这里**不做**归属判断, 一律回。归属那条闸有它自己的用例
+            # (tests/test_worker_trust_boundary.py), 那边的假 db 才如实模拟
+            # service_role"谁来都给"的行为。这个文件是**编排的录音机**, 它要
+            # 的是"编排调了谁、拿什么调的", 混进访问控制只会让两边都测不清。
+            rec.log("db.get_project_owned", (pid, user_id))
+            return dict(project, id=pid)
+
+        @staticmethod
         def list_projects(client, user_id):
             rec.log("db.list_projects", user_id)
             # ⚠️ 要把**用例里出现的每个 project_id** 都回出来。只回一个的话,

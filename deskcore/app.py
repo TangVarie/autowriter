@@ -50,7 +50,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
-from . import identity, tools, vocab
+from . import core, identity, tools, vocab
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deskcore")
@@ -347,6 +347,14 @@ async def rest_tool(name: str, request: Request):
         return {"result": result}
     except HTTPException:
         raise
+    except core.ProjectNotFound as exc:
+        # 项目 ID 打错 / 项目已删 → 404, 【不是】500。
+        # 这跟旁边那条 403 是同一个道理: 500 对调用方的意思是"服务端坏了,
+        # 待会儿重试", 于是模型会拿同一个错 ID 一直试; 而且它会把正常的
+        # "查无此项目" 计进错误监控。core 里特意把"找不到"和"不是你的"分成
+        # 两个异常, 适配层不映射就等于白分。
+        logger.warning("tool %s: %s", name, exc)
+        raise HTTPException(status_code=404, detail=str(exc)[:300])
     except PermissionError as exc:
         # 归属校验拒绝(审计 COR-015) → 403, 【不是】500。
         # 500 对调用方的意思是"服务端坏了, 待会儿重试", 于是模型会拿同一个错

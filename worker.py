@@ -72,6 +72,9 @@ import telemetry
 # 顶层 import 而不是在 handler 里懒加载: worker 存在的全部意义就是跑这些
 # handler, 它 import 不动的话应该**开机就炸**, 而不是等到领到第一个 job。
 import generation_service as gen_service
+# 只为了 KNOWN_ENGINES —— payload 校验要挡的是"引擎名是编的", 而合法名字这份
+# 清单只能有一处定义(generator.get_engine 用的是同一个 frozenset)。
+import generator
 
 
 # ── 配置（全部从环境读, 带默认值）────────────────────────────────────────
@@ -91,6 +94,11 @@ SWEEP_INTERVAL = int(os.environ.get("SWEEP_INTERVAL_SECONDS", "60"))
 
 # 优雅退出: SIGTERM/SIGINT 时停止领新 job, 当前 job 由 handler 跑完(daemon
 # 心跳线程随进程退出)。容器滚动发布先发 SIGTERM, 这样不会硬切断正在跑的任务。
+#
+# ⚠️ **它只管"不再领新的", 绝不能同时当作"切断当前这个"的信号。**
+# ``process_one`` 在 handler 正常返回后是**无条件** finish_job_success 的 ——
+# 所以任何"提前收手然后正常返回"都会变成一个 100% 的假成功, 把没跑的活儿
+# 静默丢掉。要么跑完, 要么抛异常; 没有第三种。(见 _generate_batch_handler。)
 _shutdown = threading.Event()
 
 
@@ -156,6 +164,9 @@ class _JobStatus(dict):
         self._job_id = job_id
         self._last_pct = -1
         self._last_at = 0.0
+        # 上一次上报是替哪个 plan 报的。用来识别"换 plan 了, 手上这个
+        # progress 是上一个 plan 留下的"—— 见 _maybe_report。
+        self._plan_idx: int | None = None
 
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
@@ -163,11 +174,32 @@ class _JobStatus(dict):
             self._maybe_report()
 
     def _maybe_report(self) -> None:
-        # progress 是 [0,1] 的浮点; 队列模式没写 progress 时退回 current/total。
+        # ``progress`` 是**单个 plan 内部**的 [0,1]; ``current`` 是正在跑第几个
+        # plan(0 起), ``total`` 是这个 job 一共几个 plan。
+        #
+        # ⚠️ 不能直接拿 progress 当 job 进度。队列编排每个 plan 都会写
+        # progress, 所以第一个 plan 之后这个键**一直在**, 原来那句
+        # "没写 progress 时退回 current/total" 就再也走不到了 —— 持久化的 job
+        # 进度于是 0→100、0→100 地反复, 而不是跨队列单调推进。
+        #
+        # 两个都在的时候要合起来算: 已完成的 plan 数 + 当前这个跑了多少。
         raw = self.get("progress")
-        if raw is None:
-            total = self.get("total") or 0
-            raw = (self.get("current") or 0) / total if total else 0.0
+        total = self.get("total") or 0
+        if total:
+            done = self.get("current") or 0        # 当前 plan 的下标 = 已完成数
+            # ⚠️ 编排是先写 current 再写这个 plan 的第一个 progress 的。换 plan
+            # 那一瞬间, self["progress"] 还是**上一个 plan** 留下的 1.0 ——
+            # 照用就会先冲高再掉回来(实测 …33 → 66 → 33…)。换了 plan 就当
+            # 这个 plan 才刚开始, 下一次 progress 写进来时自然会接上。
+            # 只有"从某个 plan 换到另一个 plan"才算换; 第一次上报(还没记过
+            # 下标)要照用手上的 progress, 否则一个刚开跑的 job 的首帧会被
+            # 无谓地压成 0。
+            stale = self._plan_idx is not None and done != self._plan_idx
+            self._plan_idx = done
+            intra = 0.0 if stale else (float(raw) if raw is not None else 0.0)
+            raw = (done + max(0.0, min(1.0, intra))) / total
+        elif raw is None:
+            raw = 0.0
         try:
             pct = int(max(0.0, min(1.0, float(raw))) * 100)
         except (TypeError, ValueError):
@@ -216,6 +248,69 @@ def _job_result(status: dict, **extra) -> dict:
     return out
 
 
+# ── payload 校验 ────────────────────────────────────────────────────────
+#
+# ⚠️ **Streamlit 控件上的上限不是安全边界**。UI 里 count 有 number_input 的
+# max_value、引擎是 multiselect、角色数是 2-6 的 slider —— 这些都只约束"从
+# 界面走"的那条路。而 jobs 的 RLS 策略只要求 user_id = auth.uid(), payload
+# 是自由 JSONB: 任何已登录用户都可以直接 INSERT 一条自己想要的 payload。
+#
+# 不校验的后果不是"参数怪":
+#   · generator.py 里 ThreadPoolExecutor(max_workers=len(drafts)) 随 count
+#     线性长, 另一处 max_workers = 角色数 × 引擎数 且**引擎列表不去重** ——
+#     一条精心构造的 job 就能把 worker 的线程开爆;
+#   · 每一路都是真的付费模型调用, count 没上限等于账单没上限。
+#
+# 所以这几个上限必须在 worker 这一层**再挡一次**, 而且是**拒绝**不是夹逼:
+# 夹逼会把一条攻击性 payload 悄悄变成一条正常任务, 日志里什么都看不见。
+
+_MAX_PLANS_PER_JOB = 50          # 一个队列 job 里最多几个 plan
+_MAX_ROLES = 6                   # 与 UI 的 slider 上限一致
+_MIN_ROLES = 2
+
+
+def _validate_plan(plan: dict) -> None:
+    """就地校验(并规范化)一个 plan。不合法就抛 ValueError。
+
+    ``engines`` 会被**就地去重**(保序) —— 池的大小是 角色数 × 引擎数, 重复项
+    是成倍放大它的最省事办法, 而重复地跑同一个引擎对用户没有任何价值。
+    """
+    if not isinstance(plan, dict):
+        raise ValueError(f"plan 必须是对象, 收到 {type(plan).__name__}")
+    if not str(plan.get("project_id") or "").strip():
+        raise ValueError("plan 里没有 project_id")
+
+    try:
+        count = int(plan.get("count", config.DEFAULT_GENERATION_COUNT))
+    except (TypeError, ValueError):
+        raise ValueError(f"count 不是整数: {plan.get('count')!r}") from None
+    if not 1 <= count <= config.MAX_GENERATION_COUNT:
+        raise ValueError(
+            f"count={count} 超出 1..{config.MAX_GENERATION_COUNT}")
+    plan["count"] = count
+
+    engines = plan.get("engines", ["claude"])
+    if not isinstance(engines, list) or not engines:
+        raise ValueError(f"engines 必须是非空列表, 收到 {engines!r}")
+    seen: list[str] = []
+    for e in engines:
+        if not isinstance(e, str) or e not in generator.KNOWN_ENGINES:
+            raise ValueError(
+                f"未知引擎 {e!r}; 认得的只有 {sorted(generator.KNOWN_ENGINES)}")
+        if e not in seen:
+            seen.append(e)
+    plan["engines"] = seen
+
+    if plan.get("use_multi_role"):
+        try:
+            n_roles = int(plan.get("n_roles", 3))
+        except (TypeError, ValueError):
+            raise ValueError(f"n_roles 不是整数: {plan.get('n_roles')!r}") from None
+        if not _MIN_ROLES <= n_roles <= _MAX_ROLES:
+            raise ValueError(f"n_roles={n_roles} 超出 {_MIN_ROLES}..{_MAX_ROLES}")
+        plan["n_roles"] = n_roles
+
+
 @register("generate_batch")
 def _generate_batch_handler(job: dict, sb) -> dict:
     """跑一整个队列(多个 plan)。
@@ -230,25 +325,43 @@ def _generate_batch_handler(job: dict, sb) -> dict:
         ``status["errors"]`` 里, 抛出去只会触发整批重跑。
         只有"整批一步都没走成"(payload 坏了)才抛。
 
-    停止信号复用 worker 的 ``_shutdown``: 收到 SIGTERM 时编排会在两个 plan 之间
-    收手, 而不是被硬切断。容器滚动发布正是靠这个不丢半个批次。
+    ⚠️ **排空时不能把 _shutdown 传进编排**。曾经是传的, 想法是"SIGTERM 时在
+    两个 plan 之间收手"; 实际后果是: 编排提前 return → handler 正常返回 →
+    ``process_one`` 无条件 ``finish_job_success`` → job 变成终态 success、
+    进度 100%, **剩下的 plan 永久跳过而且没有任何地方报错**。滚动发布每次
+    都会踩, 而且因为 kind 在 ``NON_IDEMPOTENT_JOB_KINDS`` 里、max_attempts
+    被强制成 1, 也不能靠重排兜回来。
+
+    所以排空契约就按本文件开头写的那样: ``_shutdown`` 只管**停止领新 job**,
+    当前这个 job 由 handler 跑到底。编排因此拿一个自己的、永远不会被 set 的
+    事件。宽限期用完被 SIGKILL 的话, job 留在 running 由 sweeper 判失败 ——
+    那是**看得见**的失败, 比一个 100% 的假 success 好。
     """
     payload = job.get("payload") or {}
     plans = payload.get("plans")
     if not isinstance(plans, list) or not plans:
         raise ValueError("generate_batch 的 payload 里没有 plans —— 无法执行")
+    # job 级的检查排在 plan 级前面: 没有 user_id 是这条 job 整个不成立,
+    # 先报它比报"第 3 个 plan 的 count 不对"有用得多。
     user_id = job.get("user_id")
     if not user_id:
         raise ValueError("generate_batch 的 job 没有 user_id")
+    if len(plans) > _MAX_PLANS_PER_JOB:
+        raise ValueError(
+            f"一个 job 里有 {len(plans)} 个 plan, 超出上限 {_MAX_PLANS_PER_JOB}")
+    for n, p in enumerate(plans):
+        try:
+            _validate_plan(p)
+        except ValueError as exc:
+            raise ValueError(f"第 {n + 1} 个 plan 不合法: {exc}") from None
 
     status = _fresh_status(sb, job["id"], total=len(plans))
     # queue_worker 是那个"保证 phase 一定落回 done"的外层 shim, 它吞掉一切异常。
     # 这里正是要它这个性质 —— 见上面关于不幂等的说明。
-    gen_service.queue_worker(plans, user_id, sb, status, _shutdown)
+    gen_service.queue_worker(plans, user_id, sb, status, threading.Event())
 
     completed = list(status.get("completed") or [])
-    return _job_result(status, plans=len(plans), completed=len(completed),
-                       stopped_early=_shutdown.is_set())
+    return _job_result(status, plans=len(plans), completed=len(completed))
 
 
 @register("quick_gen")
@@ -258,6 +371,7 @@ def _quick_gen_handler(job: dict, sb) -> dict:
     plan = payload.get("plan")
     if not isinstance(plan, dict) or not plan:
         raise ValueError("quick_gen 的 payload 里没有 plan —— 无法执行")
+    _validate_plan(plan)
     user_id = job.get("user_id")
     if not user_id:
         raise ValueError("quick_gen 的 job 没有 user_id")

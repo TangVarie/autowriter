@@ -59,11 +59,25 @@ class _FakeSB:
 # ══════════════════════════════════════════════════════════════════════
 
 def test_progress_is_mirrored_to_the_jobs_row():
+    """``progress`` 是**单个 plan 内部**的进度, 不是整个 job 的。
+
+    ⚠️ 这条断言的数字改过: 原来 total=2 + progress=0.5 期望 50%, 那是把
+    per-plan 的进度直接当成了 job 进度。codex review 指出的后果是: 队列编排
+    每个 plan 都写 progress, 于是两个 plan 的 job 会 0→100 走两遍。
+    现在两个都在时要合起来算 —— 第 0 个 plan 跑到一半 = 整体 (0+0.5)/2 = 25%。
+    """
     sb = _FakeSB()
     st = worker._fresh_status(sb, "j1", total=2)
     st["progress"] = 0.5
     assert sb.updates, "写了 progress 却没有任何一条 jobs 更新"
-    assert sb.updates[-1]["progress_pct"] == 50, sb.updates[-1]
+    assert sb.updates[-1]["progress_pct"] == 25, sb.updates[-1]
+
+    # 换到第二个 plan 并跑完 → 100%, 而不是"第二次 0→100"
+    st["current"] = 1
+    st["progress"] = 1.0
+    assert sb.updates[-1]["progress_pct"] == 100, sb.updates[-1]
+    pcts = [u["progress_pct"] for u in sb.updates]
+    assert pcts == sorted(pcts), f"进度回退了: {pcts}"
 
 
 def test_progress_falls_back_to_current_over_total():
@@ -205,16 +219,37 @@ def test_partial_plan_failure_does_not_raise(monkeypatch):
         status["message"] = "1 成功, 1 失败"
 
     monkeypatch.setattr(gen_service, "queue_worker", _fake_queue_worker)
+    # plan 现在要过 worker 的 payload 校验, 所以这里给两条**合法**的 ——
+    # 这条用例问的是"跑完之后失败怎么归集", 不是"坏 payload 挡不挡得住"
+    # (那个有 tests/test_worker_trust_boundary.py)。
     out = worker.HANDLERS["generate_batch"](
-        {"id": "j1", "user_id": "u1", "payload": {"plans": [{"a": 1}, {"b": 2}]}},
+        {"id": "j1", "user_id": "u1",
+         "payload": {"plans": [{"project_id": "p1", "count": 1},
+                               {"project_id": "p2", "count": 1}]}},
         _FakeSB())
     assert out["completed"] == 1 and out["plans"] == 2
     assert out["errors"] == ["plan-1 挂了"]
 
 
-def test_handler_passes_the_shutdown_event_so_sigterm_drains(monkeypatch):
-    """停止信号要复用 worker 的 ``_shutdown`` —— 收到 SIGTERM 时编排在两个 plan
-    之间收手, 而不是被硬切断。容器滚动发布正是靠这个不丢半个批次。"""
+def test_handler_does_not_hand_the_shutdown_event_to_the_orchestration(monkeypatch):
+    """⚠️ **这条断言以前是反的, 而反的那一版是错的。**
+
+    原来它写的是"停止信号要复用 worker 的 ``_shutdown``, 收到 SIGTERM 时编排
+    在两个 plan 之间收手", 还理直气壮地说"容器滚动发布正是靠这个不丢半个
+    批次"。codex review 指出来之后一查: 恰恰相反, 丢的就是它。
+
+    ``process_one`` 在 handler 正常返回之后是**无条件** ``finish_job_success``
+    的。编排提前收手 → handler 正常返回 → job 变成终态 success、进度 100%,
+    剩下的 plan 永久跳过, 而且没有任何地方报错。kind 又在
+    ``NON_IDEMPOTENT_JOB_KINDS`` 里(max_attempts 被强制成 1), 重排也兜不回来。
+
+    我把一个"静默丢活儿"的行为当成特性写进了断言 —— 于是这条用例不但没拦住
+    它, 还在替它背书。真正的排空契约在 worker.py 开头: ``_shutdown`` 只管
+    **不再领新 job**, 当前这个跑到底。
+
+    (信任边界那个文件里有同款断言, 那边盯的是 ``_generate_batch_handler``;
+    这条留在这里, 是因为**这个位置**才是当初写错的地方。)
+    """
     import generation_service as gen_service
     captured = {}
 
@@ -223,8 +258,10 @@ def test_handler_passes_the_shutdown_event_so_sigterm_drains(monkeypatch):
 
     monkeypatch.setattr(gen_service, "queue_worker", _fake)
     worker.HANDLERS["generate_batch"](
-        {"id": "j1", "user_id": "u1", "payload": {"plans": [{"a": 1}]}}, _FakeSB())
-    assert captured["stop_event"] is worker._shutdown
+        {"id": "j1", "user_id": "u1",
+         "payload": {"plans": [{"project_id": "p", "count": 1}]}}, _FakeSB())
+    assert captured["stop_event"] is not worker._shutdown
+    assert not captured["stop_event"].is_set()
 
 
 def test_quick_gen_reports_batch_id_back(monkeypatch):

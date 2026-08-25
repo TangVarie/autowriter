@@ -1561,9 +1561,16 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         _set_phase_progress(status, "setup")
 
         project_id = plan["project_id"]
-        project    = db.get_project(db_client, project_id)
+        # ⚠️ 必须走**带 owner 过滤**的那个。这段编排现在两种客户端都会跑到:
+        # UI 传的是用户自己的客户端(RLS 挡着), worker 传的是 service_role
+        # (绕过 RLS)。而 jobs 的 RLS 策略只管 user_id, payload 是自由 JSONB ——
+        # 任何人都能插一条 project_id 指向别人项目的 job。用不带过滤的
+        # get_project, worker 就会把对方的 system_prompt / 校准笔记 / 正反例
+        # 读出来, 并在对方项目下写内容。(队列那条路本来就安全: 它的项目字典
+        # 是 db.list_projects(client, user_id) 建的, 那个查询自带 owner 过滤。)
+        project = db.get_project_owned(db_client, project_id, user_id)
         if not project:
-            raise RuntimeError("项目不存在")
+            raise RuntimeError(f"项目不存在, 或不属于当前调用者: {project_id}")
 
         tactic          = plan.get("tactic", "")
         engines         = plan.get("engines", ["claude"])

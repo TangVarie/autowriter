@@ -253,6 +253,12 @@ def list_projects(_client: Client, user_id: str) -> list[dict]:
 
 
 def get_project(client: Client, project_id: str) -> Optional[dict]:
+    """按 id 取项目, **不带归属过滤** —— 安全性完全靠 client 身上的 RLS。
+
+    ⚠️ 只在 client 是**用户自己的** Supabase 客户端时才可以用。传 service_role
+    客户端进来等于没有任何访问控制(service_role 绕过 RLS), 见下面
+    ``get_project_owned`` 的说明。worker 里一律用那个。
+    """
     res = (
         client.table("projects")
         .select("*")
@@ -261,6 +267,31 @@ def get_project(client: Client, project_id: str) -> Optional[dict]:
         .execute()
     )
     return res.data
+
+
+def get_project_owned(client: Client, project_id: str,
+                      user_id: str) -> Optional[dict]:
+    """按 id + owner 取项目; 不是这个人的就返回 None。
+
+    为什么必须有这个: worker 拿的是 **service_role** 客户端, 它绕过 RLS。而
+    ``jobs`` 的 RLS 策略只约束 ``user_id = auth.uid()``, ``payload`` 是自由
+    JSONB —— 任何已登录用户都能插一条 user_id 是自己、payload 里的 project_id
+    是**别人**项目的 job。worker 领到之后若用不带过滤的 get_project, 就会读走
+    对方的 system_prompt / calibration_notes / 正反例, 并在对方项目下写内容。
+
+    把过滤写进**查询本身**而不是查完再比对: 后者一旦有人漏写一次 if 就又破了,
+    前者是这条 SQL 根本回不出别人的行。(同 deskcore 那次 COR-015 的口径。)
+    """
+    res = (
+        client.table("projects")
+        .select("*")
+        .eq("id", project_id)
+        .eq("owner_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    return rows[0] if rows else None
 
 
 def create_project(

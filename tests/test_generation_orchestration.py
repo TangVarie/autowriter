@@ -82,7 +82,8 @@ def _run_queue(monkeypatch, plans=None, **kw):
 
 def _tail(names: list[str]) -> list[str]:
     """去掉前缀的"取项目"那一步, 剩下的就是共有主干。"""
-    head = {"db.get_project", "db.list_projects", "proj.get_tactic_prompt_suffix"}
+    head = {"db.get_project", "db.get_project_owned", "db.list_projects",
+            "proj.get_tactic_prompt_suffix"}
     return [n for n in names if n not in head]
 
 
@@ -120,11 +121,26 @@ def test_both_paths_agree_step_for_step(monkeypatch):
 # ══════════════════════════════════════════════════════════════════════
 
 def test_difference_1_how_the_project_is_fetched(monkeypatch):
-    """quick 逐个 get_project; queue 批量 list_projects 预取(SUP-004 同款)。"""
+    """quick 逐个取单个项目; queue 批量 list_projects 预取(SUP-004 同款)。
+
+    ⚠️ 这条金标准改过一次, 记下理由(不写理由的金标准就退化成橡皮图章):
+    原来 quick 走的是 ``db.get_project``(不带归属过滤, 安全性全靠 client 上的
+    RLS)。搬进 worker 之后 client 是 service_role, RLS 没了 —— codex review
+    的 P1。改成 ``db.get_project_owned``(过滤写进查询本身)。
+
+    **差异本身没变**: 一条是逐个取, 一条是批量预取。变的只是逐个取的那个函数
+    叫什么、多带一个 user_id。两条路径也仍然各自安全: queue 的
+    ``list_projects`` 本来就带 ``.eq("owner_id", user_id)``。
+    """
     q_rec, _ = _run_quick(monkeypatch)
     k_rec, _ = _run_queue(monkeypatch)
-    assert "db.get_project" in q_rec.names() and "db.list_projects" not in q_rec.names()
-    assert "db.list_projects" in k_rec.names() and "db.get_project" not in k_rec.names()
+    assert ("db.get_project_owned" in q_rec.names()
+            and "db.list_projects" not in q_rec.names())
+    assert ("db.list_projects" in k_rec.names()
+            and "db.get_project_owned" not in k_rec.names())
+    # 不带归属过滤的那个, 两条路径都不许再出现。
+    assert "db.get_project" not in q_rec.names() + k_rec.names(), (
+        "又用回不带 owner 过滤的 get_project 了 —— worker 侧等于没有访问控制")
 
 
 def test_difference_2_tactic_suffix_ordering(monkeypatch):
