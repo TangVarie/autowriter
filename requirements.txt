@@ -19,7 +19,7 @@ supabase>=2.0.0,<3.0
 python-docx>=1.0.0,<2.0
 openpyxl>=3.1.0,<4.0
 requests>=2.31.0,<3.0
-Pillow>=10.0.0,<12.0
+Pillow>=10.0.0,<13.0
 extra-streamlit-components>=0.1.70,<1.0
 # 审计 SUP-003: dedup 的成批余弦走矩阵乘。numpy 本来就是 streamlit 的传递
 # 依赖(requirements.lock 里已经有), 这里【显式】声明是因为 dedup 属于查重硬闸
