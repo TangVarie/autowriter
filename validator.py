@@ -47,6 +47,114 @@ import re
 from typing import Optional
 
 
+# ── 用户正则的安全闸（跨库审计 2026-08-24 SUP-011）────────────────────────
+#
+# ``forbidden_regex`` 的 pattern 是**用户写的**, 直接喂 ``re.search`` 就等于
+# 把 CPU 交给用户。实测 ``(a+)+$`` 配 26 个字符的正文要 6 秒, 每多 2 个字符
+# 翻一倍 —— 正文上百字就是永不返回。
+#
+# ⚠️ **靠截断正文兜不住**: 回溯是输入长度的**指数**, 截到 100 字仍然是 2^100。
+#    Python 的 ``re`` 又**没有超时**(第三方 ``regex`` 才有, 为这一条引一个新
+#    依赖不值当), 而且它在 C 里跑, 线程超时也打不断。
+#    所以吃重的那一层只能是**写入时拒绝危险形状**, 执行期的长度上限只是兜底。
+
+_MAXREPEAT = getattr(re, "MAXREPEAT", 4294967295)
+
+
+def _parse_pattern(pattern: str):
+    """拿到 ``re`` 的解析树。私有 API, 拿不到就返回 None。
+
+    3.11 起叫 ``re._parser``, 之前是顶层 ``sre_parse``。两个都试, 都没有就
+    诚实地返回 None —— 让调用方走保守分支, 而不是假装检查过了。
+    """
+    for mod_name, attr in (("re._parser", "parse"), ("sre_parse", "parse")):
+        try:
+            mod = __import__(mod_name, fromlist=[attr])
+            return getattr(mod, attr)(pattern)
+        except Exception:      # noqa: BLE001 — 解析不了/API 变了都算"拿不到"
+            continue
+    return None
+
+
+def _has_nested_unbounded_repeat(node) -> bool:
+    """树里有没有"无上界重复套无上界重复" —— 灾难性回溯的经典形状。
+
+    ``(a+)+`` / ``(a*)*`` / ``(a+)*`` / ``(.*)*`` 都是这一类: 外层每多匹配
+    一次, 内层的切分方式就翻一倍。
+    """
+    def _walk(seq, inside_unbounded: bool) -> bool:
+        for op, av in seq or ():
+            name = getattr(op, "name", str(op))
+            if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+                _lo, hi, sub = av
+                unbounded = hi >= _MAXREPEAT
+                if unbounded and inside_unbounded:
+                    return True
+                if _walk(sub, inside_unbounded or unbounded):
+                    return True
+            elif name in ("SUBPATTERN", "ATOMIC_GROUP"):
+                sub = av[-1] if isinstance(av, tuple) else av
+                if _walk(sub, inside_unbounded):
+                    return True
+            elif name == "BRANCH":
+                for alt in (av[1] or ()):
+                    if _walk(alt, inside_unbounded):
+                        return True
+            elif name in ("ASSERT", "ASSERT_NOT"):
+                if _walk(av[1], inside_unbounded):
+                    return True
+        return False
+
+    return _walk(node, False)
+
+
+# 拿不到解析树时的保守兜底。宁可误伤几个长得像危险形状的正则, 也不放行 ——
+# 用户看到的是一条明确的"换个写法"提示, 而不是一次几分钟的卡死。
+_NESTED_QUANT_TEXT_RE = re.compile(r"\([^()]*[+*][^()]*\)\s*[+*]")
+
+
+class UnsafeRegex(ValueError):
+    """这条正则会引发灾难性回溯, 不许存、也不许跑。"""
+
+
+def assert_regex_is_safe(pattern: str) -> None:
+    """能编译 **且** 不是灾难性回溯形状, 否则抛。
+
+    ⚠️ 这**不是**完备的判定 —— 重叠分支型(``(a|a)+``)和某些前后缀组合它抓不到,
+    那类需要真正的回溯代价分析。它挡住的是实际会被人写出来的那一类
+    (嵌套无上界量词), 并且**不谎称**自己挡住了全部: 执行期那道长度上限还在。
+    """
+    if not isinstance(pattern, str) or not pattern:
+        raise UnsafeRegex("正则为空")
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise UnsafeRegex(f"正则无法编译: {exc}") from exc
+
+    tree = _parse_pattern(pattern)
+    dangerous = (_has_nested_unbounded_repeat(tree) if tree is not None
+                 else bool(_NESTED_QUANT_TEXT_RE.search(pattern)))
+    if dangerous:
+        raise UnsafeRegex(
+            "这条正则是嵌套的无上界量词(形如 (a+)+ / (a*)* ), 会引发灾难性回溯 —— "
+            "实测 26 个字符就要 6 秒, 每多 2 个字符翻一倍, 正文上百字等于卡死。"
+            "把内层的 + / * 换成确定的次数(如 {1,20}), 或去掉外层的量词。")
+
+
+def regex_is_safe(pattern: str) -> bool:
+    """``assert_regex_is_safe`` 的布尔版。"""
+    try:
+        assert_regex_is_safe(pattern)
+    except UnsafeRegex:
+        return False
+    return True
+
+
+# 执行期喂给 re.search 的正文上限。**这不是主要防线**(见上), 只是让"漏网的
+# 危险形状"和"单纯很慢的正则"都有个天花板。正常稿件远在这个数以内。
+MAX_REGEX_TARGET_CHARS = 20_000
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # 规则解析：从中文短句里抽出可执行的断言
 # ─────────────────────────────────────────────────────────────────────────
@@ -292,15 +400,20 @@ def check_hard_rules(
         elif kind == "forbidden_regex":
             pattern = spec["pattern"]
             try:
-                m = re.search(pattern, combined)
+                # ⚠️ 存量规则也要过这道闸。写入侧的校验只管**以后**存进来的,
+                # 库里那些是在有校验之前写下的 —— 只挡新的等于没挡。
+                # 不安全就当"这条规则没法执行"处理(与编译失败同一条路径:
+                # 不算违规、但埋一行日志), 而不是把生成整个卡死。
+                assert_regex_is_safe(pattern)
+                m = re.search(pattern, combined[:MAX_REGEX_TARGET_CHARS])
                 if m:
                     out.append({
                         "rule":  content,
                         "kind":  kind,
                         "match": m.group(0)[:60],
                     })
-            except re.error as exc:
-                # 正则编译失败不算违规——但要埋一行日志，否则用户在 UI 里
+            except (re.error, UnsafeRegex) as exc:
+                # 正则编译失败**或不安全**都不算违规——但要埋一行日志，否则用户在 UI 里
                 # 看到"硬规则未命中"会以为规则生效了，实际 validator 一直
                 # silent skip。memory.py 的添加路径已在保存前做 re.compile
                 # 校验，这里兜底覆盖"老规则 + 老部署"的情形。
