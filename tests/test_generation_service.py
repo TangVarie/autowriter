@@ -28,22 +28,32 @@ MOVED = [
     "_resolve_queue_strategy", "_set_phase_progress", "_llm_intra_progress",
     "_save_batch_results", "_run_hard_constraint_check", "_try_regen_one",
     "_run_semantic_dedup_pass", "_format_version_for_session",
-    "_sync_approved_to_session", "_resolve_engine_sessions",
+    "_resolve_engine_sessions",
     "_commit_session_tokens", "_update_session_occupancy",
     "_queue_worker",
 ]
 
-# ⚠️ ``_queue_worker_impl`` / ``_quick_gen_worker`` **不在上面那份清单里**。
+# ⚠️ 搬迁之后**被有意改过**的定义: 名字 → (为什么改, 现在谁看着它)。
 #
-# 它们在搬迁的那个 commit 里确实是逐字节的, 但紧接着的 SUP-012 把两处重复的
-# "调 generator"和"落库+查重+硬约束"抽成了 _call_generator / _persist_and_check
-# —— 那是**有意的改动**, 所以逐字节断言对它们不再成立。
+# 逐字节断言只能证明"没动过"。真要改的时候, 从 MOVED 里拿掉一个名字是**必须
+# 的**, 但那一步也最容易变成"删掉就绿了"。所以规矩是: 拿掉的同时必须在这里
+# 登记, 并指明接手的守卫 —— 下面 test_changed_definitions_are_still_guarded
+# 会去核那个守卫文件真的存在、真的提到了这个名字。
 #
-# 把它们从这份清单里去掉**不是**放松要求, 而是换了个更强的守卫:
-# tests/test_generation_orchestration.py 用调用录音逐步钉住它们的行为(23 步
-# 主干 + 7 处已知差异 + 跨 plan 缓存 + 去重池身份)。逐字节只能证明"没动过",
-# 录音能证明"动了但行为没变" —— 后者才是重构需要的东西。
-CHANGED_BY_SUP012 = ["_queue_worker_impl", "_quick_gen_worker"]
+# 逐字节证明"没动过", 行为测试证明"动了但该变的才变" —— 后者才是改代码需要
+# 的东西, 前者只是搬家那一步的临时脚手架。
+CHANGED_SINCE_MOVE: dict[str, tuple[str, str]] = {
+    "_queue_worker_impl": (
+        "SUP-012 抽掉了两段真正重复的代码(_call_generator / _persist_and_check)",
+        "tests/test_generation_orchestration.py"),
+    "_quick_gen_worker": (
+        "同上; 另外归属校验改走 db.get_project_owned(codex P1)",
+        "tests/test_generation_orchestration.py"),
+    "_sync_approved_to_session": (
+        "跨库审计 ROB-015: 原来丢弃 append_session_messages 的返回值, "
+        "报的是「打算写几条」而不是「实际写进去几条」",
+        "tests/test_session_sync_truthfulness.py"),
+}
 
 # 搬迁那一次的 commit 之前, app.py 里还有这些定义。用它取"搬走之前"的样子。
 _MOVE_PARENT = "5e95bfb"
@@ -107,25 +117,34 @@ def test_every_moved_definition_is_byte_identical():
 def test_app_no_longer_defines_them():
     """app.py 里不许留下重复定义 —— 两份会漂, 而且漂了不报错。"""
     cur = _top_level_sources((REPO / "app.py").read_text(encoding="utf-8"))
-    leftover = [n for n in MOVED + CHANGED_BY_SUP012 if n in cur]
+    leftover = [n for n in list(MOVED) + list(CHANGED_SINCE_MOVE) if n in cur]
     assert not leftover, f"app.py 里还留着: {leftover}"
 
 
-def test_the_two_orchestrators_are_still_there_and_guarded():
-    """被 SUP-012 改过的那两个仍然要在, 且**必须**有录音守着。
+def test_changed_definitions_are_still_guarded():
+    """从逐字节清单里拿掉的每一个, 都必须**真的**有守卫接手。
 
-    这条防的是"把逐字节断言里那两个名字删掉就绿了"这种走捷径 —— 删掉之后它们
-    就完全没人看着了。
+    这条防的是唯一那个走捷径的办法: 改了代码之后, 把名字从 MOVED 里删掉就
+    绿了 —— 而删掉之后它就完全没人看着了。所以每拿掉一个, 这里要求:
+
+      1. 它仍然存在于 generation_service.py（不是被顺手删了）;
+      2. 登记的守卫文件**真的存在**;
+      3. 那个文件里**真的提到了这个名字**（不是随便填一个路径应付）。
+
+    第 3 条是有意做成字符串检查的: 它挡不住一个故意写来骗过它的守卫, 但挡得住
+    "顺手填个看起来合理的文件名"这种真正会发生的情况。
     """
     gs = _top_level_sources(
         (REPO / "generation_service.py").read_text(encoding="utf-8"))
-    for name in CHANGED_BY_SUP012:
-        assert name in gs, f"generation_service.py 里没有 {name}"
-    guard = (REPO / "tests" / "test_generation_orchestration.py")
-    assert guard.exists(), "特征化测试不见了 —— 那两个编排就没人看着了"
-    text = guard.read_text(encoding="utf-8")
-    for name in ("queue_worker_impl", "quick_gen_worker"):
-        assert name in text, f"特征化测试里没有覆盖 {name}"
+    for name, (why, guard_path) in CHANGED_SINCE_MOVE.items():
+        assert name in gs, f"generation_service.py 里没有 {name}（{why}）"
+        guard = REPO / guard_path
+        assert guard.exists(), (
+            f"{name} 登记的守卫 {guard_path} 不存在 —— 它现在没人看着")
+        # 私有名在测试里常写成不带下划线的公开别名, 两种都认。
+        text = guard.read_text(encoding="utf-8")
+        assert name in text or name.lstrip("_") in text, (
+            f"守卫 {guard_path} 里根本没提到 {name}")
 
 
 # ══════════════════════════════════════════════════════════════════════
