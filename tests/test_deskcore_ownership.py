@@ -113,6 +113,7 @@ def test_blank_project_id_is_rejected_before_querying():
 # 归属(正负例是个人资产, 粒度比项目更细), 那道校验早就在, 见 test 的最后一节。
 GATED_ENTRYPOINTS = [
     "build_writing_brief", "draw_angles", "check_drafts", "commit_drafts",
+    "export_drafts",
     "record_rule", "record_edit", "save_my_style", "my_style", "borrow_lessons",
 ]
 
@@ -153,6 +154,7 @@ def test_every_project_scoped_entrypoint_calls_the_gate():
     lambda sb, pid: core.draw_angles(sb, pid, 3, user_id=ME),
     lambda sb, pid: core.check_drafts(sb, pid, [], user_id=ME),
     lambda sb, pid: core.commit_drafts(sb, pid, [], user_id=ME),
+    lambda sb, pid: core.export_drafts(sb, pid, batch_id="b-1", user_id=ME),
     lambda sb, pid: core.record_rule(sb, pid, "别用数字开头", user_id=ME),
     lambda sb, pid: core.record_edit(sb, pid, user_id=ME, my_title="改过的标题"),
     lambda sb, pid: core.save_my_style(sb, pid, "笔记", user_id=ME),

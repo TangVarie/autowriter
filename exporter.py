@@ -49,25 +49,97 @@ def _safe_cell_value(value):
     return value
 
 
+# ── lineage 列: 与 Truth Vault 的跨库契约 ──────────────────────────────────
+#
+# ⚠️ **这六个列名不是我们定的**, 是 truth-vault 定的 —— 见那边的
+# ``docs/11-feishu-table-setup.md``「lineage 元数据列」和
+# ``scripts/sync_feishu_notes_to_truth_vault.py`` 里的 ``_LINEAGE_FK_COLS`` /
+# ``_LINEAGE_RAW_EXTRA_COLS``。TV 的 sync **按列名**做特殊处理:
+#
+#   · 两个 UUID 列自动提升进 ``notes.source_autowriter_item_id`` /
+#     ``source_autowriter_version_id``（跨 schema FK）—— ``v_model_comparison``
+#     就 JOIN 在后者上, 模型胜率全靠它;
+#   · 另外四列落 ``notes.raw_extra`` 留痕;
+#   · **六个名字对所有项目全局预声明**, 所以带这些列的行不会被 D-021 拦下。
+#
+# 名字写错的代价**不是丢一列**: 未声明的列会让 D-021 把**整行** quarantine,
+# 那条笔记连正文带指标一起进不了库。跨库审计 COR-002 指的就是这个 ——
+# 之前这里写的是 ``_source_autowriter_ai_engine`` / ``_source_autowriter_
+# version_num``, 两个都不在 TV 认的六个里面。
+#
+# 收成一张表而不是散在两个 builder 里: 两份就会漂, 而漂了不报错 —— 表现是
+# "从某次导出开始, 飞书那边整批笔记悄悄不入库了"。tests/test_lineage_contract.py
+# 拿这张表当判据。
+#
+# 第二个元素 = 从 ``_collect_approved_items`` 产出的行里取哪个 key;
+# ``None`` = 不来自稿件本身（``_exported_at`` 是导出这一刻）。
+LINEAGE_COLUMNS: tuple[tuple[str, Optional[str]], ...] = (
+    ("_source_autowriter_project_id", "project_id"),
+    ("_source_autowriter_batch_id",   "batch_id"),
+    ("_source_autowriter_item_id",    "item_id"),
+    ("_source_autowriter_version_id", "version_id"),
+    # ⚠️ 展示用的「AI引擎」列是 .upper() 过的, 这里必须保留原值 —— TV 按它
+    #    GROUP BY 出模型胜率, 'CLAUDE' 和 'claude' 会被算成两个引擎。
+    ("_ai_engine",                    "ai_engine"),
+    # 飞书那边这一列是**日期**类型（docs/11 的表）, 所以给 ISO 8601。
+    ("_exported_at",                  None),
+)
+
+LINEAGE_HEADERS: tuple[str, ...] = tuple(name for name, _ in LINEAGE_COLUMNS)
+
+
+def _lineage_values(item: dict, exported_at: str) -> list:
+    """按 ``LINEAGE_COLUMNS`` 的顺序取一行的 lineage 值。
+
+    缺的 id 一律写空串而不是跳过 —— 列的**位置**是固定的, 少写一格会让后面
+    所有列串位, 而串位之后每个值看起来都还是合法的字符串。
+    """
+    return [exported_at if key is None else (item.get(key) or "")
+            for _name, key in LINEAGE_COLUMNS]
+
+
 # ── Combined single-column Excel ───────────────────────────────────────────
 
-def build_combined_excel(items: list[dict]) -> bytes:
-    """
-    Build a single-column Excel where every piece of copy occupies one cell.
+CONTENT_HEADER = "内容"
 
-    Cell format (newline-separated within the cell):
+
+def build_combined_excel(items: list[dict],
+                         exported_at: Optional[str] = None) -> bytes:
+    """
+    Build a copy-paste Excel: one cell per piece of copy, plus lineage columns.
+
+    A 列每格的格式（格内换行）:
         标题：[title]
         正文：[body]
         #keyword1 #keyword2 #keyword3
 
-    Designed for copy-paste into Feishu / Notion tables or direct posting.
+    B–G 列是 ``LINEAGE_COLUMNS``，第 1 行是表头。
 
-    2026-05-21：A 列保持单列粘付飞书的用法不变；B 列写一个 JSON 的 lineage
-    包并把整列 hidden=True，给 TV 反向归因用。用户粘付时按列选 A 不会带到
-    B；要做反向归因的脚本读 B 列即可。
+    ── 2026-08-25：lineage 从「隐藏的无名 B 列」改成「命名的可见列」 ──────
+    原来 B 列写的是一个 lineage JSON 包，整列 ``hidden=True``。那个设计在飞书
+    这一侧**结构上就走不通**，两条独立的原因:
+
+      · **没有表头行**（原来 ``enumerate(items, 1)`` 从第 1 行就开始写数据）。
+        飞书按**列名**匹配字段，无名列进不去；TV 的 sync 也是按名认那六列的。
+      · 隐藏列**只有"整表导入"才跟着走**。运营的实际动作是选中可见列复制、
+        粘进飞书表 —— 一粘，隐藏列就没了。truth-vault 的
+        ``docs/11-feishu-table-setup.md`` 结尾把这条单独列为待解决的坑。
+
+    于是这套 lineage 从上线起就没有真的到过飞书:
+    ``truth_vault.v_model_comparison`` JOIN 的是
+    ``notes.source_autowriter_version_id``，那一列一直是空的，view 长期查出来
+    是空集 —— 而且不报错。
+
+    改成可见的命名列之后，运营整片选中粘贴就把六列带过去了。代价是**粘贴时会
+    多带一行表头**，这是有意的取舍: 飞书要靠表头认列，而认不出列的后果（整行
+    被 D-021 quarantine）比多粘一行严重得多。
+
+    ``exported_at`` 只为测试可复现留的口子，正常调用不传。
     """
     if not _OPENPYXL_AVAILABLE:
         raise RuntimeError("openpyxl 未安装，请运行 pip install openpyxl")
+
+    exported_at = exported_at or datetime.now().isoformat(timespec="seconds")
 
     wb = Workbook()
     ws = wb.active
@@ -75,7 +147,12 @@ def build_combined_excel(items: list[dict]) -> bytes:
 
     cell_align = Alignment(vertical="top", wrap_text=True)
 
-    for row_idx, item in enumerate(items, 1):
+    # 第 1 行: 表头。飞书靠它认列 —— 少了这一行，后面写什么都没用。
+    for col_idx, header in enumerate((CONTENT_HEADER, *LINEAGE_HEADERS), 1):
+        ws.cell(row=1, column=col_idx,
+                value=_safe_cell_value(header)).font = Font(bold=True)
+
+    for row_idx, item in enumerate(items, 2):
         title = (item.get("title") or "").strip()
         body  = (item.get("body")  or "").strip()
 
@@ -98,22 +175,17 @@ def build_combined_excel(items: list[dict]) -> bytes:
         cell = ws.cell(row=row_idx, column=1, value=_safe_cell_value("\n".join(parts)))
         cell.alignment = cell_align
 
-        # B 列：lineage JSON。只在有任一 id 时写，避免给老接入方留下一片
-        # 空 JSON object 还要解析。json.dumps 保证 None / 缺失字段都安全。
-        lineage_keys = ("project_id", "batch_id", "item_id", "version_id",
-                        "ai_engine", "version_num")
-        lineage = {k: item.get(k) for k in lineage_keys if item.get(k) is not None}
-        if lineage:
-            b_cell = ws.cell(
-                row=row_idx, column=2,
-                value=_safe_cell_value(json.dumps(lineage, ensure_ascii=False)),
-            )
-            b_cell.alignment = cell_align
+        # lineage: 每个 id 一列, 名字由 TV 定。全空的稿子照样写空格子 ——
+        # 列的位置必须对所有行一致, 否则粘进飞书会串位。
+        for offset, value in enumerate(_lineage_values(item, exported_at), 2):
+            lc = ws.cell(row=row_idx, column=offset, value=_safe_cell_value(value))
+            lc.alignment = cell_align
 
     ws.column_dimensions["A"].width = 80
-    # 隐藏 lineage 列：用户视角看不到，但 TV ingest / 数据脚本仍可读
-    ws.column_dimensions["B"].hidden = True
-    ws.column_dimensions["B"].width = 60
+    for offset in range(len(LINEAGE_COLUMNS)):
+        # 2=B, 3=C … openpyxl 的列字母换算走 get_column_letter, 这里列数固定
+        # 且很小, 直接用 chr 更省一个 import。
+        ws.column_dimensions[chr(ord("B") + offset)].width = 38
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -131,8 +203,14 @@ def build_excel_document(
 ) -> bytes:
     """
     Build an Excel file from approved copy items.
-    Columns: 序号, 标题, 正文, 关键词, AI引擎, 版本
+    Columns: 序号, 标题, 正文, 关键词, AI引擎, 版本 + LINEAGE_COLUMNS
     Optimized for copy-paste into Feishu spreadsheet.
+
+    ⚠️ **当前没有任何调用方** —— 导出中心走的是 ``build_combined_excel``。
+    保留是因为分列形态（标题/正文/关键词各一列）对某些飞书表更合适，真要启用
+    时不必重写。但也正因为没人调，它是最容易和 TV 契约漂开的地方: 跨库审计
+    COR-002 钉的两个错列名就在这个函数里，从写下那天起就没被任何一次真实导出
+    暴露过。所以 lineage 一律走 ``LINEAGE_COLUMNS``，不在这里另写一份。
     """
     if not _OPENPYXL_AVAILABLE:
         raise RuntimeError("openpyxl 未安装，请运行 pip install openpyxl")
@@ -153,19 +231,16 @@ def build_excel_document(
     )
 
     # Headers
-    # 2026-05-21: 末尾 6 列是隐藏 lineage，飞书整表导入会带过去，TV ingest
-    # 用 _source_autowriter_* 反向归因到具体 item / version。AI 引擎 / 版本
+    # 末尾 6 列是 lineage（名字由 TV 定，见 LINEAGE_COLUMNS）。AI 引擎 / 版本
     # 在前 6 列已经有展示用的格式 (.upper() / "v1")，lineage 列保留原值便于
     # 程序消费。
-    headers = [
-        "序号", "标题", "正文", "关键词", "AI引擎", "版本",
-        "_source_autowriter_project_id",
-        "_source_autowriter_batch_id",
-        "_source_autowriter_item_id",
-        "_source_autowriter_version_id",
-        "_source_autowriter_ai_engine",
-        "_source_autowriter_version_num",
-    ]
+    #
+    # 2026-08-25（跨库审计 COR-002）: 这里原来最后两列写的是
+    # ``_source_autowriter_ai_engine`` / ``_source_autowriter_version_num``，
+    # 两个名字 TV 都不认。后者尤其不是改个名的事 —— TV 那一格要的是
+    # ``_exported_at``（**导出时刻**，飞书日期列），和「第几版」是两码事。
+    headers = ["序号", "标题", "正文", "关键词", "AI引擎", "版本",
+               *LINEAGE_HEADERS]
     for col_idx, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font = header_font
@@ -175,6 +250,7 @@ def build_excel_document(
 
     # Data rows
     body_alignment = Alignment(vertical="top", wrap_text=True)
+    exported_at = generated_at or datetime.now().isoformat(timespec="seconds")
     for row_idx, item in enumerate(items, 2):
         keywords = item.get("keywords", [])
         if isinstance(keywords, list):
@@ -189,12 +265,7 @@ def build_excel_document(
             kw_str,
             item.get("ai_engine", "").upper(),
             f"v{item.get('version_num', 1)}",
-            item.get("project_id", ""),
-            item.get("batch_id", ""),
-            item.get("item_id", ""),
-            item.get("version_id", ""),
-            item.get("ai_engine", ""),     # 不带 .upper()，保留原值供 TV ingest
-            item.get("version_num", 1),
+            *_lineage_values(item, exported_at),
         ]
         for col_idx, value in enumerate(row_data, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=_safe_cell_value(value))
@@ -208,10 +279,10 @@ def build_excel_document(
     ws.column_dimensions["D"].width = 25  # 关键词
     ws.column_dimensions["E"].width = 10  # AI引擎
     ws.column_dimensions["F"].width = 8   # 版本
-    # 隐藏 lineage 列：G–L 设宽 30，hidden=True
-    for col_letter in ("G", "H", "I", "J", "K", "L"):
-        ws.column_dimensions[col_letter].hidden = True
-        ws.column_dimensions[col_letter].width = 30
+    # lineage 列 G 起。**不隐藏** —— 隐藏列只有"整表导入"才跟着走, 复制可见列
+    # 粘进飞书就丢了(同 build_combined_excel 的说明)。
+    for offset in range(len(LINEAGE_COLUMNS)):
+        ws.column_dimensions[chr(ord("G") + offset)].width = 30
 
     buf = io.BytesIO()
     wb.save(buf)

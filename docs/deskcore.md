@@ -149,7 +149,7 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 
 ---
 
-## 3. 工具面（11 个）
+## 3. 工具面（12 个）
 
 | 阶段 | 工具 | 说明 |
 |---|---|---|
@@ -158,7 +158,8 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
 | | `borrow_lessons` | 转调 TV 馆员，借真实爆款经验卡 |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
-| | `commit_drafts` | 定稿入库：写指纹 + 给坐标销账 |
+| | `commit_drafts` | 定稿入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账 |
+| 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
 | 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0 |
 | | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
 | | `save_my_style` | 把模型蒸馏好的笔记写回 + 按 `edit_ids` 销账（`record_edit` 的第二步） |
@@ -199,6 +200,42 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 这个分法对应 TV README 原则 2 的 Surface/Essence 分层：两层衰减速度不同，混进一个字段就锁死了跨时间跨产品的迁移性。
 
 vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出来。
+
+### 3.4 交付与 lineage（2026-08-25）
+
+写作台以前**只到 `commit_drafts` 为止**：稿子进了指纹库，然后就没有下文了。用户自己从对话里把文案复制出去，粘进飞书表——粘过去的只有正文，没有任何"这是谁写的哪一版"。
+
+后果不在 autowriter 这边，在回程上。飞书表是 Truth Vault 的数据源，TV 靠 `notes.source_autowriter_version_id` 这个跨 schema FK 把笔记接回 `autowriter.versions`，`v_model_comparison` 就 JOIN 在它上面。那一列一直是空的，所以那个 view **长期查出空集，而且不报错**。
+
+三处一起改才通：
+
+**① `commit_drafts` 建身份。** 入了库的稿子现在有 `batches` / `items` / `versions` 行，返回值带 `batch_id` 和 `version_ids`。
+
+- 建的是 `status='pending'`，决策三列全空。**不能标 `approved`**——TV 的 `sync_autowriter_decisions_to_prepublish.py` 按 `status in ('approved','needs_revision')` 捞行、把捞到的全部当 `evaluator_type='human'` 灌进 `prepublish_evaluations`，而它**还没接** COR-004 那三列。标 approved 等于让每条定稿变成一条伪造的人工评价去校准 TV 的评估模型，且写作台没有"打回"这个动作，灌进去的会是清一色正例。
+- 只给**判定 inserted** 的那几条建。撞车被拒的不建——否则审核页会多出没人交付过的孤儿。
+- 顺序是**先造 id 写进指纹、事后建行**。反过来会留孤儿；这个方向的失败只是 lineage 断掉（退回改之前的状态），可逆，且会报 `identity_warning`。
+
+**② `export_drafts` 出表。** 按 `batch_id`（或 `version_ids`）点名导出，**不看 status**——写作台的稿子是 pending 且永远不会变 approved，走导出中心那条路（`_collect_approved_items` 第一行就是 status 判断）只会导出空。
+
+返回 `xlsx_base64`，调用方自己落盘。不给下载 URL 是因为那要配一套单独的签名鉴权，而本仓审计史上一半的坑都是"半套鉴权"。
+
+**③ lineage 列改成命名可见列。** 原来 `build_combined_excel` 把 lineage 塞在**隐藏的无名 B 列**（整张表连表头都没有）。两条独立原因让它在飞书那侧结构上就走不通：飞书按**列名**匹配字段，无名列进不去；隐藏列只有"整表导入"才跟着走，而运营的实际动作是选中可见列复制粘贴，一粘就没了。TV 的 `docs/11-feishu-table-setup.md` 把后一条单独列为待解决的坑。
+
+现在是 6 个命名可见列，列名**由 TV 定**（`exporter.LINEAGE_COLUMNS` 是唯一真源）：
+
+| 列名 | 去处 |
+|---|---|
+| `_source_autowriter_item_id` | → `notes.source_autowriter_item_id`（FK） |
+| `_source_autowriter_version_id` | → `notes.source_autowriter_version_id`（FK，`v_model_comparison` JOIN 它） |
+| `_source_autowriter_project_id` / `_batch_id` | → `notes.raw_extra` |
+| `_ai_engine` | → `raw_extra`；TV 按它 GROUP BY 出模型胜率，所以**不能 `.upper()`** |
+| `_exported_at` | → `raw_extra`；飞书那边是**日期**列 |
+
+⚠️ 名字写错的代价**不是丢一列**：未声明的列会让 TV 的 D-021 把**整行** quarantine，那条笔记连正文带指标一起进不了库。跨库审计 COR-002 抓的就是 `build_excel_document` 里那两个错名字（`_source_autowriter_ai_engine` / `_source_autowriter_version_num`）——那个函数没有调用方，所以这个错从写下那天起没被任何一次真实导出暴露过。`tests/test_lineage_contract.py` 把六个名字**手抄**在用例里当判据，不从 `exporter` 读（那样就是自己和自己比，永远绿）。
+
+**运营侧前置**：飞书表要先按上表建好这六列，列名逐字相同。`export_drafts` 的返回值里直接带 `columns`，不必翻文档。
+
+**还没接的一段**：指标回流。TV 那边有了归因数据之后，"这个角度产出的稿子后来爆没爆"才能反过来喂 `draw_angles` 和正例池——`angle_ledger` 现在只记 `drawn_at` / `consumed_version_id`，不记结果。那是下一步，不在这次范围里。
 
 ---
 
@@ -379,7 +416,7 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
    | 字段 | 能修吗 |
    |---|---|
    | `opening_hash` | **每一行都能修**——它本来就是 `sha16(normalize(opening))`，而 `opening` 原样存着。这一路是"单独就判死"的最强信号 |
-   | `ngram_hashes` | 只有 `version_id` 非空的行能修（正文在 `versions` 里）。WorkBuddy 经 `commit_drafts` 写进来的行**正文已经不存在了** |
+   | `ngram_hashes` | 只有 `version_id` 非空的行能修（正文在 `versions` 里）。~~WorkBuddy 经 `commit_drafts` 写进来的行**正文已经不存在了**~~ ——  2026-08-25 起 `commit_drafts` 会建 `versions` 行，正文留着了，所以这些行也修得回来（只有那之前写进去的旧行还是修不了） |
 
    返回值里的 `ngram_unrecoverable` 就是修不回来的行数，不为 0 时会带 `warning`。要彻底修只能把那些稿子重新 commit 一遍。
 

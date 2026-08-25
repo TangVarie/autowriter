@@ -746,6 +746,172 @@ def write_fingerprints(sb, rows: list[dict]) -> int:
     return len(rows)
 
 
+# ── 定稿的身份 (batch / item / version) ───────────────────────────────────
+
+# 写作台产出的 version 在 ``versions.ai_engine`` 里的取值。
+#
+# 为什么不写具体模型名: 稿子是**调用方**(WorkBuddy / Claude Code / 任何接了
+# 这个 MCP 的客户端)写的, deskcore 只收成品 —— 服务端并不知道对面是哪个模型,
+# 而且客户端报上来的也不可信。写一个诚实的"来自写作台"比编一个模型名好。
+#
+# TV 的 ``v_model_comparison`` 按 ``ai_engine`` GROUP BY 出胜率, 所以这个值会
+# 自成一档: 「UI 批量生成(claude / gemini)」vs「写作台手写」。那正是想看的对比。
+# 那个 view 已经在排除 ``'truth_vault_sync'``(TV 回写的占位版本), 同一个模式。
+DESKCORE_AI_ENGINE = "deskcore"
+
+# 写作台定稿落库时给 items 的状态。
+#
+# ⚠️ **必须是 pending, 不能是 approved** —— 这不是保守, 是避开一个已经修过一次
+#    的 bug 的新入口。truth-vault 的 ``sync_autowriter_decisions_to_prepublish.py``
+#    按 ``status in ('approved', 'needs_revision')`` 捞行, 把捞到的**全部**写进
+#    ``prepublish_evaluations`` 且 ``evaluator_type='human'`` —— 它现在**不读**
+#    我们刚加的 ``decision_source``(跨库审计 COR-004 的那三列 TV 侧还没接)。
+#
+#    也就是说: 这里只要写 'approved', 每一条写作台定稿都会立刻变成一条"人工评价"
+#    去校准 TV 的评估模型。而写作台从来没有"打回"这个动作, 灌进去的会是**清一色
+#    正例**。COR-004 治的正是"机器判定被当人工反馈", 这里换个门重犯一次。
+#
+#    pending + decision_source 留 NULL = 「这条稿子存在, 但没有任何审核决策」——
+#    这是实话, 而且 TV 的 ``.in_(...)`` 过滤天然把它排除在外。
+#
+#    代价: 这些 item 会出现在审核页的待审列表里。导出中心也只导 approved, 所以
+#    写作台的稿子走自己的导出(tools.export_drafts), 不蹭那条路。
+DESKCORE_ITEM_STATUS = "pending"
+
+
+def mint_draft_identity(sb, project_id: str, user_id: str, tactic: str,
+                        entries: list[dict]) -> dict:
+    """给写作台的定稿建 batch → items → versions, 让它们在库里**有身份**。
+
+    ── 为什么非有不可 ──────────────────────────────────────────────────
+    在此之前, ``commit_drafts`` 只写 ``draft_fingerprints``, ``version_id``
+    留空。core.py 里那段注释自己写着"WorkBuddy 写的稿子 version_id 为空、根本
+    不在 autowriter.versions 里"。后果有三层, 一层比一层远:
+
+      · 回填(``backfill_fingerprints`` 走 items × versions)永远看不到它们;
+      · 角度台账的 ``consumed_version_id`` 只能塞一个 hash 出来的假 UUID;
+      · **导出的 lineage 没有 version_id 可写** —— 而 TV 的
+        ``v_model_comparison`` 正是 JOIN 在 ``autowriter.versions.id`` 上。
+        于是"写作台写的稿子发出去爆没爆"这件事, 在数据上根本问不出来。
+
+    ── id 是调用方先造好的 ────────────────────────────────────────────
+    ``entries`` 里的 ``version_id`` 必须是**已经确定**的 UUID: 指纹行在这之前
+    就已经带着它写进库了(见 core.commit_drafts 的顺序说明)。这里做的是把那个
+    id 兑现成真实的 versions 行, 不是分配 id。
+
+    每次调用建**一个** batch —— 一次 commit 就是一次交付, 这是最自然的分组,
+    也让"这批是写作台写的"在 UI 里一眼可见。
+
+    失败就上抛。调用方负责说清楚"指纹进了但身份没建"这个中间态 —— 静默吞掉的话,
+    lineage 会指向一个不存在的 version, 而那和完全没有 lineage 长得一模一样。
+    """
+    if not entries:
+        return {"batch_id": None, "versions": {}}
+
+    batch = db.create_batch(
+        sb, user_id=user_id, project_id=project_id, tactic=tactic or "",
+        params={"source": "deskcore"},
+        ai_engines=[DESKCORE_AI_ENGINE])
+    batch_id = batch["id"]
+
+    minted: dict[str, str] = {}
+    for e in entries:
+        item = (sb.table("items").insert({
+            "batch_id": batch_id,
+            "user_id": user_id,
+            "status": DESKCORE_ITEM_STATUS,
+        }).execute().data or [{}])[0]
+        item_id = item.get("id")
+        if not item_id:
+            # 不往下走: versions.item_id 是可空的 FK, 带 NULL 插进去**不会报错**,
+            # 只会留下一条挂不到任何 item 上的版本 —— 导出时 item_id 那一列是空的,
+            # TV 那边归因到一半断掉, 而这里一路都是"成功"。
+            raise RuntimeError(
+                f"建 item 之后没拿到 id(batch={batch_id}) —— PostgREST 没回插入行, "
+                "多半是 service client 的 returning 行为变了")
+
+        sb.table("versions").insert({
+            # ⚠️ 显式 id: 指纹行里写的就是它, 让数据库另发一个就等于两边对不上。
+            "id": e["version_id"],
+            "item_id": item_id,
+            "version_num": 1,     # 新建的 item, 不可能有并发的第二版
+            "ai_engine": e.get("ai_engine") or DESKCORE_AI_ENGINE,
+            "title": e.get("title") or "",
+            "body": e.get("body") or "",
+            "keywords": e.get("keywords") or [],
+        }).execute()
+
+        # best_version_id 指向唯一那一版 —— 导出和"挑代表版本"都按它取。
+        sb.table("items").update(
+            {"best_version_id": e["version_id"]}).eq("id", item_id).execute()
+
+        minted[e["version_id"]] = item_id
+
+    return {"batch_id": batch_id, "versions": minted}
+
+
+def drafts_for_export(sb, project_id: str, *, batch_id: str | None = None,
+                      version_ids: list[str] | None = None,
+                      limit: int = 200) -> list[dict]:
+    """取要导出的稿子, 产出 ``exporter`` 认的行形状(带四个 lineage id)。
+
+    ── 为什么不复用导出中心那条路 ──────────────────────────────────────
+    ``app._collect_approved_items`` 第一行就是 ``if item["status"] != "approved"``。
+    而写作台的稿子是 ``pending`` 且**永远不会**变成 approved —— 它们从没进过审核
+    流(理由见 ``DESKCORE_ITEM_STATUS``)。拿那条路导等于永远导出空。
+
+    所以这里按 **batch / version 直接点名**, 不看 status。语义也更对: 调用方要导的
+    是"我刚提交的那一批", 不是"审核通过的那些"。
+
+    ``batches!inner(project_id)`` 这个 inner join 顺带把归属钉死: 别的项目的
+    batch_id 传进来会查不到行, 而不是导出别人的稿子。
+    """
+    if not batch_id and not version_ids:
+        return []
+
+    q = (sb.table("items")
+           .select("id, batch_id, best_version_id, created_at, "
+                   "versions(id, title, body, keywords, ai_engine, version_num), "
+                   "batches!inner(project_id)")
+           .eq("batches.project_id", project_id)
+           .order("created_at", desc=False)
+           .limit(limit))
+    if batch_id:
+        q = q.eq("batch_id", batch_id)
+
+    try:
+        res = q.execute()
+    except Exception:
+        logger.exception("read drafts for export failed (project=%s)", project_id)
+        return []
+
+    wanted = set(version_ids or [])
+    out: list[dict] = []
+    for item in (res.data or []):
+        for v in (item.get("versions") or []):
+            # 点名了 version 就只要点到的; 只给了 batch 就取代表版本。
+            if wanted:
+                if v.get("id") not in wanted:
+                    continue
+            else:
+                best = item.get("best_version_id")
+                if best and v.get("id") != best:
+                    continue
+            out.append({
+                "title": (v.get("title") or "").strip(),
+                "body": (v.get("body") or "").strip(),
+                "keywords": v.get("keywords") or [],
+                "ai_engine": v.get("ai_engine") or "",
+                "version_num": v.get("version_num") or 1,
+                # lineage —— 名字与 exporter.LINEAGE_COLUMNS 的取值 key 对应
+                "project_id": project_id,
+                "batch_id": item.get("batch_id"),
+                "item_id": item.get("id"),
+                "version_id": v.get("id"),
+            })
+    return out
+
+
 def commit_fingerprints_atomic(sb, project_id: str, rows: list[dict],
                                user_id: str | None,
                                ngram_hard: float,
