@@ -1304,6 +1304,310 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 部署自检 —— 这个库到底跑到第几个迁移了
+# ══════════════════════════════════════════════════════════════════════
+#
+# ── 为什么非有这一段不可 ──────────────────────────────────────────────
+#
+# `migrations/README.md` 写着「五个迁移都设计成不跑也不会坏」。那句话是真的,
+# 代价却是**没跑这件事在运行期完全看不见**: 004/005 缺席只埋一行 telemetry 就
+# 退回慢路径, 短稿照搬长稿从此抓不到; 006 缺席则是另一种 —— 现有工作台每一次
+# 「通过 / 打回」都会撞上 PostgREST 的 `column ... does not exist`。
+#
+# 这正是本仓反复栽的那个形状(runbook §5「文档与实际不一致」整节都是它):
+# 文字写着已经有了, 实际没有, 而且不报错。2026-08-26 实测生产库
+# (kduysqedr) 的结果是 **只跑了 001** —— 而 runbook §0 当时写的是
+# 「schema 也上了生产」。查一次库就知道, 但在这之前没有任何一条命令能查。
+#
+# ── 三条实现纪律 ──────────────────────────────────────────────────────
+#
+# 1. **判据必须与真正消费它的代码同源。** 这里一律走 `store.rpc_missing`,
+#    不另写一套字符串匹配。deskcore.md §4.2 记过反例: /health 自己读一遍 env,
+#    于是回显着一个从未被调用过的模型名, 配错依然当场看不见。
+#
+# 2. **探测一律只读。** 写类 RPC 用「空 `_rows`」调 —— 那时函数体的 FOR 循环
+#    一次都不进(见 migrations/005 的函数体), 只取一次事务级 advisory lock,
+#    不写任何行。CAS 那个用 nil UUID + 不可能匹配的 witness, UPDATE 命中 0 行。
+#
+# 3. **探不到的要说"探不到", 不许猜。** 003 建的是唯一索引, PostgREST 看不见
+#    索引 —— 所以它报 `unprobeable` 并把该跑的 SQL 一起交出来, 而不是按
+#    "别的都在, 它八成也在" 蒙一个 applied。蒙对了没人受益, 蒙错了正好复现
+#    这一整段想根治的那个失败形态。
+
+# 匹配不到任何真实行的 UUID。探测只读的前提之一 —— 用它当 project_id/user_id,
+# 就算某个探测函数真的会写, 它也没有行可写。
+_PROBE_NIL_UUID = "00000000-0000-0000-0000-000000000000"
+
+# 一定不等于任何一份 calibration_notes 的 md5(md5('') 是 d41d8c...)。
+_PROBE_IMPOSSIBLE_MD5 = "0" * 32
+
+# 001 建的四张表, 以及探它们用的那一列。四张表都有 ``project_id``(它们全都
+# 挂在项目下), 这不是巧合而是设计 —— 但**别把它当理所当然**: 见下面探测处的
+# 注释, 用 ``id`` 探的第一版在 user_calibration_notes 上就是错的。
+_MIGRATION_001_TABLES = ("angle_ledger", "draft_fingerprints",
+                         "user_calibration_notes", "style_edits")
+_MIGRATION_001_PROBE_COLUMN = "project_id"
+
+# backfill 自己那条路的上限(``store.legacy_version_pages`` 的默认 limit)。
+# backfill_gap 刻意**不**用它扫描, 只用它判"这个项目大到 backfill 追不平了"。
+_BACKFILL_DEFAULT_CAP = 5000
+
+# 唯一一个"不跑就当场坏"的迁移 —— 其余几个缺席都是降级 + 留痕。所以它在补救
+# 清单里必须排最前面, 与 runbook 的 `006 → 002 → 003 → 004 → 005` 一致。
+MIGRATION_RUN_FIRST = "006_item_decision_provenance.sql"
+
+MIGRATION_UNPROBEABLE_SQL = (
+    "select indexname from pg_indexes where schemaname='autowriter' "
+    "and indexname='versions_item_version_uniq';"
+)
+
+
+def _probe_ok(fn, *, predicate=None) -> tuple[str, str]:
+    """跑一个只读探测。返回 (state, note)。
+
+    判据说"这个对象不存在"→ ``missing``; 其余异常 → ``error``(**不是**
+    missing) —— 权限、参数、库故障被当成"迁移没跑"正是 store.py 里那一大段
+    注释在防的事。
+
+    ⚠️ **两种判据, 按探的是什么分**(codex review · #63, 实测确认):
+
+      · **RPC** 探测用 ``store.rpc_missing``(默认) —— 与运行期降级用的**同一个**
+        函数。同源是这里的重点: 自检说"RPC 在", 运行期就不该判它不在。
+      · **表 / 列** 探测用 ``store.schema_object_missing`` —— 因为
+        ``rpc_missing`` 对缺表返 False: PostgREST 回的是 ``PGRST205
+        Could not find the table ... in the schema cache``, 三个条件一个都不沾。
+        照旧用它的话, 一个**真的没跑 001** 的库会被报成 ``error`` 并写着
+        "不是「没跑迁移」" —— 正好说反, 而这个命令存在的全部意义就是别说反。
+        表/列这一路没有运行期对应物(运行期不该因为缺表就降级), 所以宽一档不
+        破坏同源那条纪律。
+    """
+    check = predicate or store.rpc_missing
+    try:
+        fn()
+    except Exception as exc:                       # noqa: BLE001 — 探测就是要看异常
+        if check(exc):
+            return "missing", f"{type(exc).__name__}: {exc}"[:200]
+        return "error", (f"探测本身失败(不是「没跑迁移」): "
+                         f"{type(exc).__name__}: {exc}"[:200])
+    return "applied", "ok"
+
+
+def _probe_signature(client, name: str, wide: dict, narrow: dict,
+                     wide_tag: str, narrow_tag: str) -> tuple[str, str]:
+    """先按新签名调, 报"找不到"再按旧签名调 —— 与 store.py 的两处同一套路。
+
+    区分"函数完全不存在"和"函数在、但还是旧签名"是这里的全部意义:
+    PostgREST 对**参数对不上**的报错文本里也带 ``does not exist``, 只看一次
+    调用会把"库停在 004"误报成"001 都没跑"(审计 COR-014 记过这个坑)。
+    """
+    state, note = _probe_ok(lambda: client.rpc(name, wide).execute())
+    if state != "missing":
+        return (wide_tag if state == "applied" else state), note
+    state, note = _probe_ok(lambda: client.rpc(name, narrow).execute())
+    if state == "applied":
+        return narrow_tag, "函数在, 但还是旧签名"
+    return state, note
+
+
+def migration_state(client) -> dict:
+    """逐个探测: 这个库跑到第几个迁移了, 缺的那些各自会怎样。
+
+    只读。返回 ``{"ok": bool, "checks": [...], "missing": [...],
+    "unprobeable": [...]}``; ``checks`` 每项带 ``migration`` / ``state`` /
+    ``impact``, 让人不必翻文档就知道缺了要紧不要紧。
+
+    ``ok`` 的口径是**没有一项 missing 或 error**。``unprobeable`` 不算不 ok
+    —— 探不到不等于没跑, 把它算进去会让这条命令永远报红, 而永远报红的检查
+    等于没有检查。
+    """
+    checks: list[dict] = []
+
+    def _add(migration: str, what: str, state: str, note: str, impact: str) -> None:
+        checks.append({"migration": migration, "probe": what,
+                       "state": state, "note": note, "impact": impact})
+
+    # ── 001: 四张表 + items.updated_at ──
+    #
+    # ⚠️ 取的列是 ``project_id`` 而不是 ``id``。``user_calibration_notes`` 的
+    # 主键是 ``(project_id, user_id)`` —— **它没有 id 列**。探一个不存在的列,
+    # PostgREST 报的是 `column "id" does not exist`, 而那句话正好被
+    # ``rpc_missing`` 认成"迁移没跑" —— 于是在一个 001 明明跑过的库上报 missing,
+    # 把人打发去重跑一遍迁移。这个探测器存在的全部意义就是不出这种错。
+    #
+    # 第一版就是 ``.select("id")``, 而假件不校验列名, 所以测试给了个假的绿 ——
+    # 与审计 §0.5 那条"录音机记得不够细, 得到的绿是假的"同一件事。现在
+    # ``tests/test_migration_doctor.py`` 会去 001 的 SQL 里核对这个列真的存在。
+    for table in _MIGRATION_001_TABLES:
+        state, note = _probe_ok(
+            lambda t=table: client.table(t)
+            .select(_MIGRATION_001_PROBE_COLUMN).limit(1).execute(),
+            predicate=store.schema_object_missing)
+        _add("001_deskcore.sql", f"表 {table}", state, note,
+             "deskcore 整个不可用")
+    state, note = _probe_ok(
+        lambda: client.table("items").select("id,updated_at").limit(1).execute(),
+        predicate=store.schema_object_missing)
+    _add("001_deskcore.sql", "items.updated_at", state, note,
+         "TV 的 sync_autowriter_decisions_to_prepublish 会降级回只按 created_at, "
+         "迟到的人工决策重新开始漏收")
+
+    # 001 建的还有这个 RPC —— 漏探它的代价是**静默的**: 表都在, doctor 报
+    # "001 到位", 而 store.reserve_angles 每次都判 RPC 不存在、降级成非原子发牌,
+    # 于是两个人同时发牌能拿到同一组角度坐标, 两边都报成功。部分/手工部署或
+    # schema 漂移下这是会发生的。(codex review · #63)
+    #
+    # ``_want: 0`` 是可证明的 no-op: 函数体第一句就是 `IF _want <= 0 THEN
+    # RETURN; END IF;`, 连 advisory lock 都还没取。
+    state, note = _probe_ok(lambda: client.rpc("deskcore_reserve_angles", {
+        "_project_id": _PROBE_NIL_UUID,
+        "_candidates": [],
+        "_drawn_by": _PROBE_NIL_UUID,
+        "_want": 0,
+        "_avoid_days": 30,
+    }).execute())
+    _add("001_deskcore.sql", "deskcore_reserve_angles", state, note,
+         "发牌退回非原子路径 —— 两人同时发牌可能拿到同一组角度坐标, "
+         "而两边都报成功(台账事后也看不出来)")
+
+    # ── 002: CAS RPC。nil 项目 + 不可能匹配的 witness → UPDATE 命中 0 行 ──
+    state, note = _probe_ok(lambda: client.rpc("update_calibration_notes_cas", {
+        "_project_id": _PROBE_NIL_UUID,
+        "_expected_md5": _PROBE_IMPOSSIBLE_MD5,
+        "_notes": "",
+    }).execute())
+    _add("002_calibration_cas.sql", "update_calibration_notes_cas", state, note,
+         "长笔记(>4000 字级)的自动学习静默停摆 —— 四条学习路径全部不再写回, "
+         "而且不报错")
+
+    # ── 003: 唯一索引。PostgREST 看不见索引, 只能交出 SQL ──
+    _add("003_versions_unique_num.sql", "versions_item_version_uniq (唯一索引)",
+         "unprobeable",
+         "PostgREST 读不到 pg_indexes; 用 SQL Editor 跑: " + MIGRATION_UNPROBEABLE_SQL,
+         "少了数据库层对重复 version_num 的保护(应用层重试本身不依赖它)")
+
+    # ── 004: 指纹计数 RPC ──
+    state, note = _probe_ok(lambda: client.rpc(
+        "deskcore_fingerprint_counts",
+        {"_project_ids": [_PROBE_NIL_UUID]}).execute())
+    _add("004_deskcore_check_pushdown.sql", "deskcore_fingerprint_counts",
+         state, note, "list_projects 退回逐项目 count(2N+1 次查询)")
+
+    # ── 004/005: check 的两版签名 ──
+    state, note = _probe_signature(
+        client, "deskcore_check_drafts",
+        wide={"_project_id": _PROBE_NIL_UUID, "_rows": [],
+              "_contain_min_sample": fp.CONTAIN_MIN_SAMPLE},
+        narrow={"_project_id": _PROBE_NIL_UUID, "_rows": []},
+        wide_tag="applied", narrow_tag="old_signature")
+    _add("005_deskcore_containment.sql", "deskcore_check_drafts(3 参)",
+         state, note,
+         "缺席→查重退回 Python 逐对比对(慢, 回到 4000 条上限); "
+         "旧签名→包含度那一路不发言, **短稿整段照搬长稿在 check 这一关拦不住**")
+
+    # ── 001/005: commit 的两版签名。空 _rows 时函数体的 FOR 一次都不进 ──
+    state, note = _probe_signature(
+        client, "deskcore_commit_fingerprints",
+        wide={"_project_id": _PROBE_NIL_UUID, "_rows": [],
+              "_user_id": _PROBE_NIL_UUID,
+              "_ngram_hard": fp.NGRAM_JACCARD_HARD,
+              "_contain_hard": fp.NGRAM_CONTAIN_HARD,
+              "_contain_min_sample": fp.CONTAIN_MIN_SAMPLE},
+        narrow={"_project_id": _PROBE_NIL_UUID, "_rows": [],
+                "_user_id": _PROBE_NIL_UUID,
+                "_ngram_hard": fp.NGRAM_JACCARD_HARD},
+        wide_tag="applied", narrow_tag="old_signature")
+    _add("005_deskcore_containment.sql", "deskcore_commit_fingerprints(6 参)",
+         state, note,
+         "缺席→定稿退回直插, check/commit 之间的竞态窗口重新打开; "
+         "旧签名→竞态仍关着, 但写入侧不做包含度重查")
+
+    # ── 006: 决策出处三列。⚠️ 这一条不跑是**硬失败**, 不是降级 ──
+    state, note = _probe_ok(lambda: client.table("items")
+                            .select("id,decision_source,reviewer_id,decided_at")
+                            .limit(1).execute(),
+                            predicate=store.schema_object_missing)
+    _add("006_item_decision_provenance.sql", "items 的决策出处三列", state, note,
+         "⚠️ 硬失败: db.update_item_status 无条件写这三列, 缺列会让现有工作台的"
+         "「通过 / 打回」、硬规则自动标记、查重自动标记**全部报错**。"
+         "这个迁移与其它几个不同, **不是可选的**")
+
+    # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
+    # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
+    # 一遍根本不缺的 SQL, 而同一份输出里那条 note 明明写着"不是「没跑迁移」"。
+    # 一个自检工具给出**互相矛盾的**结论, 比它不存在更坏。
+    #
+    # 两者都判红(见 ok), 但补救方式完全不同, 所以必须分开报。
+    missing = sorted({c["migration"] for c in checks
+                      if c["state"] in ("missing", "old_signature")})
+    errors = sorted({c["migration"] for c in checks if c["state"] == "error"})
+    return {
+        "ok": not missing and not errors,
+        "checks": checks,
+        "missing": missing,
+        "errors": errors,
+        "unprobeable": sorted({c["migration"] for c in checks
+                               if c["state"] == "unprobeable"}),
+    }
+
+
+def backfill_gap(client, project_id: str) -> dict:
+    """这个项目的指纹回填还差多少 —— 用**与 backfill 完全同一套口径**算。
+
+    ⚠️ 故意不做归属校验, 理由同 backfill_fingerprints / reembed_fingerprints:
+    这是运维命令, 跑它的人手里握着 service_role key。
+
+    ── 为什么不是一句 SQL ──────────────────────────────────────────────
+    runbook 里原本给的是一段手写 SQL(``items × batches × versions`` 三表 join)。
+    那是把回填的口径**抄了第二份**: backfill 只取 items × versions 里"有版本的
+    item", 而抄出来的那份一旦和 `store.legacy_version_pages` 漂开, 验收标准
+    就会在"主力项目还差几百条"的时候报绿 —— 而验收标准报绿正是本仓最怕的那
+    一类失败。这里直接调回填自己用的那两个函数, 两者不可能漂。
+
+    ⚠️ **扫全量, 不带上限**(``limit=None``)。``legacy_version_pages`` 默认
+    ``limit=5000`` —— 沿用它的话, 一个 5000 条以上的项目在最新那 5000 条补齐之后
+    就会被报成"还差 0 / done"，而更老的历史稿从来没进过查重基线。**一个只看了
+    前 5000 条的验收标准报出来的绿是假的**, 而验收标准报假绿正是本仓最怕的那类
+    失败(runbook §5 整节)。(codex review · #63)
+
+    回填本身**仍然**带 5000 上限, 那是它的已知边界 —— 所以 ``eligible`` 超过
+    上限时这里会带一条 ``backfill_capped_warning``: 那种项目靠 backfill 追不平,
+    需要先把 cap 调高。诚实地说出来, 好过让两个数永远对不上而没人知道为什么。
+
+    只读: 只数数, 不写指纹。
+    """
+    done = store.existing_fingerprint_version_ids(client, project_id)
+    eligible: set[str] = set()
+    for page in store.legacy_version_pages(client, project_id, limit=None):
+        for row in page:
+            vid = row.get("version_id")
+            if vid:
+                eligible.add(str(vid))
+
+    todo = eligible - done
+    out = {
+        "project_id": project_id,
+        "eligible": len(eligible),         # backfill 口径下"应有"的条数
+        "backfilled": len(eligible & done),
+        "todo": len(todo),
+        # ⚠️ 真的去数一次行数。这里原来写的是 len(done) —— 而 done 来自
+        # existing_fingerprint_version_ids, 它过滤掉了 version_id 为空的行、
+        # 还去了重。也就是说它**恰恰数不到**写作台经 commit_drafts 写进来的
+        # 那批(那批的 version_id 就是空的), 而 CLI 的说明文字还专门写着
+        # "含 commit_drafts 写进来的" —— 正好说反。(codex review · #63)
+        "fingerprints_total": store.fingerprint_row_count(client, project_id),
+    }
+    out["done"] = not todo
+    if todo:
+        out["next"] = (f"python -m deskcore.cli backfill --project {project_id}")
+    if len(eligible) > _BACKFILL_DEFAULT_CAP:
+        out["backfill_capped_warning"] = (
+            f"这个项目有 {len(eligible)} 条待回填, 超过 backfill 自己的上限 "
+            f"{_BACKFILL_DEFAULT_CAP} —— 跑一次追不平, 得先把 "
+            f"store.legacy_version_pages 的 limit 调高")
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 反馈学习
 # ══════════════════════════════════════════════════════════════════════
 

@@ -3,6 +3,7 @@
 用法:
   python -m deskcore.cli selftest                 ← 不连库不联网, 验查重/发牌/词表
   python -m deskcore.cli health
+  python -m deskcore.cli doctor [--project <uuid>]  ← 上线前必跑: 库跑到第几个迁移了
   python -m deskcore.cli projects --user <uuid>
   python -m deskcore.cli open  --project <uuid> --user <uuid> [--tactic ...]
   python -m deskcore.cli draw  --project <uuid> --user <uuid> -n 20 [--block]
@@ -183,6 +184,93 @@ def selftest() -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# doctor —— 上线前的那一次"别信文档, 去查库"
+# ══════════════════════════════════════════════════════════════════════
+
+_STATE_MARK = {
+    "applied": "✓",
+    "missing": "✗",
+    "old_signature": "△",     # 函数在, 但停在旧签名(库只跑到 004)
+    "unprobeable": "?",
+    "error": "!",             # 探测本身失败 —— 不等于"没跑迁移"
+}
+
+
+def _doctor(core, sb, project_id: str | None) -> int:
+    """把 ``core.migration_state`` 的结果排版出来, 并给出下一步。
+
+    退出码: 有 missing / old_signature / error 时返 1 —— 让它能直接写进
+    上线脚本, 而不是靠人读输出。``unprobeable`` 不影响退出码(见
+    ``core.migration_state`` 的说明: 永远报红的检查等于没有检查)。
+    """
+    state = core.migration_state(sb)
+
+    print("迁移状态(实测这个库, 不是照文档抄):\n")
+    last = None
+    for c in state["checks"]:
+        if c["migration"] != last:
+            print(f"  {c['migration']}")
+            last = c["migration"]
+        mark = _STATE_MARK.get(c["state"], "?")
+        print(f"    {mark} {c['probe']:38s} {c['state']}")
+        if c["state"] != "applied":
+            print(f"        ↳ {c['note']}")
+            print(f"        ↳ 不跑的后果: {c['impact']}")
+
+    if state["unprobeable"]:
+        print("\n探不到(PostgREST 够不着, 得自己用 SQL Editor 查):")
+        for m in state["unprobeable"]:
+            print(f"  ? {m}")
+
+    # ⚠️ error 单独一段, **不能**混进"还缺这些迁移"(codex review · #63)。
+    # 权限/连通性故障混进去的话, 这里会指挥人去跑一遍根本不缺的 SQL, 而上面
+    # 那条 note 明明写着"不是「没跑迁移」"—— 自检工具给出互相矛盾的结论,
+    # 比它不存在更坏。两者都判红, 但补救方式完全不同。
+    if state.get("errors"):
+        print("\n探测失败(**不是**缺迁移 —— 先查权限 / 连通性, 别急着跑 SQL):")
+        for m in state["errors"]:
+            print(f"  ! {m}")
+
+    if state["missing"]:
+        # 006 提前: 它是唯一一个不跑就当场坏的, 其余缺席都只是降级。按字典序
+        # 打印会把它排在最后, 于是照着做的人会在"审稿按钮全报错"的状态下先跑
+        # 完 002-005(其中 003 还要改数据), 而那份 runbook 写的是 006 优先。
+        # 工具和文档给出不同的顺序, 人只会信工具。
+        ordered = ([core.MIGRATION_RUN_FIRST]
+                   if core.MIGRATION_RUN_FIRST in state["missing"] else [])
+        ordered += [m for m in state["missing"] if m != core.MIGRATION_RUN_FIRST]
+
+        print("\n还缺这些迁移 —— **按这个顺序跑**:")
+        for m in ordered:
+            first = "   ← 先跑这个" if m == core.MIGRATION_RUN_FIRST else ""
+            print(f"  · migrations/{m}{first}")
+        if core.MIGRATION_RUN_FIRST in state["missing"]:
+            print("\n⚠️ 006 与其它几个不是一类: 它不跑不是降级, 是现有工作台的"
+                  "「通过 / 打回」当场报错 —— 所以它排在最前面, "
+                  "别让 003 那种要改数据的迁移把它挡在后面。")
+    elif not state.get("errors"):
+        print("\n迁移: 全部到位。")
+
+    if project_id:
+        gap = core.backfill_gap(sb, project_id)
+        print(f"\n指纹回填缺口({project_id}):")
+        print(f"  应有(items × versions 的最新版) : {gap['eligible']}")
+        print(f"  已回填                          : {gap['backfilled']}")
+        print(f"  还差                            : {gap['todo']}")
+        print(f"  指纹表这个项目共                : {gap['fingerprints_total']} 行"
+              "  (含写作台 commit_drafts 写进来的, 它们不在上面的分母里)")
+        if gap.get("backfill_capped_warning"):
+            print(f"\n  ⚠️ {gap['backfill_capped_warning']}")
+        if not gap["done"]:
+            print(f"\n  → {gap['next']}")
+        elif gap["eligible"] == 0:
+            print("\n  ⚠️ 这个项目一条历史成稿都没有 —— 不是全新项目的话, "
+                  "检查 project_id 是不是传错了。")
+
+    return 0 if state["ok"] else 1
+
+
+# ══════════════════════════════════════════════════════════════════════
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="deskcore", description="写作台内核 CLI")
@@ -190,6 +278,14 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("selftest", help="不连库验查重/发牌/词表")
     sub.add_parser("health", help="回显配置与依赖可用性")
+
+    # doctor 也是运维命令(同 backfill/reembed), 所以没有 --user。它只读,
+    # 且不碰任何具体项目的内容 —— 传 --project 时只数条数, 不看正文。
+    p = sub.add_parser(
+        "doctor",
+        help="上线前自检: 这个库跑到第几个迁移了, 缺的那些各自会怎样")
+    p.add_argument("--project", default=None,
+                   help="附带报这个项目的指纹回填缺口(与 backfill 同口径)")
 
     # ⚠️ 审计 COR-015 之后, 凡是走 MCP 工具那条路的子命令都要 --user: 归属校验
     # 在 core 层, CLI 和 MCP 走的是同一个函数, 不带身份一样会被拒。
@@ -250,6 +346,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     sb = core.sb()
+    if args.cmd == "doctor":
+        return _doctor(core, sb, args.project)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user))
     elif args.cmd == "open":
