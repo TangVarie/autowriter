@@ -193,6 +193,7 @@ _STATE_MARK = {
     "old_signature": "△",     # 函数在, 但停在旧签名(库只跑到 004)
     "unprobeable": "?",
     "error": "!",             # 探测本身失败 —— 不等于"没跑迁移"
+    "denied": "⛔",           # 表建出来了, 但没发 GRANT(42501) —— 跑 007
 }
 
 
@@ -240,10 +241,14 @@ def _doctor(core, sb, project_id: str | None) -> int:
                    if core.MIGRATION_RUN_FIRST in state["missing"] else [])
         ordered += [m for m in state["missing"] if m != core.MIGRATION_RUN_FIRST]
 
+        denied = set(state.get("denied") or ())
         print("\n还缺这些迁移 —— **按这个顺序跑**:")
         for m in ordered:
             first = "   ← 先跑这个" if m == core.MIGRATION_RUN_FIRST else ""
-            print(f"  · migrations/{m}{first}")
+            # 缺 GRANT 和缺对象长得完全不一样, 别让人对着一个"表明明在"的库
+            # 反复重跑建表 SQL 找不着北。
+            why = "   (表在, 缺的是 GRANT)" if m in denied else ""
+            print(f"  · migrations/{m}{first}{why}")
         if core.MIGRATION_RUN_FIRST in state["missing"]:
             print("\n⚠️ 006 与其它几个不是一类: 它不跑不是降级, 是现有工作台的"
                   "「通过 / 打回」当场报错 —— 所以它排在最前面, "

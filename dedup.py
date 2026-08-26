@@ -10,8 +10,9 @@ flags them as the same "angle" regardless of wording.
 
 Design choices:
 - Uses the project's existing ``google-genai`` dependency (no new package).
-- Embeddings are 768-dim (Gemini ``text-embedding-004``); persisted to
-  Supabase as ``vector(768)`` once the schema migration runs.
+- Embeddings are 768-dim; persisted to Supabase as ``vector(768)``.
+  模型是 ``gemini-embedding-001``, 它默认回 3072 维, 靠 ``output_dimensionality``
+  截到 768 —— 见 EMBEDDING_MODEL 上面那段(前一个模型 text-embedding-004 已下线)。
 - The whole module is a no-op when ``GOOGLE_API_KEY`` is missing or the
   embedding call fails — callers must handle ``embeddings_available()``
   returning False and degrade to text-only dedup.
@@ -19,10 +20,13 @@ Design choices:
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Optional
 
 import clients
+
+logger = logging.getLogger("dedup")
 
 # 审计 SUP-003: 逐元素纯 Python 的余弦在这里是主要成本。
 # 队列去重池上限 2000 条 × 768 维, 每批 10 条新标题 = 1536 万次乘加 + 同量级的
@@ -55,7 +59,23 @@ HARD_DUPLICATE_THRESHOLD: float = 0.92
 RISK_THRESHOLD: float = 0.85
 
 EMBEDDING_DIM: int = 768
-EMBEDDING_MODEL: str = "text-embedding-004"
+
+# ⚠️ 改这个名字之前先读完这段。
+#
+# 2026-08-26 首次真部署时发现 ``text-embedding-004`` 已经**下线**了 ——
+# API 回 404「is not found for API version v1beta, or is not supported for
+# embedContent」。而这条路径每一层都是静默的(见 embed_texts 的注释), 所以
+# 表现不是报错, 是 check_drafts 的 semantic_degraded 悄悄变 true, 四路信号
+# 里最贵的那一路从此不发言。
+#
+# ``gemini-embedding-001`` **默认输出 3072 维**, 而库里三列都是 vector(768)
+# (draft_fingerprints.title_embedding / versions.embedding / memories.embedding)。
+# 靠 output_dimensionality 截到 768, 不动 schema —— 见 embed_texts。
+#
+# 余弦不受截断影响: 本模块的 cosine_similarity 除以模长, pgvector 的 `<=>`
+# 也是余弦距离, 两条路径都归一化。**唯一的硬约束就是维度必须等于
+# EMBEDDING_DIM**, 而那一条由 embed_texts 里的守卫盯着。
+EMBEDDING_MODEL: str = "gemini-embedding-001"
 
 
 def _get_client():
@@ -84,15 +104,29 @@ def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
         return []
     client = _get_client()
     if client is None:
+        logger.warning("embed_texts: 没有 genai client(GOOGLE_API_KEY 未配 "
+                       "或 SDK 未安装) —— 本次退化为纯确定性查重")
         return None
     safe = [(t or "")[:1024] for t in texts]
     try:
-        # google-genai accepts a list of contents and returns parallel embeddings
+        # google-genai accepts a list of contents and returns parallel embeddings。
+        #
+        # ⚠️ output_dimensionality 不是可选的调参: gemini-embedding-001 默认回
+        # 3072 维, 而库里是 vector(768)。不截的话写库直接报维度不符, 更糟的是
+        # 在只比不写的路径上 cosine_similarity 因 len(a) != len(b) **静默返回
+        # 0.0** —— 查重变哑弹且不报错(与 R-034 的 _parse_pgvector 同款形状)。
         resp = client.models.embed_content(
             model=EMBEDDING_MODEL,
             contents=safe,
+            config={"output_dimensionality": EMBEDDING_DIM},
         )
     except Exception:
+        # ⚠️ 这里原来是裸 ``except Exception: return None``, **一行日志都不打**。
+        # 代价在 2026-08-26 首次部署时兑现了: text-embedding-004 下线之后, 表面
+        # 现象只是 semantic_degraded 悄悄变 true, Railway 日志里干干净净, 最后
+        # 是靠人肉 curl 才问出「模型 404」。降级可以静默, 但**降级的原因不行**。
+        logger.exception("embed_texts: embed_content 调用失败 (model=%s, n=%d) "
+                         "—— 本次退化为纯确定性查重", EMBEDDING_MODEL, len(safe))
         return None
 
     # The SDK wraps the embeddings as a list of objects with a `.values`
@@ -103,11 +137,29 @@ def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
         for e in resp.embeddings:
             vals = getattr(e, "values", None) or getattr(e, "embedding", None)
             if vals is None:
+                logger.error("embed_texts: 返回里有一条没有 values/embedding 字段 "
+                             "—— SDK 形状变了? (model=%s)", EMBEDDING_MODEL)
                 return None
             out.append(list(vals))
-        return out
     except Exception:
+        logger.exception("embed_texts: 解析返回失败 (model=%s)", EMBEDDING_MODEL)
         return None
+
+    # ── 维度守卫 ──────────────────────────────────────────────────────────
+    # 换模型 / 换 SDK / output_dimensionality 被谁改掉, 都会从这里冒出来。
+    # **必须整批作废而不是把不对的向量传下去**: 长度不符时 cosine_similarity
+    # 返回 0.0, 于是"查重跑了、全 pass、看着一切正常", 而它一条都抓不到。
+    # 宁可降级成纯确定性(那条路仍然有效且会在 summary 里报出来), 也不要一个
+    # 假装在工作的语义信号。
+    bad = next((len(v) for v in out if len(v) != EMBEDDING_DIM), None)
+    if bad is not None:
+        logger.error(
+            "embed_texts: 维度不符 —— 期望 %d, 拿到 %d (model=%s)。整批作废, "
+            "本次退化为纯确定性查重。库里三列都是 vector(%d), 换模型要么让它输出 "
+            "%d 维, 要么连 schema 一起改。",
+            EMBEDDING_DIM, bad, EMBEDDING_MODEL, EMBEDDING_DIM, EMBEDDING_DIM)
+        return None
+    return out
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:

@@ -479,6 +479,12 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             # `if new_vecs and i < len(new_vecs)` 等价。
             "title_embedding": (f"[{','.join(repr(float(x)) for x in new_vecs[i])}]"
                                 if new_vecs and i < len(new_vecs) else None),
+            # ⚠️ 必须带上模型名: 库里那一路要用它把**别的模型产的**历史向量
+            # 排除掉。跨模型算余弦出来的数是垃圾且【不报错】—— 不带的话
+            # migrations/008 之后的函数会退回"比全部非空向量"的老行为, 而
+            # 老行为正是 #65 P1 说的那个洞。(codex review · #65 P1)
+            "embedding_model": (dedup.EMBEDDING_MODEL
+                                if new_vecs and i < len(new_vecs) else None),
         }
         for i in range(len(o_hashes))
     ]
@@ -495,7 +501,9 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             raise RuntimeError(
                 f"deskcore_check_drafts 回执缺 {len(missing)}/{len(payload)} 篇"
                 f"(idx={missing[:5]}) —— 拒绝按'没撞车'放行")
-        total, with_vec = store.fingerprint_stats(client, project_id)
+        # 口径是"有【本模型】向量的条数" —— 见 store.fingerprint_stats 的说明。
+        total, with_vec = store.fingerprint_stats(client, project_id,
+                                                  dedup.EMBEDDING_MODEL)
 
         def _probe(i: int) -> HistHit:
             r = by_idx.get(i) or {}
@@ -534,7 +542,15 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
     history, truncated = store.fingerprints(client, project_id)
     hist_grams = [set(h.get("ngram_hashes") or []) for h in history]
     hist_open = {h.get("opening_hash"): h for h in history if h.get("opening_hash")}
-    hist_vecs = [h.get("title_embedding") for h in history]
+    # ⚠️ 只把**本模型**产的向量算进比对。跨模型算余弦出来的数是垃圾, 而且
+    # 【不报错】—— 混着比的结果是硬闸看起来跑了、结论却是噪声。
+    # ``embedding_model`` 为 NULL 的行同样排除: 那是"来路不明", 不是"本模型"。
+    # 排除掉的行仍然计入 total, 于是 with_vec < total → semantic_degraded 为
+    # true 并把原因报出去。**宁可说自己没比全, 也不能拿垃圾数当比过了。**
+    # (codex review · #65 P1; 与库里那一路 migrations/008 的过滤同一口径)
+    hist_vecs = [h.get("title_embedding")
+                 if h.get("embedding_model") == dedup.EMBEDDING_MODEL else None
+                 for h in history]
     with_vec = sum(1 for v in hist_vecs if v)
 
     def _probe_py(i: int) -> HistHit:
@@ -1088,17 +1104,30 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
     后者 backfill 够不着 —— 它扫的是 items × versions, 而 WorkBuddy 写的稿子
     version_id 为空、不在那张表里。
 
-    典型触发场景: embedding 的 key 欠费/配额用尽那几天照常 commit 了稿子,
-    它们只有确定性指纹。补上 key 之后跑这个。
+    典型触发场景两个:
+
+      · embedding 的 key 欠费/配额用尽那几天照常 commit 了稿子, 它们只有确定性
+        指纹。补上 key 之后跑这个。
+      · **换了 embedding 模型**(2026-08-26 就换过一次)。老模型产的向量不能跟新
+        向量比 —— 跨模型算余弦出来的数是垃圾且不报错 —— 所以它们被比对排除,
+        必须用新模型重算才能重新参与。这一路是 codex review · #65 P1 补的:
+        原来只扫 ``title_embedding IS NULL``, 于是换模型之后老行既进不了比对、
+        又永远不会被重算, 卡在一个**没有出口**的状态里。
     """
     if not dedup.embeddings_available():
         return {"error": "embedding 不可用(GOOGLE_API_KEY 未配或 SDK 缺失), 无法补向量",
                 "fixed": 0, "pending": None}
 
-    rows = store.fingerprints_missing_vectors(client, project_id)
+    rows = store.fingerprints_needing_vectors(client, project_id,
+                                              dedup.EMBEDDING_MODEL)
     if not rows:
         return {"pending": 0, "fixed": 0, "failed": 0,
-                "note": "没有缺向量的行, 不用补。"}
+                "note": "没有需要重算向量的行, 不用补。"}
+
+    # 分别报出来, 因为它们意味着不同的事: 缺向量是"当时没算成", 换模型是"算过
+    # 但那一批已经作废"。混成一个数字, 看的人没法判断这次该不该意外。
+    absent = sum(1 for r in rows if r.get("_expect") is store.VECTOR_ABSENT)
+    stale = len(rows) - absent
 
     fixed = failed = 0
     for start in range(0, len(rows), chunk):
@@ -1109,8 +1138,11 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
             logger.warning("reembed: embed_texts failed for chunk at %d", start)
             continue
         for r, v in zip(part, vecs):
-            if v and store.set_fingerprint_vector(client, r["id"], v,
-                                                  dedup.EMBEDDING_MODEL):
+            # expect 是读到这行时它的状态 —— set_fingerprint_vector 拿它做 CAS,
+            # 免得用更旧的批次盖掉别的进程刚刷好的结果。
+            if v and store.set_fingerprint_vector(
+                    client, r["id"], v, dedup.EMBEDDING_MODEL,
+                    expect=r.get("_expect", store.VECTOR_ABSENT)):
                 fixed += 1
             else:
                 failed += 1
@@ -1118,7 +1150,12 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
             progress(min(start + chunk, len(rows)), len(rows))
 
     out = {"pending": len(rows), "fixed": fixed, "failed": failed,
+           "missing_vector": absent, "stale_model": stale,
            "embedding_model": dedup.EMBEDDING_MODEL}
+    if stale:
+        out["stale_model_note"] = (
+            f"{stale} 条是【换模型作废】的旧向量(不是缺向量) —— 它们在重算完成"
+            f"之前不参与标题语义比对。当前模型: {dedup.EMBEDDING_MODEL}")
     if failed:
         out["note"] = (f"{failed} 条没补上(embedding 调用失败或行已被改动)。"
                        "可以再跑一次, 已补好的不会重复处理。")
@@ -1223,25 +1260,42 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
             return
         part, pending = pending, []
         processed += len(part)
-        # 缺向量的才补算, 有的直接复用(见 docstring)
-        need = [i for i, r in enumerate(part) if not r.get("embedding")]
+        # ⚠️ **能算就全部重算, 不复用 versions.embedding。**(codex review · #65 P1)
+        #
+        # 原来是"历史行有向量就直接复用, 只给缺的补算", 理由是省钱省时间。那个
+        # 理由建立在一个**再也不成立**的假设上: `versions.embedding` 与当前模型
+        # 同源。那张表【没有模型标记】, 所以它的来路永远无法证明 —— 2026-08-26
+        # 换掉 text-embedding-004 之后, 复用就等于把老模型的向量贴上新模型的标签
+        # 写进指纹库, 而跨模型算余弦出来的数是垃圾且【不报错】。
+        #
+        # 现在的口径: 能调 embedding 就一律用**当前模型**现算(几千条一批, 成本
+        # 可以忽略); 调不动才退回复用历史向量, 且那时 embedding_model 记 NULL ——
+        # 来路不明就如实说不知道, 于是比对时被排除、reembed 能找到它重算。
+        # **宁可少比, 不能拿垃圾数当比过了。**
+        need = (list(range(len(part))) if can_embed
+                else [i for i, r in enumerate(part) if not r.get("embedding")])
         fresh: list[list[float]] | None = None
         if can_embed and need:
             fresh = dedup.embed_texts([part[i]["title"] for i in need])
             if fresh is None:
                 logger.warning("backfill: embed_texts failed for a chunk of %d; "
-                               "writing those rows without vectors", len(need))
+                               "falling back to legacy vectors (model unknown)",
+                               len(need))
 
         payload = []
         for i, r in enumerate(part):
-            vec = r.get("embedding")
-            if vec:
-                reused += 1
-            elif fresh is not None:
+            # attested = 这个向量确实是【当前模型】产的。只有现算的才算数。
+            vec, attested = None, False
+            if fresh is not None and i in need:
                 pos = need.index(i)
                 vec = fresh[pos] if pos < len(fresh) else None
                 if vec:
                     computed += 1
+                    attested = True
+            if not vec and r.get("embedding"):
+                # 退路: 现算不成(或整批 embedding 不可用)才复用历史向量。
+                vec, attested = r["embedding"], False
+                reused += 1
             if not vec:
                 missing += 1
             body = r.get("body") or ""
@@ -1252,9 +1306,11 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
                 "title": r.get("title") or "",
                 "opening": fp.opening_of(body),
                 "title_embedding": vec or None,
-                # 复用的历史向量也是同一个模型产的(versions.embedding 就是
-                # 标题向量), 所以两条路径记的是同一个名字。
-                "embedding_model": dedup.EMBEDDING_MODEL if vec else None,
+                # ⚠️ 只有【现算】的才敢写模型名。复用 versions.embedding 时记
+                # NULL —— 那张表没有模型标记, 来路无法证明, 而贴一个错标签的
+                # 后果是查重安静地拿垃圾数当结论。NULL 的行会被比对排除, 并且
+                # 能被 reembed 找到重算, 是个有出口的状态。(codex review · #65 P1)
+                "embedding_model": dedup.EMBEDDING_MODEL if attested else None,
                 "opening_hash": fp.opening_hash(body),
                 "ngram_hashes": fp.ngram_hashes(body),
                 "angle_key": None,   # 历史稿不是发牌产出的, 没有坐标
@@ -1298,8 +1354,19 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
             + ("(GOOGLE_API_KEY 未配或 embedding 调用失败)。" if not can_embed or computed == 0
                else "。")
             + "这些历史稿只参与确定性查重(开头精确 + 四字串重合), "
-              "同角度换说法的标题比不出来。配好 embedding 后重跑本命令不会重复写入, "
-              "但也【不会】给已写入的行补向量 —— 要补得先删掉这些行。")
+              "同角度换说法的标题比不出来。配好 embedding 后跑 "
+              "`deskcore.cli reembed --project <id>` 给它们补上 —— 重跑 backfill "
+              "不会重复写入, 但补向量是 reembed 的活。")
+    if reused:
+        # 复用的那些没有模型标记, 所以**不参与**标题语义比对。不说出来的话
+        # "embedded: N" 看着像全都能比, 而实际能比的只有 computed 那部分 ——
+        # 又一次"写着已经有了, 实际没有"。(codex review · #65 P1)
+        out["unattested_embeddings"] = reused
+        out["unattested_note"] = (
+            f"{reused} 条复用了 versions.embedding 的历史向量。那张表【没有模型"
+            f"标记】, 来路无法证明, 所以按 embedding_model=NULL 写入 —— 它们"
+            f"**不参与**标题语义比对。跑 `deskcore.cli reembed --project <id>` "
+            f"用当前模型({dedup.EMBEDDING_MODEL})重算之后才会生效。")
     return out
 
 
@@ -1356,9 +1423,22 @@ _BACKFILL_DEFAULT_CAP = 5000
 # 清单里必须排最前面, 与 runbook 的 `006 → 002 → 003 → 004 → 005` 一致。
 MIGRATION_RUN_FIRST = "006_item_decision_provenance.sql"
 
+# 缺 GRANT 的唯一补救出口。denied 状态**一律**指向这里, 不管报 denied 的那条
+# 探测挂在哪个迁移名下 —— 见 migration_state 末尾对这条口径的完整说明。
+MIGRATION_GRANTS = "007_deskcore_table_grants.sql"
+
 MIGRATION_UNPROBEABLE_SQL = (
     "select indexname from pg_indexes where schemaname='autowriter' "
     "and indexname='versions_item_version_uniq';"
+)
+
+# 008 换的是**函数体**, 签名和返回列一个字没动 —— 从 PostgREST 这一面看,
+# 跑没跑过完全一样。所以只能交出这句 SQL, 不许蒙。
+MIGRATION_EMBEDDING_ISOLATION = "008_embedding_model_isolation.sql"
+MIGRATION_008_PROBE_SQL = (
+    "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
+    "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
+    "where n.nspname='autowriter' and p.proname='deskcore_check_drafts';"
 )
 
 
@@ -1380,11 +1460,20 @@ def _probe_ok(fn, *, predicate=None) -> tuple[str, str]:
         "不是「没跑迁移」" —— 正好说反, 而这个命令存在的全部意义就是别说反。
         表/列这一路没有运行期对应物(运行期不该因为缺表就降级), 所以宽一档不
         破坏同源那条纪律。
+
+    ⚠️ **"没授权"在两种判据之前先被拎出来, 报成 ``denied``。**
+    ``42501 permission denied for table`` 说的是"表建出来了, 但 GRANT 没发",
+    它既不是 missing(对象在)也不该混进 error(它有确定的补救 SQL: 007)。
+    不单独分一档的话, 一个**只缺 GRANT** 的库会让 001 那几条表探测全报
+    ``error`` 并写着"不是「没跑迁移」", 而同一份输出里 007 报 missing ——
+    自检工具给出互相矛盾的结论, 比它不存在更坏(与 codex #63 那条同一个道理)。
     """
     check = predicate or store.rpc_missing
     try:
         fn()
     except Exception as exc:                       # noqa: BLE001 — 探测就是要看异常
+        if store.table_permission_denied(exc):
+            return "denied", f"{type(exc).__name__}: {exc}"[:200]
         if check(exc):
             return "missing", f"{type(exc).__name__}: {exc}"[:200]
         return "error", (f"探测本身失败(不是「没跑迁移」): "
@@ -1531,19 +1620,120 @@ def migration_state(client) -> dict:
          "「通过 / 打回」、硬规则自动标记、查重自动标记**全部报错**。"
          "这个迁移与其它几个不同, **不是可选的**")
 
+    # ── 007: 四张表的表级 GRANT。⚠️ 也是**硬失败** ──
+    #
+    # 探的是"读得到吗", 不是"表在吗" —— 上面 001 那几条已经回答了后者, 而
+    # 2026-08-26 首次真部署证明这两件事**不是一回事**: 表全在, doctor 全绿,
+    # /health 全绿, 而 deskcore 除 list_projects 外每个工具都挂在
+    # `42501 permission denied for table draft_fingerprints`。
+    #
+    # 为什么 001 那几条探测挡不住这个: 它们跑在同一个 service_role 上、报的是
+    # 同一个 42501 —— 现在由 _probe_ok 统一识别成 denied, 所以两边给的是同一个
+    # 结论, 补救指向同一个文件。这里再单列一条, 是为了让"缺 GRANT"在
+    # missing 清单里有个**编号**可跑, 而不是只留一句 note 让人自己想办法。
+    #
+    # 用 draft_fingerprints 当代表: 四张表在 001 / 007 里是同一条 GRANT 语句
+    # 发的, 不存在只授权了其中一张的中间态。
+    #
+    # ⚠️ **四个权限都要探, 不能只探 SELECT。**(codex review · #65)
+    # 只探读的话, 一个"读得到但写不进"的库(手工补授权补漏了 / 后来被人收回过)
+    # 会报全绿, 而定稿入库、发牌、存个人笔记照旧在 42501 上挂 —— 正好是这条
+    # 检查存在的理由的反面。007 承诺四个权限, 就得验四个。
+    #
+    # 怎么在【不写一行】的前提下探写权限(与本节第 2 条纪律一致)。
+    #
+    # ⚠️ 关键在于三个探测都必须是**逻辑上不可能生效**的, 而不是"大概不会命中"。
+    # 这是对着生产库跑的命令, "nil UUID 应该没有对应行"这种概率论不够格 ——
+    # 真有那么一行的话, UPDATE 会清空它的标题、DELETE 会把它删掉。
+    #
+    #   · INSERT —— payload 是 ``{"project_id": None}``, 而这一列是 NOT NULL。
+    #                权限检查在约束检查【之前】, 所以没权限报 42501, 有权限报
+    #                23502(非空约束)。**无论库里有什么数据, 它都插不进去。**
+    #   · UPDATE / DELETE —— 过滤是 ``id = X AND id <> X``, 对任何一行都是假。
+    #                有权限就是成功的空操作, 没权限才报 42501。
+    #
+    # tests 里有两条断言守着: 一条钉住这三个形态(哪天谁把矛盾条件改成普通
+    # 过滤, 这个自检命令就成了删库命令); 一条让假件真的模拟 NOT NULL ——
+    # 探测的安全性靠的是那条约束, 假件不模拟它, 测试给的绿就是假的。
+    _grant_probes = (
+        ("SELECT", lambda t: t.select(_MIGRATION_001_PROBE_COLUMN).limit(1)),
+        ("INSERT", lambda t: t.insert({"project_id": None})),
+        ("UPDATE", lambda t: t.update({"title": ""})
+                              .eq("id", _PROBE_NIL_UUID)
+                              .neq("id", _PROBE_NIL_UUID)),
+        ("DELETE", lambda t: t.delete()
+                              .eq("id", _PROBE_NIL_UUID)
+                              .neq("id", _PROBE_NIL_UUID)),
+    )
+    for priv, build in _grant_probes:
+        state, note = _probe_ok(
+            lambda b=build: b(client.table("draft_fingerprints")).execute(),
+            predicate=store.schema_object_missing)
+        if priv == "INSERT" and state in ("error", "missing"):
+            # 有权限时 INSERT 必然挂在非空约束上 —— 那**正是通过**, 不是故障。
+            # (也认 23503: 万一哪天这一列不再是 NOT NULL, 外键仍然会拦下。)
+            if any(k in note.lower() for k in
+                   ("23502", "23503", "not-null", "not null", "foreign key")):
+                state, note = "applied", "ok(约束拦下, 说明 INSERT 权限是有的)"
+        if state == "missing":
+            # 表本身还不在 = 001 都没跑, 上面那几条已经在喊了。这里再喊一遍
+            # "007 也缺"只会让人以为要跑两个 —— 而 001 里已经含着同一条 GRANT。
+            state, note = "unprobeable", ("001 的四张表还不在, 先跑 001 "
+                                          "(它里面已经含着这条 GRANT)")
+        _add(MIGRATION_GRANTS,
+             f"draft_fingerprints 的 {priv} 权限", state, note,
+             "⚠️ 硬失败: service_role 绕过 RLS 但**不绕过表级 GRANT**。缺了它, "
+             "deskcore 除 list_projects 外每个工具都在 42501 permission denied 上挂, "
+             "而 /health 仍然全绿(它探的是连得上, 不是访问得了)")
+
+    # ── 008: 标题语义比对按 embedding 模型隔离 ──
+    #
+    # PostgREST 看不见函数体, 所以"这一版有没有那句过滤"从这一面探不到 ——
+    # 与 003 的唯一索引同类, 如实报 unprobeable 并把该跑的 SQL 交出来。
+    #
+    # ⚠️ **别用"函数在不在"冒充这条。** 008 是 CREATE OR REPLACE, 签名和返回列
+    # 一个字都没动 —— 跑没跑过, 从调用侧看**完全一样**, 直到某天有人换了模型
+    # 才发现比对一直是混着算的。蒙一个 applied 正好复现这套东西要根治的形态。
+    _add(MIGRATION_EMBEDDING_ISOLATION,
+         "deskcore_check_drafts 按模型过滤(函数体)",
+         "unprobeable",
+         "PostgREST 读不到函数体; 用 SQL Editor 跑: " + MIGRATION_008_PROBE_SQL,
+         "缺席→标题语义那一路把【别的模型产的】历史向量也算进来。跨模型的余弦"
+         "是噪声: 既会放过真重复, 也会误杀无关稿, 而 semantic_degraded 照报 "
+         "false —— 失灵的同时还说自己跑过了")
+
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
     # 一遍根本不缺的 SQL, 而同一份输出里那条 note 明明写着"不是「没跑迁移」"。
     # 一个自检工具给出**互相矛盾的**结论, 比它不存在更坏。
     #
     # 两者都判红(见 ok), 但补救方式完全不同, 所以必须分开报。
-    missing = sorted({c["migration"] for c in checks
-                      if c["state"] in ("missing", "old_signature")})
+    #
+    # ``denied`` 同理再分一档: 它既不是"没跑迁移"(对象在), 也不是"探测本身坏了"
+    # (它有确定的补救 SQL)。但它**进 missing** —— 因为对跑这条命令的人来说,
+    # 该做的事就是去跑 migrations/007, 与其它缺席迁移的动作完全一样。
+    #
+    # ⚠️ **denied 一律记到 007 名下, 不管这条探测挂在哪个迁移上。**(codex #65)
+    # 缺 GRANT 时 001 那四条表探测也会报 denied —— 按"探测挂在哪个迁移就算哪个"
+    # 聚合的话, missing 里会同时出现 001 和 007, 而 doctor 紧接着打印"还缺这些
+    # 迁移, 按这个顺序跑"。于是人对着一个**表和函数都好好在那儿**的库重跑一遍
+    # 建表 SQL(幂等, 什么都不会变), 然后继续 42501。
+    #
+    # 那些 denied 的探测行**照常显示**(state 就是 denied, 一眼看出是哪几张表),
+    # 只是不进【该跑什么】那份清单 —— 清单要回答的是动作, 不是现象。
+    # 这跟上面 error 不进 missing 是同一条纪律: 一个自检工具给出互相矛盾的
+    # 结论, 比它不存在更坏。
+    denied = sorted({c["migration"] for c in checks if c["state"] == "denied"})
+    missing = sorted(
+        {c["migration"] for c in checks
+         if c["state"] in ("missing", "old_signature")}
+        | ({MIGRATION_GRANTS} if denied else set()))
     errors = sorted({c["migration"] for c in checks if c["state"] == "error"})
     return {
         "ok": not missing and not errors,
         "checks": checks,
         "missing": missing,
+        "denied": denied,
         "errors": errors,
         "unprobeable": sorted({c["migration"] for c in checks
                                if c["state"] == "unprobeable"}),

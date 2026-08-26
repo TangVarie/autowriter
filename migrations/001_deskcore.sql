@@ -123,9 +123,10 @@ CREATE TABLE IF NOT EXISTS autowriter.draft_fingerprints (
 ALTER TABLE autowriter.draft_fingerprints
     ADD COLUMN IF NOT EXISTS embedding_model TEXT;
 COMMENT ON COLUMN autowriter.draft_fingerprints.title_embedding IS
-    'Gemini text-embedding-004 768d, 与 versions.embedding 同模型可互比';
+    'Gemini embedding 768d(gemini-embedding-001 截到 768 维), 与 versions.embedding 同模型可互比。'
+    '模型名以 dedup.EMBEDDING_MODEL 为准 —— 上一个 text-embedding-004 已下线。';
 COMMENT ON COLUMN autowriter.draft_fingerprints.embedding_model IS
-    '产出 title_embedding 的模型名(如 text-embedding-004)。NULL = 这行没有向量。'
+    '产出 title_embedding 的模型名(如 gemini-embedding-001)。NULL = 这行没有向量。'
     '⚠️ 换 embedding 供应商时唯一的救命稻草: 跨模型算余弦相似度出来的数是垃圾, '
     '而且【不报错】—— 没有这一列, 迁移期新旧向量混在一张表里, 查重会安静地失灵, '
     '只能靠"写入时间早于某某"去猜哪些是旧的。有了它, 换模型从停机重算变成增量迁移: '
@@ -178,6 +179,30 @@ COMMENT ON COLUMN autowriter.style_edits.distilled IS
 CREATE INDEX IF NOT EXISTS style_edits_owner_idx
     ON autowriter.style_edits (project_id, user_id, created_at DESC);
 ALTER TABLE autowriter.style_edits ENABLE ROW LEVEL SECURITY;
+
+-- ── 4.5 上面四张表的表级 GRANT ───────────────────────────────────────
+-- 2026-08-26 补。原来这一块【整个不存在】, 而症状是部署当天 deskcore 除
+-- ``list_projects`` 外每个工具都在 42501 上挂:
+--     permission denied for table draft_fingerprints
+--
+-- 坑在于 ``service_role`` **绕过 RLS 但不绕过表级 GRANT**。它在 public schema
+-- 下看着无所不能, 靠的是 Supabase 给 public 配的 default privileges;
+-- ``autowriter`` 是本仓自建 schema, **没有**这份默认授权, 于是新建的表一行
+-- 权限都没有。本文件下面给两个函数发了 EXECUTE, 当时就误以为"权限这块齐了"——
+-- 函数能跑是因为它们 SECURITY DEFINER 走 owner 权限, 和表权限是两回事。
+--
+-- 只给 service_role: 这四张表唯一的调用方是 deskcore, 它用 service key 连库,
+-- 归属隔离在应用层做(deskcore/core.py::assert_project_access)。
+-- authenticated / anon 一行都不需要。
+--
+-- 与 migrations/007 同一条语句(那个文件是给"只跑过 001 的老库"补的入口),
+-- 放在这里是为了让**只跑 001** 的路径也不再漏。GRANT 幂等, 重复执行无副作用。
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    autowriter.angle_ledger,
+    autowriter.draft_fingerprints,
+    autowriter.user_calibration_notes,
+    autowriter.style_edits
+    TO service_role;
 
 -- ── 5. items.updated_at ──────────────────────────────────────────────
 -- 回填成 created_at 而不是 NOW(), 免得历史行全部看起来"刚改过"。

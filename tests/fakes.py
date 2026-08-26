@@ -21,6 +21,16 @@ from __future__ import annotations
 
 import uuid as _uuid
 
+# 建表 SQL 里写了 NOT NULL、而且【有代码依赖这个约束真的会拦】的列。
+# 不求全 —— 按本文件的第一条取舍, 只做真的被用到的那部分。
+#
+# 目前只有一条: ``draft_fingerprints.project_id``。``core.migration_state``
+# 探 INSERT 权限时故意写 None 进去, 靠这条约束保证【无论如何插不进】。
+# 见 migrations/001_deskcore.sql:110 与 000_baseline.sql 里同一张表的定义。
+NOT_NULL_COLUMNS: dict[str, set[str]] = {
+    "draft_fingerprints": {"project_id"},
+}
+
 
 class FakeResponse:
     def __init__(self, data, count=None):
@@ -140,6 +150,16 @@ class FakeClient:
         # 开的话, "库缺列会怎样"这类用例只能靠手搭一次性替身 —— 而手搭替身正是
         # 这个文件存在要消掉的东西。
         self.missing_columns = {k: set(v) for k, v in (missing_columns or {}).items()}
+        # {表名: {列名, ...}} —— 这些列是 NOT NULL。写 None 进去按 PG 的真实
+        # 形态报 23502, 而不是欣然存下一个 None。
+        #
+        # 为什么假件要会这一手: ``core.migration_state`` 探 INSERT 权限的办法
+        # 就是**故意违反非空约束** —— 权限检查在约束检查之前, 所以没权限报
+        # 42501、有权限报 23502, 而两种情况都一行都写不进去。这条"写不进去"
+        # 的性质是那个探测在**生产库**上安全的全部依据。假件不模拟它的话,
+        # 探测在测试里会"插入成功", 于是那条断言守的是一个不存在的世界 ——
+        # 与本会话早先 `.select("id")` 那次是同一种假绿。
+        self.not_null = {k: set(v) for k, v in (NOT_NULL_COLUMNS).items()}
         self.calls: list[dict] = []
         self.rpc_calls: list[tuple[str, dict]] = []
 
@@ -224,6 +244,18 @@ class FakeClient:
 
         if q.op in ("insert", "upsert"):
             payload = q.payload if isinstance(q.payload, list) else [q.payload]
+            # NOT NULL: 与 PG 一致报 23502。**在写进 table 之前** —— 这条约束
+            # 是 core.migration_state 的 INSERT 权限探测在生产库上安全的依据,
+            # 假件放行就等于那条探测的安全性从来没被测过。
+            for row in payload:
+                if not isinstance(row, dict):
+                    continue
+                for col in sorted(self.not_null.get(q.table_name, ())):
+                    if col in row and row[col] is None:
+                        raise RuntimeError(
+                            f'{{"code":"23502","message":"null value in column '
+                            f'\\"{col}\\" of relation \\"{q.table_name}\\" '
+                            f'violates not-null constraint"}}')
             # 真库的 uuid PK 有 DEFAULT uuid_generate_v4(), 插入后 PostgREST 回的
             # 是**带 id 的整行**。假件不补这个的话, 一切"插完拿 id 去建下一层"的
             # 代码(batch → item → version)在测试里都拿到 None, 而在真库里好好的 ——

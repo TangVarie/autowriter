@@ -494,6 +494,13 @@ jobs:
               "降级直插路径没记 embedding_model"
           bsrc = inspect.getsource(C.backfill_fingerprints)
           assert "embedding_model" in bsrc, "backfill 没记 embedding_model"
+          # ⚠️ 光"记了"不够 —— 记**错**比不记更坏(codex aw#65 P1)。backfill 会复用
+          # versions.embedding 里的历史向量, 而那张表【没有模型标记】, 来路无法
+          # 证明。贴上当前模型的标签之后, 那些行会被当成"本模型产的"参与比对,
+          # 而且再也不会被 reembed 挑出来重算 —— 库里从此混着两套向量空间,
+          # 没有任何东西能分辨。所以只有【现算】的才敢写模型名。
+          assert "if attested else None" in bsrc, \
+              "backfill 给来路不明的历史向量也贴了当前模型的标签"
           for f in ("migrations/001_deskcore.sql", "migrations/000_baseline.sql"):
               t = open(f, encoding="utf-8").read()
               assert "embedding_model" in t, f"{f} 缺 embedding_model 列"
@@ -512,7 +519,14 @@ jobs:
           assert callable(C.reembed_fingerprints), "缺 reembed 修复路径"
           assert "reembed" in open("deskcore/cli.py", encoding="utf-8").read()
           rsrc = inspect.getsource(C.reembed_fingerprints)
-          assert "fingerprints_missing_vectors" in rsrc and "set_fingerprint_vector" in rsrc
+          assert "fingerprints_needing_vectors" in rsrc and "set_fingerprint_vector" in rsrc
+          # ⚠️ 2026-08-26 换模型之后又加了一层(codex aw#65 P1): reembed 要修的
+          # 不只是"没算过"的行, 还有"换了模型作废"和"来路不明"的行 —— 所以它
+          # 必须把**当前模型**传下去。原来这个函数叫 fingerprints_missing_vectors
+          # 且只扫 NULL 向量, 那时换一次模型就会让老行既进不了比对、又永远不会
+          # 被重算, 卡在一个没有出口的状态里。
+          assert "dedup.EMBEDDING_MODEL" in rsrc, \
+              "reembed 没把当前模型传下去 —— 那它挑不出换模型作废的那些行"
           print("  ✓ 取向量失败会显式报警, 且有 reembed 能补(backfill 够不着的那些行)")
 
           print("\ndeskcore round-7 回归: 6/6 通过")
@@ -925,7 +939,10 @@ jobs:
 
           mv = [{"id": f"f{i}", "title": f"t{i}"} for i in range(2500)]
           sb3 = _PSB(mv, cap=137)
-          assert len(S.fingerprints_missing_vectors(sb3, "p")) == 2000, "hard_cap 失效"
+          # 2026-08-26 更名 + 加了模型参数(codex aw#65 P1): 它现在挑的是
+          # 【向量不可用】的行, 三种都算(没算过 / 来路不明 / 换了模型), 所以
+          # 必须知道"当前模型"是什么。翻页与 hard_cap 的性质一个都没变。
+          assert len(S.fingerprints_needing_vectors(sb3, "p", "m")) == 2000, "hard_cap 失效"
           assert sb3.log[0]["order"] == ["created_at", "id"], sb3.log[0]
 
           items = [{"id": f"i{n}", "best_version_id": None, "user_id": "u",
@@ -939,9 +956,12 @@ jobs:
 
           assert S.existing_fingerprint_version_ids(_PSB([]), "p") == set()
           assert S.legacy_versions(_PSB([]), "p") == []
-          assert S.fingerprints_missing_vectors(_PSB([]), "p") == []
+          assert S.fingerprints_needing_vectors(_PSB([]), "p", "m") == []
           sb5 = _PSB([{"id": f"f{i}", "title": "t"} for i in range(5000)])
-          S.fingerprints_missing_vectors(sb5, "p", limit=2000)
+          S.fingerprints_needing_vectors(sb5, "p", "m", limit=2000)
+          # 它现在分三次查询(三种"不可用"各一次, 见函数里为什么不写成 .or_())。
+          # 第一次就凑满 hard_cap 时**必须当场收工**, 不许把另外两次也打出去 ——
+          # 否则一个大项目每跑一次 reembed 就多两轮翻页的空转。
           assert len(sb5.log) == 2, f"hard_cap 到顶还在多打请求: {len(sb5.log)}"
           # 别再退回裸 .limit()。
           #
@@ -953,7 +973,7 @@ jobs:
           # 真正要禁的是"用一个常数 .limit(N) 冒充取全量"。翻页本身由上面
           # 那些行为断言(钳到 137/页仍取全 2500)保证。
           for fn in (S.legacy_versions, S.existing_fingerprint_version_ids,
-                     S.fingerprints_missing_vectors, S.list_all_projects):
+                     S.fingerprints_needing_vectors, S.list_all_projects):
               tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
               bad = [n for n in ast.walk(tree)
                      if isinstance(n, ast.Call)

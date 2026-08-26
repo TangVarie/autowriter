@@ -204,6 +204,71 @@ def main() -> int:
         print("  ✓ 抽查的 7 张表 + 6 个函数 + 决策出处三列都在, "
               "且 CHECK 与 db.DecisionSource 一致")
 
+    # ── ②' 每张表都要授权给 service_role ───────────────────────────────
+    # 2026-08-26 首次真部署踩的坑, 值得完整记一遍。
+    #
+    # ``migrations/001_deskcore.sql`` 建了四张表, 只给两个**函数**发了 EXECUTE,
+    # 表本身一行 GRANT 都没有。上线当天 deskcore 除 list_projects 外每个工具都挂:
+    #     permission denied for table draft_fingerprints   (42501)
+    #
+    # 为什么没人发现: 直觉里 ``service_role`` 是"超级权限"。它确实**绕过 RLS**,
+    # 但**不绕过表级 GRANT** —— 两套独立机制。它在 public schema 下看着无所不能,
+    # 靠的是 Supabase 给 public 配的 default privileges; ``autowriter`` 是本仓
+    # 自建 schema, 没有这份默认授权, 新表出生就是零权限。
+    #
+    # 上一条前置检查("表建出来了吗")是绿的 —— 表确实建出来了。**建出来 ≠ 能访问**,
+    # 而这中间的缝隙是靠人肉 curl 打线上才发现的。不该是这样, 所以钉在这里。
+    #
+    # 断言的是【不变量】而不是名单: 问"autowriter 下还有谁漏了", 不问"我列的这
+    # 几张对不对"。以后加表忘了发 GRANT, 这条自己会红, 不需要谁想起来更新名单。
+    needed = ("SELECT", "INSERT", "UPDATE", "DELETE")
+    rows = sql(
+        "SELECT c.relname || '|' || "
+        + " || ',' || ".join(
+            f"(CASE WHEN has_table_privilege('service_role', c.oid, '{p}')"
+            f" THEN '' ELSE '{p}' END)" for p in needed)
+        + " FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+          "WHERE n.nspname='autowriter' AND c.relkind='r' "
+          "AND NOT (" + " AND ".join(
+              f"has_table_privilege('service_role', c.oid, '{p}')"
+              for p in needed) + ") ORDER BY c.relname;")
+    ungranted = [ln for ln in rows.splitlines() if ln.strip()]
+    if ungranted:
+        for ln in ungranted:
+            tbl, missing = ln.split("|", 1)
+            print(f"  [FAIL] autowriter.{tbl} 没授权给 service_role"
+                  f"(缺 {','.join(p for p in missing.split(',') if p)}) —— "
+                  "建了表没发 GRANT, 线上表现是 42501 permission denied")
+        bad += len(ungranted)
+    else:
+        n_tbl = sql("SELECT count(*) FROM pg_class c JOIN pg_namespace n "
+                    "ON n.oid=c.relnamespace WHERE n.nspname='autowriter' "
+                    "AND c.relkind='r';")
+        print(f"  ✓ autowriter 下全部 {n_tbl} 张表都对 service_role 有 "
+              "SELECT/INSERT/UPDATE/DELETE(建表 ≠ 能访问, 2026-08-26 的教训)")
+
+    # ── ②'' 008 的按模型过滤真的落在【最终】的函数体里 ─────────────────
+    # 为什么单独验: 008 是 CREATE OR REPLACE, 签名和返回列一个字都没动 ——
+    # 它有没有生效, 从调用侧**完全看不出来**, 直到某天有人换了 embedding 模型,
+    # 才发现标题语义那一路一直在跨模型算余弦(噪声, 而且不报错)。
+    #
+    # 这里问的是最终状态而不是"008 跑没跑": 万一以后谁加了个 009 又把这个函数
+    # REPLACE 回没有过滤的版本, 上面那句 "✓ 008_...sql" 照样是绿的, 而洞回来了。
+    #
+    # ⚠️ 本 harness 把 pgvector shim 掉了, 所以这条**只验过滤子句在不在**,
+    # 验不了它算出来的数 —— 余弦那一路本来就不在本文件的比对范围内(见文件头)。
+    src = sql("SELECT prosrc FROM pg_proc p JOIN pg_namespace n "
+              "ON n.oid = p.pronamespace WHERE n.nspname='autowriter' "
+              "AND p.proname='deskcore_check_drafts';")
+    if "f.embedding_model = _model" not in src:
+        print("  [FAIL] deskcore_check_drafts 的函数体里没有按 embedding 模型"
+              "过滤那一句 —— migrations/008 没生效, 或者被后面的迁移覆盖回去了。"
+              "后果: 换模型之后跨模型算余弦(噪声), 而 semantic_degraded 报 false")
+        bad += 1
+    else:
+        print("  ✓ deskcore_check_drafts 的最终函数体带着按模型过滤"
+              "(008 生效, 且没被后面的迁移覆盖)")
+
     # ── ③ SQL 与 Python 算出来的数一样 ─────────────────────────────────
     # 跑完整套 schema 之后 draft_fingerprints 上是有 FK 的, 先把 project 建出来。
     # (这本身也是个信号: 之前那个手搭的最小骨架没有 FK, 也就测不到这一层。)
