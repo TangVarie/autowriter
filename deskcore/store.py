@@ -25,16 +25,41 @@ logger = logging.getLogger("deskcore.store")
 
 
 def rpc_missing(exc: Exception) -> bool:
-    """这个异常是不是"RPC 还没部署"?
+    """这个异常是不是"**RPC** 还没部署"?
 
     判据从 commit_fingerprints_atomic 里提出来共用: 迁移没跑时降级、其余错误
     (权限 / 参数 / 库故障)必须原样上抛。把两者混为一谈会让真故障被当成
     "没迁移"静默降级 —— 那正是审计一直在追的那类问题。
+
+    ⚠️ **只管函数, 不管表。** PostgREST 对"表不存在"回的是 ``PGRST205``
+    ("Could not find the table ... in the schema cache"), 三个条件一个都不沾 ——
+    所以这个函数对缺表返 False, 那是**对的**: 运行期某张表突然没了不该被当成
+    "没跑迁移"然后降级, 那是真故障。要判"这个 schema 对象在不在"用
+    ``schema_object_missing``。(2026-08-26 对着真 PostgREST 实测的错误形态,
+    不是照记忆写的; codex review · #63)
     """
     msg = str(exc).lower()
     return ("could not find the function" in msg
             or "does not exist" in msg
             or "pgrst202" in msg)
+
+
+def schema_object_missing(exc: Exception) -> bool:
+    """这个异常是不是"**任何一种** schema 对象还没建"(表 / 列 / 函数)?
+
+    比 ``rpc_missing`` 宽, 多认两个 PostgREST 的 schema-cache 码:
+
+      · ``PGRST205`` —— 表不存在("Could not find the table ... in the schema cache")
+      · ``PGRST204`` —— **写**路径上的列不存在("Could not find the '...' column ...")
+        (读路径上的列不存在是 PG 自己的 ``42703 column ... does not exist``,
+         已经被 rpc_missing 那句 "does not exist" 覆盖了)
+
+    ⚠️ **只给部署自检 (core.migration_state) 用, 别拿去做运行期降级判据。**
+    两者要的东西不同: 自检问的是"这个对象在不在", 运行期问的是"要不要降级"。
+    运行期把缺表也当成"没跑迁移"就会把真故障静默吞掉。
+    """
+    return rpc_missing(exc) or any(
+        code in str(exc).lower() for code in ("pgrst205", "pgrst204"))
 
 
 def client():
@@ -328,8 +353,10 @@ def reserve_angles(sb, project_id: str, candidates: list[dict],
             "_avoid_days": avoid_days,
         }).execute()
     except Exception as exc:
-        msg = str(exc).lower()
-        if "could not find the function" in msg or "does not exist" in msg or "pgrst202" in msg:
+        # 判据走 rpc_missing —— 这里原来是它的**第二份手抄**(同样三个条件)。
+        # 两份迟早漂开, 而漂开的后果是"某一路把真故障当成没跑迁移、静默降级",
+        # 正是 rpc_missing 的 docstring 一直在防的事。(codex review · #63)
+        if rpc_missing(exc):
             logger.error("deskcore_reserve_angles RPC 不存在 —— migrations/001 还没跑? "
                          "本次降级为非原子发牌(并发时可能撞车)。")
             return None
@@ -584,12 +611,18 @@ def legacy_versions(sb, project_id: str, limit: int = 5000) -> list[dict]:
     return [r for pg in legacy_version_pages(sb, project_id, limit=limit) for r in pg]
 
 
-def legacy_version_pages(sb, project_id: str, limit: int = 5000, page: int = PAGE):
+def legacy_version_pages(sb, project_id: str, limit: int | None = 5000,
+                         page: int = PAGE):
     """``legacy_versions`` 的逐页形态(审计 ROB-011)。
 
     回填该走这个: 一页处理完就丢, 内存峰值只跟 ``page`` 有关。攒成一个大列表
     的话, 5000 条历史成稿的全文 + 每条 768 个 Python float 会同时在内存里 ——
     容器 OOM 就是这么来的, 而回填偏偏是"部署后每个项目必跑一次"的动作。
+
+    ``limit=None`` 关掉上限, 扫全量。**只有核对用途该这么调**(见
+    ``core.backfill_gap``): 一个"验收标准"如果只看了前 5000 条就报"回填完了",
+    那它报的绿是假的 —— 而验收标准报假绿正是本仓最怕的那类失败。回填本身仍然
+    带上限, 上限就是它的已知边界, 不该被核对路径顺手抹掉。(codex review · #63)
     """
     def _build(off, lim):
         return (sb.table("items")
@@ -651,6 +684,21 @@ def existing_fingerprint_version_ids(sb, project_id: str) -> set[str]:
     except Exception:
         logger.exception("read existing fingerprint version_ids failed")
         raise
+
+
+def fingerprint_row_count(sb, project_id: str) -> int:
+    """这个项目在指纹表里**一共**多少行 —— 含 version_id 为空的那些。
+
+    ⚠️ 与 ``existing_fingerprint_version_ids`` 不是一回事, 别拿后者的 len 冒充
+    它: 那个函数 ``.not_.is_("version_id","null")`` 过滤掉了空 version 的行、
+    而且返回的是 **set**(去重)。也就是说它数不到写作台经 commit_drafts 写进来
+    的那批 —— 那批恰恰**就是** version_id 为空的。(codex review · #63: 我原来
+    正是拿 len(那个 set) 当"总行数"报出去, 说明文字还专门写着"含 commit_drafts
+    写进来的", 正好说反。)
+    """
+    res = (sb.table("draft_fingerprints").select("id", count="exact")
+             .eq("project_id", project_id).limit(1).execute())
+    return int(res.count or 0)
 
 
 def fingerprints_missing_vectors(sb, project_id: str, limit: int = 2000) -> list[dict]:

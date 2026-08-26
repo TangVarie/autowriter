@@ -15,7 +15,8 @@
      都出现。钉的是【被禁止的形态】(新增迁移漏进 doctor / 漏进文档), 不是
      "代码现在长这样";
   5. **缺列时的报错要看得懂** —— 006 没跑时 `db.update_item_status` 抛的是
-     翻译过的话, 而不是 PostgREST 原文; 且只翻译这一种, 别的错原样上抛。
+     翻译过的话, 而不是 PostgREST 原文; 且只翻译这一种, 别的错原样上抛;
+  6. **codex review 那六条** —— 每条先钉住"错的那个形态"再证明修好了。
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from pathlib import Path
 import pytest
 
 from fakes import FakeClient
-from deskcore import core
+from deskcore import cli, core
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -43,8 +44,11 @@ _TABLES = {
                "decision_source": None, "reviewer_id": None, "decided_at": None}],
 }
 
-# 全部迁移都跑过的库: 四个 RPC 都在, 且 check/commit 都是新签名。
+# 全部迁移都跑过的库: 五个 RPC 都在, 且 check/commit 都是新签名。
 _ALL_RPCS = {
+    # 001 装的。漏了它 doctor 会把 001 报成没跑 —— 这个夹具本身就是那条断言的
+    # 反面教材: 加探测时忘了同步夹具, 别的用例会先红, 而那正是我们要的。
+    "deskcore_reserve_angles": lambda a: [],
     "update_calibration_notes_cas": lambda a: [],
     "deskcore_fingerprint_counts": lambda a: [],
     "deskcore_check_drafts": lambda a: [],
@@ -78,9 +82,13 @@ def test_bare_001_db_reports_every_later_migration_missing():
         rows={**_TABLES,
               # 006 的三列还不存在
               "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z"}]},
-        rpc_impl={"deskcore_commit_fingerprints": lambda a: []
-                  if "_contain_hard" not in a else (_ for _ in ()).throw(
-                      RuntimeError("PGRST202 Could not find the function"))},
+        rpc_impl={
+            # 001 跑过 → 发牌 RPC 在
+            "deskcore_reserve_angles": lambda a: [],
+            # 005 没跑 → commit 只有 4 参那版
+            "deskcore_commit_fingerprints": lambda a: []
+            if "_contain_hard" not in a else (_ for _ in ()).throw(
+                RuntimeError("PGRST202 Could not find the function"))},
         missing_columns={"items": {"decision_source", "reviewer_id", "decided_at"}},
     )
     report = core.migration_state(sb)
@@ -321,3 +329,166 @@ def test_update_item_status_does_not_swallow_unrelated_failures():
     with pytest.raises(RuntimeError, match="connection refused"):
         db.update_item_status(_Boom(), PID, "approved",
                               source=db.DecisionSource.SYSTEM)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 6 · codex review 的六条(#63) —— 每条都先钉住"错的那个形态"
+# ══════════════════════════════════════════════════════════════════════
+
+# PostgREST 的真实错误文本。2026-08-26 对着真实例打出来的, 不是照记忆写的:
+#   GET /rest/v1/no_such_table  → PGRST205 Could not find the table '...' in the schema cache
+#   GET /rest/v1/projects?select=no_such_col → 42703 column ... does not exist
+#   POST /rest/v1/rpc/no_such_fn → PGRST202 Could not find the function ...
+_PGRST205 = ('{"code":"PGRST205","message":"Could not find the table '
+             "'autowriter.angle_ledger' in the schema cache\"}")
+_PGRST204 = ('{"code":"PGRST204","message":"Could not find the '
+             "'decision_source' column of 'items' in the schema cache\"}")
+
+
+def test_missing_table_is_missing_not_error():
+    """缺表必须报 `missing`。
+
+    ⚠️ **这条钉的是 codex 找出来的那个反向结论。** `store.rpc_missing` 只认
+    "could not find the function" / "does not exist" / PGRST202 —— 而 PostgREST
+    对缺表回的是 **PGRST205**，三个条件一个都不沾。于是一个**真的没跑 001**
+    的库会被报成 `error` 并写着"不是「没跑迁移」"，正好说反，而这个命令存在的
+    全部意义就是别说反。
+    """
+    class _NoTables(FakeClient):
+        def table(self, name):
+            if name in core._MIGRATION_001_TABLES:
+                raise RuntimeError(_PGRST205)
+            return super().table(name)
+
+    report = core.migration_state(_NoTables(rows=_TABLES, rpc_impl=_ALL_RPCS))
+    st = _states(report)
+    for t in core._MIGRATION_001_TABLES:
+        assert st[f"表 {t}"] == "missing", f"缺表被报成了 {st[f'表 {t}']}"
+    assert "001_deskcore.sql" in report["missing"]
+    assert "001_deskcore.sql" not in report["errors"]
+
+
+def test_rpc_probes_keep_using_the_runtime_predicate():
+    """RPC 那一路的判据必须仍然是 `store.rpc_missing` —— 与运行期同源。
+
+    放宽是**只针对表/列**的：表/列没有运行期对应物（运行期不该因为缺表就降级）。
+    RPC 有，所以那一路一放宽，就会出现"自检说 RPC 在、运行期判它不在"的分歧，
+    而这个命令的立身之本就是不出这种分歧。
+    """
+    import inspect
+    src = inspect.getsource(core.migration_state)
+    # 三处 RPC 探测都不该显式传 predicate（默认就是 rpc_missing）
+    rpc_calls = [ln for ln in src.splitlines() if "client.rpc(" in ln]
+    assert len(rpc_calls) >= 3, rpc_calls
+    assert "schema_object_missing" in src, "表/列那一路要用放宽后的判据"
+    assert core.store.rpc_missing(RuntimeError(_PGRST205)) is False, (
+        "rpc_missing 不该认缺表 —— 运行期缺表是真故障, 不是「该降级」")
+    assert core.store.schema_object_missing(RuntimeError(_PGRST205)) is True
+    assert core.store.schema_object_missing(RuntimeError(_PGRST204)) is True
+
+
+def test_reserve_angles_rpc_is_probed():
+    """001 装的 `deskcore_reserve_angles` 也要探。
+
+    漏探它的代价是静默的：表都在 → doctor 报"001 到位"，而
+    `store.reserve_angles` 每次判 RPC 不存在、降级成非原子发牌，于是两个人
+    同时发牌能拿到同一组坐标，**两边都报成功**。
+    """
+    gone = {k: v for k, v in _ALL_RPCS.items() if k != "deskcore_reserve_angles"}
+    st = _states(core.migration_state(FakeClient(rows=_TABLES, rpc_impl=gone)))
+    assert "deskcore_reserve_angles" in st, "001 的发牌 RPC 没被探到"
+    assert st["deskcore_reserve_angles"] == "missing"
+
+    ok = FakeClient(rows=_TABLES, rpc_impl=_ALL_RPCS)
+    assert _states(core.migration_state(ok))["deskcore_reserve_angles"] == "applied"
+
+    # 探测必须是可证明的 no-op: _want=0 时函数体第一句就 RETURN, 连锁都不取。
+    args = dict(next(a for n, a in ok.rpc_calls if n == "deskcore_reserve_angles"))
+    assert args["_want"] == 0 and args["_candidates"] == []
+
+
+def test_probe_errors_do_not_land_in_the_missing_list():
+    """真故障不能进"还缺这些迁移"。
+
+    进了的话 `_doctor()` 会打印"按这个顺序跑"，把人指去跑一遍根本不缺的 SQL
+    —— 而同一份输出里那条 note 明明写着"不是「没跑迁移」"。**一个自检工具
+    给出互相矛盾的结论，比它不存在更坏。**
+    """
+    def _boom(_args):
+        raise RuntimeError("permission denied for function")
+
+    sb = FakeClient(rows=_TABLES,
+                    rpc_impl={**_ALL_RPCS, "deskcore_fingerprint_counts": _boom})
+    report = core.migration_state(sb)
+
+    assert report["errors"] == ["004_deskcore_check_pushdown.sql"]
+    assert "004_deskcore_check_pushdown.sql" not in report["missing"]
+    assert report["ok"] is False        # 照样判红, 只是补救方式不同
+
+
+def test_doctor_prints_006_first_when_missing():
+    """补救清单里 006 必须排最前 —— 与 runbook 的顺序一致。
+
+    按字典序打印会把它排到最后，于是照着做的人会在"审稿按钮全报错"的状态下
+    先跑完 002–005（其中 003 还要改 678 行数据）。**工具和文档给出不同的顺序，
+    人只会信工具。**
+    """
+    import io, contextlib
+    sb = FakeClient(
+        rows={**_TABLES, "items": [{"id": PID, "updated_at": "t"}]},
+        rpc_impl={},
+        missing_columns={"items": {"decision_source", "reviewer_id", "decided_at"}})
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli._doctor(core, sb, None)
+    out = buf.getvalue()
+
+    assert rc == 1
+    listed = [ln for ln in out.splitlines() if ln.strip().startswith("· migrations/")]
+    assert listed, out
+    assert core.MIGRATION_RUN_FIRST in listed[0], f"006 没排在第一条: {listed}"
+
+
+def test_fingerprints_total_counts_every_row():
+    """`fingerprints_total` 要数**全部**行，含 version_id 为空的那些。
+
+    原来它是 `len(existing_fingerprint_version_ids(...))` —— 那个函数
+    `.not_.is_("version_id","null")` 过滤掉空 version 的行、还去了重，也就是
+    **恰恰数不到**写作台经 `commit_drafts` 写进来的那批（那批 version_id 就是
+    空的），而 CLI 的说明文字还专门写着"含 commit_drafts 写进来的"。说反了。
+    """
+    rows = {
+        **_TABLES,
+        "draft_fingerprints": [
+            {"id": "f1", "project_id": PID, "version_id": "v1"},
+            {"id": "f2", "project_id": PID, "version_id": "v2"},
+            # 写作台写进来的三行: version_id 为空
+            {"id": "f3", "project_id": PID, "version_id": None},
+            {"id": "f4", "project_id": PID, "version_id": None},
+            {"id": "f5", "project_id": PID, "version_id": None},
+        ],
+        "items": [],
+    }
+    gap = core.backfill_gap(FakeClient(rows=rows), PID)
+    assert gap["fingerprints_total"] == 5, (
+        f"只数到 {gap['fingerprints_total']} —— 空 version_id 的那三行被漏掉了")
+    assert gap["backfilled"] == 0        # items 是空的, 没有 eligible
+
+
+def test_backfill_gap_scans_uncapped():
+    """核对路径必须扫全量，不许沿用 backfill 的 5000 上限。
+
+    沿用的话，一个 5000 条以上的项目在最新那 5000 条补齐之后就被报成
+    "还差 0 / done"，而更老的历史稿从来没进过查重基线。**一个只看了前 5000 条
+    的验收标准报出来的绿是假的。**
+    """
+    import inspect
+    src = inspect.getsource(core.backfill_gap)
+    assert "limit=None" in src, "backfill_gap 还在沿用默认上限"
+
+    # 而且超过 backfill 自己的上限时要说出来, 不能默默报 done
+    big = {**_TABLES, "draft_fingerprints": [], "items": [], "batches": []}
+    gap = core.backfill_gap(FakeClient(rows=big), PID)
+    assert "backfill_capped_warning" not in gap        # 小项目不该乱报
+    assert core._BACKFILL_DEFAULT_CAP == 5000

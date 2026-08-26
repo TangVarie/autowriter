@@ -1348,23 +1348,44 @@ _MIGRATION_001_TABLES = ("angle_ledger", "draft_fingerprints",
                          "user_calibration_notes", "style_edits")
 _MIGRATION_001_PROBE_COLUMN = "project_id"
 
+# backfill 自己那条路的上限(``store.legacy_version_pages`` 的默认 limit)。
+# backfill_gap 刻意**不**用它扫描, 只用它判"这个项目大到 backfill 追不平了"。
+_BACKFILL_DEFAULT_CAP = 5000
+
+# 唯一一个"不跑就当场坏"的迁移 —— 其余几个缺席都是降级 + 留痕。所以它在补救
+# 清单里必须排最前面, 与 runbook 的 `006 → 002 → 003 → 004 → 005` 一致。
+MIGRATION_RUN_FIRST = "006_item_decision_provenance.sql"
+
 MIGRATION_UNPROBEABLE_SQL = (
     "select indexname from pg_indexes where schemaname='autowriter' "
     "and indexname='versions_item_version_uniq';"
 )
 
 
-def _probe_ok(fn) -> tuple[str, str]:
+def _probe_ok(fn, *, predicate=None) -> tuple[str, str]:
     """跑一个只读探测。返回 (state, note)。
 
-    ``store.rpc_missing`` 说"函数/列不存在"→ ``missing``;
-    其余异常 → ``error``(**不是** missing) —— 权限、参数、库故障被当成
-    "迁移没跑"正是 store.py 里那一大段注释在防的事。
+    判据说"这个对象不存在"→ ``missing``; 其余异常 → ``error``(**不是**
+    missing) —— 权限、参数、库故障被当成"迁移没跑"正是 store.py 里那一大段
+    注释在防的事。
+
+    ⚠️ **两种判据, 按探的是什么分**(codex review · #63, 实测确认):
+
+      · **RPC** 探测用 ``store.rpc_missing``(默认) —— 与运行期降级用的**同一个**
+        函数。同源是这里的重点: 自检说"RPC 在", 运行期就不该判它不在。
+      · **表 / 列** 探测用 ``store.schema_object_missing`` —— 因为
+        ``rpc_missing`` 对缺表返 False: PostgREST 回的是 ``PGRST205
+        Could not find the table ... in the schema cache``, 三个条件一个都不沾。
+        照旧用它的话, 一个**真的没跑 001** 的库会被报成 ``error`` 并写着
+        "不是「没跑迁移」" —— 正好说反, 而这个命令存在的全部意义就是别说反。
+        表/列这一路没有运行期对应物(运行期不该因为缺表就降级), 所以宽一档不
+        破坏同源那条纪律。
     """
+    check = predicate or store.rpc_missing
     try:
         fn()
     except Exception as exc:                       # noqa: BLE001 — 探测就是要看异常
-        if store.rpc_missing(exc):
+        if check(exc):
             return "missing", f"{type(exc).__name__}: {exc}"[:200]
         return "error", (f"探测本身失败(不是「没跑迁移」): "
                          f"{type(exc).__name__}: {exc}"[:200])
@@ -1419,14 +1440,34 @@ def migration_state(client) -> dict:
     for table in _MIGRATION_001_TABLES:
         state, note = _probe_ok(
             lambda t=table: client.table(t)
-            .select(_MIGRATION_001_PROBE_COLUMN).limit(1).execute())
+            .select(_MIGRATION_001_PROBE_COLUMN).limit(1).execute(),
+            predicate=store.schema_object_missing)
         _add("001_deskcore.sql", f"表 {table}", state, note,
              "deskcore 整个不可用")
     state, note = _probe_ok(
-        lambda: client.table("items").select("id,updated_at").limit(1).execute())
+        lambda: client.table("items").select("id,updated_at").limit(1).execute(),
+        predicate=store.schema_object_missing)
     _add("001_deskcore.sql", "items.updated_at", state, note,
          "TV 的 sync_autowriter_decisions_to_prepublish 会降级回只按 created_at, "
          "迟到的人工决策重新开始漏收")
+
+    # 001 建的还有这个 RPC —— 漏探它的代价是**静默的**: 表都在, doctor 报
+    # "001 到位", 而 store.reserve_angles 每次都判 RPC 不存在、降级成非原子发牌,
+    # 于是两个人同时发牌能拿到同一组角度坐标, 两边都报成功。部分/手工部署或
+    # schema 漂移下这是会发生的。(codex review · #63)
+    #
+    # ``_want: 0`` 是可证明的 no-op: 函数体第一句就是 `IF _want <= 0 THEN
+    # RETURN; END IF;`, 连 advisory lock 都还没取。
+    state, note = _probe_ok(lambda: client.rpc("deskcore_reserve_angles", {
+        "_project_id": _PROBE_NIL_UUID,
+        "_candidates": [],
+        "_drawn_by": _PROBE_NIL_UUID,
+        "_want": 0,
+        "_avoid_days": 30,
+    }).execute())
+    _add("001_deskcore.sql", "deskcore_reserve_angles", state, note,
+         "发牌退回非原子路径 —— 两人同时发牌可能拿到同一组角度坐标, "
+         "而两边都报成功(台账事后也看不出来)")
 
     # ── 002: CAS RPC。nil 项目 + 不可能匹配的 witness → UPDATE 命中 0 行 ──
     state, note = _probe_ok(lambda: client.rpc("update_calibration_notes_cas", {
@@ -1483,18 +1524,27 @@ def migration_state(client) -> dict:
     # ── 006: 决策出处三列。⚠️ 这一条不跑是**硬失败**, 不是降级 ──
     state, note = _probe_ok(lambda: client.table("items")
                             .select("id,decision_source,reviewer_id,decided_at")
-                            .limit(1).execute())
+                            .limit(1).execute(),
+                            predicate=store.schema_object_missing)
     _add("006_item_decision_provenance.sql", "items 的决策出处三列", state, note,
          "⚠️ 硬失败: db.update_item_status 无条件写这三列, 缺列会让现有工作台的"
          "「通过 / 打回」、硬规则自动标记、查重自动标记**全部报错**。"
          "这个迁移与其它几个不同, **不是可选的**")
 
+    # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
+    # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
+    # 一遍根本不缺的 SQL, 而同一份输出里那条 note 明明写着"不是「没跑迁移」"。
+    # 一个自检工具给出**互相矛盾的**结论, 比它不存在更坏。
+    #
+    # 两者都判红(见 ok), 但补救方式完全不同, 所以必须分开报。
     missing = sorted({c["migration"] for c in checks
-                      if c["state"] in ("missing", "old_signature", "error")})
+                      if c["state"] in ("missing", "old_signature")})
+    errors = sorted({c["migration"] for c in checks if c["state"] == "error"})
     return {
-        "ok": not missing,
+        "ok": not missing and not errors,
         "checks": checks,
         "missing": missing,
+        "errors": errors,
         "unprobeable": sorted({c["migration"] for c in checks
                                if c["state"] == "unprobeable"}),
     }
@@ -1513,11 +1563,21 @@ def backfill_gap(client, project_id: str) -> dict:
     就会在"主力项目还差几百条"的时候报绿 —— 而验收标准报绿正是本仓最怕的那
     一类失败。这里直接调回填自己用的那两个函数, 两者不可能漂。
 
+    ⚠️ **扫全量, 不带上限**(``limit=None``)。``legacy_version_pages`` 默认
+    ``limit=5000`` —— 沿用它的话, 一个 5000 条以上的项目在最新那 5000 条补齐之后
+    就会被报成"还差 0 / done"，而更老的历史稿从来没进过查重基线。**一个只看了
+    前 5000 条的验收标准报出来的绿是假的**, 而验收标准报假绿正是本仓最怕的那类
+    失败(runbook §5 整节)。(codex review · #63)
+
+    回填本身**仍然**带 5000 上限, 那是它的已知边界 —— 所以 ``eligible`` 超过
+    上限时这里会带一条 ``backfill_capped_warning``: 那种项目靠 backfill 追不平,
+    需要先把 cap 调高。诚实地说出来, 好过让两个数永远对不上而没人知道为什么。
+
     只读: 只数数, 不写指纹。
     """
     done = store.existing_fingerprint_version_ids(client, project_id)
     eligible: set[str] = set()
-    for page in store.legacy_version_pages(client, project_id):
+    for page in store.legacy_version_pages(client, project_id, limit=None):
         for row in page:
             vid = row.get("version_id")
             if vid:
@@ -1529,13 +1589,21 @@ def backfill_gap(client, project_id: str) -> dict:
         "eligible": len(eligible),         # backfill 口径下"应有"的条数
         "backfilled": len(eligible & done),
         "todo": len(todo),
-        # 指纹表里还有一类行不在 items × versions 里(写作台经 commit_drafts
-        # 写进来的)。它们不算缺口, 但报出来免得两个数对不上时让人以为出错了。
-        "fingerprints_total": len(done),
+        # ⚠️ 真的去数一次行数。这里原来写的是 len(done) —— 而 done 来自
+        # existing_fingerprint_version_ids, 它过滤掉了 version_id 为空的行、
+        # 还去了重。也就是说它**恰恰数不到**写作台经 commit_drafts 写进来的
+        # 那批(那批的 version_id 就是空的), 而 CLI 的说明文字还专门写着
+        # "含 commit_drafts 写进来的" —— 正好说反。(codex review · #63)
+        "fingerprints_total": store.fingerprint_row_count(client, project_id),
     }
     out["done"] = not todo
     if todo:
         out["next"] = (f"python -m deskcore.cli backfill --project {project_id}")
+    if len(eligible) > _BACKFILL_DEFAULT_CAP:
+        out["backfill_capped_warning"] = (
+            f"这个项目有 {len(eligible)} 条待回填, 超过 backfill 自己的上限 "
+            f"{_BACKFILL_DEFAULT_CAP} —— 跑一次追不平, 得先把 "
+            f"store.legacy_version_pages 的 limit 调高")
     return out
 
 

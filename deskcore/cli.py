@@ -222,13 +222,33 @@ def _doctor(core, sb, project_id: str | None) -> int:
         for m in state["unprobeable"]:
             print(f"  ? {m}")
 
+    # ⚠️ error 单独一段, **不能**混进"还缺这些迁移"(codex review · #63)。
+    # 权限/连通性故障混进去的话, 这里会指挥人去跑一遍根本不缺的 SQL, 而上面
+    # 那条 note 明明写着"不是「没跑迁移」"—— 自检工具给出互相矛盾的结论,
+    # 比它不存在更坏。两者都判红, 但补救方式完全不同。
+    if state.get("errors"):
+        print("\n探测失败(**不是**缺迁移 —— 先查权限 / 连通性, 别急着跑 SQL):")
+        for m in state["errors"]:
+            print(f"  ! {m}")
+
     if state["missing"]:
-        print("\n还缺这些迁移 —— 按编号顺序跑, 别跳号:")
-        for m in state["missing"]:
-            print(f"  · migrations/{m}")
-        print("\n⚠️ 006 与其它几个不是一类: 它不跑不是降级, 是现有工作台的"
-              "「通过 / 打回」当场报错。")
-    else:
+        # 006 提前: 它是唯一一个不跑就当场坏的, 其余缺席都只是降级。按字典序
+        # 打印会把它排在最后, 于是照着做的人会在"审稿按钮全报错"的状态下先跑
+        # 完 002-005(其中 003 还要改数据), 而那份 runbook 写的是 006 优先。
+        # 工具和文档给出不同的顺序, 人只会信工具。
+        ordered = ([core.MIGRATION_RUN_FIRST]
+                   if core.MIGRATION_RUN_FIRST in state["missing"] else [])
+        ordered += [m for m in state["missing"] if m != core.MIGRATION_RUN_FIRST]
+
+        print("\n还缺这些迁移 —— **按这个顺序跑**:")
+        for m in ordered:
+            first = "   ← 先跑这个" if m == core.MIGRATION_RUN_FIRST else ""
+            print(f"  · migrations/{m}{first}")
+        if core.MIGRATION_RUN_FIRST in state["missing"]:
+            print("\n⚠️ 006 与其它几个不是一类: 它不跑不是降级, 是现有工作台的"
+                  "「通过 / 打回」当场报错 —— 所以它排在最前面, "
+                  "别让 003 那种要改数据的迁移把它挡在后面。")
+    elif not state.get("errors"):
         print("\n迁移: 全部到位。")
 
     if project_id:
@@ -239,6 +259,8 @@ def _doctor(core, sb, project_id: str | None) -> int:
         print(f"  还差                            : {gap['todo']}")
         print(f"  指纹表这个项目共                : {gap['fingerprints_total']} 行"
               "  (含写作台 commit_drafts 写进来的, 它们不在上面的分母里)")
+        if gap.get("backfill_capped_warning"):
+            print(f"\n  ⚠️ {gap['backfill_capped_warning']}")
         if not gap["done"]:
             print(f"\n  → {gap['next']}")
         elif gap["eligible"] == 0:
