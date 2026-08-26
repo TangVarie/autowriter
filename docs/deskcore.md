@@ -97,19 +97,19 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 
 #### 2.2.1 项目归属：按 `owner_id` 隔离（2026-08-24 拍板，审计 COR-015）
 
-上面那张表回答的是"一个项目的数据分几层"，**不回答"谁能打开这个项目"**。这两件事被混过一次：deskcore 原来对 `project_id` 没有任何归属校验，十一个工具里 `list_projects` / `borrow_lessons` / `check_drafts` 三个连调用者是谁都不问。于是任一持有效 key 的调用方传入他人 `project_id` 就能读他人成稿标题（`check_drafts` 的 `collided_with` 会回显）、往他人项目写规则和指纹。
+上面那张表回答的是"一个项目的数据分几层"，**不回答"谁能打开这个项目"**。这两件事被混过一次：deskcore 原来对 `project_id` 没有任何归属校验，当时的十一个工具里 `list_projects` / `borrow_lessons` / `check_drafts` 三个连调用者是谁都不问。于是任一持有效 key 的调用方传入他人 `project_id` 就能读他人成稿标题（`check_drafts` 的 `collided_with` 会回显）、往他人项目写规则和指纹。
 
 现在的口径：**`projects.owner_id == 调用者 user_id`**，读写两侧都校验。这与 `db.py` 里那条 RLS policy `owner_id = (select auth.uid())` 是同一条谓词——deskcore 绕过 RLS，就得自己把它执行一遍。
 
 | 谁 | 怎么执行 |
 |---|---|
-| 十一个 MCP 工具 | `TOOLS` 里 `needs_user` **全部为 True**；`core.assert_project_access` 是唯一实现，每个项目级入口以它开头 |
+| 十二个 MCP 工具 | `TOOLS` 里 `needs_user` **全部为 True**；`core.assert_project_access` 是唯一实现，每个项目级入口以它开头 |
 | `label_example` | **按 `items.user_id` 校验**，比项目粒度更细——同一项目里 A 的正负例是 A 的个人资产 |
 | REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了 |
 | CLI 的 `projects` / `open` / `draw` / `check` | 走同一个 `core` 函数，所以 `--user` 从可选变成**必填** |
 | CLI 的 `backfill` / `reembed` | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
 
-**要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在十一个工具里意味着改口径要改十一处，而漏掉的那处不会报错，只会继续放行。
+**要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在十二个工具里意味着改口径要改十二处，而漏掉的那处不会报错，只会继续放行。
 
 回归在 `tests/test_deskcore_ownership.py`（含一条 AST 断言：每个项目级入口都必须调过这道闸——归属校验最典型的失效方式不是判据写错，而是**新加了个工具忘了加校验**）+ `ci.yml` app 冒烟步里的 403 运行期断言。
 
@@ -261,9 +261,33 @@ env：
 
 ### 4.1.1 部署两步，缺一不可
 
-**① 跑迁移** `migrations/001_deskcore.sql`，以及后续的 `002` / `003` / `004`（建议先在 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。
+**① 跑迁移。** 不是只有 `001` —— 到今天是 `001_deskcore.sql` /
+`002_calibration_cas.sql` / `003_versions_unique_num.sql` /
+`004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
+`006_item_decision_provenance.sql` **六个，按编号顺序跑，别跳号**（建议先在
+Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
+`migrations/README.md` 的清单表，那份是唯一真源。
 
-其中 `004_deskcore_check_pushdown.sql` 是 2026-08-23 审计 SUP-002/SUP-004/ROB-004/ROB-011 的落地：把 `check_drafts` 的三路比对和 `list_projects` 的指纹计数下推到库里。**不跑也不会坏** —— `check_drafts` 检测到 RPC 不存在会退回 Python 逐对比对（结论一致，只是慢，且回到 4000 条上限），并埋一行 `deskcore_rpc_missing`。但大项目上不跑就仍然会撞线程池饥饿和 OOM，所以别拖。
+> ⚠️ **这一段曾经写着"`001`，以及后续的 `002` / `003` / `004`"**，`005` 和 `006`
+> 从来没被写进去。照着它部署的人会漏掉 `005`（短稿整段照搬长稿从此抓不到）和
+> `006`（现有工作台的审稿按钮当场报错），而两边都不会有任何东西提醒他漏了。
+> 现在 `tests/test_migration_doctor.py` 断言 `migrations/*.sql` 每个文件名都要
+> 出现在本文档、`migrations/README.md` 和 runbook 里——漏写会红。
+
+**先查一次库，别照文档推断**：
+
+```bash
+python -m deskcore.cli doctor        # 只读; 逐个探测缺哪个、缺了会怎样
+```
+
+判据与真正消费这些迁移的代码同源（`store.rpc_missing`），所以不会出现"文档说
+跑过了、代码认为没跑"。2026-08-26 实测生产库 `kduysqedr` **只跑过 `001`**，而
+runbook §0 当时写的是"schema 也上了生产"——这条命令就是为了不再有下一次。
+
+两个要单独记住的：
+
+- `004_deskcore_check_pushdown.sql` 是 2026-08-23 审计 SUP-002/SUP-004/ROB-004/ROB-011 的落地：把 `check_drafts` 的三路比对和 `list_projects` 的指纹计数下推到库里。**不跑也不会坏** —— `check_drafts` 检测到 RPC 不存在会退回 Python 逐对比对（结论一致，只是慢，且回到 4000 条上限），并埋一行 `deskcore_rpc_missing`。但大项目上不跑就仍然会撞线程池饥饿和 OOM，所以别拖。
+- `006_item_decision_provenance.sql` **是唯一一个不跑就当场坏的**：`db.update_item_status` 无条件写 `decision_source` / `reviewer_id` / `decided_at`，缺列会让现有工作台的「通过 / 打回」、硬规则自动标记、查重自动标记全部报错。刻意不做"去掉三列重试"的降级——那等于让机器判定继续伪装成人工反馈去污染 TV 的评估模型（COR-004 治的正是这件事）。**升级顺序上它排最前面。**
 
 **② 回填历史指纹**（**必做**）：
 
@@ -356,7 +380,7 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
 **3. 鉴权配坏了必须 fail closed。** `DESKCORE_KEYS` 的 JSON 写错时，早期实现会返回空 map → `resolve()` 判定为"没配鉴权" → **放行所有请求**。生产上一个逗号写错就等于把项目数据和全部写工具匿名开放。现在显式配了就必须当成"打算开鉴权"，解析失败一律 401，`/health` 的 `auth.ok` 会是 false。
 
-**3b. "没配鉴权"同样 fail closed（2026-08-23 审计 ROB-003）。** 上面那条只堵了"配了但写错"，"根本没配"当时仍然走 dev 模式放行——而 deskcore 持 service_role 绕 RLS，漏配一个环境变量就等于把全部租户的数据和十一个工具（含写）开放到公网。更糟的是**健康检查看不见**：`/health` 虽然会把 `auth.ok` 报成 false，但它返回的是 HTTP 200，而 Railway 的 healthcheck 只看状态码——一个彻底敞开的部署照样判定健康、照样上线。
+**3b. "没配鉴权"同样 fail closed（2026-08-23 审计 ROB-003）。** 上面那条只堵了"配了但写错"，"根本没配"当时仍然走 dev 模式放行——而 deskcore 持 service_role 绕 RLS，漏配一个环境变量就等于把全部租户的数据和十二个工具（含写）开放到公网。更糟的是**健康检查看不见**：`/health` 虽然会把 `auth.ok` 报成 false，但它返回的是 HTTP 200，而 Railway 的 healthcheck 只看状态码——一个彻底敞开的部署照样判定健康、照样上线。
 
 现在默认拒绝：没配 key 时每个请求都 401。本地开发要免 key 跑，显式设 `DESKCORE_ALLOW_ANONYMOUS=1`（`/health` 会把它回显在 `config.anonymous_allowed`，并在 `auth.note` 里写明是 dev 模式）。
 

@@ -1144,7 +1144,26 @@ def update_item_status(
         updates["best_version_id"] = best_version_id
     elif clear_best_version:
         updates["best_version_id"] = None
-    res = client.table("items").update(updates).eq("id", item_id).execute()
+    try:
+        res = client.table("items").update(updates).eq("id", item_id).execute()
+    except Exception as exc:
+        # ⚠️ 这三列来自 migrations/006, 而**没跑它就是硬失败** —— 与 001~005
+        # 那批"不跑也不会坏、只是降级"不同。这里刻意不降级(去掉三列重试一次
+        # 就等于让机器判定继续伪装成人工反馈去污染 TV 的评估模型, 正是 COR-004
+        # 要治的那件事), 只把报错**翻译成人话**: PostgREST 原样抛出来的是
+        # `column "decision_source" of relation "items" does not exist`, 点
+        # 「通过」的人看到那句话完全不知道该做什么。
+        # 三列一起来自同一个迁移, 所以三个名字都认 —— PostgREST 只报它撞上的
+        # 第一个, 而那取决于 payload 的键序(今天是 decision_source, 但那不是
+        # 契约)。只认一个的话, 键序一动这条翻译就静默失效。
+        if any(c in str(exc) for c in
+               ("decision_source", "reviewer_id", "decided_at")):
+            raise RuntimeError(
+                "审稿决定写不进去: items 缺 decision_source / reviewer_id / "
+                "decided_at 三列 —— migrations/006_item_decision_provenance.sql "
+                "还没跑。用 Supabase SQL Editor 跑一遍即可(幂等)。"
+                "自检: python -m deskcore.cli doctor") from exc
+        raise
     try:
         list_items.clear()
     except Exception:

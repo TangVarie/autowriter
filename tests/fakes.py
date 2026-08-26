@@ -127,10 +127,19 @@ class FakeClient:
     **不报错**。本仓的静默截断类 bug 全是它造成的, 假件必须能重现。
     """
 
-    def __init__(self, rows=None, rpc_impl=None, max_rows: int | None = None):
+    def __init__(self, rows=None, rpc_impl=None, max_rows: int | None = None,
+                 missing_columns: dict[str, set[str]] | None = None):
         self.rows = {k: list(v) for k, v in (rows or {}).items()}
         self.rpc_impl = rpc_impl or {}
         self.max_rows = max_rows
+        # {表名: {列名, ...}} —— 这些列在"库里还没有"。select 到它们时按
+        # PostgREST 的真实形态报错, 而不是静默返回。
+        #
+        # 为什么假件要会这一手: 迁移没跑时**缺列是硬失败**(migrations/006 的
+        # 三列就是), 而缺列与"这一行该字段是 NULL"在假件里长得一模一样。分不
+        # 开的话, "库缺列会怎样"这类用例只能靠手搭一次性替身 —— 而手搭替身正是
+        # 这个文件存在要消掉的东西。
+        self.missing_columns = {k: set(v) for k, v in (missing_columns or {}).items()}
         self.calls: list[dict] = []
         self.rpc_calls: list[tuple[str, dict]] = []
 
@@ -196,6 +205,22 @@ class FakeClient:
             "payload": q.payload,
         })
         table = self.rows.setdefault(q.table_name, [])
+
+        # 缺列: PostgREST 的报错文本带 `does not exist`, 也正是
+        # deskcore/store.rpc_missing 认的那一句。select 看 cols, 写看 payload。
+        absent = self.missing_columns.get(q.table_name)
+        if absent:
+            touched = set()
+            if q.op == "select":
+                touched = {c.strip() for c in (q.cols or "").split(",") if c.strip()}
+            elif isinstance(q.payload, dict):
+                touched = set(q.payload)
+            elif isinstance(q.payload, list):
+                touched = {k for row in q.payload if isinstance(row, dict) for k in row}
+            hit = sorted(touched & absent)
+            if hit:
+                raise RuntimeError(
+                    f'column "{hit[0]}" of relation "{q.table_name}" does not exist')
 
         if q.op in ("insert", "upsert"):
             payload = q.payload if isinstance(q.payload, list) else [q.payload]

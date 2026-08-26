@@ -3,7 +3,7 @@
 > **这份文档的定位**：`docs/deskcore.md` 讲的是**为什么这么设计**，这份讲的是
 > **现在到底是什么状态、还差什么、你下一步做什么**。以后主要在本仓迭代，从这里开始读。
 >
-> 快照时间：**2026-08-23**。所有数字都是当天从生产库（`kduysqedr`）和线上服务实测的，
+> 快照时间：**2026-08-26**。所有数字都是当天从生产库（`kduysqedr`）和线上服务实测的，
 > 不是照文档抄的。**改动之后请回来更新这些数字**，否则它就变成下一份"写着已经有了、
 > 实际没有"的文档——本仓在这上面栽过好几次，登记在 §5。
 
@@ -11,12 +11,21 @@
 
 ## 0. 一句话现状
 
-**代码全写完了、离线自测通过、schema 也上了生产。但服务没部署，四张新表全是 0 行——
-所以整条链路一次都没真跑过。**
+**代码全写完了、离线自测通过（216 条 pytest + selftest + 真 PostgreSQL 上的迁移与
+SQL/Python 逐例比对全绿）。但服务没部署，六个迁移里生产库只跑过 `001`，四张新表
+全是 0 行——所以整条链路一次都没真跑过。**
+
+> ⚠️ **这一段 2026-08-23 版写的是"schema 也上了生产"。那不对。** 08-26 实测：
+> `002` / `003` / `004` / `005` / `006` 在生产库上一个都没有（见 §1.2）。修这条
+> 的同时补了 `python -m deskcore.cli doctor`——以后不必再手写 SQL 去问这个问题。
+>
+> 其中 **`006` 不跑是硬失败**：`db.update_item_status` 无条件写
+> `decision_source` / `reviewer_id` / `decided_at`，缺列会让现有工作台的
+> 「通过 / 打回」当场报错。它排在所有步骤最前面。
 
 ---
 
-## 1. 实测状态快照（2026-08-23）
+## 1. 实测状态快照（2026-08-26）
 
 ### 1.1 TV 侧（truth-vault）——在跑，且是自动的
 
@@ -34,35 +43,98 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 
 | 部件 | 实测结果 |
 |---|---|
-| `deskcore/` 代码 | 齐。`python -m deskcore.cli selftest` → **PASS**（开头撞车拦住 / 换皮改写拦住 / 真不同的不误伤 / 组合空间 14,592 组） |
-| schema | 四张表 + `items.updated_at` **已应用到生产**（2026-08-23） |
+| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **216 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 六个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
+| ⚠️ **schema** | ❌ 生产库**只跑过 `001`**。`002` / `003` / `004` / `005` / `006` 一个都没有——见下面那张表 |
 | **服务部署** | ❌ **没有**。两个仓里搜不到任何 deskcore 的线上地址 |
 | `draft_fingerprints` | **0 行** ← 查重硬闸背后一条历史都没有 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
-| `memories` | 303 条，`scope`：project 283 / global 20；`status`：confirmed 292 / candidate 11 |
+| `memories` | 303 条 |
 | ⚠️ `memories.severity` | **303 条全是 `soft`，`hard` = 0** |
-| `items` | 4,574 条 / 643 批 / 61 个项目 / 6 个 owner |
-| `items.example_label` | positive **15** · negative **103** |
-| ⚠️ `versions.embedding` | 5,532 行，**非空 0 条** |
-| `example_label_proposal` 待人工确认 | 0（没有积压） |
+| `items` | 4,574 条 / 61 个项目 / 6 个 owner |
+| `versions` | 5,532 行 |
+| ⚠️ `versions.embedding` | **非空 0 条** |
+| ⚠️ `(item_id, version_num)` 重复 | **339 对 / 678 行** ← `003` 会先把它们重编号再建唯一索引 |
 | 最后一次真实使用 | 2026-08-19（item / batch / memory 的最新 `created_at` 都停在这天） |
 
-单项目体量（backfill 只取每个 item 的最新版本，所以行数≈item 数）：
+**迁移状态逐条实测**（2026-08-26，`information_schema` + `pg_proc` 查的）：
 
-| 项目 | items |
-|---|---|
-| WTG-No.3产品直给体验型 | 445 |
-| WTG-No.1佳琦背书直给型 | 385 |
-| WTG-No.2佳琦关键词占位型 | 383 |
-| WTG-No.4贴全棉时代 | 316 |
-| 唐小轻成分党 | 247 |
-| RIO轻享-流量 | 108 |
+| 迁移 | 生产库 | 判据 |
+|---|---|---|
+| `001_deskcore.sql` | ✅ 在 | 四张表都在；`items.updated_at` 在；`deskcore_reserve_angles` 在 |
+| `002_calibration_cas.sql` | ❌ 没跑 | `update_calibration_notes_cas` 查不到 |
+| `003_versions_unique_num.sql` | ❌ 没跑 | `versions_item_version_uniq` 索引不存在（且库里正好有 339 对重复） |
+| `004_deskcore_check_pushdown.sql` | ❌ 没跑 | `deskcore_check_drafts` / `deskcore_fingerprint_counts` 都查不到 |
+| `005_deskcore_containment.sql` | ❌ 没跑 | `deskcore_commit_fingerprints` 还是 **4 参**那版 |
+| `006_item_decision_provenance.sql` | ❌ 没跑 | `items` 没有 `decision_source` / `reviewer_id` / `decided_at` |
+
+以后不用手写这些 SQL：
+
+```bash
+python -m deskcore.cli doctor        # 只读; 逐个探测缺哪个、缺了会怎样、下一步跑什么
+```
+
+单项目体量（`backfill` 口径 = 每个 item 的**有版本的**那些，所以略小于 item 数）：
+
+| 项目 | project_id | owner_id | backfill 应有 |
+|---|---|---|---|
+| WTG-No.3产品直给体验型 | `e4171a1f-f66f-4f6f-84f8-ab4782e67fed` | `85f5f888…` | 385 |
+| WTG-No.1佳琦背书直给型 | `ff28bf9e-696f-499b-8273-9d1d4e847d22` | `85f5f888…` | 375 |
+| WTG-No.2佳琦关键词占位型 | `8c3d654e-bb4d-4445-9258-fec17f515d2e` | `85f5f888…` | 359 |
+| WTG-No.4贴全棉时代 | `5caa74c8-62e1-4dd2-960a-f5d269489470` | `85f5f888…` | 315 |
+| 唐小轻成分党 | `bcc3d155-201d-4920-9fde-64933a8948dc` | `b907ec9d…` | 229 |
+| RIO便利店调酒 | `b3ac2a5f-320b-49e5-9f11-15d6e517ec41` | `b907ec9d…` | 104 |
+
+owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
+
+| owner_id | 项目数 | items |
+|---|---|---|
+| `85f5f888-a649-4843-8358-9c83c91282e6` | 29 | 3,385 |
+| `afbaf84e-e5a3-4429-9490-72718d2a9019` | 20 | 667 |
+| `b907ec9d-9e49-4dac-89ad-220eb53afc38` | 6 | 504 |
+| 另外三个 | 6 | 18 |
 
 ---
 
-## 2. 上线四步（顺序不能换）
+## 2. 上线五步（顺序不能换）
 
-### 第 0 步 · 先想清楚「协议不通怎么办」
+### 第 0 步 · 补齐迁移（`002`–`006`），**先跑 `006`**
+
+生产库只跑过 `001`（§1.2）。**`006` 排在最前面，因为它是唯一一个"代码已经发了、
+迁移没跑就当场坏"的**：`db.update_item_status` 无条件写
+`decision_source` / `reviewer_id` / `decided_at`，缺列时现有工作台的
+「通过 / 打回」按钮、硬规则自动标记、查重自动标记全部报错。
+
+跑法：Supabase SQL Editor 粘贴执行，或 MCP `apply_migration`。建议先在 branch 库
+跑一遍 + `get_advisors` 核验再进 prod。顺序：
+
+```
+006 → 002 → 003 → 004 → 005
+```
+
+`006` 之外按编号顺序即可。**`005` 必须在 `004` 之后**（它 DROP 掉 `004` 建的那版
+`deskcore_check_drafts` 再重建，跳过 `004` 会缺 `deskcore_fingerprint_counts`）。
+
+⚠️ **`003` 会改数据**，不只是建索引：库里现有 **339 对 / 678 行**重复的
+`(item_id, version_num)`，它先按 `(version_num, created_at, id)` 稳定重编号，再建
+唯一索引。这是 `bulk_create_initial_versions` 给多引擎批次每个引擎都写
+`version_num=1` 留下的历史（审计 §0.4 第 1 条），不是数据损坏。跑之前先备份/开
+branch 库过一遍。
+
+跑完立刻自检——**别照文档推断，去查库**：
+
+```bash
+python -m deskcore.cli doctor
+```
+
+期望输出是「迁移: 全部到位」。`003` 会报 `unprobeable`（PostgREST 看不见索引），
+它会把该跑的 SQL 一起交出来，自己跑一次确认。
+
+> 这条命令是 2026-08-26 补的。此前**没有任何办法**一眼看出库跑到第几个迁移，
+> 于是这份 runbook 的 §0 写了三天"schema 也上了生产"，而实际只有 `001`。
+> 判据与真正消费这些迁移的代码同源（`store.rpc_missing`），不会出现"文档说跑过
+> 了、代码认为没跑"。
+
+### 第 0.5 步 · 先想清楚「协议不通怎么办」
 
 WorkBuddy 的 HTTP MCP 到底认不认自定义 header，官方只说了支持 HTTP MCP 和 OAuth
 （v4.7.3），**没有权威文档**。**这一步不通的话整个形态要换**，所以它是排在最前面
@@ -111,7 +183,7 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 >   而且 B 能改 A 的标注（`label_example` 的归属校验是按 `user_id` 判的）。
 >
 > ⚠️ **2026-08-24 起还多一层**（审计 COR-015）：`user_id` 现在还决定**能打开哪些项目**——
-> 判据是 `projects.owner_id == user_id`，十一个工具全部校验。所以给新人发一个全新 UUID
+> 判据是 `projects.owner_id == user_id`，十二个工具全部校验。所以给新人发一个全新 UUID
 > 意味着他**一个项目都打不开**，得先让他自己建项目（或者把他要用的项目的 `owner_id`
 > 改成他）。口径与"改成团队共享要改哪儿"见 `docs/deskcore.md` §2.2.1。
 >
@@ -184,21 +256,20 @@ python -m deskcore.cli backfill --project <uuid>    # 每个项目跑一次
 
 按项目逐个比对**该项目应有的条数**：
 
-```sql
--- 应有: 该项目每个 item 的最新版本 (与 backfill 的口径一致)
-with eligible as (
-  select distinct i.id
-    from autowriter.items i
-    join autowriter.batches b on b.id = i.batch_id
-    join autowriter.versions v on v.item_id = i.id
-   where b.project_id = '<uuid>'
-)
-select (select count(*) from eligible)                                as 应有,
-       (select count(*) from autowriter.draft_fingerprints f
-         where f.project_id = '<uuid>' and f.version_id is not null)  as 已回填;
+```bash
+python -m deskcore.cli doctor --project <uuid>
 ```
 
-两个数对上才算完。另外看 `backfill` 的返回值：`missing_embeddings` 不为 0
+`还差` 归零才算完。
+
+> 这里原来给的是一段手写的三表 join SQL。换掉它是因为那是把回填的口径**抄了
+> 第二份**——`backfill` 取的是 `store.legacy_version_pages` 那一套，抄出来的
+> SQL 一旦和它漂开，验收标准就会在"主力项目还差几百条"的时候报绿。而验收标准
+> 报绿正是本仓最怕的那类失败（§5 整节）。`doctor --project` 直接调回填自己用的
+> 那两个函数（`existing_fingerprint_version_ids` + `legacy_version_pages`），
+> 两者不可能漂；`tests/test_migration_doctor.py` 有一条 AST 断言钉着这件事。
+
+另外看 `backfill` 的返回值：`missing_embeddings` 不为 0
 就是**该有向量却没取到**（key 欠费/配额用尽——`embeddings_available()` 那时仍是
 `true`，见第 1 步），那批行只有确定性指纹，补好 key 之后要跑 `reembed`。
 
@@ -206,9 +277,11 @@ select (select count(*) from eligible)                                as 应有,
 > 只参与确定性查重；补配之后重跑**不会**给已写入的行补向量（幂等是按 `version_id`
 > 跳过的），得先把这些行删掉再跑。
 >
-> ⚠️ **2026-08-24 起还多一步。** `fingerprint.normalize` 的口径改了（原来不去中文
-> 弯引号 `“ ”` 和 `【】`，是一条能绕过查重的路子，审计 COR-014 后续）。如果这个
-> 项目**在那之前**已经回填过，必须补跑一次重算，否则新稿与老指纹的口径对不上：
+> ⚠️ **2026-08-24 起还多一步——但这次上线用不上。** `fingerprint.normalize` 的
+> 口径改了（原来不去中文弯引号 `“ ”` 和 `【】`，是一条能绕过查重的路子，审计
+> COR-014 后续）。**只有在那之前回填过的项目才要补跑重算**；而 `draft_fingerprints`
+> 现在是 0 行（§1.2），也就是说这次首次上线**一个项目都不需要跑**。留着这段是
+> 因为以后再改 `normalize` 时还会用到：
 > ```bash
 > python -m deskcore.cli recompute-fingerprints --project <uuid>
 > ```
@@ -243,21 +316,53 @@ WorkBuddy，项目级 `mcp.json`：
 skill：把本仓 `skills/bywood-writing-desk/SKILL.md` 复制到
 `~/.workbuddy/skills/bywood-writing-desk/SKILL.md`。CodeBuddy 放 `.codebuddy/skills/`。
 
+### 第 3.5 步 · 飞书表先建好那六个 lineage 列（**只影响交付那一段**）
+
+`export_drafts` 导出的 Excel 带 6 个**命名可见列**，列名由 TV 定
+（`exporter.LINEAGE_COLUMNS` 是唯一真源，与 TV
+`scripts/sync_feishu_notes_to_truth_vault.py` 的映射表对得上）：
+
+| 列名 | 飞书列类型 | 去处 |
+|---|---|---|
+| `_source_autowriter_project_id` | 文本 | `notes.raw_extra` |
+| `_source_autowriter_batch_id` | 文本 | `notes.raw_extra` |
+| `_source_autowriter_item_id` | 文本 | `notes.source_autowriter_item_id`（FK） |
+| `_source_autowriter_version_id` | 文本 | `notes.source_autowriter_version_id`（FK，`v_model_comparison` JOIN 它） |
+| `_ai_engine` | 文本 | `raw_extra`；TV 按它 GROUP BY 出模型胜率 |
+| `_exported_at` | **日期** | `raw_extra` |
+
+⚠️ **列名逐字相同，写错的代价不是丢一列**：未声明的列会让 TV 的 D-021 把**整行**
+quarantine，那条笔记连正文带指标一起进不了库。`export_drafts` 的返回值里直接带
+`columns`，不必翻文档。
+
+这一步不做不影响写稿，只影响"发出去之后爆没爆"能不能回流——可以等第 4 步验完
+再补，但**别忘了**，`v_model_comparison` 长期查出空集就是因为这一段一直没通。
+
 ### 第 4 步 · 端到端验一轮
 
-挑一个真实项目（建议 RIO轻享-流量，108 条，体量适中），完整跑：
+挑一个真实项目（建议 `RIO便利店调酒` / `b3ac2a5f-320b-49e5-9f11-15d6e517ec41`，
+104 条，体量适中；owner 是 `b907ec9d…`，`DESKCORE_KEYS` 里要有这把 key），完整跑：
 
 ```
 open_project → draw_angles(n=20) → borrow_lessons → 生成 20 篇
-             → check_drafts → commit_drafts
+             → check_drafts → commit_drafts → export_drafts
 ```
 
-然后验四件事：
+然后验六件事：
 
 1. 给一条"以后都这样"的反馈 → `record_rule(severity='hard')` → **下一轮生成时它出现在 P0 里**
 2. 手改一篇 → `record_edit` → 提炼 → `save_my_style` → **`my_style` 能读到变化，换个 key 看不到**
 3. 故意塞两篇近义改写进 `check_drafts` → **被 reject 且指出撞的是哪一条**
 4. 拿历史上被投诉重复的那批稿子回灌 → **新查重能抓出来**（这是唯一能证明"确实修好了"的测试）
+5. `commit_drafts` 的返回值里 **`batch_id` 和 `version_ids` 都不为空**，且**没有** `identity_warning`
+   —— 有 warning 说明指纹写进去了但 `batches`/`items`/`versions` 没建成，lineage 会断
+   （可逆，重跑即可，但别当没看见）
+6. `export_drafts` 出的表**粘进飞书之后**，去 TV 那边查一次
+   `select count(*) from truth_vault.notes where source_autowriter_version_id is not null`
+   —— **这一列长期是 0**，它第一次不为 0 才说明回程真的通了
+
+⚠️ 第 5、6 条是 2026-08-25 新增的那一段（`commit_drafts` 建身份 + lineage 命名列）
+的验收，2026-08-23 版的清单里没有它们。
 
 ---
 
@@ -296,11 +401,19 @@ deskcore_reserve_angles · deskcore_commit_fingerprints
 items.example_label（只有 label_example 这一个，走 db.set_item_example_label）
 ```
 
-**没有任何一个工具会创建 item/version，也没有任何一个会写 `items.status`。**
-而 TV 那条归档链路读的正是 `status ∈ (approved, needs_revision)`。
+**没有任何一个工具会写 `items.status`。** 而 TV 那条归档链路读的正是
+`status ∈ (approved, needs_revision)`。
 
-所以 Streamlit 一停，新写的稿子既不进 `autowriter.items`，也不会产生
-approved/needs_revision —— `prepublish_evaluations` 从此不再有新行，
+> **2026-08-25 起这条只对了一半。** `commit_drafts` 现在**会**建
+> `batches` / `items` / `versions`（§ `docs/deskcore.md` 3.4），所以"新写的稿子
+> 不进 `autowriter.items`"已经不成立了。但它建的是 `status='pending'`、决策三列
+> 全空，**刻意不标 approved**——标了就等于让每条定稿变成一条伪造的人工评价去
+> 校准 TV 的评估模型（而写作台没有"打回"这个动作，灌进去的会是清一色正例）。
+>
+> 也就是说：**下面这三条路的选择题仍然没解，只是选项 A 做了一半。**
+
+所以 Streamlit 一停，新写的稿子虽然进了 `autowriter.items`，却永远停在 pending，
+不会产生 approved/needs_revision —— `prepublish_evaluations` 从此不再有新行，
 **而 TV 那边不会报错**（查不到就是 0 条，跟"这几天没人审稿"长得一模一样）。
 
 顺带一个连带效应：停服之后 `items.updated_at` 唯一还会被刷的来源就是
@@ -308,13 +421,22 @@ approved/needs_revision —— `prepublish_evaluations` 从此不再有新行，
 
 **三条路，第一期之前必须选一条**（列进待办 #5 的前置）：
 
-| 选项 | 做什么 | 代价 |
+| 选项 | 做什么 | 现在到哪一步了 |
 |---|---|---|
-| A · deskcore 补写回 | `commit_drafts` 时建 item/version，`check_drafts` 的 pass/reject 或一个新工具落 `status` | 要动 schema 口径与 TV 的对接契约 |
-| B · 换一条归档源 | 让 TV 改读 `draft_fingerprints` + 一个新的决策表 | TV 侧要改，跨仓 |
-| C · 明确接受断掉 | 把这一行标成 legacy-only，`prepublish_evaluations` 冻结在存量 598 条 | `v_evaluator_calibration` 从此不再增长 |
+| A · deskcore 补写回 | `commit_drafts` 时建 item/version（**✅ 已做**），再加一个能落 `status` 的动作（❌ 没做——写作台没有"审稿"这个动作，要新增一个工具或换个语义） | 半做 |
+| B · 换一条归档源 | 让 TV 改读 `draft_fingerprints` + 一个新的决策表 | 没动，跨仓 |
+| C · 明确接受断掉 | 把这一行标成 legacy-only，`prepublish_evaluations` 冻结在存量 598 条 | 没动 |
 
 **在选定之前不要停 Streamlit。**
+
+⚠️ **另有一条跨仓待办卡在 TV 那边**（本仓改不动）：`migrations/006` 加的
+`decision_source` / `reviewer_id` / `decided_at` 三列，**TV 至今一处都没读**
+（2026-08-26 在 truth-vault 全仓 grep 过，零命中）。也就是说 COR-004 的修复只做了
+生产侧：本仓现在诚实地记下了"这个状态是机器判的还是人判的"，而
+`sync_autowriter_decisions_to_prepublish.py` 仍然把两者一起当人工反馈灌进
+`prepublish_evaluations`。**训练标签污染还在，只是现在有办法分辨了。**
+TV 侧要做的是在那条 sync 上加一句 `.eq("decision_source", "human")`（外加对存量
+NULL 行的口径决定）。
 
 ---
 
@@ -337,8 +459,9 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 
 | # | 事 | 为什么 | 验收标准 |
 |---|---|---|---|
+| 0 | **补齐迁移 `002`–`006`，`006` 最先** | 生产库只跑过 `001`。`006` 不跑是**硬失败**——现有工作台的「通过 / 打回」当场报错 | `python -m deskcore.cli doctor` 报「迁移: 全部到位」；`003` 那条 `unprobeable` 自己用 SQL 确认一次 |
 | 1 | 部署 deskcore service | 现在根本没跑 | `curl $URL/health` 每项 ok |
-| 2 | 回填指纹（至少主力项目） | 不做的话硬闸背后 0 行历史 | **逐项目**比对「应有 vs 已回填」（§2 第 2 步那条 SQL）两个数对上；且 `backfill` 返回的 `missing_embeddings` = 0。⚠️ **不能**拿全局 `count(*) > 0` 或「`empty_history_warning` 消失了」当验收——两个都会在主力项目还差几百条时报绿 |
+| 2 | 回填指纹（至少主力项目） | 不做的话硬闸背后 0 行历史 | `python -m deskcore.cli doctor --project <uuid>` 的「还差」归零；且 `backfill` 返回的 `missing_embeddings` = 0。⚠️ **不能**拿全局 `count(*) > 0` 或「`empty_history_warning` 消失了」当验收——两个都会在主力项目还差几百条时报绿 |
 | 3 | 验 WorkBuddy 的鉴权头 | 不通就要换形态 | MCP 握手成功、错 key 返 401 |
 
 ### P1 · 上线后第一周
@@ -349,6 +472,8 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。**⚠️ 前置**：先在 §3「停 Streamlit 会把 aw → TV 这条链路断掉」的 A/B/C 三条里选一条 —— 否则人工审稿决定从此不再进 `prepublish_evaluations`，而且不报错 |
 | 6 | 观察 `borrow_lessons` 选卡质量 | TV 书架规模下的选卡准确率**从来没人测过**。不行就在 `librarian/core.py:33` 那个 `CANDIDATE_CAP=50` 的口子加 embedding 预筛 |
 | 7 | 让 `check_drafts` 的降级信号被人看见 | `semantic_degraded` / `empty_history_warning` 这两个字段没人盯的话，表现就是"查重跑了、全 pass、看着一切正常" |
+| 7b | **推 TV 那边读 `decision_source`** | 跨仓。`migrations/006` 的三列 TV 至今一处都没读（2026-08-26 全仓 grep 零命中），所以机器判定仍在被当人工反馈灌进 `prepublish_evaluations`。本仓这一侧已经做完了，卡在 TV |
+| 7c | 打通 lineage 回程 | 飞书表建好那六列 + 真导一次 + 在 TV 查 `notes.source_autowriter_version_id` 非空条数。这一列长期是 0，`v_model_comparison` 因此长期查出空集且不报错 |
 
 ### P2 · 攒够再做
 
@@ -438,6 +563,36 @@ CLI 子命令、设计文档、PR 描述、连"部署必跑一次"的措辞都�
 第 5 节记的那个错法——**按注释判断代码，而不是按代码**。
 
 本次已把注释改成正确的名字和行号。**引用 `file:line` 之前先 grep 一下真的有没有。**
+
+### 5.6 部署文档漏掉了一半迁移，而生产库其实只跑过 `001`（2026-08-26，已修）
+
+三处同时不一致，任何一处单独看都不显眼：
+
+| 哪儿 | 写的 | 实际 |
+|---|---|---|
+| 本文 §0 | 「schema 也上了生产」 | 只有 `001`。`002`/`003`/`004`/`005`/`006` 一个都没有 |
+| `docs/deskcore.md` §4.1.1 | 「跑 `001`，以及后续的 `002` / `003` / `004`」 | 少写了 `005` 和 `006` |
+| `migrations/README.md` 清单 | 只列到 `005`，并写「五个迁移都不跑也不会坏」 | `006` 没进清单，**而且它不跑就是硬失败** |
+
+照着这三份文档部署的人会漏掉 `005`（短稿整段照搬长稿从此抓不到，而 `check_drafts`
+只在 `summary` 里埋一句没人看的 warning）和 `006`（现有工作台的审稿按钮直接抛
+PostgREST 原话）。**两边都不会有任何东西提醒他漏了**——又一次同样的形状。
+
+三道处理，一道比一道靠前：
+
+1. **文档改对**（三份都改了）；
+2. **`python -m deskcore.cli doctor`** —— 此前没有任何办法一眼看出库跑到第几个
+   迁移，只能手写 `information_schema` / `pg_proc` 查询。判据与真正消费这些迁移
+   的代码同源（`store.rpc_missing`）；
+3. **`tests/test_migration_doctor.py` 钉死**：`migrations/*.sql` 的每个文件名必须
+   出现在本文、`docs/deskcore.md`、`migrations/README.md` 三份里，且必须被 `doctor`
+   探到。钉的是【被禁止的形态】（新增迁移漏进文档 / 漏进 doctor），不是"代码现在
+   长这样"——所以以后加迁移忘了写文档会**当场红**，而不是等下一次部署踩到。
+
+顺带把 `db.update_item_status` 缺列时的报错翻译成人话（原来抛的是
+`column "decision_source" ... does not exist`，点「通过」的人看到那句完全不知道
+该做什么）。**刻意不降级**：去掉三列重试一次就等于让机器判定继续伪装成人工反馈
+去污染 TV 的评估模型，正是 COR-004 要治的那件事。
 
 ---
 
