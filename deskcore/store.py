@@ -62,6 +62,32 @@ def schema_object_missing(exc: Exception) -> bool:
         code in str(exc).lower() for code in ("pgrst205", "pgrst204"))
 
 
+def table_permission_denied(exc: Exception) -> bool:
+    """这个异常是不是"**表建出来了, 但没授权**"?
+
+    2026-08-26 首次真部署踩的形态。``migrations/001_deskcore.sql`` 建了四张表
+    却只给两个**函数**发了 EXECUTE, 表本身一行 GRANT 都没有, 于是 deskcore 除
+    ``list_projects`` 外每个工具都挂在::
+
+        42501 permission denied for table draft_fingerprints
+
+    坑在于 ``service_role`` **绕过 RLS 但不绕过表级 GRANT** —— 两套独立机制。
+    它在 public schema 下看着无所不能, 靠的是 Supabase 给 public 配的 default
+    privileges; ``autowriter`` 是本仓自建 schema, 没有这份默认授权。
+
+    ⚠️ **只认表 / 关系, 不认函数。** ``permission denied for function`` 是另一
+    回事(EXECUTE 没发, 或者调用方角色不对), 补救的 SQL 也不是同一条 —— 把它
+    一起认进来, doctor 就会指挥人去跑 007, 而 007 一行函数权限都不管。同样地
+    **不匹配裸 ``42501``**: 函数那条也是 42501。
+
+    ⚠️ 与 ``schema_object_missing`` 一样, **只给部署自检用**。运行期把"没权限"
+    当成可降级的情况, 就等于把一个配错的库伪装成一个功能少一点的库。
+    """
+    msg = str(exc).lower()
+    return ("permission denied for table" in msg
+            or "permission denied for relation" in msg)
+
+
 def client():
     """service_role client（已带 ClientOptions(schema='autowriter')）。
 

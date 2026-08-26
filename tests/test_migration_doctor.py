@@ -344,6 +344,107 @@ _PGRST205 = ('{"code":"PGRST205","message":"Could not find the table '
 _PGRST204 = ('{"code":"PGRST204","message":"Could not find the '
              "'decision_source' column of 'items' in the schema cache\"}")
 
+# 2026-08-26 生产库上真实回来的那一句(GRANT 没发时 PostgREST 的原文)。
+_DENIED = ('{"code":"42501","message":"permission denied for table '
+           'draft_fingerprints"}')
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 7 · 建出来 ≠ 能访问 —— 007 那条 GRANT
+#
+# 首次真部署当天的形态: doctor 全绿、/health 全绿、六个迁移全核验过, 而
+# deskcore 除 list_projects 外每个工具都回 42501。因为 001 只给两个**函数**
+# 发了 EXECUTE, 四张表一行 GRANT 都没有 —— 而 service_role **绕过 RLS 但不
+# 绕过表级 GRANT**。
+# ══════════════════════════════════════════════════════════════════════
+
+class _Denied(FakeClient):
+    """四张表都在, 但一读就 42501。"""
+
+    def table(self, name):
+        if name in core._MIGRATION_001_TABLES:
+            raise RuntimeError(_DENIED)
+        return super().table(name)
+
+
+def test_permission_denied_is_denied_not_error():
+    """没发 GRANT 要报 `denied`, 并落进"还缺这些迁移"指向 007。
+
+    钉的是【两个被禁止的形态】:
+
+      · 报成 `error` —— 那句 note 会写"探测本身失败(不是「没跑迁移」)", 把人
+        打发去查连通性, 而真正该做的是跑一条 GRANT;
+      · 报成 `missing` 且只挂在 001 —— 那会让人对着一个**表明明都在**的库
+        重跑一遍建表 SQL(幂等, 于是什么都不会变), 然后继续 42501。
+
+    两种都是"自检工具给出与现实不符的结论", 与 codex #63 那条同一个道理。
+    """
+    report = core.migration_state(_Denied(rows=_TABLES, rpc_impl=_ALL_RPCS))
+    st = _states(report)
+
+    assert st["draft_fingerprints 的表级 GRANT"] == "denied", st
+    for t in core._MIGRATION_001_TABLES:
+        assert st[f"表 {t}"] == "denied", f"缺 GRANT 被报成了 {st[f'表 {t}']}"
+
+    assert "007_deskcore_table_grants.sql" in report["missing"]
+    assert "007_deskcore_table_grants.sql" in report["denied"]
+    assert report["errors"] == [], f"没发 GRANT 不是探测故障: {report['errors']}"
+    assert report["ok"] is False
+
+
+def test_function_permission_denied_is_still_an_error():
+    """`permission denied for function` **不能**被认成 007 的事。
+
+    两者都是 42501, 但补救的 SQL 完全不同 —— 007 一行函数权限都不管。认进来
+    的话 doctor 会指挥人去跑一个解决不了问题的迁移。所以判据认的是
+    "for table / for relation" 这句话, **不是**裸的错误码。
+    """
+    assert core.store.table_permission_denied(RuntimeError(_DENIED)) is True
+    assert core.store.table_permission_denied(
+        RuntimeError('{"code":"42501","message":"permission denied for '
+                     'function deskcore_check_drafts"}')) is False
+
+    def _boom(_args):
+        raise RuntimeError("permission denied for function")
+
+    report = core.migration_state(
+        FakeClient(rows=_TABLES,
+                   rpc_impl={**_ALL_RPCS, "deskcore_fingerprint_counts": _boom}))
+    assert report["errors"] == ["004_deskcore_check_pushdown.sql"]
+    assert report["denied"] == []
+
+
+def test_grant_probe_stays_quiet_when_the_tables_are_not_there_yet():
+    """001 都没跑时, 007 报 `unprobeable` 而不是 missing。
+
+    001 里已经含着同一条 GRANT。这时再喊一句"007 也缺"只会让人以为要跑两个,
+    而先跑 001 之后 007 本来就成了 no-op。
+    """
+    class _NoTables(FakeClient):
+        def table(self, name):
+            if name in core._MIGRATION_001_TABLES:
+                raise RuntimeError(_PGRST205)
+            return super().table(name)
+
+    report = core.migration_state(_NoTables(rows=_TABLES, rpc_impl=_ALL_RPCS))
+    assert _states(report)["draft_fingerprints 的表级 GRANT"] == "unprobeable"
+    assert "007_deskcore_table_grants.sql" not in report["missing"]
+    assert "001_deskcore.sql" in report["missing"]
+
+
+def test_doctor_says_the_table_is_there_and_the_grant_is_not(capsys):
+    """`doctor` 的输出里要说清"表在, 缺的是 GRANT", 并且退出码 1。
+
+    只打一行 `· migrations/007` 的话, 看的人没有任何线索知道这个和前面那些
+    "建表"迁移不是一回事。
+    """
+    rc = cli._doctor(core, _Denied(rows=_TABLES, rpc_impl=_ALL_RPCS), None)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "007_deskcore_table_grants.sql" in out
+    assert "缺的是 GRANT" in out, out
+    assert "permission denied for table" in out, "原始报错要能看到"
+
 
 def test_missing_table_is_missing_not_error():
     """缺表必须报 `missing`。

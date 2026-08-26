@@ -442,17 +442,27 @@ CREATE INDEX IF NOT EXISTS user_logins_user_idx
 -- gated by RLS, and there's no public-read use case in this app.  ``service_
 -- role`` keeps full access for any admin scripts; ``authenticated`` gets the
 -- standard CRUD set and RLS does the per-user filtering.
+--
+-- ⚠️ 这个块只覆盖【它上面已经建出来的表】。文件后面还有 jobs 和 deskcore 那
+-- 四张表, 它们各自在自己那一段末尾发 GRANT —— 加新表时别忘了那一步。
+-- CI 会替你记着: tests/sql_parity_check.py 里有一条断言, autowriter schema 下
+-- 【每一张】表都必须至少对 service_role 有 SELECT/INSERT/UPDATE/DELETE。
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     projects, batches, items, versions, memories, batch_metrics,
-    generation_sessions, session_messages
+    calibration_note_audit, generation_sessions, session_messages
     TO authenticated;
 -- user_logins 是审计表：only SELECT + INSERT for authenticated（append-only），
 -- 防止用户改/删自己的登录历史。service_role 走 SQL Editor 看全部 / 必要时清理。
 GRANT SELECT, INSERT ON user_logins TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     projects, batches, items, versions, memories, batch_metrics, user_logins,
-    generation_sessions, session_messages
+    calibration_note_audit, generation_sessions, session_messages
     TO service_role;
+-- ⚠️ ``calibration_note_audit`` 是 2026-08-26 补进这两行的 —— 它建于本块之前
+-- 却一直不在名单里。现存的生产库看不出来(那张表建于 Supabase 授权口径变更前,
+-- 带着历史 GRANT), 坏的只有【新开的库】: db.py::log_calibration_audit 的写入
+-- 是 ``except Exception: pass``, 于是新库上调教笔记的审计流水会**静默地一条
+-- 都不留**, 没有任何东西报错。没有单独的增量迁移, 因为现存库无需修。
 
 -- ─────────────────────────────────────────────────────────────────────────
 -- 服务端聚合 RPC：batch_item_counts
@@ -640,7 +650,7 @@ CREATE TABLE IF NOT EXISTS draft_fingerprints (
     user_id         UUID,
     title           TEXT NOT NULL DEFAULT '',
     opening         TEXT NOT NULL DEFAULT '',
-    -- 与 versions.embedding 同一个模型(Gemini text-embedding-004), 可互比
+    -- 与 versions.embedding 同一个模型(见 dedup.EMBEDDING_MODEL), 可互比
     title_embedding vector(768),
     -- 产出上面那个向量的模型名。NULL = 这行没有向量。
     -- ⚠️ 换 embedding 供应商时唯一的救命稻草: 跨模型算余弦是垃圾且【不报错】,
@@ -702,6 +712,23 @@ CREATE TABLE IF NOT EXISTS style_edits (
 CREATE INDEX IF NOT EXISTS style_edits_owner_idx
     ON style_edits (project_id, user_id, created_at DESC);
 ALTER TABLE style_edits ENABLE ROW LEVEL SECURITY;
+
+-- ── 上面四张表的表级 GRANT ───────────────────────────────────────────
+-- 2026-08-26 补, 与 migrations/001_deskcore.sql:4.5 / migrations/007 同一条。
+-- 原来这四张表**一行 GRANT 都没有**, 而生产库上的症状是 deskcore 除
+-- list_projects 外每个工具都挂在 42501: permission denied for table
+-- draft_fingerprints。
+--
+-- 为什么会漏: ``service_role`` 绕过 RLS 但**不绕过表级 GRANT**, 两套独立机制。
+-- 它在 public schema 下看着无所不能, 是因为 Supabase 给 public 配了 default
+-- privileges; ``autowriter`` 是本仓自建 schema, 没有这份默认授权。
+--
+-- 只给 service_role: 这四张表唯一的调用方是 deskcore(service key 连库, 归属
+-- 隔离在 deskcore/core.py::assert_project_access 做)。Streamlit 界面已停用,
+-- authenticated 一行都不需要。
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    angle_ledger, draft_fingerprints, user_calibration_notes, style_edits
+    TO service_role;
 
 -- items.updated_at: 人工决策(status / example_label)的最后变更时间。
 -- 补 TV scripts/sync_autowriter_decisions_to_prepublish.py:36-40 记的缺陷 ——

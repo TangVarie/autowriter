@@ -1380,11 +1380,20 @@ def _probe_ok(fn, *, predicate=None) -> tuple[str, str]:
         "不是「没跑迁移」" —— 正好说反, 而这个命令存在的全部意义就是别说反。
         表/列这一路没有运行期对应物(运行期不该因为缺表就降级), 所以宽一档不
         破坏同源那条纪律。
+
+    ⚠️ **"没授权"在两种判据之前先被拎出来, 报成 ``denied``。**
+    ``42501 permission denied for table`` 说的是"表建出来了, 但 GRANT 没发",
+    它既不是 missing(对象在)也不该混进 error(它有确定的补救 SQL: 007)。
+    不单独分一档的话, 一个**只缺 GRANT** 的库会让 001 那几条表探测全报
+    ``error`` 并写着"不是「没跑迁移」", 而同一份输出里 007 报 missing ——
+    自检工具给出互相矛盾的结论, 比它不存在更坏(与 codex #63 那条同一个道理)。
     """
     check = predicate or store.rpc_missing
     try:
         fn()
     except Exception as exc:                       # noqa: BLE001 — 探测就是要看异常
+        if store.table_permission_denied(exc):
+            return "denied", f"{type(exc).__name__}: {exc}"[:200]
         if check(exc):
             return "missing", f"{type(exc).__name__}: {exc}"[:200]
         return "error", (f"探测本身失败(不是「没跑迁移」): "
@@ -1531,19 +1540,55 @@ def migration_state(client) -> dict:
          "「通过 / 打回」、硬规则自动标记、查重自动标记**全部报错**。"
          "这个迁移与其它几个不同, **不是可选的**")
 
+    # ── 007: 四张表的表级 GRANT。⚠️ 也是**硬失败** ──
+    #
+    # 探的是"读得到吗", 不是"表在吗" —— 上面 001 那几条已经回答了后者, 而
+    # 2026-08-26 首次真部署证明这两件事**不是一回事**: 表全在, doctor 全绿,
+    # /health 全绿, 而 deskcore 除 list_projects 外每个工具都挂在
+    # `42501 permission denied for table draft_fingerprints`。
+    #
+    # 为什么 001 那几条探测挡不住这个: 它们跑在同一个 service_role 上、报的是
+    # 同一个 42501 —— 现在由 _probe_ok 统一识别成 denied, 所以两边给的是同一个
+    # 结论, 补救指向同一个文件。这里再单列一条, 是为了让"缺 GRANT"在
+    # missing 清单里有个**编号**可跑, 而不是只留一句 note 让人自己想办法。
+    #
+    # 用 draft_fingerprints 当代表: 四张表在 001 / 007 里是同一条 GRANT 语句
+    # 发的, 不存在只授权了其中一张的中间态。
+    state, note = _probe_ok(
+        lambda: client.table("draft_fingerprints")
+        .select(_MIGRATION_001_PROBE_COLUMN).limit(1).execute(),
+        predicate=store.schema_object_missing)
+    if state == "missing":
+        # 表本身还不在 = 001 都没跑, 上面那几条已经在喊了。这里再喊一遍
+        # "007 也缺"只会让人以为要跑两个 —— 而 001 里已经含着同一条 GRANT。
+        state, note = "unprobeable", ("001 的四张表还不在, 先跑 001 "
+                                      "(它里面已经含着这条 GRANT)")
+    _add("007_deskcore_table_grants.sql", "draft_fingerprints 的表级 GRANT",
+         state, note,
+         "⚠️ 硬失败: service_role 绕过 RLS 但**不绕过表级 GRANT**。缺了它, "
+         "deskcore 除 list_projects 外每个工具都在 42501 permission denied 上挂, "
+         "而 /health 仍然全绿(它探的是连得上, 不是访问得了)")
+
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
     # 一遍根本不缺的 SQL, 而同一份输出里那条 note 明明写着"不是「没跑迁移」"。
     # 一个自检工具给出**互相矛盾的**结论, 比它不存在更坏。
     #
     # 两者都判红(见 ok), 但补救方式完全不同, 所以必须分开报。
+    #
+    # ``denied`` 同理再分一档: 它既不是"没跑迁移"(对象在), 也不是"探测本身坏了"
+    # (它有确定的补救 SQL)。但它**进 missing** —— 因为对跑这条命令的人来说,
+    # 该做的事就是去跑 migrations/007, 与其它缺席迁移的动作完全一样。单独再列
+    # 一份 ``denied`` 是给需要区分原因的调用方看的(比如想在日志里说清是权限)。
+    denied = sorted({c["migration"] for c in checks if c["state"] == "denied"})
     missing = sorted({c["migration"] for c in checks
-                      if c["state"] in ("missing", "old_signature")})
+                      if c["state"] in ("missing", "old_signature", "denied")})
     errors = sorted({c["migration"] for c in checks if c["state"] == "error"})
     return {
         "ok": not missing and not errors,
         "checks": checks,
         "missing": missing,
+        "denied": denied,
         "errors": errors,
         "unprobeable": sorted({c["migration"] for c in checks
                                if c["state"] == "unprobeable"}),

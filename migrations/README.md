@@ -13,6 +13,27 @@
 生产库升不上去。两边都写成幂等（`IF NOT EXISTS` / `CREATE OR REPLACE` /
 `DROP … IF EXISTS`），重复执行必须是干净 no-op。
 
+> ⚠️ **加表还有第三步：发 `GRANT`。建出来 ≠ 能访问。**
+>
+> `service_role` **绕过 RLS，但不绕过表级 `GRANT`**——两套独立机制。它在
+> `public` 下看着无所不能，靠的是 Supabase 给 `public` 配的 default privileges；
+> `autowriter` 是本仓自建的 schema，**没有**这份默认授权，新表出生就是零权限。
+>
+> 代价在 2026-08-26 首次真部署当天兑现：`001` 建的四张表一行 `GRANT` 都没有
+> （它只给两个**函数**发了 `EXECUTE`，于是"权限这块齐了"的错觉很完整——函数
+> 能跑是因为 `SECURITY DEFINER` 走 owner 权限，和表权限无关）。deskcore 除
+> `list_projects` 外每个工具都挂在 `42501 permission denied for table
+> draft_fingerprints`，而 `/health` 全绿。补丁是 `007_deskcore_table_grants.sql`。
+>
+> 同一次排查还翻出 `calibration_note_audit` 也不在基线的授权名单里。现存库
+> 看不出来（那张表建于 Supabase 授权口径变更之前，带着历史 `GRANT`），坏的只有
+> **新开的库**——而 `db.log_calibration_audit` 的写入是 `except: pass`，表现是
+> 调教笔记的审计流水**静默地一条都不留**。
+>
+> 现在 `tests/sql_parity_check.py` 常驻一条断言：**`autowriter` 下每一张表都必须
+> 对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**。断的是不变量而不是名单，
+> 以后加表忘了发 `GRANT`，CI 自己会红，不需要谁想起来更新清单。
+
 > ⚠️ **基线原来是 `db.py` 里一个 1162 行的 Python 字符串（`CREATE_TABLES_SQL`）。**
 > 审计 SUP-010 把它搬成了文件。搬的理由不是"db.py 太大"（虽然确实从 4438 行降到
 > 3280），而是**没有任何代码执行过它，所以也没有任何东西验证过它**。
@@ -73,6 +94,7 @@ python -m deskcore.cli doctor          # 逐个探测, 只读; 缺哪个、缺�
 | `004_deskcore_check_pushdown.sql` | `deskcore_check_drafts` + `deskcore_fingerprint_counts`（审计 SUP-002/SUP-004/ROB-004/ROB-011） | `check_drafts` 退回 Python 逐对比对并埋 `deskcore_rpc_missing`：结论一致但慢，且回到 4000 条上限；`list_projects` 退回逐项目 count |
 | `005_deskcore_containment.sql` | **替换** `deskcore_check_drafts` 与 `deskcore_commit_fingerprints`（审计 COR-014）：正文四字串改走 bottom-k 的标准估计式，并多回一路**包含度** | 查重仍然跑，但**短稿整段照搬长稿抓不到**——那种形状下 Jaccard 的真值本来就够不着硬闸线。`check_drafts` 会在 `summary.containment_skipped_warning` 里明说这一路没生效；`commit` 侧自动回退 4 参旧签名（竞态窗口仍然关着，只是不做包含度重查） |
 | `006_item_decision_provenance.sql` | `items` 加 `decision_source` / `reviewer_id` / `decided_at` 三列 + 一条部分索引（跨库审计 COR-004 / COR-007） | ⚠️ **这一个不跑是硬失败，不是降级**——见下 |
+| `007_deskcore_table_grants.sql` | 把 `001` 建的那四张表授权给 `service_role`（`001` 只给函数发了 `EXECUTE`，表漏了） | ⚠️ **硬失败**：deskcore 除 `list_projects` 外全挂在 `42501 permission denied`，而 `/health` 全绿——见下 |
 
 > ⚠️ **`006` 与上面五个不是一类，别把"不跑也不会坏"套到它头上。**
 >
@@ -87,6 +109,11 @@ python -m deskcore.cli doctor          # 逐个探测, 只读; 缺哪个、缺�
 >
 > **所以升级顺序上，`006` 应该排在最前面**——它是唯一一个"代码已经发了、迁移
 > 没跑就当场坏"的。
+
+> ⚠️ **`007` 和 `006` 一样是硬失败，不是降级。** 缺了它，deskcore 除
+> `list_projects` 外每个工具都在 `42501 permission denied` 上挂——而
+> `/health` 仍然全绿（它探的是连得上、不是访问得了）。任何跑过 `001` 的库都要补，
+> 排在 `006` 之后即可（它只发 `GRANT`，不依赖其它迁移的顺序）。
 
 > ⚠️ `005` 里两个函数都是 **DROP + CREATE** 而不是 `CREATE OR REPLACE`：返回列 /
 > 参数变了，`REPLACE` 会因签名冲突失败。**必须先跑 `004`**（它建的

@@ -264,7 +264,8 @@ env：
 **① 跑迁移。** 不是只有 `001` —— 到今天是 `001_deskcore.sql` /
 `002_calibration_cas.sql` / `003_versions_unique_num.sql` /
 `004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
-`006_item_decision_provenance.sql` **六个，按编号顺序跑，别跳号**（建议先在
+`006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql`
+**七个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -287,7 +288,12 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 两个要单独记住的：
 
 - `004_deskcore_check_pushdown.sql` 是 2026-08-23 审计 SUP-002/SUP-004/ROB-004/ROB-011 的落地：把 `check_drafts` 的三路比对和 `list_projects` 的指纹计数下推到库里。**不跑也不会坏** —— `check_drafts` 检测到 RPC 不存在会退回 Python 逐对比对（结论一致，只是慢，且回到 4000 条上限），并埋一行 `deskcore_rpc_missing`。但大项目上不跑就仍然会撞线程池饥饿和 OOM，所以别拖。
-- `006_item_decision_provenance.sql` **是唯一一个不跑就当场坏的**：`db.update_item_status` 无条件写 `decision_source` / `reviewer_id` / `decided_at`，缺列会让现有工作台的「通过 / 打回」、硬规则自动标记、查重自动标记全部报错。刻意不做"去掉三列重试"的降级——那等于让机器判定继续伪装成人工反馈去污染 TV 的评估模型（COR-004 治的正是这件事）。**升级顺序上它排最前面。**
+- `006_item_decision_provenance.sql` **不跑就当场坏**：`db.update_item_status` 无条件写 `decision_source` / `reviewer_id` / `decided_at`，缺列会让现有工作台的「通过 / 打回」、硬规则自动标记、查重自动标记全部报错。刻意不做"去掉三列重试"的降级——那等于让机器判定继续伪装成人工反馈去污染 TV 的评估模型（COR-004 治的正是这件事）。**升级顺序上它排最前面。**
+- `007_deskcore_table_grants.sql` **同样不跑就当场坏**，而且它的失败形态最难猜：`001` 建的那四张表**一行 `GRANT` 都没有**（`001` 只给两个*函数*发了 `EXECUTE`），于是 deskcore 除 `list_projects` 外每个工具都挂在 `42501 permission denied for table draft_fingerprints`——**而 `/health` 全绿**（它探的是连得上，不是访问得了）。
+
+  > 坑在于 `service_role` **绕过 RLS，但不绕过表级 `GRANT`**——两套独立机制。它在 `public` schema 下看着无所不能，靠的是 Supabase 给 `public` 配的 default privileges；`autowriter` 是本仓自建 schema，**没有**这份默认授权，新表出生就是零权限。
+  >
+  > 这是 2026-08-26 首次真部署当天靠人肉 `curl` 打线上才发现的。现在有两道守卫：`tests/sql_parity_check.py` 断言 **`autowriter` 下每一张表都必须对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**（断不变量而不是名单，以后加表忘了发 GRANT 会自己红）；`doctor` 把 `42501` 单独报成 `denied` 而不是混进 `error`，并直接指向 `migrations/007`。
 
 **② 回填历史指纹**（**必做**）：
 
@@ -414,7 +420,11 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
 1. **WorkBuddy 的 HTTP MCP 自定义鉴权头无权威文档。** 见 §4.3，已留两条退路，但必须最先验。
 2. **馆员选卡质量从未在真实规模验证过。** TV 书架现有 118 张卡 / 可借 201，但这个规模下的选卡准确率没人测过。
-3. **embedding 依赖 `GOOGLE_API_KEY`。** 存量 768 维向量都是 Gemini `text-embedding-004` 产的，换模型会让历史向量全部作废需重算。没有它时查重降级为纯确定性——仍能抓开头撞车和四字串重合（`selftest` 证明了这点），但同角度换说法的标题会漏。
+3. **embedding 依赖 `GOOGLE_API_KEY`。** 换模型会让存量向量全部作废需重算。没有它时查重降级为纯确定性——仍能抓开头撞车和四字串重合（`selftest` 证明了这点），但同角度换说法的标题会漏。
+
+   ⚠️ **模型是会被下线的**（2026-08-26 实测踩到）。原来写死的 `text-embedding-004` 已经不存在，API 回 404；现在是 `gemini-embedding-001`，它**默认输出 3072 维**，靠 `output_dimensionality` 截到库里那三列要求的 768。
+
+   真正的教训不是"模型换了名字"，是**这条路径的失败当时完全没有痕迹**：`embed_texts` 是裸 `except Exception: return None`，一行日志都不打，于是现象只是 `check_drafts` 的 `semantic_degraded` 悄悄变 `true`，Railway 日志干干净净，最后靠人肉 curl 才问出「模型 404」。现在那一层加了 `logger.exception`，并且多了一道**维度守卫**——长度不等于 `EMBEDDING_DIM` 时整批作废，因为 `cosine_similarity` 对长度不符**返回 0.0**（与 R-034 的 `_parse_pgvector` 同款形状：查重变哑弹且不报错）。
 4. ~~**查重目前在 Python 里逐对比。**~~ **已解决（2026-08-23 审计 SUP-002）**：`migrations/004` 的 `deskcore_check_drafts` 把三路信号全部下推，`check_drafts` 不再把指纹拉进内存，`history_size` 也从"最近 4000 条"变成全量。RPC 没部署时仍会退回老路径（带原来的上限和截断警告）。
 
    ⚠️ **余弦那一路刻意不走 ivfflat 索引**。ivfflat 是近似最近邻（默认 `probes=1` 只扫一个聚类桶），对"推荐相似内容"够用，对**查重硬闸**是致命的：漏掉的那条正是要拦下的重复稿，而且不报错；叠加 `project_id` 过滤后更糟（先按向量取候选再过滤，命中本项目的可能一条都不剩）。RPC 里 `ORDER BY` 的是子查询算好的别名 `sim`，不是 `title_embedding <=> v` —— pgvector 的索引只认后一种形态，换成前者规划器必然走顺序扫描，精确且可预期。索引留着不动，将来做"找相似选题"这类容忍近似的功能仍然用得上。
