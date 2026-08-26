@@ -94,11 +94,23 @@ def embeddings_available() -> bool:
     return clients.genai_available()
 
 
-def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
-    """Return one embedding per input string, or ``None`` if the call fails.
+def embed_texts(texts: list[str]) -> Optional[list[Optional[list[float]]]]:
+    """每个输入回一个向量; **整批失败**时回 ``None``。
+
+    返回的列表与输入**逐位对齐**, 但某一位可能是 ``None`` —— 那表示"这一条
+    没有可嵌入的内容"(空标题), 不是失败。调用方一律要判 ``if v``; 现有调用方
+    都已经这么写了, ``cosine_similarity`` 对 None 也返回 0.0。
 
     Inputs are silently truncated to 1024 chars (titles + openings fit well
     inside this) so a malformed body doesn't blow the per-request payload.
+
+    ⚠️ **空串必须在送出去之前剔掉。** google-genai 对空内容直接抛
+    ``ValueError: content is required.``, 而且是**整个请求**失败 —— 一条空标题
+    能让同一批里另外 49 条正常稿子全都拿不到向量。
+
+    2026-08-26 回填生产历史稿时现场撞上的: 第一个项目 67 条里有一批 17 条整批
+    作废, 而其中标题真的为空的只有几条。这一批的失败**被日志记下来了**(那正是
+    同一天补的留痕), 否则又是一次"跑完了、看着正常、向量少了一截"。
     """
     if not texts:
         return []
@@ -107,7 +119,19 @@ def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
         logger.warning("embed_texts: 没有 genai client(GOOGLE_API_KEY 未配 "
                        "或 SDK 未安装) —— 本次退化为纯确定性查重")
         return None
-    safe = [(t or "")[:1024] for t in texts]
+
+    safe = [(t or "").strip()[:1024] for t in texts]
+    keep = [i for i, s in enumerate(safe) if s]
+    if not keep:
+        # 全是空的: 不必打扰 API, 也**不是**失败 —— 如实回一排 None。
+        logger.warning("embed_texts: %d 条输入全是空串, 这一批没有可嵌入的内容",
+                       len(texts))
+        return [None] * len(texts)
+    if len(keep) != len(texts):
+        logger.warning("embed_texts: %d/%d 条输入是空串, 已剔除后再送 —— "
+                       "它们的向量位置回 None, 不影响同批其它条",
+                       len(texts) - len(keep), len(texts))
+    payload = [safe[i] for i in keep]
     try:
         # google-genai accepts a list of contents and returns parallel embeddings。
         #
@@ -117,7 +141,7 @@ def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
         # 0.0** —— 查重变哑弹且不报错(与 R-034 的 _parse_pgvector 同款形状)。
         resp = client.models.embed_content(
             model=EMBEDDING_MODEL,
-            contents=safe,
+            contents=payload,
             config={"output_dimensionality": EMBEDDING_DIM},
         )
     except Exception:
@@ -126,7 +150,7 @@ def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
         # 现象只是 semantic_degraded 悄悄变 true, Railway 日志里干干净净, 最后
         # 是靠人肉 curl 才问出「模型 404」。降级可以静默, 但**降级的原因不行**。
         logger.exception("embed_texts: embed_content 调用失败 (model=%s, n=%d) "
-                         "—— 本次退化为纯确定性查重", EMBEDDING_MODEL, len(safe))
+                         "—— 本次退化为纯确定性查重", EMBEDDING_MODEL, len(payload))
         return None
 
     # The SDK wraps the embeddings as a list of objects with a `.values`
@@ -159,7 +183,22 @@ def embed_texts(texts: list[str]) -> Optional[list[list[float]]]:
             "%d 维, 要么连 schema 一起改。",
             EMBEDDING_DIM, bad, EMBEDDING_MODEL, EMBEDDING_DIM, EMBEDDING_DIM)
         return None
-    return out
+
+    # ── 条数守卫 ──────────────────────────────────────────────────────────
+    # ⚠️ 调用方**一律按下标取**(vecs[i] 对应 drafts[i])。API 少回一条, 下面那
+    # 个回填就会把 A 的向量安到 B 头上 —— 查重照跑, 比的却是别人的标题, 而且
+    # 不报错。这是比"没有向量"坏得多的一种坏, 所以宁可整批作废。
+    if len(out) != len(payload):
+        logger.error("embed_texts: 送了 %d 条只回来 %d 条 (model=%s) —— "
+                     "按下标对齐会张冠李戴, 整批作废",
+                     len(payload), len(out), EMBEDDING_MODEL)
+        return None
+
+    # 映射回原位: 被剔掉的空串那几位留 None。
+    aligned: list[Optional[list[float]]] = [None] * len(texts)
+    for pos, i in enumerate(keep):
+        aligned[i] = out[pos]
+    return aligned
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
