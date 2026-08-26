@@ -449,20 +449,33 @@ CREATE INDEX IF NOT EXISTS user_logins_user_idx
 -- 【每一张】表都必须至少对 service_role 有 SELECT/INSERT/UPDATE/DELETE。
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     projects, batches, items, versions, memories, batch_metrics,
-    calibration_note_audit, generation_sessions, session_messages
+    generation_sessions, session_messages
     TO authenticated;
+-- ── 两张审计表：authenticated 只给 append + 读 ─────────────────────────
 -- user_logins 是审计表：only SELECT + INSERT for authenticated（append-only），
 -- 防止用户改/删自己的登录历史。service_role 走 SQL Editor 看全部 / 必要时清理。
-GRANT SELECT, INSERT ON user_logins TO authenticated;
+--
+-- calibration_note_audit 是同一类东西、同一个待遇。它存的是调教笔记每次写入的
+-- before / append / after 三份全文，用途就是回答"为什么这条观察突然出现/消失
+-- 了"——**能被改写或删除的审计流水回答不了这个问题**。它的 RLS 只有一条不分
+-- 命令的 owner policy，把用户限制在自己的项目里，但拦不住他改写自己项目的历史；
+-- 真正该拦住这件事的是这里少发两个权限。(codex review · aw#65)
+--
+-- ⚠️ 代码侧核对过：db.py 对这张表只有 insert / select / count，
+-- **没有任何 update 或 delete**。删项目时的清理走 projects 的
+-- ON DELETE CASCADE，而外键的级联动作是以**表 owner** 的权限执行的，
+-- 不需要调用者持有 DELETE。所以收紧它不影响任何现有路径。
+GRANT SELECT, INSERT ON user_logins            TO authenticated;
+GRANT SELECT, INSERT ON calibration_note_audit TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON
     projects, batches, items, versions, memories, batch_metrics, user_logins,
     calibration_note_audit, generation_sessions, session_messages
     TO service_role;
--- ⚠️ ``calibration_note_audit`` 是 2026-08-26 补进这两行的 —— 它建于本块之前
--- 却一直不在名单里。现存的生产库看不出来(那张表建于 Supabase 授权口径变更前,
--- 带着历史 GRANT), 坏的只有【新开的库】: db.py::log_calibration_audit 的写入
--- 是 ``except Exception: pass``, 于是新库上调教笔记的审计流水会**静默地一条
--- 都不留**, 没有任何东西报错。没有单独的增量迁移, 因为现存库无需修。
+-- ⚠️ ``calibration_note_audit`` 是 2026-08-26 补进来的 —— 它建于本块之前却一直
+-- 不在名单里。现存的生产库看不出来(那张表建于 Supabase 授权口径变更前, 带着
+-- 历史 GRANT), 坏的只有【新开的库】: db.py::log_calibration_audit 的写入是
+-- ``except Exception: pass``, 于是新库上调教笔记的审计流水会**静默地一条都
+-- 不留**, 没有任何东西报错。增量那一路见 migrations/007。
 
 -- ─────────────────────────────────────────────────────────────────────────
 -- 服务端聚合 RPC：batch_item_counts

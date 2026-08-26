@@ -247,6 +247,28 @@ def main() -> int:
         print(f"  ✓ autowriter 下全部 {n_tbl} 张表都对 service_role 有 "
               "SELECT/INSERT/UPDATE/DELETE(建表 ≠ 能访问, 2026-08-26 的教训)")
 
+    # ── ②'' 008 的按模型过滤真的落在【最终】的函数体里 ─────────────────
+    # 为什么单独验: 008 是 CREATE OR REPLACE, 签名和返回列一个字都没动 ——
+    # 它有没有生效, 从调用侧**完全看不出来**, 直到某天有人换了 embedding 模型,
+    # 才发现标题语义那一路一直在跨模型算余弦(噪声, 而且不报错)。
+    #
+    # 这里问的是最终状态而不是"008 跑没跑": 万一以后谁加了个 009 又把这个函数
+    # REPLACE 回没有过滤的版本, 上面那句 "✓ 008_...sql" 照样是绿的, 而洞回来了。
+    #
+    # ⚠️ 本 harness 把 pgvector shim 掉了, 所以这条**只验过滤子句在不在**,
+    # 验不了它算出来的数 —— 余弦那一路本来就不在本文件的比对范围内(见文件头)。
+    src = sql("SELECT prosrc FROM pg_proc p JOIN pg_namespace n "
+              "ON n.oid = p.pronamespace WHERE n.nspname='autowriter' "
+              "AND p.proname='deskcore_check_drafts';")
+    if "f.embedding_model = _model" not in src:
+        print("  [FAIL] deskcore_check_drafts 的函数体里没有按 embedding 模型"
+              "过滤那一句 —— migrations/008 没生效, 或者被后面的迁移覆盖回去了。"
+              "后果: 换模型之后跨模型算余弦(噪声), 而 semantic_degraded 报 false")
+        bad += 1
+    else:
+        print("  ✓ deskcore_check_drafts 的最终函数体带着按模型过滤"
+              "(008 生效, 且没被后面的迁移覆盖)")
+
     # ── ③ SQL 与 Python 算出来的数一样 ─────────────────────────────────
     # 跑完整套 schema 之后 draft_fingerprints 上是有 FK 的, 先把 project 建出来。
     # (这本身也是个信号: 之前那个手搭的最小骨架没有 FK, 也就测不到这一层。)

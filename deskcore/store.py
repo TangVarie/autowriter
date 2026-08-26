@@ -496,8 +496,13 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
     同一批的 created_at 完全相同。只按 created_at 排, 翻页时同值行的相对顺序
     没有保证 —— 会漏行也会重复行, 而且不报错。
     """
-    cols = ("id, title, opening, title_embedding, opening_hash, "
-            "ngram_hashes, created_at")
+    # ⚠️ ``embedding_model`` 必须取出来。这一列不是元数据装饰 —— 它是**比对的
+    # 前置条件**: 跨模型算余弦出来的数是垃圾, 而且【不报错】。取不到它, 调用方
+    # 就没法把老模型的行排除掉, 一次换模型能让硬闸安静地失灵。
+    # (codex review · #65 P1; 001 的 COMMENT 早就写了这一列的用途, 只是从来
+    #  没有任何代码真的用过它 —— 又一次"写着已经有了, 实际没有"。)
+    cols = ("id, title, opening, title_embedding, embedding_model, "
+            "opening_hash, ngram_hashes, created_at")
     rows: list[dict] = []
     truncated = False
     while len(rows) < limit:
@@ -530,14 +535,20 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
     return rows, truncated
 
 
-def fingerprint_stats(sb, project_id: str) -> tuple[int, int]:
-    """(总条数, 有 title_embedding 的条数) —— 两次 count, 不拉行。
+def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int]:
+    """(总条数, 有【可用】标题向量的条数) —— 两次 count, 不拉行。
 
     下推之后 check_drafts 不再把指纹拉进内存, 但它报出去的 summary 仍然要说清
     "比了多少条、其中多少条有向量"。后者尤其不能丢: ``hist_missing_vec > 0``
     正是 semantic_degraded 的判据之一 —— 历史行的 title_embedding 为 NULL 时
     标题语义这一路【实际没跑】, 不说出来调用方会以为全套硬闸都过了
     (core.check_drafts:380-388 为这个坑留过完整说明)。
+
+    ⚠️ **"有向量" 的口径是 "有【本模型】的向量"**, 不是 "这一格非 NULL"。
+    换模型之后老行的向量还在, 但它跟新向量算余弦出来的数是垃圾 —— 按非 NULL
+    去数, 一个全是老模型行的项目会报 ``history_missing_embedding = 0``,
+    于是 ``semantic_degraded`` 是 false, 而标题语义那一路**一条都没真的比**。
+    这正好是这个函数存在的理由的反面。(codex review · #65 P1)
 
     ⚠️ 故意不吞异常, 与 fingerprints 同理: 查重是硬闸, 读不到就不能放行。
     """
@@ -546,6 +557,7 @@ def fingerprint_stats(sb, project_id: str) -> tuple[int, int]:
     with_vec = (sb.table("draft_fingerprints").select("id", count="exact")
                   .eq("project_id", project_id)
                   .not_.is_("title_embedding", "null")
+                  .eq("embedding_model", model)
                   .limit(1).execute()).count or 0
     return int(total), int(with_vec)
 
@@ -727,40 +739,108 @@ def fingerprint_row_count(sb, project_id: str) -> int:
     return int(res.count or 0)
 
 
-def fingerprints_missing_vectors(sb, project_id: str, limit: int = 2000) -> list[dict]:
-    """指纹库里【缺标题向量】的行。给 reembed 用。
+# ``set_fingerprint_vector`` 的 ``expect`` 哨兵: "这一行本来就该没有向量"。
+# 用独立哨兵而不是 None —— None 是个**真实取值**(有向量但不知道哪个模型产的)。
+VECTOR_ABSENT = object()
+
+
+def fingerprints_needing_vectors(sb, project_id: str, model: str,
+                                 limit: int = 2000) -> list[dict]:
+    """指纹库里【标题向量不可用】的行。给 reembed 用。
+
+    "不可用" 有三种, 三种都要修:
+
+      1. ``title_embedding IS NULL``            —— 从来没算过(原来只有这一种);
+      2. 有向量但 ``embedding_model IS NULL``   —— 来路不明(老行, 或 backfill
+         复用了 ``versions.embedding`` 这种没有模型标记的历史向量);
+      3. 有向量但 ``embedding_model`` 不是当前模型 —— 换过模型了。
+
+    ⚠️ **后两种是 2026-08-26 换模型时补的(codex review · #65 P1)。** 原来只扫
+    第 1 种, 于是换模型之后老行既进不了比对(模型不符被排除)、又永远不会被
+    重算 —— 卡在一个**没有出口**的状态里, 而且不报错。修一半比不修更坏。
 
     为什么不能靠 backfill 补: backfill 扫的是 items × versions, 而 WorkBuddy
     写的稿子 version_id 是空的、根本不在 autowriter.versions 里。欠费那几天
     commit 进来的行, backfill 永远看不到 —— 只能从指纹表这一侧修。
+
+    ⚠️ 拆成三次查询而不是一句 ``.or_()``: PostgREST 的 or 语法(``a.is.null,
+    b.neq.x``)在假件里是 no-op, 写成 or 就等于这三条过滤【没有任何测试守着】,
+    而这里恰恰是"漏一种就卡死"的地方。三次平凡过滤换来三条都能被断言,
+    值这个来回 —— reembed 是运维命令, 不是热路径。
 
     ⚠️ 同 legacy_versions: 裸 ``.limit(2000)`` 会被服务端钳到 db-max-rows,
     reembed 一次只修最近的那批却报"补完了"(审计 COR-006)。翻页取全, ``id``
     做次级键。整批读完之后才开始写(set_fingerprint_vector), 所以翻页期间
     过滤条件不会被自己改动影响。
     """
-    return _paged(
-        lambda off, lim: (
-            sb.table("draft_fingerprints").select("id, title")
-              .eq("project_id", project_id)
-              .is_("title_embedding", "null")
-              .neq("title", "")
-              .order("created_at", desc=True)
-              .order("id", desc=True)
-              .range(off, off + lim - 1)
-        ),
-        hard_cap=limit,
-    )
+    def _page(extra):
+        return _paged(
+            lambda off, lim: extra(
+                sb.table("draft_fingerprints")
+                  .select("id, title, embedding_model")
+                  .eq("project_id", project_id)
+                  .neq("title", ""))
+                .order("created_at", desc=True)
+                .order("id", desc=True)
+                .range(off, off + lim - 1),
+            hard_cap=limit,
+        )
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for tag, extra in (
+        # 1 · 压根没算过
+        (VECTOR_ABSENT, lambda q: q.is_("title_embedding", "null")),
+        # 2 · 有向量, 但来路不明
+        (None, lambda q: q.not_.is_("title_embedding", "null")
+                          .is_("embedding_model", "null")),
+        # 3 · 有向量, 但是别的模型产的
+        ("other", lambda q: q.not_.is_("title_embedding", "null")
+                             .not_.is_("embedding_model", "null")
+                             .neq("embedding_model", model)),
+    ):
+        for r in _page(extra):
+            rid = str(r.get("id"))
+            if rid in seen:
+                continue
+            seen.add(rid)
+            # 回写时要做 CAS, 得知道"我以为它现在是什么"。第 3 类用行里读到的
+            # 真实模型名, 不用占位的 "other"。
+            r["_expect"] = (r.get("embedding_model") if tag == "other" else tag)
+            rows.append(r)
+            if len(rows) >= limit:
+                return rows
+    return rows
 
 
-def set_fingerprint_vector(sb, row_id: str, vec: list[float], model: str) -> bool:
-    """给一条已有指纹补上标题向量 + 记下是哪个模型产的。"""
-    res = (sb.table("draft_fingerprints")
-             .update({"title_embedding": vec, "embedding_model": model})
-             .eq("id", row_id)
-             .is_("title_embedding", "null")   # 别覆盖已有向量
-             .execute())
-    return bool(res.data)
+def set_fingerprint_vector(sb, row_id: str, vec: list[float], model: str,
+                           *, expect=VECTOR_ABSENT) -> bool:
+    """给一条指纹写标题向量 + 记下是哪个模型产的。**带 CAS**。
+
+    ``expect`` 说的是"我读到这一行的时候它是什么状态", 三种:
+
+      · ``VECTOR_ABSENT``(默认) —— 当时没有向量。只在仍然没有时才写。
+      · ``None``               —— 当时有向量但没有模型标记(来路不明)。
+      · ``"<模型名>"``          —— 当时是这个模型产的向量。
+
+    为什么要 CAS 而不是无条件覆盖: reembed 是**先整批读、再逐行写**的(见
+    fingerprints_needing_vectors 的说明), 读和写之间可能有别的进程把同一行
+    刷成了当前模型。无条件覆盖会用一个更旧的批次盖掉更新的结果, 而且不报错。
+
+    原来的写法是硬编码 ``.is_("title_embedding","null")`` —— 那既是 CAS 也是
+    "只补空行"的过滤器。换模型之后这两件事必须分开: 过滤在
+    fingerprints_needing_vectors, CAS 在这里。(codex review · #65 P1)
+    """
+    q = (sb.table("draft_fingerprints")
+           .update({"title_embedding": vec, "embedding_model": model})
+           .eq("id", row_id))
+    if expect is VECTOR_ABSENT:
+        q = q.is_("title_embedding", "null")
+    elif expect is None:
+        q = q.not_.is_("title_embedding", "null").is_("embedding_model", "null")
+    else:
+        q = q.eq("embedding_model", expect)
+    return bool(q.execute().data)
 
 
 def fingerprint_pages(sb, project_id: str, page: int = PAGE):

@@ -264,8 +264,9 @@ env：
 **① 跑迁移。** 不是只有 `001` —— 到今天是 `001_deskcore.sql` /
 `002_calibration_cas.sql` / `003_versions_unique_num.sql` /
 `004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
-`006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql`
-**七个，按编号顺序跑，别跳号**（建议先在
+`006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql` /
+`008_embedding_model_isolation.sql`
+**八个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -293,7 +294,14 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 
   > 坑在于 `service_role` **绕过 RLS，但不绕过表级 `GRANT`**——两套独立机制。它在 `public` schema 下看着无所不能，靠的是 Supabase 给 `public` 配的 default privileges；`autowriter` 是本仓自建 schema，**没有**这份默认授权，新表出生就是零权限。
   >
-  > 这是 2026-08-26 首次真部署当天靠人肉 `curl` 打线上才发现的。现在有两道守卫：`tests/sql_parity_check.py` 断言 **`autowriter` 下每一张表都必须对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**（断不变量而不是名单，以后加表忘了发 GRANT 会自己红）；`doctor` 把 `42501` 单独报成 `denied` 而不是混进 `error`，并直接指向 `migrations/007`。
+  > 这是 2026-08-26 首次真部署当天靠人肉 `curl` 打线上才发现的。现在有两道守卫：`tests/sql_parity_check.py` 断言 **`autowriter` 下每一张表都必须对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**（断不变量而不是名单，以后加表忘了发 GRANT 会自己红）；`doctor` 把 `42501` 单独报成 `denied` 而不是混进 `error`，并直接指向 `migrations/007`——而且**四个权限一个个探**，因为"读得到"证明不了"写得进"。
+- `008_embedding_model_isolation.sql` 治的是另一种"写着已经有了、实际没有"：`draft_fingerprints.embedding_model` 从 `001` 起就在，`COMMENT` 写着它是"换 embedding 供应商时唯一的救命稻草"，而**四路查重里没有任何一路读过它**。
+
+  > 后果在换模型那天兑现：两个模型都出 768 维，所以维度守卫拦不住、写库也不报错，但两套向量空间毫不相干。跨模型算出来的余弦是噪声，**双向出错**——真重复的算出来很低（放行），无关的算出来很高（误杀），而 `semantic_degraded` 报的是 `false`：这一路不但失灵，还在报告里说自己跑过了。
+  >
+  > `008` 只加一句按模型过滤，`CREATE OR REPLACE`、签名不变。因为签名不变，**跑没跑过从调用侧完全看不出来**，所以 `doctor` 把它报成 `unprobeable` 并交出查函数体的 SQL，不蒙。
+  >
+  > 存量的老模型向量从此不参与比对（`semantic_degraded` 会如实报 `true`），跑 `python -m deskcore.cli reembed --project <id>` 用当前模型重算即可。**"少比并说出来"好过"混着比不说话"。**
 
 **② 回填历史指纹**（**必做**）：
 

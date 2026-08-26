@@ -86,7 +86,32 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 - 补了两道守卫，免得靠人肉 `curl` 才发现下一个：`tests/sql_parity_check.py` 断言
   **`autowriter` 下每一张表都必须对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**
   （断不变量而不是名单）；`doctor` 把 `42501` 单独报成 `denied` 而不是混进
-  `error`，并直接指向 `migrations/007`。
+  `error`，并直接指向 `migrations/007`，而且**四个权限一个个探**——"读得到"
+  证明不了"写得进"，只探 `SELECT` 的话一个部分授权的库会报全绿。
+
+### 1.4 `008_embedding_model_isolation` —— 换模型逼出来的第八个
+
+换掉下线的 `text-embedding-004` 之后才发现的，形态和 `007` 是同一类：
+**一样东西写着已经有了，实际从来没生效过。**
+
+`draft_fingerprints.embedding_model` 从 `001` 起就在，它的 `COMMENT` 写着是"换
+embedding 供应商时唯一的救命稻草"——而**四路查重里没有任何一路读过它**，SQL 侧和
+Python 侧都是拿 `title_embedding IS NOT NULL` 当"可比"。
+
+为什么没被任何检查拦住：`text-embedding-004` 和 `gemini-embedding-001` 都能出
+768 维，维度守卫过、写库不报错。但两套向量空间毫不相干，跨模型的余弦是噪声，
+而且**双向出错**——真重复的算出来很低（放行），无关的算出来很高（误杀）。
+最坏的一层是 `semantic_degraded` 报 `false`：这一路不但失灵，还在报告里说自己
+跑过了。
+
+改了四处：`008` 给 SQL 侧加按模型过滤（`CREATE OR REPLACE`，签名不变）；Python
+兜底路径同一口径；`backfill` 不再把来路不明的 `versions.embedding` 贴上当前模型
+的标签（那张表没有模型标记，来路无法证明）；`reembed` 从只补 `NULL` 扩到也能重算
+**换模型作废**和**来路不明**的行——否则老行既进不了比对、又永远不会被重算，
+卡在一个没有出口的状态里。
+
+> ⚠️ **当前生产库不受影响**：`draft_fingerprints` 是 **0 行**、`versions.embedding`
+> 非空 **0 条**，没有任何存量向量。这一整套是为"下一次换模型"和别的环境准备的。
 
 **`003` 是唯一改数据的一个**，所以单独记：
 
@@ -151,7 +176,7 @@ owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
 跑一遍 + `get_advisors` 核验再进 prod。顺序：
 
 ```
-006 → 002 → 003 → 004 → 005 → 007
+006 → 002 → 003 → 004 → 005 → 007 → 008
 ```
 
 `006` 之外按编号顺序即可。**`005` 必须在 `004` 之后**（它 DROP 掉 `004` 建的那版
@@ -159,6 +184,10 @@ owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
 **`007` 只发 `GRANT`**，不依赖顺序，但**不能省**——省了它服务能起、`/health`
 全绿、而每个工具都挂在 `42501`（见 §1.3 那段）。全新库跑 `000_baseline.sql`
 的话这条已经含在里面了。
+
+**`008` 必须在 `005` 之后**（它 `CREATE OR REPLACE` 的正是 `005` 建的那版 3 参
+`deskcore_check_drafts`；`005` 没跑的话 `REPLACE` 会顶到 `000` 里那版 2 参的、
+签名对不上而失败）。见 §1.4。
 
 ⚠️ **`003` 会改数据**，不只是建索引：它按 `(version_num, created_at, id)` 稳定
 重编号，再建唯一索引。重复号是 `bulk_create_initial_versions` 给多引擎批次每个

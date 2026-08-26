@@ -94,7 +94,26 @@ python -m deskcore.cli doctor          # 逐个探测, 只读; 缺哪个、缺�
 | `004_deskcore_check_pushdown.sql` | `deskcore_check_drafts` + `deskcore_fingerprint_counts`（审计 SUP-002/SUP-004/ROB-004/ROB-011） | `check_drafts` 退回 Python 逐对比对并埋 `deskcore_rpc_missing`：结论一致但慢，且回到 4000 条上限；`list_projects` 退回逐项目 count |
 | `005_deskcore_containment.sql` | **替换** `deskcore_check_drafts` 与 `deskcore_commit_fingerprints`（审计 COR-014）：正文四字串改走 bottom-k 的标准估计式，并多回一路**包含度** | 查重仍然跑，但**短稿整段照搬长稿抓不到**——那种形状下 Jaccard 的真值本来就够不着硬闸线。`check_drafts` 会在 `summary.containment_skipped_warning` 里明说这一路没生效；`commit` 侧自动回退 4 参旧签名（竞态窗口仍然关着，只是不做包含度重查） |
 | `006_item_decision_provenance.sql` | `items` 加 `decision_source` / `reviewer_id` / `decided_at` 三列 + 一条部分索引（跨库审计 COR-004 / COR-007） | ⚠️ **这一个不跑是硬失败，不是降级**——见下 |
-| `007_deskcore_table_grants.sql` | 把 `001` 建的那四张表授权给 `service_role`（`001` 只给函数发了 `EXECUTE`，表漏了） | ⚠️ **硬失败**：deskcore 除 `list_projects` 外全挂在 `42501 permission denied`，而 `/health` 全绿——见下 |
+| `007_deskcore_table_grants.sql` | 把 `001` 建的那四张表授权给 `service_role`（`001` 只给函数发了 `EXECUTE`，表漏了）+ 补 `calibration_note_audit` | ⚠️ **硬失败**：deskcore 除 `list_projects` 外全挂在 `42501 permission denied`，而 `/health` 全绿——见下 |
+| `008_embedding_model_isolation.sql` | `deskcore_check_drafts` 的标题语义那一路加**按 `embedding_model` 过滤**（`CREATE OR REPLACE`，签名不变） | 换过 embedding 模型的库上，标题语义比对会把**别的模型产的**向量也算进来。跨模型余弦是噪声：既放过真重复、也误杀无关稿，而 `semantic_degraded` 照报 `false`——见下 |
+
+> ⚠️ **`008` 治的是"这一列存在了几个月却从来没有代码用过它"。**
+>
+> `draft_fingerprints.embedding_model` 从 `001` 起就在，它的 `COMMENT` 写着"换
+> embedding 供应商时唯一的救命稻草"。2026-08-26 真换模型时才发现：**四路查重
+> 里没有任何一路读过它**，SQL 侧和 Python 侧都是拿 `title_embedding IS NOT NULL`
+> 当"可比"。
+>
+> 为什么维度守卫救不了：`text-embedding-004` 和 `gemini-embedding-001` 都能出
+> 768 维，写库不报错、长度校验也过。但两套向量空间毫不相干。
+>
+> `008` 只改函数体（`CREATE OR REPLACE`，签名和返回列一个字没动），所以**跑没跑过
+> 从调用侧完全看不出来**——`doctor` 因此把它报成 `unprobeable` 并交出查函数体的
+> SQL，而不是蒙一个 applied。
+>
+> 存量的老模型向量从此不参与比对，`semantic_degraded` 会如实报 `true`。用
+> `python -m deskcore.cli reembed --project <id>` 拿当前模型重算即可。
+> **"少比并说出来"好过"混着比不说话"。**
 
 > ⚠️ **`006` 与上面五个不是一类，别把"不跑也不会坏"套到它头上。**
 >

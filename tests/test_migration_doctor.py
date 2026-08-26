@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+import fakes
 from fakes import FakeClient
 from deskcore import cli, core
 
@@ -71,8 +72,11 @@ def test_fully_migrated_db_reports_ok():
 
     assert report["ok"] is True, report["missing"]
     assert report["missing"] == []
-    # 003 探不到, 但**不该**因此把整份报告判红 —— 永远报红的检查等于没有检查。
-    assert report["unprobeable"] == ["003_versions_unique_num.sql"]
+    # 003 / 008 探不到, 但**不该**因此把整份报告判红 —— 永远报红的检查等于没有
+    # 检查。两条探不到的理由不同: 003 建的是索引(PostgREST 看不见 pg_indexes),
+    # 008 换的是函数体(签名一个字没动, 从调用侧看跑没跑过完全一样)。
+    assert report["unprobeable"] == ["003_versions_unique_num.sql",
+                                     "008_embedding_model_isolation.sql"]
     assert all(s in ("applied", "unprobeable") for s in _states(report).values())
 
 
@@ -186,16 +190,45 @@ def test_real_failures_are_not_reported_as_missing_migration():
 def test_probes_never_write():
     """doctor 是对着**生产库**跑的, 一行都不许写。
 
-    两个写类接口是这里的重点: ``update_calibration_notes_cas`` 用 nil UUID +
-    不可能匹配的 witness(UPDATE 命中 0 行), ``deskcore_commit_fingerprints``
-    用空 ``_rows``(函数体的 FOR 一次都不进)。真库上的安全性由这两个性质保证,
-    这条用例守的是"以后没人把探测参数改成会写的那种"。
+    两个写类 RPC 是老重点: ``update_calibration_notes_cas`` 用 nil UUID + 不可能
+    匹配的 witness(UPDATE 命中 0 行), ``deskcore_commit_fingerprints`` 用空
+    ``_rows``(函数体的 FOR 一次都不进)。
+
+    007 的权限探测又加了三个**表级写操作**(codex review · #65 要求验全四个权限,
+    而 SELECT 验不出 INSERT/UPDATE/DELETE)。它们的安全性不能是"nil UUID 大概
+    没有对应行"这种概率论 —— 真有那么一行的话, UPDATE 会清空它的标题、DELETE
+    会把它删掉。所以这里钉的是**逻辑上不可能生效**这个更强的性质:
+
+      · INSERT  —— payload 违反 NOT NULL, 任何数据下都插不进(假件也模拟了这条
+                   约束, 见 fakes.NOT_NULL_COLUMNS —— 否则这条断言守的是一个
+                   不存在的世界);
+      · UPDATE / DELETE —— 过滤是 ``id = X AND id <> X``, 对任何一行都是假。
+
+    ⚠️ 这条用例守的正是"以后没人把矛盾条件改回普通过滤" —— 改了的话, 这个
+    自检命令就成了删库命令。
     """
     sb = FakeClient(rows=_TABLES, rpc_impl=_ALL_RPCS)
+    before = {t: list(rows) for t, rows in sb.rows.items()}
     core.migration_state(sb)
 
-    wrote = [c for c in sb.calls if c["op"] != "select"]
-    assert not wrote, f"doctor 的表操作里出现了写: {wrote}"
+    # ① 最硬的那条: 跑完之后库里一行都没变。
+    assert sb.rows == before, f"doctor 改动了数据: {sb.rows}"
+
+    # ② 形态: 每一个非 select 的表操作都必须是三种"不可能生效"之一。
+    for c in [c for c in sb.calls if c["op"] != "select"]:
+        if c["op"] == "insert":
+            nn = fakes.NOT_NULL_COLUMNS.get(c["table"]) or set()
+            payload = c["payload"] if isinstance(c["payload"], dict) else {}
+            assert any(payload.get(col) is None for col in nn), (
+                f"INSERT 探测没有违反任何非空约束, 它可能真的写进去: {c}")
+        elif c["op"] in ("update", "delete"):
+            eqs = {(k, v) for kind, k, v in c["filters"] if kind == "eq"}
+            neqs = {(k, v) for kind, k, v in c["filters"] if kind == "neq"}
+            assert eqs & neqs, (
+                f"{c['op'].upper()} 探测的过滤条件不是自相矛盾的 —— "
+                f"它可能命中真实行并改/删掉它: {c}")
+        else:
+            raise AssertionError(f"doctor 出现了没预料到的写操作: {c}")
 
     for name, args in sb.rpc_calls:
         if name == "deskcore_commit_fingerprints":
@@ -203,6 +236,38 @@ def test_probes_never_write():
         if name == "update_calibration_notes_cas":
             assert args["_project_id"] == core._PROBE_NIL_UUID
             assert args["_expected_md5"] == core._PROBE_IMPOSSIBLE_MD5
+
+
+def test_the_insert_probe_really_cannot_write():
+    """探 INSERT 权限那一句, 在一个**会拦非空**的库上必须插不进去。
+
+    钉的是探测本身的安全性, 而不是它的结论。上一条查的是形态(payload 里有
+    None), 这条查的是后果 —— 假件按 PG 的真实形态抛 23502, 而 doctor 仍然
+    把它读成"有 INSERT 权限"。两件事都对, 这个探测才站得住。
+    """
+    sb = FakeClient(rows={**_TABLES}, rpc_impl=_ALL_RPCS)
+    n_before = len(sb.rows["draft_fingerprints"])
+    st = _states(core.migration_state(sb))
+
+    assert len(sb.rows["draft_fingerprints"]) == n_before, "探测真的插进去了"
+    assert st["draft_fingerprints 的 INSERT 权限"] == "applied", (
+        "非空约束拦下 = 有权限, 不该报成故障")
+
+    # 反面: 同一句在没有 INSERT 权限的库上要报 denied
+    class _NoInsert(FakeClient):
+        def table(self, name):
+            q = super().table(name)
+            if name == "draft_fingerprints":
+                orig = q.insert
+
+                def _boom(payload, _o=orig):
+                    _o(payload)
+                    raise RuntimeError(_DENIED)
+                q.insert = _boom
+            return q
+
+    st2 = _states(core.migration_state(_NoInsert(rows=_TABLES, rpc_impl=_ALL_RPCS)))
+    assert st2["draft_fingerprints 的 INSERT 权限"] == "denied", st2
 
 
 def test_backfill_gap_uses_the_same_helpers_as_backfill():
@@ -382,7 +447,7 @@ def test_permission_denied_is_denied_not_error():
     report = core.migration_state(_Denied(rows=_TABLES, rpc_impl=_ALL_RPCS))
     st = _states(report)
 
-    assert st["draft_fingerprints 的表级 GRANT"] == "denied", st
+    assert st["draft_fingerprints 的 SELECT 权限"] == "denied", st
     for t in core._MIGRATION_001_TABLES:
         assert st[f"表 {t}"] == "denied", f"缺 GRANT 被报成了 {st[f'表 {t}']}"
 
@@ -427,7 +492,7 @@ def test_grant_probe_stays_quiet_when_the_tables_are_not_there_yet():
             return super().table(name)
 
     report = core.migration_state(_NoTables(rows=_TABLES, rpc_impl=_ALL_RPCS))
-    assert _states(report)["draft_fingerprints 的表级 GRANT"] == "unprobeable"
+    assert _states(report)["draft_fingerprints 的 SELECT 权限"] == "unprobeable"
     assert "007_deskcore_table_grants.sql" not in report["missing"]
     assert "001_deskcore.sql" in report["missing"]
 
