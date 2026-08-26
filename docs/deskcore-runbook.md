@@ -12,16 +12,16 @@
 ## 0. 一句话现状
 
 **代码全写完了、离线自测通过（216 条 pytest + selftest + 真 PostgreSQL 上的迁移与
-SQL/Python 逐例比对全绿）。但服务没部署，六个迁移里生产库只跑过 `001`，四张新表
-全是 0 行——所以整条链路一次都没真跑过。**
+SQL/Python 逐例比对全绿）。**六个迁移已于 2026-08-26 全部跑进生产库**。但服务
+还没部署，四张新表仍然全是 0 行——所以整条链路一次都没真跑过。**
 
-> ⚠️ **这一段 2026-08-23 版写的是"schema 也上了生产"。那不对。** 08-26 实测：
-> `002` / `003` / `004` / `005` / `006` 在生产库上一个都没有（见 §1.2）。修这条
-> 的同时补了 `python -m deskcore.cli doctor`——以后不必再手写 SQL 去问这个问题。
+> ⚠️ **这一段 2026-08-23 版写的是"schema 也上了生产"。那是错的**——08-26 实测
+> 时只有 `001`，另外五个一个都没跑。修这条的同时补了
+> `python -m deskcore.cli doctor`，以后不必再手写 SQL 去问这个问题。
 >
-> 其中 **`006` 不跑是硬失败**：`db.update_item_status` 无条件写
-> `decision_source` / `reviewer_id` / `decided_at`，缺列会让现有工作台的
-> 「通过 / 打回」当场报错。它排在所有步骤最前面。
+> **同日已按 `006 → 002 → 003 → 004 → 005` 的顺序补齐**（见 §1.3）。`006` 提前
+> 是因为它不跑是硬失败：`db.update_item_status` 无条件写 `decision_source` /
+> `reviewer_id` / `decided_at`，缺列会让现有工作台的「通过 / 打回」当场报错。
 
 ---
 
@@ -43,29 +43,49 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 
 | 部件 | 实测结果 |
 |---|---|
-| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **216 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 六个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
-| ⚠️ **schema** | ❌ 生产库**只跑过 `001`**。`002` / `003` / `004` / `005` / `006` 一个都没有——见下面那张表 |
+| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **237 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 六个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
+| **schema** | ✅ 六个迁移**已全部跑进生产**（2026-08-26，见 §1.3） |
 | **服务部署** | ❌ **没有**。两个仓里搜不到任何 deskcore 的线上地址 |
 | `draft_fingerprints` | **0 行** ← 查重硬闸背后一条历史都没有 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
 | `memories` | 303 条 |
 | ⚠️ `memories.severity` | **303 条全是 `soft`，`hard` = 0** |
 | `items` | 4,574 条 / 61 个项目 / 6 个 owner |
-| `versions` | 5,532 行 |
+| `versions` | 5,532 行（跑 `003` 前后一致——重编号只改号，不增删行） |
 | ⚠️ `versions.embedding` | **非空 0 条** |
-| ⚠️ `(item_id, version_num)` 重复 | **339 对 / 678 行** ← `003` 会先把它们重编号再建唯一索引 |
+| `(item_id, version_num)` 重复 | **0**（`003` 之前是 339 对） |
 | 最后一次真实使用 | 2026-08-19（item / batch / memory 的最新 `created_at` 都停在这天） |
 
-**迁移状态逐条实测**（2026-08-26，`information_schema` + `pg_proc` 查的）：
+### 1.3 迁移落库记录（2026-08-26）
 
-| 迁移 | 生产库 | 判据 |
+跑之前实测只有 `001`。按 `006 → 002 → 003 → 004 → 005` 补齐，每跑一个验一个：
+
+| 迁移 | 结果 | 怎么验的 |
 |---|---|---|
-| `001_deskcore.sql` | ✅ 在 | 四张表都在；`items.updated_at` 在；`deskcore_reserve_angles` 在 |
-| `002_calibration_cas.sql` | ❌ 没跑 | `update_calibration_notes_cas` 查不到 |
-| `003_versions_unique_num.sql` | ❌ 没跑 | `versions_item_version_uniq` 索引不存在（且库里正好有 339 对重复） |
-| `004_deskcore_check_pushdown.sql` | ❌ 没跑 | `deskcore_check_drafts` / `deskcore_fingerprint_counts` 都查不到 |
-| `005_deskcore_containment.sql` | ❌ 没跑 | `deskcore_commit_fingerprints` 还是 **4 参**那版 |
-| `006_item_decision_provenance.sql` | ❌ 没跑 | `items` 没有 `decision_source` / `reviewer_id` / `decided_at` |
+| `006_item_decision_provenance` | ✅ | 三列 + CHECK + 部分索引都在；用**与 `db.update_item_status` 完全相同的 SET 子句**、`where` 匹配 0 行跑了一次 UPDATE，不再报缺列 |
+| `002_calibration_cas` | ✅ | `SECURITY INVOKER`、`search_path` 固定、`anon` 已 REVOKE、`authenticated`+`service_role` 已 GRANT；witness 不匹配返 0 行 |
+| `003_versions_unique_num` | ✅ | 见下 |
+| `004_deskcore_check_pushdown` | ✅ | 两个 RPC 都在 |
+| `005_deskcore_containment` | ✅ | `check_drafts` 只剩 **3 参**那版、`commit_fingerprints` 只剩 **6 参**那版（**没有重载残留**，留着旧签名调用时会报 ambiguous）；拿一条真数据跑通四路比对，10 列都回来了 |
+
+**`003` 是唯一改数据的一个**，所以单独记：
+
+- 跑之前存了快照表 `autowriter.versions_num_backup_20260826`（5,532 行，回滚 SQL 写在表注释里）。**确认无误之后可以 drop 它。**
+- 先干跑（只 SELECT）：339 个 item 受影响 / 715 个版本行 / **实际会改 376 行** / 改完仍重复 **0** 对 / 未触碰却重复 **0** 对。
+- 跑完实测：唯一索引已建、重复清零、行数 5,532 → 5,532、与快照相比改了 **376** 行（与干跑一致）。
+- ⚠️ 单独验了一件事：**受影响的 339 个 item 里，"代表版本"（最大号那一行）被换掉的是 0 个**。重编号的排序键是 `(version_num, created_at, id)`，最大号仍是最大号——这正是 COR-004 要保住的东西。
+
+跑完 `get_advisors(security)`：没有一条与本次迁移相关。报出来的 ERROR 全在 `public`
+schema（dashboard 视图 / pipeline 表，既有问题）；`autowriter` 四张表的
+`rls_enabled_no_policy` 是 INFO 且**设计如此**（deskcore 走 service_role 绕 RLS，
+隔离由 `store.py` 显式执行，启用 RLS 无策略 = 对其它角色一律拒绝）。
+**没有 `function_search_path_mutable`** —— 五个函数的 `search_path` 都固定了。
+
+> ⚠️ 一个跑之前没料到的坑：`006` 里的 `ALTER TABLE items` **不带 schema 前缀**
+> （它假定在 SQL Editor 里 `search_path` 已含 `autowriter`），而 Supabase 的
+> `apply_migration` 用的是 `"$user", public, extensions`。好在 `public.items`
+> **不存在**，所以那句会当场报错而不是改错表——但下次谁在别的环境跑，先确认
+> `search_path`，或者在前面加一句 `SET search_path = autowriter, public, extensions;`。
 
 以后不用手写这些 SQL：
 
@@ -97,12 +117,15 @@ owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
 
 ## 2. 上线五步（顺序不能换）
 
-### 第 0 步 · 补齐迁移（`002`–`006`），**先跑 `006`**
+### 第 0 步 · 补齐迁移 ✅ **已完成（2026-08-26，见 §1.3）**
 
-生产库只跑过 `001`（§1.2）。**`006` 排在最前面，因为它是唯一一个"代码已经发了、
-迁移没跑就当场坏"的**：`db.update_item_status` 无条件写
-`decision_source` / `reviewer_id` / `decided_at`，缺列时现有工作台的
-「通过 / 打回」按钮、硬规则自动标记、查重自动标记全部报错。
+> 这一步在当前生产库上已经做完了。**下面这段留着不是历史记录，是给下一套库
+> （branch 库、新环境、灾备重建）用的** —— 顺序和坑都在这儿。
+
+**`006` 排在最前面，因为它是唯一一个"代码已经发了、迁移没跑就当场坏"的**：
+`db.update_item_status` 无条件写 `decision_source` / `reviewer_id` /
+`decided_at`，缺列时现有工作台的「通过 / 打回」按钮、硬规则自动标记、查重自动
+标记全部报错。
 
 跑法：Supabase SQL Editor 粘贴执行，或 MCP `apply_migration`。建议先在 branch 库
 跑一遍 + `get_advisors` 核验再进 prod。顺序：
@@ -114,11 +137,21 @@ owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
 `006` 之外按编号顺序即可。**`005` 必须在 `004` 之后**（它 DROP 掉 `004` 建的那版
 `deskcore_check_drafts` 再重建，跳过 `004` 会缺 `deskcore_fingerprint_counts`）。
 
-⚠️ **`003` 会改数据**，不只是建索引：库里现有 **339 对 / 678 行**重复的
-`(item_id, version_num)`，它先按 `(version_num, created_at, id)` 稳定重编号，再建
-唯一索引。这是 `bulk_create_initial_versions` 给多引擎批次每个引擎都写
-`version_num=1` 留下的历史（审计 §0.4 第 1 条），不是数据损坏。跑之前先备份/开
-branch 库过一遍。
+⚠️ **`003` 会改数据**，不只是建索引：它按 `(version_num, created_at, id)` 稳定
+重编号，再建唯一索引。重复号是 `bulk_create_initial_versions` 给多引擎批次每个
+引擎都写 `version_num=1` 留下的历史（审计 §0.4 第 1 条），不是数据损坏。
+
+08-26 那次的做法，下次照抄即可：
+
+1. **先存快照**（`create table ... as select id, item_id, version_num from versions`），
+   回滚 SQL 写进表注释。
+2. **干跑**：把 `003` 的两个 CTE 原样跑成 SELECT，看四个数——受影响 item / 版本行 /
+   实际会改的行 / **改完仍重复的对子（必须是 0，否则唯一索引建不起来）**。顺带查
+   一次"未被触碰却重复的对子"也必须是 0。
+3. 跑迁移。
+4. **验代表版本没被换掉**：每个受影响 item 的最大号那一行，改前改后必须是同一行
+   （拿快照 join 一次）。这条才是 COR-004 真正要保住的东西，只看"索引建起来了"
+   是不够的。
 
 跑完立刻自检——**别照文档推断，去查库**：
 
@@ -459,7 +492,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 
 | # | 事 | 为什么 | 验收标准 |
 |---|---|---|---|
-| 0 | **补齐迁移 `002`–`006`，`006` 最先** | 生产库只跑过 `001`。`006` 不跑是**硬失败**——现有工作台的「通过 / 打回」当场报错 | `python -m deskcore.cli doctor` 报「迁移: 全部到位」；`003` 那条 `unprobeable` 自己用 SQL 确认一次 |
+| 0 | ~~补齐迁移 `002`–`006`~~ | ✅ **2026-08-26 已完成**（见 §1.3）。六个全跑进生产，逐条验过；`003` 的快照表 `versions_num_backup_20260826` 还留着，确认无误后可 drop | — |
 | 1 | 部署 deskcore service | 现在根本没跑 | `curl $URL/health` 每项 ok |
 | 2 | 回填指纹（至少主力项目） | 不做的话硬闸背后 0 行历史 | `python -m deskcore.cli doctor --project <uuid>` 的「还差」归零；且 `backfill` 返回的 `missing_embeddings` = 0。⚠️ **不能**拿全局 `count(*) > 0` 或「`empty_history_warning` 消失了」当验收——两个都会在主力项目还差几百条时报绿 |
 | 3 | 验 WorkBuddy 的鉴权头 | 不通就要换形态 | MCP 握手成功、错 key 返 401 |
