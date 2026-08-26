@@ -26,7 +26,7 @@ import logging
 import random
 import uuid
 from datetime import datetime
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import config
 import db
@@ -471,20 +471,35 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
     ⚠️ 只有"RPC 不存在"才降级到 B。查重是 deskcore 唯一不 fail-open 的路径,
     其它异常(权限 / 库故障)一律冒泡。
     """
+    # ⚠️ ``embed_texts`` 是**逐位对齐**的, 但某一位可能是 None —— 那条稿子没有
+    # 可嵌入的标题(空标题)。所以判据必须是"这一位有没有向量", 不能只判
+    # "这一批有没有向量、下标越没越界"。
+    #
+    # 2026-08-26 这里真崩过一次: 判据写成 `new_vecs and i < len(new_vecs)`,
+    # 于是空标题那一位的 None 掉进 `for x in None`, 整个 check_drafts 回 500。
+    # 起因是同一天把 embed_texts 从"整批全有或全无"改成了逐位可空(那个改动本身
+    # 是对的 —— 一条空标题不该拖垮整批), 而**这个调用点没跟上新契约**。
+    # 当时的回归夹具是 `lambda ts: [[0.1]] * len(ts)`, 永远不产生 None, 所以
+    # 测试套一片绿 —— 假件比真实情况"整齐", 测出来的绿就是假的。
+    def _vec_literal(i: int) -> Optional[str]:
+        v = new_vecs[i] if new_vecs and i < len(new_vecs) else None
+        return f"[{','.join(repr(float(x)) for x in v)}]" if v else None
+
     payload = [
         {
             "opening_hash": o_hashes[i] or None,
             "ngram_hashes": sorted(grams[i]),
-            # 本批算不出向量时传 null, 库里那一路直接跳过 —— 与 Python 路径的
-            # `if new_vecs and i < len(new_vecs)` 等价。
-            "title_embedding": (f"[{','.join(repr(float(x)) for x in new_vecs[i])}]"
-                                if new_vecs and i < len(new_vecs) else None),
+            # 这一条算不出向量时传 null, 库里那一路直接跳过。
+            "title_embedding": _vec_literal(i),
             # ⚠️ 必须带上模型名: 库里那一路要用它把**别的模型产的**历史向量
             # 排除掉。跨模型算余弦出来的数是垃圾且【不报错】—— 不带的话
             # migrations/008 之后的函数会退回"比全部非空向量"的老行为, 而
             # 老行为正是 #65 P1 说的那个洞。(codex review · #65 P1)
+            #
+            # 没有向量的那条不写模型名 —— 写了也没意义, 而且会让"这条比过没有"
+            # 从回执里看不出来。
             "embedding_model": (dedup.EMBEDDING_MODEL
-                                if new_vecs and i < len(new_vecs) else None),
+                                if _vec_literal(i) else None),
         }
         for i in range(len(o_hashes))
     ]

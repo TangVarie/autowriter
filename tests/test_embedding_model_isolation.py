@@ -116,6 +116,56 @@ def test_pushdown_payload_carries_the_model():
     assert args["_rows"][0]["embedding_model"] == CUR, args["_rows"][0]
 
 
+def test_a_blank_title_in_the_batch_does_not_crash_check_drafts(monkeypatch):
+    """同一批里混一条空标题, ``check_drafts`` 不许崩, 其余各条照常比。
+
+    ⚠️ **这条是线上真崩过一次之后补的, 而且它暴露的是一个假件问题。**
+
+    2026-08-26 把 ``embed_texts`` 从"整批全有或全无"改成"逐位对齐、某位可空"
+    (那个改动本身是对的 —— 一条空标题不该拖垮整批), 但下推 payload 那个调用点
+    **没跟上新契约**: 判据仍是 `new_vecs and i < len(new_vecs)`, 只问下标越没
+    越界、不问那一位有没有东西。于是 None 掉进 `for x in None`, 整个
+    ``check_drafts`` 回 500。
+
+    为什么测试套一片绿却没抓住: 当时的夹具是 ``lambda ts: [[0.1]] * len(ts)``
+    —— **永远不产生 None**。假件比真实情况"整齐", 测出来的绿就是假的。
+    这跟本会话早先 `.select("id")` 那次是同一种病(假件不校验列名)。
+
+    所以这条用例的夹具**必须**按真契约来: 空串那一位回 None。
+    """
+    for label, rpc in (("SQL 下推路径", {
+                            "deskcore_check_drafts": lambda a: [
+                                {"idx": i, "best_sim": 0, "best_j": 0, "best_c": 0,
+                                 "c_sample": 99, "open_exact": False}
+                                for i in range(len(a["_rows"]))],
+                            "deskcore_fingerprint_counts": lambda a: []}),
+                       ("Python 兜底路径", {})):          # 没有 RPC → 走 Python
+        sb = FakeClient(rows={"projects": _PROJECTS, "draft_fingerprints": []},
+                        rpc_impl=rpc)
+        # 与真 embed_texts 同契约: 空串那一位是 None
+        monkeypatch.setattr(dedup, "embed_texts",
+                            lambda ts: [None if not (t or "").strip() else [0.1] * 8
+                                        for t in ts])
+        monkeypatch.setattr(dedup, "embeddings_available", lambda: True)
+
+        out = core.check_drafts(sb, PID,
+                                [{"title": "", "body": "正文甲"},
+                                 {"title": "正常标题", "body": "正文乙"}],
+                                user_id=UID)          # ← 修复前这里直接 TypeError
+        assert len(out["results"]) == 2, f"{label}: 回执少了条 —— {out}"
+
+        if rpc:   # 只有下推路径能看到送下去的 payload
+            rows = next(a for n, a in sb.rpc_calls
+                        if n == "deskcore_check_drafts")["_rows"]
+            assert rows[0]["title_embedding"] is None, (
+                f"{label}: 空标题那条不该有向量字面量")
+            assert rows[0]["embedding_model"] is None, (
+                f"{label}: 没有向量就不该写模型名 —— 写了会让"
+                f"'这条比过没有'从回执里看不出来")
+            assert rows[1]["title_embedding"], f"{label}: 正常那条的向量丢了"
+            assert rows[1]["embedding_model"] == CUR
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 2 · 回填: 不许给来路不明的向量贴标签
 # ══════════════════════════════════════════════════════════════════════
