@@ -114,6 +114,19 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS manual_edit_draft JSONB;
 -- 不存在 → "relation items does not exist" → 整段 DDL 中断。
 ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT
     CHECK (example_label IN ('positive', 'negative'));
+-- 决策出处(审计 COR-004 / COR-007)。status 一个字段同时装"人工审稿意见"和
+-- "机器检测结果", 而 TV 的决策同步把两者**全部**当人工反馈灌进
+-- prepublish_evaluations 去校准模型 —— 机器自己的判定被当成人的判断喂回给
+-- 模型学。这三列让消费方不必再推断。完整说明见 migrations/006。
+-- ⚠️ 与 006 保持一致: 两边都要有(README: 加列必须两边都改)。
+ALTER TABLE items ADD COLUMN IF NOT EXISTS decision_source TEXT
+    CHECK (decision_source IN
+           ('human', 'auto_hard_rule', 'auto_dedup', 'system'));
+ALTER TABLE items ADD COLUMN IF NOT EXISTS reviewer_id UUID;
+ALTER TABLE items ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS items_human_decision_idx
+    ON items (decided_at)
+    WHERE decision_source = 'human';
 -- 2026-05-21: TV 飞轮接入相关列。等价于 autowriter-migrations/002+003 的
 -- bootstrap 路径——operator 在已部署 Supabase 上跑迁移即可；fresh 部署直接
 -- 走这段 DDL 就有列。

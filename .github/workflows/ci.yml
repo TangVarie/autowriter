@@ -728,7 +728,9 @@ jobs:
               ("创建批次",     lambda c: db.create_batch(c, "u", "p", "t", {}, ["claude"])),
               ("创建条目",     lambda c: db.create_item(c, "u", "b")),
               ("创建版本",     lambda c: db.create_version(c, "i", "claude", "t", "b")),
-              ("更新条目状态", lambda c: db.update_item_status(c, "i", "approved")),
+              ("更新条目状态", lambda c: db.update_item_status(
+                  c, "i", "approved", source=db.DecisionSource.HUMAN,
+                  reviewer_id="u")),
               ("标记正负例",   lambda c: db.set_item_example_label(c, "i", "positive")),
               ("更新记忆",     lambda c: db.update_memory(c, "m", {"content": "x"})),
               ("入队任务",     lambda c: db.insert_job(c, "noop", {}, "u")),
@@ -1298,14 +1300,23 @@ jobs:
               def incr(s, k, v=1): s.n += v
           calls = []
           _orig_us = db.update_item_status
-          db.update_item_status = lambda c, i, st: calls.append(i)
+          # 假件要**如实**接住新签名: source 是必填关键字参数。写成 (c,i,st)
+          # 的话真实调用会 TypeError, 被 _run_hard_constraint_check 自己的
+          # 错误处理吞掉, calls 变成空 —— 断言照旧红, 但红的原因就指错了地方。
+          # 顺便把 source 也记下来: 硬规则标记必须是 auto_hard_rule, 不能
+          # 混进人工反馈(审计 COR-004)。
+          db.update_item_status = (
+              lambda c, i, st, *a, source=None, reviewer_id=None, **k:
+                  calls.append((i, source, reviewer_id)))
           try:
               ivs = [{"item_id": "A", "title": "全网最低价", "body": "最好", "keywords": []},
                      {"item_id": "A", "title": "最强", "body": "最", "keywords": []},
                      {"item_id": "B", "title": "最快", "body": "", "keywords": []}]
               e = []
               _mod._run_hard_constraint_check(None, ivs, [{"content": "禁止出现'最'字"}], "P：", e, _M())
-              assert calls == ["A", "B"], f"重复标记了: {calls}"
+              assert [c[0] for c in calls] == ["A", "B"], f"重复标记了: {calls}"
+              assert all(c[1] == "auto_hard_rule" and c[2] is None for c in calls), (
+                  f"硬规则的自动标记必须标成 auto_hard_rule 且无 reviewer: {calls}")
               assert len(e) == 3, f"警告应逐条给出, 实际 {len(e)}"
           finally:
               db.update_item_status = _orig_us

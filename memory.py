@@ -1934,15 +1934,21 @@ def _render_bottom_tools(
             elif is_hard and rule_kind not in (None, "free_text") and rule_payload is None:
                 st.warning("结构化硬规则的目标字段不能为空。")
             elif is_hard and rule_kind == "forbidden_regex":
-                # 保存前再编译一次：用户可能没点"测试编译"就直接提交。否则
+                # 保存前再校验一次：用户可能没点"测试编译"就直接提交。否则
                 # 入库后 validator.check_hard_rules 只会 silent continue（参见
-                # validator.py:233），硬规则永久失效但用户无感知。
-                import re as _re
+                # validator.py），硬规则永久失效但用户无感知。
+                #
+                # 除了"能不能编译"，还要挡灾难性回溯（跨库审计 SUP-011）：
+                # (a+)+ 这类正则跑起来是输入长度的指数，26 个字符就要 6 秒。
+                # 写入这一关是**主要防线** —— Python 的 re 没有超时，存进去
+                # 之后没有任何办法在执行期安全地打断它。
+                import validator as _validator
                 try:
-                    _re.compile((rule_payload or {}).get("pattern", ""))
+                    _validator.assert_regex_is_safe(
+                        (rule_payload or {}).get("pattern", ""))
                     _do_save_memory = True
-                except _re.error as exc:
-                    st.error(f"正则无法编译，请先在「🧪 测试编译」里修复：{exc}")
+                except _validator.UnsafeRegex as exc:
+                    st.error(f"这条正则不能保存：{exc}")
             else:
                 _do_save_memory = True
 

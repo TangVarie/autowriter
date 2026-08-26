@@ -340,7 +340,8 @@ def _run_hard_constraint_check(
             # errors_sink 里那几行还在跟用户说"已标记 needs_revision"。
             # 说过的话和库里的状态对不上, 且没有任何报错。
             try:
-                db.update_item_status(db_client, item_id, "needs_revision")
+                db.update_item_status(db_client, item_id, "needs_revision",
+                                      source=db.DecisionSource.AUTO_HARD_RULE)
                 marked_items.add(item_id)
             except Exception as exc:
                 telemetry.log_event(
@@ -503,7 +504,8 @@ def _try_regen_one(
     # 重试用尽 → 标记 needs_revision
     if item_id:
         try:
-            db.update_item_status(db_client, item_id, "needs_revision")
+            db.update_item_status(db_client, item_id, "needs_revision",
+                                  source=db.DecisionSource.AUTO_DEDUP)
         except Exception as exc:
             telemetry.log_event(
                 "regen_status_update_failed",
@@ -781,9 +783,30 @@ def _sync_approved_to_session(
             new_msgs.append({"role": "assistant",
                              "content": {"text": assistant_text},
                              "item_id": iid, "batch_id": bid})
-        if new_msgs:
-            db.append_session_messages(db_client, session_id, new_msgs)
-        return len(new_msgs) // 2
+        if not new_msgs:
+            return 0
+        # ⚠️ **必须采信回执**。append_session_messages 是 read-max-then-insert
+        # + 唯一约束重试, 重试耗尽时它**返回 0 而不抛异常** —— 上面那个
+        # except 兜不住。原来这里把返回值整个丢掉、直接
+        # ``return len(new_msgs) // 2``, 报的是"打算写几条"。
+        #
+        # 这个假成功比写失败更糟: 会话历史是避重用的上下文, 少几轮没有任何
+        # 地方报错, 表现只是后面生成的稿子开始跟历史撞车, 而排查的人看到的
+        # telemetry 写着"同步成功 N 对"。(跨库审计 2026-08-24 ROB-015)
+        written = db.append_session_messages(db_client, session_id, new_msgs)
+        try:
+            written = int(written or 0)
+        except (TypeError, ValueError):
+            written = 0
+        if written < len(new_msgs):
+            telemetry.log_event(
+                "session_sync_partial",
+                session_id=session_id, project_id=project_id,
+                intended=len(new_msgs), written=written,
+            )
+        # turn 是 (user, assistant) 成对写的; 落库行数是奇数说明只写进去半对,
+        # 向下取整按"完整的几对"报 —— 宁可少报, 不可多报。
+        return written // 2
     except Exception as exc:
         telemetry.log_event(
             "session_sync_failed",

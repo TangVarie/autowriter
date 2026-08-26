@@ -209,11 +209,42 @@ def commit_drafts(project_id: str, drafts: list[dict],
 
     这个工具出错会直接报错。入库失败必须让你知道 —— 稿子没进指纹库的话,
     下次 check_drafts 会把同样的内容再放行一次。看到报错就重试, 别当没事。
+
+    返回值里的 ``batch_id`` / ``version_ids`` 是这批稿子在库里的身份, 直接拿去
+    喂 export_drafts。带 ``identity_warning`` 时说明身份没建成 —— 稿子入库了、
+    查重不受影响, 但这批导不出可归因的 lineage。
     """
     # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、
     # 只带 error 字段的结果, 而写作台协议对 commit 没有强制重试 —— 于是定稿
     # 静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id)
+
+
+def export_drafts(project_id: str, batch_id: str | None = None,
+                  version_ids: list[str] | None = None,
+                  _user_id: str | None = None) -> dict:
+    """把已经 commit 的稿子导成 Excel, 用来粘进飞书表。
+
+    什么时候调: 用户说「导出」「给我个表」「要发了」。**必须先 commit_drafts** ——
+    只有入了库的稿子才有身份, 没身份就没有可归因的 lineage。
+
+    ``batch_id`` 用 commit_drafts 刚回的那个(最常用); 只导其中几篇时给
+    ``version_ids``。两个都不给会直接报错, 不会去猜。
+
+    返回值里:
+      · ``xlsx_base64`` —— 解码写成 ``filename`` 那个文件交给用户;
+      · ``columns``     —— 飞书表里要有的列名, **逐字相同**;
+      · ``preview``     —— 标题 + version_id, 用来核对导的是不是那一批。
+
+    ⚠️ 表里除了内容列还有六个 ``_source_autowriter_*`` / ``_ai_engine`` /
+       ``_exported_at`` 列。**别让用户删掉它们**, 也别只复制内容列 —— 那六列是
+       "这条笔记是谁写的哪一版"的唯一载体, 丢了就等于这篇稿子发出去之后的数据
+       再也回不到写作台。飞书表还没建这几列的话, 让用户先按 columns 建好。
+    """
+    # 同 commit_drafts: 不包 _safe。导出失败必须当场知道 —— 静默回个空表, 用户
+    # 会以为"这批没稿子"而不是"导出坏了"。
+    return core.export_drafts(core.sb(), project_id, batch_id=batch_id,
+                              version_ids=version_ids, user_id=_user_id)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -360,6 +391,7 @@ TOOLS = {
     "borrow_lessons": (borrow_lessons, True),
     "check_drafts":   (check_drafts,   True),
     "commit_drafts":  (commit_drafts,  True),
+    "export_drafts":  (export_drafts,  True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),
     "save_my_style":  (save_my_style,  True),

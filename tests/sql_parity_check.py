@@ -41,6 +41,7 @@ sys.path.insert(0, str(REPO))
 
 from deskcore import fingerprint as fp     # noqa: E402
 from deskcore import core                 # noqa: E402
+import db as _awdb                        # noqa: E402
 
 PGHOST = sys.argv[1] if len(sys.argv) > 1 else "/tmp/awpg"
 PGPORT = sys.argv[2] if len(sys.argv) > 2 else "55432"
@@ -179,8 +180,29 @@ def main() -> int:
         if n == "0":
             print(f"  [FAIL] 函数 {fn} 没建出来")
             bad += 1
+    # 决策出处那三列(审计 COR-004 / COR-007)。**基线和增量都要有** ——
+    # migrations/README 的规矩是加列两边都改, 而这个 harness 跑的正是
+    # 000 → 001..N, 只改一边的话这里就该红。
+    for col in ("decision_source", "reviewer_id", "decided_at"):
+        n = sql("SELECT count(*) FROM information_schema.columns "
+                f"WHERE table_schema='autowriter' AND table_name='items' "
+                f"AND column_name='{col}';")
+        if n != "1":
+            print(f"  [FAIL] items.{col} 没建出来 —— 000 与 006 只改了一边?")
+            bad += 1
+    # CHECK 的取值集合必须和 db.DecisionSource 对得上。两边各写一份迟早漂,
+    # 而漂了的表现是"写进去被数据库拒", 出现在离现场很远的地方。
+    for src in sorted(_awdb._DECISION_SOURCES):
+        try:
+            sql(f"INSERT INTO autowriter.items (id, user_id, status, decision_source) "
+                f"VALUES (gen_random_uuid(), '{UID}', 'pending', '{src}');")
+        except SystemExit:
+            print(f"  [FAIL] db.DecisionSource 有 {src!r}, 但 006 的 CHECK 不认")
+            bad += 1
+    sql(f"DELETE FROM autowriter.items WHERE user_id='{UID}';")
     if not bad:
-        print("  ✓ 抽查的 7 张表 + 6 个函数都在")
+        print("  ✓ 抽查的 7 张表 + 6 个函数 + 决策出处三列都在, "
+              "且 CHECK 与 db.DecisionSource 一致")
 
     # ── ③ SQL 与 Python 算出来的数一样 ─────────────────────────────────
     # 跑完整套 schema 之后 draft_fingerprints 上是有 FK 的, 先把 project 建出来。

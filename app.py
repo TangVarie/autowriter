@@ -2513,7 +2513,9 @@ def page_review(project: dict) -> None:
             if st.button("✅ 全部通过", key="approve_all_btn", use_container_width=True):
                 for it in items:
                     if it["status"] in ("pending", "needs_revision"):
-                        db.update_item_status(db_client, it["id"], "approved")
+                        db.update_item_status(db_client, it["id"], "approved",
+                                              source=db.DecisionSource.HUMAN,
+                                              reviewer_id=user_id)
                 st.rerun()
 
     # ── Batch actions ──────────────────────────────────────────────────
@@ -2661,11 +2663,15 @@ def _render_item_card(
         col_approve, col_revise = st.columns(2)
         with col_approve:
             if st.button("✅ 通过", key=f"approve_{item_id}", use_container_width=True):
-                db.update_item_status(db_client, item_id, "approved")
+                db.update_item_status(db_client, item_id, "approved",
+                                      source=db.DecisionSource.HUMAN,
+                                      reviewer_id=user_id)
                 st.rerun()
         with col_revise:
             if st.button("✏️ 需修改", key=f"revise_{item_id}", use_container_width=True):
-                db.update_item_status(db_client, item_id, "needs_revision")
+                db.update_item_status(db_client, item_id, "needs_revision",
+                                      source=db.DecisionSource.HUMAN,
+                                      reviewer_id=user_id)
                 st.rerun()
 
         # Example label controls
@@ -2904,6 +2910,7 @@ def _render_item_card(
                 db.update_item_status(
                     db_client, item_id, "approved",
                     best_version_id=new_version["id"],
+                    source=db.DecisionSource.HUMAN, reviewer_id=user_id,
                 )
                 # Drop the auto-saved draft now that the user committed.
                 try:
@@ -3014,10 +3021,10 @@ def _render_version_comparison(
 
             # 选为最佳：只记录 best_version_id，不直接通过
             if st.button("选为最佳", key=f"best_{item_id}_{engine}"):
-                db.update_item_status(
-                    db_client, item_id, status,
-                    best_version_id=latest["id"],
-                )
+                # 「选为最佳」只是在挑展示/导出用哪一版, **不是**一次审稿决定 ——
+                # 状态压根没变。走 update_item_status 会给它盖上一枚人工
+                # 决策戳(审计 COR-004 补的那三列), 把出处数据自己污染掉。
+                db.set_best_version(db_client, item_id, latest["id"])
                 st.rerun()
 
             # 每引擎独立迭代入口
@@ -3204,7 +3211,10 @@ def _run_iteration(
     # (_render_item_card 按 best_vid 选)和导出(_collect_approved_items 同
     # 口径)会一直停在迭代前的旧版本, 用户看到"迭代成功!"但内容纹丝不动。
     # 清掉后回到"无最佳 → 取最新版本"的默认行为, 新版本立即可见。
-    db.update_item_status(db_client, item["id"], "pending", clear_best_version=True)
+    db.update_item_status(db_client, item["id"], "pending",
+                          clear_best_version=True,
+                          # 迭代出新版后重置回待审 —— 既不是审稿也不是检测。
+                          source=db.DecisionSource.SYSTEM)
 
     # Iteration succeeded — drop the saved draft so the textarea doesn't
     # auto-restore it on the next render.

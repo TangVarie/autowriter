@@ -21,14 +21,23 @@
 
 from __future__ import annotations
 
-import hashlib
+import base64
 import logging
 import random
+import uuid
+from datetime import datetime
 from typing import NamedTuple
 
 import config
 import db
 import dedup
+# ⚠️ 新增的耦合(export_drafts 用它): exporter 顶层 import 了 docx / openpyxl。
+#    两个都在 requirements.lock 里, 而 deskcore 的部署方式就是
+#    `pip install -r requirements.lock -r deskcore/requirements.txt`
+#    (见 deskcore/requirements.txt 头两行), 所以这条是成立的。
+#    真要给 deskcore 做瘦镜像的话, 这一行会让**整个服务起不来**而不是只坏一个
+#    工具 —— 那时候把它改成函数内延迟 import。
+import exporter
 import librarian_client
 import memory
 
@@ -748,11 +757,11 @@ def check_drafts(client, project_id: str, drafts: list[dict],
     return {"results": results, "summary": summary}
 
 
-def _placeholder_version_id(seed: str) -> str:
-    """没有真实 version_id 时(稿子在 WorkBuddy 里写, 不落 autowriter.versions)
-    造一个确定性 UUID, 只为把 consumed_version_id 置成非 NULL 表示"用掉了"。"""
-    h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+# (这里原来有个 _placeholder_version_id: 没有真实 version_id 时按 angle_key 的
+#  sha256 造一个确定性假 UUID, 只为把 angle_ledger.consumed_version_id 置成非
+#  NULL。commit_drafts 现在给每条没带 id 的稿子都造真 id 并建出 versions 行,
+#  那个分支再也走不到 —— 删掉而不是留着, 留着的是一段永远不执行的代码加一句
+#  "没有真实 version_id 时"的注释, 下一个读的人会以为这种情况还存在。)
 
 
 # deskcore_commit_fingerprints 成功那一支返回的 status。**改这个字面量等于改
@@ -775,6 +784,20 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     撞车的稿子(两人各自 check 时看到的是同一份旧指纹集), 那条竞态窗口只能在
     写入的同一个事务里关掉。被判撞车的条目【不入库】, 在返回值的 rejected 里
     列出来, 调用方要让用户重写。
+
+    ── 2026-08-25: 入库的稿子现在**有身份** ────────────────────────────
+    真的入了库的那几条会同时建出 ``batches`` / ``items`` / ``versions`` 行,
+    返回值带 ``batch_id`` 和 ``version_ids``。在此之前写作台的稿子只有指纹、
+    没有 version_id, 于是:
+
+      · 回填(走 items × versions)看不到它们, 欠费期间缺的向量补不回来;
+      · 导出的 lineage 没有 version_id 可写, 而 Truth Vault 的
+        ``v_model_comparison`` 正是 JOIN 在 ``autowriter.versions.id`` 上 ——
+        "写作台写的稿子发出去爆没爆"在数据上根本问不出来。
+
+    ⚠️ 建出来的 item 是 ``pending``、**不盖任何决策戳**。理由见
+    ``store.DESKCORE_ITEM_STATUS`` —— 标 approved 会让每条定稿变成一条伪造的
+    人工评价灌进 TV 的评估模型。
     """
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not drafts:
@@ -787,19 +810,39 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # embed_texts —— 它 catch 住异常返回 None。
     # 这两者必须分开记: configured 为真而 vecs 为空 = 【本该有向量却没拿到】,
     # 那是故障不是"没配"。不区分的话, 欠费那几天入库的稿子会安静地只有确定性
-    # 指纹, 而且【补不回来】—— backfill 走的是 items×versions, WorkBuddy 写的
-    # 稿子 version_id 为空、根本不在 autowriter.versions 里, backfill 永远看不到。
-    # 结果就是查重从此对那批内容有个洞, 不报错、也没人知道。
+    # 指纹, 查重从此对那批内容有个洞, 不报错、也没人知道。
+    #
+    # (这里原来还写着"而且补不回来 —— backfill 走 items×versions, WorkBuddy
+    #  写的稿子根本不在 autowriter.versions 里"。下面建身份那一步之后不再成立:
+    #  这些稿子现在有真的 versions 行, backfill 扫得到。)
     embed_configured = dedup.embeddings_available()
     vecs = dedup.embed_texts(titles) if embed_configured else None
     embed_failed = embed_configured and not vecs
+
+    # ── 先把 version_id 定下来 ──────────────────────────────────────────
+    # 顺序是有讲究的: **先造 id 并写进指纹, 事后才建 versions 行**。
+    #
+    # 反过来(先建 versions 再写指纹)的话, 被查重判撞车的那几条会留下没有指纹的
+    # 孤儿 item —— 它们会出现在审核页、进正例池、被回填扫到, 而对应的稿子其实
+    # 根本没有交付。
+    #
+    # 现在这个顺序的失败模式是另一头: 指纹写进去了、身份没建成, 于是指纹的
+    # version_id 指向一个不存在的行。那只是**退回到今天的状态**(lineage 断掉),
+    # 查重一点不受影响 —— 而且下面会明说。两个方向的坏, 这个可逆。
+    #
+    # 调用方已经带了 version_id 的(稿子是 UI 生成的, 库里本来就有那一版)照旧用
+    # 它自己的, 不重新造、也不会再建一遍身份。
+    minted_ids: dict[int, str] = {}
+    for i, d in enumerate(drafts):
+        if not d.get("version_id"):
+            minted_ids[i] = str(uuid.uuid4())
 
     rows = []
     for i, d in enumerate(drafts):
         body = d.get("body") or ""
         emb = vecs[i] if vecs and i < len(vecs) else None
         rows.append({
-            "version_id": d.get("version_id"),
+            "version_id": d.get("version_id") or minted_ids.get(i),
             "title": titles[i],
             "opening": fp.opening_of(body),
             # RPC 侧按 text 转 vector, 这里给 pgvector 的字面量形式
@@ -850,6 +893,25 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     inserted_idx = ({o["idx"] for o in outcome
                      if o.get("status") == COMMIT_STATUS_INSERTED}
                     if atomic else set(range(len(drafts))))
+
+    # ── 给真的入了库的那几条建身份 ──────────────────────────────────────
+    # 只建 inserted 的: 被判撞车的那几条没有交付, 不该在 items 里留一行。
+    # mint_draft_identity 不抛: 指纹已经进库了, 这次 commit 的**主要目的**(让这些
+    # 稿子参与以后的查重)已经达成。把整个调用报成失败会让调用方去重试, 而重试会被
+    # 自己刚写进去的指纹判成撞车 —— 一次故障变成一句"你的稿子重复了", 现场完全对
+    # 不上。它半途失败时会把**已经建成的那部分**连同 error 一起回来。
+    minted = {"batch_id": None, "versions": {}, "error": None}
+    to_mint = [
+        {"version_id": minted_ids[i], "title": titles[i],
+         "body": drafts[i].get("body") or "",
+         "keywords": drafts[i].get("keywords") or []}
+        for i in sorted(inserted_idx) if i in minted_ids
+    ]
+    if to_mint:
+        minted = store.mint_draft_identity(
+            client, project_id, str(user_id), "", to_mint)
+    identity_error = minted.get("error")
+
     consumed = 0
     attempted = 0
     for i, d in enumerate(drafts):
@@ -859,25 +921,51 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         if not key:
             continue
         attempted += 1
-        vid = d.get("version_id") or _placeholder_version_id(key)
+        # 台账销账用**真的** version_id。以前这里塞的是一个按 angle_key 哈希出来的
+        # 假 UUID(见上面删掉的 _placeholder_version_id) —— consumed_version_id 非
+        # NULL 就够避重用了, 但那个 id 指不到任何一行, 没法回答"这个角度产出的那篇
+        # 后来怎么样了"。
+        vid = d.get("version_id") or minted_ids[i]
         if store.consume_angle(client, project_id, key, vid):
             consumed += 1
 
     out = {"written": written, "consumed_angles": consumed,
            "embedded": bool(vecs), "rejected": rejected,
            "atomic_recheck": atomic,
-           "embedding_model": dedup.EMBEDDING_MODEL if vecs else None}
+           "embedding_model": dedup.EMBEDDING_MODEL if vecs else None,
+           # 这次建出来的身份。导出要用 version_id, 所以直接回给调用方 ——
+           # 不然它得再查一次才知道自己刚提交的稿子叫什么。
+           #
+           # ⚠️ 只报**真的建出了行**的那些(拿 minted["versions"] 过一遍),
+           #    不是"我本来打算用这些 id"。建失败时报出去的 id 会让调用方拿它
+           #    去导出, 而 TV 那边 JOIN 不到任何东西 —— 那比不报更坏。
+           "batch_id": minted.get("batch_id"),
+           "version_ids": [minted_ids[i] for i in sorted(inserted_idx)
+                           if minted_ids.get(i) in minted.get("versions", {})]}
+    if identity_error:
+        # 说清楚**丢的是哪几条**: 查重没事, 断的是"发出去之后能不能归因回来"。
+        # ⚠️ 报的是**实际没建成的条数**, 不是 len(to_mint) —— 半途失败时前面几条
+        #    是真建成了的, 说"全都没建成"会让人去重做已经做完的事。
+        done = len(out["version_ids"])
+        out["identity_warning"] = (
+            f"{len(to_mint)} 条稿子的指纹都入了库, 但只有 {done} 条建成了 "
+            f"items/versions({identity_error})。查重不受影响; 受影响的是导出的 "
+            f"lineage —— 没建成的那 {len(to_mint) - done} 条不在 version_ids 里, "
+            "导出时不会有 version_id, Truth Vault 那边归因不回来"
+            "(v_model_comparison 就 JOIN 在这个 id 上)。"
+            + (f"已建成的那 {done} 条照常可以 export_drafts(batch_id="
+               f"{out['batch_id']})。" if done else "")
+            + "服务端日志有堆栈。")
     if embed_failed and written:
         # 配了 embedding 却没拿到向量 = 故障(欠费/配额/网络), 不是"没配"。
-        # 这几行【补不回来】: backfill 走 items×versions, 而这些稿子的
-        # version_id 多半是空的、根本不在那张表里。所以必须当场说, 让人
-        # 决定是先修 key 再 commit, 还是接受这批只有确定性指纹。
+        # 必须当场说, 让人决定是先修 key 再 commit, 还是接受这批只有确定性指纹。
+        # (2026-08-25 起这几行**补得回来**了 —— 稿子有了 versions 行, backfill
+        #  和 reembed 都扫得到。文案里保留 reembed 的指路, 它更直接。)
         out["embedding_warning"] = (
             f"配了 embedding 但本次取向量失败, {written} 条是【没有标题向量】入库的。"
             "它们以后只参与确定性查重(开头精确 + 四字串重合), 同角度换说法的标题"
             "比不出来。常见原因是 key 欠费/配额用尽/网络不通。"
-            "⚠️ backfill 补不了这些行(它只扫 autowriter.versions), 要补得用 "
-            "`python -m deskcore.cli reembed --project <id>`。")
+            "修好 key 之后用 `python -m deskcore.cli reembed --project <id>` 补齐。")
     if attempted and consumed < attempted:
         # consume_angle 现在会在"台账里根本没这一行"时返回 False(见 store 里的
         # 说明)。差额必须说出来 —— 这些坐标下一批还会被抽到, 悄悄少算等于
@@ -894,6 +982,96 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                           "不存在, migrations/001 可能没跑)。并发 check/commit 时"
                           "可能有撞车的稿子一起进库。")
     return out
+
+
+MAX_EXPORT_DRAFTS = 200
+
+
+def export_drafts(client, project_id: str, *, batch_id: str | None = None,
+                  version_ids: list[str] | None = None,
+                  user_id: str | None = None) -> dict:
+    """把定稿导成一个可以粘进飞书表的 Excel。
+
+    ── 这一步在闭环里的位置 ────────────────────────────────────────────
+    写作台 → 飞书表 → Truth Vault → (指标回流) → 写作台。第一段一直是**手工**
+    的: 运营把稿子粘进飞书表。粘的时候如果不带 lineage, TV 就只知道"有这么一条
+    笔记", 不知道它是谁写的哪一版 —— ``v_model_comparison`` 那个 view 就是这么
+    长期查出空集的。
+
+    所以这里导出的表, 除了内容列还带 ``exporter.LINEAGE_COLUMNS`` 那六个**命名
+    可见列**(列名由 TV 定)。运营整片选中粘贴, lineage 就跟着过去了。
+
+    ⚠️ 飞书表那边要**先建好这六列**, 否则粘过去是六列无处安放的数据。列名和
+       字段类型见 truth-vault 的 ``docs/11-feishu-table-setup.md``。
+
+    ── 为什么返回 base64 而不是文件路径 ────────────────────────────────
+    deskcore 是个远端服务, 调用方读不到它的文件系统。给一个下载 URL 就得配一套
+    单独的签名/鉴权 —— 而本仓的审计史上一半的坑都是"半套鉴权"。base64 让调用方
+    自己落盘, 不新增任何鉴权面。
+
+    正文全文本来就在调用方手里(稿子是它写的), 所以真正的额外开销只有 xlsx 的
+    封装。``preview`` 只回标题和 id, 够核对导的是不是那一批, 不重复正文。
+    """
+    assert_project_access(client, project_id, user_id=user_id)
+    if not batch_id and not version_ids:
+        raise ValueError(
+            "要导哪些稿子? 给 batch_id(commit_drafts 的返回值里有)或者 version_ids。"
+            "不给的话只能靠猜, 而猜错了导出的是别的批次 —— 那会把错的 lineage "
+            "粘进飞书表, 比导不出来更难查。")
+
+    items = store.drafts_for_export(
+        client, project_id, batch_id=batch_id, version_ids=version_ids,
+        limit=MAX_EXPORT_DRAFTS)
+    if not items:
+        # 键的形状和成功那一支保持一致 —— 调用方不该为了空结果写第二套解析。
+        return {"count": 0, "columns": [], "filename": None, "xlsx_base64": None,
+                "preview": [], "missing_version_ids": sorted(version_ids or []),
+                "truncated": False, "exported_at": None,
+                "note": ("没找到可导的稿子。要么 batch_id / version_ids 不属于这个"
+                         "项目, 要么那一批还没 commit_drafts —— 只有入了库的稿子"
+                         "才有身份可导。")}
+
+    # ── 少导了就必须说 ──────────────────────────────────────────────────
+    # 本仓的审计里"静默截断"是反复出现的一类(COR-006 / ROB-011 都是它), 而导出
+    # 这条路上它尤其阴: 少导几条 = 那几篇稿子发出去之后归因不回来, 而返回值看起来
+    # 完全正常, 没有任何人会发现。所以两种少法都点名:
+    #
+    #   · 点名要了某些 version 却没找到 —— id 打错、不属于这个项目、或者还没 commit;
+    #   · 命中数顶到上限 —— 后面可能还有, 这一次没导全。
+    missing = sorted(set(version_ids or []) - {r["version_id"] for r in items})
+    truncated = len(items) >= MAX_EXPORT_DRAFTS
+
+    exported_at = datetime.now().isoformat(timespec="seconds")
+    blob = exporter.build_combined_excel(items, exported_at=exported_at)
+    stamp = exported_at.replace("-", "").replace(":", "").replace("T", "_")[:13]
+
+    notes = ["把 xlsx_base64 解码写成 filename 那个文件, 打开、整片选中、粘进飞书表。"
+             "⚠️ 飞书表要先有 columns 里的那几列, 列名逐字相同 —— 对不上的列会让 "
+             "Truth Vault 把整行 quarantine。"]
+    if missing:
+        notes.append(
+            f"⚠️ 点名的 {len(missing)} 个 version_id 没找到, **不在这个表里**: "
+            f"{missing[:10]}{' …' if len(missing) > 10 else ''}。"
+            "多半是 id 打错、不属于这个项目、或者那几条还没 commit_drafts。")
+    if truncated:
+        notes.append(
+            f"⚠️ 命中数顶到上限 {MAX_EXPORT_DRAFTS} 条, 后面可能还有没导出来的。"
+            "分批用 version_ids 点名导, 别把这一次当全量。")
+
+    return {
+        "count": len(items),
+        "missing_version_ids": missing,
+        "truncated": truncated,
+        # 明着回一份列名: 运营要照着它在飞书表里建列, 而且对不上会整行被
+        # quarantine(TV 的 D-021)。让它出现在返回值里, 不必去翻文档。
+        "columns": [exporter.CONTENT_HEADER, *exporter.LINEAGE_HEADERS],
+        "filename": f"deskcore_{stamp}.xlsx",
+        "xlsx_base64": base64.b64encode(blob).decode("ascii"),
+        "preview": [{"title": r["title"], "version_id": r["version_id"]}
+                    for r in items],
+        "exported_at": exported_at,
+        "note": " ".join(notes),
+    }
 
 
 def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,

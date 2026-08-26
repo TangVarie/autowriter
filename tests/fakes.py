@@ -19,6 +19,8 @@ CI 的那些 heredoc 块里已经各自写过四五份形状相近的假件 —�
 
 from __future__ import annotations
 
+import uuid as _uuid
+
 
 class FakeResponse:
     def __init__(self, data, count=None):
@@ -152,8 +154,24 @@ class FakeClient:
         return _RpcQuery()
 
     # ── 求值 ────────────────────────────────────────────────────────
+    @staticmethod
+    def _resolve(row, key):
+        """按 key 取值, 支持 PostgREST 的 embedded 形态 ``表名.列名``。
+
+        ``.eq("batches.project_id", pid)`` 配 ``batches!inner(project_id)`` 是本仓
+        读跨表条件的标准写法(labeled_examples / legacy_versions / drafts_for_export
+        都在用)。假件不认这个点号的话, 每一条这样的查询在测试里都**静默返回空**,
+        而在真库里好好的 —— 于是"我的查询写对了没有"这件事测试根本管不到。
+        """
+        cur = row
+        for part in key.split("."):
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(part)
+        return cur
+
     def _match(self, row, kind, key, value) -> bool:
-        cur = row.get(key)
+        cur = self._resolve(row, key)
         if kind == "eq":
             return cur == value
         if kind == "neq":
@@ -181,6 +199,14 @@ class FakeClient:
 
         if q.op in ("insert", "upsert"):
             payload = q.payload if isinstance(q.payload, list) else [q.payload]
+            # 真库的 uuid PK 有 DEFAULT uuid_generate_v4(), 插入后 PostgREST 回的
+            # 是**带 id 的整行**。假件不补这个的话, 一切"插完拿 id 去建下一层"的
+            # 代码(batch → item → version)在测试里都拿到 None, 而在真库里好好的 ——
+            # 那种假件说的谎, 测试是看不出来的。
+            # 调用方自己带了 id 的(deskcore 建 versions 就是)原样保留。
+            for row in payload:
+                if isinstance(row, dict) and "id" not in row:
+                    row["id"] = str(_uuid.uuid4())
             table.extend(payload)
             return FakeResponse(list(payload))
 

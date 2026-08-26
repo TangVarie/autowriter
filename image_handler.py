@@ -244,17 +244,21 @@ def render_image_uploader(label: str = "上传参考图片（可选）") -> list
     return encoded
 
 
-# ── Image URL → base64 for display in iterations ──────────────────────────
-
-def url_to_b64(url: str) -> Optional[dict]:
-    """
-    Fetch an image from a URL and encode it to base64.
-    Returns None on failure.
-    """
-    import requests
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        return encode_image_b64(resp.content)
-    except Exception:
-        return None
+# ── 这里**曾经**有一个 url_to_b64 ────────────────────────────────────────
+#
+# 它拿用户给的 URL 直接 ``requests.get`` 再 encode: 不限 scheme、不限主机、
+# 不挡私网地址、跟随重定向、``resp.content`` 先整个读进内存再谈大小上限。
+# 也就是一个标准的 SSRF sink(云元数据端点 169.254.169.254、内网探测)兼内存
+# 耗尽路径。两次审计各记过一笔(2026-08-23 SUP-014 / 2026-08-24 跨库 SUP-010)。
+#
+# **删掉而不是加固**, 因为查下来它在整个仓库里一个调用方都没有 —— 最后一次
+# 被调用要追到 a7a8a75。留着一个没人用、又没加固的 SSRF sink, 比删了危险:
+# 它随时可能被某个"正好需要按 URL 取图"的改动接上, 而接的人不会知道它裸着。
+#
+# 真要再做"按 URL 取图", 这些是最低要求, 别照抄上面那十行:
+#   · 只允许 https + **域名白名单**;
+#   · DNS 解析后再查一次 IP(挡 DNS rebinding), 私网/回环/链路本地一律拒;
+#   · 不跟随重定向(或每一跳都重新过上面两条);
+#   · ``stream=True`` 边读边计数, 超 MAX_RAW_IMAGE_BYTES 立刻断开。
+# tests/test_image_pipeline.py 里有一条 AST 守卫盯着本文件不许再出现裸的
+# 出站请求。
