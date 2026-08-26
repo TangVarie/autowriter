@@ -46,7 +46,8 @@ class _FakeModels:
         self.calls = []
 
     def embed_content(self, *, model, contents, config=None):
-        self.calls.append({"model": model, "n": len(contents), "config": config})
+        self.calls.append({"model": model, "n": len(contents),
+                           "contents": list(contents), "config": config})
         if self.boom:
             raise self.boom
         count = self.n if self.n is not None else len(contents)
@@ -101,6 +102,63 @@ def test_wrong_dim_voids_the_whole_batch(fake, caplog):
     assert "维度不符" in caplog.text, caplog.text
     # 两个数都要报出来 —— 只说"不符"不够, 排查的人需要知道差在哪
     assert "768" in caplog.text and "3072" in caplog.text, caplog.text
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 1.5 · 一条空标题不许拖垮整批
+#
+# 2026-08-26 回填生产历史稿时**现场撞上的**: google-genai 对空内容直接抛
+# ``ValueError: content is required.``, 而且是整个请求失败 —— 第一个项目里
+# 一批 17 条全军覆没, 而其中标题真的为空的只有几条。
+#
+# 它被抓住是因为同一天刚给每条失败路径补了日志(见下面第 2 组)。没有那行日志
+# 的话, 现象只是"回填跑完了、看着正常、向量少了一截"。
+# ══════════════════════════════════════════════════════════════════════
+
+def test_blank_inputs_do_not_poison_the_batch(fake, caplog):
+    """空串要在送出去之前剔掉, 其余各条照常拿到向量, **位置不许错**。"""
+    m = fake(dims=768)
+    with caplog.at_level(logging.WARNING, logger="dedup"):
+        out = dedup.embed_texts(["标题一", "", "标题三", "   ", "标题五"])
+
+    assert out is not None and len(out) == 5, out
+    # 只送非空的那三条
+    assert m.calls[0]["n"] == 3, f"空串没被剔掉, 送了 {m.calls[0]['n']} 条"
+    assert [c.strip() for c in m.calls[0]["contents"]] == ["标题一", "标题三", "标题五"]
+    # 逐位对齐: 空的那两位是 None, 其余是向量
+    assert [v is None for v in out] == [False, True, False, True, False], out
+    # 而且要说一声 —— 静默剔除等于悄悄少算了几条
+    assert "空串" in caplog.text, caplog.text
+
+
+def test_all_blank_batch_is_not_a_failure(fake, caplog):
+    """整批都是空的 → 回一排 None, **不是 None**。
+
+    区别很要紧: 回 None 的意思是"这次 embedding 挂了, 全批降级", 调用方会去
+    报 semantic_degraded; 而"这几条本来就没标题"根本不是故障。
+    """
+    m = fake(dims=768)
+    with caplog.at_level(logging.WARNING, logger="dedup"):
+        out = dedup.embed_texts(["", "  ", ""])
+
+    assert out == [None, None, None], out
+    assert not m.calls, "全空还去打了 API"
+    assert caplog.records, "整批空也要留一句"
+
+
+def test_short_response_voids_the_batch(fake, caplog):
+    """API 少回几条 → 整批作废。
+
+    ⚠️ 钉的是【张冠李戴】这个形态, 它比"没有向量"坏得多: 调用方一律按下标取
+    (``vecs[i]`` 对应 ``drafts[i]``), 少一条就会把 A 的向量安到 B 头上 ——
+    查重照跑, 比的却是别人的标题, 而且**不报错**。
+    """
+    fake(dims=768, n=2)                 # 送 3 条只回 2 条
+    with caplog.at_level(logging.ERROR, logger="dedup"):
+        out = dedup.embed_texts(["一", "二", "三"])
+
+    assert out is None, "少回了却还往下传 —— 会张冠李戴"
+    assert "张冠李戴" in caplog.text or "只回来" in caplog.text, caplog.text
 
 
 # ══════════════════════════════════════════════════════════════════════

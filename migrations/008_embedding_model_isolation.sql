@@ -227,15 +227,98 @@ GRANT EXECUTE ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) TO 
 
 COMMIT;
 
--- ── 校验 (人工跑, 不在事务内) ────────────────────────────────────────
--- 函数体里必须出现按模型过滤那一句:
---   SELECT prosrc LIKE '%f.embedding_model = _model%'
---     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
---    WHERE n.nspname='autowriter' AND p.proname='deskcore_check_drafts';
---   → 应为 t
+-- ══════════════════════════════════════════════════════════════════════
+-- 校验 (人工跑, 不在上面那个事务内)
 --
--- 这个项目里有多少行的向量已经作废(需要 reembed):
---   SELECT embedding_model, count(*) FROM autowriter.draft_fingerprints
+-- ⚠️ 这一段**必须真跑**, 不能靠"迁移没报错所以生效了"。008 是 CREATE OR
+-- REPLACE, 签名与返回列一个字都没动 —— 跑没跑过从调用侧完全看不出来。
+-- ══════════════════════════════════════════════════════════════════════
+
+-- ── ① 静态: 函数体里真有那句过滤 ─────────────────────────────────────
+--
+-- ⚠️ **必须先剥掉注释再查。** 直接 `prosrc LIKE '%IS NOT DISTINCT FROM%'`
+-- 会命中上面**解释"为什么不用这个操作符"的那条注释**, 报一个假的红。
+-- 2026-08-26 落库时就被自己这么吓了一跳(本仓的 pytest 里有条同名断言也在
+-- 同一处栽过)。查函数体的断言一律先 regexp_replace 掉 `--` 之后的部分。
+--
+-- WITH body AS (
+--   SELECT string_agg(regexp_replace(ln, '--.*$', ''), E'\n') AS code
+--     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace,
+--          LATERAL unnest(string_to_array(p.prosrc, E'\n')) AS ln
+--    WHERE n.nspname='autowriter' AND p.proname='deskcore_check_drafts')
+-- SELECT code LIKE '%(_model IS NULL OR f.embedding_model = _model)%' AS filter_ok,
+--        code LIKE '%IS NOT DISTINCT FROM%'                           AS wrong_op,
+--        code LIKE '%_model := NULLIF(r->>''embedding_model'', '''')%' AS reads_model
+--   FROM body;
+--   → filter_ok=t, wrong_op=f, reads_model=t
+--
+-- 顺带确认没有重载残留(留着旧签名的话调用时会报 ambiguous):
+--   SELECT p.oid::regprocedure FROM pg_proc p JOIN pg_namespace n
+--     ON n.oid=p.pronamespace WHERE n.nspname='autowriter'
+--    AND p.proname='deskcore_check_drafts';
+--   → 应只有一行: autowriter.deskcore_check_drafts(uuid,jsonb,integer)
+
+-- ── ② 功能: 过滤真的会把别的模型排除掉 ───────────────────────────────
+--
+-- ⚠️ **这一路自动化测试覆盖不到。** tests/sql_parity_check.py 把 pgvector
+-- shim 成了 text 域(见该文件头: "被 shim 掉的东西不算验过"), 单元测试用的是
+-- 假件。所以"按模型过滤到底灵不灵"只能在**有真 pgvector 的库**上跑一次。
+--
+-- 手法: 三条历史指纹的向量**完全相同**, 只有 embedding_model 不同 ——
+-- 余弦全是 1.0, 于是命中谁【只可能由模型过滤决定】, 排除了"相似度本身"这个
+-- 变量。整个夹具包在 BEGIN … ROLLBACK 里, 库里一行都不留。
+--
+-- ⚠️ **四个场景一个都不能少。** 只跑第一个是不够的: 三条余弦都是 1.0,
+-- "命中本模型的行"也可能只是标题排序碰巧(ORDER BY sim DESC, title)。
+-- 场景 ② 证明它是按模型选而不是按标题选; 场景 ③ 是决定性的那条。
+--
+-- BEGIN;
+-- INSERT INTO autowriter.projects (id, name, owner_id)
+-- VALUES ('dddddddd-dddd-dddd-dddd-dddddddddddd', '_008_probe',
+--         '00000000-0000-0000-0000-000000000001');
+-- INSERT INTO autowriter.draft_fingerprints
+--     (project_id, title, opening, title_embedding, embedding_model, ngram_hashes)
+-- SELECT 'dddddddd-dddd-dddd-dddd-dddddddddddd', t, '',
+--        ('[' || array_to_string(array_fill(0.1::float8, ARRAY[768]), ',') || ']')
+--          ::extensions.vector,
+--        m, '{}'
+--   FROM (VALUES ('AAA 本模型',   'gemini-embedding-001'),
+--                ('BBB 老模型',   'text-embedding-004'),  -- 已下线, 这里当"别的模型"用
+--                ('CCC 来路不明', NULL)) AS v(t, m);
+-- WITH probe AS (
+--   SELECT '[' || array_to_string(array_fill(0.1::float8, ARRAY[768]), ',') || ']' AS vec),
+-- scenarios(n, model) AS (
+--   VALUES (1, 'gemini-embedding-001'),   -- 应只命中 AAA
+--          (2, 'text-embedding-004'),     -- 已下线的那个: 应只命中 BBB
+--                                         --   (证明按模型选, 不是按标题)
+--          (3, 'no-such-model-xyz'),      -- 应一条都不命中  ← 决定性的一条
+--          (4, NULL))                     -- 兼容路径: 不带模型 → 比全部
+-- SELECT s.n, coalesce(s.model, '(不带模型)') AS sent_model,
+--        coalesce(r.sim_title, '(无命中)')   AS matched,
+--        round(r.best_sim, 4)                AS best_sim
+--   FROM scenarios s, probe p,
+--        LATERAL autowriter.deskcore_check_drafts(
+--          'dddddddd-dddd-dddd-dddd-dddddddddddd'::uuid,
+--          jsonb_build_array(jsonb_build_object(
+--            'title_embedding', p.vec, 'embedding_model', s.model,
+--            'opening_hash', '', 'ngram_hashes', '[]'::jsonb)), 15) r
+--  ORDER BY s.n;
+-- ROLLBACK;
+--
+--   → 1 gemini-embedding-001  AAA 本模型  1.0000
+--     2 text-embedding-004    BBB 老模型  1.0000    (已下线的那个)
+--     3 no-such-model-xyz     (无命中)    0.0000     ← 这一行是重点
+--     4 (不带模型)            AAA 本模型  1.0000
+--
+-- ⚠️ ROLLBACK 之后**复查一遍**, 别不看返回值就当它干净了:
+--   SELECT count(*) FROM autowriter.draft_fingerprints
+--    WHERE project_id = 'dddddddd-dddd-dddd-dddd-dddddddddddd';   → 应为 0
+
+-- ── ③ 存量: 这个项目里有多少行的向量已经作废(需要 reembed) ───────────
+--   SELECT coalesce(embedding_model, '(来路不明)') AS model, count(*)
+--     FROM autowriter.draft_fingerprints
 --    WHERE project_id = '<uuid>' AND title_embedding IS NOT NULL
---    GROUP BY 1;
+--    GROUP BY 1 ORDER BY 2 DESC;
 --   → 除当前模型之外的每一组都要重算; NULL 那组是"来路不明", 同样要重算。
+--     跑 `python -m deskcore.cli reembed --project <uuid>` 即可 —— 它从 008
+--     这一版起会把这三类(没算过 / 来路不明 / 换了模型)一起挑出来。
