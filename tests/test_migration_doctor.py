@@ -236,6 +236,35 @@ def test_doctor_probes_every_incremental_migration():
         "core.migration_state 里加一条探测(或显式标 unprobeable 并写明怎么查)")
 
 
+def test_the_001_probe_column_actually_exists_on_every_table():
+    """探测取的那一列必须在 `migrations/001` 里真的建了。
+
+    ⚠️ **这条是抓到过真 bug 的。** 第一版探测写的是 ``.select("id")``，而
+    ``user_calibration_notes`` 的主键是 ``(project_id, user_id)`` ——
+    **它没有 id 列**。PostgREST 会报 `column "id" does not exist`，那句话正好被
+    ``store.rpc_missing`` 认成"迁移没跑"，于是在一个 `001` 明明跑过的库上报
+    `missing`，把人打发去重跑一遍迁移。这个探测器存在的全部意义就是不出这种错。
+
+    为什么假件没抓到：`FakeClient` 不校验列名（除非显式配 `missing_columns`），
+    所以那一版测试全绿。**验证手段本身也要被验证** —— 与审计 §0.5 那条"录音机
+    记得不够细，得到的绿是假的"是同一件事。所以这条断言不去问假件，去读真的 SQL。
+    """
+    sql = (REPO_ROOT / "migrations" / "001_deskcore.sql").read_text(encoding="utf-8")
+
+    for table in core._MIGRATION_001_TABLES:
+        m = re.search(
+            r"CREATE TABLE IF NOT EXISTS autowriter\." + table + r"\s*\((.*?)\n\);",
+            sql, re.S)
+        assert m, f"001 里找不到 {table} 的建表语句 —— 改名了就同步改这份清单"
+        body = m.group(1)
+        cols = {line.strip().split()[0] for line in body.splitlines()
+                if line.strip() and not line.strip().startswith(
+                    ("PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "CONSTRAINT", "--"))}
+        assert core._MIGRATION_001_PROBE_COLUMN in cols, (
+            f"{table} 没有 {core._MIGRATION_001_PROBE_COLUMN} 列, 探测会把一个"
+            f"跑过 001 的库误报成 missing。该表实际有的列: {sorted(cols)}")
+
+
 @pytest.mark.parametrize("doc", ["migrations/README.md", "docs/deskcore.md",
                                  "docs/deskcore-runbook.md"])
 def test_every_migration_is_listed_in_the_deployment_docs(doc):

@@ -1341,6 +1341,13 @@ _PROBE_NIL_UUID = "00000000-0000-0000-0000-000000000000"
 # 一定不等于任何一份 calibration_notes 的 md5(md5('') 是 d41d8c...)。
 _PROBE_IMPOSSIBLE_MD5 = "0" * 32
 
+# 001 建的四张表, 以及探它们用的那一列。四张表都有 ``project_id``(它们全都
+# 挂在项目下), 这不是巧合而是设计 —— 但**别把它当理所当然**: 见下面探测处的
+# 注释, 用 ``id`` 探的第一版在 user_calibration_notes 上就是错的。
+_MIGRATION_001_TABLES = ("angle_ledger", "draft_fingerprints",
+                         "user_calibration_notes", "style_edits")
+_MIGRATION_001_PROBE_COLUMN = "project_id"
+
 MIGRATION_UNPROBEABLE_SQL = (
     "select indexname from pg_indexes where schemaname='autowriter' "
     "and indexname='versions_item_version_uniq';"
@@ -1399,10 +1406,20 @@ def migration_state(client) -> dict:
                        "state": state, "note": note, "impact": impact})
 
     # ── 001: 四张表 + items.updated_at ──
-    for table in ("angle_ledger", "draft_fingerprints",
-                  "user_calibration_notes", "style_edits"):
+    #
+    # ⚠️ 取的列是 ``project_id`` 而不是 ``id``。``user_calibration_notes`` 的
+    # 主键是 ``(project_id, user_id)`` —— **它没有 id 列**。探一个不存在的列,
+    # PostgREST 报的是 `column "id" does not exist`, 而那句话正好被
+    # ``rpc_missing`` 认成"迁移没跑" —— 于是在一个 001 明明跑过的库上报 missing,
+    # 把人打发去重跑一遍迁移。这个探测器存在的全部意义就是不出这种错。
+    #
+    # 第一版就是 ``.select("id")``, 而假件不校验列名, 所以测试给了个假的绿 ——
+    # 与审计 §0.5 那条"录音机记得不够细, 得到的绿是假的"同一件事。现在
+    # ``tests/test_migration_doctor.py`` 会去 001 的 SQL 里核对这个列真的存在。
+    for table in _MIGRATION_001_TABLES:
         state, note = _probe_ok(
-            lambda t=table: client.table(t).select("id").limit(1).execute())
+            lambda t=table: client.table(t)
+            .select(_MIGRATION_001_PROBE_COLUMN).limit(1).execute())
         _add("001_deskcore.sql", f"表 {table}", state, note,
              "deskcore 整个不可用")
     state, note = _probe_ok(
