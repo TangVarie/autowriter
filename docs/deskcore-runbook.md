@@ -11,12 +11,13 @@
 
 ## 0. 一句话现状
 
-**代码齐、八个迁移全部跑进生产、服务已在 Railway 上线且四路查重信号全部到齐。
-剩最后一件：`draft_fingerprints` 还是 0 行——查重硬闸背后一条历史都没有。**
+**整条链路已经跑通并验证过**：八个迁移全部落库、服务在 Railway 上线、指纹库
+回填完 **3,678 行 / 44 个项目**、四路查重信号全部到齐。剩下的只有一件是**你要做**
+的——把 deskcore 挂到客户端（见 §2 第 3 步），不挂上去这一整套没人用。
 
-离线自测：260 条 pytest + selftest + 真 PostgreSQL 上的迁移叠加与 SQL/Python
-逐例比对，全绿。线上实测：`/health` 全绿、12 个工具都在、`check_drafts` 的
-`semantic_degraded` 为 `false`。
+离线自测：264 条 pytest + selftest + 真 PostgreSQL 上的迁移叠加与 SQL/Python
+逐例比对，全绿。线上实测：`/health` 全绿、12 个工具都在、`semantic_degraded`
+为 `false`、原样照搬 / 换皮 / 只搬正文后半段三种都被 reject。
 
 > ⚠️ **这一段的历史值得留着看**，它是本仓那条老毛病的活标本：
 >
@@ -27,9 +28,14 @@
 > - `007` 之后查重能跑了，但最贵的那一路是**哑的**：换掉下线的
 >   `text-embedding-004` 时才发现 `embedding_model` 这一列存在了几个月、
 >   **从来没有任何代码读过它**。→ `008`（见 §1.4）
+> - 换模型的修复本身又带出两个：回填时**一条空标题让整批 embedding 作废**
+>   （靠前一步刚补的日志才抓住）；修那条又把 `check_drafts` 的下推路径
+>   **打崩成 500**（判据只问下标越没越界、不问那一位有没有东西）。
 >
-> 三次都是同一个形态：**写着已经有了，实际没有，而且不报错。**
-> 每一次都是靠真跑一遍才暴露的，没有一次是读代码读出来的。
+> **五次都是同一个形态：写着已经有了，实际没有，而且不报错。**
+> 没有一次是读代码读出来的——全靠真打一次。最后两个尤其说明问题：一个是被
+> 前一个的修复抓住的，另一个是被**验证部署的探针**抓住的。
+> `/health` 全绿在这五次里**一次都没帮上忙**。
 
 ---
 
@@ -47,15 +53,15 @@
 TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence → 策展成经验卡 → 进书架；
 同时把本仓的人工审稿决定倒灌回 `prepublish_evaluations` 存档。**这条线不需要本仓管。**
 
-### 1.2 本仓（autowriter）——代码齐、schema 齐、服务在线、**指纹库还是空的**
+### 1.2 本仓（autowriter）——全部到位，只差挂到客户端
 
 | 部件 | 实测结果 |
 |---|---|
-| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **260 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
+| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **264 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
 | **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
 | **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、12 个工具都在、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
 | **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
-| ⚠️ `draft_fingerprints` | **仍是 0 行** ← **查重硬闸背后一条历史都没有**。这是当前唯一未完成的部署动作，见 §2 第 2 步 |
+| `draft_fingerprints` | ✅ **3,678 行 / 44 个项目**（2026-08-26 回填，见 §1.5）。当前模型 3,671 / 来路不明 0 / 别的模型 0 / 维度 min=max=768 / 重复 `version_id` 0 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
 | `memories` | 303 条 |
 | ⚠️ `memories.severity` | **303 条全是 `soft`，`hard` = 0** |
@@ -165,6 +171,48 @@ Python 侧都是拿 `title_embedding IS NOT NULL` 当"可比"。
 > 项目数 61 不变、`draft_fingerprints` 仍是 0 行。**完整的可重跑查询写在
 > `migrations/008_embedding_model_isolation.sql` 末尾**——它只存在于这次对话里
 > 的话，下一个环境等于没有。
+
+### 1.5 指纹库回填记录（2026-08-26）
+
+只回填了**有实质调教痕迹的两个 owner**——按"调教笔记 + 记忆规则 + 人工决策 + 反馈"
+四个维度筛，不按 items 总量：
+
+| owner | 项目 | 有笔记的项目 | 笔记字数 | 记忆 | items | 已标注 | 人工决策 | 反馈 | 跑了吗 |
+|---|---|---|---|---|---|---|---|---|---|
+| `85f5f888` | 29 | **15** | **16,591** | **152** | 3,385 | 73 | 343 | 17 | ✅ |
+| `afbaf84e` | 20 | 4 | 4,989 | **139** | 667 | 42 | **206** | **40** | ✅ |
+| `b907ec9d` | 6 | 3 | 1,630 | 11 | 504 | 2 | 34 | 2 | ❌ 太薄 |
+| 另外三个 | 6 | ≤1 | ≤460 | ≤1 | 18 | ≤1 | ≤3 | 0 | ❌ 全零 |
+
+> ⚠️ **`afbaf84e` 只看 items 总量会被漏掉**：它的 items 只有 `85f5f888` 的五分之一，
+> 但记忆 139 条几乎持平、人工决策 206 条、**反馈 40 条比对方的 17 条还多**。
+> 按密度算它是调教最扎实的一个。筛选口径用错维度，就会把最该回填的那个丢掉。
+
+**库那侧核过的形状**（不是看脚本自报的数）：
+
+```
+3,678 行 / 44 个项目
+当前模型 3,671   来路不明 0   别的模型 0
+向量维度 min = max = 768
+重复 version_id 0        ← 中途掐断重跑过, 幂等没破
+没有向量 7 条            ← 全部是标题为空的历史脏数据
+```
+
+**端到端（在 385 条历史的项目上，1.3–2 秒返回）**：
+
+| 场景 | 判定 | 由哪路抓住 |
+|---|---|---|
+| 原样照搬 | **reject** | 开头精确 |
+| 换皮（标题全改·正文原样） | **reject** | 开头精确（标题语义 0.88） |
+| 只搬正文后半段（开头也不同） | **reject** | **四字串 J=0.498** |
+| 无关新稿（对照组） | **pass** | J=0.003 / 包含度 0.01 |
+
+第三行是关键：开头和标题都改了，**只有四字串那一路抓住它**——四路信号各自在
+发言，不是靠一路撑着。
+
+⚠️ **回填过程中撞出两个 bug，都已修**（见 §0 那条时间线的最后一项）：一条空标题
+让整批 embedding 作废；修那条又把 `check_drafts` 的下推路径打崩成 500。前者靠日志
+抓住，后者靠"验证部署有没有生效"的探针抓住。
 
 **`003` 是唯一改数据的一个**，所以单独记：
 
@@ -373,7 +421,9 @@ curl -sS -X POST "$DESKCORE_URL/tool/borrow_lessons" \
 # embedding 真的取得到 —— 看 backfill 的返回, 见第 2 步
 ```
 
-### 第 2 步 · 回填历史指纹（**不做等于没上查重**）
+### 第 2 步 · 回填历史指纹 ✅ **已完成（2026-08-26，见 §1.5）**
+
+> 当前生产库这一步已经做完了。下面这段留着是给**下一套库**用的——口径、坑和验证方式都在这儿。
 
 ```bash
 python -m deskcore.cli backfill --project <uuid>    # 每个项目跑一次
@@ -451,8 +501,19 @@ WorkBuddy，项目级 `mcp.json`：
                              "headers": {"X-Deskcore-Key": "k-xxx"}}}}
 ```
 
-skill：把本仓 `skills/bywood-writing-desk/SKILL.md` 复制到
-`~/.workbuddy/skills/bywood-writing-desk/SKILL.md`。CodeBuddy 放 `.codebuddy/skills/`。
+**skill：从本仓直接装，别手工复制。**
+
+```
+TangVarie/autowriter → skills/bywood-writing-desk
+```
+
+WorkBuddy 支持从 GitHub 装 skill，用这条。手工复制那份**会悄悄过期**——skill
+改了之后没有任何东西提醒你去同步，而它管的是流程纪律（必须先 `open_project`、
+`p0` 原样带进上下文、`check_drafts` 判 reject 的不许交付），过期的代价是模型
+按老规矩写而没人发现。**又是同一种病，这次不给它机会。**
+
+（CodeBuddy 的 skill 目录是 `.codebuddy/skills/`；它要是不支持从仓库装，那份
+拷贝就要自己记着同步。）
 
 ### 第 3.5 步 · 飞书表先建好那六个 lineage 列（**只影响交付那一段**）
 
