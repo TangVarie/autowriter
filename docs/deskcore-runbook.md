@@ -11,17 +11,25 @@
 
 ## 0. 一句话现状
 
-**代码全写完了、离线自测通过（216 条 pytest + selftest + 真 PostgreSQL 上的迁移与
-SQL/Python 逐例比对全绿）。**六个迁移已于 2026-08-26 全部跑进生产库**。但服务
-还没部署，四张新表仍然全是 0 行——所以整条链路一次都没真跑过。**
+**代码齐、八个迁移全部跑进生产、服务已在 Railway 上线且四路查重信号全部到齐。
+剩最后一件：`draft_fingerprints` 还是 0 行——查重硬闸背后一条历史都没有。**
 
-> ⚠️ **这一段 2026-08-23 版写的是"schema 也上了生产"。那是错的**——08-26 实测
-> 时只有 `001`，另外五个一个都没跑。修这条的同时补了
-> `python -m deskcore.cli doctor`，以后不必再手写 SQL 去问这个问题。
+离线自测：260 条 pytest + selftest + 真 PostgreSQL 上的迁移叠加与 SQL/Python
+逐例比对，全绿。线上实测：`/health` 全绿、12 个工具都在、`check_drafts` 的
+`semantic_degraded` 为 `false`。
+
+> ⚠️ **这一段的历史值得留着看**，它是本仓那条老毛病的活标本：
 >
-> **同日已按 `006 → 002 → 003 → 004 → 005` 的顺序补齐**（见 §1.3）。`006` 提前
-> 是因为它不跑是硬失败：`db.update_item_status` 无条件写 `decision_source` /
-> `reviewer_id` / `decided_at`，缺列会让现有工作台的「通过 / 打回」当场报错。
+> - 2026-08-23 版写的是"schema 也上了生产"。**那是错的**——08-26 实测时只有
+>   `001`，另外五个一个都没跑。修这条的同时补了 `deskcore.cli doctor`。
+> - 补齐六个之后服务仍然除 `list_projects` 外全挂在 `42501`：`001` 建的四张表
+>   **一行 `GRANT` 都没有**，而 `/health` 照样全绿。→ `007`（见 §1.3）
+> - `007` 之后查重能跑了，但最贵的那一路是**哑的**：换掉下线的
+>   `text-embedding-004` 时才发现 `embedding_model` 这一列存在了几个月、
+>   **从来没有任何代码读过它**。→ `008`（见 §1.4）
+>
+> 三次都是同一个形态：**写着已经有了，实际没有，而且不报错。**
+> 每一次都是靠真跑一遍才暴露的，没有一次是读代码读出来的。
 
 ---
 
@@ -39,14 +47,15 @@ SQL/Python 逐例比对全绿）。**六个迁移已于 2026-08-26 全部跑进�
 TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence → 策展成经验卡 → 进书架；
 同时把本仓的人工审稿决定倒灌回 `prepublish_evaluations` 存档。**这条线不需要本仓管。**
 
-### 1.2 本仓（autowriter）——代码齐、库是空的
+### 1.2 本仓（autowriter）——代码齐、schema 齐、服务在线、**指纹库还是空的**
 
 | 部件 | 实测结果 |
 |---|---|
-| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **237 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 六个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
-| **schema** | ✅ 七个迁移**已全部跑进生产**（2026-08-26，见 §1.3） |
-| **服务部署** | ❌ **没有**。两个仓里搜不到任何 deskcore 的线上地址 |
-| `draft_fingerprints` | **0 行** ← 查重硬闸背后一条历史都没有 |
+| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **260 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
+| **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
+| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、12 个工具都在、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
+| **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
+| ⚠️ `draft_fingerprints` | **仍是 0 行** ← **查重硬闸背后一条历史都没有**。这是当前唯一未完成的部署动作，见 §2 第 2 步 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
 | `memories` | 303 条 |
 | ⚠️ `memories.severity` | **303 条全是 `soft`，`hard` = 0** |
@@ -79,10 +88,16 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
   都没有。`service_role` **绕过 RLS，但不绕过表级 `GRANT`**——两套独立机制。它在
   `public` 下看着无所不能，靠的是 Supabase 给 `public` 配的 default privileges；
   `autowriter` 是本仓自建 schema，**没有**这份默认授权。
-- 同一次排查还翻出 `calibration_note_audit` 也不在基线的授权名单里。现存库看不
-  出来（那张表建于 Supabase 授权口径变更之前，带着历史 `GRANT`），坏的只有**新
-  开的库**——而 `db.log_calibration_audit` 的写入是 `except: pass`，表现是调教
-  笔记的审计流水**静默地一条都不留**。已在 `000_baseline.sql` 补上，现存库无需修。
+- 同一次排查还翻出 `calibration_note_audit` 也不在基线的授权名单里——而
+  `db.log_calibration_audit` 的写入是 `except: pass`，表现是调教笔记的审计流水
+  **静默地一条都不留**。
+  > ⚠️ 我当时判断"现存库带着历史 `GRANT`，所以只补基线就行"。**那是从一个库
+  > 推出来的结论，错了**（codex 在 aw#65 上指出）：任何在 Supabase 授权口径变更
+  > **之后**用旧版基线开出来的库都缺这份授权，而它们升级走的是增量、不重跑基线。
+  > 现在 `000_baseline.sql` 和 `007` 两边都补了。
+  >
+  > 顺带按 `user_logins` 的先例收成 append-only（`authenticated` 只给
+  > `SELECT + INSERT`）——能被改写或删除的流水，回答不了"这条观察为什么变了"。
 - 补了两道守卫，免得靠人肉 `curl` 才发现下一个：`tests/sql_parity_check.py` 断言
   **`autowriter` 下每一张表都必须对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**
   （断不变量而不是名单）；`doctor` 把 `42501` 单独报成 `denied` 而不是混进
@@ -112,6 +127,44 @@ Python 侧都是拿 `title_embedding IS NOT NULL` 当"可比"。
 
 > ⚠️ **当前生产库不受影响**：`draft_fingerprints` 是 **0 行**、`versions.embedding`
 > 非空 **0 条**，没有任何存量向量。这一整套是为"下一次换模型"和别的环境准备的。
+
+**落库记录（2026-08-26，记为 `aw_008_embedding_model_isolation`）**——`008` 是
+`CREATE OR REPLACE`，签名与返回列一个字都没动，所以**跑没跑过从调用侧完全看不出来**，
+验证只能查函数体：
+
+| 验什么 | 结果 |
+|---|---|
+| 函数体里真有那句过滤（**剥掉注释再查**） | ✅ `(_model IS NULL OR f.embedding_model = _model)` |
+| 用的不是 `IS NOT DISTINCT FROM` | ✅ 代码里没有 |
+| 会从 `_rows` 里读模型名 | ✅ `_model := NULLIF(r->>'embedding_model', '')` |
+| 签名没变、无重载残留 | ✅ 只有一个 `(uuid,jsonb,integer)` |
+| `STABLE` / `search_path` 固定 / 只授 `service_role` | ✅ 三项都对（`anon` / `authenticated` 均 false） |
+
+> ⚠️ **"剥掉注释再查"不是讲究，是踩过的坑。** 第一遍直接 `prosrc LIKE
+> '%IS NOT DISTINCT FROM%'` 报了 `true`，吓一跳——其实是**解释"为什么不用这个
+> 操作符"的注释**里出现了那句话。本地那条同名断言也在同一处被自己打红过。
+> 查函数体的断言一律先 `regexp_replace(ln, '--.*$', '')`。
+
+**还在真 pgvector 上做了一次功能验证**，因为这一块**所有自动化测试都覆盖不到**——
+`tests/sql_parity_check.py` 把 pgvector shim 成了 text 域（见该文件头），单元测试
+用的是假件。做法：造三条**向量完全相同**、只有 `embedding_model` 不同的历史指纹，
+所以余弦都是 `1.0`，**命中谁只可能由模型过滤决定**：
+
+| 送什么模型 | 命中 | `best_sim` |
+|---|---|---|
+| `gemini-embedding-001` | AAA 本模型 | 1.0000 |
+| `text-embedding-004` | BBB 老模型 | 1.0000 |
+| `no-such-model-xyz` | **（无命中）** | **0.0000** |
+| 不带模型（兼容路径） | AAA 本模型 | 1.0000 |
+
+> ⚠️ **只跑第一行是不够的**，我差点就收工了：三条余弦都是 1.0，"命中本模型的行"
+> 也可能只是标题排序碰巧。第 2 行（换模型就换命中）证明它是**按模型选**而不是
+> 按标题选；第 3 行（送一个不存在的模型 → 一条都不命中）是决定性的那条。
+>
+> 整个夹具包在 `BEGIN … ROLLBACK` 里，生产库一行都不留；跑完复查过
+> 项目数 61 不变、`draft_fingerprints` 仍是 0 行。**完整的可重跑查询写在
+> `migrations/008_embedding_model_isolation.sql` 末尾**——它只存在于这次对话里
+> 的话，下一个环境等于没有。
 
 **`003` 是唯一改数据的一个**，所以单独记：
 
@@ -162,7 +215,7 @@ owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
 
 ## 2. 上线五步（顺序不能换）
 
-### 第 0 步 · 补齐迁移 ✅ **已完成（2026-08-26，见 §1.3）**
+### 第 0 步 · 补齐迁移 ✅ **已完成（2026-08-26，见 §1.3 / §1.4）**
 
 > 这一步在当前生产库上已经做完了。**下面这段留着不是历史记录，是给下一套库
 > （branch 库、新环境、灾备重建）用的** —— 顺序和坑都在这儿。
@@ -235,7 +288,7 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 > 打 `POST /tool/{name}`。但**这验不了 WorkBuddy 的协议**——那需要一个
 > WorkBuddy 够得着的公网地址。
 
-### 第 1 步 · 部署 deskcore service
+### 第 1 步 · 部署 deskcore service ✅ **已完成（2026-08-26，Railway）**
 
 新建一个 Railway service（与 `worker.py` 同级的独立 service），config 指
 `deskcore/railway.json`。
