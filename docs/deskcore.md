@@ -370,7 +370,7 @@ curl -sS -X POST "$DESKCORE_URL/tool/list_projects" \
 }
 ```
 
-skill 放 `~/.workbuddy/skills/bywood-writing-desk/SKILL.md`（本仓 `skills/` 下直接复制）。
+skill 从本仓直接装：`TangVarie/autowriter → skills/bywood-writing-desk`（WorkBuddy 支持从 GitHub 装）。**别手工复制**——拷贝出去的那份改了没人提醒，而它管的是流程纪律，过期了模型会按老规矩写而没人发现。
 
 > ⚠️ **鉴权头的退路**：WorkBuddy 的 HTTP MCP 能不能配自定义 header，官方更新日志只说了支持 HTTP MCP 和 OAuth（v4.7.3），没有权威文档。所以 key **三种传法都收**，但**优先级不同**：
 >
