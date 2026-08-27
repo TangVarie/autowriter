@@ -2581,6 +2581,30 @@ jobs:
           bad = c.post("/mcp", json=INIT, headers={**H, "X-Deskcore-Key": "nope"})
           assert bad.status_code == 401, f"错 key 打 /mcp 不是 401: {bad.status_code}"
           print("  ✓ 错 key 打 /mcp → 401(鉴权在 MCP 之前生效)")
+
+          # ── 浏览器侧客户端: CORS 预检 ────────────────────────────────────
+          # 上面那两条(lifespan / 421)的**同族第三个**: initialize 用 curl 和
+          # TestClient 都能过, 而任何在浏览器 / Electron 渲染层里发请求的 MCP
+          # 客户端一个都连不上, 报的还是 `fetch failed` 这种传输层错误 ——
+          # 服务端零痕迹, /health 依旧全绿。
+          # 预检【按规范就不带自定义头】, 所以它不带 key; 拿它去过鉴权必然 401。
+          pre = c.options("/mcp", headers={
+              "Origin": "http://localhost:5173",
+              "Access-Control-Request-Method": "POST",
+              "Access-Control-Request-Headers": "content-type,x-deskcore-key"})
+          assert pre.status_code < 400, (
+              f"CORS 预检 {pre.status_code} —— 浏览器侧客户端会报 fetch failed")
+          _acao = pre.headers.get("access-control-allow-origin", "")
+          assert _acao in ("*", "http://localhost:5173"), f"预检没回 allow-origin: {_acao!r}"
+          _ach = pre.headers.get("access-control-allow-headers", "").lower()
+          assert "*" in _ach or "x-deskcore-key" in _ach, f"key 头不被允许: {_ach!r}"
+          # 401 自己也必须带 CORS 头, 否则客户端连"这是鉴权问题"都读不到,
+          # 拿到的还是 fetch failed —— CORS 装在鉴权里面就等于没装。
+          assert bad.headers.get("access-control-allow-origin") or \
+              c.post("/mcp", json=INIT, headers={"Origin": "http://localhost:5173"}
+                     ).headers.get("access-control-allow-origin"), \
+              "401 上没有 allow-origin —— CORS 中间件装在鉴权里面了"
+          print("  ✓ CORS 预检通过, 且 401 也带 CORS 头(浏览器侧读得到)")
           _stack.close()
           print("\ndeskcore app 冒烟: PASS")
           PY

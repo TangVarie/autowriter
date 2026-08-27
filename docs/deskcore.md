@@ -254,6 +254,7 @@ env：
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `borrow_lessons` 返回空 |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
+| `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
 
 > ⚠️ **不需要 `ANTHROPIC_API_KEY` / `DESKCORE_MODEL`。** deskcore 一次 LLM 调用都没有——调校笔记的蒸馏交给调用方模型做（`record_edit` 出材料 → 模型提炼 → `save_my_style` 写回）。
 >
@@ -386,7 +387,7 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
 ---
 
-## 5. ⚠️ 三个已经踩过的坑，别再踩
+## 5. ⚠️ 已经踩过的坑，别再踩
 
 **1. `AW_DISABLE_ST_CACHE`（R-042）。** deskcore 是 headless 进程，但 streamlit 在同一份 requirements 里装着，`db.py` 的缓存 shim 会走真 `st.cache_data` —— 跨进程缓存无法被 app 的 `.clear()` 失效，用户在 UI 改完记忆后 deskcore 会拿 30-60s 的旧数据。`deskcore/__init__.py` 已经在 import db 之前 setdefault 这个 env（同 `worker.py:56`）。**别在 `__init__` 之前 import db。**
 
@@ -407,6 +408,18 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 超时按不健康报，但 note 里会写明**是超时而不是连不上** —— 这是两种完全不同的排查方向：前者是连接池耗尽 / 网络黑洞，后者是配置或凭据。
 
 **4. `user_id` 必须用库里已有的 UUID。** 不要新造。TV `autowriter-migrations/RUNBOOK.md:150-153` 记过：写了 service account 的 UUID 导致 RLS 屏蔽、`list_example_items` 永远 0 行、飞轮静默断开，查了很久。配 `DESKCORE_KEYS` 时从 `projects.owner_id` / `items.user_id` 里查出来抄。
+
+**5. 浏览器侧的客户端要 CORS，而所有手工验证都绕开了它（2026-08-27）。** 第一次真的往 WorkBuddy 上挂，报的是 `streamableHttp connect failed: fetch failed`。两个独立的毛病：
+
+**5a. 一行 CORS 头都没发。** 浏览器/Electron 渲染层在发带自定义头的请求前会先发 `OPTIONS` 预检，而预检**按规范就不带任何自定义头**，也就不带 `X-Deskcore-Key` → 一头撞进鉴权中间件 → 401。浏览器对「预检没通过」的报法是 `TypeError: fetch failed`，**不是 401**，客户端那头完全看不出是鉴权的事。
+
+之所以一直没发现：curl 不做预检、浏览器地址栏打 `/health` 是同源导航也不做预检、CI 的冒烟测试用 TestClient 直接发 `initialize` 同样不做预检——**每一条验证路径都是绿的，而真实客户端一个都连不上**。又是那个老病的新形态。
+
+`CORSMiddleware` **必须注册在鉴权中间件之后**（Starlette 里最后注册的跑在最外层）。装在里面等于没装：唯一会被拦的请求（401）恰恰是最需要被客户端读到的那个。`allow_credentials` 必须是 `False`——开了它浏览器就**拒绝**通配的 `Access-Control-Allow-Origin`，两者不能同时要。
+
+**5b. `/mcp` 不带斜杠每次先吃一个 307。** `Mount("/mcp")` 的正则是 `^/mcp(?P<path>/.*)$`，光秃秃的 `/mcp` 匹配不上，落到 `redirect_slashes` 兜底跳 `/mcp/`。而文档和给客户端的地址写的全是不带斜杠的那个。平时看不出来是因为验证用的东西**都自动跟随重定向**；跨源时这一跳要重新预检，各家实现处理不一致，失败报法同样是 `fetch failed`。已用一个纯 ASGI 中间件就地改写掉（**不用** `BaseHTTPMiddleware`——它会把响应体收进内存，对流式响应有害）。
+
+`/health` 现在回显 `mcp_allowed_origins` / `mcp_allowed_hosts`。代码注释里原本就写着"会回显"，**而实际上没有**——写了但没实现，一并补上。
 
 ---
 
