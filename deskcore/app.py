@@ -28,7 +28,10 @@
              持 service_role 绕 RLS, 匿名放行等于开放全部租户数据。本地开发
              要免 key 跑, 显式设 DESKCORE_ALLOW_ANONYMOUS=1。
           LIBRARIAN_URL / LIBRARIAN_API_KEY          借爆款经验卡; 不设则跳过
-          DESKCORE_ALLOWED_HOSTS  可选, 逗号分隔; 设了才开 MCP 的 Host 校验
+          DESKCORE_ALLOWED_HOSTS    可选, 逗号分隔; 设了才开 MCP 的 Host 校验
+          DESKCORE_ALLOWED_ORIGINS  可选, 逗号分隔的完整 origin; 不设 = 允许全部。
+             放开是安全的: 身份靠显式传的 key, 从不靠 cookie, 浏览器不会自动
+             附上 —— 没有 CSRF 面。见 CORS 那段。
           ⚠️ 【不需要】ANTHROPIC_API_KEY / DESKCORE_MODEL —— deskcore 不调 LLM,
              推理全部归调用方模型。见 core.py 里"故意没有 resolve_model"那段。
   见 deskcore/railway.json。
@@ -48,6 +51,7 @@ import anyio
 import anyio.to_thread
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from . import core, identity, tools, vocab
@@ -149,6 +153,96 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     finally:
         _caller.reset(token)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# /mcp 不带斜杠时不许再走一次 307
+# ══════════════════════════════════════════════════════════════════════
+# app.mount("/mcp", ...) 建的 Mount 正则是 ``^/mcp(?P<path>/.*)$`` —— 光秃秃
+# 的 ``/mcp`` **匹配不上**, 于是落到 Starlette 的 redirect_slashes 兜底:
+# 307 跳到 /mcp/。而文档、CI、以及给 WorkBuddy / Claude Code 的地址写的都是
+# 不带斜杠的 /mcp, 也就是说**每一个 MCP 请求都要先吃一跳**。
+#
+# 平时看不出来是因为验证用的东西都自动跟随重定向(curl -L、TestClient、
+# httpx 默认)。但跨源时这一跳是独立的一条失败路径: 预检是针对 /mcp 做的,
+# 跳到 /mcp/ 之后按 Fetch 规范要重新预检, 各家实现对"预检过的请求能不能跟
+# 重定向"处理并不一致 —— 失败的报法同样是 fetch failed, 同样零痕迹。
+#
+# 写成**纯 ASGI** 中间件而不是 @app.middleware("http"): 后者是
+# BaseHTTPMiddleware, 会把响应体收进内存再吐出去, 对 MCP 的 SSE 流是有害的。
+# 这里只改 scope 里的一个字符串, 不碰 receive/send。
+class _NormalizeMcpPath:
+    """把 ``/mcp`` 就地改写成 ``/mcp/``, 让它直接命中 Mount 而不是先 307。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path") == "/mcp":
+            scope = dict(scope)
+            scope["path"] = "/mcp/"
+            if scope.get("raw_path"):
+                # raw_path 若留着旧值, 下游按它重建 URL 时会与 path 打架。
+                scope["raw_path"] = b"/mcp/"
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_NormalizeMcpPath)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CORS —— 必须注册在以上所有中间件【之后】(它要在最外层)
+# ══════════════════════════════════════════════════════════════════════
+# ⚠️ 顺序不是风格问题, 是这段能不能起作用的全部。Starlette 的
+# ``add_middleware`` 是 ``insert(0, ...)``, 构建时又 reversed 着往外裹 ——
+# **最后注册的跑在最外层**。CORS 必须在最外层, 因为浏览器的预检
+# (OPTIONS)【按规范就是不带任何自定义头的】, 也就不带 X-Deskcore-Key。
+# 它要是先撞上 auth_middleware, 拿到的是 401, 而浏览器对"预检没通过"的
+# 报法是 **fetch failed / TypeError**, 不是 401 ——
+# 客户端那头看到的是一个传输层错误, 完全看不出是鉴权的事。
+#
+# 这个洞之前一直看不见, 因为**手工验证全部绕开了 CORS**: curl 不做预检,
+# 浏览器地址栏直接打 /health 是同源导航也不做预检, REST 的 /tool/{name}
+# 自测同样是 curl。于是 /health 全绿、curl 全绿, 而任何在浏览器/Electron
+# 渲染层里发请求的 MCP 客户端【一个都连不上】。又是同一种病:
+# "部署显示健康、功能整个不可用"(见 _lifespan 与 _register_mcp 里的两处)。
+#
+# allow_credentials 必须是 False:
+#   · 本服务的身份靠**显式传的 key**(header 或 ?key=), 从不靠 cookie。
+#     浏览器不会自动附上 key, 所以恶意页面即使能发起请求也拿不到任何东西
+#     —— 没有 CSRF 面, 放开 origin 是安全的。
+#   · 而且开了 credentials 时浏览器【拒绝】通配的 Access-Control-Allow-Origin,
+#     两者不能同时要。
+# 要收紧就配 DESKCORE_ALLOWED_ORIGINS(逗号分隔的完整 origin,
+# 形如 https://app.example.com)。当前生效值 /health 会回显。
+_ALLOWED_ORIGINS = [o.strip() for o in
+                    (os.environ.get("DESKCORE_ALLOWED_ORIGINS") or "").split(",")
+                    if o.strip()] or ["*"]
+
+# MCP 传输层的 Host 白名单(DNS rebinding 保护), 与上面的 CORS origin 是两码事:
+# 这个看的是请求的 Host 头, CORS 看的是 Origin 头。留在这儿是为了让 /health
+# 能回显 —— 见 _register_mcp 里那段说明, 白名单配错的表现是 421。
+_ALLOWED_HOSTS = [h.strip() for h in
+                  (os.environ.get("DESKCORE_ALLOWED_HOSTS") or "").split(",")
+                  if h.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=False,
+    # MCP 的 streamable HTTP 三个动词都用得到: POST 发消息, GET 开事件流,
+    # DELETE 拆会话。少写一个的表现同样是预检失败 → fetch failed。
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    # 放开而不是逐个列: 客户端实际会带 X-Deskcore-Key / Authorization /
+    # Content-Type / Accept / Mcp-Session-Id / MCP-Protocol-Version /
+    # Last-Event-ID, 而这份名单会随 MCP 协议版本变。credentials 已关,
+    # 通配没有额外风险; 漏列一个的代价却是整条连不上且报成传输错。
+    allow_headers=["*"],
+    # 跨源时浏览器默认只让 JS 读到六个"安全"响应头, 会话 ID 必须显式暴露,
+    # 否则有状态模式下客户端拿不到 Mcp-Session-Id, 第二个请求就掉线。
+    expose_headers=["Mcp-Session-Id", "MCP-Protocol-Version"],
+    max_age=600,
+)
 
 
 # /health 专用的线程额度(审计 ROB-004)。
@@ -319,6 +413,13 @@ async def _collect_health() -> dict:
             # 反映 ok 的, 用 ``/ready`` —— 它不 ready 时返 503。
             "auth": {"ok": auth_ok, "note": auth_note},
             "anonymous_allowed": identity.anonymous_allowed(),
+            # 这两条口径配错时的表现都是【客户端侧的传输层错误】, 服务端不留
+            # 任何痕迹: origin 不在名单 → 浏览器报 fetch failed; host 不在名单
+            # → 421 Misdirected Request。回显出来才能当场对着排, 否则只能靠猜。
+            # (_register_mcp 里那句"/health 会回显当前生效的口径"以前是**假的**
+            # —— 写了但没实现, 又是一次"说有其实没有"。现在补上。)
+            "mcp_allowed_origins": _ALLOWED_ORIGINS,
+            "mcp_allowed_hosts": _ALLOWED_HOSTS or "(不校验)",
             "st_cache_disabled": os.environ.get("AW_DISABLE_ST_CACHE"),
         },
     }
@@ -444,8 +545,7 @@ def _register_mcp():
     # /health 会回显当前生效的口径。
     from mcp.server.transport_security import TransportSecuritySettings
 
-    allowed = [h.strip() for h in
-               (os.environ.get("DESKCORE_ALLOWED_HOSTS") or "").split(",") if h.strip()]
+    allowed = _ALLOWED_HOSTS
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=bool(allowed),
         allowed_hosts=allowed,

@@ -360,8 +360,13 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 | `GOOGLE_API_KEY` | 强烈建议 | 没有的话查重降级成纯确定性，同角度换说法的标题会漏 |
 | `LIBRARIAN_URL` | 建议 | `https://truth-vault-production.up.railway.app`（已验活） |
 | `LIBRARIAN_API_KEY` | 建议 | = TV librarian 那把 key |
-| `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔；设了才开 MCP 的 Host 校验 |
+| `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔；设了才开 MCP 的 Host 校验。配错的表现是 **421**，看着像客户端的问题 |
+| `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。**不设 = 允许全部，这是安全的**：身份靠显式传的 key、从不靠 cookie，浏览器不会自动附上，所以没有 CSRF 面。配错的表现是客户端 **`fetch failed`**，服务端零痕迹 |
 | `DESKCORE_ALLOW_ANONYMOUS` | ⛔ 仅本地 | 设 `1` 才允许免 key 访问。**生产绝不能设** —— service_role 绕 RLS，匿名 = 全租户数据开放 |
+
+> 上面两条口径 `/health` 的 `config` 里会回显（`mcp_allowed_origins` /
+> `mcp_allowed_hosts`）。这不是可有可无的排查便利：它俩配错时**服务端一行日志
+> 都不会有**，报错全在客户端那头，而且报的是传输层错误。回显出来才对得上。
 
 `DESKCORE_KEYS` 格式（**一人一把**，key 映射成 `user_id`，这是"个人风格私有"的前提）：
 
@@ -525,6 +530,40 @@ WorkBuddy 支持从 GitHub 装 skill，用这条。手工复制那份**会悄悄
 
 （CodeBuddy 的 skill 目录是 `.codebuddy/skills/`；它要是不支持从仓库装，那份
 拷贝就要自己记着同步。）
+
+#### 连不上时按这个顺序查
+
+客户端报的错基本分两类，**先分清是哪一类再动手**：
+
+| 客户端报什么 | 说明什么 | 怎么办 |
+|---|---|---|
+| `401 missing X-Deskcore-Key` | 请求到了服务器，只是没带 key | header 没生效 → 换 `Authorization: Bearer k-xxx`，再不行用 `<url>/mcp?key=k-xxx` |
+| `401 invalid X-Deskcore-Key` | key 抄错，或不在 `DESKCORE_KEYS` 里 | 对着 `/health` 的 `auth.note` 数一下几把 key |
+| 返回空列表（不报错） | key 通了但 `user_id` 配错 | 必须是库里已有的 `projects.owner_id`，编的 UUID **不报错只返空** |
+| `fetch failed` / `TypeError` | **请求根本没到服务器**，或到了但浏览器不让读 | 见下 |
+| `421 Misdirected Request` | `DESKCORE_ALLOWED_HOSTS` 配了但没包含线上域名 | 对着 `/health` 的 `mcp_allowed_hosts` 改 |
+
+`fetch failed` 这一类要先把「机器出不去」和「CORS」分开，一条命令就够：
+
+```bash
+curl -i https://<你的>/mcp        # 期望: 401 + {"detail":"missing X-Deskcore-Key"}
+```
+
+- **拿到 401** → 机器到服务器是通的，问题在 CORS 或客户端配置
+- **超时 / 证书错 / 连不上** → 是本地网络或代理，跟本服务无关
+
+确认是 CORS 那一路的话，再打一次**预检**（浏览器在真请求之前发的那个）：
+
+```bash
+curl -i -X OPTIONS https://<你的>/mcp \
+  -H "Origin: http://localhost" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: content-type,x-deskcore-key"
+```
+
+必须看到 `access-control-allow-origin`。**看不到就是服务端的问题，不是客户端的**
+——预检按规范就不带自定义头，所以它不带 key；这一层要是被鉴权拦掉，客户端
+只会看到一个传输层错误，完全看不出是鉴权的事。详见 §5.7。
 
 ### 第 3.5 步 · 飞书表先建好那六个 lineage 列（**只影响交付那一段**）
 
@@ -813,6 +852,66 @@ PostgREST 原话）。**两边都不会有任何东西提醒他漏了**——又
 `column "decision_source" ... does not exist`，点「通过」的人看到那句完全不知道
 该做什么）。**刻意不降级**：去掉三列重试一次就等于让机器判定继续伪装成人工反馈
 去污染 TV 的评估模型，正是 COR-004 要治的那件事。
+
+### 5.7 浏览器侧的 MCP 客户端一个都连不上（2026-08-27，已修）
+
+第一次真的往 WorkBuddy 上挂就炸了，报的是：
+
+```
+streamableHttp connect failed: fetch failed
+sse connect failed: sse connect timed out after 12000ms
+```
+
+**SSE 那条可以忽略**——服务端是 `stateless_http=True`，压根没有老的 SSE 端点，
+客户端两种传输都试是正常行为。真正的问题是 `fetch failed`。查出来是**两个**
+独立的毛病，都属于本仓那个老病：*部署显示健康、curl 全绿、功能整个不可用*。
+
+**一、整个服务一行 CORS 头都不发。**
+
+浏览器/Electron 渲染层在发带自定义头的请求前，会先发一个 `OPTIONS` 预检。
+预检**按规范就不带任何自定义头**，也就不带 `X-Deskcore-Key`——于是它一头撞进
+鉴权中间件，拿到 401。而浏览器对「预检没通过」的报法是 `TypeError: fetch
+failed`，**不是 401**。客户端那头看到的是一个传输层错误，怎么查都查不到鉴权
+上去。
+
+为什么一直没发现：**所有手工验证都绕开了 CORS**。curl 不做预检；浏览器地址栏
+直接打 `/health` 是同源导航，也不做预检；REST 的 `/tool/{name}` 自测同样是
+curl；CI 的冒烟测试用 TestClient 直接发 `initialize`，也不做预检。于是每一条
+验证路径都是绿的，而真实客户端一个都连不上。
+
+修法是加 `CORSMiddleware`，**必须注册在鉴权中间件之后**——Starlette 里最后注册
+的跑在最外层，装在里面等于没装：唯一会被拦的请求（401）恰恰是最需要被客户端
+读到的那个。`allow_credentials` 必须是 `False`：本服务的身份靠显式传的 key、
+从不靠 cookie，浏览器不会自动附上，所以放开 origin 没有 CSRF 面；而且开了
+credentials 时浏览器**拒绝**通配的 `Access-Control-Allow-Origin`，两者不能同时要。
+
+**二、`/mcp` 不带斜杠时每次都先吃一个 307。**
+
+`app.mount("/mcp", ...)` 建的 `Mount` 正则是 `^/mcp(?P<path>/.*)$`，光秃秃的
+`/mcp` **匹配不上**，落到 Starlette 的 `redirect_slashes` 兜底：307 跳到 `/mcp/`。
+而文档、CI、给客户端的地址写的全都是不带斜杠的那个。
+
+平时看不出来，是因为验证用的东西**都自动跟随重定向**（`curl -L`、TestClient、
+httpx 默认）。跨源时这一跳是独立的失败路径：预检是针对 `/mcp` 做的，跳到
+`/mcp/` 后按 Fetch 规范要重新预检，各家实现对「预检过的请求能不能跟重定向」
+处理并不一致——失败的报法同样是 `fetch failed`，同样零痕迹。
+
+修法是一个纯 ASGI 中间件把 `/mcp` 就地改写成 `/mcp/`。**刻意不用**
+`@app.middleware("http")`：那是 `BaseHTTPMiddleware`，会把响应体收进内存再吐
+出去，对 MCP 的流式响应有害。
+
+**三道闸，都钉的是被禁止的形态：**
+
+1. `tests/test_deskcore_cors.py`（19 条）——预检不许 401、401 本身必须带 CORS 头、
+   CORS 必须在 `user_middleware[0]`、通配 origin 与 credentials 不许同时开、
+   `/mcp` 不许 307（`follow_redirects=False` 是这条的全部意义，默认跟随的话 307
+   和 200 看起来一模一样）。另有两条防回归：带 `Origin` 不等于免鉴权、
+   `/mcpfoo` 这种前缀撞名的路径不许被顺手改写。
+2. **CI 的 deskcore 冒烟测试加了预检那一段**——就接在原来那两条
+   （lifespan / 421）后面，因为这是同族的第三个。
+3. `/health` 现在回显 `mcp_allowed_origins` / `mcp_allowed_hosts`。
+   `_register_mcp` 的注释里原本就写着「`/health` 会回显当前生效的口径」，
+   **而实际上没有**——写了但没实现，又是一次"说有其实没有"，一并补上。
 
 ---
 
