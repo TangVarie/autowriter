@@ -378,71 +378,59 @@ def rules_ledger(sb, *, user_id: str, project_id: str | None = None) -> list[dic
     return [r for r in out if (r.get("content") or "").strip()]
 
 
-def count_rules_missing_embedding(sb, *, user_id: str,
-                                  project_id: str | None = None) -> int:
-    """数一下有多少条规则没有向量。
+def _count_missing_embedding(build) -> int:
+    """跑一次 ``count='exact'`` 的计数。**失败上抛**, 不返回 0。
 
-    ⚠️ 用 ``count='exact'`` 单独查, **不要**把 ``embedding`` 加进
-    ``_LEDGER_COLS`` 顺手数 —— 那是 768 维浮点数组, 为了数个数把它们全拉回来
-    是纯浪费(``rule_counts_bulk`` 的注释里记着同一个教训: 只用 len() 却把每条
-    规则的 768 维向量一起拉了回来)。
+    ⚠️ "查不出来"和"一条都不缺"绝不能长成同一个值。补向量的完成判据就是
+    这个数归零 —— 把超时/权限/schema 错误吞成 0, 调用方会看到一个
+    「remaining: 0」然后收工, 而库里还缺着一堆。(codex review · PR #74)
     """
-    def _n(build) -> int:
-        try:
-            res = build().is_("embedding", "null").limit(1).execute()
-        except Exception:
-            logger.warning("数缺向量规则失败", exc_info=True)
-            return 0
-        return int(getattr(res, "count", 0) or 0)
-
-    total = _n(lambda: sb.table("memories").select("id", count="exact")
-                         .eq("scope", "global").eq("user_id", user_id)
-                         .or_("memory_type.is.null,memory_type.eq.rule"))
-    if project_id:
-        total += _n(lambda: sb.table("memories").select("id", count="exact")
-                              .eq("scope", "project").eq("project_id", project_id)
-                              .or_("memory_type.is.null,memory_type.eq.rule"))
-    return total
+    res = build().is_("embedding", "null").limit(1).execute()
+    return int(getattr(res, "count", 0) or 0)
 
 
-def memory_row(sb, memory_id: str) -> dict | None:
-    """按 id 取一条规则 —— 给改状态之前的**归属校验**用。
-
-    只取校验和回报需要的列, 不取 embedding(768 维, 白花流量)。
-    """
-    res = (sb.table("memories")
-             .select("id, scope, project_id, user_id, content, severity, "
-                     "status, muted_until, applicability, memory_type")
-             .eq("id", memory_id).limit(1).execute())
-    rows = getattr(res, "data", None) or []
-    return rows[0] if rows else None
+def _rules_missing_q(sb):
+    return (sb.table("memories").select("id", count="exact")
+              .or_("memory_type.is.null,memory_type.eq.rule"))
 
 
 def count_rules_missing_embedding(sb, *, user_id: str,
-                                  project_id: str | None = None) -> int:
-    """数一下有多少条规则没有向量。
+                                  project_id: str | None = None) -> int | None:
+    """**台账口径**: 我的 global 规则 + 这个项目的项目规则, 有多少缺向量。
+
+    查不出来返回 ``None``(不是 0) —— 台账少显示一个数字无所谓, 但不能让
+    调用方把"查不出来"当成"补齐了"。
 
     ⚠️ 用 ``count='exact'`` 单独查, **不要**把 ``embedding`` 加进
-    ``_LEDGER_COLS`` 顺手数 —— 那是 768 维浮点数组, 为了数个数把它们全拉回来
-    是纯浪费(``rule_counts_bulk`` 的注释里记着同一个教训: 只用 len() 却把每条
-    规则的 768 维向量一起拉了回来)。
+    ``_LEDGER_COLS`` 顺手数 —— 那是 768 维浮点数组, 为了数个数把它们全拉
+    回来是纯浪费(``rule_counts_bulk`` 的注释里记着同一个教训)。
     """
-    def _n(build) -> int:
-        try:
-            res = build().is_("embedding", "null").limit(1).execute()
-        except Exception:
-            logger.warning("数缺向量规则失败", exc_info=True)
-            return 0
-        return int(getattr(res, "count", 0) or 0)
+    try:
+        total = _count_missing_embedding(
+            lambda: _rules_missing_q(sb).eq("scope", "global").eq("user_id", user_id))
+        if project_id:
+            total += _count_missing_embedding(
+                lambda: _rules_missing_q(sb).eq("scope", "project")
+                                            .eq("project_id", project_id))
+        return total
+    except Exception:
+        logger.warning("数缺向量规则失败(台账口径)", exc_info=True)
+        return None
 
-    total = _n(lambda: sb.table("memories").select("id", count="exact")
-                         .eq("scope", "global").eq("user_id", user_id)
-                         .or_("memory_type.is.null,memory_type.eq.rule"))
-    if project_id:
-        total += _n(lambda: sb.table("memories").select("id", count="exact")
-                              .eq("scope", "project").eq("project_id", project_id)
-                              .or_("memory_type.is.null,memory_type.eq.rule"))
-    return total
+
+def count_own_rules_missing_embedding(sb, *, user_id: str) -> int:
+    """**补算口径**: 这个人名下**所有** scope 的规则里, 还有多少缺向量。
+
+    ⚠️ 必须和 ``db.backfill_memory_embeddings`` 处理的集合**完全一致** ——
+    它只按 ``user_id`` 过滤, 不分 scope。用台账口径(global + 单个项目)去数
+    会漏掉这个人在**别的项目**里的项目规则, 于是补算工具会在第一批之后就
+    报 ``remaining: 0`` 让人收工, 而那些规则一直没有向量。
+    (codex review · PR #74 · P1)
+
+    失败上抛 —— 见 ``_count_missing_embedding``。
+    """
+    return _count_missing_embedding(
+        lambda: _rules_missing_q(sb).eq("user_id", user_id))
 
 
 def memory_row(sb, memory_id: str) -> dict | None:

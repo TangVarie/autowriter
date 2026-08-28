@@ -2016,6 +2016,8 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
     # 相关性筛选** —— 于是"这个项目跟这条规则根本不相干, 它却还是进了简报"
     # 这件事从外面完全看不出来。这是这套东西唯一一个还需要跑一次运维命令
     # (cli reembed-rules)才能补上的洞, 不显示出来就没人会想起去跑。
+    # None = 查不出来(不是 0)。查不出来就什么都不显示, 别把"不知道"渲染成
+    # 一个看起来正常的数字。
     missing = store.count_rules_missing_embedding(
         client, user_id=user_id, project_id=project_id)
     if missing:
@@ -2034,8 +2036,13 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
     if missing:
         res["note_missing_embedding"] = (
             f"有 {missing} 条规则没有向量。它们照常注入, 但**不参与相关性筛选** —— "
-            "也就是跟本次要写的东西不相干时也会进简报。运维跑一次 "
-            "`python -m deskcore.cli reembed-rules --user <uuid>` 就能补上。"
+            "也就是跟本次要写的东西不相干时也会进简报。"
+            # ⚠️ 这句话是直接送到模型眼前的, 它会盖过 SKILL.md 里的指引。
+            # 原来写的是"运维跑一次 cli reembed-rules" —— 那正好把用户推回
+            # 运维环节, 而这一轮做 reembed_my_rules 就是为了消灭那个环节。
+            # (codex review · PR #74)
+            "**调 reembed_my_rules 就能补**(一次 50 条, 按返回的 remaining 重复调"
+            "直到归零), 不需要找运维。"
             "走 record_rule 新记的规则会在写入时自动算(db.upsert_memory), "
             "所以这个数只会往下走, 不会自己涨。")
     return res
@@ -2062,20 +2069,34 @@ def reembed_my_rules(client, *, user_id: str, batch: int = 50) -> dict:
     status = (out or {}).get("status")
     updated = int((out or {}).get("updated") or 0)
 
+    # ⚠️ 失败状态必须**抛**, 不能返回一个带 error 字段的字典。
+    # MCP 会把"返回了字典"当成调用成功, 于是调用方模型看到的是一次成功调用 +
+    # 一个 remaining 数字, 完全可能当作"补完了"往下走。SKILL.md 里也写着这个
+    # 工具"出错一律直接报错" —— 返回字典会让代码和文档对不上。
+    # (codex review · PR #74 · P1)
+    if status == "no_embedding_sdk":
+        raise RuntimeError(
+            "服务端没配 GOOGLE_API_KEY, 补算功能不可用 —— 这不是「没有需要补的」, "
+            "是环境缺配置, 要告诉运维")
+    if status == "schema_missing":
+        raise RuntimeError(
+            f"memories.embedding 列不存在, 需要先跑 pgvector 迁移: "
+            f"{(out or {}).get('hint') or ''}")
+    if status == "query_failed":
+        raise RuntimeError(f"补算查询失败: {(out or {}).get('error')}")
+
     # ⚠️ 剩余条数**必须重新查库**, 不能拿"上次查到多少减去补了多少"去算 ——
     # backfill 对算不出向量的行是跳过的, 那种行会永远留在待补集合里。用减法
     # 会得出一个一直在降、最后归零的假数字, 而库里其实一条没少。
-    remaining = store.count_rules_missing_embedding(client, user_id=user_id)
+    #
+    # ⚠️ 而且必须用**补算口径**(这个人名下所有 scope), 不是台账口径
+    # (global + 单个项目)。backfill 只按 user_id 过滤, 台账口径会漏掉他在别的
+    # 项目里的项目规则 → 第一批之后就报 remaining: 0 让人收工。
+    # (codex review · PR #74 · P1)
+    remaining = store.count_own_rules_missing_embedding(client, user_id=user_id)
 
     res = {"updated": updated, "remaining": remaining, "status": status}
-    if status == "no_embedding_sdk":
-        res["error"] = "服务端没配 GOOGLE_API_KEY, 补算功能不可用"
-        res["hint"] = "这不是「没有需要补的」, 是环境缺配置 —— 告诉运维"
-    elif status == "schema_missing":
-        res["error"] = "memories.embedding 列不存在, 需要先跑 pgvector 迁移"
-    elif status == "query_failed":
-        res["error"] = f"查询失败: {(out or {}).get('error')}"
-    elif status == "noop":
+    if status == "noop":
         res["note"] = "没有缺向量的规则了 —— 已经补齐。"
     elif updated == 0 and remaining:
         # 查到了却一条没补上 = 再调一次还是同一批, 明说别空转。

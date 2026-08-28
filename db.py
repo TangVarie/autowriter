@@ -1973,6 +1973,14 @@ def backfill_memory_embeddings(
             client.table("memories")
             .select("id, content, embedding")
             .eq("user_id", user_id)
+            # ⚠️ 必须按 memory_type 收窄。这里原来只过滤 user_id + 空向量,
+            # 于是**已过期的 session 记忆**也会被算成待补 —— 2026-08-28 实测
+            # 生产库 195 条 session 全部无向量且全部已过期, 比规则(174)还多。
+            # 它们会先把 max_rows 的配额吃掉, 每轮花掉 50 次 embedding 调用,
+            # 而调用方看到 updated>0 会以为在推进。session 记忆是"仅本次生成
+            # 有效"的临时上下文(memory.py:431), 从不参与向量比对, 补了纯浪费。
+            # 判据与 _is_rule_memory 一致。(codex review · PR #74)
+            .or_("memory_type.is.null,memory_type.eq.rule")
             .is_("embedding", "null")
             .limit(max_rows)
             .execute()

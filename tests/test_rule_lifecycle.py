@@ -366,7 +366,11 @@ def test_missing_embedding_count_is_real_not_a_swallowed_zero():
             _rule(3, scope="global", project_id=None, embedding=None)]
     out = core.my_rules(_client(rows), PID, user_id=ME)
     assert out["counts"].get("缺向量") == 2, out["counts"]
-    assert "reembed-rules" in out.get("note_missing_embedding", "")
+    # 提示必须指向**工具**, 不是 CLI —— 这句话直接送到模型眼前,
+    # 写成 CLI 就等于把用户推回运维环节。
+    note = out.get("note_missing_embedding", "")
+    assert "reembed_my_rules" in note, note
+    assert "cli" not in note.lower(), note
 
 
 def test_no_note_when_every_rule_has_a_vector():
@@ -474,10 +478,23 @@ def test_a_batch_that_updates_nothing_tells_you_to_stop(monkeypatch):
     assert "next" not in out, "既叫停又叫人再调一次, 自相矛盾"
 
 
-def test_missing_api_key_is_surfaced_not_swallowed(monkeypatch):
-    _with_backfill(monkeypatch, [{"status": "no_embedding_sdk"}])
-    out = core.reembed_my_rules(_client([]), user_id=ME)
-    assert "GOOGLE_API_KEY" in out.get("error", "")
+@pytest.mark.parametrize("status, kw", [
+    ("no_embedding_sdk", "GOOGLE_API_KEY"),
+    ("schema_missing",   "pgvector"),
+    ("query_failed",     "查询失败"),
+])
+def test_failure_statuses_raise_instead_of_returning_a_dict(monkeypatch, status, kw):
+    """补算失败必须**抛**, 不能返回一个带 error 字段的字典。
+
+    ⚠️ MCP 把"返回了字典"当成调用成功。返回 {"error": ..., "remaining": N}
+    的话, 调用方模型看到的是一次成功调用 —— 完全可能当作"补完了"往下走。
+    SKILL.md 里也写着这个工具"出错一律直接报错", 返回字典会让代码和文档对不上。
+    """
+    _with_backfill(monkeypatch, [{"status": status, "hint": "pgvector 迁移没跑",
+                                  "error": "boom"}])
+    with pytest.raises(RuntimeError) as exc:
+        core.reembed_my_rules(_client([]), user_id=ME)
+    assert kw in str(exc.value)
 
 
 def test_noop_says_it_is_actually_done(monkeypatch):
@@ -519,3 +536,116 @@ def test_the_tool_is_registered_and_is_not_wrapped_in_safe():
     assert "_safe" not in calls, (
         "包了 _safe 就会把 no_embedding_sdk / schema_missing 这些状态码"
         "埋成一个带 error 的「成功」")
+
+
+def test_remaining_counts_every_scope_the_backfill_touches(monkeypatch):
+    """``remaining`` 数的集合必须和 backfill 处理的**完全一致**。
+
+    ⚠️ backfill 只按 ``user_id`` 过滤, 不分 scope。如果这里用台账口径
+    (我的 global + 当前项目), 就会漏掉这个人在**别的项目**里的项目规则 ——
+    第一批补完之后报 remaining: 0 让人收工, 而那些规则一直没有向量、一直
+    不参与相关性筛选。(codex review · PR #74 · P1)
+    """
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    rows = [
+        _rule(1, scope="global", project_id=None, embedding=None),
+        _rule(2, project_id=PID, embedding=None),
+        # 同一个人、**另一个项目**里的规则。台账口径数不到它。
+        _rule(3, project_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+              embedding=None),
+    ]
+    out = core.reembed_my_rules(_client(rows), user_id=ME)
+    assert out["remaining"] == 3, (
+        f"remaining={out['remaining']} —— 漏了别的项目里的规则, "
+        "会让调用方以为补完了")
+
+
+def test_a_count_that_cannot_be_read_is_not_reported_as_zero(monkeypatch):
+    """计数查失败**不许**变成 0。
+
+    "查不出来"和"一条都不缺"绝不能长成同一个值 —— 补算的完成判据就是这个数
+    归零, 吞成 0 等于谎报完工。
+    """
+    def _boom(*a, **k):
+        raise RuntimeError("PostgREST 超时")
+    monkeypatch.setattr(store, "_count_missing_embedding", _boom)
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    with pytest.raises(RuntimeError):
+        core.reembed_my_rules(_client([]), user_id=ME)
+
+
+def test_the_ledger_hides_the_number_when_it_cannot_be_read(monkeypatch):
+    """台账那一侧相反: 查不出来就**什么都不显示**, 不阻塞看规则。"""
+    def _boom(*a, **k):
+        raise RuntimeError("PostgREST 超时")
+    monkeypatch.setattr(store, "_count_missing_embedding", _boom)
+    out = core.my_rules(_client([_rule(1, embedding=None)]), PID, user_id=ME)
+    assert "缺向量" not in out["counts"]
+    assert "note_missing_embedding" not in out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 重复定义 —— 后一个静默覆盖前一个
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("module_path", [
+    "deskcore/store.py", "deskcore/core.py",
+    "deskcore/tools.py", "deskcore/cli.py",
+])
+def test_no_shadowed_top_level_definitions(module_path):
+    """同名的顶层 def / class 只许有一个。
+
+    ⚠️ 这条是 2026-08-28 现造出来的一个 bug 换来的: 一次脚本改写里
+    ``s[:i] + new + s[j:]`` 假设了 ``j > i``, 实际 j 在 i 前面, 于是中间那段
+    被**复制了一份**, ``store.count_rules_missing_embedding`` 变成两个定义。
+    Python 不报错、不警告, 后一个(旧版)静默生效, 全套测试照样是绿的 ——
+    直到一条断言碰巧盯着新版才有的行为。
+
+    这就是本仓库反复栽的那种形态: 写着已经改了、实际跑的是旧的、而且不报错。
+    """
+    import ast
+    import collections
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(module_path).read_text(encoding="utf-8"))
+    names = [n.name for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    dupes = {k: v for k, v in collections.Counter(names).items() if v > 1}
+    assert not dupes, (
+        f"{module_path} 里有同名的顶层定义 {dupes} —— 后一个会静默覆盖前一个")
+
+
+def test_the_count_helper_itself_does_not_swallow_query_errors():
+    """``_count_missing_embedding`` **自己**不许吞异常。
+
+    ⚠️ 这条补的是一个变异漏网: 上一版只有"调用方会把异常传上去"的用例, 而它
+    是把整个 ``_count_missing_embedding`` monkeypatch 掉的 —— 于是往这个函数
+    **内部**加一个 ``except: return 0``, 全套测试照样绿。钉调用方不等于钉实现。
+
+    这里不打桩函数, 打桩的是**客户端**: 让 execute() 真的抛, 看这个 helper
+    是把它传上去还是变成 0。
+    """
+    class _Boom:
+        def table(self, *a, **k):
+            return self
+
+        def select(self, *a, **k):
+            return self
+
+        def eq(self, *a, **k):
+            return self
+
+        def or_(self, *a, **k):
+            return self
+
+        def is_(self, *a, **k):
+            return self
+
+        def limit(self, *a, **k):
+            return self
+
+        def execute(self):
+            raise RuntimeError("PostgREST 超时")
+
+    with pytest.raises(RuntimeError):
+        store.count_own_rules_missing_embedding(_Boom(), user_id=ME)
