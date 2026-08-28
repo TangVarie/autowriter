@@ -142,8 +142,19 @@ ENABLE_MEMORY_MERGE: bool = (
 # user-reported "hard requirements not being respected" — there were so
 # many same-priority "rules" the model couldn't tell which ones were
 # non-negotiable.
+#
+# 12 → 18 in 2026-08: 个人技艺库上线之后, 一个人的 global 池子从"偶尔记一条"
+# 变成"几十条沉淀下来的写作技艺"(圈圈 18 条旧规则 + 9 条 A 档技艺 = 27 条抢
+# 12 个名额)。而 _rank_memories_for_injection 对 7 天内的新规则一律优先, 于是
+# 灌一批新的就会把她自己设了几个月的旧规则**整批挤掉 7 天, 且无任何提示**。
+#
+# 18 是权衡后的数, 不是随手放宽: 上面那次事故的现场是 40+40=80 行同优先级
+# 指令; 18+18=36 行仍在当时 24 行(12+12)与 80 行之间的低位。再往上调之前,
+# 先确认 soft 规则的相关性过滤真的在起作用 —— 今天 110 条规则里只有 2 条有
+# embedding, filter_soft_by_relevance 对无向量的一律放行, 所以这道闸目前几乎
+# 是空的, cap 是唯一在限流的东西。
 MAX_INJECTED_MEMORIES_PER_SCOPE: int = int(
-    os.environ.get("MAX_INJECTED_MEMORIES_PER_SCOPE", "12")
+    os.environ.get("MAX_INJECTED_MEMORIES_PER_SCOPE", "18")
 )
 
 # ── 去重自动重生硬闸门（Stage B1+B2）─────────────────────────────────────
