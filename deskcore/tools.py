@@ -119,8 +119,11 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     而不是按时间倒序 —— 后者会让文风越写越窄。所以知道要写什么就传。
 
-    返回的 counts.hard_rules 是 0 而用户以前明明定过规则, 多半是 project_id
-    传错了, 问一句。
+    ⚠️ **counts.hard_rules 是 0 属于正常, 不要因此怀疑 project_id 传错。**
+    现存库里三百多条规则的 severity 全是 soft, 一条 hard 都没有(老工作台收
+    反馈时不分"这一次"和"以后都这样", 一律存成 soft)。传错 project_id 的真实
+    表现是 403, 或者 soft_rules 和 soft_rules_pool 【同时】为 0。
+    只有后者才值得问一句。
 
     这个工具出错会直接报错, 不会返回半份简报。报错就【停下来】, 不要凭记忆
     或常识补一份约束继续写 —— 这个项目的硬约束是什么, 只有库里那份算数。

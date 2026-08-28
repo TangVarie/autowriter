@@ -207,10 +207,24 @@ def shared_memories(sb, project_id: str,
     # _is_rule_memory 过的。服务端先用 or_ 收窄, 拉回来再用 db._is_rule_memory
     # 复核一遍 —— 判据只有一个定义, 以后新增 memory_type 也不会漏。
     # (codex review round-5 P2)
-    def _rows(query):
-        rows = (query.eq("status", "confirmed")
-                     .or_("memory_type.is.null,memory_type.eq.rule")
-                     .execute()).data or []
+    # ⚠️ 必须翻页。原来是裸 `.execute()` 无 range —— PostgREST 的 db-max-rows
+    # (Supabase 默认 1000)会【静默钳短】: 越过 1000 条之后的规则在模型眼里
+    # 【根本不存在】, 且没有任何提示。这条路径读的是**强制合规规则**, 被截掉
+    # 的那几条不会报错, 只会让这一批稿子少守几条硬约束 —— 与本函数开头那段
+    # "宁可报错也不能返回空 p0" 是同一个失败模式的另一半, 堵一半等于没堵。
+    # (审计 COR-005/006/008 同款; _paged 的终止判据是空页而不是短页, 见它的
+    # docstring —— 服务端钳短时每一页都是短页。)
+    #
+    # ``build`` 必须每次从 sb.table(...) 重新构造: postgrest-py 复用同一个
+    # builder 时 .range() 的偏移会叠加。所以这里收的是**建查询的函数**,
+    # 不是建好的查询。
+    def _rows(build):
+        rows = _paged(lambda off, lim: (
+            build().eq("status", "confirmed")
+                   .or_("memory_type.is.null,memory_type.eq.rule")
+                   .order("created_at").order("id")
+                   .range(off, off + lim - 1)
+        ))
         return [r for r in rows if db._is_rule_memory(r)]
 
     # embedding: 给 memory.filter_soft_by_relevance 用。
@@ -220,10 +234,10 @@ def shared_memories(sb, project_id: str,
     # 就是这么做的)。这个坑不修比不加相关性过滤更糟。
     cols = ("id, content, severity, scope, rule_kind, rule_payload, "
             "muted_until, user_id, memory_type, created_at, frequency, embedding")
-    proj = _rows(sb.table("memories").select(cols)
-                   .eq("project_id", project_id).eq("scope", "project"))
-    glob = (_rows(sb.table("memories").select(cols)
-                    .eq("scope", "global").eq("user_id", user_id))
+    proj = _rows(lambda: sb.table("memories").select(cols)
+                           .eq("project_id", project_id).eq("scope", "project"))
+    glob = (_rows(lambda: sb.table("memories").select(cols)
+                            .eq("scope", "global").eq("user_id", user_id))
             if user_id else [])
 
     # ⚠️ 静音判定必须复用 db.is_memory_muted_now, 不能在这里自己写一份
