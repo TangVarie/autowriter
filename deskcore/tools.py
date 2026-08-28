@@ -1,7 +1,7 @@
 """deskcore/tools.py — MCP 工具面。
 
-十五个工具, 按写稿的三个阶段分组(外加一个 create_project 开项目, 和一对
-规则台账 my_rules / set_rule_state)。设计原则是【一次调用拿全】—— 治员工反馈里
+十六个工具, 按写稿的三个阶段分组(外加一个 create_project 开项目, 和三个
+规则台账相关的 my_rules / set_rule_state / reembed_my_rules)。设计原则是【一次调用拿全】—— 治员工反馈里
 那条「一个项目一般有 5 个提示词要重复操作 5 次, 我的工作台至少有几十个提示词」。
 
 每个工具的 docstring 就是模型看到的说明, 所以写给模型看; 维护者要看的原因
@@ -437,6 +437,29 @@ def my_rules(project_id: str, _user_id: str | None = None) -> dict:
     return _safe(core.my_rules, core.sb(), project_id, user_id=_user_id)
 
 
+def reembed_my_rules(batch: int = 50, _user_id: str | None = None) -> dict:
+    """给我自己缺向量的规则补算向量, 一次一批(最多 50 条)。
+
+    什么时候调: `my_rules` 的 counts 里出现「缺向量」时。用户也可能直接说
+    「补一下向量」「规则的相关性筛选没生效」。
+
+    **没向量的规则不会报错、照常注入**, 只是不参与相关性筛选 —— 也就是跟
+    这次要写的东西毫不相干时也会挤进简报。补完就正常了。
+
+    返回 `remaining` 大于 0 就**再调一次**, 直到它变成 0。
+    ⚠️ 但返回里带 `warning`(查到了却一条没补上)时**不要再调** —— 再调还是
+    同一批, 只会白花钱。把 warning 原样告诉用户。
+
+    只补**调用者自己**名下的规则, 补不到别人的。
+    """
+    if not _user_id:
+        return {"error": "无法识别调用者身份, 补算功能不可用",
+                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    # 故意不包 _safe: 写。而且它的失败模式全是"看起来跑完了其实没干活",
+    # 包成带 error 的"成功"正好把这些状态码埋掉。
+    return core.reembed_my_rules(core.sb(), user_id=_user_id, batch=batch)
+
+
 def set_rule_state(memory_id: str, action: str, days: int = 90,
                    direction: str = "", _user_id: str | None = None) -> dict:
     """改一条规则的档位 —— 停用 / 恢复 / 升降档 / 设方向。**不改内容**。
@@ -490,4 +513,5 @@ TOOLS = {
     "my_style":       (my_style,       True),
     "my_rules":       (my_rules,       True),
     "set_rule_state": (set_rule_state, True),
+    "reembed_my_rules": (reembed_my_rules, True),
 }

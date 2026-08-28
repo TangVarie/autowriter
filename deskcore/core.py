@@ -2041,6 +2041,52 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
     return res
 
 
+def reembed_my_rules(client, *, user_id: str, batch: int = 50) -> dict:
+    """给**我自己**缺向量的规则补算, 一次一批。
+
+    为什么做成工具而不是只留 CLI: 补向量需要 Supabase 的 service_role key 和
+    GOOGLE_API_KEY, 两样都只在服务端有 —— 做成 CLI 就意味着每次都要有人进
+    Railway 的 shell, 也就是"又得找运维"。这条路径只碰调用者自己名下的行
+    (``db.backfill_memory_embeddings`` 里那句 ``.eq("user_id", user_id)``),
+    所以它跟其它十五个工具是同一套归属口径, 不是新开的管理面。
+
+    **一次只补一批**: 补算要逐条调 embedding API, 一次几百条会把工具调用拖到
+    超时。返回 ``remaining`` 让调用方自己决定要不要再来一次 —— 与 Streamlit
+    那个「立即补算(最多 50 条)」按钮同一个节奏。
+    """
+    if not user_id:
+        raise PermissionError("无法识别调用者身份, 拒绝补算")
+    batch = max(1, min(int(batch or 50), 50))
+
+    out = db.backfill_memory_embeddings(client, user_id, max_rows=batch)
+    status = (out or {}).get("status")
+    updated = int((out or {}).get("updated") or 0)
+
+    # ⚠️ 剩余条数**必须重新查库**, 不能拿"上次查到多少减去补了多少"去算 ——
+    # backfill 对算不出向量的行是跳过的, 那种行会永远留在待补集合里。用减法
+    # 会得出一个一直在降、最后归零的假数字, 而库里其实一条没少。
+    remaining = store.count_rules_missing_embedding(client, user_id=user_id)
+
+    res = {"updated": updated, "remaining": remaining, "status": status}
+    if status == "no_embedding_sdk":
+        res["error"] = "服务端没配 GOOGLE_API_KEY, 补算功能不可用"
+        res["hint"] = "这不是「没有需要补的」, 是环境缺配置 —— 告诉运维"
+    elif status == "schema_missing":
+        res["error"] = "memories.embedding 列不存在, 需要先跑 pgvector 迁移"
+    elif status == "query_failed":
+        res["error"] = f"查询失败: {(out or {}).get('error')}"
+    elif status == "noop":
+        res["note"] = "没有缺向量的规则了 —— 已经补齐。"
+    elif updated == 0 and remaining:
+        # 查到了却一条没补上 = 再调一次还是同一批, 明说别空转。
+        res["warning"] = (f"这一批查到了缺向量的行却一条都没补上(还剩 {remaining} 条)。"
+                          "**不要接着调** —— 再调还是同一批。服务端日志里有每行"
+                          "失败的原因(telemetry: backfill_memory_row_failed)。")
+    elif remaining:
+        res["next"] = f"还剩 {remaining} 条, 再调一次这个工具接着补。"
+    return res
+
+
 def set_rule_state(client, memory_id: str, action: str, *,
                    user_id: str, days: int = 90, direction: str = "") -> dict:
     """写手自己改一条规则的档位。**不改内容** —— 改内容是 record_rule 的事。

@@ -424,3 +424,98 @@ def test_a_rule_still_gets_saved_when_embedding_is_unavailable(monkeypatch):
     sb = _client([])
     out = core.record_rule(sb, PID, "标题控制在 20 字内", user_id=ME)
     assert out["memory_id"], "没配 embedding 就把规则也丢了"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# reembed_my_rules —— 补向量做成工具, 不用再进 shell
+# ══════════════════════════════════════════════════════════════════════
+
+class _FakeBackfill:
+    """按脚本依次返回 db.backfill_memory_embeddings 的结果, 并记下调用参数。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def __call__(self, client, user_id, max_rows=50):
+        self.calls.append({"user_id": user_id, "max_rows": max_rows})
+        return self.script.pop(0) if self.script else {"status": "noop"}
+
+
+def _with_backfill(monkeypatch, script):
+    fake = _FakeBackfill(script)
+    monkeypatch.setattr(db, "backfill_memory_embeddings", fake)
+    return fake
+
+
+def test_remaining_is_re_queried_not_subtracted(monkeypatch):
+    """``remaining`` 必须重新查库, **不能**拿"上次多少减去补了多少"去算。
+
+    ⚠️ backfill 对算不出向量的行是跳过的, 那种行会永远留在待补集合里。用减法
+    会得出一个一直在降、最后归零的假数字, 而库里其实一条没少 —— 于是调用方
+    看到"补完了"就不再管, 相关性筛选却始终是坏的。
+    """
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 2}])
+    # 库里放 3 条缺向量的: 假件不会因为 backfill 被 mock 掉就少行,
+    # 所以真去查的话必然还是 3, 用减法的话会算成 1。
+    rows = [_rule(i, scope="global", project_id=None, embedding=None)
+            for i in (1, 2, 3)]
+    out = core.reembed_my_rules(_client(rows), user_id=ME)
+    assert out["remaining"] == 3, (
+        f"remaining={out['remaining']} —— 像是用减法算的, 必须重新查库")
+
+
+def test_a_batch_that_updates_nothing_tells_you_to_stop(monkeypatch):
+    """查到了却一条没补上 → 明确叫停, 别让调用方接着调同一批。"""
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 0}])
+    rows = [_rule(1, scope="global", project_id=None, embedding=None)]
+    out = core.reembed_my_rules(_client(rows), user_id=ME)
+    assert "warning" in out and "不要接着调" in out["warning"]
+    assert "next" not in out, "既叫停又叫人再调一次, 自相矛盾"
+
+
+def test_missing_api_key_is_surfaced_not_swallowed(monkeypatch):
+    _with_backfill(monkeypatch, [{"status": "no_embedding_sdk"}])
+    out = core.reembed_my_rules(_client([]), user_id=ME)
+    assert "GOOGLE_API_KEY" in out.get("error", "")
+
+
+def test_noop_says_it_is_actually_done(monkeypatch):
+    _with_backfill(monkeypatch, [{"status": "noop"}])
+    out = core.reembed_my_rules(_client([]), user_id=ME)
+    assert out["remaining"] == 0 and "补齐" in out.get("note", "")
+
+
+def test_it_only_ever_backfills_the_caller(monkeypatch):
+    """只补调用者自己名下的 —— 这条路径不是新开的管理面。"""
+    fake = _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    core.reembed_my_rules(_client([]), user_id=ME)
+    assert fake.calls[0]["user_id"] == ME
+
+
+def test_batch_is_clamped_to_fifty(monkeypatch):
+    """别让调用方传一个大 batch 把工具调用拖到超时。"""
+    fake = _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    core.reembed_my_rules(_client([]), user_id=ME, batch=5000)
+    assert fake.calls[0]["max_rows"] == 50
+
+
+def test_no_identity_is_refused(monkeypatch):
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    with pytest.raises(PermissionError):
+        core.reembed_my_rules(_client([]), user_id="")
+
+
+def test_the_tool_is_registered_and_is_not_wrapped_in_safe():
+    import ast
+    import inspect
+
+    from deskcore import tools
+    assert tools.TOOLS["reembed_my_rules"][1] is True
+    src = inspect.getsource(tools.reembed_my_rules)
+    body = ast.parse(src.lstrip()).body[0]
+    calls = [n.func.id for n in ast.walk(body)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert "_safe" not in calls, (
+        "包了 _safe 就会把 no_embedding_sdk / schema_missing 这些状态码"
+        "埋成一个带 error 的「成功」")

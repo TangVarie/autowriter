@@ -60,7 +60,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
 | **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
-| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、**15 个工具**都在（2026-08-28 加了 `my_rules` / `set_rule_state`）、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
+| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、**16 个工具**都在（2026-08-28 加了 `my_rules` / `set_rule_state` / `reembed_my_rules`）、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
 | **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
 | `draft_fingerprints` | ✅ **3,678 行 / 44 个项目**（2026-08-26 回填，见 §1.5）。当前模型 3,671 / 来路不明 0 / 别的模型 0 / 维度 min=max=768 / 重复 `version_id` 0 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
@@ -777,7 +777,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 13 | `projects` 加 `UNIQUE (owner_id, lower(btrim(name)))` | `create_project` 的撞名保护是**应用层 check-then-insert**，两次并发调用会各自查空、各自建成。判据（大小写与首尾空格都不算差异）已经和这个索引对齐，加索引就是把它下推给数据库——与 `docs/deskcore.md` §2.3-D「并发正确性交给数据库」同一口径。**做之前要先处理存量可能已有的重名行**，所以单独一次迁移。现网并发建项目的概率极低，不阻塞 |
 | 14 | `store.recent_angle_keys` 也走 `_paged` | 它读 `angle_ledger` 仍是裸 `.execute()`，同 COR-005/006/008 那一族的静默截断。台账被钳短的后果是**已经用过的角度组合会被当成没用过再抽一次**，跨批次去重悄悄退化。现网台账还很小，等它长起来之前做掉 |
 | 15 | `/health` 回显注入封顶 | **纯便利, 不是唯一手段** —— `open_project` 的返回里已经有 `counts.soft_rules_cap_per_scope`(`deskcore/core.py:330`, 直接取自 `MAX_INJECTED_MEMORIES_PER_SCOPE`), 拿一把 key 和一个 project_id 就能确认线上生效值。放进 `/health` 的好处是**不需要 key、不需要 project_id**, 改完 env 立刻能验。(初稿把这条写成「线上无法验证」—— 错的, codex review 指出, 已改) |
-| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 deskcore 侧入口已就位**：`python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **它只管存量, 不是给「新规则没向量」兜底** —— 新规则本来就有向量：`db.upsert_memory` 在写入时就算(`db.py:1748`)。缺向量的 174 条来自两处：① 2026-08-28 用裸 SQL 灌的 66 条技艺库种子(**绕过了 upsert_memory**, 见 §4.5)；② 更早那批建于这段代码之前、或当时没配 GOOGLE_API_KEY 的。Streamlit 的记忆管理页也有一个「立即补算(最多 50 条)」按钮调同一个函数(`memory.py:2072`)；CLI 这版补的是它没有的三件事：**翻页**、**停滞检测**(`updated=0` 就停, 否则每轮查到同一批行、白花 embedding 的钱)、**非零退出码**。补几条用那个按钮更快。**还没跑**：跑之前那 174 条不参与相关性筛选 |
+| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 两个入口都就位**：① MCP 工具 `reembed_my_rules` —— 写手/运维在 WorkBuddy 里一句话触发, 一次 50 条, 只补调用者自己名下的, `remaining` 归零为止；② CLI `python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **只管存量, 不是给「新规则没向量」兜底** —— 新规则本来就有向量：`db.upsert_memory` 在写入时就算(`db.py:1748`)。缺向量的 174 条来自：① 2026-08-28 用**裸 SQL** 灌的 66 条技艺库种子(绕过了 upsert_memory, 见 §4.5)；② 更早那批建于这段代码之前、或当时没配 GOOGLE_API_KEY 的。按人分布：623346512 → 111 条、1796631194 → 44 条、tangziao1997 → 18 条、738443677 → 1 条(无孤儿行)。`my_rules` 的 counts 里会显示「缺向量：N」提醒 |
 
 ---
 
