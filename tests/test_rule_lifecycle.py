@@ -311,3 +311,39 @@ def test_set_rule_state_is_not_wrapped_in_safe():
     calls = [n.func.id for n in ast.walk(body)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
     assert "_safe" not in calls
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 注入封顶 —— 新规则不许把旧规则整批饿死
+# ══════════════════════════════════════════════════════════════════════
+
+def test_a_fresh_batch_cannot_starve_the_rules_someone_set_months_ago():
+    """灌一批新技艺时，写手自己设了几个月的旧规则必须还留得下位置。
+
+    ⚠️ 这条盯的是一次**差点造成的**事故。``db._rank_memories_for_injection``
+    对 7 天内的新规则一律优先（"我刚说过 → 立刻生效"，本身是对的），然后砍到
+    cap。cap=12 时往一个已有 18 条 global 规则的人库里插 9 条新的，结果是
+    新的占满 12 个名额里的 9 个、旧的只剩 3 个；插 31 条则旧的**一条都进不去、
+    持续 7 天、没有任何提示**。
+
+    这里不锁死 cap 的具体数值（那是可调的产品参数，也能用环境变量覆盖），
+    锁的是那个数值必须**大到让两边都放得下**：一批 A 档技艺进来之后，旧规则
+    仍有过半的名额。
+    """
+    import config
+    from datetime import datetime, timedelta, timezone
+
+    cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 12) or 12)
+    now = datetime.now(timezone.utc)
+    fresh = [{"id": f"new-{i}", "created_at": now.isoformat(), "frequency": 30}
+             for i in range(9)]                       # 一批 A 档技艺
+    old = [{"id": f"old-{i}",
+            "created_at": (now - timedelta(days=120)).isoformat(),
+            "frequency": 1}
+           for i in range(18)]                        # 她自己攒了几个月的
+
+    got = db._rank_memories_for_injection(fresh + old, cap)
+    survived = [m for m in got if m["id"].startswith("old-")]
+    assert len(survived) >= len(fresh), (
+        f"cap={cap} 太小：9 条新技艺进来之后旧规则只剩 {len(survived)} 条。"
+        "写手会发现自己设了几个月的规矩突然不生效，而且没有任何提示。")
