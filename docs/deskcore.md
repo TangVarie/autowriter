@@ -103,13 +103,13 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 
 | 谁 | 怎么执行 |
 |---|---|
-| 十二个 MCP 工具 | `TOOLS` 里 `needs_user` **全部为 True**；`core.assert_project_access` 是唯一实现，每个项目级入口以它开头 |
+| 十三个 MCP 工具 | `TOOLS` 里 `needs_user` **全部为 True**；`core.assert_project_access` 是唯一实现，每个项目级入口以它开头。`create_project` 不打开已有项目，所以不过这道闸——它的等价保证是**签名里没有 owner 参数**，归属只能是调用者 |
 | `label_example` | **按 `items.user_id` 校验**，比项目粒度更细——同一项目里 A 的正负例是 A 的个人资产 |
 | REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了 |
 | CLI 的 `projects` / `open` / `draw` / `check` | 走同一个 `core` 函数，所以 `--user` 从可选变成**必填** |
 | CLI 的 `backfill` / `reembed` | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
 
-**要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在十二个工具里意味着改口径要改十二处，而漏掉的那处不会报错，只会继续放行。
+**要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在十三个工具里意味着改口径要改十三处，而漏掉的那处不会报错，只会继续放行。
 
 回归在 `tests/test_deskcore_ownership.py`（含一条 AST 断言：每个项目级入口都必须调过这道闸——归属校验最典型的失效方式不是判据写错，而是**新加了个工具忘了加校验**）+ `ci.yml` app 冒烟步里的 403 运行期断言。
 
@@ -149,10 +149,11 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 
 ---
 
-## 3. 工具面（12 个）
+## 3. 工具面（13 个）
 
 | 阶段 | 工具 | 说明 |
 |---|---|---|
+| 开项目 | `create_project` | 给新品牌/新方向建项目。**owner 恒为调用者**，签名里没有 owner 参数。同名不建、返回已有的；同品牌照建但列出兄弟项目（见 §3.0） |
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
@@ -165,6 +166,24 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 | | `save_my_style` | 把模型蒸馏好的笔记写回 + 按 `edit_ids` 销账（`record_edit` 的第二步） |
 | | `label_example` | 标正/负例 |
 | | `my_style` | 查看个人风格资产；有积压时**直接带回可续做的蒸馏任务** |
+
+### 3.0 `create_project` —— 补上"新品牌进不来"这个洞（2026-08-27）
+
+**现场是这样炸的。** 团队第一次真用起来，要给六个新品（sportsix / 西屋 / 雷诺考特 / 百健士藻油 / 岸深冲牙器 / 途鸽）开项目，模型如实回答：
+
+> 这六个我这边都建不了——不是没努力，是 deskcore 这套工具里压根没有「新建项目」这个动作。
+
+它没说错。建项目的代码只在 `projects.py`（停用中的 Streamlit 页面）里，MCP 这侧一个入口都没有。而 skill 又强制「动笔前必须先 `open_project`」——**想建建不了，想跳过又不让跳，新品牌完全进不来**。这个缺口在此前任何一份文档里都没写。
+
+三条设计决定，每条都对应一个已经踩过的坑：
+
+**归属不接受参数。** 签名里没有 `owner_id`，owner 恒等于 `user_id`（这把 key 映射到的人）。加一个 owner 参数就等于允许往别人名下建项目——同一天刚踩过：一把标着某人名字的 key 实际指向同事账号，拿它写稿会把稿子记进别人的历史库。归属只能由服务端定。
+
+**同名不建第二个**，把已有项目的 `project_id` 还回去（`created: false`）。建重了的代价不是多一行：两个同名项目 = 两套互不可见的历史库，`check_drafts` 按 `project_id` 比，从此对这个方向**永久失效且不报错**。
+
+**同品牌照建，但列出兄弟项目**（`siblings` + `siblings_note`）。「途鸽」已经有 D-1..D-7，再建一个叫「途鸽」的顶层项目多半是误操作——但也可能真要开新方向，只有人能判断。所以给信息不拦，并明说新项目跟兄弟项目**不互相查重**。
+
+`tests/test_create_project.py` 钉的是被禁止的形态：签名里出现任何含 `owner` 的参数即失败；撞名后库里行数不变；无身份必抛；`db.create_project` 返回空时必抛（不许降级成带 `error` 的"成功"——调用方会拿着不存在的 `project_id` 往下走，后面每个工具都 404 而根因看不见）。另有一条断言覆盖**全部写类工具**都不许被 `_safe` 包，而不只钉这一个。
 
 ### 3.3 蒸馏的两步与它的失败模式
 
@@ -395,7 +414,7 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
 **3. 鉴权配坏了必须 fail closed。** `DESKCORE_KEYS` 的 JSON 写错时，早期实现会返回空 map → `resolve()` 判定为"没配鉴权" → **放行所有请求**。生产上一个逗号写错就等于把项目数据和全部写工具匿名开放。现在显式配了就必须当成"打算开鉴权"，解析失败一律 401，`/health` 的 `auth.ok` 会是 false。
 
-**3b. "没配鉴权"同样 fail closed（2026-08-23 审计 ROB-003）。** 上面那条只堵了"配了但写错"，"根本没配"当时仍然走 dev 模式放行——而 deskcore 持 service_role 绕 RLS，漏配一个环境变量就等于把全部租户的数据和十二个工具（含写）开放到公网。更糟的是**健康检查看不见**：`/health` 虽然会把 `auth.ok` 报成 false，但它返回的是 HTTP 200，而 Railway 的 healthcheck 只看状态码——一个彻底敞开的部署照样判定健康、照样上线。
+**3b. "没配鉴权"同样 fail closed（2026-08-23 审计 ROB-003）。** 上面那条只堵了"配了但写错"，"根本没配"当时仍然走 dev 模式放行——而 deskcore 持 service_role 绕 RLS，漏配一个环境变量就等于把全部租户的数据和十三个工具（含写）开放到公网。更糟的是**健康检查看不见**：`/health` 虽然会把 `auth.ok` 报成 false，但它返回的是 HTTP 200，而 Railway 的 healthcheck 只看状态码——一个彻底敞开的部署照样判定健康、照样上线。
 
 现在默认拒绝：没配 key 时每个请求都 401。本地开发要免 key 跑，显式设 `DESKCORE_ALLOW_ANONYMOUS=1`（`/health` 会把它回显在 `config.anonymous_allowed`，并在 `auth.note` 里写明是 dev 模式）。
 

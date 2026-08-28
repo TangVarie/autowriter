@@ -2578,6 +2578,24 @@ jobs:
           assert "_user_id" not in r.text, "身份参数不该出现在工具 schema 里"
           print(f"  ✓ MCP tools/list 暴露全部 {len(got)} 个工具, 且不含 _user_id")
 
+          # ── 新品牌进得来 ────────────────────────────────────────────────
+          # 2026-08-27 现场: 团队第一次真用起来, 要给六个新品开项目, 模型如实
+          # 回答"deskcore 这套工具里压根没有新建项目这个动作" —— 而 skill 又
+          # 强制"动笔前必须先 open_project"。想建建不了、想跳过又不让跳,
+          # 新品牌完全进不来。这里钉死那个入口还在。
+          assert "create_project" in got, (
+              "create_project 不在 MCP 工具表里 —— 新品牌又进不来了")
+          _schema = [t for t in r.json()["result"]["tools"]
+                     if t["name"] == "create_project"][0]
+          _props = set((_schema.get("inputSchema") or {}).get("properties", {}))
+          # 归属绝不能由调用方指定: 有 owner 参数 = 可以往别人名下建项目。
+          _owner_params = {p for p in _props if "owner" in p.lower()}
+          assert not _owner_params, (
+              f"create_project 的 schema 里有归属参数 {_owner_params} —— "
+              "调用方就能往别人名下建项目")
+          assert "name" in _props, f"create_project 少了 name 参数: {_props}"
+          print(f"  ✓ create_project 已暴露, 参数 {sorted(_props)}, 无归属参数")
+
           bad = c.post("/mcp", json=INIT, headers={**H, "X-Deskcore-Key": "nope"})
           assert bad.status_code == 401, f"错 key 打 /mcp 不是 401: {bad.status_code}"
           print("  ✓ 错 key 打 /mcp → 401(鉴权在 MCP 之前生效)")

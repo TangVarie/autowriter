@@ -66,6 +66,32 @@ def _safe(fn, *args, **kwargs) -> Any:
 # 写稿前
 # ══════════════════════════════════════════════════════════════════════
 
+def create_project(name: str, brand: str = "",
+                   _user_id: str | None = None) -> dict:
+    """给一个新品牌 / 新方向开一个项目。**建完立刻用返回的 project_id 调
+    open_project 接管。**
+
+    什么时候调: 用户要写的那个品在 ``list_projects`` 里没有。
+
+    **调之前先 list_projects 看一眼** —— 已经有的项目不要重建。返回值里
+    ``created`` 是 false 就说明撞名了, 库里没新建, 直接用返回的那个
+    project_id, 别改名重试。
+
+    返回里带 ``siblings`` 时要停下来问用户: 说明这个品牌名下已经有别的项目
+    了。新项目是**独立的一套历史库**, 跟它们不互相查重 —— 如果本意是在已有
+    方向下继续写, 用那个已有项目才对。
+
+    参数:
+      name  —— 项目名, 建议带上方向, 例如「途鸽-D8薪资谈判」而不是光「途鸽」。
+      brand —— 品牌名, 同品牌的项目靠它归堆。同一个品的项目 brand 要写一致。
+
+    ⚠️ 项目归属**恒为你自己**, 不能替别人建。别人要用得他自己那把 key 建。
+    """
+    # 故意不包 _safe: 这是【写】操作。建失败若降级成带 error 的"成功", 调用方
+    # 会拿着一个不存在的 project_id 往下走, 后面每个工具都 404 而根因看不见。
+    return core.create_project(core.sb(), name, brand=brand, user_id=_user_id)
+
+
 def list_projects(_user_id: str | None = None) -> dict:
     """列出【你名下】的项目, 以及每个项目手上有多少积累。
 
@@ -385,6 +411,7 @@ def save_my_style(project_id: str, notes: str,
 #   · borrow_lessons → 发给馆员的 brief 是拿项目行拼的(品牌/定位/战术)
 # 新增工具时默认写 True; 想写 False 就得先说明它凭什么不需要知道是谁在调。
 TOOLS = {
+    "create_project": (create_project, True),
     "list_projects":  (list_projects,  True),
     "open_project":   (open_project,   True),
     "draw_angles":    (draw_angles,    True),

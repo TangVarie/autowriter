@@ -16,7 +16,7 @@
 的——把 deskcore 挂到客户端（见 §2 第 3 步），不挂上去这一整套没人用。
 
 离线自测：264 条 pytest + selftest + 真 PostgreSQL 上的迁移叠加与 SQL/Python
-逐例比对，全绿。线上实测：`/health` 全绿、12 个工具都在、`semantic_degraded`
+逐例比对，全绿。线上实测：`/health` 全绿、13 个工具都在、`semantic_degraded`
 为 `false`；四路查重信号**各自都当过一次判定信号**（`opening` / `title` /
 `ngram` / `contain` 各有一个专属探针，见 §1.5）。
 
@@ -60,7 +60,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **264 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
 | **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
-| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、12 个工具都在、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
+| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、13 个工具都在、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
 | **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
 | `draft_fingerprints` | ✅ **3,678 行 / 44 个项目**（2026-08-26 回填，见 §1.5）。当前模型 3,671 / 来路不明 0 / 别的模型 0 / 维度 min=max=768 / 重复 `version_id` 0 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
@@ -385,7 +385,7 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 >   而且 B 能改 A 的标注（`label_example` 的归属校验是按 `user_id` 判的）。
 >
 > ⚠️ **2026-08-24 起还多一层**（审计 COR-015）：`user_id` 现在还决定**能打开哪些项目**——
-> 判据是 `projects.owner_id == user_id`，十二个工具全部校验。所以给新人发一个全新 UUID
+> 判据是 `projects.owner_id == user_id`，十三个工具全部校验（`create_project` 不校验已有项目，它**恒以调用者为 owner** 建新的）。所以给新人发一个全新 UUID
 > 意味着他**一个项目都打不开**，得先让他自己建项目（或者把他要用的项目的 `owner_id`
 > 改成他）。口径与"改成团队共享要改哪儿"见 `docs/deskcore.md` §2.2.1。
 >
@@ -709,7 +709,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | # | 事 | 为什么 | 验收标准 |
 |---|---|---|---|
 | 0 | ~~补齐迁移 `002`–`006`~~ | ✅ **2026-08-26 已完成**（见 §1.3）。六个全跑进生产，逐条验过；`003` 的快照表 `versions_num_backup_20260826` 还留着，确认无误后可 drop | — |
-| 1 | ~~部署 deskcore service~~ | ✅ **2026-08-26 已完成**。Railway，`/health` 每项 ok、12 个工具都在 | — |
+| 1 | ~~部署 deskcore service~~ | ✅ **2026-08-26 已完成**。Railway，`/health` 每项 ok、13 个工具都在 | — |
 | 2 | ~~回填指纹~~ | ✅ **2026-08-26 已完成**（§1.5）：3,678 行 / 44 个项目。⚠️ **只覆盖 `85f5f888` 和 `afbaf84e`**——见下一行 | — |
 | 2b | ⚠️ 给 `b907ec9d` 发 key **之前**必须先回填它 | 它那 504 条历史稿现在对查重**不可见**：一接上来，老稿重发会被当成新的放行 | `doctor --project <uuid>` 的「还差」归零；且 `backfill` 返回的 `missing_embeddings` = 0。⚠️ **不能**拿全局 `count(*) > 0` 或「`empty_history_warning` 消失了」当验收——两个都会在主力项目还差几百条时报绿 |
 | 3 | 验 WorkBuddy 的鉴权头 | 不通就要换形态 | MCP 握手成功、错 key 返 401 |
@@ -912,6 +912,20 @@ httpx 默认）。跨源时这一跳是独立的失败路径：预检是针对 `
 3. `/health` 现在回显 `mcp_allowed_origins` / `mcp_allowed_hosts`。
    `_register_mcp` 的注释里原本就写着「`/health` 会回显当前生效的口径」，
    **而实际上没有**——写了但没实现，又是一次"说有其实没有"，一并补上。
+
+### 5.8 新品牌根本进不来，而任何一份文档都没写（2026-08-27，已修）
+
+团队第一次真用起来就撞上了。要给六个新品（sportsix / 西屋 / 雷诺考特 / 百健士藻油 / 岸深冲牙器 / 途鸽）开项目，模型如实回答：
+
+> 这六个我这边都建不了——不是没努力，是 deskcore 这套工具里压根没有「新建项目」这个动作。
+
+它没说错。建项目的代码只在 `projects.py`（Streamlit 页面）里，MCP 这侧一个入口都没有；而 skill 又强制「动笔前必须先 `open_project`」。**想建建不了，想跳过又不让跳。**
+
+这个缺口的性质值得记一笔：它不是 bug，是**整条路径从没被走过**。上线检查表里每一项都绿——迁移跑完了、`/health` 全绿、12 个工具都在、端到端验过一轮——因为那轮验证用的是**已经存在的项目**。「新项目怎么来」这一步在任何一份文档、任何一条 CI 断言里都不存在，于是它既没被实现也没被发现，直到有人真要开新品。
+
+修法与三条设计决定见 [`docs/deskcore.md` §3.0](deskcore.md)。CI 的 deskcore 冒烟现在会断言 `create_project` 在 MCP 工具表里、且 schema 里**没有任何归属参数**。
+
+顺带修了 `SKILL.md` 里一句会**每次都误报**的话：原文写着「如果 `hard_rules` 是 0 而用户以前明明定过规则，说明可能传错了 project_id，问一句」——而 §5.2 早就实测出 `hard` 全局为 0。照那句话执行，模型每次开工都会怀疑 project_id 传错并问一遍。现在改成明说 `hard_rules=0` 是正常的，真正该起疑的是 `soft_rules` 也为 0。
 
 ---
 

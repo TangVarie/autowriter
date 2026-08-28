@@ -2118,6 +2118,78 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     return {"lessons": selected, "count": len(selected)}
 
 
+def create_project(client, name: str, *, brand: str = "",
+                   user_id: str | None = None) -> dict:
+    """新建一个项目。owner **恒为调用者**, 不接受 owner 参数。
+
+    为什么必须有这个工具(2026-08-27): 在此之前 deskcore 的十二个工具里没有
+    "新建项目"这个动作 —— 建项目的代码只在停用中的 Streamlit 工作台里。
+    于是现场卡成死结: 文案想给新品牌开项目, 模型如实回答"我没有这个工具";
+    想跳过项目直接写, skill 又强制要求先 open_project 取硬约束。**新品牌
+    完全进不来**, 而这一层在任何文档里都没写。
+
+    ⚠️ 签名里【没有】owner_id, 这是安全属性不是疏忽。归属恒等于
+    ``user_id``(即这把 key 映射到的人)。加一个 owner 参数就等于允许调用方
+    往别人名下建项目 —— 今天刚踩过同类的坑: 一把标着"Ziao"的 key 实际指向
+    同事的账号, 拿它写稿会把稿子记到别人的历史库里。归属只能由服务端定。
+
+    撞名保护分两层, 都不是可选的:
+
+    · **同名 → 不建**, 把已有项目的 id 还回去(``created=False``)。建重了的
+      代价不是多一行: 两个同名项目 = 两套互不可见的历史库, 查重从此对这个
+      方向失效, 而且**不报错**。宁可返回已有的。
+    · **同品牌 → 照建, 但把兄弟项目列出来**(``siblings``)。"途鸽"已经有
+      D-1..D-7 七个子项目, 再建一个叫"途鸽"的顶层项目多半是误操作, 但也可能
+      是真的要开新方向 —— 这个只有人能判断, 所以给信息不拦。
+    """
+    if not user_id:
+        raise PermissionError(
+            "无法识别调用者身份, 不能建项目 —— 项目归属按 owner 隔离。"
+            "服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID。")
+
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("project name must not be empty")
+    brand = (brand or "").strip()
+
+    dupes = store.projects_with_exact_name(client, owner_id=user_id, name=name)
+    if dupes:
+        hit = dupes[0]
+        return {
+            "project_id": hit["id"],
+            "name": hit.get("name") or name,
+            "brand": hit.get("brand") or "",
+            "created": False,
+            "note": (f"你名下已经有一个叫「{name}」的项目, 没有新建 —— "
+                     "直接用这个 project_id。建同名的第二个会让历史稿分裂成"
+                     "两套互不可见的库, 查重从此对这个方向失效。"
+                     "确实要另开方向的话, 换一个能区分的名字。"),
+        }
+
+    row = db.create_project(client, user_id=user_id, name=name, brand=brand)
+    pid = (row or {}).get("id")
+    if not pid:
+        # 不静默返回半个结果: 调用方拿不到 id 就没法接着 open_project, 而
+        # "建成功了但没 id"会让人以为项目在库里, 下一步才炸且看不出根因。
+        raise RuntimeError(
+            f"建项目之后没拿到 id(name={name!r}) —— PostgREST 没回插入行, "
+            "多半是 service client 的 returning 行为变了")
+
+    siblings = [{"project_id": p["id"], "name": p.get("name") or ""}
+                for p in store.projects_with_brand(client, owner_id=user_id,
+                                                   brand=brand)
+                if p["id"] != pid] if brand else []
+
+    out = {"project_id": pid, "name": name, "brand": brand, "created": True,
+           "siblings": siblings}
+    if siblings:
+        out["siblings_note"] = (
+            f"品牌「{brand}」名下已经有 {len(siblings)} 个项目。新建的这个是"
+            "独立的一套历史库, 跟它们【不互相查重】。如果本意是在已有方向下"
+            "继续写, 应该用那个项目而不是这个新的 —— 告诉用户, 让他确认。")
+    return out
+
+
 def list_projects(client, *, user_id: str | None = None) -> list[dict]:
     """**我的**项目清单 + 每个项目手上有多少料。
 

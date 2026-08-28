@@ -150,6 +150,41 @@ def list_all_projects(sb, *, owner_id: str) -> list[dict]:
     ))
 
 
+def projects_with_exact_name(sb, *, owner_id: str, name: str) -> list[dict]:
+    """同 owner 下**名字完全相同**的项目。建项目前的撞名检查。
+
+    ⚠️ 只按 owner 查, 不查全库: 别人的项目叫什么跟这次建重不重没关系, 而把
+    全库项目名暴露给调用方正是审计 COR-015 堵掉的那个洞。
+    """
+    return _paged(lambda off, lim: (
+        sb.table("projects")
+          .select("id, name, brand")
+          .eq("owner_id", owner_id)
+          .eq("name", name)
+          .order("id")
+          .range(off, off + lim - 1)
+    ))
+
+
+def projects_with_brand(sb, *, owner_id: str, brand: str) -> list[dict]:
+    """同 owner 下同品牌的项目 —— 建项目时用来提示"这个品已经有几个方向了"。
+
+    ⚠️ 刻意**不用** ``.or_()`` 把它和上面那个合成一次查询: 测试假件把
+    ``.or_()`` 当无操作处理(见 tests/fakes.py), 合起来写会让撞名检查在测试里
+    永远"通过"而实际没过滤 —— 又是一次"绿灯是假的"。两次查询便宜得多。
+    """
+    if not (brand or "").strip():
+        return []
+    return _paged(lambda off, lim: (
+        sb.table("projects")
+          .select("id, name, brand")
+          .eq("owner_id", owner_id)
+          .eq("brand", brand)
+          .order("name").order("id")
+          .range(off, off + lim - 1)
+    ))
+
+
 # ── 规则(共享层) ──────────────────────────────────────────────────────────
 
 def shared_memories(sb, project_id: str,
