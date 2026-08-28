@@ -60,7 +60,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
 | **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
-| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、13 个工具都在、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
+| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、**15 个工具**都在（2026-08-28 加了 `my_rules` / `set_rule_state`）、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
 | **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
 | `draft_fingerprints` | ✅ **3,678 行 / 44 个项目**（2026-08-26 回填，见 §1.5）。当前模型 3,671 / 来路不明 0 / 别的模型 0 / 维度 min=max=768 / 重复 `version_id` 0 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
@@ -736,6 +736,76 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 12 | 给 native 正例补 essence 标注 | 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，TV 的饱和度监控对它们只能报"无法评估" |
 | 13 | `projects` 加 `UNIQUE (owner_id, lower(btrim(name)))` | `create_project` 的撞名保护是**应用层 check-then-insert**，两次并发调用会各自查空、各自建成。判据（大小写与首尾空格都不算差异）已经和这个索引对齐，加索引就是把它下推给数据库——与 `docs/deskcore.md` §2.3-D「并发正确性交给数据库」同一口径。**做之前要先处理存量可能已有的重名行**，所以单独一次迁移。现网并发建项目的概率极低，不阻塞 |
 | 14 | `store.recent_angle_keys` 也走 `_paged` | 它读 `angle_ledger` 仍是裸 `.execute()`，同 COR-005/006/008 那一族的静默截断。台账被钳短的后果是**已经用过的角度组合会被当成没用过再抽一次**，跨批次去重悄悄退化。现网台账还很小，等它长起来之前做掉 |
+| 15 | `/health` 回显注入封顶 | `/health` 现在回显 embeddings / CORS / auth / 词表，**偏偏漏了 `MAX_INJECTED_MEMORIES_PER_SCOPE`** —— 而它是这几个里唯一会【静默改变产出】的：调小了规则就少注入几条，没有任何报错。2026-08-28 把它从 12 调到 18 时，线上**无法验证新值是否生效**，只能靠等部署时间。回显它就能一眼确认 |
+| 16 | `memories.embedding` 回填 | 110 条规则里**只有 2 条有向量**。`memory.filter_soft_by_relevance` 对无向量的一律放行，所以 soft 规则的相关性过滤【目前几乎是空的】，cap 是唯一在限流的东西。`db.backfill_memory_embeddings` 已经存在（db.py:1975），缺的是把它挂到一个运维入口上。做完之前不要再调高 cap |
+
+---
+
+## 4.5 个人技艺库种子（2026-08-28 已投放）
+
+把 27 份项目调校笔记（约 25,000 字、381 条工艺批注）聚成 37 簇、经三路独立
+质疑分档之后，按人写进各自的 `scope='global'` 库。
+
+**写法上的三个决定**，每条都对应一句产品要求（「技艺库要跟着写的人自己长，
+不能靠一个不写稿的人在后端调」）：
+
+| 决定 | 为什么 |
+|---|---|
+| `scope='global'`，不是项目规则 | 读路径里 global 是**私有**的（`.eq("user_id", user_id)`），队友互相看不见。这是个人技艺，不是团队规范 |
+| **每条只写进真正记过它的那个人** | 簇的 `owners` 字段有记录。只有一个人记过的就只进那个人的库——写进别人库里就是「后端下发」 |
+| `applicability` 一律留空 | 方向档的初值**推不出来**：37 簇是在没有方向维度的前提下聚的，连质疑者点名为「方向分支」的三对（结尾截断 vs 收口、去品牌标签 vs 嵌品牌名、编号分点 vs 叙事）项目集都是交叠的。填上去就是猜。第一个方向标签留给写手用 `set_rule_state set_direction` 自己打 |
+
+**分档与落库形态**
+
+| 档 | 判据 | 条数 | `status` |
+|---|---|---|---|
+| A | 三路质疑零异议 | 9 | `confirmed`（进简报） |
+| B | 2/3 通过，一票保留 | 8 | `candidate` |
+| C | 无多数 | 14 | `candidate` |
+| D | ≥2 票判品牌方向特有 | 6 | **不入库**，留项目层 |
+
+B 档没有直接设成 `confirmed`，是因为每条都带一票保留意见——让写手自己
+`promote` 比替她转正更符合上面那句要求，也顺带避开了下面这个坑。
+
+**实际落库**（`source_feedback='craft-seed-2026-08-28'`）
+
+| 人 | 种子 | 其中生效 | 其中试用 | 她原有 | global 合计 |
+|---|---|---|---|---|---|
+| 623346512（圈圈） | 31 | 9 | 22 | 18 | 49 |
+| 1796631194（佳怡） | 22 | 8 | 14 | 0 | 22 |
+| tangziao1997 | 13 | 7 | 6 | 1 | 14 |
+
+另有 2 簇的记录人是 `other`（匹配不上花名册），**没写**。
+
+### 4.5.1 灌之前必须先调 cap —— 差点造成的一次事故
+
+`db._rank_memories_for_injection` 对 **7 天内新建的规则一律优先**，然后砍到
+`MAX_INJECTED_MEMORIES_PER_SCOPE`。圈圈有 18 条自己设了几个月的 global 规则，
+cap 当时是 12：
+
+| 灌入量 | 她的旧规则还剩几条进简报 |
+|---|---|
+| 9 条 | 3 条 |
+| 31 条（原计划） | **0 条，持续 7 天，无提示** |
+
+所以顺序是**先把 cap 调到 18（PR #72）并等部署落地，再灌种子**。调完之后
+实测她的注入池是「9 条技艺种子 + 她自己票数最高的 9 条」，正好 18。
+
+⚠️ 这也是为什么 B+C 档全进 `candidate`：22 条如果一起 `confirmed`，即使
+cap=18 也会把她的旧规则重新挤空。
+
+### 4.5.2 怎么撤
+
+全部种子带同一个标记，撤销是一条语句：
+
+```sql
+delete from autowriter.memories
+where source_feedback = 'craft-seed-2026-08-28';
+```
+
+只撤某一个人的，加 `and user_id = '<uuid>'`。**原始的 27 份笔记在
+`projects.calibration_notes` 里一个字没动**——种子是 `memories` 的新增行，
+两者互不影响。
 
 ---
 
