@@ -1,6 +1,7 @@
 """deskcore/tools.py — MCP 工具面。
 
-十三个工具, 按写稿的三个阶段分组(外加一个 create_project 开项目)。设计原则是【一次调用拿全】—— 治员工反馈里
+十五个工具, 按写稿的三个阶段分组(外加一个 create_project 开项目, 和一对
+规则台账 my_rules / set_rule_state)。设计原则是【一次调用拿全】—— 治员工反馈里
 那条「一个项目一般有 5 个提示词要重复操作 5 次, 我的工作台至少有几十个提示词」。
 
 每个工具的 docstring 就是模型看到的说明, 所以写给模型看; 维护者要看的原因
@@ -281,7 +282,8 @@ def export_drafts(project_id: str, batch_id: str | None = None,
 # ══════════════════════════════════════════════════════════════════════
 
 def record_rule(project_id: str, content: str, severity: str = "soft",
-                scope: str = "project", _user_id: str | None = None) -> dict:
+                scope: str = "project", applicability: str = "",
+                _user_id: str | None = None) -> dict:
     """把一条规则永久记住。团队共享 —— 队友写这个项目时也会守。
 
     什么时候调: 用户说的是「以后都这样」而不是「这次这样」。分不清就问一句。
@@ -294,12 +296,20 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       拿不准就用 soft 并问用户要不要设成硬约束 —— hard 设多了会把文案写死,
       二十条互相打架时模型只能写出四不像。
 
-    scope: "project" 只对本项目生效; "global" 对所有项目生效(慎用)。
+    scope: "project" 只对本项目生效; "global" 对**我自己**的所有项目生效 ——
+    个人技艺库就是这一档。global 规则是私有的, 不会跑到队友那里。
+
+    applicability: 方向档, 只认三个值 —— ""(通用, 默认) / "产品向" / "流量向"。
+      同一条技艺在两个方向上经常是相反的要求(结尾要不要收口、正文出不出品牌
+      名、罗列还是叙事), 混成一条必然打架。用户说的是"写产品向的时候这样"就
+      传 "产品向"; 没提方向就留空。**不确定就留空** —— 通用的多注入一条看得见,
+      设错方向会让规则在该生效的项目上静默缺席。
     """
     # 故意不包 _safe: 这是【写】操作, 且写的可能是 hard 合规规则。写失败若
     # 报成功, 这条规则会静默缺席之后的每一份简报 —— 而用户以为已经记住了。
     return core.record_rule(core.sb(), project_id, content,
-                            severity=severity, scope=scope, user_id=_user_id)
+                            severity=severity, scope=scope, user_id=_user_id,
+                            applicability=applicability)
 
 
 def record_edit(project_id: str, ai_title: str, ai_body: str,
@@ -403,6 +413,57 @@ def save_my_style(project_id: str, notes: str,
                               user_id=_user_id, edit_ids=edit_ids)
 
 
+def my_rules(project_id: str, _user_id: str | None = None) -> dict:
+    """列出这个项目上**我能管的全部规则**, 含试用档和已停用的。
+
+    什么时候调:
+      · 用户问"你现在都记着我什么规矩""这个项目守着哪些规则";
+      · 用户抱怨某条规则【没生效】 —— 台账里的 state 会直接告诉他为什么
+        (试用 / 已停用 / 方向不符), 不用猜;
+      · 用户想清理规则库之前, 先给他看一遍。
+
+    每条的 state:
+      · 生效中   —— 这次写稿会注入
+      · 方向不符 —— 它是另一个方向(产品向/流量向)的规则, 本项目不注入
+      · 试用     —— 还在候选档, 不进简报, 等攒够票或用户手动 promote
+      · 已停用   —— 用户自己 mute 掉的, muted_until 到期自动恢复
+
+    改档位用 set_rule_state。
+    """
+    if not _user_id:
+        return {"error": "无法识别调用者身份, 规则台账不可用",
+                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    # 读, 可降级: 看不到台账不影响写稿。
+    return _safe(core.my_rules, core.sb(), project_id, user_id=_user_id)
+
+
+def set_rule_state(memory_id: str, action: str, days: int = 90,
+                   direction: str = "", _user_id: str | None = None) -> dict:
+    """改一条规则的档位 —— 停用 / 恢复 / 升降档 / 设方向。**不改内容**。
+
+    memory_id 从 my_rules 的返回里拿。
+
+    action:
+      · "mute"          —— 停用 days 天(默认 90)。用于"这条最近别用了"。
+        到期自动恢复, 所以不确定要不要永久去掉时用这个。
+      · "unmute"        —— 立刻恢复。
+      · "retire"        —— 降回试用档, 不再进简报。用于"这条不对/过时了"。
+        **不删行**, 以后还能 promote 回来。
+      · "promote"       —— 试用 → 生效。用于用户明确说"这条留着, 以后都这样"。
+      · "set_direction" —— 配合 direction 参数设成 "产品向" / "流量向" / "通用"。
+
+    ⚠️ 用户说"别用这条了"时先问一句是**暂时**还是**以后都不要**: 前者 mute,
+    后者 retire。分不清就用 mute —— 它会自己到期, 猜错的代价小。
+    """
+    if not _user_id:
+        return {"error": "无法识别调用者身份, 拒绝改动规则",
+                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    # 故意不包 _safe: 写。静默失败 = 用户以为关掉了的规则还在每一份简报里,
+    # 或者以为留下的规则其实没生效 —— 两个方向都是无声的。
+    return core.set_rule_state(core.sb(), memory_id, action,
+                               user_id=_user_id, days=days, direction=direction)
+
+
 # 工具注册表 —— app.py 和 cli.py 共用。
 # 值 = (函数, 是否需要服务端注入调用者身份)
 #
@@ -427,4 +488,6 @@ TOOLS = {
     "save_my_style":  (save_my_style,  True),
     "label_example":  (label_example,  True),
     "my_style":       (my_style,       True),
+    "my_rules":       (my_rules,       True),
+    "set_rule_state": (set_rule_state, True),
 }

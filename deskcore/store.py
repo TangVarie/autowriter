@@ -255,8 +255,15 @@ def shared_memories(sb, project_id: str,
     # dedup.cosine_similarity 会静默得 0.0, 于是【每一条】soft 规则都低于阈值
     # 被滤掉。必须过 db._parse_pgvector(autowriter 自己的 list_memories:1901-1906
     # 就是这么做的)。这个坑不修比不加相关性过滤更糟。
+    # ⚠️ ``applicability`` 必须在这个列表里。它是【方向档】(产品向 / 流量向)
+    # 的载体, core.filter_by_applicability 靠它决定一条 soft 规则要不要进这一
+    # 份简报。漏掉这一列不会报错 —— 只会让每条规则的 applicability 恒为 None,
+    # 于是方向过滤【永远不生效】而调用方看到的一切都正常。
+    # (这正是 tests/fakes.py 的 select() 从前不做列投影时验不出来的那类 bug,
+    #  test_applicability_gate.py 里有一条专门盯着这个列名。)
     cols = ("id, content, severity, scope, rule_kind, rule_payload, "
-            "muted_until, user_id, memory_type, created_at, frequency, embedding")
+            "muted_until, user_id, memory_type, created_at, frequency, "
+            "applicability, embedding")
     proj = _rows(lambda: sb.table("memories").select(cols)
                            .eq("project_id", project_id).eq("scope", "project"))
     glob = (_rows(lambda: sb.table("memories").select(cols)
@@ -332,6 +339,78 @@ def rule_counts_bulk(sb, project_ids: list[str]) -> dict[str, tuple[int, int]]:
         else:
             out[pid] = (hard, soft + 1)
     return out
+
+
+# ── 规则台账(给写手自己看 / 自己改) ───────────────────────────────────────
+#
+# shared_memories 是【注入路径】: 只要 confirmed、未静音的, 因为它喂的是简报。
+# 下面这几个是【管理路径】: 要把 candidate(试用档)和被静音的也一起端出来,
+# 否则写手在 WorkBuddy 里根本看不见自己库里还有什么、哪条被自己关掉了 ——
+# 看不见就只能回来找运维, 那正是这套东西要消灭的环节。
+
+_LEDGER_COLS = ("id, content, severity, scope, project_id, status, "
+                "muted_until, user_id, memory_type, created_at, frequency, "
+                "applicability")
+
+
+def rules_ledger(sb, *, user_id: str, project_id: str | None = None) -> list[dict]:
+    """一个人能管的全部规则: 自己的 global 规则 + (可选)某个项目的项目规则。
+
+    ⚠️ **不过滤 status, 也不过滤 muted_until** —— 见上面那段。过滤了就等于
+    "试用档的规则对写手不可见", 而试用档正是要他们去裁决的那一档。
+
+    ⚠️ global 一路必须 ``.eq("user_id", user_id)``。global 规则是**私人**的
+    (shared_memories 里那一路也是这么取的), 漏掉这个条件就会把别人的个人
+    技艺库端到这个人面前 —— 跨租户泄漏。
+    """
+    def _rows(build):
+        rows = _paged(lambda off, lim: (
+            build().or_("memory_type.is.null,memory_type.eq.rule")
+                   .order("created_at").order("id")
+                   .range(off, off + lim - 1)))
+        return [r for r in rows if db._is_rule_memory(r)]
+
+    out = _rows(lambda: sb.table("memories").select(_LEDGER_COLS)
+                          .eq("scope", "global").eq("user_id", user_id))
+    if project_id:
+        out += _rows(lambda: sb.table("memories").select(_LEDGER_COLS)
+                               .eq("scope", "project").eq("project_id", project_id))
+    return [r for r in out if (r.get("content") or "").strip()]
+
+
+def memory_row(sb, memory_id: str) -> dict | None:
+    """按 id 取一条规则 —— 给改状态之前的**归属校验**用。
+
+    只取校验和回报需要的列, 不取 embedding(768 维, 白花流量)。
+    """
+    res = (sb.table("memories")
+             .select("id, scope, project_id, user_id, content, severity, "
+                     "status, muted_until, applicability, memory_type")
+             .eq("id", memory_id).limit(1).execute())
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else None
+
+
+def update_memory_fields(sb, memory_id: str, fields: dict) -> dict | None:
+    """就地改一条规则的状态字段。返回改完之后**库里的**那一行。
+
+    ⚠️ 白名单是硬的: 这个函数只允许改状态, 不允许改 ``content`` /
+    ``user_id`` / ``scope`` / ``project_id``。改内容是另一回事(要重新算向量、
+    要重新计票), 混在一个入口里迟早有人顺手把归属字段也改了 —— 那是越权写。
+    """
+    allowed = {"status", "muted_until", "severity", "applicability", "frequency"}
+    bad = set(fields) - allowed
+    if bad:
+        raise ValueError(f"update_memory_fields 不接受这些字段: {sorted(bad)}")
+    if not fields:
+        raise ValueError("update_memory_fields 至少要改一个字段")
+    res = (sb.table("memories").update(dict(fields))
+             .eq("id", memory_id).execute())
+    rows = getattr(res, "data", None) or []
+    # ⚠️ 拿不到回显行就再读一次, **不要**把入参当成结果返回。
+    # 「回报入参而不是库里的值」正是 record_rule 那条 severity bug 当初藏了
+    # 这么久的原因: 库里没改, 返回值却说改了。(core.record_rule 的注释)
+    return rows[0] if rows else memory_row(sb, memory_id)
 
 
 # ── 正负例(个人层, 带向量) ────────────────────────────────────────────────

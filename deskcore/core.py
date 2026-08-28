@@ -25,7 +25,7 @@ import base64
 import logging
 import random
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import NamedTuple, Optional
 
 import config
@@ -123,6 +123,54 @@ def assert_project_access(client, project_id: str, *,
             "之间共享, 跨 owner 不共享。project_id 是不是传错了?")
     # ↑↑↑ 换归属模型时【只改这三行】↑↑↑
     return project
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 方向档(产品向 / 流量向)
+# ══════════════════════════════════════════════════════════════════════
+#
+# 同一条技艺在两种方向上经常是【相反】的要求。三路独立质疑在 37 簇里反复
+# 撞到同一件事:"结尾截断留白"和"结尾完整收尾"、"去品牌标签"和"正文嵌品牌
+# 名"、"编号分点"和"叙事时间线" —— 每一对的项目集几乎互补, 一边全是产品/
+# 体验向, 另一边全是流量/叙事向。也就是说它们不是互相矛盾的两条规则, 是
+# 同一条规则的两个条件分支。没有这个维度, 技艺库必然自相打架。
+#
+# ⚠️ 判据【只认这两个词】, 不做泛化猜测。``applicability`` 是自由文本, 库里
+# 已经有 "正文" / "改简历部分" 这类**部位**标注在用 —— 那些不是方向, 必须原样
+# 放行。把闸门做成"有 applicability 就按它过滤"会把这些老行全部静默挡掉,
+# 而调用方看到的一切都正常。这正是本仓库反复出现的那类事故。
+DIRECTION_TAGS = ("产品向", "流量向")
+
+
+def detect_direction(project_name: str, tactic: str = "") -> str:
+    """从项目名 / 战术名判出这次写的是哪个方向。判不出来返回 ``""``。
+
+    判不出来时上层**放行全部规则** —— 保守方向必须是"多注入", 不是"少注入":
+    漏注入一条写手明明设过的规则是无声的, 多注入一条他至少看得见。
+    """
+    text = f"{project_name or ''} {tactic or ''}"
+    hit = [t for t in DIRECTION_TAGS if t[:2] in text]   # "产品" / "流量"
+    # 两个方向词同时出现(比如"产品直出-流量版")= 判不出来, 放行。
+    return hit[0] if len(hit) == 1 else ""
+
+
+def filter_by_applicability(rules: list[dict], direction: str) -> tuple[list[dict], list[dict]]:
+    """按方向档筛 soft 规则。返回 ``(留下的, 挡掉的)``。
+
+    规则的 ``applicability`` 里带方向词的才受这道闸管; 空的、或者写的是别的
+    东西(部位标注之类)一律放行。``direction`` 为空时全部放行。
+    """
+    if not direction:
+        return list(rules), []
+    keep, dropped = [], []
+    for r in rules:
+        tag = (r.get("applicability") or "").strip()
+        tagged = [t for t in DIRECTION_TAGS if t in tag]
+        if tagged and direction not in tagged:
+            dropped.append(r)
+        else:
+            keep.append(r)
+    return keep, dropped
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -233,6 +281,17 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     ])).strip()
     soft_report: dict = {}
     soft_all = len(soft)
+    # ── 方向档闸(产品向 / 流量向) ──────────────────────────────────
+    # 排在相关性过滤【前面】。相关性靠 embedding, 而库里绝大多数规则还没有
+    # 向量 —— filter_soft_by_relevance 对无向量的一律放行。也就是说今天相关性
+    # 这一层几乎拦不住东西, 方向闸是真正在起作用的那道。
+    #
+    # ⚠️ 顺序是 方向闸 → 相关性 → 排序封顶, 三者都在 cap 之前。别把相关性挪到
+    # cap 后面: 那样 cap 先按"新 + 高频"挑满 12 条, 相关性再从里面删, 最后注入
+    # 的会【少于 12 条】, 而池子里本来还有相关的排在第 13 位没能补上。
+    direction = detect_direction(project.get("name") or "",
+                                 brief.get("tactic") or "")
+    soft, dropped_by_direction = filter_by_applicability(soft, direction)
     if soft_ctx:
         soft = memory.filter_soft_by_relevance(soft, soft_ctx, report_sink=soft_report)
     soft_cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 12) or 12)
@@ -269,6 +328,11 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
             "soft_rules_pool": soft_all,
             "soft_filter_mode": soft_report.get("soft_filter_mode", "off"),
             "soft_rules_cap_per_scope": soft_cap,
+            # 方向闸必须可见。被方向挡掉的规则和"根本没存进去"在写手眼里
+            # 长得一模一样, 不回显就没法自查 —— 这套东西的全部意义就是让写手
+            # 自己看得见、自己能改。
+            "direction": direction or "未判定",
+            "soft_dropped_by_direction": len(dropped_by_direction),
             "positive_examples": len(positives),
             "positive_pool": len(pool),
             "negative_examples": len(negatives),
@@ -1833,7 +1897,8 @@ def backfill_gap(client, project_id: str) -> dict:
 
 
 def record_rule(client, project_id: str, content: str, *, severity: str = "soft",
-                scope: str = "project", user_id: str | None = None) -> dict:
+                scope: str = "project", user_id: str | None = None,
+                applicability: str = "") -> dict:
     """沉淀一条规则(团队共享)。severity='hard' 的下次进 P0。
 
     复用 db.upsert_memory —— 它带并发安全(keyed lock + CAS 重试)和
@@ -1874,7 +1939,152 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     if stored != severity:
         out["warning"] = (f"请求 severity={severity}, 但库里这条现在是 {stored} —— "
                           "以库里的为准, 请把这个差异告诉用户")
+
+    # applicability 得单独写一次: db.upsert_memory 不认这个字段(它是 autowriter
+    # 那边的老签名), 而它正是方向档的载体。
+    # ⚠️ 写失败必须**上抛**, 不能吞。吞掉的话这条规则会以"无方向"落库 → 之后
+    # 每一个方向的项目都注入它, 而调用方收到的是一个成功返回。
+    applicability = (applicability or "").strip()
+    if applicability and out["memory_id"]:
+        bad = [t for t in DIRECTION_TAGS if t in applicability]
+        if applicability not in DIRECTION_TAGS and bad:
+            raise ValueError(
+                f"applicability={applicability!r} 里带了方向词但不等于 "
+                f"{list(DIRECTION_TAGS)} 之一。方向档是精确匹配的, "
+                "半个词会让这条规则在两个方向上都被挡掉。")
+        saved = store.update_memory_fields(
+            client, out["memory_id"], {"applicability": applicability})
+        out["applicability"] = (saved or {}).get("applicability")
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 规则台账: 让写手自己看见、自己升降、自己停用
+# ══════════════════════════════════════════════════════════════════════
+#
+# 这三个操作以前只有直连数据库才能做, 也就是只有运维能做。那意味着技艺库
+# 的进化速度被"写手找运维"这个环节卡死, 而真正知道一条规则好不好用的只有
+# 天天写的那个人。把控制权交到工具层, 这套东西才谈得上自己长。
+
+_RULE_ACTIONS = ("mute", "unmute", "retire", "promote", "set_direction")
+
+
+def my_rules(client, project_id: str, *, user_id: str) -> dict:
+    """我这个项目上**全部**规则的台账 —— 含试用档和被我关掉的。
+
+    与简报的口径差别是故意的: 简报只给"现在生效的", 台账要给"库里有的",
+    否则写手看不见自己还有什么待裁决、什么被自己静音了。
+    """
+    project = assert_project_access(client, project_id, user_id=user_id)
+    rows = store.rules_ledger(client, user_id=user_id, project_id=project_id)
+    direction = detect_direction(project.get("name") or "")
+
+    out = []
+    for r in rows:
+        muted = db.is_memory_muted_now(r.get("muted_until"))
+        status = (r.get("status") or "candidate").lower()
+        tag = (r.get("applicability") or "").strip()
+        blocked = bool(direction) and bool([t for t in DIRECTION_TAGS if t in tag]) \
+            and direction not in tag
+        if status != "confirmed":
+            state = "试用"          # 不进简报, 等升档
+        elif muted:
+            state = "已停用"
+        elif blocked:
+            state = "方向不符"      # 在别的方向上生效, 这个项目上不注入
+        else:
+            state = "生效中"
+        out.append({
+            "memory_id": r.get("id"),
+            "content": r.get("content") or "",
+            "state": state,
+            "severity": (r.get("severity") or "soft").lower(),
+            "scope": r.get("scope"),
+            "direction": tag or "通用",
+            "votes": r.get("frequency") or 1,
+            "muted_until": r.get("muted_until"),
+            "created_at": r.get("created_at"),
+        })
+    order = {"生效中": 0, "方向不符": 1, "试用": 2, "已停用": 3}
+    out.sort(key=lambda x: (order.get(x["state"], 9), -int(x["votes"] or 1)))
+    counts: dict = {}
+    for r in out:
+        counts[r["state"]] = counts.get(r["state"], 0) + 1
+    return {
+        "project_id": project_id,
+        "project_name": project.get("name") or "",
+        "project_direction": direction or "未判定",
+        "rules": out,
+        "counts": counts,
+        "actions": ("改这些用 set_rule_state: mute(停用一段时间) / unmute(恢复) / "
+                    "retire(降回试用档, 不再进简报) / promote(试用→生效) / "
+                    "set_direction(设成 产品向 / 流量向 / 通用)"),
+    }
+
+
+def set_rule_state(client, memory_id: str, action: str, *,
+                   user_id: str, days: int = 90, direction: str = "") -> dict:
+    """写手自己改一条规则的档位。**不改内容** —— 改内容是 record_rule 的事。
+
+    归属校验分两路, 因为这两种规则的归属定义本来就不同:
+      · scope='global' —— 私人技艺库, 判 ``user_id`` 相等;
+      · scope='project' —— 团队共享, 判项目归属(assert_project_access)。
+    少判任何一路都等于让持 key 的人改别人的规则。
+    """
+    action = (action or "").strip().lower()
+    if action not in _RULE_ACTIONS:
+        raise ValueError(f"action 必须是 {list(_RULE_ACTIONS)} 之一, 收到 {action!r}")
+
+    row = store.memory_row(client, memory_id)
+    if row is None:
+        raise ProjectNotFound(f"规则不存在: {memory_id}")
+    if not db._is_rule_memory(row):
+        raise ValueError(f"{memory_id} 不是一条写作规则(memory_type="
+                         f"{row.get('memory_type')!r}), 拒绝改动")
+
+    if (row.get("scope") or "") == "global":
+        if str(row.get("user_id") or "") != str(user_id):
+            raise PermissionError(
+                "这条是别人的个人技艺库里的规则, 不能改。global 规则是私有的。")
+    else:
+        assert_project_access(client, row.get("project_id"), user_id=user_id)
+
+    if action == "mute":
+        days = int(days or 90)
+        if days < 1:
+            raise ValueError("mute 的天数至少是 1")
+        until = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        fields = {"muted_until": until}
+    elif action == "unmute":
+        fields = {"muted_until": None}
+    elif action == "retire":
+        # 降回试用档 = 不再进简报, 但**不删**。删了就没法回头看"这条当初为什么
+        # 被记下来", 而技艺库的价值恰恰在那段演化史里。
+        fields = {"status": "candidate"}
+    elif action == "promote":
+        fields = {"status": "confirmed"}
+    else:                                   # set_direction
+        direction = (direction or "").strip()
+        if direction in ("", "通用"):
+            fields = {"applicability": None}
+        elif direction in DIRECTION_TAGS:
+            fields = {"applicability": direction}
+        else:
+            raise ValueError(f"direction 只能是 {list(DIRECTION_TAGS)} 或 '通用', "
+                             f"收到 {direction!r}")
+
+    saved = store.update_memory_fields(client, memory_id, fields)
+    return {
+        "memory_id": memory_id,
+        "content": (row.get("content") or "")[:120],
+        "action": action,
+        # 一律以库里的值回报。回报入参 = record_rule 那条 severity bug 的复刻。
+        "now": {
+            "status": (saved or {}).get("status"),
+            "muted_until": (saved or {}).get("muted_until"),
+            "applicability": (saved or {}).get("applicability") or "通用",
+        },
+    }
 
 
 _CALIB_SYSTEM = """\

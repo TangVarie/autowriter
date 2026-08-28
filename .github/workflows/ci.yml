@@ -88,16 +88,18 @@ jobs:
           import deskcore.tools as T
           import inspect
           src = inspect.getsource(T)
-          SAFE_OK = {"list_projects", "borrow_lessons", "my_style"}
+          # my_rules 是规则台账(纯读): 看不到台账不影响写稿, 可降级。
+          SAFE_OK = {"list_projects", "borrow_lessons", "my_style", "my_rules"}
           wrapped = set()
           for name in T.TOOLS:
               body = inspect.getsource(T.TOOLS[name][0])
               if "_safe(" in body:
                   wrapped.add(name)
           assert wrapped == SAFE_OK, f"_safe 包装范围变了: {wrapped} != {SAFE_OK}"
-          print(f"  ✓ _safe 只包三个可降级的读: {sorted(SAFE_OK)}")
+          print(f"  ✓ _safe 只包这几个可降级的读: {sorted(SAFE_OK)}")
           for name in ("open_project", "record_rule", "record_edit", "label_example",
-                       "draw_angles", "check_drafts", "commit_drafts"):
+                       "draw_angles", "check_drafts", "commit_drafts",
+                       "set_rule_state"):
               assert name not in wrapped, f"{name} 不能包 _safe(合规读/写, 失败必须冒泡)"
           print("  ✓ 合规读与全部写操作都不吞异常")
 
