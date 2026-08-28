@@ -286,4 +286,28 @@ class FakeClient:
             hits = hits[q.rng[0]:q.rng[1] + 1]
         if self.max_rows is not None:
             hits = hits[:self.max_rows]     # 服务端钳位: 静默截断, 不报错
+        hits = [self._project_cols(r, q.cols) for r in hits]
         return FakeResponse(hits, count=total if q.count_mode == "exact" else None)
+
+    @staticmethod
+    def _project_cols(row: dict, cols: str) -> dict:
+        """按 select 的列清单裁剪返回的行 —— PostgREST 就是这么干的。
+
+        ⚠️ 假件此前**忽略列清单、一律回整行**, 于是"select 里漏了一列"这个
+        故障在测试里【根本不可复现】。本会话刚踩过: 给
+        ``projects.calibration_notes``(27 个项目、约 25000 字的调校笔记积累)
+        写了一条保护用例, 把 ``store.project_row`` 的 ``select("*")`` 改成漏掉
+        该列的列清单之后, 用例**照样是绿的** —— 因为假件把整行都给了。
+        这条用例守的是一个不存在的世界, 与 NOT NULL 那次是同一种假绿。
+
+        只做真实语义的一小块: ``*`` 全量, 逗号分隔的列名裁剪, 带关联查询
+        (``a(b)``)或别名(``x:y``)的一律放行不裁 —— 那部分语义复杂, 裁错了会
+        制造出比它能挡住的更难查的假红。
+        """
+        cols = (cols or "*").strip()
+        if not cols or cols == "*":
+            return row
+        names = [c.strip() for c in cols.split(",") if c.strip()]
+        if any(("(" in n) or (":" in n) or (n == "*") for n in names):
+            return row                      # 关联/别名: 不裁, 见 docstring
+        return {k: v for k, v in row.items() if k in names}

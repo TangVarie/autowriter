@@ -149,6 +149,97 @@ def test_every_project_scoped_entrypoint_calls_the_gate():
         "审计 COR-015 的整条修复就是靠「每个入口都以这一行开头」成立的")
 
 
+# 收 project_id 却【故意】不过闸的函数, 每条都要有理由。
+# 这份名单的方向跟上面那份相反: 上面是"列进来才检查", 这里是"不列进来就必须
+# 检查"。前者漏登记 = 静默放行, 后者漏登记 = 当场红。
+UNGATED_WITH_REASON = {
+    "assert_project_access": "它【就是】那道闸",
+    "_history_probe":        "私有辅助函数, 由已过闸的调用方传入 project_id",
+    "_rpc_missing_telemetry": "只打一行遥测, 不读写业务数据",
+    "build_distillation_task": "私有辅助函数, 由已过闸的 record_edit / my_style 调用",
+    # 运维命令: 跑它们的人手里握着 service_role key(等价于直连库), 加校验挡不住
+    # 任何人, 只会挡住"帮同事补一下指纹", 还给人"运维路径也隔离了"的错觉。
+    # 这条取舍写在 docs/deskcore.md §2.2.1 的表里。
+    "reembed_fingerprints":   "运维命令, 见 docs/deskcore.md §2.2.1",
+    "recompute_fingerprints": "运维命令, 见 docs/deskcore.md §2.2.1",
+    "backfill_fingerprints":  "运维命令, 见 docs/deskcore.md §2.2.1",
+    "backfill_gap":           "运维命令, 见 docs/deskcore.md §2.2.1",
+}
+
+
+def test_no_new_project_scoped_function_slips_past_the_gate():
+    """**默认必须过闸**——收 `project_id` 却没调闸的函数, 要么加校验, 要么
+    写进 UNGATED_WITH_REASON 并说明理由。
+
+    为什么加这条: 上面那条断言钉的是一份**硬编码名单**, 它的失效方式写在它
+    自己的 docstring 里——"有人新加工具忘了加校验 → 只要把函数名列进
+    GATED_ENTRYPOINTS 就会红"。也就是说**忘了登记就不会红**, 而"忘了登记"
+    恰恰是最可能发生的那件事。
+
+    2026-08-27 加 `create_project` 时撞上了这个缺口: 它是名单建立之后的第一个
+    新工具, 全量测试一路绿, 而绿灯并不代表它被检查过——只代表没人把它列进去。
+    (它确实不该过这道闸: 它不打开已有项目。但那结论是人肉推出来的, 不是测出
+    来的, 这正是问题所在。)
+
+    把默认值反过来之后, 下一个新工具漏了校验会**当场红**, 而不是等到某次审计。
+    """
+    tree = ast.parse((REPO_ROOT / "deskcore" / "core.py").read_text(encoding="utf-8"))
+    offenders = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        params = [a.arg for a in node.args.args + node.args.kwonlyargs]
+        if "project_id" not in params:
+            continue
+        if node.name in UNGATED_WITH_REASON:
+            continue
+        gated = any(
+            isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+            and sub.func.id == "assert_project_access"
+            for sub in ast.walk(node))
+        if not gated:
+            offenders.append(node.name)
+
+    assert not offenders, (
+        f"这些函数收 project_id 却没过归属校验: {offenders}。"
+        "要么加 assert_project_access, 要么写进 UNGATED_WITH_REASON 并说明理由 —— "
+        "不许默默留着。")
+
+
+def test_the_exemption_list_has_not_gone_stale():
+    """豁免名单里的函数必须还存在, 且确实收 project_id。
+
+    改名/删函数之后名单会悄悄失效: 一个不存在的名字永远匹配不上, 于是它豁免的
+    那个位置重新变成裸奔而没人知道。
+    """
+    tree = ast.parse((REPO_ROOT / "deskcore" / "core.py").read_text(encoding="utf-8"))
+    fns = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    stale = []
+    for name in UNGATED_WITH_REASON:
+        node = fns.get(name)
+        if node is None:
+            stale.append(f"{name}(函数没了)")
+            continue
+        params = [a.arg for a in node.args.args + node.args.kwonlyargs]
+        if "project_id" not in params:
+            stale.append(f"{name}(已经不收 project_id 了)")
+    assert not stale, f"豁免名单过期: {stale} —— 清理掉, 别让它挡住真正的检查"
+
+
+def test_create_project_takes_no_owner_from_the_caller():
+    """`create_project` 不过上面那道闸(它不打开已有项目), 它的等价保证是
+    **归属不接受参数**。这条断言就是它在归属这一层的全部保护。
+
+    签名里加一个 owner 参数 = 允许往别人名下建项目。同一天刚踩过同类的坑:
+    一把标着某人名字的 key 实际指向同事账号。
+    """
+    import inspect
+    from deskcore import tools as _tools
+    for fn in (core.create_project, _tools.create_project):
+        bad = {p for p in inspect.signature(fn).parameters if "owner" in p.lower()}
+        assert not bad, f"{fn.__name__} 的签名里有归属参数: {bad}"
+
+
 @pytest.mark.parametrize("call", [
     lambda sb, pid: core.build_writing_brief(sb, pid, user_id=ME, brief={}),
     lambda sb, pid: core.draw_angles(sb, pid, 3, user_id=ME),

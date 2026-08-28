@@ -150,6 +150,64 @@ def list_all_projects(sb, *, owner_id: str) -> list[dict]:
     ))
 
 
+def projects_with_exact_name(sb, *, owner_id: str, name: str) -> list[dict]:
+    """同 owner 下**名字相同**的项目 —— 大小写与首尾空格都不算差异。
+
+    ⚠️ 只按 owner 查, 不查全库: 别人的项目叫什么跟这次建重不重没关系, 而把
+    全库项目名暴露给调用方正是审计 COR-015 堵掉的那个洞。
+
+    ⚠️ 判据从服务端的 ``.eq("name", name)`` 挪到了这里, 因为那个写法**漏得很
+    安静**: PG 的 ``=`` 对文本大小写敏感, 于是先建 ``"Sportsix"`` 再建
+    ``"sportsix"`` 会判成两个不同的项目, ``created=True``, 库里两行, 不报错。
+    两个同名项目 = 两套互不可见的历史库, ``check_drafts`` 按 project_id 比,
+    从此对这个方向永久失效。库里也没有唯一索引兜底(见下)。
+
+    为什么把比对放 Python 而不是用 ``.ilike``:
+      · ``ilike`` 要自己转义 ``% _ \\``, 转义写错的表现是"匹配不到"——又是一个
+        安静的漏法, 而它正是本函数要堵的那类。
+      · 首尾空格 ``ilike`` 也管不了(库里存着 ``"途鸽 "`` 时), 还是要 Python 复核,
+        那就只保留一处判据。
+      · 单个 owner 的项目是**几十条**量级(现网最多 29), 全取回来的代价可以忽略。
+        真长到几百上千再回头做服务端过滤 —— 那时 ``_paged`` 已经在了。
+
+    ⚠️ 这仍然是 check-then-insert, **不是原子的**: 两次并发调用会各自查空、各自
+    建成。库上没有 ``UNIQUE (owner_id, lower(btrim(name)))``, 与 docs/deskcore.md
+    §2.3-D「并发正确性交给数据库」的纪律相反。加索引要一次迁移, 且得先处理存量
+    可能已有的重名行, 单独做 —— 记在 runbook 待办里。
+    """
+    want = (name or "").strip().casefold()
+    if not want:
+        return []
+    rows = _paged(lambda off, lim: (
+        sb.table("projects")
+          .select("id, name, brand")
+          .eq("owner_id", owner_id)
+          .order("id")
+          .range(off, off + lim - 1)
+    ))
+    return [r for r in rows
+            if (r.get("name") or "").strip().casefold() == want]
+
+
+def projects_with_brand(sb, *, owner_id: str, brand: str) -> list[dict]:
+    """同 owner 下同品牌的项目 —— 建项目时用来提示"这个品已经有几个方向了"。
+
+    ⚠️ 刻意**不用** ``.or_()`` 把它和上面那个合成一次查询: 测试假件把
+    ``.or_()`` 当无操作处理(见 tests/fakes.py), 合起来写会让撞名检查在测试里
+    永远"通过"而实际没过滤 —— 又是一次"绿灯是假的"。两次查询便宜得多。
+    """
+    if not (brand or "").strip():
+        return []
+    return _paged(lambda off, lim: (
+        sb.table("projects")
+          .select("id, name, brand")
+          .eq("owner_id", owner_id)
+          .eq("brand", brand)
+          .order("name").order("id")
+          .range(off, off + lim - 1)
+    ))
+
+
 # ── 规则(共享层) ──────────────────────────────────────────────────────────
 
 def shared_memories(sb, project_id: str,
@@ -172,10 +230,24 @@ def shared_memories(sb, project_id: str,
     # _is_rule_memory 过的。服务端先用 or_ 收窄, 拉回来再用 db._is_rule_memory
     # 复核一遍 —— 判据只有一个定义, 以后新增 memory_type 也不会漏。
     # (codex review round-5 P2)
-    def _rows(query):
-        rows = (query.eq("status", "confirmed")
-                     .or_("memory_type.is.null,memory_type.eq.rule")
-                     .execute()).data or []
+    # ⚠️ 必须翻页。原来是裸 `.execute()` 无 range —— PostgREST 的 db-max-rows
+    # (Supabase 默认 1000)会【静默钳短】: 越过 1000 条之后的规则在模型眼里
+    # 【根本不存在】, 且没有任何提示。这条路径读的是**强制合规规则**, 被截掉
+    # 的那几条不会报错, 只会让这一批稿子少守几条硬约束 —— 与本函数开头那段
+    # "宁可报错也不能返回空 p0" 是同一个失败模式的另一半, 堵一半等于没堵。
+    # (审计 COR-005/006/008 同款; _paged 的终止判据是空页而不是短页, 见它的
+    # docstring —— 服务端钳短时每一页都是短页。)
+    #
+    # ``build`` 必须每次从 sb.table(...) 重新构造: postgrest-py 复用同一个
+    # builder 时 .range() 的偏移会叠加。所以这里收的是**建查询的函数**,
+    # 不是建好的查询。
+    def _rows(build):
+        rows = _paged(lambda off, lim: (
+            build().eq("status", "confirmed")
+                   .or_("memory_type.is.null,memory_type.eq.rule")
+                   .order("created_at").order("id")
+                   .range(off, off + lim - 1)
+        ))
         return [r for r in rows if db._is_rule_memory(r)]
 
     # embedding: 给 memory.filter_soft_by_relevance 用。
@@ -185,10 +257,10 @@ def shared_memories(sb, project_id: str,
     # 就是这么做的)。这个坑不修比不加相关性过滤更糟。
     cols = ("id, content, severity, scope, rule_kind, rule_payload, "
             "muted_until, user_id, memory_type, created_at, frequency, embedding")
-    proj = _rows(sb.table("memories").select(cols)
-                   .eq("project_id", project_id).eq("scope", "project"))
-    glob = (_rows(sb.table("memories").select(cols)
-                    .eq("scope", "global").eq("user_id", user_id))
+    proj = _rows(lambda: sb.table("memories").select(cols)
+                           .eq("project_id", project_id).eq("scope", "project"))
+    glob = (_rows(lambda: sb.table("memories").select(cols)
+                            .eq("scope", "global").eq("user_id", user_id))
             if user_id else [])
 
     # ⚠️ 静音判定必须复用 db.is_memory_muted_now, 不能在这里自己写一份

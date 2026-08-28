@@ -132,11 +132,17 @@ jobs:
                "memory_type": "session", "created_at": "2026-01-01", "frequency": 1},
           ]
           class _MQ:
+              # ⚠️ order/range 不是摆设: shared_memories 走 _paged 翻页(它靠
+              # 【空页】收工)。range 若是空操作, 每次都回全部行 → 永不空页 →
+              # 无限循环。所以 range 必须真切片。
               def __init__(self, rows): self._r = rows
               def select(self, *a, **k): return self
               def eq(self, *a, **k): return self
               def neq(self, *a, **k): return self
               def or_(self, *a, **k): return self
+              def order(self, *a, **k): return self
+              def range(self, start, end):
+                  q = _MQ(self._r[start:end + 1]); return q
               def execute(self): return _Resp(self._r)
           class _MSB:
               def __init__(self, rows): self._r = rows
@@ -877,10 +883,14 @@ jobs:
           # 本地那版对 naive ISO 和 7 位微秒会抛异常 → except 返 True →
           # 【被静音的规则照常注入 P0/P1】。
           class _MQ:
+              # order/range 见上一处同名假件的说明: range 必须真切片, 否则
+              # _paged 永远等不到空页。
               def __init__(s, rows): s.r = rows
               def select(s,*a,**k): return s
               def eq(s,*a,**k): return s
               def or_(s,*a,**k): return s
+              def order(s,*a,**k): return s
+              def range(s, start, end): return _MQ(s.r[start:end + 1])
               def execute(s): return _R(s.r)
           class _MSB:
               def __init__(s, rows): s.r = rows
@@ -2577,6 +2587,24 @@ jobs:
           assert got == sorted(_T.TOOLS), f"MCP 暴露的工具与 TOOLS 不一致: {got}"
           assert "_user_id" not in r.text, "身份参数不该出现在工具 schema 里"
           print(f"  ✓ MCP tools/list 暴露全部 {len(got)} 个工具, 且不含 _user_id")
+
+          # ── 新品牌进得来 ────────────────────────────────────────────────
+          # 2026-08-27 现场: 团队第一次真用起来, 要给六个新品开项目, 模型如实
+          # 回答"deskcore 这套工具里压根没有新建项目这个动作" —— 而 skill 又
+          # 强制"动笔前必须先 open_project"。想建建不了、想跳过又不让跳,
+          # 新品牌完全进不来。这里钉死那个入口还在。
+          assert "create_project" in got, (
+              "create_project 不在 MCP 工具表里 —— 新品牌又进不来了")
+          _schema = [t for t in r.json()["result"]["tools"]
+                     if t["name"] == "create_project"][0]
+          _props = set((_schema.get("inputSchema") or {}).get("properties", {}))
+          # 归属绝不能由调用方指定: 有 owner 参数 = 可以往别人名下建项目。
+          _owner_params = {p for p in _props if "owner" in p.lower()}
+          assert not _owner_params, (
+              f"create_project 的 schema 里有归属参数 {_owner_params} —— "
+              "调用方就能往别人名下建项目")
+          assert "name" in _props, f"create_project 少了 name 参数: {_props}"
+          print(f"  ✓ create_project 已暴露, 参数 {sorted(_props)}, 无归属参数")
 
           bad = c.post("/mcp", json=INIT, headers={**H, "X-Deskcore-Key": "nope"})
           assert bad.status_code == 401, f"错 key 打 /mcp 不是 401: {bad.status_code}"

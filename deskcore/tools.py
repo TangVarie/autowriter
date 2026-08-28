@@ -1,6 +1,6 @@
 """deskcore/tools.py — MCP 工具面。
 
-十二个工具, 按写稿的三个阶段分组。设计原则是【一次调用拿全】—— 治员工反馈里
+十三个工具, 按写稿的三个阶段分组(外加一个 create_project 开项目)。设计原则是【一次调用拿全】—— 治员工反馈里
 那条「一个项目一般有 5 个提示词要重复操作 5 次, 我的工作台至少有几十个提示词」。
 
 每个工具的 docstring 就是模型看到的说明, 所以写给模型看; 维护者要看的原因
@@ -66,6 +66,32 @@ def _safe(fn, *args, **kwargs) -> Any:
 # 写稿前
 # ══════════════════════════════════════════════════════════════════════
 
+def create_project(name: str, brand: str = "",
+                   _user_id: str | None = None) -> dict:
+    """给一个新品牌 / 新方向开一个项目。**建完立刻用返回的 project_id 调
+    open_project 接管。**
+
+    什么时候调: 用户要写的那个品在 ``list_projects`` 里没有。
+
+    **调之前先 list_projects 看一眼** —— 已经有的项目不要重建。返回值里
+    ``created`` 是 false 就说明撞名了, 库里没新建, 直接用返回的那个
+    project_id, 别改名重试。
+
+    返回里带 ``siblings`` 时要停下来问用户: 说明这个品牌名下已经有别的项目
+    了。新项目是**独立的一套历史库**, 跟它们不互相查重 —— 如果本意是在已有
+    方向下继续写, 用那个已有项目才对。
+
+    参数:
+      name  —— 项目名, 建议带上方向, 例如「途鸽-D8薪资谈判」而不是光「途鸽」。
+      brand —— 品牌名, 同品牌的项目靠它归堆。同一个品的项目 brand 要写一致。
+
+    ⚠️ 项目归属**恒为你自己**, 不能替别人建。别人要用得他自己那把 key 建。
+    """
+    # 故意不包 _safe: 这是【写】操作。建失败若降级成带 error 的"成功", 调用方
+    # 会拿着一个不存在的 project_id 往下走, 后面每个工具都 404 而根因看不见。
+    return core.create_project(core.sb(), name, brand=brand, user_id=_user_id)
+
+
 def list_projects(_user_id: str | None = None) -> dict:
     """列出【你名下】的项目, 以及每个项目手上有多少积累。
 
@@ -93,8 +119,11 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     而不是按时间倒序 —— 后者会让文风越写越窄。所以知道要写什么就传。
 
-    返回的 counts.hard_rules 是 0 而用户以前明明定过规则, 多半是 project_id
-    传错了, 问一句。
+    ⚠️ **counts.hard_rules 是 0 属于正常, 不要因此怀疑 project_id 传错。**
+    现存库里三百多条规则的 severity 全是 soft, 一条 hard 都没有(老工作台收
+    反馈时不分"这一次"和"以后都这样", 一律存成 soft)。传错 project_id 的真实
+    表现是 403, 或者 soft_rules 和 soft_rules_pool 【同时】为 0。
+    只有后者才值得问一句。
 
     这个工具出错会直接报错, 不会返回半份简报。报错就【停下来】, 不要凭记忆
     或常识补一份约束继续写 —— 这个项目的硬约束是什么, 只有库里那份算数。
@@ -385,6 +414,7 @@ def save_my_style(project_id: str, notes: str,
 #   · borrow_lessons → 发给馆员的 brief 是拿项目行拼的(品牌/定位/战术)
 # 新增工具时默认写 True; 想写 False 就得先说明它凭什么不需要知道是谁在调。
 TOOLS = {
+    "create_project": (create_project, True),
     "list_projects":  (list_projects,  True),
     "open_project":   (open_project,   True),
     "draw_angles":    (draw_angles,    True),
