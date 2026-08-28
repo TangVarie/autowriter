@@ -60,7 +60,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
 | **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
-| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、13 个工具都在、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
+| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、**15 个工具**都在（2026-08-28 加了 `my_rules` / `set_rule_state`）、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
 | **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
 | `draft_fingerprints` | ✅ **3,678 行 / 44 个项目**（2026-08-26 回填，见 §1.5）。当前模型 3,671 / 来路不明 0 / 别的模型 0 / 维度 min=max=768 / 重复 `version_id` 0 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
@@ -402,6 +402,46 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 > ```
 > 当前 items 最多的三个 `user_id`：`85f5f888…`(3,385) · `afbaf84e…`(667) · `b907ec9d…`(504)。
 
+#### key 轮换（怎么换、为什么这么换）
+
+key 一旦在聊天窗口、截图、工单里出现过，就当它已经泄露 —— deskcore 持
+`service_role` 绕过 RLS，一把有效 key 等于那个人名下**全部项目数据 + 十五个
+工具（含写）**。轮换是唯一的补救。
+
+**第一步：本地生成，不要让任何人替你生成。**
+
+```bash
+python - <<'EOF'
+import secrets
+for who, uid in [
+    ("quanquan", "85f5f888-a649-4843-8358-9c83c91282e6"),
+    ("jiayi",    "afbaf84e-e5a3-4429-9490-72718d2a9019"),
+    ("ziao",     "b907ec9d-9e49-4dac-89ad-220eb53afc38"),
+]:
+    print(f'  "k-{who}-{secrets.token_urlsafe(24)}": '
+          f'{{"user_id": "{uid}", "name": "{who}"}},')
+EOF
+```
+
+**为什么必须是你自己在本地跑**：让别人（包括 AI 助手）生成，新 key 就又一次
+经过了聊天记录、日志和上下文窗口 —— 那是刚刚要修的那个洞。这段脚本只吐字符串，
+不联网、不落盘。
+
+**第二步**：把输出拼成 JSON（去掉最后一个逗号），整体替换 Railway 上的
+`DESKCORE_KEYS`，等服务重启。
+
+**第三步**：`curl -s <服务地址>/health | grep auth` 确认 `note` 还是 `3 key(s)`。
+数目对不上就是 JSON 写坏了 —— 注意 `_key_map()` 是 **fail-closed** 的：
+解析失败一律 401，不会退化成"没配"（那曾经等于匿名全开，见 ROB-003）。
+
+**第四步**：把新 key 分别发给本人，**一人一把，不要群发**。旧 key 在第二步
+替换的瞬间就失效了，不需要额外撤销动作。
+
+⚠️ **`name` 字段只是给人看的备注，不参与鉴权**。2026-08-27 踩过一次：一把叫
+`k-ziao-…` 的 key，`user_id` 指向的其实是同事的账号 —— 拿它写稿会把稿子记进
+**别人**的历史库。轮换时对着上面 §「owner 分布」那张表逐个核 UUID，别照抄
+旧配置里的名字。
+
 > ⚠️ 少写一层（`{"k": "<uuid>"}`）是**合法 JSON**，`identity.py` 会当成配置错误抛
 > 可读的 401——不会漏到运行期变成 500。JSON 整个写错也一律 401，**不会**退化成
 > "没配鉴权"然后放行（这条曾经是 fail-open 的）。
@@ -736,6 +776,76 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 12 | 给 native 正例补 essence 标注 | 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，TV 的饱和度监控对它们只能报"无法评估" |
 | 13 | `projects` 加 `UNIQUE (owner_id, lower(btrim(name)))` | `create_project` 的撞名保护是**应用层 check-then-insert**，两次并发调用会各自查空、各自建成。判据（大小写与首尾空格都不算差异）已经和这个索引对齐，加索引就是把它下推给数据库——与 `docs/deskcore.md` §2.3-D「并发正确性交给数据库」同一口径。**做之前要先处理存量可能已有的重名行**，所以单独一次迁移。现网并发建项目的概率极低，不阻塞 |
 | 14 | `store.recent_angle_keys` 也走 `_paged` | 它读 `angle_ledger` 仍是裸 `.execute()`，同 COR-005/006/008 那一族的静默截断。台账被钳短的后果是**已经用过的角度组合会被当成没用过再抽一次**，跨批次去重悄悄退化。现网台账还很小，等它长起来之前做掉 |
+| 15 | `/health` 回显注入封顶 | **纯便利, 不是唯一手段** —— `open_project` 的返回里已经有 `counts.soft_rules_cap_per_scope`(`deskcore/core.py:330`, 直接取自 `MAX_INJECTED_MEMORIES_PER_SCOPE`), 拿一把 key 和一个 project_id 就能确认线上生效值。放进 `/health` 的好处是**不需要 key、不需要 project_id**, 改完 env 立刻能验。(初稿把这条写成「线上无法验证」—— 错的, codex review 指出, 已改) |
+| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 deskcore 侧入口已就位**：`python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **它只管存量, 不是给「新规则没向量」兜底** —— 新规则本来就有向量：`db.upsert_memory` 在写入时就算(`db.py:1748`)。缺向量的 174 条来自两处：① 2026-08-28 用裸 SQL 灌的 66 条技艺库种子(**绕过了 upsert_memory**, 见 §4.5)；② 更早那批建于这段代码之前、或当时没配 GOOGLE_API_KEY 的。Streamlit 的记忆管理页也有一个「立即补算(最多 50 条)」按钮调同一个函数(`memory.py:2072`)；CLI 这版补的是它没有的三件事：**翻页**、**停滞检测**(`updated=0` 就停, 否则每轮查到同一批行、白花 embedding 的钱)、**非零退出码**。补几条用那个按钮更快。**还没跑**：跑之前那 174 条不参与相关性筛选 |
+
+---
+
+## 4.5 个人技艺库种子（2026-08-28 已投放）
+
+把 27 份项目调校笔记（约 25,000 字、381 条工艺批注）聚成 37 簇、经三路独立
+质疑分档之后，按人写进各自的 `scope='global'` 库。
+
+**写法上的三个决定**，每条都对应一句产品要求（「技艺库要跟着写的人自己长，
+不能靠一个不写稿的人在后端调」）：
+
+| 决定 | 为什么 |
+|---|---|
+| `scope='global'`，不是项目规则 | 读路径里 global 是**私有**的（`.eq("user_id", user_id)`），队友互相看不见。这是个人技艺，不是团队规范 |
+| **每条只写进真正记过它的那个人** | 簇的 `owners` 字段有记录。只有一个人记过的就只进那个人的库——写进别人库里就是「后端下发」 |
+| `applicability` 一律留空 | 方向档的初值**推不出来**：37 簇是在没有方向维度的前提下聚的，连质疑者点名为「方向分支」的三对（结尾截断 vs 收口、去品牌标签 vs 嵌品牌名、编号分点 vs 叙事）项目集都是交叠的。填上去就是猜。第一个方向标签留给写手用 `set_rule_state set_direction` 自己打 |
+
+**分档与落库形态**
+
+| 档 | 判据 | 条数 | `status` |
+|---|---|---|---|
+| A | 三路质疑零异议 | 9 | `confirmed`（进简报） |
+| B | 2/3 通过，一票保留 | 8 | `candidate` |
+| C | 无多数 | 14 | `candidate` |
+| D | ≥2 票判品牌方向特有 | 6 | **不入库**，留项目层 |
+
+B 档没有直接设成 `confirmed`，是因为每条都带一票保留意见——让写手自己
+`promote` 比替她转正更符合上面那句要求，也顺带避开了下面这个坑。
+
+**实际落库**（`source_feedback='craft-seed-2026-08-28'`）
+
+| 人 | 种子 | 其中生效 | 其中试用 | 她原有 | global 合计 |
+|---|---|---|---|---|---|
+| 623346512（圈圈） | 31 | 9 | 22 | 18 | 49 |
+| 1796631194（佳怡） | 22 | 8 | 14 | 0 | 22 |
+| tangziao1997 | 13 | 7 | 6 | 1 | 14 |
+
+另有 2 簇的记录人是 `other`（匹配不上花名册），**没写**。
+
+### 4.5.1 灌之前必须先调 cap —— 差点造成的一次事故
+
+`db._rank_memories_for_injection` 对 **7 天内新建的规则一律优先**，然后砍到
+`MAX_INJECTED_MEMORIES_PER_SCOPE`。圈圈有 18 条自己设了几个月的 global 规则，
+cap 当时是 12：
+
+| 灌入量 | 她的旧规则还剩几条进简报 |
+|---|---|
+| 9 条 | 3 条 |
+| 31 条（原计划） | **0 条，持续 7 天，无提示** |
+
+所以顺序是**先把 cap 调到 18（PR #72）并等部署落地，再灌种子**。调完之后
+实测她的注入池是「9 条技艺种子 + 她自己票数最高的 9 条」，正好 18。
+
+⚠️ 这也是为什么 B+C 档全进 `candidate`：22 条如果一起 `confirmed`，即使
+cap=18 也会把她的旧规则重新挤空。
+
+### 4.5.2 怎么撤
+
+全部种子带同一个标记，撤销是一条语句：
+
+```sql
+delete from autowriter.memories
+where source_feedback = 'craft-seed-2026-08-28';
+```
+
+只撤某一个人的，加 `and user_id = '<uuid>'`。**原始的 27 份笔记在
+`projects.calibration_notes` 里一个字没动**——种子是 `memories` 的新增行，
+两者互不影响。
 
 ---
 

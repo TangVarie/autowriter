@@ -347,3 +347,80 @@ def test_a_fresh_batch_cannot_starve_the_rules_someone_set_months_ago():
     assert len(survived) >= len(fresh), (
         f"cap={cap} 太小：9 条新技艺进来之后旧规则只剩 {len(survived)} 条。"
         "写手会发现自己设了几个月的规矩突然不生效，而且没有任何提示。")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 向量: 写入时就算, 缺的要露出来
+# ══════════════════════════════════════════════════════════════════════
+
+def test_missing_embedding_count_is_real_not_a_swallowed_zero():
+    """缺向量的条数必须真的数出来。
+
+    ⚠️ ``count_rules_missing_embedding`` 出异常时返回 0(数不出来不该拖垮台账)。
+    那个 except 意味着"假件不支持 count/is_" 和 "真的一条都不缺" 长得一模一样,
+    于是这条计数可以在完全不工作的情况下让全套测试保持绿。所以这里造的是
+    **有缺的** 场景, 断言数字对得上。
+    """
+    rows = [_rule(1, embedding=None),
+            _rule(2, embedding=[0.1] * 3),
+            _rule(3, scope="global", project_id=None, embedding=None)]
+    out = core.my_rules(_client(rows), PID, user_id=ME)
+    assert out["counts"].get("缺向量") == 2, out["counts"]
+    assert "reembed-rules" in out.get("note_missing_embedding", "")
+
+
+def test_no_note_when_every_rule_has_a_vector():
+    rows = [_rule(1, embedding=[0.1] * 3)]
+    out = core.my_rules(_client(rows), PID, user_id=ME)
+    assert "缺向量" not in out["counts"]
+    assert "note_missing_embedding" not in out
+
+
+def test_someone_elses_missing_vectors_are_not_counted_as_mine():
+    """别人库里缺向量, 不该算到我头上 —— 那会让我永远看到一个补不掉的数字。"""
+    rows = [_rule(1, embedding=[0.1] * 3),
+            _rule(2, scope="global", project_id=None, user_id=OTHER,
+                  embedding=None),
+            _rule(3, project_id=OTHER_PID, embedding=None)]
+    out = core.my_rules(_client(rows), PID, user_id=ME)
+    assert "缺向量" not in out["counts"], out["counts"]
+
+
+
+
+
+
+def test_a_rule_recorded_through_the_tool_comes_out_with_a_vector(monkeypatch):
+    """走 ``record_rule`` 建的规则必须带向量。
+
+    ⚠️ 这条**故意不关心是哪一层算的**。今天是 ``db.upsert_memory`` 在写入时
+    算(db.py:1748), 但重点不是那行代码在哪, 而是这条路径的**结果**: 新规则
+    有向量, 所以它会参与 ``filter_soft_by_relevance`` 的相关性筛选。
+
+    这一层没了, 故障是无声的 —— 规则照样存下、照样注入, 只是相关性筛选对它
+    永远放行, 于是"跟本次要写的东西毫不相干的旧偏好"也会挤进简报, 而 counts
+    里一切正常。库里现存 174 条无向量的规则就是这么攒出来的(其中 66 条是
+    2026-08-28 用裸 SQL 灌的技艺库种子 —— 绕过了这条路径, 见 runbook §4.5)。
+    """
+    import dedup
+    monkeypatch.setattr(dedup, "embeddings_available", lambda: True)
+    monkeypatch.setattr(dedup, "embed_texts", lambda texts: [[0.5] * 4])
+    sb = _client([])
+    out = core.record_rule(sb, PID, "标题控制在 20 字内", user_id=ME)
+    stored = [r for r in sb.rows["memories"] if r.get("id") == out["memory_id"]]
+    assert stored, "规则没存下来"
+    assert stored[0].get("embedding") == [0.5] * 4, (
+        "新规则没有向量 —— 相关性筛选对它会永远放行, 而且不报错")
+
+
+def test_a_rule_still_gets_saved_when_embedding_is_unavailable(monkeypatch):
+    """算不出向量**不许**把规则本身也弄丢。
+
+    没向量的规则照样生效(相关性过滤对无向量的一律放行), 为了一个向量把整条
+    规则回滚掉是拿大的换小的。
+    """
+    import dedup
+    monkeypatch.setattr(dedup, "embeddings_available", lambda: False)
+    sb = _client([])
+    out = core.record_rule(sb, PID, "标题控制在 20 字内", user_id=ME)
+    assert out["memory_id"], "没配 embedding 就把规则也丢了"
