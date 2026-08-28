@@ -239,15 +239,51 @@ def test_embeddings_are_deserialized_not_handed_over_as_strings():
 # 失败不许降级
 # ══════════════════════════════════════════════════════════════════════
 
-def test_a_query_failure_raises_instead_of_returning_no_rules():
+class _BoomOn(FakeClient):
+    """只让**某一层**的查询炸, 另一层照常。"""
+
+    def __init__(self, *a, scope, **kw):
+        super().__init__(*a, **kw)
+        self._scope = scope
+
+    def _execute(self, q):
+        if q.table_name == "memories" and ("eq", "scope", self._scope) in q.filters:
+            raise RuntimeError(f"{self._scope} 那层的库挂了")
+        return super()._execute(q)
+
+
+@pytest.mark.parametrize("scope", ["project", "global"])
+def test_a_query_failure_raises_instead_of_returning_no_rules(scope):
     """降级成空列表的话, build_writing_brief 会返回一个 p0 为空、却没有任何
     错误标记的正常简报 —— 调用方照常开写, 而这一批稿子不带任何硬约束。
-    那是这个服务最坏的失败模式: 不报错、看起来正常、产出违规内容。"""
-    class Boom(FakeClient):
-        def _execute(self, q):
-            if q.table_name == "memories":
-                raise RuntimeError("库挂了")
-            return super()._execute(q)
+    那是这个服务最坏的失败模式: 不报错、看起来正常、产出违规内容。
 
+    ⚠️ **必须两层各钉一条。** 第一版的假件对 memories 表一律抛, 而 project
+    那层先算先抛 —— 于是 global 那层单独被 try/except 吞掉时测试照样绿, 反过来
+    也一样。自审实测: 给 project 层包上 ``except: proj = []`` → 325 条全绿。
+    "查询失败不许降级"这句话当时只守住了一半, 而且守住的还不是更要命的那半。
+    """
     with pytest.raises(RuntimeError):
-        store.shared_memories(Boom(rows={"memories": []}), PID, ME)
+        store.shared_memories(_BoomOn(rows={"memories": []}, scope=scope), PID, ME)
+
+
+def test_the_column_list_still_brings_scope_and_created_at_back():
+    """``scope`` 和 ``created_at`` 少了都不报错, 但各自坏一件事:
+
+    · 少 ``scope`` → core.py 里三处 ``m.get("scope") == "global"`` 恒假, 通用
+      硬约束被贴上「项目硬约束」的标签注入, P0 的小节标题错位。
+    · 少 ``created_at`` → ``db._rank_memories_for_injection`` 的"7 天内新规则
+      优先"整档变死代码(空串跟 cutoff 比恒假), 排序退化。规则数超过每个 scope
+      12 条封顶时才会真丢规则, 没超只是乱序 —— 但那正是现网 8 个项目的处境。
+
+    对照: 删 ``severity`` / ``muted_until`` / ``embedding`` 本来就会红, 说明
+    假件的列裁剪确实在起作用; 这两列补上就闭合了。
+    """
+    g = _rule(9, scope="global", project_id=None)
+    sb = _client([_rule(1), g])
+    hard, soft = store.shared_memories(sb, PID, ME)
+    got = hard + soft
+    assert got, "前提坏了: 一条规则都没取到"
+    for m in got:
+        missing = {"scope", "created_at"} - set(m)
+        assert not missing, f"select 的列清单漏了 {missing}: {sorted(m)}"

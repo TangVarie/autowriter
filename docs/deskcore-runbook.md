@@ -15,7 +15,7 @@
 回填完 **3,678 行 / 44 个项目**、四路查重信号全部到齐。剩下的只有一件是**你要做**
 的——把 deskcore 挂到客户端（见 §2 第 3 步），不挂上去这一整套没人用。
 
-离线自测：264 条 pytest + selftest + 真 PostgreSQL 上的迁移叠加与 SQL/Python
+离线自测：全套 pytest（条数以实跑为准，别在文档里钉死——前几次提交都在 commit message 里报了新数却没回来改这里）+ selftest + 真 PostgreSQL 上的迁移叠加与 SQL/Python
 逐例比对，全绿。线上实测：`/health` 全绿、13 个工具都在、`semantic_degraded`
 为 `false`；四路查重信号**各自都当过一次判定信号**（`opening` / `title` /
 `ngram` / `contain` 各有一个专属探针，见 §1.5）。
@@ -58,7 +58,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 
 | 部件 | 实测结果 |
 |---|---|
-| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **264 passed, 1 xfailed**；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
+| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
 | **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
 | **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、13 个工具都在、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
 | **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
@@ -734,6 +734,8 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 10 | "把我的调校笔记提升为项目基线" | 同一项目两人各自驯化会让风格分叉。指纹库共享、笔记不共享。跑一段时间看分叉严重程度 |
 | 11 | 拆 `db.py` / `memory.py` / `app.py` | TV R-020，触发式延后。真在这些文件里频繁改动时才做 |
 | 12 | 给 native 正例补 essence 标注 | 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，TV 的饱和度监控对它们只能报"无法评估" |
+| 13 | `projects` 加 `UNIQUE (owner_id, lower(btrim(name)))` | `create_project` 的撞名保护是**应用层 check-then-insert**，两次并发调用会各自查空、各自建成。判据（大小写与首尾空格都不算差异）已经和这个索引对齐，加索引就是把它下推给数据库——与 `docs/deskcore.md` §2.3-D「并发正确性交给数据库」同一口径。**做之前要先处理存量可能已有的重名行**，所以单独一次迁移。现网并发建项目的概率极低，不阻塞 |
+| 14 | `store.recent_angle_keys` 也走 `_paged` | 它读 `angle_ledger` 仍是裸 `.execute()`，同 COR-005/006/008 那一族的静默截断。台账被钳短的后果是**已经用过的角度组合会被当成没用过再抽一次**，跨批次去重悄悄退化。现网台账还很小，等它长起来之前做掉 |
 
 ---
 

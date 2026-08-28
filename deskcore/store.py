@@ -151,19 +151,42 @@ def list_all_projects(sb, *, owner_id: str) -> list[dict]:
 
 
 def projects_with_exact_name(sb, *, owner_id: str, name: str) -> list[dict]:
-    """同 owner 下**名字完全相同**的项目。建项目前的撞名检查。
+    """同 owner 下**名字相同**的项目 —— 大小写与首尾空格都不算差异。
 
     ⚠️ 只按 owner 查, 不查全库: 别人的项目叫什么跟这次建重不重没关系, 而把
     全库项目名暴露给调用方正是审计 COR-015 堵掉的那个洞。
+
+    ⚠️ 判据从服务端的 ``.eq("name", name)`` 挪到了这里, 因为那个写法**漏得很
+    安静**: PG 的 ``=`` 对文本大小写敏感, 于是先建 ``"Sportsix"`` 再建
+    ``"sportsix"`` 会判成两个不同的项目, ``created=True``, 库里两行, 不报错。
+    两个同名项目 = 两套互不可见的历史库, ``check_drafts`` 按 project_id 比,
+    从此对这个方向永久失效。库里也没有唯一索引兜底(见下)。
+
+    为什么把比对放 Python 而不是用 ``.ilike``:
+      · ``ilike`` 要自己转义 ``% _ \\``, 转义写错的表现是"匹配不到"——又是一个
+        安静的漏法, 而它正是本函数要堵的那类。
+      · 首尾空格 ``ilike`` 也管不了(库里存着 ``"途鸽 "`` 时), 还是要 Python 复核,
+        那就只保留一处判据。
+      · 单个 owner 的项目是**几十条**量级(现网最多 29), 全取回来的代价可以忽略。
+        真长到几百上千再回头做服务端过滤 —— 那时 ``_paged`` 已经在了。
+
+    ⚠️ 这仍然是 check-then-insert, **不是原子的**: 两次并发调用会各自查空、各自
+    建成。库上没有 ``UNIQUE (owner_id, lower(btrim(name)))``, 与 docs/deskcore.md
+    §2.3-D「并发正确性交给数据库」的纪律相反。加索引要一次迁移, 且得先处理存量
+    可能已有的重名行, 单独做 —— 记在 runbook 待办里。
     """
-    return _paged(lambda off, lim: (
+    want = (name or "").strip().casefold()
+    if not want:
+        return []
+    rows = _paged(lambda off, lim: (
         sb.table("projects")
           .select("id, name, brand")
           .eq("owner_id", owner_id)
-          .eq("name", name)
           .order("id")
           .range(off, off + lim - 1)
     ))
+    return [r for r in rows
+            if (r.get("name") or "").strip().casefold() == want]
 
 
 def projects_with_brand(sb, *, owner_id: str, brand: str) -> list[dict]:

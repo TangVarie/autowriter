@@ -120,6 +120,43 @@ def test_name_is_stripped_before_the_duplicate_check():
     assert out["created"] is False and out["project_id"] == "p-1"
 
 
+@pytest.mark.parametrize("existing, asked", [
+    ("Sportsix", "sportsix"),          # 库里首字母大写, 又建一个小写的
+    ("sportsix", "SPORTSIX"),          # 反过来, 且全大写
+    ("RIO轻享", "rio轻享"),             # 中英混排, 只有英文那半差大小写
+    ("途鸽 ", "途鸽"),                  # 库里那条带尾随空格(老工作台没 strip 就写进去了)
+    (" 途鸽", "途鸽 "),                 # 两边都带空格
+])
+def test_case_and_whitespace_do_not_create_a_twin(existing, asked):
+    """**这是自审揪出的唯一真 bug。**
+
+    原来的判据是服务端 ``.eq("name", name)``, 而 PG 的 ``=`` 对文本大小写敏感。
+    于是先建 ``Sportsix`` 再建 ``sportsix``, 第二次 ``created=True``, 库里两行,
+    **不报错**。零脏数据即可复现。
+
+    代价不是多一行: 两个同名项目 = 两套互不可见的历史库, ``check_drafts`` 按
+    project_id 比, 从此对这个方向永久失效 —— 而这恰恰是 create_project 的
+    docstring 里承诺"同名不建第二个"要防的那件事, 被自己的判据破掉了。
+
+    空格那半同理: 老工作台的项目名输入框不 strip, 库里存着 ``"途鸽 "`` 时,
+    再建一个 ``"途鸽"`` 照样是两行。
+    """
+    sb = _client([{"id": "p-1", "name": existing, "brand": "", "owner_id": ME}])
+    before = len(sb.rows["projects"])
+    out = core.create_project(sb, asked, user_id=ME)
+    assert out["created"] is False, (
+        f"库里已有「{existing}」, 又建了「{asked}」—— 建出了双胞胎")
+    assert out["project_id"] == "p-1"
+    assert len(sb.rows["projects"]) == before
+
+
+def test_genuinely_different_names_still_get_created():
+    """别矫枉过正: 只是长得像不算撞名, 否则新方向开不出来。"""
+    sb = _client([{"id": "p-1", "name": "途鸽-D1", "brand": "途鸽", "owner_id": ME}])
+    out = core.create_project(sb, "途鸽-D2", brand="途鸽", user_id=ME)
+    assert out["created"] is True and out["project_id"] != "p-1"
+
+
 def test_empty_name_is_refused():
     sb = _client()
     for bad in ("", "   ", None):
@@ -137,14 +174,44 @@ def test_same_brand_still_creates_but_surfaces_the_siblings():
     方向。只有人能判断, 所以给信息不拦。"""
     rows = [{"id": f"p-{i}", "name": f"途鸽-D{i}", "brand": "途鸽",
              "owner_id": ME} for i in range(1, 8)]
+    # ⚠️ 两条诱饵。没有它们的话, projects_with_brand 的 owner_id 和 brand
+    # 两个过滤【删掉任意一个全仓测试都不红】—— 自审实测。这个函数持
+    # service_role 绕 RLS, 那两个 .eq 是唯一防线。
+    rows += [
+        # 别人名下的同品牌: 漏 owner 过滤 = 把别人的项目名和 project_id 交出去
+        # (审计 COR-015 堵的正是这个)。
+        {"id": "p-other", "name": "途鸽-别人的内部方向", "brand": "途鸽",
+         "owner_id": OTHER},
+        # 自己名下的别的品牌: 漏 brand 过滤 = 给 RIO 建项目时列出七个途鸽兄弟,
+        # 模型照着停下来问一个根本不存在的问题。
+        {"id": "p-rio", "name": "RIO-破圈", "brand": "RIO", "owner_id": ME},
+    ]
     sb = _client(rows)
     out = core.create_project(sb, "途鸽-D8薪资谈判", brand="途鸽", user_id=ME)
     assert out["created"] is True
     names = {s["name"] for s in out["siblings"]}
-    assert len(out["siblings"]) == 7, f"兄弟项目没列全: {names}"
-    assert out["project_id"] not in {s["project_id"] for s in out["siblings"]}, \
-        "把自己也算成兄弟项目了"
+    ids = {s["project_id"] for s in out["siblings"]}
+    assert len(out["siblings"]) == 7, f"兄弟项目数不对: {names}"
+    assert "p-other" not in ids, "把别人名下的同品牌项目当成兄弟项目交出去了"
+    assert "p-rio" not in ids, "串品牌了 —— 别的品牌的项目被当成兄弟"
+    assert out["project_id"] not in ids, "把自己也算成兄弟项目了"
     assert out.get("siblings_note"), "列了兄弟项目却没说明它们不互相查重"
+
+
+def test_the_brand_lookup_really_filters_by_owner_in_the_query():
+    """除了看结果, 也钉住**那次查询本身**带了 owner 过滤。
+
+    只断结果的话, 将来有人把两条查询合成一句 ``.or_()``(store.py 的注释里正好
+    邀请过这件事)照样绿 —— 假件把 ``.or_()`` 当无操作。
+    """
+    sb = _client([{"id": "p-x", "name": "别人的", "brand": "途鸽", "owner_id": OTHER}])
+    core.create_project(sb, "途鸽-新方向", brand="途鸽", user_id=ME)
+    proj_queries = [c for c in sb.calls
+                    if c["table"] == "projects" and c["op"] == "select"]
+    assert proj_queries, "根本没查 projects"
+    assert all(("eq", "owner_id", ME) in q["filters"] for q in proj_queries), (
+        "有一次 projects 查询没带 owner 过滤: "
+        f"{[q['filters'] for q in proj_queries]}")
 
 
 def test_siblings_note_says_the_libraries_are_separate():
