@@ -96,7 +96,7 @@ description: 帆谷/BYWOOD 小红书种草文案的【写作台协议】。凡�
 
 ### 写类工具报错 = 没写进去
 
-`create_project` / `draw_angles` / `commit_drafts` / `record_rule` / `record_edit` / `save_my_style` / `label_example` / `set_rule_state` 出错**一律直接报错**，不会返回一个带 `error` 字段的"成功"结果。看到报错就重试，或者告诉用户这次没记下来——**不要当作已完成**。这几件事失败的后果都是无声的：规则没落库会在之后每一次生成里静默缺席，稿子没进指纹库会让同样的内容以后再过一次闸，坐标没销账会让同一个角度下一批再被抽到。
+`create_project` / `draw_angles` / `commit_drafts` / `record_rule` / `record_edit` / `save_my_style` / `label_example` / `set_rule_state` / `reembed_my_rules` 出错**一律直接报错**，不会返回一个带 `error` 字段的"成功"结果。看到报错就重试，或者告诉用户这次没记下来——**不要当作已完成**。这几件事失败的后果都是无声的：规则没落库会在之后每一次生成里静默缺席，稿子没进指纹库会让同样的内容以后再过一次闸，坐标没销账会让同一个角度下一批再被抽到。
 
 只有 `list_projects` / `borrow_lessons` / `my_style` / `my_rules` 四个在出错时返回带 `error` 的降级结果——它们拿不到只是少点参考，可以继续写。
 
@@ -183,6 +183,18 @@ description: 帆谷/BYWOOD 小红书种草文案的【写作台协议】。凡�
 - `set_direction` —— 配合 `direction` 设成 `产品向` / `流量向` / `通用`。
 
 **用户说"别用这条了"时先问一句：是暂时，还是以后都不要？** 前者 `mute`，后者 `retire`。分不清就 `mute`——它会自己到期，猜错的代价小。
+
+**11. `my_rules` 的 counts 里出现「缺向量」→ `reembed_my_rules`。**
+
+没向量的规则**不会报错、照常注入**，只是不参与相关性筛选——也就是跟这次要写的东西毫不相干时也会挤进简报。
+
+一次补最多 50 条。返回的 `remaining` 大于 0 就**再调一次**，直到变成 0。
+
+⚠️ 返回里带 `warning`（查到了却一条都没补上）时**不要再调**——再调还是同一批，只会白花钱。把 warning 原样告诉用户。
+
+只补调用者自己名下的规则，补不到别人的。
+
+**出错会直接抛**（没配 `GOOGLE_API_KEY`、pgvector 没建、查询失败），不会返回一个带 `error` 字段的"成功"。看到报错就把原因告诉用户，**不要当作补完了**。
 
 ## 语言层交给谁
 

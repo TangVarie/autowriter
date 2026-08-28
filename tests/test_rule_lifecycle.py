@@ -366,7 +366,11 @@ def test_missing_embedding_count_is_real_not_a_swallowed_zero():
             _rule(3, scope="global", project_id=None, embedding=None)]
     out = core.my_rules(_client(rows), PID, user_id=ME)
     assert out["counts"].get("缺向量") == 2, out["counts"]
-    assert "reembed-rules" in out.get("note_missing_embedding", "")
+    # 提示必须指向**工具**, 不是 CLI —— 这句话直接送到模型眼前,
+    # 写成 CLI 就等于把用户推回运维环节。
+    note = out.get("note_missing_embedding", "")
+    assert "reembed_my_rules" in note, note
+    assert "cli" not in note.lower(), note
 
 
 def test_no_note_when_every_rule_has_a_vector():
@@ -424,3 +428,224 @@ def test_a_rule_still_gets_saved_when_embedding_is_unavailable(monkeypatch):
     sb = _client([])
     out = core.record_rule(sb, PID, "标题控制在 20 字内", user_id=ME)
     assert out["memory_id"], "没配 embedding 就把规则也丢了"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# reembed_my_rules —— 补向量做成工具, 不用再进 shell
+# ══════════════════════════════════════════════════════════════════════
+
+class _FakeBackfill:
+    """按脚本依次返回 db.backfill_memory_embeddings 的结果, 并记下调用参数。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def __call__(self, client, user_id, max_rows=50):
+        self.calls.append({"user_id": user_id, "max_rows": max_rows})
+        return self.script.pop(0) if self.script else {"status": "noop"}
+
+
+def _with_backfill(monkeypatch, script):
+    fake = _FakeBackfill(script)
+    monkeypatch.setattr(db, "backfill_memory_embeddings", fake)
+    return fake
+
+
+def test_remaining_is_re_queried_not_subtracted(monkeypatch):
+    """``remaining`` 必须重新查库, **不能**拿"上次多少减去补了多少"去算。
+
+    ⚠️ backfill 对算不出向量的行是跳过的, 那种行会永远留在待补集合里。用减法
+    会得出一个一直在降、最后归零的假数字, 而库里其实一条没少 —— 于是调用方
+    看到"补完了"就不再管, 相关性筛选却始终是坏的。
+    """
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 2}])
+    # 库里放 3 条缺向量的: 假件不会因为 backfill 被 mock 掉就少行,
+    # 所以真去查的话必然还是 3, 用减法的话会算成 1。
+    rows = [_rule(i, scope="global", project_id=None, embedding=None)
+            for i in (1, 2, 3)]
+    out = core.reembed_my_rules(_client(rows), user_id=ME)
+    assert out["remaining"] == 3, (
+        f"remaining={out['remaining']} —— 像是用减法算的, 必须重新查库")
+
+
+def test_a_batch_that_updates_nothing_tells_you_to_stop(monkeypatch):
+    """查到了却一条没补上 → 明确叫停, 别让调用方接着调同一批。"""
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 0}])
+    rows = [_rule(1, scope="global", project_id=None, embedding=None)]
+    out = core.reembed_my_rules(_client(rows), user_id=ME)
+    assert "warning" in out and "不要接着调" in out["warning"]
+    assert "next" not in out, "既叫停又叫人再调一次, 自相矛盾"
+
+
+@pytest.mark.parametrize("status, kw", [
+    ("no_embedding_sdk", "GOOGLE_API_KEY"),
+    ("schema_missing",   "pgvector"),
+    ("query_failed",     "查询失败"),
+])
+def test_failure_statuses_raise_instead_of_returning_a_dict(monkeypatch, status, kw):
+    """补算失败必须**抛**, 不能返回一个带 error 字段的字典。
+
+    ⚠️ MCP 把"返回了字典"当成调用成功。返回 {"error": ..., "remaining": N}
+    的话, 调用方模型看到的是一次成功调用 —— 完全可能当作"补完了"往下走。
+    SKILL.md 里也写着这个工具"出错一律直接报错", 返回字典会让代码和文档对不上。
+    """
+    _with_backfill(monkeypatch, [{"status": status, "hint": "pgvector 迁移没跑",
+                                  "error": "boom"}])
+    with pytest.raises(RuntimeError) as exc:
+        core.reembed_my_rules(_client([]), user_id=ME)
+    assert kw in str(exc.value)
+
+
+def test_noop_says_it_is_actually_done(monkeypatch):
+    _with_backfill(monkeypatch, [{"status": "noop"}])
+    out = core.reembed_my_rules(_client([]), user_id=ME)
+    assert out["remaining"] == 0 and "补齐" in out.get("note", "")
+
+
+def test_it_only_ever_backfills_the_caller(monkeypatch):
+    """只补调用者自己名下的 —— 这条路径不是新开的管理面。"""
+    fake = _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    core.reembed_my_rules(_client([]), user_id=ME)
+    assert fake.calls[0]["user_id"] == ME
+
+
+def test_batch_is_clamped_to_fifty(monkeypatch):
+    """别让调用方传一个大 batch 把工具调用拖到超时。"""
+    fake = _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    core.reembed_my_rules(_client([]), user_id=ME, batch=5000)
+    assert fake.calls[0]["max_rows"] == 50
+
+
+def test_no_identity_is_refused(monkeypatch):
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    with pytest.raises(PermissionError):
+        core.reembed_my_rules(_client([]), user_id="")
+
+
+def test_the_tool_is_registered_and_is_not_wrapped_in_safe():
+    import ast
+    import inspect
+
+    from deskcore import tools
+    assert tools.TOOLS["reembed_my_rules"][1] is True
+    src = inspect.getsource(tools.reembed_my_rules)
+    body = ast.parse(src.lstrip()).body[0]
+    calls = [n.func.id for n in ast.walk(body)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert "_safe" not in calls, (
+        "包了 _safe 就会把 no_embedding_sdk / schema_missing 这些状态码"
+        "埋成一个带 error 的「成功」")
+
+
+def test_remaining_counts_every_scope_the_backfill_touches(monkeypatch):
+    """``remaining`` 数的集合必须和 backfill 处理的**完全一致**。
+
+    ⚠️ backfill 只按 ``user_id`` 过滤, 不分 scope。如果这里用台账口径
+    (我的 global + 当前项目), 就会漏掉这个人在**别的项目**里的项目规则 ——
+    第一批补完之后报 remaining: 0 让人收工, 而那些规则一直没有向量、一直
+    不参与相关性筛选。(codex review · PR #74 · P1)
+    """
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    rows = [
+        _rule(1, scope="global", project_id=None, embedding=None),
+        _rule(2, project_id=PID, embedding=None),
+        # 同一个人、**另一个项目**里的规则。台账口径数不到它。
+        _rule(3, project_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+              embedding=None),
+    ]
+    out = core.reembed_my_rules(_client(rows), user_id=ME)
+    assert out["remaining"] == 3, (
+        f"remaining={out['remaining']} —— 漏了别的项目里的规则, "
+        "会让调用方以为补完了")
+
+
+def test_a_count_that_cannot_be_read_is_not_reported_as_zero(monkeypatch):
+    """计数查失败**不许**变成 0。
+
+    "查不出来"和"一条都不缺"绝不能长成同一个值 —— 补算的完成判据就是这个数
+    归零, 吞成 0 等于谎报完工。
+    """
+    def _boom(*a, **k):
+        raise RuntimeError("PostgREST 超时")
+    monkeypatch.setattr(store, "_count_missing_embedding", _boom)
+    _with_backfill(monkeypatch, [{"status": "ok", "updated": 1}])
+    with pytest.raises(RuntimeError):
+        core.reembed_my_rules(_client([]), user_id=ME)
+
+
+def test_the_ledger_hides_the_number_when_it_cannot_be_read(monkeypatch):
+    """台账那一侧相反: 查不出来就**什么都不显示**, 不阻塞看规则。"""
+    def _boom(*a, **k):
+        raise RuntimeError("PostgREST 超时")
+    monkeypatch.setattr(store, "_count_missing_embedding", _boom)
+    out = core.my_rules(_client([_rule(1, embedding=None)]), PID, user_id=ME)
+    assert "缺向量" not in out["counts"]
+    assert "note_missing_embedding" not in out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 重复定义 —— 后一个静默覆盖前一个
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("module_path", [
+    "deskcore/store.py", "deskcore/core.py",
+    "deskcore/tools.py", "deskcore/cli.py",
+])
+def test_no_shadowed_top_level_definitions(module_path):
+    """同名的顶层 def / class 只许有一个。
+
+    ⚠️ 这条是 2026-08-28 现造出来的一个 bug 换来的: 一次脚本改写里
+    ``s[:i] + new + s[j:]`` 假设了 ``j > i``, 实际 j 在 i 前面, 于是中间那段
+    被**复制了一份**, ``store.count_rules_missing_embedding`` 变成两个定义。
+    Python 不报错、不警告, 后一个(旧版)静默生效, 全套测试照样是绿的 ——
+    直到一条断言碰巧盯着新版才有的行为。
+
+    这就是本仓库反复栽的那种形态: 写着已经改了、实际跑的是旧的、而且不报错。
+    """
+    import ast
+    import collections
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(module_path).read_text(encoding="utf-8"))
+    names = [n.name for n in tree.body
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+    dupes = {k: v for k, v in collections.Counter(names).items() if v > 1}
+    assert not dupes, (
+        f"{module_path} 里有同名的顶层定义 {dupes} —— 后一个会静默覆盖前一个")
+
+
+def test_the_count_helper_itself_does_not_swallow_query_errors():
+    """``_count_missing_embedding`` **自己**不许吞异常。
+
+    ⚠️ 这条补的是一个变异漏网: 上一版只有"调用方会把异常传上去"的用例, 而它
+    是把整个 ``_count_missing_embedding`` monkeypatch 掉的 —— 于是往这个函数
+    **内部**加一个 ``except: return 0``, 全套测试照样绿。钉调用方不等于钉实现。
+
+    这里不打桩函数, 打桩的是**客户端**: 让 execute() 真的抛, 看这个 helper
+    是把它传上去还是变成 0。
+    """
+    class _Boom:
+        def table(self, *a, **k):
+            return self
+
+        def select(self, *a, **k):
+            return self
+
+        def eq(self, *a, **k):
+            return self
+
+        def or_(self, *a, **k):
+            return self
+
+        def is_(self, *a, **k):
+            return self
+
+        def limit(self, *a, **k):
+            return self
+
+        def execute(self):
+            raise RuntimeError("PostgREST 超时")
+
+    with pytest.raises(RuntimeError):
+        store.count_own_rules_missing_embedding(_Boom(), user_id=ME)
