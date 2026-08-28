@@ -778,8 +778,14 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 
 **实测：303 条记忆，`severity` 全是 `soft`，`hard` = 0。**
 
-`SKILL.md` 里写着「如果 `counts.hard_rules` 是 0 而用户以前明明定过规则，
-说明可能传错了 project_id，问一句」——**不是传错，是真的一条都没有**。
+`SKILL.md` 里**曾经**写着「如果 `counts.hard_rules` 是 0 而用户以前明明定过规则，
+说明可能传错了 project_id，问一句」——**不是传错，是真的一条都没有**。照那句执行，
+模型每次开工都会怀疑 project_id 传错并问一遍。
+
+> **2026-08-28 已改**（见 §5.8）。`SKILL.md` 和 `deskcore/tools.py` 的
+> `open_project` docstring 两处都改成了「`hard_rules=0` 属于正常」，真正该起疑的
+> 判据是 `soft_rules` 与 `soft_rules_pool` **同时**为 0。上面那句引文保留在这里
+> 是为了记住这个坑长什么样，**不要照它去改代码**。
 
 P0 硬约束层是「规则不忘」的实现机制，在有 hard 规则之前它是空转的。
 见待办 #4。
