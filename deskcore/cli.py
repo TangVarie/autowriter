@@ -330,6 +330,11 @@ def main(argv: list[str] | None = None) -> int:
         help="按当前 normalize 口径重算确定性指纹(**只在改了 normalize 之后跑**)")
     p.add_argument("--project", required=True)
 
+    # ⚠️ 这不是从零新建的能力: Streamlit 的记忆管理页早就有一个
+    # 「立即补算(最多 50 条)」按钮在调同一个 db 函数(memory.py:2072)。
+    # 这一版补的是它没有的三件事 —— 翻页 / 停滞检测 / 非零退出码(能脚本化),
+    # 外加一个不依赖 Streamlit 还活着的入口。补几条的话那个按钮更快。
+    # (codex review · PR #73)
     p = sub.add_parser(
         "reembed-rules",
         help="给【规则】补向量 —— soft 规则的相关性过滤靠它才有意义")

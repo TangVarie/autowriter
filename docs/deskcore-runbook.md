@@ -776,8 +776,8 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 12 | 给 native 正例补 essence 标注 | 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，TV 的饱和度监控对它们只能报"无法评估" |
 | 13 | `projects` 加 `UNIQUE (owner_id, lower(btrim(name)))` | `create_project` 的撞名保护是**应用层 check-then-insert**，两次并发调用会各自查空、各自建成。判据（大小写与首尾空格都不算差异）已经和这个索引对齐，加索引就是把它下推给数据库——与 `docs/deskcore.md` §2.3-D「并发正确性交给数据库」同一口径。**做之前要先处理存量可能已有的重名行**，所以单独一次迁移。现网并发建项目的概率极低，不阻塞 |
 | 14 | `store.recent_angle_keys` 也走 `_paged` | 它读 `angle_ledger` 仍是裸 `.execute()`，同 COR-005/006/008 那一族的静默截断。台账被钳短的后果是**已经用过的角度组合会被当成没用过再抽一次**，跨批次去重悄悄退化。现网台账还很小，等它长起来之前做掉 |
-| 15 | `/health` 回显注入封顶 | `/health` 现在回显 embeddings / CORS / auth / 词表，**偏偏漏了 `MAX_INJECTED_MEMORIES_PER_SCOPE`** —— 而它是这几个里唯一会【静默改变产出】的：调小了规则就少注入几条，没有任何报错。2026-08-28 把它从 12 调到 18 时，线上**无法验证新值是否生效**，只能靠等部署时间。回显它就能一眼确认 |
-| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 入口已就位**：`python -m deskcore.cli reembed-rules --user <uuid>`。它会翻页补到没有为止，并把 `no_embedding_sdk`（没配 GOOGLE_API_KEY）/ `schema_missing`（pgvector 没建）/ `stalled`（查到了却一条没补上）分别报成**非零退出码** —— `db.backfill_memory_embeddings` 的 docstring 记着这几种以前一律塌成 int 0，运维无从判断为什么没反应。**还没跑**：跑之前 soft 规则的相关性过滤仍然几乎是空的，cap 是唯一在限流的东西，别再调高 cap |
+| 15 | `/health` 回显注入封顶 | **纯便利, 不是唯一手段** —— `open_project` 的返回里已经有 `counts.soft_rules_cap_per_scope`(`deskcore/core.py:330`, 直接取自 `MAX_INJECTED_MEMORIES_PER_SCOPE`), 拿一把 key 和一个 project_id 就能确认线上生效值。放进 `/health` 的好处是**不需要 key、不需要 project_id**, 改完 env 立刻能验。(初稿把这条写成「线上无法验证」—— 错的, codex review 指出, 已改) |
+| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 deskcore 侧入口已就位**：`python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **不是从零新建** —— Streamlit 的记忆管理页早就有一个「立即补算(最多 50 条)」按钮在调同一个函数(`memory.py:2072`)。CLI 这版补的是它没有的三件事：**翻页**(那个按钮一次点一批 50, 补不完要一直点)、**停滞检测**(`updated=0` 就停, 否则每轮查到同一批行、白花 embedding 的钱)、**非零退出码**(能脚本化)。Streamlit 还在跑的话, 补几条用那个按钮更快。(codex review 指出初稿把这条写成「缺入口」, 已改) **还没跑**：跑之前 soft 规则的相关性过滤仍然几乎是空的, cap 是唯一在限流的东西, 别再调高 cap |
 
 ---
 
