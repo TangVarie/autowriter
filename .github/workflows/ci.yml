@@ -132,11 +132,17 @@ jobs:
                "memory_type": "session", "created_at": "2026-01-01", "frequency": 1},
           ]
           class _MQ:
+              # ⚠️ order/range 不是摆设: shared_memories 走 _paged 翻页(它靠
+              # 【空页】收工)。range 若是空操作, 每次都回全部行 → 永不空页 →
+              # 无限循环。所以 range 必须真切片。
               def __init__(self, rows): self._r = rows
               def select(self, *a, **k): return self
               def eq(self, *a, **k): return self
               def neq(self, *a, **k): return self
               def or_(self, *a, **k): return self
+              def order(self, *a, **k): return self
+              def range(self, start, end):
+                  q = _MQ(self._r[start:end + 1]); return q
               def execute(self): return _Resp(self._r)
           class _MSB:
               def __init__(self, rows): self._r = rows
@@ -877,10 +883,14 @@ jobs:
           # 本地那版对 naive ISO 和 7 位微秒会抛异常 → except 返 True →
           # 【被静音的规则照常注入 P0/P1】。
           class _MQ:
+              # order/range 见上一处同名假件的说明: range 必须真切片, 否则
+              # _paged 永远等不到空页。
               def __init__(s, rows): s.r = rows
               def select(s,*a,**k): return s
               def eq(s,*a,**k): return s
               def or_(s,*a,**k): return s
+              def order(s,*a,**k): return s
+              def range(s, start, end): return _MQ(s.r[start:end + 1])
               def execute(s): return _R(s.r)
           class _MSB:
               def __init__(s, rows): s.r = rows
