@@ -1955,6 +1955,7 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
         saved = store.update_memory_fields(
             client, out["memory_id"], {"applicability": applicability})
         out["applicability"] = (saved or {}).get("applicability")
+
     return out
 
 
@@ -2010,7 +2011,17 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
     counts: dict = {}
     for r in out:
         counts[r["state"]] = counts.get(r["state"], 0) + 1
-    return {
+
+    # 缺向量的条数要露出来。没向量的规则不会报错、照样注入, 只是**不参与
+    # 相关性筛选** —— 于是"这个项目跟这条规则根本不相干, 它却还是进了简报"
+    # 这件事从外面完全看不出来。这是这套东西唯一一个还需要跑一次运维命令
+    # (cli reembed-rules)才能补上的洞, 不显示出来就没人会想起去跑。
+    missing = store.count_rules_missing_embedding(
+        client, user_id=user_id, project_id=project_id)
+    if missing:
+        counts["缺向量"] = missing
+
+    res = {
         "project_id": project_id,
         "project_name": project.get("name") or "",
         "project_direction": direction or "未判定",
@@ -2020,6 +2031,14 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
                     "retire(降回试用档, 不再进简报) / promote(试用→生效) / "
                     "set_direction(设成 产品向 / 流量向 / 通用)"),
     }
+    if missing:
+        res["note_missing_embedding"] = (
+            f"有 {missing} 条规则没有向量。它们照常注入, 但**不参与相关性筛选** —— "
+            "也就是跟本次要写的东西不相干时也会进简报。运维跑一次 "
+            "`python -m deskcore.cli reembed-rules --user <uuid>` 就能补上。"
+            "走 record_rule 新记的规则会在写入时自动算(db.upsert_memory), "
+            "所以这个数只会往下走, 不会自己涨。")
+    return res
 
 
 def set_rule_state(client, memory_id: str, action: str, *,

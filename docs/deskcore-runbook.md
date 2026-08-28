@@ -777,7 +777,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 13 | `projects` 加 `UNIQUE (owner_id, lower(btrim(name)))` | `create_project` 的撞名保护是**应用层 check-then-insert**，两次并发调用会各自查空、各自建成。判据（大小写与首尾空格都不算差异）已经和这个索引对齐，加索引就是把它下推给数据库——与 `docs/deskcore.md` §2.3-D「并发正确性交给数据库」同一口径。**做之前要先处理存量可能已有的重名行**，所以单独一次迁移。现网并发建项目的概率极低，不阻塞 |
 | 14 | `store.recent_angle_keys` 也走 `_paged` | 它读 `angle_ledger` 仍是裸 `.execute()`，同 COR-005/006/008 那一族的静默截断。台账被钳短的后果是**已经用过的角度组合会被当成没用过再抽一次**，跨批次去重悄悄退化。现网台账还很小，等它长起来之前做掉 |
 | 15 | `/health` 回显注入封顶 | **纯便利, 不是唯一手段** —— `open_project` 的返回里已经有 `counts.soft_rules_cap_per_scope`(`deskcore/core.py:330`, 直接取自 `MAX_INJECTED_MEMORIES_PER_SCOPE`), 拿一把 key 和一个 project_id 就能确认线上生效值。放进 `/health` 的好处是**不需要 key、不需要 project_id**, 改完 env 立刻能验。(初稿把这条写成「线上无法验证」—— 错的, codex review 指出, 已改) |
-| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 deskcore 侧入口已就位**：`python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **不是从零新建** —— Streamlit 的记忆管理页早就有一个「立即补算(最多 50 条)」按钮在调同一个函数(`memory.py:2072`)。CLI 这版补的是它没有的三件事：**翻页**(那个按钮一次点一批 50, 补不完要一直点)、**停滞检测**(`updated=0` 就停, 否则每轮查到同一批行、白花 embedding 的钱)、**非零退出码**(能脚本化)。Streamlit 还在跑的话, 补几条用那个按钮更快。(codex review 指出初稿把这条写成「缺入口」, 已改) **还没跑**：跑之前 soft 规则的相关性过滤仍然几乎是空的, cap 是唯一在限流的东西, 别再调高 cap |
+| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 deskcore 侧入口已就位**：`python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **它只管存量, 不是给「新规则没向量」兜底** —— 新规则本来就有向量：`db.upsert_memory` 在写入时就算(`db.py:1748`)。缺向量的 174 条来自两处：① 2026-08-28 用裸 SQL 灌的 66 条技艺库种子(**绕过了 upsert_memory**, 见 §4.5)；② 更早那批建于这段代码之前、或当时没配 GOOGLE_API_KEY 的。Streamlit 的记忆管理页也有一个「立即补算(最多 50 条)」按钮调同一个函数(`memory.py:2072`)；CLI 这版补的是它没有的三件事：**翻页**、**停滞检测**(`updated=0` 就停, 否则每轮查到同一批行、白花 embedding 的钱)、**非零退出码**。补几条用那个按钮更快。**还没跑**：跑之前那 174 条不参与相关性筛选 |
 
 ---
 

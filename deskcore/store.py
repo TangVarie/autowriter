@@ -378,6 +378,73 @@ def rules_ledger(sb, *, user_id: str, project_id: str | None = None) -> list[dic
     return [r for r in out if (r.get("content") or "").strip()]
 
 
+def count_rules_missing_embedding(sb, *, user_id: str,
+                                  project_id: str | None = None) -> int:
+    """数一下有多少条规则没有向量。
+
+    ⚠️ 用 ``count='exact'`` 单独查, **不要**把 ``embedding`` 加进
+    ``_LEDGER_COLS`` 顺手数 —— 那是 768 维浮点数组, 为了数个数把它们全拉回来
+    是纯浪费(``rule_counts_bulk`` 的注释里记着同一个教训: 只用 len() 却把每条
+    规则的 768 维向量一起拉了回来)。
+    """
+    def _n(build) -> int:
+        try:
+            res = build().is_("embedding", "null").limit(1).execute()
+        except Exception:
+            logger.warning("数缺向量规则失败", exc_info=True)
+            return 0
+        return int(getattr(res, "count", 0) or 0)
+
+    total = _n(lambda: sb.table("memories").select("id", count="exact")
+                         .eq("scope", "global").eq("user_id", user_id)
+                         .or_("memory_type.is.null,memory_type.eq.rule"))
+    if project_id:
+        total += _n(lambda: sb.table("memories").select("id", count="exact")
+                              .eq("scope", "project").eq("project_id", project_id)
+                              .or_("memory_type.is.null,memory_type.eq.rule"))
+    return total
+
+
+def memory_row(sb, memory_id: str) -> dict | None:
+    """按 id 取一条规则 —— 给改状态之前的**归属校验**用。
+
+    只取校验和回报需要的列, 不取 embedding(768 维, 白花流量)。
+    """
+    res = (sb.table("memories")
+             .select("id, scope, project_id, user_id, content, severity, "
+                     "status, muted_until, applicability, memory_type")
+             .eq("id", memory_id).limit(1).execute())
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else None
+
+
+def count_rules_missing_embedding(sb, *, user_id: str,
+                                  project_id: str | None = None) -> int:
+    """数一下有多少条规则没有向量。
+
+    ⚠️ 用 ``count='exact'`` 单独查, **不要**把 ``embedding`` 加进
+    ``_LEDGER_COLS`` 顺手数 —— 那是 768 维浮点数组, 为了数个数把它们全拉回来
+    是纯浪费(``rule_counts_bulk`` 的注释里记着同一个教训: 只用 len() 却把每条
+    规则的 768 维向量一起拉了回来)。
+    """
+    def _n(build) -> int:
+        try:
+            res = build().is_("embedding", "null").limit(1).execute()
+        except Exception:
+            logger.warning("数缺向量规则失败", exc_info=True)
+            return 0
+        return int(getattr(res, "count", 0) or 0)
+
+    total = _n(lambda: sb.table("memories").select("id", count="exact")
+                         .eq("scope", "global").eq("user_id", user_id)
+                         .or_("memory_type.is.null,memory_type.eq.rule"))
+    if project_id:
+        total += _n(lambda: sb.table("memories").select("id", count="exact")
+                              .eq("scope", "project").eq("project_id", project_id)
+                              .or_("memory_type.is.null,memory_type.eq.rule"))
+    return total
+
+
 def memory_row(sb, memory_id: str) -> dict | None:
     """按 id 取一条规则 —— 给改状态之前的**归属校验**用。
 
