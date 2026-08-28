@@ -385,7 +385,7 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 >   而且 B 能改 A 的标注（`label_example` 的归属校验是按 `user_id` 判的）。
 >
 > ⚠️ **2026-08-24 起还多一层**（审计 COR-015）：`user_id` 现在还决定**能打开哪些项目**——
-> 判据是 `projects.owner_id == user_id`，十三个工具全部校验（`create_project` 不校验已有项目，它**恒以调用者为 owner** 建新的）。所以给新人发一个全新 UUID
+> 判据是 `projects.owner_id == user_id`，十五个工具全部校验（`create_project` 不校验已有项目，它**恒以调用者为 owner** 建新的）。所以给新人发一个全新 UUID
 > 意味着他**一个项目都打不开**，得先让他自己建项目（或者把他要用的项目的 `owner_id`
 > 改成他）。口径与"改成团队共享要改哪儿"见 `docs/deskcore.md` §2.2.1。
 >
