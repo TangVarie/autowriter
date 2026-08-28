@@ -11,6 +11,7 @@
   python -m deskcore.cli backfill --project <uuid>   ← 部署时必跑一次
   python -m deskcore.cli recompute-fingerprints --project <uuid>
                                                     ← 只在改了 normalize 之后跑
+  python -m deskcore.cli reembed-rules --user <uuid> ← 给规则补向量(见 main() 里那段)
 
 ⚠️ ``--user`` 从可选变成必填(审计 COR-015): 归属校验在 core 层, CLI 与 MCP 走
 同一个函数, 不带身份的调用现在一律被拒。传的是 ``projects.owner_id`` 里【已有的】
@@ -329,6 +330,16 @@ def main(argv: list[str] | None = None) -> int:
         help="按当前 normalize 口径重算确定性指纹(**只在改了 normalize 之后跑**)")
     p.add_argument("--project", required=True)
 
+    p = sub.add_parser(
+        "reembed-rules",
+        help="给【规则】补向量 —— soft 规则的相关性过滤靠它才有意义")
+    p.add_argument("--user", required=True,
+                   help="给谁补。规则按 user_id 归属, 一次只补一个人")
+    p.add_argument("--batch", type=int, default=50,
+                   help="每轮补多少条(默认 50, 与 db 那侧的上限一致)")
+    p.add_argument("--max-rounds", type=int, default=40,
+                   help="最多转多少轮 —— 停滞保护, 见下面那段")
+
     p = sub.add_parser("check", help="查重")
     p.add_argument("--project", required=True)
     p.add_argument("--user", required=True)
@@ -340,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
         return selftest()
 
     # 以下要连库, 到这一步才 import(让 selftest 不需要任何第三方依赖)
+    import db as db_mod
     from . import core
 
     if args.cmd == "health":
@@ -387,6 +399,50 @@ def main(argv: list[str] | None = None) -> int:
         _print(out)
         if out.get("ngram_unrecoverable"):
             print("\n⚠️ " + out["warning"])
+    elif args.cmd == "reembed-rules":
+        # ⚠️ 三件事都必须显式做, 少一件这个命令就会"看起来跑完了"而其实没干活:
+        #
+        # 1) **状态码不许吞。** db.backfill_memory_embeddings 特意把
+        #    "没需要补的"(noop) 和 "没配 GOOGLE_API_KEY"(no_embedding_sdk) /
+        #    "pgvector 列没建"(schema_missing) 分开返回 —— 它的 docstring 写着
+        #    这几种以前一律塌成 int 0, 点了按钮显示"没有需要补算的记忆", 运维
+        #    无从判断为什么没反应。这里按状态分别退出码, 别再塌回去。
+        # 2) **要翻页。** 那个函数一轮最多 max_rows 条, 一次调用补不完。
+        # 3) **要有停滞检测。** 它对算不出向量的行是 `continue` 跳过的 ——
+        #    于是可能 status='ok' 但 updated=0, 而缺向量的行一条没少。
+        #    "补不完就一直转"在这里会变成【死循环】: 每轮都查到同一批行、
+        #    每轮都补 0 条。所以 updated==0 就停下并如实报, 不假装成功。
+        total = 0
+        for rnd in range(1, args.max_rounds + 1):
+            out = db_mod.backfill_memory_embeddings(
+                sb, args.user, max_rows=args.batch)
+            st = (out or {}).get("status")
+            if st == "noop":
+                _print({"status": "done", "updated": total, "rounds": rnd - 1})
+                if total == 0:
+                    print("\n这个人名下没有缺向量的规则 —— 要么已经补齐, "
+                          "要么他名下压根没有规则。")
+                return 0
+            if st != "ok":
+                _print(out)
+                print(f"\n⚠️ 补到第 {rnd} 轮停了, 已补 {total} 条。"
+                      "上面的 status 是原因, **不是「补完了」**。")
+                return 1
+            n = int(out.get("updated") or 0)
+            if n == 0:
+                _print({"status": "stalled", "updated": total, "rounds": rnd})
+                print("\n⚠️ 这一轮查到了缺向量的行, 却一条都没补上"
+                      "(embed 返回空 / 写回被拒)。**停在这里, 不再空转** —— "
+                      "服务端日志里有每行失败的原因(telemetry: "
+                      "backfill_memory_row_failed)。")
+                return 1
+            total += n
+            print(f"  第 {rnd} 轮: +{n} 条(累计 {total})", flush=True)
+        _print({"status": "max_rounds_reached", "updated": total,
+                "rounds": args.max_rounds})
+        print(f"\n⚠️ 转满 {args.max_rounds} 轮还没补完, 已补 {total} 条。"
+              "**没补完**, 再跑一次接着补(这个命令是幂等的)。")
+        return 1
     elif args.cmd == "check":
         with open(args.file, encoding="utf-8") as fh:
             drafts = json.load(fh)

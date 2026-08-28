@@ -402,6 +402,46 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 > ```
 > 当前 items 最多的三个 `user_id`：`85f5f888…`(3,385) · `afbaf84e…`(667) · `b907ec9d…`(504)。
 
+#### key 轮换（怎么换、为什么这么换）
+
+key 一旦在聊天窗口、截图、工单里出现过，就当它已经泄露 —— deskcore 持
+`service_role` 绕过 RLS，一把有效 key 等于那个人名下**全部项目数据 + 十五个
+工具（含写）**。轮换是唯一的补救。
+
+**第一步：本地生成，不要让任何人替你生成。**
+
+```bash
+python - <<'EOF'
+import secrets
+for who, uid in [
+    ("quanquan", "85f5f888-a649-4843-8358-9c83c91282e6"),
+    ("jiayi",    "afbaf84e-e5a3-4429-9490-72718d2a9019"),
+    ("ziao",     "b907ec9d-9e49-4dac-89ad-220eb53afc38"),
+]:
+    print(f'  "k-{who}-{secrets.token_urlsafe(24)}": '
+          f'{{"user_id": "{uid}", "name": "{who}"}},')
+EOF
+```
+
+**为什么必须是你自己在本地跑**：让别人（包括 AI 助手）生成，新 key 就又一次
+经过了聊天记录、日志和上下文窗口 —— 那是刚刚要修的那个洞。这段脚本只吐字符串，
+不联网、不落盘。
+
+**第二步**：把输出拼成 JSON（去掉最后一个逗号），整体替换 Railway 上的
+`DESKCORE_KEYS`，等服务重启。
+
+**第三步**：`curl -s <服务地址>/health | grep auth` 确认 `note` 还是 `3 key(s)`。
+数目对不上就是 JSON 写坏了 —— 注意 `_key_map()` 是 **fail-closed** 的：
+解析失败一律 401，不会退化成"没配"（那曾经等于匿名全开，见 ROB-003）。
+
+**第四步**：把新 key 分别发给本人，**一人一把，不要群发**。旧 key 在第二步
+替换的瞬间就失效了，不需要额外撤销动作。
+
+⚠️ **`name` 字段只是给人看的备注，不参与鉴权**。2026-08-27 踩过一次：一把叫
+`k-ziao-…` 的 key，`user_id` 指向的其实是同事的账号 —— 拿它写稿会把稿子记进
+**别人**的历史库。轮换时对着上面 §「owner 分布」那张表逐个核 UUID，别照抄
+旧配置里的名字。
+
 > ⚠️ 少写一层（`{"k": "<uuid>"}`）是**合法 JSON**，`identity.py` 会当成配置错误抛
 > 可读的 401——不会漏到运行期变成 500。JSON 整个写错也一律 401，**不会**退化成
 > "没配鉴权"然后放行（这条曾经是 fail-open 的）。
@@ -737,7 +777,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 13 | `projects` 加 `UNIQUE (owner_id, lower(btrim(name)))` | `create_project` 的撞名保护是**应用层 check-then-insert**，两次并发调用会各自查空、各自建成。判据（大小写与首尾空格都不算差异）已经和这个索引对齐，加索引就是把它下推给数据库——与 `docs/deskcore.md` §2.3-D「并发正确性交给数据库」同一口径。**做之前要先处理存量可能已有的重名行**，所以单独一次迁移。现网并发建项目的概率极低，不阻塞 |
 | 14 | `store.recent_angle_keys` 也走 `_paged` | 它读 `angle_ledger` 仍是裸 `.execute()`，同 COR-005/006/008 那一族的静默截断。台账被钳短的后果是**已经用过的角度组合会被当成没用过再抽一次**，跨批次去重悄悄退化。现网台账还很小，等它长起来之前做掉 |
 | 15 | `/health` 回显注入封顶 | `/health` 现在回显 embeddings / CORS / auth / 词表，**偏偏漏了 `MAX_INJECTED_MEMORIES_PER_SCOPE`** —— 而它是这几个里唯一会【静默改变产出】的：调小了规则就少注入几条，没有任何报错。2026-08-28 把它从 12 调到 18 时，线上**无法验证新值是否生效**，只能靠等部署时间。回显它就能一眼确认 |
-| 16 | `memories.embedding` 回填 | 110 条规则里**只有 2 条有向量**。`memory.filter_soft_by_relevance` 对无向量的一律放行，所以 soft 规则的相关性过滤【目前几乎是空的】，cap 是唯一在限流的东西。`db.backfill_memory_embeddings` 已经存在（db.py:1975），缺的是把它挂到一个运维入口上。做完之前不要再调高 cap |
+| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 入口已就位**：`python -m deskcore.cli reembed-rules --user <uuid>`。它会翻页补到没有为止，并把 `no_embedding_sdk`（没配 GOOGLE_API_KEY）/ `schema_missing`（pgvector 没建）/ `stalled`（查到了却一条没补上）分别报成**非零退出码** —— `db.backfill_memory_embeddings` 的 docstring 记着这几种以前一律塌成 int 0，运维无从判断为什么没反应。**还没跑**：跑之前 soft 规则的相关性过滤仍然几乎是空的，cap 是唯一在限流的东西，别再调高 cap |
 
 ---
 
