@@ -1,7 +1,8 @@
 """deskcore/tools.py — MCP 工具面。
 
-十六个工具, 按写稿的三个阶段分组(外加一个 create_project 开项目, 和三个
-规则台账相关的 my_rules / set_rule_state / reembed_my_rules)。设计原则是【一次调用拿全】—— 治员工反馈里
+十七个工具, 按写稿的三个阶段分组(外加一个 create_project 开项目, 三个
+规则台账相关的 my_rules / set_rule_state / reembed_my_rules, 和一个下发协议
+本身的 get_protocol)。设计原则是【一次调用拿全】—— 治员工反馈里
 那条「一个项目一般有 5 个提示词要重复操作 5 次, 我的工作台至少有几十个提示词」。
 
 每个工具的 docstring 就是模型看到的说明, 所以写给模型看; 维护者要看的原因
@@ -15,12 +16,51 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from pathlib import Path
 from typing import Any
 
 from . import core, vocab
 
 logger = logging.getLogger("deskcore.tools")
+
+# 写作台协议的正文。SKILL.md 在客户端只是一根引线, 协议本身从这里下发 ——
+# 理由见 get_protocol 的 docstring 和 docs/deskcore.md §4.3。
+PROTOCOL_PATH = Path(__file__).with_name("protocol.md")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 协议
+# ══════════════════════════════════════════════════════════════════════
+
+def get_protocol(_user_id: str | None = None) -> dict:
+    """取写作台协议的【完整正文】。进入写作台流程的第一步, 永远先调这个。
+
+    不带参数。返回:
+      · protocol —— 协议全文(markdown)。照着它逐条执行: 什么时候调哪个工具、
+        报错怎么办、反馈怎么记、评论怎么处理、哪些事绝对不能做。
+      · version  —— 正文的短哈希。两次调用不同说明协议更新了, 以新的为准。
+
+    为什么协议放服务端而不是写死在本地 skill 里: 本地那份拷出去之后改了没人
+    提醒, 而协议管的是流程纪律, 过期了模型会按老规矩写而没人发现。放这里意味着
+    仓库一合并、服务一部署, 所有人同时换版。
+
+    这个工具出错会直接报错。报错就【停下来】告诉用户"写作台协议读不到",
+    不要凭记忆补一份继续写。
+    """
+    # _user_id 收下但不用: 协议对所有人一样, 不按人裁剪。仍然走 needs_user=True
+    # 是为了不给 test_all_tools_now_require_caller_identity 那条"所有工具都绑
+    # 身份"的机械保险开口子 —— 一个例外就会变成下一个例外的先例。
+    # 故意不包 _safe: 协议拿不到就该停。包成带 error 的"成功"会让模型按记忆里
+    # 的旧版本往下走 —— 这正是把协议搬到服务端要消灭的那种失败。
+    # 每次都从盘上读而不是 import 期缓存: 文件十几 KB, 读一次微秒级, 换来的是
+    # 热修协议文本不必重启服务。
+    text = PROTOCOL_PATH.read_text(encoding="utf-8").strip()
+    if not text:
+        raise RuntimeError(f"协议文件为空: {PROTOCOL_PATH}")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return {"protocol": text, "version": digest, "chars": len(text)}
 
 
 def _safe(fn, *args, **kwargs) -> Any:
@@ -498,6 +538,7 @@ def set_rule_state(memory_id: str, action: str, days: int = 90,
 #   · borrow_lessons → 发给馆员的 brief 是拿项目行拼的(品牌/定位/战术)
 # 新增工具时默认写 True; 想写 False 就得先说明它凭什么不需要知道是谁在调。
 TOOLS = {
+    "get_protocol":   (get_protocol,   True),
     "create_project": (create_project, True),
     "list_projects":  (list_projects,  True),
     "open_project":   (open_project,   True),

@@ -463,7 +463,13 @@ curl -sS -X POST "$DESKCORE_URL/tool/list_projects" \
 }
 ```
 
-skill 从本仓直接装：`TangVarie/autowriter → skills/bywood-writing-desk`（WorkBuddy 支持从 GitHub 装）。**别手工复制**——拷贝出去的那份改了没人提醒，而它管的是流程纪律，过期了模型会按老规矩写而没人发现。
+skill 从本仓直接装：`TangVarie/autowriter → skills/bywood-writing-desk`（WorkBuddy 支持从 GitHub 装）。**装一次就够了**：那份 SKILL.md 只是一根引线，正文由 `get_protocol` 每次从服务端下发（源文件 `deskcore/protocol.md`）。
+
+> 为什么协议放服务端（2026-09-10）：WorkBuddy 从 GitHub 装的 skill 是一次性拷贝，仓库更新之后本地那份不会动，也没人提醒。协议管的是流程纪律，过期了模型会按老规矩写而没人发现——已经出过一次：旧协议没有"评论"的落点，模型收到「评论规则更新+入库」后跑去翻交付文档，反复读同一个文件被平台判定死循环强杀。现在改协议就改 `deskcore/protocol.md`，合并、Railway 部署，所有人同时换版；运营端不需要做任何事。
+>
+> 两根引线：本地 SKILL.md 说"第一步先调 `get_protocol`"；MCP initialize 的 `instructions` 也说同一句，认这个字段的平台会注入系统提示，客户端那份 skill 装漏了也有兜底。
+>
+> `get_protocol` 拿不到就**停**，不要按记忆里的旧版本继续——这是把协议搬到服务端要消灭的那种失败，工具层故意不包 `_safe`。
 
 > ⚠️ **鉴权头的退路**：WorkBuddy 的 HTTP MCP 能不能配自定义 header，官方更新日志只说了支持 HTTP MCP 和 OAuth（v4.7.3），没有权威文档。所以 key **三种传法都收**，但**优先级不同**：
 >
