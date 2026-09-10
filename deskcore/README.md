@@ -24,7 +24,8 @@ deskcore/
 ├── fingerprint.py  指纹与判定, 【只用标准库】
 ├── vocab.py        闭集: essence 来自 vendor JSON, surface 引用 generator.py
 ├── identity.py     API key → user_id, 「个人风格私有」的前提
-├── tools.py        13 个 MCP 工具, docstring 是给模型看的
+├── tools.py        17 个 MCP 工具, docstring 是给模型看的
+├── protocol.md     写作台协议正文, get_protocol 每次下发; skills/ 里的 SKILL.md 只是引线
 ├── app.py          FastAPI + MCP(streamable HTTP) + REST 兜底 + /health 配置回显
 ├── cli.py          本地 adapter, 含【不连库不联网】的 selftest
 └── vendor/         从 truth-vault 原样复制的词表 + sha256(见 vendor/README.md)
