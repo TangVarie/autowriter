@@ -137,7 +137,7 @@ def resolve(provided: str | None) -> Caller:
     if not keys and not single:
         # ⚠️ 这里【曾经是无条件放行的】(审计 ROB-003)。deskcore 持
         # service_role 绕 RLS, 部署时漏配 key 就等于把全部租户的项目数据和
-        # 十一个工具(含写)匿名开放到公网。
+        # 全部工具(含写)匿名开放到公网。
         #
         # 而 /health 发现不了: 它虽然会把 auth.ok 报成 false, 但函数正常返回
         # → HTTP 200, 而 Railway 的 healthcheck 只看状态码 —— 一个彻底敞开的

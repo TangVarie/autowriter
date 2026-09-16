@@ -27,11 +27,11 @@
 
 工作台的优势是四个**具体机制**（可搬），劣势是四个**具体工程缺陷**（可修）。deskcore 把两件事在同一个改动里做完。
 
-慢的根因是 Streamlit：`app.py` 5560 行，每次交互全量重跑。能力外置后这个问题自动消失——推理归 WorkBuddy，deskcore 只做轻量数据操作。
+慢的根因是 Streamlit：写这段时 `app.py` 5560 行，每次交互全量重跑（2026-08-24 把 `generation_service` 抽出去之后降到三千八百多行，**但每次交互全量重跑这件事没变**）。能力外置后这个问题自动消失——推理归 WorkBuddy，deskcore 只做轻量数据操作。
 
 ### 1.1 重复率的四个根因
 
-1. **硬闸默认关着。** `config.py:132` `ENABLE_DEDUP_REGEN` 默认 `"0"`。查重跑了、命中了，只写一条 UI 警告，**不重生也不拦**。
+1. **硬闸默认关着。** `config.py` `ENABLE_DEDUP_REGEN` 默认 `"0"`。查重跑了、命中了，只写一条 UI 警告，**不重生也不拦**。
 2. **只比标题，阈值过高。** `app.py:520` 只对 `title` 取向量；阈值 0.92（`config.py:140`）对标题 embedding 极高，换说法的同角度标题普遍落在 0.85–0.90 全部溜过。正文开头、场景、结尾完全不在查重范围。
 3. **提示词侧只看最近 20 条。** `db.py:1556` 从库里捞 150 条 / 最近 40 批，`generator.py:1384` 一句 `historical[-20:]` 扔掉 130 条；剩下的还只是软指令（"宁可少出一条"），靠模型自觉。
 4. **正例池是 recency top-5，构成趋同回路。** `db.py:2169` 是 `created_at DESC` limit 5。模型模仿最近 5 条正例 → 新稿被标 positive → 窗口滚动 → 语感越收越窄。
@@ -104,13 +104,13 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 
 | 谁 | 怎么执行 |
 |---|---|
-| 十五个 MCP 工具 | `TOOLS` 里 `needs_user` **全部为 True**；`core.assert_project_access` 是唯一实现，每个项目级入口以它开头。`create_project` 不打开已有项目，所以不过这道闸——它的等价保证是**签名里没有 owner 参数**，归属只能是调用者 |
+| 全部 MCP 工具 | `TOOLS` 里 `needs_user` **全部为 True**；`core.assert_project_access` 是唯一实现，每个项目级入口以它开头。`create_project` 不打开已有项目，所以不过这道闸——它的等价保证是**签名里没有 owner 参数**，归属只能是调用者。`get_protocol` 也不过闸——它不碰项目，只下发一份对所有人一样的流程文本（`needs_user` 仍是 True，不给那条机械保险开例外） |
 | `label_example` | **按 `items.user_id` 校验**，比项目粒度更细——同一项目里 A 的正负例是 A 的个人资产 |
 | REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了 |
 | CLI 的 `projects` / `open` / `draw` / `check` | 走同一个 `core` 函数，所以 `--user` 从可选变成**必填** |
 | CLI 的 `backfill` / `reembed` | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
 
-**要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在十五个工具里意味着改口径要改十五处，而漏掉的那处不会报错，只会继续放行。
+**要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在每个工具里意味着改一次口径要改十几处，而漏掉的那处不会报错，只会继续放行。
 
 回归在 `tests/test_deskcore_ownership.py`（含一条 AST 断言：每个项目级入口都必须调过这道闸——归属校验最典型的失效方式不是判据写错，而是**新加了个工具忘了加校验**）+ `ci.yml` app 冒烟步里的 403 运行期断言。
 
@@ -122,7 +122,7 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 
 **C. 查重是硬闸** → `check_drafts` 出错必须抛，静默放行就是重演根因 1。
 
-fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` / `my_style`——读，且拿不到只是少点参考。判据是「失败之后调用方还会不会当作成功继续往下走」，会就不能吞：
+fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` / `my_style` / `my_rules`——读，且拿不到只是少点参考。这个集合被 `ci.yml` 的 `SAFE_OK` 钉死，增减都会红。判据是「失败之后调用方还会不会当作成功继续往下走」，会就不能吞：
 
 | 工具 | 出错行为 | 为什么不能吞 |
 |---|---|---|
@@ -135,6 +135,7 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 | `record_edit` | 抛 | "裂变"的入口，静默失败 = 文风永远长不出来 |
 | `save_my_style` | 抛 | "裂变"闭环的最后一步，静默失败 = 前面全白做 |
 | `label_example` | 抛 | 标记没落库却报成功，用户不会再标第二次 |
+| `get_protocol` | 抛 | 协议拿不到就该停。降级成"成功"会让模型按记忆里的旧协议继续写——那正是把协议搬到服务端要消灭的失败 |
 
 （codex review round-5：`open_project` 和 `record_rule` 原来都包了 `_safe`。前者尤其糟——`store.shared_memories()` 为此专门**故意不吞异常**，外面再包一层等于把那个设计原样抵消掉。）
 
@@ -151,10 +152,13 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 
 ---
 
-## 3. 工具面（15 个）
+## 3. 工具面
+
+（**个数不在这里钉死**——打一下 `/health` 或读 `tools.py` 的 `TOOLS`。这份表管的是每个工具干什么。）
 
 | 阶段 | 工具 | 说明 |
 |---|---|---|
+| 取协议 | `get_protocol` | 下发写作台协议正文（`deskcore/protocol.md`）。**进流程第一步**，本地 SKILL.md 只是引线（见 §4.3） |
 | 开项目 | `create_project` | 给新品牌/新方向建项目。**owner 恒为调用者**，签名里没有 owner 参数。同名不建、返回已有的；同品牌照建但列出兄弟项目（见 §3.0） |
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics |
@@ -170,6 +174,7 @@ fail-open 的范围**只有三个工具**：`list_projects` / `borrow_lessons` /
 | | `my_style` | 查看个人风格资产；有积压时**直接带回可续做的蒸馏任务** |
 | 规则台账 | `my_rules` | 列出这个项目上我能管的**全部**规则，含试用档与已停用的，每条带 `state`（见 §3.5） |
 | | `set_rule_state` | 停用 / 恢复 / 升降档 / 设方向。**不改内容** |
+| | `reembed_my_rules` | 给自己名下缺向量的规则补向量——没向量的规则照常注入但不参与相关性筛选（2026-08-28） |
 
 ### 3.0 `create_project` —— 补上"新品牌进不来"这个洞（2026-08-27）
 
@@ -488,13 +493,13 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
 ## 5. ⚠️ 已经踩过的坑，别再踩
 
-**1. `AW_DISABLE_ST_CACHE`（R-042）。** deskcore 是 headless 进程，但 streamlit 在同一份 requirements 里装着，`db.py` 的缓存 shim 会走真 `st.cache_data` —— 跨进程缓存无法被 app 的 `.clear()` 失效，用户在 UI 改完记忆后 deskcore 会拿 30-60s 的旧数据。`deskcore/__init__.py` 已经在 import db 之前 setdefault 这个 env（同 `worker.py:56`）。**别在 `__init__` 之前 import db。**
+**1. `AW_DISABLE_ST_CACHE`（R-042）。** deskcore 是 headless 进程，但 streamlit 在同一份 requirements 里装着，`db.py` 的缓存 shim 会走真 `st.cache_data` —— 跨进程缓存无法被 app 的 `.clear()` 失效，用户在 UI 改完记忆后 deskcore 会拿 30-60s 的旧数据。`deskcore/__init__.py` 已经在 import db 之前 setdefault 这个 env（同 `worker.py 顶部`）。**别在 `__init__` 之前 import db。**
 
 **2. pgvector 反序列化（R-034）。** PostgREST 对 `vector(768)` 列的 JSON 序列化是**字符串** `"[0.1,...]"`，不是数组。不归一的话 `dedup.cosine_similarity` 因长度不等**静默返回 0.0** —— 查重变哑弹，一条都抓不到，而且不报错。所有读 embedding 的地方必须过 `db._parse_pgvector`（`store.py` 已经在读取边界统一处理）。
 
 **3. 鉴权配坏了必须 fail closed。** `DESKCORE_KEYS` 的 JSON 写错时，早期实现会返回空 map → `resolve()` 判定为"没配鉴权" → **放行所有请求**。生产上一个逗号写错就等于把项目数据和全部写工具匿名开放。现在显式配了就必须当成"打算开鉴权"，解析失败一律 401，`/health` 的 `auth.ok` 会是 false。
 
-**3b. "没配鉴权"同样 fail closed（2026-08-23 审计 ROB-003）。** 上面那条只堵了"配了但写错"，"根本没配"当时仍然走 dev 模式放行——而 deskcore 持 service_role 绕 RLS，漏配一个环境变量就等于把全部租户的数据和十五个工具（含写）开放到公网。更糟的是**健康检查看不见**：`/health` 虽然会把 `auth.ok` 报成 false，但它返回的是 HTTP 200，而 Railway 的 healthcheck 只看状态码——一个彻底敞开的部署照样判定健康、照样上线。
+**3b. "没配鉴权"同样 fail closed（2026-08-23 审计 ROB-003）。** 上面那条只堵了"配了但写错"，"根本没配"当时仍然走 dev 模式放行——而 deskcore 持 service_role 绕 RLS，漏配一个环境变量就等于把全部租户的数据和全部工具（含写）开放到公网。更糟的是**健康检查看不见**：`/health` 虽然会把 `auth.ok` 报成 false，但它返回的是 HTTP 200，而 Railway 的 healthcheck 只看状态码——一个彻底敞开的部署照样判定健康、照样上线。
 
 现在默认拒绝：没配 key 时每个请求都 401。本地开发要免 key 跑，显式设 `DESKCORE_ALLOW_ANONYMOUS=1`（`/health` 会把它回显在 `config.anonymous_allowed`，并在 `auth.note` 里写明是 dev 模式）。
 

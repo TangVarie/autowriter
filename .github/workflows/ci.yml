@@ -1678,8 +1678,13 @@ jobs:
               import re
               # 审计 SUP-010: 基线从 db.CREATE_TABLES_SQL 搬成了 .sql 文件。
               sql = open("migrations/000_baseline.sql", encoding="utf-8").read()
-              fns = list(re.finditer(r"CREATE OR REPLACE FUNCTION (\w+)\(", sql))
-              assert len(fns) >= 6, f"只找到 {len(fns)} 个函数, 正则可能失配了"
+              # ⚠️ 必须认限定名。2026-09-16 起基线里有两个函数是从 005/008 原样
+              # 复制过来的(见 tests/test_baseline_parity.py), 它们写成
+              # `CREATE OR REPLACE FUNCTION autowriter.xxx(` —— 不认的话这里会
+              # **静默跳过**它们, 而静默跳过正是本条断言要治的那类病。
+              fns = list(re.finditer(
+                  r"CREATE OR REPLACE FUNCTION (?:autowriter\.)?(\w+)\(", sql))
+              assert len(fns) >= 8, f"只找到 {len(fns)} 个函数, 正则可能失配了"
               checked = 0
               for i, m in enumerate(fns):
                   end = fns[i + 1].start() if i + 1 < len(fns) else len(sql)
@@ -1697,18 +1702,36 @@ jobs:
                   #   · INTO 后面的       → plpgsql 变量名, 不是表
                   stmt = "\n".join(l for l in body.splitlines()
                                    if not l.lstrip().upper().startswith(("REVOKE", "GRANT")))
+                  # 注释里的 FROM / 逗号会同时干扰下面两条: 既把注释掉的表名当成
+                  # 真引用, 又让 "), <注释若干行> jbest AS (" 里的 CTE 认不出来。
+                  stmt = re.sub(r"--[^\n]*", "", stmt)
+                  qualified = set(re.findall(r"autowriter\.([a-z_][a-z0-9_]*)", stmt))
+                  # ⚠️ 先把限定前缀打掉再找裸表。不打的话 "FROM autowriter.x" 里的
+                  # `autowriter` 本身会被当成一个裸表名 —— 以前没暴露, 是因为凡是
+                  # 这么写的函数 search_path 里正好都有 autowriter, 断言碰巧通过。
+                  stmt_bare = re.sub(r"\bautowriter\.", "@@", stmt)
                   refs = {t for t in re.findall(
-                      r"(?:FROM|UPDATE|JOIN)\s+([a-z_][a-z0-9_]*+)(?!\s*\()", stmt)}
-                  qualified = set(re.findall(r"autowriter\.([a-z_][a-z0-9_]*)", body))
-                  bare = refs - qualified
-                  if not bare:
-                      continue
-                  checked += 1
-                  assert "autowriter" in path, (
-                      f"{m.group(1)} 固定了 search_path={path.strip()!r}, 却裸用表 "
-                      f"{sorted(bare)} —— 运行时找不到表, 而报错会被 rpc_missing 当成"
-                      f"'迁移没跑'静默降级")
-              assert checked >= 4, f"只校到 {checked} 个函数, 断言可能没在真的守东西"
+                      r"(?:FROM|UPDATE|JOIN)\s+([a-z_][a-z0-9_]*+)(?!\s*\()", stmt_bare)}
+                  # CTE 名(`WITH m AS (` / `, jbest AS (`)不是表, 它们按词法解析,
+                  # 跟 search_path 无关。以前不排也没事, 是因为带 CTE 的那个函数
+                  # 正好把 autowriter 写进了 path; 现在有函数改用全限定写法(path 里
+                  # 不再有 autowriter), 不排就会把 CTE 误报成够不着的裸表。
+                  ctes = set(re.findall(r"(?:WITH|,)\s*([a-z_][a-z0-9_]*)\s+AS\s*\(",
+                                        stmt, re.I))
+                  bare = refs - qualified - ctes
+                  if bare:
+                      # 裸用表 → 只有 search_path 里有 autowriter 才够得着。
+                      checked += 1
+                      assert "autowriter" in path, (
+                          f"{m.group(1)} 固定了 search_path={path.strip()!r}, 却裸用表 "
+                          f"{sorted(bare)} —— 运行时找不到表, 而报错会被 rpc_missing 当成"
+                          f"'迁移没跑'静默降级")
+                  elif qualified:
+                      # 全限定写法 → 不依赖 search_path 里有没有 autowriter, 本来
+                      # 就够得着。这是更稳的那种写法, 同样计进 checked, 否则下面
+                      # 那条"断言还在不在守东西"的闸会因为大家改用限定名而失灵。
+                      checked += 1
+              assert checked >= 5, f"只校到 {checked} 个函数, 断言可能没在真的守东西"
 
 
           def t_sup002_no_fail_open():

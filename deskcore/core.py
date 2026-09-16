@@ -689,7 +689,7 @@ def check_drafts(client, project_id: str, drafts: list[dict],
     """比对全量历史 + 本批内互比。
 
     ⚠️ deskcore 唯一【不 fail-open】的路径。其它读类工具出错返回可用结构不阻塞
-    写稿, 但查重挂了必须抛 —— 静默放行就是重演 config.py:132 那个
+    写稿, 但查重挂了必须抛 —— 静默放行就是重演 config.py 那个
     ENABLE_DEDUP_REGEN 默认 "0"、查重跑了但不拦的老问题。
 
     ⚠️ 这是审计 COR-015 里【读侧最要命的那个】: 返回值的 ``collided_with`` 会回显
@@ -2055,7 +2055,7 @@ def reembed_my_rules(client, *, user_id: str, batch: int = 50) -> dict:
     GOOGLE_API_KEY, 两样都只在服务端有 —— 做成 CLI 就意味着每次都要有人进
     Railway 的 shell, 也就是"又得找运维"。这条路径只碰调用者自己名下的行
     (``db.backfill_memory_embeddings`` 里那句 ``.eq("user_id", user_id)``),
-    所以它跟其它十五个工具是同一套归属口径, 不是新开的管理面。
+    所以它跟其它工具是同一套归属口径, 不是新开的管理面。
 
     **一次只补一批**: 补算要逐条调 embedding API, 一次几百条会把工具调用拖到
     超时。返回 ``remaining`` 让调用方自己决定要不要再来一次 —— 与 Streamlit
