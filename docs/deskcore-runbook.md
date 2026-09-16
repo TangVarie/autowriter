@@ -299,8 +299,11 @@ owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
 的话这条已经含在里面了。
 
 **`008` 必须在 `005` 之后**（它 `CREATE OR REPLACE` 的正是 `005` 建的那版 3 参
-`deskcore_check_drafts`；`005` 没跑的话 `REPLACE` 会顶到 `000` 里那版 2 参的、
-签名对不上而失败）。见 §1.4。
+`deskcore_check_drafts`）。⚠️ 顺序错了**不会报错**：`CREATE OR REPLACE` 在参数表
+不同的时候安静地新建一个重载（只有返回类型变了才报错，PG 16.13 实测），所以
+「跑了、没报错」不等于「顶上去了」。2026-09-16 起基线自己带 `DROP FUNCTION IF EXISTS`
+清历史签名，`tests/sql_parity_check.py` 也有一条常驻断言；但**增量之间的顺序仍然要人守**。
+见 §1.4。
 
 ⚠️ **`003` 会改数据**，不只是建索引：它按 `(version_num, created_at, id)` 稳定
 重编号，再建唯一索引。重复号是 `bulk_create_initial_versions` 给多引擎批次每个
