@@ -6,7 +6,8 @@
 
 > **给谁看**：要把写作能力挂到 WorkBuddy / Claude Code / CodeBuddy 的人；以及以后维护 deskcore 的人。
 >
-> **一句话**：Streamlit 界面停用，内核做成 MCP 工具继续用。库里几年的积累一条不迁。
+> **一句话**：Streamlit 界面【计划】停用，内核做成 MCP 工具继续用。库里几年的积累一条不迁。
+> （停服**尚未执行**，前置取舍见 §3 与 runbook 待办 P1 #5。）
 >
 > 决策在 truth-vault：`DECISIONS.md` D-041 · `docs/10-sister-repo-followups.md` R-034
 

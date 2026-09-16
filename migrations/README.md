@@ -44,8 +44,10 @@
 > bug 出生**，而没人会发现。
 >
 > 现在 `tests/sql_parity_check.py`（CI 每次跑）会在一个空库上真的执行：
-> 空库 → `000` → `001..006`（它 glob 整个目录，新增的自动进链）→ **再跑一遍全部**
-> （验幂等）→ 抽查表与函数是否都在 → 逐例比对下推 SQL 与 Python 算出来的数。
+> 空库 → `000` → 目录下**全部**增量（它 glob 整个目录，新增的自动进链）→ **再跑一遍全部**
+> （验幂等）→ 抽查表与函数是否都在 → **`autowriter` 下每张表对 `service_role` 的四个权限一个不缺**
+> → **`008` 的按模型过滤落在 `deskcore_check_drafts` 的最终函数体里**（问的是终态，不是「008 跑没跑」）
+> → 逐例比对下推 SQL 与 Python 算出来的数。
 > **这才是"消双写"真正的意思：不是只留一份，而是让两份必须对得上、对不上就报错。**
 >
 > 这个 harness 上线当天就抓到两个真问题：`004` 的 `CREATE OR REPLACE` 在
@@ -56,7 +58,8 @@
 ## 历史
 
 `001` 之前的 schema 变更记在 **truth-vault 仓的 `autowriter-migrations/`**
-（编号 001–008）。那批存在于 TV，是因为当年 TV 为**集成**改 autowriter 的
+（编号 001–008）——⚠️ 注意那是**另一套**编号，与本目录的 `001`–`008` 同号不同物，
+本目录的 `001` 不是它的续号。那批存在于 TV，是因为当年 TV 为**集成**改 autowriter 的
 schema（`external_source` / `example_label_proposal` / `tv_synced_user_id` 回填
 等都是集成产物，007 只是 `db.py::CREATE_TABLES_SQL` 的一份快照）。
 
@@ -71,8 +74,13 @@ Supabase SQL Editor 粘贴执行，或 MCP `apply_migration`。
 
 **跑之前和跑之后各查一次库到底是什么状态**——别照着这份清单推断：
 
+⚠️ `doctor` **直连库**读 schema，所以要先有 `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`。
+没配时抛的是一句讲「worker 领不到 job」的 `RuntimeError`（`db.get_service_client` 的通用文案），
+跟迁移无关——不是你命令敲错了。
+
 ```bash
-python -m deskcore.cli doctor          # 逐个探测, 只读; 缺哪个、缺了会怎样
+python -m deskcore.cli doctor                    # 逐个探测, 只读; 缺哪个、缺了会怎样
+python -m deskcore.cli doctor --project <uuid>   # 额外打印这个项目的指纹回填缺口
 ```
 
 它用的判据与真正消费这些迁移的代码同源（`store.rpc_missing`），所以不会出现
@@ -87,14 +95,14 @@ python -m deskcore.cli doctor          # 逐个探测, 只读; 缺哪个、缺�
 
 | | 内容 | 不跑会怎样 |
 |---|---|---|
-| `000_baseline.sql` | 全部 15 张表 + 8 个函数 + RLS policy + 索引 + 触发器 | 新环境什么都没有。**已有库不要跑它**——跑增量就够（它幂等，跑了也不坏） |
-| `001_deskcore.sql` | 发牌台账 / 成稿指纹 / 个人调校笔记 / 精修 diff 四张表 + 两个 RPC | deskcore 整个不可用 |
+| `000_baseline.sql` | 全部 15 张表 + 8 个函数 + RLS policy + 索引 + 触发器 | 新环境什么都没有。**已有库不要跑它**——跑增量就够。⚠️ 它**不是纯 no-op**：基线里的 `deskcore_check_drafts` 还停在 2 参旧签名（而 `005` 专门把这个签名 DROP 掉了），在已升级的库上重跑 `000` 会把那个旧重载连同它的 `GRANT` 一起建回来——与 runbook「`005` 验收」要求的「无重载残留」正相反，且它既没有 `005` 的样本量前置闸也没有 `008` 的按模型过滤，`store.check_drafts_sql` 的回退路径一旦踩上就是**静默降级**。真要重跑基线，跑完必须补跑 `005` 与 `008` 把它清掉 |
+| `001_deskcore.sql` | 发牌台账 / 成稿指纹 / 个人调校笔记 / 精修 diff 四张表（含它们的表级 `GRANT`，与 `007` 同一条语句）+ 两个 RPC（`deskcore_reserve_angles` / `deskcore_commit_fingerprints`）+ `items.updated_at` 与两个 `updated_at` 触发器 | deskcore 整个不可用；另外 `items.updated_at` 缺席会让 TV 的 `sync_autowriter_decisions_to_prepublish` 退回只按 `created_at` 增量同步，迟到的人工决策重新开始漏收 |
 | `002_calibration_cas.sql` | `update_calibration_notes_cas`（审计 COR-003） | 退回旧 CAS 路径并埋 `calibration_cas_rpc_missing`；长笔记（>4000 字级）的自动学习仍然静默停摆 |
 | `003_versions_unique_num.sql` | `UNIQUE(item_id, version_num)`（审计 COR-004） | 少了数据库层保护；应用层重试本身不依赖它。⚠️ 会先把历史重复对子重编号再建索引 |
 | `004_deskcore_check_pushdown.sql` | `deskcore_check_drafts` + `deskcore_fingerprint_counts`（审计 SUP-002/SUP-004/ROB-004/ROB-011） | `check_drafts` 退回 Python 逐对比对并埋 `deskcore_rpc_missing`：结论一致但慢，且回到 4000 条上限；`list_projects` 退回逐项目 count |
 | `005_deskcore_containment.sql` | **替换** `deskcore_check_drafts` 与 `deskcore_commit_fingerprints`（审计 COR-014）：正文四字串改走 bottom-k 的标准估计式，并多回一路**包含度** | 查重仍然跑，但**短稿整段照搬长稿抓不到**——那种形状下 Jaccard 的真值本来就够不着硬闸线。`check_drafts` 会在 `summary.containment_skipped_warning` 里明说这一路没生效；`commit` 侧自动回退 4 参旧签名（竞态窗口仍然关着，只是不做包含度重查） |
 | `006_item_decision_provenance.sql` | `items` 加 `decision_source` / `reviewer_id` / `decided_at` 三列 + 一条部分索引（跨库审计 COR-004 / COR-007） | ⚠️ **这一个不跑是硬失败，不是降级**——见下 |
-| `007_deskcore_table_grants.sql` | 把 `001` 建的那四张表授权给 `service_role`（`001` 只给函数发了 `EXECUTE`，表漏了）+ 补 `calibration_note_audit` | ⚠️ **硬失败**：deskcore 除 `list_projects` 外全挂在 `42501 permission denied`，而 `/health` 全绿——见下 |
+| `007_deskcore_table_grants.sql` | 把 `001` 建的那四张表授权给 `service_role`（2026-08-26 之前那版 `001` 只给函数发了 `EXECUTE`，表漏了；现在的 `001` 已含同一条 `GRANT`，所以这一半对新库是 no-op）+ 给 `calibration_note_audit` 补 `service_role` 全套 / `authenticated` 的 `SELECT,INSERT`，并**收回** `authenticated` 对它的 `UPDATE`/`DELETE`（审计表 append-only）——后面这三条只在这里和基线里有，所以**任何跑过 `001` 的库仍然都要跑 `007`** | ⚠️ **硬失败**：碰 `001` 那四张表的工具全挂在 `42501 permission denied`，而 `/health` 全绿——见下 |
 | `008_embedding_model_isolation.sql` | `deskcore_check_drafts` 的标题语义那一路加**按 `embedding_model` 过滤**（`CREATE OR REPLACE`，签名不变） | 换过 embedding 模型的库上，标题语义比对会把**别的模型产的**向量也算进来。跨模型余弦是噪声：既放过真重复、也误杀无关稿，而 `semantic_degraded` 照报 `false`——见下 |
 
 > ⚠️ **`008` 治的是"这一列存在了几个月却从来没有代码用过它"。**
@@ -129,25 +137,45 @@ python -m deskcore.cli doctor          # 逐个探测, 只读; 缺哪个、缺�
 > **所以升级顺序上，`006` 应该排在最前面**——它是唯一一个"代码已经发了、迁移
 > 没跑就当场坏"的。
 
-> ⚠️ **`007` 和 `006` 一样是硬失败，不是降级。** 缺了它，deskcore 除
-> `list_projects` 外每个工具都在 `42501 permission denied` 上挂——而
-> `/health` 仍然全绿（它探的是连得上、不是访问得了）。任何跑过 `001` 的库都要补，
-> 排在 `006` 之后即可（它只发 `GRANT`，不依赖其它迁移的顺序）。
+> ⚠️ **`007` 和 `006` 一样是硬失败，不是降级。** 缺了它，凡是读写 `001` 那四张表的工具
+> 全挂在 `42501`：`open_project`（调校笔记）、`draw_angles`（发牌台账）、
+> `check_drafts` / `commit_drafts`（成稿指纹）、`my_style` / `save_my_style`、`record_edit`。
+> `get_protocol` 不碰库，`create_project` 只碰 `projects`，另有一批只碰 `memories` / `items` 的
+> （`record_rule` / `my_rules` / `set_rule_state` / `label_example` / `export_drafts` /
+> `borrow_lessons`）同样不受影响。
+>
+> **`list_projects` 更坏一点**：指纹计数的 `42501` 被 `store.fingerprint_counts` 与 core 里的
+> 逐项目兜底**两层**吞掉，于是它返回一份看起来正常、`fingerprint_count` 全是 0 的清单——
+> 而 `/health` 仍然全绿（它探的是连得上、不是访问得了）。
+>
+> 任何跑过 `001` 的库都要补，排在 `006` 之后即可（它只发 `GRANT`，不依赖其它迁移的顺序）。
 
-> ⚠️ `005` 里两个函数都是 **DROP + CREATE** 而不是 `CREATE OR REPLACE`：返回列 /
-> 参数变了，`REPLACE` 会因签名冲突失败。**必须先跑 `004`**（它建的
-> `deskcore_fingerprint_counts` 本文件不动）。
+> ⚠️ `005` 里两个函数的建法**不一样**，别按一种记：
+> `deskcore_check_drafts` 是 **DROP（两个签名都删）+ 裸 `CREATE`**——返回列和参数都变了，
+> `REPLACE` 会因签名冲突失败；`deskcore_commit_fingerprints` 是 **DROP 掉 4 参旧版**
+> （留着会变同名重载，调用时报 ambiguous）**+ `CREATE OR REPLACE` 建 6 参版**——这一半
+> 必须是 `OR REPLACE`，因为基线里已经有 6 参那版了，裸 `CREATE` 会报 `already exists`
+> （就是上面那条「harness 上线当天抓到的第二个真问题」）。
+> **必须先跑 `004`**（它建的 `deskcore_fingerprint_counts` 本文件不动）。
 >
 > **存量指纹不用重算。** 新估计式只用已经存下来的两个 sketch。`ngram_hashes`
 > 的 cap 同时从 200 提到 400，新旧混着比是正确的（`t = min(两边最大值)`，精度
 > 退回旧的那一边，与今天持平）。想让老行也升到新分辨率就重跑一次
 > `backfill`——**可选**，不跑不会坏。
 
-**`001`–`005` 的共同点：都设计成"不跑也不会坏"** —— 应用侧检测到 RPC 不存在会
-降级并留痕，而不是硬失败。这是刻意的：未迁移的库上硬失败会让整条功能停掉，比
+**`002`–`005` 的共同点：都设计成"不跑也不会坏"** —— 应用侧检测到 RPC 不存在会
+降级**并留痕**，而不是硬失败。这是刻意的：未迁移的库上硬失败会让整条功能停掉，比
 降级更糟。但降级都是**有代价**的，别把"不会坏"读成"可以不跑"。
 
-**`006` 不在这个共同点里**（见上面那段）。加新迁移时先问一句它属于哪一类，然后
-把答案写进上面那张表——`deskcore.cli doctor` 的 `impact` 字段就是照着这张表写的，
-而 `tests/test_migration_doctor.py` 会断言**每个 `.sql` 都出现在这份清单里**。
-漏写不会静默通过。
+**三个不在这个共同点里的，各是各的坏法**：`001` 建的是表，不跑等于 deskcore 整个不可用；
+`006` / `007` 是硬失败，缺了当场报错（见上面那两段）；`008` 最坏——它不跑**不报错也不留痕**，
+标题语义那一路混着别的模型的向量算，而 `semantic_degraded` 照报 `false`。
+
+加新迁移时先问一句它属于**硬失败 / 可降级 / 静默错答**哪一类，然后把答案写进上面那张表——
+`deskcore.cli doctor` 的 `impact` 字段就是照着这张表写的，而 `tests/test_migration_doctor.py`
+有两条守卫：`test_every_migration_is_listed_in_the_deployment_docs` 断言**每个增量 `.sql` 的
+文件名都在这三份部署文档里各出现过**（本文件 + `docs/deskcore.md` + `docs/deskcore-runbook.md`；
+`000_baseline.sql` 不在此列），`test_doctor_probes_every_incremental_migration` 断言
+`core.migration_state` 里每个增量迁移都有一条探测。
+两条都只保证"提到了 / 探到了"——**写进表格哪一格、`impact` 写得对不对，仍然要人自己看。
+漏写不会静默通过，写错会。**
