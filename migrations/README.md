@@ -55,6 +55,30 @@
 > `deskcore_commit_fingerprints` 用了裸 `CREATE FUNCTION`，重跑会报
 > `already exists`（也就是**不幂等**，而 README 这一节正好承诺了幂等）。
 
+> ⚠️ **但它有个天生的盲区，2026-09-16 补上了。**
+>
+> 这个 harness 跑的是**完整链条**（`000` → 全部增量）。而增量里凡是 `DROP` 掉再
+> 重建的函数，都会把基线那一版盖掉——于是**基线自己漂了也永远看不出来**，
+> 因为终态总是对的。
+>
+> 实际漂的就是这两个：`deskcore_check_drafts` 停在 2 参（缺 `005` 的样本量前置闸、
+> 缺 `008` 的按 `embedding_model` 过滤）；`deskcore_commit_fingerprints` 签名对但
+> 函数体缺两处样本量闸，**而且 `INSERT` 的列里根本没有 `embedding_model`**。
+> 后者最坏：一个只跑 `000` 的新库写进去的指纹全都没有模型名，而查重那一路按
+> 模型名过滤——**指纹写了，却永远匹配不上**，不报错。
+>
+> 而「只跑 `000`」正是本文件第一张表承诺的 fresh install 路径。
+>
+> 现在 `tests/test_baseline_parity.py`（**纯文本比对，不需要数据库，每次 pytest 都跑**）
+> 守四条：基线里的函数块与「最后改它的那个增量」**字节级相同**；`GRANT` 签名跟着
+> 函数签名走；`FINAL_SOURCE` 登记的确实是目录里最后定义它的那个文件（防的是以后
+> 加 `009` 又漂）；增量里 `DROP` 掉重建的函数都得登记。
+>
+> **所以改增量里那些函数的维护方式是：把整块原样复制进基线。** 刻意要求字节相同、
+> 而不是"语义等价"——后者得先解析 SQL，而解析器一旦有 bug，失效方式恰好是
+> "看起来绿、其实漂了"，正是这条要治的病。基线特有的说明写在 `CREATE` 上方，
+> 不要写进函数块里面。
+
 ## 历史
 
 `001` 之前的 schema 变更记在 **truth-vault 仓的 `autowriter-migrations/`**
@@ -95,7 +119,7 @@ python -m deskcore.cli doctor --project <uuid>   # 额外打印这个项目的�
 
 | | 内容 | 不跑会怎样 |
 |---|---|---|
-| `000_baseline.sql` | 全部 15 张表 + 8 个函数 + RLS policy + 索引 + 触发器 | 新环境什么都没有。**已有库不要跑它**——跑增量就够。⚠️ 它**不是纯 no-op**：基线里的 `deskcore_check_drafts` 还停在 2 参旧签名（而 `005` 专门把这个签名 DROP 掉了），在已升级的库上重跑 `000` 会把那个旧重载连同它的 `GRANT` 一起建回来——与 runbook「`005` 验收」要求的「无重载残留」正相反，且它既没有 `005` 的样本量前置闸也没有 `008` 的按模型过滤，`store.check_drafts_sql` 的回退路径一旦踩上就是**静默降级**。真要重跑基线，跑完必须补跑 `005` 与 `008` 把它清掉 |
+| `000_baseline.sql` | 全部 15 张表 + 8 个函数 + RLS policy + 索引 + 触发器 | 新环境什么都没有。**已有库不要跑它**——跑增量就够（它幂等，跑了也不坏；2026-09-16 起有断言守着，见下） |
 | `001_deskcore.sql` | 发牌台账 / 成稿指纹 / 个人调校笔记 / 精修 diff 四张表（含它们的表级 `GRANT`，与 `007` 同一条语句）+ 两个 RPC（`deskcore_reserve_angles` / `deskcore_commit_fingerprints`）+ `items.updated_at` 与两个 `updated_at` 触发器 | deskcore 整个不可用；另外 `items.updated_at` 缺席会让 TV 的 `sync_autowriter_decisions_to_prepublish` 退回只按 `created_at` 增量同步，迟到的人工决策重新开始漏收 |
 | `002_calibration_cas.sql` | `update_calibration_notes_cas`（审计 COR-003） | 退回旧 CAS 路径并埋 `calibration_cas_rpc_missing`；长笔记（>4000 字级）的自动学习仍然静默停摆 |
 | `003_versions_unique_num.sql` | `UNIQUE(item_id, version_num)`（审计 COR-004） | 少了数据库层保护；应用层重试本身不依赖它。⚠️ 会先把历史重复对子重编号再建索引 |

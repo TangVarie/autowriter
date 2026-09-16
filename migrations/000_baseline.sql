@@ -873,21 +873,21 @@ GRANT EXECUTE ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) T
 -- check_drafts 里做; 这里挡住的是竞态窗口里最可能撞的那两类。
 --
 -- 返回每条的结果: inserted / rejected + 撞了谁。调用方据此告诉用户哪几条要重写。
-CREATE OR REPLACE FUNCTION deskcore_commit_fingerprints(
-    _project_id UUID,
-    _rows       JSONB,        -- [{title,opening,opening_hash,ngram_hashes,title_embedding,version_id,angle_key}, ...]
-    _user_id    UUID,
-    _ngram_hard NUMERIC DEFAULT 0.35,
-    -- 审计 COR-014: 写入侧的重查必须和 deskcore_check_drafts 同口径, 否则同一对
-    -- 稿子会在两道闸上得到相反的结论。阈值仍由 Python 侧统一持有, 不在 SQL 写死。
+-- ⚠️ 下面这一整块与 migrations/005_deskcore_containment.sql 里的**字节级相同**, 是原样复制过来的。
+--    改那边就把整块重新复制过来, 不要只补差异 —— tests/test_baseline_parity.py
+--    用字符串相等来守这件事, 漏一处它会红。(2026-09-16: 基线曾停在旧形态,
+--    而完整链条上 005 会把它盖掉, 所以 sql_parity_check 发现不了。)
+CREATE OR REPLACE FUNCTION autowriter.deskcore_commit_fingerprints(
+    _project_id         UUID,
+    _rows               JSONB,
+    _user_id            UUID,
+    _ngram_hard         NUMERIC DEFAULT 0.35,
     _contain_hard       NUMERIC DEFAULT 0.60,
     _contain_min_sample INT     DEFAULT 15
 )
 RETURNS TABLE(idx INT, status TEXT, collided_with TEXT, detail TEXT)
 LANGUAGE plpgsql
-SET search_path = pg_catalog, autowriter, extensions
--- 固定 search_path 的三段各自的作用见上面 deskcore_reserve_angles 那段说明;
--- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
+SET search_path = pg_catalog, extensions   -- ::vector 需要 extensions
 AS $$
 DECLARE
     r        JSONB;
@@ -913,19 +913,19 @@ BEGIN
         ng_max := (SELECT max(x) FROM unnest(ng) x);
 
         -- ① 开头精确撞车
-        -- ⚠️ 空开头(正文为空的 title-only 稿)不参与。Python 侧 fp.opening_hash
-        -- 对空开头返回空串, 这里把空串和 NULL 一起排除 —— 否则所有 title-only
-        -- 的行会互相"精确撞车", 而这是单独就判死的强信号, 没东西兜得住。
-        -- (这段本来只改在 migrations/001 里, 本文件漏了 —— 两份 DDL 双写的
-        --  典型代价, 见审计 SUP-010。)
+        -- ⚠️ 空开头(正文为空的 title-only 稿)不参与这一条。Python 侧
+        -- fp.opening_hash 现在对空开头返回空串, 这里把空串和 NULL 一起排除 ——
+        -- 否则所有 title-only 的行会互相"精确撞车", 而 opening_exact 是单独
+        -- 就判死的强信号, 没有任何东西兜得住这个误伤。(codex review)
         open_hit := FALSE;
         IF oh IS NOT NULL AND oh <> '' THEN
             SELECT TRUE, f.title INTO open_hit, best_t
-              FROM draft_fingerprints f
+              FROM autowriter.draft_fingerprints f
              WHERE f.project_id = _project_id
                AND f.opening_hash = oh
                AND f.opening_hash <> ''
              LIMIT 1;
+            -- 撞上的那行标题本身可能为空, 所以判据用 open_hit 而不是 best_t。
             open_hit := COALESCE(open_hit, FALSE);
         END IF;
         IF open_hit THEN
@@ -936,7 +936,7 @@ BEGIN
         END IF;
 
         -- ② 四字串: Jaccard 与包含度同一次扫描算完, 口径与 deskcore_check_drafts
-        --    完全一致(受限子域 + bottom-k 标准估计式)。见 migrations/005。
+        --    完全一致(受限子域 + bottom-k 标准估计式)。
         best_j := 0; best_t := NULL;
         best_c := 0; best_ct := NULL; best_cs := 0;
         IF ng_max IS NOT NULL THEN
@@ -944,10 +944,11 @@ BEGIN
                 SELECT c.title,
                        m.inter::numeric / NULLIF(m.uni, 0)     AS j,
                        m.inter::numeric / NULLIF(m.smaller, 0) AS c,
-                       m.smaller::int                          AS smaller
+                       m.smaller::int                          AS smaller,
+                       m.uni::int                              AS uni
                   FROM (
                       SELECT f.title, f.ngram_hashes AS hs
-                        FROM draft_fingerprints f
+                        FROM autowriter.draft_fingerprints f
                        WHERE f.project_id = _project_id
                          AND f.ngram_hashes && ng
                          AND array_length(f.ngram_hashes, 1) IS NOT NULL
@@ -972,10 +973,20 @@ BEGIN
                         ) g
                   ) m
             LOOP
-                IF hit.j IS NOT NULL AND hit.j > best_j THEN
+                -- Jaccard 看并集样本量, 包含度看 min —— 两个下限用同一个数,
+                -- 但量的是不同的东西。见 check 侧 jbest 上面那段注释。
+                IF hit.j IS NOT NULL AND hit.uni >= _contain_min_sample
+                   AND hit.j > best_j THEN
                     best_j := hit.j; best_t := hit.title;
                 END IF;
-                IF hit.c IS NOT NULL AND hit.c > best_c THEN
+                -- 包含度记它自己的最佳命中: 抄袭源和"用词最像的那篇"经常不是
+                -- 同一条, 报错时要指对人。
+                -- ⚠️ 样本量先过闸再比大小(与 check 侧的 cbest、Python 侧
+                --    core.py 同一口径)。否则一条只撞上一个低位 hash 的无关
+                --    历史稿会以 c=1.0/样本量=1 当选, 把真正的抄袭源挤掉,
+                --    随后又因样本量不足被下面那个 IF 放行。
+                IF hit.c IS NOT NULL AND hit.smaller >= _contain_min_sample
+                   AND hit.c > best_c THEN
                     best_c := hit.c; best_ct := hit.title; best_cs := hit.smaller;
                 END IF;
             END LOOP;
@@ -986,8 +997,9 @@ BEGIN
             RETURN NEXT;
             CONTINUE;
         END IF;
-        -- 样本量不够就不发言 —— 与 Python 侧 CONTAIN_MIN_SAMPLE 同一口径, 刻意
-        -- fail-open(样本量小时无关稿子也能撞出高包含度, 按硬闸处理就是误杀)。
+        -- 样本量不够就不发言 —— 与 Python 侧 CONTAIN_MIN_SAMPLE 同一口径。
+        -- 这一路刻意 fail-open: 样本量小的时候无关稿子也能撞出高包含度,
+        -- 按硬闸处理就是误杀。理由见 deskcore/fingerprint.py 的注释。
         IF best_cs >= _contain_min_sample AND best_c >= _contain_hard THEN
             idx := i; status := 'rejected'; collided_with := best_ct;
             detail := format('正文有 %s%% 的四字串出现在库中已有稿件里(照搬长稿)',
@@ -996,9 +1008,9 @@ BEGIN
             CONTINUE;
         END IF;
 
-        INSERT INTO draft_fingerprints
+        INSERT INTO autowriter.draft_fingerprints
             (project_id, version_id, user_id, title, opening,
-             title_embedding, opening_hash, ngram_hashes, angle_key)
+             title_embedding, embedding_model, opening_hash, ngram_hashes, angle_key)
         VALUES (
             _project_id,
             NULLIF(r->>'version_id','')::uuid,
@@ -1007,20 +1019,27 @@ BEGIN
             COALESCE(r->>'opening',''),
             CASE WHEN r->'title_embedding' IS NULL OR jsonb_typeof(r->'title_embedding') = 'null'
                  THEN NULL ELSE (r->>'title_embedding')::vector END,
+            NULLIF(r->>'embedding_model',''),
             oh,
             ng,
             NULLIF(r->>'angle_key','')
         );
+
+        -- ⚠️ 这个字面量是**跨语言契约**: deskcore/core.py 按
+        --    COMMIT_STATUS_INSERTED('inserted') 数 written、并据此给角度台账
+        --    销账。曾经这里写成 'written', 后果不是报错 —— 是每次成功入库都
+        --    报 written=0、一条角度都不销账(同一坐标可以被无限次抽到), 全程
+        --    没有任何异常。改这个词之前先改 core.py 的那个常量。
         idx := i; status := 'inserted'; collided_with := NULL; detail := NULL;
         RETURN NEXT;
     END LOOP;
 END;
 $$;
 
-REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM PUBLIC;
-REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM anon;
-REVOKE ALL ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM authenticated;
-GRANT EXECUTE ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) TO service_role;
+REVOKE ALL ON FUNCTION autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT) TO service_role;
 
 -- ── deskcore 查重比对下推(审计 SUP-002 / ROB-004 / ROB-011) ─────────────
 -- 原来是把整个项目的指纹(4000 行 × 768 维)拉进 Python 再逐对算余弦: 百 MB 级
@@ -1033,27 +1052,35 @@ GRANT EXECUTE ON FUNCTION deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERI
 -- 漏掉的那条正是要拦下的重复稿, 且不报错。这里 ORDER BY 的是子查询算好的
 -- 别名 sim, 不是 `title_embedding <=> v` —— pgvector 的索引只认后一种形态,
 -- 换成前者规划器必然走顺序扫描, 精确且可预期。完整理由见 migrations/004。
-CREATE OR REPLACE FUNCTION deskcore_check_drafts(
+-- ⚠️ 下面这一整块与 migrations/008_embedding_model_isolation.sql 里的**字节级相同**, 是原样复制过来的。
+--    改那边就把整块重新复制过来, 不要只补差异 —— tests/test_baseline_parity.py
+--    用字符串相等来守这件事, 漏一处它会红。(2026-09-16: 基线曾停在旧形态,
+--    而完整链条上 008 会把它盖掉, 所以 sql_parity_check 发现不了。)
+CREATE OR REPLACE FUNCTION autowriter.deskcore_check_drafts(
     _project_id UUID,
-    _rows       JSONB        -- [{opening_hash, ngram_hashes, title_embedding}, ...]
+    -- [{opening_hash, ngram_hashes, title_embedding}, ...]
+    -- title_embedding 可以是 null(本批算不出向量), 那一路直接跳过。
+    _rows       JSONB,
+    -- 包含度那一路的有效样本量下限。真正生效的值由 Python 侧传下来
+    -- (fingerprint.CONTAIN_MIN_SAMPLE), 这里的 DEFAULT 只是让手动在 SQL
+    -- 控制台里调用时不至于报缺参 —— 两边写死两份就迟早对不上。
+    _contain_min_sample INT DEFAULT 15
 )
 RETURNS TABLE(
-    idx        INT,
-    best_sim   NUMERIC,
-    sim_title  TEXT,
-    best_j     NUMERIC,
-    j_title    TEXT,
-    open_exact BOOLEAN,
-    open_title TEXT,
-    best_c     NUMERIC,      -- 四字串包含度(审计 COR-014)
-    c_title    TEXT,
-    c_sample   INT           -- 该次估计的有效样本量; 太小则调用方不采信
+    idx          INT,
+    best_sim     NUMERIC,   -- 标题语义余弦的最大值; 没有可比向量时 0
+    sim_title    TEXT,
+    best_j       NUMERIC,   -- 正文四字串 Jaccard 的最大值(bottom-k 无偏估计)
+    j_title      TEXT,
+    open_exact   BOOLEAN,   -- 正文开头精确撞车
+    open_title   TEXT,
+    best_c       NUMERIC,   -- 正文四字串包含度的最大值(审计 COR-014)
+    c_title      TEXT,
+    c_sample     INT        -- 上面那次估计的有效样本量; 太小则调用方不采信
 )
 LANGUAGE plpgsql
 STABLE
-SET search_path = pg_catalog, autowriter, extensions
--- 固定 search_path 的三段各自的作用见上面 deskcore_reserve_angles 那段说明;
--- extensions 是给 ::vector 用的, autowriter 是给不带前缀的表名用的。
+SET search_path = pg_catalog, extensions   -- ::vector 需要 extensions
 AS $$
 DECLARE
     r      JSONB;
@@ -1062,6 +1089,8 @@ DECLARE
     ng_max TEXT;
     oh     TEXT;
     v      vector;
+    -- 产出本批向量的模型名。NULL = 调用方没带(老客户端), 走兼容路径。
+    _model TEXT;
 BEGIN
     FOR r IN SELECT * FROM jsonb_array_elements(_rows) LOOP
         i := i + 1;
@@ -1075,42 +1104,48 @@ BEGIN
         SELECT COALESCE(array_agg(x), '{}') INTO ng
           FROM jsonb_array_elements_text(COALESCE(r->'ngram_hashes','[]'::jsonb)) x;
         ng_max := (SELECT max(x) FROM unnest(ng) x);
-        v := CASE WHEN r->'title_embedding' IS NULL
-                    OR jsonb_typeof(r->'title_embedding') = 'null'
-                  THEN NULL ELSE (r->>'title_embedding')::vector END;
+        v := CASE
+                WHEN r->'title_embedding' IS NULL
+                  OR jsonb_typeof(r->'title_embedding') = 'null'
+                THEN NULL
+                ELSE (r->>'title_embedding')::vector
+             END;
+        _model := NULLIF(r->>'embedding_model', '');
 
-        -- ① 开头精确撞车。空开头不参与(否则 title-only 的稿子会互相撞车)。
+        -- ① 开头精确撞车。oh 为空 = 这篇没有正文开头, 空 == 空【不算撞车】
+        --    (否则所有 title-only 的稿子会互相"精确撞车", 见 fp.opening_hash)。
         IF oh IS NOT NULL THEN
             SELECT f.title INTO open_title
-              FROM draft_fingerprints f
+              FROM autowriter.draft_fingerprints f
              WHERE f.project_id = _project_id AND f.opening_hash = oh
              LIMIT 1;
             open_exact := open_title IS NOT NULL;
         END IF;
 
-        -- ② 四字串: Jaccard 与包含度同一次扫描算完, 各取各的最佳命中。
-        --    ngram_hashes 存的是 bottom-k **sketch** 不是完整集合, 所以两个
-        --    指标都只在【两个 sketch 都覆盖到的 hash 区间】上算:
-        --    t = min(两边最大值), 因为 v ≤ t 时"v ∈ 原集合" ⟺ "v ∈ sketch"。
-        --    直接对整个数组求交并比会系统性偏低(实测最大 0.125, 而硬闸线 0.35)。
-        --    包含度 |A∩B|/min(|A|,|B|) 专抓 Jaccard 结构上抓不到的形状:
-        --    短稿整段照搬长稿(那时 J 的真值就等于长度比, 再准也够不着阈值)。
-        --    完整推导与阈值的零分布见 migrations/005 + deskcore/fingerprint.py。
-        --    ⚠️ 逐行走 LATERAL, 不要拆成两个 CTE 再按 title join —— title 不唯一。
+        -- ② 正文四字串: Jaccard 与包含度**同一次扫描**算完, 各取各的最佳命中。
+        --    GIN 的 && 先粗筛 —— 没有交集的行两个指标都是 0, 不可能成为最大值。
         IF ng_max IS NOT NULL THEN
+            -- ⚠️ 逐行用 LATERAL 往下传, **不要**把中间结果拆成两个 CTE 再按
+            --    title join 回去 —— title 不唯一(同一个项目里重名的历史稿很
+            --    常见), 那样会扇出成笛卡尔积, 指标全错而且不报错。
             WITH cand AS (
                 SELECT f.title, f.ngram_hashes AS hs
-                  FROM draft_fingerprints f
+                  FROM autowriter.draft_fingerprints f
                  WHERE f.project_id = _project_id
                    AND f.ngram_hashes && ng
                    AND array_length(f.ngram_hashes, 1) IS NOT NULL
             ),
             metrics AS (
-                SELECT c.title, m.inter::numeric AS inter,
-                       m.uni::numeric AS uni, m.smaller::numeric AS smaller
+                SELECT c.title,
+                       m.inter::numeric   AS inter,
+                       m.uni::numeric     AS uni,
+                       m.smaller::numeric AS smaller
                   FROM cand c
+                  -- t = min(两个 sketch 各自的最大值)。定长十六进制,
+                  -- 字典序即数值序。
                   CROSS JOIN LATERAL (
-                      SELECT LEAST(ng_max, (SELECT max(x) FROM unnest(c.hs) x)) AS t
+                      SELECT LEAST(ng_max,
+                                   (SELECT max(x) FROM unnest(c.hs) x)) AS t
                   ) tt
                   CROSS JOIN LATERAL (
                       SELECT count(*) FILTER (WHERE g.in_a AND g.in_b) AS inter,
@@ -1118,8 +1153,9 @@ BEGIN
                              LEAST(count(*) FILTER (WHERE g.in_a),
                                    count(*) FILTER (WHERE g.in_b))     AS smaller
                         FROM (
-                            SELECT z.h, bool_or(z.src = 'a') AS in_a,
-                                        bool_or(z.src = 'b') AS in_b
+                            SELECT z.h,
+                                   bool_or(z.src = 'a') AS in_a,
+                                   bool_or(z.src = 'b') AS in_b
                               FROM (SELECT x AS h, 'a' AS src
                                       FROM unnest(ng) x WHERE x <= tt.t
                                     UNION ALL
@@ -1133,17 +1169,29 @@ BEGIN
             --    一条语句 —— 拆成两条 SELECT 的话第二条会报 relation "metrics"
             --    does not exist。(在真 PostgreSQL 上跑才发现的; 光看代码
             --    和 py_compile 都看不出来。)
+            -- Jaccard 自己的样本量下限是**并集**大小(而不是包含度用的
+            -- min(|a|,|b|)) —— 两者不能混用, 理由见 fingerprint.sketch_overlap
+            -- 的注释: 短稿 vs 超长历史稿时 min 只有两三个但 union 有几百,
+            -- 那是正常形态; 真正不可用的是**两边都塌到个位数**的时候。
             jbest AS (
                 SELECT x.title, x.j FROM (
-                    SELECT m.title, m.inter / NULLIF(m.uni, 0) AS j FROM metrics m
+                    SELECT m.title, m.inter / NULLIF(m.uni, 0) AS j
+                      FROM metrics m WHERE m.uni >= _contain_min_sample
                 ) x WHERE x.j IS NOT NULL ORDER BY x.j DESC, x.title LIMIT 1
             ),
+            -- ⚠️ 样本量的判据必须在 ORDER BY 之前。原来是先按 c 取冠军、把
+            --    冠军的样本量一起返回给调用方事后判断 —— 一条毫不相关、只跟
+            --    本稿撞上一个低位 hash 的历史稿能拿到 c=1.0 / 样本量=1, 压过
+            --    真正的抄袭源(c=0.9 / 样本量>=15); 冠军随后因样本量不足被丢掉,
+            --    真命中根本没进过决赛, 照搬长稿的稿子就这么放行了。
+            --    Python 侧 core.py 的两处 `if s >= CONTAIN_MIN_SAMPLE` 同口径。
             cbest AS (
                 SELECT x.title, x.c, x.smaller FROM (
                     SELECT m.title, m.inter / NULLIF(m.smaller, 0) AS c,
                            m.smaller::int AS smaller
                       FROM metrics m
-                ) x WHERE x.c IS NOT NULL ORDER BY x.c DESC, x.title LIMIT 1
+                ) x WHERE x.c IS NOT NULL AND x.smaller >= _contain_min_sample
+                  ORDER BY x.c DESC, x.title LIMIT 1
             )
             SELECT (SELECT b.j FROM jbest b), (SELECT b.title FROM jbest b),
                    (SELECT b.c FROM cbest b), (SELECT b.title FROM cbest b),
@@ -1154,17 +1202,29 @@ BEGIN
             c_sample := COALESCE(c_sample, 0);
         END IF;
 
-        -- ③ 标题语义余弦(见上: 顺序扫描, 精确)。
+        -- ③ 标题语义余弦。见 migrations/004 的文件头: ORDER BY 的是别名 sim,
+        --    不是距离算子 —— 刻意绕开 ivfflat 的近似最近邻。
         IF v IS NOT NULL THEN
             SELECT t.title, t.sim INTO sim_title, best_sim
               FROM (
                 SELECT f.title, 1 - (f.title_embedding <=> v) AS sim
-                  FROM draft_fingerprints f
+                  FROM autowriter.draft_fingerprints f
                  WHERE f.project_id = _project_id
                    AND f.title_embedding IS NOT NULL
+                   -- ⚠️ 按模型隔离(migrations/008)。跨模型算余弦出来的数是
+                   --    噪声, 而且【不报错】—— 既会放过真重复, 也会误杀无关稿,
+                   --    同时 semantic_degraded 还报 false。
+                   --    `=` 而不是 IS NOT DISTINCT FROM: embedding_model 为
+                   --    NULL 的行是"来路不明", 必须一起排除, 而 NULL = X 恰好
+                   --    就是 NULL(不匹配)。
+                   --    _model 为 NULL(老调用方没带)时整句退化为 TRUE, 保持
+                   --    008 之前的行为 —— 见文件头对这条兼容路径的说明。
+                   AND (_model IS NULL OR f.embedding_model = _model)
               ) t
              ORDER BY t.sim DESC, t.title
              LIMIT 1;
+            -- 全负分时报 0 —— 与 Python 侧"累加器从 0.0 起、严格大于才顶替"
+            -- 的口径一致(dedup.find_near_duplicates 同款处理)。
             IF best_sim IS NULL OR best_sim <= 0 THEN
                 best_sim := 0; sim_title := NULL;
             END IF;
@@ -1175,10 +1235,10 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM PUBLIC;
-REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM anon;
-REVOKE ALL ON FUNCTION deskcore_check_drafts(UUID, JSONB) FROM authenticated;
-GRANT EXECUTE ON FUNCTION deskcore_check_drafts(UUID, JSONB) TO service_role;
+REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) TO service_role;
 
 -- ── list_projects 的指纹批量计数(审计 SUP-004) ──────────────────────────
 -- PostgREST 不会 GROUP BY, 没有这个函数就只能每个项目发一次 count=exact:
