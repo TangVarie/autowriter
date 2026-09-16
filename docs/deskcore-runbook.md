@@ -16,7 +16,8 @@
 的——把 deskcore 挂到客户端（见 §2 第 3 步），不挂上去这一整套没人用。
 
 离线自测：全套 pytest（条数以实跑为准，别在文档里钉死——前几次提交都在 commit message 里报了新数却没回来改这里）+ selftest + 真 PostgreSQL 上的迁移叠加与 SQL/Python
-逐例比对，全绿。线上实测：`/health` 全绿、13 个工具都在、`semantic_degraded`
+逐例比对，全绿。线上实测：`/health` 全绿、工具清单与 `tools.py` 的 `TOOLS` 对得上
+（**个数同样别在文档里钉死**，打一下 `/health` 就知道）、`semantic_degraded`
 为 `false`；四路查重信号**各自都当过一次判定信号**（`opening` / `title` /
 `ngram` / `contain` 各有一个专属探针，见 §1.5）。
 
@@ -60,7 +61,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
 | **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
-| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、**16 个工具**都在（2026-08-28 加了 `my_rules` / `set_rule_state` / `reembed_my_rules`）、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
+| **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、工具清单与 `tools.py` 的 `TOOLS` 一致（陆续加过 `my_rules` / `set_rule_state` / `reembed_my_rules`（2026-08-28）与 `get_protocol`（2026-09-10）——**个数以 `/health` 为准，不在这里钉死**）、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
 | **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
 | `draft_fingerprints` | ✅ **3,678 行 / 44 个项目**（2026-08-26 回填，见 §1.5）。当前模型 3,671 / 来路不明 0 / 别的模型 0 / 维度 min=max=768 / 重复 `version_id` 0 |
 | `angle_ledger` / `user_calibration_notes` / `style_edits` | **全 0** ← 没人用过 |
@@ -385,7 +386,7 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 >   而且 B 能改 A 的标注（`label_example` 的归属校验是按 `user_id` 判的）。
 >
 > ⚠️ **2026-08-24 起还多一层**（审计 COR-015）：`user_id` 现在还决定**能打开哪些项目**——
-> 判据是 `projects.owner_id == user_id`，十五个工具全部校验（`create_project` 不校验已有项目，它**恒以调用者为 owner** 建新的）。所以给新人发一个全新 UUID
+> 判据是 `projects.owner_id == user_id`，**每个项目级工具都校验**（`create_project` 不校验已有项目，它**恒以调用者为 owner** 建新的；`get_protocol` 不碰项目）。所以给新人发一个全新 UUID
 > 意味着他**一个项目都打不开**，得先让他自己建项目（或者把他要用的项目的 `owner_id`
 > 改成他）。口径与"改成团队共享要改哪儿"见 `docs/deskcore.md` §2.2.1。
 >
@@ -405,7 +406,7 @@ key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是�
 #### key 轮换（怎么换、为什么这么换）
 
 key 一旦在聊天窗口、截图、工单里出现过，就当它已经泄露 —— deskcore 持
-`service_role` 绕过 RLS，一把有效 key 等于那个人名下**全部项目数据 + 十五个
+`service_role` 绕过 RLS，一把有效 key 等于那个人名下**全部项目数据 + 全部
 工具（含写）**。轮换是唯一的补救。
 
 **第一步：本地生成，不要让任何人替你生成。**
@@ -873,7 +874,7 @@ where source_feedback = 'craft-seed-2026-08-28';
 | 落库（批量） | `db.py:1339` `bulk_update_version_embeddings` | docstring 明写「errors are swallowed so an embedding failure never blocks the user's batch」 |
 | 落库（单条） | `db.py:1313`（在 `update_version_content` 里） | `except Exception: pass`，注释写着「保持静默」 |
 
-叠加上 `config.py:132` 的 `ENABLE_DEDUP_REGEN` **默认是 `"0"`**（查重命中了也不重生、
+叠加上 `config.py` 的 `ENABLE_DEDUP_REGEN` **默认是 `"0"`**（查重命中了也不重生、
 不拦，只写一条 UI 警告），以及 R-034 记过的 `_parse_pgvector` 缺失（PostgREST 把
 `vector(768)` 序列化成字符串，不归一则 `cosine_similarity` 因长度不等**静默返回 0.0**，
 "跨批语义查重的 DB 历史池自上线起 0 命中"）——
@@ -1067,11 +1068,12 @@ httpx 默认）。跨源时这一跳是独立的失败路径：预检是针对 `
 
 ### 6.2 三条不能破的纪律
 
-1. **fail-open 只有三个工具，别扩大。** `_safe()` 包装会把异常变成一个**看起来成功**、
+1. **fail-open 只有四个工具，别扩大。** `_safe()` 包装会把异常变成一个**看起来成功**、
    只多一个 `error` 字段的结果，`hint` 里还写着"写稿可以继续"。目前只包了
-   `list_projects` / `borrow_lessons` / `my_style` —— 读，且拿不到只是少点参考。
+   `list_projects` / `borrow_lessons` / `my_style` / `my_rules` —— 读，且拿不到只是
+   少点参考。这个集合被 `ci.yml` 的 `SAFE_OK` 钉死，增减都会红。
 
-   **`open_project` 刻意没包**（`tools.py:25` 的 docstring 专门讲了原因）：拿不到 P0
+   **`open_project` 刻意没包**（`tools.py` 里 `_safe` 的 docstring 专门讲了原因）：拿不到 P0
    硬约束就照常开写，产出的是违规内容，而调用方看到的是一份 `p0` 为空的**正常简报**。
    `store.shared_memories()` 为此故意不吞异常，外面再包一层 `_safe` 等于把那个设计
    原样抵消掉。**写类工具**（`draw_angles` / `commit_drafts` / `record_rule` /
@@ -1086,7 +1088,7 @@ httpx 默认）。跨源时这一跳是独立的失败路径：预检是针对 `
 
    判据一句话：**失败之后调用方还会不会当作成功继续往下走。会 → 不能包。**
 2. **别在 `deskcore/__init__` 之前 import `db`。** 它要先设 `AW_DISABLE_ST_CACHE=1`
-   （R-042，同 `worker.py:56`），否则 headless 进程会拿 `st.cache_data` 的 30-60s 旧数据。
+   （R-042，同 `worker.py 顶部`），否则 headless 进程会拿 `st.cache_data` 的 30-60s 旧数据。
 3. **读 embedding 必须过 `db._parse_pgvector`。** 不归一则 `cosine_similarity` 静默返回
    `0.0`——查重变哑弹且不报错（R-034）。`store.py` 已在读取边界统一处理。
 

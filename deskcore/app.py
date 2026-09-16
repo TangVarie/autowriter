@@ -16,7 +16,7 @@
 
 降级:
   读类工具出错 → 返回带 error 的可用结构 + 服务端 logger.exception 留痕。
-  check_drafts 例外 → 出错抛 500。查重静默放行 = 重演 config.py:132 那个
+  check_drafts 例外 → 出错抛 500。查重静默放行 = 重演 config.py 那个
   ENABLE_DEDUP_REGEN 默认关着的老问题。
 
 部署 (Railway / Render, 与 worker.py 同为独立 service):
@@ -37,7 +37,7 @@
   见 deskcore/railway.json。
 
 ⚠️ import 顺序: 本模块通过包 __init__ 先设 AW_DISABLE_ST_CACHE=1 再 import db
-(R-042; 同 worker.py:56)。别在 __init__ 之前 import db。
+(R-042; 同 worker.py 顶部)。别在 __init__ 之前 import db。
 """
 
 from __future__ import annotations

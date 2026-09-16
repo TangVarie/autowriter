@@ -11,7 +11,7 @@
 降级口径:
   · 读类工具出错 → 返回带 error 的可用结构, 不抛(不阻塞写稿)
   · check_drafts 是【唯一例外】→ 出错必须抛。静默放行就是重演
-    config.py:132 那个 ENABLE_DEDUP_REGEN 默认关着的老问题。
+    config.py 那个 ENABLE_DEDUP_REGEN 默认关着的老问题。
 """
 
 from __future__ import annotations
