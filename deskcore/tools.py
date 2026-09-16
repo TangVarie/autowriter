@@ -73,7 +73,8 @@ def _safe(fn, *args, **kwargs) -> Any:
     ⚠️ 【什么能包、什么绝不能包】—— 加新工具前先读这段。
     本包装会把异常变成一个**看起来成功**、只多一个 error 字段的结果, 而 hint
     里明写着"写稿可以继续"。所以它只适用于:【读】+【拿不到也只是少点参考】。
-    目前只有三个: list_projects / borrow_lessons / my_style。
+    目前只有四个: list_projects / borrow_lessons / my_style / my_rules。
+    (这个集合被 ci.yml 的 SAFE_OK 钉死, 增减都会红。)
 
     绝不能包的两类, 各有各的失败模式:
       · **合规读**(open_project) —— 拿不到 P0 硬约束就照常开写, 产出的是违规
