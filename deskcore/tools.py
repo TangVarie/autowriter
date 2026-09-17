@@ -84,6 +84,12 @@ def get_protocol(local_version: str | None = None,
     # 故意不包 _safe: 包成带 error 的"成功"会让模型以为版本核过了。
     text, digest = protocol_text()
     out: dict = {"version": digest, "chars": len(text)}
+    # 宽松地取版本号: 模型可能把整行 "<!-- protocol_version: xxx -->" 或
+    # "protocol_version: xxx" 原样传进来。只要里面有那 12 位十六进制就认。
+    # 精确比较的后果是每场对话都判成"旧版", 全文再发一遍、还让运营白重装。
+    if local_version is not None:
+        m = re.search(r"[0-9a-f]{12}", str(local_version).lower())
+        local_version = m.group(0) if m else str(local_version).strip()
     if local_version is None:
         out["protocol"] = text
         out["up_to_date"] = None
@@ -113,8 +119,11 @@ def render_skill(current_skill: str, body: str, version: str) -> str:
     if not sep:
         raise RuntimeError(
             f"{SKILL_PATH} 里没有 protocol_version 标记行 —— 不知道从哪儿开始替换。")
+    # 标记行之外再写一行**可见的**版本号: 有的 skill 加载器会把 HTML 注释剥掉,
+    # 模型就找不到该传给 get_protocol 的值了。机器认注释, 人和模型认下面这行。
     return (head.rstrip("\n") + "\n\n"
-            + SKILL_VERSION_MARK.format(version=version) + "\n\n" + body + "\n")
+            + SKILL_VERSION_MARK.format(version=version) + "\n"
+            + f"protocol_version: {version}\n\n" + body + "\n")
 
 
 def skill_sync_state() -> dict:
@@ -124,6 +133,9 @@ def skill_sync_state() -> dict:
     m = _SKILL_MARK_RE.search(skill)
     embedded_version = m.group(1) if m else None
     embedded_body = skill[m.end():].strip() if m else ""
+    # 标记后面那行可见的 "protocol_version: xxx" 不算正文
+    if embedded_body.startswith("protocol_version:"):
+        embedded_body = embedded_body.split("\n", 1)[1].strip() if "\n" in embedded_body else ""
     return {
         "in_sync": embedded_version == digest and embedded_body == body,
         "skill_version": embedded_version,
@@ -354,6 +366,17 @@ def commit_drafts(project_id: str, drafts: list[dict],
     返回值里的 ``batch_id`` / ``version_ids`` 是这批稿子在库里的身份, 直接拿去
     喂 export_drafts。带 ``identity_warning`` 时说明身份没建成 —— 稿子入库了、
     查重不受影响, 但这批导不出可归因的 lineage。
+
+    ⚠️ **入库自带闸**: 入库前会先跑一遍和 check_drafts 同一套判定, 判 reject 的
+    不入库, 在 ``rejected`` 里带 ``gate="pre_commit"``(``gate="atomic_recheck"``
+    是写入时的竞态拦截)。所以跳过 check 直接 commit 塞不进重复的稿子, 只会让你
+    在这一步才知道哪几条要重写。``gate_summary`` 是那次判定的汇总(含
+    semantic_degraded / empty_history_warning), 该告诉用户的照 check_drafts 的
+    规矩说。
+
+    **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零
+    就是有几条没带 —— 那几个角度没销账, 下一批还会被抽到, 同一个故事会被讲
+    第二遍, 而那种重复查重闸抓不到。
     """
     # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、
     # 只带 error 字段的结果, 而写作台协议对 commit 没有强制重试 —— 于是定稿

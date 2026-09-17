@@ -45,9 +45,9 @@ def test_ingest_dry_run_parses_and_writes_nothing(fake, tmp_path, capsys):
     rc = cli.main(["ingest", "--project", PROJ, "--user", ME, "--xlsx", str(p), "--dry-run"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "可补 2 条" in out and "跳过 1 条" in out
+    assert "解析到 2 条" in out and "跳过 1 条" in out
     assert "--dry-run" in out
-    assert "items" not in fake.rows and "draft_fingerprints" not in fake.rows
+    assert not fake.rows.get("items") and not fake.rows.get("draft_fingerprints")
 
 
 def test_ingest_writes_identity_and_fingerprints_with_the_file_as_source(fake, tmp_path, capsys):

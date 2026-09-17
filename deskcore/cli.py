@@ -246,8 +246,8 @@ def _ingest(core, sb, args) -> int:
     from . import ingest as I
     parsed = I.read_published_xlsx(args.xlsx, sheet=args.sheet,
                                    title_col=args.title_col, body_col=args.body_col)
-    print(f"表 {args.xlsx}: 形状={parsed['shape']}, 可补 {len(parsed['rows'])} 条, "
-          f"已在库里(带 version_id)跳过 {parsed['skipped_with_lineage']} 条, "
+    print(f"表 {args.xlsx}: 形状={parsed['shape']}, 解析到 {len(parsed['rows'])} 条, "
+          f"带 version_id(真走过 commit)跳过 {parsed['skipped_with_lineage']} 条, "
           f"空行 {parsed['skipped_empty']} 条")
     for r in parsed["rows"][:5]:
         print(f"  第 {r.row} 行  {r.title[:24]!r}  正文 {len(r.body)} 字")
@@ -257,19 +257,25 @@ def _ingest(core, sb, args) -> int:
     out = core.ingest_published(
         sb, args.project, [{"title": r.title, "body": r.body} for r in parsed["rows"]],
         user_id=args.user, source=source, dry_run=args.dry_run)
+    skipped = (f"指纹库里已有 {out['skipped_already_fingerprinted']} 条、"
+               f"表内重复 {out['skipped_duplicate_in_sheet']} 条(都跳过)")
     if args.dry_run:
-        print(f"\n--dry-run: 会写 {out['to_write']} 条, 没动库。")
+        print(f"\n--dry-run: 会写 {out['to_write']} 条; {skipped}。没动库。")
         return 0
-    print(f"\n建身份 {out['minted']}/{out['to_write']}, 写指纹 {out['fingerprinted']}, "
-          f"batch_id={out['batch_id']}, 带标题向量={out['embedded']}")
+    print(f"\n{skipped}; 建身份 {out['minted']}/{out['to_write']}, 写指纹 "
+          f"{out['fingerprinted']}, batch_id={out['batch_id']}, 带标题向量={out['embedded']}")
+    rc = 0
     if out["identity_error"]:
-        print(f"  ⚠️ 身份没建全: {out['identity_error']} —— 已建成的那些指纹已写, "
-              "没建成的重跑一次(会再建一个 batch, 不会重复指纹以外的东西)")
-        return 1
+        print(f"  ⚠️ 身份没建全: {out['identity_error']}。没建成的行**重跑本命令**会"
+              "补上(已有指纹的行会被跳过, 不会翻倍)。")
+        rc = 1
     if out["fingerprinted"] < out["minted"]:
-        print("  ⚠️ 指纹少于身份 —— 那几条下一批还是撞它; 重跑")
-        return 1
-    return 0
+        print(f"  ⚠️ 有 {out['minted'] - out['fingerprinted']} 条建了身份没写上指纹 —— "
+              "**不要重跑本命令**(重跑看不到它们的指纹, 会再建一份身份); 跑 "
+              f"`python -m deskcore.cli backfill --project {args.project}`, 它按 "
+              "version_id 幂等, 会把有身份没指纹的行补上。")
+        rc = 1
+    return rc
 
 
 def _doctor(core, sb, project_id: str | None) -> int:

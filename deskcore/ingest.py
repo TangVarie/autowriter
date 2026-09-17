@@ -47,8 +47,9 @@ def parse_content_cell(text: str | None) -> tuple[str, str]:
     """导出格式的「内容」单元格 → (标题, 正文)。
 
     格式是 exporter 写的: 第一行 "标题：xxx", 空一行, "正文：" 开头到底。
-    没有 "标题：" 前缀时整格当正文、标题留空 —— 运营手改过的格子常这样,
-    宁可标题空也别把正文丢了(指纹主要靠正文)。
+    两种手改都要认(指纹主要靠正文, 丢正文等于白补):
+      · 没有 "标题：" 前缀 → 整格当正文、标题留空;
+      · 有 "标题：" 但 "正文：" 前缀被删了 → 标题后第一个非空行起全是正文。
     """
     if not text:
         return "", ""
@@ -68,8 +69,10 @@ def parse_content_cell(text: str | None) -> tuple[str, str]:
             continue
         if in_body:
             body_lines.append(ln)
-        elif not title and ln.strip():
-            # 没有任何前缀的格子: 全部当正文
+        elif ln.strip():
+            # 到这里说明这一行既不是标题也没有"正文："前缀:
+            #   · 还没有标题 → 整格没前缀, 全部当正文;
+            #   · 已有标题   → "正文："被人删了, 这一行就是正文的开头。
             in_body = True
             body_lines.append(ln)
     return title, "\n".join(body_lines).strip()
@@ -92,6 +95,13 @@ def read_published_xlsx(path: str | Path, *, sheet: str | None = None,
     import openpyxl
 
     wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    try:
+        return _read(wb, path, sheet=sheet, title_col=title_col, body_col=body_col)
+    finally:
+        wb.close()          # read_only 模式下不 close 会一直占着文件句柄
+
+
+def _read(wb, path, *, sheet, title_col, body_col) -> dict:
     ws = wb[sheet] if sheet else wb.active
     it = ws.iter_rows(values_only=True)
     try:

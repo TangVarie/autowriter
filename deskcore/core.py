@@ -998,9 +998,23 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         outcome = []          # 全被闸前拦下, 没东西可写, 也别去碰 RPC
 
     atomic = outcome is not None
+    rpc_anomalies = 0
     if atomic:
         written = sum(1 for o in outcome
                       if o.get("status") == COMMIT_STATUS_INSERTED)
+        # ⚠️ idx 越界的回执**不许抛**: 指纹这时已经写进去了, 抛出去调用方会重试,
+        #    重试会撞上自己刚写的指纹 —— 一次故障变成一句"你的稿子重复了"。
+        #    记日志、数出来、报给调用方, 但不中断。(code review 2026-09-17)
+        valid = []
+        for o in outcome:
+            idx = o.get("idx")
+            if isinstance(idx, int) and 0 <= idx < len(survivors):
+                valid.append(o)
+            else:
+                rpc_anomalies += 1
+                logger.error("commit_drafts: RPC 回执 idx=%r 越界(幸存者 %d 条, "
+                             "project=%s) —— 跳过这一行", idx, len(survivors), project_id)
+        outcome = valid
         for o in outcome:
             if o.get("status") == "rejected":
                 orig = survivors[o["idx"]]
@@ -1120,6 +1134,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         out["angle_ledger_warning"] = (
             f"{attempted - consumed}/{attempted} 个坐标没能在台账上销账(多半是发牌时"
             "台账没写进去)。这些坐标下一批可能被重复抽到, 服务端日志有明细。")
+    if rpc_anomalies:
+        out["rpc_anomalies"] = rpc_anomalies
+        out["rpc_warning"] = (
+            f"入库 RPC 回了 {rpc_anomalies} 行对不上号的回执(idx 越界), 已跳过。"
+            "指纹可能已写入但这几条的身份/销账没做 —— 服务端日志有明细, 别重试, "
+            "重试会撞上自己刚写的指纹。")
     if unattributed:
         out["unattributed_warning"] = (
             f"{unattributed}/{written} 条入库的稿子没带 angle_key, 台账无法给它们"
@@ -2038,17 +2058,45 @@ def ingest_published(client, project_id: str, entries: list[dict], *,
     分得清这批是补进来的, 不是写作台当场写的。**不碰 items.external_source**:
     那列是 TV 同步的标记('truth_vault'), TV 按它认自己的行, 借用会搅乱对接。
 
-    ``dry_run`` 只数不写。返回里 ``fingerprinted < minted`` 说明指纹那一步失败
-    了 —— 身份在、指纹不在, 下一批还是撞它; 重跑即可, 建身份不幂等但指纹按
-    version_id 一一对应, 说清楚比自动重试稳。
+    ── 幂等(code review 2026-09-17)────────────────────────────────────
+    重跑必须安全: 运营看到一条警告就会再跑一遍。所以入库前先按正文开头哈希
+    (``opening_hash``)查一遍指纹库, **已经有指纹的行跳过**; 同一张表里正文相同
+    的行也只收第一条。两种跳过都数出来报。
+
+    但"身份建了、指纹没写"那种半途失败**不是靠重跑修**: 重跑看不到它的指纹,
+    会再建一份身份。修法是 ``backfill --project`` —— 它按 version_id 幂等, 会把
+    有身份没指纹的行补上。返回里 ``fingerprinted < minted`` 时就该走那条路。
+
+    ``dry_run`` 只数不写(但会查已有指纹, 所以 dry-run 的数字就是真跑会写的数)。
     """
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     cleaned = [{"title": (e.get("title") or "").strip(),
                 "body": (e.get("body") or "").strip()} for e in entries]
     cleaned = [e for e in cleaned if e["title"] or e["body"]]
-    out = {"received": len(entries), "to_write": len(cleaned), "minted": 0,
-           "fingerprinted": 0, "batch_id": None, "identity_error": None,
-           "embedded": False, "dry_run": dry_run}
+    # 表内去重 + 库内去重, 都按正文开头哈希。没有正文(title-only)的行算不出
+    # 开头哈希, 只能照收 —— 它们本来也拦不住谁。
+    dup_in_sheet = already = 0
+    seen: set[str] = set()
+    hashes = [fp.opening_hash(e["body"]) for e in cleaned]
+    known = store.existing_opening_hashes(client, project_id,
+                                          [h for h in hashes if h])
+    keep: list[dict] = []
+    for e, h in zip(cleaned, hashes):
+        if h and h in seen:
+            dup_in_sheet += 1
+            continue
+        if h and h in known:
+            already += 1
+            continue
+        if h:
+            seen.add(h)
+        keep.append(e)
+    cleaned = keep
+    out = {"received": len(entries), "to_write": len(cleaned),
+           "skipped_already_fingerprinted": already,
+           "skipped_duplicate_in_sheet": dup_in_sheet,
+           "minted": 0, "fingerprinted": 0, "batch_id": None,
+           "identity_error": None, "embedded": False, "dry_run": dry_run}
     if dry_run or not cleaned:
         return out
     to_mint = [{"version_id": str(uuid.uuid4()), "title": e["title"],

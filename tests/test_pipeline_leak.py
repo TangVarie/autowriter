@@ -95,6 +95,7 @@ def test_health_reports_an_unprobeable_pipeline_instead_of_hiding_it(monkeypatch
     monkeypatch.setenv("DESKCORE_KEYS",
                        '{"k-test": {"user_id": "22222222-2222-2222-2222-222222222222", "name": "t"}}')
     monkeypatch.setattr(A_, "_health_probe_client", lambda: object())
+    A_._leak_cache.update(at=0.0, value=None)     # 别让上一条测试的缓存替它回答
 
     def _boom(sb, days=7):
         raise RuntimeError("库挂了")
@@ -103,3 +104,26 @@ def test_health_reports_an_unprobeable_pipeline_instead_of_hiding_it(monkeypatch
     pipe = client.get("/health").json()["config"]["pipeline"]
     assert pipe["ok"] is None
     assert "探不到" in pipe["note"]
+
+
+def test_health_caches_the_leak_probe_between_pings(monkeypatch):
+    """/health 是 Railway 的存活探针, 几十秒一次; 7 天的漏斗一分钟内不会变。
+    每次 ping 翻一遍台账是白花的, 而且把存活探针拖慢。"""
+    testclient = pytest.importorskip("fastapi.testclient")
+    import deskcore.app as A_
+
+    monkeypatch.setenv("DESKCORE_KEYS",
+                       '{"k-test": {"user_id": "22222222-2222-2222-2222-222222222222", "name": "t"}}')
+    monkeypatch.setattr(A_, "_health_probe_client", lambda: object())
+    A_._leak_cache.update(at=0.0, value=None)
+    calls = {"n": 0}
+
+    def _leak(sb, days=7):
+        calls["n"] += 1
+        return {"ok": True, "window_days": 7, "drawn": 1, "consumed": 1,
+                "leak_pct": 0, "projects": [], "note": ""}
+    monkeypatch.setattr(core, "pipeline_leak", _leak)
+    client = testclient.TestClient(A_.app, raise_server_exceptions=False)
+    for _ in range(3):
+        assert client.get("/health").json()["config"]["pipeline"]["ok"] is True
+    assert calls["n"] == 1, "TTL 内只该查一次"

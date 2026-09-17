@@ -332,6 +332,21 @@ async def _probe(fn, fallback):
         return fallback
 
 
+_LEAK_TTL_SEC = 60.0
+_leak_cache: dict = {"at": 0.0, "value": None}
+
+
+def _leak_cached() -> dict:
+    """pipeline_leak 的 TTL 缓存, 在 _probe 的工作线程里跑(它本身是阻塞查询)。"""
+    import time
+    now = time.monotonic()
+    if _leak_cache["value"] is not None and now - _leak_cache["at"] < _LEAK_TTL_SEC:
+        return _leak_cache["value"]
+    value = core.pipeline_leak(_health_probe_client())
+    _leak_cache.update(at=now, value=value)
+    return value
+
+
 async def _collect_health() -> dict:
     """算出那份健康回显。``/health`` 与 ``/ready`` **共用这一份**。
 
@@ -382,12 +397,10 @@ async def _collect_health() -> dict:
     # 「发了角度没入库」—— 使用层的漏斗, 不是服务健康。09-11 起 78% 的稿子没走
     # commit, 而 /health 一直 ok: 服务确实没坏, 坏的是流程。所以这块**不进顶层
     # ok**(否则 Railway 会因为运营的用法重启容器), 但一定要在这里看得见。
-    from . import core as _core
-
-    def _leak_probe() -> dict:
-        return _core.pipeline_leak(_health_probe_client())
-    pipeline = await _probe(_leak_probe, {
-        "ok": None, "window_days": _core.LEAK_WINDOW_DAYS,
+    # 带 TTL 缓存: /health 是 Railway 的存活探针, 几十秒 ping 一次, 而 7 天的
+    # 漏斗一分钟内不会变 —— 每次 ping 都翻一遍台账是白花的(code review)。
+    pipeline = await _probe(_leak_cached, {
+        "ok": None, "window_days": core.LEAK_WINDOW_DAYS,
         "note": f"探不到(超时 >{_HEALTH_PROBE_TIMEOUT:g}s 或出错), 见日志"})
 
     return {

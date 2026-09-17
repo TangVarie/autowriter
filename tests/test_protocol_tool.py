@@ -124,7 +124,9 @@ def test_render_skill_keeps_the_hand_written_head_and_replaces_the_body():
     head = "---\nname: x\n---\n\n# 引线头\n\n<!-- protocol_version: 000000000000 -->\n\n旧正文\n"
     out = T.render_skill(head, "新正文", "abcdef012345")
     assert out == ("---\nname: x\n---\n\n# 引线头\n\n"
-                   "<!-- protocol_version: abcdef012345 -->\n\n新正文\n")
+                   "<!-- protocol_version: abcdef012345 -->\n"
+                   "protocol_version: abcdef012345\n\n新正文\n")
+    assert "旧正文" not in out
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -236,3 +238,38 @@ def test_rest_channel_serves_protocol(monkeypatch):
 
     listed = client.get("/tools", headers={"Authorization": "Bearer k-test"}).json()
     assert any(t["name"] == "get_protocol" for t in listed["tools"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+# code review 2026-09-17: 版本号要宽松地认, 且在 skill 里可见
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("form", [
+    "{v}", " {v} ", "<!-- protocol_version: {v} -->", "protocol_version: {v}", "{V}",
+])
+def test_get_protocol_accepts_the_version_in_any_reasonable_form(form):
+    """模型可能把整行原样传进来。精确比较的后果是每场对话都判成旧版, 全文再发
+    一遍、还让运营白重装一次 skill。"""
+    _, v = T.protocol_text()
+    out = T.get_protocol(local_version=form.format(v=v, V=v.upper()))
+    assert out["up_to_date"] is True, form
+    assert "protocol" not in out
+
+
+def test_skill_shows_the_version_as_plain_text_not_only_an_html_comment():
+    """有的 skill 加载器会把 HTML 注释剥掉 —— 那模型就找不到该传的值了。"""
+    stub = STUB.read_text(encoding="utf-8")
+    _, v = T.protocol_text()
+    assert f"protocol_version: {v}" in stub.replace(f"<!-- protocol_version: {v} -->", "")
+    assert T.skill_sync_state()["in_sync"]
+
+
+def test_the_probe_advice_never_says_to_call_get_protocol_bare():
+    """探活那句要是让模型不带参数调, 返回的正是 34 KB 全文 —— 这个 PR 诊断出的
+    病根会被协议自己请回来。"""
+    text = T.get_protocol()["protocol"]
+    for p in _blocks_about(text, "再调一次 `get_protocol`"):
+        assert "local_version" in p, p
+        assert "不带参数，它是最轻的一个" not in p
+    stub = STUB.read_text(encoding="utf-8")
+    assert "（最轻的一个）" not in stub

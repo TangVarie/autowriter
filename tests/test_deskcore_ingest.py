@@ -155,13 +155,21 @@ def test_ingest_mints_identity_with_provenance_and_writes_fingerprints():
 def test_ingest_does_not_run_the_gate():
     """已经发出去的稿子跟库里谁重复都改变不了事实 —— 拦它没有意义, 拦了下一批
     照样撞它。所以一模一样的正文也要照收。"""
-    c = _client()
-    body = "完全一样的正文, 发过两次。" * 6
+    c = _client(); c.rows["draft_fingerprints"] = []
+    already = "库里早就有的那篇。" * 6
+    from deskcore import fingerprint as fp_
+    c.rows["draft_fingerprints"].append({
+        "id": "h1", "project_id": PROJ, "title": "旧稿", "opening_hash": fp_.opening_hash(already),
+        "ngram_hashes": fp_.ngram_hashes(already), "title_embedding": None, "embedding_model": None})
+    # 一篇跟库里那篇**高度重合**(只改了一个字)的已发稿子: check_drafts 会判 reject,
+    # 但 ingest 必须照收 —— 它已经发出去了, 拦它没有意义。
+    near = already.replace("早就", "早已", 1)
     out = core.ingest_published(c, PROJ, [
-        {"title": "a", "body": body}, {"title": "b", "body": body},
+        {"title": "近似的", "body": near}, {"title": "另一篇", "body": "完全不同的正文。" * 6},
     ], user_id=ME, source="x")
-    assert out["fingerprinted"] == 2
-    assert not any(n == "deskcore_commit_fingerprints" for n, _ in c.rpc_calls)
+    assert out["fingerprinted"] == 2 and out["skipped_already_fingerprinted"] == 0
+    assert not any(n in ("deskcore_commit_fingerprints", "deskcore_check_drafts")
+                   for n, _ in c.rpc_calls)
 
 
 def test_dry_run_writes_nothing():
@@ -169,10 +177,51 @@ def test_dry_run_writes_nothing():
     out = core.ingest_published(c, PROJ, [{"title": "a", "body": "b" * 40}],
                                 user_id=ME, source="x", dry_run=True)
     assert out["dry_run"] is True and out["to_write"] == 1 and out["minted"] == 0
-    assert "items" not in c.rows and "draft_fingerprints" not in c.rows
+    assert not c.rows.get("items") and not c.rows.get("draft_fingerprints")
 
 
 def test_someone_elses_project_is_refused():
     with pytest.raises(PermissionError):
         core.ingest_published(_client(owner=OTHER), PROJ,
                               [{"title": "a", "body": "b" * 40}], user_id=ME, source="x")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# code review 2026-09-17: 幂等 + 手改格子
+# ══════════════════════════════════════════════════════════════════════
+
+def test_rerun_is_a_noop_for_rows_already_fingerprinted():
+    """⚠️ 运营看到一条警告就会再跑一遍 —— 重跑不幂等的话 234 条变 468 条。"""
+    c = _client()
+    rows = [{"title": "一", "body": "第一篇正文。" * 8}, {"title": "二", "body": "第二篇正文。" * 8}]
+    first = core.ingest_published(c, PROJ, rows, user_id=ME, source="x")
+    second = core.ingest_published(c, PROJ, rows, user_id=ME, source="x")
+    assert first["minted"] == 2
+    assert second["minted"] == 0 and second["fingerprinted"] == 0
+    assert second["skipped_already_fingerprinted"] == 2
+    assert len(c.rows["items"]) == 2 and len(c.rows["draft_fingerprints"]) == 2
+
+
+def test_duplicate_rows_inside_one_sheet_are_written_once():
+    c = _client()
+    body = "同一篇粘了两次。" * 8
+    out = core.ingest_published(c, PROJ, [
+        {"title": "a", "body": body}, {"title": "a 又一次", "body": body},
+    ], user_id=ME, source="x")
+    assert out["minted"] == 1 and out["skipped_duplicate_in_sheet"] == 1
+
+
+def test_dry_run_counts_the_already_fingerprinted_rows_too():
+    c = _client()
+    rows = [{"title": "一", "body": "正文。" * 8}]
+    core.ingest_published(c, PROJ, rows, user_id=ME, source="x")
+    dry = core.ingest_published(c, PROJ, rows, user_id=ME, source="x", dry_run=True)
+    assert dry["to_write"] == 0 and dry["skipped_already_fingerprinted"] == 1
+
+
+def test_body_without_the_prefix_is_still_the_body():
+    """⚠️ 手改过的格子: 有「标题：」, 「正文：」前缀被删了。原来整段正文被丢掉,
+    只剩标题去打指纹 —— 而 ingest 存在的唯一目的就是给正文打指纹。"""
+    title, body = ingest.parse_content_cell("标题：甲\n\n这是正文的第一行\n第二行")
+    assert title == "甲"
+    assert body == "这是正文的第一行\n第二行"

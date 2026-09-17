@@ -1128,6 +1128,22 @@ def update_fingerprint_hashes(sb, row_id: str, *, opening_hash: str,
     return bool(res.data)
 
 
+def existing_opening_hashes(sb, project_id: str, hashes: list[str]) -> set[str]:
+    """这些正文开头哈希里, 哪些在这个项目的指纹库里已经有了。给 ingest 做幂等。
+
+    分块 .in_(): PostgREST 把 in 列表拼进 URL, 太长会被网关截掉而不报错。
+    """
+    found: set[str] = set()
+    uniq = sorted({h for h in hashes if h})
+    for i in range(0, len(uniq), 200):
+        chunk = uniq[i:i + 200]
+        rows = (sb.table("draft_fingerprints").select("opening_hash")
+                  .eq("project_id", project_id)
+                  .in_("opening_hash", chunk).execute()).data or []
+        found.update(r["opening_hash"] for r in rows if r.get("opening_hash"))
+    return found
+
+
 def write_fingerprints(sb, rows: list[dict]) -> int:
     """直插指纹(不查重)。只给【回填】用 —— 回填的是已发生的历史, 本来就该原样入库。
 

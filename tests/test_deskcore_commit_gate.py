@@ -205,3 +205,23 @@ def test_rejected_drafts_do_not_count_as_unattributed():
     ], user_id=ME)
     assert out["written"] == 1
     assert out["unattributed"] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 3 · RPC 回执对不上号: 指纹已写入, 不许再抛
+# ══════════════════════════════════════════════════════════════════════
+
+def test_out_of_range_rpc_idx_is_reported_not_raised():
+    """指纹在 RPC 里已经写进去了。这时抛 500, 调用方会重试, 重试撞上自己刚写的
+    指纹 —— 一次故障变成一句"你的稿子重复了"。"""
+    c = _client()
+    c.rpc_impl["deskcore_commit_fingerprints"] = lambda args: [
+        {"idx": 0, "status": core.COMMIT_STATUS_INSERTED, "collided_with": None, "detail": None},
+        {"idx": 7, "status": core.COMMIT_STATUS_INSERTED, "collided_with": None, "detail": None},
+        {"idx": "x", "status": "rejected", "collided_with": "?", "detail": "?"},
+    ]
+    out = core.commit_drafts(c, PROJ, [{"title": "只有一条", "body": BODY_A}], user_id=ME)
+    assert out["rpc_anomalies"] == 2
+    assert "别重试" in out["rpc_warning"]
+    assert out["version_ids"] and len(out["version_ids"]) == 1
+    assert out["rejected"] == []
