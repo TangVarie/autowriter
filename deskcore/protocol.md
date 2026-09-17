@@ -108,9 +108,22 @@
 
 必须先 `commit_drafts`，用它返回的 `batch_id` 导。返回的 `xlsx_base64` 解码写成 `filename` 那个文件交给用户。表里除内容列还有几列 `_source_autowriter_*`，**别让用户删**，那是这条笔记发出去之后数据能回到写作台的唯一线索。
 
+**5c. `ingest_published`** —— 用户拿来的是**已经发出去、当时没入库**的稿子时调。
+
+运营说「这批上周发了，没入库」「补入库」「补指纹」「把飞书表里的稿子补进去」，或者把一批已经发在小红书上的稿子粘给你要"入库"——这不是 `commit_drafts`。commit 是定稿要发的稿子，过闸、销角度；这些是已经发过的历史，它跟库里谁重复都改变不了事实，**不过闸**，照收，让下一批查重能看见它们。
+
+怎么做：
+- 从用户粘的表里逐条摘 `title` / `body`，正文**整篇**给，别截断。
+- 表里 `_source_autowriter_version_id` 有值的行是真走过 commit 的，原样带 `version_id` 传进去会被跳过；不传也行。
+- 一次最多 50 条，多了分几次调。**重复调是安全的**，已有指纹的会被跳过，不会翻倍。
+- 表长的时候先 `dry_run: true` 调一次，把「会写 N 条、已有 M 条」念给用户，再正式调。
+- 返回值里 `note` 就是要告诉用户的话。`fingerprint_error` 非空时**不要重传这批**，把 `note` 原样转给用户，那一步要工程侧补。
+
+不要把这批当成写作台产出：它们没有 `angle_key`，不销任何角度，也不导出。
+
 ### 写类工具报错 = 没写进去
 
-`create_project` / `draw_angles` / `commit_drafts` / `record_rule` / `record_edit` / `save_my_style` / `label_example` / `set_rule_state` / `reembed_my_rules` 出错**一律直接报错**，不会返回一个带 `error` 字段的"成功"结果。看到报错就重试，或者告诉用户这次没记下来——**不要当作已完成**。这几件事失败的后果都是无声的：规则没落库会在之后每一次生成里静默缺席，稿子没进指纹库会让同样的内容以后再过一次闸，坐标没销账会让同一个角度下一批再被抽到。
+`create_project` / `draw_angles` / `commit_drafts` / `ingest_published` / `record_rule` / `record_edit` / `save_my_style` / `label_example` / `set_rule_state` / `reembed_my_rules` 出错**一律直接报错**，不会返回一个带 `error` 字段的"成功"结果。看到报错就重试，或者告诉用户这次没记下来——**不要当作已完成**。这几件事失败的后果都是无声的：规则没落库会在之后每一次生成里静默缺席，稿子没进指纹库会让同样的内容以后再过一次闸，坐标没销账会让同一个角度下一批再被抽到。
 
 只有 `list_projects` / `borrow_lessons` / `my_style` / `my_rules` 四个在出错时返回带 `error` 的降级结果——它们拿不到只是少点参考，可以继续写。
 
@@ -279,6 +292,7 @@
 | 「我改了你看下」 | `record_edit` → `save_my_style` |
 | 「入库」，给的是**笔记定稿** | `check_drafts` → `commit_drafts` |
 | 「入库」，给的是**评论或规矩** | `record_rule`，并说明评论没有库 |
+| 「入库」「补指纹」，给的是**已经发出去的稿子**（飞书表里拉的、之前发的） | `ingest_published`，不过闸；一次 ≤ 50 条，重复调安全 |
 | 「你都记着我什么」「那条规矩怎么没生效」 | `my_style` / `my_rules` |
 
 为什么写死：规则只改在文件里，`open_project` 取不到，下次生成照样缺席，而用户看到"已修改"会以为记住了。已经出过的事故：一次评论规则更新，模型没调 `record_rule`，跑去翻交付文档，反复读同一个文件，被平台判定死循环强杀，7 分钟过去一条规则都没落库，最后还编了一段"查重太严"的解释。

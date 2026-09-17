@@ -489,6 +489,75 @@ def export_drafts(project_id: str, batch_id: str | None = None,
                               version_ids=version_ids, user_id=_user_id)
 
 
+INGEST_MAX_PER_CALL = 50
+
+
+def ingest_published(project_id: str, drafts: list[dict], source: str = "",
+                     dry_run: bool = False, _user_id: str | None = None) -> dict:
+    """把【已经发出去、但当时没走 commit_drafts】的稿子补进指纹库。**不过闸**。
+
+    什么时候调: 用户说「这批已经发了/上周发的, 没入库」「补入库」「补指纹」
+    「把飞书表里的稿子补进去」, 或者把一批**已经发在小红书上**的稿子粘给你要
+    "入库"。跟 commit_drafts 分清: commit 是**定稿要发**的稿子(过闸、销角度);
+    这里是**已经发过的历史**, 它跟库里谁重复都改变不了事实, 拦它没有意义 ——
+    不拦, 照收, 让下一批查重能看见它们。
+
+    怎么传:
+      · ``drafts`` 每条 ``{"title": …, "body": …}``, 从用户粘的表里逐条摘, 正文
+        **整篇**给, 不要截断 —— 指纹按全文算, 只给开头会让后面的稿子撞不上它。
+      · 表里 ``_source_autowriter_version_id`` 那列**有值**的行是真走过 commit 的,
+        库里已经有, 这条可以原样带 ``version_id`` 传进来, 会被跳过并数在
+        ``skipped_already_committed`` 里; 也可以自己不传。
+      · 一次最多 50 条, 多了分几次调。**重复调是安全的**: 库里已有指纹的稿子
+        会被跳过(``skipped_already_fingerprinted``), 不会翻倍。
+      · 用户给的表很长时, 先 ``dry_run=true`` 调一次, 把「会写 N 条、已有 M 条」
+        告诉用户, 再正式调。dry-run 不写库。
+
+    看返回值:
+      · ``minted`` / ``fingerprinted`` 相等 → 这批补完了, 把三个数字告诉用户。
+      · ``identity_error`` 非空 → 没建成的行**重传即可**。
+      · ``fingerprint_error`` 非空(或 fingerprinted < minted) → **不要重传这批**:
+        它们的身份已经建了、指纹没写上, 重传看不见指纹会再建一份身份。把
+        ``note`` 里那句原样告诉用户, 这一步要工程侧跑 backfill 补。
+
+    这个工具出错会直接报错, 不会返回一个看起来成功的结果。
+    """
+    if not isinstance(drafts, list) or not drafts:
+        raise ValueError("drafts 要是非空列表, 每条 {title, body}")
+    if len(drafts) > INGEST_MAX_PER_CALL:
+        raise ValueError(f"一次最多 {INGEST_MAX_PER_CALL} 条(收到 {len(drafts)}), "
+                         "分几次调 —— 重复调是安全的, 已有的会被跳过")
+    committed = 0
+    entries = []
+    for d in drafts:
+        d = d if isinstance(d, dict) else {}
+        if (d.get("version_id") or d.get("_source_autowriter_version_id") or "").strip():
+            committed += 1        # 真走过 commit 的行, 库里已有身份和指纹
+            continue
+        entries.append({"title": d.get("title") or "", "body": d.get("body") or ""})
+    out = core.ingest_published(core.sb(), project_id, entries, user_id=_user_id,
+                                source=source or "workbuddy", dry_run=dry_run)
+    out["skipped_already_committed"] = committed
+    out["received"] = len(drafts)
+    if out.get("fingerprint_error") or out["fingerprinted"] < out["minted"]:
+        missing = out["minted"] - out["fingerprinted"]
+        out["note"] = (f"有 {missing} 条建了身份没写上指纹 —— 不要重传这批(重传会再建一份"
+                       "身份)。这一步需要工程侧对这个项目跑一次 backfill 把指纹补上, "
+                       "请把这句话转给工程。")
+    elif out.get("identity_error"):
+        out["note"] = "有几条身份没建成, 这些行重传即可; 库里已有的会被跳过, 不会翻倍。"
+    elif dry_run:
+        out["note"] = (f"dry-run, 没动库: 会写 {out['to_write']} 条; 指纹库里已有 "
+                       f"{out['skipped_already_fingerprinted']} 条、表内重复 "
+                       f"{out['skipped_duplicate_in_sheet']} 条、已走过 commit "
+                       f"{committed} 条(都跳过)。确认后去掉 dry_run 再调一次。")
+    else:
+        out["note"] = (f"补完: 建身份 {out['minted']} 条、写指纹 {out['fingerprinted']} 条; "
+                       f"跳过已有指纹 {out['skipped_already_fingerprinted']}、表内重复 "
+                       f"{out['skipped_duplicate_in_sheet']}、已走过 commit {committed}。")
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 反馈学习
 # ══════════════════════════════════════════════════════════════════════
@@ -720,6 +789,7 @@ TOOLS = {
     "commit_drafts":  (commit_drafts,  True),
     "review_drafts":  (review_drafts,  True),
     "export_drafts":  (export_drafts,  True),
+    "ingest_published": (ingest_published, True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),
     "save_my_style":  (save_my_style,  True),
