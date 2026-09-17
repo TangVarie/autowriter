@@ -8,7 +8,10 @@ skills/bywood-writing-desk/SKILL.md 缩成一根引线。
 这里锁四件事:
   1. get_protocol 返回的就是盘上那份 protocol.md, 不带 frontmatter, 不为空
   2. 协议正文覆盖 TOOLS 里的每一个工具 —— 加工具不写协议, 模型就不知道何时调它
-  3. 引线 SKILL.md 真的是引线: 指向 get_protocol, 且不再携带协议正文
+  3. skill 文件携带【完整协议】且与 protocol.md 逐字一致 —— 正文的主副本在
+     skill 里(进系统提示), get_protocol 只核版本, 版本对不上时才下发正文。
+     (2026-09-10 曾反过来只留引线, 09-11 起入库率从 110% 掉到 22%, 见
+     tools.get_protocol 的说明)
   4. REST 通道打得通, 且协议对所有人一样 —— 它是流程文本, 不按人裁剪
      (工具照旧绑身份, 那是 test_all_tools_now_require_caller_identity 守着的
      总保险, 不为它开例外)
@@ -69,14 +72,59 @@ def test_get_protocol_is_the_same_for_everyone():
     assert a == b, "协议不按人裁剪"
 
 
-def test_skill_stub_points_at_get_protocol_and_carries_no_body():
+def test_skill_carries_the_full_protocol_and_is_in_sync():
+    """⚠️ 正文的主副本在 skill 文件里 —— 它进系统提示, 整场对话都在模型眼前。
+
+    2026-09-10 曾反过来: skill 只留引线, 正文每次由 get_protocol 下发。09-11 起
+    定稿入库率从 110% 掉到 22%, 写出去的稿子没有指纹, 下一批查重看不见它们。
+    这条盯着两件事: skill 里真的有全文, 且和 protocol.md 逐字一致(否则又是
+    两份正文各改各的)。改了 protocol.md 就跑 `deskcore.cli sync-skill`。
+    """
     stub = STUB.read_text(encoding="utf-8")
     assert stub.startswith("---\nname: bywood-writing-desk\n")
-    assert "`get_protocol`" in stub
-    # 协议正文的章节标题一个都不该出现在引线里 —— 出现了就是两份正文又要各改各的。
+    assert "`get_protocol`" in stub and "protocol_version" in stub
+    state = T.skill_sync_state()
+    assert state["in_sync"], (
+        f"skill 里的协议({state['skill_version']})和 protocol.md"
+        f"({state['protocol_version']})不是同一份 —— 跑 python -m deskcore.cli sync-skill")
     for heading in ("## 标准流程", "### 一、动笔前", "### 三、收反馈"):
-        assert heading not in stub, f"引线里不该有协议正文: {heading}"
-    assert len(stub.splitlines()) < 60, "引线该是十几行, 不该长回一份协议"
+        assert heading in stub, f"skill 里缺协议正文的章节: {heading}"
+
+
+def test_get_protocol_with_the_current_version_is_tiny():
+    """版本一致时**不发正文** —— 发了就等于回到 09-10 那个每场对话开头塞 34 KB 的形态。"""
+    _, current = T.protocol_text()
+    out = T.get_protocol(local_version=current)
+    assert out["up_to_date"] is True
+    assert "protocol" not in out
+    assert out["version"] == current
+
+
+def test_get_protocol_with_a_stale_version_sends_the_body_and_says_to_reimport():
+    out = T.get_protocol(local_version="deadbeefcafe")
+    assert out["up_to_date"] is False
+    assert out["protocol"] == T.protocol_text()[0]
+    assert "重新导入" in out["warning"]
+
+
+def test_get_protocol_without_a_version_sends_the_body():
+    """没装 skill 的客户端(或老客户端)照样能拿到全文。"""
+    out = T.get_protocol()
+    assert out["up_to_date"] is None
+    assert out["protocol"] == T.protocol_text()[0]
+
+
+def test_render_skill_refuses_a_file_without_the_marker():
+    """没有标记行说明有人把 SKILL.md 改回了手工维护的一整份 —— 生成会盖掉他的改动。"""
+    with pytest.raises(RuntimeError):
+        T.render_skill("---\nname: x\n---\n# 手写的\n", "正文", "abcdef012345")
+
+
+def test_render_skill_keeps_the_hand_written_head_and_replaces_the_body():
+    head = "---\nname: x\n---\n\n# 引线头\n\n<!-- protocol_version: 000000000000 -->\n\n旧正文\n"
+    out = T.render_skill(head, "新正文", "abcdef012345")
+    assert out == ("---\nname: x\n---\n\n# 引线头\n\n"
+                   "<!-- protocol_version: abcdef012345 -->\n\n新正文\n")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -159,11 +207,11 @@ def test_protocol_forbids_offering_to_skip_a_rule_update():
 def test_the_stub_carries_these_rules_on_its_own(must_carry):
     """⚠️ 这条是这一组里最要紧的。
 
-    这两条规矩要管的正是 **`get_protocol` 没调通** 的那一刻 —— 而那一刻,
-    服务端那份协议**送不到模型面前**。所以引线必须自己带一份, 哪怕和协议
-    重复。
+    这两条要写在引线头里 —— 正文之前、模型读到的第一段。它们管的正是
+    「`get_protocol` 没调通」和「随便哪个工具失败了」的那一刻, 模型最容易在
+    那一刻编一个原因、再抛一道选择题给运营。
 
-    以后有人来精简引线、理由是"这些协议里已经写了", 这条会拦住他。
+    以后有人来精简引线头、理由是"这些正文里已经写了", 这条会拦住他。
     """
     stub = STUB.read_text(encoding="utf-8")
     said = _blocks_about(stub, must_carry)

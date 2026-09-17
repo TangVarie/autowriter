@@ -552,14 +552,17 @@ def _register_mcp():
         allowed_origins=allowed,
     )
     # instructions 会在 MCP initialize 时交给客户端, 认它的平台会注入系统提示。
-    # 这是本地 SKILL.md 引线之外的第二根引线: 就算客户端那份 skill 没装或装旧了,
-    # 连上服务的模型也会被告知先取协议。不认它的平台丢掉即可, 没有副作用。
+    # 它只说一件事: 先核版本。协议正文的主副本在 skill 文件里(进系统提示), 这里
+    # **不再**让模型每次去取全文 —— 2026-09-10 那版这么写过, 09-11 起入库率从
+    # 110% 掉到 22%, 见 tools.get_protocol 的说明。不认这个字段的平台丢掉即可。
     mcp = FastMCP(name="deskcore", stateless_http=True, json_response=True,
                   streamable_http_path="/", transport_security=security,
                   instructions=("deskcore 是 BYWOOD 小红书种草文案的写作台内核。"
-                                "给项目写稿、改稿、写评论、记规矩、入库、导出之前, "
-                                "先调 get_protocol 取完整协议并照着执行; "
-                                "协议读不到就停下来告诉用户, 不要凭记忆继续。"))
+                                "协议正文在 bywood-writing-desk 这个 skill 里。"
+                                "对话开始时调一次 get_protocol, 带上 skill 里 "
+                                "protocol_version 那一行的值核对版本: 一致就照 skill "
+                                "执行; 不一致就照返回的正文执行并提醒用户重新导入 "
+                                "skill; 没装 skill 就不带参数调它拿全文。"))
 
     def _wrap(fn, needs_user: bool):
         # 把 _user_id 从签名里摘掉再注册 —— 模型不该看到它, 也不该能传它。

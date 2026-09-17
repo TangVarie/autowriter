@@ -12,6 +12,8 @@
   python -m deskcore.cli recompute-fingerprints --project <uuid>
                                                     ← 只在改了 normalize 之后跑
   python -m deskcore.cli reembed-rules --user <uuid> ← 给规则补向量(见 main() 里那段)
+  python -m deskcore.cli sync-skill [--check]      ← 改了 protocol.md 之后跑: 把正文
+                                                    接进 skills/…/SKILL.md(不连库)
 
 ⚠️ ``--user`` 从可选变成必填(审计 COR-015): 归属校验在 core 层, CLI 与 MCP 走
 同一个函数, 不带身份的调用现在一律被拒。传的是 ``projects.owner_id`` 里【已有的】
@@ -28,6 +30,25 @@ import sys
 
 def _print(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
+
+
+def _sync_skill(*, check: bool) -> int:
+    """把 protocol.md 全文接进技能文件; ``check`` 只比对不写。不连库。"""
+    from . import tools as T
+    state = T.skill_sync_state()
+    if check:
+        mark = "一致" if state["in_sync"] else "不一致"
+        print(f"skill 里的协议 {state['skill_version']} / protocol.md {state['protocol_version']}"
+              f" → {mark}")
+        if not state["in_sync"]:
+            print("  → 跑 `python -m deskcore.cli sync-skill` 重新生成, 然后一起提交。")
+        return 0 if state["in_sync"] else 1
+    body, digest = T.protocol_text()
+    current = T.SKILL_PATH.read_text(encoding="utf-8")
+    T.SKILL_PATH.write_text(T.render_skill(current, body, digest), encoding="utf-8")
+    print(f"已写入 {T.SKILL_PATH} (protocol_version {digest}, {len(body)} 字符)。"
+          "记得让运营重新导入一次 skill。")
+    return 0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -285,6 +306,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("selftest", help="不连库验查重/发牌/词表")
     sub.add_parser("health", help="回显配置与依赖可用性")
 
+    # 协议正文的主副本在技能文件里(进系统提示, 整场对话都在模型眼前), 源文件是
+    # deskcore/protocol.md。改了源文件就跑这个把正文接进 SKILL.md; --check 只比
+    # 不写, 给 CI 用。为什么不让 get_protocol 每次下发正文: 见 tools.get_protocol。
+    p = sub.add_parser("sync-skill",
+                       help="把 protocol.md 接进 skills/…/SKILL.md(不连库)")
+    p.add_argument("--check", action="store_true",
+                   help="只检查两边是否一致, 不一致退出码 1, 不写文件")
+
     # doctor 也是运维命令(同 backfill/reembed), 所以没有 --user。它只读,
     # 且不碰任何具体项目的内容 —— 传 --project 时只数条数, 不看正文。
     p = sub.add_parser(
@@ -358,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     if args.cmd == "selftest":
         return selftest()
+    if args.cmd == "sync-skill":
+        return _sync_skill(check=args.check)
 
     # 以下要连库, 到这一步才 import(让 selftest 不需要任何第三方依赖)
     import db as db_mod
