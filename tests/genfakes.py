@@ -140,8 +140,16 @@ def _fake_mem(rec: Recorder):
             return list(mems or [])
 
         @staticmethod
-        def render_flywheel_block(lessons):
+        def render_flywheel_block(lessons, *, used=None):
+            # ``used`` 是出参: 真实实现只把**进了提示词的那几张**(前
+            # FLYWHEEL_CARD_CAP 张)填进去。假件照同一个口径填 —— 直接回填全部
+            # 的话,"取到了 ≠ 用上了"这个区分在测试里就验不出来了。
             rec.log("mem.render_flywheel_block", len(lessons or []))
+            if used is not None:
+                for L in (lessons or [])[:5]:
+                    if isinstance(L, dict):
+                        used.append({"id": L.get("source_note_id"),
+                                     "synthetic": bool(L.get("synthetic"))})
             return ""
 
         @staticmethod
@@ -194,8 +202,14 @@ def _fake_librarian(rec: Recorder):
             return {}
 
         @staticmethod
-        def fetch_flywheel_lessons(brief):
+        def fetch_flywheel_lessons(brief, *, status=None):
+            # ``status`` 是出参: 真实实现会把这次借阅的结局填进去(五种之一,
+            # 见 librarian_client.BORROW_*)。假件也要填 —— 不填的话调用方读到
+            # 的永远是 None, "空列表有五种来路"这件事在测试里就看不出来了。
             rec.log("lib.fetch_flywheel_lessons")
+            if status is not None:
+                status.update({"state": "empty", "count": 0,
+                               "elapsed_ms": 0, "detail": ""})
             return []
 
     return _Lib()

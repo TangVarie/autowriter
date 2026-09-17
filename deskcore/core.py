@@ -1079,6 +1079,142 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     return out
 
 
+# 人审只认这两个结论。**刻意不含 pending** —— 迭代后重置回待审是
+# `DecisionSource.SYSTEM`(见 app.py 那处注释), 既不是审稿也不是检测, 让它从
+# 人审入口进来就等于伪造一条人工决策。
+HUMAN_DECISIONS = ("approved", "needs_revision")
+
+MAX_REVIEW_DRAFTS = 200
+
+
+def _is_uuid(value: str) -> bool:
+    """格式合法的 UUID 才敢送进 ``.in_()``。
+
+    ``versions.id`` 是 uuid 列。PostgreSQL 在**解析**阶段就会拒掉整条查询
+    (`invalid input syntax for type uuid`), 不是跳过那一个值 —— 所以一个打错的
+    id 会连累同一批里所有好的。
+    """
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def review_drafts(client, project_id: str, decisions: list[dict],
+                  user_id: str | None = None) -> dict:
+    """给已定稿的稿子盖一枚**真实的人工审核决策**。
+
+    ── 为什么非有不可(2026-09-16 评测 AW-01)─────────────────────────────
+    ``commit_drafts`` 建的 item 是 ``pending`` 且不盖任何决策戳 —— 那是对的,
+    理由见 ``store.DESKCORE_ITEM_STATUS`` 上面那整段: 定稿不等于审核, 把每次
+    commit 写成 approved 会让「机器判定被当人工反馈」这个已经修过一次的 bug
+    从新入口重犯一次, 而且灌进去的是**清一色正例**。
+
+    但在此之前, 写作台这条路**根本没有**下一步: 只用它写稿、定稿、导出的团队
+    永远产不出一条人工审核决定, 于是 TV 那边按
+    ``status in ('approved','needs_revision')`` 捞行时一条也捞不到。缺的不是
+    「把 pending 改成 approved」, 是**一个真的有人点过的动作**。
+
+    这个函数就是那个动作, 三条纪律:
+
+      1. **reviewer 恒为调用者**, 签名里没有 reviewer 参数。审计 COR-004 治的
+         正是"把 owner 当 reviewer", 留个口子等于把它请回来。
+      2. **只认 approved / needs_revision**, 见 ``HUMAN_DECISIONS``。
+      3. **打回和通过同等公民**。一个只能点通过的审核入口产出的仍然是清一色
+         正例, 与不做无异。
+
+    ⚠️ 不设 ``best_version_id``。「选为最佳」在 UI 里是**独立于审稿**的动作
+    (app.py 那处注释: 走 update_item_status 会给它盖上一枚人工决策戳, 把出处
+    数据自己污染掉)。写作台的 item 每条只有一个版本, 代表版本自然落在它身上。
+
+    返回 ``{"reviewed", "results"}``; 每条 result 带 ``outcome``:
+      · ``recorded``   —— 决策已落库。附 ``previous_status`` 与
+                          ``previously_decided_by`` —— 后者是**上一个决定的来源**
+                          (``db.DecisionSource`` 的四个值), 只有 ``human`` 才代表
+                          之前真有人审过; 机器打回的(``auto_hard_rule`` /
+                          ``auto_dedup``)和系统置位(``system``)都不是
+      · ``not_found``  —— 这个 version_id 不在本项目里(或根本不存在)
+      · ``invalid``    —— 入参不合法: decision 不是那两个值之一, 或 version_id
+                          不是合法 UUID(``detail`` 里说是哪一种)
+      · ``duplicate``  —— 同一条稿子在本批里已经被决定过, **这条没生效**
+      · ``failed``     —— 写库失败, ``detail`` 里是原因
+
+    **部分失败照样回报已经成功的那几条**, 理由同 ``store.mint_draft_identity``:
+    行已经改了而调用方以为没改, 比报一条失败更难查。
+    """
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
+    if not decisions:
+        return {"reviewed": 0, "results": []}
+    if len(decisions) > MAX_REVIEW_DRAFTS:
+        raise ValueError(
+            f"一次最多审 {MAX_REVIEW_DRAFTS} 条, 收到 {len(decisions)} 条。"
+            "分批调用 —— 单次太大时部分失败的定位成本会陡增。")
+
+    wanted = [str(d.get("version_id") or "") for d in decisions]
+    # ⚠️ 只把**格式合法**的 id 送进 .in_()。``versions.id`` 是 uuid 列, 混进一个
+    # 手抖打错的值, PostgreSQL 会用
+    # `invalid input syntax for type uuid` 拒掉**整条查询** —— 于是同一批里
+    # 二十条好的也一起挂, 而这个函数的契约明写着部分失败要逐条报。
+    # (codex review P2; 在真 PG 16.13 上复现过)
+    known = store.items_for_versions(
+        client, project_id, [v for v in wanted if _is_uuid(v)])
+
+    results: list[dict] = []
+    reviewed = 0
+    # item_id → 本批里**先**决定它的那个 version_id。同一条稿子被点两次时,
+    # 静默让最后一次生效是最糟的选择: 两条都报 recorded, 而第二条的
+    # previous_status 取自更新前的快照、已经是错的, 把覆盖藏了起来。
+    decided_items: dict[str, str] = {}
+    for d in decisions:
+        vid = str(d.get("version_id") or "")
+        decision = str(d.get("decision") or "")
+        row = {"version_id": vid, "decision": decision}
+
+        if decision not in HUMAN_DECISIONS:
+            results.append({**row, "outcome": "invalid",
+                            "detail": f"decision 只能是 {' / '.join(HUMAN_DECISIONS)}"})
+            continue
+        if not _is_uuid(vid):
+            results.append({**row, "outcome": "invalid",
+                            "detail": "version_id 不是合法 UUID"})
+            continue
+        hit = known.get(vid)
+        if hit is None:
+            results.append({**row, "outcome": "not_found",
+                            "detail": "这个 version_id 不在本项目里"})
+            continue
+        prior = decided_items.get(hit["item_id"])
+        if prior is not None:
+            # 拒绝而不是"最后一条生效": 同一条稿子在一批里被点两次是调用方的
+            # 错, 悄悄取最后一条会让它永远发现不了。
+            results.append({**row, "outcome": "duplicate",
+                            "item_id": hit["item_id"],
+                            "detail": f"同一条稿子本批里已经被 {prior} 决定过了, "
+                                      f"这条没生效 —— 想改判就单独再调一次"})
+            continue
+
+        try:
+            db.update_item_status(client, hit["item_id"], decision,
+                                  source=db.DecisionSource.HUMAN,
+                                  reviewer_id=user_id)
+        except Exception as exc:                 # noqa: BLE001
+            logger.exception("review_drafts 写库失败 (version=%s)", vid)
+            results.append({**row, "outcome": "failed",
+                            "item_id": hit["item_id"],
+                            "detail": f"{type(exc).__name__}: {exc}"[:300]})
+            continue
+
+        reviewed += 1
+        decided_items[hit["item_id"]] = vid
+        results.append({**row, "outcome": "recorded",
+                        "item_id": hit["item_id"],
+                        "previous_status": hit.get("status"),
+                        "previously_decided_by": hit.get("decision_source")})
+
+    return {"reviewed": reviewed, "results": results}
+
+
 MAX_EXPORT_DRAFTS = 200
 
 
@@ -2410,8 +2546,15 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     project = assert_project_access(client, project_id, user_id=user_id)
     brief = librarian_client.build_brief(project, **delta)
     brief["consumer"] = "deskcore"
-    selected = librarian_client.fetch_flywheel_lessons(brief)
-    return {"lessons": selected, "count": len(selected)}
+    # ⚠️ 空列表有**五种**来路, 对调用方的含义完全不同(2026-09-16 评测 AW-05):
+    # 没匹配上是正常的, 没配 key 是部署漏了, 超时是 TV 那边慢了。只回一个
+    # count=0 的话, 模型只能猜, 而它多半会猜成"这个项目没有可借的经验"。
+    st: dict = {}
+    selected = librarian_client.fetch_flywheel_lessons(brief, status=st)
+    return {"lessons": selected, "count": len(selected),
+            "status": st.get("state"),
+            "elapsed_ms": st.get("elapsed_ms"),
+            "detail": st.get("detail") or ""}
 
 
 def create_project(client, name: str, *, brand: str = "",

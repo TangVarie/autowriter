@@ -55,8 +55,14 @@ POOL = ("的一是在不了有和人这中大为上个国我以要他时来用�
         "度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应")
 
 
-def sql(text: str) -> str:
-    r = subprocess.run(PSQL + ["-tAc", text], capture_output=True, text=True)
+def _psql(db: str | None = None) -> list[str]:
+    """``db`` 留空 = 用连接串默认库。给 ``_check_no_stale_overloads`` 用的:
+    它要另起一个只有历史签名的库, 不能污染主库。"""
+    return PSQL + (["-d", db] if db else [])
+
+
+def sql(text: str, db: str | None = None) -> str:
+    r = subprocess.run(_psql(db) + ["-tAc", text], capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(f"SQL 失败:\n{r.stderr[-3000:]}")
     return r.stdout.strip()
@@ -68,8 +74,8 @@ def sql(text: str) -> str:
 _SEARCH_PATH = "SET search_path = autowriter, extensions, public;\n"
 
 
-def run_sql_text(text: str, label: str) -> None:
-    r = subprocess.run(PSQL, input=_SEARCH_PATH + text,
+def run_sql_text(text: str, label: str, db: str | None = None) -> None:
+    r = subprocess.run(_psql(db), input=_SEARCH_PATH + text,
                        capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(f"{label} 执行失败:\n{r.stderr[-4000:]}")
@@ -412,8 +418,71 @@ def main() -> int:
         run_sql_text(_shim(f.read_text(encoding="utf-8")), f"{f.name}(第二遍)")
     print("  ✓ 整套迁移重复执行是干净 no-op(幂等)")
 
+    bad += _check_no_stale_overloads(files[0])
+
     print(f"\nschema + SQL/Python 一致性: {'全部通过' if not bad else f'{bad} 项不通过'}")
     return 1 if bad else 0
+
+
+# 历史上出现过、又不在当前基线里的函数签名。基线必须能把它们清干净。
+# 形状: (函数名, 旧签名的参数表, 这个签名从哪来)
+LEGACY_SIGNATURES = [
+    ("deskcore_check_drafts", "UUID, JSONB",
+     "2026-09-16 之前的 000_baseline.sql; 链条上由 005 删掉"),
+    ("deskcore_commit_fingerprints", "UUID, JSONB, UUID, NUMERIC",
+     "migrations/001_deskcore.sql; 链条上由 005 删掉"),
+]
+
+
+def _check_no_stale_overloads(baseline) -> int:
+    """在一个**先有历史签名**的库上跑基线, 跑完必须只剩一个重载。
+
+    这条守的是 2026-09-16 真的漏掉过的那个场景, 而且它**不在完整链条上**:
+
+      旧基线建 2 参 `deskcore_check_drafts` → 库停在这儿(或停在 001..004)
+      → 有人照 migrations/README「已有库跑了也不坏」重跑新基线
+      → 新基线的 `CREATE OR REPLACE` 是 3 参的
+
+    关键在于 `CREATE OR REPLACE` 在**参数表变了**的时候【不报错】—— 实测
+    PG 16.13: 返回类型变了才报 `cannot change return type`, 参数变了它安静地
+    新建一个重载。于是库里同时有 2 参和 3 参两版, 而两参调用当场
+    `is not unique`。
+
+    完整链条发现不了, 因为链条一定会跑到 005, 而 005 把旧签名 DROP 了。
+    所以这里单独造一个"只有旧签名"的库来问。
+
+    判据刻意写成"基线跑完只剩 1 个重载", 而不是"基线里有没有那句 DROP" ——
+    后者是在测实现, 前者是在测行为。
+    """
+    bad = 0
+    db = "parity_legacy"
+    sql(f"DROP DATABASE IF EXISTS {db};", db="postgres")
+    sql(f"CREATE DATABASE {db};", db="postgres")
+    run_sql_text(SHIMS, "Supabase shim(旧签名库)", db=db)
+
+    # 造出历史签名。函数体无所谓, 这里问的只是"基线会不会把它清掉"。
+    for fn, args, _why in LEGACY_SIGNATURES:
+        run_sql_text(
+            f"CREATE FUNCTION autowriter.{fn}({args}) RETURNS void "
+            f"LANGUAGE sql AS $legacy$ SELECT NULL::void $legacy$;",
+            f"造历史签名 {fn}({args})", db=db)
+
+    run_sql_text(_shim(baseline.read_text(encoding="utf-8")),
+                 "000_baseline.sql(落在旧签名之上)", db=db)
+
+    for fn, args, why in LEGACY_SIGNATURES:
+        n = sql("SELECT count(*) FROM pg_proc p JOIN pg_namespace n "
+                "ON n.oid = p.pronamespace WHERE n.nspname = 'autowriter' "
+                f"AND p.proname = '{fn}';", db=db)
+        if n != "1":
+            print(f"  [FAIL] 基线落在旧签名之上后 {fn} 有 {n} 个重载(该是 1 个)。"
+                  f"旧签名 ({args}) 来自 {why} —— 基线里缺一句 "
+                  f"DROP FUNCTION IF EXISTS autowriter.{fn}({args});")
+            bad += 1
+    if not bad:
+        print("  ✓ 基线落在历史签名之上仍然只剩一个重载"
+              "(CREATE OR REPLACE 换参数表不报错、只加重载, 所以必须自己 DROP)")
+    return bad
 
 
 if __name__ == "__main__":

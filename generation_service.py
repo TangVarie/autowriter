@@ -1301,6 +1301,7 @@ def _queue_worker_impl(
             # 失败/超时/未配 → []，飞轮块自动不出现，写稿照常用 owner 自有正例。
             # R-038: 飞轮块不再进 system P2(每批必变会堵死 session 历史缓存),
             # 改经 user_context_block 注入当前 user turn —— 模型看到的内容不变。
+            _fw_status: dict = {}
             flywheel_lessons = librarian_client.fetch_flywheel_lessons(
                 librarian_client.build_brief(
                     project,
@@ -1309,10 +1310,18 @@ def _queue_worker_impl(
                     target_audience=plan.get("target_audience", ""),
                     tone=plan.get("tone", ""),
                     extra_instructions=plan.get("extra_instructions", ""),
-                )
+                ),
+                status=_fw_status,
             )
-            flywheel_block = mem_module.render_flywheel_block(flywheel_lessons)
+            _fw_used: list = []
+            flywheel_block = mem_module.render_flywheel_block(
+                flywheel_lessons, used=_fw_used)
             inject_report["flywheel_lessons"] = len(flywheel_lessons or [])
+            # 只记条数分不开五种空: 没匹配 / 没配 key / 超时 / 出错 / 真借到 0 条。
+            inject_report["flywheel_status"] = _fw_status.get("state")
+            # 「取到了」和「用上了」是两件事: 借到 8 张只有前 5 张进提示词。
+            # 这一条记的是**真进了提示词的那几张**, 生成那一刻不记就永远补不回来。
+            inject_report["flywheel_cards"] = _fw_used
             full_system_prompt = mem_module.build_layered_system_prompt(
                 base_prompt=base_prompt,
                 global_memories=global_mems_for_plan,
@@ -1649,6 +1658,7 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
         )
         # ── R-032: 同 _queue_worker_impl —— 借阅飞轮经验（fail-open 成 []）。
         # R-038: 改经 user_context_block 注入 user turn, 不再进 system P2。
+        _fw_status: dict = {}
         flywheel_lessons = librarian_client.fetch_flywheel_lessons(
             librarian_client.build_brief(
                 project,
@@ -1657,10 +1667,16 @@ def _quick_gen_worker(plan: dict, user_id: str, db_client, status: dict) -> None
                 target_audience=plan.get("target_audience", ""),
                 tone=plan.get("tone", ""),
                 extra_instructions=extra_instr,
-            )
+            ),
+            status=_fw_status,
         )
-        flywheel_block = mem_module.render_flywheel_block(flywheel_lessons)
+        _fw_used: list = []
+        flywheel_block = mem_module.render_flywheel_block(
+            flywheel_lessons, used=_fw_used)
         inject_report["flywheel_lessons"] = len(flywheel_lessons or [])
+        inject_report["flywheel_status"] = _fw_status.get("state")
+        # 同上: 记的是真进了提示词的那几张, 不是借到的全部。
+        inject_report["flywheel_cards"] = _fw_used
         full_system_prompt = mem_module.build_layered_system_prompt(
             base_prompt=project.get("system_prompt", ""),
             global_memories=global_mems,

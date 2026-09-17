@@ -119,7 +119,7 @@ python -m deskcore.cli doctor --project <uuid>   # 额外打印这个项目的�
 
 | | 内容 | 不跑会怎样 |
 |---|---|---|
-| `000_baseline.sql` | 全部 15 张表 + 8 个函数 + RLS policy + 索引 + 触发器 | 新环境什么都没有。**已有库不要跑它**——跑增量就够（它幂等，跑了也不坏；2026-09-16 起有断言守着，见下） |
+| `000_baseline.sql` | 全部 15 张表 + 8 个函数 + RLS policy + 索引 + 触发器 | 新环境什么都没有。**已有库不要跑它**——跑增量就够。它幂等、落在任何中途态上也不会留下重复重载（2026-09-16 起两条断言守着：函数体与增量字节相同、基线落在历史签名之上仍只剩一个重载，见下） |
 | `001_deskcore.sql` | 发牌台账 / 成稿指纹 / 个人调校笔记 / 精修 diff 四张表（含它们的表级 `GRANT`，与 `007` 同一条语句）+ 两个 RPC（`deskcore_reserve_angles` / `deskcore_commit_fingerprints`）+ `items.updated_at` 与两个 `updated_at` 触发器 | deskcore 整个不可用；另外 `items.updated_at` 缺席会让 TV 的 `sync_autowriter_decisions_to_prepublish` 退回只按 `created_at` 增量同步，迟到的人工决策重新开始漏收 |
 | `002_calibration_cas.sql` | `update_calibration_notes_cas`（审计 COR-003） | 退回旧 CAS 路径并埋 `calibration_cas_rpc_missing`；长笔记（>4000 字级）的自动学习仍然静默停摆 |
 | `003_versions_unique_num.sql` | `UNIQUE(item_id, version_num)`（审计 COR-004） | 少了数据库层保护；应用层重试本身不依赖它。⚠️ 会先把历史重复对子重编号再建索引 |
@@ -174,11 +174,27 @@ python -m deskcore.cli doctor --project <uuid>   # 额外打印这个项目的�
 >
 > 任何跑过 `001` 的库都要补，排在 `006` 之后即可（它只发 `GRANT`，不依赖其它迁移的顺序）。
 
+> ⚠️ **换签名必须自己 `DROP`，`CREATE OR REPLACE` 兜不住。** 这条值得单独记，
+> 因为它的失效方式是无声的（PG 16.13 实测）：
+>
+> | 改了什么 | `CREATE OR REPLACE` 的反应 |
+> |---|---|
+> | 返回类型 | 报 `cannot change return type of existing function` |
+> | **参数表** | **一句话都不说，安静地新建一个重载** |
+>
+> 第二行就是 2026-09-16 那个洞的成因：基线把 `deskcore_check_drafts` 从 2 参换成
+> 3 参，只写 `CREATE OR REPLACE`，于是任何一个用旧基线起过、又没跑到 `005` 的库
+> 重跑基线之后，库里同时有两个重载，两参调用当场
+> `function autowriter.deskcore_check_drafts(uuid, jsonb) is not unique`。
+> 现在基线在两处 `CREATE` 前面各自带了一句 `DROP FUNCTION IF EXISTS`（全新库上是
+> 干净 no-op），`tests/sql_parity_check.py` 的「基线落在历史签名之上」那条守着它。
+>
 > ⚠️ `005` 里两个函数的建法**不一样**，别按一种记：
-> `deskcore_check_drafts` 是 **DROP（两个签名都删）+ 裸 `CREATE`**——返回列和参数都变了，
-> `REPLACE` 会因签名冲突失败；`deskcore_commit_fingerprints` 是 **DROP 掉 4 参旧版**
-> （留着会变同名重载，调用时报 ambiguous）**+ `CREATE OR REPLACE` 建 6 参版**——这一半
-> 必须是 `OR REPLACE`，因为基线里已经有 6 参那版了，裸 `CREATE` 会报 `already exists`
+> `deskcore_check_drafts` 是 **DROP（两个签名都删）+ 裸 `CREATE`**——返回列变了，
+> 光靠 `REPLACE` 会报 `cannot change return type`；`deskcore_commit_fingerprints`
+> 是 **DROP 掉 4 参旧版**（留着会变同名重载，调用时报 ambiguous）
+> **+ `CREATE OR REPLACE` 建 6 参版**——这一半必须是 `OR REPLACE`，因为基线里已经有
+> 6 参那版了，裸 `CREATE` 会报 `already exists`
 > （就是上面那条「harness 上线当天抓到的第二个真问题」）。
 > **必须先跑 `004`**（它建的 `deskcore_fingerprint_counts` 本文件不动）。
 >

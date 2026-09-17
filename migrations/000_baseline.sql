@@ -873,6 +873,14 @@ GRANT EXECUTE ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) T
 -- check_drafts 里做; 这里挡住的是竞态窗口里最可能撞的那两类。
 --
 -- 返回每条的结果: inserted / rejected + 撞了谁。调用方据此告诉用户哪几条要重写。
+-- ⚠️ **先 DROP 掉历史签名, 再 CREATE。** `CREATE OR REPLACE` 在参数表变了的时候
+--    【不报错】—— 它安静地新建一个重载(实测 PG 16.13: 返回类型变了才报
+--    `cannot change return type`, 参数变了一句话都不说)。migrations/001 建的是
+--    4 参版, 链条上由 005:259 删掉; 但一个停在 001..004 的库重跑本文件时, 那一版
+--    还在, 于是库里同时有 4 参和 6 参两个重载, 4 参调用当场 `is not unique`。
+--    这句在全新库上是干净 no-op。
+DROP FUNCTION IF EXISTS autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC);
+
 -- ⚠️ 下面这一整块与 migrations/005_deskcore_containment.sql 里的**字节级相同**, 是原样复制过来的。
 --    改那边就把整块重新复制过来, 不要只补差异 —— tests/test_baseline_parity.py
 --    用字符串相等来守这件事, 漏一处它会红。(2026-09-16: 基线曾停在旧形态,
@@ -1052,6 +1060,15 @@ GRANT EXECUTE ON FUNCTION autowriter.deskcore_commit_fingerprints(UUID, JSONB, U
 -- 漏掉的那条正是要拦下的重复稿, 且不报错。这里 ORDER BY 的是子查询算好的
 -- 别名 sim, 不是 `title_embedding <=> v` —— pgvector 的索引只认后一种形态,
 -- 换成前者规划器必然走顺序扫描, 精确且可预期。完整理由见 migrations/004。
+-- ⚠️ **先 DROP 掉 2 参旧签名, 再 CREATE。** 同上: 参数表变了时 `CREATE OR REPLACE`
+--    不报错, 只是多一个重载。2026-09-16 之前的基线建的正是 2 参版, 所以**任何一个
+--    用旧基线起过、又没跑到 005 的库**(包括 migrations/README 承诺的「只跑 000」那条
+--    fresh install 路径)重跑本文件之后, 库里会同时有 2 参和 3 参两个
+--    `deskcore_check_drafts` —— 实测两参调用当场
+--    `function autowriter.deskcore_check_drafts(uuid, jsonb) is not unique`。
+--    链条上 005:63 删的就是它, 但那条只有跑到 005 才生效。这句在全新库上是干净 no-op。
+DROP FUNCTION IF EXISTS autowriter.deskcore_check_drafts(UUID, JSONB);
+
 -- ⚠️ 下面这一整块与 migrations/008_embedding_model_isolation.sql 里的**字节级相同**, 是原样复制过来的。
 --    改那边就把整块重新复制过来, 不要只补差异 —— tests/test_baseline_parity.py
 --    用字符串相等来守这件事, 漏一处它会红。(2026-09-16: 基线曾停在旧形态,

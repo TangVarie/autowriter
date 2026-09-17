@@ -19,7 +19,15 @@
 | 正例池是 recency top-5，模仿最近 5 条 → 被标 positive → 窗口滚动，语感越收越窄 | 正例改按**相关性**选取（`core.py` 新增四样之三，断掉趋同回路）；`borrow_lessons` 另从 TV 飞轮图书馆借真实爆款经验卡 |
 | 一个项目 5 个提示词要点 5 次 | `open_project` 一次拿全 |
 | 运营端那份 SKILL.md 改了没人知道，模型照旧协议写 | `get_protocol` 每次从服务端下发 `protocol.md` 正文，改协议只改服务端并重部署，全员同时换版 |
+| 只用写作台写稿、定稿、导出的团队，永远产不出一条人工审核决定 | `review_drafts` 把**用户真的给出的**结论落库（`decision_source=human` + 真实 reviewer + 时间）。定稿仍然只建 `pending`——定稿不是审核，`commit_drafts` 一个字没改 |
 | 稿子发出去就断线了，TV 那边 `v_model_comparison` 长期查出空集还不报错 | `export_drafts` 导的 xlsx 带六列 `_source_autowriter_*`，是笔记回到写作台的唯一线索；列名写错会让 TV 整行 quarantine，判据见 `tests/test_lineage_contract.py`（六个名字手抄在用例里，**不**从 `exporter` 读） |
+| 借阅失败和"这次没匹配"长得一模一样，用不上经验也没人知道 | `borrow_lessons` 回 `status`：`borrowed` / `empty` / `not_configured` / `timeout` / `error` 五种结局分开，带耗时 |
+
+> 另有两条改在**常规生成那条路**（根目录的 `memory.py` / `generation_service.py`），
+> 不经过 deskcore，列在这里只是免得两边打架：未验证的经验卡现在会在提示词里
+> 显形（deskcore 这侧一直是对的——原样回卡字段，协议里解释了 `synthetic`）；
+> 生成时会记下**真进了提示词的那几张卡**的 id。deskcore 这条路记不了后者：
+> 借阅是模型单独调的一次工具，入库时它已经不知道当时借了什么。
 
 ## 结构
 

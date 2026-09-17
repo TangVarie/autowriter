@@ -1251,6 +1251,39 @@ def _mint_entries(sb, batch_id: str, user_id: str, entries: list[dict],
         minted[e["version_id"]] = item_id
 
 
+def items_for_versions(sb, project_id: str,
+                       version_ids: list[str]) -> dict[str, dict]:
+    """``version_id`` → ``{"item_id", "status", "decision_source"}``，**只认本项目的**。
+
+    归属由数据库钉死，走的是和 ``_export_rows_by_version`` 同一条路:
+    ``items!inner`` 一路 inner 到 ``batches``，再 ``.eq`` 上 project_id。
+    别的项目的 version_id **查不出来** —— 于是调用方拿不到它的 item_id，
+    不需要在 Python 里再判一次归属（少一处判据就少一处能写错的地方）。
+
+    同时回 ``status`` 与 ``decision_source``，好让审核入口能分清
+    「这条还没人审」和「这条已经被谁审过了」——两者都该让调用方看见，
+    而不是闷头覆盖。
+    """
+    out: dict[str, dict] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        res = (sb.table("versions")
+                 .select("id, items!inner(id, status, decision_source, "
+                         "batch_id, batches!inner(project_id))")
+                 .in_("id", chunk)
+                 .eq("items.batches.project_id", project_id)
+                 .execute())
+        for v in (res.data or []):
+            item = v.get("items") or {}
+            if not item.get("id"):
+                continue
+            out[str(v["id"])] = {
+                "item_id": str(item["id"]),
+                "status": item.get("status"),
+                "decision_source": item.get("decision_source"),
+            }
+    return out
+
+
 def drafts_for_export(sb, project_id: str, *, batch_id: str | None = None,
                       version_ids: list[str] | None = None,
                       limit: int = 200) -> list[dict]:
