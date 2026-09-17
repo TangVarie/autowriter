@@ -177,6 +177,44 @@ Python 侧都是拿 `title_embedding IS NOT NULL` 当"可比"。
 > `migrations/008_embedding_model_isolation.sql` 末尾**——它只存在于这次对话里
 > 的话，下一个环境等于没有。
 
+
+### 1.5 `009_tv_links` —— 让 TV 的笔记认回写作台（2026-09-17）
+
+TV 里 5966 条已发笔记，`source_autowriter_version_id` 全 NULL。原设计（§3.5 步）让运营把
+`export_drafts` 导出的六个 lineage 列手抄进飞书表，三周零匹配——到 TV 手里的飞书表
+**根本没有那六列**（TV 存的原始列名里连 `_source_autowriter` 开头的键都没有）。
+
+改法：两边在同一个 Supabase 项目里，内容都是写作台产的，**在库里按内容对**。
+`009` 建 `tv_project_map`（TV 的 `project_id` ↔ 写作台项目，谁是补录目标）与
+`tv_note_links`（每条笔记对到哪一版、怎么对上的），加两个跨 schema 的 `SECURITY DEFINER`
+RPC：读 `truth_vault.notes`、把对照写回 TV 的两列（只填 NULL 的行）。
+
+跑法（合并部署之后）：
+
+```bash
+python -m deskcore.cli tv-map add --tv-project SPX_phase1   --project 0d6f50df-eae5-4fc5-af99-7cf4643ce77c --ingest-target
+python -m deskcore.cli tv-map add --tv-project TUGE_phase1  --project a14f15a4-4b7d-4d69-8f69-52828bf6225a --ingest-target
+python -m deskcore.cli tv-map add --tv-project LNKT_phase1  --project e130534a-525b-4ba2-b122-67508e857356 --ingest-target
+python -m deskcore.cli tv-map add --tv-project XIWU_phase1  --project 775ac8dc-93c0-4b26-ae2a-1488526e6a57 --ingest-target
+python -m deskcore.cli tv-map add --tv-project ANSHEN_phase1 --project 3af42e58-968b-4500-b913-925dd8ef54ed --ingest-target
+python -m deskcore.cli tv-map add --tv-project BJS_phase1   --project efe112d3-7736-4346-8894-db5e75904248 --ingest-target
+# 途鸽还有 8 个子项目(途鸽求职 / 途鸽D-1..D-7, 08-19 建的)有版本: 各加一行**不带** --ingest-target,
+# 它们的版本也参与对照, 但对不上的只补录进上面那个目标项目。id 用 `projects --user <owner>` 查。
+python -m deskcore.cli tv-sync --all --dry-run     # 先看数: 对上多少、分不出多少、会补录多少
+python -m deskcore.cli tv-sync --all               # 写对照 + 补录指纹, 不碰 TV
+python -m deskcore.cli tv-sync --all --write-tv    # 跟 TV 打过招呼之后再加这个: 回填 source_autowriter_*
+```
+
+之后每天跑一次 `tv-sync --all --write-tv`（Railway 的 cron service 或任何有 `SUPABASE_URL` +
+`SUPABASE_SERVICE_ROLE_KEY` 的主机）。增量：已对上的笔记跳过，`--rematch` 才重对。
+
+验收：`select count(*) from truth_vault.notes where source_autowriter_version_id is not null`
+从 0 变成非 0；`doctor` 里 `009` 三条探测 applied；`tv-sync` 报表里 `ambiguous` 的
+那几条要人看一眼（它列出候选，不硬猜）。
+
+> ⚠️ 第 3.5 步（飞书建六列）**作废**。`export_drafts` 仍然带那六列，粘了不坏，但对照不再依赖它。
+> Hatherine 在 TV 里一条都没有——那张飞书表没接进 TV 同步，接进去之后加一行 `tv-map` 即可。
+
 ### 1.5 指纹库回填记录（2026-08-26）
 
 只回填了**有实质调教痕迹的两个 owner**——按"调教笔记 + 记忆规则 + 人工决策 + 反馈"
@@ -289,7 +327,7 @@ owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
 跑一遍 + `get_advisors` 核验再进 prod。顺序：
 
 ```
-006 → 002 → 003 → 004 → 005 → 007 → 008
+006 → 002 → 003 → 004 → 005 → 007 → 008 → 009
 ```
 
 `006` 之外按编号顺序即可。**`005` 必须在 `004` 之后**（它 DROP 掉 `004` 建的那版

@@ -171,7 +171,8 @@ def main() -> int:
 
     # 抽查几张表 / 几个函数真的建出来了 —— 免得 shim 把整段吃掉还报绿
     for tbl in ("projects", "items", "versions", "memories", "jobs",
-                "draft_fingerprints", "angle_ledger"):
+                "draft_fingerprints", "angle_ledger",
+                "tv_project_map", "tv_note_links"):          # 009
         n = sql("SELECT count(*) FROM information_schema.tables "
                 f"WHERE table_schema='autowriter' AND table_name='{tbl}';")
         if n != "1":
@@ -179,7 +180,8 @@ def main() -> int:
             bad += 1
     for fn in ("deskcore_check_drafts", "deskcore_commit_fingerprints",
                "deskcore_reserve_angles", "claim_one_job",
-               "update_calibration_notes_cas", "deskcore_fingerprint_counts"):
+               "update_calibration_notes_cas", "deskcore_fingerprint_counts",
+               "deskcore_tv_notes", "deskcore_tv_backfill_lineage"):   # 009
         n = sql("SELECT count(*) FROM pg_proc p JOIN pg_namespace ns "
                 "ON ns.oid = p.pronamespace "
                 f"WHERE ns.nspname='autowriter' AND p.proname='{fn}';")
@@ -207,8 +209,70 @@ def main() -> int:
             bad += 1
     sql(f"DELETE FROM autowriter.items WHERE user_id='{UID}';")
     if not bad:
-        print("  ✓ 抽查的 7 张表 + 6 个函数 + 决策出处三列都在, "
+        print("  ✓ 抽查的 9 张表 + 8 个函数 + 决策出处三列都在, "
               "且 CHECK 与 db.DecisionSource 一致")
+
+    # ── ①'' 009 的跨 schema RPC 在【没有 truth_vault】的库上要能调、且干净返回空 ──
+    # 本地 harness 与 fresh install 都没有 truth_vault; 函数靠 to_regclass 守着。
+    # 这里问的是"守卫真的生效"而不是"函数建出来了"(上面那条已经问过)。
+    n = sql("SELECT count(*) FROM autowriter.deskcore_tv_notes('SPX_phase1', NULL, NULL, 5);")
+    if n != "0":
+        print(f"  [FAIL] deskcore_tv_notes 在没有 truth_vault 的库上应返回空, 得到 {n!r}")
+        bad += 1
+    n = sql("SELECT autowriter.deskcore_tv_backfill_lineage("
+            "'[{\"note_id\":\"x\",\"version_id\":\"11111111-1111-1111-1111-111111111111\"}]'::jsonb);")
+    if n != "0":
+        print(f"  [FAIL] deskcore_tv_backfill_lineage 在没有 truth_vault 的库上应返回 0, 得到 {n!r}")
+        bad += 1
+    if not bad:
+        print("  ✓ 009 的两个跨 schema RPC 在没有 truth_vault 的库上干净返回空")
+
+    # ── ①″ 再给它一个【有】truth_vault 的库: 读得到、回填只填 NULL 的行 ──
+    # 只建 notes 里两个函数碰到的那几列 —— 这不是 TV 的 schema, 只是让守卫之外
+    # 那条真正的路径也跑一次(动态 SQL 在 CREATE 时不解析, 拼错列名只会在这里炸)。
+    run_sql_text("""
+        DROP SCHEMA IF EXISTS truth_vault CASCADE;
+        CREATE SCHEMA truth_vault;
+        CREATE TABLE truth_vault.notes (
+            note_id TEXT PRIMARY KEY, project_id TEXT, publish_time TIMESTAMP,
+            tier TEXT, raw_content TEXT, title TEXT, body TEXT,
+            source_autowriter_item_id UUID, source_autowriter_version_id UUID,
+            created_at TIMESTAMP DEFAULT now());
+        INSERT INTO truth_vault.notes (note_id, project_id, publish_time, tier, raw_content)
+        VALUES ('a', 'SPX_phase1', '2026-09-10 08:00', '爆', '【标题】甲 【正文】正文甲'),
+               ('b', 'SPX_phase1', '2026-09-11 08:00', '趴', '【标题】乙 【正文】正文乙'),
+               ('c', 'OTHER', '2026-09-11 08:00', NULL, 'x');
+        UPDATE truth_vault.notes SET source_autowriter_version_id = '22222222-2222-2222-2222-222222222222'
+         WHERE note_id = 'b';
+    """, "truth_vault 替身")
+    n = sql("SELECT string_agg(note_id, ',' ORDER BY note_id) "
+            "FROM autowriter.deskcore_tv_notes('SPX_phase1', NULL, NULL, 10);")
+    if n != "a,b":
+        print(f"  [FAIL] deskcore_tv_notes 该读到 a,b(按项目过滤), 得到 {n!r}")
+        bad += 1
+    n = sql("SELECT string_agg(note_id, ',') "
+            "FROM autowriter.deskcore_tv_notes('SPX_phase1', NULL, 'a', 10);")
+    if n != "b":
+        print(f"  [FAIL] deskcore_tv_notes 的 keyset 翻页(_after='a')该只回 b, 得到 {n!r}")
+        bad += 1
+    n = sql('SELECT autowriter.deskcore_tv_backfill_lineage(\'['
+            '{"note_id":"a","version_id":"11111111-1111-1111-1111-111111111111","item_id":null},'
+            '{"note_id":"b","version_id":"33333333-3333-3333-3333-333333333333","item_id":null}'
+            ']\'::jsonb);')
+    if n != "1":
+        print(f"  [FAIL] 回填该只更新 a(b 已有值不许覆盖), 报 1 行, 得到 {n!r}")
+        bad += 1
+    n = sql("SELECT source_autowriter_version_id::text FROM truth_vault.notes WHERE note_id='b';")
+    if n != "22222222-2222-2222-2222-222222222222":
+        print(f"  [FAIL] b 的 lineage 被覆盖了: {n!r}")
+        bad += 1
+    n = sql("SELECT source_autowriter_version_id::text FROM truth_vault.notes WHERE note_id='a';")
+    if n != "11111111-1111-1111-1111-111111111111":
+        print(f"  [FAIL] a 没回填上: {n!r}")
+        bad += 1
+    run_sql_text("DROP SCHEMA truth_vault CASCADE;", "truth_vault 替身清理")
+    if not bad:
+        print("  ✓ 有 truth_vault 时: 按项目读、keyset 翻页、回填只填 NULL 的行")
 
     # ── ②' 每张表都要授权给 service_role ───────────────────────────────
     # 2026-08-26 首次真部署踩的坑, 值得完整记一遍。

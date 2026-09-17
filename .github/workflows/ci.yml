@@ -1711,11 +1711,13 @@ jobs:
                   # 注释里的 FROM / 逗号会同时干扰下面两条: 既把注释掉的表名当成
                   # 真引用, 又让 "), <注释若干行> jbest AS (" 里的 CTE 认不出来。
                   stmt = re.sub(r"--[^\n]*", "", stmt)
-                  qualified = set(re.findall(r"autowriter\.([a-z_][a-z0-9_]*)", stmt))
+                  # 限定名 = 任何 schema.table(2026-09-17 起 009 的两个 RPC 引用
+                  # truth_vault.notes, 只认 autowriter. 会把 `truth_vault` 当成裸表)。
+                  qualified = set(re.findall(r"\b[a-z_][a-z0-9_]*\.([a-z_][a-z0-9_]*)", stmt))
                   # ⚠️ 先把限定前缀打掉再找裸表。不打的话 "FROM autowriter.x" 里的
                   # `autowriter` 本身会被当成一个裸表名 —— 以前没暴露, 是因为凡是
                   # 这么写的函数 search_path 里正好都有 autowriter, 断言碰巧通过。
-                  stmt_bare = re.sub(r"\bautowriter\.", "@@", stmt)
+                  stmt_bare = re.sub(r"\b[a-z_][a-z0-9_]*\.(?=[a-z_])", "@@", stmt)
                   refs = {t for t in re.findall(
                       r"(?:FROM|UPDATE|JOIN)\s+([a-z_][a-z0-9_]*+)(?!\s*\()", stmt_bare)}
                   # CTE 名(`WITH m AS (` / `, jbest AS (`)不是表, 它们按词法解析,

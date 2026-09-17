@@ -25,6 +25,7 @@
 | 模型跳过 `check_drafts` 直接 `commit_drafts`，同题重写的稿子整批进库（途鸽 09-10 四个标题各入库两次，两两 Jaccard 只有 0.33） | **入库自带闸**：`commit_drafts` 先跑和 `check_drafts` 同一套判定（标题语义、开头、四字串、本批内互比），判 reject 的不进 RPC；没带 `angle_key` 的数出来（`unattributed`），台账销不了账的角度下一批会再被抽到 |
 | 09-11 起 78% 的角度发出去了、稿子没入库，指纹库不知道它们，下一批查重看不见——而 `/health` 一直 ok | `doctor` 和 `/health` 的 `config.pipeline` 报近 7 天「发了角度没入库」的比例，超过 50% 标红（不进顶层 `ok`：那是流程在漏，不是服务坏了） |
 | 已经发出去、没走 commit 的稿子永远补不回指纹库 | 工具 `ingest_published`（运营在 WorkBuddy 里把表粘给模型，≤ 50 条一次，重复调安全）或 `python -m deskcore.cli ingest --xlsx 飞书表` 从导出格式或「标题/正文」两列读回来，建身份（出处记在 `batches.params`，**不碰** `items.external_source`——那列是 TV 同步的标记）+ 写指纹，**不过闸**——已发生的事实拦它没有意义 |
+| TV 里 5966 条已发笔记一条都认不回写作台（lineage 全 NULL）；让运营手抄六个 ID 列进飞书三周零匹配 | `tv-sync`（`migrations/009`）在库里按内容对：正文前 40 字 / 标题 / 时间窗内四字串包含度；对不上的直接从 TV 的全文补录进指纹库；`--write-tv` 才回填 TV 的两列。**运营不做任何事，飞书表不加列**。见 `docs/deskcore.md` §3.7 |
 
 > 另有两条改在**常规生成那条路**（根目录的 `memory.py` / `generation_service.py`），
 > 不经过 deskcore，列在这里只是免得两边打架：未验证的经验卡现在会在提示词里
@@ -86,6 +87,8 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 | `recompute-fingerprints --project <uuid>` | 按当前 normalize 口径重算确定性指纹。**只在改了 `normalize` 之后跑** |
 | `reembed-rules --user <uuid>` | 给**规则**补向量——soft 规则的相关性过滤靠它才有意义 |
 | `ingest --project <uuid> --user <uuid> --xlsx 表.xlsx [--dry-run]` | 把**已经发出去、没走 commit** 的稿子从飞书表补进库（身份 + 指纹，不过闸）。认 `export_drafts` 的导出格式（带 `version_id` 的行跳过）或「标题」「正文」两列（`--title-col/--body-col` 可指定）。先 `--dry-run` 看它认出几条 |
+| `tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target` / `tv-map list` | TV 项目 ↔ 写作台项目的对照表；每个 TV 项目只能有一个补录目标 |
+| `tv-sync --all [--dry-run] [--write-tv] [--since …] [--rematch]` | 把 TV 的笔记按内容对到写作台的版本，对不上的补进指纹库（不过闸、按全文幂等）。先 `--dry-run` 看数；`--write-tv` 才回填 TV 的 `source_autowriter_*`。**每天跑一次** |
 | `sync-skill [--check]` | **不连库。** 改了 `protocol.md` 之后跑，把正文接进 `skills/…/SKILL.md`；`--check` 只比对，给 CI 用。两边不一致时 `test_protocol_tool.py` 会红 |
 
 另有 `health` / `projects` / `open` / `draw` / `check` 几个只读的手动验证入口。完整参数与验收判据见 runbook §2。

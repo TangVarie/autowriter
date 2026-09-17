@@ -41,6 +41,9 @@ _TABLES = {
     "draft_fingerprints": [],
     "user_calibration_notes": [],
     "style_edits": [],
+    # 009 的两张表
+    "tv_project_map": [],
+    "tv_note_links": [],
     "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z",
                "decision_source": None, "reviewer_id": None, "decided_at": None}],
 }
@@ -54,6 +57,8 @@ _ALL_RPCS = {
     "deskcore_fingerprint_counts": lambda a: [],
     "deskcore_check_drafts": lambda a: [],
     "deskcore_commit_fingerprints": lambda a: [],
+    # 009: 读 TV 笔记的 RPC(库里没有 truth_vault 时它自己返回空集)
+    "deskcore_tv_notes": lambda a: [],
 }
 
 
@@ -103,6 +108,7 @@ def test_bare_001_db_reports_every_later_migration_missing():
         "004_deskcore_check_pushdown.sql",
         "005_deskcore_containment.sql",
         "006_item_decision_provenance.sql",
+        "009_tv_links.sql",           # 读 TV 的 RPC 不在 → 009 没跑
     ]
     st = _states(report)
     assert st["表 draft_fingerprints"] == "applied"      # 001 在

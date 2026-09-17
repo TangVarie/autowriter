@@ -42,7 +42,7 @@ import librarian_client
 import memory
 
 from . import fingerprint as fp
-from . import store, vocab
+from . import store, tvlink, vocab
 
 logger = logging.getLogger("deskcore.core")
 
@@ -1737,6 +1737,11 @@ MIGRATION_UNPROBEABLE_SQL = (
 # 008 换的是**函数体**, 签名和返回列一个字没动 —— 从 PostgREST 这一面看,
 # 跑没跑过完全一样。所以只能交出这句 SQL, 不许蒙。
 MIGRATION_EMBEDDING_ISOLATION = "008_embedding_model_isolation.sql"
+
+# 009 建两张表 + 两个跨 schema 的 RPC。表探列名取 tv_project_id(两张都有)。
+MIGRATION_TV_LINKS = "009_tv_links.sql"
+_MIGRATION_009_TABLES = ("tv_project_map", "tv_note_links")
+_MIGRATION_009_PROBE_COLUMN = "tv_project_id"
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -2004,6 +2009,22 @@ def migration_state(client) -> dict:
          "是噪声: 既会放过真重复, 也会误杀无关稿, 而 semantic_degraded 照报 "
          "false —— 失灵的同时还说自己跑过了")
 
+    # ── 009: TV 对照的两张表 + 读 TV 的 RPC。只读探测: 表 select 1 行, RPC 用一个
+    #    不存在的 TV 项目名(返回空集; 库里没有 truth_vault 时函数自己返回空)。
+    for table in _MIGRATION_009_TABLES:
+        state, note = _probe_ok(
+            lambda t=table: client.table(t)
+            .select(_MIGRATION_009_PROBE_COLUMN).limit(1).execute(),
+            predicate=store.schema_object_missing)
+        _add(MIGRATION_TV_LINKS, f"表 {table}", state, note,
+             "tv-sync 整个不可用: TV 的笔记认不回写作台的版本, 已发未入库的稿子"
+             "补不进指纹库, 「爆没爆」回不到写作台")
+    state, note = _probe_ok(lambda: client.rpc("deskcore_tv_notes", {
+        "_tv_project_id": "__doctor_probe__", "_since": None,
+        "_after": None, "_limit": 1}).execute())
+    _add(MIGRATION_TV_LINKS, "deskcore_tv_notes", state, note,
+         "读不到 TV 的笔记 —— tv-sync 一条都对不了")
+
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
     # 一遍根本不缺的 SQL, 而同一份输出里那条 note 明明写着"不是「没跑迁移」"。
@@ -2071,7 +2092,8 @@ def ingest_published(client, project_id: str, entries: list[dict], *,
     """
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     cleaned = [{"title": (e.get("title") or "").strip(),
-                "body": (e.get("body") or "").strip()} for e in entries]
+                "body": (e.get("body") or "").strip(), "index": i}
+               for i, e in enumerate(entries)]
     cleaned = [e for e in cleaned if e["title"] or e["body"]]
     # 表内去重 + 库内去重, 都按【开头哈希 + 整篇四字串 sketch】—— 只按开头会把
     # 同一个模板开头的不同稿子全判成重复(codex review; 见 store 里那段说明)。
@@ -2099,18 +2121,20 @@ def ingest_published(client, project_id: str, entries: list[dict], *,
            "skipped_duplicate_in_sheet": dup_in_sheet,
            "minted": 0, "fingerprinted": 0, "batch_id": None,
            "identity_error": None, "fingerprint_error": None,
-           "embedded": False, "dry_run": dry_run}
+           "embedded": False, "dry_run": dry_run, "written": []}
     if dry_run or not cleaned:
         return out
     to_mint = [{"version_id": str(uuid.uuid4()), "title": e["title"],
-                "body": e["body"], "keywords": []} for e in cleaned]
+                "body": e["body"], "keywords": [], "index": e["index"]} for e in cleaned]
     minted = store.mint_draft_identity(client, project_id, str(user_id), "",
                                        to_mint,
                                        batch_params={"source": "ingest",
                                                      "file": source})
     done = [m for m in to_mint if m["version_id"] in minted.get("versions", {})]
     out.update(minted=len(done), batch_id=minted.get("batch_id"),
-               identity_error=minted.get("error"))
+               identity_error=minted.get("error"),
+               # 调用方传进来的第几条 → 建成的 version_id(tv_sync 记对照要用)
+               written=[{"index": m["index"], "version_id": m["version_id"]} for m in done])
     if not done:
         return out
     vecs = (dedup.embed_texts([m["title"] for m in done])
@@ -2912,3 +2936,163 @@ def list_projects(client, *, user_id: str | None = None) -> list[dict]:
                     "hard_rules": hard_n, "soft_rules": soft_n,
                     "fingerprint_count": int(fp_counts.get(pid, 0) or 0)})
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 写作台 ↔ TV 的稿子对照 + 补录 (migrations/009, deskcore/tvlink.py)
+# ══════════════════════════════════════════════════════════════════════
+
+def _tv_owner(client, project_id: str) -> str:
+    row = store.project_row(client, project_id)
+    if row is None:
+        raise ProjectNotFound(f"project not found: {project_id}")
+    owner = row.get("owner_id")
+    # 系统任务, 以项目 owner 的身份跑 —— 补录进去的稿子归 owner, 与运营在
+    # WorkBuddy 里自己 commit 的一样。这里过一遍归属闸是为了让"每个项目级入口
+    # 都调过 assert_project_access"这条不变量成立, 不是因为会拒(owner 必过)。
+    assert_project_access(client, project_id, user_id=owner)
+    return str(owner)
+
+
+def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
+            write_tv: bool = False, since: str | None = None,
+            rematch: bool = False) -> dict:
+    """把一个 TV 项目的笔记对到写作台的版本; 对不上的补录进指纹库。
+
+    ── 为什么是它, 不是让运营抄 ID ──────────────────────────────────
+    2026-09-17: TV 5966 条笔记里带写作台 lineage 的是 0 条, 原设计让运营把
+    export_drafts 的六个 ID 列手抄进飞书, 三周零匹配。两边在同一个库里, 内容
+    都是写作台产的, 按内容对就行 —— 运营只管写和发。
+
+    ── 流程 ────────────────────────────────────────────────────────────
+      1. tv_project_map 告诉我们这个 TV 项目对应哪些写作台项目(WTG 有 15 个
+         方向)、其中哪一个是补录目标(ingest_target)。
+      2. 拉 TV 的笔记(RPC 跨 schema) + 各写作台项目的定稿版本。
+      3. tvlink.match_note 逐条判: body_exact / title_exact / fuzzy / ambiguous /
+         unmatched。TV 自己已经带 source_autowriter_version_id 的直接记 tv_lineage。
+      4. unmatched → ingest_published(剥掉话题标签, source="tv:<项目>", 不过闸,
+         按全文幂等), 建成的 version_id 记回对照。
+      5. 对照写进 tv_note_links(upsert, 按 note_id)。已经对上且没要求 rematch
+         的笔记跳过 —— 每天跑一次, 增量。
+      6. ``write_tv`` 才把对照写回 TV 的 source_autowriter_* 两列(只填 NULL 的
+         行; 那是 TV 的列, 默认不碰)。
+
+    ``dry_run``: 全部算、一行不写(对照不写、指纹不写、TV 不写), 报表照出。
+    """
+    maps = [m for m in store.tv_project_map(client) if m["tv_project_id"] == tv_project_id]
+    if not maps:
+        raise ValueError(f"tv_project_map 里没有 {tv_project_id!r} —— 先跑 "
+                         "`python -m deskcore.cli tv-map add --tv-project … --project … "
+                         "--ingest-target`")
+    target = next((m for m in maps if m.get("ingest_target")), None)
+    owners = {m["project_id"]: _tv_owner(client, m["project_id"]) for m in maps}
+
+    versions = [tvlink.Version.from_row(v) for m in maps
+                for v in store.versions_for_linking(client, m["project_id"])]
+    index = tvlink.VersionIndex(versions)
+    known = {v.version_id: v for v in versions}
+    notes = [tvlink.Note.from_row(r) for r in store.tv_notes(client, tv_project_id, since=since)]
+    existing = store.tv_links(client, tv_project_id)
+
+    now = store.iso_now()
+    counts: dict[str, int] = {k: 0 for k in (
+        "already_linked", "tv_lineage", "body_exact", "title_exact", "fuzzy",
+        "ambiguous", "unmatched")}
+    links: list[dict] = []
+    to_ingest: list[tvlink.Note] = []
+    ambiguous_samples: list[dict] = []
+
+    def _link(n: tvlink.Note, kind: str, *, project_id=None, version_id=None,
+              item_id=None, score=None, lag=None, candidates=None) -> dict:
+        return {"note_id": n.note_id, "tv_project_id": tv_project_id,
+                "project_id": project_id, "version_id": version_id, "item_id": item_id,
+                "match_kind": kind, "score": score, "lag_days": lag,
+                "candidates": candidates or None, "updated_at": now}
+
+    for n in notes:
+        prev = existing.get(n.note_id)
+        if prev and prev.get("version_id") and not rematch:
+            counts["already_linked"] += 1
+            continue
+        if n.tv_version_id:
+            # TV 自己带的 lineage。只在那个 version 真在我们库里时才写 version_id ——
+            # tv_note_links.version_id 有外键, 一个陈旧/别处的 id 会让整个 upsert
+            # 分块失败; 认不出的记在 candidates 里给人看, 不写外键列。
+            counts["tv_lineage"] += 1
+            v = known.get(str(n.tv_version_id))
+            links.append(_link(n, "tv_lineage",
+                               project_id=v.project_id if v else None,
+                               version_id=v.version_id if v else None,
+                               item_id=v.item_id if v else None,
+                               candidates=None if v else [{"tv_version_id": str(n.tv_version_id),
+                                                            "note": "TV 带的 version_id 不在对照的写作台项目里"}]))
+            continue
+        m = tvlink.match_note(n, index)
+        counts[m.kind] += 1
+        if m.version is not None:
+            links.append(_link(n, m.kind, project_id=m.version.project_id,
+                               version_id=m.version.version_id, item_id=m.version.item_id,
+                               score=m.score, lag=m.lag_days, candidates=m.candidates or None))
+        elif m.kind == "ambiguous":
+            links.append(_link(n, "ambiguous", score=m.score, candidates=m.candidates))
+            if len(ambiguous_samples) < 10:
+                ambiguous_samples.append({"note_id": n.note_id, "title": n.title[:40],
+                                          "candidates": m.candidates[:3]})
+        else:
+            to_ingest.append(n)
+
+    ingest: dict | None = None
+    if to_ingest and target is not None:
+        entries = [{"title": n.title, "body": n.body} for n in to_ingest]
+        ingest = ingest_published(client, target["project_id"], entries,
+                                  user_id=owners[target["project_id"]],
+                                  source=f"tv:{tv_project_id}", dry_run=dry_run)
+        by_index = {w["index"]: w["version_id"] for w in ingest.get("written", [])}
+        item_of: dict[str, dict] = {}
+        if by_index and not dry_run:
+            try:
+                item_of = store.items_for_versions(client, target["project_id"],
+                                                   list(by_index.values()))
+            except Exception:                        # noqa: BLE001
+                logger.exception("tv_sync: 取补录稿子的 item_id 失败, 对照先不带 item_id")
+        for i, n in enumerate(to_ingest):
+            vid = by_index.get(i)
+            links.append(_link(n, "ingested" if vid else "unmatched",
+                               project_id=target["project_id"], version_id=vid,
+                               item_id=(item_of.get(vid) or {}).get("item_id") if vid else None))
+    else:
+        for n in to_ingest:
+            links.append(_link(n, "unmatched"))
+
+    written_links = 0
+    backfilled = 0
+    if not dry_run:
+        written_links = store.tv_links_upsert(client, links)
+        if write_tv:
+            pending = [l for l in links if l.get("version_id")]
+            pending += [dict(r, note_id=nid) for nid, r in existing.items()
+                        if r.get("version_id") and not r.get("synced_to_tv_at")
+                        and nid not in {l["note_id"] for l in links}]
+            backfilled = store.tv_backfill_lineage(client, pending)
+            if pending:
+                store.tv_mark_synced(client, [l["note_id"] for l in pending])
+
+    matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"]
+    return {
+        "tv_project_id": tv_project_id,
+        "desk_projects": [m["project_id"] for m in maps],
+        "ingest_target": target["project_id"] if target else None,
+        "versions": len(versions), "notes": len(notes),
+        "counts": counts, "matched": matched,
+        "ingest": ingest, "links_written": written_links,
+        "tv_backfilled": backfilled, "write_tv": write_tv, "dry_run": dry_run,
+        "ambiguous_samples": ambiguous_samples,
+        "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
+                 f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
+                 f"{counts['fuzzy']}), 分不出 {counts['ambiguous']}, 对不上 "
+                 f"{counts['unmatched']}" + (
+                     f" → 补录 {ingest['minted']}/{ingest['to_write']}"
+                     if ingest and not dry_run else
+                     f" → 会补录 {ingest['to_write']}" if ingest else
+                     " → 没有补录目标, 只记 unmatched")),
+    }

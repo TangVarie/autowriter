@@ -1319,3 +1319,118 @@ REVOKE ALL ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT) FROM PUBLI
 REVOKE ALL ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT)
     TO authenticated, service_role;
+
+-- ══════════════════════════════════════════════════════════════════════
+-- 写作台 ↔ TV 的稿子对照 (migrations/009_tv_links.sql)
+-- 为什么、怎么用见 009 的文件头。下面整段与 009 逐字相同 —— 基线不许再从
+-- 增量上漂开(tests/test_baseline_parity.py 守函数块, sql_parity_check 守
+-- 表与 GRANT)。
+-- ══════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS autowriter.tv_project_map (
+    tv_project_id  TEXT NOT NULL,
+    project_id     UUID NOT NULL REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    ingest_target  BOOLEAN NOT NULL DEFAULT FALSE,
+    note           TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tv_project_id, project_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tv_project_map_one_target
+    ON autowriter.tv_project_map (tv_project_id) WHERE ingest_target;
+CREATE INDEX IF NOT EXISTS tv_project_map_project_idx
+    ON autowriter.tv_project_map (project_id);
+
+CREATE TABLE IF NOT EXISTS autowriter.tv_note_links (
+    note_id        TEXT PRIMARY KEY,
+    tv_project_id  TEXT NOT NULL,
+    project_id     UUID REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    version_id     UUID REFERENCES autowriter.versions(id) ON DELETE SET NULL,
+    item_id        UUID,
+    match_kind     TEXT NOT NULL CHECK (match_kind IN (
+                       'body_exact', 'title_exact', 'fuzzy', 'ingested',
+                       'ambiguous', 'unmatched', 'tv_lineage')),
+    score          REAL,
+    lag_days       INTEGER,
+    candidates     JSONB,
+    synced_to_tv_at TIMESTAMPTZ,
+    matched_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS tv_note_links_project_kind_idx
+    ON autowriter.tv_note_links (project_id, match_kind);
+CREATE INDEX IF NOT EXISTS tv_note_links_version_idx
+    ON autowriter.tv_note_links (version_id);
+
+-- 建出来 ≠ 能访问(migrations/README): service_role 不绕表级 GRANT。
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    autowriter.tv_project_map,
+    autowriter.tv_note_links
+    TO service_role;
+
+-- ── 读 TV 的笔记(keyset 翻页; PostgREST 的 db-max-rows 对 RPC 同样生效) ──
+CREATE OR REPLACE FUNCTION autowriter.deskcore_tv_notes(
+    _tv_project_id TEXT,
+    _since         TIMESTAMPTZ DEFAULT NULL,
+    _after         TEXT DEFAULT NULL,
+    _limit         INT DEFAULT 500
+)
+RETURNS TABLE(
+    note_id TEXT, publish_time TIMESTAMPTZ, tier TEXT, raw_content TEXT,
+    title TEXT, body TEXT, source_autowriter_version_id UUID,
+    created_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF to_regclass('truth_vault.notes') IS NULL THEN
+        RETURN;
+    END IF;
+    RETURN QUERY EXECUTE
+        'SELECT n.note_id, n.publish_time::timestamptz, n.tier, n.raw_content, '
+        '       n.title, n.body, n.source_autowriter_version_id, '
+        '       n.created_at::timestamptz '
+        '  FROM truth_vault.notes n '
+        ' WHERE n.project_id = $1 '
+        '   AND ($2 IS NULL OR n.created_at >= $2) '
+        '   AND ($3 IS NULL OR n.note_id > $3) '
+        ' ORDER BY n.note_id '
+        ' LIMIT $4'
+        USING _tv_project_id, _since, _after, GREATEST(_limit, 1);
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_notes(TEXT, TIMESTAMPTZ, TEXT, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_notes(TEXT, TIMESTAMPTZ, TEXT, INT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_notes(TEXT, TIMESTAMPTZ, TEXT, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_tv_notes(TEXT, TIMESTAMPTZ, TEXT, INT) TO service_role;
+
+-- ── 把对照写回 TV: 只填 NULL 的行, 返回实际更新的行数 ──
+CREATE OR REPLACE FUNCTION autowriter.deskcore_tv_backfill_lineage(_links JSONB)
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    _n INT := 0;
+BEGIN
+    IF to_regclass('truth_vault.notes') IS NULL THEN
+        RETURN 0;
+    END IF;
+    EXECUTE
+        'UPDATE truth_vault.notes t '
+        '   SET source_autowriter_version_id = l.version_id, '
+        '       source_autowriter_item_id    = COALESCE(t.source_autowriter_item_id, l.item_id) '
+        '  FROM jsonb_to_recordset($1) AS l(note_id TEXT, version_id UUID, item_id UUID) '
+        ' WHERE t.note_id = l.note_id '
+        '   AND l.version_id IS NOT NULL '
+        '   AND t.source_autowriter_version_id IS NULL'
+        USING _links;
+    GET DIAGNOSTICS _n = ROW_COUNT;
+    RETURN _n;
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) TO service_role;

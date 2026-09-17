@@ -15,6 +15,10 @@
   python -m deskcore.cli sync-skill [--check]      ← 改了 protocol.md 之后跑: 把正文
                                                     接进 skills/…/SKILL.md(不连库)
   python -m deskcore.cli ingest --project <uuid> --user <uuid> --xlsx 表.xlsx [--dry-run]
+  python -m deskcore.cli tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target
+  python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
+                                                    ← TV 的笔记按内容对到写作台的版本,
+                                                      对不上的补进指纹库(每天跑一次)
                                                     ← 把已发出去、没走 commit 的稿子
                                                       从飞书表补进指纹库(不过闸)
 
@@ -279,6 +283,65 @@ def _ingest(core, sb, args) -> int:
     return rc
 
 
+def _tv_map(core, sb, args) -> int:
+    from . import store as S
+    if args.action == "add":
+        if not (args.tv_project and args.project):
+            print("add 需要 --tv-project 与 --project")
+            return 2
+        S.tv_map_upsert(sb, args.tv_project, args.project,
+                        ingest_target=args.ingest_target, note=args.note)
+    rows = S.tv_project_map(sb)
+    if not rows:
+        print("tv_project_map 是空的 —— 用 `tv-map add --tv-project SPX_phase1 "
+              "--project <uuid> --ingest-target` 加。")
+        return 0
+    for r in rows:
+        mark = "← 补录目标" if r.get("ingest_target") else ""
+        print(f"  {r['tv_project_id']:16s} → {r['project_id']}  {mark} {r.get('note') or ''}")
+    return 0
+
+
+def _tv_sync(core, sb, args) -> int:
+    from . import store as S
+    if not args.tv_project and not args.all:
+        print("要 --tv-project <id> 或 --all")
+        return 2
+    targets = ([args.tv_project] if args.tv_project else
+               sorted({m["tv_project_id"] for m in S.tv_project_map(sb)}))
+    if not targets:
+        print("tv_project_map 是空的, 没有可同步的 TV 项目。")
+        return 1
+    rc = 0
+    for tv in targets:
+        out = core.tv_sync(sb, tv, dry_run=args.dry_run, write_tv=args.write_tv,
+                           since=args.since, rematch=args.rematch)
+        head = "[dry-run] " if args.dry_run else ""
+        print(f"\n{head}{tv}: {out['note']}")
+        print(f"  写作台版本 {out['versions']} 条(项目 {len(out['desk_projects'])} 个), "
+              f"对照写入 {out['links_written']}, 回填 TV {out['tv_backfilled']}")
+        ing = out.get("ingest")
+        if ing:
+            print(f"  补录: 收到 {ing['received']}, 要写 {ing['to_write']}, 指纹库已有 "
+                  f"{ing['skipped_already_fingerprinted']}, 表内重复 "
+                  f"{ing['skipped_duplicate_in_sheet']}, 建身份 {ing['minted']}, "
+                  f"写指纹 {ing['fingerprinted']}")
+            if ing.get("fingerprint_error") or ing["fingerprinted"] < ing["minted"]:
+                print(f"  ⚠️ 有 {ing['minted'] - ing['fingerprinted']} 条建了身份没写上指纹"
+                      f"({ing.get('fingerprint_error') or ''}) —— 跑 `backfill --project "
+                      f"{out['ingest_target']}` 补, **不要**重跑 tv-sync 指望它补")
+                rc = 1
+            if ing.get("identity_error"):
+                print(f"  ⚠️ 身份没建全: {ing['identity_error']} —— 重跑 tv-sync 即可, "
+                      "已有的会被跳过")
+                rc = 1
+        for smp in out["ambiguous_samples"]:
+            print(f"  ? 分不出 {smp['note_id']} 「{smp['title']}」: "
+                  + "; ".join(f"{c['version_id'][:8]}({c['score']}, {c['lag_days']}d)"
+                              for c in smp["candidates"]))
+    return rc
+
+
 def _doctor(core, sb, project_id: str | None) -> int:
     """把 ``core.migration_state`` 的结果排版出来, 并给出下一步。
 
@@ -461,6 +524,24 @@ def main(argv: list[str] | None = None) -> int:
                    help="记到 batches.params.file 的出处标签, 默认用文件名")
     p.add_argument("--dry-run", action="store_true", help="只解析、只数, 不写库")
 
+    # TV 对照(migrations/009): TV 的笔记按内容对到写作台的版本, 对不上的补录。
+    # 运营不用做任何事 —— 见 core.tv_sync 与 deskcore/tvlink.py 的说明。
+    p = sub.add_parser("tv-map", help="TV 项目 ↔ 写作台项目的对照表")
+    p.add_argument("action", choices=["list", "add"])
+    p.add_argument("--tv-project", default=None, help="TV 的 project_id, 如 SPX_phase1")
+    p.add_argument("--project", default=None, help="写作台项目 uuid")
+    p.add_argument("--ingest-target", action="store_true",
+                   help="对不上的笔记补录进这个写作台项目(每个 TV 项目只能有一个)")
+    p.add_argument("--note", default="")
+    p = sub.add_parser("tv-sync", help="把 TV 的笔记对到写作台的版本, 对不上的补进指纹库")
+    p.add_argument("--tv-project", default=None)
+    p.add_argument("--all", action="store_true", help="tv_project_map 里的全部 TV 项目")
+    p.add_argument("--since", default=None, help="只看 TV 里这个时间之后进的笔记(ISO)")
+    p.add_argument("--rematch", action="store_true", help="已对上的也重新对一遍")
+    p.add_argument("--write-tv", action="store_true",
+                   help="把对照写回 TV 的 source_autowriter_* 列(只填空的; 先跟 TV 打招呼)")
+    p.add_argument("--dry-run", action="store_true", help="全部算、一行不写")
+
     args = ap.parse_args(argv)
     if args.cmd == "selftest":
         return selftest()
@@ -484,6 +565,10 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor(core, sb, args.project)
     if args.cmd == "ingest":
         return _ingest(core, sb, args)
+    if args.cmd == "tv-map":
+        return _tv_map(core, sb, args)
+    if args.cmd == "tv-sync":
+        return _tv_sync(core, sb, args)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user))
     elif args.cmd == "open":
