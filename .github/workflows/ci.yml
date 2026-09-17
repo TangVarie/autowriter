@@ -336,11 +336,15 @@ jobs:
           for a, b, c in [(0.85, False, 0.40), (0.0, True, 0.0), (0.1, False, 0.05)]:
               assert fp.verdict(a, b, c) == fp.deciding_signals(a, b, c)[:2]
           print("  ✓ verdict() 包装与 deciding_signals 结论一致")
-          # check_drafts 必须真的用了归因, 而不是又退回 `intra or ...`
-          cd = inspect.getsource(C.check_drafts)
-          assert "deciding_signals" in cd, "check_drafts 没用归因结果"
+          # 归因必须真的用上, 而不是又退回 `intra or ...`。判定主体 2026-09-17 从
+          # check_drafts 抽进 _gate(让 commit_drafts 也跑同一套闸), 所以盯 _gate;
+          # 再钉一条: check 和 commit 都必须走 _gate —— 判定只能有一处。
+          cd = inspect.getsource(C._gate)
+          assert "deciding_signals" in cd, "_gate 没用归因结果"
           assert "by_signal" in cd and "decided_by" in cd, "撞车归因没接上"
-          print("  ✓ check_drafts 按 decided_by 归因, 不再无条件优先本批内")
+          for fn in (C.check_drafts, C.commit_drafts):
+              assert "_gate(" in inspect.getsource(fn), f"{fn.__name__} 没走 _gate —— 判定又分了两份"
+          print("  ✓ 判定主体在 _gate 且按 decided_by 归因; check_drafts / commit_drafts 都走它")
 
           # ── 3. 坐标块必须把发牌抽到的维度【全部】渲进去 ──────────────────────
           # trend_dependencies 漏渲过一次: perpetual_bias=True 强制抽了排他值
@@ -400,7 +404,8 @@ jobs:
           assert fp.opening_hash("今天聊聊防晒") != ""
           assert fp.opening_hash("今天聊聊防晒") == fp.opening_hash("今天聊聊防晒")
           print("  ✓ 空开头 → 空哈希; 有开头 → 稳定非空哈希")
-          cd = inspect.getsource(C.check_drafts)
+          # 本批内互比在 _gate 里(2026-09-17 抽出, 让 commit_drafts 也跑同一套闸)
+          cd = inspect.getsource(C._gate)
           assert "if o_hashes[i] and o_hashes[i] == o_hashes[k]" in cd, \
               "本批内互比没有排除空开头, 两篇 title-only 会互相撞车"
           print("  ✓ 本批内互比也排除了空开头")
@@ -467,8 +472,9 @@ jobs:
           print("  ✓ 小项目一次取完, 不多查")
           src = inspect.getsource(S.fingerprints)
           assert '.order("id"' in src, "翻页必须带 id 做次级排序键(成批 insert 会撞 created_at)"
-          assert "history_truncated" in inspect.getsource(C.check_drafts)
-          print("  ✓ 翻页带确定性次级键; check_drafts 会把截断报给调用方")
+          assert "history_truncated" in inspect.getsource(C._gate), \
+              "截断要报给调用方 —— 判定主体在 _gate 里(2026-09-17)"
+          print("  ✓ 翻页带确定性次级键; _gate(check/commit 共用)会把截断报给调用方")
 
           # ── 4. 角度池必须洗牌, 否则后面的角度永远轮不到 ──────────────────
           dsrc = inspect.getsource(C.draw_angles)
