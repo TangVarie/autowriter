@@ -94,6 +94,90 @@ def test_unverified_mark_sits_on_the_card_it_belongs_to():
 
 
 # ══════════════════════════════════════════════════════════════════════
+# AW-03(第一块) · 记住这批**真用上了**哪几张卡
+#
+# 这个数据是易腐的: 生成那一刻不记, 之后永远补不回来。所以它先落地,
+# 哪怕下游(TV 的指标回流)还没通 —— 通了之后想回头补也补不出来。
+# ══════════════════════════════════════════════════════════════════════
+
+def _card(i, synthetic=False, note_id=None):
+    return {**CARD, "hook_type": f"钩子{i}", "synthetic": synthetic,
+            "source_note_id": note_id if note_id is not None else f"note-{i}"}
+
+
+def test_only_cards_that_reached_the_prompt_are_recorded():
+    """⚠️ 这条是这一块存在的理由: **「取到了」不等于「用上了」**。
+
+    馆员最多回 5 张, 但真回多了的话渲染只取前 ``FLYWHEEL_CARD_CAP`` 张 ——
+    剩下的从没到过模型面前。把它们也记进归因数据, 就是把"借到"当成"采用",
+    而报告里"经验采用率"这个指标正是要区分这两件事的。
+    """
+    borrowed = [_card(i) for i in range(memory.FLYWHEEL_CARD_CAP + 3)]
+    used: list = []
+    memory.render_flywheel_block(borrowed, used=used)
+
+    assert len(used) == memory.FLYWHEEL_CARD_CAP
+    assert [u["id"] for u in used] == [
+        f"note-{i}" for i in range(memory.FLYWHEEL_CARD_CAP)]
+
+
+def test_recorded_cards_carry_the_evidence_flag():
+    """记 id 还不够 —— "这批是不是建立在未验证的数据上"要能事后问出来。"""
+    used: list = []
+    memory.render_flywheel_block(
+        [_card(0, synthetic=False), _card(1, synthetic=True)], used=used)
+    assert used == [{"id": "note-0", "synthetic": False},
+                    {"id": "note-1", "synthetic": True}]
+
+
+def test_missing_note_id_is_recorded_as_none_not_dropped():
+    """馆员没给 id 时记 None, **不是**把这张卡从记录里抹掉。
+
+    抹掉的话条数就和真进提示词的张数对不上了, 而那个差额没有任何地方解释。
+    """
+    used: list = []
+    memory.render_flywheel_block([{**CARD}], used=used)
+    assert used == [{"id": None, "synthetic": False}]
+
+
+def test_non_dict_entries_are_skipped_in_both_places():
+    """脏数据要么两边都跳过, 要么两边都算 —— 不能渲染跳过而记录算上。"""
+    used: list = []
+    block = memory.render_flywheel_block(
+        [_card(0), "这不是卡", None, _card(1)], used=used)
+    assert [u["id"] for u in used] == ["note-0", "note-1"]
+    assert block.count("· 钩子：") == 2
+
+
+def test_used_is_optional():
+    """不传的老调用方一行都不用改。"""
+    assert memory.render_flywheel_block([_card(0)])
+
+
+def test_cap_is_not_duplicated_in_the_render_loop():
+    """口径只能有一处。
+
+    ``FLYWHEEL_CARD_CAP`` 存在的唯一理由就是不让"前几张"这个数字在渲染和记录
+    之间各写一份 —— 写两份必漂, 而漂了之后归因数据会安静地多算几张。
+    """
+    import ast
+    import inspect
+
+    src = inspect.getsource(memory.render_flywheel_block)
+    # 只看**代码**: docstring 和注释里提到 "[:5]" 是在解释为什么不能这么写,
+    # 拿它们当证据会把一条讲道理的注释判成违规。
+    tree = ast.parse(src.strip())
+    fn = tree.body[0]
+    if (fn.body and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)):
+        fn.body = fn.body[1:]                      # 去掉 docstring
+    code = ast.unparse(ast.Module(body=fn.body, type_ignores=[]))
+
+    assert "[:5]" not in code, "别把 cap 写死回循环里, 用 FLYWHEEL_CARD_CAP"
+    assert "FLYWHEEL_CARD_CAP" in code
+
+
+# ══════════════════════════════════════════════════════════════════════
 # AW-05 · 四种空要分得开
 # ══════════════════════════════════════════════════════════════════════
 

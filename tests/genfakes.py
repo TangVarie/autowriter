@@ -140,8 +140,16 @@ def _fake_mem(rec: Recorder):
             return list(mems or [])
 
         @staticmethod
-        def render_flywheel_block(lessons):
+        def render_flywheel_block(lessons, *, used=None):
+            # ``used`` 是出参: 真实实现只把**进了提示词的那几张**(前
+            # FLYWHEEL_CARD_CAP 张)填进去。假件照同一个口径填 —— 直接回填全部
+            # 的话,"取到了 ≠ 用上了"这个区分在测试里就验不出来了。
             rec.log("mem.render_flywheel_block", len(lessons or []))
+            if used is not None:
+                for L in (lessons or [])[:5]:
+                    if isinstance(L, dict):
+                        used.append({"id": L.get("source_note_id"),
+                                     "synthetic": bool(L.get("synthetic"))})
             return ""
 
         @staticmethod

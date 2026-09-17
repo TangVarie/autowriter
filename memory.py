@@ -298,7 +298,14 @@ def build_layered_system_prompt(
     }
 
 
-def render_flywheel_block(flywheel_lessons: Optional[list[dict]]) -> str:
+# 一次最多往提示词里放几张卡。**记录"这批用了哪几张"时必须用同一个口径** ——
+# 借到 8 张只渲染 5 张, 那 3 张从没到过模型面前, 记进去就是把"取到了"当成
+# "用上了"(2026-09-16 评测 AW-03 专门点了这个区分)。
+FLYWHEEL_CARD_CAP = 5
+
+
+def render_flywheel_block(flywheel_lessons: Optional[list[dict]],
+                          *, used: Optional[list] = None) -> str:
     """渲染 TV 飞轮馆员借来的"真实爆款经验"块(R-032), 供 generator 的
     ``user_context_block`` 注入当前 user turn。
 
@@ -320,17 +327,33 @@ def render_flywheel_block(flywheel_lessons: Optional[list[dict]]) -> str:
 
     deskcore 那条路一直是对的(原样回卡字段 + 协议里解释了 synthetic), 所以这
     不是"所有入口都丢标记", 是**常规生成这一个入口**与另一个入口口径不一致。
+
+    ``used`` 是可选出参(2026-09-16 评测 AW-03 的第一块): 传一个 list 进来,
+    **真正进了提示词的那几张卡**会被追加成 ``{"id", "synthetic"}``。
+
+    为什么记在这里而不是让调用方自己数: 借到 8 张只渲染 5 张, 而"取到了"和
+    "用上了"是两件事 —— 口径放两处必漂, 漂了之后归因数据会安静地多算几张从没
+    到过模型面前的卡。这里填的就是渲染循环自己, 不可能不一致。
+
+    ``id`` 取 ``source_note_id``(馆员契约里的卡标识)。它不注入提示词(内部 id
+    对模型是噪音), 但**必须记下来** —— 生成那一刻不记, 之后永远补不回来。
     """
     if not flywheel_lessons:
         return ""
     fw_blocks: list[str] = []
     any_unverified = False
-    for L in flywheel_lessons[:5]:
+    for L in flywheel_lessons[:FLYWHEEL_CARD_CAP]:
         if not isinstance(L, dict):
             continue
         # 只有**显式为真**才算未验证。字段缺失 = 馆员没表态, 不替它下结论。
         unverified = bool(L.get("synthetic"))
         any_unverified = any_unverified or unverified
+        # ``used`` 是出参: 真正进了提示词的卡才记 —— 在这里填而不是让调用方
+        # 自己切一遍 ``[:5]``, 是因为那个口径一旦有两份就一定会漂, 而漂了之后
+        # 归因数据会安静地多算几张从没到过模型面前的卡。
+        if used is not None:
+            used.append({"id": L.get("source_note_id"),
+                         "synthetic": unverified})
         mark = "（⚠️ 指标未经验证，只看内容、别把它的数据当依据）" if unverified else ""
         fw_blocks.append(
             f"· 钩子：{L.get('hook_type') or '?'}｜结构：{L.get('structure') or '?'}"
