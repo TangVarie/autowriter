@@ -20,8 +20,17 @@ B = "aaaaaaaa-0000-0000-0000-00000000000b"
 @pytest.fixture(autouse=True)
 def _fresh_leak_cache():
     """/health 的漏斗块带 60s TTL 缓存 —— 不清掉的话, 上一条测试(或端到端)的
-    结果会替这一条回答, 测试顺序一换就红。"""
-    import deskcore.app as A_
+    结果会替这一条回答, 测试顺序一换就红。
+
+    ⚠️ CI 跑 pytest 的环境没装 fastapi(它在 deskcore/requirements.txt 里, 不在
+    主锁文件), 所以 deskcore.app 可能 import 不了 —— 那时只让 /health 那几条自己
+    importorskip, 别把 store/core 的纯逻辑测试一起拖死(2026-09-17 CI 真红过)。
+    """
+    try:
+        import deskcore.app as A_
+    except ImportError:
+        yield
+        return
     A_._leak_cache.update(at=0.0, value=None)
     yield
     A_._leak_cache.update(at=0.0, value=None)
