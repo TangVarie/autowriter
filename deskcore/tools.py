@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import threading
 import hashlib
 import re
 import logging
@@ -491,6 +492,38 @@ def export_drafts(project_id: str, batch_id: str | None = None,
 
 INGEST_MAX_PER_CALL = 50
 
+# 同一个项目的 ingest 串行执行(codex review #81): REST 路由把工具丢进线程池,
+# 两个重叠的调用(慢请求还没回来、模型又重传了一次)会**同时**过完"库里已有
+# 指纹吗"那一读, 然后各自建一份身份 —— 幂等只对串行成立。内容级唯一约束
+# 建不了(同一个模板开头配不同正文是合法的), 所以在这里按项目加锁。
+# Railway 单 worker 下进程内锁就是全局锁; 换多 worker 部署时要换成库级
+# advisory lock —— 到时 /health 会回显 worker 数, 别悄悄换。
+_ingest_locks: dict[str, threading.Lock] = {}
+_ingest_locks_guard = threading.Lock()
+
+
+def _ingest_lock(project_id: str) -> threading.Lock:
+    with _ingest_locks_guard:
+        return _ingest_locks.setdefault(str(project_id), threading.Lock())
+
+
+class InvalidInput(ValueError):
+    """调用方参数不对, 不是服务端坏了。REST 层映成 400 —— 500 会让模型拿同一个
+    超大载荷一直重试, 400 才说得清是"改参数"。"""
+
+
+_TITLE_KEYS = ("title", "标题")
+_BODY_KEYS = ("body", "正文", "内容")
+_LINEAGE_KEYS = ("version_id", "_source_autowriter_version_id")
+
+
+def _first(d: dict, keys: tuple) -> str:
+    for k in keys:
+        v = d.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
 
 def ingest_published(project_id: str, drafts: list[dict], source: str = "",
                      dry_run: bool = False, _user_id: str | None = None) -> dict:
@@ -503,48 +536,88 @@ def ingest_published(project_id: str, drafts: list[dict], source: str = "",
     不拦, 照收, 让下一批查重能看见它们。
 
     怎么传:
-      · ``drafts`` 每条 ``{"title": …, "body": …}``, 从用户粘的表里逐条摘, 正文
-        **整篇**给, 不要截断 —— 指纹按全文算, 只给开头会让后面的稿子撞不上它。
+      · ``drafts`` 每条 ``{"title": …, "body": …}``(也认「标题」「正文」两个键),
+        从用户粘的表里逐条摘, 正文**整篇**给, 不要截断 —— 指纹按全文算, 只给
+        开头会让后面的稿子撞不上它。**每条都要有正文**; 有一行没正文就整批
+        报错、一行都不写, 补上正文再整批重传。
       · 表里 ``_source_autowriter_version_id`` 那列**有值**的行是真走过 commit 的,
         库里已经有, 这条可以原样带 ``version_id`` 传进来, 会被跳过并数在
         ``skipped_already_committed`` 里; 也可以自己不传。
-      · 一次最多 50 条, 多了分几次调。**重复调是安全的**: 库里已有指纹的稿子
-        会被跳过(``skipped_already_fingerprinted``), 不会翻倍。
+      · 一次最多 50 条, 多了直接报错, 分几次调。**重复调是安全的**: 库里已有
+        指纹的稿子会被跳过(``skipped_already_fingerprinted``), 不会翻倍; 同一个
+        项目的调用在服务端串行, 两次调用重叠也不会各建一份。
       · 用户给的表很长时, 先 ``dry_run=true`` 调一次, 把「会写 N 条、已有 M 条」
         告诉用户, 再正式调。dry-run 不写库。
 
-    看返回值:
-      · ``minted`` / ``fingerprinted`` 相等 → 这批补完了, 把三个数字告诉用户。
-      · ``identity_error`` 非空 → 没建成的行**重传即可**。
-      · ``fingerprint_error`` 非空(或 fingerprinted < minted) → **不要重传这批**:
-        它们的身份已经建了、指纹没写上, 重传看不见指纹会再建一份身份。把
-        ``note`` 里那句原样告诉用户, 这一步要工程侧跑 backfill 补。
+    ⚠️ 报错与返回的分界 —— 这个工具和别的写类工具**不一样**:
+      · **参数不对**(空列表、超过 50 条、有行没正文)、越权、库连不上 → 直接报错,
+        一行都没写; 参数错的改好整批重传即可。
+      · **半途失败不报错**: 身份建了、指纹没写上这种, 会**正常返回**, 带
+        ``fingerprint_error`` 和 ``note``。所以每次调完都要看返回值, 不能只看
+        有没有报错, 更不能"看到 fingerprint_error 就重试"。
 
-    这个工具出错会直接报错, 不会返回一个看起来成功的结果。
+    看返回值(``note`` 就是要念给用户的那句):
+      · ``minted`` / ``fingerprinted`` 相等 → 这批补完了。
+      · 只有 ``identity_error`` → 没建成的行**重传即可**。
+      · ``fingerprint_error``(或 fingerprinted < minted) → **不要重传这批**: 它们的
+        身份已经建了、指纹没写上, 重传看不见指纹会再建一份身份; 要工程侧对这个
+        项目跑 backfill 补指纹。
+      · 两者同时出现 → **先** backfill, **再**把这批原样重传一次(已补上指纹的会
+        被跳过, 没建成身份的会补上)。顺序不能反。
     """
     if not isinstance(drafts, list) or not drafts:
-        raise ValueError("drafts 要是非空列表, 每条 {title, body}")
+        raise InvalidInput("drafts 要是非空列表, 每条 {title, body}")
     if len(drafts) > INGEST_MAX_PER_CALL:
-        raise ValueError(f"一次最多 {INGEST_MAX_PER_CALL} 条(收到 {len(drafts)}), "
-                         "分几次调 —— 重复调是安全的, 已有的会被跳过")
+        raise InvalidInput(f"一次最多 {INGEST_MAX_PER_CALL} 条(收到 {len(drafts)}), "
+                           "分几次调 —— 重复调是安全的, 已有的会被跳过")
     committed = 0
-    entries = []
-    for d in drafts:
-        d = d if isinstance(d, dict) else {}
-        if (d.get("version_id") or d.get("_source_autowriter_version_id") or "").strip():
+    entries: list[dict] = []
+    invalid: list[dict] = []
+    for i, d in enumerate(drafts):
+        if not isinstance(d, dict):
+            invalid.append({"index": i, "reason": "不是对象", "got": type(d).__name__})
+            continue
+        if _first(d, _LINEAGE_KEYS):
             committed += 1        # 真走过 commit 的行, 库里已有身份和指纹
             continue
-        entries.append({"title": d.get("title") or "", "body": d.get("body") or ""})
-    out = core.ingest_published(core.sb(), project_id, entries, user_id=_user_id,
-                                source=source or "workbuddy", dry_run=dry_run)
+        body = _first(d, _BODY_KEYS)
+        if not body:
+            # 没正文的行算不出任何指纹, 写进去也挡不住谁, 而且重传时认不出来
+            # (没有开头哈希)会再建一份 —— 所以整批拒掉, 让模型把正文补上。
+            invalid.append({"index": i, "reason": "没有正文(body/正文)",
+                            "keys": sorted(str(k) for k in d)[:8]})
+            continue
+        entries.append({"title": _first(d, _TITLE_KEYS), "body": body})
+    if invalid:
+        raise InvalidInput(f"有 {len(invalid)} 行没有可用的正文, 一行都没写: {invalid[:5]} "
+                           "—— 每条要 {title, body}, 正文整篇给; 补好后整批重传, "
+                           "已有的会被跳过")
+    zero = {"received": len(drafts), "to_write": 0,
+            "skipped_already_fingerprinted": 0, "skipped_duplicate_in_sheet": 0,
+            "skipped_already_committed": committed,
+            "minted": 0, "fingerprinted": 0, "batch_id": None,
+            "identity_error": None, "fingerprint_error": None,
+            "embedded": False, "dry_run": dry_run}
+    if not entries:
+        return {**zero, "note": f"这 {committed} 行都是走过 commit 的, 库里已有, 没有要补的。"}
+    with _ingest_lock(project_id):
+        out = core.ingest_published(core.sb(), project_id, entries, user_id=_user_id,
+                                    source=source or "workbuddy", dry_run=dry_run)
     out["skipped_already_committed"] = committed
     out["received"] = len(drafts)
-    if out.get("fingerprint_error") or out["fingerprinted"] < out["minted"]:
-        missing = out["minted"] - out["fingerprinted"]
+    fp_failed = bool(out.get("fingerprint_error")) or out["fingerprinted"] < out["minted"]
+    id_failed = bool(out.get("identity_error"))
+    missing = out["minted"] - out["fingerprinted"]
+    if fp_failed and id_failed:
+        out["note"] = (f"两种半途失败同时发生: {missing} 条建了身份没写上指纹, 另有几行身份"
+                       "没建成。顺序必须是: **先**请工程侧对这个项目跑一次 backfill 把指纹"
+                       "补上, **然后**再把这批原样重传一次(已补上指纹的会被跳过, 没建成"
+                       "身份的会补上)。别反过来, 也别现在就重传。请把这句话转给工程。")
+    elif fp_failed:
         out["note"] = (f"有 {missing} 条建了身份没写上指纹 —— 不要重传这批(重传会再建一份"
                        "身份)。这一步需要工程侧对这个项目跑一次 backfill 把指纹补上, "
                        "请把这句话转给工程。")
-    elif out.get("identity_error"):
+    elif id_failed:
         out["note"] = "有几条身份没建成, 这些行重传即可; 库里已有的会被跳过, 不会翻倍。"
     elif dry_run:
         out["note"] = (f"dry-run, 没动库: 会写 {out['to_write']} 条; 指纹库里已有 "
@@ -556,7 +629,6 @@ def ingest_published(project_id: str, drafts: list[dict], source: str = "",
                        f"跳过已有指纹 {out['skipped_already_fingerprinted']}、表内重复 "
                        f"{out['skipped_duplicate_in_sheet']}、已走过 commit {committed}。")
     return out
-
 
 # ══════════════════════════════════════════════════════════════════════
 # 反馈学习

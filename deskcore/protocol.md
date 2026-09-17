@@ -117,15 +117,18 @@
 - 表里 `_source_autowriter_version_id` 有值的行是真走过 commit 的，原样带 `version_id` 传进去会被跳过；不传也行。
 - 一次最多 50 条，多了分几次调。**重复调是安全的**，已有指纹的会被跳过，不会翻倍。
 - 表长的时候先 `dry_run: true` 调一次，把「会写 N 条、已有 M 条」念给用户，再正式调。
-- 返回值里 `note` 就是要告诉用户的话。`fingerprint_error` 非空时**不要重传这批**，把 `note` 原样转给用户，那一步要工程侧补。
+- 每条都要有正文。有一行没正文、或者超过 50 条，它会**报错且一行不写**，补好后整批重传就行。
+- 它和别的写类工具不一样：**半途失败不报错**，正常返回但带 `fingerprint_error`。所以每次调完看 `note`，`note` 就是要告诉用户的话。`fingerprint_error` 非空时**不要重传这批**，把 `note` 原样转给用户，那一步要工程侧跑 backfill；`note` 说"先 backfill 再重传"就照那个顺序，别反过来。
 
 不要把这批当成写作台产出：它们没有 `angle_key`，不销任何角度，也不导出。
 
 ### 写类工具报错 = 没写进去
 
-`create_project` / `draw_angles` / `commit_drafts` / `ingest_published` / `record_rule` / `record_edit` / `save_my_style` / `label_example` / `set_rule_state` / `reembed_my_rules` 出错**一律直接报错**，不会返回一个带 `error` 字段的"成功"结果。看到报错就重试，或者告诉用户这次没记下来——**不要当作已完成**。这几件事失败的后果都是无声的：规则没落库会在之后每一次生成里静默缺席，稿子没进指纹库会让同样的内容以后再过一次闸，坐标没销账会让同一个角度下一批再被抽到。
+`create_project` / `draw_angles` / `commit_drafts` / `record_rule` / `record_edit` / `save_my_style` / `label_example` / `set_rule_state` / `reembed_my_rules` 出错**一律直接报错**，不会返回一个带 `error` 字段的"成功"结果。看到报错就重试，或者告诉用户这次没记下来——**不要当作已完成**。这几件事失败的后果都是无声的：规则没落库会在之后每一次生成里静默缺席，稿子没进指纹库会让同样的内容以后再过一次闸，坐标没销账会让同一个角度下一批再被抽到。
 
 只有 `list_projects` / `borrow_lessons` / `my_style` / `my_rules` 四个在出错时返回带 `error` 的降级结果——它们拿不到只是少点参考，可以继续写。
+
+`ingest_published` 是另一种例外：参数不对（有行没正文、超过 50 条）才报错，报错时一行都没写；**半途失败不报错**，正常返回但带 `fingerprint_error`，处置只看它的 `note`——那种情况下"看到报错就重试"这条**不适用**，重传会把身份建成两份。
 
 **例外：403 / "不属于当前调用者" 不在降级范围内。** 那不是"这次没拿到"，是 `project_id` 传错了或者这个项目不归你——重试一万次也一样。`list_projects` 里看不到的项目就是不归你，**不要猜别人的 `project_id` 去试**。看到这类报错就停下来问用户要对的 `project_id`。
 
