@@ -24,6 +24,8 @@ from __future__ import annotations
 import base64
 import logging
 import random
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple, Optional
@@ -1740,7 +1742,7 @@ MIGRATION_EMBEDDING_ISOLATION = "008_embedding_model_isolation.sql"
 
 # 009 建两张表 + 两个跨 schema 的 RPC。表探列名取 tv_project_id(两张都有)。
 MIGRATION_TV_LINKS = "009_tv_links.sql"
-_MIGRATION_009_TABLES = ("tv_project_map", "tv_note_links")
+_MIGRATION_009_TABLES = ("tv_project_map", "tv_note_links")   # ingest_locks 单独探(列名不同)
 _MIGRATION_009_PROBE_COLUMN = "tv_project_id"
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
@@ -2024,6 +2026,23 @@ def migration_state(client) -> dict:
         "_after": None, "_limit": 1}).execute())
     _add(MIGRATION_TV_LINKS, "deskcore_tv_notes", state, note,
          "读不到 TV 的笔记 —— tv-sync 一条都对不了")
+    # 回填 RPC: 空 _links → UPDATE 一行都不碰(codex #81: 只探读的那一半, 部署了一半
+    # 的库会被报成 applied, 而 --write-tv 到运行时才炸)。
+    state, note = _probe_ok(lambda: client.rpc("deskcore_tv_backfill_lineage",
+                                               {"_links": []}).execute())
+    _add(MIGRATION_TV_LINKS, "deskcore_tv_backfill_lineage", state, note,
+         "tv-sync --write-tv 到运行时才失败: 对照写不回 TV 的 source_autowriter_*")
+    # 补录锁: 表 + 放锁 RPC(nil 项目 + 探针专用 holder: 那一行逻辑上不可能存在,
+    # DELETE 命中 0 行)。拿锁 RPC 不探 —— 探一次就真的会写一行。
+    state, note = _probe_ok(
+        lambda: client.table("ingest_locks").select("project_id").limit(1).execute(),
+        predicate=store.schema_object_missing)
+    _add(MIGRATION_TV_LINKS, "表 ingest_locks", state, note,
+         "补录退回进程内锁: 服务进程与 tv-sync 进程重叠时同一批稿子会建两份身份")
+    state, note = _probe_ok(lambda: client.rpc("deskcore_ingest_unlock", {
+        "_project_id": _PROBE_NIL_UUID, "_holder": "__doctor_probe__"}).execute())
+    _add(MIGRATION_TV_LINKS, "deskcore_ingest_unlock", state, note,
+         "同上: 跨进程互斥失效(deskcore_ingest_lock 与它同一个迁移, 不单独探)")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -2063,8 +2082,75 @@ def migration_state(client) -> dict:
     }
 
 
+# ── 补录的互斥(codex review #81 P1) ─────────────────────────────────────
+# ingest_published 的幂等靠"先读库里有没有指纹、再写"; 两个调用重叠时都过完那
+# 一读再各写一份。调用方有两种进程: 服务进程(WorkBuddy 工具)和 CLI/cron
+# (tv-sync), 进程内的锁管不到对方, 所以主锁是库里的一行(migrations/009 的
+# ingest_locks, 带 TTL, 持有方崩了也能被接管); 进程内锁只是省得同进程的并发
+# 请求都去轮询库。锁 RPC 没部署(doctor 会报)时退回进程内锁并记 warning ——
+# 那是降级, 不是"拿到了"。
+INGEST_LOCK_TTL_SEC = 600          # 一批 ≤ 50 条远用不了; tv-sync 一个项目几百条也够
+INGEST_LOCK_WAIT_SEC = 90          # 等不到就报 IngestBusy, 让调用方稍后再来
+INGEST_LOCK_POLL_SEC = 2.0
+_ingest_proc_locks: dict[str, threading.Lock] = {}
+_ingest_proc_guard = threading.Lock()
+
+
+class IngestBusy(RuntimeError):
+    """另一个补录正在这个项目上跑(锁被别的进程持有, 等了 INGEST_LOCK_WAIT_SEC 还没放)。
+    REST 层映成 409: 不是坏了, 稍后重来即可。"""
+
+
+def _ingest_proc_lock(project_id: str) -> threading.Lock:
+    with _ingest_proc_guard:
+        return _ingest_proc_locks.setdefault(str(project_id), threading.Lock())
+
+
+def _acquire_ingest_lock(client, project_id: str, holder: str) -> bool | None:
+    """轮询拿库锁。True 拿到; None 锁 RPC 没部署(降级); 等超时抛 IngestBusy。"""
+    deadline = time.monotonic() + INGEST_LOCK_WAIT_SEC
+    while True:
+        got = store.try_ingest_lock(client, project_id, holder, INGEST_LOCK_TTL_SEC)
+        if got is None:
+            logger.warning("ingest lock RPC 没部署(migrations/009), 本次只用进程内锁 "
+                           "(project=%s)", project_id)
+            return None
+        if got:
+            return True
+        if time.monotonic() >= deadline:
+            raise IngestBusy(f"项目 {project_id} 上另一个补录正在跑(锁被别的进程持有), "
+                             f"等了 {INGEST_LOCK_WAIT_SEC}s 没放 —— 稍后再试, 不要并行补录")
+        time.sleep(INGEST_LOCK_POLL_SEC)
+
+
 def ingest_published(client, project_id: str, entries: list[dict], *,
                      user_id: str, source: str, dry_run: bool = False) -> dict:
+    """``_ingest_published_unlocked`` 的加锁形态 —— 调用方一律走这个。
+
+    dry_run 不写库, 不拿锁(拿了只会让真在跑的补录多等)。
+    """
+    # 先过归属闸再去拿锁: 拿不到锁要等 90s, 等完再告诉人"不是你的项目"没有道理。
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
+    if dry_run:
+        return _ingest_published_unlocked(client, project_id, entries, user_id=user_id,
+                                          source=source, dry_run=True)
+    holder = f"{source}:{uuid.uuid4().hex[:8]}"
+    with _ingest_proc_lock(project_id):
+        got = _acquire_ingest_lock(client, project_id, holder)
+        try:
+            return _ingest_published_unlocked(client, project_id, entries, user_id=user_id,
+                                              source=source, dry_run=False)
+        finally:
+            if got:
+                try:
+                    store.ingest_unlock(client, project_id, holder)
+                except Exception:                    # noqa: BLE001
+                    logger.exception("ingest unlock failed (project=%s); 锁会在 TTL 后自动"
+                                     "过期", project_id)
+
+
+def _ingest_published_unlocked(client, project_id: str, entries: list[dict], *,
+                               user_id: str, source: str, dry_run: bool = False) -> dict:
     """把【已经发出去、但没走 commit_drafts】的稿子补进库: 身份 + 指纹, **不过闸**。
 
     ── 为什么不过闸 ────────────────────────────────────────────────────
@@ -2954,6 +3040,21 @@ def _tv_owner(client, project_id: str) -> str:
     return str(owner)
 
 
+def _resolve_any_version(client, project_of: dict, version_id: str):
+    """TV 自己带的 version_id 可能指向某个 item 的**旧版**(不是 best), 对照索引里
+    只有 best 那一版。按对照表里的每个写作台项目再问一次库(items_for_versions
+    只认本项目的 version, 别的项目的查不出来)。回 (project_id, item_id) 或 None。"""
+    for pid in project_of:
+        try:
+            hit = store.items_for_versions(client, pid, [version_id]).get(version_id)
+        except Exception:                            # noqa: BLE001
+            logger.exception("tv_sync: 按 version_id 反查 item 失败 (project=%s)", pid)
+            hit = None
+        if hit:
+            return pid, hit.get("item_id")
+    return None
+
+
 def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             write_tv: bool = False, since: str | None = None,
             rematch: bool = False) -> dict:
@@ -2991,13 +3092,14 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 for v in store.versions_for_linking(client, m["project_id"])]
     index = tvlink.VersionIndex(versions)
     known = {v.version_id: v for v in versions}
+    project_of = {m["project_id"]: m for m in maps}
     notes = [tvlink.Note.from_row(r) for r in store.tv_notes(client, tv_project_id, since=since)]
     existing = store.tv_links(client, tv_project_id)
 
     now = store.iso_now()
     counts: dict[str, int] = {k: 0 for k in (
         "already_linked", "tv_lineage", "body_exact", "title_exact", "fuzzy",
-        "ambiguous", "unmatched")}
+        "ambiguous", "unmatched", "no_body")}
     links: list[dict] = []
     to_ingest: list[tvlink.Note] = []
     ambiguous_samples: list[dict] = []
@@ -3019,13 +3121,21 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             # tv_note_links.version_id 有外键, 一个陈旧/别处的 id 会让整个 upsert
             # 分块失败; 认不出的记在 candidates 里给人看, 不写外键列。
             counts["tv_lineage"] += 1
-            v = known.get(str(n.tv_version_id))
+            tvid = str(n.tv_version_id)
+            v = known.get(tvid)
+            hit = ((v.project_id, v.item_id) if v else _resolve_any_version(client, project_of, tvid))
             links.append(_link(n, "tv_lineage",
-                               project_id=v.project_id if v else None,
-                               version_id=v.version_id if v else None,
-                               item_id=v.item_id if v else None,
-                               candidates=None if v else [{"tv_version_id": str(n.tv_version_id),
-                                                            "note": "TV 带的 version_id 不在对照的写作台项目里"}]))
+                               project_id=hit[0] if hit else None,
+                               version_id=tvid if hit else None,
+                               item_id=hit[1] if hit else None,
+                               candidates=None if hit else [{"tv_version_id": tvid,
+                                                              "note": "TV 带的 version_id 不在对照的写作台项目里"}]))
+            continue
+        if not n.body:
+            # 没正文: 对不了, 也不能补 —— 空正文建出来的身份没有开头哈希和四字串,
+            # 对查重是隐形的, 却会被报成"已补录"(codex #81 P2)。记下来给人看。
+            counts["no_body"] += 1
+            links.append(_link(n, "unmatched", candidates=[{"note": "TV 里没有正文, 无法对照也无法补录"}]))
             continue
         m = tvlink.match_note(n, index)
         counts[m.kind] += 1
@@ -3090,9 +3200,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
                  f"{counts['fuzzy']}), 分不出 {counts['ambiguous']}, 对不上 "
-                 f"{counts['unmatched']}" + (
-                     f" → 补录 {ingest['minted']}/{ingest['to_write']}"
-                     if ingest and not dry_run else
-                     f" → 会补录 {ingest['to_write']}" if ingest else
-                     " → 没有补录目标, 只记 unmatched")),
+                 f"{counts['unmatched']}"
+                 + (f", 没正文 {counts['no_body']}" if counts["no_body"] else "")
+                 + (f" → 补录 {ingest['minted']}/{ingest['to_write']}"
+                    if ingest and not dry_run else
+                    f" → 会补录 {ingest['to_write']}" if ingest else
+                    " → 没有补录目标, 只记 unmatched" if (to_ingest and target is None) else
+                    " → 没有要补录的")),
     }

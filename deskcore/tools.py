@@ -492,21 +492,8 @@ def export_drafts(project_id: str, batch_id: str | None = None,
 
 INGEST_MAX_PER_CALL = 50
 
-# 同一个项目的 ingest 串行执行(codex review #81): REST 路由把工具丢进线程池,
-# 两个重叠的调用(慢请求还没回来、模型又重传了一次)会**同时**过完"库里已有
-# 指纹吗"那一读, 然后各自建一份身份 —— 幂等只对串行成立。内容级唯一约束
-# 建不了(同一个模板开头配不同正文是合法的), 所以在这里按项目加锁。
-# Railway 单 worker 下进程内锁就是全局锁; 换多 worker 部署时要换成库级
-# advisory lock —— 到时 /health 会回显 worker 数, 别悄悄换。
-_ingest_locks: dict[str, threading.Lock] = {}
-_ingest_locks_guard = threading.Lock()
-
-
-def _ingest_lock(project_id: str) -> threading.Lock:
-    with _ingest_locks_guard:
-        return _ingest_locks.setdefault(str(project_id), threading.Lock())
-
-
+# 同一个项目的补录互斥在 core.ingest_published 里做(进程内锁 + migrations/009 的
+# 库锁): 这里和 CLI 的 tv-sync 是两个进程, 锁必须在共用的那一层。
 class InvalidInput(ValueError):
     """调用方参数不对, 不是服务端坏了。REST 层映成 400 —— 500 会让模型拿同一个
     超大载荷一直重试, 400 才说得清是"改参数"。"""
@@ -545,7 +532,8 @@ def ingest_published(project_id: str, drafts: list[dict], source: str = "",
         ``skipped_already_committed`` 里; 也可以自己不传。
       · 一次最多 50 条, 多了直接报错, 分几次调。**重复调是安全的**: 库里已有
         指纹的稿子会被跳过(``skipped_already_fingerprinted``), 不会翻倍; 同一个
-        项目的调用在服务端串行, 两次调用重叠也不会各建一份。
+        项目的补录跨进程互斥(库里的锁), 两次调用重叠也不会各建一份; 锁被别人
+        持有太久会报「另一个补录正在跑」—— 那不是坏了, 稍后再调。
       · 用户给的表很长时, 先 ``dry_run=true`` 调一次, 把「会写 N 条、已有 M 条」
         告诉用户, 再正式调。dry-run 不写库。
 
@@ -600,9 +588,8 @@ def ingest_published(project_id: str, drafts: list[dict], source: str = "",
             "embedded": False, "dry_run": dry_run}
     if not entries:
         return {**zero, "note": f"这 {committed} 行都是走过 commit 的, 库里已有, 没有要补的。"}
-    with _ingest_lock(project_id):
-        out = core.ingest_published(core.sb(), project_id, entries, user_id=_user_id,
-                                    source=source or "workbuddy", dry_run=dry_run)
+    out = core.ingest_published(core.sb(), project_id, entries, user_id=_user_id,
+                                source=source or "workbuddy", dry_run=dry_run)
     out["skipped_already_committed"] = committed
     out["received"] = len(drafts)
     fp_failed = bool(out.get("fingerprint_error")) or out["fingerprinted"] < out["minted"]

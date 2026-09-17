@@ -383,6 +383,7 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 | 分不出 | `ambiguous`：候选写进 `tv_note_links.candidates`，**不硬猜**，报表里列给人看 | |
 | 对不上 | `unmatched` → `ingest_published`（剥话题标签、不过闸、按全文幂等）补录进目标项目，建成的 `version_id` 记回 `tv_note_links` | 同项目稿子都以同一串标签结尾，不剥会互相误撞 |
 | 回填 TV | `--write-tv` 才把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL 的行** | 那是 TV 的列，回填前跟 TV 打招呼 |
+| 互斥 | 补录走 `core.ingest_published`，它先拿库里的项目锁（`ingest_locks`，TTL 10 分钟、到期可接管），拿不到等 90 秒后报「另一个补录正在跑」（REST 409） | 服务进程的工具与 CLI/cron 的 `tv-sync` 是两个进程，进程内锁管不到对方；advisory lock 跨不过 PostgREST 的多次请求 |
 
 实测（2026-09-17 的库，按全部 5000 多个版本对）：WTG 724 篇对上 229、百健士 182 对上 143、
 唐小轻 127 对上 51、sportsix 492 对上 26、雷诺考特 374 对上 17、途鸽 127 对上 17；

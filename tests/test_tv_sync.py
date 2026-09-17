@@ -82,7 +82,8 @@ def test_dry_run_computes_everything_and_writes_nothing():
     c = _client(NOTES)
     out = core.tv_sync(c, TV, dry_run=True)
     assert out["counts"] == {"already_linked": 0, "tv_lineage": 1, "body_exact": 1,
-                             "title_exact": 0, "fuzzy": 0, "ambiguous": 0, "unmatched": 1}
+                             "title_exact": 0, "fuzzy": 0, "ambiguous": 0, "unmatched": 1,
+                             "no_body": 0}
     assert out["ingest"]["to_write"] == 1 and out["ingest"]["minted"] == 0
     assert "会补录 1" in out["note"]
     assert c.rows["tv_note_links"] == [] and c.rows["draft_fingerprints"] == []
@@ -229,3 +230,61 @@ def test_cli_tv_map_add_and_list(fake, capsys):
     assert "LNKT_phase1" in out and "SPX_phase1" in out and "补录目标" in out
     assert cli.main(["tv-map", "add"]) == 2
     assert cli.main(["tv-sync"]) == 2
+
+
+# ── codex review #81 (2026-09-17, 第二轮) ─────────────────────────────
+
+def test_bodyless_tv_note_is_recorded_not_ingested():
+    """没正文的笔记补进去等于建一个没有开头哈希、没有四字串的身份: 对查重隐形,
+    却被报成 ingested。记成 unmatched + 原因, 不补。"""
+    c = _client([{"note_id": "n7", "raw_content": "【标题】只有标题", "publish_time": _iso(1),
+                  "tier": "趴", "created_at": _iso(1)}])
+    out = core.tv_sync(c, TV)
+    assert out["counts"]["no_body"] == 1 and out["counts"]["unmatched"] == 0
+    assert out["ingest"] is None and "没正文 1" in out["note"]
+    link = c.rows["tv_note_links"][0]
+    assert link["match_kind"] == "unmatched" and link["version_id"] is None
+    assert "没有正文" in link["candidates"][0]["note"]
+    assert len(c.rows["versions"]) == 1   # 没补
+
+
+def test_note_text_does_not_claim_a_missing_target_when_nothing_needs_ingesting():
+    c = _client([_note("n1", "秋招投了六十份简历没回音", BODY_A)])      # 全对上, 没有要补的
+    out = core.tv_sync(c, TV)
+    assert out["ingest"] is None
+    assert "没有补录目标" not in out["note"] and "没有要补录的" in out["note"]
+
+
+def test_tv_lineage_pointing_at_an_older_version_is_resolved_against_all_versions():
+    """TV 带的 version_id 可能指向某个 item 的旧版(不是 best); 对照索引里只有 best
+    那一版, 得再按全部版本反查, 不能标成"不在库里"。"""
+    c = _client([_note("n8", "TV 指向旧版", "z" * 40, source_autowriter_version_id="v0")])
+    # i1 的旧版 v0(best 是 v1); items_for_versions 走 versions → items!inner → batches!inner
+    c.rows["versions"].append({"id": "v0", "item_id": "i1", "title": "旧版", "body": "old" * 20,
+                               "version_num": 0, "created_at": _iso(-3),
+                               "items": {"id": "i1", "status": "pending", "decision_source": None,
+                                         "batch_id": "b1", "batches": {"project_id": P1}}})
+    out = core.tv_sync(c, TV)
+    assert out["counts"]["tv_lineage"] == 1
+    link = c.rows["tv_note_links"][0]
+    assert link["version_id"] == "v0" and link["item_id"] == "i1" and link["project_id"] == P1
+
+
+def test_cli_orders_recovery_when_both_ingest_stages_fail(fake, capsys, monkeypatch):
+    real_mint = store.mint_draft_identity
+
+    def _partial(sb, project_id, user_id, tactic, drafts, **kw):
+        out = real_mint(sb, project_id, user_id, tactic, drafts[:1], **kw)
+        out["error"] = "第 2 行身份没建成"
+        return out
+    monkeypatch.setattr(store, "mint_draft_identity", _partial)
+    monkeypatch.setattr(store, "write_fingerprints",
+                        lambda sb, rows: (_ for _ in ()).throw(RuntimeError("502")))
+    fake.rpc_impl["deskcore_tv_notes"] = lambda a: [] if a.get("_after") else [
+        _note("m1", "第一篇", "第一篇没入库的正文各不相同, 长度够二十个字以上。" * 2),
+        _note("m2", "第二篇", "第二篇没入库的正文也各不相同, 长度够二十个字以上。" * 2)]
+    assert cli.main(["tv-sync", "--tv-project", TV]) == 1
+    out = capsys.readouterr().out
+    assert "两种半途失败同时发生" in out
+    assert out.index("**先**跑 `backfill") < out.index("**然后**再跑一次 tv-sync")
+    assert "重跑 tv-sync 即可" not in out, "不许再给一句相反的指令"

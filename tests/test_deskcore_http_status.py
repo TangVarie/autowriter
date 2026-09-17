@@ -47,6 +47,7 @@ def _raises(exc):
     (core.ProjectNotFound("project not found: nope"), 404, "ID 打错/已删"),
     (PermissionError("project x 不属于当前调用者"), 403, "越权"),
     (tools.InvalidInput("一次最多 50 条"), 400, "调用方参数错(codex #81)"),
+    (core.IngestBusy("另一个补录正在跑"), 409, "锁被别的进程持有(codex #81 P1)"),
     (RuntimeError("查重真的挂了"), 500, "真故障"),
 ])
 def test_exception_maps_to_the_right_status(client, monkeypatch, exc, expected, why):

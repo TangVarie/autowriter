@@ -326,12 +326,22 @@ def _tv_sync(core, sb, args) -> int:
                   f"{ing['skipped_already_fingerprinted']}, 表内重复 "
                   f"{ing['skipped_duplicate_in_sheet']}, 建身份 {ing['minted']}, "
                   f"写指纹 {ing['fingerprinted']}")
-            if ing.get("fingerprint_error") or ing["fingerprinted"] < ing["minted"]:
-                print(f"  ⚠️ 有 {ing['minted'] - ing['fingerprinted']} 条建了身份没写上指纹"
+            fp_failed = bool(ing.get("fingerprint_error")) or ing["fingerprinted"] < ing["minted"]
+            id_failed = bool(ing.get("identity_error"))
+            missing = ing["minted"] - ing["fingerprinted"]
+            if fp_failed and id_failed:
+                print(f"  ⚠️ 两种半途失败同时发生: {missing} 条建了身份没写上指纹"
+                      f"({ing.get('fingerprint_error') or ''}), 另有几行身份没建成"
+                      f"({ing['identity_error']})。顺序必须是: **先**跑 `backfill --project "
+                      f"{out['ingest_target']}` 把指纹补上, **然后**再跑一次 tv-sync 补没建成"
+                      "的那几行。别反过来, 也别现在就重跑 tv-sync。")
+                rc = 1
+            elif fp_failed:
+                print(f"  ⚠️ 有 {missing} 条建了身份没写上指纹"
                       f"({ing.get('fingerprint_error') or ''}) —— 跑 `backfill --project "
                       f"{out['ingest_target']}` 补, **不要**重跑 tv-sync 指望它补")
                 rc = 1
-            if ing.get("identity_error"):
+            elif id_failed:
                 print(f"  ⚠️ 身份没建全: {ing['identity_error']} —— 重跑 tv-sync 即可, "
                       "已有的会被跳过")
                 rc = 1

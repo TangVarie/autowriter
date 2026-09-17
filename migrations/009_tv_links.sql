@@ -30,7 +30,15 @@
 --                                写的值。Python 侧默认不调它(--write-tv 才调),
 --                                这是 TV 的列, 回填之前要跟 TV 打招呼。
 --
--- 两个函数都用 EXECUTE 动态 SQL: plpgsql 在 CREATE 时不解析表名, 加上
+--   ingest_locks + deskcore_ingest_lock / deskcore_ingest_unlock
+--                                补录的**跨进程**互斥(codex review #81 P1): tv-sync 是
+--                                CLI/cron 进程, ingest_published 工具跑在服务进程里,
+--                                两边都会"先读库里有没有指纹、再写", 进程内的锁管不到
+--                                对方。advisory lock 跨不过 PostgREST 的多次请求, 所以
+--                                用一张锁表: 按项目一行, 带 TTL(持有方崩了也能被接管),
+--                                拿锁/放锁各一个原子 RPC。
+--
+-- 两个跨 schema 的函数都用 EXECUTE 动态 SQL: plpgsql 在 CREATE 时不解析表名, 加上
 -- to_regclass 守卫, 让没有 truth_vault 的库(本地 harness、fresh install)也能
 -- 建出来并干净地返回空 —— 而不是在 CREATE 或第一次调用时炸掉。
 --
@@ -81,6 +89,71 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
     autowriter.tv_project_map,
     autowriter.tv_note_links
     TO service_role;
+
+-- ── 补录锁: 按项目一行, 到期可被接管 ──
+CREATE TABLE IF NOT EXISTS autowriter.ingest_locks (
+    project_id   UUID PRIMARY KEY REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    holder       TEXT NOT NULL,
+    acquired_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.ingest_locks TO service_role;
+
+-- 拿锁: 没人持有 / 持有已过期 / 就是自己 → 拿到(TRUE); 别人还持有 → FALSE。
+-- INSERT … ON CONFLICT DO UPDATE … WHERE 在同一条语句里判断并写入, 两个进程同时
+-- 来只有一个能改到那一行(行锁), 不需要额外的事务控制。
+CREATE OR REPLACE FUNCTION autowriter.deskcore_ingest_lock(
+    _project_id  UUID,
+    _holder      TEXT,
+    _ttl_seconds INT DEFAULT 600
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    _got BOOLEAN := FALSE;
+BEGIN
+    -- clock_timestamp() 而不是 now(): now() 是事务开始时间, 在一个长事务里
+    -- (或 harness 把几条语句塞进同一次 psql 调用时)会让"到期"永远判不出来。
+    INSERT INTO autowriter.ingest_locks (project_id, holder, acquired_at, expires_at)
+    VALUES (_project_id, _holder, clock_timestamp(),
+            clock_timestamp() + make_interval(secs => GREATEST(_ttl_seconds, 1)))
+    ON CONFLICT (project_id) DO UPDATE
+       SET holder = EXCLUDED.holder, acquired_at = clock_timestamp(),
+           expires_at = EXCLUDED.expires_at
+     WHERE autowriter.ingest_locks.expires_at < clock_timestamp()
+        OR autowriter.ingest_locks.holder = EXCLUDED.holder
+    RETURNING TRUE INTO _got;
+    RETURN COALESCE(_got, FALSE);
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_lock(UUID, TEXT, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_lock(UUID, TEXT, INT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_lock(UUID, TEXT, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_ingest_lock(UUID, TEXT, INT) TO service_role;
+
+-- 放锁: 只放自己持有的那一行。别人的锁(或已被接管的)不动, 返回 FALSE。
+CREATE OR REPLACE FUNCTION autowriter.deskcore_ingest_unlock(_project_id UUID, _holder TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    _got BOOLEAN := FALSE;
+BEGIN
+    DELETE FROM autowriter.ingest_locks
+     WHERE project_id = _project_id AND holder = _holder
+    RETURNING TRUE INTO _got;
+    RETURN COALESCE(_got, FALSE);
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) TO service_role;
 
 -- ── 读 TV 的笔记(keyset 翻页; PostgREST 的 db-max-rows 对 RPC 同样生效) ──
 CREATE OR REPLACE FUNCTION autowriter.deskcore_tv_notes(

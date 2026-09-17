@@ -207,13 +207,15 @@ def _pick(note: Note, cands: list[Version], index: VersionIndex) -> tuple[Versio
     if len(scored) == 1 or best_s - scored[1][0] >= FUZZY_MARGIN:
         return best_v, best_s, listed
     # 包含度分不出(通常是同一篇的两个近似版本): 时间窗内、离发布最近的那一版
+    score_of = {v.version_id: s for s, v in scored}
     tied = [v for s, v in scored if best_s - s < FUZZY_MARGIN]
     inside = [(abs(lag_days(note, v)), v) for v in tied
               if lag_days(note, v) is not None and in_window(lag_days(note, v))]
     if inside:
         inside.sort(key=lambda t: t[0])
         if len(inside) == 1 or inside[0][0] != inside[1][0]:
-            return inside[0][1], best_s, listed
+            chosen = inside[0][1]
+            return chosen, score_of[chosen.version_id], listed    # 记它自己的分, 不是最高分
     return None, best_s, listed
 
 

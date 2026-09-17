@@ -140,3 +140,16 @@ def test_match_all_keys_by_note_id():
     idx = L.VersionIndex([_v("v1", "a", BODY_A)])
     out = L.match_all([_n("n1", "a", BODY_A), _n("n2", "b", "无关" * 30)], idx)
     assert out["n1"].kind == "body_exact" and out["n2"].kind == "unmatched"
+
+
+def test_time_tiebreak_records_the_chosen_versions_own_score():
+    """codex #81: 包含度差不到 0.1 时按时间决胜, 记的分必须是被选中那版自己的,
+    不是候选里的最高分 —— 否则 tv_note_links.score 与 candidates 对不上。"""
+    near = BODY_A[:-2] + "呀。"      # 开头相同, 只改结尾两个字 → 包含度略低但在 0.1 的决胜带内
+    idx = L.VersionIndex([_v("v_far", "同题", BODY_A, days=-25), _v("v_near", "同题", near, days=1)])
+    m = L.match_note(_n("n1", "同题", BODY_A, days=2), idx)
+    assert m.kind == "body_exact" and m.version.version_id == "v_near"
+    own = idx.containment(L.grams(BODY_A), m.version)
+    assert m.score == own and own < 1.0
+    top = max(c["score"] for c in m.candidates)
+    assert top == 1.0 and m.score < top

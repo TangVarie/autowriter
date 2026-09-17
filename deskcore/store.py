@@ -1748,3 +1748,36 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
                     "project_id": project_id, "title": title, "body": body,
                     "created_at": chosen.get("created_at") or item.get("created_at")})
     return out
+
+
+# ── 补录锁(migrations/009): 跨进程互斥, 按项目一行, 带 TTL ─────────────────
+
+def try_ingest_lock(sb, project_id: str, holder: str, ttl_seconds: int) -> bool | None:
+    """拿补录锁。True 拿到 / False 别人持有 / **None = 锁 RPC 还没部署**(调用方
+    退回进程内锁并记一条 warning, 不能把"没部署"当成"拿到")。"""
+    try:
+        res = sb.rpc("deskcore_ingest_lock", {
+            "_project_id": project_id, "_holder": holder,
+            "_ttl_seconds": int(ttl_seconds)}).execute()
+    except Exception as exc:                        # noqa: BLE001
+        if rpc_missing(exc):
+            return None
+        raise
+    data = res.data
+    if isinstance(data, list):
+        data = data[0] if data else False
+    return bool(data)
+
+
+def ingest_unlock(sb, project_id: str, holder: str) -> bool:
+    try:
+        res = sb.rpc("deskcore_ingest_unlock",
+                     {"_project_id": project_id, "_holder": holder}).execute()
+    except Exception as exc:                        # noqa: BLE001
+        if rpc_missing(exc):
+            return False
+        raise
+    data = res.data
+    if isinstance(data, list):
+        data = data[0] if data else False
+    return bool(data)

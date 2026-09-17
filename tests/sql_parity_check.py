@@ -172,7 +172,7 @@ def main() -> int:
     # 抽查几张表 / 几个函数真的建出来了 —— 免得 shim 把整段吃掉还报绿
     for tbl in ("projects", "items", "versions", "memories", "jobs",
                 "draft_fingerprints", "angle_ledger",
-                "tv_project_map", "tv_note_links"):          # 009
+                "tv_project_map", "tv_note_links", "ingest_locks"):   # 009
         n = sql("SELECT count(*) FROM information_schema.tables "
                 f"WHERE table_schema='autowriter' AND table_name='{tbl}';")
         if n != "1":
@@ -181,7 +181,8 @@ def main() -> int:
     for fn in ("deskcore_check_drafts", "deskcore_commit_fingerprints",
                "deskcore_reserve_angles", "claim_one_job",
                "update_calibration_notes_cas", "deskcore_fingerprint_counts",
-               "deskcore_tv_notes", "deskcore_tv_backfill_lineage"):   # 009
+               "deskcore_tv_notes", "deskcore_tv_backfill_lineage",
+               "deskcore_ingest_lock", "deskcore_ingest_unlock"):    # 009
         n = sql("SELECT count(*) FROM pg_proc p JOIN pg_namespace ns "
                 "ON ns.oid = p.pronamespace "
                 f"WHERE ns.nspname='autowriter' AND p.proname='{fn}';")
@@ -209,7 +210,7 @@ def main() -> int:
             bad += 1
     sql(f"DELETE FROM autowriter.items WHERE user_id='{UID}';")
     if not bad:
-        print("  ✓ 抽查的 9 张表 + 8 个函数 + 决策出处三列都在, "
+        print("  ✓ 抽查的 10 张表 + 10 个函数 + 决策出处三列都在, "
               "且 CHECK 与 db.DecisionSource 一致")
 
     # ── ①'' 009 的跨 schema RPC 在【没有 truth_vault】的库上要能调、且干净返回空 ──
@@ -273,6 +274,29 @@ def main() -> int:
     run_sql_text("DROP SCHEMA truth_vault CASCADE;", "truth_vault 替身清理")
     if not bad:
         print("  ✓ 有 truth_vault 时: 按项目读、keyset 翻页、回填只填 NULL 的行")
+
+    # ── ①‴ 补录锁的语义: 拿到/拿不到/自己可重入/放锁只放自己的/到期可接管 ──
+    sql(f"INSERT INTO autowriter.projects (id, owner_id, name) VALUES ('{PID}', '{UID}', '锁') "
+        "ON CONFLICT (id) DO NOTHING;")
+    steps = [
+        (f"SELECT autowriter.deskcore_ingest_lock('{PID}', 'A', 600);", "t", "A 先拿: 该拿到"),
+        (f"SELECT autowriter.deskcore_ingest_lock('{PID}', 'B', 600);", "f", "B 再拿: 该拿不到"),
+        (f"SELECT autowriter.deskcore_ingest_lock('{PID}', 'A', 600);", "t", "A 重拿: 自己的锁可重入"),
+        (f"SELECT autowriter.deskcore_ingest_unlock('{PID}', 'B');", "f", "B 放 A 的锁: 不许"),
+        (f"SELECT autowriter.deskcore_ingest_unlock('{PID}', 'A');", "t", "A 放自己的锁"),
+        (f"SELECT autowriter.deskcore_ingest_lock('{PID}', 'B', 1);", "t", "B 拿 1 秒的锁"),
+        (f"SELECT pg_sleep(1.2); SELECT autowriter.deskcore_ingest_lock('{PID}', 'C', 600);", "t", "B 的锁到期, C 可接管"),
+        (f"SELECT autowriter.deskcore_ingest_unlock('{PID}', 'B');", "f", "B 已被接管, 放不掉"),
+        (f"SELECT autowriter.deskcore_ingest_unlock('{PID}', 'C');", "t", "C 放锁"),
+    ]
+    for stmt, want, why in steps:
+        got = sql(stmt).splitlines()[-1].strip()
+        if got != want:
+            print(f"  [FAIL] 补录锁: {why} —— 期望 {want!r} 得到 {got!r}")
+            bad += 1
+    sql(f"DELETE FROM autowriter.projects WHERE id='{PID}';")
+    if not bad:
+        print("  ✓ 补录锁: 拿/拿不到/重入/只放自己的/到期接管, 九步全对")
 
     # ── ②' 每张表都要授权给 service_role ───────────────────────────────
     # 2026-08-26 首次真部署踩的坑, 值得完整记一遍。
