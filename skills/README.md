@@ -5,7 +5,7 @@
 ## 怎么装
 
 **首选从仓库装，别手工复制**：`TangVarie/autowriter → skills/bywood-writing-desk`（WorkBuddy 支持从 GitHub 装）。
-装一次就够了——这份 SKILL.md 只是一根引线，协议正文在服务端，以后改协议运营端不做任何事。
+**协议正文就在这份 SKILL.md 里**（由 `deskcore/protocol.md` 生成）。改了协议要让运营重新导入一次；忘了重新导入的话，模型开场核版本时会拿到新正文并提醒他。
 
 下面这张表只在平台不支持从仓库装时用。**那种情况下这份拷贝要自己记着同步**，理由见下一节。
 
@@ -20,17 +20,20 @@
 写作台协议：管**流程纪律**（先取规则、先发牌、成稿必过查重闸、反馈要分辨
 「这一次」还是「以后都这样」），不管文笔。
 
-**这里的 SKILL.md 只是一根引线。** 协议正文在 [`deskcore/protocol.md`](../deskcore/protocol.md)，
-由 deskcore 的 `get_protocol` 工具在每次进入流程时下发。引线装一次就不用再动；
-要改协议就改 `deskcore/protocol.md`，合并、部署，所有人同时换版。
+**协议正文的源文件是 [`deskcore/protocol.md`](../deskcore/protocol.md)，SKILL.md 里那份由它生成。**
+改了源文件就跑 `python -m deskcore.cli sync-skill`，把两个文件一起提交（测试
+`test_skill_carries_the_full_protocol_and_is_in_sync` 盯着两边逐字一致）。SKILL.md 里
+`<!-- protocol_version: … -->` 那一行以上是手写的引线头，以下是生成的。
 
-为什么这样分：本地 skill 拷到运营机器上之后改了没人提醒，而协议管的是流程纪律，
-过期了模型会按老规矩写而没人发现。已经出过一次事故（旧协议没有"评论"的落点，
-模型跑去翻交付文档反复读同一个文件，被平台判定死循环强杀）。
+为什么正文在 skill 里而不是每次从服务端取（2026-09-17）：09-10 曾把正文搬到服务端、
+SKILL.md 只留一根引线让 `get_protocol` 每次下发——09-11 起定稿入库率从 110% 掉到 22%。
+34 KB 的正文作为对话开头的一次工具返回值，在写完十几篇稿子之后已经离得太远或被平台
+压缩掉，模型不记得还要查重和入库，写出去的稿子没有指纹，下一批查重看不见它们。技能
+文件进系统提示，整场对话都在眼前。"改了没人知道"这个问题改由版本校验解决：开场
+`get_protocol` 带上本地 `protocol_version`，不一致就下发新正文并提醒重新导入。
 
-**先接服务，再装 skill。** 引线唯一的动作是调 `get_protocol`，而这个工具只在 deskcore 的
-MCP / REST 通道里。没接上服务不是"降级可用"，是模型照 SKILL.md 那条「协议读不到就停下来」
-当场停住。接入步骤（WorkBuddy 的项目级 `mcp.json`、Claude Code 的 `claude mcp add --transport http`、
+**先接服务，再装 skill。** 开场那一次 `get_protocol` 是版本校验，服务没接上时模型按本地
+这份走、但会说一句"版本没核上"；写稿、查重、入库全部依赖服务，所以没接上不是"降级可用"。接入步骤（WorkBuddy 的项目级 `mcp.json`、Claude Code 的 `claude mcp add --transport http`、
 key 一人一把）见 [`docs/deskcore.md`](../docs/deskcore.md) §4.3「挂到 WorkBuddy」；
 连不上时的排查顺序见 [`docs/deskcore-runbook.md`](../docs/deskcore-runbook.md)「连不上时按这个顺序查」。
 

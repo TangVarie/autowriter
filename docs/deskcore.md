@@ -158,7 +158,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 
 | 阶段 | 工具 | 说明 |
 |---|---|---|
-| 取协议 | `get_protocol` | 下发写作台协议正文（`deskcore/protocol.md`）。**进流程第一步**，本地 SKILL.md 只是引线（见 §4.3） |
+| 核协议版本 | `get_protocol` | 对话开始时调一次，带上 skill 里的 `protocol_version`：一致只回版本；不一致或没带才下发正文（源文件 `deskcore/protocol.md`）。正文的主副本在 skill 文件里，见 §4.3 |
 | 开项目 | `create_project` | 给新品牌/新方向建项目。**owner 恒为调用者**，签名里没有 owner 参数。同名不建、返回已有的；同品牌照建但列出兄弟项目（见 §3.0） |
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics |
@@ -494,13 +494,13 @@ curl -sS -X POST "$DESKCORE_URL/tool/list_projects" \
 }
 ```
 
-skill 从本仓直接装：`TangVarie/autowriter → skills/bywood-writing-desk`（WorkBuddy 支持从 GitHub 装）。**装一次就够了**：那份 SKILL.md 只是一根引线，正文由 `get_protocol` 每次从服务端下发（源文件 `deskcore/protocol.md`）。
+skill 从本仓直接装：`TangVarie/autowriter → skills/bywood-writing-desk`（WorkBuddy 支持从 GitHub 装）。**协议正文就在那份 SKILL.md 里**（由 `deskcore/protocol.md` 经 `python -m deskcore.cli sync-skill` 生成）。改了协议要让运营重新导入一次；忘了的话，模型开场核版本时会拿到新正文并提醒他。
 
-> 为什么协议放服务端（2026-09-10）：WorkBuddy 从 GitHub 装的 skill 是一次性拷贝，仓库更新之后本地那份不会动，也没人提醒。协议管的是流程纪律，过期了模型会按老规矩写而没人发现——已经出过一次：旧协议没有"评论"的落点，模型收到「评论规则更新+入库」后跑去翻交付文档，反复读同一个文件被平台判定死循环强杀。现在改协议就改 `deskcore/protocol.md`，合并、Railway 部署，所有人同时换版；运营端不需要做任何事。
+> **正文为什么在 skill 里，而不是每次从服务端取（2026-09-17）。** 09-10 曾反过来：SKILL.md 只留一根引线，正文由 `get_protocol` 每次下发，动机是"从 GitHub 装的 skill 是一次性拷贝，改了没人提醒"。09-11 起定稿入库率从 110% 掉到 22%（角度台账 vs 真入库的稿子）：34 KB 的正文作为对话开头的一次工具返回值，在模型写完十几篇稿子之后已经离得太远或被平台压缩掉，它不记得还要查重和入库，或者记得但找不到工具名——「找不到规则操作工具」就是那个状态的原话。写出去的稿子没有指纹，下一批再撞上它们时查重看不见；运营看到的"大量重复"就是这么来的。技能文件进系统提示，整场对话都在眼前，没有这个问题。
 >
-> 两根引线：本地 SKILL.md 说"第一步先调 `get_protocol`"；MCP initialize 的 `instructions` 也说同一句，认这个字段的平台会注入系统提示，客户端那份 skill 装漏了也有兜底。
+> "改了没人知道"改由版本校验解决：SKILL.md 里有一行 `<!-- protocol_version: … -->`，模型开场把它传给 `get_protocol`；一致只回版本（几十字节），不一致才下发正文并让模型提醒运营重新导入。MCP initialize 的 `instructions` 说的也是"先核版本"，不再是"先取全文"。
 >
-> `get_protocol` 拿不到就**停**，不要按记忆里的旧版本继续——这是把协议搬到服务端要消灭的那种失败，工具层故意不包 `_safe`。
+> `get_protocol` 报错说明服务端的协议文件坏了：模型按本地 skill 那份（同一份正文）继续，但要知道版本没核上；工具层故意不包 `_safe`，包成带 `error` 的"成功"会让它以为核过了。
 
 > ⚠️ **鉴权头的退路**：WorkBuddy 的 HTTP MCP 能不能配自定义 header，官方更新日志只说了支持 HTTP MCP 和 OAuth（v4.7.3），没有权威文档。所以 key **三种传法都收**，但**优先级不同**：
 >

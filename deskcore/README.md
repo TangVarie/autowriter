@@ -18,10 +18,13 @@
 | 跨批次越写越像 | `draw_angles` 发牌台账 + `check_drafts` 全量成稿指纹硬闸 |
 | 正例池是 recency top-5，模仿最近 5 条 → 被标 positive → 窗口滚动，语感越收越窄 | 正例改按**相关性**选取（`core.py` 新增四样之三，断掉趋同回路）；`borrow_lessons` 另从 TV 飞轮图书馆借真实爆款经验卡 |
 | 一个项目 5 个提示词要点 5 次 | `open_project` 一次拿全 |
-| 运营端那份 SKILL.md 改了没人知道，模型照旧协议写 | `get_protocol` 每次从服务端下发 `protocol.md` 正文，改协议只改服务端并重部署，全员同时换版 |
+| 运营端那份 SKILL.md 改了没人知道，模型照旧协议写 | 协议正文进技能文件（系统提示，整场对话都在模型眼前）；`get_protocol` 只核对版本，本地是旧版时才下发新正文并提醒重新导入。09-10 曾只留引线、正文每次由工具下发——09-11 起入库率从 110% 掉到 22%，34 KB 的返回值在写完十几篇之后已经离得太远，模型不记得还要查重入库 |
 | 只用写作台写稿、定稿、导出的团队，永远产不出一条人工审核决定 | `review_drafts` 把**用户真的给出的**结论落库（`decision_source=human` + 真实 reviewer + 时间）。定稿仍然只建 `pending`——定稿不是审核，`commit_drafts` 一个字没改 |
 | 稿子发出去就断线了，TV 那边 `v_model_comparison` 长期查出空集还不报错 | `export_drafts` 导的 xlsx 带六列 `_source_autowriter_*`，是笔记回到写作台的唯一线索；列名写错会让 TV 整行 quarantine，判据见 `tests/test_lineage_contract.py`（六个名字手抄在用例里，**不**从 `exporter` 读） |
 | 借阅失败和"这次没匹配"长得一模一样，用不上经验也没人知道 | `borrow_lessons` 回 `status`：`borrowed` / `empty` / `not_configured` / `timeout` / `error` 五种结局分开，带耗时 |
+| 模型跳过 `check_drafts` 直接 `commit_drafts`，同题重写的稿子整批进库（途鸽 09-10 四个标题各入库两次，两两 Jaccard 只有 0.33） | **入库自带闸**：`commit_drafts` 先跑和 `check_drafts` 同一套判定（标题语义、开头、四字串、本批内互比），判 reject 的不进 RPC；没带 `angle_key` 的数出来（`unattributed`），台账销不了账的角度下一批会再被抽到 |
+| 09-11 起 78% 的角度发出去了、稿子没入库，指纹库不知道它们，下一批查重看不见——而 `/health` 一直 ok | `doctor` 和 `/health` 的 `config.pipeline` 报近 7 天「发了角度没入库」的比例，超过 50% 标红（不进顶层 `ok`：那是流程在漏，不是服务坏了） |
+| 已经发出去、没走 commit 的稿子永远补不回指纹库 | `python -m deskcore.cli ingest --xlsx 飞书表` 从导出格式或「标题/正文」两列读回来，建身份（出处记在 `batches.params`，**不碰** `items.external_source`——那列是 TV 同步的标记）+ 写指纹，**不过闸**——已发生的事实拦它没有意义 |
 
 > 另有两条改在**常规生成那条路**（根目录的 `memory.py` / `generation_service.py`），
 > 不经过 deskcore，列在这里只是免得两边打架：未验证的经验卡现在会在提示词里
@@ -40,7 +43,7 @@ deskcore/
 ├── vocab.py        闭集: essence 来自 vendor JSON, surface 引用 generator.py
 ├── identity.py     API key → user_id, 「个人风格私有」的前提
 ├── tools.py        MCP 工具面, docstring 是给模型看的
-├── protocol.md     写作台协议正文, get_protocol 每次下发; skills/ 里的 SKILL.md 只是引线
+├── protocol.md     写作台协议正文的【源文件】; skills/…/SKILL.md 里那份由 cli sync-skill 生成, 测试盯着两边一致
 ├── app.py          FastAPI + MCP(streamable HTTP) + REST 兜底 + /health 配置回显
 ├── cli.py          本地 adapter, 含【不连库不联网】的 selftest
 ├── vendor/         从 truth-vault 原样复制的词表 + sha256(见 vendor/README.md)
@@ -82,6 +85,8 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 | `reembed --project <uuid>` | 给指纹库里缺标题向量的行补向量（欠费恢复、换 embedding 模型之后跑） |
 | `recompute-fingerprints --project <uuid>` | 按当前 normalize 口径重算确定性指纹。**只在改了 `normalize` 之后跑** |
 | `reembed-rules --user <uuid>` | 给**规则**补向量——soft 规则的相关性过滤靠它才有意义 |
+| `ingest --project <uuid> --user <uuid> --xlsx 表.xlsx [--dry-run]` | 把**已经发出去、没走 commit** 的稿子从飞书表补进库（身份 + 指纹，不过闸）。认 `export_drafts` 的导出格式（带 `version_id` 的行跳过）或「标题」「正文」两列（`--title-col/--body-col` 可指定）。先 `--dry-run` 看它认出几条 |
+| `sync-skill [--check]` | **不连库。** 改了 `protocol.md` 之后跑，把正文接进 `skills/…/SKILL.md`；`--check` 只比对，给 CI 用。两边不一致时 `test_protocol_tool.py` 会红 |
 
 另有 `health` / `projects` / `open` / `draw` / `check` 几个只读的手动验证入口。完整参数与验收判据见 runbook §2。
 
@@ -97,7 +102,7 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 没包** `_safe` —— 判据见 `tools.py` 里 `_safe` 的 docstring：失败之后调用方还会不会当作成功
 继续往下走，会就不能包。`check_drafts` 更不能，查重出错必须抛：静默放行就是重演
 `config.py` 里 `ENABLE_DEDUP_REGEN` 默认关着、查重跑了但不拦的老问题。
-`get_protocol` 同理不包——协议拿不到就该停，不能让模型按记忆里的旧版本继续。
+`get_protocol` 同理不包——它报错说明服务端的协议文件坏了；模型该按本地 skill 那份（同一份正文）继续、但知道版本没核上，包成带 `error` 的"成功"会让它以为核过了。
 
 **归属拒绝不在 fail-open 范围内**（审计 COR-015）。`_safe` 兜的是瞬时故障；
 `PermissionError` 重试一万次也一样，包成"看起来成功"会让调用方模型继续拿同一个错

@@ -79,6 +79,14 @@ class FakeQuery:
         self.filters.append(("gt", key, value))
         return self
 
+    def gte(self, key, value):
+        self.filters.append(("gte", key, value))
+        return self
+
+    def lte(self, key, value):
+        self.filters.append(("lte", key, value))
+        return self
+
     def is_(self, key, value):
         # ``.not_.is_(k, "null")`` 与 ``.is_(k, "null")`` 是一对反义, 假件要分开
         self.filters.append(("isnot" if self._negate_next else "is", key, value))
@@ -211,6 +219,10 @@ class FakeClient:
             return cur is not None and cur < value
         if kind == "gt":
             return cur is not None and cur > value
+        if kind == "gte":
+            return cur is not None and cur >= value
+        if kind == "lte":
+            return cur is not None and cur <= value
         if kind == "is":
             return cur is None
         if kind == "isnot":

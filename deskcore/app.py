@@ -332,6 +332,58 @@ async def _probe(fn, fallback):
         return fallback
 
 
+_LEAK_TTL_SEC = 60.0          # 成功结果的缓存
+_LEAK_FAIL_TTL_SEC = 30.0     # 失败也缓存: 库卡住时别让每次 ping 都再等一次超时
+_leak_cache: dict = {"at": 0.0, "value": None}
+_leak_inflight = __import__("threading").Lock()
+
+
+def _public_leak(value: dict) -> dict:
+    """/health 不鉴权 —— 只回总量, **不回项目名单**(codex review P1)。
+
+    逐项目的表在 `deskcore.cli doctor` 里(拿 service_role 跑的运维命令)。这里只
+    留: 发了多少、销了多少、漏了几成、几个项目单独超线。
+    """
+    keep = ("ok", "window_days", "drawn", "consumed", "leak_pct",
+            "projects_over_threshold", "note")
+    return {k: value[k] for k in keep if k in value}
+
+
+def _leak_unavailable(note: str) -> dict:
+    return {"ok": None, "window_days": core.LEAK_WINDOW_DAYS, "note": note}
+
+
+def _leak_cached() -> dict:
+    """pipeline_leak 的 TTL 缓存, 在 _probe 的工作线程里跑(它本身是阻塞查询)。
+
+    三条护栏, 都是为了让存活探针**不为漏斗买单**(codex review P1):
+      · 成功缓存 60s, 失败缓存 30s —— 库卡住时不是每次 ping 都再等一次超时;
+      · 同一时刻只跑一个扫描: 上一个还没回来, 这次直接回上一次的值或"探不到";
+      · 回出去的一律脱敏(见 _public_leak)。
+    """
+    import time
+    now = time.monotonic()
+    cached = _leak_cache["value"]
+    if cached is not None and now - _leak_cache["at"] < cached.get("_ttl", _LEAK_TTL_SEC):
+        return _public_leak(cached)
+    if not _leak_inflight.acquire(blocking=False):
+        return (_public_leak(cached) if cached is not None
+                else _leak_unavailable("上一次扫描还没回来, 本次不重复扫"))
+    try:
+        try:
+            value = dict(core.pipeline_leak(_health_probe_client()))
+            value["_ttl"] = _LEAK_TTL_SEC
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pipeline leak probe failed: %s", exc)
+            value = _leak_unavailable(f"探不到({type(exc).__name__}), "
+                                      f"{_LEAK_FAIL_TTL_SEC:g}s 内不再重试")
+            value["_ttl"] = _LEAK_FAIL_TTL_SEC
+        _leak_cache.update(at=time.monotonic(), value=value)
+        return _public_leak(value)
+    finally:
+        _leak_inflight.release()
+
+
 async def _collect_health() -> dict:
     """算出那份健康回显。``/health`` 与 ``/ready`` **共用这一份**。
 
@@ -379,6 +431,19 @@ async def _collect_health() -> dict:
     # 被改过, 回显的 note 和参与 ok 的判断会对不上。
     auth_ok, auth_note = identity.auth_health()
 
+    # 「发了角度没入库」—— 使用层的漏斗, 不是服务健康。09-11 起 78% 的稿子没走
+    # commit, 而 /health 一直 ok: 服务确实没坏, 坏的是流程。所以这块**不进顶层
+    # ok**(否则 Railway 会因为运营的用法重启容器), 但一定要在这里看得见。
+    # 带 TTL 缓存: /health 是 Railway 的存活探针, 几十秒 ping 一次, 而 7 天的
+    # 漏斗一分钟内不会变 —— 每次 ping 都翻一遍台账是白花的(code review)。
+    # 库探测都没过就别再去扫台账 —— 那只会让存活探针再等一次同样的超时,
+    # Railway 在库故障期间把服务重启掉, 正是存活探针设计要避免的事。
+    if db_ok:
+        pipeline = await _probe(_leak_cached, _leak_unavailable(
+            f"探不到(超时 >{_HEALTH_PROBE_TIMEOUT:g}s), 见日志"))
+    else:
+        pipeline = _leak_unavailable("库探测没过, 本次跳过漏斗")
+
     return {
         "ok": db_ok and vocab_ok and auth_ok,
         "service": SERVICE,
@@ -412,6 +477,7 @@ async def _collect_health() -> dict:
             # 注意 ``/health`` 本身仍返 200(见该端点的说明); 要一个**状态码**能
             # 反映 ok 的, 用 ``/ready`` —— 它不 ready 时返 503。
             "auth": {"ok": auth_ok, "note": auth_note},
+            "pipeline": pipeline,
             "anonymous_allowed": identity.anonymous_allowed(),
             # 这两条口径配错时的表现都是【客户端侧的传输层错误】, 服务端不留
             # 任何痕迹: origin 不在名单 → 浏览器报 fetch failed; host 不在名单
@@ -552,14 +618,17 @@ def _register_mcp():
         allowed_origins=allowed,
     )
     # instructions 会在 MCP initialize 时交给客户端, 认它的平台会注入系统提示。
-    # 这是本地 SKILL.md 引线之外的第二根引线: 就算客户端那份 skill 没装或装旧了,
-    # 连上服务的模型也会被告知先取协议。不认它的平台丢掉即可, 没有副作用。
+    # 它只说一件事: 先核版本。协议正文的主副本在 skill 文件里(进系统提示), 这里
+    # **不再**让模型每次去取全文 —— 2026-09-10 那版这么写过, 09-11 起入库率从
+    # 110% 掉到 22%, 见 tools.get_protocol 的说明。不认这个字段的平台丢掉即可。
     mcp = FastMCP(name="deskcore", stateless_http=True, json_response=True,
                   streamable_http_path="/", transport_security=security,
                   instructions=("deskcore 是 BYWOOD 小红书种草文案的写作台内核。"
-                                "给项目写稿、改稿、写评论、记规矩、入库、导出之前, "
-                                "先调 get_protocol 取完整协议并照着执行; "
-                                "协议读不到就停下来告诉用户, 不要凭记忆继续。"))
+                                "协议正文在 bywood-writing-desk 这个 skill 里。"
+                                "对话开始时调一次 get_protocol, 带上 skill 里 "
+                                "protocol_version 那一行的值核对版本: 一致就照 skill "
+                                "执行; 不一致就照返回的正文执行并提醒用户重新导入 "
+                                "skill; 没装 skill 就不带参数调它拿全文。"))
 
     def _wrap(fn, needs_user: bool):
         # 把 _user_id 从签名里摘掉再注册 —— 模型不该看到它, 也不该能传它。

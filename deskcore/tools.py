@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import logging
 from pathlib import Path
 from typing import Any
@@ -29,42 +30,151 @@ from . import core, vocab
 
 logger = logging.getLogger("deskcore.tools")
 
-# 写作台协议的正文。SKILL.md 在客户端只是一根引线, 协议本身从这里下发 ——
-# 理由见 get_protocol 的 docstring 和 docs/deskcore.md §4.3。
+# 写作台协议正文的【源文件】。运营机器上的 skill 文件里那份由它生成(见下面
+# SKILL_PATH); get_protocol 只在版本对不上时才把它发下去。
 PROTOCOL_PATH = Path(__file__).with_name("protocol.md")
+# 运营机器上的那份协议: 技能文件。它进的是**系统提示**, 整场对话都在模型眼前 ——
+# 这是它和 get_protocol 返回值的本质区别, 见 get_protocol 的说明。
+SKILL_PATH = (PROTOCOL_PATH.parent.parent / "skills" / "bywood-writing-desk"
+              / "SKILL.md")
+# 技能文件里这一行以下是 protocol.md 的原样拷贝, 由 `python -m deskcore.cli
+# sync-skill` 生成; 以上是手写的引线头。tests/test_protocol_tool.py 盯着两边一致。
+SKILL_VERSION_MARK = "<!-- protocol_version: {version} -->"
+_SKILL_MARK_RE = re.compile(r"<!-- protocol_version: ([0-9a-f]{12}) -->")
 
 
 # ══════════════════════════════════════════════════════════════════════
 # 协议
 # ══════════════════════════════════════════════════════════════════════
 
-def get_protocol(_user_id: str | None = None) -> dict:
-    """取写作台协议的【完整正文】。进入写作台流程的第一步, 永远先调这个。
+def skill_head() -> str:
+    """技能文件里标记行以上的部分(含 frontmatter): 手写的引线头。没有文件就是空串。"""
+    try:
+        skill = SKILL_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    head, sep, _ = skill.partition("<!-- protocol_version:")
+    return head.strip() if sep else ""
 
-    不带参数。返回:
-      · protocol —— 协议全文(markdown)。照着它逐条执行: 什么时候调哪个工具、
-        报错怎么办、反馈怎么记、评论怎么处理、哪些事绝对不能做。
-      · version  —— 正文的短哈希。两次调用不同说明协议更新了, 以新的为准。
 
-    为什么协议放服务端而不是写死在本地 skill 里: 本地那份拷出去之后改了没人
-    提醒, 而协议管的是流程纪律, 过期了模型会按老规矩写而没人发现。放这里意味着
-    仓库一合并、服务一部署, 所有人同时换版。
+def _strip_frontmatter(text: str) -> str:
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            return text[end + 5:].strip()
+    return text
 
-    这个工具出错会直接报错。报错就【停下来】告诉用户"写作台协议读不到",
-    不要凭记忆补一份继续写。
+
+def protocol_text() -> tuple[str, str]:
+    """(协议正文, 12 位版本哈希)。每次从盘上读: 十几 KB, 微秒级, 换来热修不必重启。
+
+    ⚠️ 版本哈希盖的是**引线头 + 正文**, 不只是 protocol.md。引线头里有几条独立
+    生效的规矩(失败不编原因 / 不问"要不要跳过"…), 只改它不改正文时, 装着旧
+    skill 的机器如果版本号不变, get_protocol 就会一直说 up_to_date, 那次更新
+    永远送不到(codex review P2)。
+    """
+    text = PROTOCOL_PATH.read_text(encoding="utf-8").strip()
+    if not text:
+        raise RuntimeError(f"协议文件为空: {PROTOCOL_PATH}")
+    digest = hashlib.sha256((skill_head() + "\n" + text).encode("utf-8")).hexdigest()[:12]
+    return text, digest
+
+
+def get_protocol(local_version: str | None = None,
+                 _user_id: str | None = None) -> dict:
+    """核对写作台协议的版本; 本地没有或已过期时下发全文。对话开始时调一次。
+
+    ``local_version`` 传 skill 文件里 ``protocol_version`` 那一行的值。返回:
+      · ``version``     —— 服务端协议的版本哈希
+      · ``up_to_date``  —— True: 本地 skill 就是最新版, **照 skill 执行**, 本返回值
+                          里没有正文; False: 本地是旧版, 正文在 ``protocol`` 里,
+                          照它执行, 并告诉用户一句「写作台 skill 有更新, 重新导入
+                          一下」; None: 没传 local_version, 全文已返回
+      · ``protocol``    —— 协议正文(只在需要时带)
+      · ``skill_header`` —— skill 文件引线头里那几条独立规矩(和 protocol 一起带;
+                          版本号盖的是两者, 头改了也算过期)
+
+    ⚠️ 协议正文的**主副本在 skill 文件里**, 不在这个工具的返回值里。2026-09-10 曾
+    反过来 —— skill 只留一根引线, 正文每次由这个工具下发 —— 结果 09-11 起定稿
+    入库率从 110% 掉到 22%: 34 KB 的正文作为对话开头的一次工具返回值, 在模型
+    写完十几篇稿子之后已经离得太远或被平台压缩掉, 于是它不记得还要查重和入库,
+    或者记得但找不到工具名(「找不到规则操作工具」就是那个状态的原话)。技能文件
+    进的是系统提示, 整场对话都在眼前, 没有这个问题。这个工具保留下来只为一件事:
+    skill 拷到运营机器上之后改了没人提醒 —— 版本对不上时它把新正文发下来。
+
+    这个工具出错就是服务端的协议文件坏了。那时**按本地 skill 那份继续**(同一份
+    正文), 但要知道版本没核上; 不要说"服务掉线"。
     """
     # _user_id 收下但不用: 协议对所有人一样, 不按人裁剪。仍然走 needs_user=True
     # 是为了不给 test_all_tools_now_require_caller_identity 那条"所有工具都绑
     # 身份"的机械保险开口子 —— 一个例外就会变成下一个例外的先例。
-    # 故意不包 _safe: 协议拿不到就该停。包成带 error 的"成功"会让模型按记忆里
-    # 的旧版本往下走 —— 这正是把协议搬到服务端要消灭的那种失败。
-    # 每次都从盘上读而不是 import 期缓存: 文件十几 KB, 读一次微秒级, 换来的是
-    # 热修协议文本不必重启服务。
-    text = PROTOCOL_PATH.read_text(encoding="utf-8").strip()
-    if not text:
-        raise RuntimeError(f"协议文件为空: {PROTOCOL_PATH}")
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
-    return {"protocol": text, "version": digest, "chars": len(text)}
+    # 故意不包 _safe: 包成带 error 的"成功"会让模型以为版本核过了。
+    text, digest = protocol_text()
+    out: dict = {"version": digest, "chars": len(text)}
+    # 宽松地取版本号: 模型可能把整行 "<!-- protocol_version: xxx -->" 或
+    # "protocol_version: xxx" 原样传进来。只要里面有那 12 位十六进制就认。
+    # 精确比较的后果是每场对话都判成"旧版", 全文再发一遍、还让运营白重装。
+    if local_version is not None:
+        m = re.search(r"[0-9a-f]{12}", str(local_version).lower())
+        local_version = m.group(0) if m else str(local_version).strip()
+    header = _strip_frontmatter(skill_head())
+    if local_version is None:
+        out["protocol"] = text
+        out["skill_header"] = header
+        out["up_to_date"] = None
+        out["note"] = ("没带 local_version, 全文已返回, 照着执行。装了 skill 的话"
+                       "下次带上它 protocol_version 那一行的值, 一致就不用再传全文。")
+    elif str(local_version).strip() == digest:
+        out["up_to_date"] = True
+        out["note"] = "本地 skill 就是最新版, 照它执行。"
+    else:
+        out["protocol"] = text
+        out["skill_header"] = header
+        out["up_to_date"] = False
+        out["warning"] = (
+            f"本地 skill 是旧版({str(local_version).strip()[:12]}), 服务端是 "
+            f"{digest}。**照本返回值里的正文执行**, 并告诉用户一句: 写作台 skill "
+            "有更新, 在 WorkBuddy 里把 TangVarie/autowriter → "
+            "skills/bywood-writing-desk 重新导入一遍。")
+    return out
+
+
+def render_skill(current_skill: str, body: str, version: str) -> str:
+    """把 protocol.md 全文接到技能文件的引线头下面。
+
+    标记行以上是手写的引线头(原样保留), 以下整段替换成 ``body``。没有标记行就
+    拒绝 —— 那说明有人把 SKILL.md 改回了手工维护的一整份, 生成会把他的改动盖掉。
+    """
+    head, sep, _ = current_skill.partition("<!-- protocol_version:")
+    if not sep:
+        raise RuntimeError(
+            f"{SKILL_PATH} 里没有 protocol_version 标记行 —— 不知道从哪儿开始替换。")
+    # 标记行之外再写一行**可见的**版本号: 有的 skill 加载器会把 HTML 注释剥掉,
+    # 模型就找不到该传给 get_protocol 的值了。机器认注释, 人和模型认下面这行。
+    # ⚠️ version 必须是按【这个 head + 这个 body】算出来的(见 protocol_text);
+    #    调用方(cli sync-skill)先把 head 写好再算, 否则标记里的号和内容对不上。
+    return (head.rstrip("\n") + "\n\n"
+            + SKILL_VERSION_MARK.format(version=version) + "\n"
+            + f"protocol_version: {version}\n\n" + body + "\n")
+
+
+def skill_sync_state() -> dict:
+    """技能文件里那份协议与 protocol.md 是不是同一份。给 sync-skill --check 和测试用。"""
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    body, digest = protocol_text()
+    m = _SKILL_MARK_RE.search(skill)
+    embedded_version = m.group(1) if m else None
+    embedded_body = skill[m.end():].strip() if m else ""
+    # 标记后面那行可见的 "protocol_version: xxx" 不算正文
+    if embedded_body.startswith("protocol_version:"):
+        embedded_body = embedded_body.split("\n", 1)[1].strip() if "\n" in embedded_body else ""
+    return {
+        "in_sync": embedded_version == digest and embedded_body == body,
+        "skill_version": embedded_version,
+        "protocol_version": digest,
+        "body_matches": embedded_body == body,
+        "skill_path": str(SKILL_PATH),
+    }
 
 
 def _safe(fn, *args, **kwargs) -> Any:
@@ -288,6 +398,17 @@ def commit_drafts(project_id: str, drafts: list[dict],
     返回值里的 ``batch_id`` / ``version_ids`` 是这批稿子在库里的身份, 直接拿去
     喂 export_drafts。带 ``identity_warning`` 时说明身份没建成 —— 稿子入库了、
     查重不受影响, 但这批导不出可归因的 lineage。
+
+    ⚠️ **入库自带闸**: 入库前会先跑一遍和 check_drafts 同一套判定, 判 reject 的
+    不入库, 在 ``rejected`` 里带 ``gate="pre_commit"``(``gate="atomic_recheck"``
+    是写入时的竞态拦截)。所以跳过 check 直接 commit 塞不进重复的稿子, 只会让你
+    在这一步才知道哪几条要重写。``gate_summary`` 是那次判定的汇总(含
+    semantic_degraded / empty_history_warning), 该告诉用户的照 check_drafts 的
+    规矩说。
+
+    **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零
+    就是有几条没带 —— 那几个角度没销账, 下一批还会被抽到, 同一个故事会被讲
+    第二遍, 而那种重复查重闸抓不到。
     """
     # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、
     # 只带 error 字段的结果, 而写作台协议对 commit 没有强制重试 —— 于是定稿

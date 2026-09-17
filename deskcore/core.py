@@ -702,10 +702,26 @@ def check_drafts(client, project_id: str, drafts: list[dict],
 
     titles = [(d.get("title") or "").strip() for d in drafts]
     bodies = [d.get("body") or "" for d in drafts]
+    new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
+    return _gate(client, project_id, titles, bodies, new_vecs)
+
+
+def _gate(client, project_id: str, titles: list[str], bodies: list[str],
+          new_vecs) -> dict:
+    """check_drafts 的判定主体: 与历史比对 + 本批内互比 + 逐条 verdict。
+
+    从 check_drafts 里抽出来是为了让 **commit_drafts 也跑同一套**(2026-09-17)。
+    在此之前入库只靠 RPC 的两路确定性信号(开头精确 / 四字串), 标题语义
+    (TITLE_SIM_HARD)和本批内互比只在 check_drafts 里 —— 于是一个跳过 check
+    直接 commit 的模型能把同题重写的稿子整批灌进库: 途鸽 09-10 一天里四个标题
+    各入库两次, 两两 Jaccard 只有 0.33, RPC 全放行。闸不该依赖模型记得先调它。
+
+    不做归属校验、不算向量: 两个调用方各自做完再进来, 向量按 ``titles`` 逐位
+    对齐(某一位可以是 None —— 空标题算不出向量)。
+    """
     o_hashes = [fp.opening_hash(b) for b in bodies]
     grams = [set(fp.ngram_hashes(b)) for b in bodies]
 
-    new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
 
     # ── 与历史比对: 优先下推到库里(审计 SUP-002 / ROB-004 / ROB-011)──────
     # ``hist`` 是一个「按 i 取四路最佳命中」的可调用对象, 两条路径共用同一个
@@ -728,7 +744,7 @@ def check_drafts(client, project_id: str, drafts: list[dict],
 
     results = []
     contain_ran = False          # 有没有任何一篇真的跑过包含度这一路
-    for i in range(len(drafts)):
+    for i in range(len(titles)):
         h = hist(i)
         best_sim, sim_hit, best_j, j_hit, exact, open_hit = (
             h.sim, h.sim_title, h.jac, h.j_title, h.open_exact, h.open_title)
@@ -913,6 +929,17 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     embed_configured = dedup.embeddings_available()
     vecs = dedup.embed_texts(titles) if embed_configured else None
     embed_failed = embed_configured and not vecs
+    bodies = [d.get("body") or "" for d in drafts]
+
+    # ── 入库自带闸(2026-09-17)────────────────────────────────────────
+    # 先跑一遍和 check_drafts **同一套**判定, 判 reject 的不进 RPC。理由见
+    # _gate 的说明: 闸不该依赖模型记得先调 check_drafts。这里多一次历史比对
+    # (一次 RPC), 换来的是"跳过 check 直接 commit"这条路从此进不了重复的稿子。
+    # 出错照样上抛 —— 和 check_drafts 一样, 查重挂了不能当作通过。
+    gate = _gate(client, project_id, titles, bodies, vecs)
+    pre_rejected = {r["index"]: r for r in gate["results"]
+                    if r.get("status") == "reject"}
+    survivors = [i for i in range(len(drafts)) if i not in pre_rejected]
 
     # ── 先把 version_id 定下来 ──────────────────────────────────────────
     # 顺序是有讲究的: **先造 id 并写进指纹, 事后才建 versions 行**。
@@ -933,8 +960,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             minted_ids[i] = str(uuid.uuid4())
 
     rows = []
-    for i, d in enumerate(drafts):
-        body = d.get("body") or ""
+    for i in survivors:
+        d = drafts[i]
+        body = bodies[i]
         emb = vecs[i] if vecs and i < len(vecs) else None
         rows.append({
             "version_id": d.get("version_id") or minted_ids.get(i),
@@ -948,36 +976,67 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             "angle_key": d.get("angle_key"),
         })
 
-    outcome = store.commit_fingerprints_atomic(
-        client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD,
-        # 阈值只在 fingerprint.py 里定义一处 —— SQL 里的 DEFAULT 只是兜底,
-        # 真正生效的是这里传下去的值。两边写死两份就迟早对不上。(审计 COR-014)
-        contain_hard=fp.NGRAM_CONTAIN_HARD,
-        contain_min_sample=fp.CONTAIN_MIN_SAMPLE)
+    # 闸前就判死的那几条: 说清是哪一路信号、撞的是本批内还是历史。
+    rejected: list[dict] = [
+        {"index": i, "title": titles[i],
+         "collided_with": r.get("collided_with") or "",
+         "collided_scope": r.get("collided_scope") or "",
+         "decided_by": r.get("decided_by"),
+         "reason": r.get("reason") or "入库前判定与已有稿件重复",
+         "gate": "pre_commit"}
+        for i, r in sorted(pre_rejected.items())]
+    # ⚠️ RPC 回的 idx 是**幸存者列表里的下标**, 不是调用方列表的。下面凡是把
+    #    idx 翻回调用方视角的地方都要过 survivors[...]。
+    if survivors:
+        outcome = store.commit_fingerprints_atomic(
+            client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD,
+            # 阈值只在 fingerprint.py 里定义一处 —— SQL 里的 DEFAULT 只是兜底,
+            # 真正生效的是这里传下去的值。两边写死两份就迟早对不上。(审计 COR-014)
+            contain_hard=fp.NGRAM_CONTAIN_HARD,
+            contain_min_sample=fp.CONTAIN_MIN_SAMPLE)
+    else:
+        outcome = []          # 全被闸前拦下, 没东西可写, 也别去碰 RPC
 
     atomic = outcome is not None
-    rejected: list[dict] = []
+    rpc_anomalies = 0
     if atomic:
-        by_idx = {o["idx"]: o for o in outcome}
         written = sum(1 for o in outcome
                       if o.get("status") == COMMIT_STATUS_INSERTED)
+        # ⚠️ idx 越界的回执**不许抛**: 指纹这时已经写进去了, 抛出去调用方会重试,
+        #    重试会撞上自己刚写的指纹 —— 一次故障变成一句"你的稿子重复了"。
+        #    记日志、数出来、报给调用方, 但不中断。(code review 2026-09-17)
+        valid = []
+        for o in outcome:
+            idx = o.get("idx")
+            if isinstance(idx, int) and 0 <= idx < len(survivors):
+                valid.append(o)
+            else:
+                rpc_anomalies += 1
+                logger.error("commit_drafts: RPC 回执 idx=%r 越界(幸存者 %d 条, "
+                             "project=%s) —— 跳过这一行", idx, len(survivors), project_id)
+        outcome = valid
         for o in outcome:
             if o.get("status") == "rejected":
+                orig = survivors[o["idx"]]
                 rejected.append({
-                    "index": o["idx"],
-                    "title": titles[o["idx"]] if o["idx"] < len(titles) else "",
+                    "index": orig,
+                    "title": titles[orig],
                     "collided_with": o.get("collided_with") or "",
+                    "collided_scope": "历史",
                     "reason": o.get("detail") or "与库中已有稿件重复",
+                    "gate": "atomic_recheck",
                 })
+        rejected.sort(key=lambda r: r["index"])
     else:
         # RPC 不在: 降级直插, 并明确标出这次没有关掉竞态窗口。
         payload = []
-        for i, r in enumerate(rows):
+        for k, r in enumerate(rows):
+            orig = survivors[k]
             payload.append({
                 "project_id": project_id, "user_id": user_id,
                 "version_id": r["version_id"], "title": r["title"],
                 "opening": r["opening"],
-                "title_embedding": vecs[i] if vecs and i < len(vecs) else None,
+                "title_embedding": vecs[orig] if vecs and orig < len(vecs) else None,
                 "embedding_model": r["embedding_model"],
                 "opening_hash": r["opening_hash"],
                 "ngram_hashes": r["ngram_hashes"], "angle_key": r["angle_key"],
@@ -985,9 +1044,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         written = store.write_fingerprints(client, payload)
 
     # 只给真的入了库的坐标销账 —— 被拒的那条角度还没产出成稿, 不该占坑。
-    inserted_idx = ({o["idx"] for o in outcome
+    inserted_idx = ({survivors[o["idx"]] for o in outcome
                      if o.get("status") == COMMIT_STATUS_INSERTED}
-                    if atomic else set(range(len(drafts))))
+                    if atomic else set(survivors))
 
     # ── 给真的入了库的那几条建身份 ──────────────────────────────────────
     # 只建 inserted 的: 被判撞车的那几条没有交付, 不该在 items 里留一行。
@@ -1024,9 +1083,16 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         if store.consume_angle(client, project_id, key, vid):
             consumed += 1
 
+    # 入了库却没带 angle_key 的: 台账没法给它们销账, 同一个故事下一批还可能被
+    # 抽到 —— 而那种重复(同题重写)指纹闸抓不到。途鸽 09-10 的 66 条里 49 条是
+    # 这么进来的, 当天四个标题各入库两次。RPC 对空 angle_key 一声不吭地照收,
+    # 所以只能在这里数出来说给调用方听。
+    unattributed = sum(1 for i in inserted_idx if not drafts[i].get("angle_key"))
     out = {"written": written, "consumed_angles": consumed,
+           "unattributed": unattributed,
            "embedded": bool(vecs), "rejected": rejected,
            "atomic_recheck": atomic,
+           "gate_summary": gate["summary"],
            "embedding_model": dedup.EMBEDDING_MODEL if vecs else None,
            # 这次建出来的身份。导出要用 version_id, 所以直接回给调用方 ——
            # 不然它得再查一次才知道自己刚提交的稿子叫什么。
@@ -1068,10 +1134,31 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         out["angle_ledger_warning"] = (
             f"{attempted - consumed}/{attempted} 个坐标没能在台账上销账(多半是发牌时"
             "台账没写进去)。这些坐标下一批可能被重复抽到, 服务端日志有明细。")
+    if rpc_anomalies:
+        out["rpc_anomalies"] = rpc_anomalies
+        out["rpc_warning"] = (
+            f"入库 RPC 回了 {rpc_anomalies} 行对不上号的回执(idx 越界), 已跳过。"
+            "指纹可能已写入但这几条的身份/销账没做 —— 服务端日志有明细, 别重试, "
+            "重试会撞上自己刚写的指纹。")
+    if unattributed:
+        out["unattributed_warning"] = (
+            f"{unattributed}/{written} 条入库的稿子没带 angle_key, 台账无法给它们"
+            "销账 —— 这些角度下一批还会被抽到, 同一个故事会被讲第二遍, 而那种"
+            "重复查重闸抓不到。成批写的稿子每条都要带 draw_angles 分给它的 "
+            "angle_key。")
     if rejected:
-        out["note"] = (f"{len(rejected)} 条在入库时被判与库中已有稿件重复 —— "
-                       "多半是你 check 之后、commit 之前有人先提交了撞车的稿子。"
-                       "这几条没有入库, 要重写后重新走 check_drafts。")
+        pre = sum(1 for r in rejected if r.get("gate") == "pre_commit")
+        race = len(rejected) - pre
+        parts = []
+        if pre:
+            parts.append(f"{pre} 条在入库前的判定里就被拦下(和 check_drafts 同一套"
+                         "闸 —— 说明这几条没过 check, 或者 check 之后又改回去了)")
+        if race:
+            parts.append(f"{race} 条在写入时被拦下(你 check 之后、commit 之前有人"
+                         "先提交了撞车的稿子)")
+        out["note"] = ("; ".join(parts)
+                       + "。这几条没有入库, 要重写后重新走 check_drafts, "
+                         "不能当作已交付。")
     if not atomic:
         out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
                           "不存在, migrations/001 可能没跑)。并发 check/commit 时"
@@ -1952,6 +2039,150 @@ def migration_state(client) -> dict:
         "errors": errors,
         "unprobeable": sorted({c["migration"] for c in checks
                                if c["state"] == "unprobeable"}),
+    }
+
+
+def ingest_published(client, project_id: str, entries: list[dict], *,
+                     user_id: str, source: str, dry_run: bool = False) -> dict:
+    """把【已经发出去、但没走 commit_drafts】的稿子补进库: 身份 + 指纹, **不过闸**。
+
+    ── 为什么不过闸 ────────────────────────────────────────────────────
+    这些稿子已经发在小红书上了。它跟库里谁重复都改变不了这个事实, 拦它没有
+    任何意义 —— 拦了, 下一批照样撞上它。回填的逻辑(backfill_fingerprints)是
+    一样的: 已发生的历史原样入库。
+
+    ── 为什么要建身份 ──────────────────────────────────────────────────
+    只写指纹也能挡重复, 但 items/versions 行是导出 lineage 和 TV 归因的凭据;
+    这些稿子既然发出去了, 之后指标回流时 TV 会按 version_id 找它们。
+    出处记在 ``batches.params``({"source": "ingest", "file": 表名}), 让人以后
+    分得清这批是补进来的, 不是写作台当场写的。**不碰 items.external_source**:
+    那列是 TV 同步的标记('truth_vault'), TV 按它认自己的行, 借用会搅乱对接。
+
+    ── 幂等(code review 2026-09-17)────────────────────────────────────
+    重跑必须安全: 运营看到一条警告就会再跑一遍。所以入库前先按正文开头哈希
+    (``opening_hash``)查一遍指纹库, **已经有指纹的行跳过**; 同一张表里正文相同
+    的行也只收第一条。两种跳过都数出来报。
+
+    但"身份建了、指纹没写"那种半途失败**不是靠重跑修**: 重跑看不到它的指纹,
+    会再建一份身份。修法是 ``backfill --project`` —— 它按 version_id 幂等, 会把
+    有身份没指纹的行补上。返回里 ``fingerprinted < minted`` 时就该走那条路。
+
+    ``dry_run`` 只数不写(但会查已有指纹, 所以 dry-run 的数字就是真跑会写的数)。
+    """
+    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
+    cleaned = [{"title": (e.get("title") or "").strip(),
+                "body": (e.get("body") or "").strip()} for e in entries]
+    cleaned = [e for e in cleaned if e["title"] or e["body"]]
+    # 表内去重 + 库内去重, 都按【开头哈希 + 整篇四字串 sketch】—— 只按开头会把
+    # 同一个模板开头的不同稿子全判成重复(codex review; 见 store 里那段说明)。
+    # 没有正文(title-only)的行算不出任何一样, 只能照收 —— 它们本来也拦不住谁。
+    dup_in_sheet = already = 0
+    seen: set[tuple] = set()
+    keys = [(fp.opening_hash(e["body"]), tuple(sorted(fp.ngram_hashes(e["body"]))))
+            for e in cleaned]
+    known = store.existing_fingerprint_sketches(
+        client, project_id, [oh for oh, _ in keys if oh])
+    keep: list[dict] = []
+    for e, (oh, sk) in zip(cleaned, keys):
+        if oh and (oh, sk) in seen:
+            dup_in_sheet += 1
+            continue
+        if oh and sk in known.get(oh, ()):
+            already += 1
+            continue
+        if oh:
+            seen.add((oh, sk))
+        keep.append(e)
+    cleaned = keep
+    out = {"received": len(entries), "to_write": len(cleaned),
+           "skipped_already_fingerprinted": already,
+           "skipped_duplicate_in_sheet": dup_in_sheet,
+           "minted": 0, "fingerprinted": 0, "batch_id": None,
+           "identity_error": None, "fingerprint_error": None,
+           "embedded": False, "dry_run": dry_run}
+    if dry_run or not cleaned:
+        return out
+    to_mint = [{"version_id": str(uuid.uuid4()), "title": e["title"],
+                "body": e["body"], "keywords": []} for e in cleaned]
+    minted = store.mint_draft_identity(client, project_id, str(user_id), "",
+                                       to_mint,
+                                       batch_params={"source": "ingest",
+                                                     "file": source})
+    done = [m for m in to_mint if m["version_id"] in minted.get("versions", {})]
+    out.update(minted=len(done), batch_id=minted.get("batch_id"),
+               identity_error=minted.get("error"))
+    if not done:
+        return out
+    vecs = (dedup.embed_texts([m["title"] for m in done])
+            if dedup.embeddings_available() else None)
+    payload = []
+    for i, m in enumerate(done):
+        vec = vecs[i] if vecs and i < len(vecs) and vecs[i] else None
+        payload.append({
+            "project_id": project_id, "user_id": user_id,
+            "version_id": m["version_id"], "title": m["title"],
+            "opening": fp.opening_of(m["body"]),
+            "title_embedding": vec,
+            "embedding_model": dedup.EMBEDDING_MODEL if vec else None,
+            "opening_hash": fp.opening_hash(m["body"]),
+            "ngram_hashes": fp.ngram_hashes(m["body"]),
+            "angle_key": None,       # 补进来的稿子不是发牌产出的, 没有坐标
+        })
+    # ⚠️ 身份已经建好了。这一步再抛出去, 调用方(CLI)就到不了"跑 backfill"那句,
+    #    而一次自然的重跑看不到这几条的指纹, 会再建一份身份(codex review)。
+    #    所以吞掉、写进返回值, 让 CLI 把正确的补救路径说出来。
+    try:
+        out["fingerprinted"] = store.write_fingerprints(client, payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ingest: 身份建成 %d 条后写指纹失败 (project=%s)",
+                         len(done), project_id)
+        out["fingerprint_error"] = f"{type(exc).__name__}: {exc}"[:300]
+    out["embedded"] = bool(vecs)
+    return out
+
+
+# ── 「发了角度没入库」: 流程漏斗的泄漏 ──────────────────────────────────
+# 09-11 起 78% 的角度发出去了、稿子没入库, 这个数字在库里躺了一周没人看 ——
+# 服务本身一直是 ok 的, 而它是使用层的故障。所以 doctor 和 /health 都报它。
+LEAK_WINDOW_DAYS = 7
+LEAK_MIN_DRAWN = 20        # 样本太小不报警: 一个人试写 5 条没入库不是事故
+LEAK_ALERT_PCT = 50
+
+
+def pipeline_leak(client, days: int = LEAK_WINDOW_DAYS) -> dict:
+    """近 ``days`` 天: 发了多少角度、多少条真的入库销了账, 按项目分。
+
+    ``ok`` 为 False 的判据: 发了至少 LEAK_MIN_DRAWN 个角度, 且超过 LEAK_ALERT_PCT
+    没入库。健康的日子(09-10)是 18%; 塌了的日子(09-14/15)是 100% / 88%。
+    这不是服务健康 —— /health 的顶层 ok 不看它; 它说的是"流程在漏"。
+    """
+    per = store.angle_leak(client, days)
+    drawn = sum(p["drawn"] for p in per)
+    consumed = sum(p["consumed"] for p in per)
+
+    def _breach(d: int, c: int) -> bool:
+        return d >= LEAK_MIN_DRAWN and round(100 * (d - c) / d) > LEAK_ALERT_PCT
+
+    for p in per:
+        p["leak_pct"] = (round(100 * (p["drawn"] - p["consumed"]) / p["drawn"])
+                         if p["drawn"] else 0)
+        p["ok"] = not _breach(p["drawn"], p["consumed"])
+    pct = round(100 * (drawn - consumed) / drawn) if drawn else 0
+    # ⚠️ 逐项目也判, 不只看总量: 一个 30/30 全漏的项目会被另一个 100/100 全入库
+    #    的大项目摊成 23%、判成健康 —— 而那个小项目的指纹一条都没进(codex review)。
+    over = [p for p in per if not p["ok"]]
+    ok = not _breach(drawn, consumed) and not over
+    return {
+        "window_days": days, "drawn": drawn, "consumed": consumed,
+        "leak_pct": pct, "ok": ok,
+        "projects_over_threshold": len(over),
+        "projects": per,
+        "note": ("发出去的角度里没走到 commit_drafts 的比例。没入库的稿子没有"
+                 "指纹, 下一批查重看不见它们。健康时约 20%, 超过 "
+                 f"{LEAK_ALERT_PCT}% 就该去看是谁的会话在半路停的"
+                 + ("" if ok else
+                    f" —— 现在就超了({len(over)} 个项目单独超线)" if over
+                    else " —— 现在就超了")),
     }
 
 

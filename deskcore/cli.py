@@ -12,6 +12,11 @@
   python -m deskcore.cli recompute-fingerprints --project <uuid>
                                                     ← 只在改了 normalize 之后跑
   python -m deskcore.cli reembed-rules --user <uuid> ← 给规则补向量(见 main() 里那段)
+  python -m deskcore.cli sync-skill [--check]      ← 改了 protocol.md 之后跑: 把正文
+                                                    接进 skills/…/SKILL.md(不连库)
+  python -m deskcore.cli ingest --project <uuid> --user <uuid> --xlsx 表.xlsx [--dry-run]
+                                                    ← 把已发出去、没走 commit 的稿子
+                                                      从飞书表补进指纹库(不过闸)
 
 ⚠️ ``--user`` 从可选变成必填(审计 COR-015): 归属校验在 core 层, CLI 与 MCP 走
 同一个函数, 不带身份的调用现在一律被拒。传的是 ``projects.owner_id`` 里【已有的】
@@ -28,6 +33,25 @@ import sys
 
 def _print(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
+
+
+def _sync_skill(*, check: bool) -> int:
+    """把 protocol.md 全文接进技能文件; ``check`` 只比对不写。不连库。"""
+    from . import tools as T
+    state = T.skill_sync_state()
+    if check:
+        mark = "一致" if state["in_sync"] else "不一致"
+        print(f"skill 里的协议 {state['skill_version']} / protocol.md {state['protocol_version']}"
+              f" → {mark}")
+        if not state["in_sync"]:
+            print("  → 跑 `python -m deskcore.cli sync-skill` 重新生成, 然后一起提交。")
+        return 0 if state["in_sync"] else 1
+    body, digest = T.protocol_text()
+    current = T.SKILL_PATH.read_text(encoding="utf-8")
+    T.SKILL_PATH.write_text(T.render_skill(current, body, digest), encoding="utf-8")
+    print(f"已写入 {T.SKILL_PATH} (protocol_version {digest}, {len(body)} 字符)。"
+          "记得让运营重新导入一次 skill。")
+    return 0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -198,6 +222,63 @@ _STATE_MARK = {
 }
 
 
+def _print_leak(core, sb) -> None:
+    """近 7 天「发了角度没入库」。09-11 起这个数字在库里躺了一周没人看。"""
+    try:
+        leak = core.pipeline_leak(sb)
+    except Exception as exc:  # noqa: BLE001 — doctor 的其它段不该被它拖死
+        print(f"\n流程漏斗: 探不到({type(exc).__name__}: {exc})")
+        return
+    print(f"\n流程漏斗(近 {leak['window_days']} 天): 发角度 {leak['drawn']} / "
+          f"入库销账 {leak['consumed']} / 没入库 {leak['leak_pct']}%")
+    for prj in leak["projects"]:
+        label = prj.get("name") or prj["project_id"][:8]
+        print(f"  {label:22s} 发 {prj['drawn']:4d}  入库 {prj['consumed']:4d}  "
+              f"没入库 {prj['leak_pct']:3d}%")
+    if not leak["ok"]:
+        print(f"\n  ⚠️ {leak['note']}")
+        print("     没入库的稿子没有指纹, 下一批查重看不见它们。已经发出去的用"
+              " `ingest --xlsx` 补; 正在发生的去看那个会话为什么在 commit 前停了。")
+
+
+def _ingest(core, sb, args) -> int:
+    from pathlib import Path as _P
+    from . import ingest as I
+    parsed = I.read_published_xlsx(args.xlsx, sheet=args.sheet,
+                                   title_col=args.title_col, body_col=args.body_col)
+    print(f"表 {args.xlsx}: 形状={parsed['shape']}, 解析到 {len(parsed['rows'])} 条, "
+          f"带 version_id(真走过 commit)跳过 {parsed['skipped_with_lineage']} 条, "
+          f"空行 {parsed['skipped_empty']} 条")
+    for r in parsed["rows"][:5]:
+        print(f"  第 {r.row} 行  {r.title[:24]!r}  正文 {len(r.body)} 字")
+    if len(parsed["rows"]) > 5:
+        print(f"  … 还有 {len(parsed['rows']) - 5} 条")
+    source = args.source or _P(args.xlsx).name
+    out = core.ingest_published(
+        sb, args.project, [{"title": r.title, "body": r.body} for r in parsed["rows"]],
+        user_id=args.user, source=source, dry_run=args.dry_run)
+    skipped = (f"指纹库里已有 {out['skipped_already_fingerprinted']} 条、"
+               f"表内重复 {out['skipped_duplicate_in_sheet']} 条(都跳过)")
+    if args.dry_run:
+        print(f"\n--dry-run: 会写 {out['to_write']} 条; {skipped}。没动库。")
+        return 0
+    print(f"\n{skipped}; 建身份 {out['minted']}/{out['to_write']}, 写指纹 "
+          f"{out['fingerprinted']}, batch_id={out['batch_id']}, 带标题向量={out['embedded']}")
+    rc = 0
+    if out["identity_error"]:
+        print(f"  ⚠️ 身份没建全: {out['identity_error']}。没建成的行**重跑本命令**会"
+              "补上(已有指纹的行会被跳过, 不会翻倍)。")
+        rc = 1
+    if out.get("fingerprint_error") or out["fingerprinted"] < out["minted"]:
+        why = f"({out['fingerprint_error']})" if out.get("fingerprint_error") else ""
+        print(f"  ⚠️ 有 {out['minted'] - out['fingerprinted']} 条建了身份没写上指纹{why} —— "
+              "**不要重跑本命令**(重跑看不到它们的指纹, 会再建一份身份); 跑 "
+              f"`python -m deskcore.cli backfill --project {args.project}`, 它按 "
+              "version_id 幂等, 会把有身份没指纹的行补上。")
+        rc = 1
+    return rc
+
+
 def _doctor(core, sb, project_id: str | None) -> int:
     """把 ``core.migration_state`` 的结果排版出来, 并给出下一步。
 
@@ -257,6 +338,7 @@ def _doctor(core, sb, project_id: str | None) -> int:
     elif not state.get("errors"):
         print("\n迁移: 全部到位。")
 
+    _print_leak(core, sb)
     if project_id:
         gap = core.backfill_gap(sb, project_id)
         print(f"\n指纹回填缺口({project_id}):")
@@ -284,6 +366,14 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("selftest", help="不连库验查重/发牌/词表")
     sub.add_parser("health", help="回显配置与依赖可用性")
+
+    # 协议正文的主副本在技能文件里(进系统提示, 整场对话都在模型眼前), 源文件是
+    # deskcore/protocol.md。改了源文件就跑这个把正文接进 SKILL.md; --check 只比
+    # 不写, 给 CI 用。为什么不让 get_protocol 每次下发正文: 见 tools.get_protocol。
+    p = sub.add_parser("sync-skill",
+                       help="把 protocol.md 接进 skills/…/SKILL.md(不连库)")
+    p.add_argument("--check", action="store_true",
+                   help="只检查两边是否一致, 不一致退出码 1, 不写文件")
 
     # doctor 也是运维命令(同 backfill/reembed), 所以没有 --user。它只读,
     # 且不碰任何具体项目的内容 —— 传 --project 时只数条数, 不看正文。
@@ -355,9 +445,27 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--file", required=True,
                    help='JSON 文件: [{"title": "...", "body": "..."}, ...]')
 
+    # 09-11 起 78% 的稿子没走 commit_drafts, 已经发出去了但指纹库不知道它们 ——
+    # 下一批查重看不见, 于是同样的句子被再写一遍。这个命令把它们从飞书表读回来
+    # 补进库, **不过闸**(已发生的事实, 拦它没有意义)。认两种表: export_drafts
+    # 导出的形状(「内容」+ lineage 列, 带 version_id 的行跳过), 或「标题」「正文」
+    # 两列。见 deskcore/ingest.py。
+    p = sub.add_parser("ingest", help="把已发未入库的稿子从飞书表补进指纹库(不过闸)")
+    p.add_argument("--project", required=True)
+    p.add_argument("--user", required=True, help="这批稿子的作者(项目 owner)")
+    p.add_argument("--xlsx", required=True)
+    p.add_argument("--sheet", default=None)
+    p.add_argument("--title-col", default=None)
+    p.add_argument("--body-col", default=None)
+    p.add_argument("--source", default=None,
+                   help="记到 batches.params.file 的出处标签, 默认用文件名")
+    p.add_argument("--dry-run", action="store_true", help="只解析、只数, 不写库")
+
     args = ap.parse_args(argv)
     if args.cmd == "selftest":
         return selftest()
+    if args.cmd == "sync-skill":
+        return _sync_skill(check=args.check)
 
     # 以下要连库, 到这一步才 import(让 selftest 不需要任何第三方依赖)
     import db as db_mod
@@ -374,6 +482,8 @@ def main(argv: list[str] | None = None) -> int:
     sb = core.sb()
     if args.cmd == "doctor":
         return _doctor(core, sb, args.project)
+    if args.cmd == "ingest":
+        return _ingest(core, sb, args)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user))
     elif args.cmd == "open":
