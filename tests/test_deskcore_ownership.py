@@ -155,6 +155,9 @@ def test_every_project_scoped_entrypoint_calls_the_gate():
 UNGATED_WITH_REASON = {
     "assert_project_access": "它【就是】那道闸",
     "_history_probe":        "私有辅助函数, 由已过闸的调用方传入 project_id",
+    "_gate":                 "私有辅助函数(check_drafts 的判定主体), 只被已过闸的 "
+                             "check_drafts / commit_drafts 调用 —— 抽出来正是为了让"
+                             "入库也跑同一套闸(2026-09-17)",
     "_rpc_missing_telemetry": "只打一行遥测, 不读写业务数据",
     "build_distillation_task": "私有辅助函数, 由已过闸的 record_edit / my_style 调用",
     # 运维命令: 跑它们的人手里握着 service_role key(等价于直连库), 加校验挡不住

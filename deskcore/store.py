@@ -531,6 +531,39 @@ def item_owner(sb, item_id: str) -> str | None:
 
 # ── 发牌台账 ──────────────────────────────────────────────────────────────
 
+def angle_leak(sb, days: int) -> list[dict]:
+    """近 ``days`` 天每个项目发了多少角度、多少个销了账(= 稿子真入库了)。
+
+    给 core.pipeline_leak 用。翻页读, 不 .limit —— PostgREST 的 max-rows 默认
+    1000 超过就静默截断, 而一周的台账在忙的时候能过千。
+    """
+    since = iso_ago(days)
+    per: dict[str, dict] = {}
+    start = 0
+    while True:
+        page = (sb.table("angle_ledger")
+                  .select("project_id, consumed_version_id")
+                  .gte("drawn_at", since)
+                  .order("drawn_at", desc=True).order("id", desc=True)
+                  .range(start, start + PAGE - 1).execute()).data or []
+        for r in page:
+            d = per.setdefault(r["project_id"], {"project_id": r["project_id"],
+                                                 "name": "", "drawn": 0, "consumed": 0})
+            d["drawn"] += 1
+            if r.get("consumed_version_id"):
+                d["consumed"] += 1
+        if len(page) < PAGE:
+            break
+        start += PAGE
+    if per:
+        names = (sb.table("projects").select("id, name")
+                   .in_("id", list(per)).execute()).data or []
+        for n in names:
+            if n.get("id") in per:
+                per[n["id"]]["name"] = n.get("name") or ""
+    return sorted(per.values(), key=lambda d: d["drawn"] - d["consumed"], reverse=True)
+
+
 def recent_angle_keys(sb, project_id: str, avoid_days: int) -> set[str]:
     """近期用过的角度组合。
 
@@ -1140,7 +1173,8 @@ DESKCORE_ITEM_STATUS = "pending"
 
 
 def mint_draft_identity(sb, project_id: str, user_id: str, tactic: str,
-                        entries: list[dict]) -> dict:
+                        entries: list[dict], *,
+                        batch_params: dict | None = None) -> dict:
     """给写作台的定稿建 batch → items → versions, 让它们在库里**有身份**。
 
     ── 为什么非有不可 ──────────────────────────────────────────────────
@@ -1181,7 +1215,11 @@ def mint_draft_identity(sb, project_id: str, user_id: str, tactic: str,
     try:
         batch = db.create_batch(
             sb, user_id=user_id, project_id=project_id, tactic=tactic or "",
-            params={"source": "deskcore"},
+            # 出处记在 batch 上。**不碰 items.external_source** —— 那列的语义是
+            # "从 TV 同步进来的 item"(migrations/000 §items, 值恒为 'truth_vault',
+            # 还挂着 items_external_source_per_user_uniq), TV 那边按它认自己的行。
+            # 补进来的稿子(core.ingest_published)用 {"source": "ingest", "file": …}。
+            params=batch_params or {"source": "deskcore"},
             ai_engines=[DESKCORE_AI_ENGINE])
         batch_id = batch["id"]
         _mint_entries(sb, batch_id, user_id, entries, minted)

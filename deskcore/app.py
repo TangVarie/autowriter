@@ -379,6 +379,17 @@ async def _collect_health() -> dict:
     # 被改过, 回显的 note 和参与 ok 的判断会对不上。
     auth_ok, auth_note = identity.auth_health()
 
+    # 「发了角度没入库」—— 使用层的漏斗, 不是服务健康。09-11 起 78% 的稿子没走
+    # commit, 而 /health 一直 ok: 服务确实没坏, 坏的是流程。所以这块**不进顶层
+    # ok**(否则 Railway 会因为运营的用法重启容器), 但一定要在这里看得见。
+    from . import core as _core
+
+    def _leak_probe() -> dict:
+        return _core.pipeline_leak(_health_probe_client())
+    pipeline = await _probe(_leak_probe, {
+        "ok": None, "window_days": _core.LEAK_WINDOW_DAYS,
+        "note": f"探不到(超时 >{_HEALTH_PROBE_TIMEOUT:g}s 或出错), 见日志"})
+
     return {
         "ok": db_ok and vocab_ok and auth_ok,
         "service": SERVICE,
@@ -412,6 +423,7 @@ async def _collect_health() -> dict:
             # 注意 ``/health`` 本身仍返 200(见该端点的说明); 要一个**状态码**能
             # 反映 ok 的, 用 ``/ready`` —— 它不 ready 时返 503。
             "auth": {"ok": auth_ok, "note": auth_note},
+            "pipeline": pipeline,
             "anonymous_allowed": identity.anonymous_allowed(),
             # 这两条口径配错时的表现都是【客户端侧的传输层错误】, 服务端不留
             # 任何痕迹: origin 不在名单 → 浏览器报 fetch failed; host 不在名单
