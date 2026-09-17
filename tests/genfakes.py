@@ -194,8 +194,14 @@ def _fake_librarian(rec: Recorder):
             return {}
 
         @staticmethod
-        def fetch_flywheel_lessons(brief):
+        def fetch_flywheel_lessons(brief, *, status=None):
+            # ``status`` 是出参: 真实实现会把这次借阅的结局填进去(五种之一,
+            # 见 librarian_client.BORROW_*)。假件也要填 —— 不填的话调用方读到
+            # 的永远是 None, "空列表有五种来路"这件事在测试里就看不出来了。
             rec.log("lib.fetch_flywheel_lessons")
+            if status is not None:
+                status.update({"state": "empty", "count": 0,
+                               "elapsed_ms": 0, "detail": ""})
             return []
 
     return _Lib()

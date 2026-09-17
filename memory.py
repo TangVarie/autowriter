@@ -311,25 +311,46 @@ def render_flywheel_block(flywheel_lessons: Optional[list[dict]]) -> str:
     字段口径(R-032 回执 §8.3): structure + transferable_tactic 是经验卡
     核心, 一并注入; tier(轻量信号)/ source_note_id(内部 id 噪音)不注入;
     excerpt 截 200 字。
+
+    ⚠️ **``synthetic`` 必须渲染出来**(2026-09-16 评测 AW-02)。馆员会给指标
+    未经验证(疑似刷量)的卡打上这个标, 而这里原来一个字都不读 —— 同一张卡在
+    ``synthetic=true/false`` 下生成的提示词**完全相同**, 模型没有任何办法
+    分辨它借鉴的"爆款"到底爆没爆过。而开头那句还无条件写着"现实中真爆过",
+    等于替未验证的数据背了书。
+
+    deskcore 那条路一直是对的(原样回卡字段 + 协议里解释了 synthetic), 所以这
+    不是"所有入口都丢标记", 是**常规生成这一个入口**与另一个入口口径不一致。
     """
     if not flywheel_lessons:
         return ""
     fw_blocks: list[str] = []
+    any_unverified = False
     for L in flywheel_lessons[:5]:
         if not isinstance(L, dict):
             continue
+        # 只有**显式为真**才算未验证。字段缺失 = 馆员没表态, 不替它下结论。
+        unverified = bool(L.get("synthetic"))
+        any_unverified = any_unverified or unverified
+        mark = "（⚠️ 指标未经验证，只看内容、别把它的数据当依据）" if unverified else ""
         fw_blocks.append(
             f"· 钩子：{L.get('hook_type') or '?'}｜结构：{L.get('structure') or '?'}"
-            f"｜为何有效：{L.get('why_it_worked') or ''}\n"
+            f"{mark}\n"
+            f"  为何有效：{L.get('why_it_worked') or ''}\n"
             f"  可迁移手法：{L.get('transferable_tactic') or ''}\n"
             f"  借这条的：{L.get('borrow_what') or ''}（相关性：{L.get('why_relevant') or ''}）\n"
             f"  原文片段：{(L.get('excerpt') or '')[:200]}"
         )
     if not fw_blocks:
         return ""
+    # 开头这句不再无条件断言"真爆过" —— 这一批里只要有一张未验证的卡, 那句话
+    # 就是假的, 而它恰恰是模型最容易采信的一句。
+    lead = ("下面是帆谷笔记的提炼经验。"
+            "**其中标了「指标未经验证」的，数据不可采信，只能凭内容判断是否借鉴。**"
+            if any_unverified else
+            "下面是现实中真爆过 / 运营确认值得参考的帆谷笔记的提炼经验。")
     return (
         "[真实爆款参照 · 系统按本次选题从帆谷飞轮库匹配]\n"
-        "下面是现实中真爆过 / 运营确认值得参考的帆谷笔记的提炼经验。"
+        + lead +
         "借鉴其钩子 / 结构 / 手法与角度，**严禁照抄原文的标题主干或具体句子**。\n"
         + "\n\n".join(fw_blocks)
     )

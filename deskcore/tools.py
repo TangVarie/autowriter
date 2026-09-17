@@ -1,9 +1,13 @@
 """deskcore/tools.py — MCP 工具面。
 
-十七个工具, 按写稿的三个阶段分组(外加一个 create_project 开项目, 三个
-规则台账相关的 my_rules / set_rule_state / reembed_my_rules, 和一个下发协议
-本身的 get_protocol)。设计原则是【一次调用拿全】—— 治员工反馈里
-那条「一个项目一般有 5 个提示词要重复操作 5 次, 我的工作台至少有几十个提示词」。
+按写稿的流程分组: 取协议 → 开项目 → 写稿前 → 写稿后 → 人审 → 交付 → 收反馈,
+外加三个规则台账工具(my_rules / set_rule_state / reembed_my_rules)。
+设计原则是【一次调用拿全】—— 治员工反馈里那条「一个项目一般有 5 个提示词
+要重复操作 5 次, 我的工作台至少有几十个提示词」。
+
+⚠️ **个数不写在这里** —— 它变过好几次(文档里至今留着 12/13/15/16 三四个版本的
+残影), 而每次加工具都得回来改一个数字的注释, 迟早漏。要准确数字就读下面的
+``TOOLS``, 或者打一下 ``/health``。
 
 每个工具的 docstring 就是模型看到的说明, 所以写给模型看; 维护者要看的原因
 写在 core.py 的注释里。
@@ -291,6 +295,45 @@ def commit_drafts(project_id: str, drafts: list[dict],
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id)
 
 
+def review_drafts(project_id: str, decisions: list[dict],
+                  _user_id: str | None = None) -> dict:
+    """人审: 给已定稿的稿子记一条【真实的人工审核决定】——通过, 或者打回。
+
+    什么时候调: **用户自己看过稿子并给了结论之后**。他说"这批可以发""第 3 条
+    重写""都过了"就是结论; 他只是让你写稿、定稿、导出, 那不是结论。
+
+    ⚠️ **不许替用户下结论。** 这个动作会在库里落一条"某人审过了"的记录, 并被
+    下游当成人工反馈去校准评估模型。用户没表态就自己点通过, 灌进去的是伪造的
+    正例, 比不记更糟。拿不准就问一句"这批是都通过, 还是有要打回的"。
+
+    ``decisions`` 传 [{"version_id": "...", "decision": "approved"}, ...]
+    —— version_id 用 ``commit_drafts`` 返回的那些。
+    ``decision`` 只认两个值:
+      · ``approved``       —— 通过
+      · ``needs_revision`` —— 打回重写
+
+    **打回和通过一样重要。** 一个只记通过的审核历史等于没有反馈信号, 用户说
+    哪条不行就照实记 needs_revision, 不要只挑好的记。
+
+    审稿人恒为调用者本人, 不能替别人审 —— 所以签名里没有 reviewer 参数。
+
+    返回每条的 ``outcome``:
+      · ``recorded``   —— 记下了。``previous_status`` 会告诉你它之前是什么状态,
+                          ``previously_decided_by`` 非空说明**之前已经有人审过**,
+                          这次是改判 —— 值得跟用户说一声
+      · ``not_found``  —— 这个 version_id 不在本项目里, 八成是 id 传错了
+      · ``invalid``    —— decision 不是那两个值之一
+      · ``failed``     —— 写库失败, detail 里是原因
+
+    ``reviewed`` 小于你传的条数就说明**有几条没记上**, 要如实告诉用户是哪几条,
+    不要把它当成全都记好了。
+    """
+    # 故意不包 _safe: 这是【写】操作, 而且写的是一条会流到下游评估模型里的
+    # 人工决策。写失败若报成功, 用户以为审过了, 而库里那条稿子永远停在 pending。
+    return core.review_drafts(core.sb(), project_id, decisions,
+                              user_id=_user_id)
+
+
 def export_drafts(project_id: str, batch_id: str | None = None,
                   version_ids: list[str] | None = None,
                   _user_id: str | None = None) -> dict:
@@ -547,6 +590,7 @@ TOOLS = {
     "borrow_lessons": (borrow_lessons, True),
     "check_drafts":   (check_drafts,   True),
     "commit_drafts":  (commit_drafts,  True),
+    "review_drafts":  (review_drafts,  True),
     "export_drafts":  (export_drafts,  True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),

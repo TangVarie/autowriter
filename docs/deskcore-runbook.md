@@ -702,12 +702,29 @@ items.example_label（只有 label_example 这一个，走 db.set_item_example_l
 > 不进 `autowriter.items`"已经不成立了。但它建的是 `status='pending'`、决策三列
 > 全空，**刻意不标 approved**——标了就等于让每条定稿变成一条伪造的人工评价去
 > 校准 TV 的评估模型（而写作台没有"打回"这个动作，灌进去的会是清一色正例）。
->
-> 也就是说：**下面这三条路的选择题仍然没解，只是选项 A 做了一半。**
 
-所以 Streamlit 一停，新写的稿子虽然进了 `autowriter.items`，却永远停在 pending，
-不会产生 approved/needs_revision —— `prepublish_evaluations` 从此不再有新行，
-**而 TV 那边不会报错**（查不到就是 0 条，跟"这几天没人审稿"长得一模一样）。
+> ✅ **2026-09-16 起这条不再成立：`review_drafts` 补上了那个动作。**
+> （2026-09-16 评测 AW-01。）
+>
+> 缺的从来不是"把 pending 改成 approved"，是**一个真的有人点过的动作**。
+> 现在有了：用户看过稿子给了结论之后，调 `review_drafts` 把结论落库，
+> `decision_source='human'`、`reviewer_id` 是真的点了这一下的那个人、
+> `decided_at` 是真实时间。
+>
+> 三条纪律写进了工具本身，别在下一次迭代里松掉：
+>
+> 1. **审稿人恒为调用者**，签名里没有 reviewer 参数（COR-004 治的正是"把
+>    owner 当 reviewer"，留个口子等于把它请回来）；
+> 2. **只认 `approved` / `needs_revision`**——`pending` 也在拒绝之列，
+>    迭代后重置回待审是 `SYSTEM`，从人审入口进来就是伪造；
+> 3. **打回和通过同等公民**——只能点通过的入口产出的仍然是清一色正例，与不做无异。
+>
+> `commit_drafts` 那边**一个字没改**，仍然是 pending + 决策三列全空。
+> 定稿不是审核，这条不许因为有了审核入口就松掉（`tests/test_deskcore_review.py`
+> 最后一条断言专门守它）。
+
+所以这条路上剩下的是 **TV 侧要接**：它现在仍然把捞到的全部写成
+`evaluator_type='human'`、不读 `decision_source`。AW 这侧的字段已经齐了。
 
 顺带一个连带效应：停服之后 `items.updated_at` 唯一还会被刷的来源就是
 `label_example` 改正负例标注，于是 TV 打印的「创建后被动过」会**全部**是标注活动。

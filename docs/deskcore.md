@@ -166,6 +166,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `borrow_lessons` | 转调 TV 馆员，借真实爆款经验卡 |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
 | | `commit_drafts` | 定稿入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账 |
+| 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human` + 真实 reviewer + 时间。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
 | 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0 |
 | | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
@@ -334,6 +335,30 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 **运营侧前置**：飞书表要先按上表建好这六列，列名逐字相同。`export_drafts` 的返回值里直接带 `columns`，不必翻文档。
 
 **还没接的一段**：指标回流。TV 那边有了归因数据之后，"这个角度产出的稿子后来爆没爆"才能反过来喂 `draw_angles` 和正例池——`angle_ledger` 现在只记 `drawn_at` / `consumed_version_id`，不记结果。那是下一步，不在这次范围里。
+
+### 3.6 人审 —— 定稿之后那一步（2026-09-16）
+
+**缺的从来不是"把 pending 改成 approved"，是一个真的有人点过的动作。**
+
+`commit_drafts` 建的 item 是 `pending` 且不盖任何决策戳，这是对的：定稿不等于审核。标成 approved 会让每条定稿变成一条伪造的人工评价去校准 TV 的评估模型，而且灌进去的是**清一色正例**——COR-004 治的正是这件事，换个门重犯一次一样糟。
+
+但在此之前，写作台这条路**没有下一步**。只用它写稿、定稿、导出的团队永远产不出一条人工审核决定，于是 TV 按 `status ∈ (approved, needs_revision)` 捞行时一条也捞不到，**而且不报错**——查不到就是 0 条，跟"这几天没人审稿"长得一模一样。
+
+`review_drafts` 就是那个动作。三条纪律写进了工具本身：
+
+| 纪律 | 为什么 |
+|---|---|
+| 审稿人**恒为调用者**，签名里没有 reviewer 参数 | COR-004 治的正是"把 owner 当 reviewer"。留个口子等于把它请回来 |
+| **只认 `approved` / `needs_revision`** | `pending` 也在拒绝之列——迭代后重置回待审是 `SYSTEM`，既不是审稿也不是检测，从人审入口进来就是伪造 |
+| **打回和通过同等公民** | 只能点通过的入口产出的仍然是清一色正例，与不做无异 |
+
+⚠️ **不设 `best_version_id`。**「选为最佳」在 UI 里是独立于审稿的动作（走 `db.set_best_version`，不盖决策戳）——把两件事合起来会污染出处数据。写作台的 item 每条只有一个版本，代表版本自然落在它身上。
+
+⚠️ **用户没表态就不许调。** 这是给模型的纪律，写在协议里：他只说"写 20 条""入库""导出"，那都不是结论。替他点通过等于灌一条伪造的正例，比不记更糟。
+
+`commit_drafts` 那边一个字没改，`tests/test_deskcore_review.py` 最后一条断言专门守着"入库路径不许写 `decision_source` / `reviewer_id`"——最容易犯的下一个错就是"既然现在能记人审了，那让 commit 顺手记一条"。
+
+**剩下的在 TV 侧**：它现在仍然把捞到的全部写成 `evaluator_type='human'`、不读 `decision_source`。AW 这侧的字段已经齐了。
 
 ---
 

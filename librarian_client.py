@@ -33,6 +33,7 @@ worker daemon 线程里同步跑,同步 HTTP 即可。
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 import requests
@@ -82,15 +83,45 @@ def build_brief(
     return brief
 
 
-def fetch_flywheel_lessons(brief: dict) -> list[dict]:
+# 一次借阅的**结局**。四种失败长得一模一样(都是空列表), 但对运营的含义完全
+# 不同: "这次没匹配上"是正常的, "没配 key"是部署漏了, "超时"是 TV 那边慢了。
+# 混成一个空列表之后, "经验到底有没有被用上"这件事就再也统计不出来了
+# (2026-09-16 评测 AW-05)。
+BORROW_BORROWED = "borrowed"            # 借到了
+BORROW_EMPTY = "empty"                  # 通了, 但这次没有匹配的卡
+BORROW_NOT_CONFIGURED = "not_configured"  # 压根没接飞轮
+BORROW_TIMEOUT = "timeout"              # 超时
+BORROW_ERROR = "error"                  # 网络 / 4xx / 5xx / 解析失败
+
+
+def fetch_flywheel_lessons(brief: dict, *,
+                           status: dict | None = None) -> list[dict]:
     """向 TV 馆员借阅经验卡。
 
     任何异常 / 超时 / 未配 → 返回 ``[]``(绝不抛、绝不阻塞写稿)。返回 list 内
     元素形状见模块 docstring 的契约;非 list 响应也归一成 ``[]``,由下游
     ``memory.build_layered_system_prompt`` 再按 dict 逐条防御。
+
+    ⚠️ **空列表不等于"没匹配上"。** 传一个 dict 给 ``status``, 调用完它会被填成
+    ``{"state", "count", "elapsed_ms", "detail"}`` —— ``state`` 是上面那五个之一。
+    不传就只有 telemetry 记着(每种结局一个独立事件名), 调用方看不见区别。
+
+    返回类型刻意**没变**: 借阅是增强项, 让它的失败去改生成路径的函数签名不值当。
     """
+    st = status if status is not None else {}
+    st.update({"state": BORROW_ERROR, "count": 0,
+               "elapsed_ms": 0, "detail": ""})
+    pid = str(brief.get("project_id") or "")
+
     if not config.LIBRARIAN_URL or not config.LIBRARIAN_API_KEY:
-        return []                              # 没接飞轮, 静默跳过
+        st["state"] = BORROW_NOT_CONFIGURED
+        st["detail"] = "LIBRARIAN_URL / LIBRARIAN_API_KEY 未配置"
+        # ⚠️ 这条以前是**完全静默**的 return —— 于是"这个部署根本没接飞轮"和
+        # "接了但这次没匹配"在数据上分不开, 而前者是要人去补配置的。
+        telemetry.log_event("flywheel_librarian_not_configured", project_id=pid)
+        return []
+
+    started = time.monotonic()
     try:
         resp = requests.post(
             f"{config.LIBRARIAN_URL.rstrip('/')}/librarian",
@@ -100,13 +131,29 @@ def fetch_flywheel_lessons(brief: dict) -> list[dict]:
         )
         resp.raise_for_status()
         selected = resp.json().get("selected")
-        return selected if isinstance(selected, list) else []
+        lessons = selected if isinstance(selected, list) else []
     except Exception as exc:
         # 超时 / 网络 / 4xx / 5xx / 解析全吞 —— 飞轮是增强项不是前置依赖,
         # 失败就当没有, 用 owner 自有正例照常写。mask_secrets 防 URL/key 入日志。
+        timed_out = isinstance(exc, requests.Timeout)
+        st["state"] = BORROW_TIMEOUT if timed_out else BORROW_ERROR
+        st["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        st["detail"] = mask_secrets(str(exc))[:300]
         telemetry.log_event(
             "flywheel_librarian_unavailable",
-            project_id=str(brief.get("project_id") or ""),
-            error=mask_secrets(str(exc))[:300],
+            project_id=pid,
+            state=st["state"],
+            elapsed_ms=st["elapsed_ms"],
+            error=st["detail"],
         )
         return []
+
+    st["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+    st["count"] = len(lessons)
+    st["state"] = BORROW_BORROWED if lessons else BORROW_EMPTY
+    telemetry.log_event(
+        "flywheel_librarian_result",
+        project_id=pid, state=st["state"],
+        count=st["count"], elapsed_ms=st["elapsed_ms"],
+    )
+    return lessons
