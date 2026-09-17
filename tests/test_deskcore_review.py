@@ -32,7 +32,7 @@ BATCH = "bbbbbbbb-0000-0000-0000-000000000002"
 ITEM_A, VER_A = "cccc0000-0000-0000-0000-00000000000a", "dddd0000-0000-0000-0000-00000000000a"
 ITEM_B, VER_B = "cccc0000-0000-0000-0000-00000000000b", "dddd0000-0000-0000-0000-00000000000b"
 # 别的项目的稿子 —— 本项目的审核入口一行也不该碰得到它
-ITEM_X, VER_X = "cccc0000-0000-0000-0000-00000000000x", "dddd0000-0000-0000-0000-00000000000x"
+ITEM_X, VER_X = "cccc0000-0000-0000-0000-0000000000cc", "dddd0000-0000-0000-0000-0000000000dd"
 
 
 def _items() -> list[dict]:
@@ -139,6 +139,58 @@ def test_previous_decision_is_reported_back():
     assert r["previously_decided_by"] == db.DecisionSource.HUMAN
 
 
+@pytest.mark.parametrize("source", [
+    db.DecisionSource.AUTO_HARD_RULE,
+    db.DecisionSource.AUTO_DEDUP,
+    db.DecisionSource.SYSTEM,
+])
+def test_previously_decided_by_can_be_a_machine(source):
+    """⚠️ codex review P2: 这个字段是**上一个决定的来源**, 不是"有没有人审过"。
+
+    硬规则违规、查重重生耗尽、迭代后重置 —— 这三种都会留下非空的
+    `decision_source`, 而其中一个人都没看过稿子。把"非空"读成"有人审过"的后果
+    不在库里而在嘴上: 模型会照着跟用户讲"这条之前有人审过, 你这次是改判", 凭空
+    编出一个不存在的审稿人。
+    """
+    items = _items()
+    items[0].update({"status": "needs_revision", "decision_source": source})
+    c = _client(items)
+    out = core.review_drafts(c, PROJ, [
+        {"version_id": VER_A, "decision": "approved"}], user_id=ME)
+
+    r = out["results"][0]
+    assert r["outcome"] == "recorded"
+    assert r["previously_decided_by"] == source
+    assert r["previously_decided_by"] != db.DecisionSource.HUMAN, "非空 ≠ 人审过"
+
+
+def test_the_docs_spell_out_every_source_this_field_can_carry():
+    """⚠️ 这条钉的是**文档**, 因为这个字段唯一的读者是模型。
+
+    上一条证明了机器来源真的会出现在返回值里；模型要不要跟用户说"之前有人审
+    过", 全凭工具 docstring 和 `protocol.md` 那两段话。所以每加一种
+    `DecisionSource`, 这两处就必须跟着点名 —— 少点一种, 模型对那一种的解释就
+    只能靠猜。
+    """
+    import re
+    from pathlib import Path
+
+    from deskcore import tools
+
+    texts = {
+        "tools.review_drafts 的 docstring": tools.review_drafts.__doc__,
+        "protocol.md": Path(core.__file__).with_name(
+            "protocol.md").read_text(encoding="utf-8"),
+    }
+    for where, text in texts.items():
+        said = [p for p in re.split(r"\n\s*\n", text)
+                if "previously_decided_by" in p]
+        assert said, f"{where} 里根本没解释 previously_decided_by"
+        blob = "\n".join(said)
+        for src in sorted(db._DECISION_SOURCES):
+            assert src in blob, f"{where} 没说 {src} 这种来源是什么意思"
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 2 · 拒绝的那几种情况, 一行都不许碰
 # ══════════════════════════════════════════════════════════════════════
@@ -166,6 +218,48 @@ def test_other_projects_version_is_not_reachable():
     assert out["results"][0]["outcome"] == "not_found"
     assert _row(c, ITEM_X)["status"] == "pending", "别的项目的稿子一行都不许碰"
     assert _row(c, ITEM_X)["decision_source"] is None
+
+
+def test_malformed_version_id_does_not_take_the_whole_batch_down():
+    """⚠️ codex review P2, 在真 PG 16.13 上复现过。
+
+    `versions.id` 是 uuid 列, `.in_()` 里混进一个打错的值, PostgreSQL 在**解析**
+    阶段就拒掉整条查询(`invalid input syntax for type uuid`)——不是跳过那一个。
+    于是一条手抖打错的 id 会连累同一批里所有好的, 而这个函数的契约明写着部分
+    失败要逐条报。
+    """
+    c = _client()
+    out = core.review_drafts(c, PROJ, [
+        {"version_id": VER_A, "decision": "approved"},
+        {"version_id": "手抖打错的id", "decision": "approved"},
+        {"version_id": VER_B, "decision": "needs_revision"},
+    ], user_id=ME)
+
+    assert out["reviewed"] == 2, "好的那两条必须照常落库"
+    assert [r["outcome"] for r in out["results"]] == [
+        "recorded", "invalid", "recorded"]
+    assert "UUID" in out["results"][1]["detail"]
+    assert _row(c, ITEM_A)["status"] == "approved"
+    assert _row(c, ITEM_B)["status"] == "needs_revision"
+
+
+def test_same_item_twice_is_refused_not_silently_overwritten():
+    """⚠️ codex review P2。
+
+    同一条稿子在一批里被点两次(还是相反的结论)时, 静默让最后一次生效是最糟的
+    选择: 两条都会报 recorded, 而第二条的 previous_status 取自更新前的快照、
+    已经是错的 —— 覆盖就这么被藏起来了。拒绝才能让调用方发现自己点重了。
+    """
+    c = _client()
+    out = core.review_drafts(c, PROJ, [
+        {"version_id": VER_A, "decision": "approved"},
+        {"version_id": VER_A, "decision": "needs_revision"},
+    ], user_id=ME)
+
+    assert out["reviewed"] == 1
+    assert [r["outcome"] for r in out["results"]] == ["recorded", "duplicate"]
+    assert VER_A in out["results"][1]["detail"]
+    assert _row(c, ITEM_A)["status"] == "approved", "第一条生效, 第二条没生效"
 
 
 def test_someone_elses_project_is_refused():

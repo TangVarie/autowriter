@@ -219,6 +219,34 @@ def test_empty_result_is_not_an_error(monkeypatch):
     assert st["state"] == lib.BORROW_EMPTY, "通了但没匹配 ≠ 出错"
 
 
+@pytest.mark.parametrize("payload, hint", [
+    ({}, "selected"),                          # 键都没有
+    ({"selected": None}, "list"),               # 键在, 值是 null
+    ({"selected": {"a": 1}}, "dict"),           # 值是对象
+    ({"selected": "反差开场"}, "str"),           # 值是字符串(还能迭代, 更危险)
+    ({"error": "rate limited"}, "selected"),    # 馆员把错误塞在 200 里
+    ([CARD], "JSON 对象"),                       # 整个响应体不是对象
+])
+def test_a_200_with_the_wrong_shape_is_an_error_not_an_empty_result(
+        monkeypatch, payload, hint):
+    """⚠️ codex review P2: 200 但结构不对**不是** empty。
+
+    契约(``librarian_client`` 模块 docstring)写着空库也要回
+    ``{"selected": []}``, 所以拿不到那个 list 就是**故障**: 馆员换了契约、回了
+    错误页、中转站塞了别的东西。而 ``empty`` 恰恰是"不需要任何人管"的那一类
+    结局 —— 把故障归进去它就永远没人看了, 这正是 AW-05 要治的病, 归错了等于
+    把病换个地方重犯一次。
+    """
+    _configured(monkeypatch)
+    monkeypatch.setattr(lib.requests, "post", lambda *a, **k: _Resp(payload))
+    st: dict = {}
+    assert lib.fetch_flywheel_lessons({"project_id": "p"}, status=st) == [], \
+        "结构不对照样 fail-open —— 借阅是增强项, 不许抛给写稿路径"
+    assert st["state"] == lib.BORROW_ERROR
+    assert st["count"] == 0
+    assert hint in st["detail"], "detail 要说清是哪儿不对, 否则报了也没法查"
+
+
 def test_borrowed_reports_the_count(monkeypatch):
     _configured(monkeypatch)
     monkeypatch.setattr(lib.requests, "post",

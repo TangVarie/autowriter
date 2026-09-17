@@ -318,9 +318,16 @@ def review_drafts(project_id: str, decisions: list[dict],
     审稿人恒为调用者本人, 不能替别人审 —— 所以签名里没有 reviewer 参数。
 
     返回每条的 ``outcome``:
-      · ``recorded``   —— 记下了。``previous_status`` 会告诉你它之前是什么状态,
-                          ``previously_decided_by`` 非空说明**之前已经有人审过**,
-                          这次是改判 —— 值得跟用户说一声
+      · ``recorded``   —— 记下了。``previous_status`` 是它之前的状态,
+                          ``previously_decided_by`` 是**上一个决定是谁下的**,
+                          不是"有没有人审过":
+                            ``human``          之前真有人审过, 这次是改判, 值得
+                                               跟用户说一声
+                            ``auto_hard_rule`` 硬规则违规, 机器打回的
+                            ``auto_dedup``     查重重生耗尽, 机器打回的
+                            ``system``         系统置位(如迭代后重置)
+                          后三个都**不是**人审 —— 人这次接手是正常流程, 别把它们
+                          说成"之前已经有人审过"
       · ``not_found``  —— 这个 version_id 不在本项目里, 八成是 id 传错了
       · ``invalid``    —— decision 不是那两个值之一
       · ``failed``     —— 写库失败, detail 里是原因

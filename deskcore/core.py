@@ -1087,6 +1087,20 @@ HUMAN_DECISIONS = ("approved", "needs_revision")
 MAX_REVIEW_DRAFTS = 200
 
 
+def _is_uuid(value: str) -> bool:
+    """格式合法的 UUID 才敢送进 ``.in_()``。
+
+    ``versions.id`` 是 uuid 列。PostgreSQL 在**解析**阶段就会拒掉整条查询
+    (`invalid input syntax for type uuid`), 不是跳过那一个值 —— 所以一个打错的
+    id 会连累同一批里所有好的。
+    """
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 def review_drafts(client, project_id: str, decisions: list[dict],
                   user_id: str | None = None) -> dict:
     """给已定稿的稿子盖一枚**真实的人工审核决策**。
@@ -1115,9 +1129,15 @@ def review_drafts(client, project_id: str, decisions: list[dict],
     数据自己污染掉)。写作台的 item 每条只有一个版本, 代表版本自然落在它身上。
 
     返回 ``{"reviewed", "results"}``; 每条 result 带 ``outcome``:
-      · ``recorded``   —— 决策已落库
+      · ``recorded``   —— 决策已落库。附 ``previous_status`` 与
+                          ``previously_decided_by`` —— 后者是**上一个决定的来源**
+                          (``db.DecisionSource`` 的四个值), 只有 ``human`` 才代表
+                          之前真有人审过; 机器打回的(``auto_hard_rule`` /
+                          ``auto_dedup``)和系统置位(``system``)都不是
       · ``not_found``  —— 这个 version_id 不在本项目里(或根本不存在)
-      · ``invalid``    —— decision 不是那两个值之一
+      · ``invalid``    —— 入参不合法: decision 不是那两个值之一, 或 version_id
+                          不是合法 UUID(``detail`` 里说是哪一种)
+      · ``duplicate``  —— 同一条稿子在本批里已经被决定过, **这条没生效**
       · ``failed``     —— 写库失败, ``detail`` 里是原因
 
     **部分失败照样回报已经成功的那几条**, 理由同 ``store.mint_draft_identity``:
@@ -1132,11 +1152,20 @@ def review_drafts(client, project_id: str, decisions: list[dict],
             "分批调用 —— 单次太大时部分失败的定位成本会陡增。")
 
     wanted = [str(d.get("version_id") or "") for d in decisions]
+    # ⚠️ 只把**格式合法**的 id 送进 .in_()。``versions.id`` 是 uuid 列, 混进一个
+    # 手抖打错的值, PostgreSQL 会用
+    # `invalid input syntax for type uuid` 拒掉**整条查询** —— 于是同一批里
+    # 二十条好的也一起挂, 而这个函数的契约明写着部分失败要逐条报。
+    # (codex review P2; 在真 PG 16.13 上复现过)
     known = store.items_for_versions(
-        client, project_id, [v for v in wanted if v])
+        client, project_id, [v for v in wanted if _is_uuid(v)])
 
     results: list[dict] = []
     reviewed = 0
+    # item_id → 本批里**先**决定它的那个 version_id。同一条稿子被点两次时,
+    # 静默让最后一次生效是最糟的选择: 两条都报 recorded, 而第二条的
+    # previous_status 取自更新前的快照、已经是错的, 把覆盖藏了起来。
+    decided_items: dict[str, str] = {}
     for d in decisions:
         vid = str(d.get("version_id") or "")
         decision = str(d.get("decision") or "")
@@ -1146,10 +1175,23 @@ def review_drafts(client, project_id: str, decisions: list[dict],
             results.append({**row, "outcome": "invalid",
                             "detail": f"decision 只能是 {' / '.join(HUMAN_DECISIONS)}"})
             continue
+        if not _is_uuid(vid):
+            results.append({**row, "outcome": "invalid",
+                            "detail": "version_id 不是合法 UUID"})
+            continue
         hit = known.get(vid)
         if hit is None:
             results.append({**row, "outcome": "not_found",
                             "detail": "这个 version_id 不在本项目里"})
+            continue
+        prior = decided_items.get(hit["item_id"])
+        if prior is not None:
+            # 拒绝而不是"最后一条生效": 同一条稿子在一批里被点两次是调用方的
+            # 错, 悄悄取最后一条会让它永远发现不了。
+            results.append({**row, "outcome": "duplicate",
+                            "item_id": hit["item_id"],
+                            "detail": f"同一条稿子本批里已经被 {prior} 决定过了, "
+                                      f"这条没生效 —— 想改判就单独再调一次"})
             continue
 
         try:
@@ -1164,6 +1206,7 @@ def review_drafts(client, project_id: str, decisions: list[dict],
             continue
 
         reviewed += 1
+        decided_items[hit["item_id"]] = vid
         results.append({**row, "outcome": "recorded",
                         "item_id": hit["item_id"],
                         "previous_status": hit.get("status"),

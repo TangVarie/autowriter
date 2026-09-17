@@ -98,9 +98,11 @@ def fetch_flywheel_lessons(brief: dict, *,
                            status: dict | None = None) -> list[dict]:
     """向 TV 馆员借阅经验卡。
 
-    任何异常 / 超时 / 未配 → 返回 ``[]``(绝不抛、绝不阻塞写稿)。返回 list 内
-    元素形状见模块 docstring 的契约;非 list 响应也归一成 ``[]``,由下游
+    任何异常 / 超时 / 未配 / 响应结构不对 → 返回 ``[]``(绝不抛、绝不阻塞写稿)。
+    返回 list 内元素形状见模块 docstring 的契约,由下游
     ``memory.build_layered_system_prompt`` 再按 dict 逐条防御。
+    **拿不到 ``selected`` 这个 list 算 ``error`` 不算 ``empty``** —— 契约里空库也
+    要回 ``{"selected": []}``, 所以结构不对是故障。
 
     ⚠️ **空列表不等于"没匹配上"。** 传一个 dict 给 ``status``, 调用完它会被填成
     ``{"state", "count", "elapsed_ms", "detail"}`` —— ``state`` 是上面那五个之一。
@@ -130,8 +132,7 @@ def fetch_flywheel_lessons(brief: dict, *,
             timeout=config.LIBRARIAN_TIMEOUT_SEC,
         )
         resp.raise_for_status()
-        selected = resp.json().get("selected")
-        lessons = selected if isinstance(selected, list) else []
+        payload = resp.json()
     except Exception as exc:
         # 超时 / 网络 / 4xx / 5xx / 解析全吞 —— 飞轮是增强项不是前置依赖,
         # 失败就当没有, 用 owner 自有正例照常写。mask_secrets 防 URL/key 入日志。
@@ -149,6 +150,33 @@ def fetch_flywheel_lessons(brief: dict, *,
         return []
 
     st["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+
+    # ⚠️ 200 但结构不对**不是** empty。契约(模块 docstring)写着空库也要回
+    # {"selected": []}, 所以拿不到那个 list 就是故障: 馆员换了契约、回了错误页、
+    # 或者中转站塞了别的东西。而 empty 恰恰是"不需要任何人管"的那一类结局 ——
+    # 把故障归进去, 它就永远没人看了, 这正是 AW-05 要治的病
+    # (codex review P2)。
+    if not isinstance(payload, dict):
+        bad = f"响应体不是 JSON 对象, 是 {type(payload).__name__}"
+    elif "selected" not in payload:
+        bad = (f"响应体里没有 selected 键(实际键: {sorted(payload)[:6]})"
+               " —— 契约要求空库也回 []")
+    elif not isinstance(payload["selected"], list):
+        bad = f"selected 不是 list, 是 {type(payload['selected']).__name__}"
+    else:
+        bad = ""
+
+    if bad:
+        st["state"] = BORROW_ERROR
+        st["detail"] = mask_secrets(f"馆员回了 200 但{bad}")[:300]
+        telemetry.log_event(
+            "flywheel_librarian_bad_payload",
+            project_id=pid, state=st["state"],
+            elapsed_ms=st["elapsed_ms"], error=st["detail"],
+        )
+        return []
+
+    lessons = payload["selected"]
     st["count"] = len(lessons)
     st["state"] = BORROW_BORROWED if lessons else BORROW_EMPTY
     telemetry.log_event(
