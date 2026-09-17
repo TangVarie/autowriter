@@ -288,3 +288,26 @@ def test_cli_orders_recovery_when_both_ingest_stages_fail(fake, capsys, monkeypa
     assert "两种半途失败同时发生" in out
     assert out.index("**先**跑 `backfill") < out.index("**然后**再跑一次 tv-sync")
     assert "重跑 tv-sync 即可" not in out, "不许再给一句相反的指令"
+
+
+def test_hundreds_of_unmatched_notes_are_ingested_in_chunks_with_one_lock_each(monkeypatch):
+    """sportsix 一次要补 461 条: 分几次调 ingest_published(每次各拿一次锁), 报表合并,
+    written 的下标换算回整体, 每条笔记都拿到自己的 version_id。"""
+    notes = [_note(f"n{i:03d}", f"第 {i} 篇", f"第 {i} 篇没入库的正文各不相同, 长度都够二十个字以上。" * 3)
+             for i in range(250)]
+    c = _client(notes)
+    seen = []
+    real = core.ingest_published
+
+    def _spy(client, project_id, entries, **kw):
+        seen.append(len(entries))
+        return real(client, project_id, entries, **kw)
+    monkeypatch.setattr(core, "ingest_published", _spy)
+    out = core.tv_sync(c, TV)
+    assert seen == [100, 100, 50]
+    assert out["ingest"]["minted"] == 250 and out["ingest"]["fingerprinted"] == 250
+    assert len(out["ingest"]["batch_ids"]) == 3
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    assert all(links[n["note_id"]]["match_kind"] == "ingested" and links[n["note_id"]]["version_id"]
+               for n in notes)
+    assert len({links[n["note_id"]]["version_id"] for n in notes}) == 250, "每条各自的 version_id"
