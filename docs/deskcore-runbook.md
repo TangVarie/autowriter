@@ -205,8 +205,11 @@ python -m deskcore.cli tv-sync --all               # 写对照 + 补录指纹, �
 python -m deskcore.cli tv-sync --all --write-tv    # 跟 TV 打过招呼之后再加这个: 回填 source_autowriter_*
 ```
 
-之后每天跑一次 `tv-sync --all --write-tv`（Railway 的 cron service 或任何有 `SUPABASE_URL` +
-`SUPABASE_SERVICE_ROLE_KEY` 的主机）。增量：已对上的笔记跳过，`--rematch` 才重对。
+之后每天跑一次 `tv-sync --all --write-tv`。Railway 上另建一个 service（同仓同分支），config-as-code
+指到 `deskcore/railway.cron.json`（cron `0 19 * * *` = 北京 03:00，启动命令就是这条），变量用
+Variable Reference 引 deskcore 主服务的四个：`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` /
+`GOOGLE_API_KEY` / `SUPABASE_ANON_KEY`。跟 TV 打招呼之前在 Settings → Deploy 里把启动命令的
+`--write-tv` 去掉。增量：已对上的笔记跳过，`--rematch` 才重对。
 
 验收：`select count(*) from truth_vault.notes where source_autowriter_version_id is not null`
 从 0 变成非 0；`doctor` 里 `009` 三条探测 applied；`tv-sync` 报表里 `ambiguous` 的
