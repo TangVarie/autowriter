@@ -41,6 +41,10 @@ _TABLES = {
     "draft_fingerprints": [],
     "user_calibration_notes": [],
     "style_edits": [],
+    # 009 的两张表
+    "tv_project_map": [],
+    "tv_note_links": [],
+    "ingest_locks": [],
     "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z",
                "decision_source": None, "reviewer_id": None, "decided_at": None}],
 }
@@ -54,6 +58,10 @@ _ALL_RPCS = {
     "deskcore_fingerprint_counts": lambda a: [],
     "deskcore_check_drafts": lambda a: [],
     "deskcore_commit_fingerprints": lambda a: [],
+    # 009: 读 TV 笔记的 RPC(库里没有 truth_vault 时它自己返回空集)
+    "deskcore_tv_notes": lambda a: [],
+    "deskcore_tv_backfill_lineage": lambda a: 0,
+    "deskcore_ingest_unlock": lambda a: False,
 }
 
 
@@ -103,6 +111,7 @@ def test_bare_001_db_reports_every_later_migration_missing():
         "004_deskcore_check_pushdown.sql",
         "005_deskcore_containment.sql",
         "006_item_decision_provenance.sql",
+        "009_tv_links.sql",           # 读 TV 的 RPC 不在 → 009 没跑
     ]
     st = _states(report)
     assert st["表 draft_fingerprints"] == "applied"      # 001 在
@@ -658,3 +667,25 @@ def test_backfill_gap_scans_uncapped():
     gap = core.backfill_gap(FakeClient(rows=big), PID)
     assert "backfill_capped_warning" not in gap        # 小项目不该乱报
     assert core._BACKFILL_DEFAULT_CAP == 5000
+
+
+def test_009_probes_cover_both_halves_and_cannot_write():
+    """codex #81: 只探读的那一半, 部署了一半的库会被报成 applied, --write-tv 到运行时
+    才炸。回填 RPC 用空 _links(UPDATE 一行不碰); 放锁 RPC 用 nil 项目 + 探针专用
+    holder(那一行逻辑上不可能存在); 拿锁 RPC **不探** —— 探一次就真的写一行。"""
+    sb = FakeClient(rows=_TABLES, rpc_impl=_ALL_RPCS)
+    report = core.migration_state(sb)
+    st = _states(report)
+    for probe in ("deskcore_tv_notes", "deskcore_tv_backfill_lineage",
+                  "表 ingest_locks", "deskcore_ingest_unlock"):
+        assert st[probe] == "applied", probe
+    calls = dict(sb.rpc_calls)
+    assert calls["deskcore_tv_backfill_lineage"] == {"_links": []}
+    assert calls["deskcore_ingest_unlock"]["_holder"] == "__doctor_probe__"
+    assert calls["deskcore_ingest_unlock"]["_project_id"] == core._PROBE_NIL_UUID
+    assert "deskcore_ingest_lock" not in calls, "拿锁 RPC 一探就会真写一行"
+
+    # 少了回填 RPC → 009 报 missing, 不是 applied
+    partial = {k: v for k, v in _ALL_RPCS.items() if k != "deskcore_tv_backfill_lineage"}
+    report = core.migration_state(FakeClient(rows=_TABLES, rpc_impl=partial))
+    assert "009_tv_links.sql" in report["missing"]

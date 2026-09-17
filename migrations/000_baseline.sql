@@ -1319,3 +1319,183 @@ REVOKE ALL ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT) FROM PUBLI
 REVOKE ALL ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT)
     TO authenticated, service_role;
+
+-- ══════════════════════════════════════════════════════════════════════
+-- 写作台 ↔ TV 的稿子对照 (migrations/009_tv_links.sql)
+-- 为什么、怎么用见 009 的文件头。下面整段与 009 逐字相同 —— 基线不许再从
+-- 增量上漂开(tests/test_baseline_parity.py 守函数块, sql_parity_check 守
+-- 表与 GRANT)。
+-- ══════════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS autowriter.tv_project_map (
+    tv_project_id  TEXT NOT NULL,
+    project_id     UUID NOT NULL REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    ingest_target  BOOLEAN NOT NULL DEFAULT FALSE,
+    note           TEXT NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tv_project_id, project_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tv_project_map_one_target
+    ON autowriter.tv_project_map (tv_project_id) WHERE ingest_target;
+CREATE INDEX IF NOT EXISTS tv_project_map_project_idx
+    ON autowriter.tv_project_map (project_id);
+
+CREATE TABLE IF NOT EXISTS autowriter.tv_note_links (
+    note_id        TEXT PRIMARY KEY,
+    tv_project_id  TEXT NOT NULL,
+    project_id     UUID REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    version_id     UUID REFERENCES autowriter.versions(id) ON DELETE SET NULL,
+    item_id        UUID,
+    match_kind     TEXT NOT NULL CHECK (match_kind IN (
+                       'body_exact', 'title_exact', 'fuzzy', 'ingested',
+                       'ambiguous', 'unmatched', 'tv_lineage')),
+    score          REAL,
+    lag_days       INTEGER,
+    candidates     JSONB,
+    synced_to_tv_at TIMESTAMPTZ,
+    matched_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS tv_note_links_project_kind_idx
+    ON autowriter.tv_note_links (project_id, match_kind);
+CREATE INDEX IF NOT EXISTS tv_note_links_version_idx
+    ON autowriter.tv_note_links (version_id);
+
+-- 建出来 ≠ 能访问(migrations/README): service_role 不绕表级 GRANT。
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+    autowriter.tv_project_map,
+    autowriter.tv_note_links
+    TO service_role;
+
+-- ── 补录锁: 按项目一行, 到期可被接管 ──
+CREATE TABLE IF NOT EXISTS autowriter.ingest_locks (
+    project_id   UUID PRIMARY KEY REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    holder       TEXT NOT NULL,
+    acquired_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.ingest_locks TO service_role;
+
+-- 拿锁: 没人持有 / 持有已过期 / 就是自己 → 拿到(TRUE); 别人还持有 → FALSE。
+-- INSERT … ON CONFLICT DO UPDATE … WHERE 在同一条语句里判断并写入, 两个进程同时
+-- 来只有一个能改到那一行(行锁), 不需要额外的事务控制。
+CREATE OR REPLACE FUNCTION autowriter.deskcore_ingest_lock(
+    _project_id  UUID,
+    _holder      TEXT,
+    _ttl_seconds INT DEFAULT 600
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    _got BOOLEAN := FALSE;
+BEGIN
+    -- clock_timestamp() 而不是 now(): now() 是事务开始时间, 在一个长事务里
+    -- (或 harness 把几条语句塞进同一次 psql 调用时)会让"到期"永远判不出来。
+    INSERT INTO autowriter.ingest_locks (project_id, holder, acquired_at, expires_at)
+    VALUES (_project_id, _holder, clock_timestamp(),
+            clock_timestamp() + make_interval(secs => GREATEST(_ttl_seconds, 1)))
+    ON CONFLICT (project_id) DO UPDATE
+       SET holder = EXCLUDED.holder, acquired_at = clock_timestamp(),
+           expires_at = EXCLUDED.expires_at
+     WHERE autowriter.ingest_locks.expires_at < clock_timestamp()
+        OR autowriter.ingest_locks.holder = EXCLUDED.holder
+    RETURNING TRUE INTO _got;
+    RETURN COALESCE(_got, FALSE);
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_lock(UUID, TEXT, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_lock(UUID, TEXT, INT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_lock(UUID, TEXT, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_ingest_lock(UUID, TEXT, INT) TO service_role;
+
+-- 放锁: 只放自己持有的那一行。别人的锁(或已被接管的)不动, 返回 FALSE。
+CREATE OR REPLACE FUNCTION autowriter.deskcore_ingest_unlock(_project_id UUID, _holder TEXT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    _got BOOLEAN := FALSE;
+BEGIN
+    DELETE FROM autowriter.ingest_locks
+     WHERE project_id = _project_id AND holder = _holder
+    RETURNING TRUE INTO _got;
+    RETURN COALESCE(_got, FALSE);
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) TO service_role;
+
+-- ── 读 TV 的笔记(keyset 翻页; PostgREST 的 db-max-rows 对 RPC 同样生效) ──
+CREATE OR REPLACE FUNCTION autowriter.deskcore_tv_notes(
+    _tv_project_id TEXT,
+    _since         TIMESTAMPTZ DEFAULT NULL,
+    _after         TEXT DEFAULT NULL,
+    _limit         INT DEFAULT 500
+)
+RETURNS TABLE(
+    note_id TEXT, publish_time TIMESTAMPTZ, tier TEXT, raw_content TEXT,
+    title TEXT, body TEXT, source_autowriter_version_id UUID,
+    created_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    IF to_regclass('truth_vault.notes') IS NULL THEN
+        RETURN;
+    END IF;
+    RETURN QUERY EXECUTE
+        'SELECT n.note_id, n.publish_time::timestamptz, n.tier, n.raw_content, '
+        '       n.title, n.body, n.source_autowriter_version_id, '
+        '       n.created_at::timestamptz '
+        '  FROM truth_vault.notes n '
+        ' WHERE n.project_id = $1 '
+        '   AND ($2 IS NULL OR n.created_at >= $2) '
+        '   AND ($3 IS NULL OR n.note_id > $3) '
+        ' ORDER BY n.note_id '
+        ' LIMIT $4'
+        USING _tv_project_id, _since, _after, GREATEST(_limit, 1);
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_notes(TEXT, TIMESTAMPTZ, TEXT, INT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_notes(TEXT, TIMESTAMPTZ, TEXT, INT) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_notes(TEXT, TIMESTAMPTZ, TEXT, INT) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_tv_notes(TEXT, TIMESTAMPTZ, TEXT, INT) TO service_role;
+
+-- ── 把对照写回 TV: 只填 NULL 的行, 返回实际更新的行数 ──
+CREATE OR REPLACE FUNCTION autowriter.deskcore_tv_backfill_lineage(_links JSONB)
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    _n INT := 0;
+BEGIN
+    IF to_regclass('truth_vault.notes') IS NULL THEN
+        RETURN 0;
+    END IF;
+    EXECUTE
+        'UPDATE truth_vault.notes t '
+        '   SET source_autowriter_version_id = l.version_id, '
+        '       source_autowriter_item_id    = COALESCE(t.source_autowriter_item_id, l.item_id) '
+        '  FROM jsonb_to_recordset($1) AS l(note_id TEXT, version_id UUID, item_id UUID) '
+        ' WHERE t.note_id = l.note_id '
+        '   AND l.version_id IS NOT NULL '
+        '   AND t.source_autowriter_version_id IS NULL'
+        USING _links;
+    GET DIAGNOSTICS _n = ROW_COUNT;
+    RETURN _n;
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) TO service_role;

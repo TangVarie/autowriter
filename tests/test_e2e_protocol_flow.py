@@ -93,6 +93,29 @@ def test_the_whole_protocol_end_to_end(env):
     assert "check_drafts" in r["note"]
     assert len(fake.rows["draft_fingerprints"]) == 3, "指纹库不许多出一条"
 
+    # ── 4b. 运营从 WorkBuddy 粘来已发未入库的稿子: 不过闸, 幂等 ──────────
+    published = [{"title": "上周发的一", "body": "上周已经发在小红书上的第一篇, 当时没入库。" * 4},
+                 {"title": "上周发的二", "body": "上周已经发在小红书上的第二篇, 同样没入库。" * 4},
+                 {"title": BODIES[0][0], "body": BODIES[0][1], "version_id": vids[0]}]  # 表里带 lineage 的行
+    r = call("ingest_published", project_id=pid, drafts=published, dry_run=True)
+    assert r["to_write"] == 2 and r["skipped_already_committed"] == 1 and r["minted"] == 0
+    assert len(fake.rows["draft_fingerprints"]) == 3, "dry-run 不写"
+    r = call("ingest_published", project_id=pid, drafts=published, source="途鸽-9月.xlsx")
+    assert (r["minted"], r["fingerprinted"], r["skipped_already_committed"]) == (2, 2, 1), r
+    assert len(fake.rows["draft_fingerprints"]) == 5
+    assert r["batch_id"] != batch_id
+    prov = next(b for b in fake.rows["batches"] if b["id"] == r["batch_id"])["params"]
+    assert prov["source"] == "ingest" and prov["file"] == "途鸽-9月.xlsx"
+    r = call("ingest_published", project_id=pid, drafts=published)
+    assert r["minted"] == 0 and r["skipped_already_fingerprinted"] == 2, "重复调不翻倍"
+    assert len(fake.rows["draft_fingerprints"]) == 5
+    # 补进来的历史现在挡得住新稿子了
+    r = call("check_drafts", project_id=pid, drafts=[published[0]])
+    assert r["summary"]["reject"] == 1
+    # 台账不受影响: 补历史不销角度, 漏斗块下面还是 3 发 3 销
+    r = call("commit_drafts", project_id=pid, drafts=[published[1]])
+    assert r["written"] == 0, "同一篇已在指纹库里, commit 也塞不进去"
+
     # ── 5. 导出 → 人审 ───────────────────────────────────────────────────
     # 导出走 PostgREST 的 embedded join(items → versions / batches); 假库不会
     # 自己嵌, 这里手动补上那一层(同 test_deskcore_export 的回环测试)。
@@ -145,3 +168,4 @@ def test_mcp_tool_surface_matches_the_protocol():
     # commit_drafts 的说明要提到新键 —— 模型只看这个
     assert "unattributed" in by["commit_drafts"].description
     assert "pre_commit" in by["commit_drafts"].description
+    assert "不过闸" in by["ingest_published"].description

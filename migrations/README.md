@@ -128,6 +128,7 @@ python -m deskcore.cli doctor --project <uuid>   # 额外打印这个项目的�
 | `006_item_decision_provenance.sql` | `items` 加 `decision_source` / `reviewer_id` / `decided_at` 三列 + 一条部分索引（跨库审计 COR-004 / COR-007） | ⚠️ **这一个不跑是硬失败，不是降级**——见下 |
 | `007_deskcore_table_grants.sql` | 把 `001` 建的那四张表授权给 `service_role`（2026-08-26 之前那版 `001` 只给函数发了 `EXECUTE`，表漏了；现在的 `001` 已含同一条 `GRANT`，所以这一半对新库是 no-op）+ 给 `calibration_note_audit` 补 `service_role` 全套 / `authenticated` 的 `SELECT,INSERT`，并**收回** `authenticated` 对它的 `UPDATE`/`DELETE`（审计表 append-only）——后面这三条只在这里和基线里有，所以**任何跑过 `001` 的库仍然都要跑 `007`** | ⚠️ **硬失败**：碰 `001` 那四张表的工具全挂在 `42501 permission denied`，而 `/health` 全绿——见下 |
 | `008_embedding_model_isolation.sql` | `deskcore_check_drafts` 的标题语义那一路加**按 `embedding_model` 过滤**（`CREATE OR REPLACE`，签名不变） | 换过 embedding 模型的库上，标题语义比对会把**别的模型产的**向量也算进来。跨模型余弦是噪声：既放过真重复、也误杀无关稿，而 `semantic_degraded` 照报 `false`——见下 |
+| `009_tv_links.sql` | 写作台 ↔ TV 的稿子对照：`tv_project_map`（TV 的 `project_id` ↔ 写作台项目，谁是补录目标）、`tv_note_links`（每条 TV 笔记对到哪一版、怎么对上的）+ 两个跨 schema 的 `SECURITY DEFINER` RPC：`deskcore_tv_notes`（读 `truth_vault.notes`）、`deskcore_tv_backfill_lineage`（把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL**）。两个函数用 `to_regclass` 守着，库里没有 `truth_vault` 时返回空，本地 harness 与新库都建得出来。另有 `ingest_locks` + `deskcore_ingest_lock` / `deskcore_ingest_unlock`：补录的**跨进程**互斥（服务进程的 `ingest_published` 工具与 CLI/cron 的 `tv-sync` 都会「先读指纹再写」），按项目一行、带 TTL、到期可接管 | `tv-sync` 整个不可用：TV 的笔记认不回写作台的版本，已发未入库的稿子补不进指纹库，「爆没爆」永远回不到写作台（2026-09-17 之前的状态：5966 条笔记 lineage 全 NULL） |
 
 > ⚠️ **`008` 治的是"这一列存在了几个月却从来没有代码用过它"。**
 >

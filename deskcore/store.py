@@ -1637,3 +1637,147 @@ def count_style_edits(sb, project_id: str, user_id: str) -> int:
     except Exception:
         logger.exception("count style_edits failed")
         return 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 写作台 ↔ TV 的稿子对照 (migrations/009_tv_links.sql)
+# ══════════════════════════════════════════════════════════════════════
+
+TV_NOTES_PAGE = 500
+
+
+def tv_project_map(sb) -> list[dict]:
+    """全部对照行: TV 的 project_id ↔ 写作台项目, 谁是补录目标。"""
+    return list((sb.table("tv_project_map")
+                 .select("tv_project_id, project_id, ingest_target, note")
+                 .order("tv_project_id").execute()).data or [])
+
+
+def tv_map_upsert(sb, tv_project_id: str, project_id: str, *,
+                  ingest_target: bool, note: str = "") -> None:
+    sb.table("tv_project_map").upsert(
+        {"tv_project_id": tv_project_id, "project_id": project_id,
+         "ingest_target": bool(ingest_target), "note": note or ""},
+        on_conflict="tv_project_id,project_id").execute()
+
+
+def tv_notes(sb, tv_project_id: str, *, since: str | None = None,
+             page: int = TV_NOTES_PAGE) -> list[dict]:
+    """TV 的笔记, keyset 翻页(PostgREST 的 db-max-rows 对 RPC 同样生效)。"""
+    out: list[dict] = []
+    after: str | None = None
+    while True:
+        rows = (sb.rpc("deskcore_tv_notes", {
+            "_tv_project_id": tv_project_id, "_since": since,
+            "_after": after, "_limit": page}).execute()).data or []
+        out.extend(rows)
+        if len(rows) < page:
+            return out
+        after = rows[-1]["note_id"]
+
+
+def tv_links(sb, tv_project_id: str) -> dict[str, dict]:
+    """已有的对照, 按 note_id。"""
+    def _build(off, lim):
+        return (sb.table("tv_note_links")
+                .select("note_id, project_id, version_id, item_id, match_kind, "
+                        "score, lag_days, synced_to_tv_at")
+                .eq("tv_project_id", tv_project_id)
+                .order("note_id").range(off, off + lim - 1))
+    return {r["note_id"]: r for r in _paged(_build)}
+
+
+def tv_links_upsert(sb, rows: list[dict]) -> int:
+    if not rows:
+        return 0
+    n = 0
+    for i in range(0, len(rows), 200):
+        chunk = rows[i:i + 200]
+        sb.table("tv_note_links").upsert(chunk, on_conflict="note_id").execute()
+        n += len(chunk)
+    return n
+
+
+def tv_backfill_lineage(sb, links: list[dict]) -> int:
+    """把对照写回 TV 的 source_autowriter_* 两列(只填 NULL 的行), 回实际更新数。"""
+    if not links:
+        return 0
+    res = sb.rpc("deskcore_tv_backfill_lineage", {"_links": [
+        {"note_id": l["note_id"], "version_id": l["version_id"], "item_id": l.get("item_id")}
+        for l in links if l.get("version_id")]}).execute()
+    data = res.data
+    if isinstance(data, list):
+        data = data[0] if data else 0
+    return int(data or 0)
+
+
+def tv_mark_synced(sb, note_ids: list[str]) -> None:
+    for i in range(0, len(note_ids), 200):
+        (sb.table("tv_note_links").update({"synced_to_tv_at": iso_now()})
+         .in_("note_id", note_ids[i:i + 200]).execute())
+
+
+def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[dict]:
+    """项目里每个 item 的定稿版本, 带 created_at / item_id —— 对照要按时间窗判。
+
+    与 ``legacy_version_pages`` 同样只取 best / 最新那一版: 发出去的是它。
+    """
+    def _build(off, lim):
+        return (sb.table("items")
+                .select("id, best_version_id, created_at, "
+                        "versions(id, title, body, version_num, created_at), "
+                        "batches!inner(project_id)")
+                .eq("batches.project_id", project_id)
+                .order("created_at", desc=True)
+                .order("id", desc=True)
+                .range(off, off + lim - 1))
+    out: list[dict] = []
+    for item in _paged(_build, hard_cap=limit):
+        versions = item.get("versions") or []
+        if not versions:
+            continue
+        best = item.get("best_version_id")
+        chosen = next((v for v in versions if v.get("id") == best), None)
+        if chosen is None:
+            chosen = max(versions, key=lambda v: v.get("version_num") or 0)
+        title = (chosen.get("title") or "").strip()
+        body = (chosen.get("body") or "").strip()
+        if not (title or body):
+            continue
+        out.append({"version_id": chosen.get("id"), "item_id": item.get("id"),
+                    "project_id": project_id, "title": title, "body": body,
+                    "created_at": chosen.get("created_at") or item.get("created_at")})
+    return out
+
+
+# ── 补录锁(migrations/009): 跨进程互斥, 按项目一行, 带 TTL ─────────────────
+
+def try_ingest_lock(sb, project_id: str, holder: str, ttl_seconds: int) -> bool | None:
+    """拿补录锁。True 拿到 / False 别人持有 / **None = 锁 RPC 还没部署**(调用方
+    退回进程内锁并记一条 warning, 不能把"没部署"当成"拿到")。"""
+    try:
+        res = sb.rpc("deskcore_ingest_lock", {
+            "_project_id": project_id, "_holder": holder,
+            "_ttl_seconds": int(ttl_seconds)}).execute()
+    except Exception as exc:                        # noqa: BLE001
+        if rpc_missing(exc):
+            return None
+        raise
+    data = res.data
+    if isinstance(data, list):
+        data = data[0] if data else False
+    return bool(data)
+
+
+def ingest_unlock(sb, project_id: str, holder: str) -> bool:
+    try:
+        res = sb.rpc("deskcore_ingest_unlock",
+                     {"_project_id": project_id, "_holder": holder}).execute()
+    except Exception as exc:                        # noqa: BLE001
+        if rpc_missing(exc):
+            return False
+        raise
+    data = res.data
+    if isinstance(data, list):
+        data = data[0] if data else False
+    return bool(data)

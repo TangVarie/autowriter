@@ -154,6 +154,8 @@ def test_every_project_scoped_entrypoint_calls_the_gate():
 # 检查"。前者漏登记 = 静默放行, 后者漏登记 = 当场红。
 UNGATED_WITH_REASON = {
     "assert_project_access": "它【就是】那道闸",
+    "_ingest_proc_lock": "按 project_id 取一把进程内锁, 不读不写项目数据; 调用它的 ingest_published 已过闸",
+    "_acquire_ingest_lock": "轮询库里的补录锁(009), 只碰 ingest_locks 那一行; 调用它的 ingest_published 已过闸",
     "_history_probe":        "私有辅助函数, 由已过闸的调用方传入 project_id",
     "_gate":                 "私有辅助函数(check_drafts 的判定主体), 只被已过闸的 "
                              "check_drafts / commit_drafts 调用 —— 抽出来正是为了让"

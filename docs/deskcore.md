@@ -168,6 +168,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `commit_drafts` | 定稿入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账 |
 | 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human` + 真实 reviewer + 时间。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
+| 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
 | 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0 |
 | | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
 | | `save_my_style` | 把模型蒸馏好的笔记写回 + 按 `edit_ids` 销账（`record_edit` 的第二步） |
@@ -362,6 +363,39 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 
 ---
 
+### 3.7 写作台 ↔ TV 的稿子对照（2026-09-17）
+
+**病灶。** TV（`truth_vault.notes`）里 5966 条已发笔记，`source_autowriter_version_id` 全 NULL。
+原设计（§3.4）让运营把 `export_drafts` 导出的六个 lineage 列手抄进飞书表，三周零匹配——
+到 TV 手里的表**根本没有那六列**。反过来看更糟：08-28 建的项目里，岸深发了 144 篇一篇
+都没进过库，西屋 301 篇库里连版本都没有，sportsix 上线第一周发了 54 篇入库 0——查重闸对
+它们一无所知，而这不是 09-11 才开始的，是从上线第一天起的常态（#80 里"09-11 之前 110%"
+那个数字是百健士 09-07 一次性补录 201 篇撑起来的，其中 101 篇发布时间早于入库时间）。
+
+**改法：在库里按内容对，运营不做任何事。** 两边在同一个 Supabase 项目里，内容都是写作台
+产的；TV 存的是全文（百健士对上的 143 篇里 115 篇正文逐字相同，其余只多了话题标签）。
+
+| 步 | 做什么 | 口径 |
+|---|---|---|
+| 对照表 | `tv_project_map`：TV 的 `project_id`（`SPX_phase1`）↔ 写作台项目。一个 TV 项目可对多个写作台项目（WTG 15 个方向），**只有一行**是补录目标 | `tv-map add` 维护，`migrations/009` |
+| 精确 | 正文前 40 字（去标点）相同 → `body_exact`；否则标题相同 → `title_exact` | 同标题多版按四字串包含度分，分不出再按时间窗内离发布最近的那版 |
+| 模糊 | 时间窗内（发布 −30 ～ +30 天）四字串**包含度** ≥ 0.6 且与次佳差 ≥ 0.1 → `fuzzy` | 途鸽发之前改得很狠（305 字 vs 527 字），精确对不上，靠这一路 |
+| 分不出 | `ambiguous`：候选写进 `tv_note_links.candidates`，**不硬猜**，报表里列给人看 | |
+| 对不上 | `unmatched` → `ingest_published`（剥话题标签、不过闸、按全文幂等）补录进目标项目，建成的 `version_id` 记回 `tv_note_links` | 同项目稿子都以同一串标签结尾，不剥会互相误撞 |
+| 回填 TV | `--write-tv` 才把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL 的行** | 那是 TV 的列，回填前跟 TV 打招呼 |
+| 互斥 | 补录走 `core.ingest_published`，它先拿库里的项目锁（`ingest_locks`，TTL 10 分钟、到期可接管），拿不到等 90 秒后报「另一个补录正在跑」（REST 409） | 服务进程的工具与 CLI/cron 的 `tv-sync` 是两个进程，进程内锁管不到对方；advisory lock 跨不过 PostgREST 的多次请求 |
+
+实测（2026-09-17 的库，按全部 5000 多个版本对）：WTG 724 篇对上 229、百健士 182 对上 143、
+唐小轻 127 对上 51、sportsix 492 对上 26、雷诺考特 374 对上 17、途鸽 127 对上 17；
+对上的发布−入库间隔中位 1～3 天、九成 13 天内。对不上的那些绝大多数是**库里根本没有**
+——`tv-sync` 会把它们补进去，之后每天跑一次。
+
+拿真数据跑过一遍匹配器（途鸽 127 条 TV 笔记 × 166 个写作台版本，含 8 个子项目）：开头相同 15、标题相同 49、模糊 7、分不出 1、对不上 55——42 条爆款里 33 条认回了写作台的版本；对不上的 55 条最近的候选包含度都在 0.2 以下，确实不在库里，`tv-sync` 会把它们补进去。
+
+跑法、验收、cron 见 runbook §1.5。匹配逻辑在 `deskcore/tvlink.py`，编排在 `core.tv_sync`，
+用例 `tests/test_tvlink.py` / `tests/test_tv_sync.py`。**§3.4 的六列不再是回流的依赖**，
+`export_drafts` 照样带着它们（粘了不坏），但没人需要再手抄。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -389,8 +423,8 @@ env：
 `002_calibration_cas.sql` / `003_versions_unique_num.sql` /
 `004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
 `006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql` /
-`008_embedding_model_isolation.sql`
-**八个，按编号顺序跑，别跳号**（建议先在
+`008_embedding_model_isolation.sql` / `009_tv_links.sql`
+**九个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -419,6 +453,8 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
   > 坑在于 `service_role` **绕过 RLS，但不绕过表级 `GRANT`**——两套独立机制。它在 `public` schema 下看着无所不能，靠的是 Supabase 给 `public` 配的 default privileges；`autowriter` 是本仓自建 schema，**没有**这份默认授权，新表出生就是零权限。
   >
   > 这是 2026-08-26 首次真部署当天靠人肉 `curl` 打线上才发现的。现在有两道守卫：`tests/sql_parity_check.py` 断言 **`autowriter` 下每一张表都必须对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**（断不变量而不是名单，以后加表忘了发 GRANT 会自己红）；`doctor` 把 `42501` 单独报成 `denied` 而不是混进 `error`，并直接指向 `migrations/007`——而且**四个权限一个个探**，因为"读得到"证明不了"写得进"。
+- `009_tv_links.sql` 是写作台 ↔ TV 的稿子对照（2026-09-17）：两张表 + 两个跨 schema 的 RPC。为什么要它：TV 5966 条笔记里带写作台 lineage 的是 **0 条**——原设计让运营把 `export_drafts` 的六个 ID 列手抄进飞书，三周零匹配，到 TV 手里的表根本没有那六列。两边在同一个库里、内容都是写作台产的，`tv-sync` 按内容对（正文前 40 字 / 标题 / 时间窗内四字串包含度），对不上的直接从 TV 的全文补录进指纹库。**运营不用做任何事，飞书表不用加列。** 见 §3.7。
+
 - `008_embedding_model_isolation.sql` 治的是另一种"写着已经有了、实际没有"：`draft_fingerprints.embedding_model` 从 `001` 起就在，`COMMENT` 写着它是"换 embedding 供应商时唯一的救命稻草"，而**四路查重里没有任何一路读过它**。
 
   > 后果在换模型那天兑现：两个模型都出 768 维，所以维度守卫拦不住、写库也不报错，但两套向量空间毫不相干。跨模型算出来的余弦是噪声，**双向出错**——真重复的算出来很低（放行），无关的算出来很高（误杀），而 `semantic_degraded` 报的是 `false`：这一路不但失灵，还在报告里说自己跑过了。
