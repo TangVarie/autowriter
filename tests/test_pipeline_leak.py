@@ -36,6 +36,12 @@ def _fresh_leak_cache():
     A_._leak_cache.update(at=0.0, value=None)
 
 
+def _live_probe_client():
+    """库探测能过的假客户端 —— /health 现在库探测没过就不扫漏斗(codex P1),
+    所以要测漏斗块的那几条得先让 supabase 那格是 ok。"""
+    return FakeClient(rows={"projects": []})
+
+
 def _ago(days: float) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
@@ -83,7 +89,22 @@ def test_pipeline_leak_verdict(monkeypatch, per, ok, pct):
     assert out["leak_pct"] == pct
     assert out["window_days"] == core.LEAK_WINDOW_DAYS
     for p in out["projects"]:
-        assert "leak_pct" in p
+        assert "leak_pct" in p and "ok" in p
+
+
+def test_a_fully_broken_project_is_not_masked_by_a_healthy_big_one(monkeypatch):
+    """codex review P1: 30/30 全漏 + 100/100 全入库 = 总量 23%, 判"健康" ——
+    而那个小项目一条指纹都没进。逐项目也要判。"""
+    monkeypatch.setattr(core.store, "angle_leak", lambda sb, days: [
+        {"project_id": A, "name": "大而健康", "drawn": 100, "consumed": 100},
+        {"project_id": B, "name": "小而全漏", "drawn": 30, "consumed": 0},
+    ])
+    out = core.pipeline_leak(object())
+    assert out["leak_pct"] == 23
+    assert out["ok"] is False
+    assert out["projects_over_threshold"] == 1
+    by = {p["name"]: p for p in out["projects"]}
+    assert by["小而全漏"]["ok"] is False and by["大而健康"]["ok"] is True
 
 
 def test_health_carries_the_pipeline_block_but_the_top_level_ok_ignores_it(monkeypatch):
@@ -94,14 +115,20 @@ def test_health_carries_the_pipeline_block_but_the_top_level_ok_ignores_it(monke
 
     monkeypatch.setenv("DESKCORE_KEYS",
                        '{"k-test": {"user_id": "22222222-2222-2222-2222-222222222222", "name": "t"}}')
-    monkeypatch.setattr(A_, "_health_probe_client", lambda: object())
+    monkeypatch.setattr(A_, "_health_probe_client", _live_probe_client)
     monkeypatch.setattr(core, "pipeline_leak", lambda sb, days=7: {
         "ok": False, "window_days": 7, "drawn": 104, "consumed": 12,
-        "leak_pct": 88, "projects": [], "note": "漏了"})
+        "leak_pct": 88, "projects_over_threshold": 1,
+        "projects": [{"project_id": A, "name": "途鸽", "drawn": 104, "consumed": 12,
+                      "leak_pct": 88, "ok": False}],
+        "note": "漏了"})
     client = testclient.TestClient(A_.app, raise_server_exceptions=False)
     body = client.get("/health").json()
     pipe = body["config"]["pipeline"]
     assert pipe["ok"] is False and pipe["leak_pct"] == 88
+    # ⚠️ /health 不鉴权 —— 项目名单不许出现在里面(codex review P1)
+    assert "projects" not in pipe
+    assert "途鸽" not in client.get("/health").text
     cfg = body["config"]
     assert body["ok"] == (cfg["supabase"]["ok"] and cfg["vendored_vocab"]["ok"]
                           and cfg["auth"]["ok"]), "漏斗不许进顶层 ok"
@@ -113,7 +140,7 @@ def test_health_reports_an_unprobeable_pipeline_instead_of_hiding_it(monkeypatch
 
     monkeypatch.setenv("DESKCORE_KEYS",
                        '{"k-test": {"user_id": "22222222-2222-2222-2222-222222222222", "name": "t"}}')
-    monkeypatch.setattr(A_, "_health_probe_client", lambda: object())
+    monkeypatch.setattr(A_, "_health_probe_client", _live_probe_client)
 
     def _boom(sb, days=7):
         raise RuntimeError("库挂了")
@@ -132,7 +159,7 @@ def test_health_caches_the_leak_probe_between_pings(monkeypatch):
 
     monkeypatch.setenv("DESKCORE_KEYS",
                        '{"k-test": {"user_id": "22222222-2222-2222-2222-222222222222", "name": "t"}}')
-    monkeypatch.setattr(A_, "_health_probe_client", lambda: object())
+    monkeypatch.setattr(A_, "_health_probe_client", _live_probe_client)
     calls = {"n": 0}
 
     def _leak(sb, days=7):
@@ -144,3 +171,51 @@ def test_health_caches_the_leak_probe_between_pings(monkeypatch):
     for _ in range(3):
         assert client.get("/health").json()["config"]["pipeline"]["ok"] is True
     assert calls["n"] == 1, "TTL 内只该查一次"
+
+
+def test_health_skips_the_leak_scan_when_the_db_probe_already_failed(monkeypatch):
+    """codex review P1: 库卡住时, 存活探针等完一次超时不该再为漏斗等第二次 ——
+    Railway 会在库故障期间把服务重启掉, 那正是存活探针设计要避免的。"""
+    testclient = pytest.importorskip("fastapi.testclient")
+    import deskcore.app as A_
+
+    monkeypatch.setenv("DESKCORE_KEYS",
+                       '{"k-test": {"user_id": "22222222-2222-2222-2222-222222222222", "name": "t"}}')
+
+    class _Dead:
+        def table(self, *_a, **_k):
+            raise RuntimeError("库挂了")
+    monkeypatch.setattr(A_, "_health_probe_client", lambda: _Dead())
+    calls = {"n": 0}
+
+    def _leak(sb, days=7):
+        calls["n"] += 1
+        raise AssertionError("库探测没过就不该来扫台账")
+    monkeypatch.setattr(core, "pipeline_leak", _leak)
+    client = testclient.TestClient(A_.app, raise_server_exceptions=False)
+    body = client.get("/health").json()
+    assert body["config"]["supabase"]["ok"] is False
+    assert body["config"]["pipeline"]["ok"] is None
+    assert "跳过" in body["config"]["pipeline"]["note"]
+    assert calls["n"] == 0
+
+
+def test_a_failed_leak_scan_is_cached_briefly(monkeypatch):
+    """失败也缓存: 不然库慢的时候每次 ping 都再等一次。"""
+    testclient = pytest.importorskip("fastapi.testclient")
+    import deskcore.app as A_
+
+    monkeypatch.setenv("DESKCORE_KEYS",
+                       '{"k-test": {"user_id": "22222222-2222-2222-2222-222222222222", "name": "t"}}')
+    monkeypatch.setattr(A_, "_health_probe_client", _live_probe_client)
+    calls = {"n": 0}
+
+    def _boom(sb, days=7):
+        calls["n"] += 1
+        raise RuntimeError("慢")
+    monkeypatch.setattr(core, "pipeline_leak", _boom)
+    client = testclient.TestClient(A_.app, raise_server_exceptions=False)
+    for _ in range(3):
+        pipe = client.get("/health").json()["config"]["pipeline"]
+        assert pipe["ok"] is None and "不再重试" in pipe["note"]
+    assert calls["n"] == 1

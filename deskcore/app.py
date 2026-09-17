@@ -332,19 +332,56 @@ async def _probe(fn, fallback):
         return fallback
 
 
-_LEAK_TTL_SEC = 60.0
+_LEAK_TTL_SEC = 60.0          # 成功结果的缓存
+_LEAK_FAIL_TTL_SEC = 30.0     # 失败也缓存: 库卡住时别让每次 ping 都再等一次超时
 _leak_cache: dict = {"at": 0.0, "value": None}
+_leak_inflight = __import__("threading").Lock()
+
+
+def _public_leak(value: dict) -> dict:
+    """/health 不鉴权 —— 只回总量, **不回项目名单**(codex review P1)。
+
+    逐项目的表在 `deskcore.cli doctor` 里(拿 service_role 跑的运维命令)。这里只
+    留: 发了多少、销了多少、漏了几成、几个项目单独超线。
+    """
+    keep = ("ok", "window_days", "drawn", "consumed", "leak_pct",
+            "projects_over_threshold", "note")
+    return {k: value[k] for k in keep if k in value}
+
+
+def _leak_unavailable(note: str) -> dict:
+    return {"ok": None, "window_days": core.LEAK_WINDOW_DAYS, "note": note}
 
 
 def _leak_cached() -> dict:
-    """pipeline_leak 的 TTL 缓存, 在 _probe 的工作线程里跑(它本身是阻塞查询)。"""
+    """pipeline_leak 的 TTL 缓存, 在 _probe 的工作线程里跑(它本身是阻塞查询)。
+
+    三条护栏, 都是为了让存活探针**不为漏斗买单**(codex review P1):
+      · 成功缓存 60s, 失败缓存 30s —— 库卡住时不是每次 ping 都再等一次超时;
+      · 同一时刻只跑一个扫描: 上一个还没回来, 这次直接回上一次的值或"探不到";
+      · 回出去的一律脱敏(见 _public_leak)。
+    """
     import time
     now = time.monotonic()
-    if _leak_cache["value"] is not None and now - _leak_cache["at"] < _LEAK_TTL_SEC:
-        return _leak_cache["value"]
-    value = core.pipeline_leak(_health_probe_client())
-    _leak_cache.update(at=now, value=value)
-    return value
+    cached = _leak_cache["value"]
+    if cached is not None and now - _leak_cache["at"] < cached.get("_ttl", _LEAK_TTL_SEC):
+        return _public_leak(cached)
+    if not _leak_inflight.acquire(blocking=False):
+        return (_public_leak(cached) if cached is not None
+                else _leak_unavailable("上一次扫描还没回来, 本次不重复扫"))
+    try:
+        try:
+            value = dict(core.pipeline_leak(_health_probe_client()))
+            value["_ttl"] = _LEAK_TTL_SEC
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pipeline leak probe failed: %s", exc)
+            value = _leak_unavailable(f"探不到({type(exc).__name__}), "
+                                      f"{_LEAK_FAIL_TTL_SEC:g}s 内不再重试")
+            value["_ttl"] = _LEAK_FAIL_TTL_SEC
+        _leak_cache.update(at=time.monotonic(), value=value)
+        return _public_leak(value)
+    finally:
+        _leak_inflight.release()
 
 
 async def _collect_health() -> dict:
@@ -399,9 +436,13 @@ async def _collect_health() -> dict:
     # ok**(否则 Railway 会因为运营的用法重启容器), 但一定要在这里看得见。
     # 带 TTL 缓存: /health 是 Railway 的存活探针, 几十秒 ping 一次, 而 7 天的
     # 漏斗一分钟内不会变 —— 每次 ping 都翻一遍台账是白花的(code review)。
-    pipeline = await _probe(_leak_cached, {
-        "ok": None, "window_days": core.LEAK_WINDOW_DAYS,
-        "note": f"探不到(超时 >{_HEALTH_PROBE_TIMEOUT:g}s 或出错), 见日志"})
+    # 库探测都没过就别再去扫台账 —— 那只会让存活探针再等一次同样的超时,
+    # Railway 在库故障期间把服务重启掉, 正是存活探针设计要避免的事。
+    if db_ok:
+        pipeline = await _probe(_leak_cached, _leak_unavailable(
+            f"探不到(超时 >{_HEALTH_PROBE_TIMEOUT:g}s), 见日志"))
+    else:
+        pipeline = _leak_unavailable("库探测没过, 本次跳过漏斗")
 
     return {
         "ok": db_ok and vocab_ok and auth_ok,

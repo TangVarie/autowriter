@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from deskcore import fingerprint as fp
 from deskcore import ingest
 
 openpyxl = pytest.importorskip("openpyxl")
@@ -225,3 +226,42 @@ def test_body_without_the_prefix_is_still_the_body():
     title, body = ingest.parse_content_cell("标题：甲\n\n这是正文的第一行\n第二行")
     assert title == "甲"
     assert body == "这是正文的第一行\n第二行"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# codex review 2026-09-17 (P1): 按全文识别重复; 写指纹失败不抛
+# ══════════════════════════════════════════════════════════════════════
+
+def test_same_template_opening_with_different_bodies_are_both_ingested():
+    """小红书同一个模板开头能起一百篇不同的稿子。只按开头 25 个字去重, 后面
+    九十九篇全被跳过、指纹永远进不了库 —— ingest 存在的目的正好被它自己废掉。"""
+    c = _client()
+    opening = "家人们谁懂啊, 秋招投到第六十份的时候我真的绷不住了。"
+    a = opening + "后来发现问题出在简历第一行, 改完一周就有三个面试。" * 5
+    b = opening + "后来我去报了个机构, 导师第一句话就是你简历没写成果。" * 5
+    assert fp.opening_hash(a) == fp.opening_hash(b), "夹具前提: 两篇开头哈希相同"
+    out = core.ingest_published(c, PROJ, [
+        {"title": "一", "body": a}, {"title": "二", "body": b},
+    ], user_id=ME, source="x")
+    assert out["minted"] == 2 and out["fingerprinted"] == 2
+    assert out["skipped_duplicate_in_sheet"] == 0
+    # 重跑: 两篇都在库里了, 按全文认出来, 都跳过
+    again = core.ingest_published(c, PROJ, [
+        {"title": "一", "body": a}, {"title": "二", "body": b},
+    ], user_id=ME, source="x")
+    assert again["minted"] == 0 and again["skipped_already_fingerprinted"] == 2
+
+
+def test_fingerprint_write_failure_is_reported_not_raised(monkeypatch):
+    """身份已经建好了。这时抛出去, CLI 到不了"跑 backfill"那句; 运营自然地重跑,
+    重跑看不到指纹, 会再建一份身份。"""
+    c = _client()
+
+    def _boom(sb, rows):
+        raise RuntimeError("PostgREST 502")
+    monkeypatch.setattr(core.store, "write_fingerprints", _boom)
+    out = core.ingest_published(c, PROJ, [{"title": "a", "body": "正文。" * 10}],
+                                user_id=ME, source="x")
+    assert out["minted"] == 1 and out["fingerprinted"] == 0
+    assert "PostgREST 502" in out["fingerprint_error"]
+    assert len(c.rows["items"]) == 1, "身份建了就是建了, 要如实报"

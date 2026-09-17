@@ -32,8 +32,8 @@ description: 帆谷/BYWOOD 小红书种草文案的【写作台协议】。凡�
 - `bywood-writing-desk`（本 skill）管这一批守不守项目规则、跟历史重不重
 - `seeding-prompt-refiner` 管提示词本身怎么迭代
 
-<!-- protocol_version: 3f6a3c2bf368 -->
-protocol_version: 3f6a3c2bf368
+<!-- protocol_version: 45b398c00ee2 -->
+protocol_version: 45b398c00ee2
 
 # 写作台协议
 

@@ -85,3 +85,16 @@ def test_sync_skill_check_fails_when_the_skill_is_stale(monkeypatch, tmp_path, c
     assert cli.main(["sync-skill"]) == 0
     assert cli.main(["sync-skill", "--check"]) == 0
     assert "旧正文" not in stale.read_text(encoding="utf-8")
+
+
+def test_fingerprint_failure_points_at_backfill_not_rerun(fake, tmp_path, capsys, monkeypatch):
+    p = _sheet(tmp_path)
+
+    def _boom(sb, rows):
+        raise RuntimeError("PostgREST 502")
+    monkeypatch.setattr(core.store, "write_fingerprints", _boom)
+    rc = cli.main(["ingest", "--project", PROJ, "--user", ME, "--xlsx", str(p)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "backfill --project" in out and "不要重跑本命令" in out
+    assert "PostgREST 502" in out

@@ -269,8 +269,9 @@ def _ingest(core, sb, args) -> int:
         print(f"  ⚠️ 身份没建全: {out['identity_error']}。没建成的行**重跑本命令**会"
               "补上(已有指纹的行会被跳过, 不会翻倍)。")
         rc = 1
-    if out["fingerprinted"] < out["minted"]:
-        print(f"  ⚠️ 有 {out['minted'] - out['fingerprinted']} 条建了身份没写上指纹 —— "
+    if out.get("fingerprint_error") or out["fingerprinted"] < out["minted"]:
+        why = f"({out['fingerprint_error']})" if out.get("fingerprint_error") else ""
+        print(f"  ⚠️ 有 {out['minted'] - out['fingerprinted']} 条建了身份没写上指纹{why} —— "
               "**不要重跑本命令**(重跑看不到它们的指纹, 会再建一份身份); 跑 "
               f"`python -m deskcore.cli backfill --project {args.project}`, 它按 "
               "version_id 幂等, 会把有身份没指纹的行补上。")

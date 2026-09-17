@@ -2073,30 +2073,33 @@ def ingest_published(client, project_id: str, entries: list[dict], *,
     cleaned = [{"title": (e.get("title") or "").strip(),
                 "body": (e.get("body") or "").strip()} for e in entries]
     cleaned = [e for e in cleaned if e["title"] or e["body"]]
-    # 表内去重 + 库内去重, 都按正文开头哈希。没有正文(title-only)的行算不出
-    # 开头哈希, 只能照收 —— 它们本来也拦不住谁。
+    # 表内去重 + 库内去重, 都按【开头哈希 + 整篇四字串 sketch】—— 只按开头会把
+    # 同一个模板开头的不同稿子全判成重复(codex review; 见 store 里那段说明)。
+    # 没有正文(title-only)的行算不出任何一样, 只能照收 —— 它们本来也拦不住谁。
     dup_in_sheet = already = 0
-    seen: set[str] = set()
-    hashes = [fp.opening_hash(e["body"]) for e in cleaned]
-    known = store.existing_opening_hashes(client, project_id,
-                                          [h for h in hashes if h])
+    seen: set[tuple] = set()
+    keys = [(fp.opening_hash(e["body"]), tuple(sorted(fp.ngram_hashes(e["body"]))))
+            for e in cleaned]
+    known = store.existing_fingerprint_sketches(
+        client, project_id, [oh for oh, _ in keys if oh])
     keep: list[dict] = []
-    for e, h in zip(cleaned, hashes):
-        if h and h in seen:
+    for e, (oh, sk) in zip(cleaned, keys):
+        if oh and (oh, sk) in seen:
             dup_in_sheet += 1
             continue
-        if h and h in known:
+        if oh and sk in known.get(oh, ()):
             already += 1
             continue
-        if h:
-            seen.add(h)
+        if oh:
+            seen.add((oh, sk))
         keep.append(e)
     cleaned = keep
     out = {"received": len(entries), "to_write": len(cleaned),
            "skipped_already_fingerprinted": already,
            "skipped_duplicate_in_sheet": dup_in_sheet,
            "minted": 0, "fingerprinted": 0, "batch_id": None,
-           "identity_error": None, "embedded": False, "dry_run": dry_run}
+           "identity_error": None, "fingerprint_error": None,
+           "embedded": False, "dry_run": dry_run}
     if dry_run or not cleaned:
         return out
     to_mint = [{"version_id": str(uuid.uuid4()), "title": e["title"],
@@ -2125,7 +2128,15 @@ def ingest_published(client, project_id: str, entries: list[dict], *,
             "ngram_hashes": fp.ngram_hashes(m["body"]),
             "angle_key": None,       # 补进来的稿子不是发牌产出的, 没有坐标
         })
-    out["fingerprinted"] = store.write_fingerprints(client, payload)
+    # ⚠️ 身份已经建好了。这一步再抛出去, 调用方(CLI)就到不了"跑 backfill"那句,
+    #    而一次自然的重跑看不到这几条的指纹, 会再建一份身份(codex review)。
+    #    所以吞掉、写进返回值, 让 CLI 把正确的补救路径说出来。
+    try:
+        out["fingerprinted"] = store.write_fingerprints(client, payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ingest: 身份建成 %d 条后写指纹失败 (project=%s)",
+                         len(done), project_id)
+        out["fingerprint_error"] = f"{type(exc).__name__}: {exc}"[:300]
     out["embedded"] = bool(vecs)
     return out
 
@@ -2148,18 +2159,30 @@ def pipeline_leak(client, days: int = LEAK_WINDOW_DAYS) -> dict:
     per = store.angle_leak(client, days)
     drawn = sum(p["drawn"] for p in per)
     consumed = sum(p["consumed"] for p in per)
+
+    def _breach(d: int, c: int) -> bool:
+        return d >= LEAK_MIN_DRAWN and round(100 * (d - c) / d) > LEAK_ALERT_PCT
+
     for p in per:
         p["leak_pct"] = (round(100 * (p["drawn"] - p["consumed"]) / p["drawn"])
                          if p["drawn"] else 0)
+        p["ok"] = not _breach(p["drawn"], p["consumed"])
     pct = round(100 * (drawn - consumed) / drawn) if drawn else 0
-    ok = not (drawn >= LEAK_MIN_DRAWN and pct > LEAK_ALERT_PCT)
+    # ⚠️ 逐项目也判, 不只看总量: 一个 30/30 全漏的项目会被另一个 100/100 全入库
+    #    的大项目摊成 23%、判成健康 —— 而那个小项目的指纹一条都没进(codex review)。
+    over = [p for p in per if not p["ok"]]
+    ok = not _breach(drawn, consumed) and not over
     return {
         "window_days": days, "drawn": drawn, "consumed": consumed,
-        "leak_pct": pct, "ok": ok, "projects": per,
+        "leak_pct": pct, "ok": ok,
+        "projects_over_threshold": len(over),
+        "projects": per,
         "note": ("发出去的角度里没走到 commit_drafts 的比例。没入库的稿子没有"
                  "指纹, 下一批查重看不见它们。健康时约 20%, 超过 "
                  f"{LEAK_ALERT_PCT}% 就该去看是谁的会话在半路停的"
-                 + ("" if ok else " —— 现在就超了")),
+                 + ("" if ok else
+                    f" —— 现在就超了({len(over)} 个项目单独超线)" if over
+                    else " —— 现在就超了")),
     }
 
 

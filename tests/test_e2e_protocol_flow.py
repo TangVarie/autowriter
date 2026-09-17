@@ -120,6 +120,8 @@ def test_the_whole_protocol_end_to_end(env):
     h = client.get("/health").json()
     pipe = h["config"]["pipeline"]
     assert pipe["ok"] is True and pipe["drawn"] == 3 and pipe["consumed"] == 3, pipe
+    assert "projects" not in pipe and "e2e-途鸽-D9" not in client.get("/health").text, \
+        "/health 不鉴权, 项目名单不许出现在里面"
     assert "pipeline" not in h or h["ok"] == (h["config"]["supabase"]["ok"]
                                              and h["config"]["vendored_vocab"]["ok"]
                                              and h["config"]["auth"]["ok"])

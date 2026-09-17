@@ -273,3 +273,23 @@ def test_the_probe_advice_never_says_to_call_get_protocol_bare():
         assert "不带参数，它是最轻的一个" not in p
     stub = STUB.read_text(encoding="utf-8")
     assert "（最轻的一个）" not in stub
+
+
+def test_version_changes_when_only_the_skill_header_changes(tmp_path, monkeypatch):
+    """codex review P2: 引线头里有几条独立生效的规矩。只改它不改正文时版本号
+    不变的话, 装着旧 skill 的机器永远等不到这次更新。"""
+    _, before = T.protocol_text()
+    stale = tmp_path / "SKILL.md"
+    stale.write_text(STUB.read_text(encoding="utf-8").replace("## 四条在任何时候都生效的规矩",
+                                                             "## 五条在任何时候都生效的规矩"),
+                     encoding="utf-8")
+    monkeypatch.setattr(T, "SKILL_PATH", stale)
+    _, after = T.protocol_text()
+    assert after != before
+
+
+def test_a_stale_client_also_receives_the_header_rules():
+    out = T.get_protocol(local_version="deadbeefcafe")
+    assert "skill_header" in out and "不要问运营" in out["skill_header"]
+    assert not out["skill_header"].startswith("---"), "frontmatter 不是规矩, 不发"
+    assert "skill_header" not in T.get_protocol(local_version=T.protocol_text()[1])

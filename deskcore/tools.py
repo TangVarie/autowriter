@@ -47,12 +47,37 @@ _SKILL_MARK_RE = re.compile(r"<!-- protocol_version: ([0-9a-f]{12}) -->")
 # 协议
 # ══════════════════════════════════════════════════════════════════════
 
+def skill_head() -> str:
+    """技能文件里标记行以上的部分(含 frontmatter): 手写的引线头。没有文件就是空串。"""
+    try:
+        skill = SKILL_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    head, sep, _ = skill.partition("<!-- protocol_version:")
+    return head.strip() if sep else ""
+
+
+def _strip_frontmatter(text: str) -> str:
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            return text[end + 5:].strip()
+    return text
+
+
 def protocol_text() -> tuple[str, str]:
-    """(协议全文, 12 位版本哈希)。每次从盘上读: 十几 KB, 微秒级, 换来热修不必重启。"""
+    """(协议正文, 12 位版本哈希)。每次从盘上读: 十几 KB, 微秒级, 换来热修不必重启。
+
+    ⚠️ 版本哈希盖的是**引线头 + 正文**, 不只是 protocol.md。引线头里有几条独立
+    生效的规矩(失败不编原因 / 不问"要不要跳过"…), 只改它不改正文时, 装着旧
+    skill 的机器如果版本号不变, get_protocol 就会一直说 up_to_date, 那次更新
+    永远送不到(codex review P2)。
+    """
     text = PROTOCOL_PATH.read_text(encoding="utf-8").strip()
     if not text:
         raise RuntimeError(f"协议文件为空: {PROTOCOL_PATH}")
-    return text, hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256((skill_head() + "\n" + text).encode("utf-8")).hexdigest()[:12]
+    return text, digest
 
 
 def get_protocol(local_version: str | None = None,
@@ -65,7 +90,9 @@ def get_protocol(local_version: str | None = None,
                           里没有正文; False: 本地是旧版, 正文在 ``protocol`` 里,
                           照它执行, 并告诉用户一句「写作台 skill 有更新, 重新导入
                           一下」; None: 没传 local_version, 全文已返回
-      · ``protocol``    —— 协议全文(只在需要时带)
+      · ``protocol``    —— 协议正文(只在需要时带)
+      · ``skill_header`` —— skill 文件引线头里那几条独立规矩(和 protocol 一起带;
+                          版本号盖的是两者, 头改了也算过期)
 
     ⚠️ 协议正文的**主副本在 skill 文件里**, 不在这个工具的返回值里。2026-09-10 曾
     反过来 —— skill 只留一根引线, 正文每次由这个工具下发 —— 结果 09-11 起定稿
@@ -90,8 +117,10 @@ def get_protocol(local_version: str | None = None,
     if local_version is not None:
         m = re.search(r"[0-9a-f]{12}", str(local_version).lower())
         local_version = m.group(0) if m else str(local_version).strip()
+    header = _strip_frontmatter(skill_head())
     if local_version is None:
         out["protocol"] = text
+        out["skill_header"] = header
         out["up_to_date"] = None
         out["note"] = ("没带 local_version, 全文已返回, 照着执行。装了 skill 的话"
                        "下次带上它 protocol_version 那一行的值, 一致就不用再传全文。")
@@ -100,6 +129,7 @@ def get_protocol(local_version: str | None = None,
         out["note"] = "本地 skill 就是最新版, 照它执行。"
     else:
         out["protocol"] = text
+        out["skill_header"] = header
         out["up_to_date"] = False
         out["warning"] = (
             f"本地 skill 是旧版({str(local_version).strip()[:12]}), 服务端是 "
@@ -121,6 +151,8 @@ def render_skill(current_skill: str, body: str, version: str) -> str:
             f"{SKILL_PATH} 里没有 protocol_version 标记行 —— 不知道从哪儿开始替换。")
     # 标记行之外再写一行**可见的**版本号: 有的 skill 加载器会把 HTML 注释剥掉,
     # 模型就找不到该传给 get_protocol 的值了。机器认注释, 人和模型认下面这行。
+    # ⚠️ version 必须是按【这个 head + 这个 body】算出来的(见 protocol_text);
+    #    调用方(cli sync-skill)先把 head 写好再算, 否则标记里的号和内容对不上。
     return (head.rstrip("\n") + "\n\n"
             + SKILL_VERSION_MARK.format(version=version) + "\n"
             + f"protocol_version: {version}\n\n" + body + "\n")

@@ -1132,19 +1132,29 @@ def update_fingerprint_hashes(sb, row_id: str, *, opening_hash: str,
     return bool(res.data)
 
 
-def existing_opening_hashes(sb, project_id: str, hashes: list[str]) -> set[str]:
-    """这些正文开头哈希里, 哪些在这个项目的指纹库里已经有了。给 ingest 做幂等。
+def existing_fingerprint_sketches(sb, project_id: str,
+                                  opening_hashes: list[str]) -> dict[str, set[tuple]]:
+    """这些开头哈希在本项目指纹库里已有的行, 连同各自的四字串 sketch。给 ingest 做幂等。
+
+    返回 {opening_hash: {tuple(sorted(ngram_hashes)), ...}}。调用方要拿**开头 +
+    整篇 sketch** 一起比才算同一篇: 开头哈希只是正文前 25 个字, 小红书同一个模板
+    开头("家人们谁懂啊…")能起一百篇不同的稿子, 只按它去重会把后面九十九篇全部
+    跳过、指纹永远进不了库(codex review)。sketch 是确定性的 bottom-k, 正文相同
+    则相同; 正文不同而 sketch 完全相同的概率可以忽略。
 
     分块 .in_(): PostgREST 把 in 列表拼进 URL, 太长会被网关截掉而不报错。
     """
-    found: set[str] = set()
-    uniq = sorted({h for h in hashes if h})
+    found: dict[str, set[tuple]] = {}
+    uniq = sorted({h for h in opening_hashes if h})
     for i in range(0, len(uniq), 200):
         chunk = uniq[i:i + 200]
-        rows = (sb.table("draft_fingerprints").select("opening_hash")
+        rows = (sb.table("draft_fingerprints").select("opening_hash, ngram_hashes")
                   .eq("project_id", project_id)
                   .in_("opening_hash", chunk).execute()).data or []
-        found.update(r["opening_hash"] for r in rows if r.get("opening_hash"))
+        for r in rows:
+            oh = r.get("opening_hash")
+            if oh:
+                found.setdefault(oh, set()).add(tuple(sorted(r.get("ngram_hashes") or [])))
     return found
 
 
