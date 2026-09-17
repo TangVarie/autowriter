@@ -637,8 +637,12 @@ def record_draw(sb, project_id: str, angles: list[dict], user_id: str | None) ->
     """
     if not angles:
         return
+    # drawn_at 库里有 DEFAULT NOW(), 但这里显式写: 降级路径自己该是完整的
+    # (consume_angle 写 consumed_at 也是显式的), 而且 pipeline_leak 按它筛窗口。
+    now = iso_now()
     rows = [{"project_id": project_id, "angle_key": a["angle_key"],
-             "dims": a["dims"], "drawn_by": user_id} for a in angles]
+             "dims": a["dims"], "drawn_by": user_id, "drawn_at": now}
+            for a in angles]
     try:
         sb.table("angle_ledger").insert(rows).execute()
     except Exception:

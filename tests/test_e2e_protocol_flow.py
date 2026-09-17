@@ -102,6 +102,13 @@ def test_the_whole_protocol_end_to_end(env):
     r = call("export_drafts", project_id=pid, batch_id=batch_id)
     assert r["filename"].endswith(".xlsx")
     assert base64.b64decode(r["xlsx_base64"])[:2] == b"PK"
+    # review 走 versions → items!inner → batches!inner 的嵌套查询, 假库同样要手动嵌。
+    items_by_id = {i["id"]: i for i in fake.rows["items"]}
+    for v in fake.rows["versions"]:
+        it = items_by_id[v["item_id"]]
+        v["items"] = {"id": it["id"], "status": it["status"],
+                      "decision_source": it.get("decision_source"),
+                      "batch_id": it["batch_id"], "batches": {"project_id": pid}}
     r = call("review_drafts", project_id=pid,
              decisions=[{"version_id": vids[0], "decision": "approved"},
                         {"version_id": vids[1], "decision": "needs_revision"}])
