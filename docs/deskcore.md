@@ -165,7 +165,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
 | | `borrow_lessons` | 转调 TV 馆员，借真实爆款经验卡 |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
-| | `commit_drafts` | 定稿入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账 |
+| | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回 |
 | 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human` + 真实 reviewer + 时间。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |

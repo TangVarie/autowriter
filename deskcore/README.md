@@ -23,6 +23,7 @@
 | 稿子发出去就断线了，TV 那边 `v_model_comparison` 长期查出空集还不报错 | `export_drafts` 导的 xlsx 带六列 `_source_autowriter_*`，是笔记回到写作台的唯一线索；列名写错会让 TV 整行 quarantine，判据见 `tests/test_lineage_contract.py`（六个名字手抄在用例里，**不**从 `exporter` 读） |
 | 借阅失败和"这次没匹配"长得一模一样，用不上经验也没人知道 | `borrow_lessons` 回 `status`：`borrowed` / `empty` / `not_configured` / `timeout` / `error` 五种结局分开，带耗时 |
 | 模型跳过 `check_drafts` 直接 `commit_drafts`，同题重写的稿子整批进库（途鸽 09-10 四个标题各入库两次，两两 Jaccard 只有 0.33） | **入库自带闸**：`commit_drafts` 先跑和 `check_drafts` 同一套判定（标题语义、开头、四字串、本批内互比），判 reject 的不进 RPC；没带 `angle_key` 的数出来（`unattributed`），台账销不了账的角度下一批会再被抽到 |
+| 协议让 `commit_drafts` 等「用户确认定稿」再调，运营拿了稿子就走，近一周 214 个角度只有 20 条走到入库；改稿时新稿又撞上自己旧版的指纹 | 协议改成**交付即入库**（待审，不代表定稿；定稿与否由飞书 → TV 的 `tv-sync` 对照回来），改稿用 `replaces_version_id` 原地升版：先摘旧指纹再过闸，成功同一个 item 加一版，被拒或异常把指纹放回（2026-09-18） |
 | 09-11 起 78% 的角度发出去了、稿子没入库，指纹库不知道它们，下一批查重看不见——而 `/health` 一直 ok | `doctor` 和 `/health` 的 `config.pipeline` 报近 7 天「发了角度没入库」的比例，超过 50% 标红（不进顶层 `ok`：那是流程在漏，不是服务坏了） |
 | 已经发出去、没走 commit 的稿子永远补不回指纹库 | 工具 `ingest_published`（运营在 WorkBuddy 里把表粘给模型，≤ 50 条一次，重复调安全）或 `python -m deskcore.cli ingest --xlsx 飞书表` 从导出格式或「标题/正文」两列读回来，建身份（出处记在 `batches.params`，**不碰** `items.external_source`——那列是 TV 同步的标记）+ 写指纹，**不过闸**——已发生的事实拦它没有意义 |
 | TV 里 5966 条已发笔记一条都认不回写作台（lineage 全 NULL）；让运营手抄六个 ID 列进飞书三周零匹配 | `tv-sync`（`migrations/009`）在库里按内容对：正文前 40 字 / 标题 / 时间窗内四字串包含度；对不上的直接从 TV 的全文补录进指纹库；`--write-tv` 才回填 TV 的两列。**运营不做任何事，飞书表不加列**。见 `docs/deskcore.md` §3.7 |

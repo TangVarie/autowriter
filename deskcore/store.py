@@ -1319,6 +1319,75 @@ def _mint_entries(sb, batch_id: str, user_id: str, entries: list[dict],
         minted[e["version_id"]] = item_id
 
 
+# ── 改稿替换旧版(2026-09-18, 交付即入库的配套) ─────────────────────────
+# 交付即入库之后, 用户让改某一条时新稿会撞上它自己旧版的指纹。替换的做法是:
+# 先把旧 item 全部版本的指纹摘下来(留副本), 新稿走同一套闸, 入了库就在旧 item
+# 上加一版; 没入库就把指纹原样放回。下面五个函数是那条路的库操作, 各自只做一件事。
+
+def version_ids_of_items(sb, item_ids: list[str]) -> dict[str, list[dict]]:
+    """``item_id`` → ``[{"id", "version_num"}, …]``。没版本的 item 也在, 值为空列表。"""
+    out: dict[str, list[dict]] = {str(i): [] for i in item_ids}
+    for chunk in db._in_chunks(list(dict.fromkeys(item_ids)), 100):
+        res = (sb.table("versions").select("id, item_id, version_num")
+               .in_("item_id", chunk).execute())
+        for v in (res.data or []):
+            out.setdefault(str(v["item_id"]), []).append(
+                {"id": str(v["id"]), "version_num": int(v.get("version_num") or 0)})
+    return out
+
+
+def fingerprint_rows_for_versions(sb, project_id: str, version_ids: list[str]) -> list[dict]:
+    """这些版本在指纹库里的**整行**(select *), 给"摘下来之后还能放回去"用。"""
+    rows: list[dict] = []
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        res = (sb.table("draft_fingerprints").select("*")
+               .eq("project_id", project_id).in_("version_id", chunk).execute())
+        rows.extend(res.data or [])
+    return rows
+
+
+def delete_fingerprints_for_versions(sb, project_id: str, version_ids: list[str]) -> int:
+    n = 0
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        res = (sb.table("draft_fingerprints").delete()
+               .eq("project_id", project_id).in_("version_id", chunk).execute())
+        n += len(res.data or [])
+    return n
+
+
+def restore_fingerprint_rows(sb, rows: list[dict]) -> int:
+    """把 ``fingerprint_rows_for_versions`` 拿到的行原样插回去(id 一并保留)。"""
+    if not rows:
+        return 0
+    sb.table("draft_fingerprints").insert(rows).execute()
+    return len(rows)
+
+
+def add_version_to_item(sb, item_id: str, *, version_id: str, version_num: int,
+                        title: str, body: str, keywords: list | None = None,
+                        ai_engine: str = DESKCORE_AI_ENGINE) -> None:
+    """给已有的 item 加一版。``version_num`` 由调用方按 max+1 算(UNIQUE(item_id, version_num))。"""
+    sb.table("versions").insert({
+        "id": version_id, "item_id": item_id, "version_num": int(version_num),
+        "ai_engine": ai_engine, "title": title or "", "body": body or "",
+        "keywords": keywords or [],
+    }).execute()
+
+
+def point_item_at_version(sb, item_id: str, version_id: str, *, reset_decision: bool) -> None:
+    """把 item 的 best_version_id 指到新版。
+
+    ``reset_decision``: 旧版已经被人审过(approved / needs_revision)的, 新版是另一
+    篇稿子, 那个结论不再成立 —— 重置回 pending, 出处记 SYSTEM(既非审稿也非检测,
+    见 db.DecisionSource)。没审过的**不碰决策三列**: 入库路径不许盖决策戳。
+    """
+    if reset_decision:
+        db.update_item_status(sb, item_id, "pending", best_version_id=version_id,
+                              source=db.DecisionSource.SYSTEM)
+    else:
+        sb.table("items").update({"best_version_id": version_id}).eq("id", item_id).execute()
+
+
 def items_for_versions(sb, project_id: str,
                        version_ids: list[str]) -> dict[str, dict]:
     """``version_id`` → ``{"item_id", "status", "decision_source"}``，**只认本项目的**。
