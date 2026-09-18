@@ -2092,6 +2092,7 @@ def migration_state(client) -> dict:
 INGEST_LOCK_TTL_SEC = 600          # 一批 ≤ 50 条远用不了; tv-sync 一个项目几百条也够
 INGEST_LOCK_WAIT_SEC = 90          # 等不到就报 IngestBusy, 让调用方稍后再来
 INGEST_LOCK_POLL_SEC = 2.0
+INGEST_EMBED_CHUNK = 100           # embed_content 单次上限; 也限住指纹请求体
 _ingest_proc_locks: dict[str, threading.Lock] = {}
 _ingest_proc_guard = threading.Lock()
 
@@ -2223,31 +2224,39 @@ def _ingest_published_unlocked(client, project_id: str, entries: list[dict], *,
                written=[{"index": m["index"], "version_id": m["version_id"]} for m in done])
     if not done:
         return out
-    vecs = (dedup.embed_texts([m["title"] for m in done])
-            if dedup.embeddings_available() else None)
-    payload = []
-    for i, m in enumerate(done):
-        vec = vecs[i] if vecs and i < len(vecs) and vecs[i] else None
-        payload.append({
-            "project_id": project_id, "user_id": user_id,
-            "version_id": m["version_id"], "title": m["title"],
-            "opening": fp.opening_of(m["body"]),
-            "title_embedding": vec,
-            "embedding_model": dedup.EMBEDDING_MODEL if vec else None,
-            "opening_hash": fp.opening_hash(m["body"]),
-            "ngram_hashes": fp.ngram_hashes(m["body"]),
-            "angle_key": None,       # 补进来的稿子不是发牌产出的, 没有坐标
-        })
-    # ⚠️ 身份已经建好了。这一步再抛出去, 调用方(CLI)就到不了"跑 backfill"那句,
-    #    而一次自然的重跑看不到这几条的指纹, 会再建一份身份(codex review)。
-    #    所以吞掉、写进返回值, 让 CLI 把正确的补救路径说出来。
-    try:
-        out["fingerprinted"] = store.write_fingerprints(client, payload)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("ingest: 身份建成 %d 条后写指纹失败 (project=%s)",
-                         len(done), project_id)
-        out["fingerprint_error"] = f"{type(exc).__name__}: {exc}"[:300]
-    out["embedded"] = bool(vecs)
+    # 按 INGEST_EMBED_CHUNK 条一批: embed_content 单次最多 100 条, 指纹行带 400 个
+    # 四字串 hash + 768 维向量, 几百行一个请求体会顶到网关上限。tv-sync 一次
+    # 补几百条是常态(2026-09-17 dry-run: sportsix 461 / 雷诺考特 357 / 西屋 301)。
+    embedded_any = False
+    can_embed = dedup.embeddings_available()
+    for start in range(0, len(done), INGEST_EMBED_CHUNK):
+        chunk = done[start:start + INGEST_EMBED_CHUNK]
+        vecs = dedup.embed_texts([m["title"] for m in chunk]) if can_embed else None
+        payload = []
+        for i, m in enumerate(chunk):
+            vec = vecs[i] if vecs and i < len(vecs) and vecs[i] else None
+            payload.append({
+                "project_id": project_id, "user_id": user_id,
+                "version_id": m["version_id"], "title": m["title"],
+                "opening": fp.opening_of(m["body"]),
+                "title_embedding": vec,
+                "embedding_model": dedup.EMBEDDING_MODEL if vec else None,
+                "opening_hash": fp.opening_hash(m["body"]),
+                "ngram_hashes": fp.ngram_hashes(m["body"]),
+                "angle_key": None,       # 补进来的稿子不是发牌产出的, 没有坐标
+            })
+        # ⚠️ 身份已经建好了。这一步再抛出去, 调用方(CLI)就到不了"跑 backfill"那句,
+        #    而一次自然的重跑看不到这几条的指纹, 会再建一份身份(codex review)。
+        #    所以吞掉、写进返回值, 让 CLI 把正确的补救路径说出来。
+        try:
+            out["fingerprinted"] += store.write_fingerprints(client, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("ingest: 身份建成 %d 条后写指纹失败 (project=%s, 已写 %d)",
+                             len(done), project_id, out["fingerprinted"])
+            out["fingerprint_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            break
+        embedded_any = embedded_any or bool(vecs)
+    out["embedded"] = embedded_any
     return out
 
 
@@ -3040,6 +3049,9 @@ def _tv_owner(client, project_id: str) -> str:
     return str(owner)
 
 
+TV_SYNC_INGEST_CHUNK = 100    # 一次 ingest_published 补几条; 与 tools 的 50 上限无关
+
+
 def _resolve_any_version(client, project_of: dict, version_id: str):
     """TV 自己带的 version_id 可能指向某个 item 的**旧版**(不是 best), 对照索引里
     只有 best 那一版。按对照表里的每个写作台项目再问一次库(items_for_versions
@@ -3152,12 +3164,57 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             to_ingest.append(n)
 
     ingest: dict | None = None
+    dup_of: dict[int, int] = {}          # to_ingest 下标 → 正文相同的第一条的下标
     if to_ingest and target is not None:
-        entries = [{"title": n.title, "body": n.body} for n in to_ingest]
-        ingest = ingest_published(client, target["project_id"], entries,
-                                  user_id=owners[target["project_id"]],
-                                  source=f"tv:{tv_project_id}", dry_run=dry_run)
+        # 先在整批里按 ingest 同一把尺子(开头哈希 + 四字串 sketch)去重, 再分块:
+        # 否则跨块的重复在 dry-run 里被数两次、真跑时第二份被判"已有指纹", 两边
+        # 的 to_write 对不上(codex #82)。重复的那条最后链到第一条建成的版本。
+        seen_key: dict[tuple, int] = {}
+        uniq: list[int] = []
+        for i, n in enumerate(to_ingest):
+            key = (fp.opening_hash(n.body), tuple(sorted(fp.ngram_hashes(n.body))))
+            first = seen_key.get(key) if key[0] else None
+            if first is None:
+                if key[0]:
+                    seen_key[key] = i
+                uniq.append(i)
+            else:
+                dup_of[i] = first
+        # 几百条分几次调: 每次一把锁(TTL 内做得完)、请求体有上限、半途失败只影响
+        # 一批。各批的计数合并成一份 ingest 报表, written 的下标换算回整体下标。
+        ingest = {"received": len(to_ingest), "to_write": 0,
+                  "skipped_already_fingerprinted": 0,
+                  "skipped_duplicate_in_sheet": len(dup_of), "minted": 0, "fingerprinted": 0,
+                  "batch_id": None, "batch_ids": [], "identity_error": None,
+                  "fingerprint_error": None, "embedded": False, "dry_run": dry_run,
+                  "written": [], "skipped_after_failure": 0}
+        for start in range(0, len(uniq), TV_SYNC_INGEST_CHUNK):
+            idxs = uniq[start:start + TV_SYNC_INGEST_CHUNK]
+            entries = [{"title": to_ingest[i].title, "body": to_ingest[i].body} for i in idxs]
+            part = ingest_published(client, target["project_id"], entries,
+                                    user_id=owners[target["project_id"]],
+                                    source=f"tv:{tv_project_id}", dry_run=dry_run)
+            for k in ("to_write", "skipped_already_fingerprinted",
+                      "skipped_duplicate_in_sheet", "minted", "fingerprinted"):
+                ingest[k] += part.get(k, 0)
+            ingest["embedded"] = ingest["embedded"] or bool(part.get("embedded"))
+            if part.get("batch_id"):
+                ingest["batch_ids"].append(part["batch_id"])
+                ingest["batch_id"] = ingest["batch_id"] or part["batch_id"]
+            for key in ("identity_error", "fingerprint_error"):
+                if part.get(key) and not ingest[key]:
+                    ingest[key] = part[key]
+            ingest["written"].extend({"index": idxs[w["index"]], "version_id": w["version_id"]}
+                                     for w in part.get("written", []))
+            if part.get("fingerprint_error"):
+                # 指纹写失败后别再往下补(先 backfill); 没处理到的要数出来并说清:
+                # backfill 之后还得再跑一次 tv-sync 补它们(codex #82 P1)。
+                ingest["skipped_after_failure"] = len(uniq) - (start + len(idxs))
+                break
         by_index = {w["index"]: w["version_id"] for w in ingest.get("written", [])}
+        for i, first in dup_of.items():
+            if first in by_index:
+                by_index[i] = by_index[first]
         item_of: dict[str, dict] = {}
         if by_index and not dry_run:
             try:
@@ -3167,9 +3224,13 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 logger.exception("tv_sync: 取补录稿子的 item_id 失败, 对照先不带 item_id")
         for i, n in enumerate(to_ingest):
             vid = by_index.get(i)
+            why = None
+            if not vid and ingest.get("fingerprint_error"):
+                why = [{"note": "补录半途指纹写失败, 这条还没处理: 先 backfill, 再跑一次 tv-sync"}]
             links.append(_link(n, "ingested" if vid else "unmatched",
                                project_id=target["project_id"], version_id=vid,
-                               item_id=(item_of.get(vid) or {}).get("item_id") if vid else None))
+                               item_id=(item_of.get(vid) or {}).get("item_id") if vid else None,
+                               candidates=why))
     else:
         for n in to_ingest:
             links.append(_link(n, "unmatched"))

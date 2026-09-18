@@ -265,3 +265,46 @@ def test_fingerprint_write_failure_is_reported_not_raised(monkeypatch):
     assert out["minted"] == 1 and out["fingerprinted"] == 0
     assert "PostgREST 502" in out["fingerprint_error"]
     assert len(c.rows["items"]) == 1, "身份建了就是建了, 要如实报"
+
+
+def test_large_ingest_embeds_and_writes_fingerprints_in_chunks(monkeypatch):
+    """真数据 dry-run: sportsix 一次要补 461 条。embed_content 单次最多 100 条,
+    几百行指纹一个请求体会顶到网关上限 —— 必须分批, 且分批之后计数仍是总数。"""
+    c = _client()
+    calls = {"embed": [], "write": []}
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: True)
+
+    def _embed(texts):
+        calls["embed"].append(len(texts))
+        return [[0.1] * 3 for _ in texts]
+    monkeypatch.setattr(core.dedup, "embed_texts", _embed)
+    real_write = core.store.write_fingerprints
+
+    def _write(sb, rows):
+        calls["write"].append(len(rows))
+        return real_write(sb, rows)
+    monkeypatch.setattr(core.store, "write_fingerprints", _write)
+    entries = [{"title": f"t{i}", "body": f"第 {i} 篇的正文各不相同, 长度都够二十个字以上。" * 3}
+               for i in range(230)]
+    out = core.ingest_published(c, PROJ, entries, user_id=ME, source="tv:SPX_phase1")
+    assert (out["minted"], out["fingerprinted"]) == (230, 230) and out["embedded"] is True
+    assert calls["embed"] == [100, 100, 30] and calls["write"] == [100, 100, 30]
+    assert len(out["written"]) == 230 and {w["index"] for w in out["written"]} == set(range(230))
+
+
+def test_fingerprint_failure_in_a_later_chunk_keeps_the_earlier_count(monkeypatch):
+    c = _client()
+    n = {"calls": 0}
+    real_write = core.store.write_fingerprints
+
+    def _write(sb, rows):
+        n["calls"] += 1
+        if n["calls"] == 2:
+            raise RuntimeError("502")
+        return real_write(sb, rows)
+    monkeypatch.setattr(core.store, "write_fingerprints", _write)
+    entries = [{"title": f"t{i}", "body": f"第 {i} 篇的正文各不相同, 长度都够二十个字以上。" * 3}
+               for i in range(150)]
+    out = core.ingest_published(c, PROJ, entries, user_id=ME, source="x")
+    assert out["minted"] == 150 and out["fingerprinted"] == 100
+    assert out["fingerprint_error"] and "502" in out["fingerprint_error"]

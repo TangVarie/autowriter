@@ -288,3 +288,75 @@ def test_cli_orders_recovery_when_both_ingest_stages_fail(fake, capsys, monkeypa
     assert "两种半途失败同时发生" in out
     assert out.index("**先**跑 `backfill") < out.index("**然后**再跑一次 tv-sync")
     assert "重跑 tv-sync 即可" not in out, "不许再给一句相反的指令"
+
+
+def test_hundreds_of_unmatched_notes_are_ingested_in_chunks_with_one_lock_each(monkeypatch):
+    """sportsix 一次要补 461 条: 分几次调 ingest_published(每次各拿一次锁), 报表合并,
+    written 的下标换算回整体, 每条笔记都拿到自己的 version_id。"""
+    notes = [_note(f"n{i:03d}", f"第 {i} 篇", f"第 {i} 篇没入库的正文各不相同, 长度都够二十个字以上。" * 3)
+             for i in range(250)]
+    c = _client(notes)
+    seen = []
+    real = core.ingest_published
+
+    def _spy(client, project_id, entries, **kw):
+        seen.append(len(entries))
+        return real(client, project_id, entries, **kw)
+    monkeypatch.setattr(core, "ingest_published", _spy)
+    out = core.tv_sync(c, TV)
+    assert seen == [100, 100, 50]
+    assert out["ingest"]["minted"] == 250 and out["ingest"]["fingerprinted"] == 250
+    assert len(out["ingest"]["batch_ids"]) == 3
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    assert all(links[n["note_id"]]["match_kind"] == "ingested" and links[n["note_id"]]["version_id"]
+               for n in notes)
+    assert len({links[n["note_id"]]["version_id"] for n in notes}) == 250, "每条各自的 version_id"
+
+
+def test_fingerprint_failure_mid_way_counts_the_unprocessed_rest_and_says_rerun(monkeypatch, capsys):
+    """codex #82 P1: 第二块写指纹失败后, 后面的块一条都没处理, 却被静默记成 unmatched、
+    不进 received/to_write, CLI 只说 backfill —— 照做的话最后那几十条永远没人补。"""
+    notes = [_note(f"n{i:03d}", f"第 {i} 篇", f"第 {i} 篇没入库的正文各不相同, 长度都够二十个字以上。" * 3)
+             for i in range(250)]
+    c = _client(notes)
+    n = {"calls": 0}
+    real_write = store.write_fingerprints
+
+    def _write(sb, rows):
+        n["calls"] += 1
+        if n["calls"] == 2:
+            raise RuntimeError("502")
+        return real_write(sb, rows)
+    monkeypatch.setattr(store, "write_fingerprints", _write)
+    out = core.tv_sync(c, TV)
+    ing = out["ingest"]
+    assert ing["received"] == 250 and ing["minted"] == 200 and ing["fingerprinted"] == 100
+    assert ing["skipped_after_failure"] == 50
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    unprocessed = [l for l in links.values() if l["match_kind"] == "unmatched"]
+    assert len(unprocessed) == 50 and all("再跑一次 tv-sync" in l["candidates"][0]["note"] for l in unprocessed)
+    # CLI 的话要把两步都说出来
+    monkeypatch.setattr(core, "sb", lambda: _client(notes))
+    n["calls"] = 0
+    assert cli.main(["tv-sync", "--tv-project", TV]) == 1
+    text = capsys.readouterr().out
+    assert "先**跑 `backfill" in text and "另有 50 条因此没处理到" in text and "再**跑一次 tv-sync" in text
+
+
+def test_duplicate_notes_across_a_chunk_boundary_count_once_in_dry_run_and_real(monkeypatch):
+    """codex #82 P2: 同正文的两条笔记落在两块里, dry-run 数两次、真跑第二份被判"已有
+    指纹" —— 两边 to_write 对不上。先整批去重再分块, 重复的那条链到第一条的版本。"""
+    body = "这一篇发了两次, 正文一模一样, 长度够二十个字以上。" * 3
+    notes = [_note(f"n{i:03d}", f"第 {i} 篇", f"第 {i} 篇没入库的正文各不相同, 长度都够二十个字以上。" * 3)
+             for i in range(120)]
+    notes[5] = _note("n005", "第一次发", body)
+    notes[115] = _note("n115", "第二次发", body)
+    dry = core.tv_sync(_client(notes), TV, dry_run=True)
+    c = _client(notes)
+    real = core.tv_sync(c, TV)
+    assert dry["ingest"]["to_write"] == real["ingest"]["to_write"] == 119
+    assert dry["ingest"]["skipped_duplicate_in_sheet"] == real["ingest"]["skipped_duplicate_in_sheet"] == 1
+    assert real["ingest"]["minted"] == 119
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    assert links["n115"]["match_kind"] == "ingested"
+    assert links["n115"]["version_id"] == links["n005"]["version_id"]

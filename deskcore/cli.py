@@ -330,16 +330,22 @@ def _tv_sync(core, sb, args) -> int:
             id_failed = bool(ing.get("identity_error"))
             missing = ing["minted"] - ing["fingerprinted"]
             if fp_failed and id_failed:
+                left = ing.get("skipped_after_failure", 0)
                 print(f"  ⚠️ 两种半途失败同时发生: {missing} 条建了身份没写上指纹"
                       f"({ing.get('fingerprint_error') or ''}), 另有几行身份没建成"
-                      f"({ing['identity_error']})。顺序必须是: **先**跑 `backfill --project "
+                      f"({ing['identity_error']})"
+                      + (f", 还有 {left} 条因此没处理到" if left else "")
+                      + f"。顺序必须是: **先**跑 `backfill --project "
                       f"{out['ingest_target']}` 把指纹补上, **然后**再跑一次 tv-sync 补没建成"
-                      "的那几行。别反过来, 也别现在就重跑 tv-sync。")
+                      "的和没处理到的。别反过来, 也别现在就重跑 tv-sync。")
                 rc = 1
             elif fp_failed:
+                left = ing.get("skipped_after_failure", 0)
                 print(f"  ⚠️ 有 {missing} 条建了身份没写上指纹"
-                      f"({ing.get('fingerprint_error') or ''}) —— 跑 `backfill --project "
-                      f"{out['ingest_target']}` 补, **不要**重跑 tv-sync 指望它补")
+                      f"({ing.get('fingerprint_error') or ''}) —— **先**跑 `backfill --project "
+                      f"{out['ingest_target']}` 补指纹, **不要**重跑 tv-sync 指望它补这几条"
+                      + (f"; 另有 {left} 条因此没处理到(记为 unmatched), backfill 之后"
+                         "**再**跑一次 tv-sync 补它们" if left else ""))
                 rc = 1
             elif id_failed:
                 print(f"  ⚠️ 身份没建全: {ing['identity_error']} —— 重跑 tv-sync 即可, "
