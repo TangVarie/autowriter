@@ -341,6 +341,24 @@ def main() -> int:
         print(f"  ✓ autowriter 下全部 {n_tbl} 张表都对 service_role 有 "
               "SELECT/INSERT/UPDATE/DELETE(建表 ≠ 能访问, 2026-08-26 的教训)")
 
+    # ── ②' 每张表都要开 RLS ───────────────────────────────────────
+    # 009 建了三张表, 发了 GRANT, 忘了 ENABLE ROW LEVEL SECURITY —— 本 schema 其他
+    # 每张表都开着, Supabase 的 advisor 对着生产库报出来(2026-09-18, 见 010)。
+    # 不是漏洞(anon 对它们没 GRANT), 但和上一条同理: 断言不变量而不是名单, 以后
+    # 再建表忘了开, 这条自己会红。
+    rows = sql(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname='autowriter' AND c.relkind='r' AND NOT c.relrowsecurity "
+        "ORDER BY c.relname;")
+    no_rls = [ln.strip() for ln in rows.splitlines() if ln.strip()]
+    if no_rls:
+        for tbl in no_rls:
+            print(f"  [FAIL] autowriter.{tbl} 没开 RLS —— 建表要带 ENABLE ROW LEVEL "
+                  "SECURITY(009 漏了, 010 补的)")
+        bad += len(no_rls)
+    else:
+        print("  ✓ autowriter 下每张表都开了 RLS(009 漏了三张, 010 补上, 以后不再漏)")
+
     # ── ②'' 008 的按模型过滤真的落在【最终】的函数体里 ─────────────────
     # 为什么单独验: 008 是 CREATE OR REPLACE, 签名和返回列一个字都没动 ——
     # 它有没有生效, 从调用侧**完全看不出来**, 直到某天有人换了 embedding 模型,

@@ -1499,3 +1499,12 @@ REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM PUBLI
 REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM anon;
 REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM authenticated;
 GRANT EXECUTE ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) TO service_role;
+
+-- ══════════════════════════════════════════════════════════════════════
+-- 009 那三张表开 RLS (migrations/010_tv_links_rls.sql)
+-- 为什么见 010 的文件头: 本 schema 每张表都开 RLS 是惯例, 009 漏了。service_role
+-- 绕 RLS, 对 deskcore / CLI 零影响; sql_parity_check 守"每张表都开了"这条不变量。
+-- ══════════════════════════════════════════════════════════════════════
+ALTER TABLE autowriter.tv_project_map ENABLE ROW LEVEL SECURITY;
+ALTER TABLE autowriter.tv_note_links  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE autowriter.ingest_locks   ENABLE ROW LEVEL SECURITY;

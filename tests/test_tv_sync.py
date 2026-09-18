@@ -127,13 +127,42 @@ def test_write_tv_backfills_only_rows_with_a_version_and_marks_them_synced():
 
 
 def test_a_previously_linked_but_unsynced_row_is_backfilled_on_the_next_write_tv():
-    """第一天没开 --write-tv, 第二天开了: 昨天对上的也要回填, 不只是今天新对上的。"""
+    """第一天没开 --write-tv, 第二天开了: 昨天对上的也要回填, 不只是今天新对上的。
+    昨天补录的(n2, ingested)照样不写 —— 见下一个用例。"""
     c = _client(NOTES)
     core.tv_sync(c, TV)                              # 对上了, 没回填
     out = core.tv_sync(c, TV, write_tv=True)         # 全部 already_linked
     assert out["counts"]["already_linked"] == 2
     sent = {l["note_id"] for l in c.tv_calls["backfill"][0]}
-    assert sent == {"n1", "n2"} and out["tv_backfilled"] == 2
+    assert sent == {"n1"} and out["tv_backfilled"] == 1
+
+
+def test_ingested_links_are_never_written_back_to_tv():
+    """TV 2026-09-18 核对时的条件: ingested 的版本是我们从这条笔记复制进写作台的,
+    写回 source_autowriter_* 等于说"笔记来源于版本 X"而 X 来源于笔记 —— 因果倒置,
+    TV 的模型对比视图会多出上千行没信息量的 deskcore。真对上的(n1)照写; 补录的
+    (n2)有 version_id 也不写、不标 synced, 无论是本次补的还是昨天补的。"""
+    c = _client(NOTES)
+    out = core.tv_sync(c, TV, write_tv=True)          # n2 本次补录
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    assert links["n2"]["match_kind"] == "ingested" and links["n2"]["version_id"]
+    assert out["tv_backfilled"] == 1
+    assert {l["note_id"] for l in c.tv_calls["backfill"][0]} == {"n1"}
+    assert links["n1"].get("synced_to_tv_at") and not links["n2"].get("synced_to_tv_at")
+
+    again = core.tv_sync(c, TV, write_tv=True)        # n2 现在是"昨天补的、没 synced"
+    assert again["tv_backfilled"] == 0 and len(c.tv_calls["backfill"]) == 1, \
+        "没 synced 的 ingested 行也不能在第二天被当成漏网之鱼补写"
+    assert not {l["note_id"]: l for l in c.rows["tv_note_links"]}["n2"].get("synced_to_tv_at")
+
+    # codex #83 P1: --rematch 会把 n2 重新对到从它自己复制出来的那一版(正文相同 →
+    # body_exact), 然后 --write-tv 把它写回 TV —— 正是这个 PR 要排除的东西。
+    # ingested 是终态, --rematch 也不重对。
+    third = core.tv_sync(c, TV, rematch=True, write_tv=True)
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    assert links["n2"]["match_kind"] == "ingested" and not links["n2"].get("synced_to_tv_at")
+    assert third["counts"]["already_linked"] == 1 and third["counts"]["body_exact"] == 1
+    assert all({l["note_id"] for l in call} == {"n1"} for call in c.tv_calls["backfill"])
 
 
 def test_tv_lineage_only_carries_a_version_id_we_actually_have():
@@ -171,6 +200,45 @@ def test_ambiguous_keeps_candidates_and_does_not_guess():
     link = c.rows["tv_note_links"][0]
     assert link["match_kind"] == "ambiguous" and link["version_id"] is None
     assert {x["version_id"] for x in link["candidates"]} == {"v1", "v2"}
+
+
+def test_tv_resolve_ingest_turns_an_ambiguous_note_into_an_ingested_link(capsys, monkeypatch):
+    """人看完「分不出」说"对不上": 正文补进指纹库, 对照改成 ingested 带 version_id,
+    原 candidates 保留并加一条人工判定; 第二天 tv_sync 把它当已对上跳过; 已对上的
+    / 不存在的 / 没正文的都不判。2026-09-18 途鸽那条(两版同标题的评论稿)的出口。"""
+    c = _client([_note("n9", "同一个标题两版", "跟两版都不像的正文, 只有标题对得上, 凑够二十个字。")])
+    c.rows["items"].append({"id": "i2", "batch_id": "b1", "best_version_id": "v2",
+                            "created_at": _iso(0), "user_id": ME, "status": "pending",
+                            "versions": [{"id": "v2", "title": "同一个标题两版", "body": BODY_A,
+                                          "version_num": 1, "created_at": _iso(0)}],
+                            "batches": {"project_id": P1}})
+    c.rows["items"][0]["versions"][0]["title"] = "同一个标题两版"
+    core.tv_sync(c, TV)
+    assert c.rows["tv_note_links"][0]["match_kind"] == "ambiguous"
+    n_versions = len(c.rows["versions"])
+
+    out = core.tv_resolve(c, "n9", ingest=True)
+    assert out["resolved"] and out["version_id"]
+    link = c.rows["tv_note_links"][0]
+    assert link["match_kind"] == "ingested" and link["version_id"] == out["version_id"]
+    assert link["candidates"][0]["note"].startswith("人工判定")
+    assert {x.get("version_id") for x in link["candidates"][1:]} == {"v1", "v2"}, "原候选保留"
+    assert len(c.rows["versions"]) == n_versions + 1
+    assert len(c.rows["draft_fingerprints"]) == 1
+
+    again = core.tv_sync(c, TV)
+    assert again["counts"]["already_linked"] == 1 and again["counts"]["ambiguous"] == 0
+
+    with pytest.raises(ValueError, match="已经对上了"):
+        core.tv_resolve(c, "n9", ingest=True)
+    with pytest.raises(ValueError, match="没有"):
+        core.tv_resolve(c, "nope", ingest=True)
+    with pytest.raises(ValueError, match="只有 --ingest"):
+        core.tv_resolve(c, "n9", ingest=False)
+
+    monkeypatch.setattr(core, "sb", lambda: c)
+    assert cli.main(["tv-resolve", "--note", "n9", "--ingest"]) == 2
+    assert "已经对上了" in capsys.readouterr().out
 
 
 def test_tv_notes_are_paged_by_keyset():

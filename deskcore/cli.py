@@ -302,6 +302,16 @@ def _tv_map(core, sb, args) -> int:
     return 0
 
 
+def _tv_resolve(core, sb, args) -> int:
+    try:
+        out = core.tv_resolve(sb, args.note, ingest=args.ingest)
+    except ValueError as e:
+        print(f"没判: {e}")
+        return 2
+    print(out["note"])
+    return 0 if out["resolved"] else 1
+
+
 def _tv_sync(core, sb, args) -> int:
     from . import store as S
     if not args.tv_project and not args.all:
@@ -557,6 +567,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--write-tv", action="store_true",
                    help="把对照写回 TV 的 source_autowriter_* 列(只填空的; 先跟 TV 打招呼)")
     p.add_argument("--dry-run", action="store_true", help="全部算、一行不写")
+    p = sub.add_parser("tv-resolve",
+                       help="人看过 tv-sync 报的「分不出」之后落判定(目前只有: 对不上, 按正文补录)")
+    p.add_argument("--note", required=True, help="tv_note_links.note_id")
+    p.add_argument("--ingest", action="store_true", help="判定为对不上, 把 TV 的正文补进指纹库")
 
     args = ap.parse_args(argv)
     if args.cmd == "selftest":
@@ -585,6 +599,8 @@ def main(argv: list[str] | None = None) -> int:
         return _tv_map(core, sb, args)
     if args.cmd == "tv-sync":
         return _tv_sync(core, sb, args)
+    if args.cmd == "tv-resolve":
+        return _tv_resolve(core, sb, args)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user))
     elif args.cmd == "open":

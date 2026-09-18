@@ -202,21 +202,49 @@ python -m deskcore.cli tv-map add --tv-project BJS_phase1   --project efe112d3-7
 # 它们的版本也参与对照, 但对不上的只补录进上面那个目标项目。id 用 `projects --user <owner>` 查。
 python -m deskcore.cli tv-sync --all --dry-run     # 先看数: 对上多少、分不出多少、会补录多少
 python -m deskcore.cli tv-sync --all               # 写对照 + 补录指纹, 不碰 TV
-python -m deskcore.cli tv-sync --all --write-tv    # 跟 TV 打过招呼之后再加这个: 回填 source_autowriter_*
+python -m deskcore.cli tv-sync --all --write-tv    # 回填 source_autowriter_*(TV 2026-09-18 已确认, 见下)
 ```
 
 之后每天跑一次 `tv-sync --all --write-tv`。Railway 上另建一个 service（同仓同分支），config-as-code
-指到 `deskcore/railway.cron.json`（cron `0 19 * * *` = 北京 03:00，启动命令就是这条），变量用
-Variable Reference 引 deskcore 主服务的四个：`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` /
-`GOOGLE_API_KEY` / `SUPABASE_ANON_KEY`。跟 TV 打招呼之前在 Settings → Deploy 里把启动命令的
-`--write-tv` 去掉。增量：已对上的笔记跳过，`--rematch` 才重对。
+指到 `deskcore/railway.cron.json`（cron `0 4 * * *` = 北京 12:00，启动命令就是这条），变量用
+Variable Reference 引 deskcore 主服务的三个：`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` /
+`GOOGLE_API_KEY`（CLI 不读 `SUPABASE_ANON_KEY`，那是 Streamlit app 的）。增量：已对上的笔记跳过，
+`--rematch` 才重对。
+
+**为什么是 UTC 04:00**：TV 的夜跑（飞书 → `truth_vault.notes`）是 UTC 02:00（北京 10:00），
+写作台的对照放在它后面，当天的新笔记才对得上。
+
+**`--write-tv` 的口径（TV 2026-09-18 核对后定的）**：只回写真对上的
+`body_exact` / `title_exact` / `fuzzy`（含 `tv_lineage`）；`ingested` 的**不写**——那些版本是从
+这条笔记复制进写作台的，写回去等于说"笔记来源于版本 X"而 X 来源于笔记，因果倒置，TV 的
+`v_model_comparison` 会多出上千行没信息量的 `deskcore`。它们留在 `tv_note_links` 里就够了。
+TV 那边 RPC 只填 NULL、不覆盖 TV 自己的值；TV 的夜跑 upsert 不带那两列，不会冲掉。
+另外 TV 把这两列的语义改成"写作台里对应的版本"而不是"生成来源"：回写的 380 条里约 208 条
+`lag_days < 0`（写作台记录比发布晚，`title_exact` 中位数晚 7 天）。真要看方向查
+`autowriter.tv_note_links.lag_days`。
+
+> 两边没有跨 schema 外键。写作台这边 `tv_note_links.version_id` 是 `ON DELETE SET NULL`，
+> 但 TV 那两列不会跟着清——deskcore 现在没有任何删版本的路径，以后若加，得顺手把
+> `truth_vault.notes.source_autowriter_*` 里指向它的清掉，否则 TV 的 `verify_supabase_state.sql`
+> 会报悬空指针。
 
 验收：`select count(*) from truth_vault.notes where source_autowriter_version_id is not null`
 从 0 变成非 0；`doctor` 里 `009` 三条探测 applied；`tv-sync` 报表里 `ambiguous` 的
-那几条要人看一眼（它列出候选，不硬猜）。
+那几条要人看一眼（它列出候选，不硬猜）。看完是「对不上」就 `tv-resolve --note <note_id> --ingest`：
+TV 的正文补进指纹库，对照改成 `ingested`（2026-09-18 途鸽 `TUGE_phase1_recvsfuucYAZZr` 就是这样处理的：
+两版同标题的稿子都是评论稿，真正的正文写作台里没有）。
 
 > ⚠️ 第 3.5 步（飞书建六列）**作废**。`export_drafts` 仍然带那六列，粘了不坏，但对照不再依赖它。
 > Hatherine 在 TV 里一条都没有——那张飞书表没接进 TV 同步，接进去之后加一行 `tv-map` 即可。
+
+### 1.6 `010_tv_links_rls` —— 009 那三张表开 RLS（2026-09-18）
+
+TV 核对 `--write-tv` 时顺手从 Supabase advisor 转来的：`tv_project_map` / `tv_note_links` /
+`ingest_locks`（以及生产库里手工留的 `versions_num_backup_20260826`）RLS 是关的。不是漏洞
+（anon / authenticated 没有表级 GRANT，拿 anon key 读不到），但本 schema 其他每张表都开着，
+补齐。service_role 绕 RLS，对 deskcore / CLI 零影响。生产库已于 2026-09-18 跑过
+（`aw_010_tv_links_rls`）。`doctor` 报它 `unprobeable`，要核就在 SQL Editor 跑
+`core.MIGRATION_010_PROBE_SQL` 那句。
 
 ### 1.5 指纹库回填记录（2026-08-26）
 

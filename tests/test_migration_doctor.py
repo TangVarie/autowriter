@@ -83,8 +83,10 @@ def test_fully_migrated_db_reports_ok():
     # 003 / 008 探不到, 但**不该**因此把整份报告判红 —— 永远报红的检查等于没有
     # 检查。两条探不到的理由不同: 003 建的是索引(PostgREST 看不见 pg_indexes),
     # 008 换的是函数体(签名一个字没动, 从调用侧看跑没跑过完全一样)。
+    # 010 开的是 RLS: service_role 绕 RLS, 开没开从 PostgREST 读起来一模一样。
     assert report["unprobeable"] == ["003_versions_unique_num.sql",
-                                     "008_embedding_model_isolation.sql"]
+                                     "008_embedding_model_isolation.sql",
+                                     "010_tv_links_rls.sql"]
     assert all(s in ("applied", "unprobeable") for s in _states(report).values())
 
 

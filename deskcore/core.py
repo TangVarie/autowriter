@@ -1744,6 +1744,12 @@ MIGRATION_EMBEDDING_ISOLATION = "008_embedding_model_isolation.sql"
 MIGRATION_TV_LINKS = "009_tv_links.sql"
 _MIGRATION_009_TABLES = ("tv_project_map", "tv_note_links")   # ingest_locks 单独探(列名不同)
 _MIGRATION_009_PROBE_COLUMN = "tv_project_id"
+# 010 开的是 RLS, PostgREST 探不到(service_role 绕 RLS, 开没开读起来一样)。
+MIGRATION_TV_LINKS_RLS = "010_tv_links_rls.sql"
+MIGRATION_010_PROBE_SQL = (
+    "select relname, relrowsecurity from pg_class c join pg_namespace n on n.oid=c.relnamespace "
+    "where n.nspname='autowriter' and relname in ('tv_project_map','tv_note_links','ingest_locks');"
+)
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -2043,6 +2049,17 @@ def migration_state(client) -> dict:
         "_project_id": _PROBE_NIL_UUID, "_holder": "__doctor_probe__"}).execute())
     _add(MIGRATION_TV_LINKS, "deskcore_ingest_unlock", state, note,
          "同上: 跨进程互斥失效(deskcore_ingest_lock 与它同一个迁移, 不单独探)")
+
+    # ── 010: 009 那三张表开 RLS。PostgREST 这一面探不到 relrowsecurity(service_role
+    #    绕 RLS, 开没开读起来一样), 与 003 / 008 同类: 如实报 unprobeable 并交出
+    #    该跑的 SQL。漏跑不影响任何功能, 只是 Supabase advisor 会一直报。
+    _add(MIGRATION_TV_LINKS_RLS,
+         "tv_project_map / tv_note_links / ingest_locks 的 RLS",
+         "unprobeable",
+         "PostgREST 读不到 pg_class.relrowsecurity; 用 SQL Editor 跑: " + MIGRATION_010_PROBE_SQL,
+         "功能不坏(anon 对这三张表没有表级 GRANT, service_role 绕 RLS); 差的是 "
+         "Supabase advisor 一直报 rls_disabled, 以及以后谁给 anon 发了 GRANT 会一下子"
+         "把整张表露出去")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -3067,6 +3084,81 @@ def _resolve_any_version(client, project_of: dict, version_id: str):
     return None
 
 
+def tv_resolve(client, note_id: str, *, ingest: bool) -> dict:
+    """人看过一条 ``ambiguous`` 之后的判定: 目前只有一种 —— "对不上, 按正文补录"。
+
+    tv_sync 判不出的留 candidates 给人看、不硬猜(两版同标题的稿子, 正文都和笔记
+    不像 —— 2026-09-18 途鸽那条, 两版都是评论稿, 真正的正文写作台里没有)。人看完
+    说"对不上", 就该和 unmatched 一样把正文补进指纹库, 否则这篇发出去的稿子查重
+    永远看不见它。判定结果写回 tv_note_links: match_kind → ingested, 带 version_id;
+    原来的 candidates 保留, 前面加一条"人工判定"。之后每天的 tv_sync 把它当已对上
+    跳过; --write-tv 对 ingested 不回写(见 _backfillable)。
+
+    "指定某一版"这个判定**故意没有**: match_kind 的 CHECK 里没有 manual 一档,
+    硬记成 body_exact 是撒谎。真需要时加迁移, 不在这儿蒙。
+    """
+    if not ingest:
+        raise ValueError("tv_resolve 目前只有 --ingest 一种判定")
+    link = store.tv_link(client, note_id)
+    if link is None:
+        raise ValueError(f"tv_note_links 里没有 {note_id!r} —— 先跑 tv-sync")
+    if link.get("version_id"):
+        raise ValueError(f"{note_id} 已经对上了({link['match_kind']} → "
+                         f"{link['version_id']}), 没什么可判的")
+    tv_project_id = link["tv_project_id"]
+    maps = [m for m in store.tv_project_map(client) if m["tv_project_id"] == tv_project_id]
+    target = next((m for m in maps if m.get("ingest_target")), None)
+    if target is None:
+        raise ValueError(f"{tv_project_id} 没有补录目标 —— 先 tv-map add … --ingest-target")
+    row = next((r for r in store.tv_notes(client, tv_project_id)
+                if str(r.get("note_id")) == note_id), None)
+    if row is None:
+        raise ValueError(f"TV 里没有 {note_id!r}(被删了?)")
+    note = tvlink.Note.from_row(row)
+    if not note.body:
+        raise ValueError(f"{note_id} 在 TV 里没有正文, 补不了")
+
+    owner = _tv_owner(client, target["project_id"])
+    report = ingest_published(client, target["project_id"],
+                              [{"title": note.title, "body": note.body}],
+                              user_id=owner, source=f"tv:{tv_project_id}")
+    written = report.get("written") or []
+    version_id = written[0]["version_id"] if written else None
+    if not version_id:
+        # 指纹库已有同正文(skipped_already_fingerprinted)或半途失败: 都不能把对照
+        # 记成 ingested, 如实回报, 对照不动。
+        return {"note_id": note_id, "resolved": False, "ingest": report,
+                "note": ("没建成版本: " + (report.get("identity_error")
+                                          or report.get("fingerprint_error")
+                                          or "指纹库里已有同正文的稿子(对照没动)"))}
+    item_id = None
+    try:
+        item_id = (store.items_for_versions(client, target["project_id"], [version_id])
+                   .get(version_id) or {}).get("item_id")
+    except Exception:                        # noqa: BLE001
+        logger.exception("tv_resolve: 取 item_id 失败, 对照先不带 item_id")
+    candidates = [{"note": "人工判定: 对不上, 按正文补录(tv-resolve --ingest)"}]
+    candidates += list(link.get("candidates") or [])
+    store.tv_links_upsert(client, [{
+        "note_id": note_id, "tv_project_id": tv_project_id,
+        "project_id": target["project_id"], "version_id": version_id, "item_id": item_id,
+        "match_kind": "ingested", "score": None, "lag_days": None,
+        "candidates": candidates, "updated_at": store.iso_now()}])
+    return {"note_id": note_id, "resolved": True, "version_id": version_id,
+            "item_id": item_id, "project_id": target["project_id"], "ingest": report,
+            "note": f"{note_id} 按对不上补录: 版本 {version_id[:8]}, 对照改成 ingested"
+                    + ("" if report.get("fingerprinted") else
+                       " —— ⚠️ 指纹没写上, 跑 backfill --project " + target["project_id"])}
+
+
+# 哪些对照可以写回 TV。ingested 排除: 版本是从这条笔记复制来的, 不是它的来源。
+_TV_BACKFILL_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "tv_lineage"})
+
+
+def _backfillable(link: dict) -> bool:
+    return bool(link.get("version_id")) and link.get("match_kind") in _TV_BACKFILL_KINDS
+
+
 def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             write_tv: bool = False, since: str | None = None,
             rematch: bool = False) -> dict:
@@ -3088,7 +3180,9 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
       5. 对照写进 tv_note_links(upsert, 按 note_id)。已经对上且没要求 rematch
          的笔记跳过 —— 每天跑一次, 增量。
       6. ``write_tv`` 才把对照写回 TV 的 source_autowriter_* 两列(只填 NULL 的
-         行; 那是 TV 的列, 默认不碰)。
+         行; 那是 TV 的列, 默认不碰)。**只回写真对上的**(body_exact / title_exact
+         / fuzzy / tv_lineage); ``ingested`` 的不写 —— 那些版本是从这条笔记复制
+         来的, 写回去因果倒置(见 _backfillable)。
 
     ``dry_run``: 全部算、一行不写(对照不写、指纹不写、TV 不写), 报表照出。
     """
@@ -3125,7 +3219,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
 
     for n in notes:
         prev = existing.get(n.note_id)
-        if prev and prev.get("version_id") and not rematch:
+        # ingested 的对照是终态, --rematch 也不重对(codex #83 P1): 它的版本就是从这条
+        # 笔记复制出来的, 重对只能对上它自己 —— 记成 body_exact 之后 _backfillable
+        # 放行, --write-tv 就把本要排除的因果倒置 lineage 全写回 TV 了。
+        if prev and prev.get("version_id") and (not rematch or prev.get("match_kind") == "ingested"):
             counts["already_linked"] += 1
             continue
         if n.tv_version_id:
@@ -3240,10 +3337,16 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     if not dry_run:
         written_links = store.tv_links_upsert(client, links)
         if write_tv:
-            pending = [l for l in links if l.get("version_id")]
+            # ingested 不回写(TV 2026-09-18 核对时的条件): 那些版本是我们从这条
+            # 笔记复制进写作台的, 写回去等于说"这条笔记来源于版本 X"而 X 来源于
+            # 这条笔记 —— 因果倒置, TV 的模型对比视图会多出上千行没信息量的
+            # deskcore。它们留在 tv_note_links 里就够了(查重靠的是指纹, 不靠 TV
+            # 那两列)。
+            fresh = {l["note_id"] for l in links}
+            pending = [l for l in links if _backfillable(l)]
             pending += [dict(r, note_id=nid) for nid, r in existing.items()
-                        if r.get("version_id") and not r.get("synced_to_tv_at")
-                        and nid not in {l["note_id"] for l in links}]
+                        if _backfillable(r) and not r.get("synced_to_tv_at")
+                        and nid not in fresh]
             backfilled = store.tv_backfill_lineage(client, pending)
             if pending:
                 store.tv_mark_synced(client, [l["note_id"] for l in pending])
