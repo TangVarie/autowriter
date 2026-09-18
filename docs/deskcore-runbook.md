@@ -707,7 +707,7 @@ quarantine，那条笔记连正文带指标一起进不了库。`export_drafts` 
 
 ```
 open_project → draw_angles(n=20) → borrow_lessons → 生成 20 篇
-             → check_drafts → commit_drafts → export_drafts
+             → check_drafts → commit_drafts（交付即入库，改稿带 replaces_version_id）→ export_drafts
 ```
 
 然后验六件事：

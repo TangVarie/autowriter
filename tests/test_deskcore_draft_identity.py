@@ -298,3 +298,282 @@ def test_identity_failure_does_not_raise():
     out = core.commit_drafts(ec, PROJ, [DRAFT], user_id=ME)
     assert out["written"] == 1
     assert "identity_warning" in out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 5 · 改稿替换旧版(2026-09-18, 交付即入库的配套)
+# ══════════════════════════════════════════════════════════════════════
+#
+# 交付即入库之后, 用户让改某一条时, 新稿会撞上它自己旧版的指纹。带
+# replaces_version_id 的稿子: 先摘旧指纹, 走同一套闸, 入了库就在旧 item 上加
+# 一版; 没入库就把指纹放回。
+
+from deskcore import fingerprint as _fp
+
+BODY_X = ("今天下班路上想到一件事, 留学生秋招最费时间的其实不是投简历, "
+          "而是等一个根本不会来的回音, 等到后来连刷新邮箱都成了一种自我安慰。") * 3
+BODY_X2 = ("今天下班路上想到一件事, 留学生秋招最费时间的其实不是投简历, "
+           "而是等一个根本不会来的回音, 等到后来连刷新邮箱都成了一种自我安慰。"
+           "改了结尾: 后来我把邮箱关了三天, 反而收到了两个面试。") * 2
+BODY_Y = ("绩点二点八的澳八大回国找工作, 我一开始也以为没人要, 后来发现问题"
+          "出在简历的第一行, 那行字把面试官最想看的东西藏到了最后。") * 3
+
+
+def _rpc_that_writes(c):
+    """RPC 判 inserted 并把指纹行真的写进假库 —— 这里要看的正是"旧指纹没了、新的在"。"""
+    def _impl(args):
+        out = []
+        for i, r in enumerate(args.get("_rows") or []):
+            c.rows.setdefault("draft_fingerprints", []).append({
+                "id": f"fp-{r['version_id']}", "project_id": PROJ, "user_id": ME,
+                "version_id": r["version_id"], "title": r["title"],
+                "opening": r["opening"], "opening_hash": r["opening_hash"],
+                "ngram_hashes": r["ngram_hashes"], "title_embedding": None,
+                "embedding_model": None, "angle_key": r.get("angle_key"),
+                "created_at": "2026-09-18T00:00:00+00:00"})
+            out.append({"idx": i, "status": core.COMMIT_STATUS_INSERTED,
+                        "collided_with": None, "detail": None})
+        return out
+    return _impl
+
+
+def _fps(c):
+    return {r["version_id"]: r for r in c.rows.get("draft_fingerprints", [])}
+
+
+def _embed(c):
+    """假库没有真 join: items_for_versions 走 ``items!inner(…, batches!inner(project_id))``,
+    行里得手动嵌上(同 test_deskcore_review)。每次替换前调一次, 嵌的是当前状态。"""
+    items = {i["id"]: i for i in c.rows.get("items", [])}
+    batches = {b["id"]: b for b in c.rows.get("batches", [])}
+    for v in c.rows.get("versions", []):
+        it = items.get(v.get("item_id"))
+        if it:
+            v["items"] = {"id": it["id"], "status": it.get("status"),
+                          "decision_source": it.get("decision_source"),
+                          "batch_id": it.get("batch_id"),
+                          "batches": {"project_id": (batches.get(it.get("batch_id")) or {}).get("project_id", PROJ)}}
+    return c
+
+
+def test_replacing_a_version_adds_a_new_version_to_the_same_item_and_swaps_the_fingerprint():
+    c = _client()
+    first = _commit(c, [{"title": "秋招等回音", "body": BODY_X, "angle_key": "k1"}],
+                    rpc=_rpc_that_writes(c))
+    v1 = first["version_ids"][0]
+    item = c.rows["items"][0]
+    assert item["best_version_id"] == v1 and len(c.rows["versions"]) == 1
+
+    # 不带 replaces: 改了结尾的稿子撞上自己的旧版, 闸前就被拒 —— 这正是要治的病
+    dup = _commit(c, [{"title": "秋招等回音", "body": BODY_X2, "angle_key": "k1"}],
+                  rpc=_rpc_that_writes(c))
+    assert dup["written"] == 0 and dup["rejected"][0]["gate"] == "pre_commit"
+
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": BODY_X2, "angle_key": "k1",
+                       "replaces_version_id": v1}], rpc=_rpc_that_writes(c))
+    assert out["rejected"] == [] and out["written"] == 1
+    assert out["replaced"] == [{"index": 0, "item_id": item["id"],
+                                "old_version_id": v1, "version_id": out["version_ids"][0]}]
+    v2 = out["version_ids"][0]
+    assert v2 != v1
+    assert len(c.rows["items"]) == 1, "替换不建新 item"
+    assert out["batch_id"] is None, "替换不建新 batch"
+    vs = {v["id"]: v for v in c.rows["versions"]}
+    assert set(vs) == {v1, v2} and vs[v2]["item_id"] == item["id"] and vs[v2]["version_num"] == 2
+    assert vs[v2]["body"] == BODY_X2
+    assert item["best_version_id"] == v2
+    assert "decision_source" not in item or item.get("decision_source") is None, "入库路径不许盖决策戳"
+    assert set(_fps(c)) == {v2}, "旧指纹摘掉、新指纹在"
+    assert out["unattributed"] == 0 and out["consumed_angles"] == 0, "替换不销角度也不算漏带"
+
+
+def test_a_rejected_replacement_puts_the_old_fingerprint_back():
+    c = _client()
+    _commit(c, [{"title": "另一篇", "body": BODY_Y}], rpc=_rpc_that_writes(c))   # 历史里有 Y
+    first = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    v1 = first["version_ids"][0]
+    before = dict(_fps(c)[v1])
+
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": BODY_Y, "replaces_version_id": v1}],
+                  rpc=_rpc_that_writes(c))            # 改成了和 Y 一样 → 闸前拒
+    assert out["written"] == 0 and out["rejected"][0]["gate"] == "pre_commit"
+    assert out["replaced"] == []
+    assert _fps(c)[v1] == before, "旧指纹原样放回(连 id 都一样)"
+    assert len(c.rows["versions"]) == 2 and c.rows["items"][1]["best_version_id"] == v1
+
+
+def test_replacing_an_unknown_or_foreign_version_is_rejected_without_touching_anything():
+    c = _client()
+    first = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    v1 = first["version_ids"][0]
+    _embed(c)
+    out = _commit(c, [{"title": "改稿", "body": BODY_X2,
+                       "replaces_version_id": "99999999-0000-0000-0000-000000000000"}],
+                  rpc=_rpc_that_writes(c))
+    assert out["written"] == 0
+    assert out["rejected"][0]["gate"] == "replace_lookup" and "不是本项目" in out["rejected"][0]["reason"]
+    assert set(_fps(c)) == {v1} and len(c.rows["versions"]) == 1
+
+
+def test_two_drafts_replacing_the_same_item_only_the_first_goes_through():
+    c = _client()
+    _embed(c)
+    v1 = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
+    _embed(c)
+    out = _commit(c, [{"title": "改一", "body": BODY_X2, "replaces_version_id": v1},
+                      {"title": "改二", "body": BODY_Y, "replaces_version_id": v1}],
+                  rpc=_rpc_that_writes(c))
+    assert [r["index"] for r in out["rejected"]] == [1] and "同一篇" in out["rejected"][0]["reason"]
+    assert len(out["replaced"]) == 1 and out["replaced"][0]["index"] == 0
+
+
+def test_when_commit_blows_up_midway_the_stashed_fingerprint_is_restored():
+    c = _client()
+    v1 = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
+    before = dict(_fps(c)[v1])
+
+    def _boom(args):
+        raise RuntimeError("库挂了")
+    _embed(c)
+    with pytest.raises(RuntimeError):
+        _commit(c, [{"title": "秋招等回音", "body": BODY_X2, "replaces_version_id": v1}], rpc=_boom)
+    assert _fps(c)[v1] == before, "异常路径也要把指纹放回"
+
+
+def test_replacement_whose_version_row_fails_is_reported_not_raised(monkeypatch):
+    c = _client()
+    v1 = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
+
+    def _fail(*a, **k):
+        raise RuntimeError("versions 插不进去")
+    monkeypatch.setattr(store, "add_version_to_item", _fail)
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": BODY_X2, "replaces_version_id": v1}],
+                  rpc=_rpc_that_writes(c))
+    assert out["written"] == 1 and out["replaced"] == [] and out["version_ids"] == []
+    assert "replace_warning" in out and "没能挂到旧稿上" in out["replace_warning"]
+    assert c.rows["items"][0]["best_version_id"] == v1, "没接上就别动 best_version_id"
+
+
+def test_replacing_a_reviewed_item_resets_it_to_pending_as_system():
+    """旧版被人审过(approved): 新版是另一篇稿子, 那个结论不再成立 —— 重置回
+    pending, 出处 SYSTEM(不是 human, 也不是入库路径自己盖的戳)。"""
+    c = _client()
+    v1 = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
+    item = c.rows["items"][0]
+    item.update({"status": "approved", "decision_source": "human", "reviewer_id": ME,
+                 "decided_at": "2026-09-17T00:00:00+00:00"})
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": BODY_X2, "replaces_version_id": v1}],
+                  rpc=_rpc_that_writes(c))
+    assert out["replaced"]
+    assert item["status"] == "pending" and item["decision_source"] == "system"
+    assert item["reviewer_id"] is None and item["best_version_id"] == out["version_ids"][0]
+
+
+# ── codex #84 (2026-09-18) ────────────────────────────────────────────────
+import time as _time
+
+
+class _LockTable:
+    def __init__(self):
+        self.rows = {}
+        self.calls = []
+
+    def lock(self, a):
+        self.calls.append("lock")
+        pid, holder, ttl = a["_project_id"], a["_holder"], a["_ttl_seconds"]
+        cur = self.rows.get(pid)
+        if cur is None or cur[1] < _time.monotonic() or cur[0] == holder:
+            self.rows[pid] = (holder, _time.monotonic() + ttl)
+            return True
+        return False
+
+    def unlock(self, a):
+        self.calls.append("unlock")
+        cur = self.rows.get(a["_project_id"])
+        if cur and cur[0] == a["_holder"]:
+            del self.rows[a["_project_id"]]
+            return True
+        return False
+
+
+def test_commit_holds_the_project_write_lock_and_is_busy_when_someone_else_has_it(monkeypatch):
+    """P1: 摘旧指纹到原子写入之间不在一个事务里, 别的 commit 能在那一瞬把与旧稿相同
+    的文字塞进来。所以 commit(有没有替换都一样)全程持 009 那把项目写锁 —— 和补录
+    同一把, 两边排队。"""
+    c = _client()
+    lt = _LockTable()
+    c.rpc_impl.update({"deskcore_ingest_lock": lt.lock, "deskcore_ingest_unlock": lt.unlock})
+    out = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    assert out["written"] == 1 and lt.calls == ["lock", "unlock"] and lt.rows == {}
+
+    monkeypatch.setattr(core, "INGEST_LOCK_WAIT_SEC", 0.05)
+    monkeypatch.setattr(core, "INGEST_LOCK_POLL_SEC", 0.01)
+    lt.rows[PROJ] = ("someone-else", _time.monotonic() + 600)
+    n_fp = len(c.rows["draft_fingerprints"])
+    with pytest.raises(core.IngestBusy):
+        _commit(c, [{"title": "另一篇", "body": BODY_Y}], rpc=_rpc_that_writes(c))
+    assert len(c.rows["draft_fingerprints"]) == n_fp, "拿不到锁就什么都不写"
+
+
+def test_a_malformed_replaces_id_rejects_only_that_entry_and_the_rest_commit():
+    c = _client()
+    v1 = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
+    _embed(c)
+    out = _commit(c, [{"title": "改稿", "body": BODY_X2, "replaces_version_id": "not-a-uuid"},
+                      {"title": "另一篇", "body": BODY_Y}], rpc=_rpc_that_writes(c))
+    assert [r["index"] for r in out["rejected"]] == [0]
+    assert out["rejected"][0]["gate"] == "replace_lookup" and "UUID" in out["rejected"][0]["reason"]
+    assert out["written"] == 1 and len(out["version_ids"]) == 1, "同批里好的那条照常入库"
+    assert v1 in _fps(c), "没碰旧指纹"
+    assert "改对 id 再提交一次" in out["note"] and "重写后重新走" not in out["note"], \
+        "id 给错不是撞车, 不该让人重写"
+
+
+def test_a_replacement_that_also_carries_version_id_is_rejected_before_anything_moves():
+    c = _client()
+    v1 = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
+    _embed(c)
+    out = _commit(c, [{"title": "改稿", "body": BODY_X2, "replaces_version_id": v1,
+                       "version_id": "12345678-0000-0000-0000-000000000000"}], rpc=_rpc_that_writes(c))
+    assert out["written"] == 0 and out["rejected"][0]["gate"] == "replace_lookup"
+    assert "不能同时带 version_id" in out["rejected"][0]["reason"]
+    assert set(_fps(c)) == {v1} and len(c.rows["versions"]) == 1
+
+
+def test_version_ids_keep_the_callers_order_when_replacements_and_new_drafts_mix():
+    c = _client()
+    v1 = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": BODY_X2, "replaces_version_id": v1},
+                      {"title": "另一篇", "body": BODY_Y}], rpc=_rpc_that_writes(c))
+    assert out["rejected"] == [] and len(out["version_ids"]) == 2
+    assert out["version_ids"][0] == out["replaced"][0]["version_id"], "第 0 条是替换稿, 它的 id 在第 0 位"
+    new_ids = {v["id"] for v in c.rows["versions"] if v["item_id"] != out["replaced"][0]["item_id"]}
+    assert out["version_ids"][1] in new_ids
+
+
+def test_a_failure_while_pulling_fingerprints_puts_the_already_pulled_ones_back(monkeypatch):
+    """P1 的另一半: 两条替换, 第二条的删除炸了 —— 第一条已经删掉的指纹要放回, 不能
+    让它在外层 try 拿到 stash 之前就永久消失。"""
+    c = _client()
+    a = _commit(c, [{"title": "稿一", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
+    b = _commit(c, [{"title": "稿二", "body": BODY_Y}], rpc=_rpc_that_writes(c))["version_ids"][0]
+    _embed(c)
+    real = store.delete_fingerprints_for_versions
+    calls = []
+
+    def _flaky(sb, pid, ids):
+        calls.append(list(ids))
+        if len(calls) == 2:
+            raise RuntimeError("第二次删炸了")
+        return real(sb, pid, ids)
+    monkeypatch.setattr(store, "delete_fingerprints_for_versions", _flaky)
+    with pytest.raises(RuntimeError, match="第二次删炸了"):
+        _commit(c, [{"title": "稿一改", "body": BODY_X2, "replaces_version_id": a},
+                    {"title": "稿二改", "body": BODY_X2 + "。", "replaces_version_id": b}],
+                rpc=_rpc_that_writes(c))
+    assert set(_fps(c)) == {a, b}, "第一条摘掉的放回来了, 第二条本来就没删成"

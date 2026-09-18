@@ -157,6 +157,10 @@ UNGATED_WITH_REASON = {
     "_ingest_proc_lock": "按 project_id 取一把进程内锁, 不读不写项目数据; 调用它的 ingest_published 已过闸",
     "_acquire_ingest_lock": "轮询库里的补录锁(009), 只碰 ingest_locks 那一行; 调用它的 ingest_published 已过闸",
     "_history_probe":        "私有辅助函数, 由已过闸的调用方传入 project_id",
+    "_prepare_replacements": "改稿替换的准备(摘旧指纹), 只被已过闸的 commit_drafts 调用; "
+                             "版本归属由 store.items_for_versions 的 inner join 钉死",
+    "_project_write_lock":   "项目级写锁(进程内 + 009 的库锁), 只碰 ingest_locks 那一行; "
+                             "调用它的 ingest_published / commit_drafts 已过闸",
     "_gate":                 "私有辅助函数(check_drafts 的判定主体), 只被已过闸的 "
                              "check_drafts / commit_drafts 调用 —— 抽出来正是为了让"
                              "入库也跑同一套闸(2026-09-17)",
