@@ -404,6 +404,7 @@ def commit_drafts(project_id: str, drafts: list[dict],
 
     这个工具出错会直接报错。入库失败必须让你知道 —— 稿子没进指纹库的话,
     下次 check_drafts 会把同样的内容再放行一次。看到报错就重试, 别当没事。
+    报"另一个写操作正在跑"(409)也是重试: 同一个项目的入库和补录是排队的。
 
     返回值里的 ``batch_id`` / ``version_ids`` 是这批稿子在库里的身份, 直接拿去
     喂 export_drafts。带 ``identity_warning`` 时说明身份没建成 —— 稿子入库了、

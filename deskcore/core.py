@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import logging
 import random
 import threading
@@ -892,18 +893,37 @@ def _prepare_replacements(client, project_id: str, drafts: list[dict]) -> tuple[
 
     回 ``(replace, rejected, stash)``:
       replace  {index: {"item_id", "old_version_id", "status", "next_version_num"}}
-      rejected {index: 原因}  —— 版本不在本项目、或同一版被替换两次
+      rejected {index: 原因}  —— 不是 UUID / 同时带了 version_id / 版本不在本项目 /
+                               同一版被替换两次
       stash    {index: [指纹整行, …]} —— 已经从库里删掉、待会儿可能要放回的
+
+    ⚠️ 调用方必须持有 _project_write_lock: 摘掉指纹到原子写入之间不在一个事务里。
+    删之前把**全部**要摘的行先读齐, 删到一半失败就把已删的放回再上抛 —— 否则前面
+    几条的指纹就此消失, 而外层 try 还没拿到 stash(codex #84 P1)。
     """
     want = {i: str(d.get("replaces_version_id")).strip()
             for i, d in enumerate(drafts) if d.get("replaces_version_id")}
     if not want:
         return {}, {}, {}
-    known = store.items_for_versions(client, project_id, list(want.values()))
-    replace: dict[int, dict] = {}
     rejected: dict[int, str] = {}
-    seen_items: dict[str, int] = {}
+    lookup: dict[int, str] = {}
     for i, vid in want.items():
+        if not _is_uuid(vid):
+            # uuid 列的 IN 谓词在解析阶段就会拒掉整条查询, 一个打错的 id 会连累同批
+            # 所有好的(codex #84 P2)。
+            rejected[i] = f"replaces_version_id={vid!r} 不是合法的 UUID"
+        elif drafts[i].get("version_id"):
+            # 带 version_id 的稿子是"库里本来就有这一版"(UI 生成), 不会造新 id ——
+            # 和替换互斥, 否则新指纹写进去之后才发现没有 id 可挂(codex #84 P2)。
+            rejected[i] = "不能同时带 version_id 和 replaces_version_id: 替换稿由入库分配新 id"
+        else:
+            lookup[i] = vid
+    if not lookup:
+        return {}, rejected, {}
+    known = store.items_for_versions(client, project_id, list(lookup.values()))
+    replace: dict[int, dict] = {}
+    seen_items: dict[str, int] = {}
+    for i, vid in lookup.items():
         hit = known.get(vid)
         if not hit:
             rejected[i] = (f"replaces_version_id={vid} 不是本项目里的版本 —— 只能替换"
@@ -919,15 +939,22 @@ def _prepare_replacements(client, project_id: str, drafts: list[dict]) -> tuple[
     if not replace:
         return replace, rejected, {}
     versions = store.version_ids_of_items(client, [r["item_id"] for r in replace.values()])
-    stash: dict[int, list[dict]] = {}
+    # 先把要摘的全部读齐, 再删 —— 读齐之前一行都不动。
+    to_pull: dict[int, tuple[list[str], list[dict]]] = {}
     for i, r in replace.items():
         vs = versions.get(r["item_id"]) or []
         r["next_version_num"] = max([v["version_num"] for v in vs] + [0]) + 1
         ids = [v["id"] for v in vs] or [r["old_version_id"]]
-        stash[i] = store.fingerprint_rows_for_versions(client, project_id, ids)
-        store.delete_fingerprints_for_versions(client, project_id, ids)
+        to_pull[i] = (ids, store.fingerprint_rows_for_versions(client, project_id, ids))
+    stash: dict[int, list[dict]] = {}
+    for i, (ids, rows) in to_pull.items():
+        try:
+            store.delete_fingerprints_for_versions(client, project_id, ids)
+        except Exception:
+            _restore_stash(client, stash, list(stash))
+            raise
+        stash[i] = rows
     return replace, rejected, stash
-
 
 def _restore_stash(client, stash: dict[int, list[dict]], indices) -> None:
     for i in indices:
@@ -977,305 +1004,322 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
 
-    replace, replace_rejected, stash = _prepare_replacements(client, project_id, drafts)
-    # 整段包在 try 里(而不是拆成子函数): ci.yml 用 inspect.getsource 守着"commit 走 _gate"
-    # 和"commit 记 embedding_model"这两条, 拆出去它们就看不见了。
-    try:
-        titles = [(d.get("title") or "").strip() for d in drafts]
-        # ⚠️ embeddings_available() 判的是【客户端对象能不能建起来】(有 key + SDK
-        # 装了), 不是调用能不能成功, 而且那个 client 是进程级单例、启动时就缓存了。
-        # 所以 key 欠费/被封/配额用尽之后它照样返回 True, 真正失败的是下面这次
-        # embed_texts —— 它 catch 住异常返回 None。
-        # 这两者必须分开记: configured 为真而 vecs 为空 = 【本该有向量却没拿到】,
-        # 那是故障不是"没配"。不区分的话, 欠费那几天入库的稿子会安静地只有确定性
-        # 指纹, 查重从此对那批内容有个洞, 不报错、也没人知道。
-        #
-        # (这里原来还写着"而且补不回来 —— backfill 走 items×versions, WorkBuddy
-        #  写的稿子根本不在 autowriter.versions 里"。下面建身份那一步之后不再成立:
-        #  这些稿子现在有真的 versions 行, backfill 扫得到。)
-        embed_configured = dedup.embeddings_available()
-        vecs = dedup.embed_texts(titles) if embed_configured else None
-        embed_failed = embed_configured and not vecs
-        bodies = [d.get("body") or "" for d in drafts]
+    # 全程持项目写锁(codex #84 P1): 替换要先摘旧指纹再查重写入, 两步之间别的 commit /
+    # 补录不能插进来。没有替换的普通 commit 也拿 —— 它们正是会在那个窗口里把与旧稿
+    # 相同的文字塞进来的一方, 只锁一边等于没锁。
+    holder = f"commit:{uuid.uuid4().hex[:8]}"
+    with _project_write_lock(client, project_id, holder):
+        replace, replace_rejected, stash = _prepare_replacements(client, project_id, drafts)
+        # 整段包在 try 里(而不是拆成子函数): ci.yml 用 inspect.getsource 守着"commit 走 _gate"
+        # 和"commit 记 embedding_model"这两条, 拆出去它们就看不见了。
+        try:
+            titles = [(d.get("title") or "").strip() for d in drafts]
+            # ⚠️ embeddings_available() 判的是【客户端对象能不能建起来】(有 key + SDK
+            # 装了), 不是调用能不能成功, 而且那个 client 是进程级单例、启动时就缓存了。
+            # 所以 key 欠费/被封/配额用尽之后它照样返回 True, 真正失败的是下面这次
+            # embed_texts —— 它 catch 住异常返回 None。
+            # 这两者必须分开记: configured 为真而 vecs 为空 = 【本该有向量却没拿到】,
+            # 那是故障不是"没配"。不区分的话, 欠费那几天入库的稿子会安静地只有确定性
+            # 指纹, 查重从此对那批内容有个洞, 不报错、也没人知道。
+            #
+            # (这里原来还写着"而且补不回来 —— backfill 走 items×versions, WorkBuddy
+            #  写的稿子根本不在 autowriter.versions 里"。下面建身份那一步之后不再成立:
+            #  这些稿子现在有真的 versions 行, backfill 扫得到。)
+            embed_configured = dedup.embeddings_available()
+            vecs = dedup.embed_texts(titles) if embed_configured else None
+            embed_failed = embed_configured and not vecs
+            bodies = [d.get("body") or "" for d in drafts]
 
-        # ── 入库自带闸(2026-09-17)────────────────────────────────────────
-        # 先跑一遍和 check_drafts **同一套**判定, 判 reject 的不进 RPC。理由见
-        # _gate 的说明: 闸不该依赖模型记得先调 check_drafts。这里多一次历史比对
-        # (一次 RPC), 换来的是"跳过 check 直接 commit"这条路从此进不了重复的稿子。
-        # 出错照样上抛 —— 和 check_drafts 一样, 查重挂了不能当作通过。
-        gate = _gate(client, project_id, titles, bodies, vecs)
-        pre_rejected = {r["index"]: r for r in gate["results"]
-                        if r.get("status") == "reject" and r["index"] not in replace_rejected}
-        survivors = [i for i in range(len(drafts))
-                     if i not in pre_rejected and i not in replace_rejected]
+            # ── 入库自带闸(2026-09-17)────────────────────────────────────────
+            # 先跑一遍和 check_drafts **同一套**判定, 判 reject 的不进 RPC。理由见
+            # _gate 的说明: 闸不该依赖模型记得先调 check_drafts。这里多一次历史比对
+            # (一次 RPC), 换来的是"跳过 check 直接 commit"这条路从此进不了重复的稿子。
+            # 出错照样上抛 —— 和 check_drafts 一样, 查重挂了不能当作通过。
+            gate = _gate(client, project_id, titles, bodies, vecs)
+            pre_rejected = {r["index"]: r for r in gate["results"]
+                            if r.get("status") == "reject" and r["index"] not in replace_rejected}
+            survivors = [i for i in range(len(drafts))
+                         if i not in pre_rejected and i not in replace_rejected]
 
-        # ── 先把 version_id 定下来 ──────────────────────────────────────────
-        # 顺序是有讲究的: **先造 id 并写进指纹, 事后才建 versions 行**。
-        #
-        # 反过来(先建 versions 再写指纹)的话, 被查重判撞车的那几条会留下没有指纹的
-        # 孤儿 item —— 它们会出现在审核页、进正例池、被回填扫到, 而对应的稿子其实
-        # 根本没有交付。
-        #
-        # 现在这个顺序的失败模式是另一头: 指纹写进去了、身份没建成, 于是指纹的
-        # version_id 指向一个不存在的行。那只是**退回到今天的状态**(lineage 断掉),
-        # 查重一点不受影响 —— 而且下面会明说。两个方向的坏, 这个可逆。
-        #
-        # 调用方已经带了 version_id 的(稿子是 UI 生成的, 库里本来就有那一版)照旧用
-        # 它自己的, 不重新造、也不会再建一遍身份。
-        minted_ids: dict[int, str] = {}
-        for i, d in enumerate(drafts):
-            if not d.get("version_id"):
-                minted_ids[i] = str(uuid.uuid4())
+            # ── 先把 version_id 定下来 ──────────────────────────────────────────
+            # 顺序是有讲究的: **先造 id 并写进指纹, 事后才建 versions 行**。
+            #
+            # 反过来(先建 versions 再写指纹)的话, 被查重判撞车的那几条会留下没有指纹的
+            # 孤儿 item —— 它们会出现在审核页、进正例池、被回填扫到, 而对应的稿子其实
+            # 根本没有交付。
+            #
+            # 现在这个顺序的失败模式是另一头: 指纹写进去了、身份没建成, 于是指纹的
+            # version_id 指向一个不存在的行。那只是**退回到今天的状态**(lineage 断掉),
+            # 查重一点不受影响 —— 而且下面会明说。两个方向的坏, 这个可逆。
+            #
+            # 调用方已经带了 version_id 的(稿子是 UI 生成的, 库里本来就有那一版)照旧用
+            # 它自己的, 不重新造、也不会再建一遍身份。
+            minted_ids: dict[int, str] = {}
+            for i, d in enumerate(drafts):
+                if not d.get("version_id"):
+                    minted_ids[i] = str(uuid.uuid4())
 
-        rows = []
-        for i in survivors:
-            d = drafts[i]
-            body = bodies[i]
-            emb = vecs[i] if vecs and i < len(vecs) else None
-            rows.append({
-                "version_id": d.get("version_id") or minted_ids.get(i),
-                "title": titles[i],
-                "opening": fp.opening_of(body),
-                # RPC 侧按 text 转 vector, 这里给 pgvector 的字面量形式
-                "title_embedding": ("[" + ",".join(repr(float(x)) for x in emb) + "]") if emb else None,
-                "embedding_model": dedup.EMBEDDING_MODEL if emb else None,
-                "opening_hash": fp.opening_hash(body),
-                "ngram_hashes": fp.ngram_hashes(body),
-                "angle_key": d.get("angle_key"),
-            })
-
-        # 闸前就判死的那几条: 说清是哪一路信号、撞的是本批内还是历史。
-        rejected: list[dict] = [
-            {"index": i, "title": titles[i],
-             "collided_with": r.get("collided_with") or "",
-             "collided_scope": r.get("collided_scope") or "",
-             "decided_by": r.get("decided_by"),
-             "reason": r.get("reason") or "入库前判定与已有稿件重复",
-             "gate": "pre_commit"}
-            for i, r in sorted(pre_rejected.items())]
-        rejected += [{"index": i, "title": titles[i], "collided_with": "", "collided_scope": "",
-                      "decided_by": None, "reason": why, "gate": "replace_lookup"}
-                     for i, why in sorted(replace_rejected.items())]
-        rejected.sort(key=lambda r: r["index"])
-        # ⚠️ RPC 回的 idx 是**幸存者列表里的下标**, 不是调用方列表的。下面凡是把
-        #    idx 翻回调用方视角的地方都要过 survivors[...]。
-        if survivors:
-            outcome = store.commit_fingerprints_atomic(
-                client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD,
-                # 阈值只在 fingerprint.py 里定义一处 —— SQL 里的 DEFAULT 只是兜底,
-                # 真正生效的是这里传下去的值。两边写死两份就迟早对不上。(审计 COR-014)
-                contain_hard=fp.NGRAM_CONTAIN_HARD,
-                contain_min_sample=fp.CONTAIN_MIN_SAMPLE)
-        else:
-            outcome = []          # 全被闸前拦下, 没东西可写, 也别去碰 RPC
-
-        atomic = outcome is not None
-        rpc_anomalies = 0
-        if atomic:
-            written = sum(1 for o in outcome
-                          if o.get("status") == COMMIT_STATUS_INSERTED)
-            # ⚠️ idx 越界的回执**不许抛**: 指纹这时已经写进去了, 抛出去调用方会重试,
-            #    重试会撞上自己刚写的指纹 —— 一次故障变成一句"你的稿子重复了"。
-            #    记日志、数出来、报给调用方, 但不中断。(code review 2026-09-17)
-            valid = []
-            for o in outcome:
-                idx = o.get("idx")
-                if isinstance(idx, int) and 0 <= idx < len(survivors):
-                    valid.append(o)
-                else:
-                    rpc_anomalies += 1
-                    logger.error("commit_drafts: RPC 回执 idx=%r 越界(幸存者 %d 条, "
-                                 "project=%s) —— 跳过这一行", idx, len(survivors), project_id)
-            outcome = valid
-            for o in outcome:
-                if o.get("status") == "rejected":
-                    orig = survivors[o["idx"]]
-                    rejected.append({
-                        "index": orig,
-                        "title": titles[orig],
-                        "collided_with": o.get("collided_with") or "",
-                        "collided_scope": "历史",
-                        "reason": o.get("detail") or "与库中已有稿件重复",
-                        "gate": "atomic_recheck",
-                    })
-            rejected.sort(key=lambda r: r["index"])
-        else:
-            # RPC 不在: 降级直插, 并明确标出这次没有关掉竞态窗口。
-            payload = []
-            for k, r in enumerate(rows):
-                orig = survivors[k]
-                payload.append({
-                    "project_id": project_id, "user_id": user_id,
-                    "version_id": r["version_id"], "title": r["title"],
-                    "opening": r["opening"],
-                    "title_embedding": vecs[orig] if vecs and orig < len(vecs) else None,
-                    "embedding_model": r["embedding_model"],
-                    "opening_hash": r["opening_hash"],
-                    "ngram_hashes": r["ngram_hashes"], "angle_key": r["angle_key"],
+            rows = []
+            for i in survivors:
+                d = drafts[i]
+                body = bodies[i]
+                emb = vecs[i] if vecs and i < len(vecs) else None
+                rows.append({
+                    "version_id": d.get("version_id") or minted_ids.get(i),
+                    "title": titles[i],
+                    "opening": fp.opening_of(body),
+                    # RPC 侧按 text 转 vector, 这里给 pgvector 的字面量形式
+                    "title_embedding": ("[" + ",".join(repr(float(x)) for x in emb) + "]") if emb else None,
+                    "embedding_model": dedup.EMBEDDING_MODEL if emb else None,
+                    "opening_hash": fp.opening_hash(body),
+                    "ngram_hashes": fp.ngram_hashes(body),
+                    "angle_key": d.get("angle_key"),
                 })
-            written = store.write_fingerprints(client, payload)
 
-        # 只给真的入了库的坐标销账 —— 被拒的那条角度还没产出成稿, 不该占坑。
-        inserted_idx = ({survivors[o["idx"]] for o in outcome
-                         if o.get("status") == COMMIT_STATUS_INSERTED}
-                        if atomic else set(survivors))
+            # 闸前就判死的那几条: 说清是哪一路信号、撞的是本批内还是历史。
+            rejected: list[dict] = [
+                {"index": i, "title": titles[i],
+                 "collided_with": r.get("collided_with") or "",
+                 "collided_scope": r.get("collided_scope") or "",
+                 "decided_by": r.get("decided_by"),
+                 "reason": r.get("reason") or "入库前判定与已有稿件重复",
+                 "gate": "pre_commit"}
+                for i, r in sorted(pre_rejected.items())]
+            rejected += [{"index": i, "title": titles[i], "collided_with": "", "collided_scope": "",
+                          "decided_by": None, "reason": why, "gate": "replace_lookup"}
+                         for i, why in sorted(replace_rejected.items())]
+            rejected.sort(key=lambda r: r["index"])
+            # ⚠️ RPC 回的 idx 是**幸存者列表里的下标**, 不是调用方列表的。下面凡是把
+            #    idx 翻回调用方视角的地方都要过 survivors[...]。
+            if survivors:
+                outcome = store.commit_fingerprints_atomic(
+                    client, project_id, rows, user_id, fp.NGRAM_JACCARD_HARD,
+                    # 阈值只在 fingerprint.py 里定义一处 —— SQL 里的 DEFAULT 只是兜底,
+                    # 真正生效的是这里传下去的值。两边写死两份就迟早对不上。(审计 COR-014)
+                    contain_hard=fp.NGRAM_CONTAIN_HARD,
+                    contain_min_sample=fp.CONTAIN_MIN_SAMPLE)
+            else:
+                outcome = []          # 全被闸前拦下, 没东西可写, 也别去碰 RPC
 
-        # ── 给真的入了库的那几条建身份 ──────────────────────────────────────
-        # 只建 inserted 的: 被判撞车的那几条没有交付, 不该在 items 里留一行。
-        # mint_draft_identity 不抛: 指纹已经进库了, 这次 commit 的**主要目的**(让这些
-        # 稿子参与以后的查重)已经达成。把整个调用报成失败会让调用方去重试, 而重试会被
-        # 自己刚写进去的指纹判成撞车 —— 一次故障变成一句"你的稿子重复了", 现场完全对
-        # 不上。它半途失败时会把**已经建成的那部分**连同 error 一起回来。
-        # 替换的稿子没入库(闸前被拒 / 原子重查撞车): 旧指纹放回去, 旧稿照旧参与查重。
-        _restore_stash(client, stash, [i for i in replace if i not in inserted_idx])
+            atomic = outcome is not None
+            rpc_anomalies = 0
+            if atomic:
+                written = sum(1 for o in outcome
+                              if o.get("status") == COMMIT_STATUS_INSERTED)
+                # ⚠️ idx 越界的回执**不许抛**: 指纹这时已经写进去了, 抛出去调用方会重试,
+                #    重试会撞上自己刚写的指纹 —— 一次故障变成一句"你的稿子重复了"。
+                #    记日志、数出来、报给调用方, 但不中断。(code review 2026-09-17)
+                valid = []
+                for o in outcome:
+                    idx = o.get("idx")
+                    if isinstance(idx, int) and 0 <= idx < len(survivors):
+                        valid.append(o)
+                    else:
+                        rpc_anomalies += 1
+                        logger.error("commit_drafts: RPC 回执 idx=%r 越界(幸存者 %d 条, "
+                                     "project=%s) —— 跳过这一行", idx, len(survivors), project_id)
+                outcome = valid
+                for o in outcome:
+                    if o.get("status") == "rejected":
+                        orig = survivors[o["idx"]]
+                        rejected.append({
+                            "index": orig,
+                            "title": titles[orig],
+                            "collided_with": o.get("collided_with") or "",
+                            "collided_scope": "历史",
+                            "reason": o.get("detail") or "与库中已有稿件重复",
+                            "gate": "atomic_recheck",
+                        })
+                rejected.sort(key=lambda r: r["index"])
+            else:
+                # RPC 不在: 降级直插, 并明确标出这次没有关掉竞态窗口。
+                payload = []
+                for k, r in enumerate(rows):
+                    orig = survivors[k]
+                    payload.append({
+                        "project_id": project_id, "user_id": user_id,
+                        "version_id": r["version_id"], "title": r["title"],
+                        "opening": r["opening"],
+                        "title_embedding": vecs[orig] if vecs and orig < len(vecs) else None,
+                        "embedding_model": r["embedding_model"],
+                        "opening_hash": r["opening_hash"],
+                        "ngram_hashes": r["ngram_hashes"], "angle_key": r["angle_key"],
+                    })
+                written = store.write_fingerprints(client, payload)
 
-        # 替换成功的: 不建新 item, 在旧 item 上加一版。半途失败与建身份同一口径 ——
-        # 指纹已进库, 主要目的达成, 不抛, 说清哪几条没接上。
-        replaced_ok: dict[int, str] = {}
-        replace_error: str | None = None
-        for i in sorted(inserted_idx):
-            if i not in replace:
-                continue
-            ctx = replace[i]
-            try:
-                store.add_version_to_item(
-                    client, ctx["item_id"], version_id=minted_ids[i],
-                    version_num=ctx["next_version_num"], title=titles[i], body=bodies[i],
-                    keywords=drafts[i].get("keywords") or [])
-                store.point_item_at_version(
-                    client, ctx["item_id"], minted_ids[i],
-                    reset_decision=(ctx.get("status") or "pending") != "pending")
-                replaced_ok[i] = ctx["item_id"]
-            except Exception as exc:                    # noqa: BLE001
-                logger.exception("commit_drafts: 替换旧版失败(index=%d, item=%s)", i, ctx["item_id"])
-                replace_error = replace_error or f"{type(exc).__name__}: {exc}"
+            # 只给真的入了库的坐标销账 —— 被拒的那条角度还没产出成稿, 不该占坑。
+            inserted_idx = ({survivors[o["idx"]] for o in outcome
+                             if o.get("status") == COMMIT_STATUS_INSERTED}
+                            if atomic else set(survivors))
 
-        minted = {"batch_id": None, "versions": {}, "error": None}
-        to_mint = [
-            {"version_id": minted_ids[i], "title": titles[i],
-             "body": drafts[i].get("body") or "",
-             "keywords": drafts[i].get("keywords") or []}
-            for i in sorted(inserted_idx) if i in minted_ids and i not in replace
-        ]
-        if to_mint:
-            minted = store.mint_draft_identity(
-                client, project_id, str(user_id), "", to_mint)
-        identity_error = minted.get("error")
+            # ── 给真的入了库的那几条建身份 ──────────────────────────────────────
+            # 只建 inserted 的: 被判撞车的那几条没有交付, 不该在 items 里留一行。
+            # mint_draft_identity 不抛: 指纹已经进库了, 这次 commit 的**主要目的**(让这些
+            # 稿子参与以后的查重)已经达成。把整个调用报成失败会让调用方去重试, 而重试会被
+            # 自己刚写进去的指纹判成撞车 —— 一次故障变成一句"你的稿子重复了", 现场完全对
+            # 不上。它半途失败时会把**已经建成的那部分**连同 error 一起回来。
+            # 替换的稿子没入库(闸前被拒 / 原子重查撞车): 旧指纹放回去, 旧稿照旧参与查重。
+            _restore_stash(client, stash, [i for i in replace if i not in inserted_idx])
 
-        consumed = 0
-        attempted = 0
-        for i, d in enumerate(drafts):
-            if i not in inserted_idx or i in replace:   # 替换: 旧版入库时已经销过
-                continue
-            key = d.get("angle_key")
-            if not key:
-                continue
-            attempted += 1
-            # 台账销账用**真的** version_id。以前这里塞的是一个按 angle_key 哈希出来的
-            # 假 UUID(见上面删掉的 _placeholder_version_id) —— consumed_version_id 非
-            # NULL 就够避重用了, 但那个 id 指不到任何一行, 没法回答"这个角度产出的那篇
-            # 后来怎么样了"。
-            vid = d.get("version_id") or minted_ids[i]
-            if store.consume_angle(client, project_id, key, vid):
-                consumed += 1
+            # 替换成功的: 不建新 item, 在旧 item 上加一版。半途失败与建身份同一口径 ——
+            # 指纹已进库, 主要目的达成, 不抛, 说清哪几条没接上。
+            replaced_ok: dict[int, str] = {}
+            replace_error: str | None = None
+            for i in sorted(inserted_idx):
+                if i not in replace:
+                    continue
+                ctx = replace[i]
+                try:
+                    store.add_version_to_item(
+                        client, ctx["item_id"], version_id=minted_ids[i],
+                        version_num=ctx["next_version_num"], title=titles[i], body=bodies[i],
+                        keywords=drafts[i].get("keywords") or [])
+                    store.point_item_at_version(
+                        client, ctx["item_id"], minted_ids[i],
+                        reset_decision=(ctx.get("status") or "pending") != "pending")
+                    replaced_ok[i] = ctx["item_id"]
+                except Exception as exc:                    # noqa: BLE001
+                    logger.exception("commit_drafts: 替换旧版失败(index=%d, item=%s)", i, ctx["item_id"])
+                    replace_error = replace_error or f"{type(exc).__name__}: {exc}"
 
-        # 入了库却没带 angle_key 的: 台账没法给它们销账, 同一个故事下一批还可能被
-        # 抽到 —— 而那种重复(同题重写)指纹闸抓不到。途鸽 09-10 的 66 条里 49 条是
-        # 这么进来的, 当天四个标题各入库两次。RPC 对空 angle_key 一声不吭地照收,
-        # 所以只能在这里数出来说给调用方听。
-        unattributed = sum(1 for i in inserted_idx
-                           if i not in replace and not drafts[i].get("angle_key"))
-        minted_ok = [minted_ids[i] for i in sorted(inserted_idx)
-                     if i not in replace and minted_ids.get(i) in minted.get("versions", {})]
-        out = {"written": written, "consumed_angles": consumed,
-               "unattributed": unattributed,
-               "embedded": bool(vecs), "rejected": rejected,
-               "atomic_recheck": atomic,
-               "gate_summary": gate["summary"],
-               "embedding_model": dedup.EMBEDDING_MODEL if vecs else None,
-               # 这次建出来的身份。导出要用 version_id, 所以直接回给调用方 ——
-               # 不然它得再查一次才知道自己刚提交的稿子叫什么。
-               #
-               # ⚠️ 只报**真的建出了行**的那些(拿 minted["versions"] 过一遍),
-               #    不是"我本来打算用这些 id"。建失败时报出去的 id 会让调用方拿它
-               #    去导出, 而 TV 那边 JOIN 不到任何东西 —— 那比不报更坏。
-               "batch_id": minted.get("batch_id"),
-               "version_ids": minted_ok + [minted_ids[i] for i in sorted(replaced_ok)],
-               # 改稿替换的: 同一个 item 升了一版。version_ids 里也有新 id(导出用)。
-               "replaced": [{"index": i, "item_id": replaced_ok[i],
-                             "old_version_id": replace[i]["old_version_id"],
-                             "version_id": minted_ids[i]} for i in sorted(replaced_ok)]}
-        if replace_error:
-            missed = [i for i in sorted(inserted_idx) if i in replace and i not in replaced_ok]
-            out["replace_warning"] = (
-                f"{len(missed)} 条替换稿的新指纹入了库, 但没能挂到旧稿上({replace_error})。"
-                "查重不受影响; 旧稿的 best_version_id 还指着旧版, 导出会拿到旧文。"
-                f"没接上的是第 {missed} 条。服务端日志有堆栈。")
-        if identity_error:
-            # 说清楚**丢的是哪几条**: 查重没事, 断的是"发出去之后能不能归因回来"。
-            # ⚠️ 报的是**实际没建成的条数**, 不是 len(to_mint) —— 半途失败时前面几条
-            #    是真建成了的, 说"全都没建成"会让人去重做已经做完的事。
-            done = len(minted_ok)
-            out["identity_warning"] = (
-                f"{len(to_mint)} 条稿子的指纹都入了库, 但只有 {done} 条建成了 "
-                f"items/versions({identity_error})。查重不受影响; 受影响的是导出的 "
-                f"lineage —— 没建成的那 {len(to_mint) - done} 条不在 version_ids 里, "
-                "导出时不会有 version_id, Truth Vault 那边归因不回来"
-                "(v_model_comparison 就 JOIN 在这个 id 上)。"
-                + (f"已建成的那 {done} 条照常可以 export_drafts(batch_id="
-                   f"{out['batch_id']})。" if done else "")
-                + "服务端日志有堆栈。")
-        if embed_failed and written:
-            # 配了 embedding 却没拿到向量 = 故障(欠费/配额/网络), 不是"没配"。
-            # 必须当场说, 让人决定是先修 key 再 commit, 还是接受这批只有确定性指纹。
-            # (2026-08-25 起这几行**补得回来**了 —— 稿子有了 versions 行, backfill
-            #  和 reembed 都扫得到。文案里保留 reembed 的指路, 它更直接。)
-            out["embedding_warning"] = (
-                f"配了 embedding 但本次取向量失败, {written} 条是【没有标题向量】入库的。"
-                "它们以后只参与确定性查重(开头精确 + 四字串重合), 同角度换说法的标题"
-                "比不出来。常见原因是 key 欠费/配额用尽/网络不通。"
-                "修好 key 之后用 `python -m deskcore.cli reembed --project <id>` 补齐。")
-        if attempted and consumed < attempted:
-            # consume_angle 现在会在"台账里根本没这一行"时返回 False(见 store 里的
-            # 说明)。差额必须说出来 —— 这些坐标下一批还会被抽到, 悄悄少算等于
-            # 避重失效了却没人知道。
-            out["angle_ledger_warning"] = (
-                f"{attempted - consumed}/{attempted} 个坐标没能在台账上销账(多半是发牌时"
-                "台账没写进去)。这些坐标下一批可能被重复抽到, 服务端日志有明细。")
-        if rpc_anomalies:
-            out["rpc_anomalies"] = rpc_anomalies
-            out["rpc_warning"] = (
-                f"入库 RPC 回了 {rpc_anomalies} 行对不上号的回执(idx 越界), 已跳过。"
-                "指纹可能已写入但这几条的身份/销账没做 —— 服务端日志有明细, 别重试, "
-                "重试会撞上自己刚写的指纹。")
-        if unattributed:
-            out["unattributed_warning"] = (
-                f"{unattributed}/{written} 条入库的稿子没带 angle_key, 台账无法给它们"
-                "销账 —— 这些角度下一批还会被抽到, 同一个故事会被讲第二遍, 而那种"
-                "重复查重闸抓不到。成批写的稿子每条都要带 draw_angles 分给它的 "
-                "angle_key。")
-        if rejected:
-            pre = sum(1 for r in rejected if r.get("gate") == "pre_commit")
-            race = len(rejected) - pre
-            parts = []
-            if pre:
-                parts.append(f"{pre} 条在入库前的判定里就被拦下(和 check_drafts 同一套"
-                             "闸 —— 说明这几条没过 check, 或者 check 之后又改回去了)")
-            if race:
-                parts.append(f"{race} 条在写入时被拦下(你 check 之后、commit 之前有人"
-                             "先提交了撞车的稿子)")
-            out["note"] = ("; ".join(parts)
-                           + "。这几条没有入库, 要重写后重新走 check_drafts, "
-                             "不能当作已交付。")
-        if not atomic:
-            out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
-                              "不存在, migrations/001 可能没跑)。并发 check/commit 时"
-                              "可能有撞车的稿子一起进库。")
-        return out
-    except Exception:
-        # 指纹已经摘了、稿子却没入库: 放回去, 否则旧稿从此不参与查重(而且没人知道)。
-        _restore_stash(client, stash, list(stash))
-        raise
+            minted = {"batch_id": None, "versions": {}, "error": None}
+            to_mint = [
+                {"version_id": minted_ids[i], "title": titles[i],
+                 "body": drafts[i].get("body") or "",
+                 "keywords": drafts[i].get("keywords") or []}
+                for i in sorted(inserted_idx) if i in minted_ids and i not in replace
+            ]
+            if to_mint:
+                minted = store.mint_draft_identity(
+                    client, project_id, str(user_id), "", to_mint)
+            identity_error = minted.get("error")
+
+            consumed = 0
+            attempted = 0
+            for i, d in enumerate(drafts):
+                if i not in inserted_idx or i in replace:   # 替换: 旧版入库时已经销过
+                    continue
+                key = d.get("angle_key")
+                if not key:
+                    continue
+                attempted += 1
+                # 台账销账用**真的** version_id。以前这里塞的是一个按 angle_key 哈希出来的
+                # 假 UUID(见上面删掉的 _placeholder_version_id) —— consumed_version_id 非
+                # NULL 就够避重用了, 但那个 id 指不到任何一行, 没法回答"这个角度产出的那篇
+                # 后来怎么样了"。
+                vid = d.get("version_id") or minted_ids[i]
+                if store.consume_angle(client, project_id, key, vid):
+                    consumed += 1
+
+            # 入了库却没带 angle_key 的: 台账没法给它们销账, 同一个故事下一批还可能被
+            # 抽到 —— 而那种重复(同题重写)指纹闸抓不到。途鸽 09-10 的 66 条里 49 条是
+            # 这么进来的, 当天四个标题各入库两次。RPC 对空 angle_key 一声不吭地照收,
+            # 所以只能在这里数出来说给调用方听。
+            unattributed = sum(1 for i in inserted_idx
+                               if i not in replace and not drafts[i].get("angle_key"))
+            minted_ok = [minted_ids[i] for i in sorted(inserted_idx)
+                         if i not in replace and minted_ids.get(i) in minted.get("versions", {})]
+            out = {"written": written, "consumed_angles": consumed,
+                   "unattributed": unattributed,
+                   "embedded": bool(vecs), "rejected": rejected,
+                   "atomic_recheck": atomic,
+                   "gate_summary": gate["summary"],
+                   "embedding_model": dedup.EMBEDDING_MODEL if vecs else None,
+                   # 这次建出来的身份。导出要用 version_id, 所以直接回给调用方 ——
+                   # 不然它得再查一次才知道自己刚提交的稿子叫什么。
+                   #
+                   # ⚠️ 只报**真的建出了行**的那些(拿 minted["versions"] 过一遍),
+                   #    不是"我本来打算用这些 id"。建失败时报出去的 id 会让调用方拿它
+                   #    去导出, 而 TV 那边 JOIN 不到任何东西 —— 那比不报更坏。
+                   "batch_id": minted.get("batch_id"),
+                   # 按调用方的下标顺序: 协议让调用方按位置留下 version_id 以便日后改稿,
+                   # 替换稿和新稿混在一批时不能把替换的都排到后面(codex #84 P2)。
+                   "version_ids": [minted_ids[i] for i in sorted(inserted_idx)
+                                   if (i in replaced_ok) or (minted_ids.get(i) in minted_ok)],
+                   # 改稿替换的: 同一个 item 升了一版。version_ids 里也有新 id(导出用)。
+                   "replaced": [{"index": i, "item_id": replaced_ok[i],
+                                 "old_version_id": replace[i]["old_version_id"],
+                                 "version_id": minted_ids[i]} for i in sorted(replaced_ok)]}
+            if replace_error:
+                missed = [i for i in sorted(inserted_idx) if i in replace and i not in replaced_ok]
+                out["replace_warning"] = (
+                    f"{len(missed)} 条替换稿的新指纹入了库, 但没能挂到旧稿上({replace_error})。"
+                    "查重不受影响; 旧稿的 best_version_id 还指着旧版, 导出会拿到旧文。"
+                    f"没接上的是第 {missed} 条。服务端日志有堆栈。")
+            if identity_error:
+                # 说清楚**丢的是哪几条**: 查重没事, 断的是"发出去之后能不能归因回来"。
+                # ⚠️ 报的是**实际没建成的条数**, 不是 len(to_mint) —— 半途失败时前面几条
+                #    是真建成了的, 说"全都没建成"会让人去重做已经做完的事。
+                done = len(minted_ok)
+                out["identity_warning"] = (
+                    f"{len(to_mint)} 条稿子的指纹都入了库, 但只有 {done} 条建成了 "
+                    f"items/versions({identity_error})。查重不受影响; 受影响的是导出的 "
+                    f"lineage —— 没建成的那 {len(to_mint) - done} 条不在 version_ids 里, "
+                    "导出时不会有 version_id, Truth Vault 那边归因不回来"
+                    "(v_model_comparison 就 JOIN 在这个 id 上)。"
+                    + (f"已建成的那 {done} 条照常可以 export_drafts(batch_id="
+                       f"{out['batch_id']})。" if done else "")
+                    + "服务端日志有堆栈。")
+            if embed_failed and written:
+                # 配了 embedding 却没拿到向量 = 故障(欠费/配额/网络), 不是"没配"。
+                # 必须当场说, 让人决定是先修 key 再 commit, 还是接受这批只有确定性指纹。
+                # (2026-08-25 起这几行**补得回来**了 —— 稿子有了 versions 行, backfill
+                #  和 reembed 都扫得到。文案里保留 reembed 的指路, 它更直接。)
+                out["embedding_warning"] = (
+                    f"配了 embedding 但本次取向量失败, {written} 条是【没有标题向量】入库的。"
+                    "它们以后只参与确定性查重(开头精确 + 四字串重合), 同角度换说法的标题"
+                    "比不出来。常见原因是 key 欠费/配额用尽/网络不通。"
+                    "修好 key 之后用 `python -m deskcore.cli reembed --project <id>` 补齐。")
+            if attempted and consumed < attempted:
+                # consume_angle 现在会在"台账里根本没这一行"时返回 False(见 store 里的
+                # 说明)。差额必须说出来 —— 这些坐标下一批还会被抽到, 悄悄少算等于
+                # 避重失效了却没人知道。
+                out["angle_ledger_warning"] = (
+                    f"{attempted - consumed}/{attempted} 个坐标没能在台账上销账(多半是发牌时"
+                    "台账没写进去)。这些坐标下一批可能被重复抽到, 服务端日志有明细。")
+            if rpc_anomalies:
+                out["rpc_anomalies"] = rpc_anomalies
+                out["rpc_warning"] = (
+                    f"入库 RPC 回了 {rpc_anomalies} 行对不上号的回执(idx 越界), 已跳过。"
+                    "指纹可能已写入但这几条的身份/销账没做 —— 服务端日志有明细, 别重试, "
+                    "重试会撞上自己刚写的指纹。")
+            if unattributed:
+                out["unattributed_warning"] = (
+                    f"{unattributed}/{written} 条入库的稿子没带 angle_key, 台账无法给它们"
+                    "销账 —— 这些角度下一批还会被抽到, 同一个故事会被讲第二遍, 而那种"
+                    "重复查重闸抓不到。成批写的稿子每条都要带 draw_angles 分给它的 "
+                    "angle_key。")
+            if rejected:
+                pre = sum(1 for r in rejected if r.get("gate") == "pre_commit")
+                race = sum(1 for r in rejected if r.get("gate") == "atomic_recheck")
+                bad_ref = sum(1 for r in rejected if r.get("gate") == "replace_lookup")
+                parts = []
+                if pre:
+                    parts.append(f"{pre} 条在入库前的判定里就被拦下(和 check_drafts 同一套"
+                                 "闸 —— 说明这几条没过 check, 或者 check 之后又改回去了)")
+                if race:
+                    parts.append(f"{race} 条在写入时被拦下(你 check 之后、commit 之前有人"
+                                 "先提交了撞车的稿子)")
+                tail = ""
+                if pre or race:
+                    tail = ("。这几条没有入库, 要重写后重新走 check_drafts, "
+                            "不能当作已交付")
+                if bad_ref:
+                    # 这不是撞车, 是 replaces_version_id 给错了: 让人重写只会再错一次
+                    # (codex #84 P2)。
+                    parts.append(f"{bad_ref} 条的 replaces_version_id 对不上(不是 UUID / 不是本"
+                                 "项目的版本 / 和 version_id 同时带了 / 同一篇替换两次) —— 稿子"
+                                 "本身没问题, 改对 id 再提交一次, 不用重写")
+                out["note"] = "; ".join(parts) + tail + "。"
+            if not atomic:
+                out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
+                                  "不存在, migrations/001 可能没跑)。并发 check/commit 时"
+                                  "可能有撞车的稿子一起进库。")
+            return out
+        except Exception:
+            # 指纹已经摘了、稿子却没入库: 放回去, 否则旧稿从此不参与查重(而且没人知道)。
+            _restore_stash(client, stash, list(stash))
+            raise
 
 
 # 人审只认这两个结论。**刻意不含 pending** —— 迭代后重置回待审是
@@ -2246,9 +2290,31 @@ def _acquire_ingest_lock(client, project_id: str, holder: str) -> bool | None:
         if got:
             return True
         if time.monotonic() >= deadline:
-            raise IngestBusy(f"项目 {project_id} 上另一个补录正在跑(锁被别的进程持有), "
-                             f"等了 {INGEST_LOCK_WAIT_SEC}s 没放 —— 稍后再试, 不要并行补录")
+            raise IngestBusy(f"项目 {project_id} 上另一个写操作(补录或入库)正在跑(锁被别的"
+                             f"进程持有), 等了 {INGEST_LOCK_WAIT_SEC}s 没放 —— 稍后再试")
         time.sleep(INGEST_LOCK_POLL_SEC)
+
+
+@contextlib.contextmanager
+def _project_write_lock(client, project_id: str, holder: str):
+    """项目级写锁: 进程内锁 + 009 的库锁(RPC 没部署就只有进程内那把)。
+
+    2026-09-18 起 commit_drafts 也拿它(codex #84 P1): 改稿替换要"先摘旧指纹、再查重
+    写入", 这两步不在一个事务里 —— 中间那一瞬别的 commit 能把与旧稿相同的文字塞进来。
+    补录和入库都过这把锁, 那个窗口就关上了。代价是每次 commit 多两次 RPC, 且补录
+    正在跑时入库要等(最多 INGEST_LOCK_WAIT_SEC, 之后 IngestBusy → 409, 重试即可)。
+    """
+    with _ingest_proc_lock(project_id):
+        got = _acquire_ingest_lock(client, project_id, holder)
+        try:
+            yield got
+        finally:
+            if got:
+                try:
+                    store.ingest_unlock(client, project_id, holder)
+                except Exception:                    # noqa: BLE001
+                    logger.exception("project write lock release failed (project=%s, "
+                                     "holder=%s); 锁会在 TTL 后自动过期", project_id, holder)
 
 
 def ingest_published(client, project_id: str, entries: list[dict], *,
@@ -2263,18 +2329,9 @@ def ingest_published(client, project_id: str, entries: list[dict], *,
         return _ingest_published_unlocked(client, project_id, entries, user_id=user_id,
                                           source=source, dry_run=True)
     holder = f"{source}:{uuid.uuid4().hex[:8]}"
-    with _ingest_proc_lock(project_id):
-        got = _acquire_ingest_lock(client, project_id, holder)
-        try:
-            return _ingest_published_unlocked(client, project_id, entries, user_id=user_id,
-                                              source=source, dry_run=False)
-        finally:
-            if got:
-                try:
-                    store.ingest_unlock(client, project_id, holder)
-                except Exception:                    # noqa: BLE001
-                    logger.exception("ingest unlock failed (project=%s); 锁会在 TTL 后自动"
-                                     "过期", project_id)
+    with _project_write_lock(client, project_id, holder):
+        return _ingest_published_unlocked(client, project_id, entries, user_id=user_id,
+                                          source=source, dry_run=False)
 
 
 def _ingest_published_unlocked(client, project_id: str, entries: list[dict], *,

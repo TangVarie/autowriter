@@ -110,7 +110,7 @@
 
 **5b. `export_drafts`** —— 用户说「导出」「给我个表」「要发了」时调。
 
-必须先 `commit_drafts`，用它返回的 `batch_id` 导。返回的 `xlsx_base64` 解码写成 `filename` 那个文件交给用户。表里除内容列还有几列 `_source_autowriter_*`，**别让用户删**，那是这条笔记发出去之后数据能回到写作台的唯一线索。
+必须先 `commit_drafts`，用它返回的 `batch_id` 导。**改过稿的那批用 `version_ids` 导**（把这次返回的 `version_ids` 原样传过去）：只有替换稿的 commit 不建新 batch，`batch_id` 是空的；新稿和替换稿混着提交时 `batch_id` 只包含新稿，按它导会漏掉改过的那几篇。返回的 `xlsx_base64` 解码写成 `filename` 那个文件交给用户。表里除内容列还有几列 `_source_autowriter_*`，**别让用户删**，那是这条笔记发出去之后数据能回到写作台的唯一线索。
 
 **5c. `ingest_published`** —— 用户拿来的是**已经发出去、当时没入库**的稿子时调。
 

@@ -95,7 +95,7 @@ def test_dry_run_never_touches_the_lock():
 def test_a_lock_held_by_another_process_makes_us_busy_not_duplicate():
     c = _client()
     c.lock_table.rows[PROJ] = ("someone-else", time.monotonic() + 600)
-    with pytest.raises(core.IngestBusy, match="另一个补录"):
+    with pytest.raises(core.IngestBusy, match="另一个写操作"):
         core.ingest_published(c, PROJ, _rows(1), user_id=ME, source="x")
     assert not c.rows.get("versions"), "拿不到锁一行都不能写"
 
