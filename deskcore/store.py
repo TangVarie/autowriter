@@ -1687,6 +1687,13 @@ def tv_links(sb, tv_project_id: str) -> dict[str, dict]:
     return {r["note_id"]: r for r in _paged(_build)}
 
 
+def tv_link(sb, note_id: str) -> dict | None:
+    """一条对照(全部列) —— tv-resolve 用, 人工判定要看它现在是什么。"""
+    rows = (sb.table("tv_note_links").select("*").eq("note_id", note_id)
+            .limit(1).execute()).data or []
+    return rows[0] if rows else None
+
+
 def tv_links_upsert(sb, rows: list[dict]) -> int:
     if not rows:
         return 0

@@ -3084,6 +3084,73 @@ def _resolve_any_version(client, project_of: dict, version_id: str):
     return None
 
 
+def tv_resolve(client, note_id: str, *, ingest: bool) -> dict:
+    """人看过一条 ``ambiguous`` 之后的判定: 目前只有一种 —— "对不上, 按正文补录"。
+
+    tv_sync 判不出的留 candidates 给人看、不硬猜(两版同标题的稿子, 正文都和笔记
+    不像 —— 2026-09-18 途鸽那条, 两版都是评论稿, 真正的正文写作台里没有)。人看完
+    说"对不上", 就该和 unmatched 一样把正文补进指纹库, 否则这篇发出去的稿子查重
+    永远看不见它。判定结果写回 tv_note_links: match_kind → ingested, 带 version_id;
+    原来的 candidates 保留, 前面加一条"人工判定"。之后每天的 tv_sync 把它当已对上
+    跳过; --write-tv 对 ingested 不回写(见 _backfillable)。
+
+    "指定某一版"这个判定**故意没有**: match_kind 的 CHECK 里没有 manual 一档,
+    硬记成 body_exact 是撒谎。真需要时加迁移, 不在这儿蒙。
+    """
+    if not ingest:
+        raise ValueError("tv_resolve 目前只有 --ingest 一种判定")
+    link = store.tv_link(client, note_id)
+    if link is None:
+        raise ValueError(f"tv_note_links 里没有 {note_id!r} —— 先跑 tv-sync")
+    if link.get("version_id"):
+        raise ValueError(f"{note_id} 已经对上了({link['match_kind']} → "
+                         f"{link['version_id']}), 没什么可判的")
+    tv_project_id = link["tv_project_id"]
+    maps = [m for m in store.tv_project_map(client) if m["tv_project_id"] == tv_project_id]
+    target = next((m for m in maps if m.get("ingest_target")), None)
+    if target is None:
+        raise ValueError(f"{tv_project_id} 没有补录目标 —— 先 tv-map add … --ingest-target")
+    row = next((r for r in store.tv_notes(client, tv_project_id)
+                if str(r.get("note_id")) == note_id), None)
+    if row is None:
+        raise ValueError(f"TV 里没有 {note_id!r}(被删了?)")
+    note = tvlink.Note.from_row(row)
+    if not note.body:
+        raise ValueError(f"{note_id} 在 TV 里没有正文, 补不了")
+
+    owner = _tv_owner(client, target["project_id"])
+    report = ingest_published(client, target["project_id"],
+                              [{"title": note.title, "body": note.body}],
+                              user_id=owner, source=f"tv:{tv_project_id}")
+    written = report.get("written") or []
+    version_id = written[0]["version_id"] if written else None
+    if not version_id:
+        # 指纹库已有同正文(skipped_already_fingerprinted)或半途失败: 都不能把对照
+        # 记成 ingested, 如实回报, 对照不动。
+        return {"note_id": note_id, "resolved": False, "ingest": report,
+                "note": ("没建成版本: " + (report.get("identity_error")
+                                          or report.get("fingerprint_error")
+                                          or "指纹库里已有同正文的稿子(对照没动)"))}
+    item_id = None
+    try:
+        item_id = (store.items_for_versions(client, target["project_id"], [version_id])
+                   .get(version_id) or {}).get("item_id")
+    except Exception:                        # noqa: BLE001
+        logger.exception("tv_resolve: 取 item_id 失败, 对照先不带 item_id")
+    candidates = [{"note": "人工判定: 对不上, 按正文补录(tv-resolve --ingest)"}]
+    candidates += list(link.get("candidates") or [])
+    store.tv_links_upsert(client, [{
+        "note_id": note_id, "tv_project_id": tv_project_id,
+        "project_id": target["project_id"], "version_id": version_id, "item_id": item_id,
+        "match_kind": "ingested", "score": None, "lag_days": None,
+        "candidates": candidates, "updated_at": store.iso_now()}])
+    return {"note_id": note_id, "resolved": True, "version_id": version_id,
+            "item_id": item_id, "project_id": target["project_id"], "ingest": report,
+            "note": f"{note_id} 按对不上补录: 版本 {version_id[:8]}, 对照改成 ingested"
+                    + ("" if report.get("fingerprinted") else
+                       " —— ⚠️ 指纹没写上, 跑 backfill --project " + target["project_id"])}
+
+
 # 哪些对照可以写回 TV。ingested 排除: 版本是从这条笔记复制来的, 不是它的来源。
 _TV_BACKFILL_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "tv_lineage"})
 

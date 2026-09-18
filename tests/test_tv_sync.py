@@ -193,6 +193,45 @@ def test_ambiguous_keeps_candidates_and_does_not_guess():
     assert {x["version_id"] for x in link["candidates"]} == {"v1", "v2"}
 
 
+def test_tv_resolve_ingest_turns_an_ambiguous_note_into_an_ingested_link(capsys, monkeypatch):
+    """人看完「分不出」说"对不上": 正文补进指纹库, 对照改成 ingested 带 version_id,
+    原 candidates 保留并加一条人工判定; 第二天 tv_sync 把它当已对上跳过; 已对上的
+    / 不存在的 / 没正文的都不判。2026-09-18 途鸽那条(两版同标题的评论稿)的出口。"""
+    c = _client([_note("n9", "同一个标题两版", "跟两版都不像的正文, 只有标题对得上, 凑够二十个字。")])
+    c.rows["items"].append({"id": "i2", "batch_id": "b1", "best_version_id": "v2",
+                            "created_at": _iso(0), "user_id": ME, "status": "pending",
+                            "versions": [{"id": "v2", "title": "同一个标题两版", "body": BODY_A,
+                                          "version_num": 1, "created_at": _iso(0)}],
+                            "batches": {"project_id": P1}})
+    c.rows["items"][0]["versions"][0]["title"] = "同一个标题两版"
+    core.tv_sync(c, TV)
+    assert c.rows["tv_note_links"][0]["match_kind"] == "ambiguous"
+    n_versions = len(c.rows["versions"])
+
+    out = core.tv_resolve(c, "n9", ingest=True)
+    assert out["resolved"] and out["version_id"]
+    link = c.rows["tv_note_links"][0]
+    assert link["match_kind"] == "ingested" and link["version_id"] == out["version_id"]
+    assert link["candidates"][0]["note"].startswith("人工判定")
+    assert {x.get("version_id") for x in link["candidates"][1:]} == {"v1", "v2"}, "原候选保留"
+    assert len(c.rows["versions"]) == n_versions + 1
+    assert len(c.rows["draft_fingerprints"]) == 1
+
+    again = core.tv_sync(c, TV)
+    assert again["counts"]["already_linked"] == 1 and again["counts"]["ambiguous"] == 0
+
+    with pytest.raises(ValueError, match="已经对上了"):
+        core.tv_resolve(c, "n9", ingest=True)
+    with pytest.raises(ValueError, match="没有"):
+        core.tv_resolve(c, "nope", ingest=True)
+    with pytest.raises(ValueError, match="只有 --ingest"):
+        core.tv_resolve(c, "n9", ingest=False)
+
+    monkeypatch.setattr(core, "sb", lambda: c)
+    assert cli.main(["tv-resolve", "--note", "n9", "--ingest"]) == 2
+    assert "已经对上了" in capsys.readouterr().out
+
+
 def test_tv_notes_are_paged_by_keyset():
     notes = [_note(f"n{i:03d}", f"第 {i} 篇", f"第 {i} 篇的正文各不相同, 长度都够二十个字以上。" * 2)
              for i in range(7)]

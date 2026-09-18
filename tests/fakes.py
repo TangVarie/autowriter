@@ -128,6 +128,7 @@ class FakeQuery:
 
     def upsert(self, payload, **kwargs):
         self.op, self.payload = "upsert", payload
+        self.on_conflict = kwargs.get("on_conflict")
         return self
 
     def delete(self):
@@ -276,6 +277,21 @@ class FakeClient:
             for row in payload:
                 if isinstance(row, dict) and "id" not in row:
                     row["id"] = str(_uuid.uuid4())
+            # upsert(on_conflict="a,b"): 真库按那几列撞上就**更新同一行**(PostgREST
+            # merge-duplicates), 不是再插一行。假件原来一律 append, 于是"改一条对照"
+            # 在测试里变成两条并存、按下标取到的还是旧的 —— tv_resolve 的测试就是
+            # 这样假红的。没给 on_conflict 的照旧 append。
+            keys = [k.strip() for k in (getattr(q, "on_conflict", None) or "").split(",") if k.strip()]
+            if keys:
+                rest = []
+                for row in payload:
+                    hit = next((r for r in table
+                                if all(r.get(k) == row.get(k) for k in keys)), None)
+                    if hit is not None:
+                        hit.update({k: v for k, v in row.items() if k != "id"})
+                    else:
+                        rest.append(row)
+                payload = rest
             table.extend(payload)
             return FakeResponse(list(payload))
 

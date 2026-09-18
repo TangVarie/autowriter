@@ -230,7 +230,9 @@ TV 那边 RPC 只填 NULL、不覆盖 TV 自己的值；TV 的夜跑 upsert 不�
 
 验收：`select count(*) from truth_vault.notes where source_autowriter_version_id is not null`
 从 0 变成非 0；`doctor` 里 `009` 三条探测 applied；`tv-sync` 报表里 `ambiguous` 的
-那几条要人看一眼（它列出候选，不硬猜）。
+那几条要人看一眼（它列出候选，不硬猜）。看完是「对不上」就 `tv-resolve --note <note_id> --ingest`：
+TV 的正文补进指纹库，对照改成 `ingested`（2026-09-18 途鸽 `TUGE_phase1_recvsfuucYAZZr` 就是这样处理的：
+两版同标题的稿子都是评论稿，真正的正文写作台里没有）。
 
 > ⚠️ 第 3.5 步（飞书建六列）**作废**。`export_drafts` 仍然带那六列，粘了不坏，但对照不再依赖它。
 > Hatherine 在 TV 里一条都没有——那张飞书表没接进 TV 同步，接进去之后加一行 `tv-map` 即可。
