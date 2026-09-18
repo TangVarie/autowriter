@@ -127,13 +127,33 @@ def test_write_tv_backfills_only_rows_with_a_version_and_marks_them_synced():
 
 
 def test_a_previously_linked_but_unsynced_row_is_backfilled_on_the_next_write_tv():
-    """第一天没开 --write-tv, 第二天开了: 昨天对上的也要回填, 不只是今天新对上的。"""
+    """第一天没开 --write-tv, 第二天开了: 昨天对上的也要回填, 不只是今天新对上的。
+    昨天补录的(n2, ingested)照样不写 —— 见下一个用例。"""
     c = _client(NOTES)
     core.tv_sync(c, TV)                              # 对上了, 没回填
     out = core.tv_sync(c, TV, write_tv=True)         # 全部 already_linked
     assert out["counts"]["already_linked"] == 2
     sent = {l["note_id"] for l in c.tv_calls["backfill"][0]}
-    assert sent == {"n1", "n2"} and out["tv_backfilled"] == 2
+    assert sent == {"n1"} and out["tv_backfilled"] == 1
+
+
+def test_ingested_links_are_never_written_back_to_tv():
+    """TV 2026-09-18 核对时的条件: ingested 的版本是我们从这条笔记复制进写作台的,
+    写回 source_autowriter_* 等于说"笔记来源于版本 X"而 X 来源于笔记 —— 因果倒置,
+    TV 的模型对比视图会多出上千行没信息量的 deskcore。真对上的(n1)照写; 补录的
+    (n2)有 version_id 也不写、不标 synced, 无论是本次补的还是昨天补的。"""
+    c = _client(NOTES)
+    out = core.tv_sync(c, TV, write_tv=True)          # n2 本次补录
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    assert links["n2"]["match_kind"] == "ingested" and links["n2"]["version_id"]
+    assert out["tv_backfilled"] == 1
+    assert {l["note_id"] for l in c.tv_calls["backfill"][0]} == {"n1"}
+    assert links["n1"].get("synced_to_tv_at") and not links["n2"].get("synced_to_tv_at")
+
+    again = core.tv_sync(c, TV, write_tv=True)        # n2 现在是"昨天补的、没 synced"
+    assert again["tv_backfilled"] == 0 and len(c.tv_calls["backfill"]) == 1, \
+        "没 synced 的 ingested 行也不能在第二天被当成漏网之鱼补写"
+    assert not {l["note_id"]: l for l in c.rows["tv_note_links"]}["n2"].get("synced_to_tv_at")
 
 
 def test_tv_lineage_only_carries_a_version_id_we_actually_have():

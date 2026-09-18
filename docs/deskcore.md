@@ -382,7 +382,7 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 | 模糊 | 时间窗内（发布 −30 ～ +30 天）四字串**包含度** ≥ 0.6 且与次佳差 ≥ 0.1 → `fuzzy` | 途鸽发之前改得很狠（305 字 vs 527 字），精确对不上，靠这一路 |
 | 分不出 | `ambiguous`：候选写进 `tv_note_links.candidates`，**不硬猜**，报表里列给人看 | |
 | 对不上 | `unmatched` → `ingest_published`（剥话题标签、不过闸、按全文幂等）补录进目标项目，建成的 `version_id` 记回 `tv_note_links` | 同项目稿子都以同一串标签结尾，不剥会互相误撞 |
-| 回填 TV | `--write-tv` 才把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL 的行** | 那是 TV 的列，回填前跟 TV 打招呼 |
+| 回填 TV | `--write-tv` 才把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL 的行**，且**只写真对上的**（`body_exact` / `title_exact` / `fuzzy` / `tv_lineage`）；`ingested` 不写 | 那是 TV 的列；补录的版本是从笔记复制来的，写回去因果倒置（TV 2026-09-18 核对时定的口径，见 runbook §1.4） |
 | 互斥 | 补录走 `core.ingest_published`，它先拿库里的项目锁（`ingest_locks`，TTL 10 分钟、到期可接管），拿不到等 90 秒后报「另一个补录正在跑」（REST 409） | 服务进程的工具与 CLI/cron 的 `tv-sync` 是两个进程，进程内锁管不到对方；advisory lock 跨不过 PostgREST 的多次请求 |
 
 实测（2026-09-17 的库，按全部 5000 多个版本对）：WTG 724 篇对上 229、百健士 182 对上 143、
@@ -423,8 +423,8 @@ env：
 `002_calibration_cas.sql` / `003_versions_unique_num.sql` /
 `004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
 `006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql` /
-`008_embedding_model_isolation.sql` / `009_tv_links.sql`
-**九个，按编号顺序跑，别跳号**（建议先在
+`008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql`
+**十个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -454,6 +454,8 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
   >
   > 这是 2026-08-26 首次真部署当天靠人肉 `curl` 打线上才发现的。现在有两道守卫：`tests/sql_parity_check.py` 断言 **`autowriter` 下每一张表都必须对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**（断不变量而不是名单，以后加表忘了发 GRANT 会自己红）；`doctor` 把 `42501` 单独报成 `denied` 而不是混进 `error`，并直接指向 `migrations/007`——而且**四个权限一个个探**，因为"读得到"证明不了"写得进"。
 - `009_tv_links.sql` 是写作台 ↔ TV 的稿子对照（2026-09-17）：两张表 + 两个跨 schema 的 RPC。为什么要它：TV 5966 条笔记里带写作台 lineage 的是 **0 条**——原设计让运营把 `export_drafts` 的六个 ID 列手抄进飞书，三周零匹配，到 TV 手里的表根本没有那六列。两边在同一个库里、内容都是写作台产的，`tv-sync` 按内容对（正文前 40 字 / 标题 / 时间窗内四字串包含度），对不上的直接从 TV 的全文补录进指纹库。**运营不用做任何事，飞书表不用加列。** 见 §3.7。
+
+- `010_tv_links_rls.sql`：`009` 建的三张表补开 RLS（2026-09-18，Supabase advisor 对着生产库报出来的）。不是漏洞——anon / authenticated 对它们没有表级 GRANT，service_role 绕 RLS——只是与本 schema 其他表同一口径。`doctor` 探不到它（RLS 开没开从 PostgREST 读起来一样），报 `unprobeable` 并给出要在 SQL Editor 跑的那句；`tests/sql_parity_check.py` 守「每张表都开了 RLS」这条不变量。
 
 - `008_embedding_model_isolation.sql` 治的是另一种"写着已经有了、实际没有"：`draft_fingerprints.embedding_model` 从 `001` 起就在，`COMMENT` 写着它是"换 embedding 供应商时唯一的救命稻草"，而**四路查重里没有任何一路读过它**。
 

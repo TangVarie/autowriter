@@ -1,12 +1,12 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
-  "//": "tv-sync 的每日 cron service(2026-09-17)。与 deskcore 主服务同一个仓、同一条分支, 另建一个 service 并把 config-as-code 指到本文件。北京时间 03:00 = UTC 19:00。变量用 Variable Reference 引 deskcore 主服务的 SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / GOOGLE_API_KEY / SUPABASE_ANON_KEY。跟 TV 打招呼之前先去掉 --write-tv(Settings → Deploy → Custom Start Command 覆盖即可)。",
+  "//": "tv-sync 的每日 cron service(2026-09-17)。与 deskcore 主服务同一个仓、同一条分支, 另建一个 service 并把 config-as-code 指到本文件。UTC 04:00 = 北京 12:00: TV 的夜跑是 UTC 02:00(北京 10:00), 放在它后面当天的新笔记才对得上。变量用 Variable Reference 引 deskcore 主服务的 SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / GOOGLE_API_KEY(CLI 不用 SUPABASE_ANON_KEY)。跟 TV 打招呼之前先去掉 --write-tv(Settings → Deploy → Custom Start Command 覆盖即可)。",
   "build": {
     "builder": "NIXPACKS",
     "buildCommand": "pip install -r requirements.lock -r deskcore/requirements.txt"
   },
   "deploy": {
-    "cronSchedule": "0 19 * * *",
+    "cronSchedule": "0 4 * * *",
     "startCommand": "python -m deskcore.cli tv-sync --all --write-tv",
     "restartPolicyType": "NEVER"
   }

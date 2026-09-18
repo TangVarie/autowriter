@@ -1744,6 +1744,12 @@ MIGRATION_EMBEDDING_ISOLATION = "008_embedding_model_isolation.sql"
 MIGRATION_TV_LINKS = "009_tv_links.sql"
 _MIGRATION_009_TABLES = ("tv_project_map", "tv_note_links")   # ingest_locks 单独探(列名不同)
 _MIGRATION_009_PROBE_COLUMN = "tv_project_id"
+# 010 开的是 RLS, PostgREST 探不到(service_role 绕 RLS, 开没开读起来一样)。
+MIGRATION_TV_LINKS_RLS = "010_tv_links_rls.sql"
+MIGRATION_010_PROBE_SQL = (
+    "select relname, relrowsecurity from pg_class c join pg_namespace n on n.oid=c.relnamespace "
+    "where n.nspname='autowriter' and relname in ('tv_project_map','tv_note_links','ingest_locks');"
+)
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -2043,6 +2049,17 @@ def migration_state(client) -> dict:
         "_project_id": _PROBE_NIL_UUID, "_holder": "__doctor_probe__"}).execute())
     _add(MIGRATION_TV_LINKS, "deskcore_ingest_unlock", state, note,
          "同上: 跨进程互斥失效(deskcore_ingest_lock 与它同一个迁移, 不单独探)")
+
+    # ── 010: 009 那三张表开 RLS。PostgREST 这一面探不到 relrowsecurity(service_role
+    #    绕 RLS, 开没开读起来一样), 与 003 / 008 同类: 如实报 unprobeable 并交出
+    #    该跑的 SQL。漏跑不影响任何功能, 只是 Supabase advisor 会一直报。
+    _add(MIGRATION_TV_LINKS_RLS,
+         "tv_project_map / tv_note_links / ingest_locks 的 RLS",
+         "unprobeable",
+         "PostgREST 读不到 pg_class.relrowsecurity; 用 SQL Editor 跑: " + MIGRATION_010_PROBE_SQL,
+         "功能不坏(anon 对这三张表没有表级 GRANT, service_role 绕 RLS); 差的是 "
+         "Supabase advisor 一直报 rls_disabled, 以及以后谁给 anon 发了 GRANT 会一下子"
+         "把整张表露出去")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -3067,6 +3084,14 @@ def _resolve_any_version(client, project_of: dict, version_id: str):
     return None
 
 
+# 哪些对照可以写回 TV。ingested 排除: 版本是从这条笔记复制来的, 不是它的来源。
+_TV_BACKFILL_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "tv_lineage"})
+
+
+def _backfillable(link: dict) -> bool:
+    return bool(link.get("version_id")) and link.get("match_kind") in _TV_BACKFILL_KINDS
+
+
 def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             write_tv: bool = False, since: str | None = None,
             rematch: bool = False) -> dict:
@@ -3088,7 +3113,9 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
       5. 对照写进 tv_note_links(upsert, 按 note_id)。已经对上且没要求 rematch
          的笔记跳过 —— 每天跑一次, 增量。
       6. ``write_tv`` 才把对照写回 TV 的 source_autowriter_* 两列(只填 NULL 的
-         行; 那是 TV 的列, 默认不碰)。
+         行; 那是 TV 的列, 默认不碰)。**只回写真对上的**(body_exact / title_exact
+         / fuzzy / tv_lineage); ``ingested`` 的不写 —— 那些版本是从这条笔记复制
+         来的, 写回去因果倒置(见 _backfillable)。
 
     ``dry_run``: 全部算、一行不写(对照不写、指纹不写、TV 不写), 报表照出。
     """
@@ -3240,10 +3267,16 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     if not dry_run:
         written_links = store.tv_links_upsert(client, links)
         if write_tv:
-            pending = [l for l in links if l.get("version_id")]
+            # ingested 不回写(TV 2026-09-18 核对时的条件): 那些版本是我们从这条
+            # 笔记复制进写作台的, 写回去等于说"这条笔记来源于版本 X"而 X 来源于
+            # 这条笔记 —— 因果倒置, TV 的模型对比视图会多出上千行没信息量的
+            # deskcore。它们留在 tv_note_links 里就够了(查重靠的是指纹, 不靠 TV
+            # 那两列)。
+            fresh = {l["note_id"] for l in links}
+            pending = [l for l in links if _backfillable(l)]
             pending += [dict(r, note_id=nid) for nid, r in existing.items()
-                        if r.get("version_id") and not r.get("synced_to_tv_at")
-                        and nid not in {l["note_id"] for l in links}]
+                        if _backfillable(r) and not r.get("synced_to_tv_at")
+                        and nid not in fresh]
             backfilled = store.tv_backfill_lineage(client, pending)
             if pending:
                 store.tv_mark_synced(client, [l["note_id"] for l in pending])
