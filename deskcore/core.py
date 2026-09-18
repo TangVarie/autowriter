@@ -3219,7 +3219,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
 
     for n in notes:
         prev = existing.get(n.note_id)
-        if prev and prev.get("version_id") and not rematch:
+        # ingested 的对照是终态, --rematch 也不重对(codex #83 P1): 它的版本就是从这条
+        # 笔记复制出来的, 重对只能对上它自己 —— 记成 body_exact 之后 _backfillable
+        # 放行, --write-tv 就把本要排除的因果倒置 lineage 全写回 TV 了。
+        if prev and prev.get("version_id") and (not rematch or prev.get("match_kind") == "ingested"):
             counts["already_linked"] += 1
             continue
         if n.tv_version_id:

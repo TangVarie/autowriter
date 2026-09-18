@@ -155,6 +155,15 @@ def test_ingested_links_are_never_written_back_to_tv():
         "没 synced 的 ingested 行也不能在第二天被当成漏网之鱼补写"
     assert not {l["note_id"]: l for l in c.rows["tv_note_links"]}["n2"].get("synced_to_tv_at")
 
+    # codex #83 P1: --rematch 会把 n2 重新对到从它自己复制出来的那一版(正文相同 →
+    # body_exact), 然后 --write-tv 把它写回 TV —— 正是这个 PR 要排除的东西。
+    # ingested 是终态, --rematch 也不重对。
+    third = core.tv_sync(c, TV, rematch=True, write_tv=True)
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    assert links["n2"]["match_kind"] == "ingested" and not links["n2"].get("synced_to_tv_at")
+    assert third["counts"]["already_linked"] == 1 and third["counts"]["body_exact"] == 1
+    assert all({l["note_id"] for l in call} == {"n1"} for call in c.tv_calls["backfill"])
+
 
 def test_tv_lineage_only_carries_a_version_id_we_actually_have():
     """tv_note_links.version_id 有外键: TV 带的 id 若不在我们库里, 硬写会让整个
