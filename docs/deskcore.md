@@ -163,7 +163,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
-| | `borrow_lessons` | 转调 TV 馆员，借真实爆款经验卡 |
+| | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
 | | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可 |
 | 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human` + 真实 reviewer + 时间。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
@@ -409,7 +409,7 @@ env：
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | ✅ | service_role，绕 RLS |
 | `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<uuid>", "name": "Ziao"}}`，一人一把 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
-| `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `borrow_lessons` 返回空 |
+| `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
 

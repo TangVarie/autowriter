@@ -272,9 +272,14 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
       · p0 —— 【不可违反的硬约束】, 必须 100% 满足, 与任何偏好冲突时以它为准
       · p1 —— 项目调性偏好 + 调校笔记 + 正反案例, 理解意图后按适用性应用
       · tactics —— 这个项目配置好的战术方向清单
+      · lessons —— 【真实爆款经验卡】, 已经替你向帆谷飞轮图书馆借好了
+        (最多 5 张); lessons_status.status 说明是 borrowed / empty /
+        not_configured / timeout / error 里的哪一种。只借钩子、结构、手法,
+        严禁照抄标题主干或具体句子; synthetic=true 的卡指标未经验证。
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     而不是按时间倒序 —— 后者会让文风越写越窄。所以知道要写什么就传。
+    经验卡也是按这几个字段匹配的, 不传就只按项目定位借。
 
     ⚠️ **counts.hard_rules 是 0 属于正常, 不要因此怀疑 project_id 传错。**
     现存库里三百多条规则的 severity 全是 soft, 一条 hard 都没有(老工作台收
@@ -323,7 +328,10 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
 def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
                    key_messages: str = "", target_audience: str = "",
                    tone: str = "", _user_id: str | None = None) -> dict:
-    """向帆谷飞轮图书馆借几张【真实爆款】的经验卡。
+    """向帆谷飞轮图书馆【再】借几张真实爆款的经验卡。
+
+    open_project 已经随简报借过一次(返回里的 lessons)。只在换了选题 / 战术、
+    想按另一个方向再匹配一批时才调这个; 同样的参数再调一次拿到的是同一批卡。
 
     这些卡来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
     结构骨架 / 为什么有效 / 可迁移手法」。写稿时可以借它的钩子或结构。
