@@ -802,11 +802,24 @@ items.example_label（只有 label_example 这一个，走 db.set_item_example_l
 >
 > 但实查生产库：`autowriter.items` 6,688 行的 `decision_source` **全是 NULL**，`review_drafts` **一次都没被调用过**；`prepublish_evaluations` 停在 **2026-08-20**，而 Streamlit 末次出稿是 **08-19**。**这条链路已经自己断了一个月**。
 >
-> 所以问题不再是「停 Streamlit 会不会把它弄断」，而是「要不要把它重新点亮」：
-> · 要 —— 那是人的流程（用户看完稿给结论、模型把结论落库），代码不用动；
-> · 不要 —— 把 `prepublish_evaluations` 明确标成 legacy-only（原选项 C），别让 TV 那边继续等一个不会来的信号。
+> 所以问题不再是「停 Streamlit 会不会把它弄断」，而是「要不要把它重新点亮」。
 >
-> ⚠️ **不要用「让模型多调 review_drafts」来解决**：协议里「用户没表态就别调」守的正是「别替用户点通过」，松掉就是往评估模型里灌伪造的正例，比不记更糟。
+> ✅ **2026-09-20 owner 拍板：不点亮，标 legacy-only（选项 C）**（TV D-072）。
+> 决定的理由不是「人工审稿没价值」，是**那张表现在没有消费者**：`prepublish_evaluations`
+> 的 598 行里 `pred_tier_class` / `actual_tier` 一条都没填、`was_correct` 全 NULL ——
+> 它从上线到现在只写不读，真实消费者（L2 Predictor）要等特征层过闸三才谈得上。
+> 让写手每场多做一个动作换一张没人读的表，性价比不对。
+>
+> **重新点亮的条件**（三条都到了再说）：① 特征层过闸三、打分器开始往那张表写
+> `evaluator_type='model'` 的行；② 有人真的要算「模型预测 vs 人怎么判 vs 实际爆没爆」；
+> ③ 有人负责填 `actual_tier`（`notes.source_autowriter_version_id` 已有 404 行，
+> lineage 不再是空的，反推有了地基）。
+>
+> **管子不拆**：TV 的 `sync_autowriter_decisions_to_prepublish.py` 继续在夜跑里，
+> 哪天真有行了会自动流进来；改的是对沉默的解释——捞不到新行是预期的，不是故障。
+> `review_drafts` 这个工具也**不下线**：用户真表了态照样该记，只是不再当成待办去推。
+>
+> ⚠️ **将来点亮时也不许用「让模型多调 review_drafts」来实现**：协议里「用户没表态就别调」守的正是「别替用户点通过」，松掉就是往评估模型里灌伪造的正例，比不记更糟。这条不随 legacy-only 一起放松。
 
 **三条路，第一期之前必须选一条**（列进待办 #5 的前置；上面那条复查说明 A 已建好、链路已断）：
 
@@ -814,7 +827,7 @@ items.example_label（只有 label_example 这一个，走 db.set_item_example_l
 |---|---|---|
 | A · deskcore 补写回 | `commit_drafts` 时建 item/version（**✅ 已做**），再加一个能落 `status` 的动作（**✅ 已做** —— `review_drafts`，2026-09-16） | **代码全做完，零调用**（见 §4 待办 7d） |
 | B · 换一条归档源 | 让 TV 改读 `draft_fingerprints` + 一个新的决策表 | 没动，跨仓 |
-| C · 明确接受断掉 | 把这一行标成 legacy-only，`prepublish_evaluations` 冻结在存量 598 条 | 没动 |
+| C · 明确接受断掉 | 把这一行标成 legacy-only，`prepublish_evaluations` 冻结在存量 598 条 | ✅ **2026-09-20 选了这条**（TV D-072），理由见上方复查段 |
 
 ~~**在选定之前不要停 Streamlit。**~~ → 2026-09-20：Streamlit 末次出稿 08-19，事实上已经停了；这句话保护的东西已经不在了。
 
@@ -859,11 +872,11 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | # | 事 | 为什么 |
 |---|---|---|
 | 4 | ~~**把真正的硬规则设成 `hard`**~~ | ✅ **2026-09-20 实查：已经在做了**。全库 465 条规则里 hard **53 条**（47 confirmed / 6 candidate），soft 412 条。P0 硬约束层不再是空的，这一条从待办降级为「继续攒」。（`protocol.md` 里那句「现存库里 300 多条全是 soft、一条 hard 都没有」也同步改了——它会让模型把真的配置问题当成正常） |
-| 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。**⚠️ 前置的前提已经变了（2026-09-20）**：那条链路**事实上已经断了一个月** —— Streamlit 末次出稿 08-19、`prepublish_evaluations` 末条 08-20、接替它的 `review_drafts` 至今零调用（见 7d）。所以 A/B/C 不再是「停服前要不要保住它」，而是「要不要把它重新点亮」；选项 A 两侧的代码都已经建好，缺的只是有人真的去用 |
+| 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。✅ **前置已解除（2026-09-20，TV D-072）**：A/B/C 选了 **C** —— `prepublish_evaluations` 标成 legacy-only。那条链路事实上已经断了一个月（Streamlit 末次出稿 08-19、表末条 08-20、`review_drafts` 零调用），而且**那张表本来就没有消费者**（598 行里 `pred_tier_class` / `actual_tier` 一条没填）。**停 Streamlit 不再被这条挡着**；管子不拆、`review_drafts` 不下线，重新点亮的条件见 §3 |
 | 6 | 观察 `borrow_lessons` 选卡质量 | TV 书架规模下的选卡准确率**从来没人测过**。不行就在 `librarian/core.py:33` 那个 `CANDIDATE_CAP=50` 的口子加 embedding 预筛 |
 | 7 | 让 `check_drafts` 的降级信号被人看见 | `semantic_degraded` / `empty_history_warning` 这两个字段没人盯的话，表现就是"查重跑了、全 pass、看着一切正常" |
 | 7b | ~~**推 TV 那边读 `decision_source`**~~ | ✅ **TV 已接**（`scripts/sync_autowriter_decisions_to_prepublish.py` 按 human / rule_based / unverified 分流，只有 `decision_source` 恰好等于 `human` 才算人工）。⚠️ **但这条管子现在零流量**，见下面 7d |
-| 7d | ⚠️ **人工审稿这条管子一个月零流量** | 2026-09-20 实查生产库：`autowriter.items` **6,688 行里 `decision_source` 全是 NULL** —— `review_drafts`（2026-09-16 上线）**一次都没被调用过**。存量 598 条 approved/needs_revision 是 Streamlit 时代留下的，TV 那边已按新口径全部归成 `evaluator_type='unverified'`，`prepublish_evaluations` **最后一条停在 2026-08-20**（Streamlit 末次出稿 08-19）。两侧代码都通，**没人拧龙头** —— 与 D-063 通道 2 那次同一个形状。⚠️ 修法**不是**让模型主动多调：协议里「用户没表态就别调」那条守的正是「别替用户点通过」，松掉就是灌伪造正例。这是给人看的决策，不是给代码修的 bug |
+| ~~7d~~ | ~~**人工审稿这条管子一个月零流量**~~ ✅ **2026-09-20 已定案：legacy-only**（TV D-072，理由与重新点亮的条件见 §3）。下面是当时查到的事实，保留作背景 | 2026-09-20 实查生产库：`autowriter.items` **6,688 行里 `decision_source` 全是 NULL** —— `review_drafts`（2026-09-16 上线）**一次都没被调用过**。存量 598 条 approved/needs_revision 是 Streamlit 时代留下的，TV 那边已按新口径全部归成 `evaluator_type='unverified'`，`prepublish_evaluations` **最后一条停在 2026-08-20**（Streamlit 末次出稿 08-19）。两侧代码都通，**没人拧龙头** —— 与 D-063 通道 2 那次同一个形状。⚠️ 修法**不是**让模型主动多调：协议里「用户没表态就别调」那条守的正是「别替用户点通过」，松掉就是灌伪造正例。这是给人看的决策，不是给代码修的 bug。**已定案：不点亮** |
 | 7c | 打通 lineage 回程 | 飞书表建好那六列 + 真导一次 + 在 TV 查 `notes.source_autowriter_version_id` 非空条数。这一列长期是 0，`v_model_comparison` 因此长期查出空集且不报错 |
 
 ### P2 · 攒够再做
