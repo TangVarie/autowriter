@@ -706,7 +706,7 @@ quarantine，那条笔记连正文带指标一起进不了库。`export_drafts` 
 104 条，体量适中；owner 是 `b907ec9d…`，`DESKCORE_KEYS` 里要有这把 key），完整跑：
 
 ```
-open_project → draw_angles(n=20) → borrow_lessons → 生成 20 篇
+open_project（简报自带 lessons）→ draw_angles(n=20) → 生成 20 篇
              → check_drafts → commit_drafts（交付即入库，改稿带 replaces_version_id）→ export_drafts
 ```
 
@@ -732,7 +732,7 @@ open_project → draw_angles(n=20) → borrow_lessons → 生成 20 篇
 
 | 方向 | 通道 | 谁调谁 | 配置 | 失败时 |
 |---|---|---|---|---|
-| TV → aw | `borrow_lessons` 借爆款经验卡 | deskcore 调 TV librarian `POST /librarian` | `LIBRARIAN_URL` + `LIBRARIAN_API_KEY` | 返回空列表，**照常写稿**。飞轮永远不是写稿的前置依赖 |
+| TV → aw | `open_project` 随简报借爆款经验卡（`borrow_lessons` 再借） | deskcore 调 TV librarian `POST /librarian` | `LIBRARIAN_URL` + `LIBRARIAN_API_KEY` | 返回空列表，**照常写稿**。飞轮永远不是写稿的前置依赖 |
 | aw → TV | 人工审稿决定归档 | TV 的 `sync_autowriter_decisions_to_prepublish.py` 每天读 `autowriter.items` 的 `status` | TV 侧 secrets，本仓不用管 | TV 侧 daily-sync 报红发邮件 |
 | ⚠️ 同上 | **仅对 Streamlit 时期的存量成立** | deskcore **不写** `items.status` | — | 停了 Streamlit 就没有新决策进 TV，见下 |
 | 共库 | 同一个 Supabase 项目 `kduysqedr` | `truth_vault` / `autowriter` 两个 schema | — | — |

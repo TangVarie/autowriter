@@ -314,7 +314,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         negative_examples=negatives,
     )
 
-    return {
+    out = {
         "project_id": project_id,
         "project_name": project.get("name") or "",
         "brand": project.get("brand") or "",
@@ -345,6 +345,25 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         },
         "positive_selection_mode": pos_mode,
     }
+
+    # ── 飞轮经验卡: 随简报一起借, 不再等模型自己想起来 ──────────────────
+    # 2026-09-19 查生产库: 9 月 1-16 日写作台 commit 了 71 批稿子, 馆员缓存里
+    # 同期只有 3 次借阅 —— 协议里 open_project / draw_angles 是"必做",
+    # borrow_lessons 是"想要真实爆款参照时调", 于是通道 2 (TV → 写作台) 在
+    # 每一场对话里都取决于模型愿不愿意多调一个可选工具, 而它 95% 的时候不愿意。
+    # 馆员本身是通的(那 3 次各借到 4-5 张卡)。修法不是再劝一遍模型, 而是把
+    # 借阅并进必做的那一步: 简报本来就是拿项目行 + 本次 delta 拼的, brief 也
+    # 是同一份材料, 多一次 fail-open 的 HTTP 调用(≤ LIBRARIAN_TIMEOUT_SEC)。
+    #
+    # ⚠️ 这一段的失败**不能**影响简报: P0 已经拿到了, 卡借不到只是少点参考。
+    # fetch_flywheel_lessons 本身绝不抛, 但 build_brief / 其它意外仍兜一层 ——
+    # 兜住之后照样留痕(status.state=error + WARN 日志), 不吞成看似成功。
+    borrowed = _borrow_for_brief(project, brief)
+    out["lessons"] = borrowed["lessons"]
+    out["lessons_status"] = {k: borrowed[k] for k in
+                             ("status", "count", "elapsed_ms", "detail")}
+    out["counts"]["lessons"] = len(borrowed["lessons"])
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3078,15 +3097,59 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     project_id 就能读出那个项目怎么定位"的接口。(审计 COR-015)
     """
     project = assert_project_access(client, project_id, user_id=user_id)
-    brief = librarian_client.build_brief(project, **delta)
-    brief["consumer"] = "deskcore"
-    # ⚠️ 空列表有**五种**来路, 对调用方的含义完全不同(2026-09-16 评测 AW-05):
-    # 没匹配上是正常的, 没配 key 是部署漏了, 超时是 TV 那边慢了。只回一个
-    # count=0 的话, 模型只能猜, 而它多半会猜成"这个项目没有可借的经验"。
+    return _borrow_for_brief(project, delta)
+
+
+# open_project 随简报带卡时的上限, 与常规生成路径 render_flywheel_block 同一
+# 口径(memory.FLYWHEEL_CARD_CAP): 馆员契约上限也是 5, 这里只是钉死"两条入口
+# 给模型看的卡数一致", 免得哪天馆员放宽了, 简报被十几张卡撑爆。
+LESSON_CAP = int(getattr(memory, "FLYWHEEL_CARD_CAP", 5) or 5)
+
+# 借阅结局里"要人管"的那三种 —— 留痕用。empty 是正常结局, 不记 WARN。
+_BORROW_NEEDS_ATTENTION = frozenset({
+    librarian_client.BORROW_NOT_CONFIGURED,
+    librarian_client.BORROW_TIMEOUT,
+    librarian_client.BORROW_ERROR,
+})
+
+
+def _borrow_for_brief(project: dict, delta: dict | None) -> dict:
+    """borrow_lessons 与 build_writing_brief 共用的借阅体。**绝不抛**。
+
+    输入是已经过归属校验的项目行 + 本次 delta(tactic / draft_topic /
+    key_messages / target_audience / tone; 多余的键会被丢掉, 因为
+    librarian_client.build_brief 只认契约里那几个)。
+
+    ⚠️ 空列表有**五种**来路, 对调用方的含义完全不同(2026-09-16 评测 AW-05):
+    没匹配上是正常的, 没配 key 是部署漏了, 超时是 TV 那边慢了。只回一个
+    count=0 的话, 模型只能猜, 而它多半会猜成"这个项目没有可借的经验"。
+    所以 status 永远带, 且三种"要人管"的结局各记一条 WARN —— 这是 TV docs/27
+    要求的"fail-open 要留痕": 服务日志里 grep 得到通道 2 到底为什么黑。
+    """
+    delta = delta or {}
+    allowed = ("tactic", "draft_topic", "key_messages",
+               "target_audience", "tone", "extra_instructions")
+    kwargs = {k: (delta.get(k) or "") for k in allowed if delta.get(k)}
     st: dict = {}
-    selected = librarian_client.fetch_flywheel_lessons(brief, status=st)
-    return {"lessons": selected, "count": len(selected),
-            "status": st.get("state"),
+    try:
+        brief = librarian_client.build_brief(project, **kwargs)
+        brief["consumer"] = "deskcore"
+        selected = librarian_client.fetch_flywheel_lessons(brief, status=st)
+    except Exception as exc:  # noqa: BLE001 — 增强项, 失败不能拖垮简报
+        logger.exception("flywheel borrow crashed (project_id=%s)", project.get("id"))
+        st = {"state": librarian_client.BORROW_ERROR, "count": 0,
+              "elapsed_ms": 0, "detail": f"{type(exc).__name__}: {exc}"[:300]}
+        selected = []
+    if not isinstance(selected, list):
+        selected = []
+    lessons = [L for L in selected if isinstance(L, dict)][:LESSON_CAP]
+    state = st.get("state") or librarian_client.BORROW_ERROR
+    if state in _BORROW_NEEDS_ATTENTION:
+        logger.warning("flywheel borrow %s (project_id=%s elapsed_ms=%s): %s",
+                       state, project.get("id"), st.get("elapsed_ms"),
+                       st.get("detail") or "")
+    return {"lessons": lessons, "count": len(lessons),
+            "status": state,
             "elapsed_ms": st.get("elapsed_ms"),
             "detail": st.get("detail") or ""}
 

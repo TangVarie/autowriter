@@ -21,6 +21,7 @@
 | 运营端那份 SKILL.md 改了没人知道，模型照旧协议写 | 协议正文进技能文件（系统提示，整场对话都在模型眼前）；`get_protocol` 只核对版本，本地是旧版时才下发新正文并提醒重新导入。09-10 曾只留引线、正文每次由工具下发——09-11 起入库率从 110% 掉到 22%，34 KB 的返回值在写完十几篇之后已经离得太远，模型不记得还要查重入库 |
 | 只用写作台写稿、定稿、导出的团队，永远产不出一条人工审核决定 | `review_drafts` 把**用户真的给出的**结论落库（`decision_source=human` + 真实 reviewer + 时间）。定稿仍然只建 `pending`——定稿不是审核，`commit_drafts` 一个字没改 |
 | 稿子发出去就断线了，TV 那边 `v_model_comparison` 长期查出空集还不报错 | `export_drafts` 导的 xlsx 带六列 `_source_autowriter_*`，是笔记回到写作台的唯一线索；列名写错会让 TV 整行 quarantine，判据见 `tests/test_lineage_contract.py`（六个名字手抄在用例里，**不**从 `exporter` 读） |
+| 经验卡是可选工具，模型 95% 的对话不调（2026-09-01~16：71 批成稿、3 次借阅），通道 2 一直黑着 | `open_project` 随简报自动借（`lessons` / `lessons_status`），借阅不再取决于模型想不想多调一个工具；三种失败结局各记一条 WARN |
 | 借阅失败和"这次没匹配"长得一模一样，用不上经验也没人知道 | `borrow_lessons` 回 `status`：`borrowed` / `empty` / `not_configured` / `timeout` / `error` 五种结局分开，带耗时 |
 | 模型跳过 `check_drafts` 直接 `commit_drafts`，同题重写的稿子整批进库（途鸽 09-10 四个标题各入库两次，两两 Jaccard 只有 0.33） | **入库自带闸**：`commit_drafts` 先跑和 `check_drafts` 同一套判定（标题语义、开头、四字串、本批内互比），判 reject 的不进 RPC；没带 `angle_key` 的数出来（`unattributed`），台账销不了账的角度下一批会再被抽到 |
 | 协议让 `commit_drafts` 等「用户确认定稿」再调，运营拿了稿子就走，近一周 214 个角度只有 20 条走到入库；改稿时新稿又撞上自己旧版的指纹 | 协议改成**交付即入库**（待审，不代表定稿；定稿与否由飞书 → TV 的 `tv-sync` 对照回来），改稿用 `replaces_version_id` 原地升版：先摘旧指纹再过闸，成功同一个 item 加一版，被拒或异常把指纹放回（2026-09-18） |
