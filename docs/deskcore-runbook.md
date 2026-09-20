@@ -61,6 +61,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
 | **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
+| **跑的是哪一份代码** | 打 `/health` 看 `build`：`commit`（12 位）和 `protocol_version`。**不需要 key。**<br>2026-09-20 加的，起因是同一天卡了两次：早上把「Railway 还没重新部署」当事实写进记录（其实没核实、它早就上线了），下午 Railway 一次部署真失败、服务停在 6 小时前的版本，而**从外面看不出来**（`/health` 不带版本、`/tools` 要 key）。<br>· `commit` 与 `main` 上的 SHA 不一致 → 部署没跟上，去 Railway 看那次 build 的日志。<br>· `protocol_version` 与 `skills/bywood-writing-desk/SKILL.md` 末尾那行不一致 → 运营手里那份 skill 该重新导入了。<br>· 显示 `unknown` → 只是这个诊断字段没取到值，**不代表服务不健康**（它刻意不参与 `ok`）。 |
 | **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、工具清单与 `tools.py` 的 `TOOLS` 一致（陆续加过 `my_rules` / `set_rule_state` / `reembed_my_rules`（2026-08-28）与 `get_protocol`（2026-09-10）——**个数以 `/health` 为准，不在这里钉死**）、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
 | **四路查重信号** | ✅ 全部到齐——`check_drafts` 实测 `semantic_degraded: false`（2026-08-26 换 `gemini-embedding-001` + 换 key 之后） |
 | `draft_fingerprints` | ✅ **3,678 行 / 44 个项目**（2026-08-26 回填，见 §1.5）。当前模型 3,671 / 来路不明 0 / 别的模型 0 / 维度 min=max=768 / 重复 `version_id` 0 |
