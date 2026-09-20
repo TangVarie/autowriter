@@ -62,6 +62,55 @@ logger = logging.getLogger("deskcore")
 SERVICE = "deskcore"
 VERSION = "1"
 
+
+def _build_commit() -> str:
+    """跑着的这份代码是哪个 commit。**算一次, 进程内不变。**
+
+    为什么要有它: 2026-09-20 一天之内被同一个问题卡了两次 ——
+      · 早上把「Railway 还没重新部署」当事实写进了记录(其实没核实, 它早就上线了);
+      · 下午 Railway 一次部署失败, 服务停在 6 小时前的版本, 而**从外面没有任何办法
+        看出来** —— /health 不带版本, /tools 要 key。
+    「代码进了 main」和「跑着的是那一份」是两件事, 而分辨它们不该需要一把 key。
+
+    取值顺序: Railway 注入的 SHA → 其它平台常见的同类变量 → 本地 git → 未知。
+    ⚠️ 拿不到时回 "unknown" 而不是抛错: 这个字段是**诊断用**的, 它本身绝不能把
+       /health 弄挂 —— 那是 Railway 的健康检查路径(见 health() 的注释)。
+    """
+    for var in ("RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT", "SOURCE_COMMIT",
+                "COMMIT_SHA", "HEROKU_SLUG_COMMIT"):
+        sha = os.environ.get(var, "").strip()
+        if sha:
+            return sha[:12]
+    try:    # 本地开发 / 容器里带着 .git 的情形
+        import subprocess
+        out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                             text=True, timeout=3, cwd=os.path.dirname(os.path.dirname(
+                                 os.path.abspath(__file__))))
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()[:12]
+    except Exception:  # noqa: BLE001  —— 没装 git / 不是仓库 / 超时, 都只是"不知道"
+        pass
+    return "unknown"
+
+
+BUILD_COMMIT = _build_commit()
+
+
+def _protocol_version() -> str:
+    """服务端此刻会发的协议版本 —— 和 skill 文件末尾那行对得上才算同步。
+
+    **每次现读**(不缓存): 与 ``tools.protocol_text()`` 同一口径, 热修协议不必重启,
+    回显也就不会比真实情况旧。十几 KB, 微秒级。
+
+    ⚠️ 吞掉异常回 "unknown": 协议文件缺了/空了是**工具层**该报的错(get_protocol 会
+       照实抛), 不该让 /health 跟着 500 —— 那是 Railway 的健康检查路径, 一挂就是
+       重启风暴。诊断字段绝不能把被诊断的东西弄坏。
+    """
+    try:
+        return tools.protocol_text()[1]
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
 # 当前请求的调用者。MCP 的 ASGI 子应用拿不到 FastAPI 的依赖注入, 用 contextvar
 # 在中间件里塞、在工具里取, 是最省事且协程安全的做法。
 #
@@ -448,6 +497,10 @@ async def _collect_health() -> dict:
         "ok": db_ok and vocab_ok and auth_ok,
         "service": SERVICE,
         "version": VERSION,
+        # 「跑着的是不是我合的那一份」——不带 key 也能回答。
+        # protocol_version 回答的是另一半: 运营手里那份 skill 跟服务端对不对得上
+        # (skills/bywood-writing-desk/SKILL.md 末尾那行 protocol_version)。
+        "build": {"commit": BUILD_COMMIT, "protocol_version": _protocol_version()},
         "tools": sorted(tools.TOOLS),
         "config": {
             # deskcore 【不调 LLM】。蒸馏搬给调用方模型之后, 服务端一次
