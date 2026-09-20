@@ -798,17 +798,40 @@ items.example_label（只有 label_example 这一个，走 db.set_item_example_l
 顺带一个连带效应：停服之后 `items.updated_at` 唯一还会被刷的来源就是
 `label_example` 改正负例标注，于是 TV 打印的「创建后被动过」会**全部**是标注活动。
 
-**三条路，第一期之前必须选一条**（列进待办 #5 的前置）：
+> ✅ **2026-09-20 复查：这一段的前提已经过期。** 选项 A 两侧都建好了 —— 本仓 `review_drafts`（09-16）落 `status` + `decision_source='human'` + `reviewer_id` + `decided_at`；TV 侧 `sync_autowriter_decisions_to_prepublish.py` 也已经按`decision_source` 分流（下面那条「卡在 TV」的跨仓待办**已解决**，别再照着它去推 TV）。
+>
+> 但实查生产库：`autowriter.items` 6,688 行的 `decision_source` **全是 NULL**，`review_drafts` **一次都没被调用过**；`prepublish_evaluations` 停在 **2026-08-20**，而 Streamlit 末次出稿是 **08-19**。**这条链路已经自己断了一个月**。
+>
+> 所以问题不再是「停 Streamlit 会不会把它弄断」，而是「要不要把它重新点亮」。
+>
+> ✅ **2026-09-20 owner 拍板：不点亮，标 legacy-only（选项 C）**（TV D-072）。
+> 决定的理由不是「人工审稿没价值」，是**那张表现在没有消费者**：`prepublish_evaluations`
+> 的 598 行里 `pred_tier_class` / `actual_tier` 一条都没填、`was_correct` 全 NULL ——
+> 它从上线到现在只写不读，真实消费者（L2 Predictor）要等特征层过闸三才谈得上。
+> 让写手每场多做一个动作换一张没人读的表，性价比不对。
+>
+> **重新点亮的条件**（三条都到了再说）：① 特征层过闸三、打分器开始往那张表写
+> `evaluator_type='model'` 的行；② 有人真的要算「模型预测 vs 人怎么判 vs 实际爆没爆」；
+> ③ 有人负责填 `actual_tier`（`notes.source_autowriter_version_id` 已有 404 行，
+> lineage 不再是空的，反推有了地基）。
+>
+> **管子不拆**：TV 的 `sync_autowriter_decisions_to_prepublish.py` 继续在夜跑里，
+> 哪天真有行了会自动流进来；改的是对沉默的解释——捞不到新行是预期的，不是故障。
+> `review_drafts` 这个工具也**不下线**：用户真表了态照样该记，只是不再当成待办去推。
+>
+> ⚠️ **将来点亮时也不许用「让模型多调 review_drafts」来实现**：协议里「用户没表态就别调」守的正是「别替用户点通过」，松掉就是往评估模型里灌伪造的正例，比不记更糟。这条不随 legacy-only 一起放松。
+
+**三条路，第一期之前必须选一条**（列进待办 #5 的前置；上面那条复查说明 A 已建好、链路已断）：
 
 | 选项 | 做什么 | 现在到哪一步了 |
 |---|---|---|
-| A · deskcore 补写回 | `commit_drafts` 时建 item/version（**✅ 已做**），再加一个能落 `status` 的动作（❌ 没做——写作台没有"审稿"这个动作，要新增一个工具或换个语义） | 半做 |
+| A · deskcore 补写回 | `commit_drafts` 时建 item/version（**✅ 已做**），再加一个能落 `status` 的动作（**✅ 已做** —— `review_drafts`，2026-09-16） | **代码全做完，零调用**（见 §4 待办 7d） |
 | B · 换一条归档源 | 让 TV 改读 `draft_fingerprints` + 一个新的决策表 | 没动，跨仓 |
-| C · 明确接受断掉 | 把这一行标成 legacy-only，`prepublish_evaluations` 冻结在存量 598 条 | 没动 |
+| C · 明确接受断掉 | 把这一行标成 legacy-only，`prepublish_evaluations` 冻结在存量 598 条 | ✅ **2026-09-20 选了这条**（TV D-072），理由见上方复查段 |
 
-**在选定之前不要停 Streamlit。**
+~~**在选定之前不要停 Streamlit。**~~ → 2026-09-20：Streamlit 末次出稿 08-19，事实上已经停了；这句话保护的东西已经不在了。
 
-⚠️ **另有一条跨仓待办卡在 TV 那边**（本仓改不动）：`migrations/006` 加的
+⚠️ ~~**另有一条跨仓待办卡在 TV 那边**~~（**2026-09-20 已解决**，TV 侧 `sync_autowriter_decisions_to_prepublish.py` 已按 `decision_source` 分流；下面这段保留作背景）：`migrations/006` 加的
 `decision_source` / `reviewer_id` / `decided_at` 三列，**TV 至今一处都没读**
 （2026-08-26 在 truth-vault 全仓 grep 过，零命中）。也就是说 COR-004 的修复只做了
 生产侧：本仓现在诚实地记下了"这个状态是机器判的还是人判的"，而
@@ -841,18 +864,19 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 0 | ~~补齐迁移 `002`–`006`~~ | ✅ **2026-08-26 已完成**（见 §1.3）。六个全跑进生产，逐条验过；`003` 的快照表 `versions_num_backup_20260826` 还留着，确认无误后可 drop | — |
 | 1 | ~~部署 deskcore service~~ | ✅ **2026-08-26 已完成**。Railway，`/health` 每项 ok、13 个工具都在 | — |
 | 2 | ~~回填指纹~~ | ✅ **2026-08-26 已完成**（§1.5）：3,678 行 / 44 个项目。⚠️ **只覆盖 `85f5f888` 和 `afbaf84e`**——见下一行 | — |
-| 2b | ⚠️ 给 `b907ec9d` 发 key **之前**必须先回填它 | 它那 504 条历史稿现在对查重**不可见**：一接上来，老稿重发会被当成新的放行 | `doctor --project <uuid>` 的「还差」归零；且 `backfill` 返回的 `missing_embeddings` = 0。⚠️ **不能**拿全局 `count(*) > 0` 或「`empty_history_warning` 消失了」当验收——两个都会在主力项目还差几百条时报绿 |
+| 2b | ⚠️ **重新启用休眠项目之前**先回填它 | **2026-09-20 实查收窄了这一条**：9 月还在出稿的项目（途鸽 / Hatherine / sportsix / 百健士-藻油 …）指纹覆盖是 **100%**，一条不差。一条指纹都没有的是 **9 个休眠项目**、共 718 条历史稿，末次出稿在 2026-03 ~ 08-19：唐小轻成分党 356、RIO便利店调酒 119、RIO破圈 96、唐小轻直出 93、途鸽求职 29，其余四个 ≤ 10。**它们不在跑，就不构成风险**；谁要重新启用其中一个，先给那个项目 `backfill` | `doctor --project <uuid>` 的「还差」归零；且 `backfill` 返回的 `missing_embeddings` = 0。⚠️ **不能**拿全局 `count(*) > 0` 或「`empty_history_warning` 消失了」当验收——两个都会在主力项目还差几百条时报绿 |
 | 3 | 验 WorkBuddy 的鉴权头 | 不通就要换形态 | MCP 握手成功、错 key 返 401 |
 
 ### P1 · 上线后第一周
 
 | # | 事 | 为什么 |
 |---|---|---|
-| 4 | **把真正的硬规则设成 `hard`** | 现在 303 条记忆**全是 soft**，P0 硬约束层是空的。"规则不忘"这个卖点在有 hard 规则之前等于没生效。先从禁词、合规话术这类开始 |
-| 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。**⚠️ 前置**：先在 §3「停 Streamlit 会把 aw → TV 这条链路断掉」的 A/B/C 三条里选一条 —— 否则人工审稿决定从此不再进 `prepublish_evaluations`，而且不报错 |
+| 4 | ~~**把真正的硬规则设成 `hard`**~~ | ✅ **2026-09-20 实查：已经在做了**。全库 465 条规则里 hard **53 条**（47 confirmed / 6 candidate），soft 412 条。P0 硬约束层不再是空的，这一条从待办降级为「继续攒」。（`protocol.md` 里那句「现存库里 300 多条全是 soft、一条 hard 都没有」也同步改了——它会让模型把真的配置问题当成正常） |
+| 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。✅ **前置已解除（2026-09-20，TV D-072）**：A/B/C 选了 **C** —— `prepublish_evaluations` 标成 legacy-only。那条链路事实上已经断了一个月（Streamlit 末次出稿 08-19、表末条 08-20、`review_drafts` 零调用），而且**那张表本来就没有消费者**（598 行里 `pred_tier_class` / `actual_tier` 一条没填）。**停 Streamlit 不再被这条挡着**；管子不拆、`review_drafts` 不下线，重新点亮的条件见 §3 |
 | 6 | 观察 `borrow_lessons` 选卡质量 | TV 书架规模下的选卡准确率**从来没人测过**。不行就在 `librarian/core.py:33` 那个 `CANDIDATE_CAP=50` 的口子加 embedding 预筛 |
 | 7 | 让 `check_drafts` 的降级信号被人看见 | `semantic_degraded` / `empty_history_warning` 这两个字段没人盯的话，表现就是"查重跑了、全 pass、看着一切正常" |
-| 7b | **推 TV 那边读 `decision_source`** | 跨仓。`migrations/006` 的三列 TV 至今一处都没读（2026-08-26 全仓 grep 零命中），所以机器判定仍在被当人工反馈灌进 `prepublish_evaluations`。本仓这一侧已经做完了，卡在 TV |
+| 7b | ~~**推 TV 那边读 `decision_source`**~~ | ✅ **TV 已接**（`scripts/sync_autowriter_decisions_to_prepublish.py` 按 human / rule_based / unverified 分流，只有 `decision_source` 恰好等于 `human` 才算人工）。⚠️ **但这条管子现在零流量**，见下面 7d |
+| ~~7d~~ | ~~**人工审稿这条管子一个月零流量**~~ ✅ **2026-09-20 已定案：legacy-only**（TV D-072，理由与重新点亮的条件见 §3）。下面是当时查到的事实，保留作背景 | 2026-09-20 实查生产库：`autowriter.items` **6,688 行里 `decision_source` 全是 NULL** —— `review_drafts`（2026-09-16 上线）**一次都没被调用过**。存量 598 条 approved/needs_revision 是 Streamlit 时代留下的，TV 那边已按新口径全部归成 `evaluator_type='unverified'`，`prepublish_evaluations` **最后一条停在 2026-08-20**（Streamlit 末次出稿 08-19）。两侧代码都通，**没人拧龙头** —— 与 D-063 通道 2 那次同一个形状。⚠️ 修法**不是**让模型主动多调：协议里「用户没表态就别调」那条守的正是「别替用户点通过」，松掉就是灌伪造正例。这是给人看的决策，不是给代码修的 bug。**已定案：不点亮** |
 | 7c | 打通 lineage 回程 | 飞书表建好那六列 + 真导一次 + 在 TV 查 `notes.source_autowriter_version_id` 非空条数。这一列长期是 0，`v_model_comparison` 因此长期查出空集且不报错 |
 
 ### P2 · 攒够再做
@@ -867,7 +891,8 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 13 | `projects` 加 `UNIQUE (owner_id, lower(btrim(name)))` | `create_project` 的撞名保护是**应用层 check-then-insert**，两次并发调用会各自查空、各自建成。判据（大小写与首尾空格都不算差异）已经和这个索引对齐，加索引就是把它下推给数据库——与 `docs/deskcore.md` §2.3-D「并发正确性交给数据库」同一口径。**做之前要先处理存量可能已有的重名行**，所以单独一次迁移。现网并发建项目的概率极低，不阻塞 |
 | 14 | `store.recent_angle_keys` 也走 `_paged` | 它读 `angle_ledger` 仍是裸 `.execute()`，同 COR-005/006/008 那一族的静默截断。台账被钳短的后果是**已经用过的角度组合会被当成没用过再抽一次**，跨批次去重悄悄退化。现网台账还很小，等它长起来之前做掉 |
 | 15 | `/health` 回显注入封顶 | **纯便利, 不是唯一手段** —— `open_project` 的返回里已经有 `counts.soft_rules_cap_per_scope`(`deskcore/core.py:330`, 直接取自 `MAX_INJECTED_MEMORIES_PER_SCOPE`), 拿一把 key 和一个 project_id 就能确认线上生效值。放进 `/health` 的好处是**不需要 key、不需要 project_id**, 改完 env 立刻能验。(初稿把这条写成「线上无法验证」—— 错的, codex review 指出, 已改) |
-| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 两个入口都就位**：① MCP 工具 `reembed_my_rules` —— 写手/运维在 WorkBuddy 里一句话触发, 一次 50 条, 只补调用者自己名下的, `remaining` 归零为止；② CLI `python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **只管存量, 不是给「新规则没向量」兜底** —— 新规则本来就有向量：`db.upsert_memory` 在写入时就算(`db.py:1748`)。缺向量的 174 条来自：① 2026-08-28 用**裸 SQL** 灌的 66 条技艺库种子(绕过了 upsert_memory, 见 §4.5)；② 更早那批建于这段代码之前、或当时没配 GOOGLE_API_KEY 的。按人分布：623346512 → 111 条、1796631194 → 44 条、tangziao1997 → 18 条、738443677 → 1 条(无孤儿行)。`my_rules` 的 counts 里会显示「缺向量：N」提醒 |
+| ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 两个入口都就位**：① MCP 工具 `reembed_my_rules` —— 写手/运维在 WorkBuddy 里一句话触发, 一次 50 条, 只补调用者自己名下的, `remaining` 归零为止；② CLI `python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **只管存量, 不是给「新规则没向量」兜底** —— 新规则本来就有向量：`db.upsert_memory` 在写入时就算(`db.py:1748`)。缺向量的 174 条来自：① 2026-08-28 用**裸 SQL** 灌的 66 条技艺库种子(绕过了 upsert_memory, 见 §4.5)；② 更早那批建于这段代码之前、或当时没配 GOOGLE_API_KEY 的。按人分布：623346512 → 111 条、1796631194 → 44 条、tangziao1997 → 18 条、738443677 → 1 条(无孤儿行)。`my_rules` 的 counts 里会显示「缺向量：N」提醒。
+**2026-09-20 复查：这一条实际只剩 1 条。** 现在全库缺向量的有 196 行，但其中 **195 行是 `memory_type='session'`**（`scope='project'`，最新一条停在 2026-08-19）——而所有召回路径都带 `memory_type.is.null,memory_type.eq.rule` 这道过滤（`store.py` 四处 + `db.py:1983`），**session 记忆从来不参与语义召回，缺不缺向量都一样**。真正缺向量的规则只有 **1 条**（global / confirmed / soft，2026-03-11 建的）。上面那个「174 条」把 session 一起算了进去，照着它去回填是在修一个不存在的问题 |
 
 ---
 

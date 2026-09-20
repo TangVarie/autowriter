@@ -52,6 +52,10 @@ logger = logging.getLogger("deskcore.core")
 MAX_POSITIVE = 5
 MAX_NEGATIVE = 3
 
+# 简报里回显"抽了没写"的回看天数(D-071)。7 天 = 一个工作周,
+# 与 TV 夜跑那盏灯 check_angle_ledger_leak.py 的默认窗口同口径。
+ANGLE_DEBT_DAYS = 7
+
 # 判定阈值与 angle_key 住在 fingerprint.py —— 那个模块只用标准库, 让 selftest
 # 能在不装 supabase/anthropic 的裸环境里跑(本模块顶层 import db, 拖整条依赖链)。
 angle_key = fp.angle_key
@@ -363,6 +367,34 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     out["lessons_status"] = {k: borrowed[k] for k in
                              ("status", "count", "elapsed_ms", "detail")}
     out["counts"]["lessons"] = len(borrowed["lessons"])
+
+    # ── 上一场停在哪: 抽了没写的角度 ──────────────────────────────────
+    # 2026-09-20 查生产库(TV D-071): 7 天发出去 214 个角度, 只有 20 个销了账;
+    # 194 个里 138 个所在的会话连一篇稿都没入库 —— 会话停在发牌之后, 而谁都不知道。
+    # deskcore 的 /health 早就在报这个比例, 但那是运维视角、没人天天看; 写手看得见
+    # 的地方只有简报。所以把"你自己上次抽了没写的"摆在每场对话开头。
+    # ⚠️ 和借卡同一条纪律: 这一段的失败绝不能影响简报, 兜住但留痕。
+    try:
+        debt = store.angle_debt(client, project_id, user_id, ANGLE_DEBT_DAYS)
+    except Exception:
+        logger.exception("angle debt lookup failed (project=%s)", project_id)
+        debt = {"unconsumed": 0, "since_days": ANGLE_DEBT_DAYS, "last_drawn_at": None}
+    out["counts"]["angle_debt"] = debt["unconsumed"]
+    if debt["unconsumed"]:
+        out["angle_debt"] = debt
+        shown = debt.get("angles") or []
+        # 必须把坐标本身给出去: 新开一场对话时, 上一次 draw_angles 的返回早就不在
+        # 上下文里了, 只报个数等于让模型"写完你不知道是哪几个的角度" —— 它只能忽略,
+        # 或者再抽一批, 恰好是这条提醒要防的事(codex review on #86)。
+        more = debt["unconsumed"] - len(shown)
+        out["angle_debt_note"] = (
+            f"你在这个项目近 {debt['since_days']} 天抽了 {debt['unconsumed']} 个角度还没出稿"
+            f"(最近一次 {debt['last_drawn_at']})。要么这一场把它们写完, 要么明说放弃 —— "
+            "别默认再抽一批: 没销账的坐标一天后就不在避重集里, 同一个故事会被讲第二遍, "
+            "而那种重复指纹闸抓不到。"
+            + (f"坐标在 angle_debt.angles 里(列了 {len(shown)} 个"
+               + (f", 还有 {more} 个没列" if more > 0 else "") + "), 接着写就按它们写, "
+               "写完照样每篇带 angle_key 提交。" if shown else ""))
     return out
 
 
@@ -1227,7 +1259,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 # NULL 就够避重用了, 但那个 id 指不到任何一行, 没法回答"这个角度产出的那篇
                 # 后来怎么样了"。
                 vid = d.get("version_id") or minted_ids[i]
-                if store.consume_angle(client, project_id, key, vid):
+                # user_id 传下去: 同一坐标占坑过期后会被重新发牌, 台账里可能有两条
+                # 未消耗行, 销账要销自己那一条(codex review on #86)。
+                if store.consume_angle(client, project_id, key, vid, user_id=user_id):
                     consumed += 1
 
             # 入了库却没带 angle_key 的: 台账没法给它们销账, 同一个故事下一批还可能被
