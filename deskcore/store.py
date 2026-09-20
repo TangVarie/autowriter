@@ -531,6 +531,37 @@ def item_owner(sb, item_id: str) -> str | None:
 
 # ── 发牌台账 ──────────────────────────────────────────────────────────────
 
+def angle_debt(sb, project_id: str, user_id: str | None, days: int) -> dict:
+    """这个人在这个项目里, 近 ``days`` 天抽了没写的角度有几个。
+
+    给 build_writing_brief 在每场对话开头回显用(D-071)。发牌台账上"抽了没销账"
+    的坐标只占坑 1 天(recent_angle_keys 的第二档), 所以它们不会长期锁死组合空间;
+    真正的代价是**没人知道上一场停在了哪**: 2026-09-20 查生产库, 7 天里发出去 214
+    个角度只有 20 个销了账, 其中 138 个所在的会话连一篇稿都没入库。开一场新对话时
+    把这个数摆在简报里, 比事后在 /health 上看一个百分比有用。
+
+    只数**调用者自己**抽的: 队友抽的牌不该记在你头上(同 scope='global' 的私有口径)。
+    user_id 缺失时返回 0 —— 宁可不报, 不报错。
+    """
+    out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None}
+    if not user_id:
+        return out
+    try:
+        rows = (sb.table("angle_ledger").select("drawn_at")
+                  .eq("project_id", project_id).eq("drawn_by", user_id)
+                  .is_("consumed_version_id", "null")
+                  .gte("drawn_at", iso_ago(days))
+                  .order("drawn_at", desc=True)
+                  .range(0, PAGE - 1).execute()).data or []
+    except Exception:
+        logger.exception("read angle debt failed (project=%s)", project_id)
+        return out
+    out["unconsumed"] = len(rows)
+    if rows:
+        out["last_drawn_at"] = rows[0].get("drawn_at")
+    return out
+
+
 def angle_leak(sb, days: int) -> list[dict]:
     """近 ``days`` 天每个项目发了多少角度、多少个销了账(= 稿子真入库了)。
 

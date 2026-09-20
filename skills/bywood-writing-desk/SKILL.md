@@ -32,8 +32,8 @@ description: 帆谷/BYWOOD 小红书种草文案的【写作台协议】。凡�
 - `bywood-writing-desk`（本 skill）管这一批守不守项目规则、跟历史重不重
 - `seeding-prompt-refiner` 管提示词本身怎么迭代
 
-<!-- protocol_version: 494eaf4d2df7 -->
-protocol_version: 494eaf4d2df7
+<!-- protocol_version: e7f853cb526e -->
+protocol_version: e7f853cb526e
 
 # 写作台协议
 
@@ -81,11 +81,13 @@ protocol_version: 494eaf4d2df7
 - `p1` 理解意图后按适用性应用。明显不适用可以让位，不必为套规则扭曲文案。
 - P0 与 P1 冲突时以 P0 为准。
 
-看一眼返回的 `counts`。**`hard_rules` 是 0 属于正常，不要因此怀疑 project_id 传错了。** 现存库里 300 多条规则的 severity 全是 `soft`，一条 hard 都没有（老工作台收反馈时不分「这一次」和「以后都这样」，一律存成 soft）。真正传错 project_id 的表现是 403 或者 `soft_rules` 也是 0。
+看一眼返回的 `counts`。**`hard_rules` 是 0 不一定是错的**，很多项目的约束确实都记在 soft 里（老工作台收反馈时不分「这一次」和「以后都这样」，一律存成 soft；2026-09-20 全库 465 条规则里 hard 只有 53 条）。真正传错 project_id 的表现是 403 或者 `soft_rules` 也是 0。
 
 `soft_rules` 和 `soft_rules_pool` 同时是 0、而用户明明定过规则，那才值得问一句。
 
 返回里还有 `lessons`：**真实爆款经验卡，已经替你向帆谷飞轮图书馆借好了**（最多 5 张），不用再单独去借。用法和下面第 3 条一样——只借钩子、结构、手法，严禁照抄标题主干或具体句子；标了 `synthetic: true` 的卡指标未经验证。`lessons_status.status` 说明这次借阅的结局（`borrowed` / `empty` / `not_configured` / `timeout` / `error`），`not_configured` 要跟用户说一句，其余三种失败别说成"没有可借的经验"。这一段拿不到**不影响**简报本身——P0 / P1 照旧算数。
+
+`counts.angle_debt` 大于 0 时，返回里会多一段 `angle_debt_note`：**你自己**在这个项目近 7 天抽了没出稿的角度有几个。**把这个数说给用户听，问一句是接着写完还是放弃**，别默认再抽一批新的。2026-09-20 查生产库：7 天发出去 214 个角度只有 20 个销了账，其中 138 个所在的会话连一篇稿都没入库——都是"抽完就散场"。没销账的坐标一天后就不在避重集里，同一个故事会被讲第二遍，而那种重复查重闸抓不到。
 
 **这个工具报错就停下来。** 它不会返回半份简报——报错意味着这个项目的硬约束**没读到**。不要凭记忆或常识补一份约束继续写：这个项目不许提什么、必须带哪句合规话术，只有库里那份算数。告诉用户读不到规则，等它恢复。
 
