@@ -109,7 +109,13 @@ jobs:
           class _Resp:
               def __init__(self, data): self.data = data
           class _Q:
+              # 调用序是 select→eq→is_→order→range→execute(挑出具体哪一行),
+              # 再 update→eq(id)→is_→execute(只销那一行)。两段都回同一份 data:
+              # 空 = 台账没有未消耗行, 非空 = 选中并销成了。
               def __init__(self, data): self._d = data
+              def select(self, *a, **k): return self
+              def order(self, *a, **k): return self
+              def range(self, *a, **k): return self
               def update(self, *a, **k): return self
               def eq(self, *a, **k): return self
               def is_(self, *a, **k): return self
@@ -120,6 +126,9 @@ jobs:
 
           assert S.consume_angle(_SB([]), "p", "k", "v") is False, "没改到行还报 True"
           assert S.consume_angle(_SB([{"id": 1}]), "p", "k", "v") is True
+          # 「只销自己抽的那一行」由 tests/test_deskcore_angle_debt.py 断行为(两条未消耗行,
+          # 断队友那条没被一起销掉) —— 那份用例本 job 上面已经跑过了, 这里不重复断,
+          # 更不去断源码字符串(D-051: 断行为不断源码)。
           print("  ✓ consume_angle 看受影响行数, 空结果 → False")
 
           # ── 3. shared_memories: note 类记忆不许进规则 ────────────────────────
