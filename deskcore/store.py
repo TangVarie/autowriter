@@ -531,8 +531,13 @@ def item_owner(sb, item_id: str) -> str | None:
 
 # ── 发牌台账 ──────────────────────────────────────────────────────────────
 
-def angle_debt(sb, project_id: str, user_id: str | None, days: int) -> dict:
-    """这个人在这个项目里, 近 ``days`` 天抽了没写的角度有几个。
+# 简报里最多回带几个"抽了没写"的坐标。够模型接着写, 又不至于把简报撑爆
+# (codex review on #86: 只报个数的话, 新开一场对话根本不知道是哪几个)。
+ANGLE_DEBT_SAMPLE = 12
+
+def angle_debt(sb, project_id: str, user_id: str | None, days: int,
+               *, sample: int = ANGLE_DEBT_SAMPLE) -> dict:
+    """这个人在这个项目里, 近 ``days`` 天抽了没写的角度: 个数 + 具体是哪几个。
 
     给 build_writing_brief 在每场对话开头回显用(D-071)。发牌台账上"抽了没销账"
     的坐标只占坑 1 天(recent_angle_keys 的第二档), 所以它们不会长期锁死组合空间;
@@ -542,23 +547,38 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int) -> dict:
 
     只数**调用者自己**抽的: 队友抽的牌不该记在你头上(同 scope='global' 的私有口径)。
     user_id 缺失时返回 0 —— 宁可不报, 不报错。
+
+    ⚠️ 两件事都是 codex review on #86 指出来的, 别退回去:
+      · **个数走服务端精确计数**(count='exact', head=True), 不是数取回来的行数。
+        一个人一周抽爆 1000 个坐标不常见但可能, 而 PostgREST 默认 max-rows 就是
+        1000 —— 取回来再 len() 会在那一刻悄悄报成 1000, 正好是最该喊的时候失真。
+      · **要回带具体坐标**。新开一场对话时上一次 draw_angles 的返回早就不在上下文里,
+        只报个数等于让模型"去写完你不知道是哪几个的角度" —— 它只能忽略, 或者再抽一批,
+        恰好是这条提醒要防的事。所以带最近 ``sample`` 个 angle_key + dims 回去。
     """
-    out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None}
+    out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None, "angles": []}
     if not user_id:
         return out
+
+    # 一次请求拿两样: count='exact' 是**分页之前**算的(PostgREST 如此, 假件也钉着
+    # 这一点), 所以 range 只影响回几行、不影响这个数。同 store.fingerprint_stats。
     try:
-        rows = (sb.table("angle_ledger").select("drawn_at")
-                  .eq("project_id", project_id).eq("drawn_by", user_id)
-                  .is_("consumed_version_id", "null")
-                  .gte("drawn_at", iso_ago(days))
-                  .order("drawn_at", desc=True)
-                  .range(0, PAGE - 1).execute()).data or []
+        res = (sb.table("angle_ledger").select("angle_key, dims, drawn_at", count="exact")
+                 .eq("project_id", project_id).eq("drawn_by", user_id)
+                 .is_("consumed_version_id", "null")
+                 .gte("drawn_at", iso_ago(days))
+                 .order("drawn_at", desc=True)
+                 .range(0, max(sample, 1) - 1).execute())
     except Exception:
         logger.exception("read angle debt failed (project=%s)", project_id)
         return out
-    out["unconsumed"] = len(rows)
+    rows = res.data or []
+    total = res.count if res.count is not None else len(rows)
+    out["unconsumed"] = int(total)
     if rows:
         out["last_drawn_at"] = rows[0].get("drawn_at")
+        out["angles"] = [{"angle_key": r.get("angle_key"), "dims": r.get("dims")}
+                         for r in rows]
     return out
 
 
@@ -681,7 +701,8 @@ def record_draw(sb, project_id: str, angles: list[dict], user_id: str | None) ->
                          "avoidance will not see this draw", project_id)
 
 
-def consume_angle(sb, project_id: str, angle_key: str, version_id: str) -> bool:
+def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
+                  *, user_id: str | None = None) -> bool:
     """把台账里这个角度标成已消耗。返回【是否真的改到了行】。
 
     ⚠️ 必须看受影响行数, 不能只看"没抛异常"。没有匹配的未消耗行时(最典型:
@@ -689,19 +710,46 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str) -> bool:
     照样返回成功、data 为空 —— 直接 return True 会让 commit_drafts 报告
     "已消耗", 而这个角度在台账上并不存在, 下一批立刻能再抽到同一个坐标。
     避重静默失效, 且没有任何痕迹。(codex review round-5 P2)
+
+    ⚠️ **只销一行, 而且优先销调用者自己那一行**(codex review on #86)。
+    同一个坐标在占坑过期(1 天)之后会被重新发出去, 于是台账里可能同时躺着
+    两条未消耗的行 —— 甲上周抽了没写, 乙今天抽了并写完。按 (project, key)
+    一把 update 会把甲那条也标成"消耗", 而这一篇并不是甲写的: 甲的欠账凭空
+    消失(angle_debt 少算), consumed_version_id 还指向乙的稿子, 追溯也错。
+    找不到自己那条时才退回最早的未消耗行 —— 那是队友把坐标转交给你的情形。
     """
+    try:
+        rows = (sb.table("angle_ledger").select("id, drawn_by")
+                  .eq("project_id", project_id).eq("angle_key", angle_key)
+                  .is_("consumed_version_id", "null")
+                  .order("drawn_at", desc=False)
+                  .range(0, 49).execute()).data or []
+    except Exception:
+        logger.exception("mark angle consumed failed (lookup): %s", angle_key)
+        return False
+    if not rows:
+        logger.warning(
+            "angle %s (project=%s) had no unconsumed ledger row to mark; "
+            "cross-batch avoidance will not see it as used", angle_key, project_id)
+        return False
+    mine = [r for r in rows if user_id and r.get("drawn_by") == user_id]
+    target = (mine or rows)[0]
+    if not mine and user_id:
+        logger.info("angle %s (project=%s) 销的是别人抽的那一行(%s) —— 坐标转交, "
+                    "不是本人发的牌", angle_key, project_id, target.get("drawn_by"))
     try:
         res = (sb.table("angle_ledger")
                  .update({"consumed_version_id": version_id, "consumed_at": iso_now()})
-                 .eq("project_id", project_id).eq("angle_key", angle_key)
+                 .eq("id", target["id"])
                  .is_("consumed_version_id", "null").execute())
     except Exception:
         logger.exception("mark angle consumed failed: %s", angle_key)
         return False
     if not (res.data or []):
-        logger.warning(
-            "angle %s (project=%s) had no unconsumed ledger row to mark; "
-            "cross-batch avoidance will not see it as used", angle_key, project_id)
+        # 选中那一行在这两步之间被别人销掉了(并发)。不是"台账没这行", 但结果一样:
+        # 这一篇没能挂上坐标, 照实报 False, 由调用方汇总进 angle_ledger_warning。
+        logger.warning("angle %s (project=%s) 选中的台账行已被并发销账, 本次没销成",
+                       angle_key, project_id)
         return False
     return True
 

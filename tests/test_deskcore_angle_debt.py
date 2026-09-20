@@ -116,7 +116,7 @@ def test_store_layer_swallows_query_errors(caplog):
             raise RuntimeError("PostgREST 503")
     with caplog.at_level("ERROR"):
         got = store.angle_debt(Boom(), PID, ME, 7)
-    assert got == {"unconsumed": 0, "since_days": 7, "last_drawn_at": None}
+    assert got == {"unconsumed": 0, "since_days": 7, "last_drawn_at": None, "angles": []}
     assert any("angle debt" in r.message for r in caplog.records)
 
 
@@ -138,3 +138,85 @@ def test_protocol_no_longer_claims_every_rule_is_soft():
     """
     body, _ = T.protocol_text()
     assert "一条 hard 都没有" not in body
+
+
+# ══════════════════════════════════════════════════════════════════════
+# codex review on #86
+# ══════════════════════════════════════════════════════════════════════
+
+def test_debt_carries_the_actual_coordinates_not_just_a_count():
+    """新开一场对话时, 上一次 draw_angles 的返回不在上下文里了。
+
+    只报个数 = 让模型"写完你不知道是哪几个的角度", 它只能忽略或者再抽一批 ——
+    恰好是这条提醒要防的事。
+    """
+    out = _brief(_client([_angle(1), _angle(2), _angle(3)]))
+    keys = [a["angle_key"] for a in out["angle_debt"]["angles"]]
+    assert sorted(keys) == ["k1", "k2", "k3"], keys
+    assert all("dims" in a for a in out["angle_debt"]["angles"])
+    assert "angle_debt.angles" in out["angle_debt_note"]
+
+
+def test_debt_sample_is_capped_and_says_how_many_it_left_out():
+    n = store.ANGLE_DEBT_SAMPLE + 5
+    out = _brief(_client([_angle(i) for i in range(n)]))
+    assert out["counts"]["angle_debt"] == n
+    assert len(out["angle_debt"]["angles"]) == store.ANGLE_DEBT_SAMPLE
+    assert "还有 5 个没列" in out["angle_debt_note"]
+
+
+def test_count_survives_server_side_max_rows_clamp():
+    """个数走服务端精确计数, 不是数取回来的行数。
+
+    PostgREST 默认 max-rows 就是 1000; 取回来再 len() 会在欠账最多的那一刻
+    悄悄报成 1000。这里把钳位调到 5 来复现同一件事。
+    """
+    angles = [_angle(i) for i in range(9)]
+    client = FakeClient(rows={
+        "projects": [{"id": PID, "name": "测试项目", "brand": "测试品",
+                      "owner_id": ME, "system_prompt": "你是文案",
+                      "calibration_notes": "", "tactics": "[]", "default_params": "{}"}],
+        "memories": [], "user_calibration_notes": [], "items": [], "versions": [],
+        "batches": [], "draft_fingerprints": [], "angle_ledger": angles, "style_edits": [],
+    }, max_rows=5)
+    assert store.angle_debt(client, PID, ME, 7)["unconsumed"] == 9
+
+
+def test_consume_marks_only_my_own_row_when_the_key_was_reissued():
+    """坐标占坑 1 天过期后会被重新发牌, 台账里可能同时有两条未消耗行。
+
+    按 (project, key) 一把 update 会把队友那条也标成消耗: 他的欠账凭空消失,
+    而这一篇并不是他写的。
+    """
+    mate_row = _angle(9, user=MATE, days_ago=3)
+    my_row = _angle(9, user=ME, days_ago=0)
+    my_row["id"] = "ang-mine"
+    client = _client([mate_row, my_row])
+    assert store.consume_angle(client, PID, "k9", "v-new", user_id=ME) is True
+    rows = {r["id"]: r for r in client.rows["angle_ledger"]}
+    assert rows["ang-mine"]["consumed_version_id"] == "v-new"
+    assert rows["ang-9"]["consumed_version_id"] is None, "队友那条不该被一起销掉"
+    # 队友的欠账还在
+    assert store.angle_debt(client, PID, MATE, 7)["unconsumed"] == 1
+
+
+def test_consume_falls_back_to_the_oldest_row_when_none_is_mine():
+    """队友把坐标转交给你的情形: 自己没抽过, 仍然要销得掉。"""
+    client = _client([_angle(9, user=MATE, days_ago=3)])
+    assert store.consume_angle(client, PID, "k9", "v-new", user_id=ME) is True
+    assert client.rows["angle_ledger"][0]["consumed_version_id"] == "v-new"
+
+
+def test_consume_still_reports_false_when_there_is_no_ledger_row(caplog):
+    """round-5 那条纪律不许松: 台账没这一行就得照实报 False + 留痕。"""
+    with caplog.at_level("WARNING"):
+        got = store.consume_angle(_client([]), PID, "k-nope", "v-1", user_id=ME)
+    assert got is False
+    assert any("no unconsumed ledger row" in r.message for r in caplog.records)
+
+
+def test_open_project_tool_description_no_longer_claims_every_rule_is_soft():
+    """MCP 客户端拿到的是 tools.open_project.__doc__, 协议改了它没改就自相矛盾。"""
+    doc = T.open_project.__doc__ or ""
+    assert "一条 hard 都没有" not in doc
+    assert "angle_debt" in doc, "工具说明里要提这个字段, 否则模型不知道简报多了什么"

@@ -281,11 +281,14 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     而不是按时间倒序 —— 后者会让文风越写越窄。所以知道要写什么就传。
     经验卡也是按这几个字段匹配的, 不传就只按项目定位借。
 
-    ⚠️ **counts.hard_rules 是 0 属于正常, 不要因此怀疑 project_id 传错。**
-    现存库里三百多条规则的 severity 全是 soft, 一条 hard 都没有(老工作台收
-    反馈时不分"这一次"和"以后都这样", 一律存成 soft)。传错 project_id 的真实
-    表现是 403, 或者 soft_rules 和 soft_rules_pool 【同时】为 0。
-    只有后者才值得问一句。
+    ⚠️ **counts.hard_rules 是 0 不一定是错的。** 很多项目的约束确实都记在 soft 里
+    (老工作台收反馈时不分"这一次"和"以后都这样", 一律存成 soft; 2026-09-20 全库
+    465 条规则里 hard 只有 53 条)。传错 project_id 的真实表现是 403, 或者
+    soft_rules 和 soft_rules_pool 【同时】为 0。只有后者才值得问一句。
+
+    counts.angle_debt 大于 0 时, 返回里还会有 angle_debt / angle_debt_note:
+    **调用者自己**在这个项目近期抽了没出稿的坐标, angle_debt.angles 里是具体是
+    哪几个。把这个数说给用户听, 问一句接着写完还是放弃, 别默认再抽一批。
 
     这个工具出错会直接报错, 不会返回半份简报。报错就【停下来】, 不要凭记忆
     或常识补一份约束继续写 —— 这个项目的硬约束是什么, 只有库里那份算数。
