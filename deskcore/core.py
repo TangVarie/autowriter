@@ -1337,11 +1337,47 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     "指纹可能已写入但这几条的身份/销账没做 —— 服务端日志有明细, 别重试, "
                     "重试会撞上自己刚写的指纹。")
             if unattributed:
+                # 只报个数没用 —— 这正是简报那段 angle_debt 踩过的:
+                # 新开一场对话时上一次 draw_angles 的返回早就不在上下文里, 只说
+                # "你有 N 条没带坐标"等于让模型去补一个它不知道是什么的东西,
+                # 它只能忽略、或者再抽一批(codex review on #86)。所以把【这个人
+                # 当前还挂着的坐标】一并回去。
+                #
+                # 2026-09-21 实查生产库: Hatherine痘痘贴 9-14/9-15 抽了 24 张牌,
+                # 9-21 04:01 另一场会话一次 commit 了 7 篇、一个坐标没带 —— 那场
+                # 会话当天【一次 draw_angles 都没调】, 手里根本没有坐标可带。简报
+                # 里的 angle_debt 那会儿已经上线了, 但"看到这个数该怎么办"写在
+                # SKILL.md 里, 得靠客户端重新导入 skill 才生效。这一段【不依赖
+                # skill】: 交闸这一刻服务端自己把坐标摆出来。
+                #
+                # ⚠️ 必须在销账【之后】查 —— 这一批刚销掉的不该再报成欠账。
+                # ⚠️ 失败绝不许冒泡。指纹这时已经写进去了, 抛出去调用方会重试,
+                #    重试会撞上自己刚写的指纹 —— 一句提醒把一次成功的入库变成
+                #    "你的稿子重复了"。同 rpc_anomalies / identity_error 的纪律。
+                try:
+                    debt = store.angle_debt(client, project_id, user_id,
+                                            ANGLE_DEBT_DAYS)
+                except Exception:
+                    logger.exception("angle debt lookup after commit failed "
+                                     "(project=%s)", project_id)
+                    debt = None
+                tail = ""
+                if debt and debt["unconsumed"]:
+                    out["angle_debt"] = debt
+                    shown = debt.get("angles") or []
+                    more = debt["unconsumed"] - len(shown)
+                    tail = (
+                        f"你在这个项目近 {debt['since_days']} 天还有 "
+                        f"{debt['unconsumed']} 个抽了没写的坐标"
+                        + (f"(angle_debt.angles 里列了 {len(shown)} 个"
+                           + (f", 还有 {more} 个没列" if more > 0 else "")
+                           + ")" if shown else "")
+                        + " —— 下一批按它们写, 别再抽一批新的。")
                 out["unattributed_warning"] = (
                     f"{unattributed}/{written} 条入库的稿子没带 angle_key, 台账无法给它们"
                     "销账 —— 这些角度下一批还会被抽到, 同一个故事会被讲第二遍, 而那种"
                     "重复查重闸抓不到。成批写的稿子每条都要带 draw_angles 分给它的 "
-                    "angle_key。")
+                    "angle_key。" + tail)
             if rejected:
                 pre = sum(1 for r in rejected if r.get("gate") == "pre_commit")
                 race = sum(1 for r in rejected if r.get("gate") == "atomic_recheck")
