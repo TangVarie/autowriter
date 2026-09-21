@@ -18,6 +18,9 @@
 from __future__ import annotations
 
 import importlib
+import os
+import pathlib
+import re
 
 import config
 
@@ -27,19 +30,46 @@ import config
 MIN_SANE_TIMEOUT_SEC = 20
 
 
+def _code_default() -> float:
+    """从源码里取【代码默认值】, 不是取 config.LIBRARIAN_TIMEOUT_SEC。
+
+    ⚠️ 第一版就是直接断言 config.LIBRARIAN_TIMEOUT_SEC —— 那是 **env 解析之后**的值:
+       · 环境里有 LIBRARIAN_TIMEOUT_SEC=45 时, 默认值改回 8 这条也照样绿(反证失效);
+       · 环境里是 8 时, 它又会在毫不相干的改动上判红。
+       两个方向都错。要钉"代码默认值"就得去源码里读那个字面量。
+    """
+    src = pathlib.Path(config.__file__).read_text(encoding="utf-8")
+    m = re.search(r'_get_secret\("LIBRARIAN_TIMEOUT_SEC"\)\s*or\s*"([0-9.]+)"', src)
+    assert m, "config.py 里那行的写法变了 —— 同步改这条守卫"
+    return float(m.group(1))
+
+
 def test_default_timeout_is_long_enough_for_an_llm_call():
-    assert config.LIBRARIAN_TIMEOUT_SEC >= MIN_SANE_TIMEOUT_SEC, (
-        f"借阅超时默认 {config.LIBRARIAN_TIMEOUT_SEC}s —— 馆员选卡要跑一次 LLM, "
+    got = _code_default()
+    assert got >= MIN_SANE_TIMEOUT_SEC, (
+        f"借阅超时的【代码默认值】是 {got}s —— 馆员选卡要跑一次 LLM, "
         "这个值下借阅会每次都超时。而它 fail-open, 超时不报错, 只是静默地什么都没借到。"
     )
 
 
-def test_env_var_still_wins(monkeypatch):
-    """默认值变大不能把"部署时能调"这件事弄丢 —— 出事时改 env 比改代码快。"""
-    monkeypatch.setenv("LIBRARIAN_TIMEOUT_SEC", "45")
-    assert float(importlib.reload(config).LIBRARIAN_TIMEOUT_SEC) == 45.0
-    monkeypatch.delenv("LIBRARIAN_TIMEOUT_SEC")
-    importlib.reload(config)      # 还原, 免得污染同批其它用例
+def test_env_var_still_wins():
+    """默认值变大不能把"部署时能调"这件事弄丢 —— 出事时改 env 比改代码快。
+
+    ⚠️ 用 try/finally 精确还原: 第一版是 delenv 之后 reload, 那还的是**代码默认值**
+       而不是跑之前的状态 —— 环境里本来有 LIBRARIAN_TIMEOUT_SEC=10 的话, 这个文件跑完
+       之后 config 就变成 30 了, 后面的用例读到的是假值。而且没有 finally, 断言一挂
+       模块就永久停在 45。
+    """
+    saved = os.environ.get("LIBRARIAN_TIMEOUT_SEC")
+    try:
+        os.environ["LIBRARIAN_TIMEOUT_SEC"] = "45"
+        assert float(importlib.reload(config).LIBRARIAN_TIMEOUT_SEC) == 45.0
+    finally:
+        if saved is None:
+            os.environ.pop("LIBRARIAN_TIMEOUT_SEC", None)
+        else:
+            os.environ["LIBRARIAN_TIMEOUT_SEC"] = saved
+        importlib.reload(config)
 
 
 def test_borrow_stays_fail_open(monkeypatch):
@@ -67,3 +97,29 @@ def test_borrow_stays_fail_open(monkeypatch):
     assert got == [], "借阅失败必须 fail-open 回空 list, 不能把写稿一起拖垮"
     assert st["state"] == librarian_client.BORROW_ERROR, (
         f"没走到异常路径(state={st.get('state')!r}) —— 这条用例又变成空跑了")
+
+
+def test_a_real_timeout_is_reported_as_timeout_not_generic_error(monkeypatch):
+    """**这条才是本 PR 正对着的那一支。**
+
+    上一版只用 RuntimeError 试了 BORROW_ERROR —— 而 requests.Timeout → BORROW_TIMEOUT
+    这条路一次都没走到, 偏偏它就是"超时"这件事本身。protocol.md 让模型对 timeout 和
+    error 分别处置, 混成一个就等于告诉它"馆员坏了"而不是"这次慢了"。
+    """
+    import librarian_client
+    import requests
+
+    monkeypatch.setattr(config, "LIBRARIAN_URL", "https://example.invalid")
+    monkeypatch.setattr(config, "LIBRARIAN_API_KEY", "k")
+
+    def slow(*a, **k):
+        raise requests.Timeout("timed out")
+    monkeypatch.setattr(requests, "post", slow)
+
+    st: dict = {}
+    got = librarian_client.fetch_flywheel_lessons(
+        {"project_id": "p", "consumer": "deskcore"}, status=st)
+
+    assert got == []
+    assert st["state"] == librarian_client.BORROW_TIMEOUT, (
+        f"超时该报 timeout 不是 {st.get('state')!r} —— 两者在协议里处置不同")
