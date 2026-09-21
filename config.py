@@ -107,7 +107,19 @@ FEISHU_WEBHOOK_URL: str = _get_secret("FEISHU_WEBHOOK_URL")
 # 留空 = 不接飞轮:写稿照常, 只是少了"真实爆款参照"这一节(纯增强项, 非前置依赖)。
 LIBRARIAN_URL: str = _get_secret("LIBRARIAN_URL")       # 例 https://truth-vault-production.up.railway.app
 LIBRARIAN_API_KEY: str = _get_secret("LIBRARIAN_API_KEY")
-LIBRARIAN_TIMEOUT_SEC: float = float(_get_secret("LIBRARIAN_TIMEOUT_SEC") or "8")
+# 默认 30 秒(2026-09-20 从 8 改的)。8 秒是按"一次 HTTP 往返"估的, 但馆员选卡**走 LLM**
+# (TV 侧 librarian/core.py: claude-sonnet-4-6 读最多 50 张候选卡再返回), 8 秒本来就悬。
+#
+# 实测那次: 写作台开 RIO便利店调酒, WorkBuddy 报"飞轮图书馆超时没借到" —— 而 TV 侧
+# flywheel_librarian_cache 在 12:14:17 给同一个 project 写了一行、**选了 5 张卡**。
+# 也就是说 TV 把活干完了、token 也烧了、卡也选好了, 写作台在第 8 秒挂断, 一张没拿到。
+# 每次借阅都这样 = 纯白烧。
+#
+# 为什么敢往大了调: 借阅是 fail-open 的**增强项**(借不到就用 owner 自有正例照常写,
+# 见 librarian_client 那个 except 全吞的注释), 调大的代价只是偶发慢几秒; 而调小的代价
+# 是这条链路根本不产生价值。D-063 查到"写作台 30 天 82 个 batch、馆员只收到 8 个 brief"
+# 时, 漏掉的正是"收到了也没送到"这一半。
+LIBRARIAN_TIMEOUT_SEC: float = float(_get_secret("LIBRARIAN_TIMEOUT_SEC") or "30")
 
 # ── Auth cookie (R-040) ─────────────────────────────────────────────────────
 # refresh token 走 stx CookieManager(JS 写入, 无法 HttpOnly —— 架构限制)。
