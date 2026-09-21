@@ -107,19 +107,25 @@ FEISHU_WEBHOOK_URL: str = _get_secret("FEISHU_WEBHOOK_URL")
 # 留空 = 不接飞轮:写稿照常, 只是少了"真实爆款参照"这一节(纯增强项, 非前置依赖)。
 LIBRARIAN_URL: str = _get_secret("LIBRARIAN_URL")       # 例 https://truth-vault-production.up.railway.app
 LIBRARIAN_API_KEY: str = _get_secret("LIBRARIAN_API_KEY")
-# 默认 30 秒(2026-09-20 从 8 改的)。8 秒是按"一次 HTTP 往返"估的, 但馆员选卡**走 LLM**
-# (TV 侧 librarian/core.py: claude-sonnet-4-6 读最多 50 张候选卡再返回), 8 秒本来就悬。
+# 默认 60 秒。这个数被猜错过两次, 下面是它的来历 (D-074):
+#   8s  (原值)  —— 按"一次 HTTP 往返"估的。而馆员选卡【走 LLM】(TV 侧 librarian/core.py:
+#                  claude-sonnet-4-6 读最多 50 张候选卡), 冷路径必超时。实测形态是
+#                  TV 把卡选好写进缓存、写手在第 8 秒挂断, 一张没拿到 —— 每次都在白烧 token。
+#   30s (第一次修) —— 仍不够。2026-09-21 实测: 一次 22s 成功, 另一次超时而 TV 侧缓存行
+#                  在 30-50s 之间落地。
+#   60s (现在)  —— 覆盖上面两个样本并留余量。
 #
-# 实测那次: 写作台开 RIO便利店调酒, WorkBuddy 报"飞轮图书馆超时没借到" —— 而 TV 侧
-# flywheel_librarian_cache 在 12:14:17 给同一个 project 写了一行、**选了 5 张卡**。
-# 也就是说 TV 把活干完了、token 也烧了、卡也选好了, 写作台在第 8 秒挂断, 一张没拿到。
-# 每次借阅都这样 = 纯白烧。
+# ⚠️ 60 仍然是从【2 个样本】外推的, 不是实测分位数。TV 侧 v1.16 已经给馆员缓存行加了
+#    select_ms(只在冷路径写), 攒够 ≥20 次之后按 p95 重定, 别再用这个外推值:
+#      select percentile_cont(0.95) within group (order by select_ms)/1000.0
+#      from truth_vault.flywheel_librarian_cache where select_ms is not null;
 #
-# 为什么敢往大了调: 借阅是 fail-open 的**增强项**(借不到就用 owner 自有正例照常写,
-# 见 librarian_client 那个 except 全吞的注释), 调大的代价只是偶发慢几秒; 而调小的代价
-# 是这条链路根本不产生价值。D-063 查到"写作台 30 天 82 个 batch、馆员只收到 8 个 brief"
-# 时, 漏掉的正是"收到了也没送到"这一半。
-LIBRARIAN_TIMEOUT_SEC: float = float(_get_secret("LIBRARIAN_TIMEOUT_SEC") or "30")
+# ⚠️ 代价说清楚: 借阅在 build_writing_brief(= open_project, 【必经调用】)的同步路径上。
+#    TV 挂住时每次 open_project 都要等 60s; 若 MCP 客户端自身超时低于 60s, 整份简报
+#    (含 P0 硬约束)会一起丢 —— 那正好违反 core.py 里"借卡失败不能影响简报"那条不变量。
+#    我们只测到过客户端容忍 ~22s, 60s 之上认不认【没有证据】。这是本决定最大的未知数。
+#    出事时改 Railway 上这个 env 变量即时生效, 不用发版。
+LIBRARIAN_TIMEOUT_SEC: float = float(_get_secret("LIBRARIAN_TIMEOUT_SEC") or "60")
 
 # ── Auth cookie (R-040) ─────────────────────────────────────────────────────
 # refresh token 走 stx CookieManager(JS 写入, 无法 HttpOnly —— 架构限制)。
