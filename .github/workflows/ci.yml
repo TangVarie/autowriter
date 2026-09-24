@@ -2685,6 +2685,7 @@ jobs:
           import config, clients, telemetry, logger_utils, validator
           import dedup, db, generator, memory, image_handler, exporter, projects
           import librarian_client  # R-032: TV 飞轮馆员 pull 客户端(import 安全, 用 requests)
+          import judge_client      # 入库判定客户端(JevforCoentent 的 judge, 与馆员同形状, 用 requests)
           import worker  # R-018: 后台 worker 入口(import 安全, main() 在 __main__ 守卫内)
           # 生成编排(审计 ROB-001/002/SUP-011/SUP-012 从 app.py 搬出来的)。
           # 它能被这一步 import 本身就是那次搬迁的意义: app.py 一 import 就开始跑

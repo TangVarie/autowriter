@@ -457,6 +457,7 @@ async def _collect_health() -> dict:
     import config
     import db
     import dedup
+    import judge_client
 
     def _db_probe() -> tuple[bool, str]:
         try:
@@ -524,6 +525,13 @@ async def _collect_health() -> dict:
             },
             "librarian": {"configured": bool(os.environ.get("LIBRARIAN_URL")
                                              or getattr(config, "LIBRARIAN_URL", ""))},
+            # 入库判定(commit_drafts 之后发给 judge, 影子期只记不拦)。取值走
+            # judge_client 自己那两个函数 —— 与真正发请求的地方同源(docs/deskcore.md §4.2
+            # 那条教训: 回显另读一遍 env, 配错时就当场看不见)。只回"接没接"和截止秒数, 不探活:
+            # 探活要打外网, 而 /health 是 Railway 的存活探针。
+            "judge": {"configured": judge_client.configured(),
+                      "timeout_sec": judge_client.timeout_sec(),
+                      "mode": "shadow"},
             # auth_health 把三态分开: 配好了 / 配了但坏了(全 401) / 没配。
             # ROB-003 之后"没配"也是全 401 —— 不再静默放行, 只有显式设了
             # DESKCORE_ALLOW_ANONYMOUS=1 才放行(那时 note 里会写明是 dev 模式)。

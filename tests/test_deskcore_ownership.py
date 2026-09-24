@@ -165,6 +165,12 @@ UNGATED_WITH_REASON = {
                              "check_drafts / commit_drafts 调用 —— 抽出来正是为了让"
                              "入库也跑同一套闸(2026-09-17)",
     "_rpc_missing_telemetry": "只打一行遥测, 不读写业务数据",
+    # 入库判定(2026-09-24): 三个都只在 commit_drafts 的尾巴上被调, 那时它开头的
+    # assert_project_access 早已过了; 放在锁外是刻意的(见 commit_drafts 里那段注释)。
+    "_judge_project_context": "私有辅助函数, 只被已过闸的 commit_drafts(经 _judge_committed)调用; "
+                              "只读 tv_project_map 与 TV 项目品类",
+    "_judge_committed":       "私有辅助函数, 只被已过闸的 commit_drafts 调用; 把刚入库的稿子发给 judge",
+    "_record_commit_metrics": "私有辅助函数, 只被已过闸的 commit_drafts 调用; 写一行 batch_metrics",
     "build_distillation_task": "私有辅助函数, 由已过闸的 record_edit / my_style 调用",
     # 运维命令: 跑它们的人手里握着 service_role key(等价于直连库), 加校验挡不住
     # 任何人, 只会挡住"帮同事补一下指纹", 还给人"运维路径也隔离了"的错觉。

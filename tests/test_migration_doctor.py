@@ -45,6 +45,8 @@ _TABLES = {
     "tv_project_map": [],
     "tv_note_links": [],
     "ingest_locks": [],
+    # 011 的视图(发牌台账 → 版本 → TV 笔记 → tier)。假件里视图和表长得一样。
+    "v_angle_outcomes": [],
     "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z",
                "decision_source": None, "reviewer_id": None, "decided_at": None}],
 }
@@ -691,3 +693,57 @@ def test_009_probes_cover_both_halves_and_cannot_write():
     partial = {k: v for k, v in _ALL_RPCS.items() if k != "deskcore_tv_backfill_lineage"}
     report = core.migration_state(FakeClient(rows=_TABLES, rpc_impl=partial))
     assert "009_tv_links.sql" in report["missing"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 8 · 011 的视图(发牌台账 → 版本 → TV 笔记 → tier, 2026-09-24)
+# ══════════════════════════════════════════════════════════════════════
+
+class _ViewFails(FakeClient):
+    """其余都在, 只有 v_angle_outcomes 一读就报 ``err``。"""
+
+    def __init__(self, err: str, **kw):
+        super().__init__(**kw)
+        self._err = err
+
+    def table(self, name):
+        if name == core._MIGRATION_011_VIEW:
+            raise RuntimeError(self._err)
+        return super().table(name)
+
+
+def test_011_view_present_is_applied_and_absent_is_missing():
+    st = _states(core.migration_state(FakeClient(rows=_TABLES, rpc_impl=_ALL_RPCS)))
+    assert st["视图 v_angle_outcomes"] == "applied"
+
+    gone = ('{"code":"PGRST205","message":"Could not find the table '
+            "'autowriter.v_angle_outcomes' in the schema cache\"}")
+    report = core.migration_state(_ViewFails(gone, rows=_TABLES, rpc_impl=_ALL_RPCS))
+    assert "011_angle_outcomes_view.sql" in report["missing"]
+    assert report["ok"] is False
+    impact = next(c["impact"] for c in report["checks"]
+                  if c["migration"] == "011_angle_outcomes_view.sql")
+    # 视图不在最常见的原因之一是跑 011 时还没有 truth_vault —— 要写在 impact 里,
+    # 否则人会以为 011 坏了。
+    assert "truth_vault" in impact and "重跑 011" in impact
+
+
+@pytest.mark.parametrize("err", [
+    '{"code":"42501","message":"permission denied for view v_angle_outcomes"}',
+    '{"code":"42501","message":"permission denied for relation v_angle_outcomes"}',
+])
+def test_011_view_without_grant_points_at_011_not_007(err):
+    """视图在、GRANT 不在: 补救是重跑 011(它自己带 GRANT)。
+
+    被禁止的两个形态: 报成 ``error``(PG 对视图说的是 "for view", 表那套判据不认,
+    于是"探测本身失败"—— 把人打发去查连通性); 按"denied 一律记 007"聚合(007 一行
+    视图权限都不管, 跑了也修不好)。
+    """
+    report = core.migration_state(_ViewFails(err, rows=_TABLES, rpc_impl=_ALL_RPCS))
+    assert _states(report)["视图 v_angle_outcomes"] == "missing"
+    assert "011_angle_outcomes_view.sql" in report["missing"]
+    assert "007_deskcore_table_grants.sql" not in report["missing"], report["missing"]
+    assert report["errors"] == [] and report["denied"] == []
+    note = next(c["note"] for c in report["checks"]
+                if c["migration"] == "011_angle_outcomes_view.sql")
+    assert "重跑 011" in note

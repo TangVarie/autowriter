@@ -127,6 +127,40 @@ LIBRARIAN_API_KEY: str = _get_secret("LIBRARIAN_API_KEY")
 #    出事时改 Railway 上这个 env 变量即时生效, 不用发版。
 LIBRARIAN_TIMEOUT_SEC: float = float(_get_secret("LIBRARIAN_TIMEOUT_SEC") or "60")
 
+
+def _bounded_number(key: str, default: float, lo: float, hi: float) -> float:
+    """读一个数值型 env, 写坏或越界时退回默认值 / 夹到界内。
+
+    ⚠️ 不直接 ``float(...)``: config 是模块级求值, 一个手滑写成 ``8s`` 的值会让
+    import 当场抛 ValueError —— deskcore / worker / Streamlit 三个进程一起起不来,
+    而那只是一个增强项的超时。增强项的配置错了, 该退回默认值, 不该拖垮主服务。
+    """
+    raw = _get_secret(key)
+    try:
+        val = float(raw) if raw else default
+    except ValueError:
+        return default
+    return min(max(val, lo), hi)
+
+
+# ── 入库判定 judge(JevforCoentent 仓的 /judge_draft, docs/00 #4)──────────────
+# commit_drafts 入库之后, 把真的建成了 versions 行的稿子逐篇发给 judge, 答案由 judge
+# 写进 TV 的账本 note_feature_answers(subject_type='aw_version')。和馆员一样是
+# **增强项**: 留空 = 不接, commit_drafts 照常, 返回里 judge_status=not_configured。
+# 见 judge_client.py 与 docs/deskcore.md §3.8。
+JUDGE_URL: str = _get_secret("JUDGE_URL")          # 例 https://judge-production.up.railway.app
+JUDGE_API_KEY: str = _get_secret("JUDGE_API_KEY")  # 发在 X-Judge-Key 头里
+# 8 秒是 docs/00 #4 定的「超时即跳过」。这里是【整批判定的共同截止】, 不是每篇各 8 秒 ——
+# 多篇并行(JUDGE_MAX_WORKERS)、到点没回来的一律记 timeout, 所以 commit_drafts 因判定
+# 多出来的时间有上界。上限夹在 15 秒: commit 本身 1~3 秒(以 elapsed_ms 实测为准)+ 判定,
+# 要留在 MCP 客户端实测能容忍的 ~22 秒之内(见上面 LIBRARIAN_TIMEOUT_SEC 那段与 D-074)。
+# ⚠️ 8 秒同样没有实测分位数撑着 —— 等 batch_metrics 里 deskcore_commit 的 phase_ms.judge
+#    攒够样本再定(查法见 docs/deskcore.md §3.8)。
+JUDGE_TIMEOUT_SEC: float = _bounded_number("JUDGE_TIMEOUT_SEC", 8.0, 1.0, 15.0)
+# 一次 commit 里最多同时发几篇。judge 那边 /judge_draft 一篇一请求、由 uvicorn 线程池并发;
+# Jev 限流 1,200 次/分。一篇 2~4 次 Jev 调用, 8 路并发 ≈ 每秒十来次, 离限流很远。
+JUDGE_MAX_WORKERS: int = int(_bounded_number("JUDGE_MAX_WORKERS", 8, 1, 16))
+
 # ── Auth cookie (R-040) ─────────────────────────────────────────────────────
 # refresh token 走 stx CookieManager(JS 写入, 无法 HttpOnly —— 架构限制)。
 # 能做的加固: Secure 标志(仅 HTTPS 发送, 防中间人嗅探)。生产默认开;

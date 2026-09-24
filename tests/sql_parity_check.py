@@ -114,6 +114,9 @@ END $r$;
 DROP SCHEMA IF EXISTS autowriter CASCADE;
 DROP SCHEMA IF EXISTS extensions CASCADE;
 DROP SCHEMA IF EXISTS auth CASCADE;
+-- 上一次本地运行半路退出时会把 truth_vault 替身留下; 不清的话「没有 truth_vault
+-- 时 RPC 返回空」那条会被上一次的残留判红。CI 每次是新库, 这行只对本地重跑有用。
+DROP SCHEMA IF EXISTS truth_vault CASCADE;
 CREATE SCHEMA autowriter;
 CREATE SCHEMA extensions;
 CREATE SCHEMA auth;
@@ -271,9 +274,15 @@ def main() -> int:
     if n != "11111111-1111-1111-1111-111111111111":
         print(f"  [FAIL] a 没回填上: {n!r}")
         bad += 1
-    run_sql_text("DROP SCHEMA truth_vault CASCADE;", "truth_vault 替身清理")
     if not bad:
         print("  ✓ 有 truth_vault 时: 按项目读、keyset 翻页、回填只填 NULL 的行")
+
+    # ── ①⁗ 011 的视图: 同一个 truth_vault 替身还在, 趁这时把它真建一次 ──
+    # 迁移链上跑 011 时还没有 truth_vault(它只打 NOTICE 跳过), 所以视图的 SQL 在那一遍
+    # 里根本没被解析过 —— 拼错列名只会在这里炸。
+    bad += _check_angle_outcomes_view()
+
+    run_sql_text("DROP SCHEMA truth_vault CASCADE;", "truth_vault 替身清理")
 
     # ── ①‴ 补录锁的语义: 拿到/拿不到/自己可重入/放锁只放自己的/到期可接管 ──
     sql(f"INSERT INTO autowriter.projects (id, owner_id, name) VALUES ('{PID}', '{UID}', '锁') "
@@ -528,6 +537,96 @@ def main() -> int:
 
     print(f"\nschema + SQL/Python 一致性: {'全部通过' if not bad else f'{bad} 项不通过'}")
     return 1 if bad else 0
+
+
+def _check_angle_outcomes_view() -> int:
+    """011: 视图真的建得出来、口径对、权限对, 且非属主来建会当场报错而不是建出空视图。
+
+    调用时 truth_vault 替身(notes: a=爆 / b=趴 / c)还在。四件事:
+
+      1. 连跑两遍 011 不报错(有 truth_vault 时的幂等);
+      2. 口径: 只列用掉了的坐标; 没对上笔记的留着(note/tier 为 NULL, 算分母要它);
+         ingested 的对照不认(因果倒置);
+      3. 权限: 以 **service_role** 身份(本 harness 里它【没有】BYPASSRLS, 三张底表 RLS
+         全开且无 policy)读得到行 —— 证明「属主建 + security_invoker=false」这条路真通;
+         anon / authenticated 读不了(明细视图不外放);
+      4. 非属主、非 BYPASSRLS 的角色来跑 011 必须当场失败 —— 否则它会建出一个永远
+         0 行、不报错的视图(设计审查 2026-09-23 §5 说的正是这个坑)。
+    """
+    bad = 0
+    # 与 TV 同形: truth_vault.notes 开 RLS、无 policy(notes_v1_2.sql)。替身默认没开,
+    # 不开的话「以属主身份读穿 RLS」这条只验了两张表。
+    sql("ALTER TABLE truth_vault.notes ENABLE ROW LEVEL SECURITY;")
+    f = REPO / "migrations" / "011_angle_outcomes_view.sql"
+    text = _shim(f.read_text(encoding="utf-8"))
+    run_sql_text(text, "011(有 truth_vault)")
+    run_sql_text(text, "011(有 truth_vault, 第二遍)")
+
+    p2, v1, v2 = ("33333333-3333-3333-3333-333333333333",
+                  "44444444-4444-4444-4444-444444444444",
+                  "55555555-5555-5555-5555-555555555555")
+    sql(f"INSERT INTO autowriter.projects (id, owner_id, name) VALUES ('{p2}', '{UID}', '台账');")
+    sql("INSERT INTO autowriter.versions (id, ai_engine, title, body) VALUES "
+        f"('{v1}', 'deskcore', '甲', '正文甲'), ('{v2}', 'deskcore', '乙', '正文乙');")
+    sql("INSERT INTO autowriter.angle_ledger (project_id, angle_key, consumed_version_id) VALUES "
+        f"('{p2}', 'k-published', '{v1}'), ('{p2}', 'k-not-yet', '{v2}'), "
+        f"('{p2}', 'k-drawn-only', NULL);")
+    sql("INSERT INTO autowriter.tv_note_links (note_id, tv_project_id, project_id, version_id, match_kind) "
+        f"VALUES ('a', 'SPX_phase1', '{p2}', '{v1}', 'body_exact'), "
+        f"       ('b', 'SPX_phase1', '{p2}', '{v2}', 'ingested');")
+    sql("GRANT USAGE ON SCHEMA autowriter TO service_role, anon, authenticated;")
+
+    got = sql("SELECT string_agg(angle_key || ':' || coalesce(note_id, '-') || ':' || "
+              "coalesce(tier, '-'), ',' ORDER BY angle_key) FROM autowriter.v_angle_outcomes "
+              f"WHERE project_id = '{p2}';")
+    want = "k-not-yet:-:-,k-published:a:爆"
+    if got != want:
+        print(f"  [FAIL] v_angle_outcomes 口径不对: 期望 {want!r}, 得到 {got!r}"
+              "(只列用掉的坐标 / 没对上的留 NULL / ingested 不认)")
+        bad += 1
+
+    # 不走 sql(): 视图若是以调用者身份读(security_invoker=true), 这里会直接 42501 ——
+    # 那也是失败, 但要记成 [FAIL] 往下走, 不能让整个 harness 半路退出、把 truth_vault
+    # 替身留在库里污染下一次运行。
+    r = subprocess.run(_psql() + ["-tAc", "SET ROLE service_role; SELECT count(*) FROM "
+                                  f"autowriter.v_angle_outcomes WHERE project_id = '{p2}';"],
+                       capture_output=True, text=True)
+    got = (r.stdout.strip().splitlines() or [""])[-1] if r.returncode == 0 else r.stderr.strip()[-200:]
+    if got != "2":
+        print(f"  [FAIL] service_role 读 v_angle_outcomes 得到 {got!r} 行(应为 2)—— 底表 RLS"
+              "无 policy, 视图若不是以属主身份读, 这里就是安静的 0")
+        bad += 1
+    for role, want_priv in (("service_role", "t"), ("anon", "f"), ("authenticated", "f")):
+        got = sql(f"SELECT has_table_privilege('{role}', 'autowriter.v_angle_outcomes', 'SELECT');")
+        if got != want_priv:
+            print(f"  [FAIL] {role} 对 v_angle_outcomes 的 SELECT 权限是 {got!r}(应为 {want_priv!r})")
+            bad += 1
+    opts = sql("SELECT coalesce(array_to_string(reloptions, ','), '') FROM pg_class "
+               "WHERE oid = 'autowriter.v_angle_outcomes'::regclass;")
+    if "security_invoker=false" not in opts:
+        print(f"  [FAIL] v_angle_outcomes 的 reloptions 是 {opts!r}, 没有显式 security_invoker=false")
+        bad += 1
+
+    # 非属主来建: 给它看得见 schema 的权限(否则它连 ::regclass 都过不去, 测不到守卫本身)。
+    sql("DO $r$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='aw_not_owner') "
+        "THEN CREATE ROLE aw_not_owner NOLOGIN; END IF; END $r$;")
+    sql("GRANT USAGE, CREATE ON SCHEMA autowriter TO aw_not_owner; "
+        "GRANT USAGE ON SCHEMA truth_vault TO aw_not_owner;")
+    r = subprocess.run(_psql(), input=_SEARCH_PATH + "SET ROLE aw_not_owner;\n" + text,
+                       capture_output=True, text=True)
+    if r.returncode == 0 or "永远查出 0 行" not in r.stderr:
+        print("  [FAIL] 非属主角色跑 011 没有被守卫拦下 —— 它会建出一个永远 0 行、不报错的视图。"
+              f"\n         rc={r.returncode} stderr={r.stderr[-400:]!r}")
+        bad += 1
+    sql("DROP OWNED BY aw_not_owner; DROP ROLE aw_not_owner;")
+
+    sql(f"DELETE FROM autowriter.projects WHERE id = '{p2}';")      # 级联带走台账与对照
+    sql(f"DELETE FROM autowriter.versions WHERE id IN ('{v1}', '{v2}');")
+    if not bad:
+        print("  ✓ 011 的视图: 连跑两遍幂等; 只列用掉的坐标、没对上的留 NULL、ingested 不认; "
+              "service_role(无 BYPASSRLS)读得到, anon/authenticated 读不了; "
+              "非属主来建当场报错, 不留安静的空视图")
+    return bad
 
 
 # 历史上出现过、又不在当前基线里的函数签名。基线必须能把它们清干净。

@@ -8,6 +8,8 @@
     db.get_service_client / get_project / set_item_example_label / upsert_memory
     dedup.embed_texts / cosine_similarity / embeddings_available
     librarian_client.build_brief / fetch_flywheel_lessons
+    judge_client.judge_draft             (入库判定: HTTP 调 judge 拿事实, 与借卡同一种
+                                          关系 —— deskcore 自己仍然零 LLM 调用)
     db._parse_pgvector                   (R-034: PostgREST 把 pgvector 序列化成
                                           字符串, 不归一的话 cosine 静默返回 0.0)
 
@@ -22,6 +24,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures as cf
 import contextlib
 import logging
 import random
@@ -41,6 +44,7 @@ import dedup
 #    真要给 deskcore 做瘦镜像的话, 这一行会让**整个服务起不来**而不是只坏一个
 #    工具 —— 那时候把它改成函数内延迟 import。
 import exporter
+import judge_client
 import librarian_client
 import memory
 
@@ -1018,6 +1022,249 @@ def _restore_stash(client, stash: dict[int, list[dict]], indices) -> None:
                                  "跑 backfill 可补", i)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 入库判定(judge) —— commit_drafts 在项目写锁之外调(2026-09-24, docs/deskcore.md §3.8)
+# ══════════════════════════════════════════════════════════════════════
+
+# 影子期(JevforCoentent docs/00 #4; docs/28 §7.3: 最低档也只是 revise, TV 不拦发布):
+# 判定只记录 —— 答案由 judge 写进 TV 账本, 结局挂在返回值上并落 batch_metrics ——
+# 不拦入库, 不改 written / rejected。这句话原样回给调用方模型: 返回里多了一块
+# hard_fails, 模型最自然的反应就是去改稿, 而影子期的判定还没过闸二, 不该驱动改稿。
+JUDGE_SHADOW_NOTE = ("影子期: 入库判定只记录(答案进 TV 账本), 不拦入库, 也不改 written / "
+                     "rejected 的口径。不要据此改稿、重写或重新提交; 判定失败或超时也不用重试。")
+
+# 数据出境口径里唯一"未发布稿整篇不发"的品类(docs/00 #7)。一个写作台项目对着几个
+# TV 项目、品类又不一致时, 只要其中有它就按它报 —— 出境这件事上宁严勿松。
+_RX_CATEGORY = "处方药"
+
+
+def _ms_since(t0: float) -> int:
+    return int((time.monotonic() - t0) * 1000)
+
+
+def _judge_targets(drafts: list[dict], titles: list[str], bodies: list[str],
+                   inserted_idx: set[int], replace: dict, replaced_ok: dict,
+                   minted_ids: dict, minted_ok) -> tuple[list[dict], list[dict]]:
+    """这次入库里**哪几篇要判**、各自的 subject_id。返回 ``(targets, skipped)``。
+
+    subject_id 必须是一条**真实存在**的 ``versions.id``: 账本按它 JOIN 回写作台,
+    指到不存在的行就等于白判(而且判的钱照花)。所以:
+
+      · 调用方自带 ``version_id`` 的(UI 生成的稿, 库里本来就有那一版)用它自己的。
+        ⚠️ 这些**不在** ``out["version_ids"]`` 里(那里只报这次新建的身份), 照
+        version_ids 判会把它们整批漏掉 —— 设计审查 2026-09-23 §5 指出的就是这个;
+      · 新稿只判 ``minted_ok`` 里的: ``identity_error`` 时没建成的那几条只有指纹、
+        没有 versions 行, **跳过**;
+      · 改稿替换只判真挂上了旧 item 的(``replaced_ok``), 挂失败的同理跳过;
+      · 正文为空的跳过: 只有标题判不出东西(fq 全部 text_too_short), 平台题却可能对着
+        一个标题给出硬伤(设计审查 §6 · loop.judge_draft 空正文那条)。
+
+    只看入库成功的(``inserted_idx``): 被拒的没有交付, 不该在账本里留答案。
+    """
+    minted_ok = set(minted_ok)
+    targets: list[dict] = []
+    skipped: list[dict] = []
+    for i in sorted(inserted_idx):
+        d = drafts[i]
+        if i in replace:
+            if i not in replaced_ok:
+                skipped.append({"index": i, "reason": "replace_failed",
+                                "detail": "新指纹入了库但没挂到旧稿上, 这一版没有 versions 行"})
+                continue
+            vid = minted_ids[i]
+        elif d.get("version_id"):
+            vid = str(d["version_id"])
+        elif minted_ids.get(i) in minted_ok:
+            vid = minted_ids[i]
+        else:
+            skipped.append({"index": i, "reason": "identity_error",
+                            "detail": "指纹入了库, 但 items/versions 没建成 —— 账本的 "
+                                      "subject_id 会指向不存在的行"})
+            continue
+        if not (bodies[i] or "").strip():
+            skipped.append({"index": i, "version_id": vid, "reason": "empty_body",
+                            "detail": "只有标题, 判不出东西"})
+            continue
+        targets.append({"index": i, "version_id": vid,
+                        "title": titles[i], "body": bodies[i]})
+    return targets, skipped
+
+
+def _judge_project_context(client, project_id: str) -> dict:
+    """judge 要的项目号与品类: 写作台项目 → ``tv_project_map`` → TV 项目号 →
+    ``truth_vault.projects.category``。
+
+    返回 ``{"project", "category", "status", "detail"}``; ``project`` 为 None 时这次
+    **不发**, ``status`` / ``detail`` 说明原因。
+
+    为什么不拿写作台的 UUID 凑一个 project: judge 的出境口径(docs/00 #7)按 TV 的项目号
+    认项目, UUID 它认不出来 —— 认不出来的项目它只能按「未清关」跑通用层 + 平台层, 而那
+    恰好漏掉了「处方药项目的未发布稿不跑」: 一个没接 tv-map 的处方药项目, 稿子会照样发给
+    Jev。所以没有映射就不发, 记 ``not_configured``, 补救是 ``tv-map add``(与 tv-sync
+    同一张表, 接上它这两件事一起好)。
+
+    多个 TV 项目时取补录目标那一行(``ingest_target``), 没有就按项目号排第一个; 品类
+    只要有一个是处方药就报处方药(见 ``_RX_CATEGORY``)。品类读不到就只发项目号。
+    """
+    try:
+        maps = [m for m in store.tv_projects_of(client, project_id) if m.get("tv_project_id")]
+    except Exception as exc:                            # noqa: BLE001 — 009 没跑 / 库故障
+        return {"project": None, "category": None, "status": judge_client.JUDGE_ERROR,
+                "detail": f"查 tv_project_map 失败({type(exc).__name__}: {exc})"[:300]}
+    if not maps:
+        return {"project": None, "category": None,
+                "status": judge_client.JUDGE_NOT_CONFIGURED,
+                "detail": ("这个项目没接 tv_project_map, 判不出 TV 项目号与品类 —— 数据出境"
+                           "口径(docs/00 #7)下不发。补救: python -m deskcore.cli tv-map add "
+                           "--tv-project <TV 项目号> --project <本项目 id>")}
+    maps.sort(key=lambda m: (not m.get("ingest_target"), str(m["tv_project_id"])))
+    project = str(maps[0]["tv_project_id"])
+    cats = store.tv_project_categories(client, [m["tv_project_id"] for m in maps])
+    category = _RX_CATEGORY if _RX_CATEGORY in cats.values() else cats.get(project)
+    return {"project": project, "category": category, "status": None, "detail": ""}
+
+
+_JUDGE_ROW_KEYS = ("judge_status", "passed", "hard_fails", "calls", "written",
+                   "policy", "elapsed_ms", "http_status", "detail")
+
+
+def _judge_row(target: dict, res: dict) -> dict:
+    """一篇一行。空字段不带: 这块东西每次 commit 都回给调用方模型, 没接 judge 的部署
+    一批 20 篇就是 20 行一模一样的空壳 —— 返回值越长, 越容易把协议挤出模型的注意力
+    (09-11 那次入库率掉到 22% 就是这个形状, 见 docs/deskcore.md §4.3)。"""
+    row = {"index": target["index"], "version_id": target["version_id"],
+           "judge_status": res.get("judge_status")}
+    row.update({k: res[k] for k in _JUDGE_ROW_KEYS
+                if k != "judge_status" and res.get(k) not in (None, "", [], {})
+                and not (k == "elapsed_ms" and not res.get(k))})   # 0 = 根本没发, 不是"很快"
+    return row
+
+
+def _judge_block(rows: list[dict], skipped: list[dict], *, project: str | None = None,
+                 category: str | None = None, detail: str | None = None,
+                 error: str | None = None) -> dict:
+    """``detail``: 整批一个都没发出去时的原因(没配 / 没接 tv-map), 只说一次。"""
+    summary: dict[str, int] = {}
+    for r in rows:
+        summary[r["judge_status"]] = summary.get(r["judge_status"], 0) + 1
+    block = {"shadow": True, "note": JUDGE_SHADOW_NOTE, "project": project,
+             "category": category, "summary": summary, "results": rows,
+             "skipped": skipped}
+    if detail:
+        block["detail"] = detail
+    if error:
+        block["error"] = error
+    return block
+
+
+def _judge_committed(client, project_id: str, targets: list[dict],
+                     skipped: list[dict]) -> dict:
+    """把 targets 并行发给 judge, **整批共用一个截止时间**。逐篇兜底, 不抛。
+
+    共同截止(``JUDGE_TIMEOUT_SEC``, 默认 8 秒)而不是每篇各 8 秒: 串行的话 10 篇就是
+    80 秒, 远过 MCP 客户端实测能容忍的 ~22 秒(config.py LIBRARIAN_TIMEOUT_SEC 那段)。
+    到点没回的记 ``timeout``; 还在排队没开跑的直接取消, 不会再发出去; 已经在飞的那几个
+    不等, 由 requests 自己的超时收尾(连接 ≤ 3 秒 + 读 ≤ 截止), 线程随后自然退出。
+    ⚠️ 记成 timeout 的那篇, judge 那边可能照样判完并写了账本 —— timeout 只说明写作台
+    这边没等到, 不说明账本里没有。
+    """
+    if not targets:
+        return _judge_block([], skipped)
+    if not judge_client.configured():
+        # 没配就一个请求都不发、一次库都不查 —— 没接 judge 的部署与改动前完全一样。
+        nc = judge_client.result(judge_client.JUDGE_NOT_CONFIGURED)
+        return _judge_block([_judge_row(t, nc) for t in targets], skipped,
+                            detail="JUDGE_URL / JUDGE_API_KEY 未配置")
+
+    ctx = _judge_project_context(client, project_id)
+    if ctx["project"] is None:
+        res = judge_client.result(ctx["status"])
+        return _judge_block([_judge_row(t, res) for t in targets], skipped,
+                            detail=ctx["detail"])
+
+    budget = judge_client.timeout_sec()
+    payloads = [judge_client.build_draft_request(
+        version_id=t["version_id"], title=t["title"], body=t["body"],
+        project=ctx["project"], category=ctx["category"]) for t in targets]
+    ex = cf.ThreadPoolExecutor(
+        max_workers=max(1, min(len(payloads), int(config.JUDGE_MAX_WORKERS))),
+        thread_name_prefix="judge")
+    futs: list[cf.Future] = []
+    try:
+        futs = [ex.submit(judge_client.judge_draft, p, timeout=budget) for p in payloads]
+        done, _pending = cf.wait(futs, timeout=budget)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    rows = []
+    for t, f in zip(targets, futs):
+        if f in done:
+            try:
+                res = f.result()
+            except Exception as exc:                    # noqa: BLE001 — judge_draft 本不抛, 兜底
+                res = judge_client.result(judge_client.JUDGE_ERROR,
+                                          detail=f"{type(exc).__name__}: {exc}")
+        else:
+            res = judge_client.result(
+                judge_client.JUDGE_TIMEOUT, elapsed_ms=int(budget * 1000),
+                detail=f"整批判定的共同截止 {budget:g}s 到了还没回来(或排队没轮到)")
+        rows.append(_judge_row(t, res))
+    return _judge_block(rows, skipped, project=ctx["project"], category=ctx["category"])
+
+
+def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
+                           out: dict) -> None:
+    """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
+
+    为什么要落库而不只打日志: 「commit_drafts 约 1~2 秒」「一批 10 篇并行也是一两秒」
+    都没有样本撑着, 8 秒的截止要拿分位数重定(docs/deskcore.md §3.8 有查法)。Railway
+    的日志留不久、也查不了分位数。判定的结局同理: 影子期要回答的就是"判了多少、超时多少、
+    被出境口径挡了多少", 答案要在库里。
+    """
+    j = out.get("judge") or {}
+    try:
+        counters = {"drafts": len(drafts), "written": int(out.get("written") or 0),
+                    "rejected": len(out.get("rejected") or []),
+                    "judge_skipped": len(j.get("skipped") or [])}
+        for k, v in (j.get("summary") or {}).items():
+            counters[f"judge_{k}"] = v
+        meta = {
+            "mode": "deskcore_commit",
+            "batch_id": out.get("batch_id"),
+            "judge_project": j.get("project"),
+            "judge_category": j.get("category"),
+            # 整批没发出去(没配 / 没接 tv-map)或判定这一步整体失败时的原因
+            "judge_detail": ((j.get("error") or j.get("detail") or "")[:300] or None),
+            # 只留判定的结局, 不留题目细节 —— 答案本身在 TV 账本里, 这里要回答的是
+            # "发出去了没有、怎么收场的"。
+            "judge": [{"version_id": r.get("version_id"), "status": r.get("judge_status"),
+                       "passed": r.get("passed"),
+                       "hard_fails": [h[1] for h in (r.get("hard_fails") or [])
+                                      if isinstance(h, (list, tuple)) and len(h) > 1],
+                       "calls": r.get("calls"), "written": r.get("written"),
+                       "elapsed_ms": r.get("elapsed_ms"),
+                       "detail": (r.get("detail") or "")[:200] or None}
+                      for r in (j.get("results") or [])],
+            "judge_skipped": [{"index": s.get("index"), "reason": s.get("reason")}
+                              for s in (j.get("skipped") or [])],
+        }
+        store.insert_commit_metrics(client, project_id=project_id, user_id=str(user_id),
+                                    phase_ms=out.get("phase_ms") or {},
+                                    counters=counters, meta=meta)
+    except Exception:                                   # noqa: BLE001 — 埋点不能拖垮入库
+        logger.exception("commit_drafts: 指标落库失败(project=%s) —— 入库不受影响",
+                         project_id)
+    try:
+        import telemetry
+        telemetry.log_event("deskcore_commit", project_id=project_id,
+                            drafts=len(drafts), written=out.get("written"),
+                            elapsed_ms=out.get("elapsed_ms"),
+                            phase_ms=out.get("phase_ms"),
+                            judge=j.get("summary"), judge_skipped=len(j.get("skipped") or []))
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 def commit_drafts(client, project_id: str, drafts: list[dict],
                   *, user_id: str | None = None) -> dict:
     """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
@@ -1050,7 +1297,16 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     版本的指纹摘下来(留副本), 新稿走**同一套**闸和原子写入; 入了库就在旧 item 上
     加一版(version_num+1, best_version_id 指过去); 被拒或半途异常就把指纹原样
     放回。不销角度(旧版已经销过)、不计 unattributed。
+
+    ── 2026-09-24: 入库判定(judge, 影子期) ───────────────────────────────
+    真的建成了 versions 行的那几篇, 入库完成、**项目写锁放掉之后**逐篇发给 judge
+    (``judge_client``), 结局挂在返回值的 ``judge`` 上, 答案由 judge 写进 TV 账本。
+    影子期只记不拦: ``written`` / ``rejected`` / ``version_ids`` 的口径一个字不变,
+    判定失败、超时、没配, 入库照样成功。返回值另带 ``elapsed_ms`` / ``phase_ms``,
+    同一份数落进 ``batch_metrics``(meta.mode='deskcore_commit')攒样本。
+    覆盖面与位置的理由见 docs/deskcore.md §3.8。
     """
+    started = time.monotonic()
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
@@ -1059,7 +1315,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # 补录不能插进来。没有替换的普通 commit 也拿 —— 它们正是会在那个窗口里把与旧稿
     # 相同的文字塞进来的一方, 只锁一边等于没锁。
     holder = f"commit:{uuid.uuid4().hex[:8]}"
+    lock_asked = time.monotonic()
     with _project_write_lock(client, project_id, holder):
+        lock_wait_ms = _ms_since(lock_asked)
         replace, replace_rejected, stash = _prepare_replacements(client, project_id, drafts)
         # 整段包在 try 里(而不是拆成子函数): ci.yml 用 inspect.getsource 守着"commit 走 _gate"
         # 和"commit 记 embedding_model"这两条, 拆出去它们就看不见了。
@@ -1404,11 +1662,42 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
                                   "不存在, migrations/001 可能没跑)。并发 check/commit 时"
                                   "可能有撞车的稿子一起进库。")
-            return out
+            # ⚠️ 这里原来是 `return out`。改成落到 with 块外面去, 是为了让下面的入库判定
+            #    【不在】项目写锁里、也【不在】这个 try 里(设计审查 2026-09-23 §5):
+            #    · 在 try 里: 判定一抛, 下面的 except 会把已替换稿的旧指纹无条件放回 ——
+            #      新旧两版指纹并存, 下一版判自己撞车; 再 raise 出去, 调用方重试又撞上
+            #      自己刚写的指纹。一次增强项的故障变成一句"你的稿子重复了"。
+            #    · 在锁里: 就算自己包了 try, 多等的 8 秒也全算进同项目其它 commit / 补录
+            #      的 90 秒等锁预算。
         except Exception:
             # 指纹已经摘了、稿子却没入库: 放回去, 否则旧稿从此不参与查重(而且没人知道)。
             _restore_stash(client, stash, list(stash))
             raise
+    commit_ms = _ms_since(started) - lock_wait_ms      # 各段可加: lock_wait + commit + judge ≈ total
+
+    # ── 入库判定(影子期): 锁已经放了, 恢复指纹的那个 try 也出来了 ─────────────
+    # 到这里入库已经成功, 下面任何一步都不许把它变成失败: 判定自己不抛
+    # (_judge_committed 内部逐篇兜底), 外面再兜一层, 兜到的也只记进 out["judge"]。
+    judge_started = time.monotonic()
+    try:
+        targets, skipped = _judge_targets(drafts, titles, bodies, inserted_idx, replace,
+                                          replaced_ok, minted_ids, minted_ok)
+        out["judge"] = _judge_committed(client, project_id, targets, skipped)
+    except Exception as exc:                            # noqa: BLE001 — 增强项, 绝不冒泡
+        logger.exception("commit_drafts: 入库判定整体失败(project=%s) —— 入库不受影响",
+                         project_id)
+        out["judge"] = _judge_block(
+            [], [], error=f"判定这一步整体失败({type(exc).__name__}: {exc}), 入库不受影响"[:300])
+    judge_ms = _ms_since(judge_started)
+
+    # 「commit_drafts 现在约 1~2 秒」在仓库里没有依据(设计审查 §5)—— 先量, 攒样本再定
+    # judge 的 8 秒。lock_wait 单列: 补录正在跑时入库要等锁(最长 INGEST_LOCK_WAIT_SEC),
+    # 不拆开的话一次等锁就把分位数带歪。
+    out["elapsed_ms"] = _ms_since(started)
+    out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms,
+                       "judge": judge_ms, "total": out["elapsed_ms"]}
+    _record_commit_metrics(client, project_id, user_id, drafts, out)
+    return out
 
 
 # 人审只认这两个结论。**刻意不含 pending** —— 迭代后重置回待审是
@@ -1993,6 +2282,9 @@ MIGRATION_010_PROBE_SQL = (
     "select relname, relrowsecurity from pg_class c join pg_namespace n on n.oid=c.relnamespace "
     "where n.nspname='autowriter' and relname in ('tv_project_map','tv_note_links','ingest_locks');"
 )
+# 011 建一个视图(发牌台账 → 版本 → TV 笔记 → tier)。PostgREST 能直接读视图, 探得到。
+MIGRATION_ANGLE_OUTCOMES = "011_angle_outcomes_view.sql"
+_MIGRATION_011_VIEW = "v_angle_outcomes"
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -2304,6 +2596,25 @@ def migration_state(client) -> dict:
          "Supabase advisor 一直报 rls_disabled, 以及以后谁给 anon 发了 GRANT 会一下子"
          "把整张表露出去")
 
+    # ── 011: 发牌台账接上结果的视图。只读: select 1 行。
+    #
+    # ⚠️ 没授权要报 missing 并指向 011, **不走** denied → 007 那条聚合: 视图的 GRANT
+    # 在 011 自己里面, 007 一行视图权限都不管, 指去跑 007 修不好它。PG 对视图报的是
+    # "permission denied for view", table_permission_denied 不认它 —— 所以这里自己认。
+    def _view_absent_or_ungranted(exc: Exception) -> bool:
+        return (store.schema_object_missing(exc)
+                or "permission denied for view" in str(exc).lower())
+    state, note = _probe_ok(
+        lambda: client.table(_MIGRATION_011_VIEW).select("ledger_id").limit(1).execute(),
+        predicate=_view_absent_or_ungranted)
+    if state == "denied" or (state == "missing" and "permission denied" in note.lower()):
+        state, note = "missing", ("视图在, 但 service_role 没有 SELECT —— 重跑 011"
+                                  "(它自己带 GRANT, 不是 007)。" + note)
+    _add(MIGRATION_ANGLE_OUTCOMES, f"视图 {_MIGRATION_011_VIEW}", state, note,
+         "发牌加权看不到结果(哪些坐标出了爆文); 不影响任何现有功能。⚠️ 视图不在也可能"
+         "是跑 011 时库里还没有 truth_vault.notes —— 那时它只打一行 NOTICE 跳过, TV 落库"
+         "之后重跑 011 即可")
+
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
     # 一遍根本不缺的 SQL, 而同一份输出里那条 note 明明写着"不是「没跑迁移」"。
@@ -2447,6 +2758,16 @@ def _ingest_published_unlocked(client, project_id: str, entries: list[dict], *,
     但"身份建了、指纹没写"那种半途失败**不是靠重跑修**: 重跑看不到它的指纹,
     会再建一份身份。修法是 ``backfill --project`` —— 它按 version_id 幂等, 会把
     有身份没指纹的行补上。返回里 ``fingerprinted < minted`` 时就该走那条路。
+
+    ── 为什么这里【不】调入库判定(judge, 2026-09-24 定的覆盖面)──────────
+    commit_drafts 入库后会把稿子发给 judge(docs/deskcore.md §3.8), 这条补录路径刻意
+    不发。D-071 的实查是写手没散场、只是稿子在外面写, 发布后由 tv-sync 倒灌回来 ——
+    走到这里的**全是已经发布的笔记**: 它们在 TV 的 ``truth_vault.notes`` 里, 由 TV 的
+    事后特征抽取(docs/31 位置 ①, 同一把 fq 尺子, ``subject_type='note'``)覆盖。再以
+    ``aw_version`` 判一遍是同一篇文字在账本里记两份、两种主体, 而"写前拦一下"对已发布的
+    稿子又没有意义。所以入库判定的覆盖面是「走写作台交付的稿」, 在外面写的那部分交给 TV。
+    ⚠️ 前提是那条笔记**在 TV 里**: 从飞书表 ``ingest --xlsx`` 补进来、而那张表没接 TV 同步
+    的(Hatherine 就是), 两边都判不到 —— 补救是把表接进 TV, 不是在这里补一刀判定。
 
     ``dry_run`` 只数不写(但会查已有指纹, 所以 dry-run 的数字就是真跑会写的数)。
     """

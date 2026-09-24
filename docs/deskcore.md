@@ -55,8 +55,9 @@ WorkBuddy 项目 (mcp.json)      Claude Code / CodeBuddy
    │                 │                  │
 本仓现有模块      migrations/001      TV librarian
 db / memory /     四张新表            (HTTP, 借爆款经验卡)
-dedup / clients /
-librarian_client
+dedup / clients /                     judge (JevforCoentent)
+librarian_client /                    (HTTP, 入库判定, 影子期, §3.8)
+judge_client
 ```
 
 ### 2.1 复用而不是重写
@@ -70,6 +71,7 @@ deskcore 是**薄的**。本仓已有的一律直接调：
 | 项目读取 / 标正负例 / 写规则 | `db.get_project` / `set_item_example_label` / `upsert_memory` |
 | embedding 与余弦 | `dedup.embed_texts` / `cosine_similarity` |
 | 借飞轮经验卡 | `librarian_client.build_brief` / `fetch_flywheel_lessons` |
+| 入库判定（§3.8） | `judge_client.build_draft_request` / `judge_draft`（HTTP 拿事实，deskcore 仍然零 LLM） |
 | pgvector 反序列化 | `db._parse_pgvector` ⚠️ 见 §5 |
 
 deskcore 自己只有六个模块：
@@ -165,7 +167,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
 | | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
-| | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可 |
+| | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8） |
 | 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human` + 真实 reviewer + 时间。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
@@ -337,6 +339,8 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 
 **还没接的一段**：指标回流。TV 那边有了归因数据之后，"这个角度产出的稿子后来爆没爆"才能反过来喂 `draw_angles` 和正例池——`angle_ledger` 现在只记 `drawn_at` / `consumed_version_id`，不记结果。那是下一步，不在这次范围里。
 
+> **2026-09-24 接上了一半**：`migrations/011` 的视图 `v_angle_outcomes` 把用掉的坐标经 `tv_note_links`（§3.7）连到了 `truth_vault.notes.tier`，「哪些坐标出了爆文」现在查得出来（见 §3.8 末尾）。**加权本身还没做**——`draw_angles` 仍是均匀随机，按规律加权要等闸二，且保留 15% 纯随机（D-065 续）。
+
 ### 3.6 人审 —— 定稿之后那一步（2026-09-16）
 
 **缺的从来不是"把 pending 改成 approved"，是一个真的有人点过的动作。**
@@ -396,6 +400,140 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 用例 `tests/test_tvlink.py` / `tests/test_tv_sync.py`。**§3.4 的六列不再是回流的依赖**，
 `export_drafts` 照样带着它们（粘了不坏），但没人需要再手抄。
 
+### 3.8 入库判定 judge（2026-09-24，影子期）
+
+**是什么。** JevforCoentent 仓 docs/00 #4 拍板：写作台的入库判定挂在 `commit_drafts` 内部，advisory，
+8 秒没回就跳过，答案进账本（TV 的 `note_feature_answers`，`subject_type='aw_version'`、
+`subject_id = versions.id`），影子期只记不拦。judge 是一个独立的 HTTP 服务（`POST /judge_draft`），
+本仓只有一个薄客户端 `judge_client.py`，照 `librarian_client.py` 的形状写：env 配置、超时、
+fail-open、绝不抛。**deskcore「一次 LLM 调用都没有」不破**——Jev 调用在 judge 那边，deskcore 拿到的
+是事实，与借卡调馆员是同一种关系；`ci.yml` 那条 AST 守卫只禁 Anthropic 调用，HTTP 不在其列。
+
+**决定一：覆盖面只到 `commit_drafts`，补录路径不判**（设计审查 2026-09-23 §4 #1）。
+docs/31 §5.1 与 docs/00 #4 的理由是「写手抽完就散场（D-071），入库是每篇稿必经的唯一一步」——
+那是把 D-071 读反了。D-071 的实查是写手**没散场**，继续用写作台发牌，但稿子在外面写、发布后由
+tv-sync 倒灌回来，不过 `commit_drafts`（sportsix 438 条 ingested 里 114 条是 9 月发的）。所以两条路分开定：
+
+| 路 | 进来的是什么 | 判不判 | 谁覆盖 |
+|---|---|---|---|
+| `commit_drafts` | 写作台交付、**未发布**的稿 | 判（本节） | judge → 账本 `aw_version` |
+| `_ingest_published_unlocked`（`ingest_published` 工具 / `ingest --xlsx` / `tv-sync` 补录） | **已经发在小红书上**的笔记 | **不判** | TV 的事后特征抽取（docs/31 位置 ①，同一把 fq 尺子，`subject_type='note'`） |
+
+补录路径不判的理由：已发布的稿子「入库前判一下」改变不了任何事；再以 `aw_version` 判一遍，是同一篇文字
+在账本里记两份、挂两种主体；而它们本来就在 TV 的抽取队列里。**代价写明**：sportsix / Hatherine 这种
+在外面写的项目，**写前**的判定 deskcore 碰不到——那要靠写手侧的 MCP 工具（judge 仓的 `judge.mcp_server`：
+`judge_draft` / `repair_plan_for`），不靠这里。⚠️ 「由 TV 覆盖」的前提是那条笔记**在 TV 里**：从飞书表
+`ingest --xlsx` 补进来、而那张表没接 TV 同步的（Hatherine 目前就是），事后抽取也够不着——两边都判不到。
+补救是把那张表接进 TV（接进去之后再加一行 `tv-map`），不是在补录路径上补一刀判定。这条决定写进了 `_ingest_published_unlocked` 的 docstring，
+`tests/test_deskcore_commit_judge.py` 最后一条钉着「补录不调 judge」。（跨仓的决策记录归 truth-vault
+`DECISIONS.md`，本仓不越界去写，见 runbook 待办。）
+
+**决定二：判定在项目写锁之外、在恢复指纹的那个大 try 之外**（设计审查 §5）。`commit_drafts` 原来在锁和
+try 里面 `return out`；现在改成落到 `with` 块外面，再判：
+
+- 放在 try 里：判定一抛，那个 `except` 会把**已替换稿的旧指纹**无条件放回——新旧两版指纹并存，下一版判
+  自己撞车；再 `raise` 出去，调用方重试又撞上自己刚写的指纹。一次增强项的故障变成一句「你的稿子重复了」。
+- 放在锁里：就算自己包了 try，多等的 8 秒也全算进同项目其它 commit / 补录的 90 秒等锁预算。
+
+判定自己逐篇兜底不抛，外面再兜一层；兜到的只记进 `out["judge"]`。`ci.yml` 钉在 `commit_drafts` 源码上的
+那几条（`_gate(`、两行 `embedding_model`、`embed_failed` / `embedding_warning`）一条没动。
+
+**判哪几篇。** subject_id 必须是一条**真实存在**的 `versions.id`，否则账本 JOIN 不回写作台、钱白花：
+
+| 情形 | 判不判 |
+|---|---|
+| 新稿、身份建成（`version_ids` 里的） | 判 |
+| 调用方自带 `version_id`（UI 生成的稿，库里本来就有那一版） | **判**。⚠️ 它们**不在** `version_ids` 里（那里只报这次新建的），照 `version_ids` 判会整批漏掉 |
+| 改稿替换、新版挂上了旧 item | 判，用新版的 id |
+| `identity_error`：指纹入了库、versions 没建成 | 跳过（`skipped.reason = identity_error`） |
+| 替换没挂上（`replace_warning`） | 跳过（`replace_failed`） |
+| 正文为空 | 跳过（`empty_body`）：只有标题判不出东西，平台题却可能对着一个标题给硬伤 |
+| 被闸拒掉的 | 不判：没交付，不该在账本里留答案 |
+
+**项目号与品类（数据出境口径，docs/00 #7）。** 未发布稿默认只跑通用层 + 平台层，处方药项目的未发布稿
+不跑，由 judge 执行；写作台每次都带上它判断所需的两样：
+
+- `project` = **TV 的项目号**（`SPX_phase1` 这种），从 `tv_project_map`（`009`，tv-sync 用的同一张表）
+  查：一个写作台项目对多个 TV 项目时取补录目标那一行，没有就按项目号排第一个。写作台的 UUID 在 TV 那边
+  认不出来，所以**不拿它凑数**：认不出来的项目 judge 只能按「未清关」跑通用层，恰好漏掉「处方药不跑」——
+  一个没接 tv-map 的处方药项目的草稿就这样发给了 Jev。因此**没有映射就一个请求都不发**，记
+  `not_configured`，detail 里写着补救命令 `tv-map add`。
+- `category` = `truth_vault.projects.category`（TV 的受控词表：处方药 / OTC药 / 保健品 / …），经
+  PostgREST 的 `schema("truth_vault")` 读（本仓第一处这么读 TV 的地方，前提是 TV 的 Exposed schemas 与
+  service_role 表级 GRANT，见 `store.tv_project_categories`）。几个映射里只要有一个是处方药就报处方药
+  （出境上宁严勿松）。读不到就只发 `project`，不影响判定。
+
+不带 `brief`：写作台的规则是自由文本，编不成闭集题（那要模型）；未清关项目的项目层本来也会被 judge 按
+出境口径丢掉。请求体其余几项：`judge_paras = "never"`（不判段，一篇的调用次数压到最少才放得进 8 秒）、
+`write = true`（账本由 judge 写）、`run_tag = "primary"`、`return_rows = false`。
+
+**结局（`judge_status`）。**
+
+| 结局 | 来路 | 要不要人管 |
+|---|---|---|
+| `ok` | 200 | — `passed` 是判定结论，影子期不拿它拦任何东西 |
+| `not_configured` | 没配 `JUDGE_URL` / `JUDGE_API_KEY`；或项目没接 tv-map | 部署 / `tv-map add` |
+| `timeout` | 连接或读超时，或整批的共同截止到了。⚠️ judge 那边可能照样判完写了账本，只是写作台没等到 | 攒多了看 p95 |
+| `policy_blocked` | 403 且 detail 以 `policy:` 开头 | 不用，**永不重试**（合同确认之后是 judge 那边的配置） |
+| `bad_request` | 422 | 是写作台这边的 bug，**永不重试** |
+| `unavailable` | 401 / 503 / 404 / 连不上 | 部署或配置 |
+| `jev_failed` | 502 | judge 那边 |
+| `error` | 其它状态码、200 但结构不对、意料之外的异常 | 看 detail |
+
+**延迟。**「`commit_drafts` 现在约 1–2 秒」「一批 10 篇并行也是一两秒」在仓库里都没有依据，8 秒也没有。
+所以：多篇**并行**发（`JUDGE_MAX_WORKERS`，默认 8），**整批共用一个截止**（`JUDGE_TIMEOUT_SEC`，默认 8，
+夹在 1–15），到点没回的记 `timeout`、还在排队的直接取消（不会再发出去），不会串成 N × 8 秒。上界是 MCP
+客户端实测能容忍的 ~22 秒（`config.py` 里 `LIBRARIAN_TIMEOUT_SEC` 那段，D-074）。返回值带 `elapsed_ms` 与
+`phase_ms = {lock_wait, commit, judge, total}`（`lock_wait` 单列：补录正在跑时入库要等锁，不拆开会把分位数
+带歪），**同一份数落进 `batch_metrics`**——它本来就是「每批一行的指标快照」（phase_ms / counters / meta 三个
+jsonb），不需要新迁移。`batch_id` 留 NULL（本次的 batch 记在 `meta.batch_id`），免得历史页给写作台批次挂上一块
+全是 0 的「性能指标」。攒够样本之后这样查：
+
+```sql
+select count(*),
+       percentile_cont(0.5)  within group (order by (phase_ms->>'commit')::int) as commit_p50,
+       percentile_cont(0.95) within group (order by (phase_ms->>'commit')::int) as commit_p95,
+       percentile_cont(0.95) within group (order by (phase_ms->>'judge')::int)  as judge_p95,
+       percentile_cont(0.95) within group (order by (phase_ms->>'total')::int)  as total_p95
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'deskcore_commit' and created_at > now() - interval '14 days';
+
+-- 判定结局的分布(影子期要回答的就是: 判了多少、超时多少、被出境口径挡了多少)
+select j->>'status' as status, count(*)
+  from autowriter.batch_metrics m, jsonb_array_elements(m.meta->'judge') j
+ where m.meta->>'mode' = 'deskcore_commit'
+ group by 1 order by 2 desc;
+```
+
+**回给调用方的。** `out["judge"] = {shadow, note, project, category, summary, results, skipped}`（整批一个都没发出去时
+多一个 `detail` 说原因，只说一次）；`results` 每篇一行：`index / version_id / judge_status`，其余
+`passed / hard_fails / calls / written / policy / elapsed_ms / http_status / detail` **有值才带**——这块东西每次 commit
+都回给调用方模型，没接 judge 的部署一批 20 篇就是 20 行空壳，返回值越长越容易把协议挤出模型的注意力。
+`hard_fails` 只带 `[题库, 题号, 答案, 概率]`，**不带证据句、不带修改单**：影子期的判定还没过闸二，返回里多一块
+「不过的题」，模型最自然的反应就是去改稿——所以 `note` 与工具 docstring 都明说「只记录，不要据此改稿或重新提交，
+判定失败也不用重试」。修改单留给写手侧的 MCP 工具。`written` / `rejected` / `version_ids` 的口径一个字不变，
+判定怎么失败都一样（`tests/test_deskcore_commit_judge.py` 用真客户端 + 超时 / 403 / 整个挂掉三种情形比对过）。
+
+**影子期之后**（不在这次范围）：等闸二有了验证过的特征，把「落在历史最低 20%」和「平台题库硬命中」标成
+`revise`，仍然不拦（docs/31 §5.1）。到那时再决定修改单要不要回给写手。
+
+**台账接上结果：`v_angle_outcomes`（`migrations/011`）。** 同一份拍板记录里「顺手查到 · 写作台」那条：
+`angle_ledger` 不记结果，发牌加权之前要一个 `consumed_version_id → tv_note_links → notes.tier` 的视图。
+两段 JOIN 的类型一一对上（UUID ↔ UUID、TEXT ↔ TEXT）。口径：只列用掉了的坐标；还没对上笔记的
+`note_id` / `tier` 为 NULL（算爆文率要分母）；只认真对上的对照（与 `_TV_BACKFILL_KINDS` 同一份名单）；同一版发了
+两条笔记就是两行。⚠️ 权限：三张底表 RLS 开着且无 policy，视图以属主身份读（`security_invoker = false`），所以
+**必须由底表属主建**（换个普通角色建出来的视图永远 0 行且不报错，迁移里先验、不够格当场报错），且**显式
+GRANT**（`autowriter` 没有 default privileges，新视图对 service_role 也是零权限）。只发给 `service_role`：这是
+绕过 RLS 的明细视图，发给 anon 等于公网可读；看板要看，在 TV 那边照 `dashboard_views_v1.sql` 建只吐计数的聚合视图。
+
+```sql
+-- 按主维度看坐标的结果(只看已对上笔记的)
+select dims->>'emotional_lever' as lever, count(*) as published,
+       count(*) filter (where tier in ('爆', '大爆')) as bao
+  from autowriter.v_angle_outcomes where note_id is not null
+ group by 1 order by bao desc;
+```
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -410,6 +548,9 @@ env：
 | `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<uuid>", "name": "Ziao"}}`，一人一把 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN |
+| `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
+| `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了退回默认）。**整批判定的共同截止**，不是每篇各 8 秒 |
+| `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16。一次 commit 同时发几篇 |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
 
@@ -423,8 +564,9 @@ env：
 `002_calibration_cas.sql` / `003_versions_unique_num.sql` /
 `004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
 `006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql` /
-`008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql`
-**十个，按编号顺序跑，别跳号**（建议先在
+`008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql` /
+`011_angle_outcomes_view.sql`
+**十一个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -454,6 +596,8 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
   >
   > 这是 2026-08-26 首次真部署当天靠人肉 `curl` 打线上才发现的。现在有两道守卫：`tests/sql_parity_check.py` 断言 **`autowriter` 下每一张表都必须对 `service_role` 有 `SELECT/INSERT/UPDATE/DELETE`**（断不变量而不是名单，以后加表忘了发 GRANT 会自己红）；`doctor` 把 `42501` 单独报成 `denied` 而不是混进 `error`，并直接指向 `migrations/007`——而且**四个权限一个个探**，因为"读得到"证明不了"写得进"。
 - `009_tv_links.sql` 是写作台 ↔ TV 的稿子对照（2026-09-17）：两张表 + 两个跨 schema 的 RPC。为什么要它：TV 5966 条笔记里带写作台 lineage 的是 **0 条**——原设计让运营把 `export_drafts` 的六个 ID 列手抄进飞书，三周零匹配，到 TV 手里的表根本没有那六列。两边在同一个库里、内容都是写作台产的，`tv-sync` 按内容对（正文前 40 字 / 标题 / 时间窗内四字串包含度），对不上的直接从 TV 的全文补录进指纹库。**运营不用做任何事，飞书表不用加列。** 见 §3.7。
+
+- `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
 - `010_tv_links_rls.sql`：`009` 建的三张表补开 RLS（2026-09-18，Supabase advisor 对着生产库报出来的）。不是漏洞——anon / authenticated 对它们没有表级 GRANT，service_role 绕 RLS——只是与本 schema 其他表同一口径。`doctor` 探不到它（RLS 开没开从 PostgREST 读起来一样），报 `unprobeable` 并给出要在 SQL Editor 跑的那句；`tests/sql_parity_check.py` 守「每张表都开了 RLS」这条不变量。
 

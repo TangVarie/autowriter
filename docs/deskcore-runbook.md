@@ -247,6 +247,38 @@ TV 核对 `--write-tv` 时顺手从 Supabase advisor 转来的：`tv_project_map
 （`aw_010_tv_links_rls`）。`doctor` 报它 `unprobeable`，要核就在 SQL Editor 跑
 `core.MIGRATION_010_PROBE_SQL` 那句。
 
+### 1.7 `011_angle_outcomes_view` + 入库判定 judge（2026-09-24，**生产库尚未执行 / 尚未配置**）
+
+两件事一起上，彼此不依赖：
+
+**① 入库判定（代码，不需要迁移）。** `commit_drafts` 锁放掉之后把真的建成了 versions 行的稿子发给
+JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不拦。设计与两条决定（覆盖面只到
+`commit_drafts`、判定在锁和恢复指纹的 try 之外）见 `docs/deskcore.md` §3.8。上线步骤：
+
+1. judge 服务先在 Railway 起来，`/health` 的 `auth.mode` 是 `key`、`write_enabled` 为 true。
+2. deskcore 主服务加两个变量：`JUDGE_URL` / `JUDGE_API_KEY`（与 judge 那边的 `JUDGE_API_KEY` 同值）；
+   `JUDGE_TIMEOUT_SEC` 先不设（默认 8）。改变量不用发版（config 在进程启动时读，Railway 改变量会自动重新部署）。
+3. `curl -s $DESKCORE_URL/health | jq .config.judge` → `configured: true`。
+4. 确认要判的项目都在 `tv_project_map` 里（`python -m deskcore.cli tv-map`）：**没接 tv-map 的项目一篇都不会
+   发**（出境口径要 TV 项目号，见 §3.8），返回里是 `not_configured` + 补救命令。Hatherine 目前不在 TV 里，
+   它的稿子因此不判。
+5. 端到端：随手 commit 一篇，返回里 `judge.summary` 是 `{"ok": 1}`；TV 里
+   `select count(*) from truth_vault.note_feature_answers where subject_type = 'aw_version'` 从 0 变非 0。
+6. 一两周后按 `docs/deskcore.md` §3.8 那两句 SQL 从 `batch_metrics` 取分位数，重定 `JUDGE_TIMEOUT_SEC`。
+
+出事时的开关：删掉 `JUDGE_URL`（不用发版，重新部署后生效），`commit_drafts` 回到改动前的行为，只是返回里多一块
+`not_configured` 和计时（计时照样落 `batch_metrics`）。
+
+**② `011_angle_outcomes_view.sql`（迁移）。** 视图 `autowriter.v_angle_outcomes`：发牌台账用掉的坐标 →
+`tv_note_links` → `truth_vault.notes.tier`，给发牌加权（docs/31 位置 ④）算「哪些坐标出了爆文」。
+⚠️ **必须用底表属主跑**（Supabase SQL Editor / MCP `apply_migration` 的默认身份 `postgres` 就是）：
+视图以属主身份读三张 RLS-on 无 policy 的底表，换一个普通角色建出来的会**永远 0 行且不报错**，所以迁移
+先验当前角色、不够格当场 `RAISE`。只 GRANT 给 `service_role`（明细视图，不外放）。先在 branch 库跑、
+`get_advisors` 核一遍——advisor 会把它报成 security definer view，那是有意的（同 TV 的
+`dashboard_views_v1.sql`），理由写在迁移文件头。验收：`doctor` 里「视图 v_angle_outcomes」applied；
+`select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
+三个数说得通（第二个 ≤ 第一个）。
+
 ### 1.5 指纹库回填记录（2026-08-26）
 
 只回填了**有实质调教痕迹的两个 owner**——按"调教笔记 + 记忆规则 + 人工决策 + 反馈"
@@ -734,6 +766,7 @@ open_project（简报自带 lessons）→ draw_angles(n=20) → 生成 20 篇
 | 方向 | 通道 | 谁调谁 | 配置 | 失败时 |
 |---|---|---|---|---|
 | TV → aw | `open_project` 随简报借爆款经验卡（`borrow_lessons` 再借） | deskcore 调 TV librarian `POST /librarian` | `LIBRARIAN_URL` + `LIBRARIAN_API_KEY` | 返回空列表，**照常写稿**。飞轮永远不是写稿的前置依赖 |
+| aw → judge → TV | `commit_drafts` 之后的入库判定（影子期），答案由 judge 写进 TV 的 `note_feature_answers(aw_version)` | deskcore 调 judge `POST /judge_draft`（JevforCoentent 仓） | `JUDGE_URL` + `JUDGE_API_KEY`；项目要在 `tv_project_map` 里 | 记 `judge_status`（返回值 + `batch_metrics`），**照常入库**。判定永远不是入库的前置条件（`docs/deskcore.md` §3.8）。补录进来的已发布笔记**不走**这条，由 TV 的事后特征抽取覆盖 |
 | aw → TV | 人工审稿决定归档 | TV 的 `sync_autowriter_decisions_to_prepublish.py` 每天读 `autowriter.items` 的 `status` | TV 侧 secrets，本仓不用管 | TV 侧 daily-sync 报红发邮件 |
 | ⚠️ 同上 | **仅对 Streamlit 时期的存量成立** | deskcore **不写** `items.status` | — | 停了 Streamlit 就没有新决策进 TV，见下 |
 | 共库 | 同一个 Supabase 项目 `kduysqedr` | `truth_vault` / `autowriter` 两个 schema | — | — |
@@ -879,6 +912,9 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 7b | ~~**推 TV 那边读 `decision_source`**~~ | ✅ **TV 已接**（`scripts/sync_autowriter_decisions_to_prepublish.py` 按 human / rule_based / unverified 分流，只有 `decision_source` 恰好等于 `human` 才算人工）。⚠️ **但这条管子现在零流量**，见下面 7d |
 | ~~7d~~ | ~~**人工审稿这条管子一个月零流量**~~ ✅ **2026-09-20 已定案：legacy-only**（TV D-072，理由与重新点亮的条件见 §3）。下面是当时查到的事实，保留作背景 | 2026-09-20 实查生产库：`autowriter.items` **6,688 行里 `decision_source` 全是 NULL** —— `review_drafts`（2026-09-16 上线）**一次都没被调用过**。存量 598 条 approved/needs_revision 是 Streamlit 时代留下的，TV 那边已按新口径全部归成 `evaluator_type='unverified'`，`prepublish_evaluations` **最后一条停在 2026-08-20**（Streamlit 末次出稿 08-19）。两侧代码都通，**没人拧龙头** —— 与 D-063 通道 2 那次同一个形状。⚠️ 修法**不是**让模型主动多调：协议里「用户没表态就别调」那条守的正是「别替用户点通过」，松掉就是灌伪造正例。这是给人看的决策，不是给代码修的 bug。**已定案：不点亮** |
 | 7c | 打通 lineage 回程 | 飞书表建好那六列 + 真导一次 + 在 TV 查 `notes.source_autowriter_version_id` 非空条数。这一列长期是 0，`v_model_comparison` 因此长期查出空集且不报错 |
+| 7e | 接上入库判定并攒样本（§1.7 ①） | 代码已合、env 没配。配上之后两周内从 `batch_metrics`（`meta.mode='deskcore_commit'`）取 `commit` / `judge` / `total` 的 p95 重定 `JUDGE_TIMEOUT_SEC`——8 秒和「commit 约 1–2 秒」都还没有样本撑着（`docs/deskcore.md` §3.8 有 SQL）。`timeout` 占比高先看是不是并发不够（`JUDGE_MAX_WORKERS`），别先加截止 |
+| 7f | 覆盖面决定回写 truth-vault `DECISIONS.md` | 跨仓决策归 TV 记。本仓定的是「入库判定只挂 `commit_drafts`，补录的已发布笔记由 TV 事后抽取（docs/31 位置 ①）覆盖」（设计审查 2026-09-23 §4 #1 纠正了 D-071 的读法），写在 `docs/deskcore.md` §3.8；TV 那边要补一条引用它，并确认 ① 的抽取确实覆盖补录进来的那些项目 |
+| 7g | 跑 `011` 并给 `tv_project_map` 补齐映射 | `011` 只建视图，没人读它不坏；但入库判定按 TV 项目号走出境口径，没映射的项目（如 Hatherine）一篇都不发。补映射同时也让 tv-sync 覆盖到它们 |
 
 ### P2 · 攒够再做
 
@@ -894,6 +930,8 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 15 | `/health` 回显注入封顶 | **纯便利, 不是唯一手段** —— `open_project` 的返回里已经有 `counts.soft_rules_cap_per_scope`(`deskcore/core.py:330`, 直接取自 `MAX_INJECTED_MEMORIES_PER_SCOPE`), 拿一把 key 和一个 project_id 就能确认线上生效值。放进 `/health` 的好处是**不需要 key、不需要 project_id**, 改完 env 立刻能验。(初稿把这条写成「线上无法验证」—— 错的, codex review 指出, 已改) |
 | ~~16~~ | ~~`memories.embedding` 回填~~ | ✅ **2026-08-28 两个入口都就位**：① MCP 工具 `reembed_my_rules` —— 写手/运维在 WorkBuddy 里一句话触发, 一次 50 条, 只补调用者自己名下的, `remaining` 归零为止；② CLI `python -m deskcore.cli reembed-rules --user <uuid>`。⚠️ **只管存量, 不是给「新规则没向量」兜底** —— 新规则本来就有向量：`db.upsert_memory` 在写入时就算(`db.py:1748`)。缺向量的 174 条来自：① 2026-08-28 用**裸 SQL** 灌的 66 条技艺库种子(绕过了 upsert_memory, 见 §4.5)；② 更早那批建于这段代码之前、或当时没配 GOOGLE_API_KEY 的。按人分布：623346512 → 111 条、1796631194 → 44 条、tangziao1997 → 18 条、738443677 → 1 条(无孤儿行)。`my_rules` 的 counts 里会显示「缺向量：N」提醒。
 **2026-09-20 复查：这一条实际只剩 1 条。** 现在全库缺向量的有 196 行，但其中 **195 行是 `memory_type='session'`**（`scope='project'`，最新一条停在 2026-08-19）——而所有召回路径都带 `memory_type.is.null,memory_type.eq.rule` 这道过滤（`store.py` 四处 + `db.py:1983`），**session 记忆从来不参与语义召回，缺不缺向量都一样**。真正缺向量的规则只有 **1 条**（global / confirmed / soft，2026-03-11 建的）。上面那个「174 条」把 session 一起算了进去，照着它去回填是在修一个不存在的问题 |
+| 17 | 发牌按结果加权 | `v_angle_outcomes`（`011`）让「哪些坐标出了爆文」查得出来，但 `draw_angles` 仍均匀随机。触发条件：闸二有了验证过的特征、且每个主维度取值下已对上笔记的样本够分出高低；保留 15% 纯随机（D-065 续），只筛「写不出」、不筛「不够爆」（docs/31 位置 ④） |
+| 18 | 入库判定出影子期 | 闸二之后把「落在历史最低 20%」「平台题库硬命中」标成 `revise`，**仍然不拦**（docs/31 §5.1）；到那时再定修改单要不要回给写手（现在刻意不回，见 `docs/deskcore.md` §3.8） |
 
 ---
 
@@ -1244,3 +1282,4 @@ deskcore 落地后，`seeding-prompt-refiner/references/cross-batch-diversity.md
 | `DECISIONS.md` D-041 / D-042 / D-043 | truth-vault | 外置为 MCP 的决策 / 分页与互斥锁 / 迟到决策时间窗 |
 | `docs/10-sister-repo-followups.md` R-034 | truth-vault | 跨仓待办总账 |
 | `docs/15` / `docs/19` | truth-vault | librarian 接入说明与 quickstart |
+| `docs/00-decisions.md` #4 / #7、`docs/31` §5、`docs/02-design-review-2026-09-23.md` §4–§5 | JevforCoentent（judge） | 入库判定的拍板（advisory、8 秒、影子期）、数据出境口径、接入清单；`judge/api.py` 是 `/judge_draft` 的契约 |
