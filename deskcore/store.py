@@ -1833,28 +1833,34 @@ def tv_project_categories(sb, tv_project_ids: list[str]) -> dict[str, str]:
     ``notes_v1_2.sql`` 给 service_role 发的表级 GRANT。任何一条不在, 这里安静地回 ``{}``
     并记一行 WARN —— 判定照常, 只是少了品类。
 
-    ``schema()`` 每次新建一个 PostgREST client(带自己的 HTTP 连接池), 用完要关,
-    否则每次 commit 漏一个连接。
+    ⚠️ ``schema()`` 交回来的那个 client 用完【不关】(codex review P2 on #92)。它是谁的、
+    关了会连累谁, 由 supabase-py / postgrest-py 的版本决定, 不由本函数决定:
+
+      · 锁文件钉的 supabase 2.30 / postgrest 2.30(实测): ``schema()`` 每次新建一个
+        SyncPostgrestClient, 带**自己的** httpx.Client, 关它不碍父 client 的事;
+      · 但 requirements.txt 放行的 ``supabase>=2.0,<3.0`` 里还有另一种: supabase 2.10 +
+        postgrest 0.18 的 ``schema()`` 是把父 client 自己那个 postgrest 的 profile 头改掉、
+        再把**它本身**交回来 —— 同一个对象、同一个 session。在那里关 ``pg.session`` 就是关掉
+        父 client 的连接: 紧接着的 ``insert_commit_metrics``(以及之后任何 ``sb.table(...)``)
+        全部失败, 而那一步的异常是被吞掉的, 指标就这样静默丢了。
+
+    所以连接的生命周期留给持有它的一方。2.30 下这个一次性 client 随函数返回不再有人引用,
+    由 GC 回收(socket 回收时关闭) —— 与 ``core.sb()`` 每次工具调用新建、同样从不显式关的
+    service client 是同一种生命周期, 不比现状多漏。⚠️ 那种老版本里 ``schema()`` 还会把父
+    client 之后的查询**都切到 truth_vault**, 不关也救不回来; 锁文件不许退回那里 ——
+    ``tests/test_deskcore_commit_judge.py`` 用真的 supabase 客户端钉着「查完品类, 父 client
+    照常能往 autowriter 写」。
     """
     ids = sorted({str(t) for t in tv_project_ids if t})
     if not ids or not callable(getattr(sb, "schema", None)):
         return {}
-    pg = None
     try:
-        pg = sb.schema("truth_vault")
-        rows = (pg.table("projects").select("project_id, category")
+        rows = (sb.schema("truth_vault").table("projects").select("project_id, category")
                 .in_("project_id", ids).execute()).data or []
     except Exception as exc:                           # noqa: BLE001 — 附加信息, 读不到就不带
         logger.warning("tv project category lookup failed (%s): %s",
                        ids, f"{type(exc).__name__}: {exc}"[:200])
         return {}
-    finally:
-        close = getattr(getattr(pg, "session", None), "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception:                          # noqa: BLE001
-                pass
     return {str(r["project_id"]): str(r["category"]) for r in rows
             if isinstance(r, dict) and r.get("project_id") and r.get("category")}
 

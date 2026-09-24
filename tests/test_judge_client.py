@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import os
 import pathlib
 import re
@@ -21,6 +22,7 @@ import requests
 
 import config
 import judge_client as J
+import logger_utils
 
 
 class _Resp:
@@ -236,6 +238,49 @@ def test_secrets_do_not_leak_into_detail(wired):
     assert "sk-ant-api03-abcdefghijklmnopqrstuvwxyz" not in out["detail"]
 
 
+# JUDGE_API_KEY 是自定义格式(不是 sk- / eyJ / AIza…), 形态正则认不出来, 只能按值认。
+_CUSTOM_KEY = "jdg_live_7Hq2VnX9pLw4Rt8Kz3Mb"
+
+
+@pytest.fixture
+def custom_key(wired, monkeypatch):
+    """配上一把自定义格式的 key, 并让值级脱敏重新从 config 读一遍(它是懒加载一次的)。"""
+    monkeypatch.setattr(config, "JUDGE_API_KEY", _CUSTOM_KEY)
+    monkeypatch.setattr(logger_utils, "_VALUE_SECRETS", None)
+    return wired
+
+
+def test_the_judge_key_is_registered_with_the_value_masker(custom_key):
+    """codex review P2 on #92: 值级脱敏原来只登记了馆员 / Supabase / Anthropic / Google
+    四把 key, JUDGE_API_KEY 不在名单里 —— 形态正则又认不出它, 于是原样放行。"""
+    assert _CUSTOM_KEY not in logger_utils.mask_secrets(f"X-Judge-Key: {_CUSTOM_KEY}")
+
+
+def test_an_error_detail_that_echoes_the_key_is_masked(custom_key, capsys):
+    """judge 把收到的头原样抄进错误体(代理 / 调试日志都干得出来), judge_client 再把错误体
+    抄进 detail —— detail 与遥测那一行里都不许出现 key 的原文。"""
+    _, set_reply = custom_key
+    set_reply(lambda: _Resp(401, {"detail": f"X-Judge-Key 不对: 收到 {_CUSTOM_KEY}"}))
+    out = J.judge_draft(PAYLOAD)
+    assert out["judge_status"] == J.JUDGE_UNAVAILABLE
+    assert _CUSTOM_KEY not in out["detail"] and "REDACTED" in out["detail"], out["detail"]
+    printed = capsys.readouterr().out
+    assert "judge_draft_result" in printed and _CUSTOM_KEY not in printed
+
+
+def test_a_key_straddling_the_detail_cutoff_leaves_no_prefix_behind(custom_key):
+    """非 JSON 的错误体原来先截到 300 字再脱敏: key 恰好跨在截断点上时只剩前半截, 值级
+    脱敏认不出半截, 那半截就原样留在 detail 里。现在先脱敏、后截断。"""
+    _, set_reply = custom_key
+    # "HTTP 502: " 占 10 个字, 正文从第 280 个字起是 key —— 旧写法会把 key 的前 10 个字留下
+    text = "x" * 280 + _CUSTOM_KEY + "y" * 200
+    set_reply(lambda: _Resp(502, text=text, bad_json=True))
+    out = J.judge_draft(PAYLOAD)
+    assert out["judge_status"] == J.JUDGE_JEV_FAILED
+    assert len(out["detail"]) <= 300
+    assert _CUSTOM_KEY[:6] not in out["detail"], out["detail"][-40:]
+
+
 def test_every_status_is_in_the_documented_set():
     assert set(J.STATUSES) == {"ok", "not_configured", "timeout", "policy_blocked",
                                "bad_request", "unavailable", "jev_failed", "error"}
@@ -269,4 +314,24 @@ def test_timeout_env_is_parsed_defensively(raw, want):
             os.environ.pop("JUDGE_TIMEOUT_SEC", None)
         else:
             os.environ["JUDGE_TIMEOUT_SEC"] = saved
+        importlib.reload(config)
+
+
+@pytest.mark.parametrize("key,default", [("JUDGE_TIMEOUT_SEC", 8.0), ("JUDGE_MAX_WORKERS", 8)])
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "Infinity"])
+def test_non_finite_numbers_fall_back_to_the_default(key, default, raw):
+    """codex review P2 on #92: ``float("nan")`` 不抛, 而且夹不住(跟 NaN 比大小一律 False,
+    max/min 原样回 nan) —— ``JUDGE_MAX_WORKERS=NaN`` 走到 ``int(nan)`` 在 import 时就抛,
+    deskcore / worker / Streamlit 三个进程一起起不来; ``JUDGE_TIMEOUT_SEC=NaN`` 则一路变成
+    requests 与线程池的超时。非有限值一律当写坏, 退回默认值。"""
+    saved = os.environ.get(key)
+    try:
+        os.environ[key] = raw
+        got = getattr(importlib.reload(config), key)     # 修之前 JUDGE_MAX_WORKERS=NaN 在这里就抛
+        assert got == default and math.isfinite(got), (raw, got)
+    finally:
+        if saved is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = saved
         importlib.reload(config)

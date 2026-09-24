@@ -10,6 +10,7 @@
     librarian_client.build_brief / fetch_flywheel_lessons
     judge_client.judge_draft             (入库判定: HTTP 调 judge 拿事实, 与借卡同一种
                                           关系 —— deskcore 自己仍然零 LLM 调用)
+    logger_utils.mask_secrets            (判定那块的 detail / error 回给调用方、落库前脱敏)
     db._parse_pgvector                   (R-034: PostgREST 把 pgvector 序列化成
                                           字符串, 不归一的话 cosine 静默返回 0.0)
 
@@ -47,6 +48,7 @@ import exporter
 import judge_client
 import librarian_client
 import memory
+from logger_utils import mask_secrets
 
 from . import fingerprint as fp
 from . import store, tvlink, vocab
@@ -1052,7 +1054,9 @@ def _judge_targets(drafts: list[dict], titles: list[str], bodies: list[str],
 
       · 调用方自带 ``version_id`` 的(UI 生成的稿, 库里本来就有那一版)用它自己的。
         ⚠️ 这些**不在** ``out["version_ids"]`` 里(那里只报这次新建的身份), 照
-        version_ids 判会把它们整批漏掉 —— 设计审查 2026-09-23 §5 指出的就是这个;
+        version_ids 判会把它们整批漏掉 —— 设计审查 2026-09-23 §5 指出的就是这个。
+        但这个 id 是调用方说的, 入库这条路径从没核过它是不是本项目的一版: 这里只标上
+        ``caller_supplied``, 发之前由 ``_judge_owned_only`` 按本项目查一遍, 查不到的不发;
       · 新稿只判 ``minted_ok`` 里的: ``identity_error`` 时没建成的那几条只有指纹、
         没有 versions 行, **跳过**;
       · 改稿替换只判真挂上了旧 item 的(``replaced_ok``), 挂失败的同理跳过;
@@ -1060,12 +1064,14 @@ def _judge_targets(drafts: list[dict], titles: list[str], bodies: list[str],
         一个标题给出硬伤(设计审查 §6 · loop.judge_draft 空正文那条)。
 
     只看入库成功的(``inserted_idx``): 被拒的没有交付, 不该在账本里留答案。
+    这里不查库 —— 要查的(归属、项目号、品类)都在 ``_judge_committed`` 的截止之内查。
     """
     minted_ok = set(minted_ok)
     targets: list[dict] = []
     skipped: list[dict] = []
     for i in sorted(inserted_idx):
         d = drafts[i]
+        caller_supplied = False
         if i in replace:
             if i not in replaced_ok:
                 skipped.append({"index": i, "reason": "replace_failed",
@@ -1074,6 +1080,7 @@ def _judge_targets(drafts: list[dict], titles: list[str], bodies: list[str],
             vid = minted_ids[i]
         elif d.get("version_id"):
             vid = str(d["version_id"])
+            caller_supplied = True
         elif minted_ids.get(i) in minted_ok:
             vid = minted_ids[i]
         else:
@@ -1085,9 +1092,79 @@ def _judge_targets(drafts: list[dict], titles: list[str], bodies: list[str],
             skipped.append({"index": i, "version_id": vid, "reason": "empty_body",
                             "detail": "只有标题, 判不出东西"})
             continue
-        targets.append({"index": i, "version_id": vid,
+        targets.append({"index": i, "version_id": vid, "caller_supplied": caller_supplied,
                         "title": titles[i], "body": bodies[i]})
     return targets, skipped
+
+
+# 调用方自带的 version_id 在本项目里查不到(不存在 / 别的项目的 / 不是 UUID)时 skipped 的 reason。
+JUDGE_SKIP_NOT_IN_PROJECT = "version_not_in_project"
+
+
+def _judge_owned_only(client, project_id: str, targets: list[dict]
+                      ) -> tuple[list[dict], list[dict], list[tuple[dict, dict]]]:
+    """调用方自带的 version_id, 发之前先按**本项目**核一遍(codex review P1 on #92)。
+    返回 ``(send, skipped, failed)``: 要发的 / 不发且记进 skipped 的 / 查库失败没发的
+    (``(target, 结局)``)。
+
+    judge 收到 ``write=true`` 就按 subject_id 把答案写进 TV 账本。而 commit_drafts 对调用方
+    带来的 version_id 一向照单全收(写进指纹、拿去销账), 从没核过。判定这里再照单全收:
+
+      · 过期的 / 抄错的 UUID → 账本里多出一组挂在不存在的 ``aw_version`` 上的答案(孤儿行),
+        JOIN 回写作台永远 JOIN 不上, 判的钱白花;
+      · **别的项目**的 version_id → 这篇稿子的判定记到了那个项目的那一版名下, 张冠李戴 ——
+        那一版自己的答案也跟着被搅乱(账本主键含 subject_id)。
+
+    所以走 ``store.items_for_versions``: ``_prepare_replacements`` 核 ``replaces_version_id``
+    用的同一个按项目钉死归属的查询(``items!inner → batches!inner`` 再 ``.eq`` project_id,
+    别的项目的 id 根本查不出来)。查不到的记 ``skipped``(``reason = version_not_in_project``),
+    不发。本次新建的 id(新稿、替换稿)是这次调用自己在本项目里建的, 不用查。
+
+      · 不是合法 UUID 的不送进查询(同 ``_is_uuid``: 一个坏值会让 PG 在解析阶段拒掉整条
+        IN 查询, 连累同批的好 id), 直接记 version_not_in_project;
+      · 发出去的是库里的规范写法(小写带连字符): 调用方写成大写或不带连字符 PG 照认,
+        账本按文本 JOIN 就对不上了;
+      · 归属查询本身失败: 这几篇**不发**(不知道是不是本项目的, 就不能拿它写账本), 记
+        ``error``; 本次新建的照发 —— 一次查询故障不该连累它们。
+    """
+    theirs = [t for t in targets if t.get("caller_supplied")]
+    if not theirs:
+        return list(targets), [], []
+    canon = {t["index"]: str(uuid.UUID(str(t["version_id"])))
+             for t in theirs if _is_uuid(t["version_id"])}
+    known: dict[str, dict] = {}
+    lookup_error = None
+    if canon:
+        try:
+            known = store.items_for_versions(client, project_id, sorted(set(canon.values())))
+        except Exception as exc:                        # noqa: BLE001 — 查不了就不发, 不抛
+            logger.exception("commit_drafts: 核对自带 version_id 的归属失败(project=%s) "
+                             "—— 这几篇不判, 入库不受影响", project_id)
+            lookup_error = f"{type(exc).__name__}: {exc}"
+    send: list[dict] = []
+    skipped: list[dict] = []
+    failed: list[tuple[dict, dict]] = []
+    for t in targets:
+        if not t.get("caller_supplied"):
+            send.append(t)
+            continue
+        vid = canon.get(t["index"])
+        if vid is None:
+            skipped.append({"index": t["index"], "version_id": t["version_id"],
+                            "reason": JUDGE_SKIP_NOT_IN_PROJECT,
+                            "detail": "调用方带的 version_id 不是合法的 UUID, 不会是本项目的版本"})
+        elif lookup_error:
+            failed.append((t, judge_client.result(
+                judge_client.JUDGE_ERROR,
+                detail=f"核对自带 version_id 是不是本项目的版本时查库失败({lookup_error}), 这篇没发")))
+        elif vid in known:
+            send.append({**t, "version_id": vid})
+        else:
+            skipped.append({"index": t["index"], "version_id": t["version_id"],
+                            "reason": JUDGE_SKIP_NOT_IN_PROJECT,
+                            "detail": ("调用方带的 version_id 不是本项目里的版本(不存在, 或属于别的"
+                                       "项目) —— 发出去 judge 会把答案写到不存在或别人的版本名下")})
+    return send, skipped, failed
 
 
 def _judge_project_context(client, project_id: str) -> dict:
@@ -1105,12 +1182,14 @@ def _judge_project_context(client, project_id: str) -> dict:
 
     多个 TV 项目时取补录目标那一行(``ingest_target``), 没有就按项目号排第一个; 品类
     只要有一个是处方药就报处方药(见 ``_RX_CATEGORY``)。品类读不到就只发项目号。
+
+    ⚠️ 这两次查库会卡: 只许在 ``_judge_committed`` 的工作线程里、共同截止之内调。
     """
     try:
         maps = [m for m in store.tv_projects_of(client, project_id) if m.get("tv_project_id")]
     except Exception as exc:                            # noqa: BLE001 — 009 没跑 / 库故障
         return {"project": None, "category": None, "status": judge_client.JUDGE_ERROR,
-                "detail": f"查 tv_project_map 失败({type(exc).__name__}: {exc})"[:300]}
+                "detail": f"查 tv_project_map 失败({type(exc).__name__}: {exc})"}
     if not maps:
         return {"project": None, "category": None,
                 "status": judge_client.JUDGE_NOT_CONFIGURED,
@@ -1126,6 +1205,8 @@ def _judge_project_context(client, project_id: str) -> dict:
 
 _JUDGE_ROW_KEYS = ("judge_status", "passed", "hard_fails", "calls", "written",
                    "policy", "elapsed_ms", "http_status", "detail")
+
+_JUDGE_BLOCK_TEXT_MAX = 300
 
 
 def _judge_row(target: dict, res: dict) -> dict:
@@ -1143,7 +1224,12 @@ def _judge_row(target: dict, res: dict) -> dict:
 def _judge_block(rows: list[dict], skipped: list[dict], *, project: str | None = None,
                  category: str | None = None, detail: str | None = None,
                  error: str | None = None) -> dict:
-    """``detail``: 整批一个都没发出去时的原因(没配 / 没接 tv-map), 只说一次。"""
+    """``detail``: 整批一个都没发出去时的原因(没配 / 没接 tv-map / 查库超时), 只说一次。
+
+    ``detail`` / ``error`` 里是异常原文, 一路进返回值和 batch_metrics: 先脱敏、再截断
+    (反过来的话, 跨在截断点上的 key 只剩半截, 值级脱敏认不出来)。每篇那一行的 detail
+    由 ``judge_client.result`` 按同一个顺序处理过了。
+    """
     summary: dict[str, int] = {}
     for r in rows:
         summary[r["judge_status"]] = summary.get(r["judge_status"], 0) + 1
@@ -1151,9 +1237,9 @@ def _judge_block(rows: list[dict], skipped: list[dict], *, project: str | None =
              "category": category, "summary": summary, "results": rows,
              "skipped": skipped}
     if detail:
-        block["detail"] = detail
+        block["detail"] = mask_secrets(detail)[:_JUDGE_BLOCK_TEXT_MAX]
     if error:
-        block["error"] = error
+        block["error"] = mask_secrets(error)[:_JUDGE_BLOCK_TEXT_MAX]
     return block
 
 
@@ -1167,6 +1253,16 @@ def _judge_committed(client, project_id: str, targets: list[dict],
     不等, 由 requests 自己的超时收尾(连接 ≤ 3 秒 + 读 ≤ 截止), 线程随后自然退出。
     ⚠️ 记成 timeout 的那篇, judge 那边可能照样判完并写了账本 —— timeout 只说明写作台
     这边没等到, 不说明账本里没有。
+
+    ── 截止从发之前的查库就开始算(codex review P2 on #92)────────────────
+    发之前要查三样: ``tv_project_map``(TV 项目号)、``truth_vault.projects``(品类, 跨
+    schema)、调用方自带 version_id 的归属(``_judge_owned_only``)。原来前两样在截止**之外**、
+    在调用线程里同步查 —— 而 PostgREST 客户端的默认超时是 120 秒: 库那边一卡, 一次**已经
+    入库成功**的 commit 就挂着远远过了 8 秒, MCP 客户端 ~22 秒放弃, 调用方看到的是失败,
+    回头一重试就撞上自己刚写进去的指纹。现在三样都在工作线程里查、算进同一个截止:
+    到点没查完 → 整批记 ``timeout``、一篇都不发, commit 照常返回; 查完了 → 判定只拿剩下的
+    时间。卡住的那个线程由 PostgREST 自己的超时收尾, 它回来之后也不会再发任何东西 ——
+    发请求只在本函数里、截止之内。
     """
     if not targets:
         return _judge_block([], skipped)
@@ -1176,39 +1272,68 @@ def _judge_committed(client, project_id: str, targets: list[dict],
         return _judge_block([_judge_row(t, nc) for t in targets], skipped,
                             detail="JUDGE_URL / JUDGE_API_KEY 未配置")
 
-    ctx = _judge_project_context(client, project_id)
-    if ctx["project"] is None:
-        res = judge_client.result(ctx["status"])
-        return _judge_block([_judge_row(t, res) for t in targets], skipped,
-                            detail=ctx["detail"])
-
     budget = judge_client.timeout_sec()
-    payloads = [judge_client.build_draft_request(
-        version_id=t["version_id"], title=t["title"], body=t["body"],
-        project=ctx["project"], category=ctx["category"]) for t in targets]
+    started = time.monotonic()
+    deadline = started + budget
+
+    def _left() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def _prepare():
+        ctx = _judge_project_context(client, project_id)
+        if ctx["project"] is None:
+            return ctx, [], [], []                     # 反正一篇都不发, 归属也不用查了
+        return (ctx, *_judge_owned_only(client, project_id, targets))
+
     ex = cf.ThreadPoolExecutor(
-        max_workers=max(1, min(len(payloads), int(config.JUDGE_MAX_WORKERS))),
+        max_workers=max(1, min(len(targets), int(config.JUDGE_MAX_WORKERS))),
         thread_name_prefix="judge")
+    send: list[dict] = []
     futs: list[cf.Future] = []
+    done: set = set()
     try:
-        futs = [ex.submit(judge_client.judge_draft, p, timeout=budget) for p in payloads]
-        done, _pending = cf.wait(futs, timeout=budget)
+        try:
+            ctx, send, not_ours, failed = ex.submit(_prepare).result(timeout=_left())
+        except cf.TimeoutError:
+            to = judge_client.result(judge_client.JUDGE_TIMEOUT)
+            return _judge_block(
+                [_judge_row(t, to) for t in targets], skipped,
+                detail=(f"发之前的查库(tv_project_map / TV 品类 / 自带 version_id 的归属)在整批"
+                        f"判定的共同截止 {budget:g}s 内没查完, 一篇都没发 —— 入库不受影响"))
+        if ctx["project"] is None:
+            res = judge_client.result(ctx["status"])
+            return _judge_block([_judge_row(t, res) for t in targets], skipped,
+                                detail=ctx["detail"])
+        skipped = sorted(skipped + not_ours, key=lambda s: s["index"])
+        rows = [_judge_row(t, r) for t, r in failed]
+        left = _left()
+        if send and left > 0:
+            payloads = [judge_client.build_draft_request(
+                version_id=t["version_id"], title=t["title"], body=t["body"],
+                project=ctx["project"], category=ctx["category"]) for t in send]
+            futs = [ex.submit(judge_client.judge_draft, p, timeout=left) for p in payloads]
+            done, _pending = cf.wait(futs, timeout=_left())
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
 
-    rows = []
-    for t, f in zip(targets, futs):
-        if f in done:
+    for k, t in enumerate(send):
+        f = futs[k] if k < len(futs) else None
+        if f is not None and f in done:
             try:
                 res = f.result()
             except Exception as exc:                    # noqa: BLE001 — judge_draft 本不抛, 兜底
                 res = judge_client.result(judge_client.JUDGE_ERROR,
                                           detail=f"{type(exc).__name__}: {exc}")
+        elif f is None:
+            res = judge_client.result(
+                judge_client.JUDGE_TIMEOUT,
+                detail=f"查库用完了整批判定的共同截止 {budget:g}s, 没来得及发")
         else:
             res = judge_client.result(
-                judge_client.JUDGE_TIMEOUT, elapsed_ms=int(budget * 1000),
+                judge_client.JUDGE_TIMEOUT, elapsed_ms=_ms_since(started),
                 detail=f"整批判定的共同截止 {budget:g}s 到了还没回来(或排队没轮到)")
         rows.append(_judge_row(t, res))
+    rows.sort(key=lambda r: r["index"])
     return _judge_block(rows, skipped, project=ctx["project"], category=ctx["category"])
 
 
@@ -1687,7 +1812,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         logger.exception("commit_drafts: 入库判定整体失败(project=%s) —— 入库不受影响",
                          project_id)
         out["judge"] = _judge_block(
-            [], [], error=f"判定这一步整体失败({type(exc).__name__}: {exc}), 入库不受影响"[:300])
+            [], [], error=f"判定这一步整体失败({type(exc).__name__}: {exc}), 入库不受影响")
     judge_ms = _ms_since(judge_started)
 
     # 「commit_drafts 现在约 1~2 秒」在仓库里没有依据(设计审查 §5)—— 先量, 攒样本再定

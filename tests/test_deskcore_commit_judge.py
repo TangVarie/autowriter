@@ -13,6 +13,15 @@
   4. **影子期**: 判定怎么失败, commit 的结果都一个字不变。
 
 外加覆盖面(§4 #1): 补录路径(ingest_published)不判。
+
+codex review on #92 又补了三条:
+
+  · (P1) 调用方自带的 version_id 发之前要按本项目核一遍: 过期的 UUID 会在账本里留下孤儿
+    答案, 别的项目的 UUID 会把这篇的判定记到那个项目的版本名下;
+  · (P2) 发之前的查库(tv_project_map / truth_vault 品类 / 归属)也算进那个共同截止 ——
+    PostgREST 默认超时 120 秒, 卡一下就能让一次已经入库的 commit 远远超过 8 秒;
+  · (P2) 查品类时不许把 ``schema()`` 回来的 client 的 session 关掉: 有的 supabase-py
+    版本里那就是父 client 自己的 session, 紧接着的 batch_metrics 就写不进去了。
 """
 
 from __future__ import annotations
@@ -33,7 +42,10 @@ from tests.fakes import FakeClient
 
 ME = "11111111-1111-1111-1111-111111111111"
 PROJ = "aaaaaaaa-0000-0000-0000-000000000001"
-CALLER_VID = "cccccccc-0000-0000-0000-00000000000c"
+CALLER_VID = "cccccccc-0000-0000-0000-00000000000c"      # 本项目里本来就有的一版(UI 生成)
+OTHER_PROJ = "bbbbbbbb-0000-0000-0000-000000000002"
+OTHER_VID = "dddddddd-0000-0000-0000-00000000000d"       # 别的项目的一版
+STALE_VID = "eeeeeeee-0000-0000-0000-00000000000e"       # 库里没有这一版(过期 / 抄错)
 
 BODY_A = ("今天下班路上想到一件事, 留学生秋招最费时间的其实不是投简历, "
           "而是等一个根本不会来的回音, 等到后来连刷新邮箱都成了一种自我安慰。") * 3
@@ -79,8 +91,21 @@ class _TVClient(FakeClient):
         return self._tv
 
 
-def _client(*, maps=None, tv_projects=None) -> _TVClient:
-    c = _TVClient(
+def _seed_version(c, vid: str, project_id: str) -> None:
+    """库里本来就有的一版(UI 生成的稿): batches → items → versions。假库没有真 join,
+    ``items_for_versions`` 的 ``items!inner → batches!inner`` 靠这里把嵌套摆好。"""
+    bid, iid = f"batch-{vid[:8]}", f"item-{vid[:8]}"
+    c.rows.setdefault("batches", []).append({"id": bid, "project_id": project_id})
+    c.rows.setdefault("items", []).append({"id": iid, "batch_id": bid, "status": "pending",
+                                           "decision_source": None})
+    c.rows.setdefault("versions", []).append({
+        "id": vid, "item_id": iid, "version_num": 1, "title": "UI 生成的那版", "body": "",
+        "items": {"id": iid, "status": "pending", "decision_source": None, "batch_id": bid,
+                  "batches": {"project_id": project_id}}})
+
+
+def _client(*, maps=None, tv_projects=None, cls=None) -> _TVClient:
+    c = (cls or _TVClient)(
         rows={"projects": [{"id": PROJ, "name": "途鸽", "brand": "途鸽", "owner_id": ME,
                             "calibration_notes": "", "tactics": "[]", "custom_roles": []}],
               "tv_project_map": list(maps if maps is not None else [
@@ -88,6 +113,8 @@ def _client(*, maps=None, tv_projects=None) -> _TVClient:
         tv_projects=tv_projects if tv_projects is not None else [
             {"project_id": "TUGE_phase1", "category": "教育"}])
     c.rpc_impl["deskcore_commit_fingerprints"] = _rpc_that_writes(c)
+    _seed_version(c, CALLER_VID, PROJ)
+    _seed_version(c, OTHER_VID, OTHER_PROJ)
     return c
 
 
@@ -134,13 +161,14 @@ def judge_on(monkeypatch):
     monkeypatch.setattr(config, "JUDGE_URL", "https://judge.example.invalid")
     monkeypatch.setattr(config, "JUDGE_API_KEY", "jk")
     monkeypatch.setattr(config, "JUDGE_TIMEOUT_SEC", 5.0)
-    rec = {"payloads": [], "reply": lambda p: judge_client.result(
+    rec = {"payloads": [], "timeouts": [], "reply": lambda p: judge_client.result(
         judge_client.JUDGE_OK, http_status=200, passed=True, calls=2, written=20)}
     lock = threading.Lock()
 
     def fake(payload, *, timeout=None):
         with lock:
             rec["payloads"].append(payload)
+            rec["timeouts"].append(timeout)
         return rec["reply"](payload)
     monkeypatch.setattr(judge_client, "judge_draft", fake)
     return rec
@@ -284,6 +312,75 @@ def test_a_replacement_that_did_not_attach_is_skipped(judge_on, monkeypatch):
     assert out["judge"]["skipped"][0]["reason"] == "replace_failed"
 
 
+def test_caller_supplied_ids_that_are_not_this_projects_are_never_sent(judge_on):
+    """codex review P1 on #92: 调用方自带的 version_id 发之前要按本项目核一遍。
+
+    judge 收到 write=true 就按 subject_id 写账本: 过期的 UUID 留下一组孤儿答案, 别的项目
+    的 UUID 把这篇的判定记到了那个项目的版本名下。这两种都不许发出去, 记进 skipped;
+    本项目的那一版照判, 而且发的是库里的规范写法(调用方写成大写 PG 照认, 账本按文本
+    JOIN 就对不上了)。入库照常 4 篇都进 —— 这是判定名单的事, 不是入库的事。"""
+    c = _client()
+    fresh = _distinct_drafts(1)[0]
+    out = core.commit_drafts(c, PROJ, [
+        {"title": "别的项目的那版", "body": BODY_A, "version_id": OTHER_VID},
+        {"title": "过期的 id", "body": BODY_B, "version_id": STALE_VID},
+        {"title": "本项目的, 写成大写", "body": BODY_C, "version_id": CALLER_VID.upper()},
+        fresh,
+    ], user_id=ME)
+    assert out["written"] == 4 and len(out["version_ids"]) == 1
+    minted = out["version_ids"][0]
+    sent = _subject_ids(judge_on)
+    assert OTHER_VID not in sent, "别的项目的版本被发去写账本了 —— 判定会记到那个项目名下"
+    assert STALE_VID not in sent, "库里没有的版本被发去写账本了 —— 账本里多一组孤儿答案"
+    assert sent == sorted([CALLER_VID, minted]), sent
+    j = out["judge"]
+    assert [(s["index"], s["reason"]) for s in j["skipped"]] == [
+        (0, core.JUDGE_SKIP_NOT_IN_PROJECT), (1, core.JUDGE_SKIP_NOT_IN_PROJECT)]
+    assert [(r["index"], r["version_id"]) for r in j["results"]] == [(2, CALLER_VID), (3, minted)]
+    assert j["summary"] == {"ok": 2}
+    m = c.rows["batch_metrics"][0]["meta"]
+    assert [s["reason"] for s in m["judge_skipped"]] == [core.JUDGE_SKIP_NOT_IN_PROJECT] * 2
+
+
+def test_the_ownership_lookup_only_sees_well_formed_uuids(judge_on, monkeypatch):
+    """不是 UUID 的不送进 IN 查询: versions.id 是 uuid 列, 一个坏值会让 PG 在解析阶段拒掉
+    整条查询, 连累同批的好 id(同 _is_uuid)。坏值本身记 version_not_in_project。
+    (真库里坏值在写指纹那一步就过不去 —— 这里钉的是判定这层自己不依赖那一步。)"""
+    seen: list[list[str]] = []
+    real = store.items_for_versions
+
+    def spy(sb, project_id, version_ids):
+        seen.append(list(version_ids))
+        return real(sb, project_id, version_ids)
+    monkeypatch.setattr(store, "items_for_versions", spy)
+    out = core.commit_drafts(_client(), PROJ, [
+        {"title": "坏 id", "body": BODY_A, "version_id": "not-a-uuid"},
+        {"title": "本项目的", "body": BODY_B, "version_id": CALLER_VID},
+    ], user_id=ME)
+    assert seen == [[CALLER_VID]], seen
+    assert _subject_ids(judge_on) == [CALLER_VID]
+    assert [(s["index"], s["reason"]) for s in out["judge"]["skipped"]] == [
+        (0, core.JUDGE_SKIP_NOT_IN_PROJECT)]
+
+
+def test_an_ownership_lookup_failure_holds_back_only_the_caller_supplied_ones(judge_on, monkeypatch):
+    """查不了归属 = 不知道是不是本项目的, 就不能拿它去写账本: 这几篇记 error、不发。
+    本次新建的 id 是这次调用自己在本项目里建的, 照发 —— 一次查询故障不该连累它们。"""
+    def boom(*a, **k):
+        raise RuntimeError("versions 查询 57014 canceling statement due to statement timeout")
+    monkeypatch.setattr(store, "items_for_versions", boom)
+    out = core.commit_drafts(_client(), PROJ, [
+        {"title": "UI 生成的那版", "body": BODY_A, "version_id": CALLER_VID},
+        {"title": "写作台新写的", "body": BODY_B},
+    ], user_id=ME)
+    assert out["written"] == 2
+    assert _subject_ids(judge_on) == out["version_ids"], "归属没核成的也发出去了"
+    by_index = {r["index"]: r for r in out["judge"]["results"]}
+    assert by_index[0]["judge_status"] == judge_client.JUDGE_ERROR
+    assert "57014" in by_index[0]["detail"] and "没发" in by_index[0]["detail"]
+    assert out["judge"]["summary"] == {"error": 1, "ok": 1}
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 3 · 项目号与品类(数据出境口径 docs/00 #7)
 # ══════════════════════════════════════════════════════════════════════
@@ -322,13 +419,117 @@ def test_category_lookup_failure_still_sends_the_project(judge_on):
     assert out["judge"]["summary"] == {"ok": 1}
 
 
+class _Session:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _SharedSessionClient(_TVClient):
+    """supabase 2.10 + postgrest 0.18 那种 ``schema()``(requirements.txt 的 ``>=2.0,<3.0``
+    放行它, 锁文件没钉在那里): 交回来的对象和父 client 用**同一个** HTTP session。
+    session 一关, 父 client 之后的每个请求都报 "client has been closed"。"""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.session = _Session()
+        parent = self
+
+        class _View:
+            session = parent.session
+
+            @staticmethod
+            def table(name):
+                parent._check_open()
+                return parent._tv.table(name)
+        self._view = _View()
+
+    def _check_open(self):
+        if self.session.closed:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+    def schema(self, name):
+        self.schema_calls.append(name)
+        return self._view
+
+    def table(self, name):
+        self._check_open()
+        return super().table(name)
+
+
+def test_the_category_lookup_leaves_the_parent_client_usable():
+    """codex review P2 on #92: 查完品类, 父 client 必须照常能用。
+
+    原来查完会关 ``schema()`` 回来的那个 client 的 session —— 在共享 session 的版本里
+    那就是父 client 自己的 session, 紧接着的 ``insert_commit_metrics`` 静默失败。"""
+    c = _client(cls=_SharedSessionClient)
+    assert store.tv_project_categories(c, ["TUGE_phase1"]) == {"TUGE_phase1": "教育"}
+    assert c.session.closed is False, "把父 client 共享的 session 关掉了"
+    store.insert_commit_metrics(c, project_id=PROJ, user_id=ME, phase_ms={"total": 1},
+                                counters={}, meta={"mode": "deskcore_commit"})
+    assert len(c.rows["batch_metrics"]) == 1
+
+
+def test_a_commit_still_records_its_metrics_after_the_category_lookup(judge_on):
+    """同一件事走整条 commit: 判定查完品类之后, batch_metrics 那一行还得落得下去。"""
+    c = _client(cls=_SharedSessionClient)
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    assert out["judge"]["category"] == "教育" and c.schema_calls == ["truth_vault"]
+    assert len(c.rows.get("batch_metrics") or []) == 1, "查完品类之后 batch_metrics 写不进去了"
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")   # postgrest 2.30 自己的 timeout/verify 参数告警
+def test_the_pinned_supabase_client_still_writes_to_autowriter_after_the_lookup(monkeypatch):
+    """用锁文件里那个**真的** supabase / postgrest 客户端(只把 HTTP 换成 MockTransport)。
+
+    实测 2.30 的 ``schema()`` 新建一个带自己 session 的 client, 所以关它原本不碍事 —— 这条
+    钉的是锁文件: 哪天 supabase 换到一个 ``schema()`` 共享 session、或者把父 client 的
+    profile 一并切到 truth_vault 的版本, 这里先红, 而不是生产上的 batch_metrics 静默丢数。"""
+    import httpx
+    import postgrest._sync.client as pg_sync
+    from supabase import create_client
+    from supabase.client import ClientOptions
+
+    seen: list[tuple] = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path,
+                     request.headers.get("accept-profile"),
+                     request.headers.get("content-profile")))
+        if request.method == "GET" and request.url.path.endswith("/projects"):
+            return httpx.Response(200, json=[{"project_id": "TUGE_phase1", "category": "教育"}])
+        return httpx.Response(201, json=[])
+
+    real_client = pg_sync.Client
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(pg_sync, "Client",
+                        lambda *a, **kw: real_client(*a, **{**kw, "transport": transport}))
+    sb = create_client("https://placeholder.supabase.co", "sb_secret_placeholder",
+                       options=ClientOptions(schema="autowriter"))
+
+    assert store.tv_project_categories(sb, ["TUGE_phase1"]) == {"TUGE_phase1": "教育"}
+    store.insert_commit_metrics(sb, project_id=PROJ, user_id=ME, phase_ms={}, counters={},
+                                meta={"mode": "deskcore_commit"})
+    assert seen[0][:3] == ("GET", "/rest/v1/projects", "truth_vault"), seen
+    assert seen[-1][0:2] == ("POST", "/rest/v1/batch_metrics"), seen
+    assert seen[-1][3] == "autowriter", "父 client 的写被切到了 truth_vault"
+    assert sb.postgrest.session.is_closed is False
+
+
 def test_no_tv_mapping_means_nothing_leaves_the_building(judge_on, monkeypatch):
     """没接 tv-map = 判不出项目号和品类。用写作台 UUID 凑一个的话, judge 认不出它、
-    只能按未清关跑通用层 —— 一个没接 tv-map 的处方药项目的草稿就这样发给了 Jev。"""
-    out = core.commit_drafts(_client(maps=[]), PROJ, [{"title": "甲", "body": BODY_A}],
-                             user_id=ME)
+    只能按未清关跑通用层 —— 一个没接 tv-map 的处方药项目的草稿就这样发给了 Jev。
+    反正一篇都不发, 自带 version_id 的归属也就不用查了。"""
+    monkeypatch.setattr(store, "items_for_versions",
+                        lambda *a, **k: pytest.fail("一篇都不发还去查了归属"))
+    out = core.commit_drafts(_client(maps=[]), PROJ, [
+        {"title": "甲", "body": BODY_A},
+        {"title": "UI 生成的那版", "body": BODY_B, "version_id": CALLER_VID}], user_id=ME)
     assert judge_on["payloads"] == []
     r = out["judge"]["results"][0]
+    assert out["judge"]["summary"] == {"not_configured": 2}
     assert r["judge_status"] == judge_client.JUDGE_NOT_CONFIGURED
     assert "tv-map add" in out["judge"]["detail"], "要把补救命令说出来, 而且整批只说一次"
     assert "detail" not in r, "每篇重复同一句话只会把返回值撑长"
@@ -339,8 +540,10 @@ def test_not_configured_sends_nothing_and_reads_nothing(monkeypatch):
     monkeypatch.setattr(config, "JUDGE_API_KEY", "")
     monkeypatch.setattr(requests, "post", lambda *a, **k: pytest.fail("没配置却发了请求"))
     monkeypatch.setattr(store, "tv_projects_of", lambda *a, **k: pytest.fail("没配置却去查了 tv-map"))
+    monkeypatch.setattr(store, "items_for_versions", lambda *a, **k: pytest.fail("没配置却去查了归属"))
     out = core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A},
-                                               {"title": "乙", "body": BODY_B}], user_id=ME)
+                                               {"title": "乙", "body": BODY_B,
+                                                "version_id": CALLER_VID}], user_id=ME)
     assert out["judge"]["summary"] == {"not_configured": 2}
     assert out["written"] == 2
     # 没接 judge 的部署每次 commit 都会带这一块, 行要短: 只有定位与结局
@@ -397,6 +600,64 @@ def test_queued_drafts_past_the_deadline_are_never_sent(judge_on, monkeypatch):
     time.sleep(1.0)                      # 让在飞的那两个跑完, 再数发出去了几个
     assert out["judge"]["summary"] == {"ok": 2, "timeout": 4}, out["judge"]["summary"]
     assert len(judge_on["payloads"]) == 4, "排队没轮到的也发出去了"
+
+
+@pytest.mark.parametrize("stalled", ["tv_projects_of", "tv_project_categories",
+                                     "items_for_versions"])
+def test_a_stalled_lookup_before_sending_is_inside_the_shared_deadline(judge_on, monkeypatch,
+                                                                      stalled):
+    """codex review P2 on #92: 发之前的三次查库(TV 项目号 / 跨 schema 的品类 / 自带
+    version_id 的归属)原来在截止之外、同步跑; PostgREST 默认超时 120 秒, 库那边卡一下,
+    一次已经入库成功的 commit 就挂着远远过了 8 秒。现在它们算进同一个截止: 到点整批记
+    timeout、一篇都不发, commit 照常返回; 卡住的那次查库事后回来了也不许再补发。"""
+    monkeypatch.setattr(config, "JUDGE_TIMEOUT_SEC", 1.0)
+    release = threading.Event()
+    real = getattr(store, stalled)
+
+    def stuck(*a, **k):
+        release.wait(10)
+        return real(*a, **k)
+    monkeypatch.setattr(store, stalled, stuck)
+
+    c = _client()
+    t0 = time.monotonic()
+    try:
+        out = core.commit_drafts(c, PROJ, [
+            {"title": "UI 生成的那版", "body": BODY_A, "version_id": CALLER_VID},
+            {"title": "写作台新写的", "body": BODY_B}], user_id=ME)
+        took = time.monotonic() - t0
+    finally:
+        release.set()
+    assert out["written"] == 2 and len(out["version_ids"]) == 1, "入库结果被判定拖坏了"
+    assert took < 3.0, f"commit 挂了 {took:.1f}s —— 查库没算进 1 秒的共同截止"
+    assert out["phase_ms"]["judge"] < 2000, out["phase_ms"]
+    j = out["judge"]
+    assert j["summary"] == {"timeout": 2}, j
+    assert "一篇都没发" in j["detail"]
+    time.sleep(0.3)                      # 卡住的查库回来之后, 也不许再把稿子发出去
+    assert judge_on["payloads"] == []
+    assert c.rows["batch_metrics"][0]["counters"]["judge_timeout"] == 2
+
+
+def test_the_judge_calls_only_get_what_the_lookups_left(judge_on, monkeypatch):
+    """查库花掉的时间从共同截止里扣: 截止 1 秒, 查库 0.6 秒, 判定只剩 ~0.4 秒 —— 一篇
+    要 0.6 秒的判定就该记 timeout, 而不是再拿满 1 秒(那样上界就成了 查库 + 截止)。"""
+    monkeypatch.setattr(config, "JUDGE_TIMEOUT_SEC", 1.0)
+    real = store.tv_projects_of
+
+    def slow(*a, **k):
+        time.sleep(0.6)
+        return real(*a, **k)
+    monkeypatch.setattr(store, "tv_projects_of", slow)
+
+    def reply(p):
+        time.sleep(0.6)
+        return judge_client.result(judge_client.JUDGE_OK, passed=True)
+    judge_on["reply"] = reply
+    out = core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    assert out["judge"]["summary"] == {"timeout": 1}, out["judge"]
+    assert out["phase_ms"]["judge"] < 1600, out["phase_ms"]
+    assert 0 < judge_on["timeouts"][0] <= 0.45, judge_on["timeouts"]
 
 
 def test_elapsed_ms_and_phases_are_reported(judge_on):
@@ -484,6 +745,35 @@ def test_a_metrics_row_records_timing_and_judge_outcomes(judge_on):
     assert m["counters"]["judge_ok"] == 1 and m["counters"]["judge_skipped"] == 1
     assert [j["status"] for j in m["meta"]["judge"]] == ["ok"]
     assert m["meta"]["judge_skipped"] == [{"index": 1, "reason": "empty_body"}]
+
+
+def test_a_judge_error_body_that_echoes_the_key_is_masked_everywhere(monkeypatch, capsys):
+    """codex review P2 on #92: JUDGE_API_KEY 是自定义格式, 形态正则认不出来; judge_client
+    又会把 judge 回的错误体抄进 detail —— 那个 detail 一路进返回值、遥测和 batch_metrics。
+    key 必须登记进值级脱敏(同 LIBRARIAN_API_KEY), 三处都不许出现原文。"""
+    import logger_utils
+    key = "jdg_live_7Hq2VnX9pLw4Rt8Kz3Mb"            # 不是 sk- / eyJ / AIza…: 只能按值认
+    monkeypatch.setattr(config, "JUDGE_URL", "https://judge.example.invalid")
+    monkeypatch.setattr(config, "JUDGE_API_KEY", key)
+    monkeypatch.setattr(logger_utils, "_VALUE_SECRETS", None)   # 值级名单是懒加载一次的
+
+    class _Echo:
+        status_code = 401
+
+        @staticmethod
+        def json():
+            return {"detail": f"X-Judge-Key 不对: 收到 {key}"}
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Echo())
+
+    c = _client()
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    r = out["judge"]["results"][0]
+    assert r["judge_status"] == judge_client.JUDGE_UNAVAILABLE and r["http_status"] == 401
+    assert key not in r["detail"] and "REDACTED" in r["detail"], r["detail"]
+    assert key not in str(c.rows["batch_metrics"]), "key 原文落进了 batch_metrics"
+    printed = capsys.readouterr().out
+    assert "judge_draft_result" in printed, "遥测那行没打出来 —— 这条用例就空跑了"
+    assert key not in printed, "key 原文进了遥测日志"
 
 
 def test_a_metrics_failure_does_not_fail_the_commit(judge_on, monkeypatch):

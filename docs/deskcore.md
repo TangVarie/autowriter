@@ -444,6 +444,7 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 |---|---|
 | 新稿、身份建成（`version_ids` 里的） | 判 |
 | 调用方自带 `version_id`（UI 生成的稿，库里本来就有那一版） | **判**。⚠️ 它们**不在** `version_ids` 里（那里只报这次新建的），照 `version_ids` 判会整批漏掉 |
+| 调用方自带的 `version_id` 不是本项目的版本（库里没有 / 别的项目的 / 不是 UUID） | 跳过（`version_not_in_project`）。发之前按本项目核一遍（`store.items_for_versions`，与核 `replaces_version_id` 同一个查询）：`write = true` 会按 subject_id 写账本，过期的 id 留下孤儿答案，别的项目的 id 把这篇的判定记到那个项目名下（codex review P1 on #92）。发的是库里的规范写法。归属查询本身失败的这几篇不发、记 `error`，本次新建的照发 |
 | 改稿替换、新版挂上了旧 item | 判，用新版的 id |
 | `identity_error`：指纹入了库、versions 没建成 | 跳过（`skipped.reason = identity_error`） |
 | 替换没挂上（`replace_warning`） | 跳过（`replace_failed`） |
@@ -461,7 +462,10 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 - `category` = `truth_vault.projects.category`（TV 的受控词表：处方药 / OTC药 / 保健品 / …），经
   PostgREST 的 `schema("truth_vault")` 读（本仓第一处这么读 TV 的地方，前提是 TV 的 Exposed schemas 与
   service_role 表级 GRANT，见 `store.tv_project_categories`）。几个映射里只要有一个是处方药就报处方药
-  （出境上宁严勿松）。读不到就只发 `project`，不影响判定。
+  （出境上宁严勿松）。读不到就只发 `project`，不影响判定。⚠️ 查完**不关** `schema()` 回来的那个 client：
+  锁文件的 supabase 2.30 里它自带 session，关不关都不碍事；但 `requirements.txt` 放行的老 2.x（如 2.10 +
+  postgrest 0.18）里它就是父 client 自己，关掉就是关掉父 client 的连接，紧接着的 `batch_metrics` 静默写不进去
+  （codex review P2 on #92）。连接的生命周期归持有它的一方。
 
 不带 `brief`：写作台的规则是自由文本，编不成闭集题（那要模型）；未清关项目的项目层本来也会被 judge 按
 出境口径丢掉。请求体其余几项：`judge_paras = "never"`（不判段，一篇的调用次数压到最少才放得进 8 秒）、
@@ -473,7 +477,7 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 |---|---|---|
 | `ok` | 200 | — `passed` 是判定结论，影子期不拿它拦任何东西 |
 | `not_configured` | 没配 `JUDGE_URL` / `JUDGE_API_KEY`；或项目没接 tv-map | 部署 / `tv-map add` |
-| `timeout` | 连接或读超时，或整批的共同截止到了。⚠️ judge 那边可能照样判完写了账本，只是写作台没等到 | 攒多了看 p95 |
+| `timeout` | 连接或读超时，或整批的共同截止到了（含发之前的查库没在截止内查完，那时一篇都没发，`judge.detail` 会说）。⚠️ judge 那边可能照样判完写了账本，只是写作台没等到 | 攒多了看 p95 |
 | `policy_blocked` | 403 且 detail 以 `policy:` 开头 | 不用，**永不重试**（合同确认之后是 judge 那边的配置） |
 | `bad_request` | 422 | 是写作台这边的 bug，**永不重试** |
 | `unavailable` | 401 / 503 / 404 / 连不上 | 部署或配置 |
@@ -482,7 +486,11 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 
 **延迟。**「`commit_drafts` 现在约 1–2 秒」「一批 10 篇并行也是一两秒」在仓库里都没有依据，8 秒也没有。
 所以：多篇**并行**发（`JUDGE_MAX_WORKERS`，默认 8），**整批共用一个截止**（`JUDGE_TIMEOUT_SEC`，默认 8，
-夹在 1–15），到点没回的记 `timeout`、还在排队的直接取消（不会再发出去），不会串成 N × 8 秒。上界是 MCP
+夹在 1–15；`nan` / `inf` 与写坏的一样退回默认值），到点没回的记 `timeout`、还在排队的直接取消（不会再发
+出去），不会串成 N × 8 秒。**截止从发之前的查库就开始算**：`tv_project_map`、跨 schema 的品类、自带
+`version_id` 的归属这三次查库在工作线程里跑、算进同一个截止（PostgREST 客户端默认超时 120 秒，原来它们在
+截止之外同步查，库一卡，一次已经入库成功的 commit 就挂着远远过了 8 秒——codex review P2 on #92）。到点没查完
+就整批记 `timeout`、一篇都不发，commit 照常返回；查完了，判定只拿剩下的时间。上界是 MCP
 客户端实测能容忍的 ~22 秒（`config.py` 里 `LIBRARIAN_TIMEOUT_SEC` 那段，D-074）。返回值带 `elapsed_ms` 与
 `phase_ms = {lock_wait, commit, judge, total}`（`lock_wait` 单列：补录正在跑时入库要等锁，不拆开会把分位数
 带歪），**同一份数落进 `batch_metrics`**——它本来就是「每批一行的指标快照」（phase_ms / counters / meta 三个
@@ -548,9 +556,9 @@ env：
 | `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<uuid>", "name": "Ziao"}}`，一人一把 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN |
-| `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
-| `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了退回默认）。**整批判定的共同截止**，不是每篇各 8 秒 |
-| `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16。一次 commit 同时发几篇 |
+| `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里；它是自定义格式，登记在 `logger_utils` 的值级脱敏名单里（judge 的错误体会被抄进 detail / 遥测 / `batch_metrics`）。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
+| `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了、`nan` / `inf` 都退回默认）。**整批判定的共同截止**，不是每篇各 8 秒 |
+| `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16（同上，写坏了退回默认）。一次 commit 同时发几篇 |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
 

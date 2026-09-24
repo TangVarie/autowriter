@@ -82,6 +82,9 @@ SUBJECT_TYPE = "aw_version"
 _CONNECT_TIMEOUT_CAP_SEC = 3.0
 
 _DETAIL_MAX = 300
+# 错误体原文先留长一些再交给 result(): 脱敏要在**截断之前**做。原来这里先截到 300 再脱敏,
+# key 恰好跨在第 300 个字上时只剩半截, 值级脱敏认不出半截, 那半截就原样留在 detail 里。
+_RAW_DETAIL_MAX = 4 * _DETAIL_MAX
 
 
 def configured() -> bool:
@@ -134,15 +137,19 @@ def result(status: str, *, detail: str = "", http_status: Optional[int] = None,
 
 
 def _error_detail(resp) -> str:
-    """FastAPI 的错误体是 ``{"detail": "..."}``; 拿不到就退回原文。"""
+    """FastAPI 的错误体是 ``{"detail": "..."}``; 拿不到就退回原文。
+
+    只截到 ``_RAW_DETAIL_MAX``(防一整页 HTML), 脱敏与截到 ``_DETAIL_MAX`` 都在 ``result()`` 里、
+    按先脱敏后截断的顺序做。
+    """
     try:
         body = resp.json()
     except Exception:                                  # noqa: BLE001
-        return (getattr(resp, "text", "") or "")[:_DETAIL_MAX]
+        return (getattr(resp, "text", "") or "")[:_RAW_DETAIL_MAX]
     if isinstance(body, dict) and "detail" in body:
         d = body["detail"]
-        return d if isinstance(d, str) else str(d)
-    return str(body)
+        return (d if isinstance(d, str) else str(d))[:_RAW_DETAIL_MAX]
+    return str(body)[:_RAW_DETAIL_MAX]
 
 
 def _status_for_http_error(code: int, detail: str) -> str:

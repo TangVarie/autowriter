@@ -4,6 +4,7 @@ Loads settings from environment variables, with fallback to st.secrets
 when running on Streamlit Cloud.
 """
 
+import math
 import os
 
 
@@ -134,11 +135,19 @@ def _bounded_number(key: str, default: float, lo: float, hi: float) -> float:
     ⚠️ 不直接 ``float(...)``: config 是模块级求值, 一个手滑写成 ``8s`` 的值会让
     import 当场抛 ValueError —— deskcore / worker / Streamlit 三个进程一起起不来,
     而那只是一个增强项的超时。增强项的配置错了, 该退回默认值, 不该拖垮主服务。
+
+    ⚠️ ``nan`` / ``inf`` 也算写坏(codex review P2 on #92)。``float("nan")`` 不抛, 而且
+    **夹不住**: 跟 NaN 比大小一律是 False, ``max(nan, lo)`` 原样回 nan, ``min`` 同理 ——
+    于是 ``JUDGE_MAX_WORKERS=NaN`` 走到下面的 ``int(nan)`` 在 import 时抛 ValueError(上面
+    那条要防的正是这个), ``JUDGE_TIMEOUT_SEC=NaN`` 则一路变成 requests 的超时和线程池的
+    截止。``inf`` 虽然会被夹到上限, 但没人会有意写 inf, 那是手滑, 同样退回默认值。
     """
     raw = _get_secret(key)
     try:
         val = float(raw) if raw else default
     except ValueError:
+        return default
+    if not math.isfinite(val):
         return default
     return min(max(val, lo), hi)
 
