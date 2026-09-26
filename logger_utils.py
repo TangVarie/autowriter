@@ -34,10 +34,15 @@ _SECRET_PATTERNS: tuple[re.Pattern, ...] = (
 )
 
 
-# R-040: 值级脱敏。LIBRARIAN_API_KEY(TV 侧自定义格式)、飞书 webhook token
-# 段等没有可识别前缀, 形态正则抓不住 —— 一旦异常文本带上它们, 上面的模式集
+# R-040: 值级脱敏。LIBRARIAN_API_KEY / JUDGE_API_KEY(自定义格式)、飞书 webhook
+# token 段等没有可识别前缀, 形态正则抓不住 —— 一旦异常文本带上它们, 上面的模式集
 # 全部漏网。这里按"已知 secret 的具体值"做替换: 从 config 懒加载一次(config
-# 仅依赖 os, 无循环导入; 失败静默, 本模块保持可独立 import)。
+# 只依赖标准库, 无循环导入; 失败静默, 本模块保持可独立 import)。
+#
+# ⚠️ 新加一个自定义格式的 key 就要登记到下面的名单里, 否则它只是"没被形态正则认出来"
+#    —— 不报错、不告警, 直接原样进日志。JUDGE_API_KEY 就是这么漏过一次的(codex
+#    review P2 on #92): judge_client 会把 judge 回的错误体抄进 detail, 而 detail 一路
+#    进返回值、遥测和 batch_metrics。
 _VALUE_SECRETS: tuple[str, ...] | None = None
 
 
@@ -50,6 +55,7 @@ def _load_value_secrets() -> tuple[str, ...]:
         import config as _cfg
         for name in (
             "LIBRARIAN_API_KEY",
+            "JUDGE_API_KEY",
             "SUPABASE_SERVICE_ROLE_KEY",
             "ANTHROPIC_API_KEY",
             "GOOGLE_API_KEY",

@@ -1809,6 +1809,87 @@ def tv_map_upsert(sb, tv_project_id: str, project_id: str, *,
         on_conflict="tv_project_id,project_id").execute()
 
 
+def tv_projects_of(sb, project_id: str) -> list[dict]:
+    """这个写作台项目对着哪几个 TV 项目(``tv_project_map``, migrations/009)。
+
+    入库判定(core._judge_project_context)用: judge 的数据出境口径按 **TV 的项目号**
+    (``SPX_phase1`` 这种)走, 写作台自己的 UUID 在 TV 那边认不出来。异常原样上抛,
+    由调用方决定怎么记。
+    """
+    return list((sb.table("tv_project_map")
+                 .select("tv_project_id, project_id, ingest_target")
+                 .eq("project_id", project_id).execute()).data or [])
+
+
+def tv_project_categories(sb, tv_project_ids: list[str]) -> dict[str, str]:
+    """TV 项目号 → 品类(``truth_vault.projects.category``, TV 的受控词表)。
+
+    读不到就回 ``{}``、**不抛**: 品类只是给 judge 的附加信息(出境口径以项目号为准,
+    judge 自己也认得项目), 拿不到就只发项目号。
+
+    ⚠️ 这是本仓第一处直接经 PostgREST 读 ``truth_vault`` 的地方(009 读笔记走的是
+    SECURITY DEFINER 的 RPC)。能这么读的前提有两条, 都是 TV 那边的现状、不是本仓能保证的:
+    Supabase 的 Exposed schemas 里有 ``truth_vault``(TV 的脚本全靠它), 以及 TV
+    ``notes_v1_2.sql`` 给 service_role 发的表级 GRANT。任何一条不在, 这里安静地回 ``{}``
+    并记一行 WARN —— 判定照常, 只是少了品类。
+
+    ⚠️ ``schema()`` 交回来的那个 client 用完【不关】(codex review P2 on #92)。它是谁的、
+    关了会连累谁, 由 supabase-py / postgrest-py 的版本决定, 不由本函数决定:
+
+      · 锁文件钉的 supabase 2.30 / postgrest 2.30(实测): ``schema()`` 每次新建一个
+        SyncPostgrestClient, 带**自己的** httpx.Client, 关它不碍父 client 的事;
+      · 但 requirements.txt 放行的 ``supabase>=2.0,<3.0`` 里还有另一种: supabase 2.10 +
+        postgrest 0.18 的 ``schema()`` 是把父 client 自己那个 postgrest 的 profile 头改掉、
+        再把**它本身**交回来 —— 同一个对象、同一个 session。在那里关 ``pg.session`` 就是关掉
+        父 client 的连接: 紧接着的 ``insert_commit_metrics``(以及之后任何 ``sb.table(...)``)
+        全部失败, 而那一步的异常是被吞掉的, 指标就这样静默丢了。
+
+    所以连接的生命周期留给持有它的一方。2.30 下这个一次性 client 随函数返回不再有人引用,
+    由 GC 回收(socket 回收时关闭) —— 与 ``core.sb()`` 每次工具调用新建、同样从不显式关的
+    service client 是同一种生命周期, 不比现状多漏。⚠️ 那种老版本里 ``schema()`` 还会把父
+    client 之后的查询**都切到 truth_vault**, 不关也救不回来; 锁文件不许退回那里 ——
+    ``tests/test_deskcore_commit_judge.py`` 用真的 supabase 客户端钉着「查完品类, 父 client
+    照常能往 autowriter 写」。
+    """
+    ids = sorted({str(t) for t in tv_project_ids if t})
+    if not ids or not callable(getattr(sb, "schema", None)):
+        return {}
+    try:
+        rows = (sb.schema("truth_vault").table("projects").select("project_id, category")
+                .in_("project_id", ids).execute()).data or []
+    except Exception as exc:                           # noqa: BLE001 — 附加信息, 读不到就不带
+        logger.warning("tv project category lookup failed (%s): %s",
+                       ids, f"{type(exc).__name__}: {exc}"[:200])
+        return {}
+    return {str(r["project_id"]): str(r["category"]) for r in rows
+            if isinstance(r, dict) and r.get("project_id") and r.get("category")}
+
+
+def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
+                          counters: dict, meta: dict) -> None:
+    """一次 commit_drafts 的耗时与判定结局, 落一行 ``batch_metrics``。
+
+    为什么是这张表、不新加迁移: 它本来就是「每批一行的指标快照」(phase_ms / counters /
+    meta 三个 jsonb), 历史页就是从它查"哪一批慢"。一次 commit 就是一次交付, 同一个形状。
+    用 ``meta.mode = 'deskcore_commit'`` 与 Streamlit 生成那两种(queue / quick)分开。
+
+    ⚠️ ``batch_id`` 刻意留 NULL(本次建出的 batch 记在 ``meta.batch_id``): 历史页按
+    batch_id 把指标挂到批次上, 挂上去会给写作台的批次显示一块 setup/llm/db_save 全是 0
+    的"性能指标", 那是误导。``batch_id`` 列本来就可空。
+
+    异常原样上抛 —— 调用方(core)自己吞, 并保证它不影响入库结果。
+    """
+    sb.table("batch_metrics").insert({
+        "batch_id": None,
+        "project_id": project_id,
+        "user_id": user_id,
+        "phase_ms": phase_ms or {},
+        "counters": counters or {},
+        "meta": meta or {},
+        "injection": {},
+    }).execute()
+
+
 def tv_notes(sb, tv_project_id: str, *, since: str | None = None,
              page: int = TV_NOTES_PAGE) -> list[dict]:
     """TV 的笔记, keyset 翻页(PostgREST 的 db-max-rows 对 RPC 同样生效)。"""

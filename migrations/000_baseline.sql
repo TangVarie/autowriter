@@ -1508,3 +1508,83 @@ GRANT EXECUTE ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) TO serv
 ALTER TABLE autowriter.tv_project_map ENABLE ROW LEVEL SECURITY;
 ALTER TABLE autowriter.tv_note_links  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE autowriter.ingest_locks   ENABLE ROW LEVEL SECURITY;
+
+-- ══════════════════════════════════════════════════════════════════════
+-- 发牌台账接上结果: autowriter.v_angle_outcomes (migrations/011_angle_outcomes_view.sql)
+-- 为什么、权限为什么非得「属主建 + 显式 GRANT」见 011 的文件头。下面的 DO 块与 011
+-- 逐字相同(tests/test_angle_outcomes_view.py 守着)。新库多半还没有 truth_vault ——
+-- 那时它只打一行 NOTICE 跳过, TV 落库之后重跑 011 即可。
+-- ══════════════════════════════════════════════════════════════════════
+DO $v011$
+DECLARE
+    _blind TEXT;
+BEGIN
+    IF to_regclass('autowriter.angle_ledger') IS NULL
+       OR to_regclass('autowriter.tv_note_links') IS NULL THEN
+        RAISE EXCEPTION '011: 缺 autowriter.angle_ledger(001)或 autowriter.tv_note_links(009) —— 先按编号跑完前面的迁移';
+    END IF;
+    IF to_regclass('truth_vault.notes') IS NULL THEN
+        RAISE NOTICE '011: 库里没有 truth_vault.notes, 跳过 autowriter.v_angle_outcomes(本地 harness / 新库的正常形态); TV 落库之后重跑本文件即可';
+        RETURN;
+    END IF;
+
+    -- 以当前角色为属主建视图时, 哪几张底表会被 RLS 挡成空集。
+    -- 表属主(含继承其权限的成员)在没开 FORCE 时不受 RLS 约束; superuser / BYPASSRLS 全不受。
+    SELECT string_agg(c.oid::regclass::text, ', ' ORDER BY c.oid::regclass::text)
+      INTO _blind
+      FROM pg_catalog.pg_class c
+     WHERE c.oid IN ('autowriter.angle_ledger'::regclass,
+                     'autowriter.tv_note_links'::regclass,
+                     'truth_vault.notes'::regclass)
+       AND c.relrowsecurity
+       AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = current_user AND (r.rolsuper OR r.rolbypassrls))
+       AND NOT (pg_has_role(current_user, c.relowner, 'USAGE') AND NOT c.relforcerowsecurity);
+    IF _blind IS NOT NULL THEN
+        RAISE EXCEPTION '011: 当前角色 % 不是 % 的属主、也不能绕过 RLS —— 以它为属主建的 v_angle_outcomes 会永远查出 0 行且不报错。换底表属主(Supabase 上是 postgres, 即 SQL Editor / apply_migration 的默认身份)来跑', current_user, _blind;
+    END IF;
+
+    EXECUTE $view$
+        CREATE OR REPLACE VIEW autowriter.v_angle_outcomes
+        WITH (security_invoker = false) AS
+        SELECT a.id                  AS ledger_id,
+               a.project_id,
+               a.angle_key,
+               a.dims,
+               a.drawn_by,
+               a.drawn_at,
+               a.consumed_version_id,
+               a.consumed_at,
+               l.note_id,
+               l.tv_project_id,
+               l.match_kind,
+               l.lag_days,
+               n.tier,
+               n.publish_time
+          FROM autowriter.angle_ledger a
+          LEFT JOIN autowriter.tv_note_links l
+                 ON l.version_id = a.consumed_version_id
+                AND l.match_kind IN ('body_exact', 'title_exact', 'fuzzy', 'tv_lineage')
+          LEFT JOIN truth_vault.notes n
+                 ON n.note_id = l.note_id
+         WHERE a.consumed_version_id IS NOT NULL
+    $view$;
+
+    EXECUTE 'COMMENT ON VIEW autowriter.v_angle_outcomes IS '
+         || quote_literal('发牌台账 → 那一版 → TV 笔记 → tier(migrations/011)。只列用掉了的坐标; '
+                          '还没对上笔记的 note_id / tier 为 NULL。明细视图, 只授权给 service_role。');
+
+    -- 角色用 IF EXISTS 包着: Supabase 上三个都有, 裸 PostgreSQL(CI / 自托管)没有,
+    -- 直接 GRANT 会报 role does not exist(同 TV dashboard_views_v1.sql 的写法)。
+    REVOKE ALL ON autowriter.v_angle_outcomes FROM PUBLIC;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'anon') THEN
+        REVOKE ALL ON autowriter.v_angle_outcomes FROM anon;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON autowriter.v_angle_outcomes FROM authenticated;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'service_role') THEN
+        GRANT SELECT ON autowriter.v_angle_outcomes TO service_role;
+    END IF;
+END;
+$v011$;
