@@ -245,6 +245,45 @@ def test_partial_mint_reports_the_ones_that_made_it(monkeypatch):
     assert "batch-9" in w, "要告诉调用方已建成的那部分怎么导"
 
 
+def test_angles_of_unminted_drafts_are_not_consumed(monkeypatch):
+    """身份没建成的那条, 它的角度**不销账**(TV 审计 2026-10-08 B-20)。
+
+    销了的话 consumed_version_id 指向一个不存在的 versions 行 —— 和当年的假 UUID
+    一模一样: 台账说"这个角度产出了一篇", 而那一篇谁也找不到。留着不销, 坐标下一批
+    还能被抽到; 这次指纹已入库, 同题重写会被闸挡下来并说清楚 —— 看得见。
+    """
+    monkeypatch.setattr(
+        store, "mint_draft_identity",
+        lambda sb, pid, uid, tactic, entries: {
+            "batch_id": "batch-9",
+            "versions": {entries[0]["version_id"]: "item-1"},     # 只有第一条建成
+            "error": "RuntimeError: 第二条炸了"})
+    c = _client(angle_ledger=[
+        {"id": "led-1", "project_id": PROJ, "angle_key": "K1", "consumed_version_id": None, "consumed_at": None},
+        {"id": "led-2", "project_id": PROJ, "angle_key": "K2", "consumed_version_id": None, "consumed_at": None},
+    ])
+    out = _commit(c, [{**DRAFT, "angle_key": "K1"},
+                      {"title": "标题二", "body": "另一篇正文", "angle_key": "K2"}])
+    led = {r["angle_key"]: r for r in c.rows["angle_ledger"]}
+    assert led["K1"]["consumed_version_id"] == out["version_ids"][0], "建成的那条照常销账"
+    assert led["K2"]["consumed_version_id"] is None, (
+        f"身份没建成却销了账: {led['K2']['consumed_version_id']} 指不到任何 versions 行")
+    assert out["consumed_angles"] == 1
+    assert "angle_ledger_warning" not in out, "没销是故意的, 不该当成'台账里没这一行'报"
+    assert "没销账" in out["identity_warning"], out["identity_warning"]
+
+
+def test_caller_supplied_version_id_still_consumes_when_nothing_was_minted():
+    """UI 生成的稿子(自带 version_id)不走 mint, minted['versions'] 是空的 —— 它的角度照常销。"""
+    existing = "99999999-9999-9999-9999-999999999999"
+    c = _client(angle_ledger=[
+        {"id": "led-1", "project_id": PROJ, "angle_key": "K1", "consumed_version_id": None, "consumed_at": None},
+    ])
+    out = _commit(c, [{**DRAFT, "version_id": existing, "angle_key": "K1"}])
+    assert out["consumed_angles"] == 1
+    assert c.rows["angle_ledger"][0]["consumed_version_id"] == existing
+
+
 def test_a_failed_version_insert_leaves_no_orphan_item():
     """item 建完、version 没建成时, 那个 item 要被**收掉**。
 

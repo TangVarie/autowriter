@@ -1630,18 +1630,28 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
 
             consumed = 0
             attempted = 0
+            unminted_angles = 0      # 身份没建成、所以**没销账**的角度(见下面那段)
             for i, d in enumerate(drafts):
                 if i not in inserted_idx or i in replace:   # 替换: 旧版入库时已经销过
                     continue
                 key = d.get("angle_key")
                 if not key:
                     continue
-                attempted += 1
                 # 台账销账用**真的** version_id。以前这里塞的是一个按 angle_key 哈希出来的
                 # 假 UUID(见上面删掉的 _placeholder_version_id) —— consumed_version_id 非
                 # NULL 就够避重用了, 但那个 id 指不到任何一行, 没法回答"这个角度产出的那篇
                 # 后来怎么样了"。
                 vid = d.get("version_id") or minted_ids[i]
+                # 身份没建成的那几条(mint 半途失败)**不销账**(TV 审计 2026-10-08 B-20)。
+                # 销了的话 consumed_version_id 指向一个不存在的 versions 行 —— 和当年的
+                # 假 UUID 一模一样: 台账说"这个角度产出了一篇", 而那一篇谁也找不到, 回填 /
+                # 导出 / v_model_comparison 全 JOIN 不到。留着不销, 这个坐标下一批还能被
+                # 抽到、重写一次 —— 这次的指纹已经入库, 同题重写会被闸挡下来并说清楚, 那是
+                # 看得见的; 悬空的 id 是看不见的。调用方自带 version_id 的不受影响。
+                if not d.get("version_id") and vid not in (minted.get("versions") or {}):
+                    unminted_angles += 1
+                    continue
+                attempted += 1
                 # user_id 传下去: 同一坐标占坑过期后会被重新发牌, 台账里可能有两条
                 # 未消耗行, 销账要销自己那一条(codex review on #86)。
                 if store.consume_angle(client, project_id, key, vid, user_id=user_id):
@@ -1695,6 +1705,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     "(v_model_comparison 就 JOIN 在这个 id 上)。"
                     + (f"已建成的那 {done} 条照常可以 export_drafts(batch_id="
                        f"{out['batch_id']})。" if done else "")
+                    + (f"没建成的里 {unminted_angles} 条带着角度, 台账**没销账**(销了会指向"
+                       "不存在的版本), 那几个坐标下一批还会被抽到。" if unminted_angles else "")
                     + "服务端日志有堆栈。")
             if embed_failed and written:
                 # 配了 embedding 却没拿到向量 = 故障(欠费/配额/网络), 不是"没配"。
