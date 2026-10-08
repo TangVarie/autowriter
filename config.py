@@ -166,6 +166,15 @@ JUDGE_API_KEY: str = _get_secret("JUDGE_API_KEY")  # 发在 X-Judge-Key 头里
 # ⚠️ 8 秒同样没有实测分位数撑着 —— 等 batch_metrics 里 deskcore_commit 的 phase_ms.judge
 #    攒够样本再定(查法见 docs/deskcore.md §3.8)。
 JUDGE_TIMEOUT_SEC: float = _bounded_number("JUDGE_TIMEOUT_SEC", 8.0, 1.0, 15.0)
+# ── open_project 随简报借卡的预算(TV 2026-10-08 审计 A-04)──────────────────────
+# 借阅在 open_project 的必经同步路径上, 原来直接等满 LIBRARIAN_TIMEOUT_SEC(60 秒); 而 MCP
+# 客户端只容忍 ~22 秒 —— 超过就是**整份简报(含 P0 硬约束)一起丢**, 协议让模型停笔。
+# TV 侧 flywheel_librarian_cache.select_ms 实测: 09-22 冷借 13 次里 12 次 >22 秒、6 次 >60 秒;
+# 那之后写作台周产量 175 → 16 → 0。所以 open_project 里的借阅只等这么久: 到点就把简报先
+# 交出去(lessons_status.status=timeout), 借阅线程继续跑完、TV 那边照样写缓存, 模型想要卡
+# 时调 borrow_lessons 同参数命中缓存即回。borrow_lessons 工具本身仍等满 LIBRARIAN_TIMEOUT_SEC
+# (那是写手明确要卡时的等待, 不在必经路径上)。上限 20: 必须留在 ~22 秒客户端容忍之内。
+OPEN_PROJECT_BORROW_SEC: float = _bounded_number("OPEN_PROJECT_BORROW_SEC", 10.0, 1.0, 20.0)
 # 一次 commit 里最多同时发几篇。judge 那边 /judge_draft 一篇一请求、由 uvicorn 线程池并发;
 # Jev 限流 1,200 次/分。一篇 2~4 次 Jev 调用, 8 路并发 ≈ 每秒十来次, 离限流很远。
 JUDGE_MAX_WORKERS: int = int(_bounded_number("JUDGE_MAX_WORKERS", 8, 1, 16))

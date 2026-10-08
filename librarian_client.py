@@ -176,6 +176,24 @@ def fetch_flywheel_lessons(brief: dict, *,
         )
         return []
 
+    # ⚠️ 200 + selected=[] + status=degraded/error **不是** empty。馆员的契约(TV-06)在
+    # 响应里带 status: ok / no_match / degraded(LLM 或内部失败, 已降级回空) / error(应用层
+    # 崩溃)。前两个是结论, 后两个是故障 —— 一个配错的 FLYWHEEL_LIBRARIAN_MODEL、中转站
+    # 断了、cache_control 被拒, 馆员都回 200 + []。不看 status 的话这些全部变成 "empty",
+    # 写手听到的是"这个项目没有可借的经验", TV 的通道 2 交通灯(降级不写缓存行)则会把
+    # 锅甩给 autowriter(TV 2026-10-08 审计 B-04)。
+    tv_status = payload.get("status")
+    if isinstance(tv_status, str) and tv_status in ("degraded", "error"):
+        st["state"] = BORROW_ERROR
+        st["detail"] = (f"馆员回了 200 但 status={tv_status}: TV 侧选卡失败(模型 / 中转站 / 库), "
+                        "不是这次没匹配上")
+        telemetry.log_event(
+            "flywheel_librarian_degraded",
+            project_id=pid, state=st["state"], tv_status=tv_status,
+            elapsed_ms=st["elapsed_ms"],
+        )
+        return []
+
     lessons = payload["selected"]
     st["count"] = len(lessons)
     st["state"] = BORROW_BORROWED if lessons else BORROW_EMPTY

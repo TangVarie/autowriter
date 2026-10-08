@@ -324,8 +324,16 @@ def _tv_sync(core, sb, args) -> int:
         return 1
     rc = 0
     for tv in targets:
-        out = core.tv_sync(sb, tv, dry_run=args.dry_run, write_tv=args.write_tv,
-                           since=args.since, rematch=args.rematch)
+        try:
+            out = core.tv_sync(sb, tv, dry_run=args.dry_run, write_tv=args.write_tv,
+                               since=args.since, rematch=args.rematch)
+        except Exception as exc:                        # noqa: BLE001
+            # 一个 TV 项目炸了(锁 / 库 / 映射), 别让 --all 把后面的项目一起跳掉: 这是
+            # 每天只跑一次的 cron, 一个项目的错不该让其它项目当天一行对照都没有
+            # (TV 2026-10-08 审计 A-02)。记下来、退出码非零, 继续下一个。
+            print(f"\n{tv}: ❌ tv-sync 失败: {type(exc).__name__}: {exc}")
+            rc = 1
+            continue
         head = "[dry-run] " if args.dry_run else ""
         print(f"\n{head}{tv}: {out['note']}")
         print(f"  写作台版本 {out['versions']} 条(项目 {len(out['desk_projects'])} 个), "

@@ -1,12 +1,12 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
-  "//": "tv-sync 的每日 cron service(2026-09-17)。与 deskcore 主服务同一个仓、同一条分支, 另建一个 service 并把 config-as-code 指到本文件。UTC 04:00 = 北京 12:00: TV 的夜跑是 UTC 02:00(北京 10:00), 放在它后面当天的新笔记才对得上。变量用 Variable Reference 引 deskcore 主服务的 SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / GOOGLE_API_KEY(CLI 不用 SUPABASE_ANON_KEY)。跟 TV 打招呼之前先去掉 --write-tv(Settings → Deploy → Custom Start Command 覆盖即可)。",
+  "//": "tv-sync 的每日 cron service(2026-09-17)。与 deskcore 主服务同一个仓、同一条分支, 另建一个 service 并把 config-as-code 指到本文件。UTC 14:00 = 北京 22:00(2026-10-08 从 04:00 挪过来): TV 的夜跑 daily-sync 写的是 cron 02:17 UTC, 但 GitHub 定时实际起跑在 08:04–09:00 UTC、跑 45–55 分钟(10-01 ~ 10-08 八次 run 实测); 04:00 排在它【前面】, 每天对照的都是前一天的笔记。14:00 留了 4 小时余量, 也避开 features-sync(实际 16:45–20:48 UTC 起)。变量用 Variable Reference 引 deskcore 主服务的 SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / GOOGLE_API_KEY(CLI 不用 SUPABASE_ANON_KEY)。跟 TV 打招呼之前先去掉 --write-tv(Settings → Deploy → Custom Start Command 覆盖即可)。",
   "build": {
     "builder": "NIXPACKS",
     "buildCommand": "pip install -r requirements.lock -r deskcore/requirements.txt"
   },
   "deploy": {
-    "cronSchedule": "0 4 * * *",
+    "cronSchedule": "0 14 * * *",
     "startCommand": "python -m deskcore.cli tv-sync --all --write-tv",
     "restartPolicyType": "NEVER"
   }

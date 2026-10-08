@@ -47,7 +47,7 @@
 
 | 部件 | 实测结果 |
 |---|---|
-| `daily-sync` cron | 129 次 run，最近 20+ 次全绿，每天 02:00 UTC（北京 10:00）自动触发 |
+| `daily-sync` cron | 190+ 次 run，连续全绿；cron 写的是 02:17 UTC，但 GitHub 定时实际 **08:04–09:00 UTC 起跑**（北京 16–17 点），跑 45–55 分钟（2026-10-01 ~ 10-08 八次实测）——写作台回程 cron 要排在它后面 |
 | librarian 服务 | `https://truth-vault-production.up.railway.app/health` → `{"ok":true,"service":"flywheel-librarian"}` |
 | worker 服务 | `https://tv-worker-production.up.railway.app/health` → `ok`，`auth.ok=true`、`mode=X-Worker-Key` |
 | 数据 | `truth_vault.notes` 4,223 · 经验卡标注 347 · 馆员缓存 5 · `prepublish_evaluations` 598（全 human） |
@@ -207,13 +207,21 @@ python -m deskcore.cli tv-sync --all --write-tv    # 回填 source_autowriter_*(
 ```
 
 之后每天跑一次 `tv-sync --all --write-tv`。Railway 上另建一个 service（同仓同分支），config-as-code
-指到 `deskcore/railway.cron.json`（cron `0 4 * * *` = 北京 12:00，启动命令就是这条），变量用
+指到 `deskcore/railway.cron.json`（cron `0 14 * * *` = 北京 22:00，启动命令就是这条），变量用
 Variable Reference 引 deskcore 主服务的三个：`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` /
 `GOOGLE_API_KEY`（CLI 不读 `SUPABASE_ANON_KEY`，那是 Streamlit app 的）。增量：已对上的笔记跳过，
-`--rematch` 才重对。
+`--rematch` 才重对。一个 TV 项目抛错（锁没等到、库错）不影响 `--all` 里后面的项目，退出码非零；
+补录某一块抛错时前面已对上的对照照样写，没处理到的记 `unmatched` + 原因、明晚重来。
 
-**为什么是 UTC 04:00**：TV 的夜跑（飞书 → `truth_vault.notes`）是 UTC 02:00（北京 10:00），
-写作台的对照放在它后面，当天的新笔记才对得上。
+**为什么是 UTC 14:00（2026-10-08 从 04:00 挪过来）**：TV 的夜跑（飞书 → `truth_vault.notes`）
+cron 写的是 02:17 UTC，但 GitHub 定时实际 08:04–09:00 UTC 才起跑、跑 45–55 分钟；04:00 排在它
+**前面**，每天对照的都是前一天的笔记（TV 审计 A-05）。14:00 留了 4 小时余量，也避开
+features-sync（实际 16:45–20:48 UTC 起）。
+
+**补录副本不进对照索引（2026-10-08，TV 审计 A-02）**：`versions_for_linking` 跳过
+`batches.params.source = 'ingest'` 的版本。否则隔天另一条正文相同的笔记（SPX 的父记录继承让同一段
+正文出现在多条笔记上）会 `body_exact` 命中副本，`--write-tv` 把"来自 TV 的版本"写成它的来源——
+生产库查到 31 篇这样的血缘，TV 的模型对比视图把它们算成写作台产出。
 
 **`--write-tv` 的口径（TV 2026-09-18 核对后定的）**：只回写真对上的
 `body_exact` / `title_exact` / `fuzzy`（含 `tv_lineage`）；`ingested` 的**不写**——那些版本是从

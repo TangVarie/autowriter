@@ -368,7 +368,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # ⚠️ 这一段的失败**不能**影响简报: P0 已经拿到了, 卡借不到只是少点参考。
     # fetch_flywheel_lessons 本身绝不抛, 但 build_brief / 其它意外仍兜一层 ——
     # 兜住之后照样留痕(status.state=error + WARN 日志), 不吞成看似成功。
-    borrowed = _borrow_for_brief(project, brief)
+    borrowed = _borrow_for_brief_bounded(project, brief)
     out["lessons"] = borrowed["lessons"]
     out["lessons_status"] = {k: borrowed[k] for k in
                              ("status", "count", "elapsed_ms", "detail")}
@@ -3670,6 +3670,40 @@ def _borrow_for_brief(project: dict, delta: dict | None) -> dict:
             "detail": st.get("detail") or ""}
 
 
+def _borrow_for_brief_bounded(project: dict, delta: dict | None,
+                              budget: float | None = None) -> dict:
+    """``open_project`` 用的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但**只等
+    ``OPEN_PROJECT_BORROW_SEC``**(默认 10 秒), 到点先把简报交出去。
+
+    为什么要有这一层(TV 2026-10-08 审计 A-04): 借阅原来直接在 open_project 的同步路径上
+    等满 ``LIBRARIAN_TIMEOUT_SEC``(60 秒), 而 MCP 客户端只容忍 ~22 秒 —— 超过的不是"少几张
+    卡", 是**整份简报连 P0 硬约束一起丢**, 协议让模型停笔。TV 侧实测 09-22 冷借 13 次里
+    12 次超过 22 秒。馆员选卡要跑一次 LLM, 把 60 秒改小不行(test_librarian_timeout 钉着);
+    把等待从必经路径上拆出来才行。
+
+    到点之后借阅线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型稍后调 borrow_lessons
+    (同参数命中缓存即回)就拿得到。``detail`` 里写清这一点, 模型读得到。
+    """
+    budget = float(config.OPEN_PROJECT_BORROW_SEC if budget is None else budget)
+    ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
+    try:
+        fut = ex.submit(_borrow_for_brief, project, delta)
+        try:
+            return fut.result(timeout=budget)
+        except cf.TimeoutError:
+            logger.warning("flywheel borrow exceeded open_project budget %.1fs (project_id=%s); "
+                           "brief returned without cards, borrow thread left running",
+                           budget, project.get("id"))
+            return {"lessons": [], "count": 0,
+                    "status": librarian_client.BORROW_TIMEOUT,
+                    "elapsed_ms": int(budget * 1000),
+                    "detail": (f"open_project 的借阅预算 {budget:g}s 内馆员没回(选卡要跑一次 LLM, "
+                               "冷路径常要 30-80s)。TV 那边会继续选完并写缓存 —— 想要卡的话稍后"
+                               "调 borrow_lessons, 同样的选题/战术参数命中缓存即回")}
+    finally:
+        ex.shutdown(wait=False)
+
+
 def create_project(client, name: str, *, brand: str = "",
                    user_id: str | None = None) -> dict:
     """新建一个项目。owner **恒为调用者**, 不接受 owner 参数。
@@ -4029,14 +4063,26 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                   "skipped_already_fingerprinted": 0,
                   "skipped_duplicate_in_sheet": len(dup_of), "minted": 0, "fingerprinted": 0,
                   "batch_id": None, "batch_ids": [], "identity_error": None,
-                  "fingerprint_error": None, "embedded": False, "dry_run": dry_run,
-                  "written": [], "skipped_after_failure": 0}
+                  "fingerprint_error": None, "chunk_error": None, "embedded": False,
+                  "dry_run": dry_run, "written": [], "skipped_after_failure": 0}
         for start in range(0, len(uniq), TV_SYNC_INGEST_CHUNK):
             idxs = uniq[start:start + TV_SYNC_INGEST_CHUNK]
             entries = [{"title": to_ingest[i].title, "body": to_ingest[i].body} for i in idxs]
-            part = ingest_published(client, target["project_id"], entries,
-                                    user_id=owners[target["project_id"]],
-                                    source=f"tv:{tv_project_id}", dry_run=dry_run)
+            try:
+                part = ingest_published(client, target["project_id"], entries,
+                                        user_id=owners[target["project_id"]],
+                                        source=f"tv:{tv_project_id}", dry_run=dry_run)
+            except Exception as exc:                    # noqa: BLE001
+                # IngestBusy(锁没等到) / 库错: 这一块一条都没处理, 后面的块也别碰 ——
+                # 但**前面块的对照和这次真对上的笔记照样要写进 tv_note_links**, 否则一次
+                # 锁冲突就让整个 TV 项目当晚一行对照都没有、明天从头再来(TV 审计 A-02)。
+                # 没处理到的记成 unmatched + 原因, 明晚自然重来(unmatched 没 version_id,
+                # 不算 already_linked)。
+                logger.exception("tv_sync: 补录第 %d 块失败 (tv=%s), 后面的块不再补",
+                                 start // TV_SYNC_INGEST_CHUNK + 1, tv_project_id)
+                ingest["chunk_error"] = f"{type(exc).__name__}: {exc}"[:300]
+                ingest["skipped_after_failure"] = len(uniq) - start
+                break
             for k in ("to_write", "skipped_already_fingerprinted",
                       "skipped_duplicate_in_sheet", "minted", "fingerprinted"):
                 ingest[k] += part.get(k, 0)
@@ -4070,6 +4116,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             why = None
             if not vid and ingest.get("fingerprint_error"):
                 why = [{"note": "补录半途指纹写失败, 这条还没处理: 先 backfill, 再跑一次 tv-sync"}]
+            elif not vid and ingest.get("chunk_error"):
+                why = [{"note": "补录分块失败(" + ingest["chunk_error"][:80] + "), 这条还没处理: 下次 tv-sync 会再补"}]
             links.append(_link(n, "ingested" if vid else "unmatched",
                                project_id=target["project_id"], version_id=vid,
                                item_id=(item_of.get(vid) or {}).get("item_id") if vid else None,
