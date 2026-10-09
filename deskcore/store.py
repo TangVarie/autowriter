@@ -937,6 +937,45 @@ def check_drafts_sql(sb, project_id: str, rows: list[dict],
     return None
 
 
+def ingest_copy_counts(sb, project_ids: list[str]) -> dict[str, int]:
+    """每个项目里有多少 item 是从 TV 补录进来的副本(``batches.params.source == 'ingest'``)。
+
+    为什么要单独数 (TV 审计 2026-10-08 B-19): 补录副本 30 天 1,593 条, 比写作台真写的多。
+    ``list_projects`` 报的"历史成稿指纹数"把它们一起算了, 模型看到一个项目"有 1,800 条
+    积累"以为是写过的稿子, 其实大半是 TV 笔记的影子。这里不改那个数(它就是指纹数, 查重
+    口径下是对的), 只把副本数拿出来并排说。
+
+    两次固定查询(不随项目数增长): batches 按 project_id 批量拉(翻页) + item 计数走
+    ``db.get_batch_item_counts``(RPC, 没部署退回一次 in_ 查询)。查失败按 0 计 —— 这是清单上的
+    提示, 不该让 list_projects 挂掉。
+    """
+    if not project_ids:
+        return {}
+    out = {str(pid): 0 for pid in project_ids}
+    try:
+        batches = _paged(lambda off, lim: (
+            sb.table("batches").select("id, project_id, params")
+              .in_("project_id", list(project_ids))
+              .order("id")
+              .range(off, off + lim - 1)))
+    except Exception:
+        logger.exception("ingest copy counts: batches lookup failed")
+        return out
+    ingest = [b for b in batches if is_ingest_batch(b)]
+    if not ingest:
+        return out
+    try:
+        counts = db.get_batch_item_counts(sb, [b["id"] for b in ingest])
+    except Exception:
+        logger.exception("ingest copy counts: item counts failed")
+        return out
+    for b in ingest:
+        pid = str(b.get("project_id"))
+        if pid in out:
+            out[pid] += int((counts.get(b["id"]) or {}).get("total") or 0)
+    return out
+
+
 def fingerprint_counts(sb, project_ids: list[str]) -> dict[str, int] | None:
     """一次拿一批项目的指纹条数(审计 SUP-004)。RPC 不存在时返回 None。"""
     if not project_ids:
@@ -988,7 +1027,10 @@ def legacy_version_pages(sb, project_id: str, limit: int | None = 5000,
         return (sb.table("items")
                   .select("id, best_version_id, user_id, created_at, "
                           "versions(id, title, body, version_num, embedding), "
-                          "batches!inner(project_id)")
+                          # params 带上: 行里标出补录副本(TV 审计 B-19), 回填照常收它们
+                          # (副本也要指纹, 不然和它正文相同的 TV 笔记隔天又补一份), 只是
+                          # 核对 / 清单的数字要把"真写"和"副本"分开说。
+                          "batches!inner(project_id, params)")
                   .eq("batches.project_id", project_id)
                   .order("created_at", desc=True)
                   .order("id", desc=True)
@@ -1015,6 +1057,7 @@ def legacy_version_pages(sb, project_id: str, limit: int | None = 5000,
                     "title": title,
                     "body": body,
                     "embedding": db._parse_pgvector(chosen.get("embedding")),
+                    "ingest": is_ingest_batch(item.get("batches")),
                 })
             yield out
     except Exception:

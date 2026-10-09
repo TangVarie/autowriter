@@ -148,3 +148,69 @@ def test_tv_sync_all_continues_past_a_project_that_raises(monkeypatch, capsys):
     assert rc == 1, "有项目失败, 退出码要非零, 别假报绿"
     assert "AAA_phase1: ❌" in out and "IngestBusy" in out
     assert f"{TV}:" in out and "对上" in out, "好的项目照常出报表"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 4. 清单 / 核对 / 审核页把"真写"和"补录副本"分开说 (TV 审计 B-19)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_legacy_version_pages_marks_ingest_copies_but_keeps_them():
+    """回填照常收补录副本(它们也要指纹, 不然正文相同的 TV 笔记隔天又补一份), 只是行里标出来。"""
+    c = _client(NOTES)
+    _add_ingest_copy(c)
+    rows = {r["version_id"]: r for pg in store.legacy_version_pages(c, P1) for r in pg}
+    assert "v2" in rows, "副本不能从回填里消失"
+    assert rows["v2"]["ingest"] is True and rows["v1"]["ingest"] is False
+
+
+def test_backfill_gap_reports_how_many_eligible_are_ingest_copies():
+    c = _client(NOTES)
+    _add_ingest_copy(c)
+    c.rows.setdefault("draft_fingerprints", [])
+    gap = core.backfill_gap(c, P1)
+    assert gap["eligible"] >= 2 and gap["ingest_copies"] == 1, gap
+    # 反证: 不是补录的同一条 → 0
+    c.rows["items"][-1]["batches"] = {"project_id": P1, "params": {"source": "deskcore"}}
+    assert core.backfill_gap(c, P1)["ingest_copies"] == 0
+
+
+def test_list_projects_reports_ingest_copies_next_to_fingerprint_count():
+    """fingerprint_count 是查重基线(含副本); ingest_copies 说其中多少是副本 —— 模型别把
+    "1,800 条积累"读成"写过 1,800 篇"。"""
+    c = _client(NOTES)
+    _add_ingest_copy(c)
+    c.rows.setdefault("projects", [])
+    if not any(p.get("id") == P1 for p in c.rows["projects"]):
+        c.rows["projects"].append({"id": P1, "name": "p", "brand": "", "owner_id": ME})
+    c.rpc_impl["deskcore_fingerprint_counts"] = lambda a: [{"project_id": P1, "n": 7}]
+    got = {p["project_id"]: p for p in core.list_projects(c, user_id=ME)}
+    assert got[P1]["fingerprint_count"] == 7 and got[P1]["ingest_copies"] == 1, got[P1]
+    # 反证: 没有补录批次 → 0, 且 fingerprint_count 不变
+    c.rows["batches"] = [b for b in c.rows["batches"] if b["id"] != "b2"]
+    got2 = {p["project_id"]: p for p in core.list_projects(c, user_id=ME)}
+    assert got2[P1]["ingest_copies"] == 0 and got2[P1]["fingerprint_count"] == 7
+
+
+def test_review_page_labels_ingest_batches_with_the_one_predicate():
+    """app.py 是 Streamlit 脚本, import 就会跑页面(session_state 炸), 所以按源码钉:
+    批次标签和审核页都得经 ``_is_ingest_batch`` → ``deskcore.store.is_ingest_batch``, 不许另抄一份口径。"""
+    import ast
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    assert "_is_ingest_batch" in fns, "app.py 缺 _is_ingest_batch"
+    helper = ast.get_source_segment(src, fns["_is_ingest_batch"])
+    assert "from deskcore.store import is_ingest_batch" in helper, "口径只能来自 deskcore.store, 不许在 app.py 另抄"
+    label = ast.get_source_segment(src, fns["_format_batch_label"])
+    assert "_is_ingest_batch(batch)" in label and "补录副本" in label, "批次标签没标补录副本"
+    review = ast.get_source_segment(src, fns["page_review"])
+    assert "_is_ingest_batch(selected_batch)" in review and "不需要审核" in review, "审核页没对补录批次说明"
+    # 真跑一遍标签函数: 把它的源码单独编译, 不 import app
+    ns: dict = {"datetime": __import__("datetime").datetime, "timezone": __import__("datetime").timezone,
+                "_BEIJING_TZ": __import__("datetime").timezone(__import__("datetime").timedelta(hours=8))}
+    exec(helper + "\n" + label, ns)
+    assert ns["_format_batch_label"]({"tactic": "通用", "created_at": "2026-10-08T00:00:00+00:00",
+                                      "params": {"source": "ingest", "file": "tv:X"}}, "P").startswith("补录副本 · P")
+    assert not ns["_format_batch_label"]({"tactic": "通用", "created_at": "2026-10-08T00:00:00+00:00",
+                                          "params": {"source": "deskcore"}}, "P").startswith("补录副本")

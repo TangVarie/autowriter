@@ -255,6 +255,10 @@ def list_projects(_user_id: str | None = None) -> dict:
     返回 project_id / 名称 / 品牌 / 已沉淀的硬规则与软偏好条数 / 历史成稿指纹数。
     不知道要写哪个项目时先调这个。
 
+    ⚠️ fingerprint_count 是**查重基线**的条数, 含从 Truth Vault 补录进来的笔记副本
+    (ingest_copies 说明其中多少是副本)。一个项目 fingerprint_count=1800、ingest_copies=1500
+    的意思是"写作台真写过约 300 篇, 另有 1500 篇 TV 笔记在查重基线里", 不是写过 1800 篇。
+
     这里看不到的项目就是不归你 —— 不要去猜别人的 project_id 试, 其它工具会拒绝。
     """
     return _safe(lambda: {"projects": core.list_projects(core.sb(),

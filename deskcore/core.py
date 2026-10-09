@@ -3063,16 +3063,22 @@ def backfill_gap(client, project_id: str) -> dict:
     """
     done = store.existing_fingerprint_version_ids(client, project_id)
     eligible: set[str] = set()
+    ingest_copies = 0
     for page in store.legacy_version_pages(client, project_id, limit=None):
         for row in page:
             vid = row.get("version_id")
             if vid:
                 eligible.add(str(vid))
+                if row.get("ingest"):
+                    ingest_copies += 1
 
     todo = eligible - done
     out = {
         "project_id": project_id,
-        "eligible": len(eligible),         # backfill 口径下"应有"的条数
+        "eligible": len(eligible),         # backfill 口径下"应有"的条数(含补录副本: 它们也要指纹)
+        # 其中从 TV 补录进来的副本(TV 审计 B-19)。eligible 里它们占大头时, "这个项目有 N 条待回填"
+        # 读起来像写作台写了 N 篇 —— 不是。backfill 自己的 5000 上限也会被副本先吃掉。
+        "ingest_copies": ingest_copies,
         "backfilled": len(eligible & done),
         "todo": len(todo),
         # ⚠️ 真的去数一次行数。这里原来写的是 len(done) —— 而 done 来自
@@ -3831,6 +3837,9 @@ def list_projects(client, *, user_id: str | None = None) -> list[dict]:
             except Exception:
                 fp_counts[pid] = 0
 
+    # 补录副本数(TV 审计 B-19): 两次固定查询, 不随项目数增长(见 store.ingest_copy_counts)。
+    ingest_counts = store.ingest_copy_counts(client, pids)
+
     out = []
     for p in projects:
         pid = p["id"]
@@ -3838,7 +3847,10 @@ def list_projects(client, *, user_id: str | None = None) -> list[dict]:
         out.append({"project_id": pid, "name": p.get("name") or "",
                     "brand": p.get("brand") or "", "owner_id": p.get("owner_id"),
                     "hard_rules": hard_n, "soft_rules": soft_n,
-                    "fingerprint_count": int(fp_counts.get(pid, 0) or 0)})
+                    "fingerprint_count": int(fp_counts.get(pid, 0) or 0),
+                    # fingerprint_count 含补录副本(查重基线就该含); 这个数说明其中多少是副本,
+                    # 模型别把"1,800 条积累"读成"写过 1,800 篇"。
+                    "ingest_copies": int(ingest_counts.get(pid, 0) or 0)})
     return out
 
 
