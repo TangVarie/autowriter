@@ -119,14 +119,23 @@ ALTER TABLE items ADD COLUMN IF NOT EXISTS example_label TEXT
 -- prepublish_evaluations 去校准模型 —— 机器自己的判定被当成人的判断喂回给
 -- 模型学。这三列让消费方不必再推断。完整说明见 migrations/006。
 -- ⚠️ 与 006 保持一致: 两边都要有(README: 加列必须两边都改)。
+-- ⚠️ 与 012 保持一致: human_via_agent 是「用户给了结论、经 deskcore 工具写入」,
+--    'human' 留给 Streamlit 里真的点了按钮的那条路(审计 A-01)。
 ALTER TABLE items ADD COLUMN IF NOT EXISTS decision_source TEXT
-    CHECK (decision_source IN
-           ('human', 'auto_hard_rule', 'auto_dedup', 'system'));
+    CONSTRAINT items_decision_source_check CHECK (decision_source IN
+           ('human', 'human_via_agent', 'auto_hard_rule', 'auto_dedup', 'system'));
 ALTER TABLE items ADD COLUMN IF NOT EXISTS reviewer_id UUID;
 ALTER TABLE items ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS items_human_decision_idx
     ON items (decided_at)
     WHERE decision_source = 'human';
+-- 012: 经代理转述的人审要留下原话和「离批次创建多少秒」, 给人复核用。
+ALTER TABLE items ADD COLUMN IF NOT EXISTS decision_note TEXT
+    CONSTRAINT items_decision_note_len_check CHECK (char_length(decision_note) <= 200);
+ALTER TABLE items ADD COLUMN IF NOT EXISTS decided_within_s INTEGER;
+CREATE INDEX IF NOT EXISTS items_human_via_agent_decision_idx
+    ON items (decided_at)
+    WHERE decision_source = 'human_via_agent';
 -- 2026-05-21: TV 飞轮接入相关列。等价于 autowriter-migrations/002+003 的
 -- bootstrap 路径——operator 在已部署 Supabase 上跑迁移即可；fresh 部署直接
 -- 走这段 DDL 就有列。

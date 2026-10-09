@@ -443,6 +443,9 @@ def commit_drafts(project_id: str, drafts: list[dict],
     也不改 written / rejected。``judge_status`` 不是 ok(超时、没配、被出境口径挡下)
     都是正常结局, **不要重试, 不要据 hard_fails 改稿或重新提交**, 也不必转述给用户,
     除非他问起。
+
+    返回里的 ``next_step`` 是入库之后的纪律: 这批是「待审」, **用户读完稿子、亲口给出
+    结论之前不要调 review_drafts**。
     """
     # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、
     # 只带 error 字段的结果, 而写作台协议对 commit 没有强制重试 —— 于是定稿
@@ -450,16 +453,27 @@ def commit_drafts(project_id: str, drafts: list[dict],
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id)
 
 
-def review_drafts(project_id: str, decisions: list[dict],
+def review_drafts(project_id: str, decisions: list[dict], user_words: str,
                   _user_id: str | None = None) -> dict:
-    """人审: 给已定稿的稿子记一条【真实的人工审核决定】——通过, 或者打回。
+    """人审: 把【用户亲口给出的】审核结论记进库——通过, 或者打回。
+
+    这条记录在库里标的是 ``decision_source=human_via_agent``: **结论来自用户, 经你
+    转述写入**。它和 Streamlit 里真的点了按钮的 ``human`` 是分开记的 —— 下游一眼
+    就能看出这条是经代理之手来的。
 
     什么时候调: **用户自己看过稿子并给了结论之后**。他说"这批可以发""第 3 条
     重写""都过了"就是结论; 他只是让你写稿、定稿、导出, 那不是结论。
 
-    ⚠️ **不许替用户下结论。** 这个动作会在库里落一条"某人审过了"的记录, 并被
-    下游当成人工反馈去校准评估模型。用户没表态就自己点通过, 灌进去的是伪造的
-    正例, 比不记更糟。拿不准就问一句"这批是都通过, 还是有要打回的"。
+    ⚠️ **不许替用户下结论, 不许自己编一句结论。** 这个动作会在库里落一条"某人审
+    过了"的记录, 并被下游当成人工反馈去校准评估模型。用户没表态就自己点通过,
+    灌进去的是伪造的正例, 比不记更糟。拿不准就问一句"这批是都通过, 还是有要
+    打回的"; 他没回答就不调。
+
+    ``user_words`` **必填**: 用户给出结论时的**原话**, 原样放进来(1 ~ 200 字, 比如
+    「这批可以发」「第 3 条重写, 其它过」)。它会存进 ``items.decision_note``, 给人
+    复核"这条通过是不是真有人说过"。缺了 / 空的 / 超长 → 返回 ``error``, **一条都
+    不写**。不要把你自己的话、也不要把整段对话塞进来。服务端另会记下决策距这批
+    稿子入库的秒数(``decided_within_s``): 入库几秒后就"审完", 一眼就看得出。
 
     ``decisions`` 传 [{"version_id": "...", "decision": "approved"}, ...]
     —— version_id 用 ``commit_drafts`` 返回的那些。
@@ -476,11 +490,13 @@ def review_drafts(project_id: str, decisions: list[dict],
       · ``recorded``   —— 记下了。``previous_status`` 是它之前的状态,
                           ``previously_decided_by`` 是**上一个决定是谁下的**,
                           不是"有没有人审过":
-                            ``human``          之前真有人审过, 这次是改判, 值得
-                                               跟用户说一声
-                            ``auto_hard_rule`` 硬规则违规, 机器打回的
-                            ``auto_dedup``     查重重生耗尽, 机器打回的
-                            ``system``         系统置位(如迭代后重置)
+                            ``human``           之前有人在工作台里亲手审过, 这次是
+                                                改判, 值得跟用户说一声
+                            ``human_via_agent`` 之前用户经代理给过结论(就是这个
+                                                工具记的), 这次也是改判, 同样要说
+                            ``auto_hard_rule``  硬规则违规, 机器打回的
+                            ``auto_dedup``      查重重生耗尽, 机器打回的
+                            ``system``          系统置位(如迭代后重置)
                           后三个都**不是**人审 —— 人这次接手是正常流程, 别把它们
                           说成"之前已经有人审过"
       · ``not_found``  —— 这个 version_id 不在本项目里, 八成是 id 传错了
@@ -493,7 +509,7 @@ def review_drafts(project_id: str, decisions: list[dict],
     # 故意不包 _safe: 这是【写】操作, 而且写的是一条会流到下游评估模型里的
     # 人工决策。写失败若报成功, 用户以为审过了, 而库里那条稿子永远停在 pending。
     return core.review_drafts(core.sb(), project_id, decisions,
-                              user_id=_user_id)
+                              user_words=user_words, user_id=_user_id)
 
 
 def export_drafts(project_id: str, batch_id: str | None = None,

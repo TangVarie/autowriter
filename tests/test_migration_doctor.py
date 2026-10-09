@@ -48,7 +48,9 @@ _TABLES = {
     # 011 的视图(发牌台账 → 版本 → TV 笔记 → tier)。假件里视图和表长得一样。
     "v_angle_outcomes": [],
     "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z",
-               "decision_source": None, "reviewer_id": None, "decided_at": None}],
+               "decision_source": None, "reviewer_id": None, "decided_at": None,
+               # 012 的两列
+               "decision_note": None, "decided_within_s": None}],
 }
 
 # 全部迁移都跑过的库: 五个 RPC 都在, 且 check/commit 都是新签名。
@@ -105,7 +107,9 @@ def test_bare_001_db_reports_every_later_migration_missing():
             "deskcore_commit_fingerprints": lambda a: []
             if "_contain_hard" not in a else (_ for _ in ()).throw(
                 RuntimeError("PGRST202 Could not find the function"))},
-        missing_columns={"items": {"decision_source", "reviewer_id", "decided_at"}},
+        missing_columns={"items": {"decision_source", "reviewer_id", "decided_at",
+                                   # 012 的两列同样不在
+                                   "decision_note", "decided_within_s"}},
     )
     report = core.migration_state(sb)
 
@@ -116,10 +120,12 @@ def test_bare_001_db_reports_every_later_migration_missing():
         "005_deskcore_containment.sql",
         "006_item_decision_provenance.sql",
         "009_tv_links.sql",           # 读 TV 的 RPC 不在 → 009 没跑
+        "012_review_via_agent_provenance.sql",
     ]
     st = _states(report)
     assert st["表 draft_fingerprints"] == "applied"      # 001 在
     assert st["items 的决策出处三列"] == "missing"
+    assert st["items 的 decision_note / decided_within_s 两列"] == "missing"
     # commit 只有 4 参那版 → 旧签名, 不是"函数不存在"。这两种要分开报:
     # 前者竞态窗口仍关着, 后者整条原子路径都退化了。
     assert st["deskcore_commit_fingerprints(6 参)"] == "old_signature"

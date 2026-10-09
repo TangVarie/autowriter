@@ -287,6 +287,29 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
 
+### 1.8 `012_review_via_agent_provenance` —— 经代理转述的人审分开记（2026-10-09，审计 A-01，**生产库尚未执行**）
+
+实查生产库：`autowriter.items` 里 `decision_source='human'` 的 32 行**全部**是 deskcore 的
+`review_drafts` 写的，而且全落在模型自己的工具链里（check → commit → review → export，
+距 commit 10~27 秒，没有一个人读得完稿子的窗口）。deskcore 不记成功的工具调用，库里分不出
+「模型自己点了」和「用户说了全过、模型照实记」。协议和 docstring 都写着「用户没表态不许调」，
+但服务端没有闸，也判不了。
+
+迁移做三件事：`decision_source` 的 CHECK 多认 **`human_via_agent`**（工具从此只写它，`human`
+留给 Streamlit 里真的点了按钮的路）；`items` 加 **`decision_note`**（用户原话，≤ 200 字，
+工具参数 `user_words` **必填**）和 **`decided_within_s`**（距被审那一版 `versions.created_at` 的秒数，服务端算；不按批次，替换稿不换批）；
+另建一条只盖 `human_via_agent` 的部分索引，006 那条 `human` 的不动。存量 32 行**不回填**。
+幂等；SQL Editor / `apply_migration` 直接跑。验收：`doctor` 里「items 的 decision_note /
+decided_within_s 两列」applied；`select decision_source, count(*) from autowriter.items group by 1`
+里从此出现 `human_via_agent`。
+
+⚠️ **没跑它之前 `review_drafts` 每条都报 `failed`**（写 `human_via_agent` 会被旧 CHECK 拒，
+写两列会缺列；`db.update_item_status` 把报错翻译成"跑 012"）。Streamlit 不受影响。
+⚠️ **TV 侧没接**：`sync_autowriter_decisions_to_prepublish.py` 只认恰好等于 `human` 的行，
+`human_via_agent` 会被归成 `unverified`——要不要算人工反馈由 TV 的 DECISIONS 定。
+协议正文 `protocol.md` 这次刻意没改（改它会换 `protocol_version`、逼全员重新导入 skill），
+规则在工具 docstring 和 `commit_drafts` 返回的 `next_step` 里。
+
 ### 1.5 指纹库回填记录（2026-08-26）
 
 只回填了**有实质调教痕迹的两个 owner**——按"调教笔记 + 记忆规则 + 人工决策 + 反馈"
@@ -821,6 +844,10 @@ items.example_label（只有 label_example 这一个，走 db.set_item_example_l
 > 现在有了：用户看过稿子给了结论之后，调 `review_drafts` 把结论落库，
 > `decision_source='human'`、`reviewer_id` 是真的点了这一下的那个人、
 > `decided_at` 是真实时间。
+>
+> ⚠️ **2026-10-09 起这条路写的是 `decision_source='human_via_agent'`，不再是 `human`**
+> （审计 A-01，§1.8）：结论来自用户、经模型转述写入，原话落 `decision_note`（工具参数
+> `user_words` 必填），`decided_within_s` 记距入库的秒数。`human` 只剩 Streamlit 的按钮会写。
 >
 > 三条纪律写进了工具本身，别在下一次迭代里松掉：
 >

@@ -134,10 +134,15 @@ def test_the_whole_protocol_end_to_end(env):
                       "batch_id": it["batch_id"], "batches": {"project_id": pid}}
     r = call("review_drafts", project_id=pid,
              decisions=[{"version_id": vids[0], "decision": "approved"},
-                        {"version_id": vids[1], "decision": "needs_revision"}])
+                        {"version_id": vids[1], "decision": "needs_revision"}],
+             user_words="第一条可以发, 第二条重写")
     assert r["reviewed"] == 2
     statuses = {i["status"] for i in fake.rows["items"]}
     assert statuses == {"approved", "needs_revision", "pending"}
+    # 审计 A-01: 工具这条路记的是「经代理转述」, 原话一起落库
+    reviewed = [i for i in fake.rows["items"] if i["status"] != "pending"]
+    assert {i["decision_source"] for i in reviewed} == {"human_via_agent"}
+    assert {i["decision_note"] for i in reviewed} == {"第一条可以发, 第二条重写"}
 
     # ── 6. /health 带漏斗块, 且这一批全销账 → 不红 ───────────────────────
     h = client.get("/health").json()
@@ -169,3 +174,7 @@ def test_mcp_tool_surface_matches_the_protocol():
     assert "unattributed" in by["commit_drafts"].description
     assert "pre_commit" in by["commit_drafts"].description
     assert "不过闸" in by["ingest_published"].description
+    # 审计 A-01: user_words 在 schema 里是**必填**, 模型省不掉它
+    rd = by["review_drafts"].inputSchema
+    assert "user_words" in rd["properties"] and "user_words" in rd.get("required", []), rd
+    assert "human_via_agent" in by["review_drafts"].description

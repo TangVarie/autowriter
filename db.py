@@ -1084,22 +1084,30 @@ def _bucket_items(page: list[dict], grouped: dict[str, list[dict]]) -> None:
 # items.status 的**出处**。与 migrations/006 里那个 CHECK 是同一个闭集 ——
 # 加值必须两边一起加, 否则写进去会被数据库拒。
 class DecisionSource:
-    HUMAN = "human"                      # 人点了通过 / 打回
+    HUMAN = "human"                      # 人在 Streamlit 里亲手点了通过 / 打回
+    # 用户给了结论、但经模型(deskcore review_drafts 工具)之手写入。审计 A-01:
+    # 生产库里 'human' 的 32 行全是工具链里写的, 和真点按钮的分不开 —— 所以工具
+    # 从此只写这个值, 原话落 decision_note, 让人能复核。
+    HUMAN_VIA_AGENT = "human_via_agent"
     AUTO_HARD_RULE = "auto_hard_rule"    # 硬规则违规, 自动标 needs_revision
     AUTO_DEDUP = "auto_dedup"            # 查重重生耗尽, 自动标 needs_revision
     SYSTEM = "system"                    # 既非审稿也非检测(如迭代后重置 pending)
 
 
 _DECISION_SOURCES = frozenset({
-    DecisionSource.HUMAN, DecisionSource.AUTO_HARD_RULE,
-    DecisionSource.AUTO_DEDUP, DecisionSource.SYSTEM,
+    DecisionSource.HUMAN, DecisionSource.HUMAN_VIA_AGENT,
+    DecisionSource.AUTO_HARD_RULE, DecisionSource.AUTO_DEDUP, DecisionSource.SYSTEM,
 })
+# 两种「有人」的来源 —— 只有它们能带 reviewer_id / decision_note。
+_HUMAN_SOURCES = frozenset({DecisionSource.HUMAN, DecisionSource.HUMAN_VIA_AGENT})
+DECISION_NOTE_MAX_CHARS = 200            # 与 migrations/012 的 CHECK 同一个数
 
 
 def update_item_status(
     client: Client, item_id: str, status: str, best_version_id: Optional[str] = None,
     clear_best_version: bool = False, *,
     source: str, reviewer_id: Optional[str] = None,
+    decision_note: Optional[str] = None, decided_within_s: Optional[int] = None,
 ) -> dict:
     """更新 item 状态; ``best_version_id`` truthy 时一并写入。
 
@@ -1123,16 +1131,34 @@ def update_item_status(
     当场 TypeError, 这正是想要的 —— 让"这次到底是谁在做决定"变成写代码时
     躲不开的一个问题。
 
-    ``reviewer_id`` 只在 ``source='human'`` 时有意义。**不要**拿 item 的
-    owner 去兜底 —— "谁拥有"和"谁审的"是两件事, 混起来正是 COR-007 那个失真。
+    ``reviewer_id`` 只在 ``source`` 是 ``human`` / ``human_via_agent`` 时有意义。
+    **不要**拿 item 的 owner 去兜底 —— "谁拥有"和"谁审的"是两件事, 混起来正是
+    COR-007 那个失真。
+
+    ``decision_note`` / ``decided_within_s``(migrations/012, 审计 A-01)**每次决定都整行
+    重写**: 传了就写, 没传就写 NULL。不能"没传就不碰"(codex review on #94, P1): 一条经
+    review_drafts 记过原话的稿子, 之后迭代被重置成 system、或在 Streamlit 里被人改判成
+    human, 这两列若留着, 行上就是「最新的决定 + 上一次代理决定的证据」—— 正是 012 要分开
+    的东西被重新混在一起。代价是 012 从此和 006 一样是硬前提(没跑它, 任何审稿决定都
+    写不进去, 下面翻译成人话)。前者是用户的原话(≤ 200 字, 与 012 的 CHECK 同一个数,
+    这里先拦, 免得错误出现在离现场很远的地方), 后者是决策距被审那一版建出来的秒数,
+    由调用方算。
     """
     if source not in _DECISION_SOURCES:
         raise ValueError(
             f"未知的 decision_source: {source!r}; 允许的是 "
             f"{sorted(_DECISION_SOURCES)}。加新值要同时改 migrations/006 的 CHECK。")
-    if reviewer_id and source != DecisionSource.HUMAN:
+    if reviewer_id and source not in _HUMAN_SOURCES:
         raise ValueError(
             f"source={source!r} 不该带 reviewer_id —— 自动判定没有「人」。")
+    if decision_note is not None:
+        if source not in _HUMAN_SOURCES:
+            raise ValueError(
+                f"source={source!r} 不该带 decision_note —— 自动判定没有「原话」。")
+        if len(decision_note) > DECISION_NOTE_MAX_CHARS:
+            raise ValueError(
+                f"decision_note 超过 {DECISION_NOTE_MAX_CHARS} 字"
+                f"({len(decision_note)}) —— migrations/012 的 CHECK 会拒, 先在这里拦。")
 
     updates: dict[str, Any] = {
         "status": status,
@@ -1140,6 +1166,9 @@ def update_item_status(
         "reviewer_id": reviewer_id or None,
         "decided_at": datetime.now(timezone.utc).isoformat(),
     }
+    # 没传 = 清空(见 docstring): 别的来源的决定不许顶着上一次代理决定的原话和秒数。
+    updates["decision_note"] = decision_note
+    updates["decided_within_s"] = int(decided_within_s) if decided_within_s is not None else None
     if best_version_id:
         updates["best_version_id"] = best_version_id
     elif clear_best_version:
@@ -1156,6 +1185,17 @@ def update_item_status(
         # 三列一起来自同一个迁移, 所以三个名字都认 —— PostgREST 只报它撞上的
         # 第一个, 而那取决于 payload 的键序(今天是 decision_source, 但那不是
         # 契约)。只认一个的话, 键序一动这条翻译就静默失效。
+        # 012 的两列从此每次决定都写; 缺了同样翻译成人话。CHECK 不认 human_via_agent 时
+        # PostgREST 报的是 23514 + 约束名 items_decision_source_check —— 这个名字里含
+        # "decision_source", 所以这条必须排在 006 那条【前面】, 否则会被引去跑一个修不了它的
+        # 迁移 (codex review on #94, P2)。
+        if any(c in str(exc) for c in
+               ("decision_note", "decided_within_s", "items_decision_source_check")):
+            raise RuntimeError(
+                "审稿决定写不进去: items 缺 decision_note / decided_within_s 两列, "
+                "或 decision_source 的 CHECK 还不认 human_via_agent —— "
+                "migrations/012_review_via_agent_provenance.sql 还没跑"
+                "(006 也没跑的库先跑 006)。自检: python -m deskcore.cli doctor") from exc
         if any(c in str(exc) for c in
                ("decision_source", "reviewer_id", "decided_at")):
             raise RuntimeError(
