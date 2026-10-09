@@ -71,7 +71,7 @@ def test_judge_draft_posts_without_write_and_returns_the_redacted_view(wired):
     assert "影子期" in out["note"]
     (method, url, headers, body, timeout), = calls
     assert method == "POST" and url == "https://judge.example.invalid/judge_draft"
-    assert headers == {"X-Judge-Key": "jk-admin"} and timeout == (3.0, 18.0)
+    assert headers == {"X-Judge-Key": "jk-admin"} and timeout[0] == 3.0 and 17.0 < timeout[1] <= 18.0, "查库花掉的时间从 18 s 里扣"
     assert body["write"] is False and body["return_rows"] is False and body["subject_id"] == "draft"
     assert body["subject_type"] == "aw_version" and body["judge_paras"] == "on_fail" and body["run_tag"] == "mcp"
     assert body["project"] == "TUGE_phase1" and body["category"] == "教育" and body["title"] == TITLE and body["body"] == BODY
@@ -101,7 +101,7 @@ def test_repair_plan_for_returns_only_the_plan(wired):
     assert calls[-1][3]["judge_paras"] == "on_fail"
     reply["fn"] = lambda m, u, kw: _Resp(200, {"results": []})
     out = core.repair_plan_for(c, PROJ, TITLE, BODY, user_id=ME)
-    assert out["judge_status"] == "error" and "plan" in out["detail"]
+    assert out["judge_status"] == "error" and "形状" in out["detail"] and "plan" not in out
 
 
 def test_not_configured_and_no_tv_map_send_nothing(wired, monkeypatch):
@@ -142,6 +142,15 @@ def test_policy_timeout_and_unavailable_become_statuses_not_exceptions(wired):
     reply["fn"] = lambda m, u, kw: _Resp(200, None, text="<html>")
     out = core.judge_draft(c, PROJ, TITLE, BODY, user_id=ME)
     assert out["judge_status"] == "error" and "JSON" in out["detail"]
+    # 200 但形状不对不是成功 (codex review on #95, P2): 版本不兼容的 judge / 会说 JSON 的代理
+    reply["fn"] = lambda m, u, kw: _Resp(200, {"detail": "error"})
+    out = core.judge_draft(c, PROJ, TITLE, BODY, user_id=ME)
+    assert out["judge_status"] == "error" and "passed" in out["detail"] and "plan" not in out
+    reply["fn"] = lambda m, u, kw: _Resp(200, {"passed": True, "plan": "not a list"})
+    assert core.repair_plan_for(c, PROJ, TITLE, BODY, user_id=ME)["judge_status"] == "error"
+    reply["fn"] = lambda m, u, kw: _Resp(200, {"x": 1})
+    out = core.list_banks()
+    assert out["judge_status"] == "error" and "banks" not in out, "坏形状的 /banks 不能报成空列表的成功"
 
 
 def test_other_users_project_is_refused_before_any_request(wired):
@@ -170,3 +179,30 @@ def test_tools_are_registered_and_need_identity():
 def test_build_tool_request_pins_write_and_rows():
     p = judge_client.build_tool_request(title="t", body="b", project="TUGE_phase1", category=None)
     assert p["write"] is False and p["return_rows"] is False and p["subject_id"] == "draft" and "category" not in p
+
+
+def test_project_context_lookup_runs_inside_the_deadline(wired, monkeypatch):
+    """查库卡住也要在预算内回 timeout、一个请求都不发 (codex review on #95, P2): PostgREST 默认 120 秒,
+    同步等它这个工具就远超 MCP 客户端 ~22 秒的容忍。"""
+    import threading
+    calls, _ = wired
+    monkeypatch.setattr(config, "JUDGE_DRAFT_TOOL_TIMEOUT_SEC", 0.2)
+    release = threading.Event()
+
+    def _stuck(client, project_id):
+        release.wait(5)
+        return {"project": "TUGE_phase1", "category": "教育", "status": None, "detail": ""}
+    monkeypatch.setattr(core, "_judge_project_context", _stuck)
+    try:
+        out = core.judge_draft(_client(), PROJ, TITLE, BODY, user_id=ME)
+    finally:
+        release.set()
+    assert out["judge_status"] == "timeout" and "查库" in out["detail"] and calls == []
+    # 查库花掉一部分预算 → 判定只拿剩下的时间
+    monkeypatch.setattr(config, "JUDGE_DRAFT_TOOL_TIMEOUT_SEC", 18.0)
+    monkeypatch.setattr(core, "_judge_project_context",
+                        lambda client, project_id: {"project": "TUGE_phase1", "category": "教育", "status": None, "detail": ""})
+    out = core.judge_draft(_client(), PROJ, TITLE, BODY, user_id=ME)
+    assert out["judge_status"] == "ok"
+    (_m, _u, _h, _b, timeout), = calls
+    assert timeout[0] == 3.0 and 15.0 < timeout[1] <= 18.0, timeout

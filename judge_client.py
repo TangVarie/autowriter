@@ -298,10 +298,32 @@ def build_tool_request(*, title: str, body: str, project: str, category: Optiona
     return payload
 
 
+def _draft_shape_problem(body: Any) -> Optional[str]:
+    """/judge_draft 的 200 契约: 对象, passed 是 bool, plan 是 list。不对就不是成功 (codex review on #95, P2:
+    版本不兼容的 judge 或会说 JSON 的代理回 {"detail": …} 也是 200, 当成 ok 等于把故障报成判完了)。"""
+    if not isinstance(body, dict):
+        return f"响应体是 {type(body).__name__}, 不是对象"
+    if not isinstance(body.get("passed"), bool):
+        return "缺 passed(bool)"
+    if not isinstance(body.get("plan"), list):
+        return "缺 plan(list)"
+    return None
+
+
+def _banks_shape_problem(body: Any) -> Optional[str]:
+    """/banks 的 200 契约: 每项带 name 的对象列表。"""
+    if not isinstance(body, list):
+        return f"响应体是 {type(body).__name__}, 不是列表"
+    if any(not isinstance(b, dict) or not b.get("name") for b in body):
+        return "列表里有不带 name 的项"
+    return None
+
+
 def _tool_call(method: str, path: str, *, json_body: Optional[dict] = None,
-               timeout: Optional[float] = None) -> dict:
+               timeout: Optional[float] = None, shape=None) -> dict:
     """GET / POST 一次, **永不抛**。回 {"judge_status", "http_status", "elapsed_ms", "detail", "response"}:
-    judge_status=ok 时 response 是 judge 的响应体(dict 已去掉 ledger_rows), 其余 response=None。"""
+    judge_status=ok 时 response 是 judge 的响应体(dict 已去掉 ledger_rows), 其余 response=None。
+    ``shape(body) -> 问题或 None``: 200 但形状不对记 error, 不算 ok。"""
     if not configured():
         return {"judge_status": JUDGE_NOT_CONFIGURED, "http_status": None, "elapsed_ms": 0,
                 "detail": "JUDGE_URL / JUDGE_API_KEY 未配置", "response": None}
@@ -338,6 +360,9 @@ def _tool_call(method: str, path: str, *, json_body: Optional[dict] = None,
     except Exception:                                  # noqa: BLE001
         return _done(JUDGE_ERROR, http_status=code,
                      detail="judge 回了 200 但不是 JSON(JUDGE_URL 指错 / 中间有代理?)")
+    problem = shape(body) if shape is not None else None
+    if problem:
+        return _done(JUDGE_ERROR, http_status=code, detail=f"judge 回了 200 但响应体不是约定的形状: {problem}")
     if isinstance(body, dict):
         body.pop("ledger_rows", None)
     return _done(JUDGE_OK, http_status=code, response=body)
@@ -345,9 +370,9 @@ def _tool_call(method: str, path: str, *, json_body: Optional[dict] = None,
 
 def judge_draft_full(payload: dict, *, timeout: Optional[float] = None) -> dict:
     """写手侧: 判一篇, 回抹掉暗题的整个响应(见 _tool_call)。"""
-    return _tool_call("POST", "/judge_draft", json_body=payload, timeout=timeout)
+    return _tool_call("POST", "/judge_draft", json_body=payload, timeout=timeout, shape=_draft_shape_problem)
 
 
 def list_banks(*, timeout: Optional[float] = None) -> dict:
     """写手侧: GET /banks(judge 默认只列每个家族的最新版本; 暗题只报个数)。"""
-    return _tool_call("GET", "/banks", timeout=timeout)
+    return _tool_call("GET", "/banks", timeout=timeout, shape=_banks_shape_problem)

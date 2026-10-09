@@ -1359,14 +1359,31 @@ def _judge_tool_call(client, project_id: str, title: str, body: str, *, user_id,
     if not judge_client.configured():
         return {**base, "judge_status": judge_client.JUDGE_NOT_CONFIGURED,
                 "detail": "JUDGE_URL / JUDGE_API_KEY 未配置: 这个 deskcore 部署没接判定服务"}
-    ctx = _judge_project_context(client, project_id)
+    # 项目号 / 品类的两次查库也算进同一个墙钟截止 (codex review on #95, P2): PostgREST 客户端默认 120 秒超时,
+    # 库一卡这个同步工具就远超 MCP 客户端 ~22 秒的容忍, 还不会报 timeout。做法同 _judge_committed: 查库在工作线程里、
+    # 到点就记 timeout 一个请求都不发; 查完了判定只拿剩下的时间。
+    budget = judge_client.tool_timeout_sec()
+    started = time.monotonic()
+    ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-tool")
+    try:
+        try:
+            ctx = ex.submit(_judge_project_context, client, project_id).result(timeout=budget)
+        except cf.TimeoutError:
+            return {**base, "judge_status": judge_client.JUDGE_TIMEOUT, "elapsed_ms": _ms_since(started),
+                    "detail": f"发之前的查库(tv_project_map / TV 品类)在 {budget:g}s 内没查完, 没发判定"}
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
     if ctx["project"] is None:
-        return {**base, "judge_status": ctx["status"], "detail": ctx["detail"]}
+        return {**base, "judge_status": ctx["status"], "detail": ctx["detail"], "elapsed_ms": _ms_since(started)}
+    left = budget - (time.monotonic() - started)
+    if left <= 0.5:
+        return {**base, "judge_status": judge_client.JUDGE_TIMEOUT, "elapsed_ms": _ms_since(started),
+                "detail": f"查库用完了 {budget:g}s 的预算, 没来得及发判定"}
     payload = judge_client.build_tool_request(
         title=title, body=body, project=ctx["project"], category=ctx["category"], judge_paras=judge_paras,
         banks=banks, brief=brief, hard_rules=hard_rules, target=target, validated=validated)
-    res = judge_client.judge_draft_full(payload)
-    return {**res, "project": ctx["project"], "category": ctx["category"]}
+    res = judge_client.judge_draft_full(payload, timeout=left)
+    return {**res, "project": ctx["project"], "category": ctx["category"], "elapsed_ms": _ms_since(started)}
 
 
 def _judge_tool_head(res: dict) -> dict:
