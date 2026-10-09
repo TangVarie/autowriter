@@ -262,3 +262,92 @@ def _log(subject_id: str, out: dict) -> None:
         http_status=out.get("http_status"), elapsed_ms=out.get("elapsed_ms"),
         passed=out.get("passed"), error=out.get("detail") or None,
     )
+
+
+# ── 写手侧工具用的"全响应"调用(2026-10-09, 写手的判稿入口从 judge.mcp_server 并进 deskcore)──
+# commit 那条路只留结局(result()); 这里把 judge **抹掉暗题之后的整个响应**原样带回 —— 写手的模型要看
+# plan / recorded / profile / hard_fails 的依据句去改稿。永远 write=false、return_rows=false: 写手拿不到账本行
+# (行里有暗题), 也不往账本写(写手侧的判定不是生产答案)。deskcore 对 judge 用的是管理 key, 所以这两条由
+# deskcore 自己保证, 不靠写手机器上的配置。仍然一次 LLM 调用都没有: 判定在 judge 那边。
+
+TOOL_SUBJECT_ID = "draft"
+TOOL_RUN_TAG = "mcp"
+JUDGE_PARAS = ("always", "on_fail", "never")
+
+
+def tool_timeout_sec() -> float:
+    return float(config.JUDGE_DRAFT_TOOL_TIMEOUT_SEC)
+
+
+def build_tool_request(*, title: str, body: str, project: str, category: Optional[str] = None,
+                       judge_paras: str = "on_fail", banks: Optional[list] = None, brief: Optional[dict] = None,
+                       hard_rules: Optional[dict] = None, target: Optional[dict] = None,
+                       validated: Optional[list] = None) -> dict:
+    """写手侧判稿的 /judge_draft 请求体: subject_id 固定 "draft"(不落账本, 主键无所谓), write / return_rows 钉死 false。"""
+    payload: dict[str, Any] = {
+        "subject_id": TOOL_SUBJECT_ID, "subject_type": SUBJECT_TYPE, "project": project,
+        "title": title or "", "body": body or "", "judge_paras": judge_paras,
+        "write": False, "return_rows": False, "run_tag": TOOL_RUN_TAG,
+    }
+    if category:
+        payload["category"] = category
+    for k, v in (("banks", banks), ("brief", brief), ("hard_rules", hard_rules),
+                 ("target", target), ("validated", validated)):
+        if v is not None:
+            payload[k] = v
+    return payload
+
+
+def _tool_call(method: str, path: str, *, json_body: Optional[dict] = None,
+               timeout: Optional[float] = None) -> dict:
+    """GET / POST 一次, **永不抛**。回 {"judge_status", "http_status", "elapsed_ms", "detail", "response"}:
+    judge_status=ok 时 response 是 judge 的响应体(dict 已去掉 ledger_rows), 其余 response=None。"""
+    if not configured():
+        return {"judge_status": JUDGE_NOT_CONFIGURED, "http_status": None, "elapsed_ms": 0,
+                "detail": "JUDGE_URL / JUDGE_API_KEY 未配置", "response": None}
+    t = float(timeout if timeout is not None else tool_timeout_sec())
+    started = time.monotonic()
+
+    def _done(status: str, *, detail: str = "", http_status: Optional[int] = None, response=None) -> dict:
+        out = {"judge_status": status, "http_status": http_status,
+               "elapsed_ms": int((time.monotonic() - started) * 1000),
+               "detail": mask_secrets(detail or "")[:_DETAIL_MAX], "response": response}
+        telemetry.log_event("judge_tool_result", path=path, state=status, http_status=http_status,
+                            elapsed_ms=out["elapsed_ms"], error=out["detail"] or None)
+        return out
+
+    try:
+        kw: dict[str, Any] = {"headers": {"X-Judge-Key": config.JUDGE_API_KEY},
+                              "timeout": (min(_CONNECT_TIMEOUT_CAP_SEC, t), t)}
+        if json_body is not None:
+            kw["json"] = json_body
+        url = f"{config.JUDGE_URL.rstrip('/')}{path}"
+        resp = requests.post(url, **kw) if method == "POST" else requests.get(url, **kw)
+    except requests.Timeout as exc:
+        return _done(JUDGE_TIMEOUT, detail=f"{t:g}s 内没回: {exc}")
+    except requests.ConnectionError as exc:
+        return _done(JUDGE_UNAVAILABLE, detail=f"连不上 judge: {exc}")
+    except Exception as exc:                           # noqa: BLE001 — 永不抛
+        return _done(JUDGE_ERROR, detail=f"{type(exc).__name__}: {exc}")
+    code = getattr(resp, "status_code", None)
+    if code != 200:
+        detail = _error_detail(resp)
+        return _done(_status_for_http_error(int(code or 0), detail), detail=f"HTTP {code}: {detail}", http_status=code)
+    try:
+        body = resp.json()
+    except Exception:                                  # noqa: BLE001
+        return _done(JUDGE_ERROR, http_status=code,
+                     detail="judge 回了 200 但不是 JSON(JUDGE_URL 指错 / 中间有代理?)")
+    if isinstance(body, dict):
+        body.pop("ledger_rows", None)
+    return _done(JUDGE_OK, http_status=code, response=body)
+
+
+def judge_draft_full(payload: dict, *, timeout: Optional[float] = None) -> dict:
+    """写手侧: 判一篇, 回抹掉暗题的整个响应(见 _tool_call)。"""
+    return _tool_call("POST", "/judge_draft", json_body=payload, timeout=timeout)
+
+
+def list_banks(*, timeout: Optional[float] = None) -> dict:
+    """写手侧: GET /banks(judge 默认只列每个家族的最新版本; 暗题只报个数)。"""
+    return _tool_call("GET", "/banks", timeout=timeout)

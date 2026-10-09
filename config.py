@@ -164,6 +164,10 @@ JUDGE_API_KEY: str = _get_secret("JUDGE_API_KEY")  # 发在 X-Judge-Key 头里
 # ⚠️ 8 秒同样没有实测分位数撑着 —— 等 batch_metrics 里 deskcore_commit 的 phase_ms.judge
 #    攒够样本再定(查法见 docs/deskcore.md §3.8)。
 JUDGE_TIMEOUT_SEC: float = _bounded_number("JUDGE_TIMEOUT_SEC", 8.0, 1.0, 15.0)
+# 写手侧判稿工具(judge_draft / repair_plan_for / list_banks, 2026-10-09 从写手机器上的 judge.mcp_server 并进
+# deskcore)一次请求的超时。单篇、同步、模型在等 —— 必须留在 MCP 客户端 ~22 秒容忍之内(上面那段);
+# Jev 实测一篇 10~12 次调用 4.5 秒(JevforCoentent docs/31 §5.4), 18 秒够, 上限夹 20。
+JUDGE_DRAFT_TOOL_TIMEOUT_SEC: float = _bounded_number("JUDGE_DRAFT_TOOL_TIMEOUT_SEC", 18.0, 1.0, 20.0)
 # ── open_project 随简报借卡的预算(TV 2026-10-08 审计 A-04)──────────────────────
 # 借阅在 open_project 的必经同步路径上, 原来直接等满 LIBRARIAN_TIMEOUT_SEC(60 秒); 而 MCP
 # 客户端只容忍 ~22 秒 —— 超过就是**整份简报(含 P0 硬约束)一起丢**, 协议让模型停笔。

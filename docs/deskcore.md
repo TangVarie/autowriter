@@ -167,6 +167,8 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
 | | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
+| | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
+| | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
 | | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8） |
 | 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human_via_agent`（结论来自用户、经模型转述写入；Streamlit 里亲手点按钮的才是 `human`）+ 真实 reviewer + 时间 + **用户原话 `user_words`（必填，落 `decision_note`）** + 距入库秒数 `decided_within_s`。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
@@ -434,7 +436,7 @@ tv-sync 倒灌回来，不过 `commit_drafts`（sportsix 438 条 ingested 里 11
 
 补录路径不判的理由：已发布的稿子「入库前判一下」改变不了任何事；再以 `aw_version` 判一遍，是同一篇文字
 在账本里记两份、挂两种主体；而它们本来就在 TV 的抽取队列里。**代价写明**：sportsix / Hatherine 这种
-在外面写的项目，**写前**的判定 deskcore 碰不到——那要靠写手侧的 MCP 工具（judge 仓的 `judge.mcp_server`：
+在外面写的项目，**写前**的判定也在 deskcore 里：`judge_draft` / `repair_plan_for` / `list_banks` 三个工具（2026-10-09 从写手机器上的 `judge.mcp_server` 并进来）——同一个 `/judge_draft`，但 `write=false`、不回账本行，项目号与品类走 `_judge_project_context`，超时 `JUDGE_DRAFT_TOOL_TIMEOUT_SEC`（默认 18 秒，Jev 实测一篇 4.5 秒，留在 MCP 客户端 ~22 秒容忍之内）。judge 仓的 `judge.mcp_server` 只剩内部 / 运维机器用。
 `judge_draft` / `repair_plan_for`），不靠这里。⚠️ 「由 TV 覆盖」的前提是那条笔记**在 TV 里**：从飞书表
 `ingest --xlsx` 补进来、而那张表没接 TV 同步的（Hatherine 目前就是），事后抽取也够不着——两边都判不到。
 补救是把那张表接进 TV（接进去之后再加一行 `tv-map`），不是在补录路径上补一刀判定。这条决定写进了 `_ingest_published_unlocked` 的 docstring，

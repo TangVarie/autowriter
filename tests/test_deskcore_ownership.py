@@ -165,6 +165,8 @@ UNGATED_WITH_REASON = {
                              "check_drafts / commit_drafts 调用 —— 抽出来正是为了让"
                              "入库也跑同一套闸(2026-09-17)",
     "_rpc_missing_telemetry": "只打一行遥测, 不读写业务数据",
+    "_judge_tool_call":      "写手侧判稿(2026-10-09)的私有主体, 只被 judge_draft / repair_plan_for 调用, "
+                             "那两个公开函数开头各自直接过 assert_project_access",
     # 入库判定(2026-09-24): 这几个都只在 commit_drafts 的尾巴上被调, 那时它开头的
     # assert_project_access 早已过了; 放在锁外是刻意的(见 commit_drafts 里那段注释)。
     "_judge_project_context": "私有辅助函数, 只被已过闸的 commit_drafts(经 _judge_committed)调用; "
