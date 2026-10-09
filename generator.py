@@ -1688,7 +1688,7 @@ def generate_batch(
     consecutive clicks still drift via a per-call nonce.
 
     ``engine_models``: optional per-engine model override, e.g.
-        {"claude": "claude-opus-4-6", "gemini": "gemini-3.1-pro-preview"}
+        {"claude": "claude-opus-5-5", "gemini": "gemini-3.1-pro-preview"}
 
     Returns a list of dicts: ``{"versions": [GenerationResult, ...], "tactic": str}``.
     """
@@ -2411,7 +2411,7 @@ def generate_batch_multi_role(
     custom_roles: if set, used as the role pool instead of CREATIVE_ROLES_POOL
     n_roles: how many roles to randomly sample from the pool each run (default 3)
     engines: list of engine names to use, default ["claude"]
-    engine_models: per-engine model override, e.g. {"claude": "claude-opus-4-6"}
+    engine_models: per-engine model override, e.g. {"claude": "claude-opus-5-5"}
     """
     pool = custom_roles if custom_roles else CREATIVE_ROLES_POOL
     k = min(n_roles, len(pool))

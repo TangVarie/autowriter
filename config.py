@@ -51,27 +51,25 @@ if ANTHROPIC_CACHE_TTL not in ("5m", "1h"):
     ANTHROPIC_CACHE_TTL = "1h"
 
 # Available Claude models: model_id -> display label
-# 仅保留 Anthropic 官方当前 GA + 中转站实际支持的模型（截至 2026-06）。
-# Retired 已删（Claude 3 全系列、Sonnet/Opus 4.0 一代——后者 2026-04-20 下线）。
-# Thinking 模式仍走 -thinking 后缀（中转站约定，非官方 API 参数）；4-6 / 4-7
-# 系列中转站未提供 thinking 变体，故不列；4-8 中转站提供 thinking 变体，已列出。
+# 2026-10-09 换了中转站(New API 一类的网关), 模型名是 claude-sonnet-5-5 这种【不带日期】的
+# 形态。只列 Claude 5 系当前 GA 的; 4.x 全部退到 MODEL_PRICING 的"历史"块(DB 里旧 batch 的
+# 成本回算还要用)。Thinking 仍走 -thinking 后缀(网关约定, 非官方 API 参数) —— 新网关认不认
+# 这个后缀还没实测: 不认的话选它整批生成会直接报 404, 不会静默, 那时把那一行删掉即可。
 CLAUDE_MODELS: dict[str, str] = {
     # ── Haiku ─────────────────────────────────────────────
-    "claude-haiku-4-5-20251001":           "Haiku 4.5（最快/最省）",
+    "claude-haiku-5-5":                    "Haiku 5.5（最快/最省）",
     # ── Sonnet ────────────────────────────────────────────
-    "claude-sonnet-4-6":                   "Sonnet 4.6",
+    "claude-sonnet-5-5":                   "Sonnet 5.5（默认，性价比）",
     # ── Opus ──────────────────────────────────────────────
-    "claude-opus-4-6":                     "Opus 4.6",
-    "claude-opus-4-7":                     "Opus 4.7",
-    "claude-opus-4-8":                     "Opus 4.8（最新，最强）",
-    "claude-opus-4-8-thinking":            "Opus 4.8 Thinking（深度推理）",
+    "claude-opus-5-5":                     "Opus 5.5（最强）",
+    "claude-opus-5-5-thinking":            "Opus 5.5 Thinking（深度推理）",
 }
 
 # Default model (can be overridden via env var)
-# Sonnet 4.6 是中转站当前支持的 Sonnet 唯一版本(Sonnet 4.5 2026-05 被分组
-# 下线),保持 backend utility calls(memory merger / calibration / compliance)
-# 默认值与中转站可用 model 同步,避免 worker 调内部辅助调用即 502。
-CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-4-6"
+# Sonnet 5.5: 写稿和 backend utility calls(memory merger / calibration / compliance)都用它 ——
+# 官方价 $2/$10, 比 Sonnet 4.6($3/$15)便宜且更强; Opus 5.5 留给面板上手动选。
+# ⚠️ 部署的 secrets 里若显式设了 CLAUDE_MODEL=claude-sonnet-4-6 之类旧名, 这个默认值不生效, 要改或删。
+CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-5-5"
 
 # ── Google Gemini ──────────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
@@ -302,17 +300,34 @@ MAX_ITERATION_ROUNDS: int = 3
 # 那档）。
 #
 # Gemini 价格暂仍按 Google 官方公开价；中转站 Gemini 实际价待用户提供后再调。
+# 中转站倍率: 旧站实测 1.8× 官方价(sonnet-4-6 官方 $3 → 实付 5.40, opus $5 → 9.00, haiku-4-5 $1 → 1.80,
+# 下面 4.x 历史行就是那组实付价)。2026-10-09 换的新站倍率还没拿账单核过, 先沿用 1.8; 核过后只改这一个数,
+# 5.x 的价档全由它算出来。4.x 历史行是旧站的实付价, 不随它变。
+RELAY_PRICE_MULTIPLIER: float = 1.8
+
+
+def _relay(input_usd: float, output_usd: float) -> dict[str, float]:
+    """官方 $/M 价 → 中转站价档。cache_write = 1.25× input, cache_read = 0.1× input(官方比例, 1h 缓存写是 2×, 这里按 5m 档估)。"""
+    m = RELAY_PRICE_MULTIPLIER
+    return {"input": round(input_usd * m, 4), "output": round(output_usd * m, 4),
+            "cache_write": round(input_usd * 1.25 * m, 4), "cache_read": round(input_usd * 0.1 * m, 4)}
+
+
 MODEL_PRICING: dict[str, dict[str, float]] = {
-    # ── Claude 当前可选（CLAUDE_MODELS 里有）──────────────────────────
+    # ── Claude 当前可选（CLAUDE_MODELS 里有）: 官方 2026-10 价 × RELAY_PRICE_MULTIPLIER ─────
+    "claude-haiku-5-5":   _relay(0.10, 0.50),
+    "claude-sonnet-5-5":  _relay(2.00, 10.00),
+    # ``claude-opus-5-5-thinking`` 经 get_pricing 最长前缀匹配命中本档, 无需单列。
+    "claude-opus-5-5":    _relay(4.00, 20.00),
+    # Fable 5.1 不在 CLAUDE_MODELS 里(新站有没有待确认), 列价档是给 get_pricing 的"未知 id 按最贵算"兜底用。
+    "claude-fable-5-1":   _relay(10.00, 50.00),
+    # ── Claude 4.x: 2026-10-09 换站后退出面板, DB 历史 batch 仍引用（仅用于成本回算, 旧站实付价）──
     "claude-haiku-4-5":   {"input": 1.80, "output": 9.00,   "cache_write": 2.25,   "cache_read": 0.18},
     "claude-sonnet-4-6":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
     "claude-opus-4-6":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
     "claude-opus-4-7":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
-    # opus-4-8 与 4-5/4-6/4-7 同档（中转站 Opus 统一价）。``claude-opus-4-8-thinking``
-    # 经 get_pricing 最长前缀匹配命中本档，无需单列；若中转站对 4-8 单独定价，改这里。
     "claude-opus-4-8":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
-    # ── Claude 已下线但 DB 历史 batch 仍引用（仅用于成本回算）──────────
-    # 2026-05 中转站新分组下线; 用户的历史 batch 大量用这些 model id
+    # 2026-05 旧中转站分组下线; 用户的历史 batch 大量用这些 model id
     "claude-sonnet-4-5":  {"input": 5.40, "output": 27.00,  "cache_write": 6.75,   "cache_read": 0.54},
     "claude-opus-4-1":    {"input": 27.00, "output": 135.00, "cache_write": 33.75, "cache_read": 2.70},
     "claude-opus-4-5":    {"input": 9.00, "output": 45.00,  "cache_write": 11.25,  "cache_read": 0.90},
@@ -333,7 +348,7 @@ def get_pricing(model_id: str) -> dict[str, float]:
     让前缀短的优先抢走精确的 model 价档。
 
     Gemini 走 substring 兜底（flash-lite / flash / pro 三档命名稳定）。
-    完全未知 / 已下线的 model id fallback 到最贵的 claude-opus-4-7，
+    完全未知 / 已下线的 model id fallback 到最贵的 claude-fable-5-1，
     宁可高估也不 silently miss（用户跑历史 batch 用了已 retire 的 model
     时也能给出合理数字而不是 KeyError）。
     """
@@ -360,9 +375,9 @@ def get_pricing(model_id: str) -> dict[str, float]:
         return MODEL_PRICING["gemini-flash"]
     if "gemini" in mid:
         return MODEL_PRICING["gemini-pro"]
-    # 3. 未知：回退到最贵的（高估好过 silently miss）。Opus 4.7 是当前最贵档
-    #    （Opus 4.1 已下线后,4.5/4.6/4.7 同价、Opus 4.7 是 alias 也最稳）。
-    return MODEL_PRICING["claude-opus-4-7"]
+    # 3. 未知：回退到最贵的（高估好过 silently miss）。Fable 5.1 是当前最贵档
+    #    （官方 $10/$50, Opus 5.5 的 2.5 倍）。
+    return MODEL_PRICING["claude-fable-5-1"]
 
 
 def estimate_cost_usd(model_id: str, usage: dict) -> float:
@@ -436,19 +451,24 @@ def estimate_cache_savings_usd(by_model: dict) -> float:
 #
 # Gemini 2.5 Pro 1M、Gemini Flash 1M; 中转站没显式说明窗口,按官方默认。
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    "claude-haiku-4-5":   200_000,
-    "claude-sonnet-4-6":  200_000,
-    "claude-opus-4-6":    200_000,
-    "claude-opus-4-7":    200_000,
-    "claude-opus-4-8":    200_000,
+    # 5.5 系按 200K 保守值: 新网关给的实际余量没实测过, 先看软警告再硬撞(上面那段的原则)。
+    "claude-haiku-5-5":   200_000,
+    "claude-sonnet-5-5":  200_000,
+    "claude-opus-5-5":    200_000,
+    "claude-fable-5-1":   200_000,
     "gemini-pro":         1_000_000,
     "gemini-flash":       1_000_000,
     "gemini-flash-lite":  1_000_000,
 }
 
-# 历史已下线 model 的窗口(给老数据回算用,跟 MODEL_PRICING 的 retired 价档
-# 同步保留)
+# 历史已下线 / 换站后退出面板的 model 的窗口(给老数据回算用, 跟 MODEL_PRICING 的
+# 历史价档同步保留)
 MODEL_CONTEXT_WINDOWS.update({
+    "claude-haiku-4-5":   200_000,
+    "claude-sonnet-4-6":  200_000,
+    "claude-opus-4-6":    200_000,
+    "claude-opus-4-7":    200_000,
+    "claude-opus-4-8":    200_000,
     "claude-sonnet-4-5":  200_000,
     "claude-opus-4-1":    200_000,
     "claude-opus-4-5":    200_000,
