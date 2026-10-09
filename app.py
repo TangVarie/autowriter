@@ -491,8 +491,18 @@ else:
     _render_quick_gen_snapshot = _quick_gen_snapshot_body
 
 
+def _is_ingest_batch(batch: dict | None) -> bool:
+    """这批是不是从 Truth Vault 补录进来的副本 —— 口径只有一处(deskcore.store), 这里不另抄。"""
+    from deskcore.store import is_ingest_batch
+    return is_ingest_batch(batch)
+
+
 def _format_batch_label(batch: dict, project_name: str = "") -> str:
-    """Format a batch label consistently: project · tactic · date · time (Beijing)."""
+    """Format a batch label consistently: project · tactic · date · time (Beijing).
+
+    补录副本的批次前缀「补录副本」(TV 审计 2026-10-08 B-19): 它们不是写作台写的, 却和真写的
+    批次混在同一个下拉里, 点开全是 pending, 看起来像一堆没审的稿子。
+    """
     tactic = batch.get("tactic", "通用")
     created_at = batch.get("created_at", "")
     # Parse and convert to Beijing time
@@ -508,6 +518,8 @@ def _format_batch_label(batch: dict, project_name: str = "") -> str:
         time_str = created_at[:16] if created_at else "未知时间"
 
     parts = []
+    if _is_ingest_batch(batch):
+        parts.append("补录副本")
     if project_name:
         parts.append(project_name)
     if tactic:
@@ -2412,6 +2424,12 @@ def page_review(project: dict) -> None:
     if not items:
         st.info("该批次暂无文案。")
         return
+    if _is_ingest_batch(selected_batch):
+        # TV 审计 B-19: 补录副本是从 Truth Vault 复制来的已发布笔记, 不是写作台产出。它们
+        # 进库只为了查重基线, status 永远 pending(入库路径不许盖决策戳)。这里的"待审核"数
+        # 对它们没有意义 —— 审了也不会发出去, 而且审核决策会被 TV 当成人工评价同步回去。
+        st.info("这一批是从 Truth Vault **补录进来的副本**(已发布笔记, 不是写作台写的), 只用于查重基线, "
+                "**不需要审核**。下面的「待审核」数不算在审核工作量里。")
 
     pending  = sum(1 for it in items if it["status"] == "pending")
     approved = sum(1 for it in items if it["status"] == "approved")

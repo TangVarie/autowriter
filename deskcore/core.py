@@ -368,7 +368,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # ⚠️ 这一段的失败**不能**影响简报: P0 已经拿到了, 卡借不到只是少点参考。
     # fetch_flywheel_lessons 本身绝不抛, 但 build_brief / 其它意外仍兜一层 ——
     # 兜住之后照样留痕(status.state=error + WARN 日志), 不吞成看似成功。
-    borrowed = _borrow_for_brief(project, brief)
+    borrowed = _borrow_for_brief_bounded(project, brief)
     out["lessons"] = borrowed["lessons"]
     out["lessons_status"] = {k: borrowed[k] for k in
                              ("status", "count", "elapsed_ms", "detail")}
@@ -1630,18 +1630,28 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
 
             consumed = 0
             attempted = 0
+            unminted_angles = 0      # 身份没建成、所以**没销账**的角度(见下面那段)
             for i, d in enumerate(drafts):
                 if i not in inserted_idx or i in replace:   # 替换: 旧版入库时已经销过
                     continue
                 key = d.get("angle_key")
                 if not key:
                     continue
-                attempted += 1
                 # 台账销账用**真的** version_id。以前这里塞的是一个按 angle_key 哈希出来的
                 # 假 UUID(见上面删掉的 _placeholder_version_id) —— consumed_version_id 非
                 # NULL 就够避重用了, 但那个 id 指不到任何一行, 没法回答"这个角度产出的那篇
                 # 后来怎么样了"。
                 vid = d.get("version_id") or minted_ids[i]
+                # 身份没建成的那几条(mint 半途失败)**不销账**(TV 审计 2026-10-08 B-20)。
+                # 销了的话 consumed_version_id 指向一个不存在的 versions 行 —— 和当年的
+                # 假 UUID 一模一样: 台账说"这个角度产出了一篇", 而那一篇谁也找不到, 回填 /
+                # 导出 / v_model_comparison 全 JOIN 不到。留着不销, 这个坐标下一批还能被
+                # 抽到、重写一次 —— 这次的指纹已经入库, 同题重写会被闸挡下来并说清楚, 那是
+                # 看得见的; 悬空的 id 是看不见的。调用方自带 version_id 的不受影响。
+                if not d.get("version_id") and vid not in (minted.get("versions") or {}):
+                    unminted_angles += 1
+                    continue
+                attempted += 1
                 # user_id 传下去: 同一坐标占坑过期后会被重新发牌, 台账里可能有两条
                 # 未消耗行, 销账要销自己那一条(codex review on #86)。
                 if store.consume_angle(client, project_id, key, vid, user_id=user_id):
@@ -1695,6 +1705,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     "(v_model_comparison 就 JOIN 在这个 id 上)。"
                     + (f"已建成的那 {done} 条照常可以 export_drafts(batch_id="
                        f"{out['batch_id']})。" if done else "")
+                    + (f"没建成的里 {unminted_angles} 条带着角度, 台账**没销账**(销了会指向"
+                       "不存在的版本), 那几个坐标下一批还会被抽到。" if unminted_angles else "")
                     + "服务端日志有堆栈。")
             if embed_failed and written:
                 # 配了 embedding 却没拿到向量 = 故障(欠费/配额/网络), 不是"没配"。
@@ -3051,16 +3063,22 @@ def backfill_gap(client, project_id: str) -> dict:
     """
     done = store.existing_fingerprint_version_ids(client, project_id)
     eligible: set[str] = set()
+    ingest_copies = 0
     for page in store.legacy_version_pages(client, project_id, limit=None):
         for row in page:
             vid = row.get("version_id")
             if vid:
                 eligible.add(str(vid))
+                if row.get("ingest"):
+                    ingest_copies += 1
 
     todo = eligible - done
     out = {
         "project_id": project_id,
-        "eligible": len(eligible),         # backfill 口径下"应有"的条数
+        "eligible": len(eligible),         # backfill 口径下"应有"的条数(含补录副本: 它们也要指纹)
+        # 其中从 TV 补录进来的副本(TV 审计 B-19)。eligible 里它们占大头时, "这个项目有 N 条待回填"
+        # 读起来像写作台写了 N 篇 —— 不是。backfill 自己的 5000 上限也会被副本先吃掉。
+        "ingest_copies": ingest_copies,
         "backfilled": len(eligible & done),
         "todo": len(todo),
         # ⚠️ 真的去数一次行数。这里原来写的是 len(done) —— 而 done 来自
@@ -3670,6 +3688,51 @@ def _borrow_for_brief(project: dict, delta: dict | None) -> dict:
             "detail": st.get("detail") or ""}
 
 
+def _borrow_for_brief_bounded(project: dict, delta: dict | None,
+                              budget: float | None = None) -> dict:
+    """``open_project`` 用的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但**只等
+    ``OPEN_PROJECT_BORROW_SEC``**(默认 10 秒), 到点先把简报交出去。
+
+    为什么要有这一层(TV 2026-10-08 审计 A-04): 借阅原来直接在 open_project 的同步路径上
+    等满 ``LIBRARIAN_TIMEOUT_SEC``(60 秒), 而 MCP 客户端只容忍 ~22 秒 —— 超过的不是"少几张
+    卡", 是**整份简报连 P0 硬约束一起丢**, 协议让模型停笔。TV 侧实测 09-22 冷借 13 次里
+    12 次超过 22 秒。馆员选卡要跑一次 LLM, 把 60 秒改小不行(test_librarian_timeout 钉着);
+    把等待从必经路径上拆出来才行。
+
+    到点之后借阅线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型稍后调 borrow_lessons
+    (同参数命中缓存即回)就拿得到。``detail`` 里写清这一点, 模型读得到。
+    """
+    budget = float(config.OPEN_PROJECT_BORROW_SEC if budget is None else budget)
+    try:
+        ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
+        fut = ex.submit(_borrow_for_brief, project, delta)
+    except Exception as exc:  # noqa: BLE001
+        # 线程池建不起来 / submit 失败 (RuntimeError: can't start new thread, 解释器关闭中…): 这一层的
+        # 承诺和 _borrow_for_brief 一样是"绝不抛" —— 抛出去 open_project 整份简报连 P0 硬约束一起丢
+        # (codex review on #93)。按借阅出错回, 简报照交。
+        logger.warning("flywheel borrow could not start (project_id=%s): %s: %s",
+                       project.get("id"), type(exc).__name__, exc)
+        return {"lessons": [], "count": 0,
+                "status": librarian_client.BORROW_ERROR,
+                "elapsed_ms": 0,
+                "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300]}
+    try:
+        try:
+            return fut.result(timeout=budget)
+        except cf.TimeoutError:
+            logger.warning("flywheel borrow exceeded open_project budget %.1fs (project_id=%s); "
+                           "brief returned without cards, borrow thread left running",
+                           budget, project.get("id"))
+            return {"lessons": [], "count": 0,
+                    "status": librarian_client.BORROW_TIMEOUT,
+                    "elapsed_ms": int(budget * 1000),
+                    "detail": (f"open_project 的借阅预算 {budget:g}s 内馆员没回(选卡要跑一次 LLM, "
+                               "冷路径常要 30-80s)。TV 那边会继续选完并写缓存 —— 想要卡的话稍后"
+                               "调 borrow_lessons, 同样的选题/战术参数命中缓存即回")}
+    finally:
+        ex.shutdown(wait=False)
+
+
 def create_project(client, name: str, *, brand: str = "",
                    user_id: str | None = None) -> dict:
     """新建一个项目。owner **恒为调用者**, 不接受 owner 参数。
@@ -3785,6 +3848,9 @@ def list_projects(client, *, user_id: str | None = None) -> list[dict]:
             except Exception:
                 fp_counts[pid] = 0
 
+    # 补录副本数(TV 审计 B-19): 两次固定查询, 不随项目数增长(见 store.ingest_copy_counts)。
+    ingest_counts = store.ingest_copy_counts(client, pids)
+
     out = []
     for p in projects:
         pid = p["id"]
@@ -3792,7 +3858,11 @@ def list_projects(client, *, user_id: str | None = None) -> list[dict]:
         out.append({"project_id": pid, "name": p.get("name") or "",
                     "brand": p.get("brand") or "", "owner_id": p.get("owner_id"),
                     "hard_rules": hard_n, "soft_rules": soft_n,
-                    "fingerprint_count": int(fp_counts.get(pid, 0) or 0)})
+                    "fingerprint_count": int(fp_counts.get(pid, 0) or 0),
+                    # 补录进来的 item 数 —— 独立的一个数, 不是 fingerprint_count 的子集 (补录半途失败的
+                    # 副本有 item 没指纹, codex review on #93), 两者别相减。它的用处是让模型别把
+                    # "1,800 条积累"读成"写过 1,800 篇"。
+                    "ingest_copies": int(ingest_counts.get(pid, 0) or 0)})
     return out
 
 
@@ -4029,14 +4099,26 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                   "skipped_already_fingerprinted": 0,
                   "skipped_duplicate_in_sheet": len(dup_of), "minted": 0, "fingerprinted": 0,
                   "batch_id": None, "batch_ids": [], "identity_error": None,
-                  "fingerprint_error": None, "embedded": False, "dry_run": dry_run,
-                  "written": [], "skipped_after_failure": 0}
+                  "fingerprint_error": None, "chunk_error": None, "embedded": False,
+                  "dry_run": dry_run, "written": [], "skipped_after_failure": 0}
         for start in range(0, len(uniq), TV_SYNC_INGEST_CHUNK):
             idxs = uniq[start:start + TV_SYNC_INGEST_CHUNK]
             entries = [{"title": to_ingest[i].title, "body": to_ingest[i].body} for i in idxs]
-            part = ingest_published(client, target["project_id"], entries,
-                                    user_id=owners[target["project_id"]],
-                                    source=f"tv:{tv_project_id}", dry_run=dry_run)
+            try:
+                part = ingest_published(client, target["project_id"], entries,
+                                        user_id=owners[target["project_id"]],
+                                        source=f"tv:{tv_project_id}", dry_run=dry_run)
+            except Exception as exc:                    # noqa: BLE001
+                # IngestBusy(锁没等到) / 库错: 这一块一条都没处理, 后面的块也别碰 ——
+                # 但**前面块的对照和这次真对上的笔记照样要写进 tv_note_links**, 否则一次
+                # 锁冲突就让整个 TV 项目当晚一行对照都没有、明天从头再来(TV 审计 A-02)。
+                # 没处理到的记成 unmatched + 原因, 明晚自然重来(unmatched 没 version_id,
+                # 不算 already_linked)。
+                logger.exception("tv_sync: 补录第 %d 块失败 (tv=%s), 后面的块不再补",
+                                 start // TV_SYNC_INGEST_CHUNK + 1, tv_project_id)
+                ingest["chunk_error"] = f"{type(exc).__name__}: {exc}"[:300]
+                ingest["skipped_after_failure"] = len(uniq) - start
+                break
             for k in ("to_write", "skipped_already_fingerprinted",
                       "skipped_duplicate_in_sheet", "minted", "fingerprinted"):
                 ingest[k] += part.get(k, 0)
@@ -4070,6 +4152,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             why = None
             if not vid and ingest.get("fingerprint_error"):
                 why = [{"note": "补录半途指纹写失败, 这条还没处理: 先 backfill, 再跑一次 tv-sync"}]
+            elif not vid and ingest.get("chunk_error"):
+                why = [{"note": "补录分块失败(" + ingest["chunk_error"][:80] + "), 这条还没处理: 下次 tv-sync 会再补"}]
             links.append(_link(n, "ingested" if vid else "unmatched",
                                project_id=target["project_id"], version_id=vid,
                                item_id=(item_of.get(vid) or {}).get("item_id") if vid else None,

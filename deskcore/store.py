@@ -937,6 +937,66 @@ def check_drafts_sql(sb, project_id: str, rows: list[dict],
     return None
 
 
+def ingest_copy_counts(sb, project_ids: list[str]) -> dict[str, int]:
+    """每个项目里有多少 item 是从 TV 补录进来的副本(``batches.params.source == 'ingest'``)。
+
+    为什么要单独数 (TV 审计 2026-10-08 B-19): 补录副本 30 天 1,593 条, 比写作台真写的多。
+    ``list_projects`` 报的"历史成稿指纹数"把它们一起算了, 模型看到一个项目"有 1,800 条
+    积累"以为是写过的稿子, 其实大半是 TV 笔记的影子。这里不改那个数(它就是指纹数, 查重
+    口径下是对的), 只把副本数拿出来并排说。
+
+    这个数是**补录进来的 item 数**, 独立于 fingerprint_count (那是 draft_fingerprints 的行数): 补录半途
+    失败的副本有 item 没指纹, 会算进这里而不在指纹数里, 所以两个数别相减 (codex review on #93)。
+
+    固定次数的查询(不随项目数增长): batches 按 project_id 批量拉(翻页) + item 计数走 ``batch_item_counts``
+    RPC; RPC 没部署 / 失败时**自己翻页数**, 不走 ``db.get_batch_item_counts`` 的退路 —— 那条是裸 ``in_``
+    查询, PostgREST 1000 行就静默钳掉, 而这里要数的正是上千条副本的项目 (codex review on #93)。
+    查失败按 0 计 —— 这是清单上的提示, 不该让 list_projects 挂掉。
+    """
+    if not project_ids:
+        return {}
+    out = {str(pid): 0 for pid in project_ids}
+    try:
+        batches = _paged(lambda off, lim: (
+            sb.table("batches").select("id, project_id, params")
+              .in_("project_id", list(project_ids))
+              .order("id")
+              .range(off, off + lim - 1)))
+    except Exception:
+        logger.exception("ingest copy counts: batches lookup failed")
+        return out
+    ingest = [b for b in batches if is_ingest_batch(b)]
+    if not ingest:
+        return out
+    ids = [b["id"] for b in ingest]
+    per_batch: dict[str, int] = {}
+    try:
+        res = sb.rpc("batch_item_counts", {"batch_ids": ids}).execute()
+        for r in (res.data or []):
+            if r.get("batch_id"):
+                per_batch[str(r["batch_id"])] = int(r.get("total") or 0)
+    except Exception:
+        try:
+            for i in range(0, len(ids), 100):
+                part = ids[i:i + 100]
+                rows = _paged(lambda off, lim, part=part: (
+                    sb.table("items").select("id, batch_id")
+                      .in_("batch_id", part)
+                      .order("id")
+                      .range(off, off + lim - 1)))
+                for r in rows:
+                    bid = str(r.get("batch_id"))
+                    per_batch[bid] = per_batch.get(bid, 0) + 1
+        except Exception:
+            logger.exception("ingest copy counts: item counts failed")
+            return out
+    for b in ingest:
+        pid = str(b.get("project_id"))
+        if pid in out:
+            out[pid] += per_batch.get(str(b["id"]), 0)
+    return out
+
+
 def fingerprint_counts(sb, project_ids: list[str]) -> dict[str, int] | None:
     """一次拿一批项目的指纹条数(审计 SUP-004)。RPC 不存在时返回 None。"""
     if not project_ids:
@@ -988,7 +1048,10 @@ def legacy_version_pages(sb, project_id: str, limit: int | None = 5000,
         return (sb.table("items")
                   .select("id, best_version_id, user_id, created_at, "
                           "versions(id, title, body, version_num, embedding), "
-                          "batches!inner(project_id)")
+                          # params 带上: 行里标出补录副本(TV 审计 B-19), 回填照常收它们
+                          # (副本也要指纹, 不然和它正文相同的 TV 笔记隔天又补一份), 只是
+                          # 核对 / 清单的数字要把"真写"和"副本"分开说。
+                          "batches!inner(project_id, params)")
                   .eq("batches.project_id", project_id)
                   .order("created_at", desc=True)
                   .order("id", desc=True)
@@ -1015,6 +1078,7 @@ def legacy_version_pages(sb, project_id: str, limit: int | None = 5000,
                     "title": title,
                     "body": body,
                     "embedding": db._parse_pgvector(chosen.get("embedding")),
+                    "ingest": is_ingest_batch(item.get("batches")),
                 })
             yield out
     except Exception:
@@ -1953,22 +2017,49 @@ def tv_mark_synced(sb, note_ids: list[str]) -> None:
          .in_("note_id", note_ids[i:i + 200]).execute())
 
 
+def is_ingest_batch(batch: dict | None) -> bool:
+    """这个 batch 是不是从 TV 补录进来的副本(``batches.params.source == 'ingest'``)。
+
+    ``params`` 在库里是 jsonb, PostgREST 回 dict; 老行 / 假件可能给字符串, 也认。
+    """
+    params = (batch or {}).get("params")
+    if isinstance(params, str):
+        import json
+        try:
+            params = json.loads(params)
+        except ValueError:
+            return False
+    return isinstance(params, dict) and params.get("source") == "ingest"
+
+
 def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[dict]:
     """项目里每个 item 的定稿版本, 带 created_at / item_id —— 对照要按时间窗判。
 
     与 ``legacy_version_pages`` 同样只取 best / 最新那一版: 发出去的是它。
+
+    ⚠️ **补录副本不进对照索引**(TV 2026-10-08 审计 A-02)。``ingest_published`` 建出来的
+    版本是从 TV 笔记复制来的(``batches.params.source == 'ingest'``), 它只该被它的
+    来源笔记以 ``ingested`` 记住。留在索引里的话, 隔天另一条正文相同的 TV 笔记(SPX
+    的「父记录继承正文」让同一段正文出现在十几条笔记上; 交叉发、重发也会)会
+    ``body_exact`` 命中这个副本 → ``_backfillable`` 放行 → ``--write-tv`` 把
+    ``notes.source_autowriter_version_id`` 写成一个"来自 TV"的版本 —— 正是 tv_sync
+    docstring 说要排除的因果倒置, 只是绕了一条路。生产库 10-08 查到 31 篇这样的
+    血缘(SPX 23 · HATHERINE 7 · LNKT 1), TV 的模型对比视图把它们算成写作台产出。
+    ``ingested`` 对照本身仍靠 ``existing`` 跳过, 不依赖这里。
     """
     def _build(off, lim):
         return (sb.table("items")
                 .select("id, best_version_id, created_at, "
                         "versions(id, title, body, version_num, created_at), "
-                        "batches!inner(project_id)")
+                        "batches!inner(project_id, params)")
                 .eq("batches.project_id", project_id)
                 .order("created_at", desc=True)
                 .order("id", desc=True)
                 .range(off, off + lim - 1))
     out: list[dict] = []
     for item in _paged(_build, hard_cap=limit):
+        if is_ingest_batch(item.get("batches")):
+            continue
         versions = item.get("versions") or []
         if not versions:
             continue

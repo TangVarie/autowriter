@@ -47,7 +47,7 @@
 
 | 部件 | 实测结果 |
 |---|---|
-| `daily-sync` cron | 129 次 run，最近 20+ 次全绿，每天 02:00 UTC（北京 10:00）自动触发 |
+| `daily-sync` cron | 190+ 次 run，连续全绿；cron 写的是 02:17 UTC，但 GitHub 定时实际 **08:04–09:00 UTC 起跑**（北京 16–17 点），跑 45–55 分钟（2026-10-01 ~ 10-08 八次实测）——写作台回程 cron 要排在它后面 |
 | librarian 服务 | `https://truth-vault-production.up.railway.app/health` → `{"ok":true,"service":"flywheel-librarian"}` |
 | worker 服务 | `https://tv-worker-production.up.railway.app/health` → `ok`，`auth.ok=true`、`mode=X-Worker-Key` |
 | 数据 | `truth_vault.notes` 4,223 · 经验卡标注 347 · 馆员缓存 5 · `prepublish_evaluations` 598（全 human） |
@@ -207,13 +207,21 @@ python -m deskcore.cli tv-sync --all --write-tv    # 回填 source_autowriter_*(
 ```
 
 之后每天跑一次 `tv-sync --all --write-tv`。Railway 上另建一个 service（同仓同分支），config-as-code
-指到 `deskcore/railway.cron.json`（cron `0 4 * * *` = 北京 12:00，启动命令就是这条），变量用
+指到 `deskcore/railway.cron.json`（cron `0 14 * * *` = 北京 22:00，启动命令就是这条），变量用
 Variable Reference 引 deskcore 主服务的三个：`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` /
 `GOOGLE_API_KEY`（CLI 不读 `SUPABASE_ANON_KEY`，那是 Streamlit app 的）。增量：已对上的笔记跳过，
-`--rematch` 才重对。
+`--rematch` 才重对。一个 TV 项目抛错（锁没等到、库错）不影响 `--all` 里后面的项目，退出码非零；
+补录某一块抛错时前面已对上的对照照样写，没处理到的记 `unmatched` + 原因、明晚重来。
 
-**为什么是 UTC 04:00**：TV 的夜跑（飞书 → `truth_vault.notes`）是 UTC 02:00（北京 10:00），
-写作台的对照放在它后面，当天的新笔记才对得上。
+**为什么是 UTC 14:00（2026-10-08 从 04:00 挪过来）**：TV 的夜跑（飞书 → `truth_vault.notes`）
+cron 写的是 02:17 UTC，但 GitHub 定时实际 08:04–09:00 UTC 才起跑、跑 45–55 分钟；04:00 排在它
+**前面**，每天对照的都是前一天的笔记（TV 审计 A-05）。14:00 留了 4 小时余量，也避开
+features-sync（实际 16:45–20:48 UTC 起）。
+
+**补录副本不进对照索引（2026-10-08，TV 审计 A-02）**：`versions_for_linking` 跳过
+`batches.params.source = 'ingest'` 的版本。否则隔天另一条正文相同的笔记（SPX 的父记录继承让同一段
+正文出现在多条笔记上）会 `body_exact` 命中副本，`--write-tv` 把"来自 TV 的版本"写成它的来源——
+生产库查到 31 篇这样的血缘，TV 的模型对比视图把它们算成写作台产出。
 
 **`--write-tv` 的口径（TV 2026-09-18 核对后定的）**：只回写真对上的
 `body_exact` / `title_exact` / `fuzzy`（含 `tv_lineage`）；`ingested` 的**不写**——那些版本是从
@@ -907,7 +915,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 |---|---|---|
 | 4 | ~~**把真正的硬规则设成 `hard`**~~ | ✅ **2026-09-20 实查：已经在做了**。全库 465 条规则里 hard **53 条**（47 confirmed / 6 candidate），soft 412 条。P0 硬约束层不再是空的，这一条从待办降级为「继续攒」。（`protocol.md` 里那句「现存库里 300 多条全是 soft、一条 hard 都没有」也同步改了——它会让模型把真的配置问题当成正常） |
 | 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。✅ **前置已解除（2026-09-20，TV D-072）**：A/B/C 选了 **C** —— `prepublish_evaluations` 标成 legacy-only。那条链路事实上已经断了一个月（Streamlit 末次出稿 08-19、表末条 08-20、`review_drafts` 零调用），而且**那张表本来就没有消费者**（598 行里 `pred_tier_class` / `actual_tier` 一条没填）。**停 Streamlit 不再被这条挡着**；管子不拆、`review_drafts` 不下线，重新点亮的条件见 §3 |
-| 6 | 观察 `borrow_lessons` 选卡质量 | TV 书架规模下的选卡准确率**从来没人测过**。不行就在 `librarian/core.py:33` 那个 `CANDIDATE_CAP=50` 的口子加 embedding 预筛 |
+| 6 | 观察 `borrow_lessons` 选卡质量 | TV 书架规模下的选卡准确率**从来没人测过**。不行就在 `librarian/core.py` 那个 `CANDIDATE_CAP`（TV D-089 起 50→24，D-088 起已有按项目的冷路径预筛）的口子再加 embedding 预筛 |
 | 7 | 让 `check_drafts` 的降级信号被人看见 | `semantic_degraded` / `empty_history_warning` 这两个字段没人盯的话，表现就是"查重跑了、全 pass、看着一切正常" |
 | 7b | ~~**推 TV 那边读 `decision_source`**~~ | ✅ **TV 已接**（`scripts/sync_autowriter_decisions_to_prepublish.py` 按 human / rule_based / unverified 分流，只有 `decision_source` 恰好等于 `human` 才算人工）。⚠️ **但这条管子现在零流量**，见下面 7d |
 | ~~7d~~ | ~~**人工审稿这条管子一个月零流量**~~ ✅ **2026-09-20 已定案：legacy-only**（TV D-072，理由与重新点亮的条件见 §3）。下面是当时查到的事实，保留作背景 | 2026-09-20 实查生产库：`autowriter.items` **6,688 行里 `decision_source` 全是 NULL** —— `review_drafts`（2026-09-16 上线）**一次都没被调用过**。存量 598 条 approved/needs_revision 是 Streamlit 时代留下的，TV 那边已按新口径全部归成 `evaluator_type='unverified'`，`prepublish_evaluations` **最后一条停在 2026-08-20**（Streamlit 末次出稿 08-19）。两侧代码都通，**没人拧龙头** —— 与 D-063 通道 2 那次同一个形状。⚠️ 修法**不是**让模型主动多调：协议里「用户没表态就别调」那条守的正是「别替用户点通过」，松掉就是灌伪造正例。这是给人看的决策，不是给代码修的 bug。**已定案：不点亮** |

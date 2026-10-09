@@ -324,8 +324,16 @@ def _tv_sync(core, sb, args) -> int:
         return 1
     rc = 0
     for tv in targets:
-        out = core.tv_sync(sb, tv, dry_run=args.dry_run, write_tv=args.write_tv,
-                           since=args.since, rematch=args.rematch)
+        try:
+            out = core.tv_sync(sb, tv, dry_run=args.dry_run, write_tv=args.write_tv,
+                               since=args.since, rematch=args.rematch)
+        except Exception as exc:                        # noqa: BLE001
+            # 一个 TV 项目炸了(锁 / 库 / 映射), 别让 --all 把后面的项目一起跳掉: 这是
+            # 每天只跑一次的 cron, 一个项目的错不该让其它项目当天一行对照都没有
+            # (TV 2026-10-08 审计 A-02)。记下来、退出码非零, 继续下一个。
+            print(f"\n{tv}: ❌ tv-sync 失败: {type(exc).__name__}: {exc}")
+            rc = 1
+            continue
         head = "[dry-run] " if args.dry_run else ""
         print(f"\n{head}{tv}: {out['note']}")
         print(f"  写作台版本 {out['versions']} 条(项目 {len(out['desk_projects'])} 个), "
@@ -360,6 +368,12 @@ def _tv_sync(core, sb, args) -> int:
             elif id_failed:
                 print(f"  ⚠️ 身份没建全: {ing['identity_error']} —— 重跑 tv-sync 即可, "
                       "已有的会被跳过")
+                rc = 1
+            if ing.get("chunk_error"):
+                # 补录某一块炸了(锁 / 库): 已对上的对照照常写了, 没处理的记 unmatched 明晚重来 —— 但这不是
+                # 一次健康的同步, 退出码得非零, 否则 Railway 的 cron 日志里它和正常跑长得一样 (codex review on #93)。
+                print(f"  ⚠️ 补录有一块炸了({ing['chunk_error']}), {ing.get('skipped_after_failure', 0)} 条记为 "
+                      "unmatched、明晚重来; 已对上的对照照常写了。")
                 rc = 1
         for smp in out["ambiguous_samples"]:
             print(f"  ? 分不出 {smp['note_id']} 「{smp['title']}」: "
