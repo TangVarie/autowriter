@@ -1799,6 +1799,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
                                   "不存在, migrations/001 可能没跑)。并发 check/commit 时"
                                   "可能有撞车的稿子一起进库。")
+            # 审计 A-01: 入库之后模型最常犯的下一步是紧接着自己调 review_drafts。
+            # 把纪律写进返回值, 让它在最容易犯错的那一刻就在眼前。
+            out["next_step"] = ("这批现在是「待审」。用户读完稿子、亲口给出结论之前"
+                                "不要调 review_drafts; 调的时候把他的原话放进 user_words。")
             # ⚠️ 这里原来是 `return out`。改成落到 with 块外面去, 是为了让下面的入库判定
             #    【不在】项目写锁里、也【不在】这个 try 里(设计审查 2026-09-23 §5):
             #    · 在 try 里: 判定一抛, 下面的 except 会把已替换稿的旧指纹无条件放回 ——
@@ -1844,6 +1848,31 @@ HUMAN_DECISIONS = ("approved", "needs_revision")
 
 MAX_REVIEW_DRAFTS = 200
 
+# review_drafts 的 user_words: 用户给结论时的原话, strip 后 1 ~ 200 字(上限与
+# migrations/012 的 CHECK 同一个数, 在 db.DECISION_NOTE_MAX_CHARS)。
+USER_WORDS_MAX_CHARS = db.DECISION_NOTE_MAX_CHARS
+
+
+def _clean_user_words(user_words) -> tuple[str | None, str | None]:
+    """``(原话, 错误)``: 只有一个非 None。空 / 不是字符串 / 超长都是错。"""
+    if not isinstance(user_words, str) or not user_words.strip():
+        return None, ("user_words 必填, 且必须是用户自己给出结论时的原话"
+                      "(比如「这批可以发」「第 3 条重写」)。用户没表态就不要调这个工具, "
+                      "也不要替他编一句。")
+    words = user_words.strip()
+    if len(words) > USER_WORDS_MAX_CHARS:
+        return None, (f"user_words 超过 {USER_WORDS_MAX_CHARS} 字({len(words)}) —— "
+                      "只放用户给结论的那一两句原话, 不要把整段对话塞进来。")
+    return words, None
+
+
+def _seconds_since(batch_created_at) -> int | None:
+    """决策时刻距批次创建的秒数; 批次时间缺失或解析不了就 None, 不硬算。"""
+    created = db.parse_ts(batch_created_at)
+    if created is None:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - created).total_seconds()))
+
 
 def _is_uuid(value: str) -> bool:
     """格式合法的 UUID 才敢送进 ``.in_()``。
@@ -1860,8 +1889,26 @@ def _is_uuid(value: str) -> bool:
 
 
 def review_drafts(client, project_id: str, decisions: list[dict],
+                  user_words: str | None = None,
                   user_id: str | None = None) -> dict:
-    """给已定稿的稿子盖一枚**真实的人工审核决策**。
+    """给已定稿的稿子盖一枚**经代理转述的**人工审核决策。
+
+    ── 2026-10-09 审计 A-01: 来源改记 ``human_via_agent``, 并留下原话 ─────
+    生产库里 ``decision_source='human'`` 的 32 行全部是这个函数写的, 而且全落在
+    模型自己的工具链里(commit 后 10~27 秒就"审完"), 库里分不出「模型自己点了」和
+    「用户说了全过、模型照实记」。所以从此:
+
+      · 这里**只写** ``db.DecisionSource.HUMAN_VIA_AGENT``, 永远不写 ``human`` ——
+        那个值留给 Streamlit 里真的点了按钮的路(app.py);
+      · ``user_words`` **必填**: 用户给结论时的原话, strip 后 1 ~ 200 字, 落到
+        ``items.decision_note``。缺了 / 空的 / 超长 → 整批不写, 回 ``error``;
+      · ``decided_within_s`` 服务端算(距这批稿子 ``batches.created_at`` 的秒数),
+        几秒内审完一批就是模型替用户点的信号。batch 时间缺失存 NULL, 不失败。
+
+    这不是服务端能判「用户真的说过」的闸 —— 它判不了。它做的是把证据留下来,
+    让人和下游**能分开看**。
+
+    ── 为什么非有不可(2026-09-16 评测 AW-01)─────────────────────────────
 
     ── 为什么非有不可(2026-09-16 评测 AW-01)─────────────────────────────
     ``commit_drafts`` 建的 item 是 ``pending`` 且不盖任何决策戳 —— 那是对的,
@@ -1889,9 +1936,10 @@ def review_drafts(client, project_id: str, decisions: list[dict],
     返回 ``{"reviewed", "results"}``; 每条 result 带 ``outcome``:
       · ``recorded``   —— 决策已落库。附 ``previous_status`` 与
                           ``previously_decided_by`` —— 后者是**上一个决定的来源**
-                          (``db.DecisionSource`` 的四个值), 只有 ``human`` 才代表
-                          之前真有人审过; 机器打回的(``auto_hard_rule`` /
-                          ``auto_dedup``)和系统置位(``system``)都不是
+                          (``db.DecisionSource`` 的五个值), 只有 ``human`` /
+                          ``human_via_agent`` 才代表之前真有人审过; 机器打回的
+                          (``auto_hard_rule`` / ``auto_dedup``)和系统置位
+                          (``system``)都不是
       · ``not_found``  —— 这个 version_id 不在本项目里(或根本不存在)
       · ``invalid``    —— 入参不合法: decision 不是那两个值之一, 或 version_id
                           不是合法 UUID(``detail`` 里说是哪一种)
@@ -1901,6 +1949,11 @@ def review_drafts(client, project_id: str, decisions: list[dict],
     **部分失败照样回报已经成功的那几条**, 理由同 ``store.mint_draft_identity``:
     行已经改了而调用方以为没改, 比报一条失败更难查。
     """
+    # user_words 先于一切校验: 不合法就一行都不碰, 也不去查库。
+    words, words_error = _clean_user_words(user_words)
+    if words_error:
+        return {"reviewed": 0, "results": [], "error": words_error,
+                "hint": "等用户读完稿子、亲口给出结论, 再把他的原话放进 user_words 调一次。"}
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not decisions:
         return {"reviewed": 0, "results": []}
@@ -1953,9 +2006,15 @@ def review_drafts(client, project_id: str, decisions: list[dict],
             continue
 
         try:
+            # ⚠️ 永远是 HUMAN_VIA_AGENT, 不是 HUMAN —— 这条路上没有人点过按钮,
+            #    只有模型转述。tests/test_review_provenance.py 用 AST 守着 deskcore/
+            #    里不再出现写 'human' 的代码。
             db.update_item_status(client, hit["item_id"], decision,
-                                  source=db.DecisionSource.HUMAN,
-                                  reviewer_id=user_id)
+                                  source=db.DecisionSource.HUMAN_VIA_AGENT,
+                                  reviewer_id=user_id,
+                                  decision_note=words,
+                                  decided_within_s=_seconds_since(
+                                      hit.get("batch_created_at")))
         except Exception as exc:                 # noqa: BLE001
             logger.exception("review_drafts 写库失败 (version=%s)", vid)
             results.append({**row, "outcome": "failed",
@@ -2422,6 +2481,10 @@ MIGRATION_010_PROBE_SQL = (
 # 011 建一个视图(发牌台账 → 版本 → TV 笔记 → tier)。PostgREST 能直接读视图, 探得到。
 MIGRATION_ANGLE_OUTCOMES = "011_angle_outcomes_view.sql"
 _MIGRATION_011_VIEW = "v_angle_outcomes"
+# 012 给 items 加 decision_note / decided_within_s 两列, 并让 decision_source 的 CHECK
+# 多认 human_via_agent(审计 A-01)。列探得到; CHECK 从 PostgREST 探不到(要写才知道),
+# 用列当代理 —— 两者在同一个事务里, 不存在只跑了一半的中间态。
+MIGRATION_REVIEW_PROVENANCE = "012_review_via_agent_provenance.sql"
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -2751,6 +2814,17 @@ def migration_state(client) -> dict:
          "发牌加权看不到结果(哪些坐标出了爆文); 不影响任何现有功能。⚠️ 视图不在也可能"
          "是跑 011 时库里还没有 truth_vault.notes —— 那时它只打一行 NOTICE 跳过, TV 落库"
          "之后重跑 011 即可")
+
+    # ── 012: 人审出处补两列 + CHECK 多认 human_via_agent(审计 A-01) ──
+    state, note = _probe_ok(lambda: client.table("items")
+                            .select("id,decision_note,decided_within_s")
+                            .limit(1).execute(),
+                            predicate=store.schema_object_missing)
+    _add(MIGRATION_REVIEW_PROVENANCE, "items 的 decision_note / decided_within_s 两列",
+         state, note,
+         "⚠️ 硬失败, 但只打 review_drafts: 它无条件写 human_via_agent + 这两列, 缺了"
+         "每条都报 failed(db.update_item_status 会翻译成人话)。Streamlit 的通过 / 打回"
+         "仍写 human + 三列, 不受影响")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑

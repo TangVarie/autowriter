@@ -195,12 +195,13 @@ def main() -> int:
     # 决策出处那三列(审计 COR-004 / COR-007)。**基线和增量都要有** ——
     # migrations/README 的规矩是加列两边都改, 而这个 harness 跑的正是
     # 000 → 001..N, 只改一边的话这里就该红。
-    for col in ("decision_source", "reviewer_id", "decided_at"):
+    for col in ("decision_source", "reviewer_id", "decided_at",
+                "decision_note", "decided_within_s"):          # 后两列: 012
         n = sql("SELECT count(*) FROM information_schema.columns "
                 f"WHERE table_schema='autowriter' AND table_name='items' "
                 f"AND column_name='{col}';")
         if n != "1":
-            print(f"  [FAIL] items.{col} 没建出来 —— 000 与 006 只改了一边?")
+            print(f"  [FAIL] items.{col} 没建出来 —— 000 与 006/012 只改了一边?")
             bad += 1
     # CHECK 的取值集合必须和 db.DecisionSource 对得上。两边各写一份迟早漂,
     # 而漂了的表现是"写进去被数据库拒", 出现在离现场很远的地方。

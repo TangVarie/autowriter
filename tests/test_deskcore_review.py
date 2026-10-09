@@ -8,7 +8,9 @@
 
 所以这里盯的不是"能不能改状态"，是**改出来的那条记录是不是诚实的**：
 
-  1. 决策来源必须是 `human`，审稿人必须是**真的点了这一下的那个人**；
+  1. 决策来源必须是 `human_via_agent`（结论来自用户、经模型转述写入；审计 A-01
+     之后这条路**永远不写** `human`，那个值留给 Streamlit 里真的点了按钮的路），
+     审稿人必须是**真的给出这条结论的那个人**；
   2. 打回和通过是同等公民 —— 只能记通过的入口产出的仍然是清一色正例，
      与不做无异（COR-004 治的正是这类"伪造的人工反馈"）；
   3. 不认 `pending` —— 迭代后重置回待审是 `SYSTEM`，从人审入口进来就是伪造；
@@ -33,6 +35,9 @@ ITEM_A, VER_A = "cccc0000-0000-0000-0000-00000000000a", "dddd0000-0000-0000-0000
 ITEM_B, VER_B = "cccc0000-0000-0000-0000-00000000000b", "dddd0000-0000-0000-0000-00000000000b"
 # 别的项目的稿子 —— 本项目的审核入口一行也不该碰得到它
 ITEM_X, VER_X = "cccc0000-0000-0000-0000-0000000000cc", "dddd0000-0000-0000-0000-0000000000dd"
+# 用户给结论时的原话 —— 审计 A-01 之后 review_drafts 必填(细节在
+# tests/test_review_provenance.py); 这里每条用例只是把它带上。
+WORDS = "这批可以发"
 
 
 def _items() -> list[dict]:
@@ -86,7 +91,7 @@ def _row(c: FakeClient, item_id: str) -> dict:
 def test_approve_records_a_real_human_decision():
     c = _client()
     out = core.review_drafts(c, PROJ, [
-        {"version_id": VER_A, "decision": "approved"}], user_id=ME)
+        {"version_id": VER_A, "decision": "approved"}], user_words=WORDS, user_id=ME)
 
     assert out["reviewed"] == 1
     assert out["results"][0]["outcome"] == "recorded"
@@ -94,8 +99,9 @@ def test_approve_records_a_real_human_decision():
 
     row = _row(c, ITEM_A)
     assert row["status"] == "approved"
-    assert row["decision_source"] == db.DecisionSource.HUMAN
-    assert row["reviewer_id"] == ME, "审稿人必须是真的点了这一下的那个人"
+    assert row["decision_source"] == db.DecisionSource.HUMAN_VIA_AGENT, \
+        "工具这条路没有人点过按钮, 只有模型转述 —— 不许冒充 human"
+    assert row["reviewer_id"] == ME, "审稿人必须是真的给出这条结论的那个人"
     assert row["decided_at"], "缺 decided_at 的决策在 TV 那边无法排序/归档"
 
 
@@ -103,12 +109,12 @@ def test_reject_is_a_first_class_citizen():
     """只能点通过的审核入口产出的仍然是清一色正例 —— 与不做无异。"""
     c = _client()
     out = core.review_drafts(c, PROJ, [
-        {"version_id": VER_A, "decision": "needs_revision"}], user_id=ME)
+        {"version_id": VER_A, "decision": "needs_revision"}], user_words=WORDS, user_id=ME)
 
     assert out["reviewed"] == 1
     row = _row(c, ITEM_A)
     assert row["status"] == "needs_revision"
-    assert row["decision_source"] == db.DecisionSource.HUMAN
+    assert row["decision_source"] == db.DecisionSource.HUMAN_VIA_AGENT
     assert row["reviewer_id"] == ME
 
 
@@ -120,7 +126,7 @@ def test_reviewer_is_always_the_caller():
     c = _client()
     core.review_drafts(c, PROJ, [
         {"version_id": VER_A, "decision": "approved",
-         "reviewer_id": SOMEONE_ELSE}], user_id=ME)
+         "reviewer_id": SOMEONE_ELSE}], user_words=WORDS, user_id=ME)
     assert _row(c, ITEM_A)["reviewer_id"] == ME
 
 
@@ -131,7 +137,7 @@ def test_previous_decision_is_reported_back():
                      "decision_source": db.DecisionSource.HUMAN})
     c = _client(items)
     out = core.review_drafts(c, PROJ, [
-        {"version_id": VER_A, "decision": "needs_revision"}], user_id=ME)
+        {"version_id": VER_A, "decision": "needs_revision"}], user_words=WORDS, user_id=ME)
 
     r = out["results"][0]
     assert r["outcome"] == "recorded"
@@ -156,7 +162,7 @@ def test_previously_decided_by_can_be_a_machine(source):
     items[0].update({"status": "needs_revision", "decision_source": source})
     c = _client(items)
     out = core.review_drafts(c, PROJ, [
-        {"version_id": VER_A, "decision": "approved"}], user_id=ME)
+        {"version_id": VER_A, "decision": "approved"}], user_words=WORDS, user_id=ME)
 
     r = out["results"][0]
     assert r["outcome"] == "recorded"
@@ -182,12 +188,19 @@ def test_the_docs_spell_out_every_source_this_field_can_carry():
         "protocol.md": Path(core.__file__).with_name(
             "protocol.md").read_text(encoding="utf-8"),
     }
+    # ⚠️ protocol.md 这次刻意没改(审计 A-01, 2026-10-09): 它的每一个字都盖进
+    # protocol_version, 改一行就逼所有写手重新导入 skill。human_via_agent 先只在
+    # 工具 docstring(服务端, 永远是最新的)里解释; 下次正文真要改版时一起补进去,
+    # 补了就把这个例外删掉。
+    _not_yet_in_protocol = {db.DecisionSource.HUMAN_VIA_AGENT}
     for where, text in texts.items():
         said = [p for p in re.split(r"\n\s*\n", text)
                 if "previously_decided_by" in p]
         assert said, f"{where} 里根本没解释 previously_decided_by"
         blob = "\n".join(said)
         for src in sorted(db._DECISION_SOURCES):
+            if where == "protocol.md" and src in _not_yet_in_protocol:
+                continue
             assert src in blob, f"{where} 没说 {src} 这种来源是什么意思"
 
 
@@ -201,7 +214,7 @@ def test_only_two_decisions_are_accepted(bad):
     既不是审稿也不是检测。让它从人审入口进来就等于伪造一条人工决策。"""
     c = _client()
     out = core.review_drafts(c, PROJ, [
-        {"version_id": VER_A, "decision": bad}], user_id=ME)
+        {"version_id": VER_A, "decision": bad}], user_words=WORDS, user_id=ME)
 
     assert out["reviewed"] == 0
     assert out["results"][0]["outcome"] == "invalid"
@@ -212,7 +225,7 @@ def test_only_two_decisions_are_accepted(bad):
 def test_other_projects_version_is_not_reachable():
     c = _client()
     out = core.review_drafts(c, PROJ, [
-        {"version_id": VER_X, "decision": "approved"}], user_id=ME)
+        {"version_id": VER_X, "decision": "approved"}], user_words=WORDS, user_id=ME)
 
     assert out["reviewed"] == 0
     assert out["results"][0]["outcome"] == "not_found"
@@ -233,7 +246,7 @@ def test_malformed_version_id_does_not_take_the_whole_batch_down():
         {"version_id": VER_A, "decision": "approved"},
         {"version_id": "手抖打错的id", "decision": "approved"},
         {"version_id": VER_B, "decision": "needs_revision"},
-    ], user_id=ME)
+    ], user_words=WORDS, user_id=ME)
 
     assert out["reviewed"] == 2, "好的那两条必须照常落库"
     assert [r["outcome"] for r in out["results"]] == [
@@ -254,7 +267,7 @@ def test_same_item_twice_is_refused_not_silently_overwritten():
     out = core.review_drafts(c, PROJ, [
         {"version_id": VER_A, "decision": "approved"},
         {"version_id": VER_A, "decision": "needs_revision"},
-    ], user_id=ME)
+    ], user_words=WORDS, user_id=ME)
 
     assert out["reviewed"] == 1
     assert [r["outcome"] for r in out["results"]] == ["recorded", "duplicate"]
@@ -266,7 +279,7 @@ def test_someone_elses_project_is_refused():
     c = _client(owner=SOMEONE_ELSE)
     with pytest.raises(PermissionError):
         core.review_drafts(c, PROJ, [
-            {"version_id": VER_A, "decision": "approved"}], user_id=ME)
+            {"version_id": VER_A, "decision": "approved"}], user_words=WORDS, user_id=ME)
 
 
 def test_batch_cap_is_enforced():
@@ -274,7 +287,7 @@ def test_batch_cap_is_enforced():
     too_many = [{"version_id": VER_A, "decision": "approved"}
                 ] * (core.MAX_REVIEW_DRAFTS + 1)
     with pytest.raises(ValueError):
-        core.review_drafts(c, PROJ, too_many, user_id=ME)
+        core.review_drafts(c, PROJ, too_many, user_words=WORDS, user_id=ME)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -292,7 +305,7 @@ def test_partial_success_reports_both_sides():
         {"version_id": VER_A, "decision": "approved"},
         {"version_id": VER_X, "decision": "approved"},       # 别的项目
         {"version_id": VER_B, "decision": "bogus"},          # 非法决策
-    ], user_id=ME)
+    ], user_words=WORDS, user_id=ME)
 
     assert out["reviewed"] == 1
     outcomes = [r["outcome"] for r in out["results"]]
@@ -304,7 +317,7 @@ def test_partial_success_reports_both_sides():
 
 def test_empty_input_is_a_noop():
     c = _client()
-    assert core.review_drafts(c, PROJ, [], user_id=ME) == {
+    assert core.review_drafts(c, PROJ, [], user_words=WORDS, user_id=ME) == {
         "reviewed": 0, "results": []}
 
 

@@ -1543,12 +1543,16 @@ def items_for_versions(sb, project_id: str,
     同时回 ``status`` 与 ``decision_source``，好让审核入口能分清
     「这条还没人审」和「这条已经被谁审过了」——两者都该让调用方看见，
     而不是闷头覆盖。
+
+    还顺路带回 ``batch_created_at``(这批稿子建出来的时刻; 同一条 inner join,
+    不多一次查询): ``review_drafts`` 拿它算 ``decided_within_s``(审计 A-01)。
+    batch 行上没有 created_at 时是 None, 调用方据此存 NULL, 不硬算。
     """
     out: dict[str, dict] = {}
     for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
         res = (sb.table("versions")
                  .select("id, items!inner(id, status, decision_source, "
-                         "batch_id, batches!inner(project_id))")
+                         "batch_id, batches!inner(project_id, created_at))")
                  .in_("id", chunk)
                  .eq("items.batches.project_id", project_id)
                  .execute())
@@ -1560,6 +1564,7 @@ def items_for_versions(sb, project_id: str,
                 "item_id": str(item["id"]),
                 "status": item.get("status"),
                 "decision_source": item.get("decision_source"),
+                "batch_created_at": (item.get("batches") or {}).get("created_at"),
             }
     return out
 

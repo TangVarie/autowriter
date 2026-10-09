@@ -168,7 +168,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
 | | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8） |
-| 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human` + 真实 reviewer + 时间。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
+| 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human_via_agent`（结论来自用户、经模型转述写入；Streamlit 里亲手点按钮的才是 `human`）+ 真实 reviewer + 时间 + **用户原话 `user_words`（必填，落 `decision_note`）** + 距入库秒数 `decided_within_s`。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
 | 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0 |
@@ -361,7 +361,20 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 
 ⚠️ **用户没表态就不许调。** 这是给模型的纪律，写在协议里：他只说"写 20 条""入库""导出"，那都不是结论。替他点通过等于灌一条伪造的正例，比不记更糟。
 
-`commit_drafts` 那边一个字没改，`tests/test_deskcore_review.py` 最后一条断言专门守着"入库路径不许写 `decision_source` / `reviewer_id`"——最容易犯的下一个错就是"既然现在能记人审了，那让 commit 顺手记一条"。
+⚠️ **2026-10-09 审计 A-01：这条路写的是 `human_via_agent`，不再是 `human`。** 实查生产库，`decision_source='human'` 的 32 行**全部**是 `review_drafts` 写的，而且全落在模型自己的工具链里（`commit_drafts` 之后 10~27 秒就"审完"）；deskcore 不记成功的工具调用，于是库里分不出「模型自己点了通过」和「用户说了全过、模型照实记」。服务端判不了用户到底说没说过，能做的是把证据留下来：
+
+| 改了什么 | 为什么 |
+|---|---|
+| 工具只写 `decision_source=human_via_agent` | `human` 留给 Streamlit 里真的点了按钮的路（`app.py`，一个字没改）。下游一眼能分开，要不要把它当人工反馈由消费方定 |
+| `user_words` **必填**（1~200 字，strip 后），落 `items.decision_note` | 用户给结论时的**原话**，给人复核"这条通过是不是真有人说过"。缺 / 空 / 超长 → 返回 `error`，**整批不写、库都不查** |
+| `decided_within_s` 服务端算（距这批稿子 `batches.created_at` 的秒数，batch 无时间存 NULL） | 入库几秒后就"审完 20 篇"一眼就看得出 |
+| `commit_drafts` 返回值多一句 `next_step` | 入库之后模型最常犯的下一步就是紧接着自己调 `review_drafts`，纪律要在最容易犯错的那一刻眼前 |
+
+迁移是 `012_review_via_agent_provenance.sql`（两列 + CHECK 多一个值 + 一条只盖 `human_via_agent` 的部分索引；006 那条 `human` 索引不动）。存量 32 行**不回填**——数据里没有证据说它们是哪种。协议正文 `protocol.md` 这次**没动**：它的每个字都盖进 `protocol_version`，改一行就逼所有写手重新导入 skill，规则先放在工具 docstring 和 `next_step` 里，下次正文真要改版时一起补。`tests/test_review_provenance.py` 用 AST 守着 `deskcore/` 下不再有写 `'human'` 的代码。
+
+⚠️ **TV 侧还没接**：`sync_autowriter_decisions_to_prepublish.py` 只认 `decision_source` 恰好等于 `human` 才算人工，`human_via_agent` 现在会被它归成 `unverified`。要不要算、怎么算，由 TV 的 DECISIONS 定，本仓不替它决定。
+
+`commit_drafts` 那边仍然不盖决策戳，`tests/test_deskcore_review.py` 最后一条断言专门守着"入库路径不许写 `decision_source` / `reviewer_id`"——最容易犯的下一个错就是"既然现在能记人审了，那让 commit 顺手记一条"。
 
 **剩下的在 TV 侧**：它现在仍然把捞到的全部写成 `evaluator_type='human'`、不读 `decision_source`。AW 这侧的字段已经齐了。
 
@@ -574,8 +587,8 @@ env：
 `004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
 `006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql` /
 `008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql` /
-`011_angle_outcomes_view.sql`
-**十一个，按编号顺序跑，别跳号**（建议先在
+`011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql`
+**十二个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -607,6 +620,8 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 - `009_tv_links.sql` 是写作台 ↔ TV 的稿子对照（2026-09-17）：两张表 + 两个跨 schema 的 RPC。为什么要它：TV 5966 条笔记里带写作台 lineage 的是 **0 条**——原设计让运营把 `export_drafts` 的六个 ID 列手抄进飞书，三周零匹配，到 TV 手里的表根本没有那六列。两边在同一个库里、内容都是写作台产的，`tv-sync` 按内容对（正文前 40 字 / 标题 / 时间窗内四字串包含度），对不上的直接从 TV 的全文补录进指纹库。**运营不用做任何事，飞书表不用加列。** 见 §3.7。
 
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
+
+- `012_review_via_agent_provenance.sql`（2026-10-09，审计 A-01，§3.6）：`items` 加 `decision_note`（用户原话，≤ 200 字）/ `decided_within_s`（距批次创建的秒数）两列，`decision_source` 的 CHECK 多认 `human_via_agent`，另建一条只盖它的部分索引。**只打 `review_drafts`**：它无条件写 `human_via_agent` + 两列，缺了每条都报 `failed`（`db.update_item_status` 会翻译成"跑 012"）；Streamlit 的通过 / 打回仍写 `human` + 三列，不受影响。`doctor` 探两列（CHECK 从 PostgREST 探不到，用列当代理，两者同一事务）。
 
 - `010_tv_links_rls.sql`：`009` 建的三张表补开 RLS（2026-09-18，Supabase advisor 对着生产库报出来的）。不是漏洞——anon / authenticated 对它们没有表级 GRANT，service_role 绕 RLS——只是与本 schema 其他表同一口径。`doctor` 探不到它（RLS 开没开从 PostgREST 读起来一样），报 `unprobeable` 并给出要在 SQL Editor 跑的那句；`tests/sql_parity_check.py` 守「每张表都开了 RLS」这条不变量。
 
