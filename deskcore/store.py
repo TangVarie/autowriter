@@ -945,9 +945,13 @@ def ingest_copy_counts(sb, project_ids: list[str]) -> dict[str, int]:
     积累"以为是写过的稿子, 其实大半是 TV 笔记的影子。这里不改那个数(它就是指纹数, 查重
     口径下是对的), 只把副本数拿出来并排说。
 
-    两次固定查询(不随项目数增长): batches 按 project_id 批量拉(翻页) + item 计数走
-    ``db.get_batch_item_counts``(RPC, 没部署退回一次 in_ 查询)。查失败按 0 计 —— 这是清单上的
-    提示, 不该让 list_projects 挂掉。
+    这个数是**补录进来的 item 数**, 独立于 fingerprint_count (那是 draft_fingerprints 的行数): 补录半途
+    失败的副本有 item 没指纹, 会算进这里而不在指纹数里, 所以两个数别相减 (codex review on #93)。
+
+    固定次数的查询(不随项目数增长): batches 按 project_id 批量拉(翻页) + item 计数走 ``batch_item_counts``
+    RPC; RPC 没部署 / 失败时**自己翻页数**, 不走 ``db.get_batch_item_counts`` 的退路 —— 那条是裸 ``in_``
+    查询, PostgREST 1000 行就静默钳掉, 而这里要数的正是上千条副本的项目 (codex review on #93)。
+    查失败按 0 计 —— 这是清单上的提示, 不该让 list_projects 挂掉。
     """
     if not project_ids:
         return {}
@@ -964,15 +968,32 @@ def ingest_copy_counts(sb, project_ids: list[str]) -> dict[str, int]:
     ingest = [b for b in batches if is_ingest_batch(b)]
     if not ingest:
         return out
+    ids = [b["id"] for b in ingest]
+    per_batch: dict[str, int] = {}
     try:
-        counts = db.get_batch_item_counts(sb, [b["id"] for b in ingest])
+        res = sb.rpc("batch_item_counts", {"batch_ids": ids}).execute()
+        for r in (res.data or []):
+            if r.get("batch_id"):
+                per_batch[str(r["batch_id"])] = int(r.get("total") or 0)
     except Exception:
-        logger.exception("ingest copy counts: item counts failed")
-        return out
+        try:
+            for i in range(0, len(ids), 100):
+                part = ids[i:i + 100]
+                rows = _paged(lambda off, lim, part=part: (
+                    sb.table("items").select("id, batch_id")
+                      .in_("batch_id", part)
+                      .order("id")
+                      .range(off, off + lim - 1)))
+                for r in rows:
+                    bid = str(r.get("batch_id"))
+                    per_batch[bid] = per_batch.get(bid, 0) + 1
+        except Exception:
+            logger.exception("ingest copy counts: item counts failed")
+            return out
     for b in ingest:
         pid = str(b.get("project_id"))
         if pid in out:
-            out[pid] += int((counts.get(b["id"]) or {}).get("total") or 0)
+            out[pid] += per_batch.get(str(b["id"]), 0)
     return out
 
 

@@ -19,6 +19,8 @@ import re
 import threading
 import time
 
+import pytest
+
 import config
 import librarian_client as lib
 from deskcore import core
@@ -80,6 +82,38 @@ def test_borrow_lessons_tool_still_waits_the_full_librarian_timeout(monkeypatch)
     monkeypatch.setattr(config, "OPEN_PROJECT_BORROW_SEC", 0.1)
     out = core.borrow_lessons(_client(), PID, user_id=ME, draft_topic="早八通勤")
     assert out["status"] == lib.BORROW_BORROWED and out["count"] == 1
+
+
+class _DeadPool:
+    """起不来的线程池: 构造或 submit 抛 (生产形态 RuntimeError: can't start new thread / 解释器关闭中)。"""
+
+    def __init__(self, *a, fail_at: str = "submit", **k):
+        if fail_at == "init":
+            raise RuntimeError("can't start new thread")
+
+    def submit(self, *a, **k):
+        raise RuntimeError("can't start new thread")
+
+    def shutdown(self, wait=False):
+        pass
+
+
+@pytest.mark.parametrize("fail_at", ["init", "submit"])
+def test_a_thread_pool_that_cannot_start_degrades_to_borrow_error(monkeypatch, caplog, fail_at):
+    """``_borrow_for_brief_bounded`` 的承诺和 ``_borrow_for_brief`` 一样是**绝不抛** —— 它在
+    open_project 的必经路径上, 抛出去整份简报连 P0 硬约束一起丢 (codex review on #93)。
+    线程池建不起来 / submit 失败时要按 BORROW_ERROR 回, 简报照交。"""
+    fake = _SlowLibrarian(delay=0.0)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+    monkeypatch.setattr(core.cf, "ThreadPoolExecutor",
+                        lambda *a, **k: _DeadPool(*a, fail_at=fail_at, **k))
+    b = core.build_writing_brief(_client(), PID, user_id=ME, brief={"draft_topic": "早八通勤"})
+    assert "p0" in b and "stable" in b, "简报本体必须交出去"
+    assert b["lessons"] == [] and b["counts"]["lessons"] == 0
+    assert b["lessons_status"]["status"] == lib.BORROW_ERROR
+    assert "起不来" in b["lessons_status"]["detail"] and "RuntimeError" in b["lessons_status"]["detail"]
+    assert fake.briefs == [], "线程都没起来, 馆员不该被调到"
+    assert any("could not start" in r.getMessage() for r in caplog.records), "留痕: 日志里 grep 得到"
 
 
 def _code_bounds() -> tuple[float, float, float]:

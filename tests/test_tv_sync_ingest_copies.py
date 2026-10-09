@@ -214,3 +214,61 @@ def test_review_page_labels_ingest_batches_with_the_one_predicate():
                                       "params": {"source": "ingest", "file": "tv:X"}}, "P").startswith("补录副本 · P")
     assert not ns["_format_batch_label"]({"tactic": "通用", "created_at": "2026-10-08T00:00:00+00:00",
                                           "params": {"source": "deskcore"}}, "P").startswith("补录副本")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 5. codex review on #93: 补录块炸了退出码非零; 副本计数自己翻页 (不走 1000 行静默钳位的裸 in_)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_cli_tv_sync_exits_nonzero_when_an_ingest_chunk_fails(monkeypatch, capsys):
+    """块失败后对照照写、没处理的记 unmatched 明晚重来 —— 但这不是一次健康的同步: Railway 的
+    cron 日志里退出码得非零, 否则它和正常跑长得一样 (codex review on #93)。"""
+    c = _client(NOTES)
+    monkeypatch.setattr(core, "sb", lambda: c)
+
+    def busy(*a, **k):
+        raise core.IngestBusy("项目上另一个写操作正在跑")
+    monkeypatch.setattr(core, "ingest_published", busy)
+
+    assert cli.main(["tv-sync", "--tv-project", TV]) == 1
+    out = capsys.readouterr().out
+    assert "补录有一块炸了" in out and "IngestBusy" in out and "明晚重来" in out
+    assert len(c.rows["tv_note_links"]) == 3, "退出码非零不等于对照不写: 对上的三行还是要落"
+
+
+def _ingest_rows(n_items: int, *, batch="b_big", project=P1):
+    return ({"id": batch, "project_id": project, "user_id": ME, "params": {"source": "ingest", "file": "tv:x"}},
+            [{"id": f"{batch}_i{i:05d}", "batch_id": batch, "user_id": ME, "status": "pending"} for i in range(n_items)])
+
+
+def test_ingest_copy_counts_pages_items_itself_when_the_rpc_is_missing():
+    """RPC 没部署时自己翻页数, 不走 ``db.get_batch_item_counts`` 的裸 ``in_`` 退路 —— 那条被服务端
+    db-max-rows 在 1000 行静默钳掉, 而要数的正是上千条副本的项目 (codex review on #93)。
+    反证: 假库 max_rows=1000 模拟钳位, 1,200 条副本要数出 1,200 而不是 1,000。"""
+    b, items = _ingest_rows(1200)
+    other_b, other_items = _ingest_rows(5, batch="b_small", project="P_other")
+    c = FakeClient(rows={"batches": [b, other_b], "items": items + other_items}, max_rows=1000)
+    got = store.ingest_copy_counts(c, [P1, "P_other"])
+    assert got == {P1: 1200, "P_other": 5}, got
+    assert [n for n, _ in c.rpc_calls] == ["batch_item_counts"], "先试 RPC, 没有再翻页"
+
+
+def test_ingest_copy_counts_prefers_the_rpc_when_it_exists():
+    b, items = _ingest_rows(3)
+    c = FakeClient(rows={"batches": [b], "items": items},
+                   rpc_impl={"batch_item_counts": lambda a: [{"batch_id": "b_big", "total": 3}]})
+    assert store.ingest_copy_counts(c, [P1]) == {P1: 3}
+
+
+def test_ingest_copy_counts_does_not_fall_back_to_the_clamped_helper():
+    """按【调用】看, 不按文本看: docstring 里提到那个退路是允许的, 调它不行。"""
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(store.ingest_copy_counts)))
+    called = {n.func.attr for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    called |= {n.func.id for n in ast.walk(tree)
+               if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "get_batch_item_counts" not in called, "裸 in_ 退路回来了: 1000 行以上的副本会被静默钳掉"
+    assert "_paged" in called and "in_" in called and "rpc" in called

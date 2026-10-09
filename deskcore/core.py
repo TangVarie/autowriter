@@ -3703,9 +3703,20 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
     (同参数命中缓存即回)就拿得到。``detail`` 里写清这一点, 模型读得到。
     """
     budget = float(config.OPEN_PROJECT_BORROW_SEC if budget is None else budget)
-    ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
     try:
+        ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
         fut = ex.submit(_borrow_for_brief, project, delta)
+    except Exception as exc:  # noqa: BLE001
+        # 线程池建不起来 / submit 失败 (RuntimeError: can't start new thread, 解释器关闭中…): 这一层的
+        # 承诺和 _borrow_for_brief 一样是"绝不抛" —— 抛出去 open_project 整份简报连 P0 硬约束一起丢
+        # (codex review on #93)。按借阅出错回, 简报照交。
+        logger.warning("flywheel borrow could not start (project_id=%s): %s: %s",
+                       project.get("id"), type(exc).__name__, exc)
+        return {"lessons": [], "count": 0,
+                "status": librarian_client.BORROW_ERROR,
+                "elapsed_ms": 0,
+                "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300]}
+    try:
         try:
             return fut.result(timeout=budget)
         except cf.TimeoutError:
@@ -3848,8 +3859,9 @@ def list_projects(client, *, user_id: str | None = None) -> list[dict]:
                     "brand": p.get("brand") or "", "owner_id": p.get("owner_id"),
                     "hard_rules": hard_n, "soft_rules": soft_n,
                     "fingerprint_count": int(fp_counts.get(pid, 0) or 0),
-                    # fingerprint_count 含补录副本(查重基线就该含); 这个数说明其中多少是副本,
-                    # 模型别把"1,800 条积累"读成"写过 1,800 篇"。
+                    # 补录进来的 item 数 —— 独立的一个数, 不是 fingerprint_count 的子集 (补录半途失败的
+                    # 副本有 item 没指纹, codex review on #93), 两者别相减。它的用处是让模型别把
+                    # "1,800 条积累"读成"写过 1,800 篇"。
                     "ingest_copies": int(ingest_counts.get(pid, 0) or 0)})
     return out
 

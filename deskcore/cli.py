@@ -369,6 +369,12 @@ def _tv_sync(core, sb, args) -> int:
                 print(f"  ⚠️ 身份没建全: {ing['identity_error']} —— 重跑 tv-sync 即可, "
                       "已有的会被跳过")
                 rc = 1
+            if ing.get("chunk_error"):
+                # 补录某一块炸了(锁 / 库): 已对上的对照照常写了, 没处理的记 unmatched 明晚重来 —— 但这不是
+                # 一次健康的同步, 退出码得非零, 否则 Railway 的 cron 日志里它和正常跑长得一样 (codex review on #93)。
+                print(f"  ⚠️ 补录有一块炸了({ing['chunk_error']}), {ing.get('skipped_after_failure', 0)} 条记为 "
+                      "unmatched、明晚重来; 已对上的对照照常写了。")
+                rc = 1
         for smp in out["ambiguous_samples"]:
             print(f"  ? 分不出 {smp['note_id']} 「{smp['title']}」: "
                   + "; ".join(f"{c['version_id'][:8]}({c['score']}, {c['lag_days']}d)"
