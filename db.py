@@ -1135,10 +1135,14 @@ def update_item_status(
     **不要**拿 item 的 owner 去兜底 —— "谁拥有"和"谁审的"是两件事, 混起来正是
     COR-007 那个失真。
 
-    ``decision_note`` / ``decided_within_s``(migrations/012, 审计 A-01)**只在传了时
-    才写** —— 没传就不出现在 payload 里, 老调用点(Streamlit 的按钮)和没跑 012 的库
-    都不受影响。前者是用户的原话(≤ 200 字, 与 012 的 CHECK 同一个数, 这里先拦,
-    免得错误出现在离现场很远的地方), 后者是决策距批次创建的秒数, 由调用方算。
+    ``decision_note`` / ``decided_within_s``(migrations/012, 审计 A-01)**每次决定都整行
+    重写**: 传了就写, 没传就写 NULL。不能"没传就不碰"(codex review on #94, P1): 一条经
+    review_drafts 记过原话的稿子, 之后迭代被重置成 system、或在 Streamlit 里被人改判成
+    human, 这两列若留着, 行上就是「最新的决定 + 上一次代理决定的证据」—— 正是 012 要分开
+    的东西被重新混在一起。代价是 012 从此和 006 一样是硬前提(没跑它, 任何审稿决定都
+    写不进去, 下面翻译成人话)。前者是用户的原话(≤ 200 字, 与 012 的 CHECK 同一个数,
+    这里先拦, 免得错误出现在离现场很远的地方), 后者是决策距被审那一版建出来的秒数,
+    由调用方算。
     """
     if source not in _DECISION_SOURCES:
         raise ValueError(
@@ -1162,10 +1166,9 @@ def update_item_status(
         "reviewer_id": reviewer_id or None,
         "decided_at": datetime.now(timezone.utc).isoformat(),
     }
-    if decision_note is not None:
-        updates["decision_note"] = decision_note
-    if decided_within_s is not None:
-        updates["decided_within_s"] = int(decided_within_s)
+    # 没传 = 清空(见 docstring): 别的来源的决定不许顶着上一次代理决定的原话和秒数。
+    updates["decision_note"] = decision_note
+    updates["decided_within_s"] = int(decided_within_s) if decided_within_s is not None else None
     if best_version_id:
         updates["best_version_id"] = best_version_id
     elif clear_best_version:
@@ -1182,21 +1185,23 @@ def update_item_status(
         # 三列一起来自同一个迁移, 所以三个名字都认 —— PostgREST 只报它撞上的
         # 第一个, 而那取决于 payload 的键序(今天是 decision_source, 但那不是
         # 契约)。只认一个的话, 键序一动这条翻译就静默失效。
+        # 012 的两列从此每次决定都写; 缺了同样翻译成人话。CHECK 不认 human_via_agent 时
+        # PostgREST 报的是 23514 + 约束名 items_decision_source_check —— 这个名字里含
+        # "decision_source", 所以这条必须排在 006 那条【前面】, 否则会被引去跑一个修不了它的
+        # 迁移 (codex review on #94, P2)。
+        if any(c in str(exc) for c in
+               ("decision_note", "decided_within_s", "items_decision_source_check")):
+            raise RuntimeError(
+                "审稿决定写不进去: items 缺 decision_note / decided_within_s 两列, "
+                "或 decision_source 的 CHECK 还不认 human_via_agent —— "
+                "migrations/012_review_via_agent_provenance.sql 还没跑"
+                "(006 也没跑的库先跑 006)。自检: python -m deskcore.cli doctor") from exc
         if any(c in str(exc) for c in
                ("decision_source", "reviewer_id", "decided_at")):
             raise RuntimeError(
                 "审稿决定写不进去: items 缺 decision_source / reviewer_id / "
                 "decided_at 三列 —— migrations/006_item_decision_provenance.sql "
                 "还没跑。用 Supabase SQL Editor 跑一遍即可(幂等)。"
-                "自检: python -m deskcore.cli doctor") from exc
-        # 012 的两列只有 review_drafts(human_via_agent)会写; 缺了同样翻译成人话。
-        # CHECK 不认 human_via_agent 时 PostgREST 报的是 23514 + 约束名, 也归到这里。
-        if any(c in str(exc) for c in
-               ("decision_note", "decided_within_s", "items_decision_source_check")):
-            raise RuntimeError(
-                "审稿决定写不进去: items 缺 decision_note / decided_within_s 两列, "
-                "或 decision_source 的 CHECK 还不认 human_via_agent —— "
-                "migrations/012_review_via_agent_provenance.sql 还没跑。"
                 "自检: python -m deskcore.cli doctor") from exc
         raise
     try:

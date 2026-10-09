@@ -66,7 +66,7 @@ BEGIN
 END;
 $$;
 
--- ── ② 两列: 原话 + 距批次创建的秒数 ─────────────────────────────────
+-- ── ② 两列: 原话 + 距被审版本创建的秒数 ─────────────────────────────────
 ALTER TABLE autowriter.items ADD COLUMN IF NOT EXISTS decision_note TEXT
     CONSTRAINT items_decision_note_len_check CHECK (char_length(decision_note) <= 200);
 ALTER TABLE autowriter.items ADD COLUMN IF NOT EXISTS decided_within_s INTEGER;
@@ -85,7 +85,7 @@ COMMENT ON COLUMN autowriter.items.decision_note IS
     '用户给出结论时的原话(review_drafts 的 user_words), ≤ 200 字。只有 human_via_agent '
     '会写。它存在的意义是让人能复核「这条通过是不是真有人说过」。';
 COMMENT ON COLUMN autowriter.items.decided_within_s IS
-    'decided_at 距这批稿子 batches.created_at 的秒数, 服务端算。几秒内审完一批就是'
-    '模型替用户点的信号。没有 batch 行时 NULL。';
+    'decided_at 距被审那一版 versions.created_at 的秒数, 服务端算 (不按批次: 替换稿往原 item 加版本, batch_id 不变)。'
+    '几秒内审完就是模型替用户点的信号。版本没有时间时 NULL。';
 
 COMMIT;

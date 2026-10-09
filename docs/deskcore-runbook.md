@@ -297,7 +297,7 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 
 迁移做三件事：`decision_source` 的 CHECK 多认 **`human_via_agent`**（工具从此只写它，`human`
 留给 Streamlit 里真的点了按钮的路）；`items` 加 **`decision_note`**（用户原话，≤ 200 字，
-工具参数 `user_words` **必填**）和 **`decided_within_s`**（距批次 `created_at` 的秒数，服务端算）；
+工具参数 `user_words` **必填**）和 **`decided_within_s`**（距被审那一版 `versions.created_at` 的秒数，服务端算；不按批次，替换稿不换批）；
 另建一条只盖 `human_via_agent` 的部分索引，006 那条 `human` 的不动。存量 32 行**不回填**。
 幂等；SQL Editor / `apply_migration` 直接跑。验收：`doctor` 里「items 的 decision_note /
 decided_within_s 两列」applied；`select decision_source, count(*) from autowriter.items group by 1`

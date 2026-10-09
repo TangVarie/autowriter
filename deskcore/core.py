@@ -1800,9 +1800,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                                   "不存在, migrations/001 可能没跑)。并发 check/commit 时"
                                   "可能有撞车的稿子一起进库。")
             # 审计 A-01: 入库之后模型最常犯的下一步是紧接着自己调 review_drafts。
-            # 把纪律写进返回值, 让它在最容易犯错的那一刻就在眼前。
-            out["next_step"] = ("这批现在是「待审」。用户读完稿子、亲口给出结论之前"
-                                "不要调 review_drafts; 调的时候把他的原话放进 user_words。")
+            # 把纪律写进返回值, 让它在最容易犯错的那一刻就在眼前。只在真有东西可审时说
+            # (codex review on #94, P2): 整批被闸拒、written=0 时没有版本, 说「待审」会让模型去
+            # 等 / 审不存在的稿子, 和 rejected 的结论打架。
+            if out.get("written"):
+                out["next_step"] = ("这批现在是「待审」。用户读完稿子、亲口给出结论之前"
+                                    "不要调 review_drafts; 调的时候把他的原话放进 user_words。")
             # ⚠️ 这里原来是 `return out`。改成落到 with 块外面去, 是为了让下面的入库判定
             #    【不在】项目写锁里、也【不在】这个 try 里(设计审查 2026-09-23 §5):
             #    · 在 try 里: 判定一抛, 下面的 except 会把已替换稿的旧指纹无条件放回 ——
@@ -1866,9 +1869,11 @@ def _clean_user_words(user_words) -> tuple[str | None, str | None]:
     return words, None
 
 
-def _seconds_since(batch_created_at) -> int | None:
-    """决策时刻距批次创建的秒数; 批次时间缺失或解析不了就 None, 不硬算。"""
-    created = db.parse_ts(batch_created_at)
+def _seconds_since(version_created_at) -> int | None:
+    """决策时刻距【被审那一版】建出来的秒数; 时间缺失或解析不了就 None, 不硬算。
+    不按批次算 (codex review on #94, P2): 替换稿是往原 item 上加新版本, batch_id 不变, 按批次算会把
+    "入库 10 秒就自审"量成几天, 信号就没了。versions.created_at 每个新版本都有。"""
+    created = db.parse_ts(version_created_at)
     if created is None:
         return None
     return max(0, int((datetime.now(timezone.utc) - created).total_seconds()))
@@ -2014,7 +2019,7 @@ def review_drafts(client, project_id: str, decisions: list[dict],
                                   reviewer_id=user_id,
                                   decision_note=words,
                                   decided_within_s=_seconds_since(
-                                      hit.get("batch_created_at")))
+                                      hit.get("version_created_at")))
         except Exception as exc:                 # noqa: BLE001
             logger.exception("review_drafts 写库失败 (version=%s)", vid)
             results.append({**row, "outcome": "failed",

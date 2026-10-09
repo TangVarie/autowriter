@@ -9,7 +9,7 @@ deskcore 又不记成功的工具调用 —— 于是库里分不出「模型自
 服务端能做的是把证据留下来。这里钉四件事:
 
   1. 工具这条路**只写** ``human_via_agent``; 用户的原话落 ``decision_note``;
-     ``decided_within_s`` 由服务端按这批稿子的 ``created_at`` 算;
+     ``decided_within_s`` 由服务端按【被审那一版】的 ``created_at`` 算(不按批次: 替换稿不换批);
   2. ``user_words`` 缺 / 空 / 超长 → 报错, **一行不碰、一次库都不查**;
   3. ``deskcore/`` 下再没有任何代码把 ``'human'`` 当 decision_source 写(AST 守着,
      守卫本身也要被验证);
@@ -39,9 +39,11 @@ ITEM_A, VER_A = "cccc0000-0000-0000-0000-00000000000a", "dddd0000-0000-0000-0000
 ITEM_B, VER_B = "cccc0000-0000-0000-0000-00000000000b", "dddd0000-0000-0000-0000-00000000000b"
 
 
-def _client(batch_created_at: str | None = None) -> FakeClient:
-    """两条待审稿。``batch_created_at`` 嵌在 versions → items → batches 那层
-    (与 ``store.items_for_versions`` 的查询形状一致), None 表示 batch 行上没有。"""
+def _client(version_created_at: str | None = None,
+            batch_created_at: str | None = None) -> FakeClient:
+    """两条待审稿。``version_created_at`` 在 versions 行上, ``batch_created_at`` 嵌在
+    versions → items → batches 那层 (与 ``store.items_for_versions`` 的查询形状一致);
+    None 表示那一行上没有。"""
     batches = {"project_id": PROJ}
     if batch_created_at is not None:
         batches["created_at"] = batch_created_at
@@ -53,7 +55,8 @@ def _client(batch_created_at: str | None = None) -> FakeClient:
          "decision_source": None, "reviewer_id": None, "decided_at": None,
          "decision_note": None, "decided_within_s": None},
     ]
-    versions = [{"id": vid, "items": {
+    versions = [{"id": vid, **({"created_at": version_created_at} if version_created_at is not None else {}),
+                 "items": {
         "id": it["id"], "status": it["status"], "decision_source": None,
         "batch_id": BATCH, "batches": dict(batches)}}
         for it, vid in zip(items, (VER_A, VER_B))]
@@ -82,7 +85,7 @@ def test_tool_records_human_via_agent_with_the_users_words(monkeypatch):
     """走 ``tools.review_drafts``(MCP 暴露的那个), 不是直接调 core —— 要验的正是
     工具入口把 user_words 传下去了。"""
     created = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
-    c = _client(batch_created_at=created)
+    c = _client(version_created_at=created)
     monkeypatch.setattr(core, "sb", lambda: c)
 
     out = tools.review_drafts(PROJ, _decisions(), user_words="  这批可以发, 第二条重写  ",
@@ -98,13 +101,23 @@ def test_tool_records_human_via_agent_with_the_users_words(monkeypatch):
         assert row["reviewer_id"] == ME
         assert row["decision_note"] == "这批可以发, 第二条重写", "原话 strip 后原样落库"
         assert 90 <= row["decided_within_s"] <= 95, \
-            f"距批次创建的秒数要由服务端算出来: {row['decided_within_s']!r}"
+            f"距被审版本创建的秒数要由服务端算出来: {row['decided_within_s']!r}"
         assert row["decided_at"]
 
 
-def test_decided_within_s_is_null_when_the_batch_has_no_created_at():
-    """batch 行上没有时间就存 NULL —— 不硬算、不失败, 决策本身照记。"""
-    c = _client(batch_created_at=None)
+def test_decided_within_s_counts_from_the_reviewed_version_not_the_items_first_batch():
+    """替换稿是往原 item 加新版本、batch_id 不变 (codex review on #94, P2): 批次十天前建的,
+    被审这一版 30 秒前建的, 秒数必须是 30 这一档, 否则"入库就自审"的信号被批次年龄冲掉。"""
+    now = datetime.now(timezone.utc)
+    c = _client(version_created_at=(now - timedelta(seconds=30)).isoformat(),
+                batch_created_at=(now - timedelta(days=10)).isoformat())
+    core.review_drafts(c, PROJ, _decisions()[:1], user_words="全过", user_id=ME)
+    assert 30 <= _row(c, ITEM_A)["decided_within_s"] <= 35
+
+
+def test_decided_within_s_is_null_when_the_version_has_no_created_at():
+    """version 行上没有时间就存 NULL —— 不硬算、不失败, 决策本身照记; 批次有时间也不拿来顶。"""
+    c = _client(version_created_at=None, batch_created_at=datetime.now(timezone.utc).isoformat())
     out = core.review_drafts(c, PROJ, _decisions()[:1], user_words="全过", user_id=ME)
 
     assert out["reviewed"] == 1
@@ -115,8 +128,8 @@ def test_decided_within_s_is_null_when_the_batch_has_no_created_at():
     assert row.get("decided_within_s") is None
 
 
-def test_unparseable_batch_time_is_also_null():
-    c = _client(batch_created_at="不是时间")
+def test_unparseable_version_time_is_also_null():
+    c = _client(version_created_at="不是时间")
     core.review_drafts(c, PROJ, _decisions()[:1], user_words="全过", user_id=ME)
     assert _row(c, ITEM_A).get("decided_within_s") is None
 
@@ -138,6 +151,14 @@ def test_commit_drafts_tells_the_model_not_to_review_on_its_own(monkeypatch):
     assert "待审" in out["next_step"] and "review_drafts" in out["next_step"] \
         and "user_words" in out["next_step"], out["next_step"]
     assert _store.DESKCORE_ITEM_STATUS == "pending"
+    # 整批被原子重查拒掉 → 没有版本可审, 不许再说「待审」(codex review on #94, P2)
+    c.rpc_impl["deskcore_commit_fingerprints"] = lambda args: [
+        {"idx": i, "status": "rejected", "collided_with": "someone-else", "detail": "撞车"}
+        for i in range(len(args.get("_rows") or []))]
+    out = core.commit_drafts(c, PROJ, [{"title": "另一条新稿子的标题", "body": "正文" * 40}],
+                             user_id=ME)
+    assert out["written"] == 0 and out["rejected"], out
+    assert "next_step" not in out, out.get("next_step")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -146,7 +167,7 @@ def test_commit_drafts_tells_the_model_not_to_review_on_its_own(monkeypatch):
 
 @pytest.mark.parametrize("bad", [None, "", "   \n ", "x" * 201, "过" * 201, 123, ["全过"]])
 def test_bad_user_words_write_nothing_and_touch_nothing(bad):
-    c = _client(batch_created_at=datetime.now(timezone.utc).isoformat())
+    c = _client(version_created_at=datetime.now(timezone.utc).isoformat())
     out = core.review_drafts(c, PROJ, _decisions(), user_words=bad, user_id=ME)
 
     assert out["reviewed"] == 0 and out["results"] == []
@@ -182,22 +203,24 @@ def test_the_tool_signature_makes_user_words_mandatory(monkeypatch):
 # 3 · db 层: 两列只在传了时才写; human_via_agent 是「有人」的来源
 # ══════════════════════════════════════════════════════════════════════
 
-def test_update_item_status_adds_the_new_columns_only_when_given():
-    """老调用点(Streamlit 的按钮)一个字没改, payload 也不许多出两列 —— 否则没跑
-    012 的库上「通过 / 打回」会当场报错。"""
+def test_update_item_status_rewrites_both_columns_on_every_decision():
+    """每次决定都整行重写两列 (codex review on #94, P1): 代理记过原话的稿子之后被重置成 system
+    或在 Streamlit 里改判成 human, 原话和秒数必须跟着清掉, 不然行上是「新决定 + 旧证据」。"""
     c = FakeClient(rows={"items": [{"id": "i1", "status": "pending"}]})
-    db.update_item_status(c, "i1", "approved", source=db.DecisionSource.HUMAN,
-                          reviewer_id=ME)
-    payload = c.calls[-1]["payload"]
-    assert payload["decision_source"] == "human"
-    assert "decision_note" not in payload and "decided_within_s" not in payload
-
     db.update_item_status(c, "i1", "approved", source=db.DecisionSource.HUMAN_VIA_AGENT,
                           reviewer_id=ME, decision_note="全过", decided_within_s=12)
     payload = c.calls[-1]["payload"]
     assert payload["decision_source"] == "human_via_agent"
     assert payload["reviewer_id"] == ME
     assert payload["decision_note"] == "全过" and payload["decided_within_s"] == 12
+
+    for source, kw in ((db.DecisionSource.SYSTEM, {}),                     # 迭代重置
+                       (db.DecisionSource.HUMAN, {"reviewer_id": ME})):    # Streamlit 的按钮, 老调用形状
+        db.update_item_status(c, "i1", "pending", source=source, **kw)
+        payload = c.calls[-1]["payload"]
+        assert payload["decision_source"] == source
+        assert "decision_note" in payload and payload["decision_note"] is None, payload
+        assert "decided_within_s" in payload and payload["decided_within_s"] is None, payload
 
 
 @pytest.mark.parametrize("source", [db.DecisionSource.AUTO_HARD_RULE,
