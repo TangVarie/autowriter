@@ -1337,6 +1337,118 @@ def _judge_committed(client, project_id: str, targets: list[dict],
     return _judge_block(rows, skipped, project=ctx["project"], category=ctx["category"])
 
 
+# ── 写手侧的判稿入口(2026-10-09)──────────────────────────────────────────────
+# 以前写手要在自己机器上起 judge 仓的 judge.mcp_server(stdio, 本地 checkout + 一套 JUDGE_* env + 一把发到写手
+# 机器的 key); 现在并进 deskcore: 写手只有 deskcore 这一个 HTTP MCP、一把 deskcore key, 判定由 deskcore 用服务端的
+# 管理 key 转发给 judge。write / return_rows 钉死 false(judge_client.build_tool_request), 账本行(含暗题)永远不到
+# 写手手里; 项目号 / 品类按 tv_project_map 定(与 commit 的影子判定同一条路 _judge_project_context, 数据出境口径
+# docs/00 #7 由 judge 执行并回显在 policy)。仍然一次 LLM 调用都没有。
+JUDGE_TOOL_NOTE = ("影子期: 这是写后的参考判定, 不拦交付、不落账本。hard_fails / plan 拿去改稿, 改完最多再判一轮; "
+                   "judge_status 不是 ok 时如实告诉用户判定这次没拿到, 查重和入库照常走。")
+
+
+def _judge_tool_call(client, project_id: str, title: str, body: str, *, user_id, judge_paras: str,
+                     banks, brief, hard_rules, target, validated) -> dict:
+    """归属校验在两个公开函数里各自直接调(tests/test_deskcore_ownership 按 AST 认函数体里的那一次调用)。"""
+    base = {"project": None, "category": None, "response": None, "http_status": None, "elapsed_ms": 0}
+    if judge_paras not in judge_client.JUDGE_PARAS:
+        return {**base, "judge_status": judge_client.JUDGE_BAD_REQUEST,
+                "detail": f"judge_paras 只能是 {' / '.join(judge_client.JUDGE_PARAS)}"}
+    if not (body or "").strip():
+        return {**base, "judge_status": judge_client.JUDGE_BAD_REQUEST, "detail": "body 不能为空"}
+    if not judge_client.configured():
+        return {**base, "judge_status": judge_client.JUDGE_NOT_CONFIGURED,
+                "detail": "JUDGE_URL / JUDGE_API_KEY 未配置: 这个 deskcore 部署没接判定服务"}
+    # 项目号 / 品类的两次查库也算进同一个墙钟截止 (codex review on #95, P2): PostgREST 客户端默认 120 秒超时,
+    # 库一卡这个同步工具就远超 MCP 客户端 ~22 秒的容忍, 还不会报 timeout。做法同 _judge_committed: 查库在工作线程里、
+    # 到点就记 timeout 一个请求都不发; 查完了判定只拿剩下的时间。
+    budget = judge_client.tool_timeout_sec()
+    started = time.monotonic()
+    ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-tool")
+    try:
+        try:
+            ctx = ex.submit(_judge_project_context, client, project_id).result(timeout=budget)
+        except cf.TimeoutError:
+            return {**base, "judge_status": judge_client.JUDGE_TIMEOUT, "elapsed_ms": _ms_since(started),
+                    "detail": f"发之前的查库(tv_project_map / TV 品类)在 {budget:g}s 内没查完, 没发判定"}
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    if ctx["project"] is None:
+        return {**base, "judge_status": ctx["status"], "detail": ctx["detail"], "elapsed_ms": _ms_since(started)}
+    left = budget - (time.monotonic() - started)
+    if left <= 0.5:
+        return {**base, "judge_status": judge_client.JUDGE_TIMEOUT, "elapsed_ms": _ms_since(started),
+                "detail": f"查库用完了 {budget:g}s 的预算, 没来得及发判定"}
+    payload = judge_client.build_tool_request(
+        title=title, body=body, project=ctx["project"], category=ctx["category"], judge_paras=judge_paras,
+        banks=banks, brief=brief, hard_rules=hard_rules, target=target, validated=validated)
+    res = judge_client.judge_draft_full(payload, timeout=left)
+    return {**res, "project": ctx["project"], "category": ctx["category"], "elapsed_ms": _ms_since(started)}
+
+
+def _judge_tool_head(res: dict) -> dict:
+    out = {"judge_status": res["judge_status"], "project": res.get("project"), "category": res.get("category"),
+           "note": JUDGE_TOOL_NOTE, "elapsed_ms": res.get("elapsed_ms", 0)}
+    if res["judge_status"] != judge_client.JUDGE_OK:
+        out["detail"] = res.get("detail")
+        if res.get("http_status") is not None:
+            out["http_status"] = res["http_status"]
+    return out
+
+
+def judge_draft(client, project_id: str, title: str, body: str, *, user_id: str | None = None,
+                judge_paras: str = "on_fail", banks: list | None = None, brief: dict | None = None,
+                hard_rules: dict | None = None, target: dict | None = None,
+                validated: list | None = None) -> dict:
+    """判一篇稿子, 回 judge 抹掉暗题的视图(profile / hard_fails / unjudged / plan / recorded / para_stats / policy / banks /
+    calls / usage)。judge_status != ok 时只回 judge_status / detail, 不抛。"""
+    assert_project_access(client, project_id, user_id=user_id)
+    res = _judge_tool_call(client, project_id, title, body, user_id=user_id, judge_paras=judge_paras, banks=banks,
+                           brief=brief, hard_rules=hard_rules, target=target, validated=validated)
+    out = _judge_tool_head(res)
+    if res["judge_status"] != judge_client.JUDGE_OK:
+        return out
+    resp = res.get("response")
+    if not isinstance(resp, dict):
+        out.update(judge_status=judge_client.JUDGE_ERROR, detail="judge 回了 200 但响应体不是对象")
+        return out
+    resp.pop("ledger_rows", None)
+    return {**resp, **out}
+
+
+def repair_plan_for(client, project_id: str, title: str, body: str, *, user_id: str | None = None,
+                    banks: list | None = None, brief: dict | None = None, hard_rules: dict | None = None,
+                    target: dict | None = None, validated: list | None = None) -> dict:
+    """同一次 /judge_draft, 只拿修改单: plan / recorded / passed / invalid_reason / policy / calls。"""
+    assert_project_access(client, project_id, user_id=user_id)
+    res = _judge_tool_call(client, project_id, title, body, user_id=user_id, judge_paras="on_fail", banks=banks,
+                           brief=brief, hard_rules=hard_rules, target=target, validated=validated)
+    out = _judge_tool_head(res)
+    if res["judge_status"] != judge_client.JUDGE_OK:
+        return out
+    resp = res.get("response")
+    if not isinstance(resp, dict) or "plan" not in resp:
+        out.update(judge_status=judge_client.JUDGE_ERROR,
+                   detail="judge 的 /judge_draft 响应里没有 plan(服务端版本太旧, 或 JUDGE_URL 不是 judge 服务?)")
+        return out
+    out.update(plan=resp["plan"], recorded=resp.get("recorded", []), passed=resp.get("passed"),
+               invalid_reason=resp.get("invalid_reason"), policy=resp.get("policy"), calls=resp.get("calls"))
+    return out
+
+
+def list_banks() -> dict:
+    """judge 上可用的题库清单(名字、版本、层、公开的题目 id; 暗题只报个数)。"""
+    res = judge_client.list_banks()
+    out = {"judge_status": res["judge_status"], "elapsed_ms": res.get("elapsed_ms", 0)}
+    if res["judge_status"] != judge_client.JUDGE_OK:
+        out["detail"] = res.get("detail")
+        if res.get("http_status") is not None:
+            out["http_status"] = res["http_status"]
+        return out
+    out["banks"] = res.get("response") if isinstance(res.get("response"), list) else []
+    return out
+
+
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                            out: dict) -> None:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。

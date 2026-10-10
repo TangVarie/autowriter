@@ -398,6 +398,41 @@ def check_drafts(project_id: str, drafts: list[dict],
     return core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id)
 
 
+def judge_draft(project_id: str, title: str, body: str, judge_paras: str = "on_fail",
+                banks: list[str] | None = None, brief: dict | None = None, hard_rules: dict | None = None,
+                target: dict | None = None, validated: list | None = None,
+                _user_id: str | None = None) -> dict:
+    """判一篇稿子的内容(可选, 写后参与点): 特征题库 + 平台题库 + 人感题库, 项目放行了再加项目层。
+    返回篇级画像 profile、硬伤 hard_fails(题、答案、概率、依据句)、修改单 plan、只记录的目标题 recorded、
+    段级分布 para_stats、数据出境 policy、用的题库 banks。不改稿、不落账本、不拦交付。
+
+    什么时候调: check_drafts 过了之后、commit_drafts 之前, 或用户问「这篇哪里有问题」。一篇一调。
+    怎么用返回值: hard_fails / plan 只说哪一句犯了哪条, 不给改法 —— 照着改稿, 改完最多再判一轮, 不要循环。
+    judge_status 不是 ok(not_configured / timeout / policy_blocked / unavailable …)时: 如实告诉用户这次没拿到判定,
+    查重和入库照常走, 不要把它当成"通过"也不要重试超过一次。影子期这不是闸: 判定不过也能交付, 但要把硬伤告诉用户。
+    project 必须是你有权限的项目, 且接了 tv_project_map(没接会回 not_configured 并写明补救)。
+    """
+    return core.judge_draft(core.sb(), project_id, title, body, user_id=_user_id, judge_paras=judge_paras,
+                            banks=banks, brief=brief, hard_rules=hard_rules, target=target, validated=validated)
+
+
+def repair_plan_for(project_id: str, title: str, body: str, banks: list[str] | None = None,
+                    brief: dict | None = None, hard_rules: dict | None = None, target: dict | None = None,
+                    validated: list | None = None, _user_id: str | None = None) -> dict:
+    """判一篇稿子并只拿修改单(同 judge_draft 的一次调用, 返回更短): plan 每条 = 题号 + 现在的答案与概率 + 依据句 +
+    该题定义, 只说哪一句犯了哪条, 不给改法; recorded 是没过闸二、只记录不下发的目标题(给了 target 才有)。
+    用法和限制同 judge_draft: 写后可选、不落账本、不拦交付, judge_status 不是 ok 就如实告诉用户。
+    """
+    return core.repair_plan_for(core.sb(), project_id, title, body, user_id=_user_id, banks=banks, brief=brief,
+                                hard_rules=hard_rules, target=target, validated=validated)
+
+
+def list_banks(_user_id: str | None = None) -> dict:
+    """判定服务上可用的题库清单(名字、版本、层、公开的题目 id; 暗题只报个数)。只在要给 judge_draft 指定 banks、
+    或用户问"判的是什么"时调; 平时不用, judge_draft 不传 banks 就是默认三层。"""
+    return core.list_banks()
+
+
 def commit_drafts(project_id: str, drafts: list[dict],
                   _user_id: str | None = None) -> dict:
     """把交付给用户的稿子入库, 让它们参与以后的查重, 并把用掉的坐标销账。
@@ -895,6 +930,9 @@ TOOLS = {
     "borrow_lessons": (borrow_lessons, True),
     "check_drafts":   (check_drafts,   True),
     "commit_drafts":  (commit_drafts,  True),
+    "judge_draft":    (judge_draft,    True),
+    "repair_plan_for": (repair_plan_for, True),
+    "list_banks":     (list_banks,     True),
     "review_drafts":  (review_drafts,  True),
     "export_drafts":  (export_drafts,  True),
     "ingest_published": (ingest_published, True),

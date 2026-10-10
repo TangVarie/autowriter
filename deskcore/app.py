@@ -531,6 +531,7 @@ async def _collect_health() -> dict:
             # 探活要打外网, 而 /health 是 Railway 的存活探针。
             "judge": {"configured": judge_client.configured(),
                       "timeout_sec": judge_client.timeout_sec(),
+                      "draft_tool_timeout_sec": judge_client.tool_timeout_sec(),
                       "mode": "shadow"},
             # auth_health 把三态分开: 配好了 / 配了但坏了(全 401) / 没配。
             # ROB-003 之后"没配"也是全 401 —— 不再静默放行, 只有显式设了

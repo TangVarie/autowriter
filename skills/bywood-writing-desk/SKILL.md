@@ -32,8 +32,8 @@ description: 帆谷/BYWOOD 小红书种草文案的【写作台协议】。凡�
 - `bywood-writing-desk`（本 skill）管这一批守不守项目规则、跟历史重不重
 - `seeding-prompt-refiner` 管提示词本身怎么迭代
 
-<!-- protocol_version: f8b65b9a78e3 -->
-protocol_version: f8b65b9a78e3
+<!-- protocol_version: 768aa6021a0b -->
+protocol_version: 768aa6021a0b
 
 # 写作台协议
 
@@ -126,6 +126,12 @@ protocol_version: f8b65b9a78e3
 如果 `summary.semantic_degraded` 是 true，说明 embedding 不可用，这次只跑了确定性查重，同角度换说法的标题可能漏过。**要告诉用户这件事**，别默默交付。
 
 这个工具报错就是查重真的挂了。**停下来告诉用户，不要当作通过。**
+
+**4a. `judge_draft` / `repair_plan_for`**（可选）—— 查重过了之后、入库之前，想知道内容本身哪里有硬伤时调；用户问「这篇哪里有问题」也用它。
+
+一篇一调，传 `project_id` + `title` + `body`。`judge_draft` 回篇级画像 `profile`、硬伤 `hard_fails`（题、答案、概率、依据句）、修改单 `plan`、段级分布 `para_stats` 和数据出境 `policy`；`repair_plan_for` 只回 `plan` / `recorded`。两者都**只说哪一句犯了哪条，不给改法**——照着改稿，改完最多再判一轮，不要循环。
+
+影子期它**不是闸**：判不过也能交付，但要把 `hard_fails` 如实告诉用户。`judge_status` 不是 `ok`（`not_configured` / `timeout` / `policy_blocked` / `unavailable`）就说这次没拿到判定，查重和入库照常走，不要重试超过一次，也不要把它说成"通过了"。判定不落账本、不改稿，题库和密钥都在服务端——你不需要也不会拿到任何题库文件。`list_banks` 只在要给 `judge_draft` 指定 `banks`、或用户问"判的是什么"时调。
 
 **5. `commit_drafts`** —— 交付的同一轮里调，不等用户表态。
 
