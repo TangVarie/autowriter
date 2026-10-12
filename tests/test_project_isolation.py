@@ -1,4 +1,6 @@
 import threading
+import concurrent.futures as cf
+import json
 
 import anyio
 import pytest
@@ -87,3 +89,38 @@ def test_real_mcp_wrapper_keeps_identity_and_does_not_block_loop(monkeypatch):
             A._caller.reset(token)
     anyio.run(run)
     assert seen == [ME]
+
+
+def test_rest_rule_rejection_is_400_and_preserves_message(monkeypatch):
+    pytest.importorskip("mcp")
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    from deskcore.app import app
+    c = client()
+    monkeypatch.setenv("DESKCORE_KEYS", json.dumps({"test-key": {"user_id": ME, "name": "测试"}}))
+    monkeypatch.setattr(core, "sb", lambda: c)
+    # REST adapter does not need to restart the one-shot MCP lifespan used by other tests.
+    http = TestClient(app)
+    r = http.post("/tool/record_rule", headers={"X-Deskcore-Key": "test-key"},
+                  json={"project_id": "west", "content": "不许说祛痘", "severity": "hard"})
+    assert r.status_code == 400 and "未写入" in r.json()["detail"]
+    assert c.rows["memories"] == []
+
+
+def test_isolation_timeout_cannot_accumulate_workers(monkeypatch):
+    release = threading.Event()
+    pool, slots = cf.ThreadPoolExecutor(max_workers=1), threading.BoundedSemaphore(1)
+    monkeypatch.setattr(core, "_ISOLATION_POOL", pool)
+    monkeypatch.setattr(core, "_ISOLATION_SLOTS", slots)
+    def slow(*a):
+        assert release.wait(4)
+        return {"status": "shadow", "flags": []}
+    monkeypatch.setattr(core, "_cross_project_shadow", slow)
+    try:
+        assert core._cross_project_shadow_bounded(None, "west", ME, [], [], set())["status"] == "timeout"
+        for _ in range(20):
+            assert core._cross_project_shadow_bounded(None, "west", ME, [], [], set())["status"] == "busy"
+        assert len(pool._threads) == 1
+    finally:
+        release.set()
+        pool.shutdown(wait=True)

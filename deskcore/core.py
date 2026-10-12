@@ -84,6 +84,10 @@ class ProjectNotFound(ValueError):
     """
 
 
+class ProjectIsolationRejected(ValueError):
+    """Actionable cross-project rule rejection; REST maps this to 400."""
+
+
 def assert_project_access(client, project_id: str, *,
                           user_id: str | None) -> dict:
     """**整套项目归属校验的唯一实现**。通过则返回项目整行。
@@ -1508,6 +1512,24 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
 COMMENT_TOOL_NOTE = ("评论只做参考判定，不入稿件库。judge_status 不是 ok 时不能声称检查通过；"
                      "needs_review 的背书或缺答需人工核实，不编造亲历。")
 
+# Running I/O cannot be cancelled by Future.cancel(). Bound surviving work across requests.
+_ISOLATION_POOL = cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="project-isolation")
+_ISOLATION_SLOTS = threading.BoundedSemaphore(2)
+_COMMENT_POOL = cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="comment-tool")
+_COMMENT_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _bounded_submit(pool, slots, fn, *args):
+    if not slots.acquire(blocking=False):
+        return None
+    try:
+        future = pool.submit(fn, *args)
+    except BaseException:
+        slots.release()
+        raise
+    future.add_done_callback(lambda _: slots.release())
+    return future
+
 
 def _cross_project_shadow(client, project_id, user_id, drafts, vectors, exclude_versions):
     from .isolation import foreign_markers
@@ -1547,18 +1569,18 @@ def _cross_project_shadow(client, project_id, user_id, drafts, vectors, exclude_
 
 
 def _cross_project_shadow_bounded(client, project_id, user_id, drafts, vectors, exclude_versions):
-    ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="project-isolation")
     try:
-        try:
-            return ex.submit(_cross_project_shadow, client, project_id, user_id, drafts, vectors,
-                             exclude_versions).result(timeout=1.5)
-        except cf.TimeoutError:
-            return {"status": "timeout", "flags": [], "note": "跨项目检查超时，无从判断；入库结果不变"}
-        except Exception as exc:
-            logger.warning("cross-project shadow failed: %s", type(exc).__name__)
-            return {"status": "unavailable", "flags": [], "note": "跨项目检查不可用；入库结果不变"}
-    finally:
-        ex.shutdown(wait=False, cancel_futures=True)
+        future = _bounded_submit(_ISOLATION_POOL, _ISOLATION_SLOTS, _cross_project_shadow,
+                                 client, project_id, user_id, drafts, vectors, exclude_versions)
+        if future is None:
+            return {"status": "busy", "flags": [], "note": "跨项目检查线程占满，无从判断；入库结果不变"}
+        return future.result(timeout=1.5)
+    except cf.TimeoutError:
+        future.cancel()  # A running call retains its slot until the done callback.
+        return {"status": "timeout", "flags": [], "note": "跨项目检查超时，无从判断；入库结果不变"}
+    except Exception as exc:
+        logger.warning("cross-project shadow failed: %s", type(exc).__name__)
+        return {"status": "unavailable", "flags": [], "note": "跨项目检查不可用；入库结果不变"}
 
 
 def _comment_tool_call(client, project_id: str, path: str, payload: dict) -> dict:
@@ -1567,31 +1589,36 @@ def _comment_tool_call(client, project_id: str, path: str, payload: dict) -> dic
     head = {"project": None, "category": None, "elapsed_ms": 0, "note": COMMENT_TOOL_NOTE}
     if not judge_client.configured():
         return {**head, "judge_status": judge_client.JUDGE_NOT_CONFIGURED, "detail": "评论判定服务未配置"}
-    ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="comment-tool")
+
+    def run():
+        ctx = _judge_project_context(client, project_id)
+        mapped = {**head, "project": ctx["project"], "category": ctx["category"]}
+        if ctx["project"] is None:
+            return {**mapped, "judge_status": ctx["status"], "detail": ctx["detail"], "elapsed_ms": _ms_since(started)}
+        left = budget - (time.monotonic() - started)
+        if left <= 0.5:
+            return {**mapped, "judge_status": judge_client.JUDGE_TIMEOUT,
+                    "elapsed_ms": _ms_since(started), "detail": "项目查询耗尽判定预算，未发送评论判定"}
+        request = {**payload, "project": ctx["project"], "category": ctx["category"]}
+        res = judge_client.judge_comment_tool(path, request, timeout=left)
+        out = {**mapped, "judge_status": res["judge_status"], "elapsed_ms": _ms_since(started)}
+        if res["judge_status"] != judge_client.JUDGE_OK:
+            return {**out, "detail": res.get("detail"), "http_status": res.get("http_status")}
+        return {**(res.get("response") or {}), **out}
+
     try:
-        try:
-            ctx = ex.submit(_judge_project_context, client, project_id).result(timeout=budget)
-        except cf.TimeoutError:
+        future = _bounded_submit(_COMMENT_POOL, _COMMENT_SLOTS, run)
+        if future is None:
             return {**head, "judge_status": judge_client.JUDGE_TIMEOUT,
-                    "elapsed_ms": _ms_since(started), "detail": "项目上下文查询超时，未发送评论判定"}
-        except Exception as exc:
-            return {**head, "judge_status": judge_client.JUDGE_ERROR,
-                    "detail": judge_client.mask_secrets(str(exc))[:300]}
-    finally:
-        ex.shutdown(wait=False, cancel_futures=True)
-    head.update(project=ctx["project"], category=ctx["category"])
-    if ctx["project"] is None:
-        return {**head, "judge_status": ctx["status"], "detail": ctx["detail"], "elapsed_ms": _ms_since(started)}
-    left = budget - (time.monotonic() - started)
-    if left <= 0.5:
+                    "elapsed_ms": _ms_since(started), "detail": "评论判定线程占满，未发送本次判定"}
+        return future.result(timeout=max(0.001, budget - (time.monotonic() - started)))
+    except cf.TimeoutError:
+        future.cancel()
         return {**head, "judge_status": judge_client.JUDGE_TIMEOUT,
-                "elapsed_ms": _ms_since(started), "detail": "项目查询耗尽判定预算，未发送评论判定"}
-    payload = {**payload, "project": ctx["project"], "category": ctx["category"]}
-    res = judge_client.judge_comment_tool(path, payload, timeout=left)
-    out = {**head, "judge_status": res["judge_status"], "elapsed_ms": _ms_since(started)}
-    if res["judge_status"] != judge_client.JUDGE_OK:
-        return {**out, "detail": res.get("detail"), "http_status": res.get("http_status")}
-    return {**(res.get("response") or {}), **out}
+                "elapsed_ms": _ms_since(started), "detail": "评论判定超过总截止，未取得完整结果"}
+    except Exception as exc:
+        return {**head, "judge_status": judge_client.JUDGE_ERROR, "elapsed_ms": _ms_since(started),
+                "detail": judge_client.mask_secrets(str(exc))[:300]}
 
 
 def comment_repair_plan_for(client, project_id: str, post_title: str, post_body: str, text: str, slot: dict, *,
@@ -2062,7 +2089,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # judge 的 8 秒。lock_wait 单列: 补录正在跑时入库要等锁(最长 INGEST_LOCK_WAIT_SEC),
     # 不拆开的话一次等锁就把分位数带歪。
     isolation_started = time.monotonic()
-    excluded = set(out.get("version_ids") or []) | {d.get("version_id") for d in drafts if d.get("version_id")}
+    excluded = {drafts[i].get("version_id") or minted_ids.get(i) for i in inserted_idx}
     out["project_isolation"] = _cross_project_shadow_bounded(client, project_id, user_id, drafts, vecs, excluded)
     out["elapsed_ms"] = _ms_since(started)
     out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms,
@@ -3456,7 +3483,7 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     conflicts = foreign_markers(content, target, projects, global_scope=scope == "global")
     if conflicts:
         terms = sorted({t for c in conflicts for t in c["terms"]})
-        raise ValueError("规则含项目专属词「" + "、".join(terms) + "」，可能串项目，未写入。请核对项目；项目专属规则不要记为全局规则。")
+        raise ProjectIsolationRejected("规则含项目专属词「" + "、".join(terms) + "」，可能串项目，未写入。请核对项目；项目专属规则不要记为全局规则。")
 
     row = db.upsert_memory(
         client, user_id=user_id, scope=scope, content=content,

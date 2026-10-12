@@ -632,7 +632,7 @@ async def rest_tool(name: str, request: Request):
         # 另一个补录正持有这个项目的锁 → 409: 不是坏了, 稍后再来。
         logger.warning("tool %s busy: %s", name, exc)
         raise HTTPException(status_code=409, detail=str(exc)[:300])
-    except tools.InvalidInput as exc:
+    except (tools.InvalidInput, core.ProjectIsolationRejected) as exc:
         # 调用方参数不对(空批、超过上限、有行没正文) → 400, 【不是】500。
         # 500 对模型的意思是"待会儿重试", 它会拿同一个超大载荷一直试;
         # 400 才说得清是"改参数"。工具说明里写的正是"分几次调"。

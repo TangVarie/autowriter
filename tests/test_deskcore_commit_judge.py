@@ -271,6 +271,24 @@ def test_identity_error_drafts_are_skipped_not_judged(judge_on, monkeypatch):
     assert [(s["index"], s["reason"]) for s in out["judge"]["skipped"]] == [(1, "identity_error")]
 
 
+def test_identity_failure_does_not_self_match_in_project_isolation(monkeypatch):
+    c = _client()
+    other = "other-project"
+    c.rows["projects"].append({"id": other, "name": "西屋", "brand": "西屋", "owner_id": ME})
+    model = core.dedup.EMBEDDING_MODEL
+    c.rows["draft_fingerprints"] = [
+        {"id": "old", "project_id": PROJ, "version_id": "old", "title_embedding": [1., 0.], "embedding_model": model},
+        {"id": "other", "project_id": other, "version_id": "other", "title_embedding": [0., 1.], "embedding_model": model}]
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: True)
+    monkeypatch.setattr(core.dedup, "embed_texts", lambda texts, **kw: [[0., 1.] for _ in texts])
+    monkeypatch.setattr(store, "mint_draft_identity", lambda *a, **kw:
+                        {"batch_id": None, "versions": {}, "error": "identity failure"})
+    monkeypatch.setattr(config, "JUDGE_URL", "")
+    out = core.commit_drafts(c, PROJ, [{"title": "全新问句", "body": BODY_A}], user_id=ME)
+    assert out["written"] == 1 and out["version_ids"] == [] and "identity_warning" in out
+    assert out["project_isolation"]["flags"][0]["title_vector"]["other_project_id"] == other
+
+
 def test_rejected_and_empty_body_drafts_are_not_judged(judge_on):
     c = _client()
     core.commit_drafts(c, PROJ, [{"title": "上周发过的", "body": BODY_C}], user_id=ME)
