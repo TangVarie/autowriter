@@ -175,7 +175,12 @@ jobs:
               def select(self, *a, **k): return self
               def eq(self, *a, **k): return self
               def limit(self, *a, **k): return self
-              def execute(self): return _Resp([{"id": "proj-1", "owner_id": "u1"}])
+              def order(self, *a, **k): return self
+              def range(self, start, end):
+                  self._off = start
+                  return self
+              def execute(self):
+                  return _Resp([] if getattr(self, "_off", 0) else [{"id": "proj-1", "owner_id": "u1"}])
           class _OwnSB:
               def table(self, *a, **k): return _OwnQ()
 
