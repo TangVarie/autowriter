@@ -433,6 +433,26 @@ def list_banks(_user_id: str | None = None) -> dict:
     return core.list_banks()
 
 
+def comment_repair_plan_for(project_id: str, post_title: str, post_body: str, text: str, slot: dict,
+                            kind: str = "product", points: list[str] | None = None, reply_to_text: str = "",
+                            _user_id: str | None = None) -> dict:
+    """判一条候选评论并给修改单。slot 含 id、speech_act（如[提问]）、may_name_brand、must_echo、
+    value_ok、min_detail；据真实帖子和评论位要求填写。needs_review 的背书需人工核实，不能改成伪造亲历。
+    judge_status!=ok 表示这次没判成，不能说通过；不写评论或稿件库。"""
+    return core.comment_repair_plan_for(core.sb(), project_id, post_title, post_body, text, slot,
+                                        user_id=_user_id, kind=kind, points=points, reply_to_text=reply_to_text)
+
+
+def judge_thread(project_id: str, post_title: str, post_body: str, comments: list[dict],
+                 kind: str = "product", points: list[str] | None = None, max_named: int = 1,
+                 _user_id: str | None = None) -> dict:
+    """判整组候选评论及各条风险。comments 含 text、role、reply_to_text，可带每位 slot 供定位修改。
+    看 passed、needs_review、hard_fails、plan；单条与成组都须检查。出错如实说明，不声称通过。
+    只判，不编造用户体验，不提交或发布评论。"""
+    return core.judge_thread(core.sb(), project_id, post_title, post_body, comments, user_id=_user_id,
+                             kind=kind, points=points, max_named=max_named)
+
+
 def commit_drafts(project_id: str, drafts: list[dict],
                   _user_id: str | None = None) -> dict:
     """把交付给用户的稿子入库, 让它们参与以后的查重, 并把用掉的坐标销账。
@@ -933,6 +953,8 @@ TOOLS = {
     "judge_draft":    (judge_draft,    True),
     "repair_plan_for": (repair_plan_for, True),
     "list_banks":     (list_banks,     True),
+    "comment_repair_plan_for": (comment_repair_plan_for, True),
+    "judge_thread": (judge_thread, True),
     "review_drafts":  (review_drafts,  True),
     "export_drafts":  (export_drafts,  True),
     "ingest_published": (ingest_published, True),

@@ -663,7 +663,7 @@ def test_the_judge_calls_only_get_what_the_lookups_left(judge_on, monkeypatch):
 def test_elapsed_ms_and_phases_are_reported(judge_on):
     out = core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
     ph = out["phase_ms"]
-    assert set(ph) == {"lock_wait", "commit", "judge", "total"}
+    assert set(ph) == {"lock_wait", "commit", "judge", "project_isolation", "total"}
     assert all(isinstance(v, int) and v >= 0 for v in ph.values())
     assert out["elapsed_ms"] == ph["total"] >= ph["commit"]
 
@@ -742,6 +742,7 @@ def test_a_metrics_row_records_timing_and_judge_outcomes(judge_on):
     assert m["project_id"] == PROJ and m["user_id"] == ME
     assert m["meta"]["mode"] == "deskcore_commit" and m["meta"]["batch_id"] == out["batch_id"]
     assert m["phase_ms"] == out["phase_ms"]
+    assert m["meta"]["project_isolation"] == out["project_isolation"]
     assert m["counters"]["judge_ok"] == 1 and m["counters"]["judge_skipped"] == 1
     assert [j["status"] for j in m["meta"]["judge"]] == ["ok"]
     assert m["meta"]["judge_skipped"] == [{"index": 1, "reason": "empty_body"}]

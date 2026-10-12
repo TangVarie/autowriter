@@ -150,6 +150,21 @@ def list_all_projects(sb, *, owner_id: str) -> list[dict]:
     ))
 
 
+def isolation_projects(sb, *, owner_id: str) -> list[dict]:
+    """Only the caller's projects; dedicated terms live in existing default_params.isolation_terms."""
+    return _paged(lambda off, lim: sb.table("projects").select("id,name,brand,owner_id,default_params")
+                  .eq("owner_id", owner_id).order("id").range(off, off + lim - 1))
+
+
+def isolation_fingerprints(sb, project_id: str, model: str) -> list[dict]:
+    """Bounded recent title-vector sample, same model only; these are advisory signals."""
+    rows = (sb.table("draft_fingerprints")
+            .select("version_id,title_embedding,embedding_model")
+            .eq("project_id", project_id).eq("embedding_model", model)
+            .order("created_at", desc=True).order("id", desc=True).limit(40).execute()).data or []
+    return [{**r, "title_embedding": db._parse_pgvector(r.get("title_embedding"))} for r in rows]
+
+
 def projects_with_exact_name(sb, *, owner_id: str, name: str) -> list[dict]:
     """同 owner 下**名字相同**的项目 —— 大小写与首尾空格都不算差异。
 

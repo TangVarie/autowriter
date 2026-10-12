@@ -376,3 +376,10 @@ def judge_draft_full(payload: dict, *, timeout: Optional[float] = None) -> dict:
 def list_banks(*, timeout: Optional[float] = None) -> dict:
     """写手侧: GET /banks(judge 默认只列每个家族的最新版本; 暗题只报个数)。"""
     return _tool_call("GET", "/banks", timeout=timeout, shape=_banks_shape_problem)
+
+
+def judge_comment_tool(path: str, payload: dict, *, timeout: Optional[float] = None) -> dict:
+    """Read-only comment tooling; candidate comments never become published ledger rows."""
+    if path not in ("/comment_repair_plan_for", "/judge_thread"):
+        raise ValueError("unknown comment tool path")
+    return _tool_call("POST", path, json_body=payload, timeout=timeout, shape=_draft_shape_problem)

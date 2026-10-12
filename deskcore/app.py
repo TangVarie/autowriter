@@ -711,11 +711,11 @@ def _register_mcp():
         params = [p for k, p in sig.parameters.items() if not k.startswith("_")]
 
         @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
+        async def wrapper(*args, **kwargs):
             kwargs.pop("_user_id", None)
             if needs_user:
                 kwargs["_user_id"] = _caller.get().user_id
-            return fn(*args, **kwargs)
+            return await run_in_threadpool(fn, *args, **kwargs)
 
         wrapper.__signature__ = sig.replace(parameters=params)
         return wrapper
