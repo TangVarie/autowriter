@@ -175,7 +175,12 @@ jobs:
               def select(self, *a, **k): return self
               def eq(self, *a, **k): return self
               def limit(self, *a, **k): return self
-              def execute(self): return _Resp([{"id": "proj-1", "owner_id": "u1"}])
+              def order(self, *a, **k): return self
+              def range(self, start, end):
+                  self._off = start
+                  return self
+              def execute(self):
+                  return _Resp([] if getattr(self, "_off", 0) else [{"id": "proj-1", "owner_id": "u1"}])
           class _OwnSB:
               def table(self, *a, **k): return _OwnQ()
 
@@ -2447,6 +2452,7 @@ jobs:
           # 运行期问题在 CI 里【完全没有覆盖】。这里补上: 装增量依赖, 起
           # TestClient 真打一次 /health。
           pip install -r deskcore/requirements.txt httpx
+          python -m pytest tests/test_project_isolation.py -q
           python - <<'PY'
           import os
           os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")

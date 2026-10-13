@@ -271,6 +271,24 @@ def test_identity_error_drafts_are_skipped_not_judged(judge_on, monkeypatch):
     assert [(s["index"], s["reason"]) for s in out["judge"]["skipped"]] == [(1, "identity_error")]
 
 
+def test_identity_failure_does_not_self_match_in_project_isolation(monkeypatch):
+    c = _client()
+    other = "other-project"
+    c.rows["projects"].append({"id": other, "name": "西屋", "brand": "西屋", "owner_id": ME})
+    model = core.dedup.EMBEDDING_MODEL
+    c.rows["draft_fingerprints"] = [
+        {"id": "old", "project_id": PROJ, "version_id": "old", "title_embedding": [1., 0.], "embedding_model": model},
+        {"id": "other", "project_id": other, "version_id": "other", "title_embedding": [0., 1.], "embedding_model": model}]
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: True)
+    monkeypatch.setattr(core.dedup, "embed_texts", lambda texts, **kw: [[0., 1.] for _ in texts])
+    monkeypatch.setattr(store, "mint_draft_identity", lambda *a, **kw:
+                        {"batch_id": None, "versions": {}, "error": "identity failure"})
+    monkeypatch.setattr(config, "JUDGE_URL", "")
+    out = core.commit_drafts(c, PROJ, [{"title": "全新问句", "body": BODY_A}], user_id=ME)
+    assert out["written"] == 1 and out["version_ids"] == [] and "identity_warning" in out
+    assert out["project_isolation"]["flags"][0]["title_vector"]["other_project_id"] == other
+
+
 def test_rejected_and_empty_body_drafts_are_not_judged(judge_on):
     c = _client()
     core.commit_drafts(c, PROJ, [{"title": "上周发过的", "body": BODY_C}], user_id=ME)
@@ -663,7 +681,7 @@ def test_the_judge_calls_only_get_what_the_lookups_left(judge_on, monkeypatch):
 def test_elapsed_ms_and_phases_are_reported(judge_on):
     out = core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
     ph = out["phase_ms"]
-    assert set(ph) == {"lock_wait", "commit", "judge", "total"}
+    assert set(ph) == {"lock_wait", "commit", "judge", "project_isolation", "total"}
     assert all(isinstance(v, int) and v >= 0 for v in ph.values())
     assert out["elapsed_ms"] == ph["total"] >= ph["commit"]
 
@@ -742,6 +760,7 @@ def test_a_metrics_row_records_timing_and_judge_outcomes(judge_on):
     assert m["project_id"] == PROJ and m["user_id"] == ME
     assert m["meta"]["mode"] == "deskcore_commit" and m["meta"]["batch_id"] == out["batch_id"]
     assert m["phase_ms"] == out["phase_ms"]
+    assert m["meta"]["project_isolation"] == out["project_isolation"]
     assert m["counters"]["judge_ok"] == 1 and m["counters"]["judge_skipped"] == 1
     assert [j["status"] for j in m["meta"]["judge"]] == ["ok"]
     assert m["meta"]["judge_skipped"] == [{"index": 1, "reason": "empty_body"}]

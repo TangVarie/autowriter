@@ -376,3 +376,33 @@ def judge_draft_full(payload: dict, *, timeout: Optional[float] = None) -> dict:
 def list_banks(*, timeout: Optional[float] = None) -> dict:
     """写手侧: GET /banks(judge 默认只列每个家族的最新版本; 暗题只报个数)。"""
     return _tool_call("GET", "/banks", timeout=timeout, shape=_banks_shape_problem)
+
+
+def judge_comment_tool(path: str, payload: dict, *, timeout: Optional[float] = None) -> dict:
+    """Read-only comment tooling; candidate comments never become published ledger rows."""
+    if path not in ("/comment_repair_plan_for", "/judge_thread"):
+        raise ValueError("unknown comment tool path")
+    return _tool_call("POST", path, json_body=payload, timeout=timeout,
+                      shape=lambda body: _comment_shape_problem(body, thread=path == "/judge_thread"))
+
+
+def _comment_shape_problem(body: Any, *, thread: bool = False) -> Optional[str]:
+    problem = _draft_shape_problem(body)
+    if problem:
+        return problem
+    if not isinstance(body.get("needs_review"), bool):
+        return "缺 needs_review(bool)"
+    if body["passed"] and body["needs_review"]:
+        return "passed=true 与 needs_review=true 矛盾"
+    for field, kind in (("profile", dict), ("hard_fails", list), ("ambiguous", list)):
+        if not isinstance(body.get(field), kind):
+            return f"缺 {field}({kind.__name__})"
+    if thread:
+        for field, kind in (("comments", list), ("code", dict), ("unjudged", list)):
+            if not isinstance(body.get(field), kind):
+                return f"缺 {field}({kind.__name__})"
+        for comment in body["comments"]:
+            problem = _comment_shape_problem(comment)
+            if problem:
+                return "单条评论: " + problem
+    return None
