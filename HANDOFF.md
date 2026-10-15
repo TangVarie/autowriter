@@ -21,7 +21,7 @@ MCP并发修复、评论转发和跨项目防护已经合并部署；现场5个�
 - 新工具`comment_repair_plan_for`、`judge_thread`先核所有权，再由服务端tv-map填项目/品类，不信任模型任意填项目。
 - 同一个18秒墙钟截止覆盖上下文查询、连接、读取、JSON解析；最多4个共享线程/在途额度，超时不认迟到结果，满额如实返回未判。
 - 只读接口拒绝写账本或伪装已发布参数。HTTP200但不是约定JSON、缺映射、服务超时/故障、`needs_review`、单条/整组结果形状异常均不得当“通过”。
-- 对应Jev [PR9](https://github.com/TangVarie/JevforCoentent/pull/9)已部署，生产`comment_tools_enabled=false`；原100条700格与C1开发试跑不能替代新40条独立复验。新40条正在由人员填写，用户明确暂不冻结，新批Jev调用0。
+- 对应Jev [PR9](https://github.com/TangVarie/JevforCoentent/pull/9)已部署，生产`comment_tools_enabled=false`；原100条700格与C1开发试跑不能替代新40条独立复验。人员40条已完整返回，原判固定为单人参考；C3获本次许可完整复验172/280、69歧义、0缺答，暂不推广。C4边界已固定并通过20条合成验证，真实旧40+新40的80条批次等待明确出境许可。
 
 ### 跨项目串词与影子提示
 
@@ -52,7 +52,7 @@ MCP并发修复、评论转发和跨项目防护已经合并部署；现场5个�
 
 | 待办 | 下一动作 | 验收边界 |
 | --- | --- | --- |
-| J-03 → J-01 → W-02 | 等40条复核返回，对账、owner确认冻结、新批独立评估及报告验收；之后才开评论、真接口小批核查、统一导入skill | 暂不重做旧A/B，不用C1开发分数放行，不因工程已部署提前开关 |
+| J-03 → J-01 → W-02 | 人员40条/C3已完成，不推广；C4真实80条待明确出境许可，再评固定版本和具体报告；之后才开评论、真接口小批核查、统一导入skill | 暂不重做旧A/B，不用C1开发分数放行，不因工程已部署提前开关 |
 | W-19 | 安排真实带鉴权、目标owner的拒写探针及正常对照；查`batch_metrics.meta.project_isolation`与`phase_ms.project_isolation`收集误报/漏报 | 证明拒绝且0写入；影子阶段不升阻断。测试探针应有明确归属，不冒充实际运营内容 |
 | F-04 | 在WorkBuddy真实客户端测`open_project`/借卡等待、超时占比与p95 | 约22秒客户端截止尚未验收；MCP并发修复和评论18秒截止不能替代借卡验收，服务端60秒亦不能保证客户端完成 |
 | W-06 | 查超线项目的发牌、会话中断、`commit_drafts`和`export_drafts`链路 | 本轮只读发现51%漏账，不自动补消费、删角度或改审核结果；先辨清真实流程断点 |
@@ -72,3 +72,10 @@ python -m deskcore.cli selftest
 连库的`python -m deskcore.cli doctor`另按已有服务端凭据执行；本轮交接没有新跑doctor，不把健康接口当迁移证明。SQL/Python parity由CI独立PostgreSQL步骤验证，`tests/sql_parity_check.py`不是普通pytest。
 
 现场配置材料在当前工作区`/workspace/rollout-audits/20261013/`，文件`w19-project-config-before.json`、`w19-project-config-after.json`、`w19-guard-validation.json`；换机器由owner安全转交，配置备份/owner或项目UUID/真实规则文本不追加上传GitHub。完整40条文件去Jev/TV交接所列本地目录获取。
+
+
+## 评论线继续收尾 · 2026-10-15
+
+用户委托整线完成再交接。已合并Jev14/TV185，C4候选及专用验证在[Jev15](https://github.com/TangVarie/JevforCoentent/pull/15)：231项测试通过，20条虚构用例131/140一致；不是生产验收。真实旧40开发/新40 AI参考输入已预检，因自动审批要求这80条新的C4出境批次明确许可而尚未调用。不能使用旧C3一次许可；也不能把新AI参考称真人金标准。
+
+本库评论转发与协议不因候选准备而改变：服务端仍默认关闭，写手不得声称已通过。W-02统一重导skill应等最终具体报告接受及J-01小批真接口验证；本轮没有通知写手/群发。整体证据与受控材料索引见TV HANDOFF及Jev收尾报告，其他12:04生产快照未在本次重测。
