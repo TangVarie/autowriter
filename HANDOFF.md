@@ -1,12 +1,14 @@
 # autowriter / deskcore交接 · 2026-10-15
 
+> **评论线云端交接**：[写作台接手说明及完整材料入口](docs/comment-handoff-online-2026-10-15.md)，可直接在GitHub阅读。
+
 本轮接管覆盖10-12～15；最后只读核对 **10-15 12:04，北京时间**。默认分支是 **`claude/xhs-content-workstation-BSEuH`**；功能基线 [PR96](https://github.com/TangVarie/autowriter/pull/96)，merge `487403b75fb06bf3001cf463a0a966171b45a2b0`。后续TV/Jev的参考评估文档没有再次改aw业务代码。
 
 跨库：[总交接](https://github.com/TangVarie/truth-vault/blob/main/HANDOFF.md)、[统一待办](https://github.com/TangVarie/truth-vault/blob/main/OPEN-ITEMS.md)、[Jev交接](https://github.com/TangVarie/JevforCoentent/blob/main/HANDOFF.md)。旧runbook保留设计与历史过程，当前状态以本文注明的实查快照为准。
 
 ## 当前结论
 
-MCP并发修复、评论转发和跨项目防护已经合并部署；现场5个隔离词已配生产。**评论服务仍关闭，J-03独立复验与报告验收未完成，W-02暂不统一群发重导skill。** 不能把工具列表出现评论接口当成评论检查已放行，也不能把线程池修复当成借卡客户端截止已验收。
+MCP并发修复、评论转发和跨项目防护已经合并部署；现场5个隔离词已配生产。**评论服务仍关闭，J-03的C3/C4固定验证已完成但未过线、上线报告尚未获接受，W-02暂不统一群发重导skill。** 不能把工具列表出现评论接口当成评论检查已放行，也不能把线程池修复当成借卡客户端截止已验收。
 
 ## 本轮改动和验证
 
