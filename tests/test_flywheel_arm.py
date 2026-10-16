@@ -366,3 +366,12 @@ def test_the_borrow_tool_passes_the_arm_through(monkeypatch):
     monkeypatch.setattr(core, "borrow_lessons", lambda c, pid, **kw: seen.update(kw) or {})
     tools.borrow_lessons(PID, flywheel_arm="patterns", _user_id=ME)
     assert seen["flywheel_arm"] == "patterns"
+
+
+def test_tool_docs_explain_external_reference_cards():
+    """TV D-117: 写作台的借卡会混进最多 2 张外部参考卡 (external=true)。工具说明要讲清它不是公司投的、只借结构、
+    不提它的品牌 —— 不然模型会按「公司自己验证过的爆款」去用它。只改工具说明, 协议不动 (不用重导 skill)。"""
+    from deskcore import tools
+    for fn in (tools.open_project, tools.borrow_lessons):
+        doc = fn.__doc__ or ""
+        assert "external=true" in doc and "不是公司投的" in doc and "品牌" in doc, fn.__name__
