@@ -61,7 +61,7 @@ MCP并发修复、评论转发和跨项目防护已经合并部署；现场5个�
 | J-08 / J-12 | 写手恢复后用`batch_metrics(meta.mode=deskcore_commit)`重估judge预算；核活跃项目tv-map | judge保持shadow；新超时值需真实样本，不凭旧runbook的“env未配”重复配置 |
 | W-04 / W-05 / W-18 | 保留发牌结果加权、recent_angle_keys分页、旧文档逐段追平待办 | 加权未实施；当前交接补入口不表示全部旧文字已重写 |
 
-Streamlit停服仍未执行；迁移011/012等更早状态不能从旧runbook“八个迁移/未执行”的段落推断，必要时用`doctor`只读核对。重新导skill由owner/运营在J-01就绪后统一安排，本轮不向写手发送消息。
+Streamlit工作台2026-10-16已停服（owner在Railway停掉，按D-072不删仓、Supabase不动）；迁移011/012等更早状态不能从旧runbook“八个迁移/未执行”的段落推断，必要时用`doctor`只读核对。重新导skill由owner/运营在J-01就绪后统一安排，本轮不向写手发送消息。
 
 ## 下一位维护者的排查入口
 
