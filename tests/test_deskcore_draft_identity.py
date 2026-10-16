@@ -229,7 +229,7 @@ def test_partial_mint_reports_the_ones_that_made_it(monkeypatch):
     good = "aaaa1111-0000-0000-0000-00000000aaaa"
     monkeypatch.setattr(
         store, "mint_draft_identity",
-        lambda sb, pid, uid, tactic, entries: {
+        lambda sb, pid, uid, tactic, entries, **kw: {
             "batch_id": "batch-9",
             # 只有第一条建成了
             "versions": {entries[0]["version_id"]: "item-1"},
@@ -254,7 +254,7 @@ def test_angles_of_unminted_drafts_are_not_consumed(monkeypatch):
     """
     monkeypatch.setattr(
         store, "mint_draft_identity",
-        lambda sb, pid, uid, tactic, entries: {
+        lambda sb, pid, uid, tactic, entries, **kw: {
             "batch_id": "batch-9",
             "versions": {entries[0]["version_id"]: "item-1"},     # 只有第一条建成
             "error": "RuntimeError: 第二条炸了"})

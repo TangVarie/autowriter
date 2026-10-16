@@ -112,7 +112,7 @@ def fetch_flywheel_lessons(brief: dict, *,
     """
     st = status if status is not None else {}
     st.update({"state": BORROW_ERROR, "count": 0,
-               "elapsed_ms": 0, "detail": ""})
+               "elapsed_ms": 0, "detail": "", "patterns": []})
     pid = str(brief.get("project_id") or "")
 
     if not config.LIBRARIAN_URL or not config.LIBRARIAN_API_KEY:
@@ -195,6 +195,9 @@ def fetch_flywheel_lessons(brief: dict, *,
         return []
 
     lessons = payload["selected"]
+    # P4 (TV D-116): 馆员这次下发的闸二已验证规律。只有 brief 带了 explore 的消费方才会拿到; 老馆员没有这个键 → []。
+    pats = payload.get("patterns")
+    st["patterns"] = [p for p in pats if isinstance(p, dict)] if isinstance(pats, list) else []
     st["count"] = len(lessons)
     st["state"] = BORROW_BORROWED if lessons else BORROW_EMPTY
     telemetry.log_event(

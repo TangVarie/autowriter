@@ -281,6 +281,11 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         (最多 5 张); lessons_status.status 说明是 borrowed / empty /
         not_configured / timeout / error 里的哪一种。只借钩子、结构、手法,
         严禁照抄标题主干或具体句子; synthetic=true 的卡指标未经验证。
+        卡上的 validated_hits 是这张卡命中了哪几条已验证规律。
+      · validated_patterns —— 【已验证规律】(有才出现): 在公司自己的历史笔记里、同一项目内
+        对照验证过的写法, 每条 {label, instruction, evidence}。同样合适时照 instruction 写;
+        它是提示不是硬约束, 和 p0 冲突时以 p0 为准, 不贴题就不用。没有这个字段就是这次没有,
+        不要自己编规律, 也不要跟用户解释为什么没有。
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     而不是按时间倒序 —— 后者会让文风越写越窄。所以知道要写什么就传。
@@ -349,6 +354,9 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
        判断借鉴, 不要把它的数据当依据。
 
     库里没有合适的卡时返回空列表, 这不是错误, 照常写就行。
+
+    validated_patterns (可能是空列表) 与 open_project 里的同名字段同一个意思: 已验证规律,
+    同样合适时照 instruction 写, 是提示不是硬约束; 空就是这次没有, 不要自己编。
     """
     return _safe(core.borrow_lessons, core.sb(), project_id, user_id=_user_id,
                  tactic=tactic, draft_topic=draft_topic,

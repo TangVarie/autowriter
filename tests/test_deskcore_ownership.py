@@ -153,6 +153,7 @@ def test_every_project_scoped_entrypoint_calls_the_gate():
 # 这份名单的方向跟上面那份相反: 上面是"列进来才检查", 这里是"不列进来就必须
 # 检查"。前者漏登记 = 静默放行, 后者漏登记 = 当场红。
 UNGATED_WITH_REASON = {
+    "flywheel_arm": "纯函数: 对 (project_id, user_id, 北京日期) 取哈希定飞轮臂, 不读写库; 调用方 borrow_lessons / build_writing_brief / commit_drafts 都已过归属闸",
     "_comment_tool_call": "只被已过归属闸的 comment_repair_plan_for / judge_thread 调用；项目和品类由服务端查询",
     "_cross_project_shadow": "只被已过闸的 commit_drafts 尾部调用；只读当前调用者名下项目的影子信号",
     "_cross_project_shadow_bounded": "私有超时包装，调用者 commit_drafts 已过归属闸，失败不改写入结果",

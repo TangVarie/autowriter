@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import concurrent.futures as cf
 import contextlib
 import logging
@@ -372,8 +373,10 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # ⚠️ 这一段的失败**不能**影响简报: P0 已经拿到了, 卡借不到只是少点参考。
     # fetch_flywheel_lessons 本身绝不抛, 但 build_brief / 其它意外仍兜一层 ——
     # 兜住之后照样留痕(status.state=error + WARN 日志), 不吞成看似成功。
-    borrowed = _borrow_for_brief_bounded(project, brief)
+    borrowed = _borrow_for_brief_bounded(project, brief, user_id=user_id)
     out["lessons"] = borrowed["lessons"]
+    if borrowed.get("validated_patterns"):
+        out["validated_patterns"] = borrowed["validated_patterns"]
     out["lessons_status"] = {k: borrowed[k] for k in
                              ("status", "count", "elapsed_ms", "detail")}
     out["counts"]["lessons"] = len(borrowed["lessons"])
@@ -1894,7 +1897,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             ]
             if to_mint:
                 minted = store.mint_draft_identity(
-                    client, project_id, str(user_id), "", to_mint)
+                    client, project_id, str(user_id), "", to_mint,
+                    # 这批落在哪个飞轮臂 (docs/28 §7.4): 和借卡时用的同一个哈希, 对照组靠它圈出来
+                    batch_params={"source": "deskcore", "flywheel_arm": flywheel_arm(project_id, user_id)})
             identity_error = minted.get("error")
 
             consumed = 0
@@ -4007,6 +4012,22 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
 # 飞轮经验卡(转调 TV 馆员)
 # ══════════════════════════════════════════════════════════════════════
 
+# ── 飞轮分臂 (TV docs/28 §7.4, D-116) ──────────────────────────────────────
+# 写作台 15% 的批次随机不注入闸二已验证规律, 作对照组: 飞轮只喂自己验证过的东西就只会反复学已经在做的事,
+# 规律什么时候失效只有留着没照做的那部分看得出来。随机在【批次】级做: 借卡发生在入库之前, 中间没地方存状态,
+# 所以按 (项目, 写手, 北京日期) 哈希 —— 同一天同一写手同一项目的借卡和入库落进同一个臂, 入库时把臂记进
+# batches.params.flywheel_arm。确定性哈希而不是 random: 重启、重试、两条入口 (open_project / borrow_lessons) 结果一致。
+FLYWHEEL_EXPLORE_PCT = 15
+_CN_TZ = timezone(timedelta(hours=8))
+
+
+def flywheel_arm(project_id, user_id, *, now: datetime | None = None) -> str:
+    """'explore' (不注入规律) | 'patterns'。"""
+    day = (now or datetime.now(timezone.utc)).astimezone(_CN_TZ).date().isoformat()
+    h = int(hashlib.sha256(f"{project_id}|{user_id or ''}|{day}".encode("utf-8")).hexdigest()[:8], 16)
+    return "explore" if h % 100 < FLYWHEEL_EXPLORE_PCT else "patterns"
+
+
 def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
                    **delta) -> dict:
     """复用 librarian_client 的 build_brief + fetch_flywheel_lessons(R-032)。
@@ -4019,7 +4040,7 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     project_id 就能读出那个项目怎么定位"的接口。(审计 COR-015)
     """
     project = assert_project_access(client, project_id, user_id=user_id)
-    return _borrow_for_brief(project, delta)
+    return _borrow_for_brief(project, delta, user_id=user_id)
 
 
 # open_project 随简报带卡时的上限, 与常规生成路径 render_flywheel_block 同一
@@ -4035,7 +4056,7 @@ _BORROW_NEEDS_ATTENTION = frozenset({
 })
 
 
-def _borrow_for_brief(project: dict, delta: dict | None) -> dict:
+def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None = None) -> dict:
     """borrow_lessons 与 build_writing_brief 共用的借阅体。**绝不抛**。
 
     输入是已经过归属校验的项目行 + 本次 delta(tactic / draft_topic /
@@ -4056,6 +4077,8 @@ def _borrow_for_brief(project: dict, delta: dict | None) -> dict:
     try:
         brief = librarian_client.build_brief(project, **kwargs)
         brief["consumer"] = "deskcore"
+        # 显式带 explore 才参与分臂 (TV 那边不带这个键的老消费方不下发规律)
+        brief["explore"] = flywheel_arm(project.get("id"), user_id) == "explore"
         selected = librarian_client.fetch_flywheel_lessons(brief, status=st)
     except Exception as exc:  # noqa: BLE001 — 增强项, 失败不能拖垮简报
         logger.exception("flywheel borrow crashed (project_id=%s)", project.get("id"))
@@ -4073,11 +4096,12 @@ def _borrow_for_brief(project: dict, delta: dict | None) -> dict:
     return {"lessons": lessons, "count": len(lessons),
             "status": state,
             "elapsed_ms": st.get("elapsed_ms"),
-            "detail": st.get("detail") or ""}
+            "detail": st.get("detail") or "",
+            "validated_patterns": list(st.get("patterns") or [])}
 
 
 def _borrow_for_brief_bounded(project: dict, delta: dict | None,
-                              budget: float | None = None) -> dict:
+                              budget: float | None = None, *, user_id: str | None = None) -> dict:
     """``open_project`` 用的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但**只等
     ``OPEN_PROJECT_BORROW_SEC``**(默认 10 秒), 到点先把简报交出去。
 
@@ -4093,7 +4117,7 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
     budget = float(config.OPEN_PROJECT_BORROW_SEC if budget is None else budget)
     try:
         ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
-        fut = ex.submit(_borrow_for_brief, project, delta)
+        fut = ex.submit(_borrow_for_brief, project, delta, user_id=user_id)
     except Exception as exc:  # noqa: BLE001
         # 线程池建不起来 / submit 失败 (RuntimeError: can't start new thread, 解释器关闭中…): 这一层的
         # 承诺和 _borrow_for_brief 一样是"绝不抛" —— 抛出去 open_project 整份简报连 P0 硬约束一起丢
@@ -4103,7 +4127,8 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
         return {"lessons": [], "count": 0,
                 "status": librarian_client.BORROW_ERROR,
                 "elapsed_ms": 0,
-                "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300]}
+                "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300],
+                "validated_patterns": []}
     try:
         try:
             return fut.result(timeout=budget)
@@ -4114,6 +4139,7 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
             return {"lessons": [], "count": 0,
                     "status": librarian_client.BORROW_TIMEOUT,
                     "elapsed_ms": int(budget * 1000),
+                    "validated_patterns": [],
                     "detail": (f"open_project 的借阅预算 {budget:g}s 内馆员没回(选卡要跑一次 LLM, "
                                "冷路径常要 30-80s)。TV 那边会继续选完并写缓存 —— 想要卡的话稍后"
                                "调 borrow_lessons, 同样的选题/战术参数命中缓存即回")}
