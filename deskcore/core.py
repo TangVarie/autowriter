@@ -3400,7 +3400,9 @@ def pipeline_leak(client, days: int = LEAK_WINDOW_DAYS) -> dict:
         "window_days": days, "drawn": drawn, "consumed": consumed,
         "leak_pct": pct, "ok": ok,
         "projects_over_threshold": len(over),
-        "projects_delivered_without_commit": sum(1 for p in over if p.get("likely_cause") == "delivered_without_commit"),
+        # 副本数读失败时给 None 而不是 0: /health 只露这个总数, 0 会把"查不到"说成"一个都没有"(codex review on #103)
+        "projects_delivered_without_commit": (None if copies is None else
+                                              sum(1 for p in over if p.get("likely_cause") == "delivered_without_commit")),
         "projects": per,
         "note": ("发出去的角度里没走到 commit_drafts 的比例。没入库的稿子没有"
                  "指纹, 下一批查重看不见它们。健康时约 20%, 超过 "

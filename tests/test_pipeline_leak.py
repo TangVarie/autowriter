@@ -250,6 +250,8 @@ def test_leak_cause_is_unknown_when_copies_cannot_be_read(monkeypatch):
     by = {p["name"]: p for p in out["projects"]}
     assert out["ok"] is False and by["x"]["likely_cause"] == "unknown" and by["x"]["synced_back"] is None
     assert by["健康"]["ok"] is True and by["健康"]["likely_cause"] is None
+    assert out["projects_delivered_without_commit"] is None, \
+        "读失败时总数给 None 不给 0 —— /health 只露这个数, 0 会把「查不到」说成「一个都没有」(codex review on #103)"
 
 
 def test_ingest_copy_counts_respects_the_window():
@@ -298,3 +300,18 @@ def test_health_shows_the_count_but_still_no_project_names(monkeypatch):
     pipe = client.get("/health").json()["config"]["pipeline"]
     assert pipe["ok"] is False and pipe["projects_delivered_without_commit"] == 1
     assert "途鸽" not in client.get("/health").text
+
+
+def test_doctor_names_the_cause_per_project(monkeypatch, capsys):
+    """/health 只给总数; 哪个项目是哪种原因只在鉴权过的 doctor 里看得到(codex review on #103)。"""
+    from deskcore import cli
+    monkeypatch.setattr(core.store, "angle_leak", lambda sb, days: [
+        _over("百健士", A), _over("西屋", B)])
+    monkeypatch.setattr(core.store, "ingest_copy_counts",
+                        lambda sb, ids, since=None, strict=False: {A: 12, B: 0})
+    cli._print_leak(core, object())
+    out = capsys.readouterr().out
+    line_a = next(l for l in out.splitlines() if "百健士" in l)
+    line_b = next(l for l in out.splitlines() if "西屋" in l)
+    assert "没走 commit" in line_a and "12" in line_a
+    assert "也没同步回来" in line_b

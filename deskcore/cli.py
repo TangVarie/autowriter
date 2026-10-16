@@ -226,6 +226,14 @@ _STATE_MARK = {
 }
 
 
+# W-22: 超线项目的原因标签(core.pipeline_leak 给的)。/health 只给总数, 哪个项目是哪种只在这里看得到。
+_LEAK_CAUSE = {
+    "delivered_without_commit": "← 稿子进了飞书但没走 commit, 坐标没销账",
+    "not_delivered": "← 飞书里也没同步回来",
+    "unknown": "← 原因查不到(补录副本数读失败)",
+}
+
+
 def _print_leak(core, sb) -> None:
     """近 7 天「发了角度没入库」。09-11 起这个数字在库里躺了一周没人看。"""
     try:
@@ -237,8 +245,13 @@ def _print_leak(core, sb) -> None:
           f"入库销账 {leak['consumed']} / 没入库 {leak['leak_pct']}%")
     for prj in leak["projects"]:
         label = prj.get("name") or prj["project_id"][:8]
+        cause = _LEAK_CAUSE.get(prj.get("likely_cause"), "")
+        synced = prj.get("synced_back")
+        tail = f"  {cause}" if cause else ""
+        if cause and synced is not None:
+            tail += f"(窗口内飞书同步回来 {synced} 条)"
         print(f"  {label:22s} 发 {prj['drawn']:4d}  入库 {prj['consumed']:4d}  "
-              f"没入库 {prj['leak_pct']:3d}%")
+              f"没入库 {prj['leak_pct']:3d}%{tail}")
     if not leak["ok"]:
         print(f"\n  ⚠️ {leak['note']}")
         print("     没入库的稿子没有指纹, 下一批查重看不见它们。已经发出去的用"
