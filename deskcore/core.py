@@ -1470,7 +1470,7 @@ def list_banks() -> dict:
 
 
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
-                           out: dict) -> None:
+                           out: dict, *, flywheel: dict | None = None) -> None:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
 
     为什么要落库而不只打日志: 「commit_drafts 约 1~2 秒」「一批 10 篇并行也是一两秒」
@@ -1505,6 +1505,9 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
             "judge_skipped": [{"index": s.get("index"), "reason": s.get("reason")}
                               for s in (j.get("skipped") or [])],
             "project_isolation": out.get("project_isolation") or {},
+            # 飞轮分臂 (docs/28 §7.4): 这次的臂、改稿挂到的旧 item、没能在旧 batch 上标 mixed 的 item ——
+            # batch.params 之外的第二份记录, 分析对照组时据此剔除跨臂改过的批次
+            **(flywheel or {}),
         }
         store.insert_commit_metrics(client, project_id=project_id, user_id=str(user_id),
                                     phase_ms=out.get("phase_ms") or {},
@@ -1708,6 +1711,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
+    arm_meta: dict = {}      # 这次入库的臂 + 改稿挂到哪些旧 item, 进 batch_metrics.meta (分析对照组的第二份记录)
 
     # 全程持项目写锁(codex #84 P1): 替换要先摘旧指纹再查重写入, 两步之间别的 commit /
     # 补录不能插进来。没有替换的普通 commit 也拿 —— 它们正是会在那个窗口里把与旧稿
@@ -1898,8 +1902,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             ]
             # 这批落在哪个飞轮臂 (docs/28 §7.4): 这场写作借卡时定下的那个, 对照组靠它圈出来
             arm, arm_source = batch_arm(project_id, user_id, from_brief=flywheel_arm)
-            if replaced_ok:
-                _mark_mixed_arm_batches(client, list(replaced_ok.values()), arm)
+            unmarked = _mark_mixed_arm_batches(client, list(replaced_ok.values()), arm) if replaced_ok else []
+            arm_meta = {"flywheel_arm": arm, "flywheel_arm_source": arm_source,
+                        "revised_item_ids": sorted(set(replaced_ok.values())),
+                        "arm_mixed_unmarked_item_ids": unmarked}
             if to_mint:
                 minted = store.mint_draft_identity(
                     client, project_id, str(user_id), "", to_mint,
@@ -1964,6 +1970,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                    "replaced": [{"index": i, "item_id": replaced_ok[i],
                                  "old_version_id": replace[i]["old_version_id"],
                                  "version_id": minted_ids[i]} for i in sorted(replaced_ok)]}
+            if arm_meta.get("arm_mixed_unmarked_item_ids"):
+                # 机器可读: 这几条改稿的旧 batch 没能标上 flywheel_arm_mixed, 分析对照组时要剔掉 (同一份也进 batch_metrics)
+                out["flywheel_arm_warning"] = {"code": "arm_mixed_unmarked", "arm": arm_meta["flywheel_arm"],
+                                               "item_ids": arm_meta["arm_mixed_unmarked_item_ids"]}
             if replace_error:
                 missed = [i for i in sorted(inserted_idx) if i in replace and i not in replaced_ok]
                 out["replace_warning"] = (
@@ -2126,7 +2136,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     out["elapsed_ms"] = _ms_since(started)
     out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms,
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
-    _record_commit_metrics(client, project_id, user_id, drafts, out)
+    _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta)
     return out
 
 
@@ -4072,17 +4082,25 @@ def batch_arm(project_id, user_id, *, from_brief: str | None = None) -> tuple[st
     return flywheel_arm(project_id, user_id, now=now), "recomputed"
 
 
-def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str) -> None:
+def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str) -> list[str]:
     """改稿挂在旧 item 上 (旧 batch), 不建新 batch。改稿这场的臂和旧 batch 记的不一样 → 这批的成稿受过两种处理,
     在 batch 上标 flywheel_arm_mixed, 分析对照组时剔掉 (codex review on #104)。旧 batch 没记臂 (分臂之前的) 不在
-    实验里, 不碰。尽力而为: 标不上只记日志, 不影响入库。"""
-    try:
-        for batch_id, params in store.batch_params_for_items(client, item_ids).items():
-            if params.get("flywheel_arm") in FLYWHEEL_ARMS and params["flywheel_arm"] != arm \
-                    and not params.get("flywheel_arm_mixed"):
-                store.merge_batch_params(client, batch_id, {"flywheel_arm_mixed": True})
-    except Exception:  # noqa: BLE001
-        logger.warning("commit_drafts: 改稿跨臂的 batch 没标上 flywheel_arm_mixed (items=%s)", item_ids, exc_info=True)
+    实验里, 不碰。
+
+    不影响入库 (失败重试一次, 再失败就放过), 但**不只记日志**: 返回没能确认标好的 item_id, 调用方把它们写进
+    commit 的返回值 (flywheel_arm_warning) 和 batch_metrics.meta —— 分析时那一份也能把这几批剔掉。"""
+    last_exc: Exception | None = None
+    for _ in range(2):
+        try:
+            for batch_id, params in store.batch_params_for_items(client, item_ids).items():
+                if params.get("flywheel_arm") in FLYWHEEL_ARMS and params["flywheel_arm"] != arm \
+                        and not params.get("flywheel_arm_mixed"):
+                    store.merge_batch_params(client, batch_id, {"flywheel_arm_mixed": True})
+            return []
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    logger.warning("commit_drafts: 改稿跨臂的 batch 没标上 flywheel_arm_mixed (items=%s): %s", item_ids, last_exc)
+    return list(item_ids)
 
 
 def borrow_lessons(client, project_id: str, *, user_id: str | None = None,

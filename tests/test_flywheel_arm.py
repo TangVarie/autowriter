@@ -307,22 +307,40 @@ def test_a_revision_of_a_pre_experiment_batch_is_left_alone(monkeypatch, fresh_a
     assert batch["params"] == {"source": "deskcore"}, "不在实验里的 batch 不碰"
 
 
-def test_marking_mixed_never_breaks_the_commit(monkeypatch, fresh_arms):
+def _commit_meta(c) -> dict:
+    rows = [r for r in c.rows.get("batch_metrics", []) if (r.get("meta") or {}).get("mode") == "deskcore_commit"]
+    return rows[-1]["meta"]
+
+
+def test_marking_mixed_never_breaks_the_commit_but_leaves_a_machine_readable_trace(monkeypatch, fresh_arms):
+    """标 mixed 失败不拖垮入库, 但不能只记日志 (codex review on #104): 返回值和 batch_metrics.meta 里都要有,
+    分析对照组时据此剔掉那几批。"""
     from tests import test_deskcore_draft_identity as T
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
     c = T._client()
     c.rpc_impl["deskcore_commit_fingerprints"] = T._rpc_that_writes(c)
     first = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X}], user_id=T.ME,
                                flywheel_arm="patterns")
+    meta = _commit_meta(c)
+    assert (meta["flywheel_arm"], meta["flywheel_arm_source"]) == ("patterns", "brief")
+    assert meta["revised_item_ids"] == [] and meta["arm_mixed_unmarked_item_ids"] == []
+
+    calls = []
 
     def boom(*a, **k):
+        calls.append(1)
         raise RuntimeError("db down")
     monkeypatch.setattr(store, "batch_params_for_items", boom)
     T._embed(c)
     out = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X2,
                                           "replaces_version_id": first["version_ids"][0]}],
                              user_id=T.ME, flywheel_arm="explore")
-    assert out["replaced"] and out["written"] == 1
+    item = out["replaced"][0]["item_id"]
+    assert out["written"] == 1 and len(calls) == 2, "入库照常; 标 mixed 重试一次"
+    assert out["flywheel_arm_warning"] == {"code": "arm_mixed_unmarked", "arm": "explore", "item_ids": [item]}
+    meta = _commit_meta(c)
+    assert meta["revised_item_ids"] == [item] and meta["arm_mixed_unmarked_item_ids"] == [item]
+    assert meta["flywheel_arm"] == "explore"
 
 
 def test_a_follow_up_borrow_after_midnight_keeps_the_session_arm(monkeypatch, fresh_arms):
