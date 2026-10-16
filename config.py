@@ -155,7 +155,7 @@ def _bounded_number(key: str, default: float, lo: float, hi: float) -> float:
 # 写进 TV 的账本 note_feature_answers(subject_type='aw_version')。和馆员一样是
 # **增强项**: 留空 = 不接, commit_drafts 照常, 返回里 judge_status=not_configured。
 # 见 judge_client.py 与 docs/deskcore.md §3.8。
-JUDGE_URL: str = _get_secret("JUDGE_URL")          # 例 https://judge-production.up.railway.app
+JUDGE_URL: str = _get_secret("JUDGE_URL")          # 例 https://judge-production-601c.up.railway.app（不带 -601c 的是另一个服务）
 JUDGE_API_KEY: str = _get_secret("JUDGE_API_KEY")  # 发在 X-Judge-Key 头里
 # 8 秒是 docs/00 #4 定的「超时即跳过」。这里是【整批判定的共同截止】, 不是每篇各 8 秒 ——
 # 多篇并行(JUDGE_MAX_WORKERS)、到点没回来的一律记 timeout, 所以 commit_drafts 因判定

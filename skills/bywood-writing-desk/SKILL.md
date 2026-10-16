@@ -32,8 +32,8 @@ description: 帆谷/BYWOOD 小红书种草文案的【写作台协议】。凡�
 - `bywood-writing-desk`（本 skill）管这一批守不守项目规则、跟历史重不重
 - `seeding-prompt-refiner` 管提示词本身怎么迭代
 
-<!-- protocol_version: 3fdff2c0b985 -->
-protocol_version: 3fdff2c0b985
+<!-- protocol_version: b8986a70d163 -->
+protocol_version: b8986a70d163
 
 # 写作台协议
 
@@ -233,7 +233,7 @@ protocol_version: 3fdff2c0b985
 
 评论位 `slot` 至少给 `id`、`speech_act`，可补 `role`、`may_name_brand`、`must_echo`、`value_ok`、`min_detail`；提问位例：`{"id":"q1","speech_act":["提问"],"must_echo":false,"value_ok":["可行动信息","判断依据","无"],"min_detail":"无"}`。整组传各条的 `text`、`role`、`reply_to_text` 和 `slot`，检查整体及单条结果；修改后最多再判一轮。
 
-只有 `judge_status=ok` 且 `passed=true`、`needs_review=false` 才能说本次检查通过。接口未开放、超时或失败时如实说明本次未完成检查，不能跳过后声称通过。评论题库尚待100条双人金标准验收，开放前的人工审核仍必需。评论用作品牌/贴主答疑和信息补充草稿；亲历和背书必须来自可核实的真实素材，不编造用户体验。`needs_review` 的评论交人工核实，不通过反复润色把风险抹掉。
+只有 `judge_status=ok` 且 `passed=true`、`needs_review=false` 才能说本次检查通过。接口未开放、超时或失败时如实说明本次未完成检查，不能跳过后声称通过。评论题库 2026-10-16 已验收（D-112）：通过与否只看主要行为、点名品牌、接住帖子、细节四项和背书复核；`plan` 里的是必须改的。`hints` 里的（说话方式、读者价值、像不像安排、运营意图）只是提示，可以参考着改，不改也不算没通过，不要把它们说成检查没过，也不要为了消掉提示反复重写。评论用作品牌/贴主答疑和信息补充草稿；亲历和背书必须来自可核实的真实素材，不编造用户体验。`needs_review` 的评论交人工核实，不通过反复润色把风险抹掉。
 
 举个真实的例子。用户说：「途鸽的维护评论规则更新+入库，提及途鸽不要用代称只能用"途鸽"80%，途鸽求职"20%」。这句话的全部工作量是**一次 `record_rule`**：
 
