@@ -40,7 +40,8 @@ REMIND_EVERY_S = 30 * 60       # 抽查提醒: 同一个人 30 分钟最多一�
 HEALTH_WINDOW_S = 24 * 3600
 
 _lock = threading.Lock()
-_seen: dict[str, tuple[str, Optional[str], float]] = {}   # user → (状态, 报的版本, 时刻)
+_seen: dict[str, tuple[Optional[str], float]] = {}   # user → (报的版本, 时刻)。状态不存, 每次拿当前版本现算 ——
+                                                       # 协议换了版, 之前报「最新」的人随之变成旧版
 _reminded: dict[str, float] = {}                          # user → 上次在非入口工具上提醒的时刻
 
 
@@ -58,6 +59,10 @@ def _key(user_id) -> str:
     return str(user_id or "anonymous")
 
 
+def _status(local: Optional[str], current: str) -> str:
+    return UNKNOWN if local is None else (UP_TO_DATE if local == current else OUTDATED)
+
+
 def report(user_id, raw_version, current: str, *, now: Optional[float] = None) -> tuple[str, Optional[str]]:
     """入口工具调: 记下这个写手报的版本, 回 (状态, 版本)。没带版本时沿用 12 小时内的记录, 没有就是 unknown。"""
     now = time.time() if now is None else now
@@ -67,11 +72,11 @@ def report(user_id, raw_version, current: str, *, now: Optional[float] = None) -
         ts = now
         if local is None:
             prev = _seen.get(k)
-            if prev and now - prev[2] < RECORD_TTL_S and prev[1]:
+            if prev and now - prev[1] < RECORD_TTL_S and prev[0]:
                 # 沿用旧记录, 时间也沿用 —— 否则一直不带版本的调用会让一条旧记录永不过期
-                local, ts = prev[1], prev[2]
-        status = UNKNOWN if local is None else (UP_TO_DATE if local == current else OUTDATED)
-        _seen[k] = (status, local, ts)
+                local, ts = prev[0], prev[1]
+        status = _status(local, current)
+        _seen[k] = (local, ts)
         if status != UP_TO_DATE:
             _reminded[k] = now     # 入口工具这次已经提醒过了, 抽查从现在起算 30 分钟, 不紧跟着再来一条
     return status, local
@@ -100,12 +105,13 @@ def annotate(tool_name: str, user_id, result, current: str, *, now: Optional[flo
     k = _key(user_id)
     with _lock:
         rec = _seen.get(k)
-        if not rec or rec[0] == UP_TO_DATE or now - rec[2] >= RECORD_TTL_S:
+        if not rec or now - rec[1] >= RECORD_TTL_S:
             return result
-        if now - _reminded.get(k, 0.0) < REMIND_EVERY_S:
+        local = rec[0]
+        status = _status(local, current)
+        if status == UP_TO_DATE or now - _reminded.get(k, 0.0) < REMIND_EVERY_S:
             return result
         _reminded[k] = now
-        status, local = rec[0], rec[1]
     result["skill_update"] = notice(status, local, current)
     return result
 
@@ -116,9 +122,10 @@ def health(current: str, *, now: Optional[float] = None) -> dict:
     counts = {UP_TO_DATE: 0, OUTDATED: 0, UNKNOWN: 0}
     old_versions: dict[str, int] = {}
     with _lock:
-        for status, local, ts in _seen.values():
+        for local, ts in _seen.values():
             if now - ts >= HEALTH_WINDOW_S:
                 continue
+            status = _status(local, current)
             counts[status] += 1
             if status == OUTDATED and local:
                 old_versions[local] = old_versions.get(local, 0) + 1

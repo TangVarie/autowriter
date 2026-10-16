@@ -229,3 +229,14 @@ def test_over_mcp_other_tools_carry_the_spot_check(monkeypatch):
     monkeypatch.setattr(core, "my_style", lambda client, pid, *, user_id=None: {"notes": ""})
     out = _mcp_payload(_mcp_call("my_style", {"project_id": "p"}))
     assert out.get("skill_update", {}).get("status") == "outdated", "MCP 这条路也做抽查"
+
+
+def test_a_protocol_change_turns_earlier_current_reports_outdated(rest, monkeypatch):
+    """状态不在报版本那一刻定死: 协议换了版 (codex review on #106), 之前报「最新」的人随之算旧版。"""
+    tools.open_project("p", skill_version=CURRENT, _user_id=ME)
+    newer = "fedcba987654"
+    monkeypatch.setattr(A, "_protocol_version", lambda: newer)
+    out = rest()
+    assert out["skill_update"]["status"] == "outdated" and out["skill_update"]["local"] == CURRENT
+    h = skillcheck.health(newer)
+    assert h["writers_24h"]["outdated"] == 1 and h["outdated_versions"] == {CURRENT: 1}
