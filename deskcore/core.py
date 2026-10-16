@@ -1896,10 +1896,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 for i in sorted(inserted_idx) if i in minted_ids and i not in replace
             ]
             if to_mint:
+                # 这批落在哪个飞轮臂 (docs/28 §7.4): 借卡时定下的那个, 对照组靠它圈出来
+                arm, arm_source = batch_arm(project_id, user_id)
                 minted = store.mint_draft_identity(
                     client, project_id, str(user_id), "", to_mint,
-                    # 这批落在哪个飞轮臂 (docs/28 §7.4): 和借卡时用的同一个哈希, 对照组靠它圈出来
-                    batch_params={"source": "deskcore", "flywheel_arm": flywheel_arm(project_id, user_id)})
+                    batch_params={"source": "deskcore", "flywheel_arm": arm, "flywheel_arm_source": arm_source})
             identity_error = minted.get("error")
 
             consumed = 0
@@ -4014,9 +4015,9 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
 
 # ── 飞轮分臂 (TV docs/28 §7.4, D-116) ──────────────────────────────────────
 # 写作台 15% 的批次随机不注入闸二已验证规律, 作对照组: 飞轮只喂自己验证过的东西就只会反复学已经在做的事,
-# 规律什么时候失效只有留着没照做的那部分看得出来。随机在【批次】级做: 借卡发生在入库之前, 中间没地方存状态,
-# 所以按 (项目, 写手, 北京日期) 哈希 —— 同一天同一写手同一项目的借卡和入库落进同一个臂, 入库时把臂记进
-# batches.params.flywheel_arm。确定性哈希而不是 random: 重启、重试、两条入口 (open_project / borrow_lessons) 结果一致。
+# 规律什么时候失效只有留着没照做的那部分看得出来。随机在【批次】级做: 按 (项目, 写手, 北京日期) 哈希定臂,
+# 借卡时定下、入库时把借卡那次的臂记进 batches.params.flywheel_arm (见下面 batch_arm)。
+# 确定性哈希而不是 random: 重启、重试、两条入口 (open_project / borrow_lessons) 同一天结果一致。
 FLYWHEEL_EXPLORE_PCT = 15
 _CN_TZ = timezone(timedelta(hours=8))
 
@@ -4026,6 +4027,38 @@ def flywheel_arm(project_id, user_id, *, now: datetime | None = None) -> str:
     day = (now or datetime.now(timezone.utc)).astimezone(_CN_TZ).date().isoformat()
     h = int(hashlib.sha256(f"{project_id}|{user_id or ''}|{day}".encode("utf-8")).hexdigest()[:8], 16)
     return "explore" if h % 100 < FLYWHEEL_EXPLORE_PCT else "patterns"
+
+
+# 入库记的是【借卡那一刻】的臂, 不是入库这一刻重算的 (codex review on #104): 一次写作跨了北京 0 点, 两天的哈希
+# 可能不同, 重算会把拿到规律的批次记成对照组。deskcore 单进程 (railway.json 的 uvicorn 没开 --workers), 记在内存里;
+# 重启过、或这个写手在这个项目 36 小时内没借过卡 → 按入库时重算, batch 上标 flywheel_arm_source="recomputed",
+# 分析对照组时可以只看 "borrow" 的。
+_ARM_TTL = timedelta(hours=36)
+_borrowed_arms: dict[tuple[str, str], tuple[str, datetime]] = {}
+_borrowed_arms_lock = threading.Lock()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _borrow_arm(project_id, user_id) -> str:
+    """借卡时定臂, 并记下来给入库用。同一 (项目, 写手) 只留最近一次。"""
+    now = _utcnow()
+    arm = flywheel_arm(project_id, user_id, now=now)
+    with _borrowed_arms_lock:
+        _borrowed_arms[(str(project_id), str(user_id or ""))] = (arm, now)
+    return arm
+
+
+def batch_arm(project_id, user_id) -> tuple[str, str]:
+    """入库时这批记哪个臂: (臂, 'borrow' | 'recomputed')。"""
+    now = _utcnow()
+    with _borrowed_arms_lock:
+        hit = _borrowed_arms.get((str(project_id), str(user_id or "")))
+    if hit and now - hit[1] <= _ARM_TTL:
+        return hit[0], "borrow"
+    return flywheel_arm(project_id, user_id, now=now), "recomputed"
 
 
 def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
@@ -4078,7 +4111,7 @@ def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None 
         brief = librarian_client.build_brief(project, **kwargs)
         brief["consumer"] = "deskcore"
         # 显式带 explore 才参与分臂 (TV 那边不带这个键的老消费方不下发规律)
-        brief["explore"] = flywheel_arm(project.get("id"), user_id) == "explore"
+        brief["explore"] = _borrow_arm(project.get("id"), user_id) == "explore"
         selected = librarian_client.fetch_flywheel_lessons(brief, status=st)
     except Exception as exc:  # noqa: BLE001 — 增强项, 失败不能拖垮简报
         logger.exception("flywheel borrow crashed (project_id=%s)", project.get("id"))

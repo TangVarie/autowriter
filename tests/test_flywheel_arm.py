@@ -1,12 +1,11 @@
 """飞轮分臂与已验证规律透传 (TV docs/28 §7.4, D-116)。
 
-写作台 15% 的批次随机不注入闸二已验证规律, 作对照组。随机在【批次】级: 借卡发生在入库之前, 中间没地方存状态,
-所以按 (项目, 写手, 北京日期) 哈希 —— 同一天同一写手同一项目的借卡和入库落进同一个臂, 入库时记进
-batches.params.flywheel_arm。
+写作台 15% 的批次随机不注入闸二已验证规律, 作对照组。随机在【批次】级: 按 (项目, 写手, 北京日期) 哈希定臂,
+借卡时定下, 入库时把借卡那次的臂记进 batches.params.flywheel_arm (没借过卡 / 进程重启过 → 重算, 标 recomputed)。
 
 这里钉的【被禁止的形态】:
   · 借卡不带 explore —— TV 那边会当老消费方, 一条规律都不给, 规律臂也就没有了;
-  · 借卡和入库算出来的臂不一样 —— 对照组圈不准;
+  · 借卡和入库记的臂不一样 (包括跨了北京 0 点: 入库要记借卡那次的臂, codex review on #104) —— 对照组圈不准;
   · 入库的 batch 没记臂;
   · 馆员回的 patterns 被丢掉, 或者探索臂也把规律给了写手。
 """
@@ -89,14 +88,7 @@ def test_borrow_sends_the_arm_and_passes_patterns_through(monkeypatch, arm):
         assert brief["lessons"][0]["validated_hits"] == ["结尾问读者"]
 
 
-def test_borrow_and_commit_use_the_same_arm(monkeypatch):
-    seen = {}
-    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: seen.setdefault((pid, uid), "explore"))
-    fake = _Librarian(PATTERNS)
-    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
-    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
-    core.borrow_lessons(_client(), PID, user_id=ME)
-
+def _commit(monkeypatch):
     captured = {}
     real = store.mint_draft_identity
 
@@ -104,6 +96,7 @@ def test_borrow_and_commit_use_the_same_arm(monkeypatch):
         captured["params"] = batch_params
         return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
     monkeypatch.setattr(store, "mint_draft_identity", spy)
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
 
     c = FakeClient(rows={"projects": [{"id": PID, "name": "项目", "brand": "A", "owner_id": ME,
                                        "calibration_notes": "", "tactics": "[]", "custom_roles": []}]})
@@ -112,9 +105,65 @@ def test_borrow_and_commit_use_the_same_arm(monkeypatch):
         for i in range(len(args.get("_rows") or []))]
     out = core.commit_drafts(c, PID, [{"title": "标题一", "body": "正文一二三四五六七八", "keywords": ["a"]}], user_id=ME)
     assert out["batch_id"]
-    assert captured["params"] == {"source": "deskcore", "flywheel_arm": "explore"}
-    assert c.rows["batches"][0]["params"]["flywheel_arm"] == "explore"
+    assert c.rows["batches"][0]["params"] == captured["params"]
+    return captured["params"]
+
+
+@pytest.fixture
+def fresh_arms(monkeypatch):
+    monkeypatch.setattr(core, "_borrowed_arms", {})
+
+
+def test_borrow_and_commit_use_the_same_arm(monkeypatch, fresh_arms):
+    seen = {}
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: seen.setdefault((pid, uid), "explore"))
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    core.borrow_lessons(_client(), PID, user_id=ME)
+
+    assert _commit(monkeypatch) == {"source": "deskcore", "flywheel_arm": "explore", "flywheel_arm_source": "borrow"}
     assert list(seen) == [(PID, ME)], "借卡和入库按同一个 (项目, 写手) 算臂"
+
+
+def _days_with_different_arms():
+    """找一对相邻北京日, 两天这个写手在这个项目的臂不一样 (15% 的臂, 60 天里一定有)。"""
+    base = datetime(2026, 10, 16, 15, 59, tzinfo=timezone.utc)        # 北京 23:59
+    for d in range(60):
+        before = base + timedelta(days=d)
+        after = before + timedelta(minutes=2)                           # 北京次日 00:01
+        if core.flywheel_arm(PID, ME, now=before) != core.flywheel_arm(PID, ME, now=after):
+            return before, after
+    raise AssertionError("60 天里臂一直没变")
+
+
+def test_commit_after_beijing_midnight_keeps_the_borrow_arm(monkeypatch, fresh_arms):
+    """借卡在北京 23:59、入库在 00:01, 两天的哈希不同: batch 必须记借卡那次的臂 (codex review on #104)。"""
+    before, after = _days_with_different_arms()
+    borrowed = core.flywheel_arm(PID, ME, now=before)
+    fake = _Librarian(PATTERNS)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+
+    monkeypatch.setattr(core, "_utcnow", lambda: before)
+    core.borrow_lessons(_client(), PID, user_id=ME)
+    assert fake.briefs[-1]["explore"] is (borrowed == "explore")
+
+    monkeypatch.setattr(core, "_utcnow", lambda: after)
+    params = _commit(monkeypatch)
+    assert params["flywheel_arm"] == borrowed != core.flywheel_arm(PID, ME, now=after)
+    assert params["flywheel_arm_source"] == "borrow"
+
+
+def test_commit_without_a_recent_borrow_recomputes_and_says_so(monkeypatch, fresh_arms):
+    now = datetime(2026, 10, 17, 2, tzinfo=timezone.utc)
+    monkeypatch.setattr(core, "_utcnow", lambda: now)
+    params = _commit(monkeypatch)
+    assert params == {"source": "deskcore", "flywheel_arm": core.flywheel_arm(PID, ME, now=now),
+                      "flywheel_arm_source": "recomputed"}, "没借过卡 (或进程重启过) 要标出来, 分析时能剔掉"
+
+    monkeypatch.setattr(core, "_utcnow", lambda: now - timedelta(hours=40))
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    core.borrow_lessons(_client(), PID, user_id=ME)
+    monkeypatch.setattr(core, "_utcnow", lambda: now)
+    assert _commit(monkeypatch)["flywheel_arm_source"] == "recomputed", "36 小时前的借卡不算这一批的"
 
 
 class _Resp:
