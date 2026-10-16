@@ -198,3 +198,128 @@ def test_tool_docs_tell_the_model_what_validated_patterns_are():
     for fn in (tools.open_project, tools.borrow_lessons):
         doc = fn.__doc__ or ""
         assert "validated_patterns" in doc and "不是硬约束" in doc and "不要自己编" in doc, fn.__name__
+
+
+# ── 臂随简报走、入库原样传回 (codex review on #104 第二轮) ─────────────────────────────
+
+def test_the_brief_carries_the_arm_even_when_the_borrow_times_out(monkeypatch, fresh_arms):
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "explore")
+    monkeypatch.setattr(config, "OPEN_PROJECT_BORROW_SEC", 0.01)
+    import time as _t
+
+    def slow(brief, *, status=None):
+        _t.sleep(0.2)
+        return []
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", slow)
+    brief = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    assert brief["lessons_status"]["status"] == lib.BORROW_TIMEOUT
+    assert brief["flywheel_arm"] == "explore", "借阅超时简报也要带臂, 入库时才传得回来"
+
+
+def _commit_with(monkeypatch, **kw):
+    captured = {}
+    real = store.mint_draft_identity
+
+    def spy(sb, project_id, user_id, tactic, entries, *, batch_params=None):
+        captured["params"] = batch_params
+        return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
+    monkeypatch.setattr(store, "mint_draft_identity", spy)
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    c = FakeClient(rows={"projects": [{"id": PID, "name": "项目", "brand": "A", "owner_id": ME,
+                                       "calibration_notes": "", "tactics": "[]", "custom_roles": []}]})
+    c.rpc_impl["deskcore_commit_fingerprints"] = lambda args: [
+        {"idx": i, "status": core.COMMIT_STATUS_INSERTED, "collided_with": None, "detail": None}
+        for i in range(len(args.get("_rows") or []))]
+    core.commit_drafts(c, PID, [{"title": "标题一", "body": "正文一二三四五六七八", "keywords": ["a"]}],
+                       user_id=ME, **kw)
+    return captured["params"]
+
+
+def test_overlapping_sessions_each_record_their_own_arm(monkeypatch, fresh_arms):
+    """同一写手同一项目开着两场: A 在北京 23:59 借卡, B 在 00:01 借卡 (臂不同, 内存里只剩 B 的)。
+    A 入库时传回自己简报里的臂 → 记 A 的; 不传才退到「最近一次借卡」。"""
+    before, after = _days_with_different_arms()
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    monkeypatch.setattr(core, "_utcnow", lambda: before)
+    arm_a = core.borrow_lessons(_client(), PID, user_id=ME)["flywheel_arm"]
+    monkeypatch.setattr(core, "_utcnow", lambda: after)
+    arm_b = core.borrow_lessons(_client(), PID, user_id=ME)["flywheel_arm"]
+    assert arm_a != arm_b
+
+    p = _commit_with(monkeypatch, flywheel_arm=arm_a)
+    assert (p["flywheel_arm"], p["flywheel_arm_source"]) == (arm_a, "brief")
+    p = _commit_with(monkeypatch)
+    assert (p["flywheel_arm"], p["flywheel_arm_source"]) == (arm_b, "borrow")
+    p = _commit_with(monkeypatch, flywheel_arm="随便写的")
+    assert (p["flywheel_arm"], p["flywheel_arm_source"]) == (arm_b, "borrow"), "认不出的值不当真"
+
+
+def test_the_commit_tool_passes_the_arm_through(monkeypatch):
+    from deskcore import tools
+    seen = {}
+    monkeypatch.setattr(core, "sb", lambda: object())
+    monkeypatch.setattr(core, "commit_drafts", lambda c, pid, drafts, **kw: seen.update(kw) or {})
+    tools.commit_drafts(PID, [], flywheel_arm="explore", _user_id=ME)
+    assert seen["flywheel_arm"] == "explore"
+    tools.commit_drafts(PID, [], _user_id=ME)
+    assert seen["flywheel_arm"] is None
+    for fn in (tools.open_project, tools.borrow_lessons, tools.commit_drafts):
+        assert "flywheel_arm" in (fn.__doc__ or "") and "原样" in (fn.__doc__ or ""), fn.__name__
+
+
+# ── 改稿挂在旧 batch 上: 跨臂就标 mixed ─────────────────────────────────────────────
+
+@pytest.mark.parametrize("first_arm, revise_arm, mixed", [
+    ("patterns", "explore", True),
+    ("patterns", "patterns", False),
+])
+def test_a_revision_under_the_other_arm_marks_the_batch_mixed(monkeypatch, fresh_arms, first_arm, revise_arm, mixed):
+    from tests import test_deskcore_draft_identity as T
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    c = T._client()
+    c.rpc_impl["deskcore_commit_fingerprints"] = T._rpc_that_writes(c)
+    first = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X}], user_id=T.ME,
+                               flywheel_arm=first_arm)
+    batch = c.rows["batches"][0]
+    assert batch["params"]["flywheel_arm"] == first_arm
+
+    T._embed(c)
+    out = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X2,
+                                          "replaces_version_id": first["version_ids"][0]}],
+                             user_id=T.ME, flywheel_arm=revise_arm)
+    assert out["replaced"] and out["batch_id"] is None, "只有替换稿: 不建新 batch"
+    assert bool(batch["params"].get("flywheel_arm_mixed")) is mixed
+    assert batch["params"]["flywheel_arm"] == first_arm and batch["params"]["source"] == "deskcore", "原有字段不动"
+
+
+def test_a_revision_of_a_pre_experiment_batch_is_left_alone(monkeypatch, fresh_arms):
+    from tests import test_deskcore_draft_identity as T
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    c = T._client()
+    c.rpc_impl["deskcore_commit_fingerprints"] = T._rpc_that_writes(c)
+    first = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X}], user_id=T.ME)
+    batch = c.rows["batches"][0]
+    batch["params"] = {"source": "deskcore"}                     # 分臂之前建的 batch
+    T._embed(c)
+    core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X2,
+                                    "replaces_version_id": first["version_ids"][0]}],
+                       user_id=T.ME, flywheel_arm="explore")
+    assert batch["params"] == {"source": "deskcore"}, "不在实验里的 batch 不碰"
+
+
+def test_marking_mixed_never_breaks_the_commit(monkeypatch, fresh_arms):
+    from tests import test_deskcore_draft_identity as T
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    c = T._client()
+    c.rpc_impl["deskcore_commit_fingerprints"] = T._rpc_that_writes(c)
+    first = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X}], user_id=T.ME,
+                               flywheel_arm="patterns")
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(store, "batch_params_for_items", boom)
+    T._embed(c)
+    out = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X2,
+                                          "replaces_version_id": first["version_ids"][0]}],
+                             user_id=T.ME, flywheel_arm="explore")
+    assert out["replaced"] and out["written"] == 1

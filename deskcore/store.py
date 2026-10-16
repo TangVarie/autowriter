@@ -1541,6 +1541,38 @@ def add_version_to_item(sb, item_id: str, *, version_id: str, version_num: int,
     }).execute()
 
 
+def _as_params(params) -> dict:
+    """``batches.params`` 是 jsonb, PostgREST 回 dict; 老行 / 假件可能给字符串。认不出 → {}。"""
+    if isinstance(params, str):
+        import json
+        try:
+            params = json.loads(params)
+        except ValueError:
+            return {}
+    return params if isinstance(params, dict) else {}
+
+
+def batch_params_for_items(sb, item_ids: list[str]) -> dict[str, dict]:
+    """这些 item 所在 batch 的 ``params`` (``batch_id`` → dict)。"""
+    batch_ids: list[str] = []
+    for chunk in db._in_chunks(list(dict.fromkeys(item_ids)), 100):
+        res = sb.table("items").select("id, batch_id").in_("id", chunk).execute()
+        batch_ids += [str(r["batch_id"]) for r in (res.data or []) if r.get("batch_id")]
+    out: dict[str, dict] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(batch_ids)), 100):
+        res = sb.table("batches").select("id, params").in_("id", chunk).execute()
+        for r in res.data or []:
+            out[str(r["id"])] = _as_params(r.get("params"))
+    return out
+
+
+def merge_batch_params(sb, batch_id: str, patch: dict) -> None:
+    """把 ``patch`` 并进 ``batches.params`` (读-并-写; 调用方持项目写锁, 同一 batch 不会并发改)。"""
+    res = sb.table("batches").select("params").eq("id", batch_id).limit(1).execute()
+    cur = _as_params((res.data or [{}])[0].get("params"))
+    sb.table("batches").update({"params": {**cur, **patch}}).eq("id", batch_id).execute()
+
+
 def point_item_at_version(sb, item_id: str, version_id: str, *, reset_decision: bool) -> None:
     """把 item 的 best_version_id 指到新版。
 

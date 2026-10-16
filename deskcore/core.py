@@ -377,6 +377,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     out["lessons"] = borrowed["lessons"]
     if borrowed.get("validated_patterns"):
         out["validated_patterns"] = borrowed["validated_patterns"]
+    out["flywheel_arm"] = borrowed.get("flywheel_arm")   # 入库时原样传给 commit_drafts (对照组圈人用)
     out["lessons_status"] = {k: borrowed[k] for k in
                              ("status", "count", "elapsed_ms", "detail")}
     out["counts"]["lessons"] = len(borrowed["lessons"])
@@ -1663,7 +1664,7 @@ def judge_thread(client, project_id: str, post_title: str, post_body: str, comme
 
 
 def commit_drafts(client, project_id: str, drafts: list[dict],
-                  *, user_id: str | None = None) -> dict:
+                  *, user_id: str | None = None, flywheel_arm: str | None = None) -> dict:
     """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
 
     只收真正定稿的 —— 指纹库脏了(把废稿也记进去)会让后续正常选题被误杀。
@@ -1895,9 +1896,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                  "keywords": drafts[i].get("keywords") or []}
                 for i in sorted(inserted_idx) if i in minted_ids and i not in replace
             ]
+            # 这批落在哪个飞轮臂 (docs/28 §7.4): 这场写作借卡时定下的那个, 对照组靠它圈出来
+            arm, arm_source = batch_arm(project_id, user_id, from_brief=flywheel_arm)
+            if replaced_ok:
+                _mark_mixed_arm_batches(client, list(replaced_ok.values()), arm)
             if to_mint:
-                # 这批落在哪个飞轮臂 (docs/28 §7.4): 借卡时定下的那个, 对照组靠它圈出来
-                arm, arm_source = batch_arm(project_id, user_id)
                 minted = store.mint_draft_identity(
                     client, project_id, str(user_id), "", to_mint,
                     batch_params={"source": "deskcore", "flywheel_arm": arm, "flywheel_arm_source": arm_source})
@@ -4029,10 +4032,13 @@ def flywheel_arm(project_id, user_id, *, now: datetime | None = None) -> str:
     return "explore" if h % 100 < FLYWHEEL_EXPLORE_PCT else "patterns"
 
 
-# 入库记的是【借卡那一刻】的臂, 不是入库这一刻重算的 (codex review on #104): 一次写作跨了北京 0 点, 两天的哈希
-# 可能不同, 重算会把拿到规律的批次记成对照组。deskcore 单进程 (railway.json 的 uvicorn 没开 --workers), 记在内存里;
-# 重启过、或这个写手在这个项目 36 小时内没借过卡 → 按入库时重算, batch 上标 flywheel_arm_source="recomputed",
-# 分析对照组时可以只看 "borrow" 的。
+# 入库记的是【这场写作借卡时】的臂, 不是入库这一刻重算的 (codex review on #104): 一次写作跨了北京 0 点, 两天的
+# 哈希可能不同, 重算会把拿到规律的批次记成对照组。三层, 先到先用, 来源记进 batch 的 flywheel_arm_source:
+#   · "brief"      —— open_project / borrow_lessons 把臂随简报交给模型, 模型入库时原样传回 (commit_drafts 的
+#                     flywheel_arm)。只有它分得清同一写手同一项目同时开着的两场 (各拿各的简报);
+#   · "borrow"     —— 模型没传: 用这个 (项目, 写手) 最近一次借卡时记下的臂 (进程内存; deskcore 单进程,
+#                     railway.json 的 uvicorn 没开 --workers);
+#   · "recomputed" —— 重启过 / 36 小时内没借过卡: 按入库时重算。分析对照组时可以只看前两种。
 _ARM_TTL = timedelta(hours=36)
 _borrowed_arms: dict[tuple[str, str], tuple[str, datetime]] = {}
 _borrowed_arms_lock = threading.Lock()
@@ -4051,14 +4057,32 @@ def _borrow_arm(project_id, user_id) -> str:
     return arm
 
 
-def batch_arm(project_id, user_id) -> tuple[str, str]:
-    """入库时这批记哪个臂: (臂, 'borrow' | 'recomputed')。"""
+FLYWHEEL_ARMS = ("patterns", "explore")
+
+
+def batch_arm(project_id, user_id, *, from_brief: str | None = None) -> tuple[str, str]:
+    """入库时这批记哪个臂: (臂, 'brief' | 'borrow' | 'recomputed')。``from_brief`` = 模型传回的简报里的臂。"""
+    if from_brief in FLYWHEEL_ARMS:
+        return from_brief, "brief"
     now = _utcnow()
     with _borrowed_arms_lock:
         hit = _borrowed_arms.get((str(project_id), str(user_id or "")))
     if hit and now - hit[1] <= _ARM_TTL:
         return hit[0], "borrow"
     return flywheel_arm(project_id, user_id, now=now), "recomputed"
+
+
+def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str) -> None:
+    """改稿挂在旧 item 上 (旧 batch), 不建新 batch。改稿这场的臂和旧 batch 记的不一样 → 这批的成稿受过两种处理,
+    在 batch 上标 flywheel_arm_mixed, 分析对照组时剔掉 (codex review on #104)。旧 batch 没记臂 (分臂之前的) 不在
+    实验里, 不碰。尽力而为: 标不上只记日志, 不影响入库。"""
+    try:
+        for batch_id, params in store.batch_params_for_items(client, item_ids).items():
+            if params.get("flywheel_arm") in FLYWHEEL_ARMS and params["flywheel_arm"] != arm \
+                    and not params.get("flywheel_arm_mixed"):
+                store.merge_batch_params(client, batch_id, {"flywheel_arm_mixed": True})
+    except Exception:  # noqa: BLE001
+        logger.warning("commit_drafts: 改稿跨臂的 batch 没标上 flywheel_arm_mixed (items=%s)", item_ids, exc_info=True)
 
 
 def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
@@ -4089,7 +4113,8 @@ _BORROW_NEEDS_ATTENTION = frozenset({
 })
 
 
-def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None = None) -> dict:
+def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None = None,
+                      arm: str | None = None) -> dict:
     """borrow_lessons 与 build_writing_brief 共用的借阅体。**绝不抛**。
 
     输入是已经过归属校验的项目行 + 本次 delta(tactic / draft_topic /
@@ -4107,11 +4132,12 @@ def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None 
                "target_audience", "tone", "extra_instructions")
     kwargs = {k: (delta.get(k) or "") for k in allowed if delta.get(k)}
     st: dict = {}
+    arm = arm or _borrow_arm(project.get("id"), user_id)
     try:
         brief = librarian_client.build_brief(project, **kwargs)
         brief["consumer"] = "deskcore"
         # 显式带 explore 才参与分臂 (TV 那边不带这个键的老消费方不下发规律)
-        brief["explore"] = _borrow_arm(project.get("id"), user_id) == "explore"
+        brief["explore"] = arm == "explore"
         selected = librarian_client.fetch_flywheel_lessons(brief, status=st)
     except Exception as exc:  # noqa: BLE001 — 增强项, 失败不能拖垮简报
         logger.exception("flywheel borrow crashed (project_id=%s)", project.get("id"))
@@ -4130,7 +4156,8 @@ def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None 
             "status": state,
             "elapsed_ms": st.get("elapsed_ms"),
             "detail": st.get("detail") or "",
-            "validated_patterns": list(st.get("patterns") or [])}
+            "validated_patterns": list(st.get("patterns") or []),
+            "flywheel_arm": arm}
 
 
 def _borrow_for_brief_bounded(project: dict, delta: dict | None,
@@ -4148,9 +4175,11 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
     (同参数命中缓存即回)就拿得到。``detail`` 里写清这一点, 模型读得到。
     """
     budget = float(config.OPEN_PROJECT_BORROW_SEC if budget is None else budget)
+    # 臂在这里先定: 借阅超时 / 线程起不来, 简报也要带着臂交出去 (入库时原样传回)
+    arm = _borrow_arm(project.get("id"), user_id)
     try:
         ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
-        fut = ex.submit(_borrow_for_brief, project, delta, user_id=user_id)
+        fut = ex.submit(_borrow_for_brief, project, delta, user_id=user_id, arm=arm)
     except Exception as exc:  # noqa: BLE001
         # 线程池建不起来 / submit 失败 (RuntimeError: can't start new thread, 解释器关闭中…): 这一层的
         # 承诺和 _borrow_for_brief 一样是"绝不抛" —— 抛出去 open_project 整份简报连 P0 硬约束一起丢
@@ -4161,7 +4190,7 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
                 "status": librarian_client.BORROW_ERROR,
                 "elapsed_ms": 0,
                 "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300],
-                "validated_patterns": []}
+                "validated_patterns": [], "flywheel_arm": arm}
     try:
         try:
             return fut.result(timeout=budget)
@@ -4172,7 +4201,7 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
             return {"lessons": [], "count": 0,
                     "status": librarian_client.BORROW_TIMEOUT,
                     "elapsed_ms": int(budget * 1000),
-                    "validated_patterns": [],
+                    "validated_patterns": [], "flywheel_arm": arm,
                     "detail": (f"open_project 的借阅预算 {budget:g}s 内馆员没回(选卡要跑一次 LLM, "
                                "冷路径常要 30-80s)。TV 那边会继续选完并写缓存 —— 想要卡的话稍后"
                                "调 borrow_lessons, 同样的选题/战术参数命中缓存即回")}
