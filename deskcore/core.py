@@ -1248,7 +1248,7 @@ def _judge_block(rows: list[dict], skipped: list[dict], *, project: str | None =
 
 
 def _judge_committed(client, project_id: str, targets: list[dict],
-                     skipped: list[dict]) -> dict:
+                     skipped: list[dict], budget: Optional[float] = None) -> dict:
     """把 targets 并行发给 judge, **整批共用一个截止时间**。逐篇兜底, 不抛。
 
     共同截止(``JUDGE_TIMEOUT_SEC``, 默认 8 秒)而不是每篇各 8 秒: 串行的话 10 篇就是
@@ -1267,6 +1267,11 @@ def _judge_committed(client, project_id: str, targets: list[dict],
     到点没查完 → 整批记 ``timeout``、一篇都不发, commit 照常返回; 查完了 → 判定只拿剩下的
     时间。卡住的那个线程由 PostgREST 自己的超时收尾, 它回来之后也不会再发任何东西 ——
     发请求只在本函数里、截止之内。
+
+    ── ``budget``: 调用方按整次 commit 的回包目标算好的截止(J-08)──────────────
+    不给就是 ``JUDGE_TIMEOUT_SEC``。commit_drafts 给的是 min(JUDGE_TIMEOUT_SEC, 回包目标 − 入库
+    已用 − 跨项目检查), 入库慢的那批判定就少等; 不到 ``_JUDGE_MIN_BUDGET_SEC`` 一篇不发、一次库
+    不查, 整批记 ``timeout``。
     """
     if not targets:
         return _judge_block([], skipped)
@@ -1276,7 +1281,14 @@ def _judge_committed(client, project_id: str, targets: list[dict],
         return _judge_block([_judge_row(t, nc) for t in targets], skipped,
                             detail="JUDGE_URL / JUDGE_API_KEY 未配置")
 
-    budget = judge_client.timeout_sec()
+    budget = judge_client.timeout_sec() if budget is None else budget
+    if budget < _JUDGE_MIN_BUDGET_SEC:
+        to = judge_client.result(judge_client.JUDGE_TIMEOUT)
+        return _judge_block(
+            [_judge_row(t, to) for t in targets], skipped,
+            detail=(f"入库本身已经用掉了大部分回包时间(整次 commit 的目标 "
+                    f"{config.COMMIT_RESPONSE_BUDGET_SEC:g}s), 留给判定的不到 "
+                    f"{_JUDGE_MIN_BUDGET_SEC:g}s, 一篇都没发 —— 入库不受影响"))
     started = time.monotonic()
     deadline = started + budget
 
@@ -1568,13 +1580,19 @@ def _cross_project_shadow(client, project_id, user_id, drafts, vectors, exclude_
             "note": "跨项目信号只记录、不拦入库。向量仅比同模型的近期标题样本，不能当成正文归属或完整扫描。"}
 
 
+# commit_drafts 留给跨项目检查的上界; 判定的预算要先把它扣出来(J-08, COMMIT_RESPONSE_BUDGET_SEC)。
+_ISOLATION_TIMEOUT_SEC = 1.5
+# 判定预算低于这个数就不发: 和 JUDGE_TIMEOUT_SEC 的下界同一个数, 再少连查库都查不完。
+_JUDGE_MIN_BUDGET_SEC = 1.0
+
+
 def _cross_project_shadow_bounded(client, project_id, user_id, drafts, vectors, exclude_versions):
     try:
         future = _bounded_submit(_ISOLATION_POOL, _ISOLATION_SLOTS, _cross_project_shadow,
                                  client, project_id, user_id, drafts, vectors, exclude_versions)
         if future is None:
             return {"status": "busy", "flags": [], "note": "跨项目检查线程占满，无从判断；入库结果不变"}
-        return future.result(timeout=1.5)
+        return future.result(timeout=_ISOLATION_TIMEOUT_SEC)
     except cf.TimeoutError:
         future.cancel()  # A running call retains its slot until the done callback.
         return {"status": "timeout", "flags": [], "note": "跨项目检查超时，无从判断；入库结果不变"}
@@ -2074,10 +2092,15 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # 到这里入库已经成功, 下面任何一步都不许把它变成失败: 判定自己不抛
     # (_judge_committed 内部逐篇兜底), 外面再兜一层, 兜到的也只记进 out["judge"]。
     judge_started = time.monotonic()
+    # J-08: 判定只拿整次回包目标里剩下的(先扣掉后面跨项目检查的上界)。入库段实测已到 12 秒,
+    # 判定再拿满 8 秒就贴着客户端 ~22 秒的容忍 —— 见 config.COMMIT_RESPONSE_BUDGET_SEC。
+    judge_budget = min(judge_client.timeout_sec(),
+                       config.COMMIT_RESPONSE_BUDGET_SEC - (judge_started - started)
+                       - _ISOLATION_TIMEOUT_SEC)
     try:
         targets, skipped = _judge_targets(drafts, titles, bodies, inserted_idx, replace,
                                           replaced_ok, minted_ids, minted_ok)
-        out["judge"] = _judge_committed(client, project_id, targets, skipped)
+        out["judge"] = _judge_committed(client, project_id, targets, skipped, budget=judge_budget)
     except Exception as exc:                            # noqa: BLE001 — 增强项, 绝不冒泡
         logger.exception("commit_drafts: 入库判定整体失败(project=%s) —— 入库不受影响",
                          project_id)

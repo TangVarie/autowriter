@@ -164,6 +164,14 @@ JUDGE_API_KEY: str = _get_secret("JUDGE_API_KEY")  # 发在 X-Judge-Key 头里
 # ⚠️ 8 秒同样没有实测分位数撑着 —— 等 batch_metrics 里 deskcore_commit 的 phase_ms.judge
 #    攒够样本再定(查法见 docs/deskcore.md §3.8)。
 JUDGE_TIMEOUT_SEC: float = _bounded_number("JUDGE_TIMEOUT_SEC", 8.0, 1.0, 15.0)
+# 整个 commit_drafts 的回包目标(J-08, 2026-10-16 用 batch_metrics 实测定)。判定实际拿到的截止是
+# min(JUDGE_TIMEOUT_SEC, 本值 − 入库已用 − 跨项目检查的 1.5 秒), 不到 1 秒就一篇不发、整批记 timeout。
+# 为什么要这一道: 上面「commit 本身 1~3 秒」的假设被实测推翻了 —— 10-12~10-15 有判定的 9 批,
+# 判定段最长 4.3 秒(单篇最长 3.4 秒, 8 秒截止一次没碰到), 但**入库段** 10 篇一批从 4~9 秒涨到
+# 11~12 秒(10-15 三批)。12.3 + 1.5 + 判定拿满 8 = 21.8 秒, 贴着 ~22 秒的客户端容忍; 超过的后果
+# 不是"少判一篇", 而是调用方看到入库失败、回头重试撞上自己刚写的指纹。判定超时只是影子期少一条
+# 账本记录(judge 那边可能照样判完), 两害取轻。20 = 22 留 2 秒余量; 不开 env, 要改先看实测。
+COMMIT_RESPONSE_BUDGET_SEC: float = 20.0
 # 写手侧判稿工具(judge_draft / repair_plan_for / list_banks, 2026-10-09 从写手机器上的 judge.mcp_server 并进
 # deskcore)一次请求的超时。单篇、同步、模型在等 —— 必须留在 MCP 客户端 ~22 秒容忍之内(上面那段);
 # Jev 实测一篇 10~12 次调用 4.5 秒(JevforCoentent docs/31 §5.4), 18 秒够, 上限夹 20。

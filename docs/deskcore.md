@@ -506,7 +506,11 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 `version_id` 的归属这三次查库在工作线程里跑、算进同一个截止（PostgREST 客户端默认超时 120 秒，原来它们在
 截止之外同步查，库一卡，一次已经入库成功的 commit 就挂着远远过了 8 秒——codex review P2 on #92）。到点没查完
 就整批记 `timeout`、一篇都不发，commit 照常返回；查完了，判定只拿剩下的时间。上界是 MCP
-客户端实测能容忍的 ~22 秒（`config.py` 里 `LIBRARIAN_TIMEOUT_SEC` 那段，D-074）。返回值带 `elapsed_ms` 与
+客户端实测能容忍的 ~22 秒（`config.py` 里 `LIBRARIAN_TIMEOUT_SEC` 那段，D-074）。**2026-10-16（J-08）起判定只拿
+整次回包里剩下的**：截止 = min(`JUDGE_TIMEOUT_SEC`, `COMMIT_RESPONSE_BUDGET_SEC`(20) − 入库已用 − 跨项目检查的
+1.5 秒)，不到 1 秒就一篇不发、整批记 `timeout`。实测（10-12～10-15，有判定的 9 批 / 84 篇）判定段最长 4.3 秒、
+单篇最长 3.4 秒，8 秒一次没碰到；但入库段 10 篇一批已到 11～12 秒，判定再拿满 8 秒就是 ~21.8 秒，贴着客户端
+容忍——超了调用方会以为入库失败去重试、撞上自己刚写的指纹，判定超时只是影子期少一条账本记录。返回值带 `elapsed_ms` 与
 `phase_ms = {lock_wait, commit, judge, total}`（`lock_wait` 单列：补录正在跑时入库要等锁，不拆开会把分位数
 带歪），**同一份数落进 `batch_metrics`**——它本来就是「每批一行的指标快照」（phase_ms / counters / meta 三个
 jsonb），不需要新迁移。`batch_id` 留 NULL（本次的 batch 记在 `meta.batch_id`），免得历史页给写作台批次挂上一块
@@ -573,7 +577,7 @@ env：
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN。馆员回 200 但 `status` 是 `degraded` / `error`（TV 侧选卡失败）记 `error` 不记 `empty` |
 | `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `10`，夹在 1–20。`open_project` 随简报借卡**只等这么久**，到点先交简报（`lessons_status.status=timeout`，`detail` 里告诉模型稍后调 `borrow_lessons` 命中缓存即回）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60） |
 | `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里；它是自定义格式，登记在 `logger_utils` 的值级脱敏名单里（judge 的错误体会被抄进 detail / 遥测 / `batch_metrics`）。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
-| `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了、`nan` / `inf` 都退回默认）。**整批判定的共同截止**，不是每篇各 8 秒 |
+| `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了、`nan` / `inf` 都退回默认）。**整批判定的共同截止**，不是每篇各 8 秒；入库慢时实际截止更短（整次 commit 回包目标 20 秒，见 §3.8，J-08） |
 | `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16（同上，写坏了退回默认）。一次 commit 同时发几篇 |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
