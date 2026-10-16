@@ -678,6 +678,56 @@ def test_the_judge_calls_only_get_what_the_lookups_left(judge_on, monkeypatch):
     assert 0 < judge_on["timeouts"][0] <= 0.45, judge_on["timeouts"]
 
 
+def _slow_gate(monkeypatch, sec):
+    """让入库段(闸那一次历史比对)多花 ``sec`` 秒 —— 模拟 10-15 实测的 11~12 秒入库段。"""
+    real = core._gate
+
+    def slow(*a, **k):
+        time.sleep(sec)
+        return real(*a, **k)
+    monkeypatch.setattr(core, "_gate", slow)
+
+
+def test_a_slow_commit_leaves_the_judge_only_what_the_response_budget_has_left(judge_on,
+                                                                              monkeypatch):
+    """J-08: 入库段实测到了 12 秒, 判定再拿满截止就贴着 MCP 客户端 ~22 秒的容忍。判定只拿
+    回包目标 − 入库已用 − 跨项目检查上界; 截止本身(这里 5 秒)比那更紧时仍以截止为准。"""
+    monkeypatch.setattr(config, "COMMIT_RESPONSE_BUDGET_SEC", 3.5)
+    _slow_gate(monkeypatch, 0.5)
+    out = core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    assert out["written"] == 1
+    assert out["judge"]["summary"] == {"ok": 1}, out["judge"]
+    # 3.5 − ≥0.5(入库) − 1.5(跨项目检查) ≤ 1.5, 远小于 JUDGE_TIMEOUT_SEC 的 5
+    assert 0 < judge_on["timeouts"][0] <= 1.5, judge_on["timeouts"]
+
+
+def test_when_the_commit_used_up_the_response_budget_nothing_is_sent(judge_on, monkeypatch):
+    """留给判定的不到 1 秒: 一篇不发、整批记 timeout, 入库结果一个字不变, 指标照记。"""
+    monkeypatch.setattr(config, "COMMIT_RESPONSE_BUDGET_SEC", 2.0)
+    _slow_gate(monkeypatch, 0.6)
+    c = _client()
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A},
+                                       {"title": "乙", "body": BODY_B}], user_id=ME)
+    assert out["written"] == 2
+    j = out["judge"]
+    assert j["summary"] == {"timeout": 2}, j
+    assert "留给判定的不到" in j["detail"] and "入库不受影响" in j["detail"]
+    assert judge_on["payloads"] == []
+    assert c.rows["batch_metrics"][0]["counters"]["judge_timeout"] == 2
+
+
+def test_a_fast_commit_still_gets_the_full_judge_deadline(judge_on):
+    """入库快的时候回包目标不碍事: 判定拿满 JUDGE_TIMEOUT_SEC(这里 5 秒), 和改动前一样。"""
+    core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    assert 4.0 < judge_on["timeouts"][0] <= 5.0, judge_on["timeouts"]
+
+
+def test_the_response_budget_stays_inside_the_mcp_client_tolerance():
+    """回包目标 + 判定截止的默认值: 前者要留在客户端实测 ~22 秒之内并留余量, 后者不许比前者还大。"""
+    assert config.COMMIT_RESPONSE_BUDGET_SEC <= 20.0
+    assert config.JUDGE_TIMEOUT_SEC < config.COMMIT_RESPONSE_BUDGET_SEC - core._ISOLATION_TIMEOUT_SEC
+
+
 def test_elapsed_ms_and_phases_are_reported(judge_on):
     out = core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
     ph = out["phase_ms"]
