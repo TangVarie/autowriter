@@ -4022,6 +4022,7 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
 # 借卡时定下、入库时把借卡那次的臂记进 batches.params.flywheel_arm (见下面 batch_arm)。
 # 确定性哈希而不是 random: 重启、重试、两条入口 (open_project / borrow_lessons) 同一天结果一致。
 FLYWHEEL_EXPLORE_PCT = 15
+FLYWHEEL_ARMS = ("patterns", "explore")
 _CN_TZ = timezone(timedelta(hours=8))
 
 
@@ -4048,16 +4049,15 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _borrow_arm(project_id, user_id) -> str:
-    """借卡时定臂, 并记下来给入库用。同一 (项目, 写手) 只留最近一次。"""
+def _borrow_arm(project_id, user_id, *, reuse: str | None = None) -> str:
+    """借卡时定臂, 并记下来给入库用。同一 (项目, 写手) 只留最近一次。
+    ``reuse`` = 这场写作已经拿到的臂 (模型把 open_project 给的原样传回): 认得出就沿用, 不重新分 —— 同一场里
+    先借后借跨了北京 0 点, 重新分会让手里已有规律的会话被记成探索臂 (codex review on #104)。"""
     now = _utcnow()
-    arm = flywheel_arm(project_id, user_id, now=now)
+    arm = reuse if reuse in FLYWHEEL_ARMS else flywheel_arm(project_id, user_id, now=now)
     with _borrowed_arms_lock:
         _borrowed_arms[(str(project_id), str(user_id or ""))] = (arm, now)
     return arm
-
-
-FLYWHEEL_ARMS = ("patterns", "explore")
 
 
 def batch_arm(project_id, user_id, *, from_brief: str | None = None) -> tuple[str, str]:
@@ -4086,7 +4086,7 @@ def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str) -> None:
 
 
 def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
-                   **delta) -> dict:
+                   flywheel_arm: str | None = None, **delta) -> dict:
     """复用 librarian_client 的 build_brief + fetch_flywheel_lessons(R-032)。
 
     那边已经处理好 fail-open(超时/非 200/未配 → [], 绝不阻塞写稿)和 brief 的
@@ -4097,7 +4097,8 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     project_id 就能读出那个项目怎么定位"的接口。(审计 COR-015)
     """
     project = assert_project_access(client, project_id, user_id=user_id)
-    return _borrow_for_brief(project, delta, user_id=user_id)
+    arm = _borrow_arm(project.get("id"), user_id, reuse=flywheel_arm)   # 这场已经有臂就沿用
+    return _borrow_for_brief(project, delta, user_id=user_id, arm=arm)
 
 
 # open_project 随简报带卡时的上限, 与常规生成路径 render_flywheel_block 同一

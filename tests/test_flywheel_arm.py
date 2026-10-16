@@ -323,3 +323,28 @@ def test_marking_mixed_never_breaks_the_commit(monkeypatch, fresh_arms):
                                           "replaces_version_id": first["version_ids"][0]}],
                              user_id=T.ME, flywheel_arm="explore")
     assert out["replaced"] and out["written"] == 1
+
+
+def test_a_follow_up_borrow_after_midnight_keeps_the_session_arm(monkeypatch, fresh_arms):
+    """open_project 在北京 23:59 分了组, 同一场 00:01 再调 borrow_lessons 并传回那个臂: 沿用, 不重新分
+    (codex review on #104 第三轮)。不传才会按当天重新分。"""
+    before, after = _days_with_different_arms()
+    fake = _Librarian(PATTERNS)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+    monkeypatch.setattr(core, "_utcnow", lambda: before)
+    arm = core.build_writing_brief(_client(), PID, user_id=ME, brief={})["flywheel_arm"]
+
+    monkeypatch.setattr(core, "_utcnow", lambda: after)
+    out = core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm)
+    assert out["flywheel_arm"] == arm and fake.briefs[-1]["explore"] is (arm == "explore")
+    assert core.batch_arm(PID, ME) == (arm, "borrow"), "沿用的臂也记进「最近一次借卡」"
+    assert core.borrow_lessons(_client(), PID, user_id=ME)["flywheel_arm"] != arm, "不传就按当天重新分"
+
+
+def test_the_borrow_tool_passes_the_arm_through(monkeypatch):
+    from deskcore import tools
+    seen = {}
+    monkeypatch.setattr(core, "sb", lambda: object())
+    monkeypatch.setattr(core, "borrow_lessons", lambda c, pid, **kw: seen.update(kw) or {})
+    tools.borrow_lessons(PID, flywheel_arm="patterns", _user_id=ME)
+    assert seen["flywheel_arm"] == "patterns"

@@ -342,7 +342,7 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
 
 def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
                    key_messages: str = "", target_audience: str = "",
-                   tone: str = "", _user_id: str | None = None) -> dict:
+                   tone: str = "", flywheel_arm: str = "", _user_id: str | None = None) -> dict:
     """向帆谷飞轮图书馆【再】借几张真实爆款的经验卡。
 
     open_project 已经随简报借过一次(返回里的 lessons)。只在换了选题 / 战术、
@@ -359,9 +359,11 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
 
     validated_patterns (可能是空列表) 与 open_project 里的同名字段同一个意思: 已验证规律,
     同样合适时照 instruction 写, 是提示不是硬约束; 空就是这次没有, 不要自己编。
-    flywheel_arm 也同 open_project: 入库时原样传给 commit_drafts。
+    flywheel_arm 也同 open_project: 入库时原样传给 commit_drafts。调本工具时也把这场 open_project
+    给的 flywheel_arm 原样传进来 —— 一场写作只分一次组, 不传会重新分。
     """
     return _safe(core.borrow_lessons, core.sb(), project_id, user_id=_user_id,
+                 flywheel_arm=flywheel_arm or None,
                  tactic=tactic, draft_topic=draft_topic,
                  key_messages=key_messages, target_audience=target_audience,
                  tone=tone)
