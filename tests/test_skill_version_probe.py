@@ -8,8 +8,8 @@
   · 最新版也被提醒 (写手刚导完又被叫去导);
   · 旧版 / 没核到版本却没提醒, 或提醒里的链接、「更新技能」那行被改了;
   · 抽查刷屏 (每个工具都带), 或进程重启后给没报过版本的人误报;
-  · 探针出错拖垮工具本身 (open_project 是合规读, 不能因为探针挂掉);
-  · /health 里出现是谁。
+  · 探针出错拖垮工具本身 (open_project 是合规读, 不能因为探针挂掉), 包括 MCP 层把 skill_version=null 当参数错误;
+  · 计数放进不鉴权的 /health (app.py 的规矩: 那里不许放业务数据), 或计数里出现是谁。
 """
 
 from __future__ import annotations
@@ -107,13 +107,13 @@ def rest(monkeypatch):
 def test_other_tools_remind_an_outdated_writer_at_most_every_30_minutes(rest, monkeypatch):
     t = [1_000_000.0]
     monkeypatch.setattr(skillcheck.time, "time", lambda: t[0])
-    tools.open_project("p", skill_version=OLD, _user_id=ME)
-    first = rest()
-    assert first["skill_update"]["message"].splitlines()[-2:] == LINK_LINES
+    assert "skill_update" in tools.open_project("p", skill_version=OLD, _user_id=ME)
+    assert "skill_update" not in rest(), "入口工具刚提醒过, 紧跟着的工具不再来一条"
+    t[0] += skillcheck.REMIND_EVERY_S
+    again = rest()
+    assert again["skill_update"]["message"].splitlines()[-2:] == LINK_LINES, "过了 30 分钟抽查再提醒"
     t[0] += 60
     assert "skill_update" not in rest(), "30 分钟内不重复提醒"
-    t[0] += skillcheck.REMIND_EVERY_S
-    assert "skill_update" in rest(), "过了 30 分钟再提醒一次"
 
 
 def test_other_tools_leave_current_and_never_reported_writers_alone(rest):
@@ -149,12 +149,19 @@ def test_health_reports_counts_but_not_who(monkeypatch):
     assert "4444" not in repr(h) and ME not in repr(h)
 
 
-def test_health_endpoint_exposes_the_counts(monkeypatch):
+KEY = "k-skill-probe"
+
+
+def test_counts_need_a_key_and_stay_off_health(monkeypatch):
     testclient = pytest.importorskip("fastapi.testclient")
+    monkeypatch.setenv("DESKCORE_KEYS", '{"%s": {"user_id": "%s", "name": "t"}}' % (KEY, ME))
     tools.open_project("p", skill_version=OLD, _user_id=ME)
-    r = testclient.TestClient(A.app, raise_server_exceptions=False).get("/health")
-    sv = r.json()["skill_versions"]
-    assert sv["current"] == CURRENT and sv["writers_24h"]["outdated"] == 1 and ME not in r.text
+    c = testclient.TestClient(A.app, raise_server_exceptions=False)
+    assert "skill_versions" not in c.get("/health").json() and "writers_24h" not in c.get("/health").text, \
+        "/health 不鉴权, 按 app.py 的规矩不许放业务数据"
+    assert c.get("/skill-versions").status_code == 401
+    r = c.get("/skill-versions", headers={"X-Deskcore-Key": KEY})
+    assert r.status_code == 200 and r.json()["writers_24h"]["outdated"] == 1 and ME not in r.text
 
 
 def test_a_stale_report_stops_driving_reminders(rest, monkeypatch):
@@ -163,3 +170,62 @@ def test_a_stale_report_stops_driving_reminders(rest, monkeypatch):
     tools.open_project("p", skill_version=OLD, _user_id=ME)
     t[0] += skillcheck.RECORD_TTL_S + 1
     assert "skill_update" not in rest(), "12 小时前报的旧版不再算数 (那之后可能早升级了, 只是这场还没调 open_project)"
+
+
+def test_calls_without_a_version_do_not_keep_an_old_report_alive(monkeypatch):
+    t = [3_000_000.0]
+    monkeypatch.setattr(skillcheck.time, "time", lambda: t[0])
+    tools.open_project("p", skill_version=OLD, _user_id=ME)
+    t[0] += 6 * 3600
+    assert tools.open_project("p", _user_id=ME)["skill_update"]["status"] == "outdated"   # 12 小时内沿用
+    t[0] += 7 * 3600                                                                       # 离那次报版本 13 小时
+    u = tools.open_project("p", _user_id=ME)["skill_update"]
+    assert u["status"] == "unknown" and u["local"] is None, "沿用不续命: 13 小时前那条旧版记录不再冒充现在的版本"
+
+
+@pytest.mark.parametrize("raw", ["d59368a8", "无", "v1"])
+def test_an_unreadable_version_is_outdated_in_both_paths(raw):
+    gp = tools.get_protocol(local_version=raw, _user_id=ME)
+    assert gp["up_to_date"] is False and gp["skill_update"]["status"] == "outdated", \
+        "get_protocol 说旧版, 探针也说旧版, 同一个返回里对得上"
+    assert gp["skill_update"]["message"].splitlines()[-2:] == LINK_LINES
+    assert tools.open_project("p", skill_version=raw, _user_id=ME)["skill_update"]["status"] == "outdated"
+
+
+@pytest.mark.parametrize("blank", [None, "", "  "])
+def test_a_blank_version_means_not_reported(blank):
+    u = tools.open_project("p", skill_version=blank, _user_id=ME)["skill_update"]
+    assert u["status"] == "unknown"
+
+
+def _mcp_call(name, args, user=ME):
+    import asyncio
+    token = A._caller.set(identity.Caller(user, "t", True))
+    try:
+        return asyncio.run(A._mcp.call_tool(name, args))
+    finally:
+        A._caller.reset(token)
+
+
+def _mcp_payload(res):
+    import json
+    blocks = res[0] if isinstance(res, tuple) else res
+    return json.loads(blocks[0].text)
+
+
+@pytest.mark.skipif(A._mcp is None, reason="mcp SDK not installed")
+def test_over_mcp_a_null_skill_version_does_not_break_open_project():
+    """老 skill 的模型最可能给 skill_version 传 null; 参数校验把它当错误的话, 合规读整个失败 (独立评审指出)。"""
+    out = _mcp_payload(_mcp_call("open_project", {"project_id": "p", "skill_version": None}))
+    assert out["project_name"] == "测试" and out["skill_update"]["status"] == "unknown"
+    out = _mcp_payload(_mcp_call("open_project", {"project_id": "p"}))
+    assert out["project_name"] == "测试"
+
+
+@pytest.mark.skipif(A._mcp is None, reason="mcp SDK not installed")
+def test_over_mcp_other_tools_carry_the_spot_check(monkeypatch):
+    monkeypatch.setattr(skillcheck, "REMIND_EVERY_S", 0)
+    _mcp_call("open_project", {"project_id": "p", "skill_version": OLD})
+    monkeypatch.setattr(core, "my_style", lambda client, pid, *, user_id=None: {"notes": ""})
+    out = _mcp_payload(_mcp_call("my_style", {"project_id": "p"}))
+    assert out.get("skill_update", {}).get("status") == "outdated", "MCP 这条路也做抽查"

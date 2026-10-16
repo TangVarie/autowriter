@@ -121,9 +121,9 @@ def get_protocol(local_version: str | None = None,
     # 宽松地取版本号: 模型可能把整行 "<!-- protocol_version: xxx -->" 或
     # "protocol_version: xxx" 原样传进来。只要里面有那 12 位十六进制就认。
     # 精确比较的后果是每场对话都判成"旧版", 全文再发一遍、还让运营白重装。
+    # 与探针 (skillcheck.normalize) 同一个口径: 空串当没传, 认不出的按旧版。
     if local_version is not None:
-        m = re.search(r"[0-9a-f]{12}", str(local_version).lower())
-        local_version = m.group(0) if m else str(local_version).strip()
+        local_version = skillcheck.normalize(local_version)
     header = _strip_frontmatter(skill_head())
     if local_version is None:
         out["protocol"] = text
@@ -274,7 +274,7 @@ def list_projects(_user_id: str | None = None) -> dict:
 def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
                  key_messages: str = "", target_audience: str = "",
                  tone: str = "", extra_instructions: str = "",
-                 skill_version: str = "",
+                 skill_version: str | None = None,
                  _user_id: str | None = None) -> dict:
     """打开一个项目, 一次拿到写这个项目需要的【全部】上下文。
 

@@ -15,7 +15,11 @@ skill 自己核版本 (get_protocol) 靠模型愿不愿意调, 更老的 skill �
     模型照抄给写手。
 
 不拦任何调用: 旧版 skill 照样能写 (get_protocol 在版本对不上时会把新正文发下去), 提醒只是让写手尽快升级。
-状态只在进程内存 (deskcore 单进程, railway.json 的 uvicorn 没开 --workers); /health 只报计数, 不报是谁。
+状态只在进程内存 (deskcore 单进程, railway.json 的 uvicorn 没开 --workers)。计数走要 key 的 /skill-versions,
+不放 /health —— /health 不鉴权, 按 app.py 的规矩不许放业务数据。
+
+记录按写手 (user_id) 而不是按机器: stateless_http 下没有会话 id。同一个人两台机器一新一旧, 记录会随最近一次
+报的版本来回变, 新版那台也可能捎上一条「你手上的是旧版」—— 让那台也升级就好。
 """
 
 from __future__ import annotations
@@ -41,11 +45,13 @@ _reminded: dict[str, float] = {}                          # user → 上次在�
 
 
 def normalize(raw) -> Optional[str]:
-    """宽松取 12 位十六进制 (模型可能把整行 "protocol_version: xxx" 或 HTML 注释原样传进来); 没有 → None。"""
-    if raw is None:
+    """宽松取 12 位十六进制 (模型可能把整行 "protocol_version: xxx" 或 HTML 注释原样传进来)。
+    空 / None → None (没报); 报了但认不出 12 位十六进制 (截断、乱填) → 原值前 12 个字符, 按旧版算 ——
+    与 get_protocol 的 up_to_date 判定同一个口径 (那边也判 False)。"""
+    if raw is None or not str(raw).strip():
         return None
     m = re.search(r"[0-9a-f]{12}", str(raw).lower())
-    return m.group(0) if m else None
+    return m.group(0) if m else str(raw).strip()[:12]
 
 
 def _key(user_id) -> str:
@@ -56,13 +62,18 @@ def report(user_id, raw_version, current: str, *, now: Optional[float] = None) -
     """入口工具调: 记下这个写手报的版本, 回 (状态, 版本)。没带版本时沿用 12 小时内的记录, 没有就是 unknown。"""
     now = time.time() if now is None else now
     local = normalize(raw_version)
+    k = _key(user_id)
     with _lock:
+        ts = now
         if local is None:
-            prev = _seen.get(_key(user_id))
+            prev = _seen.get(k)
             if prev and now - prev[2] < RECORD_TTL_S and prev[1]:
-                local = prev[1]
+                # 沿用旧记录, 时间也沿用 —— 否则一直不带版本的调用会让一条旧记录永不过期
+                local, ts = prev[1], prev[2]
         status = UNKNOWN if local is None else (UP_TO_DATE if local == current else OUTDATED)
-        _seen[_key(user_id)] = (status, local, now)
+        _seen[k] = (status, local, ts)
+        if status != UP_TO_DATE:
+            _reminded[k] = now     # 入口工具这次已经提醒过了, 抽查从现在起算 30 分钟, 不紧跟着再来一条
     return status, local
 
 

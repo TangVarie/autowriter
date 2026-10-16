@@ -539,8 +539,6 @@ async def _collect_health() -> dict:
         "build": {"commit": BUILD_COMMIT, "protocol_version": _protocol_version()},
         # W-09: 进程启动以来各种 key 传法的请求数(只有传法, 没有 key、没有身份)
         "key_transport": key_transport_counts(),
-        # skill 版本探针: 24 小时内报过版本的写手各是什么状态 (只有计数, 没有是谁)
-        "skill_versions": skillcheck.health(_protocol_version()),
         "tools": sorted(tools.TOOLS),
         "config": {
             # deskcore 【不调 LLM】。蒸馏搬给调用方模型之后, 服务端一次
@@ -624,6 +622,13 @@ async def ready():
     if payload.get("ok"):
         return payload
     return JSONResponse(payload, status_code=503)
+
+
+@app.get("/skill-versions")
+def skill_versions() -> dict:
+    """写手手上的 skill 是不是最新版 (deskcore/skillcheck.py): 24 小时内报过版本的写手里最新 / 旧版 / 没核到
+    各几个、旧版各是哪一版。只有计数, 没有是谁。要 key —— 不放 /health, 那里不鉴权, 不许放业务数据。"""
+    return skillcheck.health(_protocol_version())
 
 
 @app.get("/tools")
