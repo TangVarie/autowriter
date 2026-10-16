@@ -56,7 +56,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from . import core, identity, tools, vocab
+from . import core, identity, skillcheck, tools, vocab
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deskcore")
@@ -162,7 +162,20 @@ def _call_tool(name: str, args: dict) -> object:
     kwargs.pop("_user_id", None)          # 不允许调用方伪造身份
     if needs_user:
         kwargs["_user_id"] = _caller.get().user_id
-    return fn(**kwargs)
+    return _skill_probe(name, fn(**kwargs))
+
+
+def _skill_probe(name: str, result):
+    """skill 版本抽查 (deskcore/skillcheck.py): 记录在案是旧版的写手, 非入口工具的返回值里也捎上升级提醒
+    (同一人 30 分钟最多一次)。REST 和 MCP 两条路都走这里。探针出任何错都不影响工具结果。"""
+    try:
+        current = _protocol_version()
+        if current == "unknown":
+            return result
+        return skillcheck.annotate(name, _caller.get().user_id, result, current)
+    except Exception:  # noqa: BLE001
+        logger.warning("skill 版本抽查失败 (tool=%s), 不影响返回", name, exc_info=True)
+        return result
 
 
 # ⚠️ _mcp 必须在 app 之前建好: FastAPI 的 lifespan 要在构造时传进去, 而
@@ -611,6 +624,13 @@ async def ready():
     return JSONResponse(payload, status_code=503)
 
 
+@app.get("/skill-versions")
+def skill_versions() -> dict:
+    """写手手上的 skill 是不是最新版 (deskcore/skillcheck.py): 24 小时内报过版本的写手里最新 / 旧版 / 没核到
+    各几个、旧版各是哪一版。只有计数, 没有是谁。要 key —— 不放 /health, 那里不鉴权, 不许放业务数据。"""
+    return skillcheck.health(_protocol_version())
+
+
 @app.get("/tools")
 def list_tools() -> dict:
     """工具清单 + 说明, 给不支持 MCP 的平台看。"""
@@ -724,9 +744,11 @@ def _register_mcp():
                                 "对话开始时调一次 get_protocol, 带上 skill 里 "
                                 "protocol_version 那一行的值核对版本: 一致就照 skill "
                                 "执行; 不一致就照返回的正文执行并提醒用户重新导入 "
-                                "skill; 没装 skill 就不带参数调它拿全文。"))
+                                "skill; 没装 skill 就不带参数调它拿全文。open_project 每次带上 "
+                                "skill_version (同一个值)。任何工具的返回里出现 skill_update, "
+                                "就把它的 message 原样放在给用户回复的最前面。"))
 
-    def _wrap(fn, needs_user: bool):
+    def _wrap(fn, needs_user: bool, name: str):
         # 把 _user_id 从签名里摘掉再注册 —— 模型不该看到它, 也不该能传它。
         import functools
         import inspect
@@ -739,13 +761,13 @@ def _register_mcp():
             kwargs.pop("_user_id", None)
             if needs_user:
                 kwargs["_user_id"] = _caller.get().user_id
-            return await run_in_threadpool(fn, *args, **kwargs)
+            return _skill_probe(name, await run_in_threadpool(fn, *args, **kwargs))
 
         wrapper.__signature__ = sig.replace(parameters=params)
         return wrapper
 
     for name, (fn, needs_user) in tools.TOOLS.items():
-        mcp.add_tool(_wrap(fn, needs_user), name=name,
+        mcp.add_tool(_wrap(fn, needs_user, name), name=name,
                      description=(fn.__doc__ or "").strip())
     return mcp
 

@@ -27,7 +27,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from . import core, vocab
+from . import core, skillcheck, vocab
 
 logger = logging.getLogger("deskcore.tools")
 
@@ -94,6 +94,8 @@ def get_protocol(local_version: str | None = None,
       · ``protocol``    —— 协议正文(只在需要时带)
       · ``skill_header`` —— skill 文件引线头里那几条独立规矩(和 protocol 一起带;
                           版本号盖的是两者, 头改了也算过期)
+      · ``skill_update`` —— (不是最新版 / 没传版本时才有) 升级提醒。把它的 ``message``
+                          **原样**(三行都要)放在给用户回复的最前面, 然后照常继续。
 
     ⚠️ 协议正文的**主副本在 skill 文件里**, 不在这个工具的返回值里。2026-09-10 曾
     反过来 —— skill 只留一根引线, 正文每次由这个工具下发 —— 结果 09-11 起定稿
@@ -112,12 +114,16 @@ def get_protocol(local_version: str | None = None,
     # 故意不包 _safe: 包成带 error 的"成功"会让模型以为版本核过了。
     text, digest = protocol_text()
     out: dict = {"version": digest, "chars": len(text)}
+    # 服务端版本探针 (skillcheck): 记下这个写手报的版本, 不是最新就带升级提醒。不拦调用。
+    status, reported = skillcheck.report(_user_id, local_version, digest)
+    if status != skillcheck.UP_TO_DATE:
+        out["skill_update"] = skillcheck.notice(status, reported, digest)
     # 宽松地取版本号: 模型可能把整行 "<!-- protocol_version: xxx -->" 或
     # "protocol_version: xxx" 原样传进来。只要里面有那 12 位十六进制就认。
     # 精确比较的后果是每场对话都判成"旧版", 全文再发一遍、还让运营白重装。
+    # 与探针 (skillcheck.normalize) 同一个口径: 空串当没传, 认不出的按旧版。
     if local_version is not None:
-        m = re.search(r"[0-9a-f]{12}", str(local_version).lower())
-        local_version = m.group(0) if m else str(local_version).strip()
+        local_version = skillcheck.normalize(local_version)
     header = _strip_frontmatter(skill_head())
     if local_version is None:
         out["protocol"] = text
@@ -134,9 +140,8 @@ def get_protocol(local_version: str | None = None,
         out["up_to_date"] = False
         out["warning"] = (
             f"本地 skill 是旧版({str(local_version).strip()[:12]}), 服务端是 "
-            f"{digest}。**照本返回值里的正文执行**, 并告诉用户一句: 写作台 skill "
-            "有更新, 在 WorkBuddy 里把 TangVarie/autowriter → "
-            "skills/bywood-writing-desk 重新导入一遍。")
+            f"{digest}。**照本返回值里的正文执行**, 并把 skill_update.message 原样告诉用户"
+            f"(写作台 skill 有更新, 要重新导入: {skillcheck.UPDATE_URL} / {skillcheck.UPDATE_COMMAND})。")
     return out
 
 
@@ -269,6 +274,7 @@ def list_projects(_user_id: str | None = None) -> dict:
 def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
                  key_messages: str = "", target_audience: str = "",
                  tone: str = "", extra_instructions: str = "",
+                 skill_version: str | None = None,
                  _user_id: str | None = None) -> dict:
     """打开一个项目, 一次拿到写这个项目需要的【全部】上下文。
 
@@ -306,14 +312,29 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
 
     这个工具出错会直接报错, 不会返回半份简报。报错就【停下来】, 不要凭记忆
     或常识补一份约束继续写 —— 这个项目的硬约束是什么, 只有库里那份算数。
+
+    ``skill_version``: **每次都传** bywood-writing-desk 这个 skill 里 ``protocol_version:`` 那一行的
+    12 位值(传整行也认)。skill 里没有这一行就传空。返回里有 ``skill_update`` 时, 说明 skill 不是最新版
+    (或没核到版本): 把 ``skill_update.message`` **原样**(三行都要, 链接和「更新技能」那行一字不改)
+    放在给用户回复的最前面, 然后照常继续写 —— 不拦写稿, 只是提醒升级。
     """
     brief = {"tactic": tactic, "draft_topic": draft_topic,
              "key_messages": key_messages, "target_audience": target_audience,
              "tone": tone, "extra_instructions": extra_instructions}
     # 故意不包 _safe: 见 _safe 文档「合规读」。P0 拿不到必须停, 不能给一份
     # p0 为空却看起来正常的简报。
-    return core.build_writing_brief(core.sb(), project_id,
-                                    user_id=_user_id, brief=brief)
+    out = core.build_writing_brief(core.sb(), project_id,
+                                   user_id=_user_id, brief=brief)
+    # 服务端版本探针 (skillcheck)。协议文件读不了就跳过 —— 探针不能把合规读弄坏。
+    try:
+        digest = protocol_text()[1]
+    except Exception:  # noqa: BLE001
+        logger.warning("open_project: 协议文件读不了, 这次不核 skill 版本", exc_info=True)
+        return out
+    status, reported = skillcheck.report(_user_id, skill_version or None, digest)
+    if status != skillcheck.UP_TO_DATE:
+        out["skill_update"] = skillcheck.notice(status, reported, digest)
+    return out
 
 
 def draw_angles(project_id: str, n: int, avoid_days: int = 30,
