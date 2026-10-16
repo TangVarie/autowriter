@@ -282,6 +282,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         not_configured / timeout / error 里的哪一种。只借钩子、结构、手法,
         严禁照抄标题主干或具体句子; synthetic=true 的卡指标未经验证。
         卡上的 validated_hits 是这张卡命中了哪几条已验证规律。
+        external=true 的是【外部参考卡】(最多 2 张): 别家同品类的帖, 不是公司投的, 没有经过我们的数据验证;
+        只借结构 / 钩子, 不抄内容, 也不要提它里面的任何品牌。
       · validated_patterns —— 【已验证规律】(有才出现): 在公司自己的历史笔记里、同一项目内
         对照验证过的写法, 每条 {label, instruction, evidence}。同样合适时照 instruction 写;
         它是提示不是硬约束, 和 p0 冲突时以 p0 为准, 不贴题就不用。没有这个字段就是这次没有,
@@ -350,6 +352,8 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
 
     这些卡来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
     结构骨架 / 为什么有效 / 可迁移手法」。写稿时可以借它的钩子或结构。
+    例外: external=true 的是外部参考卡 (最多 2 张), 别家同品类的帖, 不是公司投的、没经过我们的数据验证 ——
+    只借结构 / 钩子, 不抄内容, 不提它里面的任何品牌。
 
     ⚠️ 严禁照抄卡里的标题主干或具体句子 —— 只借手法。
     ⚠️ 标了 synthetic=true 的卡表示【指标未经验证】(疑似人工刷量), 只能凭内容
