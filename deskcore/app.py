@@ -42,10 +42,12 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import logging
 import os
+import threading
 
 import anyio
 import anyio.to_thread
@@ -121,14 +123,34 @@ _caller: contextvars.ContextVar[identity.Caller] = contextvars.ContextVar(
     "deskcore_caller", default=identity.Caller(None, "anonymous", False))
 
 
+# W-09: 按 key 传法计数(进程启动以来), 只记传法不记 key。?key= 会进访问日志和代理日志,
+# 要知道还有多少客户端在用它, 才好决定什么时候不再收。
+_KEY_TRANSPORT: collections.Counter = collections.Counter()
+_KEY_TRANSPORT_LOCK = threading.Lock()
+
+
+def _count_transport(how: str) -> None:
+    with _KEY_TRANSPORT_LOCK:
+        _KEY_TRANSPORT[how] += 1
+
+
+def key_transport_counts() -> dict:
+    with _KEY_TRANSPORT_LOCK:
+        return {k: _KEY_TRANSPORT.get(k, 0) for k in ("header", "bearer", "query", "none")}
+
+
 def _extract_key(request: Request) -> str | None:
     key = request.headers.get("x-deskcore-key")
     if key:
+        _count_transport("header")
         return key
     auth = request.headers.get("authorization") or ""
     if auth.lower().startswith("bearer "):
+        _count_transport("bearer")
         return auth[7:].strip()
-    return request.query_params.get("key")
+    key = request.query_params.get("key")
+    _count_transport("query" if key else "none")
+    return key
 
 
 def _call_tool(name: str, args: dict) -> object:
@@ -394,7 +416,7 @@ def _public_leak(value: dict) -> dict:
     留: 发了多少、销了多少、漏了几成、几个项目单独超线。
     """
     keep = ("ok", "window_days", "drawn", "consumed", "leak_pct",
-            "projects_over_threshold", "note")
+            "projects_over_threshold", "projects_delivered_without_commit", "note")
     return {k: value[k] for k in keep if k in value}
 
 
@@ -502,6 +524,8 @@ async def _collect_health() -> dict:
         # protocol_version 回答的是另一半: 运营手里那份 skill 跟服务端对不对得上
         # (skills/bywood-writing-desk/SKILL.md 末尾那行 protocol_version)。
         "build": {"commit": BUILD_COMMIT, "protocol_version": _protocol_version()},
+        # W-09: 进程启动以来各种 key 传法的请求数(只有传法, 没有 key、没有身份)
+        "key_transport": key_transport_counts(),
         "tools": sorted(tools.TOOLS),
         "config": {
             # deskcore 【不调 LLM】。蒸馏搬给调用方模型之后, 服务端一次

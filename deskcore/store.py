@@ -952,8 +952,11 @@ def check_drafts_sql(sb, project_id: str, rows: list[dict],
     return None
 
 
-def ingest_copy_counts(sb, project_ids: list[str]) -> dict[str, int]:
+def ingest_copy_counts(sb, project_ids: list[str], since: str | None = None,
+                       strict: bool = False) -> dict[str, int]:
     """每个项目里有多少 item 是从 TV 补录进来的副本(``batches.params.source == 'ingest'``)。
+    ``since`` 给了就只数这之后建的补录批次(漏账灯按窗口数, W-22)。``strict`` 时查失败直接抛 ——
+    漏账灯拿它贴原因标签, 按 0 计会把"查不到"说成"飞书里也没有"。
 
     为什么要单独数 (TV 审计 2026-10-08 B-19): 补录副本 30 天 1,593 条, 比写作台真写的多。
     ``list_projects`` 报的"历史成稿指纹数"把它们一起算了, 模型看到一个项目"有 1,800 条
@@ -971,14 +974,18 @@ def ingest_copy_counts(sb, project_ids: list[str]) -> dict[str, int]:
     if not project_ids:
         return {}
     out = {str(pid): 0 for pid in project_ids}
+    def _batches(off, lim):
+        q = sb.table("batches").select("id, project_id, params").in_("project_id", list(project_ids))
+        if since:
+            q = q.gte("created_at", since)
+        return q.order("id").range(off, off + lim - 1)
+
     try:
-        batches = _paged(lambda off, lim: (
-            sb.table("batches").select("id, project_id, params")
-              .in_("project_id", list(project_ids))
-              .order("id")
-              .range(off, off + lim - 1)))
+        batches = _paged(_batches)
     except Exception:
         logger.exception("ingest copy counts: batches lookup failed")
+        if strict:
+            raise
         return out
     ingest = [b for b in batches if is_ingest_batch(b)]
     if not ingest:
@@ -1004,6 +1011,8 @@ def ingest_copy_counts(sb, project_ids: list[str]) -> dict[str, int]:
                     per_batch[bid] = per_batch.get(bid, 0) + 1
         except Exception:
             logger.exception("ingest copy counts: item counts failed")
+            if strict:
+                raise
             return out
     for b in ingest:
         pid = str(b.get("project_id"))

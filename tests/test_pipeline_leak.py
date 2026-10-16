@@ -219,3 +219,82 @@ def test_a_failed_leak_scan_is_cached_briefly(monkeypatch):
         pipe = client.get("/health").json()["config"]["pipeline"]
         assert pipe["ok"] is None and "不再重试" in pipe["note"]
     assert calls["n"] == 1
+
+
+# ── W-22: 原因标签(飞书同步回来 ≠ 交付) ─────────────────────────────────
+
+def _over(name="x", pid=A):
+    return {"project_id": pid, "name": name, "drawn": 30, "consumed": 0}
+
+
+@pytest.mark.parametrize("copies, cause", [({A: 12}, "delivered_without_commit"), ({A: 0}, "not_delivered"), ({}, "not_delivered")])
+def test_leak_cause_label_never_turns_the_light_green(monkeypatch, copies, cause):
+    """codex review on TV #189: 补录副本没有 angle_key, 对不上任何一张牌 —— 只能当原因标签,
+    不能算交付; 否则灯会在它要抓的那种失败(坐标没销账、会被重抽)上变绿。"""
+    monkeypatch.setattr(core.store, "angle_leak", lambda sb, days: [_over()])
+    monkeypatch.setattr(core.store, "ingest_copy_counts", lambda sb, ids, since=None, strict=False: copies)
+    out = core.pipeline_leak(object())
+    p = out["projects"][0]
+    assert out["ok"] is False and p["ok"] is False, "有副本也照样是漏账"
+    assert p["likely_cause"] == cause
+    assert out["projects_delivered_without_commit"] == (1 if cause == "delivered_without_commit" else 0)
+
+
+def test_leak_cause_is_unknown_when_copies_cannot_be_read(monkeypatch):
+    def boom(sb, ids, since=None, strict=False):
+        raise RuntimeError("库挂了")
+    monkeypatch.setattr(core.store, "angle_leak", lambda sb, days: [
+        _over(), {"project_id": B, "name": "健康", "drawn": 50, "consumed": 45}])
+    monkeypatch.setattr(core.store, "ingest_copy_counts", boom)
+    out = core.pipeline_leak(object())
+    by = {p["name"]: p for p in out["projects"]}
+    assert out["ok"] is False and by["x"]["likely_cause"] == "unknown" and by["x"]["synced_back"] is None
+    assert by["健康"]["ok"] is True and by["健康"]["likely_cause"] is None
+
+
+def test_ingest_copy_counts_respects_the_window():
+    c = FakeClient(rows={
+        "batches": [
+            {"id": "b-new", "project_id": A, "params": {"source": "ingest"}, "created_at": _ago(2)},
+            {"id": "b-old", "project_id": A, "params": {"source": "ingest"}, "created_at": _ago(30)},
+            {"id": "b-desk", "project_id": A, "params": {}, "created_at": _ago(1)},
+        ],
+        "items": [{"id": f"i{i}", "batch_id": b} for i, b in enumerate(["b-new"] * 3 + ["b-old"] * 5 + ["b-desk"] * 2)],
+    })
+    assert store.ingest_copy_counts(c, [A], since=_ago(7)) == {A: 3}, "只数窗口里建的补录批次"
+    assert store.ingest_copy_counts(c, [A]) == {A: 8}, "不给 since 还是全量(list_projects 用)"
+
+
+def test_leak_light_reads_copies_strictly(monkeypatch):
+    """list_projects 那边查失败按 0 计没关系(只是提示); 漏账灯不行 —— 0 会被贴成 not_delivered,
+    把"查不到"说成"飞书里也没有"。"""
+    class _Dead:
+        def table(self, *_a, **_k):
+            raise RuntimeError("库挂了")
+    assert store.ingest_copy_counts(_Dead(), [A]) == {A: 0}
+    with pytest.raises(RuntimeError):
+        store.ingest_copy_counts(_Dead(), [A], strict=True)
+    seen = {}
+
+    def spy(sb, ids, since=None, strict=False):
+        seen["strict"] = strict
+        return {}
+    monkeypatch.setattr(core.store, "angle_leak", lambda sb, days: [_over()])
+    monkeypatch.setattr(core.store, "ingest_copy_counts", spy)
+    core.pipeline_leak(object())
+    assert seen["strict"] is True
+
+
+def test_health_shows_the_count_but_still_no_project_names(monkeypatch):
+    testclient = pytest.importorskip("fastapi.testclient")
+    import deskcore.app as A_
+
+    monkeypatch.setenv("DESKCORE_KEYS",
+                       '{"k-test": {"user_id": "22222222-2222-2222-2222-222222222222", "name": "t"}}')
+    monkeypatch.setattr(A_, "_health_probe_client", _live_probe_client)
+    monkeypatch.setattr(core.store, "angle_leak", lambda sb, days: [_over("途鸽")])
+    monkeypatch.setattr(core.store, "ingest_copy_counts", lambda sb, ids, since=None, strict=False: {A: 5})
+    client = testclient.TestClient(A_.app, raise_server_exceptions=False)
+    pipe = client.get("/health").json()["config"]["pipeline"]
+    assert pipe["ok"] is False and pipe["projects_delivered_without_commit"] == 1
+    assert "途鸽" not in client.get("/health").text
