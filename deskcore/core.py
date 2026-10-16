@@ -3363,6 +3363,15 @@ def pipeline_leak(client, days: int = LEAK_WINDOW_DAYS) -> dict:
     这不是服务健康 —— /health 的顶层 ok 不看它; 它说的是"流程在漏"。
     """
     per = store.angle_leak(client, days)
+    # W-22: 同一窗口里从飞书同步回来的补录副本数。只作【原因标签】, 不算交付、不改 ok ——
+    # 副本没有 angle_key, 对不上任何一张牌; 算交付会让灯在它要抓的失败上变绿(没销账的
+    # 坐标会被重抽, 指纹查重抓不到同一个故事换个角度; codex review on TV #189)。
+    try:
+        copies = store.ingest_copy_counts(client, [p["project_id"] for p in per],
+                                          since=store.iso_ago(days), strict=True)
+    except Exception:  # noqa: BLE001 —— 标签拿不到不影响灯本身
+        logger.exception("pipeline_leak: ingest copy counts failed")
+        copies = None
     drawn = sum(p["drawn"] for p in per)
     consumed = sum(p["consumed"] for p in per)
 
@@ -3373,6 +3382,15 @@ def pipeline_leak(client, days: int = LEAK_WINDOW_DAYS) -> dict:
         p["leak_pct"] = (round(100 * (p["drawn"] - p["consumed"]) / p["drawn"])
                          if p["drawn"] else 0)
         p["ok"] = not _breach(p["drawn"], p["consumed"])
+        p["synced_back"] = None if copies is None else copies.get(str(p["project_id"]), 0)
+        if p["ok"]:
+            p["likely_cause"] = None
+        elif copies is None:
+            p["likely_cause"] = "unknown"
+        elif p["synced_back"]:
+            p["likely_cause"] = "delivered_without_commit"   # 稿子进了飞书、没走 commit: 坐标没销账, 可能被重抽
+        else:
+            p["likely_cause"] = "not_delivered"              # 既没入库, 飞书里也没同步回来
     pct = round(100 * (drawn - consumed) / drawn) if drawn else 0
     # ⚠️ 逐项目也判, 不只看总量: 一个 30/30 全漏的项目会被另一个 100/100 全入库
     #    的大项目摊成 23%、判成健康 —— 而那个小项目的指纹一条都没进(codex review)。
@@ -3382,10 +3400,14 @@ def pipeline_leak(client, days: int = LEAK_WINDOW_DAYS) -> dict:
         "window_days": days, "drawn": drawn, "consumed": consumed,
         "leak_pct": pct, "ok": ok,
         "projects_over_threshold": len(over),
+        # 副本数读失败时给 None 而不是 0: /health 只露这个总数, 0 会把"查不到"说成"一个都没有"(codex review on #103)
+        "projects_delivered_without_commit": (None if copies is None else
+                                              sum(1 for p in over if p.get("likely_cause") == "delivered_without_commit")),
         "projects": per,
         "note": ("发出去的角度里没走到 commit_drafts 的比例。没入库的稿子没有"
                  "指纹, 下一批查重看不见它们。健康时约 20%, 超过 "
-                 f"{LEAK_ALERT_PCT}% 就该去看是谁的会话在半路停的"
+                 f"{LEAK_ALERT_PCT}% 就该去看是谁的会话在半路停的。likely_cause="
+                 "delivered_without_commit 是稿子进了飞书但没走 commit(坐标没销账), 仍算漏账"
                  + ("" if ok else
                     f" —— 现在就超了({len(over)} 个项目单独超线)" if over
                     else " —— 现在就超了")),
