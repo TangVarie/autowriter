@@ -21,6 +21,11 @@
 「这一次」还是「以后都这样」），不管文笔。
 
 **协议正文的源文件是 [`deskcore/protocol.md`](../deskcore/protocol.md)，SKILL.md 里那份由它生成。**
+**什么写进协议、什么写进工具说明（2026-10-16）**：协议每改一个字都要所有写手重新导入一次 skill；工具 docstring 是
+MCP 每次连接现发的，部署即生效，同样一直在模型眼前。所以工具的参数怎么填、返回值每个字段什么意思、什么算通过，
+一律写在 `deskcore/tools.py` 的 docstring 里；协议只写流程（什么时候调哪个工具、哪些话不能说）。新加工具、改工具口径
+都不该动协议。测试 `tests/test_protocol_is_workflow_only.py` 盯着判稿 / 评论工具的字段名不进协议。
+
 改了源文件就跑 `python -m deskcore.cli sync-skill`，把两个文件一起提交（测试
 `test_skill_carries_the_full_protocol_and_is_in_sync` 盯着两边逐字一致）。SKILL.md 里
 `<!-- protocol_version: … -->` 那一行以上是手写的引线头，以下是生成的。

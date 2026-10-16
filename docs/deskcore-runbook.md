@@ -943,7 +943,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | # | 事 | 为什么 |
 |---|---|---|
 | 4 | ~~**把真正的硬规则设成 `hard`**~~ | ✅ **2026-09-20 实查：已经在做了**。全库 465 条规则里 hard **53 条**（47 confirmed / 6 candidate），soft 412 条。P0 硬约束层不再是空的，这一条从待办降级为「继续攒」。（`protocol.md` 里那句「现存库里 300 多条全是 soft、一条 hard 都没有」也同步改了——它会让模型把真的配置问题当成正常） |
-| 5 | 老 Streamlit 工作台停服 | 决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。✅ **前置已解除（2026-09-20，TV D-072）**：A/B/C 选了 **C** —— `prepublish_evaluations` 标成 legacy-only。那条链路事实上已经断了一个月（Streamlit 末次出稿 08-19、表末条 08-20、`review_drafts` 零调用），而且**那张表本来就没有消费者**（598 行里 `pred_tier_class` / `actual_tier` 一条没填）。**停 Streamlit 不再被这条挡着**；管子不拆、`review_drafts` 不下线，重新点亮的条件见 §3 |
+| 5 | 老 Streamlit 工作台停服 | ✅ **2026-10-16 已执行**：owner 在 Railway 停掉了 Streamlit 服务；之后 deskcore、Jev、TV、tv-worker 的 `/health` 都正常，没停错服务。决策是"停服但不删仓，Supabase 一行不动"。两套同时开着会让指纹库漏记（Streamlit 写的稿子不走 `commit_drafts`）。✅ **前置已解除（2026-09-20，TV D-072）**：A/B/C 选了 **C** —— `prepublish_evaluations` 标成 legacy-only。那条链路事实上已经断了一个月（Streamlit 末次出稿 08-19、表末条 08-20、`review_drafts` 零调用），而且**那张表本来就没有消费者**（598 行里 `pred_tier_class` / `actual_tier` 一条没填）。**停 Streamlit 不再被这条挡着**；管子不拆、`review_drafts` 不下线，重新点亮的条件见 §3 |
 | 6 | 观察 `borrow_lessons` 选卡质量 | TV 书架规模下的选卡准确率**从来没人测过**。不行就在 `librarian/core.py` 那个 `CANDIDATE_CAP`（TV D-089 起 50→24，D-088 起已有按项目的冷路径预筛）的口子再加 embedding 预筛 |
 | 7 | 让 `check_drafts` 的降级信号被人看见 | `semantic_degraded` / `empty_history_warning` 这两个字段没人盯的话，表现就是"查重跑了、全 pass、看着一切正常" |
 | 7b | ~~**推 TV 那边读 `decision_source`**~~ | ✅ **TV 已接**（`scripts/sync_autowriter_decisions_to_prepublish.py` 按 human / rule_based / unverified 分流，只有 `decision_source` 恰好等于 `human` 才算人工）。⚠️ **但这条管子现在零流量**，见下面 7d |

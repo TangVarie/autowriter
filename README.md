@@ -9,15 +9,15 @@ BYWOOD（芭梧文化传媒）小红书种草文案的生成与写作台系统�
 一句话分工：**Streamlit 工作台**做人工审稿与运营界面，**worker** 跑后台生成队列，
 **deskcore** 把写作台的能力外置成 MCP 工具服务，给 WorkBuddy / Claude Code / CodeBuddy 直接调。
 
-> 方向上 deskcore 是重心：团队基本弃用 Streamlit 工作台转用 WorkBuddy，能力外置之后
-> 推理归调用方模型，deskcore 只做轻量数据操作。**但 Streamlit 停服尚未执行**——
-> 前置的归档链路取舍还没定，见 [`docs/deskcore-runbook.md`](docs/deskcore-runbook.md) §3 与待办 P1 #5。
+> 方向上 deskcore 是重心：团队已弃用 Streamlit 工作台转用 WorkBuddy，能力外置之后
+> 推理归调用方模型，deskcore 只做轻量数据操作。**Streamlit 工作台 2026-10-16 已停服**（owner 在 Railway 停掉；
+> 按 TV D-072 停服不删仓，Supabase 一行不动），见 [`docs/deskcore-runbook.md`](docs/deskcore-runbook.md) §3 与待办 #5。
 
 ## 三个可部署单元
 
 | 单元 | 入口 | 部署配置 | 状态 |
 |---|---|---|---|
-| Streamlit 工作台 | 根目录 `app.py` | `Procfile` 的 `web:` | 在跑，计划停服（未执行） |
+| Streamlit 工作台 | 根目录 `app.py` | `Procfile` 的 `web:` | 2026-10-16 已停服（Railway 上停掉；代码和 `Procfile` 留着，不删仓） |
 | 后台 job worker | `worker.py` | `Procfile` 的 `worker:` | 独立 service，需单独配 `SUPABASE_SERVICE_ROLE_KEY`（R-018）。⚠️ Streamlit Cloud 忽略 `Procfile`，那种部署要另起常驻主机跑 `python worker.py` |
 | deskcore MCP 服务 | `deskcore/app.py` | `deskcore/railway.json` | 已上线 Railway，`https://autowriter-production.up.railway.app` |
 

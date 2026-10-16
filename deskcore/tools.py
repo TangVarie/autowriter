@@ -436,9 +436,17 @@ def list_banks(_user_id: str | None = None) -> dict:
 def comment_repair_plan_for(project_id: str, post_title: str, post_body: str, text: str, slot: dict,
                             kind: str = "product", points: list[str] | None = None, reply_to_text: str = "",
                             _user_id: str | None = None) -> dict:
-    """判一条候选评论并给修改单。slot 含 id、speech_act（如[提问]）、may_name_brand、must_echo、
-    value_ok、min_detail；据真实帖子和评论位要求填写。needs_review 的背书需人工核实，不能改成伪造亲历。
-    judge_status!=ok 表示这次没判成，不能说通过；不写评论或稿件库。"""
+    """判一条候选评论并给修改单（写评论时用；评论不进 check_drafts / commit_drafts）。只判，不写评论或稿件库。
+
+    slot = 这一位的要求，据真实帖子和评论位任务填写：至少 id、speech_act（如 ["提问"]），可补 role、may_name_brand、
+    must_echo、value_ok、min_detail、intent。提问位例：{"id":"q1","speech_act":["提问"],"must_echo":false,
+    "value_ok":["可行动信息","判断依据","无"],"min_detail":"无"}。
+
+    怎么读返回值：只有 judge_status=ok 且 passed=true、needs_review=false 才能说这条检查通过。
+    plan 里的是必须改的（主要行为、点名品牌、接住帖子、细节四项，2026-10-16 已验收）；hints 里的（说话方式、读者价值、
+    像不像安排、运营意图）只是提示，可以参考着改，不改不算没通过，不要说成没过，也不要为了消掉提示反复重写。改完最多再判一轮。
+    needs_review=true（多半是亲历背书，或门槛题判得拿不准）交人工核实：不能改成伪造的亲历，也不要靠反复润色把风险抹掉。
+    judge_status 不是 ok 就如实说这次没判成，不能说通过。"""
     return core.comment_repair_plan_for(core.sb(), project_id, post_title, post_body, text, slot,
                                         user_id=_user_id, kind=kind, points=points, reply_to_text=reply_to_text)
 
@@ -446,9 +454,14 @@ def comment_repair_plan_for(project_id: str, post_title: str, post_body: str, te
 def judge_thread(project_id: str, post_title: str, post_body: str, comments: list[dict],
                  kind: str = "product", points: list[str] | None = None, max_named: int = 1,
                  _user_id: str | None = None) -> dict:
-    """判整组候选评论及各条风险。comments 含 text、role、reply_to_text，可带每位 slot 供定位修改。
-    看 passed、needs_review、hard_fails、plan；单条与成组都须检查。出错如实说明，不声称通过。
-    只判，不编造用户体验，不提交或发布评论。"""
+    """判整组候选评论：评论区整体 + 每一条。只判，不编造用户体验，不提交或发布评论。
+
+    comments 每条含 text、role、reply_to_text，最好带各自的 slot（写法同 comment_repair_plan_for）——带了 slot，
+    修改单才能定位到该改哪一位。
+
+    怎么读返回值：passed / needs_review / plan / hints 的口径同 comment_repair_plan_for；comments 里是每一条的单条结果，
+    整组和单条都要看。评论区整体那几题（夸的占比、同一句式、有没有摩擦、整体像不像安排）还没验收，只进 hints；
+    点名品牌的条数超过 max_named 会判不通过。judge_status 不是 ok 就如实说这次没判成，不能说通过。"""
     return core.judge_thread(core.sb(), project_id, post_title, post_body, comments, user_id=_user_id,
                              kind=kind, points=points, max_named=max_named)
 
