@@ -281,6 +281,13 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         (最多 5 张); lessons_status.status 说明是 borrowed / empty /
         not_configured / timeout / error 里的哪一种。只借钩子、结构、手法,
         严禁照抄标题主干或具体句子; synthetic=true 的卡指标未经验证。
+        卡上的 validated_hits 是这张卡命中了哪几条已验证规律。
+      · validated_patterns —— 【已验证规律】(有才出现): 在公司自己的历史笔记里、同一项目内
+        对照验证过的写法, 每条 {label, instruction, evidence}。同样合适时照 instruction 写;
+        它是提示不是硬约束, 和 p0 冲突时以 p0 为准, 不贴题就不用。没有这个字段就是这次没有,
+        不要自己编规律, 也不要跟用户解释为什么没有。
+      · flywheel_arm —— 这场写作落在哪个对照组。入库时【原样】传给 commit_drafts 的 flywheel_arm,
+        别改、别跟用户提。
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     而不是按时间倒序 —— 后者会让文风越写越窄。所以知道要写什么就传。
@@ -335,7 +342,7 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
 
 def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
                    key_messages: str = "", target_audience: str = "",
-                   tone: str = "", _user_id: str | None = None) -> dict:
+                   tone: str = "", flywheel_arm: str = "", _user_id: str | None = None) -> dict:
     """向帆谷飞轮图书馆【再】借几张真实爆款的经验卡。
 
     open_project 已经随简报借过一次(返回里的 lessons)。只在换了选题 / 战术、
@@ -349,8 +356,14 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
        判断借鉴, 不要把它的数据当依据。
 
     库里没有合适的卡时返回空列表, 这不是错误, 照常写就行。
+
+    validated_patterns (可能是空列表) 与 open_project 里的同名字段同一个意思: 已验证规律,
+    同样合适时照 instruction 写, 是提示不是硬约束; 空就是这次没有, 不要自己编。
+    flywheel_arm 也同 open_project: 入库时原样传给 commit_drafts。调本工具时也把这场 open_project
+    给的 flywheel_arm 原样传进来 —— 一场写作只分一次组, 不传会重新分。
     """
     return _safe(core.borrow_lessons, core.sb(), project_id, user_id=_user_id,
+                 flywheel_arm=flywheel_arm or None,
                  tactic=tactic, draft_topic=draft_topic,
                  key_messages=key_messages, target_audience=target_audience,
                  tone=tone)
@@ -466,7 +479,7 @@ def judge_thread(project_id: str, post_title: str, post_body: str, comments: lis
                              kind=kind, points=points, max_named=max_named)
 
 
-def commit_drafts(project_id: str, drafts: list[dict],
+def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
                   _user_id: str | None = None) -> dict:
     """把交付给用户的稿子入库, 让它们参与以后的查重, 并把用掉的坐标销账。
 
@@ -514,11 +527,15 @@ def commit_drafts(project_id: str, drafts: list[dict],
 
     返回里的 ``next_step`` 是入库之后的纪律: 这批是「待审」, **用户读完稿子、亲口给出
     结论之前不要调 review_drafts**。
+
+    ``flywheel_arm``: 把这场写作的 open_project (或 borrow_lessons) 返回里的 ``flywheel_arm``
+    **原样**传回来。它决定这批稿子算进哪个对照组; 不传服务端会猜, 但同一项目同时开着两场时会猜错。
     """
     # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、
     # 只带 error 字段的结果, 而写作台协议对 commit 没有强制重试 —— 于是定稿
     # 静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
-    return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id)
+    return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
+                              flywheel_arm=flywheel_arm or None)
 
 
 def review_drafts(project_id: str, decisions: list[dict], user_words: str,
