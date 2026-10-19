@@ -245,7 +245,15 @@ class FakeClient:
         if kind == "ilike":
             # PostgREST ilike: % 任意串, _ 单个字符, 不分大小写
             import re as _re
-            rx = "".join(".*" if ch == "%" else "." if ch == "_" else _re.escape(ch) for ch in value)
+            rx, i = "", 0
+            while i < len(value):
+                ch = value[i]
+                if ch == "\\" and i + 1 < len(value):      # 转义: 下一个字符照字面
+                    rx += _re.escape(value[i + 1])
+                    i += 2
+                    continue
+                rx += ".*" if ch == "%" else "." if ch == "_" else _re.escape(ch)
+                i += 1
             return cur is not None and _re.fullmatch(rx, str(cur), _re.I | _re.S) is not None
         raise AssertionError(f"假件不认识这个过滤器: {kind}")
 

@@ -2084,20 +2084,36 @@ def tv_mark_synced(sb, note_ids: list[str]) -> None:
 # ── comments_for: 按发布链接找 TV 的帖子和它已有的评论(2026-10-19, D-120) ─────────────────────
 # 与 tv_project_categories 同一种读法(service_role 直读 truth_vault, 前提见那里的说明)。这两个**不吞异常**:
 # 读不到时 core 要如实说"这次没查成", 不能说成"TV 里没有这条"(那会让写手去贴正文, 而问题其实在服务端)。
-TV_LINK_CANDIDATES = 20
-TV_COMMENTS_MAX = 40
+TV_LINK_PAGE = 50
+TV_LINK_SCAN_MAX = 400
+TV_COMMENTS_MAX = 100
 
 
-def tv_notes_by_link_token(sb, token: str) -> list[dict]:
-    """publish_url 里含 ``token`` 的笔记(粗筛; 调用方再用 tvlink.link_key 比一次)。token 只含字母数字 _ -。"""
+def _like_escape(s: str) -> str:
+    """LIKE 的通配符照字面: ``_`` 在 like 里是任意一个字符(抖音短链 id 里就有)。"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def tv_notes_by_link_token(sb, token: str, *, accept=None) -> list[dict]:
+    """publish_url 里含 ``token`` 的笔记, 新发布的在前。token 只含字母数字 _ -。
+
+    ``accept(row)`` 是调用方的精确比对(tvlink.link_key): 粗筛是 ilike(不分大小写), 一页里可能全是"包含这一段"
+    却不是这条链接的; 一页页往下翻, 直到有精确命中的那一页(最多翻 TV_LINK_SCAN_MAX 行)。只截一页的话, 真的那条
+    可能被挤到截断之外, 报成"TV 里没有"(codex review on aw#107)。"""
     if not token or not re.fullmatch(r"[A-Za-z0-9_-]{4,32}", token):
         return []
-    return list((sb.schema("truth_vault").table("notes")
-                 .select("note_id, project_id, title, body, raw_content, publish_url, publish_time, "
-                         "comments_count, tier")
-                 .ilike("publish_url", f"%{token}%")
-                 .order("publish_time", desc=True)
-                 .limit(TV_LINK_CANDIDATES).execute()).data or [])
+    pattern = f"%{_like_escape(token)}%"
+    for off in range(0, TV_LINK_SCAN_MAX, TV_LINK_PAGE):
+        rows = (sb.schema("truth_vault").table("notes")
+                .select("note_id, project_id, title, body, raw_content, publish_url, publish_time, "
+                        "comments_count, tier")
+                .ilike("publish_url", pattern)
+                .order("publish_time", desc=True).order("note_id")
+                .range(off, off + TV_LINK_PAGE - 1).execute()).data or []
+        hits = [r for r in rows if accept is None or accept(r)]
+        if hits or len(rows) < TV_LINK_PAGE:
+            return hits
+    return []
 
 
 def tv_note_comments(sb, note_id: str, limit: int = TV_COMMENTS_MAX) -> list[dict]:

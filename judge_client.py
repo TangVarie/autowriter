@@ -187,10 +187,13 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
     if not all(isinstance(payload.get(k), list) for k in _SCORE_FIELDS):
         return None
     fails = []
-    for h in payload.get("hard_fails") or []:
+    for h in payload["hard_fails"]:
         # [bank, qid, answer, p, evidence] —— 证据句不放在这里(它进下面的 plan, 一句话只带一份)。
-        if isinstance(h, (list, tuple)) and len(h) >= 4:
-            fails.append([h[0], h[1], h[2], h[3]])
+        # 形状不对的一行也算整篇 error: 悄悄丢掉它, 这篇就少扣了分(codex review on aw#107)。
+        if not (isinstance(h, (list, tuple)) and len(h) >= 4 and isinstance(h[1], str)
+                and (h[3] is None or (isinstance(h[3], (int, float)) and not isinstance(h[3], bool)))):
+            return None
+        fails.append([h[0], h[1], h[2], h[3]])
     # 2026-10-19 起分数给写手看(D-120): 修改单留下来, 由 core 挑最有把握的几条给写手。只留看得懂的那几个字段,
     # 暗题的条目 judge 那边已经抹成「有一项不公开的检查没过」。
     plan = []

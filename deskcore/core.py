@@ -1657,8 +1657,10 @@ def _cross_project_shadow_bounded(client, project_id, user_id, drafts, vectors, 
         return {"status": "unavailable", "flags": [], "note": "跨项目检查不可用；入库结果不变"}
 
 
-def _comment_tool_call(client, project_id: str, path: str, payload: dict) -> dict:
-    started = time.monotonic()
+def _comment_tool_call(client, project_id: str, path: str, payload: dict, *,
+                       started: float | None = None) -> dict:
+    """``started``: 调用方已经花掉的时间也算进同一个截止(score_comments 先查帖子再判, codex review on aw#107)。"""
+    started = time.monotonic() if started is None else started
     budget = judge_client.tool_timeout_sec()
     head = {"project": None, "category": None, "elapsed_ms": 0, "note": COMMENT_TOOL_NOTE}
     if not judge_client.configured():
@@ -1766,8 +1768,8 @@ def _note_from_link(client, link: str) -> tuple[dict | None, str | None]:
     key = tvlink.link_key(link)
     if key is None:
         return None, "认不出这条链接(只认小红书 / xhslink / 抖音 / t.cn 的发布链接)"
-    rows = [r for r in store.tv_notes_by_link_token(client, key[1])
-            if tvlink.link_key(r.get("publish_url")) == key]
+    rows = store.tv_notes_by_link_token(client, key[1],
+                                        accept=lambda r: tvlink.link_key(r.get("publish_url")) == key)
     if not rows:
         return None, ("TV 里还没有这条链接(笔记每天同步一次; 短链和长链也互相认不出)。"
                       "把帖子的标题和正文贴过来, 并告诉我是哪个项目")
@@ -1860,6 +1862,7 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
     source = "tv" if note is not None else "pasted"
     comment_rules, hard_rules = _comment_rules(client, project["id"], user_id)
     existing = []
+    rows: list[dict] = []
     if note is not None:
         rows = store.tv_note_comments(client, str(note["note_id"]))
         rows.sort(key=lambda r: (r.get("comment_order") is None, r.get("comment_order") or 0))
@@ -1879,6 +1882,12 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
     if note is not None:
         out["note_id"] = note.get("note_id")
         out["tier"] = note.get("tier")
+        total = note.get("comments_count")
+        if len(rows) >= store.TV_COMMENTS_MAX or (isinstance(total, int) and total > len(existing)):
+            # 只取了前 TV_COMMENTS_MAX 条(codex review on aw#107): 说出来, 别让模型以为这就是全部
+            out["existing_comments_note"] = (
+                f"这条帖子有 {total if isinstance(total, int) else '更多'} 条评论, 这里只列了按顺序的前 "
+                f"{len(existing)} 条; 避开重复时以这些为准, 后面的没看到。")
     return out
 
 
@@ -1912,6 +1921,20 @@ def _instructions(entries, limit: int) -> list[str]:
             if isinstance(e, dict) and isinstance(e.get("instruction"), str)][:limit]
 
 
+def _comment_payload(cands: list[dict]) -> list[dict]:
+    """送给 /judge_thread 的 comments: 贴主答疑那条没给 reply_to_text 时, 接上它 reply_to 的那一位的文字。"""
+    text_by_slot = {c["slot"]["id"]: c["text"] for c in cands if c["slot"]}
+    out = []
+    for c in cands:
+        slot = c["slot"]
+        reply_to_text = c["reply_to_text"] or (text_by_slot.get(slot.get("reply_to"), "") if slot else "")
+        item = {"text": c["text"], "role": (slot or {}).get("role", "读者位"), "reply_to_text": reply_to_text}
+        if slot:
+            item["slot"] = slot
+        out.append(item)
+    return out
+
+
 def score_comments(client, *, user_id: str | None, comments: list, link: str = "", project_id: str = "",
                    post_title: str = "", post_body: str = "", kind: str = "product",
                    max_named: int = 1) -> dict:
@@ -1923,10 +1946,6 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     """
     if not isinstance(comments, list) or not comments:
         raise CommentInputError("comments 不能为空: 每条 {slot, text}")
-    project, title, body, _note, missing = _resolve_post(
-        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body)
-    if missing is not None:
-        return missing
     if kind not in COMMENT_KINDS:
         raise CommentInputError(f"kind 只能是 {' / '.join(COMMENT_KINDS)}")
     if len(comments) > MAX_SCORED_COMMENTS:
@@ -1934,8 +1953,10 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     by_id = {s["id"]: s for s in DEFAULT_COMMENT_SLOTS}
     cands = []
     for i, c in enumerate(comments):
-        if not isinstance(c, dict) or not (c.get("text") or "").strip():
-            raise CommentInputError(f"第 {i + 1} 条评论没有 text")
+        if not isinstance(c, dict) or not isinstance(c.get("text"), str) or not c["text"].strip():
+            raise CommentInputError(f"第 {i + 1} 条评论没有 text(要是一段文字)")
+        if c.get("reply_to_text") is not None and not isinstance(c["reply_to_text"], str):
+            raise CommentInputError(f"第 {i + 1} 条评论的 reply_to_text 要是一段文字")
         slot = _slot_of(c.get("slot"), by_id)
         if c.get("slot") not in (None, "") and slot is None:
             raise CommentInputError(f"第 {i + 1} 条评论的 slot {c.get('slot')!r} 不是 comments_for 给的评论位 id"
@@ -1944,18 +1965,26 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     ids = [c["slot"]["id"] for c in cands if c["slot"] and c["slot"].get("id")]
     if len(ids) != len(set(ids)):
         raise CommentInputError("同一个评论位只能有一条(slot id 重复了): 想多写几条同类的, 分几次判, 或者给它们不同的 id")
-    text_by_slot = {c["slot"]["id"]: c["text"] for c in cands if c["slot"]}
-    payload_comments = []
-    for c in cands:
-        slot = c["slot"]
-        reply_to_text = c["reply_to_text"] or (text_by_slot.get(slot.get("reply_to"), "") if slot else "")
-        item = {"text": c["text"], "role": (slot or {}).get("role", "读者位"), "reply_to_text": reply_to_text}
-        if slot:
-            item["slot"] = slot
-        payload_comments.append(item)
+    # 查帖子(链接 → TV → 项目 → 归属)也算进同一个截止: PostgREST 默认等 120 秒, 库一卡就远超 MCP 客户端 ~22 秒的
+    # 容忍(codex review on aw#107; 同 _judge_tool_call / codex #95 的做法)。参数检查在这之前, 不碰库。
+    started, budget = time.monotonic(), judge_client.tool_timeout_sec()
+    fut = _bounded_submit(_COMMENT_POOL, _COMMENT_SLOTS, lambda: _resolve_post(
+        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body))
+    if fut is None:
+        return {"judge_status": judge_client.JUDGE_TIMEOUT, "note": COMMENT_SCORE_NOTE,
+                "detail": "评论判定线程占满, 这次没判"}
+    try:
+        project, title, body, _note, missing = fut.result(timeout=budget)
+    except cf.TimeoutError:
+        fut.cancel()
+        return {"judge_status": judge_client.JUDGE_TIMEOUT, "note": COMMENT_SCORE_NOTE,
+                "detail": f"查帖子(链接 / 项目 / 归属)在 {budget:g}s 内没查完, 这次没判"}
+    if missing is not None:
+        return missing
+    payload_comments = _comment_payload(cands)
     res = _comment_tool_call(client, project["id"], "/judge_thread",
                              {"post_title": title, "post_body": body[:_POST_BODY_CHARS], "comments": payload_comments,
-                              "kind": kind, "points": None, "max_named": max_named})
+                              "kind": kind, "points": None, "max_named": max_named}, started=started)
     head = {"judge_status": res.get("judge_status"), "project_id": project["id"],
             "note": COMMENT_SCORE_NOTE}
     if res.get("judge_status") != judge_client.JUDGE_OK:
@@ -2319,12 +2348,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 done = len(minted_ok)
                 out["identity_warning"] = (
                     f"{len(to_mint)} 条稿子的指纹都入了库, 但只有 {done} 条建成了 "
-                    f"items/versions({identity_error})。查重不受影响; 受影响的是导出的 "
-                    f"lineage —— 没建成的那 {len(to_mint) - done} 条不在 version_ids 里, "
-                    "导出时不会有 version_id, Truth Vault 那边归因不回来"
-                    "(v_model_comparison 就 JOIN 在这个 id 上)。"
-                    + (f"已建成的那 {done} 条照常可以 export_drafts(batch_id="
-                       f"{out['batch_id']})。" if done else "")
+                    f"items/versions({identity_error})。查重不受影响; 受影响的是发布后对回来 —— "
+                    f"没建成的那 {len(to_mint) - done} 条不在 version_ids 里、没有底稿, 发出去之后 tv-sync 对不回"
+                    "这一版, 只会当成新稿补录(写作台的参考分、改动差异都接不上)。"
+                    + (f"已建成的那 {done} 条(batch {out['batch_id']})不受影响。" if done else "")
+                    + "要补的话告诉工程侧(服务端日志有这批的 batch 和堆栈), 不用让写手重写。"
                     + (f"没建成的里 {unminted_angles} 条带着角度, 台账**没销账**(销了会指向"
                        "不存在的版本), 那几个坐标下一批还会被抽到。" if unminted_angles else "")
                     + "服务端日志有堆栈。")

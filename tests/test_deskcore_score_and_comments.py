@@ -361,3 +361,53 @@ def test_hostnames_are_case_insensitive_but_ids_keep_their_case():
     assert tvlink.link_key("HTTPS://WWW.XIAOHONGSHU.COM/explore/690873F30000000007030EB7")[0] == \
         "xhs:690873f30000000007030eb7"
     assert tvlink.link_key("http://XHSLINK.COM/o/AbCdEf")[0] == "xhslink:AbCdEf"
+
+
+# ── codex review on aw#107, 第二轮 ─────────────────────────────────────────────────────────────
+
+def test_a_malformed_hard_fail_row_is_an_error_not_a_dropped_fail():
+    for row in ({"qid": "x", "p": 0.9}, ["b", "q", "是"], ["b", 1, "是", 0.9], ["b", "q", "是", "0.9"],
+                ["b", "q", "是", True]):
+        body = {"passed": False, "hard_fails": [row], "plan": [], "unjudged": []}
+        assert judge_client._normalize_ok(body) is None, row
+    assert judge_client._normalize_ok({"passed": False, "hard_fails": [["b", "q", "是", None]],
+                                       "plan": [], "unjudged": []}) is not None, "没给概率的行是合法的"
+
+
+@pytest.mark.parametrize("bad", [{"slot": "q1", "text": 123}, {"slot": "q1", "text": "x", "reply_to_text": 5}])
+def test_non_string_comment_fields_are_a_400(wired, monkeypatch, bad):
+    c = _tv_client()
+    monkeypatch.setattr(core, "sb", lambda: c)
+    with pytest.raises(tools.InvalidInput):
+        tools.score_comments([bad], link=LINK, _user_id=ME)
+
+
+def test_truncated_existing_comments_are_flagged():
+    c = _tv_client(notes=[dict(NOTE, comments_count=250)])
+    out = core.comments_for(c, user_id=ME, link=LINK)
+    assert "250" in out["existing_comments_note"] and len(out["existing_comments"]) == 2
+    out = core.comments_for(_tv_client(notes=[dict(NOTE, comments_count=2)]), user_id=ME, link=LINK)
+    assert "existing_comments_note" not in out
+
+
+def test_the_exact_link_is_found_past_the_first_page_and_underscore_is_literal():
+    from deskcore import store as S
+    noise = [dict(NOTE, note_id=f"x{i:03d}", publish_url=f"http://xhslink.com/o/ab_cd{i:03d}",
+                  publish_time=f"2026-10-{(i % 9) + 10}T00:00:00") for i in range(S.TV_LINK_PAGE + 5)]
+    wild = dict(NOTE, note_id="wild", publish_url="http://xhslink.com/o/abXcd")       # _ 当通配符会误中
+    mine = dict(NOTE, note_id="mine", publish_url="http://xhslink.com/o/ab_cd", publish_time="2026-01-01T00:00:00")
+    c = _tv_client(notes=noise + [wild, mine], comments=[])
+    out = core.comments_for(c, user_id=ME, link="http://xhslink.com/o/ab_cd")
+    assert out["note_id"] == "mine"
+    assert not any(x["note_id"] == "wild" for x in S.tv_notes_by_link_token(c, "ab_cd"))
+
+
+def test_post_resolution_is_inside_the_comment_deadline(wired, monkeypatch):
+    calls, _ = wired
+    import time as _t
+    monkeypatch.setattr(judge_client, "tool_timeout_sec", lambda: 0.2)
+    monkeypatch.setattr(core, "_resolve_post", lambda *a, **k: _t.sleep(1.0))
+    started = _t.monotonic()
+    out = core.score_comments(_tv_client(), user_id=ME, link=LINK, comments=[{"slot": "q1", "text": "x"}])
+    assert out["judge_status"] == "timeout" and "没查完" in out["detail"]
+    assert _t.monotonic() - started < 0.9 and calls == []
