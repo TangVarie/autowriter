@@ -411,3 +411,31 @@ def test_post_resolution_is_inside_the_comment_deadline(wired, monkeypatch):
     out = core.score_comments(_tv_client(), user_id=ME, link=LINK, comments=[{"slot": "q1", "text": "x"}])
     assert out["judge_status"] == "timeout" and "没查完" in out["detail"]
     assert _t.monotonic() - started < 0.9 and calls == []
+
+
+# ── 一个 TV 项目对好几个写作台项目(codex review on aw#107 第三轮) ──────────────────────────────────
+THIRD_PROJ = "cccccccc-0000-0000-0000-000000000003"
+
+
+def _two_direction_client(link_to=None):
+    c = _tv_client(maps=[{"tv_project_id": "TUGE_phase1", "project_id": PROJ, "ingest_target": True},
+                         {"tv_project_id": "TUGE_phase1", "project_id": THIRD_PROJ, "ingest_target": False}])
+    c.rows["projects"].append({"id": THIRD_PROJ, "name": "途鸽·留学方向", "brand": "途鸽", "owner_id": ME,
+                               "calibration_notes": "", "tactics": "[]", "custom_roles": []})
+    if link_to:
+        c.rows["tv_note_links"] = [{"note_id": NOTE["note_id"], "tv_project_id": "TUGE_phase1",
+                                    "project_id": link_to, "version_id": None, "match_kind": "fuzzy"}]
+    return c
+
+
+def test_the_note_level_link_decides_the_direction():
+    out = core.comments_for(_two_direction_client(link_to=THIRD_PROJ), user_id=ME, link=LINK)
+    assert out["resolved"] is True and out["project_id"] == THIRD_PROJ, "夜里对上的是哪个方向就用哪个"
+
+
+def test_no_link_and_several_of_mine_asks_instead_of_guessing():
+    out = core.comments_for(_two_direction_client(), user_id=ME, link=LINK)
+    assert out["resolved"] is False and out["need"] == ["project_id"]
+    assert {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+    picked = core.comments_for(_two_direction_client(), user_id=ME, link=LINK, project_id=THIRD_PROJ)
+    assert picked["resolved"] is True and picked["project_id"] == THIRD_PROJ

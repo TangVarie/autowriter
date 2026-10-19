@@ -290,27 +290,52 @@ def _kept(sentence: str, other_grams: set[str]) -> bool:
     return bool(g) and len(g & other_grams) / len(g) >= SENT_ALIGN
 
 
+def _edited_pairs(draft_sents: list[str], published_sents: list[str], removed: list[str]) -> list[list[str]]:
+    """还在、但里面改了字的句子: 稿子里每一句没被删的, 找发出去那边四字串重合最多的一句, 归一化后不一样就记
+    ``[原句, 改后]``。长句里改几个字两边都还过半, 进不了删 / 加 —— 这些小改正是要看的(codex review on aw#107)。"""
+    gone = set(removed)
+    exact = {fp.normalize(p) for p in published_sents}
+    pg = [(p, grams(p)) for p in published_sents]
+    out, seen = [], set()
+    for s in draft_sents:
+        ns = fp.normalize(s)
+        if s in gone or ns in exact or not pg:
+            continue
+        g = grams(s)
+        best, overlap = max(((p, len(g & q)) for p, q in pg), key=lambda t: t[1])
+        if overlap and (s, best) not in seen:
+            seen.add((s, best))
+            out.append([s, best])
+    return out
+
+
 def edit_diff(draft_title: str, draft_body: str, published_title: str, published_body: str,
               *, brand: str = "") -> dict:
     """写作台那版 → 发出去的那版: 改了什么。
 
-    句子按标点切; 一句在另一边能找到一半以上的四字串就算"还在", 否则算删掉 / 新加的。只回前几句(每句截断),
-    计数是全量的。``brand`` 给了就数两边各提了几次(不分大小写)。"""
+    句子按标点切; 一句在另一边能找到一半以上的四字串就算"还在", 否则算删掉 / 新加的; 还在但字不一样的记成
+    改写对(原句 → 改后)。只回前几句(每句截断), 计数是全量的。``brand`` 给了就数两边各提了几次(不分大小写)。
+    ``changed`` 看的是归一化后的整篇: 只调了句子顺序、或者改动零碎到对不上哪一句, 也算改过。"""
     dg, pg = grams(draft_body), grams(published_body)
-    removed = [s for s in sentences(draft_body) if not _kept(s, pg)]
-    added = [s for s in sentences(published_body) if not _kept(s, dg)]
+    dsents, psents = sentences(draft_body), sentences(published_body)
+    removed = [s for s in dsents if not _kept(s, pg)]
+    added = [s for s in psents if not _kept(s, dg)]
+    edited = _edited_pairs(dsents, psents, removed)
     out = {
         "title_changed": fp.normalize(draft_title) != fp.normalize(published_title),
         "draft_title": (draft_title or "")[:120], "published_title": (published_title or "")[:120],
         "draft_chars": len(fp.normalize(draft_body)), "published_chars": len(fp.normalize(published_body)),
-        "removed_count": len(removed), "added_count": len(added),
+        "removed_count": len(removed), "added_count": len(added), "edited_count": len(edited),
         "removed_sentences": [s[:DIFF_SENTENCE_CHARS] for s in removed[:DIFF_KEEP_SENTENCES]],
         "added_sentences": [s[:DIFF_SENTENCE_CHARS] for s in added[:DIFF_KEEP_SENTENCES]],
+        "edited_sentences": [[a[:DIFF_SENTENCE_CHARS], b[:DIFF_SENTENCE_CHARS]]
+                             for a, b in edited[:DIFF_KEEP_SENTENCES]],
     }
     b = (brand or "").strip().lower()
     out["brand_draft"] = (draft_body or "").lower().count(b) if b else None
     out["brand_published"] = (published_body or "").lower().count(b) if b else None
-    out["changed"] = bool(out["title_changed"] or removed or added)
+    out["changed"] = bool(out["title_changed"] or removed or added or edited
+                          or fp.normalize(draft_body) != fp.normalize(published_body))
     return out
 
 

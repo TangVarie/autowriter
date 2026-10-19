@@ -46,8 +46,10 @@ CREATE TABLE IF NOT EXISTS autowriter.tv_edit_diffs (
     published_chars    INTEGER NOT NULL,
     removed_count      INTEGER NOT NULL,
     added_count        INTEGER NOT NULL,
+    edited_count       INTEGER NOT NULL DEFAULT 0,      -- 还在、但里面改了字的句子
     removed_sentences  TEXT[] NOT NULL DEFAULT '{}',
     added_sentences    TEXT[] NOT NULL DEFAULT '{}',
+    edited_sentences   JSONB NOT NULL DEFAULT '[]'::jsonb,   -- [[原句, 改后], ...] 最多 8 对
     brand_draft        INTEGER,
     brand_published    INTEGER,
     publish_time       TIMESTAMPTZ,

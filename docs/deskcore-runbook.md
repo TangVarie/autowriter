@@ -296,7 +296,8 @@ tv-sync 多一档 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15）�
 `open_project` 每周最多带一次 `edit_digest`、写手的模型归纳成规则建议，看完调 `ack_edit_digest` 写 `tv_edit_digest_acks`。
 SQL Editor / `apply_migration` 直接跑（幂等）。验收：`doctor` 里「表 tv_edit_diffs / tv_edit_digest_acks」applied；
 下一晚 tv-sync 之后 `select match_kind, count(*), count(*) filter (where changed) from autowriter.tv_edit_diffs group by 1`
-有数（第一晚会把以前对上的补算，每个 TV 项目最多 500 条）。⚠️ 没跑它之前 tv-sync 写 `edited` 的那一块会被旧 CHECK 拒。
+有数（第一晚会把以前对上的补算，每个 TV 项目最多 500 条）。⚠️ 没跑它之前 tv-sync 写 `edited` 的那一块会被旧 CHECK 拒；差异表读写失败时 tv-sync 照写对照、但退出码 1 并打「改动差异没写成」。
+差异里除了删 / 加的句子，还有「还在但改了字」的句子对（`edited_sentences`，原句 → 改后）；摘要从上次看到的地方**从旧往新**每次最多 200 篇改过的，看不完的下一份接着给；`acked_through` 只往前走。
 
 ### 1.8 `012_review_via_agent_provenance` —— 经代理转述的人审分开记（2026-10-09，审计 A-01，**生产库尚未执行**）
 

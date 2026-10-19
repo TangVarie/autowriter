@@ -1777,9 +1777,13 @@ def _note_from_link(client, link: str) -> tuple[dict | None, str | None]:
     return rows[0], None
 
 
-def _project_for_note(client, note: dict, project_id: str | None, user_id) -> dict:
-    """笔记所在的 TV 项目 → 调用者能访问的写作台项目。不归调用者的一律 PermissionError(不回帖子内容, 也不回
-    TV 项目号 —— 拿着一把 key 挨个试链接, 不该能问出别人的项目号)。"""
+def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tuple[dict | None, list[dict]]:
+    """笔记所在的 TV 项目 → 调用者能访问的写作台项目: ``(项目, [])``, 或者定不下来时 ``(None, 可选的项目)``。
+
+    一个 TV 项目可以对好几个写作台项目(WTG 15 个方向): 先看这条笔记夜里对上的是哪一个(tv_note_links), 对不上
+    又有不止一个归调用者的, 让调用者选, 不替他猜 —— 猜错了评论规则和硬规则都是别的方向的(codex review on aw#107)。
+    不归调用者的一律 PermissionError(不回帖子内容, 也不回 TV 项目号 —— 拿着一把 key 挨个试链接, 不该能问出别人的
+    项目号)。"""
     tv_pid = str(note.get("project_id") or "")
     targets = store.tv_targets_of(client, tv_pid) if tv_pid else []
     ids = [str(t["project_id"]) for t in sorted(targets, key=lambda t: not t.get("ingest_target"))
@@ -1789,12 +1793,28 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> di
             raise PermissionError(
                 f"这条链接的笔记不属于你给的项目 {project_id}(tv_project_map 里没有这一对)。"
                 "是不是链接贴错了, 或者项目选错了? 帖子不在 TV 里对得上的话, 把正文贴过来、不带链接也行。")
-        return assert_project_access(client, project_id, user_id=user_id)
+        return assert_project_access(client, project_id, user_id=user_id), []
+    if len(ids) > 1 and note.get("note_id"):
+        try:
+            linked = str((store.tv_link(client, str(note["note_id"])) or {}).get("project_id") or "")
+        except Exception:                               # noqa: BLE001 — 查不到就让用户选, 不替他猜
+            logger.exception("comments_for: 查这条笔记的对照失败 (note=%s)", note.get("note_id"))
+            linked = ""
+        if linked in ids:
+            try:
+                return assert_project_access(client, linked, user_id=user_id), []
+            except (PermissionError, ProjectNotFound):
+                pass
+    mine = []
     for pid in ids:
         try:
-            return assert_project_access(client, pid, user_id=user_id)
+            mine.append(assert_project_access(client, pid, user_id=user_id))
         except (PermissionError, ProjectNotFound):
             continue
+    if len(mine) == 1:
+        return mine[0], []
+    if mine:
+        return None, [{"id": p["id"], "name": p.get("name")} for p in mine]
     raise PermissionError(
         "这条链接的笔记没有对到任何归你的写作台项目上(tv_project_map 里没有, 或者那个项目不归你)。"
         "告诉我要写的是哪个项目, 并把帖子正文贴过来。")
@@ -1814,7 +1834,12 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
     if link:
         note, why = _note_from_link(client, link)
     if note is not None:
-        project = _project_for_note(client, note, project_id or None, user_id)
+        project, choices = _project_for_note(client, note, project_id or None, user_id)
+        if project is None:
+            return None, "", "", None, {
+                "resolved": False, "need": ["project_id"], "choices": choices,
+                "note": "这条笔记所在的 TV 项目对着你的好几个写作台项目, 夜里也还没对上是哪一个。问用户写的是哪个"
+                        "(choices 里选), 再带 project_id 调一次。"}
         title, body = _tv_post_text(note)
         if post_body:
             title, body = post_title or title, post_body
@@ -3894,7 +3919,8 @@ EDIT_DIGEST_MIN_CHANGED = 3       # 改过的少于这几篇不出摘要: 一两
 EDIT_DIGEST_EXAMPLES = 6
 EDIT_DIGEST_TASK = (
     "这是本项目最近发出去的稿子在发布前被人改过的地方(写作台那版 → 发出去那版)。看有没有反复出现、像是有意为之的改法"
-    "(比如总删掉某类句子、总把标题改短、总少提或多提品牌), 归纳成最多 3 条能写成规则的话, 念给用户听, 问要不要记下。"
+    "(比如总删掉某类句子、总把某种说法换成另一种、总把标题改短、总少提或多提品牌), 归纳成最多 3 条能写成规则的话, "
+    "念给用户听, 问要不要记下。"
     "用户说要的, 用 record_rule 记(soft, scope=project)。只出现一两次的、说不清为什么改的, 不要硬编成规则。"
     "不管记没记, 最后调 ack_edit_digest, through 原样传回, rules_recorded 填记了几条; 之后一周内不会再出现。")
 
@@ -3914,13 +3940,14 @@ def edit_digest(client, project_id: str, *, user_id: str | None = None,
         acked_at = tvlink._as_dt(ack.get("acked_at"))
         if acked_at and now - acked_at < timedelta(days=EDIT_DIGEST_EVERY_DAYS):
             return None
-    rows = store.tv_edit_diffs_since(client, project_id, (ack or {}).get("acked_through"))
-    changed = [r for r in rows if r.get("changed")]
+    got = store.tv_edit_diffs_since(client, project_id, (ack or {}).get("acked_through"))
+    changed = [r for r in got["rows"] if r.get("changed")]
     if len(changed) < EDIT_DIGEST_MIN_CHANGED:
         return None
-    through = max(str(r.get("computed_at") or "") for r in rows)
+    # through = 这次真看到的最后一行(库里按时间从旧往新排好的); 后面还有的(more)下次接着看, 不会被跨过去
+    through = str(changed[-1].get("computed_at") or "")
     examples = []
-    for r in changed[:EDIT_DIGEST_EXAMPLES]:
+    for r in reversed(changed[-EDIT_DIGEST_EXAMPLES:]):         # 例子给最近的几篇
         ex: dict = {"title": r.get("published_title") or r.get("draft_title")}
         if r.get("title_changed"):
             ex["title_before"] = r.get("draft_title")
@@ -3928,14 +3955,19 @@ def edit_digest(client, project_id: str, *, user_id: str | None = None,
             ex["removed"] = list(r["removed_sentences"])[:3]
         if r.get("added_sentences"):
             ex["added"] = list(r["added_sentences"])[:3]
+        if r.get("edited_sentences"):
+            ex["rewritten"] = [{"before": a, "after": b} for a, b in list(r["edited_sentences"])[:3]]
         examples.append(ex)
     out = {"through": through, "since": (ack or {}).get("acked_through"),
-           "pairs": len(rows), "changed": len(changed),
-           "title_changed": sum(1 for r in rows if r.get("title_changed")),
-           "chars": {"draft_avg": _avg(r.get("draft_chars") for r in rows),
-                     "published_avg": _avg(r.get("published_chars") for r in rows)},
+           "pairs": got["pairs"], "changed": len(changed),
+           "title_changed": sum(1 for r in changed if r.get("title_changed")),
+           "rewritten_sentences": sum(int(r.get("edited_count") or 0) for r in changed),
+           "chars": {"draft_avg": _avg(r.get("draft_chars") for r in changed),
+                     "published_avg": _avg(r.get("published_chars") for r in changed)},
            "examples": examples, "task": EDIT_DIGEST_TASK}
-    bd, bp = _avg(r.get("brand_draft") for r in rows), _avg(r.get("brand_published") for r in rows)
+    if got["more"]:
+        out["more_after_through"] = True        # 一次没看完: 看完这份、ack 之后, 下一份从 through 接着往后
+    bd, bp = _avg(r.get("brand_draft") for r in changed), _avg(r.get("brand_published") for r in changed)
     if bd is not None or bp is not None:
         out["brand_mentions"] = {"draft_avg": bd, "published_avg": bp}
     return out
@@ -3950,9 +3982,9 @@ def ack_edit_digest(client, project_id: str, through: str, *, user_id: str | Non
         raise ValueError("through 要原样传回 edit_digest 里的那个时间")
     if not isinstance(rules_recorded, int) or isinstance(rules_recorded, bool) or not 0 <= rules_recorded <= 20:
         raise ValueError("rules_recorded 是这次记了几条规则(0~20 的整数)")
-    store.tv_edit_digest_ack_upsert(client, project_id, acked_through=t.isoformat(),
-                                    acked_by=str(user_id) if user_id else None, rules_recorded=rules_recorded)
-    return {"acked": True, "through": t.isoformat(), "rules_recorded": rules_recorded,
+    kept = store.tv_edit_digest_ack_upsert(client, project_id, acked_through=t.isoformat(),
+                                           acked_by=str(user_id) if user_id else None, rules_recorded=rules_recorded)
+    return {"acked": True, "through": kept, "rules_recorded": rules_recorded,
             "next_after_days": EDIT_DIGEST_EVERY_DAYS}
 
 
@@ -4918,6 +4950,8 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
     try:
         done = store.tv_edit_diff_note_ids(client, tv_project_id) if not dry_run else set()
     except Exception as exc:                            # noqa: BLE001 — 013 没跑 / 库错: 这晚不算
+        # 记日志、带回 error; cli 的 tv-sync 据它退出非零(codex review on aw#107), 对照照写
+        logger.exception("tv_sync: 读已算过的改动差异失败 (tv=%s) —— 这晚不算差异", tv_project_id)
         return {"written": 0, "error": f"{type(exc).__name__}: {exc}"[:200]}
     fresh = {l["note_id"]: l for l in links if l.get("version_id") and l.get("match_kind") in _TV_BACKFILL_KINDS}
     backlog = [dict(r, note_id=nid) for nid, r in existing.items()
@@ -4940,8 +4974,10 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
                      "publish_time": n.publish_time.isoformat() if n.publish_time else None,
                      "draft_title": v.title[:120], **{k: d[k] for k in (
                          "changed", "title_changed", "published_title", "draft_chars", "published_chars",
-                         "removed_count", "added_count", "removed_sentences", "added_sentences",
-                         "brand_draft", "brand_published")}})
+                         "removed_count", "added_count", "edited_count", "removed_sentences", "added_sentences",
+                         "edited_sentences", "brand_draft", "brand_published")},
+                     # 显式写: upsert 撞上旧行(rematch 重算)时 DEFAULT now() 不会刷新, 摘要就看不到这次重算
+                     "computed_at": store.iso_now()})
     out = {"computed": len(rows), "changed": sum(1 for r in rows if r["changed"]),
            "backfilled": sum(1 for r in rows if r["note_id"] not in fresh), "written": 0}
     if rows and not dry_run:

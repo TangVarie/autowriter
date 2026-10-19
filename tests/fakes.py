@@ -49,6 +49,7 @@ class FakeQuery:
         self.count_mode = None
         self.rng: tuple[int, int] | None = None
         self.orders: list[str] = []
+        self.sort_keys: list[tuple[str, bool]] = []     # (列, desc) —— select 真按它排(和 PostgREST 一样)
         self._negate_next = False
         self.payload = None
         self.op = "select"
@@ -111,6 +112,7 @@ class FakeQuery:
     # ── 排序 / 分页 ──────────────────────────────────────────────────
     def order(self, column, desc=False, **kwargs):
         self.orders.append(column)
+        self.sort_keys.append((column, bool(desc)))
         return self
 
     def limit(self, n):
@@ -335,7 +337,12 @@ class FakeClient:
                 r.update(q.payload or {})
             return FakeResponse(hits)
 
-        # select —— count 在分页【之前】算, 与 PostgREST 一致
+        # select —— 先排序再分页, count 在分页【之前】算, 与 PostgREST 一致。
+        # 排序按 .order() 的先后(第一个是主键); None 排最后(PostgREST 升序的默认 nulls last)。
+        for col, desc in reversed(getattr(q, "sort_keys", [])):
+            present = [r for r in hits if r.get(col) is not None]
+            absent = [r for r in hits if r.get(col) is None]
+            hits = sorted(present, key=lambda r: r.get(col), reverse=desc) + absent
         total = len(hits)
         if q.rng:
             hits = hits[q.rng[0]:q.rng[1] + 1]

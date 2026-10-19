@@ -2151,18 +2151,44 @@ def tv_edit_diffs_upsert(sb, rows: list[dict]) -> int:
 
 
 EDIT_DIGEST_ROWS = 200
+_EDIT_DIFF_COLS = ("note_id, match_kind, changed, title_changed, draft_title, published_title, draft_chars, "
+                   "published_chars, removed_count, added_count, edited_count, removed_sentences, added_sentences, "
+                   "edited_sentences, brand_draft, brand_published, publish_time, computed_at")
 
 
-def tv_edit_diffs_since(sb, project_id: str, since: str | None) -> list[dict]:
-    """这个写作台项目 ``since`` 之后算出来的差异, 新的在前, 最多 EDIT_DIGEST_ROWS 行。"""
-    q = (sb.table("tv_edit_diffs")
-         .select("note_id, match_kind, changed, title_changed, draft_title, published_title, draft_chars, "
-                 "published_chars, removed_count, added_count, removed_sentences, added_sentences, "
-                 "brand_draft, brand_published, publish_time, computed_at")
-         .eq("project_id", project_id))
+def _ts(v) -> datetime | None:
+    try:
+        t = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def tv_edit_diffs_since(sb, project_id: str, since: str | None, *, limit: int = EDIT_DIGEST_ROWS) -> dict:
+    """这个写作台项目 ``since`` 之后算出来的差异: ``{"rows": 改过的那些(旧的在前), "pairs": 全部对数, "more": 还有没有}``。
+
+    只取 ``changed`` 的、**从旧往新**取, 最多 ``limit`` 行(codex review on aw#107): 摘要的 through 就是取到的最后
+    一行, 看完之后从那儿接着往后 —— 新的在前取的话, 一次超过 limit 行时更早那些会被 through 一下跨过去、再也
+    进不了摘要; 只取改过的, 没改的再多也挡不住后面改过的。截到 limit 时, 最后一个时间点上的行可能没取全
+    (同一批 upsert 的 computed_at 可以相同), 那个时间点整体留到下一次。"""
+    def _build(off, lim):
+        q = (sb.table("tv_edit_diffs").select(_EDIT_DIFF_COLS).eq("project_id", project_id).eq("changed", True))
+        if since:
+            q = q.gt("computed_at", since)
+        return q.order("computed_at").order("note_id").range(off, off + lim - 1)
+    rows = _paged(_build, hard_cap=limit + 1)
+    more = len(rows) > limit
+    if more:
+        # 按时间比, 不按字符串: PostgREST 回的小数秒位数不固定
+        cut = _ts(rows[limit].get("computed_at"))
+        kept = [r for r in rows[:limit] if cut is None or (_ts(r.get("computed_at")) or cut) < cut]
+        rows = kept or rows[:limit]       # 全是同一个时间点(不该有): 只能先看这些
+    q = sb.table("tv_edit_diffs").select("note_id", count="exact").eq("project_id", project_id)
     if since:
         q = q.gt("computed_at", since)
-    return list((q.order("computed_at", desc=True).limit(EDIT_DIGEST_ROWS).execute()).data or [])
+    resp = q.limit(1).execute()
+    pairs = resp.count if isinstance(getattr(resp, "count", None), int) else len(rows)
+    return {"rows": rows, "pairs": pairs, "more": more}
 
 
 def tv_edit_digest_ack(sb, project_id: str) -> dict | None:
@@ -2172,11 +2198,24 @@ def tv_edit_digest_ack(sb, project_id: str) -> dict | None:
 
 
 def tv_edit_digest_ack_upsert(sb, project_id: str, *, acked_through: str, acked_by: str | None,
-                              rules_recorded: int) -> None:
-    sb.table("tv_edit_digest_acks").upsert(
-        {"project_id": project_id, "acked_through": acked_through, "acked_at": iso_now(),
-         "acked_by": acked_by, "rules_recorded": int(rules_recorded)},
-        on_conflict="project_id").execute()
+                              rules_recorded: int) -> str:
+    """记一笔"摘要看到 acked_through 了", 回实际存下的 through。
+
+    水位只往前走(codex review on aw#107): 两个人先后打开同一个项目、晚拿到摘要的先看完, 早拿到的那份(through 更旧)
+    后看完时不许把水位拉回去 —— 否则两次 through 之间那段一周后又出来一遍。先按"库里的比我旧"条件更新; 没更新到
+    再看是没有这一行(插)还是库里已经更新(只记看过的人和时间, through 不动)。"""
+    meta = {"acked_at": iso_now(), "acked_by": acked_by, "rules_recorded": int(rules_recorded)}
+    hit = (sb.table("tv_edit_digest_acks").update({"acked_through": acked_through, **meta})
+           .eq("project_id", project_id).lt("acked_through", acked_through).execute()).data or []
+    if hit:
+        return acked_through
+    cur = tv_edit_digest_ack(sb, project_id)
+    if cur is None:
+        sb.table("tv_edit_digest_acks").upsert({"project_id": project_id, "acked_through": acked_through, **meta},
+                                               on_conflict="project_id").execute()
+        return acked_through
+    sb.table("tv_edit_digest_acks").update(meta).eq("project_id", project_id).execute()
+    return str(cur.get("acked_through") or acked_through)
 
 
 def is_ingest_batch(batch: dict | None) -> bool:
