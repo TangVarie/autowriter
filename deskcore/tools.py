@@ -200,7 +200,7 @@ def _safe(fn, *args, **kwargs) -> Any:
       · **合规读**(open_project) —— 拿不到 P0 硬约束就照常开写, 产出的是违规
         内容, 而调用方看到的是一份 p0 为空的正常简报。store.shared_memories()
         专门为此【故意不吞异常】, 外面再包一层 _safe 等于把那个设计原样抵消掉。
-      · **写**(draw_angles / commit_drafts / record_rule / record_edit /
+      · **写**(draw_angles / score_drafts / commit_drafts / record_rule / record_edit /
         label_example) —— 写作台协议对这些没有强制重试步骤。一条用户明确说
         「以后都这样」的 hard 合规规则写失败, 会静默缺席之后的每一份简报;
         发牌没落台账, 同一个角度下批还能再抽出来。
@@ -294,7 +294,7 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         对照验证过的写法, 每条 {label, instruction, evidence}。同样合适时照 instruction 写;
         它是提示不是硬约束, 和 p0 冲突时以 p0 为准, 不贴题就不用。没有这个字段就是这次没有,
         不要自己编规律, 也不要跟用户解释为什么没有。
-      · flywheel_arm —— 这场写作落在哪个对照组。入库时【原样】传给 commit_drafts 的 flywheel_arm,
+      · flywheel_arm —— 这场写作落在哪个对照组。存档时【原样】传给 score_drafts 的 flywheel_arm,
         别改、别跟用户提。
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
@@ -384,7 +384,7 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
 
     validated_patterns (可能是空列表) 与 open_project 里的同名字段同一个意思: 已验证规律,
     同样合适时照 instruction 写, 是提示不是硬约束; 空就是这次没有, 不要自己编。
-    flywheel_arm 也同 open_project: 入库时原样传给 commit_drafts。调本工具时也把这场 open_project
+    flywheel_arm 也同 open_project: 存档时原样传给 score_drafts。调本工具时也把这场 open_project
     给的 flywheel_arm 原样传进来 —— 一场写作只分一次组, 不传会重新分。
     """
     return _safe(core.borrow_lessons, core.sb(), project_id, user_id=_user_id,
@@ -425,7 +425,7 @@ def check_drafts(project_id: str, drafts: list[dict],
         信号命中: 撞开头就换开场视角, 撞正文就换比喻系统或叙事路径。
         只改标题没用。重写完再跑一次。
       · warn —— 可疑, 建议换个切入再交。
-      · pass —— 可以交付, 记得调 commit_drafts 入库。
+      · pass —— 可以交付, 交付的同时调 score_drafts(存档 + 参考分)。
 
     summary.semantic_degraded 为 true 时说明 embedding 不可用, 这次只跑了确定性
     查重, 同角度换说法的标题可能漏过 —— 【要告诉用户这件事】, 别默默交付。
@@ -444,10 +444,11 @@ def judge_draft(project_id: str, title: str, body: str, judge_paras: str = "on_f
     返回篇级画像 profile、硬伤 hard_fails(题、答案、概率、依据句)、修改单 plan、只记录的目标题 recorded、
     段级分布 para_stats、数据出境 policy、用的题库 banks。不改稿、不落账本、不拦交付。
 
-    什么时候调: check_drafts 过了之后、commit_drafts 之前, 或用户问「这篇哪里有问题」。一篇一调。
+    什么时候调: score_drafts 已经给每篇自动打过参考分; 这个工具是**深一层**的(还判段落、人感), 只在用户问「这篇
+    哪里有问题」、或者想在 score_drafts 之外再细查一篇时调。一篇一调。
     怎么用返回值: hard_fails / plan 只说哪一句犯了哪条, 不给改法 —— 照着改稿, 改完最多再判一轮, 不要循环。
     judge_status 不是 ok(not_configured / timeout / policy_blocked / unavailable …)时: 如实告诉用户这次没拿到判定,
-    查重和入库照常走, 不要把它当成"通过"也不要重试超过一次。影子期这不是闸: 判定不过也能交付, 但要把硬伤告诉用户。
+    查重和存档照常走, 不要把它当成"通过"也不要重试超过一次。它不是闸: 判定不过也能交付, 但要把硬伤告诉用户。
     project 必须是你有权限的项目, 且接了 tv_project_map(没接会回 not_configured 并写明补救)。
     """
     return core.judge_draft(core.sb(), project_id, title, body, user_id=_user_id, judge_paras=judge_paras,
@@ -471,182 +472,121 @@ def list_banks(_user_id: str | None = None) -> dict:
     return core.list_banks()
 
 
-def comment_repair_plan_for(project_id: str, post_title: str, post_body: str, text: str, slot: dict,
-                            kind: str = "product", points: list[str] | None = None, reply_to_text: str = "",
-                            _user_id: str | None = None) -> dict:
-    """判一条候选评论并给修改单（写评论时用；评论不进 check_drafts / commit_drafts）。只判，不写评论或稿件库。
+def comments_for(link: str = "", project_id: str = "", post_title: str = "", post_body: str = "",
+                 skill_version: str | None = None, _user_id: str | None = None) -> dict:
+    """写评论的入口: 用户给一条发布链接(或贴帖子正文 + 说是哪个项目), 一次拿齐写评论要的东西。不用先 open_project。
 
-    slot = 这一位的要求，据真实帖子和评论位任务填写：至少 id、speech_act（如 ["提问"]），可补 role、may_name_brand、
-    must_echo、value_ok、min_detail、intent。提问位例：{"id":"q1","speech_act":["提问"],"must_echo":false,
-    "value_ok":["可行动信息","判断依据","无"],"min_detail":"无"}。
+    传 ``link`` 就行: 服务端按链接在 TV 里找到那篇帖子、它属于哪个项目、已有的评论。TV 里没有这条(每天同步一次; 短链和
+    长链互相认不出)就回 ``resolved=false`` 和 ``need``: 照 ``note`` 让用户把帖子标题、正文贴过来, 再带 ``post_title`` /
+    ``post_body`` / ``project_id`` 调一次。用户自己贴了正文时以贴的为准。
 
-    怎么读返回值：只有 judge_status=ok 且 passed=true、needs_review=false 才能说这条检查通过。
-    plan 里的是必须改的（主要行为、点名品牌、接住帖子、细节四项，2026-10-16 已验收）；hints 里的（说话方式、读者价值、
-    像不像安排、运营意图）只是提示，可以参考着改，不改不算没通过，不要说成没过，也不要为了消掉提示反复重写。改完最多再判一轮。
-    needs_review=true（多半是亲历背书，或门槛题判得拿不准）交人工核实：不能改成伪造的亲历，也不要靠反复润色把风险抹掉。
-    judge_status 不是 ok 就如实说这次没判成，不能说通过。"""
-    return core.comment_repair_plan_for(core.sb(), project_id, post_title, post_body, text, slot,
-                                        user_id=_user_id, kind=kind, points=points, reply_to_text=reply_to_text)
+    返回:
+      · post —— 要接的帖子(标题 + 正文)
+      · existing_comments —— 帖子下已有的评论(TV 里有才有): 别重复里面已经问过的事
+      · comment_rules —— 本项目管评论的规则(「评论区：」开头的), 必须守
+      · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守
+      · slots —— 默认四个评论位: q1 / q2 提问、exp 补充经验、reply 贴主答疑(回 q1)。每位写一条, 位的要求在 note 里;
+        不写背书、不编造用过某产品的亲历。用户另有要求(比如只要两条提问)就照用户的, 位的 id 照用
+      · project_id —— 下一步 score_comments 要带的
+    写完整组交给 ``score_comments``。评论不进 check_drafts / score_drafts, 也不存库。
 
-
-def judge_thread(project_id: str, post_title: str, post_body: str, comments: list[dict],
-                 kind: str = "product", points: list[str] | None = None, max_named: int = 1,
-                 _user_id: str | None = None) -> dict:
-    """判整组候选评论：评论区整体 + 每一条。只判，不编造用户体验，不提交或发布评论。
-
-    comments 每条含 text、role、reply_to_text，最好带各自的 slot（写法同 comment_repair_plan_for）——带了 slot，
-    修改单才能定位到该改哪一位。
-
-    怎么读返回值：passed / needs_review / plan / hints 的口径同 comment_repair_plan_for；comments 里是每一条的单条结果，
-    整组和单条都要看。评论区整体那几题（夸的占比、同一句式、有没有摩擦、整体像不像安排）还没验收，只进 hints；
-    点名品牌的条数超过 max_named 会判不通过。judge_status 不是 ok 就如实说这次没判成，不能说通过。"""
-    return core.judge_thread(core.sb(), project_id, post_title, post_body, comments, user_id=_user_id,
-                             kind=kind, points=points, max_named=max_named)
-
-
-def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
-                  _user_id: str | None = None) -> dict:
-    """把交付给用户的稿子入库, 让它们参与以后的查重, 并把用掉的坐标销账。
-
-    **交付的同一轮里调, 不等用户说"定稿"**(2026-09-18 起)。入库的状态是待审,
-    不代表定稿、不代表谁认可了; 哪些真的发了由飞书 → TV 那边按内容对照回来,
-    不用你操心。只传交付了的稿子; 你自己或用户当场毙掉、没交付的草稿不传。
-
-    **改稿用 ``replaces_version_id`` 替换, 不要当新稿再入一次。** 用户看完让改
-    某一条: 改好后再调本工具, 那条带 ``replaces_version_id``(上次返回的
-    ``version_ids`` 里对应的那个)。入库会先摘掉旧版的指纹再查重, 所以不会撞上
-    它自己; 成功后旧稿原地升成新版本(同一个 item), 返回值 ``replaced`` 里列出来,
-    ``version_ids`` 里是新 id。当新稿再入一次的话, 会被自己的旧版拦下, 而旧的那条
-    永远留在库里占着角度。整篇推翻换角度重写的才当新稿。
-
-    ⚠️ 入库时【会再查一次重】。你 check 之后、commit 之前, 可能有队友先提交了
-    撞车的稿子 —— 那条竞态窗口只能在写入的同一个事务里关掉。被判撞车的条目
-    【不会入库】, 在返回值的 rejected 里列出来: 那几条要重写后重新走 check_drafts,
-    不能当作已交付。
-
-    这个工具出错会直接报错。入库失败必须让你知道 —— 稿子没进指纹库的话,
-    下次 check_drafts 会把同样的内容再放行一次。看到报错就重试, 别当没事。
-    报"另一个写操作正在跑"(409)也是重试: 同一个项目的入库和补录是排队的。
-
-    返回值里的 ``batch_id`` / ``version_ids`` 是这批稿子在库里的身份, 直接拿去
-    喂 export_drafts。带 ``identity_warning`` 时说明身份没建成 —— 稿子入库了、
-    查重不受影响, 但这批导不出可归因的 lineage。
-
-    ⚠️ **入库自带闸**: 入库前会先跑一遍和 check_drafts 同一套判定, 判 reject 的
-    不入库, 在 ``rejected`` 里带 ``gate="pre_commit"``(``gate="atomic_recheck"``
-    是写入时的竞态拦截)。所以跳过 check 直接 commit 塞不进重复的稿子, 只会让你
-    在这一步才知道哪几条要重写。``gate_summary`` 是那次判定的汇总(含
-    semantic_degraded / empty_history_warning), 该告诉用户的照 check_drafts 的
-    规矩说。
-
-    **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零
-    就是有几条没带 —— 那几个角度没销账, 下一批还会被抽到, 同一个故事会被讲
-    第二遍, 而那种重复查重闸抓不到。这时返回里还会带 ``angle_debt``: 你在这个
-    项目当前还挂着的坐标(销掉这一批之后重算的)。**下一批按它们写, 别再抽一批
-    新的** —— 你上一场抽的牌就在里面。
-
-    返回里的 ``judge`` 是入库之后的自动判定(影子期): 结果只记录, **不影响入库**,
-    也不改 written / rejected。``judge_status`` 不是 ok(超时、没配、被出境口径挡下)
-    都是正常结局, **不要重试, 不要据 hard_fails 改稿或重新提交**, 也不必转述给用户,
-    除非他问起。
-
-    返回里的 ``next_step`` 是入库之后的纪律: 这批是「待审」, **用户读完稿子、亲口给出
-    结论之前不要调 review_drafts**。
-
-    ``flywheel_arm``: 把这场写作的 open_project (或 borrow_lessons) 返回里的 ``flywheel_arm``
-    **原样**传回来。它决定这批稿子算进哪个对照组; 不传服务端会猜, 但同一项目同时开着两场时会猜错。
+    ``skill_version``: 同 open_project, 每次都传 skill 里 ``protocol_version:`` 那一行的值; 返回里有 ``skill_update`` 时把
+    ``skill_update.message`` 原样放在回复最前面。
+    帖子属于别人的项目时报 403, 不回帖子内容。
     """
-    # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、
-    # 只带 error 字段的结果, 而写作台协议对 commit 没有强制重试 —— 于是定稿
-    # 静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
+    out = core.comments_for(core.sb(), user_id=_user_id, link=link, project_id=project_id,
+                            post_title=post_title, post_body=post_body)
+    try:
+        digest = protocol_text()[1]
+    except Exception:  # noqa: BLE001
+        logger.warning("comments_for: 协议文件读不了, 这次不核 skill 版本", exc_info=True)
+        return out
+    status, reported = skillcheck.report(_user_id, skill_version or None, digest)
+    if status != skillcheck.UP_TO_DATE:
+        out["skill_update"] = skillcheck.notice(status, reported, digest)
+    return out
+
+
+def score_comments(comments: list[dict], link: str = "", project_id: str = "", post_title: str = "",
+                   post_body: str = "", kind: str = "product", max_named: int = 1,
+                   _user_id: str | None = None) -> dict:
+    """一组评论写完后调(自动调, 不用等用户说): Jev 整组判一次, 回每条过没过和修改建议。只判, 不存库, 不发布。
+
+    ``comments`` 传 ``[{"slot": "q1", "text": "..."}, {"slot": "reply", "text": "..."}, ...]``: slot 写 comments_for 给的
+    评论位 id(自定义的评论位传整个对象); 同一个 id 只能有一条; 贴主答疑那条会自动接上它回的那一位。帖子参数和
+    comments_for 那次一样: ``link``, 或 ``post_title`` / ``post_body`` + ``project_id``。
+    ``kind``: product(默认, 卖货的品)/ agency(机构服务)/ shop(门店)。``max_named``: 整组最多几条点名品牌(默认 1)。
+
+    怎么读返回值:
+      · 每条 ``passed=true`` 且 ``needs_review=false`` 才算这条过。``summary.passed`` 是这组过了几条 —— 这就是整组的分数,
+        照实告诉用户。
+      · ``fix`` 是必须改的(主要行为、点名品牌、接住帖子、细节四项); ``hints`` 只是参考, 不改不算没过, 别为了消掉提示反复重写。
+      · ``thread_fix`` 是整组层面的(点名太多、评论区没有摩擦), 按「位 xx」改那一位。
+      · 没过的按 fix 改**一轮**, 再调一次本工具, 然后不管结果都交付并如实说明; 不要循环。
+      · ``needs_review=true``(多半是像背书、或判得拿不准)交人工核实: 不能改成伪造的亲历, 也不要靠反复润色把风险抹掉。
+      · ``judge_status`` 不是 ok 就说这次没判成, 不能说通过。
+    """
+    try:
+        return core.score_comments(core.sb(), user_id=_user_id, comments=comments, link=link,
+                                   project_id=project_id, post_title=post_title, post_body=post_body,
+                                   kind=kind, max_named=max_named)
+    except core.CommentInputError as exc:
+        raise InvalidInput(str(exc)) from exc
+
+
+def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
+                 _user_id: str | None = None) -> dict:
+    """稿子写完、过了 check_drafts 就调(**自动调, 不等用户说**): 一次做两件事 ——
+
+      1. **存档**: 让它们参与以后的查重、给用到的角度销账、留下发布后能对回来的底稿;
+      2. **打分**: Jev 给每篇一个参考分和最多 3 条修改建议。**不拦交付。**
+
+    写手不用为这一步做任何事, 也没有"定稿 / 导出 / 审核"这些步骤了: 用户把定下来的稿子(可以手改过)自己贴进飞书,
+    发出去之后系统每天按内容自动对回来, 不用问用户发没发。只传交付了的稿子; 你自己或用户当场毙掉的不传。
+
+    **分数怎么读、怎么说**(在 ``judge.results`` 里, 按 ``index`` 对上你传的第几篇):
+      · ``score`` 满分 100, 只看篇级硬约束(平台合规 + 特征题库里的合规题), 文笔好坏不在里面。Jev 有把握的问题每条 -25,
+        拿不准的每条 -8, 有硬约束没判出来的每条 -10; 正文太短判不了的 score 为空(``why`` 里写着)。
+      · ``fixes`` 是最该看的几条: ``sure=true`` 是 Jev 有把握的, ``sure=false`` 是拿不准、看一眼就行的。``more_fixes``
+        是没列出的条数。``instruction`` 只说哪一句犯了哪条, 不给改法。
+      · 把每篇的分数和 fixes **照实**告诉用户, 一两句话就够。用户要改哪篇: 按 fixes 改完, 那篇带
+        ``replaces_version_id`` 再调一次本工具(会重新打分)。改一轮就够, 不要为了分数反复重写。
+      · ``judge_status`` 不是 ok(超时、没配、被出境口径挡下)就说这篇这次没打成分, 不要重试, 存档照样成功了。
+
+    **改稿用 ``replaces_version_id`` 替换, 不要当新稿再存一次。** 值是上次返回的 ``version_ids`` 里对应的那个。存档
+    会先摘掉旧版的指纹再查重, 所以不会撞上它自己; 成功后旧稿原地升成新版本, ``replaced`` 里列出来, ``version_ids``
+    里是新 id。当新稿再存一次的话, 会被自己的旧版拦下, 而旧的那条永远占着角度。整篇推翻换角度重写的才当新稿。
+
+    ⚠️ 存档时【会再查一次重】, 而且自带和 check_drafts 同一套闸: 判 reject 的不存档, 在 ``rejected`` 里列出来
+    (``gate="pre_commit"`` 是闸前拦下, ``gate="atomic_recheck"`` 是写入时撞上了队友刚存的稿子)。那几条要重写后
+    重新走 check_drafts, 不能当作已交付。``gate_summary`` 里该告诉用户的(semantic_degraded / empty_history_warning)
+    照 check_drafts 的规矩说。
+
+    **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零就是有几条没带 —— 那几个角度没销账,
+    下一批还会被抽到。这时返回里还会带 ``angle_debt``: 你在这个项目当前还挂着的坐标, **下一批按它们写, 别再抽新的**。
+
+    ``project_isolation`` 是串项目的提示: 有可疑标记要说明并核对; 没发现或检查超时都不能声称已完整排除串项目。
+
+    这个工具出错会直接报错。存档失败必须让你知道 —— 稿子没进指纹库的话, 下次 check_drafts 会把同样的内容再放行
+    一次。看到报错就重试, 别当没事; 报"另一个写操作正在跑"(409)也是重试。带 ``identity_warning`` 时说明底稿没建成:
+    查重不受影响, 但发布后对不回来, 如实告诉用户。
+
+    ``flywheel_arm``: 把这场写作的 open_project (或 borrow_lessons) 返回里的 ``flywheel_arm`` **原样**传回来。
+    它决定这批稿子算进哪个对照组; 不传服务端会猜, 但同一项目同时开着两场时会猜错。
+    """
+    # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、只带 error 字段的结果, 而存档失败若被当成
+    # 成功, 稿子静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
                               flywheel_arm=flywheel_arm or None)
 
 
-def review_drafts(project_id: str, decisions: list[dict], user_words: str,
+def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
                   _user_id: str | None = None) -> dict:
-    """人审: 把【用户亲口给出的】审核结论记进库——通过, 或者打回。
-
-    这条记录在库里标的是 ``decision_source=human_via_agent``: **结论来自用户, 经你
-    转述写入**。它和 Streamlit 里真的点了按钮的 ``human`` 是分开记的 —— 下游一眼
-    就能看出这条是经代理之手来的。
-
-    什么时候调: **用户自己看过稿子并给了结论之后**。他说"这批可以发""第 3 条
-    重写""都过了"就是结论; 他只是让你写稿、定稿、导出, 那不是结论。
-
-    ⚠️ **不许替用户下结论, 不许自己编一句结论。** 这个动作会在库里落一条"某人审
-    过了"的记录, 并被下游当成人工反馈去校准评估模型。用户没表态就自己点通过,
-    灌进去的是伪造的正例, 比不记更糟。拿不准就问一句"这批是都通过, 还是有要
-    打回的"; 他没回答就不调。
-
-    ``user_words`` **必填**: 用户给出结论时的**原话**, 原样放进来(1 ~ 200 字, 比如
-    「这批可以发」「第 3 条重写, 其它过」)。它会存进 ``items.decision_note``, 给人
-    复核"这条通过是不是真有人说过"。缺了 / 空的 / 超长 → 返回 ``error``, **一条都
-    不写**。不要把你自己的话、也不要把整段对话塞进来。服务端另会记下决策距这批
-    稿子入库的秒数(``decided_within_s``): 入库几秒后就"审完", 一眼就看得出。
-
-    ``decisions`` 传 [{"version_id": "...", "decision": "approved"}, ...]
-    —— version_id 用 ``commit_drafts`` 返回的那些。
-    ``decision`` 只认两个值:
-      · ``approved``       —— 通过
-      · ``needs_revision`` —— 打回重写
-
-    **打回和通过一样重要。** 一个只记通过的审核历史等于没有反馈信号, 用户说
-    哪条不行就照实记 needs_revision, 不要只挑好的记。
-
-    审稿人恒为调用者本人, 不能替别人审 —— 所以签名里没有 reviewer 参数。
-
-    返回每条的 ``outcome``:
-      · ``recorded``   —— 记下了。``previous_status`` 是它之前的状态,
-                          ``previously_decided_by`` 是**上一个决定是谁下的**,
-                          不是"有没有人审过":
-                            ``human``           之前有人在工作台里亲手审过, 这次是
-                                                改判, 值得跟用户说一声
-                            ``human_via_agent`` 之前用户经代理给过结论(就是这个
-                                                工具记的), 这次也是改判, 同样要说
-                            ``auto_hard_rule``  硬规则违规, 机器打回的
-                            ``auto_dedup``      查重重生耗尽, 机器打回的
-                            ``system``          系统置位(如迭代后重置)
-                          后三个都**不是**人审 —— 人这次接手是正常流程, 别把它们
-                          说成"之前已经有人审过"
-      · ``not_found``  —— 这个 version_id 不在本项目里, 八成是 id 传错了
-      · ``invalid``    —— decision 不是那两个值之一
-      · ``failed``     —— 写库失败, detail 里是原因
-
-    ``reviewed`` 小于你传的条数就说明**有几条没记上**, 要如实告诉用户是哪几条,
-    不要把它当成全都记好了。
-    """
-    # 故意不包 _safe: 这是【写】操作, 而且写的是一条会流到下游评估模型里的
-    # 人工决策。写失败若报成功, 用户以为审过了, 而库里那条稿子永远停在 pending。
-    return core.review_drafts(core.sb(), project_id, decisions,
-                              user_words=user_words, user_id=_user_id)
-
-
-def export_drafts(project_id: str, batch_id: str | None = None,
-                  version_ids: list[str] | None = None,
-                  _user_id: str | None = None) -> dict:
-    """把已经 commit 的稿子导成 Excel, 用来粘进飞书表。
-
-    什么时候调: 用户说「导出」「给我个表」「要发了」。**必须先 commit_drafts** ——
-    只有入了库的稿子才有身份, 没身份就没有可归因的 lineage。
-
-    ``batch_id`` 用 commit_drafts 刚回的那个(最常用); 只导其中几篇时给
-    ``version_ids``。两个都不给会直接报错, 不会去猜。
-
-    返回值里:
-      · ``xlsx_base64`` —— 解码写成 ``filename`` 那个文件交给用户;
-      · ``columns``     —— 飞书表里要有的列名, **逐字相同**;
-      · ``preview``     —— 标题 + version_id, 用来核对导的是不是那一批。
-
-    ⚠️ 表里除了内容列还有六个 ``_source_autowriter_*`` / ``_ai_engine`` /
-       ``_exported_at`` 列。**别让用户删掉它们**, 也别只复制内容列 —— 那六列是
-       "这条笔记是谁写的哪一版"的唯一载体, 丢了就等于这篇稿子发出去之后的数据
-       再也回不到写作台。飞书表还没建这几列的话, 让用户先按 columns 建好。
-    """
-    # 同 commit_drafts: 不包 _safe。导出失败必须当场知道 —— 静默回个空表, 用户
-    # 会以为"这批没稿子"而不是"导出坏了"。
-    return core.export_drafts(core.sb(), project_id, batch_id=batch_id,
-                              version_ids=version_ids, user_id=_user_id)
+    """旧名, 和 ``score_drafts`` 完全一样(存档 + 参考分)。新版 skill 只调 score_drafts; 这个名字留着是为了还没升级
+    skill 的写手 —— 别在新对话里调它, 参数、返回值、怎么读分数都看 score_drafts 的说明。"""
+    # 同 score_drafts: 写操作, 不包 _safe。
+    return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
+                              flywheel_arm=flywheel_arm or None)
 
 
 INGEST_MAX_PER_CALL = 50
@@ -673,11 +613,11 @@ def _first(d: dict, keys: tuple) -> str:
 
 def ingest_published(project_id: str, drafts: list[dict], source: str = "",
                      dry_run: bool = False, _user_id: str | None = None) -> dict:
-    """把【已经发出去、但当时没走 commit_drafts】的稿子补进指纹库。**不过闸**。
+    """把【已经发出去、但当时没走 score_drafts 存档】的稿子补进指纹库。**不过闸**。
 
     什么时候调: 用户说「这批已经发了/上周发的, 没入库」「补入库」「补指纹」
     「把飞书表里的稿子补进去」, 或者把一批**已经发在小红书上**的稿子粘给你要
-    "入库"。跟 commit_drafts 分清: commit 是**定稿要发**的稿子(过闸、销角度);
+    "入库"。跟 score_drafts 分清: 那是**刚写完要交付**的稿子(过闸、销角度);
     这里是**已经发过的历史**, 它跟库里谁重复都改变不了事实, 拦它没有意义 ——
     不拦, 照收, 让下一批查重能看见它们。
 
@@ -1004,14 +944,13 @@ TOOLS = {
     "draw_angles":    (draw_angles,    True),
     "borrow_lessons": (borrow_lessons, True),
     "check_drafts":   (check_drafts,   True),
-    "commit_drafts":  (commit_drafts,  True),
+    "score_drafts":   (score_drafts,   True),
+    "commit_drafts":  (commit_drafts,  True),     # 旧名, 等同 score_drafts(D-120 过渡期, 老 skill 还在调)
     "judge_draft":    (judge_draft,    True),
     "repair_plan_for": (repair_plan_for, True),
     "list_banks":     (list_banks,     True),
-    "comment_repair_plan_for": (comment_repair_plan_for, True),
-    "judge_thread": (judge_thread, True),
-    "review_drafts":  (review_drafts,  True),
-    "export_drafts":  (export_drafts,  True),
+    "comments_for":   (comments_for,   True),
+    "score_comments": (score_comments, True),
     "ingest_published": (ingest_published, True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),

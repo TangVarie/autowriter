@@ -253,3 +253,35 @@ def match_note(note: Note, index: VersionIndex) -> Match:
 
 def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
     return {n.note_id: match_note(n, index) for n in notes}
+
+
+# ── 发布链接 → 查得到的键(2026-10-19, comments_for 按链接找帖子) ─────────────────────────────
+# TV 的 publish_url 是运营从飞书带过来的, 长短两种都有(10-19 实查 6168 条: 长链接 2302, xhslink 短链 3464, 其余
+# 抖音 / t.cn)。写手贴过来的可能是另一种, 所以两边都折成"平台 + 那一段 id"再比, 不比整串 URL(查询参数每次分享都不同)。
+# 短链和长链之间互相认不出(要跟一次跳转, 写作台不往外发请求), 那种情况 comments_for 会让写手把正文贴过来。
+_LINK_PATTERNS = (
+    ("xhs", re.compile(r"xiaohongshu\.com/(?:explore|discovery/item)/([0-9a-fA-F]{24})")),
+    ("xhslink", re.compile(r"xhslink\.(?:com|cn)/(?:[a-zA-Z]/)?([A-Za-z0-9_-]{4,32})")),
+    ("dy", re.compile(r"v\.douyin\.com/([A-Za-z0-9_-]{4,32})")),
+    ("dyv", re.compile(r"douyin\.com/(?:video|note)/([0-9]{8,32})")),
+    ("tcn", re.compile(r"t\.cn/([A-Za-z0-9]{4,32})")),
+)
+
+
+def link_key(url: str | None) -> tuple[str, str] | None:
+    """发布链接 → ``("平台:id", id)``; 认不出的回 None。
+
+    第二个值是拿去库里 ``ilike`` 粗筛的那一段: 只含字母数字和 ``_`` ``-``(上面的正则保证; 抖音短链里有这两个),
+    不会把 PostgREST 的过滤语法(逗号、括号、百分号)带进查询。粗筛之后必须再用本函数比一次键 —— ilike 不分大小写
+    (而且 ``_`` 在 like 里是通配), 短链的 id 分大小写。
+    小红书的 24 位 id 是十六进制, 统一成小写。
+    """
+    text = (url or "").strip()
+    if not text:
+        return None
+    for kind, rx in _LINK_PATTERNS:
+        m = rx.search(text)
+        if m:
+            token = m.group(1).lower() if kind == "xhs" else m.group(1)
+            return f"{kind}:{token}", token
+    return None

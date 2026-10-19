@@ -415,7 +415,12 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 用例 `tests/test_tvlink.py` / `tests/test_tv_sync.py`。**§3.4 的六列不再是回流的依赖**，
 `export_drafts` 照样带着它们（粘了不坏），但没人需要再手抄。
 
-### 3.8 入库判定 judge（2026-09-24，影子期）
+### 3.8 入库判定 judge（2026-09-24，影子期；2026-10-19 起给写手看）
+
+> **D-120（2026-10-19）**：判定结局不再是影子。`score_drafts`（`commit_drafts` 的新名）返回的 `judge.results` 每篇带
+> 参考分 `score` 和最多 3 条 `fixes`（`core.draft_score`：Jev 有把握 p≥0.7 的硬伤 −25、拿不准的 −8、没判出的硬约束 −10，
+> 正文太短不给分）。**仍然不拦**：written / rejected 口径不变，判不成照样存档。人审与导出两个工具撤了，评论按链接写
+> （`comments_for` / `score_comments`，§3.6 的人审流程只剩 core 里的函数）。下文"影子期"的表述按此读。
 
 **是什么。** JevforCoentent 仓 docs/00 #4 拍板：写作台的入库判定挂在 `commit_drafts` 内部，advisory，
 8 秒没回就跳过，答案进账本（TV 的 `note_feature_answers`，`subject_type='aw_version'`、

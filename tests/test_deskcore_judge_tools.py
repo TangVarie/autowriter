@@ -68,7 +68,7 @@ def test_judge_draft_posts_without_write_and_returns_the_redacted_view(wired):
     assert out["judge_status"] == "ok" and out["project"] == "TUGE_phase1" and out["category"] == "教育"
     assert out["plan"] == SERVICE["plan"] and out["hard_fails"] == SERVICE["hard_fails"] and out["profile"] == SERVICE["profile"]
     assert "ledger_rows" not in out, "账本行(含暗题)永远不到写手手里"
-    assert "影子期" in out["note"]
+    assert "不拦交付" in out["note"]
     (method, url, headers, body, timeout), = calls
     assert method == "POST" and url == "https://judge.example.invalid/judge_draft"
     assert headers == {"X-Judge-Key": "jk-admin"} and timeout[0] == 3.0 and 17.0 < timeout[1] <= 18.0, "查库花掉的时间从 18 s 里扣"
@@ -173,7 +173,7 @@ def test_list_banks_gets_with_the_server_key(wired):
 def test_tools_are_registered_and_need_identity():
     for name in ("judge_draft", "repair_plan_for", "list_banks"):
         assert name in tools.TOOLS and tools.TOOLS[name][1] is True, name
-    assert "影子期" in (tools.judge_draft.__doc__ or "") and "不要循环" in (tools.judge_draft.__doc__ or "")
+    assert "不是闸" in (tools.judge_draft.__doc__ or "") and "不要循环" in (tools.judge_draft.__doc__ or "")
 
 
 def test_build_tool_request_pins_write_and_rows():

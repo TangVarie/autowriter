@@ -1036,12 +1036,25 @@ def _restore_stash(client, stash: dict[int, list[dict]], indices) -> None:
 # 入库判定(judge) —— commit_drafts 在项目写锁之外调(2026-09-24, docs/deskcore.md §3.8)
 # ══════════════════════════════════════════════════════════════════════
 
-# 影子期(JevforCoentent docs/00 #4; docs/28 §7.3: 最低档也只是 revise, TV 不拦发布):
-# 判定只记录 —— 答案由 judge 写进 TV 账本, 结局挂在返回值上并落 batch_metrics ——
-# 不拦入库, 不改 written / rejected。这句话原样回给调用方模型: 返回里多了一块
-# hard_fails, 模型最自然的反应就是去改稿, 而影子期的判定还没过闸二, 不该驱动改稿。
-JUDGE_SHADOW_NOTE = ("影子期: 入库判定只记录(答案进 TV 账本), 不拦入库, 也不改 written / "
-                     "rejected 的口径。不要据此改稿、重写或重新提交; 判定失败或超时也不用重试。")
+# 不拦(JevforCoentent docs/00 #4; docs/28 §7.3: 最低档也只是 revise, TV 不拦发布)。
+# 2026-10-19 起(D-120, 盖过 D-119 J-07 的"留在影子期"): 存档后的判定**给写手看** —— 每篇一个参考分 + 最多
+# SCORE_MAX_FIXES 条修改建议。仍然**不拦**: 不改 written / rejected, 判不成存档照样成功。答案照旧由 judge 写进
+# TV 账本。这句话原样回给调用方模型, 它决定模型拿分数做什么: 说给用户听、按建议改一轮, 不循环、不重试。
+SCORE_NOTE = ("参考分: 不拦交付, 也不改 written / rejected。score 满分 100, 只看篇级硬约束(平台合规题 + 特征题库里的"
+              "合规题), 文笔好坏不在里面。fixes 是最该看的几条(sure=false 的是 Jev 拿不准的, 看一眼就行, 不一定要改)。"
+              "把每篇的分数和 fixes 照实告诉用户; 用户要改, 按 fixes 改完带 replaces_version_id 再调一次 score_drafts, "
+              "改一轮就够, 不要为了分数反复重写。judge_status 不是 ok 就说这篇这次没打成分, 不用重试。")
+JUDGE_SHADOW_NOTE = SCORE_NOTE          # 旧名, 老测试 / 老调用方还在 import
+
+# 参考分怎么算(写给人看的口径, 协议里同一句): 满分 100; Jev 有把握(p ≥ SCORE_SURE_P)的硬伤每条 -25,
+# 拿不准的每条 -8, 有硬约束没判出答案的每条 -10; 正文太短判不了的不给分(score=None)。
+# 线上 10-19 实查: 影子期判出的 7 条硬伤 p 全在 0.54~0.69 —— 一条都不算"有把握", 所以拿不准的必须单独一档,
+# 不然一个 0.55 的疑似就能把一篇好稿打到 75。
+SCORE_SURE_P = 0.7
+SCORE_MAX_FIXES = 3
+_SCORE_PENALTY_SURE = 25
+_SCORE_PENALTY_UNSURE = 8
+_SCORE_PENALTY_UNJUDGED = 10
 
 # 数据出境口径里唯一"未发布稿整篇不发"的品类(docs/00 #7)。一个写作台项目对着几个
 # TV 项目、品类又不一致时, 只要其中有它就按它报 —— 出境这件事上宁严勿松。
@@ -1217,12 +1230,45 @@ _JUDGE_ROW_KEYS = ("judge_status", "passed", "hard_fails", "calls", "written",
 _JUDGE_BLOCK_TEXT_MAX = 300
 
 
+def _is_sure(p) -> bool:
+    return isinstance(p, (int, float)) and not isinstance(p, bool) and p >= SCORE_SURE_P
+
+
+def draft_score(res: dict) -> dict:
+    """一篇的参考分与修改建议(口径见 SCORE_SURE_P 那段)。只在 judge_status=ok 时有意义; 其余回 {}。
+
+    返回 ``{"score", "fixes", "more_fixes"?, "unjudged"?, "why"?}``。fixes 来自 judge 的修改单(只说哪一句犯了哪条,
+    不给改法): 有把握的排前面, 同档按概率从高到低, 最多 SCORE_MAX_FIXES 条; 剩下的只报条数。
+    """
+    if res.get("judge_status") != judge_client.JUDGE_OK:
+        return {}
+    if res.get("invalid_reason"):
+        return {"score": None, "fixes": [], "why": "正文太短, 判不了"}
+    fails = [h for h in (res.get("hard_fails") or []) if isinstance(h, (list, tuple)) and len(h) >= 4]
+    sure = sum(1 for h in fails if _is_sure(h[3]))
+    unsure = len(fails) - sure
+    unjudged = int(res.get("unjudged") or 0)
+    score = max(0, 100 - _SCORE_PENALTY_SURE * sure - _SCORE_PENALTY_UNSURE * unsure
+                - _SCORE_PENALTY_UNJUDGED * unjudged)
+    plan = [e for e in (res.get("plan") or []) if isinstance(e, dict) and e.get("instruction")]
+    plan.sort(key=lambda e: (not _is_sure(e.get("p")), -(e.get("p") or 0)))
+    fixes = [{"sure": _is_sure(e.get("p")), "instruction": e["instruction"]} for e in plan[:SCORE_MAX_FIXES]]
+    out: dict = {"score": score, "fixes": fixes}
+    if len(plan) > SCORE_MAX_FIXES:
+        out["more_fixes"] = len(plan) - SCORE_MAX_FIXES
+    if unjudged:
+        out["unjudged"] = unjudged
+    return out
+
+
 def _judge_row(target: dict, res: dict) -> dict:
-    """一篇一行。空字段不带: 这块东西每次 commit 都回给调用方模型, 没接 judge 的部署
+    """一篇一行。空字段不带: 这块东西每次存档都回给调用方模型, 没接 judge 的部署
     一批 20 篇就是 20 行一模一样的空壳 —— 返回值越长, 越容易把协议挤出模型的注意力
-    (09-11 那次入库率掉到 22% 就是这个形状, 见 docs/deskcore.md §4.3)。"""
+    (09-11 那次入库率掉到 22% 就是这个形状, 见 docs/deskcore.md §4.3)。
+    参考分(``score`` / ``fixes``)排在最前面: 那是写手要看的; 后面几个键是给指标留的。"""
     row = {"index": target["index"], "version_id": target["version_id"],
            "judge_status": res.get("judge_status")}
+    row.update(draft_score(res))
     row.update({k: res[k] for k in _JUDGE_ROW_KEYS
                 if k != "judge_status" and res.get(k) not in (None, "", [], {})
                 and not (k == "elapsed_ms" and not res.get(k))})   # 0 = 根本没发, 不是"很快"
@@ -1241,7 +1287,7 @@ def _judge_block(rows: list[dict], skipped: list[dict], *, project: str | None =
     summary: dict[str, int] = {}
     for r in rows:
         summary[r["judge_status"]] = summary.get(r["judge_status"], 0) + 1
-    block = {"shadow": True, "note": JUDGE_SHADOW_NOTE, "project": project,
+    block = {"visible": True, "note": SCORE_NOTE, "project": project,
              "category": category, "summary": summary, "results": rows,
              "skipped": skipped}
     if detail:
@@ -1361,9 +1407,9 @@ def _judge_committed(client, project_id: str, targets: list[dict],
 # 以前写手要在自己机器上起 judge 仓的 judge.mcp_server(stdio, 本地 checkout + 一套 JUDGE_* env + 一把发到写手
 # 机器的 key); 现在并进 deskcore: 写手只有 deskcore 这一个 HTTP MCP、一把 deskcore key, 判定由 deskcore 用服务端的
 # 管理 key 转发给 judge。write / return_rows 钉死 false(judge_client.build_tool_request), 账本行(含暗题)永远不到
-# 写手手里; 项目号 / 品类按 tv_project_map 定(与 commit 的影子判定同一条路 _judge_project_context, 数据出境口径
+# 写手手里; 项目号 / 品类按 tv_project_map 定(与存档时的判定同一条路 _judge_project_context, 数据出境口径
 # docs/00 #7 由 judge 执行并回显在 policy)。仍然一次 LLM 调用都没有。
-JUDGE_TOOL_NOTE = ("影子期: 这是写后的参考判定, 不拦交付、不落账本。hard_fails / plan 拿去改稿, 改完最多再判一轮; "
+JUDGE_TOOL_NOTE = ("这是写后的深一层参考判定(score_drafts 存档时已经自动打过分), 不拦交付、不落账本。hard_fails / plan 拿去改稿, 改完最多再判一轮; "
                    "judge_status 不是 ok 时如实告诉用户判定这次没拿到, 查重和入库照常走。")
 
 
@@ -1495,7 +1541,8 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
             # 只留判定的结局, 不留题目细节 —— 答案本身在 TV 账本里, 这里要回答的是
             # "发出去了没有、怎么收场的"。
             "judge": [{"version_id": r.get("version_id"), "status": r.get("judge_status"),
-                       "passed": r.get("passed"),
+                       "passed": r.get("passed"), "score": r.get("score"),
+                       "fixes": len(r.get("fixes") or []) + int(r.get("more_fixes") or 0),
                        "hard_fails": [h[1] for h in (r.get("hard_fails") or [])
                                       if isinstance(h, (list, tuple)) and len(h) > 1],
                        "calls": r.get("calls"), "written": r.get("written"),
@@ -1666,6 +1713,268 @@ def judge_thread(client, project_id: str, post_title: str, post_body: str, comme
                                "kind": kind, "points": points, "max_named": max_named})
 
 
+# ── 按链接写评论(2026-10-19, D-120) ─────────────────────────────────────────────────────────────
+# 以前写评论要先 open_project, 再自己把帖子正文和评论位要求拼进 comment_repair_plan_for / judge_thread。现在
+# 写手在任何对话里贴一条发布链接(或贴帖子正文 + 说是哪个项目)就行: comments_for 从 TV 把帖子、已有评论、本项目
+# 管评论的规则和默认评论位一次拿齐; 模型写完调 score_comments, 整组一次判定, 带每条的修改建议。
+#
+# 默认评论位与 Jev 的 judge/comments.py::default_slots 同一组(提问 ×2 · 补充经验 ×1 · 贴主答疑 ×1, 不放背书位):
+# 字段名和闭集取值照抄那边 —— 写错一个取值 judge 会 422(slot.* 不在题库闭集里)。
+DEFAULT_COMMENT_SLOTS = (
+    {"id": "q1", "speech_act": ["提问"], "role": "读者位", "may_name_brand": False, "must_echo": False,
+     "value_ok": ["可行动信息", "判断依据", "无"], "min_detail": "无", "intent": "其他",
+     "note": "问一件帖子没写清的事"},
+    {"id": "q2", "speech_act": ["提问"], "role": "读者位", "may_name_brand": False, "must_echo": False,
+     "value_ok": ["可行动信息", "判断依据", "无"], "min_detail": "无", "intent": "其他",
+     "note": "问另一件帖子没写清的事, 别和 q1 问同一件"},
+    {"id": "exp", "speech_act": ["补充经验"], "role": "读者位", "may_name_brand": False, "must_echo": True,
+     "value_ok": ["可行动信息", "判断依据"], "min_detail": "模糊", "intent": "补充信息",
+     "note": "补一段和帖子相关的情境或做法, 不对品牌下结论, 不编造用过某产品的亲历"},
+    {"id": "reply", "speech_act": ["回复答疑"], "role": "贴主", "reply_to": "q1", "may_name_brand": True,
+     "must_echo": False, "value_ok": ["可行动信息"], "min_detail": "无", "intent": "补充信息",
+     "note": "贴主回答 q1, 给能用的信息"},
+)
+
+
+class CommentInputError(ValueError):
+    """score_comments 的参数不对(没有 text、slot id 认不出 / 重复、超过条数)。tools 层转成 InvalidInput → 400。"""
+
+
+COMMENT_RULE_PREFIX = "评论区"
+COMMENT_KINDS = ("product", "agency", "shop")      # judge 那边的 Literal, 写错会 422
+MAX_SCORED_COMMENTS = 20                            # judge ThreadRequest.comments 的上限
+_EXISTING_COMMENT_CHARS = 200
+_POST_BODY_CHARS = 6000            # judge 那边只看前 600 字; 给模型看的留长一些, 但别把超长帖整篇灌进对话
+
+COMMENT_SCORE_NOTE = ("评论检查: 只判不写库。passed=true 且 needs_review=false 才算这条过; fix 是必须改的(主要行为、点名品牌、"
+                      "接住帖子、细节四项), hints 只是参考, 不改不算没过。没过的按 fix 改一轮再调一次 score_comments, 不要循环。"
+                      "needs_review=true 交人工核实, 不能改成伪造的亲历。judge_status 不是 ok 就说这次没判成, 不能说通过。")
+
+
+def _tv_post_text(note: dict) -> tuple[str, str]:
+    title, body = (note.get("title") or "").strip(), (note.get("body") or "").strip()
+    if not body:
+        t2, body = tvlink.parse_raw(note.get("raw_content"))
+        title = title or t2
+    return title, body
+
+
+def _note_from_link(client, link: str) -> tuple[dict | None, str | None]:
+    """发布链接 → TV 的笔记(多条同链接取最近发布的那条)。回 ``(笔记, 认不出时的原因)``; 查库异常上抛。"""
+    key = tvlink.link_key(link)
+    if key is None:
+        return None, "认不出这条链接(只认小红书 / xhslink / 抖音 / t.cn 的发布链接)"
+    rows = [r for r in store.tv_notes_by_link_token(client, key[1])
+            if tvlink.link_key(r.get("publish_url")) == key]
+    if not rows:
+        return None, ("TV 里还没有这条链接(笔记每天同步一次; 短链和长链也互相认不出)。"
+                      "把帖子的标题和正文贴过来, 并告诉我是哪个项目")
+    rows.sort(key=lambda r: str(r.get("publish_time") or ""), reverse=True)
+    return rows[0], None
+
+
+def _project_for_note(client, note: dict, project_id: str | None, user_id) -> dict:
+    """笔记所在的 TV 项目 → 调用者能访问的写作台项目。不归调用者的一律 PermissionError(不回帖子内容, 也不回
+    TV 项目号 —— 拿着一把 key 挨个试链接, 不该能问出别人的项目号)。"""
+    tv_pid = str(note.get("project_id") or "")
+    targets = store.tv_targets_of(client, tv_pid) if tv_pid else []
+    ids = [str(t["project_id"]) for t in sorted(targets, key=lambda t: not t.get("ingest_target"))
+           if t.get("project_id")]
+    if project_id:
+        if str(project_id) not in ids:
+            raise PermissionError(
+                f"这条链接的笔记不属于你给的项目 {project_id}(tv_project_map 里没有这一对)。"
+                "是不是链接贴错了, 或者项目选错了? 帖子不在 TV 里对得上的话, 把正文贴过来、不带链接也行。")
+        return assert_project_access(client, project_id, user_id=user_id)
+    for pid in ids:
+        try:
+            return assert_project_access(client, pid, user_id=user_id)
+        except (PermissionError, ProjectNotFound):
+            continue
+    raise PermissionError(
+        "这条链接的笔记没有对到任何归你的写作台项目上(tv_project_map 里没有, 或者那个项目不归你)。"
+        "告诉我要写的是哪个项目, 并把帖子正文贴过来。")
+
+
+def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: str,
+                  post_body: str) -> tuple[dict | None, str, str, dict | None, dict | None]:
+    """评论要接的那篇帖子 → ``(项目, 标题, 正文, TV 笔记或 None, 缺东西时的回包或 None)``。
+
+    有链接先按链接找 TV(找到了按笔记反查项目、过归属闸); 找不到、或没给链接, 就用贴过来的正文 + project_id
+    (同样过闸)。两样都没有时回一份 ``resolved=false`` 的回包, 不报错 —— 那是正常的下一步。
+    用户贴了正文时以贴的为准(发布后可能改过), 链接只用来定项目和取已有评论。
+    """
+    link, project_id = (link or "").strip(), (project_id or "").strip()
+    post_title, post_body = (post_title or "").strip(), (post_body or "").strip()
+    note, why = (None, None)
+    if link:
+        note, why = _note_from_link(client, link)
+    if note is not None:
+        project = _project_for_note(client, note, project_id or None, user_id)
+        title, body = _tv_post_text(note)
+        if post_body:
+            title, body = post_title or title, post_body
+        return project, title, body, note, None
+    if post_body and project_id:
+        project = assert_project_access(client, project_id, user_id=user_id)
+        return project, post_title, post_body, None, None
+    need = []
+    if not post_body:
+        need.append("帖子的标题和正文")
+    if not project_id:
+        need.append("是哪个项目(list_projects 里的 project_id)")
+    return None, "", "", None, {
+        "resolved": False, "need": need,
+        "note": (why + "。" if why else "") + "请用户补上: " + "、".join(need) + "。补齐后再调一次。"}
+
+
+def _comment_rules(client, project_id: str, user_id) -> tuple[list[str], list[str]]:
+    """``(评论规则, 硬约束)``: content 以「评论区」开头的(任何 severity)+ 全部 hard。合规硬约束对评论一样管用。"""
+    hard, soft = store.shared_memories(client, project_id, user_id)
+    text = lambda m: (m.get("content") or "").strip()
+    comment = [text(m) for m in hard + soft if text(m).startswith(COMMENT_RULE_PREFIX)]
+    hard_only = [text(m) for m in hard if not text(m).startswith(COMMENT_RULE_PREFIX)]
+    return comment, hard_only
+
+
+def comments_for(client, *, user_id: str | None, link: str = "", project_id: str = "",
+                 post_title: str = "", post_body: str = "") -> dict:
+    """写评论之前一次拿齐: 帖子(按链接从 TV 找, 找不到就用贴过来的正文)、已有评论、本项目管评论的规则、默认评论位。
+
+    找不到帖子又没贴正文时**不报错**, 回 ``resolved=false`` + 一句该让用户补什么 —— 那是正常的下一步, 不是故障。
+    帖子所在的项目不归调用者时报 PermissionError, 不回帖子内容。归属闸在 ``_resolve_post`` 里, 两条路都过。
+    """
+    project, title, body, note, missing = _resolve_post(
+        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body)
+    if missing is not None:
+        return missing
+    source = "tv" if note is not None else "pasted"
+    comment_rules, hard_rules = _comment_rules(client, project["id"], user_id)
+    existing = []
+    if note is not None:
+        rows = store.tv_note_comments(client, str(note["note_id"]))
+        rows.sort(key=lambda r: (r.get("comment_order") is None, r.get("comment_order") or 0))
+        existing = [{"order": r.get("comment_order"), "role": r.get("comment_role"),
+                     "is_reply": bool(r.get("parent_comment_id")),
+                     "text": (r.get("content") or "").strip()[:_EXISTING_COMMENT_CHARS]}
+                    for r in rows if (r.get("content") or "").strip()]
+    out = {"resolved": True, "source": source, "project_id": project["id"],
+           "project_name": project.get("name"),
+           "post": {"title": title, "body": body[:_POST_BODY_CHARS]},
+           "existing_comments": existing,
+           "comment_rules": comment_rules, "hard_rules": hard_rules,
+           "slots": [dict(s) for s in DEFAULT_COMMENT_SLOTS],
+           "next_step": ("按 slots 每位写一条(贴主答疑那条回 q1), 守 hard_rules 和 comment_rules, 别和 existing_comments "
+                         "里已经有的问题重复; 写完把整组交给 score_comments(帖子参数和这次一样: link, 或 post_title / post_body + "
+                         "project_id; 每条评论带 slot 的 id)。")}
+    if note is not None:
+        out["note_id"] = note.get("note_id")
+        out["tier"] = note.get("tier")
+    return out
+
+
+def _slot_of(value, by_id: dict) -> dict | None:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value in by_id:
+        return dict(by_id[value])
+    return None
+
+
+def _thread_lines(entries) -> list[str]:
+    """整组的修改单条目是 ``{"slot", "why"}``(judge/comments.py::thread_repair_plan): 折成「位 q1: …」一句。"""
+    out = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        why = e.get("why") or e.get("instruction")
+        if isinstance(why, str) and why.strip():
+            out.append(f"位 {e['slot']}: {why}" if e.get("slot") else why)
+    return out
+
+
+_COMMENT_FIX_CHARS = 400            # judge 的单条修改单带整段题干, 一条能上千字; 一组 4 条 × 3 条修改单会把协议挤出注意力
+
+
+def _instructions(entries, limit: int) -> list[str]:
+    return [e["instruction"][:_COMMENT_FIX_CHARS] for e in (entries or [])
+            if isinstance(e, dict) and isinstance(e.get("instruction"), str)][:limit]
+
+
+def score_comments(client, *, user_id: str | None, comments: list, link: str = "", project_id: str = "",
+                   post_title: str = "", post_body: str = "", kind: str = "product",
+                   max_named: int = 1) -> dict:
+    """一组候选评论整体判一次(judge /judge_thread), 回每条过没过和修改建议。只判, 不写任何库。
+
+    ``comments`` 每条 ``{"slot": "q1" | {评论位}, "text": "...", "reply_to_text"?}``: slot 写 comments_for 给的 id 就行;
+    贴主答疑那条不带 reply_to_text 时, 自动用它 reply_to 的那一位的文字。帖子同 comments_for: 给 link 从 TV 取,
+    或给 post_body + project_id。
+    """
+    if not isinstance(comments, list) or not comments:
+        raise CommentInputError("comments 不能为空: 每条 {slot, text}")
+    project, title, body, _note, missing = _resolve_post(
+        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body)
+    if missing is not None:
+        return missing
+    if kind not in COMMENT_KINDS:
+        raise CommentInputError(f"kind 只能是 {' / '.join(COMMENT_KINDS)}")
+    if len(comments) > MAX_SCORED_COMMENTS:
+        raise CommentInputError(f"一次最多判 {MAX_SCORED_COMMENTS} 条评论, 这次给了 {len(comments)} 条")
+    by_id = {s["id"]: s for s in DEFAULT_COMMENT_SLOTS}
+    cands = []
+    for i, c in enumerate(comments):
+        if not isinstance(c, dict) or not (c.get("text") or "").strip():
+            raise CommentInputError(f"第 {i + 1} 条评论没有 text")
+        slot = _slot_of(c.get("slot"), by_id)
+        if c.get("slot") not in (None, "") and slot is None:
+            raise CommentInputError(f"第 {i + 1} 条评论的 slot {c.get('slot')!r} 不是 comments_for 给的评论位 id"
+                             f"({' / '.join(by_id)}); 自定义评论位要传整个对象")
+        cands.append({"text": c["text"].strip(), "slot": slot, "reply_to_text": (c.get("reply_to_text") or "").strip()})
+    ids = [c["slot"]["id"] for c in cands if c["slot"] and c["slot"].get("id")]
+    if len(ids) != len(set(ids)):
+        raise CommentInputError("同一个评论位只能有一条(slot id 重复了): 想多写几条同类的, 分几次判, 或者给它们不同的 id")
+    text_by_slot = {c["slot"]["id"]: c["text"] for c in cands if c["slot"]}
+    payload_comments = []
+    for c in cands:
+        slot = c["slot"]
+        reply_to_text = c["reply_to_text"] or (text_by_slot.get(slot.get("reply_to"), "") if slot else "")
+        item = {"text": c["text"], "role": (slot or {}).get("role", "读者位"), "reply_to_text": reply_to_text}
+        if slot:
+            item["slot"] = slot
+        payload_comments.append(item)
+    res = _comment_tool_call(client, project["id"], "/judge_thread",
+                             {"post_title": title, "post_body": body[:_POST_BODY_CHARS], "comments": payload_comments,
+                              "kind": kind, "points": None, "max_named": max_named})
+    head = {"judge_status": res.get("judge_status"), "project_id": project["id"],
+            "note": COMMENT_SCORE_NOTE}
+    if res.get("judge_status") != judge_client.JUDGE_OK:
+        return {**head, "detail": res.get("detail")}
+    rows = []
+    for i, (c, v) in enumerate(zip(cands, res.get("comments") or [])):
+        v = v if isinstance(v, dict) else {}
+        row = {"index": i, "slot": (c["slot"] or {}).get("id"), "passed": bool(v.get("passed")),
+               "needs_review": bool(v.get("needs_review"))}
+        fix = _instructions(v.get("plan"), SCORE_MAX_FIXES)
+        hints = _instructions(v.get("hints"), 2)
+        if fix:
+            row["fix"] = fix
+        if hints:
+            row["hints"] = hints
+        rows.append(row)
+    passed = sum(1 for r in rows if r["passed"])
+    thread_fix = _thread_lines(res.get("plan"))
+    thread_hints = _thread_lines(res.get("hints"))
+    out = {**head, "passed": bool(res.get("passed")), "needs_review": bool(res.get("needs_review")),
+           "summary": {"comments": len(rows), "passed": passed,
+                       "needs_review": sum(1 for r in rows if r["needs_review"])},
+           "comments": rows}
+    if thread_fix:
+        out["thread_fix"] = thread_fix[:SCORE_MAX_FIXES]
+    if thread_hints:
+        out["thread_hints"] = thread_hints[:2]
+    return out
+
+
 def commit_drafts(client, project_id: str, drafts: list[dict],
                   *, user_id: str | None = None, flywheel_arm: str | None = None) -> dict:
     """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
@@ -1699,13 +2008,19 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     加一版(version_num+1, best_version_id 指过去); 被拒或半途异常就把指纹原样
     放回。不销角度(旧版已经销过)、不计 unattributed。
 
-    ── 2026-09-24: 入库判定(judge, 影子期) ───────────────────────────────
+    ── 2026-09-24: 入库判定(judge) ───────────────────────────────────────
     真的建成了 versions 行的那几篇, 入库完成、**项目写锁放掉之后**逐篇发给 judge
     (``judge_client``), 结局挂在返回值的 ``judge`` 上, 答案由 judge 写进 TV 账本。
-    影子期只记不拦: ``written`` / ``rejected`` / ``version_ids`` 的口径一个字不变,
+    不拦: ``written`` / ``rejected`` / ``version_ids`` 的口径一个字不变,
     判定失败、超时、没配, 入库照样成功。返回值另带 ``elapsed_ms`` / ``phase_ms``,
     同一份数落进 ``batch_metrics``(meta.mode='deskcore_commit')攒样本。
     覆盖面与位置的理由见 docs/deskcore.md §3.8。
+
+    ── 2026-10-19: 存档 + 参考分(D-120) ─────────────────────────────────
+    写手不再"调 commit_drafts": 模型写完自动调 ``score_drafts``(本函数的新入口名), 存档与打分一次做完。
+    判定结局不再是影子 —— ``judge.results`` 每篇带 ``score`` / ``fixes``(``draft_score``), 给写手看,
+    仍然不拦。人审(review_drafts)和导出(export_drafts)两个工具撤了: 定稿由写手贴进飞书, 发布后
+    tv-sync 按内容对回来。
     """
     started = time.monotonic()
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
@@ -2087,13 +2402,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
                                   "不存在, migrations/001 可能没跑)。并发 check/commit 时"
                                   "可能有撞车的稿子一起进库。")
-            # 审计 A-01: 入库之后模型最常犯的下一步是紧接着自己调 review_drafts。
-            # 把纪律写进返回值, 让它在最容易犯错的那一刻就在眼前。只在真有东西可审时说
-            # (codex review on #94, P2): 整批被闸拒、written=0 时没有版本, 说「待审」会让模型去
-            # 等 / 审不存在的稿子, 和 rejected 的结论打架。
+            # 存档之后的下一步写进返回值(D-120: 人审和导出两个工具已经撤了, 模型最容易犯的错变成"让用户导出 / 等用户
+            # 说定稿")。只在真存进去了时说(codex review on #94, P2 同一个理由): written=0 时没有版本可说。
             if out.get("written"):
-                out["next_step"] = ("这批现在是「待审」。用户读完稿子、亲口给出结论之前"
-                                    "不要调 review_drafts; 调的时候把他的原话放进 user_words。")
+                out["next_step"] = ("这批已存档。把 judge.results 里每篇的 score 和 fixes 照实告诉用户(不拦交付)。"
+                                    "用户要改哪篇: 改完带 replaces_version_id 再调 score_drafts。定稿由用户自己贴进飞书, "
+                                    "发出去之后系统按内容自动对回来 —— 不用导出, 也不用再调别的工具。")
             # ⚠️ 这里原来是 `return out`。改成落到 with 块外面去, 是为了让下面的入库判定
             #    【不在】项目写锁里、也【不在】这个 try 里(设计审查 2026-09-23 §5):
             #    · 在 try 里: 判定一抛, 下面的 except 会把已替换稿的旧指纹无条件放回 ——
@@ -2107,7 +2421,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             raise
     commit_ms = _ms_since(started) - lock_wait_ms      # 各段可加: lock_wait + commit + judge ≈ total
 
-    # ── 入库判定(影子期): 锁已经放了, 恢复指纹的那个 try 也出来了 ─────────────
+    # ── 入库判定(参考分): 锁已经放了, 恢复指纹的那个 try 也出来了 ─────────────
     # 到这里入库已经成功, 下面任何一步都不许把它变成失败: 判定自己不抛
     # (_judge_committed 内部逐篇兜底), 外面再兜一层, 兜到的也只记进 out["judge"]。
     judge_started = time.monotonic()

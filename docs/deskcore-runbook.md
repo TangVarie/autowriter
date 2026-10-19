@@ -774,8 +774,12 @@ quarantine，那条笔记连正文带指标一起进不了库。`export_drafts` 
 
 ```
 open_project（简报自带 lessons）→ draw_angles(n=20) → 生成 20 篇
-             → check_drafts → commit_drafts（交付即入库，改稿带 replaces_version_id）→ export_drafts
+             → check_drafts → score_drafts（交付即存档 + 参考分，改稿带 replaces_version_id）
+             → 写手把定稿贴进飞书（不再导出，D-120）
 ```
+
+> 2026-10-19（D-120）：`export_drafts` / `review_drafts` 已从 MCP 撤下，下面第 6 条改成"发布后看 `tv_note_links`
+> 有没有对上"（`python -m deskcore.cli tv-sync --dry-run` 或直接查 `autowriter.tv_note_links`）。
 
 然后验六件事：
 

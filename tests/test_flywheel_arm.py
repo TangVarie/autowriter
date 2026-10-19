@@ -259,11 +259,13 @@ def test_the_commit_tool_passes_the_arm_through(monkeypatch):
     seen = {}
     monkeypatch.setattr(core, "sb", lambda: object())
     monkeypatch.setattr(core, "commit_drafts", lambda c, pid, drafts, **kw: seen.update(kw) or {})
-    tools.commit_drafts(PID, [], flywheel_arm="explore", _user_id=ME)
-    assert seen["flywheel_arm"] == "explore"
-    tools.commit_drafts(PID, [], _user_id=ME)
-    assert seen["flywheel_arm"] is None
-    for fn in (tools.open_project, tools.borrow_lessons, tools.commit_drafts):
+    for tool in (tools.score_drafts, tools.commit_drafts):      # commit_drafts: D-120 过渡期的旧名
+        seen.clear()
+        tool(PID, [], flywheel_arm="explore", _user_id=ME)
+        assert seen["flywheel_arm"] == "explore"
+        tool(PID, [], _user_id=ME)
+        assert seen["flywheel_arm"] is None
+    for fn in (tools.open_project, tools.borrow_lessons, tools.score_drafts):
         assert "flywheel_arm" in (fn.__doc__ or "") and "原样" in (fn.__doc__ or ""), fn.__name__
 
 

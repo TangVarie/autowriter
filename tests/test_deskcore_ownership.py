@@ -156,7 +156,11 @@ UNGATED_WITH_REASON = {
     "flywheel_arm": "纯函数: 对 (project_id, user_id, 北京日期) 取哈希定飞轮臂, 不读写库; 调用方 borrow_lessons / build_writing_brief / commit_drafts 都已过归属闸",
     "_borrow_arm": "借卡时定臂并记进进程内存 (不读写库), 只被 _borrow_for_brief 调, 其调用方 borrow_lessons / build_writing_brief 已过归属闸",
     "batch_arm": "入库时取借卡那次的臂 (进程内存, 不读写库), 只被 commit_drafts 调, 它已过归属闸",
-    "_comment_tool_call": "只被已过归属闸的 comment_repair_plan_for / judge_thread 调用；项目和品类由服务端查询",
+    "_comment_tool_call": "只被已过归属闸的 comment_repair_plan_for / judge_thread / score_comments 调用；项目和品类由服务端查询",
+    "comments_for": "归属闸在 _resolve_post 里(两条路都过 assert_project_access: 按链接反查到的项目、或调用方给的 project_id), "
+                    "过闸之前不读规则、不读评论",
+    "score_comments": "同 comments_for: 先经 _resolve_post 过归属闸, 之后才发判定",
+    "_comment_rules": "私有辅助函数, 只被已过闸(_resolve_post)的 comments_for 调用; 只读本项目规则",
     "_cross_project_shadow": "只被已过闸的 commit_drafts 尾部调用；只读当前调用者名下项目的影子信号",
     "_cross_project_shadow_bounded": "私有超时包装，调用者 commit_drafts 已过归属闸，失败不改写入结果",
     "assert_project_access": "它【就是】那道闸",

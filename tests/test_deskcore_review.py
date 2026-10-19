@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 import db
 from deskcore import core
@@ -170,43 +171,15 @@ def test_previously_decided_by_can_be_a_machine(source):
     assert r["previously_decided_by"] != db.DecisionSource.HUMAN, "非空 ≠ 人审过"
 
 
-def test_the_docs_spell_out_every_source_this_field_can_carry():
-    """⚠️ 这条钉的是**文档**, 因为这个字段唯一的读者是模型。
-
-    上一条证明了机器来源真的会出现在返回值里；模型要不要跟用户说"之前有人审
-    过", 全凭工具 docstring 和 `protocol.md` 那两段话。所以每加一种
-    `DecisionSource`, 这两处就必须跟着点名 —— 少点一种, 模型对那一种的解释就
-    只能靠猜。
-    """
-    import re
-    from pathlib import Path
-
+def test_review_and_export_are_no_longer_writer_tools():
+    """D-120(2026-10-19): 人审和导出两个工具从 MCP 撤了 —— 定稿由写手贴进飞书, 发布后 tv-sync 按内容对回来。
+    core.review_drafts 留着(上面几条测它的口径), 但模型再也调不到它; 以前那条"docstring / 协议要点名每一种
+    previously_decided_by 来源"的测试随工具一起删了: 没有人再读那段说明。"""
     from deskcore import tools
+    assert "review_drafts" not in tools.TOOLS and "export_drafts" not in tools.TOOLS
+    proto = Path(core.__file__).with_name("protocol.md").read_text(encoding="utf-8")
+    assert "`review_drafts`" not in proto and "`export_drafts`" not in proto
 
-    texts = {
-        "tools.review_drafts 的 docstring": tools.review_drafts.__doc__,
-        "protocol.md": Path(core.__file__).with_name(
-            "protocol.md").read_text(encoding="utf-8"),
-    }
-    # ⚠️ protocol.md 这次刻意没改(审计 A-01, 2026-10-09): 它的每一个字都盖进
-    # protocol_version, 改一行就逼所有写手重新导入 skill。human_via_agent 先只在
-    # 工具 docstring(服务端, 永远是最新的)里解释; 下次正文真要改版时一起补进去,
-    # 补了就把这个例外删掉。
-    _not_yet_in_protocol = {db.DecisionSource.HUMAN_VIA_AGENT}
-    for where, text in texts.items():
-        said = [p for p in re.split(r"\n\s*\n", text)
-                if "previously_decided_by" in p]
-        assert said, f"{where} 里根本没解释 previously_decided_by"
-        blob = "\n".join(said)
-        for src in sorted(db._DECISION_SOURCES):
-            if where == "protocol.md" and src in _not_yet_in_protocol:
-                continue
-            assert src in blob, f"{where} 没说 {src} 这种来源是什么意思"
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 2 · 拒绝的那几种情况, 一行都不许碰
-# ══════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("bad", ["pending", "approve", "", "ok", "APPROVED"])
 def test_only_two_decisions_are_accepted(bad):

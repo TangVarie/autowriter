@@ -8,8 +8,6 @@
 
 from __future__ import annotations
 
-import base64
-
 import anyio
 import pytest
 
@@ -73,19 +71,20 @@ def test_the_whole_protocol_end_to_end(env):
     keys = [a["angle_key"] for a in r["angles"]]
     assert len(set(keys)) == 3
 
-    # ── 3. 查重 → 定稿入库(带坐标) ──────────────────────────────────────
+    # ── 3. 查重 → 存档 + 参考分(带坐标) ─────────────────────────────────
     drafts = [{"title": t, "body": b, "angle_key": k} for (t, b), k in zip(BODIES, keys)]
     r = call("check_drafts", project_id=pid, drafts=drafts)
     assert r["summary"]["total"] == 3 and r["summary"]["reject"] == 0
-    r = call("commit_drafts", project_id=pid, drafts=drafts)
+    r = call("score_drafts", project_id=pid, drafts=drafts)
     assert r["written"] == 3 and r["rejected"] == []
     assert r["unattributed"] == 0 and "unattributed_warning" not in r
     assert r["consumed_angles"] == 3, r
     assert len(r["version_ids"]) == 3 and r["batch_id"]
     assert "gate_summary" in r
+    assert r["judge"]["visible"] is True and "飞书" in r["next_step"], "D-120: 分数给写手看, 下一步是贴飞书"
     batch_id, vids = r["batch_id"], r["version_ids"]
 
-    # ── 4. 跳过 check 直接再提交同一批: 一条都进不去 ─────────────────────
+    # ── 4. 跳过 check 直接再提交同一批: 一条都进不去(旧名 commit_drafts 走的是同一条路) ──────
     r = call("commit_drafts", project_id=pid, drafts=[{**d, "angle_key": None} for d in drafts])
     assert r["written"] == 0
     assert [x["index"] for x in r["rejected"]] == [0, 1, 2]
@@ -113,36 +112,13 @@ def test_the_whole_protocol_end_to_end(env):
     r = call("check_drafts", project_id=pid, drafts=[published[0]])
     assert r["summary"]["reject"] == 1
     # 台账不受影响: 补历史不销角度, 漏斗块下面还是 3 发 3 销
-    r = call("commit_drafts", project_id=pid, drafts=[published[1]])
-    assert r["written"] == 0, "同一篇已在指纹库里, commit 也塞不进去"
+    r = call("score_drafts", project_id=pid, drafts=[published[1]])
+    assert r["written"] == 0, "同一篇已在指纹库里, 存档也塞不进去"
 
-    # ── 5. 导出 → 人审 ───────────────────────────────────────────────────
-    # 导出走 PostgREST 的 embedded join(items → versions / batches); 假库不会
-    # 自己嵌, 这里手动补上那一层(同 test_deskcore_export 的回环测试)。
-    for row in fake.rows["items"]:
-        row["versions"] = [v for v in fake.rows["versions"] if v["item_id"] == row["id"]]
-        row["batches"] = {"project_id": pid}
-    r = call("export_drafts", project_id=pid, batch_id=batch_id)
-    assert r["filename"].endswith(".xlsx")
-    assert base64.b64decode(r["xlsx_base64"])[:2] == b"PK"
-    # review 走 versions → items!inner → batches!inner 的嵌套查询, 假库同样要手动嵌。
-    items_by_id = {i["id"]: i for i in fake.rows["items"]}
-    for v in fake.rows["versions"]:
-        it = items_by_id[v["item_id"]]
-        v["items"] = {"id": it["id"], "status": it["status"],
-                      "decision_source": it.get("decision_source"),
-                      "batch_id": it["batch_id"], "batches": {"project_id": pid}}
-    r = call("review_drafts", project_id=pid,
-             decisions=[{"version_id": vids[0], "decision": "approved"},
-                        {"version_id": vids[1], "decision": "needs_revision"}],
-             user_words="第一条可以发, 第二条重写")
-    assert r["reviewed"] == 2
-    statuses = {i["status"] for i in fake.rows["items"]}
-    assert statuses == {"approved", "needs_revision", "pending"}
-    # 审计 A-01: 工具这条路记的是「经代理转述」, 原话一起落库
-    reviewed = [i for i in fake.rows["items"] if i["status"] != "pending"]
-    assert {i["decision_source"] for i in reviewed} == {"human_via_agent"}
-    assert {i["decision_note"] for i in reviewed} == {"第一条可以发, 第二条重写"}
+    # ── 5. 导出 / 人审已经撤了(D-120): 两个工具名都是 404, 不是悄悄成功 ─────────
+    for gone in ("export_drafts", "review_drafts"):
+        r = client.post(f"/tool/{gone}", json={"project_id": pid}, headers=H)
+        assert r.status_code == 404, (gone, r.status_code, r.text[:200])
 
     # ── 6. /health 带漏斗块, 且这一批全销账 → 不红 ───────────────────────
     h = client.get("/health").json()
@@ -170,11 +146,13 @@ def test_mcp_tool_surface_matches_the_protocol():
         assert not any(k.startswith("_") for k in t.inputSchema.get("properties", {})), t.name
     assert "protocol_version" in (A_._mcp.instructions or "")
     assert "取完整协议" not in (A_._mcp.instructions or "")
-    # commit_drafts 的说明要提到新键 —— 模型只看这个
-    assert "unattributed" in by["commit_drafts"].description
-    assert "pre_commit" in by["commit_drafts"].description
+    # score_drafts 的说明要提到新键 —— 模型只看这个
+    assert "unattributed" in by["score_drafts"].description
+    assert "pre_commit" in by["score_drafts"].description
+    assert "replaces_version_id" in by["score_drafts"].description and "飞书" in by["score_drafts"].description
+    assert "score_drafts" in by["commit_drafts"].description, "旧名要指向新名"
     assert "不过闸" in by["ingest_published"].description
-    # 审计 A-01: user_words 在 schema 里是**必填**, 模型省不掉它
-    rd = by["review_drafts"].inputSchema
-    assert "user_words" in rd["properties"] and "user_words" in rd.get("required", []), rd
-    assert "human_via_agent" in by["review_drafts"].description
+    # D-120: 人审 / 导出不再暴露给模型
+    assert "review_drafts" not in by and "export_drafts" not in by
+    cf = by["comments_for"].inputSchema["properties"]
+    assert "link" in cf and "skill_version" in cf and "_user_id" not in cf

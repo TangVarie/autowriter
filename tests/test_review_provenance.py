@@ -81,15 +81,12 @@ def _decisions() -> list[dict]:
 # 1 · 工具这条路写的是 human_via_agent + 原话 + 距入库秒数
 # ══════════════════════════════════════════════════════════════════════
 
-def test_tool_records_human_via_agent_with_the_users_words(monkeypatch):
-    """走 ``tools.review_drafts``(MCP 暴露的那个), 不是直接调 core —— 要验的正是
-    工具入口把 user_words 传下去了。"""
+def test_review_records_human_via_agent_with_the_users_words():
+    """core.review_drafts 的口径(D-120 起它不再是 MCP 工具, 但 Streamlit 之外留下的这条写路径口径不变)。"""
     created = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
     c = _client(version_created_at=created)
-    monkeypatch.setattr(core, "sb", lambda: c)
 
-    out = tools.review_drafts(PROJ, _decisions(), user_words="  这批可以发, 第二条重写  ",
-                              _user_id=ME)
+    out = core.review_drafts(c, PROJ, _decisions(), user_words="  这批可以发, 第二条重写  ", user_id=ME)
 
     assert out["reviewed"] == 2
     assert [r["outcome"] for r in out["results"]] == ["recorded", "recorded"]
@@ -134,9 +131,9 @@ def test_unparseable_version_time_is_also_null():
     assert _row(c, ITEM_A).get("decided_within_s") is None
 
 
-def test_commit_drafts_tells_the_model_not_to_review_on_its_own(monkeypatch):
-    """入库之后模型最常犯的下一步就是紧接着自己调 review_drafts —— 纪律要出现在
-    返回值里, 在最容易犯错的那一刻眼前。"""
+def test_score_drafts_next_step_points_to_feishu_not_to_review(monkeypatch):
+    """D-120: 存档之后的下一步是"把分数告诉用户、定稿贴飞书", 不再有人审 / 导出 —— 返回值里不许再提那两个工具。
+    存档的 item 仍然是 pending、不盖决策戳(那条纪律没变)。"""
     from deskcore import store as _store
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
     c = FakeClient(rows={"projects": [
@@ -148,10 +145,11 @@ def test_commit_drafts_tells_the_model_not_to_review_on_its_own(monkeypatch):
     out = core.commit_drafts(c, PROJ, [{"title": "一条新稿子的标题", "body": "正文" * 40}],
                              user_id=ME)
     assert out["written"] == 1
-    assert "待审" in out["next_step"] and "review_drafts" in out["next_step"] \
-        and "user_words" in out["next_step"], out["next_step"]
+    step = out["next_step"]
+    assert "score" in step and "飞书" in step and "replaces_version_id" in step, step
+    assert "review_drafts" not in step and "export_drafts" not in step, step
     assert _store.DESKCORE_ITEM_STATUS == "pending"
-    # 整批被原子重查拒掉 → 没有版本可审, 不许再说「待审」(codex review on #94, P2)
+    # 整批被原子重查拒掉 → 没有版本可说(codex review on #94, P2)
     c.rpc_impl["deskcore_commit_fingerprints"] = lambda args: [
         {"idx": i, "status": "rejected", "collided_with": "someone-else", "detail": "撞车"}
         for i in range(len(args.get("_rows") or []))]
@@ -186,17 +184,10 @@ def test_exactly_200_chars_is_still_fine():
     assert _row(c, ITEM_A)["decision_note"] == "过" * 200
 
 
-def test_the_tool_signature_makes_user_words_mandatory(monkeypatch):
-    """MCP 层按签名生成 schema; 没有默认值的参数就是必填 —— 模型省不掉它。"""
-    import inspect
-    p = inspect.signature(tools.review_drafts).parameters["user_words"]
-    assert p.default is inspect.Parameter.empty
-    assert p.annotation in (str, "str")
-    c = _client()
-    monkeypatch.setattr(core, "sb", lambda: c)
-    with pytest.raises(TypeError):
-        tools.review_drafts(PROJ, _decisions(), _user_id=ME)      # noqa: 故意漏参
-    assert c.calls == []
+def test_review_is_no_longer_reachable_from_the_writer_side():
+    """D-120: review_drafts 不在 MCP 工具表里了 —— 模型再也没有"替用户点通过"的入口。"""
+    assert "review_drafts" not in tools.TOOLS
+    assert not hasattr(tools, "review_drafts")
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -4,7 +4,8 @@
 skill 自己核版本 (get_protocol) 靠模型愿不愿意调, 更老的 skill 连 protocol_version 那一行都没有。服务端每次都在,
 所以由它来抽查:
 
-  · 入口工具报版本: ``open_project(skill_version=…)`` / ``get_protocol(local_version=…)`` 带 skill 里 protocol_version
+  · 入口工具报版本: ``open_project(skill_version=…)`` / ``comments_for(skill_version=…)`` / ``get_protocol(local_version=…)``
+    带 skill 里 protocol_version
     那一行的 12 位值。工具说明随服务端更新 (MCP tools/list 现取), 所以已经装好的 skill 也会照新说明传 ——
     **不改协议、不改 skill 文件**, 写手不用为这个再导一次。
   · 每个写手 (按 key 映射到的 user_id) 记最近一次报的版本。没报 → 先看 12 小时内有没有报过; 没有就记「没核到」。
@@ -34,7 +35,7 @@ UPDATE_URL = ("https://github.com/TangVarie/autowriter/tree/claude/xhs-content-w
 UPDATE_COMMAND = "更新技能/bywood-writing-desk"
 
 UP_TO_DATE, OUTDATED, UNKNOWN = "up_to_date", "outdated", "unknown"
-ENTRY_TOOLS = frozenset({"open_project", "get_protocol"})
+ENTRY_TOOLS = frozenset({"open_project", "get_protocol", "comments_for"})   # comments_for: 写评论不用先 open_project
 RECORD_TTL_S = 12 * 3600       # 入口工具没带版本时, 12 小时内报过的那次算数
 REMIND_EVERY_S = 30 * 60       # 抽查提醒: 同一个人 30 分钟最多一次
 HEALTH_WINDOW_S = 24 * 3600

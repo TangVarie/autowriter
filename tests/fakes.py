@@ -87,6 +87,10 @@ class FakeQuery:
         self.filters.append(("lte", key, value))
         return self
 
+    def ilike(self, key, pattern):
+        self.filters.append(("ilike", key, pattern))
+        return self
+
     def is_(self, key, value):
         # ``.not_.is_(k, "null")`` 与 ``.is_(k, "null")`` 是一对反义, 假件要分开
         self.filters.append(("isnot" if self._negate_next else "is", key, value))
@@ -175,6 +179,16 @@ class FakeClient:
     def table(self, name):
         return FakeQuery(self, name)
 
+    def schema(self, name):
+        """``sb.schema("truth_vault").table("notes")`` → 假库里的 ``truth_vault.notes`` 表(带 schema 前缀的键)。"""
+        client = self
+
+        class _Schema:
+            @staticmethod
+            def table(t):
+                return FakeQuery(client, f"{name}.{t}")
+        return _Schema()
+
     def rpc(self, name, args):
         self.rpc_calls.append((name, args))
         impl = self.rpc_impl.get(name)
@@ -228,6 +242,11 @@ class FakeClient:
             return cur is None
         if kind == "isnot":
             return cur is not None
+        if kind == "ilike":
+            # PostgREST ilike: % 任意串, _ 单个字符, 不分大小写
+            import re as _re
+            rx = "".join(".*" if ch == "%" else "." if ch == "_" else _re.escape(ch) for ch in value)
+            return cur is not None and _re.fullmatch(rx, str(cur), _re.I | _re.S) is not None
         raise AssertionError(f"假件不认识这个过滤器: {kind}")
 
     def _execute(self, q: FakeQuery):

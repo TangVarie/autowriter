@@ -100,12 +100,12 @@ def test_someone_elses_project_is_refused(fake):
 
 # ── 协议与说明: 模型只看这两处 ────────────────────────────────────────────
 
-def test_protocol_tells_the_model_when_this_is_not_commit_drafts():
+def test_protocol_tells_the_model_when_this_is_not_score_drafts():
     body, _ = T.protocol_text()
     assert "`ingest_published`" in body
     sec = body.split("`ingest_published`", 1)[1][:1200]
     assert "不过闸" in sec and "50" in sec and "dry_run" in sec
-    assert "commit_drafts" in sec or "commit" in sec, "要讲清和 commit 的区别"
+    assert "score_drafts" in sec, "要讲清和 score_drafts(交付时的存档)的区别"
     # 请求→工具 那张表里也要有一行
     table_rows = [l for l in body.splitlines() if l.startswith("|") and "ingest_published" in l]
     assert table_rows and "已经发出去" in table_rows[0]
@@ -119,7 +119,7 @@ def test_protocol_tells_the_model_when_this_is_not_commit_drafts():
 
 def test_tool_docstring_covers_the_operating_rules():
     doc = T.ingest_published.__doc__
-    for needle in ("不过闸", "50", "dry_run", "重复调是安全的", "不要重传", "commit_drafts",
+    for needle in ("不过闸", "50", "dry_run", "重复调是安全的", "不要重传", "score_drafts",
                    "半途失败不报错", "先** backfill", "每条都要有正文"):
         assert needle in doc, needle
     assert "出错会直接报错" not in doc, "codex #81 P1: 不能再承诺'出错一律抛'"

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import db
@@ -2078,6 +2079,41 @@ def tv_mark_synced(sb, note_ids: list[str]) -> None:
     for i in range(0, len(note_ids), 200):
         (sb.table("tv_note_links").update({"synced_to_tv_at": iso_now()})
          .in_("note_id", note_ids[i:i + 200]).execute())
+
+
+# ── comments_for: 按发布链接找 TV 的帖子和它已有的评论(2026-10-19, D-120) ─────────────────────
+# 与 tv_project_categories 同一种读法(service_role 直读 truth_vault, 前提见那里的说明)。这两个**不吞异常**:
+# 读不到时 core 要如实说"这次没查成", 不能说成"TV 里没有这条"(那会让写手去贴正文, 而问题其实在服务端)。
+TV_LINK_CANDIDATES = 20
+TV_COMMENTS_MAX = 40
+
+
+def tv_notes_by_link_token(sb, token: str) -> list[dict]:
+    """publish_url 里含 ``token`` 的笔记(粗筛; 调用方再用 tvlink.link_key 比一次)。token 只含字母数字 _ -。"""
+    if not token or not re.fullmatch(r"[A-Za-z0-9_-]{4,32}", token):
+        return []
+    return list((sb.schema("truth_vault").table("notes")
+                 .select("note_id, project_id, title, body, raw_content, publish_url, publish_time, "
+                         "comments_count, tier")
+                 .ilike("publish_url", f"%{token}%")
+                 .order("publish_time", desc=True)
+                 .limit(TV_LINK_CANDIDATES).execute()).data or [])
+
+
+def tv_note_comments(sb, note_id: str, limit: int = TV_COMMENTS_MAX) -> list[dict]:
+    """这条笔记在 TV 里的评论, 按评论顺序。"""
+    return list((sb.schema("truth_vault").table("comments")
+                 .select("comment_id, parent_comment_id, comment_order, comment_role, content, is_pinned")
+                 .eq("note_id", note_id)
+                 .order("comment_order")
+                 .limit(limit).execute()).data or [])
+
+
+def tv_targets_of(sb, tv_project_id: str) -> list[dict]:
+    """这个 TV 项目对着哪几个写作台项目(``tv_project_map`` 反查)。"""
+    return list((sb.table("tv_project_map")
+                 .select("tv_project_id, project_id, ingest_target")
+                 .eq("tv_project_id", tv_project_id).execute()).data or [])
 
 
 def is_ingest_batch(batch: dict | None) -> bool:
