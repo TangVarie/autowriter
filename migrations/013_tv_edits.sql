@@ -55,6 +55,10 @@ CREATE TABLE IF NOT EXISTS autowriter.tv_edit_diffs (
     publish_time       TIMESTAMPTZ,
     computed_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- 第一版 013 建的表没有这两列(建表 IF NOT EXISTS 不会补列): 重跑时补上
+ALTER TABLE autowriter.tv_edit_diffs
+    ADD COLUMN IF NOT EXISTS edited_count     INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS edited_sentences JSONB NOT NULL DEFAULT '[]'::jsonb;
 CREATE INDEX IF NOT EXISTS tv_edit_diffs_project_idx
     ON autowriter.tv_edit_diffs (project_id, computed_at);
 GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.tv_edit_diffs TO service_role;

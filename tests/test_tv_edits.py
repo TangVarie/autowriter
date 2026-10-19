@@ -282,3 +282,27 @@ def test_cli_tv_sync_fails_loudly_when_diffs_cannot_be_read(monkeypatch, capsys)
     out = capsys.readouterr().out
     assert "改动差异没写成" in out and "doctor" in out
     assert [l["match_kind"] for l in c.rows["tv_note_links"]] == ["body_exact"], "对照照写"
+
+
+def test_a_rematch_of_the_same_version_keeps_the_old_timestamp():
+    c = _client([_note("n1", "秋招投了六十份简历没回音", BODY_A)])
+    core.tv_sync(c, TV)
+    (row,) = c.rows["tv_edit_diffs"]
+    row["computed_at"] = "2026-09-01T00:00:00+00:00"           # 早就看过的
+    core.tv_sync(c, TV, rematch=True)
+    assert c.rows["tv_edit_diffs"][0]["computed_at"] == "2026-09-01T00:00:00+00:00", "同一版重算不推过水位"
+
+
+def test_a_through_in_the_future_is_refused():
+    c = _digest_client()
+    with pytest.raises(ValueError):
+        core.ack_edit_digest(c, P1, (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(), user_id=ME)
+    assert not c.rows["tv_edit_digest_acks"]
+
+
+def test_migration_013_adds_the_new_columns_to_an_existing_table():
+    """第一版 013 建过表的库, 重跑新版要把 edited_* 两列补上(建表 IF NOT EXISTS 不补列)。"""
+    from pathlib import Path
+    for f in ("migrations/013_tv_edits.sql", "migrations/000_baseline.sql"):
+        sql = (Path(__file__).resolve().parent.parent / f).read_text(encoding="utf-8")
+        assert "ADD COLUMN IF NOT EXISTS edited_count" in sql and "ADD COLUMN IF NOT EXISTS edited_sentences" in sql, f

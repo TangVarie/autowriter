@@ -1796,11 +1796,14 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tu
         return assert_project_access(client, project_id, user_id=user_id), []
     if len(ids) > 1 and note.get("note_id"):
         try:
-            linked = str((store.tv_link(client, str(note["note_id"])) or {}).get("project_id") or "")
+            row = store.tv_link(client, str(note["note_id"])) or {}
         except Exception:                               # noqa: BLE001 — 查不到就让用户选, 不替他猜
             logger.exception("comments_for: 查这条笔记的对照失败 (note=%s)", note.get("note_id"))
-            linked = ""
+            row = {}
+        linked = str(row.get("project_id") or "") if row.get("match_kind") in _TV_BACKFILL_KINDS else ""
         if linked in ids:
+            # 只认真对上的那几档: ingested / unmatched 那一行的 project_id 是这个 TV 项目的补录目标(按项目给的默认),
+            # 不是这条笔记写的方向
             try:
                 return assert_project_access(client, linked, user_id=user_id), []
             except (PermissionError, ProjectNotFound):
@@ -3515,12 +3518,12 @@ def migration_state(client) -> dict:
          "仍写 human + 三列, 不受影响")
 
     # ── 013: 人在发布前改了什么 + 'edited' 一档(D-120 / W-23) ──
-    state, note = _probe_ok(lambda: (client.table("tv_edit_diffs").select("note_id").limit(1).execute(),
+    state, note = _probe_ok(lambda: (client.table("tv_edit_diffs").select("note_id, edited_sentences").limit(1).execute(),
                                      client.table("tv_edit_digest_acks").select("project_id").limit(1).execute()),
                             predicate=store.schema_object_missing)
-    _add(MIGRATION_TV_EDITS, "表 tv_edit_diffs / tv_edit_digest_acks", state, note,
+    _add(MIGRATION_TV_EDITS, "表 tv_edit_diffs(含 edited_sentences 列) / tv_edit_digest_acks", state, note,
          "⚠️ 硬失败, 但只打两处: tv-sync 写 match_kind='edited' 的对照会被旧 CHECK 拒(整块 upsert 失败, "
-         "那一块的对照当晚写不进去); 改动差异和每周摘要没有(tv-sync / open_project 只记一行 WARN、不报错)")
+         "那一块的对照当晚写不进去); 改动差异和每周摘要没有(tv-sync 对照照写、退出码 1; open_project 不带摘要)")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -3980,6 +3983,9 @@ def ack_edit_digest(client, project_id: str, through: str, *, user_id: str | Non
     t = tvlink._as_dt(through)
     if t is None:
         raise ValueError("through 要原样传回 edit_digest 里的那个时间")
+    if t > _utcnow() + timedelta(hours=1):
+        # 水位只往前走, 传错一个将来的时间就永远收不到摘要了 —— 摘要给的 through 不会比现在晚
+        raise ValueError("through 比现在还晚, 不是 edit_digest 给的那个时间; 原样传回")
     if not isinstance(rules_recorded, int) or isinstance(rules_recorded, bool) or not 0 <= rules_recorded <= 20:
         raise ValueError("rules_recorded 是这次记了几条规则(0~20 的整数)")
     kept = store.tv_edit_digest_ack_upsert(client, project_id, acked_through=t.isoformat(),
@@ -4940,6 +4946,16 @@ _TV_BACKFILL_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", 
 TV_SYNC_DIFF_BACKFILL = 500
 
 
+def _diff_stamp(link: dict, done: set[str], existing: dict[str, dict]) -> dict:
+    """差异行的 computed_at: 新算的、或者重对到了另一版的, 记现在(进下一份摘要); 同一版重算(--rematch)不带这一列,
+    upsert 就留着原来的时间 —— 不然一次 rematch 会把早就看过的整批差异推过水位、每周 200 篇地重放。"""
+    nid = link["note_id"]
+    old = existing.get(nid) or {}
+    if nid in done and str(old.get("version_id") or "") == str(link.get("version_id") or ""):
+        return {}
+    return {"computed_at": store.iso_now()}
+
+
 def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict[str, dict],
                    notes_by_id: dict, known: dict, *, dry_run: bool) -> dict:
     """对上的每一对算一条"人在发布前改了什么"(tvlink.edit_diff), 写 tv_edit_diffs(D-120 / W-23)。
@@ -4976,8 +4992,7 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
                          "changed", "title_changed", "published_title", "draft_chars", "published_chars",
                          "removed_count", "added_count", "edited_count", "removed_sentences", "added_sentences",
                          "edited_sentences", "brand_draft", "brand_published")},
-                     # 显式写: upsert 撞上旧行(rematch 重算)时 DEFAULT now() 不会刷新, 摘要就看不到这次重算
-                     "computed_at": store.iso_now()})
+                     **_diff_stamp(l, done, existing)})
     out = {"computed": len(rows), "changed": sum(1 for r in rows if r["changed"]),
            "backfilled": sum(1 for r in rows if r["note_id"] not in fresh), "written": 0}
     if rows and not dry_run:

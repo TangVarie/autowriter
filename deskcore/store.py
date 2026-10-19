@@ -2205,16 +2205,18 @@ def tv_edit_digest_ack_upsert(sb, project_id: str, *, acked_through: str, acked_
     后看完时不许把水位拉回去 —— 否则两次 through 之间那段一周后又出来一遍。先按"库里的比我旧"条件更新; 没更新到
     再看是没有这一行(插)还是库里已经更新(只记看过的人和时间, through 不动)。"""
     meta = {"acked_at": iso_now(), "acked_by": acked_by, "rules_recorded": int(rules_recorded)}
+    # 第一笔: 没有这一行就插, 有了就不动(ON CONFLICT DO NOTHING) —— 两个人同时第一次看完时不会互相覆盖
+    ins = (sb.table("tv_edit_digest_acks").upsert({"project_id": project_id, "acked_through": acked_through, **meta},
+                                                  on_conflict="project_id", ignore_duplicates=True)
+           .execute()).data or []
+    if ins:
+        return acked_through
     hit = (sb.table("tv_edit_digest_acks").update({"acked_through": acked_through, **meta})
            .eq("project_id", project_id).lt("acked_through", acked_through).execute()).data or []
     if hit:
         return acked_through
-    cur = tv_edit_digest_ack(sb, project_id)
-    if cur is None:
-        sb.table("tv_edit_digest_acks").upsert({"project_id": project_id, "acked_through": acked_through, **meta},
-                                               on_conflict="project_id").execute()
-        return acked_through
     sb.table("tv_edit_digest_acks").update(meta).eq("project_id", project_id).execute()
+    cur = tv_edit_digest_ack(sb, project_id) or {}
     return str(cur.get("acked_through") or acked_through)
 
 

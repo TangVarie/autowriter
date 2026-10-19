@@ -439,3 +439,11 @@ def test_no_link_and_several_of_mine_asks_instead_of_guessing():
     assert {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
     picked = core.comments_for(_two_direction_client(), user_id=ME, link=LINK, project_id=THIRD_PROJ)
     assert picked["resolved"] is True and picked["project_id"] == THIRD_PROJ
+
+
+def test_an_ingested_link_is_not_a_direction():
+    """补录(ingested)那一行的 project_id 是 TV 项目的补录目标, 不是这条笔记写的方向 —— 照样让用户选。"""
+    c = _two_direction_client(link_to=PROJ)
+    c.rows["tv_note_links"][0]["match_kind"] = "ingested"
+    out = core.comments_for(c, user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}

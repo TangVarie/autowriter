@@ -135,6 +135,7 @@ class FakeQuery:
     def upsert(self, payload, **kwargs):
         self.op, self.payload = "upsert", payload
         self.on_conflict = kwargs.get("on_conflict")
+        self.ignore_duplicates = bool(kwargs.get("ignore_duplicates"))
         return self
 
     def delete(self):
@@ -317,7 +318,9 @@ class FakeClient:
                     hit = next((r for r in table
                                 if all(r.get(k) == row.get(k) for k in keys)), None)
                     if hit is not None:
-                        hit.update({k: v for k, v in row.items() if k != "id"})
+                        # ignore_duplicates = ON CONFLICT DO NOTHING: 撞上就不动, 也不回这一行
+                        if not getattr(q, "ignore_duplicates", False):
+                            hit.update({k: v for k, v in row.items() if k != "id"})
                     else:
                         rest.append(row)
                 payload = rest
@@ -338,11 +341,12 @@ class FakeClient:
             return FakeResponse(hits)
 
         # select —— 先排序再分页, count 在分页【之前】算, 与 PostgREST 一致。
-        # 排序按 .order() 的先后(第一个是主键); None 排最后(PostgREST 升序的默认 nulls last)。
+        # 排序按 .order() 的先后(第一个是主键); NULL 的位置跟 PG 默认一样: 升序排最后, 降序排最前。
         for col, desc in reversed(getattr(q, "sort_keys", [])):
             present = [r for r in hits if r.get(col) is not None]
             absent = [r for r in hits if r.get(col) is None]
-            hits = sorted(present, key=lambda r: r.get(col), reverse=desc) + absent
+            ordered = sorted(present, key=lambda r: r.get(col), reverse=desc)
+            hits = absent + ordered if desc else ordered + absent
         total = len(hits)
         if q.rng:
             hits = hits[q.rng[0]:q.rng[1] + 1]
