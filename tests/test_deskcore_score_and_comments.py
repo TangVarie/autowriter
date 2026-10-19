@@ -312,3 +312,52 @@ def test_score_comments_checks_ownership_before_judging(wired):
         core.score_comments(c, user_id=ME, project_id=OTHER_PROJ, post_body="正文",
                             comments=[{"slot": "q1", "text": "x"}])
     assert calls == []
+
+
+# ── codex review on aw#107 ─────────────────────────────────────────────────────────────────────
+
+def test_a_malformed_ok_body_is_an_error_not_a_perfect_score():
+    for body in ({"passed": False}, {"passed": True, "hard_fails": [], "plan": []},
+                 {"passed": True, "hard_fails": "x", "plan": [], "unjudged": []}):
+        assert judge_client._normalize_ok(body) is None, body
+
+
+def test_confident_fixes_past_the_cap_are_not_crowded_out():
+    plan = ([{"kind": "hard", "qid": f"u{i}", "p": 0.55, "instruction": f"拿不准 {i}"} for i in range(15)]
+            + [{"kind": "hard", "qid": "s", "p": 0.95, "instruction": "有把握的那条"}])
+    norm = judge_client._normalize_ok({"passed": False, "hard_fails": [], "plan": plan, "unjudged": []})
+    assert norm["plan"][0]["instruction"] == "有把握的那条" and norm["plan_size"] == 16
+    out = core.draft_score(_ok(**norm))
+    assert out["fixes"][0] == {"sure": True, "instruction": "有把握的那条"}
+    assert out["more_fixes"] == 16 - core.SCORE_MAX_FIXES, "没列出的按 judge 回的总数算"
+
+
+def test_custom_slot_without_an_id_is_a_400(wired, monkeypatch):
+    calls, _ = wired
+    c = _tv_client()
+    monkeypatch.setattr(core, "sb", lambda: c)
+    with pytest.raises(tools.InvalidInput) as e:
+        tools.score_comments([{"slot": {"speech_act": ["提问"]}, "text": "x"}], link=LINK, _user_id=ME)
+    assert "带 id" in str(e.value) and calls == []
+
+
+def test_a_short_per_comment_answer_is_not_reported_as_ok(wired):
+    _, reply = wired
+    reply["fn"] = lambda m, u, kw: _Resp(200, dict(THREAD_OK, comments=THREAD_OK["comments"][:1]))
+    out = core.score_comments(_tv_client(), user_id=ME, link=LINK,
+                              comments=[{"slot": "q1", "text": "a"}, {"slot": "reply", "text": "b"}])
+    assert out["judge_status"] == "error" and "comments" not in out and "1 条" in out["detail"]
+
+
+def test_a_tv_note_without_body_asks_for_the_text():
+    c = _tv_client(notes=[dict(NOTE, body="", raw_content="")])
+    out = core.comments_for(c, user_id=ME, link=LINK)
+    assert out["resolved"] is False and out["need"] == ["帖子的正文"] and out["project_id"] == PROJ
+    out = core.comments_for(c, user_id=ME, link=LINK, post_body="贴来的正文")
+    assert out["resolved"] is True and out["post"]["body"] == "贴来的正文"
+
+
+def test_hostnames_are_case_insensitive_but_ids_keep_their_case():
+    assert tvlink.link_key("HTTPS://WWW.XIAOHONGSHU.COM/explore/690873F30000000007030EB7")[0] == \
+        "xhs:690873f30000000007030eb7"
+    assert tvlink.link_key("http://XHSLINK.COM/o/AbCdEf")[0] == "xhslink:AbCdEf"

@@ -86,6 +86,8 @@ _DETAIL_MAX = 300
 # 修改单留几条、每条多长: 一篇最多 3 条给写手(core.SCORE_MAX_FIXES), 这里多留几条给 core 挑。
 _PLAN_MAX = 12
 _INSTRUCTION_MAX = 400
+# /judge_draft 回包里算分要用的字段(judge/api.py: view 的 hard_fails / unjudged + plan), 必须都是列表。
+_SCORE_FIELDS = ("hard_fails", "plan", "unjudged")
 # 错误体原文先留长一些再交给 result(): 脱敏要在**截断之前**做。原来这里先截到 300 再脱敏,
 # key 恰好跨在第 300 个字上时只剩半截, 值级脱敏认不出半截, 那半截就原样留在 detail 里。
 _RAW_DETAIL_MAX = 4 * _DETAIL_MAX
@@ -180,6 +182,10 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("passed"), bool):
         return None
+    # 分数给写手看之后(D-120), 缺字段不能再当"空": {"passed": false} 这种版本不兼容的回包会被折成满分 100、
+    # 没有修改建议(codex review on aw#107)。算分要用的三样必须是列表, 否则整篇算 error。
+    if not all(isinstance(payload.get(k), list) for k in _SCORE_FIELDS):
+        return None
     fails = []
     for h in payload.get("hard_fails") or []:
         # [bank, qid, answer, p, evidence] —— 证据句不放在这里(它进下面的 plan, 一句话只带一份)。
@@ -189,7 +195,12 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
     # 暗题的条目 judge 那边已经抹成「有一项不公开的检查没过」。
     plan = []
     raw_plan = payload.get("plan")
-    for e in (raw_plan if isinstance(raw_plan, list) else [])[:_PLAN_MAX]:
+    # 先按把握排(高的在前、没给概率的最后)再截: 截在前面的话, 第 13 条以后有把握的修改会被前面拿不准的挤掉
+    # (codex review on aw#107)。core 的 sure 判据是 p ≥ 阈值, 按 p 降序排就是"有把握的在前"。
+    ranked = sorted((e for e in raw_plan if isinstance(e, dict)),
+                    key=lambda e: -(e["p"] if isinstance(e.get("p"), (int, float))
+                                    and not isinstance(e.get("p"), bool) else -1.0))
+    for e in ranked[:_PLAN_MAX]:
         if isinstance(e, dict) and isinstance(e.get("instruction"), str) and e["instruction"].strip():
             p = e.get("p")
             plan.append({"kind": e.get("kind"), "qid": e.get("qid"),
@@ -210,9 +221,9 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
             "calls": calls if isinstance(calls, int) else None,
             "written": written if isinstance(written, int) else None,
             "policy": policy,
-            "plan_size": len(raw_plan) if isinstance(raw_plan, list) else 0,
+            "plan_size": len(raw_plan),
             "plan": plan,
-            "unjudged": len(unjudged) if isinstance(unjudged, list) else 0,
+            "unjudged": len(unjudged),
             "invalid_reason": invalid if isinstance(invalid, str) and invalid else None}
 
 

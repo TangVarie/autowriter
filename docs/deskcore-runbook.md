@@ -778,8 +778,8 @@ open_project（简报自带 lessons）→ draw_angles(n=20) → 生成 20 篇
              → 写手把定稿贴进飞书（不再导出，D-120）
 ```
 
-> 2026-10-19（D-120）：`export_drafts` / `review_drafts` 已从 MCP 撤下，下面第 6 条改成"发布后看 `tv_note_links`
-> 有没有对上"（`python -m deskcore.cli tv-sync --dry-run` 或直接查 `autowriter.tv_note_links`）。
+> 2026-10-19（D-120）：`export_drafts` / `review_drafts` 已从 MCP 撤下，下面第 6 条是"发布后看 `tv_note_links`
+> 有没有对上"。
 
 然后验六件事：
 
@@ -790,12 +790,13 @@ open_project（简报自带 lessons）→ draw_angles(n=20) → 生成 20 篇
 5. `commit_drafts` 的返回值里 **`batch_id` 和 `version_ids` 都不为空**，且**没有** `identity_warning`
    —— 有 warning 说明指纹写进去了但 `batches`/`items`/`versions` 没建成，lineage 会断
    （可逆，重跑即可，但别当没看见）
-6. `export_drafts` 出的表**粘进飞书之后**，去 TV 那边查一次
-   `select count(*) from truth_vault.notes where source_autowriter_version_id is not null`
-   —— **这一列长期是 0**，它第一次不为 0 才说明回程真的通了
+6. 写手把定稿**贴进飞书、发出去之后**（D-120 起不再导出），等当晚的 `tv-sync` 跑完，查一次
+   `select match_kind, count(*) from autowriter.tv_note_links where version_id = any(<这批 version_ids>) group by 1`
+   —— 这批稿子出现在 `body_exact` / `title_exact` / `fuzzy` 里，才说明"按内容对回来"这条路真的通了
+   （对上之后 TV 的 `source_autowriter_version_id` 也会被回填）
 
-⚠️ 第 5、6 条是 2026-08-25 新增的那一段（`commit_drafts` 建身份 + lineage 命名列）
-的验收，2026-08-23 版的清单里没有它们。
+⚠️ 第 5、6 条是 2026-08-25 新增的那一段（`commit_drafts` 建身份 + lineage）的验收，2026-08-23 版的清单里
+没有它们；第 6 条 2026-10-19 改成按内容对回（D-120）。
 
 ---
 

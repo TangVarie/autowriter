@@ -1254,8 +1254,10 @@ def draft_score(res: dict) -> dict:
     plan.sort(key=lambda e: (not _is_sure(e.get("p")), -(e.get("p") or 0)))
     fixes = [{"sure": _is_sure(e.get("p")), "instruction": e["instruction"]} for e in plan[:SCORE_MAX_FIXES]]
     out: dict = {"score": score, "fixes": fixes}
-    if len(plan) > SCORE_MAX_FIXES:
-        out["more_fixes"] = len(plan) - SCORE_MAX_FIXES
+    # 没列出的条数按 judge 回的总数算, 不按 judge_client 截过之后留下的(codex review on aw#107)
+    total = max(len(plan), int(res.get("plan_size") or 0))
+    if total > len(fixes):
+        out["more_fixes"] = total - len(fixes)
     if unjudged:
         out["unjudged"] = unjudged
     return out
@@ -1814,6 +1816,13 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
         title, body = _tv_post_text(note)
         if post_body:
             title, body = post_title or title, post_body
+        if not body:
+            # TV 里有这条, 但正文是空的(飞书那行只有链接): 光凭标题写评论、判评论都没意义, 让用户贴正文
+            # (codex review on aw#107)。项目已经对上了, 回包里带上, 下一次带 project_id 调就行。
+            return None, "", "", None, {
+                "resolved": False, "need": ["帖子的正文"], "project_id": project["id"],
+                "note": f"TV 里有这条笔记, 但没有正文。请用户把帖子正文贴过来, 再带 post_body 和 "
+                        f"project_id={project['id']} 调一次。"}
         return project, title, body, note, None
     if post_body and project_id:
         project = assert_project_access(client, project_id, user_id=user_id)
@@ -1874,8 +1883,10 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
 
 
 def _slot_of(value, by_id: dict) -> dict | None:
+    """slot 写 id(默认评论位) 或整个对象(自定义)。自定义的必须带非空的 id: 下面按 id 接贴主答疑、查重复,
+    缺了会 KeyError 成 500(codex review on aw#107)。"""
     if isinstance(value, dict):
-        return dict(value)
+        return dict(value) if isinstance(value.get("id"), str) and value["id"].strip() else None
     if isinstance(value, str) and value in by_id:
         return dict(by_id[value])
     return None
@@ -1928,7 +1939,7 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         slot = _slot_of(c.get("slot"), by_id)
         if c.get("slot") not in (None, "") and slot is None:
             raise CommentInputError(f"第 {i + 1} 条评论的 slot {c.get('slot')!r} 不是 comments_for 给的评论位 id"
-                             f"({' / '.join(by_id)}); 自定义评论位要传整个对象")
+                                    f"({' / '.join(by_id)}); 自定义评论位要传整个对象, 而且要带 id")
         cands.append({"text": c["text"].strip(), "slot": slot, "reply_to_text": (c.get("reply_to_text") or "").strip()})
     ids = [c["slot"]["id"] for c in cands if c["slot"] and c["slot"].get("id")]
     if len(ids) != len(set(ids)):
@@ -1949,8 +1960,14 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
             "note": COMMENT_SCORE_NOTE}
     if res.get("judge_status") != judge_client.JUDGE_OK:
         return {**head, "detail": res.get("detail")}
+    per_comment = res.get("comments") or []
+    if len(per_comment) != len(cands):
+        # 少回了几条: zip 会悄悄丢掉没回的那几条, 摘要就成了"这几条评论不存在"(codex review on aw#107)
+        return {**head, "judge_status": judge_client.JUDGE_ERROR,
+                "detail": f"判定服务回了 {len(per_comment)} 条单条结果, 送去的是 {len(cands)} 条 —— 版本对不上?"
+                          "这次不算判过"}
     rows = []
-    for i, (c, v) in enumerate(zip(cands, res.get("comments") or [])):
+    for i, (c, v) in enumerate(zip(cands, per_comment)):
         v = v if isinstance(v, dict) else {}
         row = {"index": i, "slot": (c["slot"] or {}).get("id"), "passed": bool(v.get("passed")),
                "needs_review": bool(v.get("needs_review"))}

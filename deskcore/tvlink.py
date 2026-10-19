@@ -260,11 +260,13 @@ def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
 # 抖音 / t.cn)。写手贴过来的可能是另一种, 所以两边都折成"平台 + 那一段 id"再比, 不比整串 URL(查询参数每次分享都不同)。
 # 短链和长链之间互相认不出(要跟一次跳转, 写作台不往外发请求), 那种情况 comments_for 会让写手把正文贴过来。
 _LINK_PATTERNS = (
-    ("xhs", re.compile(r"xiaohongshu\.com/(?:explore|discovery/item)/([0-9a-fA-F]{24})")),
-    ("xhslink", re.compile(r"xhslink\.(?:com|cn)/(?:[a-zA-Z]/)?([A-Za-z0-9_-]{4,32})")),
-    ("dy", re.compile(r"v\.douyin\.com/([A-Za-z0-9_-]{4,32})")),
-    ("dyv", re.compile(r"douyin\.com/(?:video|note)/([0-9]{8,32})")),
-    ("tcn", re.compile(r"t\.cn/([A-Za-z0-9]{4,32})")),
+    # re.I: 主机名不分大小写(WWW.XIAOHONGSHU.COM 也认, codex review on aw#107)。取出来的 id 原样保留 ——
+    # 字符类本来就两种大小写都收, re.I 不改捕获到的文字, 短链 id 的大小写照旧区分。
+    ("xhs", re.compile(r"xiaohongshu\.com/(?:explore|discovery/item)/([0-9a-fA-F]{24})", re.I)),
+    ("xhslink", re.compile(r"xhslink\.(?:com|cn)/(?:[a-zA-Z]/)?([A-Za-z0-9_-]{4,32})", re.I)),
+    ("dy", re.compile(r"v\.douyin\.com/([A-Za-z0-9_-]{4,32})", re.I)),
+    ("dyv", re.compile(r"douyin\.com/(?:video|note)/([0-9]{8,32})", re.I)),
+    ("tcn", re.compile(r"t\.cn/([A-Za-z0-9]{4,32})", re.I)),
 )
 
 
