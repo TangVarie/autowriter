@@ -3944,14 +3944,19 @@ DESK_GAP_MIN_UNCAUGHT = 10
 DESK_GAP_MAX_CAUGHT = 2
 DESK_GAP_USED_WITHIN_DAYS = 60
 DESK_GAP_CACHE_SEC = 600          # 一场对话开头 list_projects + open_project 会连着问两次, 数一天才变一次
-_desk_gap_cache: dict[tuple, tuple[float, list]] = {}
+# 发布时间窗靠 TV 的 deskcore_tv_notes RPC 取; 它只能按 TV 入库时间(created_at)过滤, 所以先取近 30 天入库的,
+# 再按 publish_time 筛近 7 天发出去的。不按对照表的 matched_at 切: 新接一张表、或者 tv-sync 停了几天再补,
+# 一批旧笔记会同时拿到很新的 matched_at, 被说成"最近 7 天发的"(codex review on aw#109)。
+DESK_GAP_NOTES_CREATED_WITHIN_DAYS = 30
+_desk_gap_cache: dict[str, tuple[float, list]] = {}
 DESK_GAP_TASK = "把 message 原样告诉用户, 同一场对话里说过就不再说; 然后照常继续, 不用等用户回答。"
 
 
 def _desk_gap_items(client, user_id: str) -> list[dict]:
-    key = (id(client), user_id)          # 生产里 client 是单例; 测试里每个假库各算各的
-    hit = _desk_gap_cache.get(key)
-    if hit and time.monotonic() - hit[0] < DESK_GAP_CACHE_SEC:
+    # 按 user_id 缓存: store.client() 每次都新建一个 client, 拿它当键永远命中不了(codex review on aw#109)
+    now = time.monotonic()
+    hit = _desk_gap_cache.get(user_id)
+    if hit and now - hit[0] < DESK_GAP_CACHE_SEC:
         return hit[1]
     mine = {p["id"]: p.get("name") or p["id"] for p in store.list_all_projects(client, owner_id=user_id)}
     groups: dict[str, list[str]] = {}
@@ -3963,8 +3968,19 @@ def _desk_gap_items(client, user_id: str) -> list[dict]:
                 target[m["tv_project_id"]] = m["project_id"]
     items: list[dict] = []
     if groups:
+        wall = _utcnow()
+        lo = wall - timedelta(days=DESK_GAP_DAYS)
+        recent: list[str] = []
+        for tv in groups:
+            for n in store.tv_notes(client, tv, since=store.iso_ago(DESK_GAP_NOTES_CREATED_WITHIN_DAYS)):
+                pt = tvlink._as_dt(n.get("publish_time"))
+                if pt and lo <= pt <= wall:          # 排期还没发的(publish_time 在未来)不算
+                    recent.append(n["note_id"])
         counts: dict[str, list[int]] = {}
-        for r in store.tv_link_kinds_since(client, list(groups), store.iso_ago(DESK_GAP_DAYS)):
+        for r in store.tv_link_kinds_for_notes(client, recent):
+            # 只数对到【调用者自己】项目上的: 一个 TV 项目可能映射到好几个人的写作台项目(codex review on aw#109)
+            if r.get("project_id") not in mine or r.get("tv_project_id") not in groups:
+                continue
             c = counts.setdefault(r["tv_project_id"], [0, 0])
             if r.get("match_kind") == "ingested":
                 c[0] += 1
@@ -3980,7 +3996,9 @@ def _desk_gap_items(client, user_id: str) -> list[dict]:
             name = mine.get(target.get(tv, "")) or min(mine[p] for p in pids)
             items.append({"tv_project_id": tv, "project": name, "project_ids": sorted(pids),
                           "published": ing + caught, "caught": caught})
-    _desk_gap_cache[key] = (time.monotonic(), items)
+    for k in [k for k, (t, _) in _desk_gap_cache.items() if now - t >= DESK_GAP_CACHE_SEC]:
+        _desk_gap_cache.pop(k, None)                 # 过期的顺手清掉, 进程里不越攒越多
+    _desk_gap_cache[user_id] = (now, items)
     return items
 
 

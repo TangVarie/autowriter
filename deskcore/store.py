@@ -1929,19 +1929,15 @@ def tv_project_map(sb) -> list[dict]:
                  .order("tv_project_id").execute()).data or [])
 
 
-def tv_link_kinds_since(sb, tv_project_ids: list[str], since: str) -> list[dict]:
-    """这几个 TV 项目里, ``since`` 之后新写进对照表的笔记各是哪种对上法(core.desk_gaps 用)。
-
-    matched_at 是这条对照第一次写进去的时间(tv-sync 每晚只写新笔记), 窗口按它切。按 note_id 翻页(唯一)。"""
-    if not tv_project_ids:
-        return []
-    return _paged(lambda off, lim: (
-        sb.table("tv_note_links")
-          .select("note_id, tv_project_id, match_kind")
-          .in_("tv_project_id", list(tv_project_ids))
-          .gte("matched_at", since)
-          .order("note_id")
-          .range(off, off + lim - 1)))
+def tv_link_kinds_for_notes(sb, note_ids: list[str]) -> list[dict]:
+    """这些笔记各对上了哪个写作台项目、怎么对上的(core.desk_gaps 用)。按 100 个一批 .in_(), 单批 URL 不会过长。"""
+    out: list[dict] = []
+    ids = list(dict.fromkeys(note_ids))
+    for i in range(0, len(ids), 100):
+        out.extend((sb.table("tv_note_links")
+                      .select("note_id, tv_project_id, project_id, match_kind")
+                      .in_("note_id", ids[i:i + 100]).execute()).data or [])
+    return out
 
 
 def any_draw_since(sb, project_ids: list[str], since: str) -> bool:
