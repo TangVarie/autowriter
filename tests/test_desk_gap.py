@@ -6,8 +6,9 @@
   1. 途鸽形状(7 天内发出去 22 篇全是补录、60 天内发过牌) → 报; 发布时间不在窗口里的不算
   2. 窗口按【发布时间】, 不按对照写进去的时间: 新接一张表 / tv-sync 补跑, 旧笔记同时拿到新 matched_at 也不报;
      排期还没发的(publish_time 在未来)也不算
-  3. 下限: 补录差一篇、对上多一篇都不报; sportsix 那种"一部分在外面写"(12 / 18)不报
-  4. 60 天没在写作台里写过的项目不唠叨
+  3. 下限: 补录差一篇、对上多一篇都不报; sportsix 那种"一部分在外面写"(12 / 18)不报;
+     写作台那版晚于发布的对上(lag_days < 0, 抄回去的)不算接住
+  4. 从没在写作台里写过的项目不唠叨; 用过的不管断了多久都照说(不设 60 天期限)
   5. 只数对到调用者自己项目上的对照: TV 项目映射到别人的项目也不算、不泄露
   6. 当前正开着的就是它 → 话术换成"这次写完记得打分存档"; 名字取补录目标那个项目
   7. 缓存按 user_id(store.client() 每次新建, 不能拿 client 当键), 过期的会被清掉
@@ -30,7 +31,8 @@ def _ago(**kw) -> str:
     return (NOW - timedelta(**kw)).isoformat()
 
 
-def _client(*, ing=22, caught=0, drew_days=30, owner=ME, stale_links=0, other_owner_links=0):
+def _client(*, ing=22, caught=0, drew_days=30, owner=ME, stale_links=0, other_owner_links=0,
+            late_copies=0, never_drew=False):
     projects = [{"id": "p-tuge", "name": "途鸽", "brand": "途鸽", "owner_id": owner},
                 {"id": "p-tuge-d1", "name": "途鸽D-1", "brand": "途鸽", "owner_id": owner},
                 {"id": "p-tuge-x", "name": "途鸽求职", "brand": "途鸽", "owner_id": OTHER},
@@ -42,10 +44,10 @@ def _client(*, ing=22, caught=0, drew_days=30, owner=ME, stale_links=0, other_ow
     notes: dict[str, list] = {"TUGE": [], "SPX": []}
     links: list[dict] = []
 
-    def add(nid, tv, kind, pid, published, created=None):
+    def add(nid, tv, kind, pid, published, created=None, lag=1):
         notes[tv].append({"note_id": nid, "publish_time": published, "created_at": created or published})
         links.append({"note_id": nid, "tv_project_id": tv, "project_id": pid, "match_kind": kind,
-                      "matched_at": _ago(hours=1)})          # 全都是刚连上的 —— 窗口不该按它切
+                      "lag_days": lag, "matched_at": _ago(hours=1)})   # 全都是刚连上的 —— 窗口不该按它切
 
     for i in range(ing):
         add(f"t{i:03d}", "TUGE", "ingested", "p-tuge", _ago(days=2))
@@ -56,13 +58,15 @@ def _client(*, ing=22, caught=0, drew_days=30, owner=ME, stale_links=0, other_ow
         add(f"old{i:03d}", "TUGE", "ingested", "p-tuge", _ago(days=20), created=_ago(days=1))
     for i in range(5):                                        # 排期: 已入库, 还没发
         add(f"sched{i}", "TUGE", "ingested", "p-tuge", (NOW + timedelta(days=2)).isoformat(), created=_ago(days=1))
+    for i in range(late_copies):                              # 发了之后才进写作台的那版: 抄回去的
+        add(f"late{i:03d}", "TUGE", "body_exact", "p-tuge", _ago(days=2), lag=-3)
     for i in range(other_owner_links):                        # 对到别人项目上的
         add(f"x{i:03d}", "TUGE", "ingested", "p-tuge-x", _ago(days=2))
     for i in range(12):
         add(f"s{i:03d}", "SPX", "ingested", "p-spx", _ago(days=1))
     for i in range(18):
         add(f"sb{i:03d}", "SPX", "body_exact", "p-spx", _ago(days=1))
-    ledger = [{"id": "a1", "project_id": "p-tuge", "drawn_at": _ago(days=drew_days)},
+    ledger = ([] if never_drew else [{"id": "a1", "project_id": "p-tuge", "drawn_at": _ago(days=drew_days)}]) + [
               {"id": "a2", "project_id": "p-spx", "drawn_at": _ago(days=1)},
               {"id": "a3", "project_id": "p-tuge-x", "drawn_at": _ago(days=1)}]
     c = FakeClient(rows={"projects": projects, "tv_project_map": tvmap,
@@ -113,8 +117,15 @@ def test_floors():
     assert _gap(_client(ing=10, caught=core.DESK_GAP_MAX_CAUGHT)) is not None
 
 
-def test_a_project_not_written_in_the_desk_for_60_days_is_left_alone():
-    assert _gap(_client(drew_days=core.DESK_GAP_USED_WITHIN_DAYS + 1)) is None
+def test_copies_made_after_publication_are_not_catches():
+    """Hatherine 这周唯一一篇"对上"是发了之后才进写作台的那版(lag_days < 0): 那是抄回去的, 不算接住。"""
+    g = _gap(_client(ing=10, late_copies=5))
+    assert g is not None and g["projects"][0]["caught"] == 0
+
+
+def test_never_used_is_left_alone_but_a_long_outage_keeps_being_reported():
+    assert _gap(_client(never_drew=True)) is None
+    assert _gap(_client(drew_days=200)) is not None, "断了半年也照说, 不能自己转绿"
 
 
 def test_only_links_on_my_own_projects_count():

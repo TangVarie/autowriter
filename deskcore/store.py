@@ -1935,18 +1935,17 @@ def tv_link_kinds_for_notes(sb, note_ids: list[str]) -> list[dict]:
     ids = list(dict.fromkeys(note_ids))
     for i in range(0, len(ids), 100):
         out.extend((sb.table("tv_note_links")
-                      .select("note_id, tv_project_id, project_id, match_kind")
+                      .select("note_id, tv_project_id, project_id, match_kind, lag_days")
                       .in_("note_id", ids[i:i + 100]).execute()).data or [])
     return out
 
 
-def any_draw_since(sb, project_ids: list[str], since: str) -> bool:
-    """这几个写作台项目 ``since`` 之后有没有发过一次牌(谁发的都算)。"""
+def any_draw(sb, project_ids: list[str]) -> bool:
+    """这几个写作台项目有没有发过牌(谁发的、什么时候发的都算)。"""
     if not project_ids:
         return False
     rows = (sb.table("angle_ledger").select("id")
               .in_("project_id", list(project_ids))
-              .gte("drawn_at", since)
               .limit(1).execute()).data or []
     return bool(rows)
 

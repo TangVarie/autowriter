@@ -3938,11 +3938,11 @@ def _avg(xs) -> int | None:
 # owner 10-19 确认 WorkBuddy 的写作台连接是全局的(新开对话就能列项目), 那一波是 skill 没被调起来、没开项目就写了。
 # 漏接的那些对话里写作台没被调用, 在那里提醒不了 —— 所以在调到写作台的对话里(open_project / list_projects)
 # 告诉运营: 你名下哪个项目最近发出去的帖写作台没接住, 下次写它先说「打开它」。口径同 TV 角度台账
-# 那盏灯的判据 C: 近 7 天补录副本 >= 10 篇、对上 <= 2 篇、这个项目近 60 天在写作台里发过牌。
+# 那盏灯的判据 C: 近 7 天发出去的帖里补录副本 >= 10 篇、对上 <= 2 篇(对上只认写作台那版早于发布的), 这个项目
+# 在写作台里发过牌(不限时间: 断得越久越该说, codex review on TV#205)。
 DESK_GAP_DAYS = 7
 DESK_GAP_MIN_UNCAUGHT = 10
 DESK_GAP_MAX_CAUGHT = 2
-DESK_GAP_USED_WITHIN_DAYS = 60
 DESK_GAP_CACHE_SEC = 600          # 一场对话开头 list_projects + open_project 会连着问两次, 数一天才变一次
 # 发布时间窗靠 TV 的 deskcore_tv_notes RPC 取; 它只能按 TV 入库时间(created_at)过滤, 所以先取近 30 天入库的,
 # 再按 publish_time 筛近 7 天发出去的。不按对照表的 matched_at 切: 新接一张表、或者 tv-sync 停了几天再补,
@@ -3984,15 +3984,14 @@ def _desk_gap_items(client, user_id: str) -> list[dict]:
             c = counts.setdefault(r["tv_project_id"], [0, 0])
             if r.get("match_kind") == "ingested":
                 c[0] += 1
-            elif r.get("match_kind") in _TV_BACKFILL_KINDS:
-                c[1] += 1
-        used_since = store.iso_ago(DESK_GAP_USED_WITHIN_DAYS)
+            elif r.get("match_kind") in _TV_BACKFILL_KINDS and (r.get("lag_days") is None or r["lag_days"] >= 0):
+                c[1] += 1               # 写作台那版晚于发布 = 发出去之后抄回去的, 不算接住
         for tv, pids in sorted(groups.items()):
             ing, caught = counts.get(tv, (0, 0))
             if ing < DESK_GAP_MIN_UNCAUGHT or caught > DESK_GAP_MAX_CAUGHT:
                 continue
-            if not store.any_draw_since(client, pids, used_since):
-                continue        # 近 60 天没在写作台里写过的项目: 本来就不在这写, 不唠叨
+            if not store.any_draw(client, pids):
+                continue        # 从没在写作台里写过的项目: 本来就不在这写, 不唠叨
             name = mine.get(target.get(tv, "")) or min(mine[p] for p in pids)
             items.append({"tv_project_id": tv, "project": name, "project_ids": sorted(pids),
                           "published": ing + caught, "caught": caught})
