@@ -1599,58 +1599,97 @@ def _bounded_submit(pool, slots, fn, *args):
     return future
 
 
-def _cross_project_shadow(client, project_id, user_id, drafts, vectors, exclude_versions):
+def _vector_scores(vecs: dict[int, list], vs: list) -> dict[int, float]:
+    """每篇稿子对一个项目近期标题样本的最高余弦; 只比同维度的。成批走矩阵(dedup.similarity_matrix),
+    走不了(没 numpy / 维度参差)退回逐对 —— 一批 20 篇 × 40 条逐对纯 Python 就要几百毫秒(10-19 实测超时)。"""
+    out: dict[int, float] = {}
+    dims = {len(v) for v in vecs.values()}
+    if len(dims) == 1:
+        idx = list(vecs)
+        same = [v for v in vs if len(v) == next(iter(dims))]
+        sims = dedup.similarity_matrix([vecs[i] for i in idx], same) if same else None
+        if sims is not None:
+            return {i: float(sims[k].max()) for k, i in enumerate(idx)}
+    for i, vec in vecs.items():
+        same = [v for v in vs if len(v) == len(vec)]
+        if same:
+            out[i] = max(dedup.cosine_similarity(vec, v) for v in same)
+    return out
+
+
+def _cross_project_shadow(client, project_id, user_id, drafts, vectors, exclude_versions,
+                          partial: dict | None = None, deadline: float | None = None):
+    """品牌词标记先算完放进 ``partial``: 外层超时也能把它带回去(10-14 / 10-19 五批超时, 以前连标记一起丢)。
+    向量部分(拉样本 + 比)守 ``deadline``, 到点就带着已比完的返回, 不拖到外层把整次检查掐掉。"""
     from .isolation import foreign_markers
+    deadline = time.monotonic() + _ISOLATION_TIMEOUT_SEC - 0.1 if deadline is None else deadline
     projects = store.isolation_projects(client, owner_id=user_id)
     target = next((p for p in projects if str(p["id"]) == str(project_id)), None)
     if target is None:
         return {"status": "unavailable", "note": "当前项目标记未查到，无从判断是否串项目"}
     flags = [{"index": i, "markers": foreign_markers((d.get("title") or "") + "\n" + (d.get("body") or ""),
                                                       target, projects)} for i, d in enumerate(drafts)]
-    by_project = {}
-    if vectors:
-        deadline = time.monotonic() + 1.0
+    if partial is not None:
+        partial["markers"] = [dict(r) for r in flags]
+    vecs = {i: vectors[i] for i in range(len(flags)) if vectors and i < len(vectors) and vectors[i]}
+    scores: dict = {}
+    partial_vectors = False
+    if vecs:
+        fetch_until = min(time.monotonic() + 1.0, deadline - _ISOLATION_COMPARE_RESERVE_SEC)
         ordered = [target] + [p for p in projects if p["id"] != target["id"]]
-        for p in ordered:
-            if time.monotonic() >= deadline:
+        for n, p in enumerate(ordered):
+            if time.monotonic() >= fetch_until:
+                partial_vectors = True
                 break
             rows = store.isolation_fingerprints(client, p["id"], dedup.EMBEDDING_MODEL)
-            by_project[p["id"]] = [r["title_embedding"] for r in rows
-                                    if r.get("version_id") not in exclude_versions and r.get("title_embedding")
-                                    and r.get("embedding_model") == dedup.EMBEDDING_MODEL]
+            vs = [r["title_embedding"] for r in rows
+                  if r.get("version_id") not in exclude_versions and r.get("title_embedding")
+                  and r.get("embedding_model") == dedup.EMBEDDING_MODEL]
+            if vs:
+                scores[p["id"]] = _vector_scores(vecs, vs)
+            if time.monotonic() >= deadline:
+                partial_vectors = n + 1 < len(ordered)
+                break
     for i, row in enumerate(flags):
-        vec = vectors[i] if vectors and i < len(vectors) else None
-        if not vec:
-            continue
-        scores = {pid: max(dedup.cosine_similarity(vec, v) for v in vs if len(v) == len(vec))
-                  for pid, vs in by_project.items() if any(len(v) == len(vec) for v in vs)}
-        own = scores.get(target["id"])
-        others = [(score, pid) for pid, score in scores.items() if pid != target["id"]]
+        per = {pid: s[i] for pid, s in scores.items() if i in s}
+        own = per.get(target["id"])
+        others = [(score, pid) for pid, score in per.items() if pid != target["id"]]
         if own is not None and others:
             score, pid = max(others)
             if score >= 0.72 and score - own >= 0.08:
                 row["title_vector"] = {"other_project_id": pid, "other_similarity": score,
                                        "own_similarity": own, "model": dedup.EMBEDDING_MODEL}
-    return {"status": "shadow", "flags": [r for r in flags if r["markers"] or r.get("title_vector")],
-            "vector_projects_sampled": len(by_project),
-            "note": "跨项目信号只记录、不拦入库。向量仅比同模型的近期标题样本，不能当成正文归属或完整扫描。"}
+    out = {"status": "shadow", "flags": [r for r in flags if r["markers"] or r.get("title_vector")],
+           "vector_projects_sampled": len(scores), "projects_total": len(projects),
+           "note": "跨项目信号只记录、不拦入库。向量仅比同模型的近期标题样本，不能当成正文归属或完整扫描。"}
+    if partial_vectors:
+        out["vector_partial"] = True
+    return out
 
 
 # commit_drafts 留给跨项目检查的上界; 判定的预算要先把它扣出来(J-08, COMMIT_RESPONSE_BUDGET_SEC)。
 _ISOLATION_TIMEOUT_SEC = 1.5
+# 向量样本拉到截止前这么多秒就停, 留给比对和回包。
+_ISOLATION_COMPARE_RESERVE_SEC = 0.25
 # 判定预算低于这个数就不发: 和 JUDGE_TIMEOUT_SEC 的下界同一个数, 再少连查库都查不完。
 _JUDGE_MIN_BUDGET_SEC = 1.0
 
 
 def _cross_project_shadow_bounded(client, project_id, user_id, drafts, vectors, exclude_versions):
+    partial: dict = {}
     try:
         future = _bounded_submit(_ISOLATION_POOL, _ISOLATION_SLOTS, _cross_project_shadow,
-                                 client, project_id, user_id, drafts, vectors, exclude_versions)
+                                 client, project_id, user_id, drafts, vectors, exclude_versions,
+                                 partial, time.monotonic() + _ISOLATION_TIMEOUT_SEC - 0.1)
         if future is None:
             return {"status": "busy", "flags": [], "note": "跨项目检查线程占满，无从判断；入库结果不变"}
         return future.result(timeout=_ISOLATION_TIMEOUT_SEC)
     except cf.TimeoutError:
         future.cancel()  # A running call retains its slot until the done callback.
+        markers = partial.get("markers")
+        if markers is not None:
+            return {"status": "timeout", "flags": [r for r in markers if r["markers"]], "markers_checked": True,
+                    "note": "品牌词标记已查完；标题向量没比完，不能声称已完整排除串项目；入库结果不变"}
         return {"status": "timeout", "flags": [], "note": "跨项目检查超时，无从判断；入库结果不变"}
     except Exception as exc:
         logger.warning("cross-project shadow failed: %s", type(exc).__name__)

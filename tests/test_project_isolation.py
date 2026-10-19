@@ -124,3 +124,57 @@ def test_isolation_timeout_cannot_accumulate_workers(monkeypatch):
     finally:
         release.set()
         pool.shutdown(wait=True)
+
+
+def test_markers_survive_when_the_vector_half_times_out(monkeypatch):
+    """10-14 / 10-19 五批 15~20 篇全超时, 以前连品牌词标记一起丢 (W-19 等于没开)。"""
+    c = client()
+    release = threading.Event()
+    pool, slots = cf.ThreadPoolExecutor(max_workers=1), threading.BoundedSemaphore(1)
+    monkeypatch.setattr(core, "_ISOLATION_POOL", pool)
+    monkeypatch.setattr(core, "_ISOLATION_SLOTS", slots)
+    monkeypatch.setattr(core, "_ISOLATION_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(core, "_ISOLATION_COMPARE_RESERVE_SEC", 0)
+    monkeypatch.setattr(store, "isolation_fingerprints", lambda *a: (release.wait(4), [])[1])   # 拉样本卡住
+    drafts = [{"title": "西屋好用", "body": ""}, {"title": "痘痘贴76片", "body": ""}]
+    try:
+        out = core._cross_project_shadow_bounded(c, "west", ME, drafts, [[1., 0.], [0., 1.]], set())
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+    assert out["status"] == "timeout" and out["markers_checked"] is True
+    assert [f["index"] for f in out["flags"]] == [1] and out["flags"][0]["markers"]
+    assert "不能声称已完整排除" in out["note"]
+
+
+def test_vector_half_stops_at_its_own_deadline_instead_of_timing_out(monkeypatch):
+    c = client()
+    model = core.dedup.EMBEDDING_MODEL
+    c.rows["draft_fingerprints"] = [
+        {"id": "1", "project_id": "west", "version_id": "a", "title_embedding": [1., 0.], "embedding_model": model},
+        {"id": "2", "project_id": "patch", "version_id": "b", "title_embedding": [0., 1.], "embedding_model": model}]
+    real, seen = store.isolation_fingerprints, []
+
+    def slow(sb, pid, m):
+        seen.append(pid)
+        core.time.sleep(0.15)
+        return real(sb, pid, m)
+
+    monkeypatch.setattr(store, "isolation_fingerprints", slow)
+    monkeypatch.setattr(core, "_ISOLATION_COMPARE_RESERVE_SEC", 0)
+    out = core._cross_project_shadow(c, "west", ME, [{"title": "痘痘贴", "body": ""}], [[0., 1.]], set(),
+                                     None, core.time.monotonic() + 0.1)
+    assert seen == ["west"] and out["vector_partial"] is True
+    assert out["vector_projects_sampled"] == 1 and out["projects_total"] == 2
+    assert out["flags"] and out["flags"][0]["markers"], "向量没比完, 标记照报"
+
+
+def test_matrix_and_pairwise_scores_agree(monkeypatch):
+    vecs = {0: [1., 0., 0.], 2: [0.6, 0.8, 0.]}
+    vs = [[0., 1., 0.], [1., 1., 0.], [0., 0., 0.], [1., 2.]]
+    fast = core._vector_scores(vecs, vs)
+    monkeypatch.setattr(core.dedup, "similarity_matrix", lambda *a: None)
+    slow = core._vector_scores(vecs, vs)
+    assert fast.keys() == slow.keys() == {0, 2}
+    assert all(abs(fast[i] - slow[i]) < 1e-9 for i in fast)
+    assert core._vector_scores({0: [1., 0.]}, [[1., 0., 0.]]) == {}, "维度不同的样本不算这个项目"
