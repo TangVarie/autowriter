@@ -1929,6 +1929,32 @@ def tv_project_map(sb) -> list[dict]:
                  .order("tv_project_id").execute()).data or [])
 
 
+def tv_link_kinds_since(sb, tv_project_ids: list[str], since: str) -> list[dict]:
+    """这几个 TV 项目里, ``since`` 之后新写进对照表的笔记各是哪种对上法(core.desk_gaps 用)。
+
+    matched_at 是这条对照第一次写进去的时间(tv-sync 每晚只写新笔记), 窗口按它切。按 note_id 翻页(唯一)。"""
+    if not tv_project_ids:
+        return []
+    return _paged(lambda off, lim: (
+        sb.table("tv_note_links")
+          .select("note_id, tv_project_id, match_kind")
+          .in_("tv_project_id", list(tv_project_ids))
+          .gte("matched_at", since)
+          .order("note_id")
+          .range(off, off + lim - 1)))
+
+
+def any_draw_since(sb, project_ids: list[str], since: str) -> bool:
+    """这几个写作台项目 ``since`` 之后有没有发过一次牌(谁发的都算)。"""
+    if not project_ids:
+        return False
+    rows = (sb.table("angle_ledger").select("id")
+              .in_("project_id", list(project_ids))
+              .gte("drawn_at", since)
+              .limit(1).execute()).data or []
+    return bool(rows)
+
+
 def tv_map_upsert(sb, tv_project_id: str, project_id: str, *,
                   ingest_target: bool, note: str = "") -> None:
     sb.table("tv_project_map").upsert(

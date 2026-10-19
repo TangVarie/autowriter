@@ -3933,6 +3933,77 @@ def _avg(xs) -> int | None:
     return round(sum(xs) / len(xs)) if xs else None
 
 
+# ── 发出去的帖写作台没接住(desk_gap, 2026-10-19 TV O-04) ────────────────────────
+# 途鸽 9-16 之后写作台一次调用都没收到, 10-12 那周发出去 22 篇全是补录副本; 同一位写手别的项目照常在写作台里写。
+# 漏接的那些对话本身连不到写作台, 在那里提醒没用 —— 所以在【连着】的对话里(open_project / list_projects)
+# 告诉运营: 你名下哪个项目最近发出去的帖写作台没接住, 下次写它要在连着写作台的对话里写。口径同 TV 角度台账
+# 那盏灯的判据 C: 近 7 天补录副本 >= 10 篇、对上 <= 2 篇、这个项目近 60 天在写作台里发过牌。
+DESK_GAP_DAYS = 7
+DESK_GAP_MIN_UNCAUGHT = 10
+DESK_GAP_MAX_CAUGHT = 2
+DESK_GAP_USED_WITHIN_DAYS = 60
+DESK_GAP_CACHE_SEC = 600          # 一场对话开头 list_projects + open_project 会连着问两次, 数一天才变一次
+_desk_gap_cache: dict[tuple, tuple[float, list]] = {}
+DESK_GAP_TASK = "把 message 原样告诉用户, 同一场对话里说过就不再说; 然后照常继续, 不用等用户回答。"
+
+
+def _desk_gap_items(client, user_id: str) -> list[dict]:
+    key = (id(client), user_id)          # 生产里 client 是单例; 测试里每个假库各算各的
+    hit = _desk_gap_cache.get(key)
+    if hit and time.monotonic() - hit[0] < DESK_GAP_CACHE_SEC:
+        return hit[1]
+    mine = {p["id"]: p.get("name") or p["id"] for p in store.list_all_projects(client, owner_id=user_id)}
+    groups: dict[str, list[str]] = {}
+    target: dict[str, str] = {}
+    for m in store.tv_project_map(client):
+        if m["project_id"] in mine:
+            groups.setdefault(m["tv_project_id"], []).append(m["project_id"])
+            if m.get("ingest_target"):
+                target[m["tv_project_id"]] = m["project_id"]
+    items: list[dict] = []
+    if groups:
+        counts: dict[str, list[int]] = {}
+        for r in store.tv_link_kinds_since(client, list(groups), store.iso_ago(DESK_GAP_DAYS)):
+            c = counts.setdefault(r["tv_project_id"], [0, 0])
+            if r.get("match_kind") == "ingested":
+                c[0] += 1
+            elif r.get("match_kind") in _TV_BACKFILL_KINDS:
+                c[1] += 1
+        used_since = store.iso_ago(DESK_GAP_USED_WITHIN_DAYS)
+        for tv, pids in sorted(groups.items()):
+            ing, caught = counts.get(tv, (0, 0))
+            if ing < DESK_GAP_MIN_UNCAUGHT or caught > DESK_GAP_MAX_CAUGHT:
+                continue
+            if not store.any_draw_since(client, pids, used_since):
+                continue        # 近 60 天没在写作台里写过的项目: 本来就不在这写, 不唠叨
+            name = mine.get(target.get(tv, "")) or min(mine[p] for p in pids)
+            items.append({"tv_project_id": tv, "project": name, "project_ids": sorted(pids),
+                          "published": ing + caught, "caught": caught})
+    _desk_gap_cache[key] = (time.monotonic(), items)
+    return items
+
+
+def desk_gaps(client, *, user_id: str | None, current_project_id: str | None = None) -> dict | None:
+    """调用者名下, 最近发出去的帖写作台没接住的项目 + 给运营的一段原话。没有就 None。只读, 只看调用者自己的项目。"""
+    if not user_id:
+        return None
+    items = _desk_gap_items(client, user_id)
+    if not items:
+        return None
+    lines = []
+    for it in items:
+        name, n, caught = it["project"], it["published"], it["caught"]
+        if current_project_id and current_project_id in it["project_ids"]:
+            lines.append(f"「{name}」最近 {DESK_GAP_DAYS} 天发出去 {n} 篇, 写作台只接住 {caught} 篇。这次就在写作台里写, "
+                         f"写完记得让写作台打分(打分会顺手存档), 发出去以后才认得出是这里写的。")
+        else:
+            lines.append(f"「{name}」最近 {DESK_GAP_DAYS} 天发出去 {n} 篇, 写作台只接住 {caught} 篇: 其余的要么是在没连"
+                         f"写作台的对话里写的, 要么写完没让写作台打分存档, 这些稿没有查重, 也进不了改稿复盘。下次写{name}"
+                         f"请在连着写作台的对话里写, 开头先说「打开{name}」, 写完让写作台打分(打分会顺手存档)。")
+    return {"projects": [{k: v for k, v in it.items() if k != "project_ids"} for it in items],
+            "message": "写作台提醒:\n" + "\n".join(lines), "task": DESK_GAP_TASK}
+
+
 def edit_digest(client, project_id: str, *, user_id: str | None = None,
                 now: datetime | None = None) -> dict | None:
     """这个项目该不该给一份"人改了什么"的摘要: 上次看过不到一周、或者新改过的不到 3 篇 → None。"""

@@ -266,9 +266,29 @@ def list_projects(_user_id: str | None = None) -> dict:
     **别相减**。读法: ingest_copies 大 = 这个项目的"积累"大半是 TV 笔记的影子, 不是写作台写过那么多篇。
 
     这里看不到的项目就是不归你 —— 不要去猜别人的 project_id 试, 其它工具会拒绝。
+
+    **用户要写 / 改某个品牌的小红书稿或评论、却没说是哪个项目(只报了品牌名、只贴了 brief、只点了
+    human-writing), 先调这个找项目, 再 open_project。** 没说写作台也一样: 写稿就走写作台。
+
+    返回里有 ``desk_gap`` 时: 你名下有项目最近发出去的帖写作台没接住(没连写作台的对话里写的, 或写完没打分存档)。
+    把 ``desk_gap.message`` 原样告诉用户, 同一场对话里说过就不再说, 然后照常继续。
     """
-    return _safe(lambda: {"projects": core.list_projects(core.sb(),
-                                                         user_id=_user_id)})
+    def _list():
+        out = {"projects": core.list_projects(core.sb(), user_id=_user_id)}
+        gap = _desk_gap(_user_id)
+        if gap:
+            out["desk_gap"] = gap
+        return out
+    return _safe(_list)
+
+
+def _desk_gap(user_id: str | None, project_id: str | None = None) -> dict | None:
+    """附加提醒: 查不到就不带, 不能把清单 / 简报弄坏。"""
+    try:
+        return core.desk_gaps(core.sb(), user_id=user_id, current_project_id=project_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("desk_gap 查不到, 这次不带", exc_info=True)
+        return None
 
 
 def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
@@ -278,7 +298,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
                  _user_id: str | None = None) -> dict:
     """打开一个项目, 一次拿到写这个项目需要的【全部】上下文。
 
-    动笔前必须先调这个。返回:
+    动笔前必须先调这个: 给任何品牌写或改小红书稿、写评论之前都要先开项目, 用户没提写作台、只报了品牌名、
+    只贴了 brief、只点了 human-writing 也一样(不知道是哪个项目就先 list_projects)。返回:
       · stable —— 项目人格/定位, 照抄进你的写作上下文
       · p0 —— 【不可违反的硬约束】, 必须 100% 满足, 与任何偏好冲突时以它为准
       · p1 —— 项目调性偏好 + 调校笔记 + 正反案例, 理解意图后按适用性应用
@@ -320,6 +341,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     12 位值(传整行也认)。skill 里没有这一行就传空。返回里有 ``skill_update`` 时, 说明 skill 不是最新版
     (或没核到版本): 把 ``skill_update.message`` **原样**(三行都要, 链接和「更新技能」那行一字不改)
     放在给用户回复的最前面, 然后照常继续写 —— 不拦写稿, 只是提醒升级。
+
+    返回里有 ``desk_gap`` 时: 你名下有项目最近发出去的帖写作台没接住。把 ``desk_gap.message`` 原样告诉
+    用户(同一场对话里说过就不再说), 然后照常写; 当前这个项目也在里面的话, 那句话就是提醒这次写完要打分存档。
     """
     brief = {"tactic": tactic, "draft_topic": draft_topic,
              "key_messages": key_messages, "target_audience": target_audience,
@@ -338,6 +362,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         digest = None
     if digest:
         out["edit_digest"] = digest
+    gap = _desk_gap(_user_id, project_id)
+    if gap:
+        out["desk_gap"] = gap
     # 服务端版本探针 (skillcheck)。协议文件读不了就跳过 —— 探针不能把合规读弄坏。
     try:
         digest = protocol_text()[1]
