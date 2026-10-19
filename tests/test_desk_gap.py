@@ -41,11 +41,11 @@ def _client(*, ing=22, caught=0, drew_days=30, owner=ME, stale_links=0, other_ow
              {"tv_project_id": "TUGE", "project_id": "p-tuge", "ingest_target": True, "note": ""},
              {"tv_project_id": "TUGE", "project_id": "p-tuge-x", "ingest_target": False, "note": ""},
              {"tv_project_id": "SPX", "project_id": "p-spx", "ingest_target": True, "note": ""}]
-    notes: dict[str, list] = {"TUGE": [], "SPX": []}
+    notes: list[dict] = []
     links: list[dict] = []
 
     def add(nid, tv, kind, pid, published, created=None, lag=1):
-        notes[tv].append({"note_id": nid, "publish_time": published, "created_at": created or published})
+        notes.append({"note_id": nid, "project_id": tv, "publish_time": published, "body": "（正文不该被取）"})
         links.append({"note_id": nid, "tv_project_id": tv, "project_id": pid, "match_kind": kind,
                       "lag_days": lag, "matched_at": _ago(hours=1)})   # 全都是刚连上的 —— 窗口不该按它切
 
@@ -69,17 +69,9 @@ def _client(*, ing=22, caught=0, drew_days=30, owner=ME, stale_links=0, other_ow
     ledger = ([] if never_drew else [{"id": "a1", "project_id": "p-tuge", "drawn_at": _ago(days=drew_days)}]) + [
               {"id": "a2", "project_id": "p-spx", "drawn_at": _ago(days=1)},
               {"id": "a3", "project_id": "p-tuge-x", "drawn_at": _ago(days=1)}]
-    c = FakeClient(rows={"projects": projects, "tv_project_map": tvmap,
-                         "tv_note_links": links, "angle_ledger": ledger})
-
-    def _tv_notes(a):
-        rows = sorted(notes.get(a["_tv_project_id"], []), key=lambda r: r["note_id"])
-        rows = [r for r in rows if (a.get("_since") is None or r["created_at"] >= a["_since"])
-                and (a.get("_after") is None or r["note_id"] > a["_after"])]
-        return rows[:a.get("_limit") or 500]
-
-    c.rpc_impl = {"deskcore_tv_notes": _tv_notes}
-    return c
+    # 不配 deskcore_tv_notes: 那个 RPC 带正文, desk_gap 不该走它(调了会抛 PGRST202)
+    return FakeClient(rows={"projects": projects, "tv_project_map": tvmap, "tv_note_links": links,
+                            "angle_ledger": ledger, "truth_vault.notes": notes})
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +95,14 @@ def test_the_tuge_shape_is_reported():
     assert "没调起写作台" in gap["message"]
     assert "project_ids" not in p, "给模型看的不带内部 id 列表"
     assert gap["task"] == core.DESK_GAP_TASK
+
+
+def test_reads_only_ids_from_truth_vault_notes_not_the_body_rpc():
+    c = _client()
+    assert _gap(c) is not None
+    assert not c.rpc_calls, "不该走 deskcore_tv_notes(它把正文一起带回来)"
+    sel = [q for q in c.calls if q["table"] == "truth_vault.notes"]
+    assert sel and all("body" not in q["cols"] for q in sel), sel
 
 
 def test_window_is_publish_time_not_link_time():

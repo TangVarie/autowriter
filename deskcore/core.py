@@ -3944,10 +3944,8 @@ DESK_GAP_DAYS = 7
 DESK_GAP_MIN_UNCAUGHT = 10
 DESK_GAP_MAX_CAUGHT = 2
 DESK_GAP_CACHE_SEC = 600          # 一场对话开头 list_projects + open_project 会连着问两次, 数一天才变一次
-# 发布时间窗靠 TV 的 deskcore_tv_notes RPC 取; 它只能按 TV 入库时间(created_at)过滤, 所以先取近 30 天入库的,
-# 再按 publish_time 筛近 7 天发出去的。不按对照表的 matched_at 切: 新接一张表、或者 tv-sync 停了几天再补,
-# 一批旧笔记会同时拿到很新的 matched_at, 被说成"最近 7 天发的"(codex review on aw#109)。
-DESK_GAP_NOTES_CREATED_WITHIN_DAYS = 30
+# 窗口按 truth_vault.notes.publish_time 切(只取 id), 不按对照表的 matched_at: 新接一张表、或者 tv-sync 停了几天
+# 再补, 一批旧笔记会同时拿到很新的 matched_at, 被说成"最近 7 天发的"(codex review on aw#109)。
 _desk_gap_cache: dict[str, tuple[float, list]] = {}
 DESK_GAP_TASK = "把 message 原样告诉用户, 同一场对话里说过就不再说; 然后照常继续, 不用等用户回答。"
 
@@ -3969,13 +3967,9 @@ def _desk_gap_items(client, user_id: str) -> list[dict]:
     items: list[dict] = []
     if groups:
         wall = _utcnow()
-        lo = wall - timedelta(days=DESK_GAP_DAYS)
-        recent: list[str] = []
-        for tv in groups:
-            for n in store.tv_notes(client, tv, since=store.iso_ago(DESK_GAP_NOTES_CREATED_WITHIN_DAYS)):
-                pt = tvlink._as_dt(n.get("publish_time"))
-                if pt and lo <= pt <= wall:          # 排期还没发的(publish_time 在未来)不算
-                    recent.append(n["note_id"])
+        # 上界 = 现在: 排期还没发的(publish_time 在未来)不算
+        recent = store.tv_published_note_ids(client, list(groups),
+                                             (wall - timedelta(days=DESK_GAP_DAYS)).isoformat(), wall.isoformat())
         counts: dict[str, list[int]] = {}
         for r in store.tv_link_kinds_for_notes(client, recent):
             # 只数对到【调用者自己】项目上的: 一个 TV 项目可能映射到好几个人的写作台项目(codex review on aw#109)
