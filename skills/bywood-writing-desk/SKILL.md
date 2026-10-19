@@ -11,6 +11,8 @@ description: 帆谷/BYWOOD 小红书种草内容的【写作台协议】，接 d
 
 判断只有一条：这场对话写出来的东西，会不会发到某个品牌的小红书上（笔记、标题、评论都算）。会，就先走本 skill：不知道是哪个项目先 `list_projects`，再 `open_project` 拿简报，拿到再写。用户没提写作台、只说了品牌名、只贴了 brief、只点了 human-writing，都一样——操作的人不需要知道写作台是什么，记住流程的是你。只是闲聊、问问题、改提示词，才不用。
 
+**对话里一出现 human-writing**（用户点了它，或者它被调起来了），就停一下核对：这次写的东西是不是要发到某个品牌的小红书上？是，就同时用本 skill，先 `open_project` 再动笔——human-writing 管文笔，规则、查重、存档只有本 skill 有，单用 human-writing 写出来的稿子写作台看不见。
+
 ## 对话开始时先核一次版本
 
 调 deskcore 的 `get_protocol`，把下面 `protocol_version:` 那一行的 12 位值传给 `local_version`（传整行也认）：
@@ -37,8 +39,8 @@ description: 帆谷/BYWOOD 小红书种草内容的【写作台协议】，接 d
 - `bywood-writing-desk`（本 skill）管这一批守不守项目规则、跟历史重不重
 - `seeding-prompt-refiner` 管提示词本身怎么迭代
 
-<!-- protocol_version: 65af2e8c382a -->
-protocol_version: 65af2e8c382a
+<!-- protocol_version: 7707f44152c9 -->
+protocol_version: 7707f44152c9
 
 # 写作台协议
 
@@ -89,7 +91,7 @@ protocol_version: 65af2e8c382a
 
 > 这个对话没连上写作台：现在写出来的稿子不会查重、不会存档，发出去以后飞轮也认不出是写作台写的。先检查 WorkBuddy 里写作台的连接（mcp.json 的地址和 key），连上再写。
 
-用户说「先这样写吧」也不写，这不是让运营做的选择题。2026-10-19 查出来的事：途鸽 9-16 之后发出去的稿子写作台一篇都没收到，10-12 那周的 22 篇在全库存档里一句都找不到，写手却一直以为在用写作台——没连上的对话照着协议把整套流程走完了，看起来和真用了一模一样。
+用户说「先这样写吧」也不写，这不是让运营做的选择题。为什么写死：本协议就在 skill 里，没连上的对话照着它也能把整套流程走完，看起来和真用了写作台一模一样，服务端却一条记录都没有，稿子没查重、也进不了复盘。
 
 把本次要写什么（tactic / draft_topic / key_messages / target_audience）一并传进去，正案例会按相关性挑而不是按时间倒序。
 

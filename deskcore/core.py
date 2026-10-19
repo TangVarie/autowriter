@@ -3935,8 +3935,9 @@ def _avg(xs) -> int | None:
 
 # ── 发出去的帖写作台没接住(desk_gap, 2026-10-19 TV O-04) ────────────────────────
 # 途鸽 9-16 之后写作台一次调用都没收到, 10-12 那周发出去 22 篇全是补录副本; 同一位写手别的项目照常在写作台里写。
-# 漏接的那些对话本身连不到写作台, 在那里提醒没用 —— 所以在【连着】的对话里(open_project / list_projects)
-# 告诉运营: 你名下哪个项目最近发出去的帖写作台没接住, 下次写它要在连着写作台的对话里写。口径同 TV 角度台账
+# owner 10-19 确认 WorkBuddy 的写作台连接是全局的(新开对话就能列项目), 那一波是 skill 没被调起来、没开项目就写了。
+# 漏接的那些对话里写作台没被调用, 在那里提醒不了 —— 所以在调到写作台的对话里(open_project / list_projects)
+# 告诉运营: 你名下哪个项目最近发出去的帖写作台没接住, 下次写它先说「打开它」。口径同 TV 角度台账
 # 那盏灯的判据 C: 近 7 天补录副本 >= 10 篇、对上 <= 2 篇、这个项目近 60 天在写作台里发过牌。
 DESK_GAP_DAYS = 7
 DESK_GAP_MIN_UNCAUGHT = 10
@@ -3997,8 +3998,8 @@ def desk_gaps(client, *, user_id: str | None, current_project_id: str | None = N
             lines.append(f"「{name}」最近 {DESK_GAP_DAYS} 天发出去 {n} 篇, 写作台只接住 {caught} 篇。这次就在写作台里写, "
                          f"写完记得让写作台打分(打分会顺手存档), 发出去以后才认得出是这里写的。")
         else:
-            lines.append(f"「{name}」最近 {DESK_GAP_DAYS} 天发出去 {n} 篇, 写作台只接住 {caught} 篇: 其余的要么是在没连"
-                         f"写作台的对话里写的, 要么写完没让写作台打分存档, 这些稿没有查重, 也进不了改稿复盘。下次写{name}"
+            lines.append(f"「{name}」最近 {DESK_GAP_DAYS} 天发出去 {n} 篇, 写作台只接住 {caught} 篇: 其余的要么写的时候没"
+                         f"调起写作台(没先打开项目), 要么写完没让写作台打分存档, 这些稿没有查重, 也进不了改稿复盘。下次写{name}"
                          f"请在连着写作台的对话里写, 开头先说「打开{name}」, 写完让写作台打分(打分会顺手存档)。")
     return {"projects": [{k: v for k, v in it.items() if k != "project_ids"} for it in items],
             "message": "写作台提醒:\n" + "\n".join(lines), "task": DESK_GAP_TASK}
