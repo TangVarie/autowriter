@@ -562,14 +562,14 @@ async def _collect_health() -> dict:
             },
             "librarian": {"configured": bool(os.environ.get("LIBRARIAN_URL")
                                              or getattr(config, "LIBRARIAN_URL", ""))},
-            # 入库判定(commit_drafts 之后发给 judge, 影子期只记不拦)。取值走
+            # 存档时的判定(score_drafts / commit_drafts 之后发给 judge; D-120 起分数给写手看, 仍不拦)。取值走
             # judge_client 自己那两个函数 —— 与真正发请求的地方同源(docs/deskcore.md §4.2
             # 那条教训: 回显另读一遍 env, 配错时就当场看不见)。只回"接没接"和截止秒数, 不探活:
             # 探活要打外网, 而 /health 是 Railway 的存活探针。
             "judge": {"configured": judge_client.configured(),
                       "timeout_sec": judge_client.timeout_sec(),
                       "draft_tool_timeout_sec": judge_client.tool_timeout_sec(),
-                      "mode": "shadow"},
+                      "mode": "visible"},
             # auth_health 把三态分开: 配好了 / 配了但坏了(全 401) / 没配。
             # ROB-003 之后"没配"也是全 401 —— 不再静默放行, 只有显式设了
             # DESKCORE_ALLOW_ANONYMOUS=1 才放行(那时 note 里会写明是 dev 模式)。
@@ -744,8 +744,10 @@ def _register_mcp():
                                 "对话开始时调一次 get_protocol, 带上 skill 里 "
                                 "protocol_version 那一行的值核对版本: 一致就照 skill "
                                 "执行; 不一致就照返回的正文执行并提醒用户重新导入 "
-                                "skill; 没装 skill 就不带参数调它拿全文。open_project 每次带上 "
-                                "skill_version (同一个值)。任何工具的返回里出现 skill_update, "
+                                "skill; 没装 skill 就不带参数调它拿全文。open_project / comments_for 每次带上 "
+                                "skill_version (同一个值)。稿子写完过了 check_drafts 就调 score_drafts "
+                                "(存档 + 参考分, 不拦), 不用等用户定稿, 也没有导出这一步。"
+                                "任何工具的返回里出现 skill_update, "
                                 "就把它的 message 原样放在给用户回复的最前面。"))
 
     def _wrap(fn, needs_user: bool, name: str):

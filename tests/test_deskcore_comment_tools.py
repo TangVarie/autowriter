@@ -43,7 +43,9 @@ def test_comments_timeout_and_registered_tools(wired):
     reply["fn"] = fail
     out = core.judge_thread(_client(), PROJ, "t", "b", [{"text": "x"}], user_id=ME)
     assert out["judge_status"] == "timeout" and "passed" not in out
-    assert tools.TOOLS["judge_thread"][1] and tools.TOOLS["comment_repair_plan_for"][1]
+    # D-120: 写手侧换成 comments_for / score_comments(按链接取帖子、整组判); 单条 / 整组两个旧入口只留在 core
+    assert tools.TOOLS["comments_for"][1] and tools.TOOLS["score_comments"][1]
+    assert "judge_thread" not in tools.TOOLS and "comment_repair_plan_for" not in tools.TOOLS
 
 
 @pytest.mark.parametrize("body", [

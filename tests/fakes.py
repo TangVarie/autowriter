@@ -49,6 +49,7 @@ class FakeQuery:
         self.count_mode = None
         self.rng: tuple[int, int] | None = None
         self.orders: list[str] = []
+        self.sort_keys: list[tuple[str, bool]] = []     # (列, desc) —— select 真按它排(和 PostgREST 一样)
         self._negate_next = False
         self.payload = None
         self.op = "select"
@@ -87,6 +88,10 @@ class FakeQuery:
         self.filters.append(("lte", key, value))
         return self
 
+    def ilike(self, key, pattern):
+        self.filters.append(("ilike", key, pattern))
+        return self
+
     def is_(self, key, value):
         # ``.not_.is_(k, "null")`` 与 ``.is_(k, "null")`` 是一对反义, 假件要分开
         self.filters.append(("isnot" if self._negate_next else "is", key, value))
@@ -107,6 +112,7 @@ class FakeQuery:
     # ── 排序 / 分页 ──────────────────────────────────────────────────
     def order(self, column, desc=False, **kwargs):
         self.orders.append(column)
+        self.sort_keys.append((column, bool(desc)))
         return self
 
     def limit(self, n):
@@ -129,6 +135,7 @@ class FakeQuery:
     def upsert(self, payload, **kwargs):
         self.op, self.payload = "upsert", payload
         self.on_conflict = kwargs.get("on_conflict")
+        self.ignore_duplicates = bool(kwargs.get("ignore_duplicates"))
         return self
 
     def delete(self):
@@ -174,6 +181,16 @@ class FakeClient:
 
     def table(self, name):
         return FakeQuery(self, name)
+
+    def schema(self, name):
+        """``sb.schema("truth_vault").table("notes")`` → 假库里的 ``truth_vault.notes`` 表(带 schema 前缀的键)。"""
+        client = self
+
+        class _Schema:
+            @staticmethod
+            def table(t):
+                return FakeQuery(client, f"{name}.{t}")
+        return _Schema()
 
     def rpc(self, name, args):
         self.rpc_calls.append((name, args))
@@ -228,6 +245,19 @@ class FakeClient:
             return cur is None
         if kind == "isnot":
             return cur is not None
+        if kind == "ilike":
+            # PostgREST ilike: % 任意串, _ 单个字符, 不分大小写
+            import re as _re
+            rx, i = "", 0
+            while i < len(value):
+                ch = value[i]
+                if ch == "\\" and i + 1 < len(value):      # 转义: 下一个字符照字面
+                    rx += _re.escape(value[i + 1])
+                    i += 2
+                    continue
+                rx += ".*" if ch == "%" else "." if ch == "_" else _re.escape(ch)
+                i += 1
+            return cur is not None and _re.fullmatch(rx, str(cur), _re.I | _re.S) is not None
         raise AssertionError(f"假件不认识这个过滤器: {kind}")
 
     def _execute(self, q: FakeQuery):
@@ -288,7 +318,9 @@ class FakeClient:
                     hit = next((r for r in table
                                 if all(r.get(k) == row.get(k) for k in keys)), None)
                     if hit is not None:
-                        hit.update({k: v for k, v in row.items() if k != "id"})
+                        # ignore_duplicates = ON CONFLICT DO NOTHING: 撞上就不动, 也不回这一行
+                        if not getattr(q, "ignore_duplicates", False):
+                            hit.update({k: v for k, v in row.items() if k != "id"})
                     else:
                         rest.append(row)
                 payload = rest
@@ -308,7 +340,13 @@ class FakeClient:
                 r.update(q.payload or {})
             return FakeResponse(hits)
 
-        # select —— count 在分页【之前】算, 与 PostgREST 一致
+        # select —— 先排序再分页, count 在分页【之前】算, 与 PostgREST 一致。
+        # 排序按 .order() 的先后(第一个是主键); NULL 的位置跟 PG 默认一样: 升序排最后, 降序排最前。
+        for col, desc in reversed(getattr(q, "sort_keys", [])):
+            present = [r for r in hits if r.get(col) is not None]
+            absent = [r for r in hits if r.get(col) is None]
+            ordered = sorted(present, key=lambda r: r.get(col), reverse=desc)
+            hits = absent + ordered if desc else ordered + absent
         total = len(hits)
         if q.rng:
             hits = hits[q.rng[0]:q.rng[1] + 1]

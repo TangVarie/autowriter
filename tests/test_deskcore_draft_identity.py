@@ -242,7 +242,8 @@ def test_partial_mint_reports_the_ones_that_made_it(monkeypatch):
     assert len(out["version_ids"]) == 1
     w = out["identity_warning"]
     assert "只有 1 条建成" in w, w
-    assert "batch-9" in w, "要告诉调用方已建成的那部分怎么导"
+    assert "batch-9" in w, "要告诉调用方已建成的是哪一批"
+    assert "export_drafts" not in w, "D-120 撤了导出工具, 不许再指过去"
 
 
 def test_angles_of_unminted_drafts_are_not_consumed(monkeypatch):

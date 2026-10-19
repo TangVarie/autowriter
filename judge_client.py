@@ -4,7 +4,8 @@
 背景
 ────
 JevforCoentent 仓 docs/00 #4(2026-09-23 拍板): 写作台的入库判定挂在
-``commit_drafts`` 内部, **advisory, 超时 8 秒即跳过, 答案进账本, 影子期只记不拦**。
+``commit_drafts`` 内部, **advisory, 超时 8 秒即跳过, 答案进账本, 不拦**。2026-10-19 起(D-120)
+结局不再是影子: core 把它折成一个参考分 + 最多 3 条修改建议, 直接回给写手(``score_drafts``)。
 账本是 TV 的 ``truth_vault.note_feature_answers``(``subject_type='aw_version'``,
 ``subject_id = autowriter.versions.id``), 由 judge 服务自己写(``write=true``);
 写作台这边只发稿子、收一个结局。
@@ -29,7 +30,7 @@ tv-sync 补录(``core._ingest_published_unlocked``)的那些已经是公开笔�
 
 结局(``judge_status``)
 ───────────────────────
-    ok               判完了(passed 是判定结论, 影子期不拿它拦任何东西)
+    ok               判完了(passed 是判定结论; 分数给写手看, 但不拦任何东西 —— D-120)
     not_configured   没配 JUDGE_URL / JUDGE_API_KEY(或调用方判出这次不该发, 见 core)
     timeout          超时(连接或读)。judge 那边可能仍会判完并写账本, 只是我们没等到
     policy_blocked   judge 按数据出境口径拒绝。**不重试** —— 重试也是同一个结果
@@ -82,6 +83,11 @@ SUBJECT_TYPE = "aw_version"
 _CONNECT_TIMEOUT_CAP_SEC = 3.0
 
 _DETAIL_MAX = 300
+# 修改单留几条、每条多长: 一篇最多 3 条给写手(core.SCORE_MAX_FIXES), 这里多留几条给 core 挑。
+_PLAN_MAX = 12
+_INSTRUCTION_MAX = 400
+# /judge_draft 回包里算分要用的字段(judge/api.py: view 的 hard_fails / unjudged + plan), 必须都是列表。
+_SCORE_FIELDS = ("hard_fails", "plan", "unjudged")
 # 错误体原文先留长一些再交给 result(): 脱敏要在**截断之前**做。原来这里先截到 300 再脱敏,
 # key 恰好跨在第 300 个字上时只剩半截, 值级脱敏认不出半截, 那半截就原样留在 detail 里。
 _RAW_DETAIL_MAX = 4 * _DETAIL_MAX
@@ -131,7 +137,7 @@ def result(status: str, *, detail: str = "", http_status: Optional[int] = None,
     out = {"judge_status": status, "http_status": http_status,
            "elapsed_ms": int(elapsed_ms), "detail": mask_secrets(detail or "")[:_DETAIL_MAX],
            "passed": None, "hard_fails": [], "calls": None, "written": None,
-           "policy": None, "plan_size": 0}
+           "policy": None, "plan_size": 0, "plan": [], "unjudged": 0, "invalid_reason": None}
     out.update(extra)
     return out
 
@@ -176,12 +182,35 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("passed"), bool):
         return None
+    # 分数给写手看之后(D-120), 缺字段不能再当"空": {"passed": false} 这种版本不兼容的回包会被折成满分 100、
+    # 没有修改建议(codex review on aw#107)。算分要用的三样必须是列表, 否则整篇算 error。
+    if not all(isinstance(payload.get(k), list) for k in _SCORE_FIELDS):
+        return None
     fails = []
-    for h in payload.get("hard_fails") or []:
-        # [bank, qid, answer, p, evidence] —— 证据句不带回来: 它是稿子里的原句, 账本里
-        # 有; 影子期也不希望写手模型对着它改稿(见 core 的 JUDGE_SHADOW_NOTE)。
-        if isinstance(h, (list, tuple)) and len(h) >= 4:
-            fails.append([h[0], h[1], h[2], h[3]])
+    for h in payload["hard_fails"]:
+        # [bank, qid, answer, p, evidence] —— 证据句不放在这里(它进下面的 plan, 一句话只带一份)。
+        # 形状不对的一行也算整篇 error: 悄悄丢掉它, 这篇就少扣了分(codex review on aw#107)。
+        if not (isinstance(h, (list, tuple)) and len(h) >= 4 and isinstance(h[1], str)
+                and (h[3] is None or (isinstance(h[3], (int, float)) and not isinstance(h[3], bool)))):
+            return None
+        fails.append([h[0], h[1], h[2], h[3]])
+    # 2026-10-19 起分数给写手看(D-120): 修改单留下来, 由 core 挑最有把握的几条给写手。只留看得懂的那几个字段,
+    # 暗题的条目 judge 那边已经抹成「有一项不公开的检查没过」。
+    plan = []
+    raw_plan = payload.get("plan")
+    # 先按把握排(高的在前、没给概率的最后)再截: 截在前面的话, 第 13 条以后有把握的修改会被前面拿不准的挤掉
+    # (codex review on aw#107)。core 的 sure 判据是 p ≥ 阈值, 按 p 降序排就是"有把握的在前"。
+    ranked = sorted((e for e in raw_plan if isinstance(e, dict)),
+                    key=lambda e: -(e["p"] if isinstance(e.get("p"), (int, float))
+                                    and not isinstance(e.get("p"), bool) else -1.0))
+    for e in ranked[:_PLAN_MAX]:
+        if isinstance(e, dict) and isinstance(e.get("instruction"), str) and e["instruction"].strip():
+            p = e.get("p")
+            plan.append({"kind": e.get("kind"), "qid": e.get("qid"),
+                         "p": p if isinstance(p, (int, float)) and not isinstance(p, bool) else None,
+                         "instruction": mask_secrets(e["instruction"])[:_INSTRUCTION_MAX]})
+    unjudged = payload.get("unjudged")
+    invalid = payload.get("invalid_reason")
     policy = payload.get("policy")
     if isinstance(policy, dict):
         policy = {k: policy.get(k) for k in
@@ -195,7 +224,10 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
             "calls": calls if isinstance(calls, int) else None,
             "written": written if isinstance(written, int) else None,
             "policy": policy,
-            "plan_size": len(payload.get("plan") or []) if isinstance(payload.get("plan"), list) else 0}
+            "plan_size": len(raw_plan),
+            "plan": plan,
+            "unjudged": len(unjudged),
+            "invalid_reason": invalid if isinstance(invalid, str) and invalid else None}
 
 
 def judge_draft(payload: dict, *, timeout: Optional[float] = None) -> dict:

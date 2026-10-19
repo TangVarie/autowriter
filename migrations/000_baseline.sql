@@ -1354,8 +1354,9 @@ CREATE TABLE IF NOT EXISTS autowriter.tv_note_links (
     project_id     UUID REFERENCES autowriter.projects(id) ON DELETE CASCADE,
     version_id     UUID REFERENCES autowriter.versions(id) ON DELETE SET NULL,
     item_id        UUID,
-    match_kind     TEXT NOT NULL CHECK (match_kind IN (
-                       'body_exact', 'title_exact', 'fuzzy', 'ingested',
+    -- 'edited': 包含度 0.30~0.60 且领先第二名 ≥0.15(013, D-120)
+    match_kind     TEXT NOT NULL CONSTRAINT tv_note_links_match_kind_check CHECK (match_kind IN (
+                       'body_exact', 'title_exact', 'fuzzy', 'edited', 'ingested',
                        'ambiguous', 'unmatched', 'tv_lineage')),
     score          REAL,
     lag_days       INTEGER,
@@ -1518,6 +1519,49 @@ ALTER TABLE autowriter.tv_project_map ENABLE ROW LEVEL SECURITY;
 ALTER TABLE autowriter.tv_note_links  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE autowriter.ingest_locks   ENABLE ROW LEVEL SECURITY;
 
+-- 人在发布前改了什么 + 每周摘要看到哪儿了 (migrations/013_tv_edits.sql, D-120 / W-23)
+CREATE TABLE IF NOT EXISTS autowriter.tv_edit_diffs (
+    note_id            TEXT PRIMARY KEY,
+    tv_project_id      TEXT NOT NULL,
+    project_id         UUID REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    version_id         UUID REFERENCES autowriter.versions(id) ON DELETE CASCADE,
+    match_kind         TEXT NOT NULL,
+    changed            BOOLEAN NOT NULL,
+    title_changed      BOOLEAN NOT NULL,
+    draft_title        TEXT NOT NULL DEFAULT '',
+    published_title    TEXT NOT NULL DEFAULT '',
+    draft_chars        INTEGER NOT NULL,
+    published_chars    INTEGER NOT NULL,
+    removed_count      INTEGER NOT NULL,
+    added_count        INTEGER NOT NULL,
+    edited_count       INTEGER NOT NULL DEFAULT 0,      -- 还在、但里面改了字的句子
+    removed_sentences  TEXT[] NOT NULL DEFAULT '{}',
+    added_sentences    TEXT[] NOT NULL DEFAULT '{}',
+    edited_sentences   JSONB NOT NULL DEFAULT '[]'::jsonb,   -- [[原句, 改后], ...] 最多 8 对
+    brand_draft        INTEGER,
+    brand_published    INTEGER,
+    publish_time       TIMESTAMPTZ,
+    computed_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 第一版 013 建的表没有这两列(建表 IF NOT EXISTS 不会补列): 重跑时补上
+ALTER TABLE autowriter.tv_edit_diffs
+    ADD COLUMN IF NOT EXISTS edited_count     INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS edited_sentences JSONB NOT NULL DEFAULT '[]'::jsonb;
+CREATE INDEX IF NOT EXISTS tv_edit_diffs_project_idx
+    ON autowriter.tv_edit_diffs (project_id, computed_at);
+GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.tv_edit_diffs TO service_role;
+ALTER TABLE autowriter.tv_edit_diffs ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE IF NOT EXISTS autowriter.tv_edit_digest_acks (
+    project_id      UUID PRIMARY KEY REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    acked_through   TIMESTAMPTZ NOT NULL,
+    acked_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    acked_by        UUID,
+    rules_recorded  INTEGER NOT NULL DEFAULT 0
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.tv_edit_digest_acks TO service_role;
+ALTER TABLE autowriter.tv_edit_digest_acks ENABLE ROW LEVEL SECURITY;
+
 -- ══════════════════════════════════════════════════════════════════════
 -- 发牌台账接上结果: autowriter.v_angle_outcomes (migrations/011_angle_outcomes_view.sql)
 -- 为什么、权限为什么非得「属主建 + 显式 GRANT」见 011 的文件头。下面的 DO 块与 011
@@ -1597,3 +1641,38 @@ BEGIN
     END IF;
 END;
 $v011$;
+
+-- 013 把 'edited' 也算作对上(D-120 / W-23); 整段与 013 逐字相同(tests/test_angle_outcomes_view.py)
+DO $v013$
+BEGIN
+    IF to_regclass('autowriter.v_angle_outcomes') IS NULL THEN
+        RAISE NOTICE '013: 没有 autowriter.v_angle_outcomes(011 跳过了), 不改视图';
+        RETURN;
+    END IF;
+    EXECUTE $view$
+        CREATE OR REPLACE VIEW autowriter.v_angle_outcomes
+        WITH (security_invoker = false) AS
+        SELECT a.id                  AS ledger_id,
+               a.project_id,
+               a.angle_key,
+               a.dims,
+               a.drawn_by,
+               a.drawn_at,
+               a.consumed_version_id,
+               a.consumed_at,
+               l.note_id,
+               l.tv_project_id,
+               l.match_kind,
+               l.lag_days,
+               n.tier,
+               n.publish_time
+          FROM autowriter.angle_ledger a
+          LEFT JOIN autowriter.tv_note_links l
+                 ON l.version_id = a.consumed_version_id
+                AND l.match_kind IN ('body_exact', 'title_exact', 'fuzzy', 'edited', 'tv_lineage')
+          LEFT JOIN truth_vault.notes n
+                 ON n.note_id = l.note_id
+         WHERE a.consumed_version_id IS NOT NULL
+    $view$;
+END;
+$v013$;

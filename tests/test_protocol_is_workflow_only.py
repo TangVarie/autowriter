@@ -24,14 +24,14 @@ def test_protocol_defers_to_tool_descriptions():
 
 
 def test_comment_tool_descriptions_carry_the_reading_rules():
-    single, thread = T.comment_repair_plan_for.__doc__, T.judge_thread.__doc__
-    for word in ("slot", "judge_status", "passed", "needs_review", "plan", "hints", "最多再判一轮"):
-        assert word in single, f"comment_repair_plan_for 的说明里缺 {word}"
-    for word in ("slot", "hints", "max_named", "judge_status", "comments"):
-        assert word in thread, f"judge_thread 的说明里缺 {word}"
+    entry, score = T.comments_for.__doc__, T.score_comments.__doc__
+    for word in ("link", "resolved", "slots", "comment_rules", "hard_rules", "existing_comments", "score_comments"):
+        assert word in entry, f"comments_for 的说明里缺 {word}"
+    for word in ("slot", "judge_status", "passed", "needs_review", "fix", "hints", "max_named", "一轮", "不要循环"):
+        assert word in score, f"score_comments 的说明里缺 {word}"
 
 
 def test_judge_tool_descriptions_carry_the_reading_rules():
     doc = T.judge_draft.__doc__
-    for word in ("hard_fails", "plan", "judge_status", "不要循环", "影子期"):
+    for word in ("hard_fails", "plan", "judge_status", "不要循环", "不是闸"):
         assert word in doc, f"judge_draft 的说明里缺 {word}"

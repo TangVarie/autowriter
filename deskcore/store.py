@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import db
@@ -2078,6 +2079,145 @@ def tv_mark_synced(sb, note_ids: list[str]) -> None:
     for i in range(0, len(note_ids), 200):
         (sb.table("tv_note_links").update({"synced_to_tv_at": iso_now()})
          .in_("note_id", note_ids[i:i + 200]).execute())
+
+
+# ── comments_for: 按发布链接找 TV 的帖子和它已有的评论(2026-10-19, D-120) ─────────────────────
+# 与 tv_project_categories 同一种读法(service_role 直读 truth_vault, 前提见那里的说明)。这两个**不吞异常**:
+# 读不到时 core 要如实说"这次没查成", 不能说成"TV 里没有这条"(那会让写手去贴正文, 而问题其实在服务端)。
+TV_LINK_PAGE = 50
+TV_LINK_SCAN_MAX = 400
+TV_COMMENTS_MAX = 100
+
+
+def _like_escape(s: str) -> str:
+    """LIKE 的通配符照字面: ``_`` 在 like 里是任意一个字符(抖音短链 id 里就有)。"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def tv_notes_by_link_token(sb, token: str, *, accept=None) -> list[dict]:
+    """publish_url 里含 ``token`` 的笔记, 新发布的在前。token 只含字母数字 _ -。
+
+    ``accept(row)`` 是调用方的精确比对(tvlink.link_key): 粗筛是 ilike(不分大小写), 一页里可能全是"包含这一段"
+    却不是这条链接的; 一页页往下翻, 直到有精确命中的那一页(最多翻 TV_LINK_SCAN_MAX 行)。只截一页的话, 真的那条
+    可能被挤到截断之外, 报成"TV 里没有"(codex review on aw#107)。"""
+    if not token or not re.fullmatch(r"[A-Za-z0-9_-]{4,32}", token):
+        return []
+    pattern = f"%{_like_escape(token)}%"
+    for off in range(0, TV_LINK_SCAN_MAX, TV_LINK_PAGE):
+        rows = (sb.schema("truth_vault").table("notes")
+                .select("note_id, project_id, title, body, raw_content, publish_url, publish_time, "
+                        "comments_count, tier")
+                .ilike("publish_url", pattern)
+                .order("publish_time", desc=True).order("note_id")
+                .range(off, off + TV_LINK_PAGE - 1).execute()).data or []
+        hits = [r for r in rows if accept is None or accept(r)]
+        if hits or len(rows) < TV_LINK_PAGE:
+            return hits
+    return []
+
+
+def tv_note_comments(sb, note_id: str, limit: int = TV_COMMENTS_MAX) -> list[dict]:
+    """这条笔记在 TV 里的评论, 按评论顺序。"""
+    return list((sb.schema("truth_vault").table("comments")
+                 .select("comment_id, parent_comment_id, comment_order, comment_role, content, is_pinned")
+                 .eq("note_id", note_id)
+                 .order("comment_order")
+                 .limit(limit).execute()).data or [])
+
+
+def tv_targets_of(sb, tv_project_id: str) -> list[dict]:
+    """这个 TV 项目对着哪几个写作台项目(``tv_project_map`` 反查)。"""
+    return list((sb.table("tv_project_map")
+                 .select("tv_project_id, project_id, ingest_target")
+                 .eq("tv_project_id", tv_project_id).execute()).data or [])
+
+
+# ── 人在发布前改了什么(migrations/013, D-120 / W-23) ──────────────────────────────────────────
+def tv_edit_diff_note_ids(sb, tv_project_id: str) -> set[str]:
+    """这个 TV 项目已经算过差异的笔记(夜跑只给新对上的和以前漏算的补)。"""
+    def _build(off, lim):
+        return (sb.table("tv_edit_diffs").select("note_id")
+                .eq("tv_project_id", tv_project_id).order("note_id").range(off, off + lim - 1))
+    return {r["note_id"] for r in _paged(_build)}
+
+
+def tv_edit_diffs_upsert(sb, rows: list[dict]) -> int:
+    n = 0
+    for i in range(0, len(rows), 200):
+        chunk = rows[i:i + 200]
+        sb.table("tv_edit_diffs").upsert(chunk, on_conflict="note_id").execute()
+        n += len(chunk)
+    return n
+
+
+EDIT_DIGEST_ROWS = 200
+_EDIT_DIFF_COLS = ("note_id, match_kind, changed, title_changed, draft_title, published_title, draft_chars, "
+                   "published_chars, removed_count, added_count, edited_count, removed_sentences, added_sentences, "
+                   "edited_sentences, brand_draft, brand_published, publish_time, computed_at")
+
+
+def _ts(v) -> datetime | None:
+    try:
+        t = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+def tv_edit_diffs_since(sb, project_id: str, since: str | None, *, limit: int = EDIT_DIGEST_ROWS) -> dict:
+    """这个写作台项目 ``since`` 之后算出来的差异: ``{"rows": 改过的那些(旧的在前), "pairs": 全部对数, "more": 还有没有}``。
+
+    只取 ``changed`` 的、**从旧往新**取, 最多 ``limit`` 行(codex review on aw#107): 摘要的 through 就是取到的最后
+    一行, 看完之后从那儿接着往后 —— 新的在前取的话, 一次超过 limit 行时更早那些会被 through 一下跨过去、再也
+    进不了摘要; 只取改过的, 没改的再多也挡不住后面改过的。截到 limit 时, 最后一个时间点上的行可能没取全
+    (同一批 upsert 的 computed_at 可以相同), 那个时间点整体留到下一次。"""
+    def _build(off, lim):
+        q = (sb.table("tv_edit_diffs").select(_EDIT_DIFF_COLS).eq("project_id", project_id).eq("changed", True))
+        if since:
+            q = q.gt("computed_at", since)
+        return q.order("computed_at").order("note_id").range(off, off + lim - 1)
+    rows = _paged(_build, hard_cap=limit + 1)
+    more = len(rows) > limit
+    if more:
+        # 按时间比, 不按字符串: PostgREST 回的小数秒位数不固定
+        cut = _ts(rows[limit].get("computed_at"))
+        kept = [r for r in rows[:limit] if cut is None or (_ts(r.get("computed_at")) or cut) < cut]
+        rows = kept or rows[:limit]       # 全是同一个时间点(不该有): 只能先看这些
+    q = sb.table("tv_edit_diffs").select("note_id", count="exact").eq("project_id", project_id)
+    if since:
+        q = q.gt("computed_at", since)
+    resp = q.limit(1).execute()
+    pairs = resp.count if isinstance(getattr(resp, "count", None), int) else len(rows)
+    return {"rows": rows, "pairs": pairs, "more": more}
+
+
+def tv_edit_digest_ack(sb, project_id: str) -> dict | None:
+    rows = (sb.table("tv_edit_digest_acks").select("*").eq("project_id", project_id)
+            .limit(1).execute()).data or []
+    return rows[0] if rows else None
+
+
+def tv_edit_digest_ack_upsert(sb, project_id: str, *, acked_through: str, acked_by: str | None,
+                              rules_recorded: int) -> str:
+    """记一笔"摘要看到 acked_through 了", 回实际存下的 through。
+
+    水位只往前走(codex review on aw#107): 两个人先后打开同一个项目、晚拿到摘要的先看完, 早拿到的那份(through 更旧)
+    后看完时不许把水位拉回去 —— 否则两次 through 之间那段一周后又出来一遍。先按"库里的比我旧"条件更新; 没更新到
+    再看是没有这一行(插)还是库里已经更新(只记看过的人和时间, through 不动)。"""
+    meta = {"acked_at": iso_now(), "acked_by": acked_by, "rules_recorded": int(rules_recorded)}
+    # 第一笔: 没有这一行就插, 有了就不动(ON CONFLICT DO NOTHING) —— 两个人同时第一次看完时不会互相覆盖
+    ins = (sb.table("tv_edit_digest_acks").upsert({"project_id": project_id, "acked_through": acked_through, **meta},
+                                                  on_conflict="project_id", ignore_duplicates=True)
+           .execute()).data or []
+    if ins:
+        return acked_through
+    hit = (sb.table("tv_edit_digest_acks").update({"acked_through": acked_through, **meta})
+           .eq("project_id", project_id).lt("acked_through", acked_through).execute()).data or []
+    if hit:
+        return acked_through
+    sb.table("tv_edit_digest_acks").update(meta).eq("project_id", project_id).execute()
+    cur = tv_edit_digest_ack(sb, project_id) or {}
+    return str(cur.get("acked_through") or acked_through)
 
 
 def is_ingest_batch(batch: dict | None) -> bool:

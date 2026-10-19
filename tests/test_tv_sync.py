@@ -82,7 +82,7 @@ def test_dry_run_computes_everything_and_writes_nothing():
     c = _client(NOTES)
     out = core.tv_sync(c, TV, dry_run=True)
     assert out["counts"] == {"already_linked": 0, "tv_lineage": 1, "body_exact": 1,
-                             "title_exact": 0, "fuzzy": 0, "ambiguous": 0, "unmatched": 1,
+                             "title_exact": 0, "fuzzy": 0, "edited": 0, "ambiguous": 0, "unmatched": 1,
                              "no_body": 0}
     assert out["ingest"]["to_write"] == 1 and out["ingest"]["minted"] == 0
     assert "会补录 1" in out["note"]

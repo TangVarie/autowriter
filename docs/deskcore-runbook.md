@@ -290,6 +290,15 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
 
+### 1.9 `013_tv_edits` —— 改得多的同一篇也认 + 人在发布前改了什么（2026-10-19，D-120 / W-23）
+
+tv-sync 多一档 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15），每条对上的笔记算一条改动差异写 `tv_edit_diffs`，
+`open_project` 每周最多带一次 `edit_digest`、写手的模型归纳成规则建议，看完调 `ack_edit_digest` 写 `tv_edit_digest_acks`。
+SQL Editor / `apply_migration` 直接跑（幂等）。验收：`doctor` 里「表 tv_edit_diffs / tv_edit_digest_acks」applied；
+下一晚 tv-sync 之后 `select match_kind, count(*), count(*) filter (where changed) from autowriter.tv_edit_diffs group by 1`
+有数（第一晚会把以前对上的补算，每个 TV 项目最多 500 条）。⚠️ 没跑它之前 tv-sync 写 `edited` 的那一块会被旧 CHECK 拒；差异表读写失败时 tv-sync 照写对照、但退出码 1 并打「改动差异没写成」。
+差异里除了删 / 加的句子，还有「还在但改了字」的句子对（`edited_sentences`，原句 → 改后）；摘要从上次看到的地方**从旧往新**每次最多 200 篇改过的，看不完的下一份接着给；`acked_through` 只往前走。
+
 ### 1.8 `012_review_via_agent_provenance` —— 经代理转述的人审分开记（2026-10-09，审计 A-01，**生产库尚未执行**）
 
 实查生产库：`autowriter.items` 里 `decision_source='human'` 的 32 行**全部**是 deskcore 的
@@ -774,8 +783,12 @@ quarantine，那条笔记连正文带指标一起进不了库。`export_drafts` 
 
 ```
 open_project（简报自带 lessons）→ draw_angles(n=20) → 生成 20 篇
-             → check_drafts → commit_drafts（交付即入库，改稿带 replaces_version_id）→ export_drafts
+             → check_drafts → score_drafts（交付即存档 + 参考分，改稿带 replaces_version_id）
+             → 写手把定稿贴进飞书（不再导出，D-120）
 ```
+
+> 2026-10-19（D-120）：`export_drafts` / `review_drafts` 已从 MCP 撤下，下面第 6 条是"发布后看 `tv_note_links`
+> 有没有对上"。
 
 然后验六件事：
 
@@ -786,12 +799,13 @@ open_project（简报自带 lessons）→ draw_angles(n=20) → 生成 20 篇
 5. `commit_drafts` 的返回值里 **`batch_id` 和 `version_ids` 都不为空**，且**没有** `identity_warning`
    —— 有 warning 说明指纹写进去了但 `batches`/`items`/`versions` 没建成，lineage 会断
    （可逆，重跑即可，但别当没看见）
-6. `export_drafts` 出的表**粘进飞书之后**，去 TV 那边查一次
-   `select count(*) from truth_vault.notes where source_autowriter_version_id is not null`
-   —— **这一列长期是 0**，它第一次不为 0 才说明回程真的通了
+6. 写手把定稿**贴进飞书、发出去之后**（D-120 起不再导出），等当晚的 `tv-sync` 跑完，查一次
+   `select match_kind, count(*) from autowriter.tv_note_links where version_id = any(<这批 version_ids>) group by 1`
+   —— 这批稿子出现在 `body_exact` / `title_exact` / `fuzzy` 里，才说明"按内容对回来"这条路真的通了
+   （对上之后 TV 的 `source_autowriter_version_id` 也会被回填）
 
-⚠️ 第 5、6 条是 2026-08-25 新增的那一段（`commit_drafts` 建身份 + lineage 命名列）
-的验收，2026-08-23 版的清单里没有它们。
+⚠️ 第 5、6 条是 2026-08-25 新增的那一段（`commit_drafts` 建身份 + lineage）的验收，2026-08-23 版的清单里
+没有它们；第 6 条 2026-10-19 改成按内容对回（D-120）。
 
 ---
 

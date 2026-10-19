@@ -19,12 +19,9 @@ from pathlib import Path
 from deskcore import core
 
 MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
-_BLOCK = re.compile(r"^DO \$v011\$.*?^\$v011\$;\n", re.S | re.M)
-
-
-def _block(name: str) -> str:
-    m = _BLOCK.search((MIGRATIONS / name).read_text(encoding="utf-8"))
-    assert m, f"{name} 里找不到 DO $v011$ … $v011$; 那一段"
+def _block(name: str, tag: str = "v011") -> str:
+    m = re.search(rf"^DO \${tag}\$.*?^\${tag}\$;\n", (MIGRATIONS / name).read_text(encoding="utf-8"), re.S | re.M)
+    assert m, f"{name} 里找不到 DO ${tag}$ … ${tag}$; 那一段"
     return m.group(0)
 
 
@@ -34,8 +31,16 @@ def test_baseline_carries_the_same_view_block_as_011():
         "链条上 011 会把它盖掉 —— sql_parity_check 看不出来。把 011 里整段原样复制进基线。")
 
 
+def test_baseline_carries_the_013_redefinition_too():
+    """013(D-120)把 'edited' 也算作对上, 用另一段 DO 块重建视图。基线里两段都要有、都与源文件逐字相同,
+    而且 013 那段排在 011 后面 —— 只跑 000 的新库终态才是 013 那版。"""
+    base = (MIGRATIONS / "000_baseline.sql").read_text(encoding="utf-8")
+    assert _block("000_baseline.sql", "v013") == _block("013_tv_edits.sql", "v013")
+    assert base.index("DO $v011$") < base.index("DO $v013$")
+
+
 def test_match_kinds_are_the_same_list_as_the_tv_backfill_kinds():
-    block = _block("011_angle_outcomes_view.sql")
+    block = _block("013_tv_edits.sql", "v013")      # 视图的最终形态在 013
     m = re.search(r"match_kind IN \(([^)]*)\)", block)
     assert m, "视图里找不到 match_kind 的过滤"
     kinds = set(re.findall(r"'([a-z_]+)'", m.group(1)))

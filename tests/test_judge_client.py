@@ -61,7 +61,7 @@ def wired(monkeypatch):
 _OK_BODY = {
     "subject_id": "v1", "passed": False,
     "hard_fails": [["platform_health_v0.1", "efficacy_claim", "是", 0.91, "效果是真的绝, 立马就压住了"]],
-    "plan": [{"qid": "efficacy_claim"}], "calls": 3, "written": 24,
+    "plan": [{"qid": "efficacy_claim"}], "unjudged": [], "calls": 3, "written": 24,
     "policy": {"published": False, "project": "SPX_phase1", "dropped_banks": ["project"],
                "dropped_hard_rules": [], "extra": "x"},
     "profile": {"opening_type": "具体事件"},

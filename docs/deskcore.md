@@ -415,7 +415,12 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 用例 `tests/test_tvlink.py` / `tests/test_tv_sync.py`。**§3.4 的六列不再是回流的依赖**，
 `export_drafts` 照样带着它们（粘了不坏），但没人需要再手抄。
 
-### 3.8 入库判定 judge（2026-09-24，影子期）
+### 3.8 入库判定 judge（2026-09-24，影子期；2026-10-19 起给写手看）
+
+> **D-120（2026-10-19）**：判定结局不再是影子。`score_drafts`（`commit_drafts` 的新名）返回的 `judge.results` 每篇带
+> 参考分 `score` 和最多 3 条 `fixes`（`core.draft_score`：Jev 有把握 p≥0.7 的硬伤 −25、拿不准的 −8、没判出的硬约束 −10，
+> 正文太短不给分）。**仍然不拦**：written / rejected 口径不变，判不成照样存档。人审与导出两个工具撤了，评论按链接写
+> （`comments_for` / `score_comments`，§3.6 的人审流程只剩 core 里的函数）。下文"影子期"的表述按此读。
 
 **是什么。** JevforCoentent 仓 docs/00 #4 拍板：写作台的入库判定挂在 `commit_drafts` 内部，advisory，
 8 秒没回就跳过，答案进账本（TV 的 `note_feature_answers`，`subject_type='aw_version'`、
@@ -593,8 +598,8 @@ env：
 `004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
 `006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql` /
 `008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql` /
-`011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql`
-**十二个，按编号顺序跑，别跳号**（建议先在
+`011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql`
+**十三个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -627,6 +632,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
+- `013_tv_edits.sql`（2026-10-19，D-120 / W-23）：`tv_note_links.match_kind` 多认 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15，人改得多但还是这一篇）；建 `tv_edit_diffs`（每条对上的笔记一行：标题改没改、删 / 加了哪些句子、长度、品牌提了几次）和 `tv_edit_digest_acks`（每个项目的每周摘要看到哪儿了）；`v_angle_outcomes` 把 `edited` 也算作对上。**硬失败只打 tv-sync 写 `edited` 那一块**（旧 CHECK 拒）；差异和摘要缺表时只记 WARN。`doctor` 探两张表。
 - `012_review_via_agent_provenance.sql`（2026-10-09，审计 A-01，§3.6）：`items` 加 `decision_note`（用户原话，≤ 200 字）/ `decided_within_s`（距被审版本创建的秒数）两列，`decision_source` 的 CHECK 多认 `human_via_agent`，另建一条只盖它的部分索引。**只打 `review_drafts`**：它无条件写 `human_via_agent` + 两列，缺了每条都报 `failed`（`db.update_item_status` 会翻译成"跑 012"）；Streamlit 的通过 / 打回仍写 `human` + 三列，并把两列清空（每次决定整行重写，不许顶着上一次代理决定的原话）——所以 012 和 006 一样是硬前提。`doctor` 探两列（CHECK 从 PostgREST 探不到，用列当代理，两者同一事务）。
 
 - `010_tv_links_rls.sql`：`009` 建的三张表补开 RLS（2026-09-18，Supabase advisor 对着生产库报出来的）。不是漏洞——anon / authenticated 对它们没有表级 GRANT，service_role 绕 RLS——只是与本 schema 其他表同一口径。`doctor` 探不到它（RLS 开没开从 PostgREST 读起来一样），报 `unprobeable` 并给出要在 SQL Editor 跑的那句；`tests/sql_parity_check.py` 守「每张表都开了 RLS」这条不变量。

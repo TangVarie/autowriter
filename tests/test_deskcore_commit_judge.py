@@ -235,7 +235,7 @@ def test_a_judge_blowup_does_not_restore_the_stash_or_fail_the_commit(judge_on, 
     assert all(ix == [] for ix in restored), f"判定失败把旧指纹放回去了: {restored}"
     assert {f["version_id"] for f in c.rows["draft_fingerprints"]} == {v2}, "旧指纹回来了"
     assert "判定这一步整个炸了" in out["judge"]["error"]
-    assert out["judge"]["shadow"] is True
+    assert out["judge"]["visible"] is True
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -792,7 +792,7 @@ def test_commit_result_is_identical_whatever_the_judge_does(monkeypatch, post, w
            {k: v for k, v in baseline.items() if k not in _JUDGE_KEYS}
     assert judged["judge"]["summary"] == {want: 2}
     assert baseline["judge"]["summary"] == {"not_configured": 2}
-    assert judged["judge"]["note"] == core.JUDGE_SHADOW_NOTE
+    assert judged["judge"]["note"] == core.SCORE_NOTE
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -864,3 +864,23 @@ def test_ingest_published_never_calls_the_judge(judge_on):
     assert out["fingerprinted"] == 1
     assert judge_on["payloads"] == [], "补录的是已发布笔记, 由 TV 的事后抽取覆盖, 不走 judge"
     assert "judge" not in out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# D-120 · 存档时的判定给写手看: 每篇带参考分和修改建议, 指标也记分数
+# ══════════════════════════════════════════════════════════════════════
+
+def test_each_archived_draft_comes_back_with_a_score_and_fixes(judge_on):
+    judge_on["reply"] = lambda p: judge_client.result(
+        judge_client.JUDGE_OK, http_status=200, passed=False, calls=3, written=20,
+        hard_fails=[["platform_health_v0.1", "efficacy_claim", "是", 0.62]],
+        plan=[{"kind": "hard", "qid": "efficacy_claim", "p": 0.62, "instruction": "「疗效」那句。依据句：立马见效"}])
+    c = _client()
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    (row,) = out["judge"]["results"]
+    assert row["score"] == 92 and row["fixes"] == [{"sure": False, "instruction": "「疗效」那句。依据句：立马见效"}]
+    assert out["judge"]["visible"] is True and "score_drafts" in out["judge"]["note"]
+    assert out["written"] == 1, "分数不拦存档"
+    (m,) = [r for r in c.rows["batch_metrics"] if r["meta"].get("mode") == "deskcore_commit"]
+    assert m["meta"]["judge"][0]["score"] == 92 and m["meta"]["judge"][0]["fixes"] == 1
+    assert "instruction" not in str(m["meta"]["judge"]), "指标只记分数和条数, 不记稿子里的句子"

@@ -1,5 +1,7 @@
 # autowriter / deskcore交接 · 2026-10-15
 
+> **2026-10-19 · D-120 写手侧改版**：`score_drafts`（存档 + Jev 参考分，不拦；`commit_drafts` 为过渡期旧名）取代"commit → review → export"；`review_drafts` / `export_drafts` 撤出 MCP，定稿由写手贴飞书、发布后 tv-sync 对回；评论改为 `comments_for(link)` → 写 → `score_comments`。下文 10-15 的快照里涉及这几个工具的描述按此读。
+
 > **评论线云端交接**：[写作台接手说明及完整材料入口](docs/comment-handoff-online-2026-10-15.md)，可直接在GitHub阅读。
 
 本轮接管覆盖10-12～15；最后只读核对 **10-15 12:04，北京时间**。默认分支是 **`claude/xhs-content-workstation-BSEuH`**；功能基线 [PR96](https://github.com/TangVarie/autowriter/pull/96)，merge `487403b75fb06bf3001cf463a0a966171b45a2b0`。后续TV/Jev的参考评估文档没有再次改aw业务代码。
