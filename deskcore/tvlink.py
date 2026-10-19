@@ -7,8 +7,15 @@
   1. 正文前 40 字(去标点)相同           → body_exact
   2. 标题(去标点)相同                    → title_exact
   3. 都对不上, 在时间窗内按四字串包含度  → fuzzy(发布稿是从这版改出来的)
-  4. 多个候选分不出                      → ambiguous, 留候选给人看, 不硬猜
-  5. 一个都没有                          → unmatched(→ 补录进指纹库)
+  4. 包含度 0.30~0.60, 而且最像的那版比第二像的高出 0.15 以上 → edited(人改得多, 但还是这一篇)
+  5. 多个候选分不出                      → ambiguous, 留候选给人看, 不硬猜
+  6. 一个都没有                          → unmatched(→ 补录进指纹库)
+
+edited 这一档的依据(2026-10-19 实测, D-120 / W-23): 9-05 以来对不上、被补录的笔记里, 包含度落在
+0.30~0.60 的有十几篇, 其中领先第二名 ≥0.15 的(0.53 对 0.09、0.51 对 0.06、0.41 对 0.02、0.32 对
+0.17)人一看就是同一篇改出来的; 领先不够的多是同一个故事写了两三版(Hatherine), 分不出是哪一版发的,
+进 ambiguous 等周检; 0.30 以下的是共用产品话术的不同稿子。句子对齐、向量都试过/想过: 同故事多版本
+时句子对齐也分不开, 而"领先幅度"能分开。
 
 实测口径(2026-09-17 的库):
   · TV 存的是全文: 百健士对上的 143 篇里 115 篇正文逐字相同, 其余只多了话题标签;
@@ -39,6 +46,8 @@ WINDOW_AFTER_DAYS = 30      # 入库后多少天内发布仍算
 FUZZY_CONTAIN = 0.60        # 发布稿的四字串有六成来自这一版 → 认
 FUZZY_MIN_GRAMS = 15        # 与 fp.CONTAIN_MIN_SAMPLE 同口径: 样本太小不判
 FUZZY_MARGIN = 0.10         # 最佳与次佳差不到这个数 → ambiguous
+EDITED_FLOOR = 0.30         # 包含度到这个数才考虑"改得多的同一篇"
+EDITED_MARGIN = 0.15        # 而且要比第二像的那版高出这么多, 否则是同故事多版本, 分不出
 
 _TITLE_RE = re.compile(r"【标题】\s*(.*?)\s*【正文】", re.S)
 _BODY_RE = re.compile(r"【正文】\s*(.*)$", re.S)
@@ -148,7 +157,7 @@ class Note:
 
 @dataclass
 class Match:
-    kind: str                       # body_exact / title_exact / fuzzy / ambiguous / unmatched
+    kind: str                       # body_exact / title_exact / fuzzy / edited / ambiguous / unmatched
     version: Version | None = None
     score: float | None = None
     lag_days: int | None = None
@@ -242,9 +251,15 @@ def match_note(note: Note, index: VersionIndex) -> Match:
         return Match("unmatched")
     scored = sorted(((index.containment(ng, v), v) for v in index.versions
                      if in_window(lag_days(note, v))), key=lambda t: -t[0])
-    if not scored or scored[0][0] < FUZZY_CONTAIN:
+    if not scored or scored[0][0] < EDITED_FLOOR:
         return Match("unmatched")
     best_s, best_v = scored[0]
+    if best_s < FUZZY_CONTAIN:
+        second = scored[1][0] if len(scored) > 1 else 0.0
+        listed = [_cand(note, v, s) for s, v in scored[:5] if s >= EDITED_FLOOR - EDITED_MARGIN]
+        if best_s - second >= EDITED_MARGIN:
+            return Match("edited", best_v, best_s, lag_days(note, best_v), listed)
+        return Match("ambiguous", None, best_s, None, listed)
     if len(scored) > 1 and best_s - scored[1][0] < FUZZY_MARGIN:
         listed = [_cand(note, v, s) for s, v in scored[:5] if s >= FUZZY_CONTAIN - FUZZY_MARGIN]
         return Match("ambiguous", None, best_s, None, listed)
@@ -253,6 +268,50 @@ def match_note(note: Note, index: VersionIndex) -> Match:
 
 def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
     return {n.note_id: match_note(n, index) for n in notes}
+
+
+# ── 人在发布前改了什么(2026-10-19, D-120 / W-23) ─────────────────────────────────────────────
+# 每一对对上的(写作台那版 → 发出去的笔记)算一条差异: 标题改没改、删了哪些句子、加了哪些句子、长度、品牌名
+# 提了几次。纯计算, 不碰库; 存库和按项目汇总在 core。哪怕只改了几个字也记 —— 汇总时才看出规律。
+_SENT_SPLIT = re.compile(r"[。！？!?；;\n…~～]+")
+SENT_MIN_CHARS = 6          # 归一化后短于这个的不算一句(表情、"哈哈哈")
+SENT_ALIGN = 0.5            # 一句的四字串有一半以上在另一边出现, 就算"这句还在"
+DIFF_KEEP_SENTENCES = 8
+DIFF_SENTENCE_CHARS = 80
+
+
+def sentences(text: str) -> list[str]:
+    return [s.strip() for s in _SENT_SPLIT.split(text or "")
+            if len(fp.normalize(s)) >= SENT_MIN_CHARS]
+
+
+def _kept(sentence: str, other_grams: set[str]) -> bool:
+    g = grams(sentence)
+    return bool(g) and len(g & other_grams) / len(g) >= SENT_ALIGN
+
+
+def edit_diff(draft_title: str, draft_body: str, published_title: str, published_body: str,
+              *, brand: str = "") -> dict:
+    """写作台那版 → 发出去的那版: 改了什么。
+
+    句子按标点切; 一句在另一边能找到一半以上的四字串就算"还在", 否则算删掉 / 新加的。只回前几句(每句截断),
+    计数是全量的。``brand`` 给了就数两边各提了几次(不分大小写)。"""
+    dg, pg = grams(draft_body), grams(published_body)
+    removed = [s for s in sentences(draft_body) if not _kept(s, pg)]
+    added = [s for s in sentences(published_body) if not _kept(s, dg)]
+    out = {
+        "title_changed": fp.normalize(draft_title) != fp.normalize(published_title),
+        "draft_title": (draft_title or "")[:120], "published_title": (published_title or "")[:120],
+        "draft_chars": len(fp.normalize(draft_body)), "published_chars": len(fp.normalize(published_body)),
+        "removed_count": len(removed), "added_count": len(added),
+        "removed_sentences": [s[:DIFF_SENTENCE_CHARS] for s in removed[:DIFF_KEEP_SENTENCES]],
+        "added_sentences": [s[:DIFF_SENTENCE_CHARS] for s in added[:DIFF_KEEP_SENTENCES]],
+    }
+    b = (brand or "").strip().lower()
+    out["brand_draft"] = (draft_body or "").lower().count(b) if b else None
+    out["brand_published"] = (published_body or "").lower().count(b) if b else None
+    out["changed"] = bool(out["title_changed"] or removed or added)
+    return out
 
 
 # ── 发布链接 → 查得到的键(2026-10-19, comments_for 按链接找帖子) ─────────────────────────────

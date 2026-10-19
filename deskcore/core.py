@@ -3117,6 +3117,9 @@ _MIGRATION_011_VIEW = "v_angle_outcomes"
 # 多认 human_via_agent(审计 A-01)。列探得到; CHECK 从 PostgREST 探不到(要写才知道),
 # 用列当代理 —— 两者在同一个事务里, 不存在只跑了一半的中间态。
 MIGRATION_REVIEW_PROVENANCE = "012_review_via_agent_provenance.sql"
+# 013 建 tv_edit_diffs / tv_edit_digest_acks 两张表, 并让 tv_note_links 的 match_kind 多认 'edited'(D-120)。
+# 表探得到; CHECK 同 012 用表当代理(同一个事务)。
+MIGRATION_TV_EDITS = "013_tv_edits.sql"
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -3457,6 +3460,14 @@ def migration_state(client) -> dict:
          "⚠️ 硬失败, 但只打 review_drafts: 它无条件写 human_via_agent + 这两列, 缺了"
          "每条都报 failed(db.update_item_status 会翻译成人话)。Streamlit 的通过 / 打回"
          "仍写 human + 三列, 不受影响")
+
+    # ── 013: 人在发布前改了什么 + 'edited' 一档(D-120 / W-23) ──
+    state, note = _probe_ok(lambda: (client.table("tv_edit_diffs").select("note_id").limit(1).execute(),
+                                     client.table("tv_edit_digest_acks").select("project_id").limit(1).execute()),
+                            predicate=store.schema_object_missing)
+    _add(MIGRATION_TV_EDITS, "表 tv_edit_diffs / tv_edit_digest_acks", state, note,
+         "⚠️ 硬失败, 但只打两处: tv-sync 写 match_kind='edited' 的对照会被旧 CHECK 拒(整块 upsert 失败, "
+         "那一块的对照当晚写不进去); 改动差异和每周摘要没有(tv-sync / open_project 只记一行 WARN、不报错)")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -3845,6 +3856,76 @@ def backfill_gap(client, project_id: str) -> dict:
 # ⚠️ 加新功能时别顺手把 LLM 调用加回来。要模型干活就把材料和指令交出去,
 # 让调用方的模型做 —— 它本来就跑在一个有模型的环境里。
 
+
+
+# ── 人在发布前改了什么 → 每周一份摘要(2026-10-19, D-120 / W-23) ────────────────────────────────
+# tv-sync 每晚给对上的稿子算改动差异(tv_edit_diffs)。open_project 每周最多带一次摘要, 由写手的模型归纳成规则建议、
+# 问过用户再 record_rule —— 和 record_edit 的蒸馏同一个分工: 提炼是文本活, 交给本来就在跑的模型, deskcore 不调 LLM。
+EDIT_DIGEST_EVERY_DAYS = 7
+EDIT_DIGEST_MIN_CHANGED = 3       # 改过的少于这几篇不出摘要: 一两篇看不出规律, 只会诱导模型硬编
+EDIT_DIGEST_EXAMPLES = 6
+EDIT_DIGEST_TASK = (
+    "这是本项目最近发出去的稿子在发布前被人改过的地方(写作台那版 → 发出去那版)。看有没有反复出现、像是有意为之的改法"
+    "(比如总删掉某类句子、总把标题改短、总少提或多提品牌), 归纳成最多 3 条能写成规则的话, 念给用户听, 问要不要记下。"
+    "用户说要的, 用 record_rule 记(soft, scope=project)。只出现一两次的、说不清为什么改的, 不要硬编成规则。"
+    "不管记没记, 最后调 ack_edit_digest, through 原样传回, rules_recorded 填记了几条; 之后一周内不会再出现。")
+
+
+def _avg(xs) -> int | None:
+    xs = [x for x in xs if isinstance(x, (int, float))]
+    return round(sum(xs) / len(xs)) if xs else None
+
+
+def edit_digest(client, project_id: str, *, user_id: str | None = None,
+                now: datetime | None = None) -> dict | None:
+    """这个项目该不该给一份"人改了什么"的摘要: 上次看过不到一周、或者新改过的不到 3 篇 → None。"""
+    assert_project_access(client, project_id, user_id=user_id)
+    now = now or _utcnow()
+    ack = store.tv_edit_digest_ack(client, project_id)
+    if ack:
+        acked_at = tvlink._as_dt(ack.get("acked_at"))
+        if acked_at and now - acked_at < timedelta(days=EDIT_DIGEST_EVERY_DAYS):
+            return None
+    rows = store.tv_edit_diffs_since(client, project_id, (ack or {}).get("acked_through"))
+    changed = [r for r in rows if r.get("changed")]
+    if len(changed) < EDIT_DIGEST_MIN_CHANGED:
+        return None
+    through = max(str(r.get("computed_at") or "") for r in rows)
+    examples = []
+    for r in changed[:EDIT_DIGEST_EXAMPLES]:
+        ex: dict = {"title": r.get("published_title") or r.get("draft_title")}
+        if r.get("title_changed"):
+            ex["title_before"] = r.get("draft_title")
+        if r.get("removed_sentences"):
+            ex["removed"] = list(r["removed_sentences"])[:3]
+        if r.get("added_sentences"):
+            ex["added"] = list(r["added_sentences"])[:3]
+        examples.append(ex)
+    out = {"through": through, "since": (ack or {}).get("acked_through"),
+           "pairs": len(rows), "changed": len(changed),
+           "title_changed": sum(1 for r in rows if r.get("title_changed")),
+           "chars": {"draft_avg": _avg(r.get("draft_chars") for r in rows),
+                     "published_avg": _avg(r.get("published_chars") for r in rows)},
+           "examples": examples, "task": EDIT_DIGEST_TASK}
+    bd, bp = _avg(r.get("brand_draft") for r in rows), _avg(r.get("brand_published") for r in rows)
+    if bd is not None or bp is not None:
+        out["brand_mentions"] = {"draft_avg": bd, "published_avg": bp}
+    return out
+
+
+def ack_edit_digest(client, project_id: str, through: str, *, user_id: str | None = None,
+                    rules_recorded: int = 0) -> dict:
+    """记下这份摘要看过了(through 之前的差异不再进摘要), 一周内不再给。"""
+    assert_project_access(client, project_id, user_id=user_id)
+    t = tvlink._as_dt(through)
+    if t is None:
+        raise ValueError("through 要原样传回 edit_digest 里的那个时间")
+    if not isinstance(rules_recorded, int) or isinstance(rules_recorded, bool) or not 0 <= rules_recorded <= 20:
+        raise ValueError("rules_recorded 是这次记了几条规则(0~20 的整数)")
+    store.tv_edit_digest_ack_upsert(client, project_id, acked_through=t.isoformat(),
+                                    acked_by=str(user_id) if user_id else None, rules_recorded=rules_recorded)
+    return {"acked": True, "through": t.isoformat(), "rules_recorded": rules_recorded,
+            "next_after_days": EDIT_DIGEST_EVERY_DAYS}
 
 
 def record_rule(client, project_id: str, content: str, *, severity: str = "soft",
@@ -4794,7 +4875,54 @@ def tv_resolve(client, note_id: str, *, ingest: bool) -> dict:
 
 
 # 哪些对照可以写回 TV。ingested 排除: 版本是从这条笔记复制来的, 不是它的来源。
-_TV_BACKFILL_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "tv_lineage"})
+_TV_BACKFILL_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", "tv_lineage"})
+# 每晚给"以前对上、还没算过改动差异"的笔记补算多少条(013 上线后第一晚要补几百条, 之后每晚只有新对上的)
+TV_SYNC_DIFF_BACKFILL = 500
+
+
+def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict[str, dict],
+                   notes_by_id: dict, known: dict, *, dry_run: bool) -> dict:
+    """对上的每一对算一条"人在发布前改了什么"(tvlink.edit_diff), 写 tv_edit_diffs(D-120 / W-23)。
+
+    本次新对上的全算; 以前对上、还没有差异行的补算(每晚最多 TV_SYNC_DIFF_BACKFILL 条)。只算真对上的
+    (_TV_BACKFILL_KINDS, 不含 ingested —— 那一版就是从这条笔记复制的, 没有改动可言); 那一版不在对照索引里
+    (tv_lineage 指到别处的版本)就跳过。**不抛**: 这是附加信息, 算不了也不能让对照本身失败。"""
+    try:
+        done = store.tv_edit_diff_note_ids(client, tv_project_id) if not dry_run else set()
+    except Exception as exc:                            # noqa: BLE001 — 013 没跑 / 库错: 这晚不算
+        return {"written": 0, "error": f"{type(exc).__name__}: {exc}"[:200]}
+    fresh = {l["note_id"]: l for l in links if l.get("version_id") and l.get("match_kind") in _TV_BACKFILL_KINDS}
+    backlog = [dict(r, note_id=nid) for nid, r in existing.items()
+               if nid not in fresh and nid not in done and r.get("version_id")
+               and r.get("match_kind") in _TV_BACKFILL_KINDS][:TV_SYNC_DIFF_BACKFILL]
+    brands: dict[str, str] = {}
+    rows = []
+    for l in list(fresh.values()) + backlog:
+        n, v = notes_by_id.get(l["note_id"]), known.get(str(l["version_id"]))
+        if n is None or v is None:
+            continue
+        if v.project_id not in brands:
+            try:
+                brands[v.project_id] = (store.project_row(client, v.project_id) or {}).get("brand") or ""
+            except Exception:                           # noqa: BLE001
+                brands[v.project_id] = ""
+        d = tvlink.edit_diff(v.title, v.body, n.title, n.body, brand=brands[v.project_id])
+        rows.append({"note_id": n.note_id, "tv_project_id": tv_project_id, "project_id": v.project_id,
+                     "version_id": v.version_id, "match_kind": l["match_kind"],
+                     "publish_time": n.publish_time.isoformat() if n.publish_time else None,
+                     "draft_title": v.title[:120], **{k: d[k] for k in (
+                         "changed", "title_changed", "published_title", "draft_chars", "published_chars",
+                         "removed_count", "added_count", "removed_sentences", "added_sentences",
+                         "brand_draft", "brand_published")}})
+    out = {"computed": len(rows), "changed": sum(1 for r in rows if r["changed"]),
+           "backfilled": sum(1 for r in rows if r["note_id"] not in fresh), "written": 0}
+    if rows and not dry_run:
+        try:
+            out["written"] = store.tv_edit_diffs_upsert(client, rows)
+        except Exception as exc:                        # noqa: BLE001
+            logger.exception("tv_sync: 改动差异写库失败 (tv=%s) —— 对照不受影响", tv_project_id)
+            out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    return out
 
 
 def _backfillable(link: dict) -> bool:
@@ -4846,7 +4974,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
 
     now = store.iso_now()
     counts: dict[str, int] = {k: 0 for k in (
-        "already_linked", "tv_lineage", "body_exact", "title_exact", "fuzzy",
+        "already_linked", "tv_lineage", "body_exact", "title_exact", "fuzzy", "edited",
         "ambiguous", "unmatched", "no_body")}
     links: list[dict] = []
     to_ingest: list[tvlink.Note] = []
@@ -5007,7 +5135,9 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             if pending:
                 store.tv_mark_synced(client, [l["note_id"] for l in pending])
 
-    matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"]
+    edit_diffs = _tv_edit_diffs(client, tv_project_id, links, existing,
+                                {n.note_id: n for n in notes}, known, dry_run=dry_run)
+    matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
     return {
         "tv_project_id": tv_project_id,
         "desk_projects": [m["project_id"] for m in maps],
@@ -5017,9 +5147,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "ingest": ingest, "links_written": written_links,
         "tv_backfilled": backfilled, "write_tv": write_tv, "dry_run": dry_run,
         "ambiguous_samples": ambiguous_samples,
+        "edit_diffs": edit_diffs,
         "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
-                 f"{counts['fuzzy']}), 分不出 {counts['ambiguous']}, 对不上 "
+                 f"{counts['fuzzy']} / 改过 {counts['edited']}), 分不出 {counts['ambiguous']}, 对不上 "
                  f"{counts['unmatched']}"
                  + (f", 没正文 {counts['no_body']}" if counts["no_body"] else "")
                  + (f" → 补录 {ingest['minted']}/{ingest['to_write']}"

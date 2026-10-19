@@ -290,6 +290,14 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
 
+### 1.9 `013_tv_edits` —— 改得多的同一篇也认 + 人在发布前改了什么（2026-10-19，D-120 / W-23）
+
+tv-sync 多一档 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15），每条对上的笔记算一条改动差异写 `tv_edit_diffs`，
+`open_project` 每周最多带一次 `edit_digest`、写手的模型归纳成规则建议，看完调 `ack_edit_digest` 写 `tv_edit_digest_acks`。
+SQL Editor / `apply_migration` 直接跑（幂等）。验收：`doctor` 里「表 tv_edit_diffs / tv_edit_digest_acks」applied；
+下一晚 tv-sync 之后 `select match_kind, count(*), count(*) filter (where changed) from autowriter.tv_edit_diffs group by 1`
+有数（第一晚会把以前对上的补算，每个 TV 项目最多 500 条）。⚠️ 没跑它之前 tv-sync 写 `edited` 的那一块会被旧 CHECK 拒。
+
 ### 1.8 `012_review_via_agent_provenance` —— 经代理转述的人审分开记（2026-10-09，审计 A-01，**生产库尚未执行**）
 
 实查生产库：`autowriter.items` 里 `decision_source='human'` 的 32 行**全部**是 deskcore 的

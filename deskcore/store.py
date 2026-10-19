@@ -2116,6 +2116,53 @@ def tv_targets_of(sb, tv_project_id: str) -> list[dict]:
                  .eq("tv_project_id", tv_project_id).execute()).data or [])
 
 
+# ── 人在发布前改了什么(migrations/013, D-120 / W-23) ──────────────────────────────────────────
+def tv_edit_diff_note_ids(sb, tv_project_id: str) -> set[str]:
+    """这个 TV 项目已经算过差异的笔记(夜跑只给新对上的和以前漏算的补)。"""
+    def _build(off, lim):
+        return (sb.table("tv_edit_diffs").select("note_id")
+                .eq("tv_project_id", tv_project_id).order("note_id").range(off, off + lim - 1))
+    return {r["note_id"] for r in _paged(_build)}
+
+
+def tv_edit_diffs_upsert(sb, rows: list[dict]) -> int:
+    n = 0
+    for i in range(0, len(rows), 200):
+        chunk = rows[i:i + 200]
+        sb.table("tv_edit_diffs").upsert(chunk, on_conflict="note_id").execute()
+        n += len(chunk)
+    return n
+
+
+EDIT_DIGEST_ROWS = 200
+
+
+def tv_edit_diffs_since(sb, project_id: str, since: str | None) -> list[dict]:
+    """这个写作台项目 ``since`` 之后算出来的差异, 新的在前, 最多 EDIT_DIGEST_ROWS 行。"""
+    q = (sb.table("tv_edit_diffs")
+         .select("note_id, match_kind, changed, title_changed, draft_title, published_title, draft_chars, "
+                 "published_chars, removed_count, added_count, removed_sentences, added_sentences, "
+                 "brand_draft, brand_published, publish_time, computed_at")
+         .eq("project_id", project_id))
+    if since:
+        q = q.gt("computed_at", since)
+    return list((q.order("computed_at", desc=True).limit(EDIT_DIGEST_ROWS).execute()).data or [])
+
+
+def tv_edit_digest_ack(sb, project_id: str) -> dict | None:
+    rows = (sb.table("tv_edit_digest_acks").select("*").eq("project_id", project_id)
+            .limit(1).execute()).data or []
+    return rows[0] if rows else None
+
+
+def tv_edit_digest_ack_upsert(sb, project_id: str, *, acked_through: str, acked_by: str | None,
+                              rules_recorded: int) -> None:
+    sb.table("tv_edit_digest_acks").upsert(
+        {"project_id": project_id, "acked_through": acked_through, "acked_at": iso_now(),
+         "acked_by": acked_by, "rules_recorded": int(rules_recorded)},
+        on_conflict="project_id").execute()
+
+
 def is_ingest_batch(batch: dict | None) -> bool:
     """这个 batch 是不是从 TV 补录进来的副本(``batches.params.source == 'ingest'``)。
 

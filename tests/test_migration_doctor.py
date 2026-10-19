@@ -47,6 +47,9 @@ _TABLES = {
     "ingest_locks": [],
     # 011 的视图(发牌台账 → 版本 → TV 笔记 → tier)。假件里视图和表长得一样。
     "v_angle_outcomes": [],
+    # 013 的两张表(改动差异 + 每周摘要看到哪儿了)
+    "tv_edit_diffs": [],
+    "tv_edit_digest_acks": [],
     "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z",
                "decision_source": None, "reviewer_id": None, "decided_at": None,
                # 012 的两列

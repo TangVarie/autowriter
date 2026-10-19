@@ -294,6 +294,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         对照验证过的写法, 每条 {label, instruction, evidence}。同样合适时照 instruction 写;
         它是提示不是硬约束, 和 p0 冲突时以 p0 为准, 不贴题就不用。没有这个字段就是这次没有,
         不要自己编规律, 也不要跟用户解释为什么没有。
+      · edit_digest —— 【每周最多一次, 有才出现】: 本项目最近发出去的稿子在发布前被人改了什么(写作台那版 →
+        发出去那版)。照 edit_digest.task 做: 归纳成最多 3 条规则建议问用户, 同意的 record_rule, 最后调
+        ack_edit_digest。先把它说给用户, 再开始写稿。
       · flywheel_arm —— 这场写作落在哪个对照组。存档时【原样】传给 score_drafts 的 flywheel_arm,
         别改、别跟用户提。
 
@@ -325,6 +328,16 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     # p0 为空却看起来正常的简报。
     out = core.build_writing_brief(core.sb(), project_id,
                                    user_id=_user_id, brief=brief)
+    # 人在发布前改了什么(D-120 / W-23)。附加信息: 查不到不能把简报弄坏 —— 合规那部分上面已经拿到了。
+    try:
+        digest = core.edit_digest(core.sb(), project_id, user_id=_user_id)
+    except PermissionError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.warning("open_project: 改动摘要查不到, 这次不带", exc_info=True)
+        digest = None
+    if digest:
+        out["edit_digest"] = digest
     # 服务端版本探针 (skillcheck)。协议文件读不了就跳过 —— 探针不能把合规读弄坏。
     try:
         digest = protocol_text()[1]
@@ -434,6 +447,23 @@ def check_drafts(project_id: str, drafts: list[dict],
     """
     # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。
     return core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id)
+
+
+def ack_edit_digest(project_id: str, through: str, rules_recorded: int = 0,
+                    _user_id: str | None = None) -> dict:
+    """看完 open_project 给的 edit_digest 之后调: 记下这份摘要看过了, 一周内不再出现。
+
+    ``through`` 原样传回 edit_digest.through; ``rules_recorded`` 是这次按摘要记了几条规则(用户一条都没要就传 0)。
+    用户没回应、对话就结束了也要调 —— 不调的话下一场写作还会再给一遍同一份摘要。
+    """
+    # 写操作, 不包 _safe: 没记上的话, 下一场又拿到同一份摘要, 用户会被问第二遍。
+    try:
+        return core.ack_edit_digest(core.sb(), project_id, through, user_id=_user_id,
+                                    rules_recorded=rules_recorded)
+    except core.ProjectNotFound:
+        raise
+    except ValueError as exc:
+        raise InvalidInput(str(exc)) from exc
 
 
 def judge_draft(project_id: str, title: str, body: str, judge_paras: str = "on_fail",
@@ -949,6 +979,7 @@ TOOLS = {
     "judge_draft":    (judge_draft,    True),
     "repair_plan_for": (repair_plan_for, True),
     "list_banks":     (list_banks,     True),
+    "ack_edit_digest": (ack_edit_digest, True),
     "comments_for":   (comments_for,   True),
     "score_comments": (score_comments, True),
     "ingest_published": (ingest_published, True),
