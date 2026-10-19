@@ -38,7 +38,7 @@ SKILL.md 只留一根引线让 `get_protocol` 每次下发——09-11 起定稿�
 `get_protocol` 带上本地 `protocol_version`，不一致就下发新正文并提醒重新导入。
 
 **先接服务，再装 skill。** 开场那一次 `get_protocol` 是版本校验，服务没接上时模型按本地
-这份走、但会说一句"版本没核上"；写稿、查重、入库全部依赖服务，所以没接上不是"降级可用"。接入步骤（WorkBuddy 的项目级 `mcp.json`、Claude Code 的 `claude mcp add --transport http`、
+这份走、但会说一句"版本没核上"；写稿、查重、入库全部依赖服务，所以没接上不是"降级可用"。接入步骤（WorkBuddy 在「设置 → MCP」里加，全局生效；Claude Code 的 `claude mcp add --transport http`、
 key 一人一把）见 [`docs/deskcore.md`](../docs/deskcore.md) §4.3「挂到 WorkBuddy」；
 连不上时的排查顺序见 [`docs/deskcore-runbook.md`](../docs/deskcore-runbook.md)「连不上时按这个顺序查」。
 

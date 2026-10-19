@@ -734,12 +734,18 @@ def _register_mcp():
         allowed_origins=allowed,
     )
     # instructions 会在 MCP initialize 时交给客户端, 认它的平台会注入系统提示。
-    # 它只说一件事: 先核版本。协议正文的主副本在 skill 文件里(进系统提示), 这里
+    # 它说两件事: 写稿就先开项目(2026-10-19: skill 没被调起来的对话里, 只要连着写作台, 这句也在模型眼前),
+    # 以及先核版本。协议正文的主副本在 skill 文件里(进系统提示), 这里
     # **不再**让模型每次去取全文 —— 2026-09-10 那版这么写过, 09-11 起入库率从
     # 110% 掉到 22%, 见 tools.get_protocol 的说明。不认这个字段的平台丢掉即可。
     mcp = FastMCP(name="deskcore", stateless_http=True, json_response=True,
                   streamable_http_path="/", transport_security=security,
                   instructions=("deskcore 是 BYWOOD 小红书种草文案的写作台内核。"
+                                "只要用户要给任何品牌写或改小红书稿(哪怕没提写作台、只报了品牌名、只贴了 brief、"
+                                "只点了 human-writing), 都先走写作台: 不知道项目就 list_projects, 再 open_project "
+                                "拿简报, 拿到再写; 给一条笔记写评论走 comments_for(带链接), 不用 open_project。"
+                                "对话里出现 human-writing 时也核对一下: 写的是给品牌发的小红书内容, 就同时走写作台"
+                                "(human-writing 只管文笔)。"
                                 "协议正文在 bywood-writing-desk 这个 skill 里。"
                                 "对话开始时调一次 get_protocol, 带上 skill 里 "
                                 "protocol_version 那一行的值核对版本: 一致就照 skill "

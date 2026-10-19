@@ -1929,6 +1929,44 @@ def tv_project_map(sb) -> list[dict]:
                  .order("tv_project_id").execute()).data or [])
 
 
+def tv_published_note_ids(sb, tv_project_ids: list[str], since: str, until: str) -> list[str]:
+    """这几个 TV 项目里 publish_time 落在 [since, until] 的笔记 id(core.desk_gaps 用)。
+
+    只取 id 两列, 直接读 truth_vault.notes(同 tv_notes_by_link_token): deskcore_tv_notes 那个 RPC 会把正文一起带回来,
+    一个写手名下九个 TV 项目、一个月的笔记就是一两兆, 而这里只要数个数。按 note_id 翻页(唯一)。"""
+    if not tv_project_ids:
+        return []
+    return [r["note_id"] for r in _paged(lambda off, lim: (
+        sb.schema("truth_vault").table("notes")
+          .select("note_id, project_id")
+          .in_("project_id", list(tv_project_ids))
+          .gte("publish_time", since)
+          .lte("publish_time", until)
+          .order("note_id")
+          .range(off, off + lim - 1)))]
+
+
+def tv_link_kinds_for_notes(sb, note_ids: list[str]) -> list[dict]:
+    """这些笔记各对上了哪个写作台项目、怎么对上的(core.desk_gaps 用)。按 100 个一批 .in_(), 单批 URL 不会过长。"""
+    out: list[dict] = []
+    ids = list(dict.fromkeys(note_ids))
+    for i in range(0, len(ids), 100):
+        out.extend((sb.table("tv_note_links")
+                      .select("note_id, tv_project_id, project_id, match_kind, lag_days")
+                      .in_("note_id", ids[i:i + 100]).execute()).data or [])
+    return out
+
+
+def any_draw(sb, project_ids: list[str]) -> bool:
+    """这几个写作台项目有没有发过牌(谁发的、什么时候发的都算)。"""
+    if not project_ids:
+        return False
+    rows = (sb.table("angle_ledger").select("id")
+              .in_("project_id", list(project_ids))
+              .limit(1).execute()).data or []
+    return bool(rows)
+
+
 def tv_map_upsert(sb, tv_project_id: str, project_id: str, *,
                   ingest_target: bool, note: str = "") -> None:
     sb.table("tv_project_map").upsert(
