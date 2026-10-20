@@ -5213,12 +5213,12 @@ _TV_BACKFILL_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", 
 TV_SYNC_DIFF_BACKFILL = 500
 
 
-def _diff_stamp(link: dict, done: set[str], existing: dict[str, dict]) -> dict:
-    """差异行的 computed_at: 新算的、或者重对到了另一版的, 记现在(进下一份摘要); 同一版重算(--rematch)不带这一列,
-    upsert 就留着原来的时间 —— 不然一次 rematch 会把早就看过的整批差异推过水位、每周 200 篇地重放。"""
-    nid = link["note_id"]
-    old = existing.get(nid) or {}
-    if nid in done and str(old.get("version_id") or "") == str(link.get("version_id") or ""):
+def _diff_stamp(link: dict, diffed: dict[str, dict]) -> dict:
+    """差异行的 computed_at: 新算的、或者换了一版的, 记现在(进下一份摘要); 同一版重算(--rematch / 口径过时)不带这一列,
+    upsert 就留着原来的时间 —— 不然一次 rematch 会把早就看过的整批差异推过水位、每周 200 篇地重放。
+    "同一版"按差异行自己记的 version_id 比, 不按旧对照: 对照已经改过、差异没跟上的(那晚写差异失败), 换的那版要进摘要。"""
+    old = diffed.get(link["note_id"])
+    if old is not None and str(old.get("version_id") or "") == str(link.get("version_id") or ""):
         return {}
     return {"computed_at": store.iso_now()}
 
@@ -5240,16 +5240,39 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
     (_TV_BACKFILL_KINDS, 不含 ingested —— 那一版就是从这条笔记复制的, 没有改动可言); 那一版不在对照索引里
     (tv_lineage 指到别处的版本)就跳过。**不抛**: 这是附加信息, 算不了也不能让对照本身失败。"""
     try:
-        revs = store.tv_edit_diff_revs(client, tv_project_id) if not dry_run else {}
+        diffed = store.tv_edit_diff_revs(client, tv_project_id) if not dry_run else {}
     except Exception as exc:                            # noqa: BLE001 — 013 没跑 / 库错: 这晚不算
         # 记日志、带回 error; cli 的 tv-sync 据它退出非零(codex review on aw#107), 对照照写
         logger.exception("tv_sync: 读已算过的改动差异失败 (tv=%s) —— 这晚不算差异", tv_project_id)
         return {"written": 0, "error": f"{type(exc).__name__}: {exc}"[:200]}
-    done = set(revs)
-    stale = {nid for nid, rev in revs.items() if rev < tvlink.DIFF_REV}
-    fresh = {l["note_id"]: l for l in links if _diffable(l)}
-    backlog = [dict(r, note_id=nid) for nid, r in existing.items()
-               if nid not in fresh and (nid not in done or nid in stale) and _diffable(r)][:TV_SYNC_DIFF_BACKFILL]
+    # 每条笔记看它**现在**的对照(codex review on aw#113): 本次处理过的(新对上 / --rematch 重对)以本次为准,
+    # 旧对照不再进补算 —— 不然重对到"发布后才存"的那版时, 被替掉的旧对照照样按当前口径算一遍、进摘要。
+    current = {**existing, **{l["note_id"]: l for l in links}}
+    # lag 是空的、但两边时间现在都有了的, 补上并写回对照(codex review on aw#113): 以前的对照有的没记 lag
+    # (那时笔记还没有发布时间, 或者是老代码对上的), _diffable 把空当"不知道、放行", 抄回来的那版就混进差异。
+    lag_fill: dict[str, int] = {}
+    for nid, l in current.items():
+        if l.get("lag_days") is None and l.get("version_id") and l.get("match_kind") in _TV_BACKFILL_KINDS:
+            n, v = notes_by_id.get(nid), known.get(str(l["version_id"]))
+            lag = tvlink.lag_days(n, v) if n is not None and v is not None else None
+            if lag is not None:
+                lag_fill[nid] = lag
+                current[nid] = dict(l, lag_days=lag)
+    # 要(重)算的: 还没有差异行、口径过时、或差异行记的那版和现在的对照不是同一版(重对之后那晚写差异失败了)
+    stale = {nid for nid, d in diffed.items()
+             if d["rev"] < tvlink.DIFF_REV or (nid in current and current[nid].get("version_id")
+                                               and str(d.get("version_id") or "") != str(current[nid]["version_id"]))}
+    seen = {l["note_id"] for l in links}
+    fresh = {nid: current[nid] for nid in seen if _diffable(current[nid])}
+    # 先筛掉算不了的(笔记不在这次读到的范围 / 那一版不在对照索引里), 再截到每晚上限: 不然一堆永远算不了的
+    # 老对照占满名额, 后面能算的一直轮不到
+    backlog = [dict(r, note_id=nid) for nid, r in current.items()
+               if nid not in seen and (nid not in diffed or nid in stale) and _diffable(r)
+               and nid in notes_by_id and str(r["version_id"]) in known][:TV_SYNC_DIFF_BACKFILL]
+    # 已经按当前口径算过、但对照现在不该算了的(重对到抄回的那版 / 补上的 lag < 0): 降回旧口径, 摘要就读不到它;
+    # 不删行(删数据由人在 SQL 编辑器里做)。
+    demote = sorted(nid for nid, d in diffed.items()
+                    if d["rev"] >= tvlink.DIFF_REV and nid in current and not _diffable(current[nid]))
     brands: dict[str, str] = {}
     rows = []
     for l in list(fresh.values()) + backlog:
@@ -5269,16 +5292,27 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
                          "changed", "title_changed", "published_title", "draft_chars", "published_chars",
                          "removed_count", "added_count", "edited_count", "removed_sentences", "added_sentences",
                          "edited_sentences", "brand_draft", "brand_published")},
-                     **_diff_stamp(l, done, existing)})
+                     **_diff_stamp(l, diffed)})
     out = {"computed": len(rows), "changed": sum(1 for r in rows if r["changed"]),
            "backfilled": sum(1 for r in rows if r["note_id"] not in fresh),
-           "recomputed": sum(1 for r in rows if r["note_id"] in stale), "written": 0}
-    if rows and not dry_run:
+           "recomputed": sum(1 for r in rows if r["note_id"] in stale), "written": 0,
+           "lag_filled": 0, "demoted": 0}
+    if dry_run:
+        out.update(lag_filled=len(lag_fill), demoted=len(demote))      # dry-run 报"会做多少"
+        return out
+    # 三笔各写各的、各记各的错: 先降口径(这一步才让该藏的行出摘要), 再补 lag, 最后写差异 —— 一笔失败不拖住另两笔
+    # (降口径和补 lag 只看内存里的 current, 不依赖差异写没写成)。
+    for key, err_key, fn, arg, what in (
+            ("demoted", "demote_error", store.tv_edit_diffs_demote, demote, "差异降回旧口径"),
+            ("lag_filled", "lag_error", store.tv_links_set_lag, lag_fill, "对照补 lag"),
+            ("written", "error", store.tv_edit_diffs_upsert, rows, "改动差异写库")):
+        if not arg:
+            continue
         try:
-            out["written"] = store.tv_edit_diffs_upsert(client, rows)
+            out[key] = fn(client, arg)
         except Exception as exc:                        # noqa: BLE001
-            logger.exception("tv_sync: 改动差异写库失败 (tv=%s) —— 对照不受影响", tv_project_id)
-            out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+            logger.exception("tv_sync: %s失败 (tv=%s)", what, tv_project_id)
+            out[err_key] = f"{type(exc).__name__}: {exc}"[:200]
     return out
 
 

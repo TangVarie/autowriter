@@ -389,3 +389,115 @@ def test_a_lineage_link_gets_its_lag_so_a_late_copy_is_not_diffed():
     c2 = _client([_note("n-lin2", "秋招投了六十份", BODY_A, days=3, source_autowriter_version_id="v1")])
     core.tv_sync(c2, TV)
     assert c2.rows["tv_note_links"][0]["lag_days"] == 3 and len(c2.rows["tv_edit_diffs"]) == 1, "发布前的照算"
+
+
+def _old_link(nid, lag):
+    return {"note_id": nid, "tv_project_id": TV, "project_id": P1, "version_id": "v1", "item_id": "i1",
+            "match_kind": "body_exact", "score": 1.0, "lag_days": lag}
+
+
+def _diff_row(nid, rev):
+    return {"note_id": nid, "tv_project_id": TV, "project_id": P1, "version_id": "v1", "match_kind": "body_exact",
+            "changed": True, "diff_rev": rev, "computed_at": "2026-10-19T14:03:00+00:00"}
+
+
+def test_a_rematch_to_a_late_copy_keeps_the_replaced_link_out_of_the_backlog():
+    """--rematch 把一条重对到"发布后才存"的那版(codex review on aw#113): 被替掉的旧对照(lag ≥ 0、口径过时)
+    不能再进补算; 已经按当前口径算过的那行降回旧口径, 摘要读不到。"""
+    c = _client([_note("n0", "秋招投了六十份", BODY_A, days=-3)], links=[_old_link("n0", 2)])
+    c.rows["tv_edit_diffs"] = [_diff_row("n0", 0)]
+    out = core.tv_sync(c, TV, rematch=True)["edit_diffs"]
+    assert c.rows["tv_note_links"][0]["lag_days"] == -3
+    assert out["computed"] == 0 and c.rows["tv_edit_diffs"][0]["diff_rev"] == 0, "旧对照不补算"
+    c.rows["tv_edit_diffs"][0]["diff_rev"] = tvlink.DIFF_REV            # 重对之前就按当前口径算过了
+    out = core.tv_sync(c, TV, rematch=True)["edit_diffs"]
+    assert out["demoted"] == 1 and c.rows["tv_edit_diffs"][0]["diff_rev"] == 0
+    assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == []
+
+
+def test_an_old_link_without_lag_gets_it_filled_and_a_late_copy_is_not_diffed():
+    """以前的对照有的没记 lag(codex review on aw#113)。两边时间都有了就补上、写回对照; 补出来 < 0 的不算差异,
+    ≥ 0 的照算; 只有一边有时间的仍是"不知道", 照旧放行。"""
+    notes = [_note("n-late", "秋招投了六十份", BODY_A, days=-1), _note("n-ok", "秋招投了六十份", BODY_A, days=2),
+             _note("n-nopub", "秋招投了六十份", BODY_A, publish_time=None)]
+    c = _client(notes, links=[_old_link("n-late", None), _old_link("n-ok", None), _old_link("n-nopub", None)])
+    out = core.tv_sync(c, TV)["edit_diffs"]
+    lags = {l["note_id"]: l["lag_days"] for l in c.rows["tv_note_links"]}
+    assert lags == {"n-late": -1, "n-ok": 2, "n-nopub": None}
+    assert out["lag_filled"] == 2
+    assert {r["note_id"] for r in c.rows["tv_edit_diffs"]} == {"n-ok", "n-nopub"}, "抄回的那版不算"
+    assert core.tv_sync(c, TV)["edit_diffs"]["lag_filled"] == 0, "补过的不再补"
+
+
+def test_a_filled_negative_lag_demotes_a_row_already_at_the_current_rev():
+    c = _client([_note("n0", "秋招投了六十份", BODY_A, days=-2)], links=[_old_link("n0", None)])
+    c.rows["tv_edit_diffs"] = [_diff_row("n0", tvlink.DIFF_REV)]
+    out = core.tv_sync(c, TV)["edit_diffs"]
+    assert out["lag_filled"] == 1 and out["demoted"] == 1
+    assert c.rows["tv_note_links"][0]["lag_days"] == -2 and c.rows["tv_edit_diffs"][0]["diff_rev"] == 0
+
+
+def test_dry_run_reports_the_lag_fill_but_writes_nothing():
+    """dry-run 不读差异表的口径(同以前), 所以只报会补几条 lag, 降级数是 0; 两张表都不写。"""
+    c = _client([_note("n0", "秋招投了六十份", BODY_A, days=-2)], links=[_old_link("n0", None)])
+    c.rows["tv_edit_diffs"] = [_diff_row("n0", tvlink.DIFF_REV)]
+    out = core.tv_sync(c, TV, dry_run=True)["edit_diffs"]
+    assert out["lag_filled"] == 1 and out["computed"] == 0
+    assert c.rows["tv_note_links"][0]["lag_days"] is None and c.rows["tv_edit_diffs"][0]["diff_rev"] == tvlink.DIFF_REV
+
+
+def test_a_failed_diff_write_still_hides_the_late_copy_and_fills_its_lag(monkeypatch):
+    """三笔各写各的(review on the aw#113 follow-up): 差异写库失败, 降口径和补 lag 照做, 各自报各自的错。"""
+    c = _client([_note("n-late", "秋招投了六十份", BODY_A, days=-2), _note("n-new", "秋招投了六十份简历没回音", BODY_A)],
+                links=[_old_link("n-late", None)])
+    c.rows["tv_edit_diffs"] = [_diff_row("n-late", tvlink.DIFF_REV)]
+    monkeypatch.setattr(store, "tv_edit_diffs_upsert", lambda *a: (_ for _ in ()).throw(RuntimeError("payload")))
+    out = core.tv_sync(c, TV)["edit_diffs"]
+    assert "payload" in out["error"] and out["written"] == 0
+    assert out["demoted"] == 1 and out["lag_filled"] == 1, "报的是真写成的"
+    late = next(l for l in c.rows["tv_note_links"] if l["note_id"] == "n-late")
+    assert late["lag_days"] == -2 and c.rows["tv_edit_diffs"][0]["diff_rev"] == 0
+    assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == []
+
+
+def test_a_failed_lag_write_is_its_own_error_and_the_cli_says_so(monkeypatch, capsys):
+    from deskcore import cli
+    c = _client([_note("n0", "秋招投了六十份", BODY_A, days=-2)], links=[_old_link("n0", None)])
+    monkeypatch.setattr(core, "sb", lambda: c)
+    monkeypatch.setattr(store, "tv_links_set_lag", lambda *a: (_ for _ in ()).throw(RuntimeError("timeout")))
+    assert cli.main(["tv-sync", "--tv-project", TV]) == 1
+    text = capsys.readouterr().out
+    assert "lag_days 没写回" in text and "改动差异没写成" not in text
+    assert not c.rows.get("tv_edit_diffs"), "补出来 < 0, 本次照样不算差异"
+
+
+def test_the_cli_reports_lag_fills_and_demotions(monkeypatch, capsys):
+    from deskcore import cli
+    c = _client([_note("n0", "秋招投了六十份", BODY_A, days=-2)], links=[_old_link("n0", None)])
+    c.rows["tv_edit_diffs"] = [_diff_row("n0", tvlink.DIFF_REV)]
+    monkeypatch.setattr(core, "sb", lambda: c)
+    assert cli.main(["tv-sync", "--tv-project", TV]) == 0
+    text = capsys.readouterr().out
+    assert "对照补上 lag 1 条" in text and "降回旧口径 1 行" in text
+
+
+def test_a_diff_row_for_a_replaced_version_is_recomputed_and_reaches_the_digest():
+    """重对到另一版那晚差异没写成: 对照已经换了版, 差异行还是旧版的当前口径。下一晚按版本不一致重算, computed_at 记现在。"""
+    c = _client([_note("n0", "秋招投了六十份", BODY_A)], links=[_old_link("n0", 2)])
+    c.rows["tv_edit_diffs"] = [dict(_diff_row("n0", tvlink.DIFF_REV), version_id="v-old",
+                                    computed_at="2026-09-01T00:00:00+00:00")]
+    out = core.tv_sync(c, TV)["edit_diffs"]
+    assert out["recomputed"] == 1 and out["written"] == 1
+    (row,) = c.rows["tv_edit_diffs"]
+    assert row["version_id"] == "v1" and row["computed_at"] > "2026-10-01", "换了版的进下一份摘要"
+
+
+def test_uncomputable_links_do_not_starve_the_backlog(monkeypatch):
+    """每晚上限之前先筛掉算不了的(那一版不在对照索引里): 不然它们永远占着名额, 能算的轮不到。"""
+    monkeypatch.setattr(core, "TV_SYNC_DIFF_BACKFILL", 2)
+    gone = [dict(_old_link(f"a{i}", 2), version_id=f"v-gone{i}") for i in range(3)]
+    notes = [_note(f"a{i}", "秋招投了六十份", BODY_A) for i in range(3)] + [_note("z-ok", "秋招投了六十份", BODY_A)]
+    c = _client(notes, links=gone + [_old_link("z-ok", 2)])
+    c.rows["tv_edit_diffs"] = [_diff_row("z-ok", 0)]
+    out = core.tv_sync(c, TV)["edit_diffs"]
+    assert out["computed"] == 1 and c.rows["tv_edit_diffs"][0]["diff_rev"] == tvlink.DIFF_REV

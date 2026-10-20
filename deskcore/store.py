@@ -2100,6 +2100,32 @@ def tv_links_upsert(sb, rows: list[dict]) -> int:
     return n
 
 
+def tv_links_set_lag(sb, lags: dict[str, int]) -> int:
+    """给已有对照补上 lag_days(``{note_id: lag}``), 回实际改到的行数。按 lag 值分组 update, 不走 upsert: 只带两列的
+    upsert 会先按插入校验整行的非空约束。"""
+    by_lag: dict[int, list[str]] = {}
+    for nid, lag in lags.items():
+        by_lag.setdefault(int(lag), []).append(nid)
+    now, n = iso_now(), 0
+    for lag, ids in by_lag.items():
+        for i in range(0, len(ids), 200):
+            chunk = ids[i:i + 200]
+            res = sb.table("tv_note_links").update({"lag_days": lag, "updated_at": now}).in_("note_id", chunk).execute()
+            n += len(res.data or [])
+    return n
+
+
+def tv_edit_diffs_demote(sb, note_ids: list[str]) -> int:
+    """这些笔记的差异行降回 diff_rev 0, 回实际改到的行数: 对照现在不该算差异了(重对到抄回的那版 / 补上的 lag < 0),
+    摘要不再读它。"""
+    n = 0
+    for i in range(0, len(note_ids), 200):
+        chunk = list(note_ids[i:i + 200])
+        res = sb.table("tv_edit_diffs").update({"diff_rev": 0}).in_("note_id", chunk).execute()
+        n += len(res.data or [])
+    return n
+
+
 def tv_backfill_lineage(sb, links: list[dict]) -> int:
     """把对照写回 TV 的 source_autowriter_* 两列(只填 NULL 的行), 回实际更新数。"""
     if not links:
@@ -2171,13 +2197,14 @@ def tv_targets_of(sb, tv_project_id: str) -> list[dict]:
 
 
 # ── 人在发布前改了什么(migrations/013, D-120 / W-23) ──────────────────────────────────────────
-def tv_edit_diff_revs(sb, tv_project_id: str) -> dict[str, int]:
-    """这个 TV 项目已经算过差异的笔记 → 按哪一版口径算的(tvlink.DIFF_REV)。夜跑给新对上的、以前漏算的、
-    和口径过时的补算。"""
+def tv_edit_diff_revs(sb, tv_project_id: str) -> dict[str, dict]:
+    """这个 TV 项目已经算过差异的笔记 → ``{"rev": 按哪一版口径算的(tvlink.DIFF_REV), "version_id": 拿哪一版算的}``。
+    夜跑给新对上的、以前漏算的、口径过时的、和对照已经换了版的补算。"""
     def _build(off, lim):
-        return (sb.table("tv_edit_diffs").select("note_id, diff_rev")
+        return (sb.table("tv_edit_diffs").select("note_id, diff_rev, version_id")
                 .eq("tv_project_id", tv_project_id).order("note_id").range(off, off + lim - 1))
-    return {r["note_id"]: int(r.get("diff_rev") or 0) for r in _paged(_build)}
+    return {r["note_id"]: {"rev": int(r.get("diff_rev") or 0), "version_id": r.get("version_id")}
+            for r in _paged(_build)}
 
 
 def tv_edit_diffs_upsert(sb, rows: list[dict]) -> int:
