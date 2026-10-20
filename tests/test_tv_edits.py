@@ -377,3 +377,15 @@ def test_old_rows_from_post_publication_copies_are_not_recomputed_or_read():
     assert c.rows["tv_edit_diffs"][0]["diff_rev"] == 0
     assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == [], "摘要也读不到它"
     assert tvlink.DIFF_REV >= 2
+
+
+def test_a_lineage_link_gets_its_lag_so_a_late_copy_is_not_diffed():
+    """TV 自带 lineage 的笔记也要算 lag(codex review on aw#113): 不算是 None、被当成放行, 抄回来的那版照样进差异。"""
+    c = _client([_note("n-lin", "秋招投了六十份", BODY_A, days=-4, source_autowriter_version_id="v1")])
+    out = core.tv_sync(c, TV)
+    (link,) = c.rows["tv_note_links"]
+    assert link["match_kind"] == "tv_lineage" and link["lag_days"] == -4
+    assert out["edit_diffs"]["computed"] == 0
+    c2 = _client([_note("n-lin2", "秋招投了六十份", BODY_A, days=3, source_autowriter_version_id="v1")])
+    core.tv_sync(c2, TV)
+    assert c2.rows["tv_note_links"][0]["lag_days"] == 3 and len(c2.rows["tv_edit_diffs"]) == 1, "发布前的照算"

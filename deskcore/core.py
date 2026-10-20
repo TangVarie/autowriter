@@ -5364,6 +5364,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                                project_id=hit[0] if hit else None,
                                version_id=tvid if hit else None,
                                item_id=hit[1] if hit else None,
+                               # 那一版在对照索引里就照样算 lag(codex review on aw#113): 不算的话是 None, _diffable
+                               # 当成"不知道、放行", 发了之后才存进写作台的那版就混进改动差异。索引外的旧版
+                               # (_resolve_any_version 反查到的)这里拿不到时间, 但差异本来也只对索引里的版本算。
+                               lag=tvlink.lag_days(n, v) if v else None,
                                candidates=None if hit else [{"tv_version_id": tvid,
                                                               "note": "TV 带的 version_id 不在对照的写作台项目里"}]))
             continue
