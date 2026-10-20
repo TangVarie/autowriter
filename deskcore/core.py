@@ -2258,13 +2258,13 @@ DELIVERY_NEXT_STEP = ("这个项目有交付模板: delivery.text 是按模板�
                       "不要再加标记。")
 RULE_CHECKS_NEXT_STEP = ("rule_checks 是代码按项目规则逐篇查出来的: 标「必须改」的改完再交(带 replaces_version_id 再调一次), "
                          "「建议改」的告诉用户。只是参考, 存档已经成功了。")
-RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的优先列, 没列的多半是建议改), 还有 rule_checks_more 条没列: "
+RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的全列了, 没列的都是建议改), 还有 rule_checks_more 条没列: "
                               "如实告诉用户还有这么多条没列出来。")
 RULE_CHECKS_ERROR_NEXT_STEP = ("rule_checks_status=error: 这次代码查规则没跑成(存档不受影响), 不能跟用户说规则都用代码查过了。")
 
 
 def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
-                              indices: list[int], out: dict) -> dict:
+                              indices: list[int], out: dict, *, tactic: str = "") -> dict:
     """存完档之后的两样纯代码活(2026-10-20), 结果挂进 ``out``, 返回给 batch_metrics 的那一小块。**不抛**。
 
     1. 交付版式: 项目配了 ``default_params.delivery`` 就按模板把存进去的那几篇拼好(``out["delivery"]``)。
@@ -2297,13 +2297,17 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             hard, soft = store.shared_memories(client, project_id, user_id, rule_kinds=rulecheck.CHECK_KINDS)
             # 方向闸: 同简报(build_writing_brief)和 my_rules 的「方向不符」。标了另一个方向的 soft 规则简报里没有, 这里
             # 再报「建议改」就是在叫模型写它没被要求、甚至相反的东西(产品向的"带上产品名"报到流量向项目上)。
-            # hard 不过这道闸, 同简报。这里没有 tactic, 只按项目名判, 同 my_rules。
-            soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or ""))
-            # 模板管话题时, 查 where=tags 的规则用交付出去的那一份(含固定 / 条件话题), 免得和 delivery.text 对不上
-            final_tags = None
+            # hard 不过这道闸, 同简报。判据也同简报: 项目名 + 这场 open_project 传的 tactic(写手原样传回来, codex review
+            # on aw#115) —— 只按项目名判的话, 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又全报一遍。
+            soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or "", tactic or ""))
+            # 模板管话题时, 查的是交付出去的那一份, 免得和 delivery.text 对不上: 话题含固定 / 条件话题; 正文是摘掉末尾那行
+            # 话题之后的(codex review on aw#115: 拿原稿查的话, 话题行里的词会被报成「正文里有」, 必须带的话术也能靠它混过去)
+            checked, final_tags = picked, None
             if tpl is not None and delivery.wants_tags(tpl):
-                final_tags = [delivery.delivered_tags(tpl, d) for d in picked]
-            hits, stats = rulecheck.check(hard + soft, picked, indices=indices, tags=final_tags)
+                posts = [delivery.delivered_post(tpl, d) for d in picked]
+                checked = [{**d, "body": body} for d, (body, _tags) in zip(picked, posts)]
+                final_tags = [tags for _body, tags in posts]
+            hits, stats = rulecheck.check(hard + soft, checked, indices=indices, tags=final_tags)
             if hits:
                 shown, more = rulecheck.top_hits(hits)
                 out["rule_checks"] = shown
@@ -2327,7 +2331,7 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
 
 
 def commit_drafts(client, project_id: str, drafts: list[dict],
-                  *, user_id: str | None = None, flywheel_arm: str | None = None) -> dict:
+                  *, user_id: str | None = None, flywheel_arm: str | None = None, tactic: str = "") -> dict:
     """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
 
     只收真正定稿的 —— 指纹库脏了(把废稿也记进去)会让后续正常选题被误杀。
@@ -2372,6 +2376,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     判定结局不再是影子 —— ``judge.results`` 每篇带 ``score`` / ``fixes``(``draft_score``), 给写手看,
     仍然不拦。人审(review_drafts)和导出(export_drafts)两个工具撤了: 定稿由写手贴进飞书, 发布后
     tv-sync 按内容对回来。
+
+    ``tactic``(2026-10-20): 这场 open_project 传的 tactic, 只给代码查规则的方向闸用(同 build_writing_brief 的判据)。
     """
     started = time.monotonic()
     # 审计 COR-015。项目整行留着: 交付模板(default_params.delivery)就在这一行里, 不再多查一次(10-20)
@@ -2775,7 +2781,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # ── 交付版式 + 代码查规则(2026-10-20): 锁外、恢复指纹的 try 外, 同下面的判定 ──────────────────
     # 都是纯代码(模板在项目行里, 规则多一次很小的查询), 放在判定前面: 判定的截止按"已用时间"算, 这一步多花的
     # 几十毫秒从判定里扣, 不会把整次回包推过客户端的容忍。只拼 / 只查存进去了的那几篇, 被闸拒掉的要重写。
-    post_meta = _delivery_and_rule_checks(client, project, project_id, user_id, drafts, sorted(inserted_idx), out)
+    post_meta = _delivery_and_rule_checks(client, project, project_id, user_id, drafts, sorted(inserted_idx), out,
+                                          tactic=tactic)
 
     # ── 入库判定(参考分): 锁已经放了, 恢复指纹的那个 try 也出来了 ─────────────
     # 到这里入库已经成功, 下面任何一步都不许把它变成失败: 判定自己不抛

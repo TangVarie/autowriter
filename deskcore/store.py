@@ -2563,12 +2563,15 @@ def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days
 # 每篇打分的稿子 Jev 都答一遍 TV 的特征题库, 写进 truth_vault.note_feature_answers(subject_type = 'aw_version',
 # subject_id = versions.id::text, run_tag = 'primary', extractor = 'jev:<模型版本>'; judge_client.build_draft_request
 # 和 Jev 的 judge/core.ledger_rows)。写作台回包里本来就有这份 profile, 但从来没存 —— 直接回账本读, 不另存一份。
-# 和 recent_titles 同一条纪律: 固定三次往返(批次 → item 与版本 id → 答案), 只取 id、时间和答案列,
+# 和 recent_titles 同一条纪律: 固定三次往返(批次 → 版本 id 与时间 → 答案), 只取 id、时间和答案列,
 # 不取正文, 也不取 evidence(那是稿子原文片段)。
 STRUCTURE_BATCH_DAYS = 60
 STRUCTURE_ITEMS_MAX = 60
 # 一次 .in_() 最多带这么多个版本 id: 6 题 × 80 = 480 行, 在 PostgREST 的 db-max-rows(1000)以内, 不用翻页
 STRUCTURE_VERSIONS_MAX = 80
+# 窗口里最多看这么多行版本(只有 id / item_id / 时间, 一行几十字节)。按 item 摊名额之前先取够: 改过几十轮的那一篇
+# 要把这么多行都占满才挤得掉别的稿子
+STRUCTURE_VERSION_ROWS_MAX = 300
 
 
 def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[int, frozenset]],
@@ -2579,28 +2582,39 @@ def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[
     ``questions`` = {题目 id: (题目版本, 合法答案)}: 版本对不上、答案为空(无效)或不在合法答案里的行都不算。
     一个 item 算一篇, 取它最新的、有答案的那一版(改稿是往同一个 item 上加一版, 每一版都判过一次, 全算会让改得多的
     那篇占好几票)。补录副本(``source == 'ingest'``)不算, 那是发出去的帖抄回来的, 也不经过 judge。
-    同一篇同一题有好几行(Jev 换过模型版本)时取最后抽的那一行。"""
+    同一篇同一题有好几行(Jev 换过模型版本)时取最后抽的那一行。
+
+    窗口按【版本自己的时间】切, 不按批次建的时间(codex review on aw#115, 同 recent_drafted_titles 那条): 改稿是往老
+    item 上加一版, 批次还是原来那个。所以批次往前多看几倍天数(只为认出补录副本), 版本按时间取。
+    答案那一次 .in_() 的版本 id 按 item 摊(codex review on aw#115): 先给每篇最新的一版, 有空再给每篇次新的一版……
+    原来是在整批版本上按时间截 80 个再一篇一票, 改过几轮的一篇占好几个名额 —— 30 篇各三版只剩 27 篇, 一篇改了几十轮的
+    能把窗口压到 12 篇以下。"""
     if not questions:
         return []
     now = now or datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
     batches = (sb.table("batches").select("id, params, created_at")
-               .eq("project_id", project_id).gte("created_at", (now - timedelta(days=days)).isoformat())
+               .eq("project_id", project_id).gte("created_at", (now - timedelta(days=days * 4)).isoformat())
                .order("created_at", desc=True).order("id", desc=True)
                .limit(RECENT_BATCHES_MAX).execute()).data or []
     bids = [b["id"] for b in batches if b.get("id") and not is_ingest_batch(b)][:100]
     if not bids:
         return []
-    items = (sb.table("items").select("id, created_at, versions(id, created_at)")
-             .in_("batch_id", bids).order("created_at", desc=True).order("id", desc=True)
-             .limit(STRUCTURE_ITEMS_MAX).execute()).data or []
-    cands: list[tuple[datetime, str, str]] = []          # (版本时间, item id, 版本 id)
-    for item in items:
-        for v in item.get("versions") or []:
-            t = _ts(v.get("created_at")) or _ts(item.get("created_at"))
-            if v.get("id") and t is not None:
-                cands.append((t, str(item.get("id")), str(v["id"])))
+    versions = (sb.table("versions").select("id, item_id, created_at, items!inner(batch_id)")
+                .in_("items.batch_id", bids).gte("created_at", since.isoformat())
+                .order("created_at", desc=True).order("id", desc=True)
+                .limit(STRUCTURE_VERSION_ROWS_MAX).execute()).data or []
+    by_item: dict[str, list[tuple[datetime, str, str]]] = {}     # item id → [(版本时间, item id, 版本 id)]
+    for v in versions:
+        t = _ts(v.get("created_at"))
+        if v.get("id") and v.get("item_id") and t is not None and t >= since:
+            by_item.setdefault(str(v["item_id"]), []).append((t, str(v["item_id"]), str(v["id"])))
+    # 每篇一条道, 道内新的在前; 最近改过 / 写过的 STRUCTURE_ITEMS_MAX 篇, 一层一层轮着取, 直到 id 封顶
+    lanes = sorted((sorted(vs, key=lambda c: (c[0], c[2]), reverse=True) for vs in by_item.values()),
+                   key=lambda vs: (vs[0][0], vs[0][2]), reverse=True)[:STRUCTURE_ITEMS_MAX]
+    cands = [vs[depth] for depth in range(max(map(len, lanes), default=0)) for vs in lanes
+             if depth < len(vs)][:STRUCTURE_VERSIONS_MAX]
     cands.sort(key=lambda c: (c[0], c[2]), reverse=True)
-    cands = cands[:STRUCTURE_VERSIONS_MAX]
     if not cands:
         return []
     rows = (sb.schema("truth_vault").table("note_feature_answers")

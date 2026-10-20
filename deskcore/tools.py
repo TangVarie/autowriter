@@ -338,7 +338,7 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     (排不出相关性时按天轮换, 不会每次都是最近那几条 —— 那会让文风越写越窄)。所以知道要写什么就传。
-    经验卡也是按这几个字段匹配的, 不传就只按项目定位借。
+    经验卡也是按这几个字段匹配的, 不传就只按项目定位借。传了 tactic 的, 存档时 score_drafts 也原样传同一个 tactic。
 
     ⚠️ **counts.hard_rules 是 0 不一定是错的。** 很多项目的约束确实都记在 soft 里
     (老工作台收反馈时不分"这一次"和"以后都这样", 一律存成 soft; 2026-09-20 全库
@@ -609,7 +609,7 @@ def score_comments(comments: list[dict], link: str = "", project_id: str = "", p
         raise InvalidInput(str(exc)) from exc
 
 
-def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
+def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", tactic: str = "",
                  _user_id: str | None = None) -> dict:
     """稿子写完、过了 check_drafts 就调(**自动调, 不等用户说**): 一次做两件事 ——
 
@@ -654,7 +654,7 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
 
     **规则检查**: ``rule_checks`` 是代码按项目里带 check 的规则逐篇查出来的命中(有命中才带), 每条 ``index`` /
     ``rule_id`` / ``severity`` / ``where`` / ``what``。``what`` 以「必须改」开头的是硬约束, 改完再交; 「建议改」的
-    告诉用户。和分数一样不拦存档。最多列 40 条, 必须改的优先列; ``rule_checks_more`` 是没列出的条数(多半是建议改),
+    告诉用户。和分数一样不拦存档。必须改的全列, 建议改补到一共 40 条为止; ``rule_checks_more`` 是没列出的建议改条数,
     如实告诉用户还有这么多条没列。``rule_checks_status`` 是 ``"error"`` 就是这次没查成, 不能说规则都用代码查过了。
 
     ``project_isolation`` 是串项目的提示: 有可疑标记要说明并核对; 没发现或检查超时都不能声称已完整排除串项目。
@@ -665,20 +665,23 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
 
     ``flywheel_arm``: 把这场写作的 open_project (或 borrow_lessons) 返回里的 ``flywheel_arm`` **原样**传回来。
     它决定这批稿子算进哪个对照组; 不传服务端会猜, 但同一项目同时开着两场时会猜错。
+
+    ``tactic``: 这场 open_project 传过 ``tactic`` 的, 把同一个值**原样**传回来(没传过就不传)。规则检查按它和项目名判这批
+    是产品向还是流量向, 和简报同一个判据; 不传的话只按项目名判, 简报里因为方向不符没给你的建议改规则, 这里会再报一遍。
     """
     # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、只带 error 字段的结果, 而存档失败若被当成
     # 成功, 稿子静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None)
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
 
 
-def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
+def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", tactic: str = "",
                   _user_id: str | None = None) -> dict:
     """旧名, 和 ``score_drafts`` 完全一样(存档 + 参考分)。新版 skill 只调 score_drafts; 这个名字留着是为了还没升级
     skill 的写手 —— 别在新对话里调它, 参数、返回值、怎么读分数都看 score_drafts 的说明。"""
     # 同 score_drafts: 写操作, 不包 _safe。
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None)
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
 
 
 INGEST_MAX_PER_CALL = 50

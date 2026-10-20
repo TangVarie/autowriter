@@ -4,7 +4,8 @@
 (subject_type = aw_version, subject_id = versions.id)。open_project 读回本项目最近 ≤30 篇的答案, 数一数,
 占比 ≥ 0.6 的几处摆给模型, 让这一批有一半换个写法。钉住:
   · 读法: 固定三次往返; 只取答案列, 不取 evidence / 正文; 只认 primary × fq-v0.1 × jev:*、题目版本对得上的有效答案;
-    一个 item 算一篇(取最新的、有答案的那一版); 补录副本、别的项目、窗口外的批次都不算
+    一个 item 算一篇(取最新的、有答案的那一版); 补录副本、别的项目、窗口外的版本都不算(窗口按版本时间, 不按批次);
+    答案那次的版本 id 按篇摊, 改得多的一篇不挤掉别的稿子
   · 算法: 少于 12 篇不报; 某一题有效答案少于 12 篇不报; bool 题只报「是」扎堆; product_role(露出要求)不问;
     已验证规律用到的题一律不问
   · 给模型看的是中文标签不是题目 id; 哪儿都不扎堆 / 读挂了就不带这一栏, 简报照给
@@ -47,12 +48,14 @@ class _World:
     def __init__(self):
         self.batches: list[dict] = []
         self.items: list[dict] = []
+        self.versions: list[dict] = []
         self.answers: list[dict] = []
         self._n = 0
 
     def draft(self, answers: dict | None = None, *, days: float = 1, pid=PID, source="deskcore",
               extractor="jev:1.13.0", run_tag="primary", bank="fq-v0.1", versions: dict | None = None) -> str:
-        """一篇稿子(一个批次一个 item); ``versions`` = {版本 id 后缀: 答案或 None(这一版没判)}, 默认一版。"""
+        """一篇稿子(一个批次一个 item); ``versions`` = {版本 id 后缀: 答案或 None(这一版没判)}, 默认一版。
+        某一版是后来改的(改稿往老 item 上加一版, 批次不变): 值写成 (答案, 几天前)。"""
         self._n += 1
         bid, iid = f"b{self._n}", f"i{self._n}"
         self.batches.append({"id": bid, "project_id": pid, "params": {"source": source},
@@ -61,8 +64,11 @@ class _World:
         vrows = []
         for k, (suffix, ans) in enumerate(versions.items()):
             vid = f"{iid}-{suffix}"
-            vrows.append({"id": vid, "created_at": _ago(days=days, seconds=-k), "title": "(标题不该被取)",
-                          "body": "(正文不该被取)"})
+            ans, at = ans if isinstance(ans, tuple) else (ans, _ago(days=days, seconds=-k))
+            at = _ago(days=at) if isinstance(at, (int, float)) else at
+            vrows.append({"id": vid, "created_at": at, "title": "(标题不该被取)", "body": "(正文不该被取)"})
+            # versions 表里的同一行: PostgREST 的 items!inner(batch_id) 内嵌在假件里就是这一小块
+            self.versions.append({**vrows[-1], "item_id": iid, "items": {"batch_id": bid}})
             for qid, a in (ans or {}).items():
                 self.answer(vid, qid, a, extractor=extractor, run_tag=run_tag, bank=bank)
         self.items.append({"id": iid, "batch_id": bid, "created_at": _ago(days=days), "versions": vrows})
@@ -82,7 +88,7 @@ class _World:
             "projects": [_project(), _project(OTHER_PID)],
             "batches": self.batches, "items": self.items, NFA: self.answers,
             "memories": [], "user_calibration_notes": [], "draft_fingerprints": [], "angle_ledger": [],
-            "style_edits": [], "tv_note_links": [], "versions": [],
+            "style_edits": [], "tv_note_links": [], "versions": self.versions,
         }, **kw)
 
 
@@ -110,7 +116,7 @@ def test_reads_by_id_in_three_round_trips_and_never_touches_text():
     c = w.client()
     got = _read(c)
     assert got == [_neutral(0), _neutral(1), _neutral(2)]
-    assert [q["table"] for q in c.calls] == ["batches", "items", NFA], "固定三次往返"
+    assert [q["table"] for q in c.calls] == ["batches", "versions", NFA], "固定三次往返"
     nfa = next(q for q in c.calls if q["table"] == NFA)
     assert "evidence" not in nfa["cols"] and "body" not in nfa["cols"], "账本只取答案列, 不取原文片段"
     assert ("eq", "subject_type", "aw_version") in nfa["filters"]
@@ -173,6 +179,33 @@ def test_version_ids_per_request_are_bounded():
     ids = next(f for f in nfa["filters"] if f[:2] == ("in", "subject_id"))[2]
     assert len(ids) == store.STRUCTURE_VERSIONS_MAX, "一次 .in_() 的版本 id 封顶"
     assert len(got) == structure.MAX_DRAFTS, "每篇两版、只有新那版判过: 80 个 id 是 40 篇, 取最新 30 篇"
+
+
+def test_revised_items_do_not_crowd_out_other_drafts():
+    """版本 id 的封顶按 item 摊(codex review on aw#115): 先在整批版本上截 80 个再一篇一票的话, 改过几轮的稿子一篇占好几个
+    名额 —— 30 篇各三版只剩 27 篇; 一篇改了几十轮的能把窗口压到 12 篇以下, 这一栏整个不出。"""
+    w = _World()
+    for i in range(30):
+        w.draft(versions={f"v{k}": _neutral(i) for k in range(3)}, days=1 + i / 100)
+    assert len(_read(w.client())) == 30
+
+    w = _World()
+    for i in range(13):
+        w.draft(_neutral(i), days=2 + i / 100)
+    w.draft(versions={f"v{k}": (_neutral(0, opening_type="具体事件"), 1 - k / 1000) for k in range(100)}, days=1.5)
+    got = _read(w.client())
+    assert len(got) == 14 and got[0]["opening_type"] == "具体事件"
+
+
+def test_a_draft_revised_today_in_an_old_batch_counts():
+    """窗口按版本自己的时间切, 不按批次建的时间(codex review on aw#115, 同 recent_drafted_titles 那条): 改稿是往老 item 上
+    加一版, 批次还是原来那个。按批次切的话, 今天改的一篇老稿就不算了。"""
+    w = _World()
+    old = store.STRUCTURE_BATCH_DAYS + 10
+    w.draft(versions={"v1": (_neutral(0, opening_type="提问"), old), "v2": (_neutral(0, opening_type="具体事件"), 0.1)},
+            days=old)
+    w.draft(versions={"v1": (_neutral(0, opening_type="数据事实"), old)}, days=old)      # 没改过的老稿照旧不算
+    assert _read(w.client()) == [_neutral(0, opening_type="具体事件")]
 
 
 def test_no_batches_means_no_ledger_read():

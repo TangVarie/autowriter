@@ -56,6 +56,120 @@ def test_ordinary_patterns_still_pass(pattern):
     V.assert_regex_is_safe(pattern)
 
 
+# ── 1b · 挨在一起、能匹配同样字符的量词(codex review on aw#115) ─────────────────────────
+# 没有嵌套, 但回溯是多项式级: k 个这样的量词挨着, 匹配失败时要试 n^k 种切法。实测 a*a*a*a*a*a*a*a*b 配 30 个 a
+# 1.05 秒、200 个 a 超过 3 秒; 两个就够: .*.*x 配 2000 字的一行 1.5 秒(正文执行上限是 2 万字)。
+
+@pytest.mark.parametrize("pattern", [
+    "a*a*a*a*a*a*a*a*b",        # codex 给的例子
+    ".*.*x",
+    "\\w+\\w+x",
+    "[哈呵]*哈*[呵哈]*。",
+    "a*b*a*c",                  # 中间的 b* 可以是空的, 隔不开
+    "a.*a.*a.*b",               # 中间的 a 本身就能被 .* 吃掉, 也隔不开
+    "(a*)a*b",                  # 组不挡
+    "(?:x|a*)a*b",              # 分支里的也算
+    "a{0,30}a{0,30}a{0,30}b",   # 有上界也一样, 只是乘积大
+    "a?" * 14 + "a" * 14,       # 经典的 a?ⁿaⁿ
+    "(?i)A*a*b",                # 不分大小写时 A 和 a 是同一个字
+    # 外层量词的每一次之间也是挨着的(codex review on aw#115): 实测 (?:.{0,20}){5}x 配 120 个 y 4.8 秒,
+    # {0,5} 3.4 秒; 外层无上界的 (?:\w{1,5})+x 配 26 个 a 3.2 秒、(?:.{0,20})*x 6.2 秒
+    "(?:.{0,20}){5}x",
+    "(?:.{0,20}){0,5}x",
+    "(?:哈{0,9}){6}!",
+    "(?:\\w{1,5})+x",
+    "(?:.{0,20})*x",
+    # 放宽(数个数 / 结尾的量词)之后仍然要拒的
+    "(?:x.*x.*x)y",             # 数完了后面还接着别的字: 失败时每种选法都要试
+    "!.*!.*!$",                 # 结尾的 $ 也能失败: 1000 个「!」加一个字 1.4 秒
+    "\\w*\\w*\\d+",             # 结尾的量词照样要吃够一个: 3000 个 a 84 秒
+    "!.{100,}!.{100,}!.{100,}!",  # 间隔有下限就不是只数个数了: 300 个「!」加 2000 字 0.5 秒
+    "[!！]" + "[\\s\\S]*[!！]" * 15,   # 展开超过 11 份: 正好 15 个「!」的稿子(守住了)每多一份翻一倍, 2 万字 20 多秒
+    "a.*?[!！].*[!！][!！]",    # 结尾两个 X 挨着, 要的是「连着两个」而不只是个数: 1500 个「a!」16 秒
+])
+def test_adjacent_overlapping_repeats_are_rejected(pattern):
+    with pytest.raises(V.UnsafeRegex) as ei:
+        V.assert_regex_is_safe(pattern)
+    assert "挨在一起" in str(ei.value)
+
+
+@pytest.mark.parametrize("pattern", [
+    "a*b*c",                            # 两个量词管的字不一样
+    "\\d+\\.\\d+",                        # 中间有固定的字隔开
+    "[a-z]+@[a-z]+\\.com",
+    "加.{0,3}微.{0,3}信",                # 有上界、乘积小
+    "\\d{1,3}\\d{1,3}",
+    ".*私信.*",                          # 两个字以上的固定词隔开
+    "a*+a*b",                           # 占有量词不回吐
+    # Jev 的规则编译器教模型写的两种(judge/rules.py 的 PROMPT_HEAD), 写作台得收
+    "^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S",
+    "品牌[\\s\\S]*品牌[\\s\\S]*品牌",
+    "最(好|佳|强|便宜|有效)|第一(名|品牌)",
+    # 「X 最多 N 次」展开写, X 是单个字(codex review on aw#115): 只能因为 X 不够数而失败, 回溯被 X 的个数封住
+    "[!！][\\s\\S]*[!！][\\s\\S]*[!！][\\s\\S]*[!！]",
+    "最[\\s\\S]*最[\\s\\S]*最",
+    "哦[\\s\\S]*哦[\\s\\S]*哦",
+    "#[\\s\\S]*#[\\s\\S]*#[\\s\\S]*#[\\s\\S]*#[\\s\\S]*#",
+    "\\n\\s*\\n\\s*\\n",                      # 最多空一行
+    "[!！]" + "[\\s\\S]*[!！]" * 10,          # 最多 10 个: 展开 11 份是上限
+    # 整条正则最后一个量词: 吃够下限就匹配成功, 不会再回头切(codex review on aw#115)
+    "\\d+\\s*\\d+",
+    "[!！]+\\s*[!！]+",
+    "原价.*\\d+",
+    ".*[!！]{2,}",
+    # 外层量词展开之后仍然放行的
+    "(?:\\S+\\s+){5}\\S+",
+    "(?:哈){5}",
+    "(?:哈哈)+",
+    "哈{5,}",
+    "(?:\\d{1,3},)+\\d{3}",
+])
+def test_separated_or_disjoint_repeats_still_pass(pattern):
+    V.assert_regex_is_safe(pattern)
+
+
+# 上面放宽的那几种, 闸放行就得真的快: 各配几种最坏的正文(2 万字, 即执行上限)掐表
+_WORST_TEXTS = {
+    "count": ["!" * 3 + "a" * 20_000, "！" * 20_000, "最" * 2 + "\n" * 20_000, "#" * 5 + " " * 20_000,
+              "\n" + " " * 20_000, "\n \n a" * 3000, "哦" * 2 + "x" * 20_000],
+    "tail": ["1" * 20_000, "1 " * 10_000, "1" + " " * 20_000 + "a", "!" * 20_000, "! " * 10_000, "a!" * 10_000],
+}
+
+
+@pytest.mark.parametrize("pattern, texts", [
+    ("[!！][\\s\\S]*[!！][\\s\\S]*[!！][\\s\\S]*[!！]", "count"),
+    ("最[\\s\\S]*最[\\s\\S]*最", "count"),
+    ("哦[\\s\\S]*哦[\\s\\S]*哦", "count"),
+    ("#[\\s\\S]*#[\\s\\S]*#[\\s\\S]*#[\\s\\S]*#[\\s\\S]*#", "count"),
+    ("\\n\\s*\\n\\s*\\n", "count"),
+    ("\\d+\\s*\\d+", "tail"),
+    ("[!！]+\\s*[!！]+", "tail"),
+])
+def test_what_the_relaxed_rules_let_through_is_actually_fast(pattern, texts):
+    V.assert_regex_is_safe(pattern)
+    for text in _WORST_TEXTS[texts]:
+        t0 = time.perf_counter()
+        V.re.search(pattern, text[:V.MAX_REGEX_TARGET_CHARS])
+        assert time.perf_counter() - t0 < 0.2, (pattern, text[:20])
+
+
+def test_deeply_nested_fixed_counts_do_not_hang_the_check_itself():
+    """外层定次量词要展开好几份才看得出跨份的切法(codex review on aw#115), 套几层就是几次方 —— 闸自己不能被一条短正则拖住。"""
+    t0 = time.perf_counter()
+    with pytest.raises(V.UnsafeRegex) as ei:
+        V.assert_regex_is_safe("(?:(?:(?:(?:(?:a{16}){16}){16}){16}){16})")
+    assert time.perf_counter() - t0 < 1
+    assert "太复杂" in str(ei.value)
+
+
+def test_the_codex_example_no_longer_runs():
+    """存量里要是已经有这一条(手写进库的), 执行期也当场跳过, 不卡生成。"""
+    rule = {"content": "x", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": "a*a*a*a*a*a*a*a*b"}}
+    t0 = time.perf_counter()
+    assert V.check_hard_rules(hard_rules=[rule], title="标题", body="a" * 40) == []
+    assert time.perf_counter() - t0 < 0.5
+
+
 def test_uncompilable_is_also_rejected():
     with pytest.raises(V.UnsafeRegex):
         V.assert_regex_is_safe("(unclosed")

@@ -286,17 +286,21 @@ def tag_list(template: dict, title: str, body: str, content_tags: list[str]) -> 
 def post_tags(template: dict, title: str, body: str, raw_tags) -> tuple[str, list[str], int]:
     """模板管话题时的一篇: (摘掉末尾话题之后的正文, 拼进话题行的话题, 写手给的有效话题数)。
 
-    单独传了 ``tags`` 就以它为准, 没传才用正文末尾摘下来的那几个。assemble 和代码查规则(交付出去的话题)共用这一处。"""
+    单独传了 ``tags`` 就以它为准, 没传才用正文末尾摘下来的那几个。assemble 和代码查规则(交付出去的话题)共用这一处。
+    ⚠️ 传了空列表也算传了(codex review on aw#115): 写手把话题从 tags 里删光, 就是这篇不带写手的话题, 不能再退回正文末尾
+    那几个。没传、传 null、传空字符串(模型常拿 "" 填缺省)才算没传。末尾那行照样摘掉, 不留在正文里。"""
     body, lifted = lift_trailing_tags(body)
-    given = split_tags(raw_tags)
-    tags, n_mine = tag_list(template, title, body, given or lifted)
+    supplied = raw_tags is not None and not (isinstance(raw_tags, str) and not raw_tags.strip())
+    tags, n_mine = tag_list(template, title, body, split_tags(raw_tags) if supplied else lifted)
     return body, tags, n_mine
 
 
-def delivered_tags(template: dict, draft: dict) -> list[str] | None:
-    """这篇交付出去带的全部话题: 模板拼的话题行 + 正文中间留下的 #话题。模板不管话题时返回 None(调用方照原样数)。
+def delivered_post(template: dict, draft: dict) -> tuple[str, list[str]] | None:
+    """这篇交付出去的 (正文, 全部话题)。模板不管话题时返回 None(调用方照原样查)。
 
-    rulecheck 查 where=tags 的规则用它: 固定话题、条件话题是模板加的, 只看写手传的 tags 会和 delivery.text 对不上。"""
+    正文是摘掉末尾话题之后的那一份(同 assemble); 话题是模板拼的话题行 + 正文中间留下的 #话题。rulecheck 两样都用它:
+    固定话题、条件话题是模板加的, 只看写手传的 tags 会和 delivery.text 对不上; 正文末尾那行话题被摘进了话题行, 拿原稿
+    查正文规则的话, 只在话题行里的词会被报成「正文里有」, 必须带的话术也会靠被摘走的那行混过去(codex review on aw#115)。"""
     tpl = validate(template)
     if not wants_tags(tpl):
         return None
@@ -304,7 +308,7 @@ def delivered_tags(template: dict, draft: dict) -> list[str] | None:
     title = str(d.get("title") or "").strip()
     body = str(d.get("body") or "").replace("\r\n", "\n").strip()
     body, tags, _n = post_tags(tpl, title, body, d.get("tags"))
-    return _dedupe(tags + split_tags(" ".join(_TAG.findall(body))))
+    return body, _dedupe(tags + split_tags(" ".join(_TAG.findall(body))))
 
 
 def _comments(raw) -> tuple[list[dict], list[str]]:

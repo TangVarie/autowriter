@@ -61,6 +61,8 @@ def test_each_kind_normalises_with_defaults():
     ({"kind": "forbidden_regex", "pattern": "(哈|哈哈)+$"}, "灾难性回溯"),
     ({"kind": "forbidden_regex", "pattern": "(ab?)+$"}, "灾难性回溯"),
     ({"kind": "forbidden_regex", "pattern": "(?:x|yz){2,9}"}, "灾难性回溯"),
+    ({"kind": "forbidden_regex", "pattern": "a*a*a*a*a*a*a*a*b"}, "挨在一起"),
+    ({"kind": "forbidden_regex", "pattern": ".*.*x"}, "挨在一起"),
     ({"kind": "max_len"}, "至少给"),
     ({"kind": "max_len", "max": 10, "min": 20}, "不能比 max 大"),
     ({"kind": "max_len", "max": True}, "正整数"),
@@ -79,6 +81,17 @@ def test_ordinary_patterns_still_pass_the_shape_check(pattern):
     assert rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})[1]["pattern"] == pattern
 
 
+@pytest.mark.parametrize("pattern", [r"[!！][\s\S]*[!！][\s\S]*[!！][\s\S]*[!！]", r"最[\s\S]*最[\s\S]*最", r"\n\s*\n\s*\n",
+                                     r"\d+\s*\d+", r"原价.*\d+"])
+def test_counting_a_single_character_is_recordable(pattern):
+    """「感叹号最多 3 个」照 Jev 规则编译器教的展开写(X[\\s\\S]*X…X), X 是单个字也要存得进、读得出(codex review on aw#115):
+    这种写法只会因为 X 不够数而失败, 回溯被 X 的个数封住。以前 validator 把单个字当成隔不开, 整条规则连原话一起存不进。"""
+    assert rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern, "where": ["body"]}) == \
+        ("forbidden_regex", {"pattern": pattern, "where": ["body"]})
+    row = _rule(1, "forbidden_regex", {"pattern": pattern, "where": ["body"]})
+    assert rulecheck.spec_of(row) is not None
+
+
 def test_an_ambiguous_quantified_alternation_is_refused_on_read_too():
     """validator.assert_regex_is_safe 放行 (哈|哈哈)+$: 30 个「哈」加一个句号就回溯近半秒、每多一个字乘 1.6, 而 re 匹配时
     握着 GIL —— 共享的服务进程整个停住。库里要是已经有这种形状(手写进去的), 读出来也跳过, 不跑。"""
@@ -89,6 +102,16 @@ def test_an_ambiguous_quantified_alternation_is_refused_on_read_too():
                                   [{"title": "", "body": "哈" * 40 + "。"}])
     assert hits == [] and stats == {"rules": 0, "skipped": 1}
     assert time.monotonic() - t0 < 1
+
+
+def test_adjacent_overlapping_repeats_are_refused_on_read_too():
+    """a*a*a*a*a*a*a*a*b 两道老闸都放行(没嵌套、没分支), 30 个 a 就回溯一秒多(codex review on aw#115)。库里要是已经有
+    (手写进去的), 读出来也跳过, 不跑。"""
+    row = _rule(1, "forbidden_regex", {"pattern": "a*a*a*a*a*a*a*a*b", "where": ["body"]})
+    assert rulecheck.spec_of(row) is None
+    t0 = time.monotonic()
+    assert rulecheck.check([row], [{"title": "", "body": "a" * 40}]) == ([], {"rules": 0, "skipped": 1})
+    assert time.monotonic() - t0 < 0.5
 
 
 def test_validator_honours_where_on_a_desk_regex():
@@ -102,6 +125,66 @@ def test_validator_honours_where_on_a_desk_regex():
     assert len(hits(None)) == 1 and len(hits(["title", "body"])) == 1
     only_body = {"content": "x", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": "^标题", "where": ["body"]}}
     assert validator.check_hard_rules([only_body], "标题有私信", "正文") == []
+
+
+def test_validator_never_reads_an_out_of_scope_desk_rule_as_text():
+    """只管评论 / 话题的规则, validator 那边看不到那几处, 也不许退回从 content 里抽词(codex review on aw#115)。
+
+    退回去的话「评论不要出现「私信」」会被抽成"标题正文不许出现私信", 生成的稿子一律标 needs_revision。"""
+    def hits(kind, payload, content, title="标题有私信", body="正文也有私信"):
+        return validator.check_hard_rules([{"content": content, "rule_kind": kind, "rule_payload": payload}],
+                                          title, body)
+    assert hits("forbidden_regex", {"pattern": "私信", "where": ["comments"]}, "评论不要出现「私信」") == []
+    assert hits("forbidden_word", {"words": ["私信"], "where": ["tags", "comments"]}, "评论不要出现「私信」") == []
+    assert hits("required_phrase", {"any": ["示例口播"], "where": ["comments"]}, "评论必须包含「示例口播」") == []
+    # "正文或评论里有一个就行": 这里看不到评论, 正文里没有也判不了没守
+    assert hits("required_phrase", {"any": ["示例口播"], "where": ["body", "comments"]}, "必须包含「示例口播」") == []
+    # 只管标题的禁用词: 正文里有不算; 只管正文的字数下限: content 里没写数也照查
+    assert hits("forbidden_word", {"words": ["私信"], "where": ["title"]}, "标题不要出现「私信」",
+                title="标题", body="正文也有私信") == []
+    assert [h["kind"] for h in hits("forbidden_word", {"words": ["私信"], "where": ["title"]},
+                                    "标题不要出现「私信」")] == ["forbidden_word"]
+    assert [h["kind"] for h in hits("max_len", {"min": 50, "where": "body"}, "正文写长一点")] == ["max_len"]
+    # check 坏了(写手手改的库)也不退回文本抽取: 写作台那边同样是跳过
+    assert hits("forbidden_word", {"words": [], "where": ["body"]}, "不要出现「私信」") == []
+
+
+# 两边同一行规则、同一篇稿子(只看标题和正文)必须给出同样的结论 —— 合成的示例
+_PARITY_DRAFT = {"title": "Alpha 标题", "body": "禁止开头一句。\n正文提到甲 #话题乙\nmade 结尾禁止"}
+
+
+@pytest.mark.parametrize("kind, payload", [
+    ("forbidden_word", {"words": ["alpha"]}),
+    ("forbidden_word", {"words": ["甲"], "where": ["title"]}),
+    ("forbidden_word", {"words": ["ad", "话题乙"], "where": ["body"]}),
+    ("required_phrase", {"any": ["不存在的话术"], "where": ["body"]}),
+    ("required_phrase", {"any": ["ALPHA"], "where": ["title"]}),
+    ("max_len", {"max": 5, "where": "title"}),
+    ("max_len", {"max": 20}),
+    ("max_len", {"min": 100}),
+    ("forbidden_regex", {"pattern": "^禁止", "where": ["body"]}),
+    ("forbidden_regex", {"pattern": "标题$"}),
+    ("forbidden_regex", {"pattern": "禁止$", "where": ["title"]}),
+    ("forbidden_regex", {"pattern": "^Alpha", "where": ["title", "body"]}),
+])
+def test_validator_and_rulecheck_agree_on_title_and_body(kind, payload):
+    """同一行库里的规则, AW 生成链路(validator)和写作台(rulecheck)查标题正文的结论不能不一样(codex review on aw#115)。"""
+    desk = bool(rulecheck.check([_rule(1, kind, payload)], [_PARITY_DRAFT])[0])
+    aw = bool(validator.check_hard_rules([{"content": "示例规则", "rule_kind": kind, "rule_payload": payload}],
+                                         _PARITY_DRAFT["title"], _PARITY_DRAFT["body"]))
+    assert aw == desk, (kind, payload, desk)
+
+
+def test_validator_searches_each_field_separately_for_anchored_patterns():
+    """拼成"标题\n正文"再搜的话 ^ 永远碰不到正文开头、$ 永远碰不到标题结尾(codex review on aw#115)。"""
+    def hits(pattern, where=None):
+        payload = {"pattern": pattern, **({"where": where} if where is not None else {})}
+        return validator.check_hard_rules([{"content": "x", "rule_kind": "forbidden_regex", "rule_payload": payload}],
+                                          "标题以禁止结尾禁止", "禁止开头的正文")
+    assert [h["match"] for h in hits("^禁止", ["title", "body"])] == ["禁止"]
+    assert [h["match"] for h in hits("禁止$", ["title", "body"])] == ["禁止"]
+    assert len(hits("^禁止")) == 1 and len(hits("禁止$")) == 1, "老形状(没有 where)也逐个部位查, 同写作台"
+    assert hits("^禁止", ["title"]) == [] and hits("禁止$", ["body"]) == []
 
 
 def test_validator_era_payloads_still_read():
@@ -177,6 +260,17 @@ def test_truncation_keeps_every_hard_hit_before_any_soft_one():
     assert [(h["index"], h["severity"]) for h in shown] == sorted(
         [(h["index"], h["severity"]) for h in shown], key=lambda x: (x[0], x[1] != "hard")), "列出来的照旧按篇排"
     assert [h["index"] for h in shown if h["severity"] == "soft"][-1] == 12, "建议改按篇号补到满"
+
+
+def test_every_hard_hit_is_listed_even_past_the_cap():
+    """必须改的一条都不截(codex review on aw#115): rule_checks_more 只是个数, 截掉的必须改写手看不见是哪篇哪条, 就当
+    那几篇没问题交出去了。封顶只管建议改。"""
+    hits = [{"index": i, "severity": "hard", "rule_id": f"h{k}"} for i in range(20) for k in range(3)]
+    hits += [{"index": i, "severity": "soft", "rule_id": "s"} for i in range(20)]
+    shown, more = rulecheck.top_hits(hits)
+    assert sum(1 for h in shown if h["severity"] == "hard") == 60, "60 条必须改全列"
+    assert not [h for h in shown if h["severity"] == "soft"] and more == 20, "没地方了, 建议改只报个数"
+    assert [(h["index"], h["rule_id"]) for h in shown][-3:] == [(19, "h0"), (19, "h1"), (19, "h2")]
 
 
 def test_hard_hits_sort_before_soft_within_a_draft():
@@ -340,6 +434,29 @@ def test_soft_rules_for_the_other_direction_are_not_checked():
     assert sorted(h["rule_id"] for h in out["rule_checks"]) == ["m-1", "m-2", "m-3"]
 
 
+def test_the_tactic_from_the_brief_gates_soft_rules_at_scoring_too(monkeypatch):
+    """项目名判不出方向时, 简报按 open_project 传的 tactic 判(build_writing_brief); 存档这一步也要拿到同一个 tactic, 不然
+    简报里挡掉的那一边的 soft 规则, 存档时又报成「建议改」(codex review on aw#115)。"""
+    rules = [_rule(1, "required_phrase", {"any": ["示例产品名"]}, severity="soft", applicability="产品向"),
+             _rule(2, "required_phrase", {"any": ["示例口播"]}, severity="soft", applicability="流量向"),
+             _rule(3, "required_phrase", {"any": ["示例合规话术"]}, severity="hard", applicability="产品向")]
+    c = desk_client(memories=rules)
+    assert core.build_writing_brief(c, PROJ, user_id=ME, brief={"tactic": "流量向种草"})["counts"]["direction"] == "流量向"
+    out = core.commit_drafts(c, PROJ, distinct_drafts(1), user_id=ME, tactic="流量向种草")
+    assert sorted(h["rule_id"] for h in out["rule_checks"]) == ["m-2", "m-3"]
+
+    from deskcore import tools as T                    # 工具层原样往下传, 不传就是空(按项目名判, 同以前)
+    seen = {}
+    monkeypatch.setattr(core, "sb", lambda: object())
+    monkeypatch.setattr(core, "commit_drafts", lambda c, pid, drafts, **kw: seen.update(kw) or {})
+    for tool in (T.score_drafts, T.commit_drafts):
+        tool(PROJ, [], tactic="流量向种草", _user_id=ME)
+        assert seen["tactic"] == "流量向种草"
+        tool(PROJ, [], _user_id=ME)
+        assert seen["tactic"] == ""
+    assert "tactic" in (T.score_drafts.__doc__ or "") and "open_project" in (T.score_drafts.__doc__ or "")
+
+
 def test_tag_checks_see_the_tags_the_template_adds():
     """固定话题是模板加的: 只看写手传的 tags 的话, delivery.text 末尾明明有「#示例固定」, rule_checks 却说没有。"""
     tpl = {"layout": "blocks", "tags": {"content": 2, "fixed": ["示例固定"]}}
@@ -351,6 +468,21 @@ def test_tag_checks_see_the_tags_the_template_adds():
     drafts[1]["tags"] = ["话题一", "示例禁话题"]
     out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
     assert "#示例固定" in out["delivery"]["text"]
+    assert [(h["index"], h["rule_id"]) for h in out["rule_checks"]] == [(1, "m-2")]
+
+
+def test_body_checks_see_the_body_that_is_delivered():
+    """模板管话题时, 正文末尾那行 #话题 被摘进话题行, 交付出去的正文里没有它(codex review on aw#115)。正文规则要查交付的
+    那一份: 不然只在话题行里的词被报成「正文里有禁用词」, 必须带的话术靠被摘走的那行混过去。"""
+    tpl = {"layout": "blocks", "tags": {"content": 2}}
+    rules = [_rule(1, "forbidden_word", {"words": ["示例禁话题"], "where": ["body"]}),
+             _rule(2, "required_phrase", {"any": ["示例必带"], "where": ["body"]})]
+    c = desk_client(default_params=json.dumps({"delivery": tpl}, ensure_ascii=False), memories=rules)
+    drafts = distinct_drafts(2)
+    drafts[0]["body"] += "示例必带。\n#示例禁话题 #话题二"
+    drafts[1]["body"] += "\n#示例必带 #话题二"
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert "#示例禁话题" in out["delivery"]["text"], "前提: 它在交付稿的话题行里, 不在正文里"
     assert [(h["index"], h["rule_id"]) for h in out["rule_checks"]] == [(1, "m-2")]
 
 

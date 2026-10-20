@@ -5,7 +5,8 @@
 ``rule_kind`` / ``rule_payload``(000_baseline.sql 的 CHECK 只认 forbidden_word / required_phrase / max_len /
 forbidden_regex / free_text), 以前只有 AW 生成链路(generation_service → validator.check_hard_rules, 只看 hard)在读,
 生产库 292 条规则一条也没填。⚠️ validator 没退役, 同一批行它也读: 写进来的形状要让它要么读对、要么读不出(见
-validator._spec_from_structured 对 ``where`` 的处理), 不能让它把一条只管评论的正则套到标题正文上。
+validator._spec_from_desk: 标题正文照这里的口径查, 只管话题 / 评论的跳过, 都不许退回从 content 里抽词), 不能让它把
+一条只管评论的规则套到标题正文上。
 
 这里接上: ``record_rule`` 带 ``check`` 时校验后存进那两列; ``score_drafts`` 存完档, 拿和简报**同一个池子**
 (``store.shared_memories``: confirmed、没静音、项目 + 调用者自己的 global)里带 check 的那几条, soft 的再过简报那道
@@ -15,7 +16,8 @@ validator._spec_from_structured 对 ``where`` 的处理), 不能让它把一条�
 
 payload 形状(写入时 ``normalize_check`` 校验; 读出来时 ``spec_of`` 再校一遍, 坏的跳过并记日志):
   forbidden_word   {"words": [...], "where": [...]}       where 默认 ["title", "body"]
-  forbidden_regex  {"pattern": "...", "where": [...]}   量词只能套在单个字符或定长、不含分支的组上(见 _assert_regex_shape)
+  forbidden_regex  {"pattern": "...", "where": [...]}   量词只能套在单个字符或定长、不含分支的组上(见 _assert_regex_shape);
+                   能匹配同样字符的量词不能挨着(见 validator.assert_regex_is_safe)
   required_phrase  {"any": [...], "where": [...]}          一个都没有才算没守
   max_len          {"max": N, "min": M, "where": "body"}   max / min 至少给一个; 字数去掉空白和 #话题 再数
 validator.py 的老形状({"target": X} / {"scope": "标题", "n": N} / {"pattern": P})读的时候也认。
@@ -40,9 +42,8 @@ PART_CN = {"title": "标题", "body": "正文", "tags": "话题标签", "comment
 SEVERITY_LABEL = {"hard": "必须改", "soft": "建议改"}
 MAX_TERMS = 50
 MAX_TERM_CHARS = 40
-MAX_HITS = 40                 # 一批 20 篇 × 几条规则, 回包里最多列这么多; 返回值太长会把协议挤出模型的注意力
+MAX_HITS = 40                 # 一批 20 篇 × 几条规则, 建议改最多补到这么多(必须改全列); 返回值太长会把协议挤出模型的注意力
 _LEGACY_LEN_SCOPE = {"标题": "title", "正文": "body"}
-_ASCII_TERM = re.compile(r"[a-z0-9 ._/-]+")
 
 
 class CheckError(ValueError):
@@ -228,18 +229,17 @@ def spec_of(rule: dict) -> dict | None:
 # 查
 # ══════════════════════════════════════════════════════════════════════
 
-def _has(text: str, term: str) -> bool:
-    """不分大小写的包含。纯英文数字的词按词边界认, 免得 "ad" 撞进 "made"(同 isolation.foreign_markers)。"""
-    t, s = term.casefold(), text.casefold()
-    if _ASCII_TERM.fullmatch(t):
-        return re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", s) is not None
-    return t in s
+# 查词、数字数和 validator 共用一份(codex review on aw#115): 同一行规则 AW 生成链路也读, 两边口径分开写迟早不一样。
+# 不分大小写的包含, 纯英文数字的词按词边界认, 免得 "ad" 撞进 "made"(同 isolation.foreign_markers); 字数去掉空白和 #话题。
+_has = validator.contains_term
+_count = validator.count_chars
 
 
 def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
     """一篇稿 → 各部位的文本。tags 是写手传的 tags 加正文里的 #话题; comments 一条一项。
 
-    ``tags`` 给了就用它(项目有交付模板且模板管话题时, core 传交付出去的那一份: 含模板加的固定 / 条件话题)。"""
+    ``tags`` 给了就用它(项目有交付模板且模板管话题时, core 传交付出去的那一份: 含模板加的固定 / 条件话题; 那时 ``d`` 的
+    body 也是交付出去的、摘掉了末尾那行话题的正文, 见 delivery.delivered_post)。"""
     body = str(d.get("body") or "")
     if tags is None:
         # 写手传的 tags 和正文末尾那行 #话题 常常是同一批(约六分之一的稿子末尾带一行): 去重, 不然「话题不超过 N 个」
@@ -254,10 +254,6 @@ def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
             comments.append(text.strip())
     return {"title": [str(d.get("title") or "")], "body": [body], "tags": [" ".join(tags)] if tags else [],
             "comments": comments}
-
-
-def _count(text: str) -> int:
-    return len(re.sub(r"\s+", "", tvlink.strip_hashtags(text)))
 
 
 def _run(spec: dict, parts: dict[str, list[str]]) -> list[tuple[str, str]]:
@@ -322,9 +318,14 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
 
 
 def top_hits(hits: list[dict], limit: int = MAX_HITS) -> tuple[list[dict], int]:
-    """回包里列哪些: 先保必须改(hard), 再按篇号补建议改, 截到 ``limit`` 条; 列出来的再按篇、hard 在前排回去。
+    """回包里列哪些: 必须改(hard)全列, 建议改按篇号补到一共 ``limit`` 条为止; 列出来的再按篇、hard 在前排回去。
+    第二个返回值是没列出的条数, 只会是建议改。
 
-    直接按篇号截的话, 后面几篇的必须改会被前面几篇的建议改挤掉 —— 写手看不见, 就当那几篇没问题交出去了。"""
-    keep = sorted(hits, key=lambda h: (h["severity"] != "hard", h["index"]))[:limit]
+    直接按篇号截的话, 后面几篇的必须改会被前面几篇的建议改挤掉 —— 写手看不见, 就当那几篇没问题交出去了。必须改本身
+    也不截(codex review on aw#115): 一批 20 篇 × 几条硬规则就能过 40 条, 截掉的那些只剩一个个数, 写手不知道是哪篇哪条,
+    同样会当没问题交出去。条数多到这个份上, 整批本来就该返工, 回包长一点是对的。"""
+    hard = [h for h in hits if h["severity"] == "hard"]
+    soft = sorted((h for h in hits if h["severity"] != "hard"), key=lambda h: h["index"])
+    keep = hard + soft[:max(0, limit - len(hard))]
     keep.sort(key=lambda h: (h["index"], h["severity"] != "hard"))
     return keep, len(hits) - len(keep)

@@ -91,6 +91,19 @@ def test_a_trailing_tag_line_in_the_body_is_lifted_not_duplicated():
     assert given["text"] == "【标题】甲\n【正文】正文第一句。\n#新话题", "单独传了 tags 就以它为准"
 
 
+def test_an_explicitly_empty_tags_list_is_taken_at_its_word():
+    """传了 ``tags: []`` 就是"这篇不带写手的话题", 不能再退回正文末尾摘下来的那几个(codex review on aw#115): 写手把话题从
+    tags 里删光了, 交付稿里却还是那几个。没传(或传了个空字符串, 模型常这么填缺省)才用摘下来的。末尾那行照摘, 不留在正文里。"""
+    body = "正文第一句。\n#旧话题"
+    empty = delivery.assemble(BLOCKS, [{"title": "甲", "body": body, "tags": []}])
+    assert empty["text"] == "【标题】甲\n【正文】正文第一句。"
+    assert empty["problems"] == [{"index": 0, "what": "话题标签 0 个, 这个项目要 1 个; 在 tags 里补齐"}]
+    for missing in ({}, {"tags": None}, {"tags": ""}):
+        out = delivery.assemble(BLOCKS, [{"title": "甲", "body": body, **missing}])
+        assert out["text"] == "【标题】甲\n【正文】正文第一句。\n#旧话题", missing
+    assert delivery.delivered_post(BLOCKS, {"title": "甲", "body": body, "tags": []}) == ("正文第一句。", [])
+
+
 def test_tags_trailing_the_last_sentence_are_lifted_too():
     """「冲鸭！#秋招 #求职」: 话题跟在最后一句后面、不单独成行, 不摘的话交付稿里还是两份话题, 而且不报任何问题。"""
     tpl = {"layout": "blocks", "tags": {"content": 2, "fixed": ["固定甲"]}}
