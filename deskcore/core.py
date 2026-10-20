@@ -202,8 +202,16 @@ def _brief_text(brief: dict) -> str:
     return "\n".join(p for p in parts if p).strip()
 
 
+def _daily_rotation_seed(project_id, user_id, *, purpose: str, now: datetime | None = None) -> int:
+    """按天轮换的种子: (用途, 项目, 写手, 北京日期) 的 sha256, 同 flywheel_arm 的取法。用途当前缀(positives /
+    patterns), 免得几件事和分臂共用同一个哈希 —— 各轮各的, 不该绑在一起。"""
+    day = (now or datetime.now(timezone.utc)).astimezone(_CN_TZ).date().isoformat()
+    return int(hashlib.sha256(f"{purpose}|{project_id}|{user_id or ''}|{day}".encode("utf-8")).hexdigest()[:16], 16)
+
+
 def select_positive_examples(candidates: list[dict], brief: dict,
-                             limit: int = MAX_POSITIVE) -> tuple[list[dict], str]:
+                             limit: int = MAX_POSITIVE, *, project_id=None, user_id=None,
+                             now: datetime | None = None) -> tuple[list[dict], str]:
     """按相关性 + 多样性挑正例, 取代 db.list_example_items 的 created_at DESC 取 5。
 
     为什么改: recency top-5 构成【趋同回路】—— 模型模仿最近 5 条 → 新稿被标
@@ -212,20 +220,31 @@ def select_positive_examples(candidates: list[dict], brief: dict,
     那列生产库里全 NULL, 所以它从上线起永远打印"没有正例" —— 这个回路
     从来没被任何人看见过(TV D-041 / R-034 已修那个盲点)。
 
-    embedding 不可用时退化成 recency(与原行为一致, 不会更差)。
-    返回 (picked, mode)。
+    候选先按 (项目, 写手, 北京日期) 定种子洗牌 —— 同一个人同一天开几场看到的是同一批, 换一天换一批。
+    排不出相关性时(没有 brief 文本 / embedding 不可用 / 候选一条向量都没有)就按洗好的顺序取, 不退回 recency;
+    排得出时有向量的按相关性排在前面, 没向量的照洗好的顺序接在后面 —— 也轮换, 不是"最近那几条"。
+    返回 (picked, mode), mode ∈ relevance / rotating / empty。
     """
     if not candidates:
         return [], "empty"
 
-    ranked, mode = candidates, "recency_fallback"
+    # ⚠️ 原来这里先算 brief 的向量、再给每条候选打分, 没向量的记 -1.0 —— 而写作台的版本【从来不算向量】
+    # (10-20 查生产库: 09-01 以来 1,011 个写作台版本, 0 个有 embedding)。于是每条都是 -1.0, 稳定排序原样
+    # 交回最近的 N 条, mode 却报 "relevance"; 每一场拿到的都是同几条最新正例, 正是这个函数要断的趋同回路。
+    # 现在一条向量都没有就不去算 brief 的向量(还省一次 embedding 调用), 直接轮换。
+    # ⚠️ 洗牌放在打分【之前】(10-20 review): 只有少数几条有向量(网页端那条生成路径会写 versions.embedding,
+    # 用户在网页端标过的正例就带着)时, 其余的仍然都是 -1.0; 先洗再稳定排序, 这一截才跟着按天轮换,
+    # 不然空位每天都落回最新的那几条。
+    ranked = list(candidates)
+    random.Random(_daily_rotation_seed(project_id, user_id, purpose="positives", now=now)).shuffle(ranked)
+    mode = "rotating"
     text = _brief_text(brief)
-    if text and dedup.embeddings_available():
+    if text and any(c.get("embedding") for c in ranked) and dedup.embeddings_available():
         vecs = dedup.embed_texts([text])
         if vecs:
             bvec = vecs[0]
             scored = []
-            for c in candidates:
+            for c in ranked:
                 emb = c.get("embedding")
                 # 没算过向量的排后面但【不丢弃】—— 否则新项目(向量还没回填)
                 # 会一条正例都取不到。
@@ -236,6 +255,53 @@ def select_positive_examples(candidates: list[dict], brief: dict,
     # 多样性限额在 fingerprint.cap_by_shape —— 纯逻辑放无依赖模块, 让 selftest
     # 能在裸环境里验它(这一条是趋同回路的最后一道闸, 值得单独回归)。
     return fp.cap_by_shape(ranked, limit), mode
+
+
+# ── 简报里的"最近的标题"(2026-10-20): 见 build_writing_brief 末尾那段 ──────────────────────
+RECENT_TITLES_PUBLISHED_DAYS = 30
+RECENT_TITLES_DRAFTED_DAYS = 14
+RECENT_TITLES_MAX = 20
+# ⚠️ 别写成"标题句式要和它们不一样"(10-20 review): 标题句式是 draw_angles 发的硬坐标, 只有 8 种, 近 20 条标题
+# 几乎总把它们占全, 两句话就没法同时做到。这里只管具体说法 / 人设 / 场景, 并写明谁优先。
+RECENT_TITLES_TASK = (
+    "published 是这个项目最近发出去的标题, drafted 是最近在写作台写过的标题。它们只用来避开, 不要模仿, "
+    "也不用念给用户听。这一批新写的稿子: 标题别和它们撞主干词、撞具体说法(标题句式照 draw_angles 分到的写, "
+    "在同一种句式里换说法), 开头别复述这些标题; 人设和核心场景尽量和它们错开, 同一批里也尽量别两篇用同一个人设或"
+    "同一个场景。优先级: p0 / stable 定下的人设、draw_angles 分到的坐标和切入角度、用户点名要写的题目或要改的稿, "
+    "都在这一栏之上; 这一栏只管新写的稿, 改稿不受它约束。")
+
+
+# ── 已验证规律怎么用(2026-10-20) ──────────────────────────────────────────────
+# 10-20 生产诊断: 85% 的写手日简报里都带着同样 4 条已验证规律, 其中一条是"整篇围绕一个求助问题来组织"。模型把
+# 4 条全用在每一篇上 —— 批批同一副骨架。规律是"这样写表现好过", 不是"每篇都要这样写"。清单本身原样转交
+# (馆员给的, 写作台不改), 只在旁边说清楚用法, 并按条数给一个具体的轮换法: 光说"轮换"模型会自己解释成"每篇都沾一点"。
+#
+# 轮换的起点按天换(10-20 review): 固定从第 1 条起的话, 每一批的第 1 篇都用第 1 条, 同一副骨架还是批批出现(只是
+# 落在固定的那一篇上); 而 3 篇一批、4 条规律时轮不到"不用", 和"有几篇一条都不用"自相矛盾。所以 k 条规律加一个
+# "不用"排成一圈, 起点用 (项目, 写手, 北京日期) 的哈希定 —— open_project 和 borrow_lessons 同一天给的是同一句;
+# 再补一条: 两篇以上的批次没轮到"不用"的, 最后一篇不用。
+def pattern_rotation(k: int, seed: int = 0) -> list[int | None]:
+    """第 1..k+1 篇各用第几条规律(None = 一条都不用), 之后从头再来。"""
+    cycle: list[int | None] = [*range(1, k + 1), None]
+    start = seed % len(cycle)
+    return cycle[start:] + cycle[:start]
+
+
+def validated_patterns_usage(k: int, seed: int = 0) -> str:
+    rota = pattern_rotation(k, seed)
+    if k > 1:
+        steps = ", ".join(f"第 {i} 篇" + (f"用第 {p} 条" if p else "一条都不用") for i, p in enumerate(rota, 1))
+        rule = (f"默认按篇号轮换: {steps}, 然后从头再来; 一批两篇以上、按这个轮法没轮到\"一条都不用\"的, "
+                "把最后一篇改成一条都不用")
+    else:
+        rule = ("默认隔一篇用一次: " + ("单数篇用它, 双数篇不用" if rota[0] else "单数篇不用, 双数篇用它"))
+    return ("validated_patterns 是表现好过的写法, 供挑选, 不是模板。每篇最多用其中一条, 这一批里轮换着用, "
+            f"也要有几篇一条都不用。{rule}。某条跟那一篇不贴题就换成不用; 和 draw_angles 分到的坐标(内容形式、"
+            "标题句式)或 p0 冲突时, 以坐标和 p0 为准。")
+
+
+def _patterns_usage_for(project_id, user_id, k: int) -> str:
+    return validated_patterns_usage(k, _daily_rotation_seed(project_id, user_id, purpose="patterns"))
 
 
 def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
@@ -253,7 +319,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
 
     hard, soft = store.shared_memories(client, project_id, user_id)
     pool = store.labeled_examples(client, project_id, "positive", user_id)
-    positives, pos_mode = select_positive_examples(pool, brief)
+    positives, pos_mode = select_positive_examples(pool, brief, project_id=project_id, user_id=user_id)
     negatives = store.labeled_examples(client, project_id, "negative", user_id)[:MAX_NEGATIVE]
 
     shared_calib = (project.get("calibration_notes") or "").strip()
@@ -377,6 +443,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     out["lessons"] = borrowed["lessons"]
     if borrowed.get("validated_patterns"):
         out["validated_patterns"] = borrowed["validated_patterns"]
+        out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
+                                                              len(borrowed["validated_patterns"]))
     out["flywheel_arm"] = borrowed.get("flywheel_arm")   # 入库时原样传给 commit_drafts (对照组圈人用)
     out["lessons_status"] = {k: borrowed[k] for k in
                              ("status", "count", "elapsed_ms", "detail")}
@@ -409,12 +477,69 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
             + (f"坐标在 angle_debt.angles 里(列了 {len(shown)} 个"
                + (f", 还有 {more} 个没列" if more > 0 else "") + "), 接着写就按它们写, "
                "写完照样每篇带 angle_key 提交。" if shown else ""))
+
+    # ── 最近发出去 / 写过的标题: 这一批要避开的东西(2026-10-20) ──────────────────────
+    # 10-20 生产诊断: 稿子批批长得像、篇幅短, 飞书里大半被人重写。模型不知道这个项目上周发了什么、前天写了什么,
+    # 每一场都从同一份简报出发, 自然写出同一种标题句式、同一个人设。只给标题(每条 ≤40 字、合计 ≤20 条), 不给正文。
+    # ⚠️ 和借卡、角度债同一条纪律: 查不到就不带这一栏, 简报照给。
+    try:
+        recent = store.recent_titles(client, project_id, published_days=RECENT_TITLES_PUBLISHED_DAYS,
+                                     drafted_days=RECENT_TITLES_DRAFTED_DAYS, limit=RECENT_TITLES_MAX)
+    except Exception:
+        logger.exception("recent titles lookup failed (project=%s)", project_id)
+        recent = None
+    if recent and (recent.get("published") or recent.get("drafted")):
+        out["recent_titles"] = {"published": recent["published"], "drafted": recent["drafted"],
+                                "task": RECENT_TITLES_TASK}
     return out
 
 
 # ══════════════════════════════════════════════════════════════════════
 # 发牌
 # ══════════════════════════════════════════════════════════════════════
+
+
+# ── 一批之内的散布(2026-10-20) ─────────────────────────────────────────────────
+# 原来是洗牌后的笛卡尔积直接取前 n 个没避重的 —— 跨批次不重复有台账管, 同一批之内什么都不管: 一批 5 篇里两篇
+# 撞同一种内容形式、同一种标题句式是常事(各 8 个值, 5 篇的内容形式全不撞只有约 1/5, 形式和句式都不撞不到 5%)。
+# 10-20 生产诊断: 稿子批批长得像, 而同一批里体裁和标题句式撞车就是"长得像"最直接的一层。
+#
+# 做法是贪心重排, 不换抽法: 按洗好的顺序往下找, 优先内容形式和标题句式都还没用过的, 其次有一个没用过的, 再次
+# 随便; 同档里情绪杠杆没用过的优先。某一维 8 个值都用过一轮就清空重来(第 9、10 篇各开新一轮, 所以 n=10 时
+# 同一种形式最多两篇)。仍然随机(先后来自洗牌), 同 seed 结果不变。
+#
+# ⚠️ RPC 路径上这只是【排序】: 被避重挡掉的那几个由 RPC 跳过, 后面补上的那个是照"前面那个也用了"排的,
+# 所以近期用得多的项目偶尔会多撞一个。不为此多读一次台账 —— 选择必须留在 RPC 的事务里(并发发牌不撞车靠它)。
+_SPREAD_DIMS = (("content_format", len(vocab.CONTENT_FORMATS)),
+                ("title_structure", len(vocab.TITLE_STRUCTURES)),
+                ("emotional_lever", len(vocab.EMOTIONAL_LEVERS)))
+
+
+def _spread_order(candidates: list[dict], n: int) -> list[dict]:
+    """把前 ``3n + 24`` 个按"一批之内尽量不撞"重排, 后面的原序接上。只排前面一段: RPC 只会取到前 n 个加上
+    被避重跳过的那几个, 全量贪心是 O(候选²), 白花。"""
+    rest = list(candidates)
+    head = min(len(rest), 3 * max(n, 0) + 24)
+    used = {dim: set() for dim, _ in _SPREAD_DIMS}
+    out: list[dict] = []
+    while rest and len(out) < head:
+        best_i, best = 0, -1
+        for i, c in enumerate(rest):
+            d = c["dims"]
+            score = (2 * (d.get("content_format") not in used["content_format"])
+                     + 2 * (d.get("title_structure") not in used["title_structure"])
+                     + (d.get("emotional_lever") not in used["emotional_lever"]))
+            if score > best:
+                best_i, best = i, score
+                if score == 5:
+                    break
+        c = rest.pop(best_i)
+        out.append(c)
+        for dim, size in _SPREAD_DIMS:
+            used[dim].add(c["dims"].get(dim))
+            if len(used[dim]) >= size:
+                used[dim].clear()
+    return out + rest
 
 
 def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
@@ -463,6 +588,9 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
         dims = {"emotional_lever": lev, "human_truth_archetype": arc,
                 "content_format": fmt, "title_structure": st}
         candidates.append({"angle_key": angle_key(dims), "dims": dims})
+    # 一批之内错开体裁和标题句式(10-20): RPC 按候选的先后取前 n 个可用的, 所以把洗好的候选重排成"前面几个尽量
+    # 互不同形", 选择本身还是 RPC 在事务里做。见 _spread_order。
+    candidates = _spread_order(candidates, n)
 
     reserved = store.reserve_angles(client, project_id, candidates, n,
                                     user_id, avoid_days)
@@ -470,7 +598,8 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     if not atomic:
         # RPC 不在(迁移没跑)。降级到旧的"读-挑-插"三步, 并明确告知不是原子的。
         avoid = store.recent_angle_keys(client, project_id, avoid_days)
-        reserved = [c for c in candidates if c["angle_key"] not in avoid][:n]
+        # 先去掉避重的再重排一次: 这条路上知道哪些被挡, 错开得比 RPC 那条路还准
+        reserved = _spread_order([c for c in candidates if c["angle_key"] not in avoid], n)[:n]
         store.record_draw(client, project_id, reserved, user_id)
 
     tilt = rng.choice(vocab.WORD_TILTS)  # 词感是"今天的心情", 全批一致
@@ -4724,7 +4853,11 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     """
     project = assert_project_access(client, project_id, user_id=user_id)
     arm = _borrow_arm(project.get("id"), user_id, reuse=flywheel_arm)   # 这场已经有臂就沿用
-    return _borrow_for_brief(project, delta, user_id=user_id, arm=arm)
+    out = _borrow_for_brief(project, delta, user_id=user_id, arm=arm)
+    if out.get("validated_patterns"):       # 用法同简报那份(10-20): 每篇最多一条、轮换、有几篇不用
+        out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
+                                                              len(out["validated_patterns"]))
+    return out
 
 
 # open_project 随简报带卡时的上限, 与常规生成路径 render_flywheel_block 同一

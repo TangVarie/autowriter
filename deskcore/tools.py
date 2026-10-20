@@ -313,9 +313,16 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         external=true 的是【外部参考卡】(最多 2 张): 别家同品类的帖, 不是公司投的, 没有经过我们的数据验证;
         只借结构 / 钩子, 不抄内容, 也不要提它里面的任何品牌。
       · validated_patterns —— 【已验证规律】(有才出现): 在公司自己的历史笔记里、同一项目内
-        对照验证过的写法, 每条 {label, instruction, evidence}。同样合适时照 instruction 写;
-        它是提示不是硬约束, 和 p0 冲突时以 p0 为准, 不贴题就不用。没有这个字段就是这次没有,
-        不要自己编规律, 也不要跟用户解释为什么没有。
+        对照验证过的写法, 每条 {label, instruction, evidence}。它们是表现好过的选项, 不是模板:
+        **每篇最多用其中一条**(用的那条照它的 instruction 写), 一批里轮换着用, 也要有几篇一条都
+        不用(具体哪篇用哪条见旁边的 validated_patterns_usage, 起点按天换)。它是提示不是硬约束, 和
+        draw_angles 分到的坐标或 p0 冲突时以坐标和 p0 为准, 不贴题就不用。没有这个字段就是这次没有, 不要自己编规律, 也不要跟用户解释
+        为什么没有。
+      · recent_titles —— 【有才出现】本项目最近发出去的标题(published)和最近在写作台写过的标题
+        (drafted)。照 recent_titles.task 做: 新写的稿子标题别和它们撞主干词和具体说法(标题句式照
+        draw_angles 分到的写, 在同一种句式里换说法), 开头别复述它们, 人设和核心场景尽量错开。
+        p0 / stable 定的人设、发牌分到的坐标和切入角度、用户点名的题目和改稿都优先于它。
+        只用来避开, 不要模仿。
       · edit_digest —— 【每周最多一次, 有才出现】: 本项目最近发出去的稿子在发布前被人改了什么(写作台那版 →
         发出去那版)。照 edit_digest.task 做: 归纳成最多 3 条规则建议问用户, 同意的 record_rule, 最后调
         ack_edit_digest。先把它说给用户, 再开始写稿。
@@ -323,7 +330,7 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         别改、别跟用户提。
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
-    而不是按时间倒序 —— 后者会让文风越写越窄。所以知道要写什么就传。
+    (排不出相关性时按天轮换, 不会每次都是最近那几条 —— 那会让文风越写越窄)。所以知道要写什么就传。
     经验卡也是按这几个字段匹配的, 不传就只按项目定位借。
 
     ⚠️ **counts.hard_rules 是 0 不一定是错的。** 很多项目的约束确实都记在 soft 里
@@ -383,6 +390,7 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
     """发牌: 给本批 n 篇稿子各分配一组互不相同的创作坐标。
 
     批量写稿前必须先调这个, 然后【每一篇严格按分到的那组坐标写, 不得互换】。
+    同一批里内容形式和标题句式会尽量错开(各 8 种, 先各轮一遍再重复), 所以别把几篇写回同一种体裁。
 
     每组坐标含: 情绪杠杆 / 人性原型 / 内容形式 / 标题句式 / 切入角度, 外加
     情绪强度、词感倾向, 以及易混维度的判别指令(比如抽到「焦虑撬动」会告诉你
@@ -424,7 +432,9 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
     库里没有合适的卡时返回空列表, 这不是错误, 照常写就行。
 
     validated_patterns (可能是空列表) 与 open_project 里的同名字段同一个意思: 已验证规律,
-    同样合适时照 instruction 写, 是提示不是硬约束; 空就是这次没有, 不要自己编。
+    是表现好过的选项不是模板 —— 每篇最多用一条(照它的 instruction 写), 一批里轮换, 有几篇一条都不用
+    (见 validated_patterns_usage); 是提示不是硬约束, 和发牌坐标或 p0 冲突时以它们为准; 空就是这次没有,
+    不要自己编。
     flywheel_arm 也同 open_project: 存档时原样传给 score_drafts。调本工具时也把这场 open_project
     给的 flywheel_arm 原样传进来 —— 一场写作只分一次组, 不传会重新分。
     """

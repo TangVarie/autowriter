@@ -2322,6 +2322,145 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
     return out
 
 
+# ── 最近发出去 / 写过的标题: 简报里给模型"这批要避开什么"(2026-10-20) ─────────────────────────
+# 10-20 生产诊断: 写作台的稿子批批长得像, 飞书里大半被人重写。模型是无状态的, 它不知道这个项目上周发了什么、
+# 前天写了什么, 只能在同一份简报里一遍遍写出同一种标题、同一个人设。所以开项目时把标题(只要标题, 不带正文)
+# 摆出来让它避开。读法和 desk_gap 同一条纪律: truth_vault.notes 只取 note_id / publish_time 两列, 窗口按发布时间切。
+RECENT_TITLE_CHARS = 40
+RECENT_NOTES_PAGE = 200
+RECENT_NOTES_SCAN_MAX = 1000          # 一个 TV 项目对着好几个写作台项目(WTG 15 个方向), 新的在前一页页找, 最多看这么多条
+RECENT_BATCHES_MAX = 200
+# 对上了、有版本的几种; ambiguous / unmatched 没有版本, 不知道是哪一篇, 不算
+_RECENT_LINK_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", "ingested", "tv_lineage"})
+
+
+def _clean_title(t) -> str:
+    return re.sub(r"\s+", " ", str(t or "")).strip()[:RECENT_TITLE_CHARS]
+
+
+def _title_key(t: str) -> str:
+    """去重键: 去掉空白 / 标点 / 表情, 英文不分大小写。"""
+    return re.sub(r"[\W_]+", "", t.lower())
+
+
+def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int = 20,
+                            now: datetime | None = None) -> list[str]:
+    """这个写作台项目近 ``days`` 天发出去的标题(tv-sync 对到本项目上的那些), 新发的在前。异常原样上抛。
+
+    标题取哪一份: ``ingested`` 的版本就是从这条笔记复制来的, ``versions.title`` 就是发出去的标题; 其余几种对上的是
+    写作台那版, 人可能改过标题, 优先 ``tv_edit_diffs.published_title``(013), 没有再退回写作台那版。"""
+    tv_ids = sorted({str(m["tv_project_id"]) for m in tv_projects_of(sb, project_id) if m.get("tv_project_id")})
+    if not tv_ids:
+        return []
+    now = now or datetime.now(timezone.utc)
+    since = (now - timedelta(days=days)).isoformat()
+    want = max(limit, 1) * 2                      # 留余量: 有的标题为空、有的去重后重复
+    picked: list[dict] = []
+    for off in range(0, RECENT_NOTES_SCAN_MAX, RECENT_NOTES_PAGE):
+        # 上界 = 现在: 排期还没发的(publish_time 在未来)不算
+        notes = (sb.schema("truth_vault").table("notes")
+                 .select("note_id, publish_time")
+                 .in_("project_id", tv_ids)
+                 .gte("publish_time", since).lte("publish_time", now.isoformat())
+                 .order("publish_time", desc=True).order("note_id")
+                 .range(off, off + RECENT_NOTES_PAGE - 1).execute()).data or []
+        ids = [n["note_id"] for n in notes if n.get("note_id")]
+        links: dict[str, dict] = {}
+        for i in range(0, len(ids), 100):
+            for r in (sb.table("tv_note_links").select("note_id, version_id, match_kind")
+                      .eq("project_id", project_id).in_("note_id", ids[i:i + 100]).execute()).data or []:
+                links[r["note_id"]] = r
+        for nid in ids:                           # 按笔记的发布顺序, 不按对照表回来的顺序
+            r = links.get(nid)
+            if r and r.get("version_id") and r.get("match_kind") in _RECENT_LINK_KINDS:
+                picked.append(r)
+        if len(picked) >= want or len(notes) < RECENT_NOTES_PAGE:
+            break
+    picked = picked[:want]
+    if not picked:
+        return []
+    edited_ids = [r["note_id"] for r in picked if r["match_kind"] != "ingested"]
+    published: dict[str, str] = {}
+    if edited_ids:
+        try:
+            published = {r["note_id"]: r.get("published_title") or "" for r in
+                         (sb.table("tv_edit_diffs").select("note_id, published_title")
+                          .in_("note_id", edited_ids).execute()).data or []}
+        except Exception as exc:                  # noqa: BLE001 — 013 没跑 / 读挂了: 退回写作台那版标题
+            logger.warning("recent titles: tv_edit_diffs unreadable (%s), using desk titles",
+                           f"{type(exc).__name__}: {exc}"[:200])
+    vids = sorted({str(r["version_id"]) for r in picked})
+    drafts = {str(r["id"]): r.get("title") or "" for r in
+              (sb.table("versions").select("id, title").in_("id", vids).execute()).data or []}
+    return [(published.get(r["note_id"]) if r["match_kind"] != "ingested" else "")
+            or drafts.get(str(r["version_id"])) or "" for r in picked]
+
+
+def recent_drafted_titles(sb, project_id: str, *, days: int = 14, limit: int = 20,
+                          now: datetime | None = None) -> list[str]:
+    """这个项目近 ``days`` 天在写作台里写过的标题(每个 item 取定稿 / 最新那版), 新的在前。异常原样上抛。
+
+    补录副本(``batches.params.source == 'ingest'``)不算: 那是发出去的帖抄回来的, 已经在 published 里了 ——
+    而且 ingest 目标项目里副本比真写的多(B-19), 不先排掉的话这一栏全是 TV 的影子。先取批次在 Python 里认副本
+    (params 是 jsonb, 在假件和老行里可能是字符串, 同 is_ingest_batch), 再按批次取 item, 只取标题不取正文。"""
+    now = now or datetime.now(timezone.utc)
+    since = (now - timedelta(days=days)).isoformat()
+    batches = (sb.table("batches").select("id, params, created_at")
+               .eq("project_id", project_id).gte("created_at", since)
+               .order("created_at", desc=True).order("id", desc=True)
+               .limit(RECENT_BATCHES_MAX).execute()).data or []
+    ids = [b["id"] for b in batches if b.get("id") and not is_ingest_batch(b)][:100]
+    if not ids:
+        return []
+    items = (sb.table("items").select("id, best_version_id, created_at, versions(id, title, version_num)")
+             .in_("batch_id", ids).order("created_at", desc=True).order("id", desc=True)
+             .limit(max(limit, 1) * 3).execute()).data or []
+    out: list[str] = []
+    for item in items:
+        versions = item.get("versions") or []
+        if not versions:
+            continue
+        best = item.get("best_version_id")
+        chosen = next((v for v in versions if v.get("id") == best), None)
+        if chosen is None:
+            chosen = max(versions, key=lambda v: v.get("version_num") or 0)
+        out.append(chosen.get("title") or "")
+    return out
+
+
+def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days: int = 14,
+                  limit: int = 20, now: datetime | None = None) -> dict:
+    """``{"published": [...], "drafted": [...]}``: 每条截到 40 字, 去重(drafted 里不再出现 published 有的), 两栏合计
+    最多 ``limit`` 条。两栏各有份额: 写过的留 ``limit`` 的 2/5(20 条里 8 条), 发出去的占其余; 哪一栏不够, 空出来的
+    给另一栏。
+    ⚠️ 不能"发出去的先占满"(10-20 review): 活跃项目 30 天里对上的笔记远超 20 条, 那样写过的一栏永远是空的 ——
+    而昨天写了还没发的那几篇(发布一般滞后 1-3 天)正是下一批最容易撞的。
+
+    两栏各自兜底: truth_vault 读不到(Exposed schemas 没有它 / 本地库)不该连写作台自己写过的那栏一起丢 ——
+    这只是给模型的参照, 少一栏照样有用。挂了的那栏记 WARN、回空。"""
+    cols: dict[str, list[str]] = {"published": [], "drafted": []}
+    seen: set[str] = set()
+    for key, fn, days in (("published", recent_published_titles, published_days),
+                          ("drafted", recent_drafted_titles, drafted_days)):
+        try:
+            raw = fn(sb, project_id, days=days, limit=limit, now=now)
+        except Exception as exc:                  # noqa: BLE001
+            logger.warning("recent %s titles failed (project=%s): %s", key, project_id,
+                           f"{type(exc).__name__}: {exc}"[:200])
+            continue
+        for t in raw:
+            t = _clean_title(t)
+            k = _title_key(t)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            cols[key].append(t)
+    limit = max(limit, 0)
+    n_pub = min(len(cols["published"]), limit - min(len(cols["drafted"]), limit * 2 // 5))
+    n_drafted = min(len(cols["drafted"]), limit - n_pub)
+    return {"published": cols["published"][:n_pub], "drafted": cols["drafted"][:n_drafted]}
+
+
 # ── 补录锁(migrations/009): 跨进程互斥, 按项目一行, 带 TTL ─────────────────
 
 def try_ingest_lock(sb, project_id: str, holder: str, ttl_seconds: int) -> bool | None:
