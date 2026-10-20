@@ -2171,12 +2171,13 @@ def tv_targets_of(sb, tv_project_id: str) -> list[dict]:
 
 
 # ── 人在发布前改了什么(migrations/013, D-120 / W-23) ──────────────────────────────────────────
-def tv_edit_diff_note_ids(sb, tv_project_id: str) -> set[str]:
-    """这个 TV 项目已经算过差异的笔记(夜跑只给新对上的和以前漏算的补)。"""
+def tv_edit_diff_revs(sb, tv_project_id: str) -> dict[str, int]:
+    """这个 TV 项目已经算过差异的笔记 → 按哪一版口径算的(tvlink.DIFF_REV)。夜跑给新对上的、以前漏算的、
+    和口径过时的补算。"""
     def _build(off, lim):
-        return (sb.table("tv_edit_diffs").select("note_id")
+        return (sb.table("tv_edit_diffs").select("note_id, diff_rev")
                 .eq("tv_project_id", tv_project_id).order("note_id").range(off, off + lim - 1))
-    return {r["note_id"] for r in _paged(_build)}
+    return {r["note_id"]: int(r.get("diff_rev") or 0) for r in _paged(_build)}
 
 
 def tv_edit_diffs_upsert(sb, rows: list[dict]) -> int:
@@ -2202,15 +2203,17 @@ def _ts(v) -> datetime | None:
     return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
 
 
-def tv_edit_diffs_since(sb, project_id: str, since: str | None, *, limit: int = EDIT_DIGEST_ROWS) -> dict:
+def tv_edit_diffs_since(sb, project_id: str, since: str | None, *, min_rev: int = 0,
+                        limit: int = EDIT_DIGEST_ROWS) -> dict:
     """这个写作台项目 ``since`` 之后算出来的差异: ``{"rows": 改过的那些(旧的在前), "pairs": 全部对数, "more": 还有没有}``。
 
     只取 ``changed`` 的、**从旧往新**取, 最多 ``limit`` 行(codex review on aw#107): 摘要的 through 就是取到的最后
     一行, 看完之后从那儿接着往后 —— 新的在前取的话, 一次超过 limit 行时更早那些会被 through 一下跨过去、再也
     进不了摘要; 只取改过的, 没改的再多也挡不住后面改过的。截到 limit 时, 最后一个时间点上的行可能没取全
-    (同一批 upsert 的 computed_at 可以相同), 那个时间点整体留到下一次。"""
+    (同一批 upsert 的 computed_at 可以相同), 那个时间点整体留到下一次。``min_rev``: 口径过时、还没重算的行不读。"""
     def _build(off, lim):
-        q = (sb.table("tv_edit_diffs").select(_EDIT_DIFF_COLS).eq("project_id", project_id).eq("changed", True))
+        q = (sb.table("tv_edit_diffs").select(_EDIT_DIFF_COLS).eq("project_id", project_id).eq("changed", True)
+             .gte("diff_rev", min_rev))
         if since:
             q = q.gt("computed_at", since)
         return q.order("computed_at").order("note_id").range(off, off + lim - 1)
@@ -2221,7 +2224,8 @@ def tv_edit_diffs_since(sb, project_id: str, since: str | None, *, limit: int = 
         cut = _ts(rows[limit].get("computed_at"))
         kept = [r for r in rows[:limit] if cut is None or (_ts(r.get("computed_at")) or cut) < cut]
         rows = kept or rows[:limit]       # 全是同一个时间点(不该有): 只能先看这些
-    q = sb.table("tv_edit_diffs").select("note_id", count="exact").eq("project_id", project_id)
+    q = (sb.table("tv_edit_diffs").select("note_id", count="exact").eq("project_id", project_id)
+         .gte("diff_rev", min_rev))
     if since:
         q = q.gt("computed_at", since)
     resp = q.limit(1).execute()

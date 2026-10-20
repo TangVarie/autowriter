@@ -3215,6 +3215,8 @@ MIGRATION_REVIEW_PROVENANCE = "012_review_via_agent_provenance.sql"
 # 013 建 tv_edit_diffs / tv_edit_digest_acks 两张表, 并让 tv_note_links 的 match_kind 多认 'edited'(D-120)。
 # 表探得到; CHECK 同 012 用表当代理(同一个事务)。
 MIGRATION_TV_EDITS = "013_tv_edits.sql"
+# 014 给 tv_edit_diffs 加 diff_rev(差异的口径版本, 话题标签不算正文之后旧行要重算)。
+MIGRATION_TV_EDIT_REV = "014_tv_edit_diff_rev.sql"
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -3563,6 +3565,12 @@ def migration_state(client) -> dict:
     _add(MIGRATION_TV_EDITS, "表 tv_edit_diffs(含 edited_sentences 列) / tv_edit_digest_acks", state, note,
          "⚠️ 硬失败, 但只打两处: tv-sync 写 match_kind='edited' 的对照会被旧 CHECK 拒(整块 upsert 失败, "
          "那一块的对照当晚写不进去); 改动差异和每周摘要没有(tv-sync 对照照写、退出码 1; open_project 不带摘要)")
+
+    # ── 014: 改动差异的口径版本 ──
+    state, note = _probe_ok(lambda: client.table("tv_edit_diffs").select("note_id, diff_rev").limit(1).execute(),
+                            predicate=store.schema_object_missing)
+    _add(MIGRATION_TV_EDIT_REV, "tv_edit_diffs 的 diff_rev 列", state, note,
+         "改动差异写不进去、每周摘要读不出来(tv-sync 对照照写、退出码 1; open_project 不带摘要)")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -4065,7 +4073,7 @@ def edit_digest(client, project_id: str, *, user_id: str | None = None,
         acked_at = tvlink._as_dt(ack.get("acked_at"))
         if acked_at and now - acked_at < timedelta(days=EDIT_DIGEST_EVERY_DAYS):
             return None
-    got = store.tv_edit_diffs_since(client, project_id, (ack or {}).get("acked_through"))
+    got = store.tv_edit_diffs_since(client, project_id, (ack or {}).get("acked_through"), min_rev=tvlink.DIFF_REV)
     changed = [r for r in got["rows"] if r.get("changed")]
     if len(changed) < EDIT_DIGEST_MIN_CHANGED:
         return None
@@ -5082,18 +5090,21 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
                    notes_by_id: dict, known: dict, *, dry_run: bool) -> dict:
     """对上的每一对算一条"人在发布前改了什么"(tvlink.edit_diff), 写 tv_edit_diffs(D-120 / W-23)。
 
-    本次新对上的全算; 以前对上、还没有差异行的补算(每晚最多 TV_SYNC_DIFF_BACKFILL 条)。只算真对上的
+    本次新对上的全算; 以前对上、还没有差异行或口径过时(diff_rev < tvlink.DIFF_REV)的补算(每晚最多
+    TV_SYNC_DIFF_BACKFILL 条; 同一版重算不推 computed_at, 见 _diff_stamp)。只算真对上的
     (_TV_BACKFILL_KINDS, 不含 ingested —— 那一版就是从这条笔记复制的, 没有改动可言); 那一版不在对照索引里
     (tv_lineage 指到别处的版本)就跳过。**不抛**: 这是附加信息, 算不了也不能让对照本身失败。"""
     try:
-        done = store.tv_edit_diff_note_ids(client, tv_project_id) if not dry_run else set()
+        revs = store.tv_edit_diff_revs(client, tv_project_id) if not dry_run else {}
     except Exception as exc:                            # noqa: BLE001 — 013 没跑 / 库错: 这晚不算
         # 记日志、带回 error; cli 的 tv-sync 据它退出非零(codex review on aw#107), 对照照写
         logger.exception("tv_sync: 读已算过的改动差异失败 (tv=%s) —— 这晚不算差异", tv_project_id)
         return {"written": 0, "error": f"{type(exc).__name__}: {exc}"[:200]}
+    done = set(revs)
+    stale = {nid for nid, rev in revs.items() if rev < tvlink.DIFF_REV}
     fresh = {l["note_id"]: l for l in links if l.get("version_id") and l.get("match_kind") in _TV_BACKFILL_KINDS}
     backlog = [dict(r, note_id=nid) for nid, r in existing.items()
-               if nid not in fresh and nid not in done and r.get("version_id")
+               if nid not in fresh and (nid not in done or nid in stale) and r.get("version_id")
                and r.get("match_kind") in _TV_BACKFILL_KINDS][:TV_SYNC_DIFF_BACKFILL]
     brands: dict[str, str] = {}
     rows = []
@@ -5110,13 +5121,14 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
         rows.append({"note_id": n.note_id, "tv_project_id": tv_project_id, "project_id": v.project_id,
                      "version_id": v.version_id, "match_kind": l["match_kind"],
                      "publish_time": n.publish_time.isoformat() if n.publish_time else None,
-                     "draft_title": v.title[:120], **{k: d[k] for k in (
+                     "draft_title": v.title[:120], "diff_rev": tvlink.DIFF_REV, **{k: d[k] for k in (
                          "changed", "title_changed", "published_title", "draft_chars", "published_chars",
                          "removed_count", "added_count", "edited_count", "removed_sentences", "added_sentences",
                          "edited_sentences", "brand_draft", "brand_published")},
                      **_diff_stamp(l, done, existing)})
     out = {"computed": len(rows), "changed": sum(1 for r in rows if r["changed"]),
-           "backfilled": sum(1 for r in rows if r["note_id"] not in fresh), "written": 0}
+           "backfilled": sum(1 for r in rows if r["note_id"] not in fresh),
+           "recomputed": sum(1 for r in rows if r["note_id"] in stale), "written": 0}
     if rows and not dry_run:
         try:
             out["written"] = store.tv_edit_diffs_upsert(client, rows)

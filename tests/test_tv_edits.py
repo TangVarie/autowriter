@@ -7,6 +7,8 @@
   3. tv_sync: edited 写进对照、算真对上(回写 TV); 新对上的和以前漏算的都算差异; dry-run 不写; 差异挂了对照照写;
   4. edit_digest: 改过的 ≥3 篇才给; 看过之后一周内不给; 只看 through 之后的; 别人的项目 403;
   5. ack_edit_digest: 写一行, through 不对 / rules_recorded 不对 → 400; open_project 带上摘要、摘要查挂了简报照给。
+  6. (10-20) 话题标签不算正文: 稿子末尾那行 #话题 TV 里多半没有, 不能记成"人删了一句 / 少提一次品牌";
+     旧口径(diff_rev 过时)的行 tv-sync 按新口径重算、不推 computed_at; 摘要只读当前口径的行。
 """
 from __future__ import annotations
 
@@ -140,7 +142,7 @@ def _digest_client(n_changed=3, ack=None, owner=ME):
              "match_kind": "fuzzy", "changed": i < n_changed, "title_changed": i == 0,
              "draft_title": f"原标题{i}", "published_title": f"新标题{i}", "draft_chars": 300, "published_chars": 200,
              "removed_count": 2, "added_count": 1, "removed_sentences": ["删掉的一句", "又删一句", "再删", "第四句"],
-             "added_sentences": ["加的一句"], "brand_draft": 3, "brand_published": 1,
+             "added_sentences": ["加的一句"], "brand_draft": 3, "brand_published": 1, "diff_rev": tvlink.DIFF_REV,
              "computed_at": (NOW - timedelta(days=1, minutes=i)).isoformat()} for i in range(5)]
     c = FakeClient(rows={"projects": [{"id": P1, "name": "sportsix", "brand": "sportsix", "owner_id": owner}],
                          "tv_edit_diffs": rows, "tv_edit_digest_acks": [ack] if ack else []})
@@ -227,7 +229,7 @@ def _many_changed(n, start=None, tie_at=None):
         rows.append({"note_id": f"m{i:04d}", "tv_project_id": TV, "project_id": P1, "match_kind": "fuzzy",
                      "changed": True, "title_changed": False, "draft_title": "a", "published_title": "a",
                      "draft_chars": 10, "published_chars": 9, "removed_count": 1, "added_count": 0,
-                     "computed_at": t.isoformat()})
+                     "diff_rev": tvlink.DIFF_REV, "computed_at": t.isoformat()})
     return rows
 
 
@@ -276,7 +278,7 @@ def test_cli_tv_sync_fails_loudly_when_diffs_cannot_be_read(monkeypatch, capsys)
     from deskcore import cli
     c = _client([_note("n1", "秋招投了六十份简历没回音", BODY_A)])
     monkeypatch.setattr(core, "sb", lambda: c)
-    monkeypatch.setattr(store, "tv_edit_diff_note_ids",
+    monkeypatch.setattr(store, "tv_edit_diff_revs",
                         lambda *a: (_ for _ in ()).throw(RuntimeError("relation tv_edit_diffs does not exist")))
     assert cli.main(["tv-sync", "--tv-project", TV]) == 1
     out = capsys.readouterr().out
@@ -306,3 +308,49 @@ def test_migration_013_adds_the_new_columns_to_an_existing_table():
     for f in ("migrations/013_tv_edits.sql", "migrations/000_baseline.sql"):
         sql = (Path(__file__).resolve().parent.parent / f).read_text(encoding="utf-8")
         assert "ADD COLUMN IF NOT EXISTS edited_count" in sql and "ADD COLUMN IF NOT EXISTS edited_sentences" in sql, f
+
+
+# ── 6. 话题标签不算正文 + 口径版本 ───────────────────────────────────────────────────────────
+
+TAGS = "#儿童叶黄素[话题]# #开学备货 #挑食宝宝 #百健士"
+
+
+def test_a_trailing_hashtag_line_is_not_an_edit():
+    """10-20 首晚 440 条差异里 125 条只差这一行: 稿子带话题, TV 里发出去的正文不带。"""
+    body = _body(6, 0)
+    d = tvlink.edit_diff("标题", body + "\n" + TAGS, "标题", body, brand="百健士")
+    assert not d["changed"] and d["removed_count"] == 0
+    assert d["brand_draft"] == d["brand_published"] == 0, "品牌只数正文里提的"
+    joined = "#a#b#c " + body
+    assert not tvlink.edit_diff("标题", joined, "标题", body)["changed"], "连写的话题也去干净"
+    real = tvlink.edit_diff("标题", body + "\n" + TAGS, "标题", _body(4, 0))
+    assert real["changed"] and real["removed_count"] == 2, "真删的句子照记"
+
+
+def test_stale_rev_rows_are_recomputed_without_moving_the_watermark():
+    c = _client([_note("n1", "秋招投了六十份简历没回音", BODY_A + "\n#秋招 #求职")])
+    core.tv_sync(c, TV)
+    (row,) = c.rows["tv_edit_diffs"]
+    assert row["diff_rev"] == tvlink.DIFF_REV
+    row.update(diff_rev=0, changed=True, removed_count=1, computed_at="2026-09-01T00:00:00+00:00")
+    out = core.tv_sync(c, TV)["edit_diffs"]
+    assert out["recomputed"] == 1 and out["written"] == 1
+    (row,) = c.rows["tv_edit_diffs"]
+    assert row["diff_rev"] == tvlink.DIFF_REV and row["computed_at"] == "2026-09-01T00:00:00+00:00"
+    assert core.tv_sync(c, TV)["edit_diffs"]["computed"] == 0, "当前口径的不再重算"
+
+
+def test_digest_reads_only_current_rev_rows():
+    c = _digest_client()
+    for r in c.rows["tv_edit_diffs"]:
+        r["diff_rev"] = tvlink.DIFF_REV - 1
+    assert core.edit_digest(c, P1, user_id=ME, now=NOW) is None, "重算之前宁可不给, 也不给错的"
+    c.rows["tv_edit_diffs"][0]["diff_rev"] = tvlink.DIFF_REV
+    assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["pairs"] == 1
+
+
+def test_migration_014_adds_diff_rev_in_both_places():
+    from pathlib import Path
+    for f in ("migrations/014_tv_edit_diff_rev.sql", "migrations/000_baseline.sql"):
+        sql = (Path(__file__).resolve().parent.parent / f).read_text(encoding="utf-8")
+        assert "ADD COLUMN IF NOT EXISTS diff_rev SMALLINT NOT NULL DEFAULT 0" in sql, f

@@ -77,8 +77,8 @@ def parse_raw(raw: str | None) -> tuple[str, str]:
 
 
 def strip_hashtags(text: str | None) -> str:
-    """去掉话题标签。写作台的正文不带标签, TV 的带; 同项目的稿子都以同一串标签
-    结尾, 不剥的话四字串会互相误撞, 补录进指纹库更是会让整个项目互判重复。"""
+    """去掉话题标签。TV 的正文带标签, 写作台的稿子也可能带(10-20: 写手的稿子末尾常有一行 #话题);
+    同项目的稿子都以同一串标签结尾, 不剥的话四字串会互相误撞, 补录进指纹库更是会让整个项目互判重复。"""
     out = _TAG_RE.sub("", text or "")
     lines = [ln.rstrip() for ln in out.splitlines()]
     while lines and not lines[-1].strip():
@@ -278,6 +278,10 @@ SENT_MIN_CHARS = 6          # 归一化后短于这个的不算一句(表情、"
 SENT_ALIGN = 0.5            # 一句的四字串有一半以上在另一边出现, 就算"这句还在"
 DIFF_KEEP_SENTENCES = 8
 DIFF_SENTENCE_CHARS = 80
+# 差异的口径版本: 改了 edit_diff 的算法就 +1。tv-sync 把旧口径的行按新口径重算, 摘要只读当前口径的。
+# 1 (10-20): 写作台那版也剥话题标签。TV 那版读进来就剥了(Note.from_row), 写手的稿子却以一行 #话题 结尾 ——
+#   首晚 440 条差异里 125 条"改过"只差这一行, 品牌次数也跟着少一次, 摘要会把"发布时删了品牌"教给写手。
+DIFF_REV = 1
 
 
 def sentences(text: str) -> list[str]:
@@ -315,7 +319,9 @@ def edit_diff(draft_title: str, draft_body: str, published_title: str, published
 
     句子按标点切; 一句在另一边能找到一半以上的四字串就算"还在", 否则算删掉 / 新加的; 还在但字不一样的记成
     改写对(原句 → 改后)。只回前几句(每句截断), 计数是全量的。``brand`` 给了就数两边各提了几次(不分大小写)。
-    ``changed`` 看的是归一化后的整篇: 只调了句子顺序、或者改动零碎到对不上哪一句, 也算改过。"""
+    ``changed`` 看的是归一化后的整篇: 只调了句子顺序、或者改动零碎到对不上哪一句, 也算改过。
+    话题标签两边都先剥掉(``strip_hashtags``, 见 DIFF_REV 的说明), 品牌只数正文里提的。"""
+    draft_body, published_body = strip_hashtags(draft_body), strip_hashtags(published_body)
     dg, pg = grams(draft_body), grams(published_body)
     dsents, psents = sentences(draft_body), sentences(published_body)
     removed = [s for s in dsents if not _kept(s, pg)]

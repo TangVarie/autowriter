@@ -290,6 +290,15 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
 
+### 1.10 `014_tv_edit_diff_rev` —— 改动差异的口径版本（2026-10-20）
+
+013 首晚 440 条差异里 125 条"改过"只差写作台稿子末尾那行 #话题（TV 里发出去的正文多半不带），品牌次数也跟着少一次。
+`tvlink.edit_diff` 现在两边先去掉话题再比；`tv_edit_diffs.diff_rev` 记每行按哪一版口径（`tvlink.DIFF_REV`）算的。
+tv-sync 把 `diff_rev` 过时的行按新口径重算（同一版不推 `computed_at`，每个 TV 项目每晚最多 500 条），`edit_digest` 只读当前口径的行。
+SQL Editor / `apply_migration` 直接跑（幂等），**先于**代码部署。验收：`doctor` 里「tv_edit_diffs 的 diff_rev 列」applied；
+下一晚 tv-sync 之后 `select diff_rev, count(*), count(*) filter (where changed) from autowriter.tv_edit_diffs group by 1` 全是当前口径。
+以后改 `edit_diff` 的算法就把 `DIFF_REV` +1，不用再加迁移。
+
 ### 1.9 `013_tv_edits` —— 改得多的同一篇也认 + 人在发布前改了什么（2026-10-19，D-120 / W-23）
 
 tv-sync 多一档 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15），每条对上的笔记算一条改动差异写 `tv_edit_diffs`，

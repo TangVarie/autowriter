@@ -1547,6 +1547,9 @@ CREATE TABLE IF NOT EXISTS autowriter.tv_edit_diffs (
 ALTER TABLE autowriter.tv_edit_diffs
     ADD COLUMN IF NOT EXISTS edited_count     INTEGER NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS edited_sentences JSONB NOT NULL DEFAULT '[]'::jsonb;
+-- 014: 差异的口径版本(话题标签不算正文之后, 旧口径的行由 tv-sync 重算)
+ALTER TABLE autowriter.tv_edit_diffs
+    ADD COLUMN IF NOT EXISTS diff_rev SMALLINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS tv_edit_diffs_project_idx
     ON autowriter.tv_edit_diffs (project_id, computed_at);
 GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.tv_edit_diffs TO service_role;
