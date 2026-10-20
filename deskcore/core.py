@@ -5326,6 +5326,9 @@ def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str =
     if partial:
         tips.append(f"有 {partial} 条规则只查了一部分(Jev 编译时标了 partial, 没查的那部分写在 rules.partial_rules 的 "
                     "uncovered 里), 不能说它们整条守住了。")
+    if summary.get("code_unchecked"):
+        tips.append(f"有 {summary['code_unchecked']} 处(篇 × 条)代码检查这次没查完(正则没在时限内跑完, 或者限时的引擎跑不了它; "
+                    "见每篇的 code_unchecked): 不是违规, 也不能说那几条守住了; severity 是 hard 的照规则原文(rule)自己核; 不用重试。")
     if not tips:
         # 只有上面每一项都是 0 才说这句(2026-10-20 复审: 没判出来的题、没编的规则、查不了的话题规则都不算守住;
         # 第二轮: 编不了的、编出来的检查不安全没跑的也不算; 第三轮: 只查了一部分的(coverage=partial)也不算)
@@ -5513,6 +5516,12 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                                            tags=[v["tags"] for _, v in targets])
         for h in hits:
             by_index.setdefault(h["index"], []).append(h)
+    # 正则没在时限内查完的(rulecheck.check 的 timed_out_from: 从第几篇起): 那几篇这条算没查, 不能算进「守住了」
+    # (validator.search_user_regex 限时之后才有这一种; 同 score_drafts 的 rule_checks_unchecked)
+    code_timed = code_stats.get("timed_out_from") or {}
+    if code_timed:
+        rules_info["code_timed_out"] = len(code_timed)
+    rule_rows = {str(r.get("id")): r for r in pool}
     if len(code) - len(runnable):
         rules_info["code_refused"] = len(code) - len(runnable)  # 正则不安全 / 形状不对, 没跑
     rules_info["by_code"] = code_stats.get("rules", 0)          # 真跑了的; 没跑的那几条不算「代码查了」
@@ -5619,6 +5628,12 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                     summary["not_finished"] += 1
                 if res.get("detail"):
                     row["judge_detail"] = mask_secrets(str(res["detail"]))[:_JUDGE_BLOCK_TEXT_MAX]
+        code_unchecked = [{"rule_id": rid, "severity": "hard" if str((rule_rows.get(str(rid)) or {}).get("severity") or "")
+                           .lower() == "hard" else "soft", "rule": (rule_rows.get(str(rid)) or {}).get("content") or ""}
+                          for rid, at in code_timed.items() if i >= at]
+        if code_unchecked:
+            row["code_unchecked"] = code_unchecked
+            summary["code_unchecked"] = summary.get("code_unchecked", 0) + len(code_unchecked)
         found_v.sort(key=lambda e: e["severity"] != "hard")
         must = sum(1 for e in found_v if e["severity"] == "hard")
         row["violations"] = found_v[:max(must, CHECK_RULES_MAX_LISTED)]      # 必须改在前, 全列

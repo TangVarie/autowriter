@@ -793,6 +793,11 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
    数进 `rules.not_compilable`。这两种 `next_step` 都会说「有 N 条规则这次查不了，不能说它们守住了」（10-20 第二轮复审：原来
    `next_step` 只看没编译结果和话题评论两种，一条编不了的硬规则加一条正则不安全的硬规则，照说「这次查的规则都守住了」）；只有编不了的
    规则、别的都没有时，`nothing_to_check` 也照这样说，不说成「流程、交付、写作方向」那种查不了。
+   写手用 `record_rule` 的 `{"kind": "free_text"}` 撤掉了代码检查的（`free_text` 加 `{"code_check": "off"}` 标记，
+   `rulecompile.withdrawn`）编出来的 `code` 也不跑，规则题照判；AW 录规则界面写的 `free_text` 不带标记，不算撤掉。
+   正则限时（§3.10，`validator.search_user_regex`）：没在时限内查完的那条，从停下的那篇起每篇列进 `code_unchecked`
+   （`rule_id` / `severity` / `rule` 原文），数进 `summary.code_unchecked` 和 `rules.code_timed_out`；`next_step` 说这几处不是违规、
+   也不能说守住了。
 5. 账本：每篇的回包看 `written` / `write_error`（Jev 账本写失败照样回 200）：`write_error` 不为空、或 `written` 不是整数的，记一行 WARNING
    （带版本号）、`rules.ledger_write_errors` 计数、打一条 `deskcore_check_rules_ledger` 埋点；写手的 `next_step` 不提（判是判出来了，少的是
    以后校准用的那几行）。10-20 第三轮复审：原来只读 `detail.desk_rules`，`write=true` 要攒的影子期数据次次丢了也没人知道。

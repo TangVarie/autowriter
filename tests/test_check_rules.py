@@ -279,6 +279,8 @@ UNRUNNABLE_HAND_SET = [("forbidden_regex", {"pattern": "(哈|哈哈)+"}), ("max_
     (None, None, True), ("", None, True), ("free_text", None, True), ("  free_text ", None, True),
     ("forbidden_word", {"words": ["人设禁词"], "where": ["body"]}, False), ("max_len", {"max": 20, "where": "title"}, False),
     ("forbidden_word", None, True), *[(k, p, True) for k, p in UNRUNNABLE_HAND_SET],
+    # 写作台 record_rule 撤掉了代码检查(free_text + 标记; codex review on aw#115): 编出来的 code 也不跑
+    ("free_text", dict(rulecheck.WITHDRAWN), False), ("free_text", json.dumps(rulecheck.WITHDRAWN), False),
 ])
 def test_only_a_runnable_hand_set_check_suppresses_compiled_code(kind, payload, runs):
     """2026-10-20 复审: AW 记忆页存硬规则默认就是「自由文本」= free_text, 和没设分不开, 不能当成「不用代码查」;
@@ -302,6 +304,38 @@ def test_free_text_hard_rule_from_the_aw_ui_gets_its_compiled_code_run(wired):
     assert out["status"] == "checked" and out["rules"]["by_code"] == 1
     (v2,) = out["versions"]
     assert [e["what"] for e in v2["violations"]] == ["必须改: 标题里有禁用词「示例禁词」"]
+
+
+def test_a_check_withdrawn_at_the_desk_does_not_run_its_compiled_code(wired):
+    """写手用 record_rule 的 {"kind": "free_text"} 撤掉了这条的代码检查: score_drafts、生成链路都不查了, check_rules 里编出来的
+    code 也不能再报「必须改」(codex review on aw#115: 撤掉的检查不能从别的路再长回来)。"""
+    kind, payload = rulecheck.normalize_check({"kind": "free_text"})
+    rule = mem(11, "示例硬规则: 标题不许出现「示例禁词」", severity="hard", rule_kind=kind, rule_payload=payload)
+    res = code_result(rule["id"], jev_sha(rule["content"]),
+                      {"kind": "forbidden_word", "words": ["示例禁词"], "where": ["title"]})
+    out = core.check_rules(full_client(memories=[rule], compiles=[stored(rule, res)],
+                                       versions=[version(V2, title="示例禁词也在这个标题里")]), PROJ, [V2], user_id=ME)
+    assert out["rules"]["by_code"] == 0
+    assert all(not v["violations"] for v in out["versions"])
+
+
+def test_a_compiled_regex_that_runs_out_of_time_is_unchecked_not_held(wired, monkeypatch):
+    """编出来的正则也走限时的引擎(validator.search_user_regex): 没查完的那条从停下的那篇起列进 code_unchecked, 不算违规,
+    next_step 不能说「都守住了」(原来 check_rules 不看 timed_out, 一条超时的硬规则照算守住了)。"""
+    monkeypatch.setattr(config, "REGEX_SEARCH_TIMEOUT_SEC", 0.1)
+    slow = "a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b"
+    rule = mem(12, "示例硬规则: 正文不许出现某种写法", severity="hard")
+    res = code_result(rule["id"], jev_sha(rule["content"]),
+                      {"kind": "forbidden_regex", "pattern": slow, "where": ["body"]})
+    vs = [version(V1, body=BODY), version(V2, body=BODY + "a" * 2000)]
+    out = core.check_rules(full_client(memories=[rule], compiles=[stored(rule, res)], versions=vs), PROJ, [V1, V2],
+                           user_id=ME)
+    assert out["rules"]["code_timed_out"] == 1
+    by_id = {v["version_id"]: v for v in out["versions"]}
+    assert "code_unchecked" not in by_id[V1], "停下之前那篇查完了"
+    assert by_id[V2]["code_unchecked"] == [{"rule_id": rule["id"], "severity": "hard", "rule": rule["content"]}]
+    assert not by_id[V2]["violations"] and out["summary"]["code_unchecked"] == 1
+    assert "都守住了" not in out["next_step"] and "code_unchecked" in out["next_step"]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -678,9 +712,9 @@ def test_check_rules_sees_exactly_what_score_drafts_rule_checks_sees(wired, monk
     seen: list[list[dict]] = []
     real = rulecheck.check
 
-    def spy(rules, drafts, *, indices=None, tags=None):
+    def spy(rules, drafts, *, indices=None, tags=None, expects=()):
         seen.append([rulecheck._parts(d, None if tags is None else tags[k]) for k, d in enumerate(drafts)])
-        return real(rules, drafts, indices=indices, tags=tags)
+        return real(rules, drafts, indices=indices, tags=tags, expects=expects)
     monkeypatch.setattr(rulecheck, "check", spy)
 
     rules, comps = _body_rules()
@@ -920,9 +954,9 @@ def test_with_writer_tags_only_title_and_body_match_the_delivered_text(wired, mo
     seen: list[list[dict]] = []
     real = rulecheck.check
 
-    def spy(rules, drafts, *, indices=None, tags=None):
+    def spy(rules, drafts, *, indices=None, tags=None, expects=()):
         seen.append([rulecheck._parts(d, None if tags is None else tags[k]) for k, d in enumerate(drafts)])
-        return real(rules, drafts, indices=indices, tags=tags)
+        return real(rules, drafts, indices=indices, tags=tags, expects=expects)
     monkeypatch.setattr(rulecheck, "check", spy)
 
     tpl = {"layout": "blocks", "tags": {"content": 2, "fixed": ["示例固定"], "conditional": []}}

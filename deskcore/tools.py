@@ -707,6 +707,9 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
       · ``judge_status`` 是 ok、但 ``counts.unjudged`` 不是 0 的: 那几道题 Jev 没判出来(``unjudged`` 列着规则 id 和原因,
         比如 evidence_not_found = 判了「是」却指不出是哪一句, 不算没守住), 那几条**也不能说守住了**。``summary.unjudged``
         是全部篇加起来的题数。
+      · ``code_unchecked``: 代码查的正则这次没在时限内查完(或者限时的引擎跑不了它)的规则, 每条 ``rule_id`` / ``severity`` /
+        ``rule``(规则原文)。不是违规, 也**不能说那几条守住了**; hard 的照原文自己核一遍, 不用重试。``summary.code_unchecked``
+        是全部篇加起来的处数。
       · ``status`` 是 nothing_to_check / no_versions 时照 ``next_step`` 说一句就行。
       · ``status`` 是 error: 这次规则没查成(服务端读不出规则的编译结果), **不能说规则守住了**; 存档已经成功, 交付照常,
         不用重试。
@@ -898,7 +901,8 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       · {"kind": "max_len", "max": 300, "min": 150, "where": "body"}                       —— 字数范围(不算空白和话题),
         max / min 至少给一个, where 只认 title / body
       · {"kind": "forbidden_regex", "pattern": "...", "where": [...]}                       —— 固定写法(会做安全检查)
-      · {"kind": "free_text"}                                                               —— 撤掉这条的代码检查
+      · {"kind": "free_text"}                                                               —— 撤掉这条的代码检查(存档时、
+        check_rules 里编出来的都不跑; check_rules 的规则题照判)
       where 可选 title / body / tags / comments, 不传就是 ["title", "body"]。语气、结构这类判断不了的不要带 check。
       词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
       (所以「TV信号」里也不算有 "V信") —— 两种写法都要拦就都列上。

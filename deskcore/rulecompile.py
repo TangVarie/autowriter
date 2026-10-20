@@ -25,6 +25,7 @@ tests/test_rule_compile.py 拿 Jev 那边对合成样例算出来的值钉着。
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 
@@ -161,11 +162,27 @@ def hand_set(rule: dict) -> bool:
     设过的不跑编译出来的 code: score_drafts 已经按人设的那份查过, 再查一遍就重复报。
     ``free_text`` / 空 / 别的值都**不算**(2026-10-20 复审): AW 记忆页存硬规则时默认选「自由文本」, 存进库就是
     ``free_text``, 和没设(validator.py 也当没设)分不开 —— 拿它当「有人明说过不用代码查」, AW 页上记的硬规则编出来的
-    code 就永远不跑。record_rule 的 {"kind": "free_text"}(撤掉人设的 check)同理: 撤掉之后编出来的 code 照跑。
+    code 就永远不跑。record_rule 的 {"kind": "free_text"}(撤掉人设的 check)存的是 free_text 加 rulecheck.WITHDRAWN 标记,
+    也不算人设的; 那种是写手明说「这条不用代码查」, 编出来的 code 由 code_rules 另外拦下(见 withdrawn)。
     rule_kind 对、payload 却跑不了的**也不算**(2026-10-20 第三轮复审): AW 页存得进去、rulecheck 不收的那几种(validator
     放过、量词形状那道拒掉的正则; max_len 的「开头」老形状)score_drafts 只在 batch_metrics 里记一笔 skipped, 写手什么都
     看不见 —— 原来这里照样让编出来的 code 让路, 这条硬规则两边都没查, check_rules 还说它守住了 / 是流程规则。"""
     return (rule.get("rule_kind") or "").strip() in rulecheck.CHECK_KINDS and rulecheck.spec_of(rule) is not None
+
+
+def withdrawn(rule: dict) -> bool:
+    """写手用 record_rule 的 {"kind": "free_text"} 撤掉了这条的代码检查(rule_kind = free_text 加 rulecheck.WITHDRAWN 标记;
+    codex review on aw#115)。撤的是「代码查」: score_drafts 不查, 生成链路(validator)不查, 这里编出来的 code 也不跑;
+    Jev 的规则题是判断, 照判。AW 录规则界面写的 free_text 不带标记, 不算撤掉。"""
+    if (rule.get("rule_kind") or "").strip() != "free_text":
+        return False
+    payload = rule.get("rule_payload")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return False
+    return isinstance(payload, dict) and payload.get("code_check") == rulecheck.WITHDRAWN["code_check"]
 
 
 # 版本行里只存了标题和正文(autowriter.versions 没有话题 / 评论列): 写手单独传的 tags、comments 都不在。check_rules 能
@@ -199,13 +216,13 @@ def _strip_unstored(payload: dict, kind: str | None = None) -> dict | None:
 def code_rules(pairs: list[tuple[dict, dict]]) -> tuple[list[dict], list[str]]:
     """(规则, 编译结果) → (喂给 ``rulecheck.check`` 的规则行(rule_kind / rule_payload 形状), 查不了的规则 id)。
 
-    只收编译结果里带 code、且规则没有人设能跑的 check 的(见 hand_set)。where 只管话题 / 评论的(required_phrase: 只要沾了话题 /
+    只收编译结果里带 code、且规则没有人设能跑的 check 的(见 hand_set)、写手也没撤掉代码检查的(见 withdrawn)。where 只管话题 / 评论的(required_phrase: 只要沾了话题 /
     评论)进第二个列表(见 UNSTORED_PARTS), 不跑、不算「代码查了」。payload 不在这里校验: rulecheck.spec_of 读的时候会按人设 check 的同一套规矩再校一遍(正则过
     validator.assert_regex_is_safe + 量词形状那道), 不合格的记日志、跳过、计进 skipped —— Jev 那边编译时也查过, 这里是
     第二道, 不会因为 Jev 放过了一个会回溯的正则就把服务进程卡住。"""
     out, unavailable = [], []
     for rule, res in pairs:
-        if hand_set(rule) or not usable(res):
+        if hand_set(rule) or withdrawn(rule) or not usable(res):
             continue
         code = res.get("code")
         if not isinstance(code, dict) or code.get("kind") not in rulecheck.CHECK_KINDS:
