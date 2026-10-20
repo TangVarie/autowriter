@@ -172,6 +172,14 @@ JUDGE_TIMEOUT_SEC: float = _bounded_number("JUDGE_TIMEOUT_SEC", 8.0, 1.0, 15.0)
 # 不是"少判一篇", 而是调用方看到入库失败、回头重试撞上自己刚写的指纹。判定超时只是影子期少一条
 # 账本记录(judge 那边可能照样判完), 两害取轻。20 = 22 留 2 秒余量; 不开 env, 要改先看实测。
 COMMIT_RESPONSE_BUDGET_SEC: float = 20.0
+# 用户写的正则(forbidden_regex)执行期的时限(codex review on aw#115, 见 validator.search_user_regex): 一条正则规则在一次检查里
+# 共用这一份 —— score_drafts 存档时的代码查规则(deskcore/rulecheck.check, 一批几篇几个部位一起算)和 AW 生成链路的
+# check_hard_rules(一篇的标题 + 正文)。到点这条就当这次没查, 不算命中。所以一次检查最多多花约 (正则规则条数) × 本值: 到点之后
+# regex 隔一阵才看一次表, 实测最多再拖两成多; 这个进程第一次用到某条正则时的编译也从这一份里扣(打断不了, 换出来的写法有长度
+# 上限 validator.MAX_TRANSLATED_CHARS, 编一次 0.1 秒以内)。0.1 秒 × 20 条 ≈ 2.5 秒, 在上面 20 秒的回包目标里占一成多(生产库现在
+# 一条结构化正则都没有)。正常的规则一批 20 篇 × 1500 字实测几毫秒到十几毫秒, 0.1 秒够查完(codex review on aw#115 第五轮之前
+# 字集是逐个码位列的, 一个 \b 词表一批就到点 —— 别再那么写); 往大调之前先算清楚上面那笔账。夹在 0.01~1 秒。
+REGEX_SEARCH_TIMEOUT_SEC: float = _bounded_number("REGEX_SEARCH_TIMEOUT_SEC", 0.1, 0.01, 1.0)
 # 写手侧判稿工具(judge_draft / repair_plan_for / list_banks, 2026-10-09 从写手机器上的 judge.mcp_server 并进
 # deskcore)一次请求的超时。单篇、同步、模型在等 —— 必须留在 MCP 客户端 ~22 秒容忍之内(上面那段);
 # Jev 实测一篇 10~12 次调用 4.5 秒(JevforCoentent docs/31 §5.4), 18 秒够, 上限夹 20。

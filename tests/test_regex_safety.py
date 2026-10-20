@@ -413,3 +413,315 @@ def test_the_parser_is_actually_available_on_this_python():
     """
     assert V._parse_pattern("(a+)+$") is not None, (
         "re 的解析器拿不到了 —— 检测已降级为文本启发式, 该找个正经方案了")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 4 · 执行期限时: 闸是尽力而为的, 漏过去的最多花一份时限(codex review on aw#115 第四轮)
+# ══════════════════════════════════════════════════════════════════════
+# 闸放行、执行又慢的几种(闸的放行 / 拒绝不改, Jev 的 /compile_rules 镜像它): codex 给的 a*aaa*…b(两个字的字面量隔不开前后的
+# a*) 50 个 a 就 6 秒, 2000 个 a 是永不返回; \d+(?=\s*元) 这类每个起点各试一遍的平方级, 2 万位(执行上限)5~10 秒。
+
+_SLIPS_PAST_THE_GATE = [
+    ("a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b", "a" * 2000),
+    ("\\d+(?=\\s*元)", "1" * 20_000),
+    ("\\d+(?:\\.\\d+)?(?=\\s*元)", "1" * 20_000),
+]
+_TIMEOUT = 0.1
+
+
+@pytest.fixture
+def short_timeout(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "REGEX_SEARCH_TIMEOUT_SEC", _TIMEOUT)
+    return _TIMEOUT
+
+
+@pytest.mark.parametrize("pattern, text", _SLIPS_PAST_THE_GATE, ids=lambda v: v[:12] if isinstance(v, str) else None)
+def test_a_slow_pattern_that_slips_past_the_gate_is_cut_off_at_execution(short_timeout, pattern, text):
+    from deskcore import rulecheck
+    assert V.regex_is_safe(pattern), "前提: 闸放行它(闸不改)"
+    rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})
+    V.search_user_regex(pattern, "x")              # 先编译好(第一次的编译也从这一份里扣, 这里只量搜的)
+    t0 = time.perf_counter()
+    with pytest.raises(V.RegexTimeout):
+        V.search_user_regex(pattern, text)
+    assert time.perf_counter() - t0 < 10 * short_timeout
+
+
+@pytest.mark.parametrize("pattern, text", _SLIPS_PAST_THE_GATE, ids=lambda v: v[:12] if isinstance(v, str) else None)
+def test_check_hard_rules_skips_a_rule_that_runs_out_of_time(short_timeout, pattern, text):
+    """生成链路: 标题、正文共用一份时限, 用完了这条跳过(不算违规), 记一行日志; 同一批里正常的规则照旧命中。"""
+    slow = {"content": "示例慢规则", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": pattern}}
+    fine = {"content": "示例禁词", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": "示例禁词"}}
+    V.check_hard_rules(hard_rules=[slow], title="t", body="b")
+    t0 = time.perf_counter()
+    hits = V.check_hard_rules(hard_rules=[slow, fine], title="示例禁词", body=text)
+    assert time.perf_counter() - t0 < 10 * short_timeout
+    assert [h["rule"] for h in hits] == ["示例禁词"], "没查完的不能报成违规"
+
+
+def test_the_budget_is_shared_by_every_search_of_a_rule(short_timeout):
+    """一份时限是一条规则在一次检查里共用的: 每次都差一点到点的话, 一批 20 篇加起来就远不止一份了。用完了再搜直接抛, 不再跑。"""
+    budget = V.RegexBudget()
+    with pytest.raises(V.RegexTimeout):
+        V.search_user_regex("a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b", "a" * 2000, budget)
+    assert budget.timed_out and budget.left <= 0
+    t0 = time.perf_counter()
+    with pytest.raises(V.RegexTimeout):
+        V.search_user_regex("最", "最", budget)
+    assert time.perf_counter() - t0 < 0.01
+
+
+@pytest.mark.parametrize("pattern", [
+    "a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b",
+    # 后半截 re 当字面的 {e}, regex 认成模糊匹配、编译不了: 原来就退回没有时限的 re, 整条绕过了时限(codex review on aw#115 第五轮)
+    "a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b|示例{1,2}{e}",
+], ids=["codex-example", "fuzzy-brace-bypass"])
+def test_the_codex_example_returns_through_both_paths_in_a_fresh_process(pattern):
+    """真跑一遍(单独的进程, 卡住了也能收尾): 改之前 rulecheck.check 和 check_hard_rules 配 2000 个 a 都是永不返回。"""
+    import json
+    import os
+    import pathlib
+    import subprocess
+    import sys
+    import textwrap
+    code = textwrap.dedent("""
+        import json, sys, time, validator
+        from deskcore import rulecheck
+        rule = {"id": "m-1", "content": "示例", "severity": "hard", "rule_kind": "forbidden_regex",
+                "rule_payload": {"pattern": sys.argv[1]}}
+        validator.check_hard_rules([rule], "t", "b")
+        t0 = time.monotonic()
+        gen = validator.check_hard_rules([rule], "a" * 2000, "a" * 2000)
+        t1 = time.monotonic()
+        hits, stats = rulecheck.check([rule], [{"title": "a" * 2000, "body": "a" * 2000}] * 20)
+        t2 = time.monotonic()
+        print(json.dumps({"gen": gen, "gen_s": t1 - t0, "hits": hits, "stats": stats, "desk_s": t2 - t1}))
+    """)
+    assert V.regex_is_safe(pattern), "前提: 闸放行它(闸不改)"
+    root = pathlib.Path(V.__file__).resolve().parent
+    env = {**os.environ, "REGEX_SEARCH_TIMEOUT_SEC": str(_TIMEOUT)}
+    try:
+        p = subprocess.run([sys.executable, "-B", "-c", code, pattern], cwd=root, env=env, capture_output=True,
+                           text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        pytest.fail("30 秒没返回: 漏过闸的正则还是直接跑进了没有时限的 re")
+    assert p.returncode == 0, p.stderr[-2000:]
+    got = json.loads(p.stdout.strip().splitlines()[-1])
+    assert got["gen"] == [] and got["gen_s"] < 10 * _TIMEOUT
+    assert got["hits"] == [] and got["stats"] == {"rules": 1, "skipped": 0, "timed_out": ["m-1"]}
+    assert got["desk_s"] < 10 * _TIMEOUT, "一条慢正则一次 check 只该花一份时限, 不是 20 篇 × 2 个部位各一份"
+
+
+# ── 普通的正则一批照样查得完(codex review on aw#115 第五轮) ──────────────────────────────────────────
+# 早先把 \w 逐个码位列成显式字集(七百多段、14 KB), regex 每走一步挨个比, 一个 \b 又换成四个环视: \bvx\b|\bwx\b|\bqq\b 配 20 篇
+# 1500 字的稿子 0.1 秒就到点, 第 18 篇里真有的命中报成「没查」; 生成链路一篇 3000 字的稿子、8 个词的 \b 词表也是。原来的用例
+# 只拿十来个字的稿子试, 看不出来。
+
+_POST = ("这是一段示例正文，用来试规则检查的速度❤\ufe0f。今天出门散步，路上看到一家新开的小店，进去逛了一会儿，"
+         "店里的东西都挺好看①②③。回家路上又买了杯咖啡，价格 18 元，味道还不错！\n\n")
+_WORDS = ("ad", "ads", "promo", "dm", "vx", "wx", "qq", "tb", "jd", "pdd")
+_ORDINARY = ["\\bvx\\b|\\bwx\\b|\\bqq\\b", "|".join(f"\\b{w}\\b" for w in _WORDS), "\\b(?:vx|wx|qq)\\b",
+             "\\b\\d{6}\\b", "\\b\\d{3,}\\b", "\\b[A-Za-z]{2,}\\b", "\\b1[3-9]\\d{9}\\b", "\\w{2,}\\s+\\w{2,}",
+             "\\w+\\s*[:：]\\s*\\d+", "[^\\w\\s]{3,}", "\\W{3,}", "(?i)\\bwechat\\b", "(?i)\\b(?:dm|pm)\\s*me\\b"]
+
+
+@pytest.mark.parametrize("pattern", _ORDINARY)
+def test_ordinary_rules_finish_a_normal_batch_with_the_same_hits_as_re(short_timeout, pattern):
+    """20 篇 × 1500 字(比小红书正文上限还长), 违规埋在第 18 篇: 一份 0.1 秒查得完(第一次的编译也算在里面), 命中和 re 一样。"""
+    import re
+    from deskcore import rulecheck
+    rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})
+    V._compiled.cache_clear()
+    drafts = [{"title": f"示例标题第{i}期", "body": (_POST * 20)[:1500]} for i in range(20)]
+    drafts[17]["body"] += " 示例联系方式 vx 123456 13912345678 WeChat：12 dm me"
+    rule = {"id": "m-1", "severity": "hard", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": pattern}}
+    hits, stats = rulecheck.check([rule], drafts)
+    assert "timed_out" not in stats
+    want = {i for i, d in enumerate(drafts) if any(re.search(pattern, x) for x in (d["title"], d["body"]))}
+    assert {h["index"] for h in hits} == want and 17 in want
+
+
+def test_check_hard_rules_finds_a_word_list_hit_in_a_long_post(short_timeout):
+    rule = {"content": "示例词表", "rule_kind": "forbidden_regex",
+            "rule_payload": {"pattern": "|".join(f"\\b{w}\\b" for w in _WORDS[:8])}}
+    V._compiled.cache_clear()
+    hits = V.check_hard_rules([rule], title="示例标题", body=_POST * 30 + " 有事 dm")
+    assert [h["match"] for h in hits] == ["dm"]
+
+
+@pytest.mark.parametrize("pattern", ["(?>\\w+)\\s+\\w+", "(?=\\w+\\s)", "\\w++\\s", "(?>\\w*)\\s"])
+def test_running_out_of_time_on_cjk_text_stops_near_the_limit(short_timeout, pattern):
+    """到点之后 regex 隔一阵才看一次表。显式字集每一步都慢, 那一阵就拖成近 1 秒(到点后多跑 8~11 倍), 「(规则条数) × 0.1 秒」的
+    账就不成立了; 换成属性写的字集之后实测 0.1~0.12 秒。"""
+    from deskcore import rulecheck
+    rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})
+    V.search_user_regex(pattern, "x")              # 先编译好(第一次的编译也从这一份里扣, 这里只量搜的)
+    t0 = time.perf_counter()
+    with pytest.raises(V.RegexTimeout):
+        V.search_user_regex(pattern, "示例" * 10_000)
+    assert time.perf_counter() - t0 < 2 * short_timeout
+
+
+def test_compiling_a_long_boundary_pattern_costs_at_most_about_one_time_limit(short_timeout):
+    """编译打断不了, 也不能不算: 一百个 \\b 连写闸和写作台都放行, 原来换成四百个环视、几 MB 的写法, 第一次 check 编译 5 秒。"""
+    from deskcore import rulecheck
+    pattern = "\\b" * 100 + "x"
+    rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})
+    V._compiled.cache_clear()
+    t0 = time.perf_counter()
+    try:
+        V.search_user_regex(pattern, _POST * 10)
+    except V.RegexTimeout:
+        pass
+    assert time.perf_counter() - t0 < 2 * short_timeout
+
+
+def test_a_pattern_too_long_to_compile_in_time_is_reported_unchecked(short_timeout):
+    """换出来超过 MAX_TRANSLATED_CHARS 的不编译(编一次就是零点几秒到几秒), 报这次没查; 这个结论记住, 下次不再换。"""
+    pattern = "\\b" * 1000 + "x"
+    assert V.regex_is_safe(pattern), "前提: 闸放行它(闸不改)"
+    V._compiled.cache_clear()
+    for _ in range(2):
+        budget = V.RegexBudget()
+        t0 = time.perf_counter()
+        with pytest.raises(V.RegexTimeout, match="超过"):
+            V.search_user_regex(pattern, "x", budget)
+        assert budget.timed_out and time.perf_counter() - t0 < short_timeout
+
+
+def test_when_the_bounded_engine_cannot_take_a_pattern_it_is_unchecked_not_run_without_a_limit(monkeypatch):
+    """regex 装上了却编译不了换出来的写法: 报这次没查, 不退回没有时限的 re —— 不然一个 regex 不认的写法就绕过了时限。"""
+    monkeypatch.setattr(V, "_for_regex", lambda pattern, exact=False: ("(", False))
+    V._compiled.cache_clear()
+    try:
+        budget = V.RegexBudget(5)
+        with pytest.raises(V.RegexTimeout, match="编译不了"):
+            V.search_user_regex("示例", "这是示例", budget)
+        assert budget.timed_out
+    finally:
+        V._compiled.cache_clear()
+
+
+# ── 换了引擎, 结论一字不差(\w \d \s \b 照 re 的字集) ─────────────────────────────────────────────
+
+# 小红书正文里常见、两个引擎原生字集又判得不一样的字: emoji 后的 U+FE0F、连写 emoji 的 U+200D、keycap 的 U+20E3、组合重音、
+# ①②③、上标、分数、U+001C~001F、全角空格; 再加上 ASCII、Latin-1、常用汉字和标点
+_MIXED = ("示例正文❤\ufe0f好物分享👩\u200d💻，第①步②③ x²+y½ 1\ufe0f\u20e3 cafe\u0301 \x1c\x1d\u3000"
+          "ABC abc_123 #话题 www.example.com/#faq ！！ ı İ é É ß")
+_TEXTS = [_MIXED, "", " ", "①", "❤\ufe0f", "\x1c", "a", "Ab1_", "１２３", "\n\n", _MIXED * 30,
+          # {e} 这类(regex 的模糊匹配)、(?x) 下的全角空格、(?i) 下 regex 会扩的那几个字、\b 挨着字面量
+          "y", "x", "示", "加薇信", "加微{e<=1}信", "示例{e}", "x{e}", "\u3000", "a\u3000\u3000b", "！！\u3000",
+          "\u0345", "\u0399", "ẞß", "vx", " vx ", "made", "an ad", "ads_x", "x_\u3000", "13912345678"]
+_CORPUS = [
+    # 第 1 节、1b 节放行的那些
+    "最", "(?i)best|top", "第[一二三]名", "\\d{1,20}元", "(ab){1,10}", "^标题[:：]", "[a-z]+@[a-z]+\\.com",
+    "a*b*c", "\\d+\\.\\d+", "加.{0,3}微.{0,3}信", "\\d{1,3}\\d{1,3}", ".*私信.*", "a*+a*b",
+    "^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S", "品牌[\\s\\S]*品牌[\\s\\S]*品牌", "最(好|佳|强|便宜|有效)|第一(名|品牌)",
+    "[!！][\\s\\S]*[!！][\\s\\S]*[!！][\\s\\S]*[!！]", "\\n\\s*\\n\\s*\\n", "\\d+\\s*\\d+", "[!！]+\\s*[!！]+",
+    "原价.*\\d+", ".*[!！]{2,}", "(?:\\S+\\s+){5}\\S+", "(?:哈){5}", "(?:哈哈)+", "哈{5,}", "(?:\\d{1,3},)+\\d{3}",
+    "\\d+(?=元)", "\\d+(?!\\d)", "\\w+(?=\\s)", "(?<!\\d)\\d{11}(?!\\d)", "[^\\n]*(?=\\n)", "\\d+(?:\\.\\d+)?元",
+    "(?i)(?-i:a*)(?-i:A*)B", ".*\\n*x",
+    # 字集不一样的那几样
+    "^\\W", "\\W$", "[^\\w\\s]{2,}", "\\w+", "\\W+", "\\b\\w", "\\B\\w", "\\bwww\\b", "\\B", "\\s+", "\\S+", "\\d", "\\D+",
+    "[\\w-]+", "[^\\W\\d]+", "[\\s\\S]{3}", "(?a)\\w+", "(?a:\\W\\w)", "x(?a:\\W)", "(?a)x(?u:\\w)", "(?i)\\w+",
+    "[[:alpha:]]", "[[a]", "(?x) \\w+ # [注释\n x?", "(?#[\\w)\\w", "(\\w)\\1", "(?P<n>\\d)(?P=n)",
+    # re 当字面的 {: regex 认成模糊匹配(x{e} 配得上 y), 或者编译不了(codex review on aw#115 第五轮)
+    "x{e}", "示例{d}", "加微{e<=1}信", "示例{1,2}{e}", "x{e}?", "a{e}{e}", "a{}", "a{,}", "x{1, 2}", "(?x)x{1,\u30002}",
+    # (?x) 下 re 只跳过 ASCII 空白, 全角空格是字面的
+    "(?x)^\u3000{1,3}", "(?x)(\u3000+)", "(?x)a|\u3000*b", "(?x)！{2,}\u3000*", "(?x)\\b\\w\u3000+", "(?x)\\\u3000+",
+    # (?i) 下换出来的字集不按大小写扩; regex 预先算分支开头的字时会照折叠剔字
+    "(?i)[\\W]", "(?i)[^\\W\\d_]{2}", "(?i)[\\W\\d]", "(?i)[\\Wa]", "(?i)[^\\Wa]", "(?i)x|\\W", "(?i:x)|[^ιq]",
+    "(?i)\\bwechat\\b",
+    # \b 挨着英文字母数字的字面量时只看另一边
+    "\\bvx\\b", "\\bad\\b|\\bads\\b", "vx\\B", "\\Bd", "_\\b", "\\x41\\b", "\\d\\b", "a?\\b", "\\ba?", "\\b1[3-9]\\d{9}\\b",
+    "(?x)\\b a", "a\\bb", "a\\Bb",
+]
+
+
+@pytest.mark.filterwarnings("ignore::FutureWarning")      # [[:alpha:]] / [[a] 是 re 自己报的「可能是嵌套字集」
+@pytest.mark.parametrize("pattern", _CORPUS)
+def test_the_bounded_engine_finds_exactly_what_re_finds(pattern):
+    import re
+    for text in _TEXTS:
+        want = re.search(pattern, text)
+        got = V.search_user_regex(pattern, text, V.RegexBudget(5))
+        assert (got and (got.span(), got.groups())) == (want and (want.span(), want.groups())), (pattern, text[:30])
+
+
+def _bounded_spans(pattern: str, text: str) -> list:
+    """照 search_user_regex 选哪一份写法(正文里有 Python 不认识的字母数字时用 exact 那份), 列出所有匹配的位置。"""
+    rx, needs_exact, why = V._compiled(pattern)
+    assert rx is not None, why
+    if needs_exact and V._differs_from_re(text):
+        rx, _, why = V._compiled(pattern, True)
+        assert rx is not None, why
+    return [m.span() for m in rx.finditer(text)]
+
+
+_CLASS_PATTERNS = ("\\w", "\\W", "\\d", "\\D", "\\s", "\\S", "[\\w]", "[^\\w]", "[\\W\\d]", "[^\\W\\s]", "[\\w-]",
+                   "[^\\w\\s，]", "[\\s\\S]", "[^\\D\\S]", "(?a)\\w", "(?a)[\\W]", "x?(?a:\\s)", "(?i)\\w", "\\b", "\\B",
+                   "(?i)\\b", "(?i)[\\W]", "(?i)[^\\W]", "(?i)[^\\W\\d_]", "(?i)[\\W\\d]", "(?i)[\\w]", "(?i)[\\Wa]",
+                   "(?i)[^\\Wa]", "(?i)[\\sk]", "(?i)[^\\Dx]", "(?i)x|\\W", "(?i:x)|[^ιq]")
+
+
+def test_class_escapes_cover_exactly_the_characters_re_does():
+    """逐个码位比, 两份写法都比: 本机 Python 认识的码位(全部)走快的那份(属性写的字集); regex 新收、Python 还不认识的字母数字
+    (全部), 掺上每 7 个取一个的其余码位, 走 exact 那份。regex 原生的 \\w 含组合符、不含 ①², 直接换引擎 ^\\W 碰上「①」两边结论
+    相反; (?i) 下 regex 还会按大小写扩字集((?i)[\\W] 多认 Ι ß)。"""
+    import re
+    import unicodedata
+    every = "".join(chr(c) for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF)
+    known = "".join(c for c in every if unicodedata.category(c) != "Cn")
+    newer = "".join(V._FAST_W.findall("".join(c for c in every if unicodedata.category(c) == "Cn")))
+    mixed = known[::7] + newer + every[::7]
+    assert newer and not V._differs_from_re(known) and V._differs_from_re(mixed), "前提: 两段各走一份"
+    for pattern in _CLASS_PATTERNS:
+        for chars in (known, mixed):
+            assert _bounded_spans(pattern, chars) == [m.span() for m in re.finditer(pattern, chars)], pattern
+
+
+def test_the_exact_tables_can_be_written_on_this_python():
+    """exact 那份要求: re 认、regex 不认的字一个都没有(两个 Python 版本上都是), 不然写不出来、带新字的那几篇只能报没查。"""
+    assert V._exact_classes() is not None
+
+
+def test_ordinary_text_takes_the_fast_tables():
+    """emoji(连新 emoji)、①②、组合符、全角字两份结论一样, 走快的那份; 只有 Python 还不认识的字母数字才换 exact 那份。"""
+    assert not V._differs_from_re(_MIXED * 3 + "\U0001fae9\U0001fa77")
+    assert V._differs_from_re("示例\ua7cb")
+
+
+@pytest.mark.xfail(strict=True, reason="已知差异, 不值得再绕: (?i) 下 re 让 i/I 和土耳其语的 ı/İ 互认, regex 不认")
+def test_known_gap_turkish_dotless_i_under_ignorecase():
+    import re
+    assert bool(re.search("(?i)[a-z]", "ı")) == bool(V.search_user_regex("(?i)[a-z]", "ı"))
+
+
+@pytest.mark.xfail(strict=True, reason="已知差异, 不值得再绕: (?i) 下的回引, re 逐字比 lower(), regex 按大小写折叠(ſ 折成 s)")
+def test_known_gap_backreference_under_ignorecase():
+    import re
+    assert bool(re.search("(?i)(\\w)\\1", "ſs")) == bool(V.search_user_regex("(?i)(\\w)\\1", "ſs"))
+
+
+@pytest.mark.xfail(strict=True, reason="已知差异, 不值得再绕: 比 Python 新的 Unicode 才有的大小写对(Ɤ U+A7CB / ɤ), regex 照自己的表互认")
+def test_known_gap_case_pairs_newer_than_python_under_ignorecase():
+    import re
+    assert bool(re.search("(?i)\u0264", "\ua7cb")) == bool(V.search_user_regex("(?i)\u0264", "\ua7cb"))
+
+
+@pytest.mark.xfail(strict=True, reason="已知差异, 不值得再绕: 组内的 (?a:…) 管不到 regex 的不分大小写(只看整条正则的旗), "
+                                       "re 在组里只按 ASCII 互认")
+def test_known_gap_scoped_ascii_flag_under_ignorecase():
+    import re
+    assert bool(re.search("(?a:(?i:k))", "\u212a")) == bool(V.search_user_regex("(?a:(?i:k))", "\u212a"))
+
+
+def test_falls_back_to_re_when_regex_is_not_installed(monkeypatch):
+    """regex 包没装上就退回 re: 规则照查, 只是没有时限(还在闸后面、有长度上限)。装上了却跑不了的不退回(见上一节)。"""
+    monkeypatch.setattr(V, "_regex", None)
+    V._compiled.cache_clear()
+    try:
+        assert V.search_user_regex("示例\\w", "这是示例A").group(0) == "示例A"
+    finally:
+        V._compiled.cache_clear()

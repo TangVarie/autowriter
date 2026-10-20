@@ -229,6 +229,16 @@ def wants_tags(template: dict) -> bool:
     return bool(t.get("content") or t.get("fixed") or t.get("conditional"))
 
 
+def expected_parts(template: dict) -> tuple[str, ...]:
+    """模板要求每篇都带的部位(rulecheck.check 的 expects, codex review on aw#115): 评论 min ≥ 1 → comments; 写手要给话题
+    (content ≥ 1)或有固定话题 → tags。这些部位空着就是没交, 查「必须带的话术」时照没带报; 只有条件话题、评论 min 是 0、或者
+    压根不配的, 空着是这次本来就不交它, 不查。"""
+    tpl = validate(template)
+    t, c = tpl["tags"], tpl["comments"]
+    return tuple(part for part, on in (("tags", t["content"] >= 1 or bool(t["fixed"])),
+                                       ("comments", c is not None and c["min"] >= 1)) if on)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 拼
 # ══════════════════════════════════════════════════════════════════════

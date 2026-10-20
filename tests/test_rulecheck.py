@@ -607,3 +607,229 @@ def test_a_tag_both_passed_and_in_the_body_counts_once():
     """写手传的 tags 和正文末尾的 #话题 是同一批时只算一次: 按个数数的检查不能把同一个话题数两遍。"""
     parts = rulecheck._parts({"title": "t", "body": "正文一段。\n#话题一 #话题二", "tags": ["话题一", "#话题二", "话题三"]})
     assert parts["tags"] == ["话题一 话题二 话题三"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 正则限时: 没查完的不算命中, 也不能说成守住了(codex review on aw#115 第四轮)
+# ══════════════════════════════════════════════════════════════════════
+
+SLOW = "a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b"          # 闸放行(闸不改), 50 个 a 就 6 秒, 2000 个 a 永不返回
+
+
+@pytest.fixture
+def short_timeout(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "REGEX_SEARCH_TIMEOUT_SEC", 0.1)
+    validator.search_user_regex(SLOW, "x")       # 先编译好: 编译不算进时限
+    return 0.1
+
+
+def test_a_slow_regex_rule_is_reported_as_timed_out_not_as_a_hit(short_timeout):
+    rules = [_rule(1, "forbidden_regex", {"pattern": SLOW}),
+             _rule(2, "forbidden_regex", {"pattern": "示例禁词"}),
+             _rule(3, "forbidden_word", {"words": ["示例禁词"]}, severity="soft")]
+    drafts = [{"title": "a" * 2000, "body": "a" * 2000 + "示例禁词"} for _ in range(20)]
+    t0 = time.perf_counter()
+    hits, stats = rulecheck.check(rules, drafts)
+    assert time.perf_counter() - t0 < 10 * short_timeout, "一条慢正则一次 check 只花一份时限, 不是每篇每个部位各一份"
+    assert stats == {"rules": 3, "skipped": 0, "timed_out": ["m-1"]}
+    assert {h["rule_id"] for h in hits} == {"m-2", "m-3"} and len(hits) == 40, "别的规则照旧逐篇查"
+
+
+def test_a_hit_found_before_the_time_ran_out_is_still_reported(short_timeout):
+    """时限是在搜到之后才用完的: 搜到的那一处是真的, 照报; 这条同时报没查完(后面的稿子没搜)。"""
+    rule = _rule(1, "forbidden_regex", {"pattern": "a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b|示例禁词", "where": ["title", "body"]})
+    hits, stats = rulecheck.check([rule], [{"title": "示例禁词", "body": "a" * 2000}, {"title": "示例禁词", "body": "b"}])
+    assert [(h["index"], h["where"]) for h in hits] == [(0, "title")]
+    assert stats["timed_out"] == ["m-1"]
+
+
+def test_ordinary_regex_rules_hit_exactly_as_before():
+    """换成限时的引擎之后, 正常的正则命中一模一样(emoji、①、组合符这些两个引擎原生字集不一样的字也一样)。"""
+    rules = [_rule(1, "forbidden_regex", {"pattern": "^\\W", "where": ["title"]}),
+             _rule(2, "forbidden_regex", {"pattern": "[^\\w\\s]{3,}", "where": ["body"]}, severity="soft"),
+             _rule(3, "forbidden_regex", {"pattern": "\\bad\\b", "where": ["body"]}),
+             _rule(4, "forbidden_regex", {"pattern": "\\d+(?:\\.\\d+)?元", "where": ["body"]})]
+    drafts = [{"title": "①先说结论", "body": "好物❤️❤️分享 this ad 9.9元"},
+              {"title": "❤️开头", "body": "made 九块九"},
+              {"title": "普通标题", "body": "！！！ 三个感叹号"}]
+    hits, stats = rulecheck.check(rules, drafts)
+    assert "timed_out" not in stats
+    assert [(h["index"], h["rule_id"], h["what"]) for h in hits] == [
+        (0, "m-3", "必须改: 正文里有不该出现的写法「ad」"),
+        (0, "m-4", "必须改: 正文里有不该出现的写法「9.9元」"),
+        (0, "m-2", "建议改: 正文里有不该出现的写法「❤️❤️」"),
+        (1, "m-1", "必须改: 标题里有不该出现的写法「❤」"),
+        (2, "m-2", "建议改: 正文里有不该出现的写法「！！！」")]
+
+
+def test_score_drafts_lists_the_unchecked_rule_and_never_calls_it_held(short_timeout):
+    c = desk_client(memories=[_rule(1, "forbidden_regex", {"pattern": SLOW}),
+                              _rule(2, "forbidden_word", {"words": ["不会出现的词"]}, severity="soft")])
+    drafts = distinct_drafts(2)
+    drafts[0]["body"] += "a" * 2000
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert out["written"] == 2 and "rule_checks" not in out
+    assert out["rule_checks_unchecked"] == [{"rule_id": "m-1", "severity": "hard",
+                                             "what": "硬约束·没查完: 这条规则的正则这次没查完(超时或者限时的引擎跑不了), "
+                                                     "算没查, 不是查出了违规"}]
+    # 「必须改」在 rule_checks 里是"这篇查出了违规": 没查完的不能用这个开头, 不然写手会跟用户说稿子违规了(codex review on aw#115)
+    assert not any(u["what"].startswith(tuple(rulecheck.SEVERITY_LABEL.values())) for u in out["rule_checks_unchecked"])
+    assert "rule_checks_unchecked" in out["next_step"] and "不能跟用户说这几条守住了" in out["next_step"]
+    assert "不是查出了违规" in out["next_step"]
+    assert c.rows["batch_metrics"][0]["meta"]["rule_checks"]["timed_out"] == ["m-1"]
+
+
+def test_an_ordinary_boundary_rule_reports_its_hit_on_a_normal_batch():
+    """20 篇各一千来字, 最后一篇里有一处: 照常报命中, 不能因为换了限时的引擎就慢到报成没查(codex review on aw#115 第五轮 ——
+    早先 \\w 列成七百多段的显式字集, 这一批 0.1 秒就到点, 真命中只出现在 rule_checks_unchecked 里)。"""
+    drafts = distinct_drafts(20)
+    for d in drafts:
+        d["body"] = d["body"] * 4
+    drafts[-1]["body"] += " 示例联系 vx 详聊"
+    c = desk_client(memories=[_rule(1, "forbidden_regex", {"pattern": r"\b(?:vx|wx|dd)\b"}),
+                              _rule(2, "forbidden_regex", {"pattern": r"\bvx\b|\bwx\b|\bdd\b"})])
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert "rule_checks_unchecked" not in out
+    assert [(h["index"], h["rule_id"], h["what"]) for h in out["rule_checks"]] == [
+        (19, "m-1", "必须改: 正文里有不该出现的写法「vx」"), (19, "m-2", "必须改: 正文里有不该出现的写法「vx」")]
+
+
+def test_a_check_with_nothing_slow_carries_no_unchecked_marker():
+    out = core.commit_drafts(desk_client(memories=[_rule(1, "forbidden_regex", {"pattern": "不会出现"})]), PROJ,
+                             distinct_drafts(1), user_id=ME)
+    assert "rule_checks_unchecked" not in out and "rule_checks_unchecked" not in out["next_step"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 必须带的话术: 模板要求的部位空着就是没带(codex review on aw#115)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_an_expected_part_left_empty_counts_as_missing_the_phrase():
+    rule = _rule(1, "required_phrase", {"any": ["示例口播"], "where": ["comments"]})
+    draft = {"title": "t", "body": "b"}
+    assert rulecheck.check([rule], [draft])[0] == [], "模板不要求评论: 评论常常是后面另走评论那一步写的, 不查"
+    hits = rulecheck.check([rule], [draft], expects=("comments",))[0]
+    assert [h["what"] for h in hits] == ["必须改: 评论里没有「示例口播」中的任何一个(这篇没带评论)"]
+    tagged = _rule(2, "required_phrase", {"any": ["示例话题"], "where": ["tags"]})
+    assert rulecheck.check([tagged], [draft], expects=("comments",))[0] == []
+    assert len(rulecheck.check([tagged], [draft], expects=("tags",))[0]) == 1
+
+
+def _tpl(**kw) -> str:
+    return json.dumps({"delivery": {"layout": "blocks", **kw}}, ensure_ascii=False)
+
+
+_COMMENTS = {"label_reader": "读者：", "label_author": "作者："}
+
+
+@pytest.mark.parametrize("default_params, expect_hit", [
+    (_tpl(comments={"min": 1, "max": 2, **_COMMENTS}), True),
+    (None, False),
+    (_tpl(comments={"min": 0, "max": 2, **_COMMENTS}), False),
+    (_tpl(tags={"content": 1}), False),
+], ids=["template-expects-comments", "no-template", "template-min-0", "template-without-comments"])
+def test_a_comment_phrase_rule_at_scoring_follows_the_template(default_params, expect_hit):
+    rule = _rule(1, "required_phrase", {"any": ["示例口播"], "where": ["comments"]})
+    c = desk_client(default_params=default_params, memories=[rule])
+    drafts = distinct_drafts(1)
+    drafts[0]["tags"] = ["话题一"]
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    got = [(h["rule_id"], h["where"]) for h in out.get("rule_checks", [])]
+    assert got == ([("m-1", "comments")] if expect_hit else [])
+    with_phrase = distinct_drafts(1, seed=3)
+    with_phrase[0].update(tags=["话题一"], comments=[{"role": "reader", "text": "示例口播在这里"}])
+    assert "rule_checks" not in core.commit_drafts(c, PROJ, with_phrase, user_id=ME), "带了就不报"
+
+
+@pytest.mark.parametrize("tags_tpl, expect_hit", [
+    ({"content": 2}, True),
+    ({"content": 0, "conditional": [{"when_any": ["不会出现"], "add": "条件话题"}]}, False),
+    (None, False),
+], ids=["template-asks-for-tags", "only-conditional-tags", "no-template"])
+def test_a_tag_phrase_rule_at_scoring_follows_the_template(tags_tpl, expect_hit):
+    rule = _rule(1, "required_phrase", {"any": ["示例话题"], "where": ["tags"]})
+    c = desk_client(default_params=None if tags_tpl is None else _tpl(tags=tags_tpl), memories=[rule])
+    out = core.commit_drafts(c, PROJ, distinct_drafts(1), user_id=ME)
+    assert [h["rule_id"] for h in out.get("rule_checks", [])] == (["m-1"] if expect_hit else [])
+
+
+def test_fixed_tags_from_the_template_count_as_tags_given():
+    """有固定话题的模板: 话题行永远不空, 照常查(固定话题里有就算带了)。"""
+    rules = [_rule(1, "required_phrase", {"any": ["示例固定"], "where": ["tags"]}),
+             _rule(2, "required_phrase", {"any": ["别的话题"], "where": ["tags"]})]
+    c = desk_client(default_params=_tpl(tags={"content": 0, "fixed": ["示例固定"]}), memories=rules)
+    out = core.commit_drafts(c, PROJ, distinct_drafts(1), user_id=ME)
+    assert [h["rule_id"] for h in out["rule_checks"]] == ["m-2"]
+
+
+def test_the_generation_path_never_judges_a_comment_or_tag_phrase_rule():
+    """AW 生成链路(validator.check_hard_rules)只看得到标题正文: 只管评论 / 话题的必须带的话术它一律跳过(_spec_from_desk),
+    不管模板要不要 —— 生成出来的东西里本来就没有评论。"""
+    for where in (["comments"], ["tags"], ["body", "comments"]):
+        rule = _rule(1, "required_phrase", {"any": ["示例口播"], "where": where})
+        assert validator.check_hard_rules([rule], title="t", body="b") == [], where
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 查词的词边界只加在字母数字那一头(codex review on aw#115)
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("text, term, found", [
+    ("详情见 www.example.com", "www.", True),
+    ("WWW.EXAMPLE.COM", "www.", True),
+    ("wwww.example", "www.", False),
+    ("官网 example.com 有", ".com", True),
+    ("example.community", ".com", False),
+    ("学C++入门", "c++", True),
+    ("x a.b y", "a.b", True),
+    ("a.b.c", "a.b", True),
+    ("xa.b", "a.b", False),
+    ("made in", "ad", False),
+    ("an AD here", "ad", True),
+    ("/path/", "/path/", True),
+    # 不是纯英文的词也照两头的字算: 开头是字母的那一头要边界, 中文 / 标点那一头不要(codex review on aw#115 第五轮)
+    ("我开了 Apple TV+ 会员", "v+", False),
+    ("加v+", "v+", True),
+    ("家里TV信号不好", "V信", False),
+    ("加V信", "V信", True),
+    ("abc++", "c++", False),
+    ("学了 ObjC++", "c++", False),
+    ("全民K歌", "K歌", True),
+    ("OK歌", "K歌", False),
+    ("这是示例词", "示例", True),
+])
+def test_word_boundaries_apply_only_at_alphanumeric_edges(text, term, found):
+    assert validator.contains_term(text, term) is found
+
+
+def test_rulecheck_and_the_generation_path_share_the_term_matcher():
+    assert rulecheck._has is validator.contains_term
+    forbid = _rule(1, "forbidden_word", {"words": ["www."]})
+    need = _rule(2, "required_phrase", {"any": ["www."], "where": ["body"]})
+    draft = {"title": "t", "body": "详情见 www.example.com"}
+    assert [h["rule_id"] for h in rulecheck.check([forbid, need], [draft])[0]] == ["m-1"]
+    assert [h["kind"] for h in validator.check_hard_rules([forbid, need], **draft)] == ["forbidden_word"]
+    mixed = _rule(3, "forbidden_word", {"words": ["V信", "v+"]})
+    clean = {"title": "t", "body": "家里TV信号不好, 开了 Apple TV+ 会员"}
+    assert rulecheck.check([mixed], [clean])[0] == [] and validator.check_hard_rules([mixed], **clean) == []
+    dirty = {"title": "t", "body": "加V信 详聊"}
+    assert [h["what"] for h in rulecheck.check([mixed], [dirty])[0]] == ["必须改: 正文里有禁用词「V信」"]
+    assert [h["match"] for h in validator.check_hard_rules([mixed], **dirty)] == ["V信"]
+
+
+@pytest.mark.parametrize("kind, target, title, body, hit", [
+    ("forbidden_word", "ad", "t", "made in", False),
+    ("forbidden_word", "AD", "t", "an ad here", True),
+    ("forbidden_word", "示例词", "t", "这里有示例词", True),
+    ("required_phrase", "ad", "t", "made in", True),
+    ("required_phrase", "AD", "t", "an ad here", False),
+    ("required_phrase", "示例话术", "", "", False),
+])
+def test_legacy_target_rows_get_the_same_answer_on_both_paths(kind, target, title, body, hit):
+    """AW 的 Streamlit 界面还在写老形状 {"target": X}: 写作台把它读成词表(rulecheck._from_legacy), 生成链路原来在"标题\\n正文"里
+    分大小写找子串 —— "made" 算出现了 "ad"、"an ad" 又不算出现了 "AD", 两边结论相反(codex review on aw#115 第五轮)。"""
+    rule = _rule(1, kind, {"target": target})
+    desk = rulecheck.check([rule], [{"title": title, "body": body}])[0]
+    gen = validator.check_hard_rules([rule], title=title, body=body)
+    assert bool(desk) is hit and bool(gen) is hit

@@ -20,8 +20,8 @@
        - ``forbidden_word`` ：``{"target": "X"}``
        - ``required_phrase``：``{"target": "X"}``
        - ``max_len``        ：``{"scope": "标题"|"正文"|"开头", "n": N}``
-       - ``forbidden_regex``：``{"pattern": "..."}`` ─ 用 re.search，
-         可用内联标志 ``(?i)`` 不区分大小写
+       - ``forbidden_regex``：``{"pattern": "..."}`` ─ re 的写法，
+         可用内联标志 ``(?i)`` 不区分大小写；先过安全闸, 再限时执行(search_user_regex)
      不传 ``rule_kind`` 或传 ``"free_text"`` 时退回到下面的正则抽取。
   2. **禁用词 / 片段**："禁止 X" / "不要 X" / "不得 X" / "别用 X" /
      "避免 X" → 检查 title+body 是否含 X
@@ -44,7 +44,9 @@
 from __future__ import annotations
 
 import functools
+import logging
 import re
+import time
 from typing import Optional
 
 
@@ -55,9 +57,13 @@ from typing import Optional
 # 翻一倍 —— 正文上百字就是永不返回。
 #
 # ⚠️ **靠截断正文兜不住**: 回溯是输入长度的**指数**, 截到 100 字仍然是 2^100。
-#    Python 的 ``re`` 又**没有超时**(第三方 ``regex`` 才有, 为这一条引一个新
-#    依赖不值当), 而且它在 C 里跑, 线程超时也打不断。
-#    所以吃重的那一层只能是**写入时拒绝危险形状**, 执行期的长度上限只是兜底。
+#    Python 的 ``re`` 又**没有超时**, 而且它在 C 里跑, 线程超时也打不断。
+#
+# 两层(codex review on aw#115 第四轮之后改成这样):
+#   1. **写入时拒绝危险形状**(下面这道静态闸)。它是**尽力而为的过滤**, 不是判定: 四轮 review 每轮都找到新的漏网形状。
+#      闸的放行 / 拒绝不再改 —— Jev 的 /compile_rules 一字不差地镜像它, 改了两边就对不上。
+#   2. **执行期限时**(``search_user_regex``, 见 MAX_REGEX_TARGET_CHARS 后面那一节): 用第三方 ``regex`` 包的 search(timeout=…)。
+#      漏过闸的正则最多花一份时限(config.REGEX_SEARCH_TIMEOUT_SEC), 报成"这次没查", 不算命中、也不算守住了。
 
 _MAXREPEAT = getattr(re, "MAXREPEAT", 4294967295)
 
@@ -478,7 +484,8 @@ def assert_regex_is_safe(pattern: str) -> None:
 
     ⚠️ 这**不是**完备的判定 —— 重叠分支型(``(a|a)+``)和某些前后缀组合它抓不到,
     那类需要真正的回溯代价分析。它挡住的是实际会被人写出来的那一类
-    (嵌套无上界量词), 并且**不谎称**自己挡住了全部: 执行期那道长度上限还在。
+    (嵌套无上界量词), 并且**不谎称**自己挡住了全部: 执行期还有限时(``search_user_regex``)
+    和长度上限, 漏过去的最多花一份时限、报成没查。
     """
     if not isinstance(pattern, str) or not pattern:
         raise UnsafeRegex("正则为空")
@@ -524,9 +531,419 @@ def regex_is_safe(pattern: str) -> bool:
     return True
 
 
-# 执行期喂给 re.search 的正文上限。**这不是主要防线**(见上), 只是让"漏网的
+# 执行期喂给正则的正文上限。**这不是主要防线**(见上), 只是让"漏网的
 # 危险形状"和"单纯很慢的正则"都有个天花板。正常稿件远在这个数以内。
 MAX_REGEX_TARGET_CHARS = 20_000
+
+
+# ── 执行期限时(codex review on aw#115 第四轮) ──────────────────────────────────────────────
+# 闸放行的 a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b(两个字的字面量 aa 能落在很多位置, 隔不开前后的 a*, 闸却当它是隔断)50 个 a 就
+# 6 秒, 2 万字的上限之内能把共享的服务进程握着 GIL 卡住几分钟。闸再补一个洞还会有下一个, 所以根上的办法是执行期限时:
+# 第三方 regex 包(mrab-regex)的 search 收 timeout, 到点抛 TimeoutError。两处执行(这里的 check_hard_rules、写作台的
+# rulecheck)都只走 search_user_regex。超时不算命中、也不往外抛: 调用方把这条规则当"这次没查"(rulecheck 报进
+# stats["timed_out"], 这里跳过并记日志), 不能当守住了。
+#
+# ⚠️ 时限是**一条规则在一次检查里共用的一份**(RegexBudget), 不是每搜一次一份: 一批 20 篇 × 几个部位, 每次都差一点到点的话
+#    加起来就不止一份了。用完的那条后面的稿子不再搜。所以一次检查最多多花约 (正则规则条数) × REGEX_SEARCH_TIMEOUT_SEC: 到点之后
+#    regex 隔一阵才看一次表, 实测最多再拖两成多; 这个进程第一次用到这条正则时的换写法、编译也从这一份里扣(打断不了, 但换出来的
+#    写法有长度上限 MAX_TRANSLATED_CHARS, 编一次 0.1 秒以内)。正常的规则一批 20 篇 × 1500 字实测几毫秒到十几毫秒(十个词的
+#    \b 词表不到 1 毫秒), 一份 0.1 秒够查完 —— 前提是下面换写法时字集用属性写, 别逐个码位列(见下)。
+#
+# ⚠️ regex 的默认语法(VERSION0)和 re 几乎一样, 但有几处不一样, 小红书正文里还正好常见。喂给 regex 之前先换写法(_for_regex),
+#    结论和 re 一样(tests/test_regex_safety.py 逐个码位比字集、拿闸放行的那批正则 × 含 emoji / ①② 的正文比 search 的结果):
+#    · \w \W \d \D \s \S \b \B: regex 的 \w 含组合符(emoji 后面的 U+FE0F、连写 emoji 中间的 U+200D), 不含 ①②③ ² ½, re 正相反;
+#      \s 在 re 里多 U+001C~001F。直接换引擎的话 ^\W 碰上「①」两边结论相反。换成用 Unicode 属性写的字集: \w = [\p{L}\p{N}_]、
+#      \d = \p{Nd}, \s 是 str.isspace() 那 29 个字(写死, 测试逐个码位和 re 比)。⚠️ 别再逐个码位列显式字集(codex review on
+#      aw#115 第五轮): \w 一个就七百多段、14 KB, regex 每走一步挨个比, 普通的 \bvx\b 一批 20 篇就超时、真命中丢了, 编译一条
+#      \b 词表也要几秒。属性写法在本机 Python 认识的每个码位上都和 re 一样; 只有 regex 的 Unicode 表比 Python 自带的新, 新收的
+#      字母数字(3.13 上两万多个: 汉字扩展 J 区、几种新文字、新的拉丁字母 Ɤ 等)re 一律不算 \w \d —— 正文里真有这种字时
+#      (_differs_from_re, 一篇算一次)这篇改用 exact 那份写法(把它们去掉, 慢几倍, 第一次碰上时才算、才编译)。新 emoji 两边都不算 \w。
+#    · 字集里的 [(regex 认成嵌套 / POSIX 字集 [:alpha:]): 字集照 re 自己的解析树重写成显式的字和区间。
+#    · re 不当量词的 {: {e} {d} {e<=1} 在 regex 里是模糊匹配(x{e} 能配上 y), 转义成字面的 \{。
+#    · (?x) 下 re 只跳过 ASCII 的空白, regex 还跳过全角空格等 23 个字: 那些转义成字面的。
+#    · (?i) 下 re 不按大小写扩 \w 这类字集, regex 会扩((?i)[\W] 多认 Ι ß): 换出来的字集包一层 (?-i:…); 字集里有它们时拆开写,
+#      别的字照旧不分大小写。regex 自己还有个毛病要绕(见 _for_regex 里的 folds): 分支里有不分大小写的时候, 分大小写的取反字集
+#      开头的分支会漏字。
+#    · \b 挨着一定要配上的英文字母数字(\bvx\b)时只看另一边: 少两个环视, regex 还能先找字面量, \b 词表快几百倍。
+#    还剩几处 (?i) 下的不一样, 写规则用不到, 不再绕(test_known_gap_*): 土耳其语的 ı / İ; 回引((?i)(\w)\1 —— re 比的是 lower(),
+#    regex 按大小写折叠, ſ 和 s 算同一个); 比 Python 新的 Unicode 才有的大小写对(Ɤ 和 ɤ); 组内的 (?a:…) (?u:…) 碰上不分大小写
+#    (regex 不分大小写时只看整条正则的旗, 组里的 a / u 管不到: (?a:(?i:k)) 在 regex 里认 K 开尔文符号, re 不认)。
+# regex 装不上就退回 re(仍在闸后面、仍有长度上限, 只是没有时限), 记一次日志。装上了却跑不了的(换过的写法太长、regex 编译不了、
+# 拿不到 re 的解析树)不退回没有时限的 re: 报成这次没查(RegexTimeout), 记一次日志 —— 不然一个 regex 不认的写法就能把闸后面
+# 那道时限整个绕过去(a*aaa*…b|示例{1,2}{e} 曾经就这样跑进 re, 2000 个 a 永不返回)。
+try:
+    import regex as _regex
+except ImportError:                                  # pragma: no cover — requirements.lock 里有, 缺了只是退回 re
+    _regex = None
+_logger = logging.getLogger("validator")
+_REGEX_MISSING_LOGGED = [False]
+
+
+class RegexTimeout(Exception):
+    """用户正则这次没查成: 没在时限内跑完, 或者限时的引擎跑不了它(见 _compiled; 消息里是哪一种)。不算命中, 也不算没命中 ——
+    这条规则这次没查。"""
+
+
+def regex_search_timeout() -> float:
+    """一条正则规则在一次检查里共用的时限(秒), config.REGEX_SEARCH_TIMEOUT_SEC。config 读不了就用 0.1。"""
+    try:
+        import config
+        return float(config.REGEX_SEARCH_TIMEOUT_SEC)
+    except Exception:                                # noqa: BLE001 — 增强项的配置坏了退回默认, 不拖垮查规则
+        return 0.1
+
+
+class RegexBudget:
+    """一条用户正则在一次检查里共用的那一份时间。search_user_regex 每搜一次从这里扣(搜的时间, 加上这个进程第一次用这条正则时
+    换写法、编译的时间); 扣完了再搜就直接抛 RegexTimeout, 不再跑。``timed_out``: 这一份里有没有哪次没查成(调用方据此报
+    "这条这次没查完")。"""
+    __slots__ = ("left", "timed_out")
+
+    def __init__(self, seconds: Optional[float] = None):
+        self.left = regex_search_timeout() if seconds is None else float(seconds)
+        self.timed_out = False
+
+
+# 换出来的写法的长度上限。regex 编译中途打断不了, 编译时间跟着换出来的长度走(一个 \b 换成七十来个字, 挨着英文字母数字的只要
+# 三十来个); 闸不管正则多长, 这是执行期唯一卡住编译的地方: 超过就不编译, 报这次没查。实测 3 万字(四百个 \b 连写)编译 0.1 秒,
+# 一条 30 个词的 \b 词表换出来一千多字、编译几毫秒。exact 那份(见上)一个 \b 就几千字, 词表写到二三十个词会碰上这条, 那时只有
+# 带新收的字母数字的那几篇报没查。
+MAX_TRANSLATED_CHARS = 30_000
+
+# re 认的字(str.isalnum() 或 _ / str.isdecimal() / str.isspace()), 写成 regex 的字集正文(不带方括号)
+_ASCII_CLASS = {"w": "\\x30-\\x39\\x41-\\x5a\\x5f\\x61-\\x7a", "d": "\\x30-\\x39", "s": "\\x09-\\x0d\\x20"}
+_SPACE = "\\x09-\\x0d\\x1c-\\x20\\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000"
+_FAST_CLASS = {"w": "\\p{L}\\p{N}_", "d": "\\p{Nd}", "s": _SPACE}
+# \w 的反面: 除了字母(L)数字(N)之外的大类, Pc 里除了 _ 的那几个另列(见 _exact_classes)
+_NOT_WORD_PROPS = "\\p{M}\\p{Pd}\\p{Ps}\\p{Pe}\\p{Pi}\\p{Pf}\\p{Po}\\p{S}\\p{Z}\\p{C}"
+_RE_VERBOSE_SPACE = frozenset(" \t\n\r\x0b\x0c")     # (?x) 下 re 跳过的空白; regex 跳过的是 str.isspace() 的全部
+if _regex is not None:
+    _FAST_W, _FAST_D = _regex.compile("[" + _FAST_CLASS["w"] + "]"), _regex.compile(_FAST_CLASS["d"])
+
+
+def _ranges(chars) -> str:
+    out: list[list[int]] = []
+    for c in sorted(set(map(ord, chars))):
+        if out and out[-1][1] == c - 1:
+            out[-1][1] = c
+        else:
+            out.append([c, c])
+    return "".join(f"\\U{a:08x}" if a == b else f"\\U{a:08x}-\\U{b:08x}" for a, b in out)
+
+
+@functools.lru_cache(maxsize=None)
+def _exact_classes() -> Optional[dict]:
+    """exact 那份字集: \\w \\d 去掉 regex 认、re 不认的字(Python 的 unicodedata 还不认识的新字母数字)。都写成「反面」(取反用):
+    \\w = [^ 非字母数字的大类 + Pc 里除 _ 的 + 那些新字], \\d = [^ \\P{Nd} + 新数字]。整个码位表扫一遍, 零点几秒, 只在正文里真有
+    这种字时才算(一个进程一次)。反过来 re 认、regex 不认的字现在一个都没有(两个 Python 版本都是); 哪天有了这份就写不出来, 返回
+    None, 这几篇报没查。"""
+    re_w, re_d, re_nw, re_nd = (re.compile(p) for p in ("\\w", "\\d", "\\W+", "\\D+"))
+    rx_nw, rx_nd, rx_pc = (_regex.compile(p) for p in ("[^" + _FAST_CLASS["w"] + "]+", "\\P{Nd}+", "\\p{Pc}"))
+    extra_w, extra_d, missing, pc = [], [], [], []
+    for lo, hi in ((0, 0xD800), (0xE000, 0x110000)):
+        s = "".join(map(chr, range(lo, hi)))
+        extra_w += (m.group() for run in re_nw.finditer(s) for m in _FAST_W.finditer(run.group()))
+        extra_d += (m.group() for run in re_nd.finditer(s) for m in _FAST_D.finditer(run.group()))
+        missing += (m.group() for run in rx_nw.finditer(s) for m in re_w.finditer(run.group()))
+        missing += (m.group() for run in rx_nd.finditer(s) for m in re_d.finditer(run.group()))
+        pc += (c for c in rx_pc.findall(s) if c != "_")
+    if missing:
+        return None
+    return {"w": (_NOT_WORD_PROPS + _ranges(pc) + _ranges(extra_w), True),
+            "d": ("\\P{Nd}" + _ranges(extra_d), True),
+            "s": (_SPACE, False)}
+
+
+@functools.lru_cache(maxsize=64)
+def _differs_from_re(text: str) -> bool:
+    """这段正文里有没有快的那份字集(_FAST_CLASS)和 re 结论不一样的字(re 的 \\w 是 str.isalnum() 或 _, \\d 是 str.isdecimal())。
+    只看出现过的那几种字, 一篇两万字也就零点几毫秒; 同一篇被好几条规则搜, 记住结论。"""
+    chars = "".join(set(text))
+    return (set(_FAST_W.findall(chars)) != {c for c in chars if c.isalnum() or c == "_"}
+            or set(_FAST_D.findall(chars)) != {c for c in chars if c.isdecimal()})
+
+
+_FLAG_GROUP = re.compile(r"\(\?([aiLmsux]*)(?:-([imsx]*))?([:)])")
+# re 当量词的 {: 紧跟 ASCII 数字(可带一个逗号), 再接 }。别的 { 在 re 里都是字面的({e} {} {1, 2} {x})
+_QUANTIFIER = re.compile(r"\{(?:[0-9]+(?:,[0-9]*)?|,[0-9]*)\}")
+_CATEGORY_ESCAPE = {"CATEGORY_WORD": "w", "CATEGORY_NOT_WORD": "W", "CATEGORY_DIGIT": "d", "CATEGORY_NOT_DIGIT": "D",
+                    "CATEGORY_SPACE": "s", "CATEGORY_NOT_SPACE": "S"}
+_UNIVERSE = "\\x00-\\U0010ffff"
+_WORD_ASCII = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz")
+_DIGITS = frozenset("0123456789")
+_CLASS_ESCAPES = frozenset("wWdDsS")
+_HEX_DIGITS = frozenset("0123456789ABCDEFabcdef")
+
+
+class _Untranslatable(Exception):
+    """换不出和 re 结论一样的写法(re 的解析树里有这里不认识的东西, 或者 exact 那份写不出来)。"""
+
+
+def _set_items(text: str) -> tuple[bool, str, list[str]]:
+    """一个字集的原文([…])照 re 自己的解析树拆开: (取反, 普通的字和区间写成的字集正文, [类别转义 w W d D s S …])。
+    不照原文抄: [ 在 regex 里是嵌套 / POSIX 字集的开头, 拆掉 \\w 之后剩下的原文拼起来还可能多出区间(x-y-\\da → x-y-a)。"""
+    tree = _parse_pattern(text)
+    if tree is None or len(tree) != 1:
+        raise _Untranslatable(text)
+    op, av = tree[0]
+    if str(op) in ("LITERAL", "NOT_LITERAL"):
+        return str(op) == "NOT_LITERAL", f"\\U{av:08x}", []
+    if str(op) != "IN":
+        raise _Untranslatable(text)
+    negate, raw, escapes = False, [], []
+    for item_op, item in av:
+        name = str(item_op)
+        if name == "NEGATE":
+            negate = True
+        elif name == "LITERAL":
+            raw.append(f"\\U{item:08x}")
+        elif name == "RANGE":
+            raw.append(f"\\U{item[0]:08x}-\\U{item[1]:08x}")
+        elif name == "CATEGORY" and str(item) in _CATEGORY_ESCAPE:
+            escapes.append(_CATEGORY_ESCAPE[str(item)])
+        else:
+            raise _Untranslatable(text)
+    return negate, "".join(raw), escapes
+
+
+def _for_regex(pattern: str, exact: bool = False) -> Optional[tuple[str, bool]]:
+    """把 re 的写法换成 regex 包里结论一样的写法(为什么要换、换哪几样见上): (换好的, 用没用到 Unicode 下的 \\w \\d \\b)。后一样
+    为真时, 正文里有 _differs_from_re 的字就得用 exact=True 那份。拿不到 re 的解析树(不知道全局的 (?a) (?x) (?i))、或者换不出来,
+    返回 None。
+
+    加的组全是不捕获的, 回引的组号不变。跟着组里的旗走: (?a:…) 里换成 ASCII 的字集、(?u:…) 里换回 Unicode 的; (?i:…) (?-i:…)
+    决定换出来的字集要不要包 (?-i:…); (?x) 下 # 到行尾是注释、原样抄; (?#…) 原样抄; \\N{…} 原样抄。
+
+    ⚠️ re 自己有一处不一致, 这里不跟: 整条正则以组内换了 ASCII / Unicode 的字集开头时((?a:\\W)…、(?a)(?u:\\w)…), re 扫起点用的是
+    全局旗算出来的字集, 会跳过组里其实认的字 —— (?a:\\W) 在「物」上不成立, x(?a:\\W) 在「x物」上又成立。这里照 re 文档的意思(组里的旗
+    说了算)换, 只有这种开头的写法两边会不一样, 写规则用不到。"""
+    tree = _parse_pattern(pattern)
+    if tree is None:
+        return None
+    flags = getattr(getattr(tree, "state", None), "flags", 0) or 0
+    ascii_, verbose, ignore = bool(flags & re.ASCII), bool(flags & re.VERBOSE), bool(flags & re.IGNORECASE)
+    unicode_word = False
+
+    def cls(esc: str) -> tuple[str, bool]:
+        """一个类别转义 → (字集正文, 取不取反): 认的字是 [正文] 或 [^正文]。"""
+        nonlocal unicode_word
+        base = esc.lower()
+        if ascii_:
+            content, inverted = _ASCII_CLASS[base], False
+        elif base == "s" or not exact:
+            content, inverted = _FAST_CLASS[base], False
+        else:
+            table = _exact_classes()
+            if table is None:
+                raise _Untranslatable(pattern)
+            content, inverted = table[base]
+        unicode_word = unicode_word or (base != "s" and not ascii_)
+        return content, inverted != esc.isupper()
+
+    # 整条正则里哪儿开了 (?i), 取反的字集前面就都垫一个什么字都认的前瞻 (?=(?s:.))。regex 自己的毛病: 一组分支里有不分大小写的,
+    # 别的分支开头是分大小写的取反字集时, 它预先算「这个分支能以哪些字开头」用的是大小写折叠, 把折叠后落进字集的字剔掉了 ——
+    # (?i:x)|[^ιq] 碰上 U+0345(折成 ι), re 配得上、regex 配不上; 换出来的 (?i)x|(?-i:[^\p{L}\p{N}_]) 也一样。垫了前瞻它就不预先算了。
+    folds = ignore or any("i" in m.group(1) for m in _FLAG_GROUP.finditer(pattern))
+
+    def guarded(s: str, negated: bool) -> str:
+        return f"(?:(?=(?s:.)){s})" if negated and folds else s
+
+    def bare(content: str, inverted: bool, keep_case: bool) -> str:
+        s = ("[^" if inverted else "[") + content + "]"
+        return f"(?-i:{s})" if keep_case else s
+
+    def one(content: str, inverted: bool) -> str:
+        # (?i) 下 re 不按大小写扩这类字集((?i)\W 不认 Ι), regex 会扩: 包一层 (?-i:…)
+        return guarded(bare(content, inverted, ignore), inverted)
+
+    def char_set(negate: bool, raw: str, escapes: list[str]) -> str:
+        if not escapes:
+            return guarded(bare(raw, negate, False), negate)
+        if {e for e in escapes if e.islower()} & {e.lower() for e in escapes if e.isupper()}:
+            return ("[^" if negate else "[") + _UNIVERSE + "]"          # [\s\S] 这种: 什么字都认
+        classes = [cls(e) for e in escapes]
+        plain = "".join(c for c, inverted in classes if not inverted)
+        flipped = [c for c, inverted in classes if inverted]
+        if ignore:              # 普通的字照旧不分大小写, 换出来的字集不扩: 拆开写
+            parts = ([(raw, False)] if raw else []) + ([(plain, True)] if plain else [])
+        else:
+            parts = [(raw + plain, False)] if raw or plain else []
+        if not negate:          # 并: 普通的字 ∪ 不取反的字集 ∪ 每个取反的字集
+            alts = [bare(c, False, keep) for c, keep in parts] + [one(c, True) for c in flipped]
+            return alts[0] if len(alts) == 1 else "(?:" + "|".join(alts) + ")"
+        # 取反: 同一个字既不在普通的字、不取反的字集里, 又在每个取反的字集里 —— 前面的用前瞻, 最后一个吃掉这个字
+        conds = [bare(c, True, keep) for c, keep in parts] + [bare(c, False, ignore) for c in flipped]
+        body = conds[0] if len(conds) == 1 else "".join(f"(?={c})" for c in conds[:-1]) + conds[-1]
+        return guarded(body if len(conds) == 1 else f"(?:{body})", True)
+
+    def boundary(esc: str, word_before: bool, word_after: bool) -> str:
+        w = one(*cls("w"))
+        if (word_before or word_after) and not (ascii_ and ignore):
+            # 紧挨着的那一边是一定要配上的英文字母数字 / _(\bvx\b 的 v 和 x), 那个字一定在 \w 里, 只用看另一边: \b 就是另一边
+            # 不是 \w。少两个环视之外, regex 还能先找字面量再回头看 —— \b 词表一篇快几百倍(换成四个环视时一批 20 篇要几十毫秒)
+            want = "!" if esc == "b" else "="
+            return (f"(?{want}{w})" if word_before else "") + (f"(?<{want}{w})" if word_after else "")
+        if esc == "b":
+            return f"(?:(?<={w})(?!{w})|(?<!{w})(?={w}))"
+        # 空字符串上 re 的 \B 不成立(3.14 起改成成立), regex 的成立: 照当前这个 Python 的 re 来
+        guard = "" if re.search(r"\B", "") else r"(?!\A\Z)"
+        return f"(?:(?<={w})(?={w})|(?<!{w})(?!{w}){guard})"
+
+    def word_literal_at(j: int) -> bool:
+        """pattern[j] 是一个英文字母数字 / _ 的字面量, 而且一定要配上(后面没跟着 ? * { 让它可有可无; (?x) 下后面紧跟着空白或注释的
+        也不算, 量词可能隔着空白)。"""
+        if j >= n or pattern[j] not in _WORD_ASCII:
+            return False
+        nxt = pattern[j + 1:j + 2]
+        return nxt not in ("?", "*", "{") and not (verbose and (nxt in _RE_VERBOSE_SPACE or nxt == "#"))
+
+    out: list[str] = []
+    stack: list[tuple[bool, bool, bool]] = []
+    i, n = 0, len(pattern)
+    word_before = False             # 刚抄过去的是不是一个英文字母数字 / _ 的字面量(见 boundary)
+    try:
+        while i < n:
+            c = pattern[i]
+            literal = False
+            if c == "\\":
+                esc = pattern[i + 1:i + 2]
+                if esc in _CLASS_ESCAPES:
+                    out.append(one(*cls(esc)))
+                    i += 2
+                elif esc in ("b", "B"):
+                    out.append(boundary(esc, word_before, word_literal_at(i + 2)))
+                    i += 2
+                elif esc == "N" and pattern.startswith("{", i + 2):          # \N{名字}: 名字里的 { 空格原样抄
+                    j = pattern.index("}", i) + 1
+                    out.append(pattern[i:j])
+                    i = j
+                else:
+                    # \x41 \u4e00 \012 \1 后面的数字是这个转义的一部分, 不是字面量: 一起抄过去(多吃几个也只是原样抄)
+                    j = i + 2
+                    if esc in ("x", "u", "U") or esc in _DIGITS:
+                        while j < n and pattern[j] in _HEX_DIGITS:
+                            j += 1
+                    out.append(pattern[i:j])
+                    i = j
+            elif c == "[":                               # 字集: 一直到收尾的 ](紧跟在 [ 或 [^ 后面的 ] 是字面的)
+                j = i + 2 if pattern.startswith("[^", i) else i + 1
+                first = j
+                while j < n and not (pattern[j] == "]" and j != first):
+                    j += 2 if pattern[j] == "\\" else 1
+                out.append(char_set(*_set_items(pattern[i:j + 1])))
+                i = j + 1
+            elif c == "#" and verbose:
+                j = pattern.find("\n", i)
+                j = n if j < 0 else j + 1
+                out.append(pattern[i:j])
+                i = j
+            elif pattern.startswith("(?#", i):
+                j = i + 3
+                while j < n and pattern[j] != ")":
+                    j += 2 if pattern[j] == "\\" else 1
+                out.append(pattern[i:j + 1])
+                i = j + 1
+            elif c == "(":
+                m = _FLAG_GROUP.match(pattern, i)
+                if m and m.group(3) == ")":              # 开头的全局旗: 已经从解析树里拿了
+                    out.append(m.group(0))
+                    i = m.end()
+                    word_before = False
+                    continue
+                stack.append((ascii_, verbose, ignore))
+                if m:
+                    on, off = m.group(1), m.group(2) or ""
+                    ascii_ = True if "a" in on else (False if "u" in on else ascii_)
+                    verbose = True if "x" in on else (False if "x" in off else verbose)
+                    ignore = True if "i" in on else (False if "i" in off else ignore)
+                    out.append(m.group(0))
+                    i = m.end()
+                else:
+                    out.append(c)
+                    i += 1
+            elif c == ")":
+                if stack:
+                    ascii_, verbose, ignore = stack.pop()
+                out.append(c)
+                i += 1
+            elif c == "{":
+                m = _QUANTIFIER.match(pattern, i)
+                out.append(m.group(0) if m else "\\{")
+                i = m.end() if m else i + 1
+            elif verbose and c.isspace() and c not in _RE_VERBOSE_SPACE:
+                out.append(f"\\U{ord(c):08x}")
+                i += 1
+            else:
+                literal = c in _WORD_ASCII
+                out.append(c)
+                i += 1
+            word_before = literal
+    except (_Untranslatable, ValueError):
+        return None
+    return "".join(out), unicode_word
+
+
+@functools.lru_cache(maxsize=512)
+def _compiled(pattern: str, exact: bool = False):
+    """(编译好的, 要不要看正文换 exact 那份, 跑不了的理由)。每个 pattern 每个进程编一次(exact 那份第一次用到才编); 退回 re 和
+    跑不了的那次各记一行日志。
+
+    - regex 装不上: (re 编译好的, False, None) —— 退回 re, 没有时限。
+    - 限时的引擎跑不了(拿不到解析树 / 换不出来 / 换出来超过 MAX_TRANSLATED_CHARS / regex 编译不了): (None, False, 理由),
+      search_user_regex 报这次没查。不退回没有时限的 re。
+    pattern 本身 re 都编译不了的, 照 re 抛 re.error(和闸、和原来一样)。"""
+    fallback = re.compile(pattern)
+    if _regex is None:
+        if not _REGEX_MISSING_LOGGED[0]:
+            _REGEX_MISSING_LOGGED[0] = True
+            _logger.warning("validator: 装不上 regex 包, 用户正则退回 re 执行(没有时限, 只剩静态闸和长度上限)")
+        return fallback, False, None
+    got = _for_regex(pattern, exact)
+    if got is None:
+        why = "换不成限时引擎的写法"
+    elif len(got[0]) > MAX_TRANSLATED_CHARS:
+        why = f"换成限时引擎的写法有 {len(got[0])} 字, 超过 {MAX_TRANSLATED_CHARS}, 编译太慢"
+    else:
+        try:
+            return _regex.compile(got[0], _regex.VERSION0), got[1], None
+        except Exception as exc:                     # noqa: BLE001 — 编不了就报没查, 不退回没有时限的 re
+            why = f"限时引擎编译不了({str(exc)[:80]})"
+    _logger.warning("validator: 正则 %r%s %s, 这条报成这次没查", pattern[:80], "(exact)" if exact else "", why)
+    return None, False, why
+
+
+def search_user_regex(pattern: str, text: str, budget: Optional[RegexBudget] = None):
+    """用户写的正则(forbidden_regex)在正文里搜一次: 返回匹配(``.group(0)`` 可用)或 None; 这次没查成抛 ``RegexTimeout``
+    (时间用完了, 或者限时的引擎跑不了它)。
+
+    调用方先过 ``assert_regex_is_safe``(闸)再调这里; re 都编译不了的照 re 抛 re.error。正文截到 MAX_REGEX_TARGET_CHARS。
+    ``budget`` 是这条规则在这次检查里共用的那一份(见 RegexBudget), 不传就是只给这一次的一份。这个进程第一次用这条正则时的
+    换写法、编译也从这一份里扣: 编译打断不了, 但不能不算 —— 换出来的长度有上限(MAX_TRANSLATED_CHARS), 编一次最多零点几秒。"""
+    budget = budget if budget is not None else RegexBudget()
+    text = (text or "")[:MAX_REGEX_TARGET_CHARS]
+    if budget.left <= 0:
+        budget.timed_out = True
+        raise RegexTimeout("这条的时限已经用完了")
+    t0 = time.monotonic()
+    try:
+        rx, needs_exact, why = _compiled(pattern)
+        if isinstance(rx, re.Pattern):               # regex 装不上: 退回 re, 没有时限
+            return rx.search(text)
+        if rx is not None and needs_exact and _differs_from_re(text):
+            rx, _, why = _compiled(pattern, True)
+        if rx is None:
+            budget.timed_out = True
+            raise RegexTimeout(why)
+        left = budget.left - (time.monotonic() - t0)
+        if left <= 0:
+            budget.timed_out = True
+            raise RegexTimeout("编译用完了这条的时限")
+        return rx.search(text, timeout=left)
+    except TimeoutError:
+        budget.timed_out = True
+        raise RegexTimeout("没在时限内跑完") from None
+    finally:
+        budget.left -= time.monotonic() - t0
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -627,12 +1044,13 @@ def _spec_from_structured(rule: dict) -> Optional[dict]:
             payload = {}
     if isinstance(payload, dict) and _DESK_KEYS & set(payload):
         return _spec_from_desk(kind, payload)
-    if kind == "forbidden_word":
+    if kind in ("forbidden_word", "required_phrase"):
+        # 老形状 {"target": X}(AW 的 Streamlit 界面还在这么写): 照写作台的口径查, 两边结论一样(codex review on aw#115)。写作台
+        # (rulecheck._from_legacy)把它读成 {"words": [X]} / {"any": [X]}: 标题、正文分开看, 不分大小写, 英文字母数字那头按词边界
+        # (contains_term)。原来这里是在"标题\n正文"里分大小写找子串, "made" 算出现了 "ad"、"an ad" 又不算出现了 "AD"。
+        # 只剩一处不一样: 超过 40 字的 X 写作台不收(rulecheck.MAX_TERM_CHARS, 跳过这条), 这里照查。
         target = str(payload.get("target", "")).strip()
-        return {"kind": kind, "target": target} if target else None
-    if kind == "required_phrase":
-        target = str(payload.get("target", "")).strip()
-        return {"kind": kind, "target": target} if target else None
+        return {"kind": kind, "terms": [target], "where": list(_FIELDS)} if target else None
     if kind == "max_len":
         scope = str(payload.get("scope", "标题")).strip() or "标题"
         try:
@@ -653,10 +1071,12 @@ def _spec_from_structured(rule: dict) -> Optional[dict]:
 # ⚠️ 读不了也【不许】退回 _parse_rule(codex review on aw#115): content 是写给人看的原话, 「评论不要出现「私信」」
 # 会被抽成"标题正文不许出现私信", 生成的稿子全标 needs_revision; 只管标题的禁用词也会被抽成连正文一起查。
 # 所以要么照写作台的口径读对(下面的匹配 / 数字数和 rulecheck 共用), 要么返回 NOT_APPLICABLE 跳过。
+# 必须带的话术只管评论 / 话题(或者标题正文之外还管它们)的, 这里一律跳过: 写作台那边模板要求每篇都带评论 / 话题时, 空着算没带
+# (rulecheck.check 的 expects, codex review on aw#115), 可生成链路生成的东西里本来就没有评论, 话题是另算的关键词, 判不了。
 NOT_APPLICABLE = {"kind": "not_applicable"}
 _DESK_KEYS = frozenset({"words", "any", "max", "min", "where"})
 _FIELDS = ("title", "body")
-_ASCII_TERM = re.compile(r"[a-z0-9 ._/-]+")
+_ALNUM = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
 
 # ── 哪个 # 是话题: 数字数(这里和 rulecheck)、交付稿摘话题、查话题的规则(deskcore/delivery.py)共用这一处 ──────────────
 # 基本形: "#秋招" / "#秋招[话题]#" / 连写 "#a#b" / "#a[话题]#b[话题]#"(中间那个 # 收前一个也开后一个, 所以 [话题] 后面
@@ -724,11 +1144,18 @@ def is_topic_tag(text: str, at: int) -> bool:
 
 
 def contains_term(text: str, term: str) -> bool:
-    """不分大小写的包含。纯英文数字的词按词边界认, 免得 "ad" 撞进 "made"。写作台(rulecheck)查词也用这一个。"""
+    """不分大小写的包含。词的开头 / 结尾是英文字母或数字的, 那一头按词边界认, 免得 "ad" 撞进 "made"。写作台(rulecheck)查词也用这一个。
+
+    只看词两头那一个字, 不看整个词是不是纯英文(codex review on aw#115): "www." 的结尾是点, 后面紧跟着 example 是正常写法, 无条件
+    加尾边界的话 "www.example.com" 里永远找不到 "www.", 禁用词漏报、必须带的话术误报没带, ".com" 同理只看结尾; 反过来 "V信"
+    "v+" "c++" "K歌" 这种开头是字母的, 开头那一头照样要边界 —— 不然「家里TV信号不好」「Apple TV+」都算出现了「V信」「v+」。
+    中文、标点那一头不加。"""
     t, s = term.casefold(), (text or "").casefold()
-    if _ASCII_TERM.fullmatch(t):
-        return re.search(r"(?<![a-z0-9])" + re.escape(t) + r"(?![a-z0-9])", s) is not None
-    return t in s
+    head = r"(?<![a-z0-9])" if t[:1] in _ALNUM else ""
+    tail = r"(?![a-z0-9])" if t[-1:] in _ALNUM else ""
+    if not (head or tail):
+        return t in s
+    return re.search(head + re.escape(t) + tail, s) is not None
 
 
 def count_chars(text: str) -> int:
@@ -920,13 +1347,26 @@ def check_hard_rules(
                 assert_regex_is_safe(pattern)
                 # 标题、正文分开搜, 同写作台(codex review on aw#115): 拼成"标题\n正文"再搜的话 ^ 碰不到正文开头、
                 # $ 碰不到标题结尾, 同一行规则两边结论不一样。生产库里还没有一条结构化正则, 老形状一起改不影响存量。
-                m = next(filter(None, (re.search(pattern, x[:MAX_REGEX_TARGET_CHARS]) for x in fields)), None)
+                # 闸只是尽力而为: 执行限时(search_user_regex), 标题正文共用一份时限, 用完了这条就当这次没查(下面)。
+                budget = RegexBudget()
+                m = next(filter(None, (search_user_regex(pattern, x, budget) for x in fields)), None)
                 if m:
                     out.append({
                         "rule":  content,
                         "kind":  kind,
                         "match": m.group(0)[:60],
                     })
+            except RegexTimeout as exc:
+                # 漏过闸、又真的慢的正则(或者限时的引擎跑不了它): 不算违规(没查完不能说它命中), 也不能卡住生成 —— 跳过并记一行,
+                # 同下面的不安全。
+                _logger.warning("check_hard_rules: 正则规则这次没查成(%s, 时限 %.2fs), 跳过(不算违规): %r",
+                                exc, regex_search_timeout(), pattern[:80])
+                try:
+                    import telemetry as _tm
+                    _tm.log_event("hard_rule_regex_timeout", rule=content[:80], pattern=pattern[:80], reason=str(exc)[:120])
+                except Exception:
+                    pass
+                continue
             except (re.error, UnsafeRegex) as exc:
                 # 正则编译失败**或不安全**都不算违规——但要埋一行日志，否则用户在 UI 里
                 # 看到"硬规则未命中"会以为规则生效了，实际 validator 一直

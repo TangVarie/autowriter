@@ -498,13 +498,17 @@ def _doctor(core, sb, project_id: str | None) -> int:
 def _delivery_format(core, sb, args) -> int:
     """模板写错 / default_params 解析不了: 打印原因, 退出码 1, 一个字不写。"""
     from . import delivery
-    template = None
-    if args.set_file:
+    template = core.SHOW_ONLY                       # --show; --clear 不看它
+    if args.set_file is not None:                   # --set "" (部署脚本里变量没设)也要去读、报读不了, 不能当成 --show
         try:
             with open(args.set_file, encoding="utf-8") as fh:
                 template = json.load(fh)
         except (OSError, ValueError) as exc:
             print(f"读不了模板文件 {args.set_file}: {exc}")
+            return 1
+        if template is None:
+            # 文件里是 JSON null: 原来和 --show 用的是同一个 None, 一个字不写还退出码 0(codex review on aw#115)
+            print(f"模板没写进去: {args.set_file} 里是 null。要删掉模板用 --clear")
             return 1
     try:
         out = core.delivery_format(sb, args.project, template=template, clear=args.clear)

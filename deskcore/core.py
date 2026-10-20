@@ -2261,6 +2261,10 @@ RULE_CHECKS_NEXT_STEP = ("rule_checks 是代码按项目规则逐篇查出来的
 RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的全列了, 没列的都是建议改), 还有 rule_checks_more 条没列: "
                               "如实告诉用户还有这么多条没列出来。")
 RULE_CHECKS_ERROR_NEXT_STEP = ("rule_checks_status=error: 这次代码查规则没跑成(存档不受影响), 不能跟用户说规则都用代码查过了。")
+UNCHECKED_LABEL = {"hard": "硬约束·没查完", "soft": "建议·没查完"}
+RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代码没查完(正则没在时限内跑完, 或者限时的引擎跑不了它; "
+                                   "存档不受影响): 它们算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
+                                   "severity 是 hard 的(「硬约束·没查完」)照规则原文自己逐篇核一遍。")
 
 
 def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
@@ -2270,7 +2274,8 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
     1. 交付版式: 项目配了 ``default_params.delivery`` 就按模板把存进去的那几篇拼好(``out["delivery"]``)。
        模板坏了只记日志、不带这一块 —— 打分照常(运维用 CLI 设模板时已经校验过, 走到这里多半是有人手改了库)。
     2. 代码查规则: 和简报同一个池子里带 check 的那几条, soft 的过同一道方向闸, 逐篇查(``out["rule_checks"]``,
-       有命中才带)。查不成就带 ``rule_checks_status = "error"``: 不带的话和"查过了、没命中"长得一模一样。
+       有命中才带)。查不成就带 ``rule_checks_status = "error"``: 不带的话和"查过了、没命中"长得一模一样。正则规则限时
+       (rulecheck.check), 没在时限内查完的列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了"守住了"。
 
     两样都只是参考: 入库到这里已经成功了, 这一步任何失败都不许把它变成失败(同判定那一段的纪律)。
     """
@@ -2307,12 +2312,25 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
                 posts = [delivery.delivered_post(tpl, d) for d in picked]
                 checked = [{**d, "body": body} for d, (body, _tags) in zip(picked, posts)]
                 final_tags = [tags for _body, tags in posts]
-            hits, stats = rulecheck.check(hard + soft, checked, indices=indices, tags=final_tags)
+            # 模板要求每篇都带的部位(评论 min ≥ 1、要话题): 空着的话「必须带的话术」照没带报, 不能靠不交那一块混过去(codex review
+            # on aw#115)。没模板、模板不要求的部位, 空着照旧不查(评论常常是后面另走评论那一步写的)
+            expects = delivery.expected_parts(tpl) if tpl is not None else ()
+            hits, stats = rulecheck.check(hard + soft, checked, indices=indices, tags=final_tags, expects=expects)
             if hits:
                 shown, more = rulecheck.top_hits(hits)
                 out["rule_checks"] = shown
                 if more:
                     out["rule_checks_more"] = more
+            if stats.get("timed_out"):
+                sev = {r.get("id"): ("hard" if (r.get("severity") or "soft").lower() == "hard" else "soft")
+                       for r in hard + soft}
+                # 开头不用「必须改」/「建议改」(codex review on aw#115): 那两个词在 rule_checks 里是"这篇查出了违规", 写手的模型扫到
+                # 「必须改」会跟用户说稿子违规了 —— 这里什么都没查出来, 只是没查完。轻重只放在 severity 里, 开头另起一个说法
+                out["rule_checks_unchecked"] = [
+                    {"rule_id": rid, "severity": sev.get(rid, "soft"),
+                     "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则的正则这次没查完(超时或者限时的引擎跑不了), "
+                             "算没查, 不是查出了违规"}
+                    for rid in stats["timed_out"]]
             meta["rule_checks"] = {**stats, "hits": len(hits),
                                    "hard": sum(1 for h in hits if h["severity"] == "hard"),
                                    "elapsed_ms": _ms_since(t0)}
@@ -2324,6 +2342,7 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
     tips = (([DELIVERY_NEXT_STEP] if "delivery" in out else [])
             + ([RULE_CHECKS_NEXT_STEP] if "rule_checks" in out else [])
             + ([RULE_CHECKS_MORE_NEXT_STEP] if "rule_checks_more" in out else [])
+            + ([RULE_CHECKS_UNCHECKED_NEXT_STEP] if "rule_checks_unchecked" in out else [])
             + ([RULE_CHECKS_ERROR_NEXT_STEP] if out.get("rule_checks_status") == "error" else []))
     if tips and out.get("next_step"):
         out["next_step"] = out["next_step"] + " " + " ".join(tips)
@@ -4197,20 +4216,26 @@ def backfill_gap(client, project_id: str) -> dict:
     return out
 
 
-def delivery_format(client, project_id: str, *, template: dict | None = None, clear: bool = False) -> dict:
+# delivery_format 的「只看, 不写」: 不能拿 None 当这个记号 —— --set 的文件里写的是 JSON null 时 template 也是 None, 会被当成
+# --show, 一个字不写还退出码 0(codex review on aw#115)。null 要走校验、报「delivery 应该是 JSON 对象」; 删模板用 clear。
+SHOW_ONLY = object()
+
+
+def delivery_format(client, project_id: str, *, template=SHOW_ONLY, clear: bool = False) -> dict:
     """运维命令 ``cli delivery-format``: 看 / 设 / 清一个项目的交付模板(``default_params.delivery``, 2026-10-20)。
 
     不收 user: 同 backfill, 跑它的人握着 service_role key(docs/deskcore.md §2.2.1)。写手那边没有这个工具 ——
     版式是项目定的, 不该由写手的模型在对话里改。
     写之前先校验(delivery.validate), 存规范形状; 写回时保留 default_params 里别的键(isolation_terms 等), 仍存成
     JSON 字符串(生产库 80 行都是这个形状)。default_params 本身解析不了就拒绝写: 拿 {} 去合并会把别的键一起抹掉。
+    ``template`` 不传(SHOW_ONLY)是只看; 传了什么都要过校验, 传 None 也一样(抛 TemplateError, 不写)。
     """
     project = store.project_row(client, project_id)
     if project is None:
         raise ProjectNotFound(f"project not found: {project_id}")
     params = delivery.parse_params(project.get("default_params"))
     out = {"project_id": project_id, "project_name": project.get("name") or ""}
-    if template is not None or clear:
+    if template is not SHOW_ONLY or clear:
         if clear:
             params = {k: v for k, v in params.items() if k != "delivery"}
         else:

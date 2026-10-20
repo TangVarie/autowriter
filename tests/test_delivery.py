@@ -425,6 +425,43 @@ def test_cli_refuses_a_bad_template_and_writes_nothing(cli_client, tmp_path, cap
     assert not [x for x in cli_client.calls if x["op"] == "update"]
 
 
+def test_cli_refuses_a_null_template_instead_of_treating_it_as_show(cli_client, tmp_path, capsys):
+    """--set 的文件里是 JSON null: 原来和 --show 用的是同一个 None, 一个字不写、退出码 0, 运维以为设上了(codex review on
+    aw#115)。要报错、退出码 1、不写; 删模板走 --clear。core 那边「只看」也换成了单独的记号, 直接传 None 一样要过校验。"""
+    before = cli_client.rows["projects"][0]["default_params"]
+    f = tmp_path / "null.json"
+    f.write_text("null", encoding="utf-8")
+    assert cli.main(["delivery-format", "--project", PROJ, "--set", str(f)]) == 1
+    assert "--clear" in capsys.readouterr().out
+    assert cli_client.rows["projects"][0]["default_params"] == before
+    assert not [x for x in cli_client.calls if x["op"] == "update"]
+    with pytest.raises(delivery.TemplateError):
+        core.delivery_format(cli_client, PROJ, template=None)
+    assert not [x for x in cli_client.calls if x["op"] == "update"]
+    assert "written" not in core.delivery_format(cli_client, PROJ), "不传 template 仍是只看"
+    assert not [x for x in cli_client.calls if x["op"] == "update"]
+
+
+def test_cli_refuses_an_empty_set_path_instead_of_treating_it_as_show(cli_client, capsys):
+    """--set "$TPL" 而 TPL 没设(部署脚本里常见): 原来按真假判, 空字符串当成没给 --set, 打印现有模板、退出码 0, 什么都没写
+    (codex review on aw#115 第五轮)。要去读、报读不了、退出码 1、不写。"""
+    before = cli_client.rows["projects"][0]["default_params"]
+    assert cli.main(["delivery-format", "--project", PROJ, "--set", ""]) == 1
+    assert "读不了模板文件" in capsys.readouterr().out
+    assert cli_client.rows["projects"][0]["default_params"] == before
+    assert not [x for x in cli_client.calls if x["op"] == "update"]
+
+
+def test_expected_parts_are_what_the_template_asks_every_post_to_carry():
+    """rulecheck 的 expects: 这些部位空着就是没交(必须带的话术照没带报)。"""
+    assert delivery.expected_parts(TABLE) == ("tags", "comments")
+    assert delivery.expected_parts(BLOCKS) == ("tags",)
+    assert delivery.expected_parts({"layout": "blocks", "tags": {"fixed": ["固定甲"]}}) == ("tags",)
+    assert delivery.expected_parts({"layout": "blocks", "tags": {"conditional": [{"when_any": ["x"], "add": "y"}]},
+                                    "comments": {"min": 0, "max": 2, "label_reader": "读者：",
+                                                 "label_author": "作者："}}) == ()
+
+
 def test_cli_refuses_to_overwrite_default_params_it_cannot_parse(cli_client, tmp_path):
     cli_client.rows["projects"][0]["default_params"] = "{broken"
     f = tmp_path / "tpl.json"

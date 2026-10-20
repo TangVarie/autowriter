@@ -657,6 +657,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     ``rule_id`` / ``severity`` / ``where`` / ``what``。``what`` 以「必须改」开头的是硬约束, 改完再交; 「建议改」的
     告诉用户。和分数一样不拦存档。必须改的全列, 建议改补到一共 40 条为止; ``rule_checks_more`` 是没列出的建议改条数,
     如实告诉用户还有这么多条没列。``rule_checks_status`` 是 ``"error"`` 就是这次没查成, 不能说规则都用代码查过了。
+    ``rule_checks_unchecked`` 里的规则这次没查完(正则没在时限内跑完, 或者限时的引擎跑不了): 算没查 —— 不是违规(``what`` 以
+    「硬约束·没查完」/「建议·没查完」开头, 不是「必须改」), 也不能说它们守住了; severity 是 hard 的照规则原文自己核。
 
     ``project_isolation`` 是串项目的提示: 有可疑标记要说明并核对; 没发现或检查超时都不能声称已完整排除串项目。
 
