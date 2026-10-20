@@ -5223,6 +5223,14 @@ def _diff_stamp(link: dict, done: set[str], existing: dict[str, dict]) -> dict:
     return {"computed_at": store.iso_now()}
 
 
+def _diffable(link: dict) -> bool:
+    """这一对能不能算"人在发布前改了什么"。⚠️ 写作台那版晚于发布的(lag_days < 0)不算(10-20): 首晚 440 条差异里
+    212 条是发出去 6~7 天后才存进写作台的那版 —— 是把发出去的帖抄回来, 不是人改写作台的稿, 拿它们教写手就教反了。
+    desk_gap 和 TV 的判据 C 早就这样判"接住"(lag_days ≥ 0 或没有)。"""
+    return bool(link.get("version_id")) and link.get("match_kind") in _TV_BACKFILL_KINDS and (
+        link.get("lag_days") is None or link["lag_days"] >= 0)
+
+
 def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict[str, dict],
                    notes_by_id: dict, known: dict, *, dry_run: bool) -> dict:
     """对上的每一对算一条"人在发布前改了什么"(tvlink.edit_diff), 写 tv_edit_diffs(D-120 / W-23)。
@@ -5239,10 +5247,9 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
         return {"written": 0, "error": f"{type(exc).__name__}: {exc}"[:200]}
     done = set(revs)
     stale = {nid for nid, rev in revs.items() if rev < tvlink.DIFF_REV}
-    fresh = {l["note_id"]: l for l in links if l.get("version_id") and l.get("match_kind") in _TV_BACKFILL_KINDS}
+    fresh = {l["note_id"]: l for l in links if _diffable(l)}
     backlog = [dict(r, note_id=nid) for nid, r in existing.items()
-               if nid not in fresh and (nid not in done or nid in stale) and r.get("version_id")
-               and r.get("match_kind") in _TV_BACKFILL_KINDS][:TV_SYNC_DIFF_BACKFILL]
+               if nid not in fresh and (nid not in done or nid in stale) and _diffable(r)][:TV_SYNC_DIFF_BACKFILL]
     brands: dict[str, str] = {}
     rows = []
     for l in list(fresh.values()) + backlog:
@@ -5357,6 +5364,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                                project_id=hit[0] if hit else None,
                                version_id=tvid if hit else None,
                                item_id=hit[1] if hit else None,
+                               # 那一版在对照索引里就照样算 lag(codex review on aw#113): 不算的话是 None, _diffable
+                               # 当成"不知道、放行", 发了之后才存进写作台的那版就混进改动差异。索引外的旧版
+                               # (_resolve_any_version 反查到的)这里拿不到时间, 但差异本来也只对索引里的版本算。
+                               lag=tvlink.lag_days(n, v) if v else None,
                                candidates=None if hit else [{"tv_version_id": tvid,
                                                               "note": "TV 带的 version_id 不在对照的写作台项目里"}]))
             continue
