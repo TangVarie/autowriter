@@ -29,6 +29,9 @@ import uuid as _uuid
 # 见 migrations/001_deskcore.sql:110 与 000_baseline.sql 里同一张表的定义。
 NOT_NULL_COLUMNS: dict[str, set[str]] = {
     "draft_fingerprints": {"project_id"},
+    # 有 DEFAULT now() 的 NOT NULL 列: 不带这一列照样插得进; 但同一次批量写里别的行带了它, PostgREST 会给没带的补
+    # NULL(见下面 _execute 里 default_to_null 那段)—— 2026-10-20 生产 tv-sync 就是这样 23502 的。
+    "tv_edit_diffs": {"computed_at"},
 }
 
 
@@ -287,6 +290,13 @@ class FakeClient:
 
         if q.op in ("insert", "upsert"):
             payload = q.payload if isinstance(q.payload, list) else [q.payload]
+            # 批量写的列 = 所有行的键的并集(postgrest-py 的 columns=), 某行没带的列按 default_to_null=True 补 None ——
+            # 不是"没带就用列默认值"。假件原来只看每行自己带的键, 于是"有的行带 computed_at、有的不带"在测试里好好的,
+            # 生产上一整块 23502(2026-10-20 tv-sync)。只有一行、或各行键一样时, 和原来完全一样。
+            dict_rows = [r for r in payload if isinstance(r, dict)]
+            if len(dict_rows) > 1:
+                cols = set().union(*(r.keys() for r in dict_rows))
+                payload = [({c: r.get(c) for c in cols} if isinstance(r, dict) else r) for r in payload]
             # NOT NULL: 与 PG 一致报 23502。**在写进 table 之前** —— 这条约束
             # 是 core.migration_state 的 INSERT 权限探测在生产库上安全的依据,
             # 假件放行就等于那条探测的安全性从来没被测过。
