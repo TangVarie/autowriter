@@ -162,6 +162,18 @@ def test_deeply_nested_fixed_counts_do_not_hang_the_check_itself():
     assert "太复杂" in str(ei.value)
 
 
+def _assert_slow_with_re(pattern: str, ch: str, n: int) -> None:
+    """这条的例子本身得是慢的, 否则测不出东西。机器快慢差几倍(CI 的 runner 比本机快两三倍: .*a++.*x 1000 个字本机 0.12 秒、
+    CI 上 0.048 秒, 卡在 0.05 上就红了): 不够慢就把字数翻倍再试, 最多翻两次 —— 这几条都是平方级以上, 翻一倍慢四倍以上。"""
+    for _ in range(3):
+        t0 = time.perf_counter()
+        V.re.search(pattern, ch * n)
+        if time.perf_counter() - t0 > 0.05:
+            return
+        n *= 2
+    pytest.fail(f"{pattern!r} 配 {n // 2} 个字还不到 0.05 秒: 这条的例子本身得是慢的, 否则测不出东西")
+
+
 @pytest.mark.parametrize("pattern, ch", [
     ("(?i:a*)A*B", "A"),                    # codex 给的例子: 组里的 (?i) 只管组里, 但 a 和 A 照样是同一个字, 2000 个 A 实测 2 秒
     ("a*(?i:A)*b", "a"),
@@ -171,9 +183,7 @@ def test_deeply_nested_fixed_counts_do_not_hang_the_check_itself():
 ])
 def test_scoped_flags_are_honored(pattern, ch):
     """组里的旗 (?i:…) (?s:…) (?a:…) 要按组里的算, 不能一直拿整条的旗比字集(codex review on aw#115)。"""
-    t0 = time.perf_counter()
-    V.re.search(pattern, ch * 1000)
-    assert time.perf_counter() - t0 > 0.05, "这条的例子本身得是慢的, 否则测不出东西"
+    _assert_slow_with_re(pattern, ch, 1000)
     with pytest.raises(V.UnsafeRegex) as ei:
         V.assert_regex_is_safe(pattern)
     assert "挨在一起" in str(ei.value)
@@ -192,9 +202,7 @@ def test_scoped_flags_are_honored(pattern, ch):
 def test_case_insensitive_sets_are_compared_the_way_re_matches(pattern, ch):
     """(?i) 下哪些字算在字集里交给 re 自己判(codex review on aw#115): 手写的只往小写折, (?i)[A-Z] 不认 a、ẞ 和 ß 对不上。
     1000 个字实测 0.4~2.5 秒; 这里配 700 个, 省点时间。"""
-    t0 = time.perf_counter()
-    V.re.search(pattern, ch * 700)
-    assert time.perf_counter() - t0 > 0.05, "这条的例子本身得是慢的, 否则测不出东西"
+    _assert_slow_with_re(pattern, ch, 700)
     with pytest.raises(V.UnsafeRegex) as ei:
         V.assert_regex_is_safe(pattern)
     assert "挨在一起" in str(ei.value)
@@ -240,9 +248,7 @@ def test_scoped_flags_that_narrow_the_set_still_pass(pattern):
 ])
 def test_lookaheads_possessives_and_atomic_groups_do_not_separate(pattern, ch):
     """1000 个字实测 0.15~1 秒(2000 个字 1~8 秒)。"""
-    t0 = time.perf_counter()
-    V.re.search(pattern, ch * 1000)
-    assert time.perf_counter() - t0 > 0.05, "这条的例子本身得是慢的, 否则测不出东西"
+    _assert_slow_with_re(pattern, ch, 1000)
     with pytest.raises(V.UnsafeRegex) as ei:
         V.assert_regex_is_safe(pattern)
     assert "挨在一起" in str(ei.value)
@@ -310,9 +316,7 @@ def test_the_check_computes_each_char_set_once(monkeypatch):
     ("\\d*(?:a?b?)++\\d*x", "1", 1000),
 ])
 def test_repeats_inside_optional_or_counted_groups_still_meet_their_neighbours(pattern, ch, n):
-    t0 = time.perf_counter()
-    V.re.search(pattern, ch * n)
-    assert time.perf_counter() - t0 > 0.05, "这条的例子本身得是慢的, 否则测不出东西"
+    _assert_slow_with_re(pattern, ch, n)
     with pytest.raises(V.UnsafeRegex) as ei:
         V.assert_regex_is_safe(pattern)
     assert "挨在一起" in str(ei.value)
