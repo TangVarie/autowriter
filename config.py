@@ -176,7 +176,7 @@ COMMIT_RESPONSE_BUDGET_SEC: float = 20.0
 # 共用这一份 —— score_drafts 存档时的代码查规则(deskcore/rulecheck.check, 一批几篇几个部位一起算)和 AW 生成链路的
 # check_hard_rules(一篇的标题 + 正文)。到点这条就当这次没查, 不算命中。所以一次检查最多多花约 (正则规则条数) × 本值: 到点之后
 # regex 隔一阵才看一次表, 实测最多再拖两成多; 这个进程第一次用到某条正则时的编译也从这一份里扣(打断不了, 换出来的写法有长度
-# 上限 validator.MAX_TRANSLATED_CHARS, 编一次 0.1 秒以内)。0.1 秒 × 20 条 ≈ 2.5 秒, 在上面 20 秒的回包目标里占一成多(生产库现在
+# 上限 validator.MAX_TRANSLATED_CHARS、重复展开有上限 validator.MAX_REPEAT_UNROLL, 编一次 0.1 秒以内; 一个进程扫一次的码位表不扣)。0.1 秒 × 20 条 ≈ 2.5 秒, 在上面 20 秒的回包目标里占一成多(生产库现在
 # 一条结构化正则都没有)。正常的规则一批 20 篇 × 1500 字实测几毫秒到十几毫秒, 0.1 秒够查完(codex review on aw#115 第五轮之前
 # 字集是逐个码位列的, 一个 \b 词表一批就到点 —— 别再那么写); 往大调之前先算清楚上面那笔账。夹在 0.01~1 秒。
 REGEX_SEARCH_TIMEOUT_SEC: float = _bounded_number("REGEX_SEARCH_TIMEOUT_SEC", 0.1, 0.01, 1.0)

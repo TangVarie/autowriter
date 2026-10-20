@@ -658,7 +658,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     告诉用户。和分数一样不拦存档。必须改的全列, 建议改补到一共 40 条为止; ``rule_checks_more`` 是没列出的建议改条数,
     如实告诉用户还有这么多条没列。``rule_checks_status`` 是 ``"error"`` 就是这次没查成, 不能说规则都用代码查过了。
     ``rule_checks_unchecked`` 里的规则这次没查完(正则没在时限内跑完, 或者限时的引擎跑不了): 算没查 —— 不是违规(``what`` 以
-    「硬约束·没查完」/「建议·没查完」开头, 不是「必须改」), 也不能说它们守住了; severity 是 hard 的照规则原文自己核。
+    「硬约束·没查完」/「建议·没查完」开头, 不是「必须改」), 也不能说它们守住了; ``from_index`` 是从哪篇起没查完, 之前查出来、
+    列在 ``rule_checks`` 里的命中照常算; severity 是 hard 的照规则原文(``rule``)把那几篇自己核一遍。
 
     ``project_isolation`` 是串项目的提示: 有可疑标记要说明并核对; 没发现或检查超时都不能声称已完整排除串项目。
 
@@ -851,6 +852,8 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       · {"kind": "forbidden_regex", "pattern": "...", "where": [...]}                       —— 固定写法(会做安全检查)
       · {"kind": "free_text"}                                                               —— 撤掉这条的代码检查
       where 可选 title / body / tags / comments, 不传就是 ["title", "body"]。语气、结构这类判断不了的不要带 check。
+      词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
+      (所以「TV信号」里也不算有 "V信") —— 两种写法都要拦就都列上。
       check 写错会报错且这条规则不落库: 照报错改了再调一次。返回里的 ``check`` 是库里存下的那份。
     """
     # 故意不包 _safe: 这是【写】操作, 且写的可能是 hard 合规规则。写失败若

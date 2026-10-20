@@ -46,7 +46,7 @@ def test_each_kind_normalises_with_defaults():
     assert rulecheck.normalize_check({"kind": "max_len", "min": 150}) == ("max_len", {"where": "body", "min": 150})
     assert rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": r"\d{3,}", "where": "title"}) == \
         ("forbidden_regex", {"pattern": r"\d{3,}", "where": ["title"]})
-    assert rulecheck.normalize_check({"kind": "free_text"}) == ("free_text", None)
+    assert rulecheck.normalize_check({"kind": "free_text"}) == ("free_text", {"code_check": "off"})
 
 
 @pytest.mark.parametrize("bad, words", [
@@ -147,6 +147,19 @@ def test_validator_never_reads_an_out_of_scope_desk_rule_as_text():
     assert [h["kind"] for h in hits("max_len", {"min": 50, "where": "body"}, "正文写长一点")] == ["max_len"]
     # check 坏了(写手手改的库)也不退回文本抽取: 写作台那边同样是跳过
     assert hits("forbidden_word", {"words": [], "where": ["body"]}, "不要出现「私信」") == []
+
+
+def test_a_withdrawn_check_is_not_read_back_from_the_text_by_the_generation_path(rule_client):
+    """写作台撤掉代码检查(check={"kind": "free_text"})之后, AW 生成链路也不许从原文把检查抽回来(codex review on aw#115):
+    「禁止出现「私信」」原来撤掉了照样被 _parse_rule 抽成禁用词。AW 录规则界面写的 free_text(不带标记)照旧从原文抽。"""
+    core.record_rule(rule_client, PROJ, "禁止出现「私信」", severity="hard", user_id=ME,
+                     check={"kind": "forbidden_word", "words": ["私信"]})
+    core.record_rule(rule_client, PROJ, "禁止出现「私信」", severity="hard", user_id=ME, check={"kind": "free_text"})
+    (row,) = rule_client.rows["memories"]
+    assert validator.check_hard_rules([row], "标题", "正文有私信") == []
+    assert rulecheck.spec_of(row) is None
+    plain = {"content": "禁止出现「私信」", "rule_kind": "free_text", "rule_payload": None}
+    assert [h["kind"] for h in validator.check_hard_rules([plain], "标题", "正文有私信")] == ["forbidden_word"]
 
 
 # 两边同一行规则、同一篇稿子(只看标题和正文)必须给出同样的结论 —— 合成的示例
@@ -403,6 +416,7 @@ def test_re_recording_an_existing_rule_can_add_change_and_drop_its_check(rule_cl
     assert rule_client.rows["memories"][0]["rule_payload"] == {"where": "body", "min": 200}
     out = core.record_rule(rule_client, PROJ, "正文长度", user_id=ME, check={"kind": "free_text"})
     assert rule_client.rows["memories"][0]["rule_kind"] == "free_text" and out["check"] is None
+    assert rule_client.rows["memories"][0]["rule_payload"] == rulecheck.WITHDRAWN, "撤掉的要带标记, AW 链路才认得"
 
 
 def test_a_bad_check_writes_nothing_and_is_a_400(rule_client, monkeypatch):
@@ -632,7 +646,7 @@ def test_a_slow_regex_rule_is_reported_as_timed_out_not_as_a_hit(short_timeout):
     t0 = time.perf_counter()
     hits, stats = rulecheck.check(rules, drafts)
     assert time.perf_counter() - t0 < 10 * short_timeout, "一条慢正则一次 check 只花一份时限, 不是每篇每个部位各一份"
-    assert stats == {"rules": 3, "skipped": 0, "timed_out": ["m-1"]}
+    assert stats == {"rules": 3, "skipped": 0, "timed_out": ["m-1"], "timed_out_from": {"m-1": 0}}
     assert {h["rule_id"] for h in hits} == {"m-2", "m-3"} and len(hits) == 40, "别的规则照旧逐篇查"
 
 
@@ -641,7 +655,23 @@ def test_a_hit_found_before_the_time_ran_out_is_still_reported(short_timeout):
     rule = _rule(1, "forbidden_regex", {"pattern": "a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b|示例禁词", "where": ["title", "body"]})
     hits, stats = rulecheck.check([rule], [{"title": "示例禁词", "body": "a" * 2000}, {"title": "示例禁词", "body": "b"}])
     assert [(h["index"], h["where"]) for h in hits] == [(0, "title")]
-    assert stats["timed_out"] == ["m-1"]
+    assert stats["timed_out"] == ["m-1"] and stats["timed_out_from"] == {"m-1": 0}
+
+
+def test_score_drafts_says_from_which_post_a_rule_went_unchecked(short_timeout):
+    """搜到一处之后才没查完: 前面的命中是真的, 照列在 rule_checks 里; rule_checks_unchecked 说清楚从哪篇起没查, 不再整条说
+    "算没查、不是查出了违规"(同一条两头打架; 独立复审 on aw#115 第六轮)。"""
+    c = desk_client(memories=[_rule(1, "forbidden_regex", {"pattern": SLOW + "|示例禁词"})])
+    drafts = distinct_drafts(3)
+    drafts[0]["body"] += "示例禁词"
+    drafts[1]["body"] += "a" * 2000
+    drafts[2]["body"] += "示例禁词"
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert [(h["index"], h["rule_id"]) for h in out["rule_checks"]] == [(0, "m-1")]
+    [u] = out["rule_checks_unchecked"]
+    assert u["from_index"] == 1 and "index=1 那篇起没查完" in u["what"] and "之前查出来、列在 rule_checks 里的照改" in u["what"]
+    assert "from_index" in out["next_step"] and "照常算" in out["next_step"]
+    assert c.rows["batch_metrics"][0]["meta"]["rule_checks"]["timed_out_from"] == {"m-1": 1}
 
 
 def test_ordinary_regex_rules_hit_exactly_as_before():
@@ -670,9 +700,11 @@ def test_score_drafts_lists_the_unchecked_rule_and_never_calls_it_held(short_tim
     drafts[0]["body"] += "a" * 2000
     out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
     assert out["written"] == 2 and "rule_checks" not in out
-    assert out["rule_checks_unchecked"] == [{"rule_id": "m-1", "severity": "hard",
-                                             "what": "硬约束·没查完: 这条规则的正则这次没查完(超时或者限时的引擎跑不了), "
-                                                     "算没查, 不是查出了违规"}]
+    assert out["rule_checks_unchecked"] == [{"rule_id": "m-1", "severity": "hard", "rule": "示例规则 1", "from_index": 0,
+                                             "what": "硬约束·没查完: 这条规则的正则从 index=0 那篇起没查完(超时或者限时的引擎"
+                                                     "跑不了), 那几篇算没查, 不是查出了违规"}]
+    # 简报里只有规则原文、没有 id: 不带原文写手对不上是哪一条, 「照规则原文自己核」做不到(独立复审 on aw#115 第六轮)
+    assert "照规则原文(rule)" in out["next_step"]
     # 「必须改」在 rule_checks 里是"这篇查出了违规": 没查完的不能用这个开头, 不然写手会跟用户说稿子违规了(codex review on aw#115)
     assert not any(u["what"].startswith(tuple(rulecheck.SEVERITY_LABEL.values())) for u in out["rule_checks_unchecked"])
     assert "rule_checks_unchecked" in out["next_step"] and "不能跟用户说这几条守住了" in out["next_step"]

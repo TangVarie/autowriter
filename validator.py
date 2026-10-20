@@ -22,7 +22,8 @@
        - ``max_len``        ：``{"scope": "标题"|"正文"|"开头", "n": N}``
        - ``forbidden_regex``：``{"pattern": "..."}`` ─ re 的写法，
          可用内联标志 ``(?i)`` 不区分大小写；先过安全闸, 再限时执行(search_user_regex)
-     不传 ``rule_kind`` 或传 ``"free_text"`` 时退回到下面的正则抽取。
+     不传 ``rule_kind`` 或传 ``"free_text"`` 时退回到下面的正则抽取; ``free_text`` 带 ``{"code_check": "off"}``
+       (写作台撤掉了代码检查)时跳过、不抽。
   2. **禁用词 / 片段**："禁止 X" / "不要 X" / "不得 X" / "别用 X" /
      "避免 X" → 检查 title+body 是否含 X
   3. **字符上限**："标题不超过 N 字" / "标题最多 N 字" → 检查长度
@@ -46,6 +47,7 @@ from __future__ import annotations
 import functools
 import logging
 import re
+import threading
 import time
 from typing import Optional
 
@@ -546,7 +548,8 @@ MAX_REGEX_TARGET_CHARS = 20_000
 # ⚠️ 时限是**一条规则在一次检查里共用的一份**(RegexBudget), 不是每搜一次一份: 一批 20 篇 × 几个部位, 每次都差一点到点的话
 #    加起来就不止一份了。用完的那条后面的稿子不再搜。所以一次检查最多多花约 (正则规则条数) × REGEX_SEARCH_TIMEOUT_SEC: 到点之后
 #    regex 隔一阵才看一次表, 实测最多再拖两成多; 这个进程第一次用到这条正则时的换写法、编译也从这一份里扣(打断不了, 但换出来的
-#    写法有长度上限 MAX_TRANSLATED_CHARS, 编一次 0.1 秒以内)。正常的规则一批 20 篇 × 1500 字实测几毫秒到十几毫秒(十个词的
+#    写法有长度上限 MAX_TRANSLATED_CHARS、重复展开有上限 MAX_REPEAT_UNROLL, 编一次 0.1 秒以内)。exact 那份码位表一个进程扫一次
+#    (零点几秒), 不扣(见 search_user_regex)。正常的规则一批 20 篇 × 1500 字实测几毫秒到十几毫秒(十个词的
 #    \b 词表不到 1 毫秒), 一份 0.1 秒够查完 —— 前提是下面换写法时字集用属性写, 别逐个码位列(见下)。
 #
 # ⚠️ regex 的默认语法(VERSION0)和 re 几乎一样, 但有几处不一样, 小红书正文里还正好常见。喂给 regex 之前先换写法(_for_regex),
@@ -567,7 +570,8 @@ MAX_REGEX_TARGET_CHARS = 20_000
 #    · \b 挨着一定要配上的英文字母数字(\bvx\b)时只看另一边: 少两个环视, regex 还能先找字面量, \b 词表快几百倍。
 #    还剩几处 (?i) 下的不一样, 写规则用不到, 不再绕(test_known_gap_*): 土耳其语的 ı / İ; 回引((?i)(\w)\1 —— re 比的是 lower(),
 #    regex 按大小写折叠, ſ 和 s 算同一个); 比 Python 新的 Unicode 才有的大小写对(Ɤ 和 ɤ); 组内的 (?a:…) (?u:…) 碰上不分大小写
-#    (regex 不分大小写时只看整条正则的旗, 组里的 a / u 管不到: (?a:(?i:k)) 在 regex 里认 K 开尔文符号, re 不认)。
+#    (regex 不分大小写时只看整条正则的旗, 组里的 a / u 管不到: (?a:(?i:k)) 在 regex 里认 K 开尔文符号, re 不认); 整条开了 (?a)
+#    时 (?u:…) 里再套的组(换写法加的、自己写的 (?:…) 都算), regex 退回整条的 ASCII(test_known_gap_unicode_scope_inside_global_ascii)。
 # regex 装不上就退回 re(仍在闸后面、仍有长度上限, 只是没有时限), 记一次日志。装上了却跑不了的(换过的写法太长、regex 编译不了、
 # 拿不到 re 的解析树)不退回没有时限的 re: 报成这次没查(RegexTimeout), 记一次日志 —— 不然一个 regex 不认的写法就能把闸后面
 # 那道时限整个绕过去(a*aaa*…b|示例{1,2}{e} 曾经就这样跑进 re, 2000 个 a 永不返回)。
@@ -606,9 +610,37 @@ class RegexBudget:
 
 # 换出来的写法的长度上限。regex 编译中途打断不了, 编译时间跟着换出来的长度走(一个 \b 换成七十来个字, 挨着英文字母数字的只要
 # 三十来个); 闸不管正则多长, 这是执行期唯一卡住编译的地方: 超过就不编译, 报这次没查。实测 3 万字(四百个 \b 连写)编译 0.1 秒,
-# 一条 30 个词的 \b 词表换出来一千多字、编译几毫秒。exact 那份(见上)一个 \b 就几千字, 词表写到二三十个词会碰上这条, 那时只有
-# 带新收的字母数字的那几篇报没查。
+# 一条 30 个词的 \b 词表换出来一千多字、编译几毫秒。
+# exact 那份(见上)的字集是一长串区间, 一个挨着汉字的 \b 就一万二上下, 但它编译得快(每万字约 10 毫秒, 3.11 / 3.13 实测): 另给一个
+# 上限, 卡在编一次 0.1 秒左右。挨着汉字的 \b 词表 5 个词以内、挨着英文的 30 个词以内能查; 再长的, 带新收的字母数字的那几篇报没查
+# (独立复审 on aw#115 第六轮: 原来和快的那份共用 3 万, 挨着汉字的 \b 3 个词就碰上)。
 MAX_TRANSLATED_CHARS = 30_000
+MAX_TRANSLATED_CHARS_EXACT = 100_000
+
+# 重复次数展开的上限(独立复审 on aw#115 第六轮)。regex 编译时把 {m,} {m,n} 的最少那 m 遍展开, 嵌套的乘起来: x{10000000}
+# 只有十几个字, 换出来远不到 MAX_TRANSLATED_CHARS, 编译却要 5 秒、2.5 GB, 打断不了、握着 GIL(整个进程卡住); 再大的直接
+# 撑爆内存。re 不展开, 微秒级。超过就不编译, 报这次没查(闸不改, Jev 镜像它)。实测展开 2 万遍编译几毫秒、10 万遍五六十毫秒;
+# 正常的规则([\s\S]{1001,} \d{11} 哈{5,})几遍到一两千遍。
+MAX_REPEAT_UNROLL = 50_000
+
+
+def _repeat_unroll(seq, outer: int = 1) -> int:
+    """解析树里每个重复要展开几遍(它自己的最少次数 × 外面每层重复的最少次数, 0 和 1 都算 1 遍), 全加起来。"""
+    total = 0
+    for op, av in seq or ():
+        name = getattr(op, "name", str(op))
+        if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+            times = outer * max(av[0], 1)
+            total += times + _repeat_unroll(av[2], times)
+        elif name in ("SUBPATTERN", "ASSERT", "ASSERT_NOT"):
+            total += _repeat_unroll(av[-1], outer)
+        elif name == "ATOMIC_GROUP":
+            total += _repeat_unroll(av, outer)
+        elif name == "BRANCH":
+            total += sum(_repeat_unroll(sub, outer) for sub in av[1] or ())
+        elif name == "GROUPREF_EXISTS":
+            total += sum(_repeat_unroll(sub, outer) for sub in av[1:] if sub is not None)
+    return total
 
 # re 认的字(str.isalnum() 或 _ / str.isdecimal() / str.isspace()), 写成 regex 的字集正文(不带方括号)
 _ASCII_CLASS = {"w": "\\x30-\\x39\\x41-\\x5a\\x5f\\x61-\\x7a", "d": "\\x30-\\x39", "s": "\\x09-\\x0d\\x20"}
@@ -631,12 +663,23 @@ def _ranges(chars) -> str:
     return "".join(f"\\U{a:08x}" if a == b else f"\\U{a:08x}-\\U{b:08x}" for a, b in out)
 
 
-@functools.lru_cache(maxsize=None)
+_EXACT_LOCK = threading.Lock()
+_EXACT_TABLE: list = []
+
+
 def _exact_classes() -> Optional[dict]:
     """exact 那份字集: \\w \\d 去掉 regex 认、re 不认的字(Python 的 unicodedata 还不认识的新字母数字)。都写成「反面」(取反用):
     \\w = [^ 非字母数字的大类 + Pc 里除 _ 的 + 那些新字], \\d = [^ \\P{Nd} + 新数字]。整个码位表扫一遍, 零点几秒, 只在正文里真有
-    这种字时才算(一个进程一次)。反过来 re 认、regex 不认的字现在一个都没有(两个 Python 版本都是); 哪天有了这份就写不出来, 返回
-    None, 这几篇报没查。"""
+    这种字时才算, 一个进程一次(加锁: 几个线程同时碰上也只算一遍, 别的等着; 独立复审 on aw#115 第六轮)。反过来 re 认、regex 不认
+    的字现在一个都没有(两个 Python 版本都是); 哪天有了这份就写不出来, 返回 None, 这几篇报没查。"""
+    if not _EXACT_TABLE:
+        with _EXACT_LOCK:
+            if not _EXACT_TABLE:
+                _EXACT_TABLE.append(_build_exact_classes())
+    return _EXACT_TABLE[0]
+
+
+def _build_exact_classes() -> Optional[dict]:
     re_w, re_d, re_nw, re_nd = (re.compile(p) for p in ("\\w", "\\d", "\\W+", "\\D+"))
     rx_nw, rx_nd, rx_pc = (_regex.compile(p) for p in ("[^" + _FAST_CLASS["w"] + "]+", "\\P{Nd}+", "\\p{Pc}"))
     extra_w, extra_d, missing, pc = [], [], [], []
@@ -673,6 +716,7 @@ _WORD_ASCII = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqr
 _DIGITS = frozenset("0123456789")
 _CLASS_ESCAPES = frozenset("wWdDsS")
 _HEX_DIGITS = frozenset("0123456789ABCDEFabcdef")
+_OCT_DIGITS = frozenset("01234567")
 
 
 class _Untranslatable(Exception):
@@ -769,8 +813,11 @@ def _for_regex(pattern: str, exact: bool = False) -> Optional[tuple[str, bool]]:
         else:
             parts = [(raw + plain, False)] if raw or plain else []
         if not negate:          # 并: 普通的字 ∪ 不取反的字集 ∪ 每个取反的字集
+            # 原子组: 每个分支都正好吃一个字, 原子不改能配上什么; 不加的话一个字落进好几个分支(！ 既在普通的字里又是 \W),
+            # 后面配不上时 regex 挨个分支回溯, 量词一套就是指数级((?i)[！!\W]{3,}vx 碰上一长串 ！ 超时、真命中报成没查;
+            # re 当它是一个字集, 微秒级。独立复审 on aw#115 第六轮)
             alts = [bare(c, False, keep) for c, keep in parts] + [one(c, True) for c in flipped]
-            return alts[0] if len(alts) == 1 else "(?:" + "|".join(alts) + ")"
+            return alts[0] if len(alts) == 1 else "(?>" + "|".join(alts) + ")"
         # 取反: 同一个字既不在普通的字、不取反的字集里, 又在每个取反的字集里 —— 前面的用前瞻, 最后一个吃掉这个字
         conds = [bare(c, True, keep) for c, keep in parts] + [bare(c, False, ignore) for c in flipped]
         body = conds[0] if len(conds) == 1 else "".join(f"(?={c})" for c in conds[:-1]) + conds[-1]
@@ -792,8 +839,8 @@ def _for_regex(pattern: str, exact: bool = False) -> Optional[tuple[str, bool]]:
     def word_literal_at(j: int) -> bool:
         """pattern[j] 是一个英文字母数字 / _ 的字面量, 而且一定要配上(后面没跟着 ? * { 让它可有可无; (?x) 下后面紧跟着空白或注释的
         也不算, 量词可能隔着空白)。"""
-        if j >= n or pattern[j] not in _WORD_ASCII:
-            return False
+        if j >= n or pattern[j] not in _WORD_ASCII or pattern.startswith("(?#", j + 1):
+            return False            # 后面隔着 (?#…) 的量词照样管它(a(?#c)*), 不算一定要配上
         nxt = pattern[j + 1:j + 2]
         return nxt not in ("?", "*", "{") and not (verbose and (nxt in _RE_VERBOSE_SPACE or nxt == "#"))
 
@@ -817,10 +864,24 @@ def _for_regex(pattern: str, exact: bool = False) -> Optional[tuple[str, bool]]:
                     j = pattern.index("}", i) + 1
                     out.append(pattern[i:j])
                     i = j
-                else:
-                    # \x41 \u4e00 \012 \1 后面的数字是这个转义的一部分, 不是字面量: 一起抄过去(多吃几个也只是原样抄)
+                elif esc in _DIGITS:
+                    # 回引 \1 \12 / 八进制 \0 \012 \123: 照 re 的读法定长度(\0 后最多两个八进制位; \1-\9 后最多一位, 前两位和
+                    # 第三位都是八进制时是三位的八进制)。(?x) 下 regex 会隔着空白、注释接着读数字(\1 23 读成 \123), re 不会:
+                    # 包一层组把它截住(独立复审 on aw#115 第六轮)
                     j = i + 2
-                    if esc in ("x", "u", "U") or esc in _DIGITS:
+                    if esc == "0":
+                        while j < min(n, i + 4) and pattern[j] in _OCT_DIGITS:
+                            j += 1
+                    elif j < n and pattern[j] in _DIGITS:
+                        j += 1
+                        if esc in _OCT_DIGITS and pattern[j - 1] in _OCT_DIGITS and j < n and pattern[j] in _OCT_DIGITS:
+                            j += 1
+                    out.append(f"(?:{pattern[i:j]})" if verbose else pattern[i:j])
+                    i = j
+                else:
+                    # \x41 \u4e00 后面的十六进制位是这个转义的一部分, 不是字面量: 一起抄过去(多吃几个也只是原样抄)
+                    j = i + 2
+                    if esc in ("x", "u", "U"):
                         while j < n and pattern[j] in _HEX_DIGITS:
                             j += 1
                     out.append(pattern[i:j])
@@ -889,8 +950,8 @@ def _compiled(pattern: str, exact: bool = False):
     跑不了的那次各记一行日志。
 
     - regex 装不上: (re 编译好的, False, None) —— 退回 re, 没有时限。
-    - 限时的引擎跑不了(拿不到解析树 / 换不出来 / 换出来超过 MAX_TRANSLATED_CHARS / regex 编译不了): (None, False, 理由),
-      search_user_regex 报这次没查。不退回没有时限的 re。
+    - 限时的引擎跑不了(拿不到解析树 / 换不出来 / 换出来超过 MAX_TRANSLATED_CHARS(_EXACT) / 重复展开超过 MAX_REPEAT_UNROLL /
+      regex 编译不了): (None, False, 理由), search_user_regex 报这次没查。不退回没有时限的 re。
     pattern 本身 re 都编译不了的, 照 re 抛 re.error(和闸、和原来一样)。"""
     fallback = re.compile(pattern)
     if _regex is None:
@@ -898,11 +959,15 @@ def _compiled(pattern: str, exact: bool = False):
             _REGEX_MISSING_LOGGED[0] = True
             _logger.warning("validator: 装不上 regex 包, 用户正则退回 re 执行(没有时限, 只剩静态闸和长度上限)")
         return fallback, False, None
-    got = _for_regex(pattern, exact)
-    if got is None:
+    unroll = _repeat_unroll(_parse_pattern(pattern))
+    got = None if unroll > MAX_REPEAT_UNROLL else _for_regex(pattern, exact)
+    cap = MAX_TRANSLATED_CHARS_EXACT if exact else MAX_TRANSLATED_CHARS
+    if unroll > MAX_REPEAT_UNROLL:
+        why = f"重复次数要展开 {unroll} 遍, 超过 {MAX_REPEAT_UNROLL}, 编译太慢"
+    elif got is None:
         why = "换不成限时引擎的写法"
-    elif len(got[0]) > MAX_TRANSLATED_CHARS:
-        why = f"换成限时引擎的写法有 {len(got[0])} 字, 超过 {MAX_TRANSLATED_CHARS}, 编译太慢"
+    elif len(got[0]) > cap:
+        why = f"换成限时引擎的写法有 {len(got[0])} 字, 超过 {cap}, 编译太慢"
     else:
         try:
             return _regex.compile(got[0], _regex.VERSION0), got[1], None
@@ -918,7 +983,8 @@ def search_user_regex(pattern: str, text: str, budget: Optional[RegexBudget] = N
 
     调用方先过 ``assert_regex_is_safe``(闸)再调这里; re 都编译不了的照 re 抛 re.error。正文截到 MAX_REGEX_TARGET_CHARS。
     ``budget`` 是这条规则在这次检查里共用的那一份(见 RegexBudget), 不传就是只给这一次的一份。这个进程第一次用这条正则时的
-    换写法、编译也从这一份里扣: 编译打断不了, 但不能不算 —— 换出来的长度有上限(MAX_TRANSLATED_CHARS), 编一次最多零点几秒。"""
+    换写法、编译也从这一份里扣: 编译打断不了, 但不能不算 —— 换出来的长度有上限(MAX_TRANSLATED_CHARS)、重复展开有上限
+    (MAX_REPEAT_UNROLL), 编一次最多零点几秒。exact 那份码位表(一个进程扫一次)不扣。"""
     budget = budget if budget is not None else RegexBudget()
     text = (text or "")[:MAX_REGEX_TARGET_CHARS]
     if budget.left <= 0:
@@ -930,6 +996,10 @@ def search_user_regex(pattern: str, text: str, budget: Optional[RegexBudget] = N
         if isinstance(rx, re.Pattern):               # regex 装不上: 退回 re, 没有时限
             return rx.search(text)
         if rx is not None and needs_exact and _differs_from_re(text):
+            # 码位表一个进程扫一次(零点几秒), 不是这条规则花的: 不从这一份里扣, 不然第一篇带新字的稿子上真命中报成没查
+            t_table = time.monotonic()
+            _exact_classes()
+            t0 += time.monotonic() - t_table
             rx, _, why = _compiled(pattern, True)
         if rx is None:
             budget.timed_out = True
@@ -1032,7 +1102,7 @@ def _spec_from_structured(rule: dict) -> Optional[dict]:
     跳过, **不许**退回 ``_parse_rule`` —— 见 ``_spec_from_desk``。
     """
     kind = (rule.get("rule_kind") or "").strip()
-    if not kind or kind == "free_text":
+    if not kind:
         return None
     payload = rule.get("rule_payload") or {}
     if isinstance(payload, str):
@@ -1042,6 +1112,13 @@ def _spec_from_structured(rule: dict) -> Optional[dict]:
             payload = _json.loads(payload)
         except Exception:
             payload = {}
+    if kind == "free_text":
+        # 写作台 record_rule 的 check={"kind": "free_text"} 是"撤掉这条的代码检查", 存成 free_text + {"code_check": "off"}
+        # (deskcore.rulecheck.WITHDRAWN): 跳过, 不许从原文再抽回来(codex review on aw#115)。没带这个标记的 free_text
+        # 是 AW 录规则界面的"自由文本", 照旧退回 _parse_rule。
+        if isinstance(payload, dict) and payload.get("code_check") == "off":
+            return NOT_APPLICABLE
+        return None
     if isinstance(payload, dict) and _DESK_KEYS & set(payload):
         return _spec_from_desk(kind, payload)
     if kind in ("forbidden_word", "required_phrase"):
@@ -1149,6 +1226,7 @@ def contains_term(text: str, term: str) -> bool:
     只看词两头那一个字, 不看整个词是不是纯英文(codex review on aw#115): "www." 的结尾是点, 后面紧跟着 example 是正常写法, 无条件
     加尾边界的话 "www.example.com" 里永远找不到 "www.", 禁用词漏报、必须带的话术误报没带, ".com" 同理只看结尾; 反过来 "V信"
     "v+" "c++" "K歌" 这种开头是字母的, 开头那一头照样要边界 —— 不然「家里TV信号不好」「Apple TV+」都算出现了「V信」「v+」。
+    代价是同一个道理的另一面: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」里, 两种都要拦就都列上(record_rule 说明里写了)。
     中文、标点那一头不加。"""
     t, s = term.casefold(), (text or "").casefold()
     head = r"(?<![a-z0-9])" if t[:1] in _ALNUM else ""

@@ -182,10 +182,16 @@ def _validate(kind: str, payload: dict) -> dict:
     return out
 
 
+# 写手撤掉代码检查时存进 rule_payload 的标记。validator 认它(_spec_from_structured → NOT_APPLICABLE), 不退回原文抽取。
+WITHDRAWN = {"code_check": "off"}
+
+
 def normalize_check(check) -> tuple[str, dict | None]:
     """``record_rule`` 的 ``check`` 参数 → (rule_kind, rule_payload)。写错就抛 CheckError。
 
-    ``{"kind": "free_text"}`` 是"这条不用代码查": 记过 check 又发现记错了, 用它撤掉。
+    ``{"kind": "free_text"}`` 是"这条不用代码查": 记过 check 又发现记错了, 用它撤掉。存成 ``rule_kind = free_text`` 加
+    :data:`WITHDRAWN` 这个标记(codex review on aw#115): AW 的 Streamlit 录规则界面也写 ``free_text``, 意思却是"自由文本、
+    让 validator 从原文里抽" —— 光凭 kind 分不出"撤掉了", AW 生成链路(validator.check_hard_rules)会照原文把检查又抽回来。
     """
     if not isinstance(check, dict):
         raise CheckError("check 应该是 JSON 对象, 形如 {\"kind\": \"forbidden_word\", \"words\": [...]}")
@@ -194,7 +200,7 @@ def normalize_check(check) -> tuple[str, dict | None]:
     if kind == "free_text":
         if payload:
             raise CheckError("kind=free_text 是撤掉代码检查, 不带别的键")
-        return "free_text", None
+        return "free_text", dict(WITHDRAWN)
     if kind not in CHECK_KINDS:
         raise CheckError(f"check.kind 只认 {' / '.join(CHECK_KINDS)}(撤掉检查用 free_text), 现在是 {kind!r}")
     return kind, _validate(kind, payload)
@@ -307,7 +313,8 @@ def _run(spec: dict, parts: dict[str, list[str]], *, expects=(),
 def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = None,
           tags: list[list[str] | None] | None = None, expects=()) -> tuple[list[dict], dict]:
     """(命中, 统计)。命中按篇、再按 hard 在前排好; 统计 = {"rules": 能查的条数, "skipped": check 坏了跳过的条数}, 有正则规则这次
-    没查完时再带 ``"timed_out": [规则 id, …]``。
+    没查完时再带 ``"timed_out": [规则 id, …]`` 和 ``"timed_out_from": {规则 id: 从哪一篇(index)起没查完}`` —— 那一篇之前的都
+    查完了, 查出来的命中照报(独立复审 on aw#115 第六轮: 不说从哪篇起, 同一条既报了命中、又整条报"没查", 两头打架)。
 
     ``rules`` 是 store.shared_memories 的 hard + soft(没 check 的自动略过, soft 的方向闸由调用方先过);
     ``indices`` 同 delivery.assemble; ``tags`` 和 drafts 一一对应, 某篇给了就用它当这篇的话题(见 _parts);
@@ -326,6 +333,7 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
             skipped += 1
     budgets = {k: validator.RegexBudget() for k, (_r, spec) in enumerate(specs) if spec["kind"] == "forbidden_regex"}
     hits: list[dict] = []
+    stopped: dict[int, int] = {}            # 第几条规则 → 从哪一篇(index)起没查完
     idx = list(indices) if indices is not None else list(range(len(drafts)))
     for pos, d in enumerate(drafts):
         parts = _parts(d if isinstance(d, dict) else {}, tags[pos] if tags is not None else None)
@@ -337,11 +345,13 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
             for where, what in _run(spec, parts, expects=expects, budget=budget):
                 hits.append({"index": idx[pos], "rule_id": r.get("id"), "severity": sev,
                              "where": where, "what": f"{SEVERITY_LABEL[sev]}: {what}"})
+            if budget is not None and budget.timed_out:
+                stopped[k] = idx[pos]
     hits.sort(key=lambda h: (h["index"], h["severity"] != "hard"))
     stats: dict = {"rules": len(specs), "skipped": skipped}
-    timed_out = [specs[k][0].get("id") for k, b in budgets.items() if b.timed_out]
-    if timed_out:
-        stats["timed_out"] = timed_out
+    if stopped:
+        stats["timed_out"] = [specs[k][0].get("id") for k in sorted(stopped)]
+        stats["timed_out_from"] = {specs[k][0].get("id"): at for k, at in sorted(stopped.items())}
     return hits, stats
 
 

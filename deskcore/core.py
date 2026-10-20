@@ -2263,8 +2263,9 @@ RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的全列
 RULE_CHECKS_ERROR_NEXT_STEP = ("rule_checks_status=error: 这次代码查规则没跑成(存档不受影响), 不能跟用户说规则都用代码查过了。")
 UNCHECKED_LABEL = {"hard": "硬约束·没查完", "soft": "建议·没查完"}
 RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代码没查完(正则没在时限内跑完, 或者限时的引擎跑不了它; "
-                                   "存档不受影响): 它们算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
-                                   "severity 是 hard 的(「硬约束·没查完」)照规则原文自己逐篇核一遍。")
+                                   "存档不受影响): 从 from_index 那篇起算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
+                                   "它之前查出来、列在 rule_checks 里的命中照常算。severity 是 hard 的(「硬约束·没查完」)照规则原文"
+                                   "(rule)把 from_index 起的那几篇自己逐篇核一遍。")
 
 
 def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
@@ -2322,14 +2323,20 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
                 if more:
                     out["rule_checks_more"] = more
             if stats.get("timed_out"):
-                sev = {r.get("id"): ("hard" if (r.get("severity") or "soft").lower() == "hard" else "soft")
-                       for r in hard + soft}
+                rows = {r.get("id"): r for r in hard + soft}
+                sev = {rid: ("hard" if (r.get("severity") or "soft").lower() == "hard" else "soft") for rid, r in rows.items()}
                 # 开头不用「必须改」/「建议改」(codex review on aw#115): 那两个词在 rule_checks 里是"这篇查出了违规", 写手的模型扫到
-                # 「必须改」会跟用户说稿子违规了 —— 这里什么都没查出来, 只是没查完。轻重只放在 severity 里, 开头另起一个说法
+                # 「必须改」会跟用户说稿子违规了 —— 这里什么都没查出来, 只是没查完。轻重只放在 severity 里, 开头另起一个说法。
+                # 带上规则原文(独立复审 on aw#115 第六轮): 简报里只有原文没有 id, 只给 rule_id 写手对不上是哪一条, 没法照原文核
+                # 从哪篇起没查完(独立复审 on aw#115 第六轮): 前面查出来的命中是真的, 不说清楚的话同一条既是「必须改」又是"算没查"
+                found = {h["rule_id"] for h in hits}
+                start = stats.get("timed_out_from") or {}
                 out["rule_checks_unchecked"] = [
-                    {"rule_id": rid, "severity": sev.get(rid, "soft"),
-                     "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则的正则这次没查完(超时或者限时的引擎跑不了), "
-                             "算没查, 不是查出了违规"}
+                    {"rule_id": rid, "severity": sev.get(rid, "soft"), "rule": (rows.get(rid) or {}).get("content") or "",
+                     "from_index": start.get(rid),
+                     "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则的正则从 index={start.get(rid)} 那篇起没查完"
+                             "(超时或者限时的引擎跑不了), 那几篇算没查, 不是查出了违规"
+                             + ("; 之前查出来、列在 rule_checks 里的照改" if rid in found else "")}
                     for rid in stats["timed_out"]]
             meta["rule_checks"] = {**stats, "hits": len(hits),
                                    "hard": sum(1 for h in hits if h["severity"] == "hard"),

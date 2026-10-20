@@ -509,7 +509,7 @@ def test_the_codex_example_returns_through_both_paths_in_a_fresh_process(pattern
     assert p.returncode == 0, p.stderr[-2000:]
     got = json.loads(p.stdout.strip().splitlines()[-1])
     assert got["gen"] == [] and got["gen_s"] < 10 * _TIMEOUT
-    assert got["hits"] == [] and got["stats"] == {"rules": 1, "skipped": 0, "timed_out": ["m-1"]}
+    assert got["hits"] == [] and got["stats"] == {"rules": 1, "skipped": 0, "timed_out": ["m-1"], "timed_out_from": {"m-1": 0}}
     assert got["desk_s"] < 10 * _TIMEOUT, "一条慢正则一次 check 只该花一份时限, 不是 20 篇 × 2 个部位各一份"
 
 
@@ -590,6 +590,74 @@ def test_a_pattern_too_long_to_compile_in_time_is_reported_unchecked(short_timeo
         assert budget.timed_out and time.perf_counter() - t0 < short_timeout
 
 
+@pytest.mark.parametrize("pattern", ["a{1000000}", "(?:ab){4294967294}", "私信{10000000}", "x{3000000,3000001}",
+                                     "(?:x{300}){200}", "a{30000}b{30000}"])
+def test_a_huge_repeat_count_is_unchecked_without_compiling(short_timeout, pattern):
+    """regex 编译时把重复的最少次数展开, 打断不了、握着 GIL: x{10000000} 编 5 秒、2.5 GB, (?:ab){4294967294} 撑爆内存。
+    re 微秒级, 闸放行(不套组的写作台也放行)。超过 MAX_REPEAT_UNROLL 的不编译, 报这次没查(独立复审 on aw#115 第六轮)。"""
+    from deskcore import rulecheck
+    assert V.regex_is_safe(pattern), "前提: 闸放行它(闸不改)"
+    if "(" not in pattern:
+        rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})
+    V._compiled.cache_clear()
+    budget = V.RegexBudget()
+    t0 = time.perf_counter()
+    with pytest.raises(V.RegexTimeout, match="展开"):
+        V.search_user_regex(pattern, "私信" * 10, budget)
+    assert budget.timed_out and time.perf_counter() - t0 < short_timeout
+
+
+@pytest.mark.parametrize("pattern, text", [("[\\s\\S]{20000,}", "x" * 20_000), ("x{1,10000000}", "xx"), ("\\d{11}", "13912345678"),
+                                           ("(?:x{100}){200}", "x" * 20_000), ("哈{5,}", "哈" * 6)])
+def test_ordinary_repeat_counts_still_compile_and_match(short_timeout, pattern, text):
+    V._compiled.cache_clear()
+    assert V.search_user_regex(pattern, text, V.RegexBudget())
+
+
+def test_the_exact_table_is_built_once_and_not_charged_to_a_rule(monkeypatch):
+    """正文里第一次出现 Python 还不认识的字母数字时要扫一遍码位表(零点几秒)。这不是哪条规则花的: 原来从这条的那一份里扣,
+    第一篇带这种字的稿子上真命中报成没查; 几个线程同时碰上还各扫一遍(独立复审 on aw#115 第六轮)。"""
+    import threading
+    real, calls = V._build_exact_classes, []
+
+    def slow():
+        calls.append(1)
+        time.sleep(0.5)                 # 比这条的那一份长: 扣了就一定报没查
+        return real()
+
+    monkeypatch.setattr(V, "_build_exact_classes", slow)
+    monkeypatch.setattr(V, "_EXACT_TABLE", [])
+    V._compiled.cache_clear()
+    results: list = []
+
+    def one():
+        try:
+            m = V.search_user_regex("\\bvx\\b", "加 vx 聊 \ua7cb", V.RegexBudget(0.25))
+            results.append(m and m.group())
+        except V.RegexTimeout as exc:
+            results.append(exc)
+
+    threads = [threading.Thread(target=one) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    V._compiled.cache_clear()
+    assert results == ["vx"] * 4 and len(calls) == 1
+
+
+def test_overlapping_set_members_do_not_backtrack_exponentially(short_timeout):
+    """字集里的字和取反的类别转义重叠((?i)[！!\\W]: ！ 两边都在), 换成分支后一个字落进好几个分支, 后面配不上时挨个回溯, 量词一套
+    就是指数级: 24 个 ！ 就超时、真命中报成没查。换出来的是原子组, re 当它一个字集, 两边都是微秒级(独立复审 on aw#115 第六轮)。"""
+    from deskcore import rulecheck
+    pattern = "(?i)[！!？?\\W]{3,}(?:vx|wx|v信)"
+    rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})
+    V._compiled.cache_clear()
+    hit = V.search_user_regex(pattern, "太好用了" + "！" * 24 + "快去买～ 想要链接的姐妹私信 ！！！vx", V.RegexBudget())
+    assert hit and hit.group() == " ！！！vx"
+    assert V.search_user_regex(pattern, "！" * 500 + "x", V.RegexBudget()) is None
+
+
 def test_when_the_bounded_engine_cannot_take_a_pattern_it_is_unchecked_not_run_without_a_limit(monkeypatch):
     """regex 装上了却编译不了换出来的写法: 报这次没查, 不退回没有时限的 re —— 不然一个 regex 不认的写法就绕过了时限。"""
     monkeypatch.setattr(V, "_for_regex", lambda pattern, exact=False: ("(", False))
@@ -612,7 +680,8 @@ _MIXED = ("示例正文❤\ufe0f好物分享👩\u200d💻，第①步②③ x²
 _TEXTS = [_MIXED, "", " ", "①", "❤\ufe0f", "\x1c", "a", "Ab1_", "１２３", "\n\n", _MIXED * 30,
           # {e} 这类(regex 的模糊匹配)、(?x) 下的全角空格、(?i) 下 regex 会扩的那几个字、\b 挨着字面量
           "y", "x", "示", "加薇信", "加微{e<=1}信", "示例{e}", "x{e}", "\u3000", "a\u3000\u3000b", "！！\u3000",
-          "\u0345", "\u0399", "ẞß", "vx", " vx ", "made", "an ad", "ads_x", "x_\u3000", "13912345678"]
+          "\u0345", "\u0399", "ẞß", "vx", " vx ", "made", "an ad", "ads_x", "x_\u3000", "13912345678",
+          "好！", "aa23", "aS", "aa0", "aabb", "太好用了" + "！" * 24 + "私信 ！！！vx"]
 _CORPUS = [
     # 第 1 节、1b 节放行的那些
     "最", "(?i)best|top", "第[一二三]名", "\\d{1,20}元", "(ab){1,10}", "^标题[:：]", "[a-z]+@[a-z]+\\.com",
@@ -636,6 +705,10 @@ _CORPUS = [
     # \b 挨着英文字母数字的字面量时只看另一边
     "\\bvx\\b", "\\bad\\b|\\bads\\b", "vx\\B", "\\Bd", "_\\b", "\\x41\\b", "\\d\\b", "a?\\b", "\\ba?", "\\b1[3-9]\\d{9}\\b",
     "(?x)\\b a", "a\\bb", "a\\Bb",
+    # 独立复审 on aw#115 第六轮: \b 后面的字面量隔着 (?#…) 跟量词; (?x) 下回引 / 八进制后面隔着空白、注释还是数字; 字集里
+    # 的字和取反的类别转义重叠
+    "\\bv(?#可省)?！", "\\ba(?#c)*", "(?x)(a)\\1 23", "(?x)\\0 12", "(?x)(a)\\1 0", "(?x)(a)\\1b+", "(?ax)\\01#c{e}\n2??",
+    "(?x)(a)\\1\t1", "\\101", "(?x)\\101 1", "(?i)[！!？?\\W]{3,}(?:vx|wx|v信)", "[a\\W]+x",
 ]
 
 
@@ -715,6 +788,13 @@ def test_known_gap_case_pairs_newer_than_python_under_ignorecase():
 def test_known_gap_scoped_ascii_flag_under_ignorecase():
     import re
     assert bool(re.search("(?a:(?i:k))", "\u212a")) == bool(V.search_user_regex("(?a:(?i:k))", "\u212a"))
+
+
+@pytest.mark.xfail(strict=True, reason="已知差异, 不值得再绕: 整条开了 (?a) 时, (?u:…) 里面再套的组(换写法加的、自己写的 "
+                                       "(?:…) 都算) regex 退回整条的 ASCII; 写规则用不到这种开法(独立复审 on aw#115 第六轮)")
+def test_known_gap_unicode_scope_inside_global_ascii():
+    import re
+    assert bool(re.search("(?a)vx(?u:\\b)", "vx天")) == bool(V.search_user_regex("(?a)vx(?u:\\b)", "vx天"))
 
 
 def test_falls_back_to_re_when_regex_is_not_installed(monkeypatch):
