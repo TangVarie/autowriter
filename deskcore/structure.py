@@ -75,9 +75,12 @@ MAX_DRAFTS = 30          # 最近这么多篇打过分的稿子(一个 item 算�
 MIN_DRAFTS = 12          # 少于这么多篇不报: 七八篇里六成是同一种, 可能只是一两批的题材碰巧
 SHARE_MIN = 0.6
 
+# 分母(codex review on aw#115): share 是这一题有有效答案的那几篇里的占比, 不是 window 篇里的 —— Jev 不是每题都答, 30 篇
+# 里只有 12 篇答了、8 篇是「是」, 光给 window 30 和 0.67 读起来像是 20 篇。每条带上 of(这一题的分母), TASK 也照这个说。
 TASK = (
-    "concentrated 是这个项目最近 window 篇打过分的稿子里, 大多数篇写成了同一个样子的几处地方: question 是哪一处, "
-    "answer 是扎堆的那种写法, share 是占比。这一批新写的稿子, 每一处都至少有一半换成别的写法, 另一半可以照旧; "
+    "concentrated 是这个项目最近 window 篇打过分的稿子里, 扎堆写成了同一个样子的几处地方: question 是哪一处, "
+    "answer 是扎堆的那种写法, share 是占比, 分母是 of —— 这一题有答案的篇数(有的稿子这一题没答, 所以 of 可能比 "
+    "window 少, share 别当成 window 篇里的占比)。这一批新写的稿子, 每一处都至少有一半换成别的写法, 另一半可以照旧; "
     "不用每篇都换, 也不用一篇把几处全换。比如「正文第一句是哪一种 / 具体事件 / 0.86」, 就让至少一半的稿子第一句"
     "不写具体事件, 改用身份自述、观点断言、提问这类开头。换的是写法, 不动 p0 / stable 定下的东西: 人设照旧, "
     "产品要不要露出、怎么露出照项目要求。优先级: p0 / stable、draw_angles 分到的坐标和切入角度、用户点名要的写法, "
@@ -89,8 +92,8 @@ TASK = (
 def recent_structure(drafts: list[dict[str, str]]) -> dict | None:
     """``drafts``: 最近打过分的稿子(新的在前), 每篇 ``{题目 id: 答案}``, 只含有效答案。
 
-    回 ``{"window": n, "concentrated": [{question, answer, share}], "task": TASK}``; 篇数不够或哪一处都不扎堆时回
-    None(简报就不带这一栏)。占比的分母是这一题有有效答案的篇数, 那一题有效答案也要够 MIN_DRAFTS 篇。"""
+    回 ``{"window": n, "concentrated": [{question, answer, share, of}], "task": TASK}``; 篇数不够或哪一处都不扎堆时回
+    None(简报就不带这一栏)。占比的分母是这一题有有效答案的篇数(of), 那一题有效答案也要够 MIN_DRAFTS 篇。"""
     drafts = [d for d in (drafts or [])[:MAX_DRAFTS] if isinstance(d, dict) and d]
     if len(drafts) < MIN_DRAFTS:
         return None
@@ -107,7 +110,7 @@ def recent_structure(drafts: list[dict[str, str]]) -> dict | None:
         if share < SHARE_MIN or answer not in FLAG_ANSWERS.get(qid, answers):
             continue
         hits.append((-share, order, {"question": label, "answer": ANSWER_LABELS.get((qid, answer), answer),
-                                     "share": round(share, 2)}))
+                                     "share": round(share, 2), "of": valid}))
     if not hits:
         return None
     return {"window": len(drafts), "concentrated": [h for _s, _o, h in sorted(hits, key=lambda t: t[:2])],

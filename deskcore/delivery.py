@@ -39,6 +39,25 @@ _TAG = re.compile(r"#[^\s#\[\]]+(?:\[话题\]#?)?")
 _TAG_LINE = re.compile(r"^\s*(?:#[^\s#\[\]]+(?:\[话题\]#?)?\s*)+$")
 # 最后一句末尾直接跟着的一串话题("冲鸭！#秋招 #求职")。前一个字是英文字母数字的不算("C#入门" 里没有话题)。
 _TRAILING_INLINE_TAGS = re.compile(r"(?<![A-Za-z0-9])(?:#[^\s#\[\]]+(?:\[话题\]#?)?\s*)+$")
+# 网址里的 #片段(codex review on aw#115): 「详情见 https://example.com/#faq」的 # 前面是 /, 上面那条照样当话题摘, 交付稿里
+# 网址就断了、faq 跑进话题行。# 前面紧挨着、一直是网址字符(不带空白的 ASCII)的那一段像网址 —— 带 ://、带 www.、或者
+# 域名/ —— 就不是话题。只往前看到最近的空白不够: 中文句子里没有空白, 句子前面随便有个网址、甚至 Node.js/ 这种技术栈写法,
+# 末尾的话题就都不摘了("学了Node.js/Express，面试稳了！#秋招")。
+_URL_HINT = re.compile(r"://|www\.|[A-Za-z0-9-]\.[A-Za-z]{2,}(?::\d+)?/", re.I)
+_URL_CHARS = "".join(chr(c) for c in range(0x21, 0x7F))
+
+
+def _is_url_fragment(text: str, at: int) -> bool:
+    """``text[at]`` 那个 # 是不是网址的一部分: 紧挨在它前面、一直是网址字符的那一段像网址。换行、空白、中文都隔断。"""
+    head = text[:at]
+    return _URL_HINT.search(head[len(head.rstrip(_URL_CHARS)):]) is not None
+
+
+def body_tags(body: str) -> list[str]:
+    """正文里的 #话题(话题本体的列表)。网址里的 #片段 不算(codex review on aw#115): 交付稿的话题行里没有它, 查话题的规则
+    也不该看见它。"""
+    body = body or ""
+    return split_tags(" ".join(m.group(0) for m in _TAG.finditer(body) if not _is_url_fragment(body, m.start())))
 
 
 class TemplateError(ValueError):
@@ -242,7 +261,7 @@ def lift_trailing_tags(body: str) -> tuple[str, list[str]]:
     """正文末尾的话题摘出来。10-20 查生产库: 写手的稿子约六分之一末尾带一行 #话题; 模板也拼一行的话交付稿里就是两行。
 
     末尾的整行话题之外, 最后一句后面直接跟着的一串话题("冲鸭！#秋招 #求职")也摘: 不摘的话交付稿照样是两份话题。
-    正文中间的 #话题 不动。"""
+    正文中间的 #话题 不动; 网址里的 #片段(https://example.com/#faq)不是话题, 也不动, 它后面隔开跟着的话题照摘。"""
     lines = (body or "").replace("\r\n", "\n").rstrip().split("\n")
     lifted: list[str] = []
     while lines and (not lines[-1].strip() or _TAG_LINE.match(lines[-1])):
@@ -250,10 +269,12 @@ def lift_trailing_tags(body: str) -> tuple[str, list[str]]:
             lifted = split_tags(lines[-1]) + lifted
         lines.pop()
     if lines:
-        m = _TRAILING_INLINE_TAGS.search(lines[-1])
-        if m and lines[-1][:m.start()].strip():
+        last, pos = lines[-1], 0
+        while (m := _TRAILING_INLINE_TAGS.search(last, pos)) and _is_url_fragment(last, m.start()):
+            pos = _TAG.match(last, m.start()).end()      # 跳过这一段 #片段, 从它后面接着找
+        if m and last[:m.start()].strip():
             lifted = split_tags(m.group(0)) + lifted
-            lines[-1] = lines[-1][:m.start()].rstrip()
+            lines[-1] = last[:m.start()].rstrip()
     return "\n".join(lines).rstrip(), lifted
 
 
@@ -308,13 +329,41 @@ def delivered_post(template: dict, draft: dict) -> tuple[str, list[str]] | None:
     title = str(d.get("title") or "").strip()
     body = str(d.get("body") or "").replace("\r\n", "\n").strip()
     body, tags, _n = post_tags(tpl, title, body, d.get("tags"))
-    return body, _dedupe(tags + split_tags(" ".join(_TAG.findall(body))))
+    return body, _dedupe(tags + body_tags(body))
+
+
+def comment_entries(raw) -> list | None:
+    """写手传的 comments 的外壳 → 一条一项的列表。没传 / null / 空字符串是 []; 外壳本身认不出(数字、true 这类)回 None。
+
+    单独一条字符串或一条 {role, text} 也认成一条(codex review on aw#115): 列表里的每一项本来就认这两种写法, 模型只写一条
+    时常常不包列表。原来非列表一律当 [] —— 项目 min 是 0 的话一句不报, 写手明明给了的评论就从交付稿里消失了。
+    字符串是一整串 JSON 的(模型常把嵌套的列表序列化了再传), 解得开、解出来是评论列表 / 一条 {text} 的, 照解出来的拼;
+    不然整段 JSON 带着「读者：」进交付稿, 一句不报。解不开的([捂脸R]求链接 这类)照旧是一条。
+    rulecheck 查评论也走这一处, 交付稿里有的评论规则才查得到。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return []
+    if isinstance(raw, str) and raw.strip()[0] in "[{":
+        try:
+            got = json.loads(raw)
+        except ValueError:
+            got = None
+        if isinstance(got, list) and all(isinstance(c, (str, dict)) for c in got):
+            return got
+        if isinstance(got, dict) and "text" in got:
+            return [got]
+    if isinstance(raw, (str, dict)):
+        return [raw]
+    return list(raw) if isinstance(raw, (list, tuple)) else None
 
 
 def _comments(raw) -> tuple[list[dict], list[str]]:
     """写手传的 comments → [{role, text}], 外加形状不对的那几条的问题描述。空文本的不算一条。"""
     out, bad = [], []
-    for k, c in enumerate(raw if isinstance(raw, list) else []):
+    entries = comment_entries(raw)
+    if entries is None:
+        return [], [f"comments 应该是列表(每条 {{\"role\": \"reader\", \"text\": \"...\"}}), 现在是 "
+                    f"{type(raw).__name__}, 这篇的评论没拼进去"]
+    for k, c in enumerate(entries):
         if isinstance(c, str):
             c = {"role": "reader", "text": c}
         if not isinstance(c, dict):

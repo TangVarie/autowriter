@@ -224,6 +224,25 @@ def test_forbidden_words_are_found_per_part_case_insensitively():
                    (3, "m-2", "comments", "建议改: 评论里有禁用词「乙」")]
 
 
+def test_a_single_comment_not_wrapped_in_a_list_is_still_checked():
+    """交付稿把一条字符串 / 一条 dict 的 comments 也拼进去了(codex review on aw#115), 查规则也得看得见它。"""
+    rule = _rule(1, "forbidden_word", {"words": ["私信"], "where": ["comments"]})
+    for comments in ("想要的私信我", {"role": "reader", "text": "想要的私信我"}):
+        hits = rulecheck.check([rule], [{"title": "t", "body": "b", "comments": comments}])[0]
+        assert [h["where"] for h in hits] == ["comments"], comments
+
+
+def test_comments_as_a_json_string_and_url_fragments_are_seen_as_delivered():
+    """同交付稿(codex review on aw#115): 一串 JSON 的 comments 拆开查; 网址里的 #片段 不算话题(没有交付模板时也一样)。"""
+    rule = _rule(1, "forbidden_word", {"words": ["私信"], "where": ["comments"]})
+    comments = json.dumps([{"role": "reader", "text": "示例评论"}, {"role": "author", "text": "想要的私信我"}],
+                          ensure_ascii=False)
+    hits = rulecheck.check([rule], [{"title": "t", "body": "b", "comments": comments}])[0]
+    assert [h["what"] for h in hits] == ["必须改: 评论里有禁用词「私信」"]
+    ascii_tag = _rule(2, "forbidden_regex", {"pattern": "[A-Za-z]", "where": ["tags"]})
+    assert rulecheck.check([ascii_tag], [{"title": "t", "body": "详情见 https://example.com/#faq #秋招"}])[0] == []
+
+
 def test_ascii_words_match_on_word_boundaries():
     rules = [_rule(1, "forbidden_word", {"words": ["ad"]})]
     assert rulecheck.check(rules, [{"title": "made in", "body": "reading"}])[0] == []

@@ -162,9 +162,68 @@ def test_deeply_nested_fixed_counts_do_not_hang_the_check_itself():
     assert "太复杂" in str(ei.value)
 
 
+@pytest.mark.parametrize("pattern, ch", [
+    ("(?i:a*)A*B", "A"),                    # codex 给的例子: 组里的 (?i) 只管组里, 但 a 和 A 照样是同一个字, 2000 个 A 实测 2 秒
+    ("a*(?i:A)*b", "a"),
+    ("(?a:\\W*)é*x", "é"),                   # (?a) 下 \W 包括 é, 3000 个 é 实测 7 秒
+    ("(?a)\\W*é*x", "é"),                    # 开头的 (?a) 也得认
+    ("(?s:.*)\\n*x", "\n"),                  # (?s) 下 . 也吃换行
+])
+def test_scoped_flags_are_honored(pattern, ch):
+    """组里的旗 (?i:…) (?s:…) (?a:…) 要按组里的算, 不能一直拿整条的旗比字集(codex review on aw#115)。"""
+    t0 = time.perf_counter()
+    V.re.search(pattern, ch * 1000)
+    assert time.perf_counter() - t0 > 0.05, "这条的例子本身得是慢的, 否则测不出东西"
+    with pytest.raises(V.UnsafeRegex) as ei:
+        V.assert_regex_is_safe(pattern)
+    assert "挨在一起" in str(ei.value)
+
+
+@pytest.mark.parametrize("pattern, ch", [
+    ("(?i)[A-Z]*(?-i:a*)x", "a"),           # (?i)[A-Z] 也吃 a: 只往小写折的话 [A-Z] 不认 a, 有了 (?-i:…) 反而放行了
+    ("(?i)[A-Z]+(?-i:[a-z]+)\\d", "a"),
+    ("(?i:[A-Z]+)\\s*[a-z]+\\d", "a"),
+    ("[a-z]*(?i:[A-Z]*)x", "a"),
+    ("(?i)[À-Þ]*é*x", "é"),                 # É 在 À-Þ 里
+    ("(?i)ß*ẞ*x", "ß"),                     # ẞ 的小写是 ß, casefold 却是 ss
+    ("(?i)İ*i*x", "i"),                     # sre 的小写表里 İ → i
+    ("\\W*[À-Þ]*x", "×"),                  # × 夹在 À-Þ 中间, 两头的 À Þ 都不是 \W
+])
+def test_case_insensitive_sets_are_compared_the_way_re_matches(pattern, ch):
+    """(?i) 下哪些字算在字集里交给 re 自己判(codex review on aw#115): 手写的只往小写折, (?i)[A-Z] 不认 a、ẞ 和 ß 对不上。
+    1000 个字实测 0.4~2.5 秒; 这里配 700 个, 省点时间。"""
+    t0 = time.perf_counter()
+    V.re.search(pattern, ch * 700)
+    assert time.perf_counter() - t0 > 0.05, "这条的例子本身得是慢的, 否则测不出东西"
+    with pytest.raises(V.UnsafeRegex) as ei:
+        V.assert_regex_is_safe(pattern)
+    assert "挨在一起" in str(ei.value)
+
+
+@pytest.mark.parametrize("pattern", ["()(?(1)(a+)+b)", "()(?(1)a*a*a*a*a*b)", "(a)?(?(1)x|.*.*y)"])
+def test_conditional_groups_are_rejected(pattern):
+    """条件组 (?(1)是|否) 两道闸都不往里走, 里面放什么都看不见(codex review on aw#115): ()(?(1)(a+)+b) 22 个 a 0.4 秒、
+    每多 2 个翻一倍。写作台(rulecheck)本来就不收; memory.py 存规则、check_hard_rules 执行期只靠这一道, 一并不收。"""
+    with pytest.raises(V.UnsafeRegex) as ei:
+        V.assert_regex_is_safe(pattern)
+    assert "条件组" in str(ei.value)
+
+
+@pytest.mark.parametrize("pattern", [
+    "(?i)(?-i:a*)(?-i:A*)B",                # 组里关掉了 (?i): {a} 和 {A} 不相交
+    "(?a)(?u:\\W*)é*x",                      # 组里换回 Unicode: \W 不含 é
+    ".*\\n*x",                               # 没有 (?s): . 不吃换行
+])
+def test_scoped_flags_that_narrow_the_set_still_pass(pattern):
+    V.assert_regex_is_safe(pattern)
+
+
 def test_the_codex_example_no_longer_runs():
     """存量里要是已经有这一条(手写进库的), 执行期也当场跳过, 不卡生成。"""
     rule = {"content": "x", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": "a*a*a*a*a*a*a*a*b"}}
+    # 先空跑一次: 第一次调用要起 logger 等(本机约 0.3 秒), 不该算进"有没有真去跑这条正则"里 —— 真跑 40 个 a 是几十秒
+    V.check_hard_rules(hard_rules=[{"content": "x", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": "b"}}],
+                       title="标题", body="a")
     t0 = time.perf_counter()
     assert V.check_hard_rules(hard_rules=[rule], title="标题", body="a" * 40) == []
     assert time.perf_counter() - t0 < 0.5

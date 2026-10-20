@@ -116,6 +116,38 @@ def test_tags_trailing_the_last_sentence_are_lifted_too():
     assert delivery.lift_trailing_tags("在学C#入门") == ("在学C#入门", [])
 
 
+def test_a_url_fragment_at_the_end_of_the_body_is_not_a_tag():
+    """「详情见 https://example.com/#faq」: # 前面是 /, 原来当话题摘, 交付稿里网址断成 https://example.com/、faq 跑进话题行
+    (codex review on aw#115)。网址里的 #片段 留在正文里; 它后面隔开跟着的话题照摘。"""
+    out = delivery.assemble(BLOCKS, [{"title": "甲", "body": "详情见 https://example.com/#faq", "tags": ["话题"]}])
+    assert out["text"] == "【标题】甲\n【正文】详情见 https://example.com/#faq\n#话题"
+    for body in ("详情见 https://example.com/#faq", "详情见https://example.com/#faq", "看 www.example.com/#/a",
+                 "详情见 example.com/#faq"):
+        assert delivery.lift_trailing_tags(body) == (body, []), body
+    assert delivery.lift_trailing_tags("详情见 https://example.com/#faq #秋招 #求职") == (
+        "详情见 https://example.com/#faq", ["秋招", "求职"])
+    assert delivery.lift_trailing_tags("地址 https://example.com/ #秋招") == ("地址 https://example.com/", ["秋招"])
+    assert delivery.delivered_post(BLOCKS, {"title": "甲", "body": "详情见 https://example.com/#faq"})[0] == (
+        "详情见 https://example.com/#faq")
+    # 网址里的 #片段 也不算正文里的话题(codex review on aw#115): 交付稿的话题行里没有 faq, 查话题的规则也不该看见它
+    assert delivery.delivered_post(BLOCKS, {"title": "甲", "body": "详情见 https://example.com/#faq", "tags": ["话题"]}) == (
+        "详情见 https://example.com/#faq", ["话题"])
+
+
+@pytest.mark.parametrize("body, kept, tags", [
+    ("学了Node.js/Express，面试稳了！#秋招", "学了Node.js/Express，面试稳了！", ["秋招"]),        # 根本没有网址
+    ("技术栈：Vue.js/React/Node.js，冲！#秋招 #前端", "技术栈：Vue.js/React/Node.js，冲！", ["秋招", "前端"]),
+    ("详情见https://example.com/faq，冲鸭！#秋招 #求职", "详情见https://example.com/faq，冲鸭！", ["秋招", "求职"]),
+    ("关注www.example.com，每天更新！#秋招", "关注www.example.com，每天更新！", ["秋招"]),
+])
+def test_a_url_earlier_in_the_sentence_does_not_keep_the_trailing_tags(body, kept, tags):
+    """中文句子里没有空白, 「往前到最近一个空白」就是整句(codex review on aw#115): 句子前面随便有个网址、甚至 Node.js/ 这种
+    技术栈写法, 末尾的话题就不摘了, 交付稿里两份话题。只有 # 前面紧挨着、一直是网址字符(ASCII、不带空白)的那一段像网址才算。"""
+    assert delivery.lift_trailing_tags(body) == (kept, tags)
+    out = delivery.assemble({"layout": "blocks", "tags": {"content": 2}}, [{"title": "甲", "body": body, "tags": tags}])
+    assert out["text"] == f"【标题】甲\n【正文】{kept}\n" + " ".join("#" + t for t in tags)
+
+
 def test_a_template_without_tags_leaves_the_body_alone():
     out = delivery.assemble({"layout": "blocks"}, [{"title": "甲", "body": "正文。\n#话题甲", "tags": ["别的"]}])
     assert out["text"] == "【标题】甲\n【正文】正文。\n#话题甲"
@@ -143,6 +175,40 @@ def test_problems_are_reported_against_the_callers_index():
     assert "第 1 条评论没提到「示例品」" in first and "第 2 条评论" not in first
     assert "表格有「方向」列, 这篇没带 direction" in first
     assert by[7] == ["第 1 条评论的 role 是「boss」, 只认 reader / author"]
+
+
+def test_a_single_comment_not_wrapped_in_a_list_is_kept_and_a_bad_container_is_reported():
+    """comments 不是列表(codex review on aw#115): 原来一律当 [], 项目 min 是 0 时一句不报, 写手给了的评论就从交付稿里没了。
+    一条字符串 / 一条 {role, text} 认成一条(列表里每一项本来就认这两种写法); 认不出的外壳报出来; 没传 / null / "" 照旧是没有。"""
+    tpl = {"layout": "blocks", "comments": {"min": 0, "max": 3, "label_reader": "读者：", "label_author": "作者："}}
+
+    def one(comments):
+        return delivery.assemble(tpl, [{"title": "甲", "body": "正文", "comments": comments}])
+
+    assert one("示例评论")["text"] == "【标题】甲\n【正文】正文\n读者：示例评论"
+    assert one({"role": "author", "text": "示例回复"})["text"] == "【标题】甲\n【正文】正文\n作者：示例回复"
+    for empty in (None, "", "  "):
+        assert one(empty) == {"format": "blocks", "text": "【标题】甲\n【正文】正文", "problems": []}, empty
+    for bad in (5, True):
+        out = one(bad)
+        assert out["text"] == "【标题】甲\n【正文】正文"
+        assert len(out["problems"]) == 1 and "comments 应该是列表" in out["problems"][0]["what"], bad
+
+
+def test_comments_sent_as_a_json_string_are_unpacked():
+    """模型常把嵌套的列表整个序列化成一串 JSON 传进来(codex review on aw#115)。当成一条评论的话, 原样的 JSON 带着「读者：」
+    进了交付稿、一句不报; 解得开、解出来是评论列表 / 一条评论的, 照列表拼。解不开的、像 [捂脸R] 这种表情开头的照旧是一条。"""
+    tpl = {"layout": "blocks", "comments": {"min": 1, "max": 3, "label_reader": "读者：", "label_author": "作者："}}
+
+    def one(comments):
+        return delivery.assemble(tpl, [{"title": "甲", "body": "正文", "comments": comments}])
+
+    two = [{"role": "reader", "text": "示例评论"}, {"role": "author", "text": "示例回复"}]
+    assert one(json.dumps(two, ensure_ascii=False)) == {
+        "format": "blocks", "text": "【标题】甲\n【正文】正文\n读者：示例评论\n作者：示例回复", "problems": []}
+    assert one(" " + json.dumps(two[1], ensure_ascii=False))["text"] == "【标题】甲\n【正文】正文\n作者：示例回复"
+    for plain in ("[捂脸R]求链接", "[1, 2]", "{不是 JSON}"):
+        assert one(plain)["text"] == f"【标题】甲\n【正文】正文\n读者：{plain}", plain
 
 
 def test_comments_and_direction_are_not_checked_when_the_template_does_not_ask():

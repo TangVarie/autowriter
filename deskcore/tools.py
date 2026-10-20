@@ -323,8 +323,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         draw_angles 分到的写, 在同一种句式里换说法), 开头别复述它们, 人设和核心场景尽量错开。
         p0 / stable 定的人设、发牌分到的坐标和切入角度、用户点名的题目和改稿都优先于它。
         只用来避开, 不要模仿。
-      · recent_structure —— 【有才出现】本项目最近 window 篇打过分的稿子里, 大多数篇都写成同一个样子的几处
-        (concentrated 每条 {question, answer, share}: 哪一处、扎堆的那种写法、占比)。照 recent_structure.task 做:
+      · recent_structure —— 【有才出现】本项目最近 window 篇打过分的稿子里, 扎堆写成同一个样子的几处
+        (concentrated 每条 {question, answer, share, of}: 哪一处、扎堆的那种写法、占比、占比的分母 —— 这一题有答案的
+        篇数, 可能比 window 少)。照 recent_structure.task 做:
         这一批每一处都至少有一半的稿子换一种写法。p0 / stable、发牌分到的坐标和切入角度、用户点名的写法都优先于它;
         只管新写的稿, 改稿不受它约束。
       · delivery_requirements —— 【项目有交付模板才出现】score_drafts 时每篇 draft 要带什么: ``tags`` 是要给几个话题

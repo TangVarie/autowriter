@@ -31,7 +31,7 @@ import re
 
 import validator
 
-from . import delivery, tvlink
+from . import delivery
 
 logger = logging.getLogger("deskcore.rulecheck")
 
@@ -244,11 +244,11 @@ def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
     if tags is None:
         # 写手传的 tags 和正文末尾那行 #话题 常常是同一批(约六分之一的稿子末尾带一行): 去重, 不然「话题不超过 N 个」
         # 这类按个数数的检查会把同一个话题数两遍
-        raw = delivery.split_tags(d.get("tags")) + delivery.split_tags(" ".join(tvlink._TAG_RE.findall(body)))
+        raw = delivery.split_tags(d.get("tags")) + delivery.body_tags(body)     # 网址里的 #片段 不算
         seen: set[str] = set()
         tags = [t for t in raw if not (delivery.norm_tag(t) in seen or seen.add(delivery.norm_tag(t)))]
     comments = []
-    for c in d.get("comments") if isinstance(d.get("comments"), list) else []:
+    for c in delivery.comment_entries(d.get("comments")) or []:     # 一条字符串 / 一条 dict 也算一条, 同交付稿
         text = c.get("text") if isinstance(c, dict) else c
         if isinstance(text, str) and text.strip():
             comments.append(text.strip())

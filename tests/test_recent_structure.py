@@ -3,7 +3,7 @@
 10-20 生产诊断: 稿子批批长得像。Jev 给每篇打分时答过 TV 的特征题库, 答案在 truth_vault.note_feature_answers
 (subject_type = aw_version, subject_id = versions.id)。open_project 读回本项目最近 ≤30 篇的答案, 数一数,
 占比 ≥ 0.6 的几处摆给模型, 让这一批有一半换个写法。钉住:
-  · 读法: 固定三次往返; 只取答案列, 不取 evidence / 正文; 只认 primary × fq-v0.1 × jev:*、题目版本对得上的有效答案;
+  · 读法: 三步往返(答案那一步按主键排序翻页); 只取答案列, 不取 evidence / 正文; 只认 primary × fq-v0.1 × jev:*、题目版本对得上的有效答案;
     一个 item 算一篇(取最新的、有答案的那一版); 补录副本、别的项目、窗口外的版本都不算(窗口按版本时间, 不按批次);
     答案那次的版本 id 按篇摊, 改得多的一篇不挤掉别的稿子
   · 算法: 少于 12 篇不报; 某一题有效答案少于 12 篇不报; bool 题只报「是」扎堆; product_role(露出要求)不问;
@@ -110,13 +110,13 @@ def _many(w, n, **override):
 # 读法
 # ══════════════════════════════════════════════════════════════════════
 
-def test_reads_by_id_in_three_round_trips_and_never_touches_text():
+def test_reads_by_id_in_three_steps_and_never_touches_text():
     w = _World()
     _many(w, 3)
     c = w.client()
     got = _read(c)
     assert got == [_neutral(0), _neutral(1), _neutral(2)]
-    assert [q["table"] for q in c.calls] == ["batches", "versions", NFA], "固定三次往返"
+    assert [q["table"] for q in c.calls] == ["batches", "versions", NFA, NFA], "三步; 答案翻页: 一页加一次空页"
     nfa = next(q for q in c.calls if q["table"] == NFA)
     assert "evidence" not in nfa["cols"] and "body" not in nfa["cols"], "账本只取答案列, 不取原文片段"
     assert ("eq", "subject_type", "aw_version") in nfa["filters"]
@@ -148,6 +148,29 @@ def test_latest_extraction_wins_when_jev_rejudged():
     w.answer(f"{iid}-v1", "opening_type", "具体事件", extracted_at=_ago(days=3))
     w.answer(f"{iid}-v1", "opening_type", "提问", extractor="jev:1.14.0", extracted_at=_ago(days=1))
     assert _read(w.client()) == [{"opening_type": "提问"}]
+
+
+def test_answers_past_a_thousand_rows_are_paged_not_truncated():
+    """主键是 (subject, 题, 题目版本, extractor, run_tag): Jev 换模型重判一次就多一整套行(codex review on aw#115)。80 个版本
+    × 6 题 × 3 代 = 1,440 行, 过了 db-max-rows(1000); 原来不排序 .limit(1000), 最新那代答案在挑最新之前就被截掉了。"""
+    w = _World()
+    vids = []
+    for i in range(40):
+        iid = w.draft(versions={"v1": None, "v2": None}, days=1 + i / 100)
+        vids += [f"{iid}-v1", f"{iid}-v2"]
+    for gen, (extractor, opening) in enumerate([("jev:1.12.0", "具体事件"), ("jev:1.13.0", "具体事件"),
+                                                ("jev:1.14.0", "提问")]):
+        for vid in vids:
+            for qid in structure.ASKED:
+                w.answer(vid, qid, opening if qid == "opening_type" else "否", extractor=extractor,
+                         extracted_at=_ago(days=3 - gen))
+    assert len(w.answers) == 80 * len(structure.ASKED) * 3 > 1000
+    c = w.client(max_rows=1000)
+    got = _read(c)
+    assert len(got) == structure.MAX_DRAFTS
+    assert all(d == {**NEUTRAL, "opening_type": "提问"} for d in got), "每篇都该是最新那代(jev:1.14.0)的答案"
+    nfa = [q for q in c.calls if q["table"] == NFA]
+    assert len(nfa) == 3 and nfa[0]["orders"][:4] == ["subject_id", "question_id", "question_version", "extractor"]
 
 
 def test_one_vote_per_item_newest_judged_version():
@@ -223,7 +246,7 @@ def test_needs_twelve_drafts():
     assert structure.recent_structure(drafts) is None
     got = structure.recent_structure(drafts + [{**NEUTRAL, "opening_type": "具体事件"}])
     assert got["window"] == structure.MIN_DRAFTS
-    assert got["concentrated"] == [{"question": "正文第一句是哪一种", "answer": "具体事件", "share": 1.0}]
+    assert got["concentrated"] == [{"question": "正文第一句是哪一种", "answer": "具体事件", "share": 1.0, "of": 12}]
     assert got["task"] == structure.TASK
 
 
@@ -237,8 +260,8 @@ def test_share_threshold_and_ordering():
     got = structure.recent_structure(drafts)
     assert got["window"] == 20
     assert got["concentrated"] == [
-        {"question": "标题是不是问句", "answer": "是", "share": 0.85},
-        {"question": "正文第一句是哪一种", "answer": "具体事件", "share": 0.6},
+        {"question": "标题是不是问句", "answer": "是", "share": 0.85, "of": 20},
+        {"question": "正文第一句是哪一种", "answer": "具体事件", "share": 0.6, "of": 20},
     ]
 
 
@@ -255,9 +278,24 @@ def test_share_counts_only_drafts_that_answered_that_question():
     drafts = [{"turning_point": "是"}] * 12 + [{"opening_type": "提问"}] * 8
     got = structure.recent_structure(drafts)
     assert got["window"] == 20
-    assert got["concentrated"] == [{"question": "有没有「以前→转折→后来」的前后转折", "answer": "是", "share": 1.0}]
+    assert got["concentrated"] == [{"question": "有没有「以前→转折→后来」的前后转折", "answer": "是", "share": 1.0,
+                                    "of": 12}]
     # 那一题有效答案不够 12 篇: 不报
     assert structure.recent_structure([{"turning_point": "是"}] * 11 + [{"opening_type": "提问"}] * 9) is None
+
+
+def test_each_share_carries_its_own_denominator():
+    """share 的分母是这一题有答案的篇数, 不是 window(codex review on aw#115): 30 篇里只有 12 篇答了转折题、8 篇「是」,
+    光给 window 30 和 0.67 读起来像是 20 篇都写了转折。每条带上 of, TASK 也得说清楚分母是它。"""
+    drafts = ([{"turning_point": "是", "opening_type": "提问"}] * 8 + [{"turning_point": "否", "opening_type": "提问"}] * 4
+              + [{"opening_type": ["具体事件", "身份自述", "数据事实"][i % 3]} for i in range(18)])
+    got = structure.recent_structure(drafts)
+    assert got["window"] == 30
+    turn = [h for h in got["concentrated"] if h["question"] == "有没有「以前→转折→后来」的前后转折"]
+    assert turn == [{"question": "有没有「以前→转折→后来」的前后转折", "answer": "是", "share": 0.67, "of": 12}]
+    assert "of" in structure.TASK and "window" in structure.TASK and "分母" in structure.TASK
+    for text in (structure.TASK, tools.open_project.__doc__ or ""):      # 给模型看的说明两处都不能再说「大多数篇」
+        assert "大多数" not in text
 
 
 def test_window_is_capped_at_thirty_newest():
@@ -276,7 +314,7 @@ def test_model_sees_chinese_labels_not_question_ids():
     for qid in structure.QUESTIONS:
         assert qid not in text, qid
     assert "其他(列清单、贴参数这类)" in text
-    assert all(set(h) == {"question", "answer", "share"} for h in got["concentrated"])
+    assert all(set(h) == {"question", "answer", "share", "of"} for h in got["concentrated"])
 
 
 def test_validated_pattern_questions_are_never_asked():
@@ -307,8 +345,8 @@ def test_brief_carries_recent_structure():
     assert set(rs) == {"window", "concentrated", "task"}
     assert rs["window"] == 15
     assert rs["concentrated"] == [
-        {"question": "有没有写到已经发生的坏结果", "answer": "是", "share": 1.0},
-        {"question": "正文第一句是哪一种", "answer": "具体事件", "share": 0.93},
+        {"question": "有没有写到已经发生的坏结果", "answer": "是", "share": 1.0, "of": 15},
+        {"question": "正文第一句是哪一种", "answer": "具体事件", "share": 0.93, "of": 15},
     ]
 
 

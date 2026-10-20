@@ -43,6 +43,7 @@
 
 from __future__ import annotations
 
+import functools
 import re
 from typing import Optional
 
@@ -74,6 +75,27 @@ def _parse_pattern(pattern: str):
         except Exception:      # noqa: BLE001 — 解析不了/API 变了都算"拿不到"
             continue
     return None
+
+
+def _has_conditional(seq) -> bool:
+    """树里有没有条件组 (?(1)是|否)(codex review on aw#115)。它解析出来是 (组号, 是, 否), 下面两道闸都不往里走, 里面放什么都
+    看不见: ()(?(1)(a+)+b) 22 个 a 0.4 秒、每多 2 个翻一倍。写作台(rulecheck._assert_regex_shape)本来就不收; memory.py
+    存规则、check_hard_rules 执行期只靠这一道, 也不收 —— 写禁用词的规则用不到它。"""
+    for op, av in seq or ():
+        name = getattr(op, "name", str(op))
+        if name == "GROUPREF_EXISTS":
+            return True
+        if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT", "SUBPATTERN", "ASSERT", "ASSERT_NOT"):
+            subs = [av[-1]]
+        elif name == "ATOMIC_GROUP":
+            subs = [av]
+        elif name == "BRANCH":
+            subs = list(av[1] or ())
+        else:
+            continue
+        if any(_has_conditional(sub) for sub in subs):
+            return True
+    return False
 
 
 def _has_nested_unbounded_repeat(node) -> bool:
@@ -132,8 +154,12 @@ _AMBIGUITY_BUDGET = 10_000
 _UNROLL = 16
 _MAX_COUNT_CHAIN = 11
 _WALK_STEPS = 20_000
-_PROBE_CHARS = ("".join(chr(c) for c in range(128)) + " 　 é٣０Ａａ中一哈的。，！？、：；“”（）【】#\U0001F600")
-_CATEGORY_RX: dict = {}
+# 探针: ASCII 和 Latin-1 补充全部(× ÷ 夹在 À-Þ / à-þ 中间, 只看两头会漏: \W*[À-Þ]*x 配 1000 个 × 0.6 秒) + 几个常见字和大小写
+# 怪字。别的非 ASCII 范围只探两头和这里有的字 —— 公共字只在范围中间的照样看不见, 已知不完备(codex review on aw#115)。
+_PROBE_CHARS = ("".join(chr(c) for c in range(256))
+                + "\u3000\u2028٣０Ａａ中一哈的ıİſ\u212aẞ。，！？、：；“”（）【】\U0001F600")
+_CATEGORY_SRC = {"CATEGORY_DIGIT": r"\d", "CATEGORY_NOT_DIGIT": r"\D", "CATEGORY_SPACE": r"\s",
+                 "CATEGORY_NOT_SPACE": r"\S", "CATEGORY_WORD": r"\w", "CATEGORY_NOT_WORD": r"\W"}
 
 
 class _Chars:
@@ -154,40 +180,77 @@ class _Chars:
 _ANY_CHAR = _Chars(lambda c: True, "")
 
 
-def _char_test(op_name: str, av, flags: int) -> _Chars:
-    """单个字符的节点 → 它的字集。拿不准的一律当"什么字都可能"。"""
-    # casefold 可能变成两个字("ß" → "ss"), 那种就照原字比 —— 下面 RANGE 要拿它 ord()
-    fold = (lambda c: c.casefold() if len(c.casefold()) == 1 else c) if flags & re.IGNORECASE else (lambda c: c)
-    if op_name == "LITERAL":
-        ch = chr(av)
-        return _Chars(lambda c: fold(c) == fold(ch), ch)
-    if op_name == "NOT_LITERAL":
-        ch = chr(av)
-        return _Chars(lambda c: fold(c) != fold(ch), ch)
+@functools.lru_cache(maxsize=1024)
+def _case_variants(c: str) -> str:
+    """(?i) 下可能和 c 互认的字, 只拿来当探针(多几个无妨): lower/upper/casefold(单个字的)、re._casefix 那几组(ı/i、ſ/s、
+    K(开尔文)/k…), 再折一轮(K → k → K)。"""
+    vs = {c} | {v for v in (c.lower(), c.upper(), c.casefold()) if len(v) == 1}
+    try:
+        from re import _casefix
+        vs |= {chr(k) for v in list(vs) for k in _casefix._EXTRA_CASES.get(ord(v), ())}
+    except Exception:                                    # noqa: BLE001 — 私有表拿不到就少几个探针
+        pass
+    vs |= {v for x in list(vs) for v in (x.lower(), x.upper()) if len(v) == 1}
+    return "".join(sorted(vs))
+
+
+@functools.lru_cache(maxsize=4096)
+def _one_char_rx(src: str, flags: int):
+    return re.compile(src, flags)
+
+
+def _char_src(op_name: str, av):
+    """单个字符的节点 → (能单独编译的正则原文, 节点里写出来的字(范围取两头)); 认不出返回 None。
+    RANGE / CATEGORY 只会出现在 [...] 里, 给的是方括号里那一截。"""
+    if op_name in ("LITERAL", "NOT_LITERAL"):
+        return ("[^%s]" if op_name == "NOT_LITERAL" else "%s") % re.escape(chr(av)), chr(av)
     if op_name == "ANY":
-        return _ANY_CHAR if flags & re.DOTALL else _Chars(lambda c: c != "\n", "\n")
+        return ".", "\n"
     if op_name == "RANGE":
-        lo, hi = av
-        return _Chars(lambda c: lo <= ord(c) <= hi or lo <= ord(fold(c)) <= hi, chr(lo) + chr(hi))
+        return re.escape(chr(av[0])) + "-" + re.escape(chr(av[1])), chr(av[0]) + chr(av[1])
     if op_name == "CATEGORY":
-        name = getattr(av, "name", str(av))
-        rx = _CATEGORY_RX.get(name)
-        if rx is None:
-            esc = {"CATEGORY_DIGIT": r"\d", "CATEGORY_NOT_DIGIT": r"\D", "CATEGORY_SPACE": r"\s",
-                   "CATEGORY_NOT_SPACE": r"\S", "CATEGORY_WORD": r"\w", "CATEGORY_NOT_WORD": r"\W"}.get(name)
-            rx = _CATEGORY_RX[name] = re.compile(esc) if esc else None
-        return _Chars(lambda c: rx.fullmatch(c) is not None, "") if rx else _ANY_CHAR
+        src = _CATEGORY_SRC.get(getattr(av, "name", str(av)))
+        return (src, "") if src else None
     if op_name == "IN":
-        sets, negate = [], False
-        for sub_op, sub_av in av:
+        srcs, chars = [], ""
+        for k, (sub_op, sub_av) in enumerate(av):
             sub_name = getattr(sub_op, "name", str(sub_op))
-            if sub_name == "NEGATE":
-                negate = True
+            if sub_name == "NEGATE" and k == 0:
+                srcs.append("^")
                 continue
-            sets.append(_char_test(sub_name, sub_av, flags))
-        union = _union(sets)
-        return _Chars(lambda c: not union.test(c), union.probes) if negate else union
-    return _ANY_CHAR
+            got = _char_src(sub_name, sub_av) if sub_name in ("LITERAL", "RANGE", "CATEGORY") else None
+            if got is None:
+                return None
+            srcs.append(got[0])
+            chars += got[1]
+        return "[" + "".join(srcs) + "]", chars
+    return None
+
+
+def _char_test(op_name: str, av, flags: int) -> _Chars:
+    """单个字符的节点 → 它的字集。拿不准的一律当"什么字都可能"。
+
+    哪些字算在里面交给 re 自己判: 把这个节点单独编译(带上这一段生效的 i / s / a 旗)再 fullmatch(codex review on aw#115)。
+    手写的折叠对不齐 sre: 只往小写折, (?i)[A-Z] 就不认 a —— 有了 (?-i:…) 以后 (?i)[A-Z]*(?-i:a*)x 被放行, 1000 个 a 1 秒多;
+    还有 ẞ/ß、İ/i、K(开尔文)/k 这几对 casefold 对不上的; (?a) 下 \\W \\D \\S 反而更宽(é ٣ 都算进去)。
+    探针是节点里写出来的字, (?i) 下再加它们的大小写变体 —— 交集只在大小写另一边的(é 对 [À-Þ] 里的 É)也探得到。"""
+    if op_name == "ANY" and flags & re.DOTALL:
+        return _ANY_CHAR
+    got = _char_src(op_name, av)
+    if got is None:
+        return _ANY_CHAR
+    src, chars = got
+    if op_name in ("RANGE", "CATEGORY"):                 # 方括号里那一截, 单独编译得套上 []
+        src = "[" + src + "]"
+    rx_flags = flags & (re.IGNORECASE | re.DOTALL | re.ASCII | re.UNICODE)
+    if rx_flags & re.ASCII:
+        rx_flags &= ~re.UNICODE
+    try:
+        rx = _one_char_rx(src, rx_flags)
+    except re.error:                                     # 拼出来的原文编译不了: 当什么字都行
+        return _ANY_CHAR
+    probes = "".join(_case_variants(c) for c in chars) if flags & re.IGNORECASE else chars
+    return _Chars(lambda c: rx.fullmatch(c) is not None, probes)
 
 
 def _overlap(a: _Chars, b: _Chars) -> bool:
@@ -203,9 +266,18 @@ def _subset(a: _Chars, b: _Chars) -> bool:
     return not a.mask & ~b.mask and all(b.test(c) for c in a.probes + b.probes if a.test(c))
 
 
+def _scoped(flags: int, av) -> int:
+    """进 SUBPATTERN 时换上它自己的旗: (?i:…) / (?-i:…) / (?s:…) / (?a:…) 只管组里那一段(codex review on aw#115)。
+    一直拿整条的旗比, (?i:a*)A*B 就看成 {a} 和 {A} 不相交 —— 实测 2000 个 A 2 秒。开头的 (?i) 已经在 state.flags 里。"""
+    add, dele = (av[1] or 0, av[2] or 0) if isinstance(av, tuple) and len(av) == 4 else (0, 0)
+    if add & (re.ASCII | re.UNICODE):                    # (?a)…(?u:\w) 里 \w 回到 Unicode: 字符类旗只留组里给的那个
+        flags &= ~(re.ASCII | re.UNICODE)
+    return (flags | add) & ~dele
+
+
 def _check_adjacent_repeats(tree) -> None:
     """顺着解析树走一遍: 挨在一起的切法数超预算抛 _Ambiguous, 闸自己走的步数超了抛 _TooComplex。"""
-    flags = getattr(getattr(tree, "state", None), "flags", 0) or 0
+    root_flags = getattr(getattr(tree, "state", None), "flags", 0) or 0
     single = {"LITERAL", "NOT_LITERAL", "ANY", "IN"}
     repeats = ("MAX_REPEAT", "MIN_REPEAT")
     steps = [0]
@@ -213,7 +285,7 @@ def _check_adjacent_repeats(tree) -> None:
     def name_of(node):
         return getattr(node[0], "name", str(node[0]))
 
-    def chars_of(seq):
+    def chars_of(seq, flags):
         """一段(量词底下那一段)能吃的所有字的并集; 认不出就当什么字都行。"""
         sets = []
         for op, av in seq or ():
@@ -221,7 +293,7 @@ def _check_adjacent_repeats(tree) -> None:
             if name in single:
                 sets.append(_char_test(name, av, flags))
             elif name == "SUBPATTERN":
-                sets.append(chars_of(av[-1]))
+                sets.append(chars_of(av[-1], _scoped(flags, av)))
             elif name != "AT":
                 return _ANY_CHAR
         return _union(sets)
@@ -239,7 +311,7 @@ def _check_adjacent_repeats(tree) -> None:
                 return True
         return False
 
-    def counting_tail(items) -> set:
+    def counting_tail(items, flags) -> set:
         """这一段结尾那串「X R X R … X」里 X 的下标(都算隔断): 单个字 X 和同一个量词 R 一个隔一个, X 结尾, X 不超过
         _MAX_COUNT_CHAIN 份; R 下限 ≤ 1、无上界、底下一个字、X 是 R 的一部分。只对后面整条正则就结束了的那一段调。
         一定得一个隔一个: 结尾两个 X 挨着([!！].*[!！][!！])要的就是「连着两个」, 不再只是个数, 前面每种选法都会试。"""
@@ -260,11 +332,11 @@ def _check_adjacent_repeats(tree) -> None:
         cx, cr = _char_test(name_of(items[-1]), items[-1][1], flags), _char_test(name_of(sub[0]), sub[0][1], flags)
         return xs if _subset(cx, cr) else set()
 
-    def walk(seq, open_, at_end=False):
+    def walk(seq, open_, flags, at_end=False):
         """open_: [(字集, 到这里为止的切法数)]。返回走完这一段之后还开着的; 超预算就抛 _Ambiguous。
-        at_end: 这一段之后整条正则就结束了(没有任何能失败的东西)。"""
+        flags: 这一段生效的旗(组里的 (?i:…) 这类已经换上)。at_end: 这一段之后整条正则就结束了(没有任何能失败的东西)。"""
         items = list(seq or ())
-        counting = counting_tail(items) if at_end else set()
+        counting = counting_tail(items, flags) if at_end else set()
         for i, (op, av) in enumerate(items):
             steps[0] += 1 + len(open_)
             if steps[0] > _WALK_STEPS:
@@ -282,13 +354,13 @@ def _check_adjacent_repeats(tree) -> None:
                 lo, hi, sub = av
                 if lo == hi or last:                             # 定长 {n}: 当一串固定的字; 结尾的量词: 只当 {下限}
                     if lo != hi:
-                        walk(sub, [])                            # 多吃的那几次还是会试, 底下那一段自己查
-                    open_ = walk(list(sub) * min(lo, _UNROLL), open_, last and lo <= _UNROLL) if lo else open_
+                        walk(sub, [], flags)                     # 多吃的那几次还是会试, 底下那一段自己查
+                    open_ = walk(list(sub) * min(lo, _UNROLL), open_, flags, last and lo <= _UNROLL) if lo else open_
                     continue
-                walk(sub, [])                                    # 量词底下那一段自己也查((?:a*a*){1,3})
+                walk(sub, [], flags)                             # 量词底下那一段自己也查((?:a*a*){1,3})
                 if hi > 1 and has_variable_repeat(sub):          # 每一次之间也挨着: (?:.{0,20}){0,5}x / (?:\w{1,5})+x
-                    walk(list(sub) * min(hi, _UNROLL), [])
-                cs = chars_of(sub)
+                    walk(list(sub) * min(hi, _UNROLL), [], flags)
+                cs = chars_of(sub, flags)
                 span = _OPEN_SPAN if hi >= _MAXREPEAT else hi - lo + 1
                 cost = span * max([c for e, c in open_ if _overlap(e, cs)] or [1])
                 if cost > _AMBIGUITY_BUDGET:
@@ -297,22 +369,22 @@ def _check_adjacent_repeats(tree) -> None:
                     open_ = [e for e in open_ if _overlap(e[0], cs)]
                 open_ = open_ + [(cs, cost)]
             elif name in ("POSSESSIVE_REPEAT", "ATOMIC_GROUP"):
-                walk(av[-1] if name == "POSSESSIVE_REPEAT" else av, [])   # 里面自己查; 不回吐, 前后接不上
+                walk(av[-1] if name == "POSSESSIVE_REPEAT" else av, [], flags)   # 里面自己查; 不回吐, 前后接不上
                 open_ = []
             elif name == "SUBPATTERN":
-                open_ = walk(av[-1], open_, last)
+                open_ = walk(av[-1], open_, _scoped(flags, av), last)
             elif name == "BRANCH":
-                after = [walk(alt, list(open_), last) for alt in (av[1] or ())]
+                after = [walk(alt, list(open_), flags, last) for alt in (av[1] or ())]
                 open_ = [e for branch in after for e in branch]
             elif name in ("ASSERT", "ASSERT_NOT"):
-                walk(av[1], [])
+                walk(av[1], [], flags)
             elif name == "AT":
                 continue
             else:                                                # 回引这类认不出的: 不当隔断
                 continue
         return open_
 
-    walk(tree, [], True)
+    walk(tree, [], root_flags, True)
 
 
 class _Ambiguous(Exception):
@@ -347,6 +419,8 @@ def assert_regex_is_safe(pattern: str) -> None:
         raise UnsafeRegex(f"正则无法编译: {exc}") from exc
 
     tree = _parse_pattern(pattern)
+    if (_has_conditional(tree) if tree is not None else "(?(" in pattern):
+        raise UnsafeRegex("条件组 (?(1)…|…) 不支持: 闸看不进它里面, 没法确认不会卡死。拆成几条规则, 或者换成不带条件组的写法。")
     dangerous = (_has_nested_unbounded_repeat(tree) if tree is not None
                  else bool(_NESTED_QUANT_TEXT_RE.search(pattern)))
     if dangerous:

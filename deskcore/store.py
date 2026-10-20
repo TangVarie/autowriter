@@ -2563,11 +2563,14 @@ def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days
 # 每篇打分的稿子 Jev 都答一遍 TV 的特征题库, 写进 truth_vault.note_feature_answers(subject_type = 'aw_version',
 # subject_id = versions.id::text, run_tag = 'primary', extractor = 'jev:<模型版本>'; judge_client.build_draft_request
 # 和 Jev 的 judge/core.ledger_rows)。写作台回包里本来就有这份 profile, 但从来没存 —— 直接回账本读, 不另存一份。
-# 和 recent_titles 同一条纪律: 固定三次往返(批次 → 版本 id 与时间 → 答案), 只取 id、时间和答案列,
-# 不取正文, 也不取 evidence(那是稿子原文片段)。
+# 和 recent_titles 同一条纪律: 三步(批次 → 版本 id 与时间 → 答案), 只取 id、时间和答案列,
+# 不取正文, 也不取 evidence(那是稿子原文片段)。答案那一步翻页(见 STRUCTURE_VERSIONS_MAX), 平常是一页加一次空页。
 STRUCTURE_BATCH_DAYS = 60
 STRUCTURE_ITEMS_MAX = 60
-# 一次 .in_() 最多带这么多个版本 id: 6 题 × 80 = 480 行, 在 PostgREST 的 db-max-rows(1000)以内, 不用翻页
+# 一次 .in_() 最多带这么多个版本 id。⚠️ 行数不是 6 题 × 80 = 480 就封顶(codex review on aw#115): 主键是
+# (subject, 题, 题目版本, extractor, run_tag), Jev 换过模型重判一次就多一整套行(jev:<新版本>), 题库升了题目版本旧行也留着
+# —— 三代就是 1,440 行, 过了 PostgREST 的 db-max-rows(1000), 原来不排序 .limit(1000) 会静默截掉一截, 最新那代答案、
+# 甚至整篇稿子都可能在挑最新之前就没了。所以按主键剩下那几列排好序翻页(_paged), 一行不丢。
 STRUCTURE_VERSIONS_MAX = 80
 # 窗口里最多看这么多行版本(只有 id / item_id / 时间, 一行几十字节)。按 item 摊名额之前先取够: 改过几十轮的那一篇
 # 要把这么多行都占满才挤得掉别的稿子
@@ -2617,11 +2620,15 @@ def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[
     cands.sort(key=lambda c: (c[0], c[2]), reverse=True)
     if not cands:
         return []
-    rows = (sb.schema("truth_vault").table("note_feature_answers")
-            .select("subject_id, question_id, question_version, answer, extractor, extracted_at")
-            .eq("subject_type", "aw_version").eq("run_tag", "primary").eq("bank_version", bank_version)
-            .in_("question_id", sorted(questions)).in_("subject_id", [c[2] for c in cands])
-            .limit(1000).execute()).data or []
+    vids = [c[2] for c in cands]
+    rows = _paged(lambda off, lim: (
+        sb.schema("truth_vault").table("note_feature_answers")
+        .select("subject_id, question_id, question_version, answer, extractor, extracted_at")
+        .eq("subject_type", "aw_version").eq("run_tag", "primary").eq("bank_version", bank_version)
+        .in_("question_id", sorted(questions)).in_("subject_id", vids)
+        # subject_type / run_tag 上面钉死了, 剩下这四列就是主键: 排序唯一, 翻页不漏不重
+        .order("subject_id").order("question_id").order("question_version").order("extractor")
+        .range(off, off + lim - 1)))
     best: dict[tuple[str, str], tuple[str, str]] = {}      # (版本 id, 题) → (抽取时间, 答案)
     for r in rows:
         qid, ans = r.get("question_id"), str(r.get("answer") or "").strip()
