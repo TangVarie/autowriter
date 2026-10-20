@@ -296,9 +296,9 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `tvlink.edit_diff` 现在两边先去掉话题再比；`tv_edit_diffs.diff_rev` 记每行按哪一版口径（`tvlink.DIFF_REV`）算的。
 tv-sync 把 `diff_rev` 过时的行按新口径重算（同一版不推 `computed_at`，每个 TV 项目每晚最多 500 条），`edit_digest` 只读当前口径的行。
 SQL Editor / `apply_migration` 直接跑（幂等），**先于**代码部署。验收：`doctor` 里「tv_edit_diffs 的 diff_rev 列」applied；
-下一晚 tv-sync 之后 `select d.diff_rev, count(*), count(*) filter (where d.changed) from autowriter.tv_edit_diffs d join autowriter.tv_note_links l using (note_id) where l.lag_days is null or l.lag_days >= 0 group by 1` 全是当前口径（`lag_days < 0` 的抄回行故意留在旧口径，见下一段，验收时排除）。
+下一晚 tv-sync 之后 `select d.diff_rev, count(*), count(*) filter (where d.changed) from autowriter.tv_edit_diffs d join autowriter.tv_note_links l using (note_id) where l.version_id is not null and l.match_kind in ('body_exact','title_exact','fuzzy','edited','tv_lineage') and (l.lag_days is null or l.lag_days >= 0) group by 1` 全是当前口径（`lag_days < 0` 的抄回行、降回 0 的行故意留在旧口径，见下一段，验收时排除）。
 以后改 `edit_diff` 的算法就把 `DIFF_REV` +1，不用再加迁移。
-`DIFF_REV = 2`（10-20）：写作台那版晚于发布的（`tv_note_links.lag_days < 0`，发了之后才抄回写作台）不再算差异。首晚 440 条里 212 条是这种，不是人改写作台的稿；它们的旧行停在旧口径上，不重算、摘要也不读（不删库）。
+`DIFF_REV = 2`（10-20）：写作台那版晚于发布的（`tv_note_links.lag_days < 0`，发了之后才抄回写作台）不再算差异。首晚 440 条里 212 条是这种，不是人改写作台的稿；它们的旧行停在旧口径上，不重算、摘要也不读（不删库）。以前对上时没记 lag 的对照（笔记那时还没有发布时间，或老代码对上的），tv-sync 在两边时间都有了时补上并写回 `tv_note_links`，补出来 < 0 的同样不算；`--rematch` 重对过的笔记只看重对后的对照。已经按当前口径算过、但对照现在不该算的差异行降回 `diff_rev = 0`（cron 日志的「改动差异」那行会带「对照补上 lag N 条 / 降回旧口径 N 行」；这两笔和写差异各写各的，哪笔失败就单独报一行 ⚠️、退出码非零）。差异行记的那一版和现在的对照不是同一版的（重对那晚差异没写成）也会重算，computed_at 记新时间。
 
 ### 1.9 `013_tv_edits` —— 改得多的同一篇也认 + 人在发布前改了什么（2026-10-19，D-120 / W-23）
 
