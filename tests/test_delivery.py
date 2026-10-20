@@ -16,12 +16,14 @@ from __future__ import annotations
 import json
 import random
 import threading
+import time
 
 import pytest
 
 import config
 import judge_client
-from deskcore import cli, core, delivery
+import validator
+from deskcore import cli, core, delivery, rulecheck
 from tests.fakes import FakeClient
 
 ME = "11111111-1111-1111-1111-111111111111"
@@ -134,6 +136,31 @@ def test_a_url_fragment_at_the_end_of_the_body_is_not_a_tag():
         "详情见 https://example.com/#faq", ["话题"])
 
 
+@pytest.mark.parametrize("line, tags", [
+    ("学习C#入门", []), ("F#语言 和 1#楼", []), ("C#abc#def", []), ("学习C#入门 #编程", ["编程"]),
+    ("#abc#def", ["abc", "def"]), ("#秋招[话题]#求职[话题]#", ["秋招", "求职"]), ("#学C#入门", ["学C", "入门"]),
+    ("冲鸭！#秋招 #求职", ["秋招", "求职"]), ("冲鸭🔥#秋招", ["秋招"]), ("全角Ａ#秋招", ["秋招"]),
+    ("详情见 https://example.com/#faq #秋招", ["秋招"]),
+    # 收尾的那个 # 不开一串(codex review on aw#115): "#秋招[话题]#" 的第二个 # 是收尾, 后面隔着一段正文的 "C#入门" 不接在
+    # 这串话题后面; 中文句子里没有空白, 往回找最近的 # 会一路找到它
+    ("#秋招[话题]#今天学C#入门", ["秋招"]), ("上岸了#秋招[话题]#，学C#入门", ["秋招"]), ("看了#租房[话题]#1#楼的房子", ["租房"]),
+    # 收尾的 # 后面是正文, 不是又一个话题: 整句留在正文里, 不摘(原来 "开心" 被当成话题摘走)
+    ("今天拿到offer了#秋招[话题]#开心", ["秋招"]), ("#秋招[话题]#今天就到这里", ["秋招"]),
+    # 带 [话题] 的是小红书的话题写法, 前一个字是英文字母数字也算(它不会是 "C#入门" 这种词的一部分)
+    ("拿到offer#秋招[话题]#", ["秋招"]), ("冲刺2026#秋招[话题]# #求职[话题]#", ["秋招", "求职"]),
+])
+def test_finding_tags_lifting_tags_and_counting_agree_on_what_a_tag_is(line, tags):
+    """哪个 # 算话题只在 validator.topic_tag_matches 认一处(codex review on aw#115): 正文里找话题(查话题的规则)、摘末尾话题
+    (交付稿)、数字数三处一个口径。"C#入门" 前一个字是英文字母数字, 不是话题; 连写的 "#abc#def"、"#a[话题]#b[话题]#" 后一个
+    # 紧接着前一个话题, 是; 全角字、emoji、标点后面的 # 也是; 带 [话题] 的不管前一个字是什么都是。"""
+    assert delivery.body_tags(line) == tags
+    kept, lifted = delivery.lift_trailing_tags(line)
+    assert delivery.body_tags(kept) + lifted == tags
+    assert validator.count_chars(line) == validator.count_chars(kept)
+    assert [m.start() for m in validator.topic_tag_matches(line)] == \
+        [i for i, ch in enumerate(line) if ch == "#" and validator.is_topic_tag(line, i)]
+
+
 @pytest.mark.parametrize("body, kept, tags", [
     ("学了Node.js/Express，面试稳了！#秋招", "学了Node.js/Express，面试稳了！", ["秋招"]),        # 根本没有网址
     ("技术栈：Vue.js/React/Node.js，冲！#秋招 #前端", "技术栈：Vue.js/React/Node.js，冲！", ["秋招", "前端"]),
@@ -146,6 +173,30 @@ def test_a_url_earlier_in_the_sentence_does_not_keep_the_trailing_tags(body, kep
     assert delivery.lift_trailing_tags(body) == (kept, tags)
     out = delivery.assemble({"layout": "blocks", "tags": {"content": 2}}, [{"title": "甲", "body": body, "tags": tags}])
     assert out["text"] == f"【标题】甲\n【正文】{kept}\n" + " ".join("#" + t for t in tags)
+
+
+def test_prose_after_an_inline_topic_stays_in_the_delivered_body():
+    """最后一句中间夹着一个 "#秋招[话题]#"、后面还有话(codex review on aw#115): 原来摘末尾话题的正则在 [话题]# 那个可有可无的
+    # 上回溯, 把收尾的 # 当成下一个话题的开头, 后面那半句被当成话题摘走 —— 传了 tags 的话那半句直接从交付稿里没了。"""
+    tpl = {"layout": "blocks", "tags": {"content": 2}}
+    body = "第一段。\n最后祝大家#秋招[话题]#顺利拿到offer！"
+    out = delivery.assemble(tpl, [{"title": "甲", "body": body, "tags": ["秋招", "求职"]}])
+    assert out["text"] == f"【标题】甲\n【正文】{body}\n#秋招 #求职"
+    out = delivery.assemble(tpl, [{"title": "甲", "body": body}])
+    assert out["text"] == f"【标题】甲\n【正文】{body}", "没传 tags 也不能把后半句拼成话题"
+    assert delivery.delivered_post(tpl, {"title": "甲", "body": body}) == (body, ["秋招"])
+    assert delivery.lift_trailing_tags("正文。\n#秋招[话题]#今天就到这里") == ("正文。\n#秋招[话题]#今天就到这里", [])
+
+
+@pytest.mark.parametrize("body", ["#a" * 10_000 + "[", "#汉" * 10_000 + "[", "冲鸭#a" * 5_000 + "。"],
+                         ids=["ascii", "cjk", "prose"])
+def test_lifting_tags_is_linear(body):
+    """摘末尾话题不用会回溯的正则(codex review on aw#115): 原来 "#a#a…#a[" 两万字要几秒, 一直握着 GIL。"""
+    t0 = time.monotonic()
+    delivery.lift_trailing_tags(body)
+    delivery.body_tags(body)
+    validator.count_chars(body)
+    assert time.monotonic() - t0 < 0.3
 
 
 def test_a_template_without_tags_leaves_the_body_alone():
@@ -207,8 +258,66 @@ def test_comments_sent_as_a_json_string_are_unpacked():
     assert one(json.dumps(two, ensure_ascii=False)) == {
         "format": "blocks", "text": "【标题】甲\n【正文】正文\n读者：示例评论\n作者：示例回复", "problems": []}
     assert one(" " + json.dumps(two[1], ensure_ascii=False))["text"] == "【标题】甲\n【正文】正文\n作者：示例回复"
-    for plain in ("[捂脸R]求链接", "[1, 2]", "{不是 JSON}"):
+    for plain in ("[捂脸R]求链接", "[1, 2] 选哪个", "{不是 JSON}"):
         assert one(plain)["text"] == f"【标题】甲\n【正文】正文\n读者：{plain}", plain
+
+
+def test_a_comment_without_a_string_text_is_reported_not_dropped_or_stringified():
+    """没有 text 的({role, content} 这种)原来一句不报就没了; text 是列表 / 数字 / dict 的原来拿 str() 拼进交付稿(Python 的
+    ['…']), 而查规则只认字符串、看不见它, 两边对不上(codex review on aw#115)。都算这一条形状不对: 报出来, 不拼。
+    同样的东西序列化成一串 JSON 传进来也一样: 解出来是一个对象 / 一个列表的, 照对象 / 列表认, 每项再查形状。原来没有 text 的
+    对象、夹着 null 的列表整段 JSON 带着「读者：」拼进去(作者的回复成了读者评论), 一句不报, 还算够条数。"""
+    tpl = {"layout": "blocks", "comments": {"min": 0, "max": 9, "label_reader": "读者：", "label_author": "作者："}}
+    comments = [{"role": "author", "content": "示例回复"}, {"role": "reader", "text": ["示例甲", "示例乙"]},
+                {"role": "reader", "text": 12}, {"text": {"示例": 1}}, {"role": "reader", "text": None},
+                {"role": "reader", "text": "示例评论"}, {"role": "reader", "text": "  "}]
+    out = delivery.assemble(tpl, [{"title": "甲", "body": "正文", "comments": comments}])
+    assert out["text"] == "【标题】甲\n【正文】正文\n读者：示例评论"
+    assert [p["what"] for p in out["problems"]] == [
+        f'第 {k} 条评论应该是 {{"role": "reader", "text": "..."}}' for k in (1, 2, 3, 4, 5)], "空白的 text 照旧不算一条、不报"
+    one = delivery.assemble(tpl, [{"title": "甲", "body": "正文", "comments": {"role": "author", "content": "示例回复"}}])
+    assert one["text"] == "【标题】甲\n【正文】正文" and len(one["problems"]) == 1
+    shape = '第 {} 条评论应该是 {{"role": "reader", "text": "..."}}'
+    for raw, delivered, bad in [
+        (json.dumps({"role": "author", "content": "示例回复"}, ensure_ascii=False), "", [1]),
+        (json.dumps({"comments": [{"role": "reader", "text": "示例评论"}]}, ensure_ascii=False), "", [1]),  # 外面再包一层: 不往里解
+        (json.dumps([{"role": "author", "text": "示例回复"}, None, 3], ensure_ascii=False), "\n作者：示例回复", [2, 3]),
+        ("[1, 2]", "", [1, 2]),
+    ]:
+        out = delivery.assemble(tpl, [{"title": "甲", "body": "正文", "comments": raw}])
+        assert out["text"] == "【标题】甲\n【正文】正文" + delivered, raw
+        assert [p["what"] for p in out["problems"]] == [shape.format(k) for k in bad], raw
+
+
+def test_tags_sent_as_a_json_string_are_unpacked():
+    """模型常把 tags 列表 json.dumps 成一串传进来(默认分隔是 ", "): 原来按空白切成 '["a",' 和 '"b"]', 交付稿里是
+    #["a", #"b"], 一句不报, 话题数还算够(codex review on aw#115)。一项去掉空白后以 [ 开头、解得开是列表的, 列表里的字符串
+    照常再切(# 和 [话题] 照摘)。"""
+    tpl = {"layout": "blocks", "tags": {"content": 2}}
+    for raw in (json.dumps(["话题甲", "话题乙"], ensure_ascii=False), json.dumps(["#话题甲", "话题乙[话题]#"]),
+                [" " + json.dumps(["话题甲", "#话题乙"], ensure_ascii=False)], json.dumps(["#话题甲 #话题乙", 3])):
+        out = delivery.assemble(tpl, [{"title": "甲", "body": "正文", "tags": raw}])
+        assert out == {"format": "blocks", "text": "【标题】甲\n【正文】正文\n#话题甲 #话题乙", "problems": []}, raw
+    assert delivery.delivered_post(tpl, {"title": "甲", "body": "正文", "tags": json.dumps(["话题甲"])}) == ("正文", ["话题甲"])
+    assert delivery.split_tags("#话题甲 [话题]") == ["话题甲"], "不是 JSON 的照旧按空白切"
+
+
+def test_deeply_nested_brackets_never_raise_out_of_the_shared_splitters():
+    """tags / comments 是一长串 [ 的: json.loads 抛的是 RecursionError, 不是 ValueError(3.11 上 1000 层、3.13 上一万层就到)。
+    原来直接抛出去, 拼交付稿和代码查规则都在 core 那边的 except Exception 里 —— 一篇坏的, 整批的 delivery 都没了、
+    rule_checks_status 记成 error, 写得好好的那几篇也一起(codex review on aw#115)。照解不开的字符串处理。"""
+    deep = "[" * 20_000
+    tpl = {"layout": "blocks", "tags": {"content": 2},
+           "comments": {"min": 0, "max": 3, "label_reader": "读者：", "label_author": "作者："}}
+    for field in ("tags", "comments"):
+        drafts = [{"title": "甲", "body": "正文", field: deep}, {"title": "乙", "body": "正文", "tags": ["话题甲"]}]
+        out = delivery.assemble(tpl, drafts)
+        assert "【标题】乙\n【正文】正文\n#话题甲" in out["text"], field
+        assert delivery.delivered_post(tpl, drafts[0])[0] == "正文"
+        assert rulecheck.check([], drafts) == ([], {"rules": 0, "skipped": 0})
+        rule = {"id": "m-1", "content": "示例规则", "severity": "hard", "rule_kind": "forbidden_word",
+                "rule_payload": {"words": ["示例词"], "where": [field]}}
+        assert rulecheck.check([rule], drafts) == ([], {"rules": 1, "skipped": 0})
 
 
 def test_comments_and_direction_are_not_checked_when_the_template_does_not_ask():

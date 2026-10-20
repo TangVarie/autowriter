@@ -218,6 +218,123 @@ def test_scoped_flags_that_narrow_the_set_still_pass(pattern):
     V.assert_regex_is_safe(pattern)
 
 
+# ── 1c · 前瞻、占有量词、原子组都不是隔断(codex review on aw#115) ─────────────────────────────────────────────
+# 前瞻 (?=…) (?!…) 不吃字, 但前面开着的量词每换一种切法, 它就在那个位置重查一遍: 里面的量词和前面的照样挨着。占有量词 / 原子组
+# 不回吐, 可它们能吃空(.*a*+.*x 前后两个 .* 还是挨着), 吃的又是前面那个也能吃的字的话, 前面每换一种切法它就从头吃一遍。
+
+@pytest.mark.parametrize("pattern, ch", [
+    ("\\d+(?=\\d*元)", "1"),          # 2000 位实测 4~6 秒
+    (".*(?=.*x)", "a"),
+    ("\\w*(?=\\w*x)", "a"),
+    ("\\w*(?!\\w*x)y", "a"),          # 负向前瞻一样
+    ("\\d+(?=\\d*)x", "1"),           # 前瞻里结尾的量词: 前瞻后面还有东西, 每次都吃到底, 不只当下限
+    ("\\w*(?!\\w*)", "a"),            # 负向前瞻里头成了就是失败、要回头: 整条最后一项也不只当下限
+    (".*a*+.*x", "b"),                # 占有量词吃空: 前后两个 .* 还是挨着
+    (".*(?>a*).*x", "b"),
+    (".*a++.*x", "a"),                # 吃的是 .* 也能吃的字: .* 每换一种切法它从头吃一遍
+    ("\\d+(?>x?)\\d+y", "1"),         # 2000 位实测 4~5 秒
+    ("\\w*(?>a?)\\w*!", "b"),         # 2000 字实测 7~8 秒
+    ("\\d+\\d++x", "1"),
+    ("\\d+(?<=\\d(?=\\d*x))", "1"),   # 后顾定长, 可它里面的前瞻照样往后扫: 2000 位 4 秒
+    ("\\d+(?<=(?=\\d*x)\\d)", "1"),
+])
+def test_lookaheads_possessives_and_atomic_groups_do_not_separate(pattern, ch):
+    """1000 个字实测 0.15~1 秒(2000 个字 1~8 秒)。"""
+    t0 = time.perf_counter()
+    V.re.search(pattern, ch * 1000)
+    assert time.perf_counter() - t0 > 0.05, "这条的例子本身得是慢的, 否则测不出东西"
+    with pytest.raises(V.UnsafeRegex) as ei:
+        V.assert_regex_is_safe(pattern)
+    assert "挨在一起" in str(ei.value)
+
+
+@pytest.mark.parametrize("pattern, texts", [
+    ("\\d+(?=元)", ["1" * 2000]),
+    ("\\d+(?=\\s*元)", ["1" * 2000, "1" + " " * 2000]),
+    ("(?=.*品牌).*折扣", ["a" * 2000, "品牌" * 1000]),
+    ("(?=.*A)(?=.*B).*C", ["A" * 2000, "AB" * 1000]),
+    ("\\d+(?!\\d)", ["1" * 2000]),
+    ("\\w+(?=\\s)", ["a" * 2000]),
+    ("(?<!\\d)\\d{11}(?!\\d)", ["1" * 2000]),
+    ("[^\\n]*(?=\\n)", ["a" * 2000]),
+    ("\\d+(?<=\\d)x", ["1" * 2000]),            # 后顾只能定长
+    ("\\d+(?=\\d*)", ["1" * 2000]),             # 整条最后一项是正向前瞻: 它成了整条就成了, 里面结尾的量词只当下限
+    ("^\\S+(?:\\s+\\S+){3}", ["a" * 2000, "a " * 1000]),
+    ("\\d++\\.\\d+", ["1" * 2000]),             # 占有量词前面没有开着的: 和单个 \d+ 一样
+    ("(?>\\w+)\\s+\\w+", ["a" * 2000]),
+    ("a*+a*b", ["a" * 2000]),                   # 2 万个 a 0.16 秒, 比单个 a*b(0.28 秒)还快
+    (".*\\d++", ["a" * 2000, "1" * 2000]),     # 整条最后一项: 成了整条就成了, 和不占有的一样
+], ids=lambda v: v if isinstance(v, str) else None)
+def test_lookaheads_possessives_and_atomic_groups_that_stay_allowed_are_fast(pattern, texts):
+    """放行的照样得真的快: 上面拒的那几条 2000 字都要 1~8 秒, 这些和单个量词一个量级(2000 字几毫秒)。"""
+    V.assert_regex_is_safe(pattern)
+    for text in texts:
+        t0 = time.perf_counter()
+        V.re.search(pattern, text)
+        assert time.perf_counter() - t0 < 0.2, (pattern, text[:20])
+
+
+def test_the_check_computes_each_char_set_once(monkeypatch):
+    """前瞻 / 原子组 / 占有量词里那一段接着前面开着的查, 走到的每个单字节点都要和开着的比字集。每次都新建一个字集、两百多个
+    探针字各跑一遍 fullmatch 的话, 33 个字的 .*(?=(?:(?:(?:a\\d){16}){16}){10}) 闸自己就要 0.4~0.6 秒 —— 而
+    check_hard_rules 每次生成、每条规则都重跑一遍闸(codex review on aw#115)。同一个节点(连同生效的旗)一次检查里只算一次。"""
+    calls, real = [], V._char_test
+    monkeypatch.setattr(V, "_char_test", lambda *a: calls.append(repr(a)) or real(*a))
+    for pattern in (".*(?=(?:(?:(?:a\\d){16}){16}){10})", ".*(?!(?:(?:(?:a\\d){16}){16}){10})x",
+                    ".*(?>(?:(?:(?:a\\d){16}){16}){10})x"):
+        calls.clear()
+        t0 = time.perf_counter()
+        V.assert_regex_is_safe(pattern)
+        assert time.perf_counter() - t0 < 0.2, pattern
+        assert len(calls) == len(set(calls)), (pattern, len(calls), len(set(calls)))
+
+
+# ── 1d · 可选 / 次数可变的组里的量词, 和组外面的照样挨着(codex review on aw#115) ─────────────────────────────────
+# (?:…)? / (?:…){m,n} 原来当一整块: 字集算「什么字都能吃」, 组里的量词只自己查, 和组前面开着的从来不比, 组里结尾还开着的也
+# 不往后传。价格、词数这种写法很容易写出来: \d+(?:[,，]?\d+)?元 2000 位 19 秒; 一段没有「！」的中文配 \S+(?:\s*\S+)?！
+# 2000 字 20 秒以上。前瞻里套一层可选组(\d+(?=\s*(?:\d+)?元))、组里放占有量词 / 原子组 / 前瞻, 前面那几道也一样被绕过去。
+
+@pytest.mark.parametrize("pattern, ch, n", [
+    ("\\d+(?:[,，]?\\d+)?元", "1", 500),         # 1000 位 2 秒, 2000 位 19 秒
+    ("\\S+(?:\\s*\\S+)?！", "中", 500),           # 1000 字 3 秒
+    ("\\d+(?:\\s*\\d+)?元", "1", 500),
+    ("(?:\\d+\\s*)?\\d+元", "1", 1000),          # 组里结尾还开着的 \d+ 接着往后传, 和后面的 \d+ 挨着
+    ("(?:\\w+\\s*)?\\w+！", "中", 1000),
+    ("\\d+(?=\\s*(?:\\d+)?元)", "1", 500),       # 前瞻里的可选组
+    ("\\d+(?=(?:\\s*\\d+)?元)", "1", 500),
+    ("\\d+(?:\\d++)?x", "1", 1000),              # 组里的占有量词、原子组、前瞻也一样
+    ("\\d+(?:(?>\\d*))?x", "1", 1000),
+    ("\\d+(?:(?=\\d*x))?y", "1", 1000),
+    ("\\d*(?:a?b?){1,3}\\d*x", "1", 1000),        # 组能一个字都不吃: 下限 ≥ 1 也断不开组前后的两个 \d*
+    ("\\d*(?:a|)+\\d*x", "1", 1000),
+    ("\\d*(?:a?b?)++\\d*x", "1", 1000),
+])
+def test_repeats_inside_optional_or_counted_groups_still_meet_their_neighbours(pattern, ch, n):
+    t0 = time.perf_counter()
+    V.re.search(pattern, ch * n)
+    assert time.perf_counter() - t0 > 0.05, "这条的例子本身得是慢的, 否则测不出东西"
+    with pytest.raises(V.UnsafeRegex) as ei:
+        V.assert_regex_is_safe(pattern)
+    assert "挨在一起" in str(ei.value)
+
+
+@pytest.mark.parametrize("pattern, texts", [
+    # 组的字集照实算(组里有量词原来也当「什么字都能吃」): 前瞻里的 \s* 吃不了组里的 . 和数字, 不算挨着。2000 位 0.08 秒、2 万位
+    # 8.5 秒, 和放行的 \d+(?=\s*元)(2 万位 4.7 秒)、\d+(?:\.\d+)?(?=元)(6.8 秒)一样, 是每个起点各试一遍的平方级, 不是挨着的量词
+    ("\\d+(?:\\.\\d+)?(?=\\s*元)", ["1" * 1000, "1." * 1000, "1" + " " * 2000, "1.1" * 700]),
+    ("\\d+(?:\\.\\d+)?(?=\\s*[元块])", ["1" * 1000, "1." * 1000, "1" + " " * 2000]),
+    ("\\d+(?:\\.\\d+)?\\s*[元块]", ["1" * 1000, "1." * 1000, "1" + " " * 2000, "1.1" * 700]),
+    ("\\d+(?:\\.\\d+)?元", ["1" * 1000, "1." * 1000]),
+    ("[\\u4e00-\\u9fff]+(?:[a-z]+)?！", ["中" * 1000, "中a" * 500]),
+], ids=lambda v: v if isinstance(v, str) else None)
+def test_optional_groups_that_stay_allowed_are_fast(pattern, texts):
+    V.assert_regex_is_safe(pattern)
+    for text in texts:
+        t0 = time.perf_counter()
+        V.re.search(pattern, text)
+        assert time.perf_counter() - t0 < 0.2, (pattern, text[:20])
+
+
 def test_the_codex_example_no_longer_runs():
     """存量里要是已经有这一条(手写进库的), 执行期也当场跳过, 不卡生成。"""
     rule = {"content": "x", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": "a*a*a*a*a*a*a*a*b"}}

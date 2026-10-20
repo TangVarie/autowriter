@@ -2564,9 +2564,15 @@ def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days
 # subject_id = versions.id::text, run_tag = 'primary', extractor = 'jev:<模型版本>'; judge_client.build_draft_request
 # 和 Jev 的 judge/core.ledger_rows)。写作台回包里本来就有这份 profile, 但从来没存 —— 直接回账本读, 不另存一份。
 # 和 recent_titles 同一条纪律: 三步(批次 → 版本 id 与时间 → 答案), 只取 id、时间和答案列,
-# 不取正文, 也不取 evidence(那是稿子原文片段)。答案那一步翻页(见 STRUCTURE_VERSIONS_MAX), 平常是一页加一次空页。
+# 不取正文, 也不取 evidence(那是稿子原文片段)。答案那一步翻页(见 STRUCTURE_VERSIONS_MAX), 一轮是一页加一次空页。
+# 最近 STRUCTURE_ITEMS_MAX 篇里有答案的凑不够 ``limit``(30)篇、更早的稿子或没问过的旧版本还有, 就往下再问一轮, 最多
+# STRUCTURE_ROUNDS_MAX 轮(见 recent_structure_answers)。⚠️ 不只是 judge 停过才这样(codex review on aw#115): judge 不覆盖
+# 的项目 —— 没配 judge、tv_project_map 没映射(一篇都不判)—— 每次开项目都问满这几轮, 多几趟空请求、什么也换不来; 只判了
+# 一部分的(judge 刚接上)也常要多问一两轮。有界(每轮 id 封顶、最多三轮), 换的是 judge 停过一阵之后这一栏不空。补问的
+# 那几轮失败不丢第一轮找到的。
 STRUCTURE_BATCH_DAYS = 60
-STRUCTURE_ITEMS_MAX = 60
+STRUCTURE_ITEMS_MAX = 60          # 一轮最多看这么多篇
+STRUCTURE_ROUNDS_MAX = 3
 # 一次 .in_() 最多带这么多个版本 id。⚠️ 行数不是 6 题 × 80 = 480 就封顶(codex review on aw#115): 主键是
 # (subject, 题, 题目版本, extractor, run_tag), Jev 换过模型重判一次就多一整套行(jev:<新版本>), 题库升了题目版本旧行也留着
 # —— 三代就是 1,440 行, 过了 PostgREST 的 db-max-rows(1000), 原来不排序 .limit(1000) 会静默截掉一截, 最新那代答案、
@@ -2580,7 +2586,8 @@ STRUCTURE_VERSION_ROWS_MAX = 300
 def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[int, frozenset]],
                              bank_version: str, limit: int = 30, days: int = STRUCTURE_BATCH_DAYS,
                              now: datetime | None = None) -> list[dict[str, str]]:
-    """本项目最近 ``limit`` 篇打过分的稿子各答了什么, 新的在前: ``[{题目 id: 答案}, ...]``。异常原样上抛。
+    """本项目最近 ``limit`` 篇打过分的稿子各答了什么, 新的在前: ``[{题目 id: 答案}, ...]``。批次、版本和第一轮答案的
+    异常原样上抛; 往下补问的那几轮失败只记一条 warning, 用前面几轮找到的。
 
     ``questions`` = {题目 id: (题目版本, 合法答案)}: 版本对不上、答案为空(无效)或不在合法答案里的行都不算。
     一个 item 算一篇, 取它最新的、有答案的那一版(改稿是往同一个 item 上加一版, 每一版都判过一次, 全算会让改得多的
@@ -2591,7 +2598,11 @@ def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[
     item 上加一版, 批次还是原来那个。所以批次往前多看几倍天数(只为认出补录副本), 版本按时间取。
     答案那一次 .in_() 的版本 id 按 item 摊(codex review on aw#115): 先给每篇最新的一版, 有空再给每篇次新的一版……
     原来是在整批版本上按时间截 80 个再一篇一票, 改过几轮的一篇占好几个名额 —— 30 篇各三版只剩 27 篇, 一篇改了几十轮的
-    能把窗口压到 12 篇以下。"""
+    能把窗口压到 12 篇以下。
+    没判出答案的稿子不占名额(codex review on aw#115): 原来先截最近 STRUCTURE_ITEMS_MAX 篇再问答案, judge 停过一阵、
+    最近 60 篇都没答案的话这一栏就是空的 —— 窗口里明明还有 30 篇更早的、判过的。所以一轮问完凑不够 ``limit`` 篇, 就把
+    还没找到答案、也还有版本没问过的那些篇接着排下一轮(上一轮没轮到的旧版本在前, 再往后是更早的稿子), 最多
+    STRUCTURE_ROUNDS_MAX 轮; 每轮还是按篇摊、id 封顶。"""
     if not questions:
         return []
     now = now or datetime.now(timezone.utc)
@@ -2612,15 +2623,53 @@ def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[
         t = _ts(v.get("created_at"))
         if v.get("id") and v.get("item_id") and t is not None and t >= since:
             by_item.setdefault(str(v["item_id"]), []).append((t, str(v["item_id"]), str(v["id"])))
-    # 每篇一条道, 道内新的在前; 最近改过 / 写过的 STRUCTURE_ITEMS_MAX 篇, 一层一层轮着取, 直到 id 封顶
+    # 每篇一条道, 道内新的在前; 道按最新那一版排, 最近改过 / 写过的在前
     lanes = sorted((sorted(vs, key=lambda c: (c[0], c[2]), reverse=True) for vs in by_item.values()),
-                   key=lambda vs: (vs[0][0], vs[0][2]), reverse=True)[:STRUCTURE_ITEMS_MAX]
-    cands = [vs[depth] for depth in range(max(map(len, lanes), default=0)) for vs in lanes
-             if depth < len(vs)][:STRUCTURE_VERSIONS_MAX]
+                   key=lambda vs: (vs[0][0], vs[0][2]), reverse=True)
+    asked = [0] * len(lanes)                        # 每条道已经问过前几版
+    judged: set[str] = set()                        # 已经找到有答案那一版的 item
+    cands: list[tuple[datetime, str, str]] = []
+    by_version: dict[str, dict[str, str]] = {}
+    for rnd in range(STRUCTURE_ROUNDS_MAX):
+        # 这一轮: 还没找到答案、还有版本没问过的前 STRUCTURE_ITEMS_MAX 篇, 一层一层轮着取, 直到 id 封顶
+        open_ = [k for k, vs in enumerate(lanes) if vs[0][1] not in judged and asked[k] < len(vs)][:STRUCTURE_ITEMS_MAX]
+        picked = [(k, lanes[k][asked[k] + depth])
+                  for depth in range(max((len(lanes[k]) - asked[k] for k in open_), default=0))
+                  for k in open_ if asked[k] + depth < len(lanes[k])][:STRUCTURE_VERSIONS_MAX]
+        if not picked:
+            break
+        try:
+            got = _feature_answers(sb, [c[2] for _k, c in picked], questions, bank_version)
+        except Exception:
+            if not rnd:
+                raise                               # 第一轮就读不到: 账本读不到, 这一栏不带(调用方兜着)
+            # 往下补问是锦上添花(codex review on aw#115): 这一趟一时失败, 前面几轮找到的照用 —— 只问一轮时它们本来就交得出去
+            logger.warning("recent structure 第 %d 轮补问答案失败, 用前面几轮找到的 %d 篇 (project=%s)",
+                           rnd + 1, len(judged), project_id, exc_info=True)
+            break
+        for k, c in picked:                         # 每条道取走的是它还没问过的最前面几版
+            asked[k] += 1
+            cands.append(c)
+        by_version.update(got)
+        judged.update(c[1] for _k, c in picked if c[2] in by_version)
+        if len(judged) >= limit:
+            break
     cands.sort(key=lambda c: (c[0], c[2]), reverse=True)
-    if not cands:
-        return []
-    vids = [c[2] for c in cands]
+    out: list[dict[str, str]] = []
+    taken: set[str] = set()
+    for _t, iid, vid in cands:
+        if iid in taken or vid not in by_version:
+            continue
+        taken.add(iid)
+        out.append(by_version[vid])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _feature_answers(sb, vids: list[str], questions: dict[str, tuple[int, frozenset]],
+                     bank_version: str) -> dict[str, dict[str, str]]:
+    """这几版在特征题上的有效答案: ``{版本 id: {题目 id: 答案}}``, 一个有效答案都没有的版本不在里面。"""
     rows = _paged(lambda off, lim: (
         sb.schema("truth_vault").table("note_feature_answers")
         .select("subject_id, question_id, question_version, answer, extractor, extracted_at")
@@ -2644,16 +2693,7 @@ def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[
     by_version: dict[str, dict[str, str]] = {}
     for (vid, qid), (_at, ans) in best.items():
         by_version.setdefault(vid, {})[qid] = ans
-    out: list[dict[str, str]] = []
-    taken: set[str] = set()
-    for _t, iid, vid in cands:
-        if iid in taken or vid not in by_version:
-            continue
-        taken.add(iid)
-        out.append(by_version[vid])
-        if len(out) >= limit:
-            break
-    return out
+    return by_version
 
 
 # ── 补录锁(migrations/009): 跨进程互斥, 按项目一行, 带 TTL ─────────────────

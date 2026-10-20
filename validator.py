@@ -133,7 +133,7 @@ def _has_nested_unbounded_repeat(node) -> bool:
 # ── 挨在一起、能匹配同样字符的量词(codex review on aw#115) ──────────────────────────────
 # 不嵌套也能回溯到卡死: a*a*a*a*a*a*a*a*b 配 30 个 a 要 1 秒, 200 个 a 超过 3 秒; 两个就够: .*.*x 配 2000 字的
 # 一行 1.5 秒。k 个这样的量词挨着, 后面的东西匹配失败时要把那一段在它们之间的 n^k 种切法全试一遍。
-# 判法: 顺着每一层往下走, 记着"还开着"的量词(可变长、能回吐的: * + ? {m,n} 且 m≠n; 占有量词不回吐, 不算)。
+# 判法: 顺着每一层往下走, 记着"还开着"的量词(可变长、能回吐的: * + ? {m,n} 且 m≠n; 占有量词不回吐, 不算 —— 但也不是隔断, 见下)。
 # 后面来一个量词, 字集和某个开着的有交集, 就算接在它后面, 切法数相乘(无上界按 _OPEN_SPAN 算); 乘过
 # _AMBIGUITY_BUDGET 就拒。隔断: 一个必须吃掉的字、开着的那个量词吃不了(\d+\.\d+ 的 \.); 或者连着两个以上的
 # 固定字(品牌[\s\S]*品牌: 多字的词在正文里出现的次数少, 切法数被它的出现次数封住 —— Jev 的规则编译器就教模型
@@ -149,6 +149,19 @@ def _has_nested_unbounded_repeat(node) -> bool:
 # · 外层量词的每一次之间也是挨着的: 定次 {n} 展开 n 份(最多 _UNROLL 份; 2^14 已经过预算, 再多也查不出新的); 次数可变、
 #   底下又有可变长量词的, 也展开 min(上限, _UNROLL) 份自己查 —— (?:.{0,20}){5}x 配 120 字 4.8 秒、(?:\w{1,5})+x 配 26 字
 #   3.2 秒, 两道老闸都放行。展开套几层就是几次方, 闸自己走的步数也封顶(_WALK_STEPS), 超了按太复杂拒。
+# · 前瞻 (?=…) (?!…)、占有量词、原子组 (?>…) 都不是隔断(codex review on aw#115)。前瞻不吃字, 可前面开着的量词每换一种切法
+#   它就在那个位置重查一遍, 里面的量词和前面的照样挨着(\d+(?=\d*元) 2000 位 4~6 秒); 查完的结果丢掉, 后面接的还是前瞻之前
+#   开着的那些。正向前瞻是整条最后一项时它成了整条就成了, 里面结尾的量词照样只当下限; 负向的里面成了反倒是失败、要回头, 不算
+#   (\w*(?!\w*) 2000 字 6 秒)。后顾只能定长, 可它里面还能套前瞻(\d+(?<=\d(?=\d*x)) 2000 位 4 秒), 所以也接着开着的查、查完
+#   丢掉。占有量词 / 原子组不回吐, 自己不算开着的; 可能吃空的话前后两个照样
+#   挨着(.*a*+.*x 2000 字 1.7 秒、\d+(?>x?)\d+y 2000 位 4~5 秒), 吃的是前面开着的那个也能吃的字, 前面每换一种切法它就从头吃一遍
+#   (.*a++.*x 2000 个 a 1 秒) —— 所以照普通量词算切法数、照普通量词断开它吃不了的那些开着的, 只是不加进开着的里面。
+# · 次数可变的组 (?:…)? / (?:…){m,n} 不是一整块(codex review on aw#115)。原来组里那一段只自己查, 整组的字集当「什么字都能吃」:
+#   组里的量词和组前面开着的从来不比, 组里结尾还开着的也不往后传 —— \d+(?:[,，]?\d+)?元 2000 位 19 秒、(?:\d+\s*)?\d+元 5 秒、
+#   一段没有「！」的中文配 \S+(?:\s*\S+)?！ 20 秒以上, 前面几条(前瞻、占有量词)套一层可选组也就绕过去了。现在组里有可变长量词的,
+#   底下那一段(展开 min(下限, _UNROLL) 份, 至少一份)接着前面开着的查, 组里新开的、走完还开着的接在整组后面往后传。整组的字集照实
+#   算(组、分支、量词底下都往里看; 前瞻后顾不吃字, 不算), 不然 \d+(?:\.\d+)?(?=\s*元) 这种快的也拒。下限 ≥ 1 的组能吃空的话
+#   ((?:a?b?){1,3})也不断开前面开着的: 吃空也算一次, 组前后的两个照样挨着(\d*(?:a?b?){1,3}\d*x 2000 位 10 秒)。
 _OPEN_SPAN = 1000
 _AMBIGUITY_BUDGET = 10_000
 _UNROLL = 16
@@ -281,22 +294,58 @@ def _check_adjacent_repeats(tree) -> None:
     single = {"LITERAL", "NOT_LITERAL", "ANY", "IN"}
     repeats = ("MAX_REPEAT", "MIN_REPEAT")
     steps = [0]
+    tests: dict = {}
 
     def name_of(node):
         return getattr(node[0], "name", str(node[0]))
 
+    def char_test(name, av, flags) -> _Chars:
+        """_char_test 按 (节点, 旗) 记下来, 这一次检查里同一个节点只算一次字集(codex review on aw#115): 前瞻 / 原子组 / 占有量词
+        里那一段要接着前面开着的查, 走到的每个单字都和开着的比; 每次新建一个, 两百多个探针字就各跑一遍 fullmatch,
+        .*(?=(?:(?:(?:a\\d){16}){16}){10}) 这么短一条闸自己就要 0.4~0.6 秒。记在这一次调用里, 不跨正则攒。"""
+        key = (name, repr(av), flags)
+        if key not in tests:
+            tests[key] = _char_test(name, av, flags)
+        return tests[key]
+
     def chars_of(seq, flags):
-        """一段(量词底下那一段)能吃的所有字的并集; 认不出就当什么字都行。"""
+        """一段(量词底下那一段)能吃的所有字的并集: 组、分支、量词底下都往里看, 前瞻后顾和 ^ $ \\b 不吃字、不算; 只有认不出的
+        (回引这类)才当什么字都行。组里有量词原来也一律当什么字都行, \\d+(?:\\.\\d+)?(?=\\s*元) 里的 \\s* 就被看成能接着组吃,
+        快的也拒(codex review on aw#115)。"""
         sets = []
         for op, av in seq or ():
             name = getattr(op, "name", str(op))
             if name in single:
-                sets.append(_char_test(name, av, flags))
+                sets.append(char_test(name, av, flags))
             elif name == "SUBPATTERN":
                 sets.append(chars_of(av[-1], _scoped(flags, av)))
-            elif name != "AT":
+            elif name in repeats + ("POSSESSIVE_REPEAT",):
+                sets.append(chars_of(av[2], flags))
+            elif name == "ATOMIC_GROUP":
+                sets.append(chars_of(av, flags))
+            elif name == "BRANCH":
+                sets.extend(chars_of(alt, flags) for alt in (av[1] or ()))
+            elif name not in ("AT", "ASSERT", "ASSERT_NOT"):
                 return _ANY_CHAR
         return _union(sets)
+
+    def may_be_empty(seq) -> bool:
+        """这一段能不能一个字都不吃(拿不准算能)。量词下限 ≥ 1 时「至少吃一个字、它吃不了的那些开着的就此断开」只对吃不空的
+        那一段成立: (?:a?b?){1,3} 吃空也算一次, \\d*(?:a?b?){1,3}\\d*x 前后两个 \\d* 还是挨着(2000 位 10 秒)。"""
+        for op, av in seq or ():
+            name = getattr(op, "name", str(op))
+            if name in single:
+                return False
+            if name in repeats + ("POSSESSIVE_REPEAT",):
+                if av[0] and not may_be_empty(av[2]):
+                    return False
+            elif name in ("SUBPATTERN", "ATOMIC_GROUP"):
+                if not may_be_empty(av[-1] if isinstance(av, tuple) else av):
+                    return False
+            elif name == "BRANCH":
+                if not any(may_be_empty(alt) for alt in (av[1] or ())):
+                    return False
+        return True
 
     def has_variable_repeat(seq) -> bool:
         for op, av in seq or ():
@@ -308,6 +357,8 @@ def _check_adjacent_repeats(tree) -> None:
                 if has_variable_repeat(av[-1] if isinstance(av, tuple) else av):
                     return True
             elif name == "BRANCH" and any(has_variable_repeat(alt) for alt in (av[1] or ())):
+                return True
+            elif name in ("ASSERT", "ASSERT_NOT") and has_variable_repeat(av[1]):
                 return True
         return False
 
@@ -329,7 +380,7 @@ def _check_adjacent_repeats(tree) -> None:
         lo, hi, sub = items[-2][1]
         if lo > 1 or hi < _MAXREPEAT or len(sub) != 1 or name_of(sub[0]) not in single:
             return set()
-        cx, cr = _char_test(name_of(items[-1]), items[-1][1], flags), _char_test(name_of(sub[0]), sub[0][1], flags)
+        cx, cr = char_test(name_of(items[-1]), items[-1][1], flags), char_test(name_of(sub[0]), sub[0][1], flags)
         return xs if _subset(cx, cr) else set()
 
     def walk(seq, open_, flags, at_end=False):
@@ -348,9 +399,9 @@ def _check_adjacent_repeats(tree) -> None:
                 if (name == "LITERAL" and nxt == "LITERAL") or i in counting:
                     open_ = []                                   # 两个字以上的固定词 / 数个数的那个字: 隔断
                 else:
-                    cs = _char_test(name, av, flags)
+                    cs = char_test(name, av, flags)
                     open_ = [e for e in open_ if _overlap(e[0], cs)]
-            elif name in repeats:
+            elif name in repeats or (name == "POSSESSIVE_REPEAT" and last):   # 结尾的占有量词: 成了整条就成了, 同普通的
                 lo, hi, sub = av
                 if lo == hi or last:                             # 定长 {n}: 当一串固定的字; 结尾的量词: 只当 {下限}
                     if lo != hi:
@@ -365,19 +416,37 @@ def _check_adjacent_repeats(tree) -> None:
                 cost = span * max([c for e, c in open_ if _overlap(e, cs)] or [1])
                 if cost > _AMBIGUITY_BUDGET:
                     raise _Ambiguous()
-                if lo:                                           # 至少吃一个: 它吃不了的那些开着的就此断开
+                inner = []
+                if has_variable_repeat(sub):                     # 组里的量词接着组前面开着的查, 组里新开的往后传(见上)
+                    before = {id(e) for e in open_}
+                    inner = [e for e in walk(list(sub) * max(1, min(lo, _UNROLL)), list(open_), flags)
+                             if id(e) not in before]
+                if lo and not may_be_empty(sub):                 # 至少吃一个: 它吃不了的那些开着的就此断开
                     open_ = [e for e in open_ if _overlap(e[0], cs)]
-                open_ = open_ + [(cs, cost)]
-            elif name in ("POSSESSIVE_REPEAT", "ATOMIC_GROUP"):
-                walk(av[-1] if name == "POSSESSIVE_REPEAT" else av, [], flags)   # 里面自己查; 不回吐, 前后接不上
-                open_ = []
+                open_ = open_ + [(cs, cost)] + inner
+            elif name == "POSSESSIVE_REPEAT":                    # 不回吐, 自己不算开着的; 可也不是隔断(见上)
+                lo, hi, sub = av
+                walk(sub, list(open_), flags)                    # 每次从头吃: 底下那一段接着前面开着的查
+                cs = chars_of(sub, flags)
+                if lo != hi:                                     # 前面每换一种切法它就吃一遍: 和开着的照样相乘(.*a++.*x)
+                    span = _OPEN_SPAN if hi >= _MAXREPEAT else hi - lo + 1
+                    if span * max([c for e, c in open_ if _overlap(e, cs)] or [1]) > _AMBIGUITY_BUDGET:
+                        raise _Ambiguous()
+                if lo and not may_be_empty(sub):                 # 至少吃一个: 它吃不了的那些开着的就此断开; 能吃空就都还开着
+                    open_ = [e for e in open_ if _overlap(e[0], cs)]
+            elif name == "ATOMIC_GROUP":                         # 组里照常回溯到第一次成功, 接着前面开着的查; 出了组,
+                before = {id(e) for e in open_}                  # 组里新开的不回吐、不再开着, 前面开着的照常往后传
+                open_ = [e for e in walk(av, list(open_), flags, last) if id(e) in before]
             elif name == "SUBPATTERN":
                 open_ = walk(av[-1], open_, _scoped(flags, av), last)
             elif name == "BRANCH":
                 after = [walk(alt, list(open_), flags, last) for alt in (av[1] or ())]
                 open_ = [e for branch in after for e in branch]
             elif name in ("ASSERT", "ASSERT_NOT"):
-                walk(av[1], [], flags)
+                if av[0] == 1:                                   # 前瞻: 接着前面开着的查, 查完丢掉(不吃字, 后面接的还是之前开着的)
+                    walk(av[1], list(open_), flags, last and name == "ASSERT")
+                else:                                            # 后顾只能定长, 可它里面的前瞻照样往后扫: 也接着开着的查、
+                    walk(av[1], list(open_), flags)              # 查完丢掉(\d+(?<=\d(?=\d*x)) 2000 位 4 秒)
             elif name == "AT":
                 continue
             else:                                                # 回引这类认不出的: 不当隔断
@@ -438,9 +507,11 @@ def assert_regex_is_safe(pattern: str) -> None:
     except _Ambiguous:
         raise UnsafeRegex(
             "这条正则里有能匹配同样字符的量词挨在一起(形如 a*a*b / .*.*x / \\w+\\w+ / a.*a.*b), 中间没有隔开 —— "
-            "量词自己也能吃的单个字隔不开(a.*a.*b 里的 a), 会引发灾难性回溯: 实测 a*a*a*a*a*a*a*a*b 配 30 个 a 要 1 秒, "
+            "量词自己也能吃的单个字隔不开(a.*a.*b 里的 a), 前瞻 (?=…)(?!…) 里的量词和它前面的也算挨着(\\d+(?=\\d*元)), "
+            "占有量词 a++、原子组 (?>…) 也隔不开, 可选的组 (?:…)? 里的量词和组前后的也算挨着(\\d+(?:[,，]?\\d+)?元)。"
+            "这会引发灾难性回溯: 实测 a*a*a*a*a*a*a*a*b 配 30 个 a 要 1 秒, "
             ".*.*x 配 2000 字的一行要 1.5 秒。删掉多余的量词(开头结尾的 .* 不用写, 本来就在全文里找); 或者用两个字以上的"
-            "固定词隔开, 或者让量词吃不了那个字(\\n[ \\t]*\\n、[^!]*)。数「X 最多 N 次」写成 X[\\s\\S]*X…X、最后一个 X "
+            "固定词隔开, 或者让量词吃不了那个字(\\n[ \\t]*\\n、[^!]*、\\d+(?:[,，]\\d+)?元)。数「X 最多 N 次」写成 X[\\s\\S]*X…X、最后一个 X "
             f"后面什么都别接(连 $ 也别加), 最多展开 {_MAX_COUNT_CHAIN} 份。") from None
 
 
@@ -586,7 +657,70 @@ NOT_APPLICABLE = {"kind": "not_applicable"}
 _DESK_KEYS = frozenset({"words", "any", "max", "min", "where"})
 _FIELDS = ("title", "body")
 _ASCII_TERM = re.compile(r"[a-z0-9 ._/-]+")
-_HASHTAG = re.compile(r"#[^\s#\[\]]+(?:\[话题\]#?)?")     # 同 deskcore.tvlink._TAG_RE
+
+# ── 哪个 # 是话题: 数字数(这里和 rulecheck)、交付稿摘话题、查话题的规则(deskcore/delivery.py)共用这一处 ──────────────
+# 基本形: "#秋招" / "#秋招[话题]#" / 连写 "#a#b" / "#a[话题]#b[话题]#"(中间那个 # 收前一个也开后一个, 所以 [话题] 后面
+# 的 # 只有在后面不是又一个 "x[话题]" 时才当收尾吃掉; 吃掉了就只是收尾, 后面跟着的是正文)。两种 # 不是话题(codex review
+# on aw#115):
+#   · 网址里的 #片段: 「详情见 https://example.com/#faq」—— 交付稿里它是网址的一部分, 不进话题行, 也不能从字数里扣掉;
+#   · 前一个字是英文字母数字: 「学习C#入门」「1#楼」是一个词。两种除外: 紧接着上一个话题的连写("#abc#def" 第二个
+#     # 前面是 c, 但它正好从 #abc 收住的地方开始), 和带 [话题] 的("拿到offer#秋招[话题]#": 小红书的话题写法, 不会是一个词
+#     的一部分)。连写只看是不是紧挨着上一个话题, 不往回找 #: 中文句子里没有空白, 往回找会一路找到前面 "#秋招[话题]#" 收尾的
+#     那个 #, 隔着一整句的 "学C#入门" 也被认成连写。
+#   行首、空白、中文 / 全角字、emoji、标点、] 和 # 后面的 # 都可以开一个话题。
+# ⚠️ deskcore.tvlink._TAG_RE 还是老的基本形, 和这里两头不一样: 网址里的 #片段、"C#入门" 的 #入门 它也剥(比这里多);
+# 连写的 "#a[话题]#b[话题]#" 它只剥前一个, "b[话题]#" 留在文本里(比这里少)。它只在对内容 / 算改稿差异之前剥标签, 这次
+# 不动(理由见那边)。
+HASHTAG = re.compile(r"#[^\s#\[\]]+(?:\[话题\](?:#(?![^\s#\[\]]+\[话题\]))?)?")
+# 网址: # 前面紧挨着、一直是网址字符(不带空白的 ASCII)的那一段带 ://、带 www.、或者 域名/。只往前看到最近的空白不够: 中文
+# 句子里没有空白, 句子前面随便有个网址、甚至 Node.js/ 这种技术栈写法, 后面的话题就都不算了("学了Node.js/Express，面试稳了！#秋招")。
+_URL_HINT = re.compile(r"://|www\.|[A-Za-z0-9-]\.[A-Za-z]{2,}(?::\d+)?/", re.I)
+_URL_CHARS = "".join(chr(c) for c in range(0x21, 0x7F))
+
+
+def _hashes_in_urls(text: str) -> dict[int, bool]:
+    """每个 # 是不是网址的一部分(紧挨在它前面、一直是网址字符的那一段像网址), 一趟扫完。网址特征(://、www.、域名/)里没有 #,
+    所以两个 # 之间那一段单独查一次、再接上前一个 # 的结论就够了 —— 每个 # 都往回切一遍的话, 一长串 "#a#a#a…" 是平方级的。"""
+    out: dict[int, bool] = {}
+    prev, hint = -1, False
+    at = text.find("#")
+    while at >= 0:
+        seg = text[prev + 1:at]
+        tail = seg[len(seg.rstrip(_URL_CHARS)):]
+        if prev >= 0 and len(tail) == len(seg):        # 中间一直是网址字符: 和前一个 # 是同一段
+            hint = hint or _URL_HINT.search(seg) is not None
+        else:
+            hint = _URL_HINT.search(tail) is not None
+        out[at] = hint
+        prev, at = at, text.find("#", at + 1)
+    return out
+
+
+def topic_tag_matches(text: str) -> list[re.Match]:
+    """文本里真算话题的那几个(``HASHTAG`` 的匹配, 按出现顺序) —— 唯一的那一个判据(怎么认见上面)。数字数、正文里找话题、
+    摘末尾话题都从这里拿。一趟扫完: 网址那条先一趟算好, 连写只比上一个认下的话题在哪儿收住。"""
+    text = text or ""
+    in_url, out, end = _hashes_in_urls(text), [], -1
+    for m in HASHTAG.finditer(text):
+        at = m.start()
+        if in_url.get(at, False):
+            continue
+        prev = text[at - 1] if at > 0 else ""
+        if prev.isascii() and prev.isalnum() and at != end and "[话题]" not in m.group(0):
+            continue
+        out.append(m)
+        end = m.end()
+    return out
+
+
+def topic_tags(text: str) -> list[str]:
+    """文本里真算话题的那几个, 原样(带 # 和 [话题])。"""
+    return [m.group(0) for m in topic_tag_matches(text)]
+
+
+def is_topic_tag(text: str, at: int) -> bool:
+    """``text[at]`` 那个 # 是不是一个话题的开头(就是 topic_tag_matches 里有没有从这儿开始的)。"""
+    return any(m.start() == at for m in topic_tag_matches(text))
 
 
 def contains_term(text: str, term: str) -> bool:
@@ -598,8 +732,14 @@ def contains_term(text: str, term: str) -> bool:
 
 
 def count_chars(text: str) -> int:
-    """写作台口径的字数: 去掉空白和 #话题 再数。写作台(rulecheck)数字数也用这一个。"""
-    return len(re.sub(r"\s+", "", _HASHTAG.sub("", text or "")))
+    """写作台口径的字数: 去掉空白和 #话题 再数。写作台(rulecheck)数字数也用这一个。网址里的 #片段、C# 这种词不是话题,
+    照样算字(codex review on aw#115): 交付出去它们都还在正文里, 扣掉的话字数上限会放过超长的稿, 下限会冤枉够长的稿。"""
+    text, kept, pos = text or "", [], 0
+    for m in topic_tag_matches(text):
+        kept.append(text[pos:m.start()])
+        pos = m.end()
+    kept.append(text[pos:])
+    return len(re.sub(r"\s+", "", "".join(kept)))
 
 
 def _spec_from_desk(kind: str, payload: dict) -> dict:

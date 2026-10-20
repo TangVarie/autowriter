@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import re
 
+import validator
+
 LAYOUTS = ("table", "blocks")
 FIELDS = ("direction", "post", "comments")
 ROLES = ("reader", "author")
@@ -34,30 +36,16 @@ _TAG_KEYS = ("content", "fixed", "conditional")
 _COND_KEYS = ("when_any", "add")
 _COMMENT_KEYS = ("min", "max", "label_reader", "label_author", "must_mention_any")
 
-# 小红书话题的几种写法: "#秋招" / "#秋招[话题]#" / 连写 "#a#b"。同 tvlink._TAG_RE。
-_TAG = re.compile(r"#[^\s#\[\]]+(?:\[话题\]#?)?")
-_TAG_LINE = re.compile(r"^\s*(?:#[^\s#\[\]]+(?:\[话题\]#?)?\s*)+$")
-# 最后一句末尾直接跟着的一串话题("冲鸭！#秋招 #求职")。前一个字是英文字母数字的不算("C#入门" 里没有话题)。
-_TRAILING_INLINE_TAGS = re.compile(r"(?<![A-Za-z0-9])(?:#[^\s#\[\]]+(?:\[话题\]#?)?\s*)+$")
-# 网址里的 #片段(codex review on aw#115): 「详情见 https://example.com/#faq」的 # 前面是 /, 上面那条照样当话题摘, 交付稿里
-# 网址就断了、faq 跑进话题行。# 前面紧挨着、一直是网址字符(不带空白的 ASCII)的那一段像网址 —— 带 ://、带 www.、或者
-# 域名/ —— 就不是话题。只往前看到最近的空白不够: 中文句子里没有空白, 句子前面随便有个网址、甚至 Node.js/ 这种技术栈写法,
-# 末尾的话题就都不摘了("学了Node.js/Express，面试稳了！#秋招")。
-_URL_HINT = re.compile(r"://|www\.|[A-Za-z0-9-]\.[A-Za-z]{2,}(?::\d+)?/", re.I)
-_URL_CHARS = "".join(chr(c) for c in range(0x21, 0x7F))
-
-
-def _is_url_fragment(text: str, at: int) -> bool:
-    """``text[at]`` 那个 # 是不是网址的一部分: 紧挨在它前面、一直是网址字符的那一段像网址。换行、空白、中文都隔断。"""
-    head = text[:at]
-    return _URL_HINT.search(head[len(head.rstrip(_URL_CHARS)):]) is not None
+# 小红书话题的几种写法: "#秋招" / "#秋招[话题]#" / 连写 "#a#b"。哪个 # 算话题只在 validator 认一处(validator.HASHTAG /
+# topic_tag_matches: 网址里的 #片段、"C#入门" 这种英文字母数字后面的 # 不算), 数字数、摘话题、查话题的规则三处口径一样。
+# 摘末尾话题也只拿 topic_tag_matches 切, 不另写正则(codex review on aw#115): 原来那两条 "#[^\s#\[\]]+(?:\[话题\]#?)?" 串到
+# 行尾的正则会在 "#?" 上回溯, 把 "#秋招[话题]#" 收尾的 # 当成下一个话题的开头, 后面那半句正文被当成话题摘走; 长串还是平方级的。
 
 
 def body_tags(body: str) -> list[str]:
-    """正文里的 #话题(话题本体的列表)。网址里的 #片段 不算(codex review on aw#115): 交付稿的话题行里没有它, 查话题的规则
-    也不该看见它。"""
-    body = body or ""
-    return split_tags(" ".join(m.group(0) for m in _TAG.finditer(body) if not _is_url_fragment(body, m.start())))
+    """正文里的 #话题(话题本体的列表)。网址里的 #片段、"学习C#入门" 里的 #入门 都不算(codex review on aw#115): 交付稿的
+    话题行里没有它们, 查话题的规则也不该看见 —— 不然只管话题的禁用词会在一句普通的 C# 上报「必须改」。"""
+    return split_tags(" ".join(validator.topic_tags(body)))
 
 
 class TemplateError(ValueError):
@@ -246,14 +234,29 @@ def wants_tags(template: dict) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 
 def split_tags(raw) -> list[str]:
-    """写手传的 tags(列表或一串) → 话题本体的列表。"#a #b" 塞在一项里、带不带 #、带 [话题] 都认。"""
+    """写手传的 tags(列表或一串) → 话题本体的列表。"#a #b" 塞在一项里、带不带 #、带 [话题] 都认。
+
+    一项是整个列表 json.dumps 出来的一串('["a", "b"]', 模型常这么传, 默认分隔带空格)也认: 去掉空白后以 [ 开头、解得开是
+    列表的, 里面的字符串照常再切(# 和 [话题] 照摘)。原来按空白切成 '["a",' 和 '"b"]', 交付稿里是 #["a", #"b"]、一句不报,
+    话题数还算够(codex review on aw#115)。摘话题、交付稿的话题行、查话题的规则都从这里拿, 一处改三处一样。
+    一长串 [ 的 json.loads 抛的是 RecursionError(3.11 上 1000 层就到), 同解不开的一样照字符串切 —— 抛出去的话 core 那边
+    整批的交付稿和代码查规则都没了(codex review on aw#115)。"""
     if raw is None:
         return []
     items = [raw] if isinstance(raw, str) else (list(raw) if isinstance(raw, (list, tuple)) else [])
     out: list[str] = []
     for it in items:
-        if isinstance(it, str):
-            out += re.findall(r"[^\s#]+", it.replace("[话题]", " "))
+        if not isinstance(it, str):
+            continue
+        if it.strip().startswith("["):
+            try:
+                got = json.loads(it)
+            except (ValueError, RecursionError):
+                got = None
+            if isinstance(got, list):
+                out += split_tags(got)
+                continue
+        out += re.findall(r"[^\s#]+", it.replace("[话题]", " "))
     return out
 
 
@@ -261,21 +264,37 @@ def lift_trailing_tags(body: str) -> tuple[str, list[str]]:
     """正文末尾的话题摘出来。10-20 查生产库: 写手的稿子约六分之一末尾带一行 #话题; 模板也拼一行的话交付稿里就是两行。
 
     末尾的整行话题之外, 最后一句后面直接跟着的一串话题("冲鸭！#秋招 #求职")也摘: 不摘的话交付稿照样是两份话题。
-    正文中间的 #话题 不动; 网址里的 #片段(https://example.com/#faq)不是话题, 也不动, 它后面隔开跟着的话题照摘。"""
+    正文中间的 #话题 不动; 网址里的 #片段(https://example.com/#faq)、"C#入门" 不是话题(同 validator.topic_tag_matches),
+    也不动, 它们后面隔开跟着的话题照摘。"最后祝大家#秋招[话题]#顺利上岸" 这种话题后面还有正文的也不动: 收尾的那个 # 后面
+    是正文, 不是又一个话题(codex review on aw#115, 原来后半句被当成话题摘走, 传了 tags 的话交付稿里就没了)。"""
     lines = (body or "").replace("\r\n", "\n").rstrip().split("\n")
     lifted: list[str] = []
-    while lines and (not lines[-1].strip() or _TAG_LINE.match(lines[-1])):
-        if lines[-1].strip():
-            lifted = split_tags(lines[-1]) + lifted
-        lines.pop()
-    if lines:
-        last, pos = lines[-1], 0
-        while (m := _TRAILING_INLINE_TAGS.search(last, pos)) and _is_url_fragment(last, m.start()):
-            pos = _TAG.match(last, m.start()).end()      # 跳过这一段 #片段, 从它后面接着找
-        if m and last[:m.start()].strip():
-            lifted = split_tags(m.group(0)) + lifted
-            lines[-1] = last[:m.start()].rstrip()
+    while lines:
+        if not lines[-1].strip():
+            lines.pop()
+            continue
+        cut, tags = _trailing_tag_run(lines[-1])
+        if not tags:
+            break
+        lifted = tags + lifted
+        head = lines[-1][:cut].rstrip()
+        if head.strip():                    # 最后一句后面跟着的一串: 摘完这一句留下, 不再往上看
+            lines[-1] = head
+            break
+        lines.pop()                         # 整行都是话题
     return "\n".join(lines).rstrip(), lifted
+
+
+def _trailing_tag_run(line: str) -> tuple[int, list[str]]:
+    """这一行末尾那一串话题: (从哪儿起, 话题本体)。从行尾往回接 validator.topic_tag_matches 认下的话题, 两个之间只能隔空白;
+    隔着正文、网址里的 #片段、"C#入门" 就停。没有是 (-1, [])。"""
+    end, cut, run = len(line.rstrip()), -1, []
+    for m in reversed(validator.topic_tag_matches(line)):
+        if line[m.end():end].strip():
+            break
+        cut, end = m.start(), m.start()
+        run.append(m.group(0))
+    return cut, split_tags(" ".join(reversed(run)))
 
 
 def _dedupe(tags: list[str]) -> list[str]:
@@ -337,27 +356,33 @@ def comment_entries(raw) -> list | None:
 
     单独一条字符串或一条 {role, text} 也认成一条(codex review on aw#115): 列表里的每一项本来就认这两种写法, 模型只写一条
     时常常不包列表。原来非列表一律当 [] —— 项目 min 是 0 的话一句不报, 写手明明给了的评论就从交付稿里消失了。
-    字符串是一整串 JSON 的(模型常把嵌套的列表序列化了再传), 解得开、解出来是评论列表 / 一条 {text} 的, 照解出来的拼;
-    不然整段 JSON 带着「读者：」进交付稿, 一句不报。解不开的([捂脸R]求链接 这类)照旧是一条。
-    rulecheck 查评论也走这一处, 交付稿里有的评论规则才查得到。"""
+    字符串是一整串 JSON 的(模型常把嵌套的列表序列化了再传), 解得开、解出来是列表 / 对象的, 照解出来的列表 / 一条对象认;
+    不然整段 JSON 带着「读者：」进交付稿, 一句不报。解出来的每一项照常由 comment_list 认: 没有 text 的对象({role, content})、
+    外面再包一层的 {"comments": [...]}、列表里夹着的 null / 数字都报成那一条形状不对、不拼 —— 原来只解评论列表和一条 {text},
+    别的形状整段 JSON 照样当一条读者评论交出去、还算够条数(codex review on aw#115)。不往里多解一层。解不开的([捂脸R]求链接
+    这类; 一长串 [ 抛的 RecursionError 也算解不开)照旧是一条字符串。"""
     if raw is None or (isinstance(raw, str) and not raw.strip()):
         return []
     if isinstance(raw, str) and raw.strip()[0] in "[{":
         try:
             got = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             got = None
-        if isinstance(got, list) and all(isinstance(c, (str, dict)) for c in got):
+        if isinstance(got, list):
             return got
-        if isinstance(got, dict) and "text" in got:
+        if isinstance(got, dict):
             return [got]
     if isinstance(raw, (str, dict)):
         return [raw]
     return list(raw) if isinstance(raw, (list, tuple)) else None
 
 
-def _comments(raw) -> tuple[list[dict], list[str]]:
-    """写手传的 comments → [{role, text}], 外加形状不对的那几条的问题描述。空文本的不算一条。"""
+def comment_list(raw) -> tuple[list[dict], list[str]]:
+    """写手传的 comments → [{role, text}], 外加形状不对的那几条的问题描述。空文本的不算一条。
+
+    text 没有、或者不是字符串的(写成 {role, content}、给了列表 / 数字 / dict)算这一条形状不对: 报出来, 不拼(codex review
+    on aw#115)。原来没有 text 的一句不报就没了; 是列表的拿 str() 拼成 Python 的 ['…'] 进交付稿, 而查规则只认字符串、看不见
+    它。rulecheck 查评论也只从这里拿, 交付稿里有哪几条评论, 规则就查哪几条。"""
     out, bad = [], []
     entries = comment_entries(raw)
     if entries is None:
@@ -366,10 +391,10 @@ def _comments(raw) -> tuple[list[dict], list[str]]:
     for k, c in enumerate(entries):
         if isinstance(c, str):
             c = {"role": "reader", "text": c}
-        if not isinstance(c, dict):
+        if not isinstance(c, dict) or not isinstance(c.get("text"), str):
             bad.append(f"第 {k + 1} 条评论应该是 {{\"role\": \"reader\", \"text\": \"...\"}}")
             continue
-        text = str(c.get("text") or "").strip()
+        text = c["text"].strip()
         if not text:
             continue
         role = c.get("role") or "reader"
@@ -420,7 +445,7 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
 
         lines: list[str] = []
         if ccfg is not None:
-            comments, bad = _comments(d.get("comments"))
+            comments, bad = comment_list(d.get("comments"))
             problems += [{"index": i, "what": w} for w in bad]
             lo, hi = ccfg["min"], ccfg["max"]
             if not lo <= len(comments) <= hi:

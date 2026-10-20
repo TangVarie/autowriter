@@ -2776,13 +2776,18 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # 指纹已经摘了、稿子却没入库: 放回去, 否则旧稿从此不参与查重(而且没人知道)。
             _restore_stash(client, stash, list(stash))
             raise
-    commit_ms = _ms_since(started) - lock_wait_ms      # 各段可加: lock_wait + commit + judge ≈ total
+    # 各段可加: lock_wait + commit + delivery_rules + judge + project_isolation ≈ total
+    commit_ms = _ms_since(started) - lock_wait_ms
 
     # ── 交付版式 + 代码查规则(2026-10-20): 锁外、恢复指纹的 try 外, 同下面的判定 ──────────────────
     # 都是纯代码(模板在项目行里, 规则多一次很小的查询), 放在判定前面: 判定的截止按"已用时间"算, 这一步多花的
     # 几十毫秒从判定里扣, 不会把整次回包推过客户端的容忍。只拼 / 只查存进去了的那几篇, 被闸拒掉的要重写。
+    # 单记一段 delivery_rules(codex review on aw#115): 规则那次查询是翻页读的, 库慢的时候不是几十毫秒; 不单记的话
+    # 这段时间哪一段都不算, 判定被扣掉的那截预算也查不出是谁花的。
+    post_started = time.monotonic()
     post_meta = _delivery_and_rule_checks(client, project, project_id, user_id, drafts, sorted(inserted_idx), out,
                                           tactic=tactic)
+    delivery_rules_ms = _ms_since(post_started)
 
     # ── 入库判定(参考分): 锁已经放了, 恢复指纹的那个 try 也出来了 ─────────────
     # 到这里入库已经成功, 下面任何一步都不许把它变成失败: 判定自己不抛
@@ -2811,7 +2816,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     excluded = {drafts[i].get("version_id") or minted_ids.get(i) for i in inserted_idx}
     out["project_isolation"] = _cross_project_shadow_bounded(client, project_id, user_id, drafts, vecs, excluded)
     out["elapsed_ms"] = _ms_since(started)
-    out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms,
+    out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms, "delivery_rules": delivery_rules_ms,
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
     _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta, checks=post_meta)
     return out

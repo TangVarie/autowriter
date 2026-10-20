@@ -230,7 +230,8 @@ def spec_of(rule: dict) -> dict | None:
 # ══════════════════════════════════════════════════════════════════════
 
 # 查词、数字数和 validator 共用一份(codex review on aw#115): 同一行规则 AW 生成链路也读, 两边口径分开写迟早不一样。
-# 不分大小写的包含, 纯英文数字的词按词边界认, 免得 "ad" 撞进 "made"(同 isolation.foreign_markers); 字数去掉空白和 #话题。
+# 不分大小写的包含, 纯英文数字的词按词边界认, 免得 "ad" 撞进 "made"(同 isolation.foreign_markers); 字数去掉空白和 #话题
+# (哪个 # 算话题同 delivery.body_tags, 都是 validator.topic_tag_matches)。
 _has = validator.contains_term
 _count = validator.count_chars
 
@@ -244,14 +245,11 @@ def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
     if tags is None:
         # 写手传的 tags 和正文末尾那行 #话题 常常是同一批(约六分之一的稿子末尾带一行): 去重, 不然「话题不超过 N 个」
         # 这类按个数数的检查会把同一个话题数两遍
-        raw = delivery.split_tags(d.get("tags")) + delivery.body_tags(body)     # 网址里的 #片段 不算
+        raw = delivery.split_tags(d.get("tags")) + delivery.body_tags(body)     # 网址里的 #片段、C#入门 不算
         seen: set[str] = set()
         tags = [t for t in raw if not (delivery.norm_tag(t) in seen or seen.add(delivery.norm_tag(t)))]
-    comments = []
-    for c in delivery.comment_entries(d.get("comments")) or []:     # 一条字符串 / 一条 dict 也算一条, 同交付稿
-        text = c.get("text") if isinstance(c, dict) else c
-        if isinstance(text, str) and text.strip():
-            comments.append(text.strip())
+    # 评论和交付稿是同一份(delivery.comment_list): 一条字符串 / 一条 dict / 一串 JSON 都认, text 不是字符串的两边都不算
+    comments = [c["text"] for c in delivery.comment_list(d.get("comments"))[0]]
     return {"title": [str(d.get("title") or "")], "body": [body], "tags": [" ".join(tags)] if tags else [],
             "comments": comments}
 

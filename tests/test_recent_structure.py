@@ -5,7 +5,8 @@
 占比 ≥ 0.6 的几处摆给模型, 让这一批有一半换个写法。钉住:
   · 读法: 三步往返(答案那一步按主键排序翻页); 只取答案列, 不取 evidence / 正文; 只认 primary × fq-v0.1 × jev:*、题目版本对得上的有效答案;
     一个 item 算一篇(取最新的、有答案的那一版); 补录副本、别的项目、窗口外的版本都不算(窗口按版本时间, 不按批次);
-    答案那次的版本 id 按篇摊, 改得多的一篇不挤掉别的稿子
+    答案那次的版本 id 按篇摊, 改得多的一篇不挤掉别的稿子; 没判出答案的稿子不占名额(凑不够往下再问一轮, 最多三轮;
+    补问那几轮失败不丢第一轮找到的)
   · 算法: 少于 12 篇不报; 某一题有效答案少于 12 篇不报; bool 题只报「是」扎堆; product_role(露出要求)不问;
     已验证规律用到的题一律不问
   · 给模型看的是中文标签不是题目 id; 哪儿都不扎堆 / 读挂了就不带这一栏, 简报照给
@@ -53,13 +54,15 @@ class _World:
         self._n = 0
 
     def draft(self, answers: dict | None = None, *, days: float = 1, pid=PID, source="deskcore",
-              extractor="jev:1.13.0", run_tag="primary", bank="fq-v0.1", versions: dict | None = None) -> str:
-        """一篇稿子(一个批次一个 item); ``versions`` = {版本 id 后缀: 答案或 None(这一版没判)}, 默认一版。
-        某一版是后来改的(改稿往老 item 上加一版, 批次不变): 值写成 (答案, 几天前)。"""
+              extractor="jev:1.13.0", run_tag="primary", bank="fq-v0.1", versions: dict | None = None,
+              batch: str | None = None) -> str:
+        """一篇稿子(默认一个批次一个 item, ``batch`` 给了就放进那个已有的批次); ``versions`` = {版本 id 后缀: 答案或
+        None(这一版没判)}, 默认一版。某一版是后来改的(改稿往老 item 上加一版, 批次不变): 值写成 (答案, 几天前)。"""
         self._n += 1
-        bid, iid = f"b{self._n}", f"i{self._n}"
-        self.batches.append({"id": bid, "project_id": pid, "params": {"source": source},
-                             "created_at": _ago(days=days)})
+        bid, iid = batch or f"b{self._n}", f"i{self._n}"
+        if batch is None:
+            self.batches.append({"id": bid, "project_id": pid, "params": {"source": source},
+                                 "created_at": _ago(days=days)})
         versions = versions if versions is not None else {"v1": answers}
         vrows = []
         for k, (suffix, ans) in enumerate(versions.items()):
@@ -83,8 +86,8 @@ class _World:
             "answer": ans, "evidence": "(稿子原文片段, 不该被取)", "prob": 0.9, "invalid_reason": None,
             "extracted_at": extracted_at or _ago(days=0)})
 
-    def client(self, **kw):
-        return FakeClient(rows={
+    def client(self, cls=FakeClient, **kw):
+        return cls(rows={
             "projects": [_project(), _project(OTHER_PID)],
             "batches": self.batches, "items": self.items, NFA: self.answers,
             "memories": [], "user_calibration_notes": [], "draft_fingerprints": [], "angle_ledger": [],
@@ -201,7 +204,7 @@ def test_version_ids_per_request_are_bounded():
     nfa = next(q for q in c.calls if q["table"] == NFA)
     ids = next(f for f in nfa["filters"] if f[:2] == ("in", "subject_id"))[2]
     assert len(ids) == store.STRUCTURE_VERSIONS_MAX, "一次 .in_() 的版本 id 封顶"
-    assert len(got) == structure.MAX_DRAFTS, "每篇两版、只有新那版判过: 80 个 id 是 40 篇, 取最新 30 篇"
+    assert len(got) == structure.MAX_DRAFTS, "每篇两版、只有新那版判过: 一轮 60 篇已经够了, 取最新 30 篇"
 
 
 def test_revised_items_do_not_crowd_out_other_drafts():
@@ -218,6 +221,94 @@ def test_revised_items_do_not_crowd_out_other_drafts():
     w.draft(versions={f"v{k}": (_neutral(0, opening_type="具体事件"), 1 - k / 1000) for k in range(100)}, days=1.5)
     got = _read(w.client())
     assert len(got) == 14 and got[0]["opening_type"] == "具体事件"
+
+
+def _rounds(c) -> list[tuple]:
+    """答案那一步问了几轮: 每轮一组版本 id(同一轮翻页的几次请求 id 一样)。"""
+    out: list[tuple] = []
+    for q in c.calls:
+        if q["table"] == NFA:
+            ids = tuple(next(f for f in q["filters"] if f[:2] == ("in", "subject_id"))[2])
+            if not out or out[-1] != ids:
+                out.append(ids)
+    return out
+
+
+def test_unjudged_recent_drafts_do_not_empty_the_window():
+    """没判出答案的稿子不占名额(codex review on aw#115): 原来先截最近 STRUCTURE_ITEMS_MAX 篇再问答案, judge 停过一阵、
+    最近 60 篇都没答案的话这一栏就是空的 —— 窗口里明明还有 30 篇更早的、判过的。一轮凑不够就接着往下问一轮。"""
+    w = _World()
+    for i in range(store.STRUCTURE_ITEMS_MAX):
+        w.draft(versions={"v1": None}, days=0.5 + i / 1000)          # judge 停的那几天写的: 一篇都没判
+    for i in range(30):
+        w.draft(_neutral(i), days=2 + i / 100)
+    c = w.client()
+    assert _read(c) == [_neutral(i) for i in range(30)]
+    assert [len(r) for r in _rounds(c)] == [store.STRUCTURE_ITEMS_MAX, 30], "最近 60 篇一轮, 更早的 30 篇一轮"
+
+    # 改过的稿子最新那版没判、上一版判过: 第一轮的 id 只够轮到前 20 篇的上一版, 剩下的下一轮接着问
+    w = _World()
+    for i in range(store.STRUCTURE_ITEMS_MAX):
+        w.draft(versions={"v1": _neutral(i), "v2": None}, days=1 + i / 100)
+    c = w.client()
+    assert _read(c) == [_neutral(i) for i in range(30)]
+    assert [len(r) for r in _rounds(c)] == [store.STRUCTURE_VERSIONS_MAX, store.STRUCTURE_ITEMS_MAX - 20]
+
+
+def test_extra_rounds_are_bounded():
+    """往下补问最多 STRUCTURE_ROUNDS_MAX 轮, 每轮 id 照样封顶: judge 停得再久, 开项目也只多这么几趟。"""
+    w = _World()
+    for i in range(store.STRUCTURE_ITEMS_MAX * store.STRUCTURE_ROUNDS_MAX):       # 一批 10 篇(批次只看最近 100 个)
+        w.draft(versions={"v1": None}, days=0.5 + i / 1000, batch=w.batches[-1]["id"] if i % 10 else None)
+    for i in range(30):
+        w.draft(_neutral(i), days=2 + i / 100)
+    c = w.client()
+    assert len(w.items) == store.STRUCTURE_ITEMS_MAX * store.STRUCTURE_ROUNDS_MAX + 30 and len(w.batches) < 100
+    assert _read(c) == []
+    rounds = _rounds(c)
+    assert len(rounds) == store.STRUCTURE_ROUNDS_MAX
+    assert all(len(r) <= store.STRUCTURE_VERSIONS_MAX for r in rounds)
+    assert len({v for r in rounds for v in r}) == sum(map(len, rounds)), "每一版只问一次"
+
+
+class _LedgerFailsAfter(FakeClient):
+    """答案那一步问到第 ``ok_rounds + 1`` 轮(换了一组版本 id)就报错, 同 PostgREST 一时 5xx。"""
+    ok_rounds = 1
+
+    def _execute(self, q):
+        if q.table_name == NFA:
+            ids = next(f for f in q.filters if f[:2] == ("in", "subject_id"))[2]
+            seen = self.__dict__.setdefault("rounds_seen", [])
+            if not seen or seen[-1] != ids:
+                seen.append(ids)
+            if len(seen) > self.ok_rounds:
+                raise RuntimeError("503 upstream request timeout")
+        return super()._execute(q)
+
+
+def test_a_failed_extra_round_keeps_what_the_first_round_found(caplog):
+    """往下补问的那几轮失败, 第一轮已经找到的照样交出去(codex review on aw#115): 最近 60 篇只判了 20 篇, 一轮凑不够 30 篇要往下
+    补问; 补问那一趟一时报错就整个上抛的话, 简报丢掉这一栏 —— 原来只问一轮, 这 20 篇(够 MIN_DRAFTS)照样摆得出来。
+    第一轮自己读不到照旧上抛(账本读不到就不带这一栏)。"""
+    w = _World()
+    for i in range(store.STRUCTURE_ITEMS_MAX):                       # judge 停过几阵: 最近 60 篇每三篇判了一篇
+        w.draft(_neutral(i, opening_type="具体事件") if i % 3 == 0 else None, days=0.5 + i / 1000)
+    for i in range(40):
+        w.draft(_neutral(i, opening_type="具体事件"), days=2 + i / 100)
+    first = [_neutral(i, opening_type="具体事件") for i in range(0, store.STRUCTURE_ITEMS_MAX, 3)]
+
+    c = w.client(cls=_LedgerFailsAfter)
+    with caplog.at_level("WARNING", logger="deskcore.store"):
+        assert _read(c, limit=structure.MAX_DRAFTS) == first
+    assert len(c.rounds_seen) == 2, "第二轮问过、报了错"
+    assert any("补问" in r.getMessage() and r.exc_info for r in caplog.records), "补问失败要留一条 warning"
+    shape = _brief(w.client(cls=_LedgerFailsAfter))["recent_structure"]
+    assert shape["window"] == len(first) >= structure.MIN_DRAFTS
+
+    flaky = w.client(cls=_LedgerFailsAfter)
+    flaky.ok_rounds = 0
+    with pytest.raises(RuntimeError):
+        _read(flaky)
 
 
 def test_a_draft_revised_today_in_an_old_batch_counts():

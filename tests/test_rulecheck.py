@@ -18,7 +18,7 @@ import time
 import pytest
 
 import validator
-from deskcore import core, rulecheck, store, tools
+from deskcore import core, delivery, rulecheck, store, tools
 from tests.fakes import FakeClient
 from tests.test_delivery import ME, PROJ, desk_client, distinct_drafts
 
@@ -241,6 +241,80 @@ def test_comments_as_a_json_string_and_url_fragments_are_seen_as_delivered():
     assert [h["what"] for h in hits] == ["必须改: 评论里有禁用词「私信」"]
     ascii_tag = _rule(2, "forbidden_regex", {"pattern": "[A-Za-z]", "where": ["tags"]})
     assert rulecheck.check([ascii_tag], [{"title": "t", "body": "详情见 https://example.com/#faq #秋招"}])[0] == []
+
+
+@pytest.mark.parametrize("comments", [
+    [{"role": "author", "content": "想要的私信我"}],
+    [{"role": "reader", "text": ["想要的私信我"]}, {"role": "reader", "text": 12}, {"text": {"示例": "私信"}}],
+    json.dumps([{"role": "reader", "text": ["想要的私信我"]}, {"role": "author", "text": "示例回复"}], ensure_ascii=False),
+    ["示例评论", {"role": "author", "text": " 想要的私信我 "}, {"role": "boss", "text": "示例三"}],
+    {"role": "author", "text": "想要的私信我"},
+    json.dumps({"role": "author", "content": "想要的私信我"}, ensure_ascii=False),
+    json.dumps([{"role": "author", "text": "示例回复"}, None], ensure_ascii=False),
+], ids=["no-text", "text-not-a-string", "json-string", "mixed-list", "single-dict", "json-dict-no-text", "json-list-with-null"])
+def test_rules_check_exactly_the_comments_that_are_delivered(comments):
+    """查评论和拼交付稿走同一处(delivery.comment_list, codex review on aw#115): text 是列表的原来交付稿里拼成 Python 的
+    ['…'] 而规则看不见; 没有 text 的两边都不算(交付那边报一条形状不对)。序列化成一串 JSON 的同样按解出来的对象 / 列表认,
+    原样的 JSON 既不进交付稿、也不拿去查。"""
+    tpl = {"layout": "blocks", "comments": {"min": 0, "max": 9, "label_reader": "读者：", "label_author": "作者："}}
+    text = delivery.assemble(tpl, [{"title": "t", "body": "b", "comments": comments}])["text"]
+    delivered = [line.split("：", 1)[1] for line in text.split("\n")[2:]]
+    assert not any(c.startswith(("{", "[")) for c in delivered), delivered
+    assert rulecheck._parts({"comments": comments})["comments"] == delivered
+    rule = _rule(1, "forbidden_word", {"words": ["私信"], "where": ["comments"]})
+    hits = rulecheck.check([rule], [{"title": "t", "body": "b", "comments": comments}])[0]
+    assert bool(hits) == any("私信" in c for c in delivered)
+
+
+def test_tags_as_a_json_string_are_checked_as_delivered():
+    """tags 是整个列表 json.dumps 出来的一串(codex review on aw#115): 交付稿拆开拼, 查话题的规则也拆开查, 不会看见 [ " , 。"""
+    tags = json.dumps(["话题甲", "话题乙"], ensure_ascii=False)
+    assert rulecheck._parts({"tags": tags})["tags"] == ["话题甲 话题乙"]
+    punct = _rule(1, "forbidden_regex", {"pattern": "[\\[\\]\",]", "where": ["tags"]})
+    assert rulecheck.check([punct], [{"title": "t", "body": "b", "tags": tags}])[0] == []
+
+
+def test_url_fragments_and_language_tokens_count_as_characters():
+    """数字数只扣真话题(codex review on aw#115): 「详情见 https://example.com/#faq」原来把 #faq 当话题扣掉, 交付出去它还在网址
+    里 —— 上限放过超长的稿, 下限冤枉够长的稿。写作台(rulecheck)和 AW 生成链路(validator)数的是同一个数。"""
+    body = "详情见 https://example.com/#faq"
+    n = len(body.replace(" ", ""))
+    assert validator.count_chars(body) == n
+    assert validator.count_chars("今天开始学习C#入门 #编程") == len("今天开始学习C#入门")
+    assert validator.count_chars("正文。#秋招[话题]#求职[话题]#") == len("正文。"), "连写的 [话题] 两个都是话题"
+    over, enough = {"max": n - 1, "where": "body"}, {"min": n, "where": "body"}
+    hits = rulecheck.check([_rule(1, "max_len", over)], [{"title": "t", "body": body}])[0]
+    assert [h["where"] for h in hits] == ["body"]
+    assert rulecheck.check([_rule(2, "max_len", enough)], [{"title": "t", "body": body}])[0] == []
+
+    def aw(payload):
+        return validator.check_hard_rules([{"content": "示例规则", "rule_kind": "max_len", "rule_payload": payload}],
+                                          "t", body)
+    assert [h["kind"] for h in aw(over)] == ["max_len"] and aw(enough) == []
+
+
+def test_a_hash_after_an_ascii_letter_is_not_a_tag():
+    """「学习C#入门」里的 #入门 不是话题(codex review on aw#115): 摘末尾话题时前一个字是英文字母数字的 # 本来就不摘, 正文里找
+    话题却认它 —— 只管话题的禁用词会在一句普通的 C# 上报「必须改」。真话题照查。"""
+    rule = _rule(1, "forbidden_word", {"words": ["入门"], "where": ["tags"]})
+    body = "今天开始学习C#入门"
+    assert rulecheck.check([rule], [{"title": "t", "body": body}])[0] == []
+    assert [h["where"] for h in rulecheck.check([rule], [{"title": "t", "body": body + " #入门"}])[0]] == ["tags"]
+    # 同一段前面有个 "#秋招[话题]#": 它收尾的那个 # 不开一串, C#入门 照样不是话题(codex review on aw#115)。中文句子里没有
+    # 空白, 原来往回找最近的 # 一路找到它, 把 "#入门的经验" 当成接在话题后面的连写
+    for inline in ("上岸了#秋招[话题]#，分享一下我学C#入门的经验", "#秋招[话题]#今天学C#入门"):
+        assert rulecheck.check([rule], [{"title": "t", "body": inline}])[0] == [], inline
+
+
+def test_a_huati_topic_after_an_ascii_letter_is_still_a_tag():
+    """"拿到offer#秋招[话题]#": 带 [话题] 的是小红书的话题写法, 不会是 "C#入门" 这种词的一部分, 前一个字是英文字母数字也算话题
+    (codex review on aw#115)。不算的话查话题的规则看不见它(要求带「秋招」的报没带), 字数还把它的 8 个字算进正文。"""
+    body = "拿到offer#秋招[话题]#"
+    need = _rule(1, "required_phrase", {"any": ["秋招"], "where": ["tags"]})
+    assert rulecheck.check([need], [{"title": "t", "body": body, "tags": ["求职"]}])[0] == []
+    assert validator.count_chars(body) == len("拿到offer")
+    assert rulecheck.check([_rule(2, "max_len", {"max": len("拿到offer"), "where": "body"})],
+                           [{"title": "t", "body": body}])[0] == []
 
 
 def test_ascii_words_match_on_word_boundaries():
