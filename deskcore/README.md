@@ -49,6 +49,9 @@ deskcore/
 ├── core.py         逻辑层, 不 import FastAPI/MCP —— 简报/发牌/查重/学习
 ├── store.py        db.py 里【没有的】查询形状(共享层规则/带向量的正负例/四张新表)
 ├── fingerprint.py  指纹与判定, 【只用标准库】
+├── delivery.py     交付版式模板的校验与拼装(纯函数, 2026-10-20, 见 docs/deskcore.md §3.9)
+├── rulecheck.py    带 check 的规则逐篇代码查(纯函数, 2026-10-20, 见 docs/deskcore.md §3.10)
+├── structure.py    简报里的 recent_structure: 问哪几题、怎么算扎堆(纯函数, 2026-10-20, 见 docs/deskcore.md §3.1)
 ├── vocab.py        闭集: essence 来自 vendor JSON, surface 引用 generator.py
 ├── identity.py     API key → user_id, 「个人风格私有」的前提
 ├── tools.py        MCP 工具面, docstring 是给模型看的

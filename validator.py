@@ -264,7 +264,17 @@ def _spec_from_structured(rule: dict) -> Optional[dict]:
         return {"kind": kind, "scope": scope, "n": n} if n > 0 else None
     if kind == "forbidden_regex":
         pattern = str(payload.get("pattern", "")).strip()
-        return {"kind": kind, "pattern": pattern} if pattern else None
+        if not pattern:
+            return None
+        # 写作台(deskcore/rulecheck.py, 2026-10-20)写的形状多一个 ``where``: 只管哪几个部位。这里只看得到标题和正文,
+        # 只管评论 / 话题的正则不能套到标题正文上 —— 那会把一条"评论区别引导私信"变成"正文不许出现私信"的硬违规。
+        # 没有 where 的老形状照旧查标题 + 正文。
+        where = payload.get("where")
+        if where is None:
+            return {"kind": kind, "pattern": pattern}
+        where = [where] if isinstance(where, str) else (where if isinstance(where, list) else [])
+        parts = [w for w in ("title", "body") if w in where]
+        return {"kind": kind, "pattern": pattern, "where": parts} if parts else None
     return None
 
 
@@ -399,13 +409,16 @@ def check_hard_rules(
                 })
         elif kind == "forbidden_regex":
             pattern = spec["pattern"]
+            where = spec.get("where")
+            target = combined if where is None else "\n".join(
+                t for w, t in (("title", title), ("body", body)) if w in where)
             try:
                 # ⚠️ 存量规则也要过这道闸。写入侧的校验只管**以后**存进来的,
                 # 库里那些是在有校验之前写下的 —— 只挡新的等于没挡。
                 # 不安全就当"这条规则没法执行"处理(与编译失败同一条路径:
                 # 不算违规、但埋一行日志), 而不是把生成整个卡死。
                 assert_regex_is_safe(pattern)
-                m = re.search(pattern, combined[:MAX_REGEX_TARGET_CHARS])
+                m = re.search(pattern, target[:MAX_REGEX_TARGET_CHARS])
                 if m:
                     out.append({
                         "rule":  content,

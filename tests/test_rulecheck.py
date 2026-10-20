@@ -1,0 +1,384 @@
+"""能用代码查的规则, 用代码查(2026-10-20)。
+
+``memories.rule_kind`` / ``rule_payload`` 早就在库里(CHECK 只认 forbidden_word / required_phrase / max_len /
+forbidden_regex / free_text), 只是以前只有退役的 validator.py 在读。这里钉的是:
+
+  · record_rule 的 check 先校验再写, 写错整条不落库(工具层是 400 不是 500);
+  · 存档时只查和简报同一份规则里带 check 的那几条 —— 静音的、降回试用的、别人的 global 都不查;
+  · 命中只是参考: 有命中才带 rule_checks, 必须改 / 建议改分得清, 次数进 batch_metrics。
+
+所有示例词和正文都是合成的。
+"""
+
+from __future__ import annotations
+
+import json
+import time
+
+import pytest
+
+import validator
+from deskcore import core, rulecheck, store, tools
+from tests.fakes import FakeClient
+from tests.test_delivery import ME, PROJ, desk_client, distinct_drafts
+
+OTHER = "99999999-9999-9999-9999-999999999999"
+
+
+def _rule(i, kind=None, payload=None, **kw):
+    row = {"id": f"m-{i}", "content": f"示例规则 {i}", "severity": "hard", "scope": "project", "project_id": PROJ,
+           "user_id": ME, "status": "confirmed", "memory_type": "rule", "muted_until": None,
+           "rule_kind": kind, "rule_payload": payload, "created_at": f"2026-10-{i:02d}T00:00:00+00:00",
+           "frequency": 1, "applicability": None, "embedding": None}
+    row.update(kw)
+    return row
+
+
+# ══════════════════════════════════════════════════════════════════════
+# check 的形状
+# ══════════════════════════════════════════════════════════════════════
+
+def test_each_kind_normalises_with_defaults():
+    assert rulecheck.normalize_check({"kind": "forbidden_word", "words": [" 甲 ", "甲", "乙"]}) == \
+        ("forbidden_word", {"words": ["甲", "乙"], "where": ["title", "body"]})
+    assert rulecheck.normalize_check({"kind": "required_phrase", "any": ["话术"], "where": ["comments", "body"]}) == \
+        ("required_phrase", {"any": ["话术"], "where": ["body", "comments"]})
+    assert rulecheck.normalize_check({"kind": "max_len", "min": 150}) == ("max_len", {"where": "body", "min": 150})
+    assert rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": r"\d{3,}", "where": "title"}) == \
+        ("forbidden_regex", {"pattern": r"\d{3,}", "where": ["title"]})
+    assert rulecheck.normalize_check({"kind": "free_text"}) == ("free_text", None)
+
+
+@pytest.mark.parametrize("bad, words", [
+    ({"kind": "style"}, "check.kind"),
+    ("禁用词", "JSON 对象"),
+    ({"kind": "forbidden_word", "words": []}, "非空"),
+    ({"kind": "forbidden_word", "words": ["甲"], "scope": "title"}, "不认识的键"),
+    ({"kind": "forbidden_word", "words": ["甲"], "where": ["footer"]}, "where"),
+    ({"kind": "forbidden_word", "words": ["这是一整句话而不是一个词" * 5]}, "太长"),
+    ({"kind": "forbidden_regex", "pattern": "(a+)+$"}, "灾难性回溯"),
+    ({"kind": "forbidden_regex", "pattern": "("}, "无法编译"),
+    ({"kind": "forbidden_regex", "pattern": "(哈|哈哈)+$"}, "灾难性回溯"),
+    ({"kind": "forbidden_regex", "pattern": "(ab?)+$"}, "灾难性回溯"),
+    ({"kind": "forbidden_regex", "pattern": "(?:x|yz){2,9}"}, "灾难性回溯"),
+    ({"kind": "max_len"}, "至少给"),
+    ({"kind": "max_len", "max": 10, "min": 20}, "不能比 max 大"),
+    ({"kind": "max_len", "max": True}, "正整数"),
+    ({"kind": "max_len", "max": 10, "where": "tags"}, "title 或 body"),
+    ({"kind": "free_text", "words": ["甲"]}, "不带别的键"),
+])
+def test_bad_checks_are_rejected_with_a_reason(bad, words):
+    with pytest.raises(rulecheck.CheckError) as exc:
+        rulecheck.normalize_check(bad)
+    assert words in str(exc.value)
+
+
+@pytest.mark.parametrize("pattern", [r"哈{5,}", r"[!！]{3,}", r"(?:哈哈)+", r"(哈哈)+", r"\d+%", r"(最|第一|顶级)",
+                                     r"(?:啊|呀)+", r".{0,5}私信"])
+def test_ordinary_patterns_still_pass_the_shape_check(pattern):
+    assert rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})[1]["pattern"] == pattern
+
+
+def test_an_ambiguous_quantified_alternation_is_refused_on_read_too():
+    """validator.assert_regex_is_safe 放行 (哈|哈哈)+$: 30 个「哈」加一个句号就回溯近半秒、每多一个字乘 1.6, 而 re 匹配时
+    握着 GIL —— 共享的服务进程整个停住。库里要是已经有这种形状(手写进去的), 读出来也跳过, 不跑。"""
+    assert validator.regex_is_safe("(哈|哈哈)+$"), "前提: validator 那道闸确实抓不到这一类"
+    assert rulecheck.spec_of(_rule(1, "forbidden_regex", {"pattern": "(哈|哈哈)+$", "where": ["body"]})) is None
+    t0 = time.monotonic()
+    hits, stats = rulecheck.check([_rule(1, "forbidden_regex", {"pattern": "(哈|哈哈)+$"})],
+                                  [{"title": "", "body": "哈" * 40 + "。"}])
+    assert hits == [] and stats == {"rules": 0, "skipped": 1}
+    assert time.monotonic() - t0 < 1
+
+
+def test_validator_honours_where_on_a_desk_regex():
+    """AW 生成链路(generation_service → validator.check_hard_rules)也读这两列: 只管评论的正则不能被它套到标题正文上。"""
+    def hits(where):
+        rule = {"content": "评论区：别引导私信", "rule_kind": "forbidden_regex",
+                "rule_payload": {"pattern": "私信", **({"where": where} if where is not None else {})}}
+        return validator.check_hard_rules([rule], "标题有私信", "正文也有私信")
+    assert hits(["comments"]) == [] and hits(["tags", "comments"]) == []
+    assert [h["match"] for h in hits(["title"])] == ["私信"]
+    assert len(hits(None)) == 1 and len(hits(["title", "body"])) == 1
+    only_body = {"content": "x", "rule_kind": "forbidden_regex", "rule_payload": {"pattern": "^标题", "where": ["body"]}}
+    assert validator.check_hard_rules([only_body], "标题有私信", "正文") == []
+
+
+def test_validator_era_payloads_still_read():
+    """validator.py(Day 3)存的老形状: 生产库里一条也没有, 但读的时候照样认, 别让哪天灌进来的老数据静默失效。"""
+    assert rulecheck.spec_of(_rule(1, "forbidden_word", {"target": "甲"}))["words"] == ["甲"]
+    assert rulecheck.spec_of(_rule(1, "required_phrase", {"target": "话术"}))["any"] == ["话术"]
+    assert rulecheck.spec_of(_rule(1, "max_len", {"scope": "标题", "n": 20})) == \
+        {"kind": "max_len", "where": "title", "max": 20}
+    assert rulecheck.spec_of(_rule(1, "max_len", '{"scope": "正文", "n": 300}'))["where"] == "body"
+
+
+@pytest.mark.parametrize("kind, payload", [
+    ("forbidden_word", None), ("forbidden_word", "{broken"), ("max_len", {"scope": "开头", "n": 5}),
+    ("forbidden_regex", {"pattern": "(a*)*"}), ("free_text", None), (None, {"words": ["甲"]}),
+])
+def test_unusable_checks_are_skipped_not_fatal(kind, payload):
+    assert rulecheck.spec_of(_rule(1, kind, payload)) is None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 查
+# ══════════════════════════════════════════════════════════════════════
+
+DRAFT = {"title": "标题里有 Alpha", "body": "正文第一句。\n正文第二句提到甲。\n#话题乙 #话题丙",
+         "tags": ["话题丁"], "comments": [{"role": "reader", "text": "评论里有乙"}]}
+
+
+def test_forbidden_words_are_found_per_part_case_insensitively():
+    rules = [_rule(1, "forbidden_word", {"words": ["alpha", "甲", "不存在"]}),
+             _rule(2, "forbidden_word", {"words": ["乙"], "where": ["tags", "comments"]}, severity="soft")]
+    hits, stats = rulecheck.check(rules, [DRAFT], indices=[3])
+    assert stats == {"rules": 2, "skipped": 0}
+    got = [(h["index"], h["rule_id"], h["where"], h["what"]) for h in hits]
+    assert got == [(3, "m-1", "title", "必须改: 标题里有禁用词「alpha」"),
+                   (3, "m-1", "body", "必须改: 正文里有禁用词「甲」"),
+                   (3, "m-2", "tags", "建议改: 话题标签里有禁用词「乙」"),
+                   (3, "m-2", "comments", "建议改: 评论里有禁用词「乙」")]
+
+
+def test_ascii_words_match_on_word_boundaries():
+    rules = [_rule(1, "forbidden_word", {"words": ["ad"]})]
+    assert rulecheck.check(rules, [{"title": "made in", "body": "reading"}])[0] == []
+    assert len(rulecheck.check(rules, [{"title": "an AD here", "body": ""}])[0]) == 1
+
+
+def test_required_phrase_hits_only_when_none_is_present():
+    rule = _rule(1, "required_phrase", {"any": ["话术一", "话术二"], "where": ["body"]})
+    assert rulecheck.check([rule], [{"title": "", "body": "带了话术二"}])[0] == []
+    hits = rulecheck.check([rule], [{"title": "", "body": "什么都没带"}])[0]
+    assert [h["what"] for h in hits] == ["必须改: 正文里没有「话术一」「话术二」中的任何一个"]
+    on_comments = _rule(2, "required_phrase", {"any": ["话术一"], "where": ["comments"]})
+    assert rulecheck.check([on_comments], [{"title": "t", "body": "b"}])[0] == [], "没写评论就不查评论"
+
+
+def test_length_is_counted_without_whitespace_and_tags():
+    rule = _rule(1, "max_len", {"min": 10, "max": 12, "where": "body"}, severity="soft")
+    ok = {"title": "", "body": "一二三四五 六七八九十\n#话题一 #话题二"}
+    assert rulecheck.check([rule], [ok])[0] == []
+    short = rulecheck.check([rule], [{"title": "", "body": "一二三 #很长很长的话题"}])[0]
+    assert [h["what"] for h in short] == ["建议改: 正文 3 字(不算空白和话题), 下限 10"]
+    long = rulecheck.check([rule], [{"title": "", "body": "一" * 13}])[0]
+    assert long[0]["what"].endswith("上限 12")
+
+
+def test_truncation_keeps_every_hard_hit_before_any_soft_one():
+    """按篇号直接截的话, 后面几篇的必须改会被前面几篇的建议改挤掉, 写手看不见, 就当没问题交了。"""
+    hits = [{"index": i, "severity": "soft", "rule_id": f"s{k}"} for i in range(15) for k in range(3)]
+    hits.append({"index": 14, "severity": "hard", "rule_id": "h"})
+    hits.sort(key=lambda h: (h["index"], h["severity"] != "hard"))
+    shown, more = rulecheck.top_hits(hits)
+    assert len(shown) == rulecheck.MAX_HITS and more == 6
+    assert {"index": 14, "severity": "hard", "rule_id": "h"} in shown
+    assert [(h["index"], h["severity"]) for h in shown] == sorted(
+        [(h["index"], h["severity"]) for h in shown], key=lambda x: (x[0], x[1] != "hard")), "列出来的照旧按篇排"
+    assert [h["index"] for h in shown if h["severity"] == "soft"][-1] == 12, "建议改按篇号补到满"
+
+
+def test_hard_hits_sort_before_soft_within_a_draft():
+    rules = [_rule(1, "forbidden_word", {"words": ["甲"]}, severity="soft"),
+             _rule(2, "forbidden_word", {"words": ["甲"]}, severity="hard")]
+    hits = rulecheck.check(rules, [{"title": "", "body": "甲"}, {"title": "", "body": "甲"}])[0]
+    assert [(h["index"], h["severity"]) for h in hits] == [(0, "hard"), (0, "soft"), (1, "hard"), (1, "soft")]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# record_rule 带 check
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def rule_client(monkeypatch):
+    import dedup
+    monkeypatch.setattr(dedup, "embeddings_available", lambda: False)
+    return FakeClient(rows={"memories": [], "projects": [
+        {"id": PROJ, "name": "示例项目", "brand": "示例品牌", "owner_id": ME}]})
+
+
+def test_record_rule_stores_the_check(rule_client):
+    out = core.record_rule(rule_client, PROJ, "不要用示例禁词", severity="hard", user_id=ME,
+                           check={"kind": "forbidden_word", "words": ["禁词一", "禁词二"]})
+    row = rule_client.rows["memories"][0]
+    assert row["rule_kind"] == "forbidden_word"
+    assert row["rule_payload"] == {"words": ["禁词一", "禁词二"], "where": ["title", "body"]}
+    assert out["check"] == {"kind": "forbidden_word", "words": ["禁词一", "禁词二"], "where": ["title", "body"]}
+
+
+def test_re_recording_an_existing_rule_can_add_change_and_drop_its_check(rule_client):
+    """db.upsert_memory 只在新建时写这两列 —— 已有的规则再记一次带 check, 不能被静默丢掉。"""
+    core.record_rule(rule_client, PROJ, "正文长度", user_id=ME)
+    assert rule_client.rows["memories"][0].get("rule_kind") is None
+    core.record_rule(rule_client, PROJ, "正文长度", user_id=ME, check={"kind": "max_len", "min": 200})
+    assert len(rule_client.rows["memories"]) == 1
+    assert rule_client.rows["memories"][0]["rule_payload"] == {"where": "body", "min": 200}
+    out = core.record_rule(rule_client, PROJ, "正文长度", user_id=ME, check={"kind": "free_text"})
+    assert rule_client.rows["memories"][0]["rule_kind"] == "free_text" and out["check"] is None
+
+
+def test_a_bad_check_writes_nothing_and_is_a_400(rule_client, monkeypatch):
+    with pytest.raises(rulecheck.CheckError):
+        core.record_rule(rule_client, PROJ, "示例规则", user_id=ME, check={"kind": "max_len"})
+    assert rule_client.rows["memories"] == [], "check 写错了规则却落了库: 用户以为会被代码查, 其实没有"
+    monkeypatch.setattr(core, "sb", lambda: rule_client)
+    with pytest.raises(tools.InvalidInput):
+        tools.record_rule(PROJ, "示例规则", check={"kind": "forbidden_word", "words": []}, _user_id=ME)
+
+
+def test_old_record_rule_callers_are_unaffected(rule_client):
+    out = core.record_rule(rule_client, PROJ, "一条普通规则", user_id=ME)
+    assert "check" not in out
+    assert not [c for c in rule_client.calls if c["op"] == "update"]
+
+
+def test_my_rules_shows_which_rules_are_code_checked(rule_client):
+    core.record_rule(rule_client, PROJ, "示例禁词", user_id=ME, check={"kind": "forbidden_word", "words": ["甲"]})
+    core.record_rule(rule_client, PROJ, "语气轻一点", user_id=ME)
+    rows = {r["content"]: r for r in core.my_rules(rule_client, PROJ, user_id=ME)["rules"]}
+    assert rows["示例禁词"]["check"]["words"] == ["甲"]
+    assert "check" not in rows["语气轻一点"]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 存档时查: 和简报同一份规则
+# ══════════════════════════════════════════════════════════════════════
+
+def _with_word(word: str, n: int = 2) -> list[dict]:
+    drafts = distinct_drafts(n)
+    drafts[0]["body"] = drafts[0]["body"] + word
+    return drafts
+
+
+def test_score_drafts_reports_hits_and_records_counts():
+    c = desk_client(memories=[_rule(1, "forbidden_word", {"words": ["示例禁词"]}),
+                              _rule(2, "max_len", {"max": 5, "where": "title"}, severity="soft")])
+    out = core.commit_drafts(c, PROJ, _with_word("示例禁词"), user_id=ME)
+    got = [(h["index"], h["rule_id"], h["severity"]) for h in out["rule_checks"]]
+    assert got == [(0, "m-1", "hard"), (0, "m-2", "soft"), (1, "m-2", "soft")]
+    assert out["rule_checks"][0]["what"].startswith("必须改")
+    assert "rule_checks" in out["next_step"]
+    meta = c.rows["batch_metrics"][0]["meta"]["rule_checks"]
+    assert (meta["rules"], meta["hits"], meta["hard"]) == (2, 3, 1)
+
+
+def test_no_hits_means_no_rule_checks_key():
+    c = desk_client(memories=[_rule(1, "forbidden_word", {"words": ["不会出现的词"]}), _rule(2)])
+    out = core.commit_drafts(c, PROJ, distinct_drafts(2), user_id=ME)
+    assert "rule_checks" not in out
+    assert c.rows["batch_metrics"][0]["meta"]["rule_checks"]["rules"] == 1
+
+
+@pytest.mark.parametrize("row", [
+    _rule(1, "forbidden_word", {"words": ["示例禁词"]}, muted_until="2099-01-01T00:00:00+00:00"),
+    _rule(1, "forbidden_word", {"words": ["示例禁词"]}, status="candidate"),
+    _rule(1, "forbidden_word", {"words": ["示例禁词"]}, scope="global", project_id=None, user_id=OTHER),
+    _rule(1, "forbidden_word", {"words": ["示例禁词"]}, memory_type="note"),
+], ids=["muted", "retired", "someone-elses-global", "not-a-rule"])
+def test_rules_the_brief_would_not_inject_are_not_checked(row):
+    out = core.commit_drafts(desk_client(memories=[row]), PROJ, _with_word("示例禁词"), user_id=ME)
+    assert "rule_checks" not in out
+
+
+def test_my_own_global_rule_is_checked():
+    row = _rule(1, "forbidden_word", {"words": ["示例禁词"]}, scope="global", project_id=None)
+    out = core.commit_drafts(desk_client(memories=[row]), PROJ, _with_word("示例禁词"), user_id=ME)
+    assert [h["rule_id"] for h in out["rule_checks"]] == ["m-1"]
+
+
+def test_retire_and_mute_stop_the_code_check():
+    """set_rule_state 不用改: 代码检查读的就是简报那一份(shared_memories), 停用 / 降档之后自然取不到。"""
+    c = desk_client(memories=[_rule(1, "forbidden_word", {"words": ["示例禁词"]})])
+
+    def commit(seed: int) -> dict:
+        d = distinct_drafts(1, seed=seed)[0]          # 每次换一篇, 免得被自己上一次存的指纹拦下
+        return core.commit_drafts(c, PROJ, [{**d, "body": d["body"] + "示例禁词"}], user_id=ME)
+
+    assert "rule_checks" in commit(4)
+    core.set_rule_state(c, "m-1", "mute", user_id=ME, days=30)
+    assert "rule_checks" not in commit(5)
+    core.set_rule_state(c, "m-1", "unmute", user_id=ME)
+    assert "rule_checks" in commit(6)
+    core.set_rule_state(c, "m-1", "retire", user_id=ME)
+    assert "rule_checks" not in commit(7)
+
+
+def test_a_failing_rule_lookup_never_breaks_scoring_but_says_it_did_not_run(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("规则表查不动")
+    monkeypatch.setattr(store, "shared_memories", boom)
+    c = desk_client()
+    out = core.commit_drafts(c, PROJ, distinct_drafts(1), user_id=ME)
+    assert out["written"] == 1 and "rule_checks" not in out
+    assert out["rule_checks_status"] == "error", "没查成和查过了没命中长得一样的话, 写手会当整批都查干净了"
+    assert "rule_checks_status=error" in out["next_step"]
+    assert "规则表查不动" in c.rows["batch_metrics"][0]["meta"]["rule_checks"]["error"]
+
+
+def test_a_clean_check_carries_no_status_marker():
+    out = core.commit_drafts(desk_client(memories=[_rule(1, "forbidden_word", {"words": ["不会出现"]})]), PROJ,
+                             distinct_drafts(1), user_id=ME)
+    assert "rule_checks" not in out and "rule_checks_status" not in out
+
+
+def test_soft_rules_for_the_other_direction_are_not_checked():
+    """简报的方向闸(filter_by_applicability)挡掉的 soft 规则, my_rules 里是「方向不符」, 这里也不查 —— 不然产品向的
+    "带上产品名"会在流量向项目上报「建议改」。hard 不过这道闸, 同简报。"""
+    rules = [_rule(1, "required_phrase", {"any": ["示例产品名"]}, severity="soft", applicability="产品向"),
+             _rule(2, "required_phrase", {"any": ["示例口播"]}, severity="soft", applicability="流量向"),
+             _rule(3, "required_phrase", {"any": ["示例合规话术"]}, severity="hard", applicability="产品向")]
+    c = desk_client(memories=rules)
+    c.rows["projects"][0]["name"] = "示例项目 流量向"
+    out = core.commit_drafts(c, PROJ, distinct_drafts(1), user_id=ME)
+    assert sorted(h["rule_id"] for h in out["rule_checks"]) == ["m-2", "m-3"]
+    ledger = {r["memory_id"]: r["state"] for r in core.my_rules(c, PROJ, user_id=ME)["rules"]}
+    assert ledger["m-1"] == "方向不符"
+
+    undecided = desk_client(memories=rules)            # 项目名判不出方向: 全部放行, 同简报
+    out = core.commit_drafts(undecided, PROJ, distinct_drafts(1, seed=5), user_id=ME)
+    assert sorted(h["rule_id"] for h in out["rule_checks"]) == ["m-1", "m-2", "m-3"]
+
+
+def test_tag_checks_see_the_tags_the_template_adds():
+    """固定话题是模板加的: 只看写手传的 tags 的话, delivery.text 末尾明明有「#示例固定」, rule_checks 却说没有。"""
+    tpl = {"layout": "blocks", "tags": {"content": 2, "fixed": ["示例固定"]}}
+    rules = [_rule(1, "required_phrase", {"any": ["示例固定"], "where": ["tags"]}),
+             _rule(2, "forbidden_word", {"words": ["示例禁话题"], "where": ["tags"]})]
+    c = desk_client(default_params=json.dumps({"delivery": tpl}, ensure_ascii=False), memories=rules)
+    drafts = distinct_drafts(2)
+    drafts[0]["tags"] = ["话题一", "话题二"]
+    drafts[1]["tags"] = ["话题一", "示例禁话题"]
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert "#示例固定" in out["delivery"]["text"]
+    assert [(h["index"], h["rule_id"]) for h in out["rule_checks"]] == [(1, "m-2")]
+
+
+def test_the_rule_lookup_does_not_pull_embeddings():
+    """每次存档都多拉一遍 768 维向量是白花的流量 —— 代码查规则只要带 check 的那几行。"""
+    c = desk_client(memories=[_rule(1, "forbidden_word", {"words": ["甲"]})])
+    core.commit_drafts(c, PROJ, distinct_drafts(1), user_id=ME)
+    reads = [x for x in c.calls if x["table"] == "memories" and x["op"] == "select"]
+    assert reads and all("embedding" not in x["cols"] for x in reads)
+    assert all(("in", "rule_kind", rulecheck.CHECK_KINDS) in x["filters"] for x in reads)
+
+
+def test_a_required_phrase_naming_another_project_is_refused():
+    """必须带的话术会变成"正文里没有「X」"回给写手: X 是别的项目的品牌名, 等于叫模型往这个项目里写别家的名字。
+    禁用词不受这道限制 —— 禁掉别家的名字恰恰是常见用法。"""
+    sb = FakeClient(rows={"memories": [], "projects": [
+        {"id": PROJ, "name": "示例项目", "brand": "示例品牌", "owner_id": ME},
+        {"id": "p-other", "name": "另一个项目", "brand": "别家品牌", "owner_id": ME}]})
+    with pytest.raises(core.ProjectIsolationRejected):
+        core.record_rule(sb, PROJ, "必须带上指定话术", user_id=ME,
+                         check={"kind": "required_phrase", "any": ["别家品牌"]})
+    assert sb.rows["memories"] == []
+    out = core.record_rule(sb, PROJ, "不许提竞品", user_id=ME,
+                           check={"kind": "forbidden_word", "words": ["别家品牌"]})
+    assert out["check"]["words"] == ["别家品牌"]
+
+
+def test_a_tag_both_passed_and_in_the_body_counts_once():
+    """写手传的 tags 和正文末尾的 #话题 是同一批时只算一次: 按个数数的检查不能把同一个话题数两遍。"""
+    parts = rulecheck._parts({"title": "t", "body": "正文一段。\n#话题一 #话题二", "tags": ["话题一", "#话题二", "话题三"]})
+    assert parts["tags"] == ["话题一 话题二 话题三"]
