@@ -555,3 +555,30 @@ def test_tv_sync_reports_the_committed_part_of_a_failed_lag_write(monkeypatch):
                         lambda *a: (_ for _ in ()).throw(store.PartialWriteError(200, RuntimeError("timeout"))))
     out = core.tv_sync(c, TV)["edit_diffs"]
     assert out["lag_filled"] == 200 and "写了 200 行之后失败" in out["lag_error"]
+
+
+BODY_C = ("第二篇稿子讲的是另一件事: 面试前一晚把自我介绍念给室友听, 室友听到第三句就睡着了。"
+          "第二天我把前三句删了, 面试官第一次在我说完之前就开始点头。")
+
+
+def test_one_write_with_new_and_same_version_rows_does_not_null_computed_at():
+    """2026-10-20 生产 tv-sync: 同一块里有新算的差异(带 computed_at)和同一版重算的(不带), PostgREST 按所有行的键的并集
+    写、没带的补 NULL —— computed_at NOT NULL, 整块 23502, BJS / SPX 两个项目的差异一条没写成。各行带的列不一样时要分开写。"""
+    c = _client([_note("n1", "秋招投了六十份简历没回音", BODY_A), _note("n2", "自我介绍删了前三句", BODY_C)])
+    c.rows["items"].append({"id": "i2", "batch_id": "b1", "best_version_id": "v2", "created_at": _iso(0),
+                            "user_id": ME, "status": "pending",
+                            "versions": [{"id": "v2", "title": "自我介绍删了前三句", "body": BODY_C,
+                                          "version_num": 1, "created_at": _iso(0)}],
+                            "batches": {"project_id": P1}})
+    c.rows["versions"].append({"id": "v2", "item_id": "i2", "title": "自我介绍删了前三句", "body": BODY_C,
+                               "version_num": 1, "created_at": _iso(0)})
+    core.tv_sync(c, TV)
+    assert sorted(r["note_id"] for r in c.rows["tv_edit_diffs"]) == ["n1", "n2"]
+    old = next(r for r in c.rows["tv_edit_diffs"] if r["note_id"] == "n1")
+    old.update(diff_rev=0, computed_at="2026-09-01T00:00:00+00:00")          # 口径过时、同一版: 重算不推时间
+    c.rows["tv_edit_diffs"] = [old]                                          # n2 的差异那晚没写成: 新算, 记现在
+    out = core.tv_sync(c, TV)["edit_diffs"]
+    assert "error" not in out and out["written"] == 2, out
+    rows = {r["note_id"]: r for r in c.rows["tv_edit_diffs"]}
+    assert rows["n1"]["computed_at"] == "2026-09-01T00:00:00+00:00", "同一版重算照旧不推过水位"
+    assert rows["n2"]["computed_at"] and rows["n2"]["computed_at"] > "2026-10-01", "新算的记现在"

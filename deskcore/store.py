@@ -2264,16 +2264,23 @@ def tv_edit_diff_revs(sb, tv_project_id: str) -> dict[str, dict]:
 
 
 def tv_edit_diffs_upsert(sb, rows: list[dict]) -> int:
+    """按"带了哪些列"分组再分块写。⚠️ 同一次批量 upsert 里各行带的列不一样时, PostgREST 按所有行的键的并集写、
+    没带的补 NULL(postgrest-py default_to_null) —— 同一版重算的行故意不带 computed_at(见 core._diff_stamp), 和新算的
+    (带)混在一块, 整块撞 computed_at NOT NULL(2026-10-20 生产 tv-sync, BJS / SPX 两个项目的差异一条没写成)。"""
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(tuple(sorted(r)), []).append(r)
     n = 0
-    for i in range(0, len(rows), 200):
-        chunk = rows[i:i + 200]
-        try:
-            sb.table("tv_edit_diffs").upsert(chunk, on_conflict="note_id").execute()
-        except Exception as exc:                        # noqa: BLE001
-            if not n:
-                raise
-            raise PartialWriteError(n, exc) from exc
-        n += len(chunk)
+    for group in groups.values():
+        for i in range(0, len(group), 200):
+            chunk = group[i:i + 200]
+            try:
+                sb.table("tv_edit_diffs").upsert(chunk, on_conflict="note_id").execute()
+            except Exception as exc:                    # noqa: BLE001
+                if not n:
+                    raise
+                raise PartialWriteError(n, exc) from exc
+            n += len(chunk)
     return n
 
 
