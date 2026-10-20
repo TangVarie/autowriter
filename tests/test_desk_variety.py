@@ -66,7 +66,8 @@ class _World:
         self.notes.append({"note_id": nid, "project_id": "SPX", "publish_time": publish_time or _ago(days=days),
                            "title": "(TV 的标题不该被取)", "body": "(正文不该被取)", "raw_content": "(不该被取)"})
         self.links.append({"note_id": nid, "tv_project_id": "SPX", "project_id": pid,
-                           "version_id": None if kind in ("ambiguous", "unmatched") else vid, "match_kind": kind})
+                           "version_id": None if kind in ("ambiguous", "unmatched") else vid, "match_kind": kind,
+                           "matched_at": _ago(hours=len(self.links))})
         if published_title is not None:
             self.diffs.append({"note_id": nid, "project_id": pid, "published_title": published_title})
 
@@ -169,12 +170,37 @@ def test_an_active_project_still_shows_yesterdays_drafts():
 
 
 def test_a_page_of_notes_for_other_directions_does_not_hide_this_projects_titles():
-    """同一个 TV 项目对着好几个方向(WTG 15 个): 最新的一整页都是别的方向的, 本项目的在后面也要找得到。"""
+    """同一个 TV 项目对着好几个方向(WTG 15 个): 最新的几百篇都是别的方向的, 本项目的也要找得到, 而且往返次数
+    固定 —— 不能一页页翻 TV 的笔记(codex review on aw#112: 那样稀疏的方向要十几次往返, 全压在 open_project 上)。"""
     w = _World()
-    for i in range(store.RECENT_NOTES_PAGE + 5):
-        w.published(f"s{i:03d}", f"方向二的第{i}篇", days=0.5, pid=SIB)
+    for i in range(1200):
+        w.published(f"s{i:04d}", f"方向二的第{i}篇", days=0.5, pid=SIB)
     w.published("mine", "本项目的那篇", days=3)
-    assert store.recent_titles(w.client(), PID)["published"] == ["本项目的那篇"]
+    c = w.client()
+    assert store.recent_published_titles(c, PID) == ["本项目的那篇"]
+    trips = [q for q in c.calls if q["table"] in ("tv_note_links", "truth_vault.notes")]
+    assert len(trips) <= 3, trips
+
+
+def test_a_revision_of_an_older_item_counts_as_recent_writing():
+    """改稿是往老 item 上加一版, 批次还是原来那个(codex review on aw#112): 按批次时间切会漏掉昨天改的老稿。"""
+    w = _World()
+    w.drafted("b-old", ["老稿的旧标题"], days=20)
+    w.items[-1]["versions"][-1].update(title="昨天改出来的新标题", created_at=_ago(days=1))
+    w.drafted("b-older", ["一直没动的老稿"], days=25)
+    assert store.recent_drafted_titles(w.client(), PID, days=14) == ["昨天改出来的新标题"]
+
+
+def test_a_draft_matching_a_published_title_beyond_the_cap_still_shows():
+    """去重只拿真留下来的发出去的标题(codex review on aw#112): 被截掉的那条不该把写过栏里同名的一篇也挡掉。"""
+    w = _World()
+    for i in range(25):
+        w.published(f"n{i:02d}", f"发出去的第{i}篇", days=1 + i / 10)
+    w.drafted("b1", ["发出去的第24篇", "写过的另一篇"], days=0.5)     # 和第 25 条(会被截掉的)同名
+    got = store.recent_titles(w.client(), PID, limit=20)
+    assert "发出去的第24篇" not in got["published"]
+    assert got["drafted"] == ["发出去的第24篇", "写过的另一篇"], got
+    assert len(got["published"]) == 18
 
 
 def test_one_column_failing_does_not_take_the_other_down():
@@ -487,3 +513,18 @@ def test_tool_docs_say_at_most_one_pattern_per_draft():
     for fn in (tools.open_project, tools.borrow_lessons):
         doc = fn.__doc__ or ""
         assert "每篇最多用" in doc and "不是模板" in doc and "轮换" in doc, fn.__name__
+
+
+def test_spreading_a_huge_request_stays_cheap():
+    """n 没有上限(codex review on aw#112): 一次要上千个时重排不能变成 O(n × 候选数) 的纯 Python 扫描。"""
+    import time
+    from itertools import product
+    from deskcore import vocab
+    cands = [{"angle_key": f"k{i}", "dims": {"emotional_lever": a, "human_truth_archetype": "x",
+                                             "content_format": b, "title_structure": c}}
+             for i, (a, b, c) in enumerate(product(vocab.EMOTIONAL_LEVERS * 19, vocab.CONTENT_FORMATS,
+                                                     vocab.TITLE_STRUCTURES))]
+    t0 = time.perf_counter()
+    out = core._spread_order(cands, 1000)
+    assert time.perf_counter() - t0 < 2.0
+    assert len(out) == len(cands) and sorted(c["angle_key"] for c in out) == sorted(c["angle_key"] for c in cands)

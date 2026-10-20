@@ -2327,9 +2327,13 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
 # 前天写了什么, 只能在同一份简报里一遍遍写出同一种标题、同一个人设。所以开项目时把标题(只要标题, 不带正文)
 # 摆出来让它避开。读法和 desk_gap 同一条纪律: truth_vault.notes 只取 note_id / publish_time 两列, 窗口按发布时间切。
 RECENT_TITLE_CHARS = 40
-RECENT_NOTES_PAGE = 200
-RECENT_NOTES_SCAN_MAX = 1000          # 一个 TV 项目对着好几个写作台项目(WTG 15 个方向), 新的在前一页页找, 最多看这么多条
+# 先取本项目最近对上的这么多条对照(按 matched_at), 再按 id 查它们的发布时间、按发布时间切窗口。
+# ⚠️ 不按"TV 项目最新的笔记一页页往下翻"(codex review on aw#112): 一个 TV 项目对着好几个方向(WTG 15 个)、
+# 这个方向对上得少时, 那样要翻满 5 页、每页再查两次对照, 十几次往返全压在 open_project 上。现在固定几次往返。
+RECENT_LINKS_SCAN = 400
+RECENT_NOTES_CHUNK = 200
 RECENT_BATCHES_MAX = 200
+RECENT_DRAFT_ITEMS_MAX = 300
 # 对上了、有版本的几种; ambiguous / unmatched 没有版本, 不知道是哪一篇, 不算
 _RECENT_LINK_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", "ingested", "tv_lineage"})
 
@@ -2349,34 +2353,27 @@ def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int =
 
     标题取哪一份: ``ingested`` 的版本就是从这条笔记复制来的, ``versions.title`` 就是发出去的标题; 其余几种对上的是
     写作台那版, 人可能改过标题, 优先 ``tv_edit_diffs.published_title``(013), 没有再退回写作台那版。"""
-    tv_ids = sorted({str(m["tv_project_id"]) for m in tv_projects_of(sb, project_id) if m.get("tv_project_id")})
-    if not tv_ids:
-        return []
     now = now or datetime.now(timezone.utc)
-    since = (now - timedelta(days=days)).isoformat()
+    since = now - timedelta(days=days)
     want = max(limit, 1) * 2                      # 留余量: 有的标题为空、有的去重后重复
-    picked: list[dict] = []
-    for off in range(0, RECENT_NOTES_SCAN_MAX, RECENT_NOTES_PAGE):
-        # 上界 = 现在: 排期还没发的(publish_time 在未来)不算
-        notes = (sb.schema("truth_vault").table("notes")
-                 .select("note_id, publish_time")
-                 .in_("project_id", tv_ids)
-                 .gte("publish_time", since).lte("publish_time", now.isoformat())
-                 .order("publish_time", desc=True).order("note_id")
-                 .range(off, off + RECENT_NOTES_PAGE - 1).execute()).data or []
-        ids = [n["note_id"] for n in notes if n.get("note_id")]
-        links: dict[str, dict] = {}
-        for i in range(0, len(ids), 100):
-            for r in (sb.table("tv_note_links").select("note_id, version_id, match_kind")
-                      .eq("project_id", project_id).in_("note_id", ids[i:i + 100]).execute()).data or []:
-                links[r["note_id"]] = r
-        for nid in ids:                           # 按笔记的发布顺序, 不按对照表回来的顺序
-            r = links.get(nid)
-            if r and r.get("version_id") and r.get("match_kind") in _RECENT_LINK_KINDS:
-                picked.append(r)
-        if len(picked) >= want or len(notes) < RECENT_NOTES_PAGE:
-            break
-    picked = picked[:want]
+    links = [r for r in (sb.table("tv_note_links").select("note_id, version_id, match_kind")
+                         .eq("project_id", project_id).in_("match_kind", sorted(_RECENT_LINK_KINDS))
+                         .order("matched_at", desc=True).order("note_id")
+                         .limit(RECENT_LINKS_SCAN).execute()).data or []
+             if r.get("note_id") and r.get("version_id")]
+    if not links:
+        return []
+    ids = [r["note_id"] for r in links]
+    when: dict[str, datetime] = {}
+    for i in range(0, len(ids), RECENT_NOTES_CHUNK):
+        for n in (sb.schema("truth_vault").table("notes").select("note_id, publish_time")
+                  .in_("note_id", ids[i:i + RECENT_NOTES_CHUNK]).execute()).data or []:
+            t = _ts(n.get("publish_time"))
+            # 上界 = 现在: 排期还没发的(publish_time 在未来)不算
+            if t is not None and since <= t <= now:
+                when[n["note_id"]] = t
+    picked = sorted((r for r in links if r["note_id"] in when),
+                    key=lambda r: (when[r["note_id"]], r["note_id"]), reverse=True)[:want]
     if not picked:
         return []
     edited_ids = [r["note_id"] for r in picked if r["match_kind"] != "ingested"]
@@ -2399,23 +2396,25 @@ def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int =
 def recent_drafted_titles(sb, project_id: str, *, days: int = 14, limit: int = 20,
                           now: datetime | None = None) -> list[str]:
     """这个项目近 ``days`` 天在写作台里写过的标题(每个 item 取定稿 / 最新那版), 新的在前。异常原样上抛。
+    窗口按【那一版自己的时间】切, 不按批次建的时间(codex review on aw#112): 改稿是往老 item 上加一版, 批次还是
+    原来那个 —— 按批次切的话, 昨天改的一篇老稿就漏了。所以批次往前多看几倍天数, 再按版本时间筛。
 
     补录副本(``batches.params.source == 'ingest'``)不算: 那是发出去的帖抄回来的, 已经在 published 里了 ——
     而且 ingest 目标项目里副本比真写的多(B-19), 不先排掉的话这一栏全是 TV 的影子。先取批次在 Python 里认副本
     (params 是 jsonb, 在假件和老行里可能是字符串, 同 is_ingest_batch), 再按批次取 item, 只取标题不取正文。"""
     now = now or datetime.now(timezone.utc)
-    since = (now - timedelta(days=days)).isoformat()
+    since = now - timedelta(days=days)
     batches = (sb.table("batches").select("id, params, created_at")
-               .eq("project_id", project_id).gte("created_at", since)
+               .eq("project_id", project_id).gte("created_at", (now - timedelta(days=days * 4)).isoformat())
                .order("created_at", desc=True).order("id", desc=True)
                .limit(RECENT_BATCHES_MAX).execute()).data or []
     ids = [b["id"] for b in batches if b.get("id") and not is_ingest_batch(b)][:100]
     if not ids:
         return []
-    items = (sb.table("items").select("id, best_version_id, created_at, versions(id, title, version_num)")
+    items = (sb.table("items").select("id, best_version_id, created_at, versions(id, title, version_num, created_at)")
              .in_("batch_id", ids).order("created_at", desc=True).order("id", desc=True)
-             .limit(max(limit, 1) * 3).execute()).data or []
-    out: list[str] = []
+             .limit(RECENT_DRAFT_ITEMS_MAX).execute()).data or []
+    rows: list[tuple[datetime, str]] = []
     for item in items:
         versions = item.get("versions") or []
         if not versions:
@@ -2424,8 +2423,11 @@ def recent_drafted_titles(sb, project_id: str, *, days: int = 14, limit: int = 2
         chosen = next((v for v in versions if v.get("id") == best), None)
         if chosen is None:
             chosen = max(versions, key=lambda v: v.get("version_num") or 0)
-        out.append(chosen.get("title") or "")
-    return out
+        t = _ts(chosen.get("created_at")) or _ts(item.get("created_at"))
+        if t is not None and t >= since:
+            rows.append((t, chosen.get("title") or ""))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return [title for _, title in rows]
 
 
 def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days: int = 14,
@@ -2439,7 +2441,6 @@ def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days
     两栏各自兜底: truth_vault 读不到(Exposed schemas 没有它 / 本地库)不该连写作台自己写过的那栏一起丢 ——
     这只是给模型的参照, 少一栏照样有用。挂了的那栏记 WARN、回空。"""
     cols: dict[str, list[str]] = {"published": [], "drafted": []}
-    seen: set[str] = set()
     for key, fn, days in (("published", recent_published_titles, published_days),
                           ("drafted", recent_drafted_titles, drafted_days)):
         try:
@@ -2448,17 +2449,26 @@ def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days
             logger.warning("recent %s titles failed (project=%s): %s", key, project_id,
                            f"{type(exc).__name__}: {exc}"[:200])
             continue
+        seen: set[str] = set()                    # 每栏自己先去重
         for t in raw:
             t = _clean_title(t)
             k = _title_key(t)
-            if not k or k in seen:
-                continue
-            seen.add(k)
-            cols[key].append(t)
+            if k and k not in seen:
+                seen.add(k)
+                cols[key].append(t)
+    # ⚠️ 先定两栏各留几条, 再拿"真留下来的"发出去的标题给写过的去重(codex review on aw#112): 原来一边去重一边
+    # 往 seen 里塞, 发出去那栏后来被截掉的标题照样挡掉写过栏里同名的那篇 —— 两边都不出现。发出去的多留一条,
+    # 写过的只会少不会多, 所以来回两三轮就定了。
     limit = max(limit, 0)
-    n_pub = min(len(cols["published"]), limit - min(len(cols["drafted"]), limit * 2 // 5))
-    n_drafted = min(len(cols["drafted"]), limit - n_pub)
-    return {"published": cols["published"][:n_pub], "drafted": cols["drafted"][:n_drafted]}
+    pub_all, dr_all = cols["published"], cols["drafted"]
+    n_pub = min(len(pub_all), limit - min(len(dr_all), limit * 2 // 5))
+    while True:
+        kept = {_title_key(t) for t in pub_all[:n_pub]}
+        drafted = [t for t in dr_all if _title_key(t) not in kept][:limit - n_pub]
+        grow = min(len(pub_all), limit - len(drafted))
+        if grow <= n_pub:
+            return {"published": pub_all[:n_pub], "drafted": drafted}
+        n_pub = grow
 
 
 # ── 补录锁(migrations/009): 跨进程互斥, 按项目一行, 带 TTL ─────────────────

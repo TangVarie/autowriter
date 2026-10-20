@@ -510,6 +510,10 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
 #
 # ⚠️ RPC 路径上这只是【排序】: 被避重挡掉的那几个由 RPC 跳过, 后面补上的那个是照"前面那个也用了"排的,
 # 所以近期用得多的项目偶尔会多撞一个。不为此多读一次台账 —— 选择必须留在 RPC 的事务里(并发发牌不撞车靠它)。
+# 重排的长度和每一步往下看的候选数都封顶(codex review on aw#112): draw_angles 的 n 没有上限, 一次要几百上千个时
+# 不封顶是 O(n × 候选数) 的纯 Python 扫描, 能把服务卡住。一批实际是 5~20 篇, 前 240 个、每步看 600 个足够错开。
+_SPREAD_HEAD_MAX = 240
+_SPREAD_SCAN = 600
 _SPREAD_DIMS = (("content_format", len(vocab.CONTENT_FORMATS)),
                 ("title_structure", len(vocab.TITLE_STRUCTURES)),
                 ("emotional_lever", len(vocab.EMOTIONAL_LEVERS)))
@@ -519,12 +523,12 @@ def _spread_order(candidates: list[dict], n: int) -> list[dict]:
     """把前 ``3n + 24`` 个按"一批之内尽量不撞"重排, 后面的原序接上。只排前面一段: RPC 只会取到前 n 个加上
     被避重跳过的那几个, 全量贪心是 O(候选²), 白花。"""
     rest = list(candidates)
-    head = min(len(rest), 3 * max(n, 0) + 24)
+    head = min(len(rest), 3 * max(n, 0) + 24, _SPREAD_HEAD_MAX)
     used = {dim: set() for dim, _ in _SPREAD_DIMS}
     out: list[dict] = []
     while rest and len(out) < head:
         best_i, best = 0, -1
-        for i, c in enumerate(rest):
+        for i, c in enumerate(rest[:_SPREAD_SCAN]):
             d = c["dims"]
             score = (2 * (d.get("content_format") not in used["content_format"])
                      + 2 * (d.get("title_structure") not in used["title_structure"])
