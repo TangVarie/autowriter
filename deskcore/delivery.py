@@ -9,7 +9,7 @@
   · ``score_drafts`` 存完档, 用存进去的那几篇按模板拼整批, 写手把 ``delivery.text`` 原样交给用户。
 
 纯函数, 不连库不联网(同 isolation.py)。问题(problems)只报代码能确定判出来的: 话题不够、评论条数不对、评论没提到
-该提的词、表格要方向而稿子没带、模型自己又包了一层标记。都只是参考, 不拦存档。
+该提的词、表格要方向而稿子没带、模型自己又包了一层标记、模板不管话题而 tags 里的话题拼不进去。都只是参考, 不拦存档。
 
 ⚠️ 标记只认【标题】/【正文】。tv-sync(tvlink.parse_raw)按这两个标记把发出去的笔记拆回标题和正文, 运营在飞书里
 贴的也一直是这个写法(09-15 以来 6 个在跑项目 450 篇全是); 换成「标题：」这种冒号写法, 整段会被当成正文, 对不回底稿。
@@ -452,6 +452,14 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
                 post.append(" ".join("#" + t for t in tags))
         else:
             post.append(markers["body"] + body)
+            # 模板不管话题: tags 字段不拼。写手照别处的说明把话题传在 tags 里、正文里没有的那几个, 报出来, 别一句不说就没了
+            # (codex review on aw#115)
+            supplied = _dedupe(split_tags(d.get("tags")))
+            in_body = {t.casefold() for t in body_tags(body)}
+            lost = [t for t in supplied if t.casefold() not in in_body]
+            if lost:
+                problems.append({"index": i, "what": f"这个项目的交付模板不管话题, tags 里的「{'」「'.join(lost)}」没拼进交付稿: "
+                                                     "要带话题就写在正文末尾那一行, tags 留空"})
 
         lines: list[str] = []
         if ccfg is not None:
@@ -502,9 +510,13 @@ def requirements(template: dict) -> dict:
                                                 if c["must_mention_any"] else ""))
     if need_direction:
         asks.append("direction 写一句这篇的切入角度(不是 产品向 / 流量向)")
+    # 模板不管话题(wants_tags 为假)时 assemble 不读 tags 字段, 正文原样进交付稿: 这时叫写手「不放话题行」, 照项目规则要的
+    # 话题就从交付稿里没了, 一句不报(codex review on aw#115)。所以话题行放哪儿跟着模板说
     task = ("这个项目的交付稿由写作台按模板拼。"
             + (f"score_drafts 时每篇 draft 里带上: {'; '.join(asks)}。" if asks else "")
-            + "body 只放正文, 不放【标题】【正文】标记、不放话题行。")
+            + ("body 只放正文, 不放【标题】【正文】标记、不放话题行。" if wants_tags(tpl) else
+               "body 只放正文, 不放【标题】【正文】标记。这个模板不管话题: 项目要话题的话照项目规则写在正文末尾那一行, "
+               "交付稿原样带上; tags 字段不会拼进交付稿。"))
     return {"layout": tpl["layout"], "tags": t["content"], "fixed_tags": list(t["fixed"]),
             "comments": (None if c is None else {"min": c["min"], "max": c["max"],
                                                  "must_mention_any": list(c["must_mention_any"])}),

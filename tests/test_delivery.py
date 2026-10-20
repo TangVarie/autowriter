@@ -572,6 +572,30 @@ def test_the_brief_tells_the_writer_what_each_draft_must_carry():
     assert "delivery_requirements" not in core.build_writing_brief(broken, PROJ, user_id=ME), "模板坏了不拦简报"
 
 
+@pytest.mark.parametrize("tpl", [{"layout": "blocks"},
+                                 {"layout": "blocks", "comments": {"min": 1, "max": 2, "label_reader": "读者：",
+                                                                   "label_author": "作者："}}])
+def test_a_template_that_does_not_manage_tags_keeps_them_in_the_body(tpl):
+    """模板不管话题时 assemble 不读 tags 字段, 正文原样进交付稿。原来简报照样叫写手「不放话题行」, 照项目规则要的话题传在
+    tags 里就从交付稿里没了, 一句不报(codex review on aw#115)。现在简报叫它写在正文末尾那一行; tags 里正文没有的报出来。"""
+    assert not delivery.wants_tags(delivery.validate(tpl)), "前提: 这个模板不管话题"
+    task = delivery.requirements(tpl)["task"]
+    assert "不放话题行" not in task and "写在正文末尾那一行" in task and "tags 字段不会拼进交付稿" in task
+    draft = {"title": "示例标题", "body": "示例正文。\n#话题甲", "comments": [{"role": "reader", "text": "示例评论"}]}
+    kept = delivery.assemble(tpl, [draft])
+    assert "#话题甲" in kept["text"] and kept["problems"] == [], "照简报写在正文里的话题原样带上"
+    lost = delivery.assemble(tpl, [{**draft, "body": "示例正文。", "tags": ["话题甲", "#话题乙"]}], indices=[3])
+    assert "话题甲" not in lost["text"]
+    assert lost["problems"] == [{"index": 3, "what": "这个项目的交付模板不管话题, tags 里的「话题甲」「话题乙」没拼进交付稿: "
+                                                     "要带话题就写在正文末尾那一行, tags 留空"}]
+    both = delivery.assemble(tpl, [{**draft, "tags": ["话题甲"]}])
+    assert both["problems"] == [], "正文里已经有的不算丢"
+
+
+def test_a_template_that_manages_tags_still_keeps_the_tag_line_out_of_the_body():
+    assert "不放话题行" in delivery.requirements(BLOCKS)["task"]
+
+
 def test_a_broken_template_never_breaks_scoring():
     c = desk_client(default_params=json.dumps({"delivery": {"layout": "table"}}))
     out = core.commit_drafts(c, PROJ, distinct_drafts(1), user_id=ME)

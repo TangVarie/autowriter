@@ -315,6 +315,8 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
     """(命中, 统计)。命中按篇、再按 hard 在前排好; 统计 = {"rules": 能查的条数, "skipped": check 坏了跳过的条数}, 有正则规则这次
     没查完时再带 ``"timed_out": [规则 id, …]`` 和 ``"timed_out_from": {规则 id: 从哪一篇(index)起没查完}`` —— 那一篇之前的都
     查完了, 查出来的命中照报(独立复审 on aw#115 第六轮: 不说从哪篇起, 同一条既报了命中、又整条报"没查", 两头打架)。
+    rule_kind 是能查的那几种、check 却用不了的(写坏了, 或者是这里不查的老写法), 除了 skipped 计数再带
+    ``"skipped_ids": [规则 id, …]`` —— 不带的话调用方分不出「查过了、没命中」和「压根没查」(codex review on aw#115)。
 
     ``rules`` 是 store.shared_memories 的 hard + soft(没 check 的自动略过, soft 的方向闸由调用方先过);
     ``indices`` 同 delivery.assemble; ``tags`` 和 drafts 一一对应, 某篇给了就用它当这篇的话题(见 _parts);
@@ -324,13 +326,13 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
     稿子不再搜、报进 timed_out —— 不算命中, 调用方也不能把它说成守住了(限时的引擎跑不了的正则也报在这里)。所以一次 check
     最多多花约 (正则规则条数) × 那一份(到点后多拖的那一点和第一次的编译见 config.REGEX_SEARCH_TIMEOUT_SEC)。
     """
-    specs, skipped = [], 0
+    specs, skipped = [], []
     for r in rules or []:
         spec = spec_of(r)
         if spec is not None:
             specs.append((r, spec))
         elif (r.get("rule_kind") or "") in CHECK_KINDS:
-            skipped += 1
+            skipped.append(r.get("id"))
     budgets = {k: validator.RegexBudget() for k, (_r, spec) in enumerate(specs) if spec["kind"] == "forbidden_regex"}
     hits: list[dict] = []
     stopped: dict[int, int] = {}            # 第几条规则 → 从哪一篇(index)起没查完
@@ -348,7 +350,9 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
             if budget is not None and budget.timed_out:
                 stopped[k] = idx[pos]
     hits.sort(key=lambda h: (h["index"], h["severity"] != "hard"))
-    stats: dict = {"rules": len(specs), "skipped": skipped}
+    stats: dict = {"rules": len(specs), "skipped": len(skipped)}
+    if skipped:
+        stats["skipped_ids"] = skipped
     if stopped:
         stats["timed_out"] = [specs[k][0].get("id") for k in sorted(stopped)]
         stats["timed_out_from"] = {specs[k][0].get("id"): at for k, at in sorted(stopped.items())}

@@ -2262,8 +2262,8 @@ RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的全列
                               "如实告诉用户还有这么多条没列出来。")
 RULE_CHECKS_ERROR_NEXT_STEP = ("rule_checks_status=error: 这次代码查规则没跑成(存档不受影响), 不能跟用户说规则都用代码查过了。")
 UNCHECKED_LABEL = {"hard": "硬约束·没查完", "soft": "建议·没查完"}
-RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代码没查完(正则没在时限内跑完, 或者限时的引擎跑不了它; "
-                                   "存档不受影响): 从 from_index 那篇起算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
+RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代码没查完(正则没在时限内跑完、限时的引擎跑不了它, "
+                                   "或者存的 check 用不了; 存档不受影响): 从 from_index 那篇起算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
                                    "它之前查出来、列在 rule_checks 里的命中照常算。severity 是 hard 的(「硬约束·没查完」)照规则原文"
                                    "(rule)把 from_index 起的那几篇自己逐篇核一遍。")
 
@@ -2276,7 +2276,8 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
        模板坏了只记日志、不带这一块 —— 打分照常(运维用 CLI 设模板时已经校验过, 走到这里多半是有人手改了库)。
     2. 代码查规则: 和简报同一个池子里带 check 的那几条, soft 的过同一道方向闸, 逐篇查(``out["rule_checks"]``,
        有命中才带)。查不成就带 ``rule_checks_status = "error"``: 不带的话和"查过了、没命中"长得一模一样。正则规则限时
-       (rulecheck.check), 没在时限内查完的列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了"守住了"。
+       (rulecheck.check), 没在时限内查完的、存的 check 用不了的都列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了
+       "守住了"。
 
     两样都只是参考: 入库到这里已经成功了, 这一步任何失败都不许把它变成失败(同判定那一段的纪律)。
     """
@@ -2322,7 +2323,7 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
                 out["rule_checks"] = shown
                 if more:
                     out["rule_checks_more"] = more
-            if stats.get("timed_out"):
+            if stats.get("timed_out") or stats.get("skipped_ids"):
                 rows = {r.get("id"): r for r in hard + soft}
                 sev = {rid: ("hard" if (r.get("severity") or "soft").lower() == "hard" else "soft") for rid, r in rows.items()}
                 # 开头不用「必须改」/「建议改」(codex review on aw#115): 那两个词在 rule_checks 里是"这篇查出了违规", 写手的模型扫到
@@ -2337,7 +2338,15 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
                      "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则的正则从 index={start.get(rid)} 那篇起没查完"
                              "(超时或者限时的引擎跑不了), 那几篇算没查, 不是查出了违规"
                              + ("; 之前查出来、列在 rule_checks 里的照改" if rid in found else "")}
-                    for rid in stats["timed_out"]]
+                    for rid in stats.get("timed_out") or ()]
+                # 存的 check 用不了的(写坏了, 或者是这里不查的老写法; rulecheck 记日志、跳过): 原来只在 batch_metrics 里记个数,
+                # 回包和「查过了、没命中」一模一样, 一条硬规则就这样每批都没查(codex review on aw#115)。整批都没查, 照没查完报
+                out["rule_checks_unchecked"] += [
+                    {"rule_id": rid, "severity": sev.get(rid, "soft"), "rule": (rows.get(rid) or {}).get("content") or "",
+                     "from_index": indices[0],
+                     "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则存的代码检查用不了(写坏了, 或者是这里不查的"
+                             "老写法), 这次整批都没查, 不是查出了违规"}
+                    for rid in stats.get("skipped_ids") or ()]
             meta["rule_checks"] = {**stats, "hits": len(hits),
                                    "hard": sum(1 for h in hits if h["severity"] == "hard"),
                                    "elapsed_ms": _ms_since(t0)}

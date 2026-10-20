@@ -608,7 +608,9 @@ python -m deskcore.cli delivery-format --project <uuid> --clear
 **怎么拼。** `score_drafts` 存完档（锁外、恢复指纹的 try 外，判定之前），只拿**存进去了的**那几篇按模板拼成一份，挂在返回值的
 `delivery = {format, text, problems}`。一篇 = `【标题】标题` / `【正文】正文` / 话题行；话题顺序是写手的（去重、截到 `content` 个，
 和固定 / 条件话题重名的不占名额）→ 固定的 → 命中的条件话题，统一成单个 `#`、不分大小写去重。写手把话题、评论、方向作为单独的
-字段传（每篇 draft 里的 `tags` / `comments` / `direction`；`direction` 是这篇的切入角度，不是产品向 / 流量向），`body` 只放正文；
+字段传（每篇 draft 里的 `tags` / `comments` / `direction`；`direction` 是这篇的切入角度，不是产品向 / 流量向），`body` 只放正文
+（模板不管话题——`tags` 里 `content` / `fixed` / `conditional` 都没配——时例外：`assemble` 不读 `tags` 字段，正文原样进交付稿，
+简报的 `task` 叫写手把项目要的话题照项目规则写在正文末尾那一行；原来照样叫写手「不放话题行」，传在 `tags` 里的话题一句不报就没了，codex review on aw#115）；
 正文末尾要是还带着一行 `#话题`、或者最后一句后面直接跟着一串 `#话题`，模板管话题时会被摘出来（没单独传 `tags` 就用它们；传了 `tags: []` 算传了，摘下来的不用），
 不会拼出两份。网址里的 `#片段`（`#` 前面紧挨着、一直是不带空白的 ASCII 的那一段像网址：带 `://`、`www.` 或 `域名/`）不算话题，留在正文里，查规则时也不算话题；
 前一个字是英文字母数字的 `#`（`学习C#入门`、`1#楼`）同样不是话题，两种除外：紧接着上一个话题的连写（`#abc#def`，只看是不是紧挨着，
@@ -619,7 +621,7 @@ python -m deskcore.cli delivery-format --project <uuid> --clear
 外面再包一层的 `{"comments": [...]}`、没有 `text` 的对象、列表里夹着的 `null` / 数字都算那一条形状不对（不往里多解一层），不会整段 JSON 带着「读者：」交出去；解不开的（`[捂脸R]求链接`；一长串 `[` 让 `json.loads` 抛 `RecursionError` 的也算）照旧是一条字符串（codex review on aw#115）。一条评论没有 `text`、或者 `text` 不是字符串（写成 `content`、给了列表 / 数字），
 算这一条形状不对：报进 problems、不拼；查规则看的评论和交付稿是同一份（`delivery.comment_list`），交付稿里有哪几条就查哪几条。`tags` 传成整个列表 `json.dumps` 出来的一串（`'["a", "b"]'`）
 也拆开认（`delivery.split_tags`；摘话题、话题行、查话题的规则都走它），不会拼出 `#["a", #"b"]`。`problems` 只报代码判得准的：话题不够、评论条数不对、某条评论形状不对、某条评论没提到 `must_mention_any` 里的词、
-表格要方向而这篇没带、标题或正文里已经自带了标记；`index` 是写手传的位置。写手照协议先改 problems（带 `replaces_version_id`
+表格要方向而这篇没带、标题或正文里已经自带了标记、模板不管话题而 `tags` 里有正文里没有的话题（拼不进交付稿）；`index` 是写手传的位置。写手照协议先改 problems（带 `replaces_version_id`
 再存一次），再把 `text` 原样交给用户。⚠️ 话题和评论不落库，服务端拼不回上一次的稿子，所以重新存的那一次只拼改过的那几篇，
 写手用它按顺序替换原来那几篇（表格只换那几行，新返回的表头不再贴一遍）。
 
@@ -668,9 +670,9 @@ hard 不过这道闸，同简报。简报的相关性筛选和每层 12 条的�
 和 `delivery.text` 对得上。
 只查存进去了的稿子，有命中才带 `rule_checks`（每条 `index` / `rule_id` / `severity` / `where` / `what`，`what` 以「必须改」或
 「建议改」开头，必须改的全列，建议改按篇号补到一共 40 条为止，多的报个数在 `rule_checks_more`）。不调模型、不出网、不拦存档；
-查询失败记日志并带 `rule_checks_status = "error"`（不带的话和"查过了、没命中"一模一样）。正则规则这次没查完的（没在时限内跑完，或者限时的引擎跑不了）列在
+查询失败记日志并带 `rule_checks_status = "error"`（不带的话和"查过了、没命中"一模一样）。正则规则这次没查完的（没在时限内跑完，或者限时的引擎跑不了），以及存的 check 用不了的（写坏了，或者是这里不查的老写法，比如 `max_len` 的「开头」；原来只在 batch_metrics 里记个数，回包和「查过了、没命中」一模一样，codex review on aw#115），列在
 `rule_checks_unchecked`（每条 `rule_id` / `severity` / `rule`（规则原文：简报里没有 id，写手靠它对上是哪一条）/ `from_index`（从哪篇起没查完，之前的都查完了，查出来的命中照报）/ `what`；`what` 以「硬约束·没查完」/「建议·没查完」开头，不用「必须改」——那是"查出了违规"的意思），`next_step` 叫写手别说这几条守住了、也别说成违规，hard 的照原文自己核一遍；
-已经搜到的命中照报。`batch_metrics.meta.rule_checks` 记能查的规则数、命中数、硬约束命中数、耗时，有没查完的再记 `timed_out`（规则 id）和 `timed_out_from`（规则 id → 从哪篇起）。
+已经搜到的命中照报。`batch_metrics.meta.rule_checks` 记能查的规则数、命中数、硬约束命中数、耗时，有没查完的再记 `timed_out`（规则 id）和 `timed_out_from`（规则 id → 从哪篇起），check 用不了的记 `skipped_ids`。
 
 **上线后要做的。** 运营下次说到词表 / 字数类规矩时，写手会按协议带上 `check`；存量的这类规则要让写手在 `my_rules` 里挑出来、
 原文一字不差地再 `record_rule` 一次并带上 `check`（或者运维照同一形状直接写那两列）。

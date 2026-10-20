@@ -100,7 +100,7 @@ def test_an_ambiguous_quantified_alternation_is_refused_on_read_too():
     t0 = time.monotonic()
     hits, stats = rulecheck.check([_rule(1, "forbidden_regex", {"pattern": "(哈|哈哈)+$"})],
                                   [{"title": "", "body": "哈" * 40 + "。"}])
-    assert hits == [] and stats == {"rules": 0, "skipped": 1}
+    assert hits == [] and stats == {"rules": 0, "skipped": 1, "skipped_ids": ["m-1"]}
     assert time.monotonic() - t0 < 1
 
 
@@ -110,7 +110,7 @@ def test_adjacent_overlapping_repeats_are_refused_on_read_too():
     row = _rule(1, "forbidden_regex", {"pattern": "a*a*a*a*a*a*a*a*b", "where": ["body"]})
     assert rulecheck.spec_of(row) is None
     t0 = time.monotonic()
-    assert rulecheck.check([row], [{"title": "", "body": "a" * 40}]) == ([], {"rules": 0, "skipped": 1})
+    assert rulecheck.check([row], [{"title": "", "body": "a" * 40}]) == ([], {"rules": 0, "skipped": 1, "skipped_ids": ["m-1"]})
     assert time.monotonic() - t0 < 0.5
 
 
@@ -656,6 +656,24 @@ def test_a_hit_found_before_the_time_ran_out_is_still_reported(short_timeout):
     hits, stats = rulecheck.check([rule], [{"title": "示例禁词", "body": "a" * 2000}, {"title": "示例禁词", "body": "b"}])
     assert [(h["index"], h["where"]) for h in hits] == [(0, "title")]
     assert stats["timed_out"] == ["m-1"] and stats["timed_out_from"] == {"m-1": 0}
+
+
+def test_score_drafts_lists_a_rule_whose_stored_check_is_unusable(short_timeout):
+    """rule_kind 对、存的 check 却用不了(AW 页存得进去、这里不收的: 量词套分支的正则、max_len 的「开头」老形状): 原来只在
+    batch_metrics 里记个 skipped, 回包和「查过了、没命中」一模一样, 一条硬规则就这样每批都没查(codex review on aw#115)。"""
+    c = desk_client(memories=[_rule(1, "forbidden_regex", {"pattern": "(哈|哈哈)+"}),
+                              _rule(2, "max_len", {"scope": "开头", "n": 5}, severity="soft"),
+                              _rule(3, "forbidden_word", {"words": ["不会出现的词"]})])
+    drafts = distinct_drafts(2)
+    drafts[0]["body"] += "哈哈哈"
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert "rule_checks" not in out
+    assert [(u["rule_id"], u["severity"], u["rule"], u["from_index"]) for u in out["rule_checks_unchecked"]] == [
+        ("m-1", "hard", "示例规则 1", 0), ("m-2", "soft", "示例规则 2", 0)]
+    assert out["rule_checks_unchecked"][0]["what"].startswith("硬约束·没查完: 这条规则存的代码检查用不了")
+    assert not any(u["what"].startswith(tuple(rulecheck.SEVERITY_LABEL.values())) for u in out["rule_checks_unchecked"])
+    assert "存的 check 用不了" in out["next_step"] and "不能跟用户说这几条守住了" in out["next_step"]
+    assert c.rows["batch_metrics"][0]["meta"]["rule_checks"]["skipped_ids"] == ["m-1", "m-2"]
 
 
 def test_score_drafts_says_from_which_post_a_rule_went_unchecked(short_timeout):
