@@ -18,6 +18,9 @@
   python -m deskcore.cli tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target
   python -m deskcore.cli delivery-format --project <uuid> (--show | --set 模板.json | --clear)
                                                     ← 项目的交付版式模板(score_drafts 按它拼交付稿)
+  python -m deskcore.cli compile-rules (--project <uuid> | --all) [--force] [--dry-run]
+                                                    ← 把规则交给 Jev 编成写后检查, 结果缓存进
+                                                      rule_compiles(check_rules 用; 后台也会自己补编)
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
                                                     ← TV 的笔记按内容对到写作台的版本,
                                                       对不上的补进指纹库(每天跑一次)
@@ -522,6 +525,85 @@ def _delivery_format(core, sb, args) -> int:
     return 1 if out.get("error") else 0
 
 
+_COMPILE_OK = ("up_to_date", "dry_run", "ok")
+
+
+def _compile_rules(core, sb, args) -> int:
+    """compile-rules(2026-10-20, D-121): 规则池里还没编的规则交给 Jev 编译。一个项目一行计数; 有项目没编成退出码 1。
+
+    运维命令, 同 backfill 不要 --user(跑它的人握着 service_role key)。编一批最坏 6 分钟, ``--all`` 会跑很久 ——
+    已经编过的(规则 id + sha 都没变)不再发, 所以第二次跑基本是秒回。
+
+    整次运行共用一个 ``seen``(2026-10-20 复审): owner 的 global 规则在他每个项目的池子里, 没有它 ``--force`` 会按项目数
+    重编、重付钱, ``--dry-run`` 也按项目数重复计数(真编时后面的项目命中缓存, 两边对不上)。带着它, 同一条规则同一个
+    版本一次运行里最多发一次, dry-run 的「要编」合计就是真编要发的条数。
+
+    ``--all`` 遇到读超时就停, 后面的项目不再试、列出来(2026-10-20 第二轮复审): 一个项目里读超时已经不发后面几批了, 跨项目
+    原来照发 —— 每个项目各等满 RULE_COMPILE_TIMEOUT_SEC, 每一批都在 Jev 那边编完、计费, 结果没人收。Jev 慢不是哪个项目的事。"""
+    from . import store
+    if args.all:
+        projects = store.projects_with_rules(sb)
+    else:
+        row = store.project_row(sb, args.project)
+        if row is None:
+            print(f"项目不存在: {args.project}")
+            return 1
+        projects = [row]
+    if not projects:
+        print("没有带规则的项目。")
+        return 0
+    bad = 0
+    tot = {"pool": 0, "cached": 0, "to_compile": 0, "compiled": 0, "errors": 0}
+    seen: set[tuple[str, str]] = set()
+    not_tried: list[dict] = []
+    for n, p in enumerate(projects):
+        pid, name = str(p["id"]), p.get("name") or ""
+        try:
+            rep = core.compile_rules(sb, pid, force=args.force, dry_run=args.dry_run, seen=seen)
+        except Exception as exc:                         # noqa: BLE001 — 一个项目坏了不拦后面的
+            print(f"✗ {name} ({pid}): {type(exc).__name__}: {exc}"[:300], flush=True)
+            bad += 1
+            continue
+        st = rep.get("status")
+        ok = st in _COMPILE_OK
+        bad += 0 if ok else 1
+        for k in ("pool", "cached", "to_compile", "compiled"):
+            tot[k] += int(rep.get(k) or 0)
+        tot["errors"] += len(rep.get("errors") or [])
+        print(f"{'✓' if ok else '✗'} {name} ({pid}): 池子 {rep.get('pool')} 条 · 已编过 {rep.get('cached')} · "
+              f"要编 {rep.get('to_compile')} · 这次编进 {rep.get('compiled')} · 失败 {len(rep.get('errors') or [])} "
+              f"[{st}] {rep.get('elapsed_ms')}ms", flush=True)
+        if rep.get("same_run"):
+            print(f"    · 其中 {rep['same_run']} 条(owner 的 global 规则)这次运行里前面的项目已经编过 / 数过, 不再发")
+        if rep.get("verdicts"):
+            print("    结论: " + " / ".join(f"{k} {v}" for k, v in sorted(rep["verdicts"].items())))
+        if rep.get("detail"):
+            print(f"    {rep['detail']}")
+        for e in (rep.get("errors") or [])[:5]:
+            print(f"    · {e.get('memory_id')}: {e.get('error')}")
+        if len(rep.get("errors") or []) > 5:
+            print(f"    · …还有 {len(rep['errors']) - 5} 条")
+        for b in rep.get("batch_errors") or []:
+            print(f"    · 整批 {b.get('rules')} 条没编成 [{b.get('status')}]: {b.get('detail')}")
+        if rep.get("not_sent"):
+            why = ("Jev 读超时, 那一批多半还在编、照样计费; Jev 恢复之后再跑一次"
+                   if rep.get("stopped_by") == "timeout" else "同一个原因会把它们一样挡下")
+            print(f"    · 后面 {rep['not_sent']} 条没发({why})")
+        if rep.get("not_compilable"):
+            print(f"    · {len(rep['not_compilable'])} 条发不了(原文超过 Jev 的上限等), 留在简报里照旧")
+        if core.judge_client.JUDGE_TIMEOUT in (st, rep.get("stopped_by")):
+            not_tried = projects[n + 1:]
+            if not_tried:
+                print(f"⏸ Jev 读超时, 后面 {len(not_tried)} 个项目这次没试(超时那批多半还在编、照样计费, 再发只是多付钱; "
+                      "Jev 恢复之后再跑一次 compile-rules): "
+                      + "、".join(f"{q.get('name') or ''} ({q['id']})" for q in not_tried), flush=True)
+            break
+    print(f"\n合计 {len(projects)} 个项目: 池子 {tot['pool']} 条 · 已编过 {tot['cached']} · 要编 {tot['to_compile']} · "
+          f"这次编进 {tot['compiled']} · 失败 {tot['errors']}" + (" (dry-run, 一条没发)" if args.dry_run else "")
+          + (f" · {len(not_tried)} 个项目这次没试(Jev 读超时)" if not_tried else ""))
+    return 1 if bad or not_tried else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="deskcore", description="写作台内核 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -650,6 +732,15 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--set", dest="set_file", default=None, help="JSON 文件: 模板对象本身")
     g.add_argument("--clear", action="store_true", help="删掉模板(score_drafts 不再带 delivery)")
 
+    # 规则编译(2026-10-20, D-121): 规则交给 Jev 编成写后检查, 结果按 (规则 id, sha) 缓存进 rule_compiles。
+    # open_project / record_rule / check_rules 会在后台自己补编; 这个命令给上线时补一遍、或者 Jev 那边改了编译之后 --force。
+    p = sub.add_parser("compile-rules", help="把规则交给 Jev 编成写后检查(check_rules 用), 已编过的不再发")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--project", default=None)
+    g.add_argument("--all", action="store_true", help="全部带规则的项目(有项目规则的, 加上 owner 有 global 规则的)")
+    p.add_argument("--force", action="store_true", help="已经编过的也重编、覆盖(花钱; 只在 Jev 改了编译之后用)")
+    p.add_argument("--dry-run", action="store_true", help="只数要编几条, 一条不发")
+
     p = sub.add_parser("tv-resolve",
                        help="人看过 tv-sync 报的「分不出」之后落判定(目前只有: 对不上, 按正文补录)")
     p.add_argument("--note", required=True, help="tv_note_links.note_id")
@@ -662,8 +753,13 @@ def main(argv: list[str] | None = None) -> int:
         return _sync_skill(check=args.check)
 
     # 以下要连库, 到这一步才 import(让 selftest 不需要任何第三方依赖)
+    import config
     import db as db_mod
     from . import core
+
+    # CLI 进程跑完就退出: open 之类的命令触发的后台补编(D-121)会被杀在半路 —— Jev 那边照样编完、照样花钱, 结果却没人
+    # 存。CLI 里要编就用 compile-rules(同步跑完)。
+    config.RULE_COMPILE_AUTO = False
 
     if args.cmd == "health":
         import dedup
@@ -686,6 +782,8 @@ def main(argv: list[str] | None = None) -> int:
         return _tv_resolve(core, sb, args)
     if args.cmd == "delivery-format":
         return _delivery_format(core, sb, args)
+    if args.cmd == "compile-rules":
+        return _compile_rules(core, sb, args)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user))
     elif args.cmd == "open":

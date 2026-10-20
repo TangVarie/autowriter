@@ -660,6 +660,10 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     ``rule_checks_unchecked`` 里的规则这次没查完(正则没在时限内跑完, 或者限时的引擎跑不了): 算没查 —— 不是违规(``what`` 以
     「硬约束·没查完」/「建议·没查完」开头, 不是「必须改」), 也不能说它们守住了; ``from_index`` 是从哪篇起没查完, 之前查出来、
     列在 ``rule_checks`` 里的命中照常算; severity 是 hard 的照规则原文(``rule``)把那几篇自己核一遍。
+    存完之后**再调一次 ``check_rules``**(传这次返回的 ``check_rules_version_ids``, 传过 ``tactic`` 的同样带上):
+    那是按 Jev 编好的规则逐篇查, 和这里的 ``rule_checks``(人手设过 check 的那几条)不重复。``check_rules_version_ids`` 只有这批里的新稿: 带
+    ``replaces_version_id`` 改过重存的不再查(改一轮就够), 全是重存时它是空的, 不用调, ``next_step`` 也不会再让你调。
+    篇数多也整串传: check_rules 一次查 20 篇, 没查到的放在它返回的 ``remaining_version_ids`` 里, 照它的 ``next_step`` 接着调。
 
     ``project_isolation`` 是串项目的提示: 有可疑标记要说明并核对; 没发现或检查超时都不能声称已完整排除串项目。
 
@@ -677,6 +681,50 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     # 成功, 稿子静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
                               flywheel_arm=flywheel_arm or None, tactic=tactic or "")
+
+
+def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user_id: str | None = None) -> dict:
+    """score_drafts 存完档之后调一次(**自动调, 不等用户说**): 按这个项目的规则逐篇查刚存的稿子, 回每篇哪几条没守住。
+    **只是建议, 不拦交付**, 存档已经成功了。
+
+    ``version_ids`` 传 score_drafts 这次返回的 ``check_rules_version_ids``(这批里的新稿; 带 replaces_version_id 改过重存
+    的不在里面, 不再查), 篇数再多也原样整串传: 一次查前 20 篇, 多出来的原样放在返回的 ``remaining_version_ids`` 里 ——
+    有它就照 ``next_step`` 接着再调一次、传它(``tactic`` 照样带), 直到返回里没有它; 不是这个项目的稿子不查(列在
+    ``excluded`` 里)。规则由 Jev 事先编成「是非题」和「代码检查」两种, 这里只用编好的; 还没有编译结果的规则这次查不了,
+    数在 ``uncompiled_rules`` 里(``next_step`` 说为什么: 后台在编 / 这个项目编不了 / Jev 最近编译超时 / 上次编失败)
+    —— 不用等, 也不用重试。要看话题 / 评论的规则这里查不了(这两样不随稿子存), 数在 ``rules.code_unavailable``; 编不了
+    (原文超过 Jev 的上限之类)的数在 ``rules.not_compilable``, 编出来的检查不安全没跑的数在 ``rules.code_refused``,
+    只查了一部分的(编译时就没全装进去)数在 ``rules.partial`` —— 这几种都**不能说(整条)守住了**。
+
+    怎么读返回值(``versions`` 一篇一项, 按 ``version_id`` 对上):
+      · ``violations``: 没守住的规则, 每条 ``rule_id`` / ``severity`` / ``what`` / ``source``(jev 是 Jev 判的, code 是代码
+        查的)/ ``p``(Jev 的把握)/ ``evidence``(Jev 指出的那一句, 有才带)。``what`` 以「必须改」开头的是硬约束:
+        照着改, 改完那几篇用 score_drafts 带 ``replaces_version_id`` 再存一次, 改一轮就够, 不用再调本工具;
+        以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。
+      · ``unsure``: Jev 拿不准的(``what`` 以「拿不准」开头), 不算没守住, 提一句就行, 不用改。
+      · ``judge_status`` 不是 ok 的那篇(``judge_note`` 说原因, 比如「没判完」「一道都没判出来」)规则题这次没判成,
+        **不能说它守住了规则**; 不用重试。代码查出来的 ``violations`` 照样有效。
+      · ``judge_status`` 是 ok、但 ``counts.unjudged`` 不是 0 的: 那几道题 Jev 没判出来(``unjudged`` 列着规则 id 和原因,
+        比如 evidence_not_found = 判了「是」却指不出是哪一句, 不算没守住), 那几条**也不能说守住了**。``summary.unjudged``
+        是全部篇加起来的题数。
+      · ``status`` 是 nothing_to_check / no_versions 时照 ``next_step`` 说一句就行。
+      · ``status`` 是 error: 这次规则没查成(服务端读不出规则的编译结果), **不能说规则守住了**; 存档已经成功, 交付照常,
+        不用重试。
+    照 ``next_step`` 做, 把结果一两句告诉用户; 不要因为这个工具的结果拖着不交付, 也不要为了消掉「建议改」反复重写。
+
+    ``tactic``: 同 score_drafts —— 这场 open_project 传过 ``tactic`` 的, 把同一个值**原样**传回来(没传过就不传)。
+    哪些建议改规则要查按它和项目名判方向, 和简报同一个判据; 不传就只按项目名判。
+    查的是交付出去的那一份(和 score_drafts 的 ``rule_checks`` 同一份): 项目有交付模板、模板管话题时, 正文末尾的话题
+    (末尾那行、或最后一句后面直接跟着的一串)算话题行, 不算正文。
+    """
+    # 故意不包 _safe: 包成带 error 的"成功"会让模型说"规则都查过了"。Jev 那边的失败已经在每篇的 judge_status 里了;
+    # 编译结果读不出来(migrations/015 没跑)core 自己回 status=error + 一句「没查成」, 记日志(2026-10-20 第三轮复审:
+    # 原来抛出来, REST 是 500 = 「待会儿重试」, MCP 是工具错误, 服务端一行日志都没有)。走到异常这一步是规则池都读
+    # 不出来, 必须让模型知道这次没查成。
+    try:
+        return core.check_rules(core.sb(), project_id, version_ids, user_id=_user_id, tactic=tactic or "")
+    except core.RuleCheckInputError as exc:
+        raise InvalidInput(str(exc)) from exc
 
 
 def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", tactic: str = "",
@@ -855,6 +903,8 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
       (所以「TV信号」里也不算有 "V信") —— 两种写法都要拦就都列上。
       check 写错会报错且这条规则不落库: 照报错改了再调一次。返回里的 ``check`` 是库里存下的那份。
+
+    记下之后服务端会在后台把这条规则交给 Jev 编成写后检查(几分钟内好), 之后 ``check_rules`` 就会查它。不用等、不用管。
     """
     # 故意不包 _safe: 这是【写】操作, 且写的可能是 hard 合规规则。写失败若
     # 报成功, 这条规则会静默缺席之后的每一份简报 —— 而用户以为已经记住了。
@@ -1061,6 +1111,7 @@ TOOLS = {
     "borrow_lessons": (borrow_lessons, True),
     "check_drafts":   (check_drafts,   True),
     "score_drafts":   (score_drafts,   True),
+    "check_rules":    (check_rules,    True),     # 存档后按编译好的规则逐篇查, 只作建议(2026-10-20, D-121)
     "commit_drafts":  (commit_drafts,  True),     # 旧名, 等同 score_drafts(D-120 过渡期, 老 skill 还在调)
     "judge_draft":    (judge_draft,    True),
     "repair_plan_for": (repair_plan_for, True),

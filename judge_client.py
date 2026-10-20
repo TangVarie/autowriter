@@ -352,10 +352,14 @@ def _banks_shape_problem(body: Any) -> Optional[str]:
 
 
 def _tool_call(method: str, path: str, *, json_body: Optional[dict] = None,
-               timeout: Optional[float] = None, shape=None) -> dict:
+               timeout: Optional[float] = None, shape=None, connect_timeout_status: str = JUDGE_TIMEOUT) -> dict:
     """GET / POST 一次, **永不抛**。回 {"judge_status", "http_status", "elapsed_ms", "detail", "response"}:
     judge_status=ok 时 response 是 judge 的响应体(dict 已去掉 ledger_rows), 其余 response=None。
-    ``shape(body) -> 问题或 None``: 200 但形状不对记 error, 不算 ok。"""
+    ``shape(body) -> 问题或 None``: 200 但形状不对记 error, 不算 ok。
+    ``connect_timeout_status``: 连接超时(``_CONNECT_TIMEOUT_CAP_SEC`` 之内没连上, 请求一个字节都没发出去)记哪个结局。写手侧
+    默认 timeout(同 judge_draft: 「这次慢了」); 规则编译传 unavailable —— 编译的 timeout 意味着「Jev 多半还在编、照样计费」,
+    会停掉整个进程的后台补编 30 分钟、把整批规则扣 6 小时、让 compile-rules --all 整个停下, 而连接超时 Jev 什么都没收到
+    (2026-10-20 第三轮复审)。"""
     if not configured():
         return {"judge_status": JUDGE_NOT_CONFIGURED, "http_status": None, "elapsed_ms": 0,
                 "detail": "JUDGE_URL / JUDGE_API_KEY 未配置", "response": None}
@@ -370,13 +374,16 @@ def _tool_call(method: str, path: str, *, json_body: Optional[dict] = None,
                             elapsed_ms=out["elapsed_ms"], error=out["detail"] or None)
         return out
 
+    connect_cap = min(_CONNECT_TIMEOUT_CAP_SEC, t)
     try:
-        kw: dict[str, Any] = {"headers": {"X-Judge-Key": config.JUDGE_API_KEY},
-                              "timeout": (min(_CONNECT_TIMEOUT_CAP_SEC, t), t)}
+        kw: dict[str, Any] = {"headers": {"X-Judge-Key": config.JUDGE_API_KEY}, "timeout": (connect_cap, t)}
         if json_body is not None:
             kw["json"] = json_body
         url = f"{config.JUDGE_URL.rstrip('/')}{path}"
         resp = requests.post(url, **kw) if method == "POST" else requests.get(url, **kw)
+    except requests.ConnectTimeout as exc:
+        # ⚠️ 排在 Timeout 和 ConnectionError 前面: ConnectTimeout 同时是两者的子类。原来落进 Timeout, 详情写「420s 内没回」
+        return _done(connect_timeout_status, detail=f"连不上 judge(连接 {connect_cap:g}s 超时), 请求没发出去: {exc}")
     except requests.Timeout as exc:
         return _done(JUDGE_TIMEOUT, detail=f"{t:g}s 内没回: {exc}")
     except requests.ConnectionError as exc:
@@ -408,6 +415,59 @@ def judge_draft_full(payload: dict, *, timeout: Optional[float] = None) -> dict:
 def list_banks(*, timeout: Optional[float] = None) -> dict:
     """写手侧: GET /banks(judge 默认只列每个家族的最新版本; 暗题只报个数)。"""
     return _tool_call("GET", "/banks", timeout=timeout, shape=_banks_shape_problem)
+
+
+# ── 规则编译与规则题(2026-10-20, D-121)──────────────────────────────────────────────
+# 写作台的自由文本规则先由 Jev 编译一次(POST /compile_rules, 只认管理 key —— deskcore 的 JUDGE_API_KEY 就是),
+# 结果按 (规则 id, sha) 缓存在 autowriter.rule_compiles; 写手调 check_rules 时把编出来的是非题拼成内联项目题库,
+# 单独发一次 /judge_draft(只判这份题库、不判段, 答案以 run_tag=shadow-rules 落账本)。仍然一次 LLM 调用都没有:
+# 编译和判题都在 judge 那边。编译最坏要 6 分钟, 只许后台线程和 CLI 调, 写手的工具不调(预算 20 秒)。
+
+RULES_BANK_NAME = "desk_rules"          # 内联项目题库的名字: 不能撞通用层 / 平台层的前缀(Jev policy.layer_of)
+RULES_RUN_TAG = "shadow-rules"          # 账本里和存档那次的 primary 分开(JevforCoentent README「规则编译」)
+
+
+def _compile_shape_problem(body: Any) -> Optional[str]:
+    """/compile_rules 的 200 契约: 对象, rules 是每项带 id / sha 的对象列表。"""
+    if not isinstance(body, dict):
+        return f"响应体是 {type(body).__name__}, 不是对象"
+    rules = body.get("rules")
+    if not isinstance(rules, list):
+        return "缺 rules(list)"
+    if any(not isinstance(r, dict) or not isinstance(r.get("id"), str) or not isinstance(r.get("sha"), str)
+           for r in rules):
+        return "rules 里有不带 id / sha 的项"
+    return None
+
+
+def compile_rules(payload: dict, *, timeout: Optional[float] = None) -> dict:
+    """POST /compile_rules, **永不抛**; 形状同 ``_tool_call``(ok 时 response 是 Jev 的响应体)。
+
+    ``timeout`` 不给就用 ``config.RULE_COMPILE_TIMEOUT_SEC``(默认 420 秒)。连接超时记 unavailable, 不是 timeout: 请求没发出去,
+    Jev 没在编、没计费(见 ``_tool_call`` 的 connect_timeout_status)。"""
+    t = float(timeout if timeout is not None else config.RULE_COMPILE_TIMEOUT_SEC)
+    return _tool_call("POST", "/compile_rules", json_body=payload, timeout=t, shape=_compile_shape_problem,
+                      connect_timeout_status=JUDGE_UNAVAILABLE)
+
+
+def build_rules_request(*, version_id: str, title: str, body: str, project: str, category: Optional[str],
+                        project_bank: dict) -> dict:
+    """check_rules 的 /judge_draft 请求体: 只带编出来的规则题(内联项目题库), 不判通用层 / 平台层 / 人感、不判段。
+
+    · ``banks = []``: 存档那次已经判过默认三层, 这里只花规则题的钱;
+    · 题只进 ``project_bank``, **不进** ``hard_rules`` / ``brief``: 进了就会算进 passed —— 这些题只作建议(D-121);
+    · ``write = true`` + ``subject_id = versions.id``: 答案按这一版落账本(run_tag 分开), 以后能拿来校准;
+    · ``judge_paras = "never"``: 不判段, 一篇只有一次判题 + (答「是」的违反题)一次找依据句。
+    """
+    payload: dict[str, Any] = {
+        "subject_id": str(version_id), "subject_type": SUBJECT_TYPE, "project": project,
+        "title": title or "", "body": body or "", "banks": [],
+        "project_bank": project_bank, "project_bank_name": RULES_BANK_NAME,
+        "run_tag": RULES_RUN_TAG, "judge_paras": "never", "write": True, "return_rows": False,
+    }
+    if category:
+        payload["category"] = category
+    return payload
 
 
 def judge_comment_tool(path: str, payload: dict, *, timeout: Optional[float] = None) -> dict:

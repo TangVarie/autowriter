@@ -203,12 +203,19 @@ async def _lifespan(_app: FastAPI):
 
     stateless_http=True 也救不了 —— 无状态指的是不保留跨请求会话, task group
     照样要先起来。
+
+    收尾(进程退出 / 重新部署)时报一下被打断的后台补编(D-121, 2026-10-20 第三轮
+    复审): 补编是 daemon 线程, 进程一退就被杀在半路, Jev 那批照样编完、照样计费,
+    结果没存 —— 原来一行日志都没有。不等它编完: 一批最坏 6 分钟, 远超平台给的退出时间。
     """
-    if _mcp is None:
-        yield
-        return
-    async with _mcp.session_manager.run():
-        yield
+    try:
+        if _mcp is None:
+            yield
+            return
+        async with _mcp.session_manager.run():
+            yield
+    finally:
+        core.log_rule_compiles_cut_off()       # 自己不抛
 
 
 app = FastAPI(title="deskcore · 写作台内核", version=VERSION,

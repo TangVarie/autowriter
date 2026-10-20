@@ -50,6 +50,8 @@ _TABLES = {
     # 013 的两张表(改动差异 + 每周摘要看到哪儿了)
     "tv_edit_diffs": [],
     "tv_edit_digest_acks": [],
+    # 015 的规则编译缓存
+    "rule_compiles": [],
     "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z",
                "decision_source": None, "reviewer_id": None, "decided_at": None,
                # 012 的两列

@@ -115,6 +115,7 @@ GATED_ENTRYPOINTS = [
     "build_writing_brief", "draw_angles", "check_drafts", "commit_drafts",
     "export_drafts",
     "record_rule", "record_edit", "save_my_style", "my_style", "borrow_lessons",
+    "check_rules",
 ]
 
 
@@ -200,6 +201,12 @@ UNGATED_WITH_REASON = {
     "backfill_fingerprints":  "运维命令, 见 docs/deskcore.md §2.2.1",
     "backfill_gap":           "运维命令, 见 docs/deskcore.md §2.2.1",
     "delivery_format":        "运维命令(cli delivery-format, 10-20), 见 docs/deskcore.md §2.2.1; 写手那边没有对应的工具",
+    "_kick_rule_compile":     "后台补编的触发器(10-20, D-121), 只被已过闸的 build_writing_brief / record_rule / check_rules "
+                              "调用; 只起一个线程, 不读写项目数据",
+    "_rule_compile_worker":   "后台补编的线程本体, 只由 _kick_rule_compile 起; 调 compile_rules 的运维路径(按项目 owner 取池子, "
+                              "同 CLI compile-rules), 触发它的三个入口都已过闸",
+    "_uncompiled_reason":     "check_rules 过了闸之后才调(10-20 复审), 只读这个项目的 tv_project_map 行数和进程内的补编状态, "
+                              "拼一句「为什么还没有编译结果」",
 }
 
 
@@ -287,6 +294,7 @@ def test_create_project_takes_no_owner_from_the_caller():
     lambda sb, pid: core.save_my_style(sb, pid, "笔记", user_id=ME),
     lambda sb, pid: core.my_style(sb, pid, user_id=ME),
     lambda sb, pid: core.borrow_lessons(sb, pid, user_id=ME),
+    lambda sb, pid: core.check_rules(sb, pid, ["cccccccc-0000-0000-0000-00000000000c"], user_id=ME),
 ], ids=GATED_ENTRYPOINTS)
 def test_entrypoint_refuses_someone_elses_project(call):
     """上一条验"调了校验", 这一条验"调了之后真的拦得住"。

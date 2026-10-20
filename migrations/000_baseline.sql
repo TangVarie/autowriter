@@ -1565,6 +1565,19 @@ CREATE TABLE IF NOT EXISTS autowriter.tv_edit_digest_acks (
 GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.tv_edit_digest_acks TO service_role;
 ALTER TABLE autowriter.tv_edit_digest_acks ENABLE ROW LEVEL SECURITY;
 
+-- 规则编译结果的缓存 (migrations/015_rule_compiles.sql, 2026-10-20, D-121): 按 (规则 id, sha) 一行,
+-- result 是 Jev /compile_rules 回的那一条; 不复用 memories.rule_payload(那是人手设的代码检查)
+CREATE TABLE IF NOT EXISTS autowriter.rule_compiles (
+    memory_id    UUID NOT NULL REFERENCES autowriter.memories(id) ON DELETE CASCADE,
+    sha          TEXT NOT NULL,
+    result       JSONB NOT NULL,
+    model        TEXT,
+    compiled_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (memory_id, sha)
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.rule_compiles TO service_role;
+ALTER TABLE autowriter.rule_compiles ENABLE ROW LEVEL SECURITY;
+
 -- ══════════════════════════════════════════════════════════════════════
 -- 发牌台账接上结果: autowriter.v_angle_outcomes (migrations/011_angle_outcomes_view.sql)
 -- 为什么、权限为什么非得「属主建 + 显式 GRANT」见 011 的文件头。下面的 DO 块与 011

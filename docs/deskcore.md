@@ -172,6 +172,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
 | | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8）。2026-10-20 起项目有交付模板时带拼好的 `delivery`（§3.9），带 check 的规则有命中时带 `rule_checks`（§3.10） |
+| | `check_rules` | **存档之后按规则逐篇查，只作建议**（2026-10-20，D-121）：规则事先由 Jev 编成是非题 / 代码检查、缓存在 `rule_compiles`；hard 没守住报「必须改」，soft 报「建议改」，Jev 拿不准的单列「拿不准」，到点没判完的报「没判完」。不拦存档、不改稿（见 §3.11） |
 | 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human_via_agent`（结论来自用户、经模型转述写入；Streamlit 里亲手点按钮的才是 `human`）+ 真实 reviewer + 时间 + **用户原话 `user_words`（必填，落 `decision_note`）** + 距入库秒数 `decided_within_s`。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
@@ -665,7 +666,7 @@ forbidden_word / required_phrase / max_len / forbidden_regex / free_text），�
 加写手原样传回来的 `tactic` 判，同简报；codex review on aw#115）：标了另一个方向的 soft 规则简报里没有，这里也不查，不然产品向的"带上产品名"会报到流量向项目上；
 hard 不过这道闸，同简报。简报的相关性筛选和每层 12 条的封顶**不做**：那两道是给注入的文字限量的，记了 check 的规则每次都查。
 模板管话题时，查的是交付出去的那一份：话题含模板加的固定 / 条件话题，正文是摘掉末尾那行话题之后的（`delivery.delivered_post`），
-和 `delivery.text` 对得上。
+和 `delivery.text` 对得上（`core._as_delivered`，§3.11 的 `check_rules` 也只从这一处拿）。
 只查存进去了的稿子，有命中才带 `rule_checks`（每条 `index` / `rule_id` / `severity` / `where` / `what`，`what` 以「必须改」或
 「建议改」开头，必须改的全列，建议改按篇号补到一共 40 条为止，多的报个数在 `rule_checks_more`）。不调模型、不出网、不拦存档；
 查询失败记日志并带 `rule_checks_status = "error"`（不带的话和"查过了、没命中"一模一样）。正则规则这次没查完的（没在时限内跑完，或者限时的引擎跑不了）列在
@@ -674,6 +675,162 @@ hard 不过这道闸，同简报。简报的相关性筛选和每层 12 条的�
 
 **上线后要做的。** 运营下次说到词表 / 字数类规矩时，写手会按协议带上 `check`；存量的这类规则要让写手在 `my_rules` 里挑出来、
 原文一字不差地再 `record_rule` 一次并带上 `check`（或者运维照同一形状直接写那两列）。
+
+### 3.11 写完按规则逐篇查：规则由 Jev 编译，`check_rules` 只作建议（2026-10-20，D-121）
+
+**为什么。** 同一份诊断的另一半：§3.10 只管人手设了 `check` 的那几条（生产库一条没填），其余规则照旧是一段段文字塞进简报，
+单个项目的软规则平均 400 字，守不守全凭模型注意力。要读懂内容才能判的（说法、语气、宣称、人设前后一致）交给 Jev。
+owner 10-20 定了四件事（D-121）：Jev 的项目层对**所有**项目放行；规则原文可以发给 Jev 编译；结果从第一天就给写手看，但
+**只作建议**——hard 没守住报「必须改」，soft 报「建议改」，永远不拦存档；软规则什么时候从简报里拿掉，等校准之后再定
+（**简报这次一个字没改**）。
+
+**编译在 Jev 那边（`POST /compile_rules`，JevforCoentent README「规则编译」）。** deskcore 仍然零 LLM。只认管理 key
+（deskcore 的 `JUDGE_API_KEY` 就是）；项目号、品类按 `tv_project_map` 定，和 §3.8 的判定同一条路（`_judge_project_context`）
+——没接 tv-map 就不发，数据出境口径按 TV 项目号认。一次 1–60 条 `{id, text, severity, applicability?}`，每条回一个结论：
+
+| verdict | 编成什么 | 写作台怎么用 |
+|---|---|---|
+| `code` | 一份代码检查，形状和 §3.10 的 `check` 完全一样 | 交给 `rulecheck` 跑。**只跑没有人手设过能跑的 check 的规则**（`rule_kind` 是 `forbidden_word` / `forbidden_regex` / `required_phrase` / `max_len` 之一、且 `rulecheck.spec_of` 认得出 payload 的，`score_drafts` 已经按人设的那份查过）。rule_kind 对、payload 却跑不了的不算人设（10-20 第三轮复审）：AW 页存得进去、`rulecheck` 不收的那几种（`validator` 放过、量词形状那道拒掉的正则；`max_len` 的「开头」老形状）`score_drafts` 只在 batch_metrics 里记一笔 skipped，原来这里照样让编出来的 code 让路——这条规则两边都没查，`check_rules` 还说它守住了 / 是流程规则。`free_text` 不算人设（10-20 复审）：AW 记忆页存硬规则默认选「自由文本」，存进库就是 `free_text`，和没设分不开，当成「不用代码查」的话 AW 页上记的规则编出来的 code 永远不跑。只看话题 / 评论的（`where` 只有 `tags` / `comments`）不跑：版本行里只存了标题和正文，话题、评论、交付模板的固定话题都不在，查了不是误报就是空查；`where` 里混着标题 / 正文的只查那一半——`required_phrase` 除外，它沾了话题 / 评论就整条不跑（「一个都没有才算没守」，看不见的那一处可能就有，只查正文会误报） |
+| `questions` | 1–3 道「只看这一篇就能答」的是非题，每题带 `pass_if`（答哪个算守住）、`scope`、题号；分得开时 `code` 也一起给 | 拼成内联项目题库发 `/judge_draft` |
+| `not_checkable` | 流程、交付、写作方向菜单 | 只计数 |
+
+带 `error` 的那条不存，下次再编；`coverage` 是 `partial` 的（一条规则的要求没全装进题 / 代码，没装进去的写在 `uncovered`）照样用、照样查，但 `check_rules` 不说它整条守住了：这次真查了的（题进了题库 / 代码真跑了）里 partial 的数进 `rules.partial`，`rules.partial_rules` 列规则 id 和 `uncovered`（最多 5 条），`next_step` 说「有 N 条规则只查了一部分，不能说它们整条守住了」（10-20 第三轮复审：原来 `coverage` / `uncovered` 一处都不读，「标题不超过 20 字，正文要带某句话术」只编出了标题那一半，标题短就报「这次查的规则都守住了」）。原文本来就还在简报里。
+
+Jev 回 200、但 `model` 是 `mock`（`JUDGE_MOCK=1` 的测试 / 本地 Jev，按关键词给假结果）的那一批**一条不存**，报 `jev_mock`（10-20 第三轮复审）：缓存键是 (`memory_id`, `sha`)，不带 model，存进去的话以后 `JUDGE_URL` 指回真的 Jev，这些假题、假代码照样一直命中，只有 `--force` 换得掉。和整批被挡同一个处理：后面几批不发、不按规则记失败，后台这个项目停 1 小时，`check_rules` 的 `uncompiled_reason` 报 `jev_mock`。
+
+**缓存：`rule_compiles`（migrations/015）。** 一条规则的一个版本一行，键是 **（`memory_id`，`sha`）**。`sha` = 规则原文（UTF-8，
+原样不去空白）的 sha256 前 12 位；`applicability` 去首尾空白后不为空时算「原文 + `\x00` + applicability」——和 Jev
+`rules.rule_sha` 同一个算法，`deskcore/rulecompile.rule_sha` 是它的移植，`tests/test_rule_compile.py` 拿 Jev 对合成样例算出来的
+值钉着（两边一漂，缓存永远命中不了、每次都重编白花钱；所以 Jev 回的 sha 和这边算的对不上时那一条不存、报出来）。为什么键要两样：
+题号里带规则 id 的缩写，两条原文相同、id 不同的规则只按 sha 复用，会把前一条的题号带进后一条，同一份题库题号重复。原文或适用范围
+一改就是新的一行；旧 sha 的行留着（改回去不再花钱），规则删了级联删。**不复用 `memories.rule_payload`**：那是人手设的 check，
+写进去会盖掉人设的，也会被 `validator.py` 当成 AW 生成链路的硬检查。
+
+**谁来编、什么时候编。** 编一批最坏约 6 分钟（Jev：2 次调用 × 2 次尝试 × 90 秒 + 退避），所以**写手的请求永远不等它**：
+
+- `open_project`（简报的最后一步）、`record_rule`、`check_rules`（发现有没编的）各触发一次**后台补编**（`core._kick_rule_compile`）：
+  每个项目同时最多一个线程（进程内锁），跑完 `RULE_COMPILE_COOLDOWN_SEC`（5 分钟）之内再触发不起新线程。`record_rule` 不等冷却
+  ——刚记的规则要尽快编；遇到正在编的，让那个线程跑完再来一轮（它读池子时这条可能还没写进去），一次最多 3 轮。
+  要不要编由线程自己查（按 (id, sha) 比 `rule_compiles`），触发的那一下不多查库。整个进程同时只编一个项目，别的线程排队
+  （部署后第一轮各项目会同时触发；排着队编，同一个 owner 的 global 规则后一个项目读缓存时已经存下了，**这个进程里**不会编两遍）。
+  ⚠️ 只管本进程：CLI 的 `compile-rules` 是另一个进程，和服务进程的后台补编不共用锁、互相看不见对方正在编什么，两边同时编同一个
+  项目（或同一个 owner 的两个项目）时同一条规则会发两遍、付两遍钱（upsert 把后到的那份盖上去，数据里看不出来）。所以**后台补编开着
+  的时候不要对线上跑 `compile-rules`，尤其是 `--force`**；上线补编的顺序见下面「上线要做的」。
+  CLI 进程里不起后台补编（进程一退线程就被杀在半路，Jev 照样编完、花钱，结果没人存），CLI 要编就用 `compile-rules`。
+  服务进程有同样的问题（Railway 重新部署——改一个变量就重新部署——时在路上的那一批丢了，新进程会把同一批再发一遍），躲不开，只能看得见
+  （10-20 第三轮复审）：每发一批记一行 INFO（`compile_rules: 发一批 N 条去 Jev 编译(project=…)`）；`app` 的 lifespan 收尾时
+  （`core.log_rule_compiles_cut_off`）对还有一批在路上的项目记 WARNING「后台补编被进程退出打断」，排队没发的记 INFO。不等它编完：
+  一批最坏 6 分钟，远超平台给的退出时间。runbook §1.11 有怎么避开。
+- 线程跑 `core.compile_rules`：池子和简报、§3.10 同一个（`store.shared_memories`：confirmed、没静音、本项目 + owner 自己的 global，
+  hard 和 soft 都编、不过方向闸——global 规则跨项目共用，方向是查的时候按项目定的），已经有 (id, sha) 那一行的跳过，一批 ≤ 60 条
+  （`RULE_COMPILE_BATCH`），读超时 `RULE_COMPILE_TIMEOUT_SEC`（默认 420 秒，Jev 最坏约 361 秒）。Jev 那边怎么失败都不抛，回一份报告。
+- 不让失败变成花钱的循环：同一条规则的同一版编失败之后，后台 6 小时之内不再编它（进程内记账，重启清零；CLI 不受这条限制）；
+  整批被出境口径挡下 / 没接 tv-map / judge 不可用 / 请求形状不对时，这个项目的后台补编停 1 小时（`record_rule` 除外）——这几种是项目的事，
+  **不按规则记失败**（10-20 复审：按规则记的话，owner 的 global 规则在他处方药项目里被挡一次，在他别的项目里也被扣 6 小时不编）。
+- 一批**读超时**就不再发后面几批（报告里 `not_sent` / `stopped_by: timeout`），后台这个项目停 30 分钟（`RULE_COMPILE_TIMEOUT_HOLD_SEC`）：
+  `/compile_rules` 没有整体截止，调用方断开之后 Jev 照样编完、照样计费，读超时过了它最坏的 ~361 秒说明 Jev 慢下来了，再发只是多付几批
+  没人收的钱。Jev 恢复之后 CLI 再跑一次。Jev 回 502 之类（答了、几乎没花钱）的只算那一批，下一批照发。
+  **停的是整个进程，不只是那个项目**（10-20 第二轮复审）：原来 hold 只记在超时的那个项目上，排着队等槽位的别的项目一拿到槽位就发，
+  一个接一个读超时，每个 7 分钟、每批都在 Jev 那边计费。现在任何一次编译读超时都记一个进程级的停发期（`core._RULE_COMPILE_JEV`，
+  同样 30 分钟）：停发期里 `_kick_rule_compile` 对哪个项目都不起线程（`record_rule` 也不例外，回 `jev_slow`），已经排着队的线程
+  拿到槽位先看它、这一轮不发；`check_rules` 的 `rules.uncompiled_reason` 报 `jev_slow`。`compile_rules` 本身不看停发期——运维的 CLI
+  要能在 Jev 恢复之后直接重跑。
+  **连接超时不是读超时**（10-20 第三轮复审）：3 秒（`judge_client._CONNECT_TIMEOUT_CAP_SEC`）没连上，请求一个字节都没发出去，Jev 没在编、
+  没计费——`judge_client.compile_rules` 把它记成 `unavailable`（详情「连接超时，请求没发出去」），按整批被挡处理：这个项目停 1 小时，
+  不停整个进程、不按规则记失败、`compile-rules --all` 不就此停下。原来 `requests.ConnectTimeout` 先落进 `Timeout` 分支，报「420s 内没回」，
+  一次 Jev 冷启动就让整个进程停发 30 分钟、整批规则扣 6 小时、`--all` 整个停下。写手侧的判定（§3.8）照旧把连接超时算 `timeout`。
+- 编出来却写不进去：一批是一条 `INSERT … ON CONFLICT`，编的那几分钟里有规则被硬删（AW 页），外键会让整批失败——先查哪几条还在、只写还在的，
+  删掉的报「规则编译期间被删」；还是写不进去才算写失败，那一批的规则按编失败记（后台不马上再付一遍钱）。
+- 发不了的不发：原文超过 4000 字、`applicability` 超过 100 字（Jev 会让整批 60 条一起 422），记在报告的 `not_compilable`，原文留在简报里照旧。
+- `RULE_COMPILE_AUTO=0` 关掉后台补编，只剩运维命令：
+
+```bash
+python -m deskcore.cli compile-rules --all --dry-run      # 每个项目一行: 池子几条、已编过几条、要编几条, 一条不发
+python -m deskcore.cli compile-rules --all                # 真编; 已编过的不再发, 第二次跑基本秒回
+python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编、覆盖(花钱; 只在 Jev 改了编译之后用)
+```
+
+`--all` 整次运行带一个 `seen`（10-20 复审）：owner 的 global 规则在他每个项目的池子里，同一条规则的同一版一次运行里最多发一次——
+`--force` 也是（原来按项目数重编、重付钱），`--dry-run` 的「要编」合计就是真编要发的条数（原来按项目数重复计数）。`--dry-run` 和真编
+同一个结局：没配 `JUDGE_*`、没接 tv-map 的项目照样报 ✗（原来 dry-run 在这两道之前就回了，打 ✓）。
+`--all` 遇到一个项目读超时就停（10-20 第二轮复审）：后面的项目一个都不试，`⏸` 那一行列出它们，合计行写几个没试，退出码 1；读超时的那批
+也记进 `seen`。原来接着发下一个项目——6 个项目就是 6 次 420 秒的读超时、6 批没人收的编译，owner 的 global 规则也每个项目各发一遍
+（`seen` 原来只记写进库的）。
+
+**查：`check_rules(project_id, version_ids, tactic?)`。** 协议里是 `score_drafts` 之后的一步（5a）：`score_drafts` 返回的
+`check_rules_version_ids` 原样整串传，一次查（去重之后）前 20 个（`CHECK_RULES_MAX_VERSIONS`，一次的篇数都挤在同一个 18 秒截止里），
+多出来的原样放进返回的 `remaining_version_ids`，`next_step` 让接着再调一次、传它们，直到返回里没有它。10-20 第二轮复审：`score_drafts`
+一批不限篇数（22 篇的批次出现过），原来超过 20 个整次报错，协议又说「原样传、一批只调一次、报错就说规则没查成」——整批都没查。
+存档那次的 `next_step` 在新稿超过 20 篇时也先说一句要分几次。每一次：
+
+1. 归属：项目过 `assert_project_access`；版本只认本项目的（`store.versions_in_project`，和存档判定核自带 `version_id` 同一条
+   `items!inner → batches!inner` 再 `.eq` project_id），别的项目的 / 不存在的 / 不是 UUID 的记进 `excluded`，不查、不发。
+   查的是**交付出去的那一份**（`core._delivered_text`）：版本行存的是写手传的原稿，项目模板管话题时正文按 `delivery.delivered_post`
+   摘掉末尾那行话题（和 `delivery.text` 里【正文】后面那一段一样），没有模板 / 模板不管话题时是原稿去掉首尾空白；模板坏了照原稿查。
+   和 §3.10 的 `rule_checks` 走同一处（`core._as_delivered`）：标题、正文两边一字不差，和 `delivery.text` 里那一段也一字不差。话题和评论**不是**：
+   版本行里没存写手单独传的 `tags`，这边拼得出来的话题只有末尾被摘走的那行 + 模板的固定 / 条件话题，写手传了 `tags` 的那篇和交付稿的话题行
+   对不上（只有写手没传 `tags` 时一样）；评论版本行里没有，永远是空的（10-20 第三轮复审：原来这里写「两边一字不差」，只在写手没传 tags、
+   没传评论时成立）。所以编出来的 code 里看话题 / 评论的照旧不跑（见步骤 4），拼出来的话题实际上没有检查会读。哪个 `#` 算话题只认
+   `validator.topic_tag_matches`（网址里的 `#片段`、`C#入门`、`#秋招[话题]#` 后面还接着正文的都不摘，§3.9）。Jev 判的、代码查的都是它——
+   拿原稿去判，只在话题行里的词会被当成「正文里有」，正文必须带的话术也能靠被摘走的那行混过去。
+2. 池子：同简报，soft 过方向闸（`filter_by_applicability`，按项目名 + 写手原样传回来的 `tactic` 判，同简报和 §3.10；不传就只按项目名）；每条按 sha 找编译结果，找不到的数进
+   `uncompiled_rules`（并触发后台补编），这次不查。`next_step` 说「还没有编译结果」并说清为什么（`rules.uncompiled_reason`）：
+   Jev 没配 / 项目没接 tv-map（多查一次 `tv_project_map`）/ 后台补编关着 / 项目被出境口径挡下在 hold 里 / 本进程最近有编译读超时、
+   在停发期里（`jev_slow`，不管超时的是不是这个项目）/ 上次编失败了
+   （`rules.compile_failed` 条，6 小时内后台不重编）/ 真的在编。10-20 复审：原来一律说「还在后台编译」，编不了的项目每批都这么说。
+3. 规则题：所有编出来的题拼成一份内联项目题库（`rulecompile.project_bank`，Jev `to_project_bank` 的移植：每题 `noul`、criteria 是 / 否、
+   `scope` 原样；`pass_if` 为「否」的题 `evidence: on_true`——答「是」= 违反时 Jev 指出依据句，就是要改的那句）。每篇**单独**发一次
+   `/judge_draft`：`banks: []`（存档那次已经判过默认三层，这里只花规则题的钱）、`project_bank_name: "desk_rules"`、
+   `run_tag: "shadow-rules"`、`judge_paras: "never"`、`write: true`、`subject_id = versions.id`——答案按这一版落 TV 账本，和存档那次的
+   `primary` 分开，以后拿来校准。题**不进** `hard_rules` / `brief`（进了就算进 `passed`）。最多 4 路并行，整次共用
+   `JUDGE_DRAFT_TOOL_TIMEOUT_SEC`（默认 18 秒）的截止，发之前查 tv-map 的那两次库也算在里面；到点没回来的那篇报 `judge_status = timeout` +
+   `judge_note`「没判完」，**绝不算守住**。
+4. 代码查：编出来的 `code` 交给 `rulecheck.check`（查词、数字数和 §3.10 同一份 `validator.contains_term` / `count_chars`），只跑没有
+   人设能跑的 check 的规则（见上表 `code` 那行）。`where` 里的 `tags` / `comments` 先拿掉（版本行里没有），拿完一处不剩的不跑
+   （`required_phrase` 沾了就不跑），数进 `rules.code_unavailable`，`next_step` 说这几条查不了、不能说守住了。
+   payload 读的时候按人设 check 的同一套规矩再校一遍（正则过 `validator.assert_regex_is_safe` + 量词形状那道，§3.10）：不安全的不跑、
+   记日志、数进 `rules.code_refused`，**不算进** `rules.by_code`（那是真跑了的条数）。编不了的（原文超过 Jev 的字段上限之类，永远不发）
+   数进 `rules.not_compilable`。这两种 `next_step` 都会说「有 N 条规则这次查不了，不能说它们守住了」（10-20 第二轮复审：原来
+   `next_step` 只看没编译结果和话题评论两种，一条编不了的硬规则加一条正则不安全的硬规则，照说「这次查的规则都守住了」）；只有编不了的
+   规则、别的都没有时，`nothing_to_check` 也照这样说，不说成「流程、交付、写作方向」那种查不了。
+5. 账本：每篇的回包看 `written` / `write_error`（Jev 账本写失败照样回 200）：`write_error` 不为空、或 `written` 不是整数的，记一行 WARNING
+   （带版本号）、`rules.ledger_write_errors` 计数、打一条 `deskcore_check_rules_ledger` 埋点；写手的 `next_step` 不提（判是判出来了，少的是
+   以后校准用的那几行）。10-20 第三轮复审：原来只读 `detail.desk_rules`，`write=true` 要攒的影子期数据次次丢了也没人知道。
+
+**编译结果读不出来**（`rule_compiles` 不在：015 没跑、或库从 015 之前的基线恢复）：`check_rules` 记 ERROR 日志（带项目号），回
+`status: error`、`versions: []`、`reason: rule_compiles_unreadable` 和一句「这次规则没查成…不能说规则守住了；交付照常，不用重试」。
+10-20 第三轮复审：原来直接抛——REST 是 500（模型读成「待会儿重试」），MCP 是工具错误，服务端 deskcore 一行日志都没有，而每次存档的
+`next_step` 都让写手来调。
+
+**答案怎么读**（`rulecompile.read_answers`，读 `detail.desk_rules[qid]`）：答案和 `pass_if` 不一样 = 没守住。Jev 标了 `ambiguous`、或
+`p` < 0.7（同参考分的「有把握」线）的，不管偏向哪边都记「拿不准」——0.6 的守住和 0.6 的没守住一样不可信。`invalid_reason` 不为空的
+记「没判出来」，不报违反也不报守住，**没有例外**——同 Jev README「规则编译 → 送回 /judge_draft」的契约。`evidence_not_found`
+（答了「是」却指不出依据句，TV 账本里那一行 answer 为 NULL）也是没判出来（10-20 第二轮复审：原来它落在 `pass_if`「否」的题上时照算违反，
+硬规则报「必须改」，写手照着一个账本里记成无效的答案去改稿，还不知道改哪一句）。没判出来的题数进那篇的 `counts.unjudged`（`unjudged` 列出规则 id
+和原因，最多 5 条）、全部篇加起来进 `summary.unjudged`，`next_step` 说「另有 N 道规则题这次没判出来，不能说守住了」；一道都没判出来的
+那篇（回包里没有 `desk_rules`，或每题都带 `invalid_reason`）记 `judge_status: not_judged`，和没判完一样算进 `summary.not_finished`。
+10-20 复审：原来这里只在那篇上记个数，`summary` 不看它，`next_step` 照说「这次查的规则都守住了」——现在这句只在必须改 / 建议改 /
+拿不准 / 没判完 / 没判出来 / 没编译结果 / 话题评论查不了 / 编不了 / 编出来的检查没跑 / 只查了一部分全是 0 时才说。
+
+**返回值**（一篇一项 `versions[]`）：`violations`（每条 `rule_id` / `severity` / `what`（以「必须改」或「建议改」开头）/ `source`（jev | code）/
+`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`）、`unsure`（「拿不准」，最多 5 条）、`more`、`counts`、`judge_status` / `judge_note`；
+外加 `summary`（必须改 / 建议改 / 拿不准 / 没判完各几处、没判出来几道题）、`rules`（池子几条、Jev 查几条、代码查几条、查不了几条、
+还没编几条和为什么、话题评论查不了几条、编不了几条、编出来没跑几条、只查了一部分几条）、`uncompiled_rules`、这次没查到的 `remaining_version_ids`（有才带）
+和一句 `next_step`。没有可查的规则时回 `status: nothing_to_check` 和一句话，
+什么都不发。
+
+**只查新稿。** `score_drafts` 的返回多了 `check_rules_version_ids`：这批里的新稿，不含带 `replaces_version_id` 改过重存的；全是重存时
+它是空的，`next_step` 说「不用再调 check_rules」。10-20 复审：原来每次存档的 `next_step` 都说「然后调一次 check_rules」，照
+「必须改」改完重存那次也说——和协议 5a、`check_rules` 自己的「改一轮就够，不用再调」打架，最新的那句赢，多花一轮 Jev 的钱，
+还会改 → 查 → 改地转下去。这批传了 `tactic` 的，`next_step` 再提醒一句把同一个 `tactic` 带给 `check_rules`（方向闸同一个判据）。
+
+**不变的。** 简报、`score_drafts` 的参考分和 `rule_checks`、存档那次的判定都一个字没改；`check_rules` 不改库里的稿子，判不成也只是那篇
+「没判完」。写手侧唯一多出来的动作是协议 5a 那一步。
+
+**上线要做的。** ① 跑 `015`（先于部署）；② 部署，deskcore 服务上先设 `RULE_COMPILE_AUTO=0`；③ `compile-rules --all --dry-run` 看数，
+再 `compile-rules --all` 跑完（runbook §1.11 有查 `rule_compiles` 的 SQL）；④ 去掉 `RULE_COMPILE_AUTO`（Railway 改变量就重新部署，不用发版），
+后台补编打开时规则都已经在缓存里；⑤ 写手重新导入一次 skill（协议版本变了）。之后新记的 / 改过的规则由后台自己补编。为什么 ② 要先关：
+CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_project` 就会在服务端编同一批规则，付两遍钱。
 
 ## 4. 接入
 
@@ -693,6 +850,9 @@ env：
 | `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里；它是自定义格式，登记在 `logger_utils` 的值级脱敏名单里（judge 的错误体会被抄进 detail / 遥测 / `batch_metrics`）。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
 | `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了、`nan` / `inf` 都退回默认）。**整批判定的共同截止**，不是每篇各 8 秒；入库慢时实际截止更短（整次 commit 回包目标 20 秒，见 §3.8，J-08） |
 | `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16（同上，写坏了退回默认）。一次 commit 同时发几篇 |
+| `RULE_COMPILE_TIMEOUT_SEC` | 可选 | 默认 `420`，夹在 60–900。规则编译（§3.11）一次请求的读超时；Jev 最坏约 361 秒，所以至少 400。只有后台线程和 CLI 用它 |
+| `RULE_COMPILE_BATCH` | 可选 | 默认 `60`，夹在 1–60（Jev 的上限）。一次编几条 |
+| `RULE_COMPILE_AUTO` | 可选 | 默认开。`0` 关掉 `open_project` / `record_rule` / `check_rules` 触发的后台补编，只剩 `cli compile-rules`。上线补编（`compile-rules --all`）那一阵要先设 `0`，跑完再去掉：CLI 和服务进程的后台补编不共用锁，同时编会付两遍钱（§3.11） |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
 
@@ -707,8 +867,9 @@ env：
 `004_deskcore_check_pushdown.sql` / `005_deskcore_containment.sql` /
 `006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql` /
 `008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql` /
-`011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql` / `014_tv_edit_diff_rev.sql`
-**十三个，按编号顺序跑，别跳号**（建议先在
+`011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql` / `014_tv_edit_diff_rev.sql` /
+`015_rule_compiles.sql`
+**十五个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -741,6 +902,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
+- `015_rule_compiles.sql`（2026-10-20，D-121）：`rule_compiles`，规则编译结果的缓存，键 (`memory_id`, `sha`)（§3.11）。只授 `service_role`、开 RLS。**可降级**：不跑的话 `compile-rules` 和后台补编在读缓存这一步就报 error（记 WARN，一条都不发给 Jev，不花编译的钱），`check_rules` 回 `status: error`、记 ERROR 日志（写手那边是这次规则没查成、不能说守住了，存档已成功、交付不受影响；不是 500，10-20 第三轮复审：原来直接抛，REST 是 500、MCP 是工具错误，服务端一行日志都没有），简报和存档不受影响。`doctor` 探这张表。
 - `014_tv_edit_diff_rev.sql`（2026-10-20）：`tv_edit_diffs.diff_rev`，差异的口径版本。首晚 125 条"改过"只差稿子末尾的 #话题 行（TV 正文不带），`edit_diff` 改成两边先去话题、品牌只数正文；旧口径的行 tv-sync 重算（不推 `computed_at`），`edit_digest` 只读当前口径。以后改差异算法只需 `tvlink.DIFF_REV` +1。`DIFF_REV = 2`（10-20）：写作台那版晚于发布的（`lag_days < 0`，抄回来的）不算差异，同 desk_gap / 判据 C 的"接住"口径。
 - `013_tv_edits.sql`（2026-10-19，D-120 / W-23）：`tv_note_links.match_kind` 多认 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15，人改得多但还是这一篇）；建 `tv_edit_diffs`（每条对上的笔记一行：标题改没改、删 / 加了哪些句子、长度、品牌提了几次）和 `tv_edit_digest_acks`（每个项目的每周摘要看到哪儿了）；`v_angle_outcomes` 把 `edited` 也算作对上。**硬失败只打 tv-sync 写 `edited` 那一块**（旧 CHECK 拒）；差异和摘要缺表时只记 WARN。`doctor` 探两张表。
 - `012_review_via_agent_provenance.sql`（2026-10-09，审计 A-01，§3.6）：`items` 加 `decision_note`（用户原话，≤ 200 字）/ `decided_within_s`（距被审版本创建的秒数）两列，`decision_source` 的 CHECK 多认 `human_via_agent`，另建一条只盖它的部分索引。**只打 `review_drafts`**：它无条件写 `human_via_agent` + 两列，缺了每条都报 `failed`（`db.update_item_status` 会翻译成"跑 012"）；Streamlit 的通过 / 打回仍写 `human` + 三列，并把两列清空（每次决定整行重写，不许顶着上一次代理决定的原话）——所以 012 和 006 一样是硬前提。`doctor` 探两列（CHECK 从 PostgREST 探不到，用列当代理，两者同一事务）。

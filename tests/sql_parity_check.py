@@ -175,7 +175,8 @@ def main() -> int:
     # 抽查几张表 / 几个函数真的建出来了 —— 免得 shim 把整段吃掉还报绿
     for tbl in ("projects", "items", "versions", "memories", "jobs",
                 "draft_fingerprints", "angle_ledger",
-                "tv_project_map", "tv_note_links", "ingest_locks"):   # 009
+                "tv_project_map", "tv_note_links", "ingest_locks",    # 009
+                "rule_compiles"):                                     # 015
         n = sql("SELECT count(*) FROM information_schema.tables "
                 f"WHERE table_schema='autowriter' AND table_name='{tbl}';")
         if n != "1":
@@ -214,7 +215,7 @@ def main() -> int:
             bad += 1
     sql(f"DELETE FROM autowriter.items WHERE user_id='{UID}';")
     if not bad:
-        print("  ✓ 抽查的 10 张表 + 10 个函数 + 决策出处三列都在, "
+        print("  ✓ 抽查的 11 张表 + 10 个函数 + 决策出处三列都在, "
               "且 CHECK 与 db.DecisionSource 一致")
 
     # ── ①'' 009 的跨 schema RPC 在【没有 truth_vault】的库上要能调、且干净返回空 ──

@@ -39,8 +39,8 @@ description: 帆谷/BYWOOD 小红书种草内容的【写作台协议】，接 d
 - `bywood-writing-desk`（本 skill）管这一批守不守项目规则、跟历史重不重
 - `seeding-prompt-refiner` 管提示词本身怎么迭代
 
-<!-- protocol_version: 7ac5e0a57959 -->
-protocol_version: 7ac5e0a57959
+<!-- protocol_version: 6efd5acb3595 -->
+protocol_version: 6efd5acb3595
 
 # 写作台协议
 
@@ -164,11 +164,23 @@ protocol_version: 7ac5e0a57959
 
 旧版 skill 里叫 `commit_drafts` 的就是这个工具的旧名，做的事完全一样；新对话里一律用 `score_drafts`。
 
-**5a. `judge_draft` / `repair_plan_for`**（可选）—— `score_drafts` 已经给每篇打过参考分；用户追问「这篇哪里有问题」、或者想在那之外再细查一篇（段落、人感）时才调。一篇一调；返回值怎么读看工具说明。要指定题库、或用户问「判的是什么」时，先调 `list_banks`。
+**5a. `check_rules`** —— `score_drafts` 存完档就调一次，同一轮里，不等用户表态。
+
+把 `score_drafts` 这次返回的 `check_rules_version_ids` 原样传进去（这批里的新稿；带 `replaces_version_id` 改过重存的不在里面），篇数再多也整串传。它按这个项目的规则逐篇查刚存的稿子（规则事先由 Jev 编成了是非题和代码检查），回每篇哪几条没守住。**只是建议，不拦交付**，存档已经成功了：
+
+- 以「必须改」开头的是硬约束没守住：照着改，改完那几篇用 `score_drafts` 带 `replaces_version_id` 再存一次（会重新打分）。改一轮就够，不用再调 `check_rules`。
+- 以「建议改」开头的是软规则：告诉用户，改不改由用户定，不要自己反复重写去消掉它们。
+- 「拿不准」的提一句就行，不用改。
+- 某篇的规则题没判完（工具说明里写着怎么看出来），或者有题没判出来（`counts.unjudged` 不是 0），就不能说那几条守住了规则；不用重试。
+- 还有规则没有编译结果（`uncompiled_rules` 不是 0），或者有规则要看话题 / 评论查不了，或者有规则编不了、编出来的检查没跑（`rules.not_compilable` / `rules.code_refused` 不是 0），或者有规则只查了一部分（`rules.partial` 不是 0），就照 `next_step` 说一句这次没查全、那几条不能说（整条）守住了，不用等。
+
+它一次最多查 20 篇：多出来的放在返回的 `remaining_version_ids` 里，照 `next_step` 接着再调一次、传它们（`tactic` 照样带），直到返回里没有 `remaining_version_ids`，几次的结果合起来说。除此之外一批只调一次；带 `replaces_version_id` 改稿重存的不再查（全是改稿重存时 `check_rules_version_ids` 是空的，那次 `score_drafts` 的 `next_step` 也不会再让你调；新稿和改稿混在一批时它只含新稿）。结果一两句告诉用户就行，和分数放在一起说。它报错、或者返回的 `status` 是 `error`，就说这次规则没查成、不能说守住了，交付照常，不用重试。
+
+**5b. `judge_draft` / `repair_plan_for`**（可选）—— `score_drafts` 已经给每篇打过参考分；用户追问「这篇哪里有问题」、或者想在那之外再细查一篇（段落、人感）时才调。一篇一调；返回值怎么读看工具说明。要指定题库、或用户问「判的是什么」时，先调 `list_banks`。
 
 它也**不是闸**：判不过也能交付，但要把判出来的问题如实告诉用户；照着改完最多再判一轮，不要循环。没判成就说这次没拿到判定，不要说成"通过了"。
 
-**5b. `ingest_published`** —— 用户拿来的是**已经发出去、当时没存档**的稿子时调。
+**5c. `ingest_published`** —— 用户拿来的是**已经发出去、当时没存档**的稿子时调。
 
 平常不用：发出去的笔记每天会自动从飞书对回来，对不上的也会自动补进查重库。只有运营明确说「这批上周发了，没入库」「补入库」「补指纹」，或者把一批已经发在小红书上的稿子粘给你要"入库"时才用——这不是 `score_drafts`。那是刚写完要交付的稿子，过闸、销角度；这些是已经发过的历史，它跟库里谁重复都改变不了事实，**不过闸**，照收，让下一批查重能看见它们。
 
