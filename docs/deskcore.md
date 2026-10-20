@@ -640,7 +640,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
-- `014_tv_edit_diff_rev.sql`（2026-10-20）：`tv_edit_diffs.diff_rev`，差异的口径版本。首晚 125 条"改过"只差稿子末尾的 #话题 行（TV 正文不带），`edit_diff` 改成两边先去话题、品牌只数正文；旧口径的行 tv-sync 重算（不推 `computed_at`），`edit_digest` 只读当前口径。以后改差异算法只需 `tvlink.DIFF_REV` +1。
+- `014_tv_edit_diff_rev.sql`（2026-10-20）：`tv_edit_diffs.diff_rev`，差异的口径版本。首晚 125 条"改过"只差稿子末尾的 #话题 行（TV 正文不带），`edit_diff` 改成两边先去话题、品牌只数正文；旧口径的行 tv-sync 重算（不推 `computed_at`），`edit_digest` 只读当前口径。以后改差异算法只需 `tvlink.DIFF_REV` +1。`DIFF_REV = 2`（10-20）：写作台那版晚于发布的（`lag_days < 0`，抄回来的）不算差异，同 desk_gap / 判据 C 的"接住"口径。
 - `013_tv_edits.sql`（2026-10-19，D-120 / W-23）：`tv_note_links.match_kind` 多认 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15，人改得多但还是这一篇）；建 `tv_edit_diffs`（每条对上的笔记一行：标题改没改、删 / 加了哪些句子、长度、品牌提了几次）和 `tv_edit_digest_acks`（每个项目的每周摘要看到哪儿了）；`v_angle_outcomes` 把 `edited` 也算作对上。**硬失败只打 tv-sync 写 `edited` 那一块**（旧 CHECK 拒）；差异和摘要缺表时只记 WARN。`doctor` 探两张表。
 - `012_review_via_agent_provenance.sql`（2026-10-09，审计 A-01，§3.6）：`items` 加 `decision_note`（用户原话，≤ 200 字）/ `decided_within_s`（距被审版本创建的秒数）两列，`decision_source` 的 CHECK 多认 `human_via_agent`，另建一条只盖它的部分索引。**只打 `review_drafts`**：它无条件写 `human_via_agent` + 两列，缺了每条都报 `failed`（`db.update_item_status` 会翻译成"跑 012"）；Streamlit 的通过 / 打回仍写 `human` + 三列，并把两列清空（每次决定整行重写，不许顶着上一次代理决定的原话）——所以 012 和 006 一样是硬前提。`doctor` 探两列（CHECK 从 PostgREST 探不到，用列当代理，两者同一事务）。
 

@@ -298,6 +298,7 @@ tv-sync 把 `diff_rev` 过时的行按新口径重算（同一版不推 `compute
 SQL Editor / `apply_migration` 直接跑（幂等），**先于**代码部署。验收：`doctor` 里「tv_edit_diffs 的 diff_rev 列」applied；
 下一晚 tv-sync 之后 `select diff_rev, count(*), count(*) filter (where changed) from autowriter.tv_edit_diffs group by 1` 全是当前口径。
 以后改 `edit_diff` 的算法就把 `DIFF_REV` +1，不用再加迁移。
+`DIFF_REV = 2`（10-20）：写作台那版晚于发布的（`tv_note_links.lag_days < 0`，发了之后才抄回写作台）不再算差异。首晚 440 条里 212 条是这种，不是人改写作台的稿；它们的旧行停在旧口径上，不重算、摘要也不读（不删库）。
 
 ### 1.9 `013_tv_edits` —— 改得多的同一篇也认 + 人在发布前改了什么（2026-10-19，D-120 / W-23）
 

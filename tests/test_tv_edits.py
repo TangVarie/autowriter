@@ -354,3 +354,26 @@ def test_migration_014_adds_diff_rev_in_both_places():
     for f in ("migrations/014_tv_edit_diff_rev.sql", "migrations/000_baseline.sql"):
         sql = (Path(__file__).resolve().parent.parent / f).read_text(encoding="utf-8")
         assert "ADD COLUMN IF NOT EXISTS diff_rev SMALLINT NOT NULL DEFAULT 0" in sql, f
+
+
+# ── 7. 发了之后才抄回写作台的那版不算差异(10-20) ─────────────────────────────────────────────
+
+def test_a_copy_made_after_publication_is_not_an_edit():
+    """首晚 440 条差异里 212 条是发出去 6~7 天后才存进写作台的那版(lag_days < 0): 抄回来的, 不是人改写作台的稿。"""
+    c = _client([_note("n-late", "秋招投了六十份简历没回音", BODY_A, days=-5)])
+    out = core.tv_sync(c, TV)
+    assert [l["lag_days"] for l in c.rows["tv_note_links"]] == [-5], "对照照写(判据 C 还要看它)"
+    assert out["edit_diffs"]["computed"] == 0 and not c.rows.get("tv_edit_diffs")
+
+
+def test_old_rows_from_post_publication_copies_are_not_recomputed_or_read():
+    old = {"note_id": "n0", "tv_project_id": TV, "project_id": P1, "version_id": "v1", "item_id": "i1",
+           "match_kind": "body_exact", "score": 1.0, "lag_days": -6}
+    c = _client([_note("n0", "秋招投了六十份", BODY_A, days=-6)], links=[old])
+    c.rows["tv_edit_diffs"] = [{"note_id": "n0", "tv_project_id": TV, "project_id": P1, "version_id": "v1",
+                                "match_kind": "body_exact", "changed": True, "diff_rev": 0,
+                                "computed_at": "2026-10-19T14:03:00+00:00"}]
+    assert core.tv_sync(c, TV)["edit_diffs"]["computed"] == 0, "旧口径的抄回行不重算"
+    assert c.rows["tv_edit_diffs"][0]["diff_rev"] == 0
+    assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == [], "摘要也读不到它"
+    assert tvlink.DIFF_REV >= 2
