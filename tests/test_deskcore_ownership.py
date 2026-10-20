@@ -156,6 +156,9 @@ UNGATED_WITH_REASON = {
     "flywheel_arm": "纯函数: 对 (project_id, user_id, 北京日期) 取哈希定飞轮臂, 不读写库; 调用方 borrow_lessons / build_writing_brief / commit_drafts 都已过归属闸",
     "_borrow_arm": "借卡时定臂并记进进程内存 (不读写库), 只被 _borrow_for_brief 调, 其调用方 borrow_lessons / build_writing_brief 已过归属闸",
     "batch_arm": "入库时取借卡那次的臂 (进程内存, 不读写库), 只被 commit_drafts 调, 它已过归属闸",
+    "_daily_rotation_seed": "纯函数: 同 flywheel_arm, 对 (用途, project_id, user_id, 北京日期) 取哈希当正例 / 规律轮换的种子, 不读写库",
+    "_patterns_usage_for": "纯函数: 用 _daily_rotation_seed 定规律轮换的起点、拼用法说明, 不读写库; 调用方 build_writing_brief / borrow_lessons 已过归属闸",
+    "select_positive_examples": "纯函数: 候选是已过归属闸的 build_writing_brief 读好传进来的, project_id 只当轮换种子的输入(10-20)",
     "_comment_tool_call": "只被已过归属闸的 comment_repair_plan_for / judge_thread / score_comments 调用；项目和品类由服务端查询",
     "comments_for": "归属闸在 _resolve_post 里(两条路都过 assert_project_access: 按链接反查到的项目、或调用方给的 project_id), "
                     "过闸之前不读规则、不读评论",
