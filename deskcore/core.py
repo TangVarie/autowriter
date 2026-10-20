@@ -5312,6 +5312,7 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
             out[key] = fn(client, arg)
         except Exception as exc:                        # noqa: BLE001
             logger.exception("tv_sync: %s失败 (tv=%s)", what, tv_project_id)
+            out[key] = getattr(exc, "done", 0)          # 分块的: 失败前已提交的那几块照实报
             out[err_key] = f"{type(exc).__name__}: {exc}"[:200]
     return out
 

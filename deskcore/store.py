@@ -2100,6 +2100,15 @@ def tv_links_upsert(sb, rows: list[dict]) -> int:
     return n
 
 
+class PartialWriteError(RuntimeError):
+    """分块写到一半失败。每块各自提交、不回滚, ``done`` 是失败前已经写进去的行数, 调用方照实报(codex review on aw#114)。
+    第一块就失败的直接抛原来的错。"""
+
+    def __init__(self, done: int, cause: Exception):
+        super().__init__(f"写了 {done} 行之后失败: {type(cause).__name__}: {cause}")
+        self.done = done
+
+
 def tv_links_set_lag(sb, lags: dict[str, int]) -> int:
     """给已有对照补上 lag_days(``{note_id: lag}``), 回实际改到的行数。按 lag 值分组 update, 不走 upsert: 只带两列的
     upsert 会先按插入校验整行的非空约束。"""
@@ -2110,7 +2119,13 @@ def tv_links_set_lag(sb, lags: dict[str, int]) -> int:
     for lag, ids in by_lag.items():
         for i in range(0, len(ids), 200):
             chunk = ids[i:i + 200]
-            res = sb.table("tv_note_links").update({"lag_days": lag, "updated_at": now}).in_("note_id", chunk).execute()
+            try:
+                res = (sb.table("tv_note_links").update({"lag_days": lag, "updated_at": now})
+                       .in_("note_id", chunk).execute())
+            except Exception as exc:                    # noqa: BLE001
+                if not n:
+                    raise
+                raise PartialWriteError(n, exc) from exc
             n += len(res.data or [])
     return n
 
@@ -2121,7 +2136,12 @@ def tv_edit_diffs_demote(sb, note_ids: list[str]) -> int:
     n = 0
     for i in range(0, len(note_ids), 200):
         chunk = list(note_ids[i:i + 200])
-        res = sb.table("tv_edit_diffs").update({"diff_rev": 0}).in_("note_id", chunk).execute()
+        try:
+            res = sb.table("tv_edit_diffs").update({"diff_rev": 0}).in_("note_id", chunk).execute()
+        except Exception as exc:                        # noqa: BLE001
+            if not n:
+                raise
+            raise PartialWriteError(n, exc) from exc
         n += len(res.data or [])
     return n
 
@@ -2211,7 +2231,12 @@ def tv_edit_diffs_upsert(sb, rows: list[dict]) -> int:
     n = 0
     for i in range(0, len(rows), 200):
         chunk = rows[i:i + 200]
-        sb.table("tv_edit_diffs").upsert(chunk, on_conflict="note_id").execute()
+        try:
+            sb.table("tv_edit_diffs").upsert(chunk, on_conflict="note_id").execute()
+        except Exception as exc:                        # noqa: BLE001
+            if not n:
+                raise
+            raise PartialWriteError(n, exc) from exc
         n += len(chunk)
     return n
 

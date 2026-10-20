@@ -501,3 +501,57 @@ def test_uncomputable_links_do_not_starve_the_backlog(monkeypatch):
     c.rows["tv_edit_diffs"] = [_diff_row("z-ok", 0)]
     out = core.tv_sync(c, TV)["edit_diffs"]
     assert out["computed"] == 1 and c.rows["tv_edit_diffs"][0]["diff_rev"] == tvlink.DIFF_REV
+
+
+class _FailOnCall:
+    """第 ``fail_at`` 次 execute 抛错的假客户端(只够 update / upsert 链式调用用)。"""
+
+    def __init__(self, fail_at):
+        self.calls, self.fail_at = 0, fail_at
+
+    def table(self, _name):
+        return self
+
+    def update(self, _payload):
+        return self
+
+    def upsert(self, payload, **_kw):
+        self.payload = payload
+        return self
+
+    def in_(self, _col, ids):
+        self.payload = ids
+        return self
+
+    def execute(self):
+        self.calls += 1
+        if self.calls == self.fail_at:
+            raise RuntimeError("timeout")
+
+        class _R:
+            data = [{}] * len(self.payload)
+        return _R()
+
+
+@pytest.mark.parametrize("call", [
+    lambda c, ids: store.tv_links_set_lag(c, {i: -1 for i in ids}),
+    lambda c, ids: store.tv_edit_diffs_demote(c, ids),
+    lambda c, ids: store.tv_edit_diffs_upsert(c, [{"note_id": i} for i in ids]),
+])
+def test_a_chunk_failing_after_others_committed_reports_what_was_written(call):
+    """分块各自提交(codex review on aw#114): 第二块失败时, 第一块的 200 行已经写进去了, 要照实报出来。"""
+    ids = [f"n{i:03d}" for i in range(250)]
+    with pytest.raises(store.PartialWriteError) as got:
+        call(_FailOnCall(fail_at=2), ids)
+    assert got.value.done == 200
+    with pytest.raises(RuntimeError) as first:
+        call(_FailOnCall(fail_at=1), ids)
+    assert not isinstance(first.value, store.PartialWriteError), "第一块就失败的照抛原来的错"
+
+
+def test_tv_sync_reports_the_committed_part_of_a_failed_lag_write(monkeypatch):
+    c = _client([_note("n0", "秋招投了六十份", BODY_A, days=-2)], links=[_old_link("n0", None)])
+    monkeypatch.setattr(store, "tv_links_set_lag",
+                        lambda *a: (_ for _ in ()).throw(store.PartialWriteError(200, RuntimeError("timeout"))))
+    out = core.tv_sync(c, TV)["edit_diffs"]
+    assert out["lag_filled"] == 200 and "写了 200 行之后失败" in out["lag_error"]
