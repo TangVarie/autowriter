@@ -1145,4 +1145,4 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
    ⚠️ **按 `owner_id` 隔离之后这条张力换了形态**（见 §2.2.1）。原来的设想是"两个人打开同一个项目"，而现在一个项目只有一个 owner，跨人协作要么共用一个 `user_id`（那样个人层就退化没了），要么等真正的团队模型。真要做团队共享时，改的是 `core.assert_project_access` 一处——但那是个产品决策，不是顺手改。
 7. **native 正例的 essence 不可测。** 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，拿不到 `emotional_lever`，所以 TV 的饱和度监控对它们只能报"无法评估"。想让它可测需要给这些正例补 essence 标注。
 
-**10-21 审查补充。** `set_rule_state` 把项目规则升成生效或修改生效规则的方向后，立即触发后台补编并绕过冷却。排队的判定任务在开始请求时重算整次剩余时间，截止后不再发送。缓存中形状不对、题号重复或缺少题目列表的规则列入 `rules.questions_unchecked` / `rules.questions_unchecked_rules`；幸存题目即使都通过，也不能声称整条规则守住。`doctor` 对规则缓存表的权限缺失指向迁移 015。CI 在安装全部接口依赖后重跑整个测试目录。
+**10-21 审查补充。** `set_rule_state` 把项目规则升成生效、恢复停用规则或修改生效规则的方向后，立即触发后台补编并绕过冷却。排队的判定任务在开始请求时重算整次剩余时间，截止后不再发送。缓存中形状不对、题号重复或缺少题目列表的规则列入 `rules.questions_unchecked` / `rules.questions_unchecked_rules`；幸存题目即使都通过，也不能声称整条规则守住。`doctor` 对规则缓存表的权限缺失指向迁移 015。CI 在安装全部接口依赖后重跑整个测试目录。

@@ -494,11 +494,14 @@ def test_open_project_and_record_rule_trigger_without_waiting(blocking_compile, 
 
 
 @pytest.mark.parametrize("action,direction,status", [("promote", "", "candidate"),
-                                                     ("set_direction", "流量向", "confirmed")])
+                                                     ("set_direction", "流量向", "confirmed"),
+                                                     ("unmute", "", "confirmed")])
 def test_activating_or_retargeting_a_rule_starts_compiling_immediately(monkeypatch, action, direction, status):
     kicks = []
     monkeypatch.setattr(core, "_kick_rule_compile", lambda client, pid, **kw: kicks.append((pid, kw)))
     rule = mem(19, status=status)
+    if action == "unmute":
+        rule["muted_until"] = "2999-01-01T00:00:00+00:00"
     client = make_client([rule])
     core.set_rule_state(client, rule["id"], action, direction=direction, user_id=ME)
     assert kicks == [(PROJ, {"reason": "set_rule_state", "bypass_cooldown": True})]

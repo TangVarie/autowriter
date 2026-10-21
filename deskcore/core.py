@@ -4818,7 +4818,7 @@ def set_rule_state(client, memory_id: str, action: str, *,
     saved = store.update_memory_fields(client, memory_id, fields)
     if (saved and (row.get("scope") or "") == "project"
             and (saved.get("status") or "").lower() == "confirmed"
-            and (action == "promote" or (action == "set_direction"
+            and (action in ("promote", "unmute") or (action == "set_direction"
                  and (saved.get("applicability") or "").strip() != (row.get("applicability") or "").strip()))):
         _kick_rule_compile(client, row["project_id"], reason="set_rule_state", bypass_cooldown=True)
     return {
