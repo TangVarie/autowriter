@@ -910,7 +910,7 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       · {"kind": "required_phrase", "any": ["话术1", "话术2"], "where": ["body"]}         —— 至少出现一个
       · {"kind": "max_len", "max": 300, "min": 150, "where": "body"}                       —— 字数范围(不算空白和话题),
         max / min 至少给一个, where 只认 title / body
-      · {"kind": "forbidden_regex", "pattern": "...", "where": [...]}                       —— 固定写法(会做安全检查)
+      · {"kind": "forbidden_regex", "pattern": "...", "where": [...]}                       —— 固定写法(正则最长 300 字, 会做安全检查)
       · {"kind": "free_text"}                                                               —— 撤掉这条的代码检查(存档时、
         check_rules 里编出来的都不跑; check_rules 的规则题照判。Jev 只把它编成了代码检查、没有规则题的, 撤掉之后就没有
         东西查它了, check_rules 数在 rules.code_withdrawn, 不说它守住了)

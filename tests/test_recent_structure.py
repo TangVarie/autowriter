@@ -3,7 +3,7 @@
 10-20 生产诊断: 稿子批批长得像。Jev 给每篇打分时答过 TV 的特征题库, 答案在 truth_vault.note_feature_answers
 (subject_type = aw_version, subject_id = versions.id)。open_project 读回本项目最近 ≤30 篇的答案, 数一数,
 占比 ≥ 0.6 的几处摆给模型, 让这一批有一半换个写法。钉住:
-  · 读法: 三步往返(答案那一步按主键排序翻页); 只取答案列, 不取 evidence / 正文; 只认 primary × fq-v0.1 × jev:*、题目版本对得上的有效答案;
+  · 读法: 版本联表核项目和补录(按版本时间取候选)、答案按主键排序翻页; 只取答案列, 不取 evidence / 正文; 只认 primary × fq-v0.1 × jev:*、题目版本对得上的有效答案;
     一个 item 算一篇(取最新的、有答案的那一版); 补录副本、别的项目、窗口外的版本都不算(窗口按版本时间, 不按批次);
     答案那次的版本 id 按篇摊, 改得多的一篇不挤掉别的稿子; 没判出答案的稿子不占名额(凑不够往下再问一轮, 最多三轮;
     补问那几轮失败不丢第一轮找到的)
@@ -71,7 +71,8 @@ class _World:
             at = _ago(days=at) if isinstance(at, (int, float)) else at
             vrows.append({"id": vid, "created_at": at, "title": "(标题不该被取)", "body": "(正文不该被取)"})
             # versions 表里的同一行: PostgREST 的 items!inner(batch_id) 内嵌在假件里就是这一小块
-            self.versions.append({**vrows[-1], "item_id": iid, "items": {"batch_id": bid}})
+            parent = next(b for b in self.batches if b["id"] == bid)
+            self.versions.append({**vrows[-1], "item_id": iid, "items": {"batch_id": bid, "batches": parent}})
             for qid, a in (ans or {}).items():
                 self.answer(vid, qid, a, extractor=extractor, run_tag=run_tag, bank=bank)
         self.items.append({"id": iid, "batch_id": bid, "created_at": _ago(days=days), "versions": vrows})
@@ -113,13 +114,16 @@ def _many(w, n, **override):
 # 读法
 # ══════════════════════════════════════════════════════════════════════
 
-def test_reads_by_id_in_three_steps_and_never_touches_text():
+def test_reads_by_version_time_and_never_touches_text():
     w = _World()
     _many(w, 3)
     c = w.client()
     got = _read(c)
     assert got == [_neutral(0), _neutral(1), _neutral(2)]
-    assert [q["table"] for q in c.calls] == ["batches", "versions", NFA, NFA], "三步; 答案翻页: 一页加一次空页"
+    assert [q["table"] for q in c.calls] == ["versions", "versions", NFA, NFA], "版本和答案各一页加一次空页"
+    versions = c.calls[0]
+    assert ("eq", "items.batches.project_id", PID) in versions["filters"]
+    assert any(f[:2] == ("gte", "created_at") for f in versions["filters"])
     nfa = next(q for q in c.calls if q["table"] == NFA)
     assert "evidence" not in nfa["cols"] and "body" not in nfa["cols"], "账本只取答案列, 不取原文片段"
     assert ("eq", "subject_type", "aw_version") in nfa["filters"]
@@ -311,21 +315,29 @@ def test_a_failed_extra_round_keeps_what_the_first_round_found(caplog):
         _read(flaky)
 
 
-def test_a_draft_revised_today_in_an_old_batch_counts():
+@pytest.mark.parametrize("old", [store.STRUCTURE_BATCH_DAYS + 10, store.STRUCTURE_BATCH_DAYS * 4 + 1, 1000])
+def test_a_draft_revised_today_in_an_old_batch_counts(old):
     """窗口按版本自己的时间切, 不按批次建的时间(codex review on aw#115, 同 recent_drafted_titles 那条): 改稿是往老 item 上
     加一版, 批次还是原来那个。按批次切的话, 今天改的一篇老稿就不算了。"""
     w = _World()
-    old = store.STRUCTURE_BATCH_DAYS + 10
     w.draft(versions={"v1": (_neutral(0, opening_type="提问"), old), "v2": (_neutral(0, opening_type="具体事件"), 0.1)},
             days=old)
     w.draft(versions={"v1": (_neutral(0, opening_type="数据事实"), old)}, days=old)      # 没改过的老稿照旧不算
     assert _read(w.client()) == [_neutral(0, opening_type="具体事件")]
 
 
+def test_recent_revision_is_not_lost_behind_many_newer_batches():
+    w = _World()
+    w.draft(versions={"v2": (_neutral(0, opening_type="具体事件"), 0.1)}, days=1000)
+    for i in range(store.RECENT_BATCHES_MAX + 1):
+        w.draft(None, days=1 + i / 1000)
+    assert _read(w.client()) == [_neutral(0, opening_type="具体事件")]
+
+
 def test_no_batches_means_no_ledger_read():
     c = _World().client()
     assert _read(c) == []
-    assert [q["table"] for q in c.calls] == ["batches"]
+    assert [q["table"] for q in c.calls] == ["versions"]
 
 
 # ══════════════════════════════════════════════════════════════════════

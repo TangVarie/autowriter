@@ -270,6 +270,23 @@ def split_tags(raw) -> list[str]:
     return out
 
 
+def tag_problems(raw) -> list[str]:
+    """认不出的 tags 外壳或列表成员要报给写手; split_tags 的容错不能把丢掉的话题说成正常。"""
+    if isinstance(raw, str) and raw.strip().startswith("["):
+        try:
+            got = json.loads(raw)
+        except (ValueError, RecursionError):
+            got = None
+        if isinstance(got, list):
+            return tag_problems(got)
+    if raw is None or isinstance(raw, str):
+        return []
+    if not isinstance(raw, (list, tuple)):
+        return [f"tags 应该是字符串或字符串列表, 现在是 {type(raw).__name__}, 这篇的 tags 没拼进去"]
+    return [f"tags 第 {k + 1} 项应该是字符串, 现在是 {type(tag).__name__}, 这一项没拼进去"
+            for k, tag in enumerate(raw) if not isinstance(tag, str)]
+
+
 def lift_trailing_tags(body: str) -> tuple[str, list[str]]:
     """正文末尾的话题摘出来。10-20 查生产库: 写手的稿子约六分之一末尾带一行 #话题; 模板也拼一行的话交付稿里就是两行。
 
@@ -387,7 +404,7 @@ def delivered_draft(template: dict, draft: dict) -> tuple[dict, list[str]]:
         tags = _dedupe(body_tags(body))
     else:
         body, tags = post
-    return {**d, "body": body, "tags": tags,
+    return {**d, "title": str(d.get("title") or "").strip(), "body": body, "tags": tags,
             "comments": d.get("comments") if tpl["comments"] is not None else None}, tags
 
 
@@ -471,6 +488,7 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
         d = d if isinstance(d, dict) else {}
         title = str(d.get("title") or "").strip()
         body = str(d.get("body") or "").replace("\r\n", "\n").strip()
+        problems += [{"index": i, "what": w} for w in tag_problems(d.get("tags"))]
         for label, text in (("标题", title), ("正文", body)):
             hit = [m for m in markers.values() if m in text]
             if hit:

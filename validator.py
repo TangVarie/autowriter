@@ -63,7 +63,7 @@ from typing import Optional
 #
 # 两层(codex review on aw#115 第四轮之后改成这样):
 #   1. **写入时拒绝危险形状**(下面这道静态闸)。它是**尽力而为的过滤**, 不是判定: 四轮 review 每轮都找到新的漏网形状。
-#      闸的放行 / 拒绝不再改 —— Jev 的 /compile_rules 一字不差地镜像它, 改了两边就对不上。
+#      形状判据和 Jev /compile_rules 镜像; 源码最长 300 字也和 Jev 一致, 在解析、编译之前先拒绝过长输入。
 #   2. **执行期限时**(``search_user_regex``, 见 MAX_REGEX_TARGET_CHARS 后面那一节): 用第三方 ``regex`` 包的 search(timeout=…)。
 #      漏过闸的正则最多花一份时限(config.REGEX_SEARCH_TIMEOUT_SEC), 报成"这次没查", 不算命中、也不算守住了。
 
@@ -481,6 +481,9 @@ class UnsafeRegex(ValueError):
     """这条正则会引发灾难性回溯, 不许存、也不许跑。"""
 
 
+MAX_REGEX_PATTERN_CHARS = 300    # 同 Jev /compile_rules; 解析、编译之前先限长, 不让预处理绕过执行时限
+
+
 def assert_regex_is_safe(pattern: str) -> None:
     """能编译 **且** 不是灾难性回溯形状, 否则抛。
 
@@ -491,6 +494,8 @@ def assert_regex_is_safe(pattern: str) -> None:
     """
     if not isinstance(pattern, str) or not pattern:
         raise UnsafeRegex("正则为空")
+    if len(pattern) > MAX_REGEX_PATTERN_CHARS:
+        raise UnsafeRegex(f"正则超过 {MAX_REGEX_PATTERN_CHARS} 字: 拆成几条短规则")
     try:
         re.compile(pattern)
     except re.error as exc:
@@ -1186,10 +1191,13 @@ _XHS_BODY = r"[^\s#\[\]]"
 HASHTAG = re.compile(rf"#(?:{_XHS_BODY}+\[话题\](?:#(?!{_XHS_BODY}+\[话题\]))?|{_TAG_CHAR}+)")
 # 整行话题里, 话题之间、末尾可以夹的东西: 空白和上面那些标点(「#秋招、#求职、#offer」「#秋招 #求职。」)。delivery 摘末尾话题用
 TAG_GAP = re.compile(rf"[\s{TAG_STOP}]*")
-# 网址: # 前面紧挨着、一直是网址字符(不带空白的 ASCII)的那一段带 ://、带 www.、或者 域名/。只往前看到最近的空白不够: 中文
+# 网址: # 前面紧挨着、一直是网址字符的那一段带 ://、带 www.、或者 域名/。中文域名和路径也是网址字符。只往前看到最近的空白不够: 中文
 # 句子里没有空白, 句子前面随便有个网址、甚至 Node.js/ 这种技术栈写法, 后面的话题就都不算了("学了Node.js/Express，面试稳了！#秋招")。
 _URL_HINT = re.compile(r"://|www\.|[A-Za-z0-9-]\.[A-Za-z]{2,}(?::\d+)?/", re.I)
-_URL_CHARS = "".join(chr(c) for c in range(0x21, 0x7F))
+# Unicode 句读隔开网址和后面的中文正文; ASCII 标点留给 URL(查询串、括号、冒号等都可能在里面)。
+_URL_BREAK = re.compile(r"[\s\x00-\x20\x7f\u3000-\u3004\u3008-\u3020\u3030\u3036\u3037\u303d-\u303f"
+                        r"\uff01-\uff05\uff07-\uff0a\uff0c\uff1a-\uff20\uff3b-\uff3e\uff40\uff5b-\uff65"
+                        r"\u2010\u2012-\u205e\u22ef]+")
 
 
 def _hashes_in_urls(text: str) -> dict[int, bool]:
@@ -1200,7 +1208,7 @@ def _hashes_in_urls(text: str) -> dict[int, bool]:
     at = text.find("#")
     while at >= 0:
         seg = text[prev + 1:at]
-        tail = seg[len(seg.rstrip(_URL_CHARS)):]
+        tail = _URL_BREAK.split(seg)[-1]
         if prev >= 0 and len(tail) == len(seg):        # 中间一直是网址字符: 和前一个 # 是同一段
             hint = hint or _URL_HINT.search(seg) is not None
         else:

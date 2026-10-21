@@ -38,6 +38,40 @@ TABLE = {"layout": "table",
 BLOCKS = {"layout": "blocks", "tags": {"content": 1}}
 
 
+@pytest.mark.parametrize("tpl", [BLOCKS, {"layout": "blocks"}])
+@pytest.mark.parametrize("title", ["  广告  ", "\t广告\n", 123])
+def test_delivered_title_and_rule_checked_title_are_identical(tpl, title):
+    draft = {"title": title, "body": "正文", "tags": ["话题"]}
+    checked, tags = delivery.delivered_draft(tpl, draft)
+    normal = str(title).strip()
+    assert checked["title"] == normal
+    assert f"【标题】{normal}\n" in delivery.assemble(tpl, [draft])["text"]
+    rules = [{"id": "title", "severity": "hard", "rule_kind": "forbidden_regex",
+              "rule_payload": {"pattern": "^" + normal + "$", "where": ["title"]}}]
+    hits, stats = rulecheck.check(rules, [checked], tags=[tags])
+    assert len(hits) == 1 and hits[0]["where"] == "title" and not stats.get("skipped")
+
+
+@pytest.mark.parametrize("url", ["https://example.com/路径#faq", "https://例子.com/#faq",
+                                 "https://例子.公司/说明#常见问题", "www.example.com/路径#faq"])
+def test_unicode_url_fragments_survive_delivery_and_tag_checks(url):
+    body = "详情见" + url
+    assert delivery.lift_trailing_tags(body) == (body, [])
+    assert delivery.body_tags(body) == []
+    assert validator.count_chars(body) == len(body)
+    assert delivery.lift_trailing_tags(body + " #秋招") == (body, ["秋招"])
+    out = delivery.assemble(BLOCKS, [{"title": "甲", "body": body, "tags": ["话题"]}])
+    assert out["text"] == f"【标题】甲\n【正文】{body}\n#话题"
+    assert out["problems"] == []
+
+
+@pytest.mark.parametrize("tags", [{"content": "话题"}, {}, 123, False, {"话题"}, ["话题", 123], '["话题", 123]'])
+@pytest.mark.parametrize("tpl", [{"layout": "blocks"}, {"layout": "blocks", "tags": {"fixed": ["固定话题"]}}])
+def test_bad_tag_shapes_are_reported_even_without_a_content_tag_quota(tags, tpl):
+    out = delivery.assemble(tpl, [{"title": "甲", "body": "正文", "tags": tags}], indices=[7])
+    assert any(p["index"] == 7 and "tags" in p["what"] for p in out["problems"])
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 拼
 # ══════════════════════════════════════════════════════════════════════
@@ -376,9 +410,12 @@ def test_tags_sent_as_a_json_string_are_unpacked():
     照常再切(# 和 [话题] 照摘)。"""
     tpl = {"layout": "blocks", "tags": {"content": 2}}
     for raw in (json.dumps(["话题甲", "话题乙"], ensure_ascii=False), json.dumps(["#话题甲", "话题乙[话题]#"]),
-                [" " + json.dumps(["话题甲", "#话题乙"], ensure_ascii=False)], json.dumps(["#话题甲 #话题乙", 3])):
+                [" " + json.dumps(["话题甲", "#话题乙"], ensure_ascii=False)]):
         out = delivery.assemble(tpl, [{"title": "甲", "body": "正文", "tags": raw}])
         assert out == {"format": "blocks", "text": "【标题】甲\n【正文】正文\n#话题甲 #话题乙", "problems": []}, raw
+    mixed = delivery.assemble(tpl, [{"title": "甲", "body": "正文", "tags": json.dumps(["#话题甲 #话题乙", 3])}])
+    assert mixed["text"] == "【标题】甲\n【正文】正文\n#话题甲 #话题乙"
+    assert len(mixed["problems"]) == 1 and "tags 第 2 项" in mixed["problems"][0]["what"]
     assert delivery.delivered_post(tpl, {"title": "甲", "body": "正文", "tags": json.dumps(["话题甲"])}) == ("正文", ["话题甲"])
     assert delivery.split_tags("#话题甲 [话题]") == ["话题甲"], "不是 JSON 的照旧按空白切"
 
