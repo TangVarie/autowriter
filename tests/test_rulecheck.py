@@ -282,7 +282,7 @@ def test_rules_check_exactly_the_comments_that_are_delivered(comments):
 def test_tags_as_a_json_string_are_checked_as_delivered():
     """tags 是整个列表 json.dumps 出来的一串(codex review on aw#115): 交付稿拆开拼, 查话题的规则也拆开查, 不会看见 [ " , 。"""
     tags = json.dumps(["话题甲", "话题乙"], ensure_ascii=False)
-    assert rulecheck._parts({"tags": tags})["tags"] == ["话题甲 话题乙"]
+    assert rulecheck._parts({"tags": tags})["tags"] == ["话题甲 话题乙", "话题甲", "话题乙"]     # 整行 + 每个话题
     punct = _rule(1, "forbidden_regex", {"pattern": "[\\[\\]\",]", "where": ["tags"]})
     assert rulecheck.check([punct], [{"title": "t", "body": "b", "tags": tags}])[0] == []
 
@@ -334,6 +334,25 @@ def test_ascii_words_match_on_word_boundaries():
     rules = [_rule(1, "forbidden_word", {"words": ["ad"]})]
     assert rulecheck.check(rules, [{"title": "made in", "body": "reading"}])[0] == []
     assert len(rulecheck.check(rules, [{"title": "an AD here", "body": ""}])[0]) == 1
+
+
+@pytest.mark.parametrize("tags, hit", [
+    (["广告"], True), (["其他", "广告"], True), (["广告", "其他"], True), (["其他", "广告词"], False), ([], False),
+])
+def test_an_anchored_tag_regex_is_checked_against_each_tag(tags, hit):
+    """codex review on aw#115 第十一轮: 只查空格拼起来的整行的话, ^广告$ 多带一个别的话题就漏了。"""
+    rule = _rule(1, "forbidden_regex", {"pattern": "^广告$", "where": ["tags"]})
+    got = rulecheck.check([rule], [{"title": "t", "body": "b", "tags": tags}])[0]
+    assert [h["rule_id"] for h in got] == (["m-1"] if hit else [])
+
+
+@pytest.mark.parametrize("n, hit", [(5, False), (6, True)])
+def test_a_tag_count_regex_still_sees_the_whole_tag_line(n, hit):
+    """Jev 的 /compile_rules 教的「最多 5 个话题」写法(空格隔开的整行上数 \\S+); 单个话题各算一项之后照样只在整行上配得上。"""
+    rule = _rule(1, "forbidden_regex", {"pattern": "^\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S", "where": ["tags"]})
+    tags = [f"话题{i}" for i in range(n)]
+    got = rulecheck.check([rule], [{"title": "t", "body": "b", "tags": tags}])[0]
+    assert [h["rule_id"] for h in got] == (["m-1"] if hit else [])
 
 
 def test_required_phrase_hits_only_when_none_is_present():
@@ -620,7 +639,7 @@ def test_a_required_phrase_naming_another_project_is_refused():
 def test_a_tag_both_passed_and_in_the_body_counts_once():
     """写手传的 tags 和正文末尾的 #话题 是同一批时只算一次: 按个数数的检查不能把同一个话题数两遍。"""
     parts = rulecheck._parts({"title": "t", "body": "正文一段。\n#话题一 #话题二", "tags": ["话题一", "#话题二", "话题三"]})
-    assert parts["tags"] == ["话题一 话题二 话题三"]
+    assert parts["tags"] == ["话题一 话题二 话题三", "话题一", "话题二", "话题三"]     # 整行 + 每个话题, 都不重复
 
 
 # ══════════════════════════════════════════════════════════════════════

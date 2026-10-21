@@ -252,6 +252,10 @@ _count = validator.count_chars
 def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
     """一篇稿 → 各部位的文本。tags 是写手传的 tags 加正文里的 #话题; comments 一条一项。
 
+    话题这一部位: 先是空格隔开的整行(「话题不超过 N 个」这种按个数数的正则写在它上面, Jev 的 /compile_rules 也这么教),
+    两个以上时每个话题再各算一项(codex review on aw#115 第十一轮: 只查整行的话 ^广告$ 这种锚定的写法只在话题只有一个时才
+    命中, 多带一个别的话题硬规则就漏了)。单个话题里没有空白, 数个数的正则在单项上配不上, 不会多报。
+
     ``tags`` 给了就用它(项目有交付模板时, core 传交付出去的那一份: 管话题的含模板加的固定 / 条件话题, 不管话题的只有正文里的
     #话题; 那时 ``d`` 也是交付出去的那份稿子, 见 delivery.delivered_draft)。"""
     body = str(d.get("body") or "")
@@ -263,8 +267,8 @@ def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
         tags = [t for t in raw if not (delivery.norm_tag(t) in seen or seen.add(delivery.norm_tag(t)))]
     # 评论和交付稿是同一份(delivery.comment_list): 一条字符串 / 一条 dict / 一串 JSON 都认, text 不是字符串的两边都不算
     comments = [c["text"] for c in delivery.comment_list(d.get("comments"))[0]]
-    return {"title": [str(d.get("title") or "")], "body": [body], "tags": [" ".join(tags)] if tags else [],
-            "comments": comments}
+    return {"title": [str(d.get("title") or "")], "body": [body],
+            "tags": [" ".join(tags), *tags] if len(tags) > 1 else list(tags), "comments": comments}
 
 
 def _run(spec: dict, parts: dict[str, list[str]], *, expects=(),

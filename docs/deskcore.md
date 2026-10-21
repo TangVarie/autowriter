@@ -661,7 +661,7 @@ forbidden_word / required_phrase / max_len / forbidden_regex / free_text），�
 | `required_phrase` | `{"any": [...], "where": [...]}` | 列出的部位合起来一个都没有。那些部位全空时：标题 / 正文空着照没带报（codex review on aw#115：不然「正文里必须带 X」靠交一篇空正文就混过去了）；交付模板要求每篇都带的部位（评论 `min ≥ 1`；要写手给话题或有固定话题，`delivery.expected_parts`）空着就是没交，照没带报（codex review on aw#115：不然「评论里必须带 X」靠一条评论都不交就混过去了）；没模板、或者模板不要求的部位不查（评论常常是后面另走评论那一步写的）。AW 生成链路只看得到标题正文，只管评论 / 话题的这种它一律跳过 |
 | `max_len` | `{"max": N, "min": M, "where": "body" \| "title"}` | 去掉空白和 #话题 之后的字数越界（网址里的 `#片段`、`C#` 这种不是话题，照样算字）；max / min 至少一个 |
 
-`where` 可选 `title` / `body` / `tags` / `comments`，默认 `["title", "body"]`。`validator.py` 的老形状（`{"target"}` /
+`where` 可选 `title` / `body` / `tags` / `comments`，默认 `["title", "body"]`。`tags` 查两样：空格隔开的整行（「话题不超过 N 个」这种按个数数的正则写在它上面），两个以上时每个话题再单独查一遍（`^广告$` 这种锚定的写法按单个话题认；codex review on aw#115 第十一轮）；`comments` 一条一项。`validator.py` 的老形状（`{"target"}` /
 `{"scope", "n"}`）读的时候照认；AW 生成链路读老形状的 `{"target"}` 也照这里的口径（标题正文分开、不分大小写、词边界；codex review on aw#115 第五轮，原来在「标题\n正文」里分大小写找子串，两边结论相反），只剩超过 40 字的词这里不收、那边照查。反过来 AW 生成链路（`validator.check_hard_rules`）也读这两列：标题正文照这里的口径查（查词、数字数共用
 `validator.contains_term` / `count_chars`，正则逐个部位搜），只管话题 / 评论的、check 坏了的跳过，**不退回**从规则原文里抽词
 （codex review on aw#115：「评论不要出现「私信」」会被抽成标题正文的禁用词）。
