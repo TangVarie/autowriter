@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 
 import validator
 
@@ -310,6 +311,15 @@ def _run(spec: dict, parts: dict[str, list[str]], *, expects=(),
     return out
 
 
+def _regex_total() -> float:
+    """一次 check 里所有正则规则加起来的总上限(秒), config.REGEX_CHECK_TOTAL_SEC。config 读不了就用 2.5。"""
+    try:
+        import config
+        return float(config.REGEX_CHECK_TOTAL_SEC)
+    except Exception:                                # noqa: BLE001 — 增强项的配置坏了退回默认, 不拖垮查规则
+        return 2.5
+
+
 def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = None,
           tags: list[list[str] | None] | None = None, expects=()) -> tuple[list[dict], dict]:
     """(命中, 统计)。命中按篇、再按 hard 在前排好; 统计 = {"rules": 能查的条数, "skipped": check 坏了跳过的条数}, 有正则规则这次
@@ -323,8 +333,9 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
     ``expects`` 是交付模板要求每篇都带的部位(delivery.expected_parts), 必须带的话术查到这些部位空着时照没带报。
 
     正则规则限时(validator.search_user_regex): 每条在这次 check 里共用一份 config.REGEX_SEARCH_TIMEOUT_SEC, 用完了这条后面的
-    稿子不再搜、报进 timed_out —— 不算命中, 调用方也不能把它说成守住了(限时的引擎跑不了的正则也报在这里)。所以一次 check
-    最多多花约 (正则规则条数) × 那一份(到点后多拖的那一点和第一次的编译见 config.REGEX_SEARCH_TIMEOUT_SEC)。
+    稿子不再搜、报进 timed_out —— 不算命中, 调用方也不能把它说成守住了(限时的引擎跑不了的正则也报在这里)。所有正则规则加起来
+    另有一个总上限 config.REGEX_CHECK_TOTAL_SEC(codex review on aw#115: 不封顶的话是 (条数) × 那一份): 到点之后还没查完的
+    正则规则从那一篇起同样报进 timed_out。到点后多拖的那一点和第一次的编译见 config.REGEX_SEARCH_TIMEOUT_SEC。
     """
     specs, skipped = [], []
     for r in rules or []:
@@ -333,22 +344,32 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
             specs.append((r, spec))
         elif (r.get("rule_kind") or "") in CHECK_KINDS:
             skipped.append(r.get("id"))
-    budgets = {k: validator.RegexBudget() for k, (_r, spec) in enumerate(specs) if spec["kind"] == "forbidden_regex"}
     hits: list[dict] = []
     stopped: dict[int, int] = {}            # 第几条规则 → 从哪一篇(index)起没查完
     idx = list(indices) if indices is not None else list(range(len(drafts)))
-    for pos, d in enumerate(drafts):
-        parts = _parts(d if isinstance(d, dict) else {}, tags[pos] if tags is not None else None)
-        for k, (r, spec) in enumerate(specs):
-            budget = budgets.get(k)
-            if budget is not None and budget.timed_out:
-                continue                    # 这条这次已经没查完了, 后面的稿子不再搜: 一条慢正则一次 check 只花一份时限
-            sev = "hard" if (r.get("severity") or "soft").lower() == "hard" else "soft"
+    parts_of = [_parts(d if isinstance(d, dict) else {}, tags[pos] if tags is not None else None)
+                for pos, d in enumerate(drafts)]
+    # 一条规则查完所有稿子再轮下一条, 硬约束在前; 正则规则每条一份时限 = 它自己那一份和「整次剩下的 ÷ 还没轮到的正则条数」取小,
+    # 快的用不完的留给后面的(独立复审 on aw#115 第八轮)。按篇轮的话, 第一篇上几条慢的建议规则就把总上限用光, 后面每一篇上
+    # 一毫秒就查完的硬规则都报没查 —— 实测 20 篇里 19 处真违规从「必须改」变成了「自己核」。
+    order = sorted(range(len(specs)), key=lambda k: (specs[k][0].get("severity") or "soft").lower() != "hard")
+    rx_left = sum(1 for _r, spec in specs if spec["kind"] == "forbidden_regex")
+    deadline = time.monotonic() + _regex_total()
+    for k in order:
+        r, spec = specs[k]
+        sev = "hard" if (r.get("severity") or "soft").lower() == "hard" else "soft"
+        budget = None
+        if spec["kind"] == "forbidden_regex":
+            budget = validator.RegexBudget(min(validator.regex_search_timeout(), (deadline - time.monotonic()) / rx_left))
+            rx_left -= 1
+        for pos, parts in enumerate(parts_of):
+            # 时限用完与否只由 search_user_regex 判(真要搜的时候才判): 这一篇这条没东西可搜(只管评论、这篇没评论)就不算没查
             for where, what in _run(spec, parts, expects=expects, budget=budget):
                 hits.append({"index": idx[pos], "rule_id": r.get("id"), "severity": sev,
                              "where": where, "what": f"{SEVERITY_LABEL[sev]}: {what}"})
             if budget is not None and budget.timed_out:
                 stopped[k] = idx[pos]
+                break                       # 这条这次没查完, 后面的稿子不再搜
     hits.sort(key=lambda h: (h["index"], h["severity"] != "hard"))
     stats: dict = {"rules": len(specs), "skipped": len(skipped)}
     if skipped:

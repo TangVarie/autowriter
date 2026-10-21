@@ -650,6 +650,54 @@ def test_a_slow_regex_rule_is_reported_as_timed_out_not_as_a_hit(short_timeout):
     assert {h["rule_id"] for h in hits} == {"m-2", "m-3"} and len(hits) == 40, "别的规则照旧逐篇查"
 
 
+def test_all_regex_rules_together_stop_at_the_total_limit(short_timeout, monkeypatch):
+    """每条正则各一份时限、一条接一条跑: 慢正则一多就是 (条数) × 那一份, 没有封顶 —— 1 秒一份时 20 条就吃满 20 秒的回包目标
+    (codex review on aw#115)。整次另有总上限 REGEX_CHECK_TOTAL_SEC, 到点之后没查完的从那一篇起报没查, 别的规则照查。"""
+    import config
+    monkeypatch.setattr(config, "REGEX_CHECK_TOTAL_SEC", 0.3)
+    rules = [_rule(i, "forbidden_regex", {"pattern": SLOW}) for i in range(1, 31)]
+    rules.append(_rule(31, "forbidden_word", {"words": ["示例禁词"]}))
+    drafts = [{"title": "示例禁词", "body": "a" * 2000} for _ in range(3)]
+    t0 = time.perf_counter()
+    hits, stats = rulecheck.check(rules, drafts)
+    assert time.perf_counter() - t0 < 0.3 * 1.5 + 0.2, "30 条慢正则 × 0.1 秒一份是 3 秒, 总上限 0.3 秒"
+    assert stats["timed_out"] == [f"m-{i}" for i in range(1, 31)]
+    assert set(stats["timed_out_from"].values()) == {0}, "第一篇就到点了: 每条都从第一篇起没查"
+    assert [(h["index"], h["rule_id"]) for h in hits] == [(0, "m-31"), (1, "m-31"), (2, "m-31")], "查词的规则不受影响"
+
+
+def test_slow_soft_rules_do_not_starve_a_fast_hard_rule(monkeypatch):
+    """总上限是按篇花的话, 第一篇上三条慢的建议规则就把它用光, 后面每一篇上一毫秒就查完的硬规则都报没查 —— 20 处真违规只报出
+    1 处(独立复审 on aw#115 第八轮)。一条规则查完所有稿子再轮下一条、硬约束在前, 每条拿「剩下的 ÷ 还没轮到的条数」。"""
+    import config
+    monkeypatch.setattr(config, "REGEX_SEARCH_TIMEOUT_SEC", 0.2)
+    monkeypatch.setattr(config, "REGEX_CHECK_TOTAL_SEC", 0.5)
+    rules = [_rule(i, "forbidden_regex", {"pattern": SLOW + s}, severity="soft") for i, s in ((1, "！"), (2, "～"), (3, "。"))]
+    rules.append(_rule(4, "forbidden_regex", {"pattern": "加微信|vx\\d+"}))
+    drafts = [{"title": "示例标题", "body": "示例正文 加微信"} for _ in range(20)]
+    drafts[0]["body"] += "a" * 2000
+    t0 = time.perf_counter()
+    hits, stats = rulecheck.check(rules, drafts)
+    assert time.perf_counter() - t0 < 0.5 * 1.5 + 0.2
+    assert [h["index"] for h in hits if h["rule_id"] == "m-4"] == list(range(20)), "硬规则每一篇都查到了"
+    assert stats["timed_out"] == ["m-1", "m-2", "m-3"] and set(stats["timed_out_from"].values()) == {0}
+
+
+def test_a_rule_with_nothing_to_search_is_not_reported_unchecked_after_the_total_runs_out(monkeypatch):
+    """总上限用完之后, 一条只管评论的正则在没有评论的稿子上本来就没东西可搜, 不能报成「没查完」叫写手去核不存在的评论
+    (独立复审 on aw#115 第八轮)。"""
+    import config
+    monkeypatch.setattr(config, "REGEX_CHECK_TOTAL_SEC", 0)          # 一开始就用完了: 每条正则一搜就没查完
+    rules = [_rule(1, "forbidden_regex", {"pattern": "示例禁词"}),
+             _rule(2, "forbidden_regex", {"pattern": "加微信", "where": ["comments"]})]
+    drafts = [{"title": "示例标题", "body": "示例正文"} for _ in range(3)]
+    _hits, stats = rulecheck.check(rules, drafts)
+    assert stats["timed_out"] == ["m-1"] and stats["timed_out_from"] == {"m-1": 0}, "只管评论的那条没东西可搜, 不算没查"
+    drafts[2]["comments"] = [{"role": "reader", "text": "加微信"}]
+    _hits, stats = rulecheck.check(rules, drafts)
+    assert stats["timed_out_from"] == {"m-1": 0, "m-2": 2}, "有东西可搜的那一篇才算没查"
+
+
 def test_a_hit_found_before_the_time_ran_out_is_still_reported(short_timeout):
     """时限是在搜到之后才用完的: 搜到的那一处是真的, 照报; 这条同时报没查完(后面的稿子没搜)。"""
     rule = _rule(1, "forbidden_regex", {"pattern": "a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b|示例禁词", "where": ["title", "body"]})

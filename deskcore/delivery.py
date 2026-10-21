@@ -297,13 +297,24 @@ def lift_trailing_tags(body: str) -> tuple[str, list[str]]:
 
 def _trailing_tag_run(line: str) -> tuple[int, list[str]]:
     """这一行末尾那一串话题: (从哪儿起, 话题本体)。从行尾往回接 validator.topic_tag_matches 认下的话题, 两个之间只能隔空白;
-    隔着正文、网址里的 #片段、"C#入门" 就停。没有是 (-1, [])。"""
-    end, cut, run = len(line.rstrip()), -1, []
-    for m in reversed(validator.topic_tag_matches(line)):
-        if line[m.end():end].strip():
-            break
-        cut, end = m.start(), m.start()
-        run.append(m.group(0))
+    隔着正文、网址里的 #片段、"C#入门" 就停。没有是 (-1, [])。
+
+    整行都是话题的, 话题之间、末尾还可以夹标点(validator.TAG_GAP: 「#秋招、#求职、#offer」「#秋招 #求职。」), 标点跟着这一行
+    一起摘掉 —— 话题本体到句读为止之后, 这些标点不再算进话题, 只认空白的话这一行摘不下来, 交付稿里两行话题(独立复审 on aw#115
+    第八轮)。前面有正文的照旧只认空白: 「冲鸭！#秋招！」最后那个 ！ 可能是这句话的, 不摘、不丢字。"""
+    def scan(loose: bool) -> tuple[int, list[str]]:
+        end, cut, run = len(line.rstrip()), -1, []
+        for m in reversed(validator.topic_tag_matches(line)):
+            gap = line[m.end():end]
+            if gap.strip() and not (loose and validator.TAG_GAP.fullmatch(gap)):
+                break
+            cut, end = m.start(), m.start()
+            run.append(m.group(0))
+        return cut, run
+
+    cut, run = scan(True)
+    if run and (line[:cut].strip() or not validator.TAG_GAP.fullmatch(line[:cut])):
+        cut, run = scan(False)              # 前面还有正文: 只认空白隔开的
     return cut, split_tags(" ".join(reversed(run)))
 
 
@@ -416,7 +427,13 @@ def comment_list(raw) -> tuple[list[dict], list[str]]:
 
 
 def _cell(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("|", "\\|").replace("\n", "<br>")
+    # 竖线前面原本就有的反斜杠先加倍再转义竖线(codex review on aw#115): 照抄的话 A\|B 变成 A\\|B, 表格里两个反斜杠是一个
+    # 字面的反斜杠, 竖线就成了分隔符, 这一行多出一格。加倍之后是 A\\\|B: 反斜杠和竖线都原样显示, 不拆格
+    # 只从一串反斜杠的开头起匹配(?<!\\): 不然一长串反斜杠每个起点各扫一遍, 平方级。单独的 \r 也是换行(独立复审 on aw#115
+    # 第八轮: 不换成 <br> 的话表格那一行在 GFM / markdown-it 里被拆成两行)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(?<!\\)(\\*)\|", lambda m: m.group(1) * 2 + "\\|", text)
+    return text.replace("\n", "<br>")
 
 
 def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = None) -> dict:
