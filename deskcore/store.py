@@ -2602,7 +2602,7 @@ def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[
     同一篇同一题有好几行(Jev 换过模型版本)时取最后抽的那一行。
 
     窗口按【版本自己的时间】切, 不按批次建的时间(codex review on aw#115, 同 recent_drafted_titles 那条): 改稿是往老
-    item 上加一版, 批次还是原来那个。所以批次往前多看几倍天数(只为认出补录副本), 版本按时间取。
+    item 上加一版, 批次还是原来那个。直接按版本时间取候选, 联表只核项目归属和认补录副本, 不按批次年龄或数量筛。
     答案那一次 .in_() 的版本 id 按 item 摊(codex review on aw#115): 先给每篇最新的一版, 有空再给每篇次新的一版……
     原来是在整批版本上按时间截 80 个再一篇一票, 改过几轮的一篇占好几个名额 —— 30 篇各三版只剩 27 篇, 一篇改了几十轮的
     能把窗口压到 12 篇以下。
@@ -2614,19 +2614,16 @@ def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[
         return []
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=days)
-    batches = (sb.table("batches").select("id, params, created_at")
-               .eq("project_id", project_id).gte("created_at", (now - timedelta(days=days * 4)).isoformat())
-               .order("created_at", desc=True).order("id", desc=True)
-               .limit(RECENT_BATCHES_MAX).execute()).data or []
-    bids = [b["id"] for b in batches if b.get("id") and not is_ingest_batch(b)][:100]
-    if not bids:
-        return []
-    versions = (sb.table("versions").select("id, item_id, created_at, items!inner(batch_id)")
-                .in_("items.batch_id", bids).gte("created_at", since.isoformat())
-                .order("created_at", desc=True).order("id", desc=True)
-                .limit(STRUCTURE_VERSION_ROWS_MAX).execute()).data or []
+    versions = _paged(lambda off, lim: (
+        sb.table("versions").select("id, item_id, created_at, items!inner(batches!inner(project_id, params))")
+        .eq("items.batches.project_id", project_id).gte("created_at", since.isoformat())
+        .or_("params->>source.is.null,params->>source.neq.ingest", reference_table="items.batches")
+        .order("created_at", desc=True).order("id", desc=True).range(off, off + lim - 1)),
+        hard_cap=STRUCTURE_VERSION_ROWS_MAX)
     by_item: dict[str, list[tuple[datetime, str, str]]] = {}     # item id → [(版本时间, item id, 版本 id)]
     for v in versions:
+        if is_ingest_batch((v.get("items") or {}).get("batches")):   # 老行的 params 还可能是 JSON 字符串
+            continue
         t = _ts(v.get("created_at"))
         if v.get("id") and v.get("item_id") and t is not None and t >= since:
             by_item.setdefault(str(v["item_id"]), []).append((t, str(v["item_id"]), str(v["id"])))

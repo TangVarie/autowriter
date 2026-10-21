@@ -582,9 +582,9 @@ def test_compiling_a_long_boundary_pattern_costs_at_most_about_one_time_limit(sh
 
 
 def test_a_pattern_too_long_to_compile_in_time_is_reported_unchecked(short_timeout):
-    """换出来超过 MAX_TRANSLATED_CHARS 的不编译(编一次就是零点几秒到几秒), 报这次没查; 这个结论记住, 下次不再换。"""
+    """写入闸已经拒绝长源码; 绕过闸直调底层时, 换出来超过 MAX_TRANSLATED_CHARS 的仍不编译, 报没查。"""
     pattern = "\\b" * 1000 + "x"
-    assert V.regex_is_safe(pattern), "前提: 闸放行它(闸不改)"
+    assert not V.regex_is_safe(pattern), "写入闸先拒绝超过 300 字的源码"
     V._compiled.cache_clear()
     for _ in range(2):
         budget = V.RegexBudget()
@@ -809,3 +809,34 @@ def test_falls_back_to_re_when_regex_is_not_installed(monkeypatch):
         assert V.search_user_regex("示例\\w", "这是示例A").group(0) == "示例A"
     finally:
         V._compiled.cache_clear()
+def test_oversized_regex_is_rejected_before_parsing_or_compiling(monkeypatch):
+    import validator
+    from deskcore import rulecheck
+
+    original_compile = validator.re.compile
+    pattern = "(?:a|b)" * 19000
+
+    def must_not_compile(source, *args, **kwargs):
+        if source == pattern:
+            raise AssertionError("oversized user patterns must be rejected before compilation")
+        return original_compile(source, *args, **kwargs)
+
+    monkeypatch.setattr(validator.re, "compile", must_not_compile)
+    with pytest.raises(validator.UnsafeRegex, match="300"):
+        validator.assert_regex_is_safe(pattern)
+    with pytest.raises(rulecheck.CheckError, match="300"):
+        rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})
+    assert rulecheck.check([{"id": "oversized", "rule_kind": "forbidden_regex",
+                             "rule_payload": {"pattern": pattern}}], [{"body": "正文"}]) == (
+        [], {"rules": 0, "skipped": 1, "skipped_ids": ["oversized"]})
+
+
+def test_regex_source_length_boundary_matches_the_compiler_contract():
+    import validator
+    from deskcore import rulecheck
+
+    validator.assert_regex_is_safe("a" * 300)
+    with pytest.raises(validator.UnsafeRegex, match="300"):
+        validator.assert_regex_is_safe("a" * 301)
+    with pytest.raises(rulecheck.CheckError, match="300"):
+        rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": "a" * 301})

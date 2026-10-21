@@ -850,7 +850,7 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       · {"kind": "required_phrase", "any": ["话术1", "话术2"], "where": ["body"]}         —— 至少出现一个
       · {"kind": "max_len", "max": 300, "min": 150, "where": "body"}                       —— 字数范围(不算空白和话题),
         max / min 至少给一个, where 只认 title / body
-      · {"kind": "forbidden_regex", "pattern": "...", "where": [...]}                       —— 固定写法(会做安全检查)
+      · {"kind": "forbidden_regex", "pattern": "...", "where": [...]}                       —— 固定写法(正则最长 300 字, 会做安全检查)
       · {"kind": "free_text"}                                                               —— 撤掉这条的代码检查
       where 可选 title / body / tags / comments, 不传就是 ["title", "body"]。语气、结构这类判断不了的不要带 check。
       词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
