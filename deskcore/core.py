@@ -2267,25 +2267,26 @@ RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的全列
                               "如实告诉用户还有这么多条没列出来。")
 RULE_CHECKS_ERROR_NEXT_STEP = ("rule_checks_status=error: 这次代码查规则没跑成(存档不受影响), 不能跟用户说规则都用代码查过了。")
 UNCHECKED_LABEL = {"hard": "硬约束·没查完", "soft": "建议·没查完"}
-RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代码没查完(正则没在时限内跑完, 或者限时的引擎跑不了它; "
-                                   "存档不受影响): 从 from_index 那篇起算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
+RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代码没查完(正则没在时限内跑完、限时的引擎跑不了它, "
+                                   "或者存的 check 用不了; 存档不受影响): 从 from_index 那篇起算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
                                    "它之前查出来、列在 rule_checks 里的命中照常算。severity 是 hard 的(「硬约束·没查完」)照规则原文"
                                    "(rule)把 from_index 起的那几篇自己逐篇核一遍。")
 
 
 def _as_delivered(tpl: dict | None, drafts: list[dict]) -> tuple[list[dict], list[list[str]] | None]:
-    """查规则看的那几篇 → (稿子, 每篇交付出去的话题; 模板不管话题时是 None)。score_drafts 的 rule_checks 和
+    """查规则看的那几篇 → (稿子, 每篇交付出去的话题; 没有模板时是 None)。score_drafts 的 rule_checks 和
     check_rules(_delivered_text: 代码查的、发给 Jev 的)都只从这里拿, 两边看见的标题、正文一字不差; 话题只在写手没传
     ``tags`` 时一样(check_rules 读的版本行里没存写手传的 tags, 见 _delivered_text)。
 
-    模板管话题时正文换成 ``delivery.delivered_post`` 摘掉末尾话题之后的那一份, 话题是它拼的那一行(写手的 + 模板的固定 /
-    条件话题 + 正文中间留下的 #话题), 和 delivery.text 对得上; 不然原样, 话题由 rulecheck._parts 照 split_tags +
+    有模板时每篇换成 ``delivery.delivered_draft`` 交付出去的那一份, 和 delivery.text 对得上: 模板管话题的, 正文摘掉末尾话题,
+    话题是它拼的那一行(写手的 + 模板的固定 / 条件话题 + 正文中间留下的 #话题); 不管话题的, ``tags`` 字段不算、只认正文里的
+    #话题; ``comments`` 是 null 的评论不算(codex review on aw#115)。没有模板原样, 话题由 rulecheck._parts 照 split_tags +
     body_tags 拼。哪个 # 算话题(validator.topic_tag_matches)、哪几条评论算数(delivery.comment_list)也都只在 delivery /
     validator 认一处, 这里不另写。"""
-    if tpl is None or not delivery.wants_tags(tpl):
+    if tpl is None:
         return list(drafts), None
-    posts = [delivery.delivered_post(tpl, d) for d in drafts]
-    return [{**d, "body": body} for d, (body, _tags) in zip(drafts, posts)], [tags for _body, tags in posts]
+    views = [delivery.delivered_draft(tpl, d) for d in drafts]
+    return [view for view, _tags in views], [tags for _view, tags in views]
 
 
 def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
@@ -2296,7 +2297,8 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
        模板坏了只记日志、不带这一块 —— 打分照常(运维用 CLI 设模板时已经校验过, 走到这里多半是有人手改了库)。
     2. 代码查规则: 和简报同一个池子里带 check 的那几条, soft 的过同一道方向闸, 逐篇查(``out["rule_checks"]``,
        有命中才带)。查不成就带 ``rule_checks_status = "error"``: 不带的话和"查过了、没命中"长得一模一样。正则规则限时
-       (rulecheck.check), 没在时限内查完的列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了"守住了"。
+       (rulecheck.check), 没在时限内查完的、存的 check 用不了的都列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了
+       "守住了"。
 
     两样都只是参考: 入库到这里已经成功了, 这一步任何失败都不许把它变成失败(同判定那一段的纪律)。
     """
@@ -2326,8 +2328,9 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             # hard 不过这道闸, 同简报。判据也同简报: 项目名 + 这场 open_project 传的 tactic(写手原样传回来, codex review
             # on aw#115) —— 只按项目名判的话, 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又全报一遍。
             soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or "", tactic or ""))
-            # 模板管话题时, 查的是交付出去的那一份, 免得和 delivery.text 对不上: 话题含固定 / 条件话题; 正文是摘掉末尾那行
-            # 话题之后的(codex review on aw#115: 拿原稿查的话, 话题行里的词会被报成「正文里有」, 必须带的话术也能靠它混过去)。
+            # 有交付模板时, 查的是交付出去的那一份, 免得和 delivery.text 对不上(delivery.delivered_draft): 模板管话题的, 话题含
+            # 固定 / 条件话题、正文是摘掉末尾那行话题之后的; 不管话题的, tags 字段不算、只认正文里的 #话题; comments 是 null 的,
+            # 评论不算(codex review on aw#115: 拿原稿查的话, 不交付的话题 / 评论里的词照报违规, 必须带的话术也能靠它们混过去)。
             # check_rules 也走 _as_delivered 这一处, 两边看见的是同一份标题、正文(话题见 _delivered_text)
             checked, final_tags = _as_delivered(tpl, picked)
             # 模板要求每篇都带的部位(评论 min ≥ 1、要话题): 空着的话「必须带的话术」照没带报, 不能靠不交那一块混过去(codex review
@@ -2339,7 +2342,7 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
                 out["rule_checks"] = shown
                 if more:
                     out["rule_checks_more"] = more
-            if stats.get("timed_out"):
+            if stats.get("timed_out") or stats.get("skipped_ids"):
                 rows = {r.get("id"): r for r in hard + soft}
                 sev = {rid: ("hard" if (r.get("severity") or "soft").lower() == "hard" else "soft") for rid, r in rows.items()}
                 # 开头不用「必须改」/「建议改」(codex review on aw#115): 那两个词在 rule_checks 里是"这篇查出了违规", 写手的模型扫到
@@ -2354,7 +2357,15 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
                      "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则的正则从 index={start.get(rid)} 那篇起没查完"
                              "(超时或者限时的引擎跑不了), 那几篇算没查, 不是查出了违规"
                              + ("; 之前查出来、列在 rule_checks 里的照改" if rid in found else "")}
-                    for rid in stats["timed_out"]]
+                    for rid in stats.get("timed_out") or ()]
+                # 存的 check 用不了的(写坏了, 或者是这里不查的老写法; rulecheck 记日志、跳过): 原来只在 batch_metrics 里记个数,
+                # 回包和「查过了、没命中」一模一样, 一条硬规则就这样每批都没查(codex review on aw#115)。整批都没查, 照没查完报
+                out["rule_checks_unchecked"] += [
+                    {"rule_id": rid, "severity": sev.get(rid, "soft"), "rule": (rows.get(rid) or {}).get("content") or "",
+                     "from_index": indices[0],
+                     "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则存的代码检查用不了(写坏了, 或者是这里不查的"
+                             "老写法), 这次整批都没查, 不是查出了违规"}
+                    for rid in stats.get("skipped_ids") or ()]
             meta["rule_checks"] = {**stats, "hits": len(hits),
                                    "hard": sum(1 for h in hits if h["severity"] == "hard"),
                                    "elapsed_ms": _ms_since(t0)}
@@ -5398,7 +5409,8 @@ def _delivered_text(template: dict | None, version: dict) -> dict:
     版本行存的是写手传的原稿(带着末尾那行 #话题 的也原样存)。标题正文先照 assemble 去首尾空白、换行统一成 \\n, 再过
     ``_as_delivered``(score_drafts 的 rule_checks 同一处): 模板管话题时正文摘掉末尾话题(``delivery.delivered_post``);
     拿原稿去判, 只在话题行里的词会被判成「正文里有」, 必须带的话术也能靠被摘走的那行混过去。
-    没有模板 / 模板不管话题时正文就是原稿, ``tags`` 是 None(rulecheck._parts 照正文里的 #话题 拼, 同 score_drafts)。
+    没有模板时正文就是原稿, ``tags`` 是 None(rulecheck._parts 照正文里的 #话题 拼, 同 score_drafts); 模板不管话题时正文也是
+    原稿, ``tags`` 是正文里的 #话题(delivery.delivered_draft)。
     ``tags``(模板管话题时)是拿版本行能拼出来的那一行: 末尾被摘走的话题 + 模板的固定 / 条件话题。写手单独传的 ``tags``
     没存(2026-10-20 第三轮复审): 写手传了 tags 的那篇, 交付稿的话题行按写手传的拼, 和这里**对不上**; 只有写手没传 tags 时
     才和 delivery.text 的话题行一样。评论版本行里没有, rulecheck._parts 走 delivery.comment_list 拿到的永远是空的。所以编出来的

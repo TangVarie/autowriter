@@ -58,6 +58,41 @@ def test_table_is_a_markdown_table_with_one_row_per_draft():
     assert lines[3].startswith("| 方向二 | 【标题】标题二<br>【正文】只有一段<br>#话题三 #话题四 #固定甲 |")
 
 
+def _cells(row: str) -> list[str]:
+    """按表格的规矩拆一行: 竖线前面连着奇数个反斜杠的是字面的竖线, 偶数个(含 0 个)的才是分隔符。"""
+    out, cur, slashes = [], "", 0
+    for ch in row.strip()[1:-1]:
+        if ch == "|" and slashes % 2 == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+        slashes = slashes + 1 if ch == "\\" else 0
+    return out + [cur]
+
+
+def test_cells_with_a_lone_carriage_return_or_a_long_backslash_run_stay_on_one_row():
+    """单独的 \\r 也是换行: 不换成 <br> 的话这一行在 GFM / markdown-it 里拆成两行; 一长串反斜杠后面跟竖线, 原来的写法每个起点
+    各扫一遍, 平方级(独立复审 on aw#115 第八轮)。"""
+    out = delivery.assemble(TABLE, [{"title": "标题", "body": "第一行\r第二行", "tags": ["话题一", "话题二"], "direction": "方向",
+                                     "comments": [{"role": "reader", "text": "示例品"}]}])
+    assert "\r" not in out["text"] and len(out["text"].splitlines()) == 3
+    t0 = time.perf_counter()
+    delivery.assemble(TABLE, [{"title": "标题", "body": "\\" * 50_000 + "|", "tags": ["话题一", "话题二"], "direction": "方向",
+                               "comments": [{"role": "reader", "text": "示例品"}]}])
+    assert time.perf_counter() - t0 < 0.5
+
+
+@pytest.mark.parametrize("text", ["a|b", "a\\|b", "a\\\\|b", "\\|", "|", "末尾一个反斜杠\\"])
+def test_a_backslash_before_a_pipe_does_not_split_the_cell(text):
+    """正文里原本就有 \\| 时, 原来照抄成 \\\\|: 两个反斜杠是一个字面的反斜杠, 竖线成了分隔符, 这一行多出一格、整张表错位
+    (codex review on aw#115)。"""
+    out = delivery.assemble(TABLE, [{"title": "标题", "body": text, "tags": ["话题一", "话题二"], "direction": "方向",
+                                     "comments": [{"role": "reader", "text": "示例品" + text}]}])
+    row = out["text"].split("\n")[2]
+    assert len(_cells(row)) == 3, row
+
+
 def test_blocks_are_separated_by_a_blank_line_and_comments_get_their_labels():
     tpl = {"layout": "blocks", "tags": {"content": 1},
            "comments": {"min": 0, "max": 3, "label_reader": "【评论】", "label_author": "作者回复："}}
@@ -148,6 +183,15 @@ def test_a_url_fragment_at_the_end_of_the_body_is_not_a_tag():
     ("今天拿到offer了#秋招[话题]#开心", ["秋招"]), ("#秋招[话题]#今天就到这里", ["秋招"]),
     # 带 [话题] 的是小红书的话题写法, 前一个字是英文字母数字也算(它不会是 "C#入门" 这种词的一部分)
     ("拿到offer#秋招[话题]#", ["秋招"]), ("冲刺2026#秋招[话题]# #求职[话题]#", ["秋招", "求职"]),
+    # 话题本体到句读为止(codex review on aw#115): 中文句子里没有空白, 原来 "秋招，记得准备简历" 整个算话题, 后半句被摘走
+    ("今天聊聊#秋招，记得准备简历", ["秋招"]), ("看这里#秋招（附模板）", ["秋招"]), ("冲鸭！#秋招！", ["秋招"]),
+    ("#秋招、#求职", ["秋招", "求职"]), ("别错过#秋招…", ["秋招"]), ("#Node.js 和 #C++ #A&B", ["Node.js", "C++", "A&B"]),
+    # 只停在真的标点上(独立复审 on aw#115 第八轮): 夹在英文字母中间的撇号、〇 々、全角的 ＆ ／ ＋、不断行的连字符都是话题的一部分;
+    # 带 [话题] 的照旧到 [话题] 为止; ASCII 的 ~ 和 ⋯ ※ ‼ 也是标点
+    ("#Kiehl's #护肤", ["Kiehl's", "护肤"]), ("#Levi\u2019s #穿搭", ["Levi\u2019s", "穿搭"]), ("#二〇二六考研", ["二〇二六考研"]),
+    ("#Q＆A #A／B测试", ["Q＆A", "A／B测试"]), ("#Wi\u2011Fi", ["Wi\u2011Fi"]), ("#打工人！[话题]#", ["打工人！"]),
+    ("#秋招~记得准备", ["秋招"]), ("#秋招⋯⋯记得准备", ["秋招"]), ("#秋招※记得准备", ["秋招"]), ("#秋招‼记得准备", ["秋招"]),
+    ("#秋招 #求职。", ["秋招", "求职"]), ("#秋招、#求职、#offer", ["秋招", "求职", "offer"]), ("#ootd, #fashion", ["ootd", "fashion"]),
 ])
 def test_finding_tags_lifting_tags_and_counting_agree_on_what_a_tag_is(line, tags):
     """哪个 # 算话题只在 validator.topic_tag_matches 认一处(codex review on aw#115): 正文里找话题(查话题的规则)、摘末尾话题
@@ -156,9 +200,46 @@ def test_finding_tags_lifting_tags_and_counting_agree_on_what_a_tag_is(line, tag
     assert delivery.body_tags(line) == tags
     kept, lifted = delivery.lift_trailing_tags(line)
     assert delivery.body_tags(kept) + lifted == tags
-    assert validator.count_chars(line) == validator.count_chars(kept)
+    if kept.strip():
+        assert validator.count_chars(line) == validator.count_chars(kept)
+    else:       # 整行话题连同话题之间的标点一起摘掉(独立复审 on aw#115 第八轮): 少掉的只是那几个标点
+        assert validator.TAG_GAP.fullmatch(validator.HASHTAG.sub("", line))
     assert [m.start() for m in validator.topic_tag_matches(line)] == \
         [i for i, ch in enumerate(line) if ch == "#" and validator.is_topic_tag(line, i)]
+
+
+@pytest.mark.parametrize("body, tags, kept, line", [
+    ("第一段写点经验。\n最后祝大家顺利！\n#秋招 #求职。", ["秋招", "求职"], "第一段写点经验。\n最后祝大家顺利！", "#秋招 #求职 #固定甲"),
+    ("第一段写点经验。\n#秋招、#求职、#offer", None, "第一段写点经验。", "#秋招 #求职 #固定甲"),
+    ("第一段写点经验。\n#ootd, #fashion", ["ootd", "fashion"], "第一段写点经验。", "#ootd #fashion #固定甲"),
+])
+def test_a_tag_line_with_punctuation_between_or_after_the_tags_is_lifted_once(body, tags, kept, line):
+    """话题本体到句读为止之后, 标点不再算进话题: 整行话题里夹着的 、 , 。 只认空白的话这一行摘不下来, 交付稿里两行话题, 还误报
+    「话题标签 1 个」(独立复审 on aw#115 第八轮)。整行都是话题的, 夹着的标点跟着这一行一起摘掉。"""
+    tpl = {"layout": "blocks", "tags": {"content": 2, "fixed": ["固定甲"]}}
+    out = delivery.assemble(tpl, [{"title": "甲", "body": body, "tags": tags}])
+    assert out["text"] == f"【标题】甲\n【正文】{kept}\n{line}" and out["problems"] == []
+
+
+def test_a_tag_scoped_rule_sees_a_tag_with_an_apostrophe_whole():
+    """「#Kiehl's」截成 Kiehl 的话, 「话题里要带 Kiehl's」误报必须改、「话题里不许带 Levi's」漏报(独立复审 on aw#115 第八轮)。"""
+    rules = [{"id": "m-1", "severity": "hard", "rule_kind": "required_phrase", "rule_payload": {"any": ["Kiehl's"], "where": ["tags"]}},
+             {"id": "m-2", "severity": "hard", "rule_kind": "forbidden_word", "rule_payload": {"words": ["Levi's"], "where": ["tags"]}}]
+    hits, _stats = rulecheck.check(rules[:1], [{"title": "甲", "body": "换季护肤分享。\n#Kiehl's #护肤"}])
+    assert hits == [], "Kiehl's 是一个话题, 必须带的话题带了"
+    hits, _stats = rulecheck.check(rules[1:], [{"title": "乙", "body": "通勤穿搭分享。\n#Levi's #穿搭"}])
+    assert [h["rule_id"] for h in hits] == ["m-2"], "不许带的话题查得到"
+
+
+@pytest.mark.parametrize("tpl", [{"layout": "blocks", "tags": {"fixed": ["固定甲"]}}, {"layout": "blocks", "tags": {"content": 1}}])
+def test_prose_after_a_plain_tag_is_never_lifted_out_of_the_body(tpl):
+    """「今天聊聊#秋招，记得准备简历」原来整个 "秋招，记得准备简历" 算话题、被当成末尾话题摘走; 模板只有固定话题(content 0)时
+    摘下来的又不用, 交付稿里这半句就没了, 一句不报(codex review on aw#115)。"""
+    body = "第一段。\n今天聊聊#秋招，记得准备简历"
+    assert delivery.lift_trailing_tags(body) == (body, [])
+    out = delivery.assemble(tpl, [{"title": "甲", "body": body, "tags": ["话题"]}])
+    assert "，记得准备简历" in out["text"]
+    assert validator.count_chars(body) == validator.count_chars("第一段。\n今天聊聊，记得准备简历")
 
 
 @pytest.mark.parametrize("body, kept, tags", [
@@ -571,6 +652,30 @@ def test_the_brief_tells_the_writer_what_each_draft_must_carry():
     assert "delivery_requirements" not in core.build_writing_brief(desk_client(), PROJ, user_id=ME)
     broken = desk_client(default_params=json.dumps({"delivery": {"layout": "table"}}))
     assert "delivery_requirements" not in core.build_writing_brief(broken, PROJ, user_id=ME), "模板坏了不拦简报"
+
+
+@pytest.mark.parametrize("tpl", [{"layout": "blocks"},
+                                 {"layout": "blocks", "comments": {"min": 1, "max": 2, "label_reader": "读者：",
+                                                                   "label_author": "作者："}}])
+def test_a_template_that_does_not_manage_tags_keeps_them_in_the_body(tpl):
+    """模板不管话题时 assemble 不读 tags 字段, 正文原样进交付稿。原来简报照样叫写手「不放话题行」, 照项目规则要的话题传在
+    tags 里就从交付稿里没了, 一句不报(codex review on aw#115)。现在简报叫它写在正文末尾那一行; tags 里正文没有的报出来。"""
+    assert not delivery.wants_tags(delivery.validate(tpl)), "前提: 这个模板不管话题"
+    task = delivery.requirements(tpl)["task"]
+    assert "不放话题行" not in task and "写在正文末尾那一行" in task and "tags 字段不会拼进交付稿" in task
+    draft = {"title": "示例标题", "body": "示例正文。\n#话题甲", "comments": [{"role": "reader", "text": "示例评论"}]}
+    kept = delivery.assemble(tpl, [draft])
+    assert "#话题甲" in kept["text"] and kept["problems"] == [], "照简报写在正文里的话题原样带上"
+    lost = delivery.assemble(tpl, [{**draft, "body": "示例正文。", "tags": ["话题甲", "#话题乙"]}], indices=[3])
+    assert "话题甲" not in lost["text"]
+    assert lost["problems"] == [{"index": 3, "what": "这个项目的交付模板不管话题, tags 里的「话题甲」「话题乙」没拼进交付稿: "
+                                                     "要带话题就写在正文末尾那一行, tags 留空"}]
+    both = delivery.assemble(tpl, [{**draft, "tags": ["话题甲"]}])
+    assert both["problems"] == [], "正文里已经有的不算丢"
+
+
+def test_a_template_that_manages_tags_still_keeps_the_tag_line_out_of_the_body():
+    assert "不放话题行" in delivery.requirements(BLOCKS)["task"]
 
 
 def test_a_broken_template_never_breaks_scoring():

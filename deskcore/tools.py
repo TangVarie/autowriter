@@ -645,7 +645,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     ``drafts=[{"title": ..., "body": ..., "angle_key": ..., "tags": [...], "comments": [{"role": "reader" | "author",
     "text": "..."}], "direction": "..."}]``。``tags`` 是话题列表(带不带 # 都行); ``comments`` 是这篇笔记自己带的评论;
     ``direction`` 是这篇的切入角度, 一句话(如「应届生签约前怎么查公司」), **不是** 产品向 / 流量向。它们不是本工具的
-    顶层参数, 放在 drafts 外面会被丢掉。``body`` 只放正文, 不放【标题】【正文】标记、不放话题行。
+    顶层参数, 放在 drafts 外面会被丢掉。``body`` 只放正文, 不放【标题】【正文】标记、不放话题行 —— 交付模板不管话题的项目
+    例外(简报的 ``delivery_requirements.task`` 会说): 那种模板不读 ``tags``, 话题照项目规则写在正文末尾那一行。
 
     **交付稿**: 项目配了交付模板时返回里有 ``delivery``: ``text`` 是按模板把这次存进去的几篇拼好的整批交付稿(表格或
     一篇一段, 标记、话题顺序、固定话题都由服务端加), ``problems`` 是代码查出来的版式问题(``index`` 对应你传的第几篇,
@@ -657,7 +658,7 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     ``rule_id`` / ``severity`` / ``where`` / ``what``。``what`` 以「必须改」开头的是硬约束, 改完再交; 「建议改」的
     告诉用户。和分数一样不拦存档。必须改的全列, 建议改补到一共 40 条为止; ``rule_checks_more`` 是没列出的建议改条数,
     如实告诉用户还有这么多条没列。``rule_checks_status`` 是 ``"error"`` 就是这次没查成, 不能说规则都用代码查过了。
-    ``rule_checks_unchecked`` 里的规则这次没查完(正则没在时限内跑完, 或者限时的引擎跑不了): 算没查 —— 不是违规(``what`` 以
+    ``rule_checks_unchecked`` 里的规则这次没查完(正则没在时限内跑完、限时的引擎跑不了, 或者存的 check 用不了): 算没查 —— 不是违规(``what`` 以
     「硬约束·没查完」/「建议·没查完」开头, 不是「必须改」), 也不能说它们守住了; ``from_index`` 是从哪篇起没查完, 之前查出来、
     列在 ``rule_checks`` 里的命中照常算; severity 是 hard 的照规则原文(``rule``)把那几篇自己核一遍。
     存完之后**再调一次 ``check_rules``**(传这次返回的 ``check_rules_version_ids``, 传过 ``tactic`` 的同样带上):

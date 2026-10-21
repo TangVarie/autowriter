@@ -20,8 +20,8 @@ payload 形状(写入时 ``normalize_check`` 校验; 读出来时 ``spec_of`` �
                    能匹配同样字符的量词不能挨着(见 validator.assert_regex_is_safe)。这两道都是静态的、尽力而为的过滤;
                    执行限时(validator.search_user_regex): 漏过去的慢正则一次 check 最多花一份时限, 报进
                    stats["timed_out"](这次没查), 不算命中、也不能算守住了
-  required_phrase  {"any": [...], "where": [...]}          一个都没有才算没守; 选中的部位全空时只在交付模板要求每篇都带那个部位时
-                                                           才算没守(check 的 expects), 不然不查
+  required_phrase  {"any": [...], "where": [...]}          一个都没有才算没守; 选中的部位全空时: 标题 / 正文空着照没守报, 评论 /
+                                                           话题只在交付模板要求每篇都带时才算没守(check 的 expects), 不然不查
   max_len          {"max": N, "min": M, "where": "body"}   max / min 至少给一个; 字数去掉空白和 #话题 再数
 validator.py 的老形状({"target": X} / {"scope": "标题", "n": N} / {"pattern": P})读的时候也认。
 """
@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 
 import validator
 
@@ -251,8 +252,12 @@ _count = validator.count_chars
 def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
     """一篇稿 → 各部位的文本。tags 是写手传的 tags 加正文里的 #话题; comments 一条一项。
 
-    ``tags`` 给了就用它(项目有交付模板且模板管话题时, core 传交付出去的那一份: 含模板加的固定 / 条件话题; 那时 ``d`` 的
-    body 也是交付出去的、摘掉了末尾那行话题的正文, 见 delivery.delivered_post)。"""
+    话题这一部位: 先是空格隔开的整行(「话题不超过 N 个」这种按个数数的正则写在它上面, Jev 的 /compile_rules 也这么教),
+    两个以上时每个话题再各算一项(codex review on aw#115 第十一轮: 只查整行的话 ^广告$ 这种锚定的写法只在话题只有一个时才
+    命中, 多带一个别的话题硬规则就漏了)。单个话题里没有空白, 数个数的正则在单项上配不上, 不会多报。
+
+    ``tags`` 给了就用它(项目有交付模板时, core 传交付出去的那一份: 管话题的含模板加的固定 / 条件话题, 不管话题的只有正文里的
+    #话题; 那时 ``d`` 也是交付出去的那份稿子, 见 delivery.delivered_draft)。"""
     body = str(d.get("body") or "")
     if tags is None:
         # 写手传的 tags 和正文末尾那行 #话题 常常是同一批(约六分之一的稿子末尾带一行): 去重, 不然「话题不超过 N 个」
@@ -262,8 +267,8 @@ def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
         tags = [t for t in raw if not (delivery.norm_tag(t) in seen or seen.add(delivery.norm_tag(t)))]
     # 评论和交付稿是同一份(delivery.comment_list): 一条字符串 / 一条 dict / 一串 JSON 都认, text 不是字符串的两边都不算
     comments = [c["text"] for c in delivery.comment_list(d.get("comments"))[0]]
-    return {"title": [str(d.get("title") or "")], "body": [body], "tags": [" ".join(tags)] if tags else [],
-            "comments": comments}
+    return {"title": [str(d.get("title") or "")], "body": [body],
+            "tags": [" ".join(tags), *tags] if len(tags) > 1 else list(tags), "comments": comments}
 
 
 def _run(spec: dict, parts: dict[str, list[str]], *, expects=(),
@@ -291,10 +296,11 @@ def _run(spec: dict, parts: dict[str, list[str]], *, expects=(),
     elif kind == "required_phrase":
         texts = [x for w in spec["where"] for x in parts[w]]
         given = any(x.strip() for x in texts)
-        # 选中的部位全空: 一般不查 —— 评论常常是后面另走评论那一步(comments_for → score_comments)写的, 没交付模板的项目也不一定
-        # 交话题, 那时它们本来就不在这次交的东西里。可交付模板要求每篇都带的部位(expects: 评论 min ≥ 1、要写手给话题或有固定话题)
-        # 空着就是没交, 照没守报(codex review on aw#115): 不然「评论里必须带 X」这种规则, 靠一条评论都不交就混过去了。
-        must = [w for w in spec["where"] if w in expects]
+        # 选中的部位全空: 标题 / 正文是每篇稿子都有的部位, 空着照没守报(codex review on aw#115: 不然「正文里必须带 X」靠交一篇
+        # 空正文就混过去了)。评论 / 话题一般不查 —— 评论常常是后面另走评论那一步(comments_for → score_comments)写的, 没交付模板
+        # 的项目也不一定交话题, 那时它们本来就不在这次交的东西里。可交付模板要求每篇都带的部位(expects: 评论 min ≥ 1、要写手给
+        # 话题或有固定话题)空着就是没交, 同样照没守报: 不然「评论里必须带 X」这种规则, 靠一条评论都不交就混过去了。
+        must = [w for w in spec["where"] if w in ("title", "body") or w in expects]
         if (given or must) and not any(_has(x, t) for x in texts for t in spec["any"]):
             where = "/".join(spec["where"])
             absent = "" if given else f"(这篇没带{'、'.join(PART_CN[w] for w in must)})"
@@ -310,45 +316,69 @@ def _run(spec: dict, parts: dict[str, list[str]], *, expects=(),
     return out
 
 
+def _regex_total() -> float:
+    """一次 check 里所有正则规则加起来的总上限(秒), config.REGEX_CHECK_TOTAL_SEC。config 读不了就用 2.5。"""
+    try:
+        import config
+        return float(config.REGEX_CHECK_TOTAL_SEC)
+    except Exception:                                # noqa: BLE001 — 增强项的配置坏了退回默认, 不拖垮查规则
+        return 2.5
+
+
 def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = None,
           tags: list[list[str] | None] | None = None, expects=()) -> tuple[list[dict], dict]:
     """(命中, 统计)。命中按篇、再按 hard 在前排好; 统计 = {"rules": 能查的条数, "skipped": check 坏了跳过的条数}, 有正则规则这次
     没查完时再带 ``"timed_out": [规则 id, …]`` 和 ``"timed_out_from": {规则 id: 从哪一篇(index)起没查完}`` —— 那一篇之前的都
     查完了, 查出来的命中照报(独立复审 on aw#115 第六轮: 不说从哪篇起, 同一条既报了命中、又整条报"没查", 两头打架)。
+    rule_kind 是能查的那几种、check 却用不了的(写坏了, 或者是这里不查的老写法), 除了 skipped 计数再带
+    ``"skipped_ids": [规则 id, …]`` —— 不带的话调用方分不出「查过了、没命中」和「压根没查」(codex review on aw#115)。
 
     ``rules`` 是 store.shared_memories 的 hard + soft(没 check 的自动略过, soft 的方向闸由调用方先过);
     ``indices`` 同 delivery.assemble; ``tags`` 和 drafts 一一对应, 某篇给了就用它当这篇的话题(见 _parts);
     ``expects`` 是交付模板要求每篇都带的部位(delivery.expected_parts), 必须带的话术查到这些部位空着时照没带报。
 
     正则规则限时(validator.search_user_regex): 每条在这次 check 里共用一份 config.REGEX_SEARCH_TIMEOUT_SEC, 用完了这条后面的
-    稿子不再搜、报进 timed_out —— 不算命中, 调用方也不能把它说成守住了(限时的引擎跑不了的正则也报在这里)。所以一次 check
-    最多多花约 (正则规则条数) × 那一份(到点后多拖的那一点和第一次的编译见 config.REGEX_SEARCH_TIMEOUT_SEC)。
+    稿子不再搜、报进 timed_out —— 不算命中, 调用方也不能把它说成守住了(限时的引擎跑不了的正则也报在这里)。所有正则规则加起来
+    另有一个总上限 config.REGEX_CHECK_TOTAL_SEC(codex review on aw#115: 不封顶的话是 (条数) × 那一份): 到点之后还没查完的
+    正则规则从那一篇起同样报进 timed_out。到点后多拖的那一点和第一次的编译见 config.REGEX_SEARCH_TIMEOUT_SEC。
     """
-    specs, skipped = [], 0
+    specs, skipped = [], []
     for r in rules or []:
         spec = spec_of(r)
         if spec is not None:
             specs.append((r, spec))
         elif (r.get("rule_kind") or "") in CHECK_KINDS:
-            skipped += 1
-    budgets = {k: validator.RegexBudget() for k, (_r, spec) in enumerate(specs) if spec["kind"] == "forbidden_regex"}
+            skipped.append(r.get("id"))
     hits: list[dict] = []
     stopped: dict[int, int] = {}            # 第几条规则 → 从哪一篇(index)起没查完
     idx = list(indices) if indices is not None else list(range(len(drafts)))
-    for pos, d in enumerate(drafts):
-        parts = _parts(d if isinstance(d, dict) else {}, tags[pos] if tags is not None else None)
-        for k, (r, spec) in enumerate(specs):
-            budget = budgets.get(k)
-            if budget is not None and budget.timed_out:
-                continue                    # 这条这次已经没查完了, 后面的稿子不再搜: 一条慢正则一次 check 只花一份时限
-            sev = "hard" if (r.get("severity") or "soft").lower() == "hard" else "soft"
+    parts_of = [_parts(d if isinstance(d, dict) else {}, tags[pos] if tags is not None else None)
+                for pos, d in enumerate(drafts)]
+    # 一条规则查完所有稿子再轮下一条, 硬约束在前; 正则规则每条一份时限 = 它自己那一份和「整次剩下的 ÷ 还没轮到的正则条数」取小,
+    # 快的用不完的留给后面的(独立复审 on aw#115 第八轮)。按篇轮的话, 第一篇上几条慢的建议规则就把总上限用光, 后面每一篇上
+    # 一毫秒就查完的硬规则都报没查 —— 实测 20 篇里 19 处真违规从「必须改」变成了「自己核」。
+    order = sorted(range(len(specs)), key=lambda k: (specs[k][0].get("severity") or "soft").lower() != "hard")
+    rx_left = sum(1 for _r, spec in specs if spec["kind"] == "forbidden_regex")
+    deadline = time.monotonic() + _regex_total()
+    for k in order:
+        r, spec = specs[k]
+        sev = "hard" if (r.get("severity") or "soft").lower() == "hard" else "soft"
+        budget = None
+        if spec["kind"] == "forbidden_regex":
+            budget = validator.RegexBudget(min(validator.regex_search_timeout(), (deadline - time.monotonic()) / rx_left))
+            rx_left -= 1
+        for pos, parts in enumerate(parts_of):
+            # 时限用完与否只由 search_user_regex 判(真要搜的时候才判): 这一篇这条没东西可搜(只管评论、这篇没评论)就不算没查
             for where, what in _run(spec, parts, expects=expects, budget=budget):
                 hits.append({"index": idx[pos], "rule_id": r.get("id"), "severity": sev,
                              "where": where, "what": f"{SEVERITY_LABEL[sev]}: {what}"})
             if budget is not None and budget.timed_out:
                 stopped[k] = idx[pos]
+                break                       # 这条这次没查完, 后面的稿子不再搜
     hits.sort(key=lambda h: (h["index"], h["severity"] != "hard"))
-    stats: dict = {"rules": len(specs), "skipped": skipped}
+    stats: dict = {"rules": len(specs), "skipped": len(skipped)}
+    if skipped:
+        stats["skipped_ids"] = skipped
     if stopped:
         stats["timed_out"] = [specs[k][0].get("id") for k in sorted(stopped)]
         stats["timed_out_from"] = {specs[k][0].get("id"): at for k, at in sorted(stopped.items())}

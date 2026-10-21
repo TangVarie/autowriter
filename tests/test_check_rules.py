@@ -874,7 +874,8 @@ def test_an_unrunnable_hand_set_check_does_not_hide_the_compiled_code(wired, kin
                       {"kind": "forbidden_word", "words": ["示例禁词"], "where": ["body"]})
     body = BODY + "这里有示例禁词。"
     hits, stats = rulecheck.check([rule], [{"title": TITLE, "body": body}])
-    assert hits == [] and stats == {"rules": 0, "skipped": 1}, "score_drafts 那边: 人设的跑不了, 只记 skipped"
+    assert hits == [] and stats == {"rules": 0, "skipped": 1, "skipped_ids": [rule["id"]]}, \
+        "score_drafts 那边: 人设的跑不了, 只记 skipped(带上是哪一条, aw#115 起报进 rule_checks_unchecked)"
     wired.judge = answers(**{qid_of(q_soft()): {"answer": "是", "p": 0.9, "ambiguous": False}})
     for memories, compiles in (([rule], [stored(rule, res)]),
                                ([rule, R_SOFT], [stored(rule, res), stored(R_SOFT, q_soft())])):

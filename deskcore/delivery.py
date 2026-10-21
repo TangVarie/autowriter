@@ -9,7 +9,7 @@
   · ``score_drafts`` 存完档, 用存进去的那几篇按模板拼整批, 写手把 ``delivery.text`` 原样交给用户。
 
 纯函数, 不连库不联网(同 isolation.py)。问题(problems)只报代码能确定判出来的: 话题不够、评论条数不对、评论没提到
-该提的词、表格要方向而稿子没带、模型自己又包了一层标记。都只是参考, 不拦存档。
+该提的词、表格要方向而稿子没带、模型自己又包了一层标记、模板不管话题而 tags 里的话题拼不进去。都只是参考, 不拦存档。
 
 ⚠️ 标记只认【标题】/【正文】。tv-sync(tvlink.parse_raw)按这两个标记把发出去的笔记拆回标题和正文, 运营在飞书里
 贴的也一直是这个写法(09-15 以来 6 个在跑项目 450 篇全是); 换成「标题：」这种冒号写法, 整段会被当成正文, 对不回底稿。
@@ -297,13 +297,24 @@ def lift_trailing_tags(body: str) -> tuple[str, list[str]]:
 
 def _trailing_tag_run(line: str) -> tuple[int, list[str]]:
     """这一行末尾那一串话题: (从哪儿起, 话题本体)。从行尾往回接 validator.topic_tag_matches 认下的话题, 两个之间只能隔空白;
-    隔着正文、网址里的 #片段、"C#入门" 就停。没有是 (-1, [])。"""
-    end, cut, run = len(line.rstrip()), -1, []
-    for m in reversed(validator.topic_tag_matches(line)):
-        if line[m.end():end].strip():
-            break
-        cut, end = m.start(), m.start()
-        run.append(m.group(0))
+    隔着正文、网址里的 #片段、"C#入门" 就停。没有是 (-1, [])。
+
+    整行都是话题的, 话题之间、末尾还可以夹标点(validator.TAG_GAP: 「#秋招、#求职、#offer」「#秋招 #求职。」), 标点跟着这一行
+    一起摘掉 —— 话题本体到句读为止之后, 这些标点不再算进话题, 只认空白的话这一行摘不下来, 交付稿里两行话题(独立复审 on aw#115
+    第八轮)。前面有正文的照旧只认空白: 「冲鸭！#秋招！」最后那个 ！ 可能是这句话的, 不摘、不丢字。"""
+    def scan(loose: bool) -> tuple[int, list[str]]:
+        end, cut, run = len(line.rstrip()), -1, []
+        for m in reversed(validator.topic_tag_matches(line)):
+            gap = line[m.end():end]
+            if gap.strip() and not (loose and validator.TAG_GAP.fullmatch(gap)):
+                break
+            cut, end = m.start(), m.start()
+            run.append(m.group(0))
+        return cut, run
+
+    cut, run = scan(True)
+    if run and (line[:cut].strip() or not validator.TAG_GAP.fullmatch(line[:cut])):
+        cut, run = scan(False)              # 前面还有正文: 只认空白隔开的
     return cut, split_tags(" ".join(reversed(run)))
 
 
@@ -361,6 +372,25 @@ def delivered_post(template: dict, draft: dict) -> tuple[str, list[str]] | None:
     return body, _dedupe(tags + body_tags(body))
 
 
+def delivered_draft(template: dict, draft: dict) -> tuple[dict, list[str]]:
+    """这篇照模板交付出去的样子: (查规则用的那份稿子, 交付出去的全部话题)。rulecheck 查的就是它, 和 delivery.text 对得上。
+
+    - 模板管话题: 正文、话题同 delivered_post(摘掉末尾那行话题的正文; 模板拼的话题行 + 正文中间留下的 #话题)。
+    - 模板不管话题: tags 字段不拼(assemble 报「没拼进交付稿」), 交出去的话题只有正文里的 #话题。
+    - 模板 comments 是 null: 评论不拼, 查规则也不看。
+    不交出去的那几块要是还拿原稿查, 禁用词会报在不交付的话题 / 评论上, 必须带的话术也能靠它们混过去(codex review on aw#115)。"""
+    tpl = validate(template)
+    d = draft if isinstance(draft, dict) else {}
+    post = delivered_post(tpl, d)
+    if post is None:
+        body = str(d.get("body") or "").replace("\r\n", "\n").strip()
+        tags = _dedupe(body_tags(body))
+    else:
+        body, tags = post
+    return {**d, "body": body, "tags": tags,
+            "comments": d.get("comments") if tpl["comments"] is not None else None}, tags
+
+
 def comment_entries(raw) -> list | None:
     """写手传的 comments 的外壳 → 一条一项的列表。没传 / null / 空字符串是 []; 外壳本身认不出(数字、true 这类)回 None。
 
@@ -416,7 +446,13 @@ def comment_list(raw) -> tuple[list[dict], list[str]]:
 
 
 def _cell(text: str) -> str:
-    return text.replace("\r\n", "\n").replace("|", "\\|").replace("\n", "<br>")
+    # 竖线前面原本就有的反斜杠先加倍再转义竖线(codex review on aw#115): 照抄的话 A\|B 变成 A\\|B, 表格里两个反斜杠是一个
+    # 字面的反斜杠, 竖线就成了分隔符, 这一行多出一格。加倍之后是 A\\\|B: 反斜杠和竖线都原样显示, 不拆格
+    # 只从一串反斜杠的开头起匹配(?<!\\): 不然一长串反斜杠每个起点各扫一遍, 平方级。单独的 \r 也是换行(独立复审 on aw#115
+    # 第八轮: 不换成 <br> 的话表格那一行在 GFM / markdown-it 里被拆成两行)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(?<!\\)(\\*)\|", lambda m: m.group(1) * 2 + "\\|", text)
+    return text.replace("\n", "<br>")
 
 
 def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = None) -> dict:
@@ -452,6 +488,14 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
                 post.append(" ".join("#" + t for t in tags))
         else:
             post.append(markers["body"] + body)
+            # 模板不管话题: tags 字段不拼。写手照别处的说明把话题传在 tags 里、正文里没有的那几个, 报出来, 别一句不说就没了
+            # (codex review on aw#115)
+            supplied = _dedupe(split_tags(d.get("tags")))
+            in_body = {t.casefold() for t in body_tags(body)}
+            lost = [t for t in supplied if t.casefold() not in in_body]
+            if lost:
+                problems.append({"index": i, "what": f"这个项目的交付模板不管话题, tags 里的「{'」「'.join(lost)}」没拼进交付稿: "
+                                                     "要带话题就写在正文末尾那一行, tags 留空"})
 
         lines: list[str] = []
         if ccfg is not None:
@@ -502,9 +546,13 @@ def requirements(template: dict) -> dict:
                                                 if c["must_mention_any"] else ""))
     if need_direction:
         asks.append("direction 写一句这篇的切入角度(不是 产品向 / 流量向)")
+    # 模板不管话题(wants_tags 为假)时 assemble 不读 tags 字段, 正文原样进交付稿: 这时叫写手「不放话题行」, 照项目规则要的
+    # 话题就从交付稿里没了, 一句不报(codex review on aw#115)。所以话题行放哪儿跟着模板说
     task = ("这个项目的交付稿由写作台按模板拼。"
             + (f"score_drafts 时每篇 draft 里带上: {'; '.join(asks)}。" if asks else "")
-            + "body 只放正文, 不放【标题】【正文】标记、不放话题行。")
+            + ("body 只放正文, 不放【标题】【正文】标记、不放话题行。" if wants_tags(tpl) else
+               "body 只放正文, 不放【标题】【正文】标记。这个模板不管话题: 项目要话题的话照项目规则写在正文末尾那一行, "
+               "交付稿原样带上; tags 字段不会拼进交付稿。"))
     return {"layout": tpl["layout"], "tags": t["content"], "fixed_tags": list(t["fixed"]),
             "comments": (None if c is None else {"min": c["min"], "max": c["max"],
                                                  "must_mention_any": list(c["must_mention_any"])}),
