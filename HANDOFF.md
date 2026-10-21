@@ -1,6 +1,6 @@
 # autowriter / deskcore 交接 · 2026-10-21（最新，先看这一节）
 
-快照 **2026-10-21 03:20 UTC**。三库总交接看 [truth-vault HANDOFF.md 最上面一节](https://github.com/TangVarie/truth-vault/blob/main/HANDOFF.md)，未完成清单看 [OPEN-ITEMS.md](https://github.com/TangVarie/truth-vault/blob/main/OPEN-ITEMS.md)。这一节只写 aw 自己的部分。下面 10-15 那一版里没过时的照旧有效。
+快照 **2026-10-21 03:00 UTC**。三库总交接看 [truth-vault HANDOFF.md 最上面一节](https://github.com/TangVarie/truth-vault/blob/main/HANDOFF.md)，未完成清单看 [OPEN-ITEMS.md](https://github.com/TangVarie/truth-vault/blob/main/OPEN-ITEMS.md)。这一节只写 aw 自己的部分。下面 10-15 那一版里没过时的照旧有效。
 
 ### 线上
 
@@ -13,7 +13,7 @@
 1. **aw#115 写作台第二批 A–C**：TangVarie/autowriter#115，分支 `claude/zen-johnson-m2f14s`，head `3dc1efc`。
    - 内容：交付模板由代码拼交付稿（`deskcore/delivery.py`）；规则的代码检查（`deskcore/rulecheck.py`，打分之后报「必须改 / 建议改」）；限时正则引擎（`validator.search_user_regex`，`config.REGEX_SEARCH_TIMEOUT_SEC` 每条一份，`config.REGEX_CHECK_TOTAL_SEC` 一次检查的总上限）；结构指纹。口径写在 `docs/deskcore.md` §3.9、§3.10。
    - 不带迁移，改了 `deskcore/protocol.md` 和 skill：合并后协议变成 `895ed01874d6`。
-   - Codex 审了 9 轮，第 9 轮的 1 条 P2 已修，10-21 03:05 UTC 请了第 10 轮。
+   - Codex 审了 9 轮，第 9 轮的 1 条 P2 已修，10-21 约 02:50 UTC 请了第 10 轮。
    - **合并条件**：truth-vault 的 `python scripts/codex_gate.py TangVarie/autowriter 115` 输出 PASS、CI 绿、没有未解决的 thread。
    - 合并后：
      1. Railway 自动部署，核 `/health` 的 `build.commit` 是合并提交前 12 位、协议是 `895ed01874d6`。
