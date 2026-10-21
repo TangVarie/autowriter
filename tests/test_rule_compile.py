@@ -902,7 +902,7 @@ def test_a_compile_cut_off_by_shutdown_is_logged(jev, monkeypatch, caplog):
     """后台补编是 daemon 线程: 进程退出(Railway 重新部署, 改一个变量就重新部署)时在路上的那一批被杀在半路, Jev 照样编完、
     计费, 结果没存, 新进程再发一遍。原来一行日志都没有。现在每发一批记一行 INFO, app 收尾时对在路上的那批记 WARNING。"""
     import anyio
-    import deskcore.app as A
+    A = pytest.importorskip("deskcore.app")      # CI 的 smoke 不装 fastapi
     monkeypatch.setattr(config, "RULE_COMPILE_AUTO", True)
     gate = threading.Event()
     compile_one = jev.compile_one
