@@ -1,6 +1,6 @@
 # autowriter / deskcore 交接 · 2026-10-21（最新，先看这一节）
 
-快照 **2026-10-21 03:00 UTC**。三库总交接看 [truth-vault HANDOFF.md 最上面一节](https://github.com/TangVarie/truth-vault/blob/main/HANDOFF.md)，未完成清单看 [OPEN-ITEMS.md](https://github.com/TangVarie/truth-vault/blob/main/OPEN-ITEMS.md)。这一节只写 aw 自己的部分。下面 10-15 那一版里没过时的照旧有效。
+快照 **2026-10-21 03:30 UTC**。三库总交接看 [truth-vault HANDOFF.md 最上面一节](https://github.com/TangVarie/truth-vault/blob/main/HANDOFF.md)，未完成清单看 [OPEN-ITEMS.md](https://github.com/TangVarie/truth-vault/blob/main/OPEN-ITEMS.md)。这一节只写 aw 自己的部分。下面 10-15 那一版里没过时的照旧有效。
 
 ### 线上
 
@@ -10,15 +10,16 @@
 
 ### 在路上的两个 PR
 
-1. **aw#115 写作台第二批 A–C**：TangVarie/autowriter#115，分支 `claude/zen-johnson-m2f14s`，当前 head 以 PR 页为准（10-21 03:10 是 `df76d1a`）。
+1. **aw#115 写作台第二批 A–C**：TangVarie/autowriter#115，分支 `claude/zen-johnson-m2f14s`，当前 head 以 PR 页为准（10-21 03:25 是 `c709793`）。
    - 内容：交付模板由代码拼交付稿（`deskcore/delivery.py`）；规则的代码检查（`deskcore/rulecheck.py`，打分之后报「必须改 / 建议改」）；限时正则引擎（`validator.search_user_regex`，`config.REGEX_SEARCH_TIMEOUT_SEC` 每条一份，`config.REGEX_CHECK_TOTAL_SEC` 一次检查的总上限）；结构指纹。口径写在 `docs/deskcore.md` §3.9、§3.10。
    - 不带迁移，改了 `deskcore/protocol.md` 和 skill：合并后协议变成 `895ed01874d6`。
-   - Codex 每轮的意见都已修。10-21：第 9 轮 1 条 P2（「必须带的话术」只管标题或正文时，那一处空着不报），第 10 轮 1 条 P2（模板不交付的话题 / 评论，查规则还拿原稿查），都已修推；10-21 约 03:10 UTC 请了第 11 轮。前 8 轮每轮推之前先跑独立复审；第 9、10 轮因为周额度没跑独立复审，只跑了全量测试（1667 passed）和 smoke。
+   - Codex 每轮的意见都已修。10-21：第 9 轮 1 条 P2（「必须带的话术」只管标题或正文时，那一处空着不报），第 10 轮 1 条 P2（模板不交付的话题 / 评论，查规则还拿原稿查），第 11 轮 1 条 P2（`^广告$` 这种锚定的话题正则，话题多于一个就漏；现在整行和每个话题都查），都已修推；约 03:25 UTC 请了第 12 轮。前 8 轮每轮推之前先跑独立复审；第 9–11 轮因为周额度没跑独立复审，只跑了全量测试（`c709793` 上 1674 passed）和 smoke。
+   - **Codex 额度**：10-21 03:15 UTC Codex 在 TV#211 上回复「代码审查额度用完」，那一轮没审成（同一时间别的 PR 还审成了）。要是 Codex 一直审不了，按 owner 的规矩先别合，请 owner 去 Codex 设置里看额度。
    - **合并条件**：truth-vault 的 `python scripts/codex_gate.py TangVarie/autowriter 115` 输出 PASS、CI 绿、没有未解决的 thread。
    - 合并后：
      1. Railway 自动部署，核 `/health` 的 `build.commit` 是合并提交前 12 位、协议是 `895ed01874d6`。
      2. 写手重导 skill。服务端探针会在工具返回里提醒，计数看 `/skill-versions`。
-2. **aw#117 aw E：`check_rules` 写手工具 + Jev 编题**：TangVarie/autowriter#117，draft，分支 `claude/aw-e-check-rules`，叠在 aw#115 上，head `69f6037`。
+2. **aw#117 aw E：`check_rules` 写手工具 + Jev 编题**：TangVarie/autowriter#117，draft，分支 `claude/aw-e-check-rules`，叠在 aw#115 上，head `dde446a`。
    - 带迁移 `migrations/015_rule_compiles.sql`，**上线前先在生产跑**。
    - `49a3684` 是 WIP：独立复审提的 12 条只修了一部分，标题和严重程度在 PR 描述里。
    - aw#115 合并后：
@@ -43,8 +44,11 @@
 
 ### 怎么测
 
-- 本地：`python -m pytest tests/ -q`。aw#115 head 上 1659 passed，aw#117 head 上 1772 passed。
-- CI 的 smoke 是 Python 3.11，只装 `requirements.lock`，没有 fastapi / mcp。要这两个的测试得 `pytest.importorskip`，不然 CI 红（aw#117 10-21 踩过一次）。
+- 本地：`python -m pytest tests/ -q`，用装全依赖（含 `deskcore/requirements.txt`）的环境。数字随提交变：10-21 aw#115 `c709793` 上 1674 passed，aw#117 `69f6037` 上 1772 passed。
+- CI 的 smoke 是 Python 3.11。跑整个 `tests/` 的那一步只装了 `requirements.lock` 和 `requirements-dev.txt`，没有 fastapi / mcp。
+  - 要这两个的测试得 `pytest.importorskip`，不然 CI 直接红（aw#117 10-21 踩过一次）。
+  - 但跳过就等于 CI 没覆盖。后面装完 `deskcore/requirements.txt` 的那一步（`.github/workflows/ci.yml` 里 `pip install -r deskcore/requirements.txt httpx` 下面一行）只重跑点名的文件：默认分支上只有 `tests/test_project_isolation.py`，aw#117 加了 `tests/test_rule_compile.py`。新加这类测试要把文件名加到那一行。
+  - 现有十来个依赖 fastapi 的测试文件在 CI 里一直是跳过的，是已知的缺口，只在本地全依赖环境里跑。
 - 计时类测试的「例子本身得慢」前置条件用 `tests/test_regex_safety.py` 的 `_assert_slow_with_re`（aw#115 带进来），别写死毫秒数。CI 机器快，写死的会偶发红。
 
 ---
