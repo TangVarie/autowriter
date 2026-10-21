@@ -1,32 +1,47 @@
 # autowriter / deskcore 交接 · 2026-10-21（最新，先看这一节）
 
-快照 **2026-10-21 03:30 UTC**。三库总交接看 [truth-vault HANDOFF.md 最上面一节](https://github.com/TangVarie/truth-vault/blob/main/HANDOFF.md)，未完成清单看 [OPEN-ITEMS.md](https://github.com/TangVarie/truth-vault/blob/main/OPEN-ITEMS.md)。这一节只写 aw 自己的部分。下面 10-15 那一版里没过时的照旧有效。
+快照 **2026-10-21 08:25 UTC**。上一位接手的 Claude 会话到这里停手，owner 换人接手，不再有人替你盯 PR 或按时检查。三库总交接、接手要按时做的事，看 [truth-vault HANDOFF.md 最上面一节](https://github.com/TangVarie/truth-vault/blob/main/HANDOFF.md)；未完成清单看 [OPEN-ITEMS.md](https://github.com/TangVarie/truth-vault/blob/main/OPEN-ITEMS.md)。这一节只写 aw 自己的部分。下面 10-15 那一版里没过时的照旧有效。
 
 ### 线上
 
-- 默认分支 `claude/xhs-content-workstation-BSEuH` @ `f004490`（aw#116：tv-sync 写 `tv_edit_diffs` 时 `computed_at` 有的带有的不带，PostgREST 补 NULL 撞 23502）。
-- `/health`：`build.commit` = `f0044905bda1`，`protocol_version` = `5ea3b14e1f37`。
+- 默认分支 `claude/xhs-content-workstation-BSEuH` @ `2b96b36`。aw#118 只改文档，上一个改代码的是 `f004490`（aw#116：tv-sync 写 `tv_edit_diffs` 时 `computed_at` 有的带有的不带，PostgREST 补 NULL 撞 23502）。
+- `/health`（08:20 UTC）：`build.commit` = `f0044905bda1`，`protocol_version` = `5ea3b14e1f37`。Railway 按 `2b96b36` 重新部署后 build 会变，协议不变。
 - 生产迁移到 014。015 是 aw#117 的，还没跑。
 
-### 在路上的两个 PR
+### 在路上的 PR
 
-1. **aw#115 写作台第二批 A–C**：TangVarie/autowriter#115，分支 `claude/zen-johnson-m2f14s`，当前 head 以 PR 页为准（10-21 03:25 是 `c709793`）。
-   - 内容：交付模板由代码拼交付稿（`deskcore/delivery.py`）；规则的代码检查（`deskcore/rulecheck.py`，打分之后报「必须改 / 建议改」）；限时正则引擎（`validator.search_user_regex`，`config.REGEX_SEARCH_TIMEOUT_SEC` 每条一份，`config.REGEX_CHECK_TOTAL_SEC` 一次检查的总上限）；结构指纹。口径写在 `docs/deskcore.md` §3.9、§3.10。
+1. **aw#115 写作台第二批 A–C**：TangVarie/autowriter#115，分支 `claude/zen-johnson-m2f14s`。
+   - **状态**：head `c709793`，CI 绿，没有冲突，已是 ready。Codex 第 12 轮 08:09 UTC 开始审，交接时还没出结果。
+   - **内容**：口径写在 `docs/deskcore.md` §3.9、§3.10。
+     - 交付模板由代码拼交付稿（`deskcore/delivery.py`）。
+     - 规则的代码检查（`deskcore/rulecheck.py`，打分之后报「必须改 / 建议改」）。
+     - 限时正则引擎（`validator.search_user_regex`；`config.REGEX_SEARCH_TIMEOUT_SEC` 每条一份，`config.REGEX_CHECK_TOTAL_SEC` 一次检查的总上限）。
+     - 结构指纹。
    - 不带迁移，改了 `deskcore/protocol.md` 和 skill：合并后协议变成 `895ed01874d6`。
-   - Codex 每轮的意见都已修。10-21：第 9 轮 1 条 P2（「必须带的话术」只管标题或正文时，那一处空着不报），第 10 轮 1 条 P2（模板不交付的话题 / 评论，查规则还拿原稿查），第 11 轮 1 条 P2（`^广告$` 这种锚定的话题正则，话题多于一个就漏；现在整行和每个话题都查），都已修推；约 03:25 UTC 请了第 12 轮。前 8 轮每轮推之前先跑独立复审；第 9–11 轮因为周额度没跑独立复审，只跑了全量测试（`c709793` 上 1674 passed）和 smoke。
-   - **Codex 额度**：10-21 03:15 UTC Codex 在 TV#211 上回复「代码审查额度用完」，那一轮没审成（同一时间别的 PR 还审成了）。要是 Codex 一直审不了，按 owner 的规矩先别合，请 owner 去 Codex 设置里看额度。
-   - **合并条件**：truth-vault 的 `python scripts/codex_gate.py TangVarie/autowriter 115` 输出 PASS、CI 绿、没有未解决的 thread。
-   - 合并后：
+   - **10-21 这几轮**：
+     - 第 9 轮：「必须带的话术」只管标题或正文时，那一处空着不报。
+     - 第 10 轮：模板不交付的话题 / 评论，查规则还拿原稿查。
+     - 第 11 轮：`^广告$` 这种锚定的话题正则，话题多于一个就漏；现在整行和每个话题都查。
+     - 三轮都已修推。第 9–11 轮没跑独立复审（上一会话的子代理额度用完），只跑了全量测试（`c709793` 上 1674 passed）和 smoke。
+   - **合并条件**：truth-vault 的 `python scripts/codex_gate.py TangVarie/autowriter 115` 输出 PASS、CI 绿、没有未解决的 thread。有意见就修、在 thread 上回、推、再 `@codex review`。
+   - **合并后**：
      1. Railway 自动部署，核 `/health` 的 `build.commit` 是合并提交前 12 位、协议是 `895ed01874d6`。
      2. 写手重导 skill。服务端探针会在工具返回里提醒，计数看 `/skill-versions`。
-2. **aw#117 aw E：`check_rules` 写手工具 + Jev 编题**：TangVarie/autowriter#117，draft，分支 `claude/aw-e-check-rules`，叠在 aw#115 上，head `dde446a`。
+2. **aw#117 aw E：`check_rules` 写手工具 + Jev 编题**：TangVarie/autowriter#117，分支 `claude/aw-e-check-rules`。
+   - **状态**：head `52eca1b`，CI 绿，没有冲突。08:16 UTC 被改成 ready，Codex 自动开始审 `52eca1b`。
+   - `52eca1b` 把 aw#115 的 `c709793` 合了进来。冲突处理：
+     - 两条查规则的路径（`score_drafts` 的 rule_checks 和 `check_rules`）共用 `core._as_delivered`，现在一律走 `delivery.delivered_draft`；
+     - skill 用 `python -m deskcore.cli sync-skill` 重新生成，协议 `be4d668f5ab6`；
+     - 本地全量 1827 passed。
+   - ⚠️ **base 还是 aw#115 的分支 `claude/zen-johnson-m2f14s`，aw#115 合并之前不要合它**，否则 aw E 的代码会混进 aw#115。
    - 带迁移 `migrations/015_rule_compiles.sql`，**上线前先在生产跑**。
    - `49a3684` 是 WIP：独立复审提的 12 条只修了一部分，标题和严重程度在 PR 描述里。
-   - aw#115 合并后：
-     1. rebase 到默认分支，base 改成 `claude/xhs-content-workstation-BSEuH`。
+   - **aw#115 合并后**：
+     1. base 改成 `claude/xhs-content-workstation-BSEuH`，把默认分支合进来。
      2. 确认 `49a3684` 里的回归测试在修复前确实失败。
      3. 修完剩下的复审意见，再过 Codex。
    - Jev 侧 `/compile_rules` 已在线（Jev#23），编题 key 已配。
+3. **aw#119**：TangVarie/autowriter#119，CI 装完 deskcore 依赖后重跑 `tests/`，让依赖 fastapi / mcp 的测试真跑起来。owner 另开会话在做。合了以后，下面「怎么测」里那条已知缺口就补上了。
 
 ### aw#115 部署之后的数据操作
 
