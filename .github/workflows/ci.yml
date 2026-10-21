@@ -2452,7 +2452,8 @@ jobs:
           # 运行期问题在 CI 里【完全没有覆盖】。这里补上: 装增量依赖, 起
           # TestClient 真打一次 /health。
           pip install -r deskcore/requirements.txt httpx
-          python -m pytest tests/test_project_isolation.py -q
+          # 上面整个 tests/ 那一步没有 fastapi / mcp, 要它们的用例 importorskip 跳过了: 装完在这里重跑, 不然 CI 不覆盖
+          python -m pytest tests/test_project_isolation.py tests/test_rule_compile.py -q
           python - <<'PY'
           import os
           os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
