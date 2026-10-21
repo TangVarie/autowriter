@@ -2452,8 +2452,14 @@ jobs:
           # 运行期问题在 CI 里【完全没有覆盖】。这里补上: 装增量依赖, 起
           # TestClient 真打一次 /health。
           pip install -r deskcore/requirements.txt httpx
-          # 上面整个 tests/ 那一步没有 fastapi / mcp, 要它们的用例 importorskip 跳过了: 装完在这里重跑, 不然 CI 不覆盖
-          python -m pytest tests/test_project_isolation.py tests/test_rule_compile.py -q
+          # 主测试保留不装 fastapi / mcp 的导入检查; 装全依赖后再跑整个 tests/,
+          # 包含 check_rules 的 REST/MCP 测试, 避免点名文件遗漏新测试(同 aw#119)。
+          set -o pipefail
+          python -m pytest tests/ -q -ra | tee "$RUNNER_TEMP/pytest-full.log"
+          if grep "could not import" "$RUNNER_TEMP/pytest-full.log"; then
+            echo "::error::装了 deskcore/requirements.txt 之后仍有用例因缺依赖被跳过(见上)"
+            exit 1
+          fi
           python - <<'PY'
           import os
           os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")

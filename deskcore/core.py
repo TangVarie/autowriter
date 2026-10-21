@@ -3918,6 +3918,8 @@ def migration_state(client) -> dict:
     # ── 015: 规则编译结果的缓存(D-121) ──
     state, note = _probe_ok(lambda: client.table("rule_compiles").select("memory_id, sha, result").limit(1).execute(),
                             predicate=store.schema_object_missing)
+    if state == "denied":
+        state, note = "missing", "表在, 但 service_role 缺权限 —— 重跑 015(它自己带 GRANT, 不是 007)。" + note
     _add(MIGRATION_RULE_COMPILES, "表 rule_compiles", state, note,
          "可降级: compile-rules 和后台补编读不了缓存就报 error、一条都不发(不花编译的钱); check_rules 读不到编译结果"
          "就回 status=error、记日志(写手那边是这次规则没查成, 不是 500), 简报和存档不受影响")
@@ -4814,6 +4816,11 @@ def set_rule_state(client, memory_id: str, action: str, *,
                              f"收到 {direction!r}")
 
     saved = store.update_memory_fields(client, memory_id, fields)
+    if (saved and (row.get("scope") or "") == "project"
+            and (saved.get("status") or "").lower() == "confirmed"
+            and (action == "promote" or (action == "set_direction"
+                 and (saved.get("applicability") or "").strip() != (row.get("applicability") or "").strip()))):
+        _kick_rule_compile(client, row["project_id"], reason="set_rule_state", bypass_cooldown=True)
     return {
         "memory_id": memory_id,
         "content": (row.get("content") or "")[:120],
@@ -5354,9 +5361,14 @@ def _withdrawn_tip(n: int) -> str:
     return f"有 {n} 条规则撤掉了代码检查, Jev 又只编成了代码检查(没有规则题), 这次没查, 不能说它们守住了。"
 
 
+def _questions_unchecked_tip(n: int) -> str:
+    return (f"有 {n} 条规则的缓存题目形状不对或题号重复, 部分题目没查(见 rules.questions_unchecked_rules), "
+            "不能说整条规则守住了; 要运维修复编译结果。")
+
+
 def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str = "",
                            code_unavailable: int = 0, not_compilable: int = 0, code_refused: int = 0,
-                           partial: int = 0, code_withdrawn: int = 0) -> str:
+                           partial: int = 0, code_withdrawn: int = 0, questions_unchecked: int = 0) -> str:
     tips = []
     if summary.get("must_fix"):
         tips.append("「必须改」的照 what / evidence 改完, 那几篇用 score_drafts 带 replaces_version_id 再存一次(会重新打分), "
@@ -5388,6 +5400,8 @@ def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str =
                     "rules.partial_rules 的 uncovered 里), 不能说它们整条守住了。")
     if code_withdrawn:
         tips.append(_withdrawn_tip(code_withdrawn))
+    if questions_unchecked:
+        tips.append(_questions_unchecked_tip(questions_unchecked))
     if summary.get("code_unchecked"):
         # 「同一篇里已经列在 violations 的照改」: 正则先在标题上命中、再在正文上超时时, 同一条同一篇既是「必须改」又在
         # code_unchecked 里, 只说「不是违规」写手会当成连那条命中一起撤了(同 score_drafts 的 rule_checks_unchecked; 独立复审 on aw E)
@@ -5508,7 +5522,8 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
             missing.append((mid, sha))
     uncompiled = len(missing)
 
-    bank = rulecompile.project_bank([res for _, res in pairs])
+    skipped_questions: set[str] = set()
+    bank = rulecompile.project_bank([res for _, res in pairs], skipped=skipped_questions)
     questions = rulecompile.question_index(pairs, bank)
     code, code_unavailable = rulecompile.code_rules(pairs)
     # payload 在这里按人设 check 的同一套规矩校一遍(rulecheck.spec_of: 正则过 validator.assert_regex_is_safe + 量词形状那道),
@@ -5519,7 +5534,7 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     # 说成「流程、交付、写作方向」那种查不了): 人设了能跑的 check 的(score_drafts 存档时已经按人设的查过)、写手撤掉了
     # 代码检查的(Jev 只编成了 code、没有规则题时这次什么都没查它, 不能说它守住了)。
     skipped_code = [(r, res) for r, res in pairs if str(r.get("id")) not in judged and isinstance(res.get("code"), dict)]
-    by_score_drafts = sum(1 for r, _ in skipped_code if rulecompile.hand_set(r))
+    by_score_drafts = sum(1 for r in pool if rulecompile.hand_set(r))
     code_withdrawn = sum(1 for r, _ in skipped_code if rulecompile.withdrawn(r))
     rules_info = {"pool": len(pool),
                   "by_jev": len(judged),
@@ -5532,6 +5547,9 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
         rules_info["by_score_drafts"] = by_score_drafts
     if code_withdrawn:
         rules_info["code_withdrawn"] = code_withdrawn
+    if skipped_questions:
+        rules_info["questions_unchecked"] = len(skipped_questions)
+        rules_info["questions_unchecked_rules"] = sorted(skipped_questions)
     # Jev 编译时标了 coverage=partial 的(一条规则的要求没全装进题 / 代码, 没装进去的写在 uncovered): 这次查了的也只是
     # 一部分, 题全守住 / 代码没命中也不能说整条守住了(2026-10-20 第三轮复审: 原来 coverage / uncovered 这边一处都不读,
     # 「标题不超过 20 字, 正文要带某句话术」只编出了标题那一半, 标题短就报「这次查的规则都守住了」)。只数这次真查了的。
@@ -5576,6 +5594,8 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
             parts.append(_never_checked_tip(not_compilable, 0))
         if code_withdrawn:
             parts.append(_withdrawn_tip(code_withdrawn))
+        if skipped_questions:
+            parts.append(_questions_unchecked_tip(len(skipped_questions)))
         if by_score_drafts:
             # 人设了 check 的: 不是查不了, 是 score_drafts 存档时已经查过; 那边报的「必须改」照改, 不能说「不用做什么」
             # (独立复审 on aw E)
@@ -5655,7 +5675,12 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                     jev_detail = f"查库用完了 {budget:g}s 的预算, 规则题没来得及发"
                     jev = {vid: {"judge_status": judge_client.JUDGE_TIMEOUT} for vid, _ in targets}
                 else:
-                    left = _left()
+                    def _judge_before_deadline(payload):
+                        left = _left()
+                        if left <= 0:
+                            return {"judge_status": judge_client.JUDGE_TIMEOUT}
+                        return judge_client.judge_draft_full(payload, timeout=left)
+
                     for vid, v in targets:
                         if not (v["body"] or "").strip():
                             jev[vid] = {"judge_status": "empty_body"}
@@ -5663,7 +5688,7 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                         payload = judge_client.build_rules_request(
                             version_id=vid, title=v["title"], body=v["body"], project=ctx["project"],
                             category=ctx["category"], project_bank=bank)
-                        futs[ex.submit(judge_client.judge_draft_full, payload, timeout=left)] = vid
+                        futs[ex.submit(_judge_before_deadline, payload)] = vid
                     done, _pending = cf.wait(list(futs), timeout=_left())
             finally:
                 ex.shutdown(wait=False, cancel_futures=True)
@@ -5706,6 +5731,7 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                 found_v += got["violations"]
                 unsure = got["unsure"]
                 unjudged = got["unjudged"]
+                summary["unjudged"] += len(unjudged)
                 if unjudged and len(unjudged) == len(questions):
                     # 回来了, 却一道题都没判出来(回包里没有 desk_rules / 每题都带 invalid_reason): 和没判完一样, 不能当
                     # 守住了(2026-10-20 复审: 原来这里只记个数, summary 不看它, next_step 照说「都守住了」)
@@ -5715,8 +5741,6 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                         "Jev 标了判不了: " + "、".join(sorted({u["reason"] for u in unjudged}))
                     ) + "), 不能当作守住了规则")
                     summary["not_finished"] += 1
-                elif unjudged:
-                    summary["unjudged"] += len(unjudged)
                 if unjudged:
                     row["unjudged"] = unjudged[:CHECK_RULES_MAX_UNSURE]
             else:
@@ -5768,7 +5792,7 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
         out["judge_detail"] = mask_secrets(str(jev_detail))[:_JUDGE_BLOCK_TEXT_MAX]
     out["next_step"] = _check_rules_next_step(summary, uncompiled, uncompiled_why, len(code_unavailable),
                                               not_compilable, rules_info.get("code_refused", 0), len(partial),
-                                              code_withdrawn)
+                                              code_withdrawn, len(skipped_questions))
     if rest:
         out["next_step"] += _check_rules_remaining_step(rest)
     out["elapsed_ms"] = _ms_since(started)

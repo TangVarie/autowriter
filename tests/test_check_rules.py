@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 
 import pytest
 
@@ -421,7 +422,63 @@ def test_a_version_whose_rule_questions_all_came_back_unjudged_is_not_kept(wired
     assert v1["judge_status"] == "not_judged" and "一道都没判出来" in v1["judge_note"] and note in v1["judge_note"]
     assert v1["violations"] == [] and v1["counts"]["unjudged"] == 1
     assert out["summary"]["not_finished"] == 1
+    assert out["summary"]["unjudged"] == v1["counts"]["unjudged"]
     assert "都守住了" not in out["next_step"] and "没判完" in out["next_step"]
+
+
+@pytest.mark.parametrize("compiled", ["not_checkable", "questions", "missing"])
+def test_hand_set_checks_are_counted_without_compiled_code(wired, compiled):
+    result = q_soft(R_HANDSET)
+    if compiled == "not_checkable":
+        result = {**result, "verdict": "not_checkable", "questions": []}
+    compiles = [] if compiled == "missing" else [stored(R_HANDSET, result)]
+    out = core.check_rules(full_client(memories=[R_HANDSET], compiles=compiles, versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    assert out["rules"]["by_score_drafts"] == 1
+    assert "流程、交付、写作方向" not in out["next_step"]
+
+
+@pytest.mark.parametrize("bad_question", [{"ask": "坏的题"}, "bad", None, "duplicate"])
+def test_skipped_cached_questions_never_report_the_whole_rule_kept(wired, bad_question):
+    result = q_soft()
+    first = result["questions"][0]
+    result["questions"].append(dict(first) if bad_question == "duplicate" else bad_question)
+    wired.judge = answers(**{first["qid"]: {"answer": "是", "p": 0.95, "ambiguous": False}})
+    out = core.check_rules(full_client(memories=[R_SOFT], compiles=[stored(R_SOFT, result)], versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    assert out["versions"][0]["counts"]["must_fix"] == 0
+    assert out["rules"]["questions_unchecked"] == 1
+    assert out["rules"]["questions_unchecked_rules"] == [R_SOFT["id"]]
+    assert "都守住了" not in out["next_step"] and "没查" in out["next_step"]
+
+
+def test_queued_judge_calls_use_the_remaining_shared_budget(wired, monkeypatch):
+    monkeypatch.setattr(core, "CHECK_RULES_WORKERS", 1)
+    ticks = [time.monotonic()]
+    clock = type("Clock", (), {"monotonic": staticmethod(lambda: ticks[0])})()
+    monkeypatch.setattr(core, "time", clock)
+    calls = []
+
+    def judge(payload, *, timeout):
+        calls.append(timeout)
+        ticks[0] += 10
+        return {"judge_status": core.judge_client.JUDGE_OK, "response": {"detail": {}}}
+
+    monkeypatch.setattr(core.judge_client, "judge_draft_full", judge)
+    ids = [str(uuid.UUID(int=i + 1)) for i in range(3)]
+    core.check_rules(full_client(memories=[R_SOFT], compiles=[stored(R_SOFT, q_soft())],
+                                 versions=[version(vid) for vid in ids]), PROJ, ids, user_id=ME)
+    assert calls == [18.0, 8.0], "第三个任务起跑时预算已用完, 不许再发请求"
+
+
+@pytest.mark.parametrize("questions", [[], 123, {"qid": "bad"}, [None]])
+def test_a_wholly_unusable_question_cache_is_reported_without_crashing(wired, questions):
+    result = {**q_soft(), "questions": questions}
+    out = core.check_rules(full_client(memories=[R_SOFT], compiles=[stored(R_SOFT, result)], versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    assert out["status"] == "nothing_to_check" and out["rules"]["questions_unchecked"] == 1
+    assert "没查" in out["next_step"] and "都守住了" not in out["next_step"]
+    assert wired.calls == []
 
 
 def test_partly_unjudged_versions_say_how_many_questions_were_not_judged(wired):

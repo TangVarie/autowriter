@@ -758,3 +758,15 @@ def test_011_view_without_grant_points_at_011_not_007(err):
     note = next(c["note"] for c in report["checks"]
                 if c["migration"] == "011_angle_outcomes_view.sql")
     assert "重跑 011" in note
+
+
+def test_rule_compiles_missing_grant_points_to_015():
+    class DeniedCompiles(FakeClient):
+        def _execute(self, q):
+            if q.table_name == "rule_compiles":
+                raise RuntimeError('42501 permission denied for table rule_compiles')
+            return super()._execute(q)
+
+    report = core.migration_state(DeniedCompiles(rows=_TABLES, rpc_impl=_ALL_RPCS))
+    assert "015_rule_compiles.sql" in report["missing"]
+    assert "007_deskcore_table_grants.sql" not in report["missing"]

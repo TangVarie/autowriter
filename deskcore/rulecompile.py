@@ -94,16 +94,18 @@ def usable(result) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 
 def _question_ok(q) -> bool:
-    return (isinstance(q, dict) and isinstance(q.get("qid"), str) and QID_RE.match(q["qid"]) is not None
+    return (isinstance(q, dict) and isinstance(q.get("qid"), str) and QID_RE.fullmatch(q["qid"]) is not None
             and isinstance(q.get("ask"), str) and q["ask"].strip() != ""
-            and q.get("pass_if") in PASS_IF and q.get("scope") in SCOPES)
+            and q.get("pass_if") in PASS_IF and q.get("scope") in SCOPES
+            and (q.get("note") is None or isinstance(q.get("note"), str)))
 
 
-def project_bank(results: list[dict]) -> dict | None:
+def project_bank(results: list[dict], *, skipped: set[str] | None = None) -> dict | None:
     """编出来的题 → ``/judge_draft`` 的内联 project_bank(Jev 格式题库 dict); 一道题都没有回 None。
 
     Jev ``rules.to_project_bank`` 的移植(逐字节一致, 见模块头), 只差一处: 形状不对 / 题号重复的题**跳过并记日志**,
-    不抛 —— 那边是编译当场校验, 这里读的是缓存, 一条坏的不该让整份题库发不出去。
+    不抛 —— 那边是编译当场校验, 这里读的是缓存, 一条坏的不该让整份题库发不出去。跳过的规则 id 写进 skipped,
+    调用方必须把没问的那部分报出来, 不能拿剩下的题替整条规则作保。
       · 每题 noul、criteria 是 / 否、scope 原样; evidence 跟着 pass_if 走: pass_if「否」的题(答「是」= 违反)on_true,
         依据句就是要改的那句; pass_if「是」的题 never(答「否」是缺了什么, 本来就没有一句可指);
       · 不产出 hard_rules: 这些题只作建议(D-121), 调用方不能把它们写进 /judge_draft 的 hard_rules 或 brief。"""
@@ -112,12 +114,22 @@ def project_bank(results: list[dict]) -> dict | None:
     for r in results:
         if not usable(r) or r.get("verdict") != "questions":
             continue
-        for q in r.get("questions") or []:
+        raw = r.get("questions")
+        if not isinstance(raw, list) or not raw:
+            if skipped is not None:
+                skipped.add(str(r.get("id")))
+            logger.warning("rulecompile: 规则 %s 没有可用的题目列表", r.get("id"))
+            continue
+        for q in raw:
             if not _question_ok(q):
+                if skipped is not None:
+                    skipped.add(str(r.get("id")))
                 logger.warning("rulecompile: 规则 %s 的一道题形状不对, 跳过", r.get("id"))
                 continue
             qid = q["qid"]
             if qid in seen:
+                if skipped is not None:
+                    skipped.add(str(r.get("id")))
                 logger.warning("rulecompile: 题号 %s 重复(规则 %s), 跳过", qid, r.get("id"))
                 continue
             seen.add(qid)
@@ -144,7 +156,10 @@ def question_index(pairs: list[tuple[dict, dict]], bank: dict | None) -> dict[st
         if not usable(res) or res.get("verdict") != "questions":
             continue
         sev = "hard" if (rule.get("severity") or "soft").lower() == "hard" else "soft"
-        for q in res.get("questions") or []:
+        raw = res.get("questions")
+        if not isinstance(raw, list):
+            continue
+        for q in raw:
             if _question_ok(q) and q["qid"] in in_bank and q["qid"] not in out:
                 out[q["qid"]] = {"rule_id": str(rule.get("id")), "severity": sev, "ask": q["ask"].strip(),
                                  "pass_if": q["pass_if"], "note": (q.get("note") or "").strip()}

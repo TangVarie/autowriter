@@ -813,7 +813,7 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
    `rulecompile.withdrawn`）编出来的 `code` 也不跑，规则题照判；AW 录规则界面写的 `free_text` 不带标记，不算撤掉。
    Jev 只编成了 `code`、没有规则题的那条撤掉之后就没有东西查它了：数进 `rules.code_withdrawn`，`next_step` 说这几条这次没查、
    不能说守住了（独立复审 on aw E：撤掉不改 sha，不会重编；原来这条哪个桶都不进，照说「都守住了」）。
-   人设了能跑的 check 的规则编出来的 `code` 不跑，数进 `rules.by_score_drafts`（`score_drafts` 存档时已经按人设的查过）。
+   人设了能跑的 check 的规则编出来的 `code` 不跑，独立于 Jev 有没有编出 `code`，均数进 `rules.by_score_drafts`（`score_drafts` 存档时已经按人设的查过）。
    `nothing_to_check` 的「流程、交付、写作方向」那句只在每条编译结果都是 `not_checkable` 时说（独立复审 on aw E：原来池子不空就这么说，
    人设了 check 的、撤掉了代码检查的也被说成流程规则，还说「不用做什么」）：有人设的就说 `score_drafts` 已经按它查过、那边的「必须改」照改，
    有撤掉的就说这几条没查、不能说守住了。
@@ -835,7 +835,7 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
 记「没判出来」，不报违反也不报守住，**没有例外**——同 Jev README「规则编译 → 送回 /judge_draft」的契约。`evidence_not_found`
 （答了「是」却指不出依据句，TV 账本里那一行 answer 为 NULL）也是没判出来（10-20 第二轮复审：原来它落在 `pass_if`「否」的题上时照算违反，
 硬规则报「必须改」，写手照着一个账本里记成无效的答案去改稿，还不知道改哪一句）。没判出来的题数进那篇的 `counts.unjudged`（`unjudged` 列出规则 id
-和原因，最多 5 条）、全部篇加起来进 `summary.unjudged`，`next_step` 说「另有 N 道规则题这次没判出来，不能说守住了」；一道都没判出来的
+和原因，最多 5 条）、全部篇加起来进 `summary.unjudged`（整篇所有题都未判出来的也计入），`next_step` 说「另有 N 道规则题这次没判出来，不能说守住了」；一道都没判出来的
 那篇（回包里没有 `desk_rules`，或每题都带 `invalid_reason`）记 `judge_status: not_judged`，和没判完一样算进 `summary.not_finished`。
 10-20 复审：原来这里只在那篇上记个数，`summary` 不看它，`next_step` 照说「这次查的规则都守住了」——现在这句只在必须改 / 建议改 /
 拿不准 / 没判完 / 没判出来 / 没编译结果 / 话题评论查不了 / 编不了 / 编出来的检查没跑 / 只查了一部分 / 代码没查完 / 撤掉了代码检查又没有题 /
@@ -1142,3 +1142,5 @@ Claude Code：`claude mcp add --transport http deskcore <url>/mcp --header "X-De
 
    ⚠️ **按 `owner_id` 隔离之后这条张力换了形态**（见 §2.2.1）。原来的设想是"两个人打开同一个项目"，而现在一个项目只有一个 owner，跨人协作要么共用一个 `user_id`（那样个人层就退化没了），要么等真正的团队模型。真要做团队共享时，改的是 `core.assert_project_access` 一处——但那是个产品决策，不是顺手改。
 7. **native 正例的 essence 不可测。** 运营手标的正例没有 `external_source_id`，join 不到 `truth_vault.notes`，拿不到 `emotional_lever`，所以 TV 的饱和度监控对它们只能报"无法评估"。想让它可测需要给这些正例补 essence 标注。
+
+**10-21 审查补充。** `set_rule_state` 把项目规则升成生效或修改生效规则的方向后，立即触发后台补编并绕过冷却。排队的判定任务在开始请求时重算整次剩余时间，截止后不再发送。缓存中形状不对、题号重复或缺少题目列表的规则列入 `rules.questions_unchecked` / `rules.questions_unchecked_rules`；幸存题目即使都通过，也不能声称整条规则守住。`doctor` 对规则缓存表的权限缺失指向迁移 015。CI 在安装全部接口依赖后重跑整个测试目录。
