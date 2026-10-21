@@ -2307,13 +2307,14 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             # hard 不过这道闸, 同简报。判据也同简报: 项目名 + 这场 open_project 传的 tactic(写手原样传回来, codex review
             # on aw#115) —— 只按项目名判的话, 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又全报一遍。
             soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or "", tactic or ""))
-            # 模板管话题时, 查的是交付出去的那一份, 免得和 delivery.text 对不上: 话题含固定 / 条件话题; 正文是摘掉末尾那行
-            # 话题之后的(codex review on aw#115: 拿原稿查的话, 话题行里的词会被报成「正文里有」, 必须带的话术也能靠它混过去)
+            # 有交付模板时, 查的是交付出去的那一份, 免得和 delivery.text 对不上(delivery.delivered_draft): 模板管话题的, 话题含
+            # 固定 / 条件话题、正文是摘掉末尾那行话题之后的; 不管话题的, tags 字段不算、只认正文里的 #话题; comments 是 null 的,
+            # 评论不算(codex review on aw#115: 拿原稿查的话, 不交付的话题 / 评论里的词照报违规, 必须带的话术也能靠它们混过去)
             checked, final_tags = picked, None
-            if tpl is not None and delivery.wants_tags(tpl):
-                posts = [delivery.delivered_post(tpl, d) for d in picked]
-                checked = [{**d, "body": body} for d, (body, _tags) in zip(picked, posts)]
-                final_tags = [tags for _body, tags in posts]
+            if tpl is not None:
+                views = [delivery.delivered_draft(tpl, d) for d in picked]
+                checked = [view for view, _tags in views]
+                final_tags = [tags for _view, tags in views]
             # 模板要求每篇都带的部位(评论 min ≥ 1、要话题): 空着的话「必须带的话术」照没带报, 不能靠不交那一块混过去(codex review
             # on aw#115)。没模板、模板不要求的部位, 空着照旧不查(评论常常是后面另走评论那一步写的)
             expects = delivery.expected_parts(tpl) if tpl is not None else ()

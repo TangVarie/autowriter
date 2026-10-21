@@ -879,6 +879,55 @@ def test_fixed_tags_from_the_template_count_as_tags_given():
     assert [h["rule_id"] for h in out["rule_checks"]] == ["m-2"]
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 模板不交付的话题 / 评论不查(codex review on aw#115 第十轮)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_delivered_draft_drops_what_the_template_does_not_deliver():
+    draft = {"title": "甲", "body": "正文 #中间话题 接着写\r\n结尾", "tags": ["不拼的"], "comments": ["不拼的评论"]}
+    view, tags = delivery.delivered_draft({"layout": "blocks"}, draft)
+    assert (view["body"], tags, view["tags"], view["comments"]) == ("正文 #中间话题 接着写\n结尾", ["中间话题"], ["中间话题"], None)
+    with_comments = {"layout": "blocks", "comments": {"min": 0, "max": 2, **_COMMENTS}}
+    assert delivery.delivered_draft(with_comments, draft)[0]["comments"] == ["不拼的评论"]
+    view, tags = delivery.delivered_draft({"layout": "blocks", "tags": {"content": 1, "fixed": ["示例固定"]}},
+                                          {"title": "甲", "body": "正文\n#末尾话题", "tags": None})
+    assert (view["body"], tags) == ("正文", ["末尾话题", "示例固定"])
+
+
+@pytest.mark.parametrize("default_params, body_tag, hit", [
+    (None, False, True),
+    (_tpl(), False, False),
+    (_tpl(), True, True),
+    (_tpl(tags={"content": 1}), False, True),
+], ids=["no-template", "layout-only-template", "layout-only-tag-in-body", "template-with-tags"])
+def test_a_tag_rule_at_scoring_sees_only_the_tags_that_are_delivered(default_params, body_tag, hit):
+    """只管版式的模板不拼 tags 字段(assemble 报没拼进去): 那里的词不交付, 不报违规; 正文里的 #话题照样交付、照样查。"""
+    rule = _rule(1, "forbidden_word", {"words": ["示例禁词"], "where": ["tags"]})
+    c = desk_client(default_params=default_params, memories=[rule])
+    drafts = distinct_drafts(1)
+    drafts[0]["tags"] = ["示例禁词"]
+    if body_tag:
+        drafts[0]["body"] += "\n#示例禁词"
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert [h["rule_id"] for h in out.get("rule_checks", [])] == (["m-1"] if hit else [])
+
+
+@pytest.mark.parametrize("default_params, delivered", [
+    (None, True),
+    (_tpl(), False),
+    (_tpl(comments={"min": 0, "max": 2, **_COMMENTS}), True),
+], ids=["no-template", "template-without-comments", "template-with-comments"])
+def test_a_comment_rule_at_scoring_sees_only_the_comments_that_are_delivered(default_params, delivered):
+    """模板 comments 是 null: 评论不拼, 里面的禁用词不报, 必须带的话术也不能靠它混过去。"""
+    forbid = _rule(1, "forbidden_word", {"words": ["示例禁词"], "where": ["comments"]})
+    need = _rule(2, "required_phrase", {"any": ["示例口播"], "where": ["body", "comments"]})
+    c = desk_client(default_params=default_params, memories=[forbid, need])
+    drafts = distinct_drafts(1)
+    drafts[0]["comments"] = [{"role": "reader", "text": "示例禁词 示例口播"}]
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert [h["rule_id"] for h in out.get("rule_checks", [])] == (["m-1"] if delivered else ["m-2"])
+
+
 def test_the_generation_path_never_judges_a_comment_or_tag_phrase_rule():
     """AW 生成链路(validator.check_hard_rules)只看得到标题正文: 只管评论 / 话题的必须带的话术它一律跳过(_spec_from_desk),
     不管模板要不要 —— 生成出来的东西里本来就没有评论。"""

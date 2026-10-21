@@ -671,8 +671,9 @@ forbidden_word / required_phrase / max_len / forbidden_regex / free_text），�
 `rule_kind` 收窄、不取向量（每次存档多拉几百 KB 向量是白花的）。soft 的再过简报那道**方向闸**（`filter_by_applicability`，按项目名
 加写手原样传回来的 `tactic` 判，同简报；codex review on aw#115）：标了另一个方向的 soft 规则简报里没有，这里也不查，不然产品向的"带上产品名"会报到流量向项目上；
 hard 不过这道闸，同简报。简报的相关性筛选和每层 12 条的封顶**不做**：那两道是给注入的文字限量的，记了 check 的规则每次都查。
-模板管话题时，查的是交付出去的那一份：话题含模板加的固定 / 条件话题，正文是摘掉末尾那行话题之后的（`delivery.delivered_post`），
-和 `delivery.text` 对得上。
+有交付模板时，查的是交付出去的那一份（`delivery.delivered_draft`），和 `delivery.text` 对得上：模板管话题的，话题含模板加的固定 / 条件话题，
+正文是摘掉末尾那行话题之后的；不管话题的，`tags` 字段不拼、也不查，只认正文里的 `#话题`；`comments` 是 null 的，评论不拼、也不查
+（codex review on aw#115：拿原稿查的话，不交付的话题 / 评论里的词照报违规，必须带的话术也能靠它们混过去）。没模板的照原稿查。
 只查存进去了的稿子，有命中才带 `rule_checks`（每条 `index` / `rule_id` / `severity` / `where` / `what`，`what` 以「必须改」或
 「建议改」开头，必须改的全列，建议改按篇号补到一共 40 条为止，多的报个数在 `rule_checks_more`）。不调模型、不出网、不拦存档；
 查询失败记日志并带 `rule_checks_status = "error"`（不带的话和"查过了、没命中"一模一样）。正则规则这次没查完的（没在时限内跑完，或者限时的引擎跑不了），以及存的 check 用不了的（写坏了，或者是这里不查的老写法，比如 `max_len` 的「开头」；原来只在 batch_metrics 里记个数，回包和「查过了、没命中」一模一样，codex review on aw#115），列在

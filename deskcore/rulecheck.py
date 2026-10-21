@@ -252,8 +252,8 @@ _count = validator.count_chars
 def _parts(d: dict, tags: list[str] | None = None) -> dict[str, list[str]]:
     """一篇稿 → 各部位的文本。tags 是写手传的 tags 加正文里的 #话题; comments 一条一项。
 
-    ``tags`` 给了就用它(项目有交付模板且模板管话题时, core 传交付出去的那一份: 含模板加的固定 / 条件话题; 那时 ``d`` 的
-    body 也是交付出去的、摘掉了末尾那行话题的正文, 见 delivery.delivered_post)。"""
+    ``tags`` 给了就用它(项目有交付模板时, core 传交付出去的那一份: 管话题的含模板加的固定 / 条件话题, 不管话题的只有正文里的
+    #话题; 那时 ``d`` 也是交付出去的那份稿子, 见 delivery.delivered_draft)。"""
     body = str(d.get("body") or "")
     if tags is None:
         # 写手传的 tags 和正文末尾那行 #话题 常常是同一批(约六分之一的稿子末尾带一行): 去重, 不然「话题不超过 N 个」

@@ -372,6 +372,25 @@ def delivered_post(template: dict, draft: dict) -> tuple[str, list[str]] | None:
     return body, _dedupe(tags + body_tags(body))
 
 
+def delivered_draft(template: dict, draft: dict) -> tuple[dict, list[str]]:
+    """这篇照模板交付出去的样子: (查规则用的那份稿子, 交付出去的全部话题)。rulecheck 查的就是它, 和 delivery.text 对得上。
+
+    - 模板管话题: 正文、话题同 delivered_post(摘掉末尾那行话题的正文; 模板拼的话题行 + 正文中间留下的 #话题)。
+    - 模板不管话题: tags 字段不拼(assemble 报「没拼进交付稿」), 交出去的话题只有正文里的 #话题。
+    - 模板 comments 是 null: 评论不拼, 查规则也不看。
+    不交出去的那几块要是还拿原稿查, 禁用词会报在不交付的话题 / 评论上, 必须带的话术也能靠它们混过去(codex review on aw#115)。"""
+    tpl = validate(template)
+    d = draft if isinstance(draft, dict) else {}
+    post = delivered_post(tpl, d)
+    if post is None:
+        body = str(d.get("body") or "").replace("\r\n", "\n").strip()
+        tags = _dedupe(body_tags(body))
+    else:
+        body, tags = post
+    return {**d, "body": body, "tags": tags,
+            "comments": d.get("comments") if tpl["comments"] is not None else None}, tags
+
+
 def comment_entries(raw) -> list | None:
     """写手传的 comments 的外壳 → 一条一项的列表。没传 / null / 空字符串是 []; 外壳本身认不出(数字、true 这类)回 None。
 
