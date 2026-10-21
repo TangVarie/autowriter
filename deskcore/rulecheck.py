@@ -20,8 +20,8 @@ payload 形状(写入时 ``normalize_check`` 校验; 读出来时 ``spec_of`` �
                    能匹配同样字符的量词不能挨着(见 validator.assert_regex_is_safe)。这两道都是静态的、尽力而为的过滤;
                    执行限时(validator.search_user_regex): 漏过去的慢正则一次 check 最多花一份时限, 报进
                    stats["timed_out"](这次没查), 不算命中、也不能算守住了
-  required_phrase  {"any": [...], "where": [...]}          一个都没有才算没守; 选中的部位全空时只在交付模板要求每篇都带那个部位时
-                                                           才算没守(check 的 expects), 不然不查
+  required_phrase  {"any": [...], "where": [...]}          一个都没有才算没守; 选中的部位全空时: 标题 / 正文空着照没守报, 评论 /
+                                                           话题只在交付模板要求每篇都带时才算没守(check 的 expects), 不然不查
   max_len          {"max": N, "min": M, "where": "body"}   max / min 至少给一个; 字数去掉空白和 #话题 再数
 validator.py 的老形状({"target": X} / {"scope": "标题", "n": N} / {"pattern": P})读的时候也认。
 """
@@ -292,10 +292,11 @@ def _run(spec: dict, parts: dict[str, list[str]], *, expects=(),
     elif kind == "required_phrase":
         texts = [x for w in spec["where"] for x in parts[w]]
         given = any(x.strip() for x in texts)
-        # 选中的部位全空: 一般不查 —— 评论常常是后面另走评论那一步(comments_for → score_comments)写的, 没交付模板的项目也不一定
-        # 交话题, 那时它们本来就不在这次交的东西里。可交付模板要求每篇都带的部位(expects: 评论 min ≥ 1、要写手给话题或有固定话题)
-        # 空着就是没交, 照没守报(codex review on aw#115): 不然「评论里必须带 X」这种规则, 靠一条评论都不交就混过去了。
-        must = [w for w in spec["where"] if w in expects]
+        # 选中的部位全空: 标题 / 正文是每篇稿子都有的部位, 空着照没守报(codex review on aw#115: 不然「正文里必须带 X」靠交一篇
+        # 空正文就混过去了)。评论 / 话题一般不查 —— 评论常常是后面另走评论那一步(comments_for → score_comments)写的, 没交付模板
+        # 的项目也不一定交话题, 那时它们本来就不在这次交的东西里。可交付模板要求每篇都带的部位(expects: 评论 min ≥ 1、要写手给
+        # 话题或有固定话题)空着就是没交, 同样照没守报: 不然「评论里必须带 X」这种规则, 靠一条评论都不交就混过去了。
+        must = [w for w in spec["where"] if w in ("title", "body") or w in expects]
         if (given or must) and not any(_has(x, t) for x in texts for t in spec["any"]):
             where = "/".join(spec["where"])
             absent = "" if given else f"(这篇没带{'、'.join(PART_CN[w] for w in must)})"

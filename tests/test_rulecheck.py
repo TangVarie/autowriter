@@ -814,6 +814,24 @@ def test_an_expected_part_left_empty_counts_as_missing_the_phrase():
     assert len(rulecheck.check([tagged], [draft], expects=("tags",))[0]) == 1
 
 
+def test_an_empty_title_or_body_counts_as_missing_the_phrase():
+    """标题 / 正文是每篇都有的部位: 空着照没带报, 不用模板要求(codex review on aw#115: 不然交一篇空正文就混过去了)。
+    生成链路(validator.check_hard_rules)同一个口径。"""
+    on_body = _rule(1, "required_phrase", {"any": ["示例口播"], "where": ["body"]})
+    hits = rulecheck.check([on_body], [{"title": "t", "body": ""}])[0]
+    assert [h["what"] for h in hits] == ["必须改: 正文里没有「示例口播」中的任何一个(这篇没带正文)"]
+    on_title = _rule(2, "required_phrase", {"any": ["示例口播"], "where": ["title"]})
+    assert [h["rule_id"] for h in rulecheck.check([on_title], [{"title": "  ", "body": "b"}])[0]] == ["m-2"]
+    either = _rule(3, "required_phrase", {"any": ["示例口播"], "where": ["body", "comments"]})
+    hits = rulecheck.check([either], [{"title": "t", "body": ""}])[0]
+    assert [h["what"] for h in hits] == ["必须改: 正文、评论里没有「示例口播」中的任何一个(这篇没带正文)"]
+    assert rulecheck.check([either], [{"title": "t", "body": "", "comments": [{"role": "reader", "text": "示例口播"}]}])[0] == []
+    for where, title, body in ((["body"], "t", ""), (["title"], "", "b"), (["title", "body"], "", "")):
+        rule = {"content": "必须包含「示例口播」", "rule_kind": "required_phrase",
+                "rule_payload": {"any": ["示例口播"], "where": where}}
+        assert [h["kind"] for h in validator.check_hard_rules([rule], title=title, body=body)] == ["required_phrase"], where
+
+
 def _tpl(**kw) -> str:
     return json.dumps({"delivery": {"layout": "blocks", **kw}}, ensure_ascii=False)
 
@@ -922,7 +940,7 @@ def test_rulecheck_and_the_generation_path_share_the_term_matcher():
     ("forbidden_word", "示例词", "t", "这里有示例词", True),
     ("required_phrase", "ad", "t", "made in", True),
     ("required_phrase", "AD", "t", "an ad here", False),
-    ("required_phrase", "示例话术", "", "", False),
+    ("required_phrase", "示例话术", "", "", True),      # 标题正文全空也算没带(codex review on aw#115 第九轮)
 ])
 def test_legacy_target_rows_get_the_same_answer_on_both_paths(kind, target, title, body, hit):
     """AW 的 Streamlit 界面还在写老形状 {"target": X}: 写作台把它读成词表(rulecheck._from_legacy), 生成链路原来在"标题\\n正文"里

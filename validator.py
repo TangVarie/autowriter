@@ -1386,7 +1386,7 @@ def check_hard_rules(
             found = [t for t in spec["terms"] if any(contains_term(x, t) for x in fields)]
             if kind == "forbidden_word" and found:
                 out.append({"rule": content, "kind": kind, "match": "、".join(found)})
-            elif kind == "required_phrase" and any(x.strip() for x in fields) and not found:
+            elif kind == "required_phrase" and not found:      # 标题 / 正文空着也算没带(同 rulecheck, codex review on aw#115)
                 out.append({"rule": content, "kind": kind, "match": "、".join(spec["terms"])})
         elif kind == "desk_len":
             n = count_chars(title if spec["where"] == "title" else body)
