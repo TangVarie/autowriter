@@ -53,6 +53,8 @@ jobs:
           # 但**不**需要 deskcore/requirements.txt 的 fastapi·mcp —— 那些
           # 只在后面的 app-smoke 步骤里装。第三批就在这上面栽过一次
           # (ModuleNotFoundError: fastapi), 所以这里明确写下边界。
+          # 代价: importorskip fastapi / mcp / deskcore.app 的用例在本步骤全是
+          # SKIPPED —— 它们在 app-smoke 步骤装完增量依赖后整目录重跑时才真跑。
           pip install -r requirements-dev.txt
           # -q 之外还要 -ra: strict xfail 一旦被人修好会变成 XPASS 失败,
           # 摘要里必须能一眼看到是哪条, 否则下一个人只看到"红了"。
@@ -2442,7 +2444,7 @@ jobs:
               raise SystemExit("审计第三批回归 FAILED:\n  - " + "\n  - ".join(FAIL))
           print("审计第三批回归 + codex review 7 条: 23/23 通过")
           PY
-      - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1)
+      - name: deskcore app 真的能起 + /health 不炸 + MCP 能握手 (round-6/7 P1) · 装 fastapi·mcp 后重跑 tests/
         run: |
           # ⚠️ 这一步存在的理由: /health 里一个 `getattr(config, ...)` 因为
           # config 的 import 被误删而 NameError 500, 而 railway.json 把 /health
@@ -2452,7 +2454,21 @@ jobs:
           # 运行期问题在 CI 里【完全没有覆盖】。这里补上: 装增量依赖, 起
           # TestClient 真打一次 /health。
           pip install -r deskcore/requirements.txt httpx
-          python -m pytest tests/test_project_isolation.py -q
+          # 装完增量依赖, 把 tests/ 整个再跑一遍。上面的 pytest 步骤刻意不装
+          # fastapi·mcp, 于是 importorskip 它们(或 deskcore.app)的用例 —— CORS、
+          # HTTP 状态码、key 传输、build marker、e2e 协议流、/health 漏斗 …… ——
+          # 在那一步全是 SKIPPED; 以前这里只补跑 test_project_isolation.py, 其余
+          # 在 CI 里从没跑过。整目录重跑而不是列文件名: 列表会漏掉以后新加的
+          # 文件, 那正是这次要治的"静默跳过"。
+          #
+          # 本步骤依赖已装全, 再出现 importorskip 的 "could not import" 就是又有
+          # 用例因缺依赖被跳过 —— 直接红, 不让它再安静地躺着。
+          set -o pipefail
+          python -m pytest tests/ -q -ra | tee "$RUNNER_TEMP/pytest-full.log"
+          if grep "could not import" "$RUNNER_TEMP/pytest-full.log"; then
+            echo "::error::装了 deskcore/requirements.txt 之后仍有用例因缺依赖被跳过(见上)"
+            exit 1
+          fi
           python - <<'PY'
           import os
           os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
