@@ -128,7 +128,8 @@
 - 以「建议改」开头的是软规则：告诉用户，改不改由用户定，不要自己反复重写去消掉它们。
 - 「拿不准」的提一句就行，不用改。
 - 某篇的规则题没判完（工具说明里写着怎么看出来），或者有题没判出来（`counts.unjudged` 不是 0），就不能说那几条守住了规则；不用重试。
-- 还有规则没有编译结果（`uncompiled_rules` 不是 0），或者有规则要看话题 / 评论查不了，或者有规则编不了、编出来的检查没跑（`rules.not_compilable` / `rules.code_refused` 不是 0），或者有规则只查了一部分（`rules.partial` 不是 0），就照 `next_step` 说一句这次没查全、那几条不能说（整条）守住了，不用等。
+- 还有规则没有编译结果（`uncompiled_rules` 不是 0），或者有规则要看话题 / 评论查不了，或者有规则编不了、编出来的检查没跑（`rules.not_compilable` / `rules.code_refused` 不是 0），或者有规则只查了一部分（`rules.partial` 不是 0），或者有规则撤掉了代码检查、又没有规则题（`rules.code_withdrawn` 不是 0），就照 `next_step` 说一句这次没查全、那几条不能说（整条）守住了，不用等。
+- 某篇带 `code_unchecked`（代码检查这次没查完）：没查完的那部分不是违规，也不能说那几条守住了；同一篇里已经列出来的「必须改」照改，不用重试。
 
 它一次最多查 20 篇：多出来的放在返回的 `remaining_version_ids` 里，照 `next_step` 接着再调一次、传它们（`tactic` 照样带），直到返回里没有 `remaining_version_ids`，几次的结果合起来说。除此之外一批只调一次；带 `replaces_version_id` 改稿重存的不再查（全是改稿重存时 `check_rules_version_ids` 是空的，那次 `score_drafts` 的 `next_step` 也不会再让你调；新稿和改稿混在一批时它只含新稿）。结果一两句告诉用户就行，和分数放在一起说。它报错、或者返回的 `status` 是 `error`，就说这次规则没查成、不能说守住了，交付照常，不用重试。
 

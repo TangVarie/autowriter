@@ -173,7 +173,8 @@ def hand_set(rule: dict) -> bool:
 def withdrawn(rule: dict) -> bool:
     """写手用 record_rule 的 {"kind": "free_text"} 撤掉了这条的代码检查(rule_kind = free_text 加 rulecheck.WITHDRAWN 标记;
     codex review on aw#115)。撤的是「代码查」: score_drafts 不查, 生成链路(validator)不查, 这里编出来的 code 也不跑;
-    Jev 的规则题是判断, 照判。AW 录规则界面写的 free_text 不带标记, 不算撤掉。"""
+    Jev 的规则题是判断, 照判。Jev 只编成了 code、没有规则题的那条撤掉之后就没东西查它了: check_rules 数进
+    rules.code_withdrawn, 不说它守住了(独立复审 on aw E)。AW 录规则界面写的 free_text 不带标记, 不算撤掉。"""
     if (rule.get("rule_kind") or "").strip() != "free_text":
         return False
     payload = rule.get("rule_payload")
@@ -191,6 +192,8 @@ def withdrawn(rule: dict) -> bool:
 # 必须改, 「话题不超过 N 个」「评论里不许…」又查不准 / 永远查不出来却算查过了。所以这两处从 where 里拿掉, 拿完一处不剩的
 # 不跑, 单独计数(2026-10-20 复审; 第三轮复审改了理由: 模板的固定话题现在拼得回来, 拼不回来的是写手传的 tags)。
 # score_drafts 的 rule_checks 手里有写手传的 tags / comments 和模板拼出来的话题, 人设的 check 照查。
+# 拿掉了一部分、还剩标题 / 正文的照跑那一半(那一半的命中是真的), 但算「只查了一部分」(code_rules 的 stripped;
+# 独立复审 on aw E: 原来不说, 「标题、正文和评论里都不许…」评论里违了照报都守住了)。
 # ⚠️ required_phrase 例外: 它是「列出的部位合起来一个都没有才算没守」, where 里只要有一处看不见, 那一处可能就有 ——
 # 只查剩下的那半会误报。check_rules 查的又是摘掉末尾那行话题的正文(core._delivered_text), 话术只写在话题行里的
 # 那篇一定被报成没守住。所以 required_phrase 的 where 里有话题 / 评论就整条不跑, 同样单独计数。
@@ -217,7 +220,8 @@ def code_rules(pairs: list[tuple[dict, dict]]) -> tuple[list[dict], list[str]]:
     """(规则, 编译结果) → (喂给 ``rulecheck.check`` 的规则行(rule_kind / rule_payload 形状), 查不了的规则 id)。
 
     只收编译结果里带 code、且规则没有人设能跑的 check 的(见 hand_set)、写手也没撤掉代码检查的(见 withdrawn)。where 只管话题 / 评论的(required_phrase: 只要沾了话题 /
-    评论)进第二个列表(见 UNSTORED_PARTS), 不跑、不算「代码查了」。payload 不在这里校验: rulecheck.spec_of 读的时候会按人设 check 的同一套规矩再校一遍(正则过
+    评论)进第二个列表(见 UNSTORED_PARTS), 不跑、不算「代码查了」。where 里混着标题 / 正文、拿掉了话题 / 评论的那条照跑, 行上带
+    ``stripped``(拿掉的那几处), check_rules 把它算成只查了一部分。payload 不在这里校验: rulecheck.spec_of 读的时候会按人设 check 的同一套规矩再校一遍(正则过
     validator.assert_regex_is_safe + 量词形状那道), 不合格的记日志、跳过、计进 skipped —— Jev 那边编译时也查过, 这里是
     第二道, 不会因为 Jev 放过了一个会回溯的正则就把服务进程卡住。"""
     out, unavailable = [], []
@@ -227,12 +231,18 @@ def code_rules(pairs: list[tuple[dict, dict]]) -> tuple[list[dict], list[str]]:
         code = res.get("code")
         if not isinstance(code, dict) or code.get("kind") not in rulecheck.CHECK_KINDS:
             continue
-        payload = _strip_unstored({k: v for k, v in code.items() if k != "kind"}, code["kind"])
+        raw = {k: v for k, v in code.items() if k != "kind"}
+        payload = _strip_unstored(raw, code["kind"])
         if payload is None:
             unavailable.append(str(rule.get("id")))
             continue
-        out.append({"id": rule.get("id"), "severity": rule.get("severity") or "soft",
-                    "rule_kind": code["kind"], "rule_payload": payload})
+        row = {"id": rule.get("id"), "severity": rule.get("severity") or "soft",
+               "rule_kind": code["kind"], "rule_payload": payload}
+        if payload is not raw:
+            # 只查了标题 / 正文那一半: 记下拿掉了哪几处, check_rules 数进 rules.partial, 不说它整条守住了(原来照算
+            # by_code、照说「都守住了」, 评论里违了硬规则也看不出来; 独立复审 on aw E)
+            row["stripped"] = [w for w in raw["where"] if w in UNSTORED_PARTS]
+        out.append(row)
     return out, unavailable
 
 

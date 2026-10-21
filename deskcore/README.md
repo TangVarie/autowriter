@@ -17,7 +17,7 @@
 > **2026-10-20 · D-121 写完按规则逐篇查**：规则由 Jev（`POST /compile_rules`）编成是非题 / 代码检查，按（规则 id, sha）缓存进
 > `rule_compiles`（`migrations/015`）；`score_drafts` 之后调 **`check_rules(version_ids)`**（传 `score_drafts` 返回的
 > `check_rules_version_ids`：只有新稿，改稿重存的不再查），hard 没守住报「必须改」、soft 报「建议改」、
-> Jev 拿不准的单列，**只作建议、不拦存档**；没判出来的题、只看话题 / 评论的规则、只查了一部分的规则（Jev 编译时标了 partial）、还没有编译结果的规则都单独报数，不算守住。编译最坏 6 分钟，只在后台线程（`open_project` / `record_rule` / `check_rules` 触发）和
+> Jev 拿不准的单列，**只作建议、不拦存档**；没判出来的题、只看话题 / 评论的规则、只查了一部分的规则（Jev 编译时标了 partial，或者只有一部分要看话题 / 评论）、撤掉了代码检查又没有规则题的规则、还没有编译结果的规则都单独报数，不算守住。编译最坏 6 分钟，只在后台线程（`open_project` / `record_rule` / `check_rules` 触发）和
 > `cli compile-rules` 里跑，写手的请求不等它；简报不动。见 `docs/deskcore.md` §3.11。
 
 ## 它解决什么

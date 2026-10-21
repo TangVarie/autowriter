@@ -1023,3 +1023,156 @@ def test_rest_and_mcp_answer_instead_of_erroring_when_rule_compiles_is_missing(m
         A._caller.reset(token)
     assert "没查成" in json.dumps(res, ensure_ascii=False, default=str), "MCP 回的是结果, 不是工具错误"
     assert any(r.levelname == "ERROR" and PROJ in r.getMessage() for r in caplog.records)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 11 · 独立复审 on aw E: 没查的 / 只查了一半的 / 没列全的, 都不许说成守住了或说成别的
+# ══════════════════════════════════════════════════════════════════════
+
+WITHDRAWN_TEXT = "示例硬规则: 标题正文都不许出现「示例禁词」"
+WITHDRAWN_CODE = {"kind": "forbidden_word", "words": ["示例禁词"], "where": ["title", "body"]}
+
+
+def test_a_withdrawn_check_that_jev_compiled_to_code_only_is_not_said_to_hold(wired):
+    """写手记了一条带词表 check 的硬规则, Jev 把它编成了同一份代码检查(没有规则题); 写手再用 {"kind": "free_text"} 撤掉 check。
+    撤掉不改 sha, 不会重编; score_drafts 不查它, check_rules 里编出来的 code 也不跑 —— 什么都没查它。原来它哪个桶都不进,
+    next_step 照说「这次查的规则都守住了」; 只剩它一条时说成「流程、交付、写作方向」那种查不了。"""
+    c = full_client(memories=[R_SOFT], compiles=[stored(R_SOFT, q_soft())],
+                    versions=[version(V1, body=BODY + "这里有示例禁词。")])
+    rid = core.record_rule(c, PROJ, WITHDRAWN_TEXT, severity="hard", user_id=ME,
+                           check={"kind": "forbidden_word", "words": ["示例禁词"]})["memory_id"]
+    wired.compile_one = lambda r: (code_result(r["id"], jev_sha(r["text"], r.get("applicability")), WITHDRAWN_CODE)
+                                   if r["text"] == WITHDRAWN_TEXT else question_result(r["id"], jev_sha(r["text"])))
+    assert core.compile_rules(c, PROJ)["status"] == "ok"
+    core.record_rule(c, PROJ, WITHDRAWN_TEXT, severity="hard", user_id=ME, check={"kind": "free_text"})
+    assert core.compile_rules(c, PROJ)["status"] == "up_to_date", "撤掉不改 sha, 不重编"
+    wired.judge = answers(**{qid_of(q_soft()): {"answer": "是", "p": 0.9, "ambiguous": False}})
+    out = core.check_rules(c, PROJ, [V1], user_id=ME)
+    assert out["status"] == "checked" and out["versions"][0]["violations"] == []
+    assert "都守住了" not in out["next_step"] and "有 1 条规则撤掉了代码检查" in out["next_step"]
+    assert out["rules"]["code_withdrawn"] == 1 and out["rules"]["by_code"] == 0
+
+    row = next(m for m in c.rows["memories"] if m["id"] == rid)
+    comp = next(r for r in c.rows["rule_compiles"] if r["memory_id"] == rid)
+    alone = core.check_rules(make_client([row], [comp], versions=[version(V1)]), PROJ, [V1], user_id=ME)
+    assert alone["status"] == "nothing_to_check"
+    assert "流程、交付、写作方向" not in alone["next_step"] and "有 1 条规则撤掉了代码检查" in alone["next_step"]
+    assert "不能说它们守住了" in alone["next_step"] and alone["rules"]["code_withdrawn"] == 1
+
+
+def test_a_project_whose_compiled_rules_are_hand_set_is_not_told_they_are_process_rules(wired, kicks):
+    """人手设过能跑的 check 的规则, 编出来的 code 让路(score_drafts 存档时已经按人设的查过)。池子里只有它(或者只有它和一条真的
+    not_checkable)时 nothing_to_check, 原来说「这个项目的规则都是查不了的那种(流程、交付、写作方向), 不用做什么」——
+    score_drafts 刚刚就这条报过「必须改」。"""
+    sha = jev_sha(R_HANDSET["content"])
+    hs = stored(R_HANDSET, code_result(R_HANDSET["id"], sha, {"kind": "forbidden_word", "words": ["人设禁词"],
+                                                               "where": ["body"]}))
+    nc = stored(R_NOT_CHECKABLE, {"id": R_NOT_CHECKABLE["id"], "sha": jev_sha(R_NOT_CHECKABLE["content"]),
+                                  "verdict": "not_checkable", "code": None, "questions": [], "coverage": None,
+                                  "uncovered": "", "why": "交付"})
+    for memories, compiles in (([R_HANDSET], [hs]), ([R_HANDSET, R_NOT_CHECKABLE], [hs, nc])):
+        out = core.check_rules(full_client(memories=memories, compiles=compiles, versions=[version(V1)]),
+                               PROJ, [V1], user_id=ME)
+        assert out["status"] == "nothing_to_check"
+        assert "流程、交付、写作方向" not in out["next_step"] and "不用做什么" not in out["next_step"]
+        assert "score_drafts 存档时已经按它查过" in out["next_step"] and "「必须改」照改" in out["next_step"]
+        assert out["rules"]["by_score_drafts"] == 1, "rules 里也数得到它(原来池子 1 条、各项全是 0)"
+    assert wired.calls == []
+    only_nc = core.check_rules(full_client(memories=[R_NOT_CHECKABLE], compiles=[nc], versions=[version(V1)]),
+                               PROJ, [V1], user_id=ME)
+    assert "流程、交付、写作方向" in only_nc["next_step"], "真的全是 not_checkable 的照旧这么说"
+
+
+def test_a_hit_found_before_the_regex_ran_out_of_time_still_has_to_be_fixed(wired, monkeypatch):
+    """rulecheck 先查标题、再查正文, 超时时已经找到的命中照报: 同一条规则同一篇既在 violations(必须改)里, 又在
+    code_unchecked 里。原来 next_step 只说 code_unchecked「不是违规」, 写手会当成连那条必须改一起撤了(score_drafts 的
+    rule_checks_unchecked 第六轮复审就是这么改的: 之前查出来的照改)。"""
+    monkeypatch.setattr(config, "REGEX_SEARCH_TIMEOUT_SEC", 0.1)
+    slow = "a*aaa*aaa*aaa*aaa*aaa*aaa*aaa*b"
+    rule = mem(16, "示例硬规则: 标题正文都不许出现某种写法", severity="hard")
+    res = code_result(rule["id"], jev_sha(rule["content"]),
+                      {"kind": "forbidden_regex", "pattern": slow, "where": ["title", "body"]})
+    out = core.check_rules(full_client(memories=[rule], compiles=[stored(rule, res)],
+                                       versions=[version(V1, title="a" * 14 + "b", body=BODY + "a" * 3000)]),
+                           PROJ, [V1], user_id=ME)
+    (v1,) = out["versions"]
+    assert [(e["rule_id"], e["what"][:3]) for e in v1["violations"]] == [(rule["id"], "必须改")]
+    assert [u["rule_id"] for u in v1["code_unchecked"]] == [rule["id"]]
+    assert "同一篇里已经列在 violations 的照改" in out["next_step"]
+    assert "没查完的那部分不是违规" in out["next_step"]
+
+
+def test_writer_protocol_and_docs_name_every_case_that_cannot_be_called_held():
+    """协议 5a 列着所有「不能说守住了」的情形, 原来唯独没有 code_unchecked(代码没查完); docs §3.11「这句只在…全是 0 时
+    才说」也漏了它。rules.by_code 原来写成「真跑了的条数」, 限时引擎一篇都没搜成的正则也算在里面。"""
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    proto = Path(core.__file__).with_name("protocol.md").read_text(encoding="utf-8")
+    skill = (root / "skills" / "bywood-writing-desk" / "SKILL.md").read_text(encoding="utf-8")
+    for text in (proto, skill):
+        sec = text[text.index("**5a. `check_rules`**"):text.index("**5b.")]
+        assert "`code_unchecked`" in sec and "已经列出来的「必须改」照改" in sec
+        assert "`rules.code_withdrawn`" in sec
+    doc = (root / "docs" / "deskcore.md").read_text(encoding="utf-8")
+    sec = doc[doc.index("### 3.11 "):]
+    sec = sec[:sec.index("\n### ")]
+    held = sec[sec.index("现在这句只在"):]
+    held = held[:held.index("才说")]
+    assert "代码没查完" in held and "撤掉了代码检查又没有题" in held and "正文是空的" in held
+    assert "（那是真跑了的条数）" not in sec and "`rules.code_timed_out`）" in sec
+    assert "code_timed_out" in tools.check_rules.__doc__ and "by_code" in tools.check_rules.__doc__
+
+
+def test_compiled_code_that_also_looks_at_comments_or_tags_is_only_partly_checked(wired):
+    """Jev 编出来的 where 混着标题 / 正文和评论 / 话题: 评论、话题不随稿子存, 只跑标题 / 正文那一半。原来照算 by_code、
+    不算 partial, next_step 说「这次查的规则都守住了」—— 评论里违了硬规则也报守住了。看得见的那一半命中照报。"""
+    r_cmt = mem(25, "示例硬规则: 标题、正文和评论里都不能出现「示例联系方式」", severity="hard")
+    r_tag = mem(26, "示例软规则: 正文和话题里都不用「示例平替」")
+    codes = {r_cmt["id"]: {"kind": "forbidden_word", "words": ["示例联系方式"], "where": ["title", "body", "comments"]},
+             r_tag["id"]: {"kind": "forbidden_word", "words": ["示例平替"], "where": ["body", "tags"]}}
+    comps = [stored(r, code_result(r["id"], jev_sha(r["content"]), codes[r["id"]])) for r in (r_cmt, r_tag)]
+    out = core.check_rules(full_client(memories=[r_cmt, r_tag], compiles=comps,
+                                       versions=[version(V1), version(V2, body=BODY + "示例联系方式在这里。")]),
+                           PROJ, [V1, V2], user_id=ME)
+    v1, v2 = out["versions"]
+    assert v1["violations"] == [] and [e["rule_id"] for e in v2["violations"]] == [r_cmt["id"]], "看得见的那一半照报"
+    only_v1 = core.check_rules(full_client(memories=[r_cmt, r_tag], compiles=comps, versions=[version(V1)]),
+                               PROJ, [V1], user_id=ME)
+    assert only_v1["summary"]["must_fix"] == 0 and "都守住了" not in only_v1["next_step"]
+    assert "有 2 条规则只查了一部分" in out["next_step"]
+    assert out["rules"]["by_code"] == 2 and out["rules"]["partial"] == 2
+    assert {p["rule_id"]: p["uncovered"] for p in out["rules"]["partial_rules"]} == {
+        r_cmt["id"]: "评论那部分没查(不随稿子存)", r_tag["id"]: "话题标签那部分没查(不随稿子存)"}
+    (row,), _ = rulecompile.code_rules([(r_cmt, comps[0]["result"])])
+    assert row["rule_payload"]["where"] == ["title", "body"] and row["stripped"] == ["comments"]
+
+
+def test_an_empty_body_is_not_said_to_have_kept_the_rule_questions(wired):
+    """score_drafts 收标题有、正文空的稿子; check_rules 不发 Jev(empty_body), 标题上的题、「正文要带…」的题都没问。原来不算
+    没判完、也不另计数, 题库里的硬规则题一道没判, next_step 照说「这次查的规则都守住了」。"""
+    wired.judge = answers(**{qid_of(q_hard()): {"answer": "否", "p": 0.93, "ambiguous": False}})
+    out = core.check_rules(full_client(memories=[R_HARD], compiles=[stored(R_HARD, q_hard())],
+                                       versions=[version(V1), version(V2, body="")]), PROJ, [V1, V2], user_id=ME)
+    v1, v2 = out["versions"]
+    assert v1["judge_status"] == "ok" and v2["judge_status"] == "empty_body"
+    assert "都守住了" not in out["next_step"] and "有 1 篇正文是空的, 规则题没判" in out["next_step"]
+    assert out["summary"]["not_finished"] == 0 and out["summary"]["empty_body"] == 1
+
+
+def test_items_past_the_per_version_cap_are_counted_in_next_step(wired):
+    """每篇建议改补到 12 条、拿不准最多 5 条, 多的只剩每篇的 more。原来 next_step 和工具说明都不提 more, 写手照列出来的说完
+    就算了, 用户不知道还有几条软规则没守住(score_drafts 那边有 RULE_CHECKS_MORE_NEXT_STEP)。"""
+    soft = [mem(140 + i, f"示例软规则第 {i} 条") for i in range(core.CHECK_RULES_MAX_LISTED + 2)]
+    shaky = [mem(170 + i, f"示例软规则(拿不准)第 {i} 条") for i in range(core.CHECK_RULES_MAX_UNSURE + 1)]
+
+    def q(r):
+        return question_result(r["id"], jev_sha(r["content"]), ask=f"正文有没有违反{r['content']}？", pass_if="否")
+    by_qid = {q(r)["questions"][0]["qid"]: {"answer": "是", "p": 0.9, "ambiguous": False} for r in soft}
+    by_qid.update({q(r)["questions"][0]["qid"]: {"answer": "是", "p": 0.55, "ambiguous": True} for r in shaky})
+    wired.judge = answers(**by_qid)
+    out = core.check_rules(full_client(memories=soft + shaky, compiles=[stored(r, q(r)) for r in soft + shaky],
+                                       versions=[version(V1), version(V2)]), PROJ, [V1, V2], user_id=ME)
+    assert [v["more"] for v in out["versions"]] == [3, 3]
+    assert "还有 6 条建议改 / 拿不准没列出来" in out["next_step"] and "如实告诉用户" in out["next_step"]
+    assert out["summary"]["more"] == 6
+    assert "more" in tools.check_rules.__doc__ and "12 条" in tools.check_rules.__doc__

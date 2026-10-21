@@ -690,7 +690,7 @@ owner 10-20 定了四件事（D-121）：Jev 的项目层对**所有**项目放�
 
 | verdict | 编成什么 | 写作台怎么用 |
 |---|---|---|
-| `code` | 一份代码检查，形状和 §3.10 的 `check` 完全一样 | 交给 `rulecheck` 跑。**只跑没有人手设过能跑的 check 的规则**（`rule_kind` 是 `forbidden_word` / `forbidden_regex` / `required_phrase` / `max_len` 之一、且 `rulecheck.spec_of` 认得出 payload 的，`score_drafts` 已经按人设的那份查过）。rule_kind 对、payload 却跑不了的不算人设（10-20 第三轮复审）：AW 页存得进去、`rulecheck` 不收的那几种（`validator` 放过、量词形状那道拒掉的正则；`max_len` 的「开头」老形状）`score_drafts` 只在 batch_metrics 里记一笔 skipped，原来这里照样让编出来的 code 让路——这条规则两边都没查，`check_rules` 还说它守住了 / 是流程规则。`free_text` 不算人设（10-20 复审）：AW 记忆页存硬规则默认选「自由文本」，存进库就是 `free_text`，和没设分不开，当成「不用代码查」的话 AW 页上记的规则编出来的 code 永远不跑。只看话题 / 评论的（`where` 只有 `tags` / `comments`）不跑：版本行里只存了标题和正文，话题、评论、交付模板的固定话题都不在，查了不是误报就是空查；`where` 里混着标题 / 正文的只查那一半——`required_phrase` 除外，它沾了话题 / 评论就整条不跑（「一个都没有才算没守」，看不见的那一处可能就有，只查正文会误报） |
+| `code` | 一份代码检查，形状和 §3.10 的 `check` 完全一样 | 交给 `rulecheck` 跑。**只跑没有人手设过能跑的 check 的规则**（`rule_kind` 是 `forbidden_word` / `forbidden_regex` / `required_phrase` / `max_len` 之一、且 `rulecheck.spec_of` 认得出 payload 的，`score_drafts` 已经按人设的那份查过）。rule_kind 对、payload 却跑不了的不算人设（10-20 第三轮复审）：AW 页存得进去、`rulecheck` 不收的那几种（`validator` 放过、量词形状那道拒掉的正则；`max_len` 的「开头」老形状）`score_drafts` 只在 batch_metrics 里记一笔 skipped，原来这里照样让编出来的 code 让路——这条规则两边都没查，`check_rules` 还说它守住了 / 是流程规则。`free_text` 不算人设（10-20 复审）：AW 记忆页存硬规则默认选「自由文本」，存进库就是 `free_text`，和没设分不开，当成「不用代码查」的话 AW 页上记的规则编出来的 code 永远不跑。只看话题 / 评论的（`where` 只有 `tags` / `comments`）不跑：版本行里只存了标题和正文，话题、评论、交付模板的固定话题都不在，查了不是误报就是空查；`where` 里混着标题 / 正文的只查那一半（那一半的命中是真的），数进 `rules.partial`，`uncovered` 写着哪几处没查，不说它整条守住了（独立复审 on aw E：原来照算 `by_code`、照说「都守住了」，「标题、正文和评论里都不许…」评论里违了也看不出来）——`required_phrase` 除外，它沾了话题 / 评论就整条不跑（「一个都没有才算没守」，看不见的那一处可能就有，只查正文会误报） |
 | `questions` | 1–3 道「只看这一篇就能答」的是非题，每题带 `pass_if`（答哪个算守住）、`scope`、题号；分得开时 `code` 也一起给 | 拼成内联项目题库发 `/judge_draft` |
 | `not_checkable` | 流程、交付、写作方向菜单 | 只计数 |
 
@@ -725,8 +725,13 @@ Jev 回 200、但 `model` 是 `mock`（`JUDGE_MOCK=1` 的测试 / 本地 Jev，�
   hard 和 soft 都编、不过方向闸——global 规则跨项目共用，方向是查的时候按项目定的），已经有 (id, sha) 那一行的跳过，一批 ≤ 60 条
   （`RULE_COMPILE_BATCH`），读超时 `RULE_COMPILE_TIMEOUT_SEC`（默认 420 秒，Jev 最坏约 361 秒）。Jev 那边怎么失败都不抛，回一份报告。
 - 不让失败变成花钱的循环：同一条规则的同一版编失败之后，后台 6 小时之内不再编它（进程内记账，重启清零；CLI 不受这条限制）；
+  Jev 生成端的 HTTP 429 / 5xx（Jev 回「生成端调用失败：GeneratorHTTPError: HTTP 529 …」，整批失败时是 502）只停 30 分钟
+  （`RULE_COMPILE_TRANSIENT_RETRY_SEC`）：上游没出输出、没计费，多半是部署后一阵过载（独立复审 on aw E：原来也扣 6 小时，一次几秒的过载让整个池子
+  半天没检查）；504 / 524 网关超时、拒答、截断、输出不合格、读超时照旧 6 小时（可能已经计费）。
   整批被出境口径挡下 / 没接 tv-map / judge 不可用 / 请求形状不对时，这个项目的后台补编停 1 小时（`record_rule` 除外）——这几种是项目的事，
   **不按规则记失败**（10-20 复审：按规则记的话，owner 的 global 规则在他处方药项目里被挡一次，在他别的项目里也被扣 6 小时不编）。
+  之后有一轮真编成了（`ok` / `partial`，比如 `record_rule` 不等 hold 编的那一轮），这个项目的 hold 就清掉（独立复审 on aw E：原来不清，
+  Jev 恢复之后改过的规则照样被扣到 hold 到期，`check_rules` 还说「上次整批没编成(ok)」）；`check_rules` 说 hold 的原因时说起 hold 的那一轮。
 - 一批**读超时**就不再发后面几批（报告里 `not_sent` / `stopped_by: timeout`），后台这个项目停 30 分钟（`RULE_COMPILE_TIMEOUT_HOLD_SEC`）：
   `/compile_rules` 没有整体截止，调用方断开之后 Jev 照样编完、照样计费，读超时过了它最坏的 ~361 秒说明 Jev 慢下来了，再发只是多付几批
   没人收的钱。Jev 恢复之后 CLI 再跑一次。Jev 回 502 之类（答了、几乎没花钱）的只算那一批，下一批照发。
@@ -784,20 +789,29 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
    `run_tag: "shadow-rules"`、`judge_paras: "never"`、`write: true`、`subject_id = versions.id`——答案按这一版落 TV 账本，和存档那次的
    `primary` 分开，以后拿来校准。题**不进** `hard_rules` / `brief`（进了就算进 `passed`）。最多 4 路并行，整次共用
    `JUDGE_DRAFT_TOOL_TIMEOUT_SEC`（默认 18 秒）的截止，发之前查 tv-map 的那两次库也算在里面；到点没回来的那篇报 `judge_status = timeout` +
-   `judge_note`「没判完」，**绝不算守住**。
+   `judge_note`「没判完」，**绝不算守住**。正文是空的那篇不发（`judge_status: empty_body`），不算没判完，数进 `summary.empty_body`，
+   `next_step` 说这几篇规则题没判、不能说守住了（独立复审 on aw E：原来什么都不数，标题上的题、「正文要带…」的题都没问，照说「都守住了」）。
 4. 代码查：编出来的 `code` 交给 `rulecheck.check`（查词、数字数和 §3.10 同一份 `validator.contains_term` / `count_chars`），只跑没有
    人设能跑的 check 的规则（见上表 `code` 那行）。`where` 里的 `tags` / `comments` 先拿掉（版本行里没有），拿完一处不剩的不跑
    （`required_phrase` 沾了就不跑），数进 `rules.code_unavailable`，`next_step` 说这几条查不了、不能说守住了。
    payload 读的时候按人设 check 的同一套规矩再校一遍（正则过 `validator.assert_regex_is_safe` + 量词形状那道，§3.10）：不安全的不跑、
-   记日志、数进 `rules.code_refused`，**不算进** `rules.by_code`（那是真跑了的条数）。编不了的（原文超过 Jev 的字段上限之类，永远不发）
+   记日志、数进 `rules.code_refused`，**不算进** `rules.by_code`（那是交给代码查的条数；正则没在时限内查完的算在里面，另数在
+   `rules.code_timed_out`）。编不了的（原文超过 Jev 的字段上限之类，永远不发）
    数进 `rules.not_compilable`。这两种 `next_step` 都会说「有 N 条规则这次查不了，不能说它们守住了」（10-20 第二轮复审：原来
    `next_step` 只看没编译结果和话题评论两种，一条编不了的硬规则加一条正则不安全的硬规则，照说「这次查的规则都守住了」）；只有编不了的
    规则、别的都没有时，`nothing_to_check` 也照这样说，不说成「流程、交付、写作方向」那种查不了。
    写手用 `record_rule` 的 `{"kind": "free_text"}` 撤掉了代码检查的（`free_text` 加 `{"code_check": "off"}` 标记，
    `rulecompile.withdrawn`）编出来的 `code` 也不跑，规则题照判；AW 录规则界面写的 `free_text` 不带标记，不算撤掉。
+   Jev 只编成了 `code`、没有规则题的那条撤掉之后就没有东西查它了：数进 `rules.code_withdrawn`，`next_step` 说这几条这次没查、
+   不能说守住了（独立复审 on aw E：撤掉不改 sha，不会重编；原来这条哪个桶都不进，照说「都守住了」）。
+   人设了能跑的 check 的规则编出来的 `code` 不跑，数进 `rules.by_score_drafts`（`score_drafts` 存档时已经按人设的查过）。
+   `nothing_to_check` 的「流程、交付、写作方向」那句只在每条编译结果都是 `not_checkable` 时说（独立复审 on aw E：原来池子不空就这么说，
+   人设了 check 的、撤掉了代码检查的也被说成流程规则，还说「不用做什么」）：有人设的就说 `score_drafts` 已经按它查过、那边的「必须改」照改，
+   有撤掉的就说这几条没查、不能说守住了。
    正则限时（§3.10，`validator.search_user_regex`）：没在时限内查完的那条，从停下的那篇起每篇列进 `code_unchecked`
-   （`rule_id` / `severity` / `rule` 原文），数进 `summary.code_unchecked` 和 `rules.code_timed_out`；`next_step` 说这几处不是违规、
-   也不能说守住了。
+   （`rule_id` / `severity` / `rule` 原文），数进 `summary.code_unchecked` 和 `rules.code_timed_out`；`next_step` 说没查完的那部分不是违规、
+   也不能说守住了，同一篇里已经列在 `violations` 的照改（独立复审 on aw E：先在标题上命中、再在正文上超时时，同一条同一篇既是「必须改」
+   又在 `code_unchecked` 里，原来只说「不是违规」，同 §3.10 `rule_checks_unchecked` 的第六轮复审）。
 5. 账本：每篇的回包看 `written` / `write_error`（Jev 账本写失败照样回 200）：`write_error` 不为空、或 `written` 不是整数的，记一行 WARNING
    （带版本号）、`rules.ledger_write_errors` 计数、打一条 `deskcore_check_rules_ledger` 埋点；写手的 `next_step` 不提（判是判出来了，少的是
    以后校准用的那几行）。10-20 第三轮复审：原来只读 `detail.desk_rules`，`write=true` 要攒的影子期数据次次丢了也没人知道。
@@ -815,19 +829,24 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
 和原因，最多 5 条）、全部篇加起来进 `summary.unjudged`，`next_step` 说「另有 N 道规则题这次没判出来，不能说守住了」；一道都没判出来的
 那篇（回包里没有 `desk_rules`，或每题都带 `invalid_reason`）记 `judge_status: not_judged`，和没判完一样算进 `summary.not_finished`。
 10-20 复审：原来这里只在那篇上记个数，`summary` 不看它，`next_step` 照说「这次查的规则都守住了」——现在这句只在必须改 / 建议改 /
-拿不准 / 没判完 / 没判出来 / 没编译结果 / 话题评论查不了 / 编不了 / 编出来的检查没跑 / 只查了一部分全是 0 时才说。
+拿不准 / 没判完 / 没判出来 / 没编译结果 / 话题评论查不了 / 编不了 / 编出来的检查没跑 / 只查了一部分 / 代码没查完 / 撤掉了代码检查又没有题 /
+正文是空的全是 0 时才说。
 
 **返回值**（一篇一项 `versions[]`）：`violations`（每条 `rule_id` / `severity` / `what`（以「必须改」或「建议改」开头）/ `source`（jev | code）/
-`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`）、`unsure`（「拿不准」，最多 5 条）、`more`、`counts`、`judge_status` / `judge_note`；
-外加 `summary`（必须改 / 建议改 / 拿不准 / 没判完各几处、没判出来几道题）、`rules`（池子几条、Jev 查几条、代码查几条、查不了几条、
-还没编几条和为什么、话题评论查不了几条、编不了几条、编出来没跑几条、只查了一部分几条）、`uncompiled_rules`、这次没查到的 `remaining_version_ids`（有才带）
-和一句 `next_step`。没有可查的规则时回 `status: nothing_to_check` 和一句话，
-什么都不发。
+`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`）、`unsure`（「拿不准」，最多 5 条）、`more`（这篇没列出来的条数）、`counts`、`judge_status` / `judge_note`、`code_unchecked`；
+外加 `summary`（必须改 / 建议改 / 拿不准 / 没判完各几处、没判出来几道题；有才带：`more` 没列出来几条、`empty_body` 几篇正文是空的、`code_unchecked` 几处没查完）、`rules`（池子几条、Jev 查几条、代码查几条、查不了几条、
+还没编几条和为什么、话题评论查不了几条、编不了几条、编出来没跑几条、只查了一部分几条、人设过 check 由 `score_drafts` 查的几条、撤掉了代码检查又没有题的几条、正则没查完几条）、`uncompiled_rules`、这次没查到的 `remaining_version_ids`（有才带）
+和一句 `next_step`。`summary.more` 不是 0 时 `next_step` 说还有这么多条建议改 / 拿不准没列出来、如实告诉用户（独立复审 on aw E：原来
+只在每篇的 `more` 里，`next_step` 和工具说明一字不提，写手照列出来的说完就算了；同 §3.10 的 `rule_checks_more`）。没有可查的规则时回
+`status: nothing_to_check` 和一句话，什么都不发。
 
 **只查新稿。** `score_drafts` 的返回多了 `check_rules_version_ids`：这批里的新稿，不含带 `replaces_version_id` 改过重存的；全是重存时
 它是空的，`next_step` 说「不用再调 check_rules」。10-20 复审：原来每次存档的 `next_step` 都说「然后调一次 check_rules」，照
 「必须改」改完重存那次也说——和协议 5a、`check_rules` 自己的「改一轮就够，不用再调」打架，最新的那句赢，多花一轮 Jev 的钱，
 还会改 → 查 → 改地转下去。这批传了 `tactic` 的，`next_step` 再提醒一句把同一个 `tactic` 带给 `check_rules`（方向闸同一个判据）。
+底稿没建成的新稿（`identity_warning`）没有版本行，不在 `check_rules_version_ids` 里：`next_step` 说这几篇 `check_rules` 查不了、
+不能说守住了规则；「都是改过重存的，不用再调」只在没有这种新稿时说（独立复审 on aw E：原来 `check_rules_version_ids` 一空就这么说，
+两篇新稿底稿都没建成时写手被告知它们是改稿、不用查）。
 
 **不变的。** 简报、`score_drafts` 的参考分和 `rule_checks`、存档那次的判定都一个字没改；`check_rules` 不改库里的稿子，判不成也只是那篇
 「没判完」。写手侧唯一多出来的动作是协议 5a 那一步。

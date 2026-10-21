@@ -669,7 +669,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
 
     这个工具出错会直接报错。存档失败必须让你知道 —— 稿子没进指纹库的话, 下次 check_drafts 会把同样的内容再放行
     一次。看到报错就重试, 别当没事; 报"另一个写操作正在跑"(409)也是重试。带 ``identity_warning`` 时说明底稿没建成:
-    查重不受影响, 但发布后对不回来, 如实告诉用户。
+    查重不受影响, 但发布后对不回来, 如实告诉用户; 没建成的那几篇也不在 ``check_rules_version_ids`` 里, check_rules 查不了,
+    不能说它们守住了规则(``next_step`` 会说)。
 
     ``flywheel_arm``: 把这场写作的 open_project (或 borrow_lessons) 返回里的 ``flywheel_arm`` **原样**传回来。
     它决定这批稿子算进哪个对照组; 不传服务端会猜, 但同一项目同时开着两场时会猜错。
@@ -694,7 +695,11 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
     数在 ``uncompiled_rules`` 里(``next_step`` 说为什么: 后台在编 / 这个项目编不了 / Jev 最近编译超时 / 上次编失败)
     —— 不用等, 也不用重试。要看话题 / 评论的规则这里查不了(这两样不随稿子存), 数在 ``rules.code_unavailable``; 编不了
     (原文超过 Jev 的上限之类)的数在 ``rules.not_compilable``, 编出来的检查不安全没跑的数在 ``rules.code_refused``,
-    只查了一部分的(编译时就没全装进去)数在 ``rules.partial`` —— 这几种都**不能说(整条)守住了**。
+    只查了一部分的(编译时就没全装进去, 或者只有一部分要看话题 / 评论、只查了标题正文那一半)数在 ``rules.partial``,
+    用 record_rule 撤掉了代码检查、Jev 又只编成了代码检查(没有规则题)的数在 ``rules.code_withdrawn`` —— 这几种都
+    **不能说(整条)守住了**。人手设过 check 的数在 ``rules.by_score_drafts``: score_drafts 存档时已经按它查过(那边
+    ``rule_checks`` 里的「必须改」照改), 这里不重复查。``rules.by_code`` 是交给代码查的条数, 正则没在时限内查完的
+    (``rules.code_timed_out``)也算在里面。
 
     怎么读返回值(``versions`` 一篇一项, 按 ``version_id`` 对上):
       · ``violations``: 没守住的规则, 每条 ``rule_id`` / ``severity`` / ``what`` / ``source``(jev 是 Jev 判的, code 是代码
@@ -702,13 +707,17 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
         照着改, 改完那几篇用 score_drafts 带 ``replaces_version_id`` 再存一次, 改一轮就够, 不用再调本工具;
         以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。
       · ``unsure``: Jev 拿不准的(``what`` 以「拿不准」开头), 不算没守住, 提一句就行, 不用改。
-      · ``judge_status`` 不是 ok 的那篇(``judge_note`` 说原因, 比如「没判完」「一道都没判出来」)规则题这次没判成,
-        **不能说它守住了规则**; 不用重试。代码查出来的 ``violations`` 照样有效。
+      · 每篇必须改全列, 建议改补到 ``violations`` 一共 12 条为止, ``unsure`` 最多列 5 条; ``more`` 是这篇没列出来的条数
+        (``summary.more`` 是全部篇加起来的), 有就如实告诉用户还有这么多条没列。
+      · ``judge_status`` 不是 ok 的那篇(``judge_note`` 说原因, 比如「没判完」「一道都没判出来」「正文是空的」)规则题这次
+        没判成, **不能说它守住了规则**; 不用重试。代码查出来的 ``violations`` 照样有效。正文是空的那几篇另数在
+        ``summary.empty_body``。
       · ``judge_status`` 是 ok、但 ``counts.unjudged`` 不是 0 的: 那几道题 Jev 没判出来(``unjudged`` 列着规则 id 和原因,
         比如 evidence_not_found = 判了「是」却指不出是哪一句, 不算没守住), 那几条**也不能说守住了**。``summary.unjudged``
         是全部篇加起来的题数。
       · ``code_unchecked``: 代码查的正则这次没在时限内查完(或者限时的引擎跑不了它)的规则, 每条 ``rule_id`` / ``severity`` /
-        ``rule``(规则原文)。不是违规, 也**不能说那几条守住了**; hard 的照原文自己核一遍, 不用重试。``summary.code_unchecked``
+        ``rule``(规则原文)。没查完的那部分不是违规, 也**不能说那几条守住了**; 同一篇里同一条已经列在 ``violations`` 的
+        (先查到了命中、后面才没查完)照改; hard 的照原文自己核一遍, 不用重试。``summary.code_unchecked``
         是全部篇加起来的处数。
       · ``status`` 是 nothing_to_check / no_versions 时照 ``next_step`` 说一句就行。
       · ``status`` 是 error: 这次规则没查成(服务端读不出规则的编译结果), **不能说规则守住了**; 存档已经成功, 交付照常,
@@ -902,7 +911,8 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
         max / min 至少给一个, where 只认 title / body
       · {"kind": "forbidden_regex", "pattern": "...", "where": [...]}                       —— 固定写法(会做安全检查)
       · {"kind": "free_text"}                                                               —— 撤掉这条的代码检查(存档时、
-        check_rules 里编出来的都不跑; check_rules 的规则题照判)
+        check_rules 里编出来的都不跑; check_rules 的规则题照判。Jev 只把它编成了代码检查、没有规则题的, 撤掉之后就没有
+        东西查它了, check_rules 数在 rules.code_withdrawn, 不说它守住了)
       where 可选 title / body / tags / comments, 不传就是 ["title", "body"]。语气、结构这类判断不了的不要带 check。
       词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
       (所以「TV信号」里也不算有 "V信") —— 两种写法都要拦就都列上。

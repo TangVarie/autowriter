@@ -930,3 +930,82 @@ def test_a_compile_cut_off_by_shutdown_is_logged(jev, monkeypatch, caplog):
     assert len(cut) == 1 and PROJ in cut[0] and "计费" in cut[0]
     assert core._RULE_COMPILE_INFLIGHT == {} and len(c.rows["rule_compiles"]) == 2
     assert core.log_rule_compiles_cut_off() == [], "编完了就不在路上了"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 独立复审 on aw E: hold 不清、没计费的生成端过载扣 6 小时
+# ══════════════════════════════════════════════════════════════════════
+
+def test_a_successful_round_clears_the_project_hold(monkeypatch, blocking_compile):
+    """Jev 重新部署那一阵回 503(unavailable): 项目 hold 1 小时。几分钟后 Jev 好了, record_rule(不等 hold)那一轮编成了
+    (ok)。原来 hold_until 只在 hold 时设、从不清: 之后在 AW 页改的规则、set_rule_state 改的方向照样被扣到 hold 到期,
+    check_rules 还说「上次整批没编成(ok)」。"""
+    gate, calls = blocking_compile
+    gate.set()
+    statuses = iter(["unavailable", "up_to_date", "ok", "ok"])
+    monkeypatch.setattr(core, "compile_rules", lambda client, pid, **kw: (calls.append(kw) or
+                                                                          {"status": next(statuses), "errors": []}))
+    c = make_client([mem(1)])
+    missing = [(mid(1), jev_sha(mem(1)["content"]))]
+
+    def cooled():
+        _wait_idle(PROJ)
+        core._RULE_COMPILE_STATE[PROJ]["last"] -= core.RULE_COMPILE_COOLDOWN_SEC + 1     # 冷却过了
+    assert core._kick_rule_compile(c, PROJ, reason="open_project") == "started"
+    cooled()
+    assert core._kick_rule_compile(c, PROJ, reason="open_project") == "held"
+    # 一轮什么都没发(up_to_date): 说明不了 Jev 好了, hold 照旧; 说原因时说起 hold 的那一轮, 不是被盖掉的 last_status
+    assert core._kick_rule_compile(c, PROJ, reason="record_rule", bypass_cooldown=True) == "started"
+    cooled()
+    assert core._kick_rule_compile(c, PROJ, reason="open_project") == "held"
+    reason, why, _ = core._uncompiled_reason(c, PROJ, missing, "held")
+    assert reason == "held" and "(unavailable)" in why and "up_to_date" not in why
+    # record_rule 那一轮真编成了: hold 清掉, 改过的规则下一次触发就编
+    assert core._kick_rule_compile(c, PROJ, reason="record_rule", bypass_cooldown=True) == "started"
+    cooled()
+    assert core._RULE_COMPILE_STATE[PROJ]["hold_until"] == 0.0
+    assert core._kick_rule_compile(c, PROJ, reason="check_rules") == "started", "Jev 好了, 项目不再 hold"
+    _wait_idle(PROJ)
+    assert len(calls) == 4
+
+
+# Jev 的原样: compile_batch 写「生成端调用失败：{type(exc).__name__}: {exc}」, GeneratorHTTPError 是「HTTP 529 Overloaded：…」;
+# rules_api 整批都失败时回 502「规则一条都没编出来：{results[0]['error']}」
+OVERLOADED = '生成端调用失败：GeneratorHTTPError: HTTP 529 Overloaded：{"type":"error","error":{"type":"overloaded_error"}}'
+REFUSED = "生成端调用失败：GeneratorStopped: 模型拒答（stop_reason=refusal）"                  # 已计费
+GATEWAY = "生成端调用失败：GeneratorHTTPError: HTTP 504 Gateway Timeout：upstream timed out"   # 上游可能已经计费
+
+
+class _Later:
+    """core 里的 time, 但 monotonic 往后拨 ``sec`` 秒。"""
+
+    def __init__(self, sec: float):
+        self.sec = sec
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.sec
+
+
+@pytest.mark.parametrize("error, retried", [(OVERLOADED, True), (REFUSED, False), (GATEWAY, False)],
+                         ids=["overloaded", "refused", "gateway-timeout"])
+@pytest.mark.parametrize("how", ["502", "200"])
+def test_a_free_generator_overload_is_retried_after_half_an_hour_not_six(jev, monkeypatch, error, retried, how):
+    """部署后各项目一起编, Jev 生成端 529 过载(重试一次还是): 没出输出、没计费。原来和花了钱的失败一样按规则扣 6 小时,
+    整个池子半天没检查。现在只扣 RULE_COMPILE_TRANSIENT_RETRY_SEC; 拒答 / 网关超时(可能已经计费)照旧 6 小时。"""
+    c = make_client([mem(1)])
+    if how == "502":
+        jev.compile_status, jev.compile_detail = 502, "规则一条都没编出来：" + error
+    else:
+        jev.compile_one = lambda r: {"id": r["id"], "sha": jev_sha(r["text"]), "verdict": None, "code": None,
+                                     "questions": [], "coverage": None, "uncovered": "", "why": "", "error": error}
+    assert core.compile_rules(c, PROJ, skip_recent_failures=True)["status"] in ("jev_failed", "error")
+    jev.compile_status, jev.compile_one = 200, FakeJev().compile_one             # Jev 好了
+    monkeypatch.setattr(core, "time", _Later(31 * 60))                          # 半小时多一点之后
+    rep = core.compile_rules(c, PROJ, skip_recent_failures=True)
+    if retried:
+        assert rep["status"] == "ok" and rep["compiled"] == 1 and len(jev.compile_calls()) == 2
+    else:
+        assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 1

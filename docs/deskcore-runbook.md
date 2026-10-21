@@ -320,6 +320,8 @@ dry-run 的数和真编同一个口径：`--all` 一次运行里 owner 的 globa
 `--all` 也就此停下，后面的项目一个都不试，`⏸` 那一行列着它们；等 Jev 恢复再跑一次）/ `unavailable`（连不上 Jev，包括 3 秒内没连上的
 连接超时——请求没发出去、没花钱，`--all` 接着试下一个项目）/ `jev_mock`（Jev 回的是 `JUDGE_MOCK` 的假结果，一条没存：`JUDGE_URL` 指到
 测试 / 本地的 Jev 了）/ `jev_failed` / `partial`（一部分规则没编出来，下面列着每条的原因；再跑一次只重编失败的那几条）。
+后台补编对编失败的规则 6 小时内不重编；Jev 生成端过载（原因里是「生成端调用失败：GeneratorHTTPError: HTTP 429 / 5xx」，504 / 524 除外）
+没计费，只停 30 分钟（独立复审 on aw E）。
 退出码：有项目没编成、或者因为读超时有项目没试，就是 1。之后不用再手动跑：`open_project` / `record_rule` / `check_rules` 会在后台补编
 新增和改过的规则（每个项目同时一个线程、5 分钟冷却；任何一个项目读超时之后，整个服务进程 30 分钟内哪个项目都不发，`record_rule` 也不例外；
 `RULE_COMPILE_AUTO=0` 可关）。
