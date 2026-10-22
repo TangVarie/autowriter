@@ -189,6 +189,8 @@ UNGATED_WITH_REASON = {
                               "它本身是一道版本级的归属核对 —— 调用方自带的 version_id 经 "
                               "store.items_for_versions 按本项目查, 查不到的不发",
     "_record_commit_metrics": "私有辅助函数, 只被已过闸的 commit_drafts 调用; 写一行 batch_metrics",
+    "_delivery_and_rule_checks": "私有辅助函数, 只被已过闸的 commit_drafts 调用(10-20); 项目行是闸返回的那一行, "
+                                 "规则走 shared_memories(本项目 + 调用者自己的 global)",
     "build_distillation_task": "私有辅助函数, 由已过闸的 record_edit / my_style 调用",
     # 运维命令: 跑它们的人手里握着 service_role key(等价于直连库), 加校验挡不住
     # 任何人, 只会挡住"帮同事补一下指纹", 还给人"运维路径也隔离了"的错觉。
@@ -197,6 +199,7 @@ UNGATED_WITH_REASON = {
     "recompute_fingerprints": "运维命令, 见 docs/deskcore.md §2.2.1",
     "backfill_fingerprints":  "运维命令, 见 docs/deskcore.md §2.2.1",
     "backfill_gap":           "运维命令, 见 docs/deskcore.md §2.2.1",
+    "delivery_format":        "运维命令(cli delivery-format, 10-20), 见 docs/deskcore.md §2.2.1; 写手那边没有对应的工具",
 }
 
 

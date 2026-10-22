@@ -731,9 +731,27 @@ def test_the_response_budget_stays_inside_the_mcp_client_tolerance():
 def test_elapsed_ms_and_phases_are_reported(judge_on):
     out = core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
     ph = out["phase_ms"]
-    assert set(ph) == {"lock_wait", "commit", "judge", "project_isolation", "total"}
+    assert set(ph) == {"lock_wait", "commit", "delivery_rules", "judge", "project_isolation", "total"}
     assert all(isinstance(v, int) and v >= 0 for v in ph.values())
     assert out["elapsed_ms"] == ph["total"] >= ph["commit"]
+
+
+def test_delivery_and_rule_checks_get_their_own_phase(judge_on, monkeypatch):
+    """存档后的交付版式 + 代码查规则(规则那次是翻页读的)单记一段(codex review on aw#115): 原来它跑在 commit 收表之后、
+    判定开表之前, 哪一段都不算 —— 各段加起来和 total 对不上, batch_metrics 里也查不出判定少掉的那截预算是谁花的。"""
+    real = store.shared_memories
+
+    def slow(*a, **k):
+        time.sleep(0.3)
+        return real(*a, **k)
+    monkeypatch.setattr(store, "shared_memories", slow)
+    c = _client()
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    ph = out["phase_ms"]
+    parts = sum(v for k, v in ph.items() if k != "total")
+    assert ph["total"] - parts < 100, f"各段加起来该约等于 total: {ph}"
+    assert ph.get("delivery_rules", 0) >= 300, ph
+    assert c.rows["batch_metrics"][0]["phase_ms"] == ph
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -124,6 +124,17 @@ def project_row(sb, project_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def set_project_default_params(sb, project_id: str, params_json: str) -> dict | None:
+    """整列写回 ``projects.default_params``(调用方先读、合并、校验; 只有 cli delivery-format 用, 2026-10-20)。
+
+    传进来的是 **JSON 字符串**: 生产库这一列 80 行全是字符串形状(db.create_project 用 json.dumps 写), 同一列混两种
+    形状的话, 读它的地方(isolation.markers、delivery.parse_params)都得一直两头兼容下去。
+    """
+    res = sb.table("projects").update({"default_params": params_json}).eq("id", project_id).execute()
+    rows = getattr(res, "data", None) or []
+    return rows[0] if rows else None
+
+
 def list_all_projects(sb, *, owner_id: str) -> list[dict]:
     """``owner_id`` 名下的项目。
 
@@ -227,11 +238,17 @@ def projects_with_brand(sb, *, owner_id: str, brand: str) -> list[dict]:
 # ── 规则(共享层) ──────────────────────────────────────────────────────────
 
 def shared_memories(sb, project_id: str,
-                    user_id: str | None = None) -> tuple[list[dict], list[dict]]:
+                    user_id: str | None = None, *,
+                    rule_kinds: tuple[str, ...] | None = None) -> tuple[list[dict], list[dict]]:
     """项目的 confirmed 规则。
 
     返回 (hard, soft)。muted_until 未到期的过滤掉(用户临时静音一条规则而不删)。
     同时带上 scope='global' 的通用规则。
+
+    ``rule_kinds``(2026-10-20): score_drafts 的代码查规则(deskcore/rulecheck.py)只要带 check 的那几行, 和简报
+    取**同一个池子**(retire / mute 之后代码检查跟着停; 方向闸由调用方再过一遍, 同简报), 但不要向量 —— 那是每次存档
+    都多拉几百 KB(一条 768 维)。
+    给了就在服务端按 rule_kind 收窄、不取 embedding; 生产库目前一条带 check 的都没有, 这次查询几乎是空的。
 
     ⚠️ 【故意不吞异常】。这里读的是项目的强制合规规则(禁词/必含话术/绝对不能
     提的内容)。查询失败若降级成空列表, build_writing_brief 会返回一个 p0 为空、
@@ -279,11 +296,13 @@ def shared_memories(sb, project_id: str,
     #  test_applicability_gate.py 里有一条专门盯着这个列名。)
     cols = ("id, content, severity, scope, rule_kind, rule_payload, "
             "muted_until, user_id, memory_type, created_at, frequency, "
-            "applicability, embedding")
-    proj = _rows(lambda: sb.table("memories").select(cols)
-                           .eq("project_id", project_id).eq("scope", "project"))
-    glob = (_rows(lambda: sb.table("memories").select(cols)
-                            .eq("scope", "global").eq("user_id", user_id))
+            "applicability" + ("" if rule_kinds else ", embedding"))
+
+    def _base():
+        q = sb.table("memories").select(cols)
+        return q.in_("rule_kind", list(rule_kinds)) if rule_kinds else q
+    proj = _rows(lambda: _base().eq("project_id", project_id).eq("scope", "project"))
+    glob = (_rows(lambda: _base().eq("scope", "global").eq("user_id", user_id))
             if user_id else [])
 
     # ⚠️ 静音判定必须复用 db.is_memory_muted_now, 不能在这里自己写一份
@@ -366,7 +385,7 @@ def rule_counts_bulk(sb, project_ids: list[str]) -> dict[str, tuple[int, int]]:
 
 _LEDGER_COLS = ("id, content, severity, scope, project_id, status, "
                 "muted_until, user_id, memory_type, created_at, frequency, "
-                "applicability")
+                "applicability, rule_kind, rule_payload")
 
 
 def rules_ledger(sb, *, user_id: str, project_id: str | None = None) -> list[dict]:
@@ -460,6 +479,23 @@ def memory_row(sb, memory_id: str) -> dict | None:
              .eq("id", memory_id).limit(1).execute())
     rows = getattr(res, "data", None) or []
     return rows[0] if rows else None
+
+
+def set_memory_check(sb, memory_id: str, rule_kind: str, rule_payload: dict | None) -> dict | None:
+    """给一条规则挂上 / 换掉代码检查(``rule_kind`` / ``rule_payload``, 2026-10-20)。返回改完之后**库里的**那一行。
+
+    不并进 update_memory_fields: 那个入口的白名单是"只改状态", check 是规则的一部分, 只由 record_rule 在校验过
+    (rulecheck.normalize_check)之后写。db.upsert_memory 也收这两列, 但只在**新建**时写 —— 已有的规则再记一次
+    带上 check 的话会被它静默丢掉, 所以这里单独写一次(同 applicability)。
+    """
+    res = (sb.table("memories").update({"rule_kind": rule_kind, "rule_payload": rule_payload})
+             .eq("id", memory_id).execute())
+    rows = getattr(res, "data", None) or []
+    if rows:
+        return rows[0]
+    got = (sb.table("memories").select("id, rule_kind, rule_payload")
+             .eq("id", memory_id).limit(1).execute()).data or []
+    return got[0] if got else None
 
 
 def update_memory_fields(sb, memory_id: str, fields: dict) -> dict | None:
@@ -2528,6 +2564,147 @@ def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days
         if grow <= n_pub:
             return {"published": pub_all[:n_pub], "drafted": drafted}
         n_pub = grow
+
+
+# ── 最近打过分的稿子在特征题上答了什么: 简报里的 recent_structure(2026-10-20, 问哪几题见 deskcore/structure.py) ──────
+# 每篇打分的稿子 Jev 都答一遍 TV 的特征题库, 写进 truth_vault.note_feature_answers(subject_type = 'aw_version',
+# subject_id = versions.id::text, run_tag = 'primary', extractor = 'jev:<模型版本>'; judge_client.build_draft_request
+# 和 Jev 的 judge/core.ledger_rows)。写作台回包里本来就有这份 profile, 但从来没存 —— 直接回账本读, 不另存一份。
+# 和 recent_titles 同一条纪律: 三步(批次 → 版本 id 与时间 → 答案), 只取 id、时间和答案列,
+# 不取正文, 也不取 evidence(那是稿子原文片段)。答案那一步翻页(见 STRUCTURE_VERSIONS_MAX), 一轮是一页加一次空页。
+# 最近 STRUCTURE_ITEMS_MAX 篇里有答案的凑不够 ``limit``(30)篇、更早的稿子或没问过的旧版本还有, 就往下再问一轮, 最多
+# STRUCTURE_ROUNDS_MAX 轮(见 recent_structure_answers)。⚠️ 不只是 judge 停过才这样(codex review on aw#115): judge 不覆盖
+# 的项目 —— 没配 judge、tv_project_map 没映射(一篇都不判)—— 每次开项目都问满这几轮, 多几趟空请求、什么也换不来; 只判了
+# 一部分的(judge 刚接上)也常要多问一两轮。有界(每轮 id 封顶、最多三轮), 换的是 judge 停过一阵之后这一栏不空。补问的
+# 那几轮失败不丢第一轮找到的。
+STRUCTURE_BATCH_DAYS = 60
+STRUCTURE_ITEMS_MAX = 60          # 一轮最多看这么多篇
+STRUCTURE_ROUNDS_MAX = 3
+# 一次 .in_() 最多带这么多个版本 id。⚠️ 行数不是 6 题 × 80 = 480 就封顶(codex review on aw#115): 主键是
+# (subject, 题, 题目版本, extractor, run_tag), Jev 换过模型重判一次就多一整套行(jev:<新版本>), 题库升了题目版本旧行也留着
+# —— 三代就是 1,440 行, 过了 PostgREST 的 db-max-rows(1000), 原来不排序 .limit(1000) 会静默截掉一截, 最新那代答案、
+# 甚至整篇稿子都可能在挑最新之前就没了。所以按主键剩下那几列排好序翻页(_paged), 一行不丢。
+STRUCTURE_VERSIONS_MAX = 80
+# 候选上限按不同 item 计; 不能先截版本行, 否则少数多次改稿会挤掉其它篇。
+STRUCTURE_CANDIDATE_ITEMS_MAX = STRUCTURE_ITEMS_MAX * STRUCTURE_ROUNDS_MAX
+# 三轮最多问这么多版, 更老的版本不占内存; 版本扫描仍继续, 直到取够不同 item 或窗口耗尽。
+STRUCTURE_VERSIONS_PER_ITEM_MAX = STRUCTURE_VERSIONS_MAX * STRUCTURE_ROUNDS_MAX
+
+
+def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[int, frozenset]],
+                             bank_version: str, limit: int = 30, days: int = STRUCTURE_BATCH_DAYS,
+                             now: datetime | None = None) -> list[dict[str, str]]:
+    """本项目最近 ``limit`` 篇打过分的稿子各答了什么, 新的在前: ``[{题目 id: 答案}, ...]``。批次、版本和第一轮答案的
+    异常原样上抛; 往下补问的那几轮失败只记一条 warning, 用前面几轮找到的。
+
+    ``questions`` = {题目 id: (题目版本, 合法答案)}: 版本对不上、答案为空(无效)或不在合法答案里的行都不算。
+    一个 item 算一篇, 取它最新的、有答案的那一版(改稿是往同一个 item 上加一版, 每一版都判过一次, 全算会让改得多的
+    那篇占好几票)。补录副本(``source == 'ingest'``)不算, 那是发出去的帖抄回来的, 也不经过 judge。
+    同一篇同一题有好几行(Jev 换过模型版本)时取最后抽的那一行。
+
+    窗口按【版本自己的时间】切, 不按批次建的时间(codex review on aw#115, 同 recent_drafted_titles 那条): 改稿是往老
+    item 上加一版, 批次还是原来那个。直接按版本时间取候选, 联表只核项目归属和认补录副本, 不按批次年龄或数量筛。
+    答案那一次 .in_() 的版本 id 按 item 摊(codex review on aw#115): 先给每篇最新的一版, 有空再给每篇次新的一版……
+    原来是在整批版本上按时间截 80 个再一篇一票, 改过几轮的一篇占好几个名额 —— 30 篇各三版只剩 27 篇, 一篇改了几十轮的
+    能把窗口压到 12 篇以下。
+    没判出答案的稿子不占名额(codex review on aw#115): 原来先截最近 STRUCTURE_ITEMS_MAX 篇再问答案, judge 停过一阵、
+    最近 60 篇都没答案的话这一栏就是空的 —— 窗口里明明还有 30 篇更早的、判过的。所以一轮问完凑不够 ``limit`` 篇, 就把
+    还没找到答案、也还有版本没问过的那些篇接着排下一轮(上一轮没轮到的旧版本在前, 再往后是更早的稿子), 最多
+    STRUCTURE_ROUNDS_MAX 轮; 每轮还是按篇摊、id 封顶。"""
+    if not questions:
+        return []
+    now = now or datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
+    pages = _paged_iter(lambda off, lim: (
+        sb.table("versions").select("id, item_id, created_at, items!inner(batches!inner(project_id, params))")
+        .eq("items.batches.project_id", project_id).gte("created_at", since.isoformat())
+        .or_("params->>source.is.null,params->>source.neq.ingest", reference_table="items.batches")
+        .order("created_at", desc=True).order("id", desc=True).range(off, off + lim - 1)))
+    by_item: dict[str, list[tuple[datetime, str, str]]] = {}     # item id → [(版本时间, item id, 版本 id)]
+    for page in pages:
+        for v in page:
+            if is_ingest_batch((v.get("items") or {}).get("batches")):   # 老行的 params 还可能是 JSON 字符串
+                continue
+            t = _ts(v.get("created_at"))
+            if v.get("id") and v.get("item_id") and t is not None and t >= since:
+                lane = by_item.setdefault(str(v["item_id"]), [])
+                if len(lane) < STRUCTURE_VERSIONS_PER_ITEM_MAX:
+                    lane.append((t, str(v["item_id"]), str(v["id"])))
+                if len(by_item) >= STRUCTURE_CANDIDATE_ITEMS_MAX:
+                    break
+        if len(by_item) >= STRUCTURE_CANDIDATE_ITEMS_MAX:
+            break
+    # 每篇一条道, 道内新的在前; 道按最新那一版排, 最近改过 / 写过的在前
+    lanes = sorted((sorted(vs, key=lambda c: (c[0], c[2]), reverse=True) for vs in by_item.values()),
+                   key=lambda vs: (vs[0][0], vs[0][2]), reverse=True)
+    asked = [0] * len(lanes)                        # 每条道已经问过前几版
+    judged: set[str] = set()                        # 已经找到有答案那一版的 item
+    cands: list[tuple[datetime, str, str]] = []
+    by_version: dict[str, dict[str, str]] = {}
+    for rnd in range(STRUCTURE_ROUNDS_MAX):
+        # 这一轮: 还没找到答案、还有版本没问过的前 STRUCTURE_ITEMS_MAX 篇, 一层一层轮着取, 直到 id 封顶
+        open_ = [k for k, vs in enumerate(lanes) if vs[0][1] not in judged and asked[k] < len(vs)][:STRUCTURE_ITEMS_MAX]
+        picked = [(k, lanes[k][asked[k] + depth])
+                  for depth in range(max((len(lanes[k]) - asked[k] for k in open_), default=0))
+                  for k in open_ if asked[k] + depth < len(lanes[k])][:STRUCTURE_VERSIONS_MAX]
+        if not picked:
+            break
+        try:
+            got = _feature_answers(sb, [c[2] for _k, c in picked], questions, bank_version)
+        except Exception:
+            if not rnd:
+                raise                               # 第一轮就读不到: 账本读不到, 这一栏不带(调用方兜着)
+            # 往下补问是锦上添花(codex review on aw#115): 这一趟一时失败, 前面几轮找到的照用 —— 只问一轮时它们本来就交得出去
+            logger.warning("recent structure 第 %d 轮补问答案失败, 用前面几轮找到的 %d 篇 (project=%s)",
+                           rnd + 1, len(judged), project_id, exc_info=True)
+            break
+        for k, c in picked:                         # 每条道取走的是它还没问过的最前面几版
+            asked[k] += 1
+            cands.append(c)
+        by_version.update(got)
+        judged.update(c[1] for _k, c in picked if c[2] in by_version)
+        if len(judged) >= limit:
+            break
+    cands.sort(key=lambda c: (c[0], c[2]), reverse=True)
+    out: list[dict[str, str]] = []
+    taken: set[str] = set()
+    for _t, iid, vid in cands:
+        if iid in taken or vid not in by_version:
+            continue
+        taken.add(iid)
+        out.append(by_version[vid])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _feature_answers(sb, vids: list[str], questions: dict[str, tuple[int, frozenset]],
+                     bank_version: str) -> dict[str, dict[str, str]]:
+    """这几版在特征题上的有效答案: ``{版本 id: {题目 id: 答案}}``, 一个有效答案都没有的版本不在里面。"""
+    rows = _paged(lambda off, lim: (
+        sb.schema("truth_vault").table("note_feature_answers")
+        .select("subject_id, question_id, question_version, answer, extractor, extracted_at")
+        .eq("subject_type", "aw_version").eq("run_tag", "primary").eq("bank_version", bank_version)
+        .in_("question_id", sorted(questions)).in_("subject_id", vids)
+        # subject_type / run_tag 上面钉死了, 剩下这四列就是主键: 排序唯一, 翻页不漏不重
+        .order("subject_id").order("question_id").order("question_version").order("extractor")
+        .range(off, off + lim - 1)))
+    best: dict[tuple[str, str], tuple[str, str]] = {}      # (版本 id, 题) → (抽取时间, 答案)
+    for r in rows:
+        qid, ans = r.get("question_id"), str(r.get("answer") or "").strip()
+        ver, allowed = questions.get(qid, (None, ()))
+        # 只认 Jev 的行: 别的抽取器(以后 TV 要是也给稿子抽)口径不同, 不能混着算占比(D-106 #1 同一条纪律)
+        if (r.get("question_version") != ver or ans not in allowed
+                or not str(r.get("extractor") or "").startswith("jev:")):
+            continue
+        key = (str(r.get("subject_id")), qid)
+        at = str(r.get("extracted_at") or "")
+        if key not in best or at > best[key][0]:
+            best[key] = (at, ans)
+    by_version: dict[str, dict[str, str]] = {}
+    for (vid, qid), (_at, ans) in best.items():
+        by_version.setdefault(vid, {})[qid] = ans
+    return by_version
 
 
 # ── 补录锁(migrations/009): 跨进程互斥, 按项目一行, 带 TTL ─────────────────

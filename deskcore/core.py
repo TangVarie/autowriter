@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import concurrent.futures as cf
 import contextlib
 import logging
@@ -51,8 +52,9 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
+from . import delivery, rulecheck
 from . import fingerprint as fp
-from . import store, tvlink, vocab
+from . import store, structure, tvlink, vocab
 
 logger = logging.getLogger("deskcore.core")
 
@@ -491,6 +493,32 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     if recent and (recent.get("published") or recent.get("drafted")):
         out["recent_titles"] = {"published": recent["published"], "drafted": recent["drafted"],
                                 "task": RECENT_TITLES_TASK}
+
+    # ── 最近的稿子在哪几处都一样(2026-10-20, 问哪几题、怎么算见 deskcore/structure.py) ─────────────────
+    # recent_titles 管标题撞词, 管不到骨架: 10-20 查生产库, 有个项目近百篇稿子 86% 第一句是具体事件、82% 标题是问句、
+    # 95% 写了已经发生的坏结果, 而它已发笔记里这三样分别只占 45% / 43% / 35%。Jev 给每篇打分时答过的特征题就在
+    # TV 账本里, 读回来数一数, 扎堆的几处摆给模型, 让这一批有一半换个写法。只是提醒, 不拦任何东西。
+    # ⚠️ 同一条纪律: 账本读不到(Exposed schemas 没有 truth_vault / 本地库)、项目没接 judge、篇数不够, 都是不带这一栏。
+    try:
+        shape = structure.recent_structure(store.recent_structure_answers(
+            client, project_id, questions=structure.ASKED, bank_version=structure.BANK_VERSION,
+            limit=structure.MAX_DRAFTS))
+    except Exception:
+        logger.exception("recent structure lookup failed (project=%s)", project_id)
+        shape = None
+    if shape:
+        out["recent_structure"] = shape
+
+    # ── 交付模板要写手带什么(2026-10-20, deskcore/delivery.py) ──────────────────────────────────────
+    # 模板在项目行里(上面已经取了), 不多查。不放进简报的话, 写手第一次 score_drafts 才知道要几个话题、几条评论、
+    # 要不要方向, 整批带着 problems 回来再存一次(judge 也再跑一遍)。模板坏了不带这一栏, 简报照给。
+    try:
+        tpl = delivery.template_of(project)
+    except Exception as exc:                            # noqa: BLE001 — 增强项, 绝不冒泡
+        logger.warning("open_project: 项目 %s 的交付模板用不了, 简报不带 delivery_requirements(%s)", project_id, exc)
+        tpl = None
+    if tpl is not None:
+        out["delivery_requirements"] = delivery.requirements(tpl)
     return out
 
 
@@ -1651,7 +1679,7 @@ def list_banks() -> dict:
 
 
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
-                           out: dict, *, flywheel: dict | None = None) -> None:
+                           out: dict, *, flywheel: dict | None = None, checks: dict | None = None) -> None:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
 
     为什么要落库而不只打日志: 「commit_drafts 约 1~2 秒」「一批 10 篇并行也是一两秒」
@@ -1690,6 +1718,8 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
             # 飞轮分臂 (docs/28 §7.4): 这次的臂、改稿挂到的旧 item、没能在旧 batch 上标 mixed 的 item ——
             # batch.params 之外的第二份记录, 分析对照组时据此剔除跨臂改过的批次
             **(flywheel or {}),
+            # 交付版式与代码查规则(10-20): 拼了没有、几条问题, 查了几条规则、命中几次 —— 只留数, 不留稿子
+            **(checks or {}),
         }
         store.insert_commit_metrics(client, project_id=project_id, user_id=str(user_id),
                                     phase_ms=out.get("phase_ms") or {},
@@ -1705,7 +1735,8 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                             phase_ms=out.get("phase_ms"),
                             judge=j.get("summary"), judge_skipped=len(j.get("skipped") or []),
                             project_isolation_status=(out.get("project_isolation") or {}).get("status"),
-                            project_isolation_flags=len((out.get("project_isolation") or {}).get("flags") or []))
+                            project_isolation_flags=len((out.get("project_isolation") or {}).get("flags") or []),
+                            rule_check_hits=((checks or {}).get("rule_checks") or {}).get("hits"))
     except Exception:                                   # noqa: BLE001
         pass
 
@@ -2221,8 +2252,122 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     return out
 
 
+DELIVERY_NEXT_STEP = ("这个项目有交付模板: delivery.text 是按模板拼好的整批交付稿。delivery.problems 里有的先改(改过的那几篇带 "
+                      "replaces_version_id 再调一次; 新返回的 delivery.text 只含这几篇, 用它们按顺序替换原来那几篇: 表格只换那几行, "
+                      "新返回的表头和分隔行不要再贴一遍; 一篇一段的就换那几段), 然后把 delivery.text 原样交给用户, 不要自己重排版式、"
+                      "不要再加标记。")
+RULE_CHECKS_NEXT_STEP = ("rule_checks 是代码按项目规则逐篇查出来的: 标「必须改」的改完再交(带 replaces_version_id 再调一次), "
+                         "「建议改」的告诉用户。只是参考, 存档已经成功了。")
+RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的全列了, 没列的都是建议改), 还有 rule_checks_more 条没列: "
+                              "如实告诉用户还有这么多条没列出来。")
+RULE_CHECKS_ERROR_NEXT_STEP = ("rule_checks_status=error: 这次代码查规则没跑成(存档不受影响), 不能跟用户说规则都用代码查过了。")
+UNCHECKED_LABEL = {"hard": "硬约束·没查完", "soft": "建议·没查完"}
+RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代码没查完(正则没在时限内跑完、限时的引擎跑不了它, "
+                                   "或者存的 check 用不了; 存档不受影响): 从 from_index 那篇起算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
+                                   "它之前查出来、列在 rule_checks 里的命中照常算。severity 是 hard 的(「硬约束·没查完」)照规则原文"
+                                   "(rule)把 from_index 起的那几篇自己逐篇核一遍。")
+
+
+def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
+                              indices: list[int], out: dict, *, tactic: str = "") -> dict:
+    """存完档之后的两样纯代码活(2026-10-20), 结果挂进 ``out``, 返回给 batch_metrics 的那一小块。**不抛**。
+
+    1. 交付版式: 项目配了 ``default_params.delivery`` 就按模板把存进去的那几篇拼好(``out["delivery"]``)。
+       模板坏了只记日志、不带这一块 —— 打分照常(运维用 CLI 设模板时已经校验过, 走到这里多半是有人手改了库)。
+    2. 代码查规则: 和简报同一个池子里带 check 的那几条, soft 的过同一道方向闸, 逐篇查(``out["rule_checks"]``,
+       有命中才带)。查不成就带 ``rule_checks_status = "error"``: 不带的话和"查过了、没命中"长得一模一样。正则规则限时
+       (rulecheck.check), 没在时限内查完的、存的 check 用不了的都列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了
+       "守住了"。
+
+    两样都只是参考: 入库到这里已经成功了, 这一步任何失败都不许把它变成失败(同判定那一段的纪律)。
+    """
+    meta: dict = {}
+    picked = [drafts[i] for i in indices]
+    tpl = None
+    try:
+        tpl = delivery.template_of(project)
+    except Exception as exc:                            # noqa: BLE001 — 增强项, 绝不冒泡
+        logger.warning("commit_drafts: 项目 %s 的交付模板用不了, 这次不拼(%s)", project_id, exc)
+        meta["delivery"] = {"error": str(exc)[:200]}
+    if tpl is not None and picked:
+        try:
+            res = delivery.assemble(tpl, picked, indices=indices)
+            out["delivery"] = res
+            meta["delivery"] = {"layout": res["format"], "drafts": len(picked), "problems": len(res["problems"])}
+        except Exception as exc:                        # noqa: BLE001
+            logger.exception("commit_drafts: 拼交付稿失败(project=%s) —— 存档不受影响", project_id)
+            meta["delivery"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
+    if picked:
+        t0 = time.monotonic()
+        try:
+            hard, soft = store.shared_memories(client, project_id, user_id, rule_kinds=rulecheck.CHECK_KINDS)
+            # 方向闸: 同简报(build_writing_brief)和 my_rules 的「方向不符」。标了另一个方向的 soft 规则简报里没有, 这里
+            # 再报「建议改」就是在叫模型写它没被要求、甚至相反的东西(产品向的"带上产品名"报到流量向项目上)。
+            # hard 不过这道闸, 同简报。判据也同简报: 项目名 + 这场 open_project 传的 tactic(写手原样传回来, codex review
+            # on aw#115) —— 只按项目名判的话, 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又全报一遍。
+            soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or "", tactic or ""))
+            # 有交付模板时, 查的是交付出去的那一份, 免得和 delivery.text 对不上(delivery.delivered_draft): 模板管话题的, 话题含
+            # 固定 / 条件话题、正文是摘掉末尾那行话题之后的; 不管话题的, tags 字段不算、只认正文里的 #话题; comments 是 null 的,
+            # 评论不算(codex review on aw#115: 拿原稿查的话, 不交付的话题 / 评论里的词照报违规, 必须带的话术也能靠它们混过去)
+            checked, final_tags = picked, None
+            if tpl is not None:
+                views = [delivery.delivered_draft(tpl, d) for d in picked]
+                checked = [view for view, _tags in views]
+                final_tags = [tags for _view, tags in views]
+            # 模板要求每篇都带的部位(评论 min ≥ 1、要话题): 空着的话「必须带的话术」照没带报, 不能靠不交那一块混过去(codex review
+            # on aw#115)。没模板、模板不要求的部位, 空着照旧不查(评论常常是后面另走评论那一步写的)
+            expects = delivery.expected_parts(tpl) if tpl is not None else ()
+            hits, stats = rulecheck.check(hard + soft, checked, indices=indices, tags=final_tags, expects=expects)
+            if hits:
+                shown, more = rulecheck.top_hits(hits)
+                out["rule_checks"] = shown
+                if more:
+                    out["rule_checks_more"] = more
+            if stats.get("timed_out") or stats.get("skipped_ids"):
+                rows = {r.get("id"): r for r in hard + soft}
+                sev = {rid: ("hard" if (r.get("severity") or "soft").lower() == "hard" else "soft") for rid, r in rows.items()}
+                # 开头不用「必须改」/「建议改」(codex review on aw#115): 那两个词在 rule_checks 里是"这篇查出了违规", 写手的模型扫到
+                # 「必须改」会跟用户说稿子违规了 —— 这里什么都没查出来, 只是没查完。轻重只放在 severity 里, 开头另起一个说法。
+                # 带上规则原文(独立复审 on aw#115 第六轮): 简报里只有原文没有 id, 只给 rule_id 写手对不上是哪一条, 没法照原文核
+                # 从哪篇起没查完(独立复审 on aw#115 第六轮): 前面查出来的命中是真的, 不说清楚的话同一条既是「必须改」又是"算没查"
+                found = {h["rule_id"] for h in hits}
+                start = stats.get("timed_out_from") or {}
+                out["rule_checks_unchecked"] = [
+                    {"rule_id": rid, "severity": sev.get(rid, "soft"), "rule": (rows.get(rid) or {}).get("content") or "",
+                     "from_index": start.get(rid),
+                     "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则的正则从 index={start.get(rid)} 那篇起没查完"
+                             "(超时或者限时的引擎跑不了), 那几篇算没查, 不是查出了违规"
+                             + ("; 之前查出来、列在 rule_checks 里的照改" if rid in found else "")}
+                    for rid in stats.get("timed_out") or ()]
+                # 存的 check 用不了的(写坏了, 或者是这里不查的老写法; rulecheck 记日志、跳过): 原来只在 batch_metrics 里记个数,
+                # 回包和「查过了、没命中」一模一样, 一条硬规则就这样每批都没查(codex review on aw#115)。整批都没查, 照没查完报
+                out["rule_checks_unchecked"] += [
+                    {"rule_id": rid, "severity": sev.get(rid, "soft"), "rule": (rows.get(rid) or {}).get("content") or "",
+                     "from_index": indices[0],
+                     "what": f"{UNCHECKED_LABEL[sev.get(rid, 'soft')]}: 这条规则存的代码检查用不了(写坏了, 或者是这里不查的"
+                             "老写法), 这次整批都没查, 不是查出了违规"}
+                    for rid in stats.get("skipped_ids") or ()]
+            meta["rule_checks"] = {**stats, "hits": len(hits),
+                                   "hard": sum(1 for h in hits if h["severity"] == "hard"),
+                                   "elapsed_ms": _ms_since(t0)}
+        except Exception as exc:                        # noqa: BLE001
+            logger.exception("commit_drafts: 代码查规则失败(project=%s) —— 存档不受影响", project_id)
+            meta["rule_checks"] = {"error": f"{type(exc).__name__}: {exc}"[:200], "elapsed_ms": _ms_since(t0)}
+            out["rule_checks_status"] = "error"
+
+    tips = (([DELIVERY_NEXT_STEP] if "delivery" in out else [])
+            + ([RULE_CHECKS_NEXT_STEP] if "rule_checks" in out else [])
+            + ([RULE_CHECKS_MORE_NEXT_STEP] if "rule_checks_more" in out else [])
+            + ([RULE_CHECKS_UNCHECKED_NEXT_STEP] if "rule_checks_unchecked" in out else [])
+            + ([RULE_CHECKS_ERROR_NEXT_STEP] if out.get("rule_checks_status") == "error" else []))
+    if tips and out.get("next_step"):
+        out["next_step"] = out["next_step"] + " " + " ".join(tips)
+    return meta
+
+
 def commit_drafts(client, project_id: str, drafts: list[dict],
-                  *, user_id: str | None = None, flywheel_arm: str | None = None) -> dict:
+                  *, user_id: str | None = None, flywheel_arm: str | None = None, tactic: str = "") -> dict:
     """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
 
     只收真正定稿的 —— 指纹库脏了(把废稿也记进去)会让后续正常选题被误杀。
@@ -2267,9 +2412,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     判定结局不再是影子 —— ``judge.results`` 每篇带 ``score`` / ``fixes``(``draft_score``), 给写手看,
     仍然不拦。人审(review_drafts)和导出(export_drafts)两个工具撤了: 定稿由写手贴进飞书, 发布后
     tv-sync 按内容对回来。
+
+    ``tactic``(2026-10-20): 这场 open_project 传的 tactic, 只给代码查规则的方向闸用(同 build_writing_brief 的判据)。
     """
     started = time.monotonic()
-    assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
+    # 审计 COR-015。项目整行留着: 交付模板(default_params.delivery)就在这一行里, 不再多查一次(10-20)
+    project = assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
     arm_meta: dict = {}      # 这次入库的臂 + 改稿挂到哪些旧 item, 进 batch_metrics.meta (分析对照组的第二份记录)
@@ -2664,7 +2812,18 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # 指纹已经摘了、稿子却没入库: 放回去, 否则旧稿从此不参与查重(而且没人知道)。
             _restore_stash(client, stash, list(stash))
             raise
-    commit_ms = _ms_since(started) - lock_wait_ms      # 各段可加: lock_wait + commit + judge ≈ total
+    # 各段可加: lock_wait + commit + delivery_rules + judge + project_isolation ≈ total
+    commit_ms = _ms_since(started) - lock_wait_ms
+
+    # ── 交付版式 + 代码查规则(2026-10-20): 锁外、恢复指纹的 try 外, 同下面的判定 ──────────────────
+    # 都是纯代码(模板在项目行里, 规则多一次很小的查询), 放在判定前面: 判定的截止按"已用时间"算, 这一步多花的
+    # 几十毫秒从判定里扣, 不会把整次回包推过客户端的容忍。只拼 / 只查存进去了的那几篇, 被闸拒掉的要重写。
+    # 单记一段 delivery_rules(codex review on aw#115): 规则那次查询是翻页读的, 库慢的时候不是几十毫秒; 不单记的话
+    # 这段时间哪一段都不算, 判定被扣掉的那截预算也查不出是谁花的。
+    post_started = time.monotonic()
+    post_meta = _delivery_and_rule_checks(client, project, project_id, user_id, drafts, sorted(inserted_idx), out,
+                                          tactic=tactic)
+    delivery_rules_ms = _ms_since(post_started)
 
     # ── 入库判定(参考分): 锁已经放了, 恢复指纹的那个 try 也出来了 ─────────────
     # 到这里入库已经成功, 下面任何一步都不许把它变成失败: 判定自己不抛
@@ -2693,9 +2852,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     excluded = {drafts[i].get("version_id") or minted_ids.get(i) for i in inserted_idx}
     out["project_isolation"] = _cross_project_shadow_bounded(client, project_id, user_id, drafts, vecs, excluded)
     out["elapsed_ms"] = _ms_since(started)
-    out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms,
+    out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms, "delivery_rules": delivery_rules_ms,
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
-    _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta)
+    _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta, checks=post_meta)
     return out
 
 
@@ -4074,6 +4233,44 @@ def backfill_gap(client, project_id: str) -> dict:
     return out
 
 
+# delivery_format 的「只看, 不写」: 不能拿 None 当这个记号 —— --set 的文件里写的是 JSON null 时 template 也是 None, 会被当成
+# --show, 一个字不写还退出码 0(codex review on aw#115)。null 要走校验、报「delivery 应该是 JSON 对象」; 删模板用 clear。
+SHOW_ONLY = object()
+
+
+def delivery_format(client, project_id: str, *, template=SHOW_ONLY, clear: bool = False) -> dict:
+    """运维命令 ``cli delivery-format``: 看 / 设 / 清一个项目的交付模板(``default_params.delivery``, 2026-10-20)。
+
+    不收 user: 同 backfill, 跑它的人握着 service_role key(docs/deskcore.md §2.2.1)。写手那边没有这个工具 ——
+    版式是项目定的, 不该由写手的模型在对话里改。
+    写之前先校验(delivery.validate), 存规范形状; 写回时保留 default_params 里别的键(isolation_terms 等), 仍存成
+    JSON 字符串(生产库 80 行都是这个形状)。default_params 本身解析不了就拒绝写: 拿 {} 去合并会把别的键一起抹掉。
+    ``template`` 不传(SHOW_ONLY)是只看; 传了什么都要过校验, 传 None 也一样(抛 TemplateError, 不写)。
+    """
+    project = store.project_row(client, project_id)
+    if project is None:
+        raise ProjectNotFound(f"project not found: {project_id}")
+    params = delivery.parse_params(project.get("default_params"))
+    out = {"project_id": project_id, "project_name": project.get("name") or ""}
+    if template is not SHOW_ONLY or clear:
+        if clear:
+            params = {k: v for k, v in params.items() if k != "delivery"}
+        else:
+            params = {**params, "delivery": delivery.validate(template)}
+        store.set_project_default_params(client, project_id, json.dumps(params, ensure_ascii=False))
+        out["written"] = True
+        project = store.project_row(client, project_id) or {}
+    try:
+        tpl = delivery.template_of(project)
+    except delivery.TemplateError as exc:
+        out.update(delivery=None, error=str(exc))
+        return out
+    out["delivery"] = tpl
+    if tpl is not None:
+        out["preview"] = delivery.preview(tpl)["text"]
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 反馈学习
 # ══════════════════════════════════════════════════════════════════════
@@ -4259,13 +4456,17 @@ def ack_edit_digest(client, project_id: str, through: str, *, user_id: str | Non
 
 def record_rule(client, project_id: str, content: str, *, severity: str = "soft",
                 scope: str = "project", user_id: str | None = None,
-                applicability: str = "") -> dict:
+                applicability: str = "", check: dict | None = None) -> dict:
     """沉淀一条规则(团队共享)。severity='hard' 的下次进 P0。
 
     复用 db.upsert_memory —— 它带并发安全(keyed lock + CAS 重试)和
     rule_kind/rule_payload 的向后兼容 strip, 别绕过它自己 insert。
     force_confirmed=True: 这条路径是用户明确说「以后都这样」才走的, 不需要
     频次阈值(那是给自动抽取的候选留人工复核用的)。
+
+    ``check``(2026-10-20): 词表 / 某个词能不能出现在哪 / 字数范围这类规则, 再带一份代码能执行的形状, 存进
+    ``rule_kind`` / ``rule_payload``, score_drafts 存档时逐篇查(deskcore/rulecheck.py)。**先校验再写**: check 写错
+    整条不落库、报 CheckError(工具层映成 400), 免得规则记上了而检查是坏的、谁也不知道。
     """
     # 审计 COR-015。scope='global' 时 project_id 其实不参与写入, 但照样校验 ——
     # 规则是"每个项目级入口都以这一行开头", 留例外就等于留一个以后会被忘掉的
@@ -4279,13 +4480,19 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
         raise ValueError("severity must be 'hard' or 'soft'")
     if scope not in ("project", "global"):
         raise ValueError("scope must be 'project' or 'global'")
+    rule_check = rulecheck.normalize_check(check) if check is not None else None
 
     from .isolation import foreign_markers
     projects = store.isolation_projects(client, owner_id=user_id)
     target = next((p for p in projects if str(p["id"]) == str(project_id)), None)
     if target is None:
         raise RuntimeError("项目标记未查到，未写规则")
-    conflicts = foreign_markers(content, target, projects, global_scope=scope == "global")
+    # 必须带的话术也过同一道(10-20): 它会变成"必须改: 正文里没有「X」"回给写手, X 是别的项目的品牌名时等于叫模型往这个
+    # 项目里写别家的名字。禁用词 / 正则不过: 它们只会让稿子少写什么, 禁掉别家的名字恰恰是常见用法。
+    guarded = content
+    if rule_check is not None and rule_check[0] == "required_phrase":
+        guarded = content + "\n" + "\n".join(rule_check[1]["any"])
+    conflicts = foreign_markers(guarded, target, projects, global_scope=scope == "global")
     if conflicts:
         terms = sorted({t for c in conflicts for t in c["terms"]})
         raise ProjectIsolationRejected("规则含项目专属词「" + "、".join(terms) + "」，可能串项目，未写入。请核对项目；项目专属规则不要记为全局规则。")
@@ -4326,6 +4533,18 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
         saved = store.update_memory_fields(
             client, out["memory_id"], {"applicability": applicability})
         out["applicability"] = (saved or {}).get("applicability")
+
+    # check 同理单独写(db.upsert_memory 只在新建时写这两列), 写失败同样上抛 —— 吞掉的话用户以为这条会被代码查,
+    # 其实没有。回报库里的值, 不回报入参(同 severity 那条的教训)。
+    if rule_check is not None and out["memory_id"]:
+        kind, payload = rule_check
+        saved = store.set_memory_check(client, out["memory_id"], kind, payload)
+        stored_kind = (saved or {}).get("rule_kind")
+        out["check"] = ({"kind": stored_kind, **((saved or {}).get("rule_payload") or {})}
+                        if stored_kind in rulecheck.CHECK_KINDS else None)
+        if stored_kind != kind:
+            out["check_warning"] = (f"请求 check.kind={kind}, 但库里这条现在是 {stored_kind!r} —— "
+                                    "以库里的为准, 请把这个差异告诉用户")
 
     return out
 
@@ -4377,6 +4596,10 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
             "muted_until": r.get("muted_until"),
             "created_at": r.get("created_at"),
         })
+        # 存档时会被代码逐篇查的那几条带上它的 check(10-20): 写手问"这条怎么没拦住"时看得见查的是什么
+        spec = rulecheck.spec_of(r)
+        if spec is not None:
+            out[-1]["check"] = spec
     order = {"生效中": 0, "方向不符": 1, "试用": 2, "已停用": 3}
     out.sort(key=lambda x: (order.get(x["state"], 9), -int(x["votes"] or 1)))
     counts: dict = {}

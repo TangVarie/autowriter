@@ -16,6 +16,8 @@
                                                     接进 skills/…/SKILL.md(不连库)
   python -m deskcore.cli ingest --project <uuid> --user <uuid> --xlsx 表.xlsx [--dry-run]
   python -m deskcore.cli tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target
+  python -m deskcore.cli delivery-format --project <uuid> (--show | --set 模板.json | --clear)
+                                                    ← 项目的交付版式模板(score_drafts 按它拼交付稿)
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
                                                     ← TV 的笔记按内容对到写作台的版本,
                                                       对不上的补进指纹库(每天跑一次)
@@ -493,6 +495,33 @@ def _doctor(core, sb, project_id: str | None) -> int:
 
 # ══════════════════════════════════════════════════════════════════════
 
+def _delivery_format(core, sb, args) -> int:
+    """模板写错 / default_params 解析不了: 打印原因, 退出码 1, 一个字不写。"""
+    from . import delivery
+    template = core.SHOW_ONLY                       # --show; --clear 不看它
+    if args.set_file is not None:                   # --set "" (部署脚本里变量没设)也要去读、报读不了, 不能当成 --show
+        try:
+            with open(args.set_file, encoding="utf-8") as fh:
+                template = json.load(fh)
+        except (OSError, ValueError) as exc:
+            print(f"读不了模板文件 {args.set_file}: {exc}")
+            return 1
+        if template is None:
+            # 文件里是 JSON null: 原来和 --show 用的是同一个 None, 一个字不写还退出码 0(codex review on aw#115)
+            print(f"模板没写进去: {args.set_file} 里是 null。要删掉模板用 --clear")
+            return 1
+    try:
+        out = core.delivery_format(sb, args.project, template=template, clear=args.clear)
+    except delivery.TemplateError as exc:
+        print(f"模板没写进去: {exc}")
+        return 1
+    preview = out.pop("preview", None)
+    _print(out)
+    if preview:
+        print("\n── 一篇示例稿拼出来是这样 ──\n" + preview)
+    return 1 if out.get("error") else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="deskcore", description="写作台内核 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -611,6 +640,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--write-tv", action="store_true",
                    help="把对照写回 TV 的 source_autowriter_* 列(只填空的; 先跟 TV 打招呼)")
     p.add_argument("--dry-run", action="store_true", help="全部算、一行不写")
+    # 交付版式(2026-10-20): 模板存在 projects.default_params.delivery, score_drafts 存完档按它拼整批交付稿。
+    # 运维命令, 同 backfill 不要 --user; 写手那边没有对应的工具 —— 版式是项目定的, 不该在对话里被模型改掉。
+    # 字段说明见 deskcore/delivery.py 与 docs/deskcore.md §3.9。
+    p = sub.add_parser("delivery-format", help="看 / 设 / 清项目的交付版式模板(写之前先校验)")
+    p.add_argument("--project", required=True)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--show", action="store_true", help="打印现在的模板和一篇示例稿拼出来的样子")
+    g.add_argument("--set", dest="set_file", default=None, help="JSON 文件: 模板对象本身")
+    g.add_argument("--clear", action="store_true", help="删掉模板(score_drafts 不再带 delivery)")
+
     p = sub.add_parser("tv-resolve",
                        help="人看过 tv-sync 报的「分不出」之后落判定(目前只有: 对不上, 按正文补录)")
     p.add_argument("--note", required=True, help="tv_note_links.note_id")
@@ -645,6 +684,8 @@ def main(argv: list[str] | None = None) -> int:
         return _tv_sync(core, sb, args)
     if args.cmd == "tv-resolve":
         return _tv_resolve(core, sb, args)
+    if args.cmd == "delivery-format":
+        return _delivery_format(core, sb, args)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user))
     elif args.cmd == "open":

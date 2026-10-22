@@ -27,3 +27,9 @@ extra-streamlit-components>=0.1.70,<1.0
 # 退回逐元素算法, 而那正是 SUP-003 要消掉的东西。dedup 里保留纯 Python 兜底,
 # 所以缺了它不会坏, 只会慢。
 numpy>=1.24,<3.0
+# codex review on aw#115(第四轮): 用户写的 forbidden_regex 执行期限时(validator.search_user_regex)。标准库 re 没有超时、
+# 在 C 里握着 GIL 跑, 静态闸(assert_regex_is_safe)只是尽力而为, 漏过去的慢正则能把共享的服务进程卡住几分钟; 这个包的
+# search 收 timeout。生成链路(check_hard_rules)和写作台(rulecheck)都用, 所以放主文件。版本号是日期(没有 major 一说),
+# 上限放到锁定那一年之后一年; 升级照 R-017: 先跑 tests/test_regex_safety.py(和 re 逐字比字集、比 search 结果)。
+# 缺了它不会坏: validator 退回 re(没有时限)并记一行日志。
+regex>=2024.11.6,<2028

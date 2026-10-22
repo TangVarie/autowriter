@@ -323,6 +323,14 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         draw_angles 分到的写, 在同一种句式里换说法), 开头别复述它们, 人设和核心场景尽量错开。
         p0 / stable 定的人设、发牌分到的坐标和切入角度、用户点名的题目和改稿都优先于它。
         只用来避开, 不要模仿。
+      · recent_structure —— 【有才出现】本项目最近 window 篇打过分的稿子里, 扎堆写成同一个样子的几处
+        (concentrated 每条 {question, answer, share, of}: 哪一处、扎堆的那种写法、占比、占比的分母 —— 这一题有答案的
+        篇数, 可能比 window 少)。照 recent_structure.task 做:
+        这一批每一处都至少有一半的稿子换一种写法。p0 / stable、发牌分到的坐标和切入角度、用户点名的写法都优先于它;
+        只管新写的稿, 改稿不受它约束。
+      · delivery_requirements —— 【项目有交付模板才出现】score_drafts 时每篇 draft 要带什么: ``tags`` 是要给几个话题
+        (``fixed_tags`` 写作台会加, 不用给), ``comments`` 是评论条数范围和每条要提到的词(null 就是不要评论),
+        ``direction`` 为 true 时每篇要带一句切入角度。照 delivery_requirements.task 写, 一次带齐, 免得存完再返工。
       · edit_digest —— 【每周最多一次, 有才出现】: 本项目最近发出去的稿子在发布前被人改了什么(写作台那版 →
         发出去那版)。照 edit_digest.task 做: 归纳成最多 3 条规则建议问用户, 同意的 record_rule, 最后调
         ack_edit_digest。先把它说给用户, 再开始写稿。
@@ -331,7 +339,7 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     (排不出相关性时按天轮换, 不会每次都是最近那几条 —— 那会让文风越写越窄)。所以知道要写什么就传。
-    经验卡也是按这几个字段匹配的, 不传就只按项目定位借。
+    经验卡也是按这几个字段匹配的, 不传就只按项目定位借。传了 tactic 的, 存档时 score_drafts 也原样传同一个 tactic。
 
     ⚠️ **counts.hard_rules 是 0 不一定是错的。** 很多项目的约束确实都记在 soft 里
     (老工作台收反馈时不分"这一次"和"以后都这样", 一律存成 soft; 2026-09-20 全库
@@ -476,7 +484,7 @@ def check_drafts(project_id: str, drafts: list[dict],
         信号命中: 撞开头就换开场视角, 撞正文就换比喻系统或叙事路径。
         只改标题没用。重写完再跑一次。
       · warn —— 可疑, 建议换个切入再交。
-      · pass —— 可以交付, 交付的同时调 score_drafts(存档 + 参考分)。
+      · pass —— 可以交付: 交给用户之前调 score_drafts(存档 + 参考分; 项目有交付模板时它回拼好的交付稿)。
 
     summary.semantic_degraded 为 true 时说明 embedding 不可用, 这次只跑了确定性
     查重, 同角度换说法的标题可能漏过 —— 【要告诉用户这件事】, 别默默交付。
@@ -602,7 +610,7 @@ def score_comments(comments: list[dict], link: str = "", project_id: str = "", p
         raise InvalidInput(str(exc)) from exc
 
 
-def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
+def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", tactic: str = "",
                  _user_id: str | None = None) -> dict:
     """稿子写完、过了 check_drafts 就调(**自动调, 不等用户说**): 一次做两件事 ——
 
@@ -633,6 +641,27 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
     **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零就是有几条没带 —— 那几个角度没销账,
     下一批还会被抽到。这时返回里还会带 ``angle_debt``: 你在这个项目当前还挂着的坐标, **下一批按它们写, 别再抽新的**。
 
+    **话题、评论、方向是每篇 draft 自己的字段, 不要塞进正文**(都可选, 项目要什么看简报的 ``delivery_requirements``):
+    ``drafts=[{"title": ..., "body": ..., "angle_key": ..., "tags": [...], "comments": [{"role": "reader" | "author",
+    "text": "..."}], "direction": "..."}]``。``tags`` 是话题列表(带不带 # 都行); ``comments`` 是这篇笔记自己带的评论;
+    ``direction`` 是这篇的切入角度, 一句话(如「应届生签约前怎么查公司」), **不是** 产品向 / 流量向。它们不是本工具的
+    顶层参数, 放在 drafts 外面会被丢掉。``body`` 只放正文, 不放【标题】【正文】标记、不放话题行 —— 交付模板不管话题的项目
+    例外(简报的 ``delivery_requirements.task`` 会说): 那种模板不读 ``tags``, 话题照项目规则写在正文末尾那一行。
+
+    **交付稿**: 项目配了交付模板时返回里有 ``delivery``: ``text`` 是按模板把这次存进去的几篇拼好的整批交付稿(表格或
+    一篇一段, 标记、话题顺序、固定话题都由服务端加), ``problems`` 是代码查出来的版式问题(``index`` 对应你传的第几篇,
+    ``what`` 说怎么改)。有 problems 就先改那几篇(带 ``replaces_version_id`` 再调一次; 新返回的 ``delivery`` 只含改过的
+    那几篇, 按顺序替换原来那几篇: 表格只换那几行, 新返回的表头和分隔行不要再贴一遍; 一篇一段的换那几段), 然后把
+    ``delivery.text`` **原样**交给用户 —— 不要自己重排、不要再加标记。没有 ``delivery`` 就照项目规则自己排。
+
+    **规则检查**: ``rule_checks`` 是代码按项目里带 check 的规则逐篇查出来的命中(有命中才带), 每条 ``index`` /
+    ``rule_id`` / ``severity`` / ``where`` / ``what``。``what`` 以「必须改」开头的是硬约束, 改完再交; 「建议改」的
+    告诉用户。和分数一样不拦存档。必须改的全列, 建议改补到一共 40 条为止; ``rule_checks_more`` 是没列出的建议改条数,
+    如实告诉用户还有这么多条没列。``rule_checks_status`` 是 ``"error"`` 就是这次没查成, 不能说规则都用代码查过了。
+    ``rule_checks_unchecked`` 里的规则这次没查完(正则没在时限内跑完、限时的引擎跑不了, 或者存的 check 用不了): 算没查 —— 不是违规(``what`` 以
+    「硬约束·没查完」/「建议·没查完」开头, 不是「必须改」), 也不能说它们守住了; ``from_index`` 是从哪篇起没查完, 之前查出来、
+    列在 ``rule_checks`` 里的命中照常算; severity 是 hard 的照规则原文(``rule``)把那几篇自己核一遍。
+
     ``project_isolation`` 是串项目的提示: 有可疑标记要说明并核对; 没发现或检查超时都不能声称已完整排除串项目。
 
     这个工具出错会直接报错。存档失败必须让你知道 —— 稿子没进指纹库的话, 下次 check_drafts 会把同样的内容再放行
@@ -641,20 +670,23 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
 
     ``flywheel_arm``: 把这场写作的 open_project (或 borrow_lessons) 返回里的 ``flywheel_arm`` **原样**传回来。
     它决定这批稿子算进哪个对照组; 不传服务端会猜, 但同一项目同时开着两场时会猜错。
+
+    ``tactic``: 这场 open_project 传过 ``tactic`` 的, 把同一个值**原样**传回来(没传过就不传)。规则检查按它和项目名判这批
+    是产品向还是流量向, 和简报同一个判据; 不传的话只按项目名判, 简报里因为方向不符没给你的建议改规则, 这里会再报一遍。
     """
     # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、只带 error 字段的结果, 而存档失败若被当成
     # 成功, 稿子静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None)
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
 
 
-def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "",
+def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", tactic: str = "",
                   _user_id: str | None = None) -> dict:
     """旧名, 和 ``score_drafts`` 完全一样(存档 + 参考分)。新版 skill 只调 score_drafts; 这个名字留着是为了还没升级
     skill 的写手 —— 别在新对话里调它, 参数、返回值、怎么读分数都看 score_drafts 的说明。"""
     # 同 score_drafts: 写操作, 不包 _safe。
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None)
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
 
 
 INGEST_MAX_PER_CALL = 50
@@ -789,7 +821,7 @@ def ingest_published(project_id: str, drafts: list[dict], source: str = "",
 # ══════════════════════════════════════════════════════════════════════
 
 def record_rule(project_id: str, content: str, severity: str = "soft",
-                scope: str = "project", applicability: str = "",
+                scope: str = "project", applicability: str = "", check: dict | None = None,
                 _user_id: str | None = None) -> dict:
     """把一条规则永久记住。团队共享 —— 队友写这个项目时也会守。
 
@@ -811,12 +843,29 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       名、罗列还是叙事), 混成一条必然打架。用户说的是"写产品向的时候这样"就
       传 "产品向"; 没提方向就留空。**不确定就留空** —— 通用的多注入一条看得见,
       设错方向会让规则在该生效的项目上静默缺席。
+
+    check(可选): 规则是**词表 / 某个词能不能出现在哪 / 字数范围**时, 再带一份代码能查的形状, 存档时服务端逐篇查,
+    命中回在 score_drafts 的 ``rule_checks`` 里。content 照旧写人话, check 是它的机器版:
+      · {"kind": "forbidden_word", "words": ["词1", "词2"], "where": ["title", "body"]}  —— 这些词不能出现
+      · {"kind": "required_phrase", "any": ["话术1", "话术2"], "where": ["body"]}         —— 至少出现一个
+      · {"kind": "max_len", "max": 300, "min": 150, "where": "body"}                       —— 字数范围(不算空白和话题),
+        max / min 至少给一个, where 只认 title / body
+      · {"kind": "forbidden_regex", "pattern": "...", "where": [...]}                       —— 固定写法(正则最长 300 字, 会做安全检查)
+      · {"kind": "free_text"}                                                               —— 撤掉这条的代码检查
+      where 可选 title / body / tags / comments, 不传就是 ["title", "body"]。语气、结构这类判断不了的不要带 check。
+      词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
+      (所以「TV信号」里也不算有 "V信") —— 两种写法都要拦就都列上。
+      check 写错会报错且这条规则不落库: 照报错改了再调一次。返回里的 ``check`` 是库里存下的那份。
     """
     # 故意不包 _safe: 这是【写】操作, 且写的可能是 hard 合规规则。写失败若
     # 报成功, 这条规则会静默缺席之后的每一份简报 —— 而用户以为已经记住了。
-    return core.record_rule(core.sb(), project_id, content,
-                            severity=severity, scope=scope, user_id=_user_id,
-                            applicability=applicability)
+    try:
+        return core.record_rule(core.sb(), project_id, content,
+                                severity=severity, scope=scope, user_id=_user_id,
+                                applicability=applicability, check=check)
+    except core.rulecheck.CheckError as exc:
+        # check 写错是参数问题(400), 不是服务坏了(500): 500 会让模型拿同一个 check 一直重试
+        raise InvalidInput(f"check 写错了, 这条规则没记: {exc}") from exc
 
 
 def record_edit(project_id: str, ai_title: str, ai_body: str,

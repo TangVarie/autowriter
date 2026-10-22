@@ -110,7 +110,7 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 | `label_example` | **按 `items.user_id` 校验**，比项目粒度更细——同一项目里 A 的正负例是 A 的个人资产 |
 | REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了 |
 | CLI 的 `projects` / `open` / `draw` / `check` | 走同一个 `core` 函数，所以 `--user` 从可选变成**必填** |
-| CLI 的 `backfill` / `reembed` | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
+| CLI 的 `backfill` / `reembed` / `delivery-format`（2026-10-20） | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
 
 **要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在每个工具里意味着改一次口径要改十几处，而漏掉的那处不会报错，只会继续放行。
 
@@ -165,17 +165,17 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | 核协议版本 | `get_protocol` | 对话开始时调一次，带上 skill 里的 `protocol_version`：一致只回版本；不一致或没带才下发正文（源文件 `deskcore/protocol.md`）。正文的主副本在 skill 文件里，见 §4.3 |
 | 开项目 | `create_project` | 给新品牌/新方向建项目。**owner 恒为调用者**，签名里没有 owner 参数。同名不建、返回已有的；同品牌照建但列出兄弟项目（见 §3.0） |
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
-| | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`（2026-10-20，见 §3.1） |
+| | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`，以及最近的稿子在哪几处都写成一个样子 `recent_structure`（都是 2026-10-20，见 §3.1） |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
 | | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
-| | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8） |
+| | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8）。2026-10-20 起项目有交付模板时带拼好的 `delivery`（§3.9），带 check 的规则有命中时带 `rule_checks`（§3.10） |
 | 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human_via_agent`（结论来自用户、经模型转述写入；Streamlit 里亲手点按钮的才是 `human`）+ 真实 reviewer + 时间 + **用户原话 `user_words`（必填，落 `decision_note`）** + 距入库秒数 `decided_within_s`。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
-| 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0 |
+| 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0；2026-10-20 起可带 `check`，存档时用代码逐篇查（§3.10） |
 | | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
 | | `save_my_style` | 把模型蒸馏好的笔记写回 + 按 `edit_ids` 销账（`record_edit` 的第二步） |
 | | `label_example` | 标正/负例 |
@@ -301,6 +301,10 @@ cap 后面会让注入数少于 12，而池子里还有相关的排在第 13 位
 > 同一天的另外两处，都在 `open_project` 的简报里：
 > - **`recent_titles`**（有才出现）：本项目近 30 天发出去的标题（`tv-sync` 对到本项目上的笔记，窗口按 `truth_vault.notes.publish_time`，只取 `note_id` / `publish_time` 两列；`ingested` 取版本标题，其余优先 `tv_edit_diffs.published_title`，人可能改过）和近 14 天在写作台写过的标题（补录副本不算），每条 ≤40 字、合计 ≤20 条，不带正文。两栏各有份额：写过的留 8 条、发出去的占其余，哪栏不够空位给另一栏——不能"发出去的先占满"，活跃项目 30 天对上的笔记远超 20 条，那样昨天写了还没发的几篇（下一批最容易撞的）永远进不来。`task` 让模型新写的稿子标题别和它们撞主干词和具体说法、开头别复述它们、人设和核心场景尽量错开；**标题句式照发牌坐标写**（句式只有 8 种，近 20 条标题几乎总把它们占全，"句式也要不一样"和发牌的硬坐标没法同时做到），并写明优先级：p0 / stable 定的人设、发牌分到的坐标和切入角度、用户点名的题目和改稿都在这一栏之上，改稿不受它约束。查不到就不带这一栏（两栏各自兜底），简报照给。
 > - **`validated_patterns_usage`**（有规律才出现，`borrow_lessons` 同样带）：85% 的写手日简报都带着同样 4 条已验证规律，其中一条是"整篇围绕一个求助问题来组织"，模型把 4 条全用在每一篇上，批批同一副骨架。规律清单原样转交（馆员给的，写作台不改），旁边说清楚：每篇最多用一条、一批里按篇号轮换、有几篇一条都不用；它们是表现好过的选项，不是模板；和发牌坐标或 p0 冲突时以它们为准。轮换是 k 条规律加一个"不用"排成一圈，起点按 (项目, 写手, 北京日期) 的哈希定（`open_project` 和 `borrow_lessons` 同一天给同一句），两篇以上的批次没轮到"不用"的、最后一篇不用——固定从第 1 条起的话，每批第 1 篇都是同一条规律，3 篇一批、4 条规律时也轮不到"不用"。`draw_angles` 拿不到规律清单（不借卡），所以按篇号的轮换写在用法里，不在发牌回包里。
+>
+> **再加一处：`recent_structure`（有才出现，2026-10-20 第二批）。** `recent_titles` 管不到骨架。Jev 给每篇打分的稿子答过 TV 特征题库（fq-v0.1），答案在 `truth_vault.note_feature_answers`（`aw_version` × `versions.id` × `primary` × `jev:*`），回包里的 profile 原来是扔掉的。开项目时读回本项目最近 ≤30 篇打过分的稿子（近 60 天按版本自己的时间算，批次年龄和批次数量不截断候选、补录不算、一个 item 一票，版本 id 按篇摊名额；没判出答案的不占名额：最近 60 篇里有答案的凑不够 30 篇、更早的稿子或没问过的旧版本还有，就把还没找到答案的接着往下问一轮，最多 3 轮。judge 停过一阵是这样，judge 不覆盖的项目——没配 judge、`tv_project_map` 没映射（一篇都不判）、只判了一部分——也是这样，后者每次开项目都问满几轮、多几趟空请求，有界；补问那几轮失败只记 warning，第一轮找到的照用），某一处扎堆的那种答案占比 ≥ 0.6 就摆出来：`{window, concentrated: [{question, answer, share, of}], task}`（`of` 是这一题有有效答案的篇数、即 share 的分母，可能比 window 少，也要 ≥ 12 才报），让这一批每一处至少一半换个写法；p0 / stable、发牌坐标、用户点名的写法优先，改稿不受约束。少于 12 篇、不扎堆、账本读不到就不带。三步往返（批次 → 版本 → 答案；答案按主键排序翻页，Jev 换模型重判过几代、行数过了 1000 也不截；一轮是一页加一次空页，最近 60 篇凑够 30 篇有答案的就只问一轮，往下补问的每一轮再来一趟），只取答案列（不取 evidence、不取正文）。
+>
+> 问哪几题见 `deskcore/structure.py`（10-20 拿近 169 篇稿子对照 2,500 多篇已发笔记挑的）：只挑已发笔记本身不扎堆的结构题——有个项目近百篇稿子 86% 第一句是具体事件、82% 标题是问句、95% 写了已经发生的坏结果，它的已发笔记只有 45% / 43% / 35%。bool 题只报「是」扎堆；`product_role`（产品在文中的角色）不问——主角、顺带一提、只暗示、不出现，哪一种扎堆都是项目的露出要求（产品向项目九成稿子产品当主角正是要求本身），不是写法习惯；已发笔记本来就八成以上的（交代身份、亲身经历）、具体性几题、已验证规律用到的题（第一批让模型轮换着用，扎堆是有意的）都不问。篇幅 / 段落形状是 TV 的代码特征，稿子没有答案行，这里做不了。
 
 ### 3.2 词表
 
@@ -524,15 +528,17 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 1.5 秒)，不到 1 秒就一篇不发、整批记 `timeout`。实测（10-12～10-15，有判定的 9 批 / 84 篇）判定段最长 4.3 秒、
 单篇最长 3.4 秒，8 秒一次没碰到；但入库段 10 篇一批已到 11～12 秒，判定再拿满 8 秒就是 ~21.8 秒，贴着客户端
 容忍——超了调用方会以为入库失败去重试、撞上自己刚写的指纹，判定超时只是影子期少一条账本记录。返回值带 `elapsed_ms` 与
-`phase_ms = {lock_wait, commit, judge, total}`（`lock_wait` 单列：补录正在跑时入库要等锁，不拆开会把分位数
-带歪），**同一份数落进 `batch_metrics`**——它本来就是「每批一行的指标快照」（phase_ms / counters / meta 三个
-jsonb），不需要新迁移。`batch_id` 留 NULL（本次的 batch 记在 `meta.batch_id`），免得历史页给写作台批次挂上一块
-全是 0 的「性能指标」。攒够样本之后这样查：
+`phase_ms = {lock_wait, commit, delivery_rules, judge, project_isolation, total}`（`lock_wait` 单列：补录正在跑时入库要
+等锁，不拆开会把分位数带歪；`delivery_rules` 是存档之后、判定之前的交付版式 + 代码查规则（§3.9 / §3.10，规则那次是
+翻页读的），判定的截止要扣掉它花的时间——2026-10-20 起单记，各段加起来约等于 `total`），**同一份数落进
+`batch_metrics`**——它本来就是「每批一行的指标快照」（phase_ms / counters / meta 三个 jsonb），不需要新迁移。
+`batch_id` 留 NULL（本次的 batch 记在 `meta.batch_id`），免得历史页给写作台批次挂上一块全是 0 的「性能指标」。攒够样本之后这样查：
 
 ```sql
 select count(*),
        percentile_cont(0.5)  within group (order by (phase_ms->>'commit')::int) as commit_p50,
        percentile_cont(0.95) within group (order by (phase_ms->>'commit')::int) as commit_p95,
+       percentile_cont(0.95) within group (order by (phase_ms->>'delivery_rules')::int) as delivery_rules_p95,
        percentile_cont(0.95) within group (order by (phase_ms->>'judge')::int)  as judge_p95,
        percentile_cont(0.95) within group (order by (phase_ms->>'total')::int)  as total_p95
   from autowriter.batch_metrics
@@ -573,6 +579,111 @@ select dims->>'emotional_lever' as lever, count(*) as published,
   from autowriter.v_angle_outcomes where note_id is not null
  group by 1 order by bao desc;
 ```
+
+### 3.9 交付版式由代码拼（2026-10-20）
+
+**为什么。** 10-20 生产诊断：写作台的稿子只有 23~45% 原样发出去（有一个项目是 0），其余在飞书里被人重写。其中一层是版式：
+版式写成规则交给写手的模型（WorkBuddy）照着排，时灵时不灵——同一个项目攒了好几条互相打架的「交付格式」规则；老的独立
+写作台是在代码里拼的（`exporter.py` / `app.py` 的复制块），从没出过这个问题。所以版式回到代码。
+
+**模板在哪。** `projects.default_params` 的 `delivery` 键，不加迁移。这一列生产库 80 行都存成 JSON **字符串**（`isolation_terms`
+也在里面），读写两侧都按字符串处理、也认 dict。只能用运维命令设：
+
+```bash
+python -m deskcore.cli delivery-format --project <uuid> --show          # 现在的模板 + 一篇合成示例稿拼出来的样子
+python -m deskcore.cli delivery-format --project <uuid> --set 模板.json   # 先校验, 写回时保留别的键; 文件里是 null 报错不写
+python -m deskcore.cli delivery-format --project <uuid> --clear
+```
+
+写手那边没有对应的工具：版式是项目定的，不该在对话里被模型改掉。模板形状（`deskcore/delivery.py`，校验是严的，不认识的键直接拒）：
+
+| 键 | 说明 |
+|---|---|
+| `layout` | `table`（GitHub 风格的 markdown 表格，一篇一行，格内换行写成 `<br>`、`\|` 转义）或 `blocks`（一篇一段，空行隔开） |
+| `columns` | 只给 `table`：`[{"name": 表头, "field": "direction" \| "post" \| "comments"}]`，顺序即列序，必须有一列 `post` |
+| `markers` | 只能是 `【标题】` / `【正文】`（默认值）。tv-sync 的 `tvlink.parse_raw` 只认这两个标记，09-15 以来 6 个在跑项目发出去的 450 篇也全是这个写法；冒号写法会让整段被当成正文、对不回底稿，所以校验直接拒 |
+| `tags` | `content`：写手给几个话题（0~10）；`fixed`：固定话题，接在后面；`conditional`：`[{"when_any": [词], "add": 话题}]`，标题或正文里出现任一词（不分大小写）就加 |
+| `comments` | `null` 或 `{min, max, label_reader, label_author, must_mention_any}`；标签原样拼在每条评论前面。`table` 配了它就必须有一列 `comments`（反过来也是），不然评论被要求、被检查却拼不进交付稿；`blocks` 的两个标签都不能为空（评论紧跟在话题行后面，没标签分不出正文在哪结束），`table` 的可以为空 |
+
+**怎么拼。** `score_drafts` 存完档（锁外、恢复指纹的 try 外，判定之前），只拿**存进去了的**那几篇按模板拼成一份，挂在返回值的
+`delivery = {format, text, problems}`。一篇 = `【标题】标题` / `【正文】正文` / 话题行；话题顺序是写手的（去重、截到 `content` 个，
+和固定 / 条件话题重名的不占名额）→ 固定的 → 命中的条件话题，统一成单个 `#`、不分大小写去重。写手把话题、评论、方向作为单独的
+字段传（每篇 draft 里的 `tags` / `comments` / `direction`；`direction` 是这篇的切入角度，不是产品向 / 流量向），`body` 只放正文
+（模板不管话题——`tags` 里 `content` / `fixed` / `conditional` 都没配——时例外：`assemble` 不读 `tags` 字段，正文原样进交付稿，
+简报的 `task` 叫写手把项目要的话题照项目规则写在正文末尾那一行；原来照样叫写手「不放话题行」，传在 `tags` 里的话题一句不报就没了，codex review on aw#115）；
+正文末尾要是还带着一行 `#话题`、或者最后一句后面直接跟着一串 `#话题`，模板管话题时会被摘出来（没单独传 `tags` 就用它们；传了 `tags: []` 算传了，摘下来的不用），
+不会拼出两份。网址里的 `#片段`（`#` 前面紧挨着、一直是不带空白的 ASCII 的那一段像网址：带 `://`、`www.` 或 `域名/`）不算话题，留在正文里，查规则时也不算话题；
+前一个字是英文字母数字的 `#`（`学习C#入门`、`1#楼`）同样不是话题，两种除外：紧接着上一个话题的连写（`#abc#def`，只看是不是紧挨着，
+不往回找 `#`——前面 `#秋招[话题]#` 收尾的那个 `#` 不开一串，同一句后面的 `学C#入门` 照样不是话题），和带 `[话题]` 的（`拿到offer#秋招[话题]#`）。
+`#秋招[话题]#` 后面接着正文的（`最后祝大家#秋招[话题]#顺利上岸`），收尾的 `#` 后面是正文，整句不摘。不带 `[话题]` 的话题本体到句读为止
+（中文 / 全角标点、通用标点 U+2010~205E 和 `⋯`、ASCII 的 `, ; : ! ? " ' ( ) < > ~`；`.` `-` `_` `+` `&` `/` 和全角的 `＆ ＋ － ． ／ ＿`、
+`〇` `々`、不断行的连字符、夹在英文字母中间的撇号都留在话题里：`#Node.js` `#C++` `#Kiehl's` `#二〇二六考研`；`validator.TAG_STOP`）：中文句子里
+没有空白，原来 `今天聊聊#秋招，记得准备简历` 整个 `秋招，记得准备简历` 算话题，字数少算、后半句被当成末尾话题摘走（codex review on aw#115）。
+带 `[话题]` 的照旧到 `[话题]` 为止（`#打工人！[话题]#` 是一个话题）。整行都是话题的，话题之间、末尾夹着的标点（`#秋招、#求职、#offer`、
+`#秋招 #求职。`）跟着这一行一起摘掉；前面有正文的只认空白隔开，`冲鸭！#秋招！` 不摘、不丢字（独立复审 on aw#115 第八轮）。哪个 `#` 算话题只在
+`validator.topic_tag_matches` 认一处：摘话题、查话题的规则、数字数（`max_len`）三处口径一样，摘末尾话题也只拿它切、不另写正则（codex review on aw#115）；
+`comments` 只写一条（字符串或一个 `{role, text}`）也认；传成一串 JSON 的，解出来是列表就当评论列表、是对象就当一条，每一项照常查形状——
+外面再包一层的 `{"comments": [...]}`、没有 `text` 的对象、列表里夹着的 `null` / 数字都算那一条形状不对（不往里多解一层），不会整段 JSON 带着「读者：」交出去；解不开的（`[捂脸R]求链接`；一长串 `[` 让 `json.loads` 抛 `RecursionError` 的也算）照旧是一条字符串（codex review on aw#115）。一条评论没有 `text`、或者 `text` 不是字符串（写成 `content`、给了列表 / 数字），
+算这一条形状不对：报进 problems、不拼；查规则看的评论和交付稿是同一份（`delivery.comment_list`），交付稿里有哪几条就查哪几条。`tags` 传成整个列表 `json.dumps` 出来的一串（`'["a", "b"]'`）
+也拆开认（`delivery.split_tags`；摘话题、话题行、查话题的规则都走它），不会拼出 `#["a", #"b"]`。`problems` 只报代码判得准的：`tags` 外壳或列表成员形状不对（固定话题模板也报）、话题不够、评论条数不对、某条评论形状不对、某条评论没提到 `must_mention_any` 里的词、
+表格要方向而这篇没带、标题或正文里已经自带了标记、模板不管话题而 `tags` 里有正文里没有的话题（拼不进交付稿）；`index` 是写手传的位置。写手照协议先改 problems（带 `replaces_version_id`
+再存一次），再把 `text` 原样交给用户。⚠️ 话题和评论不落库，服务端拼不回上一次的稿子，所以重新存的那一次只拼改过的那几篇，
+写手用它按顺序替换原来那几篇（表格只换那几行，新返回的表头不再贴一遍）。
+
+**写之前就让写手知道。** 有模板的项目，`open_project` 的简报带 `delivery_requirements`（`delivery.requirements`：要几个话题、
+固定话题有哪些、评论几条和每条要提到的词、要不要方向，外加一句 `task`），模板就在已经取到的项目行里，不多查。不给的话
+写手第一次 `score_drafts` 才知道要什么，整批带着 problems 回来再存一次（judge 也再跑一遍）。模板坏了不带这一栏。
+
+**不变的。** 没模板的项目返回值一个字不变；发给 judge 的仍是原来的 `title` / `body`，话题、评论、方向一样都不发。模板坏了
+（有人手改了库）只记日志、这次不拼，存档和打分照常；`batch_metrics.meta.delivery` 记拼了几篇、几条问题或出错原因。
+
+**上线后要做的。** 设了模板的项目，原来那几条「交付格式」规则要 `retire`，不然简报里的文字规则和代码拼的版式会互相打架。
+
+### 3.10 能用代码查的规则用代码查（2026-10-20）
+
+**为什么。** 同一份诊断：规则越堆越多，全部写成文字塞进简报，守不守全凭模型的注意力。其中禁用词、某个词能不能出现在哪、必须带的
+话术、字数范围这一类根本不用模型判。`memories.rule_kind` / `rule_payload` 本来就有（`000_baseline.sql` 的 CHECK 只认
+forbidden_word / required_phrase / max_len / forbidden_regex / free_text），以前只有 AW 生成链路的 `validator.py`
+（`generation_service` → `check_hard_rules`，只看 hard）在读，生产库 292 条规则一条没填。不加迁移。⚠️ `validator.py` 没退役，
+同一批行它也读：`forbidden_regex` 的 `where` 它照认（只取 title / body 那部分；只管评论 / 话题的，它那边当没有结构化检查），
+别的 kind 的新形状它读不出 `target`，退回按规则原文解析，和以前一样。
+
+**正则源码最长 300 字**（和 Jev `/compile_rules` 一致），在解析和编译之前拒绝过长输入，防止校验阶段绕过执行时限。已存的超长正则列为没查，不视为守住。模板项目的标题按实际交付的转换和去空白结果查；中文域名和路径后的 URL fragment 留在正文，不当成话题摘走。
+
+**怎么记。** `record_rule` 多一个可选参数 `check = {"kind": ..., ...}`，先校验再写（`rulecheck.normalize_check`），写错整条不落库、
+回 400。`db.upsert_memory` 只在新建时写这两列，所以 check 和 `applicability` 一样单独写一次（`store.set_memory_check`），已有的
+规则再记一次也能加上 / 换掉；`{"kind": "free_text"}` 撤掉。`my_rules` 每条带上它的 `check`。`required_phrase` 的词和规则原文一起过
+项目隔离检查：命中会变成「正文里没有 X」回给写手，X 是别的项目的品牌名就等于叫模型往这个项目里写别家的名字；禁用词和正则不过这道
+（禁掉别家的名字恰恰是常见用法）。
+
+| kind | payload | 命中 |
+|---|---|---|
+| `forbidden_word` | `{"words": [...], "where": [...]}` | 出现任一词；词的开头 / 结尾是英文字母数字的，那一头按词边界认（`ad` 不算出现在 made 里，`V信` / `v+` 不算出现在「TV信号」「Apple TV+」里；中文、标点那一头不加，`www.` 照样出现在 `www.example.com` 里）。反过来 `Q群` 也不算出现在「QQ群」里、`A货` 不算出现在「AA货」「1:1A货」里，两种写法都要拦就都列上（record_rule 的说明里写了；独立复审 on aw#115 第六轮） |
+| `forbidden_regex` | `{"pattern": "...", "where": [...]}` | 匹配上。**执行限时**（codex review on aw#115 第四轮）：下面两道静态闸只是尽力而为的过滤（四轮 review 每轮都找到新的漏网形状，`a*aaa*aaa*…b` 50 个 a 就 6 秒），放行 / 拒绝不再改（Jev 的 `/compile_rules` 一字不差地镜像它们）；执行一律走 `validator.search_user_regex`（第三方 `regex` 包的 `search(timeout=…)`），每条正则在一次检查里共用一份 `config.REGEX_SEARCH_TIMEOUT_SEC`（默认 0.1 秒，env 可调，夹在 0.01~1），漏过闸的慢正则最多花这一份，后面的稿子不再搜，报进 `rule_checks_unchecked`（这次没查），不算命中、也不能说守住了；所有正则规则加起来另有总上限 `config.REGEX_CHECK_TOTAL_SEC`（默认 2.5 秒，夹在 0.1~5；codex review on aw#115：不封顶的话是条数 × 每条那一份，每条调到 1 秒时 20 条就吃满 20 秒的回包目标），到点之后没查完的正则规则从那一篇起同样报没查；所以一次 `score_drafts` 最多多花约 min（正则规则条数 × 0.1 秒，2.5 秒）：到点之后 `regex` 隔一阵才看一次表，实测最多再拖两成多；这个进程第一次用到某条正则时的换写法、编译也从这一份里扣（编译打断不了，换出来的写法超过 3 万字就不编、报没查，编一次 0.1 秒以内；重复次数要展开超过 5 万遍的也不编、报没查——`regex` 编译时把最少次数展开，`x{10000000}` 十几个字就要 5 秒、2.5 GB，`re` 微秒级；Python 还不认识的新字母数字那份码位表一个进程扫一次、加锁、不扣这一份，那份写法另有 10 万字的上限，独立复审 on aw#115 第六轮）。20 条约 2.5 秒，在 20 秒的回包目标里占一成多；正常的规则一批 20 篇 × 1500 字实测几毫秒到十几毫秒（十个词的 `\b` 词表不到 1 毫秒），一份够用。`regex` 和 `re` 有几处不一样，执行前先换写法（`validator._for_regex`），结论和 `re` 一样：原生的 `\w` `\d` `\s` `\b` 字集不一样（`\w` 含 emoji 后面的 U+FE0F、不含 ①②③，`^\W` 碰上「①」两边结论相反），换成用 Unicode 属性写的字集（`\w` = `[\p{L}\p{N}_]`、`\d` = `\p{Nd}`，`\s` 写死 `str.isspace()` 那 29 个字；codex review on aw#115 第五轮：早先逐个码位列显式字集，`\w` 一个就 14 KB，普通的 `\bvx\b` 一批 20 篇就超时、真命中丢了，编译一条 `\b` 词表要几秒），`\b` 挨着英文字母数字的字面量时只看另一边；`regex` 的 Unicode 表比 Python 新，Python 还不认识的新字母数字只在正文里真有时才换一份把它们去掉的写法；`re` 不当量词的 `{`（`x{e}` 在 `regex` 里是模糊匹配，能配上 `y`）转义成字面的；`(?x)` 下全角空格等非 ASCII 空白转义成字面的；`(?i)` 下换出来的字集不按大小写扩；字集照 `re` 的解析树重写。字集里的字和取反的类别转义重叠时（`(?i)[！!\W]`）换成原子组，免得一个字落进好几个分支、指数级回溯；`(?x)` 下回引 / 八进制转义包一层组，免得 `regex` 隔着空白接着读数字（`\1 23` 读成 `\123`）。只剩几处不一样（土耳其语的 ı / İ、回引里 ſ 和 s、比 Python 新的 Unicode 才有的大小写对、组内的 `(?a:…)` 管不到 `regex` 的不分大小写、整条开了 `(?a)` 时 `(?u:…)` 里再套的组退回 ASCII）。`regex` 装不上就退回 `re`（没有时限）、记一行日志；装上了却跑不了的（换出来太长、编译不了）报没查，不退回没有时限的 `re`。静态闸：写入和读出都过 `validator.assert_regex_is_safe`，再加一道：量词只能套单个字符或定长、不含分支的组（`(哈\|哈哈)+$` 这种 validator 放行，30 个「哈」加一个句号就回溯半秒、每多一个字乘 1.6，`re` 没有超时还握着 GIL）。validator 那道自己也加了一条（codex review on aw#115）：能匹配同样字符的量词挨在一起、中间没有固定的字隔开（`a*a*…b` / `.*.*x` / `\w+\w+`）拒，30 个 a 配 8 个 `a*` 就一秒多；外层量词的每一次也算挨着（`(?:.{0,20}){5}x`）；前瞻 `(?=…)` `(?!…)` 里的量词和它前面的也算挨着（`\d+(?=\d*元)`），占有量词、原子组 `(?>…)` 也不算隔断（`.*a*+.*x`、`\d+(?>x?)\d+y`），只是自己不算开着的；后顾里套的前瞻一样；次数可变的组（`(?:…)?`、`(?:…){m,n}`）不是一整块，组里的量词和组前后的照样算挨着（`\d+(?:[,，]?\d+)?元` 2000 位 19 秒，改成 `\d+(?:[,，]\d+)?元` 就放行），组的字集照实算（`\d+(?:\.\d+)?(?=\s*元)` 放行）。两种放行：整条正则最后一个量词只当它的下限（`\d+\s*\d+`、`原价.*\d+`），「X 最多 N 次」展开写到结尾（`[!！][\s\S]*[!！][\s\S]*[!！]`、`\n\s*\n\s*\n`，最多 11 份；后面再接东西、连 `$` 都不行）。字集交不交叉交给 `re` 自己判（把单个字的节点带着组里的 `i` / `s` / `a` 旗单独编译再比，`(?i)[A-Z]` 认 `a`、`ẞ` 认 `ß`）；条件组 `(?(1)…)` 闸看不进去，一律拒 |
+| `required_phrase` | `{"any": [...], "where": [...]}` | 列出的部位合起来一个都没有。那些部位全空时：标题 / 正文空着照没带报（codex review on aw#115：不然「正文里必须带 X」靠交一篇空正文就混过去了）；交付模板要求每篇都带的部位（评论 `min ≥ 1`；要写手给话题或有固定话题，`delivery.expected_parts`）空着就是没交，照没带报（codex review on aw#115：不然「评论里必须带 X」靠一条评论都不交就混过去了）；没模板、或者模板不要求的部位不查（评论常常是后面另走评论那一步写的）。AW 生成链路只看得到标题正文，只管评论 / 话题的这种它一律跳过 |
+| `max_len` | `{"max": N, "min": M, "where": "body" \| "title"}` | 去掉空白和 #话题 之后的字数越界（网址里的 `#片段`、`C#` 这种不是话题，照样算字）；max / min 至少一个 |
+
+`where` 可选 `title` / `body` / `tags` / `comments`，默认 `["title", "body"]`。`tags` 查两样：空格隔开的整行（「话题不超过 N 个」这种按个数数的正则写在它上面），两个以上时每个话题再单独查一遍（`^广告$` 这种锚定的写法按单个话题认；codex review on aw#115 第十一轮）；`comments` 一条一项。`validator.py` 的老形状（`{"target"}` /
+`{"scope", "n"}`）读的时候照认；AW 生成链路读老形状的 `{"target"}` 也照这里的口径（标题正文分开、不分大小写、词边界；codex review on aw#115 第五轮，原来在「标题\n正文」里分大小写找子串，两边结论相反），只剩超过 40 字的词这里不收、那边照查。反过来 AW 生成链路（`validator.check_hard_rules`）也读这两列：标题正文照这里的口径查（查词、数字数共用
+`validator.contains_term` / `count_chars`，正则逐个部位搜），只管话题 / 评论的、check 坏了的跳过，**不退回**从规则原文里抽词
+（codex review on aw#115：「评论不要出现「私信」」会被抽成标题正文的禁用词）。
+
+**怎么查。** `score_drafts` 存完档，用 `store.shared_memories(..., rule_kinds=...)` 取规则——和简报**同一个池子**（confirmed、
+没静音、本项目 + 调用者自己的 global），所以 `mute` / `retire` 之后代码检查跟着停，`set_rule_state` 不用改；只是在服务端按
+`rule_kind` 收窄、不取向量（每次存档多拉几百 KB 向量是白花的）。soft 的再过简报那道**方向闸**（`filter_by_applicability`，按项目名
+加写手原样传回来的 `tactic` 判，同简报；codex review on aw#115）：标了另一个方向的 soft 规则简报里没有，这里也不查，不然产品向的"带上产品名"会报到流量向项目上；
+hard 不过这道闸，同简报。简报的相关性筛选和每层 12 条的封顶**不做**：那两道是给注入的文字限量的，记了 check 的规则每次都查。
+有交付模板时，查的是交付出去的那一份（`delivery.delivered_draft`），和 `delivery.text` 对得上：模板管话题的，话题含模板加的固定 / 条件话题，
+正文是摘掉末尾那行话题之后的；不管话题的，`tags` 字段不拼、也不查，只认正文里的 `#话题`；`comments` 是 null 的，评论不拼、也不查
+（codex review on aw#115：拿原稿查的话，不交付的话题 / 评论里的词照报违规，必须带的话术也能靠它们混过去）。没模板的照原稿查。
+只查存进去了的稿子，有命中才带 `rule_checks`（每条 `index` / `rule_id` / `severity` / `where` / `what`，`what` 以「必须改」或
+「建议改」开头，必须改的全列，建议改按篇号补到一共 40 条为止，多的报个数在 `rule_checks_more`）。不调模型、不出网、不拦存档；
+查询失败记日志并带 `rule_checks_status = "error"`（不带的话和"查过了、没命中"一模一样）。正则规则这次没查完的（没在时限内跑完，或者限时的引擎跑不了），以及存的 check 用不了的（写坏了，或者是这里不查的老写法，比如 `max_len` 的「开头」；原来只在 batch_metrics 里记个数，回包和「查过了、没命中」一模一样，codex review on aw#115），列在
+`rule_checks_unchecked`（每条 `rule_id` / `severity` / `rule`（规则原文：简报里没有 id，写手靠它对上是哪一条）/ `from_index`（从哪篇起没查完，之前的都查完了，查出来的命中照报）/ `what`；`what` 以「硬约束·没查完」/「建议·没查完」开头，不用「必须改」——那是"查出了违规"的意思），`next_step` 叫写手别说这几条守住了、也别说成违规，hard 的照原文自己核一遍；
+已经搜到的命中照报。`batch_metrics.meta.rule_checks` 记能查的规则数、命中数、硬约束命中数、耗时，有没查完的再记 `timed_out`（规则 id）和 `timed_out_from`（规则 id → 从哪篇起），check 用不了的记 `skipped_ids`。
+
+**上线后要做的。** 运营下次说到词表 / 字数类规矩时，写手会按协议带上 `check`；存量的这类规则要让写手在 `my_rules` 里挑出来、
+原文一字不差地再 `record_rule` 一次并带上 `check`（或者运维照同一形状直接写那两列）。
 
 ## 4. 接入
 
