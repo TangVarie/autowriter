@@ -1017,3 +1017,10 @@ def test_legacy_target_rows_get_the_same_answer_on_both_paths(kind, target, titl
     desk = rulecheck.check([rule], [{"title": title, "body": body}])[0]
     gen = validator.check_hard_rules([rule], title=title, body=body)
     assert bool(desk) is hit and bool(gen) is hit
+
+
+@pytest.mark.parametrize('text,term,found', [('Straße', 'ß', True), ('großartig', 'ß', True),
+                                           ('aſb', 'ſ', True), ('aKb', 'K', True),
+                                           ('aßb', 's', False), ('XＳ', 'XＳ', True)])
+def test_term_boundaries_use_original_unicode_edges(text, term, found):
+    assert validator.contains_term(text, term) is found

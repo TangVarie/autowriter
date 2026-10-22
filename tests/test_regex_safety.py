@@ -801,12 +801,17 @@ def test_known_gap_unicode_scope_inside_global_ascii():
     assert bool(re.search("(?a)vx(?u:\\b)", "vx天")) == bool(V.search_user_regex("(?a)vx(?u:\\b)", "vx天"))
 
 
-def test_falls_back_to_re_when_regex_is_not_installed(monkeypatch):
-    """regex 包没装上就退回 re: 规则照查, 只是没有时限(还在闸后面、有长度上限)。装上了却跑不了的不退回(见上一节)。"""
+def test_missing_timeout_engine_marks_rules_unchecked(monkeypatch):
+    """静态闸不能保证 re 搜索有界; 没有 regex 时不执行用户模式。"""
     monkeypatch.setattr(V, "_regex", None)
     V._compiled.cache_clear()
     try:
-        assert V.search_user_regex("示例\\w", "这是示例A").group(0) == "示例A"
+        with pytest.raises(V.RegexTimeout, match="引擎"):
+            V.search_user_regex("示例\\w", "这是示例A")
+        from deskcore import rulecheck
+        hits, stats = rulecheck.check([{"id": "no-engine", "rule_kind": "forbidden_regex",
+                                       "rule_payload": {"pattern": "示例\\w"}}], [{"body": "这是示例A"}])
+        assert hits == [] and stats["timed_out"] == ["no-engine"]
     finally:
         V._compiled.cache_clear()
 def test_oversized_regex_is_rejected_before_parsing_or_compiling(monkeypatch):

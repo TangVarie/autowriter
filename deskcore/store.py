@@ -2585,9 +2585,10 @@ STRUCTURE_ROUNDS_MAX = 3
 # —— 三代就是 1,440 行, 过了 PostgREST 的 db-max-rows(1000), 原来不排序 .limit(1000) 会静默截掉一截, 最新那代答案、
 # 甚至整篇稿子都可能在挑最新之前就没了。所以按主键剩下那几列排好序翻页(_paged), 一行不丢。
 STRUCTURE_VERSIONS_MAX = 80
-# 窗口里最多看这么多行版本(只有 id / item_id / 时间, 一行几十字节)。按 item 摊名额之前先取够: 改过几十轮的那一篇
-# 要把这么多行都占满才挤得掉别的稿子
-STRUCTURE_VERSION_ROWS_MAX = 300
+# 候选上限按不同 item 计; 不能先截版本行, 否则少数多次改稿会挤掉其它篇。
+STRUCTURE_CANDIDATE_ITEMS_MAX = STRUCTURE_ITEMS_MAX * STRUCTURE_ROUNDS_MAX
+# 三轮最多问这么多版, 更老的版本不占内存; 版本扫描仍继续, 直到取够不同 item 或窗口耗尽。
+STRUCTURE_VERSIONS_PER_ITEM_MAX = STRUCTURE_VERSIONS_MAX * STRUCTURE_ROUNDS_MAX
 
 
 def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[int, frozenset]],
@@ -2614,19 +2615,25 @@ def recent_structure_answers(sb, project_id: str, *, questions: dict[str, tuple[
         return []
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=days)
-    versions = _paged(lambda off, lim: (
+    pages = _paged_iter(lambda off, lim: (
         sb.table("versions").select("id, item_id, created_at, items!inner(batches!inner(project_id, params))")
         .eq("items.batches.project_id", project_id).gte("created_at", since.isoformat())
         .or_("params->>source.is.null,params->>source.neq.ingest", reference_table="items.batches")
-        .order("created_at", desc=True).order("id", desc=True).range(off, off + lim - 1)),
-        hard_cap=STRUCTURE_VERSION_ROWS_MAX)
+        .order("created_at", desc=True).order("id", desc=True).range(off, off + lim - 1)))
     by_item: dict[str, list[tuple[datetime, str, str]]] = {}     # item id → [(版本时间, item id, 版本 id)]
-    for v in versions:
-        if is_ingest_batch((v.get("items") or {}).get("batches")):   # 老行的 params 还可能是 JSON 字符串
-            continue
-        t = _ts(v.get("created_at"))
-        if v.get("id") and v.get("item_id") and t is not None and t >= since:
-            by_item.setdefault(str(v["item_id"]), []).append((t, str(v["item_id"]), str(v["id"])))
+    for page in pages:
+        for v in page:
+            if is_ingest_batch((v.get("items") or {}).get("batches")):   # 老行的 params 还可能是 JSON 字符串
+                continue
+            t = _ts(v.get("created_at"))
+            if v.get("id") and v.get("item_id") and t is not None and t >= since:
+                lane = by_item.setdefault(str(v["item_id"]), [])
+                if len(lane) < STRUCTURE_VERSIONS_PER_ITEM_MAX:
+                    lane.append((t, str(v["item_id"]), str(v["id"])))
+                if len(by_item) >= STRUCTURE_CANDIDATE_ITEMS_MAX:
+                    break
+        if len(by_item) >= STRUCTURE_CANDIDATE_ITEMS_MAX:
+            break
     # 每篇一条道, 道内新的在前; 道按最新那一版排, 最近改过 / 写过的在前
     lanes = sorted((sorted(vs, key=lambda c: (c[0], c[2]), reverse=True) for vs in by_item.values()),
                    key=lambda vs: (vs[0][0], vs[0][2]), reverse=True)

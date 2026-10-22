@@ -479,3 +479,13 @@ def test_brief_survives_the_lookup_blowing_up(monkeypatch, where):
 def test_open_project_doc_tells_the_model_about_recent_structure():
     doc = tools.open_project.__doc__ or ""
     assert "recent_structure" in doc and "至少有一半" in doc and "优先于它" in doc
+
+
+def test_hundreds_of_recent_versions_do_not_hide_older_distinct_items():
+    w = _World()
+    for i in range(10):
+        w.draft(versions={f'v{n}': _neutral(i) for n in range(40)}, days=1 + i / 100)
+    for i in range(30):
+        w.draft(_neutral(i + 10), days=2 + i / 100)
+    got = _read(w.client())
+    assert got == [_neutral(i) for i in range(30)]

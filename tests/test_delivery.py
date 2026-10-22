@@ -744,3 +744,21 @@ def test_tags_comments_and_direction_are_not_sent_to_the_judge(monkeypatch):
     assert a == b, "加了话题 / 评论 / 方向之后发给 judge 的东西变了"
     assert b["body"] == plain[0]["body"]
     assert not {"tags", "comments", "direction"} & set(b)
+
+
+@pytest.mark.parametrize('url', ['https://example.com/path', 'https://example.com/a(b)',
+                                  'https://例子.公司/说明', 'www.example.com/a[b]'])
+@pytest.mark.parametrize('opening,closing', [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')])
+def test_topics_after_wrapped_urls_are_delivered_once(url, opening, closing):
+    body = f'详情见{opening}{url}{closing}'
+    assert delivery.lift_trailing_tags(body + '#秋招') == (body, ['秋招'])
+    assert validator.topic_tags(body + '#秋招') == ['#秋招']
+    assert delivery.assemble(BLOCKS, [{'title': '甲', 'body': body + '#秋招', 'tags': ['秋招']}])['text'] == (
+        f'【标题】甲\n【正文】{body}\n#秋招')
+
+
+@pytest.mark.parametrize('url', ['https://example.com/a(b)#frag', 'https://example.com/a[b]#frag',
+                                  'https://example.com/a(b(c))#frag'])
+def test_balanced_url_delimiters_preserve_fragments(url):
+    assert validator.topic_tags(url + ' #秋招') == ['#秋招']
+    assert delivery.lift_trailing_tags(url + ' #秋招') == (url, ['秋招'])
