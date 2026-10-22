@@ -1,4 +1,10 @@
-# autowriter / deskcore 交接 · 2026-10-21（最新，先看这一节）
+# autowriter / deskcore 移交下一位 · 2026-10-22
+
+用户本轮要求移交同事；先读 [aw接手卡](docs/handoff-2026-10-22-next-owner.md) 与 [三仓执行书PR TV#215](https://github.com/TangVarie/truth-vault/pull/215)。#121已合并7042cebc，生产仍旧build；#117已改base且最终head fdeaa9f过审/CI，未合并，015/运行配置先行。已有上线授权有效；本轮只交接，没有继续部署或生产写入。以下10-21及更早各段保留为历史快照，与本节/执行书冲突时按新入口，并在操作前重新核线上。
+
+---
+
+# autowriter / deskcore 交接 · 2026-10-21（历史快照）
 
 快照 **2026-10-21 08:25 UTC**。上一位接手的 Claude 会话到这里停手，owner 换人接手，不再有人替你盯 PR 或按时检查。三库总交接、接手要按时做的事，看 [truth-vault HANDOFF.md 最上面一节](https://github.com/TangVarie/truth-vault/blob/main/HANDOFF.md)；未完成清单看 [OPEN-ITEMS.md](https://github.com/TangVarie/truth-vault/blob/main/OPEN-ITEMS.md)。这一节只写 aw 自己的部分。下面 10-15 那一版里没过时的照旧有效。
 
