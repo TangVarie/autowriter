@@ -4816,11 +4816,23 @@ def set_rule_state(client, memory_id: str, action: str, *,
                              f"收到 {direction!r}")
 
     saved = store.update_memory_fields(client, memory_id, fields)
-    if (saved and (row.get("scope") or "") == "project"
+    if (saved
             and (saved.get("status") or "").lower() == "confirmed"
             and (action in ("promote", "unmute") or (action == "set_direction"
                  and (saved.get("applicability") or "").strip() != (row.get("applicability") or "").strip()))):
-        _kick_rule_compile(client, row["project_id"], reason="set_rule_state", bypass_cooldown=True)
+        compile_project = row.get("project_id")
+        if row.get("scope") == "global":
+            # 全局缓存跨项目共用; 选择 owner 自己已接 TV 的项目, 避免第一批先漏查。
+            compile_project = None
+            try:
+                for project in store.list_all_projects(client, owner_id=row["user_id"]):
+                    if any(m.get("tv_project_id") for m in store.tv_projects_of(client, project["id"])):
+                        compile_project = project["id"]
+                        break
+            except Exception:                      # 后台增强失败不能把已保存的修改报成失败
+                logger.warning("global 规则激活后查编译项目失败(memory=%s)", memory_id, exc_info=True)
+        if compile_project:
+            _kick_rule_compile(client, compile_project, reason="set_rule_state", bypass_cooldown=True)
     return {
         "memory_id": memory_id,
         "content": (row.get("content") or "")[:120],

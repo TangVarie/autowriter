@@ -496,10 +496,11 @@ def test_open_project_and_record_rule_trigger_without_waiting(blocking_compile, 
 @pytest.mark.parametrize("action,direction,status", [("promote", "", "candidate"),
                                                      ("set_direction", "流量向", "confirmed"),
                                                      ("unmute", "", "confirmed")])
-def test_activating_or_retargeting_a_rule_starts_compiling_immediately(monkeypatch, action, direction, status):
+@pytest.mark.parametrize("scope", ["project", "global"])
+def test_activating_or_retargeting_a_rule_starts_compiling_immediately(monkeypatch, action, direction, status, scope):
     kicks = []
     monkeypatch.setattr(core, "_kick_rule_compile", lambda client, pid, **kw: kicks.append((pid, kw)))
-    rule = mem(19, status=status)
+    rule = mem(19, status=status, scope=scope)
     if action == "unmute":
         rule["muted_until"] = "2999-01-01T00:00:00+00:00"
     client = make_client([rule])
@@ -1023,3 +1024,21 @@ def test_a_free_generator_overload_is_retried_after_half_an_hour_not_six(jev, mo
         assert rep["status"] == "ok" and rep["compiled"] == 1 and len(jev.compile_calls()) == 2
     else:
         assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 1
+
+
+def test_global_activation_uses_an_owned_mapped_project(monkeypatch):
+    kicks = []
+    monkeypatch.setattr(core, '_kick_rule_compile', lambda client, pid, **kw: kicks.append(pid))
+    projects = [{'id': OTHER_PROJ, 'name': 'A unmapped', 'owner_id': ME},
+                {'id': PROJ, 'name': 'B mapped', 'owner_id': ME}]
+    rule = mem(19, status='candidate', scope='global')
+    core.set_rule_state(make_client([rule], projects=projects), rule['id'], 'promote', user_id=ME)
+    assert kicks == [PROJ]
+
+
+def test_global_activation_without_an_owned_mapped_project_starts_nothing(monkeypatch):
+    kicks = []
+    monkeypatch.setattr(core, '_kick_rule_compile', lambda client, pid, **kw: kicks.append(pid))
+    rule = mem(19, status='candidate', scope='global')
+    core.set_rule_state(make_client([rule], maps=False), rule['id'], 'promote', user_id=ME)
+    assert kicks == []
