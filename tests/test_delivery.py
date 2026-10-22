@@ -763,3 +763,10 @@ def test_topics_after_wrapped_urls_are_delivered_once(url, opening, closing):
 def test_balanced_url_delimiters_preserve_fragments(url):
     assert validator.topic_tags(url + ' #秋招') == ['#秋招']
     assert delivery.lift_trailing_tags(url + ' #秋招') == (url, ['秋招'])
+
+
+def test_long_whitespace_does_not_make_url_detection_quadratic():
+    import time
+    start = time.monotonic()
+    assert validator.topic_tags(' ' * 100000 + '#秋招') == ['#秋招']
+    assert time.monotonic() - start < 2.0
