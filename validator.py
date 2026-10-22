@@ -577,12 +577,12 @@ MAX_REGEX_TARGET_CHARS = 20_000
 #    regex 按大小写折叠, ſ 和 s 算同一个); 比 Python 新的 Unicode 才有的大小写对(Ɤ 和 ɤ); 组内的 (?a:…) (?u:…) 碰上不分大小写
 #    (regex 不分大小写时只看整条正则的旗, 组里的 a / u 管不到: (?a:(?i:k)) 在 regex 里认 K 开尔文符号, re 不认); 整条开了 (?a)
 #    时 (?u:…) 里再套的组(换写法加的、自己写的 (?:…) 都算), regex 退回整条的 ASCII(test_known_gap_unicode_scope_inside_global_ascii)。
-# regex 装不上就退回 re(仍在闸后面、仍有长度上限, 只是没有时限), 记一次日志。装上了却跑不了的(换过的写法太长、regex 编译不了、
-# 拿不到 re 的解析树)不退回没有时限的 re: 报成这次没查(RegexTimeout), 记一次日志 —— 不然一个 regex 不认的写法就能把闸后面
+# regex 装不上, 或装上了却跑不了(换过的写法太长、regex 编译不了、拿不到 re 的解析树),
+# 都不退回没有时限的 re: 报成这次没查(RegexTimeout), 记一次日志 —— 不然一个 regex 不认的写法就能把闸后面
 # 那道时限整个绕过去(a*aaa*…b|示例{1,2}{e} 曾经就这样跑进 re, 2000 个 a 永不返回)。
 try:
     import regex as _regex
-except ImportError:                                  # pragma: no cover — requirements.lock 里有, 缺了只是退回 re
+except ImportError:                                  # pragma: no cover — requirements.lock 里有, 缺了报告未检查
     _regex = None
 _logger = logging.getLogger("validator")
 _REGEX_MISSING_LOGGED = [False]
@@ -951,19 +951,19 @@ def _for_regex(pattern: str, exact: bool = False) -> Optional[tuple[str, bool]]:
 
 @functools.lru_cache(maxsize=512)
 def _compiled(pattern: str, exact: bool = False):
-    """(编译好的, 要不要看正文换 exact 那份, 跑不了的理由)。每个 pattern 每个进程编一次(exact 那份第一次用到才编); 退回 re 和
-    跑不了的那次各记一行日志。
+    """(编译好的, 要不要看正文换 exact 那份, 跑不了的理由)。每个 pattern 每个进程编一次(exact 那份第一次用到才编);
+    跑不了的那次记一行日志。
 
-    - regex 装不上: (re 编译好的, False, None) —— 退回 re, 没有时限。
+    - regex 装不上: (None, False, 理由) —— 报这次没查, 不执行无时限的 re。
     - 限时的引擎跑不了(拿不到解析树 / 换不出来 / 换出来超过 MAX_TRANSLATED_CHARS(_EXACT) / 重复展开超过 MAX_REPEAT_UNROLL /
       regex 编译不了): (None, False, 理由), search_user_regex 报这次没查。不退回没有时限的 re。
     pattern 本身 re 都编译不了的, 照 re 抛 re.error(和闸、和原来一样)。"""
-    fallback = re.compile(pattern)
+    re.compile(pattern)                            # 保留无效模式的 re.error 契约, 不执行搜索
     if _regex is None:
         if not _REGEX_MISSING_LOGGED[0]:
             _REGEX_MISSING_LOGGED[0] = True
-            _logger.warning("validator: 装不上 regex 包, 用户正则退回 re 执行(没有时限, 只剩静态闸和长度上限)")
-        return fallback, False, None
+            _logger.warning("validator: 装不上 regex 包, 用户正则这次没查(限时引擎不可用)")
+        return None, False, "限时引擎不可用(regex 未安装)"
     unroll = _repeat_unroll(_parse_pattern(pattern))
     got = None if unroll > MAX_REPEAT_UNROLL else _for_regex(pattern, exact)
     cap = MAX_TRANSLATED_CHARS_EXACT if exact else MAX_TRANSLATED_CHARS
@@ -998,8 +998,6 @@ def search_user_regex(pattern: str, text: str, budget: Optional[RegexBudget] = N
     t0 = time.monotonic()
     try:
         rx, needs_exact, why = _compiled(pattern)
-        if isinstance(rx, re.Pattern):               # regex 装不上: 退回 re, 没有时限
-            return rx.search(text)
         if rx is not None and needs_exact and _differs_from_re(text):
             # 码位表一个进程扫一次(零点几秒), 不是这条规则花的: 不从这一份里扣, 不然第一篇带新字的稿子上真命中报成没查
             t_table = time.monotonic()
@@ -1194,27 +1192,36 @@ TAG_GAP = re.compile(rf"[\s{TAG_STOP}]*")
 # 网址: # 前面紧挨着、一直是网址字符的那一段带 ://、带 www.、或者 域名/。中文域名和路径也是网址字符。只往前看到最近的空白不够: 中文
 # 句子里没有空白, 句子前面随便有个网址、甚至 Node.js/ 这种技术栈写法, 后面的话题就都不算了("学了Node.js/Express，面试稳了！#秋招")。
 _URL_HINT = re.compile(r"://|www\.|[A-Za-z0-9-]\.[A-Za-z]{2,}(?::\d+)?/", re.I)
-# Unicode 句读隔开网址和后面的中文正文; ASCII 标点留给 URL(查询串、括号、冒号等都可能在里面)。
+# Unicode 句读和 ASCII 引号、尖括号隔开网址; 圆/方/花括号按配对处理。
 _URL_BREAK = re.compile(r"[\s\x00-\x20\x7f\u3000-\u3004\u3008-\u3020\u3030\u3036\u3037\u303d-\u303f"
                         r"\uff01-\uff05\uff07-\uff0a\uff0c\uff1a-\uff20\uff3b-\uff3e\uff40\uff5b-\uff65"
-                        r"\u2010\u2012-\u205e\u22ef]+")
+                        r"\u2010\u2012-\u205e\u22ef<>\"]+")
 
 
 def _hashes_in_urls(text: str) -> dict[int, bool]:
-    """每个 # 是不是网址的一部分(紧挨在它前面、一直是网址字符的那一段像网址), 一趟扫完。网址特征(://、www.、域名/)里没有 #,
-    所以两个 # 之间那一段单独查一次、再接上前一个 # 的结论就够了 —— 每个 # 都往回切一遍的话, 一长串 "#a#a#a…" 是平方级的。"""
+    """一趟扫描识别 URL 片段。URL 内平衡的括号保留, 未配对的右括号结束 URL。
+
+    只从 URL 特征起计算括号, 所以 (https://example/a(b))#话题 的外层右括号会结束 URL。
+    特征先统一查出位置, 不为每个 # 回扫, 一长串 # 也保持线性。
+    """
     out: dict[int, bool] = {}
-    prev, hint = -1, False
-    at = text.find("#")
-    while at >= 0:
-        seg = text[prev + 1:at]
-        tail = _URL_BREAK.split(seg)[-1]
-        if prev >= 0 and len(tail) == len(seg):        # 中间一直是网址字符: 和前一个 # 是同一段
-            hint = hint or _URL_HINT.search(seg) is not None
-        else:
-            hint = _URL_HINT.search(tail) is not None
-        out[at] = hint
-        prev, at = at, text.find("#", at + 1)
+    hints = {m.start() for m in _URL_HINT.finditer(text)}
+    active, stack = False, []
+    closing = {")": "(", "]": "[", "}": "{"}
+    for at, ch in enumerate(text):
+        if _URL_BREAK.match(text, at):
+            active, stack = False, []
+        elif at in hints and not active:
+            active = True
+        elif active and ch in "([{":
+            stack.append(ch)
+        elif active and ch in closing:
+            if stack and stack[-1] == closing[ch]:
+                stack.pop()
+            else:
+                active, stack = False, []
+        if ch == "#":
+            out[at] = active
     return out
 
 
@@ -1254,8 +1261,8 @@ def contains_term(text: str, term: str) -> bool:
     代价是同一个道理的另一面: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」里, 两种都要拦就都列上(record_rule 说明里写了)。
     中文、标点那一头不加。"""
     t, s = term.casefold(), (text or "").casefold()
-    head = r"(?<![a-z0-9])" if t[:1] in _ALNUM else ""
-    tail = r"(?![a-z0-9])" if t[-1:] in _ALNUM else ""
+    head = r"(?<![a-z0-9])" if term[:1].isascii() and term[:1].lower() in _ALNUM else ""
+    tail = r"(?![a-z0-9])" if term[-1:].isascii() and term[-1:].lower() in _ALNUM else ""
     if not (head or tail):
         return t in s
     return re.search(head + re.escape(t) + tail, s) is not None
