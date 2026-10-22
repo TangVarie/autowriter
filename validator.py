@@ -1209,7 +1209,7 @@ def _hashes_in_urls(text: str) -> dict[int, bool]:
     active, stack = False, []
     closing = {")": "(", "]": "[", "}": "{"}
     for at, ch in enumerate(text):
-        if _URL_BREAK.match(text, at):
+        if _URL_BREAK.fullmatch(ch):
             active, stack = False, []
         elif at in hints and not active:
             active = True
