@@ -239,11 +239,15 @@ def projects_with_brand(sb, *, owner_id: str, brand: str) -> list[dict]:
 
 def shared_memories(sb, project_id: str,
                     user_id: str | None = None, *,
-                    rule_kinds: tuple[str, ...] | None = None) -> tuple[list[dict], list[dict]]:
+                    rule_kinds: tuple[str, ...] | None = None,
+                    vectors: bool = True) -> tuple[list[dict], list[dict]]:
     """项目的 confirmed 规则。
 
     返回 (hard, soft)。muted_until 未到期的过滤掉(用户临时静音一条规则而不删)。
     同时带上 scope='global' 的通用规则。
+
+    ``vectors=False``(2026-10-20): 规则编译(core.compile_rules)和 check_rules 要的是**同一个池子**的全部规则, 但用不着
+    向量 —— 不取 embedding 列, 每次省下几百 KB。
 
     ``rule_kinds``(2026-10-20): score_drafts 的代码查规则(deskcore/rulecheck.py)只要带 check 的那几行, 和简报
     取**同一个池子**(retire / mute 之后代码检查跟着停; 方向闸由调用方再过一遍, 同简报), 但不要向量 —— 那是每次存档
@@ -296,7 +300,7 @@ def shared_memories(sb, project_id: str,
     #  test_applicability_gate.py 里有一条专门盯着这个列名。)
     cols = ("id, content, severity, scope, rule_kind, rule_payload, "
             "muted_until, user_id, memory_type, created_at, frequency, "
-            "applicability" + ("" if rule_kinds else ", embedding"))
+            "applicability" + ("" if (rule_kinds or not vectors) else ", embedding"))
 
     def _base():
         q = sb.table("memories").select(cols)
@@ -496,6 +500,95 @@ def set_memory_check(sb, memory_id: str, rule_kind: str, rule_payload: dict | No
     got = (sb.table("memories").select("id, rule_kind, rule_payload")
              .eq("id", memory_id).limit(1).execute()).data or []
     return got[0] if got else None
+
+
+# ── 规则编译结果(migrations/015, 2026-10-20, D-121) ─────────────────────────
+#
+# Jev /compile_rules 每条规则的结果按 (memory_id, sha) 一行。sha 是规则原文(+ applicability)的 sha256 前 12 位
+# (rulecompile.rule_sha), 规则一改就是新的一行; 旧 sha 的行留着(改回去不用再花钱), 规则删了跟着级联删。
+
+RULE_COMPILE_COLS = "memory_id, sha, result, model, compiled_at"
+
+
+def rule_compiles_for(sb, memory_ids: list[str]) -> dict[tuple[str, str], dict]:
+    """这些规则已经存下的编译结果: ``{(memory_id, sha): 行}``。分块 + 翻页(同 rule_counts_bulk)。
+
+    ⚠️ 出错上抛, 不回空: 回空等于"一条都没编过", 后台会把整个池子重编一遍、白花一轮钱;
+    check_rules 那边会把它当成"都还在编", 一条都不查却不报错。"""
+    out: dict[tuple[str, str], dict] = {}
+    ids = [str(i) for i in dict.fromkeys(memory_ids) if i]
+    for chunk in db._in_chunks(ids, 100):
+        for r in _paged(lambda off, lim, _c=chunk: (
+                sb.table("rule_compiles").select(RULE_COMPILE_COLS)
+                  .in_("memory_id", _c)
+                  .order("memory_id").order("sha")
+                  .range(off, off + lim - 1))):
+            out[(str(r.get("memory_id")), str(r.get("sha")))] = r
+    return out
+
+
+def rule_compiles_upsert(sb, rows: list[dict]) -> int:
+    """写编译结果, 撞上 (memory_id, sha) 就覆盖(``--force`` 重编时)。返回写了几行。出错上抛, 由调用方记。"""
+    if not rows:
+        return 0
+    res = sb.table("rule_compiles").upsert(rows, on_conflict="memory_id,sha").execute()
+    return len(getattr(res, "data", None) or [])
+
+
+def existing_memory_ids(sb, memory_ids: list[str]) -> set[str]:
+    """这些规则 id 里库里还在的那几个(compile_rules 写编译结果被外键拒掉时用, 2026-10-20 复审)。出错上抛。"""
+    out: set[str] = set()
+    ids = [str(i) for i in dict.fromkeys(memory_ids) if i]
+    for chunk in db._in_chunks(ids, 100):
+        res = sb.table("memories").select("id").in_("id", chunk).execute()
+        out.update(str(r.get("id")) for r in (getattr(res, "data", None) or []))
+    return out
+
+
+def projects_with_rules(sb) -> list[dict]:
+    """``compile-rules --all`` 要过的项目: 有 confirmed 项目规则的项目, 加上 owner 有 confirmed global 规则的项目。
+
+    返回 ``[{"id", "name", "owner_id"}]``, 按名字排。global 规则跟着 owner 的每个项目进池子(同 shared_memories),
+    编一次就缓存住, 后面的项目只是命中缓存; ``--force`` 时 CLI 带着同一次运行的 ``seen`` 走, 同一次运行里也只编一次
+    (2026-10-20 复审)。运维命令用, 不按调用者过滤(同 backfill)。"""
+    pids: set[str] = set()
+    owners: set[str] = set()
+    for r in _paged(lambda off, lim: (
+            sb.table("memories").select("project_id, user_id, scope, memory_type")
+              .eq("status", "confirmed")
+              .or_("memory_type.is.null,memory_type.eq.rule")
+              .order("id")
+              .range(off, off + lim - 1))):
+        if not db._is_rule_memory(r):
+            continue
+        if r.get("scope") == "global" and r.get("user_id"):
+            owners.add(str(r["user_id"]))
+        elif r.get("project_id"):
+            pids.add(str(r["project_id"]))
+    rows = _paged(lambda off, lim: (
+        sb.table("projects").select("id, name, owner_id")
+          .order("id").range(off, off + lim - 1)))
+    keep = [r for r in rows if str(r.get("id")) in pids or str(r.get("owner_id") or "") in owners]
+    return sorted(keep, key=lambda r: (str(r.get("name") or ""), str(r.get("id"))))
+
+
+def versions_in_project(sb, project_id: str, version_ids: list[str]) -> dict[str, dict]:
+    """``version_id`` → ``{"title", "body"}``, **只认本项目的**(check_rules 用, 2026-10-20)。
+
+    归属走 ``items_for_versions`` 同一条路: ``items!inner → batches!inner`` 再 ``.eq`` 上 project_id, 别的项目的
+    version_id 根本查不出来, 不用在 Python 里再判一次。调用方先把不是 UUID 的挑掉(一个坏值会让 PG 拒掉整条 IN 查询)。"""
+    out: dict[str, dict] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        res = (sb.table("versions")
+                 .select("id, title, body, items!inner(id, batches!inner(project_id))")
+                 .in_("id", chunk)
+                 .eq("items.batches.project_id", project_id)
+                 .execute())
+        for v in (res.data or []):
+            if not (v.get("items") or {}).get("id"):
+                continue
+            out[str(v["id"])] = {"title": v.get("title") or "", "body": v.get("body") or ""}
+    return out
 
 
 def update_memory_fields(sb, memory_id: str, fields: dict) -> dict | None:

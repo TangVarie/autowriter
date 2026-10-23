@@ -31,6 +31,7 @@ import concurrent.futures as cf
 import contextlib
 import logging
 import random
+import re
 import threading
 import time
 import uuid
@@ -52,7 +53,7 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
-from . import delivery, rulecheck
+from . import delivery, rulecheck, rulecompile
 from . import fingerprint as fp
 from . import store, structure, tvlink, vocab
 
@@ -519,6 +520,10 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         tpl = None
     if tpl is not None:
         out["delivery_requirements"] = delivery.requirements(tpl)
+
+    # ── 规则编译(2026-10-20, D-121): 有没编的规则就在后台补编, 简报一秒都不等它(编一次最坏 6 分钟) ──────────
+    # 要不要编由后台线程自己查(按 (规则 id, sha) 比 rule_compiles), 这里不多查一次库; 冷却之内重复打开不起新线程。
+    _kick_rule_compile(client, project_id, reason="open_project")
     return out
 
 
@@ -2268,6 +2273,22 @@ RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代�
                                    "(rule)把 from_index 起的那几篇自己逐篇核一遍。")
 
 
+def _as_delivered(tpl: dict | None, drafts: list[dict]) -> tuple[list[dict], list[list[str]] | None]:
+    """查规则看的那几篇 → (稿子, 每篇交付出去的话题; 没有模板时是 None)。score_drafts 的 rule_checks 和
+    check_rules(_delivered_text: 代码查的、发给 Jev 的)都只从这里拿, 两边看见的标题、正文一字不差; 话题只在写手没传
+    ``tags`` 时一样(check_rules 读的版本行里没存写手传的 tags, 见 _delivered_text)。
+
+    有模板时每篇换成 ``delivery.delivered_draft`` 交付出去的那一份, 和 delivery.text 对得上: 模板管话题的, 正文摘掉末尾话题,
+    话题是它拼的那一行(写手的 + 模板的固定 / 条件话题 + 正文中间留下的 #话题); 不管话题的, ``tags`` 字段不算、只认正文里的
+    #话题; ``comments`` 是 null 的评论不算(codex review on aw#115)。没有模板原样, 话题由 rulecheck._parts 照 split_tags +
+    body_tags 拼。哪个 # 算话题(validator.topic_tag_matches)、哪几条评论算数(delivery.comment_list)也都只在 delivery /
+    validator 认一处, 这里不另写。"""
+    if tpl is None:
+        return list(drafts), None
+    views = [delivery.delivered_draft(tpl, d) for d in drafts]
+    return [view for view, _tags in views], [tags for _view, tags in views]
+
+
 def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
                               indices: list[int], out: dict, *, tactic: str = "") -> dict:
     """存完档之后的两样纯代码活(2026-10-20), 结果挂进 ``out``, 返回给 batch_metrics 的那一小块。**不抛**。
@@ -2309,12 +2330,9 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or "", tactic or ""))
             # 有交付模板时, 查的是交付出去的那一份, 免得和 delivery.text 对不上(delivery.delivered_draft): 模板管话题的, 话题含
             # 固定 / 条件话题、正文是摘掉末尾那行话题之后的; 不管话题的, tags 字段不算、只认正文里的 #话题; comments 是 null 的,
-            # 评论不算(codex review on aw#115: 拿原稿查的话, 不交付的话题 / 评论里的词照报违规, 必须带的话术也能靠它们混过去)
-            checked, final_tags = picked, None
-            if tpl is not None:
-                views = [delivery.delivered_draft(tpl, d) for d in picked]
-                checked = [view for view, _tags in views]
-                final_tags = [tags for _view, tags in views]
+            # 评论不算(codex review on aw#115: 拿原稿查的话, 不交付的话题 / 评论里的词照报违规, 必须带的话术也能靠它们混过去)。
+            # check_rules 也走 _as_delivered 这一处, 两边看见的是同一份标题、正文(话题见 _delivered_text)
+            checked, final_tags = _as_delivered(tpl, picked)
             # 模板要求每篇都带的部位(评论 min ≥ 1、要话题): 空着的话「必须带的话术」照没带报, 不能靠不交那一块混过去(codex review
             # on aw#115)。没模板、模板不要求的部位, 空着照旧不查(评论常常是后面另走评论那一步写的)
             expects = delivery.expected_parts(tpl) if tpl is not None else ()
@@ -2798,9 +2816,40 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # 存档之后的下一步写进返回值(D-120: 人审和导出两个工具已经撤了, 模型最容易犯的错变成"让用户导出 / 等用户
             # 说定稿")。只在真存进去了时说(codex review on #94, P2 同一个理由): written=0 时没有版本可说。
             if out.get("written"):
+                # check_rules(2026-10-20, D-121)是存档之后唯一还要调的一步: 按编译好的规则逐篇查, 只作建议。
+                # 只查新稿(2026-10-20 复审): 带 replaces_version_id 改过重存的, 协议 5a 和 check_rules 自己都说「改一轮就够,
+                # 不用再调」—— 这里再叫它调一次, 最新的那句话就成了「再查」, 多花一轮 Jev 的钱, 还会改 → 查 → 改地转下去。
+                replaced_new = {r["version_id"] for r in out["replaced"]}
+                out["check_rules_version_ids"] = [v for v in out["version_ids"] if v not in replaced_new]
+                # 底稿没建成的新稿(identity_warning)没有版本行, check_rules 查不了(独立复审 on aw E: 原来 version_ids 一空就说
+                # 「都是改过重存的」, 新稿一篇都没查、写手还被告知不用查)
+                unminted = len(to_mint) - len(minted_ok)
+                unminted_step = (f"另有 {unminted} 篇新稿底稿没建成(见 identity_warning), check_rules 查不了它们, "
+                                 "不能说这几篇守住了规则。" if unminted else "")
+                if not out["check_rules_version_ids"] and unminted:
+                    rules_step = unminted_step
+                elif not out["check_rules_version_ids"]:
+                    rules_step = ("这几篇都是改过重存的(带 replaces_version_id), 不用再调 check_rules。")
+                elif replaced_new:
+                    rules_step = ("然后调一次 check_rules, 只传 check_rules_version_ids(这批里的新稿)按项目规则逐篇查, "
+                                  "只作建议; 带 replaces_version_id 改过重存的那几篇不用再查。")
+                else:
+                    rules_step = ("然后调一次 check_rules(传 check_rules_version_ids, 就是这批的 version_ids)按项目规则"
+                                  "逐篇查, 只作建议。")
+                if out["check_rules_version_ids"] and unminted:
+                    rules_step += unminted_step                      # 建成了的照查, 没建成的那几篇说清没查
+                if out["check_rules_version_ids"] and (tactic or "").strip():
+                    # 方向闸同一个判据(项目名 + tactic): 不带的话 check_rules 只按项目名判, 简报挡掉的规则又查一遍
+                    rules_step += "调 check_rules 时 tactic 也照这次传给 score_drafts 的原样带上。"
+                if len(out["check_rules_version_ids"]) > CHECK_RULES_MAX_VERSIONS:
+                    # 一批不限篇数, check_rules 一次只查这么多(2026-10-20 第二轮复审: 原来超了整次报错, 写手照协议说没查成)
+                    rules_step += (f"这批新稿 {len(out['check_rules_version_ids'])} 篇, check_rules 一次查 "
+                                   f"{CHECK_RULES_MAX_VERSIONS} 篇: 照样整串传, 没查到的它放在返回的 remaining_version_ids "
+                                   "里, 照它的 next_step 接着调。")
                 out["next_step"] = ("这批已存档。把 judge.results 里每篇的 score 和 fixes 照实告诉用户(不拦交付)。"
+                                    + rules_step +
                                     "用户要改哪篇: 改完带 replaces_version_id 再调 score_drafts。定稿由用户自己贴进飞书, "
-                                    "发出去之后系统按内容自动对回来 —— 不用导出, 也不用再调别的工具。")
+                                    "发出去之后系统按内容自动对回来 —— 不用导出。")
             # ⚠️ 这里原来是 `return out`。改成落到 with 块外面去, 是为了让下面的入库判定
             #    【不在】项目写锁里、也【不在】这个 try 里(设计审查 2026-09-23 §5):
             #    · 在 try 里: 判定一抛, 下面的 except 会把已替换稿的旧指纹无条件放回 ——
@@ -3509,6 +3558,8 @@ MIGRATION_REVIEW_PROVENANCE = "012_review_via_agent_provenance.sql"
 MIGRATION_TV_EDITS = "013_tv_edits.sql"
 # 014 给 tv_edit_diffs 加 diff_rev(差异的口径版本, 话题标签不算正文之后旧行要重算)。
 MIGRATION_TV_EDIT_REV = "014_tv_edit_diff_rev.sql"
+# 015 建 rule_compiles(规则编译结果的缓存, D-121)。表探得到。
+MIGRATION_RULE_COMPILES = "015_rule_compiles.sql"
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -3863,6 +3914,15 @@ def migration_state(client) -> dict:
                             predicate=store.schema_object_missing)
     _add(MIGRATION_TV_EDIT_REV, "tv_edit_diffs 的 diff_rev 列", state, note,
          "改动差异写不进去、每周摘要读不出来(tv-sync 对照照写、退出码 1; open_project 不带摘要)")
+
+    # ── 015: 规则编译结果的缓存(D-121) ──
+    state, note = _probe_ok(lambda: client.table("rule_compiles").select("memory_id, sha, result").limit(1).execute(),
+                            predicate=store.schema_object_missing)
+    if state == "denied":
+        state, note = "missing", "表在, 但 service_role 缺权限 —— 重跑 015(它自己带 GRANT, 不是 007)。" + note
+    _add(MIGRATION_RULE_COMPILES, "表 rule_compiles", state, note,
+         "可降级: compile-rules 和后台补编读不了缓存就报 error、一条都不发(不花编译的钱); check_rules 读不到编译结果"
+         "就回 status=error、记日志(写手那边是这次规则没查成, 不是 500), 简报和存档不受影响")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -4546,6 +4606,8 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
             out["check_warning"] = (f"请求 check.kind={kind}, 但库里这条现在是 {stored_kind!r} —— "
                                     "以库里的为准, 请把这个差异告诉用户")
 
+    # 新记的(或改了原文 / 方向的)规则在后台编译(D-121), 不等冷却; 这个调用不等它。
+    _kick_rule_compile(client, project_id, reason="record_rule", bypass_cooldown=True)
     return out
 
 
@@ -4754,6 +4816,23 @@ def set_rule_state(client, memory_id: str, action: str, *,
                              f"收到 {direction!r}")
 
     saved = store.update_memory_fields(client, memory_id, fields)
+    if (saved
+            and (saved.get("status") or "").lower() == "confirmed"
+            and (action in ("promote", "unmute") or (action == "set_direction"
+                 and (saved.get("applicability") or "").strip() != (row.get("applicability") or "").strip()))):
+        compile_project = row.get("project_id")
+        if row.get("scope") == "global":
+            # 全局缓存跨项目共用; 选择 owner 自己已接 TV 的项目, 避免第一批先漏查。
+            compile_project = None
+            try:
+                for project in store.list_all_projects(client, owner_id=row["user_id"]):
+                    if any(m.get("tv_project_id") for m in store.tv_projects_of(client, project["id"])):
+                        compile_project = project["id"]
+                        break
+            except Exception:                      # 后台增强失败不能把已保存的修改报成失败
+                logger.warning("global 规则激活后查编译项目失败(memory=%s)", memory_id, exc_info=True)
+        if compile_project:
+            _kick_rule_compile(client, compile_project, reason="set_rule_state", bypass_cooldown=True)
     return {
         "memory_id": memory_id,
         "content": (row.get("content") or "")[:120],
@@ -4765,6 +4844,971 @@ def set_rule_state(client, memory_id: str, action: str, *,
             "applicability": (saved or {}).get("applicability") or "通用",
         },
     }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 规则编译 + 写后查规则(2026-10-20, D-121)
+# ══════════════════════════════════════════════════════════════════════
+#
+# 10-20 生产诊断: 规则全部写成文字塞进简报, 守不守全凭模型注意力。改成「写完再查」: 规则由 Jev 编译一次(POST
+# /compile_rules, 模型调用在 Jev 那边, 这里仍然零 LLM), 结果按 (规则 id, sha) 缓存进 rule_compiles(migrations/015);
+# 写手写完调 check_rules, 用缓存逐篇查, 只作建议: hard → 必须改, soft → 建议改, 不拦存档(owner 10-20 拍板, D-121)。
+# 简报不动 —— 软规则移出简报要等校准之后。哪些是纯函数见 deskcore/rulecompile.py。
+#
+# 编译最坏要 6 分钟(Jev README「规则编译」), 所以**写手的请求永远不等它**: open_project / record_rule / check_rules
+# 发现可能有没编的规则, 就在后台起一个线程去编(每个项目同时最多一个、有冷却), CLI 的 compile-rules 是运维入口。
+
+RULE_COMPILE_COOLDOWN_SEC = 300          # 同一个项目两次后台编译至少隔这么久(record_rule 不受它限: 刚记的规则要尽快编)
+RULE_COMPILE_HOLD_SEC = 3600             # 整批被挡下(出境口径 / 没接 tv-map / judge 不可用)之后, 后台这么久不再试
+RULE_COMPILE_TIMEOUT_HOLD_SEC = 1800     # 一批读超时之后, 后台这么久不再试(Jev 慢成这样多半还在编、还在计费, 见 compile_rules)
+RULE_COMPILE_RETRY_AFTER_SEC = 6 * 3600  # 同一条规则的同一个版本编失败之后, 后台这么久之内不再编(每编一次都花钱)
+# Jev 生成端的 HTTP 429 / 5xx(Jev 自己重试过一次还是这样, 回「生成端调用失败：GeneratorHTTPError: HTTP 529 …」): 上游没出
+# 输出、没计费, 多半是部署后一阵过载。原来和花了钱的失败一样扣 6 小时, 一次几秒的过载让整个池子半天没检查(独立复审 on aw E)。
+# 这种只扣这么久。504 / 524 是网关超时, 上游可能已经生成、计费了, 照旧 6 小时; 拒答、截断、输出不合格、读超时同样照旧。
+RULE_COMPILE_TRANSIENT_RETRY_SEC = 1800
+_FREE_GENERATOR_FAILURE = re.compile(r"生成端调用失败：GeneratorHTTPError: HTTP (?:429|5(?!04|24)\d\d)\b")
+RULE_COMPILE_MAX_ROUNDS = 3              # 后台线程一次最多连编几轮(编的时候又记了规则, 会再来一轮)
+# Jev 回了 200, 但 model 是 mock(JUDGE_MOCK=1 的测试 / 本地起的 Jev, 按关键词给假结果): 这批一条不存(2026-10-20 第三轮
+# 复审)。缓存键是 (规则 id, sha), 不带 model —— 存进去的话, 以后 JUDGE_URL 指回真的 Jev, 这些假题、假代码照样一直命中缓存,
+# 只有 --force 换得掉。Jev 自己的账本也拒 mock 的答案(write=true 在 mock 下 422), 这边对编译结果同一个口径。
+RULE_COMPILE_MOCK = "jev_mock"
+_RULE_COMPILE_HOLD_STATUSES = frozenset({
+    judge_client.JUDGE_POLICY_BLOCKED, judge_client.JUDGE_NOT_CONFIGURED,
+    judge_client.JUDGE_UNAVAILABLE, judge_client.JUDGE_BAD_REQUEST, RULE_COMPILE_MOCK,
+})
+# 遇到就不再发后面几批的: 整批被挡的那几种(后面一样会被挡) + 读超时(2026-10-20 复审: Jev 的 /compile_rules 没有整体
+# 截止, 调用方断开之后照样编完、照样计费; 读超时过了 Jev 最坏的 ~361 秒说明它慢下来了, 再发只是多付几批没人收的钱)
+_RULE_COMPILE_STOP_STATUSES = _RULE_COMPILE_HOLD_STATUSES | {judge_client.JUDGE_TIMEOUT}
+_RULE_COMPILE_LOCK = threading.Lock()
+# 整个进程同时只编一个项目: 部署后第一轮各项目的 open_project 会同时触发, 一起压到 Jev 上; 而且同一个 owner 的 global
+# 规则在他每个项目的池子里 —— 排着队编, 后一个项目读缓存时前一个已经存下了, **这个进程里**不会把同一条 global 规则编两遍。
+# ⚠️ 只管本进程: CLI 的 compile-rules 是另一个进程, 和服务进程的后台补编不共用这把锁(runbook §1.11: 上线补编时先关
+# RULE_COMPILE_AUTO)。CLI 的 --all 自己带 seen 去重(见 compile_rules)。
+# 线程在这里排队(后台, 没人等它), 不占写手的请求。
+_RULE_COMPILE_SLOTS = threading.BoundedSemaphore(1)
+_RULE_COMPILE_STATE: dict[str, dict] = {}                    # project_id → {running, again, last, hold_until, last_status, hold_status}
+_RULE_COMPILE_FAILED: dict[tuple[str, str], float] = {}      # (memory_id, sha) → 上次编失败的时刻(monotonic)
+# 进程级的「Jev 慢下来了」(2026-10-20 第二轮复审): 任何一次编译读超时, RULE_COMPILE_TIMEOUT_HOLD_SEC 之内后台不给**任何**项目
+# 发(record_rule 也不例外)。只记在超时的那个项目上的话, 排着队等槽位的别的项目一拿到槽位就发, 一个接一个读超时 —— 每一批都在
+# Jev 那边编完、计费, 结果没人收。Jev 慢不是哪个项目、哪条规则的事。
+_RULE_COMPILE_JEV: dict[str, float] = {"slow_until": 0.0}    # monotonic; 改它要握着 _RULE_COMPILE_LOCK
+# 发出去还没回来的那一批: project_id → {"rules", "since"(monotonic)}; 改它要握着 _RULE_COMPILE_LOCK。进程退出时拿它报哪几批
+# 被打断了(log_rule_compiles_cut_off; 2026-10-20 第三轮复审)
+_RULE_COMPILE_INFLIGHT: dict[str, dict] = {}
+RULE_COMPILE_JEV_SLOW = "jev_slow"                            # 停发期里 _kick_rule_compile 的返回 / 后台线程这一轮的结局
+_RULE_COMPILE_ERROR_MAX = 200
+
+
+def _jev_slow_now() -> bool:
+    """这会儿是不是还在「Jev 慢下来了」的停发期里。调用方不能握着 _RULE_COMPILE_LOCK(它不可重入)。"""
+    with _RULE_COMPILE_LOCK:
+        return time.monotonic() < _RULE_COMPILE_JEV["slow_until"]
+
+
+def _compile_error(text) -> str:
+    return mask_secrets(str(text or ""))[:_RULE_COMPILE_ERROR_MAX]
+
+
+def _mock_model(model) -> bool:
+    """/compile_rules 回包的 model 是不是 mock(见 RULE_COMPILE_MOCK)。"""
+    return isinstance(model, str) and model.strip().lower().startswith("mock")
+
+
+def log_rule_compiles_cut_off() -> list[str]:
+    """进程要退了(app 的 lifespan 收尾时调): 还有一批编译在路上的项目记 WARNING, 返回这些项目号。**不抛**。
+
+    后台补编是 daemon 线程, 进程一退(Railway 重新部署 —— 改一个变量就重新部署)就被杀在半路: Jev 那批照样编完、照样计费,
+    结果没存, 进程内的「编失败 6 小时不重编」也跟着清零, 新进程的 open_project / record_rule 会把同一批再发一遍(2026-10-20
+    第三轮复审: 原来一行日志都没有)。排着队还没发出去的只记 INFO —— 没花钱, 新进程会照常补编。"""
+    try:
+        now = time.monotonic()
+        with _RULE_COMPILE_LOCK:
+            inflight = {pid: dict(v) for pid, v in _RULE_COMPILE_INFLIGHT.items()}
+            queued = sorted(pid for pid, st in _RULE_COMPILE_STATE.items()
+                            if st.get("running") and pid not in inflight)
+        for pid, v in sorted(inflight.items()):
+            logger.warning("后台补编被进程退出打断(project=%s): 一批 %s 条已经发给 Jev %.0f 秒, Jev 那批照样计费, 结果没存; "
+                           "新进程里这个项目下一次 open_project / record_rule 会重编(再付一次)",
+                           pid, v.get("rules"), now - float(v.get("since") or now))
+        if queued:
+            logger.info("进程退出时还有 %d 个项目的后台补编在排队、没发(没花钱, 新进程会照常补编): %s",
+                        len(queued), ", ".join(queued))
+        return sorted(inflight)
+    except Exception:                                        # noqa: BLE001 — 退出路径上, 绝不冒泡
+        logger.warning("进程退出时没查成后台补编的状态", exc_info=True)
+        return []
+
+
+def _failed_at(error) -> float:
+    """记进 _RULE_COMPILE_FAILED 的时刻。Jev 生成端没计费的 429 / 5xx(见 _FREE_GENERATOR_FAILURE)往前记, 让它
+    RULE_COMPILE_TRANSIENT_RETRY_SEC 之后就过期; 别的照实记(6 小时)。读的地方(skip_recent_failures、_uncompiled_reason)
+    都按「现在 - 这个时刻 < RULE_COMPILE_RETRY_AFTER_SEC」算, 不用另改(独立复审 on aw E)。"""
+    now = time.monotonic()
+    if _FREE_GENERATOR_FAILURE.search(str(error or "")):
+        return now - (RULE_COMPILE_RETRY_AFTER_SEC - RULE_COMPILE_TRANSIENT_RETRY_SEC)
+    return now
+
+
+def compile_rules(client, project_id: str, *, user_id: str | None = None, force: bool = False,
+                  dry_run: bool = False, skip_recent_failures: bool = False,
+                  seen: set[tuple[str, str]] | None = None) -> dict:
+    """把这个项目规则池里还没编过的规则发给 Jev 编译, 结果写进 rule_compiles。**Jev 那边怎么失败都不抛**, 回一份报告。
+
+    池子和简报 / 代码查规则同一个: ``store.shared_memories``(confirmed、没静音、本项目 + owner 自己的 global), hard 和
+    soft 都编, 方向闸不在这里过(global 规则跨项目共用, 方向是查的时候按项目定的)。每条按 rulecompile.rule_sha 算 sha,
+    (规则 id, sha) 已经有一行的跳过(``force`` 时全部重编、覆盖)。超过 Jev 字段上限的不发, 记在 ``not_compilable``。
+
+    ``user_id`` 给了就过归属闸(同其它入口); 不给是运维 / 后台路径(CLI compile-rules、open_project 和 record_rule 过了闸
+    之后起的后台线程), 按项目 owner 取池子。``skip_recent_failures``: 后台用, 近 6 小时编失败过的同一版本这次不编(Jev 生成端
+    没计费的 429 / 5xx 只 30 分钟, 见 _failed_at)。
+    ``dry_run``: 只数要编几条, 不发; 没配 JUDGE_* / 没接 tv-map 的照样报出来(和真编同一个结局, 2026-10-20 复审)。
+    ``seen``(CLI ``--all`` 用, 2026-10-20 复审): 这次运行里已经编进库(dry-run 时: 已经数过)的 (规则 id, sha), 在里面的
+    当缓存命中, ``force`` 也不重发 —— owner 的 global 规则在他每个项目的池子里, 不带它 ``--all --force`` 会按项目数重编、
+    重付钱, ``--all --dry-run`` 也会按项目数重复计数。这次写进库的 / dry-run 数到的会加进去; 读超时的那一批也加(Jev 多半
+    还在编、照样计费, 同一次运行里不再发)。
+
+    报告 ``status``: up_to_date(没有要编的)/ dry_run / ok / partial(一部分没编出来)/ error(一条都没写进去)/
+    not_configured / policy_blocked / timeout / unavailable / jev_failed / bad_request(judge_client 的结局, 整批没成)/
+    jev_mock(Jev 回的 model 是 mock: 假结果, 一条不存, 不按规则记失败, 见 RULE_COMPILE_MOCK)。连接超时(请求没发出去)是
+    unavailable, 不是 timeout: 没花钱, 不停整个进程的后台补编(judge_client.compile_rules)。
+    被挡下或读超时之后后面几批不发(``not_sent`` 条, ``stopped_by`` 是哪个结局)。读超时还会让本进程的后台补编对所有项目
+    停 RULE_COMPILE_TIMEOUT_HOLD_SEC(``_RULE_COMPILE_JEV``); 本函数自己不看这个停发期 —— 运维的 CLI 要能在 Jev 恢复之后直接重跑。
+    """
+    t0 = time.monotonic()
+    out: dict = {"project_id": project_id, "status": None, "pool": 0, "cached": 0, "to_compile": 0, "compiled": 0,
+                 "verdicts": {}, "errors": [], "not_compilable": [], "batches": 0, "calls": 0, "elapsed_ms": 0}
+
+    def _done(status: str, detail: str | None = None) -> dict:
+        out["status"] = status
+        if detail:
+            out["detail"] = _compile_error(detail)
+        out["elapsed_ms"] = _ms_since(t0)
+        return out
+
+    if user_id:
+        project = assert_project_access(client, project_id, user_id=user_id)
+    else:
+        project = store.project_row(client, project_id)
+        if project is None:
+            raise ProjectNotFound(f"project not found: {project_id}")
+    out["project_name"] = project.get("name") or ""
+    owner = str(project.get("owner_id") or "") or None
+    try:
+        hard, soft = store.shared_memories(client, project_id, owner, vectors=False)
+    except Exception as exc:                                 # noqa: BLE001 — 报告里说清, 不抛
+        logger.exception("compile_rules: 读规则池失败(project=%s)", project_id)
+        return _done("error", f"读规则池失败: {type(exc).__name__}: {exc}")
+    items: dict[str, tuple[dict, str]] = {}
+    for r in hard + soft:
+        item, sha = rulecompile.compile_input(r)
+        if item is None:
+            out["not_compilable"].append({"memory_id": r.get("id"), "reason": sha})
+        else:
+            items.setdefault(item["id"], (item, sha))
+    out["pool"] = len(hard) + len(soft)
+    try:
+        cached = store.rule_compiles_for(client, list(items))
+    except Exception as exc:                                 # noqa: BLE001
+        logger.exception("compile_rules: 读 rule_compiles 失败(project=%s)", project_id)
+        return _done("error", f"读 rule_compiles 失败(migrations/015 跑了吗?): {type(exc).__name__}: {exc}")
+    todo = [(it, sha) for mid, (it, sha) in items.items() if force or (mid, sha) not in cached]
+    if seen:
+        same_run = sum(1 for it, sha in todo if (it["id"], sha) in seen)
+        if same_run:
+            out["same_run"] = same_run                       # 这次运行里别的项目已经编过(owner 的 global 规则)
+            todo = [(it, sha) for it, sha in todo if (it["id"], sha) not in seen]
+    out["cached"] = len(items) - len(todo)
+    if skip_recent_failures and not force:
+        now = time.monotonic()
+        with _RULE_COMPILE_LOCK:
+            fresh = {k for k, t in _RULE_COMPILE_FAILED.items() if now - t < RULE_COMPILE_RETRY_AFTER_SEC}
+        held = [(it, sha) for it, sha in todo if (it["id"], sha) in fresh]
+        if held:
+            out["held_after_failure"] = len(held)
+            todo = [(it, sha) for it, sha in todo if (it["id"], sha) not in fresh]
+    out["to_compile"] = len(todo)
+    if not todo:
+        return _done("up_to_date")
+    if not judge_client.configured():
+        return _done(judge_client.JUDGE_NOT_CONFIGURED, "JUDGE_URL / JUDGE_API_KEY 未配置, 规则编不了")
+    ctx = _judge_project_context(client, project_id)
+    if ctx["project"] is None:
+        # 同存档判定的数据出境口径(docs/00 #7): 认不出 TV 项目号就不发规则原文
+        return _done(ctx["status"], ctx["detail"])
+    out["tv_project"], out["category"] = ctx["project"], ctx["category"]
+    if dry_run:
+        # 放在上面两道之后: dry-run 是真编之前看数的那一步, 真编会被挡的项目在这里就要报出来(2026-10-20 复审)
+        if seen is not None:
+            seen.update((it["id"], sha) for it, sha in todo)
+        return _done("dry_run")
+
+    def _failed(mid: str, sha: str, error: str) -> None:
+        out["errors"].append({"memory_id": mid, "error": _compile_error(error)})
+        with _RULE_COMPILE_LOCK:
+            _RULE_COMPILE_FAILED[(mid, sha)] = _failed_at(error)
+
+    batch_status = None
+    size = max(1, int(config.RULE_COMPILE_BATCH))
+    for i in range(0, len(todo), size):
+        part = todo[i:i + size]
+        payload: dict = {"project": ctx["project"], "rules": [it for it, _ in part]}
+        if ctx["category"]:
+            payload["category"] = ctx["category"]
+        # 发之前记一行: 进程在这一批回来之前退出(重新部署)的话, 日志里看得出丢了哪一批(Jev 那边照样编完、计费)
+        logger.info("compile_rules: 发一批 %d 条去 Jev 编译(project=%s, 第 %d 批, 共 %d 条要编)",
+                    len(part), project_id, out["batches"] + 1, len(todo))
+        with _RULE_COMPILE_LOCK:
+            _RULE_COMPILE_INFLIGHT[str(project_id)] = {"rules": len(part), "since": time.monotonic()}
+        try:
+            res = judge_client.compile_rules(payload)
+        finally:
+            with _RULE_COMPILE_LOCK:
+                _RULE_COMPILE_INFLIGHT.pop(str(project_id), None)
+        out["batches"] += 1
+        if res["judge_status"] == judge_client.JUDGE_OK and _mock_model(res["response"].get("model")):
+            res = {"judge_status": RULE_COMPILE_MOCK,
+                   "detail": f"Jev 回的 model 是 {res['response'].get('model')}(JUDGE_MOCK 的假结果), 一条不存; "
+                             "JUDGE_URL 指的多半是测试 / 本地的 Jev"}
+        if res["judge_status"] != judge_client.JUDGE_OK:
+            batch_status = res["judge_status"]
+            out.setdefault("batch_errors", []).append(
+                {"status": batch_status, "rules": len(part), "detail": _compile_error(res.get("detail"))})
+            if batch_status not in _RULE_COMPILE_HOLD_STATUSES:
+                # 只有超时 / Jev 失败 / 出错这几种可能是规则本身的事, 才按规则记失败。整批被挡(出境口径 / 没接 tv-map /
+                # judge 不可用 / 请求形状)是项目的事, 后台的项目级 hold 已经管了; 按规则记的话, owner 的 global 规则在
+                # 别的项目(比如他不是处方药的项目)里也会被扣 6 小时不编(2026-10-20 复审)。502 是 Jev 生成端过载(没计费)的
+                # 只扣 RULE_COMPILE_TRANSIENT_RETRY_SEC(见 _failed_at; 独立复审 on aw E)
+                now = _failed_at(res.get("detail"))
+                with _RULE_COMPILE_LOCK:
+                    for it, sha in part:
+                        _RULE_COMPILE_FAILED[(it["id"], sha)] = now
+            if batch_status in _RULE_COMPILE_STOP_STATUSES:
+                out["not_sent"] = len(todo) - i - len(part)     # 后面几批一样会被挡 / 一样慢, 不发
+                out["stopped_by"] = batch_status
+                if batch_status == judge_client.JUDGE_TIMEOUT:
+                    logger.warning("compile_rules: 一批 %d 条读超时(project=%s), 后面 %d 条不发; 超时的那批 Jev 多半"
+                                   "还在编、照样计费, 结果没人收。Jev 恢复之后再跑一次 compile-rules",
+                                   len(part), project_id, out["not_sent"])
+                    # 整个进程的后台补编一起停(见 _RULE_COMPILE_JEV); 同一次运行(CLI --all 的 seen)里这一批不再发
+                    with _RULE_COMPILE_LOCK:
+                        _RULE_COMPILE_JEV["slow_until"] = max(_RULE_COMPILE_JEV["slow_until"],
+                                                              time.monotonic() + RULE_COMPILE_TIMEOUT_HOLD_SEC)
+                    if seen is not None:
+                        seen.update((it["id"], sha) for it, sha in part)
+                break
+            continue
+        resp = res["response"]
+        model = resp.get("model") if isinstance(resp.get("model"), str) else None
+        if isinstance(resp.get("calls"), int):
+            out["calls"] += resp["calls"]
+        expected = {it["id"]: sha for it, sha in part}
+        got: set[str] = set()
+        rows = []
+        for r in resp["rules"]:
+            mid = r.get("id")
+            if mid not in expected or mid in got:
+                continue
+            got.add(mid)
+            if r.get("sha") != expected[mid]:
+                # 两边算法漂了: 存下去也永远按这边的 sha 命中不了, 每次都会重编 —— 不存, 报出来
+                _failed(mid, expected[mid], f"Jev 回的 sha {r.get('sha')} 和这边算的 {expected[mid]} 对不上")
+                continue
+            if not rulecompile.usable(r):
+                _failed(mid, expected[mid], r.get("error") or "没编出结果")
+                continue
+            rows.append({"memory_id": mid, "sha": expected[mid], "result": r, "model": model,
+                         "compiled_at": store.iso_now()})
+        for mid in expected.keys() - got:
+            _failed(mid, expected[mid], "Jev 的回包里没有这条")
+        try:
+            try:
+                store.rule_compiles_upsert(client, rows)
+            except Exception as exc:                         # noqa: BLE001
+                # 一批最多 60 行是一条 INSERT … ON CONFLICT: 编的那几分钟里有一条规则被删了(AW 页上硬删), 外键让整条
+                # 语句失败, 另外几十条已经付过钱的结果一起丢、下次还要再付一遍。先看哪几条还在, 只写还在的(2026-10-20 复审)
+                alive = store.existing_memory_ids(client, [r["memory_id"] for r in rows])
+                gone = [r for r in rows if r["memory_id"] not in alive]
+                if not gone:
+                    raise
+                logger.warning("compile_rules: %d 条规则在编译期间被删, 其余 %d 条照存(project=%s): %s",
+                               len(gone), len(rows) - len(gone), project_id, exc)
+                for r in gone:                               # 规则没了, 不记 _RULE_COMPILE_FAILED
+                    out["errors"].append({"memory_id": r["memory_id"], "error": "规则编译期间被删, 结果没存"})
+                rows = [r for r in rows if r["memory_id"] in alive]
+                store.rule_compiles_upsert(client, rows)
+        except Exception as exc:                             # noqa: BLE001 — 写不进去就停: 再编下一批也是白花钱
+            logger.exception("compile_rules: 写 rule_compiles 失败(project=%s)", project_id)
+            out["write_error"] = _compile_error(f"{type(exc).__name__}: {exc}")
+            now = time.monotonic()
+            with _RULE_COMPILE_LOCK:                         # 后台路径不要马上又付一遍钱去编这几条
+                for r in rows:
+                    _RULE_COMPILE_FAILED[(r["memory_id"], r["sha"])] = now
+            break
+        out["compiled"] += len(rows)
+        for r in rows:
+            out["verdicts"][r["result"]["verdict"]] = out["verdicts"].get(r["result"]["verdict"], 0) + 1
+        if seen is not None:
+            seen.update((r["memory_id"], r["sha"]) for r in rows)
+    if out.get("write_error"):
+        return _done("error", "编出来了但写不进 rule_compiles(migrations/015 跑了吗?): " + out["write_error"])
+    if out["compiled"] == 0 and batch_status:
+        return _done(batch_status, out["batch_errors"][-1]["detail"])
+    if out["errors"] or out.get("batch_errors"):
+        return _done("partial" if out["compiled"] else "error")
+    return _done("ok")
+
+
+def _kick_rule_compile(client, project_id: str, *, reason: str, bypass_cooldown: bool = False) -> str:
+    """有没编的规则就在后台补编, **调用方不等**。返回这次做了什么(给日志、测试和 check_rules 的措辞看): started /
+    queued / running / cooldown / held / jev_slow / off / error。绝不抛 —— 它挂在 open_project / record_rule / check_rules
+    的尾巴上, 是增强项。
+
+    每个项目同时最多一个线程(进程内锁); 线程跑完之后 RULE_COMPILE_COOLDOWN_SEC 之内再触发不起新线程, 免得每次
+    open_project 都去查一遍。``bypass_cooldown``(record_rule 用): 刚记下的规则要尽快编, 不等冷却; 正在编的话让那个线程
+    跑完再来一轮(它读池子的时候这条规则可能还没写进去)。不管从哪儿触发, 编的都是整个池子里还没编的, 已经编过的不花钱。
+    本进程里任何一次编译读超时之后的停发期里(``_RULE_COMPILE_JEV``)一律不起, 回 jev_slow —— ``bypass_cooldown`` 也一样。
+    """
+    try:
+        if not (config.RULE_COMPILE_AUTO and judge_client.configured()):
+            return "off"
+        pid = str(project_id)
+        now = time.monotonic()
+        with _RULE_COMPILE_LOCK:
+            if now < _RULE_COMPILE_JEV["slow_until"]:
+                return RULE_COMPILE_JEV_SLOW
+            st = _RULE_COMPILE_STATE.setdefault(pid, {"running": False, "again": False, "last": None,
+                                                     "hold_until": 0.0, "last_status": None})
+            if st["running"]:
+                if bypass_cooldown:
+                    st["again"] = True
+                    return "queued"
+                return "running"
+            if not bypass_cooldown:
+                if now < st["hold_until"]:
+                    return "held"
+                if st["last"] is not None and now - st["last"] < RULE_COMPILE_COOLDOWN_SEC:
+                    return "cooldown"
+            st.update(running=True, again=False, last=now)
+        try:
+            threading.Thread(target=_rule_compile_worker, args=(client, pid, reason),
+                             name=f"rule-compile-{pid[:8]}", daemon=True).start()
+        except Exception:
+            with _RULE_COMPILE_LOCK:
+                st["running"] = False
+            raise
+        return "started"
+    except Exception:                                        # noqa: BLE001 — 增强项, 绝不冒泡
+        logger.warning("后台补编没起来(project=%s, reason=%s)", project_id, reason, exc_info=True)
+        return "error"
+
+
+def _rule_compile_worker(client, project_id: str, reason: str) -> None:
+    """后台线程本体: 编到没有新触发为止(最多 RULE_COMPILE_MAX_ROUNDS 轮), 每轮先排 _RULE_COMPILE_SLOTS 的队。任何异常只记日志。
+
+    整批被挡下(或停在某种 hold 结局上)停 RULE_COMPILE_HOLD_SEC, 读超时停 RULE_COMPILE_TIMEOUT_HOLD_SEC; 这一轮的结局记进
+    ``last_status``, check_rules 拿它说清「为什么还没有编译结果」。拿到槽位之后先看进程级的停发期(``_RULE_COMPILE_JEV``):
+    排在前面的项目刚读超时的话这一轮不发, 记 jev_slow(2026-10-20 第二轮复审: 原来 hold 只记在超时的那个项目上, 排着队的
+    项目拿到槽位就发, 一个接一个读超时)。"""
+    rounds = 0
+    try:
+        while True:
+            rounds += 1
+            hold = 0.0
+            status = None
+            try:
+                with _RULE_COMPILE_SLOTS:
+                    rep = None if _jev_slow_now() else compile_rules(client, project_id, skip_recent_failures=True)
+                if rep is None:
+                    status = RULE_COMPILE_JEV_SLOW
+                    logger.info("rule compile (project=%s, reason=%s, round=%d): 本进程刚有一批编译读超时, 停发期内"
+                                "这一轮不发", project_id, reason, rounds)
+                else:
+                    status = rep.get("status")
+                    stop = rep.get("stopped_by")
+                    if status in _RULE_COMPILE_HOLD_STATUSES or stop in _RULE_COMPILE_HOLD_STATUSES:
+                        hold = RULE_COMPILE_HOLD_SEC
+                        status = status if status in _RULE_COMPILE_HOLD_STATUSES else stop
+                    elif judge_client.JUDGE_TIMEOUT in (status, stop):
+                        hold = RULE_COMPILE_TIMEOUT_HOLD_SEC
+                        status = judge_client.JUDGE_TIMEOUT
+                    logger.info("rule compile (project=%s, reason=%s, round=%d): status=%s pool=%s cached=%s "
+                                "compiled=%s errors=%s elapsed_ms=%s", project_id, reason, rounds, rep.get("status"),
+                                rep.get("pool"), rep.get("cached"), rep.get("compiled"), len(rep.get("errors") or []),
+                                rep.get("elapsed_ms"))
+            except Exception:                                # noqa: BLE001
+                status = "error"
+                logger.exception("后台补编失败(project=%s, reason=%s)", project_id, reason)
+            with _RULE_COMPILE_LOCK:
+                st = _RULE_COMPILE_STATE.setdefault(project_id, {"running": True, "again": False, "last": None,
+                                                                 "hold_until": 0.0, "last_status": None})
+                st["last_status"] = status
+                if hold:
+                    st["hold_until"] = time.monotonic() + hold
+                    st["hold_status"] = status
+                elif status in ("ok", "partial"):
+                    # 这一轮真编成了(record_rule 不等 hold): Jev 好了, 项目的 hold 清掉(独立复审 on aw E: 原来只在 hold 时设、
+                    # 从不清, Jev 恢复后改过的规则照样被扣到 hold 到期, check_rules 还说「上次整批没编成(ok)」)。
+                    # up_to_date / error 不算: 没发、或者是库的事, 说明不了被挡的那件事好了
+                    st["hold_until"] = 0.0
+                if st["again"] and rounds < RULE_COMPILE_MAX_ROUNDS and status != RULE_COMPILE_JEV_SLOW:
+                    st["again"] = False
+                    continue
+                st.update(running=False, again=False, last=time.monotonic())
+                return
+    finally:
+        with _RULE_COMPILE_LOCK:
+            st = _RULE_COMPILE_STATE.get(project_id)
+            if st is not None and st.get("running"):
+                st.update(running=False, last=time.monotonic())
+
+
+CHECK_RULES_MAX_VERSIONS = 20
+CHECK_RULES_WORKERS = 4
+# 每篇列几条: 必须改全列, 建议改补到一共这么多条为止, 其余报条数(返回值太长会把协议挤出注意力)。必须改不截, 同
+# rulecheck.top_hits(codex review on aw#115): 截掉的只剩个数, 写手不知道是哪条, 会当没问题交出去
+CHECK_RULES_MAX_LISTED = 12
+CHECK_RULES_MAX_UNSURE = 5
+_CHECK_RULES_TITLE_CHARS = 40
+_CHECK_RULES_UNCOVERED_CHARS = 80
+CHECK_RULES_NOTE = ("规则检查只是建议, 不拦交付, 存档已经成功了。必须改 = 硬约束没守住(照着改, 改完用 score_drafts 带 "
+                    "replaces_version_id 再存一次); 建议改 = 软规则, 告诉用户, 改不改由用户定; 拿不准 = Jev 判不准, 提一句"
+                    "就行, 不用改。judge_status 不是 ok 的那几篇是没判完, 不能说它们守住了规则; judge_status 是 ok 的篇里, "
+                    "counts.unjudged 数到的那几道规则题也没判出来, 同样不能说守住了。")
+
+
+# 规则编译结果读不出来(多半是 migrations/015 没跑)时的 next_step。不拦交付、不让重试: 同一个库再调一次还是读不出来
+CHECK_RULES_UNREADABLE_STEP = ("这次规则没查成(服务端读不出规则的编译结果, 要运维看一下服务日志), 不能说规则守住了; "
+                               "存档已经成功, 交付照常, 不用重试。")
+
+
+class RuleCheckInputError(ValueError):
+    """check_rules 的参数不对(不是列表 / 空的 / 有空值)。工具层映成 400。"""
+
+
+def _check_rules_ids(version_ids) -> tuple[list[str], list[str]]:
+    """(这次查的, 留到下一次的)。去重之后前 CHECK_RULES_MAX_VERSIONS 个这次查, 其余原样还回去(``remaining_version_ids``)。
+
+    2026-10-20 第二轮复审: 原来超过上限直接报错。score_drafts 一批不限篇数(22 篇的批次出现过), 协议 5a 让写手把
+    check_rules_version_ids 原样传、报错就说「这次规则没查成」—— 超过 20 篇的批次整批都没查。上限还在(一次的篇数都挤在
+    同一个 JUDGE_DRAFT_TOOL_TIMEOUT_SEC 的截止里), 只是不再拒, 改成分次。"""
+    if not isinstance(version_ids, list) or not version_ids:
+        raise RuleCheckInputError("version_ids 要是非空列表: score_drafts 返回的 check_rules_version_ids 原样传")
+    if any(not isinstance(v, str) or not v.strip() for v in version_ids):
+        raise RuleCheckInputError("version_ids 里每一项都要是非空字符串")
+    ids = list(dict.fromkeys(v.strip() for v in version_ids))
+    return ids[:CHECK_RULES_MAX_VERSIONS], ids[CHECK_RULES_MAX_VERSIONS:]
+
+
+def _check_rules_remaining_step(rest: list[str]) -> str:
+    return (f" 还有 {len(rest)} 篇这次没查(一次最多查 {CHECK_RULES_MAX_VERSIONS} 篇): 接着再调一次 check_rules, version_ids "
+            "传这次返回的 remaining_version_ids(tactic 照这次带), 几次的结果合起来告诉用户。")
+
+
+_KICK_COMPILING = frozenset({"started", "queued", "running"})
+
+
+def _ledger_write_failed(resp: dict) -> bool:
+    """check_rules 发的是 write=true: 回包的 ``written`` 不是整数、或者带着 ``write_error``, 就是答案没(全)落进 TV 账本
+    (Jev ``_write_or_report``: 账本写失败照样回 200, 判出来的答案照样给)。写手这边的结论不受影响, 少的是以后拿来校准
+    的那几行 —— 原来一个字都不看, 影子期要攒的数据次次丢了也没人知道(2026-10-20 第三轮复审)。"""
+    written = resp.get("written")
+    return bool(resp.get("write_error")) or not isinstance(written, int) or isinstance(written, bool)
+
+
+def _uncompiled_reason(client, project_id: str, missing: list[tuple[str, str]], kick: str) -> tuple[str, str, int]:
+    """没有编译结果的那几条规则, 为什么没有: (原因码, 给写手的一句, 其中上次编失败的条数)。
+
+    10-20 复审: 原来一律说「还在后台编译」, 可没接 tv-map / 没配 Jev / 后台补编关着 / 一编就失败的规则**永远**编不出来,
+    写手每批都照着说一遍「在编」。所以先认得出来的说清楚, 只有真的起了线程 / 正在编的才说「后台在编」。
+    tv-map 多查一次库(只在有没编的规则时), 不靠后台线程的上一轮结局: 部署后第一次调就要说对。"""
+    now = time.monotonic()
+    with _RULE_COMPILE_LOCK:
+        failed = sum(1 for k in missing
+                     if k in _RULE_COMPILE_FAILED and now - _RULE_COMPILE_FAILED[k] < RULE_COMPILE_RETRY_AFTER_SEC)
+        st = _RULE_COMPILE_STATE.get(str(project_id)) or {}
+        # held 时说的是**起 hold 的那一轮**的结局: 之后又有一轮(record_rule 不等 hold)把 last_status 盖成别的, 照它说就成了
+        # 「上次整批没编成(ok)」(独立复审 on aw E)
+        last = (st.get("hold_status") or st.get("last_status")) if kick == "held" else st.get("last_status")
+        slow = now < _RULE_COMPILE_JEV["slow_until"]
+    if not judge_client.configured():
+        return "judge_not_configured", "Jev 没配置, 规则编不了, 要运维配 JUDGE_URL / JUDGE_API_KEY", failed
+    try:
+        mapped = any(m.get("tv_project_id") for m in store.tv_projects_of(client, project_id))
+    except Exception:                                        # noqa: BLE001 — 查不了就不下这个结论
+        logger.warning("check_rules: 查 tv_project_map 失败(project=%s)", project_id, exc_info=True)
+        mapped = True
+    if not mapped:
+        return "no_tv_map", "这个项目没接 tv-map, 规则编不了, 要运维 tv-map add", failed
+    if kick == "off":
+        return "auto_off", "后台补编关着, 要运维跑 compile-rules", failed
+    if kick == "held" and last == judge_client.JUDGE_POLICY_BLOCKED:
+        return "policy_blocked", "规则发去编译时被出境口径挡下, 编不了", failed
+    if kick == "held" and last == RULE_COMPILE_MOCK:
+        return RULE_COMPILE_MOCK, "规则编译接到的是测试用的 Jev(回的是假结果, 没存), 要运维查 JUDGE_URL", failed
+    # 本进程里任何一个项目的编译读超时之后, 停发期内哪个项目都不发(_RULE_COMPILE_JEV), 不只是超时的那个
+    if kick == RULE_COMPILE_JEV_SLOW or slow or (kick == "held" and last == judge_client.JUDGE_TIMEOUT):
+        return RULE_COMPILE_JEV_SLOW, "最近一次编译 Jev 超时, 过一阵后台再试", failed
+    if kick == "held":
+        return "held", f"上次整批没编成({last or '原因见服务日志'}), 过一阵后台再试", failed
+    if missing and failed == len(missing):
+        return "compile_failed", "上次编失败了, 稍后后台自动重试", failed
+    tail = f"; 其中 {failed} 条上次编失败了, 稍后自动重试" if failed else ""
+    if kick in _KICK_COMPILING:
+        return "compiling", "后台在编" + tail, failed
+    return "pending", "稍后后台会再编" + tail, failed
+
+
+def _never_checked_tip(not_compilable: int, code_refused: int) -> str:
+    """编不了(原文超过 Jev 的字段上限之类, 永远不发)/ 编出来的代码检查不安全或形状不对(永远不跑)的规则: 一句话。"""
+    n = not_compilable + code_refused
+    if not n:
+        return ""
+    why = "; ".join(([f"{not_compilable} 条编不了: 原文超过 Jev 的上限之类"] if not_compilable else [])
+                    + ([f"{code_refused} 条编出来的检查不安全或形状不对, 没跑"] if code_refused else []))
+    return f"有 {n} 条规则这次查不了({why}), 不能说它们守住了。"
+
+
+def _withdrawn_tip(n: int) -> str:
+    """写手撤掉了代码检查、Jev 又只编成了代码检查(没有规则题)的规则: 这次什么都没查它(独立复审 on aw E)。"""
+    return f"有 {n} 条规则撤掉了代码检查, Jev 又只编成了代码检查(没有规则题), 这次没查, 不能说它们守住了。"
+
+
+def _questions_unchecked_tip(n: int) -> str:
+    return (f"有 {n} 条规则的缓存题目形状不对或题号重复, 部分题目没查(见 rules.questions_unchecked_rules), "
+            "不能说整条规则守住了; 要运维修复编译结果。")
+
+
+def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str = "",
+                           code_unavailable: int = 0, not_compilable: int = 0, code_refused: int = 0,
+                           partial: int = 0, code_withdrawn: int = 0, questions_unchecked: int = 0) -> str:
+    tips = []
+    if summary.get("must_fix"):
+        tips.append("「必须改」的照 what / evidence 改完, 那几篇用 score_drafts 带 replaces_version_id 再存一次(会重新打分), "
+                    "改一轮就够, 不用再调 check_rules。")
+    if summary.get("suggest"):
+        tips.append("「建议改」的告诉用户, 改不改由用户定。")
+    if summary.get("unsure"):
+        tips.append("「拿不准」的提一句就行, 不用改。")
+    if summary.get("more"):
+        # 每篇只列一部分(必须改全列, 建议改补到 12 条, 拿不准最多 5 条), 原来截掉的只剩每篇的 more, next_step 一字不提,
+        # 写手照列出来的说完就算了(同 score_drafts 的 RULE_CHECKS_MORE_NEXT_STEP; 独立复审 on aw E)
+        tips.append(f"还有 {summary['more']} 条建议改 / 拿不准没列出来(必须改的全列了; 每篇没列的条数在 more 里): "
+                    "如实告诉用户还有这么多条没列。")
+    if summary.get("not_finished"):
+        tips.append(f"有 {summary['not_finished']} 篇的规则题这次没判完, 不能说它们守住了规则; 不用重试。")
+    if summary.get("empty_body"):
+        # 空正文那篇不发 Jev, 标题上的题、「正文要带…」的题都没判: 不算没判完, 但也不能算守住了(独立复审 on aw E)
+        tips.append(f"有 {summary['empty_body']} 篇正文是空的, 规则题没判, 不能说它们守住了规则。")
+    if summary.get("unjudged"):
+        tips.append(f"另有 {summary['unjudged']} 道规则题这次没判出来(Jev 回包缺题或判不了), 那几条不能说守住了; 不用重试。")
+    if uncompiled:
+        tips.append(f"还有 {uncompiled} 条规则还没有编译结果({uncompiled_why}), 这次没查; 不用等, 下一批再说。")
+    if code_unavailable:
+        tips.append(f"有 {code_unavailable} 条规则要看话题 / 评论, 这两样不随稿子存, check_rules 查不了, 不能说它们守住了。")
+    if not_compilable or code_refused:
+        tips.append(_never_checked_tip(not_compilable, code_refused))
+    if partial:
+        tips.append(f"有 {partial} 条规则只查了一部分(Jev 编译时没全装进去, 或者有一部分要看话题 / 评论; 没查的那部分写在 "
+                    "rules.partial_rules 的 uncovered 里), 不能说它们整条守住了。")
+    if code_withdrawn:
+        tips.append(_withdrawn_tip(code_withdrawn))
+    if questions_unchecked:
+        tips.append(_questions_unchecked_tip(questions_unchecked))
+    if summary.get("code_unchecked"):
+        # 「同一篇里已经列在 violations 的照改」: 正则先在标题上命中、再在正文上超时时, 同一条同一篇既是「必须改」又在
+        # code_unchecked 里, 只说「不是违规」写手会当成连那条命中一起撤了(同 score_drafts 的 rule_checks_unchecked; 独立复审 on aw E)
+        tips.append(f"有 {summary['code_unchecked']} 处(篇 × 条)代码检查这次没查完(正则没在时限内跑完, 或者限时的引擎跑不了它; "
+                    "见每篇的 code_unchecked): 没查完的那部分不是违规, 也不能说那几条守住了; 同一篇里已经列在 violations 的照改; "
+                    "severity 是 hard 的照规则原文(rule)自己核; 不用重试。")
+    if not tips:
+        # 只有上面每一项都是 0 才说这句(2026-10-20 复审: 没判出来的题、没编的规则、查不了的话题规则都不算守住;
+        # 第二轮: 编不了的、编出来的检查不安全没跑的也不算; 第三轮: 只查了一部分的(coverage=partial)也不算;
+        # 独立复审 on aw E: 撤掉代码检查又没有题的、空正文没判题的、where 里话题 / 评论那半没查的也不算)
+        tips.append("这次查的规则都守住了。")
+    return " ".join(tips) + " 都只是建议, 不拦交付。"
+
+
+def _delivered_text(template: dict | None, version: dict) -> dict:
+    """库里的一版 → ``{"title", "body", "tags"}``。``title`` / ``body`` 是 delivery.assemble 拼进 delivery.text 的那一份
+    (表格的单元格转义除外), 一字不差; ``tags`` **只是下限**, 见下。
+
+    版本行存的是写手传的原稿(带着末尾那行 #话题 的也原样存)。标题正文先照 assemble 去首尾空白、换行统一成 \\n, 再过
+    ``_as_delivered``(score_drafts 的 rule_checks 同一处): 模板管话题时正文摘掉末尾话题(``delivery.delivered_post``);
+    拿原稿去判, 只在话题行里的词会被判成「正文里有」, 必须带的话术也能靠被摘走的那行混过去。
+    没有模板时正文就是原稿, ``tags`` 是 None(rulecheck._parts 照正文里的 #话题 拼, 同 score_drafts); 模板不管话题时正文也是
+    原稿, ``tags`` 是正文里的 #话题(delivery.delivered_draft)。
+    ``tags``(模板管话题时)是拿版本行能拼出来的那一行: 末尾被摘走的话题 + 模板的固定 / 条件话题。写手单独传的 ``tags``
+    没存(2026-10-20 第三轮复审): 写手传了 tags 的那篇, 交付稿的话题行按写手传的拼, 和这里**对不上**; 只有写手没传 tags 时
+    才和 delivery.text 的话题行一样。评论版本行里没有, rulecheck._parts 走 delivery.comment_list 拿到的永远是空的。所以编出来的
+    code 里只看话题 / 评论的照旧不跑(rulecompile.UNSTORED_PARTS), 这里的 ``tags`` 实际上没有检查会读。"""
+    title = str(version.get("title") or "").strip()
+    body = str(version.get("body") or "").replace("\r\n", "\n").strip()
+    (post,), tags = _as_delivered(template, [{"title": title, "body": body}])
+    return {"title": title, "body": post["body"], "tags": tags[0] if tags is not None else None}
+
+
+def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str | None = None,
+                tactic: str = "") -> dict:
+    """写完存过档之后, 按编译好的规则逐篇查(D-121)。只作建议, 不拦任何东西, 不改库里的稿子。
+
+    1. 归属: 项目过 assert_project_access; version_ids 只认本项目的(store.versions_in_project, 同存档判定核自带
+       version_id 的那条 inner join), 别的项目的 / 不存在的 / 不是 UUID 的记进 ``excluded``, 不查、不发;
+       查的是交付出去的那一份(``_delivered_text``: 模板管话题时正文摘掉末尾那行话题), Jev 判的和代码查的都是它;
+    2. 池子: 同简报 —— shared_memories(本项目 + 调用者自己的 global), soft 过方向闸(filter_by_applicability, 按项目名
+       + 写手原样传回来的 ``tactic`` 判, 同简报和 score_drafts 的代码查规则); 每条按 sha 找 rule_compiles 里的编译结果,
+       找不到的数进 ``uncompiled_rules`` 并说清为什么没有(_uncompiled_reason), 触发后台补编;
+    3. 规则题: 编出来的 questions 拼成内联项目题库, 每篇单独发一次 /judge_draft(banks=[]、不判段、write=true、
+       run_tag=shadow-rules), 最多 4 路并行, 整次共用 JUDGE_DRAFT_TOOL_TIMEOUT_SEC(默认 18 秒)的截止 —— 到点没回来的
+       记「没判完」, 绝不算守住; 回来了但一道题都没判出来的(回包没有 desk_rules / 每题都带 invalid_reason)同样记没判完,
+       判出了一部分的, 没判出来的题数进 ``counts.unjudged`` / ``summary.unjudged``(2026-10-20 复审);
+    4. 代码查: 编出来的 code 交给 rulecheck, 只跑没有人手设过 check 的规则(人设的 score_drafts 已经查过); 只看话题 /
+       评论的不跑(版本行里没存这两样), 数进 ``rules.code_unavailable``; 不安全 / 形状不对没跑的数进 ``rules.code_refused``,
+       不算进 ``rules.by_code``。编不了的(原文超过 Jev 的字段上限之类)数进 ``rules.not_compilable``。这三种和没编译结果的
+       一样, next_step 不会说它们守住了(2026-10-20 第二轮复审)。人设过 check 的数进 ``rules.by_score_drafts``; 写手撤掉了
+       代码检查、又没有规则题的数进 ``rules.code_withdrawn``(这次没查, 不说守住了); where 里混着话题 / 评论、只跑了标题 /
+       正文那一半的数进 ``rules.partial``(独立复审 on aw E)。
+
+    ``version_ids`` 一次查前 CHECK_RULES_MAX_VERSIONS 个(去重之后), 多出来的原样放进 ``remaining_version_ids``、next_step
+    让再调一次(2026-10-20 第二轮复审: score_drafts 一批不限篇数, 原来超过上限整次报错, 写手照协议说规则没查成)。
+    """
+    started = time.monotonic()
+    project = assert_project_access(client, project_id, user_id=user_id)
+    ids, rest = _check_rules_ids(version_ids)
+    canon = {raw: str(uuid.UUID(raw)) for raw in ids if _is_uuid(raw)}
+    found = store.versions_in_project(client, project_id, sorted(set(canon.values()))) if canon else {}
+    excluded, targets, seen = [], [], set()
+    for raw in ids:
+        vid = canon.get(raw)
+        if vid is None or vid not in found:
+            excluded.append({"version_id": raw, "reason": JUDGE_SKIP_NOT_IN_PROJECT})
+        elif vid not in seen:
+            seen.add(vid)
+            targets.append((vid, found[vid]))
+    # Jev 判的、代码查的都是交付出去的那一份(同 score_drafts 的 rule_checks, delivery.delivered_post)。模板坏了(有人手改了库)
+    # 同 score_drafts: 记日志, 照原稿查, 不拦
+    template = None
+    if targets:
+        try:
+            template = delivery.template_of(project)
+        except Exception as exc:                             # noqa: BLE001 — 增强项, 绝不冒泡
+            logger.warning("check_rules: 项目 %s 的交付模板用不了, 照原稿查(%s)", project_id, exc)
+    targets = [(vid, _delivered_text(template, v)) for vid, v in targets]
+
+    hard, soft = store.shared_memories(client, project_id, user_id, vectors=False)
+    # 方向闸的判据同简报和 score_drafts: 项目名 + 这场 open_project 传的 tactic(写手原样传回来)。只按项目名判的话,
+    # 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又当成题发给 Jev
+    soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or "", tactic or ""))
+    pool = hard + soft
+    shas: dict[str, tuple[dict, str]] = {}
+    not_compilable = 0
+    for r in pool:
+        item, sha = rulecompile.compile_input(r)
+        if item is None:
+            not_compilable += 1
+        else:
+            shas.setdefault(item["id"], (r, sha))
+    try:
+        compiled = store.rule_compiles_for(client, list(shas)) if shas else {}
+    except Exception:                                        # noqa: BLE001 — 见 CHECK_RULES_UNREADABLE_STEP
+        # migrations/015 没跑(或库从 015 之前的基线恢复)时 PostgREST 回 PGRST205。原来直接抛: REST 是 500(模型读成「待会儿
+        # 重试」), MCP 是一个工具错误, 服务端 deskcore 一行日志都没有 —— 每次存档的 next_step 都让写手来调, 次次这样
+        # (2026-10-20 第三轮复审)。改成回一份 status=error 的结果: 写手照样知道规则没查、不能说守住了, 服务端有日志。
+        logger.exception("check_rules: 读 rule_compiles 失败(project=%s), 这次规则没查 —— migrations/015 跑了吗?", project_id)
+        out = {"project_id": project_id, "status": "error", "note": CHECK_RULES_NOTE, "versions": [],
+               "rules": {"pool": len(pool)}, "reason": "rule_compiles_unreadable",
+               "next_step": CHECK_RULES_UNREADABLE_STEP}
+        if excluded:
+            out["excluded"] = excluded
+        return out
+    pairs, missing = [], []
+    for mid, (r, sha) in shas.items():
+        res = (compiled.get((mid, sha)) or {}).get("result")
+        if isinstance(res, str):
+            try:
+                res = json.loads(res)
+            except ValueError:
+                res = None
+        if rulecompile.usable(res):
+            pairs.append((r, res))
+        else:
+            missing.append((mid, sha))
+    uncompiled = len(missing)
+
+    skipped_questions: set[str] = set()
+    bank = rulecompile.project_bank([res for _, res in pairs], skipped=skipped_questions)
+    questions = rulecompile.question_index(pairs, bank)
+    code, code_unavailable = rulecompile.code_rules(pairs)
+    # payload 在这里按人设 check 的同一套规矩校一遍(rulecheck.spec_of: 正则过 validator.assert_regex_is_safe + 量词形状那道),
+    # 不合格的记日志、不跑, 数进 rules.code_refused; 先挑出来是为了知道**哪几条**真跑了(下面 partial 只数真查了的)
+    runnable = [r for r in code if rulecheck.spec_of(r) is not None]
+    judged = {q["rule_id"] for q in questions.values()}
+    # code_rules 跳过的两种(独立复审 on aw E: 原来哪个桶都不进, rules 里池子 1 条、各项全是 0; nothing_to_check 时还把它们
+    # 说成「流程、交付、写作方向」那种查不了): 人设了能跑的 check 的(score_drafts 存档时已经按人设的查过)、写手撤掉了
+    # 代码检查的(Jev 只编成了 code、没有规则题时这次什么都没查它, 不能说它守住了)。
+    skipped_code = [(r, res) for r, res in pairs if str(r.get("id")) not in judged and isinstance(res.get("code"), dict)]
+    by_score_drafts = sum(1 for r in pool if rulecompile.hand_set(r))
+    code_withdrawn = sum(1 for r, _ in skipped_code if rulecompile.withdrawn(r))
+    rules_info = {"pool": len(pool),
+                  "by_jev": len(judged),
+                  "by_code": len(code),
+                  "not_checkable": sum(1 for _, res in pairs if res.get("verdict") == "not_checkable"),
+                  "uncompiled": uncompiled}
+    if not_compilable:
+        rules_info["not_compilable"] = not_compilable
+    if by_score_drafts:
+        rules_info["by_score_drafts"] = by_score_drafts
+    if code_withdrawn:
+        rules_info["code_withdrawn"] = code_withdrawn
+    if skipped_questions:
+        rules_info["questions_unchecked"] = len(skipped_questions)
+        rules_info["questions_unchecked_rules"] = sorted(skipped_questions)
+    # Jev 编译时标了 coverage=partial 的(一条规则的要求没全装进题 / 代码, 没装进去的写在 uncovered): 这次查了的也只是
+    # 一部分, 题全守住 / 代码没命中也不能说整条守住了(2026-10-20 第三轮复审: 原来 coverage / uncovered 这边一处都不读,
+    # 「标题不超过 20 字, 正文要带某句话术」只编出了标题那一半, 标题短就报「这次查的规则都守住了」)。只数这次真查了的。
+    # 编出来的 where 里混着话题 / 评论、只跑了标题 / 正文那一半的(code_rules 的 stripped)也算(独立复审 on aw E)
+    used = judged | {str(r.get("id")) for r in runnable}
+    stripped = {str(r.get("id")): r["stripped"] for r in runnable if r.get("stripped")}
+    partial = [(str(r.get("id")), res) for r, res in pairs
+               if str(r.get("id")) in used and (res.get("coverage") == "partial" or str(r.get("id")) in stripped)]
+    if partial:
+        def _uncovered(rid: str, res: dict) -> str:
+            bits = [str(res.get("uncovered") or "").strip()] if res.get("coverage") == "partial" else []
+            if rid in stripped:
+                bits.append("、".join(rulecheck.PART_CN.get(w, w) for w in stripped[rid]) + "那部分没查(不随稿子存)")
+            return "; ".join(b for b in bits if b)[:_CHECK_RULES_UNCOVERED_CHARS]
+        rules_info["partial"] = len(partial)
+        rules_info["partial_rules"] = [{"rule_id": rid, "uncovered": _uncovered(rid, res)}
+                                       for rid, res in partial[:CHECK_RULES_MAX_UNSURE]]
+    if code_unavailable:
+        rules_info["code_unavailable"] = len(code_unavailable)      # 只看话题 / 评论, 版本行里没有, 没跑
+    uncompiled_why = ""
+    if uncompiled:
+        kick = _kick_rule_compile(client, project_id, reason="check_rules")
+        reason, uncompiled_why, failed = _uncompiled_reason(client, project_id, missing, kick)
+        rules_info["uncompiled_reason"] = reason
+        if failed:
+            rules_info["compile_failed"] = failed
+    out: dict = {"project_id": project_id, "note": CHECK_RULES_NOTE, "rules": rules_info,
+                 "uncompiled_rules": uncompiled}
+    if excluded:
+        out["excluded"] = excluded
+
+    if not questions and not code:
+        out["status"] = "nothing_to_check"
+        out["versions"] = []
+        parts = []
+        if uncompiled:
+            parts.append(f"这个项目的规则还没有编译结果({uncompiled} 条, {uncompiled_why}), 这次一条都查不了。")
+        if code_unavailable:
+            parts.append(f"有 {len(code_unavailable)} 条规则要看话题 / 评论, 这两样不随稿子存, check_rules 查不了, "
+                         "不能说它们守住了。")
+        if not_compilable:
+            parts.append(_never_checked_tip(not_compilable, 0))
+        if code_withdrawn:
+            parts.append(_withdrawn_tip(code_withdrawn))
+        if skipped_questions:
+            parts.append(_questions_unchecked_tip(len(skipped_questions)))
+        if by_score_drafts:
+            # 人设了 check 的: 不是查不了, 是 score_drafts 存档时已经查过; 那边报的「必须改」照改, 不能说「不用做什么」
+            # (独立复审 on aw E)
+            parts.append(f"有 {by_score_drafts} 条规则人手设过代码检查, score_drafts 存档时已经按它查过(那次 rule_checks 里的"
+                         "「必须改」照改), 这里不重复查。")
+        if parts:
+            out["next_step"] = " ".join(parts) + (" 不用等, 照常交付, 下一批写完再调 check_rules。" if uncompiled
+                                                  else " 照常交付。")
+        elif not pool:
+            out["next_step"] = "这个项目没有可查的规则, 不用做什么, 照常交付。"
+        elif rules_info["not_checkable"] == len(pairs):
+            # 只在每条编译结果都是 not_checkable 时这么说(独立复审 on aw E: 原来池子不空就这么说, 人设了 check 的、撤掉了
+            # 代码检查的也被说成流程规则)
+            out["next_step"] = "这个项目的规则都是查不了的那种(流程、交付、写作方向), 不用做什么, 照常交付。"
+        else:
+            # 剩下的是编译结果用不上的(题的形状全不对、code 的 kind 不认识): 没查, 不能说守住了
+            out["next_step"] = "这个项目的规则这次一条都没查(编译结果用不上, 要运维看一下), 不能说它们守住了。照常交付。"
+        return out
+    if rest:
+        out["remaining_version_ids"] = rest
+    if not targets:
+        out["status"] = "no_versions"
+        out["versions"] = []
+        out["next_step"] = ("version_ids 里没有这个项目的稿子(excluded 里写着原因): 传 score_drafts 这次返回的 "
+                            "check_rules_version_ids。查不了不影响交付。")
+        if rest:
+            out["next_step"] += _check_rules_remaining_step(rest)
+        return out
+
+    # ── 代码查: 编出来的 code, 只给没人手设过 check 的规则 ──
+    by_index: dict[int, list[dict]] = {}
+    code_stats = {"rules": 0, "skipped": 0}
+    if runnable:
+        # 话题同 score_drafts 的 rule_checks: 模板管话题时传交付出去的那一行, 不然 None(rulecheck 照正文拼)
+        hits, code_stats = rulecheck.check(runnable, [{"title": v["title"], "body": v["body"]} for _, v in targets],
+                                           tags=[v["tags"] for _, v in targets])
+        for h in hits:
+            by_index.setdefault(h["index"], []).append(h)
+    # 正则没在时限内查完的(rulecheck.check 的 timed_out_from: 从第几篇起): 那几篇这条算没查, 不能算进「守住了」
+    # (validator.search_user_regex 限时之后才有这一种; 同 score_drafts 的 rule_checks_unchecked)
+    code_timed = code_stats.get("timed_out_from") or {}
+    if code_timed:
+        rules_info["code_timed_out"] = len(code_timed)
+    rule_rows = {str(r.get("id")): r for r in pool}
+    if len(code) - len(runnable):
+        rules_info["code_refused"] = len(code) - len(runnable)  # 正则不安全 / 形状不对, 没跑
+    # 交给代码查的条数: 不安全 / 形状不对没跑的不算; 正则没在时限内查完的算在里面(同 score_drafts meta 的 rule_checks.rules),
+    # 另数在 code_timed_out(独立复审 on aw E: 文档原来说成「真跑了的」, 限时引擎一篇都没搜成的那条也在里面)
+    rules_info["by_code"] = code_stats.get("rules", 0)
+
+    # ── 规则题: 每篇单独发一次 /judge_draft, 整次共用一个截止 ──
+    jev: dict[str, dict] = {}
+    jev_detail = None
+    if questions:
+        budget = judge_client.tool_timeout_sec()
+
+        def _left() -> float:
+            return max(0.0, budget - (time.monotonic() - started))
+
+        if not judge_client.configured():
+            jev_detail = "JUDGE_URL / JUDGE_API_KEY 未配置, 规则题判不了"
+            jev = {vid: {"judge_status": judge_client.JUDGE_NOT_CONFIGURED} for vid, _ in targets}
+        else:
+            ex = cf.ThreadPoolExecutor(max_workers=CHECK_RULES_WORKERS, thread_name_prefix="check-rules")
+            futs: dict = {}
+            done: set = set()
+            try:
+                try:
+                    ctx = ex.submit(_judge_project_context, client, project_id).result(timeout=_left())
+                except cf.TimeoutError:
+                    ctx = {"project": None, "category": None, "status": judge_client.JUDGE_TIMEOUT,
+                           "detail": f"发之前的查库(tv_project_map / TV 品类)在 {budget:g}s 内没查完, 没发"}
+                if ctx["project"] is None:
+                    jev_detail = ctx["detail"]
+                    jev = {vid: {"judge_status": ctx["status"]} for vid, _ in targets}
+                elif _left() <= 0.5:
+                    jev_detail = f"查库用完了 {budget:g}s 的预算, 规则题没来得及发"
+                    jev = {vid: {"judge_status": judge_client.JUDGE_TIMEOUT} for vid, _ in targets}
+                else:
+                    def _judge_before_deadline(payload):
+                        left = _left()
+                        if left <= 0:
+                            return {"judge_status": judge_client.JUDGE_TIMEOUT}
+                        return judge_client.judge_draft_full(payload, timeout=left)
+
+                    for vid, v in targets:
+                        if not (v["body"] or "").strip():
+                            jev[vid] = {"judge_status": "empty_body"}
+                            continue
+                        payload = judge_client.build_rules_request(
+                            version_id=vid, title=v["title"], body=v["body"], project=ctx["project"],
+                            category=ctx["category"], project_bank=bank)
+                        futs[ex.submit(_judge_before_deadline, payload)] = vid
+                    done, _pending = cf.wait(list(futs), timeout=_left())
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
+            for f, vid in futs.items():
+                if f not in done:
+                    jev[vid] = {"judge_status": judge_client.JUDGE_TIMEOUT}
+                    continue
+                try:
+                    res = f.result()
+                except Exception as exc:                     # noqa: BLE001 — judge_draft_full 本不抛, 兜底
+                    res = {"judge_status": judge_client.JUDGE_ERROR, "detail": f"{type(exc).__name__}: {exc}"}
+                jev[vid] = res
+
+    versions = []
+    ledger_errors: list[str] = []
+    summary = {"versions": len(targets), "must_fix": 0, "suggest": 0, "unsure": 0, "not_finished": 0, "unjudged": 0}
+    for i, (vid, v) in enumerate(targets):
+        row: dict = {"version_id": vid, "title": (v["title"] or "")[:_CHECK_RULES_TITLE_CHARS]}
+        found_v = rulecompile.code_violations(by_index.get(i, []))
+        unsure: list[dict] = []
+        unjudged: list[dict] = []
+        if questions:
+            res = jev.get(vid) or {"judge_status": judge_client.JUDGE_TIMEOUT}
+            status = res.get("judge_status")
+            row["judge_status"] = status
+            resp = res.get("response") if status == judge_client.JUDGE_OK else None
+            if isinstance(resp, dict) and _ledger_write_failed(resp):
+                ledger_errors.append(vid)
+                logger.warning("check_rules: 规则题的答案没落进 TV 账本(project=%s, version=%s, written=%r): %s",
+                               project_id, vid, resp.get("written"),
+                               mask_secrets(str(resp.get("write_error") or "回包里没有 written"))[:_JUDGE_BLOCK_TEXT_MAX])
+            if isinstance(resp, dict) and resp.get("invalid_reason"):
+                row["judge_status"] = "not_judged"
+                row["judge_note"] = f"规则题没判: {resp['invalid_reason']}(多半是正文太短)"
+                summary["not_finished"] += 1
+            elif isinstance(resp, dict):
+                raw = resp.get("detail")
+                detail = raw.get(judge_client.RULES_BANK_NAME) if isinstance(raw, dict) else None
+                got = rulecompile.read_answers(questions, detail)
+                found_v += got["violations"]
+                unsure = got["unsure"]
+                unjudged = got["unjudged"]
+                summary["unjudged"] += len(unjudged)
+                if unjudged and len(unjudged) == len(questions):
+                    # 回来了, 却一道题都没判出来(回包里没有 desk_rules / 每题都带 invalid_reason): 和没判完一样, 不能当
+                    # 守住了(2026-10-20 复审: 原来这里只记个数, summary 不看它, next_step 照说「都守住了」)
+                    row["judge_status"] = "not_judged"
+                    row["judge_note"] = ("规则题一道都没判出来(" + (
+                        "回包里没有规则题的答案" if not isinstance(detail, dict) else
+                        "Jev 标了判不了: " + "、".join(sorted({u["reason"] for u in unjudged}))
+                    ) + "), 不能当作守住了规则")
+                    summary["not_finished"] += 1
+                if unjudged:
+                    row["unjudged"] = unjudged[:CHECK_RULES_MAX_UNSURE]
+            else:
+                row["judge_note"] = ("没判完: 这一篇的规则题这次没在时限内判完, 不能当作守住了规则"
+                                     if status == judge_client.JUDGE_TIMEOUT else
+                                     "这一篇正文是空的, 规则题没判" if status == "empty_body" else
+                                     f"规则题这次没判成({status}), 不能当作守住了规则")
+                if status != "empty_body":
+                    summary["not_finished"] += 1
+                else:
+                    # 空正文不算没判完(本来就没东西可判), 可标题上的题、「正文要带…」的题都没问, 也不能算守住了: 单独计数,
+                    # next_step 不再说「都守住了」(独立复审 on aw E)
+                    summary["empty_body"] = summary.get("empty_body", 0) + 1
+                if res.get("detail"):
+                    row["judge_detail"] = mask_secrets(str(res["detail"]))[:_JUDGE_BLOCK_TEXT_MAX]
+        code_unchecked = [{"rule_id": rid, "severity": "hard" if str((rule_rows.get(str(rid)) or {}).get("severity") or "")
+                           .lower() == "hard" else "soft", "rule": (rule_rows.get(str(rid)) or {}).get("content") or ""}
+                          for rid, at in code_timed.items() if i >= at]
+        if code_unchecked:
+            row["code_unchecked"] = code_unchecked
+            summary["code_unchecked"] = summary.get("code_unchecked", 0) + len(code_unchecked)
+        found_v.sort(key=lambda e: e["severity"] != "hard")
+        must = sum(1 for e in found_v if e["severity"] == "hard")
+        row["violations"] = found_v[:max(must, CHECK_RULES_MAX_LISTED)]      # 必须改在前, 全列
+        row["unsure"] = unsure[:CHECK_RULES_MAX_UNSURE]
+        more = len(found_v) - len(row["violations"]) + len(unsure) - len(row["unsure"])
+        if more:
+            row["more"] = more
+            summary["more"] = summary.get("more", 0) + more             # next_step 要说还有这么多条没列(独立复审 on aw E)
+        row["counts"] = {"must_fix": must, "suggest": len(found_v) - must, "unsure": len(unsure),
+                         "unjudged": len(unjudged)}
+        summary["must_fix"] += must
+        summary["suggest"] += len(found_v) - must
+        summary["unsure"] += len(unsure)
+        versions.append(row)
+    if ledger_errors:
+        # 只给运维看(写手的 next_step 不提): 判是判出来了, 少的是以后校准用的那几行账本
+        rules_info["ledger_write_errors"] = len(ledger_errors)
+        try:
+            import telemetry
+            telemetry.log_event("deskcore_check_rules_ledger", project_id=project_id, versions=len(targets),
+                                ledger_write_errors=len(ledger_errors), version_ids=ledger_errors[:CHECK_RULES_MAX_VERSIONS])
+        except Exception:                                    # noqa: BLE001 — 埋点不能拖垮查规则
+            pass
+    out["status"] = "checked"
+    out["versions"] = versions
+    out["summary"] = summary
+    if jev_detail:
+        out["judge_detail"] = mask_secrets(str(jev_detail))[:_JUDGE_BLOCK_TEXT_MAX]
+    out["next_step"] = _check_rules_next_step(summary, uncompiled, uncompiled_why, len(code_unavailable),
+                                              not_compilable, rules_info.get("code_refused", 0), len(partial),
+                                              code_withdrawn, len(skipped_questions))
+    if rest:
+        out["next_step"] += _check_rules_remaining_step(rest)
+    out["elapsed_ms"] = _ms_since(started)
+    return out
 
 
 _CALIB_SYSTEM = """\

@@ -14,6 +14,12 @@
 > - **`review_drafts` / `export_drafts` 两个工具撤了**：定稿由写手贴进飞书，发布后 `tv-sync` 按内容对回来（core 里的函数保留，不再暴露给模型）。
 > - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
 
+> **2026-10-20 · D-121 写完按规则逐篇查**：规则由 Jev（`POST /compile_rules`）编成是非题 / 代码检查，按（规则 id, sha）缓存进
+> `rule_compiles`（`migrations/015`）；`score_drafts` 之后调 **`check_rules(version_ids)`**（传 `score_drafts` 返回的
+> `check_rules_version_ids`：只有新稿，改稿重存的不再查），hard 没守住报「必须改」、soft 报「建议改」、
+> Jev 拿不准的单列，**只作建议、不拦存档**；没判出来的题、只看话题 / 评论的规则、只查了一部分的规则（Jev 编译时标了 partial，或者只有一部分要看话题 / 评论）、撤掉了代码检查又没有规则题的规则、还没有编译结果的规则都单独报数，不算守住。编译最坏 6 分钟，只在后台线程（`open_project` / `record_rule` / `check_rules` 触发）和
+> `cli compile-rules` 里跑，写手的请求不等它；简报不动。见 `docs/deskcore.md` §3.11。
+
 ## 它解决什么
 
 | 症状 | 机制 |
@@ -51,6 +57,7 @@ deskcore/
 ├── fingerprint.py  指纹与判定, 【只用标准库】
 ├── delivery.py     交付版式模板的校验与拼装(纯函数, 2026-10-20, 见 docs/deskcore.md §3.9)
 ├── rulecheck.py    带 check 的规则逐篇代码查(纯函数, 2026-10-20, 见 docs/deskcore.md §3.10)
+├── rulecompile.py  Jev 编译规则的结果: sha / 发给 Jev 的形状 / 拼题库 / 读答案(纯函数, 2026-10-20, D-121, 见 docs/deskcore.md §3.11)
 ├── structure.py    简报里的 recent_structure: 问哪几题、怎么算扎堆(纯函数, 2026-10-20, 见 docs/deskcore.md §3.1)
 ├── vocab.py        闭集: essence 来自 vendor JSON, surface 引用 generator.py
 ├── identity.py     API key → user_id, 「个人风格私有」的前提
@@ -101,6 +108,7 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 | `tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target` / `tv-map list` | TV 项目 ↔ 写作台项目的对照表；每个 TV 项目只能有一个补录目标 |
 | `tv-sync --all [--dry-run] [--write-tv] [--since …] [--rematch]` | 把 TV 的笔记按内容对到写作台的版本，对不上的补进指纹库（不过闸、按全文幂等）。先 `--dry-run` 看数；`--write-tv` 才回填 TV 的 `source_autowriter_*`。**每天跑一次** |
 | `tv-resolve --note <note_id> --ingest` | `tv-sync` 报「分不出」的那几条，人看过之后落判定：目前只有一种，「对不上，按 TV 的正文补录」。对照改成 `ingested`，原候选保留。**不硬猜**、也**不提供「指定某一版」**（`match_kind` 没有 manual 一档，硬记成 `body_exact` 是撒谎） |
+| `compile-rules (--project <uuid> \| --all) [--force] [--dry-run]` | 把规则池里还没编的规则交给 Jev 编成写后检查（`check_rules` 用），结果缓存进 `rule_compiles`；已编过的（规则 id + 原文 sha 都没变）不再发；`--all` 一次运行里 owner 的 global 规则只发一次（`--force` 也是）。先 `--dry-run` 看要编几条（和真编同一个结局：没接 tv-map / 没配 `JUDGE_*` 照样报 ✗）。后台也会自己补编，这个命令是上线时补一遍（先关 `RULE_COMPILE_AUTO`，见 runbook §1.11）、或 Jev 改了编译之后 `--force` 用。一个项目一行计数，有项目没编成退出码 1；一批读超时就不再发后面几批，`--all` 也不再试后面的项目（列出来），Jev 恢复后再跑（2026-10-20，D-121） |
 | `sync-skill [--check]` | **不连库。** 改了 `protocol.md` 之后跑，把正文接进 `skills/…/SKILL.md`；`--check` 只比对，给 CI 用。两边不一致时 `test_protocol_tool.py` 会红 |
 
 另有 `health` / `projects` / `open` / `draw` / `check` 几个只读的手动验证入口。完整参数与验收判据见 runbook §2。

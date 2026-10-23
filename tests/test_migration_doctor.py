@@ -50,6 +50,8 @@ _TABLES = {
     # 013 的两张表(改动差异 + 每周摘要看到哪儿了)
     "tv_edit_diffs": [],
     "tv_edit_digest_acks": [],
+    # 015 的规则编译缓存
+    "rule_compiles": [],
     "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z",
                "decision_source": None, "reviewer_id": None, "decided_at": None,
                # 012 的两列
@@ -756,3 +758,15 @@ def test_011_view_without_grant_points_at_011_not_007(err):
     note = next(c["note"] for c in report["checks"]
                 if c["migration"] == "011_angle_outcomes_view.sql")
     assert "重跑 011" in note
+
+
+def test_rule_compiles_missing_grant_points_to_015():
+    class DeniedCompiles(FakeClient):
+        def _execute(self, q):
+            if q.table_name == "rule_compiles":
+                raise RuntimeError('42501 permission denied for table rule_compiles')
+            return super()._execute(q)
+
+    report = core.migration_state(DeniedCompiles(rows=_TABLES, rpc_impl=_ALL_RPCS))
+    assert "015_rule_compiles.sql" in report["missing"]
+    assert "007_deskcore_table_grants.sql" not in report["missing"]

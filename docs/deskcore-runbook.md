@@ -295,6 +295,77 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
 
+### 1.11 `015_rule_compiles` —— 规则编译结果的缓存 + `compile-rules`（2026-10-20，D-121，**生产库尚未执行**）
+
+规则交给 Jev 的 `POST /compile_rules` 编成写后检查，结果按（规则 id, sha）存进 `autowriter.rule_compiles`；写手存档之后调
+`check_rules` 按它逐篇查，只作建议（hard → 必须改，soft → 建议改，不拦存档）。设计见 `docs/deskcore.md` §3.11。
+
+**顺序。** ① SQL Editor / `apply_migration` 跑 `015`（幂等，**先于**代码部署——没跑时后台补编和 `compile-rules` 读缓存就失败、
+不会去花编译的钱，`check_rules` 回 `status: error`、记 ERROR 日志，写手那边是这次规则没查成）；`doctor` 里「表 rule_compiles」applied。② 部署 deskcore，**服务上先设 `RULE_COMPILE_AUTO=0`**。
+③ 先看数再编（跑的机器上要有 `JUDGE_URL` / `JUDGE_API_KEY`，dry-run 也查）：
+
+```bash
+python -m deskcore.cli compile-rules --all --dry-run     # 每个项目一行: 池子 / 已编过 / 要编几条, 一条不发
+python -m deskcore.cli compile-rules --all               # 真编; 一批 ≤ 60 条, 最坏 6 分钟一批, 全部跑完要一阵
+python -m deskcore.cli compile-rules --project <uuid>    # 只编一个项目
+python -m deskcore.cli compile-rules --project <uuid> --force   # 已编过的也重编、覆盖(花钱; 只在 Jev 改了编译之后)
+```
+
+④ 跑完去掉 `RULE_COMPILE_AUTO`（Railway 改变量就重新部署，不用发版），后台补编打开时规则都已经在缓存里。⑤ 写手重新导入一次 skill（协议版本变了）。
+
+⚠️ **后台补编开着的时候不要对线上跑 `compile-rules`，尤其是 `--force`。** 服务进程的后台补编和 CLI 不共用锁、看不见对方在编什么：
+两边同时编同一个项目（或同一个 owner 的两个项目——global 规则在每个项目的池子里）时，同一条规则会发两遍、Jev 收两遍钱，upsert 把后到
+的那份盖上去，数据里看不出来。要跑就照 ②–④ 先关再开。
+
+dry-run 的数和真编同一个口径：`--all` 一次运行里 owner 的 global 规则只算 / 只发一次（`--force` 也是），「要编」合计就是真编要发的条数；
+「池子」合计是各项目池子相加，global 规则按项目数重复算。没配 `JUDGE_*` / 没接 tv-map 的项目 dry-run 也报 ✗。
+
+`✗` 的那一行看方括号里的状态：`not_configured`（这个项目没接 `tv_project_map`，补 `tv-map add`，或 deskcore 没配 `JUDGE_*`）/
+`policy_blocked`（出境口径挡下，处方药没清出境）/ `timeout`（一批读超时，**后面几批不再发**——超时那批 Jev 多半还在编、照样计费；
+`--all` 也就此停下，后面的项目一个都不试，`⏸` 那一行列着它们；等 Jev 恢复再跑一次）/ `unavailable`（连不上 Jev，包括 3 秒内没连上的
+连接超时——请求没发出去、没花钱，`--all` 接着试下一个项目）/ `jev_mock`（Jev 回的是 `JUDGE_MOCK` 的假结果，一条没存：`JUDGE_URL` 指到
+测试 / 本地的 Jev 了）/ `jev_failed` / `partial`（一部分规则没编出来，下面列着每条的原因；再跑一次只重编失败的那几条）。
+后台补编对编失败的规则 6 小时内不重编；Jev 生成端过载（原因里是「生成端调用失败：GeneratorHTTPError: HTTP 429 / 5xx」，504 / 524 除外）
+没计费，只停 30 分钟（独立复审 on aw E）。
+退出码：有项目没编成、或者因为读超时有项目没试，就是 1。之后不用再手动跑：`open_project` / `record_rule` / `check_rules` 会在后台补编
+新增和改过的规则（每个项目同时一个线程、5 分钟冷却；任何一个项目读超时之后，整个服务进程 30 分钟内哪个项目都不发，`record_rule` 也不例外；
+`RULE_COMPILE_AUTO=0` 可关）。
+
+⚠️ **日志里有编译在跑的时候别重新部署 / 改变量**（Railway 改一个变量就重新部署）：后台补编是 daemon 线程，进程一退就被杀在半路，
+那一批 Jev 照样编完、照样计费，结果没存，新进程会再发一遍、再付一次。看得见：每发一批有一行 INFO
+`compile_rules: 发一批 N 条去 Jev 编译(project=…)`，跑完有一行 `rule compile (project=…): status=…`；发了还没有结束行的就是在路上
+（一批最坏 6 分钟）。被打断了，退出时那个进程的日志里有 WARNING「后台补编被进程退出打断(project=…)」——不用手动补：新进程里那个项目
+下一次 `open_project` / `record_rule` 会自己重编；要马上补，就照上面 ②–④ 先关 `RULE_COMPILE_AUTO` 再跑 `compile-rules --project <uuid>`。
+
+**查 `rule_compiles` 的数**（SQL Editor）：
+
+```sql
+-- 每个项目: 规则池里几条规则有任何版本的编译结果、各是什么结论(按规则去重; 只数池子里的: confirmed、规则类、没静音、
+-- 原文非空的项目规则; global 规则另算)
+select m.project_id,
+       count(distinct m.id) as rules,
+       count(distinct c.memory_id) as compiled,
+       count(distinct c.memory_id) filter (where c.result->>'verdict' = 'questions') as questions,
+       count(distinct c.memory_id) filter (where c.result->>'verdict' = 'code') as code,
+       count(distinct c.memory_id) filter (where c.result->>'verdict' = 'not_checkable') as not_checkable,
+       max(c.compiled_at) as last_compiled
+  from autowriter.memories m
+  left join autowriter.rule_compiles c on c.memory_id = m.id
+ where m.scope = 'project' and m.status = 'confirmed'
+   and (m.memory_type is null or m.memory_type = 'rule')
+   and (m.muted_until is null or m.muted_until <= now())
+   and coalesce(btrim(m.content), '') <> ''
+ group by 1 order by 2 desc;
+-- 全表: 一共几行、几条规则有不止一个版本(改过原文 / 适用范围)
+select count(*), count(distinct memory_id), count(*) - count(distinct memory_id) as old_versions
+  from autowriter.rule_compiles;
+```
+
+⚠️ 上面第一条按规则去重了（一条规则改过原文会有好几行编译结果，旧 sha 的行故意留着），但仍然不核 sha：`compiled` 是「有任何一个版本的
+结果」，各结论那几列也可能数到旧版本（同一条规则新旧两版结论不同时两列各算一次）。session 规则和静音的规则不在池子里，没算。
+权威的数是 `compile-rules --dry-run` 的「已编过 / 要编」（它按当前原文算 sha）。查 `check_rules` 判出来的答案：TV 账本 `note_feature_answers` 里
+`subject_type = 'aw_version' and run_tag = 'shadow-rules'` 的行（和存档那次的 `primary` 分开）。
+
 ### 1.10 `014_tv_edit_diff_rev` —— 改动差异的口径版本（2026-10-20）
 
 013 首晚 440 条差异里 125 条"改过"只差写作台稿子末尾那行 #话题（TV 里发出去的正文多半不带），品牌次数也跟着少一次。

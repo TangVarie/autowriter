@@ -205,6 +205,17 @@ OPEN_PROJECT_BORROW_SEC: float = _bounded_number("OPEN_PROJECT_BORROW_SEC", 10.0
 # 一次 commit 里最多同时发几篇。judge 那边 /judge_draft 一篇一请求、由 uvicorn 线程池并发;
 # Jev 限流 1,200 次/分。一篇 2~4 次 Jev 调用, 8 路并发 ≈ 每秒十来次, 离限流很远。
 JUDGE_MAX_WORKERS: int = int(_bounded_number("JUDGE_MAX_WORKERS", 8, 1, 16))
+# ── 规则编译(Jev POST /compile_rules, 2026-10-20, D-121)──────────────────────────────
+# 一次请求编 ≤ 60 条(Jev 的上限), 最坏耗时 = 2 次调用 × (重试 + 1) × 单次超时 + 退避, Jev 默认约 361 秒
+# (JevforCoentent README「规则编译」), 所以读超时要 ≥ 400 秒; 夹在 60–900。端点没有整体截止时间, 调用方先断开
+# 服务端也照样跑完、照样花钱 —— 宁可等久一点。⚠️ 这么长的等待只许出现在后台线程和 CLI 里, 写手的工具一律不调它
+# (工具预算 20 秒, 见上面 JUDGE_DRAFT_TOOL_TIMEOUT_SEC)。
+RULE_COMPILE_TIMEOUT_SEC: float = _bounded_number("RULE_COMPILE_TIMEOUT_SEC", 420.0, 60.0, 900.0)
+# 一次请求最多几条: Jev 的 CompileRequest.rules 是 1–60 条, 超了整批 422。
+RULE_COMPILE_BATCH: int = int(_bounded_number("RULE_COMPILE_BATCH", 60, 1, 60))
+# open_project / record_rule / check_rules 发现有规则没编时, 后台起一个线程去编(写手的请求不等它)。0 = 关掉后台补编,
+# 只剩 CLI 的 compile-rules(比如 Jev 那边编译出了问题、要先停掉花钱的时候)。
+RULE_COMPILE_AUTO: bool = (_get_secret("RULE_COMPILE_AUTO") or "1").strip() not in ("0", "false", "False", "off")
 
 # ── Auth cookie (R-040) ─────────────────────────────────────────────────────
 # refresh token 走 stx CookieManager(JS 写入, 无法 HttpOnly —— 架构限制)。

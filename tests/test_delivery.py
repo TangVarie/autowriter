@@ -671,7 +671,8 @@ def test_no_template_means_the_response_is_unchanged():
     rich = core.commit_drafts(desk_client(), PROJ, extra, user_id=ME)
     for out in (plain, rich):
         assert "delivery" not in out and "rule_checks" not in out
-    volatile = {"version_ids", "batch_id", "elapsed_ms", "phase_ms", "judge", "project_isolation"}
+    volatile = {"version_ids", "check_rules_version_ids", "batch_id", "elapsed_ms", "phase_ms", "judge",
+                "project_isolation"}
     assert {k: v for k, v in plain.items() if k not in volatile} == \
            {k: v for k, v in rich.items() if k not in volatile}
 

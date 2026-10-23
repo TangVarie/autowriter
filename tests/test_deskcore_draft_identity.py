@@ -596,6 +596,58 @@ def test_version_ids_keep_the_callers_order_when_replacements_and_new_drafts_mix
     assert out["version_ids"][1] in new_ids
 
 
+def test_score_drafts_asks_for_check_rules_only_on_new_drafts():
+    """2026-10-20 复审: 照 check_rules「必须改」改完带 replaces_version_id 重存时, 协议 5a 和 check_rules 都说「不用再调」,
+    score_drafts 的 next_step 却每次都说「然后调一次 check_rules」—— 最新的那句话赢, 多花一轮钱、改 → 查 → 改地转。
+    现在只让新稿去查: ``check_rules_version_ids`` 不含改稿重存的那几篇, 全是重存时 next_step 不再提调它。"""
+    c = _client()
+    first = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    assert first["check_rules_version_ids"] == first["version_ids"]
+    assert "然后调一次 check_rules" in first["next_step"]
+    v1 = first["version_ids"][0]
+    _embed(c)
+    again = _commit(c, [{"title": "秋招等回音", "body": BODY_X2, "replaces_version_id": v1}], rpc=_rpc_that_writes(c))
+    assert again["written"] == 1 and again["replaced"] and again["check_rules_version_ids"] == []
+    assert "调一次 check_rules" not in again["next_step"] and "不用再调 check_rules" in again["next_step"]
+    v2 = again["version_ids"][0]
+    _embed(c)
+    mixed = _commit(c, [{"title": "秋招等回音", "body": BODY_X2 + "又改了一句。", "replaces_version_id": v2},
+                        {"title": "另一篇", "body": BODY_Y}], rpc=_rpc_that_writes(c))
+    assert mixed["written"] == 2 and len(mixed["replaced"]) == 1
+    assert mixed["check_rules_version_ids"] == [mixed["version_ids"][1]], "只有新稿要查"
+    assert "只传 check_rules_version_ids" in mixed["next_step"]
+    assert "tactic" not in first["next_step"] + mixed["next_step"], "没传 tactic 就不提"
+
+
+def test_score_drafts_reminds_to_pass_the_same_tactic_to_check_rules():
+    """check_rules 的方向闸和 score_drafts 同一个判据(项目名 + tactic): 这批传了 tactic, 下一步就提醒原样带给 check_rules。"""
+    c = _client()
+    c.rpc_impl["deskcore_commit_fingerprints"] = _rpc_that_writes(c)
+    out = core.commit_drafts(c, PROJ, [{"title": "秋招等回音", "body": BODY_X}], user_id=ME, tactic="示例战术")
+    assert out["check_rules_version_ids"] and "tactic 也照这次传给 score_drafts 的原样带上" in out["next_step"]
+
+
+def test_new_drafts_whose_identity_was_not_minted_are_not_called_revisions(monkeypatch):
+    """底稿没建成(identity_warning)的新稿没有版本行, 不在 check_rules_version_ids 里。原来 version_ids 一空, next_step 就说
+    「这几篇都是改过重存的, 不用再调 check_rules」—— 两篇都是新稿, 一篇都没查, 写手还被告知不用查(独立复审 on aw E)。"""
+    monkeypatch.setattr(
+        store, "mint_draft_identity",
+        lambda *a, **kw: {"batch_id": None, "versions": {}, "error": "RuntimeError: 示例: versions 表写不进去"})
+    out = _commit(_client(), [DRAFT, {"title": "标题二", "body": "另一篇正文"}])
+    assert out["written"] == 2 and out["replaced"] == [] and out["check_rules_version_ids"] == []
+    assert "都是改过重存的" not in out["next_step"]
+    assert "另有 2 篇新稿底稿没建成" in out["next_step"] and "不能说这几篇守住了规则" in out["next_step"]
+
+    # 建成了一篇: 那篇照查, 另一篇说清没查
+    monkeypatch.setattr(
+        store, "mint_draft_identity",
+        lambda sb, pid, uid, tactic, entries, **kw: {"batch_id": "batch-9", "versions": {entries[0]["version_id"]: "item-1"},
+                                                      "error": "RuntimeError: 第二条炸了"})
+    out = _commit(_client(), [DRAFT, {"title": "标题二", "body": "另一篇正文"}])
+    assert len(out["check_rules_version_ids"]) == 1 and "然后调一次 check_rules" in out["next_step"]
+    assert "另有 1 篇新稿底稿没建成" in out["next_step"]
+
+
 def test_a_failure_while_pulling_fingerprints_puts_the_already_pulled_ones_back(monkeypatch):
     """P1 的另一半: 两条替换, 第二条的删除炸了 —— 第一条已经删掉的指纹要放回, 不能
     让它在外层 try 拿到 stash 之前就永久消失。"""
