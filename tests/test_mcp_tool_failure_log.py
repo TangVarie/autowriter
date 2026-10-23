@@ -118,6 +118,8 @@ def test_driver_error_code_is_logged_but_not_its_message(monkeypatch, caplog):
     PermissionError("project x 不属于当前调用者"),
     core.ProjectNotFound("project not found"),
     tools.InvalidInput("一次最多 50 条"),
+    core.IngestBusy("另一个补录正在跑"),
+    core.ProjectIsolationRejected("跨项目规则拒收"),
 ])
 def test_expected_refusals_are_warnings_without_stack(monkeypatch, caplog, exc):
     def tool(project_id: str, drafts: list[dict], _user_id=None):
@@ -174,3 +176,58 @@ def test_project_id_is_trimmed_and_cannot_split_the_log_line(monkeypatch, caplog
         _call(monkeypatch, tool, {"project_id": "p\n" + "z" * 200})
     first_line = _mine(caplog)[0].getMessage().splitlines()[0]
     assert "project=p" + "z" * 39 + " user=" in first_line
+
+
+def test_interrupted_call_is_a_warning_and_the_same_exception_propagates(monkeypatch, caplog):
+    """取消 / 进程退出不是 Exception: 记一行 interrupted(warning、不带堆栈), 原对象照样往外抛, 不能被吞或换掉。"""
+    class _Stop(BaseException):
+        pass
+    stop = _Stop()
+
+    def tool(project_id: str, drafts: list[dict], _user_id=None):
+        raise stop
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(BaseException) as info:
+            _call(monkeypatch, tool, {"project_id": PID, "drafts": DRAFTS})
+    hit = info.value
+    while hit is not stop and isinstance(hit, BaseExceptionGroup) and len(hit.exceptions) == 1:
+        hit = hit.exceptions[0]                    # anyio 可能把它包进一层 ExceptionGroup
+    assert hit is stop
+    recs = _mine(caplog)
+    assert len(recs) == 1 and recs[0].levelno == logging.WARNING, [r.getMessage() for r in recs]
+    assert "interrupted" in recs[0].getMessage() and "File " not in recs[0].getMessage()
+
+
+@pytest.mark.parametrize("args", [
+    {"project_id": PID},                                   # 漏了 drafts
+    {"project_id": PID, "drafts": ["SECRET-B 一整篇正文直接当字符串传"]},   # drafts 形状不对
+    {"project_id": PID, "drafts": DRAFTS, "n": None},      # 不收 null 的参数传了 null
+])
+def test_argument_validation_failure_is_logged_without_input(monkeypatch, caplog, args):
+    """FastMCP 在调到 _wrap 之前就校验参数, 原来这一类是 isError + 零日志(review on W-29): score_drafts 传错形状
+    就是「存档悄悄没成」。走真的 tools/call 处理器: 要留一行(工具名 + 字段路径 + 错误类型), 不能带参数原文。"""
+    def tool(project_id: str, drafts: list[dict], n: int = 3, _user_id=None):
+        raise AssertionError("参数校验不过时不该调到工具本身")
+
+    with caplog.at_level(logging.INFO):
+        res = _call(monkeypatch, tool, args, via_server=True)["result"]
+    assert res.isError is True
+    recs = [r for r in caplog.records if r.name == "deskcore" and "bad arguments" in r.getMessage()]
+    assert len(recs) == 1 and recs[0].levelno == logging.WARNING, [r.getMessage() for r in caplog.records]
+    msg = recs[0].getMessage()
+    assert msg.startswith("mcp tool t rejected bad arguments: "), msg
+    assert ("drafts" in msg or "n:" in msg), msg
+    assert f"project={PID}" in msg and f"user={ME[:8]}" in msg
+    assert "SECRET" not in caplog.text and "input_value" not in caplog.text
+
+
+def test_valid_arguments_do_not_log_bad_arguments(monkeypatch, caplog):
+    def tool(project_id: str, drafts: list[dict], _user_id=None):
+        return {"ok": True}
+
+    with caplog.at_level(logging.INFO):
+        res = _call(monkeypatch, tool, {"project_id": PID, "drafts": DRAFTS}, via_server=True)["result"]
+    assert res.isError is False
+    assert not [r for r in caplog.records if "bad arguments" in r.getMessage()]
+

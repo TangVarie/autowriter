@@ -240,6 +240,22 @@ def _log_tool_failure(name: str, kwargs: dict, exc: BaseException, elapsed_ms: i
         logger.warning("mcp tool %s failed and the failure could not be logged", name)
 
 
+def _log_bad_arguments(name: str, arguments, cause) -> None:
+    """FastMCP 在调到 _wrap 之前就校验参数: 校验不过时 ``Tool.run`` 把 pydantic 的 ValidationError 包成 ToolError,
+    _wrap 根本没被调用, 上面那行痕也就没有(review on W-29: score_drafts 传 ``drafts: ["…"]``、漏 ``drafts``、
+    ``flywheel_arm: null`` 都是 isError 加零日志 —— 正是「存档悄悄没成」的那一类)。
+    只记字段路径和错误类型; ⚠️ 不记 ``str(cause)``: pydantic 的消息里带 ``input_value``, 就是稿子原文。"""
+    try:
+        pid, uid = _tool_log_fields(arguments if isinstance(arguments, dict) else {})
+        errs = cause.errors(include_input=False, include_url=False, include_context=False)
+        fields = ", ".join(f"{'.'.join(map(str, e.get('loc') or ()))}:{e.get('type')}" for e in errs[:10])
+        more = f" (+{len(errs) - 10})" if len(errs) > 10 else ""
+        logger.warning("mcp tool %s rejected bad arguments: %s%s (project=%s user=%s)",
+                       name, fields, more, pid, uid)
+    except Exception:  # noqa: BLE001
+        logger.warning("mcp tool %s rejected bad arguments (details could not be logged)", name)
+
+
 def _log_error_result(name: str, kwargs: dict, result) -> None:
     """工具没抛、但回的是现有的那两种"出错了"的形状: 顶层带非空 ``error``(_safe 的降级、认不出调用者)或
     ``status == "error"``(check_rules 读不出编译结果)。只记有这回事, 不记 error 的内容。"""
@@ -819,23 +835,37 @@ def _register_mcp():
     # 以及先核版本。协议正文的主副本在 skill 文件里(进系统提示), 这里
     # **不再**让模型每次去取全文 —— 2026-09-10 那版这么写过, 09-11 起入库率从
     # 110% 掉到 22%, 见 tools.get_protocol 的说明。不认这个字段的平台丢掉即可。
-    mcp = FastMCP(name="deskcore", stateless_http=True, json_response=True,
-                  streamable_http_path="/", transport_security=security,
-                  instructions=("deskcore 是 BYWOOD 小红书种草文案的写作台内核。"
-                                "只要用户要给任何品牌写或改小红书稿(哪怕没提写作台、只报了品牌名、只贴了 brief、"
-                                "只点了 human-writing), 都先走写作台: 不知道项目就 list_projects, 再 open_project "
-                                "拿简报, 拿到再写; 给一条笔记写评论走 comments_for(带链接), 不用 open_project。"
-                                "对话里出现 human-writing 时也核对一下: 写的是给品牌发的小红书内容, 就同时走写作台"
-                                "(human-writing 只管文笔)。"
-                                "协议正文在 bywood-writing-desk 这个 skill 里。"
-                                "对话开始时调一次 get_protocol, 带上 skill 里 "
-                                "protocol_version 那一行的值核对版本: 一致就照 skill "
-                                "执行; 不一致就照返回的正文执行并提醒用户重新导入 "
-                                "skill; 没装 skill 就不带参数调它拿全文。open_project / comments_for 每次带上 "
-                                "skill_version (同一个值)。稿子写完过了 check_drafts 就调 score_drafts "
-                                "(存档 + 参考分, 不拦), 不用等用户定稿, 也没有导出这一步。"
-                                "任何工具的返回里出现 skill_update, "
-                                "就把它的 message 原样放在给用户回复的最前面。"))
+    import pydantic
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    class _LoggedFastMCP(FastMCP):
+        # 参数校验不过的那条路不经过 _wrap(见 _log_bad_arguments)。FastMCP 的 _setup_handlers 绑的是
+        # self.call_tool, 在这里覆盖就能接住; 只记一行再原样抛, isError 的文本不变。
+        async def call_tool(self, name, arguments):
+            try:
+                return await super().call_tool(name, arguments)
+            except ToolError as exc:
+                if isinstance(exc.__cause__, pydantic.ValidationError):
+                    _log_bad_arguments(name, arguments, exc.__cause__)
+                raise
+
+    mcp = _LoggedFastMCP(name="deskcore", stateless_http=True, json_response=True,
+                         streamable_http_path="/", transport_security=security,
+                         instructions=("deskcore 是 BYWOOD 小红书种草文案的写作台内核。"
+                                       "只要用户要给任何品牌写或改小红书稿(哪怕没提写作台、只报了品牌名、只贴了 brief、"
+                                       "只点了 human-writing), 都先走写作台: 不知道项目就 list_projects, 再 open_project "
+                                       "拿简报, 拿到再写; 给一条笔记写评论走 comments_for(带链接), 不用 open_project。"
+                                       "对话里出现 human-writing 时也核对一下: 写的是给品牌发的小红书内容, 就同时走写作台"
+                                       "(human-writing 只管文笔)。"
+                                       "协议正文在 bywood-writing-desk 这个 skill 里。"
+                                       "对话开始时调一次 get_protocol, 带上 skill 里 "
+                                       "protocol_version 那一行的值核对版本: 一致就照 skill "
+                                       "执行; 不一致就照返回的正文执行并提醒用户重新导入 "
+                                       "skill; 没装 skill 就不带参数调它拿全文。open_project / comments_for 每次带上 "
+                                       "skill_version (同一个值)。稿子写完过了 check_drafts 就调 score_drafts "
+                                       "(存档 + 参考分, 不拦), 不用等用户定稿, 也没有导出这一步。"
+                                       "任何工具的返回里出现 skill_update, "
+                                       "就把它的 message 原样放在给用户回复的最前面。"))
 
     def _wrap(fn, needs_user: bool, name: str):
         # 把 _user_id 从签名里摘掉再注册 —— 模型不该看到它, 也不该能传它。

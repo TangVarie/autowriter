@@ -73,11 +73,14 @@ ANGLE_DEBT_DAYS = 7
 # open_project 和 draw_angles 是一起发出去的(06:32:32 已经发完牌, 06:32:43 简报才查账), 提醒到的时候牌早抽完了。
 # 窗口 1 天: 只管这一场还在写的牌; 更早挂着的由简报的 angle_debt(7 天)管。
 ARCHIVE_PENDING_DAYS = 1
-# 和 protocol.md「5. score_drafts」那段同一个口径: 查重通过 → 交给用户之前、同一轮里存档; 改过的稿子带 replaces_version_id。
+# 和 protocol.md「5. score_drafts」那段同一个口径: 查重通过 → 交给用户之前、同一轮里存档; 改的是已经存过的那篇 →
+# 直接 score_drafts 带 replaces_version_id。⚠️ 改存过的稿子**不能**先过 check_drafts: check_drafts 不认
+# replaces_version_id, 会拿它和自己存档的原版比, 必然 reject(只有 score_drafts 先摘旧版再查重)。整篇推翻、
+# 换角度重写的才当新稿, 走 check_drafts → score_drafts。
 ARCHIVE_PENDING_NEXT_STEP = (
     "查重通过的稿子, 交给用户之前就在同一轮里调 score_drafts 存档(每篇带 angle_key, 不等用户表态); "
-    "按反馈改写过的稿子也一样, 先重跑 check_drafts, 过了就同一轮调 score_drafts(改的是已经存过的那篇就带 "
-    "replaces_version_id), 存完再给用户看。")
+    "按反馈改的是已经存过的那篇, 就直接调 score_drafts 带 replaces_version_id(它会先摘掉旧版再查重, "
+    "不用先跑 check_drafts); 整篇推翻、换角度重写的当新稿, 先过 check_drafts 再存; 都存完再给用户看。")
 
 # 判定阈值与 angle_key 住在 fingerprint.py —— 那个模块只用标准库, 让 selftest
 # 能在不装 supabase/anthropic 的裸环境里跑(本模块顶层 import db, 拖整条依赖链)。

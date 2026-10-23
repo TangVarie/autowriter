@@ -201,11 +201,18 @@ def test_store_default_shape_is_unchanged_and_oldest_first_adds_one_key():
     assert oldest["oldest_drawn_at"] < newest["last_drawn_at"]
 
 
-def test_next_step_says_archive_before_showing_and_recheck_after_edits():
+def test_next_step_says_archive_before_showing_and_how_to_resave_edits():
     step = core.ARCHIVE_PENDING_NEXT_STEP
-    for must in ("score_drafts", "同一轮", "交给用户之前", "check_drafts", "replaces_version_id", "angle_key"):
+    for must in ("score_drafts", "同一轮", "交给用户之前", "replaces_version_id", "angle_key"):
         assert must in step, must
     assert step.count("。") == 1 and step.endswith("。"), "一句话"
+    # 改存过的那篇: 直接 score_drafts 带 replaces_version_id。叫它先跑 check_drafts 是错的 —— check_drafts 不认
+    # replaces_version_id, 拿改稿和它自己存档的原版比, 必然 reject(review on W-29)。
+    revise = step.split("replaces_version_id", 1)[0].rsplit(";", 1)[-1]
+    assert "已经存过" in revise and "score_drafts" in revise, revise
+    assert "先重跑 check_drafts" not in step and "不用先跑 check_drafts" in step
+    # 只有整篇重写的新稿才先过 check_drafts
+    assert "整篇推翻" in step and "先过 check_drafts" in step
 
 
 def test_open_project_debt_note_points_at_score_drafts(use):
