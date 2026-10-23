@@ -499,8 +499,8 @@ WorkBuddy 的 HTTP MCP 到底认不认自定义 header，官方只说了支持 H
 所以实际顺序是：**先部署（第 1 步，很便宜），部好立刻验协议（第 3 步的前半段），
 通了再往下走**。别把回填和铺开放在协议验证之前。
 
-key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是最后的退路，
-因为查询串会进访问日志且删不掉。
+key 支持两种传法（`X-Deskcore-Key` 头、`Authorization: Bearer`），见 `docs/deskcore.md` §4.3。
+`?key=` 查询参数 2026-10-23 起不收（W-09）：查询串会进访问日志且删不掉，一周计数没人在用。
 
 > 想在部署之前先摸一遍工具面：`uvicorn deskcore.app:app --port 8000` 本地起，
 > 打 `POST /tool/{name}`。但**这验不了 WorkBuddy 的协议**——那需要一个
@@ -736,7 +736,8 @@ WorkBuddy 支持从 GitHub 装 skill，用这条。手工复制那份**会悄悄
 
 | 客户端报什么 | 说明什么 | 怎么办 |
 |---|---|---|
-| `401 missing X-Deskcore-Key` | 请求到了服务器，只是没带 key | header 没生效 → 换 `Authorization: Bearer k-xxx`，再不行用 `<url>/mcp?key=k-xxx` |
+| `401 missing X-Deskcore-Key` | 请求到了服务器，只是没带 key | header 没生效 → 换 `Authorization: Bearer k-xxx`（`?key=` 10-23 起不收，W-09） |
+| `401 ?key= is no longer accepted` | 客户端还把 key 放在地址里 | 改成 `X-Deskcore-Key` 头或 `Authorization: Bearer`；这把 key 进过访问日志，当它半公开、换一把 |
 | `401 invalid X-Deskcore-Key` | key 抄错，或不在 `DESKCORE_KEYS` 里 | 对着 `/health` 的 `auth.note` 数一下几把 key |
 | 返回空列表（不报错） | key 通了但 `user_id` 配错 | 必须是库里已有的 `projects.owner_id`，编的 UUID **不报错只返空** |
 | `fetch failed` / `TypeError` | **请求根本没到服务器**，或到了但浏览器不让读 | 见下 |
