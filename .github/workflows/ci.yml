@@ -2604,13 +2604,15 @@ jobs:
           h = c.get("/health").json()
           assert h["config"]["auth"]["ok"] is True, h["config"]["auth"]
           print(f"  ✓ 正常配置 → /health auth.ok=true ({h['config']['auth']['note']})")
-          # 三种 key 传法都要认(WorkBuddy 能不能配自定义头没有权威文档, 留了退路)
+          # 两种 header 传法都要认; ?key= 10-23 起停收(W-09), 必须 401
           for desc, kw in (("X-Deskcore-Key 头", {"headers": {"X-Deskcore-Key": "k-good"}}),
-                           ("Authorization: Bearer", {"headers": {"Authorization": "Bearer k-good"}}),
-                           ("?key= 查询参数", {"params": {"key": "k-good"}})):
+                           ("Authorization: Bearer", {"headers": {"Authorization": "Bearer k-good"}})):
               r = c.post("/tool/list_projects", json={}, **kw)
               assert r.status_code != 401, f"{desc} 没被认出来: {r.status_code}"
               print(f"  ✓ {desc} 认得出(HTTP {r.status_code})")
+          r = c.post("/tool/list_projects", json={}, params={"key": "k-good"})
+          assert r.status_code == 401 and "no longer accepted" in r.text, (r.status_code, r.text)
+          print("  ✓ ?key= 查询参数 → 401(已停收)")
 
           # ── MCP 端点必须真的能握手 ────────────────────────────────────────
           # ⚠️ 这段才是重点。之前这一步只打 /health 和 /tool/, 于是漏掉了两个

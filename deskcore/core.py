@@ -6432,7 +6432,10 @@ def tv_resolve(client, note_id: str, *, ingest: bool) -> dict:
     maps = [m for m in store.tv_project_map(client) if m["tv_project_id"] == tv_project_id]
     target = next((m for m in maps if m.get("ingest_target")), None)
     if target is None:
-        raise ValueError(f"{tv_project_id} 没有补录目标 —— 先 tv-map add … --ingest-target")
+        # W-10 (D-119): 没有补录目标是有意的(RIO ×5 这类只判不入库), 不是配错 —— 说明白, 不抛错。
+        return {"note_id": note_id, "resolved": False, "ingest": None,
+                "note": (f"{tv_project_id} 只判不入库(映射里没有补录目标, D-119): 对不上的就留 unmatched, "
+                         "不用处理。真要补进指纹库, 先 tv-map add … --ingest-target 指一个写作台项目")}
     row = next((r for r in store.tv_notes(client, tv_project_id)
                 if str(r.get("note_id")) == note_id), None)
     if row is None:
@@ -6694,6 +6697,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             to_ingest.append(n)
 
     ingest: dict | None = None
+    unmatched_kept = 0                   # 没有补录目标、上次就是同样的 unmatched, 这次没重写(W-10)
     dup_of: dict[int, int] = {}          # to_ingest 下标 → 正文相同的第一条的下标
     if to_ingest and target is not None:
         # 先在整批里按 ingest 同一把尺子(开头哈希 + 四字串 sketch)去重, 再分块:
@@ -6776,7 +6780,15 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                                item_id=(item_of.get(vid) or {}).get("item_id") if vid else None,
                                candidates=why))
     else:
+        # W-10 (D-119): 没有补录目标的 TV 项目(RIO ×5)只判不入库, 对不上的留 unmatched。上次就记成
+        # 同样的 unmatched(没版本、没备注)的不再每晚重写一遍 —— RIO 782 行每晚只是刷一次 updated_at。
+        # 照样重新对一次(写作台存了新版本还能对上); 上次带备注的(比如"没正文")照写, 把旧备注换掉。
         for n in to_ingest:
+            prev = existing.get(n.note_id)
+            if (prev and prev.get("match_kind") == "unmatched" and not prev.get("version_id")
+                    and not prev.get("candidates")):
+                unmatched_kept += 1
+                continue
             links.append(_link(n, "unmatched"))
 
     written_links = 0
@@ -6807,7 +6819,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "ingest_target": target["project_id"] if target else None,
         "versions": len(versions), "notes": len(notes),
         "counts": counts, "matched": matched,
-        "ingest": ingest, "links_written": written_links,
+        "ingest": ingest, "links_written": written_links, "unmatched_kept": unmatched_kept,
         "tv_backfilled": backfilled, "write_tv": write_tv, "dry_run": dry_run,
         "ambiguous_samples": ambiguous_samples,
         "edit_diffs": edit_diffs,
@@ -6819,6 +6831,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                  + (f" → 补录 {ingest['minted']}/{ingest['to_write']}"
                     if ingest and not dry_run else
                     f" → 会补录 {ingest['to_write']}" if ingest else
-                    " → 没有补录目标, 只记 unmatched" if (to_ingest and target is None) else
+                    (" → 没有补录目标, 只记 unmatched"
+                     + (f"(其中 {unmatched_kept} 条上次就是 unmatched, 没重写)" if unmatched_kept else ""))
+                    if (to_ingest and target is None) else
                     " → 没有要补录的")),
     }

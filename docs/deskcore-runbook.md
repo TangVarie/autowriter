@@ -215,6 +215,11 @@ Variable Reference 引 deskcore 主服务的三个：`SUPABASE_URL` / `SUPABASE_
 `GOOGLE_API_KEY`（CLI 不读 `SUPABASE_ANON_KEY`，那是 Streamlit app 的）。增量：已对上的笔记跳过，
 `--rematch` 才重对。一个 TV 项目抛错（锁没等到、库错）不影响 `--all` 里后面的项目，退出码非零；
 补录某一块抛错时前面已对上的对照照样写，没处理到的记 `unmatched` + 原因、明晚重来。
+**没有补录目标的 TV 项目**（RIO ×5 这类只判不入库，D-119）：对不上的留 `unmatched`；上次就是同样的
+`unmatched`（没版本、没备注）的不再每晚重写一遍（W-10，2026-10-23；RIO 782 行原来每晚只刷一次
+`updated_at`），报表里记成「其中 N 条上次就是 unmatched，没重写」。每晚照样重新对一次，写作台后来存了
+对得上的版本照样会写。所以 `tv_note_links` 的 `max(updated_at)` 不能当 tv-sync 跑没跑的证据，看 cron 日志。
+对这类项目跑 `tv-resolve` 会说明「只判不入库」、退出码 1，对照不动。
 
 **为什么是 UTC 14:00（2026-10-08 从 04:00 挪过来）**：TV 的夜跑（飞书 → `truth_vault.notes`）
 cron 写的是 02:17 UTC，但 GitHub 定时实际 08:04–09:00 UTC 才起跑、跑 45–55 分钟；04:00 排在它
@@ -570,8 +575,8 @@ WorkBuddy 的 HTTP MCP 到底认不认自定义 header，官方只说了支持 H
 所以实际顺序是：**先部署（第 1 步，很便宜），部好立刻验协议（第 3 步的前半段），
 通了再往下走**。别把回填和铺开放在协议验证之前。
 
-key 支持三种传法，优先级见 `docs/deskcore.md` §4.3——`?key=` 是最后的退路，
-因为查询串会进访问日志且删不掉。
+key 支持两种传法（`X-Deskcore-Key` 头、`Authorization: Bearer`），见 `docs/deskcore.md` §4.3。
+`?key=` 查询参数 2026-10-23 起不收（W-09）：查询串会进访问日志且删不掉，一周计数没人在用。
 
 > 想在部署之前先摸一遍工具面：`uvicorn deskcore.app:app --port 8000` 本地起，
 > 打 `POST /tool/{name}`。但**这验不了 WorkBuddy 的协议**——那需要一个
@@ -807,7 +812,8 @@ WorkBuddy 支持从 GitHub 装 skill，用这条。手工复制那份**会悄悄
 
 | 客户端报什么 | 说明什么 | 怎么办 |
 |---|---|---|
-| `401 missing X-Deskcore-Key` | 请求到了服务器，只是没带 key | header 没生效 → 换 `Authorization: Bearer k-xxx`，再不行用 `<url>/mcp?key=k-xxx` |
+| `401 missing X-Deskcore-Key` | 请求到了服务器，只是没带 key | header 没生效 → 换 `Authorization: Bearer k-xxx`（`?key=` 10-23 起不收，W-09） |
+| `401 ?key= is no longer accepted` | 客户端还把 key 放在地址里 | 改成 `X-Deskcore-Key` 头或 `Authorization: Bearer`；这把 key 进过访问日志，当它半公开、换一把 |
 | `401 invalid X-Deskcore-Key` | key 抄错，或不在 `DESKCORE_KEYS` 里 | 对着 `/health` 的 `auth.note` 数一下几把 key |
 | 返回空列表（不报错） | key 通了但 `user_id` 配错 | 必须是库里已有的 `projects.owner_id`，编的 UUID **不报错只返空** |
 | `fetch failed` / `TypeError` | **请求根本没到服务器**，或到了但浏览器不让读 | 见下 |

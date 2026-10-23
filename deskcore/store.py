@@ -2205,7 +2205,7 @@ def tv_links(sb, tv_project_id: str) -> dict[str, dict]:
     def _build(off, lim):
         return (sb.table("tv_note_links")
                 .select("note_id, project_id, version_id, item_id, match_kind, "
-                        "score, lag_days, synced_to_tv_at")
+                        "score, lag_days, synced_to_tv_at, candidates")
                 .eq("tv_project_id", tv_project_id)
                 .order("note_id").range(off, off + lim - 1))
     return {r["note_id"]: r for r in _paged(_build)}
