@@ -1,7 +1,8 @@
 """W-09: /health 报各种 key 传法的请求数 —— 只报传法, 不报 key。
 
-?key= 会进访问日志和代理日志; 要决定什么时候不再收它, 得先知道还有多少
-客户端在用。/health 不鉴权, 所以这里同时钉住: 计数里没有 key 本身。
+?key= 会进访问日志和代理日志; 计数一周 query 都是 0 之后, 10-23 起不再收它。
+带 ?key= 而没有 header 的请求 401 并说清楚原因, 计数仍记一次 query。
+/health 不鉴权, 所以这里同时钉住: 计数里没有 key 本身。
 """
 
 from __future__ import annotations
@@ -27,13 +28,24 @@ def test_each_transport_is_counted_once_per_request(client):
     client.get("/tools", headers={"X-Deskcore-Key": KEY})
     client.get("/tools", headers={"Authorization": f"Bearer {KEY}"})
     client.get("/tools", headers={"Authorization": f"Bearer {KEY}"})
-    client.get(f"/tools?key={KEY}")
+    client.get(f"/tools?key={KEY}")                        # 被拒, 仍算一次 query
     client.get("/tools")                                   # 没带 key, 401 也算一次 none
     assert A.key_transport_counts() == {"header": 1, "bearer": 2, "query": 1, "none": 1}
 
 
+def test_query_key_is_rejected_with_a_reason_and_without_echoing_it(client):
+    r = client.get(f"/tools?key={KEY}")
+    assert r.status_code == 401
+    assert "no longer accepted" in r.json()["detail"]
+    assert KEY not in r.text
+    # 有效 key 放在 ?key= 也不行 —— 不是 key 错, 是传法不收
+    r = client.post(f"/tool/list_projects?key={KEY}", json={})
+    assert r.status_code == 401
+
+
 def test_header_wins_over_query_and_counts_as_header(client):
-    client.get(f"/tools?key={KEY}", headers={"X-Deskcore-Key": KEY})
+    r = client.get(f"/tools?key={KEY}", headers={"X-Deskcore-Key": KEY})
+    assert r.status_code != 401
     assert A.key_transport_counts() == {"header": 1, "bearer": 0, "query": 0, "none": 0}
 
 

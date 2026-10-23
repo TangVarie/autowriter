@@ -187,6 +187,61 @@ def test_without_an_ingest_target_unmatched_is_recorded_not_ingested():
     assert c.rows["draft_fingerprints"] == []
 
 
+def test_without_an_ingest_target_an_unchanged_unmatched_row_is_not_rewritten_every_night():
+    """W-10 (D-119): RIO ×5 这类只判不入库的映射, 对不上的 782 篇原来每晚重写一遍 unmatched(只刷 updated_at)。
+    上次就是同样的 unmatched 的不再写; 照样重新对一次, 写作台存了新版本照样能对上。"""
+    c = _client(NOTES, with_target=False)
+    first = core.tv_sync(c, TV)
+    assert first["links_written"] == 3 and first["unmatched_kept"] == 0
+    stamp = {l["note_id"]: l["updated_at"] for l in c.rows["tv_note_links"]}["n2"]
+
+    again = core.tv_sync(c, TV)
+    assert again["counts"]["unmatched"] == 1 and again["unmatched_kept"] == 1
+    assert again["links_written"] == 1, "只有 n3(TV 的 id 认不出, 没 version_id)照旧重写"
+    assert {l["note_id"]: l for l in c.rows["tv_note_links"]}["n2"]["updated_at"] == stamp
+    assert "1 条上次就是 unmatched, 没重写" in again["note"]
+
+    # 写作台后来存了一版一样的: 还是会对上、会写
+    c.rows["items"].append({"id": "i2", "batch_id": "b1", "best_version_id": "v2",
+                            "created_at": _iso(0), "user_id": ME, "status": "pending",
+                            "versions": [{"id": "v2", "title": "上周发的那篇", "body": BODY_NEW,
+                                          "version_num": 1, "created_at": _iso(0)}],
+                            "batches": {"project_id": P1}})
+    third = core.tv_sync(c, TV)
+    assert third["unmatched_kept"] == 0 and third["counts"]["body_exact"] == 1
+    assert {l["note_id"]: l for l in c.rows["tv_note_links"]}["n2"]["version_id"] == "v2"
+
+
+def test_without_an_ingest_target_a_note_that_got_its_body_drops_the_old_reason():
+    """上次是「没正文」(unmatched + 备注), 后来 TV 有了正文、还是对不上: 要重写, 把旧备注去掉 —— 不能当成没变跳过。"""
+    nid = "n7"
+    c = _client([{"note_id": nid, "raw_content": "【标题】只有标题", "publish_time": _iso(1),
+                  "tier": "趴", "created_at": _iso(1)}], with_target=False)
+    core.tv_sync(c, TV)
+    assert "没有正文" in c.rows["tv_note_links"][0]["candidates"][0]["note"]
+
+    c.rpc_impl["deskcore_tv_notes"] = lambda a: [_note(nid, "只有标题", BODY_NEW)] if a.get("_after") is None else []
+    out = core.tv_sync(c, TV)
+    assert out["unmatched_kept"] == 0 and out["links_written"] == 1
+    link = c.rows["tv_note_links"][0]
+    assert link["match_kind"] == "unmatched" and not link.get("candidates")
+
+
+def test_tv_resolve_on_a_project_without_ingest_target_explains_instead_of_raising(capsys, monkeypatch):
+    """W-10 (D-119): 只判不入库是有意的, tv-resolve 遇到时说明白、不抛错, 对照不动。"""
+    c = _client(NOTES, with_target=False)
+    core.tv_sync(c, TV)
+    before = dict({l["note_id"]: l for l in c.rows["tv_note_links"]}["n2"])
+    out = core.tv_resolve(c, "n2", ingest=True)
+    assert out["resolved"] is False and "只判不入库" in out["note"]
+    assert {l["note_id"]: l for l in c.rows["tv_note_links"]}["n2"] == before
+    assert len(c.rows["versions"]) == 1 and c.rows["draft_fingerprints"] == []
+
+    monkeypatch.setattr(core, "sb", lambda: c)
+    assert cli.main(["tv-resolve", "--note", "n2", "--ingest"]) == 1
+    assert "只判不入库" in capsys.readouterr().out
+
+
 def test_ambiguous_keeps_candidates_and_does_not_guess():
     c = _client([_note("n9", "同一个标题两版", "跟两版都不像的正文, 只有标题对得上, 凑够二十个字。")])
     c.rows["items"].append({"id": "i2", "batch_id": "b1", "best_version_id": "v2",

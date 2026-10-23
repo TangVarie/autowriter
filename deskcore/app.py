@@ -6,13 +6,15 @@
   3. CLI                        deskcore/cli.py      ← 本地 dry-run 与 selftest
 
 鉴权与身份 (X-Deskcore-Key → user_id, 见 identity.py):
-  key 支持三种传法, 优先级从高到低 ——
+  key 支持两种传法, 优先级从高到低 ——
     a) header  X-Deskcore-Key: <key>
     b) header  Authorization: Bearer <key>
-    c) query   ?key=<key>
-  三种都收是因为: WorkBuddy 的 HTTP MCP 能不能配自定义 header, 官方更新日志
-  只说了支持 HTTP MCP 和 OAuth, 没有权威文档。留 b/c 两条退路, 免得协议层
-  卡住整个方案。
+  原来还收 c) query ?key=<key>, 是怕 WorkBuddy 的 HTTP MCP 配不了自定义 header
+  (官方只说了支持 HTTP MCP 和 OAuth, 没有权威文档)。2026-10-23 停收 (W-09):
+  10-16 起两个部署的 /health 计数里 query 都是 0 (10-18 header 2,291; 10-20 部署
+  到 10-23 header 2,904、bearer 0), 没有客户端在用, 而查询串会进访问日志和
+  代理日志、事后删不掉。带 ?key= 而没有 header 的请求
+  现在直接 401 并说明要改用 header, 计数仍记一次 query, 好看出还有没有人在试。
 
 降级:
   读类工具出错 → 返回带 error 的可用结构 + 服务端 logger.exception 留痕。
@@ -124,7 +126,7 @@ _caller: contextvars.ContextVar[identity.Caller] = contextvars.ContextVar(
 
 
 # W-09: 按 key 传法计数(进程启动以来), 只记传法不记 key。?key= 会进访问日志和代理日志,
-# 要知道还有多少客户端在用它, 才好决定什么时候不再收。
+# 计数是为了决定什么时候不再收它; 10-23 起已不收, query 现在数的是被拒的请求。
 _KEY_TRANSPORT: collections.Counter = collections.Counter()
 _KEY_TRANSPORT_LOCK = threading.Lock()
 
@@ -148,9 +150,15 @@ def _extract_key(request: Request) -> str | None:
     if auth.lower().startswith("bearer "):
         _count_transport("bearer")
         return auth[7:].strip()
-    key = request.query_params.get("key")
-    _count_transport("query" if key else "none")
-    return key
+    if request.query_params.get("key"):
+        # 已停收 (W-09)。不退回成"没带 key": 那样报的是 missing, 看不出原因;
+        # 也不在日志里打 key。
+        _count_transport("query")
+        raise identity.AuthError(
+            "?key= is no longer accepted; send the key in the X-Deskcore-Key header "
+            "(or Authorization: Bearer)")
+    _count_transport("none")
+    return None
 
 
 def _call_tool(name: str, args: dict) -> object:
@@ -292,7 +300,7 @@ app.add_middleware(_NormalizeMcpPath)
 # "部署显示健康、功能整个不可用"(见 _lifespan 与 _register_mcp 里的两处)。
 #
 # allow_credentials 必须是 False:
-#   · 本服务的身份靠**显式传的 key**(header 或 ?key=), 从不靠 cookie。
+#   · 本服务的身份靠**显式传的 key**(header), 从不靠 cookie。
 #     浏览器不会自动附上 key, 所以恶意页面即使能发起请求也拿不到任何东西
 #     —— 没有 CSRF 面, 放开 origin 是安全的。
 #   · 而且开了 credentials 时浏览器【拒绝】通配的 Access-Control-Allow-Origin,
