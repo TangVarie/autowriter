@@ -292,6 +292,27 @@ def _desk_gap(user_id: str | None, project_id: str | None = None) -> dict | None
         return None
 
 
+def _archive_pending(user_id: str | None, project_id: str) -> dict | None:
+    """附加提醒(W-29): 调用者在这个项目上抽了还没存档的牌, 和下一步该做什么。查不到就不带 ——
+    不能把发牌 / 查重 / 记规则的结果弄坏(同 _desk_gap 的纪律)。"""
+    if not user_id or not project_id:
+        return None
+    try:
+        return core.archive_pending(core.sb(), project_id, user_id=user_id)
+    except Exception:  # noqa: BLE001 — 附加提醒, 任何错都只少这一段
+        logger.warning("archive_pending 查不到, 这次不带 (project=%s)", project_id, exc_info=True)
+        return None
+
+
+def _with_archive_pending(out: Any, user_id: str | None, project_id: str) -> Any:
+    """工具成功之后才调: 有没存档的牌就在返回值上加一个 ``archive_pending`` 键, 别的键一个不动。"""
+    if isinstance(out, dict) and "archive_pending" not in out:
+        block = _archive_pending(user_id, project_id)
+        if block:
+            out["archive_pending"] = block
+    return out
+
+
 def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
                  key_messages: str = "", target_audience: str = "",
                  tone: str = "", extra_instructions: str = "",
@@ -415,9 +436,11 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
     """
     # 故意不包 _safe: 发牌要写台账。写失败却报成功, 同一个角度下批还能再抽,
     # 跨批次唯一性的承诺就破了(而且没人看得见)。
-    return core.draw_angles(core.sb(), project_id, n,
+    out = core.draw_angles(core.sb(), project_id, n,
                  avoid_days=avoid_days, user_id=_user_id,
                  perpetual_bias=perpetual_bias)
+    # W-29: 发牌成功之后才查, 所以张数含这一批; 查不到就不带, 不影响发牌。
+    return _with_archive_pending(out, _user_id, project_id)
 
 
 def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
@@ -492,7 +515,9 @@ def check_drafts(project_id: str, drafts: list[dict],
     这个工具出错会直接报错而不是放行 —— 查重挂了必须停下来, 不能当作通过。
     """
     # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。
-    return core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id)
+    out = core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id)
+    # W-29: 判定之后才查; 查不到就不带, 判定结果原样回去。
+    return _with_archive_pending(out, _user_id, project_id)
 
 
 def ack_edit_digest(project_id: str, through: str, rules_recorded: int = 0,
@@ -924,12 +949,14 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
     # 故意不包 _safe: 这是【写】操作, 且写的可能是 hard 合规规则。写失败若
     # 报成功, 这条规则会静默缺席之后的每一份简报 —— 而用户以为已经记住了。
     try:
-        return core.record_rule(core.sb(), project_id, content,
-                                severity=severity, scope=scope, user_id=_user_id,
-                                applicability=applicability, check=check)
+        out = core.record_rule(core.sb(), project_id, content,
+                               severity=severity, scope=scope, user_id=_user_id,
+                               applicability=applicability, check=check)
     except core.rulecheck.CheckError as exc:
         # check 写错是参数问题(400), 不是服务坏了(500): 500 会让模型拿同一个 check 一直重试
         raise InvalidInput(f"check 写错了, 这条规则没记: {exc}") from exc
+    # W-29: 记规则多半是用户看了稿给的反馈, 改完的稿子同样要存档。规则写成之后才查, 查不到就不带。
+    return _with_archive_pending(out, _user_id, project_id)
 
 
 def record_edit(project_id: str, ai_title: str, ai_body: str,

@@ -66,6 +66,19 @@ MAX_NEGATIVE = 3
 # 与 TV 夜跑那盏灯 check_angle_ledger_leak.py 的默认窗口同口径。
 ANGLE_DEBT_DAYS = 7
 
+# 交付前没存档的牌(W-29, 2026-10-23)。10-20~10-22 途鸽五轮 73 张、百健士一轮 24 张牌全没存档: 每一轮 open_project /
+# draw_angles / 1~3 次 check_drafts 都回了 200, 然后调用方就不再调写作台了, score_drafts 一次都没到库。和 W-06 同一个
+# 形状(交付时模型没调存档), D-071 定过不设硬闸(不拦发牌、不拦交付), 所以把"存了档再给用户看"这句放进离交付最近的几个
+# 返回值里: draw_angles / check_drafts / record_rule(见 archive_pending)。简报的 angle_debt 管不到这里: 两轮里
+# open_project 和 draw_angles 是一起发出去的(06:32:32 已经发完牌, 06:32:43 简报才查账), 提醒到的时候牌早抽完了。
+# 窗口 1 天: 只管这一场还在写的牌; 更早挂着的由简报的 angle_debt(7 天)管。
+ARCHIVE_PENDING_DAYS = 1
+# 和 protocol.md「5. score_drafts」那段同一个口径: 查重通过 → 交给用户之前、同一轮里存档; 改过的稿子带 replaces_version_id。
+ARCHIVE_PENDING_NEXT_STEP = (
+    "查重通过的稿子, 交给用户之前就在同一轮里调 score_drafts 存档(每篇带 angle_key, 不等用户表态); "
+    "按反馈改写过的稿子也一样, 先重跑 check_drafts, 过了就同一轮调 score_drafts(改的是已经存过的那篇就带 "
+    "replaces_version_id), 存完再给用户看。")
+
 # 判定阈值与 angle_key 住在 fingerprint.py —— 那个模块只用标准库, 让 selftest
 # 能在不装 supabase/anthropic 的裸环境里跑(本模块顶层 import db, 拖整条依赖链)。
 angle_key = fp.angle_key
@@ -479,7 +492,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
             "而那种重复指纹闸抓不到。"
             + (f"坐标在 angle_debt.angles 里(列了 {len(shown)} 个"
                + (f", 还有 {more} 个没列" if more > 0 else "") + "), 接着写就按它们写, "
-               "写完照样每篇带 angle_key 提交。" if shown else ""))
+               "写完过了 check_drafts 就在同一轮里调 score_drafts 存档(每篇带 angle_key), 存完再给用户看。"
+               if shown else ""))
 
     # ── 最近发出去 / 写过的标题: 这一批要避开的东西(2026-10-20) ──────────────────────
     # 10-20 生产诊断: 稿子批批长得像、篇幅短, 飞书里大半被人重写。模型不知道这个项目上周发了什么、前天写了什么,
@@ -4451,6 +4465,28 @@ def desk_gaps(client, *, user_id: str | None, current_project_id: str | None = N
                          f"请在连着写作台的对话里写, 开头先说「打开{name}」, 写完让写作台打分(打分会顺手存档)。")
     return {"projects": [{k: v for k, v in it.items() if k != "project_ids"} for it in items],
             "message": "写作台提醒:\n" + "\n".join(lines), "task": DESK_GAP_TASK}
+
+
+def archive_pending(client, project_id: str, *, user_id: str | None) -> dict | None:
+    """调用者自己在这个项目近 ARCHIVE_PENDING_DAYS 天抽了、还没存档销账的牌(W-29)。有就回
+    ``{"cards": 张数, "oldest_drawn_at": 最早那张的发牌时间, "next_step": ARCHIVE_PENDING_NEXT_STEP}``, 没有回 None。
+
+    张数含这一次刚发的牌: 挂在 draw_angles 返回上时, 它就是在说"这一批写完要存档"; 比这一批更早的还挂着,
+    oldest_drawn_at 就早于这次发牌。同一次发牌的牌 drawn_at 都一样。
+
+    复用简报 angle_debt 那一条查询(store.angle_debt, 只取最早的一行 + 精确计数): 每次调用只多一次查询, 走
+    (project_id, drawn_at) 那个索引。只数 drawn_by = 调用者的行, 别人的牌、别的项目的牌都不算。
+    不过归属闸: 只被已过闸的 draw_angles / check_drafts / record_rule 在它们成功之后调(tools._archive_pending)。
+    查询失败时 store.angle_debt 自己留痕、回 0, 这里就回 None; 工具层再兜一层, 怎么都不会把工具结果弄坏。
+    """
+    if not user_id:
+        return None
+    debt = store.angle_debt(client, project_id, user_id, ARCHIVE_PENDING_DAYS, sample=1, oldest_first=True)
+    cards = int(debt.get("unconsumed") or 0)
+    if cards <= 0:
+        return None
+    return {"cards": cards, "oldest_drawn_at": debt.get("oldest_drawn_at"),
+            "next_step": ARCHIVE_PENDING_NEXT_STEP}
 
 
 def edit_digest(client, project_id: str, *, user_id: str | None = None,

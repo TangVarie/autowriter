@@ -50,6 +50,8 @@ import contextvars
 import logging
 import os
 import threading
+import time
+import traceback
 
 import anyio
 import anyio.to_thread
@@ -184,6 +186,70 @@ def _skill_probe(name: str, result):
     except Exception:  # noqa: BLE001
         logger.warning("skill 版本抽查失败 (tool=%s), 不影响返回", name, exc_info=True)
         return result
+
+
+# ── MCP 工具失败留痕(W-29, 2026-10-23) ─────────────────────────────────
+# MCP 的工具报错是 isError + HTTP 200: FastMCP 自己把异常收成错误结果, 服务端原来一行日志都没有。10-20~10-22 查
+# 「score_drafts 到底调了没有、是不是半路炸了」时, 能看的只有 edge 日志里那一串 200。_wrap 现在在异常上记一行再
+# **原样**抛出去(调用方看到的 isError 和原来一模一样): 工具名、project_id、调用者 user_id 前 8 位、异常类型
+# (+ PostgREST 的错误码)、耗时。
+# ⚠️ 不记异常消息、不记其它参数: 消息和参数里可能有稿子的标题 / 正文、规则原文; key 和请求头更不能进日志。
+#    堆栈只记帧(文件 / 行号 / 函数 / 源码行), 不带最后那行 "类型: 消息"。
+# REST 层映成 400/403/404/409 的那几类是正常拒绝, 记 warning、不带堆栈(同 rest_tool 的口径)。
+_EXPECTED_TOOL_ERRORS = (core.ProjectNotFound, core.IngestBusy, core.ProjectIsolationRejected,
+                         tools.InvalidInput, PermissionError)
+_TOOL_LOG_STACK_FRAMES = 15
+
+
+def _tool_log_fields(kwargs: dict) -> tuple[str, str]:
+    """(project_id, 调用者 user_id 前 8 位)。project_id 是调用方传的, 截短并去掉控制字符, 免得一行日志被拆成几行。"""
+    pid = kwargs.get("project_id") if isinstance(kwargs, dict) else None
+    pid = "".join(ch for ch in pid[:80] if ch.isprintable())[:40] if isinstance(pid, str) and pid else "-"
+    uid = (_caller.get().user_id or "")[:8] or "-"
+    return pid, uid
+
+
+def _exc_label(exc: BaseException) -> str:
+    """异常的类型名(带模块, 内置的不带) + PostgREST / 驱动给的错误码(有才带)。不碰异常消息。"""
+    t = type(exc)
+    label = t.__qualname__ if t.__module__ == "builtins" else f"{t.__module__}.{t.__qualname__}"
+    code = getattr(exc, "code", None)
+    if isinstance(code, (str, int)) and not isinstance(code, bool) and str(code).strip():
+        label += f" code={str(code)[:16]}"
+    return label
+
+
+def _log_tool_failure(name: str, kwargs: dict, exc: BaseException, elapsed_ms: int) -> None:
+    """工具抛了异常: 记一行(见上)。自己绝不抛 —— 留痕不能改变工具的行为。"""
+    try:
+        pid, uid = _tool_log_fields(kwargs)
+        label = _exc_label(exc)
+        if isinstance(exc, _EXPECTED_TOOL_ERRORS):
+            logger.warning("mcp tool %s refused: %s (project=%s user=%s %dms)",
+                           name, label, pid, uid, elapsed_ms)
+            return
+        if not isinstance(exc, Exception):
+            # 取消 / 进程退出: 多半是客户端断了或在重新部署, 工具线程可能还在跑。不是故障, 但要看得见调到了这里。
+            logger.warning("mcp tool %s interrupted: %s (project=%s user=%s %dms)",
+                           name, label, pid, uid, elapsed_ms)
+            return
+        stack = "".join(traceback.format_tb(exc.__traceback__, limit=-_TOOL_LOG_STACK_FRAMES))
+        logger.error("mcp tool %s failed: %s (project=%s user=%s %dms); 堆栈(不含异常消息):\n%s",
+                     name, label, pid, uid, elapsed_ms, stack.rstrip())
+    except Exception:  # noqa: BLE001
+        logger.warning("mcp tool %s failed and the failure could not be logged", name)
+
+
+def _log_error_result(name: str, kwargs: dict, result) -> None:
+    """工具没抛、但回的是现有的那两种"出错了"的形状: 顶层带非空 ``error``(_safe 的降级、认不出调用者)或
+    ``status == "error"``(check_rules 读不出编译结果)。只记有这回事, 不记 error 的内容。"""
+    try:
+        if not isinstance(result, dict) or not (result.get("error") or result.get("status") == "error"):
+            return
+        pid, uid = _tool_log_fields(kwargs)
+        logger.info("mcp tool %s returned an error-shaped result (project=%s user=%s)", name, pid, uid)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ⚠️ _mcp 必须在 app 之前建好: FastAPI 的 lifespan 要在构造时传进去, 而
@@ -784,7 +850,15 @@ def _register_mcp():
             kwargs.pop("_user_id", None)
             if needs_user:
                 kwargs["_user_id"] = _caller.get().user_id
-            return _skill_probe(name, await run_in_threadpool(fn, *args, **kwargs))
+            t0 = time.monotonic()
+            try:
+                result = await run_in_threadpool(fn, *args, **kwargs)
+            except BaseException as exc:
+                # W-29: 留一行痕再原样抛, FastMCP 照旧把它收成 isError(见 _log_tool_failure)。
+                _log_tool_failure(name, kwargs, exc, int((time.monotonic() - t0) * 1000))
+                raise
+            _log_error_result(name, kwargs, result)
+            return _skill_probe(name, result)
 
         wrapper.__signature__ = sig.replace(parameters=params)
         return wrapper

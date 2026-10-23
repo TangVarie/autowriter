@@ -136,7 +136,9 @@ def test_both_call_paths_run_the_probe():
     import inspect
     src = inspect.getsource(A)
     assert "return _skill_probe(name, fn(**kwargs))" in src, "REST 路径"
-    assert "return _skill_probe(name, await run_in_threadpool(fn, *args, **kwargs))" in src, "MCP 路径"
+    # MCP 路径(W-29 起先接住结果、失败留痕, 再过探针)
+    assert "result = await run_in_threadpool(fn, *args, **kwargs)" in src \
+        and "return _skill_probe(name, result)" in src, "MCP 路径"
 
 
 def test_health_reports_counts_but_not_who(monkeypatch):
