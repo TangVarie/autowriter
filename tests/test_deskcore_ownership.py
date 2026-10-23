@@ -207,6 +207,8 @@ UNGATED_WITH_REASON = {
                               "同 CLI compile-rules), 触发它的三个入口都已过闸",
     "_uncompiled_reason":     "check_rules 过了闸之后才调(10-20 复审), 只读这个项目的 tv_project_map 行数和进程内的补编状态, "
                               "拼一句「为什么还没有编译结果」",
+    "archive_pending":        "附加提醒(W-29, 10-23), 只被 tools 层在已过闸的 draw_angles / check_drafts / record_rule 成功之后调; "
+                              "只读 angle_ledger 里 drawn_by = 调用者的行(别人的牌不算), 只回张数和最早的发牌时间",
 }
 
 

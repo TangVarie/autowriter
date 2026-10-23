@@ -681,7 +681,7 @@ def item_owner(sb, item_id: str) -> str | None:
 ANGLE_DEBT_SAMPLE = 12
 
 def angle_debt(sb, project_id: str, user_id: str | None, days: int,
-               *, sample: int = ANGLE_DEBT_SAMPLE) -> dict:
+               *, sample: int = ANGLE_DEBT_SAMPLE, oldest_first: bool = False) -> dict:
     """这个人在这个项目里, 近 ``days`` 天抽了没写的角度: 个数 + 具体是哪几个。
 
     给 build_writing_brief 在每场对话开头回显用(D-071)。发牌台账上"抽了没销账"
@@ -700,8 +700,15 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
       · **要回带具体坐标**。新开一场对话时上一次 draw_angles 的返回早就不在上下文里,
         只报个数等于让模型"去写完你不知道是哪几个的角度" —— 它只能忽略, 或者再抽一批,
         恰好是这条提醒要防的事。所以带最近 ``sample`` 个 angle_key + dims 回去。
+
+    ``oldest_first=True`` (W-29, 2026-10-23, 给 core.archive_pending 用): 同一条查询按 drawn_at 从早到晚取,
+    多回一个 ``oldest_drawn_at`` = 还挂着的牌里最早那张是哪会儿抽的; 这时 ``last_drawn_at`` 不填(取回来的是最早的
+    几行, 最近一次是哪会儿这一次不知道), ``angles`` 是最早的那几个。默认(从晚到早)的返回形状一个键都不变 ——
+    简报原样回显它。
     """
     out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None, "angles": []}
+    if oldest_first:
+        out["oldest_drawn_at"] = None
     if not user_id:
         return out
 
@@ -712,7 +719,7 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
                  .eq("project_id", project_id).eq("drawn_by", user_id)
                  .is_("consumed_version_id", "null")
                  .gte("drawn_at", iso_ago(days))
-                 .order("drawn_at", desc=True)
+                 .order("drawn_at", desc=not oldest_first)
                  .range(0, max(sample, 1) - 1).execute())
     except Exception:
         logger.exception("read angle debt failed (project=%s)", project_id)
@@ -721,7 +728,7 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     total = res.count if res.count is not None else len(rows)
     out["unconsumed"] = int(total)
     if rows:
-        out["last_drawn_at"] = rows[0].get("drawn_at")
+        out["oldest_drawn_at" if oldest_first else "last_drawn_at"] = rows[0].get("drawn_at")
         out["angles"] = [{"angle_key": r.get("angle_key"), "dims": r.get("dims")}
                          for r in rows]
     return out
