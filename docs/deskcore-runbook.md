@@ -215,6 +215,11 @@ Variable Reference 引 deskcore 主服务的三个：`SUPABASE_URL` / `SUPABASE_
 `GOOGLE_API_KEY`（CLI 不读 `SUPABASE_ANON_KEY`，那是 Streamlit app 的）。增量：已对上的笔记跳过，
 `--rematch` 才重对。一个 TV 项目抛错（锁没等到、库错）不影响 `--all` 里后面的项目，退出码非零；
 补录某一块抛错时前面已对上的对照照样写，没处理到的记 `unmatched` + 原因、明晚重来。
+**没有补录目标的 TV 项目**（RIO ×5 这类只判不入库，D-119）：对不上的留 `unmatched`；上次就是同样的
+`unmatched`（没版本、没备注）的不再每晚重写一遍（W-10，2026-10-23；RIO 782 行原来每晚只刷一次
+`updated_at`），报表里记成「其中 N 条上次就是 unmatched，没重写」。每晚照样重新对一次，写作台后来存了
+对得上的版本照样会写。所以 `tv_note_links` 的 `max(updated_at)` 不能当 tv-sync 跑没跑的证据，看 cron 日志。
+对这类项目跑 `tv-resolve` 会说明「只判不入库」、退出码 1，对照不动。
 
 **为什么是 UTC 14:00（2026-10-08 从 04:00 挪过来）**：TV 的夜跑（飞书 → `truth_vault.notes`）
 cron 写的是 02:17 UTC，但 GitHub 定时实际 08:04–09:00 UTC 才起跑、跑 45–55 分钟；04:00 排在它
