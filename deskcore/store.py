@@ -2336,6 +2336,21 @@ def tv_notes_by_link_token(sb, token: str, *, accept=None) -> list[dict]:
     return []
 
 
+def tv_vanished_note_ids(sb, note_ids: list[str]) -> set[str]:
+    """这几条里哪些在 TV 的 ``truth_vault.v_notes_vanished``: 飞书里删了、或挪去别的表, TV 那一行还留着(D-103)。
+
+    给 core._note_from_link 用: 运营把帖子挪表之后, 同一条链接在 TV 里会有两行(旧项目已删的那行 + 新项目的那行),
+    不能让已删的那行定项目(2026-10-26 BJS_phase1 → BJS_phase2, I-22)。service_role 有这张视图的 SELECT(10-26 核过)。
+    不吞异常, 读不到时调用方自己决定怎么退。"""
+    ids = sorted({str(i) for i in note_ids if i})
+    out: set[str] = set()
+    for i in range(0, len(ids), 100):
+        rows = (sb.schema("truth_vault").table("v_notes_vanished").select("note_id")
+                .in_("note_id", ids[i:i + 100]).execute()).data or []
+        out.update(str(r["note_id"]) for r in rows if r.get("note_id"))
+    return out
+
+
 def tv_note_comments(sb, note_id: str, limit: int = TV_COMMENTS_MAX) -> list[dict]:
     """这条笔记在 TV 里的评论, 按评论顺序。"""
     return list((sb.schema("truth_vault").table("comments")

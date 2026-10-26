@@ -236,6 +236,9 @@ def main() -> int:
     # ── ①″ 再给它一个【有】truth_vault 的库: 读得到、回填只填 NULL 的行 ──
     # 只建 notes 里两个函数碰到的那几列 —— 这不是 TV 的 schema, 只是让守卫之外
     # 那条真正的路径也跑一次(动态 SQL 在 CREATE 时不解析, 拼错列名只会在这里炸)。
+    # last_seen_* 往后那几列和 flywheel_lesson_annotations 是 TV 的 v_notes_vanished 视图要读的
+    # (016 用它; 视图在 _check_tv_notes_skip_vanished 里才建), 类型照生产库; 默认 NULL, 上面
+    # 这几条断言不受影响。
     run_sql_text("""
         DROP SCHEMA IF EXISTS truth_vault CASCADE;
         CREATE SCHEMA truth_vault;
@@ -243,7 +246,11 @@ def main() -> int:
             note_id TEXT PRIMARY KEY, project_id TEXT, publish_time TIMESTAMP,
             tier TEXT, raw_content TEXT, title TEXT, body TEXT,
             source_autowriter_item_id UUID, source_autowriter_version_id UUID,
-            created_at TIMESTAMP DEFAULT now());
+            created_at TIMESTAMP DEFAULT now(),
+            publish_url TEXT, last_seen_run_id TEXT, last_seen_at TIMESTAMPTZ,
+            synced_to_ssll_at TIMESTAMP, synced_to_aw_at TIMESTAMP,
+            essence_annotated_at TIMESTAMP);
+        CREATE TABLE truth_vault.flywheel_lesson_annotations (note_id TEXT);
         INSERT INTO truth_vault.notes (note_id, project_id, publish_time, tier, raw_content)
         VALUES ('a', 'SPX_phase1', '2026-09-10 08:00', '爆', '【标题】甲 【正文】正文甲'),
                ('b', 'SPX_phase1', '2026-09-11 08:00', '趴', '【标题】乙 【正文】正文乙'),
@@ -283,6 +290,9 @@ def main() -> int:
     # 迁移链上跑 011 时还没有 truth_vault(它只打 NOTICE 跳过), 所以视图的 SQL 在那一遍
     # 里根本没被解析过 —— 拼错列名只会在这里炸。
     bad += _check_angle_outcomes_view()
+
+    # ── ①⁗' 016: 飞书里已删的篇(TV 的 v_notes_vanished)不再读给 tv-sync ──
+    bad += _check_tv_notes_skip_vanished()
 
     run_sql_text("DROP SCHEMA truth_vault CASCADE;", "truth_vault 替身清理")
 
@@ -628,6 +638,125 @@ def _check_angle_outcomes_view() -> int:
         print("  ✓ 011 的视图: 连跑两遍幂等; 只列用掉的坐标、没对上的留 NULL、ingested 不认; "
               "service_role(无 BYPASSRLS)读得到, anon/authenticated 读不了; "
               "非属主来建当场报错, 不留安静的空视图")
+    return bad
+
+
+# TV 的视图, 从 truth-vault 仓 schemas/notes_v1_21_vanished_notes.sql 逐字照抄(D-103)。2026-10-26 核过生产库
+# pg_get_viewdef 是同一条。TV 改了判据要跟着改这里, 不然这里验的是一个生产库上已经不存在的口径。
+_TV_VANISHED_VIEW = """
+CREATE OR REPLACE VIEW truth_vault.v_notes_vanished AS
+WITH latest AS (
+    SELECT DISTINCT ON (project_id)
+        project_id,
+        last_seen_run_id AS latest_run_id,
+        last_seen_at     AS latest_seen_at
+    FROM truth_vault.notes
+    WHERE last_seen_run_id IS NOT NULL
+    ORDER BY project_id, last_seen_at DESC
+)
+SELECT
+    n.note_id,
+    n.project_id,
+    n.tier,
+    n.publish_url,
+    n.last_seen_run_id,
+    n.last_seen_at,
+    l.latest_run_id,
+    l.latest_seen_at,
+    n.synced_to_ssll_at,
+    n.synced_to_aw_at,
+    n.essence_annotated_at,
+    EXISTS (SELECT 1 FROM truth_vault.flywheel_lesson_annotations c WHERE c.note_id = n.note_id) AS has_lesson_card
+FROM truth_vault.notes n
+JOIN latest l ON l.project_id = n.project_id
+WHERE n.last_seen_run_id IS NOT NULL
+  AND n.last_seen_run_id <> l.latest_run_id;
+"""
+
+
+def _check_tv_notes_skip_vanished() -> int:
+    """016: ``deskcore_tv_notes`` 不再返回飞书里已删的篇(TV 的 ``v_notes_vanished``)。
+
+    为什么要它(2026-10-26, I-22): 运营把 79 篇成人藻油从 BJS_phase1 的飞书表挪去新表, TV 那 79 行留着、进了
+    ``v_notes_vanished``。009 版的 RPC 照样把它们读给 tv-sync —— 其中 14 篇对不上, BJS_phase1 的补录目标一改回
+    true, 下一晚就被当成新稿补录进儿童藻油那个写作台项目。HATHERINE_phase1 已经在每晚重写 6 条这样的
+    unmatched。调用时 truth_vault 替身(notes: a / b 在 SPX_phase1, c 在 OTHER, 已开 RLS)还在。验:
+
+      1. 视图不在(TV 还没建 / 新库): 照旧全给 —— 守卫只加不减;
+      2. 视图在: 飞书删了的(盖过戳、不是本项目最近一次完整同步)不给; 从没盖过戳的照给(TV 口径: 那是没经历过
+         完整同步, 不是消失);
+      3. keyset 翻页: 删了的那篇不占一页的名额、也不让翻页提前停(tv-sync 靠"不满一页"收工);
+      4. 按**本项目**最近一次完整同步判: 别的项目跑得更晚, 不会把这个项目的篇判成消失;
+      5. 以 service_role(无 BYPASSRLS)调: SECURITY DEFINER 那条路穿过 notes 的 RLS 和视图; GRANT / REVOKE 在
+         CREATE OR REPLACE 之后还在;
+      6. 视图在的时候再跑一遍 016: 幂等, 结果不变。
+    """
+    bad = 0
+
+    def got(args: str) -> str:
+        return sql("SELECT coalesce(string_agg(note_id, ',' ORDER BY note_id), '') "
+                   f"FROM autowriter.deskcore_tv_notes({args});")
+
+    def expect(args: str, want: str, why: str) -> None:
+        nonlocal bad
+        g = got(args)
+        if g != want:
+            print(f"  [FAIL] 016 · {why}: deskcore_tv_notes({args}) 期望 {want!r}, 得到 {g!r}")
+            bad += 1
+
+    # SPX_phase1 最近一次完整同步是 r2(10-25): a 在里面 → 活的; b 只在 r1(10-20)里 → 飞书删了;
+    # e 没盖过戳 → 不算消失。OTHER 最近一次是 r9(10-26, 比 SPX 的晚): c 活的, d 删了。
+    sql("UPDATE truth_vault.notes SET last_seen_run_id = 'r2', last_seen_at = '2026-10-25 08:00+00' "
+        " WHERE note_id = 'a';"
+        "UPDATE truth_vault.notes SET last_seen_run_id = 'r1', last_seen_at = '2026-10-20 08:00+00' "
+        " WHERE note_id = 'b';"
+        "UPDATE truth_vault.notes SET last_seen_run_id = 'r9', last_seen_at = '2026-10-26 08:00+00' "
+        " WHERE note_id = 'c';"
+        "INSERT INTO truth_vault.notes (note_id, project_id, raw_content, last_seen_run_id, last_seen_at) "
+        "VALUES ('d', 'OTHER', 'x', 'r8', '2026-10-21 08:00+00'), "
+        "       ('e', 'SPX_phase1', '【标题】戊 【正文】正文戊', NULL, NULL);")
+
+    expect("'SPX_phase1', NULL, NULL, 10", "a,b,e", "视图不在时照旧全给")
+
+    run_sql_text(_TV_VANISHED_VIEW, "truth_vault.v_notes_vanished 替身(TV notes_v1_21 原文)")
+    vanished = sql("SELECT string_agg(note_id, ',' ORDER BY note_id) FROM truth_vault.v_notes_vanished;")
+    if vanished != "b,d":
+        print(f"  [FAIL] 016 · 替身前提不对: v_notes_vanished 该是 b,d, 得到 {vanished!r}")
+        bad += 1
+
+    expect("'SPX_phase1', NULL, NULL, 10", "a,e", "飞书删了的(b)不给, 没盖过戳的(e)照给")
+    expect("'SPX_phase1', NULL, NULL, 1", "a", "翻页第 1 页")
+    expect("'SPX_phase1', NULL, 'a', 1", "e", "翻页第 2 页: 删了的 b 不占名额")
+    expect("'SPX_phase1', NULL, 'e', 1", "", "翻页第 3 页: 到头")
+    expect("'OTHER', NULL, NULL, 10", "c", "OTHER 删了的(d)不给")
+    expect("'SPX_phase1', '2100-01-01', NULL, 10", "", "_since 照旧生效")
+
+    sql("GRANT USAGE ON SCHEMA autowriter TO service_role;")
+    r = subprocess.run(_psql() + ["-tAc", "SET ROLE service_role; SELECT coalesce(string_agg(note_id, ',' "
+                                  "ORDER BY note_id), '') FROM autowriter.deskcore_tv_notes('SPX_phase1', "
+                                  "NULL, NULL, 10);"], capture_output=True, text=True)
+    g = (r.stdout.strip().splitlines() or [""])[-1] if r.returncode == 0 else r.stderr.strip()[-200:]
+    if g != "a,e":
+        print(f"  [FAIL] 016 · service_role 调 deskcore_tv_notes 得到 {g!r}(应为 'a,e')")
+        bad += 1
+    sig = "'autowriter.deskcore_tv_notes(text, timestamptz, text, integer)'"
+    for role, want_priv in (("service_role", "t"), ("anon", "f"), ("authenticated", "f")):
+        g = sql(f"SELECT has_function_privilege('{role}', {sig}, 'EXECUTE');")
+        if g != want_priv:
+            print(f"  [FAIL] 016 · {role} 对 deskcore_tv_notes 的 EXECUTE 是 {g!r}(应为 {want_priv!r})")
+            bad += 1
+
+    f = REPO / "migrations" / "016_tv_notes_skip_vanished.sql"
+    if not f.exists():
+        print(f"  [FAIL] 016 · {f.name} 不在")
+        bad += 1
+    else:
+        run_sql_text(_shim(f.read_text(encoding="utf-8")), "016(视图在, 再跑一遍)")
+        expect("'SPX_phase1', NULL, NULL, 10", "a,e", "视图在时重跑 016 之后")
+
+    if not bad:
+        print("  ✓ 016: 视图不在照旧全给; 视图在时飞书删了的不给、没盖过戳的照给; 翻页不被删了的篇占名额; "
+              "按本项目最近一次完整同步判; service_role 调得通、anon/authenticated 调不了; 重跑幂等")
     return bad
 
 

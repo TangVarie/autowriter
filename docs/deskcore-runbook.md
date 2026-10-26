@@ -220,6 +220,7 @@ Variable Reference 引 deskcore 主服务的三个：`SUPABASE_URL` / `SUPABASE_
 `updated_at`），报表里记成「其中 N 条上次就是 unmatched，没重写」。每晚照样重新对一次，写作台后来存了
 对得上的版本照样会写。所以 `tv_note_links` 的 `max(updated_at)` 不能当 tv-sync 跑没跑的证据，看 cron 日志。
 对这类项目跑 `tv-resolve` 会说明「只判不入库」、退出码 1，对照不动。
+**飞书里已删的篇**（TV 的 `v_notes_vanished`）`016` 起 tv-sync 读不到：不重对、不补录，已有的对照一行不动；对它跑 `tv-resolve` 报「TV 里没有」。见 §1.12。
 
 **为什么是 UTC 14:00（2026-10-08 从 04:00 挪过来）**：TV 的夜跑（飞书 → `truth_vault.notes`）
 cron 写的是 02:17 UTC，但 GitHub 定时实际 08:04–09:00 UTC 才起跑、跑 45–55 分钟；04:00 排在它
@@ -294,6 +295,75 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `dashboard_views_v1.sql`），理由写在迁移文件头。验收：`doctor` 里「视图 v_angle_outcomes」applied；
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
+
+### 1.12 `016_tv_notes_skip_vanished` —— tv-sync 不再读飞书里已删的篇（2026-10-26，I-22，**生产库尚未执行**）
+
+TV 的 `truth_vault.notes` 只增不删：飞书里删掉或挪去别的表的篇，TV 那一行留着，进 `truth_vault.v_notes_vanished`（D-103）。
+009 版的 `deskcore_tv_notes` 不看这张视图，tv-sync 每晚把它们照样读回来重对：有补录目标时对不上的会被补录成副本，没有时每晚
+重写一遍 unmatched（HATHERINE_phase1 6 条，每晚 14:00 UTC）。10-26 运营把 79 篇成人藻油从 BJS_phase1 的飞书表挪到新表
+（TV 记为 BJS_phase2），BJS_phase1 那 79 行进了视图，其中 14 篇是 unmatched、有正文。016 让 RPC 不返回视图里的篇；
+签名不变，Python 不改，删了的篇已有的 `tv_note_links` 一行不动。
+
+**顺序。** ① SQL Editor（`postgres`，函数属主）跑 `016`。代码不依赖它，先后于部署都行。② 验收（SQL Editor）：
+
+```sql
+-- 两列都该是 true(doctor 报 unprobeable 时给的就是这句)
+select p.prosrc like '%v_notes_vanished%' as skips_vanished,
+       to_regclass('truth_vault.v_notes_vanished') is not null as view_present
+  from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+ where n.nspname = 'autowriter' and p.proname = 'deskcore_tv_notes';
+-- 授权没丢: true / false
+select has_function_privilege('service_role', 'autowriter.deskcore_tv_notes(text,timestamptz,text,integer)', 'EXECUTE'),
+       has_function_privilege('anon', 'autowriter.deskcore_tv_notes(text,timestamptz,text,integer)', 'EXECUTE');
+-- 读出来的里面没有已删的篇: 必须是 0(各项目的行数随 TV 同步变, 只看这个 0)
+select count(*) from autowriter.deskcore_tv_notes('BJS_phase1', null, null, 1000) t
+  join truth_vault.v_notes_vanished v using (note_id);
+```
+
+第二晚 cron 之后：`select max(l.updated_at) from autowriter.tv_note_links l join truth_vault.v_notes_vanished v using (note_id) where l.match_kind = 'unmatched'`
+不再往前走（HATHERINE_phase1 那 6 条不再被重写）。
+
+③ **016 验收过了，才能打开有已删篇的 TV 项目的补录目标**（10-26：BJS_phase1 → `efe112d3`，10-23 暂时关的）。打开前再查一次，
+这就是下一晚会被补录的篇数，必须是 0：
+
+```sql
+select count(*) from autowriter.deskcore_tv_notes('BJS_phase1', null, null, 1000) t
+  left join autowriter.tv_note_links l using (note_id)
+ where l.version_id is null;
+```
+
+打开之后的下一晚：`select count(*) from autowriter.tv_note_links l join truth_vault.v_notes_vanished v using (note_id) where l.match_kind = 'ingested' and l.updated_at > now() - interval '1 day'` 是 0。
+
+**不要删**旧项目里已删篇的对照和副本（BJS_phase1 那 79 条对照、`efe112d3` 里 25 份补录副本）：TV 的
+`check_angle_ledger_leak` 只靠 `match_kind = 'ingested'` 认副本，删了对照，副本就像真稿；已对上的对照带着已经回填进 TV 的血缘；
+016 之后那 14 条 unmatched 不再被读，无害。
+
+**新表那一边（BJS_phase2）** 是数据，不是迁移（本仓的 `tv_project_map` 从来不在迁移里种，一律 `tv-map add` 或 SQL Editor）：
+成人藻油的写作台项目 `89d3e7aa-ec89-4e70-b28f-89abfefcbb9d` 当补录目标；10-21 之前的成人稿写在 `efe112d3`，所以它也挂一行、
+**不带** `--ingest-target`，只参与对照。`465c66dd` 不挂（79 篇一篇都没对上它）。TV 先接上 BJS_phase2（映射合并、`truth_vault.projects`
+有一行、首次同步），tv-sync 下一晚才有东西对。
+
+```bash
+python -m deskcore.cli tv-map add --tv-project BJS_phase2 --project efe112d3-7736-4346-8894-db5e75904248
+python -m deskcore.cli tv-map add --tv-project BJS_phase2 --project 89d3e7aa-ec89-4e70-b28f-89abfefcbb9d --ingest-target
+python -m deskcore.cli tv-sync --tv-project BJS_phase2 --dry-run     # 先看数: 最多 40 篇对上 efe112d3 里的原稿, 其余有正文的补录进 89d3e7aa
+```
+
+手边没有能跑 CLI 的环境（dry-run 跑不了）时换个检查点：两行先都不带补录目标（SQL Editor 里 `ingest_target = false` 插两行），
+看一晚 `select match_kind, project_id, count(*) from autowriter.tv_note_links where tv_project_id = 'BJS_phase2' group by 1, 2` ——
+对上的都该指向 `efe112d3`、`ingested` 是 0；再把 `89d3e7aa` 那一行改成 true。
+
+以前在 BJS_phase1 下补录的那 25 篇不会对上旧副本（副本不进对照索引，A-02），会在 `89d3e7aa` 里再补录一份；旧副本留在 `efe112d3`。
+这几个数都是**上限**：新表 Preflight 读到 76 行、有正文 70 行，而 BJS_phase1 挪走的旧行是 79 行（26 行没有发布时间和链接），
+至少 9 行在新表里没有对应，「40 篇对上 / 25 篇再补录」只算挪进新表、正文没大改的那些（TV 侧配对见 TV OPEN-ITEMS I-22 ②）。
+
+**评论按链接找帖（`comments_for` / `score_comments`）不走这个 RPC**，直读 `truth_vault.notes`，016 管不到。同一分支（I-22）里
+`core._note_from_link` 先查 `truth_vault.v_notes_vanished`（`store.tv_vanished_note_ids`）：同一条链接有活的一行就用活的那行；
+只剩已删的那行时照样用它定项目和取已有评论，回包带 `tv_note_vanished: true` 和一句说明；写手给的 `project_id` 不在那行旧项目的
+映射里时不再 403，当作链接没找到、走贴正文那条路（照样过归属闸，旧行内容不回）；视图读不到时按原来的办法取（记 ERROR 日志）。
+这是代码改动，**随部署生效，不依赖 016**。为什么要改：挪表后同一条链接在 TV 里两行、发布时间相同，原来按 note_id 取第一行，
+`BJS_phase1_…` 排在 `BJS_phase2_…` 前面，写手在成人项目 `89d3e7aa` 下给这 79 篇里任何一篇写评论都会 403，不给项目则落到儿童项目、
+用它的评论规则。部署之前，给这几篇写评论请贴正文 + `project_id`、不带链接。
 
 ### 1.11 `015_rule_compiles` —— 规则编译结果的缓存 + `compile-rules`（2026-10-20，D-121，**生产库尚未执行**）
 
