@@ -447,3 +447,91 @@ def test_an_ingested_link_is_not_a_direction():
     c.rows["tv_note_links"][0]["match_kind"] = "ingested"
     out = core.comments_for(c, user_id=ME, link=LINK)
     assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+
+
+# ── 挪表之后同一条链接两行: 已删的那行让位给活的那行(2026-10-26, I-22) ─────────────────────────────
+# 运营把成人藻油从 BJS_phase1 的飞书表挪去新表(TV 记为 BJS_phase2): 旧行进 truth_vault.v_notes_vanished, 新行同链接、
+# 同发布时间(两张表同一套列)。排序只剩 note_id, BJS_phase1_… 排在前面 —— 不让位的话写手给成人项目也会 403。
+ADULT_LINK = "https://www.xiaohongshu.com/explore/6900aaaa0000000007030eb7"
+CHILD_TV, ADULT_TV = "BJS_phase1", "BJS_phase2"
+
+
+def _moved_client(*, twin=True, maps=None):
+    old = dict(NOTE, note_id=f"{CHILD_TV}_recA", project_id=CHILD_TV, publish_url=ADULT_LINK,
+               publish_time="2026-10-20T16:00:00")
+    notes = [old] + ([dict(old, note_id=f"{ADULT_TV}_recB", project_id=ADULT_TV)] if twin else [])
+    c = _tv_client(notes=notes, comments=[], maps=maps if maps is not None else [
+        {"tv_project_id": CHILD_TV, "project_id": THIRD_PROJ, "ingest_target": False},
+        {"tv_project_id": ADULT_TV, "project_id": PROJ, "ingest_target": True}])
+    c.rows["projects"].append({"id": THIRD_PROJ, "name": "儿童藻油", "brand": "百健士", "owner_id": ME,
+                               "calibration_notes": "", "tactics": "[]", "custom_roles": []})
+    c._tv.rows["v_notes_vanished"] = [{"note_id": old["note_id"], "project_id": CHILD_TV}]
+    return c
+
+
+def test_a_moved_post_resolves_to_its_live_twin_not_the_vanished_row():
+    c = _moved_client()
+    out = core.comments_for(c, user_id=ME, link=ADULT_LINK, project_id=PROJ)     # 旧代码: PermissionError
+    assert out["resolved"] is True and out["note_id"] == f"{ADULT_TV}_recB" and out["project_id"] == PROJ
+    assert "tv_note_vanished" not in out
+    out = core.comments_for(c, user_id=ME, link=ADULT_LINK)
+    assert out["note_id"] == f"{ADULT_TV}_recB" and out["project_id"] == PROJ, "不给项目时也按活的那行定项目"
+
+
+def test_only_a_vanished_row_is_used_but_said_to_be_old():
+    c = _moved_client(twin=False)
+    out = core.comments_for(c, user_id=ME, link=ADULT_LINK)
+    assert out["resolved"] is True and out["note_id"] == f"{CHILD_TV}_recA" and out["project_id"] == THIRD_PROJ
+    assert out["tv_note_vanished"] is True and "已删" in out["tv_note_vanished_note"]
+
+
+def test_a_vanished_row_does_not_block_the_pasted_path():
+    c = _moved_client(twin=False)
+    out = core.comments_for(c, user_id=ME, link=ADULT_LINK, project_id=PROJ)
+    assert out["resolved"] is False and "帖子的标题和正文" in out["need"] and "已删" in out["note"]
+    assert NOTE["title"] not in str(out), "旧行的内容不回"
+    out = core.comments_for(c, user_id=ME, link=ADULT_LINK, project_id=PROJ, post_body="贴过来的正文")
+    assert out["resolved"] is True and out["source"] == "pasted" and out["project_id"] == PROJ
+    assert "note_id" not in out and out["existing_comments"] == []
+
+
+def test_a_vanished_row_still_goes_through_the_ownership_gate():
+    c = _moved_client(twin=False)
+    c.rows["projects"].append({"id": OTHER_PROJ, "name": "别人的", "owner_id": "someone-else"})
+    with pytest.raises(PermissionError):
+        core.comments_for(c, user_id=ME, link=ADULT_LINK, project_id=OTHER_PROJ, post_body="正文")
+    c = _moved_client(twin=True)
+    with pytest.raises(PermissionError):           # 活的那行照旧过闸
+        core.comments_for(c, user_id=ME, link=ADULT_LINK, project_id=OTHER_PROJ)
+
+
+def test_vanished_view_unreadable_keeps_the_old_pick(monkeypatch):
+    from deskcore import store as S
+
+    def boom(*_a, **_k):
+        raise RuntimeError("PGRST205 Could not find the table 'truth_vault.v_notes_vanished'")
+    monkeypatch.setattr(S, "tv_vanished_note_ids", boom)
+    c = _moved_client(maps=[{"tv_project_id": CHILD_TV, "project_id": THIRD_PROJ, "ingest_target": False},
+                            {"tv_project_id": ADULT_TV, "project_id": THIRD_PROJ, "ingest_target": False}])
+    out = core.comments_for(c, user_id=ME, link=ADULT_LINK)
+    assert out["resolved"] is True and out["note_id"] == f"{CHILD_TV}_recA", "视图读不到: 照原来按发布时间 + note_id 取"
+    assert "tv_note_vanished" not in out
+
+
+def test_vanished_lookup_reads_only_the_candidates():
+    from deskcore import store as S
+    c = _moved_client()
+    assert S.tv_vanished_note_ids(c, [f"{CHILD_TV}_recA", f"{ADULT_TV}_recB", None]) == {f"{CHILD_TV}_recA"}
+    assert S.tv_vanished_note_ids(c, []) == set()
+    (call,) = [x for x in c._tv.calls if x["table"] == "v_notes_vanished"]
+    assert call["filters"] == [("in", "note_id", (f"{CHILD_TV}_recA", f"{ADULT_TV}_recB"))]
+
+
+def test_score_comments_says_when_the_post_is_an_old_row(wired):
+    calls, reply = wired
+    reply["fn"] = lambda m, u, kw: _Resp(200, dict(THREAD_OK))
+    c = _tv_client()
+    c._tv.rows["v_notes_vanished"] = [{"note_id": NOTE["note_id"], "project_id": "TUGE_phase1"}]
+    out = core.score_comments(c, user_id=ME, link=LINK, comments=[{"slot": "q1", "text": "简历第一行写的什么呀"},
+                                                                   {"slot": "reply", "text": "写的是实习"}])
+    assert out["judge_status"] == "ok" and out["tv_note_vanished"] is True and len(calls) == 1

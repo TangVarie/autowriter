@@ -415,7 +415,7 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 | 分不出 | `ambiguous`：候选写进 `tv_note_links.candidates`，**不硬猜**，报表里列给人看；人看完说「对不上」就 `tv-resolve --note … --ingest`，正文补录、对照改成 `ingested` | 两版同标题的评论稿都不是笔记正文（途鸽 2026-09-18）；不提供「指定某一版」，`match_kind` 没有 manual 一档 |
 | 对不上 | `unmatched` → `ingest_published`（剥话题标签、不过闸、按全文幂等）补录进目标项目，建成的 `version_id` 记回 `tv_note_links` | 同项目稿子都以同一串标签结尾，不剥会互相误撞 |
 | 回填 TV | `--write-tv` 才把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL 的行**，且**只写真对上的**（`body_exact` / `title_exact` / `fuzzy` / `tv_lineage`）；`ingested` 不写 | 那是 TV 的列；补录的版本是从笔记复制来的，写回去因果倒置（TV 2026-09-18 核对时定的口径，见 runbook §1.4） |
-| 飞书已删 | TV 的 `v_notes_vanished` 里的篇（飞书里删掉或挪去别的表、TV 那一行还留着）`deskcore_tv_notes` 不返回（`016`）：不重对、不补录、不计数，已有的对照一行不动 | 2026-10-26：79 篇成人藻油从 BJS_phase1 挪去新表（TV 记为 BJS_phase2），其中 14 篇是 unmatched，补录目标一打开就会被补录进儿童藻油的项目；视图不在（新库）时照旧全给 |
+| 飞书已删 | TV 的 `v_notes_vanished` 里的篇（飞书里删掉或挪去别的表、TV 那一行还留着）`deskcore_tv_notes` 不返回（`016`）：不重对、不补录、不计数，已有的对照一行不动。评论按链接找帖（`comments_for` / `score_comments`）不走这个 RPC，由 `core._note_from_link` 自己查视图：同一条链接有活的一行就不用已删那行，只剩已删那行时回包带 `tv_note_vanished`、给的项目对不上时走贴正文那条路（代码，不依赖 016） | 2026-10-26：79 篇成人藻油从 BJS_phase1 挪去新表（TV 记为 BJS_phase2），其中 14 篇是 unmatched，补录目标一打开就会被补录进儿童藻油的项目；视图不在（新库）时照旧全给 |
 | 互斥 | 补录走 `core.ingest_published`，它先拿库里的项目锁（`ingest_locks`，TTL 10 分钟、到期可接管），拿不到等 90 秒后报「另一个补录正在跑」（REST 409） | 服务进程的工具与 CLI/cron 的 `tv-sync` 是两个进程，进程内锁管不到对方；advisory lock 跨不过 PostgREST 的多次请求 |
 
 实测（2026-09-17 的库，按全部 5000 多个版本对）：WTG 724 篇对上 229、百健士 182 对上 143、

@@ -1995,8 +1995,19 @@ def _tv_post_text(note: dict) -> tuple[str, str]:
     return title, body
 
 
+TV_VANISHED_FLAG = "_vanished"
+TV_VANISHED_NOTE = ("TV 里这条链接只剩飞书里已删 / 挪去别的表的旧记录: 项目是按那行旧记录对的, 已有评论停在它消失前。"
+                    "帖子要是挪去了别的项目, 带那个项目的 project_id 和帖子正文再调一次。")
+_TV_VANISHED_WHY = ("TV 里这条链接只剩飞书里已删 / 挪去别的表的旧记录, 对不到你的项目(帖子可能挪了表、新表还没同步)。"
+                    "把帖子的标题和正文贴过来, 并告诉我是哪个项目")
+
+
 def _note_from_link(client, link: str) -> tuple[dict | None, str | None]:
-    """发布链接 → TV 的笔记(多条同链接取最近发布的那条)。回 ``(笔记, 认不出时的原因)``; 查库异常上抛。"""
+    """发布链接 → TV 的笔记(多条同链接取最近发布的那条)。回 ``(笔记, 认不出时的原因)``; 查库异常上抛。
+
+    飞书里已删 / 挪走的行(TV 的 v_notes_vanished)让位给活的那行: 运营挪表之后同一条链接在 TV 里有两行, 发布时间
+    一样, 排序只剩 note_id, 旧项目的那行会排在前面(BJS_phase1_… < BJS_phase2_…, I-22)。只剩已删的行时照样回它,
+    但带上 ``TV_VANISHED_FLAG``, 由调用方说清楚它是旧记录。视图读不到时按原来的办法取, 不因为它拦评论。"""
     key = tvlink.link_key(link)
     if key is None:
         return None, "认不出这条链接(只认小红书 / xhslink / 抖音 / t.cn 的发布链接)"
@@ -2006,7 +2017,15 @@ def _note_from_link(client, link: str) -> tuple[dict | None, str | None]:
         return None, ("TV 里还没有这条链接(笔记每天同步一次; 短链和长链也互相认不出)。"
                       "把帖子的标题和正文贴过来, 并告诉我是哪个项目")
     rows.sort(key=lambda r: str(r.get("publish_time") or ""), reverse=True)
-    return rows[0], None
+    try:
+        gone = store.tv_vanished_note_ids(client, [r.get("note_id") for r in rows])
+    except Exception:                                   # noqa: BLE001 — 同 016 视图不在时的退路: 照旧取
+        logger.exception("comments_for: 查 v_notes_vanished 失败, 按发布时间取最近的那条")
+        gone = set()
+    live = [r for r in rows if str(r.get("note_id")) not in gone]
+    if live:
+        return live[0], None
+    return {**rows[0], TV_VANISHED_FLAG: True}, None
 
 
 def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tuple[dict | None, list[dict]]:
@@ -2068,8 +2087,17 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
     note, why = (None, None)
     if link:
         note, why = _note_from_link(client, link)
+    project = choices = None
     if note is not None:
-        project, choices = _project_for_note(client, note, project_id or None, user_id)
+        try:
+            project, choices = _project_for_note(client, note, project_id or None, user_id)
+        except PermissionError:
+            if not note.get(TV_VANISHED_FLAG):
+                raise
+            # 只剩飞书里已删 / 挪走的旧行: 它的 TV 项目不一定是帖子现在所在的项目(I-22: 成人藻油从 BJS_phase1 挪去新表,
+            # 写手给的是成人项目), 不拿它挡人 —— 当作链接没找到, 走贴正文那条路(那条路照样过归属闸, 旧行的内容不回)。
+            note, why = None, _TV_VANISHED_WHY
+    if note is not None:
         if project is None:
             return None, "", "", None, {
                 "resolved": False, "need": ["project_id"], "choices": choices,
@@ -2142,6 +2170,9 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
     if note is not None:
         out["note_id"] = note.get("note_id")
         out["tier"] = note.get("tier")
+        if note.get(TV_VANISHED_FLAG):
+            out["tv_note_vanished"] = True
+            out["tv_note_vanished_note"] = TV_VANISHED_NOTE
         total = note.get("comments_count")
         if len(rows) >= store.TV_COMMENTS_MAX or (isinstance(total, int) and total > len(existing)):
             # 只取了前 TV_COMMENTS_MAX 条(codex review on aw#107): 说出来, 别让模型以为这就是全部
@@ -2247,6 +2278,9 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
                               "kind": kind, "points": None, "max_named": max_named}, started=started)
     head = {"judge_status": res.get("judge_status"), "project_id": project["id"],
             "note": COMMENT_SCORE_NOTE}
+    if _note is not None and _note.get(TV_VANISHED_FLAG):
+        head["tv_note_vanished"] = True
+        head["tv_note_vanished_note"] = TV_VANISHED_NOTE
     if res.get("judge_status") != judge_client.JUDGE_OK:
         return {**head, "detail": res.get("detail")}
     per_comment = res.get("comments") or []

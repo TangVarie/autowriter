@@ -346,7 +346,7 @@ select count(*) from autowriter.deskcore_tv_notes('BJS_phase1', null, null, 1000
 ```bash
 python -m deskcore.cli tv-map add --tv-project BJS_phase2 --project efe112d3-7736-4346-8894-db5e75904248
 python -m deskcore.cli tv-map add --tv-project BJS_phase2 --project 89d3e7aa-ec89-4e70-b28f-89abfefcbb9d --ingest-target
-python -m deskcore.cli tv-sync --tv-project BJS_phase2 --dry-run     # 先看数: 约 40 篇对上 efe112d3 里的原稿, 其余会补录进 89d3e7aa
+python -m deskcore.cli tv-sync --tv-project BJS_phase2 --dry-run     # 先看数: 最多 40 篇对上 efe112d3 里的原稿, 其余有正文的补录进 89d3e7aa
 ```
 
 手边没有能跑 CLI 的环境（dry-run 跑不了）时换个检查点：两行先都不带补录目标（SQL Editor 里 `ingest_target = false` 插两行），
@@ -354,6 +354,16 @@ python -m deskcore.cli tv-sync --tv-project BJS_phase2 --dry-run     # 先看数
 对上的都该指向 `efe112d3`、`ingested` 是 0；再把 `89d3e7aa` 那一行改成 true。
 
 以前在 BJS_phase1 下补录的那 25 篇不会对上旧副本（副本不进对照索引，A-02），会在 `89d3e7aa` 里再补录一份；旧副本留在 `efe112d3`。
+这几个数都是**上限**：新表 Preflight 读到 76 行、有正文 70 行，而 BJS_phase1 挪走的旧行是 79 行（26 行没有发布时间和链接），
+至少 9 行在新表里没有对应，「40 篇对上 / 25 篇再补录」只算挪进新表、正文没大改的那些（TV 侧配对见 TV OPEN-ITEMS I-22 ②）。
+
+**评论按链接找帖（`comments_for` / `score_comments`）不走这个 RPC**，直读 `truth_vault.notes`，016 管不到。同一分支（I-22）里
+`core._note_from_link` 先查 `truth_vault.v_notes_vanished`（`store.tv_vanished_note_ids`）：同一条链接有活的一行就用活的那行；
+只剩已删的那行时照样用它定项目和取已有评论，回包带 `tv_note_vanished: true` 和一句说明；写手给的 `project_id` 不在那行旧项目的
+映射里时不再 403，当作链接没找到、走贴正文那条路（照样过归属闸，旧行内容不回）；视图读不到时按原来的办法取（记 ERROR 日志）。
+这是代码改动，**随部署生效，不依赖 016**。为什么要改：挪表后同一条链接在 TV 里两行、发布时间相同，原来按 note_id 取第一行，
+`BJS_phase1_…` 排在 `BJS_phase2_…` 前面，写手在成人项目 `89d3e7aa` 下给这 79 篇里任何一篇写评论都会 403，不给项目则落到儿童项目、
+用它的评论规则。部署之前，给这几篇写评论请贴正文 + `project_id`、不带链接。
 
 ### 1.11 `015_rule_compiles` —— 规则编译结果的缓存 + `compile-rules`（2026-10-20，D-121，**生产库尚未执行**）
 
