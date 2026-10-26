@@ -1333,7 +1333,7 @@ GRANT EXECUTE ON FUNCTION update_calibration_notes_cas(UUID, TEXT, TEXT)
 -- 写作台 ↔ TV 的稿子对照 (migrations/009_tv_links.sql)
 -- 为什么、怎么用见 009 的文件头。下面整段与 009 逐字相同 —— 基线不许再从
 -- 增量上漂开(tests/test_baseline_parity.py 守函数块, sql_parity_check 守
--- 表与 GRANT)。
+-- 表与 GRANT)。例外: deskcore_tv_notes 是 016 的最终形态(见那一块上方)。
 -- ══════════════════════════════════════════════════════════════════════
 CREATE TABLE IF NOT EXISTS autowriter.tv_project_map (
     tv_project_id  TEXT NOT NULL,
@@ -1442,6 +1442,8 @@ REVOKE ALL ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) FROM authen
 GRANT EXECUTE ON FUNCTION autowriter.deskcore_ingest_unlock(UUID, TEXT) TO service_role;
 
 -- ── 读 TV 的笔记(keyset 翻页; PostgREST 的 db-max-rows 对 RPC 同样生效) ──
+-- ⚠️ 下面这一整块与 migrations/016_tv_notes_skip_vanished.sql 里的**字节级相同**(016 让它不返回飞书里已删的篇,
+--    TV 的 v_notes_vanished)。改那边就把整块重新复制过来 —— tests/test_baseline_parity.py 用字符串相等守着。
 CREATE OR REPLACE FUNCTION autowriter.deskcore_tv_notes(
     _tv_project_id TEXT,
     _since         TIMESTAMPTZ DEFAULT NULL,
@@ -1457,9 +1459,18 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog
 AS $$
+DECLARE
+    _skip_vanished TEXT := '';
 BEGIN
     IF to_regclass('truth_vault.notes') IS NULL THEN
         RETURN;
+    END IF;
+    -- 016: 飞书里已删的篇(TV 的 v_notes_vanished)不返回; 视图不在就照旧全给。
+    -- v.project_id = $1 让项目过滤下推进视图的 DISTINCT ON, 不能省。
+    IF to_regclass('truth_vault.v_notes_vanished') IS NOT NULL THEN
+        _skip_vanished :=
+            '   AND NOT EXISTS (SELECT 1 FROM truth_vault.v_notes_vanished v '
+            '                    WHERE v.project_id = $1 AND v.note_id = n.note_id) ';
     END IF;
     RETURN QUERY EXECUTE
         'SELECT n.note_id, n.publish_time::timestamptz, n.tier, n.raw_content, '
@@ -1469,6 +1480,7 @@ BEGIN
         ' WHERE n.project_id = $1 '
         '   AND ($2 IS NULL OR n.created_at >= $2) '
         '   AND ($3 IS NULL OR n.note_id > $3) '
+        || _skip_vanished ||
         ' ORDER BY n.note_id '
         ' LIMIT $4'
         USING _tv_project_id, _since, _after, GREATEST(_limit, 1);

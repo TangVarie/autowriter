@@ -45,6 +45,10 @@ FINAL_SOURCE = {
         "005_deskcore_containment.sql",
         "005 换 6 参 + 包含度重查",
     ),
+    "deskcore_tv_notes": (
+        "016_tv_notes_skip_vanished.sql",
+        "009 建; 016 排除飞书里已删的篇(TV 的 v_notes_vanished), 签名不变",
+    ),
 }
 
 

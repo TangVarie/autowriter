@@ -483,3 +483,60 @@ def test_duplicate_notes_across_a_chunk_boundary_count_once_in_dry_run_and_real(
     links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
     assert links["n115"]["match_kind"] == "ingested"
     assert links["n115"]["version_id"] == links["n005"]["version_id"]
+
+
+# ── 016: 飞书里已删的篇(TV 的 v_notes_vanished)不进 tv-sync ─────────────
+# 删了的篇不返回是 deskcore_tv_notes 的事(migrations/016, SQL 侧由 tests/sql_parity_check.py 在真库上验); 这里假件
+# 照 016 的契约把它藏掉, 钉住 Python 这一侧: 读不到的篇, 它已有的对照一行不动、不补录、不计数 —— 防以后有人加一条
+# 「笔记不见了就把对照改掉 / 重写」。10-26 的形状: BJS_phase1 里挪去新表的 14 篇成人藻油, 对照是 unmatched, 补录目标
+# 一改回 true, 009 版 RPC 下一晚就把它们补录进儿童藻油的写作台项目。
+
+GONE_ID = "n_gone"
+GONE = _note(GONE_ID, "挪去别的飞书表的那篇",
+             "这一篇已经从这张飞书表挪走了, TV 那一行还留着, 进了 v_notes_vanished, 写作台里也没有它。" * 2)
+GONE_LINK = {"note_id": GONE_ID, "tv_project_id": TV, "project_id": None, "version_id": None,
+             "item_id": None, "match_kind": "unmatched", "score": None, "lag_days": None,
+             "candidates": None, "updated_at": "2026-10-23T14:02:00+00:00"}
+
+
+def _hide_vanished(c, notes, vanished):
+    """016 之后 deskcore_tv_notes 的契约: v_notes_vanished 里的篇不返回, 翻页照常。"""
+    def _tv_notes(a):
+        rows = [n for n in notes if n["note_id"] not in vanished
+                and (a.get("_after") is None or n["note_id"] > a["_after"])]
+        return rows[: a["_limit"]]
+    c.rpc_impl["deskcore_tv_notes"] = _tv_notes
+
+
+def test_a_note_deleted_in_feishu_is_not_ingested_and_its_unmatched_link_is_left_alone(monkeypatch):
+    # 前提(009 版 RPC 的样子): 已删的篇照样读回来, 有补录目标就和真没入库的 n2 一起被补录 —— 016 要堵的就是这个
+    before = core.tv_sync(_client(NOTES + [GONE], links=[dict(GONE_LINK)]), TV, dry_run=True)
+    assert before["counts"]["unmatched"] == 2 and before["ingest"]["to_write"] == 2
+
+    c = _client(NOTES + [GONE], links=[dict(GONE_LINK)])
+    _hide_vanished(c, NOTES + [GONE], {GONE_ID})
+    sent: list[str] = []
+    real_ingest = core.ingest_published
+
+    def _spy(client, project_id, entries, **kw):
+        sent.extend(e["title"] for e in entries)
+        return real_ingest(client, project_id, entries, **kw)
+    monkeypatch.setattr(core, "ingest_published", _spy)
+
+    out = core.tv_sync(c, TV)
+    assert sent == ["上周发的那篇"], "只补录真没入库的 n2, 已删的那篇不进 ingest_published"
+    assert out["notes"] == 3 and sum(out["counts"].values()) == 3 and out["counts"]["unmatched"] == 1
+    assert out["ingest"]["minted"] == 1 and len(c.rows["draft_fingerprints"]) == 1
+    links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
+    assert links[GONE_ID] == GONE_LINK, "已删的篇的对照一行不动(updated_at 也不刷)"
+    assert out["links_written"] == 3
+
+
+def test_tv_resolve_on_a_note_deleted_in_feishu_raises_and_ingests_nothing():
+    c = _client(NOTES + [GONE], links=[dict(GONE_LINK)])
+    _hide_vanished(c, NOTES + [GONE], {GONE_ID})
+    n_versions = len(c.rows["versions"])
+    with pytest.raises(ValueError, match="TV 里没有"):
+        core.tv_resolve(c, GONE_ID, ingest=True)
+    assert len(c.rows["versions"]) == n_versions and c.rows["draft_fingerprints"] == []
+    assert {l["note_id"]: l for l in c.rows["tv_note_links"]}[GONE_ID] == GONE_LINK

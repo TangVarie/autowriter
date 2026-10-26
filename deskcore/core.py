@@ -3603,6 +3603,15 @@ MIGRATION_TV_EDITS = "013_tv_edits.sql"
 MIGRATION_TV_EDIT_REV = "014_tv_edit_diff_rev.sql"
 # 015 建 rule_compiles(规则编译结果的缓存, D-121)。表探得到。
 MIGRATION_RULE_COMPILES = "015_rule_compiles.sql"
+# 016 换 deskcore_tv_notes 的函数体(不返回 TV v_notes_vanished 里的篇), 签名和返回列没动 —— 同 008, 探不到。
+# 第二列是那张视图在不在: 视图不在时 016 照旧全给, 函数体对了也不起作用。
+MIGRATION_TV_NOTES_VANISHED = "016_tv_notes_skip_vanished.sql"
+MIGRATION_016_PROBE_SQL = (
+    "select p.prosrc like '%v_notes_vanished%' as skips_vanished, "
+    "to_regclass('truth_vault.v_notes_vanished') is not null as view_present "
+    "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
+    "where n.nspname='autowriter' and p.proname='deskcore_tv_notes';"
+)
 MIGRATION_008_PROBE_SQL = (
     "select prosrc like '%f.embedding_model = _model%' as has_model_filter "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
@@ -3885,6 +3894,15 @@ def migration_state(client) -> dict:
         "_after": None, "_limit": 1}).execute())
     _add(MIGRATION_TV_LINKS, "deskcore_tv_notes", state, note,
          "读不到 TV 的笔记 —— tv-sync 一条都对不了")
+    # ── 016: 同一个 RPC 换了函数体(飞书里已删的篇不返回)。调用侧看跑没跑过完全一样 —— 与 008 同类, 如实报
+    #    unprobeable 并交出 SQL。上面那条 applied 只说明 009 的签名在, 不说明 016 跑过。
+    _add(MIGRATION_TV_NOTES_VANISHED,
+         "deskcore_tv_notes 跳过飞书里已删的篇(函数体)",
+         "unprobeable",
+         "PostgREST 读不到函数体; 用 SQL Editor 跑(两列都该是 true): " + MIGRATION_016_PROBE_SQL,
+         "缺席→飞书里已删的篇(TV 的 v_notes_vanished)tv-sync 每晚照样读回来重对: 项目有补录目标时, 其中对不上"
+         "的会被当成新稿补录成副本、进那个项目的指纹库; 没有补录目标时每晚重写一遍 unmatched。不报错 —— "
+         "所以在它跑过之前, 别把有已删篇的 TV 项目的补录目标打开(10-26: BJS_phase1)")
     # 回填 RPC: 空 _links → UPDATE 一行都不碰(codex #81: 只探读的那一半, 部署了一半
     # 的库会被报成 applied, 而 --write-tv 到运行时才炸)。
     state, note = _probe_ok(lambda: client.rpc("deskcore_tv_backfill_lineage",

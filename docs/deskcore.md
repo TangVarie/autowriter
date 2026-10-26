@@ -415,6 +415,7 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 | 分不出 | `ambiguous`：候选写进 `tv_note_links.candidates`，**不硬猜**，报表里列给人看；人看完说「对不上」就 `tv-resolve --note … --ingest`，正文补录、对照改成 `ingested` | 两版同标题的评论稿都不是笔记正文（途鸽 2026-09-18）；不提供「指定某一版」，`match_kind` 没有 manual 一档 |
 | 对不上 | `unmatched` → `ingest_published`（剥话题标签、不过闸、按全文幂等）补录进目标项目，建成的 `version_id` 记回 `tv_note_links` | 同项目稿子都以同一串标签结尾，不剥会互相误撞 |
 | 回填 TV | `--write-tv` 才把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL 的行**，且**只写真对上的**（`body_exact` / `title_exact` / `fuzzy` / `tv_lineage`）；`ingested` 不写 | 那是 TV 的列；补录的版本是从笔记复制来的，写回去因果倒置（TV 2026-09-18 核对时定的口径，见 runbook §1.4） |
+| 飞书已删 | TV 的 `v_notes_vanished` 里的篇（飞书里删掉或挪去别的表、TV 那一行还留着）`deskcore_tv_notes` 不返回（`016`）：不重对、不补录、不计数，已有的对照一行不动 | 2026-10-26：79 篇成人藻油从 BJS_phase1 挪去新表（TV 记为 BJS_phase2），其中 14 篇是 unmatched，补录目标一打开就会被补录进儿童藻油的项目；视图不在（新库）时照旧全给 |
 | 互斥 | 补录走 `core.ingest_published`，它先拿库里的项目锁（`ingest_locks`，TTL 10 分钟、到期可接管），拿不到等 90 秒后报「另一个补录正在跑」（REST 409） | 服务进程的工具与 CLI/cron 的 `tv-sync` 是两个进程，进程内锁管不到对方；advisory lock 跨不过 PostgREST 的多次请求 |
 
 实测（2026-09-17 的库，按全部 5000 多个版本对）：WTG 724 篇对上 229、百健士 182 对上 143、
@@ -903,8 +904,8 @@ env：
 `006_item_decision_provenance.sql` / `007_deskcore_table_grants.sql` /
 `008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql` /
 `011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql` / `014_tv_edit_diff_rev.sql` /
-`015_rule_compiles.sql`
-**十五个，按编号顺序跑，别跳号**（建议先在
+`015_rule_compiles.sql` / `016_tv_notes_skip_vanished.sql`
+**十六个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -937,6 +938,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
+- `016_tv_notes_skip_vanished.sql`（2026-10-26，I-22）：`deskcore_tv_notes` 不再返回飞书里已删的篇（TV 的 `truth_vault.v_notes_vanished`，D-103），§3.7 表里「飞书已删」那一行。只换函数体，签名不变；视图不在就照旧全给。**静默错答**，和 `008` 同类：不跑不报错，已删的篇每晚照样被读回来重对，项目有补录目标时对不上的会被补录成副本。所以**先跑 016，再打开有已删篇的 TV 项目的补录目标**（10-26：BJS_phase1 挪走了 79 篇成人藻油，其中 14 篇是 unmatched）。`doctor` 报 `unprobeable` 并给出查函数体和视图的 SQL。
 - `015_rule_compiles.sql`（2026-10-20，D-121）：`rule_compiles`，规则编译结果的缓存，键 (`memory_id`, `sha`)（§3.11）。只授 `service_role`、开 RLS。**可降级**：不跑的话 `compile-rules` 和后台补编在读缓存这一步就报 error（记 WARN，一条都不发给 Jev，不花编译的钱），`check_rules` 回 `status: error`、记 ERROR 日志（写手那边是这次规则没查成、不能说守住了，存档已成功、交付不受影响；不是 500，10-20 第三轮复审：原来直接抛，REST 是 500、MCP 是工具错误，服务端一行日志都没有），简报和存档不受影响。`doctor` 探这张表。
 - `014_tv_edit_diff_rev.sql`（2026-10-20）：`tv_edit_diffs.diff_rev`，差异的口径版本。首晚 125 条"改过"只差稿子末尾的 #话题 行（TV 正文不带），`edit_diff` 改成两边先去话题、品牌只数正文；旧口径的行 tv-sync 重算（不推 `computed_at`），`edit_digest` 只读当前口径。以后改差异算法只需 `tvlink.DIFF_REV` +1。`DIFF_REV = 2`（10-20）：写作台那版晚于发布的（`lag_days < 0`，抄回来的）不算差异，同 desk_gap / 判据 C 的"接住"口径。
 - `013_tv_edits.sql`（2026-10-19，D-120 / W-23）：`tv_note_links.match_kind` 多认 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15，人改得多但还是这一篇）；建 `tv_edit_diffs`（每条对上的笔记一行：标题改没改、删 / 加了哪些句子、长度、品牌提了几次）和 `tv_edit_digest_acks`（每个项目的每周摘要看到哪儿了）；`v_angle_outcomes` 把 `edited` 也算作对上。**硬失败只打 tv-sync 写 `edited` 那一块**（旧 CHECK 拒）；差异和摘要缺表时只记 WARN。`doctor` 探两张表。

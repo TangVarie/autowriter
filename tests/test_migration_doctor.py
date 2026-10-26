@@ -93,9 +93,11 @@ def test_fully_migrated_db_reports_ok():
     # 检查。两条探不到的理由不同: 003 建的是索引(PostgREST 看不见 pg_indexes),
     # 008 换的是函数体(签名一个字没动, 从调用侧看跑没跑过完全一样)。
     # 010 开的是 RLS: service_role 绕 RLS, 开没开从 PostgREST 读起来一模一样。
+    # 016 同 008: 换的是 deskcore_tv_notes 的函数体, 签名没动。
     assert report["unprobeable"] == ["003_versions_unique_num.sql",
                                      "008_embedding_model_isolation.sql",
-                                     "010_tv_links_rls.sql"]
+                                     "010_tv_links_rls.sql",
+                                     "016_tv_notes_skip_vanished.sql"]
     assert all(s in ("applied", "unprobeable") for s in _states(report).values())
 
 
@@ -770,3 +772,21 @@ def test_rule_compiles_missing_grant_points_to_015():
     report = core.migration_state(DeniedCompiles(rows=_TABLES, rpc_impl=_ALL_RPCS))
     assert "015_rule_compiles.sql" in report["missing"]
     assert "007_deskcore_table_grants.sql" not in report["missing"]
+
+
+def test_016_is_reported_unprobeable_with_the_sql_that_checks_it():
+    """016 只换了 deskcore_tv_notes 的函数体(飞书里已删的篇不返回), 签名一个字没动 —— 009 那条 RPC 探测报
+    applied 说明不了 016 跑过。被禁止的形态: 拿「RPC 在」冒充 016 applied(那样在 016 之前打开补录目标, 已删的篇
+    会被补录成副本, 而 doctor 一片绿)。所以它必须是 unprobeable、交出查函数体和视图的那句 SQL, 且不让报告变红。"""
+    sb = FakeClient(rows=_TABLES, rpc_impl=_ALL_RPCS)
+    report = core.migration_state(sb)
+    rows = [c for c in report["checks"] if c["migration"] == "016_tv_notes_skip_vanished.sql"]
+    assert len(rows) == 1 and rows[0]["state"] == "unprobeable", rows
+    assert core.MIGRATION_TV_NOTES_VANISHED == "016_tv_notes_skip_vanished.sql"
+    assert core.MIGRATION_016_PROBE_SQL in rows[0]["note"]
+    assert "v_notes_vanished" in core.MIGRATION_016_PROBE_SQL
+    assert "to_regclass('truth_vault.v_notes_vanished')" in core.MIGRATION_016_PROBE_SQL
+    assert "补录" in rows[0]["impact"]
+    assert report["ok"] is True and "016_tv_notes_skip_vanished.sql" not in report["missing"]
+    # 016 不多调一次 RPC: deskcore_tv_notes 只有 009 那一次(不存在的 TV 项目, 返回空)
+    assert [n for n, _ in sb.rpc_calls].count("deskcore_tv_notes") == 1
