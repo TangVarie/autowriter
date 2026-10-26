@@ -481,7 +481,7 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 | 改稿替换、新版挂上了旧 item | 判，用新版的 id |
 | `identity_error`：指纹入了库、versions 没建成 | 跳过（`skipped.reason = identity_error`） |
 | 替换没挂上（`replace_warning`） | 跳过（`replace_failed`） |
-| 正文为空 | 跳过（`empty_body`）：只有标题判不出东西，平台题却可能对着一个标题给硬伤 |
+| 正文为空 | 走不到这里：`score_drafts` 入库前就按 `gate="empty_body"` 拒掉，不存档、不销角度（W-30，10-26：Hatherine 两批 15 篇只有标题的稿子照样存了档）。判定这边的跳过（`empty_body`）只防万一：只有标题判不出东西，平台题却可能对着一个标题给硬伤 |
 | 被闸拒掉的 | 不判：没交付，不该在账本里留答案 |
 
 **项目号与品类（数据出境口径，docs/00 #7）。** 未发布稿默认只跑通用层 + 平台层，处方药项目的未发布稿

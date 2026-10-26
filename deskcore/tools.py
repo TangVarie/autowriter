@@ -660,7 +660,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
 
     ⚠️ 存档时【会再查一次重】, 而且自带和 check_drafts 同一套闸: 判 reject 的不存档, 在 ``rejected`` 里列出来
     (``gate="pre_commit"`` 是闸前拦下, ``gate="atomic_recheck"`` 是写入时撞上了队友刚存的稿子)。那几条要重写后
-    重新走 check_drafts, 不能当作已交付。``gate_summary`` 里该告诉用户的(semantic_degraded / empty_history_warning)
+    重新走 check_drafts, 不能当作已交付。``gate="empty_body"`` 是这篇的 ``body`` 是空的(正文放错了字段): 不用重写,
+    把正文放进 ``body`` 原样再调一次本工具。``gate_summary`` 里该告诉用户的(semantic_degraded / empty_history_warning)
     照 check_drafts 的规矩说。
 
     **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零就是有几条没带 —— 那几个角度没销账,

@@ -669,3 +669,90 @@ def test_a_failure_while_pulling_fingerprints_puts_the_already_pulled_ones_back(
                     {"title": "稿二改", "body": BODY_X2 + "。", "replaces_version_id": b}],
                 rpc=_rpc_that_writes(c))
     assert set(_fps(c)) == {a, b}, "第一条摘掉的放回来了, 第二条本来就没删成"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 正文空的不存档(W-30, 10-26): 10-21 / 10-22 Hatherine 两批 15 篇只有标题、body 是空的,
+# 照样写了指纹、销了角度、建了身份 —— 查重看不见、发出去也对不回来。
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("body", ["", "   \n\t ", None])
+def test_an_empty_body_is_rejected_and_the_rest_of_the_batch_commits(body):
+    c = _client(angle_ledger=[
+        {"id": "led-1", "project_id": PROJ, "angle_key": "K1", "consumed_version_id": None, "consumed_at": None},
+        {"id": "led-2", "project_id": PROJ, "angle_key": "K2", "consumed_version_id": None, "consumed_at": None},
+    ])
+    out = _commit(c, [{"title": "只有标题", "body": body, "angle_key": "K1"},
+                      {"title": "秋招等回音", "body": BODY_X, "angle_key": "K2"}], rpc=_rpc_that_writes(c))
+    assert out["written"] == 1 and out["consumed_angles"] == 1
+    (r,) = out["rejected"]
+    assert r["index"] == 0 and r["gate"] == "empty_body" and r["title"] == "只有标题"
+    assert "body" in r["reason"] and "score_drafts" in r["reason"]
+    assert [x["title"] for x in c.rows["versions"]] == ["秋招等回音"], "空正文不建身份"
+    assert [x["title"] for x in _fps(c).values()] == ["秋招等回音"], "空正文不进指纹库"
+    led = {x["angle_key"]: x for x in c.rows["angle_ledger"]}
+    assert led["K1"]["consumed_version_id"] is None, "空正文那篇的角度不销账"
+    assert led["K2"]["consumed_version_id"] == out["version_ids"][0]
+
+
+def test_the_empty_body_reason_names_the_fields_but_not_their_contents():
+    c = _client()
+    out = _commit(c, [{"title": "标题", "content": "正文被放进了别的字段", "angle_key": "K1"}])
+    reason = out["rejected"][0]["reason"]
+    assert "angle_key, content, title" in reason
+    assert "正文被放进了别的字段" not in reason
+    assert out["written"] == 0 and not c.rows.get("versions")
+
+
+def test_an_empty_body_replacement_puts_the_old_fingerprint_back():
+    c = _client()
+    first = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    v1 = first["version_ids"][0]
+    before = dict(_fps(c)[v1])
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": "", "replaces_version_id": v1}], rpc=_rpc_that_writes(c))
+    assert out["written"] == 0 and out["replaced"] == []
+    assert out["rejected"][0]["gate"] == "empty_body"
+    assert _fps(c)[v1] == before, "旧指纹原样放回"
+    assert len(c.rows["versions"]) == 1 and c.rows["items"][0]["best_version_id"] == v1
+
+
+def test_an_empty_body_draft_cannot_block_a_later_draft_with_the_same_title(monkeypatch):
+    """codex review on aw#126: 空正文那篇要是进了闸, 本批内互比会拿标题向量把后面同标题的完整稿判成撞上它 ——
+    两篇都没存。"""
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: True)
+    monkeypatch.setattr(core.dedup, "embed_texts",      # 同标题 → 余弦 1, 不同标题 → 正交
+                        lambda ts: [[1.0, 0.0, 0.0] if t == "秋招等回音" else [0.0, 1.0, 0.0] for t in ts])
+    c = _client()
+    out = _commit(c, [{"title": "秋招等回音", "body": "", "angle_key": "K1"},
+                      {"title": "秋招等回音", "body": BODY_X, "angle_key": "K2"},
+                      {"title": "另一篇", "body": BODY_Y}], rpc=_rpc_that_writes(c))
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "empty_body")]
+    assert out["written"] == 2
+    assert sorted(x["title"] for x in c.rows["versions"]) == ["另一篇", "秋招等回音"]
+
+
+def test_gate_rejections_after_an_empty_body_draft_keep_the_callers_index():
+    """闸只跑非空的那几篇, 回来的下标要翻回调用方列表里的位置。"""
+    c = _client()
+    out = _commit(c, [{"title": "空的", "body": ""},
+                      {"title": "第一份", "body": BODY_X},
+                      {"title": "第二份", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "empty_body"), (2, "pre_commit")]
+    assert out["rejected"][1]["title"] == "第二份" and out["rejected"][1]["collided_with"] == "第一份"
+    assert out["written"] == 1
+
+
+def test_an_empty_body_replacement_does_not_hide_the_old_version_from_the_gate():
+    """codex review on aw#126: 先摘了空正文替换稿的旧指纹, 同批里和旧版重复的另一篇查重时就看不见旧版、照样入库。"""
+    c = _client()
+    first = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    v1 = first["version_ids"][0]
+    before = dict(_fps(c)[v1])
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": "", "replaces_version_id": v1},
+                      {"title": "换了个标题", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "empty_body"), (1, "pre_commit")]
+    assert out["rejected"][1]["collided_with"] == "秋招等回音"
+    assert out["written"] == 0 and out["replaced"] == []
+    assert _fps(c) == {v1: before}, "旧指纹一直在、没多出新指纹"

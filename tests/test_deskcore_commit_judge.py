@@ -295,12 +295,12 @@ def test_rejected_and_empty_body_drafts_are_not_judged(judge_on):
     judge_on["payloads"].clear()
     out = core.commit_drafts(c, PROJ, [
         {"title": "换了个标题", "body": BODY_C},          # 撞历史, 闸前拒
-        {"title": "只有标题", "body": ""},                  # 入库, 但判不出东西
+        {"title": "只有标题", "body": ""},                  # 正文空的不入库(W-30), 自然也不判
         {"title": "正常的", "body": BODY_A},
     ], user_id=ME)
-    assert [r["index"] for r in out["rejected"]] == [0]
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "pre_commit"), (1, "empty_body")]
     assert len(judge_on["payloads"]) == 1 and judge_on["payloads"][0]["title"] == "正常的"
-    assert [(s["index"], s["reason"]) for s in out["judge"]["skipped"]] == [(1, "empty_body")]
+    assert out["judge"]["skipped"] == []
 
 
 def test_a_replacement_is_judged_under_its_new_version_id(judge_on):
@@ -821,6 +821,7 @@ def test_a_metrics_row_records_timing_and_judge_outcomes(judge_on):
     c = _client()
     out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A},
                                        {"title": "只有标题", "body": ""}], user_id=ME)
+    assert [r["gate"] for r in out["rejected"]] == ["empty_body"]
     rows = c.rows["batch_metrics"]
     assert len(rows) == 1
     m = rows[0]
@@ -829,9 +830,9 @@ def test_a_metrics_row_records_timing_and_judge_outcomes(judge_on):
     assert m["meta"]["mode"] == "deskcore_commit" and m["meta"]["batch_id"] == out["batch_id"]
     assert m["phase_ms"] == out["phase_ms"]
     assert m["meta"]["project_isolation"] == out["project_isolation"]
-    assert m["counters"]["judge_ok"] == 1 and m["counters"]["judge_skipped"] == 1
+    assert m["counters"]["judge_ok"] == 1 and m["counters"]["judge_skipped"] == 0
     assert [j["status"] for j in m["meta"]["judge"]] == ["ok"]
-    assert m["meta"]["judge_skipped"] == [{"index": 1, "reason": "empty_body"}]
+    assert m["meta"]["judge_skipped"] == []         # 正文空的那篇没入库(W-30); 跳过的记账见 not_in_project 那条
 
 
 def test_a_judge_error_body_that_echoes_the_key_is_masked_everywhere(monkeypatch, capsys):
