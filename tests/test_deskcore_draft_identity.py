@@ -715,3 +715,29 @@ def test_an_empty_body_replacement_puts_the_old_fingerprint_back():
     assert out["rejected"][0]["gate"] == "empty_body"
     assert _fps(c)[v1] == before, "旧指纹原样放回"
     assert len(c.rows["versions"]) == 1 and c.rows["items"][0]["best_version_id"] == v1
+
+
+def test_an_empty_body_draft_cannot_block_a_later_draft_with_the_same_title(monkeypatch):
+    """codex review on aw#126: 空正文那篇要是进了闸, 本批内互比会拿标题向量把后面同标题的完整稿判成撞上它 ——
+    两篇都没存。"""
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: True)
+    monkeypatch.setattr(core.dedup, "embed_texts",      # 同标题 → 余弦 1, 不同标题 → 正交
+                        lambda ts: [[1.0, 0.0, 0.0] if t == "秋招等回音" else [0.0, 1.0, 0.0] for t in ts])
+    c = _client()
+    out = _commit(c, [{"title": "秋招等回音", "body": "", "angle_key": "K1"},
+                      {"title": "秋招等回音", "body": BODY_X, "angle_key": "K2"},
+                      {"title": "另一篇", "body": BODY_Y}], rpc=_rpc_that_writes(c))
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "empty_body")]
+    assert out["written"] == 2
+    assert sorted(x["title"] for x in c.rows["versions"]) == ["另一篇", "秋招等回音"]
+
+
+def test_gate_rejections_after_an_empty_body_draft_keep_the_callers_index():
+    """闸只跑非空的那几篇, 回来的下标要翻回调用方列表里的位置。"""
+    c = _client()
+    out = _commit(c, [{"title": "空的", "body": ""},
+                      {"title": "第一份", "body": BODY_X},
+                      {"title": "第二份", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "empty_body"), (2, "pre_commit")]
+    assert out["rejected"][1]["title"] == "第二份" and out["rejected"][1]["collided_with"] == "第一份"
+    assert out["written"] == 1

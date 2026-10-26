@@ -2503,10 +2503,16 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # "没入库就放回"那一步照常放回。
             empty_rejected = {i: _empty_body_reason(drafts[i]) for i in range(len(drafts))
                               if not bodies[i].strip() and i not in replace_rejected}
-            gate = _gate(client, project_id, titles, bodies, vecs)
-            pre_rejected = {r["index"]: r for r in gate["results"]
-                            if r.get("status") == "reject" and r["index"] not in replace_rejected
-                            and r["index"] not in empty_rejected}
+            # 空正文那几篇也不进闸(codex review on aw#126): 本批内互比会拿标题向量把后面同标题的完整稿判成撞上它,
+            # 结果两篇都没存。闸只跑其余几篇, 结果下标翻回调用方的; 全是空正文时照旧整批跑(结果反正都被拒掉)。
+            gate_idx = [i for i in range(len(drafts)) if i not in empty_rejected] or list(range(len(drafts)))
+            gate = _gate(client, project_id, [titles[i] for i in gate_idx], [bodies[i] for i in gate_idx],
+                         [vecs[i] if i < len(vecs) else None for i in gate_idx] if vecs else vecs)
+            pre_rejected = {}
+            for r in gate["results"]:
+                i = gate_idx[r["index"]]
+                if r.get("status") == "reject" and i not in replace_rejected and i not in empty_rejected:
+                    pre_rejected[i] = {**r, "index": i}
             survivors = [i for i in range(len(drafts))
                          if i not in pre_rejected and i not in replace_rejected and i not in empty_rejected]
 
