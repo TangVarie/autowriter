@@ -454,7 +454,7 @@ def test_skipped_cached_questions_never_report_the_whole_rule_kept(wired, bad_qu
 
 def test_queued_judge_calls_use_the_remaining_shared_budget(wired, monkeypatch):
     monkeypatch.setattr(core, "CHECK_RULES_WORKERS", 1)
-    ticks = [time.monotonic()]
+    ticks = [1000.0]             # 固定起点: 用真 monotonic 起点时 (s+10)-s 不一定正好是 10, CI 上出过 8.000000000000028
     clock = type("Clock", (), {"monotonic": staticmethod(lambda: ticks[0])})()
     monkeypatch.setattr(core, "time", clock)
     calls = []
@@ -468,7 +468,7 @@ def test_queued_judge_calls_use_the_remaining_shared_budget(wired, monkeypatch):
     ids = [str(uuid.UUID(int=i + 1)) for i in range(3)]
     core.check_rules(full_client(memories=[R_SOFT], compiles=[stored(R_SOFT, q_soft())],
                                  versions=[version(vid) for vid in ids]), PROJ, ids, user_id=ME)
-    assert calls == [18.0, 8.0], "第三个任务起跑时预算已用完, 不许再发请求"
+    assert calls == pytest.approx([18.0, 8.0]), "第三个任务起跑时预算已用完, 不许再发请求"
 
 
 @pytest.mark.parametrize("questions", [[], 123, {"qid": "bad"}, [None]])
