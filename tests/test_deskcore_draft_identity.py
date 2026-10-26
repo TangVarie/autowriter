@@ -741,3 +741,18 @@ def test_gate_rejections_after_an_empty_body_draft_keep_the_callers_index():
     assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "empty_body"), (2, "pre_commit")]
     assert out["rejected"][1]["title"] == "第二份" and out["rejected"][1]["collided_with"] == "第一份"
     assert out["written"] == 1
+
+
+def test_an_empty_body_replacement_does_not_hide_the_old_version_from_the_gate():
+    """codex review on aw#126: 先摘了空正文替换稿的旧指纹, 同批里和旧版重复的另一篇查重时就看不见旧版、照样入库。"""
+    c = _client()
+    first = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    v1 = first["version_ids"][0]
+    before = dict(_fps(c)[v1])
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": "", "replaces_version_id": v1},
+                      {"title": "换了个标题", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "empty_body"), (1, "pre_commit")]
+    assert out["rejected"][1]["collided_with"] == "秋招等回音"
+    assert out["written"] == 0 and out["replaced"] == []
+    assert _fps(c) == {v1: before}, "旧指纹一直在、没多出新指纹"

@@ -2471,7 +2471,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     lock_asked = time.monotonic()
     with _project_write_lock(client, project_id, holder):
         lock_wait_ms = _ms_since(lock_asked)
-        replace, replace_rejected, stash = _prepare_replacements(client, project_id, drafts)
+        # 正文空的替换稿不摘旧指纹(codex review on aw#126): 它反正要被拒(W-30, 见下), 先摘了的话同批里和旧版
+        # 重复的另一篇查重时看不见旧版, 照样入库。
+        empty_idx = {i for i, d in enumerate(drafts) if not str(d.get("body") or "").strip()}
+        replace, replace_rejected, stash = _prepare_replacements(
+            client, project_id, [{**d, "replaces_version_id": None} if i in empty_idx else d
+                                 for i, d in enumerate(drafts)])
         # 整段包在 try 里(而不是拆成子函数): ci.yml 用 inspect.getsource 守着"commit 走 _gate"
         # 和"commit 记 embedding_model"这两条, 拆出去它们就看不见了。
         try:
@@ -2499,10 +2504,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # 出错照样上抛 —— 和 check_drafts 一样, 查重挂了不能当作通过。
             # 正文空的不存档(W-30, 10-26): 10-21 / 10-22 Hatherine 两批 15 篇只有标题、body 是空的, 照样写了指纹、
             # 销了角度、建了 versions —— 判定按 empty_body 跳过, 指纹没有开头哈希和四字串, 查重看不见, 发出去也对不回来。
-            # 多半是模型把正文放进了别的字段: 拒掉, 说清收到了哪些字段, 让它当场补上重调。替换稿的旧指纹由下面
-            # "没入库就放回"那一步照常放回。
-            empty_rejected = {i: _empty_body_reason(drafts[i]) for i in range(len(drafts))
-                              if not bodies[i].strip() and i not in replace_rejected}
+            # 多半是模型把正文放进了别的字段: 拒掉, 说清收到了哪些字段, 让它当场补上重调。替换稿的旧指纹上面就没摘。
+            empty_rejected = {i: _empty_body_reason(drafts[i]) for i in sorted(empty_idx)}
             # 空正文那几篇也不进闸(codex review on aw#126): 本批内互比会拿标题向量把后面同标题的完整稿判成撞上它,
             # 结果两篇都没存。闸只跑其余几篇, 结果下标翻回调用方的; 全是空正文时照旧整批跑(结果反正都被拒掉)。
             gate_idx = [i for i in range(len(drafts)) if i not in empty_rejected] or list(range(len(drafts)))
