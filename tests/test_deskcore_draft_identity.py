@@ -669,3 +669,49 @@ def test_a_failure_while_pulling_fingerprints_puts_the_already_pulled_ones_back(
                     {"title": "稿二改", "body": BODY_X2 + "。", "replaces_version_id": b}],
                 rpc=_rpc_that_writes(c))
     assert set(_fps(c)) == {a, b}, "第一条摘掉的放回来了, 第二条本来就没删成"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 正文空的不存档(W-30, 10-26): 10-21 / 10-22 Hatherine 两批 15 篇只有标题、body 是空的,
+# 照样写了指纹、销了角度、建了身份 —— 查重看不见、发出去也对不回来。
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("body", ["", "   \n\t ", None])
+def test_an_empty_body_is_rejected_and_the_rest_of_the_batch_commits(body):
+    c = _client(angle_ledger=[
+        {"id": "led-1", "project_id": PROJ, "angle_key": "K1", "consumed_version_id": None, "consumed_at": None},
+        {"id": "led-2", "project_id": PROJ, "angle_key": "K2", "consumed_version_id": None, "consumed_at": None},
+    ])
+    out = _commit(c, [{"title": "只有标题", "body": body, "angle_key": "K1"},
+                      {"title": "秋招等回音", "body": BODY_X, "angle_key": "K2"}], rpc=_rpc_that_writes(c))
+    assert out["written"] == 1 and out["consumed_angles"] == 1
+    (r,) = out["rejected"]
+    assert r["index"] == 0 and r["gate"] == "empty_body" and r["title"] == "只有标题"
+    assert "body" in r["reason"] and "score_drafts" in r["reason"]
+    assert [x["title"] for x in c.rows["versions"]] == ["秋招等回音"], "空正文不建身份"
+    assert [x["title"] for x in _fps(c).values()] == ["秋招等回音"], "空正文不进指纹库"
+    led = {x["angle_key"]: x for x in c.rows["angle_ledger"]}
+    assert led["K1"]["consumed_version_id"] is None, "空正文那篇的角度不销账"
+    assert led["K2"]["consumed_version_id"] == out["version_ids"][0]
+
+
+def test_the_empty_body_reason_names_the_fields_but_not_their_contents():
+    c = _client()
+    out = _commit(c, [{"title": "标题", "content": "正文被放进了别的字段", "angle_key": "K1"}])
+    reason = out["rejected"][0]["reason"]
+    assert "angle_key, content, title" in reason
+    assert "正文被放进了别的字段" not in reason
+    assert out["written"] == 0 and not c.rows.get("versions")
+
+
+def test_an_empty_body_replacement_puts_the_old_fingerprint_back():
+    c = _client()
+    first = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    v1 = first["version_ids"][0]
+    before = dict(_fps(c)[v1])
+    _embed(c)
+    out = _commit(c, [{"title": "秋招等回音", "body": "", "replaces_version_id": v1}], rpc=_rpc_that_writes(c))
+    assert out["written"] == 0 and out["replaced"] == []
+    assert out["rejected"][0]["gate"] == "empty_body"
+    assert _fps(c)[v1] == before, "旧指纹原样放回"
+    assert len(c.rows["versions"]) == 1 and c.rows["items"][0]["best_version_id"] == v1

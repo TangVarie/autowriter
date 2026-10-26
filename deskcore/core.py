@@ -1204,6 +1204,13 @@ def _prepare_replacements(client, project_id: str, drafts: list[dict]) -> tuple[
         stash[i] = rows
     return replace, rejected, stash
 
+def _empty_body_reason(draft: dict) -> str:
+    """正文空的那篇怎么说(W-30)。只列字段名, 不带内容。"""
+    keys = ", ".join(sorted(str(k) for k in draft)) or "(空)"
+    return (f"正文是空的, 没存档、角度没销账。正文要放在这篇 draft 的 body 字段里(这次收到的字段: {keys}), "
+            "补上之后原样带着 angle_key / replaces_version_id 再调一次 score_drafts")
+
+
 def _restore_stash(client, stash: dict[int, list[dict]], indices) -> None:
     for i in indices:
         rows = stash.get(i)
@@ -2490,11 +2497,18 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # _gate 的说明: 闸不该依赖模型记得先调 check_drafts。这里多一次历史比对
             # (一次 RPC), 换来的是"跳过 check 直接 commit"这条路从此进不了重复的稿子。
             # 出错照样上抛 —— 和 check_drafts 一样, 查重挂了不能当作通过。
+            # 正文空的不存档(W-30, 10-26): 10-21 / 10-22 Hatherine 两批 15 篇只有标题、body 是空的, 照样写了指纹、
+            # 销了角度、建了 versions —— 判定按 empty_body 跳过, 指纹没有开头哈希和四字串, 查重看不见, 发出去也对不回来。
+            # 多半是模型把正文放进了别的字段: 拒掉, 说清收到了哪些字段, 让它当场补上重调。替换稿的旧指纹由下面
+            # "没入库就放回"那一步照常放回。
+            empty_rejected = {i: _empty_body_reason(drafts[i]) for i in range(len(drafts))
+                              if not bodies[i].strip() and i not in replace_rejected}
             gate = _gate(client, project_id, titles, bodies, vecs)
             pre_rejected = {r["index"]: r for r in gate["results"]
-                            if r.get("status") == "reject" and r["index"] not in replace_rejected}
+                            if r.get("status") == "reject" and r["index"] not in replace_rejected
+                            and r["index"] not in empty_rejected}
             survivors = [i for i in range(len(drafts))
-                         if i not in pre_rejected and i not in replace_rejected]
+                         if i not in pre_rejected and i not in replace_rejected and i not in empty_rejected]
 
             # ── 先把 version_id 定下来 ──────────────────────────────────────────
             # 顺序是有讲究的: **先造 id 并写进指纹, 事后才建 versions 行**。
@@ -2543,6 +2557,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             rejected += [{"index": i, "title": titles[i], "collided_with": "", "collided_scope": "",
                           "decided_by": None, "reason": why, "gate": "replace_lookup"}
                          for i, why in sorted(replace_rejected.items())]
+            rejected += [{"index": i, "title": titles[i], "collided_with": "", "collided_scope": "",
+                          "decided_by": None, "reason": why, "gate": "empty_body"}
+                         for i, why in sorted(empty_rejected.items())]
             rejected.sort(key=lambda r: r["index"])
             # ⚠️ RPC 回的 idx 是**幸存者列表里的下标**, 不是调用方列表的。下面凡是把
             #    idx 翻回调用方视角的地方都要过 survivors[...]。
