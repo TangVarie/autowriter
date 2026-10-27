@@ -212,8 +212,8 @@ python -m deskcore.cli tv-sync --all --write-tv    # 回填 source_autowriter_*(
 之后每天跑一次 `tv-sync --all --write-tv`。Railway 上另建一个 service（同仓同分支），config-as-code
 指到 `deskcore/railway.cron.json`（cron `0 14 * * *` = 北京 22:00，启动命令就是这条），变量用
 Variable Reference 引 deskcore 主服务的三个：`SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` /
-`GOOGLE_API_KEY`（CLI 不读 `SUPABASE_ANON_KEY`，那是 Streamlit app 的）。增量：已对上的笔记跳过，
-`--rematch` 才重对。一个 TV 项目抛错（锁没等到、库错）不影响 `--all` 里后面的项目，退出码非零；
+`GOOGLE_API_KEY`（CLI 不读 `SUPABASE_ANON_KEY`，那是 Streamlit app 的）。增量：已对上的笔记只比 TV 正文的指纹，
+指纹没变就跳过，变了才核；整篇换了的会挪（§1.13）。`--rematch` 是全部按内容重对。一个 TV 项目抛错（锁没等到、库错）不影响 `--all` 里后面的项目，退出码非零；
 补录某一块抛错时前面已对上的对照照样写，没处理到的记 `unmatched` + 原因、明晚重来。
 **没有补录目标的 TV 项目**（RIO ×5 这类只判不入库，D-119）：对不上的留 `unmatched`；上次就是同样的
 `unmatched`（没版本、没备注）的不再每晚重写一遍（W-10，2026-10-23；RIO 782 行原来每晚只刷一次
@@ -296,7 +296,7 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
 
-### 1.13 `017_tv_link_text_fp` —— tv-sync 核对已对上的对照的 TV 正文（2026-10-27，W-34，**生产库尚未执行**）
+### 1.13 `017_tv_link_text_fp` —— tv-sync 核对已对上的对照的 TV 正文（2026-10-27，W-34，生产库已执行，10-27 核对）
 
 有版本的对照以前每晚记 `already_linked`、不再看 TV 的正文。运营在飞书里把一篇整篇换成另一篇（`note_id` 不变），对照、写回 TV 的
 `source_autowriter_*` 和改动差异就一直挂在原来那版上（D-129：BJS_phase1 14 条；10-27 还有 SPX_phase1 / TUGE_phase1 各 1 条）。
@@ -323,8 +323,9 @@ select has_function_privilege('service_role', 'autowriter.deskcore_tv_clear_line
 python -m deskcore.cli tv-sync --all --write-tv --dry-run
 ```
 
-每个 TV 项目多一行「正文核对」和最多 10 行 `↻ note_id: 旧判定 旧版本 → 新判定 新版本 (重叠 x)`。首晚绝大多数对照只是第一次记指纹
-（10-27 估计约 500 条）。只该出现 W-34 查到的那几条；出现别的，先别合并，或者在 cron 服务上设 `TV_SYNC_RELINK_MAX=0`
+每个 TV 项目多一行「正文核对」和 `↻ note_id: 旧判定 旧版本 → 新判定 新版本 (重叠 x)`：预演和超上限时**每一条都列**，平时最多 10 条
+（多出的报「另有 K 条」）。首晚绝大多数对照只是第一次记指纹（10-27 估计约 500 条）；这些对照的改动差异也按现在的正文重算一遍
+（同一版，`computed_at` 不动、不重放摘要），所以首晚「改动差异」那行的重算数是几百，之后每晚只有改过字的那几条。只该出现 W-34 查到的那几条；出现别的，先别合并，或者在 cron 服务上设 `TV_SYNC_RELINK_MAX=0`
 （只记指纹、只报不挪、差异先隔离，退出码 1），第二天看清单再放开。④ 合并（自动部署），`doctor` 里 017 两项 applied。
 
 **一晚之后验收：**
@@ -344,13 +345,14 @@ select note_id, match_kind, version_id, candidates->0->>'note' from autowriter.t
 - `⚠️ 正文整篇换了的有 N 条, 超过每晚上限 M`：一条都没挪，差异已隔离。先 `tv-sync --tv-project X --write-tv --dry-run` 看清单；
   是运营把一张表挪作他用（BJS 那种）就照 D-129 的路子由人处理，确实都该挪就手动跑一次
   `TV_SYNC_RELINK_MAX=N python -m deskcore.cli tv-sync --tv-project X --write-tv`。
-- `⚠️ 撤回 TV 旧血缘失败`：017 没跑或库错。一条都没挪，差异已隔离，修好后下一晚自己挪。
+- `⚠️ 撤回 TV 旧血缘失败`：库 / RPC 出错（或 `service_role` 没有这个函数的 EXECUTE，看 `doctor`；017 没跑的话更早就整个项目 ❌ 了）。
+  一条都没挪，差异已隔离，修好后下一晚自己挪。撤回之前那几条对照已标成「没回填过」，哪一步断了，回填都会把对照现在那一版补回 TV。
 - `⚠️ TV 里的血缘已经不是我们写的那一对`：TV 那两列被别人改过（或 item 对不上）。没挪；到 TV 里看那一行，确认后人工处理。
-- `⚠️ 正文指纹没记上`：只是下一晚再核一遍，结论一样。
+- `⚠️ 正文指纹没记上`：只是下一晚再核一遍，结论一样。改过字的差异这晚没算成时，指纹也先不记（日志「指纹先不记」），下一晚再核、再算。
 
 `tv_lineage`（TV 自己带的来源）正文整篇换了：不挪、只在日志里报（不改退出码），差异隔离，要人看。
 
-### 1.12 `016_tv_notes_skip_vanished` —— tv-sync 不再读飞书里已删的篇（2026-10-26，I-22，**生产库尚未执行**）
+### 1.12 `016_tv_notes_skip_vanished` —— tv-sync 不再读飞书里已删的篇（2026-10-26，I-22，生产库已执行，10-27 核对）
 
 TV 的 `truth_vault.notes` 只增不删：飞书里删掉或挪去别的表的篇，TV 那一行留着，进 `truth_vault.v_notes_vanished`（D-103）。
 009 版的 `deskcore_tv_notes` 不看这张视图，tv-sync 每晚把它们照样读回来重对：有补录目标时对不上的会被补录成副本，没有时每晚
@@ -419,7 +421,7 @@ python -m deskcore.cli tv-sync --tv-project BJS_phase2 --dry-run     # 先看数
 `BJS_phase1_…` 排在 `BJS_phase2_…` 前面，写手在成人项目 `89d3e7aa` 下给这 79 篇里任何一篇写评论都会 403，不给项目则落到儿童项目、
 用它的评论规则。部署之前，给这几篇写评论请贴正文 + `project_id`、不带链接。
 
-### 1.11 `015_rule_compiles` —— 规则编译结果的缓存 + `compile-rules`（2026-10-20，D-121，**生产库尚未执行**）
+### 1.11 `015_rule_compiles` —— 规则编译结果的缓存 + `compile-rules`（2026-10-20，D-121，生产库已执行，10-27 核对）
 
 规则交给 Jev 的 `POST /compile_rules` 编成写后检查，结果按（规则 id, sha）存进 `autowriter.rule_compiles`；写手存档之后调
 `check_rules` 按它逐篇查，只作建议（hard → 必须改，soft → 建议改，不拦存档）。设计见 `docs/deskcore.md` §3.11。
@@ -509,7 +511,7 @@ SQL Editor / `apply_migration` 直接跑（幂等）。验收：`doctor` 里「�
 有数（第一晚会把以前对上的补算，每个 TV 项目最多 500 条）。⚠️ 没跑它之前 tv-sync 写 `edited` 的那一块会被旧 CHECK 拒；差异表读写失败时 tv-sync 照写对照、但退出码 1 并打「改动差异没写成」。
 差异里除了删 / 加的句子，还有「还在但改了字」的句子对（`edited_sentences`，原句 → 改后）；摘要从上次看到的地方**从旧往新**每次最多 200 篇改过的，看不完的下一份接着给；`acked_through` 只往前走。
 
-### 1.8 `012_review_via_agent_provenance` —— 经代理转述的人审分开记（2026-10-09，审计 A-01，**生产库尚未执行**）
+### 1.8 `012_review_via_agent_provenance` —— 经代理转述的人审分开记（2026-10-09，审计 A-01，生产库已执行，10-27 核对）
 
 实查生产库：`autowriter.items` 里 `decision_source='human'` 的 32 行**全部**是 deskcore 的
 `review_drafts` 写的，而且全落在模型自己的工具链里（check → commit → review → export，

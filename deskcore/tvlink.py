@@ -280,11 +280,23 @@ def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
 # 和原版的重叠 ≤ 0.06; 10-27 生产库 501 条读得到的对照里, 没换过的最低 0.481(那条 edited), 中间 0.078~0.481 一条都没有 ——
 # EDITED_FLOOR(0.30) 两边都有很宽的余量。指纹只用来判"改没改过字", 不参与匹配。
 
+TITLE_SAME_FLOOR = 0.5      # 写作台那版只有标题时: 标题的四字串过半还在, 就算还是那一篇(改了一两个字)
+
+
+def _h8(s: str) -> str:
+    return hashlib.sha1(fp.normalize(s).encode("utf-8")).hexdigest()[:8]
+
+
 def text_fp(note: Note) -> str:
-    """TV 这一篇现在的指纹: 标题 + 剥了话题的正文, 各自 fp.normalize(去标点、空白)后 sha1 的前 16 位。
-    只改标点、空格、话题标签的不算改过 —— 运营常这样修, 不该让每条对照每晚重核一遍。"""
-    s = fp.normalize(note.title) + "\x1f" + fp.normalize(note.body)
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+    """TV 这一篇现在的指纹, 16 位: 前 8 位是标题、后 8 位是剥了话题的正文(各自 fp.normalize —— 去标点、空白 —— 后的
+    sha1 前 8 位)。只改标点、空格、话题标签的不算改过 —— 运营常这样修, 不该让每条对照每晚重核一遍。标题和正文分开记,
+    是为了认出"只改了标题"(``body_unchanged``): 那不是换了一篇(review on aw#128)。"""
+    return _h8(note.title) + _h8(note.body)
+
+
+def body_unchanged(old_fp: str | None, new_fp: str) -> bool:
+    """两个 text_fp 的正文那一半一样(只改了标题)。旧格式 / 没有旧指纹的不算。"""
+    return bool(old_fp) and len(old_fp) == len(new_fp) == 16 and old_fp[8:] == new_fp[8:]
 
 
 def overlap(note: Note, v: Version) -> float:
@@ -298,7 +310,8 @@ def still_same(note: Note, v: Version) -> bool:
 
     · 开头 40 字(去标点)和 v 一样 → 是;
     · v 有正文(四字串够 FUZZY_MIN_GRAMS): 笔记的四字串至少 EDITED_FLOOR 在 v 里 → 是;
-    · v 只有标题(HATHERINE 59 条 title_exact 连的是没正文的稿): 标题(去标点)一样 → 是。
+    · v 只有标题(HATHERINE 59 条 title_exact 连的是没正文的稿): 标题(去标点)一样, 或标题的四字串至少 TITLE_SAME_FLOOR
+      在 v 的标题里(改了一两个字) → 是。
     笔记没正文的不判(调用方先挡掉): 飞书一时读空, 不能当成换了一篇。"""
     pk = prefix_key(note.body)
     if pk and pk == prefix_key(v.body):
@@ -308,7 +321,12 @@ def still_same(note: Note, v: Version) -> bool:
         ng = grams(note.body)
         return bool(ng) and len(ng & vg) / len(ng) >= EDITED_FLOOR
     tk = title_key(note.title)
-    return bool(tk) and tk == title_key(v.title)
+    if not tk:
+        return False
+    if tk == title_key(v.title):
+        return True
+    nt = grams(note.title)
+    return bool(nt) and len(nt & grams(v.title)) / len(nt) >= TITLE_SAME_FLOOR
 
 
 # ── 人在发布前改了什么(2026-10-19, D-120 / W-23) ─────────────────────────────────────────────

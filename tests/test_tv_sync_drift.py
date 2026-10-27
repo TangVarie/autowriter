@@ -210,7 +210,7 @@ def test_a_failed_clear_moves_nothing_fails_the_cli_and_is_retried(monkeypatch, 
     monkeypatch.setattr(core, "sb", lambda: c)
     assert cli.main(["tv-sync", "--tv-project", TV, "--write-tv"]) == 1
     out = capsys.readouterr().out
-    assert "撤回 TV 旧血缘失败" in out and "017" in out
+    assert "撤回 TV 旧血缘失败" in out and "doctor" in out
     assert _link(c, "n1")["version_id"] == "v1" and _diff(c, "n1")["diff_rev"] == 0
 
     monkeypatch.setattr(store, "tv_clear_lineage", real)
@@ -472,3 +472,152 @@ def test_doctor_reports_017_missing_when_the_column_is_absent():
     assert "017_tv_link_text_fp.sql" in rep["missing"]
     st = {c["probe"]: c["state"] for c in rep["checks"]}
     assert st["tv_note_links 的 tv_text_fp 列"] == "missing" and st["deskcore_tv_clear_lineage"] == "applied"
+
+
+# ── review on aw#128 ──────────────────────────────────────────────────────────────────────────
+
+def test_a_title_only_edit_is_never_a_replacement_even_for_a_title_only_draft():
+    """HATHERINE 59 条 title_exact 连的是只有标题的稿: 指纹里标题一改, 以前 still_same 只能比标题、判成换了一篇,
+    挪成 ingested / unmatched, 对的那条对照就丢了。现在: 指纹的正文那一半没变 = 只改了标题; 标题改一两个字也还是那一篇。"""
+    notes = [_note("n3", "我的跑步第一课", BODY_TENNIS)]
+    c = _tv(notes)
+    _add_version(c, "v3", "i3", "我的跑步第一课", "")
+    core.tv_sync(c, TV, write_tv=True)
+    assert (_link(c, "n3")["match_kind"], _link(c, "n3")["version_id"]) == ("title_exact", "v3")
+
+    _replace(notes, "n3", BODY_TENNIS, title="我的跑步第一节课")             # 只改标题
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["drift"]["text_changed"] == 1 and out["drift"]["replaced"] == 0 and not c.tv_calls["clear"]
+
+    _replace(notes, "n3", BODY_TENNIS + "补一句: 第二节课学反手。", title="我的跑步第一课")   # 标题改回、正文也改
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["drift"]["text_changed"] == 1 and out["drift"]["replaced"] == 0
+    assert _link(c, "n3")["version_id"] == "v3" and _lineage(notes, "n3") == ("v3", "i3")
+
+
+def test_still_same_accepts_a_lightly_edited_title_for_a_title_only_draft():
+    title_only = _v("我的跑步第一课", "")
+    assert tvlink.still_same(_n("我的跑步第一节课", BODY_TENNIS), title_only)
+    assert not tvlink.still_same(_n("周末去打网球", BODY_TENNIS), title_only)
+    assert tvlink.body_unchanged(tvlink.text_fp(_n("甲标题", BODY_A)), tvlink.text_fp(_n("乙标题", BODY_A)))
+    assert not tvlink.body_unchanged(None, tvlink.text_fp(_n("甲标题", BODY_A)))
+
+
+@pytest.mark.parametrize("rematch", [False, True])
+def test_a_tv_lineage_link_stays_blocked_until_tv_changes_its_lineage(rematch):
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A, source_autowriter_version_id="v1")]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    _replace(notes, "n1", BODY_C, title="自我介绍删了前三句")
+    for _ in range(2):
+        out = core.tv_sync(c, TV, rematch=rematch, write_tv=True)
+        assert out["drift"]["blocked"] == 1 and _link(c, "n1")["version_id"] == "v1"
+        assert _diff(c, "n1")["diff_rev"] == 0 and _link(c, "n1")["tv_text_fp"] != tvlink.text_fp(
+            tvlink.Note.from_row(notes[0])), "不记指纹: 每晚都报"
+    notes[0]["source_autowriter_version_id"] = None                          # TV 那边把 lineage 清了
+    out = core.tv_sync(c, TV, rematch=rematch, write_tv=True)
+    assert (_link(c, "n1")["match_kind"], _link(c, "n1")["version_id"]) == ("body_exact", "v2")
+    assert _lineage(notes, "n1") == ("v2", "i2") and not c.tv_calls["clear"]
+
+
+def test_an_empty_body_night_does_not_bring_a_quarantined_diff_back():
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    _replace(notes, "n1", BODY_TENNIS)
+    core.tv_sync(c, TV)                                                      # 没开 --write-tv: 不挪, 差异隔离
+    assert _diff(c, "n1")["diff_rev"] == 0
+    notes[0]["raw_content"] = "【标题】秋招投了六十份简历没回音 【正文】 #跑步"
+    core.tv_sync(c, TV)
+    d = _diff(c, "n1")
+    assert d["diff_rev"] == 0 and d.get("published_chars") != 0, "不拿空正文算差异"
+
+
+def test_a_link_held_over_the_cap_is_not_backfilled_with_its_known_stale_version(monkeypatch):
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A), _note("n2", "自我介绍删了前三句", BODY_C)]
+    c = _tv(notes)
+    core.tv_sync(c, TV)                                                      # 没开 --write-tv: TV 空着, 对照没回填
+    _replace(notes, "n1", BODY_TENNIS, title="第一次打网球")
+    _replace(notes, "n2", BODY_NEW, title="上周发的那篇")
+    monkeypatch.setenv("TV_SYNC_RELINK_MAX", "1")
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["drift"]["over_cap"] == 2 and out["tv_backfilled"] == 0
+    assert _lineage(notes, "n1") == (None, None) and _lineage(notes, "n2") == (None, None)
+
+
+def test_the_first_fingerprint_also_recomputes_a_diff_made_before_the_text_was_edited():
+    legacy = {"note_id": "n1", "tv_project_id": TV, "project_id": P1, "version_id": "v1", "item_id": "i1",
+              "match_kind": "body_exact", "score": 1.0, "lag_days": 2, "updated_at": OLD_TS}
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes, links=[dict(legacy)])
+    core.tv_sync(c, TV, rematch=True)                                        # 造一条按旧正文算的差异
+    c.rows["tv_note_links"] = [dict(legacy)]                                 # 回到 017 之前: 没指纹
+    _diff(c, "n1")["computed_at"] = OLD_TS
+    assert _diff(c, "n1")["added_count"] == 0
+    _replace(notes, "n1", BODY_A + "最后补一句: 简历第一行写你最硬的那段经历。")    # 017 上线前运营加了一句
+    out = core.tv_sync(c, TV)
+    assert out["drift"]["seeded"] == 1
+    d = _diff(c, "n1")
+    assert d["added_count"] == 1 and d["computed_at"] == OLD_TS
+
+
+def test_rematch_keeps_a_link_whose_version_is_no_longer_the_items_best(monkeypatch):
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    item = next(i for i in c.rows["items"] if i["id"] == "i1")
+    item["best_version_id"] = "v1new"                                       # 写手后来又存了一版当 best
+    item["versions"].append({"id": "v1new", "title": "秋招投了六十份", "body": BODY_TENNIS,
+                             "version_num": 2, "created_at": _iso(5)})
+    monkeypatch.setattr(store, "versions_in_project",
+                        lambda sb, pid, ids: {"v1": {"title": "秋招投了六十份", "body": BODY_A}} if "v1" in ids else {})
+    out = core.tv_sync(c, TV, rematch=True, write_tv=True)
+    assert out["drift"]["kept_after_rematch"] == 1 and out["drift"]["relinked"] == 0
+    assert _link(c, "n1")["version_id"] == "v1" and _lineage(notes, "n1") == ("v1", "i1") and not c.tv_calls["clear"]
+
+
+def test_a_failed_diff_write_holds_the_fingerprint_so_the_recompute_is_retried(monkeypatch):
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    _diff(c, "n1")["computed_at"] = OLD_TS
+    old_fp = _link(c, "n1")["tv_text_fp"]
+    _replace(notes, "n1", BODY_A + "最后补一句: 简历第一行写你最硬的那段经历。")
+    real = store.tv_edit_diffs_upsert
+    monkeypatch.setattr(store, "tv_edit_diffs_upsert", lambda *a: (_ for _ in ()).throw(RuntimeError("23502")))
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["edit_diffs"]["error"] and out["drift"]["fp_held"] == 1
+    assert _link(c, "n1")["tv_text_fp"] == old_fp, "差异没算成: 指纹先不记"
+    monkeypatch.setattr(store, "tv_edit_diffs_upsert", real)
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["drift"]["text_changed"] == 1 and _diff(c, "n1")["added_count"] == 1
+    assert _diff(c, "n1")["computed_at"] == OLD_TS and _link(c, "n1")["tv_text_fp"] != old_fp
+
+
+def test_a_cleared_lineage_comes_back_if_the_move_never_lands_and_the_text_is_restored(monkeypatch):
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    original = notes[0]["raw_content"]
+    _replace(notes, "n1", BODY_TENNIS)
+    real = store.tv_links_upsert
+    monkeypatch.setattr(store, "tv_links_upsert", lambda *a: (_ for _ in ()).throw(RuntimeError("502")))
+    with pytest.raises(RuntimeError):
+        core.tv_sync(c, TV, write_tv=True)                                   # 撤回提交了, 挪对照没落地
+    assert _lineage(notes, "n1") == (None, None) and _link(c, "n1")["version_id"] == "v1"
+    monkeypatch.setattr(store, "tv_links_upsert", real)
+    notes[0]["raw_content"] = original                                       # 第二天运营又改回来了
+    core.tv_sync(c, TV, write_tv=True)
+    assert _link(c, "n1")["version_id"] == "v1" and _lineage(notes, "n1") == ("v1", "i1"), "回填补回去"
+
+
+def test_dry_run_over_the_cap_lists_every_move(monkeypatch, capsys):
+    notes = [_note(f"m{i:02d}", f"标题{i:02d}", BODY_A) for i in range(12)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    for i, n in enumerate(notes):
+        n["raw_content"] = f"【标题】网球第{i}课 【正文】{BODY_TENNIS}第{i}篇。"
+    monkeypatch.setattr(core, "sb", lambda: c)
+    assert cli.main(["tv-sync", "--tv-project", TV, "--write-tv", "--dry-run"]) == 1
+    out = capsys.readouterr().out
+    assert out.count("↻ m") == 12 and "另有" not in out

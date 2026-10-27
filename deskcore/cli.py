@@ -422,7 +422,7 @@ def _print_tv_drift(out: dict, tv: str) -> int:
     """已对上的对照 TV 正文变了没有(W-34)。回这一段该给的退出码。"""
     dr = out.get("drift") or {}
     keys = ("seeded", "text_changed", "replaced", "kept_after_rematch", "relinked", "deferred", "blocked",
-            "clear_missed", "unverifiable", "no_body_kept", "over_cap")
+            "clear_missed", "unverifiable", "no_body_kept", "over_cap", "fp_held")
     if not any(dr.get(k) for k in keys) and not dr.get("clear_error") and not dr.get("fp_error"):
         return 0
     print(f"  正文核对: 第一次记指纹 {dr.get('seeded', 0)}, 改过字还是那一篇 {dr.get('text_changed', 0)}, "
@@ -432,10 +432,15 @@ def _print_tv_drift(out: dict, tv: str) -> int:
           + (f", 原来那版取不到、明晚再核 {dr['unverifiable']}" if dr.get("unverifiable") else "")
           + (f", TV 正文是空的、没动 {dr['no_body_kept']}" if dr.get("no_body_kept") else "")
           + (f"; 记指纹 {dr['fp_written']} 行" if dr.get("fp_written") else ""))
-    for smp in (dr.get("samples") or [])[:10]:
+    samples = dr.get("samples") or []
+    # 预演和超上限时一条不漏: 放行之前人要看全清单(review on aw#128); 平时最多 10 条
+    shown = samples if (out.get("dry_run") or dr.get("over_cap")) else samples[:10]
+    for smp in shown:
         ov = "?" if smp.get("overlap") is None else smp["overlap"]
         new = (f"{smp['new_kind']} {(smp.get('new_version') or '')[:8]}".rstrip() if smp.get("new_kind") else "—")
         print(f"  ↻ {smp['note_id']}: {smp['old_kind']} {smp['old_version'][:8]} → {new} (重叠 {ov}) {smp['why']}")
+    if len(samples) > len(shown):
+        print(f"  …另有 {len(samples) - len(shown)} 条, 用 --dry-run 看全部")
     rc = 0
     if dr.get("over_cap"):
         print(f"  ⚠️ 正文整篇换了的有 {dr['over_cap']} 条, 超过每晚上限 {dr.get('relink_max')}: 一条都没挪, 差异已隔离。"
@@ -444,7 +449,8 @@ def _print_tv_drift(out: dict, tv: str) -> int:
               "(runbook §1.13)")
         rc = 1
     if dr.get("clear_error"):
-        print(f"  ⚠️ 撤回 TV 旧血缘失败: {dr['clear_error']} —— 017 跑了吗(`doctor`)? 这晚一条都没挪, 差异已隔离, 修好后下一晚会挪。")
+        print(f"  ⚠️ 撤回 TV 旧血缘失败: {dr['clear_error']} —— 库 / RPC 出错(或 service_role 没有这个函数的 EXECUTE, 看 "
+              "`doctor`)。这晚一条都没挪, 差异已隔离, 修好后下一晚会挪。")
         rc = 1
     if dr.get("clear_missed"):
         print(f"  ⚠️ {dr['clear_missed']} 条 TV 里的血缘已经不是我们写的那一对(被改过, 或 item 对不上): 没挪, 差异已隔离, "
@@ -453,6 +459,8 @@ def _print_tv_drift(out: dict, tv: str) -> int:
     if dr.get("fp_error"):
         print(f"  ⚠️ 正文指纹没记上: {dr['fp_error']} —— 只是下一晚再核一遍。")
         rc = 1
+    if dr.get("fp_held"):
+        print(f"  {dr['fp_held']} 条改过字的差异这晚没算成, 指纹先不记, 下一晚再核、再算。")
     if dr.get("deferred") and not dr.get("clear_error"):
         print(f"  {dr['deferred']} 条整篇换了、但没开 --write-tv(撤回不了 TV 的旧血缘): 没挪, 差异已隔离, 下次带 --write-tv 跑时挪。")
     if dr.get("blocked") and any((s.get("old_kind") == "tv_lineage") for s in (dr.get("samples") or [])):

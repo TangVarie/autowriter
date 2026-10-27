@@ -6640,7 +6640,10 @@ def _pinned(link: dict) -> bool:
 def _tv_text_state(prev: dict, n: tvlink.Note, fp_now: str, known: dict, linked_text: dict) -> str:
     """一条有版本的对照, TV 那边的正文现在怎样(W-34)。调用方已挡掉指纹没变的和没正文的。
     unverifiable: 连着的那一版取不到 —— 不判、不记指纹, 明晚再核(不能在取不到的那晚把"整篇换了"漏掉);
-    replaced: 整篇换了(tvlink.still_same 不认); seed: 017 之前的对照第一次记指纹; edited: 改过字, 还是那一篇。"""
+    replaced: 整篇换了(tvlink.still_same 不认); seed: 017 之前的对照第一次记指纹; edited: 改过字, 还是那一篇。
+    只改了标题(指纹的正文那一半没变)直接算 edited: 写作台那版只有标题时, 改一两个字会被 still_same 判成换了一篇(review on aw#128)。"""
+    if tvlink.body_unchanged(prev.get("tv_text_fp"), fp_now):
+        return "edited"
     v = known.get(str(prev["version_id"])) or linked_text.get(str(prev["version_id"]))
     if v is None:
         return "unverifiable"
@@ -6649,13 +6652,15 @@ def _tv_text_state(prev: dict, n: tvlink.Note, fp_now: str, known: dict, linked_
     return "seed" if prev.get("tv_text_fp") is None else "edited"
 
 
-def _linked_versions_outside_index(client, existing: dict, notes: list, fp_now: dict, known: dict) -> dict:
-    """指纹变了、连着的那一版又不在对照索引里(不是 best 的旧版 / 别处的版本)的, 按项目去库里取标题和正文, 好判换没换。
-    取不到的就没有 —— 那条记 unverifiable、明晚再核, 不当成"没换"。10-27 生产库 0 条, 留着兜底。"""
+def _linked_versions_outside_index(client, existing: dict, notes: list, fp_now: dict, known: dict,
+                                   *, rematch: bool = False) -> dict:
+    """指纹变了(或 --rematch)、连着的那一版又不在对照索引里(不是 best 的旧版 / 别处的版本)的, 按项目去库里取标题和正文,
+    好判换没换。取不到的就没有 —— 那条记 unverifiable、明晚再核, 不当成"没换"。10-27 生产库 0 条, 留着兜底。"""
     want: dict[str, set] = {}
     for n in notes:
         l = existing.get(n.note_id)
-        if (l and l.get("version_id") and l.get("project_id") and l.get("tv_text_fp") != fp_now[n.note_id]
+        if (l and l.get("version_id") and l.get("project_id")
+                and (rematch or l.get("tv_text_fp") != fp_now[n.note_id])
                 and not _pinned(l) and str(l["version_id"]) not in known):
             want.setdefault(str(l["project_id"]), set()).add(str(l["version_id"]))
     out: dict[str, tvlink.Version] = {}
@@ -6730,14 +6735,21 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
     def _ok(nid: str) -> bool:
         return _diffable(current[nid]) and nid not in blocked
 
+    def _has_body(nid: str) -> bool:
+        # 这晚 TV 读到的正文是空的(只剩标题 / 只剩话题): 不拿空正文算差异 —— 会算成"整篇删了"(review on aw#128)。
+        # 只管算不算, 不管降不降: 已有的差异照旧, 有正文了再算。
+        n = notes_by_id.get(nid)
+        return n is not None and bool(n.body)
+
     seen = {l["note_id"] for l in links}
-    fresh = {nid: current[nid] for nid in seen if _ok(nid)}
+    fresh = {nid: current[nid] for nid in seen if _ok(nid) and _has_body(nid)}
     # 先筛掉算不了的(笔记不在这次读到的范围 / 那一版不在对照索引里), 再截到每晚上限: 不然一堆永远算不了的
     # 老对照占满名额, 后面能算的一直轮不到。TV 改过字的排最前(W-34): 那几条的旧差异是错的。
-    backlog = sorted((dict(r, note_id=nid) for nid, r in current.items()
-                      if nid not in seen and (nid not in diffed or nid in stale) and _ok(nid)
-                      and nid in notes_by_id and str(r["version_id"]) in known),
-                     key=lambda r: r["note_id"] not in text_changed)[:TV_SYNC_DIFF_BACKFILL]
+    eligible = sorted((dict(r, note_id=nid) for nid, r in current.items()
+                       if nid not in seen and (nid not in diffed or nid in stale) and _ok(nid)
+                       and _has_body(nid) and str(r["version_id"]) in known),
+                      key=lambda r: r["note_id"] not in text_changed)
+    backlog = eligible[:TV_SYNC_DIFF_BACKFILL]
     # 已经按当前口径算过、但对照现在不该算了的(重对到抄回的那版 / 补上的 lag < 0 / W-34 整篇换了还没挪成的): 降回旧口径,
     # 摘要就读不到它; 不删行(删数据由人在 SQL 编辑器里做)。
     demote = sorted(nid for nid, d in diffed.items()
@@ -6767,7 +6779,9 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
            "recomputed": sum(1 for r in rows if r["note_id"] in stale), "written": 0,
            "lag_filled": 0, "demoted": 0,
            "text_recomputed": sum(1 for r in rows if r["note_id"] in text_changed),
-           "quarantined": sum(1 for nid in demote if nid in blocked)}
+           "quarantined": sum(1 for nid in demote if nid in blocked),
+           # 改过字、该重算却被每晚上限挤掉的: tv_sync 这晚不给它们记指纹, 明晚再算
+           "text_left": sorted({r["note_id"] for r in eligible[TV_SYNC_DIFF_BACKFILL:]} & set(text_changed))}
     if dry_run:
         out.update(lag_filled=len(lag_fill), demoted=len(demote))      # dry-run 报"会做多少"
         return out
@@ -6839,7 +6853,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     existing = store.tv_links(client, tv_project_id)
     notes_by_id = {n.note_id: n for n in notes}
     fp_now = {n.note_id: tvlink.text_fp(n) for n in notes}
-    linked_text = _linked_versions_outside_index(client, existing, notes, fp_now, known)
+    linked_text = _linked_versions_outside_index(client, existing, notes, fp_now, known, rematch=rematch)
     relink_max = _relink_max()
 
     now = store.iso_now()
@@ -6852,7 +6866,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     # W-34: 已对上的对照, TV 正文变了没有。这些数不进 counts(counts 加起来仍等于笔记数), 单独报。
     drift: dict = {"seeded": 0, "text_changed": 0, "kept_after_rematch": 0, "replaced": 0, "relinked": 0,
                    "deferred": 0, "blocked": 0, "unverifiable": 0, "no_body_kept": 0, "tv_cleared": 0,
-                   "clear_missed": 0, "fp_written": 0, "over_cap": 0, "relink_max": relink_max,
+                   "clear_missed": 0, "fp_written": 0, "fp_held": 0, "over_cap": 0, "relink_max": relink_max,
                    "clear_error": None, "fp_error": None, "samples": []}
     fp_set: dict[str, str] = {}          # 对照不重写、只记指纹的
     text_changed: set[str] = set()       # 改过字、还是那一篇: 差异按现在的正文重算
@@ -6920,8 +6934,9 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         else:
             to_ingest.append(n)                         # 补录 / W-10 那里再带上 w34_note
 
-    def _sample(n: tvlink.Note, prev: dict, m: tvlink.Match | None, why: str) -> None:
-        if len(drift["samples"]) >= 20:
+    def _sample(n: tvlink.Note, prev: dict, m: tvlink.Match | None, why: str, *, move: bool = False) -> None:
+        # 挪的(和超上限没挪的)一条不漏: 放行之前人要看全清单(review on aw#128); 其余只是提示, 最多 20 条
+        if not move and len(drift["samples"]) >= 20:
             return
         old_v = known.get(str(prev["version_id"])) or linked_text.get(str(prev["version_id"]))
         drift["samples"].append({
@@ -6952,34 +6967,48 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             drift["no_body_kept"] += 1
             continue
         old = str(prev["version_id"])
-        if not rematch:
-            st = _tv_text_state(prev, n, fp_now[n.note_id], known, linked_text)
-            if st == "unverifiable":
-                counts["already_linked"] += 1
-                drift["unverifiable"] += 1
-                continue
-            if st in ("seed", "edited"):
-                counts["already_linked"] += 1
-                fp_set[n.note_id] = fp_now[n.note_id]
-                drift["seeded" if st == "seed" else "text_changed"] += 1
-                if st == "edited":
-                    text_changed.add(n.note_id)
-                continue
-            # 整篇换了
+        old_v = known.get(old) or linked_text.get(old)
+        # tv_lineage 而 TV 还指着这一版: 那是 TV 自己说的来源(不是我们写回的), 正文整篇换了也不挪, 差异隔离、每晚报给人看;
+        # TV 改了 lineage(清掉 / 指到别的版)之后才按 TV / 内容走 —— --rematch 也一样(review on aw#128)。
+        tv_says_old = prev.get("match_kind") not in _CONTENT_KINDS and str(n.tv_version_id or "") == old
+        st = ("same" if rematch and prev.get("tv_text_fp") == fp_now[n.note_id] else
+              _tv_text_state(prev, n, fp_now[n.note_id], known, linked_text))
+        if st == "unverifiable":
+            counts["already_linked"] += 1
+            drift["unverifiable"] += 1
+            continue
+        if st == "replaced":
             drift["replaced"] += 1
-            if prev.get("match_kind") not in _CONTENT_KINDS:
-                # tv_lineage: TV 自己说的来源, 我们不改它; 差异隔离, 报给人看。不记指纹: 每晚都报, 直到人处理。
-                counts["already_linked"] += 1
+            if tv_says_old:
+                counts["already_linked"] += 1             # 不记指纹: 每晚都报, 直到人处理
                 blocked.add(n.note_id)
                 drift["blocked"] += 1
                 _sample(n, prev, None, "TV 带的 lineage, 正文整篇换了: 没挪, 差异已隔离, 要人看")
                 continue
-            ov = None
-            old_v = known.get(old) or linked_text.get(old)
-            if old_v is not None:
-                ov = tvlink.overlap(n, old_v)
+            ov = tvlink.overlap(n, old_v) if old_v is not None else None
             w34_note[n.note_id] = [{"note": f"W-34 {now[:10]}: TV 正文整篇换了(原来 {prev.get('match_kind')} "
                                             f"{old[:8]}, 重叠 {0 if ov is None else round(ov, 3)}), 按内容重对"}]
+        elif not rematch:
+            # seed / edited: 还是那一篇。只记指纹; 差异按现在的正文重算 —— seed 也算: 017 之前改过字的, 旧差异是按改之前
+            # 的正文算的, 这回不重算, 记了指纹就再也不会重算了(review on aw#128)。同一版, 不推 computed_at。
+            counts["already_linked"] += 1
+            fp_set[n.note_id] = fp_now[n.note_id]
+            drift["seeded" if st == "seed" else "text_changed"] += 1
+            text_changed.add(n.note_id)
+            continue
+        elif old not in known:
+            # --rematch, 连着的那版已不是 item 的 best(不在对照索引里): 匹配器看不见它, 重对只会对到别处或对不上 ——
+            # 按内容核得上就留着(以前 --rematch 靠 TV 的 lineage 留住它, review on aw#128); 取不到就不动; 核不上才往下重对。
+            if old_v is None:
+                counts["already_linked"] += 1
+                drift["unverifiable"] += 1
+                continue
+            if st != "same" or tvlink.still_same(n, old_v):
+                drift["kept_after_rematch"] += 1
+                counts["already_linked"] += 1
+                fp_set[n.note_id] = fp_now[n.note_id]
+                text_changed.add(n.note_id)
+                continue
         # 整篇换了, 或 --rematch。旧版本是我们自己写回 TV 的(TV 的 lineage 正是它)就不当证据, 按内容对 ——
         # 这也修了 --rematch 的回环: 以前 519 条写回过的对照一重对就走 tv_lineage 分支、对回同一版。
         own = prev.get("match_kind") in _CONTENT_KINDS and str(n.tv_version_id or "") == old
@@ -6993,9 +7022,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             w34_note.pop(n.note_id, None)
             if mv == old:
                 _apply(n, m)
+                links[-1]["tv_text_fp"] = prev.get("tv_text_fp")     # 指纹等差异算好了再记(见下面 fp_set)
             else:
                 counts["already_linked"] += 1
-                fp_set[n.note_id] = fp_now[n.note_id]
+            fp_set[n.note_id] = fp_now[n.note_id]
             text_changed.add(n.note_id)
             continue
         moved.append((n, m, prev, own))
@@ -7011,6 +7041,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             cleared = {n.note_id for n, _ in need}      # dry-run: 报"会怎样"
         elif need and write_tv:
             try:
+                # 先把这几条对照标成"没回填过"(review on aw#128): 撤回一提交, TV 就是 NULL 了; 之后挪对照那一步要是没落地
+                # (写库失败 / 进程被杀 / RPC 提交了但客户端超时), 第二天正文又改回来的话, 指纹不变、对照不重写, TV 就一直空着。
+                # 标过之后, 不管哪一步断, 回填都会把对照现在那一版补回去(只填 NULL, 安全)。
+                store.tv_links_mark_unsynced(client, [n.note_id for n, _ in need])
                 cleared = store.tv_clear_lineage(client, [
                     {"note_id": n.note_id, "version_id": prev["version_id"], "item_id": prev.get("item_id")}
                     for n, prev in need])
@@ -7022,7 +7056,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             go = not drift["over_cap"] and (not own or n.note_id in cleared)
             if go:
                 drift["relinked"] += 1
-                _sample(n, prev, m, "整篇换了, 已按内容重对" if not rematch else "--rematch 重对到别的判定")
+                _sample(n, prev, m, "整篇换了, 已按内容重对" if not rematch else "--rematch 重对到别的判定", move=True)
                 _apply(n, m, w34_note.get(n.note_id))
                 continue
             counts["already_linked"] += 1
@@ -7036,7 +7070,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 drift["deferred"] += 1
                 why = ("撤回 TV 旧血缘失败, 没挪, 明晚再试" if drift["clear_error"] else
                        "没开 --write-tv, 撤回不了 TV 的旧血缘, 没挪")
-            _sample(n, prev, m, why)
+            _sample(n, prev, m, why, move=True)
 
     ingest: dict | None = None
     unmatched_kept = 0                   # 没有补录目标、上次就是同样的 unmatched, 这次没重写(W-10)
@@ -7138,14 +7172,6 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     backfilled = 0
     if not dry_run:
         written_links = store.tv_links_upsert(client, links)
-        if fp_set:
-            # 只记指纹的(核过、没重写对照的)。写不成不要紧: 明晚再核一遍, 结论一样(退出码 1 让人知道)。
-            try:
-                drift["fp_written"] = store.tv_links_set_fp(client, fp_set)
-            except Exception as exc:                    # noqa: BLE001
-                logger.exception("tv_sync: 记 TV 正文指纹失败 (tv=%s)", tv_project_id)
-                drift["fp_written"] = getattr(exc, "done", 0)
-                drift["fp_error"] = f"{type(exc).__name__}: {exc}"[:200]
         if write_tv:
             # ingested 不回写(TV 2026-09-18 核对时的条件): 那些版本是我们从这条
             # 笔记复制进写作台的, 写回去等于说"这条笔记来源于版本 X"而 X 来源于
@@ -7154,15 +7180,30 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             # 那两列)。
             fresh = {l["note_id"] for l in links}
             pending = [l for l in links if _backfillable(l)]
+            # 整篇换了、这晚没挪成的(blocked)不回填: 那一版已知不是它的来源(review on aw#128)
             pending += [dict(r, note_id=nid) for nid, r in existing.items()
                         if _backfillable(r) and not r.get("synced_to_tv_at")
-                        and nid not in fresh]
+                        and nid not in fresh and nid not in blocked]
             backfilled = store.tv_backfill_lineage(client, pending)
             if pending:
                 store.tv_mark_synced(client, [l["note_id"] for l in pending])
 
     edit_diffs = _tv_edit_diffs(client, tv_project_id, links, existing, notes_by_id, known, dry_run=dry_run,
                                 text_changed=text_changed, blocked=blocked)
+    if fp_set and not dry_run:
+        # 指纹最后记, 而且只给差异已经按现在的正文算好了的(review on aw#128): 指纹一记, 明晚就不再当"改过字"; 差异这晚没算成
+        # (写库失败 / 读不出 / 被每晚上限挤掉)的先不记, 明晚再核、再算。前面回填抛错中断的, 一条都不记, 同理。
+        hold = set(edit_diffs.get("text_left") or ())
+        if edit_diffs.get("error"):
+            hold |= text_changed
+        todo = {nid: f for nid, f in fp_set.items() if nid not in hold}
+        drift["fp_held"] = len(fp_set) - len(todo)
+        try:
+            drift["fp_written"] = store.tv_links_set_fp(client, todo)
+        except Exception as exc:                        # noqa: BLE001 — 明晚再核一遍, 结论一样(退出码 1 让人知道)
+            logger.exception("tv_sync: 记 TV 正文指纹失败 (tv=%s)", tv_project_id)
+            drift["fp_written"] = getattr(exc, "done", 0)
+            drift["fp_error"] = f"{type(exc).__name__}: {exc}"[:200]
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
     return {
         "tv_project_id": tv_project_id,

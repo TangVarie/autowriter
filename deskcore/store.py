@@ -2313,6 +2313,13 @@ def tv_backfill_lineage(sb, links: list[dict]) -> int:
     return int(data or 0)
 
 
+def tv_links_mark_unsynced(sb, note_ids: list[str]) -> None:
+    """这几条对照标成"现在这一版还没回填进 TV"(synced_to_tv_at = NULL), W-34 撤回 TV 旧血缘之前先标(见 core.tv_sync)。"""
+    for i in range(0, len(note_ids), 200):
+        (sb.table("tv_note_links").update({"synced_to_tv_at": None})
+         .in_("note_id", note_ids[i:i + 200]).execute())
+
+
 def tv_clear_lineage(sb, links: list[dict]) -> set[str]:
     """撤回写作台自己写进 TV 的血缘(W-34, migrations/017): TV 的 source_autowriter_version_id / _item_id 两列都还
     等于传进来的 (version_id, item_id) 才清成 NULL。回实际清了的 note_id —— 没清掉的(TV 里已经是别的值)调用方不挪。
