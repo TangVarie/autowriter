@@ -296,6 +296,60 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
 
+### 1.13 `017_tv_link_text_fp` —— tv-sync 核对已对上的对照的 TV 正文（2026-10-27，W-34，**生产库尚未执行**）
+
+有版本的对照以前每晚记 `already_linked`、不再看 TV 的正文。运营在飞书里把一篇整篇换成另一篇（`note_id` 不变），对照、写回 TV 的
+`source_autowriter_*` 和改动差异就一直挂在原来那版上（D-129：BJS_phase1 14 条；10-27 还有 SPX_phase1 / TUGE_phase1 各 1 条）。
+`--rematch` 也救不了：写回过 TV 的对照一重对，就走 TV 的 lineage 分支对回同一版。017 加 `tv_note_links.tv_text_fp` 和
+`deskcore_tv_clear_lineage`；代码每晚只核指纹变了的对照，整篇换了的按内容重对，挪之前先撤回 TV 里我们自己写的那一对。
+规则见 `docs/deskcore.md` §3.7「正文换了」。
+
+**顺序（不能换）。** ① SQL Editor（`postgres`，函数属主）跑 `017`。只加东西，旧代码不读它。② 验收（SQL Editor）：
+
+```sql
+-- 一行: tv_text_fp
+select column_name from information_schema.columns
+ where table_schema = 'autowriter' and table_name = 'tv_note_links' and column_name = 'tv_text_fp';
+-- []
+select autowriter.deskcore_tv_clear_lineage('[]'::jsonb);
+-- 授权: true / false
+select has_function_privilege('service_role', 'autowriter.deskcore_tv_clear_lineage(jsonb)', 'EXECUTE'),
+       has_function_privilege('anon', 'autowriter.deskcore_tv_clear_lineage(jsonb)', 'EXECUTE');
+```
+
+③ 用 PR 分支、cron 服务的环境跑一次只算不写的预演，**看清会挪哪几条再合并**：
+
+```bash
+python -m deskcore.cli tv-sync --all --write-tv --dry-run
+```
+
+每个 TV 项目多一行「正文核对」和最多 10 行 `↻ note_id: 旧判定 旧版本 → 新判定 新版本 (重叠 x)`。首晚绝大多数对照只是第一次记指纹
+（10-27 估计约 500 条）。只该出现 W-34 查到的那几条；出现别的，先别合并，或者在 cron 服务上设 `TV_SYNC_RELINK_MAX=0`
+（只记指纹、只报不挪、差异先隔离，退出码 1），第二天看清单再放开。④ 合并（自动部署），`doctor` 里 017 两项 applied。
+
+**一晚之后验收：**
+
+```sql
+-- 有版本、不是 ingested、还没记指纹的: 只该剩飞书里已删的那些(016 之后不再读, 不核)
+select count(*) from autowriter.tv_note_links l
+ where l.version_id is not null and l.match_kind <> 'ingested' and l.tv_text_fp is null
+   and not exists (select 1 from truth_vault.v_notes_vanished v where v.note_id = l.note_id);   -- 0
+-- 挪过的: candidates 第一条是 W-34 的备注
+select note_id, match_kind, version_id, candidates->0->>'note' from autowriter.tv_note_links
+ where candidates::text like '%W-34%' order by updated_at desc;
+```
+
+**cron 退出码 1、日志里出现这几种时：**
+
+- `⚠️ 正文整篇换了的有 N 条, 超过每晚上限 M`：一条都没挪，差异已隔离。先 `tv-sync --tv-project X --write-tv --dry-run` 看清单；
+  是运营把一张表挪作他用（BJS 那种）就照 D-129 的路子由人处理，确实都该挪就手动跑一次
+  `TV_SYNC_RELINK_MAX=N python -m deskcore.cli tv-sync --tv-project X --write-tv`。
+- `⚠️ 撤回 TV 旧血缘失败`：017 没跑或库错。一条都没挪，差异已隔离，修好后下一晚自己挪。
+- `⚠️ TV 里的血缘已经不是我们写的那一对`：TV 那两列被别人改过（或 item 对不上）。没挪；到 TV 里看那一行，确认后人工处理。
+- `⚠️ 正文指纹没记上`：只是下一晚再核一遍，结论一样。
+
+`tv_lineage`（TV 自己带的来源）正文整篇换了：不挪、只在日志里报（不改退出码），差异隔离，要人看。
+
 ### 1.12 `016_tv_notes_skip_vanished` —— tv-sync 不再读飞书里已删的篇（2026-10-26，I-22，**生产库尚未执行**）
 
 TV 的 `truth_vault.notes` 只增不删：飞书里删掉或挪去别的表的篇，TV 那一行留着，进 `truth_vault.v_notes_vanished`（D-103）。

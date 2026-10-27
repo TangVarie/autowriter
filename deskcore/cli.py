@@ -410,10 +410,53 @@ def _tv_sync(core, sb, args) -> int:
         if ed.get("lag_error"):
             print(f"  ⚠️ 对照的 lag_days 没写回: {ed['lag_error']} —— 本次差异已按补出的 lag 排除抄回的那版, 下一晚会再补。")
             rc = 1
+        rc = max(rc, _print_tv_drift(out, tv))
         for smp in out["ambiguous_samples"]:
             print(f"  ? 分不出 {smp['note_id']} 「{smp['title']}」: "
                   + "; ".join(f"{c['version_id'][:8]}({c['score']}, {c['lag_days']}d)"
                               for c in smp["candidates"]))
+    return rc
+
+
+def _print_tv_drift(out: dict, tv: str) -> int:
+    """已对上的对照 TV 正文变了没有(W-34)。回这一段该给的退出码。"""
+    dr = out.get("drift") or {}
+    keys = ("seeded", "text_changed", "replaced", "kept_after_rematch", "relinked", "deferred", "blocked",
+            "clear_missed", "unverifiable", "no_body_kept", "over_cap")
+    if not any(dr.get(k) for k in keys) and not dr.get("clear_error") and not dr.get("fp_error"):
+        return 0
+    print(f"  正文核对: 第一次记指纹 {dr.get('seeded', 0)}, 改过字还是那一篇 {dr.get('text_changed', 0)}, "
+          f"整篇换了 {dr.get('replaced', 0)}(挪了 {dr.get('relinked', 0)}"
+          + (f", 撤回 TV 旧血缘 {dr['tv_cleared']}" if dr.get("tv_cleared") else "") + ")"
+          + (f", 重对还是原来那版 {dr['kept_after_rematch']}" if dr.get("kept_after_rematch") else "")
+          + (f", 原来那版取不到、明晚再核 {dr['unverifiable']}" if dr.get("unverifiable") else "")
+          + (f", TV 正文是空的、没动 {dr['no_body_kept']}" if dr.get("no_body_kept") else "")
+          + (f"; 记指纹 {dr['fp_written']} 行" if dr.get("fp_written") else ""))
+    for smp in (dr.get("samples") or [])[:10]:
+        ov = "?" if smp.get("overlap") is None else smp["overlap"]
+        new = (f"{smp['new_kind']} {(smp.get('new_version') or '')[:8]}".rstrip() if smp.get("new_kind") else "—")
+        print(f"  ↻ {smp['note_id']}: {smp['old_kind']} {smp['old_version'][:8]} → {new} (重叠 {ov}) {smp['why']}")
+    rc = 0
+    if dr.get("over_cap"):
+        print(f"  ⚠️ 正文整篇换了的有 {dr['over_cap']} 条, 超过每晚上限 {dr.get('relink_max')}: 一条都没挪, 差异已隔离。"
+              f"先 `tv-sync --tv-project {tv} --write-tv --dry-run` 看清单; 都该挪就 "
+              f"`TV_SYNC_RELINK_MAX={dr['over_cap']} python -m deskcore.cli tv-sync --tv-project {tv} --write-tv`"
+              "(runbook §1.13)")
+        rc = 1
+    if dr.get("clear_error"):
+        print(f"  ⚠️ 撤回 TV 旧血缘失败: {dr['clear_error']} —— 017 跑了吗(`doctor`)? 这晚一条都没挪, 差异已隔离, 修好后下一晚会挪。")
+        rc = 1
+    if dr.get("clear_missed"):
+        print(f"  ⚠️ {dr['clear_missed']} 条 TV 里的血缘已经不是我们写的那一对(被改过, 或 item 对不上): 没挪, 差异已隔离, "
+              "到 TV 里看那一行再人工处理(runbook §1.13)。")
+        rc = 1
+    if dr.get("fp_error"):
+        print(f"  ⚠️ 正文指纹没记上: {dr['fp_error']} —— 只是下一晚再核一遍。")
+        rc = 1
+    if dr.get("deferred") and not dr.get("clear_error"):
+        print(f"  {dr['deferred']} 条整篇换了、但没开 --write-tv(撤回不了 TV 的旧血缘): 没挪, 差异已隔离, 下次带 --write-tv 跑时挪。")
+    if dr.get("blocked") and any((s.get("old_kind") == "tv_lineage") for s in (dr.get("samples") or [])):
+        print("  ⚠️ TV 自己带的 lineage 指着的那版和现在的正文不是一篇: 没挪(那是 TV 说的), 差异已隔离, 要人看。")
     return rc
 
 
@@ -718,7 +761,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tv-project", default=None)
     p.add_argument("--all", action="store_true", help="tv_project_map 里的全部 TV 项目")
     p.add_argument("--since", default=None, help="只看 TV 里这个时间之后进的笔记(ISO)")
-    p.add_argument("--rematch", action="store_true", help="已对上的也重新对一遍")
+    p.add_argument("--rematch", action="store_true",
+                   help="已对上的也按内容重新对一遍(我们自己写回 TV 的 lineage 不算证据; ingested 和人定过的不动; "
+                        "挪走要 --write-tv, 受 TV_SYNC_RELINK_MAX 限)")
     p.add_argument("--write-tv", action="store_true",
                    help="把对照写回 TV 的 source_autowriter_* 列(只填空的; 先跟 TV 打招呼)")
     p.add_argument("--dry-run", action="store_true", help="全部算、一行不写")

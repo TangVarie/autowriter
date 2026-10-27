@@ -71,6 +71,8 @@ _ALL_RPCS = {
     "deskcore_tv_notes": lambda a: [],
     "deskcore_tv_backfill_lineage": lambda a: 0,
     "deskcore_ingest_unlock": lambda a: False,
+    # 017: 撤回写作台自己写进 TV 的旧血缘(空 _links → 一行不碰)
+    "deskcore_tv_clear_lineage": lambda a: [],
 }
 
 
@@ -128,6 +130,7 @@ def test_bare_001_db_reports_every_later_migration_missing():
         "006_item_decision_provenance.sql",
         "009_tv_links.sql",           # 读 TV 的 RPC 不在 → 009 没跑
         "012_review_via_agent_provenance.sql",
+        "017_tv_link_text_fp.sql",    # 撤回 TV 血缘的 RPC 不在 → 017 没跑
     ]
     st = _states(report)
     assert st["表 draft_fingerprints"] == "applied"      # 001 在

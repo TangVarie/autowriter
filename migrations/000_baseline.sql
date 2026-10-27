@@ -1375,6 +1375,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
     autowriter.tv_project_map,
     autowriter.tv_note_links
     TO service_role;
+-- 017: 最近一次核对时 TV 正文的指纹(W-34, tv-sync 每晚只核指纹变了的对照)
+ALTER TABLE autowriter.tv_note_links
+    ADD COLUMN IF NOT EXISTS tv_text_fp TEXT;
+COMMENT ON COLUMN autowriter.tv_note_links.tv_text_fp IS
+    'W-34: 最近一次核对时 TV 正文的指纹(tvlink.text_fp: 标题 + 剥话题正文, fp.normalize 后 sha1 前 16 位)。NULL = 017 之前的对照, 或还没核过';
 
 -- ── 补录锁: 按项目一行, 到期可被接管 ──
 CREATE TABLE IF NOT EXISTS autowriter.ingest_locks (
@@ -1521,6 +1526,40 @@ REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM PUBLI
 REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM anon;
 REVOKE ALL ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) FROM authenticated;
 GRANT EXECUTE ON FUNCTION autowriter.deskcore_tv_backfill_lineage(JSONB) TO service_role;
+
+-- ── 撤回写作台自己写进 TV 的血缘: 两列都还等于传进来的那一对才清, 返回清了的 note_id ──
+CREATE OR REPLACE FUNCTION autowriter.deskcore_tv_clear_lineage(_links JSONB)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+    _ids JSONB;
+BEGIN
+    IF to_regclass('truth_vault.notes') IS NULL THEN
+        RETURN '[]'::jsonb;
+    END IF;
+    EXECUTE
+        'WITH u AS ( '
+        '  UPDATE truth_vault.notes t '
+        '     SET source_autowriter_version_id = NULL, '
+        '         source_autowriter_item_id    = NULL '
+        '    FROM jsonb_to_recordset($1) AS l(note_id TEXT, version_id UUID, item_id UUID) '
+        '   WHERE t.note_id = l.note_id '
+        '     AND l.version_id IS NOT NULL '
+        '     AND t.source_autowriter_version_id = l.version_id '
+        '     AND t.source_autowriter_item_id IS NOT DISTINCT FROM l.item_id '
+        '  RETURNING t.note_id) '
+        'SELECT COALESCE(jsonb_agg(note_id ORDER BY note_id), ''[]''::jsonb) FROM u'
+        INTO _ids USING _links;
+    RETURN _ids;
+END;
+$$;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_clear_lineage(JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_clear_lineage(JSONB) FROM anon;
+REVOKE ALL ON FUNCTION autowriter.deskcore_tv_clear_lineage(JSONB) FROM authenticated;
+GRANT EXECUTE ON FUNCTION autowriter.deskcore_tv_clear_lineage(JSONB) TO service_role;
 
 -- ══════════════════════════════════════════════════════════════════════
 -- 009 那三张表开 RLS (migrations/010_tv_links_rls.sql)
