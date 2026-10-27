@@ -2212,7 +2212,7 @@ def tv_links(sb, tv_project_id: str) -> dict[str, dict]:
     def _build(off, lim):
         return (sb.table("tv_note_links")
                 .select("note_id, project_id, version_id, item_id, match_kind, "
-                        "score, lag_days, synced_to_tv_at, candidates")
+                        "score, lag_days, synced_to_tv_at, candidates, tv_text_fp")
                 .eq("tv_project_id", tv_project_id)
                 .order("note_id").range(off, off + lim - 1))
     return {r["note_id"]: r for r in _paged(_build)}
@@ -2266,6 +2266,24 @@ def tv_links_set_lag(sb, lags: dict[str, int]) -> int:
     return n
 
 
+def tv_links_set_fp(sb, fps: dict[str, str]) -> int:
+    """给已有对照记上 TV 正文的指纹(``{note_id: fp}``, W-34), 回实际改到的行数。
+
+    一行一次 update: 每条的值都不一样, 分不了组; 不走 upsert —— 只带两列的 upsert 会先按插入校验整行的非空约束,
+    而且一条刚被人在 SQL 编辑器里删掉的对照会被它插回一个残行。不碰 updated_at: 指纹只是"核过了", 对照本身没变。
+    上线首晚约 500 行(每条对照第一次记), 之后每晚只有改过字的那几条。"""
+    n = 0
+    for nid, f in fps.items():
+        try:
+            res = sb.table("tv_note_links").update({"tv_text_fp": f}).eq("note_id", nid).execute()
+        except Exception as exc:                        # noqa: BLE001
+            if not n:
+                raise
+            raise PartialWriteError(n, exc) from exc
+        n += len(res.data or [])
+    return n
+
+
 def tv_edit_diffs_demote(sb, note_ids: list[str]) -> int:
     """这些笔记的差异行降回 diff_rev 0, 回实际改到的行数: 对照现在不该算差异了(重对到抄回的那版 / 补上的 lag < 0),
     摘要不再读它。"""
@@ -2293,6 +2311,27 @@ def tv_backfill_lineage(sb, links: list[dict]) -> int:
     if isinstance(data, list):
         data = data[0] if data else 0
     return int(data or 0)
+
+
+def tv_links_mark_unsynced(sb, note_ids: list[str]) -> None:
+    """这几条对照标成"现在这一版还没回填进 TV"(synced_to_tv_at = NULL), W-34 撤回 TV 旧血缘之前先标(见 core.tv_sync)。"""
+    for i in range(0, len(note_ids), 200):
+        (sb.table("tv_note_links").update({"synced_to_tv_at": None})
+         .in_("note_id", note_ids[i:i + 200]).execute())
+
+
+def tv_clear_lineage(sb, links: list[dict]) -> set[str]:
+    """撤回写作台自己写进 TV 的血缘(W-34, migrations/017): TV 的 source_autowriter_version_id / _item_id 两列都还
+    等于传进来的 (version_id, item_id) 才清成 NULL。回实际清了的 note_id —— 没清掉的(TV 里已经是别的值)调用方不挪。
+    不吞异常: 清没清成决定对照挪不挪, 调用方要知道。"""
+    rows = [{"note_id": l["note_id"], "version_id": l["version_id"], "item_id": l.get("item_id")}
+            for l in links if l.get("version_id")]
+    if not rows:
+        return set()
+    data = sb.rpc("deskcore_tv_clear_lineage", {"_links": rows}).execute().data
+    if isinstance(data, list) and len(data) == 1 and isinstance(data[0], list):
+        data = data[0]                                  # 有的客户端把标量 JSONB 再包一层
+    return {str(x) for x in (data or [])}
 
 
 def tv_mark_synced(sb, note_ids: list[str]) -> None:

@@ -49,6 +49,10 @@ FINAL_SOURCE = {
         "016_tv_notes_skip_vanished.sql",
         "009 建; 016 排除飞书里已删的篇(TV 的 v_notes_vanished), 签名不变",
     ),
+    "deskcore_tv_clear_lineage": (
+        "017_tv_link_text_fp.sql",
+        "017 建: 撤回写作台自己写进 TV 的血缘(两列都还等于才清), 回清了的 note_id",
+    ),
 }
 
 

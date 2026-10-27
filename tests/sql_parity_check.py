@@ -186,7 +186,8 @@ def main() -> int:
                "deskcore_reserve_angles", "claim_one_job",
                "update_calibration_notes_cas", "deskcore_fingerprint_counts",
                "deskcore_tv_notes", "deskcore_tv_backfill_lineage",
-               "deskcore_ingest_lock", "deskcore_ingest_unlock"):    # 009
+               "deskcore_ingest_lock", "deskcore_ingest_unlock",     # 009
+               "deskcore_tv_clear_lineage"):                         # 017
         n = sql("SELECT count(*) FROM pg_proc p JOIN pg_namespace ns "
                 "ON ns.oid = p.pronamespace "
                 f"WHERE ns.nspname='autowriter' AND p.proname='{fn}';")
@@ -215,7 +216,7 @@ def main() -> int:
             bad += 1
     sql(f"DELETE FROM autowriter.items WHERE user_id='{UID}';")
     if not bad:
-        print("  ✓ 抽查的 11 张表 + 10 个函数 + 决策出处三列都在, "
+        print("  ✓ 抽查的 11 张表 + 11 个函数 + 决策出处三列都在, "
               "且 CHECK 与 db.DecisionSource 一致")
 
     # ── ①'' 009 的跨 schema RPC 在【没有 truth_vault】的库上要能调、且干净返回空 ──
@@ -230,8 +231,13 @@ def main() -> int:
     if n != "0":
         print(f"  [FAIL] deskcore_tv_backfill_lineage 在没有 truth_vault 的库上应返回 0, 得到 {n!r}")
         bad += 1
+    n = sql("SELECT autowriter.deskcore_tv_clear_lineage("
+            "'[{\"note_id\":\"x\",\"version_id\":\"11111111-1111-1111-1111-111111111111\"}]'::jsonb) = '[]'::jsonb;")
+    if n != "t":
+        print(f"  [FAIL] deskcore_tv_clear_lineage(017) 在没有 truth_vault 的库上应返回 [], 得到 {n!r}")
+        bad += 1
     if not bad:
-        print("  ✓ 009 的两个跨 schema RPC 在没有 truth_vault 的库上干净返回空")
+        print("  ✓ 009 / 017 的跨 schema RPC 在没有 truth_vault 的库上干净返回空")
 
     # ── ①″ 再给它一个【有】truth_vault 的库: 读得到、回填只填 NULL 的行 ──
     # 只建 notes 里两个函数碰到的那几列 —— 这不是 TV 的 schema, 只是让守卫之外
@@ -293,6 +299,9 @@ def main() -> int:
 
     # ── ①⁗' 016: 飞书里已删的篇(TV 的 v_notes_vanished)不再读给 tv-sync ──
     bad += _check_tv_notes_skip_vanished()
+
+    # ── ①⁗'' 017: 撤回写作台自己写进 TV 的血缘(compare-and-swap) ──
+    bad += _check_tv_clear_lineage()
 
     run_sql_text("DROP SCHEMA truth_vault CASCADE;", "truth_vault 替身清理")
 
@@ -757,6 +766,80 @@ def _check_tv_notes_skip_vanished() -> int:
     if not bad:
         print("  ✓ 016: 视图不在照旧全给; 视图在时飞书删了的不给、没盖过戳的照给; 翻页不被删了的篇占名额; "
               "按本项目最近一次完整同步判; service_role 调得通、anon/authenticated 调不了; 重跑幂等")
+    return bad
+
+
+def _check_tv_clear_lineage() -> int:
+    """017: ``deskcore_tv_clear_lineage`` 只清 TV 里两列都还等于传进来那一对的行, 回清了的 note_id。
+
+    为什么要它(2026-10-27, W-34): 运营在飞书里把一篇整篇换成另一篇, tv-sync 要把对照挪走; 挪之前得先撤回它当初
+    写回 TV 的 source_autowriter_*(009 的回填只填 NULL, 不撤回的话新版本永远写不进去)。撤回必须是 compare-and-swap:
+    TV 里已经是别人的值就不能动, 调用方也只挪真清掉的那几条。truth_vault 替身还在。验:
+
+      1. 版本和 item 都对上才清; item 对不上(或版本对不上)不动; 链接带的 item 是 NULL 时按 IS NOT DISTINCT FROM 比;
+      2. 回的是清了的 note_id(JSONB 数组, 按 note_id 排序); 重跑一次: 一行都不清, 回 [];
+      3. 清完 009 的回填(只填 NULL)能把新版本和新 item 写进去 —— tv-sync 同一晚就是这么接上的;
+      4. 以 service_role(无 BYPASSRLS)调得通; anon / authenticated 调不了。
+    """
+    bad = 0
+    V1, V2, V3, V4, V9 = (f"{d * 8}-{d * 4}-{d * 4}-{d * 4}-{d * 12}" for d in "abcde")
+    I1, I2, I4, I9 = (f"{d * 8}-{d * 4}-{d * 4}-{d * 4}-{d * 12}" for d in "1234")
+    sql("INSERT INTO truth_vault.notes (note_id, project_id, raw_content, source_autowriter_version_id, "
+        "source_autowriter_item_id) VALUES "
+        f"('w1', 'W34', 'x', '{V1}', '{I1}'), ('w2', 'W34', 'x', '{V2}', '{I2}'), "
+        f"('w3', 'W34', 'x', '{V3}', NULL), ('w4', 'W34', 'x', '{V4}', '{I4}');")
+
+    def call(links: str, want: str, why: str) -> None:
+        nonlocal bad
+        g = sql(f"SELECT autowriter.deskcore_tv_clear_lineage('{links}'::jsonb)::text;")
+        ok = sql(f"SELECT '{g}'::jsonb = '{want}'::jsonb;") if g else "f"
+        if ok != "t":
+            print(f"  [FAIL] 017 · {why}: 期望 {want}, 得到 {g!r}")
+            bad += 1
+
+    links = ("[" + ",".join([
+        f'{{"note_id":"w1","version_id":"{V1}","item_id":"{I1}"}}',          # 两列都对上 → 清
+        f'{{"note_id":"w2","version_id":"{V2}","item_id":"{I1}"}}',          # item 对不上 → 不动
+        f'{{"note_id":"w3","version_id":"{V3}","item_id":null}}',            # item 两边都是 NULL → 清
+        f'{{"note_id":"w4","version_id":"{V1}","item_id":"{I4}"}}',          # 版本对不上 → 不动
+        '{"note_id":"nope","version_id":"' + V1 + '","item_id":null}',      # TV 里没有 → 不动
+        '{"note_id":"w2","version_id":null,"item_id":null}',                 # 没带版本 → 不动
+    ]) + "]")
+    call(links, '["w1","w3"]', "只清两列都对上的, 回清了的 note_id")
+    got = sql("SELECT string_agg(note_id || ':' || coalesce(source_autowriter_version_id::text, '-') || '/' "
+              "|| coalesce(source_autowriter_item_id::text, '-'), ' ' ORDER BY note_id) "
+              "FROM truth_vault.notes WHERE project_id = 'W34';")
+    want = f"w1:-/- w2:{V2}/{I2} w3:-/- w4:{V4}/{I4}"
+    if got != want:
+        print(f"  [FAIL] 017 · 清完 TV 该是 {want!r}, 得到 {got!r}")
+        bad += 1
+    call(links, "[]", "重跑一次: 一行都不清")
+    n = sql("SELECT autowriter.deskcore_tv_backfill_lineage("
+            f"'[{{\"note_id\":\"w1\",\"version_id\":\"{V9}\",\"item_id\":\"{I9}\"}}]'::jsonb);")
+    got = sql("SELECT source_autowriter_version_id::text || '/' || source_autowriter_item_id::text "
+              "FROM truth_vault.notes WHERE note_id = 'w1';")
+    if n != "1" or got != f"{V9}/{I9}":
+        print(f"  [FAIL] 017 · 清完之后 009 的回填该写进新的一对: 回 {n!r}, TV 是 {got!r}")
+        bad += 1
+
+    sql("GRANT USAGE ON SCHEMA autowriter TO service_role;")
+    r = subprocess.run(_psql() + ["-tAc", "SET ROLE service_role; SELECT autowriter.deskcore_tv_clear_lineage("
+                                  f"'[{{\"note_id\":\"w1\",\"version_id\":\"{V9}\",\"item_id\":\"{I9}\"}}]'"
+                                  "::jsonb)::text;"], capture_output=True, text=True)
+    g = (r.stdout.strip().splitlines() or [""])[-1] if r.returncode == 0 else r.stderr.strip()[-200:]
+    if g != '["w1"]':
+        print(f"  [FAIL] 017 · service_role 调 deskcore_tv_clear_lineage 得到 {g!r}(应为 [\"w1\"])")
+        bad += 1
+    sig = "'autowriter.deskcore_tv_clear_lineage(jsonb)'"
+    for role, want_priv in (("service_role", "t"), ("anon", "f"), ("authenticated", "f")):
+        g = sql(f"SELECT has_function_privilege('{role}', {sig}, 'EXECUTE');")
+        if g != want_priv:
+            print(f"  [FAIL] 017 · {role} 对 deskcore_tv_clear_lineage 的 EXECUTE 是 {g!r}(应为 {want_priv!r})")
+            bad += 1
+    sql("DELETE FROM truth_vault.notes WHERE project_id = 'W34';")
+    if not bad:
+        print("  ✓ 017: 两列都对上才清(item 按 IS NOT DISTINCT FROM 比), 回清了的 note_id, 重跑不清; 清完回填写得进新的一对; "
+              "service_role 调得通、anon/authenticated 调不了")
     return bad
 
 
