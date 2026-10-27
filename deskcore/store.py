@@ -906,6 +906,48 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
     return True
 
 
+# 送去台账查状态的 key 只收这种形状(W-31)。postgrest-py 的 in_() 遇到 , : ( ) 只给值套一层双引号, 不转义里面的
+# " 和 \ —— 模型编出来的 key 什么字符都可能有, 一个坏 key 就让整条查询报错。台账里的 key 全是
+# fingerprint.angle_key 出来的 20 位十六进制(10-27 查生产库 1,619 行无一例外), 不是这个形状的本来就不可能在台账里。
+_LEDGER_LOOKUP_KEY = re.compile(r"[0-9A-Za-z_\-]{1,64}")
+
+ANGLE_KEY_UNKNOWN = "unknown"   # 本项目台账里没有这个 key: 模型自己编的、抄错的
+ANGLE_KEY_USED = "used"         # 有, 但每一行都已经销给了别的版本: 一个 key 给了两篇
+ANGLE_KEY_OPEN = "open"         # 还有没销账的行: 没销成是并发 / 查询出错, 不是 key 的问题
+
+
+def angle_key_states(sb, project_id: str, keys) -> dict[str, str] | None:
+    """这几个 angle_key 在本项目台账里是什么状态: ``{key: unknown | used | open}``(W-31, 2026-10-27)。
+
+    只在 ``consume_angle`` 没销成的那几条上调, 一次查询。``consume_angle`` 找不到行只回 False + 一行 warning,
+    分不清是 key 写错了还是被并发抢先 —— 10-26 sportsix 19 篇带的 key 一条都不在台账里(7~8 位带下划线的编号、
+    53 位的长串), 回包只说「销账少了几个」, 写手那边的 AI 不知道自己的 key 是错的。
+
+    查询失败回 None(调用方当作分不清, 照旧笼统地报); 不抛。"""
+    want = list(dict.fromkeys(str(k) for k in (keys or []) if k))
+    states = {k: ANGLE_KEY_UNKNOWN for k in want}
+    lookup = [k for k in want if _LEDGER_LOOKUP_KEY.fullmatch(k)]
+    if not lookup:
+        return states
+    try:
+        rows = _paged(lambda off, lim: (
+            sb.table("angle_ledger").select("angle_key, consumed_version_id")
+              .eq("project_id", project_id).in_("angle_key", lookup)
+              .order("id").range(off, off + lim - 1)))
+    except Exception:
+        logger.exception("angle key states lookup failed (project=%s)", project_id)
+        return None
+    for r in rows:
+        k = r.get("angle_key")
+        if k not in states:
+            continue
+        if r.get("consumed_version_id") is None:
+            states[k] = ANGLE_KEY_OPEN
+        elif states[k] == ANGLE_KEY_UNKNOWN:
+            states[k] = ANGLE_KEY_USED
+    return states
+
+
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────
 
 PAGE = 1000        # PostgREST 默认 max-rows, 见下方说明

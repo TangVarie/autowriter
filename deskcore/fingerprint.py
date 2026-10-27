@@ -342,6 +342,10 @@ def verdict(title_sim: float, opening_exact: bool, ngram_j: float,
 
 # ── 发牌坐标指纹 ──────────────────────────────────────────────────────────
 
+# angle_key 的长度。台账(angle_ledger)里的 key 全是这里出来的, score_drafts 回包据此告诉模型「key 长什么样」(W-31)。
+ANGLE_KEY_HEX_LEN = 20
+
+
 def angle_key(dims: dict) -> str:
     """创作坐标的规范化指纹。只取参与无放回抽样的四个主维度。
 
@@ -351,7 +355,7 @@ def angle_key(dims: dict) -> str:
     core = "|".join(str(dims.get(k, "")) for k in
                     ("emotional_lever", "human_truth_archetype",
                      "content_format", "title_structure"))
-    return hashlib.sha256(core.encode("utf-8")).hexdigest()[:20]
+    return hashlib.sha256(core.encode("utf-8")).hexdigest()[:ANGLE_KEY_HEX_LEN]
 
 
 # ── 正例多样性限额 ────────────────────────────────────────────────────────

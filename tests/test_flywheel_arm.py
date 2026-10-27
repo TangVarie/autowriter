@@ -377,3 +377,78 @@ def test_tool_docs_explain_external_reference_cards():
     for fn in (tools.open_project, tools.borrow_lessons):
         doc = fn.__doc__ or ""
         assert "external=true" in doc and "不是公司投的" in doc and "品牌" in doc, fn.__name__
+
+
+# ── 模型传回的臂和服务端借卡记的对不上: 以服务端为准 (W-31, 10-27) ──────────────────────────────
+# 10-26 sportsix: 那场借卡是 explore (TV 缓存键 `:explore`, 没给规律), 5 批里 4 批模型传回的是 patterns, 照单记成
+# patterns, 来源 brief —— 只有没传臂的那一批 (来源 borrow) 记对了。对照组被污染, 只能事后手工剔。
+
+def _commit_out(monkeypatch, **kw):
+    """同 _commit_with, 但把回包和假库一起交回来 (要看 flywheel_arm_corrected 和 batch_metrics)。"""
+    captured = {}
+    real = store.mint_draft_identity
+
+    def spy(sb, project_id, user_id, tactic, entries, *, batch_params=None):
+        captured["params"] = batch_params
+        return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
+    monkeypatch.setattr(store, "mint_draft_identity", spy)
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    c = FakeClient(rows={"projects": [{"id": PID, "name": "项目", "brand": "A", "owner_id": ME,
+                                       "calibration_notes": "", "tactics": "[]", "custom_roles": []}]})
+    c.rpc_impl["deskcore_commit_fingerprints"] = lambda args: [
+        {"idx": i, "status": core.COMMIT_STATUS_INSERTED, "collided_with": None, "detail": None}
+        for i in range(len(args.get("_rows") or []))]
+    out = core.commit_drafts(c, PID, [{"title": "标题一", "body": "正文一二三四五六七八", "keywords": ["a"]}],
+                             user_id=ME, **kw)
+    return out, captured["params"], _commit_meta(c)
+
+
+def test_an_arm_the_server_never_issued_is_overridden_by_the_borrow(monkeypatch, fresh_arms):
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "explore")
+    fake = _Librarian(PATTERNS)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+    brief = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    assert brief["flywheel_arm"] == "explore" and "validated_patterns" not in brief
+
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm="patterns")
+    assert params == {"source": "deskcore", "flywheel_arm": "explore", "flywheel_arm_source": "borrow",
+                      "flywheel_arm_reported": "patterns"}
+    assert (meta["flywheel_arm"], meta["flywheel_arm_source"], meta["flywheel_arm_reported"]) == \
+        ("explore", "borrow", "patterns"), "batch_metrics.meta 是分析对照组的第二份记录, 也要有"
+    corr = out["flywheel_arm_corrected"]
+    assert (corr["reported"], corr["recorded"]) == ("patterns", "explore")
+    assert "原样传回" in corr["note"] and "没有给已验证规律" in corr["note"]
+
+
+def test_an_arm_the_server_did_issue_is_kept_and_nothing_is_flagged(monkeypatch, fresh_arms):
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    core.borrow_lessons(_client(), PID, user_id=ME)
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm="patterns")
+    assert params == {"source": "deskcore", "flywheel_arm": "patterns", "flywheel_arm_source": "brief"}
+    assert "flywheel_arm_corrected" not in out and "flywheel_arm_reported" not in meta
+
+
+def test_with_no_record_the_reported_arm_is_taken_as_is(monkeypatch, fresh_arms):
+    """进程里什么都没有 (重启过 / 36 小时没借过卡): 无从核对, 照旧采用模型传回的。"""
+    now = datetime(2026, 10, 27, 2, tzinfo=timezone.utc)
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "explore")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    monkeypatch.setattr(core, "_utcnow", lambda: now - timedelta(hours=40))
+    core.borrow_lessons(_client(), PID, user_id=ME)                         # 已经过了 36 小时的那次不算
+    monkeypatch.setattr(core, "_utcnow", lambda: now)
+    out, params, _ = _commit_out(monkeypatch, flywheel_arm="patterns")
+    assert (params["flywheel_arm"], params["flywheel_arm_source"]) == ("patterns", "brief")
+    assert "flywheel_arm_corrected" not in out
+
+
+def test_a_follow_up_borrow_does_not_reuse_an_arm_it_never_issued(monkeypatch, fresh_arms):
+    """borrow_lessons 的 reuse 走同一道: 不然一句传错的臂先被借卡记下来 (还真按 patterns 借了规律), 入库就核不出来了。"""
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "explore")
+    fake = _Librarian(PATTERNS)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+    core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    out = core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm="patterns")
+    assert out["flywheel_arm"] == "explore" and fake.briefs[-1]["explore"] is True
+    assert out["validated_patterns"] == []
+    assert core.batch_arm(PID, ME, from_brief="patterns") == ("explore", "borrow")

@@ -666,6 +666,10 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
 
     **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零就是有几条没带 —— 那几个角度没销账,
     下一批还会被抽到。这时返回里还会带 ``angle_debt``: 你在这个项目当前还挂着的坐标, **下一批按它们写, 别再抽新的**。
+    ``angle_key`` 要**原样复制** draw_angles 给的那个(20 位十六进制串), 不要自己编号、缩写或改写: ``unknown_angle_keys``
+    非零是有几篇带的 key 台账里根本没有, ``used_angle_keys`` 非零是有几篇带的 key 已经销给了别的稿子(一个 key 只给一篇),
+    哪几篇在 ``angle_key_mismatch`` 里, ``angle_key_warning`` 说怎么办 —— 那几篇已经存档, 不用重存, 但角度没销账;
+    接下来存的照 draw_angles 的原样带。
 
     **话题、评论、方向是每篇 draft 自己的字段, 不要塞进正文**(都可选, 项目要什么看简报的 ``delivery_requirements``):
     ``drafts=[{"title": ..., "body": ..., "angle_key": ..., "tags": [...], "comments": [{"role": "reader" | "author",
@@ -700,7 +704,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     不能说它们守住了规则(``next_step`` 会说)。
 
     ``flywheel_arm``: 把这场写作的 open_project (或 borrow_lessons) 返回里的 ``flywheel_arm`` **原样**传回来。
-    它决定这批稿子算进哪个对照组; 不传服务端会猜, 但同一项目同时开着两场时会猜错。
+    它决定这批稿子算进哪个对照组; 不传服务端会猜, 但同一项目同时开着两场时会猜错。传的不是服务端这场借卡发给你的那个,
+    以服务端为准, 返回里带 ``flywheel_arm_corrected``。
 
     ``tactic``: 这场 open_project 传过 ``tactic`` 的, 把同一个值**原样**传回来(没传过就不传)。规则检查按它和项目名判这批
     是产品向还是流量向, 和简报同一个判据; 不传的话只按项目名判, 简报里因为方向不符没给你的建议改规则, 这里会再报一遍。

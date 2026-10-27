@@ -179,3 +179,161 @@ def test_debt_lookup_failure_never_turns_a_written_commit_into_an_error():
     # 主警告照常给 —— 丢的只是那一截坐标。
     assert "angle_key" in out["unattributed_warning"]
     assert "angle_debt" not in out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 4 · 带了 key、台账却对不上(W-31, 10-27)
+#
+# 10-26 sportsix: 发牌 20 张, 5 批存了 19 篇, 每篇都带 angle_key, 可一条都不在台账里(台账的 key 都是 20 位,
+# 这 19 条是 7~8 位带下划线的编号 15 条、53 位的 4 条)。consume_angle 只记 warning, unattributed 只数没带 key 的,
+# 回包只有 consumed_angles < written —— 写手那边的 AI 一直不知道 key 是错的, 20 张牌一天后回了池子。
+#
+# 被禁止的形态:
+#   · 带了错 key 的不单独数、不说哪几篇、不说 key 该长什么样;
+#   · 把 key 错了说成「发牌时台账没写进去」;
+#   · 叫模型「按挂着的坐标写」—— 那几张牌对应的稿子其实写完存了, 再写一遍就是同一个角度两篇;
+#   · 并发 / 查询出错没销成的, 冤枉成 key 错了;
+#   · 查 key 状态失败把一次已经写进库的存档拖成报错;
+#   · 每次存档都多查一次库(只该在有没销成的时候查)。
+# ══════════════════════════════════════════════════════════════════════
+
+def _hex(i) -> str:
+    """真的发牌 key: fingerprint.angle_key 出来的 20 位十六进制。"""
+    return fp.angle_key({"emotional_lever": f"e{i}", "human_truth_archetype": "h", "content_format": "c",
+                         "title_structure": "t"})
+
+
+def _card(i, *, user=ME, consumed=None):
+    return {**_angle(i, user=user, consumed=consumed), "angle_key": _hex(i)}
+
+
+SHORT_CODE = "A_01"                                           # 10-26 那 15 条的样子
+LONG_KEY = "职场新人_签约前查公司_避坑清单_" + "x" * 36            # 53 位的那 4 条的样子
+BODY_C = ("租房第一个月我把押金条拍了三遍, 后来退租时房东说没见过那张纸, 幸亏手机里还有原图, "
+          "这件事让我明白收据这种东西永远要自己留一份。") * 3
+
+
+def test_keys_the_ledger_has_never_seen_are_counted_named_and_explained():
+    assert len(LONG_KEY) == 53
+    c = _client([_card(1), _card(2), _card(3)])
+    out = core.commit_drafts(c, PROJ, [
+        {"title": "编号", "body": BODY_A, "angle_key": SHORT_CODE},
+        {"title": "长串", "body": BODY_B, "angle_key": LONG_KEY},
+        {"title": "对的", "body": BODY_C, "angle_key": _hex(3)},
+    ], user_id=ME)
+
+    assert out["written"] == 3 and out["consumed_angles"] == 1
+    assert out["unattributed"] == 0, "带了 key 的不算没带"
+    assert out["unknown_angle_keys"] == 2 and out["used_angle_keys"] == 0
+    mm = out["angle_key_mismatch"]
+    assert [(m["index"], m["problem"], m["length"]) for m in mm] == [(0, "unknown", 4), (1, "unknown", 53)]
+    assert mm[0]["angle_key"] == SHORT_CODE
+    assert mm[1]["angle_key"] == LONG_KEY[:core.ANGLE_KEY_SHOW_CHARS] + "…", "长串只露前一截"
+    warn = out["angle_key_warning"]
+    for must in ("2 篇", "台账里根本没有", f"{fp.ANGLE_KEY_HEX_LEN} 位十六进制", "原样复制", "不用重存",
+                 "angle_key_mismatch"):
+        assert must in warn, must
+    # 差额全是 key 的问题: 不再笼统地报「多半是发牌时台账没写进去」
+    assert "angle_ledger_warning" not in out
+    # 还挂着的两张牌一并回去, 但不叫它「按它们写」—— 那两张对应的稿子刚存过
+    assert {a["angle_key"] for a in out["angle_debt"]["angles"]} == {_hex(1), _hex(2)}
+    assert "别按这些坐标再写一遍" in warn and "下一批按它们写" not in warn
+    assert "unattributed_warning" not in out
+
+
+def test_a_key_already_spent_on_another_draft_is_reported_as_used():
+    """台账里有这个 key, 但已经销给了别的稿子(上一批用过 / 同一批两篇带了同一个 key)。"""
+    c = _client([_card(1, consumed="v-old"), _card(2)])
+    out = core.commit_drafts(c, PROJ, [
+        {"title": "旧坐标", "body": BODY_A, "angle_key": _hex(1)},
+        {"title": "同一个 key 甲", "body": BODY_B, "angle_key": _hex(2)},
+        {"title": "同一个 key 乙", "body": BODY_C, "angle_key": _hex(2)},
+    ], user_id=ME)
+
+    assert out["written"] == 3 and out["consumed_angles"] == 1
+    assert out["used_angle_keys"] == 2 and out["unknown_angle_keys"] == 0
+    assert [(m["index"], m["problem"]) for m in out["angle_key_mismatch"]] == [(0, "used"), (2, "used")]
+    assert "已经销给了别的稿子" in out["angle_key_warning"]
+    assert "台账里根本没有" not in out["angle_key_warning"]
+    assert "angle_ledger_warning" not in out
+
+
+def test_a_lost_race_is_not_blamed_on_the_key(monkeypatch):
+    """台账里有这一行、还没销, 是这次没销成(并发 / 写台账出错): 照旧报 angle_ledger_warning, 不说 key 错了。"""
+    c = _client([_card(1)])
+    monkeypatch.setattr(store, "consume_angle", lambda *a, **k: False)
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A, "angle_key": _hex(1)}], user_id=ME)
+
+    assert out["consumed_angles"] == 0
+    assert out["unknown_angle_keys"] == 0 and out["used_angle_keys"] == 0
+    assert "angle_key_mismatch" not in out and "angle_key_warning" not in out
+    assert "1/1" in out["angle_ledger_warning"] and "台账里有这一行" in out["angle_ledger_warning"]
+
+
+def test_a_failed_state_lookup_never_breaks_the_commit_and_says_it_could_not_tell(monkeypatch):
+    c = _client([_card(1)])
+
+    def boom(*a, **k):
+        raise RuntimeError("PostgREST 503")
+    monkeypatch.setattr(store, "angle_key_states", boom)
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A, "angle_key": SHORT_CODE}], user_id=ME)
+
+    assert out["written"] == 1, "指纹已经写进去了, 不许因为一段提醒报失败"
+    assert out["unknown_angle_keys"] == 0 and "angle_key_mismatch" not in out
+    assert "没查清" in out["angle_ledger_warning"]
+
+
+def test_a_clean_commit_never_looks_up_key_states(monkeypatch):
+    """每篇都销成了就没有这个话题; 别为它白付一次查询。"""
+    c = _client([_card(1), _card(2)])
+    calls = []
+    real = store.angle_key_states
+    monkeypatch.setattr(store, "angle_key_states", lambda *a, **k: (calls.append(a), real(*a, **k))[1])
+    out = core.commit_drafts(c, PROJ, [
+        {"title": "甲", "body": BODY_A, "angle_key": _hex(1)},
+        {"title": "乙", "body": BODY_B, "angle_key": _hex(2)},
+    ], user_id=ME)
+    assert out["consumed_angles"] == 2 and out["unknown_angle_keys"] == 0
+    assert calls == []
+
+
+def test_state_lookup_is_scoped_to_the_project_and_never_sends_unsafe_keys():
+    """模型编的 key 什么字符都可能有: postgrest-py 的 in_() 不转义 " 和 \\, 一个坏 key 就让整条查询报错。
+    那种形状本来就不可能在台账里(台账的 key 全是 20 位十六进制), 直接算 unknown, 不送去查。"""
+    other = "aaaaaaaa-0000-0000-0000-00000000000f"
+    c = _client([_card(1), _card(2, consumed="v-2"),
+                 {**_card(3), "project_id": other}])                       # 别的项目里有, 本项目没有
+    weird = ['a"b', "x\\y", "a,b(c)", "空 格", "z" * 65]
+    got = store.angle_key_states(c, PROJ, [_hex(1), _hex(2), _hex(3), "nope_1", *weird])
+    assert got == {_hex(1): "open", _hex(2): "used", _hex(3): "unknown", "nope_1": "unknown",
+                   **{w: "unknown" for w in weird}}
+    calls = [x for x in c.calls if x["table"] == "angle_ledger"]
+    assert calls, "能查的那几个要去查"
+    for call in calls:                                                      # 翻页: 一页 + 收尾的空页
+        (sent,) = [f[2] for f in call["filters"] if f[0] == "in"]
+        assert set(sent) == {_hex(1), _hex(2), _hex(3), "nope_1"}
+        assert ("eq", "project_id", PROJ) in call["filters"]
+
+
+def test_state_lookup_failure_returns_none_not_a_guess():
+    class Boom:
+        def table(self, *a, **k):
+            raise RuntimeError("PostgREST 503")
+    assert store.angle_key_states(Boom(), PROJ, [_hex(1)]) is None
+    assert store.angle_key_states(Boom(), PROJ, ['a"b']) == {'a"b': "unknown"}, "不用查的照样分得清"
+
+
+def test_metrics_count_the_mismatches_without_storing_the_keys():
+    c = _client([_card(1)])
+    core.commit_drafts(c, PROJ, [
+        {"title": "编号", "body": BODY_A, "angle_key": SHORT_CODE},
+        {"title": "长串", "body": BODY_B, "angle_key": LONG_KEY},
+        {"title": "没带", "body": BODY_C},
+    ], user_id=ME)
+    (row,) = [r for r in c.rows["batch_metrics"] if (r.get("meta") or {}).get("mode") == "deskcore_commit"]
+    assert row["counters"]["unknown_angle_keys"] == 2 and row["counters"]["used_angle_keys"] == 0
+    assert row["counters"]["unattributed"] == 1
+    assert row["meta"]["angle_key_mismatch"] == [{"index": 0, "problem": "unknown", "length": 4},
+                                                 {"index": 1, "problem": "unknown", "length": 53}]
+    blob = repr(row)
+    assert SHORT_CODE not in blob and "职场新人" not in blob, "key 本身不进 batch_metrics"
