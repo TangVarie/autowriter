@@ -88,11 +88,12 @@ ARCHIVE_PENDING_NEXT_STEP = (
 # draw_angles / check_drafts / record_rule 的 archive_pending 只会说「还有 N 张牌没存档」—— 模型明明存过了, 只会当提醒
 # 有误。所以存档时对不上的记一笔, archive_pending 一并带上(angle_key_mismatch)。记在进程内存里, 同 _borrowed_arms 的
 # 取舍(deskcore 单进程): 重启丢了只少这一段提醒(存档那次回包已经说过), 不为它让 archive_pending 多查一次库。
-# 窗口和 archive_pending 一样 1 天; 只记 (项目, 写手) 自己的, 别人的不给看。
+# 窗口和 archive_pending 一样 1 天, 每篇对不上的各按自己存档的时刻过期(codex review on aw#130: 原来整段跟着最近一笔续命,
+# 0、23、46 小时各一篇的, 46 小时时三篇都还在, 旧 key 还占着 keys 的位置); 只记 (项目, 写手) 自己的, 别人的不给看。
 ANGLE_KEY_SHOW_CHARS = 24       # 回包里 key 只露前这么多字(模型编的长串可能是一句描述)
 ANGLE_KEY_MISS_SHOW = 10        # 提醒里最多列几个对不上的 key
 _ANGLE_KEY_MISS_TTL = timedelta(days=ARCHIVE_PENDING_DAYS)
-_angle_key_misses: dict[tuple[str, str], dict] = {}
+_angle_key_misses: dict[tuple[str, str], list[dict]] = {}   # (项目, 写手) → 每篇一笔 {"at", "problem", "angle_key"}
 _angle_key_misses_lock = threading.Lock()
 # 这个项目台账里没有的三种(都算进 unknown_angle_keys): 形状不对 = 编的 / 缩写的 / 抄错的; 形状对 = 别的项目的牌, 或者
 # 哪个台账都没有(W-31 复审: 10-27 查生产库近 60 天 48 条对不上的, 15 条是 20 位十六进制, 不能一律说「自己编的」)
@@ -2836,11 +2837,13 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             arm, arm_source, arm_check = batch_arm(project_id, user_id, from_brief=flywheel_arm)
             # 模型传回的臂认得出、却没被采用 = 服务端没给过这场这个臂 (corrected), 或者重启过核对不了 (unverified):
             # 都记服务端最近一次借卡的臂 (W-31, 见 batch_arm)。传回的那个留一份(batch.params + batch_metrics.meta),
-            # 核对不了的另标 flywheel_arm_unverified, 分析对照组时剔掉; 回包里也说一句。
+            # 核对不了的另标 flywheel_arm_unverified, 分析对照组时剔掉; 回包里也说一句。改稿挂的旧 batch 同样标上
+            # (codex review on aw#130: 旧 batch 正好是记下的那个臂时比不出 mixed, 可改稿可能是在另一个臂下写的)。
             arm_reported = flywheel_arm if arm_check else None
             arm_flags = {**({"flywheel_arm_reported": arm_reported} if arm_reported else {}),
                          **({"flywheel_arm_unverified": True} if arm_check == "unverified" else {})}
-            unmarked = _mark_mixed_arm_batches(client, list(replaced_ok.values()), arm) if replaced_ok else []
+            unmarked = _mark_mixed_arm_batches(client, list(replaced_ok.values()), arm,
+                                               unverified=arm_check == "unverified") if replaced_ok else []
             arm_meta = {"flywheel_arm": arm, "flywheel_arm_source": arm_source, **arm_flags,
                         "revised_item_ids": sorted(set(replaced_ok.values())),
                         "arm_mixed_unmarked_item_ids": unmarked}
@@ -2927,7 +2930,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                                  "old_version_id": replace[i]["old_version_id"],
                                  "version_id": minted_ids[i]} for i in sorted(replaced_ok)]}
             if arm_meta.get("arm_mixed_unmarked_item_ids"):
-                # 机器可读: 这几条改稿的旧 batch 没能标上 flywheel_arm_mixed, 分析对照组时要剔掉 (同一份也进 batch_metrics)
+                # 机器可读: 这几条改稿的旧 batch 没能标上 flywheel_arm_mixed / flywheel_arm_unverified, 分析对照组时要剔掉
+                # (同一份也进 batch_metrics)
                 out["flywheel_arm_warning"] = {"code": "arm_mixed_unmarked", "arm": arm_meta["flywheel_arm"],
                                                "item_ids": arm_meta["arm_mixed_unmarked_item_ids"]}
             if arm_check == "corrected":
@@ -4797,38 +4801,48 @@ def archive_pending(client, project_id: str, *, user_id: str | None) -> dict | N
 
 
 def _note_angle_key_misses(project_id, user_id, problems: list[dict]) -> None:
-    """存档时 key 对不上台账的那几篇记一笔(W-31), 给之后的 archive_pending 用。一天内累加, 过了窗口重新记。不抛。"""
+    """存档时 key 对不上台账的那几篇记一笔(W-31), 给之后的 archive_pending 用。每篇带自己的时刻, 记之前先剪掉过了
+    窗口的(_unexpired_angle_key_misses), 不是最近一笔还在就整段留着。不抛。"""
     if not problems or not user_id:
         return
     try:
         now = _utcnow()
         k = (str(project_id), str(user_id))
         with _angle_key_misses_lock:
-            cur = _angle_key_misses.get(k)
-            if not cur or now - cur["last_at"] > _ANGLE_KEY_MISS_TTL:
-                cur = {"problems": {}, "keys": []}
-            for p in problems:
-                cur["problems"][p["problem"]] = cur["problems"].get(p["problem"], 0) + 1
-                if p["angle_key"] not in cur["keys"] and len(cur["keys"]) < ANGLE_KEY_MISS_SHOW:
-                    cur["keys"].append(p["angle_key"])
-            cur["last_at"] = now
-            _angle_key_misses[k] = cur
+            _angle_key_misses[k] = _unexpired_angle_key_misses(k, now) + [
+                {"at": now, "problem": p["problem"], "angle_key": p["angle_key"]} for p in problems]
     except Exception:                                   # noqa: BLE001 — 提醒, 绝不拖垮入库
         logger.warning("commit_drafts: 记 angle_key 对不上的那一笔失败 (project=%s)", project_id, exc_info=True)
 
 
+def _unexpired_angle_key_misses(k: tuple[str, str], now: datetime) -> list[dict]:
+    """(项目, 写手) 记下的对不上的那几篇里, 还在 _ANGLE_KEY_MISS_TTL 窗口里的(每篇按自己的时刻算)。调用方持锁。"""
+    return [m for m in _angle_key_misses.get(k) or [] if now - m["at"] <= _ANGLE_KEY_MISS_TTL]
+
+
 def _recent_angle_key_misses(project_id, user_id) -> dict | None:
-    """调用者在这个项目近 ARCHIVE_PENDING_DAYS 天存档时 key 对不上台账的篇数和其中几个 key(W-31); 没有回 None。"""
+    """调用者在这个项目近 ARCHIVE_PENDING_DAYS 天存档时 key 对不上台账的篇数和其中几个 key(W-31); 没有回 None。
+    只数还在窗口里的那几篇, keys 也只从它们里挑; 全过期了就把这一笔清掉。"""
     now = _utcnow()
+    k = (str(project_id), str(user_id))
     with _angle_key_misses_lock:
-        cur = dict(_angle_key_misses.get((str(project_id), str(user_id))) or {})
-    if not cur or now - cur["last_at"] > _ANGLE_KEY_MISS_TTL:
+        kept = _unexpired_angle_key_misses(k, now)
+        if kept:
+            _angle_key_misses[k] = kept
+        else:
+            _angle_key_misses.pop(k, None)              # 过期的顺手清掉, 进程里不越攒越多
+    if not kept:
         return None
-    n = {k: int(v or 0) for k, v in (cur.get("problems") or {}).items()}
+    n: dict[str, int] = {}
+    keys: list[str] = []
+    for m in kept:
+        n[m["problem"]] = n.get(m["problem"], 0) + 1
+        if m["angle_key"] not in keys and len(keys) < ANGLE_KEY_MISS_SHOW:
+            keys.append(m["angle_key"])
     unknown = sum(n.get(c, 0) for c in ANGLE_KEY_ABSENT)
     used = n.get(store.ANGLE_KEY_USED, 0)
     return {"drafts": unknown + used, "unknown": unknown, "used": used, "by_problem": n,
-            "keys": list(cur.get("keys") or []), "last_at": cur["last_at"].isoformat(),
+            "keys": keys, "last_at": max(m["at"] for m in kept).isoformat(),
             "note": _angle_key_mismatch_note(n)}
 
 
@@ -6468,8 +6482,9 @@ def flywheel_arm(project_id, user_id, *, now: datetime | None = None) -> str:
 #     两个都在, 各记各的, codex review on #104 不退)。不放宽到 36 小时: 同一个写手昨天开过一场别的臂, 今天这场
 #     传错就核不出来 (W-31 复审查生产库: 近 30 天 21 个 (项目, 写手, 北京日) 里 4 个前一天 36 小时内有一场另一个臂的);
 #   · 进程起来不到 12 小时、传回的臂正好是起来之前那一段某个北京日的臂 → 可能是重启前那场拿到的, 核对不了: 记服务端
-#     最近一次发的臂、来源 borrow, 标 flywheel_arm_unverified (分析对照组时剔掉), 回包带 flywheel_arm_unverified,
-#     不说「服务端分的是 X」(W-31 复审: 部署重启落在一场写作中间时, 那样说是错的);
+#     最近一次发的臂、来源 borrow, 标 flywheel_arm_unverified (分析对照组时剔掉; 改稿挂的旧 batch 也标, 见
+#     _mark_mixed_arm_batches), 回包带 flywheel_arm_unverified, 不说「服务端分的是 X」(W-31 复审: 部署重启落在一场
+#     写作中间时, 那样说是错的);
 #   · 其余 → 服务端没给过这场这个臂, 模型手里不可能有它对应的简报: 以服务端为准, 记最近一次发的臂、来源 borrow,
 #     传回的那个另存 flywheel_arm_reported, 回包带 flywheel_arm_corrected。
 # borrow_lessons 的 reuse 走同一道 (核对不了的也沿用): 服务端没发过的臂不沿用, 否则一句传错的臂先被借卡记下来,
@@ -6554,10 +6569,14 @@ def batch_arm(project_id, user_id, *, from_brief: str | None = None) -> tuple[st
     return flywheel_arm(project_id, user_id, now=now), "recomputed", None
 
 
-def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str) -> list[str]:
+def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str, *, unverified: bool = False) -> list[str]:
     """改稿挂在旧 item 上 (旧 batch), 不建新 batch。改稿这场的臂和旧 batch 记的不一样 → 这批的成稿受过两种处理,
     在 batch 上标 flywheel_arm_mixed, 分析对照组时剔掉 (codex review on #104)。旧 batch 没记臂 (分臂之前的) 不在
     实验里, 不碰。
+
+    ``unverified`` = 改稿传回的臂核对不了 (batch_arm 的 ``"unverified"``, 重启过): ``arm`` 只是服务端重启后最近一次
+    发的, 改稿真正的臂可能是传回的那个。拿 ``arm`` 比同臂, 不等于改稿没换过处理 —— 旧 batch 也标
+    flywheel_arm_unverified, 分析对照组时一样剔掉 (codex review on aw#130)。和 ``arm`` 不同的照旧另标 mixed。
 
     不影响入库 (失败重试一次, 再失败就放过), 但**不只记日志**: 返回没能确认标好的 item_id, 调用方把它们写进
     commit 的返回值 (flywheel_arm_warning) 和 batch_metrics.meta —— 分析时那一份也能把这几批剔掉。"""
@@ -6565,13 +6584,18 @@ def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str) -> list[str]:
     for _ in range(2):
         try:
             for batch_id, params in store.batch_params_for_items(client, item_ids).items():
-                if params.get("flywheel_arm") in FLYWHEEL_ARMS and params["flywheel_arm"] != arm \
-                        and not params.get("flywheel_arm_mixed"):
-                    store.merge_batch_params(client, batch_id, {"flywheel_arm_mixed": True})
+                if params.get("flywheel_arm") not in FLYWHEEL_ARMS:
+                    continue
+                patch = {**({"flywheel_arm_mixed": True} if params["flywheel_arm"] != arm else {}),
+                         **({"flywheel_arm_unverified": True} if unverified else {})}
+                patch = {k: v for k, v in patch.items() if not params.get(k)}
+                if patch:
+                    store.merge_batch_params(client, batch_id, patch)
             return []
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-    logger.warning("commit_drafts: 改稿跨臂的 batch 没标上 flywheel_arm_mixed (items=%s): %s", item_ids, last_exc)
+    logger.warning("commit_drafts: 改稿跨臂 / 臂核对不了的 batch 没标上 flywheel_arm_mixed / flywheel_arm_unverified "
+                   "(items=%s): %s", item_ids, last_exc)
     return list(item_ids)
 
 

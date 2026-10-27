@@ -909,7 +909,9 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
 截断；`unknown` 同回包的三种合计，`by_problem` 分开数）。`note` 按出现的那几种拼：「这些牌其实写完存了、别按它们再写」只对
 `unknown` / `used` 说（别的项目的牌、台账没有这一行的，跟这个项目挂着的牌无关），「不要自己编号」只对 `unknown` 说。
 记在进程内存里，同 `_borrowed_arms` 的取舍（deskcore 单进程）：重启丢了只少这一段提醒，`archive_pending` 照旧只多一次
-查询；窗口和 `archive_pending` 一样 1 天，按 (项目, 存档的人) 记，别人的不给看；只在还挂着牌时带。
+查询；窗口和 `archive_pending` 一样 1 天，**每篇对不上的各按自己存档的时刻过期**（codex review on aw#130：原来整段跟着最近一笔
+续命，0、23、46 小时各一篇的，46 小时时三篇都还在，旧 key 还占着 `keys` 的位置），记和读的时候都先剪掉过了窗口的，`last_at` 是
+还在窗口里最近那一篇的时刻；按 (项目, 存档的人) 记，别人的不给看；只在还挂着牌时带。
 
 **模型传回的臂以服务端为准。** 进程里原来只记 (项目, 写手) 最近一次借卡的臂，模型传回的臂认得出就照收。现在记的是近
 36 小时**每个臂最后一次发出去的时刻**，传回的臂按顺序过（`core._reported_arm_check`）：
@@ -922,7 +924,9 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
    可能是重启前那一场拿到的，**核对不了**。记服务端最近一次发的臂、来源 `borrow`，传回的那个另存 `flywheel_arm_reported`，
    另标 `flywheel_arm_unverified: true`（`batches.params` 和 `batch_metrics.meta` 都有，**分析对照组时剔掉**）；回包带
    `flywheel_arm_unverified = {reported, recorded, note}`，只说重启过核对不了，不说「服务端分的是 X」（部署落在一场写作中间时
-   那样说是错的，10-26 当天 04:26 UTC 就部署过一次）；
+   那样说是错的，10-26 当天 04:26 UTC 就部署过一次）。改稿（`replaces_version_id`）不建新 batch，挂的旧 batch 也标
+   `flywheel_arm_unverified`（codex review on aw#130）：旧 batch 正好是记下的那个臂时，拿它比不出 `flywheel_arm_mixed`，可改稿
+   可能是在传回的那个臂下写的；和记下的臂不同的照旧另标 mixed。没标上的同 mixed 一样进 `arm_mixed_unmarked_item_ids`；
 4. 其余：服务端没给过这场这个臂。以最近一次发的为准，来源 `borrow`，传回的那个另存 `flywheel_arm_reported`，回包带
    `flywheel_arm_corrected = {reported, recorded, note}`。
 

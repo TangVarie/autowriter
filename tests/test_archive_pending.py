@@ -344,3 +344,41 @@ def test_the_note_only_says_invented_or_already_written_when_that_is_the_problem
     core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "A_01", "length": 4, "problem": "unknown"}])
     note = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]["note"]
     assert "已经写完存档" in note and "不要自己编号" in note and "存错了项目" in note
+
+
+def test_each_miss_expires_on_its_own(use, no_embeddings, monkeypatch):
+    """codex review on aw#130: 窗口按每一笔自己的时刻算, 不是「最近一笔还在窗口里就整段都留着」。0、23、46 小时各
+    对不上一篇: 46 小时时只剩 23、46 那两篇; 69 小时时只剩 46 那一篇; 0 小时那个 key 也不再占 keys 的位置。"""
+    use(_client([_card(1, hours_ago=1)]))
+    t0 = datetime.now(timezone.utc)
+    for h, key, problem in ((0, "H00_01", "unknown"), (23, "H23_01", "used"), (46, "H46_01", "unknown")):
+        monkeypatch.setattr(core, "_utcnow", lambda h=h: t0 + timedelta(hours=h))
+        core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": key, "length": 6, "problem": problem}])
+    assert len(core._angle_key_misses[(PID, ME)]) == 2, "记的时候就把过了窗口的剪掉"
+
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 1, 1)
+    assert mm["keys"] == ["H23_01", "H46_01"] and mm["by_problem"] == {"used": 1, "unknown": 1}
+    assert mm["last_at"] == (t0 + timedelta(hours=46)).isoformat()
+
+    monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=69))
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (1, 1, 0) and mm["keys"] == ["H46_01"]
+
+    monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=71))
+    assert "angle_key_mismatch" not in T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    assert (PID, ME) not in core._angle_key_misses, "全过期的那一笔顺手清掉, 进程里不越攒越多"
+
+
+def test_expired_keys_do_not_hold_the_shown_slots(use, no_embeddings, monkeypatch):
+    """一天前对不上的 key 占满了 ANGLE_KEY_MISS_SHOW 个位置: 过了窗口不许再挤掉新的。"""
+    use(_client([_card(1, hours_ago=1)]))
+    t0 = datetime.now(timezone.utc)
+    monkeypatch.setattr(core, "_utcnow", lambda: t0)
+    core._note_angle_key_misses(PID, ME, [{"index": i, "angle_key": f"OLD_{i:02d}", "length": 6, "problem": "unknown"}
+                                          for i in range(core.ANGLE_KEY_MISS_SHOW)])
+    monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=20))
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "NEW_01", "length": 6, "problem": "unknown"}])
+    monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=30))
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert mm["keys"] == ["NEW_01"] and mm["drafts"] == 1

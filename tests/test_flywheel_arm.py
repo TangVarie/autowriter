@@ -513,3 +513,46 @@ def test_a_restart_between_two_sessions_is_unverifiable_not_a_correction(monkeyp
         assert "flywheel_arm_unverified" not in params and "flywheel_arm_unverified" not in meta
         assert out["flywheel_arm_corrected"]["recorded"] == arm_b and "flywheel_arm_unverified" not in out
         assert core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm_a)["flywheel_arm"] == arm_b
+
+
+# ── 改稿的臂核对不了: 旧 batch 也要标出来 (codex review on aw#130) ─────────────────────────────
+
+@pytest.mark.parametrize("first_arm, restart, want", [
+    # 旧 batch explore, 改稿传回 patterns 核对不了, 服务端重启后最近一次发的正好也是 explore: 拿它比不出 mixed,
+    # 可改稿真的可能是在 patterns 那一场写的 —— 旧 batch 也标 flywheel_arm_unverified, 分析对照组时剔掉
+    ("explore", True, {"flywheel_arm_unverified": True}),
+    # 旧 batch patterns: 和记下的 explore 不同, 照旧标 mixed; 核对不了, 一并标 unverified
+    ("patterns", True, {"flywheel_arm_mixed": True, "flywheel_arm_unverified": True}),
+    # 没重启过 = 纠正, 以服务端的 explore 为准: 和旧 batch 同臂, 什么都不标 (被纠正的不是核对不了)
+    ("explore", False, {}),
+])
+def test_an_unverifiable_revision_flags_the_old_batch(monkeypatch, fresh_arms, first_arm, restart, want):
+    from tests import test_deskcore_draft_identity as T
+    cut = datetime(2026, 10, 27, 16, tzinfo=timezone.utc)                     # 北京 10-28 00:00
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, *, now=None: "patterns" if now < cut else "explore")
+    if restart:                                  # 北京 23:59 重启: 之前那一场 (patterns) 的借卡记录丢了
+        monkeypatch.setattr(core, "_ARMS_SINCE", cut - timedelta(minutes=1))
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    c = T._client()
+    c.rpc_impl["deskcore_commit_fingerprints"] = T._rpc_that_writes(c)
+
+    # 旧 batch 先存好 (进程里还什么都没有: 传回的照收)
+    monkeypatch.setattr(core, "_utcnow", lambda: cut - timedelta(hours=30))
+    first = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X}], user_id=T.ME,
+                               flywheel_arm=first_arm)
+    batch = c.rows["batches"][0]
+    assert batch["params"]["flywheel_arm"] == first_arm
+
+    monkeypatch.setattr(core, "_utcnow", lambda: cut + timedelta(minutes=1))
+    assert core._borrow_arm(T.PROJ, T.ME) == "explore"                        # 重启后 00:01 那一场
+    monkeypatch.setattr(core, "_utcnow", lambda: cut + timedelta(minutes=10))
+    T._embed(c)
+    out = core.commit_drafts(c, T.PROJ, [{"title": "秋招等回音", "body": T.BODY_X2,
+                                          "replaces_version_id": first["version_ids"][0]}],
+                             user_id=T.ME, flywheel_arm="patterns")
+    assert out["replaced"] and out["batch_id"] is None, "只有替换稿: 不建新 batch, 标记只能落在旧 batch 上"
+    assert ("flywheel_arm_unverified" in out) is restart and ("flywheel_arm_corrected" in out) is not restart
+    flags = {k: v for k, v in batch["params"].items() if k in ("flywheel_arm_mixed", "flywheel_arm_unverified")}
+    assert flags == want
+    assert batch["params"]["flywheel_arm"] == first_arm and batch["params"]["source"] == "deskcore", "原有字段不动"
+    assert "flywheel_arm_warning" not in out
