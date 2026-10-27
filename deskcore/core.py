@@ -6733,7 +6733,13 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
     stale |= set(text_changed) & set(diffed)            # TV 改过字(W-34): 同一版也按现在的正文重算
 
     def _ok(nid: str) -> bool:
-        return _diffable(current[nid]) and nid not in blocked
+        return _diffable(current[nid]) and nid not in blocked and _draft_has_body(current[nid])
+
+    def _draft_has_body(link: dict) -> bool:
+        # 写作台那版只有标题(W-36, 10-27): 没有正文可比, 算出来是"整篇都是新加的" —— HATHERINE 59 条 title_exact 连的就是
+        # 这种稿, 13 条差异按当前口径进了摘要。这种对照不算差异, 已算过的降回旧口径。那版不在索引里的照旧(这里看不到)。
+        v = known.get(str(link.get("version_id") or ""))
+        return v is None or bool(fp.normalize(tvlink.strip_hashtags(v.body)))
 
     def _has_body(nid: str) -> bool:
         # 这晚 TV 读到的正文是空的(只剩标题 / 只剩话题): 不拿空正文算差异 —— 会算成"整篇删了"(review on aw#128)。

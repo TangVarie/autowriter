@@ -621,3 +621,18 @@ def test_dry_run_over_the_cap_lists_every_move(monkeypatch, capsys):
     assert cli.main(["tv-sync", "--tv-project", TV, "--write-tv", "--dry-run"]) == 1
     out = capsys.readouterr().out
     assert out.count("↻ m") == 12 and "另有" not in out
+
+
+def test_a_title_only_draft_gets_no_edit_diff_and_an_old_one_is_demoted():
+    """W-36: 写作台那版只有标题, 差异就是"整篇都是新加的" —— 不算, 摘要里不该出现; 以前算过的(HATHERINE 13 条)降回旧口径。"""
+    notes = [_note("n3", "我的跑步第一课", BODY_TENNIS)]
+    c = _tv(notes)
+    _add_version(c, "v3", "i3", "我的跑步第一课", "")
+    core.tv_sync(c, TV)
+    assert _link(c, "n3")["version_id"] == "v3" and _diff(c, "n3") is None
+    c.rows["tv_edit_diffs"] = [{"note_id": "n3", "tv_project_id": TV, "project_id": P1, "version_id": "v3",
+                                "match_kind": "title_exact", "changed": True, "diff_rev": tvlink.DIFF_REV,
+                                "draft_chars": 0, "computed_at": OLD_TS}]
+    out = core.tv_sync(c, TV)
+    assert out["edit_diffs"]["demoted"] == 1 and _diff(c, "n3")["diff_rev"] == 0
+    assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == []
