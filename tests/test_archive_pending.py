@@ -52,6 +52,9 @@ def _client(cards=()):
 
 @pytest.fixture()
 def use(monkeypatch):
+    # 存档时 key 对不上的那一笔记在进程内存里(W-31): 每条用例从空的开始, 别的文件存过的不串进来
+    monkeypatch.setattr(core, "_angle_key_misses", {})
+
     def _use(client):
         monkeypatch.setattr(core, "sb", lambda: client)
         return client
@@ -226,3 +229,156 @@ def test_open_project_debt_note_points_at_score_drafts(use):
     note = out["angle_debt_note"]
     assert "score_drafts" in note and "同一轮" in note and "angle_key" in note
     assert "archive_pending" not in out, "简报已经有 angle_debt, 不再叠第二段"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# W-31(10-27): 存档带的 angle_key 对不上台账, 下一次提醒要说清 —— 不然它只会说「还有 N 张没存档」
+# ══════════════════════════════════════════════════════════════════════
+
+BODY_1 = ("租房第一个月我把押金条拍了三遍, 后来退租时房东说没见过那张纸, 幸亏手机里还有原图, "
+          "这件事让我明白收据这种东西永远要自己留一份。") * 3
+BODY_2 = ("绩点二点八的澳八大回国找工作, 我一开始也以为没人要, 后来发现问题"
+          "出在简历的第一行, 那行字把面试官最想看的东西藏到了最后。") * 3
+
+
+def _archive(client, drafts, *, user=ME):
+    client.rpc_impl["deskcore_commit_fingerprints"] = lambda args: [
+        {"idx": i, "status": core.COMMIT_STATUS_INSERTED, "collided_with": None, "detail": None}
+        for i in range(len(args.get("_rows") or []))]
+    return core.commit_drafts(client, PID, drafts, user_id=user)
+
+
+@pytest.fixture()
+def no_embeddings(monkeypatch):
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+
+
+def test_next_check_says_the_cards_were_archived_under_keys_the_ledger_does_not_have(use, no_embeddings):
+    """10-26 sportsix 的形状: 牌发了, 稿子也存了, key 却是模型自己编的 —— 牌一张没销。"""
+    c = use(_client([_card(1, hours_ago=2), _card(2, hours_ago=2)]))
+    out = _archive(c, [{"title": "甲", "body": BODY_1, "angle_key": "A_01"},
+                       {"title": "乙", "body": BODY_2, "angle_key": "A_02"}])
+    assert out["written"] == 2 and out["unknown_angle_keys"] == 2
+
+    for call in (lambda: T.check_drafts(PID, [], _user_id=ME),
+                 lambda: T.draw_angles(PID, 1, _user_id=ME)):
+        block = call()["archive_pending"]
+        mm = block["angle_key_mismatch"]
+        assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 2, 0)
+        assert mm["keys"] == ["A_01", "A_02"]
+        assert mm["last_at"]
+        for must in ("已经写完存档", "不用重存", "别按这些牌再写一遍", "原样复制", "20 位"):
+            assert must in mm["note"], must
+        assert block["next_step"] == core.ARCHIVE_PENDING_NEXT_STEP, "原来那句不动"
+
+
+def test_mismatches_add_up_across_batches_and_cost_no_extra_query(use, no_embeddings):
+    c = use(_client([_card(i, hours_ago=1) for i in range(4)]))
+    _archive(c, [{"title": "甲", "body": BODY_1, "angle_key": "A_01"}])
+    _archive(c, [{"title": "乙", "body": BODY_2, "angle_key": "k0"},          # 对的: 销了
+                 {"title": "丙", "body": BODY_1 + "又一篇", "angle_key": "k0"}])  # 同一个 key 第二篇: used
+    n = len(_ledger_calls(c))
+    block = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    assert len(_ledger_calls(c)) == n + 1, "提醒照旧只多一次查询(对不上的那一笔在内存里)"
+    mm = block["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 1, 1)
+    assert mm["keys"] == ["A_01", "k0"]
+
+
+def test_someone_elses_bad_keys_are_not_shown_to_me(use, no_embeddings):
+    """记的是 (项目, 存档的人) 那一笔: 别人存档时 key 对不上, 不出现在我的提醒里; 我在别的项目上的也不算。"""
+    c = use(_client([_card(1, hours_ago=1), _card(2, user=MATE, hours_ago=1)]))
+    miss = [{"index": 0, "angle_key": "MATE_01", "length": 7, "problem": "unknown"}]
+    core._note_angle_key_misses(PID, MATE, miss)
+    core._note_angle_key_misses(OTHER_PID, ME, miss)
+    block = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    assert block["cards"] == 1 and "angle_key_mismatch" not in block
+    assert core.archive_pending(c, PID, user_id=MATE)["angle_key_mismatch"]["keys"] == ["MATE_01"]
+
+
+def test_no_block_without_pending_cards_and_the_note_expires_with_the_window(use, no_embeddings, monkeypatch):
+    c = use(_client([_card(1, hours_ago=1)]))
+    _archive(c, [{"title": "甲", "body": BODY_1, "angle_key": "A_01"}])
+    assert "angle_key_mismatch" in T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+
+    later = datetime.now(timezone.utc) + timedelta(days=core.ARCHIVE_PENDING_DAYS, hours=1)
+    monkeypatch.setattr(core, "_utcnow", lambda: later)
+    assert "angle_key_mismatch" not in T.check_drafts(PID, [], _user_id=ME)["archive_pending"], "过了窗口不再提"
+
+    c.rows["angle_ledger"][0]["consumed_version_id"] = "v-x"
+    monkeypatch.setattr(core, "_utcnow", lambda: datetime.now(timezone.utc))
+    assert "archive_pending" not in T.check_drafts(PID, [], _user_id=ME), "牌都销了就不提"
+
+
+def test_an_old_miss_is_not_added_to_a_new_one(use, no_embeddings, monkeypatch):
+    """记的那一边也按窗口重新开始(W-31 复审): 一天前的那一笔不许接着累加进新的一笔, 否则提醒里的篇数和 key 越滚越旧。"""
+    use(_client([_card(1, hours_ago=1)]))
+    t0 = datetime.now(timezone.utc)
+    monkeypatch.setattr(core, "_utcnow", lambda: t0)
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "OLD_01", "length": 6, "problem": "unknown"}])
+    later = t0 + timedelta(days=core.ARCHIVE_PENDING_DAYS, hours=1)
+    monkeypatch.setattr(core, "_utcnow", lambda: later)
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "NEW_01", "length": 6, "problem": "used"}])
+
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (1, 0, 1)
+    assert mm["keys"] == ["NEW_01"]
+
+
+def test_the_note_only_says_invented_or_already_written_when_that_is_the_problem(use):
+    """别的项目的牌、台账里没有这一行的: 这个项目挂着的牌跟那几篇无关, 不许说「这些牌其实写完存了」; 形状对的不说
+    「不要自己编号」(W-31 复审)。"""
+    use(_client([_card(1, hours_ago=1)]))
+    key = "0123456789abcdef0123"
+    core._note_angle_key_misses(PID, ME, [
+        {"index": 0, "angle_key": key, "length": 20, "problem": "other_project", "project_id": OTHER_PID},
+        {"index": 1, "angle_key": key[::-1], "length": 20, "problem": "not_in_ledger"}])
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 2, 0), "这个项目台账里没有的三种都算 unknown"
+    assert mm["by_problem"] == {"other_project": 1, "not_in_ledger": 1}
+    note = mm["note"]
+    assert "存错了项目" in note and "发牌时台账没写进去" in note
+    for bad in ("已经写完存档", "别按这些牌再写一遍", "不要自己编号"):
+        assert bad not in note, bad
+
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "A_01", "length": 4, "problem": "unknown"}])
+    note = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]["note"]
+    assert "已经写完存档" in note and "不要自己编号" in note and "存错了项目" in note
+
+
+def test_each_miss_expires_on_its_own(use, no_embeddings, monkeypatch):
+    """codex review on aw#130: 窗口按每一笔自己的时刻算, 不是「最近一笔还在窗口里就整段都留着」。0、23、46 小时各
+    对不上一篇: 46 小时时只剩 23、46 那两篇; 69 小时时只剩 46 那一篇; 0 小时那个 key 也不再占 keys 的位置。"""
+    use(_client([_card(1, hours_ago=1)]))
+    t0 = datetime.now(timezone.utc)
+    for h, key, problem in ((0, "H00_01", "unknown"), (23, "H23_01", "used"), (46, "H46_01", "unknown")):
+        monkeypatch.setattr(core, "_utcnow", lambda h=h: t0 + timedelta(hours=h))
+        core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": key, "length": 6, "problem": problem}])
+    assert len(core._angle_key_misses[(PID, ME)]) == 2, "记的时候就把过了窗口的剪掉"
+
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 1, 1)
+    assert mm["keys"] == ["H23_01", "H46_01"] and mm["by_problem"] == {"used": 1, "unknown": 1}
+    assert mm["last_at"] == (t0 + timedelta(hours=46)).isoformat()
+
+    monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=69))
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (1, 1, 0) and mm["keys"] == ["H46_01"]
+
+    monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=71))
+    assert "angle_key_mismatch" not in T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    assert (PID, ME) not in core._angle_key_misses, "全过期的那一笔顺手清掉, 进程里不越攒越多"
+
+
+def test_expired_keys_do_not_hold_the_shown_slots(use, no_embeddings, monkeypatch):
+    """一天前对不上的 key 占满了 ANGLE_KEY_MISS_SHOW 个位置: 过了窗口不许再挤掉新的。"""
+    use(_client([_card(1, hours_ago=1)]))
+    t0 = datetime.now(timezone.utc)
+    monkeypatch.setattr(core, "_utcnow", lambda: t0)
+    core._note_angle_key_misses(PID, ME, [{"index": i, "angle_key": f"OLD_{i:02d}", "length": 6, "problem": "unknown"}
+                                          for i in range(core.ANGLE_KEY_MISS_SHOW)])
+    monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=20))
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "NEW_01", "length": 6, "problem": "unknown"}])
+    monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=30))
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert mm["keys"] == ["NEW_01"] and mm["drafts"] == 1

@@ -906,6 +906,79 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
     return True
 
 
+# 送去台账查状态的 key 只收这种形状(W-31)。postgrest-py 的 in_() 遇到 , : ( ) 只给值套一层双引号, 不转义里面的
+# " 和 \ —— 模型编出来的 key 什么字符都可能有, 一个坏 key 就让整条查询报错。台账里的 key 全是
+# fingerprint.angle_key 出来的 20 位十六进制(10-27 查生产库 1,619 行无一例外), 不是这个形状的本来就不可能在台账里。
+_LEDGER_LOOKUP_KEY = re.compile(r"[0-9A-Za-z_\-]{1,64}")
+
+ANGLE_KEY_UNKNOWN = "unknown"   # 本项目台账里没有这个 key: 模型自己编的、抄错的
+ANGLE_KEY_USED = "used"         # 有, 但每一行都已经销给了别的版本: 一个 key 给了两篇
+ANGLE_KEY_OPEN = "open"         # 还有没销账的行: 没销成是并发 / 查询出错, 不是 key 的问题
+# 本项目台账里没有、形状却是发牌发出来的那种(20 位十六进制)的, core 再细分(W-31 复审, 10-27 查生产库近 60 天 48 条
+# 对不上的里 15 条是这种形状: 7 条是同一个人在别的项目抽的牌, 8 条哪个台账都没有)。angle_key_states 本身不出这两种。
+ANGLE_KEY_OTHER_PROJECT = "other_project"   # 调用者自己在别的项目抽的牌: 稿子多半存错了项目
+ANGLE_KEY_NOT_IN_LEDGER = "not_in_ledger"   # 哪个台账都没有: 多半是发牌时台账没写进去(record_draw 失败只记日志)
+
+
+def angle_key_states(sb, project_id: str, keys) -> dict[str, str] | None:
+    """这几个 angle_key 在本项目台账里是什么状态: ``{key: unknown | used | open}``(W-31, 2026-10-27)。
+
+    只在 ``consume_angle`` 没销成的那几条上调, 一次查询。``consume_angle`` 找不到行只回 False + 一行 warning,
+    分不清是 key 写错了还是被并发抢先 —— 10-26 sportsix 19 篇带的 key 一条都不在台账里(7~8 位带下划线的编号、
+    53 位的长串), 回包只说「销账少了几个」, 写手那边的 AI 不知道自己的 key 是错的。
+
+    查询失败回 None(调用方当作分不清, 照旧笼统地报); 不抛。"""
+    want = list(dict.fromkeys(str(k) for k in (keys or []) if k))
+    states = {k: ANGLE_KEY_UNKNOWN for k in want}
+    lookup = [k for k in want if _LEDGER_LOOKUP_KEY.fullmatch(k)]
+    if not lookup:
+        return states
+    try:
+        rows = _paged(lambda off, lim: (
+            sb.table("angle_ledger").select("angle_key, consumed_version_id")
+              .eq("project_id", project_id).in_("angle_key", lookup)
+              .order("id").range(off, off + lim - 1)))
+    except Exception:
+        logger.exception("angle key states lookup failed (project=%s)", project_id)
+        return None
+    for r in rows:
+        k = r.get("angle_key")
+        if k not in states:
+            continue
+        if r.get("consumed_version_id") is None:
+            states[k] = ANGLE_KEY_OPEN
+        elif states[k] == ANGLE_KEY_UNKNOWN:
+            states[k] = ANGLE_KEY_USED
+    return states
+
+
+def angle_keys_drawn_elsewhere(sb, project_id: str, user_id, keys) -> dict[str, str] | None:
+    """这几个 key 是不是调用者【自己】在别的项目抽的牌: ``{key: 那个项目的 id}``(W-31 复审, 2026-10-27)。
+
+    只在本项目台账里没有、形状又是发牌发出来的那种 key 上调(core 先筛), 一次查询。只看 ``drawn_by = 调用者``:
+    别人在别的项目抽过什么不归这里说。``angle_ledger`` 只有 (project_id, angle_key) 的索引, 这条按 angle_key 跨项目查
+    走不上它; 台账只有几千行、这条又只在 key 对不上时才跑, 不为它加索引。
+
+    查询失败回 None(调用方当作分不清); 不抛。"""
+    want = [k for k in dict.fromkeys(str(k) for k in (keys or []) if k) if _LEDGER_LOOKUP_KEY.fullmatch(k)]
+    if not want or not user_id:
+        return {}
+    try:
+        rows = _paged(lambda off, lim: (
+            sb.table("angle_ledger").select("angle_key, project_id")
+              .in_("angle_key", want).eq("drawn_by", str(user_id)).neq("project_id", project_id)
+              .order("id").range(off, off + lim - 1)))
+    except Exception:
+        logger.exception("angle keys drawn elsewhere lookup failed (project=%s)", project_id)
+        return None
+    out: dict[str, str] = {}
+    for r in rows:
+        k = r.get("angle_key")
+        if k in want and k not in out and r.get("project_id") and str(r["project_id"]) != str(project_id):
+            out[k] = str(r["project_id"])
+    return out
+
+
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────
 
 PAGE = 1000        # PostgREST 默认 max-rows, 见下方说明

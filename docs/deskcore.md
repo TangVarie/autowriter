@@ -171,7 +171,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
-| | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8）。2026-10-20 起项目有交付模板时带拼好的 `delivery`（§3.9），带 check 的规则有命中时带 `rule_checks`（§3.10） |
+| | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8）。2026-10-20 起项目有交付模板时带拼好的 `delivery`（§3.9），带 check 的规则有命中时带 `rule_checks`（§3.10）。2026-10-27 起带了 key 却对不上台账的另数（`unknown_angle_keys` / `used_angle_keys`，按形状分编的、别的项目的牌、台账没写进去），传回的飞轮臂对不上服务端发的时以服务端为准、重启过核对不了的另标（§3.12） |
 | | `check_rules` | **存档之后按规则逐篇查，只作建议**（2026-10-20，D-121）：规则事先由 Jev 编成是非题 / 代码检查、缓存在 `rule_compiles`；hard 没守住报「必须改」，soft 报「建议改」，Jev 拿不准的单列「拿不准」，到点没判完的报「没判完」。不拦存档、不改稿（见 §3.11） |
 | 人审 | `review_drafts` | 把**用户真的给出的**审核结论落库：`approved` / `needs_revision`，`decision_source=human_via_agent`（结论来自用户、经模型转述写入；Streamlit 里亲手点按钮的才是 `human`）+ 真实 reviewer + 时间 + **用户原话 `user_words`（必填，落 `decision_note`）** + 距入库秒数 `decided_within_s`。审稿人恒为调用者；用户没表态**不许调**（见 §3.6） |
 | 交付 | `export_drafts` | 导成可粘进飞书表的 Excel，带 TV 认的 lineage 列（见 §3.4） |
@@ -868,6 +868,104 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
 再 `compile-rules --all` 跑完（runbook §1.11 有查 `rule_compiles` 的 SQL）；④ 去掉 `RULE_COMPILE_AUTO`（Railway 改变量就重新部署，不用发版），
 后台补编打开时规则都已经在缓存里；⑤ 写手重新导入一次 skill（协议版本变了）。之后新记的 / 改过的规则由后台自己补编。为什么 ② 要先关：
 CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_project` 就会在服务端编同一批规则，付两遍钱。
+
+### 3.12 存档时核对 angle_key 和飞轮臂，全拒也留原因（2026-10-27，W-31）
+
+10-26 sportsix 一场：08:06 UTC 发牌 20 张，08:10～08:13 存了 5 批 19 篇，每篇都带 `angle_key`，可一条都不在台账里
+（台账的 key 是 `fingerprint.angle_key` 出来的 20 位十六进制；这 19 条是 7～8 位带下划线的编号、53 位的长串，模型
+自己编的），20 张牌一张没销、一天后回了池子。`consume_angle` 找不到行只记一行 warning，`unattributed` 只数没带 key
+的，回包只有 `consumed_angles` 少于 `written`——写手那边的 AI 从头到尾不知道 key 是错的。同一场 5 批里 4 批记了
+`flywheel_arm=patterns`（模型传回的），而那场借卡是 explore（TV 缓存键 `:explore`，没给规律）；08:09 还有一次 20 篇
+全拒（written 0），`batch_metrics` 只记了总数，拒的原因事后查不出。三处一起改，都是纯代码，**不加迁移**
+（`batch_metrics` 的 `counters` / `meta` 本来就是 jsonb）。
+
+**key 对不上台账。** `score_drafts` 销账没销成的那几篇，再按 key 查一次本项目台账（`store.angle_key_states`，只在
+有没销成的时候查、一次查询）：有、但每一行都已经销给了别的版本（上一批用过、同一批两篇带了同一个 key）算 `used`；
+还有没销账的行却没销成的（同一个 key 一行已销、一行没销也算这种）是并发 / 出错，不算 key 的问题，照旧进
+`angle_ledger_warning`。这个项目台账里没有的再按形状分三种（复审补的：10-27 查生产库近 60 天 48 条对不上的里 15 条是
+20 位十六进制，7 条是同一个人在别的项目抽的牌、8 条哪个台账都没有，说成「自己编的」写手会去改一个本来没错的 key）：
+
+| `problem` | 判据 | 回包怎么说 |
+|---|---|---|
+| `unknown` | 形状不是 20 位小写十六进制（`fingerprint.looks_like_angle_key`） | 自己编的、缩写的或抄错了；**原样复制 `draw_angles` 给的那个**，不要自己编号、缩写或改写 |
+| `other_project` | 形状对；`angle_ledger` 里有调用者自己（`drawn_by`）在**别的项目**抽的这一行（`store.angle_keys_drawn_elsewhere`，只在有这种 key 时多查一次，走不上 `(project_id, angle_key)` 索引，台账几千行不加索引） | 是你在别的项目抽的牌，稿子是不是存错了项目，跟用户确认；条目多带那个项目的 `project_id`。别人在别的项目抽过同一个 key 不算 |
+| `not_in_ledger` | 形状对，哪个台账都没有（或者查别的项目失败了） | 多半是发牌时台账没写进去（非原子路径 `record_draw` 失败只记日志），不是写手编的或抄错的 |
+
+送去查的 key 只收 `[0-9A-Za-z_-]{1,64}`：postgrest-py 的 `in_()` 不转义 `"` 和 `\`，一个坏 key 会让整条查询报错，
+那种形状本来也不可能在台账里，直接算 `unknown`。回包多几个字段：
+
+| 字段 | 什么时候有 | 内容 |
+|---|---|---|
+| `unknown_angle_keys` / `used_angle_keys` | 每次（同 `unattributed`） | 篇数，和 `unattributed`（没带 key）分开数；`unknown_angle_keys` 是这个项目台账里没有的三种合计 |
+| `angle_key_mismatch` | 有对不上的 | 每篇 `{index, angle_key, length, problem}`（`other_project` 另带 `project_id`），`angle_key` 只露前 24 字（模型编的长串可能是一句描述） |
+| `angle_key_warning` | 同上 | 一段话：按上表每种几篇、怎么回事；「原样复制、不要自己编号」只在有 `unknown` / `used` 时说；已经存了的不用重存；挂着的牌在 `angle_debt` 里一并回去，但不说「下一批按它们写」——那几张牌对应的稿子可能刚存过，再写一遍就是同一个角度两篇。同一批里还有没带 key 的，`unattributed_warning` 这时也不带「下一批按它们写」那一截（复审：两句话叫模型做相反的事） |
+
+`angle_ledger_warning` 只报剩下的（key 本身没问题的那几个）；按 key 查也失败了，就笼统报「没查清」，不猜。查询失败
+不抛：指纹这时已经写进库了。
+
+**下一次提醒也带上。** 只靠存档那次的回包不够：牌还挂着，之后 `draw_angles` / `check_drafts` / `record_rule` 的
+`archive_pending`（W-29）只会说「还有 N 张没存档」，模型明明存过了，只会当提醒有误。所以存档时对不上的记一笔，
+`archive_pending` 多带 `angle_key_mismatch = {drafts, unknown, used, by_problem, keys, last_at, note}`（`keys` 最多 10 个、
+截断；`unknown` 同回包的三种合计，`by_problem` 分开数）。`note` 按出现的那几种拼：「这些牌其实写完存了、别按它们再写」只对
+`unknown` / `used` 说（别的项目的牌、台账没有这一行的，跟这个项目挂着的牌无关），「不要自己编号」只对 `unknown` 说。
+记在进程内存里，同 `_borrowed_arms` 的取舍（deskcore 单进程）：重启丢了只少这一段提醒，`archive_pending` 照旧只多一次
+查询；窗口和 `archive_pending` 一样 1 天，**每篇对不上的各按自己存档的时刻过期**（codex review on aw#130：原来整段跟着最近一笔
+续命，0、23、46 小时各一篇的，46 小时时三篇都还在，旧 key 还占着 `keys` 的位置），记和读的时候都先剪掉过了窗口的，`last_at` 是
+还在窗口里最近那一篇的时刻；按 (项目, 存档的人) 记，别人的不给看；只在还挂着牌时带。
+
+**模型传回的臂以服务端为准。** 进程里原来只记 (项目, 写手) 最近一次借卡的臂，模型传回的臂认得出就照收。现在记的是近
+36 小时**每个臂最后一次发出去的时刻**，传回的臂按顺序过（`core._reported_arm_check`）：
+
+1. 进程里什么都没有（重启后没借过 / 36 小时没借过）：无从核对，照旧采用、来源 `brief`；
+2. 是最近一次发的臂，或者 **12 小时内**（`_ARM_REPORT_TTL`）发过：采用、来源 `brief`（同时开着两场、跨北京 0 点各拿一个臂的，
+   两个都在，各记各的，codex review on #104 那条不退）。复审前放的是整个 36 小时：同一个写手昨天开过一场别的臂，今天这场传错
+   就核不出来——生产库近 30 天 21 个 (项目, 写手, 北京日) 里 9 个前一天 36 小时内也有一场，其中 4 个是另一个臂；
+3. 进程起来不到 12 小时（`_ARMS_SINCE`），传回的臂正好是起来之前那一段（往回 12 小时到起来那一刻）某个北京日哈希出来的臂：
+   可能是重启前那一场拿到的，**核对不了**。记服务端最近一次发的臂、来源 `borrow`，传回的那个另存 `flywheel_arm_reported`，
+   另标 `flywheel_arm_unverified: true`（`batches.params` 和 `batch_metrics.meta` 都有，**分析对照组时剔掉**）；回包带
+   `flywheel_arm_unverified = {reported, recorded, note}`，只说重启过核对不了，不说「服务端分的是 X」（部署落在一场写作中间时
+   那样说是错的，10-26 当天 04:26 UTC 就部署过一次）。改稿（`replaces_version_id`）不建新 batch，挂的旧 batch 也标
+   `flywheel_arm_unverified`（codex review on aw#130）：旧 batch 正好是记下的那个臂时，拿它比不出 `flywheel_arm_mixed`，可改稿
+   可能是在传回的那个臂下写的；和记下的臂不同的照旧另标 mixed。改稿没传臂、重启后（或 36 小时内）也没借过卡、按入库时重算的
+   （来源 `recomputed`）同样标：重算出来的臂是猜的，新 batch 靠来源剔，旧 batch 的来源还是它自己的，只能靠这个标。没标上的同
+   mixed 一样进 `arm_mixed_unmarked_item_ids`；
+4. 其余：服务端没给过这场这个臂。以最近一次发的为准，来源 `borrow`，传回的那个另存 `flywheel_arm_reported`，回包带
+   `flywheel_arm_corrected = {reported, recorded, note}`。
+
+`borrow_lessons` 的 `flywheel_arm`（沿用这场的臂）走同一道：1～3 沿用（核对不了的也沿用，不把重启前那一场改成另一个臂），
+4 不沿用、按当天重新分——不然一句传错的臂先被借卡记下来（还真按它借了规律），入库时就核不出来了。没选「标 mixed」：被纠正
+的那批成稿只受过一种处理（服务端发的那个臂），剔掉反而白丢样本。仍然核不出的：① 重启后什么都没借过就入库的（第 1 条，来源
+`brief`）；② 一场写作开了 12 小时以上、中间同一个写手又借到另一个臂，这一场后面的批次会被「纠正」成新的臂；③ 前一天晚上
+（12 小时内）那一场的臂，第二天一早新开的一场传错成它，照收。分析对照组时剔掉 `flywheel_arm_unverified` 和
+`flywheel_arm_mixed` 的批次。
+
+**全拒也留原因。** `batch_metrics.meta` 有被拒的才多几个键，只留数和字段名，不留标题、正文、撞上的是哪篇：
+`rejected_by`（gate → 篇数：`pre_commit` / `atomic_recheck` / `replace_lookup` / `empty_body`）、`rejected_signals`
+（依据的信号 → 篇数：`opening` / `title` / `ngram` / `contain`，一篇可以有几个）、`rejected_scope`（`in_batch` / `history`）、
+`empty_body_fields`（正文空的那几篇带了哪些字段名，W-30：多半是正文放错了字段）。`counters` 另记 `unattributed` /
+`unknown_angle_keys` / `used_angle_keys`，`meta.angle_key_mismatch` 记 `{index, problem, length}`（不记 key 本身）。
+
+```sql
+-- 全拒的批次为什么拒(W-31)
+select created_at, left(project_id::text, 8) p, counters->>'drafts' d,
+       meta->'rejected_by' by_gate, meta->'rejected_signals' signals, meta->'rejected_scope' scope, meta->'empty_body_fields' fields
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'deskcore_commit' and (counters->>'written')::int = 0 and (counters->>'rejected')::int > 0
+ order by created_at desc limit 20;
+
+-- key 对不上台账 / 臂被纠正的批次
+select created_at, left(project_id::text, 8) p, counters->>'written' w,
+       counters->>'unknown_angle_keys' unknown, counters->>'used_angle_keys' used,
+       meta->>'flywheel_arm' arm, meta->>'flywheel_arm_source' src, meta->>'flywheel_arm_reported' reported,
+       meta->>'flywheel_arm_unverified' unverified, meta->'angle_key_mismatch' mismatch
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'deskcore_commit'
+   and (coalesce((counters->>'unknown_angle_keys')::int, 0) + coalesce((counters->>'used_angle_keys')::int, 0) > 0
+        or meta ? 'flywheel_arm_reported')
+ order by created_at desc limit 20;
+```
+
+协议没改（版本不变，写手不用重导 skill）：`score_drafts` 的工具说明补了这几个字段，回包和提醒自己把话说清楚。
 
 ## 4. 接入
 

@@ -756,3 +756,58 @@ def test_an_empty_body_replacement_does_not_hide_the_old_version_from_the_gate()
     assert out["rejected"][1]["collided_with"] == "秋招等回音"
     assert out["written"] == 0 and out["replaced"] == []
     assert _fps(c) == {v1: before}, "旧指纹一直在、没多出新指纹"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 被拒的原因进 batch_metrics(W-31, 10-27): 10-26 08:09 sportsix 一次 20 篇全拒(written 0), batch_metrics 只记了
+# 总数, 事后查不出是闸前撞历史、本批内互撞还是正文放错了字段。只留数和字段名, 不留标题 / 正文 / 撞上的是哪篇。
+# ══════════════════════════════════════════════════════════════════════
+
+def _last_metrics(c) -> dict:
+    rows = [r for r in c.rows.get("batch_metrics", []) if (r.get("meta") or {}).get("mode") == "deskcore_commit"]
+    return rows[-1]
+
+
+def test_a_fully_rejected_batch_records_why_in_batch_metrics():
+    c = _client()
+    _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    out = _commit(c, [{"title": "只有标题", "content": "正文被放进了别的字段", "angle_key": "K1"},
+                      {"title": "换了个标题", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    assert out["written"] == 0 and len(out["rejected"]) == 2
+
+    row = _last_metrics(c)
+    assert row["counters"]["written"] == 0 and row["counters"]["rejected"] == 2
+    meta = row["meta"]
+    assert meta["rejected_by"] == {"empty_body": 1, "pre_commit": 1}
+    assert meta["rejected_scope"] == {"history": 1}
+    assert meta["rejected_signals"] and set(meta["rejected_signals"]) <= {"opening", "title", "ngram", "contain"}
+    assert meta["empty_body_fields"] == ["angle_key", "content", "title"], "正文放错了字段: 字段名留下"
+    blob = repr(meta)
+    for text in ("只有标题", "正文被放进了别的字段", "换了个标题", "秋招等回音", BODY_X[:12]):
+        assert text not in blob, f"batch_metrics 不留稿子: {text}"
+
+
+def test_in_batch_collisions_are_told_apart_from_history():
+    c = _client()
+    out = _commit(c, [{"title": "第一份", "body": BODY_X}, {"title": "第二份", "body": BODY_X}],
+                  rpc=_rpc_that_writes(c))
+    assert out["written"] == 1
+    meta = _last_metrics(c)["meta"]
+    assert meta["rejected_by"] == {"pre_commit": 1} and meta["rejected_scope"] == {"in_batch": 1}
+    assert "empty_body_fields" not in meta
+
+
+def test_a_clean_batch_adds_no_rejection_keys():
+    c = _client()
+    _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))
+    meta = _last_metrics(c)["meta"]
+    assert not {"rejected_by", "rejected_signals", "rejected_scope", "empty_body_fields"} & set(meta)
+
+
+def test_a_race_lost_at_write_time_is_counted_too():
+    c = _client()
+    out = _commit(c, [{"title": "甲", "body": BODY_X}], rpc=lambda args: [
+        {"idx": 0, "status": "rejected", "collided_with": "队友刚存的", "detail": "撞了"}])
+    assert out["written"] == 0
+    meta = _last_metrics(c)["meta"]
+    assert meta["rejected_by"] == {"atomic_recheck": 1} and meta["rejected_scope"] == {"history": 1}
