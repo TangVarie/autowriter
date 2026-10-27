@@ -308,3 +308,39 @@ def test_no_block_without_pending_cards_and_the_note_expires_with_the_window(use
     c.rows["angle_ledger"][0]["consumed_version_id"] = "v-x"
     monkeypatch.setattr(core, "_utcnow", lambda: datetime.now(timezone.utc))
     assert "archive_pending" not in T.check_drafts(PID, [], _user_id=ME), "牌都销了就不提"
+
+
+def test_an_old_miss_is_not_added_to_a_new_one(use, no_embeddings, monkeypatch):
+    """记的那一边也按窗口重新开始(W-31 复审): 一天前的那一笔不许接着累加进新的一笔, 否则提醒里的篇数和 key 越滚越旧。"""
+    use(_client([_card(1, hours_ago=1)]))
+    t0 = datetime.now(timezone.utc)
+    monkeypatch.setattr(core, "_utcnow", lambda: t0)
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "OLD_01", "length": 6, "problem": "unknown"}])
+    later = t0 + timedelta(days=core.ARCHIVE_PENDING_DAYS, hours=1)
+    monkeypatch.setattr(core, "_utcnow", lambda: later)
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "NEW_01", "length": 6, "problem": "used"}])
+
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (1, 0, 1)
+    assert mm["keys"] == ["NEW_01"]
+
+
+def test_the_note_only_says_invented_or_already_written_when_that_is_the_problem(use):
+    """别的项目的牌、台账里没有这一行的: 这个项目挂着的牌跟那几篇无关, 不许说「这些牌其实写完存了」; 形状对的不说
+    「不要自己编号」(W-31 复审)。"""
+    use(_client([_card(1, hours_ago=1)]))
+    key = "0123456789abcdef0123"
+    core._note_angle_key_misses(PID, ME, [
+        {"index": 0, "angle_key": key, "length": 20, "problem": "other_project", "project_id": OTHER_PID},
+        {"index": 1, "angle_key": key[::-1], "length": 20, "problem": "not_in_ledger"}])
+    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 2, 0), "这个项目台账里没有的三种都算 unknown"
+    assert mm["by_problem"] == {"other_project": 1, "not_in_ledger": 1}
+    note = mm["note"]
+    assert "存错了项目" in note and "发牌时台账没写进去" in note
+    for bad in ("已经写完存档", "别按这些牌再写一遍", "不要自己编号"):
+        assert bad not in note, bad
+
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "A_01", "length": 4, "problem": "unknown"}])
+    note = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]["note"]
+    assert "已经写完存档" in note and "不要自己编号" in note and "存错了项目" in note

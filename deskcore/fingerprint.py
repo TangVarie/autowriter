@@ -358,6 +358,13 @@ def angle_key(dims: dict) -> str:
     return hashlib.sha256(core.encode("utf-8")).hexdigest()[:ANGLE_KEY_HEX_LEN]
 
 
+def looks_like_angle_key(key) -> bool:
+    """形状是不是 ``angle_key`` 发出来的那种(ANGLE_KEY_HEX_LEN 位小写十六进制)。W-31 复审: 这个项目台账里没有的 key,
+    形状对的就不是模型编的(多半是存错了项目, 或者发牌时台账没写进去), 回包不能说它「自己编的」。"""
+    return (isinstance(key, str) and len(key) == ANGLE_KEY_HEX_LEN
+            and all(c in "0123456789abcdef" for c in key))
+
+
 # ── 正例多样性限额 ────────────────────────────────────────────────────────
 
 def opening_shape(body: str, n: int = 12) -> str:

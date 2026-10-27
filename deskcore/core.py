@@ -94,10 +94,9 @@ ANGLE_KEY_MISS_SHOW = 10        # 提醒里最多列几个对不上的 key
 _ANGLE_KEY_MISS_TTL = timedelta(days=ARCHIVE_PENDING_DAYS)
 _angle_key_misses: dict[tuple[str, str], dict] = {}
 _angle_key_misses_lock = threading.Lock()
-ANGLE_KEY_MISMATCH_NOTE = (
-    "这些牌里有的其实已经写完存档了: 存档时那几篇带的 angle_key 在台账里对不上(keys 是其中几个), 所以没销账。"
-    "已经存了的不用重存, 也别按这些牌再写一遍; 之后每篇存档时的 angle_key 照 draw_angles 返回里分给它的那个原样复制"
-    f"({fp.ANGLE_KEY_HEX_LEN} 位十六进制), 不要自己编号、缩写或改写。")
+# 这个项目台账里没有的三种(都算进 unknown_angle_keys): 形状不对 = 编的 / 缩写的 / 抄错的; 形状对 = 别的项目的牌, 或者
+# 哪个台账都没有(W-31 复审: 10-27 查生产库近 60 天 48 条对不上的, 15 条是 20 位十六进制, 不能一律说「自己编的」)
+ANGLE_KEY_ABSENT = (store.ANGLE_KEY_UNKNOWN, store.ANGLE_KEY_OTHER_PROJECT, store.ANGLE_KEY_NOT_IN_LEDGER)
 
 # 判定阈值与 angle_key 住在 fingerprint.py —— 那个模块只用标准库, 让 selftest
 # 能在不装 supabase/anthropic 的裸环境里跑(本模块顶层 import db, 拖整条依赖链)。
@@ -1232,12 +1231,17 @@ def _clip_key(key: str) -> str:
     return key if len(key) <= ANGLE_KEY_SHOW_CHARS else key[:ANGLE_KEY_SHOW_CHARS] + "…"
 
 
-def _angle_key_problems(client, project_id: str, missed: dict[int, str]) -> tuple[list[dict], bool]:
+def _angle_key_problems(client, project_id: str, missed: dict[int, str], *,
+                        user_id=None) -> tuple[list[dict], bool]:
     """送去销账却没销成的那几篇里, 哪几篇是 key 本身的问题(W-31)。
 
     回 ``(问题, 查清了没有)``; 问题是 ``[{"index", "angle_key"(只露前 ANGLE_KEY_SHOW_CHARS 字), "length", "problem"}]``,
-    problem 是 ``store.ANGLE_KEY_UNKNOWN``(台账里没有)或 ``store.ANGLE_KEY_USED``(已经销给了别的稿子)。台账里还有
-    没销账的行却没销成的(并发 / 出错)不算 key 的问题, 不在里面。**不抛**: 指纹这时已经写进去了, 同 angle_debt 那段的纪律。"""
+    problem 是 ``store.ANGLE_KEY_USED``(已经销给了别的稿子)或这个项目台账里没有的三种(ANGLE_KEY_ABSENT):
+      · ``unknown``: 形状就不是发牌发的那种(20 位十六进制) —— 编的、缩写的、抄错的;
+      · ``other_project``: 形状对, 是调用者自己在别的项目抽的牌(条目多带 ``project_id``) —— 稿子多半存错了项目;
+      · ``not_in_ledger``: 形状对, 哪个台账都没有(或者没查清别的项目) —— 多半是发牌时台账没写进去。
+    后两种是 W-31 复审补的: 形状对的 key 说成「自己编的」, 写手会去改一个本来没错的东西。台账里还有没销账的行却没销成的
+    (并发 / 出错)不算 key 的问题, 不在里面。**不抛**: 指纹这时已经写进去了, 同 angle_debt 那段的纪律。"""
     if not missed:
         return [], True
     try:
@@ -1247,16 +1251,31 @@ def _angle_key_problems(client, project_id: str, missed: dict[int, str]) -> tupl
         states = None
     if states is None:
         return [], False
+    # 本项目台账里没有、形状却对的, 再查一次是不是调用者自己在别的项目抽的(只有这种时候才多这一次查询)
+    shaped = sorted({k for k in missed.values()
+                     if states.get(k) == store.ANGLE_KEY_UNKNOWN and fp.looks_like_angle_key(k)})
+    elsewhere: dict[str, str] = {}
+    if shaped:
+        try:
+            elsewhere = store.angle_keys_drawn_elsewhere(client, project_id, user_id, shaped) or {}
+        except Exception:                               # noqa: BLE001 — 同上; 查不清就按「台账里没有」说
+            logger.exception("commit_drafts: 查 angle_key 是不是别的项目的牌失败(project=%s)", project_id)
     out = []
     for i, key in sorted(missed.items()):
         st = states.get(key)
-        if st in (store.ANGLE_KEY_UNKNOWN, store.ANGLE_KEY_USED):
-            out.append({"index": i, "angle_key": _clip_key(key), "length": len(key), "problem": st})
+        if st == store.ANGLE_KEY_UNKNOWN and fp.looks_like_angle_key(key):
+            st = store.ANGLE_KEY_OTHER_PROJECT if key in elsewhere else store.ANGLE_KEY_NOT_IN_LEDGER
+        if st in ANGLE_KEY_ABSENT or st == store.ANGLE_KEY_USED:
+            p = {"index": i, "angle_key": _clip_key(key), "length": len(key), "problem": st}
+            if st == store.ANGLE_KEY_OTHER_PROJECT:
+                p["project_id"] = elsewhere[key]
+            out.append(p)
     if out:
-        logger.warning("commit_drafts: %d 篇带的 angle_key 对不上台账 (project=%s unknown=%d used=%d lengths=%s)",
-                       len(out), project_id, sum(1 for p in out if p["problem"] == store.ANGLE_KEY_UNKNOWN),
-                       sum(1 for p in out if p["problem"] == store.ANGLE_KEY_USED),
-                       sorted({p["length"] for p in out}))
+        by = {}
+        for p in out:
+            by[p["problem"]] = by.get(p["problem"], 0) + 1
+        logger.warning("commit_drafts: %d 篇带的 angle_key 对不上台账 (project=%s problems=%s lengths=%s)",
+                       len(out), project_id, by, sorted({p["length"] for p in out}))
     return out, True
 
 
@@ -2593,10 +2612,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     ``tactic``(2026-10-20): 这场 open_project 传的 tactic, 只给代码查规则的方向闸用(同 build_writing_brief 的判据)。
 
     ── 2026-10-27: 存档时核对 key 和臂(W-31) ─────────────────────────────
-    带了 angle_key 却没销成的, 按 key 再查一次台账, 分出「台账里没有」(``unknown_angle_keys``)和「已经销给了别的稿子」
-    (``used_angle_keys``), 和 ``unattributed`` 分开数, 哪几篇在 ``angle_key_mismatch``, 怎么办在 ``angle_key_warning``;
-    同一笔记进进程内存, 下一次 archive_pending 也带上。模型传回的 flywheel_arm 服务端近 36 小时没发过时以服务端为准
-    (``flywheel_arm_corrected``, 见 batch_arm)。被拒的按原因计数进 batch_metrics.meta(``_rejection_meta``)。
+    带了 angle_key 却没销成的, 按 key 再查一次台账, 分出「这个项目台账里没有」(``unknown_angle_keys``; 形状不对的、别的
+    项目的牌、哪个台账都没有的, 见 _angle_key_problems)和「已经销给了别的稿子」(``used_angle_keys``), 和 ``unattributed``
+    分开数, 哪几篇、哪一种在 ``angle_key_mismatch``, 怎么办在 ``angle_key_warning``; 同一笔记进进程内存, 下一次
+    archive_pending 也带上。模型传回的 flywheel_arm 对不上服务端发的时以服务端为准(``flywheel_arm_corrected``), 重启过
+    核对不了的另标(``flywheel_arm_unverified``), 见 batch_arm。被拒的按原因计数进 batch_metrics.meta(``_rejection_meta``)。
     docs/deskcore.md §3.12。
     """
     started = time.monotonic()
@@ -2813,20 +2833,22 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 for i in sorted(inserted_idx) if i in minted_ids and i not in replace
             ]
             # 这批落在哪个飞轮臂 (docs/28 §7.4): 这场写作借卡时定下的那个, 对照组靠它圈出来
-            arm, arm_source = batch_arm(project_id, user_id, from_brief=flywheel_arm)
-            # 模型传回的臂认得出、却没被采用 = 服务端这 36 小时没给这个 (项目, 写手) 发过这个臂, 以服务端借卡记的为准
-            # (W-31, 见 batch_arm)。传回的那个留一份(batch.params + batch_metrics.meta), 回包里也说一句。
-            arm_reported = flywheel_arm if flywheel_arm in FLYWHEEL_ARMS and flywheel_arm != arm else None
+            arm, arm_source, arm_check = batch_arm(project_id, user_id, from_brief=flywheel_arm)
+            # 模型传回的臂认得出、却没被采用 = 服务端没给过这场这个臂 (corrected), 或者重启过核对不了 (unverified):
+            # 都记服务端最近一次借卡的臂 (W-31, 见 batch_arm)。传回的那个留一份(batch.params + batch_metrics.meta),
+            # 核对不了的另标 flywheel_arm_unverified, 分析对照组时剔掉; 回包里也说一句。
+            arm_reported = flywheel_arm if arm_check else None
+            arm_flags = {**({"flywheel_arm_reported": arm_reported} if arm_reported else {}),
+                         **({"flywheel_arm_unverified": True} if arm_check == "unverified" else {})}
             unmarked = _mark_mixed_arm_batches(client, list(replaced_ok.values()), arm) if replaced_ok else []
-            arm_meta = {"flywheel_arm": arm, "flywheel_arm_source": arm_source,
-                        **({"flywheel_arm_reported": arm_reported} if arm_reported else {}),
+            arm_meta = {"flywheel_arm": arm, "flywheel_arm_source": arm_source, **arm_flags,
                         "revised_item_ids": sorted(set(replaced_ok.values())),
                         "arm_mixed_unmarked_item_ids": unmarked}
             if to_mint:
                 minted = store.mint_draft_identity(
                     client, project_id, str(user_id), "", to_mint,
                     batch_params={"source": "deskcore", "flywheel_arm": arm, "flywheel_arm_source": arm_source,
-                                  **({"flywheel_arm_reported": arm_reported} if arm_reported else {})})
+                                  **arm_flags})
             identity_error = minted.get("error")
 
             consumed = 0
@@ -2863,9 +2885,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
 
             # 带了 key 却没销成的, 分清是不是 key 本身的问题(W-31, 10-26 sportsix: 19 篇带的 key 一条都不在台账里,
             # 回包只说「销账少了」, 写手那边的 AI 不知道 key 是错的, 20 张牌一天后回了池子)。只在有没销成的时候多查一次。
-            key_problems, keys_classified = _angle_key_problems(client, project_id, missed_keys)
-            unknown_keys = sum(1 for p in key_problems if p["problem"] == store.ANGLE_KEY_UNKNOWN)
-            used_keys = sum(1 for p in key_problems if p["problem"] == store.ANGLE_KEY_USED)
+            key_problems, keys_classified = _angle_key_problems(client, project_id, missed_keys, user_id=user_id)
+            key_problem_n: dict[str, int] = {}
+            for kp in key_problems:
+                key_problem_n[kp["problem"]] = key_problem_n.get(kp["problem"], 0) + 1
+            unknown_keys = sum(key_problem_n.get(c, 0) for c in ANGLE_KEY_ABSENT)
+            used_keys = key_problem_n.get(store.ANGLE_KEY_USED, 0)
             _note_angle_key_misses(project_id, user_id, key_problems)    # 下一次 archive_pending 也带上
 
             # 入了库却没带 angle_key 的: 台账没法给它们销账, 同一个故事下一批还可能被
@@ -2878,8 +2903,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                          if i not in replace and minted_ids.get(i) in minted.get("versions", {})]
             out = {"written": written, "consumed_angles": consumed,
                    "unattributed": unattributed,
-                   # 带了 angle_key、台账却对不上的(W-31): 台账里没有这个 key / 这个 key 已经销给了别的稿子。
-                   # 和 unattributed(没带 key)分开数, 哪几篇在 angle_key_mismatch 里
+                   # 带了 angle_key、台账却对不上的(W-31): 这个项目的台账里没有这个 key(编的 / 别的项目的牌 / 台账
+                   # 没写进去, 见 _angle_key_problems) / 这个 key 已经销给了别的稿子。和 unattributed(没带 key)分开数,
+                   # 哪几篇、哪一种在 angle_key_mismatch 里
                    "unknown_angle_keys": unknown_keys, "used_angle_keys": used_keys,
                    "embedded": bool(vecs), "rejected": rejected,
                    "atomic_recheck": atomic,
@@ -2904,13 +2930,20 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 # 机器可读: 这几条改稿的旧 batch 没能标上 flywheel_arm_mixed, 分析对照组时要剔掉 (同一份也进 batch_metrics)
                 out["flywheel_arm_warning"] = {"code": "arm_mixed_unmarked", "arm": arm_meta["flywheel_arm"],
                                                "item_ids": arm_meta["arm_mixed_unmarked_item_ids"]}
-            if arm_reported:
+            if arm_check == "corrected":
                 out["flywheel_arm_corrected"] = {
                     "reported": arm_reported, "recorded": arm,
                     "note": (f"你传回的 flywheel_arm 是 {arm_reported}, 但这场借卡时服务端分的是 {arm}"
                              + ("(没有给已验证规律)" if arm == "explore" else "")
                              + f", 这批按 {arm} 记。以后原样传回 open_project / borrow_lessons 返回里的 flywheel_arm, "
                                "不要自己填。")}
+            elif arm_check == "unverified":
+                # 重启过: 传回的可能是对的, 不能说「服务端分的是 X」(W-31 复审)。只说明这批怎么记的, 不叫模型改什么
+                out["flywheel_arm_unverified"] = {
+                    "reported": arm_reported, "recorded": arm,
+                    "note": (f"服务端中途重启过, 核对不了这场借卡时分的是不是你传回的 {arm_reported}; 这批先按服务端重启后"
+                             f"最近一次借卡的 {arm} 记, 标了 flywheel_arm_unverified, 分析对照组时会剔掉。你这边不用改, "
+                             "照旧原样传回 open_project / borrow_lessons 返回里的 flywheel_arm。")}
             if key_problems:
                 out["angle_key_mismatch"] = key_problems
             if replace_error:
@@ -3003,25 +3036,37 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                                 + listed + ": 这一场还没存的稿子, 存档时从里面找到分给它的那个 key 原样带上; "
                                 "已经存了的那几篇别按这些坐标再写一遍。")
                 if unattributed:
+                    # 同一批里还有 key 对不上的: 挂着的牌里有几张其实刚写完存了, 这里再说「下一批按它们写」就和
+                    # angle_key_warning 打架、把同一个角度写两遍(W-31 复审)。那种时候挂着的牌只在 angle_key_warning 里说
                     out["unattributed_warning"] = (
                         f"{unattributed}/{written} 条入库的稿子没带 angle_key, 台账无法给它们"
                         "销账 —— 这些角度下一批还会被抽到, 同一个故事会被讲第二遍, 而那种"
                         "重复查重闸抓不到。成批写的稿子每条都要带 draw_angles 分给它的 "
-                        "angle_key。" + tail)
+                        "angle_key。" + ("" if key_problems else tail))
                 if key_problems:
                     # W-31: 只说「销账少了几个」模型不知道是自己的 key 错了(10-26 sportsix 5 批都这样存下去)。
                     # 说清是哪几篇、错在哪、下一篇怎么带; 已经存了的不用重存(没有改 key 的路, 重存只会多一版)。
+                    # 「自己编的、缩写的或抄错了」只对形状不对的说: 形状对的不是编的(W-31 复审)
+                    n = key_problem_n
                     parts = []
-                    if unknown_keys:
-                        parts.append(f"{unknown_keys} 篇带的 angle_key 在这个项目的台账里根本没有(draw_angles 发的 key "
-                                     f"都是 {fp.ANGLE_KEY_HEX_LEN} 位十六进制串, 这几个是自己编的、缩写的或抄错了)")
+                    if n.get(store.ANGLE_KEY_UNKNOWN):
+                        parts.append(f"{n[store.ANGLE_KEY_UNKNOWN]} 篇带的 angle_key 在这个项目的台账里根本没有(draw_angles "
+                                     f"发的 key 都是 {fp.ANGLE_KEY_HEX_LEN} 位十六进制串, 这几个是自己编的、缩写的或抄错了)")
+                    if n.get(store.ANGLE_KEY_OTHER_PROJECT):
+                        parts.append(f"{n[store.ANGLE_KEY_OTHER_PROJECT]} 篇带的 angle_key 是你在别的项目抽的牌(哪个项目见 "
+                                     "angle_key_mismatch 里的 project_id): 稿子是不是存错了项目? 跟用户确认 —— 那几张牌在"
+                                     "那个项目里还挂着")
+                    if n.get(store.ANGLE_KEY_NOT_IN_LEDGER):
+                        parts.append(f"{n[store.ANGLE_KEY_NOT_IN_LEDGER]} 篇带的 angle_key 形状是对的({fp.ANGLE_KEY_HEX_LEN} "
+                                     "位十六进制), 但台账里没有这一行: 多半是发牌时台账没写进去, 不是你编的或抄错的")
                     if used_keys:
                         parts.append(f"{used_keys} 篇带的 angle_key 已经销给了别的稿子(一个 key 只能给一篇, 同一批里两篇"
                                      "带了同一个 key 也是这样)")
                     out["angle_key_warning"] = (
                         "; ".join(parts) + f"。这 {len(key_problems)} 篇已经存档、查重照常, 但角度没销账(哪几篇见 "
-                        "angle_key_mismatch): 这些牌一天后回到池子, 同一个角度还会被抽到。接下来存档时每篇的 angle_key "
-                        "照 draw_angles 返回里分给它的那个原样复制, 不要自己编号、缩写或改写; 已经存了的这几篇不用重存。"
+                        "angle_key_mismatch), 同一个角度之后还可能被抽到; 已经存了的这几篇不用重存。"
+                        + ("接下来存档时每篇的 angle_key 照 draw_angles 返回里分给它的那个原样复制, 不要自己编号、缩写或改写。"
+                           if n.get(store.ANGLE_KEY_UNKNOWN) or used_keys else "")
                         + key_tail)
             if rejected:
                 pre = sum(1 for r in rejected if r.get("gate") == "pre_commit")
@@ -4732,8 +4777,9 @@ def archive_pending(client, project_id: str, *, user_id: str | None) -> dict | N
     查询失败时 store.angle_debt 自己留痕、回 0, 这里就回 None; 工具层再兜一层, 怎么都不会把工具结果弄坏。
 
     W-31(10-27): 调用者这一天里存档时带的 angle_key 对不上台账(没有这个 key / 已经销给别的稿子)的, 多带一个
-    ``angle_key_mismatch``: ``{"drafts", "unknown", "used", "keys"(最多 ANGLE_KEY_MISS_SHOW 个, 截断), "last_at",
-    "note"}``。从进程内存读(commit_drafts 记的), 不多查库; 没有就不带。
+    ``angle_key_mismatch``: ``{"drafts", "unknown", "used", "by_problem", "keys"(最多 ANGLE_KEY_MISS_SHOW 个, 截断),
+    "last_at", "note"}``。``unknown`` 同回包的 unknown_angle_keys(这个项目台账里没有的三种), ``by_problem`` 分开数,
+    ``note`` 按出现的那几种拼(_angle_key_mismatch_note)。从进程内存读(commit_drafts 记的), 不多查库; 没有就不带。
     """
     if not user_id:
         return None
@@ -4760,9 +4806,9 @@ def _note_angle_key_misses(project_id, user_id, problems: list[dict]) -> None:
         with _angle_key_misses_lock:
             cur = _angle_key_misses.get(k)
             if not cur or now - cur["last_at"] > _ANGLE_KEY_MISS_TTL:
-                cur = {store.ANGLE_KEY_UNKNOWN: 0, store.ANGLE_KEY_USED: 0, "keys": []}
+                cur = {"problems": {}, "keys": []}
             for p in problems:
-                cur[p["problem"]] = cur.get(p["problem"], 0) + 1
+                cur["problems"][p["problem"]] = cur["problems"].get(p["problem"], 0) + 1
                 if p["angle_key"] not in cur["keys"] and len(cur["keys"]) < ANGLE_KEY_MISS_SHOW:
                     cur["keys"].append(p["angle_key"])
             cur["last_at"] = now
@@ -4778,9 +4824,34 @@ def _recent_angle_key_misses(project_id, user_id) -> dict | None:
         cur = dict(_angle_key_misses.get((str(project_id), str(user_id))) or {})
     if not cur or now - cur["last_at"] > _ANGLE_KEY_MISS_TTL:
         return None
-    unknown, used = int(cur.get(store.ANGLE_KEY_UNKNOWN) or 0), int(cur.get(store.ANGLE_KEY_USED) or 0)
-    return {"drafts": unknown + used, "unknown": unknown, "used": used, "keys": list(cur.get("keys") or []),
-            "last_at": cur["last_at"].isoformat(), "note": ANGLE_KEY_MISMATCH_NOTE}
+    n = {k: int(v or 0) for k, v in (cur.get("problems") or {}).items()}
+    unknown = sum(n.get(c, 0) for c in ANGLE_KEY_ABSENT)
+    used = n.get(store.ANGLE_KEY_USED, 0)
+    return {"drafts": unknown + used, "unknown": unknown, "used": used, "by_problem": n,
+            "keys": list(cur.get("keys") or []), "last_at": cur["last_at"].isoformat(),
+            "note": _angle_key_mismatch_note(n)}
+
+
+def _angle_key_mismatch_note(n: dict[str, int]) -> str:
+    """archive_pending 里 angle_key_mismatch 那句话, 按出现的问题拼(W-31 复审)。
+
+    「牌其实写完存了、别按它们再写」只对 unknown / used 说: 那两种是这个项目的牌写了却带错了 key。别的项目的牌、
+    台账里没有这一行的, 这个项目挂着的牌跟那几篇无关。「不要自己编号、缩写或改写」只对形状不对的(unknown)说。"""
+    unknown, used = n.get(store.ANGLE_KEY_UNKNOWN, 0), n.get(store.ANGLE_KEY_USED, 0)
+    other, missing = n.get(store.ANGLE_KEY_OTHER_PROJECT, 0), n.get(store.ANGLE_KEY_NOT_IN_LEDGER, 0)
+    parts = []
+    if unknown or used:
+        parts.append(
+            f"这些牌里有的其实已经写完存档了: 有 {unknown + used} 篇存档时带的 angle_key 在这个项目的台账里对不上"
+            "(keys 里有), 所以没销账。已经存了的不用重存, 也别按这些牌再写一遍"
+            + (f"; 之后每篇存档时的 angle_key 照 draw_angles 返回里分给它的那个原样复制({fp.ANGLE_KEY_HEX_LEN} 位十六进制), "
+               "不要自己编号、缩写或改写" if unknown else "") + "。")
+    if other:
+        parts.append(f"有 {other} 篇存进这个项目时带的是你在别的项目抽的牌: 稿子是不是存错了项目? 跟用户确认。")
+    if missing:
+        parts.append(f"有 {missing} 篇带的 angle_key 形状是对的({fp.ANGLE_KEY_HEX_LEN} 位十六进制), 但台账里没有这一行: "
+                     "多半是发牌时台账没写进去, 不是你编的或抄错的。")
+    return "".join(parts)
 
 
 def edit_digest(client, project_id: str, *, user_id: str | None = None,
@@ -6391,16 +6462,25 @@ def flywheel_arm(project_id, user_id, *, now: datetime | None = None) -> str:
 #
 # ⚠️ 模型传回的臂要和服务端对得上 (W-31, 2026-10-27)。10-26 sportsix 那场借卡是 explore (TV 缓存键 `:explore`,
 # 没给规律), 5 批里 4 批模型传回的却是 patterns, 照单记成了 patterns —— 对照组被污染, 分析时只能手工剔。所以进程里
-# 记的是这个 (项目, 写手) 近 36 小时【每个臂最后一次】发出去的时刻, 不只最近一次:
-#   · 传回的臂在里面 → 采用 (同时开着两场、跨北京 0 点各拿一个臂的, 两个都在, 各记各的, codex review on #104 不退);
-#   · 不在里面、而这段时间服务端发过臂 → 服务端没给过这个臂, 模型手里不可能有它对应的简报: 以服务端为准, 记最近
-#     一次发的臂、来源 borrow, 传回的那个另存 flywheel_arm_reported, 回包带 flywheel_arm_corrected;
-#   · 进程里什么都没有 (重启过 / 36 小时没借过) → 无从核对, 照旧采用传回的, 来源 brief。
-# borrow_lessons 的 reuse 走同一道: 服务端没发过的臂不沿用, 否则一句传错的臂先被借卡记下来, 入库时就核不出来了。
-# 没选「标 mixed」: 这批成稿只受过一种处理 (服务端发的那个臂), 不是两种, 剔掉反而白丢样本。
+# 记的是这个 (项目, 写手) 近 36 小时【每个臂最后一次】发出去的时刻, 不只最近一次 (_reported_arm_check):
+#   · 进程里什么都没有 (重启后没借过 / 36 小时没借过) → 无从核对, 照旧采用传回的, 来源 brief;
+#   · 传回的是最近一次发的臂, 或者 12 小时 (_ARM_REPORT_TTL) 内发过 → 采用 (同时开着两场、跨北京 0 点各拿一个臂的,
+#     两个都在, 各记各的, codex review on #104 不退)。不放宽到 36 小时: 同一个写手昨天开过一场别的臂, 今天这场
+#     传错就核不出来 (W-31 复审查生产库: 近 30 天 21 个 (项目, 写手, 北京日) 里 4 个前一天 36 小时内有一场另一个臂的);
+#   · 进程起来不到 12 小时、传回的臂正好是起来之前那一段某个北京日的臂 → 可能是重启前那场拿到的, 核对不了: 记服务端
+#     最近一次发的臂、来源 borrow, 标 flywheel_arm_unverified (分析对照组时剔掉), 回包带 flywheel_arm_unverified,
+#     不说「服务端分的是 X」(W-31 复审: 部署重启落在一场写作中间时, 那样说是错的);
+#   · 其余 → 服务端没给过这场这个臂, 模型手里不可能有它对应的简报: 以服务端为准, 记最近一次发的臂、来源 borrow,
+#     传回的那个另存 flywheel_arm_reported, 回包带 flywheel_arm_corrected。
+# borrow_lessons 的 reuse 走同一道 (核对不了的也沿用): 服务端没发过的臂不沿用, 否则一句传错的臂先被借卡记下来,
+# 入库时就核不出来了。没选「标 mixed」: 被纠正的那批成稿只受过一种处理 (服务端发的那个臂), 剔掉反而白丢样本。
+# 剩下核不准的: ① 一场写作开了 12 小时以上、中间同一个写手又借到另一个臂 —— 那一场后面的批次会被纠正成新的臂;
+# ② 前一晚 (12 小时内) 那一场的臂, 第二天一早新开的一场传错成它 —— 照收。docs/deskcore.md §3.12。
 _ARM_TTL = timedelta(hours=36)
+_ARM_REPORT_TTL = timedelta(hours=12)
 _borrowed_arms: dict[tuple[str, str], dict[str, datetime]] = {}     # (项目, 写手) → {臂: 最后一次发出的时刻}
 _borrowed_arms_lock = threading.Lock()
+_ARMS_SINCE = datetime.now(timezone.utc)    # 进程起来的时刻: 这之前发出去的臂 _borrowed_arms 里没有 (重启丢了)
 
 
 def _utcnow() -> datetime:
@@ -6412,16 +6492,43 @@ def _issued_arms(key: tuple[str, str], now: datetime) -> dict[str, datetime]:
     return {a: t for a, t in (_borrowed_arms.get(key) or {}).items() if now - t <= _ARM_TTL}
 
 
+def _arm_maybe_issued_before_restart(project_id, user_id, arm: str, now: datetime) -> bool:
+    """进程起来还不到 _ARM_REPORT_TTL 时, 起来之前那一段发过什么臂 _borrowed_arms 里没有。``arm`` 正好是那一段里
+    某个北京日哈希出来的臂 → 可能是重启前那场拿到的, 核对不了 (W-31 复审)。纯函数, 不读写库。"""
+    start, end = now - _ARM_REPORT_TTL, min(_ARMS_SINCE, now)
+    if end <= start:
+        return False
+    day, last = start.astimezone(_CN_TZ).date(), end.astimezone(_CN_TZ).date()
+    while day <= last:
+        if flywheel_arm(project_id, user_id, now=datetime(day.year, day.month, day.day, 12, tzinfo=_CN_TZ)) == arm:
+            return True
+        day += timedelta(days=1)
+    return False
+
+
+def _reported_arm_check(project_id, user_id, reported: str, issued: dict[str, datetime], now: datetime) -> str:
+    """模型传回的臂 (已认得出) 对不对得上服务端发过的 (见上面那段): ``"ok"`` 采用 | ``"unverified"`` 核对不了 |
+    ``"corrected"`` 服务端没给过这场这个臂。``issued`` = _issued_arms 的结果。"""
+    if not issued:
+        return "ok"
+    latest = max(issued, key=issued.get)
+    if reported == latest or (reported in issued and now - issued[reported] <= _ARM_REPORT_TTL):
+        return "ok"
+    if _arm_maybe_issued_before_restart(project_id, user_id, reported, now):
+        return "unverified"
+    return "corrected"
+
+
 def _borrow_arm(project_id, user_id, *, reuse: str | None = None) -> str:
     """借卡时定臂, 并记下来给入库用。同一 (项目, 写手) 每个臂留最后一次发出的时刻。
-    ``reuse`` = 这场写作已经拿到的臂 (模型把 open_project 给的原样传回): 认得出、而且服务端近 36 小时确实给这个
-    (项目, 写手) 发过 (或者进程里没有记录, 无从核对) 就沿用, 不重新分 —— 同一场里先借后借跨了北京 0 点, 重新分会让
-    手里已有规律的会话被记成探索臂 (codex review on #104)。服务端没发过的不沿用 (W-31), 按当天重新分。"""
+    ``reuse`` = 这场写作已经拿到的臂 (模型把 open_project 给的原样传回): 认得出、而且对得上服务端发过的 (或者核对
+    不了, 见 _reported_arm_check) 就沿用, 不重新分 —— 同一场里先借后借跨了北京 0 点, 重新分会让手里已有规律的会话
+    被记成探索臂 (codex review on #104)。服务端没给过这场的不沿用 (W-31), 按当天重新分。"""
     now = _utcnow()
     key = (str(project_id), str(user_id or ""))
     with _borrowed_arms_lock:
         issued = _issued_arms(key, now)
-        if reuse in FLYWHEEL_ARMS and (not issued or reuse in issued):
+        if reuse in FLYWHEEL_ARMS and _reported_arm_check(project_id, user_id, reuse, issued, now) != "corrected":
             arm = reuse
         else:
             arm = flywheel_arm(project_id, user_id, now=now)
@@ -6430,18 +6537,21 @@ def _borrow_arm(project_id, user_id, *, reuse: str | None = None) -> str:
     return arm
 
 
-def batch_arm(project_id, user_id, *, from_brief: str | None = None) -> tuple[str, str]:
-    """入库时这批记哪个臂: (臂, 'brief' | 'borrow' | 'recomputed')。``from_brief`` = 模型传回的简报里的臂。
-    传回的臂服务端近 36 小时没给这个 (项目, 写手) 发过时以服务端为准 (W-31, 见上面那段): 回的臂和 from_brief 不同,
-    调用方据此记 flywheel_arm_reported。"""
+def batch_arm(project_id, user_id, *, from_brief: str | None = None) -> tuple[str, str, str | None]:
+    """入库时这批记哪个臂: (臂, 'brief' | 'borrow' | 'recomputed', 传回的臂为什么没采用)。``from_brief`` = 模型传回的
+    简报里的臂。第三项 (W-31, 见上面那段): None = 采用了 / 没传; ``"corrected"`` = 服务端没给过这场这个臂, 以服务端
+    最近一次发的为准; ``"unverified"`` = 重启过核对不了, 也记服务端最近一次发的, 调用方标 flywheel_arm_unverified。"""
     now = _utcnow()
     with _borrowed_arms_lock:
         issued = _issued_arms((str(project_id), str(user_id or "")), now)
-    if from_brief in FLYWHEEL_ARMS and (not issued or from_brief in issued):
-        return from_brief, "brief"
+    if from_brief in FLYWHEEL_ARMS:
+        check = _reported_arm_check(project_id, user_id, from_brief, issued, now)
+        if check == "ok":
+            return from_brief, "brief", None
+        return max(issued, key=issued.get), "borrow", check     # 不是 ok 时 issued 一定非空
     if issued:
-        return max(issued, key=issued.get), "borrow"
-    return flywheel_arm(project_id, user_id, now=now), "recomputed"
+        return max(issued, key=issued.get), "borrow", None
+    return flywheel_arm(project_id, user_id, now=now), "recomputed", None
 
 
 def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str) -> list[str]:

@@ -914,6 +914,10 @@ _LEDGER_LOOKUP_KEY = re.compile(r"[0-9A-Za-z_\-]{1,64}")
 ANGLE_KEY_UNKNOWN = "unknown"   # 本项目台账里没有这个 key: 模型自己编的、抄错的
 ANGLE_KEY_USED = "used"         # 有, 但每一行都已经销给了别的版本: 一个 key 给了两篇
 ANGLE_KEY_OPEN = "open"         # 还有没销账的行: 没销成是并发 / 查询出错, 不是 key 的问题
+# 本项目台账里没有、形状却是发牌发出来的那种(20 位十六进制)的, core 再细分(W-31 复审, 10-27 查生产库近 60 天 48 条
+# 对不上的里 15 条是这种形状: 7 条是同一个人在别的项目抽的牌, 8 条哪个台账都没有)。angle_key_states 本身不出这两种。
+ANGLE_KEY_OTHER_PROJECT = "other_project"   # 调用者自己在别的项目抽的牌: 稿子多半存错了项目
+ANGLE_KEY_NOT_IN_LEDGER = "not_in_ledger"   # 哪个台账都没有: 多半是发牌时台账没写进去(record_draw 失败只记日志)
 
 
 def angle_key_states(sb, project_id: str, keys) -> dict[str, str] | None:
@@ -946,6 +950,33 @@ def angle_key_states(sb, project_id: str, keys) -> dict[str, str] | None:
         elif states[k] == ANGLE_KEY_UNKNOWN:
             states[k] = ANGLE_KEY_USED
     return states
+
+
+def angle_keys_drawn_elsewhere(sb, project_id: str, user_id, keys) -> dict[str, str] | None:
+    """这几个 key 是不是调用者【自己】在别的项目抽的牌: ``{key: 那个项目的 id}``(W-31 复审, 2026-10-27)。
+
+    只在本项目台账里没有、形状又是发牌发出来的那种 key 上调(core 先筛), 一次查询。只看 ``drawn_by = 调用者``:
+    别人在别的项目抽过什么不归这里说。``angle_ledger`` 只有 (project_id, angle_key) 的索引, 这条按 angle_key 跨项目查
+    走不上它; 台账只有几千行、这条又只在 key 对不上时才跑, 不为它加索引。
+
+    查询失败回 None(调用方当作分不清); 不抛。"""
+    want = [k for k in dict.fromkeys(str(k) for k in (keys or []) if k) if _LEDGER_LOOKUP_KEY.fullmatch(k)]
+    if not want or not user_id:
+        return {}
+    try:
+        rows = _paged(lambda off, lim: (
+            sb.table("angle_ledger").select("angle_key, project_id")
+              .in_("angle_key", want).eq("drawn_by", str(user_id)).neq("project_id", project_id)
+              .order("id").range(off, off + lim - 1)))
+    except Exception:
+        logger.exception("angle keys drawn elsewhere lookup failed (project=%s)", project_id)
+        return None
+    out: dict[str, str] = {}
+    for r in rows:
+        k = r.get("angle_key")
+        if k in want and k not in out and r.get("project_id") and str(r["project_id"]) != str(project_id):
+            out[k] = str(r["project_id"])
+    return out
 
 
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────

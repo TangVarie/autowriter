@@ -157,6 +157,9 @@ UNGATED_WITH_REASON = {
     "flywheel_arm": "纯函数: 对 (project_id, user_id, 北京日期) 取哈希定飞轮臂, 不读写库; 调用方 borrow_lessons / build_writing_brief / commit_drafts 都已过归属闸",
     "_borrow_arm": "借卡时定臂并记进进程内存 (不读写库), 只被 _borrow_for_brief 调, 其调用方 borrow_lessons / build_writing_brief 已过归属闸",
     "batch_arm": "入库时取借卡那次的臂 (进程内存, 不读写库), 只被 commit_drafts 调, 它已过归属闸",
+    "_reported_arm_check": "W-31 复审: 模型传回的臂对不对得上进程内存里服务端发过的 (不读写库), 只被 batch_arm / _borrow_arm 调",
+    "_arm_maybe_issued_before_restart": "W-31 复审: 纯函数, 按 flywheel_arm 的哈希看传回的臂是不是进程起来之前那一段的臂, "
+                                        "不读写库; 只被 _reported_arm_check 调",
     "_daily_rotation_seed": "纯函数: 同 flywheel_arm, 对 (用途, project_id, user_id, 北京日期) 取哈希当正例 / 规律轮换的种子, 不读写库",
     "_patterns_usage_for": "纯函数: 用 _daily_rotation_seed 定规律轮换的起点、拼用法说明, 不读写库; 调用方 build_writing_brief / borrow_lessons 已过归属闸",
     "select_positive_examples": "纯函数: 候选是已过归属闸的 build_writing_brief 读好传进来的, project_id 只当轮换种子的输入(10-20)",
@@ -210,7 +213,8 @@ UNGATED_WITH_REASON = {
     "archive_pending":        "附加提醒(W-29, 10-23), 只被 tools 层在已过闸的 draw_angles / check_drafts / record_rule 成功之后调; "
                               "只读 angle_ledger 里 drawn_by = 调用者的行(别人的牌不算), 只回张数和最早的发牌时间; "
                               "W-31 起再带调用者自己存档时 key 对不上的那一笔(进程内存, 按 (项目, 调用者) 取)",
-    "_angle_key_problems":    "W-31(10-27), 只被已过闸的 commit_drafts 调: 把它这次没销成的那几个 key 拿去本项目台账查状态",
+    "_angle_key_problems":    "W-31(10-27), 只被已过闸的 commit_drafts 调: 把它这次没销成的那几个 key 拿去本项目台账查状态; "
+                              "本项目没有、形状对的再查 drawn_by = 调用者自己在别的项目抽过没有(别人的牌不看)",
     "_note_angle_key_misses": "W-31(10-27), 只被已过闸的 commit_drafts 调: 把 key 对不上的篇数记进进程内存, 不读写库",
     "_recent_angle_key_misses": "W-31(10-27), 只被 archive_pending 调(见上): 读进程内存里调用者自己的那一笔, 不读写库",
 }

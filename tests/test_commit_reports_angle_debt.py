@@ -337,3 +337,106 @@ def test_metrics_count_the_mismatches_without_storing_the_keys():
                                                  {"index": 1, "problem": "unknown", "length": 53}]
     blob = repr(row)
     assert SHORT_CODE not in blob and "职场新人" not in blob, "key 本身不进 batch_metrics"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 4b · 形状对的 key 不是「编的」(W-31 复审, 10-27)
+#
+# 生产库近 60 天: 916 条带 key 的指纹里 48 条在自己项目的台账里对不上, 其中 15 条是 20 位十六进制 —— 7 条是同一个人
+# 在别的项目抽的牌(09-21), 8 条哪个台账都没有(09-10/11, 非原子发牌路径 record_draw 失败只记日志)。告诉写手「自己编的、
+# 缩写的或抄错了」, 他会去改一个本来没错的 key; 真正要做的是确认是不是存错了项目 / 知道是台账的锅。
+#
+# 被禁止的形态:
+#   · 形状对的 key 也说成编的 / 抄错的, 或者叫他「不要自己编号、缩写或改写」;
+#   · 拿别人在别的项目抽的牌说「是你在别的项目抽的」(只看 drawn_by = 调用者);
+#   · 有不带 key 的、也有 key 对不上的同一批里, 一句叫「下一批按挂着的坐标写」、一句叫「别按这些坐标再写」。
+# ══════════════════════════════════════════════════════════════════════
+
+OTHER_PROJ = "aaaaaaaa-0000-0000-0000-00000000000f"
+
+
+def test_a_key_drawn_in_another_project_says_wrong_project_not_invented():
+    c = _client([_card(2), {**_card(1), "id": "ang-x1", "project_id": OTHER_PROJ}])
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A, "angle_key": _hex(1)}], user_id=ME)
+
+    assert out["written"] == 1 and out["consumed_angles"] == 0
+    assert out["unknown_angle_keys"] == 1, "这个项目的台账里没有, 照样算进 unknown_angle_keys"
+    assert out["angle_key_mismatch"] == [{"index": 0, "angle_key": _hex(1), "length": 20,
+                                          "problem": "other_project", "project_id": OTHER_PROJ}]
+    warn = out["angle_key_warning"]
+    assert "别的项目抽的牌" in warn and "存错了项目" in warn
+    for bad in ("自己编的", "抄错了", "不要自己编号"):
+        assert bad not in warn, bad
+    assert "angle_ledger_warning" not in out
+
+
+def test_a_well_formed_key_in_no_ledger_of_mine_is_put_on_the_ledger_write():
+    """哪个台账都没有(队友在别的项目抽过同一个 key 不算我的): 多半是发牌时台账没写进去, 不是写手的错。"""
+    c = _client([{**_card(9, user=MATE), "id": "ang-m9", "project_id": OTHER_PROJ}])
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A, "angle_key": _hex(9)}], user_id=ME)
+
+    assert out["unknown_angle_keys"] == 1
+    (m,) = out["angle_key_mismatch"]
+    assert (m["problem"], m["length"]) == ("not_in_ledger", 20) and "project_id" not in m, "别人的牌不报"
+    warn = out["angle_key_warning"]
+    assert "发牌时台账没写进去" in warn and "不是你编的或抄错的" in warn
+    for bad in ("自己编的、缩写的", "不要自己编号"):
+        assert bad not in warn, bad
+
+
+def test_the_elsewhere_lookup_failing_falls_back_to_not_in_ledger(monkeypatch):
+    c = _client([{**_card(1), "id": "ang-x1", "project_id": OTHER_PROJ}])
+
+    def boom(*a, **k):
+        raise RuntimeError("PostgREST 503")
+    monkeypatch.setattr(store, "angle_keys_drawn_elsewhere", boom)
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A, "angle_key": _hex(1)}], user_id=ME)
+    assert out["written"] == 1 and [m["problem"] for m in out["angle_key_mismatch"]] == ["not_in_ledger"]
+
+
+def test_invented_and_well_formed_keys_in_one_batch_are_told_apart():
+    c = _client([_card(2), {**_card(1), "id": "ang-x1", "project_id": OTHER_PROJ}])
+    out = core.commit_drafts(c, PROJ, [
+        {"title": "编号", "body": BODY_A, "angle_key": SHORT_CODE},
+        {"title": "别的项目", "body": BODY_B, "angle_key": _hex(1)},
+    ], user_id=ME)
+    assert out["unknown_angle_keys"] == 2
+    assert [m["problem"] for m in out["angle_key_mismatch"]] == ["unknown", "other_project"]
+    warn = out["angle_key_warning"]
+    assert "1 篇带的 angle_key 在这个项目的台账里根本没有" in warn and "自己编的" in warn
+    assert "1 篇带的 angle_key 是你在别的项目抽的牌" in warn and "原样复制" in warn
+
+
+def test_unattributed_and_bad_keys_in_one_batch_do_not_give_opposite_orders():
+    """挂着的牌里有一张其实刚写完存了(带错了 key): 不许一句叫「下一批按它们写」、另一句叫「别按这些坐标再写」。"""
+    c = _client([_card(1), _card(2)])
+    out = core.commit_drafts(c, PROJ, [
+        {"title": "错 key", "body": BODY_A, "angle_key": "A_01"},
+        {"title": "没带", "body": BODY_B},
+    ], user_id=ME)
+    assert out["unattributed"] == 1 and out["unknown_angle_keys"] == 1
+    assert "unattributed_warning" in out and "angle_key_warning" in out
+    assert {a["angle_key"] for a in out["angle_debt"]["angles"]} == {_hex(1), _hex(2)}, "挂着的牌照样回去"
+    assert "别按这些坐标再写一遍" in out["angle_key_warning"]
+    for k, v in out.items():
+        assert "下一批按它们写" not in repr(v), k
+
+
+def test_an_open_row_wins_over_a_spent_row_for_the_same_key():
+    """同一个 key 在这个项目里有两行: 一行已销给了别的稿子, 一行还没销(过期后重新发了牌)。没销成是别的原因, 不是
+    key 的问题 —— 和行的先后无关。"""
+    c = _client([{**_card(5), "id": "ang-5a"}, {**_card(5, consumed="v-old"), "id": "ang-5b"}])
+    assert store.angle_key_states(c, PROJ, [_hex(5)]) == {_hex(5): "open"}
+
+
+def test_elsewhere_lookup_is_mine_only_and_never_sends_unsafe_keys():
+    c = _client([{**_card(1), "id": "ang-x1", "project_id": OTHER_PROJ},
+                 {**_card(2, user=MATE), "id": "ang-x2", "project_id": OTHER_PROJ},
+                 _card(3)])                                                  # 本项目的不算「别的项目」
+    got = store.angle_keys_drawn_elsewhere(c, PROJ, ME, [_hex(1), _hex(2), _hex(3), 'a"b'])
+    assert got == {_hex(1): OTHER_PROJ}
+    for call in [x for x in c.calls if x["table"] == "angle_ledger"]:
+        (sent,) = [f[2] for f in call["filters"] if f[0] == "in"]
+        assert 'a"b' not in sent
+        assert ("eq", "drawn_by", ME) in call["filters"] and ("neq", "project_id", PROJ) in call["filters"]
+    assert store.angle_keys_drawn_elsewhere(c, PROJ, None, [_hex(1)]) == {}, "不知道是谁就不查"

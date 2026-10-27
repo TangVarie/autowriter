@@ -112,6 +112,8 @@ def _commit(monkeypatch):
 @pytest.fixture
 def fresh_arms(monkeypatch):
     monkeypatch.setattr(core, "_borrowed_arms", {})
+    # 进程「早就起来了」: 用例里的借卡记录就是全部, 不落进「重启前那一段核对不了」(W-31 复审, 那条用例自己改它)
+    monkeypatch.setattr(core, "_ARMS_SINCE", datetime(2000, 1, 1, tzinfo=timezone.utc))
 
 
 def test_borrow_and_commit_use_the_same_arm(monkeypatch, fresh_arms):
@@ -357,7 +359,7 @@ def test_a_follow_up_borrow_after_midnight_keeps_the_session_arm(monkeypatch, fr
     monkeypatch.setattr(core, "_utcnow", lambda: after)
     out = core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm)
     assert out["flywheel_arm"] == arm and fake.briefs[-1]["explore"] is (arm == "explore")
-    assert core.batch_arm(PID, ME) == (arm, "borrow"), "沿用的臂也记进「最近一次借卡」"
+    assert core.batch_arm(PID, ME) == (arm, "borrow", None), "沿用的臂也记进「最近一次借卡」"
     assert core.borrow_lessons(_client(), PID, user_id=ME)["flywheel_arm"] != arm, "不传就按当天重新分"
 
 
@@ -451,4 +453,63 @@ def test_a_follow_up_borrow_does_not_reuse_an_arm_it_never_issued(monkeypatch, f
     out = core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm="patterns")
     assert out["flywheel_arm"] == "explore" and fake.briefs[-1]["explore"] is True
     assert out["validated_patterns"] == []
-    assert core.batch_arm(PID, ME, from_brief="patterns") == ("explore", "borrow")
+    assert core.batch_arm(PID, ME, from_brief="patterns") == ("explore", "borrow", "corrected")
+
+
+def test_yesterdays_arm_does_not_cover_todays_session(monkeypatch, fresh_arms):
+    """W-31 复审: 同一个写手昨天开过一场 patterns, 今天这场是 explore。今天传回 patterns 不能因为「36 小时里服务端
+    发过 patterns」就照收 —— 只认最近一次发的臂, 或者 12 小时内发过的 (跨北京 0 点同时开着的两场)。"""
+    t = datetime(2026, 10, 27, 1, tzinfo=timezone.utc)                       # 北京 09:00
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, *, now=None: "patterns" if now < t - timedelta(hours=12)
+                        else "explore")
+    fake = _Librarian(PATTERNS)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+    monkeypatch.setattr(core, "_utcnow", lambda: t - timedelta(hours=24))
+    assert core.build_writing_brief(_client(), PID, user_id=ME, brief={})["flywheel_arm"] == "patterns"
+    monkeypatch.setattr(core, "_utcnow", lambda: t)
+    assert core.build_writing_brief(_client(), PID, user_id=ME, brief={})["flywheel_arm"] == "explore"
+
+    monkeypatch.setattr(core, "_utcnow", lambda: t + timedelta(hours=1))
+    assert core.batch_arm(PID, ME, from_brief="patterns") == ("explore", "borrow", "corrected")
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm="patterns")
+    assert (params["flywheel_arm"], params["flywheel_arm_source"], params["flywheel_arm_reported"]) == \
+        ("explore", "borrow", "patterns")
+    assert out["flywheel_arm_corrected"]["recorded"] == "explore" and "flywheel_arm_unverified" not in params
+    out = core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm="patterns")
+    assert out["flywheel_arm"] == "explore" and fake.briefs[-1]["explore"] is True, "也不按昨天的臂借规律"
+
+
+@pytest.mark.parametrize("restart", ["between_sessions", "none", "after_both_days"])
+def test_a_restart_between_two_sessions_is_unverifiable_not_a_correction(monkeypatch, fresh_arms, restart):
+    """W-31 复审: A 在北京 23:59 开场拿到臂甲, 之后部署重启, B 在 00:01 开场拿到臂乙, 进程里只有乙。A 入库传回甲:
+    核对不了 (甲正是重启前那一段北京日的臂) —— 记服务端的乙、标 flywheel_arm_unverified, 不说「服务端分的是乙」,
+    A 再借卡沿用甲。没重启过 (记录是全的), 或者重启前那 12 小时里根本没有哪一天是甲, 就是纠正。"""
+    before, after = _days_with_different_arms()
+    arm_a = core.flywheel_arm(PID, ME, now=before)
+    borrow_at, commit_at = after, after + timedelta(minutes=10)
+    if restart == "between_sessions":
+        monkeypatch.setattr(core, "_ARMS_SINCE", before + timedelta(minutes=1))
+    elif restart == "after_both_days":          # 北京次日 12:31 才重启: 往回 12 小时都是次日, 甲不可能是那一段发的
+        borrow_at, commit_at = after + timedelta(hours=12, minutes=40), after + timedelta(hours=13)
+        monkeypatch.setattr(core, "_ARMS_SINCE", after + timedelta(hours=12, minutes=30))
+    fake = _Librarian(PATTERNS)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+    monkeypatch.setattr(core, "_utcnow", lambda: borrow_at)
+    arm_b = core.build_writing_brief(_client(), PID, user_id=ME, brief={})["flywheel_arm"]
+    assert arm_a != arm_b
+
+    monkeypatch.setattr(core, "_utcnow", lambda: commit_at)
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm=arm_a)
+    assert (params["flywheel_arm"], params["flywheel_arm_source"], params["flywheel_arm_reported"]) == \
+        (arm_b, "borrow", arm_a), "都记服务端的臂, 传回的另存"
+    if restart == "between_sessions":
+        assert params["flywheel_arm_unverified"] is True and meta["flywheel_arm_unverified"] is True
+        assert "flywheel_arm_corrected" not in out
+        note = out["flywheel_arm_unverified"]["note"]
+        assert "重启" in note and "服务端分的是" not in note
+        again = core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm_a)
+        assert again["flywheel_arm"] == arm_a and fake.briefs[-1]["explore"] is (arm_a == "explore"), "核对不了就沿用"
+    else:
+        assert "flywheel_arm_unverified" not in params and "flywheel_arm_unverified" not in meta
+        assert out["flywheel_arm_corrected"]["recorded"] == arm_b and "flywheel_arm_unverified" not in out
+        assert core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm_a)["flywheel_arm"] == arm_b
