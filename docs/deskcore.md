@@ -926,7 +926,9 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
    `flywheel_arm_unverified = {reported, recorded, note}`，只说重启过核对不了，不说「服务端分的是 X」（部署落在一场写作中间时
    那样说是错的，10-26 当天 04:26 UTC 就部署过一次）。改稿（`replaces_version_id`）不建新 batch，挂的旧 batch 也标
    `flywheel_arm_unverified`（codex review on aw#130）：旧 batch 正好是记下的那个臂时，拿它比不出 `flywheel_arm_mixed`，可改稿
-   可能是在传回的那个臂下写的；和记下的臂不同的照旧另标 mixed。没标上的同 mixed 一样进 `arm_mixed_unmarked_item_ids`；
+   可能是在传回的那个臂下写的；和记下的臂不同的照旧另标 mixed。改稿没传臂、重启后（或 36 小时内）也没借过卡、按入库时重算的
+   （来源 `recomputed`）同样标：重算出来的臂是猜的，新 batch 靠来源剔，旧 batch 的来源还是它自己的，只能靠这个标。没标上的同
+   mixed 一样进 `arm_mixed_unmarked_item_ids`；
 4. 其余：服务端没给过这场这个臂。以最近一次发的为准，来源 `borrow`，传回的那个另存 `flywheel_arm_reported`，回包带
    `flywheel_arm_corrected = {reported, recorded, note}`。
 

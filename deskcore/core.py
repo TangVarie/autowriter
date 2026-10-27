@@ -2839,11 +2839,14 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # 都记服务端最近一次借卡的臂 (W-31, 见 batch_arm)。传回的那个留一份(batch.params + batch_metrics.meta),
             # 核对不了的另标 flywheel_arm_unverified, 分析对照组时剔掉; 回包里也说一句。改稿挂的旧 batch 同样标上
             # (codex review on aw#130: 旧 batch 正好是记下的那个臂时比不出 mixed, 可改稿可能是在另一个臂下写的)。
+            # 没传臂、按入库时重算的 (recomputed) 也是猜的: 新 batch 靠 flywheel_arm_source 剔, 旧 batch 的来源是它
+            # 自己的, 一样标 unverified。
             arm_reported = flywheel_arm if arm_check else None
             arm_flags = {**({"flywheel_arm_reported": arm_reported} if arm_reported else {}),
                          **({"flywheel_arm_unverified": True} if arm_check == "unverified" else {})}
-            unmarked = _mark_mixed_arm_batches(client, list(replaced_ok.values()), arm,
-                                               unverified=arm_check == "unverified") if replaced_ok else []
+            unmarked = _mark_mixed_arm_batches(
+                client, list(replaced_ok.values()), arm,
+                unverified=arm_check == "unverified" or arm_source == "recomputed") if replaced_ok else []
             arm_meta = {"flywheel_arm": arm, "flywheel_arm_source": arm_source, **arm_flags,
                         "revised_item_ids": sorted(set(replaced_ok.values())),
                         "arm_mixed_unmarked_item_ids": unmarked}
@@ -6472,7 +6475,8 @@ def flywheel_arm(project_id, user_id, *, now: datetime | None = None) -> str:
 #                     flywheel_arm)。只有它分得清同一写手同一项目同时开着的两场 (各拿各的简报);
 #   · "borrow"     —— 模型没传: 用这个 (项目, 写手) 最近一次借卡时记下的臂 (进程内存; deskcore 单进程,
 #                     railway.json 的 uvicorn 没开 --workers);
-#   · "recomputed" —— 重启过 / 36 小时内没借过卡: 按入库时重算。分析对照组时可以只看前两种。
+#   · "recomputed" —— 重启过 / 36 小时内没借过卡: 按入库时重算。分析对照组时可以只看前两种。改稿不建新 batch,
+#                     挂的旧 batch 来源还是它自己的, 所以另标 flywheel_arm_unverified (见 _mark_mixed_arm_batches)。
 #
 # ⚠️ 模型传回的臂要和服务端对得上 (W-31, 2026-10-27)。10-26 sportsix 那场借卡是 explore (TV 缓存键 `:explore`,
 # 没给规律), 5 批里 4 批模型传回的却是 patterns, 照单记成了 patterns —— 对照组被污染, 分析时只能手工剔。所以进程里
@@ -6574,9 +6578,10 @@ def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str, *, unverified
     在 batch 上标 flywheel_arm_mixed, 分析对照组时剔掉 (codex review on #104)。旧 batch 没记臂 (分臂之前的) 不在
     实验里, 不碰。
 
-    ``unverified`` = 改稿传回的臂核对不了 (batch_arm 的 ``"unverified"``, 重启过): ``arm`` 只是服务端重启后最近一次
-    发的, 改稿真正的臂可能是传回的那个。拿 ``arm`` 比同臂, 不等于改稿没换过处理 —— 旧 batch 也标
-    flywheel_arm_unverified, 分析对照组时一样剔掉 (codex review on aw#130)。和 ``arm`` 不同的照旧另标 mixed。
+    ``unverified`` = 改稿的臂核对不了: 传回的臂核对不了 (batch_arm 的 ``"unverified"``, 重启过), ``arm`` 只是服务端
+    重启后最近一次发的, 改稿真正的臂可能是传回的那个; 或者没传、按入库时重算 (``"recomputed"``), ``arm`` 是猜的。
+    拿 ``arm`` 比同臂, 不等于改稿没换过处理 —— 旧 batch 也标 flywheel_arm_unverified, 分析对照组时一样剔掉
+    (codex review on aw#130)。和 ``arm`` 不同的照旧另标 mixed。
 
     不影响入库 (失败重试一次, 再失败就放过), 但**不只记日志**: 返回没能确认标好的 item_id, 调用方把它们写进
     commit 的返回值 (flywheel_arm_warning) 和 batch_metrics.meta —— 分析时那一份也能把这几批剔掉。"""
