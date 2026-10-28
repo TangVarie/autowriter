@@ -6980,6 +6980,10 @@ _CONTENT_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited"})
 # (运营把一张表挪作他用), 若自动挪, 它们会被补录进儿童藻油项目, 而 D-129 要的是成人藻油 —— 成批的换由人定。
 # 环境变量 TV_SYNC_RELINK_MAX 覆盖(人看过清单后手动放行; 0 = 只报不挪)。
 TV_SYNC_RELINK_MAX = 5
+# W-37(10-28): 飞书里删了的篇缺席多久才把它的差异降回旧口径。TV 每天完整同步一次: 真删了的, 第二晚起缺口就过一天半;
+# 两次同步重叠 / 某次写库写一半, 活着的篇只会短暂进视图(不到一天), 不降 —— 降了它回来时 computed_at 是旧的(同一版不推),
+# 中间若有人确认过摘要, 它就再也进不了摘要。
+TV_VANISHED_GRACE = timedelta(hours=36)
 # 人定过的对照不动: candidates 里带 D-xxx 决策号或"人工判定"的备注。不认 W-xx —— W-34 自己写的备注不能把链接钉死。
 _PIN_RE = re.compile(r"(?<![A-Za-z])D-\d{3}(?!\d)|人工判定")
 
@@ -7123,6 +7127,21 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
     # 摘要就读不到它; 不删行(删数据由人在 SQL 编辑器里做)。
     demote = sorted(nid for nid, d in diffed.items()
                     if d["rev"] >= tvlink.DIFF_REV and nid in current and not _ok(nid))
+    # 飞书里删了 / 挪走的篇(TV 的 v_notes_vanished, W-37, 10-28): 016 之后这晚读不到它们, 差异既不重算、上面也降不到,
+    # 一直留在摘要里 —— 10-28 HATHERINE 一篇已删的帖子还是待读摘要里的一条"人改了什么"。缺席满 TV_VANISHED_GRACE 的,
+    # 按当前口径算过的降回旧口径。只查这晚没读到的那几条(`--since` 窗口外的也没读到, 但不在视图里, 不会被降);
+    # 查不了就这晚不降、报出来。降了之后那篇又读到了, 按"口径过时"重算(那一版还在对照索引里才算得了)。
+    unread = sorted(nid for nid, d in diffed.items()
+                    if d["rev"] >= tvlink.DIFF_REV and nid not in notes_by_id and nid not in demote)
+    vanished: set[str] = set()
+    vanished_error = None
+    if unread:
+        try:
+            vanished = store.tv_long_vanished_note_ids(client, unread, min_gap=TV_VANISHED_GRACE)
+        except Exception as exc:                        # noqa: BLE001
+            logger.exception("tv_sync: 查 v_notes_vanished 失败 (tv=%s) —— 飞书删了的篇这晚不降", tv_project_id)
+            vanished_error = f"{type(exc).__name__}: {exc}"[:200]
+        demote = sorted(set(demote) | vanished)
     brands: dict[str, str] = {}
     rows = []
     for l in list(fresh.values()) + backlog:
@@ -7149,8 +7168,11 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
            "lag_filled": 0, "demoted": 0,
            "text_recomputed": sum(1 for r in rows if r["note_id"] in text_changed),
            "quarantined": sum(1 for nid in demote if nid in blocked),
+           "vanished": len(vanished),
            # 改过字、该重算却被每晚上限挤掉的: tv_sync 这晚不给它们记指纹, 明晚再算
            "text_left": sorted({r["note_id"] for r in eligible[TV_SYNC_DIFF_BACKFILL:]} & set(text_changed))}
+    if vanished_error:
+        out["vanished_error"] = vanished_error
     if dry_run:
         out.update(lag_filled=len(lag_fill), demoted=len(demote))      # dry-run 报"会做多少"
         return out

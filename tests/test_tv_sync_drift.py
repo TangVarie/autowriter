@@ -10,9 +10,12 @@ test_tv_sync 的假回填只记调用、不写回, 那个回环在那里看不�
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from deskcore import cli, core, store, tvlink
+from tests.fakes import FakeClient
 from tests.test_tv_sync import BODY_A, BODY_NEW, ME, P1, TV, _client, _iso, _note
 
 BODY_C = ("第二篇稿子讲的是另一件事: 面试前一晚把自我介绍念给室友听, 室友听到第三句就睡着了。"
@@ -636,3 +639,90 @@ def test_a_title_only_draft_gets_no_edit_diff_and_an_old_one_is_demoted():
     out = core.tv_sync(c, TV)
     assert out["edit_diffs"]["demoted"] == 1 and _diff(c, "n3")["diff_rev"] == 0
     assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == []
+
+
+def _gone(nid, *, hours):
+    """v_notes_vanished 的一行: 本项目最近一次完整同步比这篇最后被看到晚 ``hours`` 小时。"""
+    return {"note_id": nid, "last_seen_at": "2026-10-26T08:00:00+00:00",
+            "latest_seen_at": (datetime(2026, 10, 26, 8, tzinfo=timezone.utc) + timedelta(hours=hours)).isoformat()}
+
+
+def test_a_note_deleted_in_feishu_has_its_diff_demoted_and_recomputed_if_it_comes_back(monkeypatch):
+    """W-37 (10-28): 飞书里删了的篇 016 之后读不到, 差异既不重算也降不到, 一直留在摘要里 —— 缺席满一天半的降回旧口径;
+    这晚只是没读到、不在 v_notes_vanished 里的(`--since` 窗口外)不降; 短暂进视图的(两次同步重叠 / 写库写一半)不降;
+    那篇又读到了就按"口径过时"重算回来。"""
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    assert _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV
+
+    gone = notes.pop()                                  # 016: 删了的篇 deskcore_tv_notes 不再返回
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["edit_diffs"]["demoted"] == 0 and _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV, \
+        "只是这晚没读到、视图里没有: 不降"
+
+    c.rows["truth_vault.v_notes_vanished"] = [_gone("n1", hours=20)]
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["edit_diffs"]["vanished"] == 0 and _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV, \
+        "缺席不到一天半(TV 两次同步重叠 / 写库写一半): 不降"
+
+    c.rows["truth_vault.v_notes_vanished"] = [_gone("n1", hours=48)]
+    real = store.tv_long_vanished_note_ids
+    monkeypatch.setattr(store, "tv_long_vanished_note_ids",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("视图读不到")))
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["edit_diffs"]["vanished_error"].startswith("RuntimeError")
+    assert _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV, "查不了就这晚不降"
+    monkeypatch.setattr(store, "tv_long_vanished_note_ids", real)
+
+    out = core.tv_sync(c, TV, write_tv=True)
+    ed = out["edit_diffs"]
+    assert ed["vanished"] == 1 and ed["demoted"] == 1 and "vanished_error" not in ed
+    assert _diff(c, "n1")["diff_rev"] == 0
+    assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == [], "摘要读不到"
+    assert _link(c, "n1")["version_id"] == "v1", "对照不动: 删不删由人定"
+
+    c.rows["truth_vault.v_notes_vanished"] = []         # 运营把它放回去了
+    notes.append(gone)
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["edit_diffs"]["vanished"] == 0 and _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV, "按口径过时重算回来"
+
+
+def test_long_vanished_lookup_reads_the_gap_and_treats_a_missing_view_as_nothing_to_demote():
+    c = FakeClient(rows={"truth_vault.v_notes_vanished": [_gone("a", hours=48), _gone("b", hours=35),
+                                                         {"note_id": "c", "last_seen_at": None,
+                                                          "latest_seen_at": "2026-10-28T08:00:00+00:00"}]})
+    assert store.tv_long_vanished_note_ids(c, ["a", "b", "c", "d"], min_gap=core.TV_VANISHED_GRACE) == {"a"}
+
+    class _NoView(FakeClient):
+        def schema(self, name):
+            class _S:
+                @staticmethod
+                def table(t):
+                    raise RuntimeError("{'code': 'PGRST205', 'message': \"Could not find the table "
+                                       "'truth_vault.v_notes_vanished' in the schema cache\"}")
+            return _S()
+    assert store.tv_long_vanished_note_ids(_NoView(), ["a"], min_gap=core.TV_VANISHED_GRACE) == set(), \
+        "视图不在(新库): 016 照旧把删了的篇读给 tv-sync, 没有要降的"
+
+    class _Down(FakeClient):
+        def schema(self, name):
+            class _S:
+                @staticmethod
+                def table(t):
+                    raise RuntimeError("connection reset")
+            return _S()
+    with pytest.raises(RuntimeError):
+        store.tv_long_vanished_note_ids(_Down(), ["a"], min_gap=core.TV_VANISHED_GRACE)
+
+
+def test_cli_reports_a_vanished_lookup_failure_as_unhealthy(monkeypatch, capsys):
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    notes.pop()
+    monkeypatch.setattr(store, "tv_long_vanished_note_ids",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("视图读不到")))
+    monkeypatch.setattr(core, "sb", lambda: c)
+    assert cli.main(["tv-sync", "--tv-project", TV, "--write-tv"]) == 1
+    assert "v_notes_vanished" in capsys.readouterr().out
