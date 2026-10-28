@@ -2463,6 +2463,32 @@ def tv_vanished_note_ids(sb, note_ids: list[str]) -> set[str]:
     return out
 
 
+def tv_long_vanished_note_ids(sb, note_ids: list[str], *, min_gap: timedelta) -> set[str]:
+    """这几条里, 在 TV 的 ``v_notes_vanished`` 里、而且已经缺席够久的(W-37): 本项目最近一次完整同步的
+    ``latest_seen_at`` 比这篇最后被看到的 ``last_seen_at`` 晚至少 ``min_gap``。
+
+    TV 两次完整同步重叠, 或某次同步写库写到一半失败(TV 先在内存里给每篇盖新的 run id, 写失败的那几篇留着旧的), 活着的篇
+    也会短暂进视图 —— 一般不到一天, 下一次干净的同步就出来了。飞书里真删了的, 缺口每天变大。
+    视图不在(``PGRST205``: 新库 / TV 还没有 D-103)回空: 没有视图时 016 照旧把删了的篇读给 tv-sync, 本来就没有要降的。
+    其余错误原样上抛。"""
+    ids = sorted({str(i) for i in note_ids if i})
+    out: set[str] = set()
+    for i in range(0, len(ids), 100):
+        try:
+            rows = (sb.schema("truth_vault").table("v_notes_vanished")
+                    .select("note_id, last_seen_at, latest_seen_at")
+                    .in_("note_id", ids[i:i + 100]).execute()).data or []
+        except Exception as exc:                        # noqa: BLE001
+            if "pgrst205" in str(exc).lower() and "v_notes_vanished" in str(exc):
+                return set()
+            raise
+        for r in rows:
+            seen, latest = _ts(r.get("last_seen_at")), _ts(r.get("latest_seen_at"))
+            if r.get("note_id") and seen is not None and latest is not None and latest - seen >= min_gap:
+                out.add(str(r["note_id"]))
+    return out
+
+
 def tv_note_comments(sb, note_id: str, limit: int = TV_COMMENTS_MAX) -> list[dict]:
     """这条笔记在 TV 里的评论, 按评论顺序。"""
     return list((sb.schema("truth_vault").table("comments")

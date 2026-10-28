@@ -399,7 +399,7 @@ def _tv_sync(core, sb, args) -> int:
                   f"{ed.get('backfilled', 0)}, 重算 {ed.get('recomputed', 0)}), 写入 {ed.get('written', 0)}"
                   + (f"; 对照补上 lag {ed['lag_filled']} 条" if ed.get("lag_filled") else "")
                   + (f"; 降回旧口径 {ed['demoted']} 行" if ed.get("demoted") else "")
-                  + (f"(其中飞书里删了的 {ed['vanished']} 篇)" if ed.get("vanished") else ""))
+                  + (f"(其中飞书里删了的 {ed['vanished']} 篇)" if ed.get("demoted") and ed.get("vanished") else ""))
         if ed.get("error"):
             # 对照已经照常写了; 但差异一行没进库, 每周摘要就一直出不来 —— 不能让 cron 日志看起来健康(codex review on aw#107)
             print(f"  ⚠️ 改动差异没写成: {ed['error']} —— 先跑 `python -m deskcore.cli doctor` 看 013 上没上; "
