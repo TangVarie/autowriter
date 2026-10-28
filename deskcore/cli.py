@@ -398,7 +398,8 @@ def _tv_sync(core, sb, args) -> int:
             print(f"  改动差异: 算了 {ed.get('computed', 0)} 对(改过的 {ed.get('changed', 0)}, 补算以前的 "
                   f"{ed.get('backfilled', 0)}, 重算 {ed.get('recomputed', 0)}), 写入 {ed.get('written', 0)}"
                   + (f"; 对照补上 lag {ed['lag_filled']} 条" if ed.get("lag_filled") else "")
-                  + (f"; 降回旧口径 {ed['demoted']} 行" if ed.get("demoted") else ""))
+                  + (f"; 降回旧口径 {ed['demoted']} 行" if ed.get("demoted") else "")
+                  + (f"(其中飞书里删了的 {ed['vanished']} 篇)" if ed.get("vanished") else ""))
         if ed.get("error"):
             # 对照已经照常写了; 但差异一行没进库, 每周摘要就一直出不来 —— 不能让 cron 日志看起来健康(codex review on aw#107)
             print(f"  ⚠️ 改动差异没写成: {ed['error']} —— 先跑 `python -m deskcore.cli doctor` 看 013 上没上; "
@@ -409,6 +410,10 @@ def _tv_sync(core, sb, args) -> int:
             rc = 1
         if ed.get("lag_error"):
             print(f"  ⚠️ 对照的 lag_days 没写回: {ed['lag_error']} —— 本次差异已按补出的 lag 排除抄回的那版, 下一晚会再补。")
+            rc = 1
+        if ed.get("vanished_error"):
+            print(f"  ⚠️ 查不了飞书里删了哪些篇(v_notes_vanished): {ed['vanished_error']} —— 删了的篇的差异这晚没降, "
+                  "还会进每周摘要; 下一晚会再查。")
             rc = 1
         rc = max(rc, _print_tv_drift(out, tv))
         for smp in out["ambiguous_samples"]:

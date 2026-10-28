@@ -7123,6 +7123,21 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
     # 摘要就读不到它; 不删行(删数据由人在 SQL 编辑器里做)。
     demote = sorted(nid for nid, d in diffed.items()
                     if d["rev"] >= tvlink.DIFF_REV and nid in current and not _ok(nid))
+    # 飞书里删了 / 挪走的篇(TV 的 v_notes_vanished, W-37, 10-28): 016 之后这晚读不到它们, 差异既不重算、上面也降不到,
+    # 一直留在摘要里 —— 10-28 HATHERINE 一篇已删的帖子还是待读摘要里的一条"人改了什么"。按当前口径算过的降回旧口径;
+    # 那篇又读到了(TV 两次完整同步重叠时会短暂判成消失), 就按"口径过时"重算回来。只查这晚没读到的那几条
+    # (`--since` 窗口外的也没读到, 但不在视图里, 不会被降); 查不了就这晚不降、报出来。
+    unread = sorted(nid for nid, d in diffed.items()
+                    if d["rev"] >= tvlink.DIFF_REV and nid not in notes_by_id and nid not in demote)
+    vanished: set[str] = set()
+    vanished_error = None
+    if unread:
+        try:
+            vanished = store.tv_vanished_note_ids(client, unread)
+        except Exception as exc:                        # noqa: BLE001
+            logger.exception("tv_sync: 查 v_notes_vanished 失败 (tv=%s) —— 飞书删了的篇这晚不降", tv_project_id)
+            vanished_error = f"{type(exc).__name__}: {exc}"[:200]
+        demote = sorted(set(demote) | vanished)
     brands: dict[str, str] = {}
     rows = []
     for l in list(fresh.values()) + backlog:
@@ -7149,8 +7164,11 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
            "lag_filled": 0, "demoted": 0,
            "text_recomputed": sum(1 for r in rows if r["note_id"] in text_changed),
            "quarantined": sum(1 for nid in demote if nid in blocked),
+           "vanished": len(vanished),
            # 改过字、该重算却被每晚上限挤掉的: tv_sync 这晚不给它们记指纹, 明晚再算
            "text_left": sorted({r["note_id"] for r in eligible[TV_SYNC_DIFF_BACKFILL:]} & set(text_changed))}
+    if vanished_error:
+        out["vanished_error"] = vanished_error
     if dry_run:
         out.update(lag_filled=len(lag_fill), demoted=len(demote))      # dry-run 报"会做多少"
         return out

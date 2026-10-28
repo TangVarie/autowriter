@@ -636,3 +636,48 @@ def test_a_title_only_draft_gets_no_edit_diff_and_an_old_one_is_demoted():
     out = core.tv_sync(c, TV)
     assert out["edit_diffs"]["demoted"] == 1 and _diff(c, "n3")["diff_rev"] == 0
     assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == []
+
+
+def test_a_note_deleted_in_feishu_has_its_diff_demoted_and_recomputed_if_it_comes_back(monkeypatch):
+    """W-37 (10-28): 飞书里删了的篇 016 之后读不到, 差异既不重算也降不到, 一直留在摘要里 —— 降回旧口径;
+    这晚只是没读到、不在 v_notes_vanished 里的(`--since` 窗口外)不降; 那篇又读到了就按"口径过时"重算回来。"""
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    assert _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV
+
+    gone = notes.pop()                                  # 016: 删了的篇 deskcore_tv_notes 不再返回
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["edit_diffs"]["demoted"] == 0 and _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV, \
+        "只是这晚没读到、视图里没有: 不降"
+
+    c.rows["truth_vault.v_notes_vanished"] = [{"note_id": "n1"}]
+    real = store.tv_vanished_note_ids
+    monkeypatch.setattr(store, "tv_vanished_note_ids", lambda *a: (_ for _ in ()).throw(RuntimeError("视图读不到")))
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["edit_diffs"]["vanished_error"].startswith("RuntimeError")
+    assert _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV, "查不了就这晚不降"
+    monkeypatch.setattr(store, "tv_vanished_note_ids", real)
+
+    out = core.tv_sync(c, TV, write_tv=True)
+    ed = out["edit_diffs"]
+    assert ed["vanished"] == 1 and ed["demoted"] == 1 and "vanished_error" not in ed
+    assert _diff(c, "n1")["diff_rev"] == 0
+    assert store.tv_edit_diffs_since(c, P1, None, min_rev=tvlink.DIFF_REV)["rows"] == [], "摘要读不到"
+    assert _link(c, "n1")["version_id"] == "v1", "对照不动: 删不删由人定"
+
+    c.rows["truth_vault.v_notes_vanished"] = []         # TV 两次完整同步重叠时短暂判成消失, 又回来了
+    notes.append(gone)
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["edit_diffs"]["vanished"] == 0 and _diff(c, "n1")["diff_rev"] == tvlink.DIFF_REV, "按口径过时重算回来"
+
+
+def test_cli_reports_a_vanished_lookup_failure_as_unhealthy(monkeypatch, capsys):
+    notes = [_note("n1", "秋招投了六十份简历没回音", BODY_A)]
+    c = _tv(notes)
+    core.tv_sync(c, TV, write_tv=True)
+    notes.pop()
+    monkeypatch.setattr(store, "tv_vanished_note_ids", lambda *a: (_ for _ in ()).throw(RuntimeError("视图读不到")))
+    monkeypatch.setattr(core, "sb", lambda: c)
+    assert cli.main(["tv-sync", "--tv-project", TV, "--write-tv"]) == 1
+    assert "v_notes_vanished" in capsys.readouterr().out
