@@ -7389,10 +7389,11 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
 
     回 ``{"items": {version_id: item_id}, "minted", "already", "fingerprinted", "consumed", "marked", "error",
     "superseded"}``: ``items`` 里有的才是真建成的版本(可以连对照); ``error`` 非空时其余的这晚没转成、明晚再来;
-    ``superseded``: 拿到锁时底稿已经被存档记走了的, 这晚不转。版本建成之后的几步(指纹 / 销牌 / 标记)断了不撤版本: 之后
+    ``superseded``: 拿到锁时底稿已经被存档记走了的, 这晚不转; ``fingerprinted_meanwhile``: 拿到锁时帖的文字已经进了
+    指纹库的(刚被补录), 这晚不转。版本建成之后的几步(指纹 / 销牌 / 标记)断了不撤版本: 之后
     tv_sync 认出它已经有版本(同一个 id), 只补没做完的。``wait_for_post`` 的(补的这晚帖还没连上)只补指纹 / 销牌, 不记转正。"""
     out = {"items": {}, "minted": 0, "already": 0, "fingerprinted": 0, "consumed": 0, "marked": 0, "error": None,
-           "superseded": []}
+           "superseded": [], "fingerprinted_meanwhile": []}
     with _project_write_lock(client, project_id, holder):
         # 拿到锁再看一眼底稿还是不是没转正(codex on aw#132): tv-sync 读底稿到这里之间, commit_drafts 可能刚把同样文字的稿子
         # 存了档、把底稿记到了那一版(_supersede_snapshots, 同一把锁) —— 再按底稿建一份, 同一篇就有了两个版本, 牌销给了存档
@@ -7405,6 +7406,17 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
         if not groups:
             return out
         have = store.items_for_versions(client, project_id, vids)
+        # 要新建版本的, 拿到锁再核一次帖的文字是不是已经在指纹库里了(codex on aw#132): 锁外核过之后、拿到锁之前, 别的补录
+        # 可能刚把同一篇帖记成了副本 —— 再转正就是同一篇两个版本。这几篇这晚不转, 明晚照锁外那一关走(补录那条路)。
+        # 已经有版本的(补齐)不核: 帖的文字可能正是前一晚转正时记在它自己名下的。
+        fresh = [g for g in groups if g["version_id"] not in have]
+        posted = [(g, fp.opening_hash(b), tuple(sorted(fp.ngram_hashes(b)))) for g in fresh for _, b in g.get("notes") or ()]
+        if posted:
+            seen = store.existing_fingerprint_sketches(client, project_id, [h for _, h, _ in posted if h])
+            out["fingerprinted_meanwhile"] = sorted({g["version_id"] for g, h, sk in posted if h and sk in seen.get(h, ())})
+            groups = [g for g in groups if g["version_id"] not in out["fingerprinted_meanwhile"]]
+            if not groups:
+                return out
         out["items"].update({vid: (hit or {}).get("item_id") for vid, hit in have.items()})
         out["already"] = len(have)
         by_check: dict[str, list[dict]] = {}
@@ -7918,6 +7930,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             snap["error"] = snap["error"] or res["error"]
             snap["superseded"] += len(res["superseded"])
             failed.update({g["version_id"]: ("这份底稿刚存了档, 明晚按存的那一版对" if g["version_id"] in res["superseded"]
+                                             else "帖的文字刚被补录进指纹库, 明晚再对"
+                                             if g["version_id"] in res["fingerprinted_meanwhile"]
                                              else res["error"] or "没建成")
                            for g in gs if g["version_id"] not in res["items"]})
         for vid, pairs in hits.items():

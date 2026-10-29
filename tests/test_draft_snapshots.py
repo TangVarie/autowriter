@@ -783,6 +783,29 @@ def test_the_repair_night_ignores_a_post_that_w34_found_replaced(monkeypatch):
     assert _links(c)["n1"]["match_kind"] == "ingested", "换上去的那篇照 W-34 的老规矩补录"
 
 
+def test_a_post_ingested_while_tv_sync_waits_for_the_lock_is_not_promoted_too(monkeypatch):
+    # 锁外核过帖的文字不在指纹库、拿到锁之前别的补录把它记成了副本: 拿到锁再核一次, 这晚不转, 不另建一份(codex on aw#132)
+    c = _client([_note("n1", "骑了一百公里", BODY_S)], [_snap("s1", "骑了一百公里", BODY_S)])
+    real_lock = core._project_write_lock
+
+    @contextlib.contextmanager
+    def lock_after_ingest(client, project_id, holder):
+        if holder.startswith("tv-sync-snapshot"):
+            plain = tvlink.strip_hashtags(BODY_S)
+            client.rows["draft_fingerprints"].append({
+                "project_id": project_id, "version_id": "v-copy", "opening_hash": core.fp.opening_hash(plain),
+                "ngram_hashes": core.fp.ngram_hashes(plain)})
+        with real_lock(client, project_id, holder) as got:
+            yield got
+    monkeypatch.setattr(core, "_project_write_lock", lock_after_ingest)
+    n_versions = len(c.rows["versions"])
+    out = core.tv_sync(c, TV)
+    l1 = _links(c)["n1"]
+    assert l1["match_kind"] == "unmatched" and "刚被补录" in l1["candidates"][-1]["note"], l1
+    assert len(c.rows["versions"]) == n_versions and c.rows["angle_ledger"][0]["consumed_version_id"] is None
+    assert c.rows["draft_snapshots"][0]["promoted_at"] is None and out["snapshots"]["promoted"] == 0
+
+
 def test_a_rejected_recheck_after_promotion_is_closed_without_consuming_a_new_card():
     # 转正之后同样文字又查了一次(撞了它自己, reject), 带的是一张新牌: 只记成已转正, 不拿新牌销给旧版本
     snap = _snap("s1", "骑了一百公里", BODY_S, key=None)
