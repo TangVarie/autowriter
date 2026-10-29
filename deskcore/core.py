@@ -98,9 +98,11 @@ def _supersede_snapshots(client, project_id: str, drafts: list[dict], vids: dict
 # W-38(2026-10-29): 查重时带过 angle_key 的牌不算「抽了没写」—— 稿子已经写出来、查过重(draft_snapshots), 发出去以后
 # tv-sync 从飞书对回来销账。再把它们报成欠账, 模型会按同一张牌再写一篇。只有简报的 angle_debt 按这个口径数(新开一场对话时
 # 列出来让模型「按它们写」的那份); 入库后的 angle_debt 和 archive_pending 不排除 —— 那两处是在叫模型给手上的稿子存档、
-# 带上分给它的 key, 刚查过的牌正该在里面(W-38 复审)。只排除最近一次查重没被打回的(store.snapshotted_angle_keys)。
-def _checked_angle_keys(client, project_id: str, user_id: str | None, days: int) -> set[str]:
-    return {k for k in store.snapshotted_angle_keys(client, project_id, user_id, days) if fp.looks_like_angle_key(k)}
+# 带上分给它的 key, 刚查过的牌正该在里面(W-38 复审)。只排除最近一次查重没被打回的(store.snapshotted_angle_keys), 也只排除
+# 那次查重之前抽的: 同一张牌之后又抽到的那一次还没写, 照旧算欠着(codex on aw#132)。
+def _checked_angle_keys(client, project_id: str, user_id: str | None, days: int) -> dict[str, str]:
+    return {k: at for k, at in store.snapshotted_angle_keys(client, project_id, user_id, days).items()
+            if fp.looks_like_angle_key(k)}
 
 # 存档带的 angle_key 对不上台账(W-31, 2026-10-27)。10-26 sportsix 一场 20 张牌, 5 批存了 19 篇, 每篇都带了 key, 可没有
 # 一条在台账里(7~8 位带下划线的编号、53 位的长串), 牌一张没销。score_drafts 的回包现在会说清(angle_key_warning), 但之后
@@ -7369,16 +7371,32 @@ def _snapshot_fp_payload(project_id: str, user_id: str, rows: list[dict]) -> lis
     return out
 
 
+def _fp_key(body: str) -> tuple:
+    """指纹行按什么算同一行: 开头哈希 + 四字串 sketch(同 existing_fingerprint_sketches / 补录的去重)。"""
+    return (fp.opening_hash(body) or "", tuple(sorted(fp.ngram_hashes(body))))
+
+
 def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, owner: str, holder: str) -> dict:
     """把这几篇底稿转成写作台的版本(W-38), 和存过档的一样: 建 batch / item / version(时刻 = 第一次查重)、写指纹(不过闸)、
     销牌(只销写手自己在查重之前抽的那张)、底稿行记上转正。一次查重(check_id)一个 batch。拿项目写锁(同 commit / 补录)。
 
-    回 ``{"items": {version_id: item_id}, "minted", "already", "fingerprinted", "consumed", "marked", "error"}``:
-    ``items`` 里有的才是真建成的版本(可以连对照); ``error`` 非空时其余的这晚没转成、明晚再来。版本建成之后的几步
-    (指纹 / 销牌 / 标记)断了不撤版本: 第二晚 tv_sync 认出它已经有版本(同一个 id), 只补没做完的。"""
-    out = {"items": {}, "minted": 0, "already": 0, "fingerprinted": 0, "consumed": 0, "marked": 0, "error": None}
-    vids = [g["version_id"] for g in groups]
+    回 ``{"items": {version_id: item_id}, "minted", "already", "fingerprinted", "consumed", "marked", "error",
+    "superseded"}``: ``items`` 里有的才是真建成的版本(可以连对照); ``error`` 非空时其余的这晚没转成、明晚再来;
+    ``superseded``: 拿到锁时底稿已经被存档记走了的, 这晚不转。版本建成之后的几步(指纹 / 销牌 / 标记)断了不撤版本: 之后
+    tv_sync 认出它已经有版本(同一个 id), 只补没做完的。``wait_for_post`` 的(补的这晚帖还没连上)只补指纹 / 销牌, 不记转正。"""
+    out = {"items": {}, "minted": 0, "already": 0, "fingerprinted": 0, "consumed": 0, "marked": 0, "error": None,
+           "superseded": []}
     with _project_write_lock(client, project_id, holder):
+        # 拿到锁再看一眼底稿还是不是没转正(codex on aw#132): tv-sync 读底稿到这里之间, commit_drafts 可能刚把同样文字的稿子
+        # 存了档、把底稿记到了那一版(_supersede_snapshots, 同一把锁) —— 再按底稿建一份, 同一篇就有了两个版本, 牌销给了存档
+        # 那一版、对照却连着这一版。这几篇这晚不转, 明晚主索引对存了档的那一版。
+        state = store.snapshot_states(client, [i for g in groups for i in g["ids"]])
+        out["superseded"] = sorted({g["version_id"] for g in groups
+                                    if any(state.get(i) not in (None, g["version_id"]) for i in g["ids"])})
+        groups = [g for g in groups if g["version_id"] not in out["superseded"]]
+        vids = [g["version_id"] for g in groups]
+        if not groups:
+            return out
         have = store.items_for_versions(client, project_id, vids)
         out["items"].update({vid: (hit or {}).get("item_id") for vid, hit in have.items()})
         out["already"] = len(have)
@@ -7406,15 +7424,17 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
             return out
         try:
             work = [g for g in done if not g.get("mark_only")]
-            have_fp = store.fingerprinted_versions(client, project_id, [g["version_id"] for g in work])
+            # 按文字补, 不按版本: 前几晚写了底稿那一行、发出去的帖那一行还没写的(帖那时还没连上), 这晚照样补上
+            have_fp = store.fingerprint_keys(client, project_id, [g["version_id"] for g in work])
             rows: list[dict] = []
-            for g in (g for g in work if g["version_id"] not in have_fp):
-                rows.append(g)
+            for g in work:
+                seen = set(have_fp.get(g["version_id"], ()))
+                if _fp_key(g["body"]) not in seen:
+                    rows.append(g)
                 # 帖和底稿只差话题标签的不另记(帖读进来就剥了话题, 底稿原样存)
-                plain = tvlink.strip_hashtags(g["body"])
-                seen = {(fp.opening_hash(plain), tuple(sorted(fp.ngram_hashes(plain))))}
+                seen |= {_fp_key(g["body"]), _fp_key(tvlink.strip_hashtags(g["body"]))}
                 for title, body in g.get("notes") or ():
-                    k = (fp.opening_hash(body), tuple(sorted(fp.ngram_hashes(body))))
+                    k = _fp_key(body)
                     if k[0] and k not in seen:
                         seen.add(k)
                         rows.append({**g, "title": title, "body": body})
@@ -7428,6 +7448,8 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
                                                user_id=g.get("writer"), drawn_before=g.get("first_checked_at")):
                         out["consumed"] += 1
             for g in done:
+                if g.get("wait_for_post"):
+                    continue                            # 帖还没连上: 先不记转正, 等连着它的那个 TV 项目补上帖的文字
                 out["marked"] += store.mark_snapshots_promoted(client, g["ids"], version_id=g["version_id"],
                                                                note_id=g.get("note_id"))
         except Exception as exc:                        # noqa: BLE001 — 版本已在, 对照照连; 明晚补齐
@@ -7705,6 +7727,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     # ── W-38: 对不上写作台版本的帖, 再拿查重时记下的底稿对一次(补录之前 —— 补录是终态, 补成副本就再也不重对) ──
     snap: dict = {"pending": 0, "matched_notes": 0, "promoted": 0, "minted": 0, "repaired": 0, "fingerprinted": 0,
                   "angles_consumed": 0, "ambiguous": 0, "already_fingerprinted": 0, "held": 0, "failed_notes": 0,
+                  "waiting_post": 0, "superseded": 0,
                   "applied": True, "error": None, "samples": []}
     pids = [m["project_id"] for m in maps]
     try:
@@ -7741,6 +7764,9 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             g["notes"] = [(notes_by_id[nid].title, notes_by_id[nid].body) for nid in on]
             g["note_id"] = on[0] if on else None
             g["mark_only"] = not g["ok"]
+            # 这个 TV 项目里没有连着它的帖(帖在接同一个写作台项目的另一个 TV 项目里, 或者还没连上): 先补底稿那一行指纹、
+            # 销牌, 不记转正 —— 记了就再也补不上帖的文字(codex on aw#132)。连着它的那个 TV 项目那一晚补齐、记转正。
+            g["wait_for_post"] = g["ok"] and not on
             repair.setdefault(g["project_id"], []).append(g)
     if repair and not dry_run:
         for pid, gs in repair.items():
@@ -7751,7 +7777,9 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 logger.exception("tv_sync: 补齐转正一半的底稿失败 (project=%s)", pid)
                 snap["error"] = snap["error"] or f"补齐: {type(exc).__name__}: {exc}"[:300]
                 continue
-            snap["repaired"] += sum(1 for g in gs if g["version_id"] in rep["items"])
+            snap["repaired"] += sum(1 for g in gs if g["version_id"] in rep["items"] and not g["wait_for_post"])
+            snap["waiting_post"] += sum(1 for g in gs if g["version_id"] in rep["items"] and g["wait_for_post"])
+            snap["superseded"] += len(rep["superseded"])
             snap["fingerprinted"] += rep["fingerprinted"]
             snap["angles_consumed"] += rep["consumed"]
             snap["error"] = snap["error"] or rep["error"]
@@ -7838,7 +7866,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             snap["fingerprinted"] += res["fingerprinted"]
             snap["angles_consumed"] += res["consumed"]
             snap["error"] = snap["error"] or res["error"]
-            failed.update({g["version_id"]: res["error"] or "没建成" for g in gs if g["version_id"] not in res["items"]})
+            snap["superseded"] += len(res["superseded"])
+            failed.update({g["version_id"]: ("这份底稿刚存了档, 明晚按存的那一版对" if g["version_id"] in res["superseded"]
+                                             else res["error"] or "没建成")
+                           for g in gs if g["version_id"] not in res["items"]})
         for vid, pairs in hits.items():
             g = by_vid[vid]
             if vid in made:

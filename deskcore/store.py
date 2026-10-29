@@ -712,7 +712,8 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     简报原样回显它。
 
     ``exclude_keys`` (W-38, 2026-10-29): 这些 angle_key 不算(查重时带过的牌 —— 稿子写出来了, 发出去以后 tv-sync 从飞书
-    对回来销账; 再报"抽了没写"会让模型按同一张牌再写一篇)。最多排除 ANGLE_DEBT_EXCLUDE_MAX 个。
+    对回来销账; 再报"抽了没写"会让模型按同一张牌再写一篇)。最多排除 ANGLE_DEBT_EXCLUDE_MAX 个。给 ``{angle_key: 最近一次
+    查重的时刻}`` 时只排除那次查重之前抽的: 没销的牌一天后回池子, 同一张牌之后又抽到一次, 那一次还没写(codex on aw#132)。
     """
     out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None, "angles": []}
     if oldest_first:
@@ -722,7 +723,8 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
 
     # 一次请求拿两样: count='exact' 是**分页之前**算的(PostgREST 如此, 假件也钉着
     # 这一点), 所以 range 只影响回几行、不影响这个数。同 store.fingerprint_stats。
-    skip = sorted(k for k in (exclude_keys or ()) if k)[:ANGLE_DEBT_EXCLUDE_MAX]
+    checked_at = exclude_keys if isinstance(exclude_keys, dict) else {k: None for k in (exclude_keys or ())}
+    skip = sorted(k for k in checked_at if k)[:ANGLE_DEBT_EXCLUDE_MAX]
     try:
         q = (sb.table("angle_ledger").select("angle_key, dims, drawn_at", count="exact")
                .eq("project_id", project_id).eq("drawn_by", user_id)
@@ -737,6 +739,23 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
         return out
     rows = res.data or []
     total = res.count if res.count is not None else len(rows)
+    timed = [k for k in skip if _ts(checked_at.get(k)) is not None]
+    if timed:
+        # 排除掉的 key 里, 查重之后才又抽到的那几次照旧算欠着。读失败就不加回来(少报几张, 不弄坏简报)
+        try:
+            again = (sb.table("angle_ledger").select("angle_key, dims, drawn_at")
+                     .eq("project_id", project_id).eq("drawn_by", user_id)
+                     .is_("consumed_version_id", "null").gte("drawn_at", iso_ago(days))
+                     .in_("angle_key", timed).range(0, 999).execute()).data or []
+        except Exception:                               # noqa: BLE001
+            logger.warning("read redrawn angle debt failed (project=%s)", project_id, exc_info=True)
+            again = []
+        again = [r for r in again if (t := _ts(r.get("drawn_at"))) is not None
+                 and t > _ts(checked_at.get(str(r.get("angle_key"))))]
+        if again:
+            total += len(again)
+            rows = sorted(rows + again, key=lambda r: _ts(r.get("drawn_at")) or datetime.min.replace(tzinfo=timezone.utc),
+                          reverse=not oldest_first)[:max(sample, 1)]
     out["unconsumed"] = int(total)
     if rows:
         out["oldest_drawn_at" if oldest_first else "last_drawn_at"] = rows[0].get("drawn_at")
@@ -2337,13 +2356,14 @@ def mark_snapshots_promoted(sb, ids: list[str], *, version_id: str, note_id: str
     return done
 
 
-def snapshotted_angle_keys(sb, project_id: str, user_id: str | None, days: int) -> set[str]:
-    """这个人在这个项目近 ``days`` 天查重时带过、而且最近一次查重没被打回(pass / warn)的 angle_key(W-38): 这些牌的稿子
-    已经写出来、查过重了, 发出去以后 tv-sync 会从飞书对回来销账 —— 不算"抽了没写"。最近一次是 reject 的(查重打回、可能
-    没再写)照旧算欠着。读不到(018 没跑 / 任何错误)回空集: 只是少排除几张, 不能把简报弄坏。只收能安全放进 in_() 查询的
-    形状(_LEDGER_LOOKUP_KEY); 调用方再按发牌的形状筛。"""
+def snapshotted_angle_keys(sb, project_id: str, user_id: str | None, days: int) -> dict[str, str]:
+    """这个人在这个项目近 ``days`` 天查重时带过、而且最近一次查重没被打回(pass / warn)的 angle_key → 最近一次查重的时刻
+    (W-38): 这些牌的稿子已经写出来、查过重了, 发出去以后 tv-sync 会从飞书对回来销账 —— 那次查重之前抽的不算"抽了没写"
+    (之后又抽到的照旧算, 见 angle_debt)。最近一次是 reject 的(查重打回、可能没再写)照旧算欠着。读不到(018 没跑 / 任何
+    错误)回空: 只是少排除几张, 不能把简报弄坏。只收能安全放进 in_() 查询的形状(_LEDGER_LOOKUP_KEY); 调用方再按发牌的
+    形状筛。"""
     if not user_id:
-        return set()
+        return {}
     try:
         rows = _paged(lambda off, lim: (
             sb.table("draft_snapshots").select("id, angle_key, status, checked_at")
@@ -2352,14 +2372,14 @@ def snapshotted_angle_keys(sb, project_id: str, user_id: str | None, days: int) 
             .order("id").range(off, off + lim - 1)), hard_cap=5000)
     except Exception:                                   # noqa: BLE001
         logger.warning("read snapshotted angle keys failed (project=%s)", project_id, exc_info=True)
-        return set()
+        return {}
     latest: dict[str, tuple[str, str | None]] = {}
     for r in rows:
         k = str(r.get("angle_key") or "")
         at = str(r.get("checked_at") or "")
         if _LEDGER_LOOKUP_KEY.fullmatch(k) and (k not in latest or at >= latest[k][0]):
             latest[k] = (at, r.get("status"))
-    return {k for k, (_, status) in latest.items() if status in ("pass", "warn")}
+    return {k: at for k, (at, status) in latest.items() if status in ("pass", "warn")}
 
 
 def supersede_snapshots(sb, project_id: str, by_fp: dict[str, str]) -> int:
@@ -2397,13 +2417,28 @@ def consume_own_angle(sb, project_id: str, angle_key: str, version_id: str, *, u
     return bool(res.data or [])
 
 
-def fingerprinted_versions(sb, project_id: str, version_ids: list[str]) -> set[str]:
-    """这几版里已经有指纹行的(底稿转正半途断了, 第二晚补齐时不重写)。"""
-    out: set[str] = set()
+def fingerprint_keys(sb, project_id: str, version_ids: list[str]) -> dict[str, set[tuple]]:
+    """这几版已有的指纹行, 每行按 (开头哈希, 四字串 sketch) 记 —— 底稿转正半途断了, 后面几晚只补还没写的那几行(底稿那一行
+    写了、发出去的帖那一行还没有的, 照样补上)。形状同 existing_fingerprint_sketches。"""
+    out: dict[str, set[tuple]] = {}
     for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
-        rows = (sb.table("draft_fingerprints").select("version_id")
+        rows = (sb.table("draft_fingerprints").select("version_id, opening_hash, ngram_hashes")
                 .eq("project_id", project_id).in_("version_id", chunk).execute()).data or []
-        out.update(str(r["version_id"]) for r in rows if r.get("version_id"))
+        for r in rows:
+            if r.get("version_id"):
+                out.setdefault(str(r["version_id"]), set()).add(
+                    (r.get("opening_hash") or "", tuple(sorted(r.get("ngram_hashes") or []))))
+    return out
+
+
+def snapshot_states(sb, ids: list[str]) -> dict[str, str | None]:
+    """这几行底稿现在转没转正: ``{id: 转到的 version_id}``, 还没转正的是 None, 已经删了的不在里面。"""
+    out: dict[str, str | None] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(str(i) for i in ids)), 100):
+        rows = (sb.table("draft_snapshots").select("id, promoted_at, version_id")
+                .in_("id", chunk).execute()).data or []
+        for r in rows:
+            out[str(r["id"])] = str(r.get("version_id") or "?") if r.get("promoted_at") else None
     return out
 
 

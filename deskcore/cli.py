@@ -396,12 +396,15 @@ def _tv_sync(core, sb, args) -> int:
         sn = out.get("snapshots") or {}
         if not sn.get("applied", True):
             print("  · 查重底稿: 018 没跑, 没有底稿可对(对不上的照旧补录)")
-        elif sn.get("matched_notes") or sn.get("failed_notes") or sn.get("repaired"):
+        elif sn.get("matched_notes") or sn.get("failed_notes") or sn.get("repaired") or sn.get("waiting_post"):
             # W-38: 写作台查过重、没存过档的稿子, 发出去以后按内容对回来、转成版本
             print(f"  查重底稿(W-38): {sn['matched_notes']} 篇帖对上了没存档的底稿, 转成版本 {sn['promoted']}"
                   f"(新建 {sn['minted']}), 销牌 {sn['angles_consumed']}, 写指纹 {sn['fingerprinted']}"
                   + (f"; 补齐前一晚转了一半的 {sn['repaired']}" if sn.get("repaired") else "")
-                  + (f"; {sn['failed_notes']} 篇这晚没转成、没补录, 明晚再试" if sn.get("failed_notes") else ""))
+                  + (f"; 转了一半、帖不在这个 TV 项目里的 {sn['waiting_post']} 份补了指纹和销牌, 等连着帖的那个 TV 项目"
+                     "记转正" if sn.get("waiting_post") else "")
+                  + (f"; {sn['failed_notes']} 篇这晚没转成、没补录, 明晚再试" if sn.get("failed_notes") else "")
+                  + (f"(其中 {sn['superseded']} 份底稿刚存了档, 明晚按存的那一版对)" if sn.get("superseded") else ""))
         if sn.get("held"):
             print(f"  ⚠️ 读不出查重底稿, 这晚 {sn['held']} 篇对不上的没补录(记 unmatched, 明晚再对)。")
         if sn.get("error"):

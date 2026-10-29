@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -558,6 +559,68 @@ def test_the_repair_night_finds_a_post_the_main_index_links_tonight(monkeypatch)
     assert c.rows["draft_snapshots"][0]["note_id"] == "n1"
 
 
+def _half_done(monkeypatch, notes, snap, *, drop_link=False):
+    """第一晚: 版本建成了, 指纹没写上(或连对照也没写上)。回 (client, version_id), 已经把版本手动嵌进对照索引(假库不做
+    embedded join)。"""
+    c = _client(notes, [snap])
+    monkeypatch.setattr(store, "write_fingerprints", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    core.tv_sync(c, TV)
+    monkeypatch.undo()
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    vid = core._snapshot_version_id(P1, snap["text_fp"])
+    item = next(i for i in c.rows["items"] if i["id"] == _links(c)[notes[0]["note_id"]]["item_id"])
+    if drop_link:
+        c.rows["tv_note_links"] = [l for l in c.rows["tv_note_links"] if l["note_id"] != notes[0]["note_id"]]
+    ver = next(v for v in c.rows["versions"] if v["id"] == vid)
+    item.update(best_version_id=vid, versions=[dict(ver)], batches={"project_id": P1, "params": {"source": "deskcore"}})
+    ver["items"] = {"id": item["id"], "batches": {"project_id": P1}}
+    return c, vid
+
+
+def test_another_tv_project_on_the_same_desk_project_does_not_close_a_half_done_promotion(monkeypatch):
+    # 两个 TV 项目接同一个写作台项目: 帖在 TV 里, 先跑的是 TV2(它那里没有这篇帖)。TV2 补底稿那一行指纹、销牌, 不记转正;
+    # TV 跑的时候补上发出去的文字那一行、记转正(codex on aw#132)
+    published = BODY_S + "后来我又补了一根盐丸, 才没抽筋。"
+    c, vid = _half_done(monkeypatch, [_note("n1", "骑了一百公里", published)], _snap("s1", "骑了一百公里", BODY_S))
+    c.rows["tv_project_map"].append({"tv_project_id": "TV2", "project_id": P1, "ingest_target": False, "note": ""})
+    real = c.rpc_impl["deskcore_tv_notes"]
+    c.rpc_impl["deskcore_tv_notes"] = lambda a: [] if a["_tv_project_id"] == "TV2" else real(a)
+    other = core.tv_sync(c, "TV2")
+    assert other["snapshots"]["waiting_post"] == 1 and other["snapshots"]["repaired"] == 0, other["snapshots"]
+    assert c.rows["draft_snapshots"][0]["promoted_at"] is None, "帖不在这里: 不记转正"
+    assert [f["version_id"] for f in c.rows["draft_fingerprints"]] == [vid]
+    assert c.rows["angle_ledger"][0]["consumed_version_id"] == vid
+    again = core.tv_sync(c, TV)
+    assert again["snapshots"]["repaired"] == 1 and again["snapshots"]["fingerprinted"] == 1, again["snapshots"]
+    assert len(c.rows["draft_fingerprints"]) == 2, "发出去的文字那一行补上了, 底稿那一行没重写"
+    assert c.rows["draft_snapshots"][0]["promoted_at"] and c.rows["draft_snapshots"][0]["note_id"] == "n1"
+    assert sum(1 for r in c.rows["angle_ledger"] if r["consumed_version_id"]) == 1
+
+
+def test_a_snapshot_archived_while_tv_sync_waits_for_the_lock_is_not_promoted_twice(monkeypatch):
+    # tv-sync 读了底稿、还没拿到锁, commit_drafts 把同样文字的稿子存了档、底稿记到了那一版: 拿到锁再看一眼, 这晚不转,
+    # 不补录(记 unmatched), 明晚主索引对存了档的那一版(codex on aw#132)
+    snap = _snap("s1", "骑了一百公里", BODY_S)
+    c = _client([_note("n1", "骑了一百公里", BODY_S)], [snap])
+    real_lock = core._project_write_lock
+
+    @contextlib.contextmanager
+    def lock_after_archive(client, project_id, holder):
+        if holder.startswith("tv-sync-snapshot"):
+            store.supersede_snapshots(client, project_id, {snap["text_fp"]: "v-archived"})
+        with real_lock(client, project_id, holder) as got:
+            yield got
+    monkeypatch.setattr(core, "_project_write_lock", lock_after_archive)
+    n_versions = len(c.rows["versions"])
+    out = core.tv_sync(c, TV)
+    l1 = _links(c)["n1"]
+    assert l1["match_kind"] == "unmatched" and "刚存了档" in l1["candidates"][-1]["note"], l1
+    assert len(c.rows["versions"]) == n_versions, "不按底稿另建一份"
+    assert c.rows["draft_snapshots"][0]["version_id"] == "v-archived"
+    assert c.rows["angle_ledger"][0]["consumed_version_id"] is None
+    assert out["snapshots"]["superseded"] == 1 and out["ingest"] is None, out["snapshots"]
+
+
 def test_a_rejected_recheck_after_promotion_is_closed_without_consuming_a_new_card():
     # 转正之后同样文字又查了一次(撞了它自己, reject), 带的是一张新牌: 只记成已转正, 不拿新牌销给旧版本
     snap = _snap("s1", "骑了一百公里", BODY_S, key=None)
@@ -616,13 +679,29 @@ def test_angle_debt_skips_cards_whose_drafts_were_checked():
               for i, k in enumerate((KEY, KEY2))]
     c = _desk({"angle_ledger": ledger, "draft_snapshots": [dict(_snap("s1", "t", BODY_S), checked_at=store.iso_now())]})
     keys = core._checked_angle_keys(c, P1, WRITER, core.ANGLE_DEBT_DAYS)
-    assert keys == {KEY}
+    assert set(keys) == {KEY}
     debt = store.angle_debt(c, P1, WRITER, core.ANGLE_DEBT_DAYS, exclude_keys=keys)
     assert debt["unconsumed"] == 1 and [a["angle_key"] for a in debt["angles"]] == [KEY2]
     # archive_pending 不排除: 刚查过的那几张正是该存档的(参考分、规则检查、交付模板)
     assert core.archive_pending(c, P1, user_id=WRITER)["cards"] == 2
     # 别人的底稿不算我的
-    assert core._checked_angle_keys(c, P1, ME, core.ANGLE_DEBT_DAYS) == set()
+    assert not core._checked_angle_keys(c, P1, ME, core.ANGLE_DEBT_DAYS)
+
+
+def test_a_card_drawn_again_after_the_check_still_counts_as_debt():
+    # 没销的牌一天后回池子: 同一张牌查重之后又抽到一次, 那一次还没写 —— 照旧算欠着(codex on aw#132)
+    ledger = [{"id": "a1", "project_id": P1, "angle_key": KEY, "dims": {"n": 1}, "drawn_by": WRITER,
+               "drawn_at": store.iso_ago(3), "consumed_version_id": None, "consumed_at": None},
+              {"id": "a2", "project_id": P1, "angle_key": KEY, "dims": {"n": 2}, "drawn_by": WRITER,
+               "drawn_at": store.iso_now(), "consumed_version_id": None, "consumed_at": None}]
+    c = _desk({"angle_ledger": ledger,
+               "draft_snapshots": [dict(_snap("s1", "t", BODY_S), checked_at=store.iso_ago(2))]})
+    keys = core._checked_angle_keys(c, P1, WRITER, core.ANGLE_DEBT_DAYS)
+    debt = store.angle_debt(c, P1, WRITER, core.ANGLE_DEBT_DAYS, exclude_keys=keys)
+    assert debt["unconsumed"] == 1 and [a["dims"] for a in debt["angles"]] == [{"n": 2}], debt
+    assert debt["last_drawn_at"] == ledger[1]["drawn_at"]
+    # 只给 key(不带查重时刻)的老调用照旧整张排除
+    assert store.angle_debt(c, P1, WRITER, core.ANGLE_DEBT_DAYS, exclude_keys={KEY})["unconsumed"] == 0
 
 
 def test_checked_keys_are_status_aware_and_never_break_the_debt_query():
@@ -632,7 +711,7 @@ def test_checked_keys_are_status_aware_and_never_break_the_debt_query():
              dict(_snap("s3", "t2", BODY_A + "改了", key=KEY2), checked_at=now, status="pass"),       # 打回后改过、通过了
              dict(_snap("s4", "t3", BODY_OTHER, key='bad", key,(x)'), checked_at=now)]               # 模型编的 key
     c = _desk({"draft_snapshots": snaps})
-    assert core._checked_angle_keys(c, P1, WRITER, core.ANGLE_DEBT_DAYS) == {KEY2}
+    assert set(core._checked_angle_keys(c, P1, WRITER, core.ANGLE_DEBT_DAYS)) == {KEY2}
     # 编出来的 key 带引号 / 逗号 / 括号, 放进 not.in 会让整条查询 400、欠账整个读成 0: 不放进去
     assert 'bad", key,(x)' not in store.snapshotted_angle_keys(c, P1, WRITER, core.ANGLE_DEBT_DAYS)
 
@@ -686,7 +765,7 @@ def test_checked_angle_keys_fail_open(monkeypatch):
             if q.table_name == "draft_snapshots":
                 raise RuntimeError("PGRST205 draft_snapshots")
             return super()._execute(q)
-    assert core._checked_angle_keys(Broken(rows={}), P1, WRITER, 7) == set()
+    assert not core._checked_angle_keys(Broken(rows={}), P1, WRITER, 7)
 
 
 def test_archive_pending_next_step_tells_the_model_not_to_put_archiving_on_the_user():
