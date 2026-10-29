@@ -7728,9 +7728,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     snap["pending"] = len(groups)
     # 前一晚建了版本、后几步断了的(同一个 id 已经在对照索引里): 补齐指纹 / 销牌 / 标记。dry-run 不补。
     # 第二晚这篇帖已经连在那一版上了(对照里有), 帖的文字从那里拿 —— 发出去的文字那一行指纹、底稿记的 note_id 都要补。
-    # 只被打回过的(版本建成之后同样文字又查了一次, 撞了它自己)只记成已转正, 不写指纹、不销牌。
+    # 对照算到这一晚的: 前一晚断在写对照之前的话, 这篇帖是今晚主索引才连上那一版的(在 links 里, 不在 existing 里, codex
+    # on aw#132)。只被打回过的(版本建成之后同样文字又查了一次, 撞了它自己)只记成已转正, 不写指纹、不销牌。
     linked_to: dict[str, list[str]] = {}
-    for nid, l in existing.items():
+    for nid, l in {**existing, **{l["note_id"]: l for l in links}}.items():
         if l.get("version_id"):
             linked_to.setdefault(str(l["version_id"]), []).append(nid)
     repair: dict[str, list[dict]] = {}

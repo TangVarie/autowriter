@@ -522,6 +522,28 @@ def test_the_repair_night_also_records_the_published_text_and_the_note(monkeypat
     assert c.rows["draft_snapshots"][0]["note_id"] == "n1"
 
 
+def test_the_repair_night_finds_a_post_the_main_index_links_tonight(monkeypatch):
+    # 前一晚建了版本就断了(对照也没写上): 今晚主索引才把帖连上那一版(在这晚的 links 里, 不在 existing 里) ——
+    # 发出去的文字那一行指纹一样要补(codex on aw#132)
+    published = BODY_S + "后来我又补了一根盐丸, 才没抽筋。"
+    snap = _snap("s1", "骑了一百公里", BODY_S)
+    c = _client([_note("n1", "骑了一百公里", published)], [snap])
+    monkeypatch.setattr(store, "write_fingerprints", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    core.tv_sync(c, TV)
+    monkeypatch.undo()
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    vid = core._snapshot_version_id(P1, snap["text_fp"])
+    item = next(i for i in c.rows["items"] if i["id"] == _links(c)["n1"]["item_id"])
+    c.rows["tv_note_links"] = [l for l in c.rows["tv_note_links"] if l["note_id"] != "n1"]
+    ver = next(v for v in c.rows["versions"] if v["id"] == vid)
+    item.update(best_version_id=vid, versions=[dict(ver)], batches={"project_id": P1, "params": {"source": "deskcore"}})
+    ver["items"] = {"id": item["id"], "batches": {"project_id": P1}}
+    out = core.tv_sync(c, TV)
+    assert _links(c)["n1"]["version_id"] == vid, "主索引今晚连上了那一版"
+    assert out["snapshots"]["repaired"] == 1 and out["snapshots"]["fingerprinted"] == 2, out["snapshots"]
+    assert c.rows["draft_snapshots"][0]["note_id"] == "n1"
+
+
 def test_a_rejected_recheck_after_promotion_is_closed_without_consuming_a_new_card():
     # 转正之后同样文字又查了一次(撞了它自己, reject), 带的是一张新牌: 只记成已转正, 不拿新牌销给旧版本
     snap = _snap("s1", "骑了一百公里", BODY_S, key=None)
