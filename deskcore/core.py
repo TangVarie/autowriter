@@ -7326,7 +7326,8 @@ def _snapshot_version_id(project_id: str, text_fp: str) -> str:
 def _snapshot_groups(rows: list[dict]) -> dict[str, dict]:
     """底稿行 → 按 (项目, text_fp) 归成的一篇, 键是转正后的 version_id。同一篇查了几次: 时刻、check_id、飞轮臂取第一次的
     (那时这篇就已经写出来了); 原文取最晚那次的(text_fp 一样, 只差标点空白 / 话题); angle_key 取最晚带了的那次, 写手跟着
-    它走(销牌按发牌的人), 都没带就取最晚那次的写手。``ok``: 至少有一次查重没被打回(pass / warn) —— 只被打回过的(撞了
+    它走(销牌按发牌的人), 销牌只认那一次查重之前抽的(``key_checked_at``: 先没带 key 查过一次、抽了牌再带着 key 查的,
+    按第一次的时刻就销不到那张牌, codex on aw#132), 都没带就取最晚那次的写手。``ok``: 至少有一次查重没被打回(pass / warn) —— 只被打回过的(撞了
     库里的稿, 多半是照抄发出去的帖)不转正(W-38 复审)。"""
     groups: dict[str, dict] = {}
     for r in sorted(rows, key=lambda r: (str(r.get("checked_at") or ""), str(r.get("id") or ""))):
@@ -7339,13 +7340,15 @@ def _snapshot_groups(rows: list[dict]) -> dict[str, dict]:
                                "first_checked_at": r.get("checked_at"), "check_id": r.get("check_id"),
                                "flywheel_arm": r.get("flywheel_arm"),
                                "flywheel_arm_source": r.get("flywheel_arm_source"),
-                               "angle_key": None, "key_user": None, "user_id": None, "ok": False, "notes": []}
+                               "angle_key": None, "key_user": None, "key_checked_at": None, "user_id": None,
+                               "ok": False, "notes": []}
         g["ids"].append(str(r["id"]))
         g["title"], g["body"] = r.get("title") or "", r.get("body") or ""
         g["user_id"] = r.get("user_id") or g["user_id"]
         g["ok"] = g["ok"] or r.get("status") in ("pass", "warn", None)
         if r.get("angle_key"):
             g["angle_key"], g["key_user"] = str(r["angle_key"]), r.get("user_id") or g["key_user"]
+            g["key_checked_at"] = r.get("checked_at")
     for g in groups.values():
         g["writer"] = g.pop("key_user") or g["user_id"]
     return groups
@@ -7445,7 +7448,8 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
                 # B-20: 版本真建成了才销; 已经销给它的(前一晚半途断了)不再销第二张
                 if g.get("angle_key") and g["version_id"] not in consumed:
                     if store.consume_own_angle(client, project_id, g["angle_key"], g["version_id"],
-                                               user_id=g.get("writer"), drawn_before=g.get("first_checked_at")):
+                                               user_id=g.get("writer"),
+                                               drawn_before=g.get("key_checked_at") or g.get("first_checked_at")):
                         out["consumed"] += 1
             for g in done:
                 if g.get("wait_for_post"):

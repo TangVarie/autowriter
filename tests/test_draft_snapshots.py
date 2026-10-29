@@ -371,6 +371,20 @@ def test_promotion_only_consumes_the_writers_own_earlier_card():
     assert all(r["consumed_version_id"] is None for r in c.rows["angle_ledger"]), "队友的牌、之后重抽的牌都不销"
 
 
+def test_a_key_added_on_a_later_check_consumes_the_card_drawn_before_that_check():
+    # 先没带 key 查了一次, 抽了牌再带着 key 查同一篇: 销牌按带 key 的那次查重为界, 不按第一次(codex on aw#132)
+    snaps = [_snap("s1", "骑了一百公里", BODY_S, days=-3, key=None),
+             _snap("s2", "骑了一百公里", BODY_S, days=0, check="c2")]
+    ledger = [{"id": "a1", "project_id": P1, "angle_key": KEY, "dims": {}, "drawn_by": WRITER,
+               "drawn_at": _iso(-1), "consumed_version_id": None, "consumed_at": None}]
+    c = _client([_note("n1", "骑了一百公里", BODY_S, days=2)], snaps, ledger=ledger)
+    out = core.tv_sync(c, TV)
+    vid = core._snapshot_version_id(P1, snaps[0]["text_fp"])
+    assert out["snapshots"]["angles_consumed"] == 1 and c.rows["angle_ledger"][0]["consumed_version_id"] == vid
+    assert next(v for v in c.rows["versions"] if v["id"] == vid)["created_at"] == snaps[0]["checked_at"], \
+        "版本时刻照旧是第一次查重"
+
+
 def test_an_edited_post_also_puts_its_published_text_in_the_fingerprint_library():
     # 以前补录会把发出去的文字记进指纹库; 转正之后后面的稿子照样要能撞上发出去的那一版
     published = BODY_S + "后来我又补了一根盐丸, 才没抽筋。"
