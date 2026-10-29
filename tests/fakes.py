@@ -72,7 +72,9 @@ class FakeQuery:
         return self
 
     def in_(self, key, values):
-        self.filters.append(("in", key, tuple(values)))
+        # ``.not_.in_(k, [...])`` 同 is_: 反义分开记
+        self.filters.append(("notin" if self._negate_next else "in", key, tuple(values)))
+        self._negate_next = False
         return self
 
     def lt(self, key, value):
@@ -236,6 +238,8 @@ class FakeClient:
             return cur != value
         if kind == "in":
             return cur in value
+        if kind == "notin":
+            return cur is not None and cur not in value      # SQL: NULL NOT IN (...) 不成立
         if kind == "lt":
             return cur is not None and cur < value
         if kind == "gt":

@@ -233,7 +233,7 @@ _STATE_MARK = {
 
 # W-22: 超线项目的原因标签(core.pipeline_leak 给的)。/health 只给总数, 哪个项目是哪种只在这里看得到。
 _LEAK_CAUSE = {
-    "delivered_without_commit": "← 稿子进了飞书但没走 commit, 坐标没销账",
+    "delivered_without_commit": "← 同期有飞书同步回来的补录副本(发出去的帖没对回写作台)",
     "not_delivered": "← 飞书里也没同步回来",
     "unknown": "← 原因查不到(补录副本数读失败)",
 }
@@ -259,8 +259,8 @@ def _print_leak(core, sb) -> None:
               f"没入库 {prj['leak_pct']:3d}%{tail}")
     if not leak["ok"]:
         print(f"\n  ⚠️ {leak['note']}")
-        print("     没入库的稿子没有指纹, 下一批查重看不见它们。已经发出去的用"
-              " `ingest --xlsx` 补; 正在发生的去看那个会话为什么在 commit 前停了。")
+        print("     只作参考: 牌在存档、或发出去以后被 tv-sync 从查重底稿对回来时才销(W-38), 没写的、写了没发的本来就不销。"
+              "发出去的帖 tv-sync 每晚会自己对回来或补录 —— 别手动 `ingest --xlsx` 补(补成副本就再也认不回写作台的稿)。")
 
 
 def _ingest(core, sb, args) -> int:
@@ -393,6 +393,27 @@ def _tv_sync(core, sb, args) -> int:
                 print(f"  ⚠️ 补录有一块炸了({ing['chunk_error']}), {ing.get('skipped_after_failure', 0)} 条记为 "
                       "unmatched、明晚重来; 已对上的对照照常写了。")
                 rc = 1
+        sn = out.get("snapshots") or {}
+        if not sn.get("applied", True):
+            print("  · 查重底稿: 018 没跑, 没有底稿可对(对不上的照旧补录)")
+        elif (sn.get("matched_notes") or sn.get("failed_notes") or sn.get("repaired") or sn.get("waiting_post")
+              or sn.get("undated") or sn.get("held_rival")):
+            # W-38: 写作台查过重、没存过档的稿子, 发出去以后按内容对回来、转成版本
+            print(f"  查重底稿(W-38): {sn['matched_notes']} 篇帖对上了没存档的底稿, 转成版本 {sn['promoted']}"
+                  f"(新建 {sn['minted']}), 销牌 {sn['angles_consumed']}, 写指纹 {sn['fingerprinted']}"
+                  + (f"(其中 {sn['same_night']} 篇是改写过的, 按主索引的规矩连上今晚转正的版本)" if sn.get("same_night") else "")
+                  + (f"; {sn['held_rival']} 篇和今晚转正的、存过档的分不出, 没补录, 明晚再对" if sn.get("held_rival") else "")
+                  + (f"; {sn['undated']} 篇对得上底稿、还没填发布日期, 没补录, 填了再对" if sn.get("undated") else "")
+                  + (f"; 补齐前一晚转了一半的 {sn['repaired']}" if sn.get("repaired") else "")
+                  + (f"; 转了一半、帖不在这个 TV 项目里的 {sn['waiting_post']} 份补了指纹和销牌, 等连着帖的那个 TV 项目"
+                     "记转正" if sn.get("waiting_post") else "")
+                  + (f"; {sn['failed_notes']} 篇这晚没转成、没补录, 明晚再试" if sn.get("failed_notes") else "")
+                  + (f"(其中 {sn['superseded']} 份底稿刚存了档, 明晚按存的那一版对)" if sn.get("superseded") else ""))
+        if sn.get("held"):
+            print(f"  ⚠️ 读不出查重底稿, 这晚 {sn['held']} 篇对不上的没补录(记 unmatched, 明晚再对)。")
+        if sn.get("error"):
+            print(f"  ⚠️ 查重底稿那一步出错: {sn['error']} —— 已对上的对照照常写了; 没做完的明晚接着做。")
+            rc = 1
         ed = out.get("edit_diffs") or {}
         if ed:
             print(f"  改动差异: 算了 {ed.get('computed', 0)} 对(改过的 {ed.get('changed', 0)}, 补算以前的 "
@@ -420,6 +441,16 @@ def _tv_sync(core, sb, args) -> int:
             print(f"  ? 分不出 {smp['note_id']} 「{smp['title']}」: "
                   + "; ".join(f"{c['version_id'][:8]}({c['score']}, {c['lag_days']}d)"
                               for c in smp["candidates"]))
+    if args.all and not args.dry_run:
+        # W-38: 查重底稿留够天数就删(存的是稿子全文)。一晚一次, 不按 TV 项目
+        try:
+            pruned = core.prune_snapshots(sb)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"\n⚠️ 删过期的查重底稿失败: {type(exc).__name__}: {exc} —— 明晚再删。")
+            rc = 1
+        else:
+            if pruned:
+                print(f"\n查重底稿: 删了 {pruned} 行超过 {core.SNAPSHOT_RETAIN_DAYS} 天的")
     return rc
 
 

@@ -1629,6 +1629,32 @@ CREATE TABLE IF NOT EXISTS autowriter.rule_compiles (
 GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.rule_compiles TO service_role;
 ALTER TABLE autowriter.rule_compiles ENABLE ROW LEVEL SECURITY;
 
+-- 查重时记下的底稿 (migrations/018_draft_snapshots.sql, 2026-10-29, W-38): check_drafts 每查一篇记一行, 不进
+-- draft_fingerprints(不挡后面的稿子); tv-sync 对不上写作台版本的帖拿它再对, 对上了转成真的版本
+CREATE TABLE IF NOT EXISTS autowriter.draft_snapshots (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id           UUID NOT NULL REFERENCES autowriter.projects(id) ON DELETE CASCADE,
+    user_id              UUID,
+    check_id             UUID NOT NULL,
+    title                TEXT NOT NULL DEFAULT '',
+    body                 TEXT NOT NULL DEFAULT '',
+    angle_key            TEXT,
+    text_fp              TEXT NOT NULL,
+    status               TEXT,
+    flywheel_arm         TEXT,
+    flywheel_arm_source  TEXT,
+    checked_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    version_id           UUID,
+    promoted_at          TIMESTAMPTZ,
+    note_id              TEXT
+);
+CREATE INDEX IF NOT EXISTS draft_snapshots_pending_idx
+    ON autowriter.draft_snapshots (project_id, checked_at DESC) WHERE promoted_at IS NULL;
+CREATE INDEX IF NOT EXISTS draft_snapshots_user_key_idx
+    ON autowriter.draft_snapshots (project_id, user_id, checked_at DESC) WHERE angle_key IS NOT NULL;
+GRANT SELECT, INSERT, UPDATE, DELETE ON autowriter.draft_snapshots TO service_role;
+ALTER TABLE autowriter.draft_snapshots ENABLE ROW LEVEL SECURITY;
+
 -- ══════════════════════════════════════════════════════════════════════
 -- 发牌台账接上结果: autowriter.v_angle_outcomes (migrations/011_angle_outcomes_view.sql)
 -- 为什么、权限为什么非得「属主建 + 显式 GRANT」见 011 的文件头。下面的 DO 块与 011

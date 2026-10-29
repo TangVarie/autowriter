@@ -296,6 +296,45 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
 
+### 1.14 `018_draft_snapshots` —— 查重时记下底稿，tv-sync 拿飞书的帖来对（2026-10-29，W-38）
+
+写手没有「存档」这一步（D-120）：稿子写完贴进飞书，写作台自己按内容对回来。可写作台的稿只在模型调了 `score_drafts`
+时才进库；没调的那几轮（10-28 途鸽一轮 10 张牌），发出去的帖只能被补录成副本——牌不销、没有改稿差异，TV 的角度台账灯
+还把它算成「发了牌没写」。018 建 `draft_snapshots`：`check_drafts`（每篇必过的硬闸）每查一篇记一行，不进指纹库；
+tv-sync 对不上写作台版本的帖先拿底稿对，对上了转成真的版本（规则见 `docs/deskcore.md` §3.7「查重底稿」）。
+
+**顺序（先迁移、再代码）。** 018 本身可降级，但同一次部署已经不再催模型存档（给模型的话改成「没存上的稿子发出去以后写作台会自己对回来」）：
+代码先上线、018 没跑的那段时间，只查了重的稿子发出去会被补录成副本（终态，再也认不回）。① SQL Editor 跑 `018`（只建表，旧代码不碰它）。
+② 验收（SQL Editor）：
+
+```sql
+-- 一行: draft_snapshots, RLS 开着
+select relname, relrowsecurity from pg_class
+ where relnamespace = 'autowriter'::regnamespace and relname = 'draft_snapshots';
+-- 授权: service_role 有, anon / authenticated 没有(存的是稿子全文)
+select has_table_privilege('service_role', 'autowriter.draft_snapshots', 'SELECT'),
+       has_table_privilege('anon', 'autowriter.draft_snapshots', 'SELECT'),
+       has_table_privilege('authenticated', 'autowriter.draft_snapshots', 'SELECT');
+```
+
+③ 合并（自动部署），`doctor` 里「表 draft_snapshots」applied。④ 第一次有人在写作台查重之后：
+
+```sql
+select count(*), count(angle_key), count(distinct check_id) from autowriter.draft_snapshots;
+```
+
+三个数都 > 0、`count(angle_key)` 接近 `count(*)`（模型查重时带了 `angle_key`；带得少说明模型没把牌带到查重这一步，发出去以后
+对得上、但销不了牌）。⑤ 下一次 tv-sync（14:00 UTC）的日志里每个 TV 项目多一行「查重底稿(W-38): N 篇帖对上了没存档的底稿,
+转成版本 M …」（没有对上的就不打）；出错的打 ⚠️ 并退出码 1，一时读不出底稿的那晚对不上的帖**不补录**（记 unmatched，明晚再对；
+缺权限 / 缺列这种配置问题照旧补录）。`--all` 跑完多一行「查重底稿: 删了 N 行超过 60 天的」（有才打）。同一晚改稿差异那行的「对照补上 lag」
+会多出一批：以前按 UTC 日期记成 −1、按北京日是 0 的对照（10-29 估计 26 条），改回来之后它们的差异进下一份摘要。
+
+想先看会转哪几篇，用 PR 分支、cron 服务的环境跑一次只算不写的预演：
+
+```bash
+python -m deskcore.cli tv-sync --all --dry-run
+```
+
 ### 1.13 `017_tv_link_text_fp` —— tv-sync 核对已对上的对照的 TV 正文（2026-10-27，W-34，生产库已执行，10-27 核对）
 
 有版本的对照以前每晚记 `already_linked`、不再看 TV 的正文。运营在飞书里把一篇整篇换成另一篇（`note_id` 不变），对照、写回 TV 的

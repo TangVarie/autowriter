@@ -34,7 +34,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
 
 from . import fingerprint as fp
@@ -169,10 +169,21 @@ class Match:
     candidates: list[dict] = field(default_factory=list)
 
 
+# TV 的 publish_time 是飞书的「发布日期」: 北京时间那一天的 0 点, 存成不带时区的时间戳、读进来当 UTC(10-29 查 60 天
+# 2542 篇里 2524 篇是 16:00 UTC)。所以两边都换成北京日历日再相减(W-38 复审, 2026-10-29): 按 UTC 日期减, 北京当天写、当天
+# 发的稿子算成 −1(发了之后才存的), 改稿差异和「接住」都不认它 —— 10-29 生产库 lag 在 −2..2 的 264 条对照里 26 条是这样。
+_CN_TZ = timezone(timedelta(hours=8))
+
+
+def _cn_day(t: datetime) -> date:
+    return t.astimezone(_CN_TZ).date()
+
+
 def lag_days(note: Note, v: Version) -> int | None:
+    """发布那天 − 写作台这一版那天, 都按北京日历日。"""
     if note.publish_time is None or v.created_at is None:
         return None
-    return (note.publish_time.date() - v.created_at.date()).days
+    return (_cn_day(note.publish_time) - _cn_day(v.created_at)).days
 
 
 def in_window(lag: int | None) -> bool:
@@ -194,6 +205,14 @@ class VersionIndex:
             tk = title_key(v.title)
             if tk:
                 self.by_title.setdefault(tk, []).append(v)
+
+    @classmethod
+    def merged(cls, *indexes: "VersionIndex") -> "VersionIndex":
+        """几个索引合成一个, 四字串缓存一并带上(不重算)。"""
+        out = cls(v for ix in indexes for v in ix.versions)
+        for ix in indexes:
+            out._grams.update(ix._grams)
+        return out
 
     def grams_of(self, v: Version) -> set[str]:
         g = self._grams.get(v.version_id)
@@ -273,6 +292,107 @@ def match_note(note: Note, index: VersionIndex) -> Match:
 
 def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
     return {n.note_id: match_note(n, index) for n in notes}
+
+
+# ── 查重时记下的底稿(2026-10-29, W-38) ─────────────────────────────────────────────────────────
+# 写手没有「存档」这一步(D-120): 模型没调 score_drafts 的稿子, 写作台只在 check_drafts 那一刻见过它(draft_snapshots)。
+# 对不上写作台版本的帖, tv-sync 再拿这些底稿对一次, 对上了就把底稿转成真的版本(建 item / version、写指纹、销牌)——
+# 那是实打实写进库的, 所以比 match_note 严:
+#   · 帖要有发布日期, 底稿要早于帖: 发布那天 − 第一次查重那天(北京日历日)在 0..WINDOW_AFTER_DAYS 天; 晚于发布的不认
+#     (DIFF_REV 2 / 判据 C 的"接住"同一个口径, 认了也算不了改稿差异);
+#   · 开头 / 标题和帖一样的底稿是一档(精确档, 同 match_note 先看精确档), 只要包含度到 EDITED_FLOOR(match_note 的精确档
+#     不看包含度); 比它更像的底稿得是它的前后几稿, 否则 ambiguous; 只跟同样精确的比远近 —— 只是共用产品话术的别的稿子
+#     不让它变成分不出。开头 / 标题都不一样的那一档(fuzzy / edited)要到 SNAPSHOT_EDITED_FLOOR —— W-34 判"整篇换了"的线是
+#     0.30, 擦着线转正的对照, 运营在飞书里再改几句就会被挪走、补录成副本(开头 / 标题一样的, W-34 重对也照样对回这一版);
+#   · 分不出时, 只在打平的几份是同一篇的前后几稿(互相重合 SNAPSHOT_SAME_DRAFT 以上)才挑一份: 挑和这篇帖两头都最像的
+#     (帖在稿里 + 稿在帖里), 一样像取标题 / 开头和帖一样的, 再一样取最晚查的; 打平的里面有别的稿子 → ambiguous, 不硬猜;
+#   · 存过档的版本也算对手(``main``): 主索引说对不上, 可时间窗里有存档版本离最像的底稿不到一个差距(同一个故事写了两版,
+#     一版存了档、一版只查了重) → ambiguous。主索引自己遇到这种也是 ambiguous。精确档只拿同样精确的存档版本当对手 —— 在
+#     tv-sync 里碰不到(主索引的精确档有它就不会走到这里), 留着防别的调用方。
+SNAPSHOT_SAME_DRAFT = 0.60
+SNAPSHOT_EDITED_FLOOR = 0.45
+
+
+def snapshot_lag(note: Note, v: Version) -> int | None:
+    """发布那天 − 第一次查重那天(北京日历日)。帖没有发布日期的不认(回 None): TV 读到它的时刻可能比发布晚很久
+    (新接的表), 拿它当上限会把发出去之后才写的稿认成来源。"""
+    return lag_days(note, v)
+
+
+def _same_draft(a: Version, b: Version, index: VersionIndex, other: VersionIndex | None = None) -> bool:
+    ga, gb = index.grams_of(a), (other or index).grams_of(b)
+    small = min(len(ga), len(gb))
+    return small > 0 and len(ga & gb) / small >= SNAPSHOT_SAME_DRAFT
+
+
+def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
+                   main: VersionIndex | None = None, *, max_lag: int | None = WINDOW_AFTER_DAYS) -> Match:
+    """这篇帖是不是从哪份底稿发出去的。``snaps`` 每份一个 Version(created_at = 第一次查重的时刻), ``index`` 是它们自己的
+    VersionIndex(只用来缓存四字串); ``main`` 是存过档的版本的索引(对手, 见上)。回 body_exact / title_exact / fuzzy /
+    edited(带那份底稿)、ambiguous(候选里是底稿的 id)或 unmatched。``max_lag=None``: 不卡发布晚了多少天(给还没有发布日期的
+    帖试对内容用 —— 拿今天当发布日期, 等得久了会被 30 天的窗口挡掉, 而它该等到底稿过期为止, codex on aw#132)。
+
+    开头 / 标题和帖一样的底稿是一档(同 match_note 的精确档, codex / 复审 on aw#132): 只要 EDITED_FLOOR, 只跟同样开头 /
+    标题一样的比 —— 包含度最高的那份不一样、而一样的那份分数低一点(同一篇改过标题 / 开头的前后几稿), 照样认一样的那份;
+    只是共用产品话术的别的稿子(包含度差一截)不让它变成分不出。"""
+    ng = grams(note.body)
+    if len(ng) < FUZZY_MIN_GRAMS:
+        return Match("unmatched")
+    eligible = [v for v in snaps if (lag := snapshot_lag(note, v)) is not None and 0 <= lag
+                and (max_lag is None or lag <= max_lag)]
+    pk, tk = prefix_key(note.body), title_key(note.title)
+
+    def exact(v: Version) -> bool:
+        return bool(pk and pk == prefix_key(v.body) or tk and tk == title_key(v.title))
+
+    # 分数打平的, 精确的排前面(复审 on aw#132): 不然走不走精确档要看哪份先查的重
+    scored = sorted(((index.containment(ng, v), v) for v in eligible), key=lambda t: (-t[0], not exact(t[1])))
+    if not scored or scored[0][0] < EDITED_FLOOR:
+        return Match("unmatched")
+
+    def back(v: Version) -> float:                      # 稿在帖里: 一稿比另一稿多出来的那段, 帖里没有就分得开
+        g = index.grams_of(v)
+        return len(g & ng) / len(g) if g else 0.0
+
+    listed = [_cand(note, v, s) for s, v in scored[:5] if s >= EDITED_FLOOR - EDITED_MARGIN]
+    ex = [(s, v) for s, v in scored if s >= EDITED_FLOOR and exact(v)]
+    best_s, best_v = scored[0]
+    if ex:
+        # 精确档(复审 on aw#132: 有就走, 不看分数更高的那份到没到 SNAPSHOT_EDITED_FLOOR)。分数比它高的(都不精确)得是它的
+        # 前后几稿, 否则分不出;
+        # 同样精确、分数相近的得是同一篇的前后几稿, 否则分不出。存过档的版本只有同样精确的才当对手 —— 只是内容像的
+        # 存档版本比不过开头 / 标题一样的底稿(主索引的精确档也不拿它们比)。
+        e_s, e_v = ex[0]
+        above = [(s, v) for s, v in scored if s > e_s]
+        margin = FUZZY_MARGIN if e_s >= FUZZY_CONTAIN else EDITED_MARGIN
+        close = [(s, v) for s, v in ex[1:] if e_s - s < margin]
+        rivals = [] if main is None else [
+            (s, v) for s, v in ((main.containment(ng, v), v) for v in main.versions
+                                if in_window(lag_days(note, v)) and exact(v)) if e_s - s < margin]
+        if any(not _same_draft(e_v, v, index) for _, v in above + close) or rivals:
+            return Match("ambiguous", None, best_s, None, (listed + [_cand(note, v, s) for s, v in rivals])[:5])
+        group = [(e_s, e_v)] + close
+    else:
+        if best_s < FUZZY_CONTAIN and best_s < SNAPSHOT_EDITED_FLOOR:
+            return Match("unmatched")
+        margin = FUZZY_MARGIN if best_s >= FUZZY_CONTAIN else EDITED_MARGIN
+        close = [(s, v) for s, v in scored[1:] if best_s - s < margin]
+        rivals = []
+        if main is not None:
+            rivals = sorted(((main.containment(ng, v), v) for v in main.versions if in_window(lag_days(note, v))),
+                            key=lambda t: -t[0])
+            rivals = [(s, v) for s, v in rivals[:5] if best_s - s < margin]
+        if any(not _same_draft(best_v, v, index) for _, v in close) or rivals:
+            return Match("ambiguous", None, best_s, None,
+                         (listed + [_cand(note, v, s) for s, v in rivals])[:5])
+        group = [(best_s, best_v)] + [(s, v) for s, v in close if s >= SNAPSHOT_EDITED_FLOOR]
+    # 帖在稿里 + 稿在帖里最像的那一稿; 一样像的(正文一样、只改了标题的前后几稿)取标题 / 开头和帖一样的, 再一样取最晚查的
+    score, chosen = max(group, key=lambda t: (t[0] + back(t[1]), bool(tk and tk == title_key(t[1].title)),
+                                              bool(pk and pk == prefix_key(t[1].body)), t[1].created_at))
+    kind = ("body_exact" if pk and pk == prefix_key(chosen.body) else
+            "title_exact" if tk and tk == title_key(chosen.title) else
+            "fuzzy" if score >= FUZZY_CONTAIN else "edited")
+    return Match(kind, chosen, score, lag_days(note, chosen), listed if len(group) > 1 or close else [])
 
 
 # ── 对上之后 TV 那边的正文还是不是那一篇(2026-10-27, W-34) ───────────────────────────────────

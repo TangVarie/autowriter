@@ -313,5 +313,7 @@ def test_doctor_names_the_cause_per_project(monkeypatch, capsys):
     out = capsys.readouterr().out
     line_a = next(l for l in out.splitlines() if "百健士" in l)
     line_b = next(l for l in out.splitlines() if "西屋" in l)
-    assert "没走 commit" in line_a and "12" in line_a
+    assert "补录副本" in line_a and "12" in line_a
     assert "也没同步回来" in line_b
+    # W-38: 牌没销不是写手的事, 也别叫人手动补录(补成副本就再也认不回写作台的稿)
+    assert "别手动 `ingest --xlsx` 补" in out and "已经发出去的用 `ingest --xlsx` 补" not in out
