@@ -396,10 +396,13 @@ def _tv_sync(core, sb, args) -> int:
         sn = out.get("snapshots") or {}
         if not sn.get("applied", True):
             print("  · 查重底稿: 018 没跑, 没有底稿可对(对不上的照旧补录)")
-        elif sn.get("matched_notes") or sn.get("failed_notes") or sn.get("repaired") or sn.get("waiting_post"):
+        elif (sn.get("matched_notes") or sn.get("failed_notes") or sn.get("repaired") or sn.get("waiting_post")
+              or sn.get("undated") or sn.get("same_night")):
             # W-38: 写作台查过重、没存过档的稿子, 发出去以后按内容对回来、转成版本
             print(f"  查重底稿(W-38): {sn['matched_notes']} 篇帖对上了没存档的底稿, 转成版本 {sn['promoted']}"
                   f"(新建 {sn['minted']}), 销牌 {sn['angles_consumed']}, 写指纹 {sn['fingerprinted']}"
+                  + (f"; 另有 {sn['same_night']} 篇改写过的连上了今晚转正的版本" if sn.get("same_night") else "")
+                  + (f"; {sn['undated']} 篇对得上底稿、还没填发布日期, 没补录, 填了再对" if sn.get("undated") else "")
                   + (f"; 补齐前一晚转了一半的 {sn['repaired']}" if sn.get("repaired") else "")
                   + (f"; 转了一半、帖不在这个 TV 项目里的 {sn['waiting_post']} 份补了指纹和销牌, 等连着帖的那个 TV 项目"
                      "记转正" if sn.get("waiting_post") else "")

@@ -319,7 +319,11 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
                    main: VersionIndex | None = None) -> Match:
     """这篇帖是不是从哪份底稿发出去的。``snaps`` 每份一个 Version(created_at = 第一次查重的时刻), ``index`` 是它们自己的
     VersionIndex(只用来缓存四字串); ``main`` 是存过档的版本的索引(对手, 见上)。回 body_exact / title_exact / fuzzy /
-    edited(带那份底稿)、ambiguous(候选里是底稿的 id)或 unmatched。"""
+    edited(带那份底稿)、ambiguous(候选里是底稿的 id)或 unmatched。
+
+    开头 / 标题和帖一样的底稿是一档(同 match_note 的精确档, codex / 复审 on aw#132): 只要 EDITED_FLOOR, 只跟同样开头 /
+    标题一样的比 —— 包含度最高的那份不一样、而一样的那份分数低一点(同一篇改过标题 / 开头的前后几稿), 照样认一样的那份;
+    只是共用产品话术的别的稿子(包含度差一截)不让它变成分不出。"""
     ng = grams(note.body)
     if len(ng) < FUZZY_MIN_GRAMS:
         return Match("unmatched")
@@ -327,34 +331,53 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
     scored = sorted(((index.containment(ng, v), v) for v in eligible), key=lambda t: -t[0])
     if not scored or scored[0][0] < EDITED_FLOOR:
         return Match("unmatched")
-    best_s, best_v = scored[0]
     pk, tk = prefix_key(note.body), title_key(note.title)
-    exact = bool(pk and pk == prefix_key(best_v.body) or tk and tk == title_key(best_v.title))
-    # 开头 / 标题一样的只要 EDITED_FLOOR(codex on aw#132): W-34 哪天按 0.30 判它「整篇换了」重对, 开头 / 标题照样对回这一版
-    if best_s < FUZZY_CONTAIN and best_s < SNAPSHOT_EDITED_FLOOR and not exact:
-        return Match("unmatched")
-    margin = FUZZY_MARGIN if best_s >= FUZZY_CONTAIN else EDITED_MARGIN
-    close = [(s, v) for s, v in scored[1:] if best_s - s < margin]
-    listed = [_cand(note, v, s) for s, v in scored[:5] if s >= EDITED_FLOOR - EDITED_MARGIN]
-    rivals = []
-    if main is not None:
-        rivals = sorted(((main.containment(ng, v), v) for v in main.versions if in_window(lag_days(note, v))),
-                        key=lambda t: -t[0])
-        rivals = [(s, v) for s, v in rivals[:5] if best_s - s < margin]
-    if any(not _same_draft(best_v, v, index) for _, v in close) or rivals:
-        return Match("ambiguous", None, best_s, None,
-                     (listed + [_cand(note, v, s) for s, v in rivals])[:5])
+
+    def exact(v: Version) -> bool:
+        return bool(pk and pk == prefix_key(v.body) or tk and tk == title_key(v.title))
 
     def back(v: Version) -> float:                      # 稿在帖里: 一稿比另一稿多出来的那段, 帖里没有就分得开
         g = index.grams_of(v)
         return len(g & ng) / len(g) if g else 0.0
 
-    group = [(best_s, best_v)] + [(s, v) for s, v in close if s >= SNAPSHOT_EDITED_FLOOR]
-    score, chosen = max(group, key=lambda t: (t[0] + back(t[1]), t[1].created_at))
+    listed = [_cand(note, v, s) for s, v in scored[:5] if s >= EDITED_FLOOR - EDITED_MARGIN]
+    ex = [(s, v) for s, v in scored if s >= EDITED_FLOOR and exact(v)]
+    best_s, best_v = scored[0]
+    if ex and (exact(best_v) or (best_s < FUZZY_CONTAIN and best_s < SNAPSHOT_EDITED_FLOOR)):
+        # 精确档。分数比它高的(都不精确、都不到 SNAPSHOT_EDITED_FLOOR)得是它的前后几稿, 否则分不出;
+        # 同样精确、分数相近的得是同一篇的前后几稿, 否则分不出。存过档的版本只有同样精确的才当对手 —— 只是内容像的
+        # 存档版本比不过开头 / 标题一样的底稿(主索引的精确档也不拿它们比)。
+        e_s, e_v = ex[0]
+        above = [(s, v) for s, v in scored if s > e_s]
+        margin = FUZZY_MARGIN if e_s >= FUZZY_CONTAIN else EDITED_MARGIN
+        close = [(s, v) for s, v in ex[1:] if e_s - s < margin]
+        rivals = [] if main is None else [
+            (s, v) for s, v in ((main.containment(ng, v), v) for v in main.versions
+                                if in_window(lag_days(note, v)) and exact(v)) if e_s - s < margin]
+        if any(not _same_draft(e_v, v, index) for _, v in above + close) or rivals:
+            return Match("ambiguous", None, best_s, None, (listed + [_cand(note, v, s) for s, v in rivals])[:5])
+        group = [(e_s, e_v)] + close
+    else:
+        if best_s < FUZZY_CONTAIN and best_s < SNAPSHOT_EDITED_FLOOR:
+            return Match("unmatched")
+        margin = FUZZY_MARGIN if best_s >= FUZZY_CONTAIN else EDITED_MARGIN
+        close = [(s, v) for s, v in scored[1:] if best_s - s < margin]
+        rivals = []
+        if main is not None:
+            rivals = sorted(((main.containment(ng, v), v) for v in main.versions if in_window(lag_days(note, v))),
+                            key=lambda t: -t[0])
+            rivals = [(s, v) for s, v in rivals[:5] if best_s - s < margin]
+        if any(not _same_draft(best_v, v, index) for _, v in close) or rivals:
+            return Match("ambiguous", None, best_s, None,
+                         (listed + [_cand(note, v, s) for s, v in rivals])[:5])
+        group = [(best_s, best_v)] + [(s, v) for s, v in close if s >= SNAPSHOT_EDITED_FLOOR]
+    # 帖在稿里 + 稿在帖里最像的那一稿; 一样像的(正文一样、只改了标题的前后几稿)取标题 / 开头和帖一样的, 再一样取最晚查的
+    score, chosen = max(group, key=lambda t: (t[0] + back(t[1]), bool(tk and tk == title_key(t[1].title)),
+                                              bool(pk and pk == prefix_key(t[1].body)), t[1].created_at))
     kind = ("body_exact" if pk and pk == prefix_key(chosen.body) else
             "title_exact" if tk and tk == title_key(chosen.title) else
             "fuzzy" if score >= FUZZY_CONTAIN else "edited")
-    return Match(kind, chosen, score, lag_days(note, chosen), listed if close else [])
+    return Match(kind, chosen, score, lag_days(note, chosen), listed if len(group) > 1 or close else [])
 
 
 # ── 对上之后 TV 那边的正文还是不是那一篇(2026-10-27, W-34) ───────────────────────────────────

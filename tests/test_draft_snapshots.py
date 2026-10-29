@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import contextlib
+import random
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -113,6 +114,24 @@ def _m(note, snaps, main=None):
     return tvlink.match_snapshot(note, snaps, tvlink.VersionIndex(snaps), main)
 
 
+def _cjk(n, seed):
+    """n 个随机汉字(四字串几乎不会和别的段撞)。按 seed 定, 不受用例顺序影响。"""
+    rng = random.Random(seed)
+    return "".join(chr(rng.randint(0x4E00, 0x9FA5)) for _ in range(n))
+
+
+def _contain(post, draft):
+    ng = tvlink.grams(tvlink.strip_hashtags(post))
+    return len(ng & tvlink.grams(tvlink.strip_hashtags(draft))) / len(ng)
+
+
+# 同一篇的前后两稿: 第一稿(标题 / 开头 O), 改了标题、开头、加了一段 Q 的第二稿; 帖保留第一稿的标题和开头、用了第二稿加的那段
+_O, _M1, _M2, _E1, _O2, _Q, _R = (_cjk(n, i) for i, n in enumerate((45, 40, 150, 30, 45, 55, 84)))
+REV1 = _O + "。" + _M1 + "。" + _M2 + "。" + _E1
+REV2 = _O2 + "。" + _M1 + "。" + _M2 + "。" + _Q
+POST_KEPT_TITLE = _O + "。" + _M1 + "。" + _Q + "。" + _R
+
+
 def test_same_text_matches_and_lag_is_counted_in_beijing_days_from_the_first_check():
     m = _m(_n("骑了一百公里", BODY_S, days=3), [_v("s1", "骑了一百公里", BODY_S, 0)])
     assert m.kind == "body_exact" and m.version.version_id == "s1" and m.lag_days == 3 and m.score == 1.0
@@ -193,6 +212,50 @@ def test_an_archived_version_just_as_close_makes_it_ambiguous():
     m = _m(_n("骑了一百公里", BODY_S, days=1), [snap], tvlink.VersionIndex([archived]))
     assert m.kind == "ambiguous" and {c["version_id"] for c in m.candidates} == {"s1", "v9"}, m
     assert _m(_n("骑了一百公里", BODY_S, days=1), [snap], tvlink.VersionIndex([])).kind == "body_exact"
+
+
+def test_an_exact_hit_below_a_revision_of_the_same_draft_is_still_promoted():
+    # 开头 / 标题一样的那份分数低一点(0.37), 分数高的(0.40)是它改过标题 / 开头的下一稿: 认一样的那份, 不补录(复审 on aw#132)
+    assert tvlink.EDITED_FLOOR <= _contain(POST_KEPT_TITLE, REV1) < _contain(POST_KEPT_TITLE, REV2) \
+        < tvlink.SNAPSHOT_EDITED_FLOOR
+    s1, s2 = _v("s1", "骑了一百公里", REV1, 0), _v("s2", "百公里之后", REV2, 1)
+    m = _m(_n("骑了一百公里", POST_KEPT_TITLE, days=3), [s1, s2])
+    assert m.kind == "body_exact" and m.version.version_id == "s1", m
+
+
+def test_an_exact_hit_below_an_unrelated_draft_is_ambiguous_not_ingested():
+    # 分数高的那份不是它的前后几稿(别的稿子): 分不出, 不硬猜也不补录
+    other = _v("s2", "别的稿子", _cjk(45, 90) + "。" + _M1 + "。" + _Q + "。" + _cjk(300, 91), 1)
+    s1 = _v("s1", "骑了一百公里", REV1, 0)
+    assert _contain(POST_KEPT_TITLE, other.body) > _contain(POST_KEPT_TITLE, REV1)
+    assert not tvlink._same_draft(s1, other, tvlink.VersionIndex([s1, other]))
+    assert _m(_n("骑了一百公里", POST_KEPT_TITLE, days=3), [s1, other]).kind == "ambiguous"
+
+
+def test_product_talk_shared_with_another_draft_does_not_make_an_exact_hit_ambiguous():
+    # 开头 / 标题一样、包含度 0.32 的底稿 vs 只是共用产品话术(0.19)的别的稿子(存过档的 / 别的底稿): 同 match_note 的精确档,
+    # 不拿只是内容像的去比(复审 on aw#132)
+    talk = _cjk(45, 20)
+    snap_body = _cjk(45, 21) + "。" + _cjk(30, 22) + "。" + _cjk(150, 23)
+    post = snap_body[:76] + "。" + talk + "。" + _cjk(110, 24)
+    other_body = _cjk(200, 25) + "。" + talk
+    assert tvlink.EDITED_FLOOR <= _contain(post, snap_body) < tvlink.SNAPSHOT_EDITED_FLOOR
+    assert 0.1 < _contain(post, other_body) < tvlink.EDITED_FLOOR
+    s = _v("s1", "骑了一百公里", snap_body, 0)
+    archived = tvlink.Version(version_id="v9", project_id=P1, title="别的稿子", body=other_body,
+                              created_at=tvlink._as_dt(_iso(0)))
+    note = _n("骑了一百公里", post, days=2)
+    assert _m(note, [s], tvlink.VersionIndex([archived])).kind == "body_exact"
+    assert _m(note, [s, _v("s2", "别的稿子", other_body, 0)]).kind == "body_exact"
+
+
+def test_body_identical_revisions_pick_the_title_the_post_kept():
+    # 只改了标题又查了一次(正文一样, 两份分数打平): 取标题和帖一样的那份, 不取最晚查的(复审 on aw#132)
+    body = _cjk(200, 30)
+    first, retitled = _v("s1", "原来的标题写法", body, 0), _v("s2", "改过的标题写法", body, 1)
+    m = _m(_n("原来的标题写法", body, days=2), [first, retitled])
+    assert m.version.version_id == "s1", m
+    assert _m(_n("改过的标题写法", body, days=2), [first, retitled]).version.version_id == "s2"
 
 
 def test_short_posts_are_not_matched():
@@ -633,6 +696,57 @@ def test_a_snapshot_archived_while_tv_sync_waits_for_the_lock_is_not_promoted_tw
     assert c.rows["draft_snapshots"][0]["version_id"] == "v-archived"
     assert c.rows["angle_ledger"][0]["consumed_version_id"] is None
     assert out["snapshots"]["superseded"] == 1 and out["ingest"] is None, out["snapshots"]
+
+
+def test_a_post_without_a_publish_date_that_matches_a_snapshot_waits_instead_of_being_ingested():
+    # 飞书里还没填发布日期就被 TV 读进来了: 对得上底稿的先不补录(补录是终态), 填了日期那晚转正; 对不上的照旧补录(复审 on aw#132)
+    row = _note("n1", "骑了一百公里", BODY_S, days=1)
+    row["publish_time"] = None
+    other = _note("n2", "外面写的", BODY_OTHER, days=1)
+    other["publish_time"] = None
+    c = _client([row, other], [_snap("s1", "骑了一百公里", BODY_S + "\n#骑行")])
+    out = core.tv_sync(c, TV)
+    links = _links(c)
+    assert links["n1"]["match_kind"] == "unmatched" and "填了日期再对" in links["n1"]["candidates"][-1]["note"]
+    assert links["n2"]["match_kind"] == "ingested", "对不上底稿的照旧补录"
+    assert out["snapshots"]["undated"] == 1 and c.rows["draft_snapshots"][0]["promoted_at"] is None
+    row["publish_time"] = _pub(2)
+    out = core.tv_sync(c, TV)
+    assert _links(c)["n1"]["match_kind"] == "body_exact" and out["snapshots"]["promoted"] == 1
+    assert c.rows["angle_ledger"][0]["consumed_version_id"] == _links(c)["n1"]["version_id"]
+
+
+def test_a_rewritten_second_post_the_same_night_links_to_the_version_promoted_tonight():
+    # 同一篇改写给另一个号发的(开头 / 标题都换了, 包含度 0.39, 不到底稿那一档的线): 明晚主索引会连上刚转正的那一版, 今晚
+    # 补录成副本就再也连不上了 —— 今晚就按主索引的规矩对一次刚转正的几版(复审 on aw#132)
+    x = _cjk(260, 40)
+    rewritten = _cjk(50, 41) + "。" + x[60:140] + "。" + _cjk(70, 42)
+    assert tvlink.EDITED_FLOOR <= _contain(rewritten, x) < tvlink.SNAPSHOT_EDITED_FLOOR
+    snap = _snap("s1", "骑了一百公里", x + "\n#骑行")
+    c = _client([_note("n1", "骑了一百公里", x), _note("n2", "另一个号的标题", rewritten)], [snap])
+    out = core.tv_sync(c, TV)
+    links = _links(c)
+    vid = core._snapshot_version_id(P1, snap["text_fp"])
+    assert links["n1"]["version_id"] == vid and links["n2"]["version_id"] == vid, links["n2"]
+    assert links["n2"]["match_kind"] == "edited" and out["snapshots"]["same_night"] == 1
+    assert out["ingest"] is None, "没有补录副本"
+    assert sum(out["counts"].values()) == 2
+    assert "其中对上查重底稿 2" in out["note"]
+
+
+def test_the_repair_night_ignores_a_post_that_w34_found_replaced(monkeypatch):
+    # 前一晚转了一半; 今晚之前运营把这篇帖整篇换成了别的(W-34 挪走了它): 补齐时不能拿换上去的文字记到底稿那一版的指纹下
+    replaced = ("这条帖子被运营整篇换成了另一篇: 讲的是周末去海边露营, 帐篷被风吹跑了两次, "
+                "最后在沙滩上睡了一夜, 第二天早上被涨潮的水泡醒。") * 2
+    notes = [_note("n1", "骑了一百公里", BODY_S)]
+    c, vid = _half_done(monkeypatch, notes, _snap("s1", "骑了一百公里", BODY_S))
+    notes[0]["raw_content"] = f"【标题】海边露营 【正文】{replaced}"
+    out = core.tv_sync(c, TV)
+    assert out["drift"]["replaced"] == 1
+    sketch = tuple(sorted(core.fp.ngram_hashes(tvlink.strip_hashtags(replaced))))
+    assert not [f for f in c.rows["draft_fingerprints"]
+                if f["version_id"] == vid and tuple(sorted(f["ngram_hashes"])) == sketch]
+    assert _links(c)["n1"]["match_kind"] == "ingested", "换上去的那篇照 W-34 的老规矩补录"
 
 
 def test_a_rejected_recheck_after_promotion_is_closed_without_consuming_a_new_card():
