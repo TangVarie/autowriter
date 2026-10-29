@@ -258,6 +258,33 @@ def test_body_identical_revisions_pick_the_title_the_post_kept():
     assert _m(_n("改过的标题写法", body, days=2), [first, retitled]).version.version_id == "s2"
 
 
+def test_exact_snapshots_win_score_ties_whatever_was_checked_first():
+    # 两份分数打平, 先查的那份标题 / 开头和帖不一样: 照样走精确档、认标题一样的那份(复审 on aw#132)
+    body = _cjk(200, 50)
+    first = _v("s1", "第一稿的标题写法", _cjk(12, 51) + "。" + body, 0)       # 开头 / 标题都和帖不一样, 多出来的少
+    second = _v("s2", "帖用的标题写法", _cjk(80, 52) + "。" + body, 1)        # 标题一样, 多出来的多
+    post = _n("帖用的标题写法", body, days=2)
+    assert _contain(body, first.body) == _contain(body, second.body) == 1.0
+    m = _m(post, [first, second])
+    assert m.kind == "title_exact" and m.version.version_id == "s2", m
+
+
+def test_a_revision_scoring_over_the_edited_floor_does_not_skip_the_exact_tier():
+    # 帖留着第一稿的标题和开头(0.37), 改过标题 / 开头的下一稿像到 0.5: 认第一稿(同一篇的前后几稿); 更像的是别的稿子就分不出
+    tail = _cjk(130, 61)
+    rev1 = _O + "。" + _M1 + "。" + _M2 + "。" + _E1
+    rev2 = _O2 + "。" + _M1 + "。" + _M2 + "。" + _Q + "。" + tail
+    post = _O + "。" + _M1 + "。" + _Q + "。" + tail[:60] + "。" + _cjk(60, 62)
+    assert _contain(post, rev1) < tvlink.SNAPSHOT_EDITED_FLOOR <= _contain(post, rev2), (
+        _contain(post, rev1), _contain(post, rev2))
+    s1, s2 = _v("s1", "骑了一百公里", rev1, 0), _v("s2", "百公里之后", rev2, 1)
+    m = _m(_n("骑了一百公里", post, days=3), [s1, s2])
+    assert m.kind == "body_exact" and m.version.version_id == "s1", m
+    other = _v("s3", "别的稿子", _cjk(45, 63) + "。" + _Q + "。" + tail + "。" + _cjk(30, 64), 1)
+    assert not tvlink._same_draft(s1, other, tvlink.VersionIndex([s1, other]))
+    assert _m(_n("骑了一百公里", post, days=3), [s1, other]).kind == "ambiguous"
+
+
 def test_short_posts_are_not_matched():
     assert _m(_n("短", "骑了一百公里", days=1), [_v("s1", "短", "骑了一百公里", 0)]).kind == "unmatched"
 
@@ -756,6 +783,25 @@ def test_a_rewritten_second_post_is_held_when_an_archived_version_is_almost_as_c
     assert links["n1"]["version_id"] == core._snapshot_version_id(P1, snap["text_fp"])
     assert links["n2"]["match_kind"] == "unmatched" and "分不出" in links["n2"]["candidates"][0]["note"], links["n2"]
     assert out["snapshots"]["held_rival"] == 1 and out["ingest"] is None
+
+
+def test_a_rewritten_sibling_of_an_undated_post_waits_with_it():
+    # 原帖还没填发布日期(等着), 同一篇改写给另一个号发的已经有日期: 也等着, 不补录 —— 不然补成副本, 原帖填了日期、底稿转正
+    # 以后也连不回来(复审 on aw#132)
+    x = _cjk(260, 40)
+    rewritten = _cjk(50, 41) + "。" + x[60:140] + "。" + _cjk(70, 42)
+    n1 = _note("n1", "骑了一百公里", x)
+    n1["publish_time"] = None
+    c = _client([n1, _note("n2", "另一个号的标题", rewritten)], [_snap("s1", "骑了一百公里", x)])
+    out = core.tv_sync(c, TV)
+    links = _links(c)
+    assert links["n1"]["match_kind"] == "unmatched" and links["n2"]["match_kind"] == "unmatched", links["n2"]
+    assert "填了日期再对" in links["n2"]["candidates"][-1]["note"]
+    assert out["ingest"] is None and out["snapshots"]["undated"] == 2
+    n1["publish_time"] = _pub(2)
+    core.tv_sync(c, TV)
+    links = _links(c)
+    assert links["n1"]["version_id"] == links["n2"]["version_id"] and links["n2"]["match_kind"] == "edited"
 
 
 def test_an_undated_post_keeps_waiting_past_the_publication_window():

@@ -300,13 +300,15 @@ def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
 # 那是实打实写进库的, 所以比 match_note 严:
 #   · 帖要有发布日期, 底稿要早于帖: 发布那天 − 第一次查重那天(北京日历日)在 0..WINDOW_AFTER_DAYS 天; 晚于发布的不认
 #     (DIFF_REV 2 / 判据 C 的"接住"同一个口径, 认了也算不了改稿差异);
-#   · 开头 / 标题一样也要包含度到 EDITED_FLOOR(match_note 的精确档是不看包含度的); 开头 / 标题都不一样、改得多的那一档
-#     (edited)要到 SNAPSHOT_EDITED_FLOOR —— W-34 判"整篇换了"的线是 0.30, 擦着线转正的对照, 运营在飞书里再改几句就会被
-#     挪走、补录成副本(开头 / 标题一样的, W-34 重对也照样对回这一版);
+#   · 开头 / 标题和帖一样的底稿是一档(精确档, 同 match_note 先看精确档), 只要包含度到 EDITED_FLOOR(match_note 的精确档
+#     不看包含度); 比它更像的底稿得是它的前后几稿, 否则 ambiguous; 只跟同样精确的比远近 —— 只是共用产品话术的别的稿子
+#     不让它变成分不出。开头 / 标题都不一样的那一档(fuzzy / edited)要到 SNAPSHOT_EDITED_FLOOR —— W-34 判"整篇换了"的线是
+#     0.30, 擦着线转正的对照, 运营在飞书里再改几句就会被挪走、补录成副本(开头 / 标题一样的, W-34 重对也照样对回这一版);
 #   · 分不出时, 只在打平的几份是同一篇的前后几稿(互相重合 SNAPSHOT_SAME_DRAFT 以上)才挑一份: 挑和这篇帖两头都最像的
-#     (帖在稿里 + 稿在帖里), 一样像取最晚查的; 打平的里面有别的稿子 → ambiguous, 不硬猜;
+#     (帖在稿里 + 稿在帖里), 一样像取标题 / 开头和帖一样的, 再一样取最晚查的; 打平的里面有别的稿子 → ambiguous, 不硬猜;
 #   · 存过档的版本也算对手(``main``): 主索引说对不上, 可时间窗里有存档版本离最像的底稿不到一个差距(同一个故事写了两版,
-#     一版存了档、一版只查了重) → ambiguous。主索引自己遇到这种也是 ambiguous。
+#     一版存了档、一版只查了重) → ambiguous。主索引自己遇到这种也是 ambiguous。精确档只拿同样精确的存档版本当对手 —— 在
+#     tv-sync 里碰不到(主索引的精确档有它就不会走到这里), 留着防别的调用方。
 SNAPSHOT_SAME_DRAFT = 0.60
 SNAPSHOT_EDITED_FLOOR = 0.45
 
@@ -338,13 +340,15 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
         return Match("unmatched")
     eligible = [v for v in snaps if (lag := snapshot_lag(note, v)) is not None and 0 <= lag
                 and (max_lag is None or lag <= max_lag)]
-    scored = sorted(((index.containment(ng, v), v) for v in eligible), key=lambda t: -t[0])
-    if not scored or scored[0][0] < EDITED_FLOOR:
-        return Match("unmatched")
     pk, tk = prefix_key(note.body), title_key(note.title)
 
     def exact(v: Version) -> bool:
         return bool(pk and pk == prefix_key(v.body) or tk and tk == title_key(v.title))
+
+    # 分数打平的, 精确的排前面(复审 on aw#132): 不然走不走精确档要看哪份先查的重
+    scored = sorted(((index.containment(ng, v), v) for v in eligible), key=lambda t: (-t[0], not exact(t[1])))
+    if not scored or scored[0][0] < EDITED_FLOOR:
+        return Match("unmatched")
 
     def back(v: Version) -> float:                      # 稿在帖里: 一稿比另一稿多出来的那段, 帖里没有就分得开
         g = index.grams_of(v)
@@ -353,8 +357,9 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
     listed = [_cand(note, v, s) for s, v in scored[:5] if s >= EDITED_FLOOR - EDITED_MARGIN]
     ex = [(s, v) for s, v in scored if s >= EDITED_FLOOR and exact(v)]
     best_s, best_v = scored[0]
-    if ex and (exact(best_v) or (best_s < FUZZY_CONTAIN and best_s < SNAPSHOT_EDITED_FLOOR)):
-        # 精确档。分数比它高的(都不精确、都不到 SNAPSHOT_EDITED_FLOOR)得是它的前后几稿, 否则分不出;
+    if ex:
+        # 精确档(复审 on aw#132: 有就走, 不看分数更高的那份到没到 SNAPSHOT_EDITED_FLOOR)。分数比它高的(都不精确)得是它的
+        # 前后几稿, 否则分不出;
         # 同样精确、分数相近的得是同一篇的前后几稿, 否则分不出。存过档的版本只有同样精确的才当对手 —— 只是内容像的
         # 存档版本比不过开头 / 标题一样的底稿(主索引的精确档也不拿它们比)。
         e_s, e_v = ex[0]

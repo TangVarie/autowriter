@@ -7813,6 +7813,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         sindex = tvlink.VersionIndex(svers)
         by_vid = {g["version_id"]: g for g in live}
         hits: dict[str, list[tuple]] = {}
+        held: set[str] = set()                          # 帖还没有发布日期、这晚等着的底稿
         rest: list[tvlink.Note] = []
         for n in to_ingest:
             if n.publish_time is None:
@@ -7823,6 +7824,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                                               max_lag=None)
                 if probe.kind != "unmatched":
                     snap["undated"] += 1
+                    held.update([probe.version.version_id] if probe.version is not None else
+                                [str(c.get("version_id")) for c in probe.candidates or () if c.get("version_id") in by_vid])
                     links.append(_link(n, "unmatched", candidates=w34_note.get(n.note_id, []) + [
                         {"note": "W-38: 按内容对得上查重底稿, 帖还没有发布日期, 没补录, 填了日期再对"}]))
                 else:
@@ -7848,9 +7851,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         # 补录成副本就再也连不上了。所以今晚就按主索引的规矩对一次 —— 对手里带上存过档的版本(只拿今晚这几版比, 会把主索引
         # 判成分不出的硬连上); 对上的跟着这一版一起转正(帖的文字一起记指纹); 分不出的不补录, 明晚主索引重判(codex / 复审
         # on aw#132)。转正只认上面按底稿对上的那几篇: 指纹库那一关把它们都拦下了的, 跟着来的也回去补录。
+        # 这晚等发布日期的那几份底稿也一样对一次: 对上的(同一篇的改写版)也等着, 不补录 —— 不然它补成副本, 等原帖填了日期、
+        # 底稿转正了也连不回来(复审 on aw#132)
         extra: set[str] = set()
-        if hits and rest:
-            tindex = tvlink.VersionIndex([sv for sv in svers if sv.version_id in hits])
+        if (hits or held) and rest:
+            tindex = tvlink.VersionIndex([sv for sv in svers if sv.version_id in hits or sv.version_id in held])
             full: tvlink.VersionIndex | None = None
             still: list[tvlink.Note] = []
             for n in rest:
@@ -7863,6 +7868,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 if m.version is not None and m.version.version_id in hits:
                     hits[m.version.version_id].append((n, m))
                     extra.add(n.note_id)
+                elif m.version is not None and m.version.version_id in held:
+                    snap["undated"] += 1
+                    links.append(_link(n, "unmatched", candidates=w34_note.get(n.note_id, []) + [
+                        {"note": "W-38: 和一篇还没填发布日期、对得上查重底稿的帖是同一篇, 没补录, 那篇填了日期再对"}]))
                 elif m.version is None and m.kind != "ambiguous":
                     still.append(n)
                 else:
