@@ -3650,6 +3650,10 @@ def recompute_fingerprints(client, project_id: str, *, progress=None) -> dict:
     稿子重新 commit 一遍。
 
     幂等: 重复跑是同一个结果(纯函数重算), 只是白写一遍。
+
+    ⚠️ W-38(2026-10-29): 查重底稿转正的版本, 发出去的帖和底稿不一样时有两行指纹(底稿一行、帖的文字一行, 同一个
+    ``version_id``)。这里按版本正文(底稿)重算, 帖那一行的四字串会变成底稿的 —— 重算之后那几篇改过的帖, 新稿照着发出去的
+    文字写时查重会弱一点(开头那一路不受影响)。
     """
     total = recomputed = unrecoverable = 0
     for page in store.fingerprint_pages(client, project_id):
@@ -7401,9 +7405,10 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
         if not done:
             return out
         try:
-            have_fp = store.fingerprinted_versions(client, project_id, [g["version_id"] for g in done])
+            work = [g for g in done if not g.get("mark_only")]
+            have_fp = store.fingerprinted_versions(client, project_id, [g["version_id"] for g in work])
             rows: list[dict] = []
-            for g in (g for g in done if g["version_id"] not in have_fp):
+            for g in (g for g in work if g["version_id"] not in have_fp):
                 rows.append(g)
                 # 帖和底稿只差话题标签的不另记(帖读进来就剥了话题, 底稿原样存)
                 plain = tvlink.strip_hashtags(g["body"])
@@ -7415,8 +7420,8 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
                         rows.append({**g, "title": title, "body": body})
             if rows:
                 out["fingerprinted"] = store.write_fingerprints(client, _snapshot_fp_payload(project_id, owner, rows))
-            consumed = store.angle_consumed_by(client, project_id, [g["version_id"] for g in done])
-            for g in done:
+            consumed = store.angle_consumed_by(client, project_id, [g["version_id"] for g in work])
+            for g in work:
                 # B-20: 版本真建成了才销; 已经销给它的(前一晚半途断了)不再销第二张
                 if g.get("angle_key") and g["version_id"] not in consumed:
                     if store.consume_own_angle(client, project_id, g["angle_key"], g["version_id"],
@@ -7722,9 +7727,19 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     groups = _snapshot_groups(snap_rows)
     snap["pending"] = len(groups)
     # 前一晚建了版本、后几步断了的(同一个 id 已经在对照索引里): 补齐指纹 / 销牌 / 标记。dry-run 不补。
+    # 第二晚这篇帖已经连在那一版上了(对照里有), 帖的文字从那里拿 —— 发出去的文字那一行指纹、底稿记的 note_id 都要补。
+    # 只被打回过的(版本建成之后同样文字又查了一次, 撞了它自己)只记成已转正, 不写指纹、不销牌。
+    linked_to: dict[str, list[str]] = {}
+    for nid, l in existing.items():
+        if l.get("version_id"):
+            linked_to.setdefault(str(l["version_id"]), []).append(nid)
     repair: dict[str, list[dict]] = {}
     for vid, g in groups.items():
         if vid in known:
+            on = sorted(nid for nid in linked_to.get(vid, ()) if nid in notes_by_id)
+            g["notes"] = [(notes_by_id[nid].title, notes_by_id[nid].body) for nid in on]
+            g["note_id"] = on[0] if on else None
+            g["mark_only"] = not g["ok"]
             repair.setdefault(g["project_id"], []).append(g)
     if repair and not dry_run:
         for pid, gs in repair.items():
@@ -7767,14 +7782,20 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             hits.setdefault(m.version.version_id, []).append((n, m))
         # 帖的文字已经在指纹库里了(多半是以前补录的副本, 补录每晚跳过它、记 unmatched): 不拿底稿把一篇早就公开的帖转成写作台
         # 的稿(W-38 复审) —— 照旧走补录那条路(它会跳过、记 unmatched)
+        guard_error = None
         if hits:
             hit_notes = [n for pairs in hits.values() for n, _ in pairs]
             oh = [fp.opening_hash(n.body) for n in hit_notes]
             known_fp: dict[str, set] = {}
-            for pid in pids:
-                for h, sks in store.existing_fingerprint_sketches(client, pid, [h for h in oh if h]).items():
-                    known_fp.setdefault(h, set()).update(sks)
-            for vid in list(hits):
+            try:
+                for pid in pids:
+                    for h, sks in store.existing_fingerprint_sketches(client, pid, [h for h in oh if h]).items():
+                        known_fp.setdefault(h, set()).update(sks)
+            except Exception as exc:                    # noqa: BLE001 — 核不了就这晚不转正、也不补录, 明晚再对
+                logger.exception("tv_sync: 转正前查指纹库失败 (tv=%s)", tv_project_id)
+                guard_error = f"{type(exc).__name__}: {exc}"[:200]
+                snap["error"] = snap["error"] or f"转正前查指纹库: {guard_error}"
+            for vid in (list(hits) if guard_error is None else ()):
                 keep = []
                 for n, m in hits[vid]:
                     h = fp.opening_hash(n.body)
@@ -7796,6 +7817,9 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         made: dict[str, str | None] = {}               # 建成的 version_id → item_id
         failed: dict[str, str] = {}                    # 没建成的 version_id → 原因
         for pid, gs in by_project.items():
+            if guard_error is not None:
+                failed.update({g["version_id"]: f"查指纹库失败: {guard_error}" for g in gs})
+                continue
             if dry_run:
                 made.update({g["version_id"]: None for g in gs})
                 continue

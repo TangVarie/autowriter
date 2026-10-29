@@ -233,7 +233,7 @@ _STATE_MARK = {
 
 # W-22: 超线项目的原因标签(core.pipeline_leak 给的)。/health 只给总数, 哪个项目是哪种只在这里看得到。
 _LEAK_CAUSE = {
-    "delivered_without_commit": "← 稿子进了飞书但没走 commit, 坐标没销账",
+    "delivered_without_commit": "← 同期有飞书同步回来的补录副本(发出去的帖没对回写作台)",
     "not_delivered": "← 飞书里也没同步回来",
     "unknown": "← 原因查不到(补录副本数读失败)",
 }
@@ -259,8 +259,8 @@ def _print_leak(core, sb) -> None:
               f"没入库 {prj['leak_pct']:3d}%{tail}")
     if not leak["ok"]:
         print(f"\n  ⚠️ {leak['note']}")
-        print("     没入库的稿子没有指纹, 下一批查重看不见它们。已经发出去的用"
-              " `ingest --xlsx` 补; 正在发生的去看那个会话为什么在 commit 前停了。")
+        print("     只作参考: 牌在存档、或发出去以后被 tv-sync 从查重底稿对回来时才销(W-38), 没写的、写了没发的本来就不销。"
+              "发出去的帖 tv-sync 每晚会自己对回来或补录 —— 别手动 `ingest --xlsx` 补(补成副本就再也认不回写作台的稿)。")
 
 
 def _ingest(core, sb, args) -> int:

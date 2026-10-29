@@ -491,6 +491,55 @@ def test_a_link_stored_as_minus_one_by_the_old_utc_lag_is_repaired():
     assert any(d["note_id"] == "n1" for d in c.rows.get("tv_edit_diffs", []))
 
 
+def test_a_failed_fingerprint_lookup_holds_promotion_without_failing_the_night(monkeypatch):
+    # 转正前查指纹库失败: 不能让整个 TV 项目这晚失败(对照一行都不写), 也不能补录 —— 记 unmatched, 明晚再对
+    monkeypatch.setattr(store, "existing_fingerprint_sketches",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("statement timeout")))
+    c = _client([_note("n1", "骑了一百公里", BODY_S), _note("n2", "秋招投了六十份", BODY_A)],
+                [_snap("s1", "骑了一百公里", BODY_S)])
+    out = core.tv_sync(c, TV)
+    links = _links(c)
+    assert links["n2"]["version_id"] == "v1", "别的对照照常写"
+    assert links["n1"]["match_kind"] == "unmatched" and "明晚再试" in links["n1"]["candidates"][-1]["note"]
+    assert out["snapshots"]["error"] and out["snapshots"]["promoted"] == 0 and out["ingest"] is None
+
+
+def test_the_repair_night_also_records_the_published_text_and_the_note(monkeypatch):
+    published = BODY_S + "后来我又补了一根盐丸, 才没抽筋。"
+    snap = _snap("s1", "骑了一百公里", BODY_S)
+    c = _client([_note("n1", "骑了一百公里", published)], [snap])
+    monkeypatch.setattr(store, "write_fingerprints", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    core.tv_sync(c, TV)
+    monkeypatch.undo()
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    vid = core._snapshot_version_id(P1, snap["text_fp"])
+    item = next(i for i in c.rows["items"] if i["id"] == _links(c)["n1"]["item_id"])
+    ver = next(v for v in c.rows["versions"] if v["id"] == vid)
+    item.update(best_version_id=vid, versions=[dict(ver)], batches={"project_id": P1, "params": {"source": "deskcore"}})
+    ver["items"] = {"id": item["id"], "batches": {"project_id": P1}}
+    out = core.tv_sync(c, TV)
+    assert out["snapshots"]["repaired"] == 1 and out["snapshots"]["fingerprinted"] == 2, out["snapshots"]
+    assert c.rows["draft_snapshots"][0]["note_id"] == "n1"
+
+
+def test_a_rejected_recheck_after_promotion_is_closed_without_consuming_a_new_card():
+    # 转正之后同样文字又查了一次(撞了它自己, reject), 带的是一张新牌: 只记成已转正, 不拿新牌销给旧版本
+    snap = _snap("s1", "骑了一百公里", BODY_S, key=None)
+    c = _client([_note("n1", "骑了一百公里", BODY_S)], [snap])
+    core.tv_sync(c, TV)
+    vid = core._snapshot_version_id(P1, snap["text_fp"])
+    item = next(i for i in c.rows["items"] if i["id"] == _links(c)["n1"]["item_id"])
+    ver = next(v for v in c.rows["versions"] if v["id"] == vid)
+    item.update(best_version_id=vid, versions=[dict(ver)], batches={"project_id": P1, "params": {"source": "deskcore"}})
+    ver["items"] = {"id": item["id"], "batches": {"project_id": P1}}
+    c.rows["angle_ledger"].append({"id": "a2", "project_id": P1, "angle_key": KEY2, "dims": {}, "drawn_by": WRITER,
+                                   "drawn_at": _iso(2), "consumed_version_id": None, "consumed_at": None})
+    c.rows["draft_snapshots"].append(_snap("s2", "骑了一百公里", BODY_S, key=KEY2, days=3, status="reject"))
+    core.tv_sync(c, TV)
+    assert next(r for r in c.rows["angle_ledger"] if r["id"] == "a2")["consumed_version_id"] is None
+    assert next(r for r in c.rows["draft_snapshots"] if r["id"] == "s2")["promoted_at"]
+
+
 def test_cli_prunes_old_snapshots_once_per_run(monkeypatch, capsys):
     old = dict(_snap("s0", "旧稿", BODY_A), checked_at=store.iso_ago(core.SNAPSHOT_RETAIN_DAYS + 1))
     fresh = dict(_snap("s1", "新稿", BODY_OTHER), checked_at=store.iso_now())
@@ -564,6 +613,35 @@ def test_archiving_a_checked_draft_closes_its_snapshot(monkeypatch):
                      for flag in (True, False))
     assert [r["title"] for r in done] == [BODIES[0][0]] and done[0]["version_id"]
     assert [r["title"] for r in pending] == [BODIES[1][0]], "没存档的那篇照旧等飞书"
+
+
+def test_a_failed_archive_does_not_close_the_snapshot(monkeypatch):
+    # 版本没建成(mint 半途失败)就不能把底稿记成已转正: 那个 version_id 不存在, 底稿再也转不了正
+    from tests.test_e2e_protocol_flow import BODIES
+    c = _desk({"angle_ledger": [], "batches": [], "items": [], "versions": []})
+    drafts = [{"title": t, "body": b} for t, b in BODIES[:1]]
+    core.check_drafts(c, P1, drafts, user_id=WRITER, record_snapshot=True)
+    monkeypatch.setattr(store, "mint_draft_identity",
+                        lambda *a, **k: {"batch_id": None, "versions": {}, "error": "RuntimeError: db down"})
+    core.commit_drafts(c, P1, drafts, user_id=WRITER)
+    assert all(r.get("promoted_at") is None for r in c.rows["draft_snapshots"])
+
+
+def test_the_brief_skips_checked_cards_but_commit_and_archive_pending_do_not(monkeypatch):
+    seen = []
+    real = store.angle_debt
+
+    def spy(*a, **k):
+        seen.append(k.get("exclude_keys"))
+        return real(*a, **k)
+    monkeypatch.setattr(store, "angle_debt", spy)
+    monkeypatch.setattr(core, "_checked_angle_keys", lambda *a, **k: {KEY})
+    from tests.test_deskcore_angle_debt import _client as debt_client, ME as DME, PID as DPID
+    core.build_writing_brief(debt_client([]), DPID, user_id=DME)
+    assert seen and seen[-1] == {KEY}, "简报按查重时带过的牌排除"
+    seen.clear()
+    core.archive_pending(debt_client([]), DPID, user_id=DME)
+    assert seen == [None], "archive_pending 不排除: 刚查过的正该存档"
 
 
 def test_checked_angle_keys_fail_open(monkeypatch):
