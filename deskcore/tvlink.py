@@ -206,6 +206,14 @@ class VersionIndex:
             if tk:
                 self.by_title.setdefault(tk, []).append(v)
 
+    @classmethod
+    def merged(cls, *indexes: "VersionIndex") -> "VersionIndex":
+        """几个索引合成一个, 四字串缓存一并带上(不重算)。"""
+        out = cls(v for ix in indexes for v in ix.versions)
+        for ix in indexes:
+            out._grams.update(ix._grams)
+        return out
+
     def grams_of(self, v: Version) -> set[str]:
         g = self._grams.get(v.version_id)
         if g is None:
@@ -316,10 +324,11 @@ def _same_draft(a: Version, b: Version, index: VersionIndex, other: VersionIndex
 
 
 def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
-                   main: VersionIndex | None = None) -> Match:
+                   main: VersionIndex | None = None, *, max_lag: int | None = WINDOW_AFTER_DAYS) -> Match:
     """这篇帖是不是从哪份底稿发出去的。``snaps`` 每份一个 Version(created_at = 第一次查重的时刻), ``index`` 是它们自己的
     VersionIndex(只用来缓存四字串); ``main`` 是存过档的版本的索引(对手, 见上)。回 body_exact / title_exact / fuzzy /
-    edited(带那份底稿)、ambiguous(候选里是底稿的 id)或 unmatched。
+    edited(带那份底稿)、ambiguous(候选里是底稿的 id)或 unmatched。``max_lag=None``: 不卡发布晚了多少天(给还没有发布日期的
+    帖试对内容用 —— 拿今天当发布日期, 等得久了会被 30 天的窗口挡掉, 而它该等到底稿过期为止, codex on aw#132)。
 
     开头 / 标题和帖一样的底稿是一档(同 match_note 的精确档, codex / 复审 on aw#132): 只要 EDITED_FLOOR, 只跟同样开头 /
     标题一样的比 —— 包含度最高的那份不一样、而一样的那份分数低一点(同一篇改过标题 / 开头的前后几稿), 照样认一样的那份;
@@ -327,7 +336,8 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
     ng = grams(note.body)
     if len(ng) < FUZZY_MIN_GRAMS:
         return Match("unmatched")
-    eligible = [v for v in snaps if (lag := snapshot_lag(note, v)) is not None and 0 <= lag <= WINDOW_AFTER_DAYS]
+    eligible = [v for v in snaps if (lag := snapshot_lag(note, v)) is not None and 0 <= lag
+                and (max_lag is None or lag <= max_lag)]
     scored = sorted(((index.containment(ng, v), v) for v in eligible), key=lambda t: -t[0])
     if not scored or scored[0][0] < EDITED_FLOOR:
         return Match("unmatched")

@@ -7733,7 +7733,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     # ── W-38: 对不上写作台版本的帖, 再拿查重时记下的底稿对一次(补录之前 —— 补录是终态, 补成副本就再也不重对) ──
     snap: dict = {"pending": 0, "matched_notes": 0, "promoted": 0, "minted": 0, "repaired": 0, "fingerprinted": 0,
                   "angles_consumed": 0, "ambiguous": 0, "already_fingerprinted": 0, "held": 0, "failed_notes": 0,
-                  "waiting_post": 0, "superseded": 0, "undated": 0, "same_night": 0,
+                  "waiting_post": 0, "superseded": 0, "undated": 0, "same_night": 0, "held_rival": 0,
                   "applied": True, "error": None, "samples": []}
     pids = [m["project_id"] for m in maps]
     try:
@@ -7805,7 +7805,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 # 飞书里还没填发布日期就被 TV 读进来了(10-29 生产库近 14 天 413 篇里 17 篇): 底稿要按发布日期定先后, 这晚
                 # 定不了 —— 按内容对得上底稿的先不补录(补录是终态, 日期填上以后就再也认不回), 记 unmatched 等日期; 对不上
                 # 的照旧补录。等的上限同分不出的: 底稿过了 SNAPSHOT_MAX_AGE_DAYS 就不再参与(复审 on aw#132)
-                probe = tvlink.match_snapshot(dataclasses.replace(n, publish_time=tvlink._as_dt(now)), svers, sindex, index)
+                probe = tvlink.match_snapshot(dataclasses.replace(n, publish_time=tvlink._as_dt(now)), svers, sindex, index,
+                                              max_lag=None)
                 if probe.kind != "unmatched":
                     snap["undated"] += 1
                     links.append(_link(n, "unmatched", candidates=w34_note.get(n.note_id, []) + [
@@ -7829,6 +7830,32 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 rest.append(n)                          # 对不上: 照旧补录(或 W-10 只记 unmatched)
                 continue
             hits.setdefault(m.version.version_id, []).append((n, m))
+        # 同一篇改写给另一个号发的(开头 / 标题都换了, 包含度不到底稿那一档的线): 明晚主索引会把它连上今晚转正的那一版, 今晚
+        # 补录成副本就再也连不上了。所以今晚就按主索引的规矩对一次 —— 对手里带上存过档的版本(只拿今晚这几版比, 会把主索引
+        # 判成分不出的硬连上); 对上的跟着这一版一起转正(帖的文字一起记指纹); 分不出的不补录, 明晚主索引重判(codex / 复审
+        # on aw#132)。转正只认上面按底稿对上的那几篇: 指纹库那一关把它们都拦下了的, 跟着来的也回去补录。
+        extra: set[str] = set()
+        if hits and rest:
+            tindex = tvlink.VersionIndex([sv for sv in svers if sv.version_id in hits])
+            full: tvlink.VersionIndex | None = None
+            still: list[tvlink.Note] = []
+            for n in rest:
+                m = tvlink.match_note(n, tindex) if n.body else tvlink.Match("unmatched")
+                if m.version is None and m.kind != "ambiguous":
+                    still.append(n)
+                    continue
+                full = full or tvlink.VersionIndex.merged(index, tindex)
+                m = tvlink.match_note(n, full)
+                if m.version is not None and m.version.version_id in hits:
+                    hits[m.version.version_id].append((n, m))
+                    extra.add(n.note_id)
+                elif m.version is None and m.kind != "ambiguous":
+                    still.append(n)
+                else:
+                    snap["held_rival"] += 1
+                    links.append(_link(n, "unmatched", candidates=w34_note.get(n.note_id, []) + [
+                        {"note": "W-38: 和今晚转正的底稿、存过档的版本分不出, 没补录, 明晚再对"}] + list(m.candidates or [])))
+            rest = still
         # 帖的文字已经在指纹库里了(多半是以前补录的副本, 补录每晚跳过它、记 unmatched): 不拿底稿把一篇早就公开的帖转成写作台
         # 的稿(W-38 复审) —— 照旧走补录那条路(它会跳过、记 unmatched)
         guard_error = None
@@ -7853,9 +7880,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                         rest.append(n)
                     else:
                         keep.append((n, m))
-                if keep:
+                if any(n.note_id not in extra for n, _ in keep):
                     hits[vid] = keep
                 else:
+                    rest.extend(n for n, _ in keep)
                     del hits[vid]
         by_project: dict[str, list[dict]] = {}
         for vid, pairs in hits.items():
@@ -7905,6 +7933,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                         {"note": f"W-38: 对上了查重底稿, 但这晚没转成版本({failed.get(vid, '')[:80]}), 没补录, 明晚再试"}]))
                     continue
                 snap["matched_notes"] += 1
+                snap["same_night"] += n.note_id in extra
                 counts["unmatched"] -= 1                # _apply 记过一次 unmatched; counts 加起来仍等于笔记数
                 counts[m.kind] += 1
                 links.append(_link(n, m.kind, project_id=g["project_id"], version_id=vid, item_id=made[vid],
@@ -7915,30 +7944,6 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                     snap["samples"].append({"note_id": n.note_id, "kind": m.kind, "score": round(m.score or 0, 3),
                                             "lag_days": m.lag_days, "version_id": vid,
                                             "angle_key": bool(g.get("angle_key"))})
-        # 今晚刚转正的那几版, 剩下的帖再按主索引的规矩对一次(复审 on aw#132): 同一篇改写给另一个号发的(开头 / 标题都换了、
-        # 包含度不到底稿那一档的线), 明晚主索引就会把它连上这一版 —— 今晚补录成副本就再也连不上了。
-        tonight = [known[vid] for vid in made if vid in known]
-        if tonight and rest:
-            tindex = tvlink.VersionIndex(tonight)
-            still: list[tvlink.Note] = []
-            for n in rest:
-                m = tvlink.match_note(n, tindex) if n.body else tvlink.Match("unmatched")
-                if m.version is not None:
-                    vid = m.version.version_id
-                    snap["same_night"] += 1
-                    counts["unmatched"] -= 1
-                    counts[m.kind] += 1
-                    links.append(_link(n, m.kind, project_id=m.version.project_id, version_id=vid, item_id=made[vid],
-                                       score=m.score, lag=m.lag_days,
-                                       candidates=w34_note.get(n.note_id, []) + [{"note": SNAPSHOT_NOTE}]
-                                       + list(m.candidates or [])))
-                elif m.kind == "ambiguous":
-                    snap["ambiguous"] += 1      # 和今晚转正的几版分不出: 不补录, 明晚主索引重判
-                    links.append(_link(n, "unmatched", candidates=w34_note.get(n.note_id, []) + [
-                        {"note": "W-38: 和今晚刚转正的几版分不出, 没补录, 明晚再对"}] + list(m.candidates or [])))
-                else:
-                    still.append(n)
-            rest = still
         to_ingest = rest
 
     ingest: dict | None = None
@@ -8089,8 +8094,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
                  f"{counts['fuzzy']} / 改过 {counts['edited']}"
-                 + (f"; 其中对上查重底稿 {snap['matched_notes'] + snap['same_night']}"
-                    if snap["matched_notes"] or snap["same_night"] else "")
+                 + (f"; 其中对上查重底稿 {snap['matched_notes']}" if snap["matched_notes"] else "")
                  + f"), 分不出 {counts['ambiguous']}, 对不上 {counts['unmatched']}"
                  + (f", 没正文 {counts['no_body']}" if counts["no_body"] else "")
                  + (f"; 正文整篇换了 {drift['replaced']}(挪了 {drift['relinked']})" if drift["replaced"] else "")

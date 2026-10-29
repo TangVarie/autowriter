@@ -732,6 +732,40 @@ def test_a_rewritten_second_post_the_same_night_links_to_the_version_promoted_to
     assert out["ingest"] is None, "没有补录副本"
     assert sum(out["counts"].values()) == 2
     assert "其中对上查重底稿 2" in out["note"]
+    # 改写过的那篇的文字跟着这一版一起记了指纹(codex on aw#132): 以后的查重看得见它的新开头
+    oh = core.fp.opening_hash(tvlink.strip_hashtags(rewritten))
+    assert any(f["version_id"] == vid and f["opening_hash"] == oh for f in c.rows["draft_fingerprints"])
+
+
+def test_a_rewritten_second_post_is_held_when_an_archived_version_is_almost_as_close():
+    # 同一晚对今晚转正的版本时, 存过档的版本也是对手(codex on aw#132): 主索引两样都在的时候会判分不出, 不能只拿今晚这几版比
+    # 就硬连上; 分不出的不补录, 明晚主索引重判
+    x = _cjk(260, 40)
+    tail = _cjk(70, 42)
+    rewritten = _cjk(50, 41) + "。" + x[60:140] + "。" + tail
+    archived = _cjk(100, 43) + "。" + tail[:58]
+    assert tvlink.EDITED_FLOOR <= _contain(rewritten, x) < tvlink.SNAPSHOT_EDITED_FLOOR
+    assert 0.2 < _contain(rewritten, archived) < tvlink.EDITED_FLOOR
+    assert _contain(rewritten, x) - _contain(rewritten, archived) < tvlink.EDITED_MARGIN
+    snap = _snap("s1", "骑了一百公里", x)
+    c = _client([_note("n1", "骑了一百公里", x), _note("n2", "另一个号的标题", rewritten)], [snap])
+    for v in [c.rows["versions"][0], c.rows["items"][0]["versions"][0]]:
+        v.update(title="别的稿子", body=archived)
+    out = core.tv_sync(c, TV)
+    links = _links(c)
+    assert links["n1"]["version_id"] == core._snapshot_version_id(P1, snap["text_fp"])
+    assert links["n2"]["match_kind"] == "unmatched" and "分不出" in links["n2"]["candidates"][0]["note"], links["n2"]
+    assert out["snapshots"]["held_rival"] == 1 and out["ingest"] is None
+
+
+def test_an_undated_post_keeps_waiting_past_the_publication_window():
+    # 还没填发布日期的帖试对内容时不卡 30 天的窗口(拿今天当发布日期, 等得久了会被它挡掉): 一直等到底稿过期(codex on aw#132)
+    row = _note("n1", "骑了一百公里", BODY_S, days=1)
+    row["publish_time"] = None
+    snap = _snap("s1", "骑了一百公里", BODY_S, days=-25)         # 离今天 30 多天, 还在 45 天里
+    c = _client([row], [snap])
+    out = core.tv_sync(c, TV)
+    assert _links(c)["n1"]["match_kind"] == "unmatched" and out["snapshots"]["undated"] == 1, out["snapshots"]
 
 
 def test_the_repair_night_ignores_a_post_that_w34_found_replaced(monkeypatch):
