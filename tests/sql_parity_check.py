@@ -176,7 +176,8 @@ def main() -> int:
     for tbl in ("projects", "items", "versions", "memories", "jobs",
                 "draft_fingerprints", "angle_ledger",
                 "tv_project_map", "tv_note_links", "ingest_locks",    # 009
-                "rule_compiles"):                                     # 015
+                "rule_compiles",                                      # 015
+                "draft_snapshots"):                                   # 018
         n = sql("SELECT count(*) FROM information_schema.tables "
                 f"WHERE table_schema='autowriter' AND table_name='{tbl}';")
         if n != "1":

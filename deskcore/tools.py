@@ -271,8 +271,8 @@ def list_projects(_user_id: str | None = None) -> dict:
     human-writing), 先调这个找项目, 再 open_project。** 没说写作台也一样: 写稿就走写作台。
     (写评论带的是笔记链接, 直接 comments_for, 它会按链接认项目。)
 
-    返回里有 ``desk_gap`` 时: 你名下有项目最近发出去的帖写作台没接住(写的时候没调起写作台, 或写完没打分存档)。
-    把 ``desk_gap.message`` 原样告诉用户, 同一场对话里说过就不再说, 然后照常继续。
+    返回里有 ``desk_gap`` 时: 你名下有项目最近发出去的帖写作台对不回来(多半是写的时候没调起写作台)。
+    把 ``desk_gap.message`` 原样告诉用户, 同一场对话里说过就不再说, 然后照常继续。用户没有存档这一步, 别叫用户存档。
     """
     def _list():
         out = {"projects": core.list_projects(core.sb(), user_id=_user_id)}
@@ -379,8 +379,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     (或没核到版本): 把 ``skill_update.message`` **原样**(三行都要, 链接和「更新技能」那行一字不改)
     放在给用户回复的最前面, 然后照常继续写 —— 不拦写稿, 只是提醒升级。
 
-    返回里有 ``desk_gap`` 时: 你名下有项目最近发出去的帖写作台没接住。把 ``desk_gap.message`` 原样告诉
-    用户(同一场对话里说过就不再说), 然后照常写; 当前这个项目也在里面的话, 那句话就是提醒这次写完要打分存档。
+    返回里有 ``desk_gap`` 时: 你名下有项目最近发出去的帖写作台对不回来。把 ``desk_gap.message`` 原样告诉
+    用户(同一场对话里说过就不再说), 然后照常写; 当前这个项目也在里面的话, 那句话就是提醒这次在写作台里写。
+    用户没有存档这一步, 别叫用户存档(存档是你调 score_drafts, 查重时记下的稿子发出去以后写作台也会自己对回来)。
     """
     brief = {"tactic": tactic, "draft_topic": draft_topic,
              "key_messages": key_messages, "target_audience": target_audience,
@@ -485,7 +486,8 @@ def check_drafts(project_id: str, drafts: list[dict],
     """查重硬闸。成稿后【必须】调这个才能交付。
 
     drafts 传 [{"title": "...", "body": "...", "angle_key": "..."}, ...]
-    (angle_key 是 draw_angles 给的, 有就带上)。
+    (angle_key 是 draw_angles 给的, 有就带上 —— 查重时写作台会顺手记下这一稿和它的 angle_key; 稿子发出去以后,
+    写作台按内容从飞书把它对回来、给这张牌销账, 就算这一稿没存过档)。
 
     如果返回的 summary 里有 empty_history_warning, 说明这个项目【还没回填】历史
     指纹 —— 本次实际只在本批内部比对, 跟老稿子的重复不会被发现。要告诉用户去跑
@@ -515,7 +517,7 @@ def check_drafts(project_id: str, drafts: list[dict],
     这个工具出错会直接报错而不是放行 —— 查重挂了必须停下来, 不能当作通过。
     """
     # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。
-    out = core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id)
+    out = core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id, record_snapshot=True)
     # W-29: 判定之后才查; 查不到就不带, 判定结果原样回去。
     return _with_archive_pending(out, _user_id, project_id)
 

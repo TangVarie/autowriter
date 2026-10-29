@@ -52,6 +52,8 @@ _TABLES = {
     "tv_edit_digest_acks": [],
     # 015 的规则编译缓存
     "rule_compiles": [],
+    # 018 的查重底稿(W-38)
+    "draft_snapshots": [],
     "items": [{"id": PID, "updated_at": "2026-08-26T00:00:00Z",
                "decision_source": None, "reviewer_id": None, "decided_at": None,
                # 012 的两列

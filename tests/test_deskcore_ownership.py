@@ -156,7 +156,7 @@ def test_every_project_scoped_entrypoint_calls_the_gate():
 UNGATED_WITH_REASON = {
     "flywheel_arm": "纯函数: 对 (project_id, user_id, 北京日期) 取哈希定飞轮臂, 不读写库; 调用方 borrow_lessons / build_writing_brief / commit_drafts 都已过归属闸",
     "_borrow_arm": "借卡时定臂并记进进程内存 (不读写库), 只被 _borrow_for_brief 调, 其调用方 borrow_lessons / build_writing_brief 已过归属闸",
-    "batch_arm": "入库时取借卡那次的臂 (进程内存, 不读写库), 只被 commit_drafts 调, 它已过归属闸",
+    "batch_arm": "入库时取借卡那次的臂 (进程内存, 不读写库), 只被 commit_drafts 和 _record_snapshots (W-38, check_drafts 过了闸之后) 调",
     "_reported_arm_check": "W-31 复审: 模型传回的臂对不对得上进程内存里服务端发过的 (不读写库), 只被 batch_arm / _borrow_arm 调",
     "_arm_maybe_issued_before_restart": "W-31 复审: 纯函数, 按 flywheel_arm 的哈希看传回的臂是不是进程起来之前那一段的臂, "
                                         "不读写库; 只被 _reported_arm_check 调",
@@ -217,6 +217,16 @@ UNGATED_WITH_REASON = {
                               "本项目没有、形状对的再查 drawn_by = 调用者自己在别的项目抽过没有(别人的牌不看)",
     "_note_angle_key_misses": "W-31(10-27), 只被已过闸的 commit_drafts 调: 把 key 对不上的篇数记进进程内存, 不读写库",
     "_recent_angle_key_misses": "W-31(10-27), 只被 archive_pending 调(见上): 读进程内存里调用者自己的那一笔, 不读写库",
+    "_record_snapshots":      "W-38(10-29), 只被 check_drafts 在过了归属闸、判定算完之后调: 把这次查重的稿子记进 draft_snapshots"
+                              "(本项目、调用者自己), 失败只记 WARN",
+    "_checked_angle_keys":    "W-38(10-29), 只被已过闸的 build_writing_brief 调: 读调用者自己在本项目查重时带过的 "
+                              "angle_key(draft_snapshots), 不写库",
+    "_supersede_snapshots":   "W-38 复审(10-29), 只被已过闸的 commit_drafts 调: 把它刚存成版本的那几篇, 本项目里同样文字的底稿"
+                              "记成已转正, 失败只记 WARN",
+    "_snapshot_version_id":   "W-38(10-29), 纯函数: (项目, text_fp) → 转正版本的 uuid5, 不读写库",
+    "_snapshot_fp_payload":   "W-38(10-29), 纯函数: 拼转正版本的指纹行(只调 embedding), 不读写库",
+    "_promote_snapshot_groups": "W-38(10-29), 系统任务, 只被 tv_sync 调: tv_sync 开头 _tv_owner 已对每个映射的写作台项目过了"
+                                "归属闸(以项目 owner 的身份, 同补录), 这里只写那几个项目里的底稿转成的版本",
 }
 
 

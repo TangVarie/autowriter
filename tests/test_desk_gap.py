@@ -92,7 +92,9 @@ def test_the_tuge_shape_is_reported():
     (p,) = gap["projects"]
     assert (p["project"], p["published"], p["caught"]) == ("途鸽", 22, 0), "ambiguous / 排期未发的不算"
     assert "「途鸽」最近 7 天发出去 22 篇" in gap["message"] and "打开途鸽" in gap["message"]
-    assert "没调起写作台" in gap["message"]
+    # W-38(10-29, owner): 写手没有「存档」这一步 —— 提醒只叫写手在连着写作台的对话里写, 不叫打分 / 存档
+    assert "连着写作台的对话里写" in gap["message"] and "写作台会自己对回来" in gap["message"]
+    assert "存档" not in gap["message"] and "打分" not in gap["message"], gap["message"]
     assert "project_ids" not in p, "给模型看的不带内部 id 列表"
     assert gap["task"] == core.DESK_GAP_TASK
 

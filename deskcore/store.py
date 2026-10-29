@@ -680,8 +680,13 @@ def item_owner(sb, item_id: str) -> str | None:
 # (codex review on #86: 只报个数的话, 新开一场对话根本不知道是哪几个)。
 ANGLE_DEBT_SAMPLE = 12
 
+# 排除的 key 太多时 URL 会很长(not.in 拼在查询串里): 一个人一周查重带过的牌远到不了这个数, 到了就只排除其中这么多个
+ANGLE_DEBT_EXCLUDE_MAX = 200
+
+
 def angle_debt(sb, project_id: str, user_id: str | None, days: int,
-               *, sample: int = ANGLE_DEBT_SAMPLE, oldest_first: bool = False) -> dict:
+               *, sample: int = ANGLE_DEBT_SAMPLE, oldest_first: bool = False,
+               exclude_keys=None) -> dict:
     """这个人在这个项目里, 近 ``days`` 天抽了没写的角度: 个数 + 具体是哪几个。
 
     给 build_writing_brief 在每场对话开头回显用(D-071)。发牌台账上"抽了没销账"
@@ -705,6 +710,9 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     多回一个 ``oldest_drawn_at`` = 还挂着的牌里最早那张是哪会儿抽的; 这时 ``last_drawn_at`` 不填(取回来的是最早的
     几行, 最近一次是哪会儿这一次不知道), ``angles`` 是最早的那几个。默认(从晚到早)的返回形状一个键都不变 ——
     简报原样回显它。
+
+    ``exclude_keys`` (W-38, 2026-10-29): 这些 angle_key 不算(查重时带过的牌 —— 稿子写出来了, 发出去以后 tv-sync 从飞书
+    对回来销账; 再报"抽了没写"会让模型按同一张牌再写一篇)。最多排除 ANGLE_DEBT_EXCLUDE_MAX 个。
     """
     out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None, "angles": []}
     if oldest_first:
@@ -714,13 +722,16 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
 
     # 一次请求拿两样: count='exact' 是**分页之前**算的(PostgREST 如此, 假件也钉着
     # 这一点), 所以 range 只影响回几行、不影响这个数。同 store.fingerprint_stats。
+    skip = sorted(k for k in (exclude_keys or ()) if k)[:ANGLE_DEBT_EXCLUDE_MAX]
     try:
-        res = (sb.table("angle_ledger").select("angle_key, dims, drawn_at", count="exact")
-                 .eq("project_id", project_id).eq("drawn_by", user_id)
-                 .is_("consumed_version_id", "null")
-                 .gte("drawn_at", iso_ago(days))
-                 .order("drawn_at", desc=not oldest_first)
-                 .range(0, max(sample, 1) - 1).execute())
+        q = (sb.table("angle_ledger").select("angle_key, dims, drawn_at", count="exact")
+               .eq("project_id", project_id).eq("drawn_by", user_id)
+               .is_("consumed_version_id", "null")
+               .gte("drawn_at", iso_ago(days)))
+        if skip:
+            q = q.not_.in_("angle_key", skip)
+        res = (q.order("drawn_at", desc=not oldest_first)
+                .range(0, max(sample, 1) - 1).execute())
     except Exception:
         logger.exception("read angle debt failed (project=%s)", project_id)
         return out
@@ -1647,10 +1658,14 @@ def _mint_entries(sb, batch_id: str, user_id: str, entries: list[dict],
     建成的那部分。
     """
     for e in entries:
+        # created_at 只有 tv-sync 把查重底稿转成版本时带(W-38): 记那篇稿第一次查重的时刻, 不是转正这一刻 —— 对照的
+        # lag_days、改稿差异(lag < 0 不算)和以后的重对都按它判; 不带就是库的默认 now()。
+        when = {"created_at": e["created_at"]} if e.get("created_at") else {}
         item = (sb.table("items").insert({
             "batch_id": batch_id,
             "user_id": user_id,
             "status": DESKCORE_ITEM_STATUS,
+            **when,
         }).execute().data or [{}])[0]
         item_id = item.get("id")
         if not item_id:
@@ -1679,6 +1694,7 @@ def _mint_entries(sb, batch_id: str, user_id: str, entries: list[dict],
                 "title": e.get("title") or "",
                 "body": e.get("body") or "",
                 "keywords": e.get("keywords") or [],
+                **when,
             }).execute()
 
             # best_version_id 指向唯一那一版 —— 导出和"挑代表版本"都按它取。
@@ -2263,6 +2279,142 @@ def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
         "meta": meta or {},
         "injection": {},
     }).execute()
+
+
+# ── 查重时记下的底稿(migrations/018, W-38) ─────────────────────────────────────
+SNAPSHOT_COLS = ("id, project_id, user_id, check_id, title, body, angle_key, text_fp, status, "
+                 "flywheel_arm, flywheel_arm_source, checked_at")
+
+
+def snapshots_table_missing(exc: Exception) -> bool:
+    """018 没跑(``PGRST205`` 点名 draft_snapshots)。只认这张表 —— 别的缺表 / 权限 / 连接错误照旧当故障(同 W-37 的
+    tv_long_vanished_note_ids; schema_object_missing 只给 doctor 用)。"""
+    return "pgrst205" in str(exc).lower() and "draft_snapshots" in str(exc)
+
+
+def insert_draft_snapshots(sb, rows: list[dict]) -> int:
+    """一次查重的几篇底稿, 一次 insert。每行带同样的键(PostgREST 批量写按键的并集补 NULL)。异常原样上抛, 调用方吞。"""
+    if not rows:
+        return 0
+    sb.table("draft_snapshots").insert(rows).execute()
+    return len(rows)
+
+
+def snapshots_misconfigured(exc: Exception) -> bool:
+    """读底稿的错是不是库的配置问题(018 跑了一半: 缺权限 42501 / 缺列 42703 / PGRST204), 不是一时的网络 / 库故障。
+    tv-sync 遇到配置问题不扣下补录(扣下会每晚都扣、补录一直停着), 照旧补录、退出码 1 让人去修; 一时的故障才扣一晚。"""
+    msg = str(exc).lower()
+    return ("permission denied for table" in msg or "42501" in msg or "42703" in msg or "pgrst204" in msg
+            or ("column" in msg and "does not exist" in msg))
+
+
+def pending_draft_snapshots(sb, project_ids: list[str], *, since: str) -> list[dict] | None:
+    """这几个写作台项目近来还没转正的底稿(``checked_at >= since``, ``promoted_at`` 为空), 全文。
+    018 没跑回 None(调用方跳过底稿那一遍、照旧补录); 别的错误原样上抛, 调用方按 snapshots_misconfigured 分: 配置问题照旧
+    补录、退出码 1; 一时的故障那晚不补录(补录是终态, 一次读失败不能把本该对上底稿的帖变成永远的副本)。"""
+    out: list[dict] = []
+    for pid in sorted({str(p) for p in project_ids if p}):
+        try:
+            out += _paged(lambda off, lim, pid=pid: (
+                sb.table("draft_snapshots").select(SNAPSHOT_COLS)
+                .eq("project_id", pid).is_("promoted_at", "null").gte("checked_at", since)
+                .order("checked_at").order("id").range(off, off + lim - 1)))
+        except Exception as exc:                        # noqa: BLE001
+            if snapshots_table_missing(exc):
+                return None
+            raise
+    return out
+
+
+def mark_snapshots_promoted(sb, ids: list[str], *, version_id: str, note_id: str | None) -> int:
+    """这几行底稿转正了: 记版本、时刻、第一条对上的笔记。只改还没转正的行(并发 / 重跑不覆盖)。"""
+    done = 0
+    for chunk in db._in_chunks(list(dict.fromkeys(str(i) for i in ids)), 100):
+        res = (sb.table("draft_snapshots")
+               .update({"version_id": version_id, "promoted_at": iso_now(), "note_id": note_id})
+               .in_("id", chunk).is_("promoted_at", "null").execute())
+        done += len(res.data or [])
+    return done
+
+
+def snapshotted_angle_keys(sb, project_id: str, user_id: str | None, days: int) -> set[str]:
+    """这个人在这个项目近 ``days`` 天查重时带过、而且最近一次查重没被打回(pass / warn)的 angle_key(W-38): 这些牌的稿子
+    已经写出来、查过重了, 发出去以后 tv-sync 会从飞书对回来销账 —— 不算"抽了没写"。最近一次是 reject 的(查重打回、可能
+    没再写)照旧算欠着。读不到(018 没跑 / 任何错误)回空集: 只是少排除几张, 不能把简报弄坏。只收能安全放进 in_() 查询的
+    形状(_LEDGER_LOOKUP_KEY); 调用方再按发牌的形状筛。"""
+    if not user_id:
+        return set()
+    try:
+        rows = _paged(lambda off, lim: (
+            sb.table("draft_snapshots").select("id, angle_key, status, checked_at")
+            .eq("project_id", project_id).eq("user_id", user_id)
+            .not_.is_("angle_key", "null").gte("checked_at", iso_ago(days))
+            .order("id").range(off, off + lim - 1)), hard_cap=5000)
+    except Exception:                                   # noqa: BLE001
+        logger.warning("read snapshotted angle keys failed (project=%s)", project_id, exc_info=True)
+        return set()
+    latest: dict[str, tuple[str, str | None]] = {}
+    for r in rows:
+        k = str(r.get("angle_key") or "")
+        at = str(r.get("checked_at") or "")
+        if _LEDGER_LOOKUP_KEY.fullmatch(k) and (k not in latest or at >= latest[k][0]):
+            latest[k] = (at, r.get("status"))
+    return {k for k, (_, status) in latest.items() if status in ("pass", "warn")}
+
+
+def supersede_snapshots(sb, project_id: str, by_fp: dict[str, str]) -> int:
+    """存了档的稿子(``{text_fp: version_id}``), 同一个项目里同样文字的底稿记成已转正(W-38 复审): 它已经有版本了, 发出去
+    以后主索引对得上; 底稿留着没用, 还可能在那一版不再是 best 之后被另转一份。调用方吞异常。"""
+    done = 0
+    for text_fp, vid in by_fp.items():
+        res = (sb.table("draft_snapshots").update({"version_id": vid, "promoted_at": iso_now()})
+               .eq("project_id", project_id).eq("text_fp", text_fp).is_("promoted_at", "null").execute())
+        done += len(res.data or [])
+    return done
+
+
+def delete_old_snapshots(sb, *, before: str) -> int:
+    """底稿留够天数就删(存的是没发出去的稿子全文, 只留 tv-sync 用得着的那一段)。回删了几行。"""
+    res = sb.table("draft_snapshots").delete().lt("checked_at", before).execute()
+    return len(res.data or [])
+
+
+def consume_own_angle(sb, project_id: str, angle_key: str, version_id: str, *, user_id: str | None,
+                      drawn_before: str) -> bool:
+    """底稿转正时销牌(W-38 复审): 只销写这篇的人自己、在这次查重之前抽的、还没销的那张(最晚的一张), 不像 consume_angle
+    那样找不到自己的就销别人的 —— 转正发生在发布之后的某一晚, 那时台账里同一个 key 可能还有队友重抽的、或者他自己后来重抽
+    还没写的, 销错了就把真欠着的牌抹掉。找不到就不销, 回 False。"""
+    if not user_id or not angle_key:
+        return False
+    rows = (sb.table("angle_ledger").select("id")
+            .eq("project_id", project_id).eq("angle_key", angle_key).eq("drawn_by", user_id)
+            .is_("consumed_version_id", "null").lte("drawn_at", drawn_before)
+            .order("drawn_at", desc=True).range(0, 0).execute()).data or []
+    if not rows:
+        return False
+    res = (sb.table("angle_ledger").update({"consumed_version_id": version_id, "consumed_at": iso_now()})
+           .eq("id", rows[0]["id"]).is_("consumed_version_id", "null").execute())
+    return bool(res.data or [])
+
+
+def fingerprinted_versions(sb, project_id: str, version_ids: list[str]) -> set[str]:
+    """这几版里已经有指纹行的(底稿转正半途断了, 第二晚补齐时不重写)。"""
+    out: set[str] = set()
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        rows = (sb.table("draft_fingerprints").select("version_id")
+                .eq("project_id", project_id).in_("version_id", chunk).execute()).data or []
+        out.update(str(r["version_id"]) for r in rows if r.get("version_id"))
+    return out
+
+
+def angle_consumed_by(sb, project_id: str, version_ids: list[str]) -> set[str]:
+    """这几版里已经销过牌的(台账上 consumed_version_id 指着它)。"""
+    out: set[str] = set()
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        rows = (sb.table("angle_ledger").select("consumed_version_id")
+                .eq("project_id", project_id).in_("consumed_version_id", chunk).execute()).data or []
+        out.update(str(r["consumed_version_id"]) for r in rows if r.get("consumed_version_id"))
+    return out
 
 
 def tv_notes(sb, tv_project_id: str, *, since: str | None = None,
