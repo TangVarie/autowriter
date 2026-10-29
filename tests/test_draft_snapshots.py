@@ -933,3 +933,18 @@ def test_checked_angle_keys_fail_open(monkeypatch):
 def test_archive_pending_next_step_tells_the_model_not_to_put_archiving_on_the_user():
     step = core.ARCHIVE_PENDING_NEXT_STEP
     assert "别跟用户提「存档」" in step and "写作台会自己从飞书对回来" in step
+
+
+def test_a_checked_draft_archived_as_a_replacement_closes_its_snapshot():
+    # score_drafts 带 replaces_version_id 存成了旧 item 的新一版: 同样文字的底稿也记成已转正(codex on aw#132) —— 不然这一版
+    # 之后又被替换掉、主索引对不上它的时候, 底稿会被另转一份, 同一篇两个 item
+    from tests.test_deskcore_commit_judge import BODY_A as JA, BODY_A2 as JA2, ME as JME, PROJ, _client as jclient, _embed
+    c = jclient()
+    v1 = core.commit_drafts(c, PROJ, [{"title": "秋招等回音", "body": JA}], user_id=JME)["version_ids"][0]
+    _embed(c)
+    core.check_drafts(c, PROJ, [{"title": "秋招等回音", "body": JA2}], user_id=JME, record_snapshot=True)
+    out = core.commit_drafts(c, PROJ, [{"title": "秋招等回音", "body": JA2, "replaces_version_id": v1}], user_id=JME)
+    v2 = out["version_ids"][0]
+    assert out["replaced"][0]["old_version_id"] == v1
+    (s,) = c.rows["draft_snapshots"]
+    assert s["promoted_at"] and s["version_id"] == v2

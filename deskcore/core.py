@@ -2963,10 +2963,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 else:
                     missed_keys[i] = str(key)
 
-            # W-38: 存了档的稿子, 同样文字的查重底稿记成已转正 —— 它有版本了, 发出去以后主索引对得上, 底稿不用再等飞书
+            # W-38: 存了档的稿子, 同样文字的查重底稿记成已转正 —— 它有版本了, 发出去以后主索引对得上, 底稿不用再等飞书。
+            # 改稿替换真挂上了旧 item 的也算(codex on aw#132): 底稿留着, 这一版之后又被替换掉、主索引对不上它的时候, 会被另转一份
             _supersede_snapshots(client, project_id, drafts,
                                  {i: minted_ids[i] for i in sorted(inserted_idx)
-                                  if i not in replace and minted_ids.get(i) in (minted.get("versions") or {})})
+                                  if i in replaced_ok
+                                  or (i not in replace and minted_ids.get(i) in (minted.get("versions") or {}))})
 
             # 带了 key 却没销成的, 分清是不是 key 本身的问题(W-31, 10-26 sportsix: 19 篇带的 key 一条都不在台账里,
             # 回包只说「销账少了」, 写手那边的 AI 不知道 key 是错的, 20 张牌一天后回了池子)。只在有没销成的时候多查一次。
