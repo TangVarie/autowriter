@@ -292,8 +292,9 @@ def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
 # 那是实打实写进库的, 所以比 match_note 严:
 #   · 帖要有发布日期, 底稿要早于帖: 发布那天 − 第一次查重那天(北京日历日)在 0..WINDOW_AFTER_DAYS 天; 晚于发布的不认
 #     (DIFF_REV 2 / 判据 C 的"接住"同一个口径, 认了也算不了改稿差异);
-#   · 开头 / 标题一样也要包含度到 EDITED_FLOOR(match_note 的精确档是不看包含度的); 改得多的那一档(edited)要到
-#     SNAPSHOT_EDITED_FLOOR —— W-34 判"整篇换了"的线是 0.30, 擦着线转正的对照, 运营在飞书里再改几句就会被挪走、补录成副本;
+#   · 开头 / 标题一样也要包含度到 EDITED_FLOOR(match_note 的精确档是不看包含度的); 开头 / 标题都不一样、改得多的那一档
+#     (edited)要到 SNAPSHOT_EDITED_FLOOR —— W-34 判"整篇换了"的线是 0.30, 擦着线转正的对照, 运营在飞书里再改几句就会被
+#     挪走、补录成副本(开头 / 标题一样的, W-34 重对也照样对回这一版);
 #   · 分不出时, 只在打平的几份是同一篇的前后几稿(互相重合 SNAPSHOT_SAME_DRAFT 以上)才挑一份: 挑和这篇帖两头都最像的
 #     (帖在稿里 + 稿在帖里), 一样像取最晚查的; 打平的里面有别的稿子 → ambiguous, 不硬猜;
 #   · 存过档的版本也算对手(``main``): 主索引说对不上, 可时间窗里有存档版本离最像的底稿不到一个差距(同一个故事写了两版,
@@ -327,7 +328,10 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
     if not scored or scored[0][0] < EDITED_FLOOR:
         return Match("unmatched")
     best_s, best_v = scored[0]
-    if best_s < FUZZY_CONTAIN and best_s < SNAPSHOT_EDITED_FLOOR:
+    pk, tk = prefix_key(note.body), title_key(note.title)
+    exact = bool(pk and pk == prefix_key(best_v.body) or tk and tk == title_key(best_v.title))
+    # 开头 / 标题一样的只要 EDITED_FLOOR(codex on aw#132): W-34 哪天按 0.30 判它「整篇换了」重对, 开头 / 标题照样对回这一版
+    if best_s < FUZZY_CONTAIN and best_s < SNAPSHOT_EDITED_FLOOR and not exact:
         return Match("unmatched")
     margin = FUZZY_MARGIN if best_s >= FUZZY_CONTAIN else EDITED_MARGIN
     close = [(s, v) for s, v in scored[1:] if best_s - s < margin]
@@ -347,7 +351,6 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
 
     group = [(best_s, best_v)] + [(s, v) for s, v in close if s >= SNAPSHOT_EDITED_FLOOR]
     score, chosen = max(group, key=lambda t: (t[0] + back(t[1]), t[1].created_at))
-    pk, tk = prefix_key(note.body), title_key(note.title)
     kind = ("body_exact" if pk and pk == prefix_key(chosen.body) else
             "title_exact" if tk and tk == title_key(chosen.title) else
             "fuzzy" if score >= FUZZY_CONTAIN else "edited")

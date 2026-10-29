@@ -152,6 +152,20 @@ def test_heavily_rewritten_posts_need_more_than_the_main_floor():
     assert m.kind == "unmatched", m
 
 
+def test_a_heavily_rewritten_post_that_kept_the_title_or_opening_only_needs_the_main_floor():
+    # 开头 / 标题一样的不受 SNAPSHOT_EDITED_FLOOR 管(codex on aw#132): 照样转正, 不补录成副本
+    sents = BODY_S.split("。")
+    note_body = sents[0] + "。" + BODY_OTHER
+    m = _m(_n("骑了一百公里", note_body), [_v("s1", "骑了一百公里", BODY_S, 0)])
+    assert m.kind == "title_exact" and m.version.version_id == "s1", m
+    assert tvlink.EDITED_FLOOR <= m.score < tvlink.SNAPSHOT_EDITED_FLOOR, m.score
+    opening = BODY_S[:45] + BODY_OTHER
+    m = _m(_n("t", opening), [_v("s1", "t2", BODY_S, 0)])
+    assert m.kind == "body_exact" and m.score < tvlink.SNAPSHOT_EDITED_FLOOR, m
+    # 包含度不到 EDITED_FLOOR 的, 标题一样也不认(同上面 test_same_title_different_body_is_not_promoted)
+    assert _m(_n("骑了一百公里", BODY_OTHER), [_v("s1", "骑了一百公里", BODY_S, 0)]).kind == "unmatched"
+
+
 def test_revisions_of_one_draft_pick_the_one_that_was_published():
     v1 = _v("s1", "骑了一百公里", BODY_S, 0)
     v2 = _v("s2", "骑了一百公里", BODY_S + "最后那根能量胶我留着, 下次骑二百公里的时候再开。", 1)
