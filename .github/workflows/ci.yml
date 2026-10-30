@@ -2557,12 +2557,24 @@ jobs:
           # ① 匿名 dev 模式 + 没配 DESKCORE_DEFAULT_USER_ID = 认不出人 → 403。
           #    注意它【不是】401: key 这一层是放行的(显式开了匿名), 拒绝发生在
           #    归属校验那一层。两层分开才说得清该配哪个变量。
+          #    2026-10-30 发布收尾起: 403 正文是念给写手的话(找负责人, 不念配置名), 该配哪个变量写进服务端日志给运维看。
+          #    两头都要: 写手那边不出现配置名, 日志里必须有。
+          import logging as _logging
+          _logged = []
+          class _Cap(_logging.Handler):
+              def emit(self, rec):
+                  _logged.append(rec.getMessage())
+          _cap = _Cap()
+          _logging.getLogger("deskcore").addHandler(_cap)
           assert not (os.environ.get("DESKCORE_DEFAULT_USER_ID") or "").strip()
           r = c.post("/tool/list_projects", json={})
+          _logging.getLogger("deskcore").removeHandler(_cap)
           assert r.status_code == 403, \
               f"认不出调用者却不是 403: {r.status_code} {r.text[:200]}"
-          assert "DESKCORE_DEFAULT_USER_ID" in r.text, \
-              f"403 没告诉人该配什么: {r.text[:300]}"
+          assert "负责人" in r.text and "DESKCORE_" not in r.text, \
+              f"403 该叫写手找负责人、不念配置名: {r.text[:300]}"
+          assert any("DESKCORE_DEFAULT_USER_ID" in m for m in _logged), \
+              f"403 时日志里没告诉运维该配什么: {_logged[-5:]}"
 
           # ② 归属拒绝【绝不能】掉进 500 兜底。500 对调用方的意思是"服务端坏了,
           #    待会儿重试", 于是模型会拿同一个错 project_id 一直试; 而且正常的

@@ -331,10 +331,15 @@ def test_idle_siblings_are_marked():
     assert by_id["p-idle"].get("archived") is True and "archived" not in by_id["p-live"]
 
 
-def test_the_tool_says_to_look_with_include_archived_before_creating():
+def test_the_tool_says_a_miss_is_not_a_reason_to_create():
+    """2026-10-30 复审(协议「零」): 找不到要写的项目 —— 带 include_archived=true 再查一遍也没有 —— 是叫用户找负责人, 不是建。
+    原来这里把这种情形写成了「什么时候调」, 而协议说照工具说明做, 于是又建出一个空的同名项目(B1)。"""
     doc = tools.create_project.__doc__ or ""
-    assert "include_archived=true 再查一遍也没有" in doc, "清单默认不列暂时不用的项目, 先带上它再看"
-    assert "archived: true" in doc
+    assert "include_archived=true 再查一遍也没有" in doc and "archived: true" in doc
+    assert "找不到要写的项目不是调它的理由" in doc and "负责人" in doc and "也不建" in doc
+    assert "那把 key" not in doc and "恒为你自己" not in doc, "团队共用一个身份"
+    listing = tools.list_projects.__doc__ or ""
+    assert "别急着 create_project" not in listing and "不要 create_project 新建" in listing
 
 
 def test_idle_project_replies_are_writer_safe():

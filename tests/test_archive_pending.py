@@ -1,13 +1,17 @@
-"""W-29: 发牌 / 查重 / 记规则的返回里带上"这些牌还没存档, 下一步是什么"。
+"""W-29: 发牌 / 查重的返回里带上"这些牌还没存档, 下一步是什么"。
 
 2026-10-20~10-22 途鸽五轮 73 张牌、百健士一轮 24 张, 一轮都没存档。生产日志里每一轮 open_project、draw_angles、
 1~3 次 check_drafts 都回了 200, 然后调用方就不再调写作台了: score_drafts 一次都没到库。和 W-06 同一个形状,
 D-071 定过不设硬闸, 所以只在离交付最近的几个返回值里提醒, 不拦任何东西。
 
+2026-10-30 复审: 团队共用一个身份, 这笔账数到的是整个团队这一天在这个项目上没存的牌, 不分是哪一场抽的。所以提醒只挂在
+这一场确实在用牌的回包上 —— draw_angles、稿子带了 angle_key 的 check_drafts; 记规则、没带牌的查重不再带。
+
 这里钉的是【被禁止的形态】:
   · 有没存档的牌却不提醒, 或者张数 / 最早时间不对;
-  · 把别人的牌、别的项目的牌、早就存过档的牌、窗口外的牌算进来;
-  · 查这笔账失败把发牌 / 查重 / 记规则拖垮(查重是硬闸, 它的结果一个字都不能因为一段提醒丢掉);
+  · 把别的身份的牌、别的项目的牌、早就存过档的牌、窗口外的牌算进来;
+  · 这一场没在用牌(记规则、没带 angle_key 的查重)也挂上提醒;
+  · 查这笔账失败把发牌 / 查重拖垮(查重是硬闸, 它的结果一个字都不能因为一段提醒丢掉);
   · 为这段提醒多打不止一次查询。
 """
 
@@ -25,6 +29,8 @@ ME = "11111111-1111-1111-1111-111111111111"
 MATE = "22222222-2222-2222-2222-222222222222"
 PID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 OTHER_PID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+# 这一场写的稿带着牌(angle_key): check_drafts 才挂提醒
+KEYED = [{"title": "甲", "body": "正文", "angle_key": "k1"}]
 
 
 def _hours_ago(h: float) -> str:
@@ -50,10 +56,17 @@ def _client(cards=()):
     })
 
 
+def _gate_sees_no_drafts(monkeypatch):
+    """查重本身照真的跑(归属闸、回包形状、查询次数都不变), 只是不拿这几篇去比 —— 这里只看提醒挂不挂。"""
+    real = core.check_drafts
+    monkeypatch.setattr(core, "check_drafts", lambda client, pid, drafts, **k: real(client, pid, [], **k))
+
+
 @pytest.fixture()
 def use(monkeypatch):
     # 存档时 key 对不上的那一笔记在进程内存里(W-31): 每条用例从空的开始, 别的文件存过的不串进来
     monkeypatch.setattr(core, "_angle_key_misses", {})
+    _gate_sees_no_drafts(monkeypatch)
 
     def _use(client):
         monkeypatch.setattr(core, "sb", lambda: client)
@@ -66,7 +79,7 @@ def _ledger_calls(client):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 主路径: 只数调用者自己、这个项目、近 24 小时、还没存档的牌
+# 主路径: 只数这个身份、这个项目、近 24 小时、还没存档的牌
 # ══════════════════════════════════════════════════════════════════════
 
 def test_check_drafts_carries_count_and_oldest_for_my_unsettled_cards(use):
@@ -79,7 +92,7 @@ def test_check_drafts_carries_count_and_oldest_for_my_unsettled_cards(use):
         _card(7, project=OTHER_PID),                              # 我在别的项目的
         _card(8, hours_ago=24 * 3),                               # 窗口外
     ]))
-    out = T.check_drafts(PID, [], _user_id=ME)
+    out = T.check_drafts(PID, KEYED, _user_id=ME)
     block = out["archive_pending"]
     assert block == {"cards": 3, "oldest_drawn_at": oldest["drawn_at"],
                      "next_step": core.ARCHIVE_PENDING_NEXT_STEP}
@@ -96,15 +109,16 @@ def test_check_drafts_carries_count_and_oldest_for_my_unsettled_cards(use):
 def test_no_block_when_nothing_is_pending(use):
     use(_client([_card(1, consumed=True), _card(2, user=MATE), _card(3, project=OTHER_PID),
                  _card(4, hours_ago=30)]))
-    out = T.check_drafts(PID, [], _user_id=ME)
+    out = T.check_drafts(PID, KEYED, _user_id=ME)
     assert "archive_pending" not in out
     assert out == {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
 
 
 def test_other_users_cards_never_count_for_me(use):
-    """队友在同一个项目上抽了一堆没写: 记不到我头上, 也不能借这段提醒看到他抽了什么。"""
+    """别的身份(另一把 key)在同一个项目上抽了一堆没写: 记不到这个身份头上, 也不能借这段提醒看到抽了什么。
+    团队共用一个身份时, 队友的牌是同一个身份的 —— 那种见 test_teammate_cards_stay_off_sessions_that_use_no_cards。"""
     use(_client([_card(i, user=MATE) for i in range(6)]))
-    assert "archive_pending" not in T.check_drafts(PID, [], _user_id=ME)
+    assert "archive_pending" not in T.check_drafts(PID, KEYED, _user_id=ME)
 
 
 def test_draw_counts_the_cards_it_just_drew(use):
@@ -122,20 +136,27 @@ def test_draw_counts_the_cards_it_just_drew(use):
     assert sum(1 for r in c.rows["angle_ledger"] if r["drawn_by"] == ME) == 4
 
 
-def test_record_rule_carries_the_block(use, monkeypatch):
-    use(_client([_card(1, hours_ago=3)]))
+def test_teammate_cards_stay_off_sessions_that_use_no_cards(use, monkeypatch):
+    """2026-10-30 复审: 团队共用一个身份, 队友 8 小时前抽了没存的牌也记在这个身份下。一场只说了「以后别用数字开头」、
+    或者只改一篇别的对话交付的稿(查重不带牌)的对话, 不该拿到这几张牌和「都存完再给用户看」。真在用牌的那两处照旧带。"""
+    c = use(_client([_card(i, hours_ago=8) for i in range(5)]))       # 同一个身份(ME) —— 队友抽的
     stored = {"memory_id": "m-1", "severity": "soft", "scope": "project", "content": "别用数字开头"}
     monkeypatch.setattr(core, "record_rule", lambda *a, **k: dict(stored))
-    out = T.record_rule(PID, "别用数字开头", _user_id=ME)
-    assert out["archive_pending"]["cards"] == 1
-    assert {k: v for k, v in out.items() if k != "archive_pending"} == stored
+    assert T.record_rule(PID, "别用数字开头", _user_id=ME) == stored
+    plain = [{"title": "甲", "body": "正文"}, {"title": "乙", "body": "正文", "angle_key": "  "}]
+    out = T.check_drafts(PID, plain, _user_id=ME)
+    assert "archive_pending" not in out
+    assert _ledger_calls(c) == [], "这一场没在用牌: 连这笔账都不查"
+
+    assert T.check_drafts(PID, plain + KEYED, _user_id=ME)["archive_pending"]["cards"] == 5
+    assert T.draw_angles(PID, 2, _user_id=ME)["archive_pending"]["cards"] == 7
 
 
 def test_no_user_no_block_and_no_query(use, monkeypatch):
     """认不出调用者时不查(工具本身会先被归属闸拒掉; 这里只验提醒这一层不多打请求)。"""
     c = use(_client([_card(1)]))
     monkeypatch.setattr(core, "check_drafts", lambda *a, **k: {"results": [], "summary": {}})
-    out = T.check_drafts(PID, [], _user_id=None)
+    out = T.check_drafts(PID, KEYED, _user_id=None)
     assert "archive_pending" not in out
     assert _ledger_calls(c) == []
 
@@ -151,7 +172,7 @@ def test_helper_raising_does_not_break_check_drafts(use, monkeypatch, caplog):
         raise RuntimeError("PostgREST 503")
     monkeypatch.setattr(core, "archive_pending", boom)
     with caplog.at_level("WARNING", logger="deskcore.tools"):
-        out = T.check_drafts(PID, [], _user_id=ME)
+        out = T.check_drafts(PID, KEYED, _user_id=ME)
     assert out == {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
     assert any("archive_pending" in r.getMessage() for r in caplog.records), "兜住了也要留痕"
 
@@ -163,13 +184,14 @@ def test_query_failure_inside_the_store_omits_the_block(use, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("PostgREST 503")
     monkeypatch.setattr(store, "angle_debt", boom)
-    for call in (lambda: T.check_drafts(PID, [], _user_id=ME),
+    for call in (lambda: T.check_drafts(PID, KEYED, _user_id=ME),
                  lambda: T.draw_angles(PID, 2, _user_id=ME)):
         assert "archive_pending" not in call()
 
 
 def test_client_construction_failure_omits_the_block(monkeypatch):
     """第二次取 client 就炸(配置 / 网络): 工具已经拿到的结果照样回去。"""
+    _gate_sees_no_drafts(monkeypatch)
     c = _client([_card(1)])
     got = iter([c])
 
@@ -179,7 +201,7 @@ def test_client_construction_failure_omits_the_block(monkeypatch):
         except StopIteration:
             raise RuntimeError("client gone") from None
     monkeypatch.setattr(core, "sb", sb)
-    out = T.check_drafts(PID, [], _user_id=ME)
+    out = T.check_drafts(PID, KEYED, _user_id=ME)
     assert out["summary"]["total"] == 0 and "archive_pending" not in out
 
 
@@ -187,7 +209,7 @@ def test_the_tool_error_itself_still_propagates(use):
     """提醒在工具成功之后才查: 归属闸的拒绝照样冒出去, 不会被这一段吞成"成功"。"""
     use(_client([_card(1)]))
     with pytest.raises(PermissionError):
-        T.check_drafts(PID, [], _user_id=MATE)
+        T.check_drafts(PID, KEYED, _user_id=MATE)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -212,12 +234,18 @@ def test_next_step_says_archive_before_showing_and_how_to_resave_edits():
     # 改存过的那篇: score_drafts 带 replaces_version_id。原来这里叫它「不用先跑 check_drafts」—— 那时 check_drafts 不认
     # replaces_version_id, 拿改稿和它自己存档的原版比, 必然 reject(review on W-29)。2026-10-30 起 check_drafts 也认这个
     # 字段: 先过一遍查重也行, 只要那篇同样带上 replaces_version_id(不能再说「不用跑」, 也不能叫它光着跑)。
-    revise = step.split("replaces_version_id", 1)[0].rsplit(";", 1)[-1]
-    assert "已经存过" in revise and "score_drafts" in revise, revise
+    # 2026-10-30 复审: 改稿也是先过 check_drafts 再 score_drafts(协议第 4 条「新稿、改稿都要过」), 两次带同一个
+    # replaces_version_id —— 原来「要先过 check_drafts 的话」读起来是可以跳过, 而它离交付最近, 和协议说法不同时模型照它做。
+    revise = next(c for c in step.split("; ") if "已经存过" in c)
+    assert "replaces_version_id" in revise and revise.index("check_drafts") < revise.index("score_drafts"), revise
     assert "先重跑 check_drafts" not in step and "不用先跑 check_drafts" not in step
-    assert "check_drafts 的话那篇同样带上 replaces_version_id" in step and "不会拿它和自己的旧版比" in step
-    # 只有整篇重写的新稿才先过 check_drafts
-    assert "整篇推翻" in step and "先过 check_drafts" in step
+    assert "要先过 check_drafts 的话" not in step and "不会拿它和自己的旧版比" in step
+    # 整篇推翻、换角度重写的当新稿, 同样先过 check_drafts 再存 —— 断言落在那一段上: 改稿那段也有「先过 check_drafts」,
+    # 整串里找会被它顶替(review on aw#137)
+    rewrite = next(c for c in step.split("; ") if "整篇推翻" in c)
+    assert "先过 check_drafts" in rewrite and rewrite.index("check_drafts") < rewrite.index("存"), rewrite
+    # 共用一个身份, cards 是整个团队的: 和协议同一句 —— 只管这一场自己用的, 存完还在的是别人手上的
+    assert "整个团队" in step and "只管这一场自己用的" in step and "别人手上的" in step
 
 
 def test_open_project_debt_note_leaves_archiving_to_archive_pending(use, monkeypatch):
@@ -241,11 +269,11 @@ def test_cards_drawn_before_the_floor_are_not_pending(use, monkeypatch):
     monkeypatch.setattr(core, "ANGLE_DEBT_SINCE", _hours_ago(3))
     after = _card(2, hours_ago=2)
     use(_client([_card(1, hours_ago=5), after]))
-    block = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    block = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]
     assert block["cards"] == 1 and block["oldest_drawn_at"] == after["drawn_at"], block
 
     use(_client([_card(1, hours_ago=5), _card(3, hours_ago=8)]))
-    assert "archive_pending" not in T.check_drafts(PID, [], _user_id=ME), "全在下限之前: 不带提醒"
+    assert "archive_pending" not in T.check_drafts(PID, KEYED, _user_id=ME), "全在下限之前: 不带提醒"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -277,14 +305,14 @@ def test_next_check_says_the_cards_were_archived_under_keys_the_ledger_does_not_
                        {"title": "乙", "body": BODY_2, "angle_key": "A_02"}])
     assert out["written"] == 2 and out["unknown_angle_keys"] == 2
 
-    for call in (lambda: T.check_drafts(PID, [], _user_id=ME),
+    for call in (lambda: T.check_drafts(PID, KEYED, _user_id=ME),
                  lambda: T.draw_angles(PID, 1, _user_id=ME)):
         block = call()["archive_pending"]
         mm = block["angle_key_mismatch"]
         assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 2, 0)
         assert mm["keys"] == ["A_01", "A_02"]
         assert mm["last_at"]
-        for must in ("已经写完存档", "不用重存", "别按这些牌再写一遍", "原样复制", "20 位"):
+        for must in ("已经写完存档", "不用重存", "不用为那几张牌再写一遍", "原样复制", "20 位", "不跟用户提"):
             assert must in mm["note"], must
         assert block["next_step"] == core.ARCHIVE_PENDING_NEXT_STEP, "原来那句不动"
 
@@ -295,7 +323,7 @@ def test_mismatches_add_up_across_batches_and_cost_no_extra_query(use, no_embedd
     _archive(c, [{"title": "乙", "body": BODY_2, "angle_key": "k0"},          # 对的: 销了
                  {"title": "丙", "body": BODY_1 + "又一篇", "angle_key": "k0"}])  # 同一个 key 第二篇: used
     n = len(_ledger_calls(c))
-    block = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    block = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]
     assert len(_ledger_calls(c)) == n + 1, "提醒照旧只多一次查询(对不上的那一笔在内存里)"
     mm = block["angle_key_mismatch"]
     assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 1, 1)
@@ -308,23 +336,35 @@ def test_someone_elses_bad_keys_are_not_shown_to_me(use, no_embeddings):
     miss = [{"index": 0, "angle_key": "MATE_01", "length": 7, "problem": "unknown"}]
     core._note_angle_key_misses(PID, MATE, miss)
     core._note_angle_key_misses(OTHER_PID, ME, miss)
-    block = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    block = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]
     assert block["cards"] == 1 and "angle_key_mismatch" not in block
     assert core.archive_pending(c, PID, user_id=MATE)["angle_key_mismatch"]["keys"] == ["MATE_01"]
+
+
+def test_a_teammates_misfiled_draft_is_not_put_to_this_writer(use, no_embeddings):
+    """复审(on aw#137): 团队共用一个身份, 记下的那一笔可能是队友的对话存的。另一场对话抽牌时一并带上, 但只给模型看:
+    不叫它问用户「稿子是不是存错了项目」, 也不说那是「你」抽的牌。"""
+    use(_client([_card(1, hours_ago=1)]))
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "f" * 20, "length": 20, "problem": "other_project"},
+                                          {"index": 1, "angle_key": "A_01", "length": 4, "problem": "unknown"}])
+    note = T.draw_angles(PID, 1, _user_id=ME)["archive_pending"]["angle_key_mismatch"]["note"]
+    assert "不跟用户提" in note and "团队别的对话" in note
+    for bad in ("跟用户确认", "你在别的项目", "存错了项目", "不是你编的"):
+        assert bad not in note, bad
 
 
 def test_no_block_without_pending_cards_and_the_note_expires_with_the_window(use, no_embeddings, monkeypatch):
     c = use(_client([_card(1, hours_ago=1)]))
     _archive(c, [{"title": "甲", "body": BODY_1, "angle_key": "A_01"}])
-    assert "angle_key_mismatch" in T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    assert "angle_key_mismatch" in T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]
 
     later = datetime.now(timezone.utc) + timedelta(days=core.ARCHIVE_PENDING_DAYS, hours=1)
     monkeypatch.setattr(core, "_utcnow", lambda: later)
-    assert "angle_key_mismatch" not in T.check_drafts(PID, [], _user_id=ME)["archive_pending"], "过了窗口不再提"
+    assert "angle_key_mismatch" not in T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"], "过了窗口不再提"
 
     c.rows["angle_ledger"][0]["consumed_version_id"] = "v-x"
     monkeypatch.setattr(core, "_utcnow", lambda: datetime.now(timezone.utc))
-    assert "archive_pending" not in T.check_drafts(PID, [], _user_id=ME), "牌都销了就不提"
+    assert "archive_pending" not in T.check_drafts(PID, KEYED, _user_id=ME), "牌都销了就不提"
 
 
 def test_an_old_miss_is_not_added_to_a_new_one(use, no_embeddings, monkeypatch):
@@ -337,7 +377,7 @@ def test_an_old_miss_is_not_added_to_a_new_one(use, no_embeddings, monkeypatch):
     monkeypatch.setattr(core, "_utcnow", lambda: later)
     core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "NEW_01", "length": 6, "problem": "used"}])
 
-    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    mm = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]["angle_key_mismatch"]
     assert (mm["drafts"], mm["unknown"], mm["used"]) == (1, 0, 1)
     assert mm["keys"] == ["NEW_01"]
 
@@ -350,17 +390,17 @@ def test_the_note_only_says_invented_or_already_written_when_that_is_the_problem
     core._note_angle_key_misses(PID, ME, [
         {"index": 0, "angle_key": key, "length": 20, "problem": "other_project", "project_id": OTHER_PID},
         {"index": 1, "angle_key": key[::-1], "length": 20, "problem": "not_in_ledger"}])
-    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    mm = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]["angle_key_mismatch"]
     assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 2, 0), "这个项目台账里没有的三种都算 unknown"
     assert mm["by_problem"] == {"other_project": 1, "not_in_ledger": 1}
     note = mm["note"]
-    assert "存错了项目" in note and "发牌时台账没写进去" in note
-    for bad in ("已经写完存档", "别按这些牌再写一遍", "不要自己编号"):
+    assert "别的项目抽的牌" in note and "发牌时台账没写进去" in note
+    for bad in ("已经写完存档", "不用为那几张牌再写一遍", "不要自己编号"):
         assert bad not in note, bad
 
     core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "A_01", "length": 4, "problem": "unknown"}])
-    note = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]["note"]
-    assert "已经写完存档" in note and "不要自己编号" in note and "存错了项目" in note
+    note = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]["angle_key_mismatch"]["note"]
+    assert "已经写完存档" in note and "不要自己编号" in note and "别的项目抽的牌" in note
 
 
 def test_each_miss_expires_on_its_own(use, no_embeddings, monkeypatch):
@@ -373,17 +413,17 @@ def test_each_miss_expires_on_its_own(use, no_embeddings, monkeypatch):
         core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": key, "length": 6, "problem": problem}])
     assert len(core._angle_key_misses[(PID, ME)]) == 2, "记的时候就把过了窗口的剪掉"
 
-    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    mm = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]["angle_key_mismatch"]
     assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 1, 1)
     assert mm["keys"] == ["H23_01", "H46_01"] and mm["by_problem"] == {"used": 1, "unknown": 1}
     assert mm["last_at"] == (t0 + timedelta(hours=46)).isoformat()
 
     monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=69))
-    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    mm = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]["angle_key_mismatch"]
     assert (mm["drafts"], mm["unknown"], mm["used"]) == (1, 1, 0) and mm["keys"] == ["H46_01"]
 
     monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=71))
-    assert "angle_key_mismatch" not in T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    assert "angle_key_mismatch" not in T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]
     assert (PID, ME) not in core._angle_key_misses, "全过期的那一笔顺手清掉, 进程里不越攒越多"
 
 
@@ -397,5 +437,5 @@ def test_expired_keys_do_not_hold_the_shown_slots(use, no_embeddings, monkeypatc
     monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=20))
     core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "NEW_01", "length": 6, "problem": "unknown"}])
     monkeypatch.setattr(core, "_utcnow", lambda: t0 + timedelta(hours=30))
-    mm = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]["angle_key_mismatch"]
+    mm = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]["angle_key_mismatch"]
     assert mm["keys"] == ["NEW_01"] and mm["drafts"] == 1
