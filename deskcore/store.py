@@ -1064,8 +1064,11 @@ def _paged_iter(build, *, page: int = PAGE, hard_cap: int | None = None):
         yield rows
 
 
-def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bool]:
+def fingerprints(sb, project_id: str, limit: int = 4000, *, vectors: bool = True) -> tuple[list[dict], bool]:
     """项目【全量】历史指纹。返回 (rows, truncated)。
+
+    ``vectors=False``(2026-10-30): 不拉标题向量那两列(``title_embedding`` 为 None)。只给 check_drafts 改稿排除旧版
+    那条路用 —— 只需要重比四字串时, 768 维的向量是这一次读里最重的那部分, 不比就不拉。
 
     ⚠️ 故意不吞异常: 查重是硬闸, 读不到历史就不能放行。这是 deskcore 里唯一
     不 fail-open 的路径(其余读类工具出错返回可用结构不阻塞写稿)。
@@ -1087,6 +1090,8 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
     #  没有任何代码真的用过它 —— 又一次"写着已经有了, 实际没有"。)
     cols = ("id, title, opening, title_embedding, embedding_model, "
             "opening_hash, ngram_hashes, created_at")
+    if not vectors:
+        cols = "id, title, opening, opening_hash, ngram_hashes, created_at"
     rows: list[dict] = []
     truncated = False
     while len(rows) < limit:
@@ -1117,6 +1122,17 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
     for r in rows:
         r["title_embedding"] = db._parse_pgvector(r.get("title_embedding"))
     return rows, truncated
+
+
+def fingerprints_with_opening(sb, project_id: str, opening_hash: str, *, limit: int) -> list[dict]:
+    """开头哈希等于 ``opening_hash`` 的指纹行(``id, title``), 最多 ``limit`` 行。check_drafts 改稿排除旧版时用(2026-10-30):
+    旧版有 n 行, 取 n + 1 行就分得清有没有别的稿子撞了同一个开头。故意不吞异常(查重是硬闸)。"""
+    if not opening_hash:
+        return []
+    res = (sb.table("draft_fingerprints").select("id, title")
+             .eq("project_id", project_id).eq("opening_hash", opening_hash)
+             .limit(limit).execute())
+    return res.data or []
 
 
 def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int, int]:
@@ -1819,15 +1835,65 @@ def _as_params(params) -> dict:
 
 def batch_params_for_items(sb, item_ids: list[str]) -> dict[str, dict]:
     """这些 item 所在 batch 的 ``params`` (``batch_id`` → dict)。"""
-    batch_ids: list[str] = []
+    return batch_params(sb, list(batch_ids_of_items(sb, item_ids).values()))
+
+
+def batch_ids_of_items(sb, item_ids: list[str]) -> dict[str, str]:
+    """``item_id`` → ``batch_id``。查不到的、没有 batch 的不在里面。"""
+    out: dict[str, str] = {}
     for chunk in db._in_chunks(list(dict.fromkeys(item_ids)), 100):
         res = sb.table("items").select("id, batch_id").in_("id", chunk).execute()
-        batch_ids += [str(r["batch_id"]) for r in (res.data or []) if r.get("batch_id")]
+        for r in res.data or []:
+            if r.get("batch_id"):
+                out[str(r["id"])] = str(r["batch_id"])
+    return out
+
+
+def batch_params(sb, batch_ids: list[str]) -> dict[str, dict]:
+    """``batch_id`` → ``params``(dict; 认不出的当 {})。"""
     out: dict[str, dict] = {}
     for chunk in db._in_chunks(list(dict.fromkeys(batch_ids)), 100):
         res = sb.table("batches").select("id, params").in_("id", chunk).execute()
         for r in res.data or []:
             out[str(r["id"])] = _as_params(r.get("params"))
+    return out
+
+
+def batch_drafts(sb, project_id: str, batch_ids: list[str]) -> dict[str, dict]:
+    """改稿重存时把原来那一整批交付稿拼回来用(2026-10-30, core._whole_batch_delivery): 这几个 batch(只认本项目的,
+    别的项目的查不出来)的 ``params`` / ``created_at``, 和每个 item 的全部版本 id 与它现在的那一版(代表版本, 同
+    ``_representative_version``: best_version_id 指的那一版, 没指就最新那一版)的标题正文。
+
+    回 ``{batch_id: {"params", "created_at", "items": [{"item_id", "version_ids": [...],
+    "current": {"id", "title", "body"} | None}]}}``。三次查询(batches / items / versions), 都按 id 分块、翻页拉全。
+    出错上抛: 调用方退回只拼这次的几篇, 说清原因, 不会拼出半批。"""
+    out: dict[str, dict] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(batch_ids)), 100):
+        res = (sb.table("batches").select("id, params, created_at")
+                 .in_("id", chunk).eq("project_id", project_id).execute())
+        for r in res.data or []:
+            out[str(r["id"])] = {"params": _as_params(r.get("params")), "created_at": r.get("created_at"),
+                                 "items": []}
+    if not out:
+        return out
+    items: list[dict] = []
+    for chunk in db._in_chunks(list(out), 100):
+        items += _paged(lambda off, lim, _c=chunk: (
+            sb.table("items").select("id, batch_id, best_version_id")
+              .in_("batch_id", _c).order("id").range(off, off + lim - 1)))
+    versions: dict[str, list[dict]] = {}
+    for chunk in db._in_chunks([str(it["id"]) for it in items], 100):
+        for v in _paged(lambda off, lim, _c=chunk: (
+                sb.table("versions").select("id, item_id, title, body, version_num")
+                  .in_("item_id", _c).order("id").range(off, off + lim - 1))):
+            versions.setdefault(str(v["item_id"]), []).append(v)
+    for it in items:
+        vs = versions.get(str(it["id"])) or []
+        cur = _representative_version({"versions": vs, "best_version_id": it.get("best_version_id")})
+        out[str(it["batch_id"])]["items"].append({
+            "item_id": str(it["id"]), "version_ids": [str(v["id"]) for v in vs],
+            "current": ({"id": str(cur["id"]), "title": cur.get("title") or "", "body": cur.get("body") or ""}
+                        if cur else None)})
     return out
 
 

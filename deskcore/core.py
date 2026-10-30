@@ -81,13 +81,15 @@ ANGLE_DEBT_SINCE = "2026-10-29T08:26:00+00:00"
 # 窗口 1 天: 只管这一场还在写的牌; 更早挂着的由简报的 angle_debt(7 天)管。
 ARCHIVE_PENDING_DAYS = 1
 # 和 protocol.md「5. score_drafts」那段同一个口径: 查重通过 → 交给用户之前、同一轮里存档; 改的是已经存过的那篇 →
-# 直接 score_drafts 带 replaces_version_id。⚠️ 改存过的稿子**不能**先过 check_drafts: check_drafts 不认
-# replaces_version_id, 会拿它和自己存档的原版比, 必然 reject(只有 score_drafts 先摘旧版再查重)。整篇推翻、
-# 换角度重写的才当新稿, 走 check_drafts → score_drafts。
+# score_drafts 带 replaces_version_id(它先摘掉旧版再查重)。要先过一遍 check_drafts 也行(2026-10-30 发布收尾): 同样
+# 带上 replaces_version_id, 它就不拿这篇和它自己存档的旧版比(见 _without_own_versions)。原来 check_drafts 不认这个
+# 字段, 改稿一过 check_drafts 就被自己的旧版拦下(「正文开头与历史稿完全一致」), 这里才叫模型跳过它 —— 模型照协议先查一遍
+# 的那几次, 写手听到的是「改过的稿子和历史稿重复」。整篇推翻、换角度重写的才当新稿, 走 check_drafts → score_drafts。
 ARCHIVE_PENDING_NEXT_STEP = (
     "查重通过的稿子, 交给用户之前就在同一轮里调 score_drafts 存档(每篇带 angle_key, 不等用户表态); "
-    "按反馈改的是已经存过的那篇, 就直接调 score_drafts 带 replaces_version_id(它会先摘掉旧版再查重, "
-    "不用先跑 check_drafts); 整篇推翻、换角度重写的当新稿, 先过 check_drafts 再存; 都存完再给用户看"
+    "按反馈改的是已经存过的那篇, 就调 score_drafts 带 replaces_version_id(它会先摘掉旧版再查重; 要先过 check_drafts "
+    "的话那篇同样带上 replaces_version_id, 就不会拿它和自己的旧版比); 整篇推翻、换角度重写的当新稿, 先过 check_drafts "
+    "再存; 都存完再给用户看"
     "(存档是你这边的事, 别跟用户提「存档」、也别让用户做什么: 用户写完贴进飞书就行, 查重时带了 angle_key 的稿子"
     "发出去以后写作台会自己从飞书对回来)。")
 def _supersede_snapshots(client, project_id: str, drafts: list[dict], vids: dict[int, str]) -> None:
@@ -826,7 +828,7 @@ class HistHit(NamedTuple):
 
 
 def _history_probe(client, project_id: str, o_hashes: list[str],
-                   grams: list[set], new_vecs):
+                   grams: list[set], new_vecs, *, own: dict[int, list[dict]] | None = None):
     """返回 ``(probe, hist_size, hist_with_vec, hist_untitled, hist_truncated)``。
 
     ``probe(i)`` → ``HistHit`` —— 第 i 篇草稿与【历史】比对的四路最佳命中。
@@ -844,6 +846,9 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
 
     ⚠️ 只有"RPC 不存在"才降级到 B。查重是 deskcore 唯一不 fail-open 的路径,
     其它异常(权限 / 库故障)一律冒泡。
+
+    ``own``: 改稿那几篇不比的行(它替换的旧 item 的指纹, 见 _gate)。A 路径库里排除不了, 交给 _without_own_versions
+    在 Python 里补; B 路径本来就把历史拉回来了, 直接跳过那几行。
     """
     # ⚠️ ``embed_texts`` 是**逐位对齐**的, 但某一位可能是 None —— 那条稿子没有
     # 可嵌入的标题(空标题)。所以判据必须是"这一位有没有向量", 不能只判
@@ -927,6 +932,9 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             )
 
         # 下推路径比的是【全量】—— 库里没有 4000 条那个上限, 所以永不截断。
+        if own:
+            return (_without_own_versions(client, project_id, _probe, own, o_hashes, grams, new_vecs),
+                    total, with_vec, untitled, False)
         return _probe, total, with_vec, untitled, False
 
     logger.warning(
@@ -989,7 +997,137 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             c_sample,
         )
 
+    if own:
+        # 改稿那几篇: 历史里去掉它旧 item 的那几行再比(按指纹行的 id); 别的稿子照旧走 _probe_py
+        rest = _sketch_rows(history)
+        skip = {i: {str(r.get("id")) for r in rows} for i, rows in own.items()}
+
+        def _probe_py_own(i: int) -> HistHit:
+            if i not in skip:
+                return _probe_py(i)
+            return _best_hits([x for x in rest if str(x[0].get("id")) not in skip[i]],
+                              o_hashes[i], grams[i], _vec_at(new_vecs, i))
+        return _probe_py_own, len(history), with_vec, untitled, truncated
     return _probe_py, len(history), with_vec, untitled, truncated
+
+
+def _vec_at(new_vecs, i: int):
+    """第 i 篇的标题向量; 这一批没算向量、或者这一位是 None(空标题)都回 None。"""
+    return new_vecs[i] if new_vecs and i < len(new_vecs) and new_vecs[i] else None
+
+
+def _sketch_rows(rows: list[dict]) -> list[tuple[dict, set, list | None]]:
+    """历史行 → ``(行, 四字串 sketch 的集合, 本模型的标题向量或 None)``, 给 _best_hits 逐行比。别的模型产的向量、
+    来路不明的(embedding_model 为空)一律当没有, 同 _probe_py 的口径。"""
+    return [(r, set(r.get("ngram_hashes") or []),
+             r.get("title_embedding") if r.get("embedding_model") == dedup.EMBEDDING_MODEL else None)
+            for r in rows]
+
+
+def _best_hits(rows: list[tuple[dict, set, list | None]], o_hash: str, grams_i: set, vec) -> HistHit:
+    """一篇草稿和给定的这几行逐路比, 四路各取最佳命中。比法与 _probe_py 一字不差: sketch 走 sketch_overlap, 包含度的样本量
+    先过闸再比大小, 开头哈希为空不算撞车。只给改稿排除旧版那条路用(_probe_py 照旧是 Python 路径的主体)。"""
+    best_sim, sim_hit = 0.0, None
+    best_j, j_hit = 0.0, None
+    best_c, c_hit, c_sample = 0.0, None, 0
+    open_hit = None
+    for r, hg, emb in rows:
+        if vec and emb:
+            s = dedup.cosine_similarity(vec, emb)
+            if s > best_sim:
+                best_sim, sim_hit = s, r
+        if hg:
+            j, c, s = fp.sketch_overlap(grams_i, hg)
+            if j > best_j:
+                best_j, j_hit = j, r
+            if s >= fp.CONTAIN_MIN_SAMPLE and c > best_c:
+                best_c, c_hit, c_sample = c, r, s
+        if o_hash and open_hit is None and r.get("opening_hash") == o_hash:
+            open_hit = r
+
+    def _t(r):
+        return (r.get("title") or "") if r is not None else None
+    return HistHit(best_sim, _t(sim_hit), best_j, _t(j_hit), open_hit is not None, _t(open_hit),
+                   best_c, _t(c_hit), c_sample)
+
+
+# ── 改稿不和自己的旧版比(2026-10-30 发布收尾) ─────────────────────────────────────
+# check_drafts 带 replaces_version_id 的那篇, 旧 item 全部版本的指纹行不算它的对手。score_drafts 是先把那几行摘下来再查;
+# check_drafts 是只读的, 不能摘, 而库里那一路(deskcore_check_drafts)每一路只回最像的那一条的标题、也没法点名排除哪几行
+# —— 不加迁移的做法是在 Python 里补:
+#   1. 拿旧版那几行和这篇逐路比一次(几行而已)。库里回的最佳命中比得过它们(更像), 或者标题和它们都对不上, 那就是别的
+#      稿子, 照用 —— 这时"其余历史里最像的"就是它;
+#   2. 比不过的(命中的就是旧版, 或者分不清): 这一路在去掉旧版之后的历史上重比。开头精确撞车按开头哈希点查(取旧版行数 + 1
+#      行就够分清有没有别的稿子); 标题语义 / 四字串把项目指纹拉回来、去掉旧版那几行再比, 只拉要比的列, 一次查重只拉一遍。
+# 拿不准时一律当成"命中的是旧版"去重比: 重比算的就是去掉旧版之后的真值, 多比一次只是慢, 不会错。改稿时标题、正文多半和
+# 旧版很像, 所以第 2 步在改稿时几乎总要走 —— 那是这条路的代价(同 Python 路径, 只给改稿的那几篇), 新稿一行都不多拉。
+SIM_TIE_EPS = 1e-3          # 库里(pgvector)和这里(double)算同一对余弦能差出来的量; 差在这以内的当打平
+SKETCH_TIE_EPS = 1e-9       # sketch 的两个比值两边都是整数相除, 只差浮点误差
+
+
+def _without_own_versions(client, project_id: str, probe, own: dict[int, list[dict]],
+                          o_hashes: list[str], grams: list[set], new_vecs):
+    """库里那一路的 ``probe`` → 改稿那几篇不算旧版之后的 ``probe``(见上面那段说明)。出错照样上抛: 查重是硬闸。"""
+    fixed: dict[int, HistHit] = {}
+    redo: dict[int, set[str]] = {}
+    own_ids: dict[int, set[str]] = {}
+    for i, rows in own.items():
+        h = fixed[i] = probe(i)
+        own_ids[i] = {str(r.get("id")) for r in rows}
+        if not rows:
+            continue                                    # 旧版一行指纹都没有: 库里回的命中不可能是它
+        mine = _best_hits(_sketch_rows(rows), o_hashes[i], grams[i], _vec_at(new_vecs, i))
+        names = {r.get("title") or "" for r in rows}
+        sig = set()
+        if h.open_exact and mine.open_exact:
+            sig.add("opening")
+        if h.sim_title is not None and h.sim_title in names and h.sim <= mine.sim + SIM_TIE_EPS:
+            sig.add("title")
+        if h.j_title is not None and h.j_title in names and h.jac <= mine.jac + SKETCH_TIE_EPS:
+            sig.add("ngram")
+        if h.contain_title is not None and h.contain_title in names and h.contain <= mine.contain + SKETCH_TIE_EPS:
+            sig.add("contain")
+        # 库里回的值本来就 ≤ 0 的那一路: 去掉旧版之后也只会是 0, 不用重比, 把指着旧版的那个标题摘掉就行(不然通过的稿子
+        # 会把它自己的旧版报成「最接近的参照」)
+        zero = {"title": h.sim <= 0, "ngram": h.jac <= 0, "contain": h.contain <= 0}
+        patch = {**({"sim": 0.0, "sim_title": None} if "title" in sig and zero["title"] else {}),
+                 **({"jac": 0.0, "j_title": None} if "ngram" in sig and zero["ngram"] else {}),
+                 **({"contain": 0.0, "contain_title": None, "contain_sample": 0}
+                    if "contain" in sig and zero["contain"] else {})}
+        if patch:
+            fixed[i] = fixed[i]._replace(**patch)
+        sig = {s for s in sig if not zero.get(s)}
+        if sig:
+            redo[i] = sig
+    for i, sig in redo.items():
+        if "opening" in sig:
+            hits = store.fingerprints_with_opening(client, project_id, o_hashes[i], limit=len(own_ids[i]) + 1)
+            other = next((r for r in hits if str(r.get("id")) not in own_ids[i]), None)
+            fixed[i] = fixed[i]._replace(open_exact=other is not None,
+                                         open_title=(other.get("title") or "") if other is not None else None)
+    heavy = {s for sig in redo.values() for s in sig} - {"opening"}
+    if heavy:
+        history, truncated = store.fingerprints(client, project_id, vectors="title" in heavy)
+        if truncated:
+            logger.warning("check_drafts: 改稿排除旧版时项目 %s 的历史指纹超过 %d 条, 重比只覆盖了最近的这些",
+                           project_id, len(history))
+        prepped = _sketch_rows(history)
+        for i, sig in redo.items():
+            if not sig & heavy:
+                continue
+            m = _best_hits([x for x in prepped if str(x[0].get("id")) not in own_ids[i]],
+                           "", grams[i], _vec_at(new_vecs, i) if "title" in sig else None)
+            patch: dict = {}
+            if "title" in sig:
+                patch.update(sim=m.sim, sim_title=m.sim_title)
+            if "ngram" in sig:
+                patch.update(jac=m.jac, j_title=m.j_title)
+            if "contain" in sig:
+                patch.update(contain=m.contain, contain_title=m.contain_title, contain_sample=m.contain_sample)
+            fixed[i] = fixed[i]._replace(**patch)
+        logger.info("check_drafts: 改稿 %d 篇排除了旧版重比(project=%s, 信号=%s, 历史 %d 行)",
+                    len(redo), project_id, sorted(heavy), len(history))
+    return lambda i: fixed[i] if i in fixed else probe(i)
 
 
 def _rpc_missing_telemetry(name: str, project_id: str) -> None:
@@ -1014,6 +1152,12 @@ def check_drafts(client, project_id: str, drafts: list[dict],
     ⚠️ 这是审计 COR-015 里【读侧最要命的那个】: 返回值的 ``collided_with`` 会回显
     撞车对象的**标题**。没有归属校验时, 拿一篇随便什么稿子去撞别人的项目, 就是
     一个可以反复调用的历史标题读取接口。所以 user_id 现在是必需的。
+
+    ── 2026-10-30: 改稿带 ``replaces_version_id`` ──────────────────────────
+    改的是已经存过的那篇: 每篇可以带 ``replaces_version_id``(同 score_drafts 的字段名、同一套核对, _lookup_replacements)。
+    核对通过的, 旧 item 全部版本的指纹行不算它的对手(_without_own_versions), 别的稿子照常比; 这一行带回
+    ``replaces_version_id``。核对不过的(不是 UUID / 不是本项目的版本 / 和 version_id 同时带 / 同一篇替换两次)判 reject,
+    ``gate="replace_lookup"``, 和 score_drafts 那边拒的是同一种。**仍然只读**: 不摘指纹, 摘指纹是 score_drafts 存档时的事。
     """
     assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
@@ -1022,12 +1166,39 @@ def check_drafts(client, project_id: str, drafts: list[dict],
     titles = [(d.get("title") or "").strip() for d in drafts]
     bodies = [d.get("body") or "" for d in drafts]
     new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
-    out = _gate(client, project_id, titles, bodies, new_vecs)
+    # 没有改稿的批次一次多余的查询都不加(下推路径的 CI 守着"不拉指纹行")
+    replace, bad_ref = ({}, {})
+    if any(isinstance(d, dict) and d.get("replaces_version_id") for d in drafts):
+        replace, bad_ref = _lookup_replacements(client, project_id, drafts)
+    out = _gate(client, project_id, titles, bodies, new_vecs,
+                own=_own_fingerprints(client, project_id, replace))
+    if replace or bad_ref:
+        _mark_replacements(out, replace, bad_ref)
     if record_snapshot:
         # 只有写手那边的 AI 走工具查重才记(tools.check_drafts); 运维的 `cli check` 试跑不记 —— 不然试跑的稿子挂在写手名下,
-        # 发出去以后会被当成写作台写的转正(W-38 复审)
+        # 发出去以后会被当成写作台写的转正(W-38 复审)。
+        # 改稿那篇照样记一行, 但记不下它替换的是哪一版: draft_snapshots 没有这样的列(version_id 是转正后的那一版), 这次
+        # 不加列。存档时(score_drafts 带 replaces_version_id)同样文字的底稿记成转正到新的那一版(_supersede_snapshots);
+        # 没存档就发出去的, tv-sync 先拿主索引对旧版, 对不上才轮到这份底稿。
         _record_snapshots(client, project_id, user_id, drafts, out)
     return out
+
+
+def _mark_replacements(out: dict, replace: dict, bad_ref: dict) -> None:
+    """check_drafts 的回执里标出改稿那几篇(2026-10-30)。核对通过的带回 ``replaces_version_id``; 核对不过的改判 reject,
+    ``gate="replace_lookup"`` —— 和 score_drafts 那边拒的是同一种, 稿子本身不用重写, 改对 id 再查。summary 的三个数跟着重算。"""
+    for r in out.get("results") or []:
+        i = r.get("index")
+        if i in replace:
+            r["replaces_version_id"] = replace[i]["old_version_id"]
+        elif i in bad_ref:
+            r.pop("collided_note", None)
+            r.update(status="reject", collided_with="", collided_scope="", decided_by=[], gate="replace_lookup",
+                     reason=(f"{bad_ref[i]}。这篇没按改稿查: 改的是已经存过的那篇, 就把 replaces_version_id 改成 "
+                             "score_drafts 返回的 version_ids 里对应的那个再查一次, 稿子不用重写; 不是改稿就去掉这个字段"))
+    s = out.get("summary") or {}
+    for k in ("pass", "warn", "reject"):
+        s[k] = sum(1 for r in out.get("results") or [] if r.get("status") == k)
 
 
 # ── 查重时记下底稿(W-38, 2026-10-29) ────────────────────────────────────────────
@@ -1075,7 +1246,7 @@ def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list
 
 
 def _gate(client, project_id: str, titles: list[str], bodies: list[str],
-          new_vecs) -> dict:
+          new_vecs, *, own: dict[int, list[dict]] | None = None) -> dict:
     """check_drafts 的判定主体: 与历史比对 + 本批内互比 + 逐条 verdict。
 
     从 check_drafts 里抽出来是为了让 **commit_drafts 也跑同一套**(2026-09-17)。
@@ -1086,6 +1257,9 @@ def _gate(client, project_id: str, titles: list[str], bodies: list[str],
 
     不做归属校验、不算向量: 两个调用方各自做完再进来, 向量按 ``titles`` 逐位
     对齐(某一位可以是 None —— 空标题算不出向量)。
+
+    ``own``(2026-10-30): ``{第几篇: 它替换的旧 item 的指纹行}``, 只有 check_drafts 的改稿那几篇有 —— 这些行不算那一篇
+    的对手(见 _without_own_versions)。commit_drafts 不传: 它在进闸之前已经把旧版的指纹摘下来了。
     """
     o_hashes = [fp.opening_hash(b) for b in bodies]
     grams = [set(fp.ngram_hashes(b)) for b in bodies]
@@ -1095,7 +1269,7 @@ def _gate(client, project_id: str, titles: list[str], bodies: list[str],
     # ``hist`` 是一个「按 i 取四路最佳命中」的可调用对象, 两条路径共用同一个
     # 形状, 下面拼 verdict 的代码因此完全不用分叉。
     hist, hist_size, hist_with_vec, hist_untitled, hist_truncated = _history_probe(
-        client, project_id, o_hashes, grams, new_vecs)
+        client, project_id, o_hashes, grams, new_vecs, own=own)
 
     # ⚠️ 降级判定不能只看"这批能不能算向量"(codex review P1)。
     # 历史行的 title_embedding 可能是 NULL —— 当初 commit 时 embedding 服务不可用
@@ -1275,41 +1449,7 @@ def _prepare_replacements(client, project_id: str, drafts: list[dict]) -> tuple[
     删之前把**全部**要摘的行先读齐, 删到一半失败就把已删的放回再上抛 —— 否则前面
     几条的指纹就此消失, 而外层 try 还没拿到 stash(codex #84 P1)。
     """
-    want = {i: str(d.get("replaces_version_id")).strip()
-            for i, d in enumerate(drafts) if d.get("replaces_version_id")}
-    if not want:
-        return {}, {}, {}
-    rejected: dict[int, str] = {}
-    lookup: dict[int, str] = {}
-    for i, vid in want.items():
-        if not _is_uuid(vid):
-            # uuid 列的 IN 谓词在解析阶段就会拒掉整条查询, 一个打错的 id 会连累同批
-            # 所有好的(codex #84 P2)。
-            rejected[i] = f"replaces_version_id={vid!r} 不是合法的 UUID"
-        elif drafts[i].get("version_id"):
-            # 带 version_id 的稿子是"库里本来就有这一版"(UI 生成), 不会造新 id ——
-            # 和替换互斥, 否则新指纹写进去之后才发现没有 id 可挂(codex #84 P2)。
-            rejected[i] = "不能同时带 version_id 和 replaces_version_id: 替换稿由入库分配新 id"
-        else:
-            lookup[i] = vid
-    if not lookup:
-        return {}, rejected, {}
-    known = store.items_for_versions(client, project_id, list(lookup.values()))
-    replace: dict[int, dict] = {}
-    seen_items: dict[str, int] = {}
-    for i, vid in lookup.items():
-        hit = known.get(vid)
-        if not hit:
-            rejected[i] = (f"replaces_version_id={vid} 不是本项目里的版本 —— 只能替换"
-                           "本项目 commit_drafts 返回过的 version_id")
-            continue
-        if hit["item_id"] in seen_items:
-            rejected[i] = (f"replaces_version_id={vid} 与第 {seen_items[hit['item_id']]} 条"
-                           "替换的是同一篇稿子, 一次只能替换一次")
-            continue
-        seen_items[hit["item_id"]] = i
-        replace[i] = {"item_id": hit["item_id"], "old_version_id": vid,
-                      "status": hit.get("status")}
+    replace, rejected = _lookup_replacements(client, project_id, drafts)
     if not replace:
         return replace, rejected, {}
     versions = store.version_ids_of_items(client, [r["item_id"] for r in replace.values()])
@@ -1329,6 +1469,68 @@ def _prepare_replacements(client, project_id: str, drafts: list[dict]) -> tuple[
             raise
         stash[i] = rows
     return replace, rejected, stash
+
+
+def _lookup_replacements(client, project_id: str, drafts: list[dict]) -> tuple[dict, dict]:
+    """核 ``replaces_version_id``, 只读。回 ``(replace, rejected)``:
+      replace  {index: {"item_id", "old_version_id", "status"}}
+      rejected {index: 原因}  —— 不是 UUID / 同时带了 version_id / 版本不在本项目 / 同一版被替换两次
+
+    score_drafts(_prepare_replacements, 核完再摘指纹)和 check_drafts(核完只在比对时把旧版排除在外)共用这一处
+    (2026-10-30): 同一个 id 两边的判断一个字不差, 不会查重时放过、存档时又拒。
+    """
+    want = {i: str(d.get("replaces_version_id")).strip()
+            for i, d in enumerate(drafts) if isinstance(d, dict) and d.get("replaces_version_id")}
+    if not want:
+        return {}, {}
+    rejected: dict[int, str] = {}
+    lookup: dict[int, str] = {}
+    for i, vid in want.items():
+        if not _is_uuid(vid):
+            # uuid 列的 IN 谓词在解析阶段就会拒掉整条查询, 一个打错的 id 会连累同批
+            # 所有好的(codex #84 P2)。
+            rejected[i] = f"replaces_version_id={vid!r} 不是合法的 UUID"
+        elif drafts[i].get("version_id"):
+            # 带 version_id 的稿子是"库里本来就有这一版"(UI 生成), 不会造新 id ——
+            # 和替换互斥, 否则新指纹写进去之后才发现没有 id 可挂(codex #84 P2)。
+            rejected[i] = "不能同时带 version_id 和 replaces_version_id: 替换稿由入库分配新 id"
+        else:
+            lookup[i] = vid
+    if not lookup:
+        return {}, rejected
+    known = store.items_for_versions(client, project_id, list(lookup.values()))
+    replace: dict[int, dict] = {}
+    seen_items: dict[str, int] = {}
+    for i, vid in lookup.items():
+        hit = known.get(vid)
+        if not hit:
+            rejected[i] = (f"replaces_version_id={vid} 不是本项目里的版本 —— 只能替换"
+                           "本项目 score_drafts 返回过的 version_id")
+            continue
+        if hit["item_id"] in seen_items:
+            rejected[i] = (f"replaces_version_id={vid} 与第 {seen_items[hit['item_id']]} 条"
+                           "替换的是同一篇稿子, 一次只能替换一次")
+            continue
+        seen_items[hit["item_id"]] = i
+        replace[i] = {"item_id": hit["item_id"], "old_version_id": vid,
+                      "status": hit.get("status")}
+    return replace, rejected
+
+
+def _own_fingerprints(client, project_id: str, replace: dict) -> dict[int, list[dict]]:
+    """check_drafts 的改稿那几篇: 旧 item **全部版本**在指纹库里的行(和 _prepare_replacements 摘的是同一批: 发出去的帖记在
+    那一版下的(W-40)也在里面), 只读。``{index: [行, …]}``, 向量列解析成 list(同 store.fingerprints)。"""
+    if not replace:
+        return {}
+    versions = store.version_ids_of_items(client, [r["item_id"] for r in replace.values()])
+    ids_of = {i: [v["id"] for v in versions.get(r["item_id"]) or []] or [r["old_version_id"]]
+              for i, r in replace.items()}
+    rows = store.fingerprint_rows_for_versions(client, project_id, [v for ids in ids_of.values() for v in ids])
+    by_version: dict[str, list[dict]] = {}
+    for row in rows:
+        row = {**row, "title_embedding": db._parse_pgvector(row.get("title_embedding"))}
+        by_version.setdefault(str(row.get("version_id")), []).append(row)
+    return {i: [row for v in ids for row in by_version.get(str(v), [])] for i, ids in ids_of.items()}
 
 def _empty_body_reason(draft: dict) -> str:
     """正文空的那篇怎么说(W-30)。只列字段名, 不带内容。"""
@@ -2577,10 +2779,16 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     return out
 
 
-DELIVERY_NEXT_STEP = ("这个项目有交付模板: delivery.text 是按模板拼好的整批交付稿。delivery.problems 里有的先改(改过的那几篇带 "
-                      "replaces_version_id 再调一次; 新返回的 delivery.text 只含这几篇, 用它们按顺序替换原来那几篇: 表格只换那几行, "
-                      "新返回的表头和分隔行不要再贴一遍; 一篇一段的就换那几段), 然后把 delivery.text 原样交给用户, 不要自己重排版式、"
-                      "不要再加标记。")
+# 交付稿永远整段原样交(2026-10-30 发布收尾)。原来改稿重存时 delivery 只拼改过的那几篇, 这里叫模型「用它们按顺序替换原来
+# 那几篇、表头不要再贴一遍」—— 和同一句里的「原样交给用户」打架, 模型自己拼表格时行错位、表头贴两遍, 写手拿到的是两张半截
+# 的表。现在改稿重存时服务端把原来那一整批拼回来(_whole_batch_delivery), 只有拼不回来时才只给这次的几篇(scope=this_call,
+# 另外补一句 DELIVERY_PARTIAL_NEXT_STEP)。
+DELIVERY_NEXT_STEP = ("这个项目有交付模板: delivery.text 是按模板拼好的交付稿; 改过重存的那一次, 它是原来那一整批(没改的几篇照"
+                      "它们现在的样子, 改过的换在原位, 顺序不变)。delivery.problems 里有的先改(改过的那几篇带 replaces_version_id "
+                      "再调一次, 新返回的 delivery.text 就是改好之后的整批), 然后把 delivery.text 原样整段交给用户: 不要自己拼接、"
+                      "替换其中几行或几段, 不要重排版式, 不要再加标记。")
+DELIVERY_PARTIAL_NEXT_STEP = ("这一次 delivery.text 只有这次存进去的几篇(delivery.scope 是 this_call: 原来那一批的其余几篇这次"
+                              "没能一起拼出来): 照样原样交给用户, 跟用户说这是改过的那几篇, 其余几篇和上一次交给用户的一样。")
 RULE_CHECKS_NEXT_STEP = ("rule_checks 是代码按项目规则逐篇查出来的: 标「必须改」的改完再交(带 replaces_version_id 再调一次), "
                          "「建议改」的告诉用户。只是参考, 存档已经成功了。")
 RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的全列了, 没列的都是建议改), 还有 rule_checks_more 条没列: "
@@ -2591,6 +2799,127 @@ RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代�
                                    "或者存的 check 用不了; 存档不受影响): 从 from_index 那篇起算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
                                    "它之前查出来、列在 rule_checks 里的命中照常算。severity 是 hard 的(「硬约束·没查完」)照规则原文"
                                    "(rule)把 from_index 起的那几篇自己逐篇核一遍。")
+
+
+# ── 改稿重存时把原来那一整批拼回来(2026-10-30 发布收尾) ─────────────────────────────────────
+# 话题、评论、方向不进 versions(那里只有标题、正文), 原来服务端拼不回上一次的稿子: 改稿重存的那一次只拼改过的几篇, 叫模型
+# 自己按顺序替换原来那几行 —— 和同一句里的「原样交给用户」打架。现在 score_drafts 存档时把这三样连同这一批的顺序记进 batch 的
+# params(jsonb, 键 DELIVERY_PARTS_KEY, 不加迁移): ``{"order": [每篇第一版的 version_id, 按写手传的顺序], "parts": {version_id:
+# {tags / comments / direction 里写手传了的那几样}}}``; 改稿挂上旧 item 时, 新的那一版的三样并进旧 batch 记的那一份。只在项目
+# 配了交付模板时记(没模板就没有交付稿可拼)。这之前存的 batch、补录的、底稿转正的都没有这一份: 改它们的稿子时照旧只拼改过的几篇,
+# 回包里 delivery.scope = this_call、scope_fallback 说为什么。
+DELIVERY_PARTS_KEY = "delivery_parts"
+DELIVERY_FIELDS = ("tags", "comments", "direction")
+DELIVERY_SCOPE_WHOLE = "whole_batch"
+DELIVERY_SCOPE_THIS_CALL = "this_call"
+
+
+def _delivery_fields(d: dict) -> dict:
+    """一篇稿子交付时要、又不进 versions 的那几样。写手传了哪样记哪样(传了 ``tags: []`` 和没传拼出来不一样, 见
+    delivery.assemble)。过一遍 JSON: 记不下的值按字符串记 —— 宁可那一格拼得不对, 也不能让建 batch 那一次写失败。"""
+    picked = {k: d[k] for k in DELIVERY_FIELDS if isinstance(d, dict) and k in d}
+    return json.loads(json.dumps(picked, ensure_ascii=False, default=str))
+
+
+def _wants_delivery_parts(project: dict) -> bool:
+    """项目配了能用的交付模板才记交付用的那几样。模板坏了不记: 拼交付稿那一步自己会记日志。"""
+    try:
+        return delivery.template_of(project) is not None
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def _record_revised_parts(client, project_id: str, revised: dict[int, str], drafts: list[dict],
+                          minted_ids: dict[int, str]) -> None:
+    """改稿挂上旧 item 的那几篇: 新的那一版的话题 / 评论 / 方向并进旧 batch 记的那一份(调用方持项目写锁, 同一 batch 不会
+    并发改)。旧 batch 没记过的不补: 没有当初的顺序, 补了也拼不回整批。**不抛**: 记不上只是下次改同一批时退回只拼改过的几篇。"""
+    try:
+        of_item = store.batch_ids_of_items(client, sorted(set(revised.values())))
+        by_batch: dict[str, dict] = {}
+        for i, item_id in revised.items():
+            if of_item.get(item_id):
+                by_batch.setdefault(of_item[item_id], {})[minted_ids[i]] = _delivery_fields(drafts[i])
+        params = store.batch_params(client, list(by_batch))
+        for bid, parts in by_batch.items():
+            rec = (params.get(bid) or {}).get(DELIVERY_PARTS_KEY)
+            if isinstance(rec, dict) and isinstance(rec.get("parts"), dict):
+                store.merge_batch_params(client, bid, {DELIVERY_PARTS_KEY: {**rec, "parts": {**rec["parts"], **parts}}})
+    except Exception:                                   # noqa: BLE001 — 增强项, 存档已经成了
+        logger.warning("commit_drafts: 改稿的话题 / 评论 / 方向没记进原来那一批(project=%s), 下次改这一批时只拼改过的几篇",
+                       project_id, exc_info=True)
+
+
+def _whole_batch_delivery(client, project_id: str, tpl: dict, drafts: list[dict], indices: list[int],
+                          revised: dict[int, str]) -> tuple[dict | None, str | None, dict]:
+    """改稿重存时拼原来那一整批。改稿挂的每个旧 batch 一段(按 batch 建的先后; 一个表格模板就是一张表), 段里按当初的顺序:
+    没改的几篇用它们现在的那一版(标题正文从 versions 取, 话题 / 评论 / 方向从 batch 记的那一份取), 这次改过的换在原位。
+    这次另有新稿的, 拼成最后一段(它们是新的一批)。``problems`` 只报这次传的那几篇(``index`` 是写手这次传的位置): 没改的
+    几篇上一次交付时已经报过, 这一次也改不了它们。
+
+    回 ``(delivery, None, meta)``; 拼不回来回 ``(None, 原因, {})``, 原因是机器字段 ``scope_fallback`` 的值:
+      · ``batch_unknown``: 旧 item 找不到所在的 batch, 或者那个 batch 不在本项目;
+      · ``batch_not_recorded``: 旧 batch 没记交付用的那几样(这之前存的、补录的、底稿转正的), 或者某一篇现在那一版没记上;
+      · ``batch_changed``: 旧 batch 里的稿子和记下的顺序对不上。
+    查库出错上抛, 调用方退回只拼这次的几篇(``lookup_failed``)。"""
+    items = sorted(set(revised.values()))
+    of_item = store.batch_ids_of_items(client, items)
+    if any(it not in of_item for it in items):
+        return None, "batch_unknown", {}
+    first_at: dict[str, int] = {}                       # batch → 这次传的稿子里最先挂到它上面的下标(同一时刻建的按它排)
+    for i in sorted(revised):
+        first_at.setdefault(of_item[revised[i]], i)
+    info = store.batch_drafts(client, project_id, list(first_at))
+    if set(info) != set(first_at):
+        return None, "batch_unknown", {}
+    at_item = {item_id: i for i, item_id in revised.items()}
+    groups: list[tuple[list[dict], list[int | None]]] = []
+    untouched = 0
+    for bid in sorted(first_at, key=lambda b: (str(info[b].get("created_at") or ""), first_at[b])):
+        rec = info[bid]["params"].get(DELIVERY_PARTS_KEY)
+        if not (isinstance(rec, dict) and isinstance(rec.get("order"), list) and isinstance(rec.get("parts"), dict)):
+            return None, "batch_not_recorded", {}
+        by_version = {v: it for it in info[bid]["items"] for v in it["version_ids"]}
+        placed, seen = [], set()
+        for vid in rec["order"]:
+            it = by_version.get(str(vid))
+            if it is not None and it["item_id"] not in seen:     # 当初没建成的跳过
+                seen.add(it["item_id"])
+                placed.append(it)
+        if len(seen) != len(info[bid]["items"]):
+            return None, "batch_changed", {}
+        g_drafts: list[dict] = []
+        g_idx: list[int | None] = []
+        for it in placed:
+            i = at_item.get(it["item_id"])
+            if i is not None:
+                g_drafts.append(drafts[i])
+                g_idx.append(i)
+                continue
+            cur = it.get("current")
+            part = rec["parts"].get(cur["id"]) if cur else None
+            if not isinstance(part, dict):
+                return None, "batch_not_recorded", {}
+            g_drafts.append({**part, "title": cur["title"], "body": cur["body"]})
+            g_idx.append(None)
+            untouched += 1
+        groups.append((g_drafts, g_idx))
+    batches = len(groups)
+    fresh = [i for i in indices if i not in revised]
+    if fresh:
+        groups.append(([drafts[i] for i in fresh], list(fresh)))
+    texts: list[str] = []
+    problems: list[dict] = []
+    fmt, n = tpl.get("layout"), 0
+    for g_drafts, g_idx in groups:
+        res = delivery.assemble(tpl, g_drafts, indices=g_idx)
+        fmt = res["format"]
+        texts.append(res["text"])
+        n += len(g_drafts)
+        problems += [p for p in res["problems"] if p.get("index") is not None]
+    problems.sort(key=lambda p: p["index"])             # 稳定排序: 同一篇的几条保持原来的先后
+    return ({"format": fmt, "text": "\n\n".join(texts), "problems": problems, "scope": DELIVERY_SCOPE_WHOLE,
+             "batches": batches, "untouched": untouched},
+            None, {"drafts": n, "batches": batches, "untouched": untouched})
 
 
 def _as_delivered(tpl: dict | None, drafts: list[dict]) -> tuple[list[dict], list[list[str]] | None]:
@@ -2610,11 +2939,15 @@ def _as_delivered(tpl: dict | None, drafts: list[dict]) -> tuple[list[dict], lis
 
 
 def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
-                              indices: list[int], out: dict, *, tactic: str = "") -> dict:
+                              indices: list[int], out: dict, *, tactic: str = "",
+                              revised: dict[int, str] | None = None) -> dict:
     """存完档之后的两样纯代码活(2026-10-20), 结果挂进 ``out``, 返回给 batch_metrics 的那一小块。**不抛**。
 
     1. 交付版式: 项目配了 ``default_params.delivery`` 就按模板把存进去的那几篇拼好(``out["delivery"]``)。
        模板坏了只记日志、不带这一块 —— 打分照常(运维用 CLI 设模板时已经校验过, 走到这里多半是有人手改了库)。
+       ``revised``(2026-10-30): 这次改稿重存、真存进去了的那几篇 ``{第几篇: 旧 item}``。有它就拼原来那一整批
+       (_whole_batch_delivery, ``delivery.scope = "whole_batch"``); 拼不回来就照旧只拼这次的几篇, ``scope = "this_call"``,
+       ``scope_fallback`` 说为什么。没有改稿的批次回包一个字不变(不带 scope)。
     2. 代码查规则: 和简报同一个池子里带 check 的那几条, soft 的过同一道方向闸, 逐篇查(``out["rule_checks"]``,
        有命中才带)。查不成就带 ``rule_checks_status = "error"``: 不带的话和"查过了、没命中"长得一模一样。正则规则限时
        (rulecheck.check), 没在时限内查完的、存的 check 用不了的都列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了
@@ -2632,9 +2965,26 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
         meta["delivery"] = {"error": str(exc)[:200]}
     if tpl is not None and picked:
         try:
-            res = delivery.assemble(tpl, picked, indices=indices)
+            res, why, extra = None, None, {}
+            if revised:
+                try:
+                    res, why, extra = _whole_batch_delivery(client, project_id, tpl, drafts, indices, revised)
+                except Exception:                       # noqa: BLE001 — 拼不回整批就只拼这次的, 存档不受影响
+                    logger.warning("commit_drafts: 改稿重存时拼回原来那一批失败(project=%s), 这次只拼存进去的几篇",
+                                   project_id, exc_info=True)
+                    res, why, extra = None, "lookup_failed", {}
+            if res is None:
+                res = delivery.assemble(tpl, picked, indices=indices)
+                extra = {"drafts": len(picked)}
+                if revised:
+                    logger.warning("commit_drafts: 改稿重存时没拼回原来那一批(%s, project=%s), 这次只拼存进去的几篇",
+                                   why, project_id)
+                    res.update(scope=DELIVERY_SCOPE_THIS_CALL, scope_fallback=why)
+                    extra["scope_fallback"] = why
             out["delivery"] = res
-            meta["delivery"] = {"layout": res["format"], "drafts": len(picked), "problems": len(res["problems"])}
+            meta["delivery"] = {"layout": res["format"], "drafts": extra.pop("drafts"), "problems": len(res["problems"])}
+            if revised:
+                meta["delivery"].update(scope=res.get("scope"), **extra)
         except Exception as exc:                        # noqa: BLE001
             logger.exception("commit_drafts: 拼交付稿失败(project=%s) —— 存档不受影响", project_id)
             meta["delivery"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
@@ -2695,6 +3045,7 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             out["rule_checks_status"] = "error"
 
     tips = (([DELIVERY_NEXT_STEP] if "delivery" in out else [])
+            + ([DELIVERY_PARTIAL_NEXT_STEP] if (out.get("delivery") or {}).get("scope") == DELIVERY_SCOPE_THIS_CALL else [])
             + ([RULE_CHECKS_NEXT_STEP] if "rule_checks" in out else [])
             + ([RULE_CHECKS_MORE_NEXT_STEP] if "rule_checks_more" in out else [])
             + ([RULE_CHECKS_UNCHECKED_NEXT_STEP] if "rule_checks_unchecked" in out else [])
@@ -2976,6 +3327,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 except Exception as exc:                    # noqa: BLE001
                     logger.exception("commit_drafts: 替换旧版失败(index=%d, item=%s)", i, ctx["item_id"])
                     replace_error = replace_error or f"{type(exc).__name__}: {exc}"
+            # 改稿重存时要把原来那一整批拼回来(2026-10-30): 新的那一版的话题 / 评论 / 方向并进旧 batch 记的那一份。在锁里做
+            # (读-并-写), 不抛
+            keep_parts = _wants_delivery_parts(project)
+            if keep_parts and replaced_ok:
+                _record_revised_parts(client, project_id, replaced_ok, drafts, minted_ids)
             lap = _lap(commit_parts, "replace_versions", lap)
 
             minted = {"batch_id": None, "versions": {}, "error": None}
@@ -3004,10 +3360,17 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                         "arm_mixed_unmarked_item_ids": unmarked}
             lap = _lap(commit_parts, "arm", lap)
             if to_mint:
+                # 有交付模板的项目, 这一批的顺序和每篇的话题 / 评论 / 方向跟着 batch 一起记下(DELIVERY_PARTS_KEY): 以后改其中
+                # 几篇时服务端能把整批拼回来。和建 batch 是同一次写, 不多一次请求
+                parts = ({DELIVERY_PARTS_KEY: {"order": [e["version_id"] for e in to_mint],
+                                               "parts": {minted_ids[i]: _delivery_fields(drafts[i])
+                                                         for i in sorted(inserted_idx)
+                                                         if i in minted_ids and i not in replace}}}
+                         if keep_parts else {})
                 minted = store.mint_draft_identity(
                     client, project_id, str(user_id), "", to_mint,
                     batch_params={"source": "deskcore", "flywheel_arm": arm, "flywheel_arm_source": arm_source,
-                                  **arm_flags})
+                                  **arm_flags, **parts})
             identity_error = minted.get("error")
             lap = _lap(commit_parts, "mint", lap)
 
@@ -3334,8 +3697,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # 单记一段 delivery_rules(codex review on aw#115): 规则那次查询是翻页读的, 库慢的时候不是几十毫秒; 不单记的话
     # 这段时间哪一段都不算, 判定被扣掉的那截预算也查不出是谁花的。
     post_started = time.monotonic()
+    # 改稿重存、真存进去了的那几篇 → 它们挂的旧 item: 有它们就把原来那一整批拼回来(挂旧 item 半途失败的那篇也算, 写手要的是
+    # 改过的这一版换在原位)
     post_meta = _delivery_and_rule_checks(client, project, project_id, user_id, drafts, sorted(inserted_idx), out,
-                                          tactic=tactic)
+                                          tactic=tactic,
+                                          revised={i: replace[i]["item_id"] for i in sorted(inserted_idx) if i in replace})
     delivery_rules_ms = _ms_since(post_started)
 
     # ── 入库判定(参考分): 锁已经放了, 恢复指纹的那个 try 也出来了 ─────────────

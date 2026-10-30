@@ -491,6 +491,12 @@ def check_drafts(project_id: str, drafts: list[dict],
     (angle_key 是 draw_angles 给的, 有就带上 —— 查重时写作台会顺手记下这一稿和它的 angle_key; 稿子发出去以后,
     写作台按内容从飞书把它对回来、给这张牌销账, 就算这一稿没存过档)。
 
+    **改的是已经存过的那篇**(score_drafts 返回过它的 version_id): 那篇带上 ``replaces_version_id``, 值和之后调 score_drafts
+    时带的一样(上次返回的 ``version_ids`` 里对应的那个)。查重就不会拿它和它自己的旧版比, 别的稿子照常比; 这一行的返回
+    带回 ``replaces_version_id``。不带的话, 改过的稿子会被它自己的旧版拦下。id 对不上(不是本项目的版本、格式不对、两篇
+    替换同一篇)的那篇判 reject、``gate="replace_lookup"``: 稿子不用重写, 改对 id 再查一次。整篇推翻、换角度重写的是新稿,
+    不带这个字段。
+
     如果返回的 summary 里有 empty_history_warning, 说明查重库里这个项目还没有历史稿,
     本次只在本批内部比对 —— 别当作"和老稿子比过了没撞车", 把那一句照原样告诉用户就行;
     用户不用做什么。
@@ -657,6 +663,7 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     **改稿用 ``replaces_version_id`` 替换, 不要当新稿再存一次。** 值是上次返回的 ``version_ids`` 里对应的那个。存档
     会先摘掉旧版的指纹再查重, 所以不会撞上它自己; 成功后旧稿原地升成新版本, ``replaced`` 里列出来, ``version_ids``
     里是新 id。当新稿再存一次的话, 会被自己的旧版拦下, 而旧的那条永远占着角度。整篇推翻换角度重写的才当新稿。
+    改稿之前先过 check_drafts 的, 那篇在 check_drafts 里也带上同一个 ``replaces_version_id``。
 
     ⚠️ 存档时【会再查一次重】, 而且自带和 check_drafts 同一套闸: 判 reject 的不存档, 在 ``rejected`` 里列出来
     (``gate="pre_commit"`` 是闸前拦下, ``gate="atomic_recheck"`` 是写入时撞上了队友刚存的稿子)。那几条要重写后
@@ -679,11 +686,14 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     顶层参数, 放在 drafts 外面会被丢掉。``body`` 只放正文, 不放【标题】【正文】标记、不放话题行 —— 交付模板不管话题的项目
     例外(简报的 ``delivery_requirements.task`` 会说): 那种模板不读 ``tags``, 话题照项目规则写在正文末尾那一行。
 
-    **交付稿**: 项目配了交付模板时返回里有 ``delivery``: ``text`` 是按模板把这次存进去的几篇拼好的整批交付稿(表格或
-    一篇一段, 标记、话题顺序、固定话题都由服务端加), ``problems`` 是代码查出来的版式问题(``index`` 对应你传的第几篇,
-    ``what`` 说怎么改)。有 problems 就先改那几篇(带 ``replaces_version_id`` 再调一次; 新返回的 ``delivery`` 只含改过的
-    那几篇, 按顺序替换原来那几篇: 表格只换那几行, 新返回的表头和分隔行不要再贴一遍; 一篇一段的换那几段), 然后把
-    ``delivery.text`` **原样**交给用户 —— 不要自己重排、不要再加标记。没有 ``delivery`` 就照项目规则自己排。
+    **交付稿**: 项目配了交付模板时返回里有 ``delivery``: ``text`` 是按模板拼好的整批交付稿(表格或一篇一段, 标记、话题
+    顺序、固定话题都由服务端加), ``problems`` 是代码查出来的版式问题(``index`` 对应你这次传的第几篇, ``what`` 说怎么改)。
+    存新稿时它拼的是这次存进去的几篇; **改稿重存(带 ``replaces_version_id``)时它拼的是原来那一整批**: 没改的几篇照它们
+    现在的样子、改过的换在原位, 顺序和上次一样(``delivery.scope`` 是 ``whole_batch``; 改的稿子分属几批的, 一批一段依次排,
+    同一次另有新稿的排在最后)。有 problems 就先改那几篇(带 ``replaces_version_id`` 再调一次, 新返回的 ``delivery.text``
+    就是改好之后的整批)。**不管哪种, 都把 ``delivery.text`` 原样整段交给用户** —— 不要自己拼接、替换其中几行或几段,
+    不要重排, 不要再加标记。``delivery.scope`` 是 ``this_call`` 时(原来那一批这次没能一起拼出来, ``scope_fallback`` 是
+    原因)它只有这次存进去的几篇: 照样原样交, 跟用户说明这是改过的那几篇。没有 ``delivery`` 就照项目规则自己排。
 
     **规则检查**: ``rule_checks`` 是代码按项目里带 check 的规则逐篇查出来的命中(有命中才带), 每条 ``index`` /
     ``rule_id`` / ``severity`` / ``where`` / ``what``。``what`` 以「必须改」开头的是硬约束, 改完再交; 「建议改」的

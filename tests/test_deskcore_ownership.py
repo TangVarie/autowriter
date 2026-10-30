@@ -229,6 +229,15 @@ UNGATED_WITH_REASON = {
     "_snapshot_fp_payload":   "W-38(10-29), 纯函数: 拼转正版本的指纹行(只调 embedding), 不读写库",
     "_promote_snapshot_groups": "W-38(10-29), 系统任务, 只被 tv_sync 调: tv_sync 开头 _tv_owner 已对每个映射的写作台项目过了"
                                 "归属闸(以项目 owner 的身份, 同补录), 这里只写那几个项目里的底稿转成的版本",
+    # 改稿(2026-10-30 发布收尾): check_drafts 认 replaces_version_id、改稿重存时拼回原来那一整批
+    "_lookup_replacements":   "核 replaces_version_id(只读), 只被已过闸的 check_drafts 和 _prepare_replacements(commit_drafts)调; "
+                              "版本归属由 store.items_for_versions 的 inner join 钉死, 别的项目的版本查不出来",
+    "_own_fingerprints":      "只被已过闸的 check_drafts 调: 读 _lookup_replacements 核过、属于本项目的旧 item 的指纹行, 不写库",
+    "_without_own_versions":  "私有辅助函数, 只被 _history_probe(由已过闸的 check_drafts 经 _gate 调)用; 只读本项目的指纹",
+    "_record_revised_parts":  "只被已过闸的 commit_drafts 在锁里调: 把改稿挂上的旧 item(核过属于本项目)所在 batch 的 params 并一份"
+                              "话题 / 评论 / 方向, 失败只记 WARN",
+    "_whole_batch_delivery":  "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 读改稿挂的旧 batch, "
+                              "store.batch_drafts 按 project_id 过滤, 别的项目的 batch 查不出来",
 }
 
 

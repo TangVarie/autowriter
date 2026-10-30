@@ -168,7 +168,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`，以及最近的稿子在哪几处都写成一个样子 `recent_structure`（都是 2026-10-20，见 §3.1） |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
 | | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
-| 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
+| 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比。改的是已经存过的那篇时带 `replaces_version_id`（2026-10-30，同 `score_drafts` 的字段、同一套核对 `_lookup_replacements`）：旧 item 全部版本的指纹不算它的对手，别的稿子照常比；**仍然只读**，不摘指纹。库里那一路（`deskcore_check_drafts`）每路只回最像的一条的标题、排除不了哪几行，不加迁移的做法是在 Python 里补（`_without_own_versions`）：先拿旧版那几行逐路比，库里回的命中比得过它们就是别的稿子、照用；比不过的那一路在去掉旧版之后的历史上重比——开头按哈希点查，标题语义 / 四字串把项目指纹拉回来再比（只拉要比的列，只给改稿那几篇）。被旧版挡在后面的别的稿子照样拦。id 对不上判 reject、`gate="replace_lookup"`。原来不认这个字段，改稿一查就被自己的旧版拦下（「正文开头与历史稿完全一致」），`archive_pending` 那句才叫模型改稿时跳过查重 |
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
 | | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8）。2026-10-20 起项目有交付模板时带拼好的 `delivery`（§3.9），带 check 的规则有命中时带 `rule_checks`（§3.10）。2026-10-27 起带了 key 却对不上台账的另数（`unknown_angle_keys` / `used_angle_keys`，按形状分编的、别的项目的牌、台账没写进去），传回的飞轮臂对不上服务端发的时以服务端为准、重启过核对不了的另标（§3.12） |
@@ -655,8 +655,7 @@ python -m deskcore.cli delivery-format --project <uuid> --clear
 算这一条形状不对：报进 problems、不拼；查规则看的评论和交付稿是同一份（`delivery.comment_list`），交付稿里有哪几条就查哪几条。`tags` 传成整个列表 `json.dumps` 出来的一串（`'["a", "b"]'`）
 也拆开认（`delivery.split_tags`；摘话题、话题行、查话题的规则都走它），不会拼出 `#["a", #"b"]`。`problems` 只报代码判得准的：`tags` 外壳或列表成员形状不对（固定话题模板也报）、话题不够、评论条数不对、某条评论形状不对、某条评论没提到 `must_mention_any` 里的词、
 表格要方向而这篇没带、标题或正文里已经自带了标记、模板不管话题而 `tags` 里有正文里没有的话题（拼不进交付稿）；`index` 是写手传的位置。写手照协议先改 problems（带 `replaces_version_id`
-再存一次），再把 `text` 原样交给用户。⚠️ 话题和评论不落库，服务端拼不回上一次的稿子，所以重新存的那一次只拼改过的那几篇，
-写手用它按顺序替换原来那几篇（表格只换那几行，新返回的表头不再贴一遍）。
+再存一次），再把 `text` 原样整段交给用户。**改稿重存时拼的是原来那一整批**（2026-10-30）：话题、评论、方向不进 `versions`，所以存档时把这一批的顺序和每篇的这三样记进 `batches.params.delivery_parts`（`{"order": [每篇第一版的 version_id], "parts": {version_id: {写手传了的那几样}}}`，只在项目有模板时记，不加迁移）；改稿挂上旧 item 时新的那一版的三样并进去。重存时按记下的顺序，没改的几篇用它们现在那一版（标题正文从 `versions` 取），改过的换在原位，`delivery.scope = "whole_batch"`（另带 `batches` / `untouched`）；改的稿子分属几批的一批一段、按建的先后排，同一次另有新稿的拼在最后；`problems` 只报这次传的那几篇。拼不回来的（这之前存的batch、补录 / 底稿转正的、批里的稿子和记下的对不上、查库出错）照旧只拼改过的几篇，`scope = "this_call"`，`scope_fallback` 说原因（`batch_not_recorded` / `batch_changed` / `batch_unknown` / `lookup_failed`），`next_step` 多一句「照样原样交、说明是改过的那几篇」。原来是只拼改过的几篇、叫写手的模型自己按顺序替换原来那几行，和「原样交」打架。
 
 **写之前就让写手知道。** 有模板的项目，`open_project` 的简报带 `delivery_requirements`（`delivery.requirements`：要几个话题、
 固定话题有哪些、评论几条和每条要提到的词、要不要方向，外加一句 `task`），模板就在已经取到的项目行里，不多查。不给的话

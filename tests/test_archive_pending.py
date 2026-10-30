@@ -209,11 +209,13 @@ def test_next_step_says_archive_before_showing_and_how_to_resave_edits():
     for must in ("score_drafts", "同一轮", "交给用户之前", "replaces_version_id", "angle_key"):
         assert must in step, must
     assert step.count("。") == 1 and step.endswith("。"), "一句话"
-    # 改存过的那篇: 直接 score_drafts 带 replaces_version_id。叫它先跑 check_drafts 是错的 —— check_drafts 不认
-    # replaces_version_id, 拿改稿和它自己存档的原版比, 必然 reject(review on W-29)。
+    # 改存过的那篇: score_drafts 带 replaces_version_id。原来这里叫它「不用先跑 check_drafts」—— 那时 check_drafts 不认
+    # replaces_version_id, 拿改稿和它自己存档的原版比, 必然 reject(review on W-29)。2026-10-30 起 check_drafts 也认这个
+    # 字段: 先过一遍查重也行, 只要那篇同样带上 replaces_version_id(不能再说「不用跑」, 也不能叫它光着跑)。
     revise = step.split("replaces_version_id", 1)[0].rsplit(";", 1)[-1]
     assert "已经存过" in revise and "score_drafts" in revise, revise
-    assert "先重跑 check_drafts" not in step and "不用先跑 check_drafts" in step
+    assert "先重跑 check_drafts" not in step and "不用先跑 check_drafts" not in step
+    assert "check_drafts 的话那篇同样带上 replaces_version_id" in step and "不会拿它和自己的旧版比" in step
     # 只有整篇重写的新稿才先过 check_drafts
     assert "整篇推翻" in step and "先过 check_drafts" in step
 
