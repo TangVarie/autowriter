@@ -263,7 +263,9 @@ def test_score_drafts_doc_matches():
 # 3 · 撞车被拒: 拒绝不变, 写手坚持就原样交、一句话说清后果
 # ══════════════════════════════════════════════════════════════════════
 
-_INSIST = ("坚持要用", "原样交给他", "不会存进写作台的历史稿", "牌也还挂着没销账")
+_INSIST = ("坚持要用", "原样交给他", "不会存进写作台的历史稿")
+# 2026-10-30 复审: 跟写手只说「不会进历史稿」那一句; 牌没销账是台账的事, 写手做不了什么(协议「写手只做三件事」)
+_INSIST_NOT = "牌也还挂着没销账"
 
 
 def _commit_client():
@@ -288,7 +290,7 @@ def test_a_pre_commit_reject_says_what_happens_if_the_writer_insists(monkeypatch
     note = out["note"]
     for must in _INSIST:
         assert must in note, (must, note)
-    assert "不能当作已交付" not in note
+    assert "不能当作已交付" not in note and _INSIST_NOT not in note
     assert "check_drafts" in note, "默认还是重写后重新查重"
     _writer_safe(note)
 
@@ -317,4 +319,5 @@ def test_check_drafts_and_score_drafts_docs_allow_the_writer_to_insist():
         assert "不能当作已交付" not in doc, fn.__name__
         for must in _INSIST:
             assert must in doc, (fn.__name__, must)
+        assert _INSIST_NOT not in doc, fn.__name__
     assert "不用再传给 score_drafts" in (T.check_drafts.__doc__ or "")

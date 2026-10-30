@@ -597,23 +597,32 @@ def test_one_write_with_new_and_same_version_rows_does_not_null_computed_at():
 
 # ── W-33(10-30): 摘要带一句原样转给用户的话 ─────────────────────────────────────────────────────
 
-def test_the_digest_carries_a_message_to_relay_and_the_task_says_so_first():
+def test_the_digest_carries_a_message_to_relay_and_does_not_block_writing():
+    """2026-10-30 复审(协议第 1 条): 摘要不挡写稿 —— message 进开场(项目名之后), 照常写完交付, 交付那条回复末尾列改法,
+    发出那条回复之前 ack(0); 用户之后要记的 record_rule 再 ack。原来是「放在最前面 …… 然后才开始写稿」、等用户做了决定才 ack:
+    写手拿了稿子就走, 一直不 ack, 每场开头都再来一遍。"""
     d = core.edit_digest(_digest_client(), P1, user_id=ME, now=NOW)
     assert d["message"] == core.EDIT_DIGEST_MESSAGE.format(changed=3) and "3 篇" in d["message"]
     # 只有篇数, 不带标题、句子(那些在 examples 里, 由模型挑着说)
     assert not any(t in d["message"] for t in ("原标题", "新标题", "删掉的一句"))
-    assert d["task"].startswith("先把 message 原样告诉用户")
-    assert d["task"].index("然后才开始写稿") < d["task"].index("record_rule"), "说完、做完再写稿"
-    assert "没看出规律" in d["task"] and "有的话" in d["message"], "不预设一定有规律"
-    assert d["task"].index("record_rule") < d["task"].index("ack_edit_digest"), "ack 仍在用户做了决定之后"
+    task, msg = d["task"], d["message"]
+    for stale in ("才开始写稿", "最前面", "开写之前", "我先看看"):
+        assert stale not in task + msg, stale
+    assert "不挡写稿" in task and "开场" in task and "交完" in msg, "说的是交完再列, 交的时候兑现"
+    assert task.index("交付完") < task.index("ack_edit_digest") < task.index("record_rule"), \
+        "交付完列改法 → 发出那条回复之前 ack → 用户之后要记的再 record_rule"
+    assert "rules_recorded 传 0" in task and "through 不变" in task
+    assert "没看出规律" in task and "有的话" in msg, "不预设一定有规律"
 
 
 def test_tool_docs_say_relay_first_and_never_ack_an_unshown_digest():
     doc = tools.open_project.__doc__
     assert "edit_digest.message" in doc and "原样" in doc
     assert "每周最多一次" not in doc, "没 ack 时每次打开都带, 不是每周一次"
+    assert "说完再开始写稿" not in doc and "回复的最前面" not in doc, "摘要不挡写稿, 开场是项目名在前"
     ack_doc = tools.ack_edit_digest.__doc__
     assert "对话就结束了也要调" not in ack_doc and "还没把 edit_digest.message 和归纳出的改法说给用户就别调" in ack_doc
+    assert "发出这条回复之前" in ack_doc and "不等" in ack_doc, "交付那条回复里说了改法就 ack, 不等写手回话"
 
 
 # ── W-39(10-30): 差异跟写稿的写作台项目走, 不跟 TV 项目的补录目标走 ────────────────────────────────────

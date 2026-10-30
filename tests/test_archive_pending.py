@@ -212,10 +212,12 @@ def test_next_step_says_archive_before_showing_and_how_to_resave_edits():
     # 改存过的那篇: score_drafts 带 replaces_version_id。原来这里叫它「不用先跑 check_drafts」—— 那时 check_drafts 不认
     # replaces_version_id, 拿改稿和它自己存档的原版比, 必然 reject(review on W-29)。2026-10-30 起 check_drafts 也认这个
     # 字段: 先过一遍查重也行, 只要那篇同样带上 replaces_version_id(不能再说「不用跑」, 也不能叫它光着跑)。
-    revise = step.split("replaces_version_id", 1)[0].rsplit(";", 1)[-1]
-    assert "已经存过" in revise and "score_drafts" in revise, revise
+    # 2026-10-30 复审: 改稿也是先过 check_drafts 再 score_drafts(协议第 4 条「新稿、改稿都要过」), 两次带同一个
+    # replaces_version_id —— 原来「要先过 check_drafts 的话」读起来是可以跳过, 而它离交付最近, 和协议说法不同时模型照它做。
+    revise = next(c for c in step.split("; ") if "已经存过" in c)
+    assert "replaces_version_id" in revise and revise.index("check_drafts") < revise.index("score_drafts"), revise
     assert "先重跑 check_drafts" not in step and "不用先跑 check_drafts" not in step
-    assert "check_drafts 的话那篇同样带上 replaces_version_id" in step and "不会拿它和自己的旧版比" in step
+    assert "要先过 check_drafts 的话" not in step and "不会拿它和自己的旧版比" in step
     # 只有整篇重写的新稿才先过 check_drafts
     assert "整篇推翻" in step and "先过 check_drafts" in step
 
