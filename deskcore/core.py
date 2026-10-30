@@ -4774,11 +4774,16 @@ EDIT_DIGEST_EVERY_DAYS = 7
 EDIT_DIGEST_MIN_CHANGED = 3       # 改过的少于这几篇不出摘要: 一两篇看不出规律, 只会诱导模型硬编
 EDIT_DIGEST_EXAMPLES = 6
 EDIT_DIGEST_TASK = (
+    "先把 message 原样告诉用户(放在这一轮回复最前面), 再开始写稿。"
     "这是本项目最近发出去的稿子在发布前被人改过的地方(写作台那版 → 发出去那版)。看有没有反复出现、像是有意为之的改法"
     "(比如总删掉某类句子、总把某种说法换成另一种、总把标题改短、总少提或多提品牌), 归纳成最多 3 条能写成规则的话, "
     "念给用户听, 问要不要记下。"
     "用户说要的, 用 record_rule 记(soft, scope=project)。只出现一两次的、说不清为什么改的, 不要硬编成规则。"
     "不管记没记, 最后调 ack_edit_digest, through 原样传回, rules_recorded 填记了几条; 之后一周内不会再出现。")
+
+
+EDIT_DIGEST_MESSAGE = ("开写之前说一句: 这个项目最近发出去的稿子里有 {changed} 篇在发布前被人改过。"
+                       "我先把反复出现的改法列给你, 你看哪几条要记成以后都照着写的规则(都不要也行)。")
 
 
 def _avg(xs) -> int | None:
@@ -5007,7 +5012,10 @@ def edit_digest(client, project_id: str, *, user_id: str | None = None,
            "rewritten_sentences": sum(int(r.get("edited_count") or 0) for r in changed),
            "chars": {"draft_avg": _avg(r.get("draft_chars") for r in changed),
                      "published_avg": _avg(r.get("published_chars") for r in changed)},
-           "examples": examples, "task": EDIT_DIGEST_TASK}
+           "examples": examples, "task": EDIT_DIGEST_TASK,
+           # W-33(10-30): 10-21～10-26 摘要给了 8 次只 ack 过 1 次, 模型拿到就直接去发牌了 —— 加一句原样转给用户的话
+           # (同 desk_gap / skill_update), 至少让写手看得见; ack 仍在用户看过、做了决定之后(先 ack 会让漏看的差异再也进不了摘要)
+           "message": EDIT_DIGEST_MESSAGE.format(changed=len(changed))}
     if got["more"]:
         out["more_after_through"] = True        # 一次没看完: 看完这份、ack 之后, 下一份从 through 接着往后
     bd, bp = _avg(r.get("brand_draft") for r in changed), _avg(r.get("brand_published") for r in changed)
@@ -7260,6 +7268,8 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
             except Exception:                           # noqa: BLE001
                 brands[v.project_id] = ""
         d = tvlink.edit_diff(v.title, v.body, n.title, n.body, brand=brands[v.project_id])
+        # project_id = 那一版所在的写作台项目(写稿的那个), 不是 TV 项目的补录目标(W-39, 10-30): 一个 TV 项目对着几个写作台
+        # 项目时, 改法回到写这篇稿的那个项目的摘要里; 按 TV 项目归会把 8～10 个方向压成一个、或同一条改法在几个项目里各出一次
         rows.append({"note_id": n.note_id, "tv_project_id": tv_project_id, "project_id": v.project_id,
                      "version_id": v.version_id, "match_kind": l["match_kind"],
                      "publish_time": n.publish_time.isoformat() if n.publish_time else None,

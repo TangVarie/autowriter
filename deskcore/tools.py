@@ -352,9 +352,10 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
       · delivery_requirements —— 【项目有交付模板才出现】score_drafts 时每篇 draft 要带什么: ``tags`` 是要给几个话题
         (``fixed_tags`` 写作台会加, 不用给), ``comments`` 是评论条数范围和每条要提到的词(null 就是不要评论),
         ``direction`` 为 true 时每篇要带一句切入角度。照 delivery_requirements.task 写, 一次带齐, 免得存完再返工。
-      · edit_digest —— 【每周最多一次, 有才出现】: 本项目最近发出去的稿子在发布前被人改了什么(写作台那版 →
-        发出去那版)。照 edit_digest.task 做: 归纳成最多 3 条规则建议问用户, 同意的 record_rule, 最后调
-        ack_edit_digest。先把它说给用户, 再开始写稿。
+      · edit_digest —— 【有才出现; ack 之后一周内不再出现, 没 ack 就每次打开项目都带】: 本项目最近发出去的稿子
+        在发布前被人改了什么(写作台那版 → 发出去那版)。**先把 edit_digest.message 原样放在这一轮回复的最前面**,
+        再照 edit_digest.task 做: 归纳成最多 3 条规则建议问用户, 同意的 record_rule, 用户做了决定之后调
+        ack_edit_digest。说完再开始写稿。
       · flywheel_arm —— 这场写作落在哪个对照组。存档时【原样】传给 score_drafts 的 flywheel_arm,
         别改、别跟用户提。
 
@@ -527,7 +528,8 @@ def ack_edit_digest(project_id: str, through: str, rules_recorded: int = 0,
     """看完 open_project 给的 edit_digest 之后调: 记下这份摘要看过了, 一周内不再出现。
 
     ``through`` 原样传回 edit_digest.through; ``rules_recorded`` 是这次按摘要记了几条规则(用户一条都没要就传 0)。
-    用户没回应、对话就结束了也要调 —— 不调的话下一场写作还会再给一遍同一份摘要。
+    摘要已经说给用户、用户没接话的, 在这一轮最后一条回复之前调(传 0) —— 不调的话下一场写作还会再给一遍同一份摘要。
+    还没把 edit_digest.message 说给用户就别调: 调了这批改法就再也不会出现。
     """
     # 写操作, 不包 _safe: 没记上的话, 下一场又拿到同一份摘要, 用户会被问第二遍。
     try:
