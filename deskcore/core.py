@@ -67,6 +67,11 @@ MAX_NEGATIVE = 3
 # 简报里回显"抽了没写"的回看天数(D-071)。7 天 = 一个工作周,
 # 与 TV 夜跑那盏灯 check_angle_ledger_leak.py 的默认窗口同口径。
 ANGLE_DEBT_DAYS = 7
+# 只数这个时刻之后抽的牌(2026-10-30 发布收尾)。W-38(查重时就记下稿子, tv-sync 拿飞书的帖对它)是 2026-10-29 08:26 UTC
+# 上线的; 在那之前只有 score_drafts 会记稿子, 写手没有存档这一步(D-120), 于是那之前抽的牌大多已经写完、发出去了,
+# 只是对不回来、销不了账。拿它们当「抽了没写」报, 每场开头都是一串其实写过的坐标。简报的 angle_debt、存档后的
+# angle_debt、archive_pending 都按这个下限数; 一周之后它自然落到 7 天窗口外面, 不用再改。
+ANGLE_DEBT_SINCE = "2026-10-29T08:26:00+00:00"
 
 # 交付前没存档的牌(W-29, 2026-10-23)。10-20~10-22 途鸽五轮 73 张、百健士一轮 24 张牌全没存档: 每一轮 open_project /
 # draw_angles / 1~3 次 check_drafts 都回了 200, 然后调用方就不再调写作台了, score_drafts 一次都没到库。和 W-06 同一个
@@ -104,6 +109,19 @@ def _supersede_snapshots(client, project_id: str, drafts: list[dict], vids: dict
 def _checked_angle_keys(client, project_id: str, user_id: str | None, days: int) -> dict[str, str]:
     return {k: at for k, at in store.snapshotted_angle_keys(client, project_id, user_id, days).items()
             if fp.looks_like_angle_key(k)}
+
+
+def _angle_debt_note(days: int, n: int, last_drawn_at, shown: int, more: int) -> str:
+    """简报里 angle_debt_note 那句话(2026-10-30 发布收尾)。说给模型听的: 这个项目发牌分到、还没有稿子的坐标, 用户这次
+    要写的对得上就优先按它们写。不叫模型把数字转告用户、不问「接着写还是放弃」(那不是写手该拍板的事), 不说「你抽了」
+    (一个团队共用一个身份), 也不提存档(写手没有这一步, D-120; 存档的事 draw_angles / check_drafts 的 archive_pending 会说)。"""
+    return (
+        f"这个项目近 {days} 天发牌分到的坐标里, 有 {n} 个还没有对应的稿子(最近一次发牌 {last_drawn_at}; "
+        "查重时带过 angle_key 的已经写出来了, 不在这里面)。用户这次要写的对得上(比如要这个项目的一批稿、没点具体题目), "
+        "就优先按这些坐标写, 不够再调 draw_angles 补齐; 用户点了具体题目或角度, 就照用户的写, 这些坐标放着就行。"
+        + (f"坐标在 angle_debt.angles 里(列了 {shown} 个" + (f", 还有 {more} 个没列" if more > 0 else "")
+           + "), 按哪个写, 查重时就带上它的 angle_key。" if shown else "")
+        + "这段是给你挑坐标用的, 不用转告用户, 也不用问用户怎么处理。")
 
 # 存档带的 angle_key 对不上台账(W-31, 2026-10-27)。10-26 sportsix 一场 20 张牌, 5 批存了 19 篇, 每篇都带了 key, 可没有
 # 一条在台账里(7~8 位带下划线的编号、53 位的长串), 牌一张没销。score_drafts 的回包现在会说清(angle_key_warning), 但之后
@@ -508,14 +526,18 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
                              ("status", "count", "elapsed_ms", "detail")}
     out["counts"]["lessons"] = len(borrowed["lessons"])
 
-    # ── 上一场停在哪: 抽了没写的角度 ──────────────────────────────────
+    # ── 上一场停在哪: 发了牌还没写的角度 ──────────────────────────────────
     # 2026-09-20 查生产库(TV D-071): 7 天发出去 214 个角度, 只有 20 个销了账;
     # 194 个里 138 个所在的会话连一篇稿都没入库 —— 会话停在发牌之后, 而谁都不知道。
-    # deskcore 的 /health 早就在报这个比例, 但那是运维视角、没人天天看; 写手看得见
-    # 的地方只有简报。所以把"你自己上次抽了没写的"摆在每场对话开头。
+    # deskcore 的 /health 早就在报这个比例, 但那是运维视角、没人天天看; 模型每场都看得见
+    # 的地方只有简报。所以把这个项目发了牌还没写的坐标摆在每场对话开头, 让模型优先拿它们写。
+    # 2026-10-30 发布收尾: 原来那句是叫模型把这个数说给用户、问「接着写完还是放弃」—— 可那时数出来的大多是 W-38 之前
+    # 写完发出去、只是对不回来的牌(见 ANGLE_DEBT_SINCE), 写手每场开头都被问一遍自己做不了主的事。现在只数下限之后的,
+    # 话也改成说给模型听的: 用户这次要写的对得上就优先按它们写, 不转告、不问用户。一个团队共用一个身份(同一个 user_id),
+    # 所以说「这个项目」, 不说「你抽了」。
     # ⚠️ 和借卡同一条纪律: 这一段的失败绝不能影响简报, 兜住但留痕。
     try:
-        debt = store.angle_debt(client, project_id, user_id, ANGLE_DEBT_DAYS,
+        debt = store.angle_debt(client, project_id, user_id, ANGLE_DEBT_DAYS, since=ANGLE_DEBT_SINCE,
                                 exclude_keys=_checked_angle_keys(client, project_id, user_id, ANGLE_DEBT_DAYS))
     except Exception:
         logger.exception("angle debt lookup failed (project=%s)", project_id)
@@ -528,17 +550,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         # 上下文里了, 只报个数等于让模型"写完你不知道是哪几个的角度" —— 它只能忽略,
         # 或者再抽一批, 恰好是这条提醒要防的事(codex review on #86)。
         more = debt["unconsumed"] - len(shown)
-        out["angle_debt_note"] = (
-            f"你在这个项目近 {debt['since_days']} 天抽了 {debt['unconsumed']} 个角度还没出稿"
-            f"(最近一次 {debt['last_drawn_at']})。要么这一场把它们写完, 要么明说放弃 —— "
-            "别默认再抽一批: 没销账的坐标一天后就不在避重集里, 同一个故事会被讲第二遍, "
-            "而那种重复指纹闸抓不到。"
-            + (f"坐标在 angle_debt.angles 里(列了 {len(shown)} 个"
-               + (f", 还有 {more} 个没列" if more > 0 else "") + "), 接着写就按它们写, "
-               "写完过了 check_drafts 就在同一轮里调 score_drafts 存档(每篇带 angle_key), 存完再给用户看。"
-               if shown else "")
-            + "(查重时带过 angle_key 的牌不在这里面: 那几篇写出来了, 发出去以后写作台会从飞书对回来销账。"
-            "存档是你这边的事, 不用跟用户提。)")
+        out["angle_debt_note"] = _angle_debt_note(debt["since_days"], debt["unconsumed"], debt["last_drawn_at"],
+                                                  len(shown), more)
 
     # ── 最近发出去 / 写过的标题: 这一批要避开的东西(2026-10-20) ──────────────────────
     # 10-20 生产诊断: 稿子批批长得像、篇幅短, 飞书里大半被人重写。模型不知道这个项目上周发了什么、前天写了什么,
@@ -3175,10 +3188,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 # ⚠️ 失败绝不许冒泡。指纹这时已经写进去了, 抛出去调用方会重试,
                 #    重试会撞上自己刚写的指纹 —— 一句提醒把一次成功的入库变成
                 #    "你的稿子重复了"。同 rpc_anomalies / identity_error 的纪律。
+                # W-38 上线之前抽的不算(ANGLE_DEBT_SINCE, 同简报): 那些多半写完发出去了, 叫模型「下一批按它们写」会再写一遍。
                 lap = _lap(commit_parts, "other", lap)       # 拼回包、提示语(纯代码)
                 try:
                     debt = store.angle_debt(client, project_id, user_id,
-                                            ANGLE_DEBT_DAYS)
+                                            ANGLE_DEBT_DAYS, since=ANGLE_DEBT_SINCE)
                 except Exception:
                     logger.exception("angle debt lookup after commit failed "
                                      "(project=%s)", project_id)
@@ -4881,6 +4895,11 @@ def _avg(xs) -> int | None:
 # 告诉运营: 你名下哪个项目最近发出去的帖写作台没接住, 下次写它先说「打开它」。口径同 TV 角度台账
 # 那盏灯的判据 C: 近 7 天发出去的帖里补录副本 >= 10 篇、对上 <= 2 篇(对上只认写作台那版早于发布的), 这个项目
 # 在写作台里发过牌(不限时间: 断得越久越该说, codex review on TV#205)。
+#
+# 2026-10-30 发布收尾: list_projects / open_project 不再带它。一个团队共用一个身份, 每个写手每场开头都听到一段「写作台
+# 提醒」, 点名的是别人的项目, 还推断「写的时候没调起写作台」—— 可对不回来的大多是 W-38 之前写的(那时查重不记稿子,
+# 见 ANGLE_DEBT_SINCE), 不是谁没在写作台里写; 正在写作台里写的人还被叫「这次就在写作台里写」。看漏接走 TV 角度台账
+# 那盏灯(判据 C, 同口径)。这里的计算留着(desk_gaps), 只是不再进回包; 现在没有别的调用方。
 DESK_GAP_DAYS = 7
 DESK_GAP_MIN_UNCAUGHT = 10
 DESK_GAP_MAX_CAUGHT = 2
@@ -4937,7 +4956,8 @@ def _desk_gap_items(client, user_id: str) -> list[dict]:
 
 
 def desk_gaps(client, *, user_id: str | None, current_project_id: str | None = None) -> dict | None:
-    """调用者名下, 最近发出去的帖写作台没接住的项目 + 给运营的一段原话。没有就 None。只读, 只看调用者自己的项目。"""
+    """调用者名下, 最近发出去的帖写作台没接住的项目 + 一段原话。没有就 None。只读, 只看调用者自己的项目。
+    2026-10-30 起不进任何工具的回包(见上面 DESK_GAP_* 那段), 只留给排查时手动调。"""
     if not user_id:
         return None
     items = _desk_gap_items(client, user_id)
@@ -4980,7 +5000,9 @@ def archive_pending(client, project_id: str, *, user_id: str | None) -> dict | N
         return None
     # W-38: 这里【不】排除查重时带过的牌 —— 它挂在 check_drafts 的回包上, 刚查过的那几张正是该存档的(存档才有参考分、
     # 规则检查和交付模板); 没存上也不丢(发出去以后 tv-sync 从底稿对回来), 所以 next_step 只叫模型存, 不叫它跟用户说。
-    debt = store.angle_debt(client, project_id, user_id, ARCHIVE_PENDING_DAYS, sample=1, oldest_first=True)
+    # W-38 上线之前抽的不算(ANGLE_DEBT_SINCE, 同简报): 那些多半写完发出去了, 只是当时查重没记稿子、对不回来。
+    debt = store.angle_debt(client, project_id, user_id, ARCHIVE_PENDING_DAYS, sample=1, oldest_first=True,
+                            since=ANGLE_DEBT_SINCE)
     cards = int(debt.get("unconsumed") or 0)
     if cards <= 0:
         return None

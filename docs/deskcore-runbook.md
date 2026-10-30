@@ -544,7 +544,7 @@ SQL Editor / `apply_migration` 直接跑（幂等），**先于**代码部署。
 ### 1.9 `013_tv_edits` —— 改得多的同一篇也认 + 人在发布前改了什么（2026-10-19，D-120 / W-23）
 
 tv-sync 多一档 `edited`（包含度 0.30~0.60 且领先第二名 ≥0.15），每条对上的笔记算一条改动差异写 `tv_edit_diffs`，
-`open_project` 带 `edit_digest`（ack 之后一周内不再带；没 ack 就每次打开都带）、写手的模型归纳成规则建议，看完调 `ack_edit_digest` 写 `tv_edit_digest_acks`。W-33（10-30）：10-21～10-26 摘要给了 8 次只 ack 过 1 次，模型拿到就直接去发牌，所以摘要多了一句 `message`，要原样放在回复最前面（同 `desk_gap`），ack 仍在用户做了决定之后。没有投递记录；周检用 Supabase 网关日志数 `tv_edit_digest_acks` / `tv_edit_diffs` 的读法还原。差异跟写稿的写作台项目走，不跟 TV 项目的补录目标走（W-39）。
+`open_project` 带 `edit_digest`（ack 之后一周内不再带；没 ack 就每次打开都带）、写手的模型归纳成规则建议，看完调 `ack_edit_digest` 写 `tv_edit_digest_acks`。W-33（10-30）：10-21～10-26 摘要给了 8 次只 ack 过 1 次，模型拿到就直接去发牌，所以摘要多了一句 `message`，要原样放在回复最前面，ack 仍在用户做了决定之后。没有投递记录；周检用 Supabase 网关日志数 `tv_edit_digest_acks` / `tv_edit_diffs` 的读法还原。差异跟写稿的写作台项目走，不跟 TV 项目的补录目标走（W-39）。
 SQL Editor / `apply_migration` 直接跑（幂等）。验收：`doctor` 里「表 tv_edit_diffs / tv_edit_digest_acks」applied；
 下一晚 tv-sync 之后 `select match_kind, count(*), count(*) filter (where changed) from autowriter.tv_edit_diffs group by 1`
 有数（第一晚会把以前对上的补算，每个 TV 项目最多 500 条）。⚠️ 没跑它之前 tv-sync 写 `edited` 的那一块会被旧 CHECK 拒；差异表读写失败时 tv-sync 照写对照、但退出码 1 并打「改动差异没写成」。

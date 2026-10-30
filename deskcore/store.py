@@ -686,7 +686,7 @@ ANGLE_DEBT_EXCLUDE_MAX = 200
 
 def angle_debt(sb, project_id: str, user_id: str | None, days: int,
                *, sample: int = ANGLE_DEBT_SAMPLE, oldest_first: bool = False,
-               exclude_keys=None) -> dict:
+               exclude_keys=None, since: str | None = None) -> dict:
     """这个人在这个项目里, 近 ``days`` 天抽了没写的角度: 个数 + 具体是哪几个。
 
     给 build_writing_brief 在每场对话开头回显用(D-071)。发牌台账上"抽了没销账"
@@ -714,6 +714,9 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     ``exclude_keys`` (W-38, 2026-10-29): 这些 angle_key 不算(查重时带过的牌 —— 稿子写出来了, 发出去以后 tv-sync 从飞书
     对回来销账; 再报"抽了没写"会让模型按同一张牌再写一篇)。最多排除 ANGLE_DEBT_EXCLUDE_MAX 个。给 ``{angle_key: 最近一次
     查重的时刻}`` 时只排除那次查重之前抽的: 没销的牌一天后回池子, 同一张牌之后又抽到一次, 那一次还没写(codex on aw#132)。
+
+    ``since`` (2026-10-30, 见 core.ANGLE_DEBT_SINCE): 比它早抽的不算, 和 ``days`` 取晚的那个当起点。``since_days``
+    照旧回 ``days``(返回形状一个键都不变)。读不懂的 ``since`` 当没给, 按 ``days`` 数。
     """
     out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None, "angles": []}
     if oldest_first:
@@ -721,6 +724,10 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     if not user_id:
         return out
 
+    start = iso_ago(days)
+    floor = _ts(since) if since else None
+    if floor is not None and floor > _ts(start):
+        start = floor.isoformat()
     # 一次请求拿两样: count='exact' 是**分页之前**算的(PostgREST 如此, 假件也钉着
     # 这一点), 所以 range 只影响回几行、不影响这个数。同 store.fingerprint_stats。
     checked_at = exclude_keys if isinstance(exclude_keys, dict) else {k: None for k in (exclude_keys or ())}
@@ -729,7 +736,7 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
         q = (sb.table("angle_ledger").select("angle_key, dims, drawn_at", count="exact")
                .eq("project_id", project_id).eq("drawn_by", user_id)
                .is_("consumed_version_id", "null")
-               .gte("drawn_at", iso_ago(days)))
+               .gte("drawn_at", start))
         if skip:
             q = q.not_.in_("angle_key", skip)
         res = (q.order("drawn_at", desc=not oldest_first)
@@ -745,7 +752,7 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
         try:
             again = (sb.table("angle_ledger").select("angle_key, dims, drawn_at")
                      .eq("project_id", project_id).eq("drawn_by", user_id)
-                     .is_("consumed_version_id", "null").gte("drawn_at", iso_ago(days))
+                     .is_("consumed_version_id", "null").gte("drawn_at", start)
                      .in_("angle_key", timed).range(0, 999).execute()).data or []
         except Exception:                               # noqa: BLE001
             logger.warning("read redrawn angle debt failed (project=%s)", project_id, exc_info=True)

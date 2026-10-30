@@ -218,8 +218,10 @@ def test_next_step_says_archive_before_showing_and_how_to_resave_edits():
     assert "整篇推翻" in step and "先过 check_drafts" in step
 
 
-def test_open_project_debt_note_points_at_score_drafts(use):
-    """简报那句 angle_debt_note 原来说"写完照样每篇带 angle_key 提交", 现在说清楚提交就是同一轮里的 score_drafts。"""
+def test_open_project_debt_note_leaves_archiving_to_archive_pending(use, monkeypatch):
+    """简报那句 angle_debt_note 是给模型挑坐标用的(2026-10-30 发布收尾): 按哪个坐标写、查重时带上它的 angle_key。
+    存档的事归 draw_angles / check_drafts 回包里的 archive_pending 说, 简报不再提 —— 写手没有存档这一步(D-120)。"""
+    monkeypatch.setattr(core, "ANGLE_DEBT_SINCE", _hours_ago(24 * 3))   # 下限是固定时刻; 这里只看话术
     use(_client([_card(1, hours_ago=30), _card(2, hours_ago=50)]))
     c = core.sb()
     c.rows.update({"memories": [], "user_calibration_notes": [], "items": [], "versions": [],
@@ -227,8 +229,21 @@ def test_open_project_debt_note_points_at_score_drafts(use):
     c.rows["projects"][0].update({"system_prompt": "你是文案", "default_params": "{}"})
     out = core.build_writing_brief(c, PID, user_id=ME)
     note = out["angle_debt_note"]
-    assert "score_drafts" in note and "同一轮" in note and "angle_key" in note
+    assert "查重时就带上它的 angle_key" in note
+    assert "score_drafts" not in note and "存档" not in note, note
     assert "archive_pending" not in out, "简报已经有 angle_debt, 不再叠第二段"
+
+
+def test_cards_drawn_before_the_floor_are_not_pending(use, monkeypatch):
+    """W-38 上线之前抽的牌不算(core.ANGLE_DEBT_SINCE, 同简报)。下限挪到 3 小时前: 5 小时前那张不算, 2 小时前那张算。"""
+    monkeypatch.setattr(core, "ANGLE_DEBT_SINCE", _hours_ago(3))
+    after = _card(2, hours_ago=2)
+    use(_client([_card(1, hours_ago=5), after]))
+    block = T.check_drafts(PID, [], _user_id=ME)["archive_pending"]
+    assert block["cards"] == 1 and block["oldest_drawn_at"] == after["drawn_at"], block
+
+    use(_client([_card(1, hours_ago=5), _card(3, hours_ago=8)]))
+    assert "archive_pending" not in T.check_drafts(PID, [], _user_id=ME), "全在下限之前: 不带提醒"
 
 
 # ══════════════════════════════════════════════════════════════════════

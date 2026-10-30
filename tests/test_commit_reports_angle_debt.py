@@ -116,6 +116,16 @@ def test_teammates_unwritten_angles_are_not_charged_to_you():
     assert "坐标" not in out["unattributed_warning"]
 
 
+def test_cards_drawn_before_the_floor_are_not_listed(monkeypatch):
+    """W-38 上线之前抽的牌不算(core.ANGLE_DEBT_SINCE, 同简报): 那些多半写完发出去了, 叫模型「下一批按它们写」
+    会再写一遍。下限挪到两天前(真实的下限是固定时刻): 三天前抽的不列, 一天前抽的照列。"""
+    monkeypatch.setattr(core, "ANGLE_DEBT_SINCE", store.iso_ago(2))
+    c = _client([_angle(1, days_ago=3), _angle(2, days_ago=1)])
+    out = core.commit_drafts(c, PROJ, [{"title": "没带", "body": BODY_A}], user_id=ME)
+    assert out["angle_debt"]["unconsumed"] == 1
+    assert [a["angle_key"] for a in out["angle_debt"]["angles"]] == ["k2"]
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 2 · 不该说话的时候别说
 # ══════════════════════════════════════════════════════════════════════

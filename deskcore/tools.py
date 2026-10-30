@@ -271,31 +271,15 @@ def list_projects(_user_id: str | None = None) -> dict:
     **用户要写 / 改某个品牌的小红书稿、却没说是哪个项目(只报了品牌名、只贴了 brief、只点了
     human-writing), 先调这个找项目, 再 open_project。** 没说写作台也一样: 写稿就走写作台。
     (写评论带的是笔记链接, 直接 comments_for, 它会按链接认项目。)
-
-    返回里有 ``desk_gap`` 时: 你名下有项目最近发出去的帖写作台对不回来(多半是写的时候没调起写作台)。
-    把 ``desk_gap.message`` 原样告诉用户, 同一场对话里说过就不再说, 然后照常继续。用户没有存档这一步, 别叫用户存档。
     """
-    def _list():
-        out = {"projects": core.list_projects(core.sb(), user_id=_user_id)}
-        gap = _desk_gap(_user_id)
-        if gap:
-            out["desk_gap"] = gap
-        return out
-    return _safe(_list)
-
-
-def _desk_gap(user_id: str | None, project_id: str | None = None) -> dict | None:
-    """附加提醒: 查不到就不带, 不能把清单 / 简报弄坏。"""
-    try:
-        return core.desk_gaps(core.sb(), user_id=user_id, current_project_id=project_id)
-    except Exception:  # noqa: BLE001
-        logger.warning("desk_gap 查不到, 这次不带", exc_info=True)
-        return None
+    # 2026-10-30 发布收尾: 不再带 desk_gap(「写作台提醒」, 见 core 里 DESK_GAP_* 那段) —— 一个团队共用一个身份,
+    # 每个写手每场开头都听到别人项目的漏接推断, 而对不回来的多半是 W-38 之前写的。
+    return _safe(lambda: {"projects": core.list_projects(core.sb(), user_id=_user_id)})
 
 
 def _archive_pending(user_id: str | None, project_id: str) -> dict | None:
     """附加提醒(W-29): 调用者在这个项目上抽了还没存档的牌, 和下一步该做什么。查不到就不带 ——
-    不能把发牌 / 查重 / 记规则的结果弄坏(同 _desk_gap 的纪律)。"""
+    不能把发牌 / 查重 / 记规则的结果弄坏(同 open_project 里 edit_digest 那段的纪律)。"""
     if not user_id or not project_id:
         return None
     try:
@@ -369,9 +353,10 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     465 条规则里 hard 只有 53 条)。传错 project_id 的真实表现是 403, 或者
     soft_rules 和 soft_rules_pool 【同时】为 0。只有后者才值得问一句。
 
-    counts.angle_debt 大于 0 时, 返回里还会有 angle_debt / angle_debt_note:
-    **调用者自己**在这个项目近期抽了没出稿的坐标, angle_debt.angles 里是具体是
-    哪几个。把这个数说给用户听, 问一句接着写完还是放弃, 别默认再抽一批。
+    counts.angle_debt 大于 0 时, 返回里还会有 angle_debt / angle_debt_note: 这个项目近期发牌分到、
+    还没有对应稿子的坐标, angle_debt.angles 里是具体是哪几个。这是给你挑坐标用的: 用户这次要写的对得上
+    (比如要这个项目的一批稿、没点具体题目), 就优先按这些坐标写, 查重时带上各自的 angle_key, 不够再调
+    draw_angles 补齐; 用户点了具体题目或角度就照用户的写。不用把这个数转告用户, 也不用问用户怎么处理。
 
     这个工具出错会直接报错, 不会返回半份简报。报错就【停下来】, 不要凭记忆
     或常识补一份约束继续写 —— 这个项目的硬约束是什么, 只有库里那份算数。
@@ -380,10 +365,6 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     12 位值(传整行也认)。skill 里没有这一行就传空。返回里有 ``skill_update`` 时, 说明 skill 不是最新版
     (或没核到版本): 把 ``skill_update.message`` **原样**(三行都要, 链接和「更新技能」那行一字不改)
     放在给用户回复的最前面, 然后照常继续写 —— 不拦写稿, 只是提醒升级。
-
-    返回里有 ``desk_gap`` 时: 你名下有项目最近发出去的帖写作台对不回来。把 ``desk_gap.message`` 原样告诉
-    用户(同一场对话里说过就不再说), 然后照常写; 当前这个项目也在里面的话, 那句话就是提醒这次在写作台里写。
-    用户没有存档这一步, 别叫用户存档(存档是你调 score_drafts, 查重时记下的稿子发出去以后写作台也会自己对回来)。
     """
     brief = {"tactic": tactic, "draft_topic": draft_topic,
              "key_messages": key_messages, "target_audience": target_audience,
@@ -402,9 +383,7 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         digest = None
     if digest:
         out["edit_digest"] = digest
-    gap = _desk_gap(_user_id, project_id)
-    if gap:
-        out["desk_gap"] = gap
+    # 2026-10-30 发布收尾: 不再带 desk_gap(同 list_projects)。
     # 服务端版本探针 (skillcheck)。协议文件读不了就跳过 —— 探针不能把合规读弄坏。
     try:
         digest = protocol_text()[1]

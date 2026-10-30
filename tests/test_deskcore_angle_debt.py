@@ -11,9 +11,16 @@
 修法不是再劝一遍模型, 是把这笔账摆到写手每场对话都会看的地方 —— 简报里。
 这里钉的是【被禁止的形态】: 简报不报这笔账、把别人的账记到你头上、
 或者查这笔账失败把简报拖垮。
+
+2026-10-30 发布收尾: 写手说每场开头都被问一遍「近 N 天抽了 X 个角度还没出稿, 接着写完还是放弃」, 而那些牌大多
+写完发出去了 —— W-38(10-29 08:26 UTC)之前只有 score_drafts 记稿子, 写手又没有存档这一步(D-120), 对不回来、销不了账。
+所以又钉两条: W-38 之前抽的牌不算(core.ANGLE_DEBT_SINCE); 那句话是说给模型听的(对得上就优先按这些坐标写), 不叫它
+问用户「接着写还是放弃」, 不说「你抽了」(一个团队共用一个身份), 不提存档。
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pytest
 
@@ -57,11 +64,22 @@ def test_brief_reports_unwritten_angles_and_says_what_to_do():
     out = _brief(_client([_angle(1), _angle(2), _angle(3)]))
     assert out["counts"]["angle_debt"] == 3
     note = out["angle_debt_note"]
-    assert "3 个角度" in note
+    assert "有 3 个还没有对应的稿子" in note
     # 光报个数字没用 —— 得告诉模型这一场该怎么处置, 否则它照样接着抽新的。
-    assert "写完" in note and "放弃" in note
+    assert "优先按这些坐标写" in note and "draw_angles" in note
     assert out["angle_debt"]["since_days"] == core.ANGLE_DEBT_DAYS
     assert out["angle_debt"]["last_drawn_at"]
+
+
+def test_note_is_for_the_model_not_a_question_for_the_writer():
+    """2026-10-30: 原来那句叫模型把数字说给用户、问「接着写完还是放弃」—— 写手每场开头都被问一遍自己做不了主的事。"""
+    note = _brief(_client([_angle(1), _angle(2)]))["angle_debt_note"]
+    for banned in ("放弃", "你抽", "你在这个项目", "接着写完", "存档", "score_drafts"):
+        assert banned not in note, (banned, note)
+    assert note.startswith("这个项目"), "一个团队共用一个身份: 说「这个项目」, 不说「你」"
+    assert "不用转告用户" in note and "不用问用户" in note
+    # 用户点了题目就照用户的写 —— 这些坐标只在对得上的时候优先
+    assert "照用户的写" in note
 
 
 def test_no_debt_means_no_note_at_all():
@@ -82,10 +100,53 @@ def test_only_my_own_angles_count():
     assert out["counts"]["angle_debt"] == 1
 
 
-def test_old_angles_fall_out_of_the_window():
+def test_old_angles_fall_out_of_the_window(monkeypatch):
     """窗口是 7 天。半个月前抽的牌早就不在避重集里了, 再翻出来催无意义。"""
+    monkeypatch.setattr(core, "ANGLE_DEBT_SINCE", None)         # 只看窗口, 不让 W-38 那个下限替它挡掉
     out = _brief(_client([_angle(1, days_ago=core.ANGLE_DEBT_DAYS + 3), _angle(2)]))
     assert out["counts"]["angle_debt"] == 1
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 下限: W-38 上线之前抽的牌不算(2026-10-30 发布收尾)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_the_floor_is_the_w38_deploy():
+    """W-38(查重时就记下稿子)是 2026-10-29 08:26 UTC 上线的; 那之前抽的牌大多写完发出去了, 只是对不回来。"""
+    assert datetime.fromisoformat(core.ANGLE_DEBT_SINCE) == datetime(2026, 10, 29, 8, 26, tzinfo=timezone.utc)
+
+
+def test_a_draw_before_the_floor_is_not_debt_one_after_is(monkeypatch):
+    """下限挪到两天前(真实的下限是固定时刻, 测试用相对时间才不随日期变): 三天前抽的不算, 一天前抽的算。"""
+    monkeypatch.setattr(core, "ANGLE_DEBT_SINCE", store.iso_ago(2))
+    out = _brief(_client([_angle(1, days_ago=3), _angle(2, days_ago=1)]))
+    assert out["counts"]["angle_debt"] == 1
+    assert [a["angle_key"] for a in out["angle_debt"]["angles"]] == ["k2"]
+    assert "有 1 个还没有对应的稿子" in out["angle_debt_note"]
+    assert out["angle_debt"]["since_days"] == core.ANGLE_DEBT_DAYS, "返回形状不变"
+
+
+def test_only_draws_before_the_floor_means_no_note(monkeypatch):
+    monkeypatch.setattr(core, "ANGLE_DEBT_SINCE", store.iso_ago(2))
+    out = _brief(_client([_angle(1, days_ago=3), _angle(2, days_ago=4)]))
+    assert out["counts"]["angle_debt"] == 0
+    assert "angle_debt_note" not in out and "angle_debt" not in out
+
+
+def test_store_floor_never_widens_the_window():
+    """下限比窗口还早时按窗口数: 下限只往里收, 不往外放。"""
+    c = _client([_angle(1, days_ago=10), _angle(2)])
+    assert store.angle_debt(c, PID, ME, 7, since=store.iso_ago(30))["unconsumed"] == 1
+    assert store.angle_debt(c, PID, ME, 7, since="不是时间")["unconsumed"] == 1, "读不懂的下限当没给"
+    assert store.angle_debt(c, PID, ME, 30, since=store.iso_ago(5))["unconsumed"] == 1
+
+
+def test_store_floor_also_holds_for_cards_redrawn_after_a_check():
+    """查重之后又抽到的那一次照旧算欠着(codex on aw#132) —— 但那一次也得在下限之后: 补回来的那条查询同一个起点。"""
+    c = _client([_angle(1, days_ago=3)])
+    checked = {"k1": store.iso_ago(4)}                         # 四天前查过重, 三天前又抽到一次
+    assert store.angle_debt(c, PID, ME, 7, exclude_keys=checked)["unconsumed"] == 1
+    assert store.angle_debt(c, PID, ME, 7, exclude_keys=checked, since=store.iso_ago(2))["unconsumed"] == 0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -220,3 +281,11 @@ def test_open_project_tool_description_no_longer_claims_every_rule_is_soft():
     doc = T.open_project.__doc__ or ""
     assert "一条 hard 都没有" not in doc
     assert "angle_debt" in doc, "工具说明里要提这个字段, 否则模型不知道简报多了什么"
+
+
+def test_open_project_tool_description_does_not_send_the_debt_to_the_user():
+    """工具说明是服务端实时下发的, 和协议对不上时以它为准(2026-10-30): 不能再叫模型问用户「接着写完还是放弃」。"""
+    doc = T.open_project.__doc__ or ""
+    part = doc[doc.index("counts.angle_debt"):].split("\n\n", 1)[0]
+    assert "放弃" not in part and "说给用户听" not in part and "调用者自己" not in part, part
+    assert "优先按这些坐标写" in part and "不用把这个数转告用户" in part
