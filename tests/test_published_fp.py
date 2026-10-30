@@ -165,11 +165,47 @@ def test_a_text_change_is_recorded_only_once_its_diff_is_done(monkeypatch):
     assert out["drift"]["fp_written"] == 1 and out["published_fp"]["written"] == 1 and len(_rows(c)) == 2
 
 
-def test_a_version_without_any_fingerprint_row_is_not_patched_here():
+def test_a_version_without_fingerprint_rows_still_gets_the_post_at_its_own_time():
+    # 改稿 replaces_version_id 会把整个 item 的指纹撤了重写(老版本下一行都不剩), 帖还连着老版本: 照样记, 时刻取那一版建的时刻,
+    # 写手记项目 owner(review: 以前这里每晚 no_rows 跳过, 发出去的文字永远进不了库)
     c = _client([_note("n1", TITLE, REWRITE)], fps=[])
     out = core.tv_sync(c, TV)
-    assert out["published_fp"]["no_rows"] == 1 and out["published_fp"]["written"] == 0
-    assert _rows(c) == []
+    assert out["published_fp"]["no_rows"] == 1 and out["published_fp"]["written"] == 1
+    (row,) = _rows(c)
+    assert row["opening_hash"] == fp.opening_hash(REWRITE) and row["created_at"] == _iso(0)
+    assert row["user_id"] == ME and row["angle_key"] is None
+    assert core.tv_sync(c, TV)["published_fp"]["written"] == 0, "第二晚那一版已经有这一行了"
+
+
+def test_rows_removed_by_a_later_replace_come_back_the_next_night():
+    c = _client([_note("n1", TITLE, REWRITE)])
+    core.tv_sync(c, TV)
+    assert len(_rows(c)) == 2
+    # 写手改稿(replaces_version_id=v1): commit 把这个 item 所有版本的指纹撤掉, 新版本自己记一行
+    c.rows["draft_fingerprints"] = [r for r in c.rows["draft_fingerprints"] if r.get("version_id") != "v1"]
+    out = core.tv_sync(c, TV)
+    assert out["published_fp"]["written"] == 1
+    assert [r["opening_hash"] for r in _rows(c)] == [fp.opening_hash(REWRITE)]
+
+
+def test_a_post_that_only_changed_the_title_records_the_new_title():
+    # 运营只改了标题、正文原样发: 正文的指纹库里有, 标题没有 —— 查重单看标题也会判死, 所以照样记一行(带发出去的标题)
+    c = _client([_note("n1", "简历第一行写错了, 六十份全白投", DRAFT)])
+    out = core.tv_sync(c, TV)
+    assert out["counts"]["body_exact"] == 1 and out["published_fp"]["written"] == 1
+    new = next(r for r in _rows(c) if r["id"] != "f1")
+    assert new["title"] == "简历第一行写错了, 六十份全白投" and new["opening_hash"] == fp.opening_hash(DRAFT)
+    assert core.tv_sync(c, TV)["published_fp"]["written"] == 0
+    # 标题只差标点 / 空白的不算改了
+    c2 = _client([_note("n1", TITLE + "!", DRAFT)])
+    assert core.tv_sync(c2, TV)["published_fp"]["written"] == 0
+
+
+def test_a_post_without_a_title_is_compared_by_body_only():
+    c = _client([_note("n1", "", DRAFT)])
+    out = core.tv_sync(c, TV)
+    assert out["counts"]["body_exact"] == 1
+    assert out["published_fp"]["checked"] == 1 and out["published_fp"]["written"] == 0 and len(_rows(c)) == 1
 
 
 def test_ingested_copies_get_no_second_row():
@@ -222,3 +258,54 @@ def test_the_lock_rereads_and_skips_text_recorded_meanwhile(monkeypatch):
     monkeypatch.setattr(core, "_project_write_lock", _Lock)
     out = core.tv_sync(c, TV)
     assert out["published_fp"]["written"] == 0 and len(_rows(c)) == 2
+
+
+def _add_version(c, vid, title, body, *, rows=True, days=0):
+    c.rows["items"].append({"id": f"i-{vid}", "batch_id": "b1", "best_version_id": vid, "created_at": _iso(days),
+                            "user_id": WRITER, "status": "pending",
+                            "versions": [{"id": vid, "title": title, "body": body, "version_num": 1,
+                                          "created_at": _iso(days)}],
+                            "batches": {"project_id": P1}})
+    c.rows["versions"].append({"id": vid, "item_id": f"i-{vid}", "title": title, "body": body, "version_num": 1,
+                               "created_at": _iso(days)})
+    if rows:
+        c.rows["draft_fingerprints"].append(_fp_row(f"f-{vid}", vid, body, title=title, days=days, key="k-angle-2"))
+
+
+def test_the_reread_under_the_lock_keeps_versions_already_done():
+    # n1 的文字前一晚已经记在 v1 下, n2 这晚要记在 v2 下: 锁里重读要把两版都读回来, 不能把 v1 当成"没有指纹行"再记一遍
+    title2 = "面试官只问了我一个数字"
+    draft2 = "第一次面试被问到转化率的时候我愣住了, 因为那个数字是我编进简历的。后来我把每个数字都换成能讲出来历的那个。"
+    post2 = "被问到转化率那一刻我才明白, 简历上每个数字都要能讲出来历。后来我只写自己能讲半小时的那三个数。"
+    c = _client([_note("n1", TITLE, REWRITE), _note("n2", title2, post2)])
+    _add_version(c, "v2", title2, draft2, days=1)
+    c.rows["draft_fingerprints"].append(_fp_row("f-pub", "v1", REWRITE))
+    out = core.tv_sync(c, TV)
+    assert out["published_fp"]["written"] == 1 and out["published_fp"]["no_rows"] == 0
+    assert len(_rows(c, "v1")) == 2 and len(_rows(c, "v2")) == 2
+    new = next(r for r in _rows(c, "v2") if r["id"] != "f-v2")
+    assert new["created_at"] == _iso(1) and new["angle_key"] == "k-angle-2"
+
+
+def test_inserts_go_in_chunks(monkeypatch):
+    monkeypatch.setattr(core, "INGEST_EMBED_CHUNK", 1)
+    sizes = []
+    real = core.store.write_fingerprints
+
+    def _spy(sb, rows):
+        sizes.append(len(rows))
+        return real(sb, rows)
+    monkeypatch.setattr(core.store, "write_fingerprints", _spy)
+    other = REWRITE.replace("学姐", "学长").replace("一周三个面试", "第二周就拿到了两个 offer")
+    c = _client([_note("n1", TITLE, REWRITE), _note("n2", TITLE, other)])
+    out = core.tv_sync(c, TV)
+    assert out["published_fp"]["written"] == 2 and sizes == [1, 1]
+
+
+def test_a_punctuation_only_edit_does_not_add_a_row():
+    # 开头哈希取的是原文前 25 字: 逗号换成全角、补个空格, 窗口一挪哈希就变 —— W-40 只按去标点后的正文比, 不另记一行
+    c = _client([_note("n1", TITLE, REWRITE)])
+    core.tv_sync(c, TV)
+    assert len(_rows(c)) == 2
+    c2 = _client([_note("n1", TITLE, REWRITE.replace(", ", "，").replace(": ", "："))], fps=list(c.rows["draft_fingerprints"]))
+    assert core.tv_sync(c2, TV)["published_fp"]["written"] == 0 and len(_rows(c2)) == 2

@@ -7392,33 +7392,45 @@ def _fingerprint_published(client, pairs: list[tuple], *, known: dict, owners: d
     """W-40: 帖对上了写作台的哪一版, 发出去的文字就记一行指纹在那一版下 —— 查重比的是写过的稿, 写手拿去改过再发的那一版
     原来不在库里, 下一篇照着发出去的帖写, 查重认不出(补录的帖、W-38 转正的帖早就是这样记的, 只有对上存档版本的漏了)。
 
-    ``pairs``: ``[(note, project_id, version_id)]``, 只放今晚核过、按现在的正文还连着这一版的。按文字幂等: 那一版下已经有同样
-    文字的行(底稿 / 存档那一行, 或者前一晚记过的帖)不再记; 帖和那一版只差话题标签的也不记(帖读进来就剥了话题)。行的时刻、写手、
-    angle_key 跟那一版最早那行走 —— 是那一版的另一种写法, 不是今晚新写的稿(TV 的发帖对账按时间窗数稿子, 记成今晚就多数一篇)。
-    那一版一行指纹都没有的不补(W-38 转了一半的由转正那一步补齐; 老的没指纹的版本走 backfill)。拿项目写锁(同补录 / 转正),
-    锁里重读一遍再写。回 ``{"checked", "to_write", "written", "no_rows", "error"}``; ``dry_run`` 只数不写。"""
+    ``pairs``: ``[(note, project_id, version_id)]``, 只放今晚核过、按现在的正文还连着这一版的。按文字幂等, 正文和标题一起算
+    (正文去标点空白后比四字串 sketch, 标题去标点空白后比): 那一版下已经有正文一样、标题也一样的行(底稿 / 存档那一行, 或者前一晚记过的帖)不再记; 帖和那一版只差话题标签的也算一样
+    (帖读进来就剥了话题)。只改了标题的照样记一行(查重单看标题也会判死, 运营改过的标题不在库里就拦不住照着它起的标题)。
+    行的时刻、写手、angle_key 跟那一版最早那行走 —— 是那一版的另一种写法, 不是今晚新写的稿(TV 的发帖对账按时间窗数稿子,
+    记成今晚就多数一篇)。那一版一行指纹都没有的(改稿时 replaces_version_id 把整个 item 的指纹撤了重写、老的没指纹的版本、
+    W-38 转了一半的), 时刻取那一版自己建的时刻、写手记项目 owner, 照样记 —— 帖还在外面, 不能因为那一版的行没了就漏掉。
+    拿项目写锁(同补录 / 转正), 锁里重读一遍再写, 按 INGEST_EMBED_CHUNK 分批插(同补录)。
+    回 ``{"checked", "to_write", "written", "no_rows", "error"}``(``no_rows``: 那一版没有指纹行、按它自己的时刻记的篇数);
+    ``dry_run`` 只数不写。"""
     out = {"checked": len(pairs), "to_write": 0, "written": 0, "no_rows": 0, "error": None}
     by_pid: dict[str, list[tuple]] = {}
     for n, pid, vid in pairs:
         by_pid.setdefault(str(pid), []).append((n, str(vid)))
 
-    def _rows(items: list[tuple], meta: dict, bodies: dict) -> tuple[list[dict], int]:
+    def _text(body: str) -> tuple:
+        # 正文按四字串 sketch 比(去标点空白之后的全文), 不带开头哈希: 开头哈希取的是原文前 25 字再规范化, 标点 / 空格一改窗口就挪,
+        # 只改了标点的帖会被当成新文字再记一行
+        return tuple(sorted(fp.ngram_hashes(body)))
+
+    def _rows(items: list[tuple], meta: dict, versions: dict, times: dict) -> tuple[list[dict], int]:
         rows, no_rows, seen = [], 0, {}
         for n, vid in items:
-            m = meta.get(vid)
-            if not m:
-                no_rows += 1
+            k = _text(n.body)
+            if not k:
                 continue
-            k = _fp_key(n.body)
-            if not k[0]:
+            m = meta.get(vid) or {"pairs": set(), "created_at": times.get(vid), "user_id": None, "angle_key": None}
+            have = seen.get(vid)
+            if have is None:
+                have = seen[vid] = {(hk[1], fp.normalize(ht)) for hk, ht in m["pairs"]}
+                v = versions.get(vid)
+                if v is not None:
+                    vt = fp.normalize(v.title)
+                    have |= {(_text(v.body), vt), (_text(tvlink.strip_hashtags(v.body)), vt)}
+            t = fp.normalize(n.title)
+            # 帖没标题的只比正文(不为一个空标题另记一行)
+            if any(hk == k and (not t or ht == t) for hk, ht in have):
                 continue
-            have = seen.setdefault(vid, set(m["keys"]))
-            v = known.get(vid) or bodies.get(vid)
-            if v is not None:
-                have |= {_fp_key(v.body), _fp_key(tvlink.strip_hashtags(v.body))}
-            if k in have:
-                continue
-            have.add(k)
+            have.add((k, t))
+            no_rows += vid not in meta
             rows.append({"version_id": vid, "title": n.title, "body": n.body, "writer": m.get("user_id"),
                          "angle_key": m.get("angle_key"), "created_at": m.get("created_at")})
         return rows, no_rows
@@ -7427,31 +7439,39 @@ def _fingerprint_published(client, pairs: list[tuple], *, known: dict, owners: d
         try:
             vids = sorted({vid for _, vid in items})
             meta = store.fingerprint_meta(client, pid, vids)
-            todo, _ = _rows(items, meta, {})
-            bodies: dict = {}
-            outside = sorted({r["version_id"] for r in todo} - set(known))
+            versions = {vid: known[vid] for vid in vids if vid in known}
+            outside = sorted(set(vids) - set(known))
             if outside:
-                # 索引外的旧版(不是 best 的那版): 取正文只为了认出"只差话题标签"的
-                bodies = {vid: tvlink.Version(version_id=vid, project_id=pid, title=(r.get("title") or "").strip(),
-                                              body=(r.get("body") or "").strip(), created_at=None)
-                          for vid, r in store.versions_in_project(client, pid, outside).items()}
-            todo, no_rows = _rows(items, meta, bodies)
-            out["no_rows"] += no_rows
+                # 索引外的旧版(不是 best 的那版): 取正文和标题只为了认出"和那一版一样 / 只差话题标签"的
+                versions.update({vid: tvlink.Version(version_id=vid, project_id=pid, title=(r.get("title") or "").strip(),
+                                                     body=(r.get("body") or "").strip(), created_at=None)
+                                 for vid, r in store.versions_in_project(client, pid, outside).items()})
+            times: dict = {}
+            bare = sorted(set(vids) - set(meta))
+            if bare:
+                times = {vid: (versions[vid].created_at.isoformat() if vid in versions and versions[vid].created_at
+                               else None) for vid in bare}
+                missing = [vid for vid, t in times.items() if not t]
+                if missing:
+                    times.update(store.version_times(client, missing))
+            todo, no_rows = _rows(items, meta, versions, times)
             if not todo:
                 continue
             if dry_run:
                 out["to_write"] += len(todo)
+                out["no_rows"] += no_rows
                 continue
             with _project_write_lock(client, pid, holder):
                 # 锁里重读: 锁外读完到这里, 别的 tv-sync / 转正可能刚把同样的文字记上
-                meta = store.fingerprint_meta(client, pid, sorted({r["version_id"] for r in todo}))
-                todo, _ = _rows([(n, vid) for n, vid in items if vid in meta], meta, bodies)
+                meta = store.fingerprint_meta(client, pid, vids)
+                todo, no_rows = _rows(items, meta, versions, times)
                 out["to_write"] += len(todo)
-                if todo:
-                    payload = _snapshot_fp_payload(pid, owners.get(pid), todo)
-                    for p, r in zip(payload, todo):
-                        p["created_at"] = r["created_at"] or store.iso_now()
-                    out["written"] += store.write_fingerprints(client, payload)
+                out["no_rows"] += no_rows
+                payload = _snapshot_fp_payload(pid, owners.get(pid), todo)
+                for p, r in zip(payload, todo):
+                    p["created_at"] = r["created_at"] or store.iso_now()
+                for start in range(0, len(payload), INGEST_EMBED_CHUNK):
+                    out["written"] += store.write_fingerprints(client, payload[start:start + INGEST_EMBED_CHUNK])
         except Exception as exc:                        # noqa: BLE001 — 对照已经写了; 没记上的明晚按文字再补
             logger.exception("tv_sync: 帖的文字记进指纹库失败 (project=%s)", pid)
             out["error"] = out["error"] or f"{type(exc).__name__}: {exc}"[:300]

@@ -73,6 +73,12 @@ NOTES = [
 ]
 
 
+def _not_v1(c):
+    """指纹库里 v1 以外的行。n1 发出去的标题和 v1 不一样(运营改过标题), 而这里的 v1 没有底稿那行, W-40 会按 v1 自己的时刻
+    把发出去的那篇记一行在 v1 下 —— 下面数补录写了几行时把它除开。"""
+    return [r for r in c.rows["draft_fingerprints"] if r.get("version_id") != "v1"]
+
+
 @pytest.fixture(autouse=True)
 def _no_embeddings(monkeypatch):
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
@@ -100,7 +106,8 @@ def test_real_run_links_matches_ingests_the_rest_and_is_incremental():
     assert links["n2"]["match_kind"] == "ingested" and links["n2"]["version_id"]
     # 补录真的进了指纹库, 且剥了话题标签
     assert out["ingest"]["minted"] == 1 and out["ingest"]["fingerprinted"] == 1
-    assert len(c.rows["draft_fingerprints"]) == 1
+    assert len(_not_v1(c)) == 1
+    assert [r["title"] for r in c.rows["draft_fingerprints"] if r["version_id"] == "v1"] == ["秋招投了六十份简历没回音"]
     minted = next(v for v in c.rows["versions"] if v["id"] == links["n2"]["version_id"])
     assert "#跑步" not in minted["body"] and minted["title"] == "上周发的那篇"
     prov = next(b for b in c.rows["batches"] if b["id"] == out["ingest"]["batch_id"])["params"]
@@ -111,7 +118,7 @@ def test_real_run_links_matches_ingests_the_rest_and_is_incremental():
     # 第二次: 两条已对上跳过, n3(TV 的 id 认不出, 没 version_id)会再看一眼但不补
     again = core.tv_sync(c, TV)
     assert again["counts"]["already_linked"] == 2 and again["ingest"] is None
-    assert len(c.rows["draft_fingerprints"]) == 1 and len(c.rows["versions"]) == 2
+    assert len(c.rows["draft_fingerprints"]) == 2 and len(c.rows["versions"]) == 2
 
 
 def test_write_tv_backfills_only_rows_with_a_version_and_marks_them_synced():
@@ -184,7 +191,7 @@ def test_without_an_ingest_target_unmatched_is_recorded_not_ingested():
     assert out["ingest"] is None and "没有补录目标" in out["note"]
     links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
     assert links["n2"]["match_kind"] == "unmatched" and links["n2"]["version_id"] is None
-    assert c.rows["draft_fingerprints"] == []
+    assert _not_v1(c) == []
 
 
 def test_without_an_ingest_target_an_unchanged_unmatched_row_is_not_rewritten_every_night():
@@ -235,7 +242,7 @@ def test_tv_resolve_on_a_project_without_ingest_target_explains_instead_of_raisi
     out = core.tv_resolve(c, "n2", ingest=True)
     assert out["resolved"] is False and "只判不入库" in out["note"]
     assert {l["note_id"]: l for l in c.rows["tv_note_links"]}["n2"] == before
-    assert len(c.rows["versions"]) == 1 and c.rows["draft_fingerprints"] == []
+    assert len(c.rows["versions"]) == 1 and _not_v1(c) == []
 
     monkeypatch.setattr(core, "sb", lambda: c)
     assert cli.main(["tv-resolve", "--note", "n2", "--ingest"]) == 1
@@ -526,7 +533,7 @@ def test_a_note_deleted_in_feishu_is_not_ingested_and_its_unmatched_link_is_left
     out = core.tv_sync(c, TV)
     assert sent == ["上周发的那篇"], "只补录真没入库的 n2, 已删的那篇不进 ingest_published"
     assert out["notes"] == 3 and sum(out["counts"].values()) == 3 and out["counts"]["unmatched"] == 1
-    assert out["ingest"]["minted"] == 1 and len(c.rows["draft_fingerprints"]) == 1
+    assert out["ingest"]["minted"] == 1 and len(_not_v1(c)) == 1
     links = {l["note_id"]: l for l in c.rows["tv_note_links"]}
     assert links[GONE_ID] == GONE_LINK, "已删的篇的对照一行不动(updated_at 也不刷)"
     assert out["links_written"] == 3
