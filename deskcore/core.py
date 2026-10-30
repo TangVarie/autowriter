@@ -7423,8 +7423,11 @@ def _fingerprint_published(client, pairs: list[tuple], *, known: dict, owners: d
                 have = seen[vid] = {(hk[1], fp.normalize(ht)) for hk, ht in m["pairs"]}
                 v = versions.get(vid)
                 if v is not None:
-                    vt = fp.normalize(v.title)
-                    have |= {(_text(v.body), vt), (_text(tvlink.strip_hashtags(v.body)), vt)}
+                    # 只差话题标签的帖算已经在库里, 前提是那一版自己的文字(标题 + 带话题的正文)真有一行 —— 那一版的行被撤光了的,
+                    # 和它一模一样的帖也得记(codex on aw#133)
+                    vt, vk = fp.normalize(v.title), _text(v.body)
+                    if (vk, vt) in have:
+                        have.add((_text(tvlink.strip_hashtags(v.body)), vt))
             t = fp.normalize(n.title)
             # 帖没标题的只比正文(不为一个空标题另记一行)
             if any(hk == k and (not t or ht == t) for hk, ht in have):
@@ -7447,13 +7450,19 @@ def _fingerprint_published(client, pairs: list[tuple], *, known: dict, owners: d
                                                      body=(r.get("body") or "").strip(), created_at=None)
                                  for vid, r in store.versions_in_project(client, pid, outside).items()})
             times: dict = {}
-            bare = sorted(set(vids) - set(meta))
-            if bare:
-                times = {vid: (versions[vid].created_at.isoformat() if vid in versions and versions[vid].created_at
-                               else None) for vid in bare}
-                missing = [vid for vid, t in times.items() if not t]
+
+            def _fill_times(meta: dict) -> None:
+                # 没有指纹行的版本按它自己建的时刻记; 锁里重读之后才没了行的(刚被改稿撤掉)也要补上(codex on aw#133)
+                bare = sorted(set(vids) - set(meta) - set(times))
+                if not bare:
+                    return
+                times.update({vid: versions[vid].created_at.isoformat() for vid in bare
+                              if vid in versions and versions[vid].created_at})
+                missing = [vid for vid in bare if vid not in times]
                 if missing:
                     times.update(store.version_times(client, missing))
+
+            _fill_times(meta)
             todo, no_rows = _rows(items, meta, versions, times)
             if not todo:
                 continue
@@ -7464,6 +7473,7 @@ def _fingerprint_published(client, pairs: list[tuple], *, known: dict, owners: d
             with _project_write_lock(client, pid, holder):
                 # 锁里重读: 锁外读完到这里, 别的 tv-sync / 转正可能刚把同样的文字记上
                 meta = store.fingerprint_meta(client, pid, vids)
+                _fill_times(meta)
                 todo, no_rows = _rows(items, meta, versions, times)
                 out["to_write"] += len(todo)
                 out["no_rows"] += no_rows

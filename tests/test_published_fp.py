@@ -309,3 +309,37 @@ def test_a_punctuation_only_edit_does_not_add_a_row():
     assert len(_rows(c)) == 2
     c2 = _client([_note("n1", TITLE, REWRITE.replace(", ", "，").replace(": ", "："))], fps=list(c.rows["draft_fingerprints"]))
     assert core.tv_sync(c2, TV)["published_fp"]["written"] == 0 and len(_rows(c2)) == 2
+
+
+def test_a_post_identical_to_a_version_without_rows_is_recorded():
+    # 那一版的行被改稿撤光了, 帖和它一字不差: 库里没有任何一行盖着它, 照样记(codex on aw#133)
+    c = _client([_note("n1", TITLE, DRAFT)], fps=[])
+    out = core.tv_sync(c, TV)
+    assert out["published_fp"]["written"] == 1 and out["published_fp"]["no_rows"] == 1
+    (row,) = _rows(c)
+    assert row["opening_hash"] == fp.opening_hash(DRAFT) and row["created_at"] == _iso(0)
+    # 只差话题标签的也一样: 那一版带话题的那行不在了, 剥了话题的帖就是唯一的一行
+    c2 = _client([_note("n1", TITLE, DRAFT)], draft=DRAFT + "\n#求职 #简历", fps=[])
+    assert core.tv_sync(c2, TV)["published_fp"]["written"] == 1 and len(_rows(c2)) == 1
+
+
+def test_rows_removed_while_waiting_for_the_lock_still_get_the_version_time(monkeypatch):
+    # 锁外读的时候那一版还有行, 拿到锁之前被改稿撤光了: 锁里重读发现没行, 时刻照样取那一版建的时刻, 不记成今晚(codex on aw#133)
+    c = _client([_note("n1", TITLE, REWRITE)])
+    real = core._project_write_lock
+
+    class _Lock:
+        def __init__(self, *a, **k):
+            self._inner = real(*a, **k)
+
+        def __enter__(self):
+            c.rows["draft_fingerprints"] = [r for r in c.rows["draft_fingerprints"] if r.get("version_id") != "v1"]
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+    monkeypatch.setattr(core, "_project_write_lock", _Lock)
+    out = core.tv_sync(c, TV)
+    assert out["published_fp"]["written"] == 1 and out["published_fp"]["no_rows"] == 1
+    (row,) = _rows(c)
+    assert row["created_at"] == _iso(0), row["created_at"]
