@@ -7382,6 +7382,82 @@ def _fp_key(body: str) -> tuple:
     return (fp.opening_hash(body) or "", tuple(sorted(fp.ngram_hashes(body))))
 
 
+# W-40(10-30): 哪几种对照的帖, 发出去的文字要记在连着的那一版下。ingested 不用(版本就是从这篇帖抄进来的, 文字本来就在库里)。
+# body_exact 也要: 它只是正文前 40 字一样, 后面改过的照样有。
+_PUBLISHED_FP_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", "tv_lineage"})
+
+
+def _fingerprint_published(client, pairs: list[tuple], *, known: dict, owners: dict, holder: str,
+                           dry_run: bool = False) -> dict:
+    """W-40: 帖对上了写作台的哪一版, 发出去的文字就记一行指纹在那一版下 —— 查重比的是写过的稿, 写手拿去改过再发的那一版
+    原来不在库里, 下一篇照着发出去的帖写, 查重认不出(补录的帖、W-38 转正的帖早就是这样记的, 只有对上存档版本的漏了)。
+
+    ``pairs``: ``[(note, project_id, version_id)]``, 只放今晚核过、按现在的正文还连着这一版的。按文字幂等: 那一版下已经有同样
+    文字的行(底稿 / 存档那一行, 或者前一晚记过的帖)不再记; 帖和那一版只差话题标签的也不记(帖读进来就剥了话题)。行的时刻、写手、
+    angle_key 跟那一版最早那行走 —— 是那一版的另一种写法, 不是今晚新写的稿(TV 的发帖对账按时间窗数稿子, 记成今晚就多数一篇)。
+    那一版一行指纹都没有的不补(W-38 转了一半的由转正那一步补齐; 老的没指纹的版本走 backfill)。拿项目写锁(同补录 / 转正),
+    锁里重读一遍再写。回 ``{"checked", "to_write", "written", "no_rows", "error"}``; ``dry_run`` 只数不写。"""
+    out = {"checked": len(pairs), "to_write": 0, "written": 0, "no_rows": 0, "error": None}
+    by_pid: dict[str, list[tuple]] = {}
+    for n, pid, vid in pairs:
+        by_pid.setdefault(str(pid), []).append((n, str(vid)))
+
+    def _rows(items: list[tuple], meta: dict, bodies: dict) -> tuple[list[dict], int]:
+        rows, no_rows, seen = [], 0, {}
+        for n, vid in items:
+            m = meta.get(vid)
+            if not m:
+                no_rows += 1
+                continue
+            k = _fp_key(n.body)
+            if not k[0]:
+                continue
+            have = seen.setdefault(vid, set(m["keys"]))
+            v = known.get(vid) or bodies.get(vid)
+            if v is not None:
+                have |= {_fp_key(v.body), _fp_key(tvlink.strip_hashtags(v.body))}
+            if k in have:
+                continue
+            have.add(k)
+            rows.append({"version_id": vid, "title": n.title, "body": n.body, "writer": m.get("user_id"),
+                         "angle_key": m.get("angle_key"), "created_at": m.get("created_at")})
+        return rows, no_rows
+
+    for pid, items in by_pid.items():
+        try:
+            vids = sorted({vid for _, vid in items})
+            meta = store.fingerprint_meta(client, pid, vids)
+            todo, _ = _rows(items, meta, {})
+            bodies: dict = {}
+            outside = sorted({r["version_id"] for r in todo} - set(known))
+            if outside:
+                # 索引外的旧版(不是 best 的那版): 取正文只为了认出"只差话题标签"的
+                bodies = {vid: tvlink.Version(version_id=vid, project_id=pid, title=(r.get("title") or "").strip(),
+                                              body=(r.get("body") or "").strip(), created_at=None)
+                          for vid, r in store.versions_in_project(client, pid, outside).items()}
+            todo, no_rows = _rows(items, meta, bodies)
+            out["no_rows"] += no_rows
+            if not todo:
+                continue
+            if dry_run:
+                out["to_write"] += len(todo)
+                continue
+            with _project_write_lock(client, pid, holder):
+                # 锁里重读: 锁外读完到这里, 别的 tv-sync / 转正可能刚把同样的文字记上
+                meta = store.fingerprint_meta(client, pid, sorted({r["version_id"] for r in todo}))
+                todo, _ = _rows([(n, vid) for n, vid in items if vid in meta], meta, bodies)
+                out["to_write"] += len(todo)
+                if todo:
+                    payload = _snapshot_fp_payload(pid, owners.get(pid), todo)
+                    for p, r in zip(payload, todo):
+                        p["created_at"] = r["created_at"] or store.iso_now()
+                    out["written"] += store.write_fingerprints(client, payload)
+        except Exception as exc:                        # noqa: BLE001 — 对照已经写了; 没记上的明晚按文字再补
+            logger.exception("tv_sync: 帖的文字记进指纹库失败 (project=%s)", pid)
+            out["error"] = out["error"] or f"{type(exc).__name__}: {exc}"[:300]
+    return out
+
+
 def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, owner: str, holder: str) -> dict:
     """把这几篇底稿转成写作台的版本(W-38), 和存过档的一样: 建 batch / item / version(时刻 = 第一次查重)、写指纹(不过闸)、
     销牌(只销写手自己在查重之前抽的那张)、底稿行记上转正。同一晚同一次查重(check_id)的几篇一个 batch(一轮的帖分几晚发,
@@ -8089,6 +8165,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
 
     edit_diffs = _tv_edit_diffs(client, tv_project_id, links, existing, notes_by_id, known, dry_run=dry_run,
                                 text_changed=text_changed, blocked=blocked)
+    fp_ok: set = set(fp_set) if dry_run else set()   # 正文指纹记上了的(W-40 只认这些改过字的)
     if fp_set and not dry_run:
         # 指纹最后记, 而且只给差异已经按现在的正文算好了的(review on aw#128): 指纹一记, 明晚就不再当"改过字"; 差异这晚没算成
         # (写库失败 / 读不出 / 被每晚上限挤掉)的先不记, 明晚再核、再算。前面回填抛错中断的, 一条都不记, 同理。
@@ -8099,10 +8176,24 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         drift["fp_held"] = len(fp_set) - len(todo)
         try:
             drift["fp_written"] = store.tv_links_set_fp(client, todo)
+            fp_ok = set(todo)
         except Exception as exc:                        # noqa: BLE001 — 明晚再核一遍, 结论一样(退出码 1 让人知道)
             logger.exception("tv_sync: 记 TV 正文指纹失败 (tv=%s)", tv_project_id)
             drift["fp_written"] = getattr(exc, "done", 0)
             drift["fp_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    # W-40: 对上了写作台版本的帖, 发出去的文字也记进指纹库。只认按现在的正文核过的对照: 今晚写的对照(带着现在的指纹)、
+    # 今晚记上指纹的(改过字、还是那一篇)、之前核过且字没变的; 整篇换了没挪成的(blocked)、补录 / 底稿那条路的不在这里。
+    final = {**existing, **{l["note_id"]: l for l in links}}
+    pairs = []
+    for nid, l in final.items():
+        n = notes_by_id.get(nid)
+        if (n is None or not n.body or nid in blocked or not l.get("version_id") or l.get("project_id") not in owners
+                or l.get("match_kind") not in _PUBLISHED_FP_KINDS):
+            continue
+        if l.get("tv_text_fp") == fp_now[nid] or nid in fp_ok:
+            pairs.append((n, str(l["project_id"]), str(l["version_id"])))
+    published_fp = _fingerprint_published(client, pairs, known=known, owners=owners, dry_run=dry_run,
+                                          holder=f"tv-sync-published:{tv_project_id}:{uuid.uuid4().hex[:8]}")
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
     return {
         "tv_project_id": tv_project_id,
@@ -8116,6 +8207,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "edit_diffs": edit_diffs,
         "drift": drift,
         "snapshots": snap,
+        "published_fp": published_fp,
         "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
                  f"{counts['fuzzy']} / 改过 {counts['edited']}"
