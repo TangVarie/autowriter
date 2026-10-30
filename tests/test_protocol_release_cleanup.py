@@ -45,13 +45,15 @@ def test_header_has_one_upgrade_wording_and_no_export():
 
 def test_header_routes_open_project_failures_like_the_body():
     """复审(on aw#137): 引线头那条原来是「调了、重试一次还是失败 → 没连上」, 一个 403 / 500 也会叫写手去查 mcp.json。
-    现在照正文「一、动笔前」第 1 条分三种: 没连上才说那句原话; 403 / 身份认不出不重试、找负责人; 别的报错读不到规则。"""
+    现在照正文「一、动笔前」第 1 条分四种: 没连上才说那句原话; 403 / 身份认不出不重试、找负责人; project not found 重新
+    list_projects 抄 id(等多久都不会好); 别的报错读不到规则。"""
     bullet = next(ln for ln in HEAD.splitlines() if ln.startswith("- `open_project` 调不了"))
-    for must in ("「一、动笔前」", "鉴权失败", "重试一次", "403", "不属于当前调用者", "无法识别调用者身份", "不重试",
-                 "负责人", "读不到规则"):
+    for must in ("「一、动笔前」", "四种", "鉴权失败", "重试一次", "403", "不属于当前调用者", "无法识别调用者身份", "不重试",
+                 "负责人", "`project not found`", "include_archived=true", "原样抄 `project_id`", "读不到规则"):
         assert must in bullet, must
     assert "调了、重试一次还是失败" not in HEAD, "所有失败一律当没连上的旧说法"
-    assert bullet.index("没连上") < bullet.index("403") < bullet.index("读不到规则")
+    assert (bullet.index("没连上") < bullet.index("403") < bullet.index("project not found")
+            < bullet.index("读不到规则"))
 
 
 def test_project_choice_never_creates_on_a_miss():
@@ -176,8 +178,42 @@ def test_a_lost_digest_through_is_fetched_again_not_guessed():
 
 
 def test_open_project_failures_are_routed_by_kind():
-    for must in ("没连上", "项目打不开", "别的报错", "无法识别调用者身份"):
+    for must in ("失败分四种", "没连上", "项目打不开", "找不到项目", "别的报错", "无法识别调用者身份"):
         assert must in SEC_OPEN, must
+    # 复审(on aw#137): 库里没有这个 id 不是「等它恢复」, 是回「零」重新抄 id; 共用一个身份以后, 传错 id 也不再是 403
+    kind = next(ln for ln in SEC_OPEN.splitlines() if ln.startswith("- **找不到项目**"))
+    for must in ("`project not found`", "「零」", "include_archived=true", "原样抄", "照「零」的原话说"):
+        assert must in kind, must
+    assert "传错 project_id 的表现是 403" not in BODY and "传错 project_id 的真实表现是 403" not in T.open_project.__doc__
+    assert "找不到项目之外的报错" in SEC_OPEN
+
+
+def test_project_not_found_says_to_list_projects_again(monkeypatch):
+    monkeypatch.setattr(store, "project_row", lambda client, pid: None)
+    for pid in ("p-nope", "  "):
+        with pytest.raises(core.ProjectNotFound) as exc:
+            core.assert_project_access(None, pid, user_id="me")
+        msg = str(exc.value)
+        assert core.PROJECT_NOT_FOUND_NEXT in msg
+    for must in ("list_projects", "include_archived=true", "原样抄", "写作台里找不到这个项目，请找负责人看一下", "不要新建"):
+        assert must in core.PROJECT_NOT_FOUND_NEXT, must
+
+
+def test_comments_for_failures_are_routed_like_open_project():
+    """复审(on aw#137): 评论那段原来是「找不到、或者重试一次还调不通 → 同样是没连上」, 一个 403 / 500 也叫写手去查
+    mcp.json。现在同第 1 条分开说; 403 那一类照报错给的下一步(问项目、贴正文、找负责人), 不重试。"""
+    assert "重试一次还调不通，同样是没连上" not in BODY
+    sec = _between(BODY, "`comments_for` 调不了就先不写", "**不要**把单独写的评论")
+    lines = [ln for ln in sec.splitlines() if ln.startswith("- ")]
+    assert len(lines) == 3, sec
+    conn, refused, other = lines
+    for must in ("找不到这个工具", "连接失败、鉴权失败", "重试一次", "没连上写作台", "「一、动笔前」第 1 条"):
+        assert must in conn, must
+    for must in ("403", "不属于当前调用者", "无法识别调用者身份", "不重试", "照报错里给的下一步", "负责人"):
+        assert must in refused, must
+    assert "读不到" in other and "等它恢复" in other and "没连上" not in other
+    doc = T.comments_for.__doc__
+    assert "不重试" in doc and "照报错里给的下一步" in doc
 
 
 def test_lessons_retry_carries_the_arm_and_not_configured_is_not_said():
@@ -225,6 +261,10 @@ def _server_texts() -> dict[str, str]:
                   "_CALIB_SYSTEM"):
         texts[f"core.{const}"] = getattr(core, const)
     texts["core._check_rules_next_step(must_fix)"] = core._check_rules_next_step({"must_fix": 1}, 0)
+    texts["core.PROJECT_NOT_FOUND_NEXT"] = core.PROJECT_NOT_FOUND_NEXT
+    texts["core._angle_key_mismatch_note(all)"] = core._angle_key_mismatch_note(
+        {store.ANGLE_KEY_UNKNOWN: 1, store.ANGLE_KEY_USED: 1, store.ANGLE_KEY_OTHER_PROJECT: 1,
+         store.ANGLE_KEY_NOT_IN_LEDGER: 1})
     notice = skillcheck.notice("aaaaaaaaaaaa", "bbbbbbbbbbbb")
     texts["skillcheck.notice.action"] = notice["action"]
     texts["skillcheck.notice.message"] = notice["message"]
@@ -264,6 +304,19 @@ def test_server_revision_path_goes_through_check_drafts_first():
                  core._check_rules_next_step({"must_fix": 1}, 0)):
         assert "replaces_version_id 先过 check_drafts" in text, text
         assert text.index("check_drafts") < text.index("score_drafts"), text
+
+
+@pytest.mark.parametrize("problems", [
+    {store.ANGLE_KEY_OTHER_PROJECT: 1}, {store.ANGLE_KEY_UNKNOWN: 1}, {store.ANGLE_KEY_USED: 2},
+    {store.ANGLE_KEY_NOT_IN_LEDGER: 1}, {store.ANGLE_KEY_OTHER_PROJECT: 1, store.ANGLE_KEY_UNKNOWN: 1},
+])
+def test_archive_pending_key_mismatch_note_is_for_the_model_only(problems):
+    """复审(on aw#137): 那一笔按 (项目, 身份) 记, 团队共用一个身份 —— 可能是队友的对话存的。只给模型看, 不叫它去问用户,
+    也不说是「你」抽的、「你」编的。"""
+    note = core._angle_key_mismatch_note(problems)
+    assert note.endswith("不用回头处理, 也不跟用户提。") and "团队别的对话" in note
+    for bad in ("跟用户确认", "你在别的项目", "不是你编的", "存错了项目"):
+        assert bad not in note, (bad, note)
 
 
 def test_calibration_notes_are_the_projects_not_one_persons(monkeypatch):

@@ -312,7 +312,7 @@ def test_next_check_says_the_cards_were_archived_under_keys_the_ledger_does_not_
         assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 2, 0)
         assert mm["keys"] == ["A_01", "A_02"]
         assert mm["last_at"]
-        for must in ("已经写完存档", "不用重存", "别按这些牌再写一遍", "原样复制", "20 位"):
+        for must in ("已经写完存档", "不用重存", "不用为那几张牌再写一遍", "原样复制", "20 位", "不跟用户提"):
             assert must in mm["note"], must
         assert block["next_step"] == core.ARCHIVE_PENDING_NEXT_STEP, "原来那句不动"
 
@@ -339,6 +339,18 @@ def test_someone_elses_bad_keys_are_not_shown_to_me(use, no_embeddings):
     block = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]
     assert block["cards"] == 1 and "angle_key_mismatch" not in block
     assert core.archive_pending(c, PID, user_id=MATE)["angle_key_mismatch"]["keys"] == ["MATE_01"]
+
+
+def test_a_teammates_misfiled_draft_is_not_put_to_this_writer(use, no_embeddings):
+    """复审(on aw#137): 团队共用一个身份, 记下的那一笔可能是队友的对话存的。另一场对话抽牌时一并带上, 但只给模型看:
+    不叫它问用户「稿子是不是存错了项目」, 也不说那是「你」抽的牌。"""
+    use(_client([_card(1, hours_ago=1)]))
+    core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "f" * 20, "length": 20, "problem": "other_project"},
+                                          {"index": 1, "angle_key": "A_01", "length": 4, "problem": "unknown"}])
+    note = T.draw_angles(PID, 1, _user_id=ME)["archive_pending"]["angle_key_mismatch"]["note"]
+    assert "不跟用户提" in note and "团队别的对话" in note
+    for bad in ("跟用户确认", "你在别的项目", "存错了项目", "不是你编的"):
+        assert bad not in note, bad
 
 
 def test_no_block_without_pending_cards_and_the_note_expires_with_the_window(use, no_embeddings, monkeypatch):
@@ -382,13 +394,13 @@ def test_the_note_only_says_invented_or_already_written_when_that_is_the_problem
     assert (mm["drafts"], mm["unknown"], mm["used"]) == (2, 2, 0), "这个项目台账里没有的三种都算 unknown"
     assert mm["by_problem"] == {"other_project": 1, "not_in_ledger": 1}
     note = mm["note"]
-    assert "存错了项目" in note and "发牌时台账没写进去" in note
-    for bad in ("已经写完存档", "别按这些牌再写一遍", "不要自己编号"):
+    assert "别的项目抽的牌" in note and "发牌时台账没写进去" in note
+    for bad in ("已经写完存档", "不用为那几张牌再写一遍", "不要自己编号"):
         assert bad not in note, bad
 
     core._note_angle_key_misses(PID, ME, [{"index": 0, "angle_key": "A_01", "length": 4, "problem": "unknown"}])
     note = T.check_drafts(PID, KEYED, _user_id=ME)["archive_pending"]["angle_key_mismatch"]["note"]
-    assert "已经写完存档" in note and "不要自己编号" in note and "存错了项目" in note
+    assert "已经写完存档" in note and "不要自己编号" in note and "别的项目抽的牌" in note
 
 
 def test_each_miss_expires_on_its_own(use, no_embeddings, monkeypatch):

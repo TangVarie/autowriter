@@ -407,8 +407,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
 
     ⚠️ **counts.hard_rules 是 0 不一定是错的。** 很多项目的约束确实都记在 soft 里
     (老工作台收反馈时不分"这一次"和"以后都这样", 一律存成 soft; 2026-09-20 全库
-    465 条规则里 hard 只有 53 条)。传错 project_id 的真实表现是 403, 或者
-    soft_rules 和 soft_rules_pool 【同时】为 0。只有后者才值得问一句。
+    465 条规则里 hard 只有 53 条)。传错 project_id 的真实表现是报 project not found(照报错里说的重新
+    list_projects 抄 id), 或者 soft_rules 和 soft_rules_pool 【同时】为 0。只有后者才值得问一句。
 
     counts.angle_debt 大于 0 时, 返回里还会有 angle_debt / angle_debt_note: 这个项目近期发牌分到、
     还没有对应稿子的坐标, angle_debt.angles 里是具体是哪几个(一小时以内刚发的不在里面 —— 一个团队共用一个身份,
@@ -657,7 +657,8 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
 
     ``skill_version``: 同 open_project, 每次都传 skill 里 ``protocol_version:`` 那一行的值; 返回里有 ``skill_update`` 时把
     ``skill_update.message`` 原样放在开场(同一条只放一次)。
-    帖子属于别人的项目时报 403, 不回帖子内容。
+    帖子属于别人的项目时报 403, 不回帖子内容。这种报错(403、笔记对不上项目、不属于当前调用者、无法识别调用者身份)
+    不重试, 照报错里给的下一步做: 问写的是哪个项目、请用户把帖子正文贴过来, 或者请用户找负责人看一下。
     """
     out = core.comments_for(core.sb(), user_id=_user_id, link=link, project_id=project_id,
                             post_title=post_title, post_body=post_body)

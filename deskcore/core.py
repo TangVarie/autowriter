@@ -117,6 +117,11 @@ ARCHIVE_PENDING_NEXT_STEP = (
 IDENTITY_REFUSED = "无法识别调用者身份, {what}。这次没做成; 请用户找负责人看一下, 不用重试。"
 PROJECT_REFUSED_NEXT = ("这个项目打不开: 请用户找负责人看一下; 不要换别的 project_id 试, 不要问用户要 project_id, "
                         "也不要新建一个项目绕过去。")
+# 库里没有这个 project_id(2026-10-30 复审, 和 protocol.md「一、动笔前」第 1 条「找不到项目」同一个口径): 多半是 id 没抄对,
+# 下一步是重新 list_projects 抄 id —— 不是等它恢复(那是「别的报错」), 也不是找负责人(那是 403)。
+PROJECT_NOT_FOUND_NEXT = ("写作台里没有这个 project_id, 多半是没抄对: 带 include_archived=true 再调一次 list_projects, "
+                          "把 project_id 原样抄过来再调一次; 还是找不到, 就告诉用户「写作台里找不到这个项目，请找负责人看一下」, "
+                          "不要新建项目, 也不要问用户要 project_id。")
 
 
 def _supersede_snapshots(client, project_id: str, drafts: list[dict], vids: dict[int, str]) -> None:
@@ -229,7 +234,7 @@ def assert_project_access(client, project_id: str, *,
     读不出东西。
     """
     if not project_id or not str(project_id).strip():
-        raise ProjectNotFound("project_id 不能为空")
+        raise ProjectNotFound(f"project_id 不能为空。{PROJECT_NOT_FOUND_NEXT}")
     if not user_id:
         # 报错文本是念给写手的(2026-10-30 发布收尾): 配置怎么补只进日志。deskcore 持 service_role 绕过 RLS,
         # 认不出人就等于对所有租户开放, 所以拒。
@@ -240,7 +245,7 @@ def assert_project_access(client, project_id: str, *,
 
     project = store.project_row(client, project_id)
     if project is None:
-        raise ProjectNotFound(f"project not found: {project_id}")
+        raise ProjectNotFound(f"project not found: {project_id}。{PROJECT_NOT_FOUND_NEXT}")
 
     # ↓↓↓ 换归属模型时【只改这三行】↓↓↓
     owner = project.get("owner_id")
@@ -5672,22 +5677,26 @@ def _recent_angle_key_misses(project_id, user_id) -> dict | None:
 def _angle_key_mismatch_note(n: dict[str, int]) -> str:
     """archive_pending 里 angle_key_mismatch 那句话, 按出现的问题拼(W-31 复审)。
 
-    「牌其实写完存了、别按它们再写」只对 unknown / used 说: 那两种是这个项目的牌写了却带错了 key。别的项目的牌、
-    台账里没有这一行的, 这个项目挂着的牌跟那几篇无关。「不要自己编号、缩写或改写」只对形状不对的(unknown)说。"""
+    「牌其实写完存了、不用为它们再写」只对 unknown / used 说: 那两种是这个项目的牌写了却带错了 key。别的项目的牌、
+    台账里没有这一行的, 这个项目挂着的牌跟那几篇无关。「不要自己编号、缩写或改写」只对形状不对的(unknown)说。
+    记的是 (项目, 身份), 团队共用一个身份, 所以那几篇可能是队友的对话存的(2026-10-30 复审): 只给模型看, 不叫它问用户
+    —— 这一场存的那几篇, score_drafts 当时的 angle_key_warning 已经说过; 别人存的, 这一场的写手管不着。"""
     unknown, used = n.get(store.ANGLE_KEY_UNKNOWN, 0), n.get(store.ANGLE_KEY_USED, 0)
     other, missing = n.get(store.ANGLE_KEY_OTHER_PROJECT, 0), n.get(store.ANGLE_KEY_NOT_IN_LEDGER, 0)
     parts = []
     if unknown or used:
         parts.append(
-            f"这些牌里有的其实已经写完存档了: 有 {unknown + used} 篇存档时带的 angle_key 在这个项目的台账里对不上"
-            "(keys 里有), 所以没销账。已经存了的不用重存, 也别按这些牌再写一遍"
+            f"cards 里有的牌其实已经写完存档了: 这个项目有 {unknown + used} 篇存档时带的 angle_key 在台账里对不上"
+            "(keys 里是它们带的 key), 所以那几张没销账。已经存了的不用重存, 也不用为那几张牌再写一遍"
             + (f"; 之后每篇存档时的 angle_key 照 draw_angles 返回里分给它的那个原样复制({fp.ANGLE_KEY_HEX_LEN} 位十六进制), "
                "不要自己编号、缩写或改写" if unknown else "") + "。")
     if other:
-        parts.append(f"有 {other} 篇存进这个项目时带的是你在别的项目抽的牌: 稿子是不是存错了项目? 跟用户确认。")
+        parts.append(f"有 {other} 篇存进这个项目时带的是别的项目抽的牌, 那几张销不到这个项目的账上, 跟这里挂着的牌无关。")
     if missing:
         parts.append(f"有 {missing} 篇带的 angle_key 形状是对的({fp.ANGLE_KEY_HEX_LEN} 位十六进制), 但台账里没有这一行: "
-                     "多半是发牌时台账没写进去, 不是你编的或抄错的。")
+                     "多半是发牌时台账没写进去, 不是编的或抄错的。")
+    parts.append("这几篇可能是这一场存的, 也可能是团队别的对话存的(大家共用一个身份); 这一场存的, score_drafts 当时已经说过。"
+                 "不用回头处理, 也不跟用户提。")
     return "".join(parts)
 
 

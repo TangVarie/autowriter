@@ -352,6 +352,59 @@ def test_a_through_from_before_new_diffs_arrived_is_still_accepted():
     assert later["changed"] == 3 and later["through"] == fresh[-1]["computed_at"], "新来的那几篇一篇不丢"
 
 
+class _PgTimes(FakeClient):
+    """timestamptz 列按时刻比, 跟 Postgres 一样。默认假件按字符串比: 同一时刻、小数秒位数不同(PostgREST 去掉末尾的 0)
+    就比错, 那样连「按时刻比」的那行代码也测不出来。"""
+    _TS_COLS = {"computed_at", "acked_through", "acked_at"}
+
+    def _match(self, row, kind, key, value) -> bool:
+        if key in self._TS_COLS and kind in ("eq", "lt", "gt", "gte", "lte"):
+            cur, val = store._ts(self._resolve(row, key)), store._ts(value)
+            if cur is None or val is None:
+                return False
+            return {"eq": cur == val, "lt": cur < val, "gt": cur > val, "gte": cur >= val, "lte": cur <= val}[kind]
+        return super()._match(row, kind, key, value)
+
+
+@pytest.mark.parametrize("stored", [
+    "2026-10-18T12:00:00+00:00",
+    "2026-10-18T12:00:00.123456+00:00",
+    "2026-10-18T12:00:00.12345+00:00",           # 存的是 .123450, PostgREST 回的时候去掉了末尾的 0
+    "2026-10-18T12:00:00.1+00:00",
+    "2026-10-18T12:00:00.5Z",
+])
+def test_the_through_is_accepted_whatever_fraction_postgrest_returns(stored):
+    """复审(on aw#137): 上面那条只用了整秒。computed_at 存的是微秒(iso_now), 大约十行里有一行末尾是 0, PostgREST 回的
+    小数就短一截; 按字符串比的话, 那些项目的 ack 每次都 400, 摘要永远看不完。"""
+    base = _digest_client()
+    c = _PgTimes(rows=base.rows)
+    c.rows["tv_edit_diffs"][0]["computed_at"] = stored                     # n0: 最新的那一篇, through 就是它
+    d = core.edit_digest(c, P1, user_id=ME, now=NOW)
+    assert d["through"] == stored
+    out = core.ack_edit_digest(c, P1, d["through"], user_id=ME, rules_recorded=0)
+    assert out["acked"] and store._ts(c.rows["tv_edit_digest_acks"][0]["acked_through"]) == store._ts(stored)
+
+
+def test_a_through_from_another_projects_digest_is_refused(monkeypatch):
+    """复审(on aw#137): 一场对话开了两个项目, 交付时把 P2 的 through 抄给了 P1。收下的话 P1 的水位跳到 P2 的时间,
+    水位只往前走, P1 那之前没人看过的差异再也进不了摘要。只认这个项目自己给出去的那个 through。"""
+    c = _digest_client()
+    c.rows["projects"].append({"id": P2, "name": "match-only", "brand": "sportsix", "owner_id": ME})
+    c.rows["tv_edit_diffs"].extend(
+        dict(r, note_id=f"p2-{r['note_id']}", project_id=P2, computed_at=(NOW - timedelta(hours=1, minutes=i)).isoformat())
+        for i, r in enumerate(list(c.rows["tv_edit_diffs"])))
+    d2 = core.edit_digest(c, P2, user_id=ME, now=NOW)
+    assert d2 and d2["through"] > core.edit_digest(c, P1, user_id=ME, now=NOW)["through"]
+    with pytest.raises(ValueError) as exc:
+        core.ack_edit_digest(c, P1, d2["through"], user_id=ME)
+    assert "edit_digest.through" in str(exc.value)
+    monkeypatch.setattr(core, "sb", lambda: c)
+    with pytest.raises(tools.InvalidInput):
+        tools.ack_edit_digest(P1, d2["through"], _user_id=ME)
+    assert not [a for a in c.rows["tv_edit_digest_acks"] if a["project_id"] == P1], "P1 一行都没记"
+    assert core.ack_edit_digest(c, P2, d2["through"], user_id=ME)["acked"], "P2 自己的照收"
+
+
 def test_migration_013_adds_the_new_columns_to_an_existing_table():
     """第一版 013 建过表的库, 重跑新版要把 edited_* 两列补上(建表 IF NOT EXISTS 不补列)。"""
     from pathlib import Path
