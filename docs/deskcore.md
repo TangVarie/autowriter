@@ -537,7 +537,13 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 等锁，不拆开会把分位数带歪；`delivery_rules` 是存档之后、判定之前的交付版式 + 代码查规则（§3.9 / §3.10，规则那次是
 翻页读的），判定的截止要扣掉它花的时间——2026-10-20 起单记，各段加起来约等于 `total`），**同一份数落进
 `batch_metrics`**——它本来就是「每批一行的指标快照」（phase_ms / counters / meta 三个 jsonb），不需要新迁移。
-`batch_id` 留 NULL（本次的 batch 记在 `meta.batch_id`），免得历史页给写作台批次挂上一块全是 0 的「性能指标」。攒够样本之后这样查：
+`batch_id` 留 NULL（本次的 batch 记在 `meta.batch_id`），免得历史页给写作台批次挂上一块全是 0 的「性能指标」。
+**2026-10-30（W-21）起 commit 段再按步拆开**，记在 `meta.commit_parts_ms`（不进 `phase_ms`，那里各段加起来要等于 `total`；也不进回包）：
+`access`（查项目）、`replace_prep`（改稿摘旧指纹）、`embed`（标题向量）、`gate`（查重闸）、`fingerprints`（原子写指纹）、
+`restore`（被拒的改稿放回旧指纹）、`replace_versions`（改稿挂旧 item）、`arm`（飞轮臂）、`mint`（建 batch / item / version，
+每篇三次写）、`consume`（角度销账，每篇一查一写）、`snapshots`（查重底稿转正，W-38）、`key_check`（key 对不上台账时多查一次）、
+`angle_debt`（存档后查欠账，只在有没带 key / key 对不上时）、`other`（拼回包、提示语、放锁）。按这个顺序一段接一段量，
+加起来等于 `phase_ms.commit`。攒够样本之后这样查：
 
 ```sql
 select count(*),
@@ -548,6 +554,15 @@ select count(*),
        percentile_cont(0.95) within group (order by (phase_ms->>'total')::int)  as total_p95
   from autowriter.batch_metrics
  where meta->>'mode' = 'deskcore_commit' and created_at > now() - interval '14 days';
+
+-- commit 段哪一步占大头(W-21, 2026-10-30 起才有 commit_parts_ms); per_draft 按这批存进去的篇数摊
+select e.k as step, count(*),
+       percentile_cont(0.5)  within group (order by e.v::int) as p50,
+       percentile_cont(0.95) within group (order by e.v::int) as p95,
+       round(avg(e.v::numeric / greatest((m.counters->>'written')::int, 1))) as per_draft_avg
+  from autowriter.batch_metrics m, jsonb_each_text(m.meta->'commit_parts_ms') as e(k, v)
+ where m.meta->>'mode' = 'deskcore_commit' and m.created_at > now() - interval '14 days'
+ group by 1 order by p95 desc;
 
 -- 判定结局的分布(影子期要回答的就是: 判了多少、超时多少、被出境口径挡了多少)
 select j->>'status' as status, count(*)

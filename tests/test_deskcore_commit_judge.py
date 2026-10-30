@@ -754,6 +754,49 @@ def test_delivery_and_rule_checks_get_their_own_phase(judge_on, monkeypatch):
     assert c.rows["batch_metrics"][0]["phase_ms"] == ph
 
 
+def test_the_commit_phase_is_split_by_step_into_meta_and_the_slow_step_shows(judge_on, monkeypatch):
+    """W-21(10-30): commit 段 10 篇一批 11～18 秒, 库侧两条 RPC 都不到 0.5 秒, 拆不开。现在按步计时进
+    batch_metrics.meta.commit_parts_ms: 各步加起来 = phase_ms.commit, 慢的那一步落在它自己的名下;
+    phase_ms 的键和「各段加起来 = total」都不变, 回给调用方的也不多一个字段。"""
+    real_mint, real_consume = store.mint_draft_identity, store.consume_angle
+
+    def slow_mint(*a, **k):
+        time.sleep(0.3)
+        return real_mint(*a, **k)
+
+    def slow_consume(*a, **k):
+        time.sleep(0.1)
+        return real_consume(*a, **k)
+    monkeypatch.setattr(store, "mint_draft_identity", slow_mint)
+    monkeypatch.setattr(store, "consume_angle", slow_consume)
+    c = _client()
+    drafts = [{**d, "angle_key": f"k{i}"} for i, d in enumerate(_distinct_drafts(2))]
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert out["written"] == 2, out
+    ph = out["phase_ms"]
+    assert set(ph) == {"lock_wait", "commit", "delivery_rules", "judge", "project_isolation", "total"}
+    assert "commit_parts_ms" not in out, "按步计时只进埋点, 不进回包"
+    parts = c.rows["batch_metrics"][0]["meta"]["commit_parts_ms"]
+    assert list(parts) == [k for k in core.COMMIT_PARTS if k in parts], "按执行顺序"
+    assert {"access", "embed", "gate", "fingerprints", "mint", "consume", "other"} <= set(parts), parts
+    assert all(isinstance(v, int) and v >= 0 for v in parts.values()), parts
+    assert abs(sum(parts.values()) - ph["commit"]) <= 2, (parts, ph)
+    assert parts["mint"] >= 300 and parts["consume"] >= 200, parts
+    assert parts["other"] < 100, f"慢的那几步不该落进 other: {parts}"
+
+
+def test_a_commit_that_raises_records_nothing_and_an_empty_batch_has_no_parts(judge_on, monkeypatch):
+    """计时不改失败路径: 指纹写完之后建身份之前抛了, 照旧放回旧指纹、原样上抛, 不落 batch_metrics。"""
+    def boom(*a, **k):
+        raise RuntimeError("库挂了")
+    monkeypatch.setattr(store, "commit_fingerprints_atomic", boom)
+    c = _client()
+    with pytest.raises(RuntimeError):
+        core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    assert not c.rows.get("batch_metrics")
+    assert core.commit_drafts(c, PROJ, [], user_id=ME) == {"written": 0, "consumed_angles": 0, "rejected": []}
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 5 · 影子期: commit 的结果一个字不变
 # ══════════════════════════════════════════════════════════════════════
