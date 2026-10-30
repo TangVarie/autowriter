@@ -152,10 +152,13 @@ def list_all_projects(sb, *, owner_id: str) -> list[dict]:
     1000)会**静默截断**: 越过 1000 个项目之后, 后面的项目在模型眼里【根本不存在】,
     且没有任何提示(审计 COR-005 同款, 判据同样是空页收工 + offset 按实收行数前进)。
     ``name`` 有重名, 排序必须带 ``id`` 做次级键, 否则翻页会漏行也会重复行。
+
+    带 ``default_params``(2026-10-30): 归档标记 ``"archived": true`` 在里面(core.project_archived), list_projects
+    据此把不用的项目藏起来。这一列存的是 JSON 字符串, 库里没法按它过滤, 只能取回来在 Python 里判。
     """
     return _paged(lambda off, lim: (
         sb.table("projects")
-          .select("id, name, brand, owner_id")
+          .select("id, name, brand, owner_id, default_params")
           .eq("owner_id", owner_id)
           .order("name").order("id")
           .range(off, off + lim - 1)

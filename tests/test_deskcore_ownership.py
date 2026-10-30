@@ -206,6 +206,7 @@ UNGATED_WITH_REASON = {
     "backfill_fingerprints":  "运维命令, 见 docs/deskcore.md §2.2.1",
     "backfill_gap":           "运维命令, 见 docs/deskcore.md §2.2.1",
     "delivery_format":        "运维命令(cli delivery-format, 10-20), 见 docs/deskcore.md §2.2.1; 写手那边没有对应的工具",
+    "project_archive":        "运维命令(cli project-archive, 10-30), 见 docs/deskcore.md §2.2.1 / §3.13; 写手那边没有对应的工具",
     "_kick_rule_compile":     "后台补编的触发器(10-20, D-121), 只被已过闸的 build_writing_brief / record_rule / check_rules "
                               "调用; 只起一个线程, 不读写项目数据",
     "_rule_compile_worker":   "后台补编的线程本体, 只由 _kick_rule_compile 起; 调 compile_rules 的运维路径(按项目 owner 取池子, "

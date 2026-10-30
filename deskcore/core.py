@@ -506,6 +506,11 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         },
         "positive_selection_mode": pos_mode,
     }
+    # 归档的项目照开(2026-10-30, 见 project_archived 上面那段): 简报一样不少, 只多一个机器字段和一句给模型的话 ——
+    # 先跟用户确认是不是这个项目。项目行上面已经取了, 不多查。
+    if project_archived(project):
+        out["archived"] = True
+        out["archived_note"] = ARCHIVED_NOTE.format(name=project.get("name") or project_id)
 
     # ── 飞轮经验卡: 随简报一起借, 不再等模型自己想起来 ──────────────────
     # 2026-09-19 查生产库: 9 月 1-16 日写作台 commit 了 71 批稿子, 馆员缓存里
@@ -2344,6 +2349,12 @@ def _cross_project_shadow(client, project_id, user_id, drafts, vectors, exclude_
     target = next((p for p in projects if str(p["id"]) == str(project_id)), None)
     if target is None:
         return {"status": "unavailable", "note": "当前项目标记未查到，无从判断是否串项目"}
+    # 归档的项目不比(2026-10-30 发布收尾, 见 project_archived 上面那段): 品牌词标记和标题向量都不拿它们比 —— 一个早就
+    # 不写的项目的品牌词出现在正文里, 原来就报一次「可能串项目」。当前项目自己归档了照比(写手确认过要写它, 见 open_project)。
+    # 去掉了几个记在 archived_skipped, 跟着 project_isolation 进 batch_metrics。
+    live = [p for p in projects if p is target or not project_archived(p)]
+    archived_skipped = len(projects) - len(live)
+    projects = live
     flags = [{"index": i, "markers": foreign_markers((d.get("title") or "") + "\n" + (d.get("body") or ""),
                                                       target, projects)} for i, d in enumerate(drafts)]
     if partial is not None:
@@ -2379,6 +2390,8 @@ def _cross_project_shadow(client, project_id, user_id, drafts, vectors, exclude_
     out = {"status": "shadow", "flags": [r for r in flags if r["markers"] or r.get("title_vector")],
            "vector_projects_sampled": len(scores), "projects_total": len(projects),
            "note": "跨项目信号只记录、不拦入库。向量仅比同模型的近期标题样本，不能当成正文归属或完整扫描。"}
+    if archived_skipped:
+        out["archived_skipped"] = archived_skipped
     if partial_vectors:
         out["vector_partial"] = True
     return out
@@ -7503,7 +7516,61 @@ def create_project(client, name: str, *, brand: str = "",
     return out
 
 
-def list_projects(client, *, user_id: str | None = None) -> list[dict]:
+# ── 归档: 不用的项目不进清单、不进跨项目检查(2026-10-30 发布收尾) ──────────────────────────────────
+# 主身份名下 41 个项目, 在用的六个左右。不用的那些照样排在 list_projects 里, 模型每场开头要在一长串里挑; score_drafts 的
+# 跨项目检查(_cross_project_shadow)也拿它们的品牌词和近期标题去比 —— 一个早就不写的项目的品牌词出现在正文里, 就报一次
+# 「可能串项目」, 写手要去核对一件跟这次无关的事。
+# 不加迁移: 标记就是 projects.default_params 里的 "archived": true(同 delivery / isolation_terms, 整列存成 JSON 字符串)。
+# 只有运维命令 cli project-archive 设 / 撤(project_archive), 没有任何路径自动写它, 写手那边也没有对应的工具。
+# 归档不锁人: open_project 照常给整份简报, 只多带 archived 和一句让模型跟用户确认是不是这个项目 —— 一个团队共用一个
+# 身份, 某个写手要接着写一个旧项目是正当的, 拦下来就是把人关在门外。
+ARCHIVED_KEY = "archived"
+ARCHIVED_NOTE = "「{name}」这个项目标成了暂时不用。动笔前先跟用户确认一句这次要写的就是它: 是就照常写, 不是就换成用户要的那个项目。"
+
+
+def project_archived(project: dict | None) -> bool:
+    """项目行 → 归档没有。只认 ``default_params`` 里的 ``"archived": true``(JSON 的 true, 字符串 "true" 不算)。
+
+    ⚠️ ``default_params`` 解析不了按**没归档**算, 不抛: 一个写坏的 default_params 不能让在用的项目从清单里消失、
+    或者从跨项目检查里漏掉。CLI 写之前用的是严格的 delivery.parse_params(解析不了就拒绝写), 这里是读, 宽着读。"""
+    params = (project or {}).get("default_params")
+    if isinstance(params, str):
+        try:
+            params = json.loads(params) if params.strip() else {}
+        except (TypeError, ValueError):
+            return False
+    return isinstance(params, dict) and params.get(ARCHIVED_KEY) is True
+
+
+def project_archive(client, project_id: str, *, archived: bool = True) -> dict:
+    """运维命令 ``cli project-archive``: 设 / 撤一个项目的归档标记(``default_params.archived``)。
+
+    不收 user: 同 delivery_format, 跑它的人握着 service_role key。写手那边没有这个工具 —— 哪些项目不用了是负责人定的。
+    撤销是把键删掉, 不写 false: 「没有这个键」就是没归档, 库里不留两种表示同一件事的形状。
+    写回时保留 default_params 里别的键(delivery / isolation_terms 等), 仍存成 JSON 字符串; default_params 本身解析
+    不了就拒绝写(delivery.TemplateError, 同 delivery_format): 拿 {} 去合并会把别的键一起抹掉。
+    已经是要的状态就不写(``changed`` false), 重复跑无害。"""
+    project = store.project_row(client, project_id)
+    if project is None:
+        raise ProjectNotFound(f"project not found: {project_id}")
+    params = delivery.parse_params(project.get("default_params"))
+    was = params.get(ARCHIVED_KEY) is True
+    out = {"project_id": project_id, "project_name": project.get("name") or "",
+           "archived": was, "changed": False}
+    if was == bool(archived):
+        return out
+    params = {k: v for k, v in params.items() if k != ARCHIVED_KEY}
+    if archived:
+        params[ARCHIVED_KEY] = True
+    store.set_project_default_params(client, project_id, json.dumps(params, ensure_ascii=False))
+    out["changed"] = True
+    # 以库里实际的值回报(同 record_rule / set_rule_state 的纪律), 不回报入参
+    out["archived"] = project_archived(store.project_row(client, project_id))
+    return out
+
+
+def list_projects(client, *, user_id: str | None = None, include_archived: bool = False,
+                  report_sink: dict | None = None) -> list[dict]:
     """**我的**项目清单 + 每个项目手上有多少料。
 
     审计 COR-015: 这个清单原来返回**全库所有项目**(名称/品牌/owner_id/规则条数/
@@ -7520,12 +7587,21 @@ def list_projects(client, *, user_id: str | None = None) -> list[dict]:
     个数无关(加 owner 过滤不改变这个性质 —— 它只是第一次查询多一个 .eq)。
     指纹计数走 migrations/004 的 RPC(PostgREST 不会 GROUP BY);
     RPC 没部署时退回逐项目 count —— 慢, 但清单仍然是对的。
+
+    归档的项目默认不列(2026-10-30, 见 project_archived 上面那段); ``include_archived`` 为真时列出来、带 ``archived: true``。
+    藏了几个写进 ``report_sink["archived_hidden"]``(同 memory.filter_soft_by_relevance 的 report_sink), 返回值仍是
+    清单本身。藏掉的不算规则 / 指纹数 —— 计数仍是 3 次固定查询, 只是 id 少了。
     """
     if not user_id:
         raise PermissionError(
             "无法识别调用者身份, 不能列项目 —— 清单按 owner 隔离。"
             "服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID。")
     projects = store.list_all_projects(client, owner_id=user_id)
+    if not include_archived:
+        live = [p for p in projects if not project_archived(p)]
+        if report_sink is not None:
+            report_sink["archived_hidden"] = len(projects) - len(live)
+        projects = live
     if not projects:
         return []
     pids = [p["id"] for p in projects]
@@ -7553,14 +7629,18 @@ def list_projects(client, *, user_id: str | None = None) -> list[dict]:
     for p in projects:
         pid = p["id"]
         hard_n, soft_n = rule_counts.get(pid, (0, 0))
-        out.append({"project_id": pid, "name": p.get("name") or "",
-                    "brand": p.get("brand") or "", "owner_id": p.get("owner_id"),
-                    "hard_rules": hard_n, "soft_rules": soft_n,
-                    "fingerprint_count": int(fp_counts.get(pid, 0) or 0),
-                    # 补录进来的 item 数 —— 独立的一个数, 不是 fingerprint_count 的子集 (补录半途失败的
-                    # 副本有 item 没指纹, codex review on #93), 两者别相减。它的用处是让模型别把
-                    # "1,800 条积累"读成"写过 1,800 篇"。
-                    "ingest_copies": int(ingest_counts.get(pid, 0) or 0)})
+        row = {"project_id": pid, "name": p.get("name") or "",
+               "brand": p.get("brand") or "", "owner_id": p.get("owner_id"),
+               "hard_rules": hard_n, "soft_rules": soft_n,
+               "fingerprint_count": int(fp_counts.get(pid, 0) or 0),
+               # 补录进来的 item 数 —— 独立的一个数, 不是 fingerprint_count 的子集 (补录半途失败的
+               # 副本有 item 没指纹, codex review on #93), 两者别相减。它的用处是让模型别把
+               # "1,800 条积累"读成"写过 1,800 篇"。
+               "ingest_copies": int(ingest_counts.get(pid, 0) or 0)}
+        # 只有 include_archived 才会走到归档的项目; 没归档的行不加这个键, 清单形状和原来一样
+        if project_archived(p):
+            row["archived"] = True
+        out.append(row)
     return out
 
 

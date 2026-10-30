@@ -284,13 +284,17 @@ def create_project(name: str, brand: str = "",
     return core.create_project(core.sb(), name, brand=brand, user_id=_user_id)
 
 
-def list_projects(_user_id: str | None = None) -> dict:
+def list_projects(include_archived: bool = False, _user_id: str | None = None) -> dict:
     """列出【你名下】的项目, 以及每个项目手上有多少积累。
 
     返回 project_id / 名称 / 品牌 / 已沉淀的硬规则与软偏好条数 / 历史成稿指纹数。
     不知道要写哪个项目时先调这个。
 
-    ⚠️ fingerprint_count 是**查重基线**的条数(draft_fingerprints 的行), 含从 Truth Vault 补录进来的
+    默认只列在用的项目; 标成暂时不用的项目不列, 返回里的 archived_hidden 是没列出来的个数(没有就不带)。
+    用户要写的品在清单里找不到、而 archived_hidden 大于 0 时, 先带 include_archived=true 再调一次看看
+    (那一份里暂时不用的项目带 archived: true), 找到了就用它, 别急着 create_project 建一个新的。
+
+    ⚠️ fingerprint_count 是**查重基线**的条数, 含从 Truth Vault 补录进来的
     笔记副本。ingest_copies 是**补录进来的 item 数**, 独立的一个数, 不是 fingerprint_count 的子集:
     补录半途失败的副本有 item 没指纹, 会算进 ingest_copies 而不在 fingerprint_count 里, 所以两个数
     **别相减**。读法: ingest_copies 大 = 这个项目的"积累"大半是 TV 笔记的影子, 不是写作台写过那么多篇。
@@ -303,7 +307,15 @@ def list_projects(_user_id: str | None = None) -> dict:
     """
     # 2026-10-30 发布收尾: 不再带 desk_gap(「写作台提醒」, 见 core 里 DESK_GAP_* 那段) —— 一个团队共用一个身份,
     # 每个写手每场开头都听到别人项目的漏接推断, 而对不回来的多半是 W-38 之前写的。
-    return _safe(lambda: {"projects": core.list_projects(core.sb(), user_id=_user_id)})
+    # 归档的项目默认不列(2026-10-30, 见 core.project_archived 上面那段); 藏了几个照实说, 免得模型找不到就去建重。
+    def _list() -> dict:
+        seen: dict = {}
+        out = {"projects": core.list_projects(core.sb(), user_id=_user_id,
+                                              include_archived=bool(include_archived), report_sink=seen)}
+        if seen.get("archived_hidden"):
+            out["archived_hidden"] = seen["archived_hidden"]
+        return out
+    return _safe(_list)
 
 
 def _archive_pending(user_id: str | None, project_id: str) -> dict | None:
@@ -375,6 +387,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         ack_edit_digest。说完再开始写稿。
       · flywheel_arm —— 这场写作落在哪个对照组。存档时【原样】传给 score_drafts 的 flywheel_arm,
         别改、别跟用户提。
+      · archived —— 【有才出现】这个项目标成了暂时不用。简报照常给全; 照 archived_note 先跟用户确认一句
+        这次要写的就是这个项目, 确认了就照常写。
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     (排不出相关性时按天轮换, 不会每次都是最近那几条 —— 那会让文风越写越窄)。所以知道要写什么就传。

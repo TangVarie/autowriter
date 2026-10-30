@@ -110,7 +110,7 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 | `label_example` | **按 `items.user_id` 校验**，比项目粒度更细——同一项目里 A 的正负例是 A 的个人资产 |
 | REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了 |
 | CLI 的 `projects` / `open` / `draw` / `check` | 走同一个 `core` 函数，所以 `--user` 从可选变成**必填** |
-| CLI 的 `backfill` / `reembed` / `delivery-format`（2026-10-20） | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
+| CLI 的 `backfill` / `reembed` / `delivery-format`（2026-10-20）/ `project-archive`（2026-10-30） | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
 
 **要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在每个工具里意味着改一次口径要改十几处，而漏掉的那处不会报错，只会继续放行。
 
@@ -164,7 +164,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 |---|---|---|
 | 核协议版本 | `get_protocol` | 对话开始时调一次，带上 skill 里的 `protocol_version`：一致只回版本；不一致或没带才下发正文（源文件 `deskcore/protocol.md`）。正文的主副本在 skill 文件里，见 §4.3 |
 | 开项目 | `create_project` | 给新品牌/新方向建项目。**owner 恒为调用者**，签名里没有 owner 参数。同名不建、返回已有的；同品牌照建但列出兄弟项目（见 §3.0） |
-| 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
+| 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1）。2026-10-30 起归档的项目默认不列，`include_archived=true` 才列（见 §3.13） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`，以及最近的稿子在哪几处都写成一个样子 `recent_structure`（都是 2026-10-20，见 §3.1） |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block`（2026-10-30 起每篇那行带完整的 `angle_key`：「第1篇 [angle_key=…]」，模型照着贴进 `check_drafts` / `score_drafts`，不再自己编） |
 | | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
@@ -1000,6 +1000,29 @@ select created_at, left(project_id::text, 8) p, counters->>'written' w,
 ```
 
 协议没改（版本不变，写手不用重导 skill）：`score_drafts` 的工具说明补了这几个字段，回包和提醒自己把话说清楚。
+
+### 3.13 归档：不用的项目不进清单、不进跨项目检查（2026-10-30，发布收尾）
+
+**为什么。** 主身份名下 41 个项目，在用的六个左右。不用的那些照样排在 `list_projects` 里，模型每场开头要在一长串里挑；`score_drafts` 的跨项目检查（`project_isolation`）也拿它们的品牌词和近期标题去比——一个早就不写的项目的品牌词出现在正文里，就报一次「可能串项目」。
+
+**标记在哪。** `projects.default_params` 的 `"archived": true`，不加迁移（同 `delivery` / `isolation_terms`，整列存成 JSON 字符串）。只认 JSON 的 `true`；`default_params` 解析不了按**没归档**算（读是宽的：写坏一行不能把在用的项目藏起来）。**没有任何路径自动写它**，写手那边也没有对应的工具，只能用运维命令：
+
+```bash
+python -m deskcore.cli project-archive --project <uuid>               # 标成归档; 写回时保留别的键, 已经归档就不写
+python -m deskcore.cli project-archive --project <uuid> --unarchive   # 撤销: 删掉这个键(不写 false)
+python -m deskcore.cli projects --user <uuid> --include-archived      # 全列出来, 归档的带 archived: true
+```
+
+`default_params` 本身解析不了就拒绝写、退出码 1（同 `delivery-format`：拿 `{}` 去合并会把别的键一起抹掉）。
+
+| 哪里 | 归档之后 |
+|---|---|
+| `list_projects` | 默认不列；回包带 `archived_hidden`（藏了几个，没有就不带）。工具说明叫模型：要写的品找不到、而 `archived_hidden` 大于 0 时先带 `include_archived=true` 再看，别急着 `create_project` 建重。列出来的归档项目带 `archived: true`，在用的行形状不变 |
+| 跨项目检查（`_cross_project_shadow`） | 候选集里去掉归档的项目，品牌词和标题向量都不拿它们比；当前项目自己归档了照比。`projects_total` 是去掉之后的个数，去掉了几个记在 `archived_skipped`（随 `project_isolation` 进 `batch_metrics.meta`） |
+| `open_project` | **照开，不锁人**——一个团队共用一个身份，某个写手要接着写一个旧项目是正当的。简报一样不少，只多 `archived: true` 和一句 `archived_note`：让模型先跟用户确认这次要写的就是这个项目 |
+| `record_rule` 的串项目闸 | **没动**：归档项目的专属词照样挡。那道闸拦的是写，要不要放宽是另一个决定 |
+
+协议没改（版本不变，写手不用重导 skill）：`list_projects` / `open_project` 的工具说明补了这两个字段。回归在 `tests/test_project_archive.py`。
 
 ## 4. 接入
 
