@@ -528,8 +528,9 @@ def ack_edit_digest(project_id: str, through: str, rules_recorded: int = 0,
     """看完 open_project 给的 edit_digest 之后调: 记下这份摘要看过了, 一周内不再出现。
 
     ``through`` 原样传回 edit_digest.through; ``rules_recorded`` 是这次按摘要记了几条规则(用户一条都没要就传 0)。
-    摘要已经说给用户、用户没接话的, 在这一轮最后一条回复之前调(传 0) —— 不调的话下一场写作还会再给一遍同一份摘要。
-    还没把 edit_digest.message 说给用户就别调: 调了这批改法就再也不会出现。
+    message 和归纳出的改法(没看出规律就说没看出)都已经说给用户、用户没接话的, 在这一轮最后一条回复之前调(传 0)
+    —— 不调的话下一场写作还会再给一遍同一份摘要。之后用户再要记哪条, record_rule 照记, 再调一次 ack(through 不变, rules_recorded 填一共记了几条)。
+    还没把 edit_digest.message 和归纳出的改法说给用户就别调: 调了这批改法就再也不会出现。
     """
     # 写操作, 不包 _safe: 没记上的话, 下一场又拿到同一份摘要, 用户会被问第二遍。
     try:

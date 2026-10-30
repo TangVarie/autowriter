@@ -274,6 +274,17 @@ def test_the_ack_watermark_never_moves_back():
     assert c.rows["tv_edit_digest_acks"][0]["rules_recorded"] == 1, "看过的人和时间照记"
 
 
+def test_a_late_second_ack_with_the_same_through_keeps_the_watermark_and_takes_the_total():
+    # W-33(10-30): 这一轮末尾先 ack 0, 用户下一条说要记两条 → 同一个 through 再 ack 一次(工具文档这么教)
+    c = _digest_client()
+    through = "2026-10-18T12:00:00+00:00"
+    core.ack_edit_digest(c, P1, through, user_id=ME, rules_recorded=0)
+    out = core.ack_edit_digest(c, P1, through, user_id=ME, rules_recorded=2)
+    row = c.rows["tv_edit_digest_acks"][0]
+    assert len(c.rows["tv_edit_digest_acks"]) == 1 and out["through"] == through == row["acked_through"]
+    assert row["rules_recorded"] == 2
+
+
 def test_cli_tv_sync_fails_loudly_when_diffs_cannot_be_read(monkeypatch, capsys):
     from deskcore import cli
     c = _client([_note("n1", "秋招投了六十份简历没回音", BODY_A)])
@@ -592,6 +603,8 @@ def test_the_digest_carries_a_message_to_relay_and_the_task_says_so_first():
     # 只有篇数, 不带标题、句子(那些在 examples 里, 由模型挑着说)
     assert not any(t in d["message"] for t in ("原标题", "新标题", "删掉的一句"))
     assert d["task"].startswith("先把 message 原样告诉用户")
+    assert d["task"].index("然后才开始写稿") < d["task"].index("record_rule"), "说完、做完再写稿"
+    assert "没看出规律" in d["task"] and "有的话" in d["message"], "不预设一定有规律"
     assert d["task"].index("record_rule") < d["task"].index("ack_edit_digest"), "ack 仍在用户做了决定之后"
 
 
@@ -600,7 +613,7 @@ def test_tool_docs_say_relay_first_and_never_ack_an_unshown_digest():
     assert "edit_digest.message" in doc and "原样" in doc
     assert "每周最多一次" not in doc, "没 ack 时每次打开都带, 不是每周一次"
     ack_doc = tools.ack_edit_digest.__doc__
-    assert "对话就结束了也要调" not in ack_doc and "还没把 edit_digest.message 说给用户就别调" in ack_doc
+    assert "对话就结束了也要调" not in ack_doc and "还没把 edit_digest.message 和归纳出的改法说给用户就别调" in ack_doc
 
 
 # ── W-39(10-30): 差异跟写稿的写作台项目走, 不跟 TV 项目的补录目标走 ────────────────────────────────────

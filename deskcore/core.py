@@ -4768,22 +4768,23 @@ def delivery_format(client, project_id: str, *, template=SHOW_ONLY, clear: bool 
 
 
 # ── 人在发布前改了什么 → 每周一份摘要(2026-10-19, D-120 / W-23) ────────────────────────────────
-# tv-sync 每晚给对上的稿子算改动差异(tv_edit_diffs)。open_project 每周最多带一次摘要, 由写手的模型归纳成规则建议、
+# tv-sync 每晚给对上的稿子算改动差异(tv_edit_diffs)。open_project 带摘要(ack 之后一周内不再带, 没 ack 就每次打开都带), 由写手的模型归纳成规则建议、
 # 问过用户再 record_rule —— 和 record_edit 的蒸馏同一个分工: 提炼是文本活, 交给本来就在跑的模型, deskcore 不调 LLM。
 EDIT_DIGEST_EVERY_DAYS = 7
 EDIT_DIGEST_MIN_CHANGED = 3       # 改过的少于这几篇不出摘要: 一两篇看不出规律, 只会诱导模型硬编
 EDIT_DIGEST_EXAMPLES = 6
 EDIT_DIGEST_TASK = (
-    "先把 message 原样告诉用户(放在这一轮回复最前面), 再开始写稿。"
+    "先把 message 原样告诉用户(放在这一轮回复最前面), 再照下面做完, 然后才开始写稿。"
     "这是本项目最近发出去的稿子在发布前被人改过的地方(写作台那版 → 发出去那版)。看有没有反复出现、像是有意为之的改法"
     "(比如总删掉某类句子、总把某种说法换成另一种、总把标题改短、总少提或多提品牌), 归纳成最多 3 条能写成规则的话, "
     "念给用户听, 问要不要记下。"
-    "用户说要的, 用 record_rule 记(soft, scope=project)。只出现一两次的、说不清为什么改的, 不要硬编成规则。"
+    "用户说要的, 用 record_rule 记(soft, scope=project)。只出现一两次的、说不清为什么改的, 不要硬编成规则; "
+    "一条都看不出来就直接跟用户说没看出规律。"
     "不管记没记, 最后调 ack_edit_digest, through 原样传回, rules_recorded 填记了几条; 之后一周内不会再出现。")
 
 
 EDIT_DIGEST_MESSAGE = ("开写之前说一句: 这个项目最近发出去的稿子里有 {changed} 篇在发布前被人改过。"
-                       "我先把反复出现的改法列给你, 你看哪几条要记成以后都照着写的规则(都不要也行)。")
+                       "我先看看有没有反复出现的改法, 有的话列给你, 你看哪几条要记成以后都照着写的规则(都不要也行)。")
 
 
 def _avg(xs) -> int | None:
