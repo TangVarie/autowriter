@@ -229,6 +229,121 @@ def test_no_brand_means_no_sibling_lookup():
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 标成暂时不用的项目(2026-10-30 复审)
+#
+# list_projects 默认不列它们, 回头写旧品的写手在清单里找不到, 模型照「清单里没有就建」建出一个空的同名项目 —— 历史稿、
+# 规则都在旧的那个里, 新的从零开始, 两边互不查重。建之前再找一遍, 撞上了就回它。
+# ══════════════════════════════════════════════════════════════════════
+
+_IDLE = '{"archived": true}'
+
+
+def test_the_same_name_as_an_idle_project_returns_it_and_says_it_is_idle():
+    sb = _client([{"id": "p-idle", "name": "示例运动", "brand": "示例", "owner_id": ME, "default_params": _IDLE}])
+    out = core.create_project(sb, "示例运动", brand="示例", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-idle" and out["archived"] is True
+    assert len(sb.rows["projects"]) == 1, "撞上暂时不用的同名项目还是建了第二个"
+    note = out["note"]
+    assert "暂时不用" in note and "直接用这个" in note and "open_project" in note, note
+    assert "不用跟用户提" in note, "用户要写的就是这个品, 不用让他知道它被标过"
+
+
+@pytest.mark.parametrize("existing, asked", [
+    ("示例运动-产品向", "示例运动 产品向"),        # 分隔符换成空格
+    ("示例运动-产品向", "示例运动—产品向"),        # 换成破折号
+    ("Ｓｐｏｒｔ-Ａ", "sport a"),                 # 全角 + 大小写 + 分隔符
+    ("示例运动 · 产品向", "示例运动产品向"),       # 中点和空格
+])
+def test_an_idle_project_whose_name_differs_only_in_spelling_is_returned(existing, asked):
+    sb = _client([{"id": "p-idle", "name": existing, "brand": "示例", "owner_id": ME, "default_params": _IDLE}])
+    out = core.create_project(sb, asked, user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-idle" and out["archived"] is True, out
+    assert out["name"] == existing, "回的是库里那个项目的名字"
+    assert len(sb.rows["projects"]) == 1
+    assert "确认" in out["note"] and "不用跟用户提" not in out["note"], "写法不一样, 先跟用户确认"
+
+
+def test_an_idle_namesake_under_another_brand_does_not_block_a_new_project():
+    """给了品牌时品牌也要对得上: 同名不同品是另一个东西。"""
+    sb = _client([{"id": "p-idle", "name": "示例运动-产品向", "brand": "别的品", "owner_id": ME,
+                   "default_params": _IDLE}])
+    out = core.create_project(sb, "示例运动 产品向", brand="示例", user_id=ME)
+    assert out["created"] is True and out["project_id"] != "p-idle"
+
+
+def test_someone_elses_idle_project_is_never_returned():
+    sb = _client([{"id": "p-other", "name": "示例运动-产品向", "brand": "示例", "owner_id": OTHER,
+                   "default_params": _IDLE}])
+    out = core.create_project(sb, "示例运动 产品向", brand="示例", user_id=ME)
+    assert out["created"] is True and out["project_id"] != "p-other"
+
+
+def test_a_live_project_wins_over_an_idle_one_with_the_same_name():
+    sb = _client([{"id": "p-a", "name": "示例运动", "brand": "示例", "owner_id": ME, "default_params": _IDLE},
+                  {"id": "p-b", "name": "示例运动", "brand": "示例", "owner_id": ME}])
+    out = core.create_project(sb, "示例运动", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-b" and "archived" not in out
+
+
+def test_a_live_project_whose_name_differs_only_in_spelling_is_returned_with_a_confirm_note():
+    """复审 2026-10-30: 「示例运动-产品向」和「示例运动 产品向」建成两个就是两套互不查重的历史库。在用的同样回它, 不建;
+    写法不一样, 叫模型先跟用户确认一句。"""
+    sb = _client([{"id": "p-live", "name": "示例运动-产品向", "brand": "示例", "owner_id": ME}])
+    out = core.create_project(sb, "示例运动 产品向", brand="示例", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-live" and "archived" not in out, out
+    assert "确认" in out["note"] and len(sb.rows["projects"]) == 1
+
+
+def test_a_live_spelling_namesake_wins_over_an_idle_one():
+    """复审 2026-10-30: 在用的「途鸽 D1」和暂时不用的「途鸽-D1」都在时, 回在用的那个(原来只找暂时不用的, 稿子会写进旧库)。"""
+    sb = _client([{"id": "p-idle", "name": "示例-D1", "brand": "示例", "owner_id": ME, "default_params": _IDLE},
+                  {"id": "p-live", "name": "示例 D1", "brand": "示例", "owner_id": ME}])
+    out = core.create_project(sb, "示例D1", brand="示例", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-live" and "archived" not in out, out
+
+
+@pytest.mark.parametrize("existing, asked", [
+    ("示例-D1-2", "示例-D12"),       # 夹在数字中间的分隔符不去
+    ("示例 2.0", "示例 20"),
+    ("示例 ¥99套餐", "示例 99套餐"),
+    ("示例 A+B", "示例 AB"),
+])
+def test_names_that_only_look_alike_are_different_projects(existing, asked):
+    sb = _client([{"id": "p-idle", "name": existing, "brand": "示例", "owner_id": ME, "default_params": _IDLE}])
+    out = core.create_project(sb, asked, brand="示例", user_id=ME)
+    assert out["created"] is True and out["project_id"] != "p-idle", out
+
+
+def test_the_same_name_as_an_idle_project_under_another_brand_asks_first():
+    """同名但品牌对不上: 照旧不建(同名两个会让查重分裂), 但叫模型先跟用户确认, 不闷头用。"""
+    sb = _client([{"id": "p-idle", "name": "示例运动", "brand": "别的品", "owner_id": ME, "default_params": _IDLE}])
+    out = core.create_project(sb, "示例运动", brand="示例", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-idle" and out["archived"] is True
+    assert "确认" in out["note"] and "不用跟用户提" not in out["note"] and "别的品" in out["note"]
+
+
+def test_idle_siblings_are_marked():
+    sb = _client([{"id": "p-idle", "name": "示例-旧方向", "brand": "示例", "owner_id": ME, "default_params": _IDLE},
+                  {"id": "p-live", "name": "示例-在用", "brand": "示例", "owner_id": ME}])
+    out = core.create_project(sb, "示例-新方向", brand="示例", user_id=ME)
+    assert out["created"] is True
+    by_id = {s["project_id"]: s for s in out["siblings"]}
+    assert by_id["p-idle"].get("archived") is True and "archived" not in by_id["p-live"]
+
+
+def test_the_tool_says_to_look_with_include_archived_before_creating():
+    doc = tools.create_project.__doc__ or ""
+    assert "include_archived=true 再查一遍也没有" in doc, "清单默认不列暂时不用的项目, 先带上它再看"
+    assert "archived: true" in doc
+
+
+def test_idle_project_replies_are_writer_safe():
+    from tests.test_writer_facing_text import _assert_writer_safe
+    sb = _client([{"id": "p-idle", "name": "示例运动", "brand": "示例", "owner_id": ME, "default_params": _IDLE}])
+    _assert_writer_safe(core.create_project(sb, "示例 运动", user_id=ME), "create_project[idle]")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 失败不许降级
 # ══════════════════════════════════════════════════════════════════════
 

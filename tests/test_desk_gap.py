@@ -12,7 +12,9 @@
   5. 只数对到调用者自己项目上的对照: TV 项目映射到别人的项目也不算、不泄露
   6. 当前正开着的就是它 → 话术换成"这次写完记得打分存档"; 名字取补录目标那个项目
   7. 缓存按 user_id(store.client() 每次新建, 不能拿 client 当键), 过期的会被清掉
-  8. open_project / list_projects 带上它; 它查挂了清单和简报照给
+  8. 2026-10-30 发布收尾: open_project / list_projects 不再带它, 也不再算它。一个团队共用一个身份, 每个写手每场开头
+     都听到别人项目的「写作台提醒」, 还推断「写的时候没调起写作台」—— 对不回来的多半是 W-38 之前写的(那时查重
+     不记稿子), 正在写作台里写的人还被叫「这次就在写作台里写」。计算(core.desk_gaps)留着, 1~7 照旧钉它的口径。
 """
 from __future__ import annotations
 
@@ -157,24 +159,28 @@ def test_cached_per_user_and_expired_entries_are_pruned(monkeypatch):
     assert "stale-user" not in core._desk_gap_cache, "过期的要清掉, 不在进程里越攒越多"
 
 
-def test_open_project_and_list_projects_carry_it_and_survive_its_failure(monkeypatch):
+def test_open_project_and_list_projects_no_longer_carry_it(monkeypatch):
+    """回包里没有 desk_gap, 也不为它多查一次(core.desk_gaps 不该被调)。"""
     monkeypatch.setattr(core, "sb", lambda: object())
     monkeypatch.setattr(core, "build_writing_brief", lambda *a, **k: {"p0": [], "counts": {}})
     monkeypatch.setattr(core, "edit_digest", lambda *a, **k: None)
     monkeypatch.setattr(core, "list_projects", lambda *a, **k: [{"id": "p-tuge"}])
-    seen = {}
+    called = []
 
-    def fake_gaps(client, *, user_id, current_project_id=None):
-        seen["current"] = current_project_id
-        return {"projects": [], "message": "写作台提醒:\n…", "task": "x"}
+    def fake_gaps(*a, **k):
+        called.append(k)
+        return {"projects": [{"project": "途鸽"}], "message": "写作台提醒:\n…", "task": "x"}
 
     monkeypatch.setattr(core, "desk_gaps", fake_gaps)
-    assert tools.open_project("p-tuge", _user_id=ME)["desk_gap"]["message"].startswith("写作台提醒")
-    assert seen["current"] == "p-tuge", "open_project 要把正在开的项目传进去"
-    assert tools.list_projects(_user_id=ME)["desk_gap"]["task"] == "x"
-
-    monkeypatch.setattr(core, "desk_gaps", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("表没建")))
     out = tools.open_project("p-tuge", _user_id=ME)
     assert "desk_gap" not in out and out["p0"] == []
-    listed = tools.list_projects(_user_id=ME)
-    assert "desk_gap" not in listed and listed["projects"] == [{"id": "p-tuge"}]
+    assert tools.list_projects(_user_id=ME) == {"projects": [{"id": "p-tuge"}]}
+    assert called == [], "不进回包就别再算"
+    assert not hasattr(tools, "_desk_gap")
+
+
+def test_tool_descriptions_no_longer_mention_it():
+    """MCP 客户端拿到的是工具说明; 还写着「把 desk_gap.message 原样告诉用户」, 模型会以为漏了一段。"""
+    for fn in (tools.open_project, tools.list_projects):
+        doc = fn.__doc__ or ""
+        assert "desk_gap" not in doc and "写作台提醒" not in doc, fn.__name__

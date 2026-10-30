@@ -973,7 +973,9 @@ def test_a_failed_archive_does_not_close_the_snapshot(monkeypatch):
     assert all(r.get("promoted_at") is None for r in c.rows["draft_snapshots"])
 
 
-def test_the_brief_skips_checked_cards_but_commit_and_archive_pending_do_not(monkeypatch):
+def test_the_brief_and_commit_skip_checked_cards_but_archive_pending_does_not(monkeypatch):
+    """2026-10-30 复审: 存档后的 angle_debt 那句改成和简报同一句(对得上就优先按它们写, 不再说存档), 查重时带过的牌也就
+    和简报一样不列; archive_pending 照旧不排除(它叫模型给手上的稿子存档, 刚查过的正该在里面)。"""
     seen = []
     real = store.angle_debt
 
@@ -985,6 +987,10 @@ def test_the_brief_skips_checked_cards_but_commit_and_archive_pending_do_not(mon
     from tests.test_deskcore_angle_debt import _client as debt_client, ME as DME, PID as DPID
     core.build_writing_brief(debt_client([]), DPID, user_id=DME)
     assert seen and seen[-1] == {KEY}, "简报按查重时带过的牌排除"
+    seen.clear()
+    from tests.test_commit_reports_angle_debt import _client as commit_client, ME as CME, PROJ as CPROJ, BODY_A as CBODY
+    core.commit_drafts(commit_client([]), CPROJ, [{"title": "没带", "body": CBODY}], user_id=CME)
+    assert seen == [{KEY}], "存档后那份同样按查重时带过的牌排除"
     seen.clear()
     core.archive_pending(debt_client([]), DPID, user_id=DME)
     assert seen == [None], "archive_pending 不排除: 刚查过的正该存档"

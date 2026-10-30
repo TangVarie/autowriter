@@ -172,20 +172,9 @@ def _call_tool(name: str, args: dict) -> object:
     kwargs.pop("_user_id", None)          # 不允许调用方伪造身份
     if needs_user:
         kwargs["_user_id"] = _caller.get().user_id
-    return _skill_probe(name, fn(**kwargs))
-
-
-def _skill_probe(name: str, result):
-    """skill 版本抽查 (deskcore/skillcheck.py): 记录在案是旧版的写手, 非入口工具的返回值里也捎上升级提醒
-    (同一人 30 分钟最多一次)。REST 和 MCP 两条路都走这里。探针出任何错都不影响工具结果。"""
-    try:
-        current = _protocol_version()
-        if current == "unknown":
-            return result
-        return skillcheck.annotate(name, _caller.get().user_id, result, current)
-    except Exception:  # noqa: BLE001
-        logger.warning("skill 版本抽查失败 (tool=%s), 不影响返回", name, exc_info=True)
-        return result
+    # 2026-10-30 发布收尾: 非入口工具不再按身份抽查 skill 版本、捎升级提醒 —— 一个团队共用一个身份, 一个人手上的旧版
+    # 会让所有人都收到。提醒只看入口工具这一次报上来的版本(deskcore/skillcheck.py), REST 和 MCP 都原样回工具结果。
+    return fn(**kwargs)
 
 
 # ── MCP 工具失败留痕(W-29, 2026-10-23) ─────────────────────────────────
@@ -257,7 +246,8 @@ def _log_bad_arguments(name: str, arguments, cause) -> None:
 
 
 def _log_error_result(name: str, kwargs: dict, result) -> None:
-    """工具没抛、但回的是现有的那两种"出错了"的形状: 顶层带非空 ``error``(_safe 的降级、认不出调用者)或
+    """工具没抛、但回的是现有的那两种"出错了"的形状: 顶层带非空 ``error``(_safe 的降级; 认不出调用者现在是抛
+    PermissionError, 走 _log_tool_failure)或
     ``status == "error"``(check_rules 读不出编译结果)。只记有这回事, 不记 error 的内容。"""
     try:
         if not isinstance(result, dict) or not (result.get("error") or result.get("status") == "error"):
@@ -723,8 +713,9 @@ async def ready():
 
 @app.get("/skill-versions")
 def skill_versions() -> dict:
-    """写手手上的 skill 是不是最新版 (deskcore/skillcheck.py): 24 小时内报过版本的写手里最新 / 旧版 / 没核到
-    各几个、旧版各是哪一版。只有计数, 没有是谁。要 key —— 不放 /health, 那里不鉴权, 不许放业务数据。"""
+    """写手手上的 skill 是不是最新版 (deskcore/skillcheck.py): 24 小时内报上来的版本里最新 / 旧版 / 没报各几个
+    (按「身份 × 版本」数, 一个团队共用一个身份时读作有几种版本在用, 不是人数)、旧版各是哪一版。只有计数, 没有是谁。
+    要 key —— 不放 /health, 那里不鉴权, 不许放业务数据。"""
     return skillcheck.health(_protocol_version())
 
 
@@ -888,7 +879,7 @@ def _register_mcp():
                 _log_tool_failure(name, kwargs, exc, int((time.monotonic() - t0) * 1000))
                 raise
             _log_error_result(name, kwargs, result)
-            return _skill_probe(name, result)
+            return result
 
         wrapper.__signature__ = sig.replace(parameters=params)
         return wrapper

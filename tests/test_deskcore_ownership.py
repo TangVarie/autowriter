@@ -22,6 +22,8 @@ key 的调用方传入他人 project_id 就能读他人成稿标题、往他人�
 from __future__ import annotations
 
 import ast
+import inspect
+import logging
 import pathlib
 
 import pytest
@@ -204,6 +206,7 @@ UNGATED_WITH_REASON = {
     "backfill_fingerprints":  "运维命令, 见 docs/deskcore.md §2.2.1",
     "backfill_gap":           "运维命令, 见 docs/deskcore.md §2.2.1",
     "delivery_format":        "运维命令(cli delivery-format, 10-20), 见 docs/deskcore.md §2.2.1; 写手那边没有对应的工具",
+    "project_archive":        "运维命令(cli project-archive, 10-30), 见 docs/deskcore.md §2.2.1 / §3.13; 写手那边没有对应的工具",
     "_kick_rule_compile":     "后台补编的触发器(10-20, D-121), 只被已过闸的 build_writing_brief / record_rule / check_rules "
                               "调用; 只起一个线程, 不读写项目数据",
     "_rule_compile_worker":   "后台补编的线程本体, 只由 _kick_rule_compile 起; 调 compile_rules 的运维路径(按项目 owner 取池子, "
@@ -219,14 +222,23 @@ UNGATED_WITH_REASON = {
     "_recent_angle_key_misses": "W-31(10-27), 只被 archive_pending 调(见上): 读进程内存里调用者自己的那一笔, 不读写库",
     "_record_snapshots":      "W-38(10-29), 只被 check_drafts 在过了归属闸、判定算完之后调: 把这次查重的稿子记进 draft_snapshots"
                               "(本项目、调用者自己), 失败只记 WARN",
-    "_checked_angle_keys":    "W-38(10-29), 只被已过闸的 build_writing_brief 调: 读调用者自己在本项目查重时带过的 "
-                              "angle_key(draft_snapshots), 不写库",
+    "_checked_angle_keys":    "W-38(10-29), 只被已过闸的 build_writing_brief 和 commit_drafts(存档后的 angle_debt, 10-30 复审)调: "
+                              "读调用者自己在本项目查重时带过的 angle_key(draft_snapshots), 不写库",
     "_supersede_snapshots":   "W-38 复审(10-29), 只被已过闸的 commit_drafts 调: 把它刚存成版本的那几篇, 本项目里同样文字的底稿"
                               "记成已转正, 失败只记 WARN",
     "_snapshot_version_id":   "W-38(10-29), 纯函数: (项目, text_fp) → 转正版本的 uuid5, 不读写库",
     "_snapshot_fp_payload":   "W-38(10-29), 纯函数: 拼转正版本的指纹行(只调 embedding), 不读写库",
     "_promote_snapshot_groups": "W-38(10-29), 系统任务, 只被 tv_sync 调: tv_sync 开头 _tv_owner 已对每个映射的写作台项目过了"
                                 "归属闸(以项目 owner 的身份, 同补录), 这里只写那几个项目里的底稿转成的版本",
+    # 改稿(2026-10-30 发布收尾): check_drafts 认 replaces_version_id、改稿重存时拼回原来那一整批
+    "_lookup_replacements":   "核 replaces_version_id(只读), 只被已过闸的 check_drafts 和 _prepare_replacements(commit_drafts)调; "
+                              "版本归属由 store.items_for_versions 的 inner join 钉死, 别的项目的版本查不出来",
+    "_own_fingerprints":      "只被已过闸的 check_drafts 调: 读 _lookup_replacements 核过、属于本项目的旧 item 的指纹行, 不写库",
+    "_without_own_versions":  "私有辅助函数, 只被 _history_probe(由已过闸的 check_drafts 经 _gate 调)用; 只读本项目的指纹",
+    "_record_revised_parts":  "只被已过闸的 commit_drafts 在锁里调: 把改稿挂上的旧 item(核过属于本项目)所在 batch 的 params 并一份"
+                              "话题 / 评论 / 方向, 失败只记 WARN",
+    "_whole_batch_delivery":  "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 读改稿挂的旧 batch, "
+                              "store.batch_drafts 按 project_id 过滤, 别的项目的 batch 查不出来",
 }
 
 
@@ -432,6 +444,45 @@ def test_safe_wrapper_does_not_swallow_permission_errors():
 
     out = tools._safe(_boom)
     assert isinstance(out, dict) and "error" in out and "hint" in out
+
+
+# 个人层 / 规则台账这几个工具自己先看有没有调用者身份(不全是项目级, 走不到 assert_project_access)。
+IDENTITY_FIRST_TOOLS = [
+    ("record_edit", {"project_id": MINE, "ai_title": "原标题", "ai_body": "原正文", "my_title": "改后", "my_body": "改后正文"}),
+    ("label_example", {"item_id": "item-mine", "label": "positive"}),
+    ("my_style", {"project_id": MINE}),
+    ("save_my_style", {"project_id": MINE, "notes": "笔记"}),
+    ("my_rules", {"project_id": MINE}),
+    ("reembed_my_rules", {}),
+    ("set_rule_state", {"memory_id": "m-1", "action": "mute"}),
+]
+
+
+@pytest.mark.parametrize("name, kwargs", IDENTITY_FIRST_TOOLS, ids=[n for n, _ in IDENTITY_FIRST_TOOLS])
+def test_an_unknown_caller_is_refused_by_raising_like_every_other_tool(name, kwargs, monkeypatch, caplog):
+    """认不出调用者: 抛 PermissionError, 和项目归属拒绝同一个口径(REST 403 / MCP 工具错误)。
+
+    2026-10-30 发布收尾: 这几个原来回 ``{"error", "hint"}`` —— 在模型那边像一次成功的调用(my_style / my_rules
+    还走 _safe 的降级形状), hint 里那句配置变量名会被原样念给写手。配置怎么补只进日志。"""
+    sb = _client()
+    monkeypatch.setattr(core, "sb", lambda: sb)
+    fn, needs_user = tools.TOOLS[name]
+    assert needs_user is True
+    with caplog.at_level(logging.WARNING, logger="deskcore.tools"):
+        with pytest.raises(PermissionError) as exc:
+            fn(**kwargs, _user_id=None)
+    msg = str(exc.value)
+    assert "无法识别调用者身份" in msg
+    assert "DESKCORE" not in msg and "运维" not in msg, f"念给写手的话里有配置项: {msg}"
+    assert "DESKCORE_KEYS" in caplog.text, "怎么补进了日志(不是删掉)"
+    assert sb.calls == [], "认不出人就在查库之前拒了"
+
+
+def test_no_tool_answers_an_unknown_caller_with_an_error_dict():
+    """形态: tools.py 里不再有「认不出身份 → 回带 error 的 dict」这条路。"""
+    src = inspect.getsource(tools)
+    assert "无法识别调用者身份" not in "".join(
+        line for line in src.splitlines() if '"error"' in line), "认不出调用者要抛 PermissionError, 不回 error 字段"
 
 
 def test_rest_layer_maps_denial_to_403_not_500():

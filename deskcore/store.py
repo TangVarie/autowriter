@@ -152,10 +152,13 @@ def list_all_projects(sb, *, owner_id: str) -> list[dict]:
     1000)会**静默截断**: 越过 1000 个项目之后, 后面的项目在模型眼里【根本不存在】,
     且没有任何提示(审计 COR-005 同款, 判据同样是空页收工 + offset 按实收行数前进)。
     ``name`` 有重名, 排序必须带 ``id`` 做次级键, 否则翻页会漏行也会重复行。
+
+    带 ``default_params``(2026-10-30): 归档标记 ``"archived": true`` 在里面(core.project_archived), list_projects
+    据此把不用的项目藏起来。这一列存的是 JSON 字符串, 库里没法按它过滤, 只能取回来在 Python 里判。
     """
     return _paged(lambda off, lim: (
         sb.table("projects")
-          .select("id, name, brand, owner_id")
+          .select("id, name, brand, owner_id, default_params")
           .eq("owner_id", owner_id)
           .order("name").order("id")
           .range(off, off + lim - 1)
@@ -205,9 +208,10 @@ def projects_with_exact_name(sb, *, owner_id: str, name: str) -> list[dict]:
     want = (name or "").strip().casefold()
     if not want:
         return []
+    # default_params: create_project 要知道撞上的是不是标成暂时不用的项目(core.project_archived, 2026-10-30 复审)
     rows = _paged(lambda off, lim: (
         sb.table("projects")
-          .select("id, name, brand")
+          .select("id, name, brand, default_params")
           .eq("owner_id", owner_id)
           .order("id")
           .range(off, off + lim - 1)
@@ -225,9 +229,10 @@ def projects_with_brand(sb, *, owner_id: str, brand: str) -> list[dict]:
     """
     if not (brand or "").strip():
         return []
+    # default_params: 兄弟项目里标成暂时不用的要标出来(core.project_archived, 2026-10-30 复审)
     return _paged(lambda off, lim: (
         sb.table("projects")
-          .select("id, name, brand")
+          .select("id, name, brand, default_params")
           .eq("owner_id", owner_id)
           .eq("brand", brand)
           .order("name").order("id")
@@ -686,7 +691,7 @@ ANGLE_DEBT_EXCLUDE_MAX = 200
 
 def angle_debt(sb, project_id: str, user_id: str | None, days: int,
                *, sample: int = ANGLE_DEBT_SAMPLE, oldest_first: bool = False,
-               exclude_keys=None) -> dict:
+               exclude_keys=None, since: str | None = None, until: str | None = None) -> dict:
     """这个人在这个项目里, 近 ``days`` 天抽了没写的角度: 个数 + 具体是哪几个。
 
     给 build_writing_brief 在每场对话开头回显用(D-071)。发牌台账上"抽了没销账"
@@ -714,6 +719,12 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     ``exclude_keys`` (W-38, 2026-10-29): 这些 angle_key 不算(查重时带过的牌 —— 稿子写出来了, 发出去以后 tv-sync 从飞书
     对回来销账; 再报"抽了没写"会让模型按同一张牌再写一篇)。最多排除 ANGLE_DEBT_EXCLUDE_MAX 个。给 ``{angle_key: 最近一次
     查重的时刻}`` 时只排除那次查重之前抽的: 没销的牌一天后回池子, 同一张牌之后又抽到一次, 那一次还没写(codex on aw#132)。
+
+    ``since`` (2026-10-30, 见 core.ANGLE_DEBT_SINCE): 比它早抽的不算, 和 ``days`` 取晚的那个当起点。``since_days``
+    照旧回 ``days``(返回形状一个键都不变)。读不懂的 ``since`` 当没给, 按 ``days`` 数。
+
+    ``until`` (2026-10-30 复审, 见 core.ANGLE_DEBT_MIN_AGE): 比它晚抽的也不算 —— 刚抽的牌多半有人正在写(一个团队共用一个
+    身份, 分不出是谁抽的)。两次查询(主查询和"查重之后又抽到"那次)都按它截, 个数和列出来的坐标同一个口径。
     """
     out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None, "angles": []}
     if oldest_first:
@@ -721,6 +732,10 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     if not user_id:
         return out
 
+    start = iso_ago(days)
+    floor = _ts(since) if since else None
+    if floor is not None and floor > _ts(start):
+        start = floor.isoformat()
     # 一次请求拿两样: count='exact' 是**分页之前**算的(PostgREST 如此, 假件也钉着
     # 这一点), 所以 range 只影响回几行、不影响这个数。同 store.fingerprint_stats。
     checked_at = exclude_keys if isinstance(exclude_keys, dict) else {k: None for k in (exclude_keys or ())}
@@ -729,7 +744,9 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
         q = (sb.table("angle_ledger").select("angle_key, dims, drawn_at", count="exact")
                .eq("project_id", project_id).eq("drawn_by", user_id)
                .is_("consumed_version_id", "null")
-               .gte("drawn_at", iso_ago(days)))
+               .gte("drawn_at", start))
+        if until:
+            q = q.lte("drawn_at", until)
         if skip:
             q = q.not_.in_("angle_key", skip)
         res = (q.order("drawn_at", desc=not oldest_first)
@@ -743,10 +760,12 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     if timed:
         # 排除掉的 key 里, 查重之后才又抽到的那几次照旧算欠着。读失败就不加回来(少报几张, 不弄坏简报)
         try:
-            again = (sb.table("angle_ledger").select("angle_key, dims, drawn_at")
-                     .eq("project_id", project_id).eq("drawn_by", user_id)
-                     .is_("consumed_version_id", "null").gte("drawn_at", iso_ago(days))
-                     .in_("angle_key", timed).range(0, 999).execute()).data or []
+            aq = (sb.table("angle_ledger").select("angle_key, dims, drawn_at")
+                  .eq("project_id", project_id).eq("drawn_by", user_id)
+                  .is_("consumed_version_id", "null").gte("drawn_at", start))
+            if until:
+                aq = aq.lte("drawn_at", until)
+            again = aq.in_("angle_key", timed).range(0, 999).execute().data or []
         except Exception:                               # noqa: BLE001
             logger.warning("read redrawn angle debt failed (project=%s)", project_id, exc_info=True)
             again = []
@@ -1057,8 +1076,11 @@ def _paged_iter(build, *, page: int = PAGE, hard_cap: int | None = None):
         yield rows
 
 
-def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bool]:
+def fingerprints(sb, project_id: str, limit: int = 4000, *, vectors: bool = True) -> tuple[list[dict], bool]:
     """项目【全量】历史指纹。返回 (rows, truncated)。
+
+    ``vectors=False``(2026-10-30): 不拉标题向量那两列(``title_embedding`` 为 None)。只给 check_drafts 改稿排除旧版
+    那条路用 —— 只需要重比四字串时, 768 维的向量是这一次读里最重的那部分, 不比就不拉。
 
     ⚠️ 故意不吞异常: 查重是硬闸, 读不到历史就不能放行。这是 deskcore 里唯一
     不 fail-open 的路径(其余读类工具出错返回可用结构不阻塞写稿)。
@@ -1080,6 +1102,8 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
     #  没有任何代码真的用过它 —— 又一次"写着已经有了, 实际没有"。)
     cols = ("id, title, opening, title_embedding, embedding_model, "
             "opening_hash, ngram_hashes, created_at")
+    if not vectors:
+        cols = "id, title, opening, opening_hash, ngram_hashes, created_at"
     rows: list[dict] = []
     truncated = False
     while len(rows) < limit:
@@ -1112,8 +1136,19 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
     return rows, truncated
 
 
-def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int]:
-    """(总条数, 有【可用】标题向量的条数) —— 两次 count, 不拉行。
+def fingerprints_with_opening(sb, project_id: str, opening_hash: str, *, limit: int) -> list[dict]:
+    """开头哈希等于 ``opening_hash`` 的指纹行(``id, title``), 最多 ``limit`` 行。check_drafts 改稿排除旧版时用(2026-10-30):
+    旧版有 n 行, 取 n + 1 行就分得清有没有别的稿子撞了同一个开头。故意不吞异常(查重是硬闸)。"""
+    if not opening_hash:
+        return []
+    res = (sb.table("draft_fingerprints").select("id, title")
+             .eq("project_id", project_id).eq("opening_hash", opening_hash)
+             .limit(limit).execute())
+    return res.data or []
+
+
+def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int, int]:
+    """(总条数, 有【可用】标题向量的条数, 空标题且没向量的条数) —— 三次 count, 不拉行。
 
     下推之后 check_drafts 不再把指纹拉进内存, 但它报出去的 summary 仍然要说清
     "比了多少条、其中多少条有向量"。后者尤其不能丢: ``hist_missing_vec > 0``
@@ -1127,6 +1162,14 @@ def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int]:
     于是 ``semantic_degraded`` 是 false, 而标题语义那一路**一条都没真的比**。
     这正好是这个函数存在的理由的反面。(codex review · #65 P1)
 
+    ⚠️ **空标题的行不算"缺向量"**(2026-10-30)。标题是空串的行永远算不出标题向量 —— embed_texts 对空串回 None,
+    reembed 也特意不扫它们(fingerprints_needing_vectors 的 ``.neq("title", "")``), 它们没有"补上"这条出口。原来照样
+    算进 total - with_vec, 于是一个项目只要补录过一条空标题的帖, 之后**每一次** check_drafts 都报 semantic_degraded,
+    写手每批都听一遍「标题语义查重没跑全」(生产上 18 条这样的行里 17 条是补录副本)。所以第三个数单独数出来, 由调用方
+    从"缺"里减掉。口径是 ``title = ''`` 且 ``title_embedding IS NULL``: 有标题、没向量的照样算缺(那是真没比), 空标题却
+    有向量的(不该有)也不在这里, 不会被减两次。列是 NOT NULL DEFAULT '', 写入的各条路径都先 strip 过, 空标题只有空串
+    这一种形态。
+
     ⚠️ 故意不吞异常, 与 fingerprints 同理: 查重是硬闸, 读不到就不能放行。
     """
     total = (sb.table("draft_fingerprints").select("id", count="exact")
@@ -1136,7 +1179,12 @@ def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int]:
                   .not_.is_("title_embedding", "null")
                   .eq("embedding_model", model)
                   .limit(1).execute()).count or 0
-    return int(total), int(with_vec)
+    untitled = (sb.table("draft_fingerprints").select("id", count="exact")
+                  .eq("project_id", project_id)
+                  .eq("title", "")
+                  .is_("title_embedding", "null")
+                  .limit(1).execute()).count or 0
+    return int(total), int(with_vec), int(untitled)
 
 
 def check_drafts_sql(sb, project_id: str, rows: list[dict],
@@ -1394,9 +1442,12 @@ def fingerprint_row_count(sb, project_id: str) -> int:
 VECTOR_ABSENT = object()
 
 
-def fingerprints_needing_vectors(sb, project_id: str, model: str,
+def fingerprints_needing_vectors(sb, project_id: str | None, model: str,
                                  limit: int = 2000) -> list[dict]:
     """指纹库里【标题向量不可用】的行。给 reembed 用。
+
+    ``project_id`` 为 None(2026-10-30 复审): 不分项目, 给 tv-sync 每晚顺手补向量用(core.reembed_after_sync, 带上限)。
+    每行带 ``project_id``, 调用方据此报涉及几个项目。
 
     "不可用" 有三种, 三种都要修:
 
@@ -1423,13 +1474,13 @@ def fingerprints_needing_vectors(sb, project_id: str, model: str,
     做次级键。整批读完之后才开始写(set_fingerprint_vector), 所以翻页期间
     过滤条件不会被自己改动影响。
     """
+    def _base():
+        q = sb.table("draft_fingerprints").select("id, project_id, title, embedding_model")
+        return (q.eq("project_id", project_id) if project_id is not None else q).neq("title", "")
+
     def _page(extra):
         return _paged(
-            lambda off, lim: extra(
-                sb.table("draft_fingerprints")
-                  .select("id, title, embedding_model")
-                  .eq("project_id", project_id)
-                  .neq("title", ""))
+            lambda off, lim: extra(_base())
                 .order("created_at", desc=True)
                 .order("id", desc=True)
                 .range(off, off + lim - 1),
@@ -1799,15 +1850,65 @@ def _as_params(params) -> dict:
 
 def batch_params_for_items(sb, item_ids: list[str]) -> dict[str, dict]:
     """这些 item 所在 batch 的 ``params`` (``batch_id`` → dict)。"""
-    batch_ids: list[str] = []
+    return batch_params(sb, list(batch_ids_of_items(sb, item_ids).values()))
+
+
+def batch_ids_of_items(sb, item_ids: list[str]) -> dict[str, str]:
+    """``item_id`` → ``batch_id``。查不到的、没有 batch 的不在里面。"""
+    out: dict[str, str] = {}
     for chunk in db._in_chunks(list(dict.fromkeys(item_ids)), 100):
         res = sb.table("items").select("id, batch_id").in_("id", chunk).execute()
-        batch_ids += [str(r["batch_id"]) for r in (res.data or []) if r.get("batch_id")]
+        for r in res.data or []:
+            if r.get("batch_id"):
+                out[str(r["id"])] = str(r["batch_id"])
+    return out
+
+
+def batch_params(sb, batch_ids: list[str]) -> dict[str, dict]:
+    """``batch_id`` → ``params``(dict; 认不出的当 {})。"""
     out: dict[str, dict] = {}
     for chunk in db._in_chunks(list(dict.fromkeys(batch_ids)), 100):
         res = sb.table("batches").select("id, params").in_("id", chunk).execute()
         for r in res.data or []:
             out[str(r["id"])] = _as_params(r.get("params"))
+    return out
+
+
+def batch_drafts(sb, project_id: str, batch_ids: list[str]) -> dict[str, dict]:
+    """改稿重存时把原来那一整批交付稿拼回来用(2026-10-30, core._whole_batch_delivery): 这几个 batch(只认本项目的,
+    别的项目的查不出来)的 ``params`` / ``created_at``, 和每个 item 的全部版本 id 与它现在的那一版(代表版本, 同
+    ``_representative_version``: best_version_id 指的那一版, 没指就最新那一版)的标题正文。
+
+    回 ``{batch_id: {"params", "created_at", "items": [{"item_id", "version_ids": [...],
+    "current": {"id", "title", "body"} | None}]}}``。三次查询(batches / items / versions), 都按 id 分块、翻页拉全。
+    出错上抛: 调用方退回只拼这次的几篇, 说清原因, 不会拼出半批。"""
+    out: dict[str, dict] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(batch_ids)), 100):
+        res = (sb.table("batches").select("id, params, created_at")
+                 .in_("id", chunk).eq("project_id", project_id).execute())
+        for r in res.data or []:
+            out[str(r["id"])] = {"params": _as_params(r.get("params")), "created_at": r.get("created_at"),
+                                 "items": []}
+    if not out:
+        return out
+    items: list[dict] = []
+    for chunk in db._in_chunks(list(out), 100):
+        items += _paged(lambda off, lim, _c=chunk: (
+            sb.table("items").select("id, batch_id, best_version_id")
+              .in_("batch_id", _c).order("id").range(off, off + lim - 1)))
+    versions: dict[str, list[dict]] = {}
+    for chunk in db._in_chunks([str(it["id"]) for it in items], 100):
+        for v in _paged(lambda off, lim, _c=chunk: (
+                sb.table("versions").select("id, item_id, title, body, version_num")
+                  .in_("item_id", _c).order("id").range(off, off + lim - 1))):
+            versions.setdefault(str(v["item_id"]), []).append(v)
+    for it in items:
+        vs = versions.get(str(it["id"])) or []
+        cur = _representative_version({"versions": vs, "best_version_id": it.get("best_version_id")})
+        out[str(it["batch_id"])]["items"].append({
+            "item_id": str(it["id"]), "version_ids": [str(v["id"]) for v in vs],
+            "current": ({"id": str(cur["id"]), "title": cur.get("title") or "", "body": cur.get("body") or ""}
+                        if cur else None)})
     return out
 
 

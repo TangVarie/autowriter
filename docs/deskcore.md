@@ -110,7 +110,7 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 | `label_example` | **按 `items.user_id` 校验**，比项目粒度更细——同一项目里 A 的正负例是 A 的个人资产 |
 | REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了 |
 | CLI 的 `projects` / `open` / `draw` / `check` | 走同一个 `core` 函数，所以 `--user` 从可选变成**必填** |
-| CLI 的 `backfill` / `reembed` / `delivery-format`（2026-10-20） | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
+| CLI 的 `backfill` / `reembed` / `delivery-format`（2026-10-20）/ `project-archive`（2026-10-30） | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
 
 **要改成团队共享时改哪儿**：`core.assert_project_access` 的函数体（加一张 `project_members` 表就是把那个 `!=` 换成一次成员查询），调用方一行不动。判据刻意收敛成一处，就是因为归属是会变的产品决策——散在每个工具里意味着改一次口径要改十几处，而漏掉的那处不会报错，只会继续放行。
 
@@ -164,11 +164,11 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 |---|---|---|
 | 核协议版本 | `get_protocol` | 对话开始时调一次，带上 skill 里的 `protocol_version`：一致只回版本；不一致或没带才下发正文（源文件 `deskcore/protocol.md`）。正文的主副本在 skill 文件里，见 §4.3 |
 | 开项目 | `create_project` | 给新品牌/新方向建项目。**owner 恒为调用者**，签名里没有 owner 参数。同名不建、返回已有的；同品牌照建但列出兄弟项目（见 §3.0） |
-| 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
+| 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1）。2026-10-30 起归档的项目默认不列，`include_archived=true` 才列（见 §3.13） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`，以及最近的稿子在哪几处都写成一个样子 `recent_structure`（都是 2026-10-20，见 §3.1） |
-| | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
+| | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block`（2026-10-30 起每篇那行带完整的 `angle_key`：「第1篇 [angle_key=…]」，模型照着贴进 `check_drafts` / `score_drafts`，不再自己编） |
 | | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
-| 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比 |
+| 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比。改的是已经存过的那篇时带 `replaces_version_id`（2026-10-30，同 `score_drafts` 的字段、同一套核对 `_lookup_replacements`）：旧 item 全部版本的指纹不算它的对手，别的稿子照常比；**仍然只读**，不摘指纹。库里那一路（`deskcore_check_drafts`）每路只回最像的一条的标题、排除不了哪几行，不加迁移的做法是在 Python 里补（`_without_own_versions`）：先拿旧版那几行逐路比，库里回的命中比得过它们就是别的稿子、照用；比不过的那一路在去掉旧版之后的历史上重比——开头按哈希点查，标题语义 / 四字串把项目指纹拉回来再比（只拉要比的列，只给改稿那几篇）。被旧版挡在后面的别的稿子照样拦。id 对不上判 reject、`gate="replace_lookup"`。原来不认这个字段，改稿一查就被自己的旧版拦下（「正文开头与历史稿完全一致」），`archive_pending` 那句才叫模型改稿时跳过查重 |
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
 | | `commit_drafts` | 入库：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8）。2026-10-20 起项目有交付模板时带拼好的 `delivery`（§3.9），带 check 的规则有命中时带 `rule_checks`（§3.10）。2026-10-27 起带了 key 却对不上台账的另数（`unknown_angle_keys` / `used_angle_keys`，按形状分编的、别的项目的牌、台账没写进去），传回的飞轮臂对不上服务端发的时以服务端为准、重启过核对不了的另标（§3.12） |
@@ -297,6 +297,10 @@ cap 后面会让注入数少于 12，而池子里还有相关的排在第 13 位
 
 台账避重两档时效：真出了稿的按 `avoid_days`（默认 30 天）；只抽了没写的（占位）按 1 天——抽了不写不该长期占坑。
 
+> **"抽了没写"只数 W-38 之后的牌（2026-10-30 发布收尾）。** 简报的 `angle_debt`、存档后的 `angle_debt`、`archive_pending` 都只数 `core.ANGLE_DEBT_SINCE`（2026-10-29 08:26 UTC，W-38 上线）之后抽的牌：那之前只有 `score_drafts` 记稿子、写手又没有存档这一步（D-120），那时抽的牌大多写完发出去了，只是对不回来。简报那句 `angle_debt_note` 也改成说给模型听的——这个项目发牌分到、还没有稿子的坐标，用户这次要写的对得上就优先按它们写（查重时带上各自的 `angle_key`）；不再叫模型把数字说给用户、问「接着写完还是放弃」，不说「你抽了」（一个团队共用一个身份），不提存档。返回的键不变。
+>
+> **复审（同日）：刚抽的牌不算。** 一个团队共用一个身份，分不出牌是谁抽的：队友几分钟前刚抽、正在写的牌原来会出现在另一个写手新开那场的简报里，被叫「优先按它们写」。简报的 `angle_debt` 和存档后的 `angle_debt` 现在只数抽了一小时以上的（`core.ANGLE_DEBT_MIN_AGE`；抽牌到查重通常只隔几分钟，查过重的已按 W-38 的底稿排除；断掉的那场过一小时再开，它的牌照样在里面），`archive_pending` 不截（它管的就是这一场刚抽的牌）。存档后那份也按查重时带过的 key 排除，那句话改成和简报同一个写法：说「这个项目」，对得上就优先按这些坐标写、查重时带上 key，不再叫「别再抽一批新的」，不提存档。
+
 > **一批之内也错开（2026-10-20）。** 10-20 生产诊断：稿子篇幅短、批批长得像，飞书里大半被人重写。台账只管跨批次不重复，同一批之内原来什么都不管——洗牌后直接取前 n 个，5 篇的内容形式全不撞只有约 1/5。现在 `_spread_order` 把洗好的候选贪心重排：优先内容形式和标题句式都还没用过的，其次有一个没用过的，再次随便；同档里情绪杠杆没用过的优先；某一维 8 个值用满一轮就清空重来。所以 n=8 时 8 种内容形式、8 种标题句式各一，n=10 时同一种最多两篇。仍是随机（先后来自洗牌，同 seed 结果不变）；选择仍在 RPC 的事务里做，这里只是排序——近期用得多的项目，被避重跳过的那一位由后面的补上，偶尔会多撞一个；降级路径先去掉避重的再排，不打折。
 >
 > 同一天的另外两处，都在 `open_project` 的简报里：
@@ -420,6 +424,7 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 | 飞书已删 | TV 的 `v_notes_vanished` 里的篇（飞书里删掉或挪去别的表、TV 那一行还留着）`deskcore_tv_notes` 不返回（`016`）：不重对、不补录、不计数，已有的对照一行不动。缺席满一天半的（视图里本项目最近一次完整同步比这篇最后被看到晚 ≥ 36 小时，`TV_VANISHED_GRACE`），按当前口径算过的改动差异降回旧口径（W-37，10-28），摘要不再读。只查这晚没读到的那几条：`--since` 窗口外、视图里没有的不降；TV 两次完整同步重叠、或某次写库写一半，活着的篇也会短暂进视图（不到一天），不降。降了之后那篇又读到了，按「口径过时」重算（那一版还在对照索引里才算得了），`computed_at` 留旧值（同一版不推），中间若确认过摘要，它不会再进摘要。视图查不了这晚不降、退出码 1；视图不在（新库，`PGRST205`）不降、不报。评论按链接找帖（`comments_for` / `score_comments`）不走这个 RPC，由 `core._note_from_link` 自己查视图：同一条链接有活的一行就不用已删那行，只剩已删那行时回包带 `tv_note_vanished`、给的项目对不上时走贴正文那条路（代码，不依赖 016） | 2026-10-26：79 篇成人藻油从 BJS_phase1 挪去新表（TV 记为 BJS_phase2），其中 14 篇是 unmatched，补录目标一打开就会被补录进儿童藻油的项目；视图不在（新库）时照旧全给 |
 | 正文换了 | 有版本的对照（`ingested` 和人定过的除外）每晚比一次 TV 正文的指纹（`tv_note_links.tv_text_fp`，`017`；16 位，前 8 位是标题、后 8 位是剥话题的正文，各自去标点后 sha1，只改标点、空格、话题不算）。指纹变了才核：只改了标题（正文那一半没变），或还是那一篇（开头 40 字相同 / 四字串 ≥ 0.30 在原版里 / 原版只有标题而标题相同或四字串过半还在）→ 只记新指纹、改动差异按现在的正文重算（同一版不推 `computed_at`；017 之前的对照第一次记指纹时也重算一遍）。指纹等差异算好了才记，差异这晚没算成的明晚再核。**整篇换了** → 按内容重对，TV 里那条 lineage 若正是我们写回去的旧版就不当证据。挪之前先把这几条对照标成「没回填过」，再用 `deskcore_tv_clear_lineage` 撤回 TV 里我们写的那一对（两列都还等于才清），撤成了才挪，同一晚的回填写新版本。撤回失败、TV 里已是别的值、或一晚超过 `TV_SYNC_RELINK_MAX`（默认 5，按 TV 项目）的都不挪，差异先隔离（降回旧口径），退出码 1 等人看；没开 `--write-tv` 的也不挪、差异隔离，但只报（退出码 0），下次带 `--write-tv` 跑时挪。`tv_lineage` 而 TV 还指着这一版的，正文换了不挪、只报（退出码 0），TV 改了 lineage 之后再按 TV / 内容走。`--rematch` 同样按内容重对、受同一套限制；连着的那版已不是 item 的 best 时，正文还是那一篇就留着 | W-34（2026-10-27）。D-129 那 14 条：10-20 对上儿童稿，飞书正文后来整篇换成成人帖（重叠 ≤ 0.06），对照、TV 血缘和改动差异一直挂着，10 条差异进了儿童藻油项目的改稿摘要。10-27 生产库 501 条读得到的对照里，没换过的最低 0.481，中间 0.078~0.481 一条都没有。成批的换（运营把一张表挪作他用）由人定，所以有上限 |
 | 互斥 | 补录走 `core.ingest_published`，它先拿库里的项目锁（`ingest_locks`，TTL 10 分钟、到期可接管），拿不到等 90 秒后报「另一个补录正在跑」（REST 409） | 服务进程的工具与 CLI/cron 的 `tv-sync` 是两个进程，进程内锁管不到对方；advisory lock 跨不过 PostgREST 的多次请求 |
+| 补标题向量 | `--all` 且不是 `--dry-run` 时，所有 TV 项目同步完（删过期底稿之后）跑一次 `core.reembed_after_sync`：有标题、没有当前模型向量的指纹行（缺向量 / 来路不明 / 换模型作废三种，`store.fingerprints_needing_vectors`，**不分项目**，不只是 `tv_project_map` 里的），缺向量的排前面，每晚最多 `TV_SYNC_REEMBED_MAX`（200）行、最多跑 `TV_SYNC_REEMBED_BUDGET_SEC`（90）秒（embedding 客户端没设请求超时，到点在块与块之间停，剩下的不算失败），没轮到的明晚接着补；CLI 报补了几行、涉及几个项目。尽力而为：embedding 调用失败或读库出错报 ⚠️、退出码 1，这晚写进去的对照一行不动；没配 embedding 只说一句、退出码不变 | 2026-10-30 复审：sportsix 有一条有标题、没向量的指纹，之后每一批查重都报 `semantic_degraded`；补它的 `reembed` 是运维命令，没有任何东西排着跑。cron 本来就带着 `GOOGLE_API_KEY`（`railway.cron.json`） |
 
 实测（2026-09-17 的库，按全部 5000 多个版本对）：WTG 724 篇对上 229、百健士 182 对上 143、
 唐小轻 127 对上 51、sportsix 492 对上 26、雷诺考特 374 对上 17、途鸽 127 对上 17；
@@ -438,6 +443,16 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 > 参考分 `score` 和最多 3 条 `fixes`（`core.draft_score`：Jev 有把握 p≥0.7 的硬伤 −25、拿不准的 −8、没判出的硬约束 −10，
 > 正文太短不给分）。**仍然不拦**：written / rejected 口径不变，判不成照样存档。人审与导出两个工具撤了，评论按链接写
 > （`comments_for` / `score_comments`，§3.6 的人审流程只剩 core 里的函数）。下文"影子期"的表述按此读。
+>
+> **2026-10-30 发布收尾：分数不再逐篇报。** 10 月存档的 234 篇里 231 篇是 100 分，「每篇多少分」写手听到的几乎全是一串 100。
+> `judge.note`（`core.SCORE_NOTE`）和 `next_step` 开头那句（`core._score_report_step`，判定跑完才接在「这批已存档。」后面）
+> 改成：有 `fixes` / `hard_fails` 的那几篇点出 `judge.results` 里的 index，只说这几篇要改哪一句、犯了哪条；其余整批一句
+> 「合规检查都过了」；没打成分的一句带过（不看是哪种失败，回包除 `judge` 外一个字不变）。`score` / `fixes` 照旧都在 `judge.results` 里。
+>
+> **复审（同日）：「合规检查都过了」只在每篇都打成了分、都没有 `fixes` / `hard_fails` / `unjudged` 时说。** 只有 `unjudged`
+> 的（有几道硬约束 Jev 这次没判出来）单独一句「有几道硬约束这次没判出来，不能说都过了；不影响交付，不用重试」；混着别的
+> 情形时其余几篇只说「没查出要改的地方」；没打成分的从来不算过。整批没发出去时的工程原因（没配哪个变量、没接 tv-map、
+> 查库卡在哪）只进 `batch_metrics.meta.judge_detail`，回包里的 `judge.detail` 是念给写手的那一句。
 
 **是什么。** JevforCoentent 仓 docs/00 #4 拍板：写作台的入库判定挂在 `commit_drafts` 内部，advisory，
 8 秒没回就跳过，答案进账本（TV 的 `note_feature_answers`，`subject_type='aw_version'`、
@@ -653,8 +668,7 @@ python -m deskcore.cli delivery-format --project <uuid> --clear
 算这一条形状不对：报进 problems、不拼；查规则看的评论和交付稿是同一份（`delivery.comment_list`），交付稿里有哪几条就查哪几条。`tags` 传成整个列表 `json.dumps` 出来的一串（`'["a", "b"]'`）
 也拆开认（`delivery.split_tags`；摘话题、话题行、查话题的规则都走它），不会拼出 `#["a", #"b"]`。`problems` 只报代码判得准的：`tags` 外壳或列表成员形状不对（固定话题模板也报）、话题不够、评论条数不对、某条评论形状不对、某条评论没提到 `must_mention_any` 里的词、
 表格要方向而这篇没带、标题或正文里已经自带了标记、模板不管话题而 `tags` 里有正文里没有的话题（拼不进交付稿）；`index` 是写手传的位置。写手照协议先改 problems（带 `replaces_version_id`
-再存一次），再把 `text` 原样交给用户。⚠️ 话题和评论不落库，服务端拼不回上一次的稿子，所以重新存的那一次只拼改过的那几篇，
-写手用它按顺序替换原来那几篇（表格只换那几行，新返回的表头不再贴一遍）。
+再存一次），再把 `text` 原样整段交给用户。**改稿重存时拼的是原来那一整批**（2026-10-30）：话题、评论、方向不进 `versions`，所以存档时把这一批的顺序和每篇的这三样记进 `batches.params.delivery_parts`（`{"order": [每篇第一版的 version_id], "parts": {version_id: {写手传了的那几样}}}`，只在项目有模板时记，不加迁移）；改稿挂上旧 item 时新的那一版的三样并进去。重存时按记下的顺序，没改的几篇用它们现在那一版（标题正文从 `versions` 取），改过的换在原位，`delivery.scope = "whole_batch"`（另带 `batches` / `untouched`）；改的稿子分属几批的一批一段、按建的先后排，同一次另有新稿的拼在最后；`problems` 只报这次传的那几篇。拼不回来的（这之前存的batch、补录 / 底稿转正的、批里的稿子和记下的对不上、查库出错）照旧只拼改过的几篇，`scope = "this_call"`，`scope_fallback` 说原因（`batch_not_recorded` / `batch_changed` / `batch_unknown` / `lookup_failed`），`next_step` 多一句「照样原样交、说明是改过的那几篇」。原来是只拼改过的几篇、叫写手的模型自己按顺序替换原来那几行，和「原样交」打架。
 
 **写之前就让写手知道。** 有模板的项目，`open_project` 的简报带 `delivery_requirements`（`delivery.requirements`：要几个话题、
 固定话题有哪些、评论几条和每条要提到的词、要不要方向，外加一句 `task`），模板就在已经取到的项目行里，不多查。不给的话
@@ -921,7 +935,7 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
 |---|---|---|
 | `unknown_angle_keys` / `used_angle_keys` | 每次（同 `unattributed`） | 篇数，和 `unattributed`（没带 key）分开数；`unknown_angle_keys` 是这个项目台账里没有的三种合计 |
 | `angle_key_mismatch` | 有对不上的 | 每篇 `{index, angle_key, length, problem}`（`other_project` 另带 `project_id`），`angle_key` 只露前 24 字（模型编的长串可能是一句描述） |
-| `angle_key_warning` | 同上 | 一段话：按上表每种几篇、怎么回事；「原样复制、不要自己编号」只在有 `unknown` / `used` 时说；已经存了的不用重存；挂着的牌在 `angle_debt` 里一并回去，但不说「下一批按它们写」——那几张牌对应的稿子可能刚存过，再写一遍就是同一个角度两篇。同一批里还有没带 key 的，`unattributed_warning` 这时也不带「下一批按它们写」那一截（复审：两句话叫模型做相反的事） |
+| `angle_key_warning` | 同上 | 一段话：按上表每种几篇、怎么回事；「原样复制、不要自己编号」只在有 `unknown` / `used` 时说；已经存了的不用重存；挂着的牌在 `angle_debt` 里一并回去，但不说「按它们写」——那几张牌对应的稿子可能刚存过，再写一遍就是同一个角度两篇。同一批里还有没带 key 的，`unattributed_warning` 这时也不带「按它们写」那一截（复审：两句话叫模型做相反的事） |
 
 `angle_ledger_warning` 只报剩下的（key 本身没问题的那几个）；按 key 查也失败了，就笼统报「没查清」，不猜。查询失败
 不抛：指纹这时已经写进库了。
@@ -968,6 +982,11 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
 `empty_body_fields`（正文空的那几篇带了哪些字段名，W-30：多半是正文放错了字段）。`counters` 另记 `unattributed` /
 `unknown_angle_keys` / `used_angle_keys`，`meta.angle_key_mismatch` 记 `{index, problem, length}`（不记 key 本身）。
 
+> **正文放错了字段先对上（2026-10-30 发布收尾）。** `check_drafts` / `score_drafts`（和旧名 `commit_drafts`）在工具层（`tools._draft_fields`）
+> 先看每篇：`body` / `title` 空着、而别名键（`正文` / `内容` / `content` / `text`，标题是 `标题`）里**恰好一个**有字，就拿它当正文 / 标题；
+> 本名有字的不覆盖，两个别名都有字的不猜。对上的那份就是查重比的、底稿记的、存进 `versions` 的（之后 `check_rules` 查的也是它）。
+> 哪儿都没有正文的照旧按 `empty_body` 拒。对上了几篇只进 `deskcore.tools` 的 WARN 日志（键名 → 篇数，不带内容），回包不多字段。
+
 ```sql
 -- 全拒的批次为什么拒(W-31)
 select created_at, left(project_id::text, 8) p, counters->>'drafts' d,
@@ -990,6 +1009,30 @@ select created_at, left(project_id::text, 8) p, counters->>'written' w,
 
 协议没改（版本不变，写手不用重导 skill）：`score_drafts` 的工具说明补了这几个字段，回包和提醒自己把话说清楚。
 
+### 3.13 归档：不用的项目不进清单、不进跨项目检查（2026-10-30，发布收尾）
+
+**为什么。** 主身份名下 41 个项目，在用的六个左右。不用的那些照样排在 `list_projects` 里，模型每场开头要在一长串里挑；`score_drafts` 的跨项目检查（`project_isolation`）也拿它们的品牌词和近期标题去比——一个早就不写的项目的品牌词出现在正文里，就报一次「可能串项目」。
+
+**标记在哪。** `projects.default_params` 的 `"archived": true`，不加迁移（同 `delivery` / `isolation_terms`，整列存成 JSON 字符串）。只认 JSON 的 `true`；`default_params` 解析不了按**没归档**算（读是宽的：写坏一行不能把在用的项目藏起来）。**没有任何路径自动写它**，写手那边也没有对应的工具，只能用运维命令：
+
+```bash
+python -m deskcore.cli project-archive --project <uuid>               # 标成归档; 写回时保留别的键, 已经归档就不写
+python -m deskcore.cli project-archive --project <uuid> --unarchive   # 撤销: 删掉这个键(不写 false)
+python -m deskcore.cli projects --user <uuid> --include-archived      # 全列出来, 归档的带 archived: true
+```
+
+`default_params` 本身解析不了就拒绝写、退出码 1（同 `delivery-format`：拿 `{}` 去合并会把别的键一起抹掉）。
+
+| 哪里 | 归档之后 |
+|---|---|
+| `list_projects` | 默认不列；回包带 `archived_hidden`（藏了几个，没有就不带）和一句 `archived_hidden_note`（怎么看它们）。工具说明叫模型：要写的品找不到、而 `archived_hidden` 大于 0 时先带 `include_archived=true` 再看，别急着 `create_project` 建重。列出来的归档项目带 `archived: true`，在用的行形状不变 |
+| `create_project` | 建之前再找一遍（复审）：同名（不分大小写、首尾空格）的照旧不建，归档的那个品牌对得上（或没给品牌）就回它、带 `archived: true` 和一句「用户要写的是它就照常用」，品牌对不上也不建、但叫模型先跟用户确认。名字只差空格、分隔符（`-` `_` `·` `/` `、` 等，夹在两个数字中间的不算）、全半角、大小写的（给了品牌时品牌也一样）同样不建：**在用的优先**，回它并叫模型先跟用户确认一句（写法不一样，不能闷头用）。「D1-2」和「D12」、「2.0」和「20」、「¥99套餐」和「99套餐」不算同名。兄弟项目里归档的带 `archived: true`。工具说明的触发条件改成「带 `include_archived=true` 再查也没有」 |
+| 跨项目检查（`_cross_project_shadow`） | 候选集里去掉归档的项目，品牌词和标题向量都不拿它们比；当前项目自己归档了照比。`projects_total` 是去掉之后的个数，去掉了几个记在 `archived_skipped`（随 `project_isolation` 进 `batch_metrics.meta`） |
+| `open_project` | **照开，不锁人**——一个团队共用一个身份，某个写手要接着写一个旧项目是正当的。简报一样不少，只多 `archived: true` 和一句 `archived_note`：用户点名了这个项目或品牌就照常写、不提它暂时不用；只有模型自己挑的项目才先跟用户确认（复审：原来每次都确认，点名要的项目再被问一遍是多余的一问）。打开归档项目记一行 INFO 日志 |
+| `record_rule` 的串项目闸 | **没动**：归档项目的专属词照样挡。那道闸拦的是写，要不要放宽是另一个决定 |
+
+协议没改（版本不变，写手不用重导 skill）：`list_projects` / `open_project` 的工具说明补了这两个字段。回归在 `tests/test_project_archive.py`。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -1004,7 +1047,7 @@ env：
 | `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<uuid>", "name": "Ziao"}}`，一人一把 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN。馆员回 200 但 `status` 是 `degraded` / `error`（TV 侧选卡失败）记 `error` 不记 `empty` |
-| `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `10`，夹在 1–20。`open_project` 随简报借卡**只等这么久**，到点先交简报（`lessons_status.status=timeout`，`detail` 里告诉模型稍后调 `borrow_lessons` 命中缓存即回）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60） |
+| `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `15`（2026-10-30 起，原 10；最近冷借 14–18 秒），夹在 1–20。`open_project` 随简报借卡**最多等这么久**，而且不超过整次回包目标 `OPEN_PROJECT_RESPONSE_BUDGET_SEC`（20 秒，不开 env）扣掉借阅之前已用的时间和借阅之后几步的预留（`core.OPEN_PROJECT_TAIL_RESERVE_SEC`，2.5 秒）剩下的那段；到点先交简报（`lessons_status.status=timeout`，`detail` 里叫模型动笔之前用同样的参数调一次 `borrow_lessons`，命中缓存即回；只调一次，还没有就照常写）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60），2026-10-30 起也收 `extra_instructions`（它在馆员的缓存键里） |
 | `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里；它是自定义格式，登记在 `logger_utils` 的值级脱敏名单里（judge 的错误体会被抄进 detail / 遥测 / `batch_metrics`）。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
 | `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了、`nan` / `inf` 都退回默认）。**整批判定的共同截止**，不是每篇各 8 秒；入库慢时实际截止更短（整次 commit 回包目标 20 秒，见 §3.8，J-08） |
 | `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16（同上，写坏了退回默认）。一次 commit 同时发几篇 |
@@ -1157,7 +1200,7 @@ skill 从本仓直接装：`TangVarie/autowriter → skills/bywood-writing-desk`
 > **让写作台在各种说法下都被调起来（2026-10-19）。** 操作的人不懂架构，不会说「用写作台」；10-19 查到同一位写手的写作台是连着的，写途鸽的那批对话却一次都没调到它。owner 确认 WorkBuddy 的写作台连接是**全局**的（随便开个新对话都能列出项目），那一波是 **skill 没被调起来**（写手点的是 human-writing），后面整套流程就没走。所以「被调起来」不能靠人记，三层各兜一层：
 > ① **skill 的 `description`**（平台据它决定要不要加载 skill，常驻上下文）：写成「只要产出给品牌发的小红书内容就用」，列出只报品牌名 / 只贴 brief / 只点 human-writing 这些最容易漏的说法，并点了现有品牌名；
 > ② **服务端**：MCP `instructions` 和 `open_project` / `list_projects` 的说明里写着「写稿先开项目，没提写作台也一样」——只要连着写作台，skill 没被加载也在模型眼前，部署即生效、不用重新导入；
-> ③ **事后提醒**：`open_project` / `list_projects` 回包里的 `desk_gap`——你名下哪个项目近 7 天发出去的帖写作台没接住（口径同 TV 角度台账灯判据 C：按发布时间、对上只认写作台那版早于发布的、项目用过写作台就算），原话告诉运营下次在连着写作台的对话里写、先说「打开某某」。漏接的那些对话自己连不到写作台，只能在下一次连着的对话里说。
+> ③ **事后提醒**：`open_project` / `list_projects` 回包里的 `desk_gap`——你名下哪个项目近 7 天发出去的帖写作台没接住（口径同 TV 角度台账灯判据 C：按发布时间、对上只认写作台那版早于发布的、项目用过写作台就算），原话告诉运营下次在连着写作台的对话里写、先说「打开某某」。漏接的那些对话自己连不到写作台，只能在下一次连着的对话里说。**2026-10-30 发布收尾起不再带**：一个团队共用一个身份，每个写手每场开头都听到别人项目的这段提醒，还推断「写的时候没调起写作台」；可对不回来的多半是 W-38 之前写的（那时查重不记稿子），正在写作台里写的人还被叫「这次就在写作台里写」。计算 `core.desk_gaps` 留着、不进回包；看漏接走 TV 角度台账灯判据 C。
 > 新品牌上线时记得把品牌名加进 `description`（改的是 skill 头，`sync-skill` 后版本号会变）。owner 10-19 说 WorkBuddy 现在会自动更新从仓库装的 skill；没更新到的那份，开场 `get_protocol` 核版本时模型会提醒运营重新导入——两条路都在，但描述里的新品牌名只有更新到了才生效，上新品牌时顺口跟运营确认一句。
 >
 > **"按本地那份继续"只在 `open_project` 通的时候成立（2026-10-19）。** 正文进了 skill 之后多了一种失效：写作台的 MCP 没连上（地址 / key 不对），模型照样拿到整份协议，原来那句「核不上版本就按本地这份继续、不要停下来不写」让它把整套流程走完，稿子写得和真用了写作台一模一样，服务端却一条记录都没有。（途鸽 9-16 之后写作台没收到任何调用，最初怀疑是这一种；后来确认连接是全局的、原因是 skill 没被调起来，见上一段。这条硬闸照样留着，堵的是真断线的那种。）现在 skill 头和协议「一、动笔前」第 1 条都写死：`open_project`（写评论时是 `comments_for`）找不到、或者重试一次还失败，就不写，原话告诉用户去查连接。判据是真去调，不是看眼前的工具列表——按需加载工具的客户端里，连上了列表里也可能一开始看不到它。服务端这边由 TV 的角度台账那盏灯补一种形状（项目在发帖、写作台却没接住），见 TV `scripts/check_angle_ledger_leak.py`。

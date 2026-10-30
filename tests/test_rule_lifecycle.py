@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 import db
@@ -478,12 +480,14 @@ def test_a_batch_that_updates_nothing_tells_you_to_stop(monkeypatch):
     assert "next" not in out, "既叫停又叫人再调一次, 自相矛盾"
 
 
-@pytest.mark.parametrize("status, kw", [
-    ("no_embedding_sdk", "GOOGLE_API_KEY"),
-    ("schema_missing",   "pgvector"),
-    ("query_failed",     "查询失败"),
+@pytest.mark.parametrize("status, writer_text, logged", [
+    # 两种「补不了」各有各的一句: 服务端算不了向量(key / SDK) ≠ 服务端还没有规则向量这一列(迁移)。
+    # 写手那边只说是哪一种、不用他做什么; 补救(配 key / 跑 pgvector 迁移)只进日志 —— 两种都钉住, 别让任何一种静默。
+    ("no_embedding_sdk", "这次补不了: 服务端暂时算不了向量", ("GOOGLE_API_KEY",)),
+    ("schema_missing",   "这次补不了: 服务端还不支持规则向量", ("pgvector", "memories.embedding")),
+    ("query_failed",     "补算查询失败", ()),
 ])
-def test_failure_statuses_raise_instead_of_returning_a_dict(monkeypatch, status, kw):
+def test_failure_statuses_raise_instead_of_returning_a_dict(monkeypatch, caplog, status, writer_text, logged):
     """补算失败必须**抛**, 不能返回一个带 error 字段的字典。
 
     ⚠️ MCP 把"返回了字典"当成调用成功。返回 {"error": ..., "remaining": N}
@@ -492,9 +496,23 @@ def test_failure_statuses_raise_instead_of_returning_a_dict(monkeypatch, status,
     """
     _with_backfill(monkeypatch, [{"status": status, "hint": "pgvector 迁移没跑",
                                   "error": "boom"}])
+    caplog.set_level(logging.WARNING, logger="deskcore.core")
     with pytest.raises(RuntimeError) as exc:
         core.reembed_my_rules(_client([]), user_id=ME)
-    assert kw in str(exc.value)
+    msg = str(exc.value)
+    assert msg.startswith(writer_text), msg
+    # 两种「补不了」说的不是同一句: 一种是算不了, 一种是还不支持
+    others = {"no_embedding_sdk": "还不支持规则向量", "schema_missing": "暂时算不了向量"}
+    if status in others:
+        assert others[status] not in msg, msg
+        assert "不是「没有需要补的」" in msg and "不用你做什么" in msg
+    # 报错文本是念给写手的: 环境变量 / 列名 / 迁移只进日志(2026-10-30 发布收尾)
+    for bad in ("GOOGLE_API_KEY", "pgvector", "memories.embedding", "运维"):
+        assert bad not in msg, (bad, msg)
+    # ……但补救一定要进日志, 不然运维那边也不知道该做什么
+    log = "\n".join(r.getMessage() for r in caplog.records if r.name == "deskcore.core")
+    for remedy in logged:
+        assert remedy in log, (remedy, log)
 
 
 def test_noop_says_it_is_actually_done(monkeypatch):

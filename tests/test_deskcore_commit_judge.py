@@ -549,7 +549,9 @@ def test_no_tv_mapping_means_nothing_leaves_the_building(judge_on, monkeypatch):
     r = out["judge"]["results"][0]
     assert out["judge"]["summary"] == {"not_configured": 2}
     assert r["judge_status"] == judge_client.JUDGE_NOT_CONFIGURED
-    assert "tv-map add" in out["judge"]["detail"], "要把补救命令说出来, 而且整批只说一次"
+    # detail 是念给写手的: 只说这次判不了、不影响什么, 整批只说一次; 补救命令进日志(2026-10-30 发布收尾)
+    assert "判不了" in out["judge"]["detail"], "整批只说一次"
+    assert "tv-map" not in out["judge"]["detail"] and "python -m" not in out["judge"]["detail"]
     assert "detail" not in r, "每篇重复同一句话只会把返回值撑长"
 
 
@@ -877,6 +879,36 @@ def test_a_metrics_row_records_timing_and_judge_outcomes(judge_on):
     assert m["counters"]["judge_ok"] == 1 and m["counters"]["judge_skipped"] == 0
     assert [j["status"] for j in m["meta"]["judge"]] == ["ok"]
     assert m["meta"]["judge_skipped"] == []         # 正文空的那篇没入库(W-30); 跳过的记账见 not_in_project 那条
+
+
+@pytest.mark.parametrize("case, want", [
+    ("no_map", "tv_project_map"),                       # 没接 tv-map: 补救是 tv-map add
+    ("not_configured", "JUDGE_URL / JUDGE_API_KEY"),     # 没配判定服务
+    ("lookup_failed", "查 tv_project_map 失败"),          # 查对照表出错
+])
+def test_the_ops_cause_lands_in_batch_metrics_but_never_in_the_reply(judge_on, monkeypatch, case, want):
+    """G1 之后 judge.detail 是念给写手的一句话(「这次判不了, 不影响什么」), 工程原因原来就这样从
+    batch_metrics.meta.judge_detail 里丢了 —— 事后查「这批为什么没判」只看得到那句客气话(2026-10-30 复审)。
+    现在原因只进 batch_metrics, 回包里一个字都不带(也没有多出来的键)。"""
+    c = _client(maps=[] if case == "no_map" else None)
+    if case == "not_configured":
+        monkeypatch.setattr(config, "JUDGE_URL", "")
+    if case == "lookup_failed":
+        def boom(*a, **k):
+            raise RuntimeError("PGRST205 tv_project_map")
+        monkeypatch.setattr(store, "tv_projects_of", boom)
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    assert out["written"] == 1 and judge_on["payloads"] == []
+    j = out["judge"]
+    assert core.JUDGE_OPS_DETAIL_KEY not in j, "工程原因的键不进回包"
+    blob = repr(out)
+    for bad in ("tv_project_map", "tv-map", "python -m", "JUDGE_URL", "JUDGE_API_KEY", "PGRST205"):
+        assert bad not in blob, (bad, j.get("detail"))
+    assert j["detail"], "写手那句照旧在"
+    (row,) = c.rows["batch_metrics"]
+    assert want in (row["meta"]["judge_detail"] or ""), row["meta"]["judge_detail"]
+    if case == "no_map":
+        assert f"--project {PROJ}" in row["meta"]["judge_detail"], "补救命令带着项目号, 照着就能接上"
 
 
 def test_a_judge_error_body_that_echoes_the_key_is_masked_everywhere(monkeypatch, capsys):

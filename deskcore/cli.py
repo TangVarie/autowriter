@@ -18,12 +18,16 @@
   python -m deskcore.cli tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target
   python -m deskcore.cli delivery-format --project <uuid> (--show | --set 模板.json | --clear)
                                                     ← 项目的交付版式模板(score_drafts 按它拼交付稿)
+  python -m deskcore.cli project-archive --project <uuid> [--unarchive]
+                                                    ← 把不用的项目标成归档(list_projects 默认不列,
+                                                      跨项目检查不拿它比; open_project 照开)
   python -m deskcore.cli compile-rules (--project <uuid> | --all) [--force] [--dry-run]
                                                     ← 把规则交给 Jev 编成写后检查, 结果缓存进
                                                       rule_compiles(check_rules 用; 后台也会自己补编)
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
                                                     ← TV 的笔记按内容对到写作台的版本,
-                                                      对不上的补进指纹库(每天跑一次)
+                                                      对不上的补进指纹库(每天跑一次); --all 跑完
+                                                      顺手补缺的标题向量(每晚最多 200 行)
                                                     ← 把已发出去、没走 commit 的稿子
                                                       从飞书表补进指纹库(不过闸)
 
@@ -460,7 +464,35 @@ def _tv_sync(core, sb, args) -> int:
         else:
             if pruned:
                 print(f"\n查重底稿: 删了 {pruned} 行超过 {core.SNAPSHOT_RETAIN_DAYS} 天的")
+        rc = max(rc, _tv_sync_reembed(core, sb))
     return rc
+
+
+def _tv_sync_reembed(core, sb) -> int:
+    """同步完顺手补标题向量(core.reembed_after_sync, 每晚最多 TV_SYNC_REEMBED_MAX 行)。回这一段该给的退出码。
+    放在所有同步之后、单独兜住: 补不成只报警告 + 退出码 1, 这晚写进去的对照一行不动。"""
+    try:
+        rv = core.reembed_after_sync(sb)
+    except Exception as exc:                            # noqa: BLE001
+        print(f"\n⚠️ 标题向量没补成: {type(exc).__name__}: {exc} —— 对照照常写了; 明晚再补。")
+        return 1
+    if rv.get("skipped"):
+        print("\n标题向量: 这个部署没配 embedding(GOOGLE_API_KEY), 没补。")
+        return 0
+    if not rv.get("pending"):
+        if rv.get("error"):                             # 先看故障再看「没有要补的」(复审 2026-10-30): pending 是 0 也可能是没补成
+            print(f"\n⚠️ 标题向量没补成: {rv['error']} —— 对照照常写了; 明晚再补。")
+            return 1
+        return 0
+    print(f"\n标题向量(每晚最多补 {core.TV_SYNC_REEMBED_MAX} 行): 补了 {rv['fixed']}/{rv['pending']} 行"
+          f"(项目 {rv['projects']} 个; 缺向量 {rv['missing_vector']}, 换模型作废 {rv['stale_model']})"
+          + (f", {rv['failed']} 行没补上" if rv.get("failed") else "")
+          + ("; 到了这一步的时间上限, 先停" if rv.get("stopped_early") else "")
+          + ("; 可能还有没轮到的, 明晚接着补" if rv.get("capped") else ""))
+    if rv.get("error"):
+        print(f"  ⚠️ {rv['error']} —— 对照照常写了; 这几行明晚再补, 连着几晚都这样就查 embedding 的 key / 配额。")
+        return 1
+    return 0
 
 
 def _print_tv_drift(out: dict, tv: str) -> int:
@@ -621,6 +653,23 @@ def _delivery_format(core, sb, args) -> int:
     return 1 if out.get("error") else 0
 
 
+def _project_archive(core, sb, args) -> int:
+    """项目不存在 / default_params 解析不了: 打印原因, 退出码 1, 一个字不写(同 delivery-format)。"""
+    from . import delivery
+    try:
+        out = core.project_archive(sb, args.project, archived=not args.unarchive)
+    except core.ProjectNotFound as exc:
+        print(f"项目不存在: {exc}")
+        return 1
+    except delivery.TemplateError as exc:
+        print(f"没写进去: {exc}")
+        return 1
+    _print(out)
+    if not out["changed"]:
+        print("\n已经是这个状态, 没写。")
+    return 0
+
+
 _COMPILE_OK = ("up_to_date", "dry_run", "ok")
 
 
@@ -731,6 +780,8 @@ def main(argv: list[str] | None = None) -> int:
     # psql)。安全边界在 MCP/REST 那一面, 不在这儿。
     p = sub.add_parser("projects", help="列项目(仅 --user 名下)")
     p.add_argument("--user", required=True)
+    p.add_argument("--include-archived", action="store_true",
+                   help="归档的项目也列出来(带 archived: true); 默认不列, 同 list_projects")
 
     p = sub.add_parser("open", help="打开项目, 打印完整写作简报")
     p.add_argument("--project", required=True)
@@ -830,6 +881,13 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--set", dest="set_file", default=None, help="JSON 文件: 模板对象本身")
     g.add_argument("--clear", action="store_true", help="删掉模板(score_drafts 不再带 delivery)")
 
+    # 归档(2026-10-30 发布收尾): 标记存在 projects.default_params.archived, 不加迁移; 什么都不自动写它, 只有这个命令。
+    # 归档的项目 list_projects 默认不列、跨项目检查不拿它比; open_project 照开, 只多一句让模型跟用户确认是不是这个项目。
+    # 运维命令, 同 delivery-format 不要 --user; 写手那边没有对应的工具 —— 哪些项目不用了是负责人定的。
+    p = sub.add_parser("project-archive", help="把项目标成归档 / 撤销归档(--unarchive)")
+    p.add_argument("--project", required=True)
+    p.add_argument("--unarchive", action="store_true", help="撤销归档(删掉标记)")
+
     # 规则编译(2026-10-20, D-121): 规则交给 Jev 编成写后检查, 结果按 (规则 id, sha) 缓存进 rule_compiles。
     # open_project / record_rule / check_rules 会在后台自己补编; 这个命令给上线时补一遍、或者 Jev 那边改了编译之后 --force。
     p = sub.add_parser("compile-rules", help="把规则交给 Jev 编成写后检查(check_rules 用), 已编过的不再发")
@@ -880,10 +938,12 @@ def main(argv: list[str] | None = None) -> int:
         return _tv_resolve(core, sb, args)
     if args.cmd == "delivery-format":
         return _delivery_format(core, sb, args)
+    if args.cmd == "project-archive":
+        return _project_archive(core, sb, args)
     if args.cmd == "compile-rules":
         return _compile_rules(core, sb, args)
     if args.cmd == "projects":
-        _print(core.list_projects(sb, user_id=args.user))
+        _print(core.list_projects(sb, user_id=args.user, include_archived=args.include_archived))
     elif args.cmd == "open":
         _print(core.build_writing_brief(
             sb, args.project, user_id=args.user,

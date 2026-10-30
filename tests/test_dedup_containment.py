@@ -16,6 +16,7 @@ docs/audit-2026-08-23-full.md §0.5 与 deskcore/fingerprint.py 的注释里。
 
 from __future__ import annotations
 
+import logging
 import random
 
 import pytest
@@ -299,7 +300,7 @@ def test_python_path_rejects_short_copy_of_long_history():
     assert out["summary"]["containment_checked"] is True
 
 
-def test_old_004_rpc_is_treated_as_not_run_not_as_zero():
+def test_old_004_rpc_is_treated_as_not_run_not_as_zero(caplog):
     """只跑过 004 的库回不出包含度三列 —— 必须报"这一路没跑", 不能当成"没撞车"。
 
     这正是本条 finding 自己的形态: 一个信号静默没跑, 而返回值看起来一切正常。
@@ -317,11 +318,14 @@ def test_old_004_rpc_is_treated_as_not_run_not_as_zero():
                "ngram_hashes": sorted(fp.ngram_hashes(long_body)),
                "title_embedding": None}],
              rpc_impl={"deskcore_check_drafts": lambda a: [old_row]})
-    out = core.check_drafts(sb, PID, [{"title": "全新的标题", "body": short_body}],
-                            user_id=ME)
+    with caplog.at_level(logging.WARNING, logger="deskcore.core"):
+        out = core.check_drafts(sb, PID, [{"title": "全新的标题", "body": short_body}],
+                                user_id=ME)
     assert out["summary"]["containment_checked"] is False
     assert "containment_skipped_warning" in out["summary"], out["summary"]
-    assert "005" in out["summary"]["containment_skipped_warning"]
+    # 是哪个迁移没跑只进日志; 念给写手的那句不带迁移号(2026-10-30 发布收尾)
+    assert "005" in caplog.text, caplog.text
+    assert "migrations" not in out["summary"]["containment_skipped_warning"]
     # 而且【不能】因此把这一路当成 0 分就判 pass 却什么都不说
     assert out["results"][0]["signals"]["containment_sample"] == 0
 

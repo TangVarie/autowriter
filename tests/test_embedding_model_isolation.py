@@ -91,8 +91,9 @@ def test_stats_count_only_usable_vectors():
     """
     sb = FakeClient(rows={"draft_fingerprints":
                           [_fp("a", OLD), _fp("b", None), _fp("c", CUR)]})
-    total, with_vec = store.fingerprint_stats(sb, PID, CUR)
-    assert (total, with_vec) == (3, 1)
+    total, with_vec, untitled = store.fingerprint_stats(sb, PID, CUR)
+    # 三条都有标题: 第三个数(空标题且没向量, 不算缺)是 0
+    assert (total, with_vec, untitled) == (3, 1, 0)
 
 
 def test_pushdown_payload_carries_the_model():
