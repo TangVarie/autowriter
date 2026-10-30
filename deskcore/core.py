@@ -1398,6 +1398,20 @@ def _ms_since(t0: float) -> int:
     return int((time.monotonic() - t0) * 1000)
 
 
+# commit 段里各步的名字(W-21, 10-30): 按执行顺序, 「other」是 commit 段减去这些之后剩的(拼回包、算提示语、放锁)。
+COMMIT_PARTS = ("access", "replace_prep", "embed", "gate", "fingerprints", "restore", "replace_versions", "arm",
+                "mint", "consume", "snapshots", "key_check", "angle_debt", "other")
+
+
+def _lap(parts: dict, key: str, since: float) -> float:
+    """把 since 到现在的毫秒数累加进 ``parts[key]``, 回现在, 下一步从这里接着量(W-21)。
+
+    一段接一段地量、中间不留缝, 各步加起来 + other 就是 phase_ms.commit; 哪一步慢一眼看得出, 不用再猜。"""
+    now = time.monotonic()
+    parts[key] = parts.get(key, 0) + int((now - since) * 1000)
+    return now
+
+
 def _judge_targets(drafts: list[dict], titles: list[str], bodies: list[str],
                    inserted_idx: set[int], replace: dict, replaced_ok: dict,
                    minted_ids: dict, minted_ok) -> tuple[list[dict], list[dict]]:
@@ -1893,7 +1907,8 @@ def _rejection_meta(drafts: list[dict], rejected: list[dict]) -> dict:
 
 
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
-                           out: dict, *, flywheel: dict | None = None, checks: dict | None = None) -> None:
+                           out: dict, *, flywheel: dict | None = None, checks: dict | None = None,
+                           commit_parts: dict | None = None) -> None:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
 
     为什么要落库而不只打日志: 「commit_drafts 约 1~2 秒」「一批 10 篇并行也是一两秒」
@@ -1933,6 +1948,8 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
             "judge_skipped": [{"index": s.get("index"), "reason": s.get("reason")}
                               for s in (j.get("skipped") or [])],
             "project_isolation": out.get("project_isolation") or {},
+            # commit 段按步拆开的毫秒数(W-21, COMMIT_PARTS 的顺序), 加起来 = phase_ms.commit。不放 phase_ms: 那里各段加起来 = total
+            "commit_parts_ms": {k: int(commit_parts[k]) for k in COMMIT_PARTS if k in (commit_parts or {})},
             # 飞轮分臂 (docs/28 §7.4): 这次的臂、改稿挂到的旧 item、没能在旧 batch 上标 mixed 的 item ——
             # batch.params 之外的第二份记录, 分析对照组时据此剔除跨臂改过的批次
             **(flywheel or {}),
@@ -1957,6 +1974,7 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                             drafts=len(drafts), written=out.get("written"),
                             elapsed_ms=out.get("elapsed_ms"),
                             phase_ms=out.get("phase_ms"),
+                            commit_parts_ms=commit_parts or {},
                             judge=j.get("summary"), judge_skipped=len(j.get("skipped") or []),
                             project_isolation_status=(out.get("project_isolation") or {}).get("status"),
                             project_isolation_flags=len((out.get("project_isolation") or {}).get("flags") or []),
@@ -2695,10 +2713,14 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     docs/deskcore.md §3.12。
     """
     started = time.monotonic()
+    # W-21(10-30): commit 段(入库段)按步计时, 落进 batch_metrics.meta.commit_parts_ms, 不进 phase_ms(那里各段加起来等于
+    # total, 测试和查法都靠这一条)。从 started 起一段接一段量, 等锁那段不算(单列在 lock_wait)。
+    commit_parts: dict[str, int] = {}
     # 审计 COR-015。项目整行留着: 交付模板(default_params.delivery)就在这一行里, 不再多查一次(10-20)
     project = assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
+    _lap(commit_parts, "access", started)
     arm_meta: dict = {}      # 这次入库的臂 + 改稿挂到哪些旧 item, 进 batch_metrics.meta (分析对照组的第二份记录)
 
     # 全程持项目写锁(codex #84 P1): 替换要先摘旧指纹再查重写入, 两步之间别的 commit /
@@ -2708,12 +2730,14 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     lock_asked = time.monotonic()
     with _project_write_lock(client, project_id, holder):
         lock_wait_ms = _ms_since(lock_asked)
+        lap = time.monotonic()
         # 正文空的替换稿不摘旧指纹(codex review on aw#126): 它反正要被拒(W-30, 见下), 先摘了的话同批里和旧版
         # 重复的另一篇查重时看不见旧版, 照样入库。
         empty_idx = {i for i, d in enumerate(drafts) if not str(d.get("body") or "").strip()}
         replace, replace_rejected, stash = _prepare_replacements(
             client, project_id, [{**d, "replaces_version_id": None} if i in empty_idx else d
                                  for i, d in enumerate(drafts)])
+        lap = _lap(commit_parts, "replace_prep", lap)
         # 整段包在 try 里(而不是拆成子函数): ci.yml 用 inspect.getsource 守着"commit 走 _gate"
         # 和"commit 记 embedding_model"这两条, 拆出去它们就看不见了。
         try:
@@ -2733,6 +2757,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             vecs = dedup.embed_texts(titles) if embed_configured else None
             embed_failed = embed_configured and not vecs
             bodies = [d.get("body") or "" for d in drafts]
+            lap = _lap(commit_parts, "embed", lap)
 
             # ── 入库自带闸(2026-09-17)────────────────────────────────────────
             # 先跑一遍和 check_drafts **同一套**判定, 判 reject 的不进 RPC。理由见
@@ -2755,6 +2780,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     pre_rejected[i] = {**r, "index": i}
             survivors = [i for i in range(len(drafts))
                          if i not in pre_rejected and i not in replace_rejected and i not in empty_rejected]
+            lap = _lap(commit_parts, "gate", lap)
 
             # ── 先把 version_id 定下来 ──────────────────────────────────────────
             # 顺序是有讲究的: **先造 id 并写进指纹, 事后才建 versions 行**。
@@ -2864,6 +2890,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                         "ngram_hashes": r["ngram_hashes"], "angle_key": r["angle_key"],
                     })
                 written = store.write_fingerprints(client, payload)
+            lap = _lap(commit_parts, "fingerprints", lap)
 
             # 只给真的入了库的坐标销账 —— 被拒的那条角度还没产出成稿, 不该占坑。
             inserted_idx = ({survivors[o["idx"]] for o in outcome
@@ -2878,6 +2905,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # 不上。它半途失败时会把**已经建成的那部分**连同 error 一起回来。
             # 替换的稿子没入库(闸前被拒 / 原子重查撞车): 旧指纹放回去, 旧稿照旧参与查重。
             _restore_stash(client, stash, [i for i in replace if i not in inserted_idx])
+            lap = _lap(commit_parts, "restore", lap)
 
             # 替换成功的: 不建新 item, 在旧 item 上加一版。半途失败与建身份同一口径 ——
             # 指纹已进库, 主要目的达成, 不抛, 说清哪几条没接上。
@@ -2899,6 +2927,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 except Exception as exc:                    # noqa: BLE001
                     logger.exception("commit_drafts: 替换旧版失败(index=%d, item=%s)", i, ctx["item_id"])
                     replace_error = replace_error or f"{type(exc).__name__}: {exc}"
+            lap = _lap(commit_parts, "replace_versions", lap)
 
             minted = {"batch_id": None, "versions": {}, "error": None}
             to_mint = [
@@ -2924,12 +2953,14 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             arm_meta = {"flywheel_arm": arm, "flywheel_arm_source": arm_source, **arm_flags,
                         "revised_item_ids": sorted(set(replaced_ok.values())),
                         "arm_mixed_unmarked_item_ids": unmarked}
+            lap = _lap(commit_parts, "arm", lap)
             if to_mint:
                 minted = store.mint_draft_identity(
                     client, project_id, str(user_id), "", to_mint,
                     batch_params={"source": "deskcore", "flywheel_arm": arm, "flywheel_arm_source": arm_source,
                                   **arm_flags})
             identity_error = minted.get("error")
+            lap = _lap(commit_parts, "mint", lap)
 
             consumed = 0
             attempted = 0
@@ -2962,6 +2993,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     consumed += 1
                 else:
                     missed_keys[i] = str(key)
+            lap = _lap(commit_parts, "consume", lap)
 
             # W-38: 存了档的稿子, 同样文字的查重底稿记成已转正 —— 它有版本了, 发出去以后主索引对得上, 底稿不用再等飞书。
             # 改稿替换真挂上了旧 item 的也算(codex on aw#132): 底稿留着, 这一版之后又被替换掉、主索引对不上它的时候, 会被另转一份
@@ -2969,6 +3001,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                                  {i: minted_ids[i] for i in sorted(inserted_idx)
                                   if i in replaced_ok
                                   or (i not in replace and minted_ids.get(i) in (minted.get("versions") or {}))})
+            lap = _lap(commit_parts, "snapshots", lap)
 
             # 带了 key 却没销成的, 分清是不是 key 本身的问题(W-31, 10-26 sportsix: 19 篇带的 key 一条都不在台账里,
             # 回包只说「销账少了」, 写手那边的 AI 不知道 key 是错的, 20 张牌一天后回了池子)。只在有没销成的时候多查一次。
@@ -2979,6 +3012,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             unknown_keys = sum(key_problem_n.get(c, 0) for c in ANGLE_KEY_ABSENT)
             used_keys = key_problem_n.get(store.ANGLE_KEY_USED, 0)
             _note_angle_key_misses(project_id, user_id, key_problems)    # 下一次 archive_pending 也带上
+            lap = _lap(commit_parts, "key_check", lap)
 
             # 入了库却没带 angle_key 的: 台账没法给它们销账, 同一个故事下一批还可能被
             # 抽到 —— 而那种重复(同题重写)指纹闸抓不到。途鸽 09-10 的 66 条里 49 条是
@@ -3100,6 +3134,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 # ⚠️ 失败绝不许冒泡。指纹这时已经写进去了, 抛出去调用方会重试,
                 #    重试会撞上自己刚写的指纹 —— 一句提醒把一次成功的入库变成
                 #    "你的稿子重复了"。同 rpc_anomalies / identity_error 的纪律。
+                lap = _lap(commit_parts, "other", lap)       # 拼回包、提示语(纯代码)
                 try:
                     debt = store.angle_debt(client, project_id, user_id,
                                             ANGLE_DEBT_DAYS)
@@ -3107,6 +3142,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     logger.exception("angle debt lookup after commit failed "
                                      "(project=%s)", project_id)
                     debt = None
+                lap = _lap(commit_parts, "angle_debt", lap)
                 tail = key_tail = ""
                 if debt and debt["unconsumed"]:
                     out["angle_debt"] = debt
@@ -3232,6 +3268,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             raise
     # 各段可加: lock_wait + commit + delivery_rules + judge + project_isolation ≈ total
     commit_ms = _ms_since(started) - lock_wait_ms
+    # commit 段剩下的(拼回包、提示语、放锁)记进 other, 各步加起来 = commit(W-21)。毫秒取整各自截断, 差几毫秒算进 other
+    commit_parts["other"] = max(0, commit_parts.get("other", 0)
+                                + commit_ms - sum(commit_parts.values()))
 
     # ── 交付版式 + 代码查规则(2026-10-20): 锁外、恢复指纹的 try 外, 同下面的判定 ──────────────────
     # 都是纯代码(模板在项目行里, 规则多一次很小的查询), 放在判定前面: 判定的截止按"已用时间"算, 这一步多花的
@@ -3272,7 +3311,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     out["elapsed_ms"] = _ms_since(started)
     out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms, "delivery_rules": delivery_rules_ms,
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
-    _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta, checks=post_meta)
+    _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta, checks=post_meta,
+                           commit_parts=commit_parts)
     return out
 
 
