@@ -263,15 +263,17 @@ def create_project(name: str, brand: str = "",
     """给一个新品牌 / 新方向开一个项目。**建完立刻用返回的 project_id 调
     open_project 接管。**
 
-    什么时候调: 用户要写的那个品在 ``list_projects`` 里没有。
+    什么时候调: 用户要写的那个品在 ``list_projects`` 里没有, **带 include_archived=true 再查一遍也没有**
+    (list_projects 默认不列标成暂时不用的项目, 回头写旧品时它多半在那里面)。
 
     **调之前先 list_projects 看一眼** —— 已经有的项目不要重建。返回值里
     ``created`` 是 false 就说明撞名了, 库里没新建, 直接用返回的那个
-    project_id, 别改名重试。
+    project_id, 别改名重试。带 ``archived: true`` 的是撞上了标成暂时不用的同名项目: 照常用它(历史稿和规则都在
+    它里面), 用户要写的就是这个品就不用跟用户提它暂时不用。
 
     返回里带 ``siblings`` 时要停下来问用户: 说明这个品牌名下已经有别的项目
-    了。新项目是**独立的一套历史库**, 跟它们不互相查重 —— 如果本意是在已有
-    方向下继续写, 用那个已有项目才对。
+    了(带 ``archived: true`` 的那几个标成了暂时不用)。新项目是**独立的一套历史库**, 跟它们不互相查重 —— 如果本意是
+    在已有方向下继续写, 用那个已有项目才对。
 
     参数:
       name  —— 项目名, 建议带上方向, 例如「途鸽-D8薪资谈判」而不是光「途鸽」。
@@ -290,7 +292,8 @@ def list_projects(include_archived: bool = False, _user_id: str | None = None) -
     返回 project_id / 名称 / 品牌 / 已沉淀的硬规则与软偏好条数 / 历史成稿指纹数。
     不知道要写哪个项目时先调这个。
 
-    默认只列在用的项目; 标成暂时不用的项目不列, 返回里的 archived_hidden 是没列出来的个数(没有就不带)。
+    默认只列在用的项目; 标成暂时不用的项目不列, 返回里的 archived_hidden 是没列出来的个数(没有就不带, 有的时候
+    archived_hidden_note 一句话说怎么看它们)。
     用户要写的品在清单里找不到、而 archived_hidden 大于 0 时, 先带 include_archived=true 再调一次看看
     (那一份里暂时不用的项目带 archived: true), 找到了就用它, 别急着 create_project 建一个新的。
 
@@ -314,6 +317,7 @@ def list_projects(include_archived: bool = False, _user_id: str | None = None) -
                                               include_archived=bool(include_archived), report_sink=seen)}
         if seen.get("archived_hidden"):
             out["archived_hidden"] = seen["archived_hidden"]
+            out["archived_hidden_note"] = core.ARCHIVED_HIDDEN_NOTE.format(n=seen["archived_hidden"])
         return out
     return _safe(_list)
 
@@ -387,8 +391,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         ack_edit_digest。说完再开始写稿。
       · flywheel_arm —— 这场写作落在哪个对照组。存档时【原样】传给 score_drafts 的 flywheel_arm,
         别改、别跟用户提。
-      · archived —— 【有才出现】这个项目标成了暂时不用。简报照常给全; 照 archived_note 先跟用户确认一句
-        这次要写的就是这个项目, 确认了就照常写。
+      · archived —— 【有才出现】这个项目标成了暂时不用。简报照常给全。用户点名要写这个项目或这个品牌的就照常写,
+        不用跟用户提它暂时不用; 是你自己挑的这个项目(用户没点名), 照 archived_note 先跟用户确认一句这次要写的就是它。
 
     传入本次的 tactic / draft_topic / key_messages 会让正案例按【相关性】挑选
     (排不出相关性时按天轮换, 不会每次都是最近那几条 —— 那会让文风越写越窄)。所以知道要写什么就传。
@@ -400,7 +404,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     soft_rules 和 soft_rules_pool 【同时】为 0。只有后者才值得问一句。
 
     counts.angle_debt 大于 0 时, 返回里还会有 angle_debt / angle_debt_note: 这个项目近期发牌分到、
-    还没有对应稿子的坐标, angle_debt.angles 里是具体是哪几个。这是给你挑坐标用的: 用户这次要写的对得上
+    还没有对应稿子的坐标, angle_debt.angles 里是具体是哪几个(一小时以内刚发的不在里面 —— 一个团队共用一个身份,
+    那多半是队友正在写的牌)。这是给你挑坐标用的: 用户这次要写的对得上
     (比如要这个项目的一批稿、没点具体题目), 就优先按这些坐标写, 查重时带上各自的 angle_key, 不够再调
     draw_angles 补齐; 用户点了具体题目或角度就照用户的写。不用把这个数转告用户, 也不用问用户怎么处理。
 
@@ -682,11 +687,13 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
         拿不准的每条 -8, 有硬约束没判出来的每条 -10; 正文太短判不了的 score 为空(``why`` 里写着)。
       · ``fixes`` 是最该看的几条: ``sure=true`` 是 Jev 有把握的, ``sure=false`` 是拿不准、看一眼就行的。``more_fixes``
         是没列出的条数。``instruction`` 只说哪一句犯了哪条, 不给改法。
-      · **分数不用逐篇报给用户。** 没有 ``fixes`` 也没有 ``hard_fails`` 的稿子, 整批说一句「合规检查都过了」就行;
-        只把有 ``fixes`` 或 ``hard_fails`` 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条(``next_step`` 会点出
-        是哪几个 index)。``score`` / ``fixes`` 照旧都在返回里, 用户问起分数再说。用户要改哪篇: 按 fixes 改完, 那篇带
-        ``replaces_version_id`` 再调一次本工具(会重新打分)。改一轮就够, 不要为了分数反复重写。
-      · ``judge_status`` 不是 ok(超时、没配、被出境口径挡下)就说这篇这次没打成分, 不要重试, 存档照样成功了。
+      · **分数不用逐篇报给用户。** 这一批每篇都打成了分、而且都没有 ``fixes``、``hard_fails``、``unjudged`` 时, 整批说一句
+        「合规检查都过了」就行; 只把有 ``fixes`` 或 ``hard_fails`` 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条
+        (``next_step`` 会点出是哪几个 index)。只有 ``unjudged`` 的那几篇是有几道硬约束这次没判出来: 没有可改的地方, 但
+        **不能说都过了**, 跟用户提一句就行, 不影响交付, 不用重试。``score`` / ``fixes`` 照旧都在返回里, 用户问起分数再说。
+        用户要改哪篇: 按 fixes 改完, 那篇带 ``replaces_version_id`` 再调一次本工具(会重新打分)。改一轮就够, 不要为了分数
+        反复重写。
+      · ``judge_status`` 不是 ok(超时、没配、被出境口径挡下)就说这篇这次没打成分, 不能说过了, 也不要重试, 存档照样成功了。
 
     **改稿用 ``replaces_version_id`` 替换, 不要当新稿再存一次。** 值是上次返回的 ``version_ids`` 里对应的那个。存档
     会先摘掉旧版的指纹再查重, 所以不会撞上它自己; 成功后旧稿原地升成新版本, ``replaced`` 里列出来, ``version_ids``
@@ -701,7 +708,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     照 check_drafts 的规矩说。
 
     **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零就是有几条没带 —— 那几个角度没销账,
-    下一批还会被抽到。这时返回里还会带 ``angle_debt``: 你在这个项目当前还挂着的坐标, **下一批按它们写, 别再抽新的**。
+    下一批还会被抽到。这时返回里还会带 ``angle_debt``: 这个项目还没有对应稿子的坐标(一小时以内刚发的、查重时带过 key 的
+    不在里面), 用户接下来要写的对得上就优先按它们写, 查重时带上它的 angle_key; 用户点了具体题目就照用户的写。
     ``angle_key`` 要**原样复制** draw_angles 给的那个(prompt_block 里这一篇那行方括号里的 20 位十六进制串), 不要自己编号、
     缩写或改写: ``unknown_angle_keys`` 非零是有几篇带的 key 这个项目的台账里没有, ``used_angle_keys`` 非零是有几篇带的 key
     已经销给了别的稿子(一个 key 只给一篇),

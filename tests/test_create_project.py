@@ -229,6 +229,90 @@ def test_no_brand_means_no_sibling_lookup():
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 标成暂时不用的项目(2026-10-30 复审)
+#
+# list_projects 默认不列它们, 回头写旧品的写手在清单里找不到, 模型照「清单里没有就建」建出一个空的同名项目 —— 历史稿、
+# 规则都在旧的那个里, 新的从零开始, 两边互不查重。建之前再找一遍, 撞上了就回它。
+# ══════════════════════════════════════════════════════════════════════
+
+_IDLE = '{"archived": true}'
+
+
+def test_the_same_name_as_an_idle_project_returns_it_and_says_it_is_idle():
+    sb = _client([{"id": "p-idle", "name": "示例运动", "brand": "示例", "owner_id": ME, "default_params": _IDLE}])
+    out = core.create_project(sb, "示例运动", brand="示例", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-idle" and out["archived"] is True
+    assert len(sb.rows["projects"]) == 1, "撞上暂时不用的同名项目还是建了第二个"
+    note = out["note"]
+    assert "暂时不用" in note and "直接用这个" in note and "open_project" in note, note
+    assert "不用跟用户提" in note, "用户要写的就是这个品, 不用让他知道它被标过"
+
+
+@pytest.mark.parametrize("existing, asked", [
+    ("示例运动-产品向", "示例运动 产品向"),        # 分隔符换成空格
+    ("示例运动-产品向", "示例运动—产品向"),        # 换成破折号
+    ("Ｓｐｏｒｔ-Ａ", "sport a"),                 # 全角 + 大小写 + 分隔符
+    ("示例运动 · 产品向", "示例运动产品向"),       # 中点和空格
+])
+def test_an_idle_project_whose_name_differs_only_in_spelling_is_returned(existing, asked):
+    sb = _client([{"id": "p-idle", "name": existing, "brand": "示例", "owner_id": ME, "default_params": _IDLE}])
+    out = core.create_project(sb, asked, user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-idle" and out["archived"] is True, out
+    assert out["name"] == existing, "回的是库里那个项目的名字"
+    assert len(sb.rows["projects"]) == 1
+
+
+def test_an_idle_namesake_under_another_brand_does_not_block_a_new_project():
+    """给了品牌时品牌也要对得上: 同名不同品是另一个东西。"""
+    sb = _client([{"id": "p-idle", "name": "示例运动-产品向", "brand": "别的品", "owner_id": ME,
+                   "default_params": _IDLE}])
+    out = core.create_project(sb, "示例运动 产品向", brand="示例", user_id=ME)
+    assert out["created"] is True and out["project_id"] != "p-idle"
+
+
+def test_someone_elses_idle_project_is_never_returned():
+    sb = _client([{"id": "p-other", "name": "示例运动-产品向", "brand": "示例", "owner_id": OTHER,
+                   "default_params": _IDLE}])
+    out = core.create_project(sb, "示例运动 产品向", brand="示例", user_id=ME)
+    assert out["created"] is True and out["project_id"] != "p-other"
+
+
+def test_a_live_project_wins_over_an_idle_one_with_the_same_name():
+    sb = _client([{"id": "p-a", "name": "示例运动", "brand": "示例", "owner_id": ME, "default_params": _IDLE},
+                  {"id": "p-b", "name": "示例运动", "brand": "示例", "owner_id": ME}])
+    out = core.create_project(sb, "示例运动", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-b" and "archived" not in out
+
+
+def test_live_projects_still_need_the_exact_name():
+    """只有暂时不用的项目放宽了写法(模型在清单里看不见它们); 在用的照旧按原来的判据(大小写、首尾空格)。"""
+    sb = _client([{"id": "p-live", "name": "示例运动-产品向", "brand": "示例", "owner_id": ME}])
+    out = core.create_project(sb, "示例运动 产品向", brand="示例", user_id=ME)
+    assert out["created"] is True
+
+
+def test_idle_siblings_are_marked():
+    sb = _client([{"id": "p-idle", "name": "示例-旧方向", "brand": "示例", "owner_id": ME, "default_params": _IDLE},
+                  {"id": "p-live", "name": "示例-在用", "brand": "示例", "owner_id": ME}])
+    out = core.create_project(sb, "示例-新方向", brand="示例", user_id=ME)
+    assert out["created"] is True
+    by_id = {s["project_id"]: s for s in out["siblings"]}
+    assert by_id["p-idle"].get("archived") is True and "archived" not in by_id["p-live"]
+
+
+def test_the_tool_says_to_look_with_include_archived_before_creating():
+    doc = tools.create_project.__doc__ or ""
+    assert "include_archived=true 再查一遍也没有" in doc, "清单默认不列暂时不用的项目, 先带上它再看"
+    assert "archived: true" in doc
+
+
+def test_idle_project_replies_are_writer_safe():
+    from tests.test_writer_facing_text import _assert_writer_safe
+    sb = _client([{"id": "p-idle", "name": "示例运动", "brand": "示例", "owner_id": ME, "default_params": _IDLE}])
+    _assert_writer_safe(core.create_project(sb, "示例 运动", user_id=ME), "create_project[idle]")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 失败不许降级
 # ══════════════════════════════════════════════════════════════════════
 

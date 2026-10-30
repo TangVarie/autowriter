@@ -222,8 +222,8 @@ UNGATED_WITH_REASON = {
     "_recent_angle_key_misses": "W-31(10-27), 只被 archive_pending 调(见上): 读进程内存里调用者自己的那一笔, 不读写库",
     "_record_snapshots":      "W-38(10-29), 只被 check_drafts 在过了归属闸、判定算完之后调: 把这次查重的稿子记进 draft_snapshots"
                               "(本项目、调用者自己), 失败只记 WARN",
-    "_checked_angle_keys":    "W-38(10-29), 只被已过闸的 build_writing_brief 调: 读调用者自己在本项目查重时带过的 "
-                              "angle_key(draft_snapshots), 不写库",
+    "_checked_angle_keys":    "W-38(10-29), 只被已过闸的 build_writing_brief 和 commit_drafts(存档后的 angle_debt, 10-30 复审)调: "
+                              "读调用者自己在本项目查重时带过的 angle_key(draft_snapshots), 不写库",
     "_supersede_snapshots":   "W-38 复审(10-29), 只被已过闸的 commit_drafts 调: 把它刚存成版本的那几篇, 本项目里同样文字的底稿"
                               "记成已转正, 失败只记 WARN",
     "_snapshot_version_id":   "W-38(10-29), 纯函数: (项目, text_fp) → 转正版本的 uuid5, 不读写库",

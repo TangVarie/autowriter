@@ -243,6 +243,32 @@ def test_a_zero_score_hit_on_the_old_version_is_dropped_without_pulling_history(
                 "ngram_hashes": fp.ngram_hashes(BODY_A), "title_embedding": None, "embedding_model": None}]}
     hit = core.HistHit(0.0, None, 0.0, "秋招等回音", False, None, 0.0, None, 0)
     monkeypatch.setattr(store, "fingerprints", lambda *a, **k: pytest.fail("值是 0 的那一路不该重拉历史"))
-    probe = core._without_own_versions(object(), PROJ, lambda i: hit, own, [fp.opening_hash(BODY_C)],
-                                       [set(fp.ngram_hashes(BODY_C))], None)
+    probe, cap = core._without_own_versions(object(), PROJ, lambda i: hit, own, [fp.opening_hash(BODY_C)],
+                                            [set(fp.ngram_hashes(BODY_C))], None)
     assert probe(0).j_title is None and probe(0).jac == 0.0
+    assert cap == 0, "没拉历史就谈不上截断"
+
+
+def test_a_truncated_recheck_on_the_pushdown_path_says_so(monkeypatch):
+    """库里那一路比的是全量, 但改稿那几篇排除旧版重比时要把历史拉回来(store.fingerprints 有条数上限)。拉不全的时候原来
+    只记一行日志、history_truncated 照报 False —— 写手听不到「更早的没参与查重」(2026-10-30 复审)。上限调到 1 条来钉。"""
+    c, v1 = _archived("rpc")
+    _ingested(c, "飞书上的另一篇", BODY_A, opening_hash="0" * 16)      # 同 body 那条: 一定要重拉历史
+    real = store.fingerprints
+    monkeypatch.setattr(store, "fingerprints", lambda *a, **k: real(*a, **{**k, "limit": 1}))
+    out = core.check_drafts(c, PROJ, [{"title": "秋招等回音", "body": BODY_A2, "replaces_version_id": v1}], user_id=ME)
+    summ = out["summary"]
+    assert summ["history_truncated"] is True, summ
+    warn = summ["history_truncated_warning"]
+    assert "改过的那几篇这次只和最近的 1 篇比了" in warn and "更早的没参与查重" in warn, warn
+    assert summ["history_size"] == 2, "history_size 照旧是库里的全量"
+    from tests.test_writer_facing_text import _assert_writer_safe
+    _assert_writer_safe(summ, "check_drafts[revision truncated]")
+
+    # 不截断(默认上限)、新稿(不重拉)都照旧是 False
+    monkeypatch.setattr(store, "fingerprints", real)
+    again = core.check_drafts(c, PROJ, [{"title": "秋招等回音", "body": BODY_A2, "replaces_version_id": v1}],
+                              user_id=ME)["summary"]
+    assert again["history_truncated"] is False and "history_truncated_warning" not in again
+    fresh = core.check_drafts(c, PROJ, [{"title": "一篇新稿", "body": BODY_C}], user_id=ME)["summary"]
+    assert fresh["history_truncated"] is False

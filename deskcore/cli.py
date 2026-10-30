@@ -26,7 +26,8 @@
                                                       rule_compiles(check_rules 用; 后台也会自己补编)
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
                                                     ← TV 的笔记按内容对到写作台的版本,
-                                                      对不上的补进指纹库(每天跑一次)
+                                                      对不上的补进指纹库(每天跑一次); --all 跑完
+                                                      顺手补缺的标题向量(每晚最多 200 行)
                                                     ← 把已发出去、没走 commit 的稿子
                                                       从飞书表补进指纹库(不过闸)
 
@@ -463,7 +464,31 @@ def _tv_sync(core, sb, args) -> int:
         else:
             if pruned:
                 print(f"\n查重底稿: 删了 {pruned} 行超过 {core.SNAPSHOT_RETAIN_DAYS} 天的")
+        rc = max(rc, _tv_sync_reembed(core, sb))
     return rc
+
+
+def _tv_sync_reembed(core, sb) -> int:
+    """同步完顺手补标题向量(core.reembed_after_sync, 每晚最多 TV_SYNC_REEMBED_MAX 行)。回这一段该给的退出码。
+    放在所有同步之后、单独兜住: 补不成只报警告 + 退出码 1, 这晚写进去的对照一行不动。"""
+    try:
+        rv = core.reembed_after_sync(sb)
+    except Exception as exc:                            # noqa: BLE001
+        print(f"\n⚠️ 标题向量没补成: {type(exc).__name__}: {exc} —— 对照照常写了; 明晚再补。")
+        return 1
+    if rv.get("skipped"):
+        print("\n标题向量: 这个部署没配 embedding(GOOGLE_API_KEY), 没补。")
+        return 0
+    if not rv.get("pending"):
+        return 0
+    print(f"\n标题向量(每晚最多补 {core.TV_SYNC_REEMBED_MAX} 行): 补了 {rv['fixed']}/{rv['pending']} 行"
+          f"(项目 {rv['projects']} 个; 缺向量 {rv['missing_vector']}, 换模型作废 {rv['stale_model']})"
+          + (f", {rv['failed']} 行没补上" if rv.get("failed") else "")
+          + ("; 没轮到的明晚接着补" if rv.get("capped") else ""))
+    if rv.get("error"):
+        print(f"  ⚠️ {rv['error']} —— 对照照常写了; 这几行明晚再补, 连着几晚都这样就查 embedding 的 key / 配额。")
+        return 1
+    return 0
 
 
 def _print_tv_drift(out: dict, tv: str) -> int:

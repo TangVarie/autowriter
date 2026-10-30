@@ -86,10 +86,45 @@ def test_warning_names_the_outstanding_coordinates_not_just_a_count():
     keys = [a["angle_key"] for a in out["angle_debt"]["angles"]]
     assert set(keys) == {"k1", "k2", "k3"}
     warn = out["unattributed_warning"]
-    assert "3 个抽了没写的坐标" in warn
+    assert "还有 3 个没有对应的稿子" in warn
     assert "angle_debt.angles" in warn
-    # 还要说清下一步, 否则模型照样再抽一批。
-    assert "别再抽一批新的" in warn
+    # 还要说清下一步, 否则模型照样再抽一批。2026-10-30 复审: 照简报那句的写法 —— 对得上就优先按它们写、查重时带上
+    # key; 说「这个项目」不说「你」(一个团队共用一个身份); 不叫「别再抽一批新的」(用户点了题目就照用户的写),
+    # 不提放弃, 也不说存档。
+    assert "优先按这些坐标写" in warn and "查重时带上它的 angle_key" in warn
+    tail = warn[warn.index("这个项目近"):]
+    for banned in ("别再抽", "放弃", "你在这个项目", "你抽", "存档", "下一批按它们写"):
+        assert banned not in tail, (banned, tail)
+
+
+# ── 刚抽的牌不列(2026-10-30 复审, 同简报 core.ANGLE_DEBT_MIN_AGE) ──
+# 一个团队共用一个身份: 一小时以内抽的多半是队友正在写的牌, 叫这一场「优先按它们写」就是两个人写同一张牌。
+
+MINUTES = 1 / (24 * 60)
+
+
+def test_a_card_drawn_minutes_ago_is_not_listed_after_commit():
+    c = _client([_angle(1, days_ago=5 * MINUTES)])
+    out = core.commit_drafts(c, PROJ, [{"title": "没带", "body": BODY_A}], user_id=ME)
+    assert out["unattributed"] == 1
+    assert "angle_debt" not in out, "刚抽的牌不算欠账"
+    assert out["unattributed_warning"].endswith("angle_key。"), "没有可列的就不接那一截"
+
+
+def test_a_card_drawn_two_hours_ago_is_listed_after_commit():
+    c = _client([_angle(1, days_ago=5 * MINUTES), _angle(2, days_ago=2 / 24)])
+    out = core.commit_drafts(c, PROJ, [{"title": "没带", "body": BODY_A}], user_id=ME)
+    assert out["angle_debt"]["unconsumed"] == 1
+    assert [a["angle_key"] for a in out["angle_debt"]["angles"]] == ["k2"]
+    assert "一小时以内刚发的多半有人正在写" in out["unattributed_warning"]
+
+
+def test_cards_checked_with_their_key_are_not_listed_after_commit(monkeypatch):
+    """查重时带过 key 的牌, 稿子已经写出来了(W-38): 和简报一样不列, 不然「优先按这些坐标写」会把同一个角度再写一遍。"""
+    monkeypatch.setattr(core, "_checked_angle_keys", lambda *a, **k: {"k1": store.iso_now()})
+    c = _client([_angle(1, days_ago=1), _angle(2, days_ago=1)])
+    out = core.commit_drafts(c, PROJ, [{"title": "没带", "body": BODY_A}], user_id=ME)
+    assert [a["angle_key"] for a in out["angle_debt"]["angles"]] == ["k2"]
 
 
 def test_debt_is_computed_after_this_batch_settles_its_own_angles():
@@ -247,8 +282,11 @@ def test_keys_the_ledger_has_never_seen_are_counted_named_and_explained():
     assert "angle_ledger_warning" not in out
     # 还挂着的两张牌一并回去, 但不叫它「按它们写」—— 那两张对应的稿子刚存过
     assert {a["angle_key"] for a in out["angle_debt"]["angles"]} == {_hex(1), _hex(2)}
-    assert "别按这些坐标再写一遍" in warn and "下一批按它们写" not in warn
+    assert "别按这些坐标再写一遍" in warn and "下一批按它们写" not in warn and "优先按这些坐标写" not in warn
     assert "unattributed_warning" not in out
+    # 说「这个项目」不说「你」, 也不再叫模型存档时从挂着的牌里找 key(一小时以内刚抽的不在里面, 照 draw_angles 的带)
+    key_tail = warn[warn.index("这个项目近"):]
+    assert "你在这个项目" not in key_tail and "存档时从里面找" not in key_tail, key_tail
 
 
 def test_a_key_already_spent_on_another_draft_is_reported_as_used():
@@ -429,7 +467,7 @@ def test_unattributed_and_bad_keys_in_one_batch_do_not_give_opposite_orders():
     assert {a["angle_key"] for a in out["angle_debt"]["angles"]} == {_hex(1), _hex(2)}, "挂着的牌照样回去"
     assert "别按这些坐标再写一遍" in out["angle_key_warning"]
     for k, v in out.items():
-        assert "下一批按它们写" not in repr(v), k
+        assert "下一批按它们写" not in repr(v) and "优先按这些坐标写" not in repr(v), k
 
 
 def test_an_open_row_wins_over_a_spent_row_for_the_same_key():

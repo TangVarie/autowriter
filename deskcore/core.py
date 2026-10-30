@@ -36,6 +36,7 @@ import random
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple, Optional
@@ -72,6 +73,18 @@ ANGLE_DEBT_DAYS = 7
 # 只是对不回来、销不了账。拿它们当「抽了没写」报, 每场开头都是一串其实写过的坐标。简报的 angle_debt、存档后的
 # angle_debt、archive_pending 都按这个下限数; 一周之后它自然落到 7 天窗口外面, 不用再改。
 ANGLE_DEBT_SINCE = "2026-10-29T08:26:00+00:00"
+# 刚抽的牌不算欠账(2026-10-30 发布收尾复审)。一个团队共用一个身份(同一个 user_id), 分不出牌是谁抽的: 队友几分钟前刚抽、
+# 正在写的牌, 原来会出现在另一个写手新开那场的简报里, 模型照「优先按这些坐标写」再写一遍 —— 两个人写同一张牌。抽牌到查重
+# 通常只隔几分钟, 查过重的已经按 W-38 的底稿排除了(_checked_angle_keys), 所以只数抽了一小时以上的; 断掉的那场过一小时
+# 再开, 它的牌照样在里面。简报的 angle_debt 和存档后的 angle_debt 都按它截; archive_pending 不截(那里管的就是这一场
+# 刚抽的牌, 见 ARCHIVE_PENDING_DAYS)。
+ANGLE_DEBT_MIN_AGE = timedelta(hours=1)
+
+
+def _angle_debt_until() -> str:
+    """简报 / 存档后数欠账的上界: 比它晚抽的(一小时以内)不算, 见 ANGLE_DEBT_MIN_AGE。"""
+    return (datetime.now(timezone.utc) - ANGLE_DEBT_MIN_AGE).isoformat()
+
 
 # 交付前没存档的牌(W-29, 2026-10-23)。10-20~10-22 途鸽五轮 73 张、百健士一轮 24 张牌全没存档: 每一轮 open_project /
 # draw_angles / 1~3 次 check_drafts 都回了 200, 然后调用方就不再调写作台了, score_drafts 一次都没到库。和 W-06 同一个
@@ -104,9 +117,10 @@ def _supersede_snapshots(client, project_id: str, drafts: list[dict], vids: dict
 
 
 # W-38(2026-10-29): 查重时带过 angle_key 的牌不算「抽了没写」—— 稿子已经写出来、查过重(draft_snapshots), 发出去以后
-# tv-sync 从飞书对回来销账。再把它们报成欠账, 模型会按同一张牌再写一篇。只有简报的 angle_debt 按这个口径数(新开一场对话时
-# 列出来让模型「按它们写」的那份); 入库后的 angle_debt 和 archive_pending 不排除 —— 那两处是在叫模型给手上的稿子存档、
-# 带上分给它的 key, 刚查过的牌正该在里面(W-38 复审)。只排除最近一次查重没被打回的(store.snapshotted_angle_keys), 也只排除
+# tv-sync 从飞书对回来销账。再把它们报成欠账, 模型会按同一张牌再写一篇。简报的 angle_debt 和存档后的 angle_debt 都按这个
+# 口径数(两处都是叫模型「优先按这些坐标写」的那份; 存档后那份原来不排除, 是因为那句话叫模型给手上的稿子存档、带上分给它的
+# key —— 2026-10-30 复审改成和简报同一句话、不再说存档, 刚查过的牌也就不该再列); archive_pending 不排除 —— 它是在叫模型给
+# 手上的稿子存档, 刚查过的牌正该在里面(W-38 复审)。只排除最近一次查重没被打回的(store.snapshotted_angle_keys), 也只排除
 # 那次查重之前抽的: 同一张牌之后又抽到的那一次还没写, 照旧算欠着(codex on aw#132)。
 def _checked_angle_keys(client, project_id: str, user_id: str | None, days: int) -> dict[str, str]:
     return {k: at for k, at in store.snapshotted_angle_keys(client, project_id, user_id, days).items()
@@ -116,10 +130,12 @@ def _checked_angle_keys(client, project_id: str, user_id: str | None, days: int)
 def _angle_debt_note(days: int, n: int, last_drawn_at, shown: int, more: int) -> str:
     """简报里 angle_debt_note 那句话(2026-10-30 发布收尾)。说给模型听的: 这个项目发牌分到、还没有稿子的坐标, 用户这次
     要写的对得上就优先按它们写。不叫模型把数字转告用户、不问「接着写还是放弃」(那不是写手该拍板的事), 不说「你抽了」
-    (一个团队共用一个身份), 也不提存档(写手没有这一步, D-120; 存档的事 draw_angles / check_drafts 的 archive_pending 会说)。"""
+    (一个团队共用一个身份), 也不提存档(写手没有这一步, D-120; 存档的事 draw_angles / check_drafts 的 archive_pending 会说)。
+    一小时以内抽的不在里面(ANGLE_DEBT_MIN_AGE): 多半有人正在写。"""
     return (
         f"这个项目近 {days} 天发牌分到的坐标里, 有 {n} 个还没有对应的稿子(最近一次发牌 {last_drawn_at}; "
-        "查重时带过 angle_key 的已经写出来了, 不在这里面)。用户这次要写的对得上(比如要这个项目的一批稿、没点具体题目), "
+        "查重时带过 angle_key 的已经写出来了, 一小时以内刚发的多半有人正在写, 都不在这里面)。"
+        "用户这次要写的对得上(比如要这个项目的一批稿、没点具体题目), "
         "就优先按这些坐标写, 不够再调 draw_angles 补齐; 用户点了具体题目或角度, 就照用户的写, 这些坐标放着就行。"
         + (f"坐标在 angle_debt.angles 里(列了 {shown} 个" + (f", 还有 {more} 个没列" if more > 0 else "")
            + "), 按哪个写, 查重时就带上它的 angle_key。" if shown else "")
@@ -507,10 +523,12 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         "positive_selection_mode": pos_mode,
     }
     # 归档的项目照开(2026-10-30, 见 project_archived 上面那段): 简报一样不少, 只多一个机器字段和一句给模型的话 ——
-    # 先跟用户确认是不是这个项目。项目行上面已经取了, 不多查。
+    # 用户点名了就照常写, 模型自己挑的才确认。项目行上面已经取了, 不多查。
     if project_archived(project):
         out["archived"] = True
         out["archived_note"] = ARCHIVED_NOTE.format(name=project.get("name") or project_id)
+        logger.info("open_project: 打开了标成暂时不用的项目 %s「%s」 —— 常有人写的话考虑撤销归档",
+                    project_id, project.get("name") or "")
 
     # ── 飞轮经验卡: 随简报一起借, 不再等模型自己想起来 ──────────────────
     # 2026-09-19 查生产库: 9 月 1-16 日写作台 commit 了 71 批稿子, 馆员缓存里
@@ -543,10 +561,11 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # 2026-10-30 发布收尾: 原来那句是叫模型把这个数说给用户、问「接着写完还是放弃」—— 可那时数出来的大多是 W-38 之前
     # 写完发出去、只是对不回来的牌(见 ANGLE_DEBT_SINCE), 写手每场开头都被问一遍自己做不了主的事。现在只数下限之后的,
     # 话也改成说给模型听的: 用户这次要写的对得上就优先按它们写, 不转告、不问用户。一个团队共用一个身份(同一个 user_id),
-    # 所以说「这个项目」, 不说「你抽了」。
+    # 所以说「这个项目」, 不说「你抽了」; 也因为共用身份, 一小时以内抽的不数(ANGLE_DEBT_MIN_AGE): 那多半是队友正在写的牌。
     # ⚠️ 和借卡同一条纪律: 这一段的失败绝不能影响简报, 兜住但留痕。
     try:
         debt = store.angle_debt(client, project_id, user_id, ANGLE_DEBT_DAYS, since=ANGLE_DEBT_SINCE,
+                                until=_angle_debt_until(),
                                 exclude_keys=_checked_angle_keys(client, project_id, user_id, ANGLE_DEBT_DAYS))
     except Exception:
         logger.exception("angle debt lookup failed (project=%s)", project_id)
@@ -844,6 +863,8 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                    grams: list[set], new_vecs, *, own: dict[int, list[dict]] | None = None):
     """返回 ``(probe, hist_size, hist_with_vec, hist_untitled, hist_truncated)``。
 
+    ``hist_truncated`` 是个数(2026-10-30 复审): 0 = 比全了; 大于 0 = 有比对只拿到了最近的这么多条历史(Python 路径是整批;
+    下推路径只会是改稿那几篇排除旧版重比时, 见 _without_own_versions)。
     ``probe(i)`` → ``HistHit`` —— 第 i 篇草稿与【历史】比对的四路最佳命中。
     ``hist_untitled`` 是空标题、也没有向量的历史条数: 它们永远算不出标题向量, 不算"缺"
     (见 store.fingerprint_stats 的说明), 由 _gate 从缺向量的数里减掉。
@@ -944,11 +965,13 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                 int(r.get("c_sample") or 0),
             )
 
-        # 下推路径比的是【全量】—— 库里没有 4000 条那个上限, 所以永不截断。
+        # 下推路径比的是【全量】—— 库里没有 4000 条那个上限, 所以库里那一路永不截断。改稿那几篇排除旧版重比时要把历史
+        # 拉回 Python(store.fingerprints, 同样 4000 条上限), 那一步截了就照实带出去(2026-10-30 复审: 原来只记日志,
+        # history_truncated 恒为 False, 写手听不到「更早的没参与查重」)。
         if own:
-            return (_without_own_versions(client, project_id, _probe, own, o_hashes, grams, new_vecs),
-                    total, with_vec, untitled, False)
-        return _probe, total, with_vec, untitled, False
+            probe, cap = _without_own_versions(client, project_id, _probe, own, o_hashes, grams, new_vecs)
+            return probe, total, with_vec, untitled, cap
+        return _probe, total, with_vec, untitled, 0
 
     logger.warning(
         "deskcore_check_drafts RPC 不存在(migrations/004 没跑) —— 本次退回 "
@@ -956,6 +979,7 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
     _rpc_missing_telemetry("deskcore_check_drafts", project_id)
 
     history, truncated = store.fingerprints(client, project_id)
+    hist_cap = len(history) if truncated else 0
     hist_grams = [set(h.get("ngram_hashes") or []) for h in history]
     hist_open = {h.get("opening_hash"): h for h in history if h.get("opening_hash")}
     # ⚠️ 只把**本模型**产的向量算进比对。跨模型算余弦出来的数是垃圾, 而且
@@ -1020,8 +1044,8 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                 return _probe_py(i)
             return _best_hits([x for x in rest if str(x[0].get("id")) not in skip[i]],
                               o_hashes[i], grams[i], _vec_at(new_vecs, i))
-        return _probe_py_own, len(history), with_vec, untitled, truncated
-    return _probe_py, len(history), with_vec, untitled, truncated
+        return _probe_py_own, len(history), with_vec, untitled, hist_cap
+    return _probe_py, len(history), with_vec, untitled, hist_cap
 
 
 def _vec_at(new_vecs, i: int):
@@ -1080,7 +1104,10 @@ SKETCH_TIE_EPS = 1e-9       # sketch 的两个比值两边都是整数相除, �
 
 def _without_own_versions(client, project_id: str, probe, own: dict[int, list[dict]],
                           o_hashes: list[str], grams: list[set], new_vecs):
-    """库里那一路的 ``probe`` → 改稿那几篇不算旧版之后的 ``probe``(见上面那段说明)。出错照样上抛: 查重是硬闸。"""
+    """库里那一路的 ``probe`` → 改稿那几篇不算旧版之后的 ``(probe, 截断)``(见上面那段说明)。出错照样上抛: 查重是硬闸。
+
+    截断(2026-10-30 复审): 重比要把历史拉回来(store.fingerprints, 有条数上限), 拉不全时回实际比了的条数, 否则 0;
+    _history_probe 原样交给 _gate, 写手那边照 history_truncated 的规矩说一句「更早的没参与查重」。"""
     fixed: dict[int, HistHit] = {}
     redo: dict[int, set[str]] = {}
     own_ids: dict[int, set[str]] = {}
@@ -1119,9 +1146,11 @@ def _without_own_versions(client, project_id: str, probe, own: dict[int, list[di
             fixed[i] = fixed[i]._replace(open_exact=other is not None,
                                          open_title=(other.get("title") or "") if other is not None else None)
     heavy = {s for sig in redo.values() for s in sig} - {"opening"}
+    cap = 0
     if heavy:
         history, truncated = store.fingerprints(client, project_id, vectors="title" in heavy)
         if truncated:
+            cap = len(history)
             logger.warning("check_drafts: 改稿排除旧版时项目 %s 的历史指纹超过 %d 条, 重比只覆盖了最近的这些",
                            project_id, len(history))
         prepped = _sketch_rows(history)
@@ -1140,7 +1169,7 @@ def _without_own_versions(client, project_id: str, probe, own: dict[int, list[di
             fixed[i] = fixed[i]._replace(**patch)
         logger.info("check_drafts: 改稿 %d 篇排除了旧版重比(project=%s, 信号=%s, 历史 %d 行)",
                     len(redo), project_id, sorted(heavy), len(history))
-    return lambda i: fixed[i] if i in fixed else probe(i)
+    return (lambda i: fixed[i] if i in fixed else probe(i)), cap
 
 
 def _rpc_missing_telemetry(name: str, project_id: str) -> None:
@@ -1381,7 +1410,7 @@ def _gate(client, project_id: str, titles: list[str], bodies: list[str],
         "history_missing_embedding": hist_missing_vec,
         # 空标题、没向量的历史条数: 不算在 history_missing_embedding 里(见上面降级判定那段)
         "history_untitled": hist_untitled,
-        "history_truncated": hist_truncated,
+        "history_truncated": bool(hist_truncated),
         "semantic_degraded": degraded,
         "containment_checked": contain_ran,
     }
@@ -1395,11 +1424,16 @@ def _gate(client, project_id: str, titles: list[str], bodies: list[str],
         summary["containment_skipped_warning"] = (
             "「短稿整段照搬长稿」这一路这次没查成(多半是草稿和历史稿长短差太多, 能比的字数不够), "
             "另外三路照常查了; 整段照搬一篇长稿的重复这次可能漏掉。已记下, 交付照常, 不用你做什么。")
-    if hist_truncated:
+    if hist_truncated and hist_truncated < hist_size:
+        # 下推路径(hist_size 是库里的全量条数): 库里那一路比的是全量, 只有改稿那几篇排除旧版重比时把历史拉回来、拉不全
+        # (2026-10-30 复审; _without_own_versions 已经记了日志)。只有那几篇少比了更早的。
+        summary["history_truncated_warning"] = (
+            f"这个项目的历史稿超过 {hist_truncated} 篇, 改过的那几篇这次只和最近的 {hist_truncated} 篇比了, "
+            "更早的没参与查重。已记下, 交付照常, 不用你做什么。")
+    elif hist_truncated:
         # history_size 报的是【实际比过的条数】, 但项目的历史比这更多。
         # 不说出来的话, "比对全量历史" 就成了一句假话。
-        # 下推路径不会走到这里(库里是全量比的, hist_truncated 恒为 False),
-        # 只有 migrations/004 没跑、退回 Python 路径时才可能命中。
+        # 只有 migrations/004 没跑、退回 Python 路径时才走到这里(整批都只比了最近的这些)。
         logger.warning("check_drafts: 项目 %s 的历史指纹超过 %d 条, 只比了最近的这些 —— 退回了 Python 路径"
                        "(migrations/004 没跑?), 长期解法是把比对下推到数据库(docs/deskcore.md §7)",
                        project_id, hist_size)
@@ -1626,11 +1660,14 @@ def _restore_stash(client, stash: dict[int, list[dict]], indices) -> None:
 # 2026-10-30 发布收尾: 不再叫模型逐篇报分数。10 月存档的 234 篇里 231 篇是 100 分, 「每篇多少分」写手听到的几乎全是
 # 一串 100, 真要改的那一两篇反而淹在里面。现在只说要改的那几篇(哪一句、犯了哪条), 其余整批一句「合规检查都过了」;
 # score / fixes 照旧都在 judge.results 里(指标、改稿对照要用), 只是不念。具体是哪几篇由 _score_report_step 写进 next_step。
+# 2026-10-30 复审: 「合规检查都过了」只在每篇都打成了分、而且都没有 fixes / hard_fails / unjudged 时说。只有 unjudged 的
+# (有几道硬约束 Jev 这次没判出来)没有可改的地方, 但也不能说过了 —— 单独一句; 没打成分的(超时 / 跳过)从来不算过。
 SCORE_NOTE = ("参考分: 不拦交付, 也不改 written / rejected。score 满分 100, 只看篇级硬约束(平台合规题 + 特征题库里的"
-              "合规题), 文笔好坏不在里面。分数不用逐篇报给用户: 没有 fixes 也没有 hard_fails 的稿子, 整批说一句「合规检查都过了」"
-              "就行; 只把有 fixes 或 hard_fails 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条(sure=false 的是 Jev "
-              "拿不准的, 看一眼就行, 不一定要改)。用户要改, 按 fixes 改完带 replaces_version_id 再调一次 score_drafts, "
-              "改一轮就够, 不要为了分数反复重写。judge_status 不是 ok 就说这篇这次没打成分, 不用重试。")
+              "合规题), 文笔好坏不在里面。分数不用逐篇报给用户: 这一批每篇都打成了分、而且都没有 fixes、hard_fails、unjudged, "
+              "才整批说一句「合规检查都过了」; 只把有 fixes 或 hard_fails 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条"
+              "(sure=false 的是 Jev 拿不准的, 看一眼就行, 不一定要改)。只有 unjudged 的那几篇是有几道硬约束这次没判出来, "
+              "不能说都过了, 跟用户提一句就行(不影响交付, 不用重试)。用户要改, 按 fixes 改完带 replaces_version_id 再调一次 "
+              "score_drafts, 改一轮就够, 不要为了分数反复重写。judge_status 不是 ok 就说这篇这次没打成分, 不能说过了, 不用重试。")
 JUDGE_SHADOW_NOTE = SCORE_NOTE          # 旧名, 老测试 / 老调用方还在 import
 
 # score_drafts 的 next_step 开头那句(存档成功才有)。判定在它之后才跑, 跑完由 _with_score_report 在它后面接上
@@ -1644,16 +1681,23 @@ def _score_report_step(judge: dict | None) -> str:
     · 有 fixes 或 hard_fails 的(``more_fixes`` 也算: 修改单截掉了的那几条同样要改): 点出是 judge.results 里哪几个
       index, 只说这几篇, 照 fixes 说清哪一句、犯了哪条; 没有 fixes 的说 hard_fails 里是哪一条没过(依据句在修改单里,
       hard_fails 里不重复一份)。不报分数。
-    · 判了、什么都没查出来的(只有 ``unjudged`` 的也在这里: 没有一处可改的地方): 整批一句「合规检查都过了」, 不报分数。
-    · 没打成分的(judge_status 不是 ok、正文太短、跳过的): 一句带过, 不用重试。这一句**不看是哪种失败** —— 没接判定、
-      超时、出境口径挡下, 回包除了 judge 块之外一个字都不变(test_commit_result_is_identical_whatever_the_judge_does)。
+    · 只有 ``unjudged`` 的(有几道硬约束 Jev 这次没判出来, 2026-10-30 复审): 没有一处可改的地方, 但也不能说过了 —— 点出
+      是哪几个 index, 单独一句「有几道硬约束这次没判出来, 不能说都过了; 不影响交付, 不用重试」。
+    · 判了、什么都没查出来的: 只有在**这一批每篇都是这样**(没有要改的、没有没判出来的、没有没打成分的)时, 才叫模型整批
+      说一句「合规检查都过了」; 混着别的情形时只说「(另外 / 这) N 篇没查出要改的地方」, 不用这句话 —— 模型照念的「都过了」
+      会把没判全、没打成分的那几篇一起说成过了。不报分数。
+    · 没打成分的(judge_status 不是 ok、正文太短、跳过的): 一句带过, 不用重试, 从来不算过。这一句**不看是哪种失败** ——
+      没接判定、超时、出境口径挡下, 回包除了 judge 块之外一个字都不变(test_commit_result_is_identical_whatever_the_judge_does)。
     纯函数, 不抛: 判定块是怎么来的(整批失败时只有 error、没有 results)都能写出一句。
     """
     judge = judge if isinstance(judge, dict) else {}
     rows = [r for r in (judge.get("results") or []) if isinstance(r, dict)]
     scored = [r for r in rows if r.get("judge_status") == judge_client.JUDGE_OK and r.get("score") is not None]
-    flagged = [r for r in scored if r.get("fixes") or r.get("hard_fails") or r.get("more_fixes")]
-    clean = len(scored) - len(flagged)
+    def _to_fix(r: dict) -> bool:
+        return bool(r.get("fixes") or r.get("hard_fails") or r.get("more_fixes"))
+    flagged = [r for r in scored if _to_fix(r)]
+    unjudged = [r for r in scored if not _to_fix(r) and r.get("unjudged")]
+    clean = len(scored) - len(flagged) - len(unjudged)
     unscored = len(rows) - len(scored) + len(judge.get("skipped") or [])
     parts: list[str] = []
     if flagged:
@@ -1661,10 +1705,18 @@ def _score_report_step(judge: dict | None) -> str:
         parts.append(f"参考分(不拦交付): judge.results 里 index 是 {idx} 的 {len(flagged)} 篇有要改的地方 —— 只把这几篇告诉"
                      "用户, 照各自的 fixes 说清要改的是哪一句、犯了哪条(没有 fixes 的就说 hard_fails 里是哪一条没过; "
                      "sure=false 的说是拿不准、看一眼就行), 不用报分数。")
+    if unjudged:
+        idx = "、".join(str(r.get("index")) for r in unjudged)
+        parts.append((f"另外 index 是 {idx} 的" if flagged else f"judge.results 里 index 是 {idx} 的")
+                     + f" {len(unjudged)} 篇有几道硬约束这次没判出来, 不能说都过了; 不影响交付, 不用重试: "
+                     "跟用户提一句就行, 不用报分数。")
     if clean:
-        parts.append((f"另外 {clean} 篇" if flagged else f"这 {clean} 篇") + "合规检查都过了: 整批跟用户说一句"
-                     "「合规检查都过了」就行, 不用报分数, 也不用逐篇说。")
-    if unscored or not (flagged or clean):
+        if flagged or unjudged or unscored:
+            parts.append((f"另外 {clean} 篇" if flagged or unjudged else f"这 {clean} 篇")
+                         + "没查出要改的地方, 不用逐篇说, 也不用报分数。")
+        else:
+            parts.append(f"这 {clean} 篇合规检查都过了: 整批跟用户说一句「合规检查都过了」就行, 不用报分数, 也不用逐篇说。")
+    if unscored or not (flagged or unjudged or clean):
         parts.append((f"{unscored} 篇" if unscored else "这批") + "这次没打成参考分(不影响存档和交付): "
                      "跟用户提一句就行, 不用重试。")
     return "".join(parts)
@@ -1934,12 +1986,19 @@ def _judge_row(target: dict, res: dict) -> dict:
     return row
 
 
+# 判定块里只给 batch_metrics 的那一项(2026-10-30 复审): 整批没发出去的工程原因(没配哪个变量、没接哪张表、查库卡在哪)。
+# G1 之后 ``detail`` 是念给写手的一句话, 原因原来就这样从 batch_metrics.meta.judge_detail 里丢了。commit_drafts 拿到判定块
+# 之后先把它摘下来(不进回包), 交给 _record_commit_metrics。
+JUDGE_OPS_DETAIL_KEY = "_ops_detail"
+
+
 def _judge_block(rows: list[dict], skipped: list[dict], *, project: str | None = None,
                  category: str | None = None, detail: str | None = None,
-                 error: str | None = None) -> dict:
-    """``detail``: 整批一个都没发出去时的原因(没配 / 没接 tv-map / 查库超时), 只说一次。
+                 error: str | None = None, ops_detail: str | None = None) -> dict:
+    """``detail``: 整批一个都没发出去时的原因(没配 / 没接 tv-map / 查库超时), 只说一次, 是念给写手的那一句。
+    ``ops_detail``: 同一件事的工程原因, 放在 ``JUDGE_OPS_DETAIL_KEY`` 下, 只进 batch_metrics(见那个常量上面那段)。
 
-    ``detail`` / ``error`` 里是异常原文, 一路进返回值和 batch_metrics: 先脱敏、再截断
+    ``detail`` / ``error`` / ``ops_detail`` 里可能是异常原文, 一路进返回值和 batch_metrics: 先脱敏、再截断
     (反过来的话, 跨在截断点上的 key 只剩半截, 值级脱敏认不出来)。每篇那一行的 detail
     由 ``judge_client.result`` 按同一个顺序处理过了。
     """
@@ -1953,6 +2012,8 @@ def _judge_block(rows: list[dict], skipped: list[dict], *, project: str | None =
         block["detail"] = mask_secrets(detail)[:_JUDGE_BLOCK_TEXT_MAX]
     if error:
         block["error"] = mask_secrets(error)[:_JUDGE_BLOCK_TEXT_MAX]
+    if ops_detail:
+        block[JUDGE_OPS_DETAIL_KEY] = mask_secrets(ops_detail)[:_JUDGE_BLOCK_TEXT_MAX]
     return block
 
 
@@ -1989,7 +2050,8 @@ def _judge_committed(client, project_id: str, targets: list[dict],
         nc = judge_client.result(judge_client.JUDGE_NOT_CONFIGURED)
         # 没配是部署层面的事(judge_status=not_configured 已经落进 batch_metrics), 写手那边只说没打成分
         return _judge_block([_judge_row(t, nc) for t in targets], skipped,
-                            detail="这个写作台还没接判定服务, 这次没打分; 不影响存档和交付, 不用你做什么。")
+                            detail="这个写作台还没接判定服务, 这次没打分; 不影响存档和交付, 不用你做什么。",
+                            ops_detail="JUDGE_URL / JUDGE_API_KEY 未配置")
 
     budget = judge_client.timeout_sec() if budget is None else budget
     if budget < _JUDGE_MIN_BUDGET_SEC:
@@ -2026,11 +2088,13 @@ def _judge_committed(client, project_id: str, targets: list[dict],
                            "共同截止 %.1fs 内没查完, 一篇都没发 (project=%s)", budget, project_id)
             return _judge_block(
                 [_judge_row(t, to) for t in targets], skipped,
-                detail=(f"发判定之前查库超时({budget:g}s), 这次一篇都没发、没打分; 不影响存档和交付, 不用重试。"))
+                detail=(f"发判定之前查库超时({budget:g}s), 这次一篇都没发、没打分; 不影响存档和交付, 不用重试。"),
+                ops_detail=(f"发之前的查库(tv_project_map / TV 品类 / 自带 version_id 的归属)在整批判定的共同截止 "
+                            f"{budget:g}s 内没查完, 一篇都没发"))
         if ctx["project"] is None:
             res = judge_client.result(ctx["status"])
             return _judge_block([_judge_row(t, res) for t in targets], skipped,
-                                detail=ctx["detail"])
+                                detail=ctx["detail"], ops_detail=ctx.get("ops_detail"))
         skipped = sorted(skipped + not_ours, key=lambda s: s["index"])
         rows = [_judge_row(t, r) for t, r in failed]
         left = _left()
@@ -2224,8 +2288,11 @@ def _rejection_meta(drafts: list[dict], rejected: list[dict]) -> dict:
 
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                            out: dict, *, flywheel: dict | None = None, checks: dict | None = None,
-                           commit_parts: dict | None = None) -> None:
+                           commit_parts: dict | None = None, judge_ops: str | None = None) -> None:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
+
+    ``judge_ops``: 判定块里摘下来的工程原因(JUDGE_OPS_DETAIL_KEY), 落进 meta.judge_detail —— 回包里的 judge.detail 是念给
+    写手的话, 查「为什么这批没判」要的是这一句(2026-10-30 复审)。
 
     为什么要落库而不只打日志: 「commit_drafts 约 1~2 秒」「一批 10 篇并行也是一两秒」
     都没有样本撑着, 8 秒的截止要拿分位数重定(docs/deskcore.md §3.8 有查法)。Railway
@@ -2248,8 +2315,9 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
             "batch_id": out.get("batch_id"),
             "judge_project": j.get("project"),
             "judge_category": j.get("category"),
-            # 整批没发出去(没配 / 没接 tv-map)或判定这一步整体失败时的原因
-            "judge_detail": ((j.get("error") or j.get("detail") or "")[:300] or None),
+            # 整批没发出去(没配 / 没接 tv-map / 查库超时)或判定这一步整体失败时的原因: 工程原因优先(judge_ops), 没有才用
+            # 回包里那句(预算不够这种, detail 本身就是原因)
+            "judge_detail": ((judge_ops or j.get("error") or j.get("detail") or "")[:300] or None),
             # 只留判定的结局, 不留题目细节 —— 答案本身在 TV 账本里, 这里要回答的是
             # "发出去了没有、怎么收场的"。
             "judge": [{"version_id": r.get("version_id"), "status": r.get("judge_status"),
@@ -3624,11 +3692,15 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 # ⚠️ 失败绝不许冒泡。指纹这时已经写进去了, 抛出去调用方会重试,
                 #    重试会撞上自己刚写的指纹 —— 一句提醒把一次成功的入库变成
                 #    "你的稿子重复了"。同 rpc_anomalies / identity_error 的纪律。
-                # W-38 上线之前抽的不算(ANGLE_DEBT_SINCE, 同简报): 那些多半写完发出去了, 叫模型「下一批按它们写」会再写一遍。
+                # W-38 上线之前抽的不算(ANGLE_DEBT_SINCE, 同简报): 那些多半写完发出去了, 叫模型「按它们写」会再写一遍。
+                # 2026-10-30 复审: 和简报同一个口径 —— 一小时以内抽的不算(ANGLE_DEBT_MIN_AGE: 一个团队共用一个身份, 那多半是
+                # 队友正在写的牌), 查重时带过的不算(_checked_angle_keys: 稿子已经写出来了); 那句话也照简报的写法改了(见下)。
                 lap = _lap(commit_parts, "other", lap)       # 拼回包、提示语(纯代码)
                 try:
                     debt = store.angle_debt(client, project_id, user_id,
-                                            ANGLE_DEBT_DAYS, since=ANGLE_DEBT_SINCE)
+                                            ANGLE_DEBT_DAYS, since=ANGLE_DEBT_SINCE, until=_angle_debt_until(),
+                                            exclude_keys=_checked_angle_keys(client, project_id, user_id,
+                                                                             ANGLE_DEBT_DAYS))
                 except Exception:
                     logger.exception("angle debt lookup after commit failed "
                                      "(project=%s)", project_id)
@@ -3642,14 +3714,17 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     listed = (f"(angle_debt.angles 里列了 {len(shown)} 个"
                               + (f", 还有 {more} 个没列" if more > 0 else "")
                               + ")" if shown else "")
+                    # 2026-10-30 复审: 照简报那句(_angle_debt_note)的写法 —— 说「这个项目」不说「你」(一个团队共用一个身份),
+                    # 不再叫「别再抽一批新的」(用户点了题目就照用户的写), 只说对得上时优先按它们写、查重时带上 key。
                     tail = (
-                        f"你在这个项目近 {debt['since_days']} 天还有 "
-                        f"{debt['unconsumed']} 个抽了没写的坐标" + listed
-                        + " —— 下一批按它们写, 别再抽一批新的。")
-                    # key 对不上的那几篇其实写了、存了: 它们的牌还挂在这里面, 叫模型「按它们写」会把同一个角度再写一遍
-                    key_tail = (f"你在这个项目近 {debt['since_days']} 天还挂着 {debt['unconsumed']} 个没销账的坐标"
-                                + listed + ": 这一场还没存的稿子, 存档时从里面找到分给它的那个 key 原样带上; "
-                                "已经存了的那几篇别按这些坐标再写一遍。")
+                        f"这个项目近 {debt['since_days']} 天发牌分到的坐标里, 还有 "
+                        f"{debt['unconsumed']} 个没有对应的稿子" + listed
+                        + "; 一小时以内刚发的多半有人正在写, 不在里面。用户接下来要写的对得上, 就优先按这些坐标写, "
+                        "查重时带上它的 angle_key; 用户点了具体题目, 照用户的写。")
+                    # key 对不上的那几篇其实写了、存了: 它们的牌还挂在这里面, 叫模型「按它们写」会把同一个角度再写一遍。
+                    # 这一场刚抽的牌(一小时以内)不在这里面: 还没存的稿子照 draw_angles 回包里分给它的 key 带。
+                    key_tail = (f"这个项目近 {debt['since_days']} 天还挂着 {debt['unconsumed']} 个没销账的坐标"
+                                + listed + ": 已经存了的那几篇别按这些坐标再写一遍。")
                 if unattributed:
                     # 同一批里还有 key 对不上的: 挂着的牌里有几张其实刚写完存了, 这里再说「下一批按它们写」就和
                     # angle_key_warning 打架、把同一个角度写两遍(W-31 复审)。那种时候挂着的牌只在 angle_key_warning 里说
@@ -3799,6 +3874,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                          project_id)
         out["judge"] = _judge_block(
             [], [], error=f"判定这一步整体失败({type(exc).__name__}: {exc}), 入库不受影响")
+    # 工程原因只进 batch_metrics, 不进回包(念给写手的是 judge.detail 那一句)
+    judge_ops = out["judge"].pop(JUDGE_OPS_DETAIL_KEY, None)
     if out.get("next_step"):
         out["next_step"] = _with_score_report(out["next_step"], out["judge"])
     judge_ms = _ms_since(judge_started)
@@ -3813,7 +3890,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms, "delivery_rules": delivery_rules_ms,
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
     _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta, checks=post_meta,
-                           commit_parts=commit_parts)
+                           commit_parts=commit_parts, judge_ops=judge_ops)
     return out
 
 
@@ -4100,9 +4177,13 @@ def export_drafts(client, project_id: str, *, batch_id: str | None = None,
     }
 
 
-def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
-                         progress=None) -> dict:
+def reembed_fingerprints(client, project_id: str | None, *, chunk: int = 50,
+                         progress=None, limit: int = 2000) -> dict:
     """给指纹库里缺标题向量的行补上向量。
+
+    ``project_id`` 为 None、``limit``(2026-10-30 复审): 不分项目、最多补这么多行 —— 给 tv-sync 每晚顺手补用
+    (reembed_after_sync)。这时多回 ``projects``(涉及几个项目)。``embed_failed`` 是其中整块 embedding 调用失败的行数
+    (欠费 / 配额 / 网络; 其余没补上的是空标题算不出、或者 CAS 时行已被别人改过), 有才带。
 
     ⚠️ 【故意没有归属校验】(审计 COR-015)。它和 backfill 一样不是 MCP 工具 ——
     只有 CLI 能调, 而跑 CLI 的人手里握着 service_role key(等价于直连库)。在这儿
@@ -4129,7 +4210,7 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
                 "fixed": 0, "pending": None}
 
     rows = store.fingerprints_needing_vectors(client, project_id,
-                                              dedup.EMBEDDING_MODEL)
+                                              dedup.EMBEDDING_MODEL, limit=limit)
     if not rows:
         return {"pending": 0, "fixed": 0, "failed": 0,
                 "note": "没有需要重算向量的行, 不用补。"}
@@ -4139,12 +4220,13 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
     absent = sum(1 for r in rows if r.get("_expect") is store.VECTOR_ABSENT)
     stale = len(rows) - absent
 
-    fixed = failed = 0
+    fixed = failed = embed_failed = 0
     for start in range(0, len(rows), chunk):
         part = rows[start:start + chunk]
         vecs = dedup.embed_texts([r.get("title") or "" for r in part])
         if vecs is None:
             failed += len(part)
+            embed_failed += len(part)
             logger.warning("reembed: embed_texts failed for chunk at %d", start)
             continue
         for r, v in zip(part, vecs):
@@ -4162,6 +4244,10 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
     out = {"pending": len(rows), "fixed": fixed, "failed": failed,
            "missing_vector": absent, "stale_model": stale,
            "embedding_model": dedup.EMBEDDING_MODEL}
+    if embed_failed:
+        out["embed_failed"] = embed_failed
+    if project_id is None:
+        out["projects"] = len({str(r.get("project_id")) for r in rows if r.get("project_id")})
     if stale:
         out["stale_model_note"] = (
             f"{stale} 条是【换模型作废】的旧向量(不是缺向量) —— 它们在重算完成"
@@ -4169,6 +4255,39 @@ def reembed_fingerprints(client, project_id: str, *, chunk: int = 50,
     if failed:
         out["note"] = (f"{failed} 条没补上(embedding 调用失败或行已被改动)。"
                        "可以再跑一次, 已补好的不会重复处理。")
+    return out
+
+
+# tv-sync 每晚顺手补标题向量(2026-10-30 发布收尾复审)。sportsix 有一条有标题、没向量的指纹, 之后每一批 check_drafts /
+# score_drafts 都报 semantic_degraded(标题语义没比全); 补它的 reembed 是运维命令, 没有任何东西排着跑。tv-sync 的 cron 本来
+# 就带着 embedding 的 key(railway.cron.json), 同步完顺手补: 有标题、没有当前模型向量的行(三种, 见
+# store.fingerprints_needing_vectors), 每晚最多这么多行(跨所有项目, 不只是 tv_project_map 里的), 缺向量的排在换模型作废的
+# 前面。尽力而为: 补不成照其它步骤的警告报、退出码 1, 这晚写进去的对照一行不动; 没补完的明晚接着补。
+TV_SYNC_REEMBED_MAX = 200
+
+
+def reembed_after_sync(client, *, limit: int = TV_SYNC_REEMBED_MAX) -> dict:
+    """tv-sync --all 同步完调一次(见 TV_SYNC_REEMBED_MAX 上面那段)。只给有标题的行补(空标题算不出向量, 也不算缺)。
+
+    回 ``{"pending", "fixed", "failed", "missing_vector", "stale_model", "projects", "capped", "embedding_model"}``,
+    ``error`` 有值 = 这一步出了故障(embedding 调用失败), CLI 记退出码 1。没配 embedding 不算故障(同 commit_drafts:
+    "没配"是部署层面的选择): 回 ``{"skipped": "not_configured"}``, 一次库都不查。读指纹库出错原样上抛, CLI 兜住。
+
+    ⚠️ 不收 project_id、不过归属闸: 同 reembed_fingerprints, 是运维路径(跑 tv-sync 的人握着 service_role key), 而且只写
+    向量这两列, 不读写任何稿子内容。"""
+    if not dedup.embeddings_available():
+        return {"skipped": "not_configured"}
+    limit = max(1, int(limit))
+    got = reembed_fingerprints(client, None, limit=limit)
+    out = {"pending": int(got.get("pending") or 0), "fixed": int(got.get("fixed") or 0),
+           "failed": int(got.get("failed") or 0), "missing_vector": int(got.get("missing_vector") or 0),
+           "stale_model": int(got.get("stale_model") or 0), "projects": int(got.get("projects") or 0),
+           "embedding_model": dedup.EMBEDDING_MODEL}
+    out["capped"] = out["pending"] >= limit
+    if got.get("embed_failed"):
+        out["error"] = f"{got['embed_failed']} 行的 embedding 调用失败"
+    elif got.get("error"):                              # embedding 在两次判断之间变得不可用(进程级单例, 几乎不会)
+        out["error"] = str(got["error"])
     return out
 
 
@@ -7467,6 +7586,13 @@ def create_project(client, name: str, *, brand: str = "",
     · **同品牌 → 照建, 但把兄弟项目列出来**(``siblings``)。"途鸽"已经有
       D-1..D-7 七个子项目, 再建一个叫"途鸽"的顶层项目多半是误操作, 但也可能
       是真的要开新方向 —— 这个只有人能判断, 所以给信息不拦。
+
+    ── 2026-10-30 复审: 认得标成暂时不用的项目 ──────────────────────────────
+    list_projects 默认不列标成暂时不用的项目(project_archived), 回头写一个旧品的写手在清单里找不到它, 模型照「清单里没有
+    就建」建出一个空的同名项目 —— 历史稿、规则都在旧的那个里, 新的从零开始, 两边互不查重。所以建之前再找一遍: 名字一样
+    (同上, 不分大小写和首尾空格)的不建, 回已有的那个, 它暂时不用就带 ``archived`` 并在 note 里说清; 暂时不用的项目里
+    名字只差空格、标点、全半角、大小写的(_project_name_key), 给了品牌时品牌也一样, 同样不建、回它。兄弟项目里暂时不用的
+    带 ``archived: true``。
     """
     if not user_id:
         raise PermissionError(
@@ -7480,7 +7606,9 @@ def create_project(client, name: str, *, brand: str = "",
 
     dupes = store.projects_with_exact_name(client, owner_id=user_id, name=name)
     if dupes:
-        hit = dupes[0]
+        hit = next((d for d in dupes if not project_archived(d)), dupes[0])    # 有在用的先回在用的
+        if project_archived(hit):
+            return _existing_idle_project(hit, name)
         return {
             "project_id": hit["id"],
             "name": hit.get("name") or name,
@@ -7491,6 +7619,10 @@ def create_project(client, name: str, *, brand: str = "",
                      "两套互不可见的库, 查重从此对这个方向失效。"
                      "确实要另开方向的话, 换一个能区分的名字。"),
         }
+    # 暂时不用的项目里名字只差写法的(见上面 2026-10-30 复审那段): list_projects 默认不列它们, 模型找不到才来建
+    idle = _idle_namesake(client, user_id, name, brand)
+    if idle is not None:
+        return _existing_idle_project(idle, name)
 
     row = db.create_project(client, user_id=user_id, name=name, brand=brand)
     pid = (row or {}).get("id")
@@ -7501,7 +7633,9 @@ def create_project(client, name: str, *, brand: str = "",
             f"建项目之后没拿到 id(name={name!r}) —— PostgREST 没回插入行, "
             "多半是 service client 的 returning 行为变了")
 
-    siblings = [{"project_id": p["id"], "name": p.get("name") or ""}
+    # 暂时不用的兄弟项目带 archived: true(list_projects 默认不列它们, 模型得知道要带 include_archived 才看得见)
+    siblings = [{"project_id": p["id"], "name": p.get("name") or "",
+                 **({"archived": True} if project_archived(p) else {})}
                 for p in store.projects_with_brand(client, owner_id=user_id,
                                                    brand=brand)
                 if p["id"] != pid] if brand else []
@@ -7516,16 +7650,62 @@ def create_project(client, name: str, *, brand: str = "",
     return out
 
 
+def _project_name_key(text: str) -> str:
+    """项目名 / 品牌名比对用的键: 全半角统一(NFKC)、不分大小写、去掉空白和标点(fingerprint.normalize 的口径)。
+    「途鸽-D8」「途鸽 D8」「途鸽－Ｄ８」是同一个键。只给 create_project 找暂时不用的同名项目用。"""
+    return fp.normalize(unicodedata.normalize("NFKC", text or "").casefold())
+
+
+def _idle_namesake(client, user_id: str, name: str, brand: str) -> dict | None:
+    """调用者名下标成暂时不用、名字(给了品牌时还有品牌)按 _project_name_key 一样的项目, 没有回 None。只看自己名下的
+    (store.list_all_projects 按 owner 过滤), 别人的项目叫什么跟这次建不建没关系。键是空串(名字全是标点)不比。"""
+    want = _project_name_key(name)
+    if not want:
+        return None
+    want_brand = _project_name_key(brand) if brand else None
+    for p in store.list_all_projects(client, owner_id=user_id):
+        if not project_archived(p) or _project_name_key(p.get("name") or "") != want:
+            continue
+        if want_brand is not None and _project_name_key(p.get("brand") or "") != want_brand:
+            continue
+        return p
+    return None
+
+
+def _existing_idle_project(hit: dict, asked: str) -> dict:
+    """create_project 撞上标成暂时不用的项目时的回包: 不建, 回它。note 是给模型的话, 用户要写的就是这个品时照常用它。"""
+    name = hit.get("name") or asked
+    return {
+        "project_id": hit["id"],
+        "name": name,
+        "brand": hit.get("brand") or "",
+        "created": False,
+        "archived": True,
+        "note": (f"已经有「{name}」这个项目, 没有新建 —— 它标成了暂时不用, 所以 list_projects 默认不列。直接用这个 "
+                 "project_id 调 open_project, 历史稿和规则都在它里面; 用户要写的就是这个品, 照常写, 不用跟用户提它暂时不用。"
+                 "确实要另开一个新方向, 换一个能区分的名字再建。"),
+    }
+
+
 # ── 归档: 不用的项目不进清单、不进跨项目检查(2026-10-30 发布收尾) ──────────────────────────────────
 # 主身份名下 41 个项目, 在用的六个左右。不用的那些照样排在 list_projects 里, 模型每场开头要在一长串里挑; score_drafts 的
 # 跨项目检查(_cross_project_shadow)也拿它们的品牌词和近期标题去比 —— 一个早就不写的项目的品牌词出现在正文里, 就报一次
 # 「可能串项目」, 写手要去核对一件跟这次无关的事。
 # 不加迁移: 标记就是 projects.default_params 里的 "archived": true(同 delivery / isolation_terms, 整列存成 JSON 字符串)。
 # 只有运维命令 cli project-archive 设 / 撤(project_archive), 没有任何路径自动写它, 写手那边也没有对应的工具。
-# 归档不锁人: open_project 照常给整份简报, 只多带 archived 和一句让模型跟用户确认是不是这个项目 —— 一个团队共用一个
-# 身份, 某个写手要接着写一个旧项目是正当的, 拦下来就是把人关在门外。
+# 归档不锁人: open_project 照常给整份简报, 只多带 archived 和一句给模型的话 —— 一个团队共用一个身份, 某个写手要接着写
+# 一个旧项目是正当的, 拦下来就是把人关在门外。2026-10-30 复审: 那句话原来叫模型每次都跟用户确认一遍, 可写手点名要的项目
+# 再被问「是这个吗」就是多余的一问(还像是在说他找错了)。现在只在模型自己挑的项目时确认; 写手点名了项目或品牌就照常写,
+# 不提「暂时不用」。打开归档项目记一行日志(哪些不用的项目又被拿起来了, 负责人据此决定要不要撤销归档)。
 ARCHIVED_KEY = "archived"
-ARCHIVED_NOTE = "「{name}」这个项目标成了暂时不用。动笔前先跟用户确认一句这次要写的就是它: 是就照常写, 不是就换成用户要的那个项目。"
+ARCHIVED_NOTE = ("「{name}」这个项目标成了暂时不用。用户点名要写这个项目或这个品牌的, 照常写, 不用跟用户提它暂时不用; "
+                 "是你自己挑的这个项目(用户没点名), 动笔前先跟用户确认一句这次要写的就是它, 不是就换成用户要的那个项目。")
+
+
+# list_projects 藏了暂时不用的项目时带的那一句(2026-10-30 复审): 只报个数(archived_hidden), 模型找不到用户要的品时会去
+# create_project 建一个空的新项目; 这句话把「怎么看它们」直接说出来。说给模型听的, 不叫它转告用户。
+ARCHIVED_HIDDEN_NOTE = ("另有 {n} 个标成暂时不用的项目没列出来。用户要写的品在上面找不到, 先带 include_archived=true 再调一次 "
+                        "list_projects 看看, 在里面就直接用它, 别新建。")
 
 
 def project_archived(project: dict | None) -> bool:

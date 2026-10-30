@@ -135,6 +135,19 @@ def test_list_projects_tool_reports_how_many_it_hid(monkeypatch):
     assert "archived_hidden" not in T.list_projects(_user_id=ME), "没藏东西就不带这个键"
 
 
+def test_list_projects_tool_says_in_one_line_how_to_see_hidden_projects(monkeypatch):
+    """只报 archived_hidden 一个数, 模型找不到用户要的品时会去 create_project 建一个空的新项目(2026-10-30 复审)。
+    藏了的时候一句话说清怎么看; 没藏就不带。"""
+    c = _list_client()
+    monkeypatch.setattr(core, "sb", lambda: c)
+    out = T.list_projects(_user_id=ME)
+    note = out["archived_hidden_note"]
+    assert "1 个标成暂时不用的项目没列出来" in note and "include_archived=true" in note and "别新建" in note
+    assert "\n" not in note, "一句话"
+    _assert_writer_safe(out, "list_projects[hidden]")
+    assert "archived_hidden_note" not in T.list_projects(include_archived=True, _user_id=ME)
+
+
 def test_list_projects_tool_description_explains_the_parameter():
     doc = T.list_projects.__doc__ or ""
     assert "include_archived" in doc and "archived_hidden" in doc
@@ -246,9 +259,10 @@ def _brief_client(params) -> FakeClient:
     return c
 
 
-def test_open_project_on_an_archived_project_still_gives_the_whole_brief(monkeypatch):
+def test_open_project_on_an_archived_project_still_gives_the_whole_brief(monkeypatch, caplog):
     c = _brief_client(json.dumps({"archived": True, "isolation_terms": ["示例词"]}, ensure_ascii=False))
     monkeypatch.setattr(core, "sb", lambda: c)
+    caplog.set_level("INFO", logger="deskcore.core")
     out = T.open_project(PROJ, _user_id=ME)
     assert out["archived"] is True
     assert out["archived_note"] == core.ARCHIVED_NOTE.format(name="示例品牌-产品向")
@@ -257,6 +271,19 @@ def test_open_project_on_an_archived_project_still_gives_the_whole_brief(monkeyp
     # 简报一样不少: 不锁人
     assert "示例硬规则" in out["p0"] and out["project_id"] == PROJ and "lessons_status" in out
     _assert_writer_safe(out, "open_project[archived]")
+    # 哪些不用的项目又被拿起来了, 记一行(负责人据此决定要不要撤销归档)
+    assert any("标成暂时不用的项目" in r.getMessage() and PROJ in r.getMessage() for r in caplog.records)
+
+
+def test_archived_note_only_asks_when_the_model_picked_the_project_itself():
+    """2026-10-30 复审: 原来那句叫模型每次都跟用户确认 —— 写手点名要的项目再被问一遍「是这个吗」是多余的一问, 还像是
+    在说他找错了。现在: 用户点名了项目或品牌就照常写、不提它暂时不用; 只有模型自己挑的才确认。"""
+    note = core.ARCHIVED_NOTE.format(name="示例")
+    named, picked = note.split("; ", 1)
+    assert "用户点名" in named and "照常写" in named and "不用跟用户提" in named, named
+    assert "确认" not in named, "点名了就不再确认"
+    assert "自己挑的" in picked and "确认" in picked, picked
+    assert note.index("用户点名") < note.index("确认"), "先说点名了照常写, 再说自己挑的才确认"
 
 
 @pytest.mark.parametrize("params", [None, "", json.dumps({"isolation_terms": ["示例词"]}, ensure_ascii=False),
@@ -272,6 +299,8 @@ def test_open_project_on_a_live_project_does_not_mention_it(monkeypatch, params)
 def test_open_project_tool_description_mentions_the_confirmation():
     doc = T.open_project.__doc__ or ""
     assert "archived_note" in doc and "确认" in doc
+    part = doc[doc.index("· archived"):].split("\n\n", 1)[0]
+    assert "用户点名" in part and "照常写" in part and "自己挑的" in part, part
 
 
 def test_archived_note_is_writer_safe():

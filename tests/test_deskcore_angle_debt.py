@@ -133,6 +133,50 @@ def test_only_draws_before_the_floor_means_no_note(monkeypatch):
     assert "angle_debt_note" not in out and "angle_debt" not in out
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 刚抽的牌不算(2026-10-30 发布收尾复审)
+#
+# 一个团队共用一个身份(同一个 user_id): 队友几分钟前刚抽、正在写的牌, 原来会出现在另一个写手新开那场的简报里, 模型照
+# 「优先按这些坐标写」再写一遍 —— 两个人写同一张牌。抽牌到查重通常只隔几分钟, 查过重的已按 W-38 的底稿排除, 所以只数
+# 抽了一小时以上的(core.ANGLE_DEBT_MIN_AGE); 断掉的那场过一小时再开, 它的牌照样在里面。
+# ══════════════════════════════════════════════════════════════════════
+
+MINUTES = 1 / (24 * 60)
+
+
+def test_a_card_drawn_minutes_ago_is_not_in_the_brief_and_not_recommended():
+    out = _brief(_client([_angle(1, days_ago=5 * MINUTES)]))
+    assert out["counts"]["angle_debt"] == 0
+    assert "angle_debt" not in out and "angle_debt_note" not in out, "队友正在写的牌不该被推荐给另一场"
+
+
+def test_a_card_drawn_two_hours_ago_is_debt_and_recommended():
+    older = _angle(2, days_ago=2 / 24)
+    out = _brief(_client([_angle(1, days_ago=5 * MINUTES), older]))
+    assert out["counts"]["angle_debt"] == 1
+    assert [a["angle_key"] for a in out["angle_debt"]["angles"]] == ["k2"], "两小时前那张照列, 刚抽的那张不列"
+    assert out["angle_debt"]["last_drawn_at"] == older["drawn_at"], "最近一次发牌报的是列出来的那张"
+    note = out["angle_debt_note"]
+    assert "有 1 个还没有对应的稿子" in note and "优先按这些坐标写" in note
+    assert "一小时以内" in note, "说清刚发的为什么不在里面, 免得模型以为牌丢了"
+
+
+def test_the_min_age_is_an_hour():
+    assert core.ANGLE_DEBT_MIN_AGE.total_seconds() == 3600
+
+
+def test_store_until_cuts_both_the_main_and_the_redrawn_query():
+    """store.angle_debt 的 until 只数它之前抽的; 「查重之后又抽到一次」补回来的那条查询同一个上界。"""
+    c = _client([_angle(1, days_ago=3), _angle(2, days_ago=5 * MINUTES)])
+    until = core._angle_debt_until()
+    assert store.angle_debt(c, PID, ME, 7, until=until)["unconsumed"] == 1
+    assert store.angle_debt(c, PID, ME, 7)["unconsumed"] == 2, "不给 until 照旧全数(archive_pending 走这一路)"
+    c2 = _client([_angle(1, days_ago=5 * MINUTES)])
+    checked = {"k1": store.iso_ago(4)}                          # 四天前查过重, 几分钟前又抽到一次
+    assert store.angle_debt(c2, PID, ME, 7, exclude_keys=checked)["unconsumed"] == 1
+    assert store.angle_debt(c2, PID, ME, 7, exclude_keys=checked, until=until)["unconsumed"] == 0
+
+
 def test_store_floor_never_widens_the_window():
     """下限比窗口还早时按窗口数: 下限只往里收, 不往外放。"""
     c = _client([_angle(1, days_ago=10), _angle(2)])

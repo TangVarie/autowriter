@@ -208,9 +208,10 @@ def projects_with_exact_name(sb, *, owner_id: str, name: str) -> list[dict]:
     want = (name or "").strip().casefold()
     if not want:
         return []
+    # default_params: create_project 要知道撞上的是不是标成暂时不用的项目(core.project_archived, 2026-10-30 复审)
     rows = _paged(lambda off, lim: (
         sb.table("projects")
-          .select("id, name, brand")
+          .select("id, name, brand, default_params")
           .eq("owner_id", owner_id)
           .order("id")
           .range(off, off + lim - 1)
@@ -228,9 +229,10 @@ def projects_with_brand(sb, *, owner_id: str, brand: str) -> list[dict]:
     """
     if not (brand or "").strip():
         return []
+    # default_params: 兄弟项目里标成暂时不用的要标出来(core.project_archived, 2026-10-30 复审)
     return _paged(lambda off, lim: (
         sb.table("projects")
-          .select("id, name, brand")
+          .select("id, name, brand, default_params")
           .eq("owner_id", owner_id)
           .eq("brand", brand)
           .order("name").order("id")
@@ -689,7 +691,7 @@ ANGLE_DEBT_EXCLUDE_MAX = 200
 
 def angle_debt(sb, project_id: str, user_id: str | None, days: int,
                *, sample: int = ANGLE_DEBT_SAMPLE, oldest_first: bool = False,
-               exclude_keys=None, since: str | None = None) -> dict:
+               exclude_keys=None, since: str | None = None, until: str | None = None) -> dict:
     """这个人在这个项目里, 近 ``days`` 天抽了没写的角度: 个数 + 具体是哪几个。
 
     给 build_writing_brief 在每场对话开头回显用(D-071)。发牌台账上"抽了没销账"
@@ -720,6 +722,9 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
 
     ``since`` (2026-10-30, 见 core.ANGLE_DEBT_SINCE): 比它早抽的不算, 和 ``days`` 取晚的那个当起点。``since_days``
     照旧回 ``days``(返回形状一个键都不变)。读不懂的 ``since`` 当没给, 按 ``days`` 数。
+
+    ``until`` (2026-10-30 复审, 见 core.ANGLE_DEBT_MIN_AGE): 比它晚抽的也不算 —— 刚抽的牌多半有人正在写(一个团队共用一个
+    身份, 分不出是谁抽的)。两次查询(主查询和"查重之后又抽到"那次)都按它截, 个数和列出来的坐标同一个口径。
     """
     out = {"unconsumed": 0, "since_days": days, "last_drawn_at": None, "angles": []}
     if oldest_first:
@@ -740,6 +745,8 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
                .eq("project_id", project_id).eq("drawn_by", user_id)
                .is_("consumed_version_id", "null")
                .gte("drawn_at", start))
+        if until:
+            q = q.lte("drawn_at", until)
         if skip:
             q = q.not_.in_("angle_key", skip)
         res = (q.order("drawn_at", desc=not oldest_first)
@@ -753,10 +760,12 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     if timed:
         # 排除掉的 key 里, 查重之后才又抽到的那几次照旧算欠着。读失败就不加回来(少报几张, 不弄坏简报)
         try:
-            again = (sb.table("angle_ledger").select("angle_key, dims, drawn_at")
-                     .eq("project_id", project_id).eq("drawn_by", user_id)
-                     .is_("consumed_version_id", "null").gte("drawn_at", start)
-                     .in_("angle_key", timed).range(0, 999).execute()).data or []
+            aq = (sb.table("angle_ledger").select("angle_key, dims, drawn_at")
+                  .eq("project_id", project_id).eq("drawn_by", user_id)
+                  .is_("consumed_version_id", "null").gte("drawn_at", start))
+            if until:
+                aq = aq.lte("drawn_at", until)
+            again = aq.in_("angle_key", timed).range(0, 999).execute().data or []
         except Exception:                               # noqa: BLE001
             logger.warning("read redrawn angle debt failed (project=%s)", project_id, exc_info=True)
             again = []
@@ -1433,9 +1442,12 @@ def fingerprint_row_count(sb, project_id: str) -> int:
 VECTOR_ABSENT = object()
 
 
-def fingerprints_needing_vectors(sb, project_id: str, model: str,
+def fingerprints_needing_vectors(sb, project_id: str | None, model: str,
                                  limit: int = 2000) -> list[dict]:
     """指纹库里【标题向量不可用】的行。给 reembed 用。
+
+    ``project_id`` 为 None(2026-10-30 复审): 不分项目, 给 tv-sync 每晚顺手补向量用(core.reembed_after_sync, 带上限)。
+    每行带 ``project_id``, 调用方据此报涉及几个项目。
 
     "不可用" 有三种, 三种都要修:
 
@@ -1462,13 +1474,13 @@ def fingerprints_needing_vectors(sb, project_id: str, model: str,
     做次级键。整批读完之后才开始写(set_fingerprint_vector), 所以翻页期间
     过滤条件不会被自己改动影响。
     """
+    def _base():
+        q = sb.table("draft_fingerprints").select("id, project_id, title, embedding_model")
+        return (q.eq("project_id", project_id) if project_id is not None else q).neq("title", "")
+
     def _page(extra):
         return _paged(
-            lambda off, lim: extra(
-                sb.table("draft_fingerprints")
-                  .select("id, title, embedding_model")
-                  .eq("project_id", project_id)
-                  .neq("title", ""))
+            lambda off, lim: extra(_base())
                 .order("created_at", desc=True)
                 .order("id", desc=True)
                 .range(off, off + lim - 1),

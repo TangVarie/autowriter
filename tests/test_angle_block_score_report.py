@@ -7,7 +7,8 @@
      ``angles[].angle_key`` 照旧;
   2. 参考分: 10 月存档的 234 篇里 231 篇是 100 分, 「把每篇的分数告诉用户」写手听到的几乎全是一串 100。现在
      没有 fixes / hard_fails 的整批一句「合规检查都过了」, 只点出要改的那几篇(哪一句、犯了哪条), 不报分数;
-     judge.results 里的 score / fixes 一个不少;
+     judge.results 里的 score / fixes 一个不少。复审: 「合规检查都过了」只在每篇都打成了分、都没有 fixes / hard_fails /
+     unjudged 时说; 只有 unjudged 的单独一句(不能说都过了), 没打成分的从来不算过;
   3. 存档时被判撞车(pre_commit / atomic_recheck)的那几条, note 原来说「不能当作已交付」—— 协议却允许写手看过撞的
      是哪一条之后坚持要用。现在: 拒绝本身不变(没存档、没销牌), 写手坚持就原样交, 用一句话说清这篇不进写作台的
      历史稿、牌还挂着。
@@ -114,7 +115,8 @@ def test_only_the_drafts_with_fixes_are_named_and_the_rest_is_one_line():
     step = core._score_report_step(block)
     assert "index 是 1、3 的 2 篇有要改的地方" in step
     assert "只把这几篇告诉用户" in step and "哪一句" in step and "犯了哪条" in step
-    assert "另外 2 篇合规检查都过了" in step
+    # 有要改的那一批不叫模型说「合规检查都过了」(照念会把整批说成过了), 其余几篇只说没查出要改的
+    assert "另外 2 篇没查出要改的地方" in step and "合规检查都过了" not in step
     assert "不用报分数" in step
     # 数据一个不少: 每篇的分数、修改建议都还在
     assert [r["score"] for r in block["results"]] == [100, 75, 100, 92]
@@ -137,11 +139,36 @@ def test_fixes_cut_off_by_the_cap_still_count():
 
 
 def test_only_unjudged_constraints_is_not_something_to_change():
-    """只有"没判出来"的硬约束: 没有一处可改, 归进整批那一句; 分数照扣、unjudged 照报。"""
+    """只有"没判出来"的硬约束: 没有一处可改(不进「有要改的地方」那句), 但也不能说过了 —— 单独一句(2026-10-30 复审:
+    原来归进整批「合规检查都过了」, 有几道硬约束 Jev 根本没判出来, 写手听到的却是都过了)。分数照扣、unjudged 照报。"""
     row = _row(0, unjudged=2)
     assert row["score"] == 80 and row["unjudged"] == 2
     step = core._score_report_step(core._judge_block([row], []))
-    assert "这 1 篇合规检查都过了" in step and "index 是" not in step
+    assert "合规检查都过了" not in step, step
+    assert "index 是 0 的 1 篇有几道硬约束这次没判出来, 不能说都过了" in step, step
+    assert "不影响交付" in step and "不用重试" in step
+    assert "有要改的地方" not in step, "没有可改的地方, 不叫模型去说改哪一句"
+    _writer_safe(step)
+
+
+def test_unjudged_drafts_keep_the_rest_of_the_batch_from_being_called_compliant():
+    """一批里混着只有 unjudged 的: 别的几篇也不说「合规检查都过了」(模型照念就成了整批都过了)。"""
+    step = core._score_report_step(core._judge_block([_row(0, passed=True), _row(1, unjudged=1),
+                                                      _row(2, passed=True)], []))
+    assert "合规检查都过了" not in step, step
+    assert "index 是 1 的 1 篇有几道硬约束这次没判出来" in step
+    assert "另外 2 篇没查出要改的地方" in step
+
+
+def test_fixes_unjudged_clean_and_unscored_each_get_their_own_sentence():
+    rows = [_row(0, **_fix()), _row(1, unjudged=1), _row(2, passed=True),
+            core._judge_row({"index": 3, "version_id": "v3"}, judge_client.result(judge_client.JUDGE_TIMEOUT))]
+    step = core._score_report_step(core._judge_block(rows, []))
+    assert "index 是 0 的 1 篇有要改的地方" in step
+    assert "另外 index 是 1 的 1 篇有几道硬约束这次没判出来" in step
+    assert "另外 1 篇没查出要改的地方" in step and "1 篇这次没打成参考分" in step
+    assert "合规检查都过了" not in step
+    _writer_safe(step)
 
 
 @pytest.mark.parametrize("status", [judge_client.JUDGE_TIMEOUT, judge_client.JUDGE_NOT_CONFIGURED,
@@ -159,7 +186,9 @@ def test_too_short_skipped_and_a_whole_judge_failure_are_not_called_compliant():
     assert short["score"] is None
     step = core._score_report_step(core._judge_block([short, _row(1, passed=True)],
                                                      [{"index": 2, "reason": "identity_error"}]))
-    assert "这 1 篇合规检查都过了" in step and "2 篇这次没打成参考分" in step
+    # 有没打成分的就不说「合规检查都过了」(照念会连那两篇一起说成过了), 打成了分的那篇只说没查出要改的
+    assert "这 1 篇没查出要改的地方" in step and "2 篇这次没打成参考分" in step
+    assert "合规检查都过了" not in step
     whole = core._score_report_step(core._judge_block([], [], error="判定这一步整体失败"))
     assert whole.startswith("这批这次没打成参考分") and "合规检查都过了" not in whole
     assert core._score_report_step(None).startswith("这批这次没打成参考分")
@@ -176,7 +205,7 @@ def test_score_drafts_names_only_the_draft_to_fix_and_keeps_every_score(judge_on
     assert out["written"] == 3
     step = out["next_step"]
     assert step.startswith(core.ARCHIVED_STEP_HEAD + "参考分(不拦交付): judge.results 里 index 是 1 的 1 篇"), step
-    assert "另外 2 篇合规检查都过了" in step
+    assert "另外 2 篇没查出要改的地方" in step and "合规检查都过了" not in step
     assert "每篇的 score" not in step and "照实告诉用户" not in step.split("check_rules")[0]
     # 后面那几句照旧: check_rules、改稿怎么改、贴飞书
     assert "check_rules" in step and "replaces_version_id" in step and "飞书" in step
@@ -216,6 +245,8 @@ def test_the_score_note_no_longer_asks_for_every_number():
     note = core.SCORE_NOTE
     assert "把每篇的分数" not in note and "不用逐篇报给用户" in note
     assert "「合规检查都过了」" in note and "fixes" in note and "hard_fails" in note
+    # 只有 unjudged 的、没打成分的都不能说过了(2026-10-30 复审)
+    assert "unjudged" in note and "不能说都过了" in note and "不能说过了" in note
     assert "不拦交付" in note and "replaces_version_id" in note
     _writer_safe(note)
 
@@ -224,6 +255,7 @@ def test_score_drafts_doc_matches():
     doc = T.score_drafts.__doc__ or ""
     assert "把每篇的分数和 fixes" not in doc
     assert "分数不用逐篇报给用户" in doc and "「合规检查都过了」" in doc
+    assert "``unjudged``" in doc and "不能说都过了" in doc
     assert "next_step" in doc and "index" in doc
 
 
