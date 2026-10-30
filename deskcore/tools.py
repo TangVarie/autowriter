@@ -342,7 +342,10 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
       · tactics —— 这个项目配置好的战术方向清单
       · lessons —— 【真实爆款经验卡】, 已经替你向帆谷飞轮图书馆借好了
         (最多 5 张); lessons_status.status 说明是 borrowed / empty /
-        not_configured / timeout / error 里的哪一种。只借钩子、结构、手法,
+        not_configured / timeout / error 里的哪一种。**是 timeout 时**(卡这次没来得及选完, 还在后台接着选):
+        动笔之前调一次 borrow_lessons, 参数和这次 open_project 一样(tactic / draft_topic / key_messages /
+        target_audience / tone / extra_instructions 照传, flywheel_arm 传这份简报里的); 只调这一次, 还是没有卡就照常写。
+        只借钩子、结构、手法,
         严禁照抄标题主干或具体句子; synthetic=true 的卡指标未经验证。
         卡上的 validated_hits 是这张卡命中了哪几条已验证规律。
         external=true 的是【外部参考卡】(最多 2 张): 别家同品类的帖, 不是公司投的, 没有经过我们的数据验证;
@@ -435,7 +438,9 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
     perpetual_bias=True 偏向抽「不依赖任何时效元素」的组合, 写出来更能穿越周期
     (但会少掉当下感)。默认 False。
 
-    返回里的 prompt_block 可以直接贴进生成提示词。
+    返回里的 prompt_block 可以直接贴进生成提示词。它每一篇那行开头的方括号里是这一篇的 ``angle_key``
+    (「第1篇 [angle_key=…]」, 和 ``angles[].angle_key`` 是同一个, 20 位十六进制串): 这一篇调 check_drafts 和
+    score_drafts 时, 把方括号里那串**原样复制**进这一篇的 ``angle_key``, 不要自己编号、缩写或改写, 也不写进标题和正文。
     """
     # 故意不包 _safe: 发牌要写台账。写失败却报成功, 同一个角度下批还能再抽,
     # 跨批次唯一性的承诺就破了(而且没人看得见)。
@@ -448,11 +453,15 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
 
 def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
                    key_messages: str = "", target_audience: str = "",
-                   tone: str = "", flywheel_arm: str = "", _user_id: str | None = None) -> dict:
+                   tone: str = "", flywheel_arm: str = "", extra_instructions: str = "",
+                   _user_id: str | None = None) -> dict:
     """向帆谷飞轮图书馆【再】借几张真实爆款的经验卡。
 
     open_project 已经随简报借过一次(返回里的 lessons)。只在换了选题 / 战术、
     想按另一个方向再匹配一批时才调这个; 同样的参数再调一次拿到的是同一批卡。
+    **例外: open_project 返回的 lessons_status.status 是 timeout 时**, 卡还在后台接着选 —— 动笔之前用和那次
+    open_project 一样的参数(tactic / draft_topic / key_messages / target_audience / tone / extra_instructions 照传,
+    flywheel_arm 传简报里的)调一次, 选好了就能拿到; 只调这一次, 还是没有卡就照常写。
 
     这些卡来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
     结构骨架 / 为什么有效 / 可迁移手法」。写稿时可以借它的钩子或结构。
@@ -472,11 +481,13 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
     flywheel_arm 也同 open_project: 存档时原样传给 score_drafts。调本工具时也把这场 open_project
     给的 flywheel_arm 原样传进来 —— 一场写作只分一次组, 不传会重新分。
     """
+    # extra_instructions 也要能传(2026-10-30 发布收尾): 它在馆员的缓存键里, open_project 带了它而这里传不了的话,
+    # "同样的参数"永远对不上那次在后台选好的卡, 又从冷路径选一遍。
     return _safe(core.borrow_lessons, core.sb(), project_id, user_id=_user_id,
                  flywheel_arm=flywheel_arm or None,
                  tactic=tactic, draft_topic=draft_topic,
                  key_messages=key_messages, target_audience=target_audience,
-                 tone=tone)
+                 tone=tone, extra_instructions=extra_instructions)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -488,8 +499,8 @@ def check_drafts(project_id: str, drafts: list[dict],
     """查重硬闸。成稿后【必须】调这个才能交付。
 
     drafts 传 [{"title": "...", "body": "...", "angle_key": "..."}, ...]
-    (angle_key 是 draw_angles 给的, 有就带上 —— 查重时写作台会顺手记下这一稿和它的 angle_key; 稿子发出去以后,
-    写作台按内容从飞书把它对回来、给这张牌销账, 就算这一稿没存过档)。
+    (angle_key 是 draw_angles 给的: prompt_block 里这一篇那行方括号里的那串, 原样复制, 有就带上 —— 查重时写作台会顺手
+    记下这一稿和它的 angle_key; 稿子发出去以后, 写作台按内容从飞书把它对回来、给这张牌销账, 就算这一稿没存过档)。
 
     **改的是已经存过的那篇**(score_drafts 返回过它的 version_id): 那篇带上 ``replaces_version_id``, 值和之后调 score_drafts
     时带的一样(上次返回的 ``version_ids`` 里对应的那个)。查重就不会拿它和它自己的旧版比, 别的稿子照常比; 这一行的返回
@@ -515,7 +526,8 @@ def check_drafts(project_id: str, drafts: list[dict],
     每条返回 pass / warn / reject:
       · reject —— 必须重写。不允许「少出一条」糊弄过去。reason 里说了是哪个
         信号命中: 撞开头就换开场视角, 撞正文就换比喻系统或叙事路径。
-        只改标题没用。重写完再跑一次。
+        只改标题没用。重写完再跑一次。用户看过撞的是哪一条还是坚持要用这篇: 原样交给他, 用一句话告诉他
+        这篇不会存进写作台的历史稿、分给它的那张牌也还挂着没销账; 这篇不用再传给 score_drafts(传了也存不进去)。
       · warn —— 可疑, 建议换个切入再交。
       · pass —— 可以交付: 交给用户之前调 score_drafts(存档 + 参考分; 项目有交付模板时它回拼好的交付稿)。
 
@@ -656,7 +668,9 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
         拿不准的每条 -8, 有硬约束没判出来的每条 -10; 正文太短判不了的 score 为空(``why`` 里写着)。
       · ``fixes`` 是最该看的几条: ``sure=true`` 是 Jev 有把握的, ``sure=false`` 是拿不准、看一眼就行的。``more_fixes``
         是没列出的条数。``instruction`` 只说哪一句犯了哪条, 不给改法。
-      · 把每篇的分数和 fixes **照实**告诉用户, 一两句话就够。用户要改哪篇: 按 fixes 改完, 那篇带
+      · **分数不用逐篇报给用户。** 没有 ``fixes`` 也没有 ``hard_fails`` 的稿子, 整批说一句「合规检查都过了」就行;
+        只把有 ``fixes`` 或 ``hard_fails`` 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条(``next_step`` 会点出
+        是哪几个 index)。``score`` / ``fixes`` 照旧都在返回里, 用户问起分数再说。用户要改哪篇: 按 fixes 改完, 那篇带
         ``replaces_version_id`` 再调一次本工具(会重新打分)。改一轮就够, 不要为了分数反复重写。
       · ``judge_status`` 不是 ok(超时、没配、被出境口径挡下)就说这篇这次没打成分, 不要重试, 存档照样成功了。
 
@@ -666,15 +680,17 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     改稿之前先过 check_drafts 的, 那篇在 check_drafts 里也带上同一个 ``replaces_version_id``。
 
     ⚠️ 存档时【会再查一次重】, 而且自带和 check_drafts 同一套闸: 判 reject 的不存档, 在 ``rejected`` 里列出来
-    (``gate="pre_commit"`` 是闸前拦下, ``gate="atomic_recheck"`` 是写入时撞上了队友刚存的稿子)。那几条要重写后
-    重新走 check_drafts, 不能当作已交付。``gate="empty_body"`` 是这篇的 ``body`` 是空的(正文放错了字段): 不用重写,
+    (``gate="pre_commit"`` 是闸前拦下, ``gate="atomic_recheck"`` 是写入时撞上了队友刚存的稿子)。那几条没有存档, 要重写后
+    重新走 check_drafts; 用户看过撞的是哪一条还是坚持要用, 就原样交给他, 用一句话告诉他这篇不会存进写作台的历史稿、
+    分给它的那张牌也还挂着没销账(``note`` 里也是这句)。``gate="empty_body"`` 是这篇的 ``body`` 是空的(正文放错了字段): 不用重写,
     把正文放进 ``body`` 原样再调一次本工具。``gate_summary`` 里该告诉用户的(semantic_degraded / empty_history_warning)
     照 check_drafts 的规矩说。
 
     **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零就是有几条没带 —— 那几个角度没销账,
     下一批还会被抽到。这时返回里还会带 ``angle_debt``: 你在这个项目当前还挂着的坐标, **下一批按它们写, 别再抽新的**。
-    ``angle_key`` 要**原样复制** draw_angles 给的那个(20 位十六进制串), 不要自己编号、缩写或改写: ``unknown_angle_keys``
-    非零是有几篇带的 key 这个项目的台账里没有, ``used_angle_keys`` 非零是有几篇带的 key 已经销给了别的稿子(一个 key 只给一篇),
+    ``angle_key`` 要**原样复制** draw_angles 给的那个(prompt_block 里这一篇那行方括号里的 20 位十六进制串), 不要自己编号、
+    缩写或改写: ``unknown_angle_keys`` 非零是有几篇带的 key 这个项目的台账里没有, ``used_angle_keys`` 非零是有几篇带的 key
+    已经销给了别的稿子(一个 key 只给一篇),
     哪几篇在 ``angle_key_mismatch`` 里(``problem``: unknown 编的或抄错的 / other_project 你在别的项目抽的牌, 先确认是不是
     存错了项目 / not_in_ledger 台账没写进去, 不是你的错 / used), ``angle_key_warning`` 说怎么办 —— 那几篇已经存档, 不用重存,
     但角度没销账; 接下来存的照 draw_angles 的原样带。

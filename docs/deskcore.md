@@ -166,7 +166,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | 开项目 | `create_project` | 给新品牌/新方向建项目。**owner 恒为调用者**，签名里没有 owner 参数。同名不建、返回已有的；同品牌照建但列出兄弟项目（见 §3.0） |
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`，以及最近的稿子在哪几处都写成一个样子 `recent_structure`（都是 2026-10-20，见 §3.1） |
-| | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block` |
+| | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block`（2026-10-30 起每篇那行带完整的 `angle_key`：「第1篇 [angle_key=…]」，模型照着贴进 `check_drafts` / `score_drafts`，不再自己编） |
 | | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比。改的是已经存过的那篇时带 `replaces_version_id`（2026-10-30，同 `score_drafts` 的字段、同一套核对 `_lookup_replacements`）：旧 item 全部版本的指纹不算它的对手，别的稿子照常比；**仍然只读**，不摘指纹。库里那一路（`deskcore_check_drafts`）每路只回最像的一条的标题、排除不了哪几行，不加迁移的做法是在 Python 里补（`_without_own_versions`）：先拿旧版那几行逐路比，库里回的命中比得过它们就是别的稿子、照用；比不过的那一路在去掉旧版之后的历史上重比——开头按哈希点查，标题语义 / 四字串把项目指纹拉回来再比（只拉要比的列，只给改稿那几篇）。被旧版挡在后面的别的稿子照样拦。id 对不上判 reject、`gate="replace_lookup"`。原来不认这个字段，改稿一查就被自己的旧版拦下（「正文开头与历史稿完全一致」），`archive_pending` 那句才叫模型改稿时跳过查重 |
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
@@ -440,6 +440,11 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 > 参考分 `score` 和最多 3 条 `fixes`（`core.draft_score`：Jev 有把握 p≥0.7 的硬伤 −25、拿不准的 −8、没判出的硬约束 −10，
 > 正文太短不给分）。**仍然不拦**：written / rejected 口径不变，判不成照样存档。人审与导出两个工具撤了，评论按链接写
 > （`comments_for` / `score_comments`，§3.6 的人审流程只剩 core 里的函数）。下文"影子期"的表述按此读。
+>
+> **2026-10-30 发布收尾：分数不再逐篇报。** 10 月存档的 234 篇里 231 篇是 100 分，「每篇多少分」写手听到的几乎全是一串 100。
+> `judge.note`（`core.SCORE_NOTE`）和 `next_step` 开头那句（`core._score_report_step`，判定跑完才接在「这批已存档。」后面）
+> 改成：有 `fixes` / `hard_fails` 的那几篇点出 `judge.results` 里的 index，只说这几篇要改哪一句、犯了哪条；其余整批一句
+> 「合规检查都过了」；没打成分的一句带过（不看是哪种失败，回包除 `judge` 外一个字不变）。`score` / `fixes` 照旧都在 `judge.results` 里。
 
 **是什么。** JevforCoentent 仓 docs/00 #4 拍板：写作台的入库判定挂在 `commit_drafts` 内部，advisory，
 8 秒没回就跳过，答案进账本（TV 的 `note_feature_answers`，`subject_type='aw_version'`、
@@ -1010,7 +1015,7 @@ env：
 | `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<uuid>", "name": "Ziao"}}`，一人一把 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN。馆员回 200 但 `status` 是 `degraded` / `error`（TV 侧选卡失败）记 `error` 不记 `empty` |
-| `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `10`，夹在 1–20。`open_project` 随简报借卡**只等这么久**，到点先交简报（`lessons_status.status=timeout`，`detail` 里告诉模型稍后调 `borrow_lessons` 命中缓存即回）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60） |
+| `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `15`（2026-10-30 起，原 10；最近冷借 14–18 秒），夹在 1–20。`open_project` 随简报借卡**最多等这么久**，而且不超过整次回包目标 `OPEN_PROJECT_RESPONSE_BUDGET_SEC`（20 秒，不开 env）扣掉借阅之前已用的时间和借阅之后几步的预留（`core.OPEN_PROJECT_TAIL_RESERVE_SEC`，2.5 秒）剩下的那段；到点先交简报（`lessons_status.status=timeout`，`detail` 里叫模型动笔之前用同样的参数调一次 `borrow_lessons`，命中缓存即回；只调一次，还没有就照常写）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60），2026-10-30 起也收 `extra_instructions`（它在馆员的缓存键里） |
 | `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里；它是自定义格式，登记在 `logger_utils` 的值级脱敏名单里（judge 的错误体会被抄进 detail / 遥测 / `batch_metrics`）。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
 | `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了、`nan` / `inf` 都退回默认）。**整批判定的共同截止**，不是每篇各 8 秒；入库慢时实际截止更短（整次 commit 回包目标 20 秒，见 §3.8，J-08） |
 | `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16（同上，写坏了退回默认）。一次 commit 同时发几篇 |

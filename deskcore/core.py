@@ -391,6 +391,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     唯一改动的语义(隔离口径: 项目规则团队共享 + 个人风格私有)。
     """
     brief = brief or {}
+    # 整次 open_project 的回包目标从这里算起(OPEN_PROJECT_RESPONSE_BUDGET_SEC): 下面借卡只拿剩下的那段, 见 _brief_borrow_budget
+    started = time.monotonic()
     # 归属校验 + 取项目行一次搞定 —— 这里本来就要 db.get_project, 所以 COR-015
     # 的校验在这条路径上【不多发一次查询】。
     project = assert_project_access(client, project_id, user_id=user_id)
@@ -517,7 +519,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # ⚠️ 这一段的失败**不能**影响简报: P0 已经拿到了, 卡借不到只是少点参考。
     # fetch_flywheel_lessons 本身绝不抛, 但 build_brief / 其它意外仍兜一层 ——
     # 兜住之后照样留痕(status.state=error + WARN 日志), 不吞成看似成功。
-    borrowed = _borrow_for_brief_bounded(project, brief, user_id=user_id)
+    borrowed = _borrow_for_brief_bounded(project, brief, user_id=user_id, started=started)
     out["lessons"] = borrowed["lessons"]
     if borrowed.get("validated_patterns"):
         out["validated_patterns"] = borrowed["validated_patterns"]
@@ -773,6 +775,10 @@ def render_angles_block(angles: list[dict]) -> str:
     照 generator._build_slot_coordinates_block(:1350) 的形状, 但多带 essence
     维度和边界判据 —— 光给标签名模型会混(docs/05 §3 花 40 行讲焦虑 vs 恐惧
     怎么分是有原因的)。
+
+    每篇那一行带上完整的 angle_key(2026-10-30 发布收尾): 模型贴进提示词、照着写的是这个块, 原来块里没有 key, 查重 /
+    存档时它就自己编一个 —— 10-26 sportsix 带上来的 key 长 7 / 8 / 53 位, 一个都销不了账。key 和 angles[].angle_key
+    是同一个, 原样印出来, 不截短。
     """
     if not angles:
         return ""
@@ -780,7 +786,7 @@ def render_angles_block(angles: list[dict]) -> str:
     for a in angles:
         d = a["dims"]
         lines.append(
-            f"第{a['slot']}篇：情绪杠杆={d['emotional_lever']}"
+            f"第{a['slot']}篇 [angle_key={a['angle_key']}]：情绪杠杆={d['emotional_lever']}"
             f"({a['emotional_valence']}/{a['emotional_intensity']})"
             f" · 人性原型={d['human_truth_archetype']}"
             f" · 内容形式={d['content_format']}"
@@ -801,6 +807,8 @@ def render_angles_block(angles: list[dict]) -> str:
             lines.append(f"    ↳ 角度：{a['angle_brief']}")
     lines.append(f"\n全批词感倾向：{angles[0].get('word_tilt', '')}")
     lines.append("以上坐标为硬约束。写完后每一篇要能说出自己用的是哪一组，说不出就是没按坐标写。")
+    lines.append("每篇方括号里的 angle_key 原样复制进这一篇查重（check_drafts）和存档（score_drafts）时的 angle_key，"
+                 "不要自己编号、缩写或改写；它只是给写作台记账用的，不写进标题和正文。")
     return "\n".join(lines)
 
 
@@ -1610,11 +1618,63 @@ def _restore_stash(client, stash: dict[int, list[dict]], indices) -> None:
 # 2026-10-19 起(D-120, 盖过 D-119 J-07 的"留在影子期"): 存档后的判定**给写手看** —— 每篇一个参考分 + 最多
 # SCORE_MAX_FIXES 条修改建议。仍然**不拦**: 不改 written / rejected, 判不成存档照样成功。答案照旧由 judge 写进
 # TV 账本。这句话原样回给调用方模型, 它决定模型拿分数做什么: 说给用户听、按建议改一轮, 不循环、不重试。
+# 2026-10-30 发布收尾: 不再叫模型逐篇报分数。10 月存档的 234 篇里 231 篇是 100 分, 「每篇多少分」写手听到的几乎全是
+# 一串 100, 真要改的那一两篇反而淹在里面。现在只说要改的那几篇(哪一句、犯了哪条), 其余整批一句「合规检查都过了」;
+# score / fixes 照旧都在 judge.results 里(指标、改稿对照要用), 只是不念。具体是哪几篇由 _score_report_step 写进 next_step。
 SCORE_NOTE = ("参考分: 不拦交付, 也不改 written / rejected。score 满分 100, 只看篇级硬约束(平台合规题 + 特征题库里的"
-              "合规题), 文笔好坏不在里面。fixes 是最该看的几条(sure=false 的是 Jev 拿不准的, 看一眼就行, 不一定要改)。"
-              "把每篇的分数和 fixes 照实告诉用户; 用户要改, 按 fixes 改完带 replaces_version_id 再调一次 score_drafts, "
+              "合规题), 文笔好坏不在里面。分数不用逐篇报给用户: 没有 fixes 也没有 hard_fails 的稿子, 整批说一句「合规检查都过了」"
+              "就行; 只把有 fixes 或 hard_fails 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条(sure=false 的是 Jev "
+              "拿不准的, 看一眼就行, 不一定要改)。用户要改, 按 fixes 改完带 replaces_version_id 再调一次 score_drafts, "
               "改一轮就够, 不要为了分数反复重写。judge_status 不是 ok 就说这篇这次没打成分, 不用重试。")
 JUDGE_SHADOW_NOTE = SCORE_NOTE          # 旧名, 老测试 / 老调用方还在 import
+
+# score_drafts 的 next_step 开头那句(存档成功才有)。判定在它之后才跑, 跑完由 _with_score_report 在它后面接上
+# 「参考分怎么跟用户说」那句 —— 那句要看这一批判出来的结果, 写 next_step 的时候还不知道。
+ARCHIVED_STEP_HEAD = "这批已存档。"
+
+
+def _score_report_step(judge: dict | None) -> str:
+    """存档之后「参考分怎么跟用户说」那一句, 按这一批判出来的结果写(2026-10-30 发布收尾)。
+
+    · 有 fixes 或 hard_fails 的(``more_fixes`` 也算: 修改单截掉了的那几条同样要改): 点出是 judge.results 里哪几个
+      index, 只说这几篇, 照 fixes 说清哪一句、犯了哪条; 没有 fixes 的说 hard_fails 里是哪一条没过(依据句在修改单里,
+      hard_fails 里不重复一份)。不报分数。
+    · 判了、什么都没查出来的(只有 ``unjudged`` 的也在这里: 没有一处可改的地方): 整批一句「合规检查都过了」, 不报分数。
+    · 没打成分的(judge_status 不是 ok、正文太短、跳过的): 一句带过, 不用重试。这一句**不看是哪种失败** —— 没接判定、
+      超时、出境口径挡下, 回包除了 judge 块之外一个字都不变(test_commit_result_is_identical_whatever_the_judge_does)。
+    纯函数, 不抛: 判定块是怎么来的(整批失败时只有 error、没有 results)都能写出一句。
+    """
+    judge = judge if isinstance(judge, dict) else {}
+    rows = [r for r in (judge.get("results") or []) if isinstance(r, dict)]
+    scored = [r for r in rows if r.get("judge_status") == judge_client.JUDGE_OK and r.get("score") is not None]
+    flagged = [r for r in scored if r.get("fixes") or r.get("hard_fails") or r.get("more_fixes")]
+    clean = len(scored) - len(flagged)
+    unscored = len(rows) - len(scored) + len(judge.get("skipped") or [])
+    parts: list[str] = []
+    if flagged:
+        idx = "、".join(str(r.get("index")) for r in flagged)
+        parts.append(f"参考分(不拦交付): judge.results 里 index 是 {idx} 的 {len(flagged)} 篇有要改的地方 —— 只把这几篇告诉"
+                     "用户, 照各自的 fixes 说清要改的是哪一句、犯了哪条(没有 fixes 的就说 hard_fails 里是哪一条没过; "
+                     "sure=false 的说是拿不准、看一眼就行), 不用报分数。")
+    if clean:
+        parts.append((f"另外 {clean} 篇" if flagged else f"这 {clean} 篇") + "合规检查都过了: 整批跟用户说一句"
+                     "「合规检查都过了」就行, 不用报分数, 也不用逐篇说。")
+    if unscored or not (flagged or clean):
+        parts.append((f"{unscored} 篇" if unscored else "这批") + "这次没打成参考分(不影响存档和交付): "
+                     "跟用户提一句就行, 不用重试。")
+    return "".join(parts)
+
+
+def _with_score_report(next_step: str | None, judge: dict | None) -> str | None:
+    """把 _score_report_step 那句接在 next_step 开头那句(ARCHIVED_STEP_HEAD)后面。没有 next_step(一篇都没存进去)就不加。"""
+    if not next_step or not next_step.startswith(ARCHIVED_STEP_HEAD):
+        return next_step
+    try:
+        step = _score_report_step(judge)
+    except Exception:                                   # noqa: BLE001 — 存档已经成功, 这一句写不出来也不能把回包弄坏
+        logger.warning("score_drafts: 参考分那句没写出来, next_step 不带它", exc_info=True)
+        return next_step
+    return ARCHIVED_STEP_HEAD + step + next_step[len(ARCHIVED_STEP_HEAD):]
 
 # 参考分怎么算(写给人看的口径, 协议里同一句): 满分 100; Jev 有把握(p ≥ SCORE_SURE_P)的硬伤每条 -25,
 # 拿不准的每条 -8, 有硬约束没判出答案的每条 -10; 正文太短判不了的不给分(score=None)。
@@ -3623,8 +3683,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                                  "先提交了撞车的稿子)")
                 tail = ""
                 if pre or race:
-                    tail = ("。这几条没有入库, 要重写后重新走 check_drafts, "
-                            "不能当作已交付")
+                    # 2026-10-30 发布收尾: 原来这里是「不能当作已交付」—— 可协议允许写手看过撞的是哪一条之后坚持要用, 模型夹在中间
+                    # 两头为难, 写手听到的是「不许交」。拒绝本身不变(没存档、没销牌); 写手坚持就原样交, 只说清后果, 一句话。
+                    tail = ("。这几条没有存档, 要重写后重新走 check_drafts; 用户看过撞的是哪一条还是坚持要用, 就原样交给他, "
+                            "用一句话告诉他这篇不会存进写作台的历史稿、分给它的那张牌也还挂着没销账")
                 if bad_ref:
                     # 这不是撞车, 是 replaces_version_id 给错了: 让人重写只会再错一次
                     # (codex #84 P2)。
@@ -3670,7 +3732,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     rules_step += (f"这批新稿 {len(out['check_rules_version_ids'])} 篇, check_rules 一次查 "
                                    f"{CHECK_RULES_MAX_VERSIONS} 篇: 照样整串传, 没查到的它放在返回的 remaining_version_ids "
                                    "里, 照它的 next_step 接着调。")
-                out["next_step"] = ("这批已存档。把 judge.results 里每篇的 score 和 fixes 照实告诉用户(不拦交付)。"
+                # 参考分那句(哪几篇要说、其余一句「合规检查都过了」)要看判定结果, 判定在锁外才跑 —— 跑完由 _with_score_report
+                # 接在 ARCHIVED_STEP_HEAD 后面(2026-10-30 发布收尾; 原来这里是「把每篇的 score 和 fixes 照实告诉用户」)。
+                out["next_step"] = (ARCHIVED_STEP_HEAD
                                     + rules_step +
                                     "用户要改哪篇: 改完带 replaces_version_id 再调 score_drafts。定稿由用户自己贴进飞书, "
                                     "发出去之后系统按内容自动对回来 —— 不用导出。")
@@ -3722,6 +3786,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                          project_id)
         out["judge"] = _judge_block(
             [], [], error=f"判定这一步整体失败({type(exc).__name__}: {exc}), 入库不受影响")
+    if out.get("next_step"):
+        out["next_step"] = _with_score_report(out["next_step"], out["judge"])
     judge_ms = _ms_since(judge_started)
 
     # 「commit_drafts 现在约 1~2 秒」在仓库里没有依据(设计审查 §5)—— 先量, 攒样本再定
@@ -7291,10 +7357,37 @@ def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None 
             "flywheel_arm": arm}
 
 
+# open_project 里借阅之后还要跑的几步留出来的时间(2026-10-30 发布收尾): 角度债 2~3 + 最近标题 2 + 最近结构 1 次库往返,
+# tools 那层的改动摘要 1~3 次, 每次 0.1~0.3 秒。借阅只拿 OPEN_PROJECT_RESPONSE_BUDGET_SEC 扣掉"已用"和这一段之后剩下的,
+# 账见 config.OPEN_PROJECT_BORROW_SEC 那段。
+OPEN_PROJECT_TAIL_RESERVE_SEC = 2.5
+
+
+def _brief_borrow_budget(started: float | None) -> float:
+    """open_project 这一次借阅能等多久: min(OPEN_PROJECT_BORROW_SEC, 回包目标 − 从 ``started`` 起已用 − 借阅之后的预留),
+    不小于 0。``started`` 为 None(不是从 build_writing_brief 来的)就只看 OPEN_PROJECT_BORROW_SEC。"""
+    cap = float(config.OPEN_PROJECT_BORROW_SEC)
+    if started is None:
+        return cap
+    left = (float(config.OPEN_PROJECT_RESPONSE_BUDGET_SEC) - (time.monotonic() - started)
+            - OPEN_PROJECT_TAIL_RESERVE_SEC)
+    return max(0.0, min(cap, left))
+
+
+# lessons_status.detail 在借阅超时时那句(念给模型的; 2026-10-30 发布收尾)。原来是"想要卡的话稍后调 borrow_lessons" ——
+# 模型多半就不调了, 这一场写下来一张卡都没参照。现在说清: 动笔之前、同样的参数、调一次; 还没有就照常写。
+BORROW_TIMEOUT_NOTE = ("这次随简报借卡没来得及选完(选卡要跑一次模型, 冷的时候要十几秒), 卡还在后台接着选。"
+                       "动笔之前调一次 borrow_lessons, 参数和这次 open_project 一样(tactic / draft_topic / key_messages / "
+                       "target_audience / tone / extra_instructions 照传, flywheel_arm 传这份简报里的), 选好了就能拿到; "
+                       "只调这一次, 还是没有卡就照常写, 不用再调, 也别跟用户说没有可借的经验。")
+
+
 def _borrow_for_brief_bounded(project: dict, delta: dict | None,
-                              budget: float | None = None, *, user_id: str | None = None) -> dict:
+                              budget: float | None = None, *, user_id: str | None = None,
+                              started: float | None = None) -> dict:
     """``open_project`` 用的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但**只等
-    ``OPEN_PROJECT_BORROW_SEC``**(默认 10 秒), 到点先把简报交出去。
+    ``OPEN_PROJECT_BORROW_SEC``**(默认 15 秒), 而且不超过整次回包目标里剩下的(``started`` 是 open_project 开始的
+    时刻, 见 _brief_borrow_budget), 到点先把简报交出去。
 
     为什么要有这一层(TV 2026-10-08 审计 A-04): 借阅原来直接在 open_project 的同步路径上
     等满 ``LIBRARIAN_TIMEOUT_SEC``(60 秒), 而 MCP 客户端只容忍 ~22 秒 —— 超过的不是"少几张
@@ -7302,10 +7395,10 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
     12 次超过 22 秒。馆员选卡要跑一次 LLM, 把 60 秒改小不行(test_librarian_timeout 钉着);
     把等待从必经路径上拆出来才行。
 
-    到点之后借阅线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型稍后调 borrow_lessons
-    (同参数命中缓存即回)就拿得到。``detail`` 里写清这一点, 模型读得到。
+    到点之后借阅线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型动笔之前调一次 borrow_lessons
+    (同参数命中缓存即回)就拿得到。``detail`` 里写清这一点(BORROW_TIMEOUT_NOTE), 模型读得到。
     """
-    budget = float(config.OPEN_PROJECT_BORROW_SEC if budget is None else budget)
+    budget = _brief_borrow_budget(started) if budget is None else float(budget)
     # 臂在这里先定: 借阅超时 / 线程起不来, 简报也要带着臂交出去 (入库时原样传回)
     arm = _borrow_arm(project.get("id"), user_id)
     try:
@@ -7333,9 +7426,7 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
                     "status": librarian_client.BORROW_TIMEOUT,
                     "elapsed_ms": int(budget * 1000),
                     "validated_patterns": [], "flywheel_arm": arm,
-                    "detail": (f"open_project 的借阅预算 {budget:g}s 内馆员没回(选卡要跑一次 LLM, "
-                               "冷路径常要 30-80s)。TV 那边会继续选完并写缓存 —— 想要卡的话稍后"
-                               "调 borrow_lessons, 同样的选题/战术参数命中缓存即回")}
+                    "detail": BORROW_TIMEOUT_NOTE}
     finally:
         ex.shutdown(wait=False)
 

@@ -201,7 +201,19 @@ JUDGE_DRAFT_TOOL_TIMEOUT_SEC: float = _bounded_number("JUDGE_DRAFT_TOOL_TIMEOUT_
 # 交出去(lessons_status.status=timeout), 借阅线程继续跑完、TV 那边照样写缓存, 模型想要卡
 # 时调 borrow_lessons 同参数命中缓存即回。borrow_lessons 工具本身仍等满 LIBRARIAN_TIMEOUT_SEC
 # (那是写手明确要卡时的等待, 不在必经路径上)。上限 20: 必须留在 ~22 秒客户端容忍之内。
-OPEN_PROJECT_BORROW_SEC: float = _bounded_number("OPEN_PROJECT_BORROW_SEC", 10.0, 1.0, 20.0)
+# 2026-10-30 发布收尾: 默认 10 → 15 秒。最近几次冷借 14~18 秒, 10 秒的预算让简报常常不带卡、叫模型"稍后再调"。
+# 15 秒放得下, 是因为借阅实际等的不是这个数本身, 而是 min(本值, 下面的回包目标 − 借阅之前已用 − 借阅之后的预留)
+# (core._brief_borrow_budget, 同 commit_drafts 给判定算截止的办法)。账这样算(open_project 里借阅之外的几步):
+#   · 借阅之前: 项目行 1 + 规则 1~2 + 正 / 反例 2 + 个人校准 1 次库往返, 外加 brief 文本的 1 次 embedding,
+#     每次 0.1~0.5 秒, 合计约 1~3 秒;
+#   · 借阅之后: 角度债 2~3 + 最近标题 2 + 最近结构 1 次库往返, tools 那层的改动摘要 1~3 次, 合计约 1~2 秒 ——
+#     预留 core.OPEN_PROJECT_TAIL_RESERVE_SEC(2.5 秒)。
+#   前面 2 秒 + 借阅 15 + 后面 2 = 19 秒, 在 20 秒的回包目标之内; 前面慢到 3 秒以上, 借阅就自动少等(20 − 3 − 2.5 = 14.5),
+#   整次仍不过 20。代价: 18 秒的那种冷借这次照样拿不到卡, 只能靠回包里那句"动笔前调一次 borrow_lessons"。
+OPEN_PROJECT_BORROW_SEC: float = _bounded_number("OPEN_PROJECT_BORROW_SEC", 15.0, 1.0, 20.0)
+# open_project 整次的回包目标, 同 COMMIT_RESPONSE_BUDGET_SEC(20 = 客户端 ~22 秒留 2 秒余量; 不开 env, 要改先看实测)。
+# 借阅只拿它扣掉"借阅之前已用"和"借阅之后的预留"剩下的那段, 不够 0 就一秒都不等(借阅线程照样起, TV 那边照样写缓存)。
+OPEN_PROJECT_RESPONSE_BUDGET_SEC: float = 20.0
 # 一次 commit 里最多同时发几篇。judge 那边 /judge_draft 一篇一请求、由 uvicorn 线程池并发;
 # Jev 限流 1,200 次/分。一篇 2~4 次 Jev 调用, 8 路并发 ≈ 每秒十来次, 离限流很远。
 JUDGE_MAX_WORKERS: int = int(_bounded_number("JUDGE_MAX_WORKERS", 8, 1, 16))
