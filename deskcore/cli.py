@@ -414,6 +414,15 @@ def _tv_sync(core, sb, args) -> int:
         if sn.get("error"):
             print(f"  ⚠️ 查重底稿那一步出错: {sn['error']} —— 已对上的对照照常写了; 没做完的明晚接着做。")
             rc = 1
+        pf = out.get("published_fp") or {}
+        if pf.get("to_write"):
+            # W-40: 对上写作台版本的帖, 发出去的文字记在那一版下(按文字幂等; 第一晚会把以前对上的一起补上)
+            print(f"  帖的文字进指纹库(W-40): " + (f"会记 {pf['to_write']} 篇" if out.get("dry_run") else
+                                                 f"记了 {pf['written']} 篇")
+                  + f"(核了 {pf['checked']} 篇对上写作台版本的帖, 其余的文字已经在库里)")
+        if pf.get("error"):
+            print(f"  ⚠️ 帖的文字没记进指纹库: {pf['error']} —— 对照照常写了; 下一晚按文字再补。")
+            rc = 1
         ed = out.get("edit_diffs") or {}
         if ed:
             print(f"  改动差异: 算了 {ed.get('computed', 0)} 对(改过的 {ed.get('changed', 0)}, 补算以前的 "

@@ -2431,6 +2431,36 @@ def fingerprint_keys(sb, project_id: str, version_ids: list[str]) -> dict[str, s
     return out
 
 
+def fingerprint_meta(sb, project_id: str, version_ids: list[str]) -> dict[str, dict]:
+    """这几版已有的指纹行(W-40): ``{version_id: {"pairs", "created_at", "user_id", "angle_key"}}``。``pairs`` 每行一个
+    ((开头哈希, 四字串 sketch), 标题原文) —— 正文同 fingerprint_keys, 标题由调用方规范化;
+    写手 / angle_key / 时刻取这一版最早那行(底稿或存档时记的那行) —— 帖的文字记在同一版下, 跟着它走。没有指纹行的版本不在里面。"""
+    out: dict[str, dict] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        rows = (sb.table("draft_fingerprints")
+                .select("version_id, title, opening_hash, ngram_hashes, created_at, user_id, angle_key")
+                .eq("project_id", project_id).in_("version_id", chunk).execute()).data or []
+        for r in sorted(rows, key=lambda r: str(r.get("created_at") or "")):
+            if not r.get("version_id"):
+                continue
+            m = out.setdefault(str(r["version_id"]), {"pairs": set(), "created_at": r.get("created_at"),
+                                                       "user_id": r.get("user_id"), "angle_key": r.get("angle_key")})
+            m["pairs"].add(((r.get("opening_hash") or "", tuple(sorted(r.get("ngram_hashes") or []))),
+                            r.get("title") or ""))
+            m["angle_key"] = m["angle_key"] or r.get("angle_key")
+    return out
+
+
+def version_times(sb, version_ids: list[str]) -> dict[str, str]:
+    """``{version_id: created_at}``(W-40: 那一版没有指纹行时, 帖的那一行按它自己建的时刻记)。"""
+    out: dict[str, str] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):
+        for r in (sb.table("versions").select("id, created_at").in_("id", chunk).execute()).data or []:
+            if r.get("created_at"):
+                out[str(r["id"])] = r["created_at"]
+    return out
+
+
 def snapshot_states(sb, ids: list[str]) -> dict[str, str | None]:
     """这几行底稿现在转没转正: ``{id: 转到的 version_id}``, 还没转正的是 None, 已经删了的不在里面。"""
     out: dict[str, str | None] = {}
