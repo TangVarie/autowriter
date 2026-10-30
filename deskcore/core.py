@@ -693,6 +693,8 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     atomic = reserved is not None
     if not atomic:
         # RPC 不在(迁移没跑)。降级到旧的"读-挑-插"三步, 并明确告知不是原子的。
+        logger.warning("draw_angles: 本次发牌不是原子的(deskcore_reserve_angles RPC 不存在, migrations/001 "
+                       "可能没跑, project=%s)", project_id)
         avoid = store.recent_angle_keys(client, project_id, avoid_days)
         # 先去掉避重的再重排一次: 这条路上知道哪些被挡, 错开得比 RPC 那条路还准
         reserved = _spread_order([c for c in candidates if c["angle_key"] not in avoid], n)[:n]
@@ -744,9 +746,9 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
         "combination_space": vocab.combination_space(),
         "note": ("发到的组合少于请求数, 说明近期用掉太多; 可以调小 avoid_days 或分批写。"
                  if len(picked) < n else ""),
+        # 念给写手的只说后果; RPC / 迁移号在上面 atomic 判定那里记日志
         "warning": ("" if atomic else
-                    "本次发牌不是原子的(deskcore_reserve_angles RPC 不存在, "
-                    "migrations/001 可能没跑)。并发发牌时可能与队友撞车。"),
+                    "这次发牌没能锁住角度: 队友同时发牌时可能抽到同一组。已记下, 不用你做什么。"),
     }
 
 
@@ -812,9 +814,11 @@ class HistHit(NamedTuple):
 
 def _history_probe(client, project_id: str, o_hashes: list[str],
                    grams: list[set], new_vecs):
-    """返回 ``(probe, hist_size, hist_with_vec, hist_truncated)``。
+    """返回 ``(probe, hist_size, hist_with_vec, hist_untitled, hist_truncated)``。
 
     ``probe(i)`` → ``HistHit`` —— 第 i 篇草稿与【历史】比对的四路最佳命中。
+    ``hist_untitled`` 是空标题、也没有向量的历史条数: 它们永远算不出标题向量, 不算"缺"
+    (见 store.fingerprint_stats 的说明), 由 _gate 从缺向量的数里减掉。
 
     两条实现共用这一个形状:
 
@@ -874,8 +878,14 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                 f"deskcore_check_drafts 回执缺 {len(missing)}/{len(payload)} 篇"
                 f"(idx={missing[:5]}) —— 拒绝按'没撞车'放行")
         # 口径是"有【本模型】向量的条数" —— 见 store.fingerprint_stats 的说明。
-        total, with_vec = store.fingerprint_stats(client, project_id,
-                                                  dedup.EMBEDDING_MODEL)
+        total, with_vec, untitled = store.fingerprint_stats(client, project_id,
+                                                            dedup.EMBEDDING_MODEL)
+        # 老版 RPC(只跑过 migrations/004)回不出包含度三列。写手那边只听到「这一路没查成」(见 _gate),
+        # 到底是哪个迁移没跑只在这里说一次。
+        if rows and any("c_sample" not in r for r in rows):
+            logger.warning("deskcore_check_drafts 回执没有包含度三列(project=%s): 库里只跑了 migrations/004、"
+                           "没跑 005, 短稿照搬长稿这一路在 check 这一关不发言 —— 跑 migrations/005 修好",
+                           project_id)
 
         def _probe(i: int) -> HistHit:
             r = by_idx.get(i) or {}
@@ -904,7 +914,7 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             )
 
         # 下推路径比的是【全量】—— 库里没有 4000 条那个上限, 所以永不截断。
-        return _probe, total, with_vec, False
+        return _probe, total, with_vec, untitled, False
 
     logger.warning(
         "deskcore_check_drafts RPC 不存在(migrations/004 没跑) —— 本次退回 "
@@ -924,6 +934,9 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
                  if h.get("embedding_model") == dedup.EMBEDDING_MODEL else None
                  for h in history]
     with_vec = sum(1 for v in hist_vecs if v)
+    # 与 store.fingerprint_stats 同一口径: 空标题且没向量的行不算缺。
+    untitled = sum(1 for h in history
+                   if not (h.get("title") or "") and not h.get("title_embedding"))
 
     def _probe_py(i: int) -> HistHit:
         best_sim, sim_hit = 0.0, None
@@ -963,7 +976,7 @@ def _history_probe(client, project_id: str, o_hashes: list[str],
             c_sample,
         )
 
-    return _probe_py, len(history), with_vec, truncated
+    return _probe_py, len(history), with_vec, untitled, truncated
 
 
 def _rpc_missing_telemetry(name: str, project_id: str) -> None:
@@ -1068,7 +1081,7 @@ def _gate(client, project_id: str, titles: list[str], bodies: list[str],
     # ── 与历史比对: 优先下推到库里(审计 SUP-002 / ROB-004 / ROB-011)──────
     # ``hist`` 是一个「按 i 取四路最佳命中」的可调用对象, 两条路径共用同一个
     # 形状, 下面拼 verdict 的代码因此完全不用分叉。
-    hist, hist_size, hist_with_vec, hist_truncated = _history_probe(
+    hist, hist_size, hist_with_vec, hist_untitled, hist_truncated = _history_probe(
         client, project_id, o_hashes, grams, new_vecs)
 
     # ⚠️ 降级判定不能只看"这批能不能算向量"(codex review P1)。
@@ -1076,13 +1089,15 @@ def _gate(client, project_id: str, titles: list[str], bodies: list[str],
     # 就会这样, 而且没有回填路径。那种情况下 new_vecs 非空、看起来正常, 但每一条
     # 历史都在下面被跳过, 标题语义这一路【实际没跑】,
     # 却报 semantic_degraded=false 让调用方以为全套硬闸都过了。
-    hist_missing_vec = hist_size - hist_with_vec
-    semantic_ran = bool(new_vecs) and (hist_with_vec > 0 or hist_size == 0)
+    #
+    # ⚠️ 但空标题的历史行【不算缺】(2026-10-30)。它们永远算不出标题向量, 也没有补的出口 —— 原来算进缺的那一边,
+    # 一个项目只要补录过一条空标题的帖, 之后每一批都报 degraded, 写手每次都听一遍「没跑全」, 而那一路其实对每一条
+    # 有标题的历史都比过了。有标题、没向量的照样算缺。(口径见 store.fingerprint_stats)
+    # 几个数来自分开的几次 count, 中间有人删行时可能对不齐, 钳到 0, 别报出一个负数。
+    hist_missing_vec = max(0, hist_size - hist_with_vec - hist_untitled)
+    hist_titled = max(0, hist_size - hist_untitled)
+    semantic_ran = bool(new_vecs) and (hist_with_vec > 0 or hist_titled == 0)
     degraded = not semantic_ran or hist_missing_vec > 0
-    if degraded:
-        logger.warning("semantic dedup degraded (project=%s): new_vecs=%s "
-                       "history_with_vec=%d/%d",
-                       project_id, bool(new_vecs), hist_with_vec, hist_size)
 
     results = []
     contain_ran = False          # 有没有任何一篇真的跑过包含度这一路
@@ -1164,49 +1179,56 @@ def _gate(client, project_id: str, titles: list[str], bodies: list[str],
         "history_size": hist_size,
         "history_with_embedding": hist_with_vec,
         "history_missing_embedding": hist_missing_vec,
+        # 空标题、没向量的历史条数: 不算在 history_missing_embedding 里(见上面降级判定那段)
+        "history_untitled": hist_untitled,
         "history_truncated": hist_truncated,
         "semantic_degraded": degraded,
         "containment_checked": contain_ran,
     }
+    # ── 下面几句是**原样念给写手的**(2026-10-30 发布收尾)────────────────────────
+    # 只说发生了什么、交付照不照常; 命令、迁移号、环境变量、表名一律进 logger.warning, 不进返回值 ——
+    # 原来这里写着 `python -m deskcore.cli backfill` / migrations/004 之类, 模型照念, 写手每批听一遍看不懂、
+    # 也做不了的工程指令。写手手里没有任何一步能补这些, 不能说成是他们要做什么。
     if hist_size and not contain_ran:
-        # 审计 COR-014: 包含度这一路一次都没真的发言。两种可能, 都要说出来 ——
-        # 静默不发言正是这条 finding 本身的形态(有个信号没跑, 而返回值看起来
-        # 一切正常)。
+        # 审计 COR-014: 包含度这一路一次都没真的发言。静默不发言正是这条 finding 本身的形态(有个信号没跑,
+        # 而返回值看起来一切正常), 所以照样说; 老版 RPC 回不出包含度那种情形 _history_probe 已经记了日志。
         summary["containment_skipped_warning"] = (
-            "「短稿照搬长稿」这一路本次没有生效: 要么草稿太短、与历史稿的长度差"
-            "太大, 有效样本量不够(低于 "
-            f"{fp.CONTAIN_MIN_SAMPLE} 就不发言, 免得噪声误杀); 要么服务端只跑了 "
-            "migrations/004 而没跑 005(老版 RPC 回不出包含度)。"
-            "另外三路照常跑了, 但整段照搬一篇长稿的重复可能漏掉 —— 要告诉用户。")
+            "「短稿整段照搬长稿」这一路这次没查成(多半是草稿和历史稿长短差太多, 能比的字数不够), "
+            "另外三路照常查了; 整段照搬一篇长稿的重复这次可能漏掉。已记下, 交付照常, 不用你做什么。")
     if hist_truncated:
         # history_size 报的是【实际比过的条数】, 但项目的历史比这更多。
         # 不说出来的话, "比对全量历史" 就成了一句假话。
         # 下推路径不会走到这里(库里是全量比的, hist_truncated 恒为 False),
         # 只有 migrations/004 没跑、退回 Python 路径时才可能命中。
+        logger.warning("check_drafts: 项目 %s 的历史指纹超过 %d 条, 只比了最近的这些 —— 退回了 Python 路径"
+                       "(migrations/004 没跑?), 长期解法是把比对下推到数据库(docs/deskcore.md §7)",
+                       project_id, hist_size)
         summary["history_truncated_warning"] = (
-            f"这个项目的历史指纹超过 {hist_size} 条, 本次只比了最近的这些。"
-            "更老的稿子没参与查重, 跟它们的重复不会被发现 —— 要告诉用户。"
-            "长期解法是把比对下推到数据库(migrations/004, 见 docs/deskcore.md §7)。")
+            f"这个项目的历史稿超过 {hist_size} 篇, 这次只和最近的 {hist_size} 篇比了, 更早的没参与查重。"
+            "已记下, 交付照常, 不用你做什么。")
     # 指纹库是空的但项目其实有历史 = 没回填。硬闸背后什么都没有, 必须说出来,
     # 不能让调用方以为"比对了全量历史然后没撞车"。
     if not hist_size:
+        logger.warning("check_drafts: 项目 %s 的指纹库一条历史都没有 —— 不是新项目的话说明还没回填, "
+                       "跑 `python -m deskcore.cli backfill --project %s`", project_id, project_id)
         summary["empty_history_warning"] = (
-            "指纹库里这个项目一条历史都没有。如果这不是全新项目, 说明【还没回填】——"
-            "本次查重实际只在本批内部比对, 跟历史稿的重复不会被发现。"
-            "跑 `python -m deskcore.cli backfill --project <id>` 补上。")
+            "查重库里这个项目还没有历史稿, 这次只在本批内部比了(新项目本来就是这样)。"
+            "已记下, 交付照常, 不用你做什么。")
 
     if degraded:
+        # 原因只进日志: 写手那边一句话就够, 而且一个字都不该是要他们去做的事。
         why = []
         if not new_vecs:
             why.append("本批标题算不出向量(GOOGLE_API_KEY 未配或 embedding 调用失败)")
         if hist_missing_vec:
-            why.append(f"{hist_missing_vec}/{hist_size} 条历史没有 title_embedding"
-                       f"(当初 commit 时 embedding 不可用, 且没有回填路径 —— "
-                       f"跑 `python -m deskcore.cli backfill --project <id>` 可补)")
-        summary["degraded_note"] = (
-            "标题语义查重【没有完整跑】: " + "; ".join(why) +
-            "。确定性信号(开头精确 + 四字串重合)仍然有效, 但同角度换说法的标题"
-            "可能漏过 —— 要告诉用户。")
+            # 补已经在指纹库里的行是 reembed 的活, 不是 backfill(见 reembed_fingerprints 的说明)
+            why.append(f"{hist_missing_vec}/{hist_titled} 条有标题的历史没有本模型的 title_embedding"
+                       f"(跑 `python -m deskcore.cli reembed --project {project_id}` 可补)")
+        logger.warning("semantic dedup degraded (project=%s): new_vecs=%s history_with_vec=%d/%d "
+                       "(另有 %d 条空标题, 不算缺): %s",
+                       project_id, bool(new_vecs), hist_with_vec, hist_size, hist_untitled,
+                       "; ".join(why))
+        summary["degraded_note"] = "这次标题语义查重没跑全, 已记下; 交付照常, 不用你做什么。"
     return {"results": results, "summary": summary}
 
 
@@ -1551,19 +1573,27 @@ def _judge_project_context(client, project_id: str) -> dict:
     多个 TV 项目时取补录目标那一行(``ingest_target``), 没有就按项目号排第一个; 品类
     只要有一个是处方药就报处方药(见 ``_RX_CATEGORY``)。品类读不到就只发项目号。
 
+    ``detail`` 会原样进 score_drafts / judge_draft / check_rules 的返回值, 是念给写手的那一句, 所以只说"这次判不了、
+    不影响什么"; 补救命令和异常原文进日志和 ``ops_detail``(只给 CLI 的 compile-rules 打印, 2026-10-30 发布收尾)。
+
     ⚠️ 这两次查库会卡: 只许在 ``_judge_committed`` 的工作线程里、共同截止之内调。
     """
     try:
         maps = [m for m in store.tv_projects_of(client, project_id) if m.get("tv_project_id")]
     except Exception as exc:                            # noqa: BLE001 — 009 没跑 / 库故障
+        ops = f"查 tv_project_map 失败({type(exc).__name__}: {exc})"
+        logger.warning("judge: %s (project=%s), 这次一篇都不发", ops, project_id)
         return {"project": None, "category": None, "status": judge_client.JUDGE_ERROR,
-                "detail": f"查 tv_project_map 失败({type(exc).__name__}: {exc})"}
+                "detail": "这次没查到项目对照, 判不了; 已记下, 不影响存档和交付, 不用重试。",
+                "ops_detail": ops}
     if not maps:
+        ops = ("这个项目没接 tv_project_map, 判不出 TV 项目号与品类 —— 数据出境口径(docs/00 #7)下不发。"
+               f"补救: python -m deskcore.cli tv-map add --tv-project <TV 项目号> --project {project_id}")
+        logger.warning("judge: %s", ops)
         return {"project": None, "category": None,
                 "status": judge_client.JUDGE_NOT_CONFIGURED,
-                "detail": ("这个项目没接 tv_project_map, 判不出 TV 项目号与品类 —— 数据出境"
-                           "口径(docs/00 #7)下不发。补救: python -m deskcore.cli tv-map add "
-                           "--tv-project <TV 项目号> --project <本项目 id>")}
+                "detail": "这个项目还没接上判定服务, 这次判不了; 已记下, 不影响存档和交付, 不用你做什么。",
+                "ops_detail": ops}
     maps.sort(key=lambda m: (not m.get("ingest_target"), str(m["tv_project_id"])))
     project = str(maps[0]["tv_project_id"])
     cats = store.tv_project_categories(client, [m["tv_project_id"] for m in maps])
@@ -1677,8 +1707,9 @@ def _judge_committed(client, project_id: str, targets: list[dict],
     if not judge_client.configured():
         # 没配就一个请求都不发、一次库都不查 —— 没接 judge 的部署与改动前完全一样。
         nc = judge_client.result(judge_client.JUDGE_NOT_CONFIGURED)
+        # 没配是部署层面的事(judge_status=not_configured 已经落进 batch_metrics), 写手那边只说没打成分
         return _judge_block([_judge_row(t, nc) for t in targets], skipped,
-                            detail="JUDGE_URL / JUDGE_API_KEY 未配置")
+                            detail="这个写作台还没接判定服务, 这次没打分; 不影响存档和交付, 不用你做什么。")
 
     budget = judge_client.timeout_sec() if budget is None else budget
     if budget < _JUDGE_MIN_BUDGET_SEC:
@@ -1711,10 +1742,11 @@ def _judge_committed(client, project_id: str, targets: list[dict],
             ctx, send, not_ours, failed = ex.submit(_prepare).result(timeout=_left())
         except cf.TimeoutError:
             to = judge_client.result(judge_client.JUDGE_TIMEOUT)
+            logger.warning("judge: 发之前的查库(tv_project_map / TV 品类 / 自带 version_id 的归属)在整批判定的"
+                           "共同截止 %.1fs 内没查完, 一篇都没发 (project=%s)", budget, project_id)
             return _judge_block(
                 [_judge_row(t, to) for t in targets], skipped,
-                detail=(f"发之前的查库(tv_project_map / TV 品类 / 自带 version_id 的归属)在整批"
-                        f"判定的共同截止 {budget:g}s 内没查完, 一篇都没发 —— 入库不受影响"))
+                detail=(f"发判定之前查库超时({budget:g}s), 这次一篇都没发、没打分; 不影响存档和交付, 不用重试。"))
         if ctx["project"] is None:
             res = judge_client.result(ctx["status"])
             return _judge_block([_judge_row(t, res) for t in targets], skipped,
@@ -1773,7 +1805,7 @@ def _judge_tool_call(client, project_id: str, title: str, body: str, *, user_id,
         return {**base, "judge_status": judge_client.JUDGE_BAD_REQUEST, "detail": "body 不能为空"}
     if not judge_client.configured():
         return {**base, "judge_status": judge_client.JUDGE_NOT_CONFIGURED,
-                "detail": "JUDGE_URL / JUDGE_API_KEY 未配置: 这个 deskcore 部署没接判定服务"}
+                "detail": "这个写作台还没接判定服务, 这次判不了; 不用重试, 不用你做什么。"}
     # 项目号 / 品类的两次查库也算进同一个墙钟截止 (codex review on #95, P2): PostgREST 客户端默认 120 秒超时,
     # 库一卡这个同步工具就远超 MCP 客户端 ~22 秒的容忍, 还不会报 timeout。做法同 _judge_committed: 查库在工作线程里、
     # 到点就记 timeout 一个请求都不发; 查完了判定只拿剩下的时间。
@@ -1784,8 +1816,10 @@ def _judge_tool_call(client, project_id: str, title: str, body: str, *, user_id,
         try:
             ctx = ex.submit(_judge_project_context, client, project_id).result(timeout=budget)
         except cf.TimeoutError:
+            logger.warning("judge_draft: 发之前的查库(tv_project_map / TV 品类)在 %.1fs 内没查完, 没发判定 "
+                           "(project=%s)", budget, project_id)
             return {**base, "judge_status": judge_client.JUDGE_TIMEOUT, "elapsed_ms": _ms_since(started),
-                    "detail": f"发之前的查库(tv_project_map / TV 品类)在 {budget:g}s 内没查完, 没发判定"}
+                    "detail": f"发判定之前查库超时({budget:g}s), 这次没判; 不用重试。"}
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
     if ctx["project"] is None:
@@ -1843,8 +1877,10 @@ def repair_plan_for(client, project_id: str, title: str, body: str, *, user_id: 
         return out
     resp = res.get("response")
     if not isinstance(resp, dict) or "plan" not in resp:
+        logger.warning("repair_plan_for: judge 的 /judge_draft 响应里没有 plan(project=%s) —— 服务端版本太旧, "
+                       "或 JUDGE_URL 不是 judge 服务?", project_id)
         out.update(judge_status=judge_client.JUDGE_ERROR,
-                   detail="judge 的 /judge_draft 响应里没有 plan(服务端版本太旧, 或 JUDGE_URL 不是 judge 服务?)")
+                   detail="判定服务这次没给出改稿方案, 已记下; 不用重试, 不用你做什么。")
         return out
     out.update(plan=resp["plan"], recorded=resp.get("recorded", []), passed=resp.get("passed"),
                invalid_reason=resp.get("invalid_reason"), policy=resp.get("policy"), calls=resp.get("calls"))
@@ -2255,7 +2291,7 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tu
     if project_id:
         if str(project_id) not in ids:
             raise PermissionError(
-                f"这条链接的笔记不属于你给的项目 {project_id}(tv_project_map 里没有这一对)。"
+                f"这条链接的笔记不属于你给的项目 {project_id}。"
                 "是不是链接贴错了, 或者项目选错了? 帖子不在 TV 里对得上的话, 把正文贴过来、不带链接也行。")
         return assert_project_access(client, project_id, user_id=user_id), []
     if len(ids) > 1 and note.get("note_id"):
@@ -2283,7 +2319,7 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tu
     if mine:
         return None, [{"id": p["id"], "name": p.get("name")} for p in mine]
     raise PermissionError(
-        "这条链接的笔记没有对到任何归你的写作台项目上(tv_project_map 里没有, 或者那个项目不归你)。"
+        "这条链接的笔记没有对到任何归你的写作台项目上(还没接上, 或者那个项目不归你)。"
         "告诉我要写的是哪个项目, 并把帖子正文贴过来。")
 
 
@@ -3068,37 +3104,43 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                              "照旧原样传回 open_project / borrow_lessons 返回里的 flywheel_arm。")}
             if key_problems:
                 out["angle_key_mismatch"] = key_problems
+            # ── 下面这几句 *_warning 是念给写手的(2026-10-30 发布收尾): 只说发生了什么、要不要重来; 异常原文、表名、
+            #    补救命令一律进日志, 写手手里没有任何一步能补这些。
             if replace_error:
                 missed = [i for i in sorted(inserted_idx) if i in replace and i not in replaced_ok]
+                logger.warning("commit_drafts: %d 条替换稿的新指纹入了库, 但没能挂到旧稿上(%s), 下标 %s; 旧稿的 "
+                               "best_version_id 还指着旧版 (project=%s)", len(missed), replace_error, missed, project_id)
                 out["replace_warning"] = (
-                    f"{len(missed)} 条替换稿的新指纹入了库, 但没能挂到旧稿上({replace_error})。"
-                    "查重不受影响; 旧稿的 best_version_id 还指着旧版, 导出会拿到旧文。"
-                    f"没接上的是第 {missed} 条。服务端日志有堆栈。")
+                    f"{len(missed)} 条改稿存进去了、查重照常, 但没能挂到旧稿上(第 {missed} 条)。"
+                    "已记下, 不用重存, 不用你做什么。")
             if identity_error:
                 # 说清楚**丢的是哪几条**: 查重没事, 断的是"发出去之后能不能归因回来"。
                 # ⚠️ 报的是**实际没建成的条数**, 不是 len(to_mint) —— 半途失败时前面几条
                 #    是真建成了的, 说"全都没建成"会让人去重做已经做完的事。
                 done = len(minted_ok)
+                logger.warning("commit_drafts: %d 条指纹都入了库, 只有 %d 条建成了 items/versions (batch=%s, "
+                               "project=%s): %s —— 没建成的发出去之后 tv-sync 对不回这一版、只会当新稿补录; "
+                               "带角度没销账的 %d 条", len(to_mint), done, out.get("batch_id"), project_id,
+                               identity_error, unminted_angles)
                 out["identity_warning"] = (
-                    f"{len(to_mint)} 条稿子的指纹都入了库, 但只有 {done} 条建成了 "
-                    f"items/versions({identity_error})。查重不受影响; 受影响的是发布后对回来 —— "
-                    f"没建成的那 {len(to_mint) - done} 条不在 version_ids 里、没有底稿, 发出去之后 tv-sync 对不回"
-                    "这一版, 只会当成新稿补录(写作台的参考分、改动差异都接不上)。"
+                    f"{len(to_mint)} 条稿子都存进了查重库, 但只有 {done} 条建成了底稿。查重不受影响; "
+                    f"没建成的那 {len(to_mint) - done} 条不在 version_ids 里, 发出去以后写作台认不回这一版"
+                    "(参考分、改动对照接不上)。"
                     + (f"已建成的那 {done} 条(batch {out['batch_id']})不受影响。" if done else "")
-                    + "要补的话告诉工程侧(服务端日志有这批的 batch 和堆栈), 不用让写手重写。"
-                    + (f"没建成的里 {unminted_angles} 条带着角度, 台账**没销账**(销了会指向"
-                       "不存在的版本), 那几个坐标下一批还会被抽到。" if unminted_angles else "")
-                    + "服务端日志有堆栈。")
+                    + (f"没建成的里 {unminted_angles} 条带着角度, 这几张牌**没销账**, 下一批可能还会抽到。"
+                       if unminted_angles else "")
+                    + "已记下, 不用重写, 不用你做什么。")
             if embed_failed and written:
                 # 配了 embedding 却没拿到向量 = 故障(欠费/配额/网络), 不是"没配"。
                 # 必须当场说, 让人决定是先修 key 再 commit, 还是接受这批只有确定性指纹。
                 # (2026-08-25 起这几行**补得回来**了 —— 稿子有了 versions 行, backfill
-                #  和 reembed 都扫得到。文案里保留 reembed 的指路, 它更直接。)
+                #  和 reembed 都扫得到。reembed 更直接, 指路只进日志: 那是工程侧的事, 写手做不了。)
+                logger.warning("commit_drafts: 配了 embedding 但本次取向量失败, %d 条没有标题向量入库 (project=%s) "
+                               "—— 常见原因是 key 欠费/配额用尽/网络不通; 修好之后跑 "
+                               "`python -m deskcore.cli reembed --project %s` 补齐", written, project_id, project_id)
                 out["embedding_warning"] = (
-                    f"配了 embedding 但本次取向量失败, {written} 条是【没有标题向量】入库的。"
-                    "它们以后只参与确定性查重(开头精确 + 四字串重合), 同角度换说法的标题"
-                    "比不出来。常见原因是 key 欠费/配额用尽/网络不通。"
-                    "修好 key 之后用 `python -m deskcore.cli reembed --project <id>` 补齐。")
+                    f"这次存档时标题向量没算出来, {written} 条暂时只参与开头和正文重合的查重"
+                    "(同角度换说法的标题比不出来)。已记下, 交付照常, 不用你做什么。")
             other_missed = attempted - consumed - len(key_problems)
             if attempted and other_missed > 0:
                 # consume_angle 现在会在"台账里根本没这一行"时返回 False(见 store 里的
@@ -3109,13 +3151,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     f"{other_missed}/{attempted} 个坐标没能在台账上销账("
                     + ("台账里有这一行, 是查台账或写台账时出了错、或者被并发抢先" if keys_classified
                        else "没查清是 key 对不上台账、还是写台账时出了错")
-                    + ")。这些坐标下一批可能被重复抽到, 服务端日志有明细。")
+                    + ")。这些坐标下一批可能被重复抽到; 已记下, 不用你做什么。")
             if rpc_anomalies:
                 out["rpc_anomalies"] = rpc_anomalies
                 out["rpc_warning"] = (
-                    f"入库 RPC 回了 {rpc_anomalies} 行对不上号的回执(idx 越界), 已跳过。"
-                    "指纹可能已写入但这几条的身份/销账没做 —— 服务端日志有明细, 别重试, "
-                    "重试会撞上自己刚写的指纹。")
+                    f"存档回执里有 {rpc_anomalies} 行对不上号, 已跳过并记下: 这几条可能已经存进去了, "
+                    "但底稿 / 销账没做。别重试 —— 重试会撞上刚存进去的这几条。")
             if unattributed or key_problems:
                 # 只报个数没用 —— 这正是简报那段 angle_debt 踩过的:
                 # 新开一场对话时上一次 draw_angles 的返回早就不在上下文里, 只说
@@ -3215,9 +3256,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                                  "本身没问题, 改对 id 再提交一次, 不用重写")
                 out["note"] = "; ".join(parts) + tail + "。"
             if not atomic:
-                out["warning"] = ("本次入库没有做原子重查(deskcore_commit_fingerprints RPC "
-                                  "不存在, migrations/001 可能没跑)。并发 check/commit 时"
-                                  "可能有撞车的稿子一起进库。")
+                logger.warning("commit_drafts: 本次入库没有做原子重查(deskcore_commit_fingerprints RPC 不存在, "
+                               "migrations/001 可能没跑, project=%s)", project_id)
+                out["warning"] = ("这次存档没做并发重查: 队友同时存档时, 可能有撞车的稿子一起存进去。"
+                                  "已记下, 不用你做什么。")
             # 存档之后的下一步写进返回值(D-120: 人审和导出两个工具已经撤了, 模型最容易犯的错变成"让用户导出 / 等用户
             # 说定稿")。只在真存进去了时说(codex review on #94, P2 同一个理由): written=0 时没有版本可说。
             if out.get("written"):
@@ -5267,7 +5309,7 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
             # 运维环节, 而这一轮做 reembed_my_rules 就是为了消灭那个环节。
             # (codex review · PR #74)
             "**调 reembed_my_rules 就能补**(一次 50 条, 按返回的 remaining 重复调"
-            "直到归零), 不需要找运维。"
+            "直到归零), 不用找别人。"
             "走 record_rule 新记的规则会在写入时自动算(db.upsert_memory), "
             "所以这个数只会往下走, 不会自己涨。")
     return res
@@ -5299,14 +5341,19 @@ def reembed_my_rules(client, *, user_id: str, batch: int = 50) -> dict:
     # 一个 remaining 数字, 完全可能当作"补完了"往下走。SKILL.md 里也写着这个
     # 工具"出错一律直接报错" —— 返回字典会让代码和文档对不上。
     # (codex review · PR #74 · P1)
+    # 报错文本是念给写手的(2026-10-30 发布收尾): 环境变量、列名、迁移只进日志, 写手那边只说"这次补不了、不是没东西补"。
     if status == "no_embedding_sdk":
+        logger.warning("reembed_my_rules: 服务端没配 GOOGLE_API_KEY(或 embedding SDK 缺失), 补算功能不可用 (user=%s)",
+                       user_id)
         raise RuntimeError(
-            "服务端没配 GOOGLE_API_KEY, 补算功能不可用 —— 这不是「没有需要补的」, "
-            "是环境缺配置, 要告诉运维")
+            "这次补不了: 服务端暂时算不了向量(不是「没有需要补的」)。已记下, 规则照常生效, "
+            "不用重试, 不用你做什么。")
     if status == "schema_missing":
+        logger.warning("reembed_my_rules: memories.embedding 列不存在, 需要先跑 pgvector 迁移: %s",
+                       (out or {}).get("hint") or "")
         raise RuntimeError(
-            f"memories.embedding 列不存在, 需要先跑 pgvector 迁移: "
-            f"{(out or {}).get('hint') or ''}")
+            "这次补不了: 服务端还不支持规则向量(不是「没有需要补的」)。已记下, 规则照常生效, "
+            "不用重试, 不用你做什么。")
     if status == "query_failed":
         raise RuntimeError(f"补算查询失败: {(out or {}).get('error')}")
 
@@ -5325,9 +5372,11 @@ def reembed_my_rules(client, *, user_id: str, batch: int = 50) -> dict:
         res["note"] = "没有缺向量的规则了 —— 已经补齐。"
     elif updated == 0 and remaining:
         # 查到了却一条没补上 = 再调一次还是同一批, 明说别空转。
-        res["warning"] = (f"这一批查到了缺向量的行却一条都没补上(还剩 {remaining} 条)。"
-                          "**不要接着调** —— 再调还是同一批。服务端日志里有每行"
-                          "失败的原因(telemetry: backfill_memory_row_failed)。")
+        # 每行失败的原因在日志里(telemetry: backfill_memory_row_failed), 不念给写手
+        logger.warning("reembed_my_rules: 查到了缺向量的行却一条都没补上(还剩 %d 条, user=%s) —— 每行原因见 "
+                       "telemetry backfill_memory_row_failed", remaining, user_id)
+        res["warning"] = (f"这一批查到了缺向量的规则却一条都没补上(还剩 {remaining} 条)。"
+                          "**不要接着调** —— 再调还是同一批。已记下, 规则照常生效, 不用你做什么。")
     elif remaining:
         res["next"] = f"还剩 {remaining} 条, 再调一次这个工具接着补。"
     return res
@@ -5602,8 +5651,8 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
         return _done(judge_client.JUDGE_NOT_CONFIGURED, "JUDGE_URL / JUDGE_API_KEY 未配置, 规则编不了")
     ctx = _judge_project_context(client, project_id)
     if ctx["project"] is None:
-        # 同存档判定的数据出境口径(docs/00 #7): 认不出 TV 项目号就不发规则原文
-        return _done(ctx["status"], ctx["detail"])
+        # 同存档判定的数据出境口径(docs/00 #7): 认不出 TV 项目号就不发规则原文。这里是 CLI / 后台, 报带补救命令的那句
+        return _done(ctx["status"], ctx.get("ops_detail") or ctx["detail"])
     out["tv_project"], out["category"] = ctx["project"], ctx["category"]
     if dry_run:
         # 放在上面两道之后: dry-run 是真编之前看数的那一步, 真编会被挡的项目在这里就要报出来(2026-10-20 复审)
@@ -5846,8 +5895,8 @@ CHECK_RULES_NOTE = ("规则检查只是建议, 不拦交付, 存档已经成功�
 
 
 # 规则编译结果读不出来(多半是 migrations/015 没跑)时的 next_step。不拦交付、不让重试: 同一个库再调一次还是读不出来
-CHECK_RULES_UNREADABLE_STEP = ("这次规则没查成(服务端读不出规则的编译结果, 要运维看一下服务日志), 不能说规则守住了; "
-                               "存档已经成功, 交付照常, 不用重试。")
+CHECK_RULES_UNREADABLE_STEP = ("这次规则检查没查成, 已记下; 不能说规则守住了, 但存档已经成功, 交付照常, "
+                               "不用重试, 不用你做什么。")
 
 
 class RuleCheckInputError(ValueError):
@@ -5899,26 +5948,38 @@ def _uncompiled_reason(client, project_id: str, missing: list[tuple[str, str]], 
         # 「上次整批没编成(ok)」(独立复审 on aw E)
         last = (st.get("hold_status") or st.get("last_status")) if kick == "held" else st.get("last_status")
         slow = now < _RULE_COMPILE_JEV["slow_until"]
+    # 第二个值原样进 check_rules 的 next_step(念给写手的, 2026-10-30 发布收尾): 只说"为什么这次查不了、不用做什么",
+    # 要配什么、跑什么命令只进日志 —— 原来写着「要运维配 JUDGE_URL」「要运维 tv-map add」, 写手每批都听一遍。
     if not judge_client.configured():
-        return "judge_not_configured", "Jev 没配置, 规则编不了, 要运维配 JUDGE_URL / JUDGE_API_KEY", failed
+        logger.warning("check_rules: 规则没有编译结果、也编不了 —— Jev 没配置, 要配 JUDGE_URL / JUDGE_API_KEY "
+                       "(project=%s)", project_id)
+        return "judge_not_configured", "Jev 没配置, 规则编不了, 这次查不了, 已记下", failed
     try:
         mapped = any(m.get("tv_project_id") for m in store.tv_projects_of(client, project_id))
     except Exception:                                        # noqa: BLE001 — 查不了就不下这个结论
         logger.warning("check_rules: 查 tv_project_map 失败(project=%s)", project_id, exc_info=True)
         mapped = True
     if not mapped:
-        return "no_tv_map", "这个项目没接 tv-map, 规则编不了, 要运维 tv-map add", failed
+        logger.warning("check_rules: 项目 %s 没接 tv_project_map, 规则编不了 —— 补救: python -m deskcore.cli tv-map add "
+                       "--tv-project <TV 项目号> --project %s", project_id, project_id)
+        return "no_tv_map", "这个项目还没接上规则编译, 这次查不了, 已记下", failed
     if kick == "off":
-        return "auto_off", "后台补编关着, 要运维跑 compile-rules", failed
+        logger.warning("check_rules: 项目 %s 有没编的规则, 但后台补编关着(RULE_COMPILE_AUTO) —— 跑 "
+                       "python -m deskcore.cli compile-rules --project %s", project_id, project_id)
+        return "auto_off", "后台补编关着, 规则还没编好, 这次查不了, 已记下", failed
     if kick == "held" and last == judge_client.JUDGE_POLICY_BLOCKED:
         return "policy_blocked", "规则发去编译时被出境口径挡下, 编不了", failed
     if kick == "held" and last == RULE_COMPILE_MOCK:
-        return RULE_COMPILE_MOCK, "规则编译接到的是测试用的 Jev(回的是假结果, 没存), 要运维查 JUDGE_URL", failed
+        logger.warning("check_rules: 规则编译接到的是测试用的 Jev(model 是 mock, 结果没存) —— 查 JUDGE_URL "
+                       "(project=%s)", project_id)
+        return RULE_COMPILE_MOCK, "规则编译这次没接到正式的编译服务, 编出来的没存, 已记下", failed
     # 本进程里任何一个项目的编译读超时之后, 停发期内哪个项目都不发(_RULE_COMPILE_JEV), 不只是超时的那个
     if kick == RULE_COMPILE_JEV_SLOW or slow or (kick == "held" and last == judge_client.JUDGE_TIMEOUT):
         return RULE_COMPILE_JEV_SLOW, "最近一次编译 Jev 超时, 过一阵后台再试", failed
     if kick == "held":
-        return "held", f"上次整批没编成({last or '原因见服务日志'}), 过一阵后台再试", failed
+        if not last:
+            logger.warning("check_rules: 项目 %s 上次整批没编成, 结局没记下来(见编译线程的日志)", project_id)
+        return "held", f"上次整批没编成({last or '原因已记下'}), 过一阵后台再试", failed
     if missing and failed == len(missing):
         return "compile_failed", "上次编失败了, 稍后后台自动重试", failed
     tail = f"; 其中 {failed} 条上次编失败了, 稍后自动重试" if failed else ""
@@ -5944,7 +6005,7 @@ def _withdrawn_tip(n: int) -> str:
 
 def _questions_unchecked_tip(n: int) -> str:
     return (f"有 {n} 条规则的缓存题目形状不对或题号重复, 部分题目没查(见 rules.questions_unchecked_rules), "
-            "不能说整条规则守住了; 要运维修复编译结果。")
+            "不能说整条规则守住了; 已记下, 不用你做什么。")
 
 
 def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str = "",
@@ -6131,6 +6192,9 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     if skipped_questions:
         rules_info["questions_unchecked"] = len(skipped_questions)
         rules_info["questions_unchecked_rules"] = sorted(skipped_questions)
+        # 写手那边只说「部分题目没查、已记下」(_questions_unchecked_tip), 要修的是编译结果, 记在这里
+        logger.warning("check_rules: 项目 %s 有 %d 条规则的缓存题目形状不对或题号重复, 部分题目没查 —— 要修编译结果"
+                       "(compile-rules --force): %s", project_id, len(skipped_questions), sorted(skipped_questions)[:10])
     # Jev 编译时标了 coverage=partial 的(一条规则的要求没全装进题 / 代码, 没装进去的写在 uncovered): 这次查了的也只是
     # 一部分, 题全守住 / 代码没命中也不能说整条守住了(2026-10-20 第三轮复审: 原来 coverage / uncovered 这边一处都不读,
     # 「标题不超过 20 字, 正文要带某句话术」只编出了标题那一半, 标题短就报「这次查的规则都守住了」)。只数这次真查了的。
@@ -6193,7 +6257,9 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
             out["next_step"] = "这个项目的规则都是查不了的那种(流程、交付、写作方向), 不用做什么, 照常交付。"
         else:
             # 剩下的是编译结果用不上的(题的形状全不对、code 的 kind 不认识): 没查, 不能说守住了
-            out["next_step"] = "这个项目的规则这次一条都没查(编译结果用不上, 要运维看一下), 不能说它们守住了。照常交付。"
+            logger.warning("check_rules: 项目 %s 的编译结果都用不上(题的形状全不对 / code 的 kind 不认识), 一条都没查",
+                           project_id)
+            out["next_step"] = "这次规则检查没查全(编译结果用不上), 已记下; 不能说它们守住了。交付照常, 不用你做什么。"
         return out
     if rest:
         out["remaining_version_ids"] = rest
@@ -6237,7 +6303,7 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
             return max(0.0, budget - (time.monotonic() - started))
 
         if not judge_client.configured():
-            jev_detail = "JUDGE_URL / JUDGE_API_KEY 未配置, 规则题判不了"
+            jev_detail = "这个写作台还没接判定服务, 规则题这次判不了。"
             jev = {vid: {"judge_status": judge_client.JUDGE_NOT_CONFIGURED} for vid, _ in targets}
         else:
             ex = cf.ThreadPoolExecutor(max_workers=CHECK_RULES_WORKERS, thread_name_prefix="check-rules")
@@ -6247,8 +6313,10 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                 try:
                     ctx = ex.submit(_judge_project_context, client, project_id).result(timeout=_left())
                 except cf.TimeoutError:
+                    logger.warning("check_rules: 发规则题之前的查库(tv_project_map / TV 品类)在 %.1fs 内没查完, "
+                                   "没发 (project=%s)", budget, project_id)
                     ctx = {"project": None, "category": None, "status": judge_client.JUDGE_TIMEOUT,
-                           "detail": f"发之前的查库(tv_project_map / TV 品类)在 {budget:g}s 内没查完, 没发"}
+                           "detail": f"发规则题之前查库超时({budget:g}s), 这次没发。"}
                 if ctx["project"] is None:
                     jev_detail = ctx["detail"]
                     jev = {vid: {"judge_status": ctx["status"]} for vid, _ in targets}

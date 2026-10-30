@@ -1112,8 +1112,8 @@ def fingerprints(sb, project_id: str, limit: int = 4000) -> tuple[list[dict], bo
     return rows, truncated
 
 
-def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int]:
-    """(总条数, 有【可用】标题向量的条数) —— 两次 count, 不拉行。
+def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int, int]:
+    """(总条数, 有【可用】标题向量的条数, 空标题且没向量的条数) —— 三次 count, 不拉行。
 
     下推之后 check_drafts 不再把指纹拉进内存, 但它报出去的 summary 仍然要说清
     "比了多少条、其中多少条有向量"。后者尤其不能丢: ``hist_missing_vec > 0``
@@ -1127,6 +1127,14 @@ def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int]:
     于是 ``semantic_degraded`` 是 false, 而标题语义那一路**一条都没真的比**。
     这正好是这个函数存在的理由的反面。(codex review · #65 P1)
 
+    ⚠️ **空标题的行不算"缺向量"**(2026-10-30)。标题是空串的行永远算不出标题向量 —— embed_texts 对空串回 None,
+    reembed 也特意不扫它们(fingerprints_needing_vectors 的 ``.neq("title", "")``), 它们没有"补上"这条出口。原来照样
+    算进 total - with_vec, 于是一个项目只要补录过一条空标题的帖, 之后**每一次** check_drafts 都报 semantic_degraded,
+    写手每批都听一遍「标题语义查重没跑全」(生产上 18 条这样的行里 17 条是补录副本)。所以第三个数单独数出来, 由调用方
+    从"缺"里减掉。口径是 ``title = ''`` 且 ``title_embedding IS NULL``: 有标题、没向量的照样算缺(那是真没比), 空标题却
+    有向量的(不该有)也不在这里, 不会被减两次。列是 NOT NULL DEFAULT '', 写入的各条路径都先 strip 过, 空标题只有空串
+    这一种形态。
+
     ⚠️ 故意不吞异常, 与 fingerprints 同理: 查重是硬闸, 读不到就不能放行。
     """
     total = (sb.table("draft_fingerprints").select("id", count="exact")
@@ -1136,7 +1144,12 @@ def fingerprint_stats(sb, project_id: str, model: str) -> tuple[int, int]:
                   .not_.is_("title_embedding", "null")
                   .eq("embedding_model", model)
                   .limit(1).execute()).count or 0
-    return int(total), int(with_vec)
+    untitled = (sb.table("draft_fingerprints").select("id", count="exact")
+                  .eq("project_id", project_id)
+                  .eq("title", "")
+                  .is_("title_embedding", "null")
+                  .limit(1).execute()).count or 0
+    return int(total), int(with_vec), int(untitled)
 
 
 def check_drafts_sql(sb, project_id: str, rows: list[dict],

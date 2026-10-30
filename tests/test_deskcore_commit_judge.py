@@ -549,7 +549,9 @@ def test_no_tv_mapping_means_nothing_leaves_the_building(judge_on, monkeypatch):
     r = out["judge"]["results"][0]
     assert out["judge"]["summary"] == {"not_configured": 2}
     assert r["judge_status"] == judge_client.JUDGE_NOT_CONFIGURED
-    assert "tv-map add" in out["judge"]["detail"], "要把补救命令说出来, 而且整批只说一次"
+    # detail 是念给写手的: 只说这次判不了、不影响什么, 整批只说一次; 补救命令进日志(2026-10-30 发布收尾)
+    assert "判不了" in out["judge"]["detail"], "整批只说一次"
+    assert "tv-map" not in out["judge"]["detail"] and "python -m" not in out["judge"]["detail"]
     assert "detail" not in r, "每篇重复同一句话只会把返回值撑长"
 
 

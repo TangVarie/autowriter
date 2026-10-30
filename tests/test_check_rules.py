@@ -567,7 +567,9 @@ def test_a_project_without_tv_map_is_not_said_to_be_compiling(jev, kicks):     #
     out = core.check_rules(c, PROJ, [V1], user_id=ME)
     assert out["status"] == "nothing_to_check" and out["rules"]["uncompiled_reason"] == "no_tv_map"
     assert "在后台编译" not in out["next_step"] and "后台在编" not in out["next_step"]
-    assert "还没有编译结果" in out["next_step"] and "tv-map" in out["next_step"]
+    assert "还没有编译结果" in out["next_step"] and "还没接上规则编译" in out["next_step"]
+    # 「要运维 tv-map add」原来原样念给写手(2026-10-30 发布收尾): 补救只进日志
+    assert "tv-map" not in out["next_step"] and "运维" not in out["next_step"]
 
 
 _REAL_KICK = core._kick_rule_compile

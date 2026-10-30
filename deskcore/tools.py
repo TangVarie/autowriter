@@ -220,8 +220,9 @@ def _safe(fn, *args, **kwargs) -> Any:
         raise
     except Exception as exc:  # noqa: BLE001 — 故意兜底
         logger.exception("%s failed", getattr(fn, "__name__", fn))
+        # hint 是念给写手的: 堆栈已经在上面那行日志里, 这里只说"写稿照常"(2026-10-30 发布收尾)
         return {"error": f"{type(exc).__name__}: {exc}"[:300],
-                "hint": "写稿可以继续, 但这次没拿到这部分数据; 服务端日志有完整堆栈"}
+                "hint": "写稿可以继续, 但这次没拿到这部分数据; 已记下, 不用你做什么"}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -490,9 +491,9 @@ def check_drafts(project_id: str, drafts: list[dict],
     (angle_key 是 draw_angles 给的, 有就带上 —— 查重时写作台会顺手记下这一稿和它的 angle_key; 稿子发出去以后,
     写作台按内容从飞书把它对回来、给这张牌销账, 就算这一稿没存过档)。
 
-    如果返回的 summary 里有 empty_history_warning, 说明这个项目【还没回填】历史
-    指纹 —— 本次实际只在本批内部比对, 跟老稿子的重复不会被发现。要告诉用户去跑
-    backfill, 别当作"比过了没撞车"。
+    如果返回的 summary 里有 empty_history_warning, 说明查重库里这个项目还没有历史稿,
+    本次只在本批内部比对 —— 别当作"和老稿子比过了没撞车", 把那一句照原样告诉用户就行;
+    用户不用做什么。
 
     比对本项目【全部】历史成稿 + 本批内互比, 四个信号:
       · 标题语义相似度
@@ -501,9 +502,9 @@ def check_drafts(project_id: str, drafts: list[dict],
       · 正文四字串【包含度】(抓短稿整段照搬长稿 —— 那种情况下上一条会被
         长度差稀释, 看起来像不重复)
 
-    summary.containment_checked 为 false 时说明最后那一路本次没生效(草稿太短、
-    与历史稿长度差太大, 或服务端没跑 migrations/005), summary 里会写清楚原因 ——
-    【要告诉用户】, 整段照搬一篇长稿的重复这次可能漏掉。
+    summary.containment_checked 为 false 时说明最后那一路本次没生效(多半是草稿太短、
+    与历史稿长度差太大), summary.containment_skipped_warning 里有一句现成的话 ——
+    照原样告诉用户, 整段照搬一篇长稿的重复这次可能漏掉。
 
     每条返回 pass / warn / reject:
       · reject —— 必须重写。不允许「少出一条」糊弄过去。reason 里说了是哪个
@@ -512,8 +513,9 @@ def check_drafts(project_id: str, drafts: list[dict],
       · warn —— 可疑, 建议换个切入再交。
       · pass —— 可以交付: 交给用户之前调 score_drafts(存档 + 参考分; 项目有交付模板时它回拼好的交付稿)。
 
-    summary.semantic_degraded 为 true 时说明 embedding 不可用, 这次只跑了确定性
-    查重, 同角度换说法的标题可能漏过 —— 【要告诉用户这件事】, 别默默交付。
+    summary.semantic_degraded 为 true 时说明标题语义这一路这次没跑全(另外三路照常),
+    把 summary.degraded_note 那一句照原样告诉用户就行: 交付照常, 用户不用做什么,
+    也不用重试。
 
     这个工具出错会直接报错而不是放行 —— 查重挂了必须停下来, 不能当作通过。
     """
@@ -844,10 +846,10 @@ def ingest_published(project_id: str, drafts: list[dict], source: str = "",
       · ``minted`` / ``fingerprinted`` 相等 → 这批补完了。
       · 只有 ``identity_error`` → 没建成的行**重传即可**。
       · ``fingerprint_error``(或 fingerprinted < minted) → **不要重传这批**: 它们的
-        身份已经建了、指纹没写上, 重传看不见指纹会再建一份身份; 要工程侧对这个
-        项目跑 backfill 补指纹。
-      · 两者同时出现 → **先** backfill, **再**把这批原样重传一次(已补上指纹的会
-        被跳过, 没建成身份的会补上)。顺序不能反。
+        身份已经建了、指纹没写上, 重传看不见指纹会再建一份身份。服务端已经记下了,
+        补指纹不归写手管, 照 ``note`` 说一句就行, 用户不用做什么。
+      · 两者同时出现 → 同样**先别重传**: 现在重传会把指纹没写上的那几条再建一份。
+        照 ``note`` 说一句就行, 用户不用做什么。
     """
     if not isinstance(drafts, list) or not drafts:
         raise InvalidInput("drafts 要是非空列表, 每条 {title, body}")
@@ -891,15 +893,20 @@ def ingest_published(project_id: str, drafts: list[dict], source: str = "",
     fp_failed = bool(out.get("fingerprint_error")) or out["fingerprinted"] < out["minted"]
     id_failed = bool(out.get("identity_error"))
     missing = out["minted"] - out["fingerprinted"]
+    # note 是念给写手的(2026-10-30 发布收尾): 补救要先对这个项目跑 backfill 补指纹(两种失败同时发生时补完再把
+    # 这批原样重传一次, 顺序不能反), 那是工程侧的事, 只进日志; 写手那边只说"先别重传"。
+    if fp_failed:
+        logger.warning("ingest_published: project=%s 有 %d 条建了身份没写上指纹(%s)%s —— 补救: 先跑 "
+                       "`python -m deskcore.cli backfill --project %s` 补指纹%s",
+                       project_id, missing, out.get("fingerprint_error"),
+                       f", 另有几行身份没建成({out.get('identity_error')})" if id_failed else "",
+                       project_id, ", 然后把这批原样重传一次(已补上的会被跳过)" if id_failed else "")
     if fp_failed and id_failed:
-        out["note"] = (f"两种半途失败同时发生: {missing} 条建了身份没写上指纹, 另有几行身份"
-                       "没建成。顺序必须是: **先**请工程侧对这个项目跑一次 backfill 把指纹"
-                       "补上, **然后**再把这批原样重传一次(已补上指纹的会被跳过, 没建成"
-                       "身份的会补上)。别反过来, 也别现在就重传。请把这句话转给工程。")
+        out["note"] = (f"这批没补完: {missing} 条只存了一半, 另有几行没存上。已记下, 这批先别重传 —— "
+                       "现在重传会把存了一半的那几条再存一份。不用你做什么。")
     elif fp_failed:
-        out["note"] = (f"有 {missing} 条建了身份没写上指纹 —— 不要重传这批(重传会再建一份"
-                       "身份)。这一步需要工程侧对这个项目跑一次 backfill 把指纹补上, "
-                       "请把这句话转给工程。")
+        out["note"] = (f"有 {missing} 条只存了一半。已记下, 这批不要重传(重传会再存一份), "
+                       "不用你做什么。")
     elif id_failed:
         out["note"] = "有几条身份没建成, 这些行重传即可; 库里已有的会被跳过, 不会翻倍。"
     elif dry_run:

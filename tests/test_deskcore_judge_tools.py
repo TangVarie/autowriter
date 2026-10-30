@@ -108,11 +108,13 @@ def test_not_configured_and_no_tv_map_send_nothing(wired, monkeypatch):
     calls, _ = wired
     monkeypatch.setattr(config, "JUDGE_URL", "")
     out = core.judge_draft(_client(), PROJ, TITLE, BODY, user_id=ME)
-    assert out["judge_status"] == "not_configured" and "JUDGE_URL" in out["detail"] and calls == []
+    assert out["judge_status"] == "not_configured" and "没接判定服务" in out["detail"] and calls == []
+    assert "JUDGE_URL" not in out["detail"], "环境变量名不念给写手(2026-10-30 发布收尾)"
     assert core.list_banks()["judge_status"] == "not_configured" and calls == []
     monkeypatch.setattr(config, "JUDGE_URL", "https://judge.example.invalid")
     out = core.judge_draft(_client(maps=[]), PROJ, TITLE, BODY, user_id=ME)
-    assert out["judge_status"] == "not_configured" and "tv-map add" in out["detail"] and calls == []
+    assert out["judge_status"] == "not_configured" and "还没接上判定服务" in out["detail"] and calls == []
+    assert "tv-map" not in out["detail"], "补救命令只进日志"
 
 
 def test_bad_input_is_refused_locally(wired):

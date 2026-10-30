@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from deskcore import core
@@ -74,15 +76,22 @@ def test_repeat_call_is_idempotent(fake):
     assert len(fake.rows["draft_fingerprints"]) == 3, "重复调不许翻倍"
 
 
-def test_fingerprint_failure_says_do_not_resend(fake, monkeypatch):
-    """身份建了、指纹没写: 重传会再建一份身份。note 必须是"不要重传"。"""
+def test_fingerprint_failure_says_do_not_resend(fake, monkeypatch, caplog):
+    """身份建了、指纹没写: 重传会再建一份身份。note 必须是"不要重传"。
+
+    补救(对这个项目跑 backfill)是工程侧的事, 只进日志; note 是念给写手的, 不许出现命令或"转给工程"
+    (2026-10-30 发布收尾)。"""
     def _boom(sb, rows):
         raise RuntimeError("PostgREST 502")
     monkeypatch.setattr(core.store, "write_fingerprints", _boom)
-    out = T.ingest_published(PROJ, _rows(2), _user_id=ME)      # 不抛
+    with caplog.at_level(logging.WARNING, logger="deskcore.tools"):
+        out = T.ingest_published(PROJ, _rows(2), _user_id=ME)      # 不抛
     assert out["minted"] == 2 and out["fingerprinted"] == 0
     assert out["fingerprint_error"]
-    assert "不要重传" in out["note"] and "backfill" in out["note"]
+    assert "不要重传" in out["note"]
+    for bad in ("backfill", "工程", "python -m"):
+        assert bad not in out["note"], (bad, out["note"])
+    assert f"backfill --project {PROJ}" in caplog.text, "补救命令要进日志"
 
 
 def test_identity_failure_says_resend_is_fine(fake, monkeypatch):
@@ -120,8 +129,10 @@ def test_protocol_tells_the_model_when_this_is_not_score_drafts():
 def test_tool_docstring_covers_the_operating_rules():
     doc = T.ingest_published.__doc__
     for needle in ("不过闸", "50", "dry_run", "重复调是安全的", "不要重传", "score_drafts",
-                   "半途失败不报错", "先** backfill", "每条都要有正文"):
+                   "半途失败不报错", "先别重传", "每条都要有正文"):
         assert needle in doc, needle
+    # 工具说明是念给模型的, 补指纹是工程侧的事, 不许再叫写手去找工程跑命令(2026-10-30 发布收尾)
+    assert "backfill" not in doc and "工程侧" not in doc
     assert "出错会直接报错" not in doc, "codex #81 P1: 不能再承诺'出错一律抛'"
 
 
@@ -161,9 +172,10 @@ def test_a_batch_made_only_of_committed_rows_writes_nothing_and_says_so(fake):
     assert not fake.rows.get("versions")
 
 
-def test_both_failures_at_once_keep_both_recovery_steps_in_order(fake, monkeypatch):
+def test_both_failures_at_once_keep_both_recovery_steps_in_order(fake, monkeypatch, caplog):
     """P2: 身份部分失败 + 指纹失败同时发生时, 只说"不要重传"会让没建成身份的行
-    永远缺席(backfill 补不了身份)。note 必须是: 先 backfill, 再重传。"""
+    永远缺席(backfill 补不了身份)。补救顺序必须是: 先 backfill, 再重传 —— 这个顺序是给工程侧的, 记进日志;
+    念给写手的 note 只说"先别重传"。"""
     real_mint = core.store.mint_draft_identity
 
     def _partial(sb, project_id, user_id, tactic, drafts, **kw):
@@ -173,13 +185,17 @@ def test_both_failures_at_once_keep_both_recovery_steps_in_order(fake, monkeypat
     monkeypatch.setattr(core.store, "mint_draft_identity", _partial)
     monkeypatch.setattr(core.store, "write_fingerprints",
                         lambda sb, rows: (_ for _ in ()).throw(RuntimeError("502")))
-    out = T.ingest_published(PROJ, _rows(2), _user_id=ME)
+    with caplog.at_level(logging.WARNING, logger="deskcore.tools"):
+        out = T.ingest_published(PROJ, _rows(2), _user_id=ME)
     assert out["minted"] == 1 and out["fingerprinted"] == 0
     assert out["identity_error"] and out["fingerprint_error"]
     n = out["note"]
-    assert "backfill" in n and "重传" in n
-    assert n.index("backfill") < n.index("重传一次"), "顺序: 先 backfill 再重传"
-    assert "别现在就重传" in n
+    # 先 backfill 再重传的顺序是工程侧的补救, 进日志; 念给写手的只说"先别重传"(2026-10-30 发布收尾)
+    assert "先别重传" in n
+    assert "backfill" not in n and "工程" not in n, n
+    log = caplog.text
+    assert "backfill --project" in log and "重传" in log
+    assert log.index("backfill --project") < log.index("重传一次"), "顺序: 先 backfill 再重传"
 
 
 def test_overlapping_calls_for_the_same_project_do_not_double_write(fake, monkeypatch):

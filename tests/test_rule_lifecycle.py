@@ -479,8 +479,8 @@ def test_a_batch_that_updates_nothing_tells_you_to_stop(monkeypatch):
 
 
 @pytest.mark.parametrize("status, kw", [
-    ("no_embedding_sdk", "GOOGLE_API_KEY"),
-    ("schema_missing",   "pgvector"),
+    ("no_embedding_sdk", "补不了"),
+    ("schema_missing",   "补不了"),
     ("query_failed",     "查询失败"),
 ])
 def test_failure_statuses_raise_instead_of_returning_a_dict(monkeypatch, status, kw):
@@ -495,6 +495,9 @@ def test_failure_statuses_raise_instead_of_returning_a_dict(monkeypatch, status,
     with pytest.raises(RuntimeError) as exc:
         core.reembed_my_rules(_client([]), user_id=ME)
     assert kw in str(exc.value)
+    # 报错文本是念给写手的: 环境变量 / 列名 / 迁移只进日志(2026-10-30 发布收尾)
+    for bad in ("GOOGLE_API_KEY", "pgvector", "memories.embedding", "运维"):
+        assert bad not in str(exc.value), (bad, str(exc.value))
 
 
 def test_noop_says_it_is_actually_done(monkeypatch):
