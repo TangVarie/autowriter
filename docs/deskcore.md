@@ -543,7 +543,7 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 `restore`（被拒的改稿放回旧指纹）、`replace_versions`（改稿挂旧 item）、`arm`（飞轮臂）、`mint`（建 batch / item / version，
 每篇三次写）、`consume`（角度销账，每篇一查一写）、`snapshots`（查重底稿转正，W-38）、`key_check`（key 对不上台账时多查一次）、
 `angle_debt`（存档后查欠账，只在有没带 key / key 对不上时）、`other`（拼回包、提示语、放锁）。按这个顺序一段接一段量，
-加起来等于 `phase_ms.commit`。攒够样本之后这样查：
+加起来等于 `phase_ms.commit`（存进 jsonb 后键会按名字重排，要按执行顺序看就按 `core.COMMIT_PARTS` 排）。攒够样本之后这样查：
 
 ```sql
 select count(*),
@@ -555,11 +555,17 @@ select count(*),
   from autowriter.batch_metrics
  where meta->>'mode' = 'deskcore_commit' and created_at > now() - interval '14 days';
 
--- commit 段哪一步占大头(W-21, 2026-10-30 起才有 commit_parts_ms); per_draft 按这批存进去的篇数摊
+-- commit 段哪一步占大头(W-21, 2026-10-30 起才有 commit_parts_ms)。p50 / p95 是每批的绝对毫秒。
+-- 摊到篇数用加权比(总毫秒 / 总篇数, 不是每批比值再平均: 那样 1 篇的小批和 20 篇的大批一样重), 分母看这一步跟谁走:
+--   per_submitted 按交上来的篇数(counters.drafts): gate 逐篇比对, 被拒的也照算; embed 是一批一次调用, 更像固定成本
+--   per_written   按存进去的篇数(counters.written): mint / consume / snapshots / replace_versions 只碰存进去的;
+--                 全拒的批(written = 0)不进这一列, 否则它的整批耗时会被当成「一篇」
 select e.k as step, count(*),
        percentile_cont(0.5)  within group (order by e.v::int) as p50,
        percentile_cont(0.95) within group (order by e.v::int) as p95,
-       round(avg(e.v::numeric / greatest((m.counters->>'written')::int, 1))) as per_draft_avg
+       round(sum(e.v::numeric) / nullif(sum((m.counters->>'drafts')::int), 0)) as per_submitted,
+       round(sum(e.v::numeric) filter (where (m.counters->>'written')::int > 0)
+             / nullif(sum((m.counters->>'written')::int), 0)) as per_written
   from autowriter.batch_metrics m, jsonb_each_text(m.meta->'commit_parts_ms') as e(k, v)
  where m.meta->>'mode' = 'deskcore_commit' and m.created_at > now() - interval '14 days'
  group by 1 order by p95 desc;

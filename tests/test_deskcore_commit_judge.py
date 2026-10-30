@@ -777,7 +777,8 @@ def test_the_commit_phase_is_split_by_step_into_meta_and_the_slow_step_shows(jud
     assert set(ph) == {"lock_wait", "commit", "delivery_rules", "judge", "project_isolation", "total"}
     assert "commit_parts_ms" not in out, "按步计时只进埋点, 不进回包"
     parts = c.rows["batch_metrics"][0]["meta"]["commit_parts_ms"]
-    assert list(parts) == [k for k in core.COMMIT_PARTS if k in parts], "按执行顺序"
+    # 交给库的这份按执行顺序(jsonb 存进去会按键名重排, 库里看顺序以 COMMIT_PARTS 为准)
+    assert list(parts) == [k for k in core.COMMIT_PARTS if k in parts]
     assert {"access", "embed", "gate", "fingerprints", "mint", "consume", "other"} <= set(parts), parts
     assert all(isinstance(v, int) and v >= 0 for v in parts.values()), parts
     assert abs(sum(parts.values()) - ph["commit"]) <= 2, (parts, ph)
