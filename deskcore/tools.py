@@ -329,8 +329,9 @@ def list_projects(include_archived: bool = False, _user_id: str | None = None) -
 
 
 def _archive_pending(user_id: str | None, project_id: str) -> dict | None:
-    """附加提醒(W-29): 调用者在这个项目上抽了还没存档的牌, 和下一步该做什么。查不到就不带 ——
-    不能把发牌 / 查重 / 记规则的结果弄坏(同 open_project 里 edit_digest 那段的纪律)。"""
+    """附加提醒(W-29): 这个身份在这个项目上抽了还没存档的牌, 和下一步该做什么。团队共用一个身份, 数到的是整个团队的牌,
+    所以只挂在这一场确实在用牌的回包上(draw_angles、带 angle_key 的 check_drafts; 2026-10-30 复审)。查不到就不带 ——
+    不能把发牌 / 查重的结果弄坏(同 open_project 里 edit_digest 那段的纪律)。"""
     if not user_id or not project_id:
         return None
     try:
@@ -569,21 +570,26 @@ def check_drafts(project_id: str, drafts: list[dict],
     # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。正文 / 标题放错了字段的先对上(_draft_fields), 不然这一篇只按标题查。
     drafts = _draft_fields(drafts, "check_drafts", project_id)
     out = core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id, record_snapshot=True)
-    # W-29: 判定之后才查; 查不到就不带, 判定结果原样回去。
-    return _with_archive_pending(out, _user_id, project_id)
+    # W-29: 判定之后才查; 查不到就不带, 判定结果原样回去。2026-10-30 复审: 只在这批稿子带了 angle_key 时查 —— 团队共用一个
+    # 身份, 没带牌的查重(改一篇别的对话交付的稿、用户点题的单篇)查到的全是队友手上的牌, 那句「都存完再给用户看」只会添乱。
+    if isinstance(drafts, list) and any(isinstance(d, dict) and str(d.get("angle_key") or "").strip() for d in drafts):
+        return _with_archive_pending(out, _user_id, project_id)
+    return out
 
 
 def ack_edit_digest(project_id: str, through: str, rules_recorded: int = 0,
                     _user_id: str | None = None) -> dict:
     """记下 open_project 给的 edit_digest 已经说给用户了, 一周内不再出现。
 
-    ``through`` 原样传回 edit_digest.through; ``rules_recorded`` 是一共按摘要记了几条规则。
+    ``through`` 原样传回 edit_digest.through(第二次 ack 也可以抄第一次返回的 ``through``), 不要猜、不要自己拼: 不是摘要
+    给出去的那个时间会报 400。到交付时要是摘要已经不在眼前了, 就用开场那次一样的参数再调一次 open_project 拿回来(没 ack 之前
+    每次打开都带)。``rules_recorded`` 是一共按摘要记了几条规则。
     什么时候调(和协议第 1 条同一个时机): edit_digest.message 已经放进了开场; 这一批交付完, 要在交付那条回复的末尾
     把归纳出的改法(最多 3 条; 没看出规律就说没看出)列给用户 —— **发出这条回复之前**调一次, rules_recorded 传 0, 不等
     用户回话(写手多半拿了稿子就走, 等他回话就永远不 ack, 下一场写作还会再给一遍同一份摘要)。这场不写稿的, 在办完用户
     这次的事、说出改法的那条回复之前调。之后用户再要记哪条, record_rule 照记, 再调一次 ack(through 不变, rules_recorded
     填一共记了几条)。
-    还没把 edit_digest.message 和归纳出的改法说给用户就别调: 调了这批改法就再也不会出现。
+    edit_digest.message 和归纳出的改法都不在这一轮的回复里就别调: 调了这批改法就再也不会出现。
     """
     # 写操作, 不包 _safe: 没记上的话, 下一场又拿到同一份摘要, 用户会被问第二遍。
     try:
@@ -742,9 +748,9 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     顺序、固定话题都由服务端加), ``problems`` 是代码查出来的版式问题(``index`` 对应你这次传的第几篇, ``what`` 说怎么改)。
     存新稿时它拼的是这次存进去的几篇; **改稿重存(带 ``replaces_version_id``)时它拼的是原来那一整批**: 没改的几篇照它们
     现在的样子、改过的换在原位, 顺序和上次一样(``delivery.scope`` 是 ``whole_batch``; 改的稿子分属几批的, 一批一段依次排,
-    同一次另有新稿的排在最后)。有 problems 就先改那几篇(带 ``replaces_version_id`` 再调一次, 新返回的 ``delivery.text``
-    就是改好之后的整批)。**不管哪种, 都把 ``delivery.text`` 原样整段交给用户** —— 不要自己拼接、替换其中几行或几段,
-    不要重排, 不要再加标记(用户坚持要用、被拒没存进去的那篇不在里面: 放在 ``delivery.text`` 后面单独给)。``delivery.scope`` 是 ``this_call`` 时(原来那一批这次没能一起拼出来, ``scope_fallback`` 是
+    同一次另有新稿的排在最后)。有 problems 就先改那几篇(带 ``replaces_version_id`` 先过 check_drafts、再调一次本工具,
+    新返回的 ``delivery.text`` 就是改好之后的整批)。**不管哪种, 都把 ``delivery.text`` 原样整段交给用户** ——
+    不要自己拼接、替换其中几行或几段, 不要重排, 不要再加标记(用户坚持要用、被拒没存进去的那篇不在里面: 放在 ``delivery.text`` 后面单独给)。``delivery.scope`` 是 ``this_call`` 时(原来那一批这次没能一起拼出来, ``scope_fallback`` 是
     原因)它只有这次存进去的几篇: 照样原样交, 跟用户说明这是改过的那几篇。没有 ``delivery`` 就照项目规则自己排。
 
     **规则检查**: ``rule_checks`` 是代码按项目里带 check 的规则逐篇查出来的命中(有命中才带), 每条 ``index`` /
@@ -1071,8 +1077,10 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
     except core.rulecheck.CheckError as exc:
         # check 写错是参数问题(400), 不是服务坏了(500): 500 会让模型拿同一个 check 一直重试
         raise InvalidInput(f"check 写错了, 这条规则没记: {exc}") from exc
-    # W-29: 记规则多半是用户看了稿给的反馈, 改完的稿子同样要存档。规则写成之后才查, 查不到就不带。
-    return _with_archive_pending(out, _user_id, project_id)
+    # 2026-10-30 复审: 不再带 archive_pending(W-29 原来带, 理由是记规则多半是看了稿给的反馈、改完的稿子同样要存档)。团队共用
+    # 一个身份, 一场只说了「以后别用感叹号」的对话也会拿到队友没存的牌和「都存完再给用户看」; 而这场真抽了牌的, 改完的稿子
+    # 照样要过 check_drafts(带 angle_key), 提醒在那里一样到。
+    return out
 
 
 def record_edit(project_id: str, ai_title: str, ai_body: str,

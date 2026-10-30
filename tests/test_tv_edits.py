@@ -267,7 +267,7 @@ def test_a_timestamp_tie_at_the_cut_is_left_whole_for_next_time():
 
 def test_the_ack_watermark_never_moves_back():
     c = _digest_client()
-    newer, older = "2026-10-18T12:00:00+00:00", "2026-10-17T12:00:00+00:00"
+    newer, older = "2026-10-18T12:00:00+00:00", "2026-10-18T11:58:00+00:00"     # n0 / n2 的 computed_at
     assert core.ack_edit_digest(c, P1, newer, user_id=ME)["through"] == newer
     out = core.ack_edit_digest(c, P1, older, user_id=ME, rules_recorded=1)
     assert out["through"] == newer and c.rows["tv_edit_digest_acks"][0]["acked_through"] == newer
@@ -311,6 +311,45 @@ def test_a_through_in_the_future_is_refused():
     with pytest.raises(ValueError):
         core.ack_edit_digest(c, P1, (datetime.now(timezone.utc) + timedelta(days=2)).isoformat(), user_id=ME)
     assert not c.rows["tv_edit_digest_acks"]
+
+
+# ── 2026-10-30 复审: ack 挪到交付那条回复之前, 摘要多半已经离得很远 —— through 只认摘要真给出去的那个 ──────────────
+
+def test_the_through_the_digest_handed_out_is_accepted():
+    c = _digest_client()
+    d = core.edit_digest(c, P1, user_id=ME, now=NOW)
+    out = core.ack_edit_digest(c, P1, d["through"], user_id=ME, rules_recorded=0)
+    assert out["acked"] and c.rows["tv_edit_digest_acks"][0]["acked_through"] == d["through"]
+    # 格式不同、时刻相同的也认(PostgREST 回的小数秒位数 / Z 和 +00:00 不固定)
+    core.ack_edit_digest(c, P1, d["through"].replace("+00:00", "Z"), user_id=ME, rules_recorded=1)
+
+
+@pytest.mark.parametrize("guess", ["2026-10-18", "2026-10-30", "2026-10-18T12:00:01+00:00"])
+def test_a_guessed_through_is_refused_and_says_where_to_get_the_real_one(monkeypatch, guess):
+    """像日期就收的话, 猜一个「今天」会把用户没看过的差异一起 ack 掉(水位只往前走, 再也进不了摘要)。"""
+    c = _digest_client()
+    monkeypatch.setattr(core, "_utcnow", lambda: datetime(2026, 10, 30, 12, tzinfo=timezone.utc))
+    with pytest.raises(ValueError) as exc:
+        core.ack_edit_digest(c, P1, guess, user_id=ME)
+    assert not c.rows["tv_edit_digest_acks"], "没记下"
+    msg = str(exc.value)
+    assert "open_project" in msg and "edit_digest.through" in msg and "不要自己猜" in msg
+    monkeypatch.setattr(core, "sb", lambda: c)
+    with pytest.raises(tools.InvalidInput):                 # 工具层是 400, 不是 500
+        tools.ack_edit_digest(P1, guess, _user_id=ME)
+
+
+def test_a_through_from_before_new_diffs_arrived_is_still_accepted():
+    """打开项目和交付之间 tv-sync 又写进了新差异: 摘要给出去的那一行还在, 照认; 新的那几篇留给下一份。"""
+    c = _digest_client()
+    d = core.edit_digest(c, P1, user_id=ME, now=NOW)
+    fresh = [dict(c.rows["tv_edit_diffs"][0], note_id=f"late{i}", changed=True,
+                  computed_at=(NOW + timedelta(minutes=5 + i)).isoformat()) for i in range(3)]
+    c.rows["tv_edit_diffs"].extend(fresh)
+    assert core.ack_edit_digest(c, P1, d["through"], user_id=ME)["through"] == d["through"]
+    c.rows["tv_edit_digest_acks"][0]["acked_at"] = (NOW - timedelta(days=8)).isoformat()
+    later = core.edit_digest(c, P1, user_id=ME, now=NOW + timedelta(hours=1))
+    assert later["changed"] == 3 and later["through"] == fresh[-1]["computed_at"], "新来的那几篇一篇不丢"
 
 
 def test_migration_013_adds_the_new_columns_to_an_existing_table():
@@ -621,7 +660,8 @@ def test_tool_docs_say_relay_first_and_never_ack_an_unshown_digest():
     assert "每周最多一次" not in doc, "没 ack 时每次打开都带, 不是每周一次"
     assert "说完再开始写稿" not in doc and "回复的最前面" not in doc, "摘要不挡写稿, 开场是项目名在前"
     ack_doc = tools.ack_edit_digest.__doc__
-    assert "对话就结束了也要调" not in ack_doc and "还没把 edit_digest.message 和归纳出的改法说给用户就别调" in ack_doc
+    assert "对话就结束了也要调" not in ack_doc and "edit_digest.message 和归纳出的改法都不在这一轮的回复里就别调" in ack_doc
+    assert "说给用户就别调" not in ack_doc, "ack 就在交付那条回复发出之前, 那时还什么都没说出去(和协议第 1 条同一个说法)"
     assert "发出这条回复之前" in ack_doc and "不等" in ack_doc, "交付那条回复里说了改法就 ack, 不等写手回话"
 
 

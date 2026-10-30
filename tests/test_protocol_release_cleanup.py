@@ -43,6 +43,17 @@ def test_header_has_one_upgrade_wording_and_no_export():
     assert "skill_update.message" in HEAD and "`skill_version`" in HEAD
 
 
+def test_header_routes_open_project_failures_like_the_body():
+    """复审(on aw#137): 引线头那条原来是「调了、重试一次还是失败 → 没连上」, 一个 403 / 500 也会叫写手去查 mcp.json。
+    现在照正文「一、动笔前」第 1 条分三种: 没连上才说那句原话; 403 / 身份认不出不重试、找负责人; 别的报错读不到规则。"""
+    bullet = next(ln for ln in HEAD.splitlines() if ln.startswith("- `open_project` 调不了"))
+    for must in ("「一、动笔前」", "鉴权失败", "重试一次", "403", "不属于当前调用者", "无法识别调用者身份", "不重试",
+                 "负责人", "读不到规则"):
+        assert must in bullet, must
+    assert "调了、重试一次还是失败" not in HEAD, "所有失败一律当没连上的旧说法"
+    assert bullet.index("没连上") < bullet.index("403") < bullet.index("读不到规则")
+
+
 def test_project_choice_never_creates_on_a_miss():
     """B1: 找不到 → 带 include_archived 再查 → 还没有就找负责人。不建、不问 project_id。"""
     assert "include_archived=true" in SEC_FIND and "负责人" in SEC_FIND
@@ -153,6 +164,17 @@ def test_digest_ack_happens_before_the_reply_that_lists_the_edits():
         assert must in SEC_OPEN, must
 
 
+def test_a_lost_digest_through_is_fetched_again_not_guessed():
+    """复审(on aw#137): ack 挪到交付那条回复之前, 开场那次 open_project 的结果多半已经离得很远。through 不许猜, 拿不到就
+    用同样的参数再调一次 open_project(没 ack 之前每次都带)。服务端也只认摘要给出去的那个(core.ack_edit_digest)。"""
+    for must in ("原样抄", "不要猜", "再调一次 `open_project`", "没 ack 之前每次打开都带"):
+        assert must in SEC_OPEN, must
+    doc = T.ack_edit_digest.__doc__
+    assert "不要猜" in doc and "open_project" in doc and "400" in doc
+    msg = core.ACK_THROUGH_UNKNOWN
+    assert "open_project" in msg and "edit_digest.through" in msg and "不要自己猜" in msg
+
+
 def test_open_project_failures_are_routed_by_kind():
     for must in ("没连上", "项目打不开", "别的报错", "无法识别调用者身份"):
         assert must in SEC_OPEN, must
@@ -173,6 +195,20 @@ def test_reimport_of_a_delivered_final_is_not_checked_again():
     assert "不再查重" in row and "`check_drafts` →" not in row
 
 
+def test_resend_of_the_table_gives_every_group():
+    """复审(on aw#137): 「给我个表」那行原来只说「最新的 delivery.text」—— 分两组交的, 照字面只会再给第二组。"""
+    row = next(ln for ln in BODY.splitlines() if ln.startswith("| 「给我个表」"))
+    assert "每组各给它最新的那份" in row and "按组的顺序" in row
+
+
+def test_archive_pending_is_only_about_this_conversations_cards():
+    """复审(on aw#137): 共用一个身份, archive_pending 数的是整个团队的牌 —— 只管这场自己用的, 没用牌就当没看到、不提。"""
+    para = next(c for c in BODY.split("\n\n") if "`archive_pending`" in c)
+    for must in ("团队共用一个身份", "这场对话自己用的牌", "别人手上的", "就当没看到", "不跟用户提"):
+        assert must in para, must
+    assert "record_rule" not in para
+
+
 def _app_instructions() -> str:
     src = Path(T.__file__).with_name("app.py").read_text(encoding="utf-8")
     for node in ast.walk(ast.parse(src)):
@@ -184,8 +220,11 @@ def _app_instructions() -> str:
 def _server_texts() -> dict[str, str]:
     texts = {f"tools.{name}": fn.__doc__ or "" for name, (fn, _) in T.TOOLS.items()}
     for const in ("EDIT_DIGEST_TASK", "EDIT_DIGEST_MESSAGE", "ARCHIVE_PENDING_NEXT_STEP", "SCORE_NOTE",
-                  "ARCHIVED_STEP_HEAD", "IDENTITY_REFUSED", "PROJECT_REFUSED_NEXT"):
+                  "ARCHIVED_STEP_HEAD", "IDENTITY_REFUSED", "PROJECT_REFUSED_NEXT",
+                  "DELIVERY_NEXT_STEP", "RULE_CHECKS_NEXT_STEP", "CHECK_RULES_NOTE", "ACK_THROUGH_UNKNOWN",
+                  "_CALIB_SYSTEM"):
         texts[f"core.{const}"] = getattr(core, const)
+    texts["core._check_rules_next_step(must_fix)"] = core._check_rules_next_step({"must_fix": 1}, 0)
     notice = skillcheck.notice("aaaaaaaaaaaa", "bbbbbbbbbbbb")
     texts["skillcheck.notice.action"] = notice["action"]
     texts["skillcheck.notice.message"] = notice["message"]
@@ -200,18 +239,47 @@ SERVER_STALE = (
     "只能标【自己的】", "我能管的", "牌也还挂着没销账", "project_id 是不是传错", "不用导出", "没有导出这一步", "人审",
     "你 check 之后", "要先过 check_drafts 的话", "改完带 replaces_version_id 再调 score_drafts",
     "带 ``replaces_version_id`` 再调一次本工具", "用 score_drafts 带 ``replaces_version_id`` 再存一次",
+    # 复审(on aw#137): 改稿重存跳过 check_drafts 的运行时说法(比对时不看 ``)
+    "用 score_drafts 带 replaces_version_id 再存一次", "带 replaces_version_id 再调一次",
+    # 调校笔记是这个项目大家共用的一份, 不是某一个人的
+    "个人写作调校笔记", "同一个人对 AI 初稿", "这个人的语感偏好", "人的偏好会变", "个人风格清掉",
+    # ack 就在交付那条回复发出之前, 那时还什么都没说出去
+    "说给用户就别调",
 )
 
 
 @pytest.mark.parametrize("stale", SERVER_STALE)
 def test_server_text_does_not_contradict_the_protocol(stale):
-    hits = [where for where, text in _server_texts().items() if stale in text]
+    # 文档串里是 ``x``、运行时的话里是 x: 去掉 `` 再比, 两种写法都拦得住
+    stale = stale.replace("``", "")
+    hits = [where for where, text in _server_texts().items() if stale in text.replace("``", "")]
     assert not hits, f"服务端的话里还有和协议打架的旧说法「{stale}」: {hits}"
 
 
 def test_server_revision_path_goes_through_check_drafts_first():
     for text in (core.ARCHIVE_PENDING_NEXT_STEP, core.SCORE_NOTE, T.score_drafts.__doc__, T.check_rules.__doc__):
         assert "先过 check_drafts" in text
+    # 复审(on aw#137): 离动作最近的那几句(score_drafts 的 next_step 后缀、check_rules 的 note / next_step)也一样
+    for text in (core.DELIVERY_NEXT_STEP, core.RULE_CHECKS_NEXT_STEP, core.CHECK_RULES_NOTE,
+                 core._check_rules_next_step({"must_fix": 1}, 0)):
+        assert "replaces_version_id 先过 check_drafts" in text, text
+        assert text.index("check_drafts") < text.index("score_drafts"), text
+
+
+def test_calibration_notes_are_the_projects_not_one_persons(monkeypatch):
+    """复审(on aw#137): 精修来自写这个项目的几个人, 笔记是共用的一份 —— 蒸馏口径、改稿备注的标签、空笔记的报错都这么说。"""
+    assert "写这个项目的人共用" in core._CALIB_SYSTEM and "以新观察为准" in core._CALIB_SYSTEM
+    assert "以动词开头" in core._CALIB_SYSTEM, "其余铁律照旧"
+    edit = {"id": "e1", "ai_title": "甲", "ai_body": "原", "my_title": "甲", "my_body": "改", "note": "太长"}
+    monkeypatch.setattr(store, "recent_style_edits", lambda *a, **k: [edit])
+    monkeypatch.setattr(store, "get_user_calibration", lambda *a, **k: ("", None))
+    monkeypatch.setattr(store, "count_pending_distillation", lambda *a, **k: 1)
+    task = core.build_distillation_task(None, "p", user_id="u")
+    assert task["instruction"] == core._CALIB_SYSTEM and "本人" not in task["edits"] and "太长" in task["edits"]
+    monkeypatch.setattr(core, "assert_project_access", lambda *a, **k: None)
+    with pytest.raises(ValueError) as exc:
+        core.save_my_style(None, "p", "  ", user_id="u")
+    assert "这个项目已有的调校笔记" in str(exc.value) and "个人" not in str(exc.value)
 
 
 def test_upgrade_notice_goes_after_the_project_name():
