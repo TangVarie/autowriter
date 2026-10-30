@@ -274,6 +274,17 @@ def test_the_ack_watermark_never_moves_back():
     assert c.rows["tv_edit_digest_acks"][0]["rules_recorded"] == 1, "看过的人和时间照记"
 
 
+def test_a_late_second_ack_with_the_same_through_keeps_the_watermark_and_takes_the_total():
+    # W-33(10-30): 这一轮末尾先 ack 0, 用户下一条说要记两条 → 同一个 through 再 ack 一次(工具文档这么教)
+    c = _digest_client()
+    through = "2026-10-18T12:00:00+00:00"
+    core.ack_edit_digest(c, P1, through, user_id=ME, rules_recorded=0)
+    out = core.ack_edit_digest(c, P1, through, user_id=ME, rules_recorded=2)
+    row = c.rows["tv_edit_digest_acks"][0]
+    assert len(c.rows["tv_edit_digest_acks"]) == 1 and out["through"] == through == row["acked_through"]
+    assert row["rules_recorded"] == 2
+
+
 def test_cli_tv_sync_fails_loudly_when_diffs_cannot_be_read(monkeypatch, capsys):
     from deskcore import cli
     c = _client([_note("n1", "秋招投了六十份简历没回音", BODY_A)])
@@ -582,3 +593,82 @@ def test_one_write_with_new_and_same_version_rows_does_not_null_computed_at():
     rows = {r["note_id"]: r for r in c.rows["tv_edit_diffs"]}
     assert rows["n1"]["computed_at"] == "2026-09-01T00:00:00+00:00", "同一版重算照旧不推过水位"
     assert rows["n2"]["computed_at"] and rows["n2"]["computed_at"] > "2026-10-01", "新算的记现在"
+
+
+# ── W-33(10-30): 摘要带一句原样转给用户的话 ─────────────────────────────────────────────────────
+
+def test_the_digest_carries_a_message_to_relay_and_the_task_says_so_first():
+    d = core.edit_digest(_digest_client(), P1, user_id=ME, now=NOW)
+    assert d["message"] == core.EDIT_DIGEST_MESSAGE.format(changed=3) and "3 篇" in d["message"]
+    # 只有篇数, 不带标题、句子(那些在 examples 里, 由模型挑着说)
+    assert not any(t in d["message"] for t in ("原标题", "新标题", "删掉的一句"))
+    assert d["task"].startswith("先把 message 原样告诉用户")
+    assert d["task"].index("然后才开始写稿") < d["task"].index("record_rule"), "说完、做完再写稿"
+    assert "没看出规律" in d["task"] and "有的话" in d["message"], "不预设一定有规律"
+    assert d["task"].index("record_rule") < d["task"].index("ack_edit_digest"), "ack 仍在用户做了决定之后"
+
+
+def test_tool_docs_say_relay_first_and_never_ack_an_unshown_digest():
+    doc = tools.open_project.__doc__
+    assert "edit_digest.message" in doc and "原样" in doc
+    assert "每周最多一次" not in doc, "没 ack 时每次打开都带, 不是每周一次"
+    ack_doc = tools.ack_edit_digest.__doc__
+    assert "对话就结束了也要调" not in ack_doc and "还没把 edit_digest.message 和归纳出的改法说给用户就别调" in ack_doc
+
+
+# ── W-39(10-30): 差异跟写稿的写作台项目走, 不跟 TV 项目的补录目标走 ────────────────────────────────────
+
+P2 = "aaaaaaaa-0000-0000-0000-000000000002"
+
+
+def _two_desk_projects(notes, *, p2_versions):
+    """TV 项目对着两个写作台项目: P1 是补录目标, P2 只用来对照(同 BJS_phase2 → 成人藻油 / 百健士-藻油)。"""
+    c = _client(notes)
+    c.rows["projects"].append({"id": P2, "name": "match-only", "brand": "", "owner_id": ME,
+                               "calibration_notes": "", "tactics": "[]", "custom_roles": []})
+    c.rows["tv_project_map"].append({"tv_project_id": TV, "project_id": P2, "ingest_target": False, "note": ""})
+    c.rows["batches"].append({"id": "b2", "project_id": P2, "user_id": ME})
+    for vid, title, body in p2_versions:
+        c.rows["items"].append({"id": f"i-{vid}", "batch_id": "b2", "best_version_id": vid, "created_at": _iso(0),
+                                "user_id": ME, "status": "pending",
+                                "versions": [{"id": vid, "title": title, "body": body, "version_num": 1,
+                                              "created_at": _iso(0)}],
+                                "batches": {"project_id": P2}})
+        c.rows["versions"].append({"id": vid, "item_id": f"i-{vid}", "title": title, "body": body,
+                                   "version_num": 1, "created_at": _iso(0)})
+    return c
+
+
+def test_a_draft_from_a_match_only_desk_project_keeps_its_own_project():
+    bodies = ["。".join(SENTS[i * 6:(i + 1) * 6]) + "。" for i in range(3)]
+    p2 = [(f"v2{i}", f"写作台标题{i}", bodies[i]) for i in range(3)]
+    notes = [_note(f"m{i}", f"运营改过的标题{i}", bodies[i]) for i in range(3)]
+    c = _two_desk_projects(notes, p2_versions=p2)
+    core.tv_sync(c, TV)
+    rows = {r["note_id"]: r for r in c.rows["tv_edit_diffs"]}
+    assert set(rows) == {"m0", "m1", "m2"}
+    assert {r["project_id"] for r in rows.values()} == {P2}, "改法回到写这篇稿的那个项目"
+    assert {r["tv_project_id"] for r in rows.values()} == {TV}
+    assert all(r["changed"] and r["title_changed"] for r in rows.values())
+    later = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert core.edit_digest(c, P2, user_id=ME, now=later)["changed"] == 3
+    assert core.edit_digest(c, P1, user_id=ME, now=later) is None, "补录目标那边看不到别人写的稿的改法"
+
+
+def test_an_ingested_link_never_gets_a_diff_even_when_its_text_differs():
+    prev = {"note_id": "n9", "tv_project_id": TV, "project_id": P1, "version_id": "v1", "item_id": "i1",
+            "match_kind": "ingested", "score": None}
+    c = _client([_note("n9", "完全不同的标题", "。".join(FRESH[:6]) + "。")], links=[prev])
+    out = core.tv_sync(c, TV)
+    assert not c.rows.get("tv_edit_diffs") and out["edit_diffs"]["computed"] == 0
+
+
+def test_one_desk_project_under_two_tv_projects_gets_one_digest_covering_both():
+    c = _digest_client(n_changed=4)
+    for r in c.rows["tv_edit_diffs"][2:]:
+        r["tv_project_id"] = "BJS_phase2"
+    d = core.edit_digest(c, P1, user_id=ME, now=NOW)
+    assert d["changed"] == 4 and d["pairs"] == 5, "两个 TV 项目下的差异合在一份里, 各出现一次"
+    assert d["through"] == max(r["computed_at"] for r in c.rows["tv_edit_diffs"] if r["changed"])
+    core.ack_edit_digest(c, P1, d["through"], user_id=ME, rules_recorded=0)
+    assert core.edit_digest(c, P1, user_id=ME, now=NOW + timedelta(days=8)) is None, "看过之后两边都不再出现"

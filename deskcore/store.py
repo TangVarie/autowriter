@@ -2771,6 +2771,7 @@ def _ts(v) -> datetime | None:
 def tv_edit_diffs_since(sb, project_id: str, since: str | None, *, min_rev: int = 0,
                         limit: int = EDIT_DIGEST_ROWS) -> dict:
     """这个写作台项目 ``since`` 之后算出来的差异: ``{"rows": 改过的那些(旧的在前), "pairs": 全部对数, "more": 还有没有}``。
+    按写作台项目读, 不分 TV 项目: 这个项目挂在几个 TV 项目下(百健士-藻油同时在 BJS_phase1 / BJS_phase2 下), 几边的都读到(W-39)。
 
     只取 ``changed`` 的、**从旧往新**取, 最多 ``limit`` 行(codex review on aw#107): 摘要的 through 就是取到的最后
     一行, 看完之后从那儿接着往后 —— 新的在前取的话, 一次超过 limit 行时更早那些会被 through 一下跨过去、再也
