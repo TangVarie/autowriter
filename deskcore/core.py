@@ -4178,12 +4178,13 @@ def export_drafts(client, project_id: str, *, batch_id: str | None = None,
 
 
 def reembed_fingerprints(client, project_id: str | None, *, chunk: int = 50,
-                         progress=None, limit: int = 2000) -> dict:
+                         progress=None, limit: int = 2000, deadline: float | None = None) -> dict:
     """给指纹库里缺标题向量的行补上向量。
 
     ``project_id`` 为 None、``limit``(2026-10-30 复审): 不分项目、最多补这么多行 —— 给 tv-sync 每晚顺手补用
     (reembed_after_sync)。这时多回 ``projects``(涉及几个项目)。``embed_failed`` 是其中整块 embedding 调用失败的行数
-    (欠费 / 配额 / 网络; 其余没补上的是空标题算不出、或者 CAS 时行已被别人改过), 有才带。
+    (欠费 / 配额 / 网络; 其余没补上的是空标题算不出、或者 CAS 时行已被别人改过), 有才带。``deadline``(time.monotonic()
+    的时刻): 到点就在块与块之间停下, 剩下的不算失败, 回 ``stopped_early: true`` —— tv-sync 那一步不能拖住 cron。
 
     ⚠️ 【故意没有归属校验】(审计 COR-015)。它和 backfill 一样不是 MCP 工具 ——
     只有 CLI 能调, 而跑 CLI 的人手里握着 service_role key(等价于直连库)。在这儿
@@ -4221,7 +4222,11 @@ def reembed_fingerprints(client, project_id: str | None, *, chunk: int = 50,
     stale = len(rows) - absent
 
     fixed = failed = embed_failed = 0
+    stopped_early = False
     for start in range(0, len(rows), chunk):
+        if deadline is not None and start and time.monotonic() >= deadline:
+            stopped_early = True                        # 剩下的没碰过, 不算失败; 明晚接着补
+            break
         part = rows[start:start + chunk]
         vecs = dedup.embed_texts([r.get("title") or "" for r in part])
         if vecs is None:
@@ -4246,6 +4251,8 @@ def reembed_fingerprints(client, project_id: str | None, *, chunk: int = 50,
            "embedding_model": dedup.EMBEDDING_MODEL}
     if embed_failed:
         out["embed_failed"] = embed_failed
+    if stopped_early:
+        out["stopped_early"] = True
     if project_id is None:
         out["projects"] = len({str(r.get("project_id")) for r in rows if r.get("project_id")})
     if stale:
@@ -4264,6 +4271,9 @@ def reembed_fingerprints(client, project_id: str | None, *, chunk: int = 50,
 # store.fingerprints_needing_vectors), 每晚最多这么多行(跨所有项目, 不只是 tv_project_map 里的), 缺向量的排在换模型作废的
 # 前面。尽力而为: 补不成照其它步骤的警告报、退出码 1, 这晚写进去的对照一行不动; 没补完的明晚接着补。
 TV_SYNC_REEMBED_MAX = 200
+# 这一步的墙钟上限(秒): embedding 客户端没设请求超时, 一次卡住的调用会拖住 14:00 那趟 cron(Railway 在上一趟没跑完时跳过
+# 下一趟)。只能在块与块之间停 —— 一块最多 50 行、四块封顶, 平时几秒就完; 超了就停, 没补的明晚接着补。
+TV_SYNC_REEMBED_BUDGET_SEC = 90
 
 
 def reembed_after_sync(client, *, limit: int = TV_SYNC_REEMBED_MAX) -> dict:
@@ -4278,12 +4288,16 @@ def reembed_after_sync(client, *, limit: int = TV_SYNC_REEMBED_MAX) -> dict:
     if not dedup.embeddings_available():
         return {"skipped": "not_configured"}
     limit = max(1, int(limit))
-    got = reembed_fingerprints(client, None, limit=limit)
+    got = reembed_fingerprints(client, None, limit=limit,
+                               deadline=time.monotonic() + TV_SYNC_REEMBED_BUDGET_SEC)
     out = {"pending": int(got.get("pending") or 0), "fixed": int(got.get("fixed") or 0),
            "failed": int(got.get("failed") or 0), "missing_vector": int(got.get("missing_vector") or 0),
            "stale_model": int(got.get("stale_model") or 0), "projects": int(got.get("projects") or 0),
            "embedding_model": dedup.EMBEDDING_MODEL}
-    out["capped"] = out["pending"] >= limit
+    # capped: 这晚可能没补完(取满了上限, 或者到点停了) —— 取满上限时不一定还有剩, 所以 CLI 说「可能还有」
+    out["capped"] = out["pending"] >= limit or bool(got.get("stopped_early"))
+    if got.get("stopped_early"):
+        out["stopped_early"] = True
     if got.get("embed_failed"):
         out["error"] = f"{got['embed_failed']} 行的 embedding 调用失败"
     elif got.get("error"):                              # embedding 在两次判断之间变得不可用(进程级单例, 几乎不会)
@@ -7608,7 +7622,9 @@ def create_project(client, name: str, *, brand: str = "",
     if dupes:
         hit = next((d for d in dupes if not project_archived(d)), dupes[0])    # 有在用的先回在用的
         if project_archived(hit):
-            return _existing_idle_project(hit, name)
+            # 同名但品牌对不上(复审 2026-10-30): 照旧不建, 但先跟用户确认, 不叫模型闷头用
+            mismatch = bool(brand) and _project_name_key(hit.get("brand") or "") != _project_name_key(brand)
+            return _existing_idle_project(hit, name, confirm=mismatch)
         return {
             "project_id": hit["id"],
             "name": hit.get("name") or name,
@@ -7619,10 +7635,21 @@ def create_project(client, name: str, *, brand: str = "",
                      "两套互不可见的库, 查重从此对这个方向失效。"
                      "确实要另开方向的话, 换一个能区分的名字。"),
         }
-    # 暂时不用的项目里名字只差写法的(见上面 2026-10-30 复审那段): list_projects 默认不列它们, 模型找不到才来建
-    idle = _idle_namesake(client, user_id, name, brand)
-    if idle is not None:
-        return _existing_idle_project(idle, name)
+    # 名字只差写法的(见上面 2026-10-30 复审那段): 暂时不用的 list_projects 默认不列, 模型找不到才来建; 在用的也算 ——
+    # 「途鸽 D1」和「途鸽-D1」建成两个就是两套互不查重的历史库。写法不一样, 所以都先跟用户确认一句再用。
+    near = _namesake(client, user_id, name, brand)
+    if near is not None:
+        if project_archived(near):
+            return _existing_idle_project(near, name, confirm=True)
+        near_name = near.get("name") or ""
+        return {
+            "project_id": near["id"],
+            "name": near_name,
+            "brand": near.get("brand") or "",
+            "created": False,
+            "note": (f"已经有一个叫「{near_name}」的项目, 和「{name}」只差写法, 没有新建。先跟用户确认一句要写的是不是它: "
+                     "是就直接用这个 project_id; 不是同一个方向, 换一个能区分的名字再建。"),
+        }
 
     row = db.create_project(client, user_id=user_id, name=name, brand=brand)
     pid = (row or {}).get("id")
@@ -7650,41 +7677,56 @@ def create_project(client, name: str, *, brand: str = "",
     return out
 
 
+# 项目名里只当分隔用的符号: 去掉它们之后「途鸽-D8」「途鸽 D8」「途鸽·D8」是一个名字。不用 fingerprint.normalize(复审
+# 2026-10-30): 它把所有标点和符号都去掉, 「D1-2」和「D12」、「2.0」和「20」、「¥99套餐」和「99套餐」会撞成一个键。
+# 夹在两个数字中间的分隔符也留着(「D1-2」≠「D12」)。
+_NAME_SEPARATORS = frozenset("-_‐‑‒–—―·・‧•/\\|、，,")
+
+
 def _project_name_key(text: str) -> str:
-    """项目名 / 品牌名比对用的键: 全半角统一(NFKC)、不分大小写、去掉空白和标点(fingerprint.normalize 的口径)。
-    「途鸽-D8」「途鸽 D8」「途鸽－Ｄ８」是同一个键。只给 create_project 找暂时不用的同名项目用。"""
-    return fp.normalize(unicodedata.normalize("NFKC", text or "").casefold())
+    """项目名 / 品牌名比对用的键: 全半角统一(NFKC)、不分大小写、去掉空白和不夹在数字中间的分隔符(_NAME_SEPARATORS)。
+    「途鸽-D8」「途鸽 D8」「途鸽－Ｄ８」是同一个键;「D1-2」和「D12」不是。只给 create_project 找写法不同的同名项目用。"""
+    t = unicodedata.normalize("NFKC", text or "").casefold().strip()
+    out = []
+    for i, ch in enumerate(t):
+        if ch.isspace() or ch in _NAME_SEPARATORS:
+            if 0 < i < len(t) - 1 and t[i - 1].isdigit() and t[i + 1].isdigit():
+                out.append(ch)
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
-def _idle_namesake(client, user_id: str, name: str, brand: str) -> dict | None:
-    """调用者名下标成暂时不用、名字(给了品牌时还有品牌)按 _project_name_key 一样的项目, 没有回 None。只看自己名下的
-    (store.list_all_projects 按 owner 过滤), 别人的项目叫什么跟这次建不建没关系。键是空串(名字全是标点)不比。"""
+def _namesake(client, user_id: str, name: str, brand: str) -> dict | None:
+    """调用者名下名字(给了品牌时还有品牌)按 _project_name_key 一样的项目, 没有回 None。**在用的优先**(复审 2026-10-30:
+    原来只找暂时不用的, 在用的「途鸽 D1」和暂时不用的「途鸽-D1」同时在时会回后者, 稿子写进不用的那套历史库)。只看自己
+    名下的(store.list_all_projects 按 owner 过滤), 别人的项目叫什么跟这次建不建没关系。键是空串(名字全是分隔符)不比。"""
     want = _project_name_key(name)
     if not want:
         return None
     want_brand = _project_name_key(brand) if brand else None
-    for p in store.list_all_projects(client, owner_id=user_id):
-        if not project_archived(p) or _project_name_key(p.get("name") or "") != want:
-            continue
-        if want_brand is not None and _project_name_key(p.get("brand") or "") != want_brand:
-            continue
-        return p
-    return None
+    hits = [p for p in store.list_all_projects(client, owner_id=user_id)
+            if _project_name_key(p.get("name") or "") == want
+            and (want_brand is None or _project_name_key(p.get("brand") or "") == want_brand)]
+    return next((p for p in hits if not project_archived(p)), hits[0] if hits else None)
 
 
-def _existing_idle_project(hit: dict, asked: str) -> dict:
-    """create_project 撞上标成暂时不用的项目时的回包: 不建, 回它。note 是给模型的话, 用户要写的就是这个品时照常用它。"""
+def _existing_idle_project(hit: dict, asked: str, *, confirm: bool = False) -> dict:
+    """create_project 撞上标成暂时不用的项目时的回包: 不建, 回它。note 是给模型的话。
+
+    ``confirm``: 名字只差写法、或者同名但品牌对不上 —— 不能确定就是用户说的那个, 先跟用户确认; 否则(同名、品牌对得上或
+    没给品牌)是条件句: 用户要写的是这个品就照常用, 不提它暂时不用。"""
     name = hit.get("name") or asked
-    return {
-        "project_id": hit["id"],
-        "name": name,
-        "brand": hit.get("brand") or "",
-        "created": False,
-        "archived": True,
-        "note": (f"已经有「{name}」这个项目, 没有新建 —— 它标成了暂时不用, 所以 list_projects 默认不列。直接用这个 "
-                 "project_id 调 open_project, 历史稿和规则都在它里面; 用户要写的就是这个品, 照常写, 不用跟用户提它暂时不用。"
-                 "确实要另开一个新方向, 换一个能区分的名字再建。"),
-    }
+    brand = hit.get("brand") or ""
+    if confirm:
+        note = (f"已经有一个叫「{name}」" + (f"(品牌「{brand}」)" if brand else "") + "的项目, 和用户说的名字或品牌不完全一样, "
+                "它标成了暂时不用, 所以 list_projects 默认不列; 没有新建。先跟用户确认一句要写的是不是它: 是就用这个 "
+                "project_id 调 open_project; 不是同一个, 换一个能区分的名字再建。")
+    else:
+        note = (f"已经有「{name}」这个项目, 没有新建 —— 它标成了暂时不用, 所以 list_projects 默认不列。用户要写的是这个品, "
+                "就直接用这个 project_id 调 open_project 照常写(历史稿和规则都在它里面), 不用跟用户提它暂时不用; "
+                "确实要另开一个新方向, 换一个能区分的名字再建。")
+    return {"project_id": hit["id"], "name": name, "brand": brand, "created": False, "archived": True, "note": note}
 
 
 # ── 归档: 不用的项目不进清单、不进跨项目检查(2026-10-30 发布收尾) ──────────────────────────────────

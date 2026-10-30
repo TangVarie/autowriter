@@ -480,11 +480,15 @@ def _tv_sync_reembed(core, sb) -> int:
         print("\n标题向量: 这个部署没配 embedding(GOOGLE_API_KEY), 没补。")
         return 0
     if not rv.get("pending"):
+        if rv.get("error"):                             # 先看故障再看「没有要补的」(复审 2026-10-30): pending 是 0 也可能是没补成
+            print(f"\n⚠️ 标题向量没补成: {rv['error']} —— 对照照常写了; 明晚再补。")
+            return 1
         return 0
     print(f"\n标题向量(每晚最多补 {core.TV_SYNC_REEMBED_MAX} 行): 补了 {rv['fixed']}/{rv['pending']} 行"
           f"(项目 {rv['projects']} 个; 缺向量 {rv['missing_vector']}, 换模型作废 {rv['stale_model']})"
           + (f", {rv['failed']} 行没补上" if rv.get("failed") else "")
-          + ("; 没轮到的明晚接着补" if rv.get("capped") else ""))
+          + ("; 到了这一步的时间上限, 先停" if rv.get("stopped_early") else "")
+          + ("; 可能还有没轮到的, 明晚接着补" if rv.get("capped") else ""))
     if rv.get("error"):
         print(f"  ⚠️ {rv['error']} —— 对照照常写了; 这几行明晚再补, 连着几晚都这样就查 embedding 的 key / 配额。")
         return 1

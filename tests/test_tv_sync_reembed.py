@@ -162,3 +162,28 @@ def test_cli_only_heals_on_the_nightly_all_run(fake, embed_on, monkeypatch, argv
     monkeypatch.setattr(core, "reembed_after_sync", lambda *a, **k: pytest.fail("只在 --all 且不是 --dry-run 时补"))
     assert cli.main(argv) == 0
     assert "标题向量" not in capsys.readouterr().out
+
+
+def test_it_stops_between_chunks_at_its_time_budget(embed_on, monkeypatch):
+    """复审 2026-10-30: embedding 客户端没设请求超时, 这一步不能拖住 14:00 那趟 cron。到点就在块与块之间停, 剩下的不算失败,
+    stopped_early 照实报, 明晚接着补。第一块总要做完(到点前已经开始)。"""
+    c = FakeClient(rows={"draft_fingerprints": [_fp(f"a{i}", P1, f"缺向量{i}") for i in range(5)]})
+    monkeypatch.setattr(core.time, "monotonic", lambda: 100.0)                 # 第二块开始前就已经过点
+    got = core.reembed_fingerprints(c, None, chunk=2, limit=10, deadline=50.0)
+    assert got["fixed"] == 2 and got["failed"] == 0 and got.get("stopped_early") is True, got
+    assert sum(1 for r in c.rows["draft_fingerprints"] if r.get("embedding_model") == CUR) == 2
+
+
+def test_the_nightly_step_reports_a_budget_stop_as_capped(embed_on, monkeypatch):
+    monkeypatch.setattr(core, "TV_SYNC_REEMBED_BUDGET_SEC", -1)                 # 一开始就超了: 只做第一块(50 行)
+    c = FakeClient(rows={"draft_fingerprints": [_fp(f"b{i}", P1, f"缺{i}") for i in range(120)]})
+    out = core.reembed_after_sync(c)
+    assert out["fixed"] == 50 and out["stopped_early"] is True and out["capped"] is True and "error" not in out, out
+
+
+def test_cli_reports_an_error_even_when_nothing_was_pending(fake, monkeypatch, capsys):
+    """复审 2026-10-30: 原来先看「没有要补的」就回 0, embedding 在两次判断之间不可用时(pending 是 0、error 有值)一声不吭。"""
+    monkeypatch.setattr(core, "reembed_after_sync",
+                        lambda *a, **k: {"pending": 0, "fixed": 0, "failed": 0, "error": "embedding 不可用"})
+    assert cli.main(["tv-sync", "--all"]) == 1
+    assert "标题向量没补成: embedding 不可用" in capsys.readouterr().out

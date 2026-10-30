@@ -260,6 +260,7 @@ def test_an_idle_project_whose_name_differs_only_in_spelling_is_returned(existin
     assert out["created"] is False and out["project_id"] == "p-idle" and out["archived"] is True, out
     assert out["name"] == existing, "回的是库里那个项目的名字"
     assert len(sb.rows["projects"]) == 1
+    assert "确认" in out["note"] and "不用跟用户提" not in out["note"], "写法不一样, 先跟用户确认"
 
 
 def test_an_idle_namesake_under_another_brand_does_not_block_a_new_project():
@@ -284,11 +285,41 @@ def test_a_live_project_wins_over_an_idle_one_with_the_same_name():
     assert out["created"] is False and out["project_id"] == "p-b" and "archived" not in out
 
 
-def test_live_projects_still_need_the_exact_name():
-    """只有暂时不用的项目放宽了写法(模型在清单里看不见它们); 在用的照旧按原来的判据(大小写、首尾空格)。"""
+def test_a_live_project_whose_name_differs_only_in_spelling_is_returned_with_a_confirm_note():
+    """复审 2026-10-30: 「示例运动-产品向」和「示例运动 产品向」建成两个就是两套互不查重的历史库。在用的同样回它, 不建;
+    写法不一样, 叫模型先跟用户确认一句。"""
     sb = _client([{"id": "p-live", "name": "示例运动-产品向", "brand": "示例", "owner_id": ME}])
     out = core.create_project(sb, "示例运动 产品向", brand="示例", user_id=ME)
-    assert out["created"] is True
+    assert out["created"] is False and out["project_id"] == "p-live" and "archived" not in out, out
+    assert "确认" in out["note"] and len(sb.rows["projects"]) == 1
+
+
+def test_a_live_spelling_namesake_wins_over_an_idle_one():
+    """复审 2026-10-30: 在用的「途鸽 D1」和暂时不用的「途鸽-D1」都在时, 回在用的那个(原来只找暂时不用的, 稿子会写进旧库)。"""
+    sb = _client([{"id": "p-idle", "name": "示例-D1", "brand": "示例", "owner_id": ME, "default_params": _IDLE},
+                  {"id": "p-live", "name": "示例 D1", "brand": "示例", "owner_id": ME}])
+    out = core.create_project(sb, "示例D1", brand="示例", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-live" and "archived" not in out, out
+
+
+@pytest.mark.parametrize("existing, asked", [
+    ("示例-D1-2", "示例-D12"),       # 夹在数字中间的分隔符不去
+    ("示例 2.0", "示例 20"),
+    ("示例 ¥99套餐", "示例 99套餐"),
+    ("示例 A+B", "示例 AB"),
+])
+def test_names_that_only_look_alike_are_different_projects(existing, asked):
+    sb = _client([{"id": "p-idle", "name": existing, "brand": "示例", "owner_id": ME, "default_params": _IDLE}])
+    out = core.create_project(sb, asked, brand="示例", user_id=ME)
+    assert out["created"] is True and out["project_id"] != "p-idle", out
+
+
+def test_the_same_name_as_an_idle_project_under_another_brand_asks_first():
+    """同名但品牌对不上: 照旧不建(同名两个会让查重分裂), 但叫模型先跟用户确认, 不闷头用。"""
+    sb = _client([{"id": "p-idle", "name": "示例运动", "brand": "别的品", "owner_id": ME, "default_params": _IDLE}])
+    out = core.create_project(sb, "示例运动", brand="示例", user_id=ME)
+    assert out["created"] is False and out["project_id"] == "p-idle" and out["archived"] is True
+    assert "确认" in out["note"] and "不用跟用户提" not in out["note"] and "别的品" in out["note"]
 
 
 def test_idle_siblings_are_marked():
