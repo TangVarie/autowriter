@@ -16,6 +16,8 @@
   · 读类工具出错 → 返回带 error 的可用结构, 不抛(不阻塞写稿)
   · check_drafts 是【唯一例外】→ 出错必须抛。静默放行就是重演
     config.py 那个 ENABLE_DEDUP_REGEN 默认关着的老问题。
+  · 认不出调用者 / 项目不归你 → 一律抛 PermissionError(_require_caller /
+    core.assert_project_access), 不算"出错降级", 也不回带 error 的 dict。
 """
 
 from __future__ import annotations
@@ -81,6 +83,22 @@ def protocol_text() -> tuple[str, str]:
     return text, digest
 
 
+def _attach_skill_update(out: Any, tool: str, user_id: str | None, raw_version,
+                         current: str | None = None) -> Any:
+    """入口工具的版本探针 (skillcheck.probe): 这次调用报上来的是旧版, 就在返回值上加 ``skill_update``; 最新 / 没报都不加。
+    ``current`` 不给就现读协议版本。协议文件读不了、探针出任何错都只记日志 —— 探针不能把合规读 (open_project) 弄坏。"""
+    if not isinstance(out, dict):
+        return out
+    try:
+        update = skillcheck.probe(user_id, raw_version, current or protocol_text()[1])
+    except Exception:  # noqa: BLE001
+        logger.warning("%s: 这次没核 skill 版本(协议文件读不了或探针出错)", tool, exc_info=True)
+        return out
+    if update:
+        out["skill_update"] = update
+    return out
+
+
 def get_protocol(local_version: str | None = None,
                  _user_id: str | None = None) -> dict:
     """核对写作台协议的版本; 本地没有或已过期时下发全文。对话开始时调一次。
@@ -94,8 +112,8 @@ def get_protocol(local_version: str | None = None,
       · ``protocol``    —— 协议正文(只在需要时带)
       · ``skill_header`` —— skill 文件引线头里那几条独立规矩(和 protocol 一起带;
                           版本号盖的是两者, 头改了也算过期)
-      · ``skill_update`` —— (不是最新版 / 没传版本时才有) 升级提醒。把它的 ``message``
-                          **原样**(三行都要)放在给用户回复的最前面, 然后照常继续。
+      · ``skill_update`` —— (你传的版本不是最新版时才有; 没传就没有) 升级提醒。把它的
+                          ``message`` **原样**(三行都要)放在给用户回复的最前面, 然后照常继续。
 
     ⚠️ 协议正文的**主副本在 skill 文件里**, 不在这个工具的返回值里。2026-09-10 曾
     反过来 —— skill 只留一根引线, 正文每次由这个工具下发 —— 结果 09-11 起定稿
@@ -114,14 +132,12 @@ def get_protocol(local_version: str | None = None,
     # 故意不包 _safe: 包成带 error 的"成功"会让模型以为版本核过了。
     text, digest = protocol_text()
     out: dict = {"version": digest, "chars": len(text)}
-    # 服务端版本探针 (skillcheck): 记下这个写手报的版本, 不是最新就带升级提醒。不拦调用。
-    status, reported = skillcheck.report(_user_id, local_version, digest)
-    if status != skillcheck.UP_TO_DATE:
-        out["skill_update"] = skillcheck.notice(status, reported, digest)
+    # 服务端版本探针 (skillcheck): 这次报的是旧版才带升级提醒, 没报不提醒。不拦调用。
+    _attach_skill_update(out, "get_protocol", _user_id, local_version, digest)
     # 宽松地取版本号: 模型可能把整行 "<!-- protocol_version: xxx -->" 或
     # "protocol_version: xxx" 原样传进来。只要里面有那 12 位十六进制就认。
     # 精确比较的后果是每场对话都判成"旧版", 全文再发一遍、还让运营白重装。
-    # 与探针 (skillcheck.normalize) 同一个口径: 空串当没传, 认不出的按旧版。
+    # 与探针 (skillcheck.normalize) 同一个口径: 空串和「无」这类占位当没传, 认不出的按旧版。
     if local_version is not None:
         local_version = skillcheck.normalize(local_version)
     header = _strip_frontmatter(skill_head())
@@ -223,6 +239,19 @@ def _safe(fn, *args, **kwargs) -> Any:
         # hint 是念给写手的: 堆栈已经在上面那行日志里, 这里只说"写稿照常"(2026-10-30 发布收尾)
         return {"error": f"{type(exc).__name__}: {exc}"[:300],
                 "hint": "写稿可以继续, 但这次没拿到这部分数据; 已记下, 不用你做什么"}
+
+
+def _require_caller(user_id: str | None, tool: str, what: str) -> None:
+    """个人层 / 规则台账这几个工具认不出调用者时**拒绝**: 抛 PermissionError, 和项目归属拒绝同一个口径
+    (core.assert_project_access; MCP 层收成工具错误, REST 映成 403)。
+
+    2026-10-30 发布收尾: 原来这几个回一个带 ``error`` / ``hint`` 的 dict, 别的工具却抛 —— 同一件事两种形状, 带 error
+    的 dict 在模型那边像一次成功的调用, 而 hint 里那句配置变量名会被原样念给写手。服务端怎么补(配 key 映射)只进日志。"""
+    if user_id:
+        return
+    logger.warning("%s: 认不出调用者身份, 拒绝 —— 服务端要配 DESKCORE_KEYS(或 DESKCORE_API_KEY + "
+                   "DESKCORE_DEFAULT_USER_ID)", tool)
+    raise PermissionError(f"无法识别调用者身份, {what}。这次没做成, 已记下, 不用你做什么。")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -362,9 +391,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     或常识补一份约束继续写 —— 这个项目的硬约束是什么, 只有库里那份算数。
 
     ``skill_version``: **每次都传** bywood-writing-desk 这个 skill 里 ``protocol_version:`` 那一行的
-    12 位值(传整行也认)。skill 里没有这一行就传空。返回里有 ``skill_update`` 时, 说明 skill 不是最新版
-    (或没核到版本): 把 ``skill_update.message`` **原样**(三行都要, 链接和「更新技能」那行一字不改)
-    放在给用户回复的最前面, 然后照常继续写 —— 不拦写稿, 只是提醒升级。
+    12 位值(传整行也认)。skill 里没有这一行就传空。返回里有 ``skill_update`` 时, 说明你这次传的版本不是最新版:
+    把 ``skill_update.message`` **原样**(三行都要, 链接和「更新技能」那行一字不改)
+    放在给用户回复的最前面, 然后照常继续写 —— 不拦写稿, 只是提醒升级。没有 ``skill_update`` 就不用提版本的事。
     """
     brief = {"tactic": tactic, "draft_topic": draft_topic,
              "key_messages": key_messages, "target_audience": target_audience,
@@ -384,16 +413,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     if digest:
         out["edit_digest"] = digest
     # 2026-10-30 发布收尾: 不再带 desk_gap(同 list_projects)。
-    # 服务端版本探针 (skillcheck)。协议文件读不了就跳过 —— 探针不能把合规读弄坏。
-    try:
-        digest = protocol_text()[1]
-    except Exception:  # noqa: BLE001
-        logger.warning("open_project: 协议文件读不了, 这次不核 skill 版本", exc_info=True)
-        return out
-    status, reported = skillcheck.report(_user_id, skill_version or None, digest)
-    if status != skillcheck.UP_TO_DATE:
-        out["skill_update"] = skillcheck.notice(status, reported, digest)
-    return out
+    # 服务端版本探针 (skillcheck): 只看这次传的 skill_version —— 一个团队共用一个身份, 别人的旧版、重启后没核到都不算到这一场头上。
+    return _attach_skill_update(out, "open_project", _user_id, skill_version)
 
 
 def draw_angles(project_id: str, n: int, avoid_days: int = 30,
@@ -498,7 +519,8 @@ def check_drafts(project_id: str, drafts: list[dict],
 
     这个工具出错会直接报错而不是放行 —— 查重挂了必须停下来, 不能当作通过。
     """
-    # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。
+    # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。正文 / 标题放错了字段的先对上(_draft_fields), 不然这一篇只按标题查。
+    drafts = _draft_fields(drafts, "check_drafts", project_id)
     out = core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id, record_snapshot=True)
     # W-29: 判定之后才查; 查不到就不带, 判定结果原样回去。
     return _with_archive_pending(out, _user_id, project_id)
@@ -583,15 +605,7 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
     """
     out = core.comments_for(core.sb(), user_id=_user_id, link=link, project_id=project_id,
                             post_title=post_title, post_body=post_body)
-    try:
-        digest = protocol_text()[1]
-    except Exception:  # noqa: BLE001
-        logger.warning("comments_for: 协议文件读不了, 这次不核 skill 版本", exc_info=True)
-        return out
-    status, reported = skillcheck.report(_user_id, skill_version or None, digest)
-    if status != skillcheck.UP_TO_DATE:
-        out["skill_update"] = skillcheck.notice(status, reported, digest)
-    return out
+    return _attach_skill_update(out, "comments_for", _user_id, skill_version)
 
 
 def score_comments(comments: list[dict], link: str = "", project_id: str = "", post_title: str = "",
@@ -699,6 +713,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     """
     # 故意不包 _safe: 这是【写】操作。_safe 会把异常变成一个看起来成功、只带 error 字段的结果, 而存档失败若被当成
     # 成功, 稿子静默缺席指纹库, 查重的历史出现空洞, 同样的稿子以后能再过一次闸。
+    # 正文 / 标题放错了字段的先对上(_draft_fields): 存进 versions 的正文就是对上的那份, 之后 check_rules 查的也是它。
+    drafts = _draft_fields(drafts, "score_drafts", project_id)
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
                               flywheel_arm=flywheel_arm or None, tactic=tactic or "")
 
@@ -762,7 +778,8 @@ def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", t
                   _user_id: str | None = None) -> dict:
     """旧名, 和 ``score_drafts`` 完全一样(存档 + 参考分)。新版 skill 只调 score_drafts; 这个名字留着是为了还没升级
     skill 的写手 —— 别在新对话里调它, 参数、返回值、怎么读分数都看 score_drafts 的说明。"""
-    # 同 score_drafts: 写操作, 不包 _safe。
+    # 同 score_drafts: 写操作, 不包 _safe; 放错字段的一样先对上。
+    drafts = _draft_fields(drafts, "commit_drafts", project_id)
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
                               flywheel_arm=flywheel_arm or None, tactic=tactic or "")
 
@@ -776,8 +793,10 @@ class InvalidInput(ValueError):
     超大载荷一直重试, 400 才说得清是"改参数"。"""
 
 
+# 头一个是本名, 后面是别名。ingest_published 按顺序取第一个有字的; check_drafts / score_drafts 只在本名空着、别名里恰好
+# 一个有字时才拿别名(_draft_fields)。content / text 是模型把正文放错字段时最常用的英文键(W-30 记下的字段名里就有 content)。
 _TITLE_KEYS = ("title", "标题")
-_BODY_KEYS = ("body", "正文", "内容")
+_BODY_KEYS = ("body", "正文", "内容", "content", "text")
 _LINEAGE_KEYS = ("version_id", "_source_autowriter_version_id")
 
 
@@ -787,6 +806,42 @@ def _first(d: dict, keys: tuple) -> str:
         if v is not None and str(v).strip():
             return str(v).strip()
     return ""
+
+
+def _draft_fields(drafts: Any, tool: str, project_id: str) -> Any:
+    """check_drafts / score_drafts 收到的每篇稿子: ``body`` / ``title`` 空着(没有、None、全是空白), 而别名键
+    (_BODY_KEYS / _TITLE_KEYS 里本名之后那几个)里**恰好只有一个**是有字的字符串 —— 就拿它当 body / title。
+
+    core 只读 ``draft["body"]`` / ``draft["title"]``。模型把正文放进了别的键, 稿子就成了只有标题的一篇: 10-21 / 10-22
+    15 篇照样存了档(查重看不见、发出去对不回来, W-30 之后改成拒), 10-26 一批 20 篇全被拒(W-31)。那是模型放错了字段,
+    写手什么也没做错; 意思明确的在这一层替它对上。
+      · 本名有字的**绝不覆盖**; 两个以上别名有字(分不清哪个是正文)、或别名的值不是字符串的, 原样不动 —— 正文还是空的,
+        照旧走 W-30 的 empty_body 拒, 回包说清收到了哪些字段;
+      · 只换出新的 dict, 不改调用方传进来的那份; 别名键原样留着(core 不读它们);
+      · 对上了几篇只进日志(给工程看模型还在往哪个键里放), 回包一个字段不多。"""
+    if not isinstance(drafts, list):
+        return drafts
+    out: list = []
+    moved: dict[str, int] = {}
+    for d in drafts:
+        if not isinstance(d, dict):
+            out.append(d)
+            continue
+        fixed = d
+        for keys in (_TITLE_KEYS, _BODY_KEYS):
+            name = keys[0]
+            v = d.get(name)
+            if v is not None and str(v).strip():
+                continue
+            hits = [k for k in keys[1:] if isinstance(d.get(k), str) and d[k].strip()]
+            if len(hits) == 1:
+                fixed = {**fixed, name: d[hits[0]]}
+                moved[f"{hits[0]}→{name}"] = moved.get(f"{hits[0]}→{name}", 0) + 1
+        out.append(fixed)
+    if moved:
+        logger.warning("%s: project=%s 有稿子的 title / body 放在了别的字段, 按别名收下: %s",
+                       tool, str(project_id)[:40], dict(sorted(moved.items())))
+    return out
 
 
 def ingest_published(project_id: str, drafts: list[dict], source: str = "",
@@ -979,9 +1034,7 @@ def record_edit(project_id: str, ai_title: str, ai_body: str,
     ⚠️ 只在用户【真的动手改了】的时候调。用户没改就通过的稿子不要传进来 ——
     从「没改」里推不出偏好, 硬推会让系统编造出根本不存在的风格规则。
     """
-    if not _user_id:
-        return {"error": "无法识别调用者身份, 个人风格功能不可用",
-                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    _require_caller(_user_id, "record_edit", "个人风格功能不可用")
     # 故意不包 _safe: 写。这是"裂变"的唯一入口, 静默失败 = 文风永远长不出来。
     return core.record_edit(core.sb(), project_id, user_id=_user_id,
                             ai_title=ai_title, ai_body=ai_body,
@@ -1003,9 +1056,7 @@ def label_example(item_id: str, label: str, _user_id: str | None = None) -> dict
     负例 —— 数据不好有太多与内容无关的原因(没进流量池、账号限流、时机不对),
     那样会把被埋没的好内容也标成垃圾。
     """
-    if not _user_id:
-        return {"error": "无法识别调用者身份, 不能标记正负例(那是个人资产)",
-                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    _require_caller(_user_id, "label_example", "不能标记正负例(那是个人资产)")
     # 故意不包 _safe: 写。标记没落库却报成功, 用户不会再标第二次。
     return core.label_example(core.sb(), item_id,
                               None if label in ("none", "", None) else label,
@@ -1023,9 +1074,7 @@ def my_style(project_id: str, _user_id: str | None = None) -> dict:
     这时返回值里会直接带上 pending_distillation_task, **材料和口径都在里面**,
     照着提炼完调 save_my_style 就能补上, 不需要让用户把稿子再喂一遍。
     """
-    if not _user_id:
-        return {"error": "无法识别调用者身份",
-                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    _require_caller(_user_id, "my_style", "个人风格资产看不了")
     return _safe(core.my_style, core.sb(), project_id, user_id=_user_id)
 
 
@@ -1050,9 +1099,7 @@ def save_my_style(project_id: str, notes: str,
     (还剩几条)。剩的不为 0 说明没吸收完 —— 待吸收超过一次快照(8 条)时是正常
     的, 接着做下一批。
     """
-    if not _user_id:
-        return {"error": "无法识别调用者身份, 个人风格功能不可用",
-                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    _require_caller(_user_id, "save_my_style", "个人风格功能不可用")
     # 故意不包 _safe: 写。这是"裂变"闭环的最后一步, 静默失败 = 前面白做。
     return core.save_my_style(core.sb(), project_id, notes,
                               user_id=_user_id, edit_ids=edit_ids)
@@ -1075,10 +1122,8 @@ def my_rules(project_id: str, _user_id: str | None = None) -> dict:
 
     改档位用 set_rule_state。
     """
-    if not _user_id:
-        return {"error": "无法识别调用者身份, 规则台账不可用",
-                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
-    # 读, 可降级: 看不到台账不影响写稿。
+    _require_caller(_user_id, "my_rules", "规则台账不可用")
+    # 读, 可降级: 看不到台账不影响写稿。认不出人不是"看不到台账", 上面那行已经拒了(同项目归属的口径)。
     return _safe(core.my_rules, core.sb(), project_id, user_id=_user_id)
 
 
@@ -1097,9 +1142,7 @@ def reembed_my_rules(batch: int = 50, _user_id: str | None = None) -> dict:
 
     只补**调用者自己**名下的规则, 补不到别人的。
     """
-    if not _user_id:
-        return {"error": "无法识别调用者身份, 补算功能不可用",
-                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    _require_caller(_user_id, "reembed_my_rules", "补算功能不可用")
     # 故意不包 _safe: 写。而且它的失败模式全是"看起来跑完了其实没干活",
     # 包成带 error 的"成功"正好把这些状态码埋掉。
     return core.reembed_my_rules(core.sb(), user_id=_user_id, batch=batch)
@@ -1123,9 +1166,7 @@ def set_rule_state(memory_id: str, action: str, days: int = 90,
     ⚠️ 用户说"别用这条了"时先问一句是**暂时**还是**以后都不要**: 前者 mute,
     后者 retire。分不清就用 mute —— 它会自己到期, 猜错的代价小。
     """
-    if not _user_id:
-        return {"error": "无法识别调用者身份, 拒绝改动规则",
-                "hint": "服务端需要配置 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID"}
+    _require_caller(_user_id, "set_rule_state", "拒绝改动规则")
     # 故意不包 _safe: 写。静默失败 = 用户以为关掉了的规则还在每一份简报里,
     # 或者以为留下的规则其实没生效 —— 两个方向都是无声的。
     return core.set_rule_state(core.sb(), memory_id, action,

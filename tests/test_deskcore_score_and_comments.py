@@ -222,10 +222,13 @@ def test_comments_for_is_an_entry_tool_for_the_skill_probe(monkeypatch):
     c = _tv_client()
     monkeypatch.setattr(core, "sb", lambda: c)
     out = tools.comments_for(link=LINK, _user_id=ME)
-    assert out["skill_update"]["status"] == skillcheck.UNKNOWN
+    assert "skill_update" not in out, "没带版本只记一笔, 不提醒(2026-10-30 发布收尾)"
     _, current = tools.protocol_text()
     out = tools.comments_for(link=LINK, skill_version=current, _user_id=ME)
     assert "skill_update" not in out
+    out = tools.comments_for(link=LINK, skill_version="0123456789ab", _user_id=ME)
+    assert out["skill_update"]["status"] == skillcheck.OUTDATED
+    assert skillcheck.health(current)["writers_24h"] == {"up_to_date": 1, "outdated": 1, "unknown": 1}
     skillcheck.reset()
 
 

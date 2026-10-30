@@ -164,6 +164,15 @@ def test_feishu_style_chinese_keys_are_accepted(fake):
     assert fake.rows["versions"][0]["title"] == "中文键"
 
 
+@pytest.mark.parametrize("key", ["content", "text"])
+def test_english_body_aliases_are_accepted_too(fake, key):
+    """和 check_drafts / score_drafts 共用一份别名(2026-10-30 发布收尾): 模型把正文放进 content / text 也认。"""
+    body = "正文放在了英文键里, 也是整篇正文。" * 4
+    out = T.ingest_published(PROJ, [{"title": "英文键", key: body}], _user_id=ME)
+    assert (out["minted"], out["fingerprinted"]) == (1, 1)
+    assert fake.rows["versions"][0]["body"] == body
+
+
 def test_a_batch_made_only_of_committed_rows_writes_nothing_and_says_so(fake):
     rows = [{"title": "已入库", "body": "x" * 40, "version_id": "v1"}]
     out = T.ingest_published(PROJ, rows, _user_id=ME)

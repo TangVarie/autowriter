@@ -22,6 +22,8 @@ key 的调用方传入他人 project_id 就能读他人成稿标题、往他人�
 from __future__ import annotations
 
 import ast
+import inspect
+import logging
 import pathlib
 
 import pytest
@@ -432,6 +434,45 @@ def test_safe_wrapper_does_not_swallow_permission_errors():
 
     out = tools._safe(_boom)
     assert isinstance(out, dict) and "error" in out and "hint" in out
+
+
+# 个人层 / 规则台账这几个工具自己先看有没有调用者身份(不全是项目级, 走不到 assert_project_access)。
+IDENTITY_FIRST_TOOLS = [
+    ("record_edit", {"project_id": MINE, "ai_title": "原标题", "ai_body": "原正文", "my_title": "改后", "my_body": "改后正文"}),
+    ("label_example", {"item_id": "item-mine", "label": "positive"}),
+    ("my_style", {"project_id": MINE}),
+    ("save_my_style", {"project_id": MINE, "notes": "笔记"}),
+    ("my_rules", {"project_id": MINE}),
+    ("reembed_my_rules", {}),
+    ("set_rule_state", {"memory_id": "m-1", "action": "mute"}),
+]
+
+
+@pytest.mark.parametrize("name, kwargs", IDENTITY_FIRST_TOOLS, ids=[n for n, _ in IDENTITY_FIRST_TOOLS])
+def test_an_unknown_caller_is_refused_by_raising_like_every_other_tool(name, kwargs, monkeypatch, caplog):
+    """认不出调用者: 抛 PermissionError, 和项目归属拒绝同一个口径(REST 403 / MCP 工具错误)。
+
+    2026-10-30 发布收尾: 这几个原来回 ``{"error", "hint"}`` —— 在模型那边像一次成功的调用(my_style / my_rules
+    还走 _safe 的降级形状), hint 里那句配置变量名会被原样念给写手。配置怎么补只进日志。"""
+    sb = _client()
+    monkeypatch.setattr(core, "sb", lambda: sb)
+    fn, needs_user = tools.TOOLS[name]
+    assert needs_user is True
+    with caplog.at_level(logging.WARNING, logger="deskcore.tools"):
+        with pytest.raises(PermissionError) as exc:
+            fn(**kwargs, _user_id=None)
+    msg = str(exc.value)
+    assert "无法识别调用者身份" in msg
+    assert "DESKCORE" not in msg and "运维" not in msg, f"念给写手的话里有配置项: {msg}"
+    assert "DESKCORE_KEYS" in caplog.text, "怎么补进了日志(不是删掉)"
+    assert sb.calls == [], "认不出人就在查库之前拒了"
+
+
+def test_no_tool_answers_an_unknown_caller_with_an_error_dict():
+    """形态: tools.py 里不再有「认不出身份 → 回带 error 的 dict」这条路。"""
+    src = inspect.getsource(tools)
+    assert "无法识别调用者身份" not in "".join(
+        line for line in src.splitlines() if '"error"' in line), "认不出调用者要抛 PermissionError, 不回 error 字段"
 
 
 def test_rest_layer_maps_denial_to_403_not_500():

@@ -970,6 +970,11 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
 `empty_body_fields`（正文空的那几篇带了哪些字段名，W-30：多半是正文放错了字段）。`counters` 另记 `unattributed` /
 `unknown_angle_keys` / `used_angle_keys`，`meta.angle_key_mismatch` 记 `{index, problem, length}`（不记 key 本身）。
 
+> **正文放错了字段先对上（2026-10-30 发布收尾）。** `check_drafts` / `score_drafts`（和旧名 `commit_drafts`）在工具层（`tools._draft_fields`）
+> 先看每篇：`body` / `title` 空着、而别名键（`正文` / `内容` / `content` / `text`，标题是 `标题`）里**恰好一个**有字，就拿它当正文 / 标题；
+> 本名有字的不覆盖，两个别名都有字的不猜。对上的那份就是查重比的、底稿记的、存进 `versions` 的（之后 `check_rules` 查的也是它）。
+> 哪儿都没有正文的照旧按 `empty_body` 拒。对上了几篇只进 `deskcore.tools` 的 WARN 日志（键名 → 篇数，不带内容），回包不多字段。
+
 ```sql
 -- 全拒的批次为什么拒(W-31)
 select created_at, left(project_id::text, 8) p, counters->>'drafts' d,
