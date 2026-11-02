@@ -106,13 +106,14 @@ def test_published_titles_come_from_links_to_this_project_newest_first():
     assert got == ["昨天发的", "没算过差异的那篇", "人改过的标题", "补录的那篇就是发出去的标题"], got
 
 
-def test_truth_vault_notes_are_read_by_id_and_time_only():
+def test_truth_vault_notes_are_read_by_id_time_and_counts_only():
+    """angle cards v2 §3.5: 多取评论数和 tier(给 working 一栏挑"评论多的"), 照旧不取标题、正文。"""
     w = _World()
     w.published("n1", "标题一")
     c = w.client()
     assert store.recent_titles(c, PID)["published"] == ["标题一"]
     sel = [q for q in c.calls if q["table"] == "truth_vault.notes"]
-    assert sel and all(q["cols"] == "note_id, publish_time" for q in sel), sel
+    assert sel and all(q["cols"] == "note_id, publish_time, comments_count, tier" for q in sel), sel
     assert not c.rpc_calls, "deskcore_tv_notes 带正文, 不该走它"
     assert all("body" not in (q["cols"] or "") for q in c.calls), "全程不取正文"
 

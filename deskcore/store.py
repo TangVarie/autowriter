@@ -689,6 +689,17 @@ ANGLE_DEBT_SAMPLE = 12
 ANGLE_DEBT_EXCLUDE_MAX = 200
 
 
+def public_dims(dims):
+    """台账 dims 里给模型 / 给人看的那一份: 去掉下划线开头的键(angle cards v2 的 ``_draw`` 记账块就在 dims 里)。
+
+    台账的 dims 是 RPC 原样存下的 jsonb: 四个主维度之外, v2 发的牌多一个 ``_draw``(来源、概率、批次 —— 只给
+    service_role 的 v_angle_outcomes 和 draw-report 用)。凡是 dims 要回给模型的地方都过这一道, 不然模型会把记账块
+    当成坐标的一部分念出来、照着写。不是 dict 的原样返回(老行 / 假件里可能是 None)。"""
+    if not isinstance(dims, dict):
+        return dims
+    return {k: v for k, v in dims.items() if not str(k).startswith("_")}
+
+
 def angle_debt(sb, project_id: str, user_id: str | None, days: int,
                *, sample: int = ANGLE_DEBT_SAMPLE, oldest_first: bool = False,
                exclude_keys=None, since: str | None = None, until: str | None = None) -> dict:
@@ -778,7 +789,8 @@ def angle_debt(sb, project_id: str, user_id: str | None, days: int,
     out["unconsumed"] = int(total)
     if rows:
         out["oldest_drawn_at" if oldest_first else "last_drawn_at"] = rows[0].get("drawn_at")
-        out["angles"] = [{"angle_key": r.get("angle_key"), "dims": r.get("dims")}
+        # dims 原样回给简报 / score_drafts / archive_pending: v2 的 ``_draw`` 记账块不能跟着出去(public_dims)
+        out["angles"] = [{"angle_key": r.get("angle_key"), "dims": public_dims(r.get("dims"))}
                          for r in rows]
     return out
 
@@ -1026,6 +1038,77 @@ def angle_keys_drawn_elsewhere(sb, project_id: str, user_id, keys) -> dict[str, 
         if k in want and k not in out and r.get("project_id") and str(r["project_id"]) != str(project_id):
             out[k] = str(r["project_id"])
     return out
+
+
+# ── angle cards v2: 发牌前在 Python 里看一眼台账(§2.6 L1–L5) ──────────────────────────────────
+# RPC 只按 angle_key 挡「写过的(avoid_days 内)」和「一天内抽了没写的」; v2 还要挡「30 天内抽过的任何一行」、按形状降温、
+# 参考帖冷却 —— 这些都要台账的 dims(含 _draw)。每次发牌现读一次, 不缓存: 两个队友前后脚发牌, 缓存会让后一个看不到前一个。
+LEDGER_WINDOW_CAP = 2000
+_LEDGER_WINDOW_COLS = "id, angle_key, dims, drawn_by, drawn_at, consumed_at, consumed_version_id"
+
+
+def ledger_window(sb, project_id: str, days: int, cap: int = LEDGER_WINDOW_CAP) -> list[dict] | None:
+    """这个项目近 ``days`` 天【抽过】的台账行, 加上更早抽、但这 ``days`` 天里【写掉】的那几行; 新抽的在前, 最多 ``cap`` 行。
+    dims 原样(带 ``_draw``) —— 这是给发牌策略自己看的, 不给模型。
+
+    两次简单查询, 不用 ``or=(drawn_at.gte…,consumed_at.gte…)``: 时间戳里的 ``+`` ``:`` ``.`` 在 PostgREST 的
+    or 语法里都要转义, 写错了是整条 400; 第二次只取「抽得早、写得近」的那一小撮, 按 id 去重合并。
+
+    读失败回 None(调用方退回只靠 RPC 挡 exact key, 记 ``dd="rpc_only"``); 不抛。"""
+    since = iso_ago(max(int(days), 1))
+    cap = max(int(cap), 1)
+    try:
+        drawn = _paged(lambda off, lim: (
+            sb.table("angle_ledger").select(_LEDGER_WINDOW_COLS)
+              .eq("project_id", project_id).gte("drawn_at", since)
+              .order("drawn_at", desc=True).order("id", desc=True)
+              .range(off, off + lim - 1)), hard_cap=cap)
+        late = _paged(lambda off, lim: (
+            sb.table("angle_ledger").select(_LEDGER_WINDOW_COLS)
+              .eq("project_id", project_id).gte("consumed_at", since).lt("drawn_at", since)
+              .order("consumed_at", desc=True).order("id", desc=True)
+              .range(off, off + lim - 1)), hard_cap=cap)
+    except Exception as exc:                            # noqa: BLE001 — 发牌照发, RPC 兜着 exact key
+        logger.warning("ledger window read failed (project=%s): %s", project_id,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    floor = _ts(since)
+    out: list[dict] = []
+    seen: set = set()
+    for r in drawn + late:
+        rid = r.get("id")
+        if rid in seen:
+            continue                                    # 翻页途中有人发牌, offset 会错开一行: 按 id 去重
+        seen.add(rid)
+        drawn_at, consumed_at = _ts(r.get("drawn_at")), _ts(r.get("consumed_at"))
+        # 服务端已经按窗口筛过, 这里再核一遍(老行 / 假件里时间可能是 NULL)
+        if (drawn_at is not None and drawn_at >= floor) or (consumed_at is not None and consumed_at >= floor):
+            out.append(r)
+    if len(drawn) >= cap:
+        logger.warning("ledger window hit the cap (project=%s, days=%s, cap=%d): older draws are not seen by the "
+                       "Python dedup layers", project_id, days, cap)
+    return out[:cap]
+
+
+def ledger_dims_for(sb, project_id: str, key: str) -> dict | None:
+    """本项目台账里 ``key`` 这张牌的四个主维度(最近抽的那一行; 去掉 ``_draw`` 这类下划线键)。写手点名「再写一次这个
+    角度」(``repeat_of``, §2.9)时用: key 必须是本项目台账里有的, 才按同样的四个维度再发一行。
+
+    没有这一行、key 形状不对、或者读失败, 都回 None —— 调用方一律当成「不能重发」, 报错、什么都不写; 不抛。"""
+    k = str(key or "")
+    if not _LEDGER_LOOKUP_KEY.fullmatch(k):
+        return None
+    try:
+        rows = (sb.table("angle_ledger").select("angle_key, dims, drawn_at")
+                  .eq("project_id", project_id).eq("angle_key", k)
+                  .order("drawn_at", desc=True).limit(1).execute()).data or []
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("ledger dims lookup failed (project=%s, key=%s): %s", project_id, k,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    if not rows or rows[0].get("angle_key") != k or not isinstance(rows[0].get("dims"), dict):
+        return None
+    return public_dims(rows[0]["dims"])
 
 
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────
@@ -2376,6 +2459,271 @@ def tv_project_categories(sb, tv_project_ids: list[str]) -> dict[str, str]:
             if isinstance(r, dict) and r.get("project_id") and r.get("category")}
 
 
+# ══════════════════════════════════════════════════════════════════════
+# angle cards v2 的读数(§4 表里的 ①–⑦、⑨): 全是 SELECT, 翻页、只取要的列, 聚合在 Python 里做
+# ══════════════════════════════════════════════════════════════════════
+# 纪律同 tv_project_categories: 直接经 PostgREST 读 truth_vault(Exposed schemas + TV 的表级 GRANT 是前提, 不是本仓
+# 能保证的)。所以这一组【读不到就回 None、不抛】, 记一行 WARN —— 发牌和简报照常出, 退回缓存 / 快照 / 通用配比
+# (priors 管)。None 和 [] 是两回事: [] 是真的没有, None 是这一次读不到, 调用方据此决定要不要用旧缓存。
+# 一页之内也可能被服务端的 db-max-rows 钳短, 所以都按「拿到空页才收工」(_paged 的那条纪律), offset / 游标按实收行数走。
+
+TV_OUTCOME_COLS = ("note_id, project_id, publish_time, content_format, emotional_lever, human_truth_archetype, "
+                   "emotional_intensity, trend_dependencies, tier, comments_count, data_quality_flags")
+TV_OUTCOMES_PAGE = 1000
+TV_OUTCOMES_MAX_PAGES = 15          # 全库 ~7k 条, 15 页是两倍余量; 到顶记 WARN
+TV_TITLE_ANSWERS_MAX_PAGES = 10     # title_is_question ~5.8k 行
+TV_PROFILE_PAGE = 200               # 带 raw_content, 一页小一点
+TV_PROFILE_CAP = 1000               # 一个写作台项目 60 天最多的也就三百来篇
+NOTE_ANSWERS_CHUNK = 100            # 一次 .in_() 带这么多个 id, URL 不会过长
+EXTERNAL_SLICE_DAYS = 45
+EXTERNAL_SLICE_PAGE = 500
+EXTERNAL_SLICE_CAP = 2000           # 一个品类现在两百来条
+_EXTERNAL_COLS = "note_id, category, title, comments, liked, collected, fetched_at, ad_like, has_product"
+
+
+def _tv_warn(what: str, exc: Exception) -> None:
+    logger.warning("%s failed: %s", what, f"{type(exc).__name__}: {exc}"[:200])
+
+
+def _keyset(fetch, *, max_pages: int, what: str) -> list[dict] | None:
+    """按 note_id 游标翻页: ``fetch(after)`` 回一页(升序), None 表示这一页读挂了 → 整个回 None(半张表比没有更糟:
+    少掉的那一截是按 id 排的, 会偏)。到 ``max_pages`` 还没读到空页就停, 记 WARN, 交回已读到的。"""
+    out: list[dict] = []
+    after: str | None = None
+    for _ in range(max(int(max_pages), 1)):
+        page = fetch(after)
+        if page is None:
+            return None
+        if not page:
+            return out
+        out.extend(page)
+        nxt = page[-1].get("note_id")
+        if nxt is None or str(nxt) == after:
+            logger.warning("%s: keyset cursor did not advance (after=%s); stopping", what, after)
+            return out
+        after = str(nxt)
+    logger.warning("%s: stopped at %d pages (%d rows); the rest is not read", what, max_pages, len(out))
+    return out
+
+
+def tv_notes_outcomes_page(sb, *, after: str | None = None, limit: int = TV_OUTCOMES_PAGE) -> list[dict] | None:
+    """① 全库笔记的结果表的一页(按 note_id 升序, 从 ``after`` 之后): 只取打标签、算起量用的那几列, 不取正文和标题。
+    没有 publish_time 的不要(算不了窗口、也算不了"发出三天")。读挂了回 None。"""
+    try:
+        q = (sb.schema("truth_vault").table("notes").select(TV_OUTCOME_COLS)
+               .not_.is_("publish_time", "null"))
+        if after:
+            q = q.gt("note_id", after)
+        return list(q.order("note_id").limit(max(int(limit), 1)).execute().data or [])
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("tv notes outcomes page", exc)
+        return None
+
+
+def tv_notes_outcomes(sb, *, max_pages: int = TV_OUTCOMES_MAX_PAGES,
+                      page: int = TV_OUTCOMES_PAGE) -> list[dict] | None:
+    """① 整张结果表(``tv_notes_outcomes_page`` 一页页读完)。任何一页读挂了回 None。"""
+    return _keyset(lambda after: tv_notes_outcomes_page(sb, after=after, limit=page),
+                   max_pages=max_pages, what="tv notes outcomes")
+
+
+def tv_title_answers_page(sb, *, offset: int = 0, limit: int = PAGE) -> list[dict] | None:
+    """② TV 笔记在 ``title_is_question`` 上的答案的一页: ``[{subject_id, answer, extracted_at}]``。
+
+    一篇可能有好几行(Jev 换过抽取器各答一遍), 所以按 offset 翻, 排序用剩下的主键列(subject_id, 题目版本,
+    extractor) —— subject_type / run_tag / question_id 都钉死了, 这三列排出来唯一, 翻页不漏不重。读挂了回 None。"""
+    try:
+        return list((sb.schema("truth_vault").table("note_feature_answers")
+                       .select("subject_id, answer, extracted_at")
+                       .eq("subject_type", "note").eq("run_tag", "primary").eq("question_id", "title_is_question")
+                       .order("subject_id").order("question_version").order("extractor")
+                       .range(max(int(offset), 0), max(int(offset), 0) + max(int(limit), 1) - 1)
+                       .execute()).data or [])
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("tv title answers page", exc)
+        return None
+
+
+def _latest_answer(best: dict, key, row: dict) -> None:
+    """``best[key] = (抽取时间, 答案)``, 只留最后抽的那一行; 空答案(无效)不算。按时间比, 不按字符串。"""
+    ans = str(row.get("answer") or "").strip()
+    if not ans:
+        return
+    at = _ts(row.get("extracted_at")) or datetime.min.replace(tzinfo=timezone.utc)
+    if key not in best or at >= best[key][0]:
+        best[key] = (at, ans)
+
+
+def tv_title_answers(sb, *, max_pages: int = TV_TITLE_ANSWERS_MAX_PAGES,
+                     page: int = PAGE) -> dict[str, str] | None:
+    """② ``{note_id: "是" | "否"}``: 每篇取最后抽的那个有效答案。任何一页读挂了回 None; 到 ``max_pages`` 记 WARN。"""
+    best: dict[str, tuple[datetime, str]] = {}
+    offset = 0
+    for _ in range(max(int(max_pages), 1)):
+        rows = tv_title_answers_page(sb, offset=offset, limit=page)
+        if rows is None:
+            return None
+        if not rows:
+            break
+        for r in rows:
+            if r.get("subject_id"):
+                _latest_answer(best, str(r["subject_id"]), r)
+        offset += len(rows)
+    else:
+        logger.warning("tv title answers: stopped at %d pages (%d rows); the rest is not read", max_pages, offset)
+    return {k: v[1] for k, v in best.items()}
+
+
+def tv_projects_meta(sb) -> dict[str, dict] | None:
+    """③ ``{TV 项目号: {"category": TV 品类 | None, "brand_key": 项目号 "_" 前那一截}}``。一次请求(全库二十来个项目)。
+    品牌按项目号前缀认(AAA_phase1 / AAA_phase2 是同一个品牌的两期), 不读 projects.brand —— 那是客户品牌名,
+    这里用不着。读挂了回 None。"""
+    try:
+        rows = (sb.schema("truth_vault").table("projects").select("project_id, category")
+                  .order("project_id").limit(PAGE).execute()).data or []
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("tv projects meta", exc)
+        return None
+    out: dict[str, dict] = {}
+    for r in rows:
+        pid = str(r.get("project_id") or "")
+        if pid:
+            out[pid] = {"category": r.get("category") or None, "brand_key": pid.split("_", 1)[0]}
+    return out
+
+
+def tv_notes_profile(sb, tv_ids, since) -> list[dict] | None:
+    """④ 写作台项目对着的这几个 TV 项目、``since`` 之后发的笔记: ① 的列再加 title 和 raw_content(近期笔记的
+    notes.title 全是 NULL, 标题只在 raw_content 的【标题】那一行, 见 vocab.note_title)。正文只在进程里用来分标题
+    句式, 不往外给。按 note_id 游标翻, 最多 TV_PROFILE_CAP 行。没有 TV 项目回 []; 读挂了回 None。"""
+    ids = sorted({str(t) for t in (tv_ids or ()) if t})
+    if not ids:
+        return []
+    since_s = since.isoformat() if isinstance(since, datetime) else str(since)
+
+    def fetch(after):
+        try:
+            q = (sb.schema("truth_vault").table("notes").select(TV_OUTCOME_COLS + ", title, raw_content")
+                   .in_("project_id", ids).gte("publish_time", since_s))
+            if after:
+                q = q.gt("note_id", after)
+            return list(q.order("note_id").limit(TV_PROFILE_PAGE).execute().data or [])
+        except Exception as exc:                        # noqa: BLE001
+            _tv_warn("tv notes profile", exc)
+            return None
+    return _keyset(fetch, max_pages=-(-TV_PROFILE_CAP // TV_PROFILE_PAGE), what="tv notes profile")
+
+
+def note_answers(sb, ids, qids, *, subject_type: str = "note",
+                 run_tag: str = "primary") -> dict[str, dict[str, str]] | None:
+    """⑤ / ⑦ 这几篇在这几道特征题上的答案: ``{subject_id: {question_id: answer}}``。同一篇同一题有好几行(换过抽取器、
+    题目升过版本)时取最后抽的那一行; 空答案不算; 一个有效答案都没有的篇不在里面。
+
+    TV 自己的笔记是 ``subject_type="note", run_tag="primary"``; Jev 答的外部帖是 ``"external_note", "external"``。
+    id 按 NOTE_ANSWERS_CHUNK 个一批 .in_(), 每批里再翻页(100 篇 × 8 题 × 两个抽取器就过 1000 行)。读挂了回 None。"""
+    want_ids = list(dict.fromkeys(str(i) for i in (ids or ()) if i))
+    want_q = sorted({str(q) for q in (qids or ()) if q})
+    if not want_ids or not want_q:
+        return {}
+    best: dict[tuple[str, str], tuple[datetime, str]] = {}
+    try:
+        for i in range(0, len(want_ids), NOTE_ANSWERS_CHUNK):
+            chunk = want_ids[i:i + NOTE_ANSWERS_CHUNK]
+            rows = _paged(lambda off, lim, chunk=chunk: (
+                sb.schema("truth_vault").table("note_feature_answers")
+                  .select("subject_id, question_id, answer, extracted_at")
+                  .eq("subject_type", subject_type).eq("run_tag", run_tag)
+                  .in_("question_id", want_q).in_("subject_id", chunk)
+                  # subject_type / run_tag 钉死了, 剩下这四列就是主键: 排序唯一, 翻页不漏不重
+                  .order("subject_id").order("question_id").order("question_version").order("extractor")
+                  .range(off, off + lim - 1)))
+            for r in rows:
+                sid, qid = str(r.get("subject_id") or ""), str(r.get("question_id") or "")
+                if sid and qid in want_q:
+                    _latest_answer(best, (sid, qid), r)
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn(f"note answers ({subject_type}/{run_tag})", exc)
+        return None
+    out: dict[str, dict[str, str]] = {}
+    for (sid, qid), (_at, ans) in best.items():
+        out.setdefault(sid, {})[qid] = ans
+    return out
+
+
+def external_slice(sb, category: str, *, days: int = EXTERNAL_SLICE_DAYS) -> list[dict] | None:
+    """⑥ 这个外部品类近 ``days`` 天抓到的帖(truth_vault.external_notes): 只取算速度、做筛选要的列。标题只在进程里用来
+    分句式和挡我们自己的品牌词, 不往外给; 不取正文。没有品类回 []; 读挂了回 None。"""
+    cat = str(category or "").strip()
+    if not cat:
+        return []
+    since = iso_ago(max(int(days), 1))
+
+    def fetch(after):
+        try:
+            q = (sb.schema("truth_vault").table("external_notes").select(_EXTERNAL_COLS)
+                   .eq("category", cat).gte("fetched_at", since))
+            if after:
+                q = q.gt("note_id", after)
+            return list(q.order("note_id").limit(EXTERNAL_SLICE_PAGE).execute().data or [])
+        except Exception as exc:                        # noqa: BLE001
+            _tv_warn("external slice", exc)
+            return None
+    return _keyset(fetch, max_pages=-(-EXTERNAL_SLICE_CAP // EXTERNAL_SLICE_PAGE), what="external slice")
+
+
+# ⑨ 写作台写的稿子发出去了没有(project_now.desk、draw-report 的 M2/M3)。和 v_angle_outcomes 同一组对照: 真对上了的
+# 几种(tv_lineage 是 TV 自己记的来源, 也算发出去了); ingested 是从 TV 抄回来的副本、ambiguous / unmatched 不知道是哪一篇, 不算。
+ADOPTION_LINK_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", "tv_lineage"})
+
+
+def desk_adoption(sb, version_ids) -> dict | None:
+    """这几版写作台稿子(一般是近 14 天台账上销账用的 consumed_version_id)发出去了几篇、几篇标题被人改了。
+
+    ``{"versions": 去重后的版数, "published": 对上了 TV 笔记的版数, "title_changed": 其中标题被改过的版数,
+       "by_version": {版本 id: {"note_id", "match_kind", "title_changed", "draft_chars", "published_chars"}}}``
+
+    标题改没改看 tv_edit_diffs(013): 还没算出差异的那篇 title_changed 是 None, 不算进 title_changed。差异表读挂了
+    照样回发出去的篇数(title_changed 记 None); 对照表读挂了回 None。只数, 不带标题和正文。"""
+    vids = list(dict.fromkeys(str(v) for v in (version_ids or ()) if v))
+    out: dict = {"versions": len(vids), "published": 0, "title_changed": 0, "by_version": {}}
+    if not vids:
+        return out
+    links: dict[str, dict] = {}
+    try:
+        for i in range(0, len(vids), NOTE_ANSWERS_CHUNK):
+            for r in (sb.table("tv_note_links").select("note_id, version_id, match_kind")
+                        .in_("version_id", vids[i:i + NOTE_ANSWERS_CHUNK])
+                        .in_("match_kind", sorted(ADOPTION_LINK_KINDS))
+                        .order("note_id").limit(PAGE).execute()).data or []:
+                vid = str(r.get("version_id") or "")
+                if vid in vids and r.get("note_id") and r.get("match_kind") in ADOPTION_LINK_KINDS:
+                    links.setdefault(vid, r)          # 一版对上两条笔记(重复发)只算一篇
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("desk adoption: tv_note_links unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    diffs: dict[str, dict] | None = {}
+    note_ids = sorted({str(r["note_id"]) for r in links.values()})
+    try:
+        for i in range(0, len(note_ids), NOTE_ANSWERS_CHUNK):
+            for r in (sb.table("tv_edit_diffs")
+                        .select("note_id, title_changed, draft_chars, published_chars")
+                        .in_("note_id", note_ids[i:i + NOTE_ANSWERS_CHUNK]).limit(PAGE).execute()).data or []:
+                if r.get("note_id"):
+                    diffs[str(r["note_id"])] = r
+    except Exception as exc:                            # noqa: BLE001 — 013 没跑 / 读挂了: 只少了"改没改"
+        logger.warning("desk adoption: tv_edit_diffs unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+        diffs = None
+    for vid, link in links.items():
+        d = (diffs or {}).get(str(link["note_id"])) or {}
+        changed = d.get("title_changed") if diffs is not None and d else None
+        out["by_version"][vid] = {"note_id": str(link["note_id"]), "match_kind": link.get("match_kind"),
+                                  "title_changed": None if changed is None else bool(changed),
+                                  "draft_chars": d.get("draft_chars"), "published_chars": d.get("published_chars")}
+    out["published"] = len(out["by_version"])
+    out["title_changed"] = sum(1 for v in out["by_version"].values() if v["title_changed"])
+    return out
+
+
 def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
                           counters: dict, meta: dict) -> None:
     """一次 commit_drafts 的耗时与判定结局, 落一行 ``batch_metrics``。
@@ -3052,12 +3400,34 @@ def _title_key(t: str) -> str:
     return re.sub(r"[\W_]+", "", t.lower())
 
 
+# 「working」一栏(angle cards v2 §3.5): 发出去的里面, 发出三天以上、评论 ≥20 或标了爆的几条 —— 给模型学句式和开头的路数。
+# 和 priors 的起量口径同一把尺(发出三天以上才看得出来; 评论 ≥20 或 爆/大爆)。这里只是挑标题, 不做清洗口径(合成 / 投流
+# 那几种标记)—— 那是算 lift 的事, 这一栏只要"本项目自己真发出去、评论多"的标题。
+HIT_TIERS = frozenset({"爆", "大爆"})
+WORKING_MIN_COMMENTS = 20
+WORKING_MIN_AGE_DAYS = 3
+
+
+def _is_working(stat: dict, t: datetime, now: datetime) -> bool:
+    if t > now - timedelta(days=WORKING_MIN_AGE_DAYS):
+        return False
+    cc = stat.get("comments_count")
+    return stat.get("tier") in HIT_TIERS or (isinstance(cc, (int, float)) and cc >= WORKING_MIN_COMMENTS)
+
+
 def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int = 20,
                             now: datetime | None = None) -> list[str]:
     """这个写作台项目近 ``days`` 天发出去的标题(tv-sync 对到本项目上的那些), 新发的在前。异常原样上抛。
 
     标题取哪一份: ``ingested`` 的版本就是从这条笔记复制来的, ``versions.title`` 就是发出去的标题; 其余几种对上的是
     写作台那版, 人可能改过标题, 优先 ``tv_edit_diffs.published_title``(013), 没有再退回写作台那版。"""
+    return _recent_published(sb, project_id, days=days, limit=limit, now=now)[0]
+
+
+def _recent_published(sb, project_id: str, *, days: int, limit: int, now: datetime | None,
+                      working: int = 0) -> tuple[list[str], list[str]]:
+    """``(发出去的标题 新的在前, working 候选标题)``。working 候选按 爆 > 评论数 > 新 排, 最多取 ``working`` 的两倍
+    (有的标题为空、有的去重后重复, 由 recent_titles 截到 ``working`` 条); ``working=0`` 时第二项恒为空, 和原来一样。"""
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=days)
     want = max(limit, 1) * 2                      # 留余量: 有的标题为空、有的去重后重复
@@ -3067,21 +3437,38 @@ def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int =
                          .limit(RECENT_LINKS_SCAN).execute()).data or []
              if r.get("note_id") and r.get("version_id")]
     if not links:
-        return []
+        return [], []
     ids = [r["note_id"] for r in links]
     when: dict[str, datetime] = {}
+    stats: dict[str, dict] = {}
     for i in range(0, len(ids), RECENT_NOTES_CHUNK):
-        for n in (sb.schema("truth_vault").table("notes").select("note_id, publish_time")
+        # comments_count / tier 给 working 一栏用(angle cards v2); 照旧不取标题和正文
+        for n in (sb.schema("truth_vault").table("notes").select("note_id, publish_time, comments_count, tier")
                   .in_("note_id", ids[i:i + RECENT_NOTES_CHUNK]).execute()).data or []:
             t = _ts(n.get("publish_time"))
             # 上界 = 现在: 排期还没发的(publish_time 在未来)不算
             if t is not None and since <= t <= now:
                 when[n["note_id"]] = t
+                stats[n["note_id"]] = n
     picked = sorted((r for r in links if r["note_id"] in when),
                     key=lambda r: (when[r["note_id"]], r["note_id"]), reverse=True)[:want]
     if not picked:
-        return []
-    edited_ids = [r["note_id"] for r in picked if r["match_kind"] != "ingested"]
+        return [], []
+    work: list[dict] = []
+    if working > 0:
+        seen_notes: set[str] = set()
+        cands = []
+        for r in links:
+            nid = r["note_id"]
+            if nid in when and nid not in seen_notes and _is_working(stats.get(nid) or {}, when[nid], now):
+                seen_notes.add(nid)
+                cands.append(r)
+        cc = (lambda r: stats[r["note_id"]].get("comments_count")
+              if isinstance(stats[r["note_id"]].get("comments_count"), (int, float)) else -1)
+        work = sorted(cands, key=lambda r: (stats[r["note_id"]].get("tier") in HIT_TIERS, cc(r),
+                                            when[r["note_id"]], r["note_id"]), reverse=True)[:max(working, 1) * 2]
+    rows = picked + [r for r in work if r not in picked]
+    edited_ids = sorted({r["note_id"] for r in rows if r["match_kind"] != "ingested"})
     published: dict[str, str] = {}
     if edited_ids:
         try:
@@ -3091,11 +3478,14 @@ def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int =
         except Exception as exc:                  # noqa: BLE001 — 013 没跑 / 读挂了: 退回写作台那版标题
             logger.warning("recent titles: tv_edit_diffs unreadable (%s), using desk titles",
                            f"{type(exc).__name__}: {exc}"[:200])
-    vids = sorted({str(r["version_id"]) for r in picked})
+    vids = sorted({str(r["version_id"]) for r in rows})
     drafts = {str(r["id"]): r.get("title") or "" for r in
               (sb.table("versions").select("id, title").in_("id", vids).execute()).data or []}
-    return [(published.get(r["note_id"]) if r["match_kind"] != "ingested" else "")
-            or drafts.get(str(r["version_id"])) or "" for r in picked]
+
+    def title(r) -> str:
+        return ((published.get(r["note_id"]) if r["match_kind"] != "ingested" else "")
+                or drafts.get(str(r["version_id"])) or "")
+    return [title(r) for r in picked], [title(r) for r in work]
 
 
 def recent_drafted_titles(sb, project_id: str, *, days: int = 14, limit: int = 20,
@@ -3136,43 +3526,63 @@ def recent_drafted_titles(sb, project_id: str, *, days: int = 14, limit: int = 2
 
 
 def recent_titles(sb, project_id: str, *, published_days: int = 30, drafted_days: int = 14,
-                  limit: int = 20, now: datetime | None = None) -> dict:
+                  limit: int = 20, now: datetime | None = None, working: int = 0) -> dict:
     """``{"published": [...], "drafted": [...]}``: 每条截到 40 字, 去重(drafted 里不再出现 published 有的), 两栏合计
     最多 ``limit`` 条。两栏各有份额: 写过的留 ``limit`` 的 2/5(20 条里 8 条), 发出去的占其余; 哪一栏不够, 空出来的
     给另一栏。
     ⚠️ 不能"发出去的先占满"(10-20 review): 活跃项目 30 天里对上的笔记远超 20 条, 那样写过的一栏永远是空的 ——
     而昨天写了还没发的那几篇(发布一般滞后 1-3 天)正是下一批最容易撞的。
 
+    ``working`` > 0(angle cards v2 §3.5)时多一栏 ``"working"``: 发出去的里面发出三天以上、评论 ≥20 或标了爆的, 最多
+    ``working`` 条, 同样截到 40 字、去重。它不占 ``limit`` 的份额 —— 活跃项目里发出去那栏只装得下最近三四天的, 三天以上
+    的正好被截掉, 所以 working 从整个窗口里挑, 不从截过的那栏里挑; drafted 里也不再出现 working 有的。默认 0: 返回形状
+    和原来一个键都不差。
+
     两栏各自兜底: truth_vault 读不到(Exposed schemas 没有它 / 本地库)不该连写作台自己写过的那栏一起丢 ——
-    这只是给模型的参照, 少一栏照样有用。挂了的那栏记 WARN、回空。"""
-    cols: dict[str, list[str]] = {"published": [], "drafted": []}
-    for key, fn, days in (("published", recent_published_titles, published_days),
-                          ("drafted", recent_drafted_titles, drafted_days)):
+    这只是给模型的参照, 少一栏照样有用。挂了的那栏记 WARN、回空(working 跟着发出去那栏一起空)。"""
+    cols: dict[str, list[str]] = {"published": [], "drafted": [], "working": []}
+    working = max(int(working or 0), 0)
+
+    def _published(sb, project_id, *, days, limit, now):
+        return _recent_published(sb, project_id, days=days, limit=limit, now=now, working=working)
+
+    def _drafted(sb, project_id, *, days, limit, now):
+        return recent_drafted_titles(sb, project_id, days=days, limit=limit, now=now), []
+
+    for key, fn, days in (("published", _published, published_days),
+                          ("drafted", _drafted, drafted_days)):
         try:
-            raw = fn(sb, project_id, days=days, limit=limit, now=now)
+            raw, extra = fn(sb, project_id, days=days, limit=limit, now=now)
         except Exception as exc:                  # noqa: BLE001
             logger.warning("recent %s titles failed (project=%s): %s", key, project_id,
                            f"{type(exc).__name__}: {exc}"[:200])
             continue
-        seen: set[str] = set()                    # 每栏自己先去重
-        for t in raw:
-            t = _clean_title(t)
-            k = _title_key(t)
-            if k and k not in seen:
-                seen.add(k)
-                cols[key].append(t)
+        for col, titles in ((key, raw), ("working", extra)):
+            seen: set[str] = set()                # 每栏自己先去重
+            for t in titles:
+                t = _clean_title(t)
+                k = _title_key(t)
+                if k and k not in seen:
+                    seen.add(k)
+                    cols[col].append(t)
+    work = cols["working"][:working]
     # ⚠️ 先定两栏各留几条, 再拿"真留下来的"发出去的标题给写过的去重(codex review on aw#112): 原来一边去重一边
     # 往 seen 里塞, 发出去那栏后来被截掉的标题照样挡掉写过栏里同名的那篇 —— 两边都不出现。发出去的多留一条,
     # 写过的只会少不会多, 所以来回两三轮就定了。
     limit = max(limit, 0)
-    pub_all, dr_all = cols["published"], cols["drafted"]
+    pub_all = cols["published"]
+    work_keys = {_title_key(t) for t in work}
+    dr_all = [t for t in cols["drafted"] if _title_key(t) not in work_keys]
     n_pub = min(len(pub_all), limit - min(len(dr_all), limit * 2 // 5))
     while True:
         kept = {_title_key(t) for t in pub_all[:n_pub]}
         drafted = [t for t in dr_all if _title_key(t) not in kept][:limit - n_pub]
         grow = min(len(pub_all), limit - len(drafted))
         if grow <= n_pub:
-            return {"published": pub_all[:n_pub], "drafted": drafted}
+            out = {"published": pub_all[:n_pub], "drafted": drafted}
+            if working:
+                out["working"] = work
+            return out
         n_pub = grow
 
 

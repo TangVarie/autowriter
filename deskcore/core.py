@@ -782,7 +782,9 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
 
     picked: list[dict] = []
     for r in reserved:
-        dims = r["dims"]
+        # 回给模型的 dims 只有四个主维度: angle cards v2 往台账 dims 里塞了 _draw 记账块(RPC 原样存、原样回), 不能
+        # 跟着进 angles[].dims 和 prompt_block —— 见 store.public_dims
+        dims = store.public_dims(r["dims"]) or {}
         lev = dims.get("emotional_lever", "")
         angle = angle_order[len(picked) % len(angle_order)]
         trends = ([vocab.TREND_EXCLUSIVE] if perpetual_bias
