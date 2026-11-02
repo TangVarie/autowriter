@@ -261,6 +261,9 @@ def _pick(note: Note, cands: list[Version], index: VersionIndex) -> tuple[Versio
 # 同一条线)的, 标题档不认它, 走下面的内容对(fuzzy / edited); 内容也对不上就 ambiguous, 把这几版列进候选、标 WEAK_TITLE_KEY ——
 # 留给人看(ambiguous_samples / tv-resolve), 不当 unmatched 去补录。只有标题的稿(HATHERINE 那 59 条)、只有标题的笔记(四字串
 # 不够)照旧: 正文没得比, 标题就是全部证据。不加新的 match_kind(要改 CHECK 约束和 TV 的 CAUGHT_KINDS)。
+# 复审(同日): ambiguous 不进补录、W-40 也不记它的文字 —— 只因为标题一样就挂着, 发出去的文字查重一直看不见、底稿(W-38)也不对。
+# 所以 tv_sync 把"只是标题一样"的(weak_title_only)先当 unmatched 对一遍底稿, 底稿认领就转正; 没认领的 ambiguous 只挂
+# core.TV_WEAK_TITLE_GRACE_DAYS 天等人看, 满了照常补录。时间窗外的同标题连候选都不算(下面 match_note)。
 WEAK_TITLE_KEY = "weak_title"
 
 
@@ -273,6 +276,12 @@ def title_without_body(note: Note, v: Version) -> bool:
     """标题档连上的这一对, 正文其实不像(见上面那段): 两边正文都够长、包含度不到 EDITED_FLOOR。tv-sync 拿它复核以前按
     标题连上的对照(core.tv_sync)。"""
     return _weak_title(grams(note.body), grams(v.body))
+
+
+def weak_title_only(m: Match) -> bool:
+    """match_note 判 ambiguous 只是因为标题一样: 候选全是 WEAK_TITLE_KEY 的(内容那一路什么都没对上 —— 它分不出时列的候选
+    包含度都 ≥ EDITED_FLOOR, 不会标 weak)。tv_sync 拿它把这种帖先当 unmatched 对一遍查重底稿, 再定等人看还是补录(F04 复审)。"""
+    return m.kind == "ambiguous" and bool(m.candidates) and all(c.get(WEAK_TITLE_KEY) for c in m.candidates)
 
 
 def match_note(note: Note, index: VersionIndex) -> Match:
@@ -288,6 +297,9 @@ def match_note(note: Note, index: VersionIndex) -> Match:
         # F04: 标题一样、正文不像的不进标题档(见上面那段); 剩下的(正文像的、只有标题的稿)照旧
         weak = [v for v in exact if _weak_title(ng, index.grams_of(v))]
         exact = [v for v in exact if not any(v is w for w in weak)]
+        # 2026-11-02 外部审计 11-02 F04 复审: 时间窗外的(发布比那一版早 / 晚 30 天以上)连"只有标题一样"的候选都不算 ——
+        # 半年后拿一个旧标题写的另一篇, 是 unmatched(→ 补录进指纹库), 不该挂成 ambiguous 等人看(内容那一路本来就只看窗口里的)
+        weak = [v for v in weak if in_window(lag_days(note, v))]
     if exact:
         if len(exact) == 1:
             v = exact[0]

@@ -1023,3 +1023,82 @@ def test_a_checked_draft_archived_as_a_replacement_closes_its_snapshot():
     assert out["replaced"][0]["old_version_id"] == v1
     (s,) = c.rows["draft_snapshots"]
     assert s["promoted_at"] and s["version_id"] == v2
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 只因为标题一样才分不出的帖(外部审计 11-02 F04 复审, 2026-11-02)
+# ══════════════════════════════════════════════════════════════════════
+# F04 之后, 和存档的 v1 标题一样、正文毫不相干的帖记 ambiguous 等人看。可 ambiguous 不进补录, W-38 只对补录名单里的帖找底稿,
+# W-40 也不记它的文字(没有版本) —— 一直挂着: 真正的来源(只查了重的底稿)认不回来, 发出去的文字查重永远看不见(复审复现:
+# 以前 title_exact v1、W-40 记了 1 行; F04 之后 0 行, 每晚都还是 ambiguous)。
+
+def _post_rows(c, body):
+    sk = set(core.fp.ngram_hashes(tvlink.strip_hashtags(body)))
+    return [r for r in c.rows["draft_fingerprints"] if sk & set(r.get("ngram_hashes") or [])]
+
+
+def test_a_same_title_post_whose_source_is_an_unarchived_snapshot_is_promoted():
+    """写手拿 v1 的旧标题写了一篇新的, 查了重、没存档就发了: 底稿认领它, 转成版本、销牌, 不挂成 ambiguous。"""
+    snaps = [_snap("s1", "秋招投了六十份", BODY_S, days=0)]
+    c = _client([_note("n1", "秋招投了六十份", BODY_S, days=2)], snaps)
+    out = core.tv_sync(c, TV)
+    vid = core._snapshot_version_id(P1, snaps[0]["text_fp"])
+    l = _links(c)["n1"]
+    assert (l["match_kind"], l["version_id"]) == ("body_exact", vid)
+    assert out["snapshots"]["matched_notes"] == 1 and out["snapshots"]["angles_consumed"] == 1
+    assert out["counts"]["body_exact"] == 1 and out["counts"]["ambiguous"] == 0 and out["counts"]["unmatched"] == 0
+    assert sum(out["counts"].values()) == out["notes"] and out["weak_title"] == {"held": 0, "released": 0}
+    assert _post_rows(c, BODY_S), "帖的文字跟着转正进了指纹库"
+
+
+def test_a_same_title_post_with_no_snapshot_waits_then_is_ingested():
+    """没有底稿认领: 头一次判出来之后 TV_WEAK_TITLE_GRACE_DAYS 天内记 ambiguous 等人看(这几天查重看不见它, 认了的代价);
+    哪天起等的记在对照里、每晚带过去; 满了没人判就照常补录, 帖的文字进指纹库。"""
+    c = _client([_note("n1", "秋招投了六十份", BODY_S, days=2)], [])
+    out = core.tv_sync(c, TV)
+    l = _links(c)["n1"]
+    assert l["match_kind"] == "ambiguous" and l["version_id"] is None and out["weak_title"] == {"held": 1, "released": 0}
+    since = next(x[core.WEAK_SINCE_KEY] for x in l["candidates"] if core.WEAK_SINCE_KEY in x)
+    assert since == store.iso_now()[:10]
+    assert [(x["version_id"], x[tvlink.WEAK_TITLE_KEY]) for x in l["candidates"] if "version_id" in x] == [("v1", True)]
+    assert out["ingest"] is None and not _post_rows(c, BODY_S) and out["published_fp"]["written"] == 0
+    assert [s["note_id"] for s in out["ambiguous_samples"]] == ["n1"] and "等人看" in out["note"]
+    assert out["counts"]["ambiguous"] == 1 and sum(out["counts"].values()) == out["notes"]
+
+    again = core.tv_sync(c, TV)                         # 第二晚: 还在等, 从哪天算不变
+    l = _links(c)["n1"]
+    assert l["match_kind"] == "ambiguous" and again["weak_title"]["held"] == 1
+    assert next(x[core.WEAK_SINCE_KEY] for x in l["candidates"] if core.WEAK_SINCE_KEY in x) == since
+
+    old = (datetime.fromisoformat(since) - timedelta(days=core.TV_WEAK_TITLE_GRACE_DAYS)).date().isoformat()
+    next(x for x in l["candidates"] if core.WEAK_SINCE_KEY in x)[core.WEAK_SINCE_KEY] = old
+    out = core.tv_sync(c, TV)                           # 等满了: 照常补录
+    l = _links(c)["n1"]
+    assert l["match_kind"] == "ingested" and l["version_id"] and out["weak_title"] == {"held": 0, "released": 1}
+    assert out["ingest"]["minted"] == 1 and _post_rows(c, BODY_S), "发出去的文字进了指纹库"
+    assert any("F04" in str(x.get("note")) for x in l["candidates"]) and \
+        [x["version_id"] for x in l["candidates"] if x.get(tvlink.WEAK_TITLE_KEY)] == ["v1"], "补录的对照里留着为什么"
+    assert sum(out["counts"].values()) == out["notes"]
+
+
+def test_a_released_post_without_an_ingest_target_stays_unmatched_and_keeps_its_date():
+    """W-10 只判不入库的项目: 等满了记 unmatched(带着哪天起等的), 第二晚不重新等一轮。"""
+    c = _client([_note("n1", "秋招投了六十份", BODY_S, days=2)], [], with_target=False)
+    core.tv_sync(c, TV)
+    l = _links(c)["n1"]
+    next(x for x in l["candidates"] if core.WEAK_SINCE_KEY in x)[core.WEAK_SINCE_KEY] = "2026-01-01"
+    for _ in range(2):
+        out = core.tv_sync(c, TV)
+        l = _links(c)["n1"]
+        assert l["match_kind"] == "unmatched" and out["weak_title"] == {"held": 0, "released": 1}
+        assert next(x[core.WEAK_SINCE_KEY] for x in l["candidates"] if core.WEAK_SINCE_KEY in x) == "2026-01-01"
+
+
+def test_a_same_title_post_far_outside_the_window_is_simply_unmatched():
+    """半年后拿一个旧标题写的另一篇: 时间窗外的同标题连候选都不算(复审复现 lag 200 天 → 一直 ambiguous), 照常补录。"""
+    c = _client([_note("n1", "秋招投了六十份", BODY_S, days=200)], [])
+    out = core.tv_sync(c, TV)
+    l = _links(c)["n1"]
+    assert l["match_kind"] == "ingested" and out["weak_title"] == {"held": 0, "released": 0}
+    assert _post_rows(c, BODY_S)
+

@@ -347,6 +347,26 @@ def test_only_the_draft_with_the_bad_id_is_rejected():
     assert led == {"K1": None, "K2": out["version_ids"][0]}
 
 
+def test_a_draft_with_a_bad_id_does_not_block_its_twin_in_the_same_batch():
+    """复审: 带错 id 的那篇也不进本批内的互查 —— 它反正不存, 进了的话和它一模一样的另一篇(模型把同一篇带 id、不带 id 各传
+    了一次)会被判成撞上它, 两篇都没存(同 codex on aw#126 的空正文那条)。"""
+    body = "秋招等回音的第三周, 我把投出去的四十份简历挨个复盘了一遍, 发现问题都出在项目经历那一段写得太空"
+    c = _client()
+    out = _commit(c, [{"title": "秋招等回音", "body": body, "version_id": GHOST}, {"title": "秋招等回音", "body": body}])
+    assert out["written"] == 1 and len(out["version_ids"]) == 1
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "version_lookup")]
+    assert c.rows["batch_metrics"][0]["meta"]["rejected_by"] == {"version_lookup": 1}
+
+
+def test_a_bad_id_with_an_empty_body_is_reported_once():
+    """一篇只报一个原因: id 带错又正文空的, 记 version_lookup 一次, 不再另记一条 empty_body(rejected_by 不重复数)。"""
+    c = _client()
+    out = _commit(c, [{"title": "秋招等回音", "body": "", "version_id": GHOST}])
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "version_lookup")]
+    assert c.rows["batch_metrics"][0]["meta"]["rejected_by"] == {"version_lookup": 1}
+    assert out["written"] == 0 and not c.rows.get("draft_fingerprints")
+
+
 def test_a_known_source_autowriter_version_id_changes_nothing():
     """_source_autowriter_version_id 核得上(本项目的)就照旧: 存档只认 version_id, 这篇当新稿存、分配新 id。"""
     existing = "99999999-9999-9999-9999-999999999999"

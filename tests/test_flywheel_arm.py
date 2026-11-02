@@ -641,7 +641,8 @@ def test_a_timed_out_brief_records_that_no_patterns_were_shown(monkeypatch, fres
 
 
 def test_a_follow_up_borrow_in_the_same_session_keeps_the_larger_count(monkeypatch, fresh_arms):
-    """简报给过 1 条, 同一场补借 (传回简报里的臂) 降级了、这次 0 条: 模型手里还是那 1 条, 记 1。不传臂的 (新开的一场) 照这次的记。"""
+    """简报给过 1 条, 同一场补借 (传回简报里的臂) 降级了、这次 0 条: 模型手里还是那 1 条, 记 1。不传臂的 (新开的一场) 这次
+    0 条, 和前面那场的 1 条对不上 —— 分不出入库的是哪一场 (复审: 共用身份), 记 None, 不拿最后一次的数顶。"""
     monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
     monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
     arm = core.build_writing_brief(_client(), PID, user_id=ME, brief={})["flywheel_arm"]
@@ -649,7 +650,41 @@ def test_a_follow_up_borrow_in_the_same_session_keeps_the_larger_count(monkeypat
     core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm)
     assert core.batch_arm(PID, ME, from_brief=arm)[3] == 1
     core.borrow_lessons(_client(), PID, user_id=ME)
-    assert core.batch_arm(PID, ME, from_brief=arm)[3] == 0
+    assert core.batch_arm(PID, ME, from_brief=arm)[3] is None
+
+
+# ── 共用身份的几场叠在一起 (F13 复审, 2026-11-02) ────────────────────────────────────────────────────
+# 团队共用一个 user_id: 同一个项目同一天的几场拿到同一个臂、记在同一个键下。以前只留最后一次借卡的条数, A 场入库记的是 B 场的
+# (复审复现: A 简报 1 条、B 降级 0 条 → A 的批次记 0; 反过来 A 超时 0 条、B 3 条 → A 没看到规律的批次记 3, 进了处理组)。
+
+@pytest.mark.parametrize("first, second", [(PATTERNS, []), ([], PATTERNS * 3)], ids=["A-1-then-B-0", "A-0-then-B-3"])
+def test_two_sessions_under_one_identity_with_different_counts_record_null(monkeypatch, fresh_arms, first, second):
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(first) if first else _degraded([]))
+    a = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    assert len(a.get("validated_patterns") or []) == len(first)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(second) if second else _degraded([]))
+    core.build_writing_brief(_client(), PID, user_id=ME, brief={})          # B 场: 同一个身份、同一天 → 同一个臂
+    assert core.batch_arm(PID, ME, from_brief=a["flywheel_arm"])[3] is None, "分不出是哪一场的, 不能记成另一场的条数"
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm=a["flywheel_arm"])
+    assert params["flywheel_arm"] == "patterns" and params["flywheel_arm_source"] == "brief", "臂照旧"
+    assert params["flywheel_patterns_shown"] is None and meta["flywheel_patterns_shown"] is None
+
+
+def test_two_sessions_with_the_same_count_keep_it_and_old_sessions_drop_out(monkeypatch, fresh_arms):
+    """几场条数一样就照记; 离最近一次发臂超过 _ARM_REPORT_TTL 的旧场不算 (和臂的核对同一条线)。"""
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    t = datetime(2026, 11, 2, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(core, "_utcnow", lambda: t)
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _degraded([]))
+    core.build_writing_brief(_client(), PID, user_id=ME, brief={})          # 一早那场: 0 条
+    monkeypatch.setattr(core, "_utcnow", lambda: t + core._ARM_REPORT_TTL + timedelta(minutes=1))
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    assert core.batch_arm(PID, ME, from_brief="patterns")[3] == 1, "12 小时之前那场不和这一场比"
+    monkeypatch.setattr(core, "_utcnow", lambda: t + core._ARM_REPORT_TTL + timedelta(minutes=5))
+    core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    assert core.batch_arm(PID, ME, from_brief="patterns")[3] == 1, "两场都是 1 条: 不管是哪一场的都是 1"
 
 
 def test_the_arm_assignment_itself_does_not_change(monkeypatch, fresh_arms):

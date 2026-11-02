@@ -7607,7 +7607,11 @@ _ARMS_SINCE = datetime.now(timezone.utc)    # 进程起来的时刻: 这之前�
 # (发臂之后又借了一次、这一次还没记上, 就是不知道, 回 None, 不拿上一场的数顶)。入库时写进 batches.params 和
 # batch_metrics.meta 的 flywheel_patterns_shown: 整数 = 给出去几条; null = 服务端不知道(重启过 / 按入库时重算的臂);
 # 没有这个键 = F13 之前的批次。分析时 patterns 臂只算 shown > 0 的, 或者把 0 / null 单列一组。
-_patterns_shown: dict[tuple[str, str, str], tuple[datetime, int]] = {}
+# 复审(同日): 团队共用一个身份(同一个 user_id), 同一个项目同一天的几场拿到的是同一个臂、记在同一个键下 —— 只留最后一次,
+# A 场入库就会记成 B 场借卡的条数(A 简报里 1 条、B 降级 0 条 → A 记 0; 反过来 A 超时 0 条、B 3 条 → A 记 3, 没看到规律的
+# 批次进了处理组)。服务端分不出这一批是哪一场的。所以每次发臂各记一条(时刻, 条数), 留 _ARM_REPORT_TTL 之内的: 都一样才回
+# 这个数, 对不上就是不知道(None)。
+_patterns_shown: dict[tuple[str, str, str], list[tuple[datetime, int]]] = {}
 
 
 def _utcnow() -> datetime:
@@ -7666,25 +7670,32 @@ def _borrow_arm(project_id, user_id, *, reuse: str | None = None) -> str:
 
 def _note_patterns_shown(project_id, user_id, arm: str, shown: int, *, carry: bool = False) -> None:
     """借卡交出去之后, 把这一场实际给出去几条规律记在刚发的那个臂旁边(F13, 见 _patterns_shown 那段)。只写进程内存,
-    不读写库。``carry`` = 同一场里接着借(borrow_lessons 原样传回了简报里的臂、而且被沿用了): 和这一场前面那次取大的 ——
+    不读写库。``carry`` = 同一场里接着借(borrow_lessons 原样传回了简报里的臂、而且被沿用了): 和前面最近那次取大的 ——
     简报里给过 3 条、后来补借一次降级了, 模型手里还是那 3 条。上一场的(离这次发臂超过 _ARM_REPORT_TTL)不带过来。
-    臂这时已经不在 _borrowed_arms 里(不该发生)就不记。"""
+    臂这时已经不在 _borrowed_arms 里(不该发生)就不记。每次各记一条(复审: 共用身份的几场叠在一起时, 只留最后一次会把别的
+    场的数记到这一批上), 离这次超过 _ARM_REPORT_TTL 的旧记录丢掉。carry 取大的那一次也可能是别的场的 —— 那样的话别的场自己
+    那条还在、和这条不一样, _shown_for 照样回 None。"""
     key = (str(project_id), str(user_id or ""))
     with _borrowed_arms_lock:
         at = (_borrowed_arms.get(key) or {}).get(arm)
         if at is None:
             return
         n = max(0, int(shown or 0))
-        prev = _patterns_shown.get(key + (arm,))
-        if carry and prev is not None and at - prev[0] <= _ARM_REPORT_TTL:
-            n = max(n, prev[1])
-        _patterns_shown[key + (arm,)] = (at, n)
+        recs = [r for r in _patterns_shown.get(key + (arm,), ()) if at - r[0] <= _ARM_REPORT_TTL]
+        if carry and recs:
+            n = max(n, recs[-1][1])
+        _patterns_shown[key + (arm,)] = recs + [(at, n)]
 
 
 def _shown_for(key: tuple[str, str], arm: str, issued: dict[str, datetime]) -> int | None:
-    """这个臂最近一次发出去时实际给了几条规律; 记的那一次和 issued 里的对不上(或者没记)就是不知道, 回 None。调用方持锁。"""
-    rec = _patterns_shown.get(key + (arm,))
-    return rec[1] if rec is not None and issued.get(arm) == rec[0] else None
+    """这个臂发出去时实际给了几条规律。最近一次发臂还没记上(时刻和 issued 里的对不上 / 没记)就是不知道, 回 None;
+    _ARM_REPORT_TTL 之内记过几次、条数不一样也是不知道(复审: 共用身份的几场叠在一起, 分不出这一批是哪一场的), 回 None。
+    调用方持锁。"""
+    recs = _patterns_shown.get(key + (arm,)) or []
+    if not recs or issued.get(arm) != recs[-1][0]:
+        return None
+    counts = {n for t, n in recs if recs[-1][0] - t <= _ARM_REPORT_TTL}
+    return counts.pop() if len(counts) == 1 else None
 
 
 def batch_arm(project_id, user_id, *,
@@ -7693,7 +7704,8 @@ def batch_arm(project_id, user_id, *,
     ``from_brief`` = 模型传回的简报里的臂。第三项 (W-31, 见上面那段): None = 采用了 / 没传; ``"corrected"`` = 服务端
     没给过这场这个臂, 以服务端最近一次发的为准; ``"unverified"`` = 重启过核对不了, 也记服务端最近一次发的, 调用方标
     flywheel_arm_unverified。第四项 (外部审计 11-02 F13, 见 _patterns_shown 那段): 整数 = 服务端记下的那一次借卡交出去
-    几条规律(explore 臂是 0); None = 不知道(重启过、按入库时重算的、那一次借卡还没记上)。臂怎么定一点没变。"""
+    几条规律(explore 臂是 0); None = 不知道(重启过、按入库时重算的、那一次借卡还没记上、共用身份的几场 12 小时内各借了
+    一次而条数不一样 —— 分不出这一批是哪一场的)。臂怎么定一点没变。"""
     now = _utcnow()
     key = (str(project_id), str(user_id or ""))
     with _borrowed_arms_lock:
@@ -8314,6 +8326,32 @@ TV_SYNC_RELINK_MAX = 5
 TV_VANISHED_GRACE = timedelta(hours=36)
 # 人定过的对照不动: candidates 里带 D-xxx 决策号或"人工判定"的备注。不认 W-xx —— W-34 自己写的备注不能把链接钉死。
 _PIN_RE = re.compile(r"(?<![A-Za-z])D-\d{3}(?!\d)|人工判定")
+# 2026-11-02 外部审计 11-02 F04 复审: 只因为标题一样才分不出的帖(tvlink.weak_title_only —— 标题一样那几版的正文和它都不到
+# EDITED_FLOOR、内容那一路什么都没对上), 查重底稿也没认领的, 记 ambiguous 等人看最多这么多天(从头一次这样判出来那晚算,
+# 记在对照 candidates 的 WEAK_SINCE_KEY 里), 满了没人判就照常补录(W-10 没补录目标的记 unmatched)。不能一直挂着: ambiguous
+# 不进补录、W-40 也不记它的文字(它没有版本), 发出去的文字查重一直看不见; 而人看完能做的也只有 tv-resolve --ingest(补录)。
+# 一周: 至少赶上一次周检; 发之后才存档的那版(lag < 0 也在时间窗里)这几天里存进来, 内容那一路照样能对上。
+TV_WEAK_TITLE_GRACE_DAYS = 7
+WEAK_SINCE_KEY = "weak_title_since"
+
+
+def _weak_title_since(link: dict | None) -> str | None:
+    """这条笔记头一次判成"只有标题一样"的那天(UTC 日期, YYYY-MM-DD); 以前的对照没记过就是 None。"""
+    for c in (link or {}).get("candidates") or ():
+        if isinstance(c, dict) and c.get(WEAK_SINCE_KEY):
+            return str(c[WEAK_SINCE_KEY])[:10]
+    return None
+
+
+def _weak_title_link(link: dict) -> bool:
+    """以前按标题连上、存着的包含度又不到 EDITED_FLOOR 的对照(F04 复审): 字没变也要核, 所以连着的那一版不在对照索引里
+    (不是 best 了)也要去库里取正文(_linked_versions_outside_index), 不然核不了、错的对照一直挂着。只有标题的稿(包含度 0)
+    也会取到 —— 不多, 绝大多数连着的还是 best、在索引里, 不用取。"""
+    try:
+        return (link.get("match_kind") == "title_exact" and link.get("score") is not None
+                and float(link["score"]) < tvlink.EDITED_FLOOR)
+    except (TypeError, ValueError):
+        return False
 
 
 def _relink_max() -> int:
@@ -8350,12 +8388,14 @@ def _tv_text_state(prev: dict, n: tvlink.Note, fp_now: str, known: dict, linked_
 def _linked_versions_outside_index(client, existing: dict, notes: list, fp_now: dict, known: dict,
                                    *, rematch: bool = False) -> dict:
     """指纹变了(或 --rematch)、连着的那一版又不在对照索引里(不是 best 的旧版 / 别处的版本)的, 按项目去库里取标题和正文,
-    好判换没换。取不到的就没有 —— 那条记 unverifiable、明晚再核, 不当成"没换"。10-27 生产库 0 条, 留着兜底。"""
+    好判换没换。取不到的就没有 —— 那条记 unverifiable、明晚再核, 不当成"没换"。10-27 生产库 0 条, 留着兜底。
+    外部审计 11-02 F04 复审: 存着的包含度不到 EDITED_FLOOR 的 title_exact(_weak_title_link)字没变也取 —— F04 复核以前按标题
+    连上的对照要那一版的正文, 那一版后来不是 best 了(改过稿)也得核得了。"""
     want: dict[str, set] = {}
     for n in notes:
         l = existing.get(n.note_id)
         if (l and l.get("version_id") and l.get("project_id")
-                and (rematch or l.get("tv_text_fp") != fp_now[n.note_id])
+                and (rematch or l.get("tv_text_fp") != fp_now[n.note_id] or _weak_title_link(l))
                 and not _pinned(l) and str(l["version_id"]) not in known):
             want.setdefault(str(l["project_id"]), set()).add(str(l["version_id"]))
     out: dict[str, tvlink.Version] = {}
@@ -8880,6 +8920,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     w34_note: dict[str, list[dict]] = {}  # 挪走的对照, 新对照的 candidates 前面记一句为什么挪
     moved: list[tuple] = []              # (笔记, 新判定, 旧对照, 旧版本是不是我们自己写回 TV 的)
     weak_ids: set[str] = set()           # 以前按标题连上、正文其实不像的(外部审计 11-02 F04), 这晚按内容重对
+    weak_amb: dict[str, tvlink.Match] = {}  # 只因为标题一样才分不出的(F04 复审): 先进补录名单对底稿, 补录之前再分
 
     def _link(n: tvlink.Note, kind: str, *, project_id=None, version_id=None,
               item_id=None, score=None, lag=None, candidates=None) -> dict:
@@ -8927,6 +8968,13 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             # 对查重是隐形的, 却会被报成"已补录"(codex #81 P2)。记下来给人看。
             counts["no_body"] += 1
             links.append(_link(n, "unmatched", candidates=extra + [{"note": "TV 里没有正文, 无法对照也无法补录"}]))
+            return
+        if tvlink.weak_title_only(m):
+            # F04 复审: 只因为标题一样才分不出的, 先当 unmatched 走一遍查重底稿(W-38) —— 写手拿旧标题写了一篇新的、只查了重
+            # 没存档时, 底稿才是它的来源; 底稿也没认领的, 补录之前再分: 等人看(ambiguous)还是照常补录(见 weak_amb 那一段)
+            counts["unmatched"] += 1
+            weak_amb[n.note_id] = m
+            to_ingest.append(n)
             return
         counts[m.kind] += 1
         if m.version is not None:
@@ -9323,6 +9371,43 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                                             "angle_key": bool(g.get("angle_key"))})
         to_ingest = rest
 
+    # ── 只因为标题一样才分不出、查重底稿也没认领的(外部审计 11-02 F04 复审, 2026-11-02) ──
+    # 头一次这样判出来之后 TV_WEAK_TITLE_GRACE_DAYS 天内记 ambiguous 等人看(不补录: 补录是终态); 满了没人判就照常补录, 发出去的
+    # 文字进指纹库 —— 以前这种帖按标题连在那一版上, W-40 把文字记在它名下; F04 之后它没有版本, 一直挂着的话查重永远看不见它。
+    # 哪天头一次判出来记在对照的 candidates 里(WEAK_SINCE_KEY), 每晚带过去; 补录没建成(指纹库里已有同样的文字)记 unmatched
+    # 的也带着, 不会每晚重新等一轮。
+    weak_title: dict = {"held": 0, "released": 0}
+    if weak_amb:
+        today = now[:10]
+        keep: list[tvlink.Note] = []
+        for n in to_ingest:
+            m = weak_amb.get(n.note_id)
+            if m is None:
+                keep.append(n)
+                continue
+            since = _weak_title_since(existing.get(n.note_id)) or today
+            try:
+                waited = (datetime.fromisoformat(today) - datetime.fromisoformat(since)).days
+            except ValueError:
+                since, waited = today, 0
+            if waited < TV_WEAK_TITLE_GRACE_DAYS:
+                weak_title["held"] += 1
+                counts["unmatched"] -= 1                # _apply 按 unmatched 记的; counts 加起来仍等于笔记数
+                counts["ambiguous"] += 1
+                links.append(_link(n, "ambiguous", score=m.score, candidates=w34_note.get(n.note_id, []) + [
+                    {"note": f"F04: 只有标题一样、正文不像(包含度不到 {tvlink.EDITED_FLOOR}), 查重底稿也没认领; "
+                             f"{since} 起等人看, 满 {TV_WEAK_TITLE_GRACE_DAYS} 天没人判就按对不上补录",
+                     WEAK_SINCE_KEY: since}] + list(m.candidates)))
+                if len(ambiguous_samples) < 10:
+                    ambiguous_samples.append({"note_id": n.note_id, "title": n.title[:40], "candidates": m.candidates[:3]})
+                continue
+            weak_title["released"] += 1
+            w34_note[n.note_id] = w34_note.get(n.note_id, []) + [
+                {"note": f"F04: 只有标题一样、正文不像, {since} 起等了 {waited} 天没人判, 按对不上补录", WEAK_SINCE_KEY: since}
+            ] + list(m.candidates)
+            keep.append(n)
+        to_ingest = keep
+
     ingest: dict | None = None
     unmatched_kept = 0                   # 没有补录目标、上次就是同样的 unmatched, 这次没重写(W-10)
     dup_of: dict[int, int] = {}          # to_ingest 下标 → 正文相同的第一条的下标
@@ -9484,11 +9569,17 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "drift": drift,
         "snapshots": snap,
         "published_fp": published_fp,
+        "weak_title": weak_title,
         "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
                  f"{counts['fuzzy']} / 改过 {counts['edited']}"
                  + (f"; 其中对上查重底稿 {snap['matched_notes']}" if snap["matched_notes"] else "")
-                 + f"), 分不出 {counts['ambiguous']}, 对不上 {counts['unmatched']}"
+                 + f"), 分不出 {counts['ambiguous']}"
+                 + (f"(其中只有标题一样、等人看的 {weak_title['held']}, 满 {TV_WEAK_TITLE_GRACE_DAYS} 天没人判就补录)"
+                    if weak_title["held"] else "")
+                 + f", 对不上 {counts['unmatched']}"
+                 + (f"(其中只有标题一样、等满 {TV_WEAK_TITLE_GRACE_DAYS} 天的 {weak_title['released']})"
+                    if weak_title["released"] else "")
                  + (f", 没正文 {counts['no_body']}" if counts["no_body"] else "")
                  + (f"; 正文整篇换了 {drift['replaced']}(挪了 {drift['relinked']})" if drift["replaced"] else "")
                  + (f"; 只有标题一样、正文不像的旧对照 {drift['weak_title']}(F04, 按内容重对)" if drift["weak_title"] else "")

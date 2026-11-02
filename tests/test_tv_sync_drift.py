@@ -391,7 +391,9 @@ def test_a_weak_title_match_is_moved_off_its_version_and_our_lineage_cleared(fp_
     assert l["match_kind"] == "ambiguous" and l["version_id"] is None
     assert "F04" in l["candidates"][0]["note"] and "v1" in l["candidates"][0]["note"]
     assert not core._pinned(l), "F04 那句备注不能把对照钉死"
-    assert [(cd["version_id"], cd.get(tvlink.WEAK_TITLE_KEY)) for cd in l["candidates"][1:]] == [("v1", True)]
+    # 复审: 第二条记它哪天起等人看(满 core.TV_WEAK_TITLE_GRACE_DAYS 天没人判就补录), 后面才是候选
+    assert l["candidates"][1][core.WEAK_SINCE_KEY] == store.iso_now()[:10] and not core._pinned(l)
+    assert [(cd["version_id"], cd.get(tvlink.WEAK_TITLE_KEY)) for cd in l["candidates"][2:]] == [("v1", True)]
     assert _lineage(notes, "n1") == (None, None), "TV 不再说它来自 v1"
     assert _diff(c, "n1")["diff_rev"] == 0, "那条 2697 → 188 字的差异降回旧口径, 摘要读不到"
     assert out["counts"]["ambiguous"] == 1 and sum(out["counts"].values()) == out["notes"]
@@ -410,6 +412,33 @@ def test_a_weak_title_match_without_write_tv_waits_and_its_diff_is_quarantined()
     assert out["drift"]["weak_title"] == 1 and out["drift"]["deferred"] == 1 and out["drift"]["relinked"] == 0
     assert _link(c, "n1")["version_id"] == "v1" and _lineage(notes, "n1") == ("v1", "i1")
     assert _diff(c, "n1")["diff_rev"] == 0
+
+
+def test_a_weak_title_link_whose_version_is_no_longer_the_best_is_still_checked(monkeypatch):
+    """F04 复审: 连着的那一版后来不是 item 的 best 了(写手又存了一版), TV 的字也没变 —— 以前它不在对照索引里, 只在指纹变了 /
+    --rematch 时才去库里取, 于是核不了, 那条只有标题一样的对照、写进 TV 的血缘和差异一直挂着, 每晚的输出里什么都不报。
+    现在存着的包含度不到 EDITED_FLOOR 的 title_exact 字没变也去取那一版来核。"""
+    notes, c = _weak_title_legacy(fp=True)
+    item = next(i for i in c.rows["items"] if i["id"] == "i1")
+    rev = ("改过一版的稿子写的是完全不同的东西: 周末去爬山带了三瓶水还是不够喝, "
+           "下山的时候膝盖疼得要命, 回来查了才知道下坡要侧着走, 第二次就好多了。")
+    item["best_version_id"] = "v1b"
+    item["versions"].append({"id": "v1b", "title": "秋招投了六十份", "body": rev, "version_num": 2,
+                             "created_at": item["created_at"]})
+    c.rows["versions"].append({"id": "v1b", "item_id": "i1", "title": "秋招投了六十份", "body": rev, "version_num": 2,
+                               "created_at": item["created_at"]})
+    asked: list = []
+
+    def fetch(sb, pid, ids):
+        asked.append(sorted(ids))
+        return {"v1": {"title": "秋招投了六十份", "body": BODY_A}} if "v1" in ids else {}
+    monkeypatch.setattr(store, "versions_in_project", fetch)
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert asked == [["v1"]], "字没变也去取那一版"
+    assert out["drift"]["weak_title"] == 1 and out["drift"]["relinked"] == 1 and out["drift"]["tv_cleared"] == 1
+    l = _link(c, "n1")
+    assert l["match_kind"] == "ambiguous" and l["version_id"] is None
+    assert _lineage(notes, "n1") == (None, None) and _diff(c, "n1")["diff_rev"] == 0
 
 
 def test_title_only_and_body_backed_title_links_are_left_alone():

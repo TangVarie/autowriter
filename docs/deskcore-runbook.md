@@ -391,6 +391,31 @@ select note_id, match_kind, version_id, candidates->0->>'note' from autowriter.t
 
 `tv_lineage`（TV 自己带的来源）正文整篇换了：不挪、只在日志里报（不改退出码），差异隔离，要人看。
 
+**外部审计 11-02 F04（2026-11-02）：只有标题一样的旧对照。** 标题档以前不看正文，生产库 124 条 `title_exact` 里 2 条是标题一样、
+正文不像的（SPX_phase1 那条 0.063、TUGE_phase1 那条 0.076，写作台那版都有完整正文；都回填进了 TV，途鸽那条的改动差异是
+2697 → 188 字）。不用单独跑什么：tv-sync 每晚把存着的包含度不到 0.30 的 `title_exact` 再核一遍（连着的那一版不是 best 了也去库里
+取），正文确实不像的走 W-34 挪对照那条路——要 `--write-tv`（cron 带着）、受 `TV_SYNC_RELINK_MAX` 上限，日志「正文核对」那行多一个
+「只有标题一样、正文不像 N」，样本行的原因是「只有标题一样、正文不像(F04), 已按内容重对」。挪完记 `ambiguous`、等人看 7 天
+（`TV_WEAK_TITLE_GRACE_DAYS`），满了没人判就补录（W-40 已经把这两条的文字记在原来那版名下的话，补录会按「指纹库里已有」跳过、
+记 `unmatched`——文字还在指纹库里，查重照样看得见）。部署后第一晚验收（SQL Editor）：
+
+```sql
+-- 标题档连着、包含度不到 0.30、写作台那版有正文的(只有标题的稿不算): SPX / 途鸽那两条不该再在里面; 剩下的只该是笔记正文
+-- 太短的(不到 15 个四字串, 只有标题 / 一两句) —— 那种正文没得比, 照旧认标题
+select l.tv_project_id, l.note_id, l.score from autowriter.tv_note_links l
+  join autowriter.versions v on v.id = l.version_id
+ where l.match_kind = 'title_exact' and l.score < 0.30 and length(coalesce(v.body, '')) > 20;
+-- 挪走的那两条: 不再连着版本, 候选里有 F04 的备注; TV 的血缘清了、差异降回旧口径(diff_rev 0)
+select l.note_id, l.match_kind, l.version_id, l.candidates->0->>'note' note, d.diff_rev
+  from autowriter.tv_note_links l left join autowriter.tv_edit_diffs d using (note_id)
+ where l.candidates::text like '%F04%' order by l.updated_at desc;
+```
+
+第一个查询第二晚还有那两条：多半是那一晚没挪成（日志里有「没开 --write-tv」「撤回 TV 旧血缘失败」「超过每晚上限」），看日志处理；
+想先看会挪哪几条，跑 `python -m deskcore.cli tv-sync --tv-project X --write-tv --dry-run`（也可以加 `--rematch`，整个项目按内容重对）。
+等人看的那些：`select note_id, candidates from autowriter.tv_note_links where candidates::text like '%weak_title_since%' and match_kind = 'ambiguous'`；
+人看完确认对不上就 `tv-resolve --note … --ingest`，不处理的 7 天后自动补录。
+
 ### 1.12 `016_tv_notes_skip_vanished` —— tv-sync 不再读飞书里已删的篇（2026-10-26，I-22，生产库已执行，10-27 核对）
 
 TV 的 `truth_vault.notes` 只增不删：飞书里删掉或挪去别的表的篇，TV 那一行留着，进 `truth_vault.v_notes_vanished`（D-103）。

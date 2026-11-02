@@ -147,6 +147,67 @@ def test_title_only_drafts_and_title_only_notes_keep_matching_by_title():
     assert m.kind == "title_exact" and m.version.version_id == "v1"
 
 
+# ── F04 复审(2026-11-02): 线卡在哪、候选怎么并、时间窗 ───────────────────────────────────────────
+# 上面几条的包含度不是 0.0 就是 0.6 以上, 把线挪到 0.10、把 < 改成 <=、把内容那一路分不出的候选扔掉, 全套用例照样过(复审变异)。
+
+def _cjk(n: int, seed: int) -> str:
+    """n 个随机汉字(四字串几乎不会撞)。按 seed 定。"""
+    import random
+    rng = random.Random(seed)
+    return "".join(chr(rng.randint(0x4E00, 0x9FA5)) for _ in range(n))
+
+
+def _shared(k: int, *, seed: int = 0) -> tuple[str, str]:
+    """标题一样的一对正文: 笔记 100 个四字串, 其中正好 k 个也在那一版里(共用的那段放在后面, 开头不一样, 不走开头档)。"""
+    tail = _cjk(k + 3, seed + 1)
+    return _cjk(100 - k, seed + 2) + tail, _cjk(60, seed + 3) + tail
+
+
+def _contain(note_body: str, version_body: str) -> float:
+    ng = L.grams(note_body)
+    return len(ng & L.grams(version_body)) / len(ng)
+
+
+def test_a_title_match_below_the_floor_is_weak_even_well_above_zero():
+    note, ver = _shared(20)
+    assert _contain(note, ver) == 0.2
+    m = L.match_note(_n("n1", "标题一样的一对", note), L.VersionIndex([_v("v1", "标题一样的一对", ver)]))
+    assert m.kind == "ambiguous" and m.score == 0.2
+    assert [(c["version_id"], c.get(L.WEAK_TITLE_KEY)) for c in m.candidates] == [("v1", True)]
+    assert L.weak_title_only(m)
+
+
+def test_a_title_match_at_or_above_the_floor_is_still_a_title_match():
+    for k in (30, 31):
+        note, ver = _shared(k)
+        assert _contain(note, ver) == k / 100
+        m = L.match_note(_n("n1", "标题一样的一对", note), L.VersionIndex([_v("v1", "标题一样的一对", ver)]))
+        assert (m.kind, m.version.version_id if m.version else None) == ("title_exact", "v1"), (k, m.kind)
+        assert not L.title_without_body(_n("n1", "标题一样的一对", note), _v("v1", "标题一样的一对", ver))
+
+
+def test_content_ambiguity_and_a_weak_title_candidate_are_listed_together():
+    """内容那一路在 v2 / v3 之间分不出(各 0.45), 另有一版 v1 只是标题一样: 三版都列进候选, 只有 v1 标 WEAK_TITLE_KEY ——
+    这不是"只因为标题一样"(tv_sync 照普通的分不出处理, 不当 unmatched 去对底稿)。"""
+    tail = _cjk(48, 11)
+    note = _cjk(55, 12) + tail
+    idx = L.VersionIndex([_v("v1", "同题一篇", _cjk(80, 13)), _v("v2", "另一个标题", _cjk(40, 14) + tail),
+                          _v("v3", "第三个标题", _cjk(50, 15) + tail)])
+    assert _contain(note, idx.versions[1].body) == _contain(note, idx.versions[2].body) == 0.45
+    m = L.match_note(_n("n1", "同题一篇", note), idx)
+    assert m.kind == "ambiguous" and m.score == 0.45
+    assert {c["version_id"]: bool(c.get(L.WEAK_TITLE_KEY)) for c in m.candidates} == {"v1": True, "v2": False, "v3": False}
+    assert not L.weak_title_only(m)
+
+
+def test_a_weak_title_candidate_outside_the_time_window_is_not_a_candidate():
+    """半年后拿旧标题写的另一篇: 不是"只有标题一样、等人看", 是对不上(→ 补录)。窗口里的照旧列成候选。"""
+    idx = L.VersionIndex([_v("v1", "秋天第一杯奶茶怎么选", BODY_TEA, days=0)])
+    assert L.match_note(_n("n1", "秋天第一杯奶茶怎么选", BODY_CAMP, days=200), idx).kind == "unmatched"
+    assert L.match_note(_n("n1", "秋天第一杯奶茶怎么选", BODY_CAMP, days=-40), idx).kind == "unmatched"
+    assert L.match_note(_n("n1", "秋天第一杯奶茶怎么选", BODY_CAMP, days=30), idx).kind == "ambiguous"
+
+
 def test_tie_is_broken_by_the_closest_version_inside_the_window():
     idx = L.VersionIndex([_v("v1", "同题", BODY_A, days=-20), _v("v2", "同题", BODY_A, days=1)])
     m = L.match_note(_n("n1", "同题", BODY_A, days=2), idx)
