@@ -32,3 +32,8 @@ os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
 os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
 os.environ.setdefault("SUPABASE_ANON_KEY", "placeholder-anon-key")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "placeholder-service-key")
+
+
+def pytest_configure(config):
+    # 慢用例(几秒级的模拟闸, angle cards v2 §5.6): 默认照跑, `-m "not slow"` 可以跳过
+    config.addinivalue_line("markers", "slow: 几秒级的模拟 / 回测用例(默认照跑, -m 'not slow' 跳过)")

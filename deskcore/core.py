@@ -706,6 +706,29 @@ def _spread_order(candidates: list[dict], n: int) -> list[dict]:
     return out + rest
 
 
+def _v1_candidates(n: int, rng) -> list[dict]:
+    """v1 的候选表(angle cards v2 之前的发牌; DESK_DRAW_POLICY=v1 时走它): 全组合空间洗牌, 取前 max(20n, 500) 个,
+    再按 _spread_order 把前面一段排成一批之内尽量不撞。rng 的消耗次序和抽出来以前完全一样(同 seed 同候选表)。"""
+    space = [(lev, arc, fmt, st)
+             for lev in vocab.EMOTIONAL_LEVERS
+             for arc in vocab.HUMAN_TRUTH_ARCHETYPES
+             for fmt in vocab.CONTENT_FORMATS
+             for st in vocab.TITLE_STRUCTURES]
+    rng.shuffle(space)
+
+    # 过量供给候选给 RPC —— 它在事务里逐个查避重集、取前 n 个可用的。
+    # 20 倍冗余(下限 500)足以覆盖"近期用掉很多"的项目。
+    cand_cap = min(len(space), max(n * 20, 500))
+    candidates = []
+    for lev, arc, fmt, st in space[:cand_cap]:
+        dims = {"emotional_lever": lev, "human_truth_archetype": arc,
+                "content_format": fmt, "title_structure": st}
+        candidates.append({"angle_key": angle_key(dims), "dims": dims})
+    # 一批之内错开体裁和标题句式(10-20): RPC 按候选的先后取前 n 个可用的, 所以把洗好的候选重排成"前面几个尽量
+    # 互不同形", 选择本身还是 RPC 在事务里做。见 _spread_order。
+    return _spread_order(candidates, n)
+
+
 def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
                 user_id: str | None = None, seed: int | None = None,
                 perpetual_bias: bool = False) -> dict:
@@ -737,24 +760,7 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
 
     rng = random.Random(seed) if seed is not None else random.Random()
 
-    space = [(lev, arc, fmt, st)
-             for lev in vocab.EMOTIONAL_LEVERS
-             for arc in vocab.HUMAN_TRUTH_ARCHETYPES
-             for fmt in vocab.CONTENT_FORMATS
-             for st in vocab.TITLE_STRUCTURES]
-    rng.shuffle(space)
-
-    # 过量供给候选给 RPC —— 它在事务里逐个查避重集、取前 n 个可用的。
-    # 20 倍冗余(下限 500)足以覆盖"近期用掉很多"的项目。
-    cand_cap = min(len(space), max(n * 20, 500))
-    candidates = []
-    for lev, arc, fmt, st in space[:cand_cap]:
-        dims = {"emotional_lever": lev, "human_truth_archetype": arc,
-                "content_format": fmt, "title_structure": st}
-        candidates.append({"angle_key": angle_key(dims), "dims": dims})
-    # 一批之内错开体裁和标题句式(10-20): RPC 按候选的先后取前 n 个可用的, 所以把洗好的候选重排成"前面几个尽量
-    # 互不同形", 选择本身还是 RPC 在事务里做。见 _spread_order。
-    candidates = _spread_order(candidates, n)
+    candidates = _v1_candidates(n, rng)
 
     reserved = store.reserve_angles(client, project_id, candidates, n,
                                     user_id, avoid_days)

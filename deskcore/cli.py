@@ -26,6 +26,9 @@
                                                       rule_compiles(check_rules 用; 后台也会自己补编)
   python -m deskcore.cli angle-prior --project <uuid> [--backtest] [--cells cells.json --mix mix.json] [--json]
                                                     ← 发牌 v2 的先验(只读): 项目的 π 表 / 上线前的回测闸
+  python -m deskcore.cli angle-sim --project <uuid|TV 项目号> --days 28 --per-day 5|10 [--seeds 5] [--profile p.json]
+                                                    ← 发牌 v2 的模拟(假台账, 不写库): 5 张/天判上线闸, 10 张/天只报数;
+                                                      TV 项目号 / --profile 不连库(用 vendored 快照 / 给的 Profile)
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
                                                     ← TV 的笔记按内容对到写作台的版本,
                                                       对不上的补进指纹库(每天跑一次); --all 跑完
@@ -382,6 +385,37 @@ def _angle_prior(args) -> int:
         else:
             _print_profile(prof)
     return rc
+
+
+def _angle_sim_profile(args, *, live: bool):
+    """angle-sim 用哪个 Profile: --profile 给的 JSON(angle-prior --json 的输出) > vendored 快照里的 TV 项目号(只有聚合数,
+    起量帖按配比合成) > 写作台项目 uuid 现读(只读, live=True 时才走)。"""
+    from . import drawsim as ds, priors
+    if args.profile:
+        with open(args.profile, encoding="utf-8") as fh:
+            return json.load(fh)
+    prof = ds.fixture_profile(args.project) if args.project else None
+    if prof is not None or not live:
+        return prof
+    from . import core, store
+    sb = core.sb()
+    row = store.project_row(sb, args.project) or args.project
+    return priors.get_profile(sb, row, budget_s=args.wait)
+
+
+def _angle_sim(args, *, live: bool = False) -> int:
+    """发牌 v2 的模拟(§5.6): 假台账、按天发牌, 5 张/天判上线闸(几个 seed 平均), 10 张/天只报数。不写库。"""
+    from . import drawsim as ds
+    prof = _angle_sim_profile(args, live=live)
+    if prof is None:
+        print(f"angle-sim: 没有 {args.project} 的 Profile(不是快照里的 TV 项目号, 也没给 --profile)")
+        return 2
+    rep = ds.run(prof, days=args.days, per_day=args.per_day, seeds=range(max(args.seeds, 1)))
+    if args.json:
+        _print(rep)
+    else:
+        print(ds.format_report(rep))
+    return 0 if (not rep["gated"] or rep["pass"]) else 1
 
 
 def _tv_map(core, sb, args) -> int:
@@ -995,6 +1029,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wait", type=float, default=120.0, help="--project 时最多等先验建好的秒数")
     p.add_argument("--json", action="store_true")
 
+    # 发牌 v2 的模拟(angle cards v2 §5.6): 运维命令, 假台账、不写库, 同 angle-prior 不要 --user。
+    p = sub.add_parser("angle-sim", help="发牌 v2 的模拟: 假台账按天发牌, 5 张/天判上线闸、10 张/天只报数(不写库)")
+    p.add_argument("--project", default=None,
+                   help="写作台项目 uuid(现读 Profile, 只读), 或 vendored 快照里的 TV 项目号(不连库)")
+    p.add_argument("--profile", default=None, help="Profile 的 JSON 文件(angle-prior --json 的输出; 不连库)")
+    p.add_argument("--days", type=int, default=28)
+    p.add_argument("--per-day", dest="per_day", type=int, default=5)
+    p.add_argument("--seeds", type=int, default=5, help="跑几个 seed 取平均(0..seeds-1)")
+    p.add_argument("--wait", type=float, default=120.0, help="现读 Profile 时最多等先验建好的秒数")
+    p.add_argument("--json", action="store_true")
+
     args = ap.parse_args(argv)
     if args.cmd == "selftest":
         return selftest()
@@ -1005,6 +1050,11 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("angle-prior: 给 --project 或 --backtest(或两个都给)")
         if args.backtest and args.cells and not args.project:
             return _angle_prior(args)             # 离线回测: 不连库、不 import config / db
+    if args.cmd == "angle-sim":
+        if not (args.project or args.profile):
+            ap.error("angle-sim: 给 --project 或 --profile")
+        if args.profile or _angle_sim_profile(args, live=False) is not None:
+            return _angle_sim(args)               # 快照 / 给定 Profile: 不连库、不 import config / db
 
     # 以下要连库, 到这一步才 import(让 selftest 不需要任何第三方依赖)
     import config
@@ -1042,6 +1092,8 @@ def main(argv: list[str] | None = None) -> int:
         return _compile_rules(core, sb, args)
     if args.cmd == "angle-prior":
         return _angle_prior(args)
+    if args.cmd == "angle-sim":
+        return _angle_sim(args, live=True)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user, include_archived=args.include_archived))
     elif args.cmd == "open":
