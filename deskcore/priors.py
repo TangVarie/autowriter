@@ -124,6 +124,10 @@ EXT_CATEGORY_BY_PROJECT: dict[str, tuple[str, ...]] = {
     "运动补给": ("sportsix",),
     "术后营养": ("大象集团", "nucare"),
     "求职留学": ("途鸽",),
+    # 2026-11-02 起 Jev 加抓的三个品类(TV D-138 / TangVarie/truth-vault#261 的书架表, 一字不差地对齐)
+    "家居家电": ("西屋",),
+    "个护": ("hatherine",),
+    "藻油": ("百健士",),
 }
 
 SNAPSHOT_PATH = os.path.join(os.path.dirname(__file__), "vendor", "angle_priors_snapshot.json")

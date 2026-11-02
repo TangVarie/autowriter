@@ -12,7 +12,7 @@ with f as (
  select distinct on (subject_id) subject_id note_id, answer from truth_vault.note_feature_answers
  where subject_type='note' and question_id='title_is_question' and run_tag='primary' and coalesce(answer,'')<>''
  order by subject_id, extracted_at desc),
-pc as (select project_id, count(comments_count) > 0 has_cc from truth_vault.notes group by 1),
+pc as (select project_id, count(comments_count) filter (where publish_time <= now()) > 0 has_cc from truth_vault.notes group by 1),
 s as (select project_id, min((publish_time + interval '8 hours')::date) d0 from truth_vault.notes where publish_time <= now() group by 1),
 e as (
  select n.project_id, pc.has_cc, ((n.publish_time + interval '8 hours')::date - s.d0) dd,

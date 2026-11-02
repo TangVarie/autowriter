@@ -875,9 +875,11 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
     base = {"v": 2, "pol": "v2", "b": b}
     # 这一批的整张计划(槽位数和各来源份额)每张都带: draw-report 的「来源计划」按批算 n·份额, 一批只算一次 —— 光凭每张
     # 实际落下来的来源和它的 sp 拼不出整张计划(一张都没落下的来源就不见了, review on aw#140)
-    shares = {s_: float(v) for s_, v in (plan.get("shares") or {}).items() if float(v or 0.0) > 0}
-    if shares:
-        base.update(pn=int(plan.get("n") or len(slots)), pl={s_: round(v, 3) for s_, v in shares.items()})
+    # 记的是这一批实际排出来的各来源槽位数(外部保底那一张、外部封顶之后的), 不是份额: 大批(封顶)和小批(保底)的
+    # 计划不等于 n·份额, 拿 n·份额去比会报出本来就该有的差(复审 on aw#140)。_draw 有 300 字的预算, 所以只记槽位数。
+    counts = {s_: int(c) for s_, c in (plan.get("counts") or {}).items() if int(c or 0) > 0}
+    if counts:
+        base.update(pn=int(plan.get("n") or len(slots)), pk=counts)
     extra_keys = dict(extra or {})
 
     used_refs: list = []

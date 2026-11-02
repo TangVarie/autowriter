@@ -378,6 +378,8 @@ def test_scheduled_notes_with_a_future_publish_time_change_nothing():
     assert "where n.publish_time <= now() and not coalesce((n.data_quality_flags->>'synthetic')" in mix_sql
     assert "where x.project_id=g.project_id and x.publish_time <= now()) span" in mix_sql
     assert "from truth_vault.notes where publish_time <= now() group by 1)" in sql.split("-- 2) mix.json")[0]
+    # 「有没有评论数」也只看已发的(复审 on aw#140: 只有排期稿带评论数的项目, 导出和 build_global 口径不一)
+    assert "count(comments_count) filter (where publish_time <= now()) > 0 has_cc" in sql.split("-- 2) mix.json")[0]
 
 
 def test_hit_pool_top_decile_own_and_brand_windows_never_cross_brand():
@@ -455,7 +457,11 @@ def test_external_pool_filters_and_orders_by_comment_velocity():
 def test_external_category_mirrors_the_tv_brand_table():
     assert priors.EXT_CATEGORY_BY_PROJECT == {
         "戒烟": ("力克雷", "nicorette"), "鼻炎": ("雷诺考特",), "运动补给": ("sportsix",),
-        "术后营养": ("大象集团", "nucare"), "求职留学": ("途鸽",)}
+        "术后营养": ("大象集团", "nucare"), "求职留学": ("途鸽",),
+        "家居家电": ("西屋",), "个护": ("hatherine",), "藻油": ("百健士",)}
+    assert priors.external_category({"brand": "西屋", "name": "西屋911gt"}) == "家居家电"
+    assert priors.external_category({"brand": "", "name": "Hatherine痘痘贴"}) == "个护"
+    assert priors.external_category({"brand": "百健士", "name": "百健士成人藻油"}) == "藻油"
     assert priors.external_category({"brand": "SportSix", "name": "x"}) == "运动补给"
     assert priors.external_category({"brand": "", "name": "途鸽留学 11 月"}) == "求职留学"
     assert priors.external_category({"brand": "某家电", "name": "x"}) is None

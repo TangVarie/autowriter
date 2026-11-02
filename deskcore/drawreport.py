@@ -109,7 +109,7 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
             "sp": d.get("sp"), "p": d.get("p"), "pu": d.get("pu"), "pv": pv,
             "fit": dp.fit_score(pv) if isinstance(pv, list) else None,
             "lever": dims.get(dp.L), "fmt": dims.get(dp.F), "arc": dims.get(dp.A), "ttl": dims.get(dp.T),
-            "dd": d.get("dd"), "ps": d.get("ps"), "b": d.get("b"), "pn": d.get("pn"), "pl": d.get("pl"),
+            "dd": d.get("dd"), "ps": d.get("ps"), "b": d.get("b"), "pn": d.get("pn"), "pl": d.get("pl"), "pk": d.get("pk"),
             "m1": m1, "m2": m2, "m3": m3, "d1": d1, "m5": m5, "m6": m6,
         })
     return out
@@ -204,14 +204,23 @@ def x_only_lever_lift(cards, m: str) -> dict:
 
 
 def _planned_sources(cards) -> dict:
-    """来源计划: 每一批按它记下的整张计划(_draw 的 pn 槽位数、pl 各来源份额)加 n·份额, 一批只算一次(review on
-    aw#140)。按每张实际落下的来源加 sp 会把计划缩成「实际 × 份额」, 一张都没落下的来源整个不见。没记计划的批(重写的
-    几张 rep 自己不带计划; 加 pn / pl 之前发的 v2 牌)不算进来。"""
+    """来源计划: 每一批按它记下的整张计划加一次(review on aw#140): _draw 的 pk 是这一批实际排出来的各来源槽位数
+    (外部保底 / 封顶之后的); 只有 pn(槽位数)+ pl(份额)的就按 n·份额。按每张实际落下的来源加 sp 会把计划缩成
+    「实际 × 份额」, 一张都没落下的来源整个不见。没记计划的批(重写的几张 rep 自己不带计划)不算进来。"""
     plan: dict[str, float] = defaultdict(float)
     seen: set = set()
     for c in cards:
-        b, pn, pl = c.get("b"), c.get("pn"), c.get("pl")
-        if not b or b in seen or not isinstance(pl, dict) or not isinstance(pn, (int, float)):
+        b, pn, pl, pk = c.get("b"), c.get("pn"), c.get("pl"), c.get("pk")
+        if not b or b in seen:
+            continue
+        # 优先用这一批实际排出来的槽位数(pk: 外部保底 / 封顶之后的); 没记 pk 的老牌退回 n·份额
+        if isinstance(pk, dict) and pk:
+            seen.add(b)
+            for s, k in pk.items():
+                if isinstance(k, (int, float)) and k > 0:
+                    plan[str(s)] += float(k)
+            continue
+        if not isinstance(pl, dict) or not isinstance(pn, (int, float)):
             continue
         seen.add(b)
         for s, share in pl.items():

@@ -194,3 +194,19 @@ def test_cli_reads_only_and_reports(monkeypatch, capsys):
     assert "title" not in snap["cols"] and "body" not in snap["cols"]
     notes = next(x for x in c.calls if x["table"] == "truth_vault.notes")
     assert "raw_content" not in notes["cols"] and "title" not in notes["cols"]
+
+
+
+def test_planned_sources_prefer_the_slot_counts_the_batch_actually_planned():
+    """复审 on aw#140: 外部保底(小批)和外部封顶(大批)之后排出来的槽位数不等于 n·份额; 记了 pk 就按 pk 算,
+    没记的老牌照旧 n·份额。"""
+    rows = _batch("B1", 1, ["w"] * 17 + ["x"] * 6 + ["e"] * 4 + ["h"] * 3,
+                  plan={"w": 0.5, "x": 0.2, "e": 0.2, "h": 0.1}, n=30,
+                  sp={"w": 0.5, "x": 0.2, "e": 0.2, "h": 0.1})
+    for r in rows:
+        r["dims"]["_draw"]["pk"] = {"w": 17, "x": 6, "e": 4, "h": 3}
+    rows += _batch("B2", 40, ["w", "x", "e"], plan={"w": 0.55, "x": 0.2, "e": 0.25}, n=3,
+                   sp={"w": 0.55, "x": 0.2, "e": 0.25})
+    h = dr.health(dr.card_rows(rows, now=NOW), now=NOW)[P1]
+    assert h["sources_planned"]["e"] == pytest.approx(4 + 0.75, abs=0.06)    # 报表保留一位小数
+    assert h["sources_planned"]["w"] == pytest.approx(17 + 1.65, abs=0.06)

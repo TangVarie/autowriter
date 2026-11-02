@@ -389,7 +389,12 @@ def test_the_ledger_carries_each_batch_plan_for_the_report(monkeypatch):
     cards = drawreport.card_rows(w.client.rows["angle_ledger"], now=NOW)
     h = drawreport.health(cards, now=NOW)[PID]
     assert sum(h["sources"].values()) == 20
-    assert h["sources_planned"] == {k: round(20 * v, 1) for k, v in shares.items() if v > 0}
+    # 计划按每批实际排出来的槽位数(pk)记: 假 RPC 把主牌都留下了, 计划张数就等于实际落下来的张数; 和 n·份额差不过
+    # 取整那一点(复审 on aw#140)
+    assert {k: int(v) for k, v in h["sources_planned"].items()} == h["sources"]
+    for k, v in shares.items():
+        if v > 0:
+            assert abs(h["sources_planned"].get(k, 0) - 20 * v) <= 2
 
 
 def test_short_batches_say_so(monkeypatch):
