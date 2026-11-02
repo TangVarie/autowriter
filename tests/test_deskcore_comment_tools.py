@@ -151,13 +151,43 @@ def test_slightly_edited_text_still_matches_and_a_rewrite_sharing_a_sentence_doe
     edited = BODY_A.replace("涨了一千出头", "涨了一千多").replace("耳机里放着", "耳机里一直放着")
     rewrite = ("真正坚持下来是因为我把单词本换成了自己录的语音，这招是室友教我的。\n\n以前我总觉得背单词就得坐在书桌前，"
                "后来发现碎片时间反而记得牢，现在午饭排队的时候也会听两遍，想问问大家还有什么省时间的小办法？")
-    forms = core._text_forms(TITLE_A, BODY_A)
-    sim = lambda text: max(core._text_sim(a, b) for a in core._text_probe(text)[0] for b in forms)
+    sim = lambda text: core._text_score(core._text_probe(text)[0], TITLE_A, BODY_A)
     assert core.TEXT_MATCH_SIM <= sim(edited) < 1.0 and sim(rewrite) < 0.3
     c = _tv_client(notes=[_note("A")], comments=[_comment("A")])
     assert core.comments_for(c, user_id=ME, project_id=PROJ, post_body=edited)["note_id"] == "A"
     out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=rewrite)
     assert out["source"] == "pasted" and "note_id" not in out and out["existing_comments"] == []
+
+
+# 同标题的另一版: 正文差几处, 正文对正文 0.897(阈值就是按这个量的, 生产库同标题不同链接的两组是 0.893 / 0.897)
+SIBLING_A = BODY_A.replace("四十分钟", "半小时").replace("更有用的事", "更划算的事")
+
+
+def test_a_same_title_sibling_is_not_pushed_over_the_line_by_the_title():
+    """复审(on a3d12e6): 飞书正文格带着标题行贴过来, 原来比的是「标题 + 正文」对「标题 + 正文」, 同标题的另一版多出一截
+    共同的四字串, 0.897 被推到 0.907、认成这一篇, 把它的评论安了过来。现在标题行按笔记的标题剥掉, 只比正文。"""
+    form = lambda text: (core.fp.normalize(text), core.tvlink.grams(text))
+    assert core._text_sim(form(BODY_A), form(SIBLING_A)) < core.TEXT_MATCH_SIM
+    assert core._text_sim(form(TITLE_A + BODY_A), form(TITLE_A + SIBLING_A)) >= core.TEXT_MATCH_SIM, "带上标题会过线"
+    c = _tv_client(notes=[_note("Y", body=SIBLING_A)], comments=[_comment("Y", "另一版下面的评论")])
+    for pasted in (f"{TITLE_A}\n{BODY_A}\n\n{TAGS}", f"【标题】{TITLE_A}\n【正文】{BODY_A}", BODY_A):
+        out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=pasted)
+        assert out["source"] == "pasted" and "note_id" not in out and out["existing_comments"] == [], pasted[:20]
+    # 这一篇自己在 TV 里时照样认得出(两版都在: 取原文那条)
+    c = _tv_client(notes=[_note("Y", body=SIBLING_A, when="2026-10-28T16:00:00"), _note("A")],
+                   comments=[_comment("Y", "另一版下面的评论"), _comment("A")])
+    out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=f"{TITLE_A}\n{BODY_A}\n\n{TAGS}")
+    assert out["source"] == "tv_by_text" and out["note_id"] == "A"
+    assert [x["text"] for x in out["existing_comments"]] == ["自己录语音用的什么软件呀"]
+
+
+def test_a_body_that_itself_starts_with_the_title_is_not_trimmed():
+    """正文自己以标题开头的笔记(生产库 3295 篇里 14 篇): 不剥, 贴不贴标题行都认。"""
+    body = f"{TITLE_A}。{BODY_A}"
+    c = _tv_client(notes=[_note("A", body=body)], comments=[_comment("A")])
+    for pasted in (body, f"{TITLE_A}\n{body}\n{TAGS}"):
+        out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=pasted)
+        assert out["source"] == "tv_by_text" and out["note_id"] == "A", pasted[:20]
 
 
 def test_posts_that_only_share_a_slogan_are_not_matched():
@@ -197,12 +227,31 @@ def test_an_unmapped_desk_project_does_not_query_tv():
 
 
 def test_live_wins_over_vanished_then_the_closest_then_the_latest():
+    # 挪表: 同一条链接在 TV 里两行, 旧表那行已删
     old = _note(f"{TV}_old", when="2026-10-25T16:00:00")
-    live = _note(f"{TV}_new", when="2026-10-20T16:00:00")
+    live = {**_note(f"{TV}_new", when="2026-10-20T16:00:00"), "publish_url": old["publish_url"]}
     c = _tv_client(notes=[old, live], comments=[_comment(old["note_id"], "旧行的评论"), _comment(live["note_id"])])
     c._tv.rows["v_notes_vanished"] = [{"note_id": old["note_id"], "project_id": TV}]
     out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)
     assert out["note_id"] == live["note_id"] and "tv_note_vanished" not in out, "发布更晚的已删行让位给活的那行"
+    # 同一条链接里活的那行改过几个字(没那么像)也照样是它: 活的优先只看同一篇的几行
+    edited = {**live, "raw_content": live["raw_content"].replace("涨了一千出头", "涨了一千多")}
+    c = _tv_client(notes=[old, edited], comments=[_comment(old["note_id"], "旧行的评论"), _comment(live["note_id"])])
+    c._tv.rows["v_notes_vanished"] = [{"note_id": old["note_id"], "project_id": TV}]
+    out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)
+    assert out["note_id"] == live["note_id"] and "tv_note_vanished" not in out
+    # 复审(on a3d12e6): 别的帖子(链接不同)活着、只是够像, 不压过这篇只剩已删那行的原文
+    repost = _note("R", body=BODY_A.replace("涨了一千出头", "涨了一千多"), when="2026-10-28T16:00:00")
+    c = _tv_client(notes=[old, repost], comments=[_comment(old["note_id"], "旧行的评论"), _comment("R", "别的帖子")])
+    c._tv.rows["v_notes_vanished"] = [{"note_id": old["note_id"], "project_id": TV}]
+    out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)
+    assert out["note_id"] == old["note_id"] and out["tv_note_vanished"] is True
+    assert [x["text"] for x in out["existing_comments"]] == ["旧行的评论"]
+    # 两篇一样像(同一段文案发了两次)时还是活的优先, 哪怕已删那行发布得更晚
+    twin = _note("T", when="2026-10-21T16:00:00")
+    c = _tv_client(notes=[old, twin], comments=[])
+    c._tv.rows["v_notes_vanished"] = [{"note_id": old["note_id"], "project_id": TV}]
+    assert core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)["note_id"] == "T"
     # 只剩已删的那行: 照样用, 说清楚是旧记录(按正文对上的说法, 不说「链接」)
     c = _tv_client(notes=[old], comments=[_comment(old["note_id"], "旧行的评论")])
     c._tv.rows["v_notes_vanished"] = [{"note_id": old["note_id"], "project_id": TV}]
@@ -272,6 +321,18 @@ def test_a_link_not_found_with_a_pasted_body_falls_back_to_the_text():
     c = _tv_client(notes=[_note("A")], comments=[_comment("A")])
     out = core.comments_for(c, user_id=ME, link=LINK, project_id=PROJ, post_body=BODY_A)
     assert out["source"] == "tv_by_text" and out["note_id"] == "A" and len(out["existing_comments"]) == 1
+
+
+def test_the_by_text_note_does_not_send_the_model_round_in_circles():
+    """复审(on a3d12e6): 链接在 TV 里没找到、改贴正文对上了别的帖子, 原来那句话叫模型「要发布链接再调一次」—— 带着同一条
+    链接再调还是走贴正文这条路、对上同一篇。现在说的是用户说不是这一篇就别用这份评论, 照贴来的正文写。"""
+    note = core.TV_BY_TEXT_NOTE
+    assert "用户说不是这一篇" in note and "别用 existing_comments / note_id" in note and "照贴来的正文写" in note
+    assert "链接再调" not in note and "给发布链接" not in note
+    c = _tv_client(notes=[_note("A")], comments=[_comment("A")])
+    first = core.comments_for(c, user_id=ME, link=LINK, project_id=PROJ, post_body=BODY_A)
+    assert first["tv_by_text_note"] == note
+    assert "不是这一篇" in tools.comments_for.__doc__ and "existing_comments" in tools.comments_for.__doc__
 
 
 def test_the_link_path_does_not_look_the_text_up():

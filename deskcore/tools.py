@@ -650,7 +650,8 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
 
     返回:
       · post —— 要接的帖子(标题 + 正文)
-      · source —— ``tv``(按链接找到)/ ``tv_by_text``(按贴来的正文对上, 带一句 ``tv_by_text_note``)/ ``pasted``
+      · source —— ``tv``(按链接找到)/ ``tv_by_text``(按贴来的正文对上, 带一句 ``tv_by_text_note``; 用户说不是这一篇
+        就别用它的 ``existing_comments``, 照贴来的正文写)/ ``pasted``
       · existing_comments —— 帖子下已有的评论(TV 里找到了才有): 别重复里面已经问过的事
       · comment_rules —— 本项目管评论的规则(「评论区：」开头的), 必须守
       · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守

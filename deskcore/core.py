@@ -2707,16 +2707,21 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tu
 # TV, existing_comments 永远是空的, 模型照样会写出和已有评论重复的问题。现在只在这个写作台项目对着的 TV 项目
 # (tv_project_map)里找一次: 挑正文里两段最长的连续文字(store.TV_TEXT_RUN_CHARS, 截 16 字)逐段粗筛, 每段一次查询、一页
 # 30 条, 再在 Python 里按全文比 —— 去标点、剥话题之后的四字串, 交集占**较大那一边**的比例 ≥ TEXT_MATCH_SIM(两个方向的
-# 包含度都够、长度也差不多)才算同一篇; 标题行贴没贴都认(笔记那边按「正文」和「标题 + 正文」各比一次)。
+# 包含度都够、长度也差不多)才算同一篇。只比正文对正文(_text_score): 贴来的整格开头就是这条笔记的标题时先剥掉再比。
 #
 # 阈值 0.90 的依据(11-02 查生产库 truth_vault.notes 全部 19 个项目, 同项目两两比, 正文去标点后不完全相同的 52.8 万对):
 #   · 链接不同的两篇里到 0.90 的只有 2 对(0.951 / 0.937), 都是同一段文案隔几天又发了一次; 紧挨着的 7 对在 0.875 ~ 0.897:
 #     同标题同开头的另一版、同一个故事写了两三版、一篇整段包含另一篇再加一句 —— 阈值放到 0.85 就会把它们认成同一篇;
 #   · 同一条链接的两行(挪表 / 改过的旧行)9 对里 4 对 ≥ 0.90、3 对 0.80 ~ 0.90、2 对不到 0.6 —— 改得多的认不出, 只是退回贴正文;
 #   · 共用的品牌话术、一整行话题撞不到这个数: 话题先剥掉, 一句话术三十来字, 占不到一篇两三百字的帖子的一成半。
+# 这些数都是正文对正文量的, 所以标题不能进分(复审 on a3d12e6): 原来笔记那边还拿「标题 + 正文」比, 贴来的整格带着标题行时
+# 比的就成了标题 + 正文对标题 + 正文, 同标题的另一版多出十来个共同的四字串 —— RIO 的两组同标题不同链接的帖子正文 0.893 /
+# 0.897, 带上标题是 0.905 / 0.902, 过了线。现在笔记正文自己不以标题开头、贴来的却以它开头, 那一截就是标题行, 剥掉再比;
+# 11-02 再查: 映射的 10 个 TV 项目 3295 篇带标题的里正文以自己标题开头的只有 14 篇(这种不剥, 贴来的照原样比)。
 # 宁可认不出(和原来一样照贴来的正文写), 不把别的帖子的评论安到这篇头上。正文完全一样的两行生产库有 261 对: 153 对是同一条
-# 链接(挪表留下的旧行等, 活的那行优先), 69 对链接不同(同一段文案发了两次)分不出是哪一篇 —— 活的优先、再取最像的、再取
-# 发布最近的, 和按链接找的口径一样, 回包里说清楚是按正文对上的。
+# 链接(挪表留下的旧行等, 活的那行优先), 69 对链接不同(同一段文案发了两次)分不出是哪一篇。几条都过线时先按帖子(发布链接)
+# 比谁更像; 活的优先只在同一条链接的几行之间(同 _note_from_link) —— 别的帖子活着不该压过这篇只剩已删那行的原文(复审 on
+# a3d12e6); 一样像的再看活不活、再取发布最近的。回包里说清楚是按正文对上的。
 # 尽力而为: 查库出错只记日志, 照原来走贴正文那条路, 不抛、不拦写评论。score_comments 不走这一步: 它只用标题正文判,
 # 而且查帖子算在 ~22 秒的判定截止里, 多两次查询换不来什么。
 TV_BY_TEXT_FLAG = "_by_text"
@@ -2724,18 +2729,17 @@ TEXT_MATCH_SIM = 0.90
 TEXT_MATCH_MIN_CHARS = 20          # 去标点后不到这么多字不查(同 tvlink.MIN_PREFIX: 太短的到处撞)
 TEXT_MATCH_TRIES = 2               # 最多粗筛两段; 没对上就当没找到, 不往下翻
 _TEXT_RUN_RE = re.compile(f"[{store.TV_TEXT_RUN_CHARS}]{{{store.TV_TEXT_RUN_MIN},}}")
+# 复审(on a3d12e6): 原来说「用户说不是这一篇, 请用户给发布链接再调一次」—— 链接在 TV 里没找到时带链接再调还是走这条路、
+# 对上同一篇, 绕圈。现在让模型别用这份评论, 照贴来的正文写
 TV_BY_TEXT_NOTE = ("帖子是按贴来的正文在 TV 里对上的(没有链接, 或链接在 TV 里没找到); 同一段正文发过不止一条时取最近发布的那条。"
-                   "用户说不是这一篇, 请用户给发布链接再调一次。")
+                   "用户说不是这一篇: 别用 existing_comments / note_id, 照贴来的正文写, 不用再调。")
 TV_VANISHED_BY_TEXT_NOTE = "按正文对上的这条在 TV 里只剩飞书里已删 / 挪去别的表的旧记录, 已有评论停在它消失前。"
 
 
-def _text_forms(title: str, body: str) -> list[tuple[str, set[str]]]:
-    """一篇帖子拿去比的样子: 去标点、剥话题之后的「正文」和「标题 + 正文」, 各带四字串。正文是空的不比。"""
-    norm_body = fp.normalize(tvlink.strip_hashtags(body))
-    if not norm_body:
-        return []
-    forms = [norm_body] + ([fp.normalize(title) + norm_body] if fp.normalize(title) else [])
-    return [(f, tvlink.grams(f)) for f in dict.fromkeys(forms)]
+def _text_form(text: str) -> tuple[str, set[str]]:
+    """拿去比的样子: 去标点、剥话题之后的串, 带四字串。"""
+    norm = fp.normalize(tvlink.strip_hashtags(text))
+    return norm, tvlink.grams(norm)
 
 
 def _text_sim(a: tuple[str, set[str]], b: tuple[str, set[str]]) -> float:
@@ -2747,19 +2751,39 @@ def _text_sim(a: tuple[str, set[str]], b: tuple[str, set[str]]) -> float:
     return len(a[1] & b[1]) / max(len(a[1]), len(b[1]))
 
 
-def _text_probe(text: str) -> tuple[list[tuple[str, set[str]]], list[str]] | None:
-    """贴来的正文 → ``(拿去比的样子, 拿去粗筛的几段)``; 太短、或没有一段够长的连续文字时回 None(不查)。
+def _text_score(pasted: tuple[str, set[str]], title: str, body: str) -> float:
+    """贴来的正文 vs 一条笔记的(标题, 正文): 只比正文对正文, 阈值是按这个量的。
 
-    带「【标题】…【正文】…」标记的按标记拆开(同 TV 的 raw_content); 不带的整段当正文, 第一行是标题也没关系 ——
-    笔记那边「标题 + 正文」那个样子会对上。粗筛的段从剥了话题的正文里挑最长的两段(一样长取靠前的), 截前 16 字。"""
-    title, body = tvlink.parse_raw(text)
-    body = tvlink.strip_hashtags(body)
-    forms = [f for f in _text_forms(title, body) if len(f[0]) >= TEXT_MATCH_MIN_CHARS]
+    贴来的开头就是笔记的标题、笔记正文自己又不以标题开头时, 那一截是飞书正文格里的标题行, 剥掉再比; 标题不进分 ——
+    同标题的另一版带上标题会多出一截共同的四字串, 把 0.89 推过 0.90。标题对不上的就照原样比(多出来的字只会压低分)。"""
+    note = _text_form(body)
+    if not note[0]:
+        return 0.0
+    head = fp.normalize(title)
+    if head and pasted[0].startswith(head) and not note[0].startswith(head):
+        rest = pasted[0][len(head):]
+        pasted = (rest, tvlink.grams(rest))
+    return _text_sim(pasted, note)
+
+
+def _text_probe(text: str) -> tuple[tuple[str, set[str]], list[str]] | None:
+    """贴来的正文 → ``(拿去比的正文, 拿去粗筛的几段)``; 太短、或没有一段够长的连续文字时回 None(不查)。
+
+    带「【标题】…【正文】…」标记的按标记拆开、只留正文(同 TV 的 raw_content); 不带的整段当正文, 第一行是标题也没关系 ——
+    _text_score 按笔记的标题剥掉。粗筛的段从剥了话题的正文里挑最长的两段(一样长取靠前的), 截前 16 字。"""
+    body = tvlink.strip_hashtags(tvlink.parse_raw(text)[1])
+    form = _text_form(body)
     runs = list(dict.fromkeys(r[:store.TV_TEXT_RUN_MAX]
                               for r in sorted(_TEXT_RUN_RE.findall(body), key=len, reverse=True)))
-    if not forms or not runs:
+    if len(form[0]) < TEXT_MATCH_MIN_CHARS or not runs:
         return None
-    return forms, runs[:TEXT_MATCH_TRIES]
+    return form, runs[:TEXT_MATCH_TRIES]
+
+
+def _tv_post_key(row: dict) -> str:
+    """同一篇帖子的几行(挪表留下的旧行等)认发布链接; 没有链接的各算各的。"""
+    key = tvlink.link_key(row.get("publish_url"))
+    return key[0] if key else (str(row.get("publish_url") or "").strip() or f"note:{row.get('note_id')}")
 
 
 def _note_from_text(client, project_id: str, post_body: str) -> dict | None:
@@ -2771,7 +2795,7 @@ def _note_from_text(client, project_id: str, post_body: str) -> dict | None:
         probe = _text_probe(post_body)
         if probe is None:
             return None
-        forms, runs = probe
+        pasted, runs = probe
         tv_ids = sorted({str(r["tv_project_id"]) for r in store.tv_projects_of(client, project_id)
                          if r.get("tv_project_id")})
         if not tv_ids:
@@ -2781,7 +2805,7 @@ def _note_from_text(client, project_id: str, post_body: str) -> dict | None:
             for row in store.tv_notes_by_text_run(client, run, tv_ids):
                 if str(row.get("project_id") or "") not in tv_ids or not row.get("note_id"):
                     continue
-                score = max((_text_sim(a, b) for a in forms for b in _text_forms(*_tv_post_text(row))), default=0.0)
+                score = _text_score(pasted, *_tv_post_text(row))
                 if score >= TEXT_MATCH_SIM:
                     hits.append((score, row))
             if hits:
@@ -2793,9 +2817,14 @@ def _note_from_text(client, project_id: str, post_body: str) -> dict | None:
         except Exception:                               # noqa: BLE001 — 同 _note_from_link: 视图读不到就照旧取
             logger.exception("comments_for: 按正文找帖时查 v_notes_vanished 失败, 按相似度和发布时间取")
             gone = set()
-        # 活的优先(同 _note_from_link), 再取最像的(同一段文案改了几个字又发一次时, 贴来的是哪一版就是哪一版), 再取发布最近的
-        hits.sort(key=lambda h: (str(h[1]["note_id"]) not in gone, h[0], str(h[1].get("publish_time") or "")),
-                  reverse=True)
+        # 先按帖子比谁更像(同一段文案改了几个字又发一次时, 贴来的是哪一版就是哪一版; 别的帖子活着也不压过这篇的原文),
+        # 同一条链接的几行里活的优先(同 _note_from_link), 再取更像的, 再取发布最近的
+        best: dict[str, float] = {}
+        for score, row in hits:
+            key = _tv_post_key(row)
+            best[key] = max(best.get(key, 0.0), score)
+        hits.sort(key=lambda h: (best[_tv_post_key(h[1])], str(h[1]["note_id"]) not in gone, h[0],
+                                 str(h[1].get("publish_time") or "")), reverse=True)
         row = hits[0][1]
         note = {**row, TV_BY_TEXT_FLAG: True}
         if str(row["note_id"]) in gone:
