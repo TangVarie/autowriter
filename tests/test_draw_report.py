@@ -111,13 +111,54 @@ def test_mantel_haenszel_by_project():
     assert mh["rd_mh"] == pytest.approx(0.25) and mh["rr_mh"] == pytest.approx(2.0)
 
 
-def test_ipw_reweights_to_the_explore_distribution():
-    """w 牌 p 大 pu 小(策略偏爱的格子), x 牌 p = pu: IPW 估计把 w 的权重压下去, 落在 x 一侧。"""
+def test_uniform_estimate_is_the_explore_card_rate():
+    """配额内均匀乱抽只用试新牌估(review round 2 on aw#140): w 牌(策略偏爱的格子, p 大 pu 小)不再按 pu / p 并进来,
+    估计就是 x 牌的比例; observed 仍是 w + x 实际的比例。"""
     rows = [_card(i, src="w", p=0.04, pu=0.01, consumed_after=1) for i in range(1, 9)]
-    rows += [_card(i, src="x", p=0.01, pu=0.01) for i in range(9, 13)]
+    rows += [_card(i, src="x", p=0.01, pu=0.01, consumed_after=1 if i == 9 else None) for i in range(9, 13)]
     est = dr.ipw_uniform(dr.card_rows(rows, now=NOW), "m1")
-    assert est["cards"] == 12 and est["observed"] == pytest.approx(8 / 12, abs=1e-3)
-    assert est["estimate"] == pytest.approx(2 / 6, abs=1e-3)
+    assert est["explore_cards"] == 4 and est["estimate"] == pytest.approx(1 / 4, abs=1e-4)
+    assert est["observed_cards"] == 12 and est["observed"] == pytest.approx(9 / 12, abs=1e-3)
+    assert dr.ipw_uniform(dr.card_rows(rows[:8], now=NOW), "m1")["estimate"] is None, "没有试新牌就没有估计"
+
+
+def test_uniform_estimate_uses_explore_cards_only_when_the_weighted_arm_cannot_reach_a_cell():
+    """review round 2 on aw#140: 一批里「疑问句」到了标题封顶, w 槽在它的格子上 p = 0, 试新分布却还有 pu > 0(试新牌不设
+    标题封顶) —— 这一类格子只有 x 牌代表。原来 w 牌按 pu / p 加权和 x 牌并在一起估「配额内均匀乱抽」, w 牌只摊薄它们:
+    占均匀分布 11.4% 的「疑问句」被估成 2.5% 上下。现在只用 x 牌(它们就是这个策略的直接样本), w 牌一张都不进估计。
+    指标 m1 这里就记「这一张是不是疑问句」, 所以真值 = 试新分布在疑问句上的质量。"""
+    import random
+
+    from deskcore import drawpolicy as dp, priors
+    prof = priors.uniform_profile("fx")
+    prof.update(stage="run", n_res=200, ps="live")
+    st = dp.ledger_state([], NOW)
+    f, capped = "提问求助", "疑问句"
+    batch = [("愤怒撬动", "健康焦虑", f, capped), ("焦虑撬动", "经济焦虑", f, capped)]     # 非试新的两张: 到封顶
+    w = dp.slot_distribution(prof, st, {"f": f, "src": "w"}, batch_cells=batch, n=10, n_nonx=8)
+    x = dp.slot_distribution(prof, st, {"f": f, "src": "x"}, batch_cells=batch, n=10, n_nonx=8)
+    truth = sum(pu for c, (_p, pu) in x.items() if c[3] == capped)
+    assert truth == pytest.approx(0.114, abs=0.001)
+    assert all(p == 0 and pu > 0 for c, (p, pu) in w.items() if c[3] == capped), "w 抽不到, 试新抽得到"
+    rng = random.Random(20261102)
+    rows = []
+    for src, dist, n in (("w", w, 2000), ("x", x, 500)):           # 份额 0.8 / 0.2
+        cells = [c for c, (p, _pu) in dist.items() if p > 0]
+        for c in rng.choices(cells, weights=[dist[c][0] for c in cells], k=n):
+            r = _card(len(rows) + 1, src=src, p=dist[c][0], pu=dist[c][1],
+                      consumed_after=1 if c[3] == capped else None)
+            r["dims"].update(dict(zip(dp.DIMS4, c)))
+            rows.append(r)
+    cards = dr.card_rows(rows, now=NOW)
+    est = dr.ipw_uniform(cards, "m1")
+    assert est["estimate"] == pytest.approx(truth, abs=0.03), est
+    assert est["explore_cards"] == 500 and est["observed_cards"] == 2500
+    # w 牌不进估计: 把 w 牌的结果全翻过来, 估计一个字不变
+    for c in cards:
+        if c["src"] == "w":
+            c["m1"] = 1 - c["m1"]
+    assert dr.ipw_uniform(cards, "m1")["estimate"] == est["estimate"]
+    assert "试新牌 500 张" in dr.format_report(dr.report(rows, now=NOW))
 
 
 def test_x_only_lever_lift_uses_explore_cards_only():

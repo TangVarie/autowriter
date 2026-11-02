@@ -278,6 +278,15 @@ def _angle_v2_samples() -> dict[str, str]:
             {"kind": "repeat", "of": "0" * 20}]
     cards = [dict(base, slot=i + 1, **({"reference": r} if r else {})) for i, r in enumerate(refs)]
     _p, pin_err = drawpolicy.normalize_pin({"标题句式": "反问句"}, prof)
+    # repeat_of 点了一张还没用掉的牌(review round 2 on aw#140): 台账里这个 key 还挂着一行没销账的
+    from deskcore.fingerprint import angle_key
+    from tests.fakes import FakeClient
+    open_key = angle_key(dims)
+    open_ledger = FakeClient(rows={"angle_ledger": [{
+        "id": "l1", "project_id": "p", "angle_key": open_key, "dims": dict(dims), "drawn_by": "u",
+        "drawn_at": "2026-11-01T00:00:00+00:00", "consumed_version_id": None, "consumed_at": None}]})
+    _items, not_used_yet = core._repeat_items(open_ledger, "p", [open_key], 3)
+    assert not_used_yet and not_used_yet["error"] == "repeat_of_invalid" and open_key in not_used_yet["message"]
     return {
         "core.render_angles_block(sample)": core.render_angles_block(cards, status=project_now.status_line(prof)),
         "project_now.status_line(run)": project_now.status_line(prof),
@@ -291,6 +300,7 @@ def _angle_v2_samples() -> dict[str, str]:
         "core._repeat_items(not_ours).message": core._repeat_items(None, "p", ["0" * 20], 3)[1]["message"],
         "core._repeat_items(too_many).message": core._repeat_items(None, "p", [f"{i:020x}" for i in range(4)], 5)[1][
             "message"],
+        "core._repeat_items(not_used_yet).message": not_used_yet["message"],
     }
 
 

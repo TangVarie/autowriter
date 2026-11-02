@@ -12,9 +12,12 @@
      截 [0.6, 1.6]; 两者相乘)要 ≥ 0.60。不到就 β = 0.5 再跑; 还低于 0.58 就 β = 0(只按配比发)。
 另外打印 rank 信号(评论数中位秩代替 0/1)的同一个打分, 只有它比 binary 高出 0.02 才值得换。
 
-输入是「格」: ``{项目: [{bucket: train|gap|test, content_format, emotional_lever, q: Q|NQ|None, y, n, r}]}``,
-n 是这一格的篇数、r 是中位秩之和。线上从 ①② 读出来的笔记用 ``cells_from_notes`` 转; 离线用导出的聚合
-(scripts/sql/angle_priors_export.sql 第一段, scripts/build_angle_priors.parse_cells)。
+输入是「格」: ``{项目: [{bucket: train|gap|test, content_format, emotional_lever, q: Q|NQ|None, y, n, r, rt}]}``,
+n 是这一格的篇数、r 是中位秩之和(在这个项目【全部】合格笔记的同一内容形式里排, 当别的项目的全局 / 品牌层时用)、
+rt 是训练格只在【训练窗口】(前 10 天)里排的中位秩之和(目标项目自己的训练标签只用它; 别的桶记 0)。训练格要是也用
+r, 测试期一篇的评论数一变, 训练格的秩就跟着变 —— rank 对 binary 的比较等于偷看了答案(review round 2 on aw#140)。
+没有 rt 的格子(老导出)rank 变体退回 binary, 不拿 r 凑。线上从 ①② 读出来的笔记用 ``cells_from_notes`` 转; 离线用导出的
+聚合(scripts/sql/angle_priors_export.sql 第一段, scripts/build_angle_priors.parse_cells)。
 """
 
 from __future__ import annotations
@@ -33,9 +36,27 @@ def _bj_date(t: datetime):
     return (t + timedelta(hours=8)).date()
 
 
+def _format_ranks(elig, idxs) -> dict[int, float]:
+    """elig 里 idxs 这几篇各自的中位秩: 只在 idxs 之内、按内容形式分组排(同 priors.build_global 的口径)。"""
+    groups: dict[str, list[int]] = {}
+    for i in idxs:
+        groups.setdefault(priors._valid("content_format", elig[i][0].get("content_format")) or "", []).append(i)
+    ranks: dict[int, float] = {}
+    for g in groups.values():
+        vals = [float(elig[i][0].get("comments_count") or 0) for i in g]
+        for i, rk in zip(g, priors._mid_ranks(vals)):
+            ranks[i] = rk
+    return ranks
+
+
+def _bucket(day: int) -> str:
+    return "train" if day < TRAIN_DAYS else "test" if day >= TEST_FROM_DAY else "gap"
+
+
 def cells_from_notes(notes, title_answers, *, now: datetime | None = None,
                      params: dict = priors.PARAMS) -> tuple[dict, dict]:
-    """①(全库笔记) + ②(title_is_question 答案) → (格, 每个项目的 (第一篇, 最后一篇) 日期)。一篇一格。"""
+    """①(全库笔记) + ②(title_is_question 答案) → (格, 每个项目的 (第一篇, 最后一篇) 日期)。一篇一格。
+    r: 在全部合格笔记里排的秩; rt: 训练格只和训练窗口里的笔记排的秩(见模块说明)。"""
     now = now or priors._utcnow()
     answers = title_answers or {}
     by_p: dict[str, list[dict]] = {}
@@ -54,33 +75,32 @@ def cells_from_notes(notes, title_answers, *, now: datetime | None = None,
             y = priors.label(r, has_cc=has_cc, now=now, params=params)
             if y is not None:
                 elig.append((r, t, y))
+        buckets = [_bucket((_bj_date(t) - d0).days) for _r, t, _y in elig]
         ranks: dict[int, float] = {}
+        train_ranks: dict[int, float] = {}
         if has_cc:
-            groups: dict[str, list[int]] = {}
-            for i, (r, _t, _y) in enumerate(elig):
-                groups.setdefault(priors._valid("content_format", r.get("content_format")) or "", []).append(i)
-            for idxs in groups.values():
-                vals = [float(elig[i][0].get("comments_count") or 0) for i in idxs]
-                for i, rk in zip(idxs, priors._mid_ranks(vals)):
-                    ranks[i] = rk
+            ranks = _format_ranks(elig, range(len(elig)))
+            train_ranks = _format_ranks(elig, [i for i, b in enumerate(buckets) if b == "train"])
         out = []
-        for i, (r, t, y) in enumerate(elig):
-            day = (_bj_date(t) - d0).days
-            out.append({"bucket": "train" if day < TRAIN_DAYS else "test" if day >= TEST_FROM_DAY else "gap",
+        for i, (r, _t, y) in enumerate(elig):
+            out.append({"bucket": buckets[i],
                         "content_format": r.get("content_format"), "emotional_lever": r.get("emotional_lever"),
                         "q": priors._qclass(answers.get(str(r.get("note_id")))), "y": y, "n": 1,
-                        "r": ranks.get(i, 0.0)})
+                        "r": ranks.get(i, 0.0), "rt": train_ranks.get(i, 0.0)})
         cells[pid] = out
     return cells, spans
 
 
-def _label(cells) -> dict | None:
+def _label(cells, rank_key: str = "r") -> dict | None:
+    """格 → 标签表。rank_key: 秩取哪一列 —— 当全局 / 品牌层用 "r"(全部数据), 目标项目自己的训练标签用 "rt"
+    (只在训练窗口里排的; 没有这一列就是 0, rk 记 false, rank 信号退回 binary)。"""
     lbl = None
     for c in cells:
         lbl = lbl or priors._new_label()
+        rank = float(c.get(rank_key) or 0.0)
         priors.label_add(lbl, fmt=c.get("content_format"), lever=c.get("emotional_lever"), qclass=c.get("q"),
-                         y=int(c["y"]), rank=float(c.get("r") or 0.0), n=int(c.get("n") or 1))
-        if float(c.get("r") or 0.0) > 0:
+                         y=int(c["y"]), rank=rank, n=int(c.get("n") or 1))
+        if rank > 0:
             lbl["rk"] = True
     return lbl
 
@@ -211,7 +231,8 @@ def backtest(cells: dict, spans: dict | None = None, *, params: dict = priors.PA
         for T in tg:
             train = [c for c in cells[T] if c["bucket"] == "train"]
             test = [c for c in cells[T] if c["bucket"] == "test"]
-            by[T] = auc(fn(T, _label(train), test))
+            # 目标项目的训练标签只用训练窗口里排的秩(rt): 测试期的评论数不能漏进训练格(review round 2 on aw#140)
+            by[T] = auc(fn(T, _label(train, rank_key="rt"), test))
         m = _mean(by.values())
         models[name] = {"mean_auc": None if m is None else round(m, 4),
                         "by_project": {k: (None if v is None else round(v, 4)) for k, v in by.items()}}

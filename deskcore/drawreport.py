@@ -14,8 +14,9 @@
   M6 爆      tier 爆 / 大爆 的篇数                                                  按月
 
 比较(§5.2): w 对 x(盲、批内随机)是主比较, Mantel–Haenszel 按项目分层的风险差和风险比; e / h 对 w 是次要比较(参考行
-本身就是处理的一部分, 不盲)。IPW: 用 _draw 里的 p / pu 估「配额内均匀乱抽」会写出 / 发出多少。x-only 杠杆提升: 只用
-试新牌(不受策略本身的偏向影响)重估各杠杆的 M1 / M2。pin / rep(写手点名的)不进比较, 单独计数(D3)。
+本身就是处理的一部分, 不盲)。配额内均匀乱抽(ipw_uniform): 只用试新牌估它会写出 / 发出多少 —— 试新牌就是这个策略的
+直接样本; w 牌不并进来(w 抽不到的格子试新抽得到, 并进来会偏, 见 ipw_uniform)。x-only 杠杆提升: 只用试新牌(不受策略
+本身的偏向影响)重估各杠杆的 M1 / M2。pin / rep(写手点名的)不进比较, 单独计数(D3)。
 
 健康(§5.3 末): 配额外比例、各维度实际 vs 目标、30 天里不同 key ÷ 牌数、14 天里最大杠杆份额、来源实际 vs 计划、
 fb 比例、写手点名比例。
@@ -166,24 +167,20 @@ def mantel_haenszel(cards, treat: str, ctrl: str, m: str) -> dict:
 
 
 def ipw_uniform(cards, m: str) -> dict:
-    """用 p / pu 估「配额内均匀乱抽」的指标 m(自归一化 IPW, 只用 w / x 牌)。权重 = pu / p。"""
-    num = den = 0.0
-    n = 0
-    for c in cards:
-        if c["src"] not in ("w", "x") or c.get(m) is None:
-            continue
-        try:
-            p, pu = float(c.get("p") or 0.0), float(c.get("pu") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if p <= 0:
-            continue
-        w = pu / p
-        num += w * c[m]
-        den += w
-        n += 1
-    return {"metric": m, "cards": n, "estimate": round(num / den, 4) if den else None,
-            "observed": _rate([c for c in cards if c["src"] in ("w", "x")], m)["rate"]}
+    """「配额内均匀乱抽」的指标 m: 每个槽位的内容形式照项目配额, (杠杆, 原型, 标题) 在这个槽位过得了跨批次去重和一批之内
+    约束的格子里按 D·B 抽 —— 也就是试新牌(x)自己的抽法。只用试新牌估, 估计 = 能读到 m 的试新牌里 m 的比例; 它们就是这个
+    策略的直接样本(x 牌的 p 和 pu 是同一个分布, 要加权的话每张都是 1)。
+
+    名字沿用原来的 IPW。原来把 w 牌按 pu / p 加权和 x 牌并在一起估, 有偏(review round 2 on aw#140): 有的格子 w 抽不到
+    (p = 0, 比如这一批某个标题句式到了封顶)、试新分布却抽得到(pu > 0, 试新不设标题封顶), 这些格子只有 x 牌代表, 并进来的
+    w 牌只把它们摊薄 —— 一个占均匀分布 11.4% 的标题句式会被估成 2.5% 上下。所以 w 牌一张都不进这个估计。
+
+    回 {metric, estimate, explore_cards(进估计的试新牌张数), observed(w + x 实际的比例, 对照用), observed_cards}。
+    试新牌只占两成, 张数少的时候估计很粗, 看 explore_cards。"""
+    xs = [c[m] for c in cards if c["src"] == "x" and c.get(m) is not None]
+    seen = _rate([c for c in cards if c["src"] in ("w", "x")], m)
+    return {"metric": m, "estimate": round(sum(xs) / len(xs), 4) if xs else None, "explore_cards": len(xs),
+            "observed": seen["rate"], "observed_cards": seen["n"]}
 
 
 def x_only_lever_lift(cards, m: str) -> dict:
@@ -300,7 +297,8 @@ def format_report(rep: dict) -> str:
             lines.append(f"  {c['treat']} vs {c['ctrl']} {c['metric']}: 风险差 {c['rd_mh']} · 风险比 {c['rr_mh']} "
                          f"({c['y_treat']}/{c['n_treat']} vs {c['y_ctrl']}/{c['n_ctrl']}, {c['strata']} 个项目)")
     for r in rep["ipw_uniform"]:
-        lines.append(f"  IPW 配额内均匀乱抽 {r['metric']}: {r['estimate']} (实际 {r['observed']}, {r['cards']} 张)")
+        lines.append(f"  配额内均匀乱抽 {r['metric']}: {r['estimate']} (只用试新牌 {r['explore_cards']} 张; "
+                     f"w + x 实际 {r['observed']}, {r['observed_cards']} 张)")
     lines.append("健康:")
     for proj, h in rep["health"].items():
         lines.append(f"  {proj}: 配额外 {h['off_quota_share']} · 不同 key/牌 {h['distinct_keys_per_card_30d']} · "

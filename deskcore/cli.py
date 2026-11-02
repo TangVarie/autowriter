@@ -31,7 +31,7 @@
                                                       TV 项目号 / --profile 不连库(用 vendored 快照 / 给的 Profile)
   python -m deskcore.cli draw-report --days 28 [--project <uuid>] [--json]
                                                     ← 发牌 v2 的读数(只读): 来源 × 项目 × 周的 M1/M2/M3/D1/M5/M6、
-                                                      MH 比较、IPW、只用试新牌的杠杆提升、健康指标
+                                                      MH 比较、配额内均匀乱抽和杠杆提升(都只用试新牌)、健康指标
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
                                                     ← TV 的笔记按内容对到写作台的版本,
                                                       对不上的补进指纹库(每天跑一次); --all 跑完

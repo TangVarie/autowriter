@@ -42,8 +42,9 @@ def _idx(values, i):
 
 
 def parse_cells(rows) -> dict[str, list[dict]]:
-    """标签格导出(angle_priors_export.sql 第一段) → {TV 项目: [{bucket, content_format, emotional_lever, q, y, n, r}]}。
-    每格是「阶段 × 形式 × 杠杆 × 问句与否 × 起量与否」的篇数 n 和中位秩之和 r; bucket 是项目开张后第几段
+    """标签格导出(angle_priors_export.sql 第一段) → {TV 项目: [{bucket, content_format, emotional_lever, q, y, n, r, rt}]}。
+    每格是「阶段 × 形式 × 杠杆 × 问句与否 × 起量与否」的篇数 n、中位秩之和 r(全部合格笔记里排; 快照用)和 rt(训练格
+    只在前 10 天里排, 别的格 0; 回测的训练标签用, 见 priors_backtest); bucket 是项目开张后第几段
     (0: 前 10 天, 1: 第 10–13 天, 2: 第 14 天起), 回测用。"""
     out: dict[str, list[dict]] = {}
     for r in rows:
@@ -52,16 +53,18 @@ def parse_cells(rows) -> dict[str, list[dict]]:
             if not c:
                 continue
             parts = c.split(",")
-            if len(parts) != 7:
-                # 少一段多半是导出里哪一列成了 NULL(concat_ws 会把它整个丢掉), 猜不出丢的是哪一列, 只能整份不认
+            if len(parts) != 8:
+                # 少一段多半是导出里哪一列成了 NULL(concat_ws 会把它整个丢掉), 猜不出丢的是哪一列, 只能整份不认。
+                # 7 段的也可能是旧版 SQL 导出的(没有 train_rank_sum): 一样不认, 用现在的 SQL 重导一次
                 raise ValueError(f"cells export: project {r.get('p')!r} has a cell with {len(parts)} fields, "
-                                 f"expected 7 (bucket,format,lever,question,y,n,rank_sum): {c!r}")
-            b, fi, li, qi, y, n, rs = parts
+                                 f"expected 8 (bucket,format,lever,question,y,n,rank_sum,train_rank_sum; "
+                                 f"re-export with scripts/sql/angle_priors_export.sql if it is an older export): {c!r}")
+            b, fi, li, qi, y, n, rs, rts = parts
             cells.append({"bucket": _TIERS.get(int(b), "test"),
                           "content_format": _idx(vocab.CONTENT_FORMATS, fi),
                           "emotional_lever": _idx(vocab.EMOTIONAL_LEVERS, li),
                           "q": {"1": priors.Q, "0": priors.NQ}.get(qi),
-                          "y": int(y), "n": int(n), "r": float(rs)})
+                          "y": int(y), "n": int(n), "r": float(rs), "rt": float(rts)})
         out[str(r["p"])] = cells
     return out
 

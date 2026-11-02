@@ -1111,6 +1111,28 @@ def ledger_dims_for(sb, project_id: str, key: str) -> dict | None:
     return public_dims(rows[0]["dims"])
 
 
+def ledger_repeat_source(sb, project_id: str, key: str) -> dict | None:
+    """``repeat_of``(§2.9)要知道的两样: ``{"dims": 本项目台账里 key 最近那一行的四个主维度(同 ledger_dims_for),
+    "open": 这个项目里这个 key 还有没有没销账的行(谁抽的都算)}``。
+
+    open 为什么要看(review round 2 on aw#140): 还挂着一张没用的时候再插一行, 存档时 ``consume_angle`` 销的是最早那一行
+    —— 销掉的是原来那张, 重写的那张一直挂着, 重写那篇的结果也记到原来那张的来源上。调用方见到 open 就不重发。
+
+    没有这一行、key 形状不对、任一次读失败都回 None(调用方当成「不能重发」, 报错、什么都不写); 不抛。"""
+    dims = ledger_dims_for(sb, project_id, key)
+    if dims is None:
+        return None
+    try:
+        open_rows = (sb.table("angle_ledger").select("id")
+                       .eq("project_id", project_id).eq("angle_key", str(key))
+                       .is_("consumed_version_id", "null").limit(1).execute()).data or []
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("ledger open-row lookup failed (project=%s, key=%s): %s", project_id, key,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    return {"dims": dims, "open": bool(open_rows)}
+
+
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────
 
 PAGE = 1000        # PostgREST 默认 max-rows, 见下方说明

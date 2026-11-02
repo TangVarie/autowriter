@@ -502,7 +502,7 @@ def test_snapshot_problems_flags_text_and_unknown_values():
 def test_export_label_is_never_null_and_short_cells_are_rejected():
     """标签格导出(review on aw#140): tier 是 NULL、评论 < 20 的笔记, 原来 y 那一列是 SQL 的 NULL(``NULL in (...)`` 是
     NULL, ``NULL or false`` 还是 NULL), 不是 priors.label 的 0 —— concat_ws 把 NULL 那一段整个丢掉, 格子只剩 6 段,
-    parse_cells 解包就炸。SQL 里 tier 那一条要 coalesce 成 false, 整个 y 也兜一层; 真来了 6 段的格子, parse_cells
+    parse_cells 解包就炸。SQL 里 tier 那一条要 coalesce 成 false, 整个 y 也兜一层; 真来了少一段的格子, parse_cells
     报出是哪个项目的哪一格, 不是一句「not enough values to unpack」。"""
     import re
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -516,10 +516,10 @@ def test_export_label_is_never_null_and_short_cells_are_rejected():
     y_expr = re.search(r"^\s*(.+?)\s+y,\s*$", cells_sql, re.M).group(1)
     assert "coalesce(n.tier in ('爆','大爆'), false)" in y_expr, y_expr
     assert y_expr.startswith("coalesce(") and y_expr.endswith(", false)::int"), y_expr
-    got = bap.parse_cells([{"p": "AAA_phase1", "c": "2,6,8,0,0,5,1.20;0,-1,-1,-1,1,1,0.50"}])
+    got = bap.parse_cells([{"p": "AAA_phase1", "c": "2,6,8,0,0,5,1.20,0;0,-1,-1,-1,1,1,0.50,0.50"}])
     assert [(c["y"], c["n"]) for c in got["AAA_phase1"]] == [(0, 5), (1, 1)]
-    with pytest.raises(ValueError, match=r"AAA_phase1.*2,6,8,0,5,1.20"):
-        bap.parse_cells([{"p": "AAA_phase1", "c": "2,6,8,0,5,1.20"}])
+    with pytest.raises(ValueError, match=r"AAA_phase1.*2,6,8,0,5,1.20,0"):
+        bap.parse_cells([{"p": "AAA_phase1", "c": "2,6,8,0,5,1.20,0"}])
 
 
 def test_build_script_from_export_matches_the_live_label_path(tmp_path):
@@ -528,7 +528,7 @@ def test_build_script_from_export_matches_the_live_label_path(tmp_path):
         import build_angle_priors as bap
     finally:
         sys.path.pop(0)
-    cells = [{"p": "AAA_phase1", "c": "0,6,3,1,1,2,1.80;2,6,8,0,0,5,1.20;2,-1,-1,-1,0,1,0.50"}]
+    cells = [{"p": "AAA_phase1", "c": "0,6,3,1,1,2,1.80,1.50;2,6,8,0,0,5,1.20,0;2,-1,-1,-1,0,1,0.50,0"}]
     mix = [{"p": "AAA_phase1", "c": "个护", "span": "2026-09-01/2026-10-20", "built": "2026-11-02 12:00:00+00",
             "m": "Af6:7.000;Al3:2.000;Al8:5.000;An:8.000;AqQ:2.000;AqN:5.000;Ba11:3.500;Bn:8.000"}]
     gt = bap.from_export(cells, mix)
@@ -718,6 +718,82 @@ def test_backtest_from_notes_buckets_by_beijing_day():
     assert spans["AAA_phase1"][0] < spans["AAA_phase1"][1]
 
 
+def _rank_backtest_inputs(monkeypatch, cells, spans, target):
+    """跑一遍回测, 记下目标项目在 rank 变体里拿到的训练标签和打出来的分(_shipped_scores 的入参和回值)。"""
+    seen = {}
+    real = bt._shipped_scores
+
+    def spy(T, train_lbl, full, test_cells, **kw):
+        out = real(T, train_lbl, full, test_cells, **kw)
+        if T == target and kw.get("signal") == "rank":
+            seen["train_label"] = json.loads(json.dumps(train_lbl))
+            seen["scores"] = list(out)
+        return out
+
+    with monkeypatch.context() as m:                    # 每跑一遍换回原函数, 不让上一遍的 spy 串进来
+        m.setattr(bt, "_shipped_scores", spy)
+        bt.backtest(cells, spans)
+    return seen
+
+
+def test_rank_signal_trains_only_on_the_training_window(monkeypatch):
+    """review round 2 on aw#140: rank 信号(评论数在 (项目, 形式) 里的中位秩)原来按项目【全部】合格笔记一起排, 再切
+    训练 / 间隔 / 测试 —— 测试期一篇的评论数一变, 训练格的秩跟着变, rank 对 binary 的比较偷看了答案。只改一篇测试期笔记
+    的评论数(起量与否不变): 目标项目训练格的秩、训练出来的打分都不能动。"""
+    def rows(test_comments):
+        out = []
+        for i, (lev, cc) in enumerate((("好奇驱动", 30), ("好奇驱动", 9), ("好奇驱动", 6), ("共鸣释放", 4),
+                                        ("共鸣释放", 2), ("共鸣释放", 1), ("好奇驱动", 3), ("共鸣释放", 0))):
+            out.append(note("AAA_phase1", age_days=40 - i, lever=lev, comments=cc))                 # 训练期: 前 10 天
+        for i, (lev, cc) in enumerate((("好奇驱动", 25), ("共鸣释放", 1), ("好奇驱动", 5), ("共鸣释放", 22),
+                                        ("好奇驱动", test_comments), ("共鸣释放", 3))):
+            out.append(note("AAA_phase1", age_days=20 - i, lever=lev, comments=cc))                 # 测试期
+        for i in range(12):
+            out.append(note("BBB_phase1", age_days=60 - i, lever=("好奇驱动", "共鸣释放")[i % 2],
+                            comments=(28, 2, 7, 1, 24, 0)[i % 6]))
+        return out
+
+    got = []
+    for test_comments in (1, 19):                       # 都 < 20: 这篇的 y 不变, 测试格一模一样
+        cells, spans = bt.cells_from_notes(rows(test_comments), {}, now=NOW)
+        assert [(c["bucket"], c["y"]) for c in cells["AAA_phase1"]][-6:] == [("test", y) for y in (1, 0, 0, 1, 0, 0)]
+        assert "AAA_phase1" in bt.targets(cells)
+        got.append(_rank_backtest_inputs(monkeypatch, cells, spans, "AAA_phase1"))
+    assert got[0]["train_label"]["rk"] is True
+    assert got[0]["train_label"] == got[1]["train_label"], "测试期的评论数漏进了训练格的秩"
+    assert got[0]["scores"] == got[1]["scores"], "测试期的评论数漏进了训练出来的打分"
+
+
+def test_offline_export_carries_the_training_window_rank(monkeypatch):
+    """离线那条路同样(review round 2 on aw#140): 导出每格多带一列「只在训练窗口里排的秩之和」, parse_cells 读成 rt,
+    回测拿它建目标项目的训练标签, 不拿全量排的 r。SQL 里训练窗口那一列只在 (项目, 形式, 是不是前 10 天) 里排;
+    格子少一段照旧整份不认。"""
+    import re
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    try:
+        import build_angle_priors as bap
+    finally:
+        sys.path.pop(0)
+    with open(os.path.join(ROOT, "scripts", "sql", "angle_priors_export.sql"), encoding="utf-8") as fh:
+        cells_sql = fh.read().split("-- 2) mix.json")[0]
+    assert re.search(r"partition by project_id, fi, dd < 10 order by cc", cells_sql), cells_sql
+    assert "concat_ws(',', dd, fi, li, qi, y, n, rs, rts)" in cells_sql
+    assert "round(coalesce(sum(rkt),0)::numeric, 2) rts" in cells_sql
+    # 训练格: 全量排的秩和(r)和只在训练窗口里排的(rt)不一样; 测试 / 间隔格的 rt 是 0
+    rows = [{"p": "AAA_phase1", "c": "0,6,10,-1,1,2,1.90,1.50;0,6,8,-1,0,2,0.40,0.50;2,6,10,-1,1,1,0.95,0;"
+                                     "2,6,8,-1,0,2,0.80,0;2,6,10,-1,0,1,0.30,0"},
+            {"p": "BBB_phase1", "c": "0,6,10,-1,1,3,2.40,2.40;0,6,8,-1,0,3,0.60,0.60;2,6,10,-1,1,2,1.70,0;"
+                                     "2,6,8,-1,0,4,1.30,0"}]
+    cells = bap.parse_cells(rows)
+    train = [c for c in cells["AAA_phase1"] if c["bucket"] == "train"]
+    assert [(c["r"], c["rt"]) for c in train] == [(1.9, 1.5), (0.4, 0.5)]
+    assert all(c["rt"] == 0 for c in cells["AAA_phase1"] if c["bucket"] != "train")
+    seen = _rank_backtest_inputs(monkeypatch, cells, None, "AAA_phase1")
+    assert seen["train_label"]["lev"]["提问求助"] == {"好奇驱动": [2, 2, 1.5], "共鸣释放": [2, 0, 0.5]}
+    with pytest.raises(ValueError, match=r"AAA_phase1.*expected 8"):
+        bap.parse_cells([{"p": "AAA_phase1", "c": "2,6,8,0,0,5,1.20"}])
+
+
 def test_cli_offline_backtest_runs_without_a_database(tmp_path, capsys):
     from deskcore import cli
     path = tmp_path / "cells.json"
@@ -728,7 +804,7 @@ def test_cli_offline_backtest_runs_without_a_database(tmp_path, capsys):
         for b in (0, 2):
             for li in (8, 10):
                 for y in (0, 1):
-                    toks.append(f"{b},6,{li},{rng.choice([0, 1])},{y},{rng.randint(1, 9) if y else 30},0")
+                    toks.append(f"{b},6,{li},{rng.choice([0, 1])},{y},{rng.randint(1, 9) if y else 30},0,0")
         rows.append({"p": p, "c": ";".join(toks)})
     path.write_text(json.dumps(rows), encoding="utf-8")
     rc = cli.main(["angle-prior", "--backtest", "--cells", str(path)])

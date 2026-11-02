@@ -783,6 +783,10 @@ DRAW_AVOID_MIN, DRAW_AVOID_MAX = 14, 90
 DRAW_PROFILE_BUDGET_S = 2.5
 REPEAT_MAX = dp.MAX_REPEAT
 DRAW_CLAMPED_NOTE = "一次最多发 {max} 篇的坐标, 这次按 {max} 篇发; 还要就写完这批再发一次。"
+# repeat_of 点的 key 还有一张没用掉的牌(review round 2 on aw#140): 不重发, 叫模型直接用原来那张卡
+REPEAT_NOT_USED_YET = ("「{key}」这张卡发出去之后还没用过(还没有稿子带着它存档), 不用重写一次: 直接照原来那张卡写, "
+                       "查重和存档时带原来那张卡的 angle_key「{key}」就行。这次还要别的角度的话, 把它从 repeat_of 里去掉"
+                       "再发一次。")
 
 
 def draw_policy() -> str:
@@ -814,7 +818,9 @@ def _draw_error(kind: str, message: str, n: int, **extra) -> dict:
 
 def _repeat_items(client, project_id: str, repeat_of, n: int) -> tuple[list, dict | None]:
     """repeat_of 校验(§2.9): 至多 3 个、不多于这次要的篇数 n(调用方传夹过之后的 n), 每个都必须是本项目台账里有的
-    angle_key。回 ([(key, 四个维度)], None) 或 ([], 错误)。只读台账, 不写。"""
+    angle_key, 而且这个项目里已经没有这个 key 没用掉的牌了(还挂着一张就报错, 叫模型直接用原来那张: 再插一行的话存档
+    销的是原来那张、重写的那张一直挂着, review round 2 on aw#140)。回 ([(key, 四个维度)], None) 或 ([], 错误)。
+    只读台账, 不写。"""
     if not repeat_of:
         return [], None
     keys = [repeat_of] if isinstance(repeat_of, str) else list(repeat_of)
@@ -830,11 +836,14 @@ def _repeat_items(client, project_id: str, repeat_of, n: int) -> tuple[list, dic
             f"少点几个, 或者把篇数加到 {len(keys)}。", n, max=n)
     items = []
     for k in keys:
-        dims = store.ledger_dims_for(client, project_id, k)
+        src = store.ledger_repeat_source(client, project_id, k)
+        dims = (src or {}).get("dims")
         if not dims or dp.cell_of(dims) is None or angle_key(dp.cell_dims(dp.cell_of(dims))) != k:
             return [], _draw_error(
                 "repeat_of_invalid",
                 f"「{k}」不是这个项目发过的坐标, 只能点名这个项目自己的 angle_key(原样抄, 不改)。", n, key=k)
+        if src.get("open"):
+            return [], _draw_error("repeat_of_invalid", REPEAT_NOT_USED_YET.format(key=k), n, key=k)
         items.append((k, dims))
     return items, None
 

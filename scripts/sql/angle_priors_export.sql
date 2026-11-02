@@ -3,11 +3,16 @@
 -- Both return aggregates only: no note ids, no titles, no text. Save each result's JSON rows to a file; do not
 -- commit the exports.
 --
--- 1) cells.json — label cells per TV project: "bucket,format,lever,question,y,n,rank_sum" joined by ";".
+-- 1) cells.json — label cells per TV project: "bucket,format,lever,question,y,n,rank_sum,train_rank_sum" joined by ";".
 --    Same label as deskcore.priors.label: published >= 3 days ago, not TGV_phase1, not synthetic / paid /
 --    铺评工单; projects with comments: comments not NULL, y = 爆/大爆 or comments >= 20; projects without: tier
 --    爆/大爆/趴 only. bucket = Beijing day since the project's first post: 0 (<10), 1 (10-13), 2 (>=14).
 --    Indices follow deskcore/vendor/controlled_vocab_v0_2.json (-1 = missing); question 1 = 是, 0 = 否.
+--    rank_sum ranks comments within (project, format) over all eligible notes (the snapshot and the global / brand
+--    layers use it); train_rank_sum ranks bucket-0 notes only among the project's own first 10 days (0 elsewhere):
+--    the backtest builds the target project's training label from it, so test-period comments never reach a
+--    training cell (deskcore.priors_backtest.cells_from_notes does the same). Both rank by format index fi, so a
+--    missing and an off-vocabulary format share one group, as in deskcore.priors (format "" there).
 with f as (
  select distinct on (subject_id) subject_id note_id, answer from truth_vault.note_feature_answers
  where subject_type='note' and question_id='title_is_question' and run_tag='primary' and coalesce(answer,'')<>''
@@ -20,9 +25,9 @@ e as (
   coalesce(array_position(array['焦虑撬动','羞耻撬动','恐惧撬动','愤怒撬动','罪恶感撬动','造梦投射','认同感建立','归属感建立','共鸣释放','虚荣撬动','好奇驱动','信息差利用']::text[], n.emotional_lever)-1, -1) li,
   case f.answer when '是' then 1 when '否' then 0 else -1 end qi,
   -- tier NULL 时 `tier in (...)` 是 NULL, `NULL or false` 还是 NULL: 不 coalesce 的话 y 是 NULL, concat_ws 丢掉那一段,
-  -- 格子只剩 6 段(review on aw#140)。和 priors.label 一样, 能进来的每一篇都记明确的 0 / 1
+  -- 格子少一段(review on aw#140)。和 priors.label 一样, 能进来的每一篇都记明确的 0 / 1
   coalesce(coalesce(n.tier in ('爆','大爆'), false) or (pc.has_cc and n.comments_count >= 20), false)::int y,
-  n.comments_count cc, n.content_format
+  n.comments_count cc
  from truth_vault.notes n join pc using(project_id) join s using(project_id) left join f using(note_id)
  where n.publish_time is not null and n.publish_time <= now() - interval '3 days'
    and n.project_id <> 'TGV_phase1'
@@ -31,11 +36,17 @@ e as (
    and not coalesce(n.data_quality_flags->'comment_maintained_routes' ? '铺评工单', false)
    and ((pc.has_cc and n.comments_count is not null) or (not pc.has_cc and n.tier in ('爆','大爆','趴')))),
 r as (select e.*, case when has_cc then
-   ((rank() over (partition by project_id, content_format order by cc) - 1)
-    + 0.5 * count(*) over (partition by project_id, content_format, cc)) / count(*) over (partition by project_id, content_format)
-   end rk from e),
-c as (select project_id, case when dd < 10 then 0 when dd < 14 then 1 else 2 end dd, fi, li, qi, y, count(*) n, round(coalesce(sum(rk),0)::numeric, 2) rs from r group by 1,2,3,4,5,6)
-select project_id p, string_agg(concat_ws(',', dd, fi, li, qi, y, n, rs), ';' order by dd, fi, li, qi, y) c
+   ((rank() over (partition by project_id, fi order by cc) - 1)
+    + 0.5 * count(*) over (partition by project_id, fi, cc)) / count(*) over (partition by project_id, fi)
+   end rk,
+   case when has_cc and dd < 10 then
+   ((rank() over (partition by project_id, fi, dd < 10 order by cc) - 1)
+    + 0.5 * count(*) over (partition by project_id, fi, dd < 10, cc))
+    / count(*) over (partition by project_id, fi, dd < 10)
+   end rkt from e),
+c as (select project_id, case when dd < 10 then 0 when dd < 14 then 1 else 2 end dd, fi, li, qi, y, count(*) n,
+   round(coalesce(sum(rk),0)::numeric, 2) rs, round(coalesce(sum(rkt),0)::numeric, 2) rts from r group by 1,2,3,4,5,6)
+select project_id p, string_agg(concat_ws(',', dd, fi, li, qi, y, n, rs, rts), ';' order by dd, fi, li, qi, y) c
 from c group by 1 order by 1;
 
 -- 2) mix.json — posting mix per TV project (synthetic notes excluded): window A = the project's own last 180

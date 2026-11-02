@@ -629,6 +629,8 @@ def _scan(ctx: _Ctx, batch: Batch, f: str, src: str, rng, *, t_only=None, relaxe
             for ttl, dd, bw, bwt in cells:
                 if (ttl, arc) in sig_ban or (lev, arc, ttl) in cell_ban:
                     continue
+                # pu 的分母不看标题封顶(试新牌本来就不设): 封顶的标题在 w / h / pin 槽里 p = 0、pu 却 > 0, 所以 draw-report 的
+                # 「配额内均匀乱抽」只用试新牌估, 不拿 w 牌按 pu / p 加权(review round 2 on aw#140, drawreport.ipw_uniform)
                 sdb += dd
                 if by_title is not None and bwt > 0:
                     by_title[ttl] = by_title.get(ttl, 0.0) + bwt

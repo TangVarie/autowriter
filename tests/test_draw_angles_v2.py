@@ -8,7 +8,7 @@
     (tests/golden/draw_v1_aceee73.json, 改 core 之前用 aceee73 的代码抓的); 反证: v2 同一个 seed 的候选次序不一样;
   · v2 策略里出异常 / 先验整个拿不到 → 这一批按 v1 发, 台账 src "fb"; TV 读不到、台账读不到都照常发(fail open);
   · pin: 每张牌都是点名的值, L0 / L1 照样挡; 值不对 → 报错、什么都不写;
-  · repeat_of: 走非原子的 record_draw, _draw.src "rep"; 别的项目的 key / 超过 3 个 → 报错、什么都不写;
+  · repeat_of: 走非原子的 record_draw, _draw.src "rep"; 别的项目的 key / 超过 3 个 / 还没用掉的牌 → 报错、什么都不写;
   · 回包: project_status(也是 prompt_block 第二行)、batch_note、policy、angles[].reference(只有 e / h / rep)、
     凑不满时的 note、n / avoid_days 的夹子; angles[].dims 只有四个键。
 """
@@ -325,15 +325,50 @@ def test_more_repeats_than_the_batch_is_an_error_with_no_writes():
     _assert_writer_safe(out, "repeat_of over n")
     same = core.draw_angles(w.client, PID, 1, user_id=ME, seed=2, repeat_of=[a["angle_key"], a["angle_key"]])
     assert "error" not in same and same["requested"] == same["delivered"] == 1
-    both = core.draw_angles(w.client, PID, 2, user_id=ME, seed=2, repeat_of=[a["angle_key"], b["angle_key"]])
+    assert len(w.inserts()) == 1 and len(w.inserts()[0]["payload"]) == 1
+    # 新的一个台账(上面那次重写的 a 还没用, 再点 a 会被当成「还没用过」报错, 见下一条用例)
+    w2 = _World([a, b])
+    both = core.draw_angles(w2.client, PID, 2, user_id=ME, seed=2, repeat_of=[a["angle_key"], b["angle_key"]])
     assert "error" not in both and both["requested"] == both["delivered"] == 2
-    assert len(w.inserts()) == 2 and not w.client.rpc_calls
+    assert len(w2.inserts()) == 1 and len(w2.inserts()[0]["payload"]) == 2
+    assert not w.client.rpc_calls and not w2.client.rpc_calls
+
+
+def test_repeat_of_a_card_not_yet_used_is_an_error_and_the_original_stays_the_only_row():
+    """review round 2 on aw#140: 点名重写的 key 还有一张没用掉的牌(两天前抽的, 还没存档)。原来照样再插一行 —— 存档时
+    consume_angle 销的是这个人【最早】那一行, 于是销掉的是原来那张、重写的那张一直挂着, 重写那篇的结果也记到原来那张的
+    来源上。现在: 报错、台账一行不写、RPC 不调, 叫模型直接照原来那张卡的 angle_key 写; 照做之后销的就是原来那一行。"""
+    dims = {"emotional_lever": "愤怒撬动", "human_truth_archetype": "健康焦虑", "content_format": "提问求助",
+            "title_structure": "疑问句"}
+    old = _row(dims, days=2, i=1)                       # 还没存档的那一张
+    key = old["angle_key"]
+    w = _World([dict(old)])
+    out = core.draw_angles(w.client, PID, 3, user_id=ME, seed=2, repeat_of=[key])
+    assert out.get("error") == "repeat_of_invalid", out.get("error")
+    assert out["delivered"] == 0 and out["angles"] == [] and out["key"] == key
+    assert key in out["message"] and "还没用" in out["message"] and "不用重写" in out["message"]
+    assert not w.client.rpc_calls and not w.inserts(), "报错就什么都不写"
+    _assert_writer_safe(out, "repeat_of not yet used")
+    assert [r["id"] for r in w.client.rows["angle_ledger"] if r["angle_key"] == key] == ["l1"]
+    # 模型照做: 用原来那张卡的 angle_key 写完存档 —— 销的就是原来那一行, 台账里这个 key 还是只有它
+    assert store.consume_angle(w.client, PID, key, "v9", user_id=ME) is True
+    rows = [r for r in w.client.rows["angle_ledger"] if r["angle_key"] == key]
+    assert [(r["id"], r["consumed_version_id"]) for r in rows] == [("l1", "v9")]
+    # 队友抽了没用的也算: 同一个 key 在这个项目里还挂着一张, 一样不重发
+    theirs = dict(old, drawn_by=OTHER)
+    w2 = _World([theirs])
+    out2 = core.draw_angles(w2.client, PID, 1, user_id=ME, seed=2, repeat_of=[key])
+    assert out2.get("error") == "repeat_of_invalid" and not w2.inserts()
+    # 原来那张已经用掉(存档过)才是真的「再写一次」: 照常重发
+    w3 = _World([_row(dims, days=2, consumed_days=1, i=1)])
+    out3 = core.draw_angles(w3.client, PID, 1, user_id=ME, seed=2, repeat_of=[key])
+    assert "error" not in out3 and out3["delivered"] == 1 and len(w3.inserts()) == 1
 
 
 def test_only_repeats_needs_no_rpc():
     dims = {"emotional_lever": "好奇驱动", "human_truth_archetype": "自我提升", "content_format": "教程攻略",
             "title_structure": "数字清单"}
-    old = _row(dims, days=4, i=1)
+    old = _row(dims, days=4, consumed_days=3, i=1)
     w = _World([old])
     out = core.draw_angles(w.client, PID, 1, user_id=ME, repeat_of=[old["angle_key"]])
     assert out["delivered"] == 1 and out["atomic_reservation"] is True and out["warning"] == ""
