@@ -2900,6 +2900,15 @@ def tv_edit_diffs_since(sb, project_id: str, since: str | None, *, min_rev: int 
     return {"rows": rows, "pairs": pairs, "more": more}
 
 
+def tv_edit_diff_at(sb, project_id: str, at: datetime) -> bool:
+    """这个项目有没有一行差异的 computed_at 正好是 ``at``: 摘要的 through 就是这样一行的时间, ack 只认它(2026-10-30 复审)。
+    之后 tv-sync 又加了新行不影响 —— 那一行还在, 同一版重算也不推它的 computed_at。按时间比, 不按字符串: PostgREST
+    回的小数秒位数不固定。"""
+    rows = (sb.table("tv_edit_diffs").select("computed_at").eq("project_id", project_id)
+            .gte("computed_at", at.isoformat()).order("computed_at").limit(1).execute()).data or []
+    return bool(rows) and _ts(rows[0].get("computed_at")) == at
+
+
 def tv_edit_digest_ack(sb, project_id: str) -> dict | None:
     rows = (sb.table("tv_edit_digest_acks").select("*").eq("project_id", project_id)
             .limit(1).execute()).data or []

@@ -213,9 +213,10 @@ UNGATED_WITH_REASON = {
                               "同 CLI compile-rules), 触发它的三个入口都已过闸",
     "_uncompiled_reason":     "check_rules 过了闸之后才调(10-20 复审), 只读这个项目的 tv_project_map 行数和进程内的补编状态, "
                               "拼一句「为什么还没有编译结果」",
-    "archive_pending":        "附加提醒(W-29, 10-23), 只被 tools 层在已过闸的 draw_angles / check_drafts / record_rule 成功之后调; "
-                              "只读 angle_ledger 里 drawn_by = 调用者的行(别人的牌不算), 只回张数和最早的发牌时间; "
-                              "W-31 起再带调用者自己存档时 key 对不上的那一笔(进程内存, 按 (项目, 调用者) 取)",
+    "archive_pending":        "附加提醒(W-29, 10-23), 只被 tools 层在已过闸的 draw_angles / 带 angle_key 的 check_drafts 成功之后调"
+                              "(10-30 复审起不再挂 record_rule); 只读 angle_ledger 里 drawn_by = 调用者这个身份的行(别的身份的牌"
+                              "不算; 团队共用一个身份时就是整个团队的), 只回张数和最早的发牌时间; "
+                              "W-31 起再带这个身份存档时 key 对不上的那一笔(进程内存, 按 (项目, 调用者) 取)",
     "_angle_key_problems":    "W-31(10-27), 只被已过闸的 commit_drafts 调: 把它这次没销成的那几个 key 拿去本项目台账查状态; "
                               "本项目没有、形状对的再查 drawn_by = 调用者自己在别的项目抽过没有(别人的牌不看)",
     "_note_angle_key_misses": "W-31(10-27), 只被已过闸的 commit_drafts 调: 把 key 对不上的篇数记进进程内存, 不读写库",

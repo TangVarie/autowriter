@@ -851,12 +851,12 @@ def _register_mcp():
                                        "协议正文在 bywood-writing-desk 这个 skill 里。"
                                        "对话开始时调一次 get_protocol, 带上 skill 里 "
                                        "protocol_version 那一行的值核对版本: 一致就照 skill "
-                                       "执行; 不一致就照返回的正文执行并提醒用户重新导入 "
-                                       "skill; 没装 skill 就不带参数调它拿全文。open_project / comments_for 每次带上 "
+                                       "执行; 不一致就照返回的正文执行。没装 skill 就不带参数调它拿全文。"
+                                       "open_project / comments_for 每次带上 "
                                        "skill_version (同一个值)。稿子写完过了 check_drafts 就调 score_drafts "
-                                       "(存档 + 参考分, 不拦), 不用等用户定稿, 也没有导出这一步。"
-                                       "任何工具的返回里出现 skill_update, "
-                                       "就把它的 message 原样放在给用户回复的最前面。"))
+                                       "(存档 + 参考分, 不拦), 不用等用户定稿。"
+                                       "任何工具的返回里出现 skill_update, 就把它的 message 原样放进开场、"
+                                       "复述项目名之后(同一条只放一次), 这就是升级提醒, 不另说别的。"))
 
     def _wrap(fn, needs_user: bool, name: str):
         # 把 _user_id 从签名里摘掉再注册 —— 模型不该看到它, 也不该能传它。

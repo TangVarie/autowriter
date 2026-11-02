@@ -76,8 +76,8 @@ ANGLE_DEBT_SINCE = "2026-10-29T08:26:00+00:00"
 # 刚抽的牌不算欠账(2026-10-30 发布收尾复审)。一个团队共用一个身份(同一个 user_id), 分不出牌是谁抽的: 队友几分钟前刚抽、
 # 正在写的牌, 原来会出现在另一个写手新开那场的简报里, 模型照「优先按这些坐标写」再写一遍 —— 两个人写同一张牌。抽牌到查重
 # 通常只隔几分钟, 查过重的已经按 W-38 的底稿排除了(_checked_angle_keys), 所以只数抽了一小时以上的; 断掉的那场过一小时
-# 再开, 它的牌照样在里面。简报的 angle_debt 和存档后的 angle_debt 都按它截; archive_pending 不截(那里管的就是这一场
-# 刚抽的牌, 见 ARCHIVE_PENDING_DAYS)。
+# 再开, 它的牌照样在里面。简报的 angle_debt 和存档后的 angle_debt 都按它截; archive_pending 不截(它只挂在这一场发牌、
+# 带 angle_key 查重的回包上, 刚抽的那几张正是它要提醒存档的, 见 ARCHIVE_PENDING_DAYS)。
 ANGLE_DEBT_MIN_AGE = timedelta(hours=1)
 
 
@@ -91,20 +91,39 @@ def _angle_debt_until() -> str:
 # 形状(交付时模型没调存档), D-071 定过不设硬闸(不拦发牌、不拦交付), 所以把"存了档再给用户看"这句放进离交付最近的几个
 # 返回值里: draw_angles / check_drafts / record_rule(见 archive_pending)。简报的 angle_debt 管不到这里: 两轮里
 # open_project 和 draw_angles 是一起发出去的(06:32:32 已经发完牌, 06:32:43 简报才查账), 提醒到的时候牌早抽完了。
-# 窗口 1 天: 只管这一场还在写的牌; 更早挂着的由简报的 angle_debt(7 天)管。
+# 窗口 1 天: 只管还在写的牌; 更早挂着的由简报的 angle_debt(7 天)管。2026-10-30 复审: 团队共用一个身份, 数到的是这一天整个
+# 团队在这个项目上没存的牌, 不分是哪一场抽的 —— 所以只挂在这一场确实在用牌的回包上(draw_angles、带 angle_key 的
+# check_drafts), 不再挂 record_rule、不带牌的 check_drafts; 协议「5. score_drafts」那段叫模型只管这场自己用的牌。
 ARCHIVE_PENDING_DAYS = 1
 # 和 protocol.md「5. score_drafts」那段同一个口径: 查重通过 → 交给用户之前、同一轮里存档; 改的是已经存过的那篇 →
 # score_drafts 带 replaces_version_id(它先摘掉旧版再查重)。要先过一遍 check_drafts 也行(2026-10-30 发布收尾): 同样
 # 带上 replaces_version_id, 它就不拿这篇和它自己存档的旧版比(见 _without_own_versions)。原来 check_drafts 不认这个
 # 字段, 改稿一过 check_drafts 就被自己的旧版拦下(「正文开头与历史稿完全一致」), 这里才叫模型跳过它 —— 模型照协议先查一遍
 # 的那几次, 写手听到的是「改过的稿子和历史稿重复」。整篇推翻、换角度重写的才当新稿, 走 check_drafts → score_drafts。
+# 2026-10-30 复审: 改稿也是先 check_drafts 再 score_drafts(协议第 4 条「新稿、改稿都要过」), 两次带同一个 replaces_version_id ——
+# 原来这里说「要先过 check_drafts 的话」, 读起来是可以跳过; 它在离交付最近的回包里, 协议和它说法不同时模型照它做。
+# 同一次复审: cards 是整个团队的(共用一个身份), 和协议「5. score_drafts」那段一样说清只管这一场自己用的牌 —— 不然存完自己的
+# 还剩几张, 模型会当存档没成(W-31 那种误会)。
 ARCHIVE_PENDING_NEXT_STEP = (
     "查重通过的稿子, 交给用户之前就在同一轮里调 score_drafts 存档(每篇带 angle_key, 不等用户表态); "
-    "按反馈改的是已经存过的那篇, 就调 score_drafts 带 replaces_version_id(它会先摘掉旧版再查重; 要先过 check_drafts "
-    "的话那篇同样带上 replaces_version_id, 就不会拿它和自己的旧版比); 整篇推翻、换角度重写的当新稿, 先过 check_drafts "
-    "再存; 都存完再给用户看"
+    "按反馈改的是已经存过的那篇, 就让那篇带上 replaces_version_id 先过 check_drafts(不会拿它和自己的旧版比), "
+    "再带同一个 replaces_version_id 调 score_drafts(它会先摘掉旧版再存); 整篇推翻、换角度重写的当新稿, 先过 check_drafts "
+    "再存; cards 数的是整个团队这一天在这个项目上没存的牌(大家共用一个身份), 只管这一场自己用的那几张, 存完它还在就是"
+    "别人手上的, 不用管; 这一场的都存完再给用户看"
     "(存档是你这边的事, 别跟用户提「存档」、也别让用户做什么: 用户写完贴进飞书就行, 查重时带了 angle_key 的稿子"
     "发出去以后写作台会自己从飞书对回来)。")
+# 认不出调用者 / 项目不归这个身份时念给写手的话(2026-10-30 复审, 和 protocol.md「例外：403」那段同一个口径): 找负责人, 不重试,
+# 不换 project_id, 不新建项目绕过去。配置项(DESKCORE_KEYS …)只进日志 —— 写手手里没有任何一步能补它。
+IDENTITY_REFUSED = "无法识别调用者身份, {what}。这次没做成; 请用户找负责人看一下, 不用重试。"
+PROJECT_REFUSED_NEXT = ("这个项目打不开: 请用户找负责人看一下; 不要换别的 project_id 试, 不要问用户要 project_id, "
+                        "也不要新建一个项目绕过去。")
+# 库里没有这个 project_id(2026-10-30 复审, 和 protocol.md「一、动笔前」第 1 条「找不到项目」同一个口径): 多半是 id 没抄对,
+# 下一步是重新 list_projects 抄 id —— 不是等它恢复(那是「别的报错」), 也不是找负责人(那是 403)。
+PROJECT_NOT_FOUND_NEXT = ("写作台里没有这个 project_id, 多半是没抄对: 带 include_archived=true 再调一次 list_projects, "
+                          "把 project_id 原样抄过来再调一次; 还是找不到, 就告诉用户「写作台里找不到这个项目，请找负责人看一下」, "
+                          "不要新建项目, 也不要问用户要 project_id。")
+
+
 def _supersede_snapshots(client, project_id: str, drafts: list[dict], vids: dict[int, str]) -> None:
     """commit_drafts 存成版本的那几篇, 同样文字的查重底稿记成已转正(W-38 复审)。附带的一步, 失败只记 WARN。"""
     try:
@@ -143,11 +162,12 @@ def _angle_debt_note(days: int, n: int, last_drawn_at, shown: int, more: int) ->
 
 # 存档带的 angle_key 对不上台账(W-31, 2026-10-27)。10-26 sportsix 一场 20 张牌, 5 批存了 19 篇, 每篇都带了 key, 可没有
 # 一条在台账里(7~8 位带下划线的编号、53 位的长串), 牌一张没销。score_drafts 的回包现在会说清(angle_key_warning), 但之后
-# draw_angles / check_drafts / record_rule 的 archive_pending 只会说「还有 N 张牌没存档」—— 模型明明存过了, 只会当提醒
+# draw_angles / check_drafts 的 archive_pending 只会说「还有 N 张牌没存档」—— 模型明明存过了, 只会当提醒
 # 有误。所以存档时对不上的记一笔, archive_pending 一并带上(angle_key_mismatch)。记在进程内存里, 同 _borrowed_arms 的
 # 取舍(deskcore 单进程): 重启丢了只少这一段提醒(存档那次回包已经说过), 不为它让 archive_pending 多查一次库。
 # 窗口和 archive_pending 一样 1 天, 每篇对不上的各按自己存档的时刻过期(codex review on aw#130: 原来整段跟着最近一笔续命,
-# 0、23、46 小时各一篇的, 46 小时时三篇都还在, 旧 key 还占着 keys 的位置); 只记 (项目, 写手) 自己的, 别人的不给看。
+# 0、23、46 小时各一篇的, 46 小时时三篇都还在, 旧 key 还占着 keys 的位置); 按 (项目, 身份) 记, 别的身份的不给看
+# (团队共用一个身份时, 就是这个团队在这个项目上的)。
 ANGLE_KEY_SHOW_CHARS = 24       # 回包里 key 只露前这么多字(模型编的长串可能是一句描述)
 ANGLE_KEY_MISS_SHOW = 10        # 提醒里最多列几个对不上的 key
 _ANGLE_KEY_MISS_TTL = timedelta(days=ARCHIVE_PENDING_DAYS)
@@ -214,25 +234,26 @@ def assert_project_access(client, project_id: str, *,
     读不出东西。
     """
     if not project_id or not str(project_id).strip():
-        raise ProjectNotFound("project_id 不能为空")
+        raise ProjectNotFound(f"project_id 不能为空。{PROJECT_NOT_FOUND_NEXT}")
     if not user_id:
-        raise PermissionError(
-            "无法识别调用者身份, 拒绝访问项目数据 —— deskcore 持 service_role "
-            "绕过 RLS, 认不出人就等于对所有租户开放。服务端要配 DESKCORE_KEYS "
-            "(推荐)或 DESKCORE_API_KEY + DESKCORE_DEFAULT_USER_ID; 本地匿名 dev "
-            "模式也要配 DESKCORE_DEFAULT_USER_ID。")
+        # 报错文本是念给写手的(2026-10-30 发布收尾): 配置怎么补只进日志。deskcore 持 service_role 绕过 RLS,
+        # 认不出人就等于对所有租户开放, 所以拒。
+        logger.warning("认不出调用者身份, 拒绝访问项目数据 (project=%s) —— 服务端要配 DESKCORE_KEYS(推荐)或 "
+                       "DESKCORE_API_KEY + DESKCORE_DEFAULT_USER_ID; 本地匿名 dev 模式也要配 DESKCORE_DEFAULT_USER_ID",
+                       str(project_id)[:40])
+        raise PermissionError(IDENTITY_REFUSED.format(what="打不开项目"))
 
     project = store.project_row(client, project_id)
     if project is None:
-        raise ProjectNotFound(f"project not found: {project_id}")
+        raise ProjectNotFound(f"project not found: {project_id}。{PROJECT_NOT_FOUND_NEXT}")
 
     # ↓↓↓ 换归属模型时【只改这三行】↓↓↓
     owner = project.get("owner_id")
     if str(owner or "") != str(user_id):
+        # 按 projects.owner_id 隔离: 项目规则在同一 owner 的项目之间共享, 跨 owner 不共享。原来的报错以「project_id 是不是
+        # 传错了?」结尾 —— 那是叫模型换个 id 试, 协议禁止这件事(2026-10-30 复审)。
         raise PermissionError(
-            f"project {project_id} 不属于当前调用者, 拒绝访问。"
-            "deskcore 按 projects.owner_id 隔离 —— 项目规则在同一 owner 的项目"
-            "之间共享, 跨 owner 不共享。project_id 是不是传错了?")
+            f"project {project_id} 不属于当前调用者, 拒绝访问。{PROJECT_REFUSED_NEXT}")
     # ↑↑↑ 换归属模型时【只改这三行】↑↑↑
     return project
 
@@ -424,7 +445,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     if shared_calib:
         calib_parts.append(f"[项目共享基线]\n{shared_calib}")
     if my_calib:
-        calib_parts.append("[我的个人风格 —— 从我手动改稿里提炼; 与项目基线冲突时以本节为准]\n"
+        # 团队共用一个身份(2026-10-30 复审): 这份调校笔记是这个项目上大家共用的, 不是哪位写手私有的
+        calib_parts.append("[调校笔记 —— 从这个项目的手动改稿里提炼, 写这个项目的人共用这一份; 与项目基线冲突时以本节为准]\n"
                            + my_calib)
     calibration = "\n\n".join(calib_parts)
 
@@ -1666,13 +1688,14 @@ SCORE_NOTE = ("参考分: 不拦交付, 也不改 written / rejected。score 满
               "合规题), 文笔好坏不在里面。分数不用逐篇报给用户: 这一批每篇都打成了分、而且都没有 fixes、hard_fails、unjudged, "
               "才整批说一句「合规检查都过了」; 只把有 fixes 或 hard_fails 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条"
               "(sure=false 的是 Jev 拿不准的, 看一眼就行, 不一定要改)。只有 unjudged 的那几篇是有几道硬约束这次没判出来, "
-              "不能说都过了, 跟用户提一句就行(不影响交付, 不用重试)。用户要改, 按 fixes 改完带 replaces_version_id 再调一次 "
-              "score_drafts, 改一轮就够, 不要为了分数反复重写。judge_status 不是 ok 就说这篇这次没打成分, 不能说过了, 不用重试。")
+              "不能说都过了, 跟用户提一句就行(不影响交付, 不用重试)。用户要改, 按 fixes 改完, 那篇带 replaces_version_id 先过 "
+              "check_drafts 再调 score_drafts, 改一轮就够, 不要为了分数反复重写。judge_status 不是 ok 就说这篇这次没打成分, 不能说过了, 不用重试。")
 JUDGE_SHADOW_NOTE = SCORE_NOTE          # 旧名, 老测试 / 老调用方还在 import
 
 # score_drafts 的 next_step 开头那句(存档成功才有)。判定在它之后才跑, 跑完由 _with_score_report 在它后面接上
 # 「参考分怎么跟用户说」那句 —— 那句要看这一批判出来的结果, 写 next_step 的时候还不知道。
-ARCHIVED_STEP_HEAD = "这批已存档。"
+# 2026-10-30 复审: 协议说 next_step 是给模型的指示、不是原话; 开头这句也说清, 免得「这批已存档」被照念给写手(写手没有存档这一步)。
+ARCHIVED_STEP_HEAD = "这批已存档(下面是给你的指示, 不是要念给用户的原话; 别跟用户提「存档」)。"
 
 
 def _score_report_step(judge: dict | None) -> str:
@@ -2926,12 +2949,12 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
 # 另外补一句 DELIVERY_PARTIAL_NEXT_STEP)。
 DELIVERY_NEXT_STEP = ("这个项目有交付模板: delivery.text 是按模板拼好的交付稿; 改过重存的那一次, 它是原来那一整批(没改的几篇照"
                       "它们现在的样子, 改过的换在原位, 顺序不变)。delivery.problems 里有的先改(改过的那几篇带 replaces_version_id "
-                      "再调一次, 新返回的 delivery.text 就是改好之后的整批), 然后把 delivery.text 原样整段交给用户: 不要自己拼接、"
-                      "替换其中几行或几段, 不要重排版式, 不要再加标记。")
+                      "先过 check_drafts、再调 score_drafts, 新返回的 delivery.text 就是改好之后的整批), 然后把 delivery.text 原样"
+                      "整段交给用户: 不要自己拼接、替换其中几行或几段, 不要重排版式, 不要再加标记。")
 DELIVERY_PARTIAL_NEXT_STEP = ("这一次 delivery.text 只有这次存进去的几篇(delivery.scope 是 this_call: 原来那一批的其余几篇这次"
                               "没能一起拼出来): 照样原样交给用户, 跟用户说这是改过的那几篇, 其余几篇和上一次交给用户的一样。")
-RULE_CHECKS_NEXT_STEP = ("rule_checks 是代码按项目规则逐篇查出来的: 标「必须改」的改完再交(带 replaces_version_id 再调一次), "
-                         "「建议改」的告诉用户。只是参考, 存档已经成功了。")
+RULE_CHECKS_NEXT_STEP = ("rule_checks 是代码按项目规则逐篇查出来的: 标「必须改」的改完再交(那几篇带 replaces_version_id "
+                         "先过 check_drafts、再调 score_drafts), 「建议改」的告诉用户。只是参考, 存档已经成功了。")
 RULE_CHECKS_MORE_NEXT_STEP = ("rule_checks 只列了一部分(必须改的全列了, 没列的都是建议改), 还有 rule_checks_more 条没列: "
                               "如实告诉用户还有这么多条没列出来。")
 RULE_CHECKS_ERROR_NEXT_STEP = ("rule_checks_status=error: 这次代码查规则没跑成(存档不受影响), 不能跟用户说规则都用代码查过了。")
@@ -3767,14 +3790,15 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     parts.append(f"{pre} 条在入库前的判定里就被拦下(和 check_drafts 同一套"
                                  "闸 —— 说明这几条没过 check, 或者 check 之后又改回去了)")
                 if race:
-                    parts.append(f"{race} 条在写入时被拦下(你 check 之后、commit 之前有人"
-                                 "先提交了撞车的稿子)")
+                    parts.append(f"{race} 条在写入时被拦下(你查重之后、存档之前, 有人"
+                                 "先存了撞车的稿子)")
                 tail = ""
                 if pre or race:
                     # 2026-10-30 发布收尾: 原来这里是「不能当作已交付」—— 可协议允许写手看过撞的是哪一条之后坚持要用, 模型夹在中间
                     # 两头为难, 写手听到的是「不许交」。拒绝本身不变(没存档、没销牌); 写手坚持就原样交, 只说清后果, 一句话。
+                    # 2026-10-30 复审: 跟写手只说一句「不会进历史稿」; 牌没销账是台账的事, 写手做不了什么, 只留给模型知道。
                     tail = ("。这几条没有存档, 要重写后重新走 check_drafts; 用户看过撞的是哪一条还是坚持要用, 就原样交给他, "
-                            "用一句话告诉他这篇不会存进写作台的历史稿、分给它的那张牌也还挂着没销账")
+                            "用一句话告诉他这篇不会存进写作台的历史稿(分给它的牌也没销账 —— 那是你这边的事, 不用跟用户提)")
                 if bad_ref:
                     # 这不是撞车, 是 replaces_version_id 给错了: 让人重写只会再错一次
                     # (codex #84 P2)。
@@ -3824,8 +3848,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 # 接在 ARCHIVED_STEP_HEAD 后面(2026-10-30 发布收尾; 原来这里是「把每篇的 score 和 fixes 照实告诉用户」)。
                 out["next_step"] = (ARCHIVED_STEP_HEAD
                                     + rules_step +
-                                    "用户要改哪篇: 改完带 replaces_version_id 再调 score_drafts。定稿由用户自己贴进飞书, "
-                                    "发出去之后系统按内容自动对回来 —— 不用导出。")
+                                    "用户要改哪篇: 改完那篇带 replaces_version_id 先过 check_drafts, 再调 score_drafts。"
+                                    "定稿由用户自己贴进飞书, 发出去之后系统按内容自动对回来, 用户不用再做什么。")
             # ⚠️ 这里原来是 `return out`。改成落到 with 块外面去, 是为了让下面的入库判定
             #    【不在】项目写锁里、也【不在】这个 try 里(设计审查 2026-09-23 §5):
             #    · 在 try 里: 判定一抛, 下面的 except 会把已替换稿的旧指纹无条件放回 ——
@@ -5447,18 +5471,28 @@ def delivery_format(client, project_id: str, *, template=SHOW_ONLY, clear: bool 
 EDIT_DIGEST_EVERY_DAYS = 7
 EDIT_DIGEST_MIN_CHANGED = 3       # 改过的少于这几篇不出摘要: 一两篇看不出规律, 只会诱导模型硬编
 EDIT_DIGEST_EXAMPLES = 6
+# 2026-10-30 复审(和 protocol.md 第 1 条同一个时机): 摘要**不挡写稿** —— message 放进开场(项目名之后), 照常写完这一批、
+# 交付, 归纳出的改法放在交付那条回复的末尾; 发出那条回复之前 ack(rules_recorded=0)。原来这里写「放在最前面 …… 然后才开始写稿」,
+# 写手要先回答一轮问题才拿得到稿子; 写手多半拿了稿子就走、不回话, 于是一直不 ack, 每场开头都再来一遍(10-21～10-26 给了
+# 8 次只 ack 过 1 次)。message 也不再说「开写之前 …… 我先看看」: 说完紧接着交的是稿子, 那句话当场就不算数了。
 EDIT_DIGEST_TASK = (
-    "先把 message 原样告诉用户(放在这一轮回复最前面), 再照下面做完, 然后才开始写稿。"
-    "这是本项目最近发出去的稿子在发布前被人改过的地方(写作台那版 → 发出去那版)。看有没有反复出现、像是有意为之的改法"
-    "(比如总删掉某类句子、总把某种说法换成另一种、总把标题改短、总少提或多提品牌), 归纳成最多 3 条能写成规则的话, "
-    "念给用户听, 问要不要记下。"
-    "用户说要的, 用 record_rule 记(soft, scope=project)。只出现一两次的、说不清为什么改的, 不要硬编成规则; "
-    "一条都看不出来就直接跟用户说没看出规律。"
-    "不管记没记, 最后调 ack_edit_digest, through 原样传回, rules_recorded 填记了几条; 之后一周内不会再出现。")
+    "这是本项目最近发出去的稿子在发布前被人改过的地方(写作台那版 → 发出去那版)。它不挡写稿: message 原样放进开场"
+    "(复述项目名之后), 然后照常做用户要的事。"
+    "看有没有反复出现、像是有意为之的改法"
+    "(比如总删掉某类句子、总把某种说法换成另一种、总把标题改短、总少提或多提品牌), 归纳成最多 3 条能写成规则的话; "
+    "只出现一两次的、说不清为什么改的, 不要硬编成规则, 一条都看不出来就说没看出规律。"
+    "这一批稿子交付完, 在同一条回复的末尾把归纳出的改法列给用户, 问要不要记成以后的规则(这场不写稿, 就在办完用户这次的事之后说)。"
+    "发出这条回复之前调 ack_edit_digest, through 原样传回, rules_recorded 传 0; 之后一周内不会再出现。"
+    "用户之后说要哪几条, 用 record_rule 记(soft, scope=project), 再调一次 ack_edit_digest(through 不变, rules_recorded "
+    "填一共记了几条)。")
 
 
-EDIT_DIGEST_MESSAGE = ("开写之前说一句: 这个项目最近发出去的稿子里有 {changed} 篇在发布前被人改过。"
-                       "我先看看有没有反复出现的改法, 有的话列给你, 你看哪几条要记成以后都照着写的规则(都不要也行)。")
+EDIT_DIGEST_MESSAGE = ("这个项目最近发出去的稿子里有 {changed} 篇在发布前被人改过。这批稿子交完, 我把反复出现的改法"
+                       "(有的话)列给你, 你看哪几条要记成以后都照着写的规则(都不要也行)。")
+# ack 传来的 through 不是摘要给出去的那个(猜的、自己拼的)时的 400。说给模型听: 去哪儿拿回原来那个, 不要猜。
+ACK_THROUGH_UNKNOWN = ("through 不是这个项目的 edit_digest 给出去的那个时间, 这次没记下。原样传 edit_digest.through"
+                       "(或者上次 ack_edit_digest 返回的 through); 都不在眼前了, 就用开场那次一样的参数再调一次 open_project "
+                       "拿回 edit_digest(没 ack 之前每次打开都带; 返回里没有它就是已经有人记下了, 不用再调)。不要自己猜一个时间。")
 
 
 def _avg(xs) -> int | None:
@@ -5558,18 +5592,19 @@ def desk_gaps(client, *, user_id: str | None, current_project_id: str | None = N
 
 
 def archive_pending(client, project_id: str, *, user_id: str | None) -> dict | None:
-    """调用者自己在这个项目近 ARCHIVE_PENDING_DAYS 天抽了、还没存档销账的牌(W-29)。有就回
+    """这个身份在这个项目近 ARCHIVE_PENDING_DAYS 天抽了、还没存档销账的牌(W-29)。有就回
     ``{"cards": 张数, "oldest_drawn_at": 最早那张的发牌时间, "next_step": ARCHIVE_PENDING_NEXT_STEP}``, 没有回 None。
 
     张数含这一次刚发的牌: 挂在 draw_angles 返回上时, 它就是在说"这一批写完要存档"; 比这一批更早的还挂着,
     oldest_drawn_at 就早于这次发牌。同一次发牌的牌 drawn_at 都一样。
 
     复用简报 angle_debt 那一条查询(store.angle_debt, 只取最早的一行 + 精确计数): 每次调用只多一次查询, 走
-    (project_id, drawn_at) 那个索引。只数 drawn_by = 调用者的行, 别人的牌、别的项目的牌都不算。
-    不过归属闸: 只被已过闸的 draw_angles / check_drafts / record_rule 在它们成功之后调(tools._archive_pending)。
+    (project_id, drawn_at) 那个索引。只数 drawn_by = 调用者这个身份的行, 别的身份、别的项目的牌都不算 —— 但团队共用一个
+    身份, 所以数到的是整个团队这一天在这个项目上没存的牌, 不只是这一场抽的(2026-10-30 复审)。因此只挂在这一场确实在用牌的
+    回包上: 不过归属闸, 只被已过闸的 draw_angles、带 angle_key 的 check_drafts 在它们成功之后调(tools._archive_pending)。
     查询失败时 store.angle_debt 自己留痕、回 0, 这里就回 None; 工具层再兜一层, 怎么都不会把工具结果弄坏。
 
-    W-31(10-27): 调用者这一天里存档时带的 angle_key 对不上台账(没有这个 key / 已经销给别的稿子)的, 多带一个
+    W-31(10-27): 这个身份这一天里存档时带的 angle_key 对不上台账(没有这个 key / 已经销给别的稿子)的, 多带一个
     ``angle_key_mismatch``: ``{"drafts", "unknown", "used", "by_problem", "keys"(最多 ANGLE_KEY_MISS_SHOW 个, 截断),
     "last_at", "note"}``。``unknown`` 同回包的 unknown_angle_keys(这个项目台账里没有的三种), ``by_problem`` 分开数,
     ``note`` 按出现的那几种拼(_angle_key_mismatch_note)。从进程内存读(commit_drafts 记的), 不多查库; 没有就不带。
@@ -5642,22 +5677,26 @@ def _recent_angle_key_misses(project_id, user_id) -> dict | None:
 def _angle_key_mismatch_note(n: dict[str, int]) -> str:
     """archive_pending 里 angle_key_mismatch 那句话, 按出现的问题拼(W-31 复审)。
 
-    「牌其实写完存了、别按它们再写」只对 unknown / used 说: 那两种是这个项目的牌写了却带错了 key。别的项目的牌、
-    台账里没有这一行的, 这个项目挂着的牌跟那几篇无关。「不要自己编号、缩写或改写」只对形状不对的(unknown)说。"""
+    「牌其实写完存了、不用为它们再写」只对 unknown / used 说: 那两种是这个项目的牌写了却带错了 key。别的项目的牌、
+    台账里没有这一行的, 这个项目挂着的牌跟那几篇无关。「不要自己编号、缩写或改写」只对形状不对的(unknown)说。
+    记的是 (项目, 身份), 团队共用一个身份, 所以那几篇可能是队友的对话存的(2026-10-30 复审): 只给模型看, 不叫它问用户
+    —— 这一场存的那几篇, score_drafts 当时的 angle_key_warning 已经说过; 别人存的, 这一场的写手管不着。"""
     unknown, used = n.get(store.ANGLE_KEY_UNKNOWN, 0), n.get(store.ANGLE_KEY_USED, 0)
     other, missing = n.get(store.ANGLE_KEY_OTHER_PROJECT, 0), n.get(store.ANGLE_KEY_NOT_IN_LEDGER, 0)
     parts = []
     if unknown or used:
         parts.append(
-            f"这些牌里有的其实已经写完存档了: 有 {unknown + used} 篇存档时带的 angle_key 在这个项目的台账里对不上"
-            "(keys 里有), 所以没销账。已经存了的不用重存, 也别按这些牌再写一遍"
+            f"cards 里有的牌其实已经写完存档了: 这个项目有 {unknown + used} 篇存档时带的 angle_key 在台账里对不上"
+            "(keys 里是它们带的 key), 所以那几张没销账。已经存了的不用重存, 也不用为那几张牌再写一遍"
             + (f"; 之后每篇存档时的 angle_key 照 draw_angles 返回里分给它的那个原样复制({fp.ANGLE_KEY_HEX_LEN} 位十六进制), "
                "不要自己编号、缩写或改写" if unknown else "") + "。")
     if other:
-        parts.append(f"有 {other} 篇存进这个项目时带的是你在别的项目抽的牌: 稿子是不是存错了项目? 跟用户确认。")
+        parts.append(f"有 {other} 篇存进这个项目时带的是别的项目抽的牌, 那几张销不到这个项目的账上, 跟这里挂着的牌无关。")
     if missing:
         parts.append(f"有 {missing} 篇带的 angle_key 形状是对的({fp.ANGLE_KEY_HEX_LEN} 位十六进制), 但台账里没有这一行: "
-                     "多半是发牌时台账没写进去, 不是你编的或抄错的。")
+                     "多半是发牌时台账没写进去, 不是编的或抄错的。")
+    parts.append("这几篇可能是这一场存的, 也可能是团队别的对话存的(大家共用一个身份); 这一场存的, score_drafts 当时已经说过。"
+                 "不用回头处理, 也不跟用户提。")
     return "".join(parts)
 
 
@@ -5697,7 +5736,8 @@ def edit_digest(client, project_id: str, *, user_id: str | None = None,
                      "published_avg": _avg(r.get("published_chars") for r in changed)},
            "examples": examples, "task": EDIT_DIGEST_TASK,
            # W-33(10-30): 10-21～10-26 摘要给了 8 次只 ack 过 1 次, 模型拿到就直接去发牌了 —— 加一句原样转给用户的话
-           # (同 desk_gap / skill_update), 至少让写手看得见; ack 仍在用户看过、做了决定之后(先 ack 会让漏看的差异再也进不了摘要)
+           # (同 desk_gap / skill_update), 至少让写手看得见。何时 ack 见 EDIT_DIGEST_TASK: 改法列在交付那条回复的末尾,
+           # 发出那条回复之前就 ack(rules_recorded=0), 不等写手回话; 改法没进这一轮的回复就不 ack(不然那批差异再也进不了摘要)
            "message": EDIT_DIGEST_MESSAGE.format(changed=len(changed))}
     if got["more"]:
         out["more_after_through"] = True        # 一次没看完: 看完这份、ack 之后, 下一份从 through 接着往后
@@ -5713,12 +5753,17 @@ def ack_edit_digest(client, project_id: str, through: str, *, user_id: str | Non
     assert_project_access(client, project_id, user_id=user_id)
     t = tvlink._as_dt(through)
     if t is None:
-        raise ValueError("through 要原样传回 edit_digest 里的那个时间")
+        raise ValueError(ACK_THROUGH_UNKNOWN)
     if t > _utcnow() + timedelta(hours=1):
         # 水位只往前走, 传错一个将来的时间就永远收不到摘要了 —— 摘要给的 through 不会比现在晚
         raise ValueError("through 比现在还晚, 不是 edit_digest 给的那个时间; 原样传回")
     if not isinstance(rules_recorded, int) or isinstance(rules_recorded, bool) or not 0 <= rules_recorded <= 20:
         raise ValueError("rules_recorded 是这次记了几条规则(0~20 的整数)")
+    if not store.tv_edit_diff_at(client, project_id, t):
+        # 2026-10-30 复审: 只认摘要真给出去的那个 through(某一行差异的 computed_at)。ack 挪到交付那条回复之前以后, 摘要多半
+        # 已经离得很远; 原来任何像日期的都收, 模型猜一个「2026-10-30」就被收下, 水位只往前走, 用户没看过的差异(含
+        # more_after_through 那一截)再也进不了摘要。之后 tv-sync 又加了新差异不要紧: 给出去的那一行还在(store.tv_edit_diff_at)。
+        raise ValueError(ACK_THROUGH_UNKNOWN)
     kept = store.tv_edit_digest_ack_upsert(client, project_id, acked_through=t.isoformat(),
                                            acked_by=str(user_id) if user_id else None, rules_recorded=rules_recorded)
     return {"acked": True, "through": kept, "rules_recorded": rules_recorded,
@@ -6005,7 +6050,7 @@ def set_rule_state(client, memory_id: str, action: str, *,
     if (row.get("scope") or "") == "global":
         if str(row.get("user_id") or "") != str(user_id):
             raise PermissionError(
-                "这条是别人的个人技艺库里的规则, 不能改。global 规则是私有的。")
+                "这条 global 规则不在这个身份名下, 不能改; 请用户找负责人看一下。")
     else:
         assert_project_access(client, row.get("project_id"), user_id=user_id)
 
@@ -6488,10 +6533,10 @@ CHECK_RULES_MAX_LISTED = 12
 CHECK_RULES_MAX_UNSURE = 5
 _CHECK_RULES_TITLE_CHARS = 40
 _CHECK_RULES_UNCOVERED_CHARS = 80
-CHECK_RULES_NOTE = ("规则检查只是建议, 不拦交付, 存档已经成功了。必须改 = 硬约束没守住(照着改, 改完用 score_drafts 带 "
-                    "replaces_version_id 再存一次); 建议改 = 软规则, 告诉用户, 改不改由用户定; 拿不准 = Jev 判不准, 提一句"
-                    "就行, 不用改。judge_status 不是 ok 的那几篇是没判完, 不能说它们守住了规则; judge_status 是 ok 的篇里, "
-                    "counts.unjudged 数到的那几道规则题也没判出来, 同样不能说守住了。")
+CHECK_RULES_NOTE = ("规则检查只是建议, 不拦交付, 存档已经成功了。必须改 = 硬约束没守住(照着改, 改完那几篇带 "
+                    "replaces_version_id 先过 check_drafts、再用 score_drafts 存一次); 建议改 = 软规则, 告诉用户, 改不改"
+                    "由用户定; 拿不准 = Jev 判不准, 提一句就行, 不用改。judge_status 不是 ok 的那几篇是没判完, 不能说它们"
+                    "守住了规则; judge_status 是 ok 的篇里, counts.unjudged 数到的那几道规则题也没判出来, 同样不能说守住了。")
 
 
 # 规则编译结果读不出来(多半是 migrations/015 没跑)时的 next_step。不拦交付、不让重试: 同一个库再调一次还是读不出来
@@ -6613,8 +6658,8 @@ def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str =
                            partial: int = 0, code_withdrawn: int = 0, questions_unchecked: int = 0) -> str:
     tips = []
     if summary.get("must_fix"):
-        tips.append("「必须改」的照 what / evidence 改完, 那几篇用 score_drafts 带 replaces_version_id 再存一次(会重新打分), "
-                    "改一轮就够, 不用再调 check_rules。")
+        tips.append("「必须改」的照 what / evidence 改完, 那几篇带 replaces_version_id 先过 check_drafts、再用 score_drafts "
+                    "存一次(会重新打分), 改一轮就够, 不用再调 check_rules。")
     if summary.get("suggest"):
         tips.append("「建议改」的告诉用户, 改不改由用户定。")
     if summary.get("unsure"):
@@ -7048,11 +7093,13 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     return out
 
 
+# 团队共用一个身份(2026-10-30 复审): 精修来自写这个项目的几个人, 笔记是这个项目大家共用的一份 —— 不再说「个人写作调校笔记」
+# 「同一个人」「这个人的语感偏好」, 模型照那个口径会写出「这位写手偏好…」, 再跟写手说「记住了你的个人偏好」。
 _CALIB_SYSTEM = """\
-你在维护一份「个人写作调校笔记」。输入是同一个人对 AI 初稿做的手动精修 —— \
-左边是 AI 写的，右边是这个人改成的样子。
+你在维护这个项目的「写作调校笔记」，写这个项目的人共用这一份。输入是他们对 AI 初稿做的手动精修 —— \
+左边是 AI 写的，右边是人改成的样子；改稿的可能不止一个人。
 
-你的任务：从这些改动里提炼出【这个人的语感偏好】，写成可执行的短句。
+你的任务：从这些改动里提炼出【这个项目的改稿里看得出的语感偏好】，写成可执行的短句。
 
 铁律：
 1. 只写从改动里【看得出来】的偏好。看不出来就不写，宁可少写。
@@ -7061,7 +7108,7 @@ _CALIB_SYSTEM = """\
 3. 每条一行，以动词开头，可以直接当写作指令用。
 4. 合并同类项。新观察和已有笔记说的是一件事，就改写已有那条让它更准，\
 不要并列两条。
-5. 与已有笔记冲突时以新观察为准（人的偏好会变）。
+5. 与已有笔记冲突时以新观察为准（越新的改稿越代表这个项目现在要怎么写）。
 6. 总长度控制在 20 行以内。超了就合并最弱的几条。
 
 只输出笔记正文，不要解释，不要 markdown 标题。"""
@@ -7136,7 +7183,7 @@ def build_distillation_task(client, project_id: str, *, user_id: str,
              f"  标题：{e.get('my_title','')}\n"
              f"  正文：{(e.get('my_body') or '')[:400]}")
         if e.get("note"):
-            b += f"\n  本人备注：{e['note']}"
+            b += f"\n  改稿备注：{e['note']}"
         blocks.append(b)
 
     total_pending = store.count_pending_distillation(client, project_id, user_id)
@@ -7152,7 +7199,7 @@ def build_distillation_task(client, project_id: str, *, user_id: str,
     if total_pending > len(edits):
         out["more_pending"] = total_pending - len(edits)
         out["note"] = (
-            f"这个人还有 {total_pending - len(edits)} 条精修没进本次快照"
+            f"这个项目还有 {total_pending - len(edits)} 条精修没进本次快照"
             f"(一次最多取 {max_edits} 条)。写回之后【再调一次 record_edit 或看 "
             "my_style】会拿到下一批, 别以为一次就吸收完了。")
     return out
@@ -7175,7 +7222,7 @@ def save_my_style(client, project_id: str, notes: str, *, user_id: str,
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     notes = (notes or "").strip()
     if not notes:
-        raise ValueError("notes 不能为空 —— 空笔记会把已有的个人风格清掉")
+        raise ValueError("notes 不能为空 —— 空笔记会把这个项目已有的调校笔记清掉")
     store.save_user_calibration(client, project_id, user_id, notes)
     marked = store.mark_edits_distilled(client, project_id, user_id, edit_ids or [])
     out = {"saved": True, "notes": notes, "lines": len(notes.splitlines()),
@@ -7213,17 +7260,16 @@ def label_example(client, item_id: str, label: str | None,
     if label not in ("positive", "negative", None):
         raise ValueError("label must be 'positive', 'negative' or None")
     if not user_id:
-        raise PermissionError(
-            "label_example 需要调用者身份 —— 正负例是个人资产, 不能匿名改。"
-            "服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID。")
+        logger.warning("label_example: 认不出调用者身份, 拒绝 —— 服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID")
+        raise PermissionError(IDENTITY_REFUSED.format(what="不能标正负例"))
 
     owner = store.item_owner(client, item_id)
     if owner is None:
         raise ValueError(f"item not found: {item_id}")
     if str(owner) != str(user_id):
+        # 团队共用一个身份(2026-10-30 复审): 不再说「个人风格资产 / 私有层」—— 这个身份名下的正负例是写这个项目的人共用的
         raise PermissionError(
-            f"item {item_id} 属于别人, 不能改它的 example_label。"
-            "正负例是个人风格资产(私有层), 项目规则才是团队共享的。")
+            f"item {item_id} 不在这个身份名下, 不能改它的 example_label; 请用户找负责人看一下。")
 
     db.set_item_example_label(client, item_id, label)
     return {"item_id": item_id, "example_label": label}
@@ -7609,9 +7655,9 @@ def create_project(client, name: str, *, brand: str = "",
     带 ``archived: true``。
     """
     if not user_id:
-        raise PermissionError(
-            "无法识别调用者身份, 不能建项目 —— 项目归属按 owner 隔离。"
-            "服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID。")
+        logger.warning("create_project: 认不出调用者身份, 拒绝(项目归属按 owner 隔离) —— 服务端要配 DESKCORE_KEYS 或 "
+                       "DESKCORE_DEFAULT_USER_ID")
+        raise PermissionError(IDENTITY_REFUSED.format(what="不能建项目"))
 
     name = (name or "").strip()
     if not name:
@@ -7815,9 +7861,9 @@ def list_projects(client, *, user_id: str | None = None, include_archived: bool 
     清单本身。藏掉的不算规则 / 指纹数 —— 计数仍是 3 次固定查询, 只是 id 少了。
     """
     if not user_id:
-        raise PermissionError(
-            "无法识别调用者身份, 不能列项目 —— 清单按 owner 隔离。"
-            "服务端要配 DESKCORE_KEYS 或 DESKCORE_DEFAULT_USER_ID。")
+        logger.warning("list_projects: 认不出调用者身份, 拒绝(清单按 owner 隔离) —— 服务端要配 DESKCORE_KEYS 或 "
+                       "DESKCORE_DEFAULT_USER_ID")
+        raise PermissionError(IDENTITY_REFUSED.format(what="不能列项目"))
     projects = store.list_all_projects(client, owner_id=user_id)
     if not include_archived:
         live = [p for p in projects if not project_archived(p)]

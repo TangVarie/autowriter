@@ -88,7 +88,9 @@ def notice(local: Optional[str], current: str) -> dict:
         "current": current,
         "message": (f"写作台 skill 不是最新版（你手上的是 {local}，最新是 {current}），请先升级：\n"
                     f"{UPDATE_URL}\n{UPDATE_COMMAND}"),
-        "action": "把 message 原样（三行都要）放在给用户回复的最前面，然后照常继续；不要改写链接和「更新技能」那一行。",
+        # 2026-10-30 复审: 开场顺序是 项目名 → 这条 → 改稿摘要(protocol.md 第 1 条); 原来说「放在最前面」, 会顶到项目名前面去
+        "action": ("把 message 原样（三行都要）放进开场、复述项目名之后（写评论没有项目名，放在开场就行），同一条只放一次；"
+                   "然后照常继续，不另说别的升级话；不要改写链接和「更新技能」那一行。"),
     }
 
 
