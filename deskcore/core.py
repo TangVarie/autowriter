@@ -2800,16 +2800,19 @@ def _note_from_text(client, project_id: str, post_body: str) -> dict | None:
                          if r.get("tv_project_id")})
         if not tv_ids:
             return None
-        hits: list[tuple[float, dict]] = []
+        found: dict[str, tuple[float, dict]] = {}
         for run in runs:
             for row in store.tv_notes_by_text_run(client, run, tv_ids):
                 if str(row.get("project_id") or "") not in tv_ids or not row.get("note_id"):
                     continue
                 score = _text_score(pasted, *_tv_post_text(row))
                 if score >= TEXT_MATCH_SIM:
-                    hits.append((score, row))
-            if hits:
+                    found[str(row["note_id"])] = (score, row)
+            # 第一段找到原文(规范化后一字不差)才停。只找到改过几个字的另一篇时, 用第二段再查一次、两段的一起排:
+            # 原文里这一段要是标点和贴来的不一样, ilike 正好漏掉它, 而第二段查得到(codex review on aw#138)
+            if any(score >= 1.0 for score, _ in found.values()):
                 break
+        hits = list(found.values())
         if not hits:
             return None
         try:

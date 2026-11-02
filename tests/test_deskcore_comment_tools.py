@@ -226,6 +226,25 @@ def test_an_unmapped_desk_project_does_not_query_tv():
     assert out["source"] == "pasted" and _notes_calls(c) == []
 
 
+def test_a_near_hit_on_the_first_probe_does_not_hide_the_exact_post_behind_the_second():
+    """codex review on aw#138: 原文第一段里多了个逗号, 第一段的 ilike 漏掉它, 却查到一篇改过几个字的另一篇(过线);
+    不能就此停下 —— 第二段查得到原文(规范化后一字不差), 两段一起排, 回原文和它自己的评论。"""
+    first = core._text_probe(BODY_A)[1][0]
+    original = _note("A", body=BODY_A.replace(first, first[:6] + "，" + first[6:]))
+    other = _note("B", body=BODY_A.replace("涨了一千出头", "涨了一千多"), when="2026-10-28T16:00:00")
+    assert core._text_score(core._text_probe(BODY_A)[0], TITLE_A, other["raw_content"].split("【正文】")[1]) \
+        >= core.TEXT_MATCH_SIM, "另一篇确实过线, 否则测不到"
+    c = _tv_client(notes=[original, other], comments=[_comment("A"), _comment("B", "别的帖子的评论")])
+    out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)
+    assert out["source"] == "tv_by_text" and out["note_id"] == "A"
+    assert [x["text"] for x in out["existing_comments"]] == ["自己录语音用的什么软件呀"]
+    assert len(_notes_calls(c)) == 2, "第一段只有近似命中才查第二段"
+    # 第一段就是原文时只查一次
+    c = _tv_client(notes=[_note("A"), other], comments=[])
+    assert core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)["note_id"] == "A"
+    assert len(_notes_calls(c)) == 1
+
+
 def test_live_wins_over_vanished_then_the_closest_then_the_latest():
     # 挪表: 同一条链接在 TV 里两行, 旧表那行已删
     old = _note(f"{TV}_old", when="2026-10-25T16:00:00")

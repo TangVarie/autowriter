@@ -1041,7 +1041,7 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 | 步 | 做什么 | 口径 |
 |---|---|---|
 | 拆 | 带「【标题】…【正文】…」标记的按标记拆（`tvlink.parse_raw`），不带的整段当正文；剥话题（`tvlink.strip_hashtags`）。去标点后不到 20 字不查 | 同 `tvlink.MIN_PREFIX`：太短的到处撞 |
-| 粗筛 | 正文里最长的两段连续汉字 / 字母 / 数字（`store.TV_TEXT_RUN_CHARS`，≥ 8 字，截前 16 字），逐段 `ilike` 一次 `raw_content`，新发布的在前、一页 30 条（`store.tv_notes_by_text_run`）。第一段对上了就不查第二段，最多两次 | 进 PostgREST 过滤串的只有这几类字符（没有 `%` `_` `,` `(` `)` 空格），照样过 `_like_escape`；段不合规的 store 层直接回空、不发请求。只比 `raw_content`：生产库 6838 行 `body` 列全空、`raw_content` 每行都有 |
+| 粗筛 | 正文里最长的两段连续汉字 / 字母 / 数字（`store.TV_TEXT_RUN_CHARS`，≥ 8 字，截前 16 字），逐段 `ilike` 一次 `raw_content`，新发布的在前、一页 30 条（`store.tv_notes_by_text_run`）。第一段对上原文（规范化后一字不差）就不查第二段；第一段没对上、或只对上改过几个字的另一篇，再查第二段，两段的一起排（codex review on aw#138），最多两次 | 进 PostgREST 过滤串的只有这几类字符（没有 `%` `_` `,` `(` `)` 空格），照样过 `_like_escape`；段不合规的 store 层直接回空、不发请求。只比 `raw_content`：生产库 6838 行 `body` 列全空、`raw_content` 每行都有 |
 | 细比 | 去标点、剥话题之后的四字串，交集占**较大那一边**的比例 ≥ 0.90（`core.TEXT_MATCH_SIM`；完全一样直接算 1；两边都要有 15 个四字串，太短的只认完全一样）。只比正文对正文（`core._text_score`）：贴来的开头就是这条笔记的标题、笔记正文自己又不以标题开头时，那一截是正文格里的标题行，剥掉再比 | 两个方向的包含度都要够、长度也要差不多：一句共用的话术过不了，一篇整段包含另一篇、多出一成以上的也过不了。标题不进分：阈值是按正文对正文量的，同标题的另一版带上标题会被推过线（见下） |
 | 多条都像 | 先按帖子（发布链接）比谁更像；同一条链接的几行里活的优先（`v_notes_vanished` 里的让位，同 `_note_from_link`），再取更像的；一样像的再看活不活、再取发布最近的；视图读不到就当都活着 | 同一段文案改几个字又发一次：贴来的是哪一版就取哪一版。别的帖子活着、只是够像，不压过这篇只剩已删那行的原文 |
 | 回包 | `source = "tv_by_text"`，带 `note_id` / `tier` / `existing_comments`（截断说明照旧）和一句 `tv_by_text_note`（是按正文对上的；同一段正文发过不止一条时取最近的；用户说不是这一篇就别用 `existing_comments` / `note_id`，照贴来的正文写、不用再调——链接在 TV 里没找到时带链接再调还是走这条路、对上同一篇）；只剩已删那行时带 `tv_note_vanished` 和按正文的说法 | 标题正文照旧用贴来的，TV 那份只用来取评论 |
