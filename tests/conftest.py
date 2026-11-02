@@ -32,3 +32,39 @@ os.environ.setdefault("AW_DISABLE_ST_CACHE", "1")
 os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
 os.environ.setdefault("SUPABASE_ANON_KEY", "placeholder-anon-key")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "placeholder-service-key")
+
+
+def pytest_configure(config):
+    # 慢用例(几秒级的模拟闸, angle cards v2 §5.6): 默认照跑, `-m "not slow"` 可以跳过
+    config.addinivalue_line("markers", "slow: 几秒级的模拟 / 回测用例(默认照跑, -m 'not slow' 跳过)")
+
+
+# ── 发牌先验的进程缓存(deskcore/priors.py, angle cards v2 §4) ──────────────────────────────────────
+# 生产里先验在两个后台线程里建(open_project 只投递不等, draw_angles 至多等 2.5 秒)。用例里换成「投递就地跑完」的池子:
+# 走假件的构建几毫秒就完, 就地跑让每条用例对假件发了哪些请求是确定的(后台线程跑的话, 简报回来之后它还在往同一个假件
+# 上发请求, 数请求的断言会时红时绿)。每条用例从空缓存开始, 别的用例建好的先验不串进来。
+# 要测「冷缓存 / 慢 TV 不拖慢 open_project」的用例自己调 priors.reset_cache() 换回真的线程池(tests/test_priors.py、
+# tests/test_project_now.py)。
+import pytest  # noqa: E402
+
+
+class _InlinePool:
+    def submit(self, fn, fut):
+        if not fut.set_running_or_notify_cancel():
+            return
+        try:
+            fut.set_result(fn())
+        except BaseException as exc:                    # noqa: BLE001 — 交给 Future, 同真池子
+            fut.set_exception(exc)
+
+    def wait_idle(self, timeout: float = 10.0) -> bool:
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _angle_priors_cache():
+    from deskcore import priors
+    priors.reset_cache()
+    priors._POOL[0] = _InlinePool()
+    yield
+    priors.reset_cache()

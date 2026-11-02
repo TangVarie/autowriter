@@ -1,0 +1,253 @@
+"""draw-report(angle cards v2 §5.2 / §5.3): 纯函数的口径 + CLI 走假库一遍(只读)。
+
+数据全是合成的: 两个写作台项目、手写的台账行(dims._draw 照 drawpolicy 的键)、对照表 / 差异表 / 查重底稿各几行、
+发出去的几篇只有评论数和 tier。
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from deskcore import cli, drawreport as dr
+from tests.fakes import FakeClient
+
+NOW = datetime(2026, 12, 1, 4, 0, tzinfo=timezone.utc)
+P1, P2 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+
+def _iso(days):
+    return (NOW - timedelta(days=days)).isoformat()
+
+
+def _card(i, *, src="w", project=P1, days=10, consumed_after=None, lever="愤怒撬动", p=0.02, pu=0.01,
+          pv=(0.84, 0.6, 0.2, 0.3), pol="v2"):
+    d = {"v": 2, "pol": pol, "b": "b0", "i": 1, "src": src, "sp": 0.5, "p": p, "pu": pu, "pv": list(pv),
+         "st": "run", "ps": "live", "dd": "py"}
+    dims = {"emotional_lever": lever, "human_truth_archetype": "健康焦虑", "content_format": "提问求助",
+            "title_structure": "疑问句", "_draw": d}
+    return {"id": f"l{i}", "project_id": project, "angle_key": f"{i:020x}", "dims": dims, "drawn_by": "u",
+            "drawn_at": _iso(days),
+            "consumed_version_id": f"v{i}" if consumed_after is not None else None,
+            "consumed_at": _iso(days - consumed_after) if consumed_after is not None else None}
+
+
+def test_m1_counts_only_cards_old_enough_and_consumed_within_three_days():
+    rows = [_card(1, consumed_after=1), _card(2, consumed_after=5), _card(3), _card(4, days=1, consumed_after=0.5)]
+    cards = {c["key"]: c for c in dr.card_rows(rows, now=NOW)}
+    assert [cards[f"{i:020x}"]["m1"] for i in (1, 2, 3, 4)] == [1, 0, 0, None], "第 4 张还没到 D+3, 不算 0"
+    assert all(c["m2"] is None for c in cards.values()), "没有对照表就读不到 M2"
+
+
+def test_m2_m3_m5_m6_from_links_diffs_and_notes():
+    rows = [_card(i, consumed_after=1) for i in range(1, 5)]
+    adoption = {"by_version": {
+        "v1": {"note_id": "n1", "title_changed": False, "draft_chars": 500, "published_chars": 480},
+        "v2": {"note_id": "n2", "title_changed": True, "draft_chars": 500, "published_chars": 500},
+        "v3": {"note_id": "n3", "title_changed": False, "draft_chars": 500, "published_chars": 300}}}
+    notes = {"n1": {"publish_time": _iso(6), "comments_count": 25, "tier": "爆"},
+             "n2": {"publish_time": _iso(6), "comments_count": 3, "tier": None},
+             "n3": {"publish_time": _iso(1), "comments_count": 50, "tier": None}}
+    cards = {c["key"][-1]: c for c in dr.card_rows(rows, adoption=adoption, notes=notes, now=NOW)}
+    assert [cards[k]["m2"] for k in "1234"] == [1, 1, 1, 0]
+    assert [cards[k]["m3"] for k in "1234"] == [1, 0, 0, 0], "标题改了 / 字数少过 0.85 都不算留着"
+    assert [cards[k]["m5"] for k in "123"] == [1, 0, None], "发出不满三天的不算"
+    assert [cards[k]["m6"] for k in "123"] == [1, 0, 0]
+
+
+def test_m3_is_unknown_until_the_title_and_both_char_counts_are_known():
+    """差异还没算 / 读不到(title_changed None)、字数缺一样: M3 是 None(不进分母), 不是 0, 也不能当字数够了记 1
+    (review on aw#140)。没发出去的仍然是 0。"""
+    rows = [_card(i, consumed_after=1) for i in range(1, 7)]
+    adoption = {"by_version": {
+        "v1": {"note_id": "n1", "title_changed": None, "draft_chars": 500, "published_chars": 480},
+        "v2": {"note_id": "n2", "title_changed": False, "draft_chars": None, "published_chars": None},
+        "v3": {"note_id": "n3", "title_changed": False, "draft_chars": 500, "published_chars": None},
+        "v4": {"note_id": "n4", "title_changed": None, "draft_chars": None, "published_chars": None},
+        "v5": {"note_id": "n5", "title_changed": False, "draft_chars": 500, "published_chars": 450}}}
+    cards = {c["key"][-1]: c for c in dr.card_rows(rows, adoption=adoption, now=NOW)}
+    assert [cards[k]["m2"] for k in "123456"] == [1, 1, 1, 1, 1, 0]
+    assert [cards[k]["m3"] for k in "123456"] == [None, None, None, None, 1, 0]
+    rep = dr.report(rows, adoption=adoption, now=NOW)
+    assert rep["by_source"]["w"]["m3"] == {"n": 2, "y": 1, "rate": 0.5}
+
+
+def test_d1_is_reject_or_warn_among_checks_after_the_draw():
+    rows = [_card(1), _card(2), _card(3)]
+    snaps = [{"project_id": P1, "angle_key": f"{1:020x}", "status": "reject", "checked_at": _iso(9)},
+             {"project_id": P1, "angle_key": f"{2:020x}", "status": "pass", "checked_at": _iso(9)},
+             {"project_id": P1, "angle_key": f"{3:020x}", "status": "warn", "checked_at": _iso(12)}]   # 抽之前的不算
+    d1 = [c["d1"] for c in dr.card_rows(rows, snapshots=snaps, now=NOW)]
+    assert d1 == [1, 0, None]
+
+
+def test_d1_checks_belong_to_the_draw_they_follow_not_to_a_later_reissue():
+    """同一个 key 重发(repeat_of)之后的查重归重发的那一张, 不再算回原来那一张(review on aw#140)。别的项目同一个 key
+    的发牌不截断这一个项目的窗口。"""
+    key = f"{1:020x}"
+    orig = _card(1, days=10, consumed_after=1)
+    rep = _card(2, src="rep", days=5)
+    rep["angle_key"] = key
+    theirs = _card(3, project=P2, days=8)
+    theirs["angle_key"] = key
+    snaps = [{"project_id": P1, "angle_key": key, "status": "pass", "checked_at": _iso(9.5)},     # 原来那张的查重
+             {"project_id": P1, "angle_key": key, "status": "reject", "checked_at": _iso(4)}]     # 重发那张的查重
+    d1 = {(c["project"], c["src"]): c["d1"] for c in dr.card_rows([rep, orig, theirs], snapshots=snaps, now=NOW)}
+    assert d1[(P1, "w")] == 0, "重发之后的 reject 不归原来那张"
+    assert d1[(P1, "rep")] == 1
+    assert d1[(P2, "w")] is None
+
+
+def test_mantel_haenszel_by_project():
+    rows = []
+    i = 0
+    # P1: w 8/10, x 4/10;  P2: w 2/10, x 1/10
+    for proj, src, y, n in ((P1, "w", 8, 10), (P1, "x", 4, 10), (P2, "w", 2, 10), (P2, "x", 1, 10)):
+        for k in range(n):
+            i += 1
+            rows.append(_card(i, src=src, project=proj, consumed_after=1 if k < y else None))
+    mh = dr.mantel_haenszel(dr.card_rows(rows, now=NOW), "w", "x", "m1")
+    assert mh["strata"] == 2 and (mh["y_treat"], mh["n_treat"], mh["y_ctrl"], mh["n_ctrl"]) == (10, 20, 5, 20)
+    assert mh["rd_mh"] == pytest.approx(0.25) and mh["rr_mh"] == pytest.approx(2.0)
+
+
+def test_uniform_estimate_is_the_explore_card_rate():
+    """配额内均匀乱抽只用试新牌估(review round 2 on aw#140): w 牌(策略偏爱的格子, p 大 pu 小)不再按 pu / p 并进来,
+    估计就是 x 牌的比例; observed 仍是 w + x 实际的比例。"""
+    rows = [_card(i, src="w", p=0.04, pu=0.01, consumed_after=1) for i in range(1, 9)]
+    rows += [_card(i, src="x", p=0.01, pu=0.01, consumed_after=1 if i == 9 else None) for i in range(9, 13)]
+    est = dr.ipw_uniform(dr.card_rows(rows, now=NOW), "m1")
+    assert est["explore_cards"] == 4 and est["estimate"] == pytest.approx(1 / 4, abs=1e-4)
+    assert est["observed_cards"] == 12 and est["observed"] == pytest.approx(9 / 12, abs=1e-3)
+    assert dr.ipw_uniform(dr.card_rows(rows[:8], now=NOW), "m1")["estimate"] is None, "没有试新牌就没有估计"
+
+
+def test_uniform_estimate_uses_explore_cards_only_when_the_weighted_arm_cannot_reach_a_cell():
+    """review round 2 on aw#140: 一批里「疑问句」到了标题封顶, w 槽在它的格子上 p = 0, 试新分布却还有 pu > 0(试新牌不设
+    标题封顶) —— 这一类格子只有 x 牌代表。原来 w 牌按 pu / p 加权和 x 牌并在一起估「配额内均匀乱抽」, w 牌只摊薄它们:
+    占均匀分布 11.4% 的「疑问句」被估成 2.5% 上下。现在只用 x 牌(它们就是这个策略的直接样本), w 牌一张都不进估计。
+    指标 m1 这里就记「这一张是不是疑问句」, 所以真值 = 试新分布在疑问句上的质量。"""
+    import random
+
+    from deskcore import drawpolicy as dp, priors
+    prof = priors.uniform_profile("fx")
+    prof.update(stage="run", n_res=200, ps="live")
+    st = dp.ledger_state([], NOW)
+    f, capped = "提问求助", "疑问句"
+    batch = [("愤怒撬动", "健康焦虑", f, capped), ("焦虑撬动", "经济焦虑", f, capped)]     # 非试新的两张: 到封顶
+    w = dp.slot_distribution(prof, st, {"f": f, "src": "w"}, batch_cells=batch, n=10, n_nonx=8)
+    x = dp.slot_distribution(prof, st, {"f": f, "src": "x"}, batch_cells=batch, n=10, n_nonx=8)
+    truth = sum(pu for c, (_p, pu) in x.items() if c[3] == capped)
+    assert truth == pytest.approx(0.114, abs=0.001)
+    assert all(p == 0 and pu > 0 for c, (p, pu) in w.items() if c[3] == capped), "w 抽不到, 试新抽得到"
+    rng = random.Random(20261102)
+    rows = []
+    for src, dist, n in (("w", w, 2000), ("x", x, 500)):           # 份额 0.8 / 0.2
+        cells = [c for c, (p, _pu) in dist.items() if p > 0]
+        for c in rng.choices(cells, weights=[dist[c][0] for c in cells], k=n):
+            r = _card(len(rows) + 1, src=src, p=dist[c][0], pu=dist[c][1],
+                      consumed_after=1 if c[3] == capped else None)
+            r["dims"].update(dict(zip(dp.DIMS4, c)))
+            rows.append(r)
+    cards = dr.card_rows(rows, now=NOW)
+    est = dr.ipw_uniform(cards, "m1")
+    assert est["estimate"] == pytest.approx(truth, abs=0.03), est
+    assert est["explore_cards"] == 500 and est["observed_cards"] == 2500
+    # w 牌不进估计: 把 w 牌的结果全翻过来, 估计一个字不变
+    for c in cards:
+        if c["src"] == "w":
+            c["m1"] = 1 - c["m1"]
+    assert dr.ipw_uniform(cards, "m1")["estimate"] == est["estimate"]
+    assert "试新牌 500 张" in dr.format_report(dr.report(rows, now=NOW))
+
+
+def test_x_only_lever_lift_uses_explore_cards_only():
+    rows = [_card(i, src="x", lever="愤怒撬动", consumed_after=1) for i in range(1, 5)]
+    rows += [_card(i, src="x", lever="共鸣释放") for i in range(5, 9)]
+    rows += [_card(i, src="w", lever="共鸣释放", consumed_after=1) for i in range(9, 30)]   # w 不进
+    got = dr.x_only_lever_lift(dr.card_rows(rows, now=NOW), "m1")
+    assert got["cards"] == 8 and got["base_rate"] == 0.5
+    assert got["lift"]["愤怒撬动"]["lift"] == pytest.approx((4 + 1) / 6 / 0.5, abs=1e-3)
+    assert got["lift"]["共鸣释放"]["lift"] == pytest.approx((0 + 1) / 6 / 0.5, abs=1e-3)
+
+
+def test_health_flags_off_quota_writer_share_and_fallbacks():
+    rows = [_card(1), _card(2, pv=(0.0, 0.5, 0.1, 0.1)), _card(3, src="pin", pv=(0.0, 1, 1, 1)), _card(4, src="rep"),
+            _card(5, src="fb"), _card(6, src="v1", pol="v1")]
+    h = dr.health(dr.card_rows(rows, now=NOW), now=NOW)[P1]
+    assert h["off_quota_share"] == 0.5, "pin 出来的配额外不算"
+    assert h["writer_share"] == round(2 / 5, 3) and h["fb_share"] == round(1 / 6, 3)
+    assert h["distinct_keys_per_card_30d"] == 1.0 and h["max_lever_share_14d"] == 1.0
+    rep = dr.report(rows, now=NOW)
+    assert rep["by_source"]["w"]["cards"] == 2 and {r["src"] for r in rep["table"]} >= {"w", "pin", "rep", "fb", "v1"}
+    assert "draw-report" in dr.format_report(rep)
+
+
+def _batch(b, start, srcs, *, plan, n, sp):
+    """一批发出去的牌: srcs 是实际落下来的来源(e 槽没参考帖时按 w 发, 带的是 w 的份额); plan 是这一批的整张计划。"""
+    rows = []
+    for k, s in enumerate(srcs):
+        r = _card(start + k, src=s)
+        r["dims"]["_draw"].update(b=b, i=k + 1, sp=sp[s], pn=n, pl=dict(plan))
+        rows.append(r)
+    return rows
+
+
+def test_planned_sources_are_the_whole_plan_once_per_batch():
+    """计划张数 = 每批 n·份额, 每批只算一次(review on aw#140): 原来按每张实际落下的来源加它的 sp, 10 张 w .8 / x .2 的
+    一批报成 w 6.4 / x 0.4; 一张都没落下的来源(e 槽退回 w)整个不见。"""
+    rows = _batch("B1", 1, ["w"] * 8 + ["x"] * 2, plan={"w": 0.8, "x": 0.2}, n=10, sp={"w": 0.8, "x": 0.2})
+    rows += _batch("B2", 20, ["w"] * 4 + ["x"], plan={"w": 0.6, "x": 0.2, "e": 0.2}, n=5,
+                   sp={"w": 0.6, "x": 0.2})
+    h = dr.health(dr.card_rows(rows, now=NOW), now=NOW)[P1]
+    assert h["sources"] == {"w": 12, "x": 3}
+    assert h["sources_planned"] == {"w": 11.0, "x": 3.0, "e": 1.0}
+
+
+def test_legacy_rows_without_draw_are_their_own_source():
+    row = _card(1)
+    row["dims"].pop("_draw")
+    assert dr.card_rows([row], now=NOW)[0]["src"] == "legacy"
+
+
+def test_cli_reads_only_and_reports(monkeypatch, capsys):
+    rows = [_card(i, src="w" if i % 2 else "x", consumed_after=1) for i in range(1, 7)]
+    for r in rows:
+        r["drawn_at"] = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        r["consumed_at"] = (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()
+    c = FakeClient(rows={
+        "angle_ledger": rows,
+        "tv_note_links": [{"note_id": "n1", "version_id": "v1", "match_kind": "body_exact"}],
+        "tv_edit_diffs": [{"note_id": "n1", "title_changed": False, "draft_chars": 400, "published_chars": 400}],
+        "draft_snapshots": [{"id": "s1", "project_id": P1, "angle_key": rows[0]["angle_key"], "status": "warn",
+                             "checked_at": datetime.now(timezone.utc).isoformat(), "title": "不该被取", "body": "不该被取"}],
+        "truth_vault.notes": [{"note_id": "n1", "publish_time": _iso(20), "comments_count": 22, "tier": None,
+                               "raw_content": "不该被取"}],
+    })
+
+    class Args:
+        days, project, json = 28, None, True
+    assert cli._draw_report(c, Args) == 0
+    out = capsys.readouterr().out
+    assert '"cards": 6' in out and "m1" in out
+    assert not [x for x in c.calls if x["op"] != "select"], "只读"
+    snap = next(x for x in c.calls if x["table"] == "draft_snapshots")
+    assert "title" not in snap["cols"] and "body" not in snap["cols"]
+    notes = next(x for x in c.calls if x["table"] == "truth_vault.notes")
+    assert "raw_content" not in notes["cols"] and "title" not in notes["cols"]
+
+
+
+def test_planned_sources_prefer_the_slot_counts_the_batch_actually_planned():
+    """复审 on aw#140: 外部保底(小批)和外部封顶(大批)之后排出来的槽位数不等于 n·份额; 记了 pk 就按 pk 算,
+    没记的老牌照旧 n·份额。"""
+    rows = _batch("B1", 1, ["w"] * 17 + ["x"] * 6 + ["e"] * 4 + ["h"] * 3,
+                  plan={"w": 0.5, "x": 0.2, "e": 0.2, "h": 0.1}, n=30,
+                  sp={"w": 0.5, "x": 0.2, "e": 0.2, "h": 0.1})
+    for r in rows:
+        r["dims"]["_draw"]["pk"] = {"w": 17, "x": 6, "e": 4, "h": 3}
+    rows += _batch("B2", 40, ["w", "x", "e"], plan={"w": 0.55, "x": 0.2, "e": 0.25}, n=3,
+                   sp={"w": 0.55, "x": 0.2, "e": 0.25})
+    h = dr.health(dr.card_rows(rows, now=NOW), now=NOW)[P1]
+    assert h["sources_planned"]["e"] == pytest.approx(4 + 0.75, abs=0.06)    # 报表保留一位小数
+    assert h["sources_planned"]["w"] == pytest.approx(17 + 1.65, abs=0.06)

@@ -24,6 +24,14 @@
   python -m deskcore.cli compile-rules (--project <uuid> | --all) [--force] [--dry-run]
                                                     ← 把规则交给 Jev 编成写后检查, 结果缓存进
                                                       rule_compiles(check_rules 用; 后台也会自己补编)
+  python -m deskcore.cli angle-prior --project <uuid> [--backtest] [--cells cells.json --mix mix.json] [--json]
+                                                    ← 发牌 v2 的先验(只读): 项目的 π 表 / 上线前的回测闸
+  python -m deskcore.cli angle-sim --project <uuid|TV 项目号> --days 28 --per-day 5|10 [--seeds 5] [--profile p.json]
+                                                    ← 发牌 v2 的模拟(假台账, 不写库): 5 张/天判上线闸, 10 张/天只报数;
+                                                      TV 项目号 / --profile 不连库(用 vendored 快照 / 给的 Profile)
+  python -m deskcore.cli draw-report --days 28 [--project <uuid>] [--json]
+                                                    ← 发牌 v2 的读数(只读): 来源 × 项目 × 周的 M1/M2/M3/D1/M5/M6、
+                                                      MH 比较、配额内均匀乱抽和杠杆提升(都只用试新牌)、健康指标
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
                                                     ← TV 的笔记按内容对到写作台的版本,
                                                       对不上的补进指纹库(每天跑一次); --all 跑完
@@ -303,6 +311,115 @@ def _ingest(core, sb, args) -> int:
               "version_id 幂等, 会把有身份没指纹的行补上。")
         rc = 1
     return rc
+
+
+def _fmt_shares(d: dict | None, *, top: int = 12, floor: float = 0.0) -> str:
+    items = sorted(((k, v) for k, v in (d or {}).items() if v is not None and v >= floor), key=lambda kv: -kv[1])
+    return " · ".join(f"{k} {v:.3f}" for k, v in items[:top]) or "-"
+
+
+def _print_profile(prof: dict) -> None:
+    """angle-prior --project 的人读版: 阶段、先验从哪来、四张 π 表、提升和带子。"""
+    tv, lift, mix = prof.get("tv") or {}, prof.get("lift") or {}, prof.get("mix") or {}
+    print(f"项目 {prof.get('project_id')} · 阶段 {prof.get('stage')} (已出标签 {prof.get('n_res')}) · "
+          f"全局先验 {prof.get('ps')}" + (f" ({prof.get('prior_age_min')} 分钟前)" if prof.get("prior_age_min") is not None
+                                    else "") + f" · 项目块 {prof.get('pp')}")
+    print(f"TV: 当前 {tv.get('current') or '-'} · 对照 {', '.join(tv.get('ids') or []) or '-'} · 同品牌 "
+          f"{', '.join(tv.get('brand_ids') or []) or '-'}(上一期 {', '.join(tv.get('earlier_ids') or []) or '-'}) · "
+          f"品类 {tv.get('category') or '-'}")
+    ref = prof.get("ref") or {}
+    print(f"配比参照: {ref.get('source')} {ref.get('ids') or ''} · 近{mix.get('window_days')}天 {mix.get('posts')} 篇 "
+          f"({mix.get('per_day')}/天) · 已发问句占比(收缩后) q={mix.get('question_share', 0):.3f}")
+    pi = prof.get("pi") or {}
+    print(f"\n内容形式 π: {_fmt_shares(pi.get('content_format'))}")
+    print(f"标题句式 π: {_fmt_shares(pi.get('title_structure'))}")
+    print(f"    P(疑问句)={lift.get('p_question', 0):.3f}  P*={lift.get('p_star', 0):.3f}  带子 "
+          f"[{(lift.get('band') or [0, 0])[0]:.3f}, {(lift.get('band') or [0, 0])[1]:.3f}]  "
+          f"L_T {_fmt_shares(lift.get('title'))}  品牌层 {_fmt_shares(lift.get('title_brand'))}  "
+          f"本项目标题起量 {lift.get('title_successes')}")
+    print(f"情绪杠杆 π: {_fmt_shares(pi.get('emotional_lever'))}")
+    print(f"    提升 L (β={lift.get('beta')}): {_fmt_shares(lift.get('emotional_lever'))}")
+    print(f"人性原型 π: {_fmt_shares(pi.get('human_truth_archetype'), floor=0.02)}")
+    ex = prof.get("extras") or {}
+    print(f"情绪浓度: {_fmt_shares(ex.get('emotional_intensity'))} · 时效: {_fmt_shares(ex.get('trend_dependencies'), top=4)}")
+    ext = prof.get("ext") or {}
+    print(f"\n外部参考: 品类 {ext.get('category') or '-'} · {ext.get('state')} · 可用 {ext.get('eligible', 0)} 篇 · "
+          f"ok={ext.get('ok')} · 近14天 {ext.get('recent_14d')} · {', '.join(ext.get('top_structures') or [])}")
+    hits = prof.get("hits") or []
+    print(f"起量帖: 本项目 {sum(1 for h in hits if h.get('own'))} 篇 · 同品牌其他期 {sum(1 for h in hits if not h.get('own'))} 篇")
+    w = prof.get("working") or {}
+    if w:
+        print(f"已出标签 {w.get('resolved')} 篇, 起量 {w.get('successes')} 篇 · 按标题 {w.get('by_title')}")
+
+
+def _angle_prior(args) -> int:
+    """发牌 v2 的先验(只读)。--project 打印 Profile; --backtest 跑 §5.6 的两道闸(--cells 给了就离线, 不连库)。"""
+    import json as _json
+    from . import priors, priors_backtest as bt
+    rc = 0
+    if args.backtest:
+        if args.cells:
+            sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "scripts"))
+            import build_angle_priors as bap
+            with open(args.cells, encoding="utf-8") as fh:
+                cells = bap.parse_cells(_json.load(fh))
+            spans = None
+            if args.mix:
+                with open(args.mix, encoding="utf-8") as fh:
+                    spans = {str(r["p"]): tuple(str(r.get("span") or "/").split("/")) for r in _json.load(fh)}
+        else:
+            from . import core, store
+            sb = core.sb()
+            notes, answers = store.tv_notes_outcomes(sb), store.tv_title_answers(sb)
+            if notes is None or answers is None:
+                print("truth_vault 读不到(见上面的 WARN), 回测没跑。")
+                return 1
+            cells, spans = bt.cells_from_notes(notes, answers)
+        res = bt.backtest(cells, spans)
+        print(_json.dumps(res, ensure_ascii=False, indent=2) if args.json else bt.format_report(res))
+        if not (res["gates"]["gate1_reference"]["pass"] and res["gates"]["gate2_shipped"]["pass"]):
+            rc = 1
+    if args.project:
+        from . import core, store
+        sb = core.sb()
+        row = store.project_row(sb, args.project) or args.project
+        prof = priors.get_profile(sb, row, budget_s=args.wait)
+        if args.json:
+            _print(prof)
+        else:
+            _print_profile(prof)
+    return rc
+
+
+def _angle_sim_profile(args, *, live: bool):
+    """angle-sim 用哪个 Profile: --profile 给的 JSON(angle-prior --json 的输出) > vendored 快照里的 TV 项目号(只有聚合数,
+    起量帖按配比合成) > 写作台项目 uuid 现读(只读, live=True 时才走)。"""
+    from . import drawsim as ds, priors
+    if args.profile:
+        with open(args.profile, encoding="utf-8") as fh:
+            return json.load(fh)
+    prof = ds.fixture_profile(args.project) if args.project else None
+    if prof is not None or not live:
+        return prof
+    from . import core, store
+    sb = core.sb()
+    row = store.project_row(sb, args.project) or args.project
+    return priors.get_profile(sb, row, budget_s=args.wait)
+
+
+def _angle_sim(args, *, live: bool = False) -> int:
+    """发牌 v2 的模拟(§5.6): 假台账、按天发牌, 5 张/天判上线闸(几个 seed 平均), 10 张/天只报数。不写库。"""
+    from . import drawsim as ds
+    prof = _angle_sim_profile(args, live=live)
+    if prof is None:
+        print(f"angle-sim: 没有 {args.project} 的 Profile(不是快照里的 TV 项目号, 也没给 --profile)")
+        return 2
+    rep = ds.run(prof, days=args.days, per_day=args.per_day, seeds=range(max(args.seeds, 1)))
+    if args.json:
+        _print(rep)
+    else:
+        print(ds.format_report(rep))
+    return 0 if (not rep["gated"] or rep["pass"]) else 1
 
 
 def _tv_map(core, sb, args) -> int:
@@ -752,6 +869,30 @@ def _compile_rules(core, sb, args) -> int:
     return 1 if bad or not_tried else 0
 
 
+def _draw_report(sb, args) -> int:
+    """draw-report(§5.3): 只读。台账 → 销账版本对上 TV 的情况 → 查重底稿的结论 → 发出去那几篇的评论数, 然后算表。"""
+    from . import drawreport, store
+    rows = store.report_ledger_rows(sb, args.days, args.project)
+    if rows is None:
+        print("draw-report: 台账读不到, 什么都没算")
+        return 1
+    vids = sorted({str(r["consumed_version_id"]) for r in rows if r.get("consumed_version_id")})
+    adoption = store.desk_adoption(sb, vids)
+    if adoption is None:
+        print("draw-report: tv_note_links 读不到, M2 / M3 / M5 / M6 这次不算")
+    snaps = store.report_snapshot_verdicts(sb, args.days, args.project)
+    if snaps is None:
+        print("draw-report: draft_snapshots 读不到, D1 这次不算")
+    note_ids = [v["note_id"] for v in ((adoption or {}).get("by_version") or {}).values() if v.get("note_id")]
+    notes = store.report_note_outcomes(sb, note_ids) if note_ids else {}
+    rep = drawreport.report(rows, adoption=adoption, snapshots=snaps, notes=notes, days=args.days)
+    if args.json:
+        _print(rep)
+    else:
+        print(drawreport.format_report(rep))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="deskcore", description="写作台内核 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -905,11 +1046,49 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--note", required=True, help="tv_note_links.note_id")
     p.add_argument("--ingest", action="store_true", help="判定为对不上, 把 TV 的正文补进指纹库")
 
+    # 发牌 v2 的先验(angle cards v2 §5.6): 运维命令, 只读, 同 doctor 不要 --user。
+    p = sub.add_parser("angle-prior",
+                       help="发牌 v2 的先验: 打印项目的 Profile 和 π 表; --backtest 跑上线前的回测闸(只读)")
+    p.add_argument("--project", default=None, help="写作台项目 uuid(打印它的 Profile)")
+    p.add_argument("--backtest", action="store_true", help="前 10 天训练 / 第 14 天起预测, 两道闸 + rank 变体")
+    p.add_argument("--cells", default=None,
+                   help="离线回测: scripts/sql/angle_priors_export.sql 第一段导出的 JSON(不连库)")
+    p.add_argument("--mix", default=None, help="离线回测时项目的起止日期(第二段导出的 JSON); 不给就没有品牌层")
+    p.add_argument("--wait", type=float, default=120.0, help="--project 时最多等先验建好的秒数")
+    p.add_argument("--json", action="store_true")
+
+    # 发牌 v2 的模拟(angle cards v2 §5.6): 运维命令, 假台账、不写库, 同 angle-prior 不要 --user。
+    p = sub.add_parser("angle-sim", help="发牌 v2 的模拟: 假台账按天发牌, 5 张/天判上线闸、10 张/天只报数(不写库)")
+    p.add_argument("--project", default=None,
+                   help="写作台项目 uuid(现读 Profile, 只读), 或 vendored 快照里的 TV 项目号(不连库)")
+    p.add_argument("--profile", default=None, help="Profile 的 JSON 文件(angle-prior --json 的输出; 不连库)")
+    p.add_argument("--days", type=int, default=28)
+    p.add_argument("--per-day", dest="per_day", type=int, default=5)
+    p.add_argument("--seeds", type=int, default=5, help="跑几个 seed 取平均(0..seeds-1)")
+    p.add_argument("--wait", type=float, default=120.0, help="现读 Profile 时最多等先验建好的秒数")
+    p.add_argument("--json", action="store_true")
+
+    # 发牌 v2 的读数(angle cards v2 §5.3): 运维命令, 只读, 同 angle-prior 不要 --user。
+    p = sub.add_parser("draw-report", help="发牌 v2 的读数: 来源 × 项目 × 周的写了 / 发了 / 留着 / 撞车, MH 比较与健康(只读)")
+    p.add_argument("--days", type=int, default=28)
+    p.add_argument("--project", default=None, help="只看这一个写作台项目(uuid); 不给就全部")
+    p.add_argument("--json", action="store_true")
+
     args = ap.parse_args(argv)
     if args.cmd == "selftest":
         return selftest()
     if args.cmd == "sync-skill":
         return _sync_skill(check=args.check)
+    if args.cmd == "angle-prior":
+        if not (args.project or args.backtest):
+            ap.error("angle-prior: 给 --project 或 --backtest(或两个都给)")
+        if args.backtest and args.cells and not args.project:
+            return _angle_prior(args)             # 离线回测: 不连库、不 import config / db
+    if args.cmd == "angle-sim":
+        if not (args.project or args.profile):
+            ap.error("angle-sim: 给 --project 或 --profile")
+        if args.profile or _angle_sim_profile(args, live=False) is not None:
+            return _angle_sim(args)               # 快照 / 给定 Profile: 不连库、不 import config / db
 
     # 以下要连库, 到这一步才 import(让 selftest 不需要任何第三方依赖)
     import config
@@ -945,6 +1124,12 @@ def main(argv: list[str] | None = None) -> int:
         return _project_archive(core, sb, args)
     if args.cmd == "compile-rules":
         return _compile_rules(core, sb, args)
+    if args.cmd == "angle-prior":
+        return _angle_prior(args)
+    if args.cmd == "angle-sim":
+        return _angle_sim(args, live=True)
+    if args.cmd == "draw-report":
+        return _draw_report(sb, args)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user, include_archived=args.include_archived))
     elif args.cmd == "open":

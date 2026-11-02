@@ -362,10 +362,37 @@ def test_share_threshold_and_ordering():
                        "turning_point": "是" if i < 11 else "否"})                                                # 0.55
     got = structure.recent_structure(drafts)
     assert got["window"] == 20
+    # angle cards v2 §3.5: 标题是不是问句不再报(0.85 也不报) —— 标题句式归发牌的卡管
     assert got["concentrated"] == [
-        {"question": "标题是不是问句", "answer": "是", "share": 0.85, "of": 20},
         {"question": "正文第一句是哪一种", "answer": "具体事件", "share": 0.6, "of": 20},
     ]
+
+
+def test_title_question_is_never_flagged_even_when_every_draft_is_a_question():
+    assert structure.recent_structure([_neutral(i, title_is_question="是") for i in range(20)]) is None
+    assert "title_is_question" in structure.NEVER_FLAG
+
+
+def test_with_published_base_rates_only_a_real_excess_is_flagged():
+    """和本项目已发笔记的比例相比(§3.5): 门槛是 max(0.6, 已发占比 + 0.20)。已发七成具体事件开头, 稿子八成不算扎堆;
+    已发两成写了坏结果, 稿子七成算 —— 并且带上 published。没有那一题的已发比例, 照原来的 0.6。"""
+    drafts = [_neutral(i, opening_type="具体事件" if i < 16 else "提问",                 # 0.80
+                       negative_outcome_happened="是" if i < 14 else "否",            # 0.70
+                       turning_point="是" if i < 13 else "否")                         # 0.65
+              for i in range(20)]
+    shares = {"opening_type": {"具体事件": 0.7, "提问": 0.1}, "negative_outcome_happened": 0.2}
+    got = structure.recent_structure(drafts, shares)
+    assert got["concentrated"] == [
+        {"question": "有没有写到已经发生的坏结果", "answer": "是", "share": 0.7, "of": 20, "published": 0.2},
+        {"question": "有没有「以前→转折→后来」的前后转折", "answer": "是", "share": 0.65, "of": 20},
+    ]
+    assert "和本项目已发的比例相比" in structure.TASK and "published" in structure.TASK
+    # 已发 0.55 → 门槛 0.75: 0.70 不报
+    got = structure.recent_structure(drafts, {"negative_outcome_happened": 0.55, "turning_point": 0.5})
+    assert [h["question"] for h in got["concentrated"]] == ["正文第一句是哪一种"]
+    # 没有已发比例: 照原来的口径(0.6), 三处都报
+    got = structure.recent_structure(drafts)
+    assert len(got["concentrated"]) == 3 and all("published" not in h for h in got["concentrated"])
 
 
 @pytest.mark.parametrize("role", ["主角", "解决方案", "顺带一提", "只暗示", "未出现"])
@@ -413,7 +440,7 @@ def test_model_sees_chinese_labels_not_question_ids():
              for qid, (_v, answers) in structure.ASKED.items()}
     got = structure.recent_structure([{**every, "opening_type": "其他"}] * 15)
     text = repr(got["concentrated"])
-    assert len(got["concentrated"]) == len(structure.ASKED)
+    assert len(got["concentrated"]) == len(set(structure.ASKED) - structure.NEVER_FLAG)
     for qid in structure.QUESTIONS:
         assert qid not in text, qid
     assert "其他(列清单、贴参数这类)" in text

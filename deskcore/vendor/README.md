@@ -6,6 +6,7 @@
 |---|---|---|
 | `controlled_vocab_v0_2.json` | `truth-vault:schemas/controlled_vocab_v0_2.json` | 受控词表的机器可读权威导出。人类可读权威源是 TV 的 `docs/05-controlled-vocab.md`；TV 的 CI 保证那两者一致 |
 | `controlled_vocab_v0_2.json.sha256` | 本地生成 | 上面那份文件的校验和。CI（`python -m deskcore.cli selftest`）与线上都校验副本没被手改：对不上时 `/health` 的 `config.vendored_vocab.ok` 和顶层 `ok` 都是 false（`/health` 本身仍返 200），`/ready` 返 **503**。所以 JSON 与 `.sha256` 必须在**同一个提交里**一起改 |
+| `angle_priors_snapshot.json` | 本仓 `scripts/build_angle_priors.py` 从 TV 只读生成 | 发牌 v2 的先验快照（angle cards v2 §4）：每个 TV 项目的干净标签计数（内容形式 × 情绪杠杆 / × 问句与否）、发帖配比、品类、构建时间。**只有计数**，没有标题、正文、笔记 id（写盘前 `priors.snapshot_problems` 按白名单查）。TV 读不到时 `priors.get_profile` 用它（`ps=snap`）。每次部署重建；不是上游产物，没有 sha 校验，坏了就退到均匀分布 |
 
 ## 为什么 vendor 而不是手抄
 

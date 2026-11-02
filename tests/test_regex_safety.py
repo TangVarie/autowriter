@@ -573,12 +573,23 @@ def test_compiling_a_long_boundary_pattern_costs_at_most_about_one_time_limit(sh
     pattern = "\\b" * 100 + "x"
     rulecheck.normalize_check({"kind": "forbidden_regex", "pattern": pattern})
     V._compiled.cache_clear()
-    t0 = time.perf_counter()
+    # 量的是编译 + 搜索本身: 整套跑到这里进程里有几十万个对象, 一次自动的全量垃圾回收要 0.3 秒, 正好落在计时里就超 0.2 秒
+    # 的上限 —— 那是前面几千条用例留下的, 不是这条正则的开销。先收一次、计时期间不让它自动收
+    import gc
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
     try:
-        V.search_user_regex(pattern, _POST * 10)
-    except V.RegexTimeout:
-        pass
-    assert time.perf_counter() - t0 < 2 * short_timeout
+        t0 = time.perf_counter()
+        try:
+            V.search_user_regex(pattern, _POST * 10)
+        except V.RegexTimeout:
+            pass
+        elapsed = time.perf_counter() - t0
+    finally:
+        if was_enabled:
+            gc.enable()
+    assert elapsed < 2 * short_timeout
 
 
 def test_a_pattern_too_long_to_compile_in_time_is_reported_unchecked(short_timeout):

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from deskcore import tools as T
+from deskcore import vocab, tools as T
 
 BODY, _ = T.protocol_text()
 HEAD = T.skill_head()
@@ -136,7 +136,7 @@ def test_delivery_is_always_the_whole_text_and_scores_are_not_read_out():
 import ast
 from pathlib import Path
 
-from deskcore import core, skillcheck, store
+from deskcore import core, project_now, skillcheck, store, structure
 
 SEC_REJECT = _between(BODY, "- **reject**", "- **pass**")
 
@@ -253,6 +253,57 @@ def _app_instructions() -> str:
     raise AssertionError("app.py 里找不到 MCP instructions")
 
 
+def _angle_v2_samples() -> dict[str, str]:
+    """拼出来的那几句(卡面、project_status 三种、batch_note、project_now.message、pin / repeat_of 报错)各取一份样例。"""
+    from deskcore import drawpolicy, priors
+    prof = priors.uniform_profile("p")
+    prof.update(stage="run", n_res=200, ps="live", pp="live",
+                working={"resolved": 200, "by_lever": {"愤怒撬动": [30, 5]}})
+    prof["lift"]["emotional_lever"]["愤怒撬动"] = 1.4
+    prof["mix"].update(posts=224, per_day=3.7)
+    prof["evidence"] = {"content_format": {"提问求助": 0.88, "场景植入": 0.12}, "title_structure": {"疑问句": 0.66},
+                        "human_truth_archetype": {"健康焦虑": 0.27}, "emotional_lever": {}}
+    cold = dict(prof, stage="cold", n_res=9, ref={"source": "brand", "ids": [], "by_dim": {}})
+    unmapped = dict(prof, stage="none")
+    dims = {"emotional_lever": "焦虑撬动", "human_truth_archetype": "健康焦虑", "content_format": "提问求助",
+            "title_structure": "疑问句"}
+    base = {"angle_key": "0" * 20, "dims": dims, "emotional_intensity": "medium", "word_tilt": "口语",
+            "trend_dependencies": ["通用"], "angle_name": "叙事角", "angle_brief": "",
+            "boundary_rule": "判据", "evidence": project_now.card_evidence(prof, dims)}
+    refs = [None, {"kind": "hit", "own": True, "age_days": 5, "desc": {"opening_type": "具体事件",
+                                                                      "ending_asks_reader": True}},
+            {"kind": "hit", "own": False, "age_days": 30, "desc": {"turning_point": True, "asks_for_help": True}},
+            {"kind": "external", "title_structure": "数字清单", "posted_days_ago": 21, "comments_per_day": 14,
+             "desc": {"opening_type": "身份自述", "own_experience": True, "turning_point": True}},
+            {"kind": "repeat", "of": "0" * 20}]
+    cards = [dict(base, slot=i + 1, **({"reference": r} if r else {})) for i, r in enumerate(refs)]
+    _p, pin_err = drawpolicy.normalize_pin({"标题句式": "反问句"}, prof)
+    # repeat_of 点了一张还没用掉的牌(review round 2 on aw#140): 台账里这个 key 还挂着一行没销账的
+    from deskcore.fingerprint import angle_key
+    from tests.fakes import FakeClient
+    open_key = angle_key(dims)
+    open_ledger = FakeClient(rows={"angle_ledger": [{
+        "id": "l1", "project_id": "p", "angle_key": open_key, "dims": dict(dims), "drawn_by": "u",
+        "drawn_at": "2026-11-01T00:00:00+00:00", "consumed_version_id": None, "consumed_at": None}]})
+    _items, not_used_yet = core._repeat_items(open_ledger, "p", [open_key], 3)
+    assert not_used_yet and not_used_yet["error"] == "repeat_of_invalid" and open_key in not_used_yet["message"]
+    return {
+        "core.render_angles_block(sample)": core.render_angles_block(cards, status=project_now.status_line(prof)),
+        "project_now.status_line(run)": project_now.status_line(prof),
+        "project_now.status_line(cold)": project_now.status_line(cold),
+        "project_now.status_line(none)": project_now.status_line(unmapped),
+        "project_now.batch_note(sample)": project_now.batch_note(cards, pin={"title_structure": "疑问句"}),
+        "project_now.build(sample).message": project_now.build(
+            prof, {"days": 14, "cards_drawn": 20, "written": 20, "published": 0, "title_changed": 0},
+            name="示例项目")["message"],
+        "drawpolicy.normalize_pin(error).message": pin_err["message"],
+        "core._repeat_items(not_ours).message": core._repeat_items(None, "p", ["0" * 20], 3)[1]["message"],
+        "core._repeat_items(too_many).message": core._repeat_items(None, "p", [f"{i:020x}" for i in range(4)], 5)[1][
+            "message"],
+        "core._repeat_items(not_used_yet).message": not_used_yet["message"],
+    }
+
+
 def _server_texts() -> dict[str, str]:
     texts = {f"tools.{name}": fn.__doc__ or "" for name, (fn, _) in T.TOOLS.items()}
     for const in ("EDIT_DIGEST_TASK", "EDIT_DIGEST_MESSAGE", "ARCHIVE_PENDING_NEXT_STEP", "SCORE_NOTE",
@@ -267,6 +318,19 @@ def _server_texts() -> dict[str, str]:
     texts["core._angle_key_mismatch_note(all)"] = core._angle_key_mismatch_note(
         {store.ANGLE_KEY_UNKNOWN: 1, store.ANGLE_KEY_USED: 1, store.ANGLE_KEY_OTHER_PROJECT: 1,
          store.ANGLE_KEY_NOT_IN_LEDGER: 1})
+    # angle cards v2(§3): 发牌回包 / 卡面 / 简报里新加的话, 同样不许说回旧口径
+    for const in ("RECENT_TITLES_TASK", "ANGLES_HEADER", "ANGLES_FOOTER", "ANGLES_KEY_LINE", "REPEAT_LINE"):
+        texts[f"core.{const}"] = getattr(core, const)
+    texts["core.DRAW_CLAMPED_NOTE"] = core.DRAW_CLAMPED_NOTE.format(max=core.DRAW_N_MAX)
+    for const in ("PROJECT_NOW_TASK", "WORKING_NOTE", "NO_EXTERNAL_NOTE", "EXTERNAL_UNREAD_NOTE", "STATUS_DEGRADED",
+                  "STATUS_V1", "SHORT_NOTE"):
+        texts[f"project_now.{const}"] = getattr(project_now, const)
+    texts["structure.TASK"] = structure.TASK
+    # 卡面上的大白话(angle cards v2): 也是念给模型看的服务端文案
+    for name in ("PLAIN_FORMAT", "PLAIN_TITLE", "PLAIN_LEVER", "PLAIN_TREND", "OPENING_PLAIN"):
+        for k, v in getattr(vocab, name).items():
+            texts[f"vocab.{name}[{k}]"] = v
+    texts.update(_angle_v2_samples())
     notice = skillcheck.notice("aaaaaaaaaaaa", "bbbbbbbbbbbb")
     texts["skillcheck.notice.action"] = notice["action"]
     texts["skillcheck.notice.message"] = notice["message"]
@@ -393,3 +457,15 @@ def test_check_drafts_says_the_batch_is_not_saved_until_score_drafts():
     empty = {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
     T._add_check_next_step(empty)
     assert "next_step" not in empty
+
+
+def test_angle_v2_texts_are_writer_safe():
+    """angle cards v2 新加的话(卡面、project_status、batch_note、project_now、TASK)也照 test_writer_facing_text 的规矩:
+    没有命令、表名、找运维这类工程指令; 也不提「试新」「explore」(盲法: 写手和模型都不该知道哪张是试新牌)。"""
+    from tests.test_writer_facing_text import FORBIDDEN
+    texts = {k: v for k, v in _server_texts().items()
+             if k.startswith(("project_now.", "structure.", "core.ANGLES", "core.REPEAT", "core.DRAW_",
+                              "core.RECENT_TITLES", "core.render_angles_block", "drawpolicy.", "core._repeat"))}
+    assert len(texts) >= 20, sorted(texts)
+    bad = [(k, f) for k, v in texts.items() for f in FORBIDDEN + ("试新", "explore", "src") if f in v]
+    assert not bad, bad

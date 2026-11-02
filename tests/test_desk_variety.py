@@ -10,7 +10,9 @@
      · 每条 ≤40 字、合计 ≤20 条, 写过的留 8 条份额(活跃项目发出去的远超 20 条, 不留的话昨天写的永远进不来),
        哪栏不够空位给另一栏; 不带正文; 查不到就不带这一栏, 简报照给
      · task 不要求"标题句式不一样"(那是发牌的硬坐标), 只管说法 / 人设 / 场景, 并写明谁优先
-  2. draw_angles 一批之内错开内容形式和标题句式: n=8 时 8 种各一, n=10 时同一种最多两篇; 避重照旧
+  2. draw_angles 一批之内错开(angle cards v2 之后): 不再硬把 8 种内容形式轮一遍 —— 形式照项目的配额发(84/16 的项目
+     n=10 平均 8.4 篇提问求助、配额外 0 篇), 没有数据(均匀先验)时 8 张牌照旧 8 种形式; 一批之内不重复「形式 + 标题 +
+     原型」, 也不重复「杠杆 + 原型」, 杠杆 / 原型各有封顶; 避重照旧, 同 seed 同候选表(两种发法都钉)
   3. 正例排不出相关性时【轮换】, 不再是"最近 N 条": 写作台版本从来没有向量(09-01 起 1,011 个, 0 个有),
      原来每条都是 -1.0、稳定排序原样交回最近的 N 条, mode 还报 relevance; 只有几条有向量时, 没向量的那一截
      也按天轮换(洗牌在打分之前)
@@ -22,10 +24,12 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
+import math
+
 import pytest
 
 import librarian_client as lib
-from deskcore import core, store, tools
+from deskcore import core, priors, store, tools, vocab
 from tests.fakes import FakeClient
 
 ME = "11111111-1111-1111-1111-111111111111"
@@ -106,13 +110,15 @@ def test_published_titles_come_from_links_to_this_project_newest_first():
     assert got == ["昨天发的", "没算过差异的那篇", "人改过的标题", "补录的那篇就是发出去的标题"], got
 
 
-def test_truth_vault_notes_are_read_by_id_and_time_only():
+def test_truth_vault_notes_are_read_by_id_time_and_counts_only():
+    """angle cards v2 §3.5: 多取评论数和 tier(给 working 一栏挑"评论多的")、数据质量标记(复审: 铺评 / 投流 / 合成的
+    不算 working), 照旧不取标题、正文。"""
     w = _World()
     w.published("n1", "标题一")
     c = w.client()
     assert store.recent_titles(c, PID)["published"] == ["标题一"]
     sel = [q for q in c.calls if q["table"] == "truth_vault.notes"]
-    assert sel and all(q["cols"] == "note_id, publish_time" for q in sel), sel
+    assert sel and all(q["cols"] == "note_id, publish_time, comments_count, tier, data_quality_flags" for q in sel), sel
     assert not c.rpc_calls, "deskcore_tv_notes 带正文, 不该走它"
     assert all("body" not in (q["cols"] or "") for q in c.calls), "全程不取正文"
 
@@ -238,16 +244,29 @@ def test_brief_carries_recent_titles_with_a_task():
     rt = out["recent_titles"]
     assert rt["published"] == ["发出去的标题"] and rt["drafted"] == ["写过的标题"]
     assert rt["task"] == core.RECENT_TITLES_TASK
-    for word in ("主干词", "开头", "人设", "场景", "同一批", "不要模仿"):
+    for word in ("主干词", "开头", "人设", "场景", "同一批", "working", "不用念给用户听"):
         assert word in rt["task"], word
-    assert set(rt) == {"published", "drafted", "task"}, "只给标题, 不带正文和内部 id"
+    assert set(rt) == {"published", "drafted", "task"}, "只给标题, 不带正文和内部 id; 没有起量的就没有 working"
+
+
+def test_brief_carries_working_titles_that_got_traction():
+    """angle cards v2 §3.5: 发出三天以上、评论 ≥20 或标了爆的几条单列成 working, 可以学它的句式和开头。"""
+    w = _World()
+    w.published("n-hot", "评论很多的那篇", kind="ingested", days=5)
+    w.published("n-new", "昨天才发的", kind="ingested", days=1)
+    w.published("n-cold", "没人评论的", kind="ingested", days=6)
+    for n in w.notes:
+        n["comments_count"] = {"n-hot": 45, "n-new": 80, "n-cold": 2}[n["note_id"]]
+    rt = _brief(w.client())["recent_titles"]
+    assert rt["working"] == ["评论很多的那篇"], "三天以内的不算(评论还没长完), 评论少的不算"
+    assert "可以学它的句式" in rt["task"]
 
 
 def test_recent_titles_task_does_not_fight_the_drawn_title_structure():
-    """10-20 review: 标题句式是 draw_angles 发的硬坐标(8 种), 近 20 条标题几乎总把它们占全 —— task 要是还说
-    "标题句式要和它们不一样", 两句话就没法同时做到。句式照发牌写, 并且写明发牌坐标 / p0 / 改稿优先。"""
+    """10-20 review: 标题句式是 draw_angles 发的坐标(8 种), 近 20 条标题几乎总把它们占全 —— task 要是还说
+    "标题句式要和它们不一样", 两句话就没法同时做到。写明发牌坐标 / p0 / 改稿优先(angle cards v2 §3.5 的新措辞)。"""
     task = core.RECENT_TITLES_TASK
-    assert "标题句式照 draw_angles 分到的写" in task
+    assert "draw_angles 分到的坐标" in task
     assert "句式、开头写法" not in task and "标题句式都要" not in task
     for word in ("优先级", "p0", "stable", "切入角度", "改稿", "尽量"):
         assert word in task, word
@@ -269,18 +288,20 @@ def test_brief_survives_recent_titles_blowing_up(monkeypatch):
 
 def test_open_project_doc_tells_the_model_about_recent_titles():
     doc = tools.open_project.__doc__ or ""
-    assert "recent_titles" in doc and "不要模仿" in doc
+    assert "recent_titles" in doc and "不要模仿" in doc and "working" in doc
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 2. 发牌: 一批之内错开
+# 2. 发牌: 一批之内错开(angle cards v2: 贴项目的配额, 一批之内不撞形状 / 杠杆原型对)
 # ══════════════════════════════════════════════════════════════════════
 
 AVOID: set[str] = set()
+SEEN: list[list[dict]] = []          # 每次发牌交给 RPC 的候选表(同 seed 同候选表要比这个)
 
 
 def _reserve(args):
     """仿 deskcore_reserve_angles: 按候选先后, 跳过避重集, 取前 _want 个。"""
+    SEEN.append(args["_candidates"])
     out = []
     for c in args["_candidates"]:
         if c["angle_key"] in AVOID:
@@ -296,34 +317,71 @@ def _draw_client(*, rpc: bool, ledger=()):
                       rpc_impl={"deskcore_reserve_angles": _reserve} if rpc else None)
 
 
+@pytest.fixture(params=["v2", "v1"])
+def policy(request, monkeypatch):
+    monkeypatch.setenv(core.DRAW_POLICY_ENV, request.param)
+    return request.param
+
+
+def _fixed_profile(monkeypatch, prof):
+    monkeypatch.setattr(core.priors, "get_profile", lambda *a, **k: prof)
+
+
+def _profile_8416(**kw):
+    p = priors.uniform_profile(PID)
+    p.update(stage="run", n_res=200, ps="live", pp="live")
+    p["pi"]["content_format"] = {"提问求助": 0.84, "场景植入": 0.16}
+    p.update(kw)
+    return p
+
+
 @pytest.mark.parametrize("rpc", [True, False], ids=["rpc", "fallback"])
-@pytest.mark.parametrize("seed", range(12))
-def test_eight_angles_cover_eight_formats_and_eight_title_structures(rpc, seed):
+@pytest.mark.parametrize("seed", range(6))
+def test_without_project_data_eight_angles_still_cover_eight_formats(rpc, seed):
+    """没有数据(没对上 TV, 先验均匀)时, 原来的性质照旧: 8 张牌 8 种形式(配额就是均匀的, 系统抽样正好各一)。"""
     out = core.draw_angles(_draw_client(rpc=rpc), PID, 8, user_id=ME, seed=seed)
-    assert out["delivered"] == 8
+    assert out["delivered"] == 8 and out["policy"]["name"] == "v2" and out["policy"]["stage"] == "none"
     assert len({a["dims"]["content_format"] for a in out["angles"]}) == 8
-    assert len({a["dims"]["title_structure"] for a in out["angles"]}) == 8
+
+
+@pytest.mark.slow
+def test_an_8416_project_gets_its_quota_and_nothing_off_support(monkeypatch):
+    """84/16 的项目: n=10 两百批平均 8.4 ± 0.3 篇提问求助, 配额外的形式一张都没有(v1 每批都会发到配额外, 见
+    test_drawpolicy 的反证)。"""
+    _fixed_profile(monkeypatch, _profile_8416())
+    counts, off = [], 0
+    for seed in range(200):
+        out = core.draw_angles(_draw_client(rpc=True), PID, 10, user_id=ME, seed=seed)
+        fs = [a["dims"]["content_format"] for a in out["angles"]]
+        assert len(fs) == 10
+        counts.append(fs.count("提问求助"))
+        off += sum(1 for f in fs if f not in ("提问求助", "场景植入"))
+    assert off == 0
+    assert sum(counts) / len(counts) == pytest.approx(8.4, abs=0.3)
+
+
+@pytest.mark.parametrize("n", [5, 10, 30])
+def test_no_in_batch_shape_or_pair_repeat_and_caps_hold(monkeypatch, n):
+    lev = {v: (0.40 if v == "愤怒撬动" else 0.6 / 11) for v in vocab.EMOTIONAL_LEVERS}
+    arc = {v: (0.35 if v == "健康焦虑" else 0.65 / 18) for v in vocab.HUMAN_TRUTH_ARCHETYPES}
+    prof = _profile_8416()
+    prof["pi"].update(emotional_lever=lev, human_truth_archetype=arc)
+    _fixed_profile(monkeypatch, prof)
+    lev_cap, arc_cap = max(2, math.ceil(0.4 * n)), max(2, math.ceil(0.35 * n))
+    for seed in range(15):
+        out = core.draw_angles(_draw_client(rpc=True), PID, n, user_id=ME, seed=seed)
+        ds = [a["dims"] for a in out["angles"]]
+        assert len(ds) == n
+        shapes = {(d["content_format"], d["title_structure"], d["human_truth_archetype"]) for d in ds}
+        pairs = {(d["emotional_lever"], d["human_truth_archetype"]) for d in ds}
+        assert len(shapes) == n and len(pairs) == n, "一批之内形状、杠杆原型对都不重复"
+        assert max(Counter(d["emotional_lever"] for d in ds).values()) <= lev_cap
+        assert max(Counter(d["human_truth_archetype"] for d in ds).values()) <= arc_cap
 
 
 @pytest.mark.parametrize("rpc", [True, False], ids=["rpc", "fallback"])
-@pytest.mark.parametrize("seed", range(12))
-def test_ten_angles_use_no_format_more_than_twice(rpc, seed):
-    out = core.draw_angles(_draw_client(rpc=rpc), PID, 10, user_id=ME, seed=seed)
-    fmts = Counter(a["dims"]["content_format"] for a in out["angles"])
-    sts = Counter(a["dims"]["title_structure"] for a in out["angles"])
-    assert max(fmts.values()) <= 2 and max(sts.values()) <= 2, (fmts, sts)
-    assert len({a["angle_key"] for a in out["angles"]}) == 10
-
-
-def test_small_batches_never_repeat_a_format():
-    for seed in range(30):
-        out = core.draw_angles(_draw_client(rpc=True), PID, 5, user_id=ME, seed=seed)
-        assert len({a["dims"]["content_format"] for a in out["angles"]}) == 5
-
-
-@pytest.mark.parametrize("rpc", [True, False], ids=["rpc", "fallback"])
-def test_avoided_keys_are_still_never_returned(rpc):
-    """先看同一个 seed 本来会发哪几张, 把它们(和再往后的十几张)记成近期用过的, 再发一次: 一张都不能回来。"""
+def test_avoided_keys_are_still_never_returned(rpc, policy):
+    """先看同一个 seed 本来会发哪几张, 把它们(和再往后的十几张)记成近期用过的, 再发一次: 一张都不能回来(两种发法)。"""
     first = core.draw_angles(_draw_client(rpc=True), PID, 8, user_id=ME, seed=3)
     avoid = {a["angle_key"] for a in first["angles"]}
     second = core.draw_angles(_draw_client(rpc=True, ledger=()), PID, 24, user_id=ME, seed=3)
@@ -339,15 +397,30 @@ def test_avoided_keys_are_still_never_returned(rpc):
         AVOID.clear()
     got = {a["angle_key"] for a in out["angles"]}
     assert out["delivered"] == 8 and not (got & avoid)
-    if not rpc:   # 降级路径先去掉避重的再排, 错开不打折
+    if not rpc and policy == "v1":   # v1 的降级路径先去掉避重的再排, 错开不打折
         assert len({a["dims"]["content_format"] for a in out["angles"]}) == 8
 
 
-def test_same_seed_same_draw():
+def test_same_seed_same_draw(policy):
+    """同 seed、同先验、同台账: 交给 RPC 的候选表(含 _draw, 连批次号)一字不差, 发出来的牌和切入角度也一样。"""
+    SEEN.clear()
     a = core.draw_angles(_draw_client(rpc=True), PID, 6, user_id=ME, seed=42)
     b = core.draw_angles(_draw_client(rpc=True), PID, 6, user_id=ME, seed=42)
+    assert len(SEEN) == 2 and SEEN[0] == SEEN[1]
+    assert all("_draw" in c["dims"] and c["dims"]["_draw"]["pol"] == policy for c in SEEN[0])
     assert [x["angle_key"] for x in a["angles"]] == [x["angle_key"] for x in b["angles"]]
     assert [x["angle_name"] for x in a["angles"]] == [x["angle_name"] for x in b["angles"]]
+    assert a["prompt_block"] == b["prompt_block"]
+
+
+def test_thirty_cards_stay_cheap(policy):
+    """n = 30 一次发牌(先验已在缓存里)300 ms 以内, 两种发法都是。"""
+    import time
+    c = _draw_client(rpc=True)
+    core.draw_angles(c, PID, 3, user_id=ME, seed=1)          # 先验进缓存
+    t0 = time.perf_counter()
+    out = core.draw_angles(_draw_client(rpc=True), PID, 30, user_id=ME, seed=2)
+    assert time.perf_counter() - t0 < 0.3 and out["delivered"] == 30
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -57,8 +57,9 @@ import memory
 from logger_utils import mask_secrets
 
 from . import delivery, rulecheck, rulecompile
+from . import drawpolicy as dp
 from . import fingerprint as fp
-from . import store, structure, tvlink, vocab
+from . import priors, project_now, store, structure, tvlink, vocab
 
 logger = logging.getLogger("deskcore.core")
 
@@ -381,14 +382,18 @@ def select_positive_examples(candidates: list[dict], brief: dict,
 RECENT_TITLES_PUBLISHED_DAYS = 30
 RECENT_TITLES_DRAFTED_DAYS = 14
 RECENT_TITLES_MAX = 20
-# ⚠️ 别写成"标题句式要和它们不一样"(10-20 review): 标题句式是 draw_angles 发的硬坐标, 只有 8 种, 近 20 条标题
+RECENT_TITLES_WORKING = 5          # angle cards v2 §3.5: 发出三天以上、评论 ≥20 或标了爆的, 最多这么多条
+# ⚠️ 别写成"标题句式要和它们不一样"(10-20 review): 标题句式是 draw_angles 发的坐标, 只有 8 种, 近 20 条标题
 # 几乎总把它们占全, 两句话就没法同时做到。这里只管具体说法 / 人设 / 场景, 并写明谁优先。
+# angle cards v2 §3.5: 多一栏 working —— 本项目发出三天以上、评论多的几条, 可以学它的句式和开头的路数(原来整栏都是
+# 「只用来避开, 不要模仿」, 起量的标题也一样躲着走)。working 是从近 30 天整个窗口里挑的, 不一定在 published 那栏里
+# (活跃项目 published 只装得下最近三四天的), 所以这里不说「published 里的」。
 RECENT_TITLES_TASK = (
-    "published 是这个项目最近发出去的标题, drafted 是最近在写作台写过的标题。它们只用来避开, 不要模仿, "
-    "也不用念给用户听。这一批新写的稿子: 标题别和它们撞主干词、撞具体说法(标题句式照 draw_angles 分到的写, "
-    "在同一种句式里换说法), 开头别复述这些标题; 人设和核心场景尽量和它们错开, 同一批里也尽量别两篇用同一个人设或"
-    "同一个场景。优先级: p0 / stable 定下的人设、draw_angles 分到的坐标和切入角度、用户点名要写的题目或要改的稿, "
-    "都在这一栏之上; 这一栏只管新写的稿, 改稿不受它约束。")
+    "published 是这个项目最近发出去的标题，drafted 是最近在写作台写过的标题；working 是这个项目近一个月发出去三天以上、"
+    "评论多的几条。这一批新写的稿子：标题别和这些标题撞主干词、撞具体说法，开头别复述它们；working 里的可以学它的句式、"
+    "语气和开头的路数。人设和核心场景尽量和最近的错开，同一批里也别两篇用同一个人设或同一个场景。优先级：p0 / stable、"
+    "draw_angles 分到的坐标和切入角度、用户点名要写的题目或要改的稿，都在这一栏之上；这一栏只管新写的稿，改稿不受它约束。"
+    "不用念给用户听。")
 
 
 # ── 已验证规律怎么用(2026-10-20) ──────────────────────────────────────────────
@@ -614,23 +619,49 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # ⚠️ 和借卡、角度债同一条纪律: 查不到就不带这一栏, 简报照给。
     try:
         recent = store.recent_titles(client, project_id, published_days=RECENT_TITLES_PUBLISHED_DAYS,
-                                     drafted_days=RECENT_TITLES_DRAFTED_DAYS, limit=RECENT_TITLES_MAX)
+                                     drafted_days=RECENT_TITLES_DRAFTED_DAYS, limit=RECENT_TITLES_MAX,
+                                     working=RECENT_TITLES_WORKING)
     except Exception:
         logger.exception("recent titles lookup failed (project=%s)", project_id)
         recent = None
-    if recent and (recent.get("published") or recent.get("drafted")):
-        out["recent_titles"] = {"published": recent["published"], "drafted": recent["drafted"],
-                                "task": RECENT_TITLES_TASK}
+    if recent and (recent.get("published") or recent.get("drafted") or recent.get("working")):
+        out["recent_titles"] = {"published": recent.get("published") or [], "drafted": recent.get("drafted") or []}
+        if recent.get("working"):
+            out["recent_titles"]["working"] = recent["working"]
+        out["recent_titles"]["task"] = RECENT_TITLES_TASK
+
+    # ── 这个项目现在什么情况(angle cards v2 §3.4) ──────────────────────────────────────────────
+    # 只读缓存, 一个请求都不发: 发牌的先验(priors)和写作台近两周的计数都在进程缓存里, 缓存是冷的就在下面投递一次
+    # 后台预热, 这一次说 warming —— open_project 一秒都不等它(冷构建最坏要读几千行 TV 的表)。项目块里的已发特征题比例
+    # 也顺手给下面的 recent_structure 当底(§3.5)。
+    # ⚠️ 同一条纪律: 这一段出什么错都不能影响简报, counts 里记 unavailable。
+    pid_now = project.get("id") or project_id
+    cached = None
+    try:
+        cached = priors.cached_profile(pid_now)
+        block = project_now.build(cached, project_now.cached_desk(pid_now), name=project.get("name") or "")
+        if block:
+            out["project_now"] = block
+            out["counts"]["project_now"] = "ok"
+        else:
+            out["counts"]["project_now"] = ("unavailable" if priors.cache_state(pid_now) == "unavailable"
+                                            else "warming")
+    except Exception:                                   # noqa: BLE001 — 增强项, 绝不冒泡
+        logger.exception("project_now failed (project=%s)", project_id)
+        out["counts"]["project_now"] = "unavailable"
 
     # ── 最近的稿子在哪几处都一样(2026-10-20, 问哪几题、怎么算见 deskcore/structure.py) ─────────────────
     # recent_titles 管标题撞词, 管不到骨架: 10-20 查生产库, 有个项目近百篇稿子 86% 第一句是具体事件、82% 标题是问句、
     # 95% 写了已经发生的坏结果, 而它已发笔记里这三样分别只占 45% / 43% / 35%。Jev 给每篇打分时答过的特征题就在
     # TV 账本里, 读回来数一数, 扎堆的几处摆给模型, 让这一批有一半换个写法。只是提醒, 不拦任何东西。
     # ⚠️ 同一条纪律: 账本读不到(Exposed schemas 没有 truth_vault / 本地库)、项目没接 judge、篇数不够, 都是不带这一栏。
+    # angle cards v2 §3.5: 和本项目已发笔记的比例相比才算扎堆(已发的本来就七成「具体事件」开头, 稿子七成也是常态);
+    # 已发的比例来自上面那份缓存里的项目块, 没有就照原来的口径(标题问句那一题不再报 —— 标题句式归发牌的卡管)。
     try:
+        published_shares = (cached or {}).get("fq_shares") or None
         shape = structure.recent_structure(store.recent_structure_answers(
             client, project_id, questions=structure.ASKED, bank_version=structure.BANK_VERSION,
-            limit=structure.MAX_DRAFTS))
+            limit=structure.MAX_DRAFTS), published_shares)
     except Exception:
         logger.exception("recent structure lookup failed (project=%s)", project_id)
         shape = None
@@ -651,6 +682,14 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # ── 规则编译(2026-10-20, D-121): 有没编的规则就在后台补编, 简报一秒都不等它(编一次最坏 6 分钟) ──────────
     # 要不要编由后台线程自己查(按 (规则 id, sha) 比 rule_compiles), 这里不多查一次库; 冷却之内重复打开不起新线程。
     _kick_rule_compile(client, project_id, reason="open_project")
+
+    # ── 发牌先验和 project_now 的后台预热(angle cards v2 §4): 只投递不等, 接下来那次 draw_angles 多半直接读到缓存 ──────
+    # 放在最后、读完缓存之后: 上面的 project_now 说的是「打开这一刻缓存里有什么」, 预热不改这一次的回包。
+    try:
+        priors.warm(client, pid_now, project)
+        project_now.warm_desk(client, pid_now)
+    except Exception:                                   # noqa: BLE001 — warm 本身不抛, 这里再兜一层
+        logger.exception("angle priors warm failed (project=%s)", project_id)
     return out
 
 
@@ -706,15 +745,126 @@ def _spread_order(candidates: list[dict], n: int) -> list[dict]:
     return out + rest
 
 
+def _v1_candidates(n: int, rng, *, keep=None) -> list[dict]:
+    """v1 的候选表(angle cards v2 之前的发牌; DESK_DRAW_POLICY=v1 和 v2 出错退回时走它): 全组合空间洗牌, 取前
+    max(20n, 500) 个, 再按 _spread_order 把前面一段排成一批之内尽量不撞。rng 的消耗次序和抽出来以前完全一样(同 seed 同
+    候选表, tests/golden/draw_v1_aceee73.json 钉着)。
+
+    ``keep``: 写手 pin 了维度时只留符合的格子(洗牌之后、截断之前筛, 所以不 pin 时 rng 的消耗一个不差)。"""
+    space = [(lev, arc, fmt, st)
+             for lev in vocab.EMOTIONAL_LEVERS
+             for arc in vocab.HUMAN_TRUTH_ARCHETYPES
+             for fmt in vocab.CONTENT_FORMATS
+             for st in vocab.TITLE_STRUCTURES]
+    rng.shuffle(space)
+    if keep is not None:
+        space = [c for c in space if keep(c)]
+
+    # 过量供给候选给 RPC —— 它在事务里逐个查避重集、取前 n 个可用的。
+    # 20 倍冗余(下限 500)足以覆盖"近期用掉很多"的项目。
+    cand_cap = min(len(space), max(n * 20, 500))
+    candidates = []
+    for lev, arc, fmt, st in space[:cand_cap]:
+        dims = {"emotional_lever": lev, "human_truth_archetype": arc,
+                "content_format": fmt, "title_structure": st}
+        candidates.append({"angle_key": angle_key(dims), "dims": dims})
+    # 一批之内错开体裁和标题句式(10-20): RPC 按候选的先后取前 n 个可用的, 所以把洗好的候选重排成"前面几个尽量
+    # 互不同形", 选择本身还是 RPC 在事务里做。见 _spread_order。
+    return _spread_order(candidates, n)
+
+
+# ── 发牌 v2(angle cards v2 §2.1 / §2.10): 策略开关、夹子、写手点名 ──────────────────────────────────
+# DESK_DRAW_POLICY=v1 是总开关(kill switch): 回到原来的洗牌 + _spread_order(候选次序和 aceee73 一字不差), 只换了卡面。
+# 默认 v2: 按项目的配比和效果发(drawpolicy), 去重分层; 策略里出任何异常、或者先验整个拿不到(快照也坏了), 这一批退回 v1
+# 的发法, 台账记 src "fb"。RPC(deskcore_reserve_angles)的契约一个字不改: 有序、过量供给的候选表, 原子预留, 避重在 RPC 里。
+DRAW_POLICY_ENV = "DESK_DRAW_POLICY"
+DRAW_N_MAX = 30
+DRAW_AVOID_MIN, DRAW_AVOID_MAX = 14, 90
+DRAW_PROFILE_BUDGET_S = 2.5
+REPEAT_MAX = dp.MAX_REPEAT
+DRAW_CLAMPED_NOTE = "一次最多发 {max} 篇的坐标, 这次按 {max} 篇发; 还要就写完这批再发一次。"
+# repeat_of 点的 key 还有一张没用掉的牌(review round 2 on aw#140): 不重发, 叫模型直接用原来那张卡
+REPEAT_NOT_USED_YET = ("「{key}」这张卡发出去之后还没用过(还没有稿子带着它存档), 不用重写一次: 直接照原来那张卡写"
+                       "(卡上的四个维度在这次返回的 dims 里), 查重和存档时带原来那张卡的 angle_key「{key}」就行。"
+                       "这次还要别的角度的话, 把它从 repeat_of 里去掉再发一次。")
+
+
+def draw_policy() -> str:
+    """"v1" | "v2"(默认)。只认 v1 这一个值, 别的(没设、拼错)一律 v2 —— 开关是为了退回去, 不是为了多一种发法。"""
+    return "v1" if (os.environ.get(DRAW_POLICY_ENV) or "").strip().lower() == "v1" else "v2"
+
+
+def _weighted_choice(rng, dist: dict, values) -> str:
+    """按 dist 的权重从 values 里抽一个(一次 rng.random()); 权重全是 0 就均匀。"""
+    vals = list(values)
+    ws = [max(float((dist or {}).get(v) or 0.0), 0.0) for v in vals]
+    tot = sum(ws)
+    if tot <= 0:
+        return rng.choice(vals)
+    u = rng.random() * tot
+    acc = 0.0
+    for v, w in zip(vals, ws):
+        acc += w
+        if u < acc:
+            return v
+    return vals[-1]
+
+
+def _draw_error(kind: str, message: str, n: int, **extra) -> dict:
+    """pin / repeat_of 不对: 原样回给模型(可选值、项目现在的形式占比), 什么都没写。"""
+    return {"error": kind, "message": message, **extra,
+            "angles": [], "requested": n, "delivered": 0, "prompt_block": ""}
+
+
+def _repeat_items(client, project_id: str, repeat_of, n: int) -> tuple[list, dict | None]:
+    """repeat_of 校验(§2.9): 至多 3 个、不多于这次要的篇数 n(调用方传夹过之后的 n), 每个都必须是本项目台账里有的
+    angle_key, 而且这个项目里已经没有这个 key 没用掉的牌了(还挂着一张就报错, 叫模型直接用原来那张: 再插一行的话存档
+    销的是原来那张、重写的那张一直挂着, review round 2 on aw#140)。回 ([(key, 四个维度)], None) 或 ([], 错误)。
+    只读台账, 不写。"""
+    if not repeat_of:
+        return [], None
+    keys = [repeat_of] if isinstance(repeat_of, str) else list(repeat_of)
+    keys = list(dict.fromkeys(str(k or "").strip() for k in keys if str(k or "").strip()))
+    if len(keys) > REPEAT_MAX:
+        return [], _draw_error("repeat_of_invalid", f"repeat_of 一次最多 {REPEAT_MAX} 个角度。", n,
+                               max=REPEAT_MAX)
+    # 点名重写的每一个都占这一批的一篇: 多于 n 时原来照样全写进台账、回包 delivered 比 requested 多(review on aw#140)
+    if len(keys) > n:
+        return [], _draw_error(
+            "repeat_of_invalid",
+            f"这次只要 {n} 篇, repeat_of 却点了 {len(keys)} 个角度; 点名重写的不能多于这次要的篇数 —— "
+            f"少点几个, 或者把篇数加到 {len(keys)}。", n, max=n)
+    items = []
+    for k in keys:
+        src = store.ledger_repeat_source(client, project_id, k)
+        dims = (src or {}).get("dims")
+        if not dims or dp.cell_of(dims) is None or angle_key(dp.cell_dims(dp.cell_of(dims))) != k:
+            return [], _draw_error(
+                "repeat_of_invalid",
+                f"「{k}」不是这个项目发过的坐标, 只能点名这个项目自己的 angle_key(原样抄, 不改)。", n, key=k)
+        if src.get("open"):
+            # 带上那张卡的四个维度: 卡不在模型手边(新开的对话、超过角度债那一周、别人抽的)也能照着写(复审 on aw#140)
+            return [], _draw_error("repeat_of_invalid", REPEAT_NOT_USED_YET.format(key=k), n, key=k,
+                                   dims=dict(store.public_dims(dims)))
+        items.append((k, dims))
+    return items, None
+
+
 def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
                 user_id: str | None = None, seed: int | None = None,
-                perpetual_bias: bool = False) -> dict:
-    """发 n 张互不重复、且避开台账的创作坐标, 写入台账。
+                perpetual_bias: bool = False, pin: dict | None = None,
+                repeat_of: list[str] | None = None) -> dict:
+    """发 n 张互不重复、且避开台账的创作坐标, 写入台账(angle cards v2 §2.1)。
 
     这是 generator._assign_slot_coordinates(:1301) 的复活版。当年移除
     (generator.py:1576-1584)的理由是通用角度池跟项目自己的 role 设定打架 ——
     LLM 会锁定更具体的平台标签、把项目的 role 降级成"风格提示"。修法照注释里
     留的那条路: **切入角度优先用项目自己的 custom_roles**, 没配才用通用池。
+
+    v2 的一次发牌: 归属校验 → 夹 n(1–30)和 avoid_days(14–90)→ 校验写手点名(pin / repeat_of, 不对就报错、什么都
+    不写)→ 先验(priors.get_profile, 至多等 2.5 秒, 从不抛)→ 现读台账(store.ledger_window, 读不到就只靠 RPC 挡
+    exact key)→ 点名重写的几张走非原子的 record_draw → 槽位计划 → 候选表 → RPC 预留(不变)→ 把预留到的 key 对回
+    候选的元数据、补每张卡的附加项(浓度 / 时效 / 词感 / 切入角度 / 判据)→ 去掉 _draw → 渲染。
     """
     # 归属校验放在 n<=0 的早返回【之前】: 每个项目级入口都以这一行开头, 才能在
     # CI 里用一条断言把"有没有漏掉某个工具"验死。代价是 n=0 时多一次查询,
@@ -722,6 +872,9 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     project = assert_project_access(client, project_id, user_id=user_id)
     if n <= 0:
         return {"angles": [], "requested": 0, "delivered": 0}
+    clamped = n > DRAW_N_MAX
+    n = min(int(n), DRAW_N_MAX)
+    avoid_days = min(max(int(avoid_days or 30), DRAW_AVOID_MIN), DRAW_AVOID_MAX)
 
     custom = project.get("custom_roles") or []
     if isinstance(custom, str):
@@ -736,38 +889,87 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     pool_source = "project.custom_roles" if custom else "generator.CREATIVE_ROLES_POOL"
 
     rng = random.Random(seed) if seed is not None else random.Random()
+    policy = draw_policy()
+    pid = project.get("id") or project_id
 
-    space = [(lev, arc, fmt, st)
-             for lev in vocab.EMOTIONAL_LEVERS
-             for arc in vocab.HUMAN_TRUTH_ARCHETYPES
-             for fmt in vocab.CONTENT_FORMATS
-             for st in vocab.TITLE_STRUCTURES]
-    rng.shuffle(space)
+    # ── 写手点名(§2.9): 全部校验完再动手 —— 有一样不对就报错, 台账一行不写 ──────────────────────────────
+    reps, err = _repeat_items(client, project_id, repeat_of, n)
+    if err:
+        return err
+    pin_n, err = dp.normalize_pin(pin) if pin else (None, None)
+    # v2 的先验在这里读(pin 报错时要给项目现在的形式占比); v1 是总开关, 不碰 TV, 只看进程缓存里有没有现成的
+    profile = (priors.get_profile(client, project, budget_s=DRAW_PROFILE_BUDGET_S) if policy == "v2"
+               else priors.cached_profile(pid))
+    if err:
+        _p, err = dp.normalize_pin(pin, profile)
+        return _draw_error(err.pop("error"), err.pop("message"), n, **err)
 
-    # 过量供给候选给 RPC —— 它在事务里逐个查避重集、取前 n 个可用的。
-    # 20 倍冗余(下限 500)足以覆盖"近期用掉很多"的项目。
-    cand_cap = min(len(space), max(n * 20, 500))
-    candidates = []
-    for lev, arc, fmt, st in space[:cand_cap]:
-        dims = {"emotional_lever": lev, "human_truth_archetype": arc,
-                "content_format": fmt, "title_structure": st}
-        candidates.append({"angle_key": angle_key(dims), "dims": dims})
-    # 一批之内错开体裁和标题句式(10-20): RPC 按候选的先后取前 n 个可用的, 所以把洗好的候选重排成"前面几个尽量
-    # 互不同形", 选择本身还是 RPC 在事务里做。见 _spread_order。
-    candidates = _spread_order(candidates, n)
+    arm = flywheel_arm(pid, user_id)
+    fallback = policy == "v2" and (bool((profile or {}).get("error")) or (profile or {}).get("ps") == "uniform")
+    if fallback:
+        logger.warning("draw_angles: 先验整个拿不到(%s), 这一批按 v1 发(src=fb, project=%s)",
+                       (profile or {}).get("error") or "快照也读不到", project_id)
+    # 批次号: v2 从 rng 里取; v1 / fb 不能动 rng(候选次序要和原来一字不差), 取 rng 当前状态的哈希 —— 同 seed 同批次号,
+    # 生产里 rng 不设 seed, 状态是随机的, 批次号也就是随机的
+    batch = (dp.new_batch_id(rng) if policy == "v2" and not fallback
+             else hashlib.sha256(repr(rng.getstate()).encode()).hexdigest()[:12])
 
-    reserved = store.reserve_angles(client, project_id, candidates, n,
-                                    user_id, avoid_days)
+    # ── 点名重写的几张: 原样四个维度再发一行, 故意绕过 L0 / L1(§2.9), 走非原子的 record_draw ──────────────────
+    rep_cards = dp.repeat_candidates(reps, batch_id=batch, profile=profile, extra={"fa": arm})
+    if policy == "v1":
+        for c in rep_cards:
+            c["dims"]["_draw"]["pol"] = "v1"
+    if rep_cards:
+        store.record_draw(client, project_id, rep_cards, user_id)
+    n_rest = max(n - len(rep_cards), 0)
+
+    # ── 候选表 ────────────────────────────────────────────────────────────────────────────────────
+    plan = meta = None
+    candidates: list[dict] = []
+    if n_rest and policy == "v2" and not fallback:
+        try:
+            rows = store.ledger_window(client, project_id, max(30, avoid_days))
+            if rows is None:
+                logger.warning("draw_angles: 台账读不到, 这一批只靠 RPC 挡 exact key(dd=rpc_only, project=%s)",
+                               project_id)
+            state = dp.ledger_state(rows, avoid_days=avoid_days)
+            plan = dp.slot_plan(n_rest, profile, rng, pin=pin_n)
+            seed_cells = [dp.cell_of(c["dims"]) for c in rep_cards]
+            candidates, meta = dp.build_candidates(profile, state, plan, rng, pin=pin_n, seed_cells=seed_cells,
+                                                   batch_id=batch, extra={"fa": arm})
+        except Exception:                               # noqa: BLE001 — 策略出错不能拦发牌
+            logger.exception("draw_angles: v2 策略出错, 这一批按 v1 发(src=fb, project=%s)", project_id)
+            fallback, plan, meta, candidates = True, None, None, []
+    v1_path = policy == "v1" or fallback
+    if n_rest and v1_path:
+        keep = None
+        if pin_n:
+            want = {dp.DIMS4.index(d): v for d, v in pin_n.items()}
+            keep = lambda cell: all(cell[i] == v for i, v in want.items())     # noqa: E731
+        candidates = _v1_candidates(n_rest, rng, keep=keep)
+        tag = {"v": 2, "pol": policy, "src": "fb" if fallback else "v1", "b": batch, "fa": arm}
+        if pin_n:
+            tag["pin"] = [d for d in dp.DIMS4 if d in pin_n]
+        candidates = [{"angle_key": c["angle_key"], "dims": {**c["dims"], "_draw": dict(tag)}} for c in candidates]
+
+    # ── 预留: RPC 照旧 ─────────────────────────────────────────────────────────────────────────────
+    reserved = store.reserve_angles(client, project_id, candidates, n_rest, user_id, avoid_days) if n_rest else []
     atomic = reserved is not None
     if not atomic:
         # RPC 不在(迁移没跑)。降级到旧的"读-挑-插"三步, 并明确告知不是原子的。
         logger.warning("draw_angles: 本次发牌不是原子的(deskcore_reserve_angles RPC 不存在, migrations/001 "
                        "可能没跑, project=%s)", project_id)
         avoid = store.recent_angle_keys(client, project_id, avoid_days)
-        # 先去掉避重的再重排一次: 这条路上知道哪些被挡, 错开得比 RPC 那条路还准
-        reserved = _spread_order([c for c in candidates if c["angle_key"] not in avoid], n)[:n]
+        fresh = [c for c in candidates if c["angle_key"] not in avoid]
+        # v1: 先去掉避重的再重排一次(这条路上知道哪些被挡, 错开得比 RPC 那条路还准); v2 的候选次序本身就是槽位次序
+        reserved = (_spread_order(fresh, n_rest) if v1_path else fresh)[:n_rest]
         store.record_draw(client, project_id, reserved, user_id)
 
+    # ── 每张卡的附加项(§2.8: 每种来源同一条规矩) ──────────────────────────────────────────────────────
+    # v1 / fb 照原来的随机抽(rng 的消耗次序不变); v2 的浓度、时效按项目自己的配比抽(向全局收缩), 抽到「通用」而没开
+    # perpetual_bias 就是「不要求」(空列表, 卡上不写那一行) —— 只有开了 perpetual_bias 才是排他的「通用」。
+    v2_extras = (profile or {}).get("extras") if not v1_path else None
+    by_key = (meta or {}).get("by_key") or {}
     tilt = rng.choice(vocab.WORD_TILTS)  # 词感是"今天的心情", 全批一致
 
     # ⚠️ 角度池要洗牌, 不能每次都从 0 号开始取。
@@ -776,56 +978,179 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     # 只发 3 篇, 那就永远只用前 3 个, 另外 3 个一次都不会出现。其他维度都随机
     # 了, 唯独这一维退化成常量, 而这正是"跨批次别老写同样切入"要治的东西。
     # 用本次请求的 rng 洗牌: seed 相同则结果可复现(draw 支持 seed 参数)。
+    # 切入角度和来源无关(试新牌和普通牌一样轮): 按预留到的先后轮, 不看是哪种来源。
     # (codex review)
     angle_order = list(angles_pool)
     rng.shuffle(angle_order)
 
     picked: list[dict] = []
-    for r in reserved:
-        dims = r["dims"]
+    for r in list(rep_cards) + list(reserved):
+        # 回给模型的 dims 只有四个主维度: _draw 记账块(RPC 原样存、原样回)不跟着进 angles[].dims 和 prompt_block ——
+        # 见 store.public_dims
+        dims = store.public_dims(r["dims"]) or {}
         lev = dims.get("emotional_lever", "")
         angle = angle_order[len(picked) % len(angle_order)]
-        trends = ([vocab.TREND_EXCLUSIVE] if perpetual_bias
-                  else vocab.normalize_trends([rng.choice(vocab.TREND_DEPENDENCIES)]))
-        picked.append({
+        if v2_extras is None:
+            trends = ([vocab.TREND_EXCLUSIVE] if perpetual_bias
+                      else vocab.normalize_trends([rng.choice(vocab.TREND_DEPENDENCIES)]))
+            intensity = rng.choice(vocab.EMOTIONAL_INTENSITIES)
+        else:
+            trend = _weighted_choice(rng, v2_extras.get("trend_dependencies"), vocab.TREND_DEPENDENCIES)
+            trends = ([vocab.TREND_EXCLUSIVE] if perpetual_bias
+                      else [] if trend == vocab.TREND_EXCLUSIVE else vocab.normalize_trends([trend]))
+            intensity = _weighted_choice(rng, v2_extras.get("emotional_intensity"), vocab.EMOTIONAL_INTENSITIES)
+        card = {
             "slot": len(picked) + 1,
             "angle_key": r["angle_key"],
             "dims": dims,
             "emotional_valence": vocab.valence_of(lev),
-            "emotional_intensity": rng.choice(vocab.EMOTIONAL_INTENSITIES),
+            "emotional_intensity": intensity,
             "trend_dependencies": trends,
             "word_tilt": tilt,
             "angle_name": angle.get("name") or angle.get("id") or "",
             "angle_brief": angle.get("brief") or "",
-            "boundary_rule": vocab.boundary_rules_for(lev),
-        })
+            "boundary_rule": vocab.boundary_rule_text(lev),
+        }
+        draw_meta = (r["dims"].get("_draw") if isinstance(r.get("dims"), dict) else None) or {}
+        ref = None
+        if draw_meta.get("src") == "rep":
+            ref = {"kind": "repeat", "of": draw_meta.get("of") or r["angle_key"]}
+        elif (by_key.get(r["angle_key"]) or {}).get("reference"):
+            ref = dict(by_key[r["angle_key"]]["reference"])
+        # 卡面上真有参考行才带(复审): 说不出结构的参考(特征题没读到 / 开头是「其他」、是非题都不是「是」)卡上没有那一行,
+        # 带着 reference 的话 batch_note 会说「参照了…的结构」, 写手听到的和卡上的对不上。发牌那边已经不挑这种参考帖
+        # (drawpolicy.describable), 这里再挡一道。
+        if ref and _reference_line(ref):
+            card["reference"] = ref
+        if not v1_path:
+            ev = project_now.card_evidence(profile, dims)
+            if ev:
+                card["evidence"] = ev
+        picked.append(card)
 
     if len(picked) < n:
         logger.warning("angle space exhausted (project=%s): asked %d got %d",
                        project_id, n, len(picked))
 
+    if policy == "v1":
+        status = project_now.STATUS_V1
+        pol = {"name": "v1", "batch": batch}
+    elif fallback:
+        status = project_now.STATUS_DEGRADED
+        pol = {"name": "v1", "fallback": True, "batch": batch}
+    else:
+        status = project_now.status_line(profile, plan)
+        pol = {"name": "v2", "stage": (profile or {}).get("stage"), "prior": (profile or {}).get("ps"),
+               "prior_age_min": (profile or {}).get("prior_age_min"), "batch": batch}
+    notes = []
+    if clamped:
+        notes.append(DRAW_CLAMPED_NOTE.format(max=DRAW_N_MAX))
+    if len(picked) < n:
+        notes.append(project_now.SHORT_NOTE)
     return {
         "angles": picked,
         "requested": n,
         "delivered": len(picked),
-        "prompt_block": render_angles_block(picked),
+        "prompt_block": render_angles_block(picked, status=status),
         "angle_pool_source": pool_source,
         "atomic_reservation": atomic,
         "combination_space": vocab.combination_space(),
-        "note": ("发到的组合少于请求数, 说明近期用掉太多; 可以调小 avoid_days 或分批写。"
-                 if len(picked) < n else ""),
+        "note": " ".join(notes),
         # 念给写手的只说后果; RPC / 迁移号在上面 atomic 判定那里记日志
         "warning": ("" if atomic else
                     "这次发牌没能锁住角度: 队友同时发牌时可能抽到同一组。已记下, 不用你做什么。"),
+        "project_status": status,
+        "batch_note": project_now.batch_note(picked, pin=pin_n),
+        "policy": pol,
     }
 
 
-def render_angles_block(angles: list[dict]) -> str:
-    """渲染成可直接贴进 prompt 的硬约束块。
+# ── 卡面(angle cards v2 §3.1 / §3.2) ─────────────────────────────────────────────────────────────
+# 一个渲染函数画每一张卡, 它看不到这张卡是哪种来源抽出来的(没有来源参数, angles 里也不带来源): 试新牌和普通牌值一样,
+# 画出来就一字不差(盲法, §0)。括号里的依据只看值在本项目近 60 天的占比(project_now.card_evidence, 发牌时算好放进
+# angles[].evidence); 参考行只有外部参考 / 起量帖 / 点名重写这三种牌有(angles[].reference)。
+# 协议(98–104 行)要的几样一字不改: 头一行、「第i篇 [angle_key=…]」、四个维度名、「↳ 判据」、「写完能说出每篇用的是哪一组」、
+# 最后那行 angle_key 原样复制的话。原来那句「以上坐标为硬约束……说不出就是没按坐标写」换成下面的 ANGLES_FOOTER。
+ANGLES_HEADER = "【本批次每篇的创作坐标（必须按编号对应，不得互换）】"
+ANGLES_FOOTER = ("每篇按分到的这一组写，不互换编号：内容形式和标题句式照卡写；情绪杠杆和人性原型是这一篇的方向，用自己的话"
+                 "写出来，卡上的分类名、判据里的说法都不要搬进标题和正文。写完能说出每篇用的是哪一组。")
+ANGLES_KEY_LINE = ("每篇方括号里的 angle_key 原样复制进这一篇查重（check_drafts）和存档（score_drafts）时的 angle_key，"
+                   "不要自己编号、缩写或改写；它只是给写作台记账用的，不写进标题和正文。")
+REPEAT_LINE = "这一篇是写手点名要再写一次的角度：角度照旧，内容要新，查重照常。"
 
-    照 generator._build_slot_coordinates_block(:1350) 的形状, 但多带 essence
-    维度和边界判据 —— 光给标签名模型会混(docs/05 §3 花 40 行讲焦虑 vs 恐惧
-    怎么分是有原因的)。
+
+def _glossed(value: str, plain: dict) -> str:
+    gloss = plain.get(value)
+    return f"{value}——{gloss}" if gloss else str(value)
+
+
+def _bracket(text: str | None) -> str:
+    return f"（{text}）" if text else ""
+
+
+def _days_ago_text(d) -> str:
+    try:
+        d = max(int(d), 0)
+    except (TypeError, ValueError):
+        return ""
+    if d < 14:
+        return f"{d}天前发"
+    if d < 60:
+        return f"约{round(d / 7)}周前发"
+    return f"约{round(d / 30)}个月前发"
+
+
+def _per_day_text(v) -> str:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    return "每天不到1条评论" if v < 1 else f"每天约{int(round(v))}条评论"
+
+
+_structure_bits = vocab.structure_bits          # 发牌那一道筛(drawpolicy.describable)读同一份
+
+
+def _reference_line(ref: dict | None) -> str | None:
+    """参考行(只有 e / h / 点名重写的牌有)。只说结构, 不给参考帖的标题和正文。说不出任何结构回 None —— 这时
+    draw_angles 也不给这张牌带 reference(batch_note 只数卡面上真有参考行的)。
+
+    外部参考的尾巴是「不提那篇帖子里的品牌」, 不是「不提任何品牌」(复审): 外部卡的内容形式照项目配额发, 也会分到
+    场景植入这种产品向的形式, 那一篇本来就要点本项目的品牌名(协议 218 行)。"""
+    if not isinstance(ref, dict):
+        return None
+    kind = ref.get("kind")
+    if kind == "repeat":
+        return REPEAT_LINE
+    if kind == "external":
+        when = "，".join(x for x in (_days_ago_text(ref.get("posted_days_ago")),
+                                    _per_day_text(ref.get("comments_per_day"))) if x)
+        bits = []
+        if ref.get("title_structure"):
+            bits.append(f"标题是{ref['title_structure']}")
+        bits += _structure_bits(ref.get("desc"), external=True)
+        if not bits:
+            return None
+        head = "同品类别家近期起量的一篇" + (f"，{when}" if when else "")
+        return f"参考结构（{head}）：{'；'.join(bits)}。只借结构，不抄内容，不提那篇帖子里的品牌。"
+    if kind == "hit":
+        bits = _structure_bits(ref.get("desc"), external=False)
+        if not bits:
+            return None
+        who = ("本项目近三周评论数排在同类帖前一成的一篇" if ref.get("own")
+               else "同品牌上一期评论数排在同类帖前一成的一篇")
+        age = ref.get("age_days")
+        head = who + (f"，发出{int(age)}天" if isinstance(age, (int, float)) else "")
+        return f"参考结构（{head}）：{'；'.join(bits)}。只借结构，不抄说法。"
+    return None
+
+
+def render_angles_block(angles: list[dict], status: str | None = None) -> str:
+    """渲染成可直接贴进 prompt 的坐标块(§3.1)。``status`` 是 project_status(块的第二行); 不给就没有那一行。
+
+    每张卡: 「第i篇 [angle_key=…]：」, 然后四个维度各一行(名字照协议, 值后面一句大白话, 括号里是本项目的占比依据),
+    易混杠杆的「↳ 判据」(去掉了标志词那一截), 切入角度, 要求时效的才有时效那一行, 有参考的才有参考行。
+    没有来源参数: 看不到、也不看这张牌是怎么抽出来的。
 
     每篇那一行带上完整的 angle_key(2026-10-30 发布收尾): 模型贴进提示词、照着写的是这个块, 原来块里没有 key, 查重 /
     存档时它就自己编一个 —— 10-26 sportsix 带上来的 key 长 7 / 8 / 53 位, 一个都销不了账。key 和 angles[].angle_key
@@ -833,33 +1158,44 @@ def render_angles_block(angles: list[dict]) -> str:
     """
     if not angles:
         return ""
-    lines = ["【本批次每篇的创作坐标（必须按编号对应，不得互换）】"]
+    lines = [ANGLES_HEADER]
+    if status:
+        lines.append(f"本项目现在：{status}")
+    lines.append("")
     for a in angles:
         d = a["dims"]
-        lines.append(
-            f"第{a['slot']}篇 [angle_key={a['angle_key']}]：情绪杠杆={d['emotional_lever']}"
-            f"({a['emotional_valence']}/{a['emotional_intensity']})"
-            f" · 人性原型={d['human_truth_archetype']}"
-            f" · 内容形式={d['content_format']}"
-            f" · 标题句式={d['title_structure']}"
-            f" · 切入角度={a['angle_name']}")
+        ev = a.get("evidence") or {}
+        lev = d.get("emotional_lever", "")
+        intensity = vocab.INTENSITY_PLAIN.get(a.get("emotional_intensity"), a.get("emotional_intensity") or "")
+        lines.append(f"第{a['slot']}篇 [angle_key={a['angle_key']}]：")
+        lines.append(f"  · 内容形式：{_glossed(d.get('content_format', ''), vocab.PLAIN_FORMAT)}"
+                     f"{_bracket(ev.get('content_format'))}")
+        lines.append(f"  · 标题句式：{_glossed(d.get('title_structure', ''), vocab.PLAIN_TITLE)}"
+                     f"{_bracket(ev.get('title_structure'))}")
+        lines.append(f"  · 情绪杠杆：{_glossed(lev, vocab.PLAIN_LEVER)}"
+                     f"{_bracket(f'浓度：{intensity}' if intensity else '')}")
+        if a.get("boundary_rule"):
+            lines.append(f"    ↳ 判据：{a['boundary_rule']}")
+        lines.append(f"  · 人性原型：{d.get('human_truth_archetype', '')}{_bracket(ev.get('human_truth_archetype'))}")
+        name, brief = a.get("angle_name") or "", a.get("angle_brief") or ""
+        lines.append(f"  · 切入角度：{name}——{brief}" if brief else f"  · 切入角度：{name}")
         # ⚠️ 时效依赖必须渲进来。它是发牌时抽的(perpetual_bias=True 时强制抽
         # 排他值「通用」), 但这个块才是文档让人贴进 prompt 的东西 —— 不渲染
         # 的话模型根本收不到, perpetual_bias 这个开关等于没接线, 除非调用方
-        # 自己去翻原始 angles。(codex review)
+        # 自己去翻原始 angles。(codex review)  v2 抽到「通用」而没开 perpetual_bias 时列表是空的, 这一行就不出现。
         trends = a.get("trend_dependencies") or []
         if trends:
             note = ("（排他值：全篇不得出现任何时事、节日、平台事件、流行词等"
                     "时效元素）" if vocab.TREND_EXCLUSIVE in trends else "")
-            lines.append(f"    ↳ 时效依赖：{'、'.join(trends)}{note}")
-        if a.get("boundary_rule"):
-            lines.append(f"    ↳ 判据：{a['boundary_rule']}")
-        if a.get("angle_brief"):
-            lines.append(f"    ↳ 角度：{a['angle_brief']}")
-    lines.append(f"\n全批词感倾向：{angles[0].get('word_tilt', '')}")
-    lines.append("以上坐标为硬约束。写完后每一篇要能说出自己用的是哪一组，说不出就是没按坐标写。")
-    lines.append("每篇方括号里的 angle_key 原样复制进这一篇查重（check_drafts）和存档（score_drafts）时的 angle_key，"
-                 "不要自己编号、缩写或改写；它只是给写作台记账用的，不写进标题和正文。")
+            shown = [f"{t}（{vocab.PLAIN_TREND[t]}）" if t in vocab.PLAIN_TREND else t for t in trends]
+            lines.append(f"    ↳ 时效依赖：{'、'.join(shown)}{note}")
+        ref_line = _reference_line(a.get("reference"))
+        if ref_line:
+            lines.append(f"    ↳ {ref_line}")
+    lines.append("")
+    lines.append(f"全批词感（可参考）：{angles[0].get('word_tilt', '')}")
+    lines.append(ANGLES_FOOTER)
+    lines.append(ANGLES_KEY_LINE)
     return "\n".join(lines)
 
 

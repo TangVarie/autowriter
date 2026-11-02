@@ -351,6 +351,9 @@ def angle_key(dims: dict) -> str:
 
     情绪强度 / 时效依赖 / 词感是叠加项【不进 key】—— 否则同一个核心组合换个
     词感就被当成"没用过", 跨批次台账就白记了。
+
+    只按名字取这四个键: dims 里多出来的键(angle cards v2 的 ``_draw`` 记账块)不进 key, 台账上新旧两种行的 key
+    一致(tests/test_angle_dims_tolerance.py 钉着)。
     """
     core = "|".join(str(dims.get(k, "")) for k in
                     ("emotional_lever", "human_truth_archetype",
