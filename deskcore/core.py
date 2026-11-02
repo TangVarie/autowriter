@@ -2702,13 +2702,119 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tu
         "告诉我要写的是哪个项目, 并把帖子正文贴过来。")
 
 
+# ── 没有链接时按贴来的正文找帖(2026-11-02) ──────────────────────────────────────────────────────────
+# 写手常常不给链接, 只贴正文(飞书那一行的正文格整段复制: 带不带标题行、末尾带不带话题都有) + project_id。原来这条路不找
+# TV, existing_comments 永远是空的, 模型照样会写出和已有评论重复的问题。现在只在这个写作台项目对着的 TV 项目
+# (tv_project_map)里找一次: 挑正文里两段最长的连续文字(store.TV_TEXT_RUN_CHARS, 截 16 字)逐段粗筛, 每段一次查询、一页
+# 30 条, 再在 Python 里按全文比 —— 去标点、剥话题之后的四字串, 交集占**较大那一边**的比例 ≥ TEXT_MATCH_SIM(两个方向的
+# 包含度都够、长度也差不多)才算同一篇; 标题行贴没贴都认(笔记那边按「正文」和「标题 + 正文」各比一次)。
+#
+# 阈值 0.90 的依据(11-02 查生产库 truth_vault.notes 全部 19 个项目, 同项目两两比, 正文去标点后不完全相同的 52.8 万对):
+#   · 链接不同的两篇里到 0.90 的只有 2 对(0.951 / 0.937), 都是同一段文案隔几天又发了一次; 紧挨着的 7 对在 0.875 ~ 0.897:
+#     同标题同开头的另一版、同一个故事写了两三版、一篇整段包含另一篇再加一句 —— 阈值放到 0.85 就会把它们认成同一篇;
+#   · 同一条链接的两行(挪表 / 改过的旧行)9 对里 4 对 ≥ 0.90、3 对 0.80 ~ 0.90、2 对不到 0.6 —— 改得多的认不出, 只是退回贴正文;
+#   · 共用的品牌话术、一整行话题撞不到这个数: 话题先剥掉, 一句话术三十来字, 占不到一篇两三百字的帖子的一成半。
+# 宁可认不出(和原来一样照贴来的正文写), 不把别的帖子的评论安到这篇头上。正文完全一样的两行生产库有 261 对: 153 对是同一条
+# 链接(挪表留下的旧行等, 活的那行优先), 69 对链接不同(同一段文案发了两次)分不出是哪一篇 —— 活的优先、再取最像的、再取
+# 发布最近的, 和按链接找的口径一样, 回包里说清楚是按正文对上的。
+# 尽力而为: 查库出错只记日志, 照原来走贴正文那条路, 不抛、不拦写评论。score_comments 不走这一步: 它只用标题正文判,
+# 而且查帖子算在 ~22 秒的判定截止里, 多两次查询换不来什么。
+TV_BY_TEXT_FLAG = "_by_text"
+TEXT_MATCH_SIM = 0.90
+TEXT_MATCH_MIN_CHARS = 20          # 去标点后不到这么多字不查(同 tvlink.MIN_PREFIX: 太短的到处撞)
+TEXT_MATCH_TRIES = 2               # 最多粗筛两段; 没对上就当没找到, 不往下翻
+_TEXT_RUN_RE = re.compile(f"[{store.TV_TEXT_RUN_CHARS}]{{{store.TV_TEXT_RUN_MIN},}}")
+TV_BY_TEXT_NOTE = ("帖子是按贴来的正文在 TV 里对上的(没有链接, 或链接在 TV 里没找到); 同一段正文发过不止一条时取最近发布的那条。"
+                   "用户说不是这一篇, 请用户给发布链接再调一次。")
+TV_VANISHED_BY_TEXT_NOTE = "按正文对上的这条在 TV 里只剩飞书里已删 / 挪去别的表的旧记录, 已有评论停在它消失前。"
+
+
+def _text_forms(title: str, body: str) -> list[tuple[str, set[str]]]:
+    """一篇帖子拿去比的样子: 去标点、剥话题之后的「正文」和「标题 + 正文」, 各带四字串。正文是空的不比。"""
+    norm_body = fp.normalize(tvlink.strip_hashtags(body))
+    if not norm_body:
+        return []
+    forms = [norm_body] + ([fp.normalize(title) + norm_body] if fp.normalize(title) else [])
+    return [(f, tvlink.grams(f)) for f in dict.fromkeys(forms)]
+
+
+def _text_sim(a: tuple[str, set[str]], b: tuple[str, set[str]]) -> float:
+    """完全一样 1.0; 否则四字串交集 / 较大那一边(两边都要有 FUZZY_MIN_GRAMS 个, 太短的只认完全一样)。"""
+    if a[0] == b[0]:
+        return 1.0
+    if min(len(a[1]), len(b[1])) < tvlink.FUZZY_MIN_GRAMS:
+        return 0.0
+    return len(a[1] & b[1]) / max(len(a[1]), len(b[1]))
+
+
+def _text_probe(text: str) -> tuple[list[tuple[str, set[str]]], list[str]] | None:
+    """贴来的正文 → ``(拿去比的样子, 拿去粗筛的几段)``; 太短、或没有一段够长的连续文字时回 None(不查)。
+
+    带「【标题】…【正文】…」标记的按标记拆开(同 TV 的 raw_content); 不带的整段当正文, 第一行是标题也没关系 ——
+    笔记那边「标题 + 正文」那个样子会对上。粗筛的段从剥了话题的正文里挑最长的两段(一样长取靠前的), 截前 16 字。"""
+    title, body = tvlink.parse_raw(text)
+    body = tvlink.strip_hashtags(body)
+    forms = [f for f in _text_forms(title, body) if len(f[0]) >= TEXT_MATCH_MIN_CHARS]
+    runs = list(dict.fromkeys(r[:store.TV_TEXT_RUN_MAX]
+                              for r in sorted(_TEXT_RUN_RE.findall(body), key=len, reverse=True)))
+    if not forms or not runs:
+        return None
+    return forms, runs[:TEXT_MATCH_TRIES]
+
+
+def _note_from_text(client, project_id: str, post_body: str) -> dict | None:
+    """贴来的正文 → 这个写作台项目对着的 TV 项目里的同一篇笔记(带 ``TV_BY_TEXT_FLAG``), 对不上回 None。
+
+    调用方已经过了归属闸; 这里只查 ``tv_project_map`` 里这个项目对着的 TV 项目, 回来的行再核一遍项目号, 别的项目的
+    笔记不回。查库出错只记日志、回 None, 不抛。"""
+    try:
+        probe = _text_probe(post_body)
+        if probe is None:
+            return None
+        forms, runs = probe
+        tv_ids = sorted({str(r["tv_project_id"]) for r in store.tv_projects_of(client, project_id)
+                         if r.get("tv_project_id")})
+        if not tv_ids:
+            return None
+        hits: list[tuple[float, dict]] = []
+        for run in runs:
+            for row in store.tv_notes_by_text_run(client, run, tv_ids):
+                if str(row.get("project_id") or "") not in tv_ids or not row.get("note_id"):
+                    continue
+                score = max((_text_sim(a, b) for a in forms for b in _text_forms(*_tv_post_text(row))), default=0.0)
+                if score >= TEXT_MATCH_SIM:
+                    hits.append((score, row))
+            if hits:
+                break
+        if not hits:
+            return None
+        try:
+            gone = store.tv_vanished_note_ids(client, [r["note_id"] for _, r in hits])
+        except Exception:                               # noqa: BLE001 — 同 _note_from_link: 视图读不到就照旧取
+            logger.exception("comments_for: 按正文找帖时查 v_notes_vanished 失败, 按相似度和发布时间取")
+            gone = set()
+        # 活的优先(同 _note_from_link), 再取最像的(同一段文案改了几个字又发一次时, 贴来的是哪一版就是哪一版), 再取发布最近的
+        hits.sort(key=lambda h: (str(h[1]["note_id"]) not in gone, h[0], str(h[1].get("publish_time") or "")),
+                  reverse=True)
+        row = hits[0][1]
+        note = {**row, TV_BY_TEXT_FLAG: True}
+        if str(row["note_id"]) in gone:
+            note[TV_VANISHED_FLAG] = True
+        return note
+    except Exception:                                   # noqa: BLE001 — 尽力而为, 不因为它让写评论报错
+        logger.exception("comments_for: 按正文在 TV 里找帖失败, 照贴来的正文写 (project=%s)", project_id)
+        return None
+
+
 def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: str,
-                  post_body: str) -> tuple[dict | None, str, str, dict | None, dict | None]:
+                  post_body: str, by_text: bool = False) -> tuple[dict | None, str, str, dict | None, dict | None]:
     """评论要接的那篇帖子 → ``(项目, 标题, 正文, TV 笔记或 None, 缺东西时的回包或 None)``。
 
     有链接先按链接找 TV(找到了按笔记反查项目、过归属闸); 找不到、或没给链接, 就用贴过来的正文 + project_id
     (同样过闸)。两样都没有时回一份 ``resolved=false`` 的回包, 不报错 —— 那是正常的下一步。
     用户贴了正文时以贴的为准(发布后可能改过), 链接只用来定项目和取已有评论。
+    ``by_text``(只有 comments_for 开): 走贴正文那条路时, 过了闸再按正文在这个项目的 TV 笔记里找一次
+    (``_note_from_text``), 找到的笔记只用来取已有评论, 标题正文照旧用贴来的。
     """
     link, project_id = (link or "").strip(), (project_id or "").strip()
     post_title, post_body = (post_title or "").strip(), (post_body or "").strip()
@@ -2744,7 +2850,8 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
         return project, title, body, note, None
     if post_body and project_id:
         project = assert_project_access(client, project_id, user_id=user_id)
-        return project, post_title, post_body, None, None
+        note = _note_from_text(client, str(project["id"]), post_body) if by_text else None
+        return project, post_title, post_body, note, None
     need = []
     if not post_body:
         need.append("帖子的标题和正文")
@@ -2768,19 +2875,30 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
                  post_title: str = "", post_body: str = "") -> dict:
     """写评论之前一次拿齐: 帖子(按链接从 TV 找, 找不到就用贴过来的正文)、已有评论、本项目管评论的规则、默认评论位。
 
+    只贴了正文 + project_id 时也按正文在这个项目的 TV 笔记里找一次(``_note_from_text``): 对上了 ``source`` 是
+    ``tv_by_text``、已有评论照样带回; 对不上或查不成就是 ``pasted``, 和原来一样。
     找不到帖子又没贴正文时**不报错**, 回 ``resolved=false`` + 一句该让用户补什么 —— 那是正常的下一步, 不是故障。
     帖子所在的项目不归调用者时报 PermissionError, 不回帖子内容。归属闸在 ``_resolve_post`` 里, 两条路都过。
     """
     project, title, body, note, missing = _resolve_post(
-        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body)
+        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body,
+        by_text=True)
     if missing is not None:
         return missing
-    source = "tv" if note is not None else "pasted"
     comment_rules, hard_rules = _comment_rules(client, project["id"], user_id)
     existing = []
     rows: list[dict] = []
     if note is not None:
-        rows = store.tv_note_comments(client, str(note["note_id"]))
+        try:
+            rows = store.tv_note_comments(client, str(note["note_id"]))
+        except Exception:                               # noqa: BLE001
+            if not note.get(TV_BY_TEXT_FLAG):
+                raise
+            # 按正文对上的是尽力而为: 评论读不到就当没对上, 照贴来的正文写(和原来一样), 不让写评论报错
+            logger.exception("comments_for: 按正文对上的笔记读评论失败, 照贴来的正文写 (note=%s)", note.get("note_id"))
+            note = None
+    source = "pasted" if note is None else "tv_by_text" if note.get(TV_BY_TEXT_FLAG) else "tv"
+    if note is not None:
         rows.sort(key=lambda r: (r.get("comment_order") is None, r.get("comment_order") or 0))
         existing = [{"order": r.get("comment_order"), "role": r.get("comment_role"),
                      "is_reply": bool(r.get("parent_comment_id")),
@@ -2798,9 +2916,11 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
     if note is not None:
         out["note_id"] = note.get("note_id")
         out["tier"] = note.get("tier")
+        if note.get(TV_BY_TEXT_FLAG):
+            out["tv_by_text_note"] = TV_BY_TEXT_NOTE
         if note.get(TV_VANISHED_FLAG):
             out["tv_note_vanished"] = True
-            out["tv_note_vanished_note"] = TV_VANISHED_NOTE
+            out["tv_note_vanished_note"] = TV_VANISHED_BY_TEXT_NOTE if note.get(TV_BY_TEXT_FLAG) else TV_VANISHED_NOTE
         total = note.get("comments_count")
         if len(rows) >= store.TV_COMMENTS_MAX or (isinstance(total, int) and total > len(existing)):
             # 只取了前 TV_COMMENTS_MAX 条(codex review on aw#107): 说出来, 别让模型以为这就是全部

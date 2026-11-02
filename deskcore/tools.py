@@ -644,10 +644,14 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
     传 ``link`` 就行: 服务端按链接在 TV 里找到那篇帖子、它属于哪个项目、已有的评论。TV 里没有这条(每天同步一次; 短链和
     长链互相认不出)就回 ``resolved=false`` 和 ``need``: 照 ``note`` 让用户把帖子标题、正文贴过来, 再带 ``post_title`` /
     ``post_body`` / ``project_id`` 调一次。用户自己贴了正文时以贴的为准。
+    只贴了正文 + ``project_id``(用户从飞书整格复制的正文就行, 带不带标题行、话题都可以)时, 服务端也按正文在这个项目的
+    TV 笔记里找一次: 对上了 ``source`` 是 ``tv_by_text``, 已有评论照样带回来; 对不上 ``source`` 是 ``pasted``、
+    ``existing_comments`` 是空的, 照常写, 不用再问用户要链接。
 
     返回:
       · post —— 要接的帖子(标题 + 正文)
-      · existing_comments —— 帖子下已有的评论(TV 里有才有): 别重复里面已经问过的事
+      · source —— ``tv``(按链接找到)/ ``tv_by_text``(按贴来的正文对上, 带一句 ``tv_by_text_note``)/ ``pasted``
+      · existing_comments —— 帖子下已有的评论(TV 里找到了才有): 别重复里面已经问过的事
       · comment_rules —— 本项目管评论的规则(「评论区：」开头的), 必须守
       · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守
       · slots —— 默认四个评论位: q1 / q2 提问、exp 补充经验、reply 贴主答疑(回 q1)。每位写一条, 位的要求在 note 里;

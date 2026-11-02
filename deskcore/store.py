@@ -2766,6 +2766,35 @@ def tv_notes_by_link_token(sb, token: str, *, accept=None) -> list[dict]:
     return []
 
 
+# ── comments_for: 没有链接时按贴来的正文找帖(2026-11-02) ───────────────────────────────────────────
+# 粗筛用正文里一段连续的汉字 / 字母 / 数字(core._text_probe 挑): 只许这几类字符, 进 PostgREST 的过滤串里没有 % _ , ( )
+# 空格这些语法字符; 照样过一遍 _like_escape(这个字符集下不起作用, 防的是以后有人放宽字符集)。只比 raw_content:
+# 11-02 查生产库 truth_vault.notes 6838 行, body 列一行都没有值、raw_content 每行都有(「【标题】… 【正文】…」或整段),
+# 标题列有值的 130 行。一页 30 条: 同一天抽查五个项目 1489 篇, 每篇正文里最长的那段(截 16 字)在本项目里最多出现在
+# 27 篇里(94% 只有它自己), 一页就装得下; 装不下的(共用的品牌话术)由调用方换一段再查一次。不吞异常, 由 core 决定怎么退。
+TV_TEXT_PAGE = 30
+TV_TEXT_RUN_CHARS = "0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff"      # 数字、ASCII 字母、汉字(基本区 + 扩展 A)
+TV_TEXT_RUN_MIN, TV_TEXT_RUN_MAX = 8, 16
+_TV_TEXT_RUN_RE = re.compile(f"[{TV_TEXT_RUN_CHARS}]{{{TV_TEXT_RUN_MIN},{TV_TEXT_RUN_MAX}}}")
+
+
+def tv_notes_by_text_run(sb, run: str, tv_project_ids: list[str], *, page: int = TV_TEXT_PAGE) -> list[dict]:
+    """这几个 TV 项目里 raw_content 含 ``run`` 的笔记, 新发布的在前, 只取一页(``page`` 条)。
+
+    ``run`` 只许汉字 / 字母 / 数字、8~16 个, 别的一律不查、回 ``[]``。这只是粗筛(ilike 不分大小写, 一段话也可能
+    几篇共用), 是不是同一篇由调用方按全文再比。项目号来自 ``tv_project_map``, 不是用户给的字。"""
+    ids = [str(i) for i in (tv_project_ids or []) if i]
+    if not ids or not isinstance(run, str) or not _TV_TEXT_RUN_RE.fullmatch(run):
+        return []
+    return list((sb.schema("truth_vault").table("notes")
+                 .select("note_id, project_id, title, body, raw_content, publish_url, publish_time, "
+                         "comments_count, tier")
+                 .in_("project_id", ids)
+                 .ilike("raw_content", f"%{_like_escape(run)}%")
+                 .order("publish_time", desc=True).order("note_id")
+                 .range(0, page - 1).execute()).data or [])
+
+
 def tv_vanished_note_ids(sb, note_ids: list[str]) -> set[str]:
     """这几条里哪些在 TV 的 ``truth_vault.v_notes_vanished``: 飞书里删了、或挪去别的表, TV 那一行还留着(D-103)。
 
