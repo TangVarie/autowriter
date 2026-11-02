@@ -1526,3 +1526,23 @@ def cache_state(project_id: str, *, params: dict = PARAMS) -> str:
         return "unavailable" if e and e.get("err_at") else "warming"
     except Exception:                                   # noqa: BLE001
         return "unavailable"
+
+
+# ── 别的模块借这套缓存(project_now 的写作台计数用) ─────────────────────────────────────
+# 同一套单飞 + 两个工作线程 + TTL(键不是 g / x: 开头的按项目块算, 2 小时)+ 72 小时旧值。键别和 g / p: / x: 撞。
+def warm_value(key: str, fn, *, params: dict = PARAMS) -> None:
+    """只投递、不等: ``key`` 不新鲜就在后台跑 ``fn``(回 None / 抛 = 这一次没建成)。从不抛。"""
+    try:
+        if key and not key.startswith(("g", "p:", "x:")):
+            _need(key, fn, params)
+    except Exception:                                   # noqa: BLE001
+        logger.exception("priors: warm_value failed (%s)", key)
+
+
+def cached_value(key: str, *, params: dict = PARAMS):
+    """只读缓存: 72 小时内建成过的值, 没有回 None。不发请求、不等。从不抛。"""
+    try:
+        e = _entry(key)
+        return e["value"] if _usable(e, params) else None
+    except Exception:                                   # noqa: BLE001
+        return None

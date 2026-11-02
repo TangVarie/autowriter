@@ -2724,6 +2724,66 @@ def desk_adoption(sb, version_ids) -> dict | None:
     return out
 
 
+
+# ── draw-report(angle cards v2 §5.3, 运维 CLI, 只读) ───────────────────────────────────────────────
+# 三样都只取 id / 时间 / 结论列: 台账带 dims(含 _draw 记账块); 底稿只取 angle_key 和查重结论(不取标题、正文);
+# TV 笔记只取评论数、tier、发布时间。读挂了回 None, 由 CLI 说读不到。
+REPORT_LEDGER_CAP = 20000
+REPORT_SNAPSHOT_CAP = 20000
+
+
+def report_ledger_rows(sb, days: int, project_id: str | None = None,
+                       cap: int = REPORT_LEDGER_CAP) -> list[dict] | None:
+    """近 ``days`` 天抽的台账行(全部项目, 或只一个), 旧的在前。"""
+    since = iso_ago(max(int(days), 1))
+    try:
+        return _paged(lambda off, lim: _maybe_eq(
+            sb.table("angle_ledger").select("id, project_id, " + _LEDGER_WINDOW_COLS.split(", ", 1)[1]),
+            "project_id", project_id).gte("drawn_at", since).order("drawn_at").order("id")
+            .range(off, off + lim - 1), hard_cap=cap)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("draw report: ledger unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+        return None
+
+
+def report_snapshot_verdicts(sb, days: int, project_id: str | None = None,
+                             cap: int = REPORT_SNAPSHOT_CAP) -> list[dict] | None:
+    """近 ``days`` 天查重时记下的底稿里带 angle_key 的那些: 只取 项目 / angle_key / 结论 / 时间(D1 用)。018 没跑回 []。"""
+    since = iso_ago(max(int(days), 1))
+    try:
+        return _paged(lambda off, lim: _maybe_eq(
+            sb.table("draft_snapshots").select("id, project_id, angle_key, status, checked_at"),
+            "project_id", project_id).gte("checked_at", since).not_.is_("angle_key", "null")
+            .order("checked_at").order("id").range(off, off + lim - 1), hard_cap=cap)
+    except Exception as exc:                            # noqa: BLE001
+        if snapshots_table_missing(exc):
+            return []
+        logger.warning("draw report: draft_snapshots unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+        return None
+
+
+def report_note_outcomes(sb, note_ids) -> dict[str, dict] | None:
+    """这几篇 TV 笔记的评论数、tier、发布时间(M5 / M6): ``{note_id: {...}}``。读挂了回 None。"""
+    ids = sorted({str(i) for i in (note_ids or ()) if i})
+    out: dict[str, dict] = {}
+    try:
+        for i in range(0, len(ids), NOTE_ANSWERS_CHUNK):
+            chunk = ids[i:i + NOTE_ANSWERS_CHUNK]
+            for r in (sb.schema("truth_vault").table("notes")
+                        .select("note_id, project_id, content_format, publish_time, comments_count, tier")
+                        .in_("note_id", chunk).limit(PAGE).execute()).data or []:
+                if r.get("note_id"):
+                    out[str(r["note_id"])] = r
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("draw report notes", exc)
+        return None
+    return out
+
+
+def _maybe_eq(q, col: str, value):
+    return q.eq(col, value) if value else q
+
+
 def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
                           counters: dict, meta: dict) -> None:
     """一次 commit_drafts 的耗时与判定结局, 落一行 ``batch_metrics``。

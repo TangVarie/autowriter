@@ -29,6 +29,9 @@
   python -m deskcore.cli angle-sim --project <uuid|TV 项目号> --days 28 --per-day 5|10 [--seeds 5] [--profile p.json]
                                                     ← 发牌 v2 的模拟(假台账, 不写库): 5 张/天判上线闸, 10 张/天只报数;
                                                       TV 项目号 / --profile 不连库(用 vendored 快照 / 给的 Profile)
+  python -m deskcore.cli draw-report --days 28 [--project <uuid>] [--json]
+                                                    ← 发牌 v2 的读数(只读): 来源 × 项目 × 周的 M1/M2/M3/D1/M5/M6、
+                                                      MH 比较、IPW、只用试新牌的杠杆提升、健康指标
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
                                                     ← TV 的笔记按内容对到写作台的版本,
                                                       对不上的补进指纹库(每天跑一次); --all 跑完
@@ -865,6 +868,30 @@ def _compile_rules(core, sb, args) -> int:
     return 1 if bad or not_tried else 0
 
 
+def _draw_report(sb, args) -> int:
+    """draw-report(§5.3): 只读。台账 → 销账版本对上 TV 的情况 → 查重底稿的结论 → 发出去那几篇的评论数, 然后算表。"""
+    from . import drawreport, store
+    rows = store.report_ledger_rows(sb, args.days, args.project)
+    if rows is None:
+        print("draw-report: 台账读不到, 什么都没算")
+        return 1
+    vids = sorted({str(r["consumed_version_id"]) for r in rows if r.get("consumed_version_id")})
+    adoption = store.desk_adoption(sb, vids)
+    if adoption is None:
+        print("draw-report: tv_note_links 读不到, M2 / M3 / M5 / M6 这次不算")
+    snaps = store.report_snapshot_verdicts(sb, args.days, args.project)
+    if snaps is None:
+        print("draw-report: draft_snapshots 读不到, D1 这次不算")
+    note_ids = [v["note_id"] for v in ((adoption or {}).get("by_version") or {}).values() if v.get("note_id")]
+    notes = store.report_note_outcomes(sb, note_ids) if note_ids else {}
+    rep = drawreport.report(rows, adoption=adoption, snapshots=snaps, notes=notes, days=args.days)
+    if args.json:
+        _print(rep)
+    else:
+        print(drawreport.format_report(rep))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="deskcore", description="写作台内核 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1040,6 +1067,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wait", type=float, default=120.0, help="现读 Profile 时最多等先验建好的秒数")
     p.add_argument("--json", action="store_true")
 
+    # 发牌 v2 的读数(angle cards v2 §5.3): 运维命令, 只读, 同 angle-prior 不要 --user。
+    p = sub.add_parser("draw-report", help="发牌 v2 的读数: 来源 × 项目 × 周的写了 / 发了 / 留着 / 撞车, MH 比较与健康(只读)")
+    p.add_argument("--days", type=int, default=28)
+    p.add_argument("--project", default=None, help="只看这一个写作台项目(uuid); 不给就全部")
+    p.add_argument("--json", action="store_true")
+
     args = ap.parse_args(argv)
     if args.cmd == "selftest":
         return selftest()
@@ -1094,6 +1127,8 @@ def main(argv: list[str] | None = None) -> int:
         return _angle_prior(args)
     if args.cmd == "angle-sim":
         return _angle_sim(args, live=True)
+    if args.cmd == "draw-report":
+        return _draw_report(sb, args)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user, include_archived=args.include_archived))
     elif args.cmd == "open":

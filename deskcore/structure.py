@@ -22,6 +22,8 @@
     efficacy_promise(合规观察项, 永不下发)。body_len_bucket 这类代码特征稿子没有答案行(Jev 只答模型题), 篇幅/段落
     形状这一维这里做不了。
   · 已验证规律用到的题一律不报(PATTERN_QIDS): 第一批让模型按篇轮换着用它们, 那几处扎不扎堆是那条轮换管的, 是有意的。
+  · angle cards v2(§3.5): title_is_question 照读、不再报(NEVER_FLAG) —— 标题句式归发牌的卡管; 其余几题和本项目已发
+    笔记的比例相比(published_shares), 高出 0.20 以上、且不低于 0.6 才算扎堆。
 
 怎么算扎堆: 只看 bool 题的「是」、选择题的指定取值(FLAG_ANSWERS)。bool 题落在「否」那边是已发笔记的常态(上面那几个
 百分比), 不算趋同。
@@ -75,31 +77,54 @@ MAX_DRAFTS = 30          # 最近这么多篇打过分的稿子(一个 item 算�
 MIN_DRAFTS = 12          # 少于这么多篇不报: 七八篇里六成是同一种, 可能只是一两批的题材碰巧
 SHARE_MIN = 0.6
 
+# angle cards v2 §3.5: 「扎堆」改成和本项目已发笔记的比例相比 —— 已发的本来就六七成是某种写法时, 稿子也六七成是常态,
+# 不是趋同。给了已发的比例(简报从发牌先验的项目块里拿, published_shares)时, 一处要到 max(0.6, 已发占比 + 0.20) 才报,
+# 每条多带一个 published(已发笔记里这种写法的占比); 没有已发的比例就照原来的口径。标题是不是问句这一题一律不报了:
+# 标题句式是 draw_angles 的卡定的(问句的份额已经按项目的已发比例和效果配好), 这里再叫一半稿子换掉就是和卡打架。
+NEVER_FLAG = frozenset({"title_is_question"})
+RELATIVE_MARGIN = 0.20
+
 # 分母(codex review on aw#115): share 是这一题有有效答案的那几篇里的占比, 不是 window 篇里的 —— Jev 不是每题都答, 30 篇
 # 里只有 12 篇答了、8 篇是「是」, 光给 window 30 和 0.67 读起来像是 20 篇。每条带上 of(这一题的分母), TASK 也照这个说。
 TASK = (
-    "concentrated 是这个项目最近 window 篇打过分的稿子里, 扎堆写成了同一个样子的几处地方: question 是哪一处, "
-    "answer 是扎堆的那种写法, share 是占比, 分母是 of —— 这一题有答案的篇数(有的稿子这一题没答, 所以 of 可能比 "
-    "window 少, share 别当成 window 篇里的占比)。这一批新写的稿子, 每一处都至少有一半换成别的写法, 另一半可以照旧; "
+    "concentrated 是这个项目最近 window 篇打过分的稿子里, 和本项目已发的比例相比扎堆写成了同一个样子的几处地方: "
+    "question 是哪一处, answer 是扎堆的那种写法, share 是占比, 分母是 of —— 这一题有答案的篇数(有的稿子这一题没答, "
+    "所以 of 可能比 window 少, share 别当成 window 篇里的占比); 带 published 的那条, published 是本项目已发笔记里这种写法的"
+    "占比, share 比它高出一截才列在这里。这一批新写的稿子, 每一处都至少有一半换成别的写法, 另一半可以照旧; "
     "不用每篇都换, 也不用一篇把几处全换。比如「正文第一句是哪一种 / 具体事件 / 0.86」, 就让至少一半的稿子第一句"
     "不写具体事件, 改用身份自述、观点断言、提问这类开头。换的是写法, 不动 p0 / stable 定下的东西: 人设照旧, "
     "产品要不要露出、怎么露出照项目要求。优先级: p0 / stable、draw_angles 分到的坐标和切入角度、用户点名要的写法, "
-    "都在这一栏之上 —— 分到的标题句式就是疑问句的那篇, 标题照样写问句。这一栏只管新写的稿, 改稿不受它约束; "
+    "都在这一栏之上 —— 标题句式照卡写。这一栏只管新写的稿, 改稿不受它约束; "
     "只用来自己调整, 不用念给用户听。"
 )
 
 
-def recent_structure(drafts: list[dict[str, str]]) -> dict | None:
-    """``drafts``: 最近打过分的稿子(新的在前), 每篇 ``{题目 id: 答案}``, 只含有效答案。
+def _published_share(published_shares: dict | None, qid: str, answer: str) -> float | None:
+    """已发笔记里这一题这种写法的占比: 选择题是 {答案: 占比}, bool 题是「是」的占比。没有就 None。"""
+    if not published_shares or qid not in published_shares:
+        return None
+    v = published_shares[qid]
+    if isinstance(v, dict):
+        x = v.get(answer)
+        return float(x) if isinstance(x, (int, float)) else 0.0
+    if isinstance(v, (int, float)):
+        return float(v) if answer == "是" else 1.0 - float(v)
+    return None
 
-    回 ``{"window": n, "concentrated": [{question, answer, share, of}], "task": TASK}``; 篇数不够或哪一处都不扎堆时回
-    None(简报就不带这一栏)。占比的分母是这一题有有效答案的篇数(of), 那一题有效答案也要够 MIN_DRAFTS 篇。"""
+
+def recent_structure(drafts: list[dict[str, str]], published_shares: dict | None = None) -> dict | None:
+    """``drafts``: 最近打过分的稿子(新的在前), 每篇 ``{题目 id: 答案}``, 只含有效答案。``published_shares``: 本项目已发
+    笔记的特征题比例(发牌先验的 ``fq_shares``: 选择题 {答案: 占比}, bool 题「是」的占比), 没有就 None。
+
+    回 ``{"window": n, "concentrated": [{question, answer, share, of[, published]}], "task": TASK}``; 篇数不够或哪一处都
+    不扎堆时回 None(简报就不带这一栏)。占比的分母是这一题有有效答案的篇数(of), 那一题有效答案也要够 MIN_DRAFTS 篇。
+    门槛: 有已发比例的题是 max(0.6, 已发占比 + 0.20), 没有的是 0.6。标题问句那一题不报(NEVER_FLAG)。"""
     drafts = [d for d in (drafts or [])[:MAX_DRAFTS] if isinstance(d, dict) and d]
     if len(drafts) < MIN_DRAFTS:
         return None
     hits = []
     for order, (qid, (_ver, label, answers)) in enumerate(QUESTIONS.items()):
-        if qid not in ASKED:
+        if qid not in ASKED or qid in NEVER_FLAG:
             continue
         counts = Counter(d[qid] for d in drafts if d.get(qid) in answers)
         valid = sum(counts.values())
@@ -107,10 +132,17 @@ def recent_structure(drafts: list[dict[str, str]]) -> dict | None:
             continue
         answer, top = counts.most_common(1)[0]
         share = top / valid
-        if share < SHARE_MIN or answer not in FLAG_ANSWERS.get(qid, answers):
+        if answer not in FLAG_ANSWERS.get(qid, answers):
             continue
-        hits.append((-share, order, {"question": label, "answer": ANSWER_LABELS.get((qid, answer), answer),
-                                     "share": round(share, 2), "of": valid}))
+        pub = _published_share(published_shares, qid, answer)
+        bar = SHARE_MIN if pub is None else max(SHARE_MIN, pub + RELATIVE_MARGIN)
+        if share < bar - 1e-9:
+            continue
+        item = {"question": label, "answer": ANSWER_LABELS.get((qid, answer), answer),
+                "share": round(share, 2), "of": valid}
+        if pub is not None:
+            item["published"] = round(pub, 2)
+        hits.append((-share, order, item))
     if not hits:
         return None
     return {"window": len(drafts), "concentrated": [h for _s, _o, h in sorted(hits, key=lambda t: t[:2])],

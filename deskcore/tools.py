@@ -371,19 +371,24 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         只借钩子、结构、手法,
         严禁照抄标题主干或具体句子; synthetic=true 的卡指标未经验证。
         卡上的 validated_hits 是这张卡命中了哪几条已验证规律。
-        external=true 的是【外部参考卡】(最多 2 张): 别家同品类的帖, 不是公司投的, 没有经过我们的数据验证;
-        只借结构 / 钩子, 不抄内容, 也不要提它里面的任何品牌。
+        external=true 的是外部参考卡：别家同品类最近涨得快的帖（不是公司投的，卡上有发帖时间和日均评论），说明这个品类
+        现在什么写法在起作用；只借结构 / 钩子，不抄内容，不提它里面的任何品牌。
       · validated_patterns —— 【已验证规律】(有才出现): 在公司自己的历史笔记里、同一项目内
         对照验证过的写法, 每条 {label, instruction, evidence}。它们是表现好过的选项, 不是模板:
         **每篇最多用其中一条**(用的那条照它的 instruction 写), 一批里轮换着用, 也要有几篇一条都
         不用(具体哪篇用哪条见旁边的 validated_patterns_usage, 起点按天换)。它是提示不是硬约束, 和
         draw_angles 分到的坐标或 p0 冲突时以坐标和 p0 为准, 不贴题就不用。没有这个字段就是这次没有, 不要自己编规律, 也不要跟用户解释
         为什么没有。
-      · recent_titles —— 【有才出现】本项目最近发出去的标题(published)和最近在写作台写过的标题
-        (drafted)。照 recent_titles.task 做: 新写的稿子标题别和它们撞主干词和具体说法(标题句式照
-        draw_angles 分到的写, 在同一种句式里换说法), 开头别复述它们, 人设和核心场景尽量错开。
+      · recent_titles —— 【有才出现】本项目最近发出去的标题(published)、最近在写作台写过的标题(drafted),
+        有的话还有 working(本项目发出去三天以上、评论多的几条)。照 recent_titles.task 做: 新写的稿子标题别和它们撞
+        主干词和具体说法(标题句式照 draw_angles 分到的写, 在同一种句式里换说法), 开头别复述它们, 人设和核心场景尽量
+        错开; working 里的可以学它的句式、语气和开头的路数, 别的只用来避开, 不要模仿。
         p0 / stable 定的人设、发牌分到的坐标和切入角度、用户点名的题目和改稿都优先于它。
-        只用来避开, 不要模仿。
+      · project_now —— 【有才出现】这个项目现在的情况: 近 60 天发了什么(mix)、发出三天以上的里面哪种写法起量多
+        (working, 只是计数)、写作台近两周写的稿子发出去了几篇(desk)、同品类有没有外部参考(external)。照
+        project_now.task 用: 默认贴着 mix 写(draw_angles 的卡已经按这个比例发了), working 只在两种写法之间拿主意;
+        用户问这个项目现在怎么样时用一句话说 message, 不放进开场。counts.project_now 是 ok / warming(这次还在准备,
+        下次打开就有) / unavailable(这次读不到) —— 后两种照常写, 不用跟用户提。
       · recent_structure —— 【有才出现】本项目最近 window 篇打过分的稿子里, 扎堆写成同一个样子的几处
         (concentrated 每条 {question, answer, share, of}: 哪一处、扎堆的那种写法、占比、占比的分母 —— 这一题有答案的
         篇数, 可能比 window 少)。照 recent_structure.task 做:
@@ -448,32 +453,47 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
 
 
 def draw_angles(project_id: str, n: int, avoid_days: int = 30,
-                perpetual_bias: bool = False, _user_id: str | None = None) -> dict:
+                perpetual_bias: bool = False, pin: dict | None = None,
+                repeat_of: list[str] | None = None, _user_id: str | None = None) -> dict:
     """发牌: 给本批 n 篇稿子各分配一组互不相同的创作坐标。
 
-    批量写稿前必须先调这个, 然后【每一篇严格按分到的那组坐标写, 不得互换】。
-    同一批里内容形式和标题句式会尽量错开(各 8 种, 先各轮一遍再重复), 所以别把几篇写回同一种体裁。
+    批量写稿前必须先调这个, 然后【每一篇按分到的那组坐标写, 不得互换编号】。
+    牌是照这个项目平时发的样子发的: 内容形式按项目的流量 / 产品配比, 标题句式、情绪杠杆、人性原型跟着项目已发笔记
+    的比例和评论多的写法走, 所以同一批里几篇同一种内容形式是正常的(那就是项目的配比), 不用自己再去错开体裁。
+    同一组坐标一个月内不会再发; 同一批里不会有两篇是同一种「内容形式 + 标题句式 + 人性原型」。
 
-    每组坐标含: 情绪杠杆 / 人性原型 / 内容形式 / 标题句式 / 切入角度, 外加
-    情绪强度、词感倾向, 以及易混维度的判别指令(比如抽到「焦虑撬动」会告诉你
-    它和「恐惧撬动」怎么分 —— 前者是模糊的未来担心, 后者要有具体已发生的威胁)。
+    每组坐标含: 内容形式 / 标题句式 / 情绪杠杆 / 人性原型 / 切入角度, 每一样后面跟一句大白话, 外加情绪浓度、词感,
+    以及易混杠杆的判据(比如「焦虑撬动」和「恐惧撬动」怎么分 —— 前者是模糊的未来担心, 后者要有具体已发生的威胁)。
+    有的卡多一行「参考结构」: 照本项目或同品类最近评论多的一篇的结构写, 只借结构, 不抄说法、不提品牌。
 
-    这些组合会避开本项目最近 avoid_days 天已经用过的 —— 这是跨批次不重复的
-    根本保证。光靠提示词让模型「注意不要重复」做不到: 模型是无状态的, 它不知道
-    自己上个月写过什么。
+    这些组合会避开本项目最近 avoid_days 天(14–90, 默认 30)已经用过的 —— 这是跨批次不重复的根本保证。光靠提示词让
+    模型「注意不要重复」做不到: 模型是无状态的, 它不知道自己上个月写过什么。n 一次最多 30。
 
-    perpetual_bias=True 偏向抽「不依赖任何时效元素」的组合, 写出来更能穿越周期
-    (但会少掉当下感)。默认 False。
+    perpetual_bias=True 要求「不依赖任何时效元素」, 写出来更能穿越周期(但会少掉当下感)。默认 False。
 
-    返回里的 prompt_block 可以直接贴进生成提示词。它每一篇那行开头的方括号里是这一篇的 ``angle_key``
-    (「第1篇 [angle_key=…]」, 和 ``angles[].angle_key`` 是同一个, 20 位十六进制串): 这一篇调 check_drafts 和
-    score_drafts 时, 把方括号里那串**原样复制**进这一篇的 ``angle_key``, 不要自己编号、缩写或改写, 也不写进标题和正文。
+    返回里的 prompt_block 可以直接贴进生成提示词。它第二行是 project_status(这个项目现在的配比、这批照什么发);
+    每一篇那行开头的方括号里是这一篇的 ``angle_key``(「第1篇 [angle_key=…]」, 和 ``angles[].angle_key`` 是同一个,
+    20 位十六进制串): 这一篇调 check_drafts 和 score_drafts 时, 把方括号里那串**原样复制**进这一篇的 ``angle_key``,
+    不要自己编号、缩写或改写, 也不写进标题和正文。
+
+    交付这一批的那条回复里, 把 ``batch_note`` 原样说一次(不放进开场, 只说一次)。用户问为什么这批是这样配的,
+    照 ``project_status`` 回答。``delivered`` 少于 ``requested`` 时照 ``note`` 跟用户说, 别硬凑。
+
+    ``pin`` / ``repeat_of`` **只在用户明确要求时用**, 平时不传:
+      · pin —— 用户点名「这批都写 X」(固定某一维), 写成 {维度: 值}, 比如 {"标题句式": "疑问句"} 或
+        {"内容形式": "提问求助"}; 维度是 内容形式 / 标题句式 / 情绪杠杆 / 人性原型。值不在可选里会报错、什么都不发,
+        报错里列着可选值和项目现在的内容形式占比 —— 照它跟用户确认, 别自己挑一个近似的。
+      · repeat_of —— 用户点名「这个角度再写一次」, 传那一篇的 angle_key(至多 3 个, 必须是这个项目发过的, 原样抄)。
+        这几张原样再发一次(角度照旧、内容要新, 查重照常), 其余的照常发。
     """
     # 故意不包 _safe: 发牌要写台账。写失败却报成功, 同一个角度下批还能再抽,
     # 跨批次唯一性的承诺就破了(而且没人看得见)。
+    # n / avoid_days 的夹子在 core 里(1–30 / 14–90): CLI 和 REST 走同一个函数。
     out = core.draw_angles(core.sb(), project_id, n,
-                 avoid_days=avoid_days, user_id=_user_id,
-                 perpetual_bias=perpetual_bias)
+                           avoid_days=avoid_days, user_id=_user_id,
+                           perpetual_bias=perpetual_bias, pin=pin, repeat_of=repeat_of)
+    if out.get("error"):
+        return out                         # pin / repeat_of 不对: 什么都没发, 也就没有要提醒存档的
     # W-29: 发牌成功之后才查, 所以张数含这一批; 查不到就不带, 不影响发牌。
     return _with_archive_pending(out, _user_id, project_id)
 
@@ -490,10 +510,10 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
     open_project 一样的参数(tactic / draft_topic / key_messages / target_audience / tone / extra_instructions 照传,
     flywheel_arm 传简报里的)调一次, 选好了就能拿到; 只调这一次, 还是没有卡就照常写。
 
-    这些卡来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
+    这些卡(external=true 的除外)来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
     结构骨架 / 为什么有效 / 可迁移手法」。写稿时可以借它的钩子或结构。
-    例外: external=true 的是外部参考卡 (最多 2 张), 别家同品类的帖, 不是公司投的、没经过我们的数据验证 ——
-    只借结构 / 钩子, 不抄内容, 不提它里面的任何品牌。
+    external=true 的是外部参考卡：别家同品类最近涨得快的帖（不是公司投的，卡上有发帖时间和日均评论），说明这个品类
+    现在什么写法在起作用；只借结构 / 钩子，不抄内容，不提它里面的任何品牌。
 
     ⚠️ 严禁照抄卡里的标题主干或具体句子 —— 只借手法。
     ⚠️ 标了 synthetic=true 的卡表示【指标未经验证】(疑似人工刷量), 只能凭内容
