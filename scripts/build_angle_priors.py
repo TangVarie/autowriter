@@ -51,7 +51,12 @@ def parse_cells(rows) -> dict[str, list[dict]]:
         for c in str(r.get("c") or "").split(";"):
             if not c:
                 continue
-            b, fi, li, qi, y, n, rs = c.split(",")
+            parts = c.split(",")
+            if len(parts) != 7:
+                # 少一段多半是导出里哪一列成了 NULL(concat_ws 会把它整个丢掉), 猜不出丢的是哪一列, 只能整份不认
+                raise ValueError(f"cells export: project {r.get('p')!r} has a cell with {len(parts)} fields, "
+                                 f"expected 7 (bucket,format,lever,question,y,n,rank_sum): {c!r}")
+            b, fi, li, qi, y, n, rs = parts
             cells.append({"bucket": _TIERS.get(int(b), "test"),
                           "content_format": _idx(vocab.CONTENT_FORMATS, fi),
                           "emotional_lever": _idx(vocab.EMOTIONAL_LEVERS, li),

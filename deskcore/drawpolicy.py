@@ -20,8 +20,9 @@ n 个可用的、原子预留、避重在 RPC 里), 这里只决定【候选的�
 
 每张候选: {"angle_key": fp.angle_key(四个维度), "dims": {四个维度, "_draw": {...}}}。fp.angle_key 只认四个主维度,
 _draw 不进 key; RPC 把 dims 原样存进台账、原样回来 —— 预留到哪一张, 那一张就带着自己真实的来源(§2.7)。
-_draw 的键(§5.1): v pol b i src sp g p pu pv st ps dd [fa ref reuse pin of l1 pp]。pp 只在项目块不是新鲜的时候带
-(stale 旧的 / table 只读到对照表、配比从全局表或快照里拼 / none 都没有)。
+_draw 的键(§5.1): v pol b i src sp pn pl g p pu pv st ps dd [fa ref reuse pin of l1 pp]。pp 只在项目块不是新鲜的时候带
+(stale 旧的 / table 只读到对照表、配比从全局表或快照里拼 / none 都没有)。pn / pl 是这一批的槽位数和各来源份额(整张计划,
+每张都带; draw-report 的来源计划按批算 n·份额), sp 是这一张实际落下的来源的份额。
 
 去重为什么是相对的(P1 / P2 的平衡): 绝对的形状惩罚会把项目自己的主形状压下去(v2 的健康焦虑 14% vs 已发 28%);
 这里一个形状只在跑到目标份额以上时才降温, 另有硬封顶。精确 key 30 天不重发(L1)本身就把任何一种
@@ -872,6 +873,11 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
     ps = (profile or {}).get("ps") or "uniform"
     dd_mode = state.get("dd") or ("py" if state.get("ok") else "rpc_only")
     base = {"v": 2, "pol": "v2", "b": b}
+    # 这一批的整张计划(槽位数和各来源份额)每张都带: draw-report 的「来源计划」按批算 n·份额, 一批只算一次 —— 光凭每张
+    # 实际落下来的来源和它的 sp 拼不出整张计划(一张都没落下的来源就不见了, review on aw#140)
+    shares = {s_: float(v) for s_, v in (plan.get("shares") or {}).items() if float(v or 0.0) > 0}
+    if shares:
+        base.update(pn=int(plan.get("n") or len(slots)), pl={s_: round(v, 3) for s_, v in shares.items()})
     extra_keys = dict(extra or {})
 
     used_refs: list = []

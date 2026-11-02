@@ -7,7 +7,9 @@
   M1 写了    抽出后 3 天内销账(score_drafts 或底稿转正)                         D+3
   M2 发了    销账的那一版在 tv_note_links 按内容对上了 TV 的笔记                   D+8
   M3 留着    M2, 而且标题没改、发出去的字数 ≥ 写作台那版的 0.85(tv_edit_diffs)       D+8
+             (差异没算出来、标题改没改或两边字数缺一样的读不到, 不进分母)
   D1 撞车    带这张牌的 key 查过重的稿子里, 有 reject / warn 的比例                  D+1
+             (查重只归它之前最近的那一次发牌: 同一个 key 重发之后的查重算重发那张的)
   M5 评论    发出去三天以上、评论 ≥ 20 的比例(样本小, 只给计数)                      D+10
   M6 爆      tier 爆 / 大爆 的篇数                                                  按月
 
@@ -56,6 +58,13 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
         t = _ts(s.get("checked_at"))
         if s.get("angle_key") and t is not None:
             snaps[(str(s.get("project_id")), str(s["angle_key"]))].append((t, str(s.get("status") or "")))
+    # 同一个 key 在同一个项目里每次发出去的时刻(repeat_of 重发、过了避重窗口又抽到): 一次查重只归它之前最近的那一次发牌,
+    # 不归更早的几次(review on aw#140)
+    issued: dict[tuple[str, str], list[datetime]] = defaultdict(list)
+    for r in ledger_rows or ():
+        t = _ts(r.get("drawn_at"))
+        if t is not None and r.get("angle_key"):
+            issued[(str(r.get("project_id")), str(r["angle_key"]))].append(t)
     out = []
     for r in ledger_rows or ():
         dims = r.get("dims") if isinstance(r.get("dims"), dict) else {}
@@ -76,9 +85,11 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
             if link is None:
                 m3 = 0
             else:
-                dc, pc = link.get("draft_chars"), link.get("published_chars")
-                ratio_ok = (not dc) or (pc is not None and pc / dc >= KEEP_RATIO)
-                m3 = int(link.get("title_changed") is False and ratio_ok)
+                # 改稿差异还没算出来 / 读不到(title_changed None)、字数缺一样: 读不到, 记 None(不进分母), 不记 0、
+                # 也不当字数够了(review on aw#140)。正文为空的稿(draft_chars 0)发出去多少字都算够。
+                tc, dc, pc = link.get("title_changed"), link.get("draft_chars"), link.get("published_chars")
+                if tc is not None and dc is not None and pc is not None:
+                    m3 = int(tc is False and float(pc) >= KEEP_RATIO * float(dc))
                 note = (notes or {}).get(str(link.get("note_id"))) if notes is not None else None
                 if note is not None:
                     pt = _ts(note.get("publish_time"))
@@ -86,8 +97,9 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
                             and note.get("comments_count") is not None:
                         m5 = int(int(note["comments_count"]) >= priors.PARAMS["label_min_comments"])
                     m6 = int(str(note.get("tier") or "") in HIT_TIERS)
-        verdicts = [st for t, st in snaps.get((str(r.get("project_id")), str(r.get("angle_key"))), ())
-                    if t >= drawn]
+        pk = (str(r.get("project_id")), str(r.get("angle_key")))
+        nxt = min((t for t in issued.get(pk, ()) if t > drawn), default=None)
+        verdicts = [st for t, st in snaps.get(pk, ()) if t >= drawn and (nxt is None or t < nxt)]
         d1 = int(any(v in ("reject", "warn") for v in verdicts)) if verdicts else None
         pv = d.get("pv")
         out.append({
@@ -97,7 +109,7 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
             "sp": d.get("sp"), "p": d.get("p"), "pu": d.get("pu"), "pv": pv,
             "fit": dp.fit_score(pv) if isinstance(pv, list) else None,
             "lever": dims.get(dp.L), "fmt": dims.get(dp.F), "arc": dims.get(dp.A), "ttl": dims.get(dp.T),
-            "dd": d.get("dd"), "ps": d.get("ps"),
+            "dd": d.get("dd"), "ps": d.get("ps"), "b": d.get("b"), "pn": d.get("pn"), "pl": d.get("pl"),
             "m1": m1, "m2": m2, "m3": m3, "d1": d1, "m5": m5, "m6": m6,
         })
     return out
@@ -191,6 +203,23 @@ def x_only_lever_lift(cards, m: str) -> dict:
     return {"metric": m, "cards": len(xs), "base_rate": round(rbar, 4), "lift": lift}
 
 
+def _planned_sources(cards) -> dict:
+    """来源计划: 每一批按它记下的整张计划(_draw 的 pn 槽位数、pl 各来源份额)加 n·份额, 一批只算一次(review on
+    aw#140)。按每张实际落下的来源加 sp 会把计划缩成「实际 × 份额」, 一张都没落下的来源整个不见。没记计划的批(重写的
+    几张 rep 自己不带计划; 加 pn / pl 之前发的 v2 牌)不算进来。"""
+    plan: dict[str, float] = defaultdict(float)
+    seen: set = set()
+    for c in cards:
+        b, pn, pl = c.get("b"), c.get("pn"), c.get("pl")
+        if not b or b in seen or not isinstance(pl, dict) or not isinstance(pn, (int, float)):
+            continue
+        seen.add(b)
+        for s, share in pl.items():
+            if isinstance(share, (int, float)) and share > 0:
+                plan[str(s)] += float(pn) * float(share)
+    return plan
+
+
 def health(cards, *, now: datetime | None = None) -> dict:
     """每个项目: 配额外比例(pin / rep 不算)、30 天不同 key ÷ 牌数(rep 不算)、14 天最大杠杆份额、来源实际 vs 计划、
     fb / stale / 快照比例、写手点名比例、贴合度均值。"""
@@ -207,10 +236,7 @@ def health(cards, *, now: datetime | None = None) -> dict:
         last14 = [c for c in cs if (now - c["drawn_at"]).days < 14 and c.get("lever")]
         lev14 = Counter(c["lever"] for c in last14)
         src = Counter(c["src"] for c in v2)
-        plan = defaultdict(float)
-        for c in v2:
-            if c["src"] in COMPARE_SOURCES and isinstance(c.get("sp"), (int, float)):
-                plan[c["src"]] += float(c["sp"])
+        plan = _planned_sources(v2)
         fits = [c["fit"] for c in normal if c.get("fit") is not None]
         out[proj] = {
             "cards": len(cs), "v2_cards": len(v2),

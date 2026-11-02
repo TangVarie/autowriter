@@ -309,6 +309,27 @@ def test_repeat_of_a_key_from_another_project_is_an_error_with_no_writes():
     assert too_many["error"] == "repeat_of_invalid" and not w.inserts()
 
 
+def test_more_repeats_than_the_batch_is_an_error_with_no_writes():
+    """repeat_of 点的篇数多于这次要的篇数(夹过之后的 n): 报错、台账一行不写、RPC 不调(review on aw#140: n=1 点两个,
+    原来两张都写进台账、回包 requested 1 delivered 2)。重复的 key 先去重再数; 正好等于 n 照常发。"""
+    d1 = {"emotional_lever": "愤怒撬动", "human_truth_archetype": "健康焦虑", "content_format": "提问求助",
+          "title_structure": "疑问句"}
+    d2 = {"emotional_lever": "好奇驱动", "human_truth_archetype": "自我提升", "content_format": "教程攻略",
+          "title_structure": "数字清单"}
+    a, b = _row(d1, days=3, consumed_days=2, i=1), _row(d2, days=4, consumed_days=3, i=2)
+    w = _World([a, b])
+    out = core.draw_angles(w.client, PID, 1, user_id=ME, seed=2, repeat_of=[a["angle_key"], b["angle_key"]])
+    assert out["error"] == "repeat_of_invalid" and out["requested"] == 1
+    assert out["delivered"] == 0 and out["angles"] == []
+    assert not w.client.rpc_calls and not w.inserts(), "报错就什么都不写"
+    _assert_writer_safe(out, "repeat_of over n")
+    same = core.draw_angles(w.client, PID, 1, user_id=ME, seed=2, repeat_of=[a["angle_key"], a["angle_key"]])
+    assert "error" not in same and same["requested"] == same["delivered"] == 1
+    both = core.draw_angles(w.client, PID, 2, user_id=ME, seed=2, repeat_of=[a["angle_key"], b["angle_key"]])
+    assert "error" not in both and both["requested"] == both["delivered"] == 2
+    assert len(w.inserts()) == 2 and not w.client.rpc_calls
+
+
 def test_only_repeats_needs_no_rpc():
     dims = {"emotional_lever": "好奇驱动", "human_truth_archetype": "自我提升", "content_format": "教程攻略",
             "title_structure": "数字清单"}
@@ -350,6 +371,25 @@ def test_return_shape_status_note_policy_and_references(monkeypatch):
         assert '"_draw"' not in json.dumps(out, ensure_ascii=False) and "ext:fx" not in json.dumps(out)
         _assert_writer_safe(out, "draw_angles v2")
     assert seen_refs == {"e", "h"}
+
+
+def test_the_ledger_carries_each_batch_plan_for_the_report(monkeypatch):
+    """台账上每张 v2 牌都带这一批的整张计划(n 和各来源份额), draw-report 的「来源计划」= 每批 n·份额、每批一次
+    (review on aw#140)。两批各 10 张。"""
+    import random
+
+    from deskcore import drawreport
+    prof = _run_profile(ext=_ext_pool(8), hits=_hits(5))
+    _fixed_profile(monkeypatch, prof)
+    shares = dp.slot_plan(10, prof, random.Random(0))["shares"]
+    assert sum(1 for v in shares.values() if v > 0) == 4, "四种来源都在计划里"
+    w = _World()
+    for seed in (3, 4):
+        assert core.draw_angles(w.client, PID, 10, user_id=ME, seed=seed)["delivered"] == 10
+    cards = drawreport.card_rows(w.client.rows["angle_ledger"], now=NOW)
+    h = drawreport.health(cards, now=NOW)[PID]
+    assert sum(h["sources"].values()) == 20
+    assert h["sources_planned"] == {k: round(20 * v, 1) for k, v in shares.items() if v > 0}
 
 
 def test_short_batches_say_so(monkeypatch):

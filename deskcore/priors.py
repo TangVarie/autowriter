@@ -172,6 +172,14 @@ def _days(a: datetime, b: datetime) -> float:
     return (a - b).total_seconds() / 86400.0
 
 
+def published_at(row: dict, now: datetime) -> datetime | None:
+    """这篇发出去的时刻: publish_time 读得出、而且不晚于 now。排期还没发的(publish_time 在未来)回 None —— 不算发了,
+    不进任何「已发」的聚合(配比、篇数、近两周加倍、最后发帖日、起量帖池、全局表、回测), 同 store._recent_published
+    的上界(review on aw#140)。"""
+    t = _ts(row.get("publish_time"))
+    return t if t is not None and t <= now else None
+
+
 def _truthy(v) -> bool:
     return v is True or (isinstance(v, str) and v.strip().lower() == "true")
 
@@ -389,7 +397,7 @@ def build_global(notes, title_answers, projects_meta, *, now: datetime | None = 
     rows_by_p: dict[str, list[dict]] = {}
     for r in notes or ():
         pid = str(r.get("project_id") or "")
-        if pid and _ts(r.get("publish_time")) is not None:
+        if pid and published_at(r, now) is not None:            # 排期还没发的不算(first / last / 配比 / 有没有评论数)
             rows_by_p.setdefault(pid, []).append(r)
     win = timedelta(days=params["ref_window_days"])
     out: dict = {"schema": SNAPSHOT_SCHEMA, "built_at": now.isoformat(timespec="seconds"), "projects": {}}
@@ -902,8 +910,10 @@ def project_aggregate(rows, answers, *, tv_ids, brand_ids=(), now: datetime | No
     ans = answers or {}
     win = params["mix_window_days"]
     recent = params["mix_recent_days"]
-    own = [r for r in rows or () if str(r.get("project_id")) in tv]
-    brows = [r for r in rows or () if str(r.get("project_id")) in brand]
+    # 排期还没发的(publish_time 在未来)一篇都不进: 年龄是负的会过窗口、拿近两周加倍、顶到最后发帖日, 还会改起量帖的门槛
+    rows = [r for r in rows or () if published_at(r, now) is not None]
+    own = [r for r in rows if str(r.get("project_id")) in tv]
+    brows = [r for r in rows if str(r.get("project_id")) in brand]
     has_cc = {p: any(r.get("comments_count") is not None for r in own + brows if str(r.get("project_id")) == p)
               for p in tv | brand}
     wmix = _new_mix()
@@ -1301,11 +1311,15 @@ def fetch_project(sb, project_id: str, row: dict | None = None, *, now: datetime
         return None
     tv = set(tv_ids)
     own_ids = [str(r.get("note_id")) for r in rows if str(r.get("project_id")) in tv and r.get("note_id")]
-    hit_age = params["hit_brand_age"][1]
+    hit_from = now - timedelta(days=params["hit_brand_age"][1])
+
+    def _brand_recent(r) -> bool:                       # 起量帖候选: 发出去了(排期还没发的不算)、在品牌期的窗口里
+        t = published_at(r, now)
+        return t is not None and t >= hit_from
+
     brand_cand = [str(r.get("note_id")) for r in rows
                   if str(r.get("project_id")) not in tv and r.get("note_id") and r.get("comments_count") is not None
-                  and (_ts(r.get("publish_time")) or now) >= now - timedelta(days=hit_age)
-                  and int(r.get("comments_count") or 0) >= params["hit_min_comments"]]
+                  and _brand_recent(r) and int(r.get("comments_count") or 0) >= params["hit_min_comments"]]
     answers = st.note_answers(sb, own_ids + brand_cand, FQ_QIDS)
     if answers is None:
         logger.warning("priors: fq answers unreadable (%s); title classes fall back to the regex", project_id)

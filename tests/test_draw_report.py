@@ -55,6 +55,23 @@ def test_m2_m3_m5_m6_from_links_diffs_and_notes():
     assert [cards[k]["m6"] for k in "123"] == [1, 0, 0]
 
 
+def test_m3_is_unknown_until_the_title_and_both_char_counts_are_known():
+    """差异还没算 / 读不到(title_changed None)、字数缺一样: M3 是 None(不进分母), 不是 0, 也不能当字数够了记 1
+    (review on aw#140)。没发出去的仍然是 0。"""
+    rows = [_card(i, consumed_after=1) for i in range(1, 7)]
+    adoption = {"by_version": {
+        "v1": {"note_id": "n1", "title_changed": None, "draft_chars": 500, "published_chars": 480},
+        "v2": {"note_id": "n2", "title_changed": False, "draft_chars": None, "published_chars": None},
+        "v3": {"note_id": "n3", "title_changed": False, "draft_chars": 500, "published_chars": None},
+        "v4": {"note_id": "n4", "title_changed": None, "draft_chars": None, "published_chars": None},
+        "v5": {"note_id": "n5", "title_changed": False, "draft_chars": 500, "published_chars": 450}}}
+    cards = {c["key"][-1]: c for c in dr.card_rows(rows, adoption=adoption, now=NOW)}
+    assert [cards[k]["m2"] for k in "123456"] == [1, 1, 1, 1, 1, 0]
+    assert [cards[k]["m3"] for k in "123456"] == [None, None, None, None, 1, 0]
+    rep = dr.report(rows, adoption=adoption, now=NOW)
+    assert rep["by_source"]["w"]["m3"] == {"n": 2, "y": 1, "rate": 0.5}
+
+
 def test_d1_is_reject_or_warn_among_checks_after_the_draw():
     rows = [_card(1), _card(2), _card(3)]
     snaps = [{"project_id": P1, "angle_key": f"{1:020x}", "status": "reject", "checked_at": _iso(9)},
@@ -62,6 +79,23 @@ def test_d1_is_reject_or_warn_among_checks_after_the_draw():
              {"project_id": P1, "angle_key": f"{3:020x}", "status": "warn", "checked_at": _iso(12)}]   # 抽之前的不算
     d1 = [c["d1"] for c in dr.card_rows(rows, snapshots=snaps, now=NOW)]
     assert d1 == [1, 0, None]
+
+
+def test_d1_checks_belong_to_the_draw_they_follow_not_to_a_later_reissue():
+    """同一个 key 重发(repeat_of)之后的查重归重发的那一张, 不再算回原来那一张(review on aw#140)。别的项目同一个 key
+    的发牌不截断这一个项目的窗口。"""
+    key = f"{1:020x}"
+    orig = _card(1, days=10, consumed_after=1)
+    rep = _card(2, src="rep", days=5)
+    rep["angle_key"] = key
+    theirs = _card(3, project=P2, days=8)
+    theirs["angle_key"] = key
+    snaps = [{"project_id": P1, "angle_key": key, "status": "pass", "checked_at": _iso(9.5)},     # 原来那张的查重
+             {"project_id": P1, "angle_key": key, "status": "reject", "checked_at": _iso(4)}]     # 重发那张的查重
+    d1 = {(c["project"], c["src"]): c["d1"] for c in dr.card_rows([rep, orig, theirs], snapshots=snaps, now=NOW)}
+    assert d1[(P1, "w")] == 0, "重发之后的 reject 不归原来那张"
+    assert d1[(P1, "rep")] == 1
+    assert d1[(P2, "w")] is None
 
 
 def test_mantel_haenszel_by_project():
@@ -106,6 +140,27 @@ def test_health_flags_off_quota_writer_share_and_fallbacks():
     rep = dr.report(rows, now=NOW)
     assert rep["by_source"]["w"]["cards"] == 2 and {r["src"] for r in rep["table"]} >= {"w", "pin", "rep", "fb", "v1"}
     assert "draw-report" in dr.format_report(rep)
+
+
+def _batch(b, start, srcs, *, plan, n, sp):
+    """一批发出去的牌: srcs 是实际落下来的来源(e 槽没参考帖时按 w 发, 带的是 w 的份额); plan 是这一批的整张计划。"""
+    rows = []
+    for k, s in enumerate(srcs):
+        r = _card(start + k, src=s)
+        r["dims"]["_draw"].update(b=b, i=k + 1, sp=sp[s], pn=n, pl=dict(plan))
+        rows.append(r)
+    return rows
+
+
+def test_planned_sources_are_the_whole_plan_once_per_batch():
+    """计划张数 = 每批 n·份额, 每批只算一次(review on aw#140): 原来按每张实际落下的来源加它的 sp, 10 张 w .8 / x .2 的
+    一批报成 w 6.4 / x 0.4; 一张都没落下的来源(e 槽退回 w)整个不见。"""
+    rows = _batch("B1", 1, ["w"] * 8 + ["x"] * 2, plan={"w": 0.8, "x": 0.2}, n=10, sp={"w": 0.8, "x": 0.2})
+    rows += _batch("B2", 20, ["w"] * 4 + ["x"], plan={"w": 0.6, "x": 0.2, "e": 0.2}, n=5,
+                   sp={"w": 0.6, "x": 0.2})
+    h = dr.health(dr.card_rows(rows, now=NOW), now=NOW)[P1]
+    assert h["sources"] == {"w": 12, "x": 3}
+    assert h["sources_planned"] == {"w": 11.0, "x": 3.0, "e": 1.0}
 
 
 def test_legacy_rows_without_draw_are_their_own_source():

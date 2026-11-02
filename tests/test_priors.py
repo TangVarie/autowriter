@@ -345,6 +345,41 @@ def test_working_counts_and_published_feature_shares():
     assert agg["fq_shares"]["opening_type"] == pytest.approx({"具体事件": 0.5, "提问": 0.5})
 
 
+def test_scheduled_notes_with_a_future_publish_time_change_nothing():
+    """排期还没发的笔记(publish_time 在未来)不算发了(review on aw#140, 同 store._recent_published 的上界): 加进去之后
+    项目块(篇数、配比和近两周加倍、证据、最后发帖日、起量帖池和它的前一成门槛)、全局表(first / last、配比、标签)、
+    回测的格子和跨度、选「本期」都和没有它们时一模一样。"""
+    past = []
+    for i in range(10):
+        past.append(note("AAA_phase2", age_days=3 + i, comments=20 + i, lever="好奇驱动", title="今天去爬山"))
+    past.append(note("AAA_phase1", age_days=30, fmt="场景植入", comments=12, title="去年的帖"))
+    past.append(note("AAA_phase1", age_days=40, fmt="场景植入", comments=50, title="更早的帖"))
+    future = [note("AAA_phase2", age_days=-2, comments=0, title="这个怎么办？"),       # 和起量帖同一格: 门槛会变
+              note("AAA_phase1", age_days=-1, fmt="横评对比", comments=0, title="排期中"),
+              note("CCC_phase1", age_days=-4, fmt="横评对比", comments=0, title="还没发")]
+    ans = {r["note_id"]: {"title_is_question": "否", "opening_type": "具体事件"} for r in past + future}
+    tv = ["AAA_phase1", "AAA_phase2"]
+    agg = priors.project_aggregate(past + future, ans, tv_ids=tv, now=NOW)
+    base = priors.project_aggregate(past, ans, tv_ids=tv, now=NOW)
+    assert [h["comments"] for h in agg["hits"]] == [h["comments"] for h in base["hits"]] == [29]
+    assert agg == base
+    assert base["last_by_id"]["AAA_phase1"] < base["last_by_id"]["AAA_phase2"] <= NOW.date().isoformat()
+    tq = {r["note_id"]: "否" for r in past + future}
+    gt = priors.build_global(past + future, tq, {}, now=NOW)
+    assert gt == priors.build_global(past, tq, {}, now=NOW)
+    assert "CCC_phase1" not in gt["projects"]
+    prof = priors.compose(gt, dict(agg, tv_ids=tv), None, project_id="desk", now=NOW)
+    assert prof["tv"]["current"] == "AAA_phase2" and prof["mix"]["posts"] == 12
+    assert bt.cells_from_notes(past + future, tq, now=NOW) == bt.cells_from_notes(past, tq, now=NOW)
+    # 离线快照的 SQL 导出(build_global 的镜像)同一个上界: 配比的两个窗口、跨度、开张日
+    with open(os.path.join(ROOT, "scripts", "sql", "angle_priors_export.sql"), encoding="utf-8") as fh:
+        sql = fh.read()
+    mix_sql = sql.split("-- 2) mix.json")[1]
+    assert "where n.publish_time <= now() and not coalesce((n.data_quality_flags->>'synthetic')" in mix_sql
+    assert "where x.project_id=g.project_id and x.publish_time <= now()) span" in mix_sql
+    assert "from truth_vault.notes where publish_time <= now() group by 1)" in sql.split("-- 2) mix.json")[0]
+
+
 def test_hit_pool_top_decile_own_and_brand_windows_never_cross_brand():
     rows = []
     for i in range(30):
@@ -456,6 +491,29 @@ def test_snapshot_problems_flags_text_and_unknown_values():
     probs = priors.snapshot_problems(gt)
     assert any("titles" in p for p in probs) and any("不存在" in p for p in probs)
     assert priors.snapshot_problems({"schema": 2}) != []
+
+
+def test_export_label_is_never_null_and_short_cells_are_rejected():
+    """标签格导出(review on aw#140): tier 是 NULL、评论 < 20 的笔记, 原来 y 那一列是 SQL 的 NULL(``NULL in (...)`` 是
+    NULL, ``NULL or false`` 还是 NULL), 不是 priors.label 的 0 —— concat_ws 把 NULL 那一段整个丢掉, 格子只剩 6 段,
+    parse_cells 解包就炸。SQL 里 tier 那一条要 coalesce 成 false, 整个 y 也兜一层; 真来了 6 段的格子, parse_cells
+    报出是哪个项目的哪一格, 不是一句「not enough values to unpack」。"""
+    import re
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    try:
+        import build_angle_priors as bap
+    finally:
+        sys.path.pop(0)
+    with open(os.path.join(ROOT, "scripts", "sql", "angle_priors_export.sql"), encoding="utf-8") as fh:
+        sql = fh.read()
+    cells_sql = sql.split("-- 2) mix.json")[0]
+    y_expr = re.search(r"^\s*(.+?)\s+y,\s*$", cells_sql, re.M).group(1)
+    assert "coalesce(n.tier in ('爆','大爆'), false)" in y_expr, y_expr
+    assert y_expr.startswith("coalesce(") and y_expr.endswith(", false)::int"), y_expr
+    got = bap.parse_cells([{"p": "AAA_phase1", "c": "2,6,8,0,0,5,1.20;0,-1,-1,-1,1,1,0.50"}])
+    assert [(c["y"], c["n"]) for c in got["AAA_phase1"]] == [(0, 5), (1, 1)]
+    with pytest.raises(ValueError, match=r"AAA_phase1.*2,6,8,0,5,1.20"):
+        bap.parse_cells([{"p": "AAA_phase1", "c": "2,6,8,0,5,1.20"}])
 
 
 def test_build_script_from_export_matches_the_live_label_path(tmp_path):

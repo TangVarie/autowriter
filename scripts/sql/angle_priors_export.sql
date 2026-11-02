@@ -13,13 +13,15 @@ with f as (
  where subject_type='note' and question_id='title_is_question' and run_tag='primary' and coalesce(answer,'')<>''
  order by subject_id, extracted_at desc),
 pc as (select project_id, count(comments_count) > 0 has_cc from truth_vault.notes group by 1),
-s as (select project_id, min((publish_time + interval '8 hours')::date) d0 from truth_vault.notes where publish_time is not null group by 1),
+s as (select project_id, min((publish_time + interval '8 hours')::date) d0 from truth_vault.notes where publish_time <= now() group by 1),
 e as (
  select n.project_id, pc.has_cc, ((n.publish_time + interval '8 hours')::date - s.d0) dd,
   coalesce(array_position(array['情感叙事','认知重构','横评对比','教程攻略','直给推荐','场景植入','提问求助','反差破圈']::text[], n.content_format)-1, -1) fi,
   coalesce(array_position(array['焦虑撬动','羞耻撬动','恐惧撬动','愤怒撬动','罪恶感撬动','造梦投射','认同感建立','归属感建立','共鸣释放','虚荣撬动','好奇驱动','信息差利用']::text[], n.emotional_lever)-1, -1) li,
   case f.answer when '是' then 1 when '否' then 0 else -1 end qi,
-  ((n.tier in ('爆','大爆')) or (pc.has_cc and n.comments_count >= 20))::int y,
+  -- tier NULL 时 `tier in (...)` 是 NULL, `NULL or false` 还是 NULL: 不 coalesce 的话 y 是 NULL, concat_ws 丢掉那一段,
+  -- 格子只剩 6 段(review on aw#140)。和 priors.label 一样, 能进来的每一篇都记明确的 0 / 1
+  coalesce(coalesce(n.tier in ('爆','大爆'), false) or (pc.has_cc and n.comments_count >= 20), false)::int y,
   n.comments_count cc, n.content_format
  from truth_vault.notes n join pc using(project_id) join s using(project_id) left join f using(note_id)
  where n.publish_time is not null and n.publish_time <= now() - interval '3 days'
@@ -39,14 +41,15 @@ from c group by 1 order by 1;
 -- 2) mix.json — posting mix per TV project (synthetic notes excluded): window A = the project's own last 180
 --    days of data, window B = the last 180 days from now. "<window><dim><index>:<count>" joined by ";", dims
 --    f/l/a/i/t = format / lever / archetype (1/len each) / intensity / trends (1/len each), q = title answered
---    Q / N, n = posts.
+--    Q / N, n = posts. Scheduled notes (publish_time in the future) are not published yet and count nowhere,
+--    here, in the span or in the first-post day above (same as deskcore.priors.published_at).
 with f as (
  select distinct on (subject_id) subject_id note_id, answer from truth_vault.note_feature_answers
  where subject_type='note' and question_id='title_is_question' and run_tag='primary' and coalesce(answer,'')<>''
  order by subject_id, extracted_at desc),
 b as (select n.*, f.answer tq, max(n.publish_time) over (partition by n.project_id) p_last
       from truth_vault.notes n left join f using(note_id)
-      where n.publish_time is not null and not coalesce((n.data_quality_flags->>'synthetic')::boolean,false)),
+      where n.publish_time <= now() and not coalesce((n.data_quality_flags->>'synthetic')::boolean,false)),
 w as (select 'A' win, b.* from b where publish_time >= p_last - interval '180 days'
       union all select 'B', b.* from b where publish_time >= now() - interval '180 days'),
 u as (
@@ -58,6 +61,6 @@ u as (
  union all select project_id, win, 'q', case tq when '是' then 'Q' else 'N' end, 1.0 from w where tq is not null
  union all select project_id, win, 'n', '', 1.0 from w),
 g as (select project_id, win, d, v, round(sum(x)::numeric, 3) s from u group by 1,2,3,4)
-select g.project_id p, p.category c, (select min(publish_time)::date||'/'||max(publish_time)::date from truth_vault.notes x where x.project_id=g.project_id) span, now()::text built,
+select g.project_id p, p.category c, (select min(publish_time)::date||'/'||max(publish_time)::date from truth_vault.notes x where x.project_id=g.project_id and x.publish_time <= now()) span, now()::text built,
  string_agg(win||d||v||':'||s, ';' order by win, d, v) m
 from g join truth_vault.projects p using(project_id) group by 1,2 order by 1;

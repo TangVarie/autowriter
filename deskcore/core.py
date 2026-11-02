@@ -813,8 +813,8 @@ def _draw_error(kind: str, message: str, n: int, **extra) -> dict:
 
 
 def _repeat_items(client, project_id: str, repeat_of, n: int) -> tuple[list, dict | None]:
-    """repeat_of 校验(§2.9): 至多 3 个, 每个都必须是本项目台账里有的 angle_key。回 ([(key, 四个维度)], None) 或
-    ([], 错误)。只读台账, 不写。"""
+    """repeat_of 校验(§2.9): 至多 3 个、不多于这次要的篇数 n(调用方传夹过之后的 n), 每个都必须是本项目台账里有的
+    angle_key。回 ([(key, 四个维度)], None) 或 ([], 错误)。只读台账, 不写。"""
     if not repeat_of:
         return [], None
     keys = [repeat_of] if isinstance(repeat_of, str) else list(repeat_of)
@@ -822,6 +822,12 @@ def _repeat_items(client, project_id: str, repeat_of, n: int) -> tuple[list, dic
     if len(keys) > REPEAT_MAX:
         return [], _draw_error("repeat_of_invalid", f"repeat_of 一次最多 {REPEAT_MAX} 个角度。", n,
                                max=REPEAT_MAX)
+    # 点名重写的每一个都占这一批的一篇: 多于 n 时原来照样全写进台账、回包 delivered 比 requested 多(review on aw#140)
+    if len(keys) > n:
+        return [], _draw_error(
+            "repeat_of_invalid",
+            f"这次只要 {n} 篇, repeat_of 却点了 {len(keys)} 个角度; 点名重写的不能多于这次要的篇数 —— "
+            f"少点几个, 或者把篇数加到 {len(keys)}。", n, max=n)
     items = []
     for k in keys:
         dims = store.ledger_dims_for(client, project_id, k)

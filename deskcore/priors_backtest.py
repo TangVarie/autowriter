@@ -40,7 +40,7 @@ def cells_from_notes(notes, title_answers, *, now: datetime | None = None,
     answers = title_answers or {}
     by_p: dict[str, list[dict]] = {}
     for r in notes or ():
-        if r.get("project_id") and priors._ts(r.get("publish_time")) is not None:
+        if r.get("project_id") and priors.published_at(r, now) is not None:     # 排期还没发的不算
             by_p.setdefault(str(r["project_id"]), []).append(r)
     cells: dict[str, list[dict]] = {}
     spans: dict[str, tuple[str, str]] = {}
