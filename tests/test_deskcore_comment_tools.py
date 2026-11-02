@@ -128,10 +128,12 @@ def test_a_pasted_body_finds_the_post_and_brings_its_comments():
     assert [x["text"] for x in out["existing_comments"]] == ["自己录语音用的什么软件呀"]
     assert out["post"] == {"title": "", "body": BODY_A}, "标题正文照旧用贴来的, TV 那份只用来取评论"
     assert out["tv_by_text_note"] == core.TV_BY_TEXT_NOTE and "tv_note_vanished" not in out
-    (call,) = _notes_calls(c)
-    assert ("in", "project_id", (TV,)) in call["filters"] and call["range"] == (0, store.TV_TEXT_PAGE - 1)
-    (pattern,) = [f[2] for f in call["filters"] if f[0] == "ilike"]
-    assert [f[1] for f in call["filters"] if f[0] == "ilike"] == ["raw_content"] and _RUN_PATTERN.fullmatch(pattern)
+    calls = _notes_calls(c)
+    assert len(calls) == len(core._text_probe(BODY_A)[1]) == 2, "两段都查(不提前停), 最多两次"
+    for call in calls:
+        assert ("in", "project_id", (TV,)) in call["filters"] and call["range"] == (0, store.TV_TEXT_PAGE - 1)
+        (pattern,) = [f[2] for f in call["filters"] if f[0] == "ilike"]
+        assert [f[1] for f in call["filters"] if f[0] == "ilike"] == ["raw_content"] and _RUN_PATTERN.fullmatch(pattern)
 
 
 @pytest.mark.parametrize("pasted", [
@@ -238,11 +240,21 @@ def test_a_near_hit_on_the_first_probe_does_not_hide_the_exact_post_behind_the_s
     out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)
     assert out["source"] == "tv_by_text" and out["note_id"] == "A"
     assert [x["text"] for x in out["existing_comments"]] == ["自己录语音用的什么软件呀"]
-    assert len(_notes_calls(c)) == 2, "第一段只有近似命中才查第二段"
-    # 第一段就是原文时只查一次
-    c = _tv_client(notes=[_note("A"), other], comments=[])
-    assert core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)["note_id"] == "A"
-    assert len(_notes_calls(c)) == 1
+    assert len(_notes_calls(c)) == 2
+
+
+def test_an_exact_vanished_row_on_the_first_probe_does_not_hide_the_live_row_behind_the_second():
+    """codex review on aw#138 第二轮: 挪表后同一条链接两行, 已删那行第一段一字不差, 活的那行第一段里多了个逗号 ——
+    两行规范化后都是 1.0。第一段查到已删那行就停的话回的是旧评论; 两段都查, 活的优先。"""
+    first = core._text_probe(BODY_A)[1][0]
+    old = _note(f"{TV}_old", when="2026-10-25T16:00:00")
+    live = {**_note(f"{TV}_new", body=BODY_A.replace(first, first[:6] + "，" + first[6:]), when="2026-10-20T16:00:00"),
+            "publish_url": old["publish_url"]}
+    c = _tv_client(notes=[old, live], comments=[_comment(old["note_id"], "旧行的评论"), _comment(live["note_id"])])
+    c._tv.rows["v_notes_vanished"] = [{"note_id": old["note_id"], "project_id": TV}]
+    out = core.comments_for(c, user_id=ME, project_id=PROJ, post_body=BODY_A)
+    assert out["note_id"] == live["note_id"] and "tv_note_vanished" not in out
+    assert [x["text"] for x in out["existing_comments"]] == ["自己录语音用的什么软件呀"]
 
 
 def test_live_wins_over_vanished_then_the_closest_then_the_latest():

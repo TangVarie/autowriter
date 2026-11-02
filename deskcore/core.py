@@ -2808,10 +2808,9 @@ def _note_from_text(client, project_id: str, post_body: str) -> dict | None:
                 score = _text_score(pasted, *_tv_post_text(row))
                 if score >= TEXT_MATCH_SIM:
                     found[str(row["note_id"])] = (score, row)
-            # 第一段找到原文(规范化后一字不差)才停。只找到改过几个字的另一篇时, 用第二段再查一次、两段的一起排:
-            # 原文里这一段要是标点和贴来的不一样, ilike 正好漏掉它, 而第二段查得到(codex review on aw#138)
-            if any(score >= 1.0 for score, _ in found.values()):
-                break
+        # 两段都查完再排, 不提前停(codex review on aw#138, 两轮): ilike 是逐字比的, 某一行在某一段里标点和贴来的不一样就会
+        # 漏掉它 —— 第一段只找到改过几个字的另一篇、或只找到同一篇已删的那行时, 原文 / 活的那行要靠第二段。多一次查询
+        # (最大的项目约 10 ms), 换来下面的排序看得到全部候选。
         hits = list(found.values())
         if not hits:
             return None
