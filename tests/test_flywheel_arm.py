@@ -653,6 +653,22 @@ def test_a_follow_up_borrow_in_the_same_session_keeps_the_larger_count(monkeypat
     assert core.batch_arm(PID, ME, from_brief=arm)[3] is None
 
 
+def test_a_carried_retry_after_an_empty_brief_records_what_the_retry_showed(monkeypatch, fresh_arms):
+    """第二轮复审 (aw#139): 开项目时借卡超时 / 降级、简报里 0 条, 模型照提示带着简报里的臂补借, 这次拿到规律 —— 同一场,
+    记补借的条数, 不是 {0, k} 对不上记 None; 之后同一天别的场也不会被这条 0 带成 None。"""
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _degraded([]))
+    arm = core.build_writing_brief(_client(), PID, user_id=ME, brief={})["flywheel_arm"]
+    assert core.batch_arm(PID, ME, from_brief=arm)[3] == 0
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm)
+    assert core.batch_arm(PID, ME, from_brief=arm)[3] == len(PATTERNS)
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm=arm)
+    assert params["flywheel_patterns_shown"] == len(PATTERNS) and meta["flywheel_patterns_shown"] == len(PATTERNS)
+    core.build_writing_brief(_client(), PID, user_id=ME, brief={})          # 稍后另一场, 缓存热了、同样的条数
+    assert core.batch_arm(PID, ME, from_brief=arm)[3] == len(PATTERNS), "上一场补借之前那条 0 不留下来拖成 None"
+
+
 # ── 共用身份的几场叠在一起 (F13 复审, 2026-11-02) ────────────────────────────────────────────────────
 # 团队共用一个 user_id: 同一个项目同一天的几场拿到同一个臂、记在同一个键下。以前只留最后一次借卡的条数, A 场入库记的是 B 场的
 # (复审复现: A 简报 1 条、B 降级 0 条 → A 的批次记 0; 反过来 A 超时 0 条、B 3 条 → A 没看到规律的批次记 3, 进了处理组)。

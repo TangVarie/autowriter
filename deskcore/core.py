@@ -7683,7 +7683,11 @@ def _note_patterns_shown(project_id, user_id, arm: str, shown: int, *, carry: bo
         n = max(0, int(shown or 0))
         recs = [r for r in _patterns_shown.get(key + (arm,), ()) if at - r[0] <= _ARM_REPORT_TTL]
         if carry and recs:
-            n = max(n, recs[-1][1])
+            # 接着借是同一场在补自己最近那条(第二轮复审: 开项目借卡超时记了 0, 模型照提示带着臂补借拿到规律 —— 追加一条的话
+            # {0, k} 两个数, 这一场和之后 12 小时同项目的场都成了 None)。替换, 不追加; 那条要是别的场的, 这一场自己更早的
+            # 那条还在列表里, 数不一样 _shown_for 照样回 None。
+            _patterns_shown[key + (arm,)] = recs[:-1] + [(at, max(n, recs[-1][1]))]
+            return
         _patterns_shown[key + (arm,)] = recs + [(at, n)]
 
 
