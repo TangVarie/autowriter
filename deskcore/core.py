@@ -995,10 +995,16 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
             "boundary_rule": vocab.boundary_rule_text(lev),
         }
         draw_meta = (r["dims"].get("_draw") if isinstance(r.get("dims"), dict) else None) or {}
+        ref = None
         if draw_meta.get("src") == "rep":
-            card["reference"] = {"kind": "repeat", "of": draw_meta.get("of") or r["angle_key"]}
+            ref = {"kind": "repeat", "of": draw_meta.get("of") or r["angle_key"]}
         elif (by_key.get(r["angle_key"]) or {}).get("reference"):
-            card["reference"] = dict(by_key[r["angle_key"]]["reference"])
+            ref = dict(by_key[r["angle_key"]]["reference"])
+        # 卡面上真有参考行才带(复审): 说不出结构的参考(特征题没读到 / 开头是「其他」、是非题都不是「是」)卡上没有那一行,
+        # 带着 reference 的话 batch_note 会说「参照了…的结构」, 写手听到的和卡上的对不上。发牌那边已经不挑这种参考帖
+        # (drawpolicy.describable), 这里再挡一道。
+        if ref and _reference_line(ref):
+            card["reference"] = ref
         if not v1_path:
             ev = project_now.card_evidence(profile, dims)
             if ev:
@@ -1085,25 +1091,15 @@ def _per_day_text(v) -> str:
     return "每天不到1条评论" if v < 1 else f"每天约{int(round(v))}条评论"
 
 
-def _structure_bits(desc: dict, *, external: bool) -> list[str]:
-    desc = desc or {}
-    bits = []
-    opening = vocab.OPENING_PLAIN.get(str(desc.get("opening_type") or ""))
-    if opening:
-        bits.append(opening)
-    if external and desc.get("own_experience") is True:
-        bits.append("写的是自己的亲身经历")
-    if desc.get("turning_point") is True:
-        bits.append("中间有一次前后转折")
-    if desc.get("asks_for_help") is True:
-        bits.append("正文在向大家讨主意")
-    if desc.get("ending_asks_reader") is True:
-        bits.append("结尾问了读者")
-    return bits
+_structure_bits = vocab.structure_bits          # 发牌那一道筛(drawpolicy.describable)读同一份
 
 
 def _reference_line(ref: dict | None) -> str | None:
-    """参考行(只有 e / h / 点名重写的牌有)。只说结构, 不给参考帖的标题和正文。"""
+    """参考行(只有 e / h / 点名重写的牌有)。只说结构, 不给参考帖的标题和正文。说不出任何结构回 None —— 这时
+    draw_angles 也不给这张牌带 reference(batch_note 只数卡面上真有参考行的)。
+
+    外部参考的尾巴是「不提那篇帖子里的品牌」, 不是「不提任何品牌」(复审): 外部卡的内容形式照项目配额发, 也会分到
+    场景植入这种产品向的形式, 那一篇本来就要点本项目的品牌名(协议 218 行)。"""
     if not isinstance(ref, dict):
         return None
     kind = ref.get("kind")
@@ -1119,7 +1115,7 @@ def _reference_line(ref: dict | None) -> str | None:
         if not bits:
             return None
         head = "同品类别家近期起量的一篇" + (f"，{when}" if when else "")
-        return f"参考结构（{head}）：{'；'.join(bits)}。只借结构，不抄内容，不提任何品牌。"
+        return f"参考结构（{head}）：{'；'.join(bits)}。只借结构，不抄内容，不提那篇帖子里的品牌。"
     if kind == "hit":
         bits = _structure_bits(ref.get("desc"), external=False)
         if not bits:

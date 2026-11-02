@@ -338,7 +338,7 @@ def test_return_shape_status_note_policy_and_references(monkeypatch):
         assert out["policy"]["batch"] == w.seen[0][0]["dims"]["_draw"]["b"]
         assert out["project_status"].startswith("近60天发了224篇") and len(out["project_status"]) <= 120
         assert out["prompt_block"].splitlines()[1] == "本项目现在：" + out["project_status"]
-        assert out["batch_note"].startswith("这批10篇：") and "试新" not in out["batch_note"]
+        assert out["batch_note"].startswith("新抽的这10篇：") and "试新" not in out["batch_note"]
         for a in out["angles"]:
             assert set(a["dims"]) == {"emotional_lever", "human_truth_archetype", "content_format", "title_structure"}
             src = next(c["dims"]["_draw"]["src"] for c in w.seen[0] if c["angle_key"] == a["angle_key"])
@@ -385,3 +385,42 @@ def test_the_tool_passes_pin_and_repeat_of_through(monkeypatch):
     for must in ("batch_note", "project_status", "只在用户明确要求时用", "pin", "repeat_of", "原样说一次"):
         assert must in doc, must
     assert "先各轮一遍再重复" not in doc
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 复审回合
+# ══════════════════════════════════════════════════════════════════════
+
+def test_tv_down_but_mapping_readable_deals_inside_the_quota(monkeypatch):
+    """重启后缓存是空的、TV 读不到, 写作台这边的对照表读得到: 按快照里本项目那一条的配比发, 不按 8 种形式平均发
+    (§0 的阻断项: 配额外的形式)。卡上记 pp=table, 状态行说这次读不到最新的数据。"""
+    for fn in ("tv_notes_outcomes", "tv_title_answers", "tv_projects_meta", "tv_notes_profile", "note_answers",
+               "external_slice"):
+        monkeypatch.setattr(store, fn, lambda *a, **k: None)
+    monkeypatch.setattr(store, "tv_projects_of", lambda *a, **k: [{"tv_project_id": "XIWU_phase2"}])
+    snap = priors.load_snapshot()["projects"]["XIWU_phase2"]["mix_recent"]["content_format"]
+    support = {v for v, c in snap.items() if c / sum(snap.values()) >= 0.03}
+    for seed in range(5):
+        w = _World()
+        out = core.draw_angles(w.client, PID, 10, user_id=ME, seed=seed)
+        assert out["delivered"] == 10 and out["policy"]["name"] == "v2" and out["policy"]["prior"] == "snap"
+        assert {a["dims"]["content_format"] for a in out["angles"]} <= support
+        assert out["project_status"] == project_now.STATUS_TABLE
+        assert {c["dims"]["_draw"].get("pp") for c in w.seen[0]} == {"table"}
+
+
+@pytest.mark.parametrize("bypass_filter", [False, True])
+def test_a_reference_that_renders_no_line_is_not_attached_or_counted(monkeypatch, bypass_filter):
+    """起量帖的特征题没读到(desc 全空)/ 开头是「其他」、几个是非题都是否: 卡上不会有参考行, angles[].reference 就不带、
+    batch_note 也不说「参照了…的结构」。bypass_filter: 绕过发牌那一道筛, 渲染前那一道也挡得住。"""
+    blank = {"opening_type": "其他", "ending_asks_reader": False, "asks_for_help": None, "turning_point": False}
+    hits = [dict(h, desc=dict(blank)) for h in _hits(5)]
+    _fixed_profile(monkeypatch, _run_profile(hits=hits))
+    if bypass_filter:
+        monkeypatch.setattr(dp, "hit_anchors", lambda prof: list((prof or {}).get("hits") or []))
+    for seed in range(5):
+        w = _World()
+        out = core.draw_angles(w.client, PID, 10, user_id=ME, seed=seed)
+        assert out["delivered"] == 10
+        assert all("reference" not in a for a in out["angles"])
+        assert "参照" not in out["batch_note"] and "参考结构" not in out["prompt_block"]

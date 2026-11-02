@@ -325,7 +325,8 @@ def _print_profile(prof: dict) -> None:
           f"全局先验 {prof.get('ps')}" + (f" ({prof.get('prior_age_min')} 分钟前)" if prof.get("prior_age_min") is not None
                                     else "") + f" · 项目块 {prof.get('pp')}")
     print(f"TV: 当前 {tv.get('current') or '-'} · 对照 {', '.join(tv.get('ids') or []) or '-'} · 同品牌 "
-          f"{', '.join(tv.get('brand_ids') or []) or '-'} · 品类 {tv.get('category') or '-'}")
+          f"{', '.join(tv.get('brand_ids') or []) or '-'}(上一期 {', '.join(tv.get('earlier_ids') or []) or '-'}) · "
+          f"品类 {tv.get('category') or '-'}")
     ref = prof.get("ref") or {}
     print(f"配比参照: {ref.get('source')} {ref.get('ids') or ''} · 近{mix.get('window_days')}天 {mix.get('posts')} 篇 "
           f"({mix.get('per_day')}/天) · 已发问句占比(收缩后) q={mix.get('question_share', 0):.3f}")

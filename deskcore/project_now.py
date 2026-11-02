@@ -4,7 +4,7 @@
                     写的稿子发出去了几篇、外部同品类有没有参考。只读缓存(priors.cached_profile + 这里的写作台计数),
                     open_project 一秒都不等 —— 缓存是冷的就由 build_writing_brief 投递一次后台预热, 这一次说 warming。
   · ``status_line`` 发牌回包的 project_status(也是 prompt_block 的第二行): 一句话, ≤120 字, 只说项目的配比和这批照什么发。
-  · ``batch_note``  发牌回包的 batch_note: 从这一批实际发出去的牌数出来的一句话, 交付时原样说一次。从不提「试新」——
+  · ``batch_note``  发牌回包的 batch_note: 从这次新抽的牌数出来的一句话, 交付时原样说一次。从不提「试新」——
                     试新牌和普通牌对写手、对模型都长得一模一样(§0 的盲法), 这句话只看牌面上的值和参考行。
 
 再加一个 ``evidence_text``: 卡面上「（本项目近60天约九成是这一类）」那个括号。只看这个值在本项目近 60 天里的原始占比
@@ -50,6 +50,8 @@ NO_EXTERNAL_NOTE = "本品类还没有外部参考"
 EXTERNAL_UNREAD_NOTE = "同品类的外部参考这次没读到"
 
 STATUS_DEGRADED = "暂时读不到已发数据，这批按通用配比发。"
+# 项目块读不到、对照表读到了(priors 的 pp="table", 复审): 配比是从上次存下的全局表 / 快照里本项目那几条拼的
+STATUS_TABLE = "这次读不到本项目最新的已发数据，这批先按之前存下的比例发。"
 STATUS_V1 = "这批按通用配比发。"
 SHORT_NOTE = "近期这个项目用掉的组合太多，凑不满；分两批写，或固定某一项（pin）再发。"
 
@@ -153,6 +155,8 @@ def status_line(profile, plan: dict | None = None) -> str:
     tail = "同品类的外部参考这次没读到。" if _ext_unread(p, plan) else ""
     if stage == "none":
         return _fit("这个项目还没对上已发的笔记，这批先按通用配比发；对上之后按它自己的比例发。", tail)
+    if p.get("pp") == "table":
+        return _fit(STATUS_TABLE, tail)
     if stage == "cold":
         n = int(p.get("n_res") or 0)
         return _fit(f"本项目发出三天以上的还少（{n}篇），这批先按{_ref_label(p)}的比例发；"
@@ -193,8 +197,11 @@ _PIN_LABEL = {"content_format": "内容形式", "title_structure": "标题句式
 
 
 def batch_note(picked: list[dict], *, pin: dict | None = None) -> str:
-    """「这批10篇：9篇提问求助、1篇场景植入，6篇问句标题；1篇参照了本项目近期评论多的一篇的结构。」
-    只数牌面上的值和参考行(外部 / 起量帖 / 点名重写), 不提试新, 也不提每张牌是怎么抽出来的。"""
+    """「新抽的这10篇：9篇提问求助、1篇场景植入，6篇问句标题；1篇参照了本项目近期评论多的帖的结构。」
+    只数牌面上的值和参考行(外部 / 起量帖 / 点名重写), 不提试新, 也不提每张牌是怎么抽出来的。
+
+    开头是「新抽的这N篇」, 不是「这批N篇」(复审): 协议让模型先写 angle_debt 里欠着的、再发牌补齐 —— 交付 10 篇、其中
+    7 篇是补写的时候, 这次只抽了 3 张, 说「这批3篇」就和交出去的 10 篇对不上。"""
     cards = [a for a in picked or () if isinstance(a, dict) and isinstance(a.get("dims"), dict)]
     if not cards:
         return ""
@@ -202,7 +209,7 @@ def batch_note(picked: list[dict], *, pin: dict | None = None) -> str:
     fmts = Counter(a["dims"].get("content_format") for a in cards)
     ranked = sorted(fmts, key=lambda v: (-fmts[v], order.get(v, 99), str(v)))
     fparts = [f"{fmts[v]}篇{v}" for v in ranked[:3]]
-    head = f"这批{len(cards)}篇：" + "、".join(fparts) + ("等" if len(ranked) > 3 else "")
+    head = f"新抽的这{len(cards)}篇：" + "、".join(fparts) + ("等" if len(ranked) > 3 else "")
     q = sum(1 for a in cards if a["dims"].get("title_structure") == QUESTION)
     if q:
         head += f"，{q}篇问句标题"
@@ -245,6 +252,8 @@ def _prior_text(profile) -> str:
     ref = _ref_label(profile)
     if (profile or {}).get("pp") == "none":
         return "暂时读不到本项目已发的数据，按通用配比"
+    if (profile or {}).get("pp") == "table" and stage != "none":
+        return "暂时读不到本项目最新的已发数据，按之前存下的比例"
     if stage == "run":
         return f"本项目自己的数据为主，{ref}补充"
     if stage == "warm":
@@ -315,6 +324,8 @@ def _message(profile, desk, *, name: str = "") -> str:
     who = name or "这个项目"
     if p.get("pp") == "none":
         first = f"{who}已发的数据这次没读到"
+    elif p.get("pp") == "table" and (p.get("stage") or "none") != "none":
+        first = f"{who}最新的已发数据这次没读到"
     elif (p.get("stage") or "none") == "none":
         first = f"{who}还没对上已发的笔记"
     else:
@@ -330,15 +341,19 @@ def _message(profile, desk, *, name: str = "") -> str:
         first = f"{who}近两个月发了{posts}篇" + ("，" + "、".join(bits) if bits else "")
     second = ""
     if desk:
-        written, published = int(desk.get("written") or 0), int(desk.get("published") or 0)
+        written = int(desk.get("written") or 0)
+        # published 是 None = 这次没读到发布对照(tv_note_links), 不知道发没发 —— 不能当成 0 说「一篇都没发出去」(复审)
+        published = desk.get("published")
         if not int(desk.get("cards_drawn") or 0) and not written:
             second = "写作台近两周还没有发过牌"
         elif not written:
             second = "写作台近两周发了牌、还没有写成的稿子"
-        elif not published:
+        elif published is None:
+            second = f"写作台近两周写了{written}篇"
+        elif not int(published or 0):
             second = f"写作台近两周写的{written}篇还没有一篇发出去"
         else:
-            second = f"写作台近两周写的{written}篇发出去了{published}篇"
+            second = f"写作台近两周写的{written}篇发出去了{int(published)}篇"
     return first + ("；" + second if second else "") + "。"
 
 

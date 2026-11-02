@@ -151,7 +151,7 @@ def test_an_external_title_never_reaches_the_output(monkeypatch):
             assert a["dims"]["title_structure"] == "疑问句", "外部卡的标题句式照参考帖的(Jev 没答问句就按正则分)"
         if ext_cards:
             assert "参考结构（同品类别家近期起量的一篇" in out["prompt_block"]
-            assert "只借结构，不抄内容，不提任何品牌。" in out["prompt_block"]
+            assert "只借结构，不抄内容，不提那篇帖子里的品牌。" in out["prompt_block"]
     assert found_ext
 
 
@@ -197,7 +197,7 @@ def test_reference_lines_only_for_external_hit_and_repeat():
         "kind": "external", "title_structure": "数字清单", "posted_days_ago": 21, "comments_per_day": 14.2,
         "desc": {"opening_type": "身份自述", "turning_point": True, "ending_asks_reader": True}})])
     assert ("    ↳ 参考结构（同品类别家近期起量的一篇，约3周前发，每天约14条评论）：标题是数字清单；开头先讲自己的身份；"
-            "中间有一次前后转折；结尾问了读者。只借结构，不抄内容，不提任何品牌。") in ext
+            "中间有一次前后转折；结尾问了读者。只借结构，不抄内容，不提那篇帖子里的品牌。") in ext
     rep = core.render_angles_block([_card(reference={"kind": "repeat", "of": "0123456789abcdef0123"})])
     assert "    ↳ " + core.REPEAT_LINE in rep
     # 「其他」开头不说; 什么结构都没有的起量帖不出参考行
@@ -225,3 +225,14 @@ def test_removing_the_draw_strip_leaks_the_block(monkeypatch):
     monkeypatch.setattr(store, "public_dims", lambda d: d)
     out = core.draw_angles(_World().client, PID, 3, user_id=ME, seed=1)
     assert any("_draw" in a["dims"] for a in out["angles"]), "不剥就漏 —— 回包只剩四个键的断言因此能红"
+
+
+def test_external_reference_line_does_not_ban_the_projects_own_brand():
+    """外部参考卡也可能分到产品向的形式(场景植入: 要点品牌名), 参考行只说不提「那篇帖子里的」品牌, 不读成连本项目的
+    品牌都不许提。"""
+    block = core.render_angles_block([_card(
+        dims={"emotional_lever": "愤怒撬动", "human_truth_archetype": "健康焦虑", "content_format": "场景植入",
+              "title_structure": "数字清单"},
+        reference={"kind": "external", "title_structure": "数字清单", "posted_days_ago": 9, "comments_per_day": 3,
+                   "desc": {"opening_type": "身份自述"}})])
+    assert "不提任何品牌" not in block and "只借结构，不抄内容，不提那篇帖子里的品牌。" in block

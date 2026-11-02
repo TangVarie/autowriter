@@ -18,8 +18,9 @@
 同品牌 → 本项目两层, 再按已发比例夹在一个带子里。品类层默认关(回测里它让 AUC 变差)。常数都在 PARAMS, 一处改。
 
 Profile 的键(drawpolicy / project_now 读这些):
-  stage none|cold|warm|run · n_res · ps live|stale|snap|uniform(全局先验从哪来) · pp live|stale|none(项目块)
-  prior_age_min · tv{ids,current,brand,brand_ids,category} · ref{source,ids}
+  stage none|cold|warm|run · n_res · ps live|stale|snap|uniform(全局先验从哪来)
+  pp live|stale|table|none(项目块; table = 项目块读不到、对照表读到了, 配比从全局表 / 快照里本项目那几条拼)
+  prior_age_min · tv{ids,current,brand,brand_ids,earlier_ids,category} · ref{source,ids}
   mix{posts,per_day,window_days,question_share,<四个维度>: 收缩后的配比} · evidence{<维度>: 本项目近 60 天原始占比}
   pi{content_format,title_structure,emotional_lever,human_truth_archetype} · lift{emotional_lever,beta,title,p_question,…}
   extras{emotional_intensity,trend_dependencies} · working{resolved,successes,by_title,by_lever} · fq_shares
@@ -569,6 +570,19 @@ def brand_of(pid: str | None) -> str:
     return str(pid or "").split("_", 1)[0]
 
 
+def earlier_phases(gt, current: str | None, candidates=(), *, now: datetime | None = None) -> list[str]:
+    """同品牌【上一期】(§2.3 配比参照、§2.5 起量帖; 同 priors_backtest._earlier_brand): 品牌前缀和本期一样、最后一篇
+    发在本期第一篇之前的那几期。后一期、同时在跑的那一期都不算(复审: 只对上前一期的写作台项目, 卡上不能把后一期的帖
+    说成「同品牌上一期」)。本期还不在全局表 / 快照里(刚开的新一期)按「今天才开始」算。日期是 YYYY-MM-DD 字符串。"""
+    if not current:
+        return []
+    projs = _projects(gt)
+    start = (projs.get(current) or {}).get("first") or (now or _utcnow()).date().isoformat()
+    b = brand_of(current)
+    return sorted({p for p in candidates or () if p != current and brand_of(p) == b
+                   and (projs.get(p) or {}).get("last") and str(projs[p]["last"]) < str(start)})
+
+
 def lever_lift(gt, current: str | None, *, brand_ids=(), params: dict = PARAMS, signal: str | None = None) -> dict:
     """情绪杠杆提升(clip 后、^β 之前)和各层: ``{"lift", "global", "brand", "category"}``。
 
@@ -1036,6 +1050,37 @@ def _uniform(dim: str) -> dict:
     return {v: 1.0 / len(VALUES[dim]) for v in VALUES[dim]}
 
 
+def table_own(gt, tv_ids, *, now: datetime, params: dict = PARAMS) -> tuple[dict, int]:
+    """项目块读不到、对照表读到了(pp="table", 复审)时本项目「自己的配比」和已出标签的篇数, 从全局表 / 快照里它那几条
+    拼(只有聚合数): 配比用 mix_recent(现在往回 180 天; 没有就是 180 天没发过, 自己那份留空, 全靠参照); 标题只有问句 /
+    非问句两类, 非问句按 NONQ_SPLIT 摊(同 drawsim.fixture_profile); 篇数用标签的 n, 最后一篇在 60 天窗口外的记 0
+    (项目块的口径: 窗口里没有已出标签的就是冷启动)。"""
+    projs = _projects(gt)
+    own: dict = {dim: {} for dim in MIX_DIMS}
+    own["title_structure"] = {}
+    n_res = 0
+    floor = (now - timedelta(days=params["mix_window_days"])).date().isoformat()
+    for pid in tv_ids or ():
+        e = projs.get(pid) or {}
+        m = e.get("mix_recent")
+        if isinstance(m, dict):
+            for dim in MIX_DIMS:
+                for v, x in (m.get(dim) or {}).items():
+                    if v in VALUES[dim]:
+                        own[dim][v] = own[dim].get(v, 0.0) + float(x or 0.0)
+            tq = m.get("title_q") or {}
+            q, nq = float(tq.get(Q) or 0.0), float(tq.get(NQ) or 0.0)
+            ts = own["title_structure"]
+            if q > 0:
+                ts[QUESTION] = ts.get(QUESTION, 0.0) + q
+            if nq > 0:
+                for k, sh in vocab.NONQ_SPLIT.items():
+                    ts[k] = ts.get(k, 0.0) + nq * sh
+        if str(e.get("last") or "") >= floor:
+            n_res += int((e.get("label") or {}).get("n") or 0)
+    return own, n_res
+
+
 def stage_of(n_res: int | None, mapped: bool, params: dict = PARAMS) -> str:
     if not mapped or n_res is None:
         return "none"
@@ -1055,21 +1100,28 @@ def compose(gt, proj: dict | None, ext: dict | None, *, project_id: str | None =
     current = None
     brand_ids: list[str] = []
     category = None
+    earlier: list[str] = []
+    table = mapped and bool((proj or {}).get("mapping_only"))
     if mapped:
         last = dict((proj or {}).get("last_by_id") or {})
         for pid in tv_ids:
             last.setdefault(pid, (projs.get(pid) or {}).get("last") or "")
         current = max(tv_ids, key=lambda p: (last.get(p, ""), p))
         b = brand_of(current)
+        # 同品牌其他期: 情绪 / 标题提升的品牌层(§2.2 的 Br, 不论先后); 配比参照和起量帖只认上一期(§2.3 §2.5, 复审)
         brand_ids = sorted({p for p in set(projs) | set((proj or {}).get("brand_ids") or []) | set(tv_ids)
                             if brand_of(p) == b and p != current})
+        earlier = earlier_phases(gt, current, brand_ids, now=now)
         category = (projs.get(current) or {}).get("category") or ((proj or {}).get("categories") or {}).get(current)
     n_res = (proj or {}).get("n_res") if mapped else None
+    wmix = (proj or {}).get("wmix") or {}
+    if table:
+        # 项目块读不到、只有对照表(复审): 不能当成「没对上」去按 8 种形式平均发 —— 自己的配比从全局表 / 快照里拼
+        wmix, n_res = table_own(gt, tv_ids, now=now, params=params)
     stage = stage_of(n_res, mapped, params)
 
-    ref = reference(gt, current=current, brand_ids=brand_ids, category=category, exclude=tv_ids, params=params)
+    ref = reference(gt, current=current, brand_ids=earlier, category=category, exclude=tv_ids, params=params)
     kappa = params["mix_kappa"]
-    wmix = (proj or {}).get("wmix") or {}
     mix: dict = {}
     for dim in ("content_format", "emotional_lever", "human_truth_archetype", "title_structure"):
         own = (wmix.get(dim) or {}) if mapped else {}
@@ -1119,7 +1171,7 @@ def compose(gt, proj: dict | None, ext: dict | None, *, project_id: str | None =
         own = (wmix.get(dim) or {}) if mapped else {}
         extras[dim] = shrink(own, sum(own.values()), glob[dim], params["extras_kappa"], VALUES[dim])
 
-    raw = (proj or {}).get("raw") or {}
+    raw = (proj or {}).get("raw") or {}                 # table: 没有近 60 天的原始数 → evidence 空, 卡上不给括号
     posts = int((proj or {}).get("posts") or 0) if mapped else 0
     evidence = {}
     for dim in ("content_format", "emotional_lever", "human_truth_archetype", "title_structure"):
@@ -1142,7 +1194,7 @@ def compose(gt, proj: dict | None, ext: dict | None, *, project_id: str | None =
         "n_res": n_res,
         "ps": ps, "pp": pp if proj else "none", "prior_age_min": prior_age_min,
         "tv": {"ids": tv_ids, "current": current, "brand": brand_of(current) if current else None,
-               "brand_ids": brand_ids, "category": category},
+               "brand_ids": brand_ids, "earlier_ids": earlier, "category": category},
         "ref": {"source": ref["source"], "ids": ref["ids"], "by_dim": ref["sources"]},
         "mix": {"posts": posts, "per_day": round(posts / params["mix_window_days"], 2),
                 "window_days": params["mix_window_days"], "question_share": q, **mix},
@@ -1156,7 +1208,9 @@ def compose(gt, proj: dict | None, ext: dict | None, *, project_id: str | None =
         "working": (proj or {}).get("working") if mapped else None,
         "fq_shares": (proj or {}).get("fq_shares") if mapped else {},
         "ext": ext_info,
-        "hits": list((proj or {}).get("hits") or []) if mapped else [],
+        # 起量帖: 本项目自己的 + 同品牌上一期的(后一期 / 同时在跑的那一期不算, 复审)
+        "hits": [h for h in (proj or {}).get("hits") or [] if isinstance(h, dict)
+                 and (h.get("own") or h.get("tv_project") in set(earlier))] if mapped else [],
     }
 
 
@@ -1168,7 +1222,7 @@ def uniform_profile(project_id: str | None = None, *, reason: str = "") -> dict:
     p = {
         "v": 1, "project_id": project_id, "built_at": _utcnow().isoformat(timespec="seconds"),
         "stage": "none", "n_res": None, "ps": "uniform", "pp": "none", "prior_age_min": None,
-        "tv": {"ids": [], "current": None, "brand": None, "brand_ids": [], "category": None},
+        "tv": {"ids": [], "current": None, "brand": None, "brand_ids": [], "earlier_ids": [], "category": None},
         "ref": {"source": "uniform", "ids": [], "by_dim": {}},
         "mix": {"posts": 0, "per_day": 0.0, "window_days": PARAMS["mix_window_days"], "question_share": q,
                 **{d: dict(uni[d]) for d in DIMS}},
@@ -1210,7 +1264,12 @@ def fetch_global(sb, *, now: datetime | None = None, params: dict = PARAMS) -> d
 
 
 def fetch_project(sb, project_id: str, row: dict | None = None, *, now: datetime | None = None,
-                  params: dict = PARAMS) -> dict | None:
+                  params: dict = PARAMS, on_mapping=None) -> dict | None:
+    """项目块 ④⑤。读对照表(写作台这边的库, 便宜)→ 读 TV 的近 60 天笔记和特征题(慢, 可能读不到)。
+
+    on_mapping(复审): 对照表一读到就先交出去({project_id, ext_category, tv_ids, built_at}), 调用方记进缓存的 m:<id> ——
+    后面 TV 读失败(回 None)或者慢过发牌的等待预算, 发牌照样知道这个项目对上了哪几个 TV 项目, 按全局表 / 快照里它自己的
+    配比发, 不当成「没对上」去按 8 种形式平均发。"""
     st = _store()
     now = now or _utcnow()
     if row is None:
@@ -1227,6 +1286,11 @@ def fetch_project(sb, project_id: str, row: dict | None = None, *, now: datetime
     tv_ids = sorted({str(m.get("tv_project_id")) for m in maps or () if m.get("tv_project_id")})
     base = {"project_id": project_id, "ext_category": external_category(row), "tv_ids": tv_ids,
             "built_at": now.isoformat(timespec="seconds")}
+    if on_mapping is not None:
+        try:
+            on_mapping(dict(base, tv_ids=list(tv_ids)))
+        except Exception:                               # noqa: BLE001 — 记不下对照表不影响建项目块
+            logger.exception("priors: remembering the tv mapping failed (%s)", project_id)
     if not tv_ids:
         return base
     meta = st.tv_projects_meta(sb) or {}
@@ -1324,7 +1388,9 @@ class _Pool:
 
 
 _LOCK = threading.Lock()
-_CACHE: dict[str, dict] = {}       # 键 → {"value", "at"(time.time()), "err_at"}
+# 键 → {"value", "at"(time.time()), "err_at"}。g 全局表 · p:<id> 项目块 · m:<id> 对照表(项目块构建途中记下的) ·
+# x:<品类> 外部块 · 别的模块借用的(project_now 的 d:<id>)
+_CACHE: dict[str, dict] = {}
 _INFLIGHT: dict[str, Future] = {}
 _GEN = [0]
 _POOL = [_Pool()]
@@ -1395,6 +1461,20 @@ def _submit(key: str, fn) -> Future:
     return f
 
 
+def _remember(key: str, value, gen: int) -> None:
+    """构建途中先记下已经拿到的一块(对照表 m:<id>)。只在缓存代号没变时写: reset_cache 之后, 旧池子里还在跑的构建写不回来。"""
+    with _LOCK:
+        if _GEN[0] == gen:
+            _CACHE[key] = {"value": value, "at": _NOW[0](), "err_at": None}
+
+
+def _project_builder(sb, pid: str, row, params: dict):
+    """p:<pid> 的构建函数: 建项目块, 对照表一读到就记进 m:<pid>(复审, 见 fetch_project)。"""
+    gen = _GEN[0]
+    return lambda: fetch_project(sb, pid, row, params=params,
+                                 on_mapping=lambda v: _remember("m:" + pid, v, gen))
+
+
 def _need(key: str, fn, params: dict) -> Future | None:
     """这一块不新鲜就投递构建(刚失败过的、手里又没有能用的旧值, 一分钟内不重试), 回要等的 Future。"""
     e = _entry(key)
@@ -1431,6 +1511,11 @@ def _assemble(pid: str, *, now: datetime, params: dict, ext_cat: str | None = No
     p = _entry("p:" + pid)
     proj = p["value"] if _usable(p, params) else None
     pp = ("live" if _fresh(p, "p:" + pid, params) else "stale") if proj else "none"
+    if proj is None:
+        # 项目块没有(冷缓存 + TV 慢 / 读失败, 一分钟内不重试), 对照表在(复审): 按对上的 TV 项目发, 配比从全局表 / 快照拼
+        m = _entry("m:" + pid)
+        if _usable(m, params) and isinstance(m.get("value"), dict):
+            proj, pp = dict(m["value"], mapping_only=True), "table"
     ext = None
     ext_state = None
     cat = ext_cat or (proj or {}).get("ext_category")
@@ -1455,15 +1540,18 @@ def get_profile(sb, project, *, budget_s: float | None = None, now: datetime | N
         budget = params["budget_s"] if budget_s is None else float(budget_s)
         deadline = time.monotonic() + max(budget, 0.0)
         ext_cat = external_category(row) if row else None
+        # 项目块排在最前: 两个工作线程, 它的第一步就是读对照表(便宜), 读到就记下(复审) —— 全局表慢的时候也不耽误
         futs = [f for f in (
+            _need("p:" + pid, _project_builder(sb, pid, row, params), params) if pid else None,
             _need("g", lambda: fetch_global(sb, params=params), params),
-            _need("p:" + pid, lambda: fetch_project(sb, pid, row, params=params), params) if pid else None,
             _need("x:" + ext_cat, lambda: fetch_ext(sb, ext_cat, params=params), params) if ext_cat else None,
         ) if f is not None]
         if futs:
             _fwait(futs, timeout=max(deadline - time.monotonic(), 0.0))
         if not ext_cat and pid:
             p = _entry("p:" + pid)
+            if not _usable(p, params):
+                p = _entry("m:" + pid)
             cat = ((p or {}).get("value") or {}).get("ext_category")
             if cat:
                 f = _need("x:" + cat, lambda: fetch_ext(sb, cat, params=params), params)
@@ -1480,20 +1568,22 @@ def warm(sb, project_id: str, project: dict | None = None, *, params: dict = PAR
     """只投递、不等待(build_writing_brief / open_project 用): 接下来那次发牌多半就能直接读缓存。从不抛。"""
     try:
         pid = str(project_id or "")
-        _need("g", lambda: fetch_global(sb, params=params), params)
         if not pid:
+            _need("g", lambda: fetch_global(sb, params=params), params)
             return
         row = project if isinstance(project, dict) else None
         cat = external_category(row) if row else None
+        fetch_p = _project_builder(sb, pid, row, params)
 
         def build_p():
-            v = fetch_project(sb, pid, row, params=params)
+            v = fetch_p()
             c = (v or {}).get("ext_category")
             if c:
                 _need("x:" + c, lambda: fetch_ext(sb, c, params=params), params)
             return v
 
-        _need("p:" + pid, build_p, params)
+        _need("p:" + pid, build_p, params)                  # 项目块先投(同 get_profile: 对照表早一点记下)
+        _need("g", lambda: fetch_global(sb, params=params), params)
         if cat:
             _need("x:" + cat, lambda: fetch_ext(sb, cat, params=params), params)
     except Exception:                                   # noqa: BLE001
@@ -1529,11 +1619,11 @@ def cache_state(project_id: str, *, params: dict = PARAMS) -> str:
 
 
 # ── 别的模块借这套缓存(project_now 的写作台计数用) ─────────────────────────────────────
-# 同一套单飞 + 两个工作线程 + TTL(键不是 g / x: 开头的按项目块算, 2 小时)+ 72 小时旧值。键别和 g / p: / x: 撞。
+# 同一套单飞 + 两个工作线程 + TTL(键不是 g / x: 开头的按项目块算, 2 小时)+ 72 小时旧值。键别和 g / p: / m: / x: 撞。
 def warm_value(key: str, fn, *, params: dict = PARAMS) -> None:
     """只投递、不等: ``key`` 不新鲜就在后台跑 ``fn``(回 None / 抛 = 这一次没建成)。从不抛。"""
     try:
-        if key and not key.startswith(("g", "p:", "x:")):
+        if key and not key.startswith(("g", "p:", "m:", "x:")):
             _need(key, fn, params)
     except Exception:                                   # noqa: BLE001
         logger.exception("priors: warm_value failed (%s)", key)

@@ -4,11 +4,14 @@
 deskcore_reserve_angles 判据的假 RPC 按顺序预留(写过且在 avoid_days 内的跳过、一天内抽过没写的跳过)。预留到的牌按
 consume_rate 当天写掉(写掉的 L0 挡 avoid_days 天)。发牌和「写不写」用两个独立的 rng, 同一个 seed 结果不变。
 
+两种 RPC 会跳过主牌的情形(复审): rpc_only=True —— 台账读不到, 策略看到的是空状态(Python 去重全关), 假 RPC 照样按真
+台账挡写过的; steal=s —— 队友同一时刻在同一个项目上发牌, 每张主牌有 s 的概率在我们预留之前被抢走(抢走的记进台账)。
+
 上线闸(§5.6, 5 张/天、5 个 seed 平均):
   · 30 天内精确 key 全不重复              · 配额外的内容形式 0 张
   · 每种形式的占比离 π 不超过 5 个点        · 非试新牌的疑问句占比 ≥ 目标 − 0.08
   · 非试新牌里 π 最大的原型占比 ≥ 0.7 × π    · 任意 14 天里最多的杠杆占比 ≤ 0.40
-  · 一批之内没有重复的形状 / (杠杆, 原型)
+  · 一批之内没有重复的形状 / (杠杆, 原型) / 参考帖     · 没 pin 的牌不放宽 L1(复审: 只在重度 pin 时放宽)
 10 张/天只报数, 不设闸。
 
 fixture_profile 用 vendored 快照(只有聚合数)拼一个项目的 Profile: 本项目近 60 天配比 + 快照里的标签计数; 标题句式只有
@@ -35,7 +38,8 @@ GATES = {
     "question": ("非试新疑问句 ≥ 目标 − 0.08", lambda m: m["q_nonx"] >= m["q_target"] - 0.08 - 1e-9),
     "top_arc": ("非试新最大原型 ≥ 0.7 × π", lambda m: m["arc_nonx"] >= 0.7 * m["arc_target"] - 1e-9),
     "lever14": ("任意 14 天最多的杠杆 ≤ 0.40", lambda m: m["lever14_max"] <= 0.40 + 1e-9),
-    "in_batch": ("一批之内形状 / (杠杆, 原型) 不重复", lambda m: m["in_batch_repeats"] == 0),
+    "in_batch": ("一批之内形状 / (杠杆, 原型) / 参考帖不重复", lambda m: m["in_batch_repeats"] == 0),
+    "l1_relaxed": ("没 pin 的牌不放宽 L1", lambda m: m["l1_relaxed"] == 0),
 }
 
 
@@ -109,10 +113,13 @@ def _l0_blocked(rows: list[dict], now: datetime, avoid_days: int) -> bool:
 
 
 def simulate(profile: dict, *, days: int = 28, per_day: int = 5, seed: int = 0, avoid_days: int = 30,
-             consume_rate: float = 0.6, params: dict = dp.PARAMS, start: datetime | None = None) -> dict:
-    """按天发牌 days 天, 每天一批 per_day 张。回 {"cards": [...], "batches": [...], "requested", "delivered"}。"""
+             consume_rate: float = 0.6, params: dict = dp.PARAMS, start: datetime | None = None,
+             rpc_only: bool = False, steal: float = 0.0) -> dict:
+    """按天发牌 days 天, 每天一批 per_day 张。回 {"cards": [...], "batches": [...], "requested", "delivered"}。
+    rpc_only / steal 见模块说明。"""
     rng = random.Random(seed)
     crng = random.Random(10_007 * seed + 1)
+    srng = random.Random(20_011 * seed + 3)
     start = start or SIM_START
     ledger: list[dict] = []
     by_key: dict[str, list[dict]] = {}
@@ -124,9 +131,17 @@ def simulate(profile: dict, *, days: int = 28, per_day: int = 5, seed: int = 0, 
         rows = [r for r in reversed(ledger)
                 if r["_t"] >= now - timedelta(days=win)
                 or (r["_c"] is not None and r["_c"] >= now - timedelta(days=win))]
-        state = dp.ledger_state(rows, now, avoid_days, params=params)
+        state = dp.ledger_state(None if rpc_only else rows, now, avoid_days, params=params)
         plan = dp.slot_plan(per_day, profile, rng, params=params)
         cands, meta = dp.build_candidates(profile, state, plan, rng, params=params)
+        if steal > 0:                                     # 队友同一时刻抢走一部分主牌(记进台账, 一天内抽过 → L0 挡)
+            for c in cands[:len(meta["primaries"])]:
+                if srng.random() < steal:
+                    row = {"id": len(ledger) + 1, "angle_key": c["angle_key"], "dims": c["dims"], "drawn_by": "mate",
+                           "drawn_at": _iso(now), "_t": now, "consumed_at": None, "_c": None,
+                           "consumed_version_id": None}
+                    ledger.append(row)
+                    by_key.setdefault(c["angle_key"], []).append(row)
         taken = []
         for c in cands:                                   # 假 RPC: 按顺序取前 per_day 个可用的
             if len(taken) >= per_day:
@@ -146,7 +161,8 @@ def simulate(profile: dict, *, days: int = 28, per_day: int = 5, seed: int = 0, 
             by_key.setdefault(c["angle_key"], []).append(row)
             d = c["dims"]["_draw"]
             card = {"day": day, "src": d.get("src"), "i": d.get("i"), "cell": dp.cell_of(c["dims"]),
-                    "key": c["angle_key"], "batch": meta["batch"], "ref": d.get("ref"), "g": d.get("g", 0)}
+                    "key": c["angle_key"], "batch": meta["batch"], "ref": d.get("ref"), "g": d.get("g", 0),
+                    "l1": d.get("l1")}
             cards.append(card)
             bcards.append(card)
         batches.append({"day": day, "batch": meta["batch"], "cards": bcards, "plan": meta["plan"],
@@ -217,7 +233,8 @@ def metrics(sim: dict, profile: dict, *, params: dict = dp.PARAMS) -> dict:
         cs = [c for c in b["cards"] if c["cell"]]
         sig = [(c["cell"][2], c["cell"][3], c["cell"][1]) for c in cs]
         pairs = [(c["cell"][0], c["cell"][1]) for c in cs]
-        if len(set(sig)) < len(sig) or len(set(pairs)) < len(pairs):
+        refs = [c["ref"] for c in cs if c.get("ref")]
+        if len(set(sig)) < len(sig) or len(set(pairs)) < len(pairs) or len(set(refs)) < len(refs):
             in_batch += 1
     src: dict = {}
     for c in cards:
@@ -237,6 +254,7 @@ def metrics(sim: dict, profile: dict, *, params: dict = dp.PARAMS) -> dict:
         "distinct30": distinct30, "repeats14": repeats14,
         "shape14_max": shapes14.get(top_shape, 0) if top_shape else 0, "shape14_cap": shape_cap,
         "in_batch_repeats": in_batch,
+        "l1_relaxed": sum(1 for c in cards if c.get("l1") == "relaxed" and c["src"] != "pin"),
     }
 
 
@@ -245,15 +263,15 @@ def _mean(ms: list[dict], key: str) -> float:
 
 
 def run(profile: dict, *, days: int = 28, per_day: int = 5, seeds=range(5), params: dict = dp.PARAMS,
-        avoid_days: int = 30, consume_rate: float = 0.6) -> dict:
+        avoid_days: int = 30, consume_rate: float = 0.6, rpc_only: bool = False, steal: float = 0.0) -> dict:
     """几个 seed 各跑一遍, 指标取平均; per_day ≤ 5 时判闸(10 张/天只报数)。"""
     per_seed = []
     for s in seeds:
         sim = simulate(profile, days=days, per_day=per_day, seed=s, params=params, avoid_days=avoid_days,
-                       consume_rate=consume_rate)
+                       consume_rate=consume_rate, rpc_only=rpc_only, steal=steal)
         per_seed.append(metrics(sim, profile, params=params))
     avg_keys = ("fmt_nonx", "fmt_dev_max", "q_nonx", "q_x", "arc_nonx", "lever14_max", "lever14_last", "distinct30",
-                "off_support", "in_batch_repeats", "shape14_max", "repeats14", "delivered")
+                "off_support", "in_batch_repeats", "shape14_max", "repeats14", "delivered", "l1_relaxed")
     avg = {k: _mean(per_seed, k) for k in avg_keys}
     first = per_seed[0] if per_seed else {}
     for k in ("top_format", "fmt_target", "q_target", "top_arc", "arc_target", "requested"):
@@ -290,7 +308,8 @@ def format_report(rep: dict) -> str:
              f"  最近 14 天同一形状最多 {m['shape14_max']:.1f} 次(最多的一个 seed {m['shape14_max_max']}, "
              f"封顶 {m['shape14_cap_min']}) · 杠杆最多占比: 最近 14 天 {m['lever14_last']:.3f}、"
              f"任意 14 天 {m['lever14_max']:.3f}",
-             f"  一批之内撞形状 / 撞 (杠杆, 原型) 的批数 {m['in_batch_repeats']:.1f}"]
+             f"  一批之内撞形状 / 撞 (杠杆, 原型) / 撞参考帖的批数 {m['in_batch_repeats']:.1f} · "
+             f"没 pin 而放宽 L1 的牌 {m['l1_relaxed']:.1f}"]
     if rep["gated"]:
         lines.append("闸(§5.6): " + ("全过" if rep["pass"] else "没过"))
         for g in rep["gates"].values():

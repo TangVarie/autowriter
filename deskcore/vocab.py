@@ -235,6 +235,27 @@ OPENING_PLAIN: dict[str, str] = {
     "感叹情绪": "开头先是一句感叹",
 }
 
+
+def structure_bits(desc: dict | None, *, external: bool) -> list[str]:
+    """参考行里能说出来的结构(§3.1, 外部参考 / 起量帖两种卡共用): 开头类型(「其他」不说)、亲身经历(只外部帖)、
+    转折、求助、结尾问读者。发牌(drawpolicy: 一样都说不出来的参考帖不用)和渲染(core._reference_line)读同一份 ——
+    两边口径不一样, 就会有卡带着参考、卡面上却没有参考行。"""
+    desc = desc or {}
+    bits = []
+    opening = OPENING_PLAIN.get(str(desc.get("opening_type") or ""))
+    if opening:
+        bits.append(opening)
+    if external and desc.get("own_experience") is True:
+        bits.append("写的是自己的亲身经历")
+    if desc.get("turning_point") is True:
+        bits.append("中间有一次前后转折")
+    if desc.get("asks_for_help") is True:
+        bits.append("正文在向大家讨主意")
+    if desc.get("ending_asks_reader") is True:
+        bits.append("结尾问了读者")
+    return bits
+
+
 # 写手 pin 标题句式时的别名(§2.9): 写手嘴里说的是「问句」。
 TITLE_ALIASES: dict[str, str] = {"问句": "疑问句"}
 

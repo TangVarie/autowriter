@@ -3461,15 +3461,19 @@ def _title_key(t: str) -> str:
 
 
 # 「working」一栏(angle cards v2 §3.5): 发出去的里面, 发出三天以上、评论 ≥20 或标了爆的几条 —— 给模型学句式和开头的路数。
-# 和 priors 的起量口径同一把尺(发出三天以上才看得出来; 评论 ≥20 或 爆/大爆)。这里只是挑标题, 不做清洗口径(合成 / 投流
-# 那几种标记)—— 那是算 lift 的事, 这一栏只要"本项目自己真发出去、评论多"的标题。
+# 和 priors 的起量口径同一把尺(发出三天以上才看得出来; 评论 ≥20 或 爆/大爆), 也同一套清洗(priors.is_clean, 复审):
+# 合成的、投了流的、评论区走过铺评工单的不算 —— 评论是铺出来 / 买来的, 叫模型学它的写法就是学错了东西(协议: 疑似刷量的
+# 别把它的数据当依据; project_now.working 的起量也不数这几种)。published 那一栏照旧有它们(新稿照样要避开这些标题)。
 HIT_TIERS = frozenset({"爆", "大爆"})
 WORKING_MIN_COMMENTS = 20
 WORKING_MIN_AGE_DAYS = 3
 
 
 def _is_working(stat: dict, t: datetime, now: datetime) -> bool:
+    from . import priors                          # 晚 import: priors 自己也是晚 import store
     if t > now - timedelta(days=WORKING_MIN_AGE_DAYS):
+        return False
+    if not priors.is_clean(stat):
         return False
     cc = stat.get("comments_count")
     return stat.get("tier") in HIT_TIERS or (isinstance(cc, (int, float)) and cc >= WORKING_MIN_COMMENTS)
@@ -3502,8 +3506,9 @@ def _recent_published(sb, project_id: str, *, days: int, limit: int, now: dateti
     when: dict[str, datetime] = {}
     stats: dict[str, dict] = {}
     for i in range(0, len(ids), RECENT_NOTES_CHUNK):
-        # comments_count / tier 给 working 一栏用(angle cards v2); 照旧不取标题和正文
-        for n in (sb.schema("truth_vault").table("notes").select("note_id, publish_time, comments_count, tier")
+        # comments_count / tier / data_quality_flags 给 working 一栏用(angle cards v2); 照旧不取标题和正文
+        for n in (sb.schema("truth_vault").table("notes")
+                  .select("note_id, publish_time, comments_count, tier, data_quality_flags")
                   .in_("note_id", ids[i:i + RECENT_NOTES_CHUNK]).execute()).data or []:
             t = _ts(n.get("publish_time"))
             # 上界 = 现在: 排期还没发的(publish_time 在未来)不算

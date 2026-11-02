@@ -482,12 +482,14 @@ DRAW_KEYS = {"v", "pol", "b", "i", "src", "sp", "p", "pu", "pv", "st", "ps", "dd
 
 
 def test_candidate_list_caps_at_2000_keys():
-    prof = concentrated(stage="warm", ext=ext_block(6))
-    _plan, cands, meta = draw(prof, 150, 3)                 # 生产里 n 封顶 30; 这里只看 2,000 的上限
+    # 生产里 n 封顶 30; 这里只看 2,000 的上限。备牌 / 尾巴要过整批的 B(复审), 一批 100 张时只剩 128 个 (杠杆, 原型)
+    # —— 只有两种形式的项目凑不出 1,900 张合规的备牌, 所以用八种形式都在配额里的项目
+    prof = make_profile(stage="warm", ext=ext_block(6), q=0.5)
+    _plan, cands, meta = draw(prof, 100, 3)
     keys = [c["angle_key"] for c in cands]
     assert len(keys) == len(set(keys)) == 2000
     idx = [c["dims"]["_draw"]["i"] for c in cands if c["dims"]["_draw"]["i"]]
-    assert idx == sorted(idx) and len(idx) == len(meta["primaries"]) == 150 - meta["short"]
+    assert idx == sorted(idx) and len(idx) == len(meta["primaries"]) == 100 - meta["short"]
 
 
 @pytest.mark.parametrize("n", [1, 5, 30])
@@ -659,3 +661,131 @@ def test_cli_angle_sim_runs_offline_from_the_snapshot(capsys):
                    "--json"])
     rep = json.loads(capsys.readouterr().out)
     assert rc == 0 and rep["gated"] is False and rep["mean"]["delivered"] == 30
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 复审回合: RPC 跳过主牌、起量帖槽的 L1、e / h 的 p、说不出结构的参考帖
+# ══════════════════════════════════════════════════════════════════════
+
+def _reserve(cands, n, blocked=frozenset()):
+    """仿 deskcore_reserve_angles: 按候选表的先后取前 n 个没被挡的(被挡 = 并发发牌刚抢走 / 写过而台账没读到)。"""
+    out = []
+    for c in cands:
+        if len(out) >= n:
+            break
+        if c["angle_key"] not in blocked:
+            out.append(c)
+    return out
+
+
+@pytest.mark.parametrize("rpc_only", [False, True])
+def test_backups_keep_the_batch_free_of_repeats_when_the_rpc_skips_primaries(rpc_only):
+    """RPC 跳过某张主牌时顶上来的是候选表里接下来的备牌 / 尾巴: 它们也不能和批里的形状、(杠杆, 原型)、参考帖撞
+    (§2.6 B、L5)。跳几张都一样(备牌之间也互不相撞); 只跳一张时杠杆 / 原型封顶也守住。台账读不到(rpc_only)时 L1 关着,
+    主牌常常是写过的 key、被 RPC 挡下 —— 这条路最常见。"""
+    prof = concentrated(ext=ext_block(8), hits=[hit_entry(i, arc=ARCS[i]) for i in range(4)])
+    n = 10
+    lev_cap, arc_cap = max(2, math.ceil(0.4 * n)), max(2, math.ceil(0.35 * n))
+    for seed in range(30):
+        st = dp.ledger_state(None, NOW) if rpc_only else empty_state()
+        rng = random.Random(seed)
+        plan = dp.slot_plan(n, prof, rng)
+        cands, meta = dp.build_candidates(prof, st, plan, rng)
+        prim = [p["angle_key"] for p in meta["primaries"]]
+        assert len(prim) == n
+        pick = random.Random(1000 + seed)
+        skips = [{k} for k in prim] + [set(pick.sample(prim, j)) for j in (2, 3, 5)]
+        noise = {c["angle_key"] for c in cands[n:] if pick.random() < 0.3}    # 备牌里也有一批写过的
+        for blocked in skips + [s | noise for s in skips[-3:]]:
+            got = _reserve(cands, n, blocked)
+            cells = [dp.cell_of(c["dims"]) for c in got]
+            assert len(got) == n
+            assert len({(c[2], c[3], c[1]) for c in cells}) == n, (seed, len(blocked), "形状重复")
+            assert len({(c[0], c[1]) for c in cells}) == n, (seed, len(blocked), "(杠杆, 原型) 重复")
+            refs = [c["dims"]["_draw"]["ref"] for c in got if c["dims"]["_draw"].get("ref")]
+            assert len(refs) == len(set(refs)), (seed, "同一篇参考帖一批出了两张")
+            if len(blocked) == 1:
+                assert max(sum(1 for c in cells if c[0] == v) for v in LEVS) <= lev_cap
+                assert max(sum(1 for c in cells if c[1] == v) for v in ARCS) <= arc_cap
+
+
+def test_hit_slot_tries_other_anchors_then_w_before_relaxing_l1():
+    """起量帖自己那一圈(本格 + 换原型 / 标题 / 杠杆, 共 37 格)全在 8–30 天前抽过: 不放宽 L1 去重发(§2.6 只在重度 pin
+    时放宽), 先换别的起量帖, 都不行就按 w 发 —— w 还有上千个格子。"""
+    neigh = ({cell()} | {cell(arc=x) for x in ARCS} | {cell(ttl=t) for t in TTLS} | {cell(lev=v) for v in LEVS})
+    rows = [row(c, 8 + i % 20, rid=f"n{i}") for i, c in enumerate(sorted(neigh))]
+    st = dp.ledger_state(rows, NOW)
+    plan = one_slot_plan("h", "提问求助", sp=0.1)
+    same = [hit_entry(i) for i in range(3)]                              # 三篇起量帖是同一个格子
+    for seed in range(20):
+        _c, meta = dp.build_candidates(concentrated(hits=same), st, plan, random.Random(seed), params=NO_TAIL)
+        p = meta["primaries"][0]
+        assert p["l1"] is None and p["src"] == "w" and dp.cell_of(p["dims"]) not in neigh
+    other = hit_entry(9, lev="好奇驱动", arc="经济焦虑", ttl="场景直述")
+    for seed in range(20):
+        _c, meta = dp.build_candidates(concentrated(hits=same + [other]), st, plan, random.Random(seed),
+                                       params=NO_TAIL)
+        p = meta["primaries"][0]
+        assert p["l1"] is None and p["src"] == "h" and p["ref"] == other["ref"]
+        assert dp.cell_of(p["dims"]) == ("好奇驱动", "经济焦虑", "提问求助", "场景直述")
+
+
+def test_external_slot_p_is_the_cells_probability_over_all_references():
+    """e 槽存的 p 是这个格子在这个槽位里的概率 Σ_r p_r·P(格子 | r)(§2.7), 不是「挑中这篇参考帖 × 格子」的联合概率 ——
+    40 篇参考帖里一大半是同一种标题句式, 联合概率会小几十倍。"""
+    pool = [dict(ext_entry(i, title="数字清单" if i < 30 else "场景直述"), w=1.0 + (i % 7) / 3) for i in range(40)]
+    prof = concentrated(ext={"category": "运动补给", "state": "ok", "ok": True, "eligible": 40, "pool": pool})
+    st = empty_state()
+    plan = one_slot_plan("e", "提问求助", sp=0.2)
+    total = sum(e["w"] for e in pool)
+    cond = {t: dp.slot_distribution(prof, st, {"f": "提问求助", "src": "e", "t_only": t}) for t in ("数字清单", "场景直述")}
+    for seed in range(8):
+        cands, meta = dp.build_candidates(prof, st, plan, random.Random(seed), params=NO_TAIL)
+        c0 = cands[0]
+        assert c0["dims"]["_draw"]["src"] == "e"
+        c = dp.cell_of(c0["dims"])
+        want = sum(e["w"] / total * cond[e[T]].get(c, (0.0, 0.0))[0] for e in pool)
+        assert c0["dims"]["_draw"]["p"] == pytest.approx(float(f"{want:.3g}"), rel=1e-6)
+
+
+def test_hit_slot_p_is_the_cells_probability_over_all_anchors():
+    """h 槽: 三篇起量帖是同一个格子、一篇是另一个格子, 权重一样 → 这两个格子在槽位里的概率是 3/4 和 1/4。"""
+    other = hit_entry(9, lev="好奇驱动", arc="经济焦虑", ttl="场景直述")
+    prof = concentrated(hits=[hit_entry(i) for i in range(3)] + [other])
+    plan = one_slot_plan("h", "提问求助", sp=0.1)
+    got = {}
+    for seed in range(30):
+        cands, _meta = dp.build_candidates(prof, empty_state(), plan, random.Random(seed), params=NO_TAIL)
+        got[dp.cell_of(cands[0]["dims"])] = cands[0]["dims"]["_draw"]["p"]
+    assert got == {cell(): 0.75, ("好奇驱动", "经济焦虑", "提问求助", "场景直述"): 0.25}
+
+
+def test_references_without_a_describable_structure_are_not_used():
+    """卡上的参考行只说结构; 一样结构都说不出来的起量帖 / 外部帖(特征题没读到、开头是「其他」、几个是非题都是否)不当
+    参考 —— 不然卡上没有参考行, batch_note 却说「参照了…的结构」。"""
+    blank = {"opening_type": "其他", "ending_asks_reader": False, "asks_for_help": None, "turning_point": False}
+    hits = [dict(hit_entry(i, arc=ARCS[i]), desc=dict(blank)) for i in range(5)]
+    ext = ext_block(6)
+    for e in ext["pool"]:
+        e.update(title_structure=None, desc=dict(blank, own_experience=None))
+    prof = concentrated(hits=hits, ext=ext)
+    assert dp.hit_anchors(prof) == [] and dp.ext_refs(prof) == []
+    for seed in range(10):
+        plan, _c, meta = draw(prof, 10, seed, params=NO_TAIL)
+        assert plan["counts"].get("h", 0) == 0 and plan["counts"].get("e", 0) == 0
+        assert all(p["reference"] is None for p in meta["primaries"])
+    # 说得出一样就够: 开头类型、或者任何一个「是」
+    ok = dict(hit_entry(0), desc=dict(blank, ending_asks_reader=True))
+    assert dp.hit_anchors(concentrated(hits=[ok])) == [ok]
+
+
+@pytest.mark.slow
+def test_sim_keeps_batches_clean_when_the_ledger_is_unreadable_or_teammates_draw_at_once():
+    """模拟里台账读不到(Python 去重全关, 只靠 RPC 挡写过的)、或者队友同一时刻抢走一部分主牌: 一批之内照样没有
+    重复的形状 / (杠杆, 原型); 没 pin 的牌一张都不放宽 L1。"""
+    prof = ds.fixture_profile("XIWU_phase2")
+    for kw in ({"rpc_only": True}, {"steal": 0.3}):
+        rep = ds.run(prof, days=21, per_day=10, seeds=range(2), **kw)
+        m = rep["mean"]
+        assert m["in_batch_repeats"] == 0 and m["l1_relaxed"] == 0, (kw, ds.format_report(rep))
+        assert m["delivered"] == 210

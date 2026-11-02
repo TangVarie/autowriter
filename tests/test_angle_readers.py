@@ -508,3 +508,20 @@ def test_working_is_empty_when_truth_vault_is_unreachable():
     w.draft("b1", ["写过的"])
     c = w.client(Flaky, fail_table="truth_vault.notes")
     assert store.recent_titles(c, PID, working=5) == {"published": [], "drafted": ["写过的"], "working": []}
+
+
+def test_working_skips_seeded_paid_and_synthetic_posts():
+    """working 是给模型学句式的「评论多」: 评论区走过铺评工单的、投了流的、合成的不算(和 project_now.working 的起量
+    同一把尺, priors.is_clean)。published 那一栏照旧有它们(新稿照样要避开这些标题)。"""
+    w = _Titles()
+    w.post("paved", "铺过评论的那篇", days=6, comments=72)
+    w.post("paid", "投了流的那篇", days=7, comments=40)
+    w.post("syn", "合成的那篇", days=8, comments=37)
+    w.post("clean", "自己起来的那篇", days=9, comments=24)
+    flags = {"paved": {"comment_maintained_routes": ["铺评工单"]}, "paid": {"paid_promoted": True},
+             "syn": {"synthetic": "true"}}
+    for n in w.notes:
+        n["data_quality_flags"] = flags.get(n["note_id"], {})
+    got = store.recent_titles(w.client(), PID, working=5)
+    assert got["working"] == ["自己起来的那篇"]
+    assert {"铺过评论的那篇", "投了流的那篇", "合成的那篇"} <= set(got["published"])

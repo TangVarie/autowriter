@@ -221,7 +221,7 @@ def test_batch_note_counts_the_cards_and_never_mentions_explore():
         return a
     picked = ([card("提问求助", "疑问句")] * 6 + [card("提问求助", "场景直述")] * 3
               + [card("场景植入", "感叹共鸣", {"kind": "hit", "own": True})])
-    assert project_now.batch_note(picked) == ("这批10篇：9篇提问求助、1篇场景植入，6篇问句标题；"
+    assert project_now.batch_note(picked) == ("新抽的这10篇：9篇提问求助、1篇场景植入，6篇问句标题；"
                                               "1篇参照了本项目近期评论多的帖的结构。")
     picked.append(card("提问求助", "疑问句", {"kind": "external"}))
     note = project_now.batch_note(picked)
@@ -233,3 +233,45 @@ def test_batch_note_counts_the_cards_and_never_mentions_explore():
                                     (0.21, "约两成"), (0.33, "约三分之一")])
 def test_share_phrase(s, want):
     assert project_now.share_phrase(s) == want
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 复审回合
+# ══════════════════════════════════════════════════════════════════════
+
+def test_message_does_not_say_nothing_was_published_when_the_count_is_unknown():
+    """tv_note_links 读不到时 published 是 None(不知道), 不是 0: message 不下「一篇都没发出去」的结论。"""
+    desk = {"days": 14, "cards_drawn": 12, "written": 9, "published": None, "title_changed": None}
+    msg = project_now.build(_profile({"resolved": 0}), desk, name="示例项目")["message"]
+    assert "发出去" not in msg and msg.endswith("写作台近两周写了9篇。")
+    assert project_now.build(_profile({"resolved": 0}), {**desk, "published": 0})["message"].endswith(
+        "写作台近两周写的9篇还没有一篇发出去。")
+
+
+def test_batch_note_speaks_only_for_the_newly_drawn_cards():
+    """交付里可能有一部分是 angle_debt 补写的(协议: 先写欠着的, 再发牌补齐), batch_note 只数这次新抽的牌, 话也只这么说;
+    draw_angles 的说明里交代清楚。"""
+    note = project_now.batch_note([{"dims": {"content_format": "提问求助", "title_structure": "疑问句"}}] * 3)
+    assert note.startswith("新抽的这3篇：3篇提问求助") and not note.startswith("这批")
+    doc = T.draw_angles.__doc__ or ""
+    i = doc.index("batch_note")
+    assert "angle_debt" in doc[i:i + 400]
+
+
+def test_status_line_when_only_the_mapping_is_known():
+    table = _profile({"resolved": 0}, pp="table", stage="run")
+    assert project_now.status_line(table) == project_now.STATUS_TABLE
+    assert "通用配比" not in project_now.STATUS_TABLE and len(project_now.STATUS_TABLE) <= project_now.STATUS_MAX_CHARS
+    unmapped = _profile({"resolved": 0}, pp="table", stage="none")
+    assert project_now.status_line(unmapped).startswith("这个项目还没对上已发的笔记")
+
+
+def test_external_lesson_wording_waits_for_the_tv_shelf():
+    """TV 的书架还是按总评论数排、卡上没有发帖时间和日均评论(配套的 TV 改动还没上): 工具说明照旧说外部卡没经过我们的
+    数据验证, 不许诺卡上有它没有的字段。"""
+    for fn in (T.open_project, T.borrow_lessons):
+        doc = fn.__doc__ or ""
+        i = doc.index("external=true 的是")
+        part = doc[i:i + 160]
+        assert "数据验证" in part and ("没有经过" in part or "没经过" in part), fn.__name__
+        assert "日均评论" not in doc and "涨得快" not in doc, fn.__name__

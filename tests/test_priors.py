@@ -672,3 +672,89 @@ def test_cli_offline_backtest_runs_without_a_database(tmp_path, capsys):
     assert "gate 1" in out and "gate 2" in out and rc in (0, 1)
     rc = cli.main(["angle-prior", "--backtest", "--cells", str(path), "--json"])
     assert json.loads(capsys.readouterr().out)["n_targets"] == 3
+
+
+# ── 复审回合: 项目块读不到但对照表读得到; 同品牌只认上一期 ─────────────────────────────
+
+def _tv_down(monkeypatch, *, profile_delay=None):
+    """TV 那几张表读不到(或者 tv_notes_profile 卡住 profile_delay 秒再失败), 写作台这边的对照表照常读得到。"""
+    from deskcore import store
+    gate = threading.Event()
+
+    def none(*a, **k):
+        return None
+
+    def notes_profile(*a, **k):
+        if profile_delay:
+            gate.wait(profile_delay)
+        return None
+
+    for fn in ("tv_notes_outcomes", "tv_title_answers", "tv_projects_meta", "note_answers", "external_slice"):
+        monkeypatch.setattr(store, fn, none)
+    monkeypatch.setattr(store, "tv_notes_profile", notes_profile)
+    monkeypatch.setattr(store, "project_row", lambda *a, **k: {"id": "desk-x", "name": "x", "brand": "某家电"})
+    monkeypatch.setattr(store, "tv_projects_of", lambda *a, **k: [{"tv_project_id": "XIWU_phase2"}])
+    return gate
+
+
+def _snapshot_support(tv_id: str) -> set:
+    m = priors.load_snapshot()["projects"][tv_id]["mix_recent"]["content_format"]
+    tot = sum(m.values())
+    return {v for v, c in m.items() if c / tot >= priors.PARAMS["fmt_support_min"]}
+
+
+def test_tv_down_with_a_readable_mapping_keeps_formats_inside_the_snapshot_quota(monkeypatch):
+    """重启后缓存是空的、TV 读不到: 对照表已经读到了, 就不能把项目当成「没对上」按 8 种形式平均发 —— 配比从快照里
+    本项目那一条拼, 形式只在它的配额里; 没有近 60 天的原始数, 卡上不给括号, 简报的 project_now 照旧只认项目块。"""
+    _tv_down(monkeypatch)
+    for _ in range(2):                                   # 第二次: 项目块 60 秒内不重试, 对照表照样认得
+        prof = priors.get_profile(object(), "desk-x", budget_s=2.5)
+        assert prof["ps"] == "snap" and prof["pp"] == "table" and prof["stage"] in ("warm", "run")
+        assert prof["tv"]["ids"] == ["XIWU_phase2"] and prof["tv"]["current"] == "XIWU_phase2"
+        sup = {v for v, s in prof["pi"]["content_format"].items() if s > 0}
+        assert sup and sup <= _snapshot_support("XIWU_phase2")
+        assert prof["evidence"]["content_format"] == {} and prof["hits"] == []
+        assert prof["lift"]["brand"] is not None, "提升照样按本项目对上的 TV 项目算(全局表 / 快照里有它的计数)"
+    assert priors.cache_state("desk-x") == "unavailable" and priors.cached_profile("desk-x") is None
+
+
+def test_a_slow_tv_with_a_readable_mapping_keeps_formats_inside_the_quota(monkeypatch):
+    """冷缓存 + TV 慢(项目块超过发牌的等待预算): 对照表一读到就先记下, 这一次发牌照样按本项目的配额发。"""
+    gate = _tv_down(monkeypatch, profile_delay=5.0)
+    try:
+        t0 = time.monotonic()
+        prof = priors.get_profile(object(), "desk-x", budget_s=0.5)
+        assert time.monotonic() - t0 < 0.8
+        assert prof["pp"] == "table" and prof["stage"] != "none"
+        assert {v for v, s in prof["pi"]["content_format"].items() if s > 0} <= _snapshot_support("XIWU_phase2")
+        assert priors.cache_state("desk-x") == "warming"
+    finally:
+        gate.set()
+        assert priors._POOL[0].wait_idle(10)
+
+
+def test_brand_layer_for_reference_and_anchors_is_the_earlier_phase_only():
+    """「同品牌上一期」= 最后一篇发在本期第一篇之前的那一期(§2.3 §2.5, 同 priors_backtest._earlier_brand)。只对上
+    前一期的写作台项目不拿后一期当配比参照、不拿后一期的帖当起量帖; 只对上后一期的照常用前一期。"""
+    rows = []
+    for i in range(80):
+        rows.append(note("AAA_phase1", age_days=30 + i % 15, comments=5 + i, fmt="场景植入"))     # 前一期: 30–44 天前
+    for i in range(80):
+        rows.append(note("AAA_phase2", age_days=2 + i % 24, comments=5 + i))                     # 后一期: 2–25 天前
+    ans = {r["note_id"]: {"opening_type": "具体事件"} for r in rows}
+    meta = {"AAA_phase1": {"category": "家居家电"}, "AAA_phase2": {"category": "家居家电"}}
+    gt = priors.build_global(rows, {}, meta, now=NOW)
+
+    def prof(own, other):
+        proj = priors.project_aggregate(rows, ans, tv_ids=[own], brand_ids=[other], now=NOW)
+        proj.update(project_id="desk-a", tv_ids=[own])
+        return priors.compose(gt, proj, None, project_id="desk-a", now=NOW)
+
+    old = prof("AAA_phase1", "AAA_phase2")
+    assert old["ref"]["source"] != "brand" and old["ref"]["by_dim"]["content_format"] != "brand"
+    assert [h for h in old["hits"] if not h["own"]] == []
+    assert old["tv"]["earlier_ids"] == []
+    new = prof("AAA_phase2", "AAA_phase1")
+    assert new["ref"]["source"] == "brand" and new["ref"]["ids"] == ["AAA_phase1"]
+    assert new["tv"]["earlier_ids"] == ["AAA_phase1"]
+    assert any(not h["own"] and h["tv_project"] == "AAA_phase1" for h in new["hits"])

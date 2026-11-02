@@ -14,11 +14,14 @@ n 个可用的、原子预留、避重在 RPC 里), 这里只决定【候选的�
         h: 起量帖自己的 (杠杆, 原型, 标题); D·B 为 0 时依次换原型 / 标题 / 杠杆
      D 跨批次去重(每种来源一样: 两条臂面对同一套去重), R 向目标回拉(只 w/e/h), B 一批之内(见 §2.6 的表)。
   3. 候选表 = n 张主牌 + 每个槽位 2 张备牌(轮流排) + 按 w 分布在全部配额形式上接着抽的尾巴, 凑到
-     max(20n, 500) 个不同的 key(封顶 2000)。按 angle_key 去重。
+     max(20n, 500) 个不同的 key(封顶 2000)。按 angle_key 去重。RPC 跳过一张主牌时顶上来的是表里接下来的那张, 不一定
+     是那个槽位自己的备牌, 所以备牌和尾巴都要过【整批】的 B、不带主牌已经用了的参考帖, 彼此撞形状 / (杠杆, 原型) 的
+     排到后一档(复审; 见 build_candidates)。
 
 每张候选: {"angle_key": fp.angle_key(四个维度), "dims": {四个维度, "_draw": {...}}}。fp.angle_key 只认四个主维度,
 _draw 不进 key; RPC 把 dims 原样存进台账、原样回来 —— 预留到哪一张, 那一张就带着自己真实的来源(§2.7)。
-_draw 的键(§5.1): v pol b i src sp g p pu pv st ps dd [fa ref reuse pin of l1]。
+_draw 的键(§5.1): v pol b i src sp g p pu pv st ps dd [fa ref reuse pin of l1 pp]。pp 只在项目块不是新鲜的时候带
+(stale 旧的 / table 只读到对照表、配比从全局表或快照里拼 / none 都没有)。
 
 去重为什么是相对的(P1 / P2 的平衡): 绝对的形状惩罚会把项目自己的主形状压下去(v2 的健康焦虑 14% vs 已发 28%);
 这里一个形状只在跑到目标份额以上时才降温, 另有硬封顶。精确 key 30 天不重发(L1)本身就把任何一种
@@ -156,8 +159,18 @@ def systematic_round(n: int, shares: dict, rng) -> dict:
 # 槽位计划(§2.4)
 # ══════════════════════════════════════════════════════════════════════
 
+def describable(entry: dict, *, external: bool) -> bool:
+    """这篇参考帖 / 起量帖在卡上说得出至少一样结构吗(和渲染的参考行同一份口径, vocab.structure_bits; 外部帖的标题句式
+    也算一样)。说不出来的不当参考(复审): 特征题没读到(项目块里 answers 是空的)、开头是「其他」而几个是非题都不是「是」
+    —— 用了它, 卡上没有参考行, batch_note 却说「参照了…的结构」。"""
+    if external and entry.get(T) in VALUES[T]:
+        return True
+    return bool(vocab.structure_bits(entry.get("desc"), external=external))
+
+
 def hit_anchors(profile) -> list[dict]:
-    """能用的起量帖: 杠杆 / 原型 / 标题句式三样都在词表里的。冷启动(cold / none)只用同品牌上一期的(§2.4 表)。"""
+    """能用的起量帖: 杠杆 / 原型 / 标题句式三样都在词表里、卡上说得出结构的。冷启动(cold / none)只用同品牌上一期的
+    (§2.4 表)。"""
     stage = (profile or {}).get("stage") or "none"
     out = []
     for h in (profile or {}).get("hits") or []:
@@ -167,13 +180,17 @@ def hit_anchors(profile) -> list[dict]:
             continue
         if stage in ("cold", "none") and h.get("own"):
             continue
+        if not describable(h, external=False):
+            continue
         out.append(h)
     return out
 
 
 def ext_refs(profile) -> list[dict]:
+    """能用的外部参考帖: 有 ref、卡上说得出结构的(ext_ok 的「至少 5 篇」也按这个数)。"""
     ext = (profile or {}).get("ext") or {}
-    return [e for e in ext.get("pool") or [] if isinstance(e, dict) and e.get("ref")]
+    return [e for e in ext.get("pool") or []
+            if isinstance(e, dict) and e.get("ref") and describable(e, external=True)]
 
 
 def slot_plan(n: int, profile, rng, *, pin: dict | None = None, params: dict = PARAMS) -> dict:
@@ -471,6 +488,18 @@ def es_pick(weights, rng, k: int = 1) -> list:
     return [item for _, item in top]
 
 
+def _ref_w(e: dict) -> float:
+    return max(float(e.get("w") or 0.0), 0.0) or 1e-9
+
+
+def _fresh_refs(pool, *, ref_age, cooldown_days: float, in_batch=()) -> list:
+    """没在冷却期里、这一批也还没用过的参考帖(pick_reference 和 p 的边际概率用同一份)。"""
+    ref_age = ref_age or {}
+    used = set(in_batch or ())
+    return [e for e in pool or () if e.get("ref") and e["ref"] not in used
+            and (ref_age.get(e["ref"]) is None or ref_age[e["ref"]] > cooldown_days)]
+
+
 def pick_reference(pool, rng, *, ref_age=None, cooldown_days: float, in_batch=(), prefer=None):
     """从参考池里挑一篇(§2.5 / L5): 权重是条目的 w(外部 √日均评论, 起量帖 本项目 ×3 / 同品牌 ×1)。
 
@@ -481,12 +510,12 @@ def pick_reference(pool, rng, *, ref_age=None, cooldown_days: float, in_batch=()
     avail = [e for e in pool or () if e.get("ref") and e["ref"] not in used]
     if not avail:
         return None, 0.0, 0
-    fresh = [e for e in avail if ref_age.get(e["ref"]) is None or ref_age[e["ref"]] > cooldown_days]
+    fresh = _fresh_refs(avail, ref_age=ref_age, cooldown_days=cooldown_days)
     if fresh:
         if prefer is not None:
             pref = [e for e in fresh if prefer(e)]
             fresh = pref or fresh
-        ws = [(i, max(float(e.get("w") or 0.0), 0.0) or 1e-9) for i, e in enumerate(fresh)]
+        ws = [(i, _ref_w(e)) for i, e in enumerate(fresh)]
         tot = sum(w for _, w in ws)
         i = es_pick(ws, rng)[0]
         return fresh[i], ws[i][1] / tot, 0
@@ -569,11 +598,12 @@ _TINY = 1e-300
 
 
 def _scan(ctx: _Ctx, batch: Batch, f: str, src: str, rng, *, t_only=None, relaxed=False, k: int = 3,
-          es: bool = True, collect: dict | None = None) -> dict:
+          es: bool = True, collect: dict | None = None, by_title: dict | None = None) -> dict:
     """一个槽位(形式 f 定了)在全部 (杠杆, 原型, 标题) 格子上的一遍: 权重 w(按来源)、试新分布 DB(= D·B_x, 给 pu)、
     ES 的前 k 名。t_only: e 槽只在参考帖的标题句式上有权重(DB 仍按全部标题算)。
 
-    w: π_l·π_a·π_t·R·D · B    e: π_l·π_a·R·D · 1[t = t_only] · B′    x: D · B    pin: 同 w(限在 pin 的值上)"""
+    w: π_l·π_a·π_t·R·D · B    e: π_l·π_a·R·D · 1[t = t_only] · B′    x: D · B    pin: 同 w(限在 pin 的值上)
+    by_title(给 e 槽算边际概率): 按标题句式累加 π_l·π_a·R·D(过了 B′ 的格子) —— 就是参考帖是这一类时那一遍的 sw。"""
     lev_ban = {v for v in ctx.vals[L] if batch.lev_full(v)}
     arc_ban = {v for v in ctx.vals[A] if batch.arc_full(v)}
     pair_ban = batch.pairs if batch.pair_ban else ()
@@ -599,6 +629,8 @@ def _scan(ctx: _Ctx, batch: Batch, f: str, src: str, rng, *, t_only=None, relaxe
                 if (ttl, arc) in sig_ban or (lev, arc, ttl) in cell_ban:
                     continue
                 sdb += dd
+                if by_title is not None and bwt > 0:
+                    by_title[ttl] = by_title.get(ttl, 0.0) + bwt
                 if ttl in ttl_ban:
                     if collect is not None:
                         collect[(lev, arc, f, ttl)] = (0.0, dd)
@@ -634,29 +666,36 @@ def _scan_relaxing(ctx, batch, f, src, rng, **kw):
     return res
 
 
-def _h_chain(ctx: _Ctx, batch: Batch, f: str, anchor: dict, rng, relaxed: bool) -> list:
-    """起量帖槽: 先试起量帖自己的格子(D·B > 0 就用它), 不行依次换原型(按 π_arc)、标题(按 π_ttl)、杠杆(按 π_lev),
-    每一步内按 ES 排好。回 [(格子, 条件概率, DB)], 第一个是主牌, 后面的是备牌。"""
+def _h_steps(ctx: _Ctx, batch: Batch, f: str, anchor: dict) -> tuple:
+    """起量帖槽(形式 f)的候选, 不用随机数: (本格, 它的 D 或 0) 和三步退路 [(格子, 权重, D)](换原型 → 标题 → 杠杆;
+    一步之内的权重 = 换掉的那一维的 π · D · R)。只看严格的 L1(§2.6 只在重度 pin 时放宽; pin 时没有 h 槽)。"""
     la, aa, ta = anchor[L], anchor[A], anchor[T]
     pi = ctx.pi
-    out = []
     c0 = (la, aa, f, ta)
-    d0 = ctx.d(c0, relaxed)
-    if d0 > 0 and b_factor(c0, batch, "h") > 0:
-        out.append((c0, 1.0, d0))
-    steps = ((A, [(la, a, f, ta) for a in VALUES[A] if a != aa]),
-             (T, [(la, aa, f, t) for t in VALUES[T] if t != ta]),
-             (L, [(lv, aa, f, ta) for lv in VALUES[L] if lv != la]))
-    for dim, cells in steps:
+    d0 = ctx.d(c0)
+    d0 = d0 if d0 > 0 and b_factor(c0, batch, "h") > 0 else 0.0
+    steps = []
+    for dim, cells in ((A, [(la, a, f, ta) for a in VALUES[A] if a != aa]),
+                       (T, [(la, aa, f, t) for t in VALUES[T] if t != ta]),
+                       (L, [(lv, aa, f, ta) for lv in VALUES[L] if lv != la])):
         ws = []
         for c in cells:
-            dd = ctx.d(c, relaxed)
+            dd = ctx.d(c)
             if dd <= 0 or b_factor(c, batch, "h") <= 0:
                 continue
-            v = c[DIMS4.index(dim)]
-            w = pi[dim][v] * dd * ctx.r[L][c[0]] * ctx.r[A][c[1]] * ctx.r[T][c[3]]
+            w = pi[dim][c[DIMS4.index(dim)]] * dd * ctx.r[L][c[0]] * ctx.r[A][c[1]] * ctx.r[T][c[3]]
             if w > 0:
                 ws.append((c, w, dd))
+        steps.append(ws)
+    return (c0, d0), steps
+
+
+def _h_chain(ctx: _Ctx, batch: Batch, f: str, anchor: dict, rng) -> list:
+    """起量帖槽: 先试起量帖自己的格子(D·B > 0 就用它), 不行依次换原型(按 π_arc)、标题(按 π_ttl)、杠杆(按 π_lev),
+    每一步内按 ES 排好。回 [(格子, 条件概率, DB)], 第一个是主牌, 后面的是备牌。"""
+    (c0, d0), steps = _h_steps(ctx, batch, f, anchor)
+    out = [(c0, 1.0, d0)] if d0 > 0 else []
+    for ws in steps:
         if not ws:
             continue
         tot = sum(w for _, w, _ in ws)
@@ -665,7 +704,77 @@ def _h_chain(ctx: _Ctx, batch: Batch, f: str, anchor: dict, rng, relaxed: bool) 
     return out
 
 
+def _h_first(ctx: _Ctx, batch: Batch, f: str, anchor: dict) -> dict:
+    """这篇起量帖定下之后, 槽位那一张(链上第一个)的分布: 本格能用就是它(概率 1), 否则第一步非空的退路里按权重。"""
+    (c0, d0), steps = _h_steps(ctx, batch, f, anchor)
+    if d0 > 0:
+        return {c0: 1.0}
+    for ws in steps:
+        if ws:
+            tot = sum(w for _, w, _ in ws)
+            return {c: w / tot for c, w, _ in ws}
+    return {}
+
+
+def _h_marginal(ctx: _Ctx, batch: Batch, f: str, anchors, *, ref_age, used_refs) -> dict:
+    """h 槽里每个格子的概率(§2.7 的 p = 这个格子在这个槽位里的概率, 复审): Σ_a P(挑中起量帖 a)·P(格子 | a)。
+
+    挑起量帖的过程(pick_reference + 用不上就换下一篇): 没冷却的里面先挑形式和槽位一样的, 链是空的就排除再挑。等价于
+    在「能用的」那一组里按 w 抽 —— 形式一样而能用的有就是它们, 没有就是全部能用的。"""
+    fresh = _fresh_refs(anchors, ref_age=ref_age, cooldown_days=ctx.params["hit_cooldown_days"], in_batch=used_refs)
+    firsts = [(a, _h_first(ctx, batch, f, a)) for a in fresh]
+    ok = [(a, d) for a, d in firsts if d]
+    pref = [(a, d) for a, d in ok if a.get(F) == f]
+    group = pref or ok
+    tot = sum(_ref_w(a) for a, _ in group)
+    out: dict = {}
+    for a, d in group:
+        pa = _ref_w(a) / tot
+        for c, pc in d.items():
+            out[c] = out.get(c, 0.0) + pa * pc
+    return out
+
+
+def _e_title(ctx: _Ctx, ref: dict):
+    t = ref.get(T) if ref.get(T) in VALUES[T] else None
+    if t is not None and T in ctx.pin and ctx.pin[T] != t:
+        t = None
+    return t
+
+
+def _e_marginal(ctx: _Ctx, batch: Batch, f: str, pool, cells, *, ref_age, used_refs, rng) -> dict:
+    """e 槽里这几个格子的概率(复审): Σ_r P(挑中参考帖 r)·P(格子 | r)。P(格子 | r) 只看 r 的标题句式 t_r ——
+    同一类的参考帖条件分布一样, 所以 = Σ_t P(挑中的是 t 类)·P(格子 | t)。挑的过程同 h(用不上的排除再挑), 等价于在
+    「这一类在槽位里有正权重」的参考帖里按 w 抽; 没有标题句式的参考帖按 w 的分布(含 π_t)。"""
+    sums: dict = {}
+    s_none = _scan(ctx, batch, f, "e", rng, es=False, by_title=sums)["sw"]
+    fresh = _fresh_refs(pool, ref_age=ref_age, cooldown_days=ctx.params["ext_cooldown_days"], in_batch=used_refs)
+    cls: dict = {}
+    for e in fresh:
+        t = _e_title(ctx, e)
+        if (sums.get(t, 0.0) if t is not None else s_none) > 0:
+            cls[t] = cls.get(t, 0.0) + _ref_w(e)
+    tot = sum(cls.values())
+    out = {}
+    for c in cells:
+        lev, arc, fmt, ttl = c
+        if tot <= 0:
+            out[c] = 0.0
+            continue
+        bwt = (ctx.pi[L][lev] * ctx.pi[A][arc] * ctx.r[L][lev] * ctx.r[A][arc] * ctx.r[T][ttl] * ctx.d(c))
+        p = 0.0
+        if cls.get(ttl) and sums.get(ttl, 0.0) > 0:
+            p += cls[ttl] / tot * bwt / sums[ttl]
+        if cls.get(None) and s_none > 0:
+            p += cls[None] / tot * bwt * ctx.pi[T][ttl] / s_none
+        out[c] = p
+    return out
+
+
 def _pick_slot(ctx: _Ctx, batch: Batch, slot: dict, rng, *, profile, used_refs: list, k: int) -> dict:
+    """一个槽位抽主牌和它的备牌。h / e 槽: 一篇参考帖用不上(它那一圈的格子全被去重挡了)就换下一篇, 都用不上才按 w 发
+    —— 不为了用上某一篇参考帖去放宽 L1(复审: L1 只在 w / x 槽正权重的格子不到 3 个时放宽, 那只在重度 pin 时出现;
+    pin 时整批都是 pin 槽, 没有 h / e)。h / e 的 p 是格子在槽位里的边际概率(对所有可能挑中的参考帖求和)。"""
     f, src = slot["f"], slot["src"]
     st = ctx.state
     res: dict = {"slot": slot, "src": src, "picks": [], "ref": None, "reuse": 0, "l1": None, "reference": None}
@@ -673,20 +782,22 @@ def _pick_slot(ctx: _Ctx, batch: Batch, slot: dict, rng, *, profile, used_refs: 
         anchors = hit_anchors(profile)
         tried: list = []
         while True:
-            anchor, p_ref, reuse = pick_reference(
+            anchor, _p_ref, reuse = pick_reference(
                 anchors, rng, ref_age=st.get("ref_age"), cooldown_days=ctx.params["hit_cooldown_days"],
                 in_batch=list(used_refs) + tried, prefer=lambda e: e.get(F) == f)
             if anchor is None:
                 break
-            chain = _h_chain(ctx, batch, f, anchor, rng, False)
-            l1 = None
-            if not chain and ctx.has_soft:
-                chain, l1 = _h_chain(ctx, batch, f, anchor, rng, True), "relaxed"
+            chain = _h_chain(ctx, batch, f, anchor, rng)
             if chain:
                 base = _scan(ctx, batch, f, "x", rng, es=False)           # pu 的分母: 这个槽位的试新分布
                 sdb = base["sdb"] or 1.0
-                res["picks"] = [(c, p_ref * pc, dd / sdb) for c, pc, dd in chain[:k]]
-                res.update(ref=anchor["ref"], reuse=reuse, l1=l1, reference={
+                if reuse:                                                    # 全在冷却里, 重用最久没用的: 定死的那一篇
+                    first = _h_first(ctx, batch, f, anchor)
+                    probs = {c: first.get(c, 0.0) for c, _pc, _dd in chain[:k]}
+                else:
+                    probs = _h_marginal(ctx, batch, f, anchors, ref_age=st.get("ref_age"), used_refs=used_refs)
+                res["picks"] = [(c, probs.get(c, 0.0), dd / sdb) for c, _pc, dd in chain[:k]]
+                res.update(ref=anchor["ref"], reuse=reuse, reference={
                     "kind": "hit", "own": bool(anchor.get("own")), "age_days": anchor.get("age_days"),
                     "title_structure": anchor.get(T), "desc": dict(anchor.get("desc") or {})})
                 return res
@@ -696,19 +807,23 @@ def _pick_slot(ctx: _Ctx, batch: Batch, slot: dict, rng, *, profile, used_refs: 
         pool = ext_refs(profile)
         tried = []
         while True:
-            ref, p_ref, reuse = pick_reference(
+            ref, _p_ref, reuse = pick_reference(
                 pool, rng, ref_age=st.get("ref_age"), cooldown_days=ctx.params["ext_cooldown_days"],
                 in_batch=list(used_refs) + tried)
             if ref is None:
                 break
-            t_ref = ref.get(T) if ref.get(T) in VALUES[T] else None
-            if t_ref is not None and T in ctx.pin and ctx.pin[T] != t_ref:
-                t_ref = None
-            out = _scan_relaxing(ctx, batch, f, "e", rng, t_only=t_ref, k=k)
+            t_ref = _e_title(ctx, ref)
+            out = _scan(ctx, batch, f, "e", rng, t_only=t_ref, k=k)
             if out["sw"] > 0:
                 sdb = out["sdb"] or 1.0
-                res["picks"] = [(c, p_ref * w / out["sw"], dd / sdb) for c, w, dd in out["top"]]
-                res.update(ref=ref["ref"], reuse=reuse, l1=out.get("l1"), reference={
+                cells = [c for c, _w, _dd in out["top"]]
+                if reuse:
+                    probs = {c: w / out["sw"] for c, w, _dd in out["top"]}
+                else:
+                    probs = _e_marginal(ctx, batch, f, pool, cells, ref_age=st.get("ref_age"), used_refs=used_refs,
+                                        rng=rng)
+                res["picks"] = [(c, probs.get(c, 0.0), dd / sdb) for c, _w, dd in out["top"]]
+                res.update(ref=ref["ref"], reuse=reuse, reference={
                     "kind": "external", "title_structure": t_ref, "posted_days_ago": ref.get("posted_days_ago"),
                     "comments_per_day": ref.get("velocity"), "desc": dict(ref.get("desc") or {})})
                 return res
@@ -769,12 +884,12 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
                 used_refs.append(r["ref"])
         results.append(r)
 
-    cands: list[dict] = []
     seen: set = set()
     by_key: dict = {}
     unmapped = (state.get("unmapped_keys") or {}) if (state.get("ok") and params["l1"]) else {}
+    pp = (profile or {}).get("pp")
 
-    def push(cell, *, i, src, sp, p, pu, g=0, ref=None, reuse=0, l1=None, reference=None) -> str | None:
+    def make(cell, *, i, src, sp, p, pu, g=0, ref=None, reuse=0, l1=None, reference=None) -> dict | None:
         dims = cell_dims(cell)
         key = angle_key(dims)
         if key in seen or key in unmapped:
@@ -782,6 +897,8 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
         seen.add(key)
         d = dict(base)
         d.update(i=i, src=src, sp=sp, p=_sig3(p), pu=_sig3(pu), pv=_pv(cell, ctx.pi), st=stage, ps=ps, dd=dd_mode)
+        if pp and pp != "live":
+            d["pp"] = pp                                    # 项目块是旧的 / 只有对照表 / 没有(复审: 分析时分得出来)
         if g:
             d["g"] = 1
         if ref:
@@ -794,48 +911,94 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
             d["l1"] = l1
         d.update(extra_keys)
         dims["_draw"] = d
-        cands.append({"angle_key": key, "dims": dims})
         by_key[key] = {"src": src, "i": i, "ref": ref, "reference": reference}
-        return key
+        return {"angle_key": key, "dims": dims}
 
+    prim_cands: list[dict] = []
     primaries = []
+    final = Batch(n, n_nonx, ctx.pi, pinned=pin, params=params)      # 整批定下来之后的 B: 重发的几张 + 全部主牌
+    for c in seeds:
+        final.add(c, "rep")
+    prim_refs: set = set()
     for r in results:
         if not r["picks"]:
             continue
         s = r["slot"]
         sp = s["sp"] if r["src"] == s["src"] else (plan.get("shares") or {}).get("w", 0.0)
         c, p, pu = r["picks"][0]
-        key = push(c, i=s["i"], src=r["src"], sp=sp, p=p, pu=pu, g=s.get("g", 0) if r["src"] == "e" else 0,
-                   ref=r["ref"], reuse=r["reuse"], l1=r["l1"], reference=r["reference"])
-        if key:
-            primaries.append({"i": s["i"], "src": r["src"], "planned": s["src"], "angle_key": key,
+        cand = make(c, i=s["i"], src=r["src"], sp=sp, p=p, pu=pu, g=s.get("g", 0) if r["src"] == "e" else 0,
+                    ref=r["ref"], reuse=r["reuse"], l1=r["l1"], reference=r["reference"])
+        if cand:
+            prim_cands.append(cand)
+            final.add(c, r["src"])
+            if r["ref"]:
+                prim_refs.add(r["ref"])
+            primaries.append({"i": s["i"], "src": r["src"], "planned": s["src"], "angle_key": cand["angle_key"],
                               "dims": cell_dims(c), "ref": r["ref"], "reuse": r["reuse"], "l1": r["l1"],
                               "reference": r["reference"]})
+
+    # ── 备牌和尾巴(复审): RPC 按表的先后取前 n 个能用的 —— 跳过一张主牌(并发发牌刚抢走; 台账读不到时撞上写过的 key),
+    # 顶上来的就是接下来的备牌 / 尾巴, 它不一定是那个槽位自己的备牌。所以每一张备牌都要和【整批】比:
+    #   · 过不了整批的 B(形状、(杠杆, 原型)、同一个格子、杠杆 / 原型封顶, w / h 还有标题封顶)的不进表;
+    #   · 带着某张主牌的参考帖的不进表(L5: 一篇参考帖一批只出一张 —— e / h 槽自己的备牌因此都不进表);
+    #   · 和前面的备牌撞形状 / (杠杆, 原型) / 参考帖的排到后面一档。
+    # RPC 顶上来的几张都在第一档里时(第一档有上百张, 一次发牌至多 30 张), 不管跳过了几张, 一批之内形状和 (杠杆, 原型)
+    # 都不重复; 只跳一张时封顶也守得住。
+    tier1: list[dict] = []
+    tier2: list[dict] = []
+    b_sig: set = set()
+    b_pair: set = set()
+    b_ref: set = set()
+
+    def push_backup(cell, *, src, ref=None, **kw) -> bool:
+        if ref and ref in prim_refs:
+            return False
+        if b_factor(cell, final, src) <= 0:
+            return False
+        lev, arc, fmt, ttl = cell
+        sig, pair = (fmt, ttl, arc), (lev, arc)
+        clash = ((final.sigma_ban and sig in b_sig) or (final.pair_ban and pair in b_pair)
+                 or (ref is not None and ref in b_ref))
+        cand = make(cell, i=0, src=src, ref=ref, **kw)
+        if cand is None:
+            return False
+        if clash:
+            tier2.append(cand)
+        else:
+            tier1.append(cand)
+            b_sig.add(sig)
+            b_pair.add(pair)
+            if ref:
+                b_ref.add(ref)
+        return True
+
     for j in range(1, k):                                   # 备牌: 每个槽位第 j 名, 轮流排
         for r in results:
             if len(r["picks"]) > j:
                 s = r["slot"]
                 sp = s["sp"] if r["src"] == s["src"] else (plan.get("shares") or {}).get("w", 0.0)
                 c, p, pu = r["picks"][j]
-                push(c, i=0, src=r["src"], sp=sp, p=p, pu=pu, ref=r["ref"], reuse=r["reuse"], l1=r["l1"],
-                     reference=r["reference"])
+                push_backup(c, src=r["src"], sp=sp, p=p, pu=pu, ref=r["ref"], reuse=r["reuse"], l1=r["l1"],
+                            reference=r["reference"])
 
     n_req = max(int(plan.get("n") or len(slots)), 1)
     want = min(max(params["tail_mult"] * n_req, params["tail_min"]), params["tail_cap"])
-    if slots and len(cands) < want:
-        _tail(ctx, rng, want - len(cands), seen, unmapped, push, pin=pin,
+    have = len(prim_cands) + len(tier1) + len(tier2)
+    if slots and have < want:
+        _tail(ctx, rng, want - have, push_backup, pin=pin,
               sp=(plan.get("shares") or {}).get("pin" if pin else "w", 1.0))
+    cands = prim_cands + tier1 + tier2
 
     meta = {"batch": b, "dd": dd_mode, "stage": stage, "ps": ps, "plan": {k_: plan.get(k_) for k_ in (
         "n", "stage", "ext_ok", "hit_ok", "guaranteed_ext", "shares", "counts", "formats")},
         "primaries": primaries, "short": sum(1 for r in results if not r["picks"]),
-        "by_key": by_key, "n_candidates": len(cands)}
+        "by_key": by_key, "n_candidates": len(cands), "backups": [len(tier1), len(tier2)]}
     return cands, meta
 
 
-def _tail(ctx: _Ctx, rng, need: int, seen: set, unmapped: dict, push, *, pin, sp) -> None:
-    """尾巴(§2.7 第 3 步): w 分布在全部配额形式上的接续 —— 权重 π_f·π_lev·π_arc·π_ttl·D·R(不带 B), ES 排序, 跳过已在表里的。
-    只给 RPC 在主牌 / 备牌都被并发发牌抢走时兜底, 很少被预留到。"""
+def _tail(ctx: _Ctx, rng, need: int, push, *, pin, sp) -> None:
+    """尾巴(§2.7 第 3 步): w 分布在全部配额形式上的接续 —— 权重 π_f·π_lev·π_arc·π_ttl·D·R, ES 排序; push 跳过已在表里的、
+    过不了整批 B 的(见 build_candidates 的备牌说明)。只给 RPC 在主牌 / 备牌都被并发发牌抢走时兜底, 很少被预留到。"""
     pi = ctx.pi
     fmts = ctx.vals[F] if F in ctx.pin else tuple(v for v in VALUES[F] if pi[F][v] > 0)
     rnd, log = rng.random, math.log
@@ -858,7 +1021,7 @@ def _tail(ctx: _Ctx, rng, need: int, seen: set, unmapped: dict, push, *, pin, sp
     for _key, cell, w, db in items:
         if added >= need:
             break
-        if push(cell, i=0, src=src, sp=sp, p=w / sw, pu=db / sdb):
+        if push(cell, src=src, sp=sp, p=w / sw, pu=db / sdb):
             added += 1
 
 
