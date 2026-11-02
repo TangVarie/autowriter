@@ -784,9 +784,9 @@ DRAW_PROFILE_BUDGET_S = 2.5
 REPEAT_MAX = dp.MAX_REPEAT
 DRAW_CLAMPED_NOTE = "一次最多发 {max} 篇的坐标, 这次按 {max} 篇发; 还要就写完这批再发一次。"
 # repeat_of 点的 key 还有一张没用掉的牌(review round 2 on aw#140): 不重发, 叫模型直接用原来那张卡
-REPEAT_NOT_USED_YET = ("「{key}」这张卡发出去之后还没用过(还没有稿子带着它存档), 不用重写一次: 直接照原来那张卡写, "
-                       "查重和存档时带原来那张卡的 angle_key「{key}」就行。这次还要别的角度的话, 把它从 repeat_of 里去掉"
-                       "再发一次。")
+REPEAT_NOT_USED_YET = ("「{key}」这张卡发出去之后还没用过(还没有稿子带着它存档), 不用重写一次: 直接照原来那张卡写"
+                       "(卡上的四个维度在这次返回的 dims 里), 查重和存档时带原来那张卡的 angle_key「{key}」就行。"
+                       "这次还要别的角度的话, 把它从 repeat_of 里去掉再发一次。")
 
 
 def draw_policy() -> str:
@@ -843,7 +843,9 @@ def _repeat_items(client, project_id: str, repeat_of, n: int) -> tuple[list, dic
                 "repeat_of_invalid",
                 f"「{k}」不是这个项目发过的坐标, 只能点名这个项目自己的 angle_key(原样抄, 不改)。", n, key=k)
         if src.get("open"):
-            return [], _draw_error("repeat_of_invalid", REPEAT_NOT_USED_YET.format(key=k), n, key=k)
+            # 带上那张卡的四个维度: 卡不在模型手边(新开的对话、超过角度债那一周、别人抽的)也能照着写(复审 on aw#140)
+            return [], _draw_error("repeat_of_invalid", REPEAT_NOT_USED_YET.format(key=k), n, key=k,
+                                   dims=dict(store.public_dims(dims)))
         items.append((k, dims))
     return items, None
 

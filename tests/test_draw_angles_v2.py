@@ -347,6 +347,7 @@ def test_repeat_of_a_card_not_yet_used_is_an_error_and_the_original_stays_the_on
     assert out.get("error") == "repeat_of_invalid", out.get("error")
     assert out["delivered"] == 0 and out["angles"] == [] and out["key"] == key
     assert key in out["message"] and "还没用" in out["message"] and "不用重写" in out["message"]
+    assert out["dims"] == dims, "带上原来那张卡的四个维度, 卡不在手边也能照着写"
     assert not w.client.rpc_calls and not w.inserts(), "报错就什么都不写"
     _assert_writer_safe(out, "repeat_of not yet used")
     assert [r["id"] for r in w.client.rows["angle_ledger"] if r["angle_key"] == key] == ["l1"]
