@@ -242,6 +242,11 @@ UNGATED_WITH_REASON = {
                               "话题 / 评论 / 方向, 失败只记 WARN",
     "_whole_batch_delivery":  "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 读改稿挂的旧 batch, "
                               "store.batch_drafts 按 project_id 过滤, 别的项目的 batch 查不出来",
+    # 外部审计 11-02(2026-11-02)
+    "_caller_version_problems": "F05: 只被已过闸的 commit_drafts 调, 只读; 本身就是一道版本级的归属核对 —— 调用方自带的 "
+                                "version_id 经 store.items_for_versions(inner join 钉死项目)核, 别的项目的查不出来、按拒处理",
+    "_note_patterns_shown":   "F13: 借卡交出去之后把给了几条规律记进进程内存(不读写库), 只被已过闸的 borrow_lessons / "
+                              "build_writing_brief(经 _borrow_for_brief_bounded)调",
 }
 
 

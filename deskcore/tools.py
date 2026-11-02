@@ -730,7 +730,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     重新走 check_drafts; 用户看过撞的是哪一条还是坚持要用, 就原样交给他, 用一句话告诉他这篇不会存进写作台的历史稿
     (``note`` 里也是这句; 分给它的牌没销账是你这边的事, 不用跟用户提)。这两种之外的不是撞车, 稿子不用重写:
     ``gate="replace_lookup"`` 是 ``replaces_version_id`` 对不上, 改对 id 再调一次; ``gate="empty_body"`` 是这篇的
-    ``body`` 是空的(正文放错了字段), 把正文放进 ``body`` 原样再调一次本工具。``gate_summary`` 里该告诉用户的(semantic_degraded / empty_history_warning)
+    ``body`` 是空的(正文放错了字段), 把正文放进 ``body`` 原样再调一次本工具; ``gate="version_lookup"`` 是稿子上带了本项目里
+    查不到的 ``version_id``, 新稿去掉它、改稿换成 ``replaces_version_id``, 再调一次。``gate_summary`` 里该告诉用户的(semantic_degraded / empty_history_warning)
     照 check_drafts 的规矩说。
 
     **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零就是有几条没带 —— 那几个角度没销账,
@@ -1083,6 +1084,9 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
     except core.rulecheck.CheckError as exc:
         # check 写错是参数问题(400), 不是服务坏了(500): 500 会让模型拿同一个 check 一直重试
         raise InvalidInput(f"check 写错了, 这条规则没记: {exc}") from exc
+    except core.RuleInputError as exc:
+        # 方向档 / 原文 / 档位写错同理(外部审计 11-02 F06): 校验都在写库之前, 报这个时一行没写
+        raise InvalidInput(f"这条规则没记: {exc}") from exc
     # 2026-10-30 复审: 不再带 archive_pending(W-29 原来带, 理由是记规则多半是看了稿给的反馈、改完的稿子同样要存档)。团队共用
     # 一个身份, 一场只说了「以后别用感叹号」的对话也会拿到队友没存的牌和「都存完再给用户看」; 而这场真抽了牌的, 改完的稿子
     # 照样要过 check_drafts(带 angle_key), 提醒在那里一样到。

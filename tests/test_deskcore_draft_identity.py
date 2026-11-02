@@ -132,13 +132,25 @@ def test_rejected_drafts_get_no_identity():
     assert len(c.rows["versions"]) == 1
 
 
+def _seed_version(c, vid: str, project_id: str = PROJ) -> None:
+    """库里本来就有的一版(UI 生成的稿): batches → items → versions, 嵌好 items_for_versions 要的那层(假库没有真 join)。"""
+    bid, iid = f"batch-{vid[:8]}-{project_id[-4:]}", f"item-{vid[:8]}-{project_id[-4:]}"
+    c.rows.setdefault("batches", []).append({"id": bid, "project_id": project_id})
+    c.rows.setdefault("items", []).append({"id": iid, "batch_id": bid, "status": "pending", "decision_source": None})
+    c.rows.setdefault("versions", []).append({
+        "id": vid, "item_id": iid, "version_num": 1, "title": "UI 生成的那版", "body": "",
+        "items": {"id": iid, "status": "pending", "decision_source": None, "batch_id": bid,
+                  "batches": {"project_id": project_id}}})
+
+
 def test_caller_supplied_version_id_is_not_re_minted():
     """稿子是 UI 生成的(库里本来就有那一版)时, 不重新造 id、也不再建一遍身份。"""
-    c = _client()
     existing = "99999999-9999-9999-9999-999999999999"
+    c = _client()
+    _seed_version(c, existing)
     out = _commit(c, [{**DRAFT, "version_id": existing}])
     assert out["version_ids"] == []
-    assert not c.rows.get("versions")
+    assert [v["id"] for v in c.rows["versions"]] == [existing], "没再建一遍身份: 只有本来就有的那一版"
     assert _rpc_rows(c)[0]["version_id"] == existing
 
 
@@ -280,9 +292,82 @@ def test_caller_supplied_version_id_still_consumes_when_nothing_was_minted():
     c = _client(angle_ledger=[
         {"id": "led-1", "project_id": PROJ, "angle_key": "K1", "consumed_version_id": None, "consumed_at": None},
     ])
+    _seed_version(c, existing)
     out = _commit(c, [{**DRAFT, "version_id": existing, "angle_key": "K1"}])
     assert out["consumed_angles"] == 1
     assert c.rows["angle_ledger"][0]["consumed_version_id"] == existing
+
+
+# ── 自带的 version_id 先按本项目核(外部审计 11-02 F05, 2026-11-02) ───────────────────────────────────
+# 以前照单全收: 一个编出来的 UUID → written=1、销了 1 张牌、0 行 versions, 指纹和台账都挂在不存在的版本名下, identity_warning
+# 也没有(审计复现 probes/test_probe_f05.py)。现在核不上的进 rejected(gate=version_lookup): 不写指纹、不销牌、不算 written。
+
+OTHER_PROJ = "bbbbbbbb-0000-0000-0000-000000000002"
+GHOST = "12345678-1234-1234-1234-123456789abc"
+
+
+def _ledger_client():
+    c = _client(angle_ledger=[
+        {"id": "l1", "project_id": PROJ, "angle_key": "K1", "consumed_version_id": None, "consumed_at": None}])
+    c.rpc_impl["deskcore_commit_fingerprints"] = lambda args: pytest.fail("核不上的 id 进了写指纹的 RPC")
+    return c
+
+
+@pytest.mark.parametrize("key, vid", [
+    ("version_id", GHOST),                                   # 库里没有(审计复现那条)
+    ("version_id", "99999999-9999-9999-9999-999999999999"),  # 别的项目的
+    ("version_id", "not-a-uuid"),                            # 不是 UUID: 不送进查询
+    ("_source_autowriter_version_id", GHOST),                # 补录表那一列的写法, 同样核
+])
+def test_an_unknown_or_foreign_version_id_is_rejected_and_nothing_is_written(key, vid):
+    c = _ledger_client()
+    _seed_version(c, "99999999-9999-9999-9999-999999999999", project_id=OTHER_PROJ)
+    out = core.commit_drafts(c, PROJ, [{**DRAFT, key: vid, "angle_key": "K1"}], user_id=ME)
+    assert (out["written"], out["consumed_angles"], out["version_ids"]) == (0, 0, [])
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "version_lookup")]
+    assert key in out["rejected"][0]["reason"] and "replaces_version_id" in out["rejected"][0]["reason"]
+    assert "version_id" in out["note"] and "不用重写" in out["note"]
+    assert c.rows["angle_ledger"][0]["consumed_version_id"] is None, "牌销给了一个不存在 / 别人的版本"
+    assert not c.rows.get("draft_fingerprints") and "identity_warning" not in out
+    assert not [b for b in c.rows.get("batches", []) if b.get("project_id") == PROJ], "没东西入库, 不该建 batch"
+    assert c.rows["batch_metrics"][0]["meta"]["rejected_by"] == {"version_lookup": 1}
+
+
+def test_only_the_draft_with_the_bad_id_is_rejected():
+    """一批里只有一篇带错 id: 那篇拒, 其余照常存、照常销牌; 指纹 / 台账里只有真建出来的那一版。"""
+    c = _client(angle_ledger=[
+        {"id": "l1", "project_id": PROJ, "angle_key": "K1", "consumed_version_id": None, "consumed_at": None},
+        {"id": "l2", "project_id": PROJ, "angle_key": "K2", "consumed_version_id": None, "consumed_at": None}])
+    out = _commit(c, [{**DRAFT, "version_id": GHOST, "angle_key": "K1"},
+                      {"title": "标题二", "body": "另一篇正文, 和第一篇不一样的内容", "angle_key": "K2"}])
+    assert out["written"] == 1 and out["consumed_angles"] == 1 and len(out["version_ids"]) == 1
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "version_lookup")]
+    assert [r["version_id"] for r in _rpc_rows(c)] == out["version_ids"]
+    led = {r["angle_key"]: r["consumed_version_id"] for r in c.rows["angle_ledger"]}
+    assert led == {"K1": None, "K2": out["version_ids"][0]}
+
+
+def test_a_known_source_autowriter_version_id_changes_nothing():
+    """_source_autowriter_version_id 核得上(本项目的)就照旧: 存档只认 version_id, 这篇当新稿存、分配新 id。"""
+    existing = "99999999-9999-9999-9999-999999999999"
+    c = _client()
+    _seed_version(c, existing)
+    out = _commit(c, [{**DRAFT, "_source_autowriter_version_id": existing}])
+    assert out["written"] == 1 and out["rejected"] == [] and len(out["version_ids"]) == 1
+    assert out["version_ids"][0] != existing and _rpc_rows(c)[0]["version_id"] == out["version_ids"][0]
+
+
+def test_a_failed_version_lookup_raises_before_anything_is_written(monkeypatch):
+    """核不了就不能当作核过: 查库失败上抛(拿锁之前, 什么都还没写), 调用方重试。"""
+    c = _ledger_client()
+
+    def boom(*a, **k):
+        raise RuntimeError("versions 查询 57014 canceling statement due to statement timeout")
+    monkeypatch.setattr(store, "items_for_versions", boom)
+    with pytest.raises(RuntimeError, match="57014"):
+        core.commit_drafts(c, PROJ, [{**DRAFT, "version_id": GHOST, "angle_key": "K1"}], user_id=ME)
+    assert not c.rows.get("draft_fingerprints") and c.rows["angle_ledger"][0]["consumed_version_id"] is None
+    assert not c.rows.get("batches") and not c.rows.get("batch_metrics")
 
 
 def test_a_failed_version_insert_leaves_no_orphan_item():
@@ -577,10 +662,16 @@ def test_a_replacement_that_also_carries_version_id_is_rejected_before_anything_
     c = _client()
     v1 = _commit(c, [{"title": "秋招等回音", "body": BODY_X}], rpc=_rpc_that_writes(c))["version_ids"][0]
     _embed(c)
+    # version_id 是本项目的(这里拿 v1 自己): 过了 F05 的核对, 由替换那一道拒
     out = _commit(c, [{"title": "改稿", "body": BODY_X2, "replaces_version_id": v1,
-                       "version_id": "12345678-0000-0000-0000-000000000000"}], rpc=_rpc_that_writes(c))
+                       "version_id": v1}], rpc=_rpc_that_writes(c))
     assert out["written"] == 0 and out["rejected"][0]["gate"] == "replace_lookup"
     assert "不能同时带 version_id" in out["rejected"][0]["reason"]
+    assert set(_fps(c)) == {v1} and len(c.rows["versions"]) == 1
+    # version_id 库里没有(外部审计 11-02 F05): 先按 version_lookup 拒, 一篇只报一个原因; 同样什么都没动(旧指纹没摘)
+    out = _commit(c, [{"title": "改稿", "body": BODY_X2, "replaces_version_id": v1,
+                       "version_id": "12345678-0000-0000-0000-000000000000"}], rpc=_rpc_that_writes(c))
+    assert out["written"] == 0 and [r["gate"] for r in out["rejected"]] == ["version_lookup"]
     assert set(_fps(c)) == {v1} and len(c.rows["versions"]) == 1
 
 

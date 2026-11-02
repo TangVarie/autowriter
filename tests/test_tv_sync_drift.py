@@ -363,17 +363,70 @@ def test_an_emptied_tv_body_leaves_the_link_alone(rematch):
     assert out["drift"]["no_body_kept"] == 1 and _link(c, "n1") == before and not c.tv_calls["clear"]
 
 
-def test_a_weak_title_match_that_rematches_to_the_same_version_is_kept_then_quiet():
-    """10-27 生产库 TUGE 那条: title_exact、当初就只有 0.076 的包含度。重对还是同一版 —— 留着、记指纹, 第二晚不再动。"""
+def _weak_title_legacy(*, fp: bool = False) -> tuple[list[dict], FakeClient]:
+    """10-27 生产库途鸽那条的样子: title_exact、当初就只有 0.076 的包含度, 回填进了 TV, 有一条按当前口径算的改动差异。"""
+    notes = [_note("n1", "秋招投了六十份", BODY_TENNIS,
+                   source_autowriter_version_id="v1", source_autowriter_item_id="i1")]
     legacy = {"note_id": "n1", "tv_project_id": TV, "project_id": P1, "version_id": "v1", "item_id": "i1",
-              "match_kind": "title_exact", "score": 0.076, "lag_days": 2, "updated_at": OLD_TS}
-    notes = [_note("n1", "秋招投了六十份", BODY_TENNIS)]
-    c = _tv(notes, links=[dict(legacy)])
+              "match_kind": "title_exact", "score": 0.076, "lag_days": 2, "updated_at": OLD_TS,
+              "synced_to_tv_at": OLD_TS,
+              "tv_text_fp": tvlink.text_fp(tvlink.Note.from_row(notes[0])) if fp else None}
+    c = _tv(notes, links=[legacy])
+    c.rows["tv_edit_diffs"] = [{"note_id": "n1", "tv_project_id": TV, "project_id": P1, "version_id": "v1",
+                                "match_kind": "title_exact", "diff_rev": tvlink.DIFF_REV, "computed_at": OLD_TS}]
+    return notes, c
+
+
+@pytest.mark.parametrize("fp_known", [False, True], ids=["first-night", "text-unchanged"])
+def test_a_weak_title_match_is_moved_off_its_version_and_our_lineage_cleared(fp_known):
+    """外部审计 11-02 F04。以前: 重对还是经标题档对回 v1, 留着、记指纹, 第二晚不再动 —— 一条只有标题一样的对照永远挂着
+    (血缘在 TV 里、差异进摘要)。现在: TV 的字变没变都按内容重对; 内容也对不上 → ambiguous, v1 只作为"只有标题一样"的候选
+    (WEAK_TITLE_KEY)列着, 不算还对回原来那版; 我们写进 TV 的血缘撤回, 差异降回旧口径。第二晚稳定在 ambiguous, 不再挪。"""
+    notes, c = _weak_title_legacy(fp=fp_known)
+    out = core.tv_sync(c, TV, write_tv=True)
+    dr = out["drift"]
+    assert dr["weak_title"] == 1 and dr["relinked"] == 1 and dr["tv_cleared"] == 1 and dr["kept_after_rematch"] == 0
+    assert c.tv_calls["clear"][-1] == [{"note_id": "n1", "version_id": "v1", "item_id": "i1"}]
+    l = _link(c, "n1")
+    assert l["match_kind"] == "ambiguous" and l["version_id"] is None
+    assert "F04" in l["candidates"][0]["note"] and "v1" in l["candidates"][0]["note"]
+    assert not core._pinned(l), "F04 那句备注不能把对照钉死"
+    assert [(cd["version_id"], cd.get(tvlink.WEAK_TITLE_KEY)) for cd in l["candidates"][1:]] == [("v1", True)]
+    assert _lineage(notes, "n1") == (None, None), "TV 不再说它来自 v1"
+    assert _diff(c, "n1")["diff_rev"] == 0, "那条 2697 → 188 字的差异降回旧口径, 摘要读不到"
+    assert out["counts"]["ambiguous"] == 1 and sum(out["counts"].values()) == out["notes"]
+    assert any(s["note_id"] == "n1" and "F04" in s["why"] for s in dr["samples"])
+    assert [s["note_id"] for s in out["ambiguous_samples"]] == ["n1"], "周检看得到"
+
+    again = core.tv_sync(c, TV, write_tv=True)
+    assert again["drift"]["weak_title"] == 0 and again["drift"]["relinked"] == 0
+    assert _link(c, "n1")["match_kind"] == "ambiguous" and _lineage(notes, "n1") == (None, None)
+
+
+def test_a_weak_title_match_without_write_tv_waits_and_its_diff_is_quarantined():
+    """没开 --write-tv 撤不了 TV 的血缘: 不挪(否则明晚又被 TV 的旧血缘拽回 v1), 差异先隔离, 每晚报出来。"""
+    notes, c = _weak_title_legacy()
     out = core.tv_sync(c, TV)
-    assert out["drift"]["kept_after_rematch"] == 1 and out["drift"]["relinked"] == 0
-    assert _link(c, "n1")["version_id"] == "v1" and _link(c, "n1")["tv_text_fp"]
-    again = core.tv_sync(c, TV)
-    assert again["links_written"] == 0 and again["drift"]["kept_after_rematch"] == 0
+    assert out["drift"]["weak_title"] == 1 and out["drift"]["deferred"] == 1 and out["drift"]["relinked"] == 0
+    assert _link(c, "n1")["version_id"] == "v1" and _lineage(notes, "n1") == ("v1", "i1")
+    assert _diff(c, "n1")["diff_rev"] == 0
+
+
+def test_title_only_and_body_backed_title_links_are_left_alone():
+    """F04 只动"两边正文都够长、却不像"的: 写作台那版只有标题的(HATHERINE 59 条)、正文沾得上边的, 字没变照旧跳过。"""
+    notes = [_note("n1", "秋招投了六十份", BODY_TENNIS), _note("n2", "自我介绍删了前三句", BODY_C)]
+    links = [{"note_id": "n1", "tv_project_id": TV, "project_id": P1, "version_id": "v-title", "item_id": "i-title",
+              "match_kind": "title_exact", "score": 0.0, "lag_days": 2, "updated_at": OLD_TS, "synced_to_tv_at": OLD_TS,
+              "tv_text_fp": tvlink.text_fp(tvlink.Note.from_row(notes[0]))},
+             {"note_id": "n2", "tv_project_id": TV, "project_id": P1, "version_id": "v2", "item_id": "i2",
+              "match_kind": "title_exact", "score": 1.0, "lag_days": 2, "updated_at": OLD_TS, "synced_to_tv_at": OLD_TS,
+              "tv_text_fp": tvlink.text_fp(tvlink.Note.from_row(notes[1]))}]
+    c = _tv(notes, links=links)
+    _add_version(c, "v-title", "i-title", "秋招投了六十份", "")
+    before = [dict(l) for l in c.rows["tv_note_links"]]
+    out = core.tv_sync(c, TV, write_tv=True)
+    assert out["drift"]["weak_title"] == 0 and out["counts"]["already_linked"] == 2
+    assert c.rows["tv_note_links"] == before and not c.tv_calls["clear"]
 
 
 def test_rematch_that_cannot_tell_two_versions_apart_keeps_the_old_one():

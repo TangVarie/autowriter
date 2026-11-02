@@ -112,6 +112,7 @@ def _commit(monkeypatch):
 @pytest.fixture
 def fresh_arms(monkeypatch):
     monkeypatch.setattr(core, "_borrowed_arms", {})
+    monkeypatch.setattr(core, "_patterns_shown", {})        # F13: 记在臂旁边的「给出去几条规律」跟着一起清
     # 进程「早就起来了」: 用例里的借卡记录就是全部, 不落进「重启前那一段核对不了」(W-31 复审, 那条用例自己改它)
     monkeypatch.setattr(core, "_ARMS_SINCE", datetime(2000, 1, 1, tzinfo=timezone.utc))
 
@@ -122,7 +123,8 @@ def test_borrow_and_commit_use_the_same_arm(monkeypatch, fresh_arms):
     monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
     core.borrow_lessons(_client(), PID, user_id=ME)
 
-    assert _commit(monkeypatch) == {"source": "deskcore", "flywheel_arm": "explore", "flywheel_arm_source": "borrow"}
+    assert _commit(monkeypatch) == {"source": "deskcore", "flywheel_arm": "explore", "flywheel_arm_source": "borrow",
+                                    "flywheel_patterns_shown": 0}
     assert list(seen) == [(PID, ME)], "借卡和入库按同一个 (项目, 写手) 算臂"
 
 
@@ -159,7 +161,8 @@ def test_commit_without_a_recent_borrow_recomputes_and_says_so(monkeypatch, fres
     monkeypatch.setattr(core, "_utcnow", lambda: now)
     params = _commit(monkeypatch)
     assert params == {"source": "deskcore", "flywheel_arm": core.flywheel_arm(PID, ME, now=now),
-                      "flywheel_arm_source": "recomputed"}, "没借过卡 (或进程重启过) 要标出来, 分析时能剔掉"
+                      "flywheel_arm_source": "recomputed", "flywheel_patterns_shown": None}, \
+        "没借过卡 (或进程重启过) 要标出来, 分析时能剔掉; 给出去几条规律也不知道 (F13: null, 不是 0)"
 
     monkeypatch.setattr(core, "_utcnow", lambda: now - timedelta(hours=40))
     monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
@@ -359,7 +362,8 @@ def test_a_follow_up_borrow_after_midnight_keeps_the_session_arm(monkeypatch, fr
     monkeypatch.setattr(core, "_utcnow", lambda: after)
     out = core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm)
     assert out["flywheel_arm"] == arm and fake.briefs[-1]["explore"] is (arm == "explore")
-    assert core.batch_arm(PID, ME) == (arm, "borrow", None), "沿用的臂也记进「最近一次借卡」"
+    assert core.batch_arm(PID, ME) == (arm, "borrow", None, 1 if arm == "patterns" else 0), \
+        "沿用的臂也记进「最近一次借卡」"
     assert core.borrow_lessons(_client(), PID, user_id=ME)["flywheel_arm"] != arm, "不传就按当天重新分"
 
 
@@ -414,7 +418,7 @@ def test_an_arm_the_server_never_issued_is_overridden_by_the_borrow(monkeypatch,
 
     out, params, meta = _commit_out(monkeypatch, flywheel_arm="patterns")
     assert params == {"source": "deskcore", "flywheel_arm": "explore", "flywheel_arm_source": "borrow",
-                      "flywheel_arm_reported": "patterns"}
+                      "flywheel_arm_reported": "patterns", "flywheel_patterns_shown": 0}
     assert (meta["flywheel_arm"], meta["flywheel_arm_source"], meta["flywheel_arm_reported"]) == \
         ("explore", "borrow", "patterns"), "batch_metrics.meta 是分析对照组的第二份记录, 也要有"
     corr = out["flywheel_arm_corrected"]
@@ -427,7 +431,8 @@ def test_an_arm_the_server_did_issue_is_kept_and_nothing_is_flagged(monkeypatch,
     monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
     core.borrow_lessons(_client(), PID, user_id=ME)
     out, params, meta = _commit_out(monkeypatch, flywheel_arm="patterns")
-    assert params == {"source": "deskcore", "flywheel_arm": "patterns", "flywheel_arm_source": "brief"}
+    assert params == {"source": "deskcore", "flywheel_arm": "patterns", "flywheel_arm_source": "brief",
+                      "flywheel_patterns_shown": 1}
     assert "flywheel_arm_corrected" not in out and "flywheel_arm_reported" not in meta
 
 
@@ -453,7 +458,7 @@ def test_a_follow_up_borrow_does_not_reuse_an_arm_it_never_issued(monkeypatch, f
     out = core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm="patterns")
     assert out["flywheel_arm"] == "explore" and fake.briefs[-1]["explore"] is True
     assert out["validated_patterns"] == []
-    assert core.batch_arm(PID, ME, from_brief="patterns") == ("explore", "borrow", "corrected")
+    assert core.batch_arm(PID, ME, from_brief="patterns") == ("explore", "borrow", "corrected", 0)
 
 
 def test_yesterdays_arm_does_not_cover_todays_session(monkeypatch, fresh_arms):
@@ -470,7 +475,7 @@ def test_yesterdays_arm_does_not_cover_todays_session(monkeypatch, fresh_arms):
     assert core.build_writing_brief(_client(), PID, user_id=ME, brief={})["flywheel_arm"] == "explore"
 
     monkeypatch.setattr(core, "_utcnow", lambda: t + timedelta(hours=1))
-    assert core.batch_arm(PID, ME, from_brief="patterns") == ("explore", "borrow", "corrected")
+    assert core.batch_arm(PID, ME, from_brief="patterns") == ("explore", "borrow", "corrected", 0)
     out, params, meta = _commit_out(monkeypatch, flywheel_arm="patterns")
     assert (params["flywheel_arm"], params["flywheel_arm_source"], params["flywheel_arm_reported"]) == \
         ("explore", "borrow", "patterns")
@@ -565,3 +570,92 @@ def test_an_unverifiable_revision_flags_the_old_batch(monkeypatch, fresh_arms, f
     assert flags == want
     assert batch["params"]["flywheel_arm"] == first_arm and batch["params"]["source"] == "deskcore", "原有字段不动"
     assert "flywheel_arm_warning" not in out
+
+
+# ── 分到的臂 ≠ 看到的规律 (外部审计 11-02 F13, 2026-11-02) ──────────────────────────────────────────
+# TV 先算规律、后选卡, 选卡失败 (status=degraded) 时规律照样回来; librarian_client 原来在读 patterns 之前就按降级返回了 ——
+# 这一场模型一条规律都没拿到, 批次却照样记 patterns。现在规律不丢, 而且借卡那一刻实际给出去几条, 记在臂旁边, 入库时写进
+# batches.params / batch_metrics.meta 的 flywheel_patterns_shown (L-07 / G-05 拿 patterns 臂对 explore 比时按它分)。
+
+def _degraded(patterns):
+    def fetch(brief, *, status=None):
+        if status is not None:
+            status.update({"state": lib.BORROW_ERROR, "count": 0, "elapsed_ms": 5,
+                           "detail": "馆员回了 200 但 status=degraded", "patterns": list(patterns)})
+        return []
+    return fetch
+
+
+def test_a_degraded_borrow_keeps_the_patterns_but_still_counts_as_an_error(monkeypatch):
+    """审计复现 (probes/test_probe_f13.py): 降级的回包带着 1 条规律 → 以前 patterns=[]。"""
+    import requests
+    payload = {"selected": [], "status": "degraded", "patterns": [PATTERNS[0], "junk"]}
+    monkeypatch.setattr(config, "LIBRARIAN_URL", "https://example.invalid")
+    monkeypatch.setattr(config, "LIBRARIAN_API_KEY", "k")
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp(payload))
+    st: dict = {}
+    out = lib.fetch_flywheel_lessons({"project_id": "p", "consumer": "deskcore", "explore": False}, status=st)
+    assert out == [] and st["state"] == lib.BORROW_ERROR and st["count"] == 0, "卡照旧是空的、结局照旧是 error"
+    assert st["patterns"] == PATTERNS, "TV 降级时照样给的规律不能丢"
+    st = {}
+    payload["status"] = "error"
+    lib.fetch_flywheel_lessons({"project_id": "p", "consumer": "deskcore", "explore": False}, status=st)
+    assert st["state"] == lib.BORROW_ERROR and st["patterns"] == PATTERNS
+
+
+def test_a_degraded_brief_shows_the_patterns_and_the_commit_records_them(monkeypatch, fresh_arms):
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _degraded(PATTERNS))
+    brief = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    assert brief["lessons"] == [] and brief["lessons_status"]["status"] == lib.BORROW_ERROR
+    assert brief["validated_patterns"] == PATTERNS and "validated_patterns_usage" in brief
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm="patterns")
+    assert params["flywheel_patterns_shown"] == 1 and meta["flywheel_patterns_shown"] == 1
+    assert isinstance(params["flywheel_patterns_shown"], int)
+
+
+def test_a_timed_out_brief_records_that_no_patterns_were_shown(monkeypatch, fresh_arms):
+    """简报超时交出去时一条规律都没带 —— 后台线程之后选完了也不算, 这一场的模型没看到。"""
+    import threading
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(config, "OPEN_PROJECT_BORROW_SEC", 0.01)
+    done = threading.Event()
+
+    def slow(brief, *, status=None):
+        done.wait(2)
+        if status is not None:
+            status.update({"state": lib.BORROW_BORROWED, "count": 1, "elapsed_ms": 900, "detail": "",
+                           "patterns": list(PATTERNS)})
+        return [{"source_note_id": "n1"}]
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", slow)
+    try:
+        brief = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+        assert brief["lessons_status"]["status"] == lib.BORROW_TIMEOUT and "validated_patterns" not in brief
+        assert core.batch_arm(PID, ME, from_brief="patterns") == ("patterns", "brief", None, 0)
+    finally:
+        done.set()
+    import time as _t
+    _t.sleep(0.05)                                   # 后台那次借卡这时跑完了: 不改这一场的记录
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm="patterns")
+    assert params["flywheel_patterns_shown"] == 0 and meta["flywheel_patterns_shown"] == 0
+
+
+def test_a_follow_up_borrow_in_the_same_session_keeps_the_larger_count(monkeypatch, fresh_arms):
+    """简报给过 1 条, 同一场补借 (传回简报里的臂) 降级了、这次 0 条: 模型手里还是那 1 条, 记 1。不传臂的 (新开的一场) 照这次的记。"""
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    arm = core.build_writing_brief(_client(), PID, user_id=ME, brief={})["flywheel_arm"]
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _degraded([]))
+    core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=arm)
+    assert core.batch_arm(PID, ME, from_brief=arm)[3] == 1
+    core.borrow_lessons(_client(), PID, user_id=ME)
+    assert core.batch_arm(PID, ME, from_brief=arm)[3] == 0
+
+
+def test_the_arm_assignment_itself_does_not_change(monkeypatch, fresh_arms):
+    """F13 只多记一个数: 降级、超时、规律条数都不影响分到哪个臂、来源是什么。"""
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _degraded([]))
+    core.borrow_lessons(_client(), PID, user_id=ME)
+    assert core.batch_arm(PID, ME) == ("patterns", "borrow", None, 0)
+    assert core.batch_arm(PID, ME, from_brief="explore")[:3] == ("patterns", "borrow", "corrected")

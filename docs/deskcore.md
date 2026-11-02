@@ -495,7 +495,7 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 |---|---|
 | 新稿、身份建成（`version_ids` 里的） | 判 |
 | 调用方自带 `version_id`（UI 生成的稿，库里本来就有那一版） | **判**。⚠️ 它们**不在** `version_ids` 里（那里只报这次新建的），照 `version_ids` 判会整批漏掉 |
-| 调用方自带的 `version_id` 不是本项目的版本（库里没有 / 别的项目的 / 不是 UUID） | 跳过（`version_not_in_project`）。发之前按本项目核一遍（`store.items_for_versions`，与核 `replaces_version_id` 同一个查询）：`write = true` 会按 subject_id 写账本，过期的 id 留下孤儿答案，别的项目的 id 把这篇的判定记到那个项目名下（codex review P1 on #92）。发的是库里的规范写法。归属查询本身失败的这几篇不发、记 `error`，本次新建的照发 |
+| 调用方自带的 `version_id` 不是本项目的版本（库里没有 / 别的项目的 / 不是 UUID） | 走不到这里（外部审计 11-02 F05，2026-11-02）：`score_drafts` 拿锁之前就按本项目核一遍（`_caller_version_problems`，同一个查询，`_source_autowriter_version_id` 也核），核不上的按 `gate="version_lookup"` 拒掉，不写指纹、不销角度、不算 `written`。以前照单全收：指纹挂在不存在的版本名下、角度销给了它，回包一切正常。判定这边照旧跳过（`version_not_in_project`），只防万一。发之前按本项目核一遍（`store.items_for_versions`，与核 `replaces_version_id` 同一个查询）：`write = true` 会按 subject_id 写账本，过期的 id 留下孤儿答案，别的项目的 id 把这篇的判定记到那个项目名下（codex review P1 on #92）。发的是库里的规范写法。归属查询本身失败的这几篇不发、记 `error`，本次新建的照发 |
 | 改稿替换、新版挂上了旧 item | 判，用新版的 id |
 | `identity_error`：指纹入了库、versions 没建成 | 跳过（`skipped.reason = identity_error`） |
 | 替换没挂上（`replace_warning`） | 跳过（`replace_failed`） |
@@ -975,8 +975,19 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
 （12 小时内）那一场的臂，第二天一早新开的一场传错成它，照收。分析对照组时剔掉 `flywheel_arm_unverified` 和
 `flywheel_arm_mixed` 的批次。
 
+**分到的臂 ≠ 看到的规律（外部审计 11-02 F13，2026-11-02）。** patterns 臂的那一场，借卡超时、馆员降级（`status=degraded`）、
+馆员这次没给规律时，模型手里一条规律都没有，这批却照样记 patterns。降级那一种是写作台自己丢的：TV 先算规律、后选卡，选卡
+失败时规律照样回来，`librarian_client` 原来在看 `patterns` 之前就按降级返回了。现在降级 / `error` 时卡照旧是空的、结局照旧
+`error`，规律照样交给模型。另外借卡交出去之后把**实际给出去几条规律**记在发出去的那个臂旁边（进程内存 `_patterns_shown`，
+同 `_borrowed_arms` 的取舍）：`open_project` 记简报里带的条数（超时 / 借阅线程起不来 = 0，后台线程之后选完了也不算），
+`borrow_lessons` 记这次给的条数，原样传回简报里的臂（同一场接着借）就和前面那次取大的。入库时 `batch_arm` 第四项取出来，
+写进 `batches.params.flywheel_patterns_shown` 和 `batch_metrics.meta.flywheel_patterns_shown`：整数 = 给出去几条（explore 臂
+是 0）；`null` = 服务端不知道（重启过、按入库时重算的臂、记下的那次借卡和最近一次发臂对不上）；没有这个键 = F13 之前的批次。
+臂怎么分一点没变。分析 L-07 / G-05 时 patterns 臂只算 `flywheel_patterns_shown > 0` 的，0 和 `null` 单列一组。W-38 查重底稿
+转正建的 batch 不带这个键（`draft_snapshots` 没有这一列）。
+
 **全拒也留原因。** `batch_metrics.meta` 有被拒的才多几个键，只留数和字段名，不留标题、正文、撞上的是哪篇：
-`rejected_by`（gate → 篇数：`pre_commit` / `atomic_recheck` / `replace_lookup` / `empty_body`）、`rejected_signals`
+`rejected_by`（gate → 篇数：`pre_commit` / `atomic_recheck` / `replace_lookup` / `empty_body` / `version_lookup`）、`rejected_signals`
 （依据的信号 → 篇数：`opening` / `title` / `ngram` / `contain`，一篇可以有几个）、`rejected_scope`（`in_batch` / `history`）、
 `empty_body_fields`（正文空的那几篇带了哪些字段名，W-30：多半是正文放错了字段）。`counters` 另记 `unattributed` /
 `unknown_angle_keys` / `used_angle_keys`，`meta.angle_key_mismatch` 记 `{index, problem, length}`（不记 key 本身）。
@@ -998,7 +1009,7 @@ select created_at, left(project_id::text, 8) p, counters->>'drafts' d,
 select created_at, left(project_id::text, 8) p, counters->>'written' w,
        counters->>'unknown_angle_keys' unknown, counters->>'used_angle_keys' used,
        meta->>'flywheel_arm' arm, meta->>'flywheel_arm_source' src, meta->>'flywheel_arm_reported' reported,
-       meta->>'flywheel_arm_unverified' unverified, meta->'angle_key_mismatch' mismatch
+       meta->>'flywheel_arm_unverified' unverified, meta->>'flywheel_patterns_shown' shown, meta->'angle_key_mismatch' mismatch
   from autowriter.batch_metrics
  where meta->>'mode' = 'deskcore_commit'
    and (coalesce((counters->>'unknown_angle_keys')::int, 0) + coalesce((counters->>'used_angle_keys')::int, 0) > 0

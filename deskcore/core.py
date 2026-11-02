@@ -203,6 +203,11 @@ class ProjectIsolationRejected(ValueError):
     """Actionable cross-project rule rejection; REST maps this to 400."""
 
 
+class RuleInputError(ValueError):
+    """record_rule 的参数不对(原文空 / 档位 / 范围 / 方向档), 一行没写。工具层映成 400(InvalidInput) ——
+    500 会让模型拿同一个参数一直重试(外部审计 11-02 F06)。"""
+
+
 def assert_project_access(client, project_id: str, *,
                           user_id: str | None) -> dict:
     """**整套项目归属校验的唯一实现**。通过则返回项目整行。
@@ -1286,7 +1291,7 @@ def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list
     try:
         status = {r.get("index"): r.get("status") for r in (gate.get("results") or [])}
         try:
-            arm, arm_source, _ = batch_arm(project_id, user_id)
+            arm, arm_source, _, _ = batch_arm(project_id, user_id)
         except Exception:                               # noqa: BLE001 — 臂只是附带记一下
             arm, arm_source = None, None
         check_id = str(uuid.uuid4())
@@ -1586,6 +1591,52 @@ def _lookup_replacements(client, project_id: str, drafts: list[dict]) -> tuple[d
     return replace, rejected
 
 
+# 稿子上带的「库里本来就有这一版」的 id: version_id(commit 拿它写指纹、销牌, 不再造新的)和它在补录表里的同义列
+# _source_autowriter_version_id(tools._LINEAGE_KEYS / ingest.VERSION_ID_HEADER 同一对)。
+CALLER_VERSION_KEYS = ("version_id", "_source_autowriter_version_id")
+
+
+def _caller_version_problems(client, project_id: str, drafts: list[dict]) -> dict[int, str]:
+    """2026-11-02 外部审计 11-02 F05: 调用方自带的 version_id / _source_autowriter_version_id 入库之前先按**本项目**核一遍,
+    回 ``{下标: 原因}`` —— 这几篇进 rejected(gate='version_lookup'): 不写指纹、不销牌、不算进 written。
+
+    commit_drafts 对调用方带来的 version_id 一向照单全收(_judge_owned_only 那段自己写着: 写进指纹、拿去销账, 从没核过),
+    只有判定那一步核了归属。库里没有的 / 别的项目的 id 一进来: 指纹挂在一个不存在(或别人)的版本名下、角度销给了它、
+    written 照算、identity_warning 也没有 —— 回包看着一切正常(审计复现: 一个编出来的 UUID → written=1, 销了 1 张牌,
+    0 行 versions)。draft_fingerprints.version_id 和 angle_ledger.consumed_version_id 都没有外键兜着。协议从不让模型
+    给 score_drafts 带 version_id(新稿由存档分配, 改稿用 replaces_version_id), 带了多半是把补录(ingest_published)的
+    写法搬过来了 —— 说清楚、让它去掉重存, 比悄悄存进去强。
+
+    走 ``store.items_for_versions``, 和 _judge_owned_only / _lookup_replacements 同一个按项目钉死归属的查询(别的项目的
+    id 查不出来)。不是合法 UUID 的不送进查询(同 _is_uuid: 一个坏值会让 PG 拒掉整条 IN 查询)。两个键都带了就两个都核。
+    _source_autowriter_version_id 本身不改存档的行为(commit 只认 version_id; 核得上的照旧当新稿存、分配新 id), 核它是
+    因为带了查不到的 id 同样说明模型拿错了东西。查库本身失败**上抛**: 这一步在拿锁之前, 什么都还没写, 调用方重试即可 ——
+    核不了就不能当作核过。"""
+    want: dict[int, list[tuple[str, str]]] = {}
+    for i, d in enumerate(drafts):
+        if isinstance(d, dict):
+            ids = [(k, str(d[k])) for k in CALLER_VERSION_KEYS if d.get(k)]     # 同 commit 判"自带"的口径: 有值就算
+            if ids:
+                want[i] = ids
+    if not want:
+        return {}
+    fix = "新稿不要带 version_id(存档会分配), 改稿用 replaces_version_id"
+    bad: dict[int, str] = {}
+    for i, ids in want.items():
+        wrong = [(k, v) for k, v in ids if not _is_uuid(v)]
+        if wrong:
+            bad[i] = f"{wrong[0][0]}={wrong[0][1][:60]!r} 不是合法的 UUID, 不会是本项目的版本 —— {fix}"
+    lookup = sorted({str(uuid.UUID(v)) for i, ids in want.items() if i not in bad for _, v in ids})
+    known = store.items_for_versions(client, project_id, lookup) if lookup else {}
+    for i, ids in want.items():
+        if i in bad:
+            continue
+        missing = [(k, v) for k, v in ids if str(uuid.UUID(v)) not in known]
+        if missing:
+            bad[i] = f"{missing[0][0]}={missing[0][1]} 不是本项目里的版本(库里没有, 或属于别的项目) —— {fix}"
+    return bad
+
+
 def _own_fingerprints(client, project_id: str, replace: dict) -> dict[int, list[dict]]:
     """check_drafts 的改稿那几篇: 旧 item **全部版本**在指纹库里的行(和 _prepare_replacements 摘的是同一批: 发出去的帖记在
     那一版下的(W-40)也在里面), 只读。``{index: [行, …]}``, 向量列解析成 list(同 store.fingerprints)。"""
@@ -1853,7 +1904,8 @@ def _judge_owned_only(client, project_id: str, targets: list[dict]
     (``(target, 结局)``)。
 
     judge 收到 ``write=true`` 就按 subject_id 把答案写进 TV 账本。而 commit_drafts 对调用方
-    带来的 version_id 一向照单全收(写进指纹、拿去销账), 从没核过。判定这里再照单全收:
+    带来的 version_id 一向照单全收(写进指纹、拿去销账), 从没核过(2026-11-02 外部审计 11-02 F05 之后入库前就核了 ——
+    _caller_version_problems, 核不上的按 version_lookup 拒、到不了这里; 这一道留着防万一)。判定这里再照单全收:
 
       · 过期的 / 抄错的 UUID → 账本里多出一组挂在不存在的 ``aw_version`` 上的答案(孤儿行),
         JOIN 回写作台永远 JOIN 不上, 判的钱白花;
@@ -2276,7 +2328,7 @@ def _rejection_meta(drafts: list[dict], rejected: list[dict]) -> dict:
     回包里有 rejected, 可 batch_metrics 只记了个总数, 事后查不出是闸前撞车、本批内互撞还是正文空。
 
     只留数和字段名, 不留标题、正文、撞上的是哪篇:
-      · ``rejected_by``: gate → 篇数(pre_commit / atomic_recheck / replace_lookup / empty_body);
+      · ``rejected_by``: gate → 篇数(pre_commit / atomic_recheck / replace_lookup / empty_body / version_lookup);
       · ``rejected_signals``: 依据的信号 → 篇数(opening / title / ngram / contain; 一篇可以有几个);
       · ``rejected_scope``: 撞的是本批内(in_batch)还是历史(history);
       · ``empty_body_fields``: 正文空的那几篇带了哪些字段名(W-30: 多半是正文放错了字段)。
@@ -3426,6 +3478,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     archive_pending 也带上。模型传回的 flywheel_arm 对不上服务端发的时以服务端为准(``flywheel_arm_corrected``), 重启过
     核对不了的另标(``flywheel_arm_unverified``), 见 batch_arm。被拒的按原因计数进 batch_metrics.meta(``_rejection_meta``)。
     docs/deskcore.md §3.12。
+
+    ── 2026-11-02: 外部审计 11-02 ──────────────────────────────────────────
+    F05: 稿子自带的 version_id / _source_autowriter_version_id 拿锁之前先按本项目核(_caller_version_problems), 库里没有的、
+    别的项目的、不是 UUID 的进 rejected(``gate="version_lookup"``): 不写指纹、不销牌、不算 written。F13: 这场借卡实际给出去
+    几条规律(batch_arm 第四项)记进 batch.params 和 batch_metrics.meta 的 ``flywheel_patterns_shown``。
     """
     started = time.monotonic()
     # W-21(10-30): commit 段(入库段)按步计时, 落进 batch_metrics.meta.commit_parts_ms, 不进 phase_ms(那里各段加起来等于
@@ -3435,6 +3492,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     project = assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
+    # 外部审计 11-02 F05: 自带的 version_id 先按本项目核, 核不上的这几篇进 rejected(gate=version_lookup), 不写指纹、不销牌。
+    # 在拿锁之前: 只读; 查库失败就上抛, 这时什么都没写
+    bad_vid = _caller_version_problems(client, project_id, drafts)
     _lap(commit_parts, "access", started)
     arm_meta: dict = {}      # 这次入库的臂 + 改稿挂到哪些旧 item, 进 batch_metrics.meta (分析对照组的第二份记录)
 
@@ -3448,9 +3508,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         lap = time.monotonic()
         # 正文空的替换稿不摘旧指纹(codex review on aw#126): 它反正要被拒(W-30, 见下), 先摘了的话同批里和旧版
         # 重复的另一篇查重时看不见旧版, 照样入库。
-        empty_idx = {i for i, d in enumerate(drafts) if not str(d.get("body") or "").strip()}
+        # version_id 核不上的(F05)也不摘、也不算空正文: 一篇只报一个原因, 先报 id 错了(改了 id 再存才看得到别的)
+        empty_idx = {i for i, d in enumerate(drafts) if not str(d.get("body") or "").strip()} - set(bad_vid)
         replace, replace_rejected, stash = _prepare_replacements(
-            client, project_id, [{**d, "replaces_version_id": None} if i in empty_idx else d
+            client, project_id, [{**d, "replaces_version_id": None} if i in empty_idx or i in bad_vid else d
                                  for i, d in enumerate(drafts)])
         lap = _lap(commit_parts, "replace_prep", lap)
         # 整段包在 try 里(而不是拆成子函数): ci.yml 用 inspect.getsource 守着"commit 走 _gate"
@@ -3485,16 +3546,19 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             empty_rejected = {i: _empty_body_reason(drafts[i]) for i in sorted(empty_idx)}
             # 空正文那几篇也不进闸(codex review on aw#126): 本批内互比会拿标题向量把后面同标题的完整稿判成撞上它,
             # 结果两篇都没存。闸只跑其余几篇, 结果下标翻回调用方的; 全是空正文时照旧整批跑(结果反正都被拒掉)。
-            gate_idx = [i for i in range(len(drafts)) if i not in empty_rejected] or list(range(len(drafts)))
+            gate_idx = ([i for i in range(len(drafts)) if i not in empty_rejected and i not in bad_vid]
+                        or list(range(len(drafts))))
             gate = _gate(client, project_id, [titles[i] for i in gate_idx], [bodies[i] for i in gate_idx],
                          [vecs[i] if i < len(vecs) else None for i in gate_idx] if vecs else vecs)
             pre_rejected = {}
             for r in gate["results"]:
                 i = gate_idx[r["index"]]
-                if r.get("status") == "reject" and i not in replace_rejected and i not in empty_rejected:
+                if (r.get("status") == "reject" and i not in replace_rejected and i not in empty_rejected
+                        and i not in bad_vid):
                     pre_rejected[i] = {**r, "index": i}
             survivors = [i for i in range(len(drafts))
-                         if i not in pre_rejected and i not in replace_rejected and i not in empty_rejected]
+                         if i not in pre_rejected and i not in replace_rejected and i not in empty_rejected
+                         and i not in bad_vid]
             lap = _lap(commit_parts, "gate", lap)
 
             # ── 先把 version_id 定下来 ──────────────────────────────────────────
@@ -3547,6 +3611,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             rejected += [{"index": i, "title": titles[i], "collided_with": "", "collided_scope": "",
                           "decided_by": None, "reason": why, "gate": "empty_body"}
                          for i, why in sorted(empty_rejected.items())]
+            rejected += [{"index": i, "title": titles[i], "collided_with": "", "collided_scope": "",
+                          "decided_by": None, "reason": why, "gate": "version_lookup"}
+                         for i, why in sorted(bad_vid.items())]
             rejected.sort(key=lambda r: r["index"])
             # ⚠️ RPC 回的 idx 是**幸存者列表里的下标**, 不是调用方列表的。下面凡是把
             #    idx 翻回调用方视角的地方都要过 survivors[...]。
@@ -3657,7 +3724,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 for i in sorted(inserted_idx) if i in minted_ids and i not in replace
             ]
             # 这批落在哪个飞轮臂 (docs/28 §7.4): 这场写作借卡时定下的那个, 对照组靠它圈出来
-            arm, arm_source, arm_check = batch_arm(project_id, user_id, from_brief=flywheel_arm)
+            arm, arm_source, arm_check, patterns_shown = batch_arm(project_id, user_id, from_brief=flywheel_arm)
             # 模型传回的臂认得出、却没被采用 = 服务端没给过这场这个臂 (corrected), 或者重启过核对不了 (unverified):
             # 都记服务端最近一次借卡的臂 (W-31, 见 batch_arm)。传回的那个留一份(batch.params + batch_metrics.meta),
             # 核对不了的另标 flywheel_arm_unverified, 分析对照组时剔掉; 回包里也说一句。改稿挂的旧 batch 同样标上
@@ -3670,7 +3737,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             unmarked = _mark_mixed_arm_batches(
                 client, list(replaced_ok.values()), arm,
                 unverified=arm_check == "unverified" or arm_source == "recomputed") if replaced_ok else []
+            # 外部审计 11-02 F13: 分到的臂之外, 记这场借卡实际给出去几条规律(batch_arm 第四项; None = 服务端不知道)。
+            # batch.params 和 batch_metrics.meta 各一份, 同 flywheel_arm
             arm_meta = {"flywheel_arm": arm, "flywheel_arm_source": arm_source, **arm_flags,
+                        "flywheel_patterns_shown": patterns_shown,
                         "revised_item_ids": sorted(set(replaced_ok.values())),
                         "arm_mixed_unmarked_item_ids": unmarked}
             lap = _lap(commit_parts, "arm", lap)
@@ -3685,7 +3755,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 minted = store.mint_draft_identity(
                     client, project_id, str(user_id), "", to_mint,
                     batch_params={"source": "deskcore", "flywheel_arm": arm, "flywheel_arm_source": arm_source,
-                                  **arm_flags, **parts})
+                                  "flywheel_patterns_shown": patterns_shown, **arm_flags, **parts})
             identity_error = minted.get("error")
             lap = _lap(commit_parts, "mint", lap)
 
@@ -3936,6 +4006,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 pre = sum(1 for r in rejected if r.get("gate") == "pre_commit")
                 race = sum(1 for r in rejected if r.get("gate") == "atomic_recheck")
                 bad_ref = sum(1 for r in rejected if r.get("gate") == "replace_lookup")
+                bad_own = sum(1 for r in rejected if r.get("gate") == "version_lookup")
                 parts = []
                 if pre:
                     parts.append(f"{pre} 条在入库前的判定里就被拦下(和 check_drafts 同一套"
@@ -3956,6 +4027,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                     parts.append(f"{bad_ref} 条的 replaces_version_id 对不上(不是 UUID / 不是本"
                                  "项目的版本 / 和 version_id 同时带了 / 同一篇替换两次) —— 稿子"
                                  "本身没问题, 改对 id 再提交一次, 不用重写")
+                if bad_own:
+                    # F05: 同 bad_ref, 不是撞车, 是 id 带错了; 没存档、没销牌
+                    parts.append(f"{bad_own} 条带的 version_id 不是本项目里的版本(不是 UUID / 库里没有 / 别的项目的) "
+                                 "—— 没存档、没销牌。稿子本身没问题: 新稿去掉 version_id, 改稿换成 replaces_version_id, "
+                                 "再提交一次, 不用重写")
                 out["note"] = "; ".join(parts) + tail + "。"
             if not atomic:
                 logger.warning("commit_drafts: 本次入库没有做原子重查(deskcore_commit_fingerprints RPC 不存在, "
@@ -5939,15 +6015,24 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     # 规则是"每个项目级入口都以这一行开头", 留例外就等于留一个以后会被忘掉的
     # 缺口, 而这里的代价只是一次主键查询。
     assert_project_access(client, project_id, user_id=user_id)
+    # 2026-11-02 外部审计 11-02 F06: 参数校验(原文 / 档位 / 范围 / check / 方向)全部在写库之前做完, 错了一行不写、报
+    # RuleInputError(工具层映成 400)。方向档原来是写完规则之后才查的: applicability="产品向为主" 报了错(还是 500), 可规则
+    # 已经以「已确认、无方向」落了库 —— 每个方向的项目都注入它, 调用方收到的却是一次失败。
     content = (content or "").strip()
     if not content:
-        raise ValueError("rule content must not be empty")
+        raise RuleInputError("规则原文是空的")
     severity = (severity or "soft").lower()
     if severity not in ("hard", "soft"):
-        raise ValueError("severity must be 'hard' or 'soft'")
+        raise RuleInputError("severity 只能是 'hard' 或 'soft'")
     if scope not in ("project", "global"):
-        raise ValueError("scope must be 'project' or 'global'")
+        raise RuleInputError("scope 只能是 'project' 或 'global'")
     rule_check = rulecheck.normalize_check(check) if check is not None else None
+    applicability = (applicability or "").strip()
+    if applicability not in DIRECTION_TAGS and [t for t in DIRECTION_TAGS if t in applicability]:
+        raise RuleInputError(
+            f"applicability={applicability!r} 里带了方向词但不等于 "
+            f"{list(DIRECTION_TAGS)} 之一。方向档是精确匹配的, "
+            "半个词会让这条规则在两个方向上都被挡掉。")
 
     from .isolation import foreign_markers
     projects = store.isolation_projects(client, owner_id=user_id)
@@ -5975,6 +6060,11 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
         # 否则"把这条改成硬约束"会返回成功但库里还是 soft, 继续待在 P1。
         # (codex review round-5 P1)
         update_severity=True,
+        # F06: 新建的规则一次 insert 就带着方向和 check 落库(upsert_memory 只在新建时写这三列), 下面单独写的那两次
+        # 半途失败也不会留下一条「已确认、无方向 / 没有检查」的规则。命中已有规则时它不写这三列, 照旧靠下面那两次
+        applicability=applicability or None,
+        rule_kind=rule_check[0] if rule_check is not None else None,
+        rule_payload=rule_check[1] if rule_check is not None else None,
     )
     # 以【库里实际的值】为准回报, 别回报入参 —— 回报入参正是上面那个 bug 之所以
     # 看不见的原因: 库里没改, 返回值却说改了。
@@ -5989,14 +6079,8 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     # 那边的老签名), 而它正是方向档的载体。
     # ⚠️ 写失败必须**上抛**, 不能吞。吞掉的话这条规则会以"无方向"落库 → 之后
     # 每一个方向的项目都注入它, 而调用方收到的是一个成功返回。
-    applicability = (applicability or "").strip()
+    # 方向的校验在最上面(F06), 这里只写。
     if applicability and out["memory_id"]:
-        bad = [t for t in DIRECTION_TAGS if t in applicability]
-        if applicability not in DIRECTION_TAGS and bad:
-            raise ValueError(
-                f"applicability={applicability!r} 里带了方向词但不等于 "
-                f"{list(DIRECTION_TAGS)} 之一。方向档是精确匹配的, "
-                "半个词会让这条规则在两个方向上都被挡掉。")
         saved = store.update_memory_fields(
             client, out["memory_id"], {"applicability": applicability})
         out["applicability"] = (saved or {}).get("applicability")
@@ -7516,6 +7600,14 @@ _ARM_REPORT_TTL = timedelta(hours=12)
 _borrowed_arms: dict[tuple[str, str], dict[str, datetime]] = {}     # (项目, 写手) → {臂: 最后一次发出的时刻}
 _borrowed_arms_lock = threading.Lock()
 _ARMS_SINCE = datetime.now(timezone.utc)    # 进程起来的时刻: 这之前发出去的臂 _borrowed_arms 里没有 (重启丢了)
+# 2026-11-02 外部审计 11-02 F13: 分到的臂不等于看到的东西。patterns 臂的那一场, 借卡超时 / 馆员降级 / 馆员这次没给规律时,
+# 模型手里一条规律都没有, 这一批却照样按 patterns 记 —— 11-20 L-07 / G-05 拿 patterns 对 explore 比的时候, 处理组里混着
+# 没受过处理的批次, 事后也补不回来(哪一场到底给出去几条, 只有借卡那一刻知道)。所以借卡那一刻把【实际给出去的规律条数】
+# 记在发出去的那个臂旁边: (项目, 写手, 臂) → (那一次发臂的时刻, 条数)。batch_arm 只认时刻对得上 _borrowed_arms 里那一次的
+# (发臂之后又借了一次、这一次还没记上, 就是不知道, 回 None, 不拿上一场的数顶)。入库时写进 batches.params 和
+# batch_metrics.meta 的 flywheel_patterns_shown: 整数 = 给出去几条; null = 服务端不知道(重启过 / 按入库时重算的臂);
+# 没有这个键 = F13 之前的批次。分析时 patterns 臂只算 shown > 0 的, 或者把 0 / null 单列一组。
+_patterns_shown: dict[tuple[str, str, str], tuple[datetime, int]] = {}
 
 
 def _utcnow() -> datetime:
@@ -7572,21 +7664,50 @@ def _borrow_arm(project_id, user_id, *, reuse: str | None = None) -> str:
     return arm
 
 
-def batch_arm(project_id, user_id, *, from_brief: str | None = None) -> tuple[str, str, str | None]:
-    """入库时这批记哪个臂: (臂, 'brief' | 'borrow' | 'recomputed', 传回的臂为什么没采用)。``from_brief`` = 模型传回的
-    简报里的臂。第三项 (W-31, 见上面那段): None = 采用了 / 没传; ``"corrected"`` = 服务端没给过这场这个臂, 以服务端
-    最近一次发的为准; ``"unverified"`` = 重启过核对不了, 也记服务端最近一次发的, 调用方标 flywheel_arm_unverified。"""
-    now = _utcnow()
+def _note_patterns_shown(project_id, user_id, arm: str, shown: int, *, carry: bool = False) -> None:
+    """借卡交出去之后, 把这一场实际给出去几条规律记在刚发的那个臂旁边(F13, 见 _patterns_shown 那段)。只写进程内存,
+    不读写库。``carry`` = 同一场里接着借(borrow_lessons 原样传回了简报里的臂、而且被沿用了): 和这一场前面那次取大的 ——
+    简报里给过 3 条、后来补借一次降级了, 模型手里还是那 3 条。上一场的(离这次发臂超过 _ARM_REPORT_TTL)不带过来。
+    臂这时已经不在 _borrowed_arms 里(不该发生)就不记。"""
+    key = (str(project_id), str(user_id or ""))
     with _borrowed_arms_lock:
-        issued = _issued_arms((str(project_id), str(user_id or "")), now)
-    if from_brief in FLYWHEEL_ARMS:
-        check = _reported_arm_check(project_id, user_id, from_brief, issued, now)
-        if check == "ok":
-            return from_brief, "brief", None
-        return max(issued, key=issued.get), "borrow", check     # 不是 ok 时 issued 一定非空
-    if issued:
-        return max(issued, key=issued.get), "borrow", None
-    return flywheel_arm(project_id, user_id, now=now), "recomputed", None
+        at = (_borrowed_arms.get(key) or {}).get(arm)
+        if at is None:
+            return
+        n = max(0, int(shown or 0))
+        prev = _patterns_shown.get(key + (arm,))
+        if carry and prev is not None and at - prev[0] <= _ARM_REPORT_TTL:
+            n = max(n, prev[1])
+        _patterns_shown[key + (arm,)] = (at, n)
+
+
+def _shown_for(key: tuple[str, str], arm: str, issued: dict[str, datetime]) -> int | None:
+    """这个臂最近一次发出去时实际给了几条规律; 记的那一次和 issued 里的对不上(或者没记)就是不知道, 回 None。调用方持锁。"""
+    rec = _patterns_shown.get(key + (arm,))
+    return rec[1] if rec is not None and issued.get(arm) == rec[0] else None
+
+
+def batch_arm(project_id, user_id, *,
+              from_brief: str | None = None) -> tuple[str, str, str | None, int | None]:
+    """入库时这批记哪个臂: (臂, 'brief' | 'borrow' | 'recomputed', 传回的臂为什么没采用, 这个臂实际给出去几条规律)。
+    ``from_brief`` = 模型传回的简报里的臂。第三项 (W-31, 见上面那段): None = 采用了 / 没传; ``"corrected"`` = 服务端
+    没给过这场这个臂, 以服务端最近一次发的为准; ``"unverified"`` = 重启过核对不了, 也记服务端最近一次发的, 调用方标
+    flywheel_arm_unverified。第四项 (外部审计 11-02 F13, 见 _patterns_shown 那段): 整数 = 服务端记下的那一次借卡交出去
+    几条规律(explore 臂是 0); None = 不知道(重启过、按入库时重算的、那一次借卡还没记上)。臂怎么定一点没变。"""
+    now = _utcnow()
+    key = (str(project_id), str(user_id or ""))
+    with _borrowed_arms_lock:
+        issued = _issued_arms(key, now)
+        if from_brief in FLYWHEEL_ARMS:
+            check = _reported_arm_check(project_id, user_id, from_brief, issued, now)
+            if check == "ok":
+                return from_brief, "brief", None, _shown_for(key, from_brief, issued)
+            arm = max(issued, key=issued.get)                   # 不是 ok 时 issued 一定非空
+            return arm, "borrow", check, _shown_for(key, arm, issued)
+        if issued:
+            arm = max(issued, key=issued.get)
+            return arm, "borrow", None, _shown_for(key, arm, issued)
+    return flywheel_arm(project_id, user_id, now=now), "recomputed", None, None
 
 
 def _mark_mixed_arm_batches(client, item_ids: list[str], arm: str, *, unverified: bool = False) -> list[str]:
@@ -7634,6 +7755,9 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     project = assert_project_access(client, project_id, user_id=user_id)
     arm = _borrow_arm(project.get("id"), user_id, reuse=flywheel_arm)   # 这场已经有臂就沿用
     out = _borrow_for_brief(project, delta, user_id=user_id, arm=arm)
+    # F13: 这次实际交出去几条规律, 记在这个臂旁边; 沿用了简报里的臂 = 同一场接着借, 和前面那次取大的
+    _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []),
+                         carry=flywheel_arm == arm)
     if out.get("validated_patterns"):       # 用法同简报那份(10-20): 每篇最多一条、轮换、有几篇不用
         out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
                                                               len(out["validated_patterns"]))
@@ -7744,6 +7868,13 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
     budget = _brief_borrow_budget(started) if budget is None else float(budget)
     # 臂在这里先定: 借阅超时 / 线程起不来, 简报也要带着臂交出去 (入库时原样传回)
     arm = _borrow_arm(project.get("id"), user_id)
+
+    def _shown(out: dict) -> dict:
+        # 外部审计 11-02 F13: 简报实际带出去几条规律(超时 / 线程起不来 = 0 —— 后台线程之后选完了也不算, 这一份简报里
+        # 没有), 记在这个臂旁边。open_project 是新开的一场, 不和上一场取大
+        _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []))
+        return out
+
     try:
         ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
         fut = ex.submit(_borrow_for_brief, project, delta, user_id=user_id, arm=arm)
@@ -7753,23 +7884,23 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
         # (codex review on #93)。按借阅出错回, 简报照交。
         logger.warning("flywheel borrow could not start (project_id=%s): %s: %s",
                        project.get("id"), type(exc).__name__, exc)
-        return {"lessons": [], "count": 0,
-                "status": librarian_client.BORROW_ERROR,
-                "elapsed_ms": 0,
-                "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300],
-                "validated_patterns": [], "flywheel_arm": arm}
+        return _shown({"lessons": [], "count": 0,
+                       "status": librarian_client.BORROW_ERROR,
+                       "elapsed_ms": 0,
+                       "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300],
+                       "validated_patterns": [], "flywheel_arm": arm})
     try:
         try:
-            return fut.result(timeout=budget)
+            return _shown(fut.result(timeout=budget))
         except cf.TimeoutError:
             logger.warning("flywheel borrow exceeded open_project budget %.1fs (project_id=%s); "
                            "brief returned without cards, borrow thread left running",
                            budget, project.get("id"))
-            return {"lessons": [], "count": 0,
-                    "status": librarian_client.BORROW_TIMEOUT,
-                    "elapsed_ms": int(budget * 1000),
-                    "validated_patterns": [], "flywheel_arm": arm,
-                    "detail": BORROW_TIMEOUT_NOTE}
+            return _shown({"lessons": [], "count": 0,
+                           "status": librarian_client.BORROW_TIMEOUT,
+                           "elapsed_ms": int(budget * 1000),
+                           "validated_patterns": [], "flywheel_arm": arm,
+                           "detail": BORROW_TIMEOUT_NOTE})
     finally:
         ex.shutdown(wait=False)
 
@@ -8739,7 +8870,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     to_ingest: list[tvlink.Note] = []
     ambiguous_samples: list[dict] = []
     # W-34: 已对上的对照, TV 正文变了没有。这些数不进 counts(counts 加起来仍等于笔记数), 单独报。
-    drift: dict = {"seeded": 0, "text_changed": 0, "kept_after_rematch": 0, "replaced": 0, "relinked": 0,
+    drift: dict = {"seeded": 0, "text_changed": 0, "kept_after_rematch": 0, "replaced": 0, "weak_title": 0, "relinked": 0,
                    "deferred": 0, "blocked": 0, "unverifiable": 0, "no_body_kept": 0, "tv_cleared": 0,
                    "clear_missed": 0, "fp_written": 0, "fp_held": 0, "over_cap": 0, "relink_max": relink_max,
                    "clear_error": None, "fp_error": None, "samples": []}
@@ -8748,6 +8879,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     blocked: set[str] = set()            # 整篇换了、这晚没挪成: 差异隔离
     w34_note: dict[str, list[dict]] = {}  # 挪走的对照, 新对照的 candidates 前面记一句为什么挪
     moved: list[tuple] = []              # (笔记, 新判定, 旧对照, 旧版本是不是我们自己写回 TV 的)
+    weak_ids: set[str] = set()           # 以前按标题连上、正文其实不像的(外部审计 11-02 F04), 这晚按内容重对
 
     def _link(n: tvlink.Note, kind: str, *, project_id=None, version_id=None,
               item_id=None, score=None, lag=None, candidates=None) -> dict:
@@ -8833,7 +8965,16 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         if _pinned(prev):
             counts["already_linked"] += 1
             continue
-        if not rematch and prev.get("tv_text_fp") == fp_now[n.note_id]:
+        old = str(prev["version_id"])
+        old_v = known.get(old) or linked_text.get(old)
+        # 外部审计 11-02 F04(2026-11-02): 以前按标题连上(title_exact)、正文其实不像的(tvlink.title_without_body: 两边正文都够
+        # 长、包含度不到 EDITED_FLOOR), 现在的 match_note 不会再这样连; 已经连上的, 字没变也不跳过, 按内容重对 —— 走 W-34
+        # 整篇换了的那条路(每晚上限、先撤回 TV 里我们写的旧血缘、差异降回旧口径)。重对多半是 ambiguous(内容也对不上): 那时候
+        # 原来那版只作为"只有标题一样"的候选列着(WEAK_TITLE_KEY), 不算还对回原来那版。生产库 11-02 是 2 条(SPX、途鸽)。
+        # 只有标题的稿(HATHERINE)、正文太短的笔记不算: 正文没得比。那一版不在对照索引里(不是 best 了)就不核, 同 W-34。
+        weak = (prev.get("match_kind") == "title_exact" and old_v is not None and bool(n.body)
+                and tvlink.title_without_body(n, old_v))
+        if not weak and not rematch and prev.get("tv_text_fp") == fp_now[n.note_id]:
             counts["already_linked"] += 1             # 上次核过, 字没变: 绝大多数对照每晚走这里
             continue
         if not n.body:
@@ -8841,12 +8982,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             counts["already_linked"] += 1
             drift["no_body_kept"] += 1
             continue
-        old = str(prev["version_id"])
-        old_v = known.get(old) or linked_text.get(old)
         # tv_lineage 而 TV 还指着这一版: 那是 TV 自己说的来源(不是我们写回的), 正文整篇换了也不挪, 差异隔离、每晚报给人看;
         # TV 改了 lineage(清掉 / 指到别的版)之后才按 TV / 内容走 —— --rematch 也一样(review on aw#128)。
         tv_says_old = prev.get("match_kind") not in _CONTENT_KINDS and str(n.tv_version_id or "") == old
-        st = ("same" if rematch and prev.get("tv_text_fp") == fp_now[n.note_id] else
+        st = ("weak_title" if weak else
+              "same" if rematch and prev.get("tv_text_fp") == fp_now[n.note_id] else
               _tv_text_state(prev, n, fp_now[n.note_id], known, linked_text))
         if st == "unverifiable":
             counts["already_linked"] += 1
@@ -8863,6 +9003,12 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             ov = tvlink.overlap(n, old_v) if old_v is not None else None
             w34_note[n.note_id] = [{"note": f"W-34 {now[:10]}: TV 正文整篇换了(原来 {prev.get('match_kind')} "
                                             f"{old[:8]}, 重叠 {0 if ov is None else round(ov, 3)}), 按内容重对"}]
+        elif st == "weak_title":
+            # F04: 不是 TV 改了字, 是当初连错了。挪走的那条在候选前面记一句为什么(同 W-34 的那句, 不带决策号, 不会钉死对照)
+            drift["weak_title"] += 1
+            weak_ids.add(n.note_id)
+            w34_note[n.note_id] = [{"note": f"F04 {now[:10]}: 原来只是标题一样(title_exact {old[:8]}, 正文重叠 "
+                                            f"{round(tvlink.overlap(n, old_v), 3)}, 不到 {tvlink.EDITED_FLOOR}), 按内容重对"}]
         elif not rematch:
             # seed / edited: 还是那一篇。只记指纹; 差异按现在的正文重算 —— seed 也算: 017 之前改过字的, 旧差异是按改之前
             # 的正文算的, 这回不重算, 记了指纹就再也不会重算了(review on aw#128)。同一版, 不推 computed_at。
@@ -8890,7 +9036,9 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         m = _decide(n, trust_tv=not own)
         mv = (str(m.version.version_id) if m.version is not None else
               str(n.tv_version_id) if m.kind == "tv_lineage" and n.tv_version_id else None)
-        if mv == old or (m.kind == "ambiguous" and old in {str(c.get("version_id")) for c in (m.candidates or [])}):
+        # 分不出的候选里有原来那版也留着 —— 但它只是"标题一样、正文不像"(F04, WEAK_TITLE_KEY)的不算: 那正是要挪走的
+        if mv == old or (m.kind == "ambiguous" and old in {str(c.get("version_id")) for c in (m.candidates or [])
+                                                           if not c.get(tvlink.WEAK_TITLE_KEY)}):
             # 还对回原来那版(或原来那版在分不出的候选里): 对照留着。同一版照常写一遍(--rematch 的老行为), 带上指纹;
             # 分不出的不写 —— 不能因为重对一次就把已经对上的版本丢掉。
             drift["kept_after_rematch"] += 1
@@ -8931,7 +9079,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             go = not drift["over_cap"] and (not own or n.note_id in cleared)
             if go:
                 drift["relinked"] += 1
-                _sample(n, prev, m, "整篇换了, 已按内容重对" if not rematch else "--rematch 重对到别的判定", move=True)
+                _sample(n, prev, m, ("只有标题一样、正文不像(F04), 已按内容重对" if n.note_id in weak_ids else
+                                     "整篇换了, 已按内容重对" if not rematch else "--rematch 重对到别的判定"), move=True)
                 _apply(n, m, w34_note.get(n.note_id))
                 continue
             counts["already_linked"] += 1
@@ -9342,6 +9491,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                  + f"), 分不出 {counts['ambiguous']}, 对不上 {counts['unmatched']}"
                  + (f", 没正文 {counts['no_body']}" if counts["no_body"] else "")
                  + (f"; 正文整篇换了 {drift['replaced']}(挪了 {drift['relinked']})" if drift["replaced"] else "")
+                 + (f"; 只有标题一样、正文不像的旧对照 {drift['weak_title']}(F04, 按内容重对)" if drift["weak_title"] else "")
                  + (f" → 补录 {ingest['minted']}/{ingest['to_write']}"
                     if ingest and not dry_run else
                     f" → 会补录 {ingest['to_write']}" if ingest else
