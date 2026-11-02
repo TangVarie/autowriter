@@ -113,7 +113,7 @@ def test_no_trend_line_for_a_sampled_tongyong_without_perpetual(monkeypatch):
 
 def test_other_trend_values_render_without_the_exclusive_note():
     block = core.render_angles_block([_card(trend_dependencies=["季节性事件"])])
-    assert "↳ 时效依赖：季节性事件" in block and "排他值" not in block
+    assert "↳ 时效依赖：季节性事件（跟当下这个季节的事挂钩）" in block and "排他值" not in block
 
 
 # ══════════════════════════════════════════════════════════════════════

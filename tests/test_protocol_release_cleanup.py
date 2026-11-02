@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from deskcore import tools as T
+from deskcore import vocab, tools as T
 
 BODY, _ = T.protocol_text()
 HEAD = T.skill_head()
@@ -316,6 +316,10 @@ def _server_texts() -> dict[str, str]:
                   "STATUS_V1", "SHORT_NOTE"):
         texts[f"project_now.{const}"] = getattr(project_now, const)
     texts["structure.TASK"] = structure.TASK
+    # 卡面上的大白话(angle cards v2): 也是念给模型看的服务端文案
+    for name in ("PLAIN_FORMAT", "PLAIN_TITLE", "PLAIN_LEVER", "PLAIN_TREND", "OPENING_PLAIN"):
+        for k, v in getattr(vocab, name).items():
+            texts[f"vocab.{name}[{k}]"] = v
     texts.update(_angle_v2_samples())
     notice = skillcheck.notice("aaaaaaaaaaaa", "bbbbbbbbbbbb")
     texts["skillcheck.notice.action"] = notice["action"]

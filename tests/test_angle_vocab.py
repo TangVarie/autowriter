@@ -220,3 +220,9 @@ def test_note_title(title, raw, want):
 def test_note_title_feeds_classify_title():
     assert vocab.classify_title(vocab.note_title(None, "【标题】晚上总睡不着怎么办\n【正文】x")) == "疑问句"
     assert vocab.classify_title(vocab.note_title(None, "【标题】【正文】x")) is None
+
+
+def test_every_trend_value_but_the_exclusive_one_has_a_plain_gloss():
+    """卡面的时效那一行跟一句大白话; 「通用」后面本来跟着排他说明, 不另加。"""
+    assert set(vocab.PLAIN_TREND) == set(vocab.TREND_DEPENDENCIES) - {vocab.TREND_EXCLUSIVE}
+    assert all(v and "标志词" not in v for v in vocab.PLAIN_TREND.values())

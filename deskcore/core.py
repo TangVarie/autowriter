@@ -1170,7 +1170,8 @@ def render_angles_block(angles: list[dict], status: str | None = None) -> str:
         if trends:
             note = ("（排他值：全篇不得出现任何时事、节日、平台事件、流行词等"
                     "时效元素）" if vocab.TREND_EXCLUSIVE in trends else "")
-            lines.append(f"    ↳ 时效依赖：{'、'.join(trends)}{note}")
+            shown = [f"{t}（{vocab.PLAIN_TREND[t]}）" if t in vocab.PLAIN_TREND else t for t in trends]
+            lines.append(f"    ↳ 时效依赖：{'、'.join(shown)}{note}")
         ref_line = _reference_line(a.get("reference"))
         if ref_line:
             lines.append(f"    ↳ {ref_line}")
