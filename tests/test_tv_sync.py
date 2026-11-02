@@ -261,7 +261,9 @@ def test_ambiguous_keeps_candidates_and_does_not_guess():
     assert out["counts"]["ambiguous"] == 1 and out["ambiguous_samples"]
     link = c.rows["tv_note_links"][0]
     assert link["match_kind"] == "ambiguous" and link["version_id"] is None
-    assert {x["version_id"] for x in link["candidates"]} == {"v1", "v2"}
+    # 两版正文都和笔记不像(只有标题一样, 外部审计 11-02 F04): 候选前面多一条记它哪天起等人看(复审)
+    assert {x["version_id"] for x in link["candidates"] if "version_id" in x} == {"v1", "v2"}
+    assert [x for x in link["candidates"] if core.WEAK_SINCE_KEY in x]
 
 
 def test_tv_resolve_ingest_turns_an_ambiguous_note_into_an_ingested_link(capsys, monkeypatch):
@@ -284,7 +286,7 @@ def test_tv_resolve_ingest_turns_an_ambiguous_note_into_an_ingested_link(capsys,
     link = c.rows["tv_note_links"][0]
     assert link["match_kind"] == "ingested" and link["version_id"] == out["version_id"]
     assert link["candidates"][0]["note"].startswith("人工判定")
-    assert {x.get("version_id") for x in link["candidates"][1:]} == {"v1", "v2"}, "原候选保留"
+    assert {x.get("version_id") for x in link["candidates"][1:] if "version_id" in x} == {"v1", "v2"}, "原候选保留"
     assert len(c.rows["versions"]) == n_versions + 1
     assert len(c.rows["draft_fingerprints"]) == 1
 

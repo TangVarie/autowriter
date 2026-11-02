@@ -182,6 +182,13 @@ def fetch_flywheel_lessons(brief: dict, *,
     # 断了、cache_control 被拒, 馆员都回 200 + []。不看 status 的话这些全部变成 "empty",
     # 写手听到的是"这个项目没有可借的经验", TV 的通道 2 交通灯(降级不写缓存行)则会把
     # 锅甩给 autowriter(TV 2026-10-08 审计 B-04)。
+    # P4 (TV D-116): 馆员这次下发的闸二已验证规律。只有 brief 带了 explore 的消费方才会拿到; 老馆员没有这个键 → []。
+    # 2026-11-02 外部审计 11-02 F13: 在看 status 之前读。TV 先算规律、后选卡, status=degraded(选卡那一步失败)时规律照样
+    # 回来(TV 那边的注释: 写作台不该因为没有卡就连规律一起丢)。以前 degraded 在这之前就 return [], 规律丢了, 可这一批
+    # 照样按 patterns 臂记 —— 对照组里混进了没看到规律的批次。卡照旧是空的、结局照旧是 error, 只是规律不丢。
+    pats = payload.get("patterns")
+    st["patterns"] = [p for p in pats if isinstance(p, dict)] if isinstance(pats, list) else []
+
     tv_status = payload.get("status")
     if isinstance(tv_status, str) and tv_status in ("degraded", "error"):
         st["state"] = BORROW_ERROR
@@ -190,14 +197,11 @@ def fetch_flywheel_lessons(brief: dict, *,
         telemetry.log_event(
             "flywheel_librarian_degraded",
             project_id=pid, state=st["state"], tv_status=tv_status,
-            elapsed_ms=st["elapsed_ms"],
+            elapsed_ms=st["elapsed_ms"], patterns=len(st["patterns"]),
         )
         return []
 
     lessons = payload["selected"]
-    # P4 (TV D-116): 馆员这次下发的闸二已验证规律。只有 brief 带了 explore 的消费方才会拿到; 老馆员没有这个键 → []。
-    pats = payload.get("patterns")
-    st["patterns"] = [p for p in pats if isinstance(p, dict)] if isinstance(pats, list) else []
     st["count"] = len(lessons)
     st["state"] = BORROW_BORROWED if lessons else BORROW_EMPTY
     telemetry.log_event(

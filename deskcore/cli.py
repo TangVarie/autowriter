@@ -498,12 +498,15 @@ def _tv_sync_reembed(core, sb) -> int:
 def _print_tv_drift(out: dict, tv: str) -> int:
     """已对上的对照 TV 正文变了没有(W-34)。回这一段该给的退出码。"""
     dr = out.get("drift") or {}
-    keys = ("seeded", "text_changed", "replaced", "kept_after_rematch", "relinked", "deferred", "blocked",
+    keys = ("seeded", "text_changed", "replaced", "weak_title", "kept_after_rematch", "relinked", "deferred", "blocked",
             "clear_missed", "unverifiable", "no_body_kept", "over_cap", "fp_held")
     if not any(dr.get(k) for k in keys) and not dr.get("clear_error") and not dr.get("fp_error"):
         return 0
     print(f"  正文核对: 第一次记指纹 {dr.get('seeded', 0)}, 改过字还是那一篇 {dr.get('text_changed', 0)}, "
-          f"整篇换了 {dr.get('replaced', 0)}(挪了 {dr.get('relinked', 0)}"
+          f"整篇换了 {dr.get('replaced', 0)}"
+          # 外部审计 11-02 F04: 以前按标题连上、正文其实不像的, 这晚按内容重对(挪了的一起算在后面的「挪了」里)
+          + (f", 只有标题一样、正文不像 {dr['weak_title']}" if dr.get("weak_title") else "")
+          + f"(挪了 {dr.get('relinked', 0)}"
           + (f", 撤回 TV 旧血缘 {dr['tv_cleared']}" if dr.get("tv_cleared") else "") + ")"
           + (f", 重对还是原来那版 {dr['kept_after_rematch']}" if dr.get("kept_after_rematch") else "")
           + (f", 原来那版取不到、明晚再核 {dr['unverifiable']}" if dr.get("unverifiable") else "")

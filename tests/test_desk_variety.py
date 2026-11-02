@@ -458,9 +458,11 @@ def librarian(monkeypatch):
     monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian())
     with core._borrowed_arms_lock:
         core._borrowed_arms.clear()
+        core._patterns_shown.clear()
     yield
     with core._borrowed_arms_lock:
         core._borrowed_arms.clear()
+        core._patterns_shown.clear()
 
 
 def test_brief_and_borrow_say_one_pattern_per_draft_and_rotate(monkeypatch, librarian):

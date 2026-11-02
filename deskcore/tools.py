@@ -521,6 +521,32 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
 # 写稿后
 # ══════════════════════════════════════════════════════════════════════
 
+# 11-02 owner 实测(西屋911gt, 16:14 北京): 开项目 → 发 5 张牌 → check_drafts 5 篇全过, 之后 score_drafts 一次都没调, 模型却跟
+# 用户说「已存档并打分」, 报了 88 / 92 分和几条建议 —— 全是编的(库里 0 批、0 条 batch_metrics), 稿子也没先给用户看。和 10-28
+# 途鸽那轮(W-29 / W-38)同一个形状: 查完重就当交付了。docstring 里写了「交给用户之前调 score_drafts」, 但模型读的是返回值,
+# 所以把下一步写进返回值本身: 这几篇还没存、还没有分数和合规结论, 那些只在 score_drafts 的返回里。只改服务端说的话, 协议不动。
+CHECK_NEXT_STEP = ("这 {n} 篇还没存档, 也还没有参考分和合规结论 —— 那些只在 score_drafts 的返回里。下一步: 把要交付的这几篇"
+                   "原样(同样的标题、正文、angle_key, 改稿的带同样的 replaces_version_id)交给 score_drafts, 再把它返回的交付稿"
+                   "(有 delivery 就原样给 delivery.text)交给用户。{warn}调 score_drafts 之前, 不要跟用户说已经存了或打过分, "
+                   "不要报任何分数和合规结论, 也不要只给摘要不给全文。")
+# warn 照协议第 4 条: 第一次查到的先换个切入重写一次再查, 还是 warn 才照常交(复审: 不分开说的话, 照返回值办事的模型会把头一回
+# warn 的稿子原样存掉, 跳过那次重写)。服务端分不出这是第几次查, 所以两种都写上。
+CHECK_NEXT_STEP_WARN = ("其中 {m} 篇是 warn: 这一轮第一次查到 warn 的, 先换个切入重写一次再查; 重查还是 warn 的, "
+                        "照常和其余的一起交给 score_drafts。")
+
+
+def _add_check_next_step(out: dict) -> None:
+    """查重有过了的(pass / warn)就在返回里写明下一步是 score_drafts; 全是 reject 或没有稿子时不加。warn 的另起一句,
+    照协议先重写一次再查。"""
+    s = out.get("summary") if isinstance(out, dict) else None
+    if not isinstance(s, dict):
+        return
+    warn = int(s.get("warn") or 0)
+    n = int(s.get("pass") or 0) + warn
+    if n > 0:
+        out["next_step"] = CHECK_NEXT_STEP.format(n=n, warn=CHECK_NEXT_STEP_WARN.format(m=warn) if warn else "")
+
+
 def check_drafts(project_id: str, drafts: list[dict],
                  _user_id: str | None = None) -> dict:
     """查重硬闸。成稿后【必须】调这个才能交付。
@@ -570,6 +596,7 @@ def check_drafts(project_id: str, drafts: list[dict],
     # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。正文 / 标题放错了字段的先对上(_draft_fields), 不然这一篇只按标题查。
     drafts = _draft_fields(drafts, "check_drafts", project_id)
     out = core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id, record_snapshot=True)
+    _add_check_next_step(out)
     # W-29: 判定之后才查; 查不到就不带, 判定结果原样回去。2026-10-30 复审: 只在这批稿子带了 angle_key 时查 —— 团队共用一个
     # 身份, 没带牌的查重(改一篇别的对话交付的稿、用户点题的单篇)查到的全是队友手上的牌, 那句「都存完再给用户看」只会添乱。
     if isinstance(drafts, list) and any(isinstance(d, dict) and str(d.get("angle_key") or "").strip() for d in drafts):
@@ -730,7 +757,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     重新走 check_drafts; 用户看过撞的是哪一条还是坚持要用, 就原样交给他, 用一句话告诉他这篇不会存进写作台的历史稿
     (``note`` 里也是这句; 分给它的牌没销账是你这边的事, 不用跟用户提)。这两种之外的不是撞车, 稿子不用重写:
     ``gate="replace_lookup"`` 是 ``replaces_version_id`` 对不上, 改对 id 再调一次; ``gate="empty_body"`` 是这篇的
-    ``body`` 是空的(正文放错了字段), 把正文放进 ``body`` 原样再调一次本工具。``gate_summary`` 里该告诉用户的(semantic_degraded / empty_history_warning)
+    ``body`` 是空的(正文放错了字段), 把正文放进 ``body`` 原样再调一次本工具; ``gate="version_lookup"`` 是稿子上带了本项目里
+    查不到的 ``version_id``, 新稿去掉它、改稿换成 ``replaces_version_id``, 再调一次。``gate_summary`` 里该告诉用户的(semantic_degraded / empty_history_warning)
     照 check_drafts 的规矩说。
 
     **每条都带 ``angle_key``**(draw_angles 分给它的那组)。``unattributed`` 非零就是有几条没带 —— 那几个角度没销账,
@@ -1083,6 +1111,9 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
     except core.rulecheck.CheckError as exc:
         # check 写错是参数问题(400), 不是服务坏了(500): 500 会让模型拿同一个 check 一直重试
         raise InvalidInput(f"check 写错了, 这条规则没记: {exc}") from exc
+    except core.RuleInputError as exc:
+        # 方向档 / 原文 / 档位写错同理(外部审计 11-02 F06): 校验都在写库之前, 报这个时一行没写
+        raise InvalidInput(f"这条规则没记: {exc}") from exc
     # 2026-10-30 复审: 不再带 archive_pending(W-29 原来带, 理由是记规则多半是看了稿给的反馈、改完的稿子同样要存档)。团队共用
     # 一个身份, 一场只说了「以后别用感叹号」的对话也会拿到队友没存的牌和「都存完再给用户看」; 而这场真抽了牌的, 改完的稿子
     # 照样要过 check_drafts(带 angle_key), 提醒在那里一样到。

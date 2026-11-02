@@ -104,6 +104,18 @@ def _seed_version(c, vid: str, project_id: str) -> None:
                   "batches": {"project_id": project_id}}})
 
 
+def _after_the_commit_lookup(real, then):
+    """外部审计 11-02 F05: 自带 version_id 的稿子, commit 拿锁之前先按本项目核一次(第一次 items_for_versions, 核不上的
+    直接拒)。这里要钉的是判定那一步自己的那次查询(_judge_owned_only), 第一次放给真的, 之后的交给 ``then``。"""
+    calls = []
+
+    def _impl(*a, **k):
+        calls.append(a[2] if len(a) > 2 else k.get("version_ids"))
+        return real(*a, **k) if len(calls) == 1 else then(*a, **k)
+    _impl.calls = calls
+    return _impl
+
+
 def _client(*, maps=None, tv_projects=None, cls=None) -> _TVClient:
     c = (cls or _TVClient)(
         rows={"projects": [{"id": PROJ, "name": "途鸽", "brand": "途鸽", "owner_id": ME,
@@ -334,9 +346,11 @@ def test_caller_supplied_ids_that_are_not_this_projects_are_never_sent(judge_on)
     """codex review P1 on #92: 调用方自带的 version_id 发之前要按本项目核一遍。
 
     judge 收到 write=true 就按 subject_id 写账本: 过期的 UUID 留下一组孤儿答案, 别的项目
-    的 UUID 把这篇的判定记到了那个项目的版本名下。这两种都不许发出去, 记进 skipped;
-    本项目的那一版照判, 而且发的是库里的规范写法(调用方写成大写 PG 照认, 账本按文本
-    JOIN 就对不上了)。入库照常 4 篇都进 —— 这是判定名单的事, 不是入库的事。"""
+    的 UUID 把这篇的判定记到了那个项目的版本名下。这两种都不许发出去; 本项目的那一版照判,
+    而且发的是库里的规范写法(调用方写成大写 PG 照认, 账本按文本 JOIN 就对不上了)。
+
+    外部审计 11-02 F05(2026-11-02): 以前这两篇照样入库(写了指纹), 只是不判; 现在入库之前就按本项目核, 核不上的按
+    gate=version_lookup 拒掉 —— 不写指纹、不判、不算 written。"""
     c = _client()
     fresh = _distinct_drafts(1)[0]
     out = core.commit_drafts(c, PROJ, [
@@ -345,25 +359,27 @@ def test_caller_supplied_ids_that_are_not_this_projects_are_never_sent(judge_on)
         {"title": "本项目的, 写成大写", "body": BODY_C, "version_id": CALLER_VID.upper()},
         fresh,
     ], user_id=ME)
-    assert out["written"] == 4 and len(out["version_ids"]) == 1
+    assert out["written"] == 2 and len(out["version_ids"]) == 1
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "version_lookup"), (1, "version_lookup")]
+    fps = {r["version_id"] for r in c.rows.get("draft_fingerprints", [])}
+    assert OTHER_VID not in fps and STALE_VID not in fps, "核不上的 id 进了指纹库"
     minted = out["version_ids"][0]
     sent = _subject_ids(judge_on)
     assert OTHER_VID not in sent, "别的项目的版本被发去写账本了 —— 判定会记到那个项目名下"
     assert STALE_VID not in sent, "库里没有的版本被发去写账本了 —— 账本里多一组孤儿答案"
     assert sent == sorted([CALLER_VID, minted]), sent
     j = out["judge"]
-    assert [(s["index"], s["reason"]) for s in j["skipped"]] == [
-        (0, core.JUDGE_SKIP_NOT_IN_PROJECT), (1, core.JUDGE_SKIP_NOT_IN_PROJECT)]
+    assert j["skipped"] == [], "被拒的不进判定名单"
     assert [(r["index"], r["version_id"]) for r in j["results"]] == [(2, CALLER_VID), (3, minted)]
     assert j["summary"] == {"ok": 2}
     m = c.rows["batch_metrics"][0]["meta"]
-    assert [s["reason"] for s in m["judge_skipped"]] == [core.JUDGE_SKIP_NOT_IN_PROJECT] * 2
+    assert m["rejected_by"] == {"version_lookup": 2}
 
 
 def test_the_ownership_lookup_only_sees_well_formed_uuids(judge_on, monkeypatch):
     """不是 UUID 的不送进 IN 查询: versions.id 是 uuid 列, 一个坏值会让 PG 在解析阶段拒掉
-    整条查询, 连累同批的好 id(同 _is_uuid)。坏值本身记 version_not_in_project。
-    (真库里坏值在写指纹那一步就过不去 —— 这里钉的是判定这层自己不依赖那一步。)"""
+    整条查询, 连累同批的好 id(同 _is_uuid)。F05 之后入库前那次核对(第一次查询)和判定那次都只送好的;
+    坏值那篇入库前就按 version_lookup 拒了, 不写指纹、不进判定名单。"""
     seen: list[list[str]] = []
     real = store.items_for_versions
 
@@ -375,10 +391,11 @@ def test_the_ownership_lookup_only_sees_well_formed_uuids(judge_on, monkeypatch)
         {"title": "坏 id", "body": BODY_A, "version_id": "not-a-uuid"},
         {"title": "本项目的", "body": BODY_B, "version_id": CALLER_VID},
     ], user_id=ME)
-    assert seen == [[CALLER_VID]], seen
+    assert seen and all(ids == [CALLER_VID] for ids in seen), seen
+    assert [(r["index"], r["gate"]) for r in out["rejected"]] == [(0, "version_lookup")]
+    assert "不是合法的 UUID" in out["rejected"][0]["reason"]
     assert _subject_ids(judge_on) == [CALLER_VID]
-    assert [(s["index"], s["reason"]) for s in out["judge"]["skipped"]] == [
-        (0, core.JUDGE_SKIP_NOT_IN_PROJECT)]
+    assert out["judge"]["skipped"] == []
 
 
 def test_an_ownership_lookup_failure_holds_back_only_the_caller_supplied_ones(judge_on, monkeypatch):
@@ -386,7 +403,8 @@ def test_an_ownership_lookup_failure_holds_back_only_the_caller_supplied_ones(ju
     本次新建的 id 是这次调用自己在本项目里建的, 照发 —— 一次查询故障不该连累它们。"""
     def boom(*a, **k):
         raise RuntimeError("versions 查询 57014 canceling statement due to statement timeout")
-    monkeypatch.setattr(store, "items_for_versions", boom)
+    # 入库前那次(F05)查成了, 判定那次失败
+    monkeypatch.setattr(store, "items_for_versions", _after_the_commit_lookup(store.items_for_versions, boom))
     out = core.commit_drafts(_client(), PROJ, [
         {"title": "UI 生成的那版", "body": BODY_A, "version_id": CALLER_VID},
         {"title": "写作台新写的", "body": BODY_B},
@@ -540,8 +558,9 @@ def test_no_tv_mapping_means_nothing_leaves_the_building(judge_on, monkeypatch):
     """没接 tv-map = 判不出项目号和品类。用写作台 UUID 凑一个的话, judge 认不出它、
     只能按未清关跑通用层 —— 一个没接 tv-map 的处方药项目的草稿就这样发给了 Jev。
     反正一篇都不发, 自带 version_id 的归属也就不用查了。"""
-    monkeypatch.setattr(store, "items_for_versions",
-                        lambda *a, **k: pytest.fail("一篇都不发还去查了归属"))
+    monkeypatch.setattr(store, "items_for_versions",          # 入库前那次核对(F05)不算, 判定那边不许再查
+                        _after_the_commit_lookup(store.items_for_versions,
+                                                 lambda *a, **k: pytest.fail("一篇都不发还去查了归属")))
     out = core.commit_drafts(_client(maps=[]), PROJ, [
         {"title": "甲", "body": BODY_A},
         {"title": "UI 生成的那版", "body": BODY_B, "version_id": CALLER_VID}], user_id=ME)
@@ -560,7 +579,9 @@ def test_not_configured_sends_nothing_and_reads_nothing(monkeypatch):
     monkeypatch.setattr(config, "JUDGE_API_KEY", "")
     monkeypatch.setattr(requests, "post", lambda *a, **k: pytest.fail("没配置却发了请求"))
     monkeypatch.setattr(store, "tv_projects_of", lambda *a, **k: pytest.fail("没配置却去查了 tv-map"))
-    monkeypatch.setattr(store, "items_for_versions", lambda *a, **k: pytest.fail("没配置却去查了归属"))
+    monkeypatch.setattr(store, "items_for_versions",          # 入库前那次核对(F05)不算, 判定那边不许再查
+                        _after_the_commit_lookup(store.items_for_versions,
+                                                 lambda *a, **k: pytest.fail("没配置却去查了归属")))
     out = core.commit_drafts(_client(), PROJ, [{"title": "甲", "body": BODY_A},
                                                {"title": "乙", "body": BODY_B,
                                                 "version_id": CALLER_VID}], user_id=ME)
@@ -637,7 +658,9 @@ def test_a_stalled_lookup_before_sending_is_inside_the_shared_deadline(judge_on,
     def stuck(*a, **k):
         release.wait(10)
         return real(*a, **k)
-    monkeypatch.setattr(store, stalled, stuck)
+    # items_for_versions: 入库前那次核对(F05, 拿锁之前、不在判定的截止里)放过去, 卡判定那次
+    monkeypatch.setattr(store, stalled, _after_the_commit_lookup(real, stuck) if stalled == "items_for_versions"
+                        else stuck)
 
     c = _client()
     t0 = time.monotonic()

@@ -23,9 +23,15 @@ T0 = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
 TITLE = "秋招投了六十份简历没回音"
 DRAFT = ("投到第六十份的时候我开始怀疑是不是邮箱坏了, 后来发现坏的是简历第一行。"
          "改完之后一周里来了三个面试, 才知道之前的六十份全都倒在第一行上。")
-# 标题一样、正文改过很多的发出去的版本(title_exact)
-REWRITE = ("六十份简历石沉大海那阵子, 我每天早上第一件事就是刷邮箱。"
-           "后来一个学姐只看了一眼就说: 你第一行写的是求职意向, 没人关心这个。换成项目结果之后, 一周三个面试。")
+# 标题一样、正文改过很多的发出去的版本(title_exact)。外部审计 11-02 F04(2026-11-02)之后标题档要正文也沾得上边(包含度到
+# tvlink.EDITED_FLOOR): 原来那句和底稿只有 0.03 的重合 —— 那正是 F04 不再认的"只有标题一样", 改成留了几句原话的改写(0.345)
+REWRITE = ("六十份简历石沉大海那阵子, 我每天早上第一件事就是刷邮箱, 开始怀疑是不是邮箱坏了, 后来发现坏的是简历第一行。"
+           "一个学姐只看了一眼就说: 你第一行写的是求职意向, 没人关心这个。改完之后一周里来了三个面试。")
+
+
+# F04 之前的那句(和底稿只有 0.03 的重合): 标题一样、几乎整篇重写。复审要求把它现在怎么走钉住(下面 F04 复审那条)
+OLD_REWRITE = ("六十份简历石沉大海那阵子, 我每天早上第一件事就是刷邮箱。"
+               "后来一个学姐只看了一眼就说: 你第一行写的是求职意向, 没人关心这个。换成项目结果之后, 一周三个面试。")
 
 
 def _iso(days):
@@ -276,7 +282,8 @@ def test_the_reread_under_the_lock_keeps_versions_already_done():
     # n1 的文字前一晚已经记在 v1 下, n2 这晚要记在 v2 下: 锁里重读要把两版都读回来, 不能把 v1 当成"没有指纹行"再记一遍
     title2 = "面试官只问了我一个数字"
     draft2 = "第一次面试被问到转化率的时候我愣住了, 因为那个数字是我编进简历的。后来我把每个数字都换成能讲出来历的那个。"
-    post2 = "被问到转化率那一刻我才明白, 简历上每个数字都要能讲出来历。后来我只写自己能讲半小时的那三个数。"
+    # 留了半句原话(包含度 0.5): F04 之后标题档要正文也沾得上边, 原来那句只有 0.17
+    post2 = "被问到转化率那一刻我愣住了, 因为那个数字是我编进简历的。后来我只写自己能讲半小时的那三个数。"
     c = _client([_note("n1", TITLE, REWRITE), _note("n2", title2, post2)])
     _add_version(c, "v2", title2, draft2, days=1)
     c.rows["draft_fingerprints"].append(_fp_row("f-pub", "v1", REWRITE))
@@ -343,3 +350,28 @@ def test_rows_removed_while_waiting_for_the_lock_still_get_the_version_time(monk
     assert out["published_fp"]["written"] == 1 and out["published_fp"]["no_rows"] == 1
     (row,) = _rows(c)
     assert row["created_at"] == _iso(0), row["created_at"]
+
+
+def test_a_same_title_rewrite_below_the_floor_is_held_without_its_text_then_ingested():
+    """外部审计 11-02 F04 复审, 钉住现在的行为: 标题一样、几乎整篇重写(和底稿 0.03)的帖, 以前 title_exact 连到 v1、W-40 把
+    文字记在 v1 下; 现在只有标题一样不算对上 —— 先 ambiguous 等人看 core.TV_WEAK_TITLE_GRACE_DAYS 天, 这几天文字不在指纹库里
+    (认了的代价: 记在 v1 下是说它来自 v1, 记成补录又是终态); 满了没人判就补录, 文字进库。"""
+    note = tvlink.Note.from_row(_note("n1", TITLE, OLD_REWRITE))
+    v1 = tvlink.Version(version_id="v1", project_id=P1, title=TITLE, body=DRAFT, created_at=None)
+    assert tvlink.overlap(note, v1) < 0.05 and tvlink.title_without_body(note, v1)
+    c = _client([_note("n1", TITLE, OLD_REWRITE)])
+    out = core.tv_sync(c, TV)
+    link = next(l for l in c.rows["tv_note_links"] if l["note_id"] == "n1")
+    assert link["match_kind"] == "ambiguous" and link["version_id"] is None
+    assert out["published_fp"]["checked"] == 0 and len(_rows(c)) == 1 and len(c.rows["draft_fingerprints"]) == 1
+    assert out["ingest"] is None and out["weak_title"]["held"] == 1
+
+    mark = next(x for x in link["candidates"] if core.WEAK_SINCE_KEY in x)
+    mark[core.WEAK_SINCE_KEY] = "2026-01-01"
+    out = core.tv_sync(c, TV)
+    link = next(l for l in c.rows["tv_note_links"] if l["note_id"] == "n1")
+    assert link["match_kind"] == "ingested" and out["weak_title"]["released"] == 1
+    assert any(r["opening_hash"] == fp.opening_hash(OLD_REWRITE) and r["ngram_hashes"] == fp.ngram_hashes(OLD_REWRITE)
+               for r in c.rows["draft_fingerprints"] if r.get("version_id") == link["version_id"])
+    assert len(_rows(c)) == 1, "不记在 v1 名下"
+

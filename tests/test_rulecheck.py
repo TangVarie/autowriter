@@ -447,6 +447,45 @@ def test_a_bad_check_writes_nothing_and_is_a_400(rule_client, monkeypatch):
         tools.record_rule(PROJ, "示例规则", check={"kind": "forbidden_word", "words": []}, _user_id=ME)
 
 
+@pytest.mark.parametrize("bad", [{"applicability": "产品向为主"}, {"applicability": "偏流量向"},
+                                 {"severity": "critical"}, {"scope": "team"}, {"content": "   "}])
+def test_a_bad_parameter_writes_nothing_and_is_a_400(rule_client, monkeypatch, bad):
+    """外部审计 11-02 F06(2026-11-02): 方向档原来是写完规则之后才查的 —— applicability="产品向为主" 报了错(还是 500), 可规则
+    已经以「已确认、硬约束、无方向」落了库, 每个方向的项目都注入它(审计复现 probes/test_probe_f06.py)。现在所有参数都在写库
+    之前查完, 错了一行不写, 工具层是 400。"""
+    kw = {"content": "标题不超过18字", "severity": "hard", **bad}
+    content = kw.pop("content")
+    with pytest.raises(core.RuleInputError):
+        core.record_rule(rule_client, PROJ, content, user_id=ME, **kw)
+    assert rule_client.rows["memories"] == [], "参数错了规则却落了库"
+    assert not [c for c in rule_client.calls if c["op"] in ("insert", "update", "upsert")]
+    monkeypatch.setattr(core, "sb", lambda: rule_client)
+    with pytest.raises(tools.InvalidInput, match="这条规则没记"):
+        tools.record_rule(PROJ, content, _user_id=ME, **kw)
+    assert rule_client.rows["memories"] == []
+
+
+def test_a_bad_direction_on_an_existing_rule_changes_nothing(rule_client):
+    """已有的规则再记一次带了坏方向: 计票、档位、方向一样都不动(以前 upsert 先把 frequency +1、severity 写回去了)。"""
+    core.record_rule(rule_client, PROJ, "标题不超过18字", user_id=ME, applicability="产品向")
+    before = dict(rule_client.rows["memories"][0])
+    with pytest.raises(core.RuleInputError):
+        core.record_rule(rule_client, PROJ, "标题不超过18字", severity="hard", user_id=ME, applicability="产品向为主")
+    assert rule_client.rows["memories"] == [before]
+
+
+def test_a_new_rule_is_born_with_its_direction(rule_client, monkeypatch):
+    """新建的规则一次 insert 就带着方向和 check(F06): 后面单独写方向的那一步失败了, 库里也不会留一条「无方向」的规则。"""
+    def boom(*a, **k):
+        raise RuntimeError("memories update 超时")
+    monkeypatch.setattr(store, "update_memory_fields", boom)
+    with pytest.raises(RuntimeError):
+        core.record_rule(rule_client, PROJ, "结尾不收口", user_id=ME, applicability="流量向",
+                         check={"kind": "forbidden_word", "words": ["总之"]})
+    row = rule_client.rows["memories"][0]
+    assert row["applicability"] == "流量向" and row["rule_kind"] == "forbidden_word"
+
+
 def test_old_record_rule_callers_are_unaffected(rule_client):
     out = core.record_rule(rule_client, PROJ, "一条普通规则", user_id=ME)
     assert "check" not in out

@@ -252,25 +252,78 @@ def _pick(note: Note, cands: list[Version], index: VersionIndex) -> tuple[Versio
     return None, best_s, listed
 
 
+# ── 标题一样、正文不像的不认标题(2026-11-02, 外部审计 11-02 F04) ─────────────────────────────────
+# 标题档原来一个候选就直接认 title_exact、不看正文(几个候选时 _pick 按时间窗挑, 也没有下限): 同一个标题、正文毫不相干的两篇
+# 被连上, 包含度 0.0, lag 0(审计复现)。连上之后一路都认它: TV 血缘回填、发布原文记指纹、改动差异(进每周摘要)、TV 的接住率。
+# 10-27 W-34 也清不掉 —— 它只在 TV 正文改过字时才核, 重对又经标题档对回同一版。生产库 124 条 title_exact 里 2 条是这种
+# (SPX 0.063、途鸽 0.076, 写作台那版都有完整正文; 途鸽那条的改动差异是 2697 → 188 字、"删了 59 句")。
+# 所以: 笔记和那一版的正文都够 FUZZY_MIN_GRAMS 个四字串、包含度又不到 EDITED_FLOOR(match_snapshot 精确档和 still_same 用的
+# 同一条线)的, 标题档不认它, 走下面的内容对(fuzzy / edited); 内容也对不上就 ambiguous, 把这几版列进候选、标 WEAK_TITLE_KEY ——
+# 留给人看(ambiguous_samples / tv-resolve), 不当 unmatched 去补录。只有标题的稿(HATHERINE 那 59 条)、只有标题的笔记(四字串
+# 不够)照旧: 正文没得比, 标题就是全部证据。不加新的 match_kind(要改 CHECK 约束和 TV 的 CAUGHT_KINDS)。
+# 复审(同日): ambiguous 不进补录、W-40 也不记它的文字 —— 只因为标题一样就挂着, 发出去的文字查重一直看不见、底稿(W-38)也不对。
+# 所以 tv_sync 把"只是标题一样"的(weak_title_only)先当 unmatched 对一遍底稿, 底稿认领就转正; 没认领的 ambiguous 只挂
+# core.TV_WEAK_TITLE_GRACE_DAYS 天等人看, 满了照常补录。时间窗外的同标题连候选都不算(下面 match_note)。
+WEAK_TITLE_KEY = "weak_title"
+
+
+def _weak_title(note_grams: set[str], version_grams: set[str]) -> bool:
+    return (len(note_grams) >= FUZZY_MIN_GRAMS and len(version_grams) >= FUZZY_MIN_GRAMS
+            and len(note_grams & version_grams) / len(note_grams) < EDITED_FLOOR)
+
+
+def title_without_body(note: Note, v: Version) -> bool:
+    """标题档连上的这一对, 正文其实不像(见上面那段): 两边正文都够长、包含度不到 EDITED_FLOOR。tv-sync 拿它复核以前按
+    标题连上的对照(core.tv_sync)。"""
+    return _weak_title(grams(note.body), grams(v.body))
+
+
+def weak_title_only(m: Match) -> bool:
+    """match_note 判 ambiguous 只是因为标题一样: 候选全是 WEAK_TITLE_KEY 的(内容那一路什么都没对上 —— 它分不出时列的候选
+    包含度都 ≥ EDITED_FLOOR, 不会标 weak)。tv_sync 拿它把这种帖先当 unmatched 对一遍查重底稿, 再定等人看还是补录(F04 复审)。"""
+    return m.kind == "ambiguous" and bool(m.candidates) and all(c.get(WEAK_TITLE_KEY) for c in m.candidates)
+
+
 def match_note(note: Note, index: VersionIndex) -> Match:
     pk = prefix_key(note.body)
     exact = list(index.by_prefix.get(pk, ())) if pk else []
     kind = "body_exact"
+    ng = grams(note.body)
+    weak: list[Version] = []
     if not exact:
         tk = title_key(note.title)
         exact = list(index.by_title.get(tk, ())) if tk else []
         kind = "title_exact"
+        # F04: 标题一样、正文不像的不进标题档(见上面那段); 剩下的(正文像的、只有标题的稿)照旧
+        weak = [v for v in exact if _weak_title(ng, index.grams_of(v))]
+        exact = [v for v in exact if not any(v is w for w in weak)]
+        # 2026-11-02 外部审计 11-02 F04 复审: 时间窗外的(发布比那一版早 / 晚 30 天以上)连"只有标题一样"的候选都不算 ——
+        # 半年后拿一个旧标题写的另一篇, 是 unmatched(→ 补录进指纹库), 不该挂成 ambiguous 等人看(内容那一路本来就只看窗口里的)
+        weak = [v for v in weak if in_window(lag_days(note, v))]
     if exact:
         if len(exact) == 1:
             v = exact[0]
             return Match(kind, v, 1.0 if kind == "body_exact" else
-                         index.containment(grams(note.body), v), lag_days(note, v))
+                         index.containment(ng, v), lag_days(note, v))
         v, score, listed = _pick(note, exact, index)
         if v is not None:
             return Match(kind, v, score, lag_days(note, v), listed)
         return Match("ambiguous", None, score, None, listed)
 
-    ng = grams(note.body)
+    m = _match_by_content(note, ng, index)
+    if weak and m.version is None:
+        # 内容也对不上(或分不出): 标题一样的那几版列进候选、标 WEAK_TITLE_KEY, 记 ambiguous 等人看
+        listed = {c["version_id"]: c for c in (m.candidates if m.kind == "ambiguous" else [])}
+        scored = sorted(((index.containment(ng, v), v) for v in weak), key=lambda t: -t[0])
+        for s, v in scored:
+            listed[v.version_id] = {**_cand(note, v, s), WEAK_TITLE_KEY: True}
+        score = m.score if m.kind == "ambiguous" else scored[0][0]
+        return Match("ambiguous", None, score, None, list(listed.values()))
+    return m
+
+
+def _match_by_content(note: Note, ng: set[str], index: VersionIndex) -> Match:
+    """开头 / 标题都没对上(或标题档不认)时按四字串包含度对: fuzzy / edited / ambiguous / unmatched。"""
     if len(ng) < FUZZY_MIN_GRAMS:
         return Match("unmatched")
     scored = sorted(((index.containment(ng, v), v) for v in index.versions
