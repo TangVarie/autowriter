@@ -687,6 +687,24 @@ def test_a_carried_borrow_does_not_erase_an_overlapping_sessions_count(monkeypat
     assert core.batch_arm(PID, ME, from_brief=b["flywheel_arm"])[3] is None
 
 
+def test_after_a_restart_a_carried_borrow_does_not_take_over_another_sessions_lone_record(monkeypatch, fresh_arms):
+    """第四轮复审 (aw#139): A 开项目 2 条 → 重启(进程内存清空) → B 开项目降级 0 条 → A 带着臂补借拿到 1 条。这时列表里
+    唯一那条是 B 的, 不是 A 自己的(A 那条随重启丢了): 替换的话 B 那批记成 1 条, 应该记 None。"""
+    two = PATTERNS + [dict(PATTERNS[0], id="p2", label="规律二", instruction="另一条。")]
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(two))
+    a = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    monkeypatch.setattr(core, "_borrowed_arms", {})                       # 重启
+    monkeypatch.setattr(core, "_patterns_shown", {})
+    monkeypatch.setattr(core, "_ARMS_SINCE", datetime.now(timezone.utc))
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _degraded([]))
+    b = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=a["flywheel_arm"])
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm=b["flywheel_arm"])
+    assert params["flywheel_patterns_shown"] is None and meta["flywheel_patterns_shown"] is None
+
+
 # ── 共用身份的几场叠在一起 (F13 复审, 2026-11-02) ────────────────────────────────────────────────────
 # 团队共用一个 user_id: 同一个项目同一天的几场拿到同一个臂、记在同一个键下。以前只留最后一次借卡的条数, A 场入库记的是 B 场的
 # (复审复现: A 简报 1 条、B 降级 0 条 → A 的批次记 0; 反过来 A 超时 0 条、B 3 条 → A 没看到规律的批次记 3, 进了处理组)。
