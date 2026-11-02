@@ -263,6 +263,7 @@ def _server_texts() -> dict[str, str]:
     texts["core._check_rules_next_step(must_fix)"] = core._check_rules_next_step({"must_fix": 1}, 0)
     texts["core.PROJECT_NOT_FOUND_NEXT"] = core.PROJECT_NOT_FOUND_NEXT
     texts["tools.CHECK_NEXT_STEP"] = T.CHECK_NEXT_STEP
+    texts["tools.CHECK_NEXT_STEP_WARN"] = T.CHECK_NEXT_STEP_WARN
     texts["core._angle_key_mismatch_note(all)"] = core._angle_key_mismatch_note(
         {store.ANGLE_KEY_UNKNOWN: 1, store.ANGLE_KEY_USED: 1, store.ANGLE_KEY_OTHER_PROJECT: 1,
          store.ANGLE_KEY_NOT_IN_LEDGER: 1})
@@ -380,6 +381,12 @@ def test_check_drafts_says_the_batch_is_not_saved_until_score_drafts():
     assert "这 2 篇还没存档" in step and "score_drafts" in step and "delivery.text" in step
     assert "不要跟用户说已经存了" in step and "分数和合规结论" in step and "只给摘要不给全文" in step
     assert "replaces_version_id" in step, "改稿带着 replaces_version_id 原样交给 score_drafts"
+    # 复审: warn 照协议第 4 条先换切入重写一次再查, 不能叫模型把头一回 warn 的原样存掉
+    assert "其中 1 篇是 warn" in step and "先换个切入重写一次再查" in step and "重查还是 warn" in step
+    all_pass = {"results": [{"verdict": "pass"}] * 5, "summary": {"total": 5, "pass": 5, "warn": 0, "reject": 0}}
+    T._add_check_next_step(all_pass)
+    assert "这 5 篇还没存档" in all_pass["next_step"] and "warn" not in all_pass["next_step"]
+    assert "{" not in all_pass["next_step"] and "{" not in step, "占位符都填上了"
     only_rejects = {"results": [{"verdict": "reject"}], "summary": {"total": 1, "pass": 0, "warn": 0, "reject": 1}}
     T._add_check_next_step(only_rejects)
     assert "next_step" not in only_rejects, "全被拦下就没有要存的, 不加"

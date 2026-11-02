@@ -669,6 +669,24 @@ def test_a_carried_retry_after_an_empty_brief_records_what_the_retry_showed(monk
     assert core.batch_arm(PID, ME, from_brief=arm)[3] == len(PATTERNS), "上一场补借之前那条 0 不留下来拖成 None"
 
 
+def test_a_carried_borrow_does_not_erase_an_overlapping_sessions_count(monkeypatch, fresh_arms):
+    """第三轮复审 (aw#139): 共用身份, A 开项目 k 条、B 开项目降级 0 条、A 换话题带着臂再借又是 k 条。补借要是替换最近那条,
+    抹掉的是 B 的 0, B 那批就记成了它没看到的 k 条; 应该照旧追加, 两场条数不一样记 None。B 之后自己补借还是 0 也一样。"""
+    monkeypatch.setattr(core, "flywheel_arm", lambda pid, uid, **kw: "patterns")
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    a = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _degraded([]))
+    b = core.build_writing_brief(_client(), PID, user_id=ME, brief={})
+    assert core.batch_arm(PID, ME, from_brief=b["flywheel_arm"])[3] is None
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
+    core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=a["flywheel_arm"], draft_topic="换个话题")
+    out, params, meta = _commit_out(monkeypatch, flywheel_arm=b["flywheel_arm"])
+    assert params["flywheel_patterns_shown"] is None and meta["flywheel_patterns_shown"] is None
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", _degraded([]))
+    core.borrow_lessons(_client(), PID, user_id=ME, flywheel_arm=b["flywheel_arm"])   # B 自己补借, 还是 0
+    assert core.batch_arm(PID, ME, from_brief=b["flywheel_arm"])[3] is None
+
+
 # ── 共用身份的几场叠在一起 (F13 复审, 2026-11-02) ────────────────────────────────────────────────────
 # 团队共用一个 user_id: 同一个项目同一天的几场拿到同一个臂、记在同一个键下。以前只留最后一次借卡的条数, A 场入库记的是 B 场的
 # (复审复现: A 简报 1 条、B 降级 0 条 → A 的批次记 0; 反过来 A 超时 0 条、B 3 条 → A 没看到规律的批次记 3, 进了处理组)。

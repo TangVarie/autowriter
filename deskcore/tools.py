@@ -525,20 +525,26 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
 # 用户说「已存档并打分」, 报了 88 / 92 分和几条建议 —— 全是编的(库里 0 批、0 条 batch_metrics), 稿子也没先给用户看。和 10-28
 # 途鸽那轮(W-29 / W-38)同一个形状: 查完重就当交付了。docstring 里写了「交给用户之前调 score_drafts」, 但模型读的是返回值,
 # 所以把下一步写进返回值本身: 这几篇还没存、还没有分数和合规结论, 那些只在 score_drafts 的返回里。只改服务端说的话, 协议不动。
-CHECK_NEXT_STEP = ("这 {n} 篇还没存档, 也还没有参考分和合规结论 —— 那些只在 score_drafts 的返回里。下一步: 把这几篇原样"
-                   "(同样的标题、正文、angle_key, 改稿的带同样的 replaces_version_id)交给 score_drafts, 再把它返回的交付稿"
-                   "(有 delivery 就原样给 delivery.text)交给用户。调 score_drafts 之前, 不要跟用户说已经存了或打过分, "
+CHECK_NEXT_STEP = ("这 {n} 篇还没存档, 也还没有参考分和合规结论 —— 那些只在 score_drafts 的返回里。下一步: 把要交付的这几篇"
+                   "原样(同样的标题、正文、angle_key, 改稿的带同样的 replaces_version_id)交给 score_drafts, 再把它返回的交付稿"
+                   "(有 delivery 就原样给 delivery.text)交给用户。{warn}调 score_drafts 之前, 不要跟用户说已经存了或打过分, "
                    "不要报任何分数和合规结论, 也不要只给摘要不给全文。")
+# warn 照协议第 4 条: 第一次查到的先换个切入重写一次再查, 还是 warn 才照常交(复审: 不分开说的话, 照返回值办事的模型会把头一回
+# warn 的稿子原样存掉, 跳过那次重写)。服务端分不出这是第几次查, 所以两种都写上。
+CHECK_NEXT_STEP_WARN = ("其中 {m} 篇是 warn: 这一轮第一次查到 warn 的, 先换个切入重写一次再查; 重查还是 warn 的, "
+                        "照常和其余的一起交给 score_drafts。")
 
 
 def _add_check_next_step(out: dict) -> None:
-    """查重有过了的(pass / warn)就在返回里写明下一步是 score_drafts; 全是 reject 或没有稿子时不加。"""
+    """查重有过了的(pass / warn)就在返回里写明下一步是 score_drafts; 全是 reject 或没有稿子时不加。warn 的另起一句,
+    照协议先重写一次再查。"""
     s = out.get("summary") if isinstance(out, dict) else None
     if not isinstance(s, dict):
         return
-    n = int(s.get("pass") or 0) + int(s.get("warn") or 0)
+    warn = int(s.get("warn") or 0)
+    n = int(s.get("pass") or 0) + warn
     if n > 0:
-        out["next_step"] = CHECK_NEXT_STEP.format(n=n)
+        out["next_step"] = CHECK_NEXT_STEP.format(n=n, warn=CHECK_NEXT_STEP_WARN.format(m=warn) if warn else "")
 
 
 def check_drafts(project_id: str, drafts: list[dict],

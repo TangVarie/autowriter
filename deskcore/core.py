@@ -7683,11 +7683,15 @@ def _note_patterns_shown(project_id, user_id, arm: str, shown: int, *, carry: bo
         n = max(0, int(shown or 0))
         recs = [r for r in _patterns_shown.get(key + (arm,), ()) if at - r[0] <= _ARM_REPORT_TTL]
         if carry and recs:
-            # 接着借是同一场在补自己最近那条(第二轮复审: 开项目借卡超时记了 0, 模型照提示带着臂补借拿到规律 —— 追加一条的话
-            # {0, k} 两个数, 这一场和之后 12 小时同项目的场都成了 None)。替换, 不追加; 那条要是别的场的, 这一场自己更早的
-            # 那条还在列表里, 数不一样 _shown_for 照样回 None。
-            _patterns_shown[key + (arm,)] = recs[:-1] + [(at, max(n, recs[-1][1]))]
-            return
+            n = max(n, recs[-1][1])
+            if len(recs) == 1:
+                # 只有一条 = 就是这一场自己开项目时记的(第二轮复审: 开项目借卡超时记了 0, 模型照提示带着臂补借拿到规律 ——
+                # 追加的话 {0, k} 两个数, 这一场和之后 12 小时同项目的场都成了 None)。替换, 不追加。
+                # 不止一条就照旧追加(第三轮复审): 最近那条可能是共用身份的另一场的, 替换会把它那个数抹掉 —— 这一场自己
+                # 更早那条的数恰好和补借的一样时, 只剩一个数, 另一场那批就记成了它没看到的条数, 而不是 None。
+                # 没盖住的一种: 这一场自己那条已经过了 _ARM_REPORT_TTL 才补借, 那时只剩别的场那条 —— 一场 12 小时以后才补借不现实。
+                _patterns_shown[key + (arm,)] = [(at, n)]
+                return
         _patterns_shown[key + (arm,)] = recs + [(at, n)]
 
 
