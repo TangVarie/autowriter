@@ -1,0 +1,1654 @@
+{
+ "captured_at_commit": "c5ca36c",
+ "note": "DESK_DRAW_POLICY=v2 golden with no layer requested: candidate keys and dims (incl. _draw) handed to deskcore_reserve_angles, repeat rows, delivered cards and the prompt block for fixed seeds (synthetic profiles, see tests/draw_v2_golden.py). Regenerate only if v2 is meant to change.",
+ "cases": [
+  {
+   "case": {
+    "kind": "run",
+    "seed": 0,
+    "n": 3
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "71b7670169071a8b4ba2c3bb87a6cd8ada7afe7452e3537add4a1d02fdbb00f3",
+    "dims_sha256": "d00229c817698064e0f3e0a100908bb8de1ebb620e49a413e256d8fbafda5587",
+    "repeat_rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "angles": [
+     [
+      "f34b17b0265ace49661b",
+      "对比角",
+      "medium",
+      [
+       "特定平台事件"
+      ],
+      "克制",
+      {
+       "emotional_lever": "信息差利用",
+       "human_truth_archetype": "育儿焦虑",
+       "content_format": "场景植入",
+       "title_structure": "数字清单"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类"
+      }
+     ],
+     [
+      "c87b3b3ba71ebe27b55b",
+      "叙事角",
+      "low",
+      [
+       "时代语言范式"
+      ],
+      "克制",
+      {
+       "emotional_lever": "虚荣撬动",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "提问求助",
+       "title_structure": "场景直述"
+      },
+      {
+       "kind": "hit",
+       "own": true,
+       "age_days": 7,
+       "title_structure": "场景直述",
+       "desc": {
+        "opening_type": "具体事件",
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "turning_point": true
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约两成用这种"
+      }
+     ],
+     [
+      "d4246326da60692dd0c7",
+      "共情角",
+      "low",
+      [
+       "特定IP引用"
+      ],
+      "克制",
+      {
+       "emotional_lever": "虚荣撬动",
+       "human_truth_archetype": "自由意志",
+       "content_format": "情感叙事",
+       "title_structure": "疑问句"
+      },
+      {
+       "kind": "external",
+       "title_structure": null,
+       "posted_days_ago": 9,
+       "comments_per_day": 7.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": true,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ]
+    ],
+    "prompt_block_sha256": "6e54e9865a16322036619de65ec0e3f970af1dcdceedb5e200e05327f64cb5b5",
+    "batch": "629fd82c07cd",
+    "batch_note": "新抽的这3篇：1篇情感叙事、1篇场景植入、1篇提问求助，1篇问句标题；1篇参照了本项目近期评论多的帖的结构；1篇参照了同品类别家最近涨得快的帖的结构。",
+    "project_status": "近60天发了180篇，六成是提问求助、两成是场景植入；标题约四成是问句，最常写健康焦虑。这批照这个比例发。"
+   }
+  },
+  {
+   "case": {
+    "kind": "run",
+    "seed": 1,
+    "n": 6
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "3e8923bf42113028226f17d1d1cad145aa65a63146888fa517240936e07f23d7",
+    "dims_sha256": "ca0b32418a8a1ab2c411570373bc02dc08274e6755f2e54d780ac87b78d209b0",
+    "repeat_rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "angles": [
+     [
+      "c0bcb57369d954dd6b1b",
+      "对比角",
+      "low",
+      [
+       "特定平台事件"
+      ],
+      "感性",
+      {
+       "emotional_lever": "认同感建立",
+       "human_truth_archetype": "自我提升",
+       "content_format": "提问求助",
+       "title_structure": "数字清单"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "6655bd06c2095ea81bbd",
+      "叙事角",
+      "low",
+      [
+       "当代流行词"
+      ],
+      "感性",
+      {
+       "emotional_lever": "好奇驱动",
+       "human_truth_archetype": "职场关系",
+       "content_format": "场景植入",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "ab73a39e16d192a4b9a3",
+      "场合角",
+      "low",
+      [
+       "时代语言范式"
+      ],
+      "感性",
+      {
+       "emotional_lever": "认同感建立",
+       "human_truth_archetype": "职场关系",
+       "content_format": "场景植入",
+       "title_structure": "场景直述"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类",
+       "title_structure": "本项目近60天约两成用这种"
+      }
+     ],
+     [
+      "1bca574a7cb2e6415f68",
+      "干货角",
+      "medium",
+      [
+       "平台话术"
+      ],
+      "感性",
+      {
+       "emotional_lever": "造梦投射",
+       "human_truth_archetype": "职场关系",
+       "content_format": "情感叙事",
+       "title_structure": "对白引语"
+      },
+      {
+       "kind": "external",
+       "title_structure": "对白引语",
+       "posted_days_ago": 12,
+       "comments_per_day": 10.0,
+       "desc": {
+        "opening_type": "具体事件",
+        "turning_point": true,
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      null
+     ],
+     [
+      "c87b3b3ba71ebe27b55b",
+      "洞察角",
+      "medium",
+      [
+       "时事热点"
+      ],
+      "感性",
+      {
+       "emotional_lever": "虚荣撬动",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "提问求助",
+       "title_structure": "场景直述"
+      },
+      {
+       "kind": "hit",
+       "own": true,
+       "age_days": 7,
+       "title_structure": "场景直述",
+       "desc": {
+        "opening_type": "具体事件",
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "turning_point": true
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约两成用这种"
+      }
+     ],
+     [
+      "9bdb148d140010db1873",
+      "共情角",
+      "medium",
+      [
+       "节日"
+      ],
+      "感性",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "育儿焦虑",
+       "content_format": "提问求助",
+       "title_structure": "对白引语"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ]
+    ],
+    "prompt_block_sha256": "d6b77a60747e31ed32cb4311e29c5560cbaa1818a074deba9373d925588d113b",
+    "batch": "91b72265b1f5",
+    "batch_note": "新抽的这6篇：3篇提问求助、2篇场景植入、1篇情感叙事，1篇问句标题；1篇参照了本项目近期评论多的帖的结构；1篇参照了同品类别家最近涨得快的帖的结构。",
+    "project_status": "近60天发了180篇，六成是提问求助、两成是场景植入；标题约四成是问句，最常写健康焦虑。这批照这个比例发。"
+   }
+  },
+  {
+   "case": {
+    "kind": "run",
+    "seed": 2,
+    "n": 10
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "91be3c5f3f0ec09d6bcb7bb8eed35bdf7b1d5b0a952673455844a52cf1c54774",
+    "dims_sha256": "0b1f27456eca528e79d355e693bf120f9d163517169e7bf9b41e340f6bb26fdc",
+    "repeat_rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "angles": [
+     [
+      "1d6b01faaff7255b155a",
+      "洞察角",
+      "low",
+      [
+       "节日"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "归属感建立",
+       "human_truth_archetype": "情感缺位",
+       "content_format": "情感叙事",
+       "title_structure": "对白引语"
+      },
+      null,
+      null
+     ],
+     [
+      "badfe40e8d713d66a8e7",
+      "对比角",
+      "high",
+      [
+       "季节性事件"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "身份认同",
+       "content_format": "情感叙事",
+       "title_structure": "比喻起手"
+      },
+      {
+       "kind": "hit",
+       "own": true,
+       "age_days": 9,
+       "title_structure": "比喻起手",
+       "desc": {
+        "opening_type": "具体事件",
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "turning_point": true
+       }
+      },
+      null
+     ],
+     [
+      "92bf1d713fc29fb2c546",
+      "叙事角",
+      "medium",
+      [
+       "时代语言范式"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "共鸣释放",
+       "human_truth_archetype": "自我提升",
+       "content_format": "场景植入",
+       "title_structure": "比喻起手"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类"
+      }
+     ],
+     [
+      "c472039fb96d75cc6d1f",
+      "共情角",
+      "high",
+      [
+       "当代流行词"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "归属感建立",
+       "human_truth_archetype": "身份认同",
+       "content_format": "提问求助",
+       "title_structure": "第一人称自白"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "b7380608d00b9f3944db",
+      "干货角",
+      "high",
+      [
+       "当代流行词"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "造梦投射",
+       "human_truth_archetype": "情感缺位",
+       "content_format": "提问求助",
+       "title_structure": "第一人称自白"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "5bfccc56a0a3d03ef7c6",
+      "场合角",
+      "high",
+      [
+       "时代语言范式"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "罪恶感撬动",
+       "human_truth_archetype": "自由意志",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      {
+       "kind": "external",
+       "title_structure": "对比反转",
+       "posted_days_ago": 7,
+       "comments_per_day": 5.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": true,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "c1d8eeff5c381313f397",
+      "洞察角",
+      "low",
+      [
+       "节日"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "恐惧撬动",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "2911228fe48af0c93f44",
+      "对比角",
+      "medium",
+      [
+       "特定IP引用"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "经济焦虑",
+       "content_format": "提问求助",
+       "title_structure": "比喻起手"
+      },
+      {
+       "kind": "external",
+       "title_structure": "比喻起手",
+       "posted_days_ago": 10,
+       "comments_per_day": 8.0,
+       "desc": {
+        "opening_type": "具体事件",
+        "turning_point": true,
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "3bf717e90ca3fdc6125d",
+      "叙事角",
+      "medium",
+      [
+       "当代流行词"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "好奇驱动",
+       "human_truth_archetype": "代际冲突",
+       "content_format": "提问求助",
+       "title_structure": "数字清单"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "ba191cea48f2286f936b",
+      "共情角",
+      "medium",
+      [
+       "平台话术"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "好奇驱动",
+       "human_truth_archetype": "健康焦虑",
+       "content_format": "场景植入",
+       "title_structure": "数字清单"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类",
+       "human_truth_archetype": "本项目最常写的一种"
+      }
+     ]
+    ],
+    "prompt_block_sha256": "d6f07ee62ed56336b91e2858c9dc09368d091a2d590024a92e1c8256e46f4276",
+    "batch": "dcf4f4bea973",
+    "batch_note": "新抽的这10篇：6篇提问求助、2篇情感叙事、2篇场景植入；1篇参照了本项目近期评论多的帖的结构；2篇参照了同品类别家最近涨得快的帖的结构。",
+    "project_status": "近60天发了180篇，六成是提问求助、两成是场景植入；标题约四成是问句，最常写健康焦虑。这批照这个比例发。"
+   }
+  },
+  {
+   "case": {
+    "kind": "run",
+    "seed": 3,
+    "n": 15
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "daaf7a62c3f62b619e4851c1f1975e5b0a8f2633860d91deacea1f73eb31cfad",
+    "dims_sha256": "5582d975e0b268cfcbe962b009deac6c409c5750963892aead5729cdc6d0d818",
+    "repeat_rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "angles": [
+     [
+      "0e96cacff60960c0ff47",
+      "共情角",
+      "medium",
+      [],
+      "冷静",
+      {
+       "emotional_lever": "虚荣撬动",
+       "human_truth_archetype": "同辈比较",
+       "content_format": "场景植入",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "6e81642e8adf040cec6b",
+      "叙事角",
+      "low",
+      [],
+      "冷静",
+      {
+       "emotional_lever": "恐惧撬动",
+       "human_truth_archetype": "代际冲突",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      {
+       "kind": "external",
+       "title_structure": "对比反转",
+       "posted_days_ago": 7,
+       "comments_per_day": 5.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": true,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "da3fd1cee6804a490c06",
+      "洞察角",
+      "low",
+      [
+       "季节性事件"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "焦虑撬动",
+       "human_truth_archetype": "伴侣关系",
+       "content_format": "场景植入",
+       "title_structure": "第一人称自白"
+      },
+      {
+       "kind": "hit",
+       "own": false,
+       "age_days": 8,
+       "title_structure": "第一人称自白",
+       "desc": {
+        "opening_type": "具体事件",
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "turning_point": false
+       }
+      },
+      {
+       "content_format": "本项目近60天约两成是这一类"
+      }
+     ],
+     [
+      "67ee7f8f606bbc379497",
+      "场合角",
+      "low",
+      [
+       "时代语言范式"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "恐惧撬动",
+       "human_truth_archetype": "健康焦虑",
+       "content_format": "场景植入",
+       "title_structure": "对白引语"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类",
+       "human_truth_archetype": "本项目最常写的一种"
+      }
+     ],
+     [
+      "5e58d836a5f8a7843cad",
+      "干货角",
+      "medium",
+      [
+       "节日"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "焦虑撬动",
+       "human_truth_archetype": "同辈比较",
+       "content_format": "提问求助",
+       "title_structure": "感叹共鸣"
+      },
+      {
+       "kind": "external",
+       "title_structure": "感叹共鸣",
+       "posted_days_ago": 11,
+       "comments_per_day": 9.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": false,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "10993d37b1cef799cf94",
+      "对比角",
+      "medium",
+      [
+       "特定IP引用"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "好奇驱动",
+       "human_truth_archetype": "控制感渴望",
+       "content_format": "提问求助",
+       "title_structure": "场景直述"
+      },
+      {
+       "kind": "external",
+       "title_structure": "场景直述",
+       "posted_days_ago": 8,
+       "comments_per_day": 6.0,
+       "desc": {
+        "opening_type": "具体事件",
+        "turning_point": false,
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约两成用这种"
+      }
+     ],
+     [
+      "3b46d4763ae7b29242ee",
+      "共情角",
+      "low",
+      [
+       "季节性事件"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "造梦投射",
+       "human_truth_archetype": "自我提升",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "a5c2035271b90a97c2fd",
+      "叙事角",
+      "low",
+      [
+       "节日"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "焦虑撬动",
+       "human_truth_archetype": "自由意志",
+       "content_format": "提问求助",
+       "title_structure": "疑问句"
+      },
+      {
+       "kind": "hit",
+       "own": false,
+       "age_days": 4,
+       "title_structure": "疑问句",
+       "desc": {
+        "opening_type": "具体事件",
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "turning_point": false
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "b49b3a7b24451369010e",
+      "洞察角",
+      "high",
+      [
+       "时代语言范式"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "好奇驱动",
+       "human_truth_archetype": "经济焦虑",
+       "content_format": "情感叙事",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "42e9f109e7afd7f597a8",
+      "场合角",
+      "medium",
+      [
+       "平台话术"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "恐惧撬动",
+       "human_truth_archetype": "阶层焦虑",
+       "content_format": "情感叙事",
+       "title_structure": "对白引语"
+      },
+      null,
+      null
+     ],
+     [
+      "ebfab4455b952be6fee7",
+      "干货角",
+      "low",
+      [
+       "特定平台事件"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "代际冲突",
+       "content_format": "提问求助",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "656dc6c940644b550132",
+      "对比角",
+      "low",
+      [
+       "平台话术"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "虚荣撬动",
+       "human_truth_archetype": "情感缺位",
+       "content_format": "情感叙事",
+       "title_structure": "对白引语"
+      },
+      null,
+      null
+     ],
+     [
+      "95bafd70402769921611",
+      "共情角",
+      "high",
+      [
+       "特定IP引用"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "恐惧撬动",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "提问求助",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "b40ed4c8cc8f4fd04851",
+      "叙事角",
+      "medium",
+      [
+       "时事热点"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "焦虑撬动",
+       "human_truth_archetype": "职场关系",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "ad19053473d5f9eba76b",
+      "洞察角",
+      "medium",
+      [
+       "季节性事件"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "羞耻撬动",
+       "human_truth_archetype": "经济焦虑",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ]
+    ],
+    "prompt_block_sha256": "f9eaecc3c69b2402fdf555cef90203115c3d3ab2d904f501704045483f94fb67",
+    "batch": "97b73ceb3ffd",
+    "batch_note": "新抽的这15篇：9篇提问求助、3篇情感叙事、3篇场景植入，5篇问句标题；2篇参照了同品牌上一期评论多的帖的结构；3篇参照了同品类别家最近涨得快的帖的结构。",
+    "project_status": "近60天发了180篇，六成是提问求助、两成是场景植入；标题约四成是问句，最常写健康焦虑。这批照这个比例发。"
+   }
+  },
+  {
+   "case": {
+    "kind": "run",
+    "seed": 4,
+    "n": 10,
+    "ledger": true
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "7cd09574c6dec1ccc842c1826fe0708f83b1fdb63564b4eb30a1a7fd6dfc5ba2",
+    "dims_sha256": "41f093a066fcdb225da50f7d04e2ab2bd9fdd634dbd02085846cc0a92f47f8d4",
+    "repeat_rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "angles": [
+     [
+      "8ec11b3d220daf07ec79",
+      "干货角",
+      "high",
+      [
+       "行业事件"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "信息差利用",
+       "human_truth_archetype": "时间流逝感",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "69f5f3fb1d3f81afca8c",
+      "对比角",
+      "high",
+      [
+       "行业事件"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "共鸣释放",
+       "human_truth_archetype": "时间流逝感",
+       "content_format": "场景植入",
+       "title_structure": "比喻起手"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类"
+      }
+     ],
+     [
+      "aa2316a8658bf1cf66d3",
+      "叙事角",
+      "medium",
+      [
+       "当代流行词"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "羞耻撬动",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "提问求助",
+       "title_structure": "比喻起手"
+      },
+      {
+       "kind": "external",
+       "title_structure": "比喻起手",
+       "posted_days_ago": 10,
+       "comments_per_day": 8.0,
+       "desc": {
+        "opening_type": "具体事件",
+        "turning_point": true,
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "35bde30bcc986ef6b874",
+      "场合角",
+      "medium",
+      [
+       "时事热点"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "恐惧撬动",
+       "human_truth_archetype": "经济焦虑",
+       "content_format": "情感叙事",
+       "title_structure": "数字清单"
+      },
+      null,
+      null
+     ],
+     [
+      "3c1d6ecee84712eea880",
+      "共情角",
+      "medium",
+      [],
+      "冷静",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "经济焦虑",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "aab4e146f75444f03e8c",
+      "洞察角",
+      "high",
+      [
+       "当代流行词"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "信息差利用",
+       "human_truth_archetype": "伴侣关系",
+       "content_format": "情感叙事",
+       "title_structure": "对白引语"
+      },
+      null,
+      null
+     ],
+     [
+      "c87b3b3ba71ebe27b55b",
+      "干货角",
+      "medium",
+      [
+       "特定平台事件"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "虚荣撬动",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "提问求助",
+       "title_structure": "场景直述"
+      },
+      {
+       "kind": "hit",
+       "own": true,
+       "age_days": 7,
+       "title_structure": "场景直述",
+       "desc": {
+        "opening_type": "具体事件",
+        "ending_asks_reader": true,
+        "asks_for_help": null,
+        "turning_point": true
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约两成用这种"
+      }
+     ],
+     [
+      "dc682c1774ced8960e6e",
+      "对比角",
+      "medium",
+      [
+       "特定IP引用"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "好奇驱动",
+       "human_truth_archetype": "时间流逝感",
+       "content_format": "场景植入",
+       "title_structure": "对比反转"
+      },
+      {
+       "kind": "external",
+       "title_structure": null,
+       "posted_days_ago": 9,
+       "comments_per_day": 7.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": true,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "content_format": "本项目近60天约两成是这一类"
+      }
+     ],
+     [
+      "41eb9e238e087417b952",
+      "叙事角",
+      "medium",
+      [
+       "当代流行词"
+      ],
+      "冷静",
+      {
+       "emotional_lever": "罪恶感撬动",
+       "human_truth_archetype": "归属缺失",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "c63a24d3ce120a9a109c",
+      "场合角",
+      "low",
+      [],
+      "冷静",
+      {
+       "emotional_lever": "共鸣释放",
+       "human_truth_archetype": "宠物相关",
+       "content_format": "提问求助",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ]
+    ],
+    "prompt_block_sha256": "70866e3b300097ed2a0d7c071ce2beb1fe992d45bca1837469fafbc488c22347",
+    "batch": "4da43c6da5d7",
+    "batch_note": "新抽的这10篇：6篇提问求助、2篇情感叙事、2篇场景植入，1篇问句标题；1篇参照了本项目近期评论多的帖的结构；2篇参照了同品类别家最近涨得快的帖的结构。",
+    "project_status": "近60天发了180篇，六成是提问求助、两成是场景植入；标题约四成是问句，最常写健康焦虑。这批照这个比例发。"
+   }
+  },
+  {
+   "case": {
+    "kind": "run",
+    "seed": 5,
+    "n": 8,
+    "ledger": true,
+    "repeat": true
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "7d22ab54e92b53f09bbeb5caa5ae5951ed3f5de9ed5ad9e7eb382ce185ef4bef",
+    "dims_sha256": "742cd8d48afbde6f34fbb811697136d0ab5dc04f6a24fdf403def0785e5bc566",
+    "repeat_rows_sha256": "f2895fecf3e7a0f8fb0f79c68f0224cbbe4e2488bfb5be8e21a1bf8c642fd9cf",
+    "angles": [
+     [
+      "148555d7f0fd2556694a",
+      "对比角",
+      "low",
+      [
+       "节日"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "经济焦虑",
+       "content_format": "场景植入",
+       "title_structure": "场景直述"
+      },
+      {
+       "kind": "repeat",
+       "of": "148555d7f0fd2556694a"
+      },
+      {
+       "content_format": "本项目近60天约两成是这一类",
+       "title_structure": "本项目近60天约两成用这种"
+      }
+     ],
+     [
+      "5319169734bea2de0888",
+      "共情角",
+      "medium",
+      [
+       "平台话术"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "自由意志",
+       "content_format": "提问求助",
+       "title_structure": "感叹共鸣"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "2f8796efa2d7424d6d9e",
+      "洞察角",
+      "medium",
+      [
+       "特定IP引用"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "羞耻撬动",
+       "human_truth_archetype": "同辈比较",
+       "content_format": "提问求助",
+       "title_structure": "第一人称自白"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "553cfe6dc6ee084d6537",
+      "场合角",
+      "medium",
+      [
+       "时事热点"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "信息差利用",
+       "human_truth_archetype": "自我提升",
+       "content_format": "场景植入",
+       "title_structure": "第一人称自白"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类"
+      }
+     ],
+     [
+      "07d6145bb27253091402",
+      "干货角",
+      "high",
+      [
+       "时代语言范式"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "焦虑撬动",
+       "human_truth_archetype": "伴侣关系",
+       "content_format": "提问求助",
+       "title_structure": "对比反转"
+      },
+      {
+       "kind": "external",
+       "title_structure": null,
+       "posted_days_ago": 9,
+       "comments_per_day": 7.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": true,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "3f150f46e111f066260a",
+      "叙事角",
+      "high",
+      [
+       "时代语言范式"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "虚荣撬动",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "场景植入",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "994b2b7d54de2a9938c4",
+      "对比角",
+      "high",
+      [
+       "行业事件"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "焦虑撬动",
+       "human_truth_archetype": "时间流逝感",
+       "content_format": "提问求助",
+       "title_structure": "比喻起手"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类"
+      }
+     ],
+     [
+      "937fa06f963c8a303b66",
+      "共情角",
+      "medium",
+      [
+       "当代流行词"
+      ],
+      "自嘲",
+      {
+       "emotional_lever": "认同感建立",
+       "human_truth_archetype": "自我形象维护",
+       "content_format": "情感叙事",
+       "title_structure": "对比反转"
+      },
+      {
+       "kind": "external",
+       "title_structure": "对比反转",
+       "posted_days_ago": 7,
+       "comments_per_day": 5.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": true,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      null
+     ]
+    ],
+    "prompt_block_sha256": "6b1de83c059ae24790758b0ab0a8936978840066e97c1eeb9a5ebc00f3c16e24",
+    "batch": "41649f767c45",
+    "batch_note": "新抽的这8篇：4篇提问求助、3篇场景植入、1篇情感叙事，1篇问句标题；2篇参照了同品类别家最近涨得快的帖的结构；1篇是点名要再写一次的角度。",
+    "project_status": "近60天发了180篇，六成是提问求助、两成是场景植入；标题约四成是问句，最常写健康焦虑。这批照这个比例发。"
+   }
+  },
+  {
+   "case": {
+    "kind": "run",
+    "seed": 6,
+    "n": 5,
+    "pin": {
+     "标题句式": "疑问句"
+    }
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "fe875e0d6eec9747cea8345da844d410dea6f645b4ef6e2ec6800a2b8392bd1b",
+    "dims_sha256": "f4e208766ff043ab1a65d9728e4634e7c51ffb3d050a1d0c757d1e2ce8a68fad",
+    "repeat_rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "angles": [
+     [
+      "9004e9309f6ba7674fc1",
+      "干货角",
+      "low",
+      [
+       "时代语言范式"
+      ],
+      "口语",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "健康焦虑",
+       "content_format": "提问求助",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约四成是问句",
+       "human_truth_archetype": "本项目最常写的一种"
+      }
+     ],
+     [
+      "bd134da74c8f22cc8a78",
+      "洞察角",
+      "medium",
+      [
+       "当代流行词"
+      ],
+      "口语",
+      {
+       "emotional_lever": "羞耻撬动",
+       "human_truth_archetype": "自我提升",
+       "content_format": "场景植入",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约两成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "8a9d2ec207d8db855b36",
+      "共情角",
+      "high",
+      [
+       "平台话术"
+      ],
+      "口语",
+      {
+       "emotional_lever": "共鸣释放",
+       "human_truth_archetype": "伴侣关系",
+       "content_format": "提问求助",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "e9625f24c7f818996895",
+      "对比角",
+      "low",
+      [
+       "时事热点"
+      ],
+      "口语",
+      {
+       "emotional_lever": "共鸣释放",
+       "human_truth_archetype": "阶层焦虑",
+       "content_format": "提问求助",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "content_format": "本项目近60天约六成是这一类",
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ],
+     [
+      "20680fa6031dd8286611",
+      "叙事角",
+      "high",
+      [
+       "当代流行词"
+      ],
+      "口语",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "职场关系",
+       "content_format": "情感叙事",
+       "title_structure": "疑问句"
+      },
+      null,
+      {
+       "title_structure": "本项目近60天约四成是问句"
+      }
+     ]
+    ],
+    "prompt_block_sha256": "fc454a6128606f7b3a6df41bac9a81f08a66542966f24cdbab76e357eeba8001",
+    "batch": "92e5cb1855fe",
+    "batch_note": "新抽的这5篇：3篇提问求助、1篇情感叙事、1篇场景植入，5篇问句标题；标题句式都按点名的「疑问句」。",
+    "project_status": "近60天发了180篇，六成是提问求助、两成是场景植入；标题约四成是问句，最常写健康焦虑。这批照这个比例发。"
+   }
+  },
+  {
+   "case": {
+    "kind": "cold",
+    "seed": 7,
+    "n": 6
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "752f6d14684cf05388853a75389e8719b5ddac4bd2f8a43f4ac658659cdc09b1",
+    "dims_sha256": "f1b58f536f75dda6ea11f189d3b7ec11386740303d44c28f2897c1183ee8110c",
+    "repeat_rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "angles": [
+     [
+      "0bc04ffefff2cffea5d1",
+      "共情角",
+      "high",
+      [
+       "特定平台事件"
+      ],
+      "感性",
+      {
+       "emotional_lever": "虚荣撬动",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "情感叙事",
+       "title_structure": "对比反转"
+      },
+      null,
+      null
+     ],
+     [
+      "fd37fe6561faa1be0425",
+      "场合角",
+      "low",
+      [
+       "节日"
+      ],
+      "感性",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "身份认同",
+       "content_format": "教程攻略",
+       "title_structure": "疑问句"
+      },
+      null,
+      null
+     ],
+     [
+      "1a8b66715519a2e017c0",
+      "洞察角",
+      "low",
+      [
+       "特定IP引用"
+      ],
+      "感性",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "伴侣关系",
+       "content_format": "教程攻略",
+       "title_structure": "第一人称自白"
+      },
+      null,
+      null
+     ],
+     [
+      "c15f46c2393bd18e79e6",
+      "干货角",
+      "low",
+      [],
+      "感性",
+      {
+       "emotional_lever": "信息差利用",
+       "human_truth_archetype": "情感缺位",
+       "content_format": "情感叙事",
+       "title_structure": "对比反转"
+      },
+      {
+       "kind": "external",
+       "title_structure": "对比反转",
+       "posted_days_ago": 7,
+       "comments_per_day": 5.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": true,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      null
+     ],
+     [
+      "c78a7d2573c66cee4486",
+      "对比角",
+      "high",
+      [
+       "行业事件"
+      ],
+      "感性",
+      {
+       "emotional_lever": "信息差利用",
+       "human_truth_archetype": "归属缺失",
+       "content_format": "情感叙事",
+       "title_structure": "疑问句"
+      },
+      null,
+      null
+     ],
+     [
+      "b6280097f012eee2acd5",
+      "叙事角",
+      "medium",
+      [
+       "时代语言范式"
+      ],
+      "感性",
+      {
+       "emotional_lever": "愤怒撬动",
+       "human_truth_archetype": "同辈比较",
+       "content_format": "教程攻略",
+       "title_structure": "疑问句"
+      },
+      null,
+      null
+     ]
+    ],
+    "prompt_block_sha256": "e7d5f5a4d58998ef07d7ea13b9592a8f98dc6195cae6a72aab6c28c4eb7bcc1b",
+    "batch": "f2a752e6b438",
+    "batch_note": "新抽的这6篇：3篇情感叙事、3篇教程攻略，3篇问句标题；1篇参照了同品类别家最近涨得快的帖的结构。",
+    "project_status": "本项目发出三天以上的还少（4篇），这批先按通用配比的比例发；发出去三天后开始用本项目自己的数据。"
+   }
+  },
+  {
+   "case": {
+    "kind": "cold",
+    "seed": 8,
+    "n": 4,
+    "ledger": true
+   },
+   "expect": {
+    "n_candidates": 500,
+    "keys_sha256": "bfa059cd4f92fd71fd90b781477f6ac6019c26753ae79012596025a0207d3e2d",
+    "dims_sha256": "df4692b13194d7d5d04d1e46563718cc5106987f0c13a473d4259596b6dd80f7",
+    "repeat_rows_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "angles": [
+     [
+      "c7b1ff5c44ed419aff29",
+      "共情角",
+      "low",
+      [
+       "行业事件"
+      ],
+      "理性",
+      {
+       "emotional_lever": "归属感建立",
+       "human_truth_archetype": "健康焦虑",
+       "content_format": "教程攻略",
+       "title_structure": "感叹共鸣"
+      },
+      null,
+      null
+     ],
+     [
+      "93b04e32d9183f70cd65",
+      "对比角",
+      "medium",
+      [
+       "当代流行词"
+      ],
+      "理性",
+      {
+       "emotional_lever": "归属感建立",
+       "human_truth_archetype": "认同缺失",
+       "content_format": "情感叙事",
+       "title_structure": "对白引语"
+      },
+      null,
+      null
+     ],
+     [
+      "3fd3ff60f05d8d2ba7ba",
+      "叙事角",
+      "medium",
+      [],
+      "理性",
+      {
+       "emotional_lever": "恐惧撬动",
+       "human_truth_archetype": "阶层焦虑",
+       "content_format": "教程攻略",
+       "title_structure": "对比反转"
+      },
+      {
+       "kind": "external",
+       "title_structure": "对比反转",
+       "posted_days_ago": 7,
+       "comments_per_day": 5.0,
+       "desc": {
+        "opening_type": "身份自述",
+        "turning_point": true,
+        "ending_asks_reader": false,
+        "asks_for_help": null,
+        "own_experience": null
+       }
+      },
+      null
+     ],
+     [
+      "41215e91b38cf7c29db5",
+      "干货角",
+      "high",
+      [
+       "季节性事件"
+      ],
+      "理性",
+      {
+       "emotional_lever": "罪恶感撬动",
+       "human_truth_archetype": "代际冲突",
+       "content_format": "情感叙事",
+       "title_structure": "感叹共鸣"
+      },
+      null,
+      null
+     ]
+    ],
+    "prompt_block_sha256": "40b78db61acbf86f57c3e6376b8618198b55feee14b671766d2133019047c81a",
+    "batch": "5ed33a096533",
+    "batch_note": "新抽的这4篇：2篇情感叙事、2篇教程攻略；1篇参照了同品类别家最近涨得快的帖的结构。",
+    "project_status": "本项目发出三天以上的还少（4篇），这批先按通用配比的比例发；发出去三天后开始用本项目自己的数据。"
+   }
+  }
+ ]
+}
