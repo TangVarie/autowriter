@@ -1113,7 +1113,7 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 | 环节 | 做什么 |
 |---|---|
 | `comments_for` | 回包多一个 `style`（`core.COMMENT_STYLE_LINES` 三句），next_step 叫模型和 hard_rules、comment_rules 一起守，先别写出来 |
-| `score_comments` | 判之前先用代码查（`core.comment_style_issues`，不调模型）：全角「。」任何位置、半角句末单个「.」（「...」、3.5 不算）；方言语气词「伐」（只认句末 / 标点前，步伐、讨伐、砍伐不算）、「侬」、「阿拉」（阿拉伯、阿拉斯加不算）；像要联系方式的：单独一个 v（后面是标点、空格或结尾；「V计划」这种后面接汉字的不算）、加微 / 加v / 加vx、vx、wx、薇信、威信、v我。有一样那条 `passed=false`、带 `style_fix`，整组 `passed=false`，`style_next_step` 叫模型照改、不用问用户；判定服务没判成时这几样照样在 `style_issues` 里回 |
+| `score_comments` | 判之前先用代码查（`core.comment_style_issues`，不调模型）：全角「。」任何位置、半角句末单个「.」（「...」不算；3.5 的点不在句末本来不算，「今年28.」算）；方言语气词「伐」（只认句末 / 标点前，步伐、讨伐、砍伐不算）、「侬」、「阿拉」（阿拉伯、阿拉斯加不算）；像要联系方式的：单独一个 v（后面是标点、空格或结尾；「V计划」这种后面接汉字的不算）、加微信 / 加v / 加vx / 加个微信、光一个「加微」时后面得是标点、结尾或语气字（「添加微量元素」「增加微调」不算）、vx、wx、薇信、v我（「威信」是常用词，不查）。有一样那条 `passed=false`、带 `style_fix`，整组 `passed=false`，`style_next_step` 叫模型照改、不用问用户；判定服务没判成时这几样照样在 `style_issues` 里回 |
 
 送去 Jev 判的文字照原样，不替模型改（改了模型就不知道自己写的哪里不对，下一批照样写）。按协议「没过的按修改建议改一轮再调一次」，模型自己改掉，写手不用动手。
 

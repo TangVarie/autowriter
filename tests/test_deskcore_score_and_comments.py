@@ -628,6 +628,10 @@ def test_score_comments_says_when_the_post_is_an_old_row(wired):
     ("求vx", ["「vx」"]),
     ("好的。然后呢", ["句号"]),
     ("结尾一个点.", ["句号"]),
+    ("今年28.", ["句号"]),                       # codex review on aw#143: 数字后面的句末点也是句号
+    ("我的绩点是3.5.", ["句号"]),
+    ("可以加微吗", ["「加微」"]),
+    ("加个微信聊", ["「加个微信」"]),
 ])
 def test_style_issues_are_found(text, expect):
     issues = core.comment_style_issues(text)
@@ -639,6 +643,7 @@ def test_style_issues_are_found(text, expect):
 @pytest.mark.parametrize("text", [
     "V计划和途鸽哪个好", "步伐太快了", "砍伐", "我也是...", "涨了3.5个点", "问下 HC 多不多", "vlog做得好",
     "阿拉伯语专业能投吗", "真滴有用吗", "简历第一行写的什么呀", "",
+    "还需要额外添加微量元素吗", "这个会不会影响老师的威信", "增加微调的空间",   # codex review on aw#143: 常用词不算
 ])
 def test_style_leaves_ordinary_text_alone(text):
     assert core.comment_style_issues(text) == []
