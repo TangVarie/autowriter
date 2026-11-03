@@ -1070,6 +1070,23 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 
 协议没改（版本不变，写手不用重导 skill）：`comments_for` 的工具说明补了这条路和 `source` 的三个取值。回归在 `tests/test_deskcore_comment_tools.py`。
 
+### 3.15 贴型：写手说了才标，带方向的规则跟着卡走（2026-11-03）
+
+**为什么。** 老板的内容层：产品贴 P（产品在正文里出场）、流量贴 T（冲着切口写，产品多半靠评论区种）、提问贴 Q（和 T 同一族）、精品贴 J（产品融进切口）。飞书「方向」列只有一部分项目有，项目整体的配比也不等于写作台这一批要写的那一片，所以**不给默认配比**，只在写手 / 模型说了「写 N 篇 X 贴」「这批都是产品贴」时给卡标。效果学习这一轮不动（按贴型分开学留到以后）。
+
+| 环节 | 做什么 | 没标贴型时 |
+|---|---|---|
+| `draw_angles(layer=…)` | 一个贴型（每篇都是）或 `{贴型: 篇数}`（其余不标）；别名见 `vocab.LAYER_ALIASES`；`pin` 里的「方向」/`layer` 归进这里（`drawpolicy.split_pin_layer`），不当维度。写错、篇数超过 n、和 pin 里的方向说的不一样 → `layer_invalid`、什么都不写。按槽位先后标（`slot_layers`，不用 rng）；点名重写的带原来那张卡的贴型（写手这次说「都是 X」时按 X），各几篇的说法先拿它们抵账 | 一字不差：`tests/golden/draw_v2_c5ca36c.json` 钉着候选表、台账 `_draw`、重发的行、牌和卡面（rng 消耗也一样）；v1 总开关照旧 |
+| 台账 | `_draw.ly` = P / T / Q / J；不进 `angle_key`、不进去重；备牌跟着它那个槽位，尾巴只在整批同一个贴型时带。`ledger_dims_for` 带出 `_draw: {ly}`（`public_dims` 照样剥掉） | 没有这个键 |
+| 卡面 | 「第i篇」下面一行 `vocab.LAYER_LINE`；流量贴 / 提问贴的「直给推荐」「场景植入」换一句不叫人硬插产品的大白话（`PLAIN_FORMAT_TRAFFIC`）。渲染只看卡上的值 | 不加行 |
+| 规则 | `core.rule_applies_to_layer`：流量向只管 T / Q，产品向只管 P / J（hard、soft 一样），通用的照旧每篇都管。简报里带方向的规则后面注【只管流量贴/提问贴的稿】/【只管产品贴/精品贴的稿】，那一层末尾一句说清卡上没写贴型的照常守（root 的 `memory.py` 不动，改的是传进去的副本）；`score_drafts` 的代码查规则和 `check_rules`（Jev 规则题按贴型分组发各自的题库，编出来的 code 逐篇过滤）按每篇的贴型查。贴型从台账来：存档时按稿子带的 `angle_key`（`store.ledger_layers`），`check_rules` 按销给这一版的那张卡、没有再按指纹行记的 `angle_key`（`store.version_layers`） | 原来的口径：soft 过这场的方向闸，hard 都管；读不到台账也是这样 |
+| 参考帖 | 外部帖多读 Jev 的 `product_role`（`EXT_QIDS`），池子条目带 `prod`（1 出场 / 0 没出场，答了才有）；产品贴 / 精品贴的 e 槽优先 `prod=1`，流量贴 / 提问贴优先 `prod=0`。起量帖读 TV `notes.content_layer`（单独一次可选的查询，不进 `TV_OUTCOME_COLS`；列不在就不读），条目带 `ly`，h 槽分三档：形式一样且同一族 → 形式一样 → 同一族。只是优先、不筛，√日均评论的权重和 `ext_ok` 的篇数不变，记的 p 按同一套分档算（`_e_marginal` / `_h_marginal`） | 不分档 |
+| 判定提示 | `score_drafts` 那次判定本来就回 `profile.product_role`：产品贴 / 精品贴判出「未出现」、流量贴 / 提问贴判出「主角」时，那一篇的 `judge.results` 带一句 `layer_hint`，next_step 叫模型提一句；不扣分、不拦存档、不多调 Jev | 不带 |
+
+**投流事件（同一轮）。** `priors.is_clean` 另外排除 `truth_vault.v_paid_boost_events` 里的帖（投了薯条、没标 `paid_promoted` 的也在里面；service_role 读得到，有 `note_id` 列）：每次建全局表 / 项目块经 `store.tv_paid_boost_note_ids` 读一次，读不到记 WARN、照原来的口径算。生产上起量标签会少几篇（11-03 视图里 38 篇，其中 28 篇没标 `paid_promoted`，是这次新排除的）；快照脚本的离线模式（读导出文件）不读这个视图。
+
+**`_draw` 的预算。** 预算那条用例（`test_drawpolicy` 的夹具）标了贴型照样 ≤ 300 字。最坏情形本来就超过 300（点名四个维度、L1 放宽、旧先验的牌 359 字；带参考帖、重用、保底、旧先验的牌 333 字），贴型只多 11 字；没标贴型的牌一个字不多（金标钉着），所以没动已有的键。回归在 `tests/test_draw_layers.py`、`tests/test_layer_rules.py`。
+
 ## 4. 接入
 
 ### 4.1 部署

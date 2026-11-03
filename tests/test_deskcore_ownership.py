@@ -188,6 +188,10 @@ UNGATED_WITH_REASON = {
     "_rpc_missing_telemetry": "只打一行遥测, 不读写业务数据",
     "_repeat_items":         "私有辅助函数, 只被已过闸的 draw_angles 调(repeat_of 的校验); 只读本项目台账 "
                              "(store.ledger_repeat_source / ledger_dims_for 按 project_id 过滤), 不写",
+    "_draft_layers":         "贴型(2026-11-03): 私有辅助函数, 只被已过闸的 commit_drafts 调; 只读本项目台账 "
+                             "(store.ledger_layers 按 project_id 过滤), 不写",
+    "_version_layers":       "贴型(2026-11-03): 私有辅助函数, 只被已过闸的 check_rules 调, 传的是 versions_in_project "
+                             "核过归属的 version_id; 只读本项目台账 / 指纹行(store.version_layers 按 project_id 过滤), 不写",
     "_judge_tool_call":      "写手侧判稿(2026-10-09)的私有主体, 只被 judge_draft / repair_plan_for 调用, "
                              "那两个公开函数开头各自直接过 assert_project_access",
     # 入库判定(2026-09-24): 这几个都只在 commit_drafts 的尾巴上被调, 那时它开头的

@@ -22,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 
 import db
 
+from . import vocab
+
 logger = logging.getLogger("deskcore.store")
 
 
@@ -1090,9 +1092,18 @@ def ledger_window(sb, project_id: str, days: int, cap: int = LEDGER_WINDOW_CAP) 
     return out[:cap]
 
 
+def _draw_layer(dims) -> str | None:
+    """台账 dims 的 _draw.ly(写手点名的贴型代号 P / T / Q / J, 2026-11-03); 没有 / 认不出回 None。"""
+    d = dims.get("_draw") if isinstance(dims, dict) else None
+    ly = d.get("ly") if isinstance(d, dict) else None
+    return ly if ly in vocab.LAYERS else None
+
+
 def ledger_dims_for(sb, project_id: str, key: str) -> dict | None:
     """本项目台账里 ``key`` 这张牌的四个主维度(最近抽的那一行; 去掉 ``_draw`` 这类下划线键)。写手点名「再写一次这个
     角度」(``repeat_of``, §2.9)时用: key 必须是本项目台账里有的, 才按同样的四个维度再发一行。
+    那一行标了贴型的(_draw.ly)另带 ``"_draw": {"ly": 代号}``, 重发的那张跟着原来那张卡(drawpolicy.repeat_candidates);
+    没标的回包和原来一样只有四个键。
 
     没有这一行、key 形状不对、或者读失败, 都回 None —— 调用方一律当成「不能重发」, 报错、什么都不写; 不抛。"""
     k = str(key or "")
@@ -1108,7 +1119,11 @@ def ledger_dims_for(sb, project_id: str, key: str) -> dict | None:
         return None
     if not rows or rows[0].get("angle_key") != k or not isinstance(rows[0].get("dims"), dict):
         return None
-    return public_dims(rows[0]["dims"])
+    out = public_dims(rows[0]["dims"])
+    ly = _draw_layer(rows[0]["dims"])
+    if ly:
+        out["_draw"] = {"ly": ly}       # 贴型(2026-11-03): 重发带原来那张卡的; 下划线键, 给模型之前 public_dims 照样剥掉
+    return out
 
 
 def ledger_repeat_source(sb, project_id: str, key: str) -> dict | None:
@@ -1131,6 +1146,76 @@ def ledger_repeat_source(sb, project_id: str, key: str) -> dict | None:
                        f"{type(exc).__name__}: {exc}"[:200])
         return None
     return {"dims": dims, "open": bool(open_rows)}
+
+
+LAYER_LOOKUP_CHUNK = 100
+
+
+def ledger_layers(sb, project_id: str, keys) -> dict[str, str] | None:
+    """这几个 angle_key 在本项目台账里标的贴型: ``{key: 代号}``(每个 key 取最近抽的那一行; 那一行没标的不在里面)。
+    score_drafts 查规则时按稿子带的 angle_key 找它那张卡的贴型(带方向的规则跟着贴型走, 2026-11-03)。
+
+    形状不对的 key 不查(同 angle_key_states)。读失败回 None(调用方当作这批都没有贴型, 照原来的方向闸查); 不抛。"""
+    want = [k for k in dict.fromkeys(str(k) for k in (keys or []) if k) if _LEDGER_LOOKUP_KEY.fullmatch(k)]
+    if not want:
+        return {}
+    best: dict[str, tuple[str, str | None]] = {}
+    try:
+        for i in range(0, len(want), LAYER_LOOKUP_CHUNK):
+            chunk = want[i:i + LAYER_LOOKUP_CHUNK]
+            rows = _paged(lambda off, lim, chunk=chunk: (
+                sb.table("angle_ledger").select("angle_key, dims, drawn_at")
+                  .eq("project_id", project_id).in_("angle_key", chunk)
+                  .order("id").range(off, off + lim - 1)))
+            for r in rows:
+                k = r.get("angle_key")
+                at = str(r.get("drawn_at") or "")
+                if k in want and (k not in best or at >= best[k][0]):
+                    best[k] = (at, _draw_layer(r.get("dims")))
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("ledger layers lookup failed (project=%s): %s", project_id,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    return {k: ly for k, (_at, ly) in best.items() if ly}
+
+
+def version_layers(sb, project_id: str, version_ids) -> dict[str, str] | None:
+    """这几版稿子的贴型: ``{version_id: 代号}``。check_rules 只拿到 version_id: 先找台账里销给它的那一行
+    (consumed_version_id), 没有的(改稿重存的新版不销牌)再按指纹行记的 angle_key 找那张卡(ledger_layers)。
+    没标贴型的不在里面。任一次读失败回 None(调用方照原来的方向闸查); 不抛。"""
+    vids = list(dict.fromkeys(str(v) for v in (version_ids or []) if v))
+    if not vids:
+        return {}
+    out: dict[str, str] = {}
+    try:
+        for i in range(0, len(vids), LAYER_LOOKUP_CHUNK):
+            chunk = vids[i:i + LAYER_LOOKUP_CHUNK]
+            rows = (sb.table("angle_ledger").select("consumed_version_id, dims")
+                      .eq("project_id", project_id).in_("consumed_version_id", chunk).execute()).data or []
+            for r in rows:
+                ly = _draw_layer(r.get("dims"))
+                if ly and r.get("consumed_version_id"):
+                    out[str(r["consumed_version_id"])] = ly
+        rest = [v for v in vids if v not in out]
+        keys: dict[str, str] = {}
+        for i in range(0, len(rest), LAYER_LOOKUP_CHUNK):
+            chunk = rest[i:i + LAYER_LOOKUP_CHUNK]
+            rows = (sb.table("draft_fingerprints").select("version_id, angle_key, created_at")
+                      .eq("project_id", project_id).in_("version_id", chunk).execute()).data or []
+            for r in sorted(rows, key=lambda r: str(r.get("created_at") or "")):
+                vid, k = str(r.get("version_id") or ""), r.get("angle_key")
+                if vid and k and vid not in keys:
+                    keys[vid] = str(k)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("version layers lookup failed (project=%s): %s", project_id,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    if keys:
+        by_key = ledger_layers(sb, project_id, sorted(set(keys.values())))
+        if by_key is None:
+            return None
+        out.update({vid: by_key[k] for vid, k in keys.items() if k in by_key})
+    return out
 
 
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────
@@ -2691,6 +2776,61 @@ def external_slice(sb, category: str, *, days: int = EXTERNAL_SLICE_DAYS) -> lis
             _tv_warn("external slice", exc)
             return None
     return _keyset(fetch, max_pages=-(-EXTERNAL_SLICE_CAP // EXTERNAL_SLICE_PAGE), what="external slice")
+
+
+# 投了薯条、却没标 paid_promoted 的帖(2026-11-03): TV 的 v_paid_boost_events 认出来的投流事件(service_role 读得到, 有
+# note_id 列)。priors 每次建全局表 / 项目块读一次, 这些帖不算干净(priors.is_clean), 不进起量标签、不当起量帖。
+PAID_BOOST_MAX_PAGES = 10
+
+
+def tv_paid_boost_note_ids(sb) -> set[str] | None:
+    """``{note_id}``: truth_vault.v_paid_boost_events 里出现过的帖(投流事件, 不论 paid_promoted 标没标)。
+    视图不在 / 没权限 / 读挂了回 None(调用方记 WARN、照原来的口径算); 不抛。"""
+    out: set[str] = set()
+    try:
+        for i in range(PAID_BOOST_MAX_PAGES):
+            rows = (sb.schema("truth_vault").table("v_paid_boost_events").select("note_id")
+                      .order("note_id").range(i * PAGE, (i + 1) * PAGE - 1).execute()).data or []
+            out.update(str(r["note_id"]) for r in rows if r.get("note_id"))
+            if not rows:
+                break
+        else:
+            logger.warning("tv paid boost events: stopped at %d pages (%d notes)", PAID_BOOST_MAX_PAGES, len(out))
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("tv paid boost events", exc)
+        return None
+    return out
+
+
+TV_LAYER_CHUNK = 100
+
+
+def tv_note_layers(sb, note_ids) -> dict[str, str] | None:
+    """这几篇 TV 笔记的贴型: ``{note_id: 代号}``(truth_vault.notes.content_layer, 认得出的才放进来; vocab.layer_code)。
+    单独一次查询, **不**加进 TV_OUTCOME_COLS: 这一列是 TV 后加的, 库里还没有它的时候整张结果表都会读挂。列不在 / 读挂了回
+    None(起量帖不按贴型分档, 和原来一样); 不抛。"""
+    ids = list(dict.fromkeys(str(i) for i in (note_ids or ()) if i))
+    if not ids:
+        return {}
+    out: dict[str, str] = {}
+    try:
+        for i in range(0, len(ids), TV_LAYER_CHUNK):
+            chunk = ids[i:i + TV_LAYER_CHUNK]
+            rows = (sb.schema("truth_vault").table("notes").select("note_id, content_layer")
+                      .in_("note_id", chunk).execute()).data or []
+            for r in rows:
+                code = vocab.layer_code(r.get("content_layer"))
+                if code and r.get("note_id"):
+                    out[str(r["note_id"])] = code
+    except Exception as exc:                            # noqa: BLE001
+        msg = str(exc)
+        if "content_layer" in msg and ("does not exist" in msg or "42703" in msg):
+            # TV 还没加这一列: 预期之内(TV 那边的迁移跑了就好), 不当故障报
+            logger.info("tv note layers: truth_vault.notes.content_layer not there yet; hits stay unlayered")
+        else:
+            _tv_warn("tv note layers", exc)
+        return None
+    return out
 
 
 # ⑨ 写作台写的稿子发出去了没有(project_now.desk、draw-report 的 M2/M3)。和 v_angle_outcomes 同一组对照: 真对上了的

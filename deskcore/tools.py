@@ -454,7 +454,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
 
 def draw_angles(project_id: str, n: int, avoid_days: int = 30,
                 perpetual_bias: bool = False, pin: dict | None = None,
-                repeat_of: list[str] | None = None, _user_id: str | None = None) -> dict:
+                repeat_of: list[str] | None = None, layer: str | dict | None = None,
+                _user_id: str | None = None) -> dict:
     """发牌: 给本批 n 篇稿子各分配一组互不相同的创作坐标。
 
     批量写稿前必须先调这个, 然后【每一篇按分到的那组坐标写, 不得互换编号】。
@@ -487,15 +488,22 @@ def draw_angles(project_id: str, n: int, avoid_days: int = 30,
       · repeat_of —— 用户点名「这个角度再写一次」, 传那一篇的 angle_key(至多 3 个、不多于这次要的篇数 n, 必须是这个项目发过的, 原样抄)。
         这几张原样再发一次(角度照旧、内容要新, 查重照常), 其余的照常发。原来那张卡还没用过(还没有稿子带着它存档)
         的不用点名, 直接照原来那张卡写; 点了会报错、什么都不发。
+
+    ``layer``(贴型)**只在用户自己说了是哪种贴时传**, 平时不传, 也不要为它去问用户:
+      · 用户说「这批都是产品贴」「写 5 篇流量贴」→ layer="产品贴" / "流量贴"(这一批每篇都是它);
+      · 用户说「写 3 篇产品贴、2 篇流量贴」→ layer={"产品贴": 3, "流量贴": 2}(篇数加起来不超过 n, 剩下的不标)。
+      可选: 产品贴(也认 产品向 / 直出贴 / 直给 / 好物分享-产品贴)、流量贴(流量向)、提问贴(提问)、精品贴(精品)。写错了会报
+      layer_invalid、什么都不发, 照报错里列的可选值改了再发。标了的卡上多一行「这篇是X贴：…」, 照那一行写; 项目里标了
+      【只管…的稿】的规则, 只管卡上写着那种贴的稿。
     """
     # 故意不包 _safe: 发牌要写台账。写失败却报成功, 同一个角度下批还能再抽,
     # 跨批次唯一性的承诺就破了(而且没人看得见)。
     # n / avoid_days 的夹子在 core 里(1–30 / 14–90): CLI 和 REST 走同一个函数。
     out = core.draw_angles(core.sb(), project_id, n,
                            avoid_days=avoid_days, user_id=_user_id,
-                           perpetual_bias=perpetual_bias, pin=pin, repeat_of=repeat_of)
+                           perpetual_bias=perpetual_bias, pin=pin, repeat_of=repeat_of, layer=layer)
     if out.get("error"):
-        return out                         # pin / repeat_of 不对: 什么都没发, 也就没有要提醒存档的
+        return out                         # pin / repeat_of / layer 不对: 什么都没发, 也就没有要提醒存档的
     # W-29: 发牌成功之后才查, 所以张数含这一批; 查不到就不带, 不影响发牌。
     return _with_archive_pending(out, _user_id, project_id)
 
@@ -768,6 +776,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
         用户要改哪篇: 按 fixes 改完, 那篇带 ``replaces_version_id`` 先过 check_drafts, 再调一次本工具(会重新打分)。改一轮
         就够, 不要为了分数反复重写。
       · ``judge_status`` 不是 ok(超时、没配、被出境口径挡下)就说这篇这次没打成分, 不能说过了, 也不要重试, 存档照样成功了。
+      · 带 ``layer_hint`` 的那篇: 卡上标的贴型和判出来的产品角色对不上(产品贴里产品没出场、流量贴里产品成了主角), 照那一句
+        跟用户提一下; 只是参考, 不扣分, 用户觉得没问题就不用改。
 
     **改稿用 ``replaces_version_id`` 替换, 不要当新稿再存一次。** 值是上次返回的 ``version_ids`` 里对应的那个。存档
     会先摘掉旧版的指纹再查重, 所以不会撞上它自己; 成功后旧稿原地升成新版本, ``replaced`` 里列出来, ``version_ids``
@@ -881,6 +891,8 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
       · ``status`` 是 nothing_to_check / no_versions 时照 ``next_step`` 说一句就行。
       · ``status`` 是 error: 这次规则没查成(服务端读不出规则的编译结果), **不能说规则守住了**; 存档已经成功, 交付照常,
         不用重试。
+      · 带 ``layer`` 的那篇: 发牌卡上标了贴型(产品贴 / 流量贴 / 提问贴 / 精品贴), 只标了流量向 / 产品向的规则按它查 ——
+        不管这种贴的那几条这篇不查, 不算没守住。
     照 ``next_step`` 做, 把结果一两句告诉用户; 不要因为这个工具的结果拖着不交付, 也不要为了消掉「建议改」反复重写。
 
     ``tactic``: 同 score_drafts —— 这场 open_project 传过 ``tactic`` 的, 把同一个值**原样**传回来(没传过就不传)。

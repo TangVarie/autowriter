@@ -312,6 +312,46 @@ def filter_by_applicability(rules: list[dict], direction: str) -> tuple[list[dic
     return keep, dropped
 
 
+def rule_applies_to_layer(rule: dict, layer: str | None, direction: str) -> bool:
+    """这条规则管不管这一篇(2026-11-03 贴型)。``layer`` 是这一篇卡上标的贴型代号(台账 _draw.ly; 没有就是 None),
+    ``direction`` 是这场的方向闸(detect_direction, 项目名 + tactic)。
+
+      · applicability 里不带方向词的(通用 / 空 / 部位标注): 每篇都管, 同原来;
+      · 卡标了贴型: 流量向的只管流量贴 / 提问贴, 产品向的只管产品贴 / 精品贴 —— hard、soft 一样, 不再看这场的方向闸;
+      · 卡没标贴型: 原来的口径 —— hard 都管, soft 过方向闸(filter_by_applicability)。"""
+    tag = (rule.get("applicability") or "").strip()
+    tagged = [t for t in DIRECTION_TAGS if t in tag]
+    if not tagged:
+        return True
+    want = vocab.LAYER_DIRECTION.get(layer or "")
+    if want:
+        return want in tagged
+    if (rule.get("severity") or "soft").lower() == "hard":
+        return True
+    return not direction or direction in tagged
+
+
+# 简报里带方向的规则那一截之后的说明(只在这一层真有带方向的规则时加): 没标贴型的稿照原来的口径守, 一个字的行为都不变
+DIRECTION_RULE_TAIL = ("（标了【只管产品贴/精品贴的稿】【只管流量贴/提问贴的稿】的规则, 只管发牌卡上写着那种贴的稿; "
+                       "卡上没写是哪种贴的稿, 照常守。）")
+
+
+def _annotate_direction_rules(rules: list[dict]) -> tuple[list[dict], int]:
+    """带方向的规则在简报里注一句管哪种贴的稿(vocab.DIRECTION_RULE_NOTE), 回 (新的列表, 注了几条)。不改原来那一行
+    (复制一份改 content), root 的 memory.build_layered_system_prompt 一个字不动 —— 老的生成链路照旧。两个方向都写了的、
+    不带方向的原样。"""
+    out, n = [], 0
+    for r in rules:
+        tag = (r.get("applicability") or "").strip()
+        tagged = [t for t in DIRECTION_TAGS if t in tag]
+        if len(tagged) == 1 and r.get("content"):
+            out.append({**r, "content": f"{r['content']}{vocab.DIRECTION_RULE_NOTE[tagged[0]]}"})
+            n += 1
+        else:
+            out.append(r)
+    return out, n
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 写作简报
 # ══════════════════════════════════════════════════════════════════════
@@ -513,15 +553,23 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     soft = (db._rank_memories_for_injection(soft_by_scope["global"], soft_cap)
             + db._rank_memories_for_injection(soft_by_scope["project"], soft_cap))
 
+    # 贴型(2026-11-03): 带方向的规则注明只管哪种贴的稿 —— 发牌卡上标了贴型的那几篇按卡走, 没标的照原来的口径守
+    # (DIRECTION_RULE_TAIL 接在那一层末尾说清楚)。只改给模型看的这一份, 方向闸、相关性、封顶都在上面照旧
+    soft_shown, soft_noted = _annotate_direction_rules(soft)
+    hard_shown, hard_noted = _annotate_direction_rules(hard)
     layers = memory.build_layered_system_prompt(
         base_prompt=project.get("system_prompt") or "",
         tactic_suffix=tactic_suffix,
-        global_memories=[m for m in soft + hard if m.get("scope") == "global"],
-        project_memories=[m for m in soft + hard if m.get("scope") != "global"],
+        global_memories=[m for m in soft_shown + hard_shown if m.get("scope") == "global"],
+        project_memories=[m for m in soft_shown + hard_shown if m.get("scope") != "global"],
         calibration_notes=calibration,
         positive_examples=positives,
         negative_examples=negatives,
     )
+    if hard_noted and layers.get("p0"):
+        layers["p0"] = layers["p0"] + "\n" + DIRECTION_RULE_TAIL
+    if soft_noted and layers.get("p1"):
+        layers["p1"] = layers["p1"] + "\n\n" + DIRECTION_RULE_TAIL
 
     out = {
         "project_id": project_id,
@@ -853,7 +901,7 @@ def _repeat_items(client, project_id: str, repeat_of, n: int) -> tuple[list, dic
 def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
                 user_id: str | None = None, seed: int | None = None,
                 perpetual_bias: bool = False, pin: dict | None = None,
-                repeat_of: list[str] | None = None) -> dict:
+                repeat_of: list[str] | None = None, layer=None) -> dict:
     """发 n 张互不重复、且避开台账的创作坐标, 写入台账(angle cards v2 §2.1)。
 
     这是 generator._assign_slot_coordinates(:1301) 的复活版。当年移除
@@ -865,6 +913,10 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     不写)→ 先验(priors.get_profile, 至多等 2.5 秒, 从不抛)→ 现读台账(store.ledger_window, 读不到就只靠 RPC 挡
     exact key)→ 点名重写的几张走非原子的 record_draw → 槽位计划 → 候选表 → RPC 预留(不变)→ 把预留到的 key 对回
     候选的元数据、补每张卡的附加项(浓度 / 时效 / 词感 / 切入角度 / 判据)→ 去掉 _draw → 渲染。
+
+    贴型(2026-11-03): ``layer`` 是写手说的「写 N 篇 X 贴」—— 一个贴型(每篇都是它)或 {贴型: 篇数}(其余不标), pin 里写的
+    「方向」也归进这里(drawpolicy.split_pin_layer)。写错了报 layer_invalid、什么都不写。标了的牌台账 _draw.ly 记代号, 卡上
+    多一行说这是哪种贴, 参考帖按贴型先挑一档; 不进 angle_key、不进去重。没点名就一个字不变(rng 的消耗也一样)。
     """
     # 归属校验放在 n<=0 的早返回【之前】: 每个项目级入口都以这一行开头, 才能在
     # CI 里用一条断言把"有没有漏掉某个工具"验死。代价是 n=0 时多一次查询,
@@ -893,6 +945,18 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
     pid = project.get("id") or project_id
 
     # ── 写手点名(§2.9): 全部校验完再动手 —— 有一样不对就报错, 台账一行不写 ──────────────────────────────
+    # 贴型先校: pin 里的「方向」归进 layer(不当维度), 两处都写了而说的不一样就报错
+    pin, pin_layer = dp.split_pin_layer(pin)
+    layer_spec, err = dp.normalize_layer(layer, n)
+    if err is None and pin_layer is not None:
+        pin_spec, err = dp.normalize_layer(pin_layer, n)
+        if err is None and layer_spec is not None and pin_spec != layer_spec:
+            err = {"error": "layer_invalid", "value": pin_layer,
+                   "message": "layer 和 pin 里的「方向」说的不一样, 只留一处再发一次。",
+                   "allowed": [vocab.LAYER_NAME[c] for c in vocab.LAYERS]}
+        layer_spec = layer_spec if layer_spec is not None else pin_spec
+    if err:
+        return _draw_error(err.pop("error"), err.pop("message"), n, **err)
     reps, err = _repeat_items(client, project_id, repeat_of, n)
     if err:
         return err
@@ -915,13 +979,15 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
              else hashlib.sha256(repr(rng.getstate()).encode()).hexdigest()[:12])
 
     # ── 点名重写的几张: 原样四个维度再发一行, 故意绕过 L0 / L1(§2.9), 走非原子的 record_draw ──────────────────
-    rep_cards = dp.repeat_candidates(reps, batch_id=batch, profile=profile, extra={"fa": arm})
+    rep_cards = dp.repeat_candidates(reps, batch_id=batch, profile=profile, extra={"fa": arm},
+                                     layer=layer_spec if isinstance(layer_spec, str) else None)
     if policy == "v1":
         for c in rep_cards:
             c["dims"]["_draw"]["pol"] = "v1"
     if rep_cards:
         store.record_draw(client, project_id, rep_cards, user_id)
     n_rest = max(n - len(rep_cards), 0)
+    rep_layers = [dp.layer_of(c["dims"]) for c in rep_cards]
 
     # ── 候选表 ────────────────────────────────────────────────────────────────────────────────────
     plan = meta = None
@@ -934,6 +1000,10 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
                                project_id)
             state = dp.ledger_state(rows, avoid_days=avoid_days)
             plan = dp.slot_plan(n_rest, profile, rng, pin=pin_n)
+            if layer_spec is not None:                  # 贴型按槽位先后标, 不用 rng(没点名时这一步整个不走)
+                for s_, ly in zip(plan["slots"], dp.slot_layers(layer_spec, len(plan["slots"]), rep_layers)):
+                    if ly:
+                        s_["ly"] = ly
             seed_cells = [dp.cell_of(c["dims"]) for c in rep_cards]
             candidates, meta = dp.build_candidates(profile, state, plan, rng, pin=pin_n, seed_cells=seed_cells,
                                                    batch_id=batch, extra={"fa": arm})
@@ -951,6 +1021,14 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
         if pin_n:
             tag["pin"] = [d for d in dp.DIMS4 if d in pin_n]
         candidates = [{"angle_key": c["angle_key"], "dims": {**c["dims"], "_draw": dict(tag)}} for c in candidates]
+        if layer_spec is not None:
+            # 贴型: 前 n_rest 张按槽位先后标(RPC 按先后取), 后面的只在整批同一个贴型时带 —— 不动 rng、不动候选次序
+            lys = dp.slot_layers(layer_spec, n_rest, rep_layers)
+            tail_ly = dp.common_layer(lys)
+            for i, c in enumerate(candidates):
+                ly = lys[i] if i < n_rest else tail_ly
+                if ly:
+                    c["dims"]["_draw"]["ly"] = ly
 
     # ── 预留: RPC 照旧 ─────────────────────────────────────────────────────────────────────────────
     reserved = store.reserve_angles(client, project_id, candidates, n_rest, user_id, avoid_days) if n_rest else []
@@ -1022,6 +1100,9 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
         # (drawpolicy.describable), 这里再挡一道。
         if ref and _reference_line(ref):
             card["reference"] = ref
+        ly = dp.layer_of(r.get("dims"))
+        if ly:
+            card["layer"] = vocab.LAYER_NAME[ly]          # 卡面那一行(render_angles_block); 没点名贴型就没有这个键
         if not v1_path:
             ev = project_now.card_evidence(profile, dims)
             if ev:
@@ -1155,6 +1236,9 @@ def render_angles_block(angles: list[dict], status: str | None = None) -> str:
     每篇那一行带上完整的 angle_key(2026-10-30 发布收尾): 模型贴进提示词、照着写的是这个块, 原来块里没有 key, 查重 /
     存档时它就自己编一个 —— 10-26 sportsix 带上来的 key 长 7 / 8 / 53 位, 一个都销不了账。key 和 angles[].angle_key
     是同一个, 原样印出来, 不截短。
+
+    贴型(2026-11-03): 卡上有 ``layer``(写手点名的「产品贴」等)才在「第i篇」下面加一行 vocab.LAYER_LINE; 没有就一个字不变。
+    同样只看卡上的值。
     """
     if not angles:
         return ""
@@ -1167,8 +1251,14 @@ def render_angles_block(angles: list[dict], status: str | None = None) -> str:
         ev = a.get("evidence") or {}
         lev = d.get("emotional_lever", "")
         intensity = vocab.INTENSITY_PLAIN.get(a.get("emotional_intensity"), a.get("emotional_intensity") or "")
+        ly = vocab.layer_code(a.get("layer"))
         lines.append(f"第{a['slot']}篇 [angle_key={a['angle_key']}]：")
-        lines.append(f"  · 内容形式：{_glossed(d.get('content_format', ''), vocab.PLAIN_FORMAT)}"
+        if ly:
+            # 贴型(2026-11-03): 写手点名了才有这一行; 流量贴 / 提问贴的卡上「直给推荐」「场景植入」换一句不叫人硬插产品的话
+            lines.append(f"  · {vocab.LAYER_LINE[ly]}")
+        plain_f = ({**vocab.PLAIN_FORMAT, **vocab.PLAIN_FORMAT_TRAFFIC}
+                   if vocab.LAYER_FAMILY.get(ly or "") == "traffic" else vocab.PLAIN_FORMAT)
+        lines.append(f"  · 内容形式：{_glossed(d.get('content_format', ''), plain_f)}"
                      f"{_bracket(ev.get('content_format'))}")
         lines.append(f"  · 标题句式：{_glossed(d.get('title_structure', ''), vocab.PLAIN_TITLE)}"
                      f"{_bracket(ev.get('title_structure'))}")
@@ -2129,6 +2219,12 @@ def _score_report_step(judge: dict | None) -> str:
     if unscored or not (flagged or unjudged or clean):
         parts.append((f"{unscored} 篇" if unscored else "这批") + "这次没打成参考分(不影响存档和交付): "
                      "跟用户提一句就行, 不用重试。")
+    hinted = [r for r in rows if r.get("layer_hint")]
+    if hinted:
+        # 贴型(2026-11-03, _add_layer_hints): 卡上的贴型和判出来的产品角色对不上 —— 只是参考, 不算要改的地方
+        idx = "、".join(str(r.get("index")) for r in hinted)
+        parts.append(f"index 是 {idx} 的 {len(hinted)} 篇带了 layer_hint(卡上的贴型和判出来的产品角色对不上): 照那一句跟用户"
+                     "提一下, 只是参考, 用户觉得没问题就不用改。")
     return "".join(parts)
 
 
@@ -2348,6 +2444,7 @@ _JUDGE_ROW_KEYS = ("judge_status", "passed", "hard_fails", "calls", "written",
                    "policy", "elapsed_ms", "http_status", "detail")
 
 _JUDGE_BLOCK_TEXT_MAX = 300
+JUDGE_PRODUCT_ROLE_KEY = "_product_role"
 
 
 def _is_sure(p) -> bool:
@@ -2394,6 +2491,9 @@ def _judge_row(target: dict, res: dict) -> dict:
     row.update({k: res[k] for k in _JUDGE_ROW_KEYS
                 if k != "judge_status" and res.get(k) not in (None, "", [], {})
                 and not (k == "elapsed_ms" and not res.get(k))})   # 0 = 根本没发, 不是"很快"
+    if res.get("product_role"):
+        # 只给 commit_drafts 对贴型用(_add_layer_hints 一律摘掉, 不进回包和 batch_metrics)
+        row[JUDGE_PRODUCT_ROLE_KEY] = res["product_role"]
     return row
 
 
@@ -3641,9 +3741,56 @@ def _as_delivered(tpl: dict | None, drafts: list[dict]) -> tuple[list[dict], lis
     return [view for view, _tags in views], [tags for _view, tags in views]
 
 
+def _draft_layers(client, project_id: str, drafts: list[dict], indices: list[int]) -> dict[int, str]:
+    """{第几篇: 贴型代号}: 每篇带的 angle_key → 本项目台账里那张卡的 _draw.ly(store.ledger_layers)。没带 key、卡没标贴型、
+    台账读不到的都不在里面 —— 那几篇照原来的口径(方向闸)查规则。不抛。"""
+    keys = {i: str(drafts[i].get("angle_key") or "").strip() for i in indices}
+    keys = {i: k for i, k in keys.items() if k}
+    if not keys:
+        return {}
+    try:
+        by_key = store.ledger_layers(client, project_id, sorted(set(keys.values())))
+    except Exception:                                   # noqa: BLE001 — 读数本不抛, 再兜一层
+        logger.warning("score_drafts: 查稿子的贴型失败(project=%s), 这批照原来的方向闸查规则", project_id, exc_info=True)
+        by_key = None
+    if not by_key:
+        return {}
+    return {i: by_key[k] for i, k in keys.items() if k in by_key}
+
+
+# 判定回来的 product_role(Jev 特征题「产品在稿子里是什么角色」)和卡上的贴型对不上时, 给那一篇的一句提示(只是参考, 不扣分、
+# 不拦存档)。只用存档时那次判定已经回来的答案, 不为它多调一次 Jev。
+LAYER_HINT = {
+    "product": "这篇卡上是{name}, 判下来正文里产品没出场(product_role={role}); 看一眼要不要让产品在正文里出场。",
+    "traffic": "这篇卡上是{name}, 判下来产品是正文的主角(product_role={role}); 看一眼是不是写成了产品贴。",
+}
+
+
+def _add_layer_hints(judge: dict | None, layers: dict[int, str] | None) -> int:
+    """产品贴 / 精品贴判出 product_role「未出现」, 流量贴 / 提问贴判出「主角」: 那一篇的判定行加 ``layer_hint``(一句, 只作
+    参考)。回加了几条。每一行带回来的 product_role(_judge_row 放的私有键)一律摘掉; 卡没标贴型、判定没回 product_role 的
+    不加 —— 回包和原来一样。"""
+    if not isinstance(judge, dict):
+        return 0
+    n = 0
+    for row in judge.get("results") or []:
+        if not isinstance(row, dict):
+            continue
+        role = row.pop(JUDGE_PRODUCT_ROLE_KEY, None)
+        if not layers or row.get("judge_status") != judge_client.JUDGE_OK:
+            continue
+        ly = layers.get(row.get("index"))
+        fam = vocab.LAYER_FAMILY.get(ly or "")
+        if (fam == "product" and role == "未出现") or (fam == "traffic" and role == "主角"):
+            row["layer_hint"] = LAYER_HINT[fam].format(name=vocab.LAYER_NAME[ly], role=role)
+            n += 1
+    return n
+
+
 def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
                               indices: list[int], out: dict, *, tactic: str = "",
-                              revised: dict[int, str] | None = None) -> dict:
+                              revised: dict[int, str] | None = None,
+                              layers: dict[int, str] | None = None) -> dict:
     """存完档之后的两样纯代码活(2026-10-20), 结果挂进 ``out``, 返回给 batch_metrics 的那一小块。**不抛**。
 
     1. 交付版式: 项目配了 ``default_params.delivery`` 就按模板把存进去的那几篇拼好(``out["delivery"]``)。
@@ -3655,6 +3802,9 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
        有命中才带)。查不成就带 ``rule_checks_status = "error"``: 不带的话和"查过了、没命中"长得一模一样。正则规则限时
        (rulecheck.check), 没在时限内查完的、存的 check 用不了的都列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了
        "守住了"。
+       ``layers``(2026-11-03 贴型): {第几篇: 卡上标的贴型代号}(_draft_layers 从台账查的)。有一篇标了, 带方向的规则就逐篇
+       跟着贴型走(rule_applies_to_layer: 流量向只管流量贴 / 提问贴, 产品向只管产品贴 / 精品贴; 没标的那几篇照原来的方向闸);
+       一篇都没标就和原来一字不差。
 
     两样都只是参考: 入库到这里已经成功了, 这一步任何失败都不许把它变成失败(同判定那一段的纪律)。
     """
@@ -3700,7 +3850,14 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             # 再报「建议改」就是在叫模型写它没被要求、甚至相反的东西(产品向的"带上产品名"报到流量向项目上)。
             # hard 不过这道闸, 同简报。判据也同简报: 项目名 + 这场 open_project 传的 tactic(写手原样传回来, codex review
             # on aw#115) —— 只按项目名判的话, 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又全报一遍。
-            soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or "", tactic or ""))
+            # 贴型(2026-11-03): 这一批有卡标了贴型的, 方向闸改成逐篇过(rule_applies_to_layer), 池子里留着全部 soft
+            direction = detect_direction(project.get("name") or "", tactic or "")
+            pick_layers = [(layers or {}).get(i) for i in indices]
+            applies = None
+            if any(pick_layers):
+                applies = lambda r, pos: rule_applies_to_layer(r, pick_layers[pos], direction)    # noqa: E731
+            else:
+                soft, _dropped = filter_by_applicability(soft, direction)
             # 有交付模板时, 查的是交付出去的那一份, 免得和 delivery.text 对不上(delivery.delivered_draft): 模板管话题的, 话题含
             # 固定 / 条件话题、正文是摘掉末尾那行话题之后的; 不管话题的, tags 字段不算、只认正文里的 #话题; comments 是 null 的,
             # 评论不算(codex review on aw#115: 拿原稿查的话, 不交付的话题 / 评论里的词照报违规, 必须带的话术也能靠它们混过去)。
@@ -3709,7 +3866,9 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             # 模板要求每篇都带的部位(评论 min ≥ 1、要话题): 空着的话「必须带的话术」照没带报, 不能靠不交那一块混过去(codex review
             # on aw#115)。没模板、模板不要求的部位, 空着照旧不查(评论常常是后面另走评论那一步写的)
             expects = delivery.expected_parts(tpl) if tpl is not None else ()
-            hits, stats = rulecheck.check(hard + soft, checked, indices=indices, tags=final_tags, expects=expects)
+            # 没标贴型的批次照原来那样调(不带 applies)
+            hits, stats = rulecheck.check(hard + soft, checked, indices=indices, tags=final_tags, expects=expects,
+                                          **({"applies": applies} if applies is not None else {}))
             if hits:
                 shown, more = rulecheck.top_hits(hits)
                 out["rule_checks"] = shown
@@ -3742,6 +3901,8 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             meta["rule_checks"] = {**stats, "hits": len(hits),
                                    "hard": sum(1 for h in hits if h["severity"] == "hard"),
                                    "elapsed_ms": _ms_since(t0)}
+            if applies is not None:
+                meta["rule_checks"]["layered"] = sum(1 for ly in pick_layers if ly)
         except Exception as exc:                        # noqa: BLE001
             logger.exception("commit_drafts: 代码查规则失败(project=%s) —— 存档不受影响", project_id)
             meta["rule_checks"] = {"error": f"{type(exc).__name__}: {exc}"[:200], "elapsed_ms": _ms_since(t0)}
@@ -4436,11 +4597,15 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # 单记一段 delivery_rules(codex review on aw#115): 规则那次查询是翻页读的, 库慢的时候不是几十毫秒; 不单记的话
     # 这段时间哪一段都不算, 判定被扣掉的那截预算也查不出是谁花的。
     post_started = time.monotonic()
+    # 贴型(2026-11-03): 每篇按它带的 angle_key 找台账里那张卡标的贴型, 查规则(带方向的跟着贴型走)和下面判定的提示都用它。
+    # 查不到 / 没标就是 {}: 和原来一字不差
+    draft_layers = _draft_layers(client, project_id, drafts, sorted(inserted_idx))
     # 改稿重存、真存进去了的那几篇 → 它们挂的旧 item: 有它们就把原来那一整批拼回来(挂旧 item 半途失败的那篇也算, 写手要的是
     # 改过的这一版换在原位)
     post_meta = _delivery_and_rule_checks(client, project, project_id, user_id, drafts, sorted(inserted_idx), out,
                                           tactic=tactic,
-                                          revised={i: replace[i]["item_id"] for i in sorted(inserted_idx) if i in replace})
+                                          revised={i: replace[i]["item_id"] for i in sorted(inserted_idx) if i in replace},
+                                          layers=draft_layers)
     delivery_rules_ms = _ms_since(post_started)
 
     # ── 入库判定(参考分): 锁已经放了, 恢复指纹的那个 try 也出来了 ─────────────
@@ -4461,6 +4626,11 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                          project_id)
         out["judge"] = _judge_block(
             [], [], error=f"判定这一步整体失败({type(exc).__name__}: {exc}), 入库不受影响")
+    try:
+        # 贴型(2026-11-03): 判定回来的 product_role 和卡上的贴型对不上时那一篇带一句提示; 私有的 product_role 一律摘掉
+        _add_layer_hints(out["judge"], draft_layers)
+    except Exception:                                   # noqa: BLE001 — 提示是参考, 绝不冒泡
+        logger.warning("score_drafts: 贴型提示没加上(project=%s)", project_id, exc_info=True)
     # 工程原因只进 batch_metrics, 不进回包(念给写手的是 judge.detail 那一句)
     judge_ops = out["judge"].pop(JUDGE_OPS_DETAIL_KEY, None)
     if out.get("next_step"):
@@ -7293,6 +7463,25 @@ def _delivered_text(template: dict | None, version: dict) -> dict:
     return {"title": title, "body": post["body"], "tags": tags[0] if tags is not None else None}
 
 
+# 贴型分组(2026-11-03): 带方向的规则只认「产品向那一族 / 流量向那一族」, 同一族的贴型(产品贴 / 精品贴)问的是同一组规则
+_GROUP_LAYER = {"产品向": "P", "流量向": "T"}
+
+
+def _layer_group(layer: str | None) -> str | None:
+    """贴型代号 → 它那一组(产品向 / 流量向); 没标回 None(按这场的方向闸, 同原来)。"""
+    return vocab.LAYER_DIRECTION.get(layer or "")
+
+
+def _version_layers(client, project_id: str, version_ids: list[str]) -> dict[str, str]:
+    """{version_id: 贴型代号}(store.version_layers: 台账里销给它的那张卡, 或者指纹行记的 angle_key 那张卡)。读不到当都没标。"""
+    try:
+        got = store.version_layers(client, project_id, version_ids)
+    except Exception:                                   # noqa: BLE001 — 读数本不抛, 再兜一层
+        logger.warning("check_rules: 查稿子的贴型失败(project=%s), 照原来的方向闸查", project_id, exc_info=True)
+        got = None
+    return got or {}
+
+
 def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str | None = None,
                 tactic: str = "") -> dict:
     """写完存过档之后, 按编译好的规则逐篇查(D-121)。只作建议, 不拦任何东西, 不改库里的稿子。
@@ -7343,7 +7532,13 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     hard, soft = store.shared_memories(client, project_id, user_id, vectors=False)
     # 方向闸的判据同简报和 score_drafts: 项目名 + 这场 open_project 传的 tactic(写手原样传回来)。只按项目名判的话,
     # 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又当成题发给 Jev
-    soft, _dropped = filter_by_applicability(soft, detect_direction(project.get("name") or "", tactic or ""))
+    # 贴型(2026-11-03): 有稿子的卡标了贴型时, 带方向的规则逐篇跟着贴型走(rule_applies_to_layer) —— 池子里留着全部 soft,
+    # 每篇只问 / 只查它那一组的规则(_layer_group); 一篇都没标就和原来一字不差
+    direction = detect_direction(project.get("name") or "", tactic or "")
+    vlayers = _version_layers(client, project_id, [vid for vid, _ in targets]) if targets else {}
+    t_groups = [_layer_group(vlayers.get(vid)) for vid, _ in targets]
+    if not any(t_groups):
+        soft, _dropped = filter_by_applicability(soft, direction)
     pool = hard + soft
     shas: dict[str, tuple[dict, str]] = {}
     not_compilable = 0
@@ -7381,8 +7576,14 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     uncompiled = len(missing)
 
     skipped_questions: set[str] = set()
-    bank = rulecompile.project_bank([res for _, res in pairs], skipped=skipped_questions)
-    questions = rulecompile.question_index(pairs, bank)
+    # 每组(没标贴型 / 产品向那一族 / 流量向那一族)一份题库: 这一组的稿子只问管它的规则。没标贴型时只有一组, 就是原来那一份
+    banks: dict = {}
+    q_by_group: dict = {}
+    for g in (dict.fromkeys(t_groups) if targets else (None,)):
+        pairs_g = [(r, res) for r, res in pairs if rule_applies_to_layer(r, _GROUP_LAYER.get(g), direction)]
+        banks[g] = rulecompile.project_bank([res for _, res in pairs_g], skipped=skipped_questions)
+        q_by_group[g] = rulecompile.question_index(pairs_g, banks[g])
+    questions = {qid: q for qs in q_by_group.values() for qid, q in qs.items()}
     code, code_unavailable = rulecompile.code_rules(pairs)
     # payload 在这里按人设 check 的同一套规矩校一遍(rulecheck.spec_of: 正则过 validator.assert_regex_is_safe + 量词形状那道),
     # 不合格的记日志、不跑, 数进 rules.code_refused; 先挑出来是为了知道**哪几条**真跑了(下面 partial 只数真查了的)
@@ -7493,8 +7694,14 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     code_stats = {"rules": 0, "skipped": 0}
     if runnable:
         # 话题同 score_drafts 的 rule_checks: 模板管话题时传交付出去的那一行, 不然 None(rulecheck 照正文拼)
+        # 贴型: 带方向的规则只查它管的那几篇(同上面的题库分组)
+        by_id = {str(r.get("id")): r for r in pool}
+        applies = ((lambda row, pos: rule_applies_to_layer(by_id.get(str(row.get("id"))) or row,
+                                                           _GROUP_LAYER.get(t_groups[pos]), direction))
+                   if any(t_groups) else None)
         hits, code_stats = rulecheck.check(runnable, [{"title": v["title"], "body": v["body"]} for _, v in targets],
-                                           tags=[v["tags"] for _, v in targets])
+                                           tags=[v["tags"] for _, v in targets],
+                                           **({"applies": applies} if applies is not None else {}))
         for h in hits:
             by_index.setdefault(h["index"], []).append(h)
     # 正则没在时限内查完的(rulecheck.check 的 timed_out_from: 从第几篇起): 那几篇这条算没查, 不能算进「守住了」
@@ -7546,13 +7753,15 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                             return {"judge_status": judge_client.JUDGE_TIMEOUT}
                         return judge_client.judge_draft_full(payload, timeout=left)
 
-                    for vid, v in targets:
+                    for (vid, v), g in zip(targets, t_groups):
+                        if not q_by_group.get(g):
+                            continue                 # 这一组(贴型)没有规则题: 这一篇不发
                         if not (v["body"] or "").strip():
                             jev[vid] = {"judge_status": "empty_body"}
                             continue
                         payload = judge_client.build_rules_request(
                             version_id=vid, title=v["title"], body=v["body"], project=ctx["project"],
-                            category=ctx["category"], project_bank=bank)
+                            category=ctx["category"], project_bank=banks[g])
                         futs[ex.submit(_judge_before_deadline, payload)] = vid
                     done, _pending = cf.wait(list(futs), timeout=_left())
             finally:
@@ -7572,10 +7781,13 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     summary = {"versions": len(targets), "must_fix": 0, "suggest": 0, "unsure": 0, "not_finished": 0, "unjudged": 0}
     for i, (vid, v) in enumerate(targets):
         row: dict = {"version_id": vid, "title": (v["title"] or "")[:_CHECK_RULES_TITLE_CHARS]}
+        if vlayers.get(vid) and any(t_groups):
+            row["layer"] = vocab.LAYER_NAME[vlayers[vid]]   # 带方向的规则按这个贴型查的
         found_v = rulecompile.code_violations(by_index.get(i, []))
         unsure: list[dict] = []
         unjudged: list[dict] = []
-        if questions:
+        q_row = q_by_group.get(t_groups[i]) or {}
+        if q_row:
             res = jev.get(vid) or {"judge_status": judge_client.JUDGE_TIMEOUT}
             status = res.get("judge_status")
             row["judge_status"] = status
@@ -7592,12 +7804,12 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
             elif isinstance(resp, dict):
                 raw = resp.get("detail")
                 detail = raw.get(judge_client.RULES_BANK_NAME) if isinstance(raw, dict) else None
-                got = rulecompile.read_answers(questions, detail)
+                got = rulecompile.read_answers(q_row, detail)
                 found_v += got["violations"]
                 unsure = got["unsure"]
                 unjudged = got["unjudged"]
                 summary["unjudged"] += len(unjudged)
-                if unjudged and len(unjudged) == len(questions):
+                if unjudged and len(unjudged) == len(q_row):
                     # 回来了, 却一道题都没判出来(回包里没有 desk_rules / 每题都带 invalid_reason): 和没判完一样, 不能当
                     # 守住了(2026-10-20 复审: 原来这里只记个数, summary 不看它, next_step 照说「都守住了」)
                     row["judge_status"] = "not_judged"

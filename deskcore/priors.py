@@ -109,7 +109,7 @@ MIX_DIMS = ("content_format", "emotional_lever", "human_truth_archetype", "emoti
 FQ_QIDS = ("title_is_question", "opening_type", "turning_point", "negative_outcome_happened", "comparison_group",
            "calls_out_reader_group", "ending_asks_reader", "asks_for_help")
 EXT_QIDS = ("title_is_question", "opening_type", "turning_point", "ending_asks_reader", "asks_for_help",
-            "own_experience", "efficacy_promise")
+            "own_experience", "efficacy_promise", "product_role")
 HIT_DESC_QIDS = ("opening_type", "ending_asks_reader", "asks_for_help", "turning_point")
 EXT_DESC_QIDS = ("opening_type", "turning_point", "ending_asks_reader", "asks_for_help", "own_experience")
 
@@ -202,11 +202,16 @@ def is_synthetic(row: dict) -> bool:
     return _truthy(_flags(row).get("synthetic"))
 
 
-def is_clean(row: dict) -> bool:
-    """干净: 不是合成的、没投流、评论区没走过铺评工单(§2.2)。"""
+def is_clean(row: dict, boosted=frozenset()) -> bool:
+    """干净: 不是合成的、没投流、评论区没走过铺评工单(§2.2)。
+
+    boosted(2026-11-03): TV v_paid_boost_events 里的帖(投了薯条、却没标 paid_promoted 的也在里面; store.tv_paid_boost_note_ids,
+    每次建全局表 / 项目块读一次)同样不干净。不给就是原来的口径。"""
     f = _flags(row)
     routes = f.get("comment_maintained_routes")
     paved = isinstance(routes, (list, tuple)) and PAVED_ROUTE in routes
+    if boosted and str(row.get("note_id") or "") in boosted:
+        return False
     return not (_truthy(f.get("synthetic")) or _truthy(f.get("paid_promoted")) or paved)
 
 
@@ -265,7 +270,7 @@ def _clip(x: float, lohi) -> float:
 # 标签(§2.2)
 # ══════════════════════════════════════════════════════════════════════
 
-def label(row: dict, *, has_cc: bool, now: datetime, params: dict = PARAMS) -> int | None:
+def label(row: dict, *, has_cc: bool, now: datetime, params: dict = PARAMS, boosted=frozenset()) -> int | None:
     """一篇 TV 笔记的干净标签: 1 起量 / 0 没起 / None 不参与。
 
     参与: 发出满 3 天(publish_time 只到天), 不是 TGV_phase1, 干净(``is_clean``)。
@@ -276,7 +281,7 @@ def label(row: dict, *, has_cc: bool, now: datetime, params: dict = PARAMS) -> i
     pt = _ts(row.get("publish_time"))
     if pt is None or _days(now, pt) < params["label_min_age_days"]:
         return None
-    if not is_clean(row):
+    if not is_clean(row, boosted):
         return None
     tier = row.get("tier")
     if has_cc:
@@ -385,7 +390,7 @@ def _round_tree(x, nd: int = 3):
 
 
 def build_global(notes, title_answers, projects_meta, *, now: datetime | None = None,
-                 params: dict = PARAMS) -> dict:
+                 params: dict = PARAMS, boosted=frozenset()) -> dict:
     """① 全库笔记 + ② title_is_question 答案 + ③ 项目品类 → 全局表(和快照同一个形状, 只有计数)。
 
     ``projects.<id>``:
@@ -394,7 +399,8 @@ def build_global(notes, title_answers, projects_meta, *, now: datetime | None = 
              R = 中位秩之和(rank 信号用; 没有评论数的项目 rk=false)
       mix:        它自己最后 180 天数据的配比(同品牌上一期当参照时用)
       mix_recent: 现在往回 180 天的配比(品类 / 全局参照用)
-    配比各维是计数(人性原型、时效依赖一篇多值按 1/len 记), title_q 是 {Q, NQ} 篇数, n 是篇数。"""
+    配比各维是计数(人性原型、时效依赖一篇多值按 1/len 记), title_q 是 {Q, NQ} 篇数, n 是篇数。
+    boosted: 投流事件里的帖(is_clean), 不进标签; 配比照算(配比是「发了什么」, 投没投流都是发了)。"""
     now = now or _utcnow()
     answers = title_answers or {}
     meta = projects_meta or {}
@@ -418,7 +424,7 @@ def build_global(notes, title_answers, projects_meta, *, now: datetime | None = 
             lbl = _new_label()
             elig = []
             for r in rows:
-                y = label(r, has_cc=has_cc, now=now, params=params)
+                y = label(r, has_cc=has_cc, now=now, params=params, boosted=boosted)
                 if y is not None:
                     elig.append((r, y))
             ranks: dict[int, float] = {}
@@ -797,7 +803,9 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
     · 不像广告(ad_like 不是 true)、Jev 的 efficacy_promise 不是「是」、标题里没点到我们登记的品牌;
     · 日均评论 = 评论数 / max(抓取时帖龄, 3), 不低于这个品类 3–90 天帖的中位数; 不设前 N 名的上限。
     每条: ref("ext:<id>") / w(√日均评论, 抽签权重) / velocity / posted_days_ago / title_structure(Jev 的问句答案优先)
-    / desc(开头类型、转折、结尾问读者、求助、亲历)。标题本身不出这个函数。"""
+    / desc(开头类型、转折、结尾问读者、求助、亲历)/ prod(2026-11-03: Jev 的 product_role 答了才有 —— 1 产品出场了
+    (主角 / 解决方案), 0 没出场(未出现 / 只暗示 / 顺带一提); 发牌按卡的贴型优先挑哪一档, 只是优先、不筛, 池子和 ext_ok
+    的篇数都不变)。标题本身不出这个函数。"""
     now = now or _utcnow()
     reg = tuple(registered if registered is not None else registered_brands())
     ans = answers or {}
@@ -838,7 +846,7 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
             continue
         isq = answer_bool(a.get("title_is_question"))
         ts_class = vocab.classify_title(title, isq) or (QUESTION if isq is True else None)
-        pool.append({
+        entry = {
             "ref": f"ext:{nid}",
             "w": math.sqrt(vel),
             "velocity": round(vel, 2),
@@ -847,7 +855,11 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
             "age_at_scrape": round(age, 1),
             "title_structure": ts_class,
             "desc": _desc(a, EXT_DESC_QIDS),
-        })
+        }
+        role = str(a.get("product_role") or "").strip()
+        if role in vocab.PRODUCT_PRESENT or role in vocab.PRODUCT_ABSENT:
+            entry["prod"] = 1 if role in vocab.PRODUCT_PRESENT else 0
+        pool.append(entry)
     pool.sort(key=lambda e: (-e["velocity"], e["ref"]))
     counts: dict[str, int] = {}
     for e in pool:
@@ -904,10 +916,12 @@ def _top_decile_floor(values: list[int], frac: float) -> int | None:
 
 
 def project_aggregate(rows, answers, *, tv_ids, brand_ids=(), now: datetime | None = None,
-                      params: dict = PARAMS) -> dict:
+                      params: dict = PARAMS, boosted=frozenset(), layers=None) -> dict:
     """本项目(对照表里的 TV 项目)近 60 天的笔记 + 特征题答案 → 项目块(聚合数 + 起量帖池)。纯函数。
 
-    rows 里同品牌其他期(brand_ids, 没对照到本项目的)的帖只用来找起量帖(45 天内), 不进本项目的配比和计数。"""
+    rows 里同品牌其他期(brand_ids, 没对照到本项目的)的帖只用来找起量帖(45 天内), 不进本项目的配比和计数。
+    boosted: 投流事件里的帖(is_clean), 不进标签、不当起量帖。layers: {note_id: 贴型代号}(TV 的 content_layer, 读得到才有),
+    起量帖带上 ly, 发牌按卡的贴型优先同一族; 不给就和原来一样。"""
     now = now or _utcnow()
     tv = set(tv_ids or ())
     brand = set(brand_ids or ()) - tv
@@ -961,7 +975,7 @@ def project_aggregate(rows, answers, *, tv_ids, brand_ids=(), now: datetime | No
                 continue
             fq.setdefault(q, {})
             fq[q][str(v).strip()] = fq[q].get(str(v).strip(), 0) + 1
-        y = label(r, has_cc=has_cc.get(pid, False), now=now, params=params)
+        y = label(r, has_cc=has_cc.get(pid, False), now=now, params=params, boosted=boosted)
         if y is None:
             continue
         working["resolved"] += 1
@@ -990,7 +1004,7 @@ def project_aggregate(rows, answers, *, tv_ids, brand_ids=(), now: datetime | No
             fq_shares[q] = {k: v / tot for k, v in counts.items()}
         else:
             fq_shares[q] = counts.get("是", 0) / tot
-    hits = _hit_pool(own, brows, ans, tv=tv, brand=brand, now=now, params=params)
+    hits = _hit_pool(own, brows, ans, tv=tv, brand=brand, now=now, params=params, boosted=boosted, layers=layers)
     return {
         "tv_ids": sorted(tv), "brand_ids": sorted(brand), "last_by_id": last_by_id,
         "posts": posts, "window_days": win,
@@ -1000,12 +1014,12 @@ def project_aggregate(rows, answers, *, tv_ids, brand_ids=(), now: datetime | No
     }
 
 
-def _hit_pool(own, brows, ans, *, tv, brand, now, params) -> list[dict]:
+def _hit_pool(own, brows, ans, *, tv, brand, now, params, boosted=frozenset(), layers=None) -> list[dict]:
     """起量帖: 干净、评论 ≥ 10、在(TV 项目, 内容形式)里评论数排前一成。本项目 2–21 天权重 ×3, 同品牌其他期 2–45 天 ×1。
     不跨品牌。卡上只拿它的 杠杆 / 第一个人性原型 / 标题句式 和 开头、结尾、求助、转折 四个结构答案。"""
     groups: dict[tuple, list[int]] = {}
     for r in own + brows:
-        if not is_clean(r) or r.get("comments_count") is None:
+        if not is_clean(r, boosted) or r.get("comments_count") is None:
             continue
         key = (str(r.get("project_id")), _valid("content_format", r.get("content_format")) or "")
         try:
@@ -1019,7 +1033,7 @@ def _hit_pool(own, brows, ans, *, tv, brand, now, params) -> list[dict]:
         is_own = pid in tv
         lo, hi = params["hit_own_age"] if is_own else params["hit_brand_age"]
         t = _ts(r.get("publish_time"))
-        if t is None or not is_clean(r) or r.get("comments_count") is None:
+        if t is None or not is_clean(r, boosted) or r.get("comments_count") is None:
             continue
         age = _days(now, t)
         if not (lo <= age <= hi):
@@ -1039,7 +1053,7 @@ def _hit_pool(own, brows, ans, *, tv, brand, now, params) -> list[dict]:
         ts_class = vocab.classify_title(vocab.note_title(r.get("title"), r.get("raw_content")), isq)
         if ts_class is None and isq is True:
             ts_class = QUESTION
-        out.append({
+        hit = {
             "ref": f"note:{r.get('note_id')}",
             "own": is_own,
             "w": params["hit_own_weight"] if is_own else params["hit_brand_weight"],
@@ -1051,7 +1065,11 @@ def _hit_pool(own, brows, ans, *, tv, brand, now, params) -> list[dict]:
             "age_days": int(age),
             "comments": cc,
             "desc": _desc(a, HIT_DESC_QIDS),
-        })
+        }
+        ly = (layers or {}).get(str(r.get("note_id")))
+        if ly in vocab.LAYERS:
+            hit["ly"] = ly                    # TV 的 content_layer(读得到才有): 发牌按卡的贴型优先同一族
+        out.append(hit)
     out.sort(key=lambda e: (-e["w"], -e["comments"], e["ref"]))
     return out
 
@@ -1263,6 +1281,28 @@ def _store():
     return store
 
 
+def _as_int(v) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _paid_boosted(st, sb) -> frozenset:
+    """投流事件里的帖(store.tv_paid_boost_note_ids), 每次建全局表 / 项目块读一次。读不到记 WARN、当没有(照原来的口径算),
+    不让整块建不成。"""
+    try:
+        got = st.tv_paid_boost_note_ids(sb)
+    except Exception as exc:                            # noqa: BLE001 — 读数本不抛, 再兜一层
+        got = None
+        logger.warning("priors: paid boost events unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+    if got is None:
+        logger.warning("priors: truth_vault.v_paid_boost_events unreadable; boosted-but-unflagged posts stay in the "
+                       "labels this build")
+        return frozenset()
+    return frozenset(got)
+
+
 def fetch_global(sb, *, now: datetime | None = None, params: dict = PARAMS) -> dict | None:
     st = _store()
     notes = st.tv_notes_outcomes(sb)
@@ -1274,7 +1314,7 @@ def fetch_global(sb, *, now: datetime | None = None, params: dict = PARAMS) -> d
     meta = st.tv_projects_meta(sb)
     if meta is None:
         return None
-    return build_global(notes, answers, meta, now=now, params=params)
+    return build_global(notes, answers, meta, now=now, params=params, boosted=_paid_boosted(st, sb))
 
 
 def fetch_project(sb, project_id: str, row: dict | None = None, *, now: datetime | None = None,
@@ -1328,7 +1368,17 @@ def fetch_project(sb, project_id: str, row: dict | None = None, *, now: datetime
     if answers is None:
         logger.warning("priors: fq answers unreadable (%s); title classes fall back to the regex", project_id)
         answers = {}
-    agg = project_aggregate(rows, answers, tv_ids=tv_ids, brand_ids=brand_ids, now=now, params=params)
+    # 起量帖的贴型(TV notes.content_layer, 2026-11-03): 单独一次可选的读, 只读评论够起量帖门槛的那几篇; 列还不在 / 读挂了
+    # 就不分档(和原来一样)
+    hit_ids = [str(r.get("note_id")) for r in rows if r.get("note_id") and r.get("comments_count") is not None
+               and _as_int(r.get("comments_count")) >= params["hit_min_comments"]]
+    try:
+        layers = st.tv_note_layers(sb, hit_ids) if hit_ids else {}
+    except Exception as exc:                            # noqa: BLE001 — 读数本不抛, 再兜一层
+        layers = None
+        logger.warning("priors: tv note layers unreadable (%s): %s", project_id, f"{type(exc).__name__}: {exc}"[:200])
+    agg = project_aggregate(rows, answers, tv_ids=tv_ids, brand_ids=brand_ids, now=now, params=params,
+                            boosted=_paid_boosted(st, sb), layers=layers or None)
     agg["categories"] = {p: (meta.get(p) or {}).get("category") for p in tv_ids if (meta.get(p) or {}).get("category")}
     base.update(agg)
     return base

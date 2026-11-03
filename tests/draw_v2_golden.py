@@ -14,7 +14,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
-from deskcore import core, drawpolicy as dp, priors, store, vocab
+from deskcore import core, drawpolicy as dp, priors, vocab
 from deskcore.fingerprint import angle_key
 from tests.fakes import FakeClient
 
