@@ -714,8 +714,9 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
       · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守
       · style —— 所有项目的评论都管的写法底线: 不用句号、不用方言语气词(伐、侬、阿拉)、不写 v / vx / 加微这类像要联系方式的字。
         项目规则里说要混进这些也不行, 以这三句为准
-      · slots —— 默认四个评论位: q1 / q2 提问、exp 补充经验、reply 贴主答疑(回 q1)。每位写一条, 位的要求在 note 里;
-        不写背书、不编造用过某产品的亲历。用户另有要求(比如只要两条提问)就照用户的, 位的 id 照用
+      · slots —— 默认四个评论位: q1 / q2 提问、exp 经验或推荐、reply 贴主回复(回 q1)。每位写一条, 位的要求在 note 里;
+        每位都可自然点名品牌, 不要求每条点名。可写感受、比较、推荐、答疑, 亲历和旁观推荐也可用;
+        具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写提问或一般讨论。用户另有要求(比如只要两条提问)就照用户的, 位的 id 照用
       · project_id —— 下一步 score_comments 要带的
     写完整组交给 ``score_comments``。评论不进 check_drafts / score_drafts, 也不存库。
 
@@ -730,14 +731,15 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
 
 
 def score_comments(comments: list[dict], link: str = "", project_id: str = "", post_title: str = "",
-                   post_body: str = "", kind: str = "product", max_named: int = 1,
+                   post_body: str = "", kind: str = "product", max_named: int | None = None,
                    _user_id: str | None = None) -> dict:
     """一组评论写完后调(自动调, 不用等用户说): Jev 整组判一次, 回每条过没过和修改建议。只判, 不存库, 不发布。
 
     ``comments`` 传 ``[{"slot": "q1", "text": "..."}, {"slot": "reply", "text": "..."}, ...]``: slot 写 comments_for 给的
     评论位 id(自定义的评论位传整个对象); 同一个 id 只能有一条; 贴主答疑那条会自动接上它回的那一位。帖子参数和
     comments_for 那次一样: ``link``, 或 ``post_title`` / ``post_body`` + ``project_id``。
-    ``kind``: product(默认, 卖货的品)/ agency(机构服务)/ shop(门店)。``max_named``: 整组最多几条点名品牌(默认 1)。
+    ``kind``: product(默认, 卖货的品)/ agency(机构服务)/ shop(门店)。``max_named``: 默认 None, 不设固定品牌点名配额;
+    品牌可自然提及, 不要求每条点名。用户明确要限制时才传整数(整组最多几条点名品牌, 0 表示不点名)。
 
     怎么读返回值:
       · 每条 ``passed=true`` 且 ``needs_review=false`` 才算这条过。``summary.passed`` 是这组过了几条 —— 这就是整组的分数,
@@ -745,9 +747,11 @@ def score_comments(comments: list[dict], link: str = "", project_id: str = "", p
       · ``fix`` 是必须改的(主要行为、点名品牌、接住帖子、细节四项); ``hints`` 只是参考, 不改不算没过, 别为了消掉提示反复重写。
       · ``style_fix`` 是代码查出来的写法底线(句号、方言语气词、像要联系方式的 v / vx / 加微), 有它那条就算没过, 和 fix 一样
         照着改、不用问用户。判定没判成(``judge_status`` 不是 ok)时它在 ``style_issues`` 里, 照样先改掉。
-      · ``thread_fix`` 是整组层面的(点名太多、评论区没有摩擦), 按「位 xx」改那一位。
+      · ``thread_fix`` 是整组必须改的(如违反用户显式设置的品牌点名配额), 按「位 xx」改那一位。
+        ``thread_hints`` 是整组参考(如同句式、摩擦等), 不用为消提示重写。
       · 没过的按 fix 改**一轮**, 再调一次本工具, 然后不管结果都交付并如实说明; 不要循环。
-      · ``needs_review=true``(多半是像背书、或判得拿不准)交人工核实: 不能改成伪造的亲历, 也不要靠反复润色把风险抹掉。
+      · 亲历背书、旁观推荐不因表达类型本身转人工。``needs_review=true`` 时按具体疑点交人工核实: 具体经历、效果和数字依提供素材,
+        不编造事实, 也不要靠反复润色把疑点抹掉。
       · ``judge_status`` 不是 ok 就说这次没判成, 不能说通过。
     """
     try:

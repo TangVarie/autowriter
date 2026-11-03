@@ -52,6 +52,15 @@ def test_comments_timeout_and_registered_tools(wired):
     assert "judge_thread" not in tools.TOOLS and "comment_repair_plan_for" not in tools.TOOLS
 
 
+@pytest.mark.parametrize("kwargs, expected", [({}, None), ({"max_named": 0}, 0), ({"max_named": 2}, 2)])
+def test_legacy_thread_entry_uses_the_same_optional_brand_limit(wired, kwargs, expected):
+    calls, reply = wired
+    reply["fn"] = lambda *args: _Resp(200, dict(THREAD_OK))
+    core.judge_thread(_client(), PROJ, "标题", "正文", [{"text": "评论"}], user_id=ME, **kwargs)
+    (_method, _url, _headers, body, _timeout), = calls
+    assert body["max_named"] == expected
+
+
 @pytest.mark.parametrize("body", [
     {"passed": True, "plan": []},
     {"passed": True, "plan": [], "needs_review": "false"},

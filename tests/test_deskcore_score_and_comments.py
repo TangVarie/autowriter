@@ -161,7 +161,15 @@ def test_a_link_brings_back_the_post_its_comments_rules_and_slots():
     assert out["comment_rules"] == ["评论区：提到途鸽时不用代称"]
     assert out["hard_rules"] == ["不能承诺包过"], "合规硬约束对评论一样管用; 正文偏好不带"
     assert [s["id"] for s in out["slots"]] == ["q1", "q2", "exp", "reply"]
-    assert not any("背书" in a for s in out["slots"] for a in s["speech_act"]), "默认不放背书位"
+    slots = {s["id"]: s for s in out["slots"]}
+    assert all(s["may_name_brand"] for s in slots.values()), "四个评论位都可自然点名, 不强制点名"
+    assert slots["q1"]["speech_act"] == slots["q2"]["speech_act"] == ["提问"]
+    assert slots["exp"]["speech_act"] == ["补充经验", "亲历背书", "旁观推荐"]
+    assert slots["reply"]["speech_act"] == ["回复答疑", "亲历背书", "旁观推荐"]
+    assert slots["reply"]["reply_to"] == "q1", "可推荐不改变回复对象"
+    for slot in slots.values():
+        assert "不必" in slot["note"], "允许点名不能让写手以为每条都要点名"
+    assert "依提供素材" in slots["exp"]["note"] and "不编造事实" in slots["reply"]["note"]
     assert out["note_id"] == NOTE["note_id"] and out["tier"] == "爆"
 
 
@@ -268,6 +276,19 @@ def test_slots_by_id_and_the_reply_picks_up_the_question(wired):
     assert out["thread_fix"] == ["位 q1: 评论区没有摩擦：这一位改成审慎的追问"]
     assert out["thread_hints"] == ["评论区参考题（未验收）不理想：praise_share"]
     assert "ledger_rows" not in out and "profile" not in out, "回包压过, 不把整份判定原样灌给模型"
+
+
+@pytest.mark.parametrize("kwargs, expected", [({}, None), ({"max_named": None}, None),
+                                              ({"max_named": 0}, 0), ({"max_named": 2}, 2)])
+def test_comment_brand_limit_is_optional_and_explicit_limits_are_forwarded(wired, monkeypatch, kwargs, expected):
+    calls, reply = wired
+    reply["fn"] = lambda m, u, kw: _Resp(200, dict(THREAD_OK))
+    monkeypatch.setattr(core, "sb", lambda: _tv_client())
+    tools.score_comments([{"slot": "q1", "text": "途鸽的简历课有这一部分吗"},
+                          {"slot": "reply", "text": "途鸽这部分可以分开了解"}], link=LINK, _user_id=ME, **kwargs)
+    (_m, _url, _h, body, _t), = calls
+    assert body["max_named"] == expected, "不传不加配额, 显式的 0 和整数仍交给 Jev 检查"
+    assert all(c["slot"]["may_name_brand"] for c in body["comments"])
 
 
 @pytest.mark.parametrize("comments, why", [
