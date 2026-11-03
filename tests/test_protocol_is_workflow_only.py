@@ -31,6 +31,17 @@ def test_comment_tool_descriptions_carry_the_reading_rules():
         assert word in score, f"score_comments 的说明里缺 {word}"
 
 
+def test_comment_guidance_allows_supported_experience_and_natural_brand_mentions():
+    entry, score = T.comments_for.__doc__, T.score_comments.__doc__
+    assert "不要求每条点名" in entry and "默认 None" in score
+    assert "用户明确要限制时才传整数" in score
+    for text in (entry, score, PROTOCOL):
+        assert "依提供素材" in text and "不编造事实" in text
+        assert "不写背书" not in text and "多半是像背书" not in text
+    assert "亲历背书、旁观推荐不因表达类型本身转人工" in score
+    assert "没有素材时写提问或一般讨论" in PROTOCOL
+
+
 def test_judge_tool_descriptions_carry_the_reading_rules():
     doc = T.judge_draft.__doc__
     for word in ("hard_fails", "plan", "judge_status", "不要循环", "不是闸"):

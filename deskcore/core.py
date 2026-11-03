@@ -2955,7 +2955,7 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
 
 
 COMMENT_TOOL_NOTE = ("评论只做参考判定，不入稿件库。judge_status 不是 ok 时不能声称检查通过；"
-                     "needs_review 的背书或缺答需人工核实，不编造亲历。")
+                     "needs_review 标出的具体疑点需人工核实；亲历、效果和数字依提供素材，不编造事实。")
 
 # Running I/O cannot be cancelled by Future.cancel(). Bound surviving work across requests.
 _ISOLATION_POOL = cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="project-isolation")
@@ -3133,7 +3133,7 @@ def comment_repair_plan_for(client, project_id: str, post_title: str, post_body:
 
 def judge_thread(client, project_id: str, post_title: str, post_body: str, comments: list, *,
                  user_id: str | None = None, kind: str = "product", points: list | None = None,
-                 max_named: int = 1) -> dict:
+                 max_named: int | None = None) -> dict:
     """整组评论判定；不写稿件库或评论账本。"""
     assert_project_access(client, project_id, user_id=user_id)
     return _comment_tool_call(client, project_id, "/judge_thread",
@@ -3146,21 +3146,21 @@ def judge_thread(client, project_id: str, post_title: str, post_body: str, comme
 # 写手在任何对话里贴一条发布链接(或贴帖子正文 + 说是哪个项目)就行: comments_for 从 TV 把帖子、已有评论、本项目
 # 管评论的规则和默认评论位一次拿齐; 模型写完调 score_comments, 整组一次判定, 带每条的修改建议。
 #
-# 默认评论位与 Jev 的 judge/comments.py::default_slots 同一组(提问 ×2 · 补充经验 ×1 · 贴主答疑 ×1, 不放背书位):
+# 默认评论位与 Jev 的 judge/comments.py::default_slots 同一组(提问 ×2 · 经验/推荐 ×1 · 贴主回复 ×1):
 # 字段名和闭集取值照抄那边 —— 写错一个取值 judge 会 422(slot.* 不在题库闭集里)。
 DEFAULT_COMMENT_SLOTS = (
-    {"id": "q1", "speech_act": ["提问"], "role": "读者位", "may_name_brand": False, "must_echo": False,
+    {"id": "q1", "speech_act": ["提问"], "role": "读者位", "may_name_brand": True, "must_echo": False,
      "value_ok": ["可行动信息", "判断依据", "无"], "min_detail": "无", "intent": "其他",
-     "note": "问一件帖子没写清的事"},
-    {"id": "q2", "speech_act": ["提问"], "role": "读者位", "may_name_brand": False, "must_echo": False,
+     "note": "问一件帖子没写清的事, 品牌可自然提及, 不必每条点名"},
+    {"id": "q2", "speech_act": ["提问"], "role": "读者位", "may_name_brand": True, "must_echo": False,
      "value_ok": ["可行动信息", "判断依据", "无"], "min_detail": "无", "intent": "其他",
-     "note": "问另一件帖子没写清的事, 别和 q1 问同一件"},
-    {"id": "exp", "speech_act": ["补充经验"], "role": "读者位", "may_name_brand": False, "must_echo": True,
+     "note": "问另一件帖子没写清的事, 别和 q1 问同一件; 品牌可自然提及, 不必每条点名"},
+    {"id": "exp", "speech_act": ["补充经验", "亲历背书", "旁观推荐"], "role": "读者位", "may_name_brand": True, "must_echo": True,
      "value_ok": ["可行动信息", "判断依据"], "min_detail": "模糊", "intent": "补充信息",
-     "note": "补一段和帖子相关的情境或做法, 不对品牌下结论, 不编造用过某产品的亲历"},
-    {"id": "reply", "speech_act": ["回复答疑"], "role": "贴主", "reply_to": "q1", "may_name_brand": True,
+     "note": "接着帖子补充经验、感受、比较或推荐, 品牌可自然提及, 不必点名; 具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写一般讨论"},
+    {"id": "reply", "speech_act": ["回复答疑", "亲历背书", "旁观推荐"], "role": "贴主", "reply_to": "q1", "may_name_brand": True,
      "must_echo": False, "value_ok": ["可行动信息"], "min_detail": "无", "intent": "补充信息",
-     "note": "贴主回答 q1, 给能用的信息"},
+     "note": "贴主接着 q1 答疑, 可结合素材表达感受、比较或推荐, 品牌可自然提及, 不必点名; 具体经历、效果和数字依提供素材, 不编造事实"},
 )
 
 
@@ -3609,7 +3609,7 @@ def _comment_payload(cands: list[dict]) -> list[dict]:
 
 def score_comments(client, *, user_id: str | None, comments: list, link: str = "", project_id: str = "",
                    post_title: str = "", post_body: str = "", kind: str = "product",
-                   max_named: int = 1) -> dict:
+                   max_named: int | None = None) -> dict:
     """一组候选评论整体判一次(judge /judge_thread), 回每条过没过和修改建议。只判, 不写任何库。
 
     ``comments`` 每条 ``{"slot": "q1" | {评论位}, "text": "...", "reply_to_text"?}``: slot 写 comments_for 给的 id 就行;
