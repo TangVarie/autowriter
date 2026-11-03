@@ -683,13 +683,13 @@ python -m deskcore.cli doctor        # 只读; 逐个探测缺哪个、缺了会
 | 唐小轻成分党 | `bcc3d155-201d-4920-9fde-64933a8948dc` | `b907ec9d…` | 229 |
 | RIO便利店调酒 | `b3ac2a5f-320b-49e5-9f11-15d6e517ec41` | `b907ec9d…` | 104 |
 
-owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
+owner 分布（只列前 8 位：本仓公开，完整 UUID 不进仓。配 `DESKCORE_KEYS` 时 `user_id` 一律填团队身份 —— 第一行 `85f5f888…`（在用的那几个项目都归它；按项目数认会认错，表是 08-28 的数），完整值从 Railway 现有那几行抄或用 `select distinct owner_id from autowriter.projects` 查，**别新造**）：
 
 | owner_id | 项目数 | items |
 |---|---|---|
-| `85f5f888-a649-4843-8358-9c83c91282e6` | 29 | 3,385 |
-| `afbaf84e-e5a3-4429-9490-72718d2a9019` | 20 | 667 |
-| `b907ec9d-9e49-4dac-89ad-220eb53afc38` | 6 | 504 |
+| `85f5f888…` | 29 | 3,385 |
+| `afbaf84e…` | 20 | 667 |
+| `b907ec9d…` | 6 | 504 |
 | 另外三个 | 6 | 18 |
 
 ---
@@ -793,26 +793,27 @@ key 支持两种传法（`X-Deskcore-Key` 头、`Authorization: Bearer`），见
 > `mcp_allowed_hosts`）。这不是可有可无的排查便利：它俩配错时**服务端一行日志
 > 都不会有**，报错全在客户端那头，而且报的是传输层错误。回显出来才对得上。
 
-`DESKCORE_KEYS` 格式（**一人一把**，key 映射成 `user_id`，这是"个人风格私有"的前提）：
+`DESKCORE_KEYS` 格式（**钥匙一人一把，`user_id` 全填团队身份那一个**，2026-11-02 D-136 起）：
 
 ```json
-{"k-ziao-xxxx": {"user_id": "<uuid>", "name": "Ziao"},
- "k-xiaoyu-yyy": {"user_id": "<uuid>", "name": "小鱼"}}
+{"k-ziao-xxxx": {"user_id": "<团队身份的 user_id>", "name": "ziao"},
+ "k-xiaoyu-yyy": {"user_id": "<团队身份的 user_id>", "name": "小鱼"}}
 ```
 
-> ⚠️ **判据是「这把 key 背后是不是同一个人」，不是「UUID 在不在库里」。**
+> **钥匙按人发，身份只有一个。**
 >
-> - **老人**（库里已有他的项目/稿子）→ **必须用他自己那个已有 UUID**，否则
->   `open_project` 里的个人正负例、`my_style` 的调校笔记全都看不到，个人层等于关着。
-> - **新人**（库里没有任何历史）→ **可以给一个全新 UUID**，他从空的个人层开始积累，
->   这是对的。
-> - ❌ **绝不能把两个人塞进同一个 UUID** —— 那等于把 A 的调校笔记和正负例交给 B 看，
->   而且 B 能改 A 的标注（`label_example` 的归属校验是按 `user_id` 判的）。
+> - **钥匙一人一把**：谁的钥匙漏了只换谁那一把，别人不受影响。`name` 只是 Railway 配置里的备注：日志和 `/skill-versions` 都分不出是哪把钥匙（日志只记 `user_id` 前 8 位，D-136 之后每把都一样；`/skill-versions` 只有计数）。所以 `name` 要写清是谁的，漏了的时候只能靠它认出该换哪一行。
+> - **`user_id` 全是团队身份**：项目归团队（`projects.owner_id`），每个项目级工具按 `owner_id == user_id` 校验
+>   （审计 COR-015，2026-08-24 起；`create_project` 恒以调用者为 owner 建新的，`get_protocol` 不碰项目），
+>   所以只有团队身份打得开那几个在用的项目。个人层（正负例、`my_style` 调校笔记）跟着也是整个团队一份 ——
+>   D-136 就是这么定的，不再按人分身份（08-22 定的「个人风格私有」从这天起不按人分）。
+> - **加一个写手 = 在 `DESKCORE_KEYS` 里加一行**（`user_id` 填团队身份），不建项目、不改 `owner_id`。步骤见下面「加一个写手」。
+> - ❌ 给新人一个全新 UUID：他**一个项目都打不开**，`list_projects` 回空列表、**不报错**，写手只会觉得写作台是空的。
+> - 团队身份的 UUID **不写进本仓**（公开仓）：从 Railway 上现有那几行抄，认前 8 位 `85f5f888…`。要从库里查，带上项目名：
+>   `select owner_id, string_agg(name, '、') from autowriter.projects where name in ('途鸽', 'sportsix', '百健士成人藻油') group by 1 having count(*) = 3;`（三个名字都在的那一个；别的 owner 名下也有叫「途鸽」的旧项目）
+>   ⚠️ 别按「项目最多」认：另一个 owner 名下有 30 个旧项目，填成它 `list_projects` 不是空的、而是一堆旧项目，下面「回空列表 = 填错了」那条就不灵了。
 >
-> ⚠️ **2026-08-24 起还多一层**（审计 COR-015）：`user_id` 现在还决定**能打开哪些项目**——
-> 判据是 `projects.owner_id == user_id`，**每个项目级工具都校验**（`create_project` 不校验已有项目，它**恒以调用者为 owner** 建新的；`get_protocol` 不碰项目）。所以给新人发一个全新 UUID
-> 意味着他**一个项目都打不开**，得先让他自己建项目（或者把他要用的项目的 `owner_id`
-> 改成他）。口径与"改成团队共享要改哪儿"见 `docs/deskcore.md` §2.2.1。
+> 口径与"改成团队共享要改哪儿"见 `docs/deskcore.md` §2.2.1。
 >
 > **为什么不是 RLS 的事**：deskcore 持 `service_role`，**绕过 RLS**，个人层是靠
 > `store.py` 里一串显式 `.eq("user_id", user_id)` 隔离的（:143 / :471 / :499 / :524 /
@@ -833,30 +834,40 @@ key 一旦在聊天窗口、截图、工单里出现过，就当它已经泄露 
 `service_role` 绕过 RLS，一把有效 key 等于那个人名下**全部项目数据 + 全部
 工具（含写）**。轮换是唯一的补救。
 
-**第一步：本地生成，不要让任何人替你生成。**
+**只漏了一把**（某个写手的钥匙出现在聊天 / 截图里）：不用全换。按下面第一步的脚本只给她生成一行，在 Railway 的 `DESKCORE_KEYS` 里**只换她那一行的钥匙串**（引号里 `k-…` 那一段；她的 `name` / `user_id` 和前后的逗号、括号都不动，别把脚本输出整行贴过去 —— 末尾那个逗号贴在最后一行会让整份 JSON 坏掉、全员 401），`/health` 的条数不变、`auth.ok` 是 true，新钥匙私发给她。别人不受影响。下面四步是**整份 `DESKCORE_KEYS` 或好几把都可能漏了**时用的。
+
+**第一步：生成新钥匙，钥匙值不经过对话。**
 
 ```bash
 python - <<'EOF'
 import secrets
-for who, uid in [
-    ("quanquan", "85f5f888-a649-4843-8358-9c83c91282e6"),
-    ("jiayi",    "afbaf84e-e5a3-4429-9490-72718d2a9019"),
-    ("ziao",     "b907ec9d-9e49-4dac-89ad-220eb53afc38"),
-]:
-    print(f'  "k-{who}-{secrets.token_urlsafe(24)}": '
-          f'{{"user_id": "{uid}", "name": "{who}"}},')
+TEAM = "<团队身份的 user_id>"          # 从 Railway 现有的 DESKCORE_KEYS 抄
+WHO = ["<现在 DESKCORE_KEYS 里每一行的 name>"]   # 一行不落, 照 Railway 上现有的抄; 漏一个她就 401
+for who in WHO:
+    # 钥匙本身只用 ASCII: 它走 HTTP 头, 中文名进钥匙客户端会报错或对不上(401)。名字只放 name 里
+    print(f'  "k-{secrets.token_urlsafe(24)}": '
+          f'{{"user_id": "{TEAM}", "name": "{who}"}},')
 EOF
 ```
 
-**为什么必须是你自己在本地跑**：让别人（包括 AI 助手）生成，新 key 就又一次
-经过了聊天记录、日志和上下文窗口 —— 那是刚刚要修的那个洞。这段脚本只吐字符串，
-不联网、不落盘。
+自己本地跑最稳：脚本只吐字符串到屏幕，不联网、不落盘。
+
+要 Claude 生成也行（11-03 加写手就是这么做的），但输出必须**直接重定向进文件**，对话里只能出现文件路径、不能出现内容（`EOF` 和 `)` 各占一行，写在一行里 bash 会报语法错）：
+
+```bash
+(umask 077; python - > <仓库外的路径>/deskcore-keys.txt <<'EOF'
+<第一步那段脚本>
+EOF
+)
+```
+
+你从文件里拷到 Railway，拷完删掉文件。
+钥匙一旦在聊天记录、工具输出、截图里出现过，就等于又漏了一次 —— 那正是轮换要堵的洞。
 
 **第二步**：把输出拼成 JSON（去掉最后一个逗号），整体替换 Railway 上的
 `DESKCORE_KEYS`，等服务重启。
 
-**第三步**：`curl -s <服务地址>/health | grep auth` 确认 `note` 还是 `3 key(s)`。
-数目对不上就是 JSON 写坏了 —— 注意 `_key_map()` 是 **fail-closed** 的：
+**第三步**：`curl -s <服务地址>/health | grep auth` 确认 `note` 的条数和你配的一样（11-03 起是 `4 key(s)`）、`auth.ok` 是 true。条数少了，先看是不是第一步漏了谁；`auth.ok` 是 false 就是 JSON 写坏了（`note` 里写了原因）。`auth.ok` 是 true 而写手 401，是她手上还是旧钥匙 —— 第四步发完才好。注意 `_key_map()` 是 **fail-closed** 的：
 解析失败一律 401，不会退化成"没配"（那曾经等于匿名全开，见 ROB-003）。
 
 **第四步**：把新 key 分别发给本人，**一人一把，不要群发**。旧 key 在第二步
@@ -864,8 +875,17 @@ EOF
 
 ⚠️ **`name` 字段只是给人看的备注，不参与鉴权**。2026-08-27 踩过一次：一把叫
 `k-ziao-…` 的 key，`user_id` 指向的其实是同事的账号 —— 拿它写稿会把稿子记进
-**别人**的历史库。轮换时对着上面 §「owner 分布」那张表逐个核 UUID，别照抄
-旧配置里的名字。
+**别人**的历史库。D-136 之后判据简单了：**每一行的 `user_id` 都该是团队身份那一个**，轮换时逐行核，
+有一行不是就是配错了。
+
+#### 加一个写手（不轮换）
+
+1. 按第一步的脚本只生成一行（`WHO` 只写她的名字，名字只进 `name`），`user_id` 填团队身份。
+2. 加进 Railway 上的 `DESKCORE_KEYS`（原有几行不动），等服务重启。
+3. `/health` 的 `auth.note` 多一条、`auth.ok` 是 true。
+4. 拿新钥匙调一次 `list_projects`，回来的应该就是团队在用的那几个项目；随便编一把钥匙应该是 401。
+   回空列表不报错 = `user_id` 填错了（见上面「格式」那段）。
+5. 钥匙单独私发给她本人。上手步骤给她《写作台评论写手入门指南》（不含钥匙值）。
 
 > ⚠️ 少写一层（`{"k": "<uuid>"}`）是**合法 JSON**，`identity.py` 会当成配置错误抛
 > 可读的 401——不会漏到运行期变成 500。JSON 整个写错也一律 401，**不会**退化成

@@ -452,6 +452,83 @@ def test_an_ingested_link_is_not_a_direction():
     assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
 
 
+# ── 夜里没对上时先去掉暂时不用的项目(2026-11-03); 这张表的本家归档了也留着, 别的表的本家不去(复审 11-03) ──────────────────────
+ARCHIVED_PARAMS = '{"archived": true}'
+FOURTH_PROJ = "dddddddd-0000-0000-0000-000000000004"
+
+
+def _archived_siblings_client(*, home_archived=False):
+    """途鸽的形状: 本家(补录目标) + 两个早就归档的方向, 都归调用者。"""
+    c = _tv_client(maps=[{"tv_project_id": "TUGE_phase1", "project_id": PROJ, "ingest_target": True},
+                         {"tv_project_id": "TUGE_phase1", "project_id": THIRD_PROJ, "ingest_target": False},
+                         {"tv_project_id": "TUGE_phase1", "project_id": FOURTH_PROJ, "ingest_target": False}])
+    for pid, name in ((THIRD_PROJ, "途鸽D-1"), (FOURTH_PROJ, "途鸽D-2")):
+        c.rows["projects"].append({"id": pid, "name": name, "brand": "途鸽", "owner_id": ME, "calibration_notes": "",
+                                   "tactics": "[]", "custom_roles": [], "default_params": ARCHIVED_PARAMS})
+    if home_archived:
+        next(p for p in c.rows["projects"] if p["id"] == PROJ)["default_params"] = ARCHIVED_PARAMS
+    return c
+
+
+def test_archived_directions_are_not_offered():
+    out = core.comments_for(_archived_siblings_client(), user_id=ME, link=LINK)
+    assert out["resolved"] is True and out["project_id"] == PROJ, "只剩一个在用的就是它, 不让写手在归档的里挑"
+
+
+def test_all_archived_still_asks_among_them():
+    out = core.comments_for(_archived_siblings_client(home_archived=True), user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ, FOURTH_PROJ}
+
+
+def test_a_live_direction_is_still_asked_even_with_archived_ones_around():
+    c = _archived_siblings_client()
+    next(p for p in c.rows["projects"] if p["id"] == THIRD_PROJ)["default_params"] = "{}"
+    out = core.comments_for(c, user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+
+
+def _two_tables_client(*, home_archived=False, link=None):
+    """成人藻油的形状: BJS_phase2 的本家是成人项目; 儿童项目是 BJS_phase1 的本家, 也挂在 BJS_phase2 上
+    (这张表里真有青少年款, D-129 指回了它)。"""
+    note = dict(NOTE, note_id="BJS_phase2_recB", project_id="BJS_phase2")
+    c = _tv_client(notes=[note], comments=[], maps=[
+        {"tv_project_id": "BJS_phase2", "project_id": PROJ, "ingest_target": True},
+        {"tv_project_id": "BJS_phase2", "project_id": THIRD_PROJ, "ingest_target": False},
+        {"tv_project_id": "BJS_phase1", "project_id": THIRD_PROJ, "ingest_target": True}])
+    c.rows["projects"].append({"id": THIRD_PROJ, "name": "儿童藻油", "brand": "百健士", "owner_id": ME,
+                               "calibration_notes": "", "tactics": "[]", "custom_roles": []})
+    if home_archived:
+        next(p for p in c.rows["projects"] if p["id"] == PROJ)["default_params"] = ARCHIVED_PARAMS
+    if link:
+        c.rows["tv_note_links"] = [{"note_id": "BJS_phase2_recB", "tv_project_id": "BJS_phase2",
+                                    "project_id": link[0], "version_id": None, "match_kind": link[1]}]
+    return c
+
+
+def test_two_live_products_on_one_table_still_ask():
+    """不按「这张表的本家」替他定(复审 11-03): 这张表里有另一个品的帖, 定错了评论就丢了那个品的硬规则。"""
+    out = core.comments_for(_two_tables_client(), user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+
+
+def test_an_ingested_row_pointing_at_the_other_product_still_asks():
+    out = core.comments_for(_two_tables_client(link=(THIRD_PROJ, "ingested")), user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+
+
+def test_an_archived_home_is_kept_so_the_other_product_is_not_picked_silently():
+    out = core.comments_for(_two_tables_client(home_archived=True), user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+    direct, choices = core._project_for_note(_two_tables_client(home_archived=True), dict(NOTE, note_id="BJS_phase2_recB",
+                                             project_id="BJS_phase2"), None, ME)
+    assert direct is None and len(choices) == 2, "score_comments 走的也是这条路"
+
+
+def test_the_night_link_still_wins():
+    out = core.comments_for(_two_tables_client(link=(THIRD_PROJ, "fuzzy")), user_id=ME, link=LINK)
+    assert out["project_id"] == THIRD_PROJ, "夜里对上了旧稿就是那个项目写的"
+
+
 # ── 挪表之后同一条链接两行: 已删的那行让位给活的那行(2026-10-26, I-22) ─────────────────────────────
 # 运营把成人藻油从 BJS_phase1 的飞书表挪去新表(TV 记为 BJS_phase2): 旧行进 truth_vault.v_notes_vanished, 新行同链接、
 # 同发布时间(两张表同一套列)。排序只剩 note_id, BJS_phase1_… 排在前面 —— 不让位的话写手给成人项目也会 403。

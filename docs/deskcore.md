@@ -1089,6 +1089,21 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 
 **`_draw` 的预算。** 预算那条用例（`test_drawpolicy` 的夹具）标了贴型照样 ≤ 300 字。最坏情形本来就超过 300（点名四个维度、L1 放宽、旧先验的牌 359 字；带参考帖、重用、保底、旧先验的牌 333 字），贴型只多 11 字；没标贴型的牌一个字不多（金标钉着），所以没动已有的键。回归在 `tests/test_draw_layers.py`、`tests/test_layer_rules.py`。
 
+### 3.16 写评论：按链接找到帖子时，暂时不用的项目不拿来问（2026-11-03）
+
+**为什么。** 一张飞书表（一个 TV 项目）可以对着好几个写作台项目。夜里没对上这条笔记写的是哪一个时，`comments_for` 把调用者名下的全列出来让写手挑（`choices`）。按团队身份数，近 60 天途鸽 144 条链接里 126 条要在 8 个名字里挑，其中 7 个是早就归档的方向（途鸽D-1…D-7）。
+
+**怎么去（`core._narrow_note_projects`，只在候选不止一个时走）。** 去掉归档的（`project_archived`，`list_projects` 默认也不列它们，§3.13），剩一个就直接用。两条不去：
+
+- 这张表自己的补录目标（`ingest_target`）归档了也留着。它是这张表的本家，归档的项目照样能写；去掉它可能只剩一个挂在这张表上的别的品，不问就定成那个，规则全是别的品的。
+- 一个在用的都没有就照旧全给。
+
+**没做的：按「哪张表的本家」替他定。** 第一版（同一个 PR 的头一个提交）还去掉「在别的表当补录目标的」候选，理由是「这张表里的帖子写的就是这张表的品」。复审查生产库推翻了：成人藻油那张表（BJS_phase2）里 10-07～10-19 的帖是青少年款（D-129 更正：对照指回 百健士-藻油 的 42 篇里 41 篇；夜里没对上、只靠 `ingested` 指回的 25 篇里 24 篇，另 1 篇 10-21 是成人帖），按那条规则会定成成人项目，评论就丢了 百健士-藻油 那几条青少年款的硬规则。所以几个都在用就照旧问；`ingested` 那一行指着哪个项目也不拿来定（同 `test_an_ingested_link_is_not_a_direction`）。成人藻油那张表的链接照旧要问一句。
+
+不动的：夜里真对上了（`tv_note_links` 的匹配档）就用对上的那个，归档的也用；`score_comments` 走同一条路。
+
+协议没改（版本不变，写手不用重导 skill）。回归在 `tests/test_deskcore_score_and_comments.py`。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -1100,7 +1115,7 @@ env：
 | 变量 | 必需 | 说明 |
 |---|---|---|
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | ✅ | service_role，绕 RLS |
-| `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<uuid>", "name": "Ziao"}}`，一人一把 |
+| `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<团队身份的 uuid>", "name": "Ziao"}}`。钥匙一人一把，`user_id` 全填团队身份（2026-11-02 D-136）；加写手就加一行，见 runbook「加一个写手」 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN。馆员回 200 但 `status` 是 `degraded` / `error`（TV 侧选卡失败）记 `error` 不记 `empty` |
 | `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `15`（2026-10-30 起，原 10；最近冷借 14–18 秒），夹在 1–20。`open_project` 随简报借卡**最多等这么久**，而且不超过整次回包目标 `OPEN_PROJECT_RESPONSE_BUDGET_SEC`（20 秒，不开 env）扣掉借阅之前已用的时间和借阅之后几步的预留（`core.OPEN_PROJECT_TAIL_RESERVE_SEC`，2.5 秒）剩下的那段；到点先交简报（`lessons_status.status=timeout`，`detail` 里叫模型动笔之前用同样的参数调一次 `borrow_lessons`，命中缓存即回；只调一次，还没有就照常写）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60），2026-10-30 起也收 `extra_instructions`（它在馆员的缓存键里） |

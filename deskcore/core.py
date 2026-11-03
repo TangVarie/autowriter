@@ -3220,6 +3220,26 @@ def _note_from_link(client, link: str) -> tuple[dict | None, str | None]:
     return {**rows[0], TV_VANISHED_FLAG: True}, None
 
 
+def _narrow_note_projects(targets: list[dict], mine: list[dict]) -> list[dict]:
+    """一条笔记对着调用者好几个写作台项目、夜里又没对上时, 先去掉暂时不用的(project_archived), 再决定问不问(2026-11-03)。
+
+    途鸽的飞书表对着团队 8 个项目, 7 个是早就归档的方向(途鸽D-1…D-7) —— 不去掉的话近 60 天 144 条途鸽链接里 126 条要
+    写手在 8 个名字里挑。list_projects 默认也不列它们。
+    两条不去的:
+      · 这张表自己的补录目标(``ingest_target``)归档了也留着: 它是这张表的本家, 归档的项目照样能写(归档不锁人);
+        去掉它可能只剩一个挂在这张表上的别的项目, 不问就定成那个, 规则全是别的品的;
+      · 一个在用的都没有就照旧全给, 不替他挑。
+    不按「哪张表的本家」替他定(复审 11-03): 成人藻油那张表(BJS_phase2)里 10-07～10-19 的帖是青少年款(D-129 更正:
+    指回 百健士-藻油 的 42 篇里 41 篇; 夜里没对上、只靠 ingested 指回的 25 篇里 24 篇), 按「这张表的帖子写的就是这张表的
+    品」定成成人项目, 评论就丢了青少年款那几条硬规则。几个都在用就照旧问。
+    """
+    live = [p for p in mine if not project_archived(p)]
+    if not live:
+        return mine
+    home = {str(t["project_id"]) for t in targets if t.get("ingest_target") and t.get("project_id")}
+    return [p for p in mine if not project_archived(p) or str(p["id"]) in home]
+
+
 def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tuple[dict | None, list[dict]]:
     """笔记所在的 TV 项目 → 调用者能访问的写作台项目: ``(项目, [])``, 或者定不下来时 ``(None, 可选的项目)``。
 
@@ -3257,6 +3277,8 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tu
             mine.append(assert_project_access(client, pid, user_id=user_id))
         except (PermissionError, ProjectNotFound):
             continue
+    if len(mine) > 1:
+        mine = _narrow_note_projects(targets, mine)
     if len(mine) == 1:
         return mine[0], []
     if mine:

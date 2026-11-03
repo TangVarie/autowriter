@@ -113,7 +113,7 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 
 另有 `health` / `projects` / `open` / `draw` / `check` 几个只读的手动验证入口。完整参数与验收判据见 runbook §2。
 
-运行期 env（`DESKCORE_KEYS` 一人一把、`SUPABASE_*`、`GOOGLE_API_KEY`、`DESKCORE_ALLOWED_*`）
+运行期 env（`DESKCORE_KEYS` 钥匙一人一把、`user_id` 全是团队身份（D-136）、`SUPABASE_*`、`GOOGLE_API_KEY`、`DESKCORE_ALLOWED_*`）
 见 [`docs/deskcore.md`](../docs/deskcore.md) §4.1。**两侧都 fail-closed**：key 一个都没配时所有请求 401
 （本服务持 `service_role` 绕 RLS，匿名放行等于开放全部租户数据）。
 
