@@ -326,7 +326,7 @@ def _regex_total() -> float:
 
 
 def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = None,
-          tags: list[list[str] | None] | None = None, expects=()) -> tuple[list[dict], dict]:
+          tags: list[list[str] | None] | None = None, expects=(), applies=None) -> tuple[list[dict], dict]:
     """(命中, 统计)。命中按篇、再按 hard 在前排好; 统计 = {"rules": 能查的条数, "skipped": check 坏了跳过的条数}, 有正则规则这次
     没查完时再带 ``"timed_out": [规则 id, …]`` 和 ``"timed_out_from": {规则 id: 从哪一篇(index)起没查完}`` —— 那一篇之前的都
     查完了, 查出来的命中照报(独立复审 on aw#115 第六轮: 不说从哪篇起, 同一条既报了命中、又整条报"没查", 两头打架)。
@@ -336,6 +336,8 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
     ``rules`` 是 store.shared_memories 的 hard + soft(没 check 的自动略过, soft 的方向闸由调用方先过);
     ``indices`` 同 delivery.assemble; ``tags`` 和 drafts 一一对应, 某篇给了就用它当这篇的话题(见 _parts);
     ``expects`` 是交付模板要求每篇都带的部位(delivery.expected_parts), 必须带的话术查到这些部位空着时照没带报。
+    ``applies(rule, pos)``(2026-11-03 贴型): 这条规则管不管 drafts[pos] 这一篇 —— 带方向的规则跟着每篇卡的贴型走
+    (core.rule_applies_to_layer); 不管的那一篇不查、不报。不给就是每条查每篇(原来的口径)。
 
     正则规则限时(validator.search_user_regex): 每条在这次 check 里共用一份 config.REGEX_SEARCH_TIMEOUT_SEC, 用完了这条后面的
     稿子不再搜、报进 timed_out —— 不算命中, 调用方也不能把它说成守住了(限时的引擎跑不了的正则也报在这里)。所有正则规则加起来
@@ -368,6 +370,8 @@ def check(rules: list[dict], drafts: list[dict], *, indices: list[int] | None = 
             budget = validator.RegexBudget(min(validator.regex_search_timeout(), (deadline - time.monotonic()) / rx_left))
             rx_left -= 1
         for pos, parts in enumerate(parts_of):
+            if applies is not None and not applies(r, pos):
+                continue                    # 这条带方向的规则不管这一篇的贴型
             # 时限用完与否只由 search_user_regex 判(真要搜的时候才判): 这一篇这条没东西可搜(只管评论、这篇没评论)就不算没查
             for where, what in _run(spec, parts, expects=expects, budget=budget):
                 hits.append({"index": idx[pos], "rule_id": r.get("id"), "severity": sev,

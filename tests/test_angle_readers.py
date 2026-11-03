@@ -525,3 +525,30 @@ def test_working_skips_seeded_paid_and_synthetic_posts():
     got = store.recent_titles(w.client(), PID, working=5)
     assert got["working"] == ["自己起来的那篇"]
     assert {"铺过评论的那篇", "投了流的那篇", "合成的那篇"} <= set(got["published"])
+
+
+def test_working_skips_posts_in_the_paid_boost_view():
+    """投了薯条、却没标 paid_promoted 的帖(TV v_paid_boost_events)也不算(复审: 同 priors 的起量标签, 共用 priors.paid_boosted
+    那份进程缓存)。published 那一栏照旧有它; 视图读不到时照原来的口径(记 WARN), 简报照给。"""
+    w = _Titles()
+    w.post("boost", "投了薯条的那篇", days=6, comments=3, tier="爆")
+    w.post("many", "评论多的那篇", days=7, comments=60)
+    w.post("clean", "自己起来的那篇", days=9, comments=24)
+    c = w.client()
+    c.rows["truth_vault.v_paid_boost_events"] = [{"note_id": "boost"}, {"note_id": "many"}]
+    got = store.recent_titles(c, PID, working=5)
+    assert got["working"] == ["自己起来的那篇"]
+    assert {"投了薯条的那篇", "评论多的那篇"} <= set(got["published"])
+
+    from deskcore import priors
+    priors.reset_cache()
+    c2 = w.client(missing_columns={"truth_vault.v_paid_boost_events": {"note_id"}})
+    assert store.recent_titles(c2, PID, working=5)["working"] == ["投了薯条的那篇", "评论多的那篇", "自己起来的那篇"]
+
+
+def test_working_reads_the_paid_boost_view_only_when_some_post_qualifies():
+    w = _Titles()
+    w.post("few", "评论很少", days=6, comments=2)
+    c = w.client()
+    assert store.recent_titles(c, PID, working=5)["working"] == []
+    assert not [q for q in c.calls if q["table"] == "truth_vault.v_paid_boost_events"], "没有候选就不读那个视图"

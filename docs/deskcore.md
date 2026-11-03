@@ -1070,6 +1070,25 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 
 协议没改（版本不变，写手不用重导 skill）：`comments_for` 的工具说明补了这条路和 `source` 的三个取值。回归在 `tests/test_deskcore_comment_tools.py`。
 
+### 3.15 贴型：写手说了才标，带方向的规则跟着卡走（2026-11-03）
+
+**为什么。** 老板的内容层：产品贴 P（产品在正文里出场）、流量贴 T（冲着切口写，产品多半靠评论区种）、提问贴 Q（和 T 同一族）、精品贴 J（产品融进切口）。飞书「方向」列只有一部分项目有，项目整体的配比也不等于写作台这一批要写的那一片，所以**不给默认配比**，只在写手 / 模型说了「写 N 篇 X 贴」「这批都是产品贴」时给卡标。效果学习这一轮不动（按贴型分开学留到以后）。
+
+| 环节 | 做什么 | 没标贴型时 |
+|---|---|---|
+| `draw_angles(layer=…)` | 一个贴型（每篇都是）或 `{贴型: 篇数}`（其余不标）；别名见 `vocab.LAYER_ALIASES`；`pin` 里的「方向」/`layer` 归进这里（`drawpolicy.split_pin_layer`），不当维度。写错、篇数超过 n、和 pin 里的方向说的不一样 → `layer_invalid`、什么都不写。按槽位先后标（`slot_layers`，不用 rng）；点名重写的带原来那张卡的贴型（写手这次说「都是 X」时按 X），各几篇的说法先拿它们抵账 | 一字不差：`tests/golden/draw_v2_c5ca36c.json` 钉着候选表、台账 `_draw`、重发的行、牌和卡面（rng 消耗也一样）；v1 总开关照旧 |
+| 台账 | `_draw.ly` = P / T / Q / J；不进 `angle_key`、不进去重；备牌跟着它那个槽位，尾巴只在整批同一个贴型时带。`ledger_dims_for` 带出 `_draw: {ly}`（`public_dims` 照样剥掉） | 没有这个键 |
+| 卡面 | 「第i篇」下面一行 `vocab.LAYER_LINE`；流量贴 / 提问贴的「直给推荐」「场景植入」换一句不叫人硬插产品的大白话（`PLAIN_FORMAT_TRAFFIC`）。渲染只看卡上的值 | 不加行 |
+| 规则 | `core.rule_applies_to_layer`：流量向只管 T / Q，产品向只管 P / J（hard、soft 一样），通用的照旧每篇都管。简报里带方向的规则后面注【只管流量贴/提问贴的稿】/【只管产品贴/精品贴的稿】，那一层末尾一句说清卡上没写贴型的照常守（root 的 `memory.py` 不动，改的是传进去的副本）；这场方向闸挡掉的另一个方向的 soft 规则单独一截接在 P1 最后（`OTHER_DIRECTION_BLOCK`，过同一道相关性、同样封顶，`counts.soft_rules_for_other_layers`），写明只管卡上写着那一族贴型的稿、没写贴型的不用管 —— 复审：不然标了另一族贴型的稿会被报一条简报里从没出现过的「建议改」，原来那一截一个字不变；`score_drafts` 的代码查规则和 `check_rules`（Jev 规则题按贴型分组发各自的题库，编出来的 code 逐篇过滤）按每篇的贴型查，这一批哪一篇都不管的规则先拿掉（不报「没查完」、不数进 stats / pool / uncompiled，也不为它补编）。贴型从台账来，存档和 `check_rules`（`store.resolve_version_layers`）认同一张卡：销给这一版的那张卡（存档时销账先做完，新稿就用销的那一行：`consume_angle` 销账时把那一行的贴型一并回给 `commit_drafts`，存档不再按版本读一次 —— 同一个 key 台账里有两行没销的时候，`consume_angle` 销的是调用者最早那一行，按 key 找到的是最近抽的那一行，Codex review on aw#141；多读那一次的话，它一失败就只能退回按 key 找）；改稿重存的那一版自己不销牌，找同一篇稿子别的版本销的那张（这一步读失败照旧按 key 找）；找到了卡、卡没标贴型也算定了。两条线上都没有卡的才按 `angle_key` 找最近抽的那一行（存档时按稿子带的 key，`check_rules` 按指纹行记的 key，`store.ledger_layers`） | 原来的口径：soft 过这场的方向闸，hard 都管；读不到台账也是这样 |
+| 参考帖 | 外部帖多读 Jev 的 `product_role`（`EXT_QIDS`），池子条目带 `prod`（1 出场 / 0 没出场，答了才有）；产品贴 / 精品贴的 e 槽优先 `prod=1`，流量贴 / 提问贴优先 `prod=0`。起量帖读 TV `notes.content_layer`（单独一次可选的查询，不进 `TV_OUTCOME_COLS`；列不在就不读），条目带 `ly`，h 槽分三档：形式一样且同一族 → 形式一样 → 同一族。只是优先、不筛（外部帖进池的门槛按族算，见表下第一段），√日均评论的权重不变，记的 p 按同一套分档算（`_e_marginal` / `_h_marginal`） | 不分档 |
+| 判定提示 | `score_drafts` 那次判定本来就回 `profile.product_role`：产品贴 / 精品贴判出「未出现」、流量贴 / 提问贴判出「主角」时，那一篇的 `judge.results` 带一句 `layer_hint`，next_step 叫模型提一句；不扣分、不拦存档、不多调 Jev | 不带 |
+
+**外部帖按族比日均评论（同一轮，老板 11-03 定的）。** 正文里产品当主角 / 解决方案的外部帖（Jev `product_role`）评论本来就少（近 45 天日均评论中位数 0.71，其余 2.84），按全品类一个中位数切，P/J 卡想优先的 `prod=1` 在进池之前就被切掉大半。`priors.external_pool` 改成按族切：P 族 = `product_role` 是主角 / 解决方案，O 族 = 其余（包括没答的），各自在帖龄合格的帖上取中位数，留 ≥ 自己那一族中位数的；一族不满 `ext_family_min_n`（5）篇就用全品类的中位数；整个品类一篇 `product_role` 都没答（读挂了 / 没抓）就和原来一样只有一个中位数（回包也不带 `family_median_velocity`）。权重照样 √日均评论、不打折，`ext_ok` 照样数切完的池子。按族切只管哪些帖进池：`title_shares`（`compose` 按 `ext_title_blend` 0.25 掺进非问句的标题句式 π）、`top_structures`、`recent_14d` 和掺外部那一步的篇数门槛（回包新加的 `summary_eligible`，`ext_title_min` 数它；没有这个键的外部块照旧数 `eligible`）仍按全品类一个中位数切出来的帖算 —— 复审：不然没标贴型的卡的标题句式 π、`cli` / `project_now` 的摘要行在生产上也跟着变，超出这次定的范围；要让它们也跟新池子走，得另外定。金标不受影响：两份发牌金标的外部池是合成的，不经过 `external_pool`。
+
+**投流事件（同一轮）。** `priors.is_clean` 另外排除 `truth_vault.v_paid_boost_events` 里的帖（投了薯条、没标 `paid_promoted` 的也在里面；service_role 读得到，有 `note_id` 列）：经 `priors.paid_boosted` 那份进程缓存读（复审：视图每读一次要算 ~0.5 秒，原来每次建全局表 / 项目块都读、还要多读一页空的，压在发牌冷缓存那 2.5 秒里）：全局表、项目块、简报的 working 一栏（`store._recent_published`，有候选时才读）共用一份，6 小时一刷，同一时刻只一个线程读、手里有旧的先用旧的；读不到时有旧的用旧的，没有就记 WARN、照原来的口径算，5 分钟内不再去读。`store.tv_paid_boost_note_ids` 不满一页就停。生产上起量标签会少几篇（11-03 视图里 38 篇，其中 28 篇没标 `paid_promoted`，是这次新排除的）；快照脚本的离线模式（读导出文件）不读这个视图。
+
+**`_draw` 的预算。** 预算那条用例（`test_drawpolicy` 的夹具）标了贴型照样 ≤ 300 字。最坏情形本来就超过 300（点名四个维度、L1 放宽、旧先验的牌 359 字；带参考帖、重用、保底、旧先验的牌 333 字），贴型只多 11 字；没标贴型的牌一个字不多（金标钉着），所以没动已有的键。回归在 `tests/test_draw_layers.py`、`tests/test_layer_rules.py`。
+
 ## 4. 接入
 
 ### 4.1 部署

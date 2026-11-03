@@ -220,14 +220,21 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
         policy = None
     calls = payload.get("calls")
     written = payload.get("written")
-    return {"passed": payload["passed"], "hard_fails": fails,
-            "calls": calls if isinstance(calls, int) else None,
-            "written": written if isinstance(written, int) else None,
-            "policy": policy,
-            "plan_size": len(raw_plan),
-            "plan": plan,
-            "unjudged": len(unjudged),
-            "invalid_reason": invalid if isinstance(invalid, str) and invalid else None}
+    out = {"passed": payload["passed"], "hard_fails": fails,
+           "calls": calls if isinstance(calls, int) else None,
+           "written": written if isinstance(written, int) else None,
+           "policy": policy,
+           "plan_size": len(raw_plan),
+           "plan": plan,
+           "unjudged": len(unjudged),
+           "invalid_reason": invalid if isinstance(invalid, str) and invalid else None}
+    # 篇级画像里的 product_role(特征题「产品在稿子里是什么角色」, 同一次判定本来就答了): 只留这一题, core 拿它对卡上的
+    # 贴型给一句提示(2026-11-03)。回包里没有 / 不是字符串就不带这个键, 结局的形状和原来一样
+    profile = payload.get("profile")
+    role = profile.get("product_role") if isinstance(profile, dict) else None
+    if isinstance(role, str) and role.strip():
+        out["product_role"] = role.strip()[:20]
+    return out
 
 
 def judge_draft(payload: dict, *, timeout: Optional[float] = None) -> dict:

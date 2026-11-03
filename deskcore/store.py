@@ -22,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 
 import db
 
+from . import vocab
+
 logger = logging.getLogger("deskcore.store")
 
 
@@ -914,9 +916,35 @@ def record_draw(sb, project_id: str, angles: list[dict], user_id: str | None) ->
                          "avoidance will not see this draw", project_id)
 
 
+def relabel_draw_layer(sb, project_id: str, angle_key: str, batch_id: str, dims: dict) -> bool:
+    """这一批刚预留到的那一行(project_id + angle_key + dims._draw.b = 这一批 + 还没销账)换成 ``dims``(只是 _draw.ly 改了 /
+    去掉了): RPC 跳过被并发抢走的主牌、顶上来的牌带错了贴型时, draw_angles 把贴型对回写手要的篇数, 台账跟着改(Codex review
+    on aw#141)。回是否真改到了行。
+
+    失败(查询出错、一行都没对上)只记 warning、回 False, 不拦发牌 —— 卡面照样用对过的贴型, 只是台账上那一行还是原来的。"""
+    try:
+        res = (sb.table("angle_ledger").update({"dims": dims})
+                 .eq("project_id", project_id).eq("angle_key", angle_key)
+                 .eq("dims->_draw->>b", str(batch_id))
+                 .is_("consumed_version_id", "null").execute())
+    except Exception as exc:                            # noqa: BLE001 — 发牌照发
+        logger.warning("relabel draw layer failed (project=%s, key=%s, batch=%s): %s", project_id, angle_key,
+                       batch_id, f"{type(exc).__name__}: {exc}"[:200])
+        return False
+    if not (res.data or []):
+        logger.warning("relabel draw layer matched no ledger row (project=%s, key=%s, batch=%s)", project_id,
+                       angle_key, batch_id)
+        return False
+    return True
+
+
 def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
-                  *, user_id: str | None = None) -> bool:
+                  *, user_id: str | None = None, row: dict | None = None) -> bool:
     """把台账里这个角度标成已消耗。返回【是否真的改到了行】。
+
+    ``row``(给了的话, review on aw#141): 销成了就往里放销的那一行 ``{"id": 行 id, "layer": 卡上标的贴型代号}``(没标贴型
+    ``layer`` 是 None)。commit_drafts 拿它定这一篇的贴型, 不用销完再按版本读一次台账 —— 那一次读失败的话只能退回按 key
+    找(最近抽的那一行), 同一个 key 台账里有两行没销的时候和 check_rules(按销的那一行找)方向相反。没销成不动它。
 
     ⚠️ 必须看受影响行数, 不能只看"没抛异常"。没有匹配的未消耗行时(最典型:
     非原子降级路径里 record_draw 的插入失败了, 台账根本没这一行), PostgREST
@@ -932,7 +960,7 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
     找不到自己那条时才退回最早的未消耗行 —— 那是队友把坐标转交给你的情形。
     """
     try:
-        rows = (sb.table("angle_ledger").select("id, drawn_by")
+        rows = (sb.table("angle_ledger").select("id, drawn_by, dims")
                   .eq("project_id", project_id).eq("angle_key", angle_key)
                   .is_("consumed_version_id", "null")
                   .order("drawn_at", desc=False)
@@ -964,6 +992,8 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
         logger.warning("angle %s (project=%s) 选中的台账行已被并发销账, 本次没销成",
                        angle_key, project_id)
         return False
+    if row is not None:
+        row.update(id=target.get("id"), layer=_draw_layer(target.get("dims")))
     return True
 
 
@@ -1090,9 +1120,18 @@ def ledger_window(sb, project_id: str, days: int, cap: int = LEDGER_WINDOW_CAP) 
     return out[:cap]
 
 
+def _draw_layer(dims) -> str | None:
+    """台账 dims 的 _draw.ly(写手点名的贴型代号 P / T / Q / J, 2026-11-03); 没有 / 认不出回 None。"""
+    d = dims.get("_draw") if isinstance(dims, dict) else None
+    ly = d.get("ly") if isinstance(d, dict) else None
+    return ly if ly in vocab.LAYERS else None
+
+
 def ledger_dims_for(sb, project_id: str, key: str) -> dict | None:
     """本项目台账里 ``key`` 这张牌的四个主维度(最近抽的那一行; 去掉 ``_draw`` 这类下划线键)。写手点名「再写一次这个
     角度」(``repeat_of``, §2.9)时用: key 必须是本项目台账里有的, 才按同样的四个维度再发一行。
+    那一行标了贴型的(_draw.ly)另带 ``"_draw": {"ly": 代号}``, 重发的那张跟着原来那张卡(drawpolicy.repeat_candidates);
+    没标的回包和原来一样只有四个键。
 
     没有这一行、key 形状不对、或者读失败, 都回 None —— 调用方一律当成「不能重发」, 报错、什么都不写; 不抛。"""
     k = str(key or "")
@@ -1108,7 +1147,11 @@ def ledger_dims_for(sb, project_id: str, key: str) -> dict | None:
         return None
     if not rows or rows[0].get("angle_key") != k or not isinstance(rows[0].get("dims"), dict):
         return None
-    return public_dims(rows[0]["dims"])
+    out = public_dims(rows[0]["dims"])
+    ly = _draw_layer(rows[0]["dims"])
+    if ly:
+        out["_draw"] = {"ly": ly}       # 贴型(2026-11-03): 重发带原来那张卡的; 下划线键, 给模型之前 public_dims 照样剥掉
+    return out
 
 
 def ledger_repeat_source(sb, project_id: str, key: str) -> dict | None:
@@ -1131,6 +1174,153 @@ def ledger_repeat_source(sb, project_id: str, key: str) -> dict | None:
                        f"{type(exc).__name__}: {exc}"[:200])
         return None
     return {"dims": dims, "open": bool(open_rows)}
+
+
+LAYER_LOOKUP_CHUNK = 100
+
+
+def ledger_layers(sb, project_id: str, keys) -> dict[str, str] | None:
+    """这几个 angle_key 在本项目台账里标的贴型: ``{key: 代号}``(每个 key 取最近抽的那一行; 那一行没标的不在里面)。
+    score_drafts 查规则时按稿子带的 angle_key 找它那张卡的贴型(带方向的规则跟着贴型走, 2026-11-03)。
+
+    形状不对的 key 不查(同 angle_key_states)。读失败回 None(调用方当作这批都没有贴型, 照原来的方向闸查); 不抛。"""
+    want = [k for k in dict.fromkeys(str(k) for k in (keys or []) if k) if _LEDGER_LOOKUP_KEY.fullmatch(k)]
+    if not want:
+        return {}
+    best: dict[str, tuple[str, str | None]] = {}
+    try:
+        for i in range(0, len(want), LAYER_LOOKUP_CHUNK):
+            chunk = want[i:i + LAYER_LOOKUP_CHUNK]
+            rows = _paged(lambda off, lim, chunk=chunk: (
+                sb.table("angle_ledger").select("angle_key, dims, drawn_at")
+                  .eq("project_id", project_id).in_("angle_key", chunk)
+                  .order("id").range(off, off + lim - 1)))
+            for r in rows:
+                k = r.get("angle_key")
+                at = str(r.get("drawn_at") or "")
+                if k in want and (k not in best or at >= best[k][0]):
+                    best[k] = (at, _draw_layer(r.get("dims")))
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("ledger layers lookup failed (project=%s): %s", project_id,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    return {k: ly for k, (_at, ly) in best.items() if ly}
+
+
+def _consumed_layers(sb, project_id: str, vids: list[str]) -> tuple[dict[str, str], set[str]]:
+    """台账里销给这几版的行: (``{version_id: 贴型代号}``(那一行标了贴型的), 销过牌的 version_id(标没标都算))。读失败上抛。"""
+    out: dict[str, str] = {}
+    consumed: set[str] = set()
+    for i in range(0, len(vids), LAYER_LOOKUP_CHUNK):
+        chunk = vids[i:i + LAYER_LOOKUP_CHUNK]
+        rows = (sb.table("angle_ledger").select("consumed_version_id, dims")
+                  .eq("project_id", project_id).in_("consumed_version_id", chunk).execute()).data or []
+        for r in rows:
+            vid = str(r.get("consumed_version_id") or "")
+            if not vid:
+                continue
+            consumed.add(vid)
+            ly = _draw_layer(r.get("dims"))
+            if ly:
+                out[vid] = ly
+    return out, consumed
+
+
+def _lineage_layers(sb, project_id: str, vids: list[str]) -> tuple[dict[str, str], set[str]]:
+    """自己没销过牌的几版(改稿重存的新版): 同一篇稿子(versions.item_id)别的版本销的那张卡的贴型(Codex review on aw#141)。
+    归属同 items_for_versions(``items!inner → batches!inner`` 再 ``.eq`` 上 project_id): 别的项目的版本查不出 item, 也就
+    没有这一步。一篇稿子有几版销过牌的(不该有: 改稿重存不销牌), 取版本号最小的那一版 —— 那张卡标没标贴型都是它。
+
+    回 (``{version_id: 贴型代号}``(那张卡标了贴型的), 同一篇稿子有别的版本销过牌的 version_id(那张卡标没标都算: 这几版
+    的贴型就是那张卡的, 不再按 key 找))。读失败上抛。"""
+    items = items_for_versions(sb, project_id, vids)
+    by_item: dict[str, list[str]] = {}
+    for vid in vids:
+        hit = items.get(vid)
+        if hit and hit.get("item_id"):
+            by_item.setdefault(str(hit["item_id"]), []).append(vid)
+    if not by_item:
+        return {}, set()
+    siblings = version_ids_of_items(sb, sorted(by_item))
+    order: dict[str, tuple[str, int]] = {}
+    for item_id, vs in siblings.items():
+        if str(item_id) not in by_item:
+            continue
+        for v in vs:
+            order[str(v["id"])] = (str(item_id), int(v.get("version_num") or 0))
+    sib_ids = sorted(v for v in order if v not in vids)
+    if not sib_ids:
+        return {}, set()
+    layers, consumed = _consumed_layers(sb, project_id, sib_ids)
+    first: dict[str, tuple[int, str, str | None]] = {}
+    for sid in consumed:
+        if sid not in order:
+            continue
+        item_id, num = order[sid]
+        if item_id not in first or (num, sid) < first[item_id][:2]:
+            first[item_id] = (num, sid, layers.get(sid))
+    out = {vid: first[item_id][2] for item_id, vs in by_item.items()
+           if item_id in first and first[item_id][2] for vid in vs}
+    settled = {vid for item_id, vs in by_item.items() if item_id in first for vid in vs}
+    return out, settled
+
+
+def _settled_layers(sb, project_id: str, vids: list[str]) -> tuple[dict[str, str], set[str]]:
+    """台账里定得下来的那几版: 自己销过牌的(销给它的那一行), 自己没销过、同一篇稿子别的版本销过的(_lineage_layers)。
+    回 (``{version_id: 贴型代号}``(那张卡标了贴型的), 定下来了的 version_id(那张卡标没标都算))。读失败上抛。"""
+    out, own = _consumed_layers(sb, project_id, vids)
+    never = [v for v in vids if v not in own]
+    lineage: set[str] = set()
+    if never:
+        got, lineage = _lineage_layers(sb, project_id, never)
+        out.update(got)
+    return out, own | lineage
+
+
+def resolve_version_layers(sb, project_id: str, version_ids) -> tuple[dict[str, str], set[str]] | None:
+    """这几版稿子的贴型, 连同哪几版是台账里那张卡定下来的: ``({version_id: 代号}, {定下来了的 version_id})``。
+
+    先找台账里销给它的那一行(consumed_version_id); 自己没销过牌的(改稿重存的新版不销牌)找同一篇稿子别的版本销的那一行
+    (_lineage_layers, Codex review on aw#141: 那个 key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是重发那张)。
+    这两步找到了那张卡就定了 —— 卡没标贴型也定了(没标就是没标, 不在 dict 里, 但在定下来的那一组里): 贴型上线之前抽的牌
+    都没标, 那个 key 后来被 repeat_of 标上贴型重发, 按 key 找到的是重发那张, 原来那篇和它的改稿不能跟着它换方向。
+    两步都找不到的(没销过牌、同一篇稿子也没有)才按指纹行记的 angle_key 找那张卡(ledger_layers), 这几版不算定下来了。
+
+    任一次读失败回 None(调用方照原来的方向闸查); 不抛。"""
+    vids = list(dict.fromkeys(str(v) for v in (version_ids or []) if v))
+    if not vids:
+        return {}, set()
+    try:
+        out, settled = _settled_layers(sb, project_id, vids)
+        rest = [v for v in vids if v not in settled]
+        keys: dict[str, str] = {}
+        for i in range(0, len(rest), LAYER_LOOKUP_CHUNK):
+            chunk = rest[i:i + LAYER_LOOKUP_CHUNK]
+            rows = (sb.table("draft_fingerprints").select("version_id, angle_key, created_at")
+                      .eq("project_id", project_id).in_("version_id", chunk).execute()).data or []
+            for r in sorted(rows, key=lambda r: str(r.get("created_at") or "")):
+                vid, k = str(r.get("version_id") or ""), r.get("angle_key")
+                if vid and k and vid not in keys:
+                    keys[vid] = str(k)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("version layers lookup failed (project=%s): %s", project_id,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    if keys:
+        by_key = ledger_layers(sb, project_id, sorted(set(keys.values())))
+        if by_key is None:
+            return None
+        out.update({vid: by_key[k] for vid, k in keys.items() if k in by_key})
+    return out, settled
+
+
+def version_layers(sb, project_id: str, version_ids) -> dict[str, str] | None:
+    """这几版稿子的贴型: ``{version_id: 代号}``(resolve_version_layers 的第一项)。check_rules 只拿到 version_id: 先找
+    台账里销给它的那一行, 自己没销过牌的找同一篇稿子别的版本销的那一行 —— 找到了就是它, 那张卡没标贴型就是没标(不再按
+    key 找: 那个 key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是重发那张); 两步都找不到的才按指纹行记的
+    angle_key 找那张卡(ledger_layers)。没标贴型的不在里面。任一次读失败回 None(调用方照原来的方向闸查); 不抛。"""
+    got = resolve_version_layers(sb, project_id, version_ids)
+    return None if got is None else got[0]
 
 
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────
@@ -2693,6 +2883,63 @@ def external_slice(sb, category: str, *, days: int = EXTERNAL_SLICE_DAYS) -> lis
     return _keyset(fetch, max_pages=-(-EXTERNAL_SLICE_CAP // EXTERNAL_SLICE_PAGE), what="external slice")
 
 
+# 投了薯条、却没标 paid_promoted 的帖(2026-11-03): TV 的 v_paid_boost_events 认出来的投流事件(service_role 读得到, 有
+# note_id 列)。这些帖不算干净(priors.is_clean), 不进起量标签、不当起量帖、不进简报的 working 一栏。视图每读一次都要算一遍
+# (生产 ~0.5 秒), 所以只经 priors.paid_boosted 那份进程缓存读(复审), 别在别处直接调。
+PAID_BOOST_MAX_PAGES = 10
+
+
+def tv_paid_boost_note_ids(sb) -> set[str] | None:
+    """``{note_id}``: truth_vault.v_paid_boost_events 里出现过的帖(投流事件, 不论 paid_promoted 标没标)。
+    视图不在 / 没权限 / 读挂了回 None(调用方记 WARN、照原来的口径算); 不抛。不满一页就是读完了 —— 不再多读一页空的
+    (复审: 原来要读到空页才停, 视图每次都多算一遍)。"""
+    out: set[str] = set()
+    try:
+        for i in range(PAID_BOOST_MAX_PAGES):
+            rows = (sb.schema("truth_vault").table("v_paid_boost_events").select("note_id")
+                      .order("note_id").range(i * PAGE, (i + 1) * PAGE - 1).execute()).data or []
+            out.update(str(r["note_id"]) for r in rows if r.get("note_id"))
+            if len(rows) < PAGE:
+                break
+        else:
+            logger.warning("tv paid boost events: stopped at %d pages (%d notes)", PAID_BOOST_MAX_PAGES, len(out))
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("tv paid boost events", exc)
+        return None
+    return out
+
+
+TV_LAYER_CHUNK = 100
+
+
+def tv_note_layers(sb, note_ids) -> dict[str, str] | None:
+    """这几篇 TV 笔记的贴型: ``{note_id: 代号}``(truth_vault.notes.content_layer, 认得出的才放进来; vocab.layer_code)。
+    单独一次查询, **不**加进 TV_OUTCOME_COLS: 这一列是 TV 后加的, 库里还没有它的时候整张结果表都会读挂。列不在 / 读挂了回
+    None(起量帖不按贴型分档, 和原来一样); 不抛。"""
+    ids = list(dict.fromkeys(str(i) for i in (note_ids or ()) if i))
+    if not ids:
+        return {}
+    out: dict[str, str] = {}
+    try:
+        for i in range(0, len(ids), TV_LAYER_CHUNK):
+            chunk = ids[i:i + TV_LAYER_CHUNK]
+            rows = (sb.schema("truth_vault").table("notes").select("note_id, content_layer")
+                      .in_("note_id", chunk).execute()).data or []
+            for r in rows:
+                code = vocab.layer_code(r.get("content_layer"))
+                if code and r.get("note_id"):
+                    out[str(r["note_id"])] = code
+    except Exception as exc:                            # noqa: BLE001
+        msg = str(exc)
+        if "content_layer" in msg and ("does not exist" in msg or "42703" in msg):
+            # TV 还没加这一列: 预期之内(TV 那边的迁移跑了就好), 不当故障报
+            logger.info("tv note layers: truth_vault.notes.content_layer not there yet; hits stay unlayered")
+        else:
+            _tv_warn("tv note layers", exc)
+        return None
+    return out
+
+
 # ⑨ 写作台写的稿子发出去了没有(project_now.desk、draw-report 的 M2/M3)。和 v_angle_outcomes 同一组对照: 真对上了的
 # 几种(tv_lineage 是 TV 自己记的来源, 也算发出去了); ingested 是从 TV 抄回来的副本、ambiguous / unmatched 不知道是哪一篇, 不算。
 ADOPTION_LINK_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", "tv_lineage"})
@@ -3491,14 +3738,29 @@ WORKING_MIN_COMMENTS = 20
 WORKING_MIN_AGE_DAYS = 3
 
 
-def _is_working(stat: dict, t: datetime, now: datetime) -> bool:
+def _is_working(stat: dict, t: datetime, now: datetime, boosted=frozenset()) -> bool:
     from . import priors                          # 晚 import: priors 自己也是晚 import store
     if t > now - timedelta(days=WORKING_MIN_AGE_DAYS):
         return False
-    if not priors.is_clean(stat):
+    if not priors.is_clean(stat, boosted):
         return False
     cc = stat.get("comments_count")
     return stat.get("tier") in HIT_TIERS or (isinstance(cc, (int, float)) and cc >= WORKING_MIN_COMMENTS)
+
+
+def _working_boosted(sb) -> frozenset:
+    """working 一栏要排除的投流事件里的帖(priors.paid_boosted, 进程缓存)。读不到记 WARN、回空(原来的口径); 不抛。"""
+    from . import priors
+    try:
+        got = priors.paid_boosted(sb)
+    except Exception:                             # noqa: BLE001 — 增强项, 绝不拖垮简报
+        logger.warning("recent titles: paid boost events lookup failed", exc_info=True)
+        got = None
+    if got is None:
+        logger.warning("recent titles: truth_vault.v_paid_boost_events unreadable; boosted-but-unflagged posts may show "
+                       "in the working column")
+        return frozenset()
+    return got
 
 
 def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int = 20,
@@ -3550,6 +3812,12 @@ def _recent_published(sb, project_id: str, *, days: int, limit: int, now: dateti
             if nid in when and nid not in seen_notes and _is_working(stats.get(nid) or {}, when[nid], now):
                 seen_notes.add(nid)
                 cands.append(r)
+        if cands:
+            # 投流事件里的帖(投了薯条、没标 paid_promoted 的也在里面)同样不算(复审: 同 priors 的起量标签, priors.is_clean 的
+            # boosted)。只在真有候选时读, 和先验共用 priors.paid_boosted 那份进程缓存; 读不到记 WARN、照原来的口径
+            boosted = _working_boosted(sb)
+            if boosted:
+                cands = [r for r in cands if _is_working(stats.get(r["note_id"]) or {}, when[r["note_id"]], now, boosted)]
         cc = (lambda r: stats[r["note_id"]].get("comments_count")
               if isinstance(stats[r["note_id"]].get("comments_count"), (int, float)) else -1)
         work = sorted(cands, key=lambda r: (stats[r["note_id"]].get("tier") in HIT_TIERS, cc(r),

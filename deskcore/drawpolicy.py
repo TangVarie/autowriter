@@ -20,8 +20,9 @@ n 个可用的、原子预留、避重在 RPC 里), 这里只决定【候选的�
 
 每张候选: {"angle_key": fp.angle_key(四个维度), "dims": {四个维度, "_draw": {...}}}。fp.angle_key 只认四个主维度,
 _draw 不进 key; RPC 把 dims 原样存进台账、原样回来 —— 预留到哪一张, 那一张就带着自己真实的来源(§2.7)。
-_draw 的键(§5.1): v pol b i src sp pn pl g p pu pv st ps dd [fa ref reuse pin of l1 pp]。pp 只在项目块不是新鲜的时候带
-(stale 旧的 / table 只读到对照表、配比从全局表或快照里拼 / none 都没有)。pn / pl 是这一批的槽位数和各来源份额(整张计划,
+_draw 的键(§5.1): v pol b i src sp pn pl g p pu pv st ps dd [fa ref reuse pin of l1 pp ly]。pp 只在项目块不是新鲜的时候带
+(stale 旧的 / table 只读到对照表、配比从全局表或快照里拼 / none 都没有)。ly 是写手点名的贴型(P / T / Q / J, 2026-11-03),
+没点名就没有这个键; 它不进 key、不进去重, 只决定卡面上那一行、带方向的规则管不管这一篇、参考帖先挑哪一档。pn / pl 是这一批的槽位数和各来源份额(整张计划,
 每张都带; draw-report 的来源计划按批算 n·份额), sp 是这一张实际落下的来源的份额。
 
 去重为什么是相对的(P1 / P2 的平衡): 绝对的形状惩罚会把项目自己的主形状压下去(v2 的健康焦虑 14% vs 已发 28%);
@@ -74,6 +75,8 @@ SOURCES = ("w", "x", "e", "h")
 MAX_REPEAT = 3
 PIN_DIM_ALIASES = {"内容形式": F, "标题句式": T, "情绪杠杆": L, "人性原型": A,
                    "format": F, "title": T, "lever": L, "archetype": A}
+# pin 里写的「方向」(贴型)不是一个维度: 归进 layer(split_pin_layer), 不进 angle_key、不进去重(2026-11-03 贴型)
+PIN_LAYER_KEYS = frozenset({"方向", "内容方向", "贴型", "内容层", "layer", "direction", "content_layer"})
 DIM_LABEL = {F: "内容形式", T: "标题句式", L: "情绪杠杆", A: "人性原型"}
 
 
@@ -501,11 +504,24 @@ def _fresh_refs(pool, *, ref_age, cooldown_days: float, in_batch=()) -> list:
             and (ref_age.get(e["ref"]) is None or ref_age[e["ref"]] > cooldown_days)]
 
 
+def _preferred(cands: list, prefer) -> list:
+    """prefer 是一个判据, 或者几个判据排成的几档(先第一档, 第一档一篇都没有再看第二档 …): 回第一个非空的那一档, 都空就
+    原样回 cands。只是「优先」, 从不筛掉 —— 一档都没有就照全部挑。一个判据时就是原来的 ``[e for e if prefer(e)] or cands``。"""
+    if prefer is None:
+        return cands
+    for p in (prefer if isinstance(prefer, (list, tuple)) else (prefer,)):
+        sel = [e for e in cands if p(e)]
+        if sel:
+            return sel
+    return cands
+
+
 def pick_reference(pool, rng, *, ref_age=None, cooldown_days: float, in_batch=(), prefer=None):
     """从参考池里挑一篇(§2.5 / L5): 权重是条目的 w(外部 √日均评论, 起量帖 本项目 ×3 / 同品牌 ×1)。
 
-    冷却期(这个写作台项目 cooldown_days 天内用过的)和这一批已经用过的不挑; prefer(起量帖: 形式和槽位一样的)在没冷却的
-    里面优先。全在冷却里就重用最久没用的那篇(reuse=1)。回 (条目, 被挑中的概率, reuse) 或 (None, 0.0, 0)。"""
+    冷却期(这个写作台项目 cooldown_days 天内用过的)和这一批已经用过的不挑; prefer(起量帖: 形式和槽位一样的; 卡标了
+    贴型时再按贴型分档, 见 _hit_prefer / _ext_prefer)在没冷却的里面优先(_preferred)。全在冷却里就重用最久没用的那篇
+    (reuse=1)。回 (条目, 被挑中的概率, reuse) 或 (None, 0.0, 0)。"""
     ref_age = ref_age or {}
     used = set(in_batch or ())
     avail = [e for e in pool or () if e.get("ref") and e["ref"] not in used]
@@ -513,17 +529,36 @@ def pick_reference(pool, rng, *, ref_age=None, cooldown_days: float, in_batch=()
         return None, 0.0, 0
     fresh = _fresh_refs(avail, ref_age=ref_age, cooldown_days=cooldown_days)
     if fresh:
-        if prefer is not None:
-            pref = [e for e in fresh if prefer(e)]
-            fresh = pref or fresh
+        fresh = _preferred(fresh, prefer)
         ws = [(i, _ref_w(e)) for i, e in enumerate(fresh)]
         tot = sum(w for _, w in ws)
         i = es_pick(ws, rng)[0]
         return fresh[i], ws[i][1] / tot, 0
-    if prefer is not None:
-        avail = [e for e in avail if prefer(e)] or avail
+    avail = _preferred(avail, prefer)
     lru = max(avail, key=lambda e: (ref_age.get(e["ref"], 0.0), e["ref"]))
     return lru, 1.0, 1
+
+
+def _ext_prefer(ly):
+    """外部参考帖按贴型优先(贴型, 2026-11-03): 产品贴 / 精品贴优先产品出场了的(Jev product_role 主角 / 解决方案,
+    池子里 prod=1), 流量贴 / 提问贴优先没出场的(未出现 / 只暗示 / 顺带一提, prod=0)。没答过的哪一档都不算。卡没标贴型
+    回 None —— 和原来一样不分档, rng 一个都不多用。"""
+    fam = vocab.LAYER_FAMILY.get(ly or "")
+    if fam is None:
+        return None
+    want = 1 if fam == "product" else 0
+    return lambda e: e.get("prod") == want
+
+
+def _hit_prefer(f: str, ly):
+    """起量帖的优先: 原来是「形式和槽位一样的」; 卡标了贴型、起量帖带着 TV 的 content_layer(ly)时分三档 ——
+    形式一样且同一族 → 形式一样 → 同一族。没标贴型就是原来那一个判据。"""
+    same_f = lambda e: e.get(F) == f                    # noqa: E731
+    fam = vocab.LAYER_FAMILY.get(ly or "")
+    if fam is None:
+        return same_f
+    same_fam = lambda e: vocab.LAYER_FAMILY.get(e.get("ly") or "") == fam      # noqa: E731
+    return (lambda e: same_f(e) and same_fam(e), same_f, same_fam)
 
 
 class _Ctx:
@@ -719,16 +754,18 @@ def _h_first(ctx: _Ctx, batch: Batch, f: str, anchor: dict) -> dict:
     return {}
 
 
-def _h_marginal(ctx: _Ctx, batch: Batch, f: str, anchors, *, ref_age, used_refs) -> dict:
+def _h_marginal(ctx: _Ctx, batch: Batch, f: str, anchors, *, ref_age, used_refs, prefer=None) -> dict:
     """h 槽里每个格子的概率(§2.7 的 p = 这个格子在这个槽位里的概率, 复审): Σ_a P(挑中起量帖 a)·P(格子 | a)。
 
     挑起量帖的过程(pick_reference + 用不上就换下一篇): 没冷却的里面先挑形式和槽位一样的, 链是空的就排除再挑。等价于
-    在「能用的」那一组里按 w 抽 —— 形式一样而能用的有就是它们, 没有就是全部能用的。"""
+    在「能用的」那一组里按 w 抽 —— 形式一样而能用的有就是它们, 没有就是全部能用的。prefer 是 _pick_slot 交给
+    pick_reference 的那一份(卡标了贴型时分几档): 同理是「能用的」里第一个非空的那一档。不给就是形式一样的那一个判据。"""
     fresh = _fresh_refs(anchors, ref_age=ref_age, cooldown_days=ctx.params["hit_cooldown_days"], in_batch=used_refs)
     firsts = [(a, _h_first(ctx, batch, f, a)) for a in fresh]
     ok = [(a, d) for a, d in firsts if d]
-    pref = [(a, d) for a, d in ok if a.get(F) == f]
-    group = pref or ok
+    prefer = prefer if prefer is not None else (lambda e: e.get(F) == f)
+    keep = {id(a) for a in _preferred([a for a, _d in ok], prefer)}
+    group = [(a, d) for a, d in ok if id(a) in keep]
     tot = sum(_ref_w(a) for a, _ in group)
     out: dict = {}
     for a, d in group:
@@ -745,18 +782,23 @@ def _e_title(ctx: _Ctx, ref: dict):
     return t
 
 
-def _e_marginal(ctx: _Ctx, batch: Batch, f: str, pool, cells, *, ref_age, used_refs, rng) -> dict:
+def _e_marginal(ctx: _Ctx, batch: Batch, f: str, pool, cells, *, ref_age, used_refs, rng, prefer=None) -> dict:
     """e 槽里这几个格子的概率(复审): Σ_r P(挑中参考帖 r)·P(格子 | r)。P(格子 | r) 只看 r 的标题句式 t_r ——
     同一类的参考帖条件分布一样, 所以 = Σ_t P(挑中的是 t 类)·P(格子 | t)。挑的过程同 h(用不上的排除再挑), 等价于在
-    「这一类在槽位里有正权重」的参考帖里按 w 抽; 没有标题句式的参考帖按 w 的分布(含 π_t)。"""
+    「这一类在槽位里有正权重」的参考帖里按 w 抽; 没有标题句式的参考帖按 w 的分布(含 π_t)。卡标了贴型时(prefer, 同
+    _pick_slot 交给 pick_reference 的那一份)先在能用的里取第一个非空的那一档, 再按 w 抽, 同 _h_marginal。"""
     sums: dict = {}
     s_none = _scan(ctx, batch, f, "e", rng, es=False, by_title=sums)["sw"]
     fresh = _fresh_refs(pool, ref_age=ref_age, cooldown_days=ctx.params["ext_cooldown_days"], in_batch=used_refs)
-    cls: dict = {}
+    usable = []
     for e in fresh:
         t = _e_title(ctx, e)
         if (sums.get(t, 0.0) if t is not None else s_none) > 0:
-            cls[t] = cls.get(t, 0.0) + _ref_w(e)
+            usable.append(e)
+    cls: dict = {}
+    for e in _preferred(usable, prefer):
+        t = _e_title(ctx, e)
+        cls[t] = cls.get(t, 0.0) + _ref_w(e)
     tot = sum(cls.values())
     out = {}
     for c in cells:
@@ -779,15 +821,17 @@ def _pick_slot(ctx: _Ctx, batch: Batch, slot: dict, rng, *, profile, used_refs: 
     —— 不为了用上某一篇参考帖去放宽 L1(复审: L1 只在 w / x 槽正权重的格子不到 3 个时放宽, 那只在重度 pin 时出现;
     pin 时整批都是 pin 槽, 没有 h / e)。h / e 的 p 是格子在槽位里的边际概率(对所有可能挑中的参考帖求和)。"""
     f, src = slot["f"], slot["src"]
+    ly = slot.get("ly")
     st = ctx.state
     res: dict = {"slot": slot, "src": src, "picks": [], "ref": None, "reuse": 0, "l1": None, "reference": None}
     if src == "h":
         anchors = hit_anchors(profile)
         tried: list = []
+        h_prefer = _hit_prefer(f, ly)
         while True:
             anchor, _p_ref, reuse = pick_reference(
                 anchors, rng, ref_age=st.get("ref_age"), cooldown_days=ctx.params["hit_cooldown_days"],
-                in_batch=list(used_refs) + tried, prefer=lambda e: e.get(F) == f)
+                in_batch=list(used_refs) + tried, prefer=h_prefer)
             if anchor is None:
                 break
             chain = _h_chain(ctx, batch, f, anchor, rng)
@@ -798,7 +842,8 @@ def _pick_slot(ctx: _Ctx, batch: Batch, slot: dict, rng, *, profile, used_refs: 
                     first = _h_first(ctx, batch, f, anchor)
                     probs = {c: first.get(c, 0.0) for c, _pc, _dd in chain[:k]}
                 else:
-                    probs = _h_marginal(ctx, batch, f, anchors, ref_age=st.get("ref_age"), used_refs=used_refs)
+                    probs = _h_marginal(ctx, batch, f, anchors, ref_age=st.get("ref_age"), used_refs=used_refs,
+                                        prefer=h_prefer)
                 res["picks"] = [(c, probs.get(c, 0.0), dd / sdb) for c, _pc, dd in chain[:k]]
                 res.update(ref=anchor["ref"], reuse=reuse, reference={
                     "kind": "hit", "own": bool(anchor.get("own")), "age_days": anchor.get("age_days"),
@@ -809,10 +854,11 @@ def _pick_slot(ctx: _Ctx, batch: Batch, slot: dict, rng, *, profile, used_refs: 
     if src == "e":
         pool = ext_refs(profile)
         tried = []
+        e_prefer = _ext_prefer(ly)
         while True:
             ref, _p_ref, reuse = pick_reference(
                 pool, rng, ref_age=st.get("ref_age"), cooldown_days=ctx.params["ext_cooldown_days"],
-                in_batch=list(used_refs) + tried)
+                in_batch=list(used_refs) + tried, prefer=e_prefer)
             if ref is None:
                 break
             t_ref = _e_title(ctx, ref)
@@ -824,7 +870,7 @@ def _pick_slot(ctx: _Ctx, batch: Batch, slot: dict, rng, *, profile, used_refs: 
                     probs = {c: w / out["sw"] for c, w, _dd in out["top"]}
                 else:
                     probs = _e_marginal(ctx, batch, f, pool, cells, ref_age=st.get("ref_age"), used_refs=used_refs,
-                                        rng=rng)
+                                        rng=rng, prefer=e_prefer)
                 res["picks"] = [(c, probs.get(c, 0.0), dd / sdb) for c, _w, dd in out["top"]]
                 res.update(ref=ref["ref"], reuse=reuse, reference={
                     "kind": "external", "title_structure": t_ref, "posted_days_ago": ref.get("posted_days_ago"),
@@ -857,6 +903,8 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
 
     pin: 写手点名的维度(已经过 normalize_pin); 不给就用 plan["pin"]。seed_cells: 这一批里已经有的格子(repeat_of 重发
     的那几张), 只进 B, 不进候选。extra: 每张 _draw 都带的额外键(core 传 {"fa": flywheel_arm})。
+    槽位上的 ``ly``(core 按 slot_layers 填的贴型, 没点名就没有): 主牌和它的备牌记进 _draw.ly, e / h 槽按它给参考帖分档
+    (_ext_prefer / _hit_prefer); 没有 ly 的槽位和原来一字不差, rng 一个都不多用。
 
     回 (candidates, meta)。candidates 按 RPC 的先后排好、按 angle_key 去重; meta 有每个槽位抽到什么、每个 key 的参考帖
     描述(by_key, 给渲染用 —— 描述不进台账)。同一个 seed、profile、台账给出完全一样的候选表和 _draw。"""
@@ -899,7 +947,7 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
     unmapped = (state.get("unmapped_keys") or {}) if (state.get("ok") and params["l1"]) else {}
     pp = (profile or {}).get("pp")
 
-    def make(cell, *, i, src, sp, p, pu, g=0, ref=None, reuse=0, l1=None, reference=None) -> dict | None:
+    def make(cell, *, i, src, sp, p, pu, g=0, ref=None, reuse=0, l1=None, reference=None, ly=None) -> dict | None:
         dims = cell_dims(cell)
         key = angle_key(dims)
         if key in seen or key in unmapped:
@@ -919,6 +967,8 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
             d["pin"] = [x for x in DIMS4 if x in pin]
         if l1:
             d["l1"] = l1
+        if ly:
+            d["ly"] = ly                                    # 贴型(写手点名的, 2026-11-03): 只记账, 不进 key / 去重
         d.update(extra_keys)
         dims["_draw"] = d
         by_key[key] = {"src": src, "i": i, "ref": ref, "reference": reference}
@@ -937,7 +987,7 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
         sp = s["sp"] if r["src"] == s["src"] else (plan.get("shares") or {}).get("w", 0.0)
         c, p, pu = r["picks"][0]
         cand = make(c, i=s["i"], src=r["src"], sp=sp, p=p, pu=pu, g=s.get("g", 0) if r["src"] == "e" else 0,
-                    ref=r["ref"], reuse=r["reuse"], l1=r["l1"], reference=r["reference"])
+                    ref=r["ref"], reuse=r["reuse"], l1=r["l1"], reference=r["reference"], ly=s.get("ly"))
         if cand:
             prim_cands.append(cand)
             final.add(c, r["src"])
@@ -989,14 +1039,15 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
                 sp = s["sp"] if r["src"] == s["src"] else (plan.get("shares") or {}).get("w", 0.0)
                 c, p, pu = r["picks"][j]
                 push_backup(c, src=r["src"], sp=sp, p=p, pu=pu, ref=r["ref"], reuse=r["reuse"], l1=r["l1"],
-                            reference=r["reference"])
+                            reference=r["reference"], ly=s.get("ly"))
 
     n_req = max(int(plan.get("n") or len(slots)), 1)
     want = min(max(params["tail_mult"] * n_req, params["tail_min"]), params["tail_cap"])
     have = len(prim_cands) + len(tier1) + len(tier2)
     if slots and have < want:
+        # 尾巴不知道顶的是哪个槽位: 只有各槽位的贴型都一样(写手说「这批都是产品贴」)才带, 混着的、没标的都不带
         _tail(ctx, rng, want - have, push_backup, pin=pin,
-              sp=(plan.get("shares") or {}).get("pin" if pin else "w", 1.0))
+              sp=(plan.get("shares") or {}).get("pin" if pin else "w", 1.0), ly=common_layer(s_.get("ly") for s_ in slots))
     cands = prim_cands + tier1 + tier2
 
     meta = {"batch": b, "dd": dd_mode, "stage": stage, "ps": ps, "plan": {k_: plan.get(k_) for k_ in (
@@ -1006,7 +1057,7 @@ def build_candidates(profile, state, plan: dict, rng, *, pin: dict | None = None
     return cands, meta
 
 
-def _tail(ctx: _Ctx, rng, need: int, push, *, pin, sp) -> None:
+def _tail(ctx: _Ctx, rng, need: int, push, *, pin, sp, ly=None) -> None:
     """尾巴(§2.7 第 3 步): w 分布在全部配额形式上的接续 —— 权重 π_f·π_lev·π_arc·π_ttl·D·R, ES 排序; push 跳过已在表里的、
     过不了整批 B 的(见 build_candidates 的备牌说明)。只给 RPC 在主牌 / 备牌都被并发发牌抢走时兜底, 很少被预留到。"""
     pi = ctx.pi
@@ -1031,7 +1082,7 @@ def _tail(ctx: _Ctx, rng, need: int, push, *, pin, sp) -> None:
     for _key, cell, w, db in items:
         if added >= need:
             break
-        if push(cell, src=src, sp=sp, p=w / sw, pu=db / sdb):
+        if push(cell, src=src, sp=sp, p=w / sw, pu=db / sdb, ly=ly):
             added += 1
 
 
@@ -1064,6 +1115,7 @@ def _pin_error(dim, value, profile, *, why: str) -> dict:
 
 def normalize_pin(pin, profile=None) -> tuple[dict | None, dict | None]:
     """校验写手点名固定的维度: 键是四个维度名(或 内容形式 / 标题句式 / 情绪杠杆 / 人性原型), 值必须在词表里(问句 → 疑问句)。
+    「方向」(PIN_LAYER_KEYS)是贴型, 由 split_pin_layer 归进 layer, 这里跳过。
     回 (pin, None) 或 (None, 错误)。错误里列出可选值和项目现在的内容形式占比 —— 调用方原样回给模型、什么都不写。"""
     if not pin:
         return None, None
@@ -1071,6 +1123,8 @@ def normalize_pin(pin, profile=None) -> tuple[dict | None, dict | None]:
         return None, _pin_error(None, pin, profile, why="pin 要写成 {维度: 值}, 比如 {\"标题句式\": \"疑问句\"}。")
     out: dict = {}
     for k, v in pin.items():
+        if str(k).strip() in PIN_LAYER_KEYS:
+            continue                        # 「方向」是贴型, 不是维度: 调用方先用 split_pin_layer 拿走了(这里只是不报错)
         dim = k if k in DIMS4 else PIN_DIM_ALIASES.get(str(k).strip())
         if dim is None:
             return None, _pin_error(None, k, profile, why=f"pin 里的「{k}」不是可以固定的维度。")
@@ -1080,13 +1134,18 @@ def normalize_pin(pin, profile=None) -> tuple[dict | None, dict | None]:
         if val not in VALUES[dim]:
             return None, _pin_error(dim, v, profile, why=f"「{v}」不是{DIM_LABEL[dim]}的可选值。")
         out[dim] = val
-    return out, None
+    return (out or None), None
 
 
-def repeat_candidates(items, *, batch_id: str, profile=None, extra: dict | None = None) -> list[dict]:
+def repeat_candidates(items, *, batch_id: str, profile=None, extra: dict | None = None,
+                      layer: str | None = None) -> list[dict]:
     """repeat_of 重发的那几张(§2.9): items = [(angle_key, 四个维度)](store.ledger_dims_for 查到的)。每张原样四个维度 +
     _draw={src:"rep", of:key}, 由调用方走非原子的 store.record_draw 写进台账 —— 故意绕过 L0 / L1。
-    四个维度算出来的 key 和给的 key 对不上的不发(台账那一行坏了)。"""
+    四个维度算出来的 key 和给的 key 对不上的不发(台账那一行坏了)。
+
+    贴型(2026-11-03): 带原来那张卡的 ly(ledger_dims_for 带出来的 _draw.ly); ``layer`` 是写手这次说的「这批都是 X 贴」
+    (normalize_layer 回的单个代号), 有就按它 —— 写手现在说的比原来那张卡上的新。各几篇的说法不在这里改(slot_layers 先拿
+    重发的这几张抵账)。"""
     stage = (profile or {}).get("stage") or "none"
     ps = (profile or {}).get("ps") or "uniform"
     out = []
@@ -1099,8 +1158,121 @@ def repeat_candidates(items, *, batch_id: str, profile=None, extra: dict | None 
             continue
         d = {"v": 2, "pol": "v2", "b": batch_id, "i": i, "src": "rep", "of": key, "st": stage, "ps": ps}
         d.update(extra or {})
+        ly = layer if layer in vocab.LAYERS else layer_of(dims)
+        if ly:
+            d["ly"] = ly
         d4["_draw"] = d
         out.append({"angle_key": key, "dims": d4})
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 贴型(2026-11-03): 写手说了才标, 只记账、不进 key / 去重
+# ══════════════════════════════════════════════════════════════════════
+
+def layer_of(dims) -> str | None:
+    """台账 dims(或 ledger_dims_for 带出来的那一份)里 _draw.ly 记的贴型代号; 没有 / 认不出回 None。"""
+    d = dims.get("_draw") if isinstance(dims, dict) else None
+    ly = d.get("ly") if isinstance(d, dict) else None
+    return ly if ly in vocab.LAYERS else None
+
+
+def common_layer(layers) -> str | None:
+    """几个槽位的贴型都一样(都标了、同一个)就回它, 否则 None(尾巴和 v1 / fb 的候选用)。"""
+    got = list(layers)
+    first = got[0] if got else None
+    return first if first in vocab.LAYERS and all(x == first for x in got) else None
+
+
+def _layer_error(value, *, why: str) -> dict:
+    return {"error": "layer_invalid", "message": why, "value": value,
+            "allowed": [vocab.LAYER_NAME[c] for c in vocab.LAYERS]}
+
+
+def normalize_layer(layer, n: int) -> tuple[str | dict | None, dict | None]:
+    """校验写手说的贴型(draw_angles 的 layer): 一个字符串 = 这一批每篇都是它; {贴型: 篇数} = 各几篇, 其余的不标。
+    名字认 LAYER_NAME / LAYER_ALIASES / 代号(vocab.layer_code)。回 (代号 | {代号: 篇数}(按 P T Q J 排、去掉 0) | None, None)
+    或 (None, 错误)。篇数加起来不能多于这次要的 n 篇; 都是 0 / 空 dict 当没说。错误同 pin_invalid 的口径: 调用方原样回给
+    模型、什么都不写。"""
+    if layer is None or layer == "" or layer == {}:
+        return None, None
+    if isinstance(layer, str):
+        code = vocab.layer_code(layer)
+        if code is None:
+            return None, _layer_error(layer, why=f"「{layer}」不是可以标的贴型。")
+        return code, None
+    if not isinstance(layer, dict):
+        return None, _layer_error(layer, why="layer 要写成一个贴型(\"产品贴\"), 或者 {贴型: 篇数}, 比如 "
+                                             "{\"产品贴\": 3, \"流量贴\": 2}。")
+    counts: dict[str, int] = {}
+    for k, v in layer.items():
+        code = vocab.layer_code(k)
+        if code is None:
+            return None, _layer_error(k, why=f"layer 里的「{k}」不是可以标的贴型。")
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            return None, _layer_error(layer, why=f"layer 里「{k}」的篇数要写成 0 或正整数。")
+        counts[code] = counts.get(code, 0) + v
+    total = sum(counts.values())
+    if total > n:
+        return None, _layer_error(layer, why=f"layer 里的篇数加起来 {total} 篇, 比这次要的 {n} 篇多: 少标几篇, 或者把篇数加到 {total}。")
+    out = {c: counts[c] for c in vocab.LAYERS if counts.get(c)}
+    return (out or None), None
+
+
+def split_pin_layer(pin) -> tuple:
+    """pin 里写的「方向」(PIN_LAYER_KEYS)拿出来当贴型: 回 (去掉它之后的 pin, 方向的值 | None)。pin 不是 dict 原样回
+    (由 normalize_pin 报错)。去掉之后一个维度都不剩的回 None。没有方向那一项时 pin 原样回(同一个对象)。"""
+    if not isinstance(pin, dict) or not any(str(k).strip() in PIN_LAYER_KEYS for k in pin):
+        return pin, None
+    rest = {k: v for k, v in pin.items() if str(k).strip() not in PIN_LAYER_KEYS}
+    val = next(v for k, v in pin.items() if str(k).strip() in PIN_LAYER_KEYS)
+    return (rest or None), val
+
+
+def slot_layers(spec, n_slots: int, rep_layers=()) -> list[str | None]:
+    """新抽的 n_slots 个槽位各标什么贴型(按槽位先后, 不用随机数 —— 槽位本身已经是洗过的来源 × 形式)。
+    spec 是 normalize_layer 回的: None → 都不标; 代号 → 都是它; {代号: 篇数} → 先拿点名重写的那几张(rep_layers, 它们
+    带着原来那张卡的贴型)抵账, 剩下的按 P T Q J 的先后从第一个槽位排起, 多出来的槽位不标; 超过槽位数的截掉。"""
+    n_slots = max(int(n_slots or 0), 0)
+    if spec is None:
+        return [None] * n_slots
+    if isinstance(spec, str):
+        return [spec] * n_slots
+    left = dict(spec)
+    for ly in rep_layers or ():
+        if left.get(ly, 0) > 0:
+            left[ly] -= 1
+    seq = [c for c in vocab.LAYERS for _ in range(left.get(c, 0))][:n_slots]
+    return seq + [None] * (n_slots - len(seq))
+
+
+def rebalance_layers(got, want) -> list[str | None]:
+    """真预留到的几张牌的贴型对回写手要的篇数(Codex review on aw#141)。RPC 跳过一张被并发发牌抢走的主牌时, 顶上来的是表里
+    下一张能用的(备牌 / 尾巴), 不一定是那个槽位自己的备牌, 而备牌带的是它自己槽位的贴型 —— 「3 篇产品贴 + 2 篇流量贴」会
+    变成 4 + 1, 回包还说 5 篇都发了。
+
+    got 是预留到的牌按先后的贴型(代号 / None), want 是 slot_layers 排的那一份(同一个 spec、同样的 n_rest 和重发的几张)。
+    还要这个贴型的牌留着; 多出来的(这个贴型已经够了)按先后拿剩下要的: 先是有名字的(按 P T Q J), 再是不标的。预留到的
+    比要的少时有名字的先补齐: 少了几张, 不标的那几篇就先少要几篇再去留牌 —— got=[None]*3、want=[P, T, None, None]
+    回 [None, P, T], 不是留下两张不标的、只补一张 P。回一份和 got 一样长的新列表, 不改 got、不用随机数。"""
+    need: dict = {}
+    for ly in want or ():
+        need[ly] = need.get(ly, 0) + 1
+    short = len(want or ()) - len(got or ())
+    if short > 0 and need.get(None, 0) > 0:
+        need[None] = max(need[None] - short, 0)
+    out: list = []
+    misfits: list[int] = []
+    for i, ly in enumerate(got or ()):
+        if need.get(ly, 0) > 0:
+            need[ly] -= 1
+            out.append(ly)
+        else:
+            out.append(None)
+            misfits.append(i)
+    left = iter([c for c in vocab.LAYERS for _ in range(need.get(c, 0))] + [None] * need.get(None, 0))
+    for i in misfits:
+        out[i] = next(left, None)
     return out
 
 

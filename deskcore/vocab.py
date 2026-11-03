@@ -222,6 +222,14 @@ PLAIN_LEVER: dict[str, str] = {
     "信息差利用": "告诉读者一件大多数人不知道的事",
 }
 
+# 卡上标了流量贴 / 提问贴时, 这两种内容形式的大白话换成这一份(2026-11-03 贴型): 原来那句「直接说推荐什么」「自然带出
+# 产品」放在流量贴的卡上, 和「产品别硬插、品牌名按本项目规则(多放评论区)」那一行打架。没标贴型、标了产品贴 / 精品贴的
+# 卡照用 PLAIN_FORMAT, 一个字不变。
+PLAIN_FORMAT_TRAFFIC: dict[str, str] = {
+    "直给推荐": "直接说该怎么选、为什么，产品不硬插",
+    "场景植入": "在一个具体生活场景里自然带出产品，不硬插",
+}
+
 # 情绪浓度在卡上写成 弱/中/强(§3.2)。
 INTENSITY_PLAIN: dict[str, str] = {"low": "弱", "medium": "中", "high": "强"}
 
@@ -247,6 +255,48 @@ OPENING_PLAIN: dict[str, str] = {
     "数据事实": "开头先摆一个数字或事实",
     "感叹情绪": "开头先是一句感叹",
 }
+
+
+# ── 贴型(content layers, 2026-11-03) ──────────────────────────────────
+# 老板方法论里的四种内容层: 产品贴 P(产品在正文里出场)、流量贴 T(冲着切口写, 产品多半靠评论区种)、提问贴 Q(提问开头,
+# 和 T 同一族)、精品贴 J(产品融进切口)。只在写手 / 模型点名时给卡标(draw_angles 的 layer, 台账 _draw.ly 记代号);
+# 不进 angle_key、不进去重。带方向的规则跟着每篇卡的贴型走: 流量向的只管 T / Q, 产品向的只管 P / J。
+LAYERS: tuple[str, ...] = ("P", "T", "Q", "J")
+LAYER_NAME: dict[str, str] = {"P": "产品贴", "T": "流量贴", "Q": "提问贴", "J": "精品贴"}
+# 写手 / 飞书「方向」列里的说法 → 代号。代号本身(大小写都认)和四个名字也认。
+LAYER_ALIASES: dict[str, str] = {
+    "产品向": "P", "产品贴": "P", "好物分享-产品贴": "P", "直出贴": "P", "直给": "P",
+    "流量向": "T", "流量贴": "T",
+    "提问贴": "Q", "提问": "Q",
+    "精品贴": "J", "精品": "J",
+}
+LAYER_FAMILY: dict[str, str] = {"P": "product", "J": "product", "T": "traffic", "Q": "traffic"}
+# 规则的 applicability(方向档)→ 它管哪一族的稿; 两个词同 core.DIRECTION_TAGS
+LAYER_DIRECTION: dict[str, str] = {"P": "产品向", "J": "产品向", "T": "流量向", "Q": "流量向"}
+# 简报里带方向的规则后面加的那一截(core.build_writing_brief)
+DIRECTION_RULE_NOTE: dict[str, str] = {"产品向": "【只管产品贴/精品贴的稿】", "流量向": "【只管流量贴/提问贴的稿】"}
+# 卡面上那一行(core.render_angles_block), 没标贴型的卡不加
+LAYER_LINE: dict[str, str] = {
+    "P": "这篇是产品贴：先打一个痛点，再让本项目的产品在正文里出场、当成解决办法；一篇只讲一个点。",
+    "T": "这篇是流量贴：冲着切口写，产品别硬插，可以融进场景；品牌名按本项目规则（多放评论区）。",
+    "Q": "这篇是提问贴：用读者做决定时真会问的问题开头；品牌名按本项目规则（多放评论区的回答里）。",
+    "J": "这篇是精品贴：产品融进切口，讲自己的感受，不写『分享好物、推荐』，文字像普通人写的。",
+}
+# Jev 的 product_role(外部帖的特征题, 写作台存档时的判定也答): 产品出场了 / 没出场
+PRODUCT_PRESENT = frozenset({"主角", "解决方案"})
+PRODUCT_ABSENT = frozenset({"未出现", "只暗示", "顺带一提"})
+
+
+def layer_code(value) -> str | None:
+    """「产品贴」/「流量向」/「p」/「好物分享-产品贴」… → P / T / Q / J; 认不出回 None。"""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if s.upper() in LAYERS:
+        return s.upper()
+    if s in LAYER_ALIASES:
+        return LAYER_ALIASES[s]
+    return next((c for c, name in LAYER_NAME.items() if name == s), None)
 
 
 def structure_bits(desc: dict | None, *, external: bool) -> list[str]:
