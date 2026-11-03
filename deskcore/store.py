@@ -2779,20 +2779,22 @@ def external_slice(sb, category: str, *, days: int = EXTERNAL_SLICE_DAYS) -> lis
 
 
 # 投了薯条、却没标 paid_promoted 的帖(2026-11-03): TV 的 v_paid_boost_events 认出来的投流事件(service_role 读得到, 有
-# note_id 列)。priors 每次建全局表 / 项目块读一次, 这些帖不算干净(priors.is_clean), 不进起量标签、不当起量帖。
+# note_id 列)。这些帖不算干净(priors.is_clean), 不进起量标签、不当起量帖、不进简报的 working 一栏。视图每读一次都要算一遍
+# (生产 ~0.5 秒), 所以只经 priors.paid_boosted 那份进程缓存读(复审), 别在别处直接调。
 PAID_BOOST_MAX_PAGES = 10
 
 
 def tv_paid_boost_note_ids(sb) -> set[str] | None:
     """``{note_id}``: truth_vault.v_paid_boost_events 里出现过的帖(投流事件, 不论 paid_promoted 标没标)。
-    视图不在 / 没权限 / 读挂了回 None(调用方记 WARN、照原来的口径算); 不抛。"""
+    视图不在 / 没权限 / 读挂了回 None(调用方记 WARN、照原来的口径算); 不抛。不满一页就是读完了 —— 不再多读一页空的
+    (复审: 原来要读到空页才停, 视图每次都多算一遍)。"""
     out: set[str] = set()
     try:
         for i in range(PAID_BOOST_MAX_PAGES):
             rows = (sb.schema("truth_vault").table("v_paid_boost_events").select("note_id")
                       .order("note_id").range(i * PAGE, (i + 1) * PAGE - 1).execute()).data or []
             out.update(str(r["note_id"]) for r in rows if r.get("note_id"))
-            if not rows:
+            if len(rows) < PAGE:
                 break
         else:
             logger.warning("tv paid boost events: stopped at %d pages (%d notes)", PAID_BOOST_MAX_PAGES, len(out))
@@ -3631,14 +3633,29 @@ WORKING_MIN_COMMENTS = 20
 WORKING_MIN_AGE_DAYS = 3
 
 
-def _is_working(stat: dict, t: datetime, now: datetime) -> bool:
+def _is_working(stat: dict, t: datetime, now: datetime, boosted=frozenset()) -> bool:
     from . import priors                          # 晚 import: priors 自己也是晚 import store
     if t > now - timedelta(days=WORKING_MIN_AGE_DAYS):
         return False
-    if not priors.is_clean(stat):
+    if not priors.is_clean(stat, boosted):
         return False
     cc = stat.get("comments_count")
     return stat.get("tier") in HIT_TIERS or (isinstance(cc, (int, float)) and cc >= WORKING_MIN_COMMENTS)
+
+
+def _working_boosted(sb) -> frozenset:
+    """working 一栏要排除的投流事件里的帖(priors.paid_boosted, 进程缓存)。读不到记 WARN、回空(原来的口径); 不抛。"""
+    from . import priors
+    try:
+        got = priors.paid_boosted(sb)
+    except Exception:                             # noqa: BLE001 — 增强项, 绝不拖垮简报
+        logger.warning("recent titles: paid boost events lookup failed", exc_info=True)
+        got = None
+    if got is None:
+        logger.warning("recent titles: truth_vault.v_paid_boost_events unreadable; boosted-but-unflagged posts may show "
+                       "in the working column")
+        return frozenset()
+    return got
 
 
 def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int = 20,
@@ -3690,6 +3707,12 @@ def _recent_published(sb, project_id: str, *, days: int, limit: int, now: dateti
             if nid in when and nid not in seen_notes and _is_working(stats.get(nid) or {}, when[nid], now):
                 seen_notes.add(nid)
                 cands.append(r)
+        if cands:
+            # 投流事件里的帖(投了薯条、没标 paid_promoted 的也在里面)同样不算(复审: 同 priors 的起量标签, priors.is_clean 的
+            # boosted)。只在真有候选时读, 和先验共用 priors.paid_boosted 那份进程缓存; 读不到记 WARN、照原来的口径
+            boosted = _working_boosted(sb)
+            if boosted:
+                cands = [r for r in cands if _is_working(stats.get(r["note_id"]) or {}, when[r["note_id"]], now, boosted)]
         cc = (lambda r: stats[r["note_id"]].get("comments_count")
               if isinstance(stats[r["note_id"]].get("comments_count"), (int, float)) else -1)
         work = sorted(cands, key=lambda r: (stats[r["note_id"]].get("tier") in HIT_TIERS, cc(r),

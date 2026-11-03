@@ -1288,19 +1288,62 @@ def _as_int(v) -> int:
         return 0
 
 
-def _paid_boosted(st, sb) -> frozenset:
-    """投流事件里的帖(store.tv_paid_boost_note_ids), 每次建全局表 / 项目块读一次。读不到记 WARN、当没有(照原来的口径算),
-    不让整块建不成。"""
+# 投流事件里的帖(store.tv_paid_boost_note_ids)在进程里缓存一份(复审 2026-11-03): 那个视图每读一次都要整表扫 notes、再查
+# audit_log(生产实测一次 ~0.5 秒), 内容却只在 TV 夜里同步时才变。原来每次建全局表 / 项目块都读, 项目块又是在 draw_angles
+# 冷缓存那 2.5 秒(budget_s)里建的, 这一读就把发牌往旧先验 / 快照 / v1 兜底上推。现在全局表、项目块、简报的 working 一栏
+# (store._recent_published)共用这一份: PAID_BOOST_TTL_S 一刷; 同一时刻只一个线程去读(冷的时候别的线程等它, 手里有旧的就
+# 先用旧的、不等); 读不到时有旧的用旧的, 没有就当没有(原来的口径, 调用方记 WARN), PAID_BOOST_RETRY_S 之内不再去读。
+PAID_BOOST_TTL_S = 6 * 3600
+PAID_BOOST_RETRY_S = 300
+_BOOST: dict = {"value": None, "at": 0.0, "err_at": None}
+_BOOST_LOCK = threading.Lock()
+
+
+def paid_boosted(sb, st=None) -> frozenset | None:
+    """投流事件里的帖 ``frozenset({note_id})``(上面那份缓存)。从来没读到过回 None; 不抛。``st`` 是 store 模块(测试换假件用)。"""
+    def _usable_now() -> tuple[bool, frozenset | None]:
+        t = _NOW[0]()
+        if _BOOST["value"] is not None and t - _BOOST["at"] <= PAID_BOOST_TTL_S:
+            return True, _BOOST["value"]
+        if _BOOST["err_at"] is not None and t - _BOOST["err_at"] < PAID_BOOST_RETRY_S:
+            return True, _BOOST["value"]
+        return False, None
+
+    done, got = _usable_now()
+    if done:
+        return got
+    # 手里有旧的就不排队: 别的线程正在刷, 先用旧的
+    if not _BOOST_LOCK.acquire(blocking=_BOOST["value"] is None):
+        return _BOOST["value"]
     try:
-        got = st.tv_paid_boost_note_ids(sb)
-    except Exception as exc:                            # noqa: BLE001 — 读数本不抛, 再兜一层
-        got = None
-        logger.warning("priors: paid boost events unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+        done, got = _usable_now()                       # 等锁的时候别的线程可能刚刷完 / 刚失败
+        if done:
+            return got
+        gen = _GEN[0]
+        try:
+            ids = (st or _store()).tv_paid_boost_note_ids(sb)
+        except Exception as exc:                        # noqa: BLE001 — 读数本不抛, 再兜一层
+            ids = None
+            logger.warning("priors: paid boost events unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+        with _LOCK:
+            if _GEN[0] == gen:                          # reset_cache 之后读回来的不写
+                if ids is None:
+                    _BOOST["err_at"] = _NOW[0]()
+                else:
+                    _BOOST.update(value=frozenset(ids), at=_NOW[0](), err_at=None)
+        return frozenset(ids) if ids is not None else _BOOST["value"]
+    finally:
+        _BOOST_LOCK.release()
+
+
+def _paid_boosted(st, sb) -> frozenset:
+    """投流事件里的帖(paid_boosted 那份缓存), 建全局表 / 项目块时用。读不到记 WARN、当没有(照原来的口径算), 不让整块建不成。"""
+    got = paid_boosted(sb, st)
     if got is None:
         logger.warning("priors: truth_vault.v_paid_boost_events unreadable; boosted-but-unflagged posts stay in the "
                        "labels this build")
         return frozenset()
-    return frozenset(got)
+    return got
 
 
 def fetch_global(sb, *, now: datetime | None = None, params: dict = PARAMS) -> dict | None:
@@ -1472,6 +1515,7 @@ def reset_cache() -> None:
         _INFLIGHT.clear()
         _GEN[0] += 1
         _POOL[0] = _Pool()
+        _BOOST.update(value=None, at=0.0, err_at=None)
     _SNAPSHOT.clear()
 
 

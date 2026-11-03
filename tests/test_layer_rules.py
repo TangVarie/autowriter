@@ -119,13 +119,72 @@ def test_brief_without_direction_rules_is_unchanged(monkeypatch):
     assert sorted(m["content"] for m in seen["project_memories"]) == ["写清用了多久", "标题不超过二十字"]
 
 
-def test_the_session_direction_gate_still_drops_the_other_soft_rules_from_the_brief():
+def _main_and_other(p1: str) -> tuple[str, str]:
+    """简报 P1 → (原来那一截, 方向闸挡掉的那一截)。"""
+    head = "[只管卡上写着"
+    return (p1.split(head)[0], head + p1.split(head)[1]) if head in p1 else (p1, "")
+
+
+def test_the_session_direction_gate_moves_the_other_soft_rules_to_their_own_block():
+    """复审: 方向闸挡掉的 soft 规则(另一个方向的)卡上标了那一族贴型的稿照查, 所以简报里得给模型看 —— 不在原来那一截
+    (那一截一个字不变、counts 照旧), 单独一截接在 P1 最后, 写明没标贴型的稿不用管。"""
     c = desk_client(memories=RULES)
     c.rows["projects"][0]["name"] = "示例项目 产品向"
     out = core.build_writing_brief(c, PROJ, user_id=ME)
-    assert "示例规则 2" not in out["p1"] and out["counts"]["soft_dropped_by_direction"] == 1
-    assert "示例规则 1【只管产品贴/精品贴的稿】" in out["p1"]
+    main, other = _main_and_other(out["p1"])
+    assert "示例规则 2" not in main and out["counts"]["soft_dropped_by_direction"] == 1
+    assert "示例规则 1【只管产品贴/精品贴的稿】" in main and main.rstrip().endswith(core.DIRECTION_RULE_TAIL)
     assert "示例规则 3【只管产品贴/精品贴的稿】" in out["p0"]
+    assert other == core.OTHER_DIRECTION_BLOCK.format(names="流量贴/提问贴", direction="产品向", other="流量向",
+                                                      bullets="• 示例规则 2")
+    assert "卡上没写是哪种贴的稿不用管" in other and out["p1"].endswith(other)
+    assert out["counts"]["soft_rules_for_other_layers"] == 1 and out["counts"]["soft_rules"] == 1
+
+    # 一条被挡掉的都没有(项目名判不出方向): 没有这一截、没有这个键
+    c2 = desk_client(memories=RULES)
+    out2 = core.build_writing_brief(c2, PROJ, user_id=ME)
+    assert "[只管卡上写着" not in out2["p1"] and "soft_rules_for_other_layers" not in out2["counts"]
+
+
+def test_brief_without_a_p1_still_shows_the_other_direction_block():
+    rows = [_rule(1, content="示例流量向规则", severity="soft", applicability="流量向")]
+    c = desk_client(memories=rows)
+    c.rows["projects"][0]["name"] = "示例项目 产品向"
+    out = core.build_writing_brief(c, PROJ, user_id=ME)
+    assert out["p1"].startswith("[只管卡上写着流量贴/提问贴的稿]") and "• 示例流量向规则" in out["p1"]
+
+
+def _soft_rules_shown(out: dict, layer: str | None) -> set[str]:
+    """简报告诉这一种卡要守的 soft 规则(示例规则 i → m-i): 原来那一截里没注贴型的 + 注了这一族的; 卡上标了贴型的再加上
+    方向闸挡掉的那一截里写着这一族的。"""
+    main, other = _main_and_other(out["p1"])
+    fam = vocab.LAYER_DIRECTION.get(layer or "")
+    got = set()
+    for line in main.splitlines():
+        if not line.startswith("• 示例规则 "):
+            continue
+        note = next((t for t, n in vocab.DIRECTION_RULE_NOTE.items() if n in line), None)
+        if note is None or fam is None or note == fam:
+            got.add("m-" + line.split("示例规则 ")[1][:1])
+    if other and fam and core.DIRECTION_LAYER_NAMES[fam] in other.splitlines()[0]:
+        got |= {"m-" + line.split("示例规则 ")[1][:1] for line in other.splitlines() if line.startswith("• 示例规则 ")}
+    return got
+
+
+def test_brief_and_per_draft_soft_checks_agree():
+    """复审: 每篇被报「建议改」的 soft 规则, 简报里都告诉过模型这一种卡要守它; 反过来简报叫这一种卡守的、带检查的 soft
+    规则, 这一篇都查了。"""
+    lys = ("T", "P", None, "J")
+    c, keys = _client(*lys)
+    out = core.build_writing_brief(c, PROJ, user_id=ME)
+    drafts = distinct_drafts(4)
+    for d, k in zip(drafts, keys):
+        d["angle_key"] = k
+    got = _by_draft(core.commit_drafts(c, PROJ, drafts, user_id=ME))
+    soft_ids = {r["id"] for r in RULES if r["severity"] == "soft"}
+    for i, ly in enumerate(lys):
+        assert set(got.get(i, [])) & soft_ids == _soft_rules_shown(out, ly), (i, ly)
+    assert _soft_rules_shown(out, "T") == {"m-2"} and _soft_rules_shown(out, None) == {"m-1"}, "反证: 两族看到的不一样"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -146,6 +205,27 @@ def test_score_drafts_checks_direction_rules_per_card_layer():
         3: ["m-2", "m-4"],                     # 提问贴: 同流量贴
     }
     assert c.rows["batch_metrics"][0]["meta"]["rule_checks"]["layered"] == 3
+
+
+BROKEN = _rule(9, "required_phrase", {"bogus": 1}, severity="soft", applicability="流量向")   # 存的检查用不了
+
+
+@pytest.mark.parametrize("lys,unchecked,n_rules", [
+    ((None, None), [], 3),             # 没标贴型: 方向闸挡掉流量向的 soft(原来的口径)
+    (("P", "P"), [], 3),               # 整批产品贴: 流量向的那几条哪一篇都不管 —— 不报「整批都没查」、不数
+    (("T", "P"), ["m-9"], 4),          # 有一篇流量贴: 那条管得着它, 用不了就照报(用不了的不数进 rules)
+])
+def test_rules_that_apply_to_no_draft_are_not_reported_or_counted(lys, unchecked, n_rules):
+    """复审: 标了贴型时池子先拿掉这一批哪一篇都不管的规则, rule_checks_unchecked 和 stats 只说管得着的。"""
+    c, keys = _client(*lys)
+    c.rows["memories"].append(dict(BROKEN))
+    drafts = distinct_drafts(2)
+    for d, k in zip(drafts, keys):
+        d["angle_key"] = k
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert [u["rule_id"] for u in out.get("rule_checks_unchecked") or []] == unchecked
+    meta = c.rows["batch_metrics"][0]["meta"]["rule_checks"]
+    assert meta["rules"] == n_rules and meta.get("skipped", 0) == len(unchecked)
 
 
 def test_score_drafts_without_layers_is_exactly_the_old_gate(monkeypatch):
@@ -250,7 +330,7 @@ def test_check_rules_sends_each_layer_group_its_own_bank_and_runs_code_per_layer
     assert _rule_ids(rows[V_P]) == sorted([R_PROD["id"], R_ALL["id"], R_PROD_CODE["id"]])
     assert _rule_ids(rows[V_N]) == sorted([R_PROD["id"], R_ALL["id"], R_PROD_CODE["id"]])
     assert rows[V_T]["layer"] == "流量贴" and rows[V_P]["layer"] == "精品贴" and "layer" not in rows[V_N]
-    assert out["rules"]["pool"] == 5, "有稿子标了贴型时池子里留着全部 soft, 逐篇分组"
+    assert out["rules"]["pool"] == 5, "有稿子标了贴型时池子里留着管得着某一篇的规则(这里五条都管得着), 逐篇分组"
 
 
 def test_check_rules_without_layers_is_the_old_single_bank(wired):
@@ -278,6 +358,26 @@ def test_check_rules_skips_jev_for_a_group_with_no_questions(wired):
     by = {r["version_id"]: r for r in out["versions"]}
     assert _rule_ids(by[V_T]) == [R_TRAF_CODE["id"]] and "judge_status" not in by[V_T]
     assert _rule_ids(by[V_P]) == [R_PROD["id"]]
+
+
+R_TRAF_NEW = mem(16, "示例软规则: 还没编译的流量向规则", applicability="流量向")
+
+
+def test_check_rules_pool_only_holds_rules_that_apply_to_some_target(wired):
+    """复审: 几篇全是产品向那一族时, 流量向的规则(编了的、还没编的)哪一篇都不管 —— 不进池子、不数进 uncompiled(不为它们
+    补编)、next_step 不提; 有一篇流量贴时照旧算。"""
+    c = _rules_client(layers={V_T: "P", V_P: "J"})
+    c.rows["memories"].append(dict(R_TRAF_NEW))
+    out = core.check_rules(c, CPROJ, [V_T, V_P], user_id=ME)
+    assert out["rules"]["pool"] == 3 and out["uncompiled_rules"] == 0 and out["rules"]["uncompiled"] == 0
+    assert "uncompiled_reason" not in out["rules"] and "还没有编译结果" not in out.get("next_step", "")
+    assert all(R_TRAF["id"] not in _rule_ids(r) and R_TRAF_CODE["id"] not in _rule_ids(r) for r in out["versions"])
+
+    wired.calls.clear()
+    c2 = _rules_client(layers={V_T: "T", V_P: "J"})
+    c2.rows["memories"].append(dict(R_TRAF_NEW))
+    out2 = core.check_rules(c2, CPROJ, [V_T, V_P], user_id=ME)
+    assert out2["rules"]["pool"] == 6 and out2["uncompiled_rules"] == 1
 
 
 def test_version_layers_reads_the_consumed_row_then_the_fingerprint_key():

@@ -335,6 +335,24 @@ def rule_applies_to_layer(rule: dict, layer: str | None, direction: str) -> bool
 DIRECTION_RULE_TAIL = ("（标了【只管产品贴/精品贴的稿】【只管流量贴/提问贴的稿】的规则, 只管发牌卡上写着那种贴的稿; "
                        "卡上没写是哪种贴的稿, 照常守。）")
 
+# 这场方向闸挡掉的那些 soft 规则(另一个方向的; 复审 2026-11-03): 卡上标了那一族贴型的稿, score_drafts / check_rules 照它们查
+# (rule_applies_to_layer), 简报里就得让模型看得见 —— 不然模型被报「建议改」的是一条它从没见过的规则。单独一截接在 P1 最后,
+# 说清没标贴型的稿不用管(同方向闸); P1 原来那一截一个字不变, counts.soft_dropped_by_direction 照旧数它们。
+DIRECTION_LAYER_NAMES = {"产品向": "产品贴/精品贴", "流量向": "流量贴/提问贴"}
+OTHER_DIRECTION_BLOCK = ("[只管卡上写着{names}的稿]\n这场按{direction}写, 下面几条是{other}的规则: 发牌卡上写着{names}的那几篇"
+                         "照它们写, 卡上没写是哪种贴的稿不用管。\n{bullets}")
+
+
+def _other_direction_block(rules: list[dict], direction: str) -> str:
+    """方向闸挡掉的 soft 规则 → 简报 P1 末尾那一截(OTHER_DIRECTION_BLOCK)。没有就回 ""。挡掉的只会是另一个方向的
+    (filter_by_applicability: 带方向词、又不带这场方向的), 所以一截只有一个方向。"""
+    rules = [r for r in rules if r.get("content")]
+    if not rules or direction not in DIRECTION_LAYER_NAMES:
+        return ""
+    other = next(t for t in DIRECTION_TAGS if t != direction)
+    return OTHER_DIRECTION_BLOCK.format(names=DIRECTION_LAYER_NAMES[other], direction=direction, other=other,
+                                        bullets="\n".join(f"• {r['content']}" for r in rules))
+
 
 def _annotate_direction_rules(rules: list[dict]) -> tuple[list[dict], int]:
     """带方向的规则在简报里注一句管哪种贴的稿(vocab.DIRECTION_RULE_NOTE), 回 (新的列表, 注了几条)。不改原来那一行
@@ -544,14 +562,27 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     direction = detect_direction(project.get("name") or "",
                                  brief.get("tactic") or "")
     soft, dropped_by_direction = filter_by_applicability(soft, direction)
+    # 贴型(复审 2026-11-03): 挡掉的那些(另一个方向的)卡上标了那一族贴型的稿照查, 简报里另起一截给模型看(OTHER_DIRECTION_BLOCK)。
+    # 它们过同一道相关性、同样封顶, 但和上面那一份分开数 —— 上面那一份注入哪几条一条不变
+    other_dir = list(dropped_by_direction)
     if soft_ctx:
-        soft = memory.filter_soft_by_relevance(soft, soft_ctx, report_sink=soft_report)
+        if other_dir:
+            # 相关性逐条判(门槛), 合在一起调一次只为少算一次上下文向量; 上面那一份留下哪几条和单独调一模一样
+            kept = {id(m) for m in memory.filter_soft_by_relevance(soft + other_dir, soft_ctx, report_sink=soft_report)}
+            soft = [m for m in soft if id(m) in kept]
+            other_dir = [m for m in other_dir if id(m) in kept]
+        else:
+            soft = memory.filter_soft_by_relevance(soft, soft_ctx, report_sink=soft_report)
     soft_cap = int(getattr(config, "MAX_INJECTED_MEMORIES_PER_SCOPE", 12) or 12)
-    soft_by_scope = {"global": [], "project": []}
-    for m in soft:
-        soft_by_scope["global" if m.get("scope") == "global" else "project"].append(m)
-    soft = (db._rank_memories_for_injection(soft_by_scope["global"], soft_cap)
-            + db._rank_memories_for_injection(soft_by_scope["project"], soft_cap))
+
+    def _capped(rules: list[dict]) -> list[dict]:
+        by_scope = {"global": [], "project": []}
+        for m in rules:
+            by_scope["global" if m.get("scope") == "global" else "project"].append(m)
+        return (db._rank_memories_for_injection(by_scope["global"], soft_cap)
+                + db._rank_memories_for_injection(by_scope["project"], soft_cap))
+    soft = _capped(soft)
+    other_dir = _capped(other_dir) if other_dir else []
 
     # 贴型(2026-11-03): 带方向的规则注明只管哪种贴的稿 —— 发牌卡上标了贴型的那几篇按卡走, 没标的照原来的口径守
     # (DIRECTION_RULE_TAIL 接在那一层末尾说清楚)。只改给模型看的这一份, 方向闸、相关性、封顶都在上面照旧
@@ -570,6 +601,11 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         layers["p0"] = layers["p0"] + "\n" + DIRECTION_RULE_TAIL
     if soft_noted and layers.get("p1"):
         layers["p1"] = layers["p1"] + "\n\n" + DIRECTION_RULE_TAIL
+    # 方向闸挡掉的那些(复审): 接在 P1 最后, 放在上面那句说明之后 —— 那句「照常守」说的是上面注了【只管…】的, 这一截自己写清
+    # 没标贴型的稿不用管
+    other_block = _other_direction_block(other_dir, direction)
+    if other_block:
+        layers["p1"] = (layers["p1"] + "\n\n" + other_block) if layers.get("p1") else other_block
 
     out = {
         "project_id": project_id,
@@ -593,6 +629,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
             # 自己看得见、自己能改。
             "direction": direction or "未判定",
             "soft_dropped_by_direction": len(dropped_by_direction),
+            # 挡掉的里面, 给卡上标了另一族贴型的稿看的那几条(P1 末尾那一截; 过了相关性、封了顶)。没有就不带这个键
+            **({"soft_rules_for_other_layers": len(other_dir)} if other_block else {}),
             "positive_examples": len(positives),
             "positive_pool": len(pool),
             "negative_examples": len(negatives),
@@ -3803,8 +3841,8 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
        (rulecheck.check), 没在时限内查完的、存的 check 用不了的都列进 ``out["rule_checks_unchecked"]``, 理由同上: 不列就成了
        "守住了"。
        ``layers``(2026-11-03 贴型): {第几篇: 卡上标的贴型代号}(_draft_layers 从台账查的)。有一篇标了, 带方向的规则就逐篇
-       跟着贴型走(rule_applies_to_layer: 流量向只管流量贴 / 提问贴, 产品向只管产品贴 / 精品贴; 没标的那几篇照原来的方向闸);
-       一篇都没标就和原来一字不差。
+       跟着贴型走(rule_applies_to_layer: 流量向只管流量贴 / 提问贴, 产品向只管产品贴 / 精品贴; 没标的那几篇照原来的方向闸),
+       这一批哪一篇都不管的规则不查、不报、不数; 一篇都没标就和原来一字不差。
 
     两样都只是参考: 入库到这里已经成功了, 这一步任何失败都不许把它变成失败(同判定那一段的纪律)。
     """
@@ -3850,12 +3888,17 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             # 再报「建议改」就是在叫模型写它没被要求、甚至相反的东西(产品向的"带上产品名"报到流量向项目上)。
             # hard 不过这道闸, 同简报。判据也同简报: 项目名 + 这场 open_project 传的 tactic(写手原样传回来, codex review
             # on aw#115) —— 只按项目名判的话, 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又全报一遍。
-            # 贴型(2026-11-03): 这一批有卡标了贴型的, 方向闸改成逐篇过(rule_applies_to_layer), 池子里留着全部 soft
+            # 贴型(2026-11-03): 这一批有卡标了贴型的, 方向闸改成逐篇过(rule_applies_to_layer); 这一批哪一篇都不管的规则
+            # (比如整批都是产品贴时流量向的那几条)先拿掉(复审) —— 不然它存的检查用不了时会被报成「整批都没查」, stats 也把它
+            # 数进去, 而它本来就不管这一批的任何一篇。管某一篇的另一个方向的 soft 规则, 简报 P1 末尾那一截给模型看过
+            # (OTHER_DIRECTION_BLOCK)
             direction = detect_direction(project.get("name") or "", tactic or "")
             pick_layers = [(layers or {}).get(i) for i in indices]
             applies = None
             if any(pick_layers):
                 applies = lambda r, pos: rule_applies_to_layer(r, pick_layers[pos], direction)    # noqa: E731
+                hard = [r for r in hard if any(rule_applies_to_layer(r, ly, direction) for ly in pick_layers)]
+                soft = [r for r in soft if any(rule_applies_to_layer(r, ly, direction) for ly in pick_layers)]
             else:
                 soft, _dropped = filter_by_applicability(soft, direction)
             # 有交付模板时, 查的是交付出去的那一份, 免得和 delivery.text 对不上(delivery.delivered_draft): 模板管话题的, 话题含
@@ -7532,14 +7575,20 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     hard, soft = store.shared_memories(client, project_id, user_id, vectors=False)
     # 方向闸的判据同简报和 score_drafts: 项目名 + 这场 open_project 传的 tactic(写手原样传回来)。只按项目名判的话,
     # 项目名不带方向、靠 tactic 判出方向的那场, 简报挡掉的规则这里又当成题发给 Jev
-    # 贴型(2026-11-03): 有稿子的卡标了贴型时, 带方向的规则逐篇跟着贴型走(rule_applies_to_layer) —— 池子里留着全部 soft,
-    # 每篇只问 / 只查它那一组的规则(_layer_group); 一篇都没标就和原来一字不差
+    # 贴型(2026-11-03): 有稿子的卡标了贴型时, 带方向的规则逐篇跟着贴型走(rule_applies_to_layer) —— 池子里留着管得着这次
+    # 某一篇的规则(另一个方向的 soft 也算, 简报 P1 末尾那一截给模型看过), 每篇只问 / 只查它那一组的(_layer_group);
+    # 一篇都没标就和原来一字不差
     direction = detect_direction(project.get("name") or "", tactic or "")
     vlayers = _version_layers(client, project_id, [vid for vid, _ in targets]) if targets else {}
     t_groups = [_layer_group(vlayers.get(vid)) for vid, _ in targets]
     if not any(t_groups):
         soft, _dropped = filter_by_applicability(soft, direction)
-    pool = hard + soft
+        pool = hard + soft
+    else:
+        # 这次哪一篇都不管的规则(比如几篇全是产品贴时流量向的那几条)不进池子(复审): 不然 pool / partial / uncompiled(连带
+        # 补编)/ code_unavailable 都把它数进去, next_step 还会说它「没查」, 而它本来就不管这次的任何一篇
+        pool = [r for r in hard + soft
+                if any(rule_applies_to_layer(r, _GROUP_LAYER.get(g), direction) for g in dict.fromkeys(t_groups))]
     shas: dict[str, tuple[dict, str]] = {}
     not_compilable = 0
     for r in pool:

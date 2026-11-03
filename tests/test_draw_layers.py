@@ -482,7 +482,8 @@ def test_fetch_project_reads_layers_and_boosts_separately_and_survives_their_abs
     outcome_cols = [q["cols"] for q in c.calls if q["table"] == "truth_vault.notes" and "raw_content" in (q["cols"] or "")]
     assert outcome_cols and all("content_layer" not in cols for cols in outcome_cols)
     assert "content_layer" not in store.TV_OUTCOME_COLS
-    # 列还不在 / 视图读不到: 不分档、照原来的口径, 项目块照样建成
+    # 列还不在 / 视图读不到: 不分档、照原来的口径, 项目块照样建成(投流事件是进程缓存, 换一个冷的进程看)
+    priors.reset_cache()
     c2, rows2 = _tv_world(layers_column=False, boost_view=False)
     with caplog.at_level("INFO"):
         got2 = priors.fetch_project(c2, PID, now=PNOW)
@@ -496,6 +497,7 @@ def test_fetch_project_reads_layers_and_boosts_separately_and_survives_their_abs
 def test_fetch_global_drops_boosted_posts_and_warns_when_the_view_is_unreadable(caplog):
     c, rows = _tv_world()
     g = priors.fetch_global(c, now=PNOW)
+    priors.reset_cache()                                     # 投流事件是进程缓存: 换一个冷的进程看读不到的那种
     c2, _ = _tv_world(boost_view=False)
     with caplog.at_level("WARNING"):
         g2 = priors.fetch_global(c2, now=PNOW)
@@ -504,7 +506,83 @@ def test_fetch_global_drops_boosted_posts_and_warns_when_the_view_is_unreadable(
     assert store.tv_paid_boost_note_ids(c) == {rows[29]["note_id"]}
 
 
+def _boost_reads(c) -> int:
+    return sum(1 for q in c.calls if q["table"] == "truth_vault.v_paid_boost_events")
+
+
+def test_paid_boost_view_is_read_once_per_process_and_shared_between_builds(monkeypatch):
+    """复审: 视图每读一次 ~0.5 秒, 又只在 TV 夜里同步时变 —— 全局表、项目块共用一份进程缓存(PAID_BOOST_TTL_S 一刷);
+    不满一页就是读完了, 不再多读一页空的。"""
+    clock = [1_000_000.0]
+    monkeypatch.setattr(priors, "_NOW", [lambda: clock[0]])
+    c, rows = _tv_world()
+    g = priors.fetch_global(c, now=PNOW)
+    p = priors.fetch_project(c, PID, now=PNOW)
+    p2 = priors.fetch_project(c, PID, now=PNOW)
+    assert _boost_reads(c) == 1, "一页没满就停, 后面两次建块用缓存"
+    assert rows[29]["note_id"] not in {h["ref"][5:] for h in p["hits"] + p2["hits"]}
+    assert g["projects"]["AAA_phase2"]["label"]["n"] >= 1
+    clock[0] += priors.PAID_BOOST_TTL_S + 1
+    priors.fetch_project(c, PID, now=PNOW)
+    assert _boost_reads(c) == 2, "过了 TTL 再读一次"
+
+
+def test_paid_boost_cache_keeps_the_old_set_when_a_refresh_fails_and_waits_before_retrying(monkeypatch):
+    clock = [1_000_000.0]
+    monkeypatch.setattr(priors, "_NOW", [lambda: clock[0]])
+    c, rows = _tv_world()
+    assert priors.paid_boosted(c) == frozenset({rows[29]["note_id"]})
+    clock[0] += priors.PAID_BOOST_TTL_S + 1
+    broken, _ = _tv_world(boost_view=False)
+    assert priors.paid_boosted(broken) == frozenset({rows[29]["note_id"]}), "刷不成: 有旧的用旧的"
+    assert priors.paid_boosted(broken) == frozenset({rows[29]["note_id"]})
+    assert _boost_reads(broken) == 1, "刚失败过, PAID_BOOST_RETRY_S 之内不再去读"
+    clock[0] += priors.PAID_BOOST_RETRY_S + 1
+    priors.paid_boosted(broken)
+    assert _boost_reads(broken) == 2
+
+    priors.reset_cache()                                     # 冷的进程、一次都没读到过: 当没有(调用方照原来的口径)
+    assert priors.paid_boosted(broken) is None
+    assert priors._paid_boosted(store, broken) == frozenset()
+
+
+def test_paid_boost_reader_stops_on_a_short_page(monkeypatch):
+    monkeypatch.setattr(store, "PAGE", 2)
+    ids = [{"note_id": f"n{i}"} for i in range(5)]
+    c = FakeClient(rows={"truth_vault.v_paid_boost_events": ids})
+    assert store.tv_paid_boost_note_ids(c) == {f"n{i}" for i in range(5)}
+    assert _boost_reads(c) == 3, "2 + 2 + 1: 第三页没满就停"
+    c2 = FakeClient(rows={"truth_vault.v_paid_boost_events": ids[:4]})
+    store.tv_paid_boost_note_ids(c2)
+    assert _boost_reads(c2) == 3, "正好满页时多读一页空的才知道读完了"
+
+
 def test_normalize_pin_skips_the_direction_key():
     assert dp.normalize_pin({"方向": "流量贴"}) == (None, None)
     assert dp.normalize_pin({"方向": "流量贴", "标题句式": "问句"}) == ({dp.T: "疑问句"}, None)
     assert dp.normalize_pin({"风格": "x"})[1]["error"] == "pin_invalid"
+
+
+def test_paid_boost_cache_is_single_flight(monkeypatch):
+    """冷的时候几个线程一起要: 只有一个去读视图, 别的等它; 手里有旧的就不等。"""
+    import threading
+    started, release = threading.Event(), threading.Event()
+    reads = []
+
+    class SlowStore:
+        @staticmethod
+        def tv_paid_boost_note_ids(sb):
+            reads.append(1)
+            started.set()
+            release.wait(5)
+            return {"n1"}
+    got = []
+    ts = [threading.Thread(target=lambda: got.append(priors.paid_boosted(None, SlowStore))) for _ in range(3)]
+    ts[0].start()
+    assert started.wait(5)
+    for t in ts[1:]:
+        t.start()
+    release.set()
+    for t in ts:
+        t.join(5)
+    assert len(reads) == 1 and got == [frozenset({"n1"})] * 3
