@@ -497,6 +497,78 @@ def test_external_pool_without_product_role_is_one_median_as_before(strip):
     assert set(_vel_of(out)) == {k for k, v in vel.items() if v >= med}, "整个品类没答 product_role: 照原来一个中位数切"
     bare = priors.external_pool(rows, {}, category="运动补给", now=PNOW, registered=())
     assert set(out) == set(bare) and [(e["ref"], e["w"]) for e in out["pool"]] == [(e["ref"], e["w"]) for e in bare["pool"]]
+    assert out["summary_eligible"] == out["eligible"], "没有族中位数时摘要那批帖就是池子"
+
+
+def _mixed_family_rows(o_vels, p_vels):
+    """O 族: 标题场景直述、发帖 11 天(抓取时 10 天)、开头三篇里两篇身份自述; P 族: 标题数字清单、发帖 21 天(抓取时 20 天)、
+    开头具体事件。日均评论按给的数反推评论数。"""
+    rows, answers = [], {}
+    for i, v in enumerate(o_vels):
+        r = ext_row(posted_days=11, comments=int(v * 10), title="今天练完腿")
+        rows.append(r)
+        answers[r["note_id"]] = {"product_role": "未出现", "opening_type": "观点断言" if i % 3 == 0 else "身份自述"}
+    for v in p_vels:
+        r = ext_row(posted_days=21, comments=int(v * 20), title="3个练腿方法")
+        rows.append(r)
+        answers[r["note_id"]] = {"product_role": "主角", "opening_type": "具体事件"}
+    no_role = {k: {q: x for q, x in a.items() if q != "product_role"} for k, a in answers.items()}
+    return rows, answers, no_role
+
+
+_SUMMARY_KEYS = ("title_shares", "top_structures", "recent_14d", "summary_eligible", "median_velocity")
+
+
+def test_family_cut_moves_pool_membership_only_not_the_summaries():
+    """复审: 按族切只改哪些帖进池; title_shares(会掺进标题句式 π)、top_structures、recent_14d 照原来一个中位数切的算。"""
+    rows, answers, no_role = _mixed_family_rows(range(10, 20), range(2, 8))     # O 10–19/天, P 2–7/天
+    out = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=())
+    one = priors.external_pool(rows, no_role, category="运动补给", now=PNOW, registered=())
+    assert "family_median_velocity" in out and "family_median_velocity" not in one
+    assert [e["velocity"] for e in out["pool"]] == pytest.approx([19, 18, 17, 16, 15, 7, 6, 5])
+    assert [e["velocity"] for e in one["pool"]] == pytest.approx([19, 18, 17, 16, 15, 14, 13, 12])
+    assert {k: out[k] for k in _SUMMARY_KEYS} == {k: one[k] for k in _SUMMARY_KEYS}
+    assert out["title_shares"] == {"场景直述": 1.0} and out["recent_14d"] == 8 and out["summary_eligible"] == 8
+    assert out["top_structures"] == ["标题是场景直述", vocab.OPENING_PLAIN["身份自述"]]
+    # 要是按新池子算, 三样都会变(P 族三篇: 数字清单、20 天前发的、开头具体事件) —— 这条用例确实分得开
+    pool_ts = [e["title_structure"] for e in out["pool"]]
+    assert pool_ts.count("数字清单") == 3 and sum(e["posted_days_ago"] <= 14 for e in out["pool"]) == 5
+    assert [e["desc"].get("opening_type") for e in out["pool"]].count("具体事件") == 3
+
+
+def _blend_profile(ext):
+    proj = {"tv_ids": ["AAA_phase1"], "n_res": 80, "posts": 100,
+            "wmix": {"content_format": {"提问求助": 100}, "title_structure": {"疑问句": 50, "感叹共鸣": 50}}}
+    return priors.compose({"schema": 1, "projects": {}}, proj, ext, now=PNOW)["pi"]["title_structure"]
+
+
+def test_family_cut_leaves_the_title_prior_of_unlayered_cards_alone():
+    """标题配比掺外部(ext_title_blend)的那份和篇数门槛都照原来的切法: 有没有 product_role, 标题句式 π 一样。"""
+    rows, answers, no_role = _mixed_family_rows(range(10, 50), range(2, 14))    # 52 篇, 摘要那批 26 篇 ≥ 15
+    out = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=())
+    one = priors.external_pool(rows, no_role, category="运动补给", now=PNOW, registered=())
+    assert out["summary_eligible"] == one["summary_eligible"] == 26 >= priors.PARAMS["ext_title_min"]
+    assert [e["ref"] for e in out["pool"]] != [e["ref"] for e in one["pool"]]
+    pi = _blend_profile(out)
+    assert pi == _blend_profile(one) != _blend_profile(None), "外部的标题配比照样掺进来, 掺的是同一份"
+    pool_counts = {}
+    for e in out["pool"]:
+        pool_counts[e["title_structure"]] = pool_counts.get(e["title_structure"], 0) + 1
+    by_pool = dict(out, title_shares={k: v / len(out["pool"]) for k, v in pool_counts.items()})
+    assert _blend_profile(by_pool) != pi, "按新池子算 title_shares 的话, 没标贴型的卡的标题句式 π 会跟着变"
+
+
+def test_title_blend_gate_counts_the_summary_posts_not_the_family_pool():
+    """P 族 15 篇(1–15/天)、O 族 13 篇(20–32/天): 全品类中位数 14.5 切出 14 篇(不到 ext_title_min 15, 不掺);
+    按族切池子是 15 篇。门槛数 summary_eligible, 照样不掺; 老缓存没有这个键时才数 eligible。"""
+    rows, answers, no_role = _mixed_family_rows(range(20, 33), range(1, 16))
+    out = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=())
+    one = priors.external_pool(rows, no_role, category="运动补给", now=PNOW, registered=())
+    assert out["median_velocity"] == pytest.approx(14.5)
+    assert (out["summary_eligible"], out["eligible"]) == (14, 15) and (one["summary_eligible"], one["eligible"]) == (14, 14)
+    assert _blend_profile(out) == _blend_profile(one) == _blend_profile(None)
+    legacy = {k: v for k, v in out.items() if k != "summary_eligible"}
+    assert _blend_profile(legacy) != _blend_profile(None), "没有 summary_eligible 的外部块照旧数 eligible"
 
 
 def _hit_rows():

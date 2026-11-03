@@ -825,7 +825,9 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
     · 日均评论 = 评论数 / max(抓取时帖龄, 3), 不低于它那一族 3–90 天帖的中位数; 不设前 N 名的上限。族(2026-11-03,
       老板定的): Jev 的 product_role 是主角 / 解决方案的算 P(正文里产品出场, 评论本来就少), 其余(包括没答的)算 O,
       各自取中位数; 一族不满 ext_family_min_n 篇就用全品类的中位数; 整个品类一篇 product_role 都没答(读挂了 / 没抓)
-      就和原来一样只有一个中位数。
+      就和原来一样只有一个中位数。按族切只管哪些帖进池(e 槽挑参考帖、eligible、ext_ok): title_shares / top_structures /
+      recent_14d 和标题配比掺外部那一步的篇数门槛(summary_eligible)照原来全品类一个中位数切出来的帖算 —— 复审: 不然
+      没标贴型的卡的标题句式 π(ext_title_blend)也跟着变, 超出老板这次定的范围。
     每条: ref("ext:<id>") / w(√日均评论, 抽签权重) / velocity / posted_days_ago / title_structure(Jev 的问句答案优先)
     / desc(开头类型、转折、结尾问读者、求助、亲历)/ prod(2026-11-03: Jev 的 product_role 答了才有 —— 1 产品出场了
     (主角 / 解决方案), 0 没出场(未出现 / 只暗示 / 顺带一提); 发牌按卡的贴型优先挑哪一档, 只是优先、不筛, 权重不打折,
@@ -858,6 +860,7 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
     med = _median([c[5] for c in cands])
     fam_med = _family_medians(cands, ans, med, params)
     pool = []
+    summary = []                                        # 全品类一个中位数切出来的帖(没有族中位数时就是 pool 那些)
     for r, nid, posted, age, comments, vel in cands:
         a = ans.get(nid) or {}
         if _truthy(r.get("ad_like")):
@@ -868,7 +871,9 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
         if any(b and b in title.lower() for b in reg):
             continue
         cut = fam_med[_ext_family(a)] if fam_med else med
-        if cut is not None and vel < cut:
+        in_pool = cut is None or vel >= cut
+        in_summary = med is None or vel >= med         # 原来的切法: 标题配比和摘要行照它算
+        if not (in_pool or in_summary):
             continue
         isq = answer_bool(a.get("title_is_question"))
         ts_class = vocab.classify_title(title, isq) or (QUESTION if isq is True else None)
@@ -885,16 +890,19 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
         role = str(a.get("product_role") or "").strip()
         if role in vocab.PRODUCT_PRESENT or role in vocab.PRODUCT_ABSENT:
             entry["prod"] = 1 if role in vocab.PRODUCT_PRESENT else 0
-        pool.append(entry)
+        if in_pool:
+            pool.append(entry)
+        if in_summary:
+            summary.append(entry)
     pool.sort(key=lambda e: (-e["velocity"], e["ref"]))
     counts: dict[str, int] = {}
-    for e in pool:
+    for e in summary:
         if e["title_structure"]:
             counts[e["title_structure"]] = counts.get(e["title_structure"], 0) + 1
     tot = sum(counts.values())
     title_shares = {k: v / tot for k, v in counts.items()} if tot else {}
     opening: dict[str, int] = {}
-    for e in pool:
+    for e in summary:
         o = e["desc"].get("opening_type")
         if o in vocab.OPENING_PLAIN:
             opening[o] = opening.get(o, 0) + 1
@@ -911,10 +919,11 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
         **({"family_median_velocity": {f: None if v is None else round(v, 3) for f, v in fam_med.items()}}
            if fam_med else {}),
         "eligible": len(pool),
+        "summary_eligible": len(summary),
         "pool": pool,
         "title_shares": title_shares,
         "updated_days_ago": None if latest_fetch is None else max(int(_days(now, latest_fetch)), 0),
-        "recent_14d": sum(1 for e in pool if e["posted_days_ago"] <= 14),
+        "recent_14d": sum(1 for e in summary if e["posted_days_ago"] <= 14),
         "top_structures": top,
     }
 
@@ -1205,7 +1214,9 @@ def compose(gt, proj: dict | None, ext: dict | None, *, project_id: str | None =
         pi_fmt = _uniform("content_format")
     nonq = {v: mix["title_structure"].get(v, 0.0) for v in vocab.TITLE_STRUCTURES if v != QUESTION}
     nonq = _norm(nonq) if sum(nonq.values()) > 0 else dict(vocab.NONQ_SPLIT)
-    ext_ok_titles = ext and ext.get("eligible", 0) >= params["ext_title_min"]
+    # 篇数门槛数的是 title_shares 那批帖(外部池按族切之后 eligible 是池子的篇数, 两者可以不一样); 老缓存 / 合成的
+    # 外部块没有 summary_eligible 就数 eligible
+    ext_ok_titles = ext and ext.get("summary_eligible", ext.get("eligible", 0)) >= params["ext_title_min"]
     if ext_ok_titles:
         en = {v: (ext.get("title_shares") or {}).get(v, 0.0) for v in nonq}
         if sum(en.values()) > 0:
