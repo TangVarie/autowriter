@@ -916,6 +916,28 @@ def record_draw(sb, project_id: str, angles: list[dict], user_id: str | None) ->
                          "avoidance will not see this draw", project_id)
 
 
+def relabel_draw_layer(sb, project_id: str, angle_key: str, batch_id: str, dims: dict) -> bool:
+    """这一批刚预留到的那一行(project_id + angle_key + dims._draw.b = 这一批 + 还没销账)换成 ``dims``(只是 _draw.ly 改了 /
+    去掉了): RPC 跳过被并发抢走的主牌、顶上来的牌带错了贴型时, draw_angles 把贴型对回写手要的篇数, 台账跟着改(Codex review
+    on aw#141)。回是否真改到了行。
+
+    失败(查询出错、一行都没对上)只记 warning、回 False, 不拦发牌 —— 卡面照样用对过的贴型, 只是台账上那一行还是原来的。"""
+    try:
+        res = (sb.table("angle_ledger").update({"dims": dims})
+                 .eq("project_id", project_id).eq("angle_key", angle_key)
+                 .eq("dims->_draw->>b", str(batch_id))
+                 .is_("consumed_version_id", "null").execute())
+    except Exception as exc:                            # noqa: BLE001 — 发牌照发
+        logger.warning("relabel draw layer failed (project=%s, key=%s, batch=%s): %s", project_id, angle_key,
+                       batch_id, f"{type(exc).__name__}: {exc}"[:200])
+        return False
+    if not (res.data or []):
+        logger.warning("relabel draw layer matched no ledger row (project=%s, key=%s, batch=%s)", project_id,
+                       angle_key, batch_id)
+        return False
+    return True
+
+
 def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
                   *, user_id: str | None = None) -> bool:
     """把台账里这个角度标成已消耗。返回【是否真的改到了行】。
@@ -1179,23 +1201,69 @@ def ledger_layers(sb, project_id: str, keys) -> dict[str, str] | None:
     return {k: ly for k, (_at, ly) in best.items() if ly}
 
 
+def _consumed_layers(sb, project_id: str, vids: list[str]) -> tuple[dict[str, str], set[str]]:
+    """台账里销给这几版的行: (``{version_id: 贴型代号}``(那一行标了贴型的), 销过牌的 version_id(标没标都算))。读失败上抛。"""
+    out: dict[str, str] = {}
+    consumed: set[str] = set()
+    for i in range(0, len(vids), LAYER_LOOKUP_CHUNK):
+        chunk = vids[i:i + LAYER_LOOKUP_CHUNK]
+        rows = (sb.table("angle_ledger").select("consumed_version_id, dims")
+                  .eq("project_id", project_id).in_("consumed_version_id", chunk).execute()).data or []
+        for r in rows:
+            vid = str(r.get("consumed_version_id") or "")
+            if not vid:
+                continue
+            consumed.add(vid)
+            ly = _draw_layer(r.get("dims"))
+            if ly:
+                out[vid] = ly
+    return out, consumed
+
+
+def _lineage_layers(sb, project_id: str, vids: list[str]) -> dict[str, str]:
+    """自己没销过牌的几版(改稿重存的新版): 同一篇稿子(versions.item_id)别的版本销的那张卡的贴型(Codex review on aw#141)。
+    归属同 items_for_versions(``items!inner → batches!inner`` 再 ``.eq`` 上 project_id): 别的项目的版本查不出 item, 也就
+    没有这一步。一篇稿子有几版销过牌的(不该有: 改稿重存不销牌), 取版本号最小的那一版。读失败上抛。"""
+    items = items_for_versions(sb, project_id, vids)
+    by_item: dict[str, list[str]] = {}
+    for vid in vids:
+        hit = items.get(vid)
+        if hit and hit.get("item_id"):
+            by_item.setdefault(str(hit["item_id"]), []).append(vid)
+    if not by_item:
+        return {}
+    siblings = version_ids_of_items(sb, sorted(by_item))
+    order: dict[str, tuple[str, int]] = {}
+    for item_id, vs in siblings.items():
+        if str(item_id) not in by_item:
+            continue
+        for v in vs:
+            order[str(v["id"])] = (str(item_id), int(v.get("version_num") or 0))
+    sib_ids = sorted(v for v in order if v not in vids)
+    if not sib_ids:
+        return {}
+    layers, _consumed = _consumed_layers(sb, project_id, sib_ids)
+    best: dict[str, tuple[int, str]] = {}
+    for sid, ly in layers.items():
+        item_id, num = order[sid]
+        if item_id not in best or num < best[item_id][0]:
+            best[item_id] = (num, ly)
+    return {vid: best[item_id][1] for item_id, vs in by_item.items() if item_id in best for vid in vs}
+
+
 def version_layers(sb, project_id: str, version_ids) -> dict[str, str] | None:
     """这几版稿子的贴型: ``{version_id: 代号}``。check_rules 只拿到 version_id: 先找台账里销给它的那一行
-    (consumed_version_id), 没有的(改稿重存的新版不销牌)再按指纹行记的 angle_key 找那张卡(ledger_layers)。
-    没标贴型的不在里面。任一次读失败回 None(调用方照原来的方向闸查); 不抛。"""
+    (consumed_version_id); 自己没销过牌的(改稿重存的新版不销牌)找同一篇稿子别的版本销的那一行(_lineage_layers, Codex
+    review on aw#141: 那个 key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是重发那张); 还没有的再按指纹行记的
+    angle_key 找那张卡(ledger_layers)。没标贴型的不在里面。任一次读失败回 None(调用方照原来的方向闸查); 不抛。"""
     vids = list(dict.fromkeys(str(v) for v in (version_ids or []) if v))
     if not vids:
         return {}
-    out: dict[str, str] = {}
     try:
-        for i in range(0, len(vids), LAYER_LOOKUP_CHUNK):
-            chunk = vids[i:i + LAYER_LOOKUP_CHUNK]
-            rows = (sb.table("angle_ledger").select("consumed_version_id, dims")
-                      .eq("project_id", project_id).in_("consumed_version_id", chunk).execute()).data or []
-            for r in rows:
-                ly = _draw_layer(r.get("dims"))
-                if ly and r.get("consumed_version_id"):
-                    out[str(r["consumed_version_id"])] = ly
+        out, consumed = _consumed_layers(sb, project_id, vids)
+        never = [v for v in vids if v not in consumed]
+        if never:
+            out.update(_lineage_layers(sb, project_id, never))
         rest = [v for v in vids if v not in out]
         keys: dict[str, str] = {}
         for i in range(0, len(rest), LAYER_LOOKUP_CHUNK):

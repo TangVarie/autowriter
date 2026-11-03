@@ -586,3 +586,154 @@ def test_paid_boost_cache_is_single_flight(monkeypatch):
     for t in ts:
         t.join(5)
     assert len(reads) == 1 and got == [frozenset({"n1"})] * 3
+
+
+# ══════════════════════════════════════════════════════════════════════
+# F · RPC 跳过被并发抢走的主牌: 贴型对回写手要的篇数(Codex review on aw#141)
+# ══════════════════════════════════════════════════════════════════════
+
+def _race(monkeypatch, *, steal=3, seed=3, n=5, layer=None):
+    """同 _run, 只是 RPC 预留之前队友那一批先抢走了候选表里第 steal 张(台账多一行、一天内抽的、没写): RPC 跳过它,
+    顶上来的是表里下一张能用的。回 (回包, 那个世界, 被抢走的那张候选)。"""
+    prof = G.profile("run")
+    monkeypatch.delenv(core.DRAW_POLICY_ENV, raising=False)
+    monkeypatch.setattr(priors, "get_profile", lambda *a, **k: copy.deepcopy(prof))
+    monkeypatch.setattr(core, "flywheel_arm", lambda *a, **k: "patterns")
+    monkeypatch.setattr(dp, "_utcnow", lambda: G.FIXED)
+    w = G._World()
+    real, stolen = w._reserve, {}
+
+    def racing(args):
+        c = args["_candidates"][steal]
+        stolen.update(c)
+        w.client.rows["angle_ledger"].append({
+            "id": "teammate", "project_id": PID, "angle_key": c["angle_key"],
+            "dims": {**store.public_dims(c["dims"]), "_draw": {"b": "teammatebatch", "src": "w"}},
+            "drawn_by": "22222222-2222-2222-2222-222222222222", "drawn_at": G.FIXED.isoformat(),
+            "consumed_at": None, "consumed_version_id": None})
+        return real(args)
+    w.client.rpc_impl["deskcore_reserve_angles"] = racing
+    out = core.draw_angles(w.client, PID, n, user_id=ME, seed=seed, layer=layer)
+    return out, w, stolen
+
+
+def _batch_rows(w, batch) -> dict:
+    return {r["angle_key"]: r for r in w.client.rows["angle_ledger"] if r["dims"]["_draw"].get("b") == batch}
+
+
+def _updates(w) -> list[dict]:
+    return [c for c in w.client.calls if c["table"] == "angle_ledger" and c["op"] == "update"]
+
+
+def test_a_concurrently_taken_primary_does_not_change_the_requested_layer_counts(monkeypatch):
+    """Codex 的那一例: n=5、seed 3、{产品贴: 3, 流量贴: 2}, 第四张主牌(流量贴)被并发发牌抢走。RPC 顶上来的是第一档备牌
+    (带的是它自己槽位的产品贴), 原来回包说 5 篇都发了, 卡上却是 4 篇产品贴 + 1 篇流量贴。"""
+    out, w, stolen = _race(monkeypatch, layer={"产品贴": 3, "流量贴": 2})
+    cands = w.seen[0]
+    assert stolen["dims"]["_draw"]["i"] == 4 and stolen["dims"]["_draw"]["ly"] == "T", "抢走的是第四张主牌(流量贴)"
+    assert out["delivered"] == 5 and stolen["angle_key"] not in {a["angle_key"] for a in out["angles"]}
+    got = [a.get("layer") for a in out["angles"]]
+    assert got.count("产品贴") == 3 and got.count("流量贴") == 2
+    assert out["prompt_block"].count(LINES["P"]) == 3 and out["prompt_block"].count(LINES["T"]) == 2
+    # 顶上来的那张原来带的是产品贴(候选表里那一份不改), 现在是流量贴
+    filler = out["angles"][4]["angle_key"]
+    assert next(c for c in cands if c["angle_key"] == filler)["dims"]["_draw"]["ly"] == "P"
+    assert out["angles"][4]["layer"] == "流量贴"
+    # 台账: 这一批的五行跟着卡走, 只改了那一行; 队友那一行不动
+    rows = _batch_rows(w, out["policy"]["batch"])
+    assert set(rows) == {a["angle_key"] for a in out["angles"]}
+    assert {k: r["dims"]["_draw"].get("ly") for k, r in rows.items()} == \
+        {a["angle_key"]: vocab.layer_code(a["layer"]) for a in out["angles"]}
+    assert rows[filler]["dims"] == {**next(c for c in cands if c["angle_key"] == filler)["dims"],
+                                    "_draw": {**next(c for c in cands if c["angle_key"] == filler)["dims"]["_draw"],
+                                              "ly": "T"}}, "只换了 _draw.ly"
+    mate = next(r for r in w.client.rows["angle_ledger"] if r["id"] == "teammate")
+    assert mate["dims"]["_draw"] == {"b": "teammatebatch", "src": "w"}
+    ups = _updates(w)
+    assert len(ups) == 1
+    assert set(ups[0]["filters"]) == {("eq", "project_id", PID), ("eq", "angle_key", filler),
+                                      ("eq", "dims->_draw->>b", out["policy"]["batch"]),
+                                      ("is", "consumed_version_id", "null")}
+
+
+def test_without_a_race_the_mixed_draw_is_unchanged_and_writes_no_update(monkeypatch):
+    out, w = _run(monkeypatch, n=5, seed=3, layer={"产品贴": 3, "流量贴": 2})
+    assert [a.get("layer") for a in out["angles"]] == ["产品贴"] * 3 + ["流量贴"] * 2
+    assert _updates(w) == []
+
+
+@pytest.mark.parametrize("layer", [None, "产品贴"])
+def test_single_layer_and_no_layer_draws_never_rebalance(monkeypatch, layer):
+    """只有 {贴型: 篇数} 会走样: 一个贴型、没点名的, 被抢走一张也不改台账(rng 也不碰: 牌和没有这一步时一样)。"""
+    out, w, _stolen = _race(monkeypatch, layer=layer)
+    assert out["delivered"] == 5 and _updates(w) == []
+    want = [vocab.LAYER_NAME["P"]] * 5 if layer else [None] * 5
+    assert [a.get("layer") for a in out["angles"]] == want
+    monkeypatch.setattr(core, "_rebalance_layers", lambda reserved, *a: (reserved, []))
+    again, _w, _s = _race(monkeypatch, layer=layer)
+    assert again["angles"] == out["angles"] and again["prompt_block"] == out["prompt_block"]
+
+
+def test_the_non_atomic_path_rebalances_before_it_inserts(monkeypatch):
+    """RPC 不在(迁移没跑): 读-挑-插。第四张主牌在读避重集那一刻已经被队友抽了 —— 插进台账的行就已经对了, 不再 update。"""
+    prof = G.profile("run")
+    monkeypatch.delenv(core.DRAW_POLICY_ENV, raising=False)
+    monkeypatch.setattr(priors, "get_profile", lambda *a, **k: copy.deepcopy(prof))
+    monkeypatch.setattr(core, "flywheel_arm", lambda *a, **k: "patterns")
+    monkeypatch.setattr(dp, "_utcnow", lambda: G.FIXED)
+    built = {}
+    real_build = dp.build_candidates
+    monkeypatch.setattr(dp, "build_candidates", lambda *a, **k: built.setdefault("c", real_build(*a, **k)))
+    monkeypatch.setattr(store, "recent_angle_keys", lambda *a, **k: {built["c"][0][3]["angle_key"]})
+    c = FakeClient(rows={"projects": [G._project()], "angle_ledger": []})
+    out = core.draw_angles(c, PID, 5, user_id=ME, seed=3, layer={"产品贴": 3, "流量贴": 2})
+    assert out["atomic_reservation"] is False and out["delivered"] == 5
+    got = [a.get("layer") for a in out["angles"]]
+    assert got.count("产品贴") == 3 and got.count("流量贴") == 2
+    inserts = [q for q in c.calls if q["table"] == "angle_ledger" and q["op"] == "insert"]
+    assert len(inserts) == 1
+    assert [r["dims"]["_draw"].get("ly") for r in inserts[0]["payload"]] == [vocab.layer_code(x) for x in got]
+    assert not [q for q in c.calls if q["table"] == "angle_ledger" and q["op"] == "update"]
+
+
+def test_a_failed_relabel_never_blocks_the_draw(monkeypatch, caplog):
+    """台账那一行改不成(查询出错): 记 warning, 牌照发, 卡上照样是对过的贴型。"""
+    orig = FakeClient._execute
+
+    def flaky(self, q):
+        if q.table_name == "angle_ledger" and q.op == "update":
+            raise RuntimeError("statement timeout")
+        return orig(self, q)
+    monkeypatch.setattr(FakeClient, "_execute", flaky)
+    with caplog.at_level("WARNING"):
+        out, w, _stolen = _race(monkeypatch, layer={"产品贴": 3, "流量贴": 2})
+    got = [a.get("layer") for a in out["angles"]]
+    assert out["delivered"] == 5 and got.count("产品贴") == 3 and got.count("流量贴") == 2
+    assert "relabel draw layer failed" in caplog.text
+    assert store.relabel_draw_layer(FakeClient(rows={"angle_ledger": []}), PID, "k", "b", {}) is False
+
+
+@pytest.mark.parametrize("got,want,expect", [
+    (["P", "P", "P", "P", "T"], ["P", "P", "P", "T", "T"], ["P", "P", "P", "T", "T"]),     # Codex 的那一例
+    (["T", "P", "P", "T", "P"], ["P", "P", "P", "T", "T"], ["T", "P", "P", "T", "P"]),     # 篇数本来就对: 原样(位置不动)
+    (["P", "P", "P", "P"], ["P", "P", "P", "T", "T"], ["P", "P", "P", "T"]),               # 少发了一张: 有名字的先补
+    ([None, None, None], ["P", "T", None, None], [None, None, "P"]),
+    (["P", "P", "P", None, "P"], ["P", "P", "T", None, None], ["P", "P", "T", None, None]),  # 不标的那几篇也算数
+    (["T", "T", "T"], ["P", None, None], ["P", None, None]),
+    ([None, None, None], ["J", "Q", "T"], ["T", "Q", "J"]),                                 # 剩下的按 P T Q J 给
+    ([], ["P", "T"], []),
+])
+def test_rebalance_layers(got, want, expect):
+    before = list(got)
+    assert dp.rebalance_layers(got, want) == expect
+    assert got == before, "不改传进来的那一份"
+
+
+def test_rebalance_layers_with_the_draws_own_quota():
+    want = dp.slot_layers({"P": 3, "T": 2}, 5)
+    assert dp.rebalance_layers(["P"] * 5, want) == ["P", "P", "P", "T", "T"]
+    rep_want = dp.slot_layers({"P": 3, "T": 2}, 4, rep_layers=["T"])        # 重发的那张流量贴先抵账
+    assert sorted(dp.rebalance_layers(["T", "T", "P", "P"], rep_want)) == ["P", "P", "P", "T"]
+    for spec in (None, "P"):
+        rows = [{"angle_key": "k", "dims": {"_draw": {"ly": "T"}}}]
+        assert core._rebalance_layers(rows, spec, 1, []) == (rows, [])

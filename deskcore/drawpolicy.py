@@ -1246,6 +1246,32 @@ def slot_layers(spec, n_slots: int, rep_layers=()) -> list[str | None]:
     return seq + [None] * (n_slots - len(seq))
 
 
+def rebalance_layers(got, want) -> list[str | None]:
+    """真预留到的几张牌的贴型对回写手要的篇数(Codex review on aw#141)。RPC 跳过一张被并发发牌抢走的主牌时, 顶上来的是表里
+    下一张能用的(备牌 / 尾巴), 不一定是那个槽位自己的备牌, 而备牌带的是它自己槽位的贴型 —— 「3 篇产品贴 + 2 篇流量贴」会
+    变成 4 + 1, 回包还说 5 篇都发了。
+
+    got 是预留到的牌按先后的贴型(代号 / None), want 是 slot_layers 排的那一份(同一个 spec、同样的 n_rest 和重发的几张)。
+    还要这个贴型的牌留着; 多出来的(这个贴型已经够了)按先后拿剩下要的: 先是有名字的(按 P T Q J), 再是不标的。预留到的
+    比要的少时照样对: 有名字的先补齐。回一份和 got 一样长的新列表, 不改 got、不用随机数。"""
+    need: dict = {}
+    for ly in want or ():
+        need[ly] = need.get(ly, 0) + 1
+    out: list = []
+    misfits: list[int] = []
+    for i, ly in enumerate(got or ()):
+        if need.get(ly, 0) > 0:
+            need[ly] -= 1
+            out.append(ly)
+        else:
+            out.append(None)
+            misfits.append(i)
+    left = iter([c for c in vocab.LAYERS for _ in range(need.get(c, 0))] + [None] * need.get(None, 0))
+    for i in misfits:
+        out[i] = next(left, None)
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 贴合度(§5.2 的剂量-反应)
 # ══════════════════════════════════════════════════════════════════════

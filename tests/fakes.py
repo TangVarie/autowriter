@@ -222,7 +222,20 @@ class FakeClient:
         读跨表条件的标准写法(labeled_examples / legacy_versions / drafts_for_export
         都在用)。假件不认这个点号的话, 每一条这样的查询在测试里都**静默返回空**,
         而在真库里好好的 —— 于是"我的查询写对了没有"这件事测试根本管不到。
+
+        也认 PostgREST 的 JSON 路径 ``列->键->>键``(``->`` 取 JSON、``->>`` 取文本): store.relabel_draw_layer 按
+        ``dims->_draw->>b`` 筛这一批的那几行。不认的话这种过滤器在假件里静默匹配不上, 理由同上。
         """
+        if "->" in key:
+            import json as _json
+            import re as _re
+            parts = _re.split(r"(->>|->)", key)
+            cur = FakeClient._resolve(row, parts[0])
+            for op, k in zip(parts[1::2], parts[2::2]):
+                cur = cur.get(k) if isinstance(cur, dict) else None
+                if op == "->>" and cur is not None and not isinstance(cur, str):
+                    cur = _json.dumps(cur, ensure_ascii=False)
+            return cur
         cur = row
         for part in key.split("."):
             if not isinstance(cur, dict):

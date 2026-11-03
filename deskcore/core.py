@@ -936,6 +936,37 @@ def _repeat_items(client, project_id: str, repeat_of, n: int) -> tuple[list, dic
     return items, None
 
 
+def _rebalance_layers(reserved: list[dict], layer_spec, n_rest: int, rep_layers) -> tuple[list[dict], list[dict]]:
+    """预留到的牌的贴型对回写手要的篇数(Codex review on aw#141): RPC 跳过被并发抢走的主牌时, 顶上来的备牌 / 尾巴带的是
+    它自己槽位的贴型, 「各几篇」会走样(drawpolicy.rebalance_layers)。只有 {贴型: 篇数} 会走样: 一个贴型、没点名的原样回,
+    一步都不走(不碰台账、不碰 rng)。
+
+    回 (新的 reserved, 改了贴型的那几张)。改了的换成新的 dict(dims、_draw 都是新的, 不改 RPC 回来的那一份); 没改的原样。"""
+    if not isinstance(layer_spec, dict) or not reserved:
+        return reserved, []
+    got = [dp.layer_of(r.get("dims")) for r in reserved]
+    fixed = dp.rebalance_layers(got, dp.slot_layers(layer_spec, n_rest, rep_layers))
+    out: list[dict] = []
+    moved: list[dict] = []
+    for r, old, new in zip(reserved, got, fixed):
+        if new == old:
+            out.append(r)
+            continue
+        dims = dict(r.get("dims") or {})
+        d = dict(dims.get("_draw") or {})
+        if new:
+            d["ly"] = new
+        else:
+            d.pop("ly", None)
+        dims["_draw"] = d
+        r2 = {**r, "dims": dims}
+        out.append(r2)
+        moved.append(r2)
+    if moved:
+        logger.info("draw_angles: %d 张牌的贴型对回了写手要的篇数(RPC 顶上来的牌带的是别的槽位的贴型)", len(moved))
+    return out, moved
+
+
 def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
                 user_id: str | None = None, seed: int | None = None,
                 perpetual_bias: bool = False, pin: dict | None = None,
@@ -1079,7 +1110,14 @@ def draw_angles(client, project_id: str, n: int, *, avoid_days: int = 30,
         fresh = [c for c in candidates if c["angle_key"] not in avoid]
         # v1: 先去掉避重的再重排一次(这条路上知道哪些被挡, 错开得比 RPC 那条路还准); v2 的候选次序本身就是槽位次序
         reserved = (_spread_order(fresh, n_rest) if v1_path else fresh)[:n_rest]
+        # 贴型先对回写手要的篇数再插: 插进去的行就是对的(没点名「各几篇」时一步都不走)
+        reserved, _moved = _rebalance_layers(reserved, layer_spec, n_rest, rep_layers)
         store.record_draw(client, project_id, reserved, user_id)
+    else:
+        # RPC 已经插了行: 贴型对过的那几张, 台账上那一行跟着改(改不成只记 warning, 卡面照样用对过的贴型)
+        reserved, moved = _rebalance_layers(reserved, layer_spec, n_rest, rep_layers)
+        for r in moved:
+            store.relabel_draw_layer(client, project_id, r["angle_key"], batch, r["dims"])
 
     # ── 每张卡的附加项(§2.8: 每种来源同一条规矩) ──────────────────────────────────────────────────────
     # v1 / fb 照原来的随机抽(rng 的消耗次序不变); v2 的浓度、时效按项目自己的配比抽(向全局收缩), 抽到「通用」而没开
@@ -3779,21 +3817,38 @@ def _as_delivered(tpl: dict | None, drafts: list[dict]) -> tuple[list[dict], lis
     return [view for view, _tags in views], [tags for _view, tags in views]
 
 
-def _draft_layers(client, project_id: str, drafts: list[dict], indices: list[int]) -> dict[int, str]:
+def _draft_layers(client, project_id: str, drafts: list[dict], indices: list[int],
+                  replaced: dict[int, str] | None = None) -> dict[int, str]:
     """{第几篇: 贴型代号}: 每篇带的 angle_key → 本项目台账里那张卡的 _draw.ly(store.ledger_layers)。没带 key、卡没标贴型、
-    台账读不到的都不在里面 —— 那几篇照原来的口径(方向闸)查规则。不抛。"""
-    keys = {i: str(drafts[i].get("angle_key") or "").strip() for i in indices}
+    台账读不到的都不在里面 —— 那几篇照原来的口径(方向闸)查规则。不抛。
+
+    改稿重存的那几篇(``replaced``: {第几篇: 它替换的旧 version_id}, 核过的)先按旧版那条线找(store.version_layers: 旧版
+    销的那张卡, 或者同一篇稿子别的版本销的那张), 找不到才按 angle_key 找(Codex review on aw#141): 同一个 key 后来被
+    repeat_of 换了贴型重发过的话, 按 key 找到的是最新那张, 改的却是原来那篇。"""
+    out: dict[int, str] = {}
+    wanted = set(indices)
+    lineage = {i: str(v) for i, v in (replaced or {}).items() if i in wanted and v}
+    if lineage:
+        try:
+            by_vid = store.version_layers(client, project_id, sorted(set(lineage.values())))
+        except Exception:                               # noqa: BLE001 — 读数本不抛, 再兜一层
+            logger.warning("score_drafts: 按旧版查改稿的贴型失败(project=%s), 改稿按 angle_key 查", project_id,
+                           exc_info=True)
+            by_vid = None
+        out.update({i: by_vid[v] for i, v in lineage.items() if v in (by_vid or {})})
+    keys = {i: str(drafts[i].get("angle_key") or "").strip() for i in indices if i not in out}
     keys = {i: k for i, k in keys.items() if k}
     if not keys:
-        return {}
+        return out
     try:
         by_key = store.ledger_layers(client, project_id, sorted(set(keys.values())))
     except Exception:                                   # noqa: BLE001 — 读数本不抛, 再兜一层
         logger.warning("score_drafts: 查稿子的贴型失败(project=%s), 这批照原来的方向闸查规则", project_id, exc_info=True)
         by_key = None
     if not by_key:
-        return {}
-    return {i: by_key[k] for i, k in keys.items() if k in by_key}
+        return out
+    out.update({i: by_key[k] for i, k in keys.items() if k in by_key})
+    return out
 
 
 # 判定回来的 product_role(Jev 特征题「产品在稿子里是什么角色」)和卡上的贴型对不上时, 给那一篇的一句提示(只是参考, 不扣分、
@@ -4642,7 +4697,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     post_started = time.monotonic()
     # 贴型(2026-11-03): 每篇按它带的 angle_key 找台账里那张卡标的贴型, 查规则(带方向的跟着贴型走)和下面判定的提示都用它。
     # 查不到 / 没标就是 {}: 和原来一字不差
-    draft_layers = _draft_layers(client, project_id, drafts, sorted(inserted_idx))
+    # 改稿重存的那几篇先按它替换的旧版找(同一个 key 被 repeat_of 换了贴型重发过时, 按 key 找到的是重发那张)
+    draft_layers = _draft_layers(client, project_id, drafts, sorted(inserted_idx),
+                                 replaced={i: replace[i]["old_version_id"] for i in sorted(inserted_idx) if i in replace})
     # 改稿重存、真存进去了的那几篇 → 它们挂的旧 item: 有它们就把原来那一整批拼回来(挂旧 item 半途失败的那篇也算, 写手要的是
     # 改过的这一版换在原位)
     post_meta = _delivery_and_rule_checks(client, project, project_id, user_id, drafts, sorted(inserted_idx), out,
