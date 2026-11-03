@@ -494,17 +494,29 @@ def test_a_revision_keeps_the_layer_of_the_card_it_was_written_from(monkeypatch)
 
 def test_draft_layers_reads_the_old_version_first_and_falls_back_to_the_key(monkeypatch):
     asked = []
-    monkeypatch.setattr(store, "version_layers", lambda c, p, vids: asked.append(vids) or {"old-1": "P"})
+    monkeypatch.setattr(store, "resolve_version_layers",
+                        lambda c, p, vids: asked.append(vids) or ({"old-1": "P"}, {"old-1"}))
     monkeypatch.setattr(store, "ledger_layers", lambda c, p, keys: {"k": "T"})
     drafts = [{"angle_key": "k"}, {"angle_key": "k"}, {"angle_key": "k"}, {}]
     got = core._draft_layers(None, PROJ, drafts, [0, 1, 2, 3], replaced={0: "old-1", 1: "old-2", 9: "old-9"})
     assert got == {0: "P", 1: "T", 2: "T"}, "旧版那条线找不到的(old-2)才按 key 找"
     assert asked == [["old-1", "old-2"]], "只查这次存进去的那几篇"
-    monkeypatch.setattr(store, "version_layers", lambda *a: None)                # 读不到: 按 key
+    monkeypatch.setattr(store, "resolve_version_layers", lambda *a: None)       # 读不到: 按 key
     assert core._draft_layers(None, PROJ, drafts, [0, 1, 2, 3], replaced={0: "old-1"}) == {0: "T", 1: "T", 2: "T"}
     asked.clear()
-    monkeypatch.setattr(store, "version_layers", lambda c, p, vids: asked.append(vids) or {})
+    monkeypatch.setattr(store, "resolve_version_layers", lambda c, p, vids: asked.append(vids) or ({}, set()))
     assert core._draft_layers(None, PROJ, drafts, [0]) == {0: "T"} and asked == [], "没有改稿就不走旧版那条线"
+
+
+def test_draft_layers_does_not_fall_back_to_the_key_when_the_old_card_is_unlabelled(monkeypatch):
+    """旧版那条线上找到了卡、卡没标贴型(贴型上线之前抽的牌): 那一篇不标贴型(照原来的方向闸), 不按 key 拿重发那张的贴型;
+    那条线上压根没找到卡的才按 key 找。"""
+    monkeypatch.setattr(store, "resolve_version_layers",
+                        lambda c, p, vids: ({"old-1": "P"}, {"old-1", "old-2"}))
+    monkeypatch.setattr(store, "ledger_layers", lambda c, p, keys: {"k": "T"})
+    drafts = [{"angle_key": "k"}, {"angle_key": "k"}, {"angle_key": "k"}, {"angle_key": "k"}]
+    got = core._draft_layers(None, PROJ, drafts, [0, 1, 2, 3], replaced={0: "old-1", 1: "old-2", 2: "old-3"})
+    assert got == {0: "P", 2: "T", 3: "T"}, "old-2 定下来了、没标: 第 1 篇不标; old-3 没定下来: 按 key"
 
 
 ITEM = "dddddddd-0000-4000-8000-0000000000e1"
@@ -512,9 +524,10 @@ V_ORIG = "cccccccc-0000-4000-8000-0000000000e1"
 V_REV = "cccccccc-0000-4000-8000-0000000000e2"
 
 
-def _revision_client(*, rev_project=None):
+def _revision_client(*, rev_project=None, orig_ly="P"):
     """一篇稿子两版: V_ORIG 按产品贴的卡写、销了牌; V_REV 是改稿重存的新版(不销牌, 指纹行记着同一个 key)。同一个 key
-    后来被 repeat_of 换成流量贴重发过(台账多一行 ly=T, 抽得更晚、还没用)。"""
+    后来被 repeat_of 换成流量贴重发过(台账多一行 ly=T, 抽得更晚、还没用)。``orig_ly=None``: 原来那张卡没标贴型(贴型
+    上线之前抽的牌), V_ORIG 自己也有指纹行记着那个 key。"""
     mems = [R_PROD, R_TRAF, R_ALL, R_PROD_CODE, R_TRAF_CODE]
     comp = [stored(R_PROD, Q_PROD), stored(R_TRAF, Q_TRAF), stored(R_ALL, Q_ALL),
             stored(R_PROD_CODE, _code(R_PROD_CODE, "示例价格")), stored(R_TRAF_CODE, _code(R_TRAF_CODE, "示例渠道"))]
@@ -528,7 +541,8 @@ def _revision_client(*, rev_project=None):
     dims = dict(CELLS[0])
     k = angle_key(dims)
     c.rows["angle_ledger"] = [
-        {"id": "orig", "project_id": CPROJ, "angle_key": k, "dims": {**dims, "_draw": {"src": "w", "ly": "P"}},
+        {"id": "orig", "project_id": CPROJ, "angle_key": k,
+         "dims": {**dims, "_draw": {"src": "w", **({"ly": orig_ly} if orig_ly else {})}},
          "drawn_by": ME, "drawn_at": "2026-10-01T00:00:00+00:00", "consumed_version_id": V_ORIG,
          "consumed_at": "2026-10-02T00:00:00+00:00"},
         {"id": "reissue", "project_id": CPROJ, "angle_key": k,
@@ -536,6 +550,9 @@ def _revision_client(*, rev_project=None):
          "drawn_by": ME, "drawn_at": "2026-11-02T00:00:00+00:00", "consumed_version_id": None, "consumed_at": None}]
     c.rows["draft_fingerprints"] = [{"project_id": CPROJ, "version_id": V_REV, "angle_key": k,
                                      "created_at": "2026-11-02T00:00:00+00:00"}]
+    if orig_ly is None:
+        c.rows["draft_fingerprints"].insert(0, {"project_id": CPROJ, "version_id": V_ORIG, "angle_key": k,
+                                                "created_at": "2026-10-02T00:00:00+00:00"})
     return c, k
 
 
@@ -570,3 +587,73 @@ def test_check_rules_on_a_revised_version_uses_the_original_cards_layer(wired):
     row = out["versions"][0]
     assert row["layer"] == "产品贴"
     assert _rule_ids(row) == sorted([R_PROD["id"], R_ALL["id"], R_PROD_CODE["id"]])
+
+
+# ══════════════════════════════════════════════════════════════════════
+# I · 原来那张卡没标贴型(贴型上线之前抽的牌), 那个 key 后来被 repeat_of 标上贴型重发: 原来那篇和它的改稿都不跟着换方向
+# ══════════════════════════════════════════════════════════════════════
+
+def test_an_unlabelled_original_keeps_its_rules_after_the_key_is_reissued_with_a_layer(monkeypatch):
+    """原来那篇按没标贴型的卡写、存档销了牌(方向闸: 产品向项目 → 产品向 + 通用); 后来同一个 key 点名重发成流量贴。
+    原来那一版查贴型还是没标(不按 key 拿重发那张的 T), 改它的那一版照原来的方向闸查; 按重发那张写的新稿才是流量贴。"""
+    from deskcore import priors
+    from tests.test_delivery_revision import _embed
+    c, keys = _client(None)
+    c.rows["angle_ledger"][0]["drawn_at"] = "2026-10-01T00:00:00+00:00"
+    drafts = distinct_drafts(2, seed=7)
+    first = core.commit_drafts(c, PROJ, [{**drafts[0], "angle_key": keys[0]}], user_id=ME)
+    assert first["consumed_angles"] == 1 and _by_draft(first) == {0: ["m-1", "m-3", "m-4"]}
+    v1 = first["version_ids"][0]
+
+    monkeypatch.setattr(priors, "get_profile", lambda *a, **k: priors.uniform_profile(PROJ))
+    rep = core.draw_angles(c, PROJ, 1, user_id=ME, repeat_of=[keys[0]], layer="流量贴")
+    assert rep["delivered"] == 1 and rep["angles"][0]["layer"] == "流量贴"
+    assert store.ledger_layers(c, PROJ, [keys[0]]) == {keys[0]: "T"}, "反证: 按 key 找到的是重发那张"
+    assert store.version_layers(c, PROJ, [v1]) == {}, "原来那一版销的那张卡没标: 就是没标"
+    assert store.resolve_version_layers(c, PROJ, [v1]) == ({}, {v1})
+
+    _embed(c)
+    revised = {**drafts[0], "body": drafts[0]["body"] + "后来补了一句。", "angle_key": keys[0], "replaces_version_id": v1}
+    out = core.commit_drafts(c, PROJ, [revised, {**drafts[1], "angle_key": keys[0]}], user_id=ME)
+    assert out["written"] == 2 and out["replaced"]
+    assert _by_draft(out) == {0: ["m-1", "m-3", "m-4"],        # 改原来那篇: 照原来的方向闸, 和原来那一版一样
+                              1: ["m-2", "m-4"]}               # 按重发那张写的新稿: 流量贴(流量向 + 通用)
+    v_new = out["version_ids"][1]
+    assert store.version_layers(c, PROJ, [v1, v_new]) == {v_new: "T"}, "重发那张销给新稿: 新稿是流量贴, 原来那一版照旧"
+    # 改稿那一版(自己不销牌)走同一篇稿子别的版本那条线: 见 test_version_layers_settles_an_unlabelled_consumed_card_...
+
+
+def test_version_layers_settles_an_unlabelled_consumed_card_for_the_version_and_its_revision():
+    c, k = _revision_client(orig_ly=None)
+    assert store.ledger_layers(c, CPROJ, [k]) == {k: "T"}, "反证: 按指纹行的 key 找到的是重发那张"
+    assert store.version_layers(c, CPROJ, [V_ORIG]) == {}, "自己销的那张没标: 不按 key 找"
+    assert store.version_layers(c, CPROJ, [V_REV]) == {}, "同一篇稿子别的版本销的那张没标: 不按 key 找"
+    assert store.resolve_version_layers(c, CPROJ, [V_ORIG, V_REV]) == ({}, {V_ORIG, V_REV})
+    # 原来那张标了的: 照旧
+    c2, _k = _revision_client()
+    assert store.resolve_version_layers(c2, CPROJ, [V_ORIG, V_REV]) == ({V_ORIG: "P", V_REV: "P"}, {V_ORIG, V_REV})
+    # 别的项目的版本查不出 item: 没定下来, 照原来按指纹行的 key 找
+    c3, _k = _revision_client(rev_project="aaaaaaaa-0000-0000-0000-00000000ffff", orig_ly=None)
+    assert store.resolve_version_layers(c3, CPROJ, [V_REV]) == ({V_REV: "T"}, set())
+
+
+def test_lineage_takes_the_lowest_numbered_consumed_version_even_when_it_is_unlabelled():
+    """一篇稿子几版都销过牌(不该有): 取版本号最小的那一版那张卡 —— 它没标贴型就是没标, 不跳到后面标了的那一版。"""
+    c, k = _revision_client(orig_ly=None)
+    v3 = "cccccccc-0000-4000-8000-0000000000e3"
+    c.rows["versions"].append({**c.rows["versions"][1], "id": v3, "version_num": 3})
+    c.rows["angle_ledger"].append({"id": "late", "project_id": CPROJ, "angle_key": k,
+                                   "dims": {**CELLS[0], "_draw": {"src": "w", "ly": "T"}}, "drawn_by": ME,
+                                   "drawn_at": "2026-11-01T00:00:00+00:00", "consumed_version_id": v3,
+                                   "consumed_at": "2026-11-01T00:00:00+00:00"})
+    assert store.resolve_version_layers(c, CPROJ, [V_REV]) == ({}, {V_REV})
+
+
+def test_check_rules_on_an_unlabelled_original_and_its_revision_uses_the_direction_gate(wired):
+    c, _k = _revision_client(orig_ly=None)
+    out = core.check_rules(c, CPROJ, [V_ORIG, V_REV], user_id=ME)
+    banks = _banks(wired)
+    assert set(banks) == {V_ORIG, V_REV} and banks[V_ORIG] == banks[V_REV], "两版同一个题库(原来的方向闸)"
+    for row in out["versions"]:
+        assert "layer" not in row
+        assert _rule_ids(row) == sorted([R_PROD["id"], R_ALL["id"], R_PROD_CODE["id"]])

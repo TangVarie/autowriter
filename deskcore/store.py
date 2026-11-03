@@ -1220,10 +1220,13 @@ def _consumed_layers(sb, project_id: str, vids: list[str]) -> tuple[dict[str, st
     return out, consumed
 
 
-def _lineage_layers(sb, project_id: str, vids: list[str]) -> dict[str, str]:
+def _lineage_layers(sb, project_id: str, vids: list[str]) -> tuple[dict[str, str], set[str]]:
     """自己没销过牌的几版(改稿重存的新版): 同一篇稿子(versions.item_id)别的版本销的那张卡的贴型(Codex review on aw#141)。
     归属同 items_for_versions(``items!inner → batches!inner`` 再 ``.eq`` 上 project_id): 别的项目的版本查不出 item, 也就
-    没有这一步。一篇稿子有几版销过牌的(不该有: 改稿重存不销牌), 取版本号最小的那一版。读失败上抛。"""
+    没有这一步。一篇稿子有几版销过牌的(不该有: 改稿重存不销牌), 取版本号最小的那一版 —— 那张卡标没标贴型都是它。
+
+    回 (``{version_id: 贴型代号}``(那张卡标了贴型的), 同一篇稿子有别的版本销过牌的 version_id(那张卡标没标都算: 这几版
+    的贴型就是那张卡的, 不再按 key 找))。读失败上抛。"""
     items = items_for_versions(sb, project_id, vids)
     by_item: dict[str, list[str]] = {}
     for vid in vids:
@@ -1231,7 +1234,7 @@ def _lineage_layers(sb, project_id: str, vids: list[str]) -> dict[str, str]:
         if hit and hit.get("item_id"):
             by_item.setdefault(str(hit["item_id"]), []).append(vid)
     if not by_item:
-        return {}
+        return {}, set()
     siblings = version_ids_of_items(sb, sorted(by_item))
     order: dict[str, tuple[str, int]] = {}
     for item_id, vs in siblings.items():
@@ -1241,30 +1244,49 @@ def _lineage_layers(sb, project_id: str, vids: list[str]) -> dict[str, str]:
             order[str(v["id"])] = (str(item_id), int(v.get("version_num") or 0))
     sib_ids = sorted(v for v in order if v not in vids)
     if not sib_ids:
-        return {}
-    layers, _consumed = _consumed_layers(sb, project_id, sib_ids)
-    best: dict[str, tuple[int, str]] = {}
-    for sid, ly in layers.items():
+        return {}, set()
+    layers, consumed = _consumed_layers(sb, project_id, sib_ids)
+    first: dict[str, tuple[int, str, str | None]] = {}
+    for sid in consumed:
+        if sid not in order:
+            continue
         item_id, num = order[sid]
-        if item_id not in best or num < best[item_id][0]:
-            best[item_id] = (num, ly)
-    return {vid: best[item_id][1] for item_id, vs in by_item.items() if item_id in best for vid in vs}
+        if item_id not in first or (num, sid) < first[item_id][:2]:
+            first[item_id] = (num, sid, layers.get(sid))
+    out = {vid: first[item_id][2] for item_id, vs in by_item.items()
+           if item_id in first and first[item_id][2] for vid in vs}
+    settled = {vid for item_id, vs in by_item.items() if item_id in first for vid in vs}
+    return out, settled
 
 
-def version_layers(sb, project_id: str, version_ids) -> dict[str, str] | None:
-    """这几版稿子的贴型: ``{version_id: 代号}``。check_rules 只拿到 version_id: 先找台账里销给它的那一行
-    (consumed_version_id); 自己没销过牌的(改稿重存的新版不销牌)找同一篇稿子别的版本销的那一行(_lineage_layers, Codex
-    review on aw#141: 那个 key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是重发那张); 还没有的再按指纹行记的
-    angle_key 找那张卡(ledger_layers)。没标贴型的不在里面。任一次读失败回 None(调用方照原来的方向闸查); 不抛。"""
+def _settled_layers(sb, project_id: str, vids: list[str]) -> tuple[dict[str, str], set[str]]:
+    """台账里定得下来的那几版: 自己销过牌的(销给它的那一行), 自己没销过、同一篇稿子别的版本销过的(_lineage_layers)。
+    回 (``{version_id: 贴型代号}``(那张卡标了贴型的), 定下来了的 version_id(那张卡标没标都算))。读失败上抛。"""
+    out, own = _consumed_layers(sb, project_id, vids)
+    never = [v for v in vids if v not in own]
+    lineage: set[str] = set()
+    if never:
+        got, lineage = _lineage_layers(sb, project_id, never)
+        out.update(got)
+    return out, own | lineage
+
+
+def resolve_version_layers(sb, project_id: str, version_ids) -> tuple[dict[str, str], set[str]] | None:
+    """这几版稿子的贴型, 连同哪几版是台账里那张卡定下来的: ``({version_id: 代号}, {定下来了的 version_id})``。
+
+    先找台账里销给它的那一行(consumed_version_id); 自己没销过牌的(改稿重存的新版不销牌)找同一篇稿子别的版本销的那一行
+    (_lineage_layers, Codex review on aw#141: 那个 key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是重发那张)。
+    这两步找到了那张卡就定了 —— 卡没标贴型也定了(没标就是没标, 不在 dict 里, 但在定下来的那一组里): 贴型上线之前抽的牌
+    都没标, 那个 key 后来被 repeat_of 标上贴型重发, 按 key 找到的是重发那张, 原来那篇和它的改稿不能跟着它换方向。
+    两步都找不到的(没销过牌、同一篇稿子也没有)才按指纹行记的 angle_key 找那张卡(ledger_layers), 这几版不算定下来了。
+
+    任一次读失败回 None(调用方照原来的方向闸查); 不抛。"""
     vids = list(dict.fromkeys(str(v) for v in (version_ids or []) if v))
     if not vids:
-        return {}
+        return {}, set()
     try:
-        out, consumed = _consumed_layers(sb, project_id, vids)
-        never = [v for v in vids if v not in consumed]
-        if never:
-            out.update(_lineage_layers(sb, project_id, never))
-        rest = [v for v in vids if v not in out]
+        out, settled = _settled_layers(sb, project_id, vids)
+        rest = [v for v in vids if v not in settled]
         keys: dict[str, str] = {}
         for i in range(0, len(rest), LAYER_LOOKUP_CHUNK):
             chunk = rest[i:i + LAYER_LOOKUP_CHUNK]
@@ -1283,7 +1305,16 @@ def version_layers(sb, project_id: str, version_ids) -> dict[str, str] | None:
         if by_key is None:
             return None
         out.update({vid: by_key[k] for vid, k in keys.items() if k in by_key})
-    return out
+    return out, settled
+
+
+def version_layers(sb, project_id: str, version_ids) -> dict[str, str] | None:
+    """这几版稿子的贴型: ``{version_id: 代号}``(resolve_version_layers 的第一项)。check_rules 只拿到 version_id: 先找
+    台账里销给它的那一行, 自己没销过牌的找同一篇稿子别的版本销的那一行 —— 找到了就是它, 那张卡没标贴型就是没标(不再按
+    key 找: 那个 key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是重发那张); 两步都找不到的才按指纹行记的
+    angle_key 找那张卡(ledger_layers)。没标贴型的不在里面。任一次读失败回 None(调用方照原来的方向闸查); 不抛。"""
+    got = resolve_version_layers(sb, project_id, version_ids)
+    return None if got is None else got[0]
 
 
 # ── 成稿指纹库 ────────────────────────────────────────────────────────────

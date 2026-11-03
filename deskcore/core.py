@@ -3822,21 +3822,25 @@ def _draft_layers(client, project_id: str, drafts: list[dict], indices: list[int
     """{第几篇: 贴型代号}: 每篇带的 angle_key → 本项目台账里那张卡的 _draw.ly(store.ledger_layers)。没带 key、卡没标贴型、
     台账读不到的都不在里面 —— 那几篇照原来的口径(方向闸)查规则。不抛。
 
-    改稿重存的那几篇(``replaced``: {第几篇: 它替换的旧 version_id}, 核过的)先按旧版那条线找(store.version_layers: 旧版
-    销的那张卡, 或者同一篇稿子别的版本销的那张), 找不到才按 angle_key 找(Codex review on aw#141): 同一个 key 后来被
-    repeat_of 换了贴型重发过的话, 按 key 找到的是最新那张, 改的却是原来那篇。"""
+    改稿重存的那几篇(``replaced``: {第几篇: 它替换的旧 version_id}, 核过的)先按旧版那条线找(store.resolve_version_layers:
+    旧版销的那张卡, 或者同一篇稿子别的版本销的那张), 那条线上找不到卡的才按 angle_key 找(Codex review on aw#141): 同一个
+    key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是最新那张, 改的却是原来那篇。那条线上找到了卡、卡却没标贴型
+    (贴型上线之前抽的牌都这样)也算找到了: 这一篇不标贴型、照原来的方向闸查, 不按 key 拿重发那张的贴型。"""
     out: dict[int, str] = {}
+    settled: set[int] = set()
     wanted = set(indices)
     lineage = {i: str(v) for i, v in (replaced or {}).items() if i in wanted and v}
     if lineage:
         try:
-            by_vid = store.version_layers(client, project_id, sorted(set(lineage.values())))
+            got = store.resolve_version_layers(client, project_id, sorted(set(lineage.values())))
         except Exception:                               # noqa: BLE001 — 读数本不抛, 再兜一层
             logger.warning("score_drafts: 按旧版查改稿的贴型失败(project=%s), 改稿按 angle_key 查", project_id,
                            exc_info=True)
-            by_vid = None
-        out.update({i: by_vid[v] for i, v in lineage.items() if v in (by_vid or {})})
-    keys = {i: str(drafts[i].get("angle_key") or "").strip() for i in indices if i not in out}
+            got = None
+        by_vid, final = got if got is not None else ({}, set())
+        out.update({i: by_vid[v] for i, v in lineage.items() if v in by_vid})
+        settled = {i for i, v in lineage.items() if v in final}
+    keys = {i: str(drafts[i].get("angle_key") or "").strip() for i in indices if i not in out and i not in settled}
     keys = {i: k for i, k in keys.items() if k}
     if not keys:
         return out
@@ -7573,7 +7577,8 @@ def _layer_group(layer: str | None) -> str | None:
 
 
 def _version_layers(client, project_id: str, version_ids: list[str]) -> dict[str, str]:
-    """{version_id: 贴型代号}(store.version_layers: 台账里销给它的那张卡, 或者指纹行记的 angle_key 那张卡)。读不到当都没标。"""
+    """{version_id: 贴型代号}(store.version_layers: 台账里销给它的那张卡, 或者同一篇稿子别的版本销的那张; 都没有才按指纹行
+    记的 angle_key 找那张卡)。读不到当都没标。"""
     try:
         got = store.version_layers(client, project_id, version_ids)
     except Exception:                                   # noqa: BLE001 — 读数本不抛, 再兜一层
