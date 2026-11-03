@@ -452,7 +452,7 @@ def test_an_ingested_link_is_not_a_direction():
     assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
 
 
-# ── 夜里没对上时先去掉明摆着不是它的(2026-11-03): 暂时不用的项目 / 别的表的本家 ──────────────────────
+# ── 夜里没对上时先去掉暂时不用的项目(2026-11-03); 这张表的本家归档了也留着, 别的表的本家不去(复审 11-03) ──────────────────────
 ARCHIVED_PARAMS = '{"archived": true}'
 FOURTH_PROJ = "dddddddd-0000-0000-0000-000000000004"
 
