@@ -1253,10 +1253,14 @@ def rebalance_layers(got, want) -> list[str | None]:
 
     got 是预留到的牌按先后的贴型(代号 / None), want 是 slot_layers 排的那一份(同一个 spec、同样的 n_rest 和重发的几张)。
     还要这个贴型的牌留着; 多出来的(这个贴型已经够了)按先后拿剩下要的: 先是有名字的(按 P T Q J), 再是不标的。预留到的
-    比要的少时照样对: 有名字的先补齐。回一份和 got 一样长的新列表, 不改 got、不用随机数。"""
+    比要的少时有名字的先补齐: 少了几张, 不标的那几篇就先少要几篇再去留牌 —— got=[None]*3、want=[P, T, None, None]
+    回 [None, P, T], 不是留下两张不标的、只补一张 P。回一份和 got 一样长的新列表, 不改 got、不用随机数。"""
     need: dict = {}
     for ly in want or ():
         need[ly] = need.get(ly, 0) + 1
+    short = len(want or ()) - len(got or ())
+    if short > 0 and need.get(None, 0) > 0:
+        need[None] = max(need[None] - short, 0)
     out: list = []
     misfits: list[int] = []
     for i, ly in enumerate(got or ()):

@@ -413,7 +413,8 @@ def test_external_pool_carries_prod_only_when_jev_answered():
     rows = [ext_row(posted_days=5 + i, comments=200 + 37 * i) for i in range(14)]
     roles = ["主角", "解决方案", "未出现", "只暗示", "顺带一提", "看不出", None]
     answers = {r["note_id"]: ({"product_role": roles[i % 7]} if roles[i % 7] else {}) for i, r in enumerate(rows)}
-    out = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=())
+    one_median = {**priors.PARAMS, "ext_family_min_n": 99}      # 两族都退回全品类的中位数: 这里只看 prod 这个字段
+    out = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=(), params=one_median)
     base = priors.external_pool(rows, {}, category="运动补给", now=PNOW, registered=())
     assert out["pool"] and [e["ref"] for e in out["pool"]] == [e["ref"] for e in base["pool"]], "只多一个字段, 池子不变"
     assert out["eligible"] == base["eligible"] and out["age_ok"] == base["age_ok"]
@@ -423,6 +424,79 @@ def test_external_pool_carries_prod_only_when_jev_answered():
         assert e.get("prod") == want and (want is not None or "prod" not in e)
     assert all("prod" not in e for e in base["pool"])
     assert "product_role" in priors.EXT_QIDS
+
+
+def _family_rows(o_comments, p_comments):
+    """抓取时帖龄 10 天(日均评论 = 评论数 / 10)。O 族一半答了「未出现」、一半没答 product_role; P 族一半主角一半解决方案。"""
+    rows, answers = [], {}
+    for i, c in enumerate(o_comments):
+        r = ext_row(posted_days=11, comments=c)
+        rows.append(r)
+        answers[r["note_id"]] = {"product_role": "未出现"} if i % 2 else {"opening_type": "身份自述"}
+    p_rows = []
+    for i, c in enumerate(p_comments):
+        r = ext_row(posted_days=11, comments=c)
+        rows.append(r)
+        p_rows.append(r)
+        answers[r["note_id"]] = {"product_role": "解决方案" if i % 2 else "主角"}
+    return rows, answers, p_rows
+
+
+def _vel_of(out):
+    return {e["ref"][4:]: e["velocity"] for e in out["pool"]}
+
+
+def test_external_pool_keeps_a_product_post_above_its_family_median():
+    """产品在正文里出场的帖(P 族)评论本来就少: 和同一族比, 低于全品类中位数也留得下(老板 11-03 定的)。"""
+    rows, answers, p_rows = _family_rows(range(100, 200, 10), (20, 30, 40, 50, 60, 70))   # O 10–19/天, P 2–7/天
+    out = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=())
+    assert out["age_ok"] == 16 and out["median_velocity"] == pytest.approx(11.5)
+    assert out["family_median_velocity"] == {"P": pytest.approx(4.5), "O": pytest.approx(14.5)}
+    kept = _vel_of(out)
+    p6 = p_rows[4]["note_id"]                                       # 6/天: 低于全品类的 11.5, 高于 P 族的 4.5
+    assert kept[p6] == pytest.approx(6.0)
+    assert sorted(v for k, v in kept.items() if k in {r["note_id"] for r in p_rows}) == pytest.approx([5.0, 6.0, 7.0])
+    assert sorted(v for k, v in kept.items() if k not in {r["note_id"] for r in p_rows}) == pytest.approx(
+        [15.0, 16.0, 17.0, 18.0, 19.0]), "O 族(没答的也在里面)按自己的中位数 14.5 切"
+    assert out["eligible"] == 8 == len(out["pool"])
+    e = next(e for e in out["pool"] if e["ref"] == f"ext:{p6}")
+    assert e["w"] == pytest.approx(6.0 ** 0.5) and e["prod"] == 1, "权重照样 √日均评论, 不打折"
+    today = priors.external_pool(rows, {}, category="运动补给", now=PNOW, registered=())
+    assert p6 not in _vel_of(today) and min(_vel_of(today).values()) >= 11.5, "原来一个中位数时 P 族一篇都留不下"
+
+
+def test_external_pool_small_family_falls_back_to_the_category_median():
+    rows, answers, p_rows = _family_rows(range(100, 200, 10), (30, 60, 125, 185))         # P 只有 4 篇: 3 / 6 / 12.5 / 18.5
+    out = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=())
+    assert out["median_velocity"] == pytest.approx(13.5)
+    assert out["family_median_velocity"] == {"P": pytest.approx(13.5), "O": pytest.approx(14.5)}
+    kept = _vel_of(out)
+    p_ids = {r["note_id"] for r in p_rows}
+    assert sorted(v for k, v in kept.items() if k in p_ids) == pytest.approx([18.5]), "不满 5 篇: P 族按全品类的 13.5 切"
+    loose = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=(),
+                                 params={**priors.PARAMS, "ext_family_min_n": 4})
+    assert loose["family_median_velocity"]["P"] == pytest.approx(9.25)
+    assert sorted(v for k, v in _vel_of(loose).items() if k in p_ids) == pytest.approx([12.5, 18.5]), "门槛在参数里"
+    assert priors.PARAMS["ext_family_min_n"] == 5
+
+
+@pytest.mark.parametrize("strip", ["no_answers", "no_role", "unusable_role"])
+def test_external_pool_without_product_role_is_one_median_as_before(strip):
+    rows, answers, _p = _family_rows(range(100, 200, 10), (20, 30, 40, 50, 60, 70))
+    if strip == "no_answers":
+        answers = {}
+    elif strip == "no_role":
+        answers = {k: {q: v for q, v in a.items() if q != "product_role"} for k, a in answers.items()}
+    else:
+        answers = {k: {**a, "product_role": "看不出"} for k, a in answers.items()}
+    out = priors.external_pool(rows, answers, category="运动补给", now=PNOW, registered=())
+    assert "family_median_velocity" not in out and all("prod" not in e for e in out["pool"])
+    med = out["median_velocity"]
+    assert med == pytest.approx(11.5)
+    vel = {r["note_id"]: r["comments"] / 10.0 for r in rows}
+    assert set(_vel_of(out)) == {k for k, v in vel.items() if v >= med}, "整个品类没答 product_role: 照原来一个中位数切"
+    bare = priors.external_pool(rows, {}, category="运动补给", now=PNOW, registered=())
+    assert set(out) == set(bare) and [(e["ref"], e["w"]) for e in out["pool"]] == [(e["ref"], e["w"]) for e in bare["pool"]]
 
 
 def _hit_rows():
@@ -717,7 +791,8 @@ def test_a_failed_relabel_never_blocks_the_draw(monkeypatch, caplog):
     (["P", "P", "P", "P", "T"], ["P", "P", "P", "T", "T"], ["P", "P", "P", "T", "T"]),     # Codex 的那一例
     (["T", "P", "P", "T", "P"], ["P", "P", "P", "T", "T"], ["T", "P", "P", "T", "P"]),     # 篇数本来就对: 原样(位置不动)
     (["P", "P", "P", "P"], ["P", "P", "P", "T", "T"], ["P", "P", "P", "T"]),               # 少发了一张: 有名字的先补
-    ([None, None, None], ["P", "T", None, None], [None, None, "P"]),
+    ([None, None, None], ["P", "T", None, None], [None, "P", "T"]),                        # 少发了: 不标的先少要
+    ([None, "T", None], ["P", "T", None, None], [None, "T", "P"]),
     (["P", "P", "P", None, "P"], ["P", "P", "T", None, None], ["P", "P", "T", None, None]),  # 不标的那几篇也算数
     (["T", "T", "T"], ["P", None, None], ["P", None, None]),
     ([None, None, None], ["J", "Q", "T"], ["T", "Q", "J"]),                                 # 剩下的按 P T Q J 给

@@ -79,6 +79,9 @@ PARAMS: dict = {
     # 外部参考(§2.5)
     "ext_min_age_days": 3, "ext_max_age_days": 90, "ext_scrape_days": 45, "ext_ok_min": 5,
     "ext_velocity_floor_days": 3,
+    # 日均评论的中位数按族分开算(2026-11-03): 正文里产品出场(Jev product_role 主角 / 解决方案)的帖本来就少评论;
+    # 一族不满这么多篇时那一族用全品类的中位数
+    "ext_family_min_n": 5,
     # 本项目起量帖(§2.5)
     "hit_min_comments": 10, "hit_top_frac": 0.10,
     "hit_own_age": (2, 21), "hit_brand_age": (2, 45), "hit_own_weight": 3.0, "hit_brand_weight": 1.0,
@@ -795,17 +798,38 @@ def _median(xs: list[float]) -> float | None:
     return s[m] if len(s) % 2 else (s[m - 1] + s[m]) / 2.0
 
 
+def _ext_family(a: dict) -> str:
+    """外部帖分哪一族比日均评论: P = Jev 的 product_role 是主角 / 解决方案, 其余(包括没答的)是 O。"""
+    return "P" if str((a or {}).get("product_role") or "").strip() in vocab.PRODUCT_PRESENT else "O"
+
+
+def _family_medians(cands, ans: dict, med: float | None, params: dict) -> dict[str, float | None] | None:
+    """每一族的日均评论中位数(在全部帖龄合格的帖上算, 和全品类那个一样)。一族不满 ext_family_min_n 篇用全品类的;
+    整个品类一篇 product_role 都没答(读挂了 / 没抓)回 None —— 调用方照原来只用一个中位数。"""
+    roles = vocab.PRODUCT_PRESENT | vocab.PRODUCT_ABSENT
+    if not any(str((ans.get(c[1]) or {}).get("product_role") or "").strip() in roles for c in cands):
+        return None
+    vels: dict[str, list[float]] = {"P": [], "O": []}
+    for c in cands:
+        vels[_ext_family(ans.get(c[1]) or {})].append(c[5])
+    n_min = int(params["ext_family_min_n"])
+    return {f: (_median(xs) if len(xs) >= n_min else med) for f, xs in vels.items()}
+
+
 def external_pool(rows, answers, *, category: str | None = None, now: datetime | None = None,
                   registered=None, params: dict = PARAMS) -> dict:
     """外部同品类帖 → 参考池(只留结构)。
 
     · 发帖时间从 note_id 解; 抓取时帖龄 3–90 天、近 45 天抓的;
     · 不像广告(ad_like 不是 true)、Jev 的 efficacy_promise 不是「是」、标题里没点到我们登记的品牌;
-    · 日均评论 = 评论数 / max(抓取时帖龄, 3), 不低于这个品类 3–90 天帖的中位数; 不设前 N 名的上限。
+    · 日均评论 = 评论数 / max(抓取时帖龄, 3), 不低于它那一族 3–90 天帖的中位数; 不设前 N 名的上限。族(2026-11-03,
+      老板定的): Jev 的 product_role 是主角 / 解决方案的算 P(正文里产品出场, 评论本来就少), 其余(包括没答的)算 O,
+      各自取中位数; 一族不满 ext_family_min_n 篇就用全品类的中位数; 整个品类一篇 product_role 都没答(读挂了 / 没抓)
+      就和原来一样只有一个中位数。
     每条: ref("ext:<id>") / w(√日均评论, 抽签权重) / velocity / posted_days_ago / title_structure(Jev 的问句答案优先)
     / desc(开头类型、转折、结尾问读者、求助、亲历)/ prod(2026-11-03: Jev 的 product_role 答了才有 —— 1 产品出场了
-    (主角 / 解决方案), 0 没出场(未出现 / 只暗示 / 顺带一提); 发牌按卡的贴型优先挑哪一档, 只是优先、不筛, 池子和 ext_ok
-    的篇数都不变)。标题本身不出这个函数。"""
+    (主角 / 解决方案), 0 没出场(未出现 / 只暗示 / 顺带一提); 发牌按卡的贴型优先挑哪一档, 只是优先、不筛, 权重不打折,
+    ext_ok 的篇数照样数这个池子)。标题本身不出这个函数。"""
     now = now or _utcnow()
     reg = tuple(registered if registered is not None else registered_brands())
     ans = answers or {}
@@ -832,6 +856,7 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
         vel = comments / max(age, float(params["ext_velocity_floor_days"]))
         cands.append((r, nid, posted, age, comments, vel))
     med = _median([c[5] for c in cands])
+    fam_med = _family_medians(cands, ans, med, params)
     pool = []
     for r, nid, posted, age, comments, vel in cands:
         a = ans.get(nid) or {}
@@ -842,7 +867,8 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
         title = str(r.get("title") or "")
         if any(b and b in title.lower() for b in reg):
             continue
-        if med is not None and vel < med:
+        cut = fam_med[_ext_family(a)] if fam_med else med
+        if cut is not None and vel < cut:
             continue
         isq = answer_bool(a.get("title_is_question"))
         ts_class = vocab.classify_title(title, isq) or (QUESTION if isq is True else None)
@@ -882,6 +908,8 @@ def external_pool(rows, answers, *, category: str | None = None, now: datetime |
         "scraped": len(rows),
         "age_ok": len(cands),
         "median_velocity": None if med is None else round(med, 3),
+        **({"family_median_velocity": {f: None if v is None else round(v, 3) for f, v in fam_med.items()}}
+           if fam_med else {}),
         "eligible": len(pool),
         "pool": pool,
         "title_shares": title_shares,
