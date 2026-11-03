@@ -644,6 +644,7 @@ def test_style_issues_are_found(text, expect):
     "V计划和途鸽哪个好", "步伐太快了", "砍伐", "我也是...", "涨了3.5个点", "问下 HC 多不多", "vlog做得好",
     "阿拉伯语专业能投吗", "真滴有用吗", "简历第一行写的什么呀", "",
     "还需要额外添加微量元素吗", "这个会不会影响老师的威信", "增加微调的空间",   # codex review on aw#143: 常用词不算
+    "迪卡侬那款也行", "吴侬软语", "阿拉巴马", "阿拉比卡豆", "Liquid I.V.好喝吗",   # 复审 aw#143: 品牌 / 地名 / 缩写不算
 ])
 def test_style_leaves_ordinary_text_alone(text):
     assert core.comment_style_issues(text) == []

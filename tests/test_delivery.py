@@ -770,3 +770,27 @@ def test_long_whitespace_does_not_make_url_detection_quadratic():
     start = time.monotonic()
     assert validator.topic_tags(' ' * 100000 + '#秋招') == ['#秋招']
     assert time.monotonic() - start < 2.0
+
+
+# ── 跟着笔记交付的评论也守写法底线(commentstyle, 2026-11-03; 复审 aw#143: 原来只有单独写评论那条路查) ──────────────
+def test_note_attached_comments_get_the_comment_style_floor():
+    tpl = {"layout": "blocks", "comments": {"min": 1, "max": 3, "label_reader": "读者：", "label_author": "作者："}}
+    out = delivery.assemble(tpl, [{"title": "甲", "body": "正文。", "comments": [
+        {"role": "reader", "text": "午休靠一会儿腰就松了。"},
+        {"role": "reader", "text": "有啥方法伐"},
+        {"role": "author", "text": "可以的，加v聊"},
+        {"role": "reader", "text": "这个怎么选呀"}]}])
+    whats = [p["what"] for p in out["problems"] if p["index"] == 0]
+    assert any(w.startswith("第 1 条评论: 去掉句号") for w in whats)
+    assert any(w.startswith("第 2 条评论: 「伐」") for w in whats)
+    assert any(w.startswith("第 3 条评论: 去掉「加v」") for w in whats)
+    assert not any(w.startswith("第 4 条评论:") for w in whats), "干净的那条不报"
+    assert not any("正文" in w and "句号" in w for w in whats), "正文里的句号不管"
+    assert "读者：午休靠一会儿腰就松了。" in out["text"], "交付稿照原样拼, 只报问题、不偷偷改"
+
+
+def test_the_brief_tells_note_writers_the_comment_style_floor():
+    req = delivery.requirements({"layout": "blocks", "comments": {"min": 1, "max": 2, "label_reader": "读者：",
+                                                                  "label_author": "作者："}})
+    assert "评论不用句号" in req["task"] and "加微" in req["task"]
+    assert "评论不用句号" not in delivery.requirements({"layout": "blocks"})["task"], "模板不管评论就不说"

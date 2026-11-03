@@ -56,7 +56,7 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
-from . import delivery, rulecheck, rulecompile
+from . import commentstyle, delivery, rulecheck, rulecompile
 from . import drawpolicy as dp
 from . import fingerprint as fp
 from . import priors, project_now, store, structure, tvlink, vocab
@@ -3179,47 +3179,12 @@ COMMENT_SCORE_NOTE = ("评论检查: 只判不写库。passed=true 且 needs_rev
                       "needs_review=true 交人工核实, 不能改成伪造的亲历。judge_status 不是 ok 就说这次没判成, 不能说通过。")
 
 
-# ── 评论的写法底线, 所有项目都管(2026-11-03) ──────────────────────────────────────────────────────
-# owner:「写作台加一条，把句号去掉」「修正一下方言的语气……最好不需要人工再来改」「这个v是个啥」。代码查、不靠模型自觉:
-# score_comments 判之前先查这三样, 有一样那条就算没过(style_fix 里写清改哪儿), 模型按协议自己改一轮, 写手不用动手。
-# comments_for 也把这三句放进回包(style), 先别写出来。只管评论, 不管笔记正文。
-# 途鸽那批的「v」「伐」是项目里一条旧硬规则要「按比例混入」的(网络缩写 v、方言词「伐」), 句号是另一条「所有文案必须含句号」;
-# 那两条规则的改法另给 owner SQL。这里是整个写作台的底线, 项目规则说要也不行。
-# 「v」在小红书评论里多半是「加 v / vx = 微信」, 像在要联系方式(引流), 平台会判违规; 不是网感。
-COMMENT_STYLE_LINES = (
-    "评论里不用句号: 句末不加, 句中要停顿用逗号或空格",
-    "口语用普通话口语, 不用方言语气词(伐、侬、阿拉)",
-    "不写 v、vx、加微这类像在要联系方式的字(像引流, 平台会判违规)",
-)
-# 句号: 全角「。」哪里都不要; 半角只管句末那一个点(「...」省略号不算; 3.5 的点不在句末, 本来就不算, 「今年28.」算)
-_STYLE_PERIOD = re.compile(r"。|(?<!\.)\.\s*$")
-# 「伐」只认句末 / 标点前的语气词用法(步伐、讨伐、砍伐不算); 「阿拉」不认阿拉伯、阿拉斯加这类
-_STYLE_DIALECT = re.compile(r"(?<![步讨砍征攻杀])伐(?=[\s？?！!，,。.~～…]|$)|侬|阿拉(?![伯斯丁善])")
-# 单独一个 v(前后不是字母数字, 后面是标点、空格或结尾; 「V计划」这种后面接汉字的不算)、加微信 / 加v / 加vx、vx、wx、薇信、v我。
-# 「加微」只认要联系方式的说法: 前面不是添 / 增 / 参 / 附……(添加微量元素), 光一个「微」时后面得是标点、结尾或语气字;
-# 「威信」是常用词(老师的威信), 不查。
-_STYLE_CONTACT = re.compile(
-    r"(?i)(?<![a-z0-9])v(?=[\s。.，,！!？?~～…]|$)"
-    r"|(?<![添增参附施追叠倍更])加\s*(?:个\s*)?(?:微信|vx|wx|v(?![a-z]))"
-    r"|(?<![添增参附施追叠倍更])加\s*(?:个\s*)?微(?=[\s。.，,！!？?~～…吧呀呢哈了聊我吗啊么嘛]|$)"
-    r"|(?<![a-z])(?:vx|wx)(?![a-z])|薇信|(?<![a-z])v我")
+# ── 评论的写法底线, 所有项目都管(2026-11-03, 见 deskcore/commentstyle.py) ──────────────────────────────
+# 单独写评论这条路: comments_for 回包带 style, score_comments 判之前先查(style_fix)。跟着笔记交付的评论在 delivery 里查。
+COMMENT_STYLE_LINES = commentstyle.LINES
+comment_style_issues = commentstyle.issues
 COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字), 和 fix 一样算没过: 照着改, "
                            "不用问用户。")
-
-
-def comment_style_issues(text: str) -> list[str]:
-    """一条评论 → 写法底线上要改的地方(空表 = 没问题)。只看文字, 不调模型。"""
-    t = text or ""
-    out = []
-    if _STYLE_PERIOD.search(t):
-        out.append("去掉句号: 句末不加, 句中要停顿用逗号或空格")
-    dialect = "".join(f"「{w}」" for w in dict.fromkeys(m.group(0) for m in _STYLE_DIALECT.finditer(t)))
-    if dialect:
-        out.append(f"{dialect}是方言语气词, 换成普通话口语(比如「吗」「呀」), 或者不要")
-    contact = "".join(f"「{w}」" for w in dict.fromkeys(m.group(0).strip() for m in _STYLE_CONTACT.finditer(t)))
-    if contact:
-        out.append(f"去掉{contact}: 像在要联系方式, 平台会判引流")
-    return out
 
 
 def _style_block(cands: list[dict], style: list[list[str]]) -> dict:
