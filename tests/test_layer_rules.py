@@ -241,13 +241,20 @@ def test_score_drafts_without_layers_is_exactly_the_old_gate(monkeypatch):
     assert "layered" not in c.rows["batch_metrics"][0]["meta"]["rule_checks"]
 
 
-def test_a_ledger_read_failure_falls_back_to_the_old_gate(monkeypatch):
-    monkeypatch.setattr(store, "ledger_layers", lambda *a, **k: None)
+@pytest.mark.parametrize("broken,want", [
+    (("ledger_layers", "resolve_version_layers"), ["m-1", "m-3", "m-4"]),   # 台账两条路都读不到: 原来的方向闸
+    (("resolve_version_layers",), ["m-2", "m-4"]),                          # 只是按版本那条读不到: 按 angle_key 找(T)
+    (("ledger_layers",), ["m-2", "m-4"]),                                   # 按 key 那条读不到: 销了牌的按销的那一行找
+])
+def test_a_ledger_read_failure_falls_back_to_the_old_gate(monkeypatch, broken, want):
+    for name in broken:
+        monkeypatch.setattr(store, name, lambda *a, **k: None)
     c, keys = _client("T")
     drafts = distinct_drafts(1)
     drafts[0]["angle_key"] = keys[0]
     out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
-    assert _by_draft(out) == {0: ["m-1", "m-3", "m-4"]}
+    assert out["written"] == 1 and out["consumed_angles"] == 1, "读不到贴型不影响存档"
+    assert _by_draft(out) == {0: want}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -657,3 +664,109 @@ def test_check_rules_on_an_unlabelled_original_and_its_revision_uses_the_directi
     for row in out["versions"]:
         assert "layer" not in row
         assert _rule_ids(row) == sorted([R_PROD["id"], R_ALL["id"], R_PROD_CODE["id"]])
+
+
+# ══════════════════════════════════════════════════════════════════════
+# J · 新稿的贴型按它销的那一行找, 不按 key 找最近抽的那一行(Codex review on aw#141)
+# ══════════════════════════════════════════════════════════════════════
+
+def _two_open_rows(c) -> tuple[str, str]:
+    """台账里同一个 key 两行都没销: 早先那张产品贴没写、占坑过期了, 同一个角度后来又按流量贴发了一次(抽得更晚)。两行都是
+    调用者自己抽的 —— consume_angle 销最早那一行(P), ledger_layers 按 key 找的是最近抽的那一行(T)。回 (key, 早先那行的 id)。"""
+    first = c.rows["angle_ledger"][0]
+    first["drawn_at"] = "2026-10-01T00:00:00+00:00"
+    again = {**first, "id": "l0-again", "drawn_at": "2026-11-02T00:00:00+00:00",
+             "dims": {**first["dims"], "_draw": {**first["dims"]["_draw"], "ly": "T"}}}
+    c.rows["angle_ledger"].append(again)
+    return first["angle_key"], first["id"]
+
+
+def _make_checkable(c, vids: list[str]) -> None:
+    """同一个 client 接着跑 check_rules: 存档建出来的版本行补上归属(假件不连表), 加几条编译好的带方向规则(本项目的)。"""
+    for v in c.rows["versions"]:
+        if v["id"] in vids:
+            v["items"] = {"id": v["item_id"], "batches": {"project_id": PROJ}}
+    mems = [{**r, "project_id": PROJ} for r in (R_PROD, R_TRAF, R_ALL, R_PROD_CODE, R_TRAF_CODE)]
+    c.rows["memories"] += mems
+    c.rows["rule_compiles"] = [stored(mems[0], Q_PROD), stored(mems[1], Q_TRAF), stored(mems[2], Q_ALL),
+                               stored(mems[3], _code(R_PROD_CODE, "示例价格")),
+                               stored(mems[4], _code(R_TRAF_CODE, "示例渠道"))]
+    c.rows["tv_project_map"] = [{"tv_project_id": "DEMO_phase1", "project_id": PROJ, "ingest_target": True}]
+    c.rows["truth_vault.projects"] = [{"project_id": "DEMO_phase1", "category": "示例品类"}]
+
+
+def test_a_new_draft_takes_the_layer_of_the_row_it_consumed_and_check_rules_agrees(wired):
+    """Codex 那个场景原样: 同一个 key 台账里一行 P(早, 没写)、一行 T(晚), 都没销。存档销的是 P 那一行, score_drafts 查规则
+    就照产品贴查(原来按 key 找到 T、照流量贴查); 之后对同一版调 check_rules(按销给它的那一行找)也是产品贴 —— 两边同一个方向。"""
+    c, _keys = _client("P")
+    k, p_row = _two_open_rows(c)
+    assert store.ledger_layers(c, PROJ, [k]) == {k: "T"}, "反证: 按 key 找到的是最近抽的那一行"
+    drafts = distinct_drafts(1, seed=11)
+    drafts[0].update(angle_key=k, body=drafts[0]["body"] + "顺手提到示例价格和示例渠道。")
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert out["written"] == 1 and out["consumed_angles"] == 1
+    vid = out["version_ids"][0]
+    rows = {r["id"]: r for r in c.rows["angle_ledger"]}
+    assert rows[p_row]["consumed_version_id"] == vid and rows["l0-again"]["consumed_version_id"] is None
+    assert _by_draft(out) == {0: ["m-1", "m-3", "m-4"]}, "产品贴: 产品向 + 通用(不是流量贴的 m-2 / m-4)"
+    assert store.version_layers(c, PROJ, [vid]) == {vid: "P"}
+
+    _make_checkable(c, [vid])
+    wired.calls.clear()
+    got = core.check_rules(c, PROJ, [vid], user_id=ME)
+    qid = {r["id"]: q["questions"][0]["qid"] for r, q in ((R_PROD, Q_PROD), (R_TRAF, Q_TRAF), (R_ALL, Q_ALL))}
+    assert _banks(wired) == {vid: sorted([qid[R_PROD["id"]], qid[R_ALL["id"]]])}, "check_rules 也是产品贴的题库"
+    row = got["versions"][0]
+    assert row["version_id"] == vid and row["layer"] == "产品贴"
+    assert _rule_ids(row) == sorted([R_PROD["id"], R_ALL["id"], R_PROD_CODE["id"]]), "编出来的 code 也只查产品向那一组"
+
+
+def test_a_new_draft_that_consumed_an_unlabelled_row_does_not_take_the_keys_later_layer():
+    """销的那一行没标贴型(贴型上线之前抽的牌), 同一个 key 后来按流量贴又发了一次、还没销: 这一篇不标贴型, 照原来的方向闸查,
+    和 check_rules(version_layers 回 {})一样; 不按 key 拿 T。"""
+    c, _keys = _client(None)
+    k, p_row = _two_open_rows(c)
+    assert store.ledger_layers(c, PROJ, [k]) == {k: "T"}
+    drafts = distinct_drafts(1, seed=12)
+    drafts[0]["angle_key"] = k
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    vid = out["version_ids"][0]
+    assert {r["id"]: r for r in c.rows["angle_ledger"]}[p_row]["consumed_version_id"] == vid
+    assert _by_draft(out) == {0: ["m-1", "m-3", "m-4"]}, "没标: 方向闸(产品向项目)"
+    assert store.version_layers(c, PROJ, [vid]) == {}
+    assert "layered" not in c.rows["batch_metrics"][0]["meta"]["rule_checks"], "一篇都没标: 和原来一字不差"
+
+
+def test_a_new_draft_whose_consumption_missed_falls_back_to_the_key(monkeypatch):
+    """销账没销成(并发抢先之类)的新稿: 台账里没有销给它的那一行, 照原来按 angle_key 找(check_rules 那边同样按指纹行的 key
+    找, 还是同一张)。"""
+    monkeypatch.setattr(store, "consume_angle", lambda *a, **k: False)
+    c, keys = _client("T")
+    drafts = distinct_drafts(1, seed=13)
+    drafts[0]["angle_key"] = keys[0]
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert out["consumed_angles"] == 0
+    vid = out["version_ids"][0]
+    assert _by_draft(out) == {0: ["m-2", "m-4"]}
+    assert store.version_layers(c, PROJ, [vid]) == {vid: "T"}
+
+
+def test_draft_layers_reads_consumed_new_drafts_by_version(monkeypatch):
+    asked = []
+    monkeypatch.setattr(store, "resolve_version_layers",
+                        lambda c, p, vids: asked.append(vids) or ({"new-1": "P", "old-1": "J"},
+                                                                  {"new-1", "new-2", "old-1"}))
+    monkeypatch.setattr(store, "ledger_layers", lambda c, p, keys: {"k": "T"})
+    drafts = [{"angle_key": "k"} for _ in range(5)]
+    got = core._draft_layers(None, PROJ, drafts, [0, 1, 2, 3, 4], replaced={3: "old-1"},
+                             consumed={0: "new-1", 1: "new-2", 2: "new-3", 9: "new-9"})
+    assert got == {0: "P", 2: "T", 3: "J", 4: "T"}, \
+        "销给 new-1 的那行是 P; new-2 定下来了、没标: 不按 key; new-3 没定下来、没销牌的第 4 篇: 按 key"
+    assert asked == [["new-1", "new-2", "new-3", "old-1"]], "改稿的旧版和销了牌的新版一次查, 只查这次存进去的几篇"
+    monkeypatch.setattr(store, "resolve_version_layers", lambda *a: None)       # 读不到: 都按 key
+    assert core._draft_layers(None, PROJ, drafts, [0, 1], consumed={0: "new-1", 1: "new-2"}) == {0: "T", 1: "T"}
+
+    def boom(*a):
+        raise RuntimeError("statement timeout")
+    monkeypatch.setattr(store, "resolve_version_layers", boom)                  # 抛了也不冒泡: 按 key
+    assert core._draft_layers(None, PROJ, drafts, [0], consumed={0: "new-1"}) == {0: "T"}

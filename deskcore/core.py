@@ -3818,23 +3818,31 @@ def _as_delivered(tpl: dict | None, drafts: list[dict]) -> tuple[list[dict], lis
 
 
 def _draft_layers(client, project_id: str, drafts: list[dict], indices: list[int],
-                  replaced: dict[int, str] | None = None) -> dict[int, str]:
-    """{第几篇: 贴型代号}: 每篇带的 angle_key → 本项目台账里那张卡的 _draw.ly(store.ledger_layers)。没带 key、卡没标贴型、
-    台账读不到的都不在里面 —— 那几篇照原来的口径(方向闸)查规则。不抛。
+                  replaced: dict[int, str] | None = None,
+                  consumed: dict[int, str] | None = None) -> dict[int, str]:
+    """{第几篇: 贴型代号}: 每篇那张卡在本项目台账里标的 _draw.ly。没带 key、卡没标贴型、台账读不到的都不在里面 —— 那几篇照
+    原来的口径(方向闸)查规则。不抛。和 check_rules(store.version_layers)走同一条路, 同一篇两边查的是同一张卡:
 
-    改稿重存的那几篇(``replaced``: {第几篇: 它替换的旧 version_id}, 核过的)先按旧版那条线找(store.resolve_version_layers:
-    旧版销的那张卡, 或者同一篇稿子别的版本销的那张), 那条线上找不到卡的才按 angle_key 找(Codex review on aw#141): 同一个
-    key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是最新那张, 改的却是原来那篇。那条线上找到了卡、卡却没标贴型
-    (贴型上线之前抽的牌都这样)也算找到了: 这一篇不标贴型、照原来的方向闸查, 不按 key 拿重发那张的贴型。"""
+    · 这次销了牌的新稿(``consumed``: {第几篇: 销给它的 version_id}, 销账那一步真改到了行的)按销给它的那一行找
+      (store.resolve_version_layers)。不按 angle_key 找(Codex review on aw#141): 一张没用过的产品贴占坑过期, 同一个角度
+      又按流量贴发了一次, 台账里这个 key 就有两行没销的 —— consume_angle 销的是调用者最早那一行(P), 按 key 找到的是最近
+      抽的那一行(T), 存档查的和 check_rules 查的就成了相反的方向;
+    · 改稿重存的那几篇(``replaced``: {第几篇: 它替换的旧 version_id}, 核过的)按旧版那条线找(旧版销的那张卡, 或者同一篇
+      稿子别的版本销的那张): 同一个 key 后来被 repeat_of 换了贴型重发过的话, 按 key 找到的是最新那张, 改的却是原来那篇。
+
+    这两条线上找到了卡、卡却没标贴型(贴型上线之前抽的牌都这样)也算找到了: 这一篇不标贴型、照原来的方向闸查, 不按 key 拿
+    别的那张的贴型。这两条线上都找不到卡的(没销成牌的新稿、旧版那条线上没有卡的改稿)才按 angle_key 找(store.ledger_layers:
+    最近抽的那一行)。"""
     out: dict[int, str] = {}
     settled: set[int] = set()
     wanted = set(indices)
     lineage = {i: str(v) for i, v in (replaced or {}).items() if i in wanted and v}
+    lineage.update({i: str(v) for i, v in (consumed or {}).items() if i in wanted and v and i not in lineage})
     if lineage:
         try:
             got = store.resolve_version_layers(client, project_id, sorted(set(lineage.values())))
         except Exception:                               # noqa: BLE001 — 读数本不抛, 再兜一层
-            logger.warning("score_drafts: 按旧版查改稿的贴型失败(project=%s), 改稿按 angle_key 查", project_id,
+            logger.warning("score_drafts: 按版本查稿子的贴型失败(project=%s), 这几篇按 angle_key 查", project_id,
                            exc_info=True)
             got = None
         by_vid, final = got if got is not None else ({}, set())
@@ -4362,6 +4370,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             attempted = 0
             unminted_angles = 0      # 身份没建成、所以**没销账**的角度(见下面那段)
             missed_keys: dict[int, str] = {}     # 送去销账却没销成的: 下标 → key(W-31, 下面分清是不是 key 本身错了)
+            consumed_vids: dict[int, str] = {}   # 销成了的: 下标 → 销给它的 version_id(查规则按销的那一行找贴型)
             for i, d in enumerate(drafts):
                 if i not in inserted_idx or i in replace:   # 替换: 旧版入库时已经销过
                     continue
@@ -4387,6 +4396,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 # 未消耗行, 销账要销自己那一条(codex review on #86)。
                 if store.consume_angle(client, project_id, key, vid, user_id=user_id):
                     consumed += 1
+                    consumed_vids[i] = str(vid)
                 else:
                     missed_keys[i] = str(key)
             lap = _lap(commit_parts, "consume", lap)
@@ -4699,11 +4709,13 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # 单记一段 delivery_rules(codex review on aw#115): 规则那次查询是翻页读的, 库慢的时候不是几十毫秒; 不单记的话
     # 这段时间哪一段都不算, 判定被扣掉的那截预算也查不出是谁花的。
     post_started = time.monotonic()
-    # 贴型(2026-11-03): 每篇按它带的 angle_key 找台账里那张卡标的贴型, 查规则(带方向的跟着贴型走)和下面判定的提示都用它。
-    # 查不到 / 没标就是 {}: 和原来一字不差
-    # 改稿重存的那几篇先按它替换的旧版找(同一个 key 被 repeat_of 换了贴型重发过时, 按 key 找到的是重发那张)
+    # 贴型(2026-11-03): 每篇找台账里那张卡标的贴型, 查规则(带方向的跟着贴型走)和下面判定的提示都用它。查不到 / 没标就是 {}:
+    # 和原来一字不差。销账在上面锁里已经做完了: 销成了牌的新稿按销给它的那一行找, 改稿重存的那几篇按它替换的旧版找 —— 和
+    # check_rules 同一条路(同一个 key 台账里有两行没销的 / 被 repeat_of 换了贴型重发过时, 按 key 找到的是最近抽的那张);
+    # 两条线上都没有卡的才按 angle_key 找
     draft_layers = _draft_layers(client, project_id, drafts, sorted(inserted_idx),
-                                 replaced={i: replace[i]["old_version_id"] for i in sorted(inserted_idx) if i in replace})
+                                 replaced={i: replace[i]["old_version_id"] for i in sorted(inserted_idx) if i in replace},
+                                 consumed=consumed_vids)
     # 改稿重存、真存进去了的那几篇 → 它们挂的旧 item: 有它们就把原来那一整批拼回来(挂旧 item 半途失败的那篇也算, 写手要的是
     # 改过的这一版换在原位)
     post_meta = _delivery_and_rule_checks(client, project, project_id, user_id, drafts, sorted(inserted_idx), out,
