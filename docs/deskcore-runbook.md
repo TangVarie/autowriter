@@ -810,7 +810,7 @@ key 支持两种传法（`X-Deskcore-Key` 头、`Authorization: Bearer`），见
 > - **加一个写手 = 在 `DESKCORE_KEYS` 里加一行**（`user_id` 填团队身份），不建项目、不改 `owner_id`。步骤见下面「加一个写手」。
 > - ❌ 给新人一个全新 UUID：他**一个项目都打不开**，`list_projects` 回空列表、**不报错**，写手只会觉得写作台是空的。
 > - 团队身份的 UUID **不写进本仓**（公开仓）：从 Railway 上现有那几行抄，认前 8 位 `85f5f888…`。要从库里查，带上项目名：
->   `select owner_id, string_agg(name, '、') from autowriter.projects where name in ('途鸽', 'sportsix', '百健士成人藻油') group by 1;`
+>   `select owner_id, string_agg(name, '、') from autowriter.projects where name in ('途鸽', 'sportsix', '百健士成人藻油') group by 1 having count(*) = 3;`（三个名字都在的那一个；别的 owner 名下也有叫「途鸽」的旧项目）
 >   ⚠️ 别按「项目最多」认：另一个 owner 名下有 30 个旧项目，填成它 `list_projects` 不是空的、而是一堆旧项目，下面「回空列表 = 填错了」那条就不灵了。
 >
 > 口径与"改成团队共享要改哪儿"见 `docs/deskcore.md` §2.2.1。
@@ -834,7 +834,7 @@ key 一旦在聊天窗口、截图、工单里出现过，就当它已经泄露 
 `service_role` 绕过 RLS，一把有效 key 等于那个人名下**全部项目数据 + 全部
 工具（含写）**。轮换是唯一的补救。
 
-**只漏了一把**（某个写手的钥匙出现在聊天 / 截图里）：不用全换。按下面第一步的脚本只给她生成一行，在 Railway 的 `DESKCORE_KEYS` 里**只替换她那一行**（别的行不动），`/health` 的条数不变、`auth.ok` 是 true，新钥匙私发给她。别人不受影响。下面四步是**整份 `DESKCORE_KEYS` 或好几把都可能漏了**时用的。
+**只漏了一把**（某个写手的钥匙出现在聊天 / 截图里）：不用全换。按下面第一步的脚本只给她生成一行，在 Railway 的 `DESKCORE_KEYS` 里**只换她那一行的钥匙串**（引号里 `k-…` 那一段；她的 `name` / `user_id` 和前后的逗号、括号都不动，别把脚本输出整行贴过去 —— 末尾那个逗号贴在最后一行会让整份 JSON 坏掉、全员 401），`/health` 的条数不变、`auth.ok` 是 true，新钥匙私发给她。别人不受影响。下面四步是**整份 `DESKCORE_KEYS` 或好几把都可能漏了**时用的。
 
 **第一步：生成新钥匙，钥匙值不经过对话。**
 
@@ -852,14 +852,22 @@ EOF
 
 自己本地跑最稳：脚本只吐字符串到屏幕，不联网、不落盘。
 
-要 Claude 生成也行（11-03 加写手就是这么做的），但输出必须**直接重定向进文件**，对话里只能出现文件路径、不能出现内容：
-`(umask 077; python - > <仓库外的路径>/deskcore-keys.txt <<'EOF' … EOF)`。你从文件里拷到 Railway，拷完删掉文件。
+要 Claude 生成也行（11-03 加写手就是这么做的），但输出必须**直接重定向进文件**，对话里只能出现文件路径、不能出现内容（`EOF` 和 `)` 各占一行，写在一行里 bash 会报语法错）：
+
+```bash
+(umask 077; python - > <仓库外的路径>/deskcore-keys.txt <<'EOF'
+<第一步那段脚本>
+EOF
+)
+```
+
+你从文件里拷到 Railway，拷完删掉文件。
 钥匙一旦在聊天记录、工具输出、截图里出现过，就等于又漏了一次 —— 那正是轮换要堵的洞。
 
 **第二步**：把输出拼成 JSON（去掉最后一个逗号），整体替换 Railway 上的
 `DESKCORE_KEYS`，等服务重启。
 
-**第三步**：`curl -s <服务地址>/health | grep auth` 确认 `note` 的条数和你配的一样（11-03 起是 `4 key(s)`）、`auth.ok` 是 true。条数少了，先看是不是第一步漏了谁；`auth.ok` 是 false 或全员 401 就是 JSON 写坏了 —— 注意 `_key_map()` 是 **fail-closed** 的：
+**第三步**：`curl -s <服务地址>/health | grep auth` 确认 `note` 的条数和你配的一样（11-03 起是 `4 key(s)`）、`auth.ok` 是 true。条数少了，先看是不是第一步漏了谁；`auth.ok` 是 false 就是 JSON 写坏了（`note` 里写了原因）。`auth.ok` 是 true 而写手 401，是她手上还是旧钥匙 —— 第四步发完才好。注意 `_key_map()` 是 **fail-closed** 的：
 解析失败一律 401，不会退化成"没配"（那曾经等于匿名全开，见 ROB-003）。
 
 **第四步**：把新 key 分别发给本人，**一人一把，不要群发**。旧 key 在第二步
