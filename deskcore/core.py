@@ -3179,6 +3179,51 @@ COMMENT_SCORE_NOTE = ("评论检查: 只判不写库。passed=true 且 needs_rev
                       "needs_review=true 交人工核实, 不能改成伪造的亲历。judge_status 不是 ok 就说这次没判成, 不能说通过。")
 
 
+# ── 评论的写法底线, 所有项目都管(2026-11-03) ──────────────────────────────────────────────────────
+# owner:「写作台加一条，把句号去掉」「修正一下方言的语气……最好不需要人工再来改」「这个v是个啥」。代码查、不靠模型自觉:
+# score_comments 判之前先查这三样, 有一样那条就算没过(style_fix 里写清改哪儿), 模型按协议自己改一轮, 写手不用动手。
+# comments_for 也把这三句放进回包(style), 先别写出来。只管评论, 不管笔记正文。
+# 途鸽那批的「v」「伐」是项目里一条旧硬规则要「按比例混入」的(网络缩写 v、方言词「伐」), 句号是另一条「所有文案必须含句号」;
+# 那两条规则的改法另给 owner SQL。这里是整个写作台的底线, 项目规则说要也不行。
+# 「v」在小红书评论里多半是「加 v / vx = 微信」, 像在要联系方式(引流), 平台会判违规; 不是网感。
+COMMENT_STYLE_LINES = (
+    "评论里不用句号: 句末不加, 句中要停顿用逗号或空格",
+    "口语用普通话口语, 不用方言语气词(伐、侬、阿拉)",
+    "不写 v、vx、加微这类像在要联系方式的字(像引流, 平台会判违规)",
+)
+# 句号: 全角「。」哪里都不要; 半角只管句末那一个点(「...」省略号、3.5 这种不算)
+_STYLE_PERIOD = re.compile(r"。|(?<![.\d])\.\s*$")
+# 「伐」只认句末 / 标点前的语气词用法(步伐、讨伐、砍伐不算); 「阿拉」不认阿拉伯、阿拉斯加这类
+_STYLE_DIALECT = re.compile(r"(?<![步讨砍征攻杀])伐(?=[\s？?！!，,。.~～…]|$)|侬|阿拉(?![伯斯丁善])")
+# 单独一个 v(前后不是字母数字, 后面是标点、空格或结尾; 「V计划」这种后面接汉字的不算)、加微 / 加v、vx、wx、薇信、v我
+_STYLE_CONTACT = re.compile(r"(?i)(?<![a-z0-9])v(?=[\s。.，,！!？?~～…]|$)|加\s*(?:微|vx|wx|v(?![a-z]))|"
+                            r"(?<![a-z])(?:vx|wx)(?![a-z])|薇信|威信|(?<![a-z])v我")
+COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字), 和 fix 一样算没过: 照着改, "
+                           "不用问用户。")
+
+
+def comment_style_issues(text: str) -> list[str]:
+    """一条评论 → 写法底线上要改的地方(空表 = 没问题)。只看文字, 不调模型。"""
+    t = text or ""
+    out = []
+    if _STYLE_PERIOD.search(t):
+        out.append("去掉句号: 句末不加, 句中要停顿用逗号或空格")
+    dialect = "".join(f"「{w}」" for w in dict.fromkeys(m.group(0) for m in _STYLE_DIALECT.finditer(t)))
+    if dialect:
+        out.append(f"{dialect}是方言语气词, 换成普通话口语(比如「吗」「呀」), 或者不要")
+    contact = "".join(f"「{w}」" for w in dict.fromkeys(m.group(0).strip() for m in _STYLE_CONTACT.finditer(t)))
+    if contact:
+        out.append(f"去掉{contact}: 像在要联系方式, 平台会判引流")
+    return out
+
+
+def _style_block(cands: list[dict], style: list[list[str]]) -> dict:
+    """没判成 / 判不全的回包也带上代码查出的写法问题: 那几样不用等判定服务, 照样能改。"""
+    rows = [{"index": i, "slot": (c["slot"] or {}).get("id"), "style_fix": issues}
+            for i, (c, issues) in enumerate(zip(cands, style)) if issues]
+    return {"style_issues": rows, "style_next_step": COMMENT_STYLE_NEXT_STEP} if rows else {}
+
+
 def _tv_post_text(note: dict) -> tuple[str, str]:
     title, body = (note.get("title") or "").strip(), (note.get("body") or "").strip()
     if not body:
@@ -3527,7 +3572,8 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
            "existing_comments": existing,
            "comment_rules": comment_rules, "hard_rules": hard_rules,
            "slots": [dict(s) for s in DEFAULT_COMMENT_SLOTS],
-           "next_step": ("按 slots 每位写一条(贴主答疑那条回 q1), 守 hard_rules 和 comment_rules, 别和 existing_comments "
+           "style": list(COMMENT_STYLE_LINES),
+           "next_step": ("按 slots 每位写一条(贴主答疑那条回 q1), 守 hard_rules、comment_rules 和 style(所有项目都管), 别和 existing_comments "
                          "里已经有的问题重复; 写完把整组交给 score_comments(帖子参数和这次一样: link, 或 post_title / post_body + "
                          "project_id; 每条评论带 slot 的 id)。")}
     if note is not None:
@@ -3621,6 +3667,7 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     ids = [c["slot"]["id"] for c in cands if c["slot"] and c["slot"].get("id")]
     if len(ids) != len(set(ids)):
         raise CommentInputError("同一个评论位只能有一条(slot id 重复了): 想多写几条同类的, 分几次判, 或者给它们不同的 id")
+    style = [comment_style_issues(c["text"]) for c in cands]
     # 查帖子(链接 → TV → 项目 → 归属)也算进同一个截止: PostgREST 默认等 120 秒, 库一卡就远超 MCP 客户端 ~22 秒的
     # 容忍(codex review on aw#107; 同 _judge_tool_call / codex #95 的做法)。参数检查在这之前, 不碰库。
     started, budget = time.monotonic(), judge_client.tool_timeout_sec()
@@ -3628,13 +3675,13 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body))
     if fut is None:
         return {"judge_status": judge_client.JUDGE_TIMEOUT, "note": COMMENT_SCORE_NOTE,
-                "detail": "评论判定线程占满, 这次没判"}
+                "detail": "评论判定线程占满, 这次没判", **_style_block(cands, style)}
     try:
         project, title, body, _note, missing = fut.result(timeout=budget)
     except cf.TimeoutError:
         fut.cancel()
         return {"judge_status": judge_client.JUDGE_TIMEOUT, "note": COMMENT_SCORE_NOTE,
-                "detail": f"查帖子(链接 / 项目 / 归属)在 {budget:g}s 内没查完, 这次没判"}
+                "detail": f"查帖子(链接 / 项目 / 归属)在 {budget:g}s 内没查完, 这次没判", **_style_block(cands, style)}
     if missing is not None:
         return missing
     payload_comments = _comment_payload(cands)
@@ -3647,18 +3694,21 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         head["tv_note_vanished"] = True
         head["tv_note_vanished_note"] = TV_VANISHED_NOTE
     if res.get("judge_status") != judge_client.JUDGE_OK:
-        return {**head, "detail": res.get("detail")}
+        return {**head, "detail": res.get("detail"), **_style_block(cands, style)}
     per_comment = res.get("comments") or []
     if len(per_comment) != len(cands):
         # 少回了几条: zip 会悄悄丢掉没回的那几条, 摘要就成了"这几条评论不存在"(codex review on aw#107)
         return {**head, "judge_status": judge_client.JUDGE_ERROR,
                 "detail": f"判定服务回了 {len(per_comment)} 条单条结果, 送去的是 {len(cands)} 条 —— 版本对不上?"
-                          "这次不算判过"}
+                          "这次不算判过", **_style_block(cands, style)}
     rows = []
     for i, (c, v) in enumerate(zip(cands, per_comment)):
         v = v if isinstance(v, dict) else {}
-        row = {"index": i, "slot": (c["slot"] or {}).get("id"), "passed": bool(v.get("passed")),
+        row = {"index": i, "slot": (c["slot"] or {}).get("id"),
+               "passed": bool(v.get("passed")) and not style[i],
                "needs_review": bool(v.get("needs_review"))}
+        if style[i]:
+            row["style_fix"] = style[i]
         fix = _instructions(v.get("plan"), SCORE_MAX_FIXES)
         hints = _instructions(v.get("hints"), 2)
         if fix:
@@ -3669,7 +3719,8 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     passed = sum(1 for r in rows if r["passed"])
     thread_fix = _thread_lines(res.get("plan"))
     thread_hints = _thread_lines(res.get("hints"))
-    out = {**head, "passed": bool(res.get("passed")), "needs_review": bool(res.get("needs_review")),
+    out = {**head, "passed": bool(res.get("passed")) and not any(style),
+           "needs_review": bool(res.get("needs_review")),
            "summary": {"comments": len(rows), "passed": passed,
                        "needs_review": sum(1 for r in rows if r["needs_review"])},
            "comments": rows}
@@ -3677,6 +3728,8 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         out["thread_fix"] = thread_fix[:SCORE_MAX_FIXES]
     if thread_hints:
         out["thread_hints"] = thread_hints[:2]
+    if any(style):
+        out["style_next_step"] = COMMENT_STYLE_NEXT_STEP
     return out
 
 

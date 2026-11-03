@@ -615,3 +615,73 @@ def test_score_comments_says_when_the_post_is_an_old_row(wired):
     out = core.score_comments(c, user_id=ME, link=LINK, comments=[{"slot": "q1", "text": "简历第一行写的什么呀"},
                                                                    {"slot": "reply", "text": "写的是实习"}])
     assert out["judge_status"] == "ok" and out["tv_note_vanished"] is True and len(calls) == 1
+
+
+# ── 评论的写法底线(2026-11-03): 句号、方言语气词、像要联系方式的 v / vx / 加微, 代码查, 所有项目都管 ──────────────
+@pytest.mark.parametrize("text, expect", [
+    ("双非投出去回音比之前多些，v。", ["句号", "「v」"]),          # 11-03 途鸽那批原样
+    ("同款28岁英硕，有啥方法伐？", ["「伐」"]),
+    ("澳硕计算机回去好进吗，伐", ["「伐」"]),
+    ("侬晓得伐", ["「侬」「伐」"]),
+    ("加v聊, 求vx", ["「加v」「vx」"]),
+    ("加v聊", ["「加v」"]),
+    ("求vx", ["「vx」"]),
+    ("好的。然后呢", ["句号"]),
+    ("结尾一个点.", ["句号"]),
+])
+def test_style_issues_are_found(text, expect):
+    issues = core.comment_style_issues(text)
+    assert len(issues) == len(expect), issues
+    for want, got in zip(expect, issues):
+        assert want in got
+
+
+@pytest.mark.parametrize("text", [
+    "V计划和途鸽哪个好", "步伐太快了", "砍伐", "我也是...", "涨了3.5个点", "问下 HC 多不多", "vlog做得好",
+    "阿拉伯语专业能投吗", "真滴有用吗", "简历第一行写的什么呀", "",
+])
+def test_style_leaves_ordinary_text_alone(text):
+    assert core.comment_style_issues(text) == []
+
+
+def test_comments_for_hands_out_the_style_lines():
+    out = core.comments_for(_tv_client(), user_id=ME, link=LINK)
+    assert out["style"] == list(core.COMMENT_STYLE_LINES) and "style" in out["next_step"]
+
+
+def test_a_style_problem_fails_the_comment_even_when_the_judge_passes_it(wired):
+    calls, reply = wired
+    ok = {"passed": True, "needs_review": False, "profile": {}, "flags": [], "hard_fails": [], "ambiguous": [],
+          "plan": [], "hints": [], "advisory": [], "calls": 2}
+    reply["fn"] = lambda m, u, kw: _Resp(200, {**THREAD_OK, "passed": True, "plan": [], "hints": [],
+                                                "comments": [dict(ok), dict(ok)]})
+    out = core.score_comments(_tv_client(), user_id=ME, link=LINK, comments=[
+        {"slot": "q1", "text": "简历第一行写的什么呀，v。"},
+        {"slot": "reply", "text": "写的是最近一段实习做成了什么"}])
+    first, second = out["comments"]
+    assert first["passed"] is False and len(first["style_fix"]) == 2
+    assert second["passed"] is True and "style_fix" not in second
+    assert out["passed"] is False and out["summary"]["passed"] == 1
+    assert out["style_next_step"] == core.COMMENT_STYLE_NEXT_STEP
+    assert body_text(calls) == ["简历第一行写的什么呀，v。", "写的是最近一段实习做成了什么"], "照原样送去判, 不偷偷改"
+
+
+def body_text(calls):
+    (_m, _url, _h, body, _t), = calls
+    return [c["text"] for c in body["comments"]]
+
+
+def test_style_problems_still_come_back_when_the_judge_did_not_answer(wired):
+    _, reply = wired
+    reply["fn"] = lambda m, u, kw: _Resp(503, {"detail": "评论判定服务未开启"})
+    out = core.score_comments(_tv_client(), user_id=ME, link=LINK, comments=[{"slot": "q1", "text": "有啥方法伐？"}])
+    assert out["judge_status"] != "ok" and "passed" not in out
+    assert out["style_issues"] == [{"index": 0, "slot": "q1", "style_fix": [core.comment_style_issues("有啥方法伐？")[0]]}]
+
+
+def test_clean_comments_carry_no_style_keys(wired):
+    _, reply = wired
+    reply["fn"] = lambda m, u, kw: _Resp(200, dict(THREAD_OK))
+    out = core.score_comments(_tv_client(), user_id=ME, link=LINK, comments=[
+        {"slot": "q1", "text": "简历第一行写的什么呀"}, {"slot": "reply", "text": "写的是最近一段实习做成了什么"}])
+    assert "style_next_step" not in out and all("style_fix" not in r for r in out["comments"])
