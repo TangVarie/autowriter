@@ -683,13 +683,13 @@ python -m deskcore.cli doctor        # 只读; 逐个探测缺哪个、缺了会
 | 唐小轻成分党 | `bcc3d155-201d-4920-9fde-64933a8948dc` | `b907ec9d…` | 229 |
 | RIO便利店调酒 | `b3ac2a5f-320b-49e5-9f11-15d6e517ec41` | `b907ec9d…` | 104 |
 
-owner 分布（配 `DESKCORE_KEYS` 时从这里抄 UUID，**别新造**）：
+owner 分布（只列前 8 位：本仓公开，完整 UUID 不进仓。配 `DESKCORE_KEYS` 时 `user_id` 一律填团队身份 —— 第一行 `85f5f888…`（在用的那几个项目都归它；按项目数认会认错，表是 08-28 的数），完整值从 Railway 现有那几行抄或用 `select distinct owner_id from autowriter.projects` 查，**别新造**）：
 
 | owner_id | 项目数 | items |
 |---|---|---|
-| `85f5f888-a649-4843-8358-9c83c91282e6` | 29 | 3,385 |
-| `afbaf84e-e5a3-4429-9490-72718d2a9019` | 20 | 667 |
-| `b907ec9d-9e49-4dac-89ad-220eb53afc38` | 6 | 504 |
+| `85f5f888…` | 29 | 3,385 |
+| `afbaf84e…` | 20 | 667 |
+| `b907ec9d…` | 6 | 504 |
 | 另外三个 | 6 | 18 |
 
 ---
@@ -802,7 +802,7 @@ key 支持两种传法（`X-Deskcore-Key` 头、`Authorization: Bearer`），见
 
 > **钥匙按人发，身份只有一个。**
 >
-> - **钥匙一人一把**：谁的钥匙漏了只换谁那一把，别人不受影响；`name` 让 `/skill-versions`、日志里看得出是谁那把。
+> - **钥匙一人一把**：谁的钥匙漏了只换谁那一把，别人不受影响。`name` 只是 Railway 配置里的备注：日志和 `/skill-versions` 都分不出是哪把钥匙（日志只记 `user_id` 前 8 位，D-136 之后每把都一样；`/skill-versions` 只有计数）。所以 `name` 要写清是谁的，漏了的时候只能靠它认出该换哪一行。
 > - **`user_id` 全是团队身份**：项目归团队（`projects.owner_id`），每个项目级工具按 `owner_id == user_id` 校验
 >   （审计 COR-015，2026-08-24 起；`create_project` 恒以调用者为 owner 建新的，`get_protocol` 不碰项目），
 >   所以只有团队身份打得开那几个在用的项目。个人层（正负例、`my_style` 调校笔记）跟着也是整个团队一份 ——
@@ -839,7 +839,8 @@ key 一旦在聊天窗口、截图、工单里出现过，就当它已经泄露 
 python - <<'EOF'
 import secrets
 TEAM = "<团队身份的 user_id>"          # 从 Railway 现有的 DESKCORE_KEYS 抄
-for who in ["quanquan", "jiayi", "ziao"]:
+WHO = ["<现在 DESKCORE_KEYS 里每一行的 name>"]   # 一行不落, 照 Railway 上现有的抄; 漏一个她就 401
+for who in WHO:
     print(f'  "k-{who}-{secrets.token_urlsafe(24)}": '
           f'{{"user_id": "{TEAM}", "name": "{who}"}},')
 EOF
@@ -852,7 +853,7 @@ EOF
 **第二步**：把输出拼成 JSON（去掉最后一个逗号），整体替换 Railway 上的
 `DESKCORE_KEYS`，等服务重启。
 
-**第三步**：`curl -s <服务地址>/health | grep auth` 确认 `note` 的条数和你配的一样（11-03 起是 `4 key(s)`）、`auth.ok` 是 true。
+**第三步**：`curl -s <服务地址>/health | grep auth` 确认 `note` 的条数和你配的一样（11-03 起是 `4 key(s)`）、`auth.ok` 是 true。条数少了，先看是不是第一步漏了谁，再看 JSON。
 数目对不上就是 JSON 写坏了 —— 注意 `_key_map()` 是 **fail-closed** 的：
 解析失败一律 401，不会退化成"没配"（那曾经等于匿名全开，见 ROB-003）。
 

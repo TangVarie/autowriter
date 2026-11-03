@@ -3220,38 +3220,23 @@ def _note_from_link(client, link: str) -> tuple[dict | None, str | None]:
     return {**rows[0], TV_VANISHED_FLAG: True}, None
 
 
-def _narrow_note_projects(client, tv_pid: str, targets: list[dict], mine: list[dict]) -> list[dict]:
-    """一条笔记对着调用者好几个写作台项目、夜里又没对上时, 先去掉两种明摆着不是它的, 再决定问不问(2026-11-03)。
+def _narrow_note_projects(targets: list[dict], mine: list[dict]) -> list[dict]:
+    """一条笔记对着调用者好几个写作台项目、夜里又没对上时, 先去掉暂时不用的(project_archived), 再决定问不问(2026-11-03)。
 
-    1. **暂时不用的**(project_archived): 途鸽的飞书表对着团队 8 个项目, 7 个是早就归档的方向(途鸽D-1…D-7) ——
-       不去掉的话近 60 天 144 条途鸽链接里 126 条要写手在 8 个名字里挑。list_projects 默认也不列它们。
-       全都是归档的就照旧全给, 不替他挑。
-    2. **别的表的本家**: 这张表自己的补录目标(ingest_target)在候选里时, 去掉在**另一个** TV 项目当补录目标的那几个。
-       它们挂在这张表上只是为了让夜里对得上挪表之前写的旧稿(I-22: 成人藻油从 BJS_phase1 挪去 BJS_phase2,
-       百健士-藻油 两张表都挂着), 这张表里的帖子写的是这张表的品。方向项目(不在任何表当补录目标)不动 ——
-       那种猜错了评论规则和硬规则都是别的方向的(codex review on aw#107), 照旧让用户选。
-       查不成就不去掉: 宁可多问一句, 不替他猜。
+    途鸽的飞书表对着团队 8 个项目, 7 个是早就归档的方向(途鸽D-1…D-7) —— 不去掉的话近 60 天 144 条途鸽链接里 126 条要
+    写手在 8 个名字里挑。list_projects 默认也不列它们。
+    两条不去的:
+      · 这张表自己的补录目标(``ingest_target``)归档了也留着: 它是这张表的本家, 归档的项目照样能写(归档不锁人);
+        去掉它可能只剩一个挂在这张表上的别的项目, 不问就定成那个, 规则全是别的品的;
+      · 一个在用的都没有就照旧全给, 不替他挑。
+    不按「哪张表的本家」替他定(复审 11-03): 成人藻油那张表(BJS_phase2)里有 25 篇青少年款, D-129 指回了 百健士-藻油,
+    按「这张表的帖子写的就是这张表的品」定成成人项目, 评论就丢了青少年款那几条硬规则。几个都在用就照旧问。
     """
     live = [p for p in mine if not project_archived(p)]
-    cands = live or mine
-    if len(cands) < 2:
-        return cands
+    if not live:
+        return mine
     home = {str(t["project_id"]) for t in targets if t.get("ingest_target") and t.get("project_id")}
-    if not home & {str(p["id"]) for p in cands}:
-        return cands
-    kept = []
-    for p in cands:
-        if str(p["id"]) in home:
-            kept.append(p)
-            continue
-        try:
-            rows = store.tv_projects_of(client, str(p["id"]))
-        except Exception:                               # noqa: BLE001 — 查不到就让用户选, 不替他猜
-            logger.exception("comments_for: 查项目挂了哪些 TV 表失败 (project=%s)", p["id"])
-            return cands
-        if not any(r.get("ingest_target") and str(r.get("tv_project_id") or "") not in ("", tv_pid) for r in rows):
-            kept.append(p)
-    return kept
+    return [p for p in mine if not project_archived(p) or str(p["id"]) in home]
 
 
 def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tuple[dict | None, list[dict]]:
@@ -3292,7 +3277,7 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tu
         except (PermissionError, ProjectNotFound):
             continue
     if len(mine) > 1:
-        mine = _narrow_note_projects(client, tv_pid, targets, mine)
+        mine = _narrow_note_projects(targets, mine)
     if len(mine) == 1:
         return mine[0], []
     if mine:
