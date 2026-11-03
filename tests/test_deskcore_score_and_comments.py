@@ -452,6 +452,81 @@ def test_an_ingested_link_is_not_a_direction():
     assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
 
 
+# ── 夜里没对上时先去掉明摆着不是它的(2026-11-03): 暂时不用的项目 / 别的表的本家 ──────────────────────
+ARCHIVED_PARAMS = '{"archived": true}'
+FOURTH_PROJ = "dddddddd-0000-0000-0000-000000000004"
+
+
+def _archived_siblings_client(*, home_archived=False):
+    """途鸽的形状: 本家(补录目标) + 两个早就归档的方向, 都归调用者。"""
+    c = _tv_client(maps=[{"tv_project_id": "TUGE_phase1", "project_id": PROJ, "ingest_target": True},
+                         {"tv_project_id": "TUGE_phase1", "project_id": THIRD_PROJ, "ingest_target": False},
+                         {"tv_project_id": "TUGE_phase1", "project_id": FOURTH_PROJ, "ingest_target": False}])
+    for pid, name in ((THIRD_PROJ, "途鸽D-1"), (FOURTH_PROJ, "途鸽D-2")):
+        c.rows["projects"].append({"id": pid, "name": name, "brand": "途鸽", "owner_id": ME, "calibration_notes": "",
+                                   "tactics": "[]", "custom_roles": [], "default_params": ARCHIVED_PARAMS})
+    if home_archived:
+        next(p for p in c.rows["projects"] if p["id"] == PROJ)["default_params"] = ARCHIVED_PARAMS
+    return c
+
+
+def test_archived_directions_are_not_offered():
+    out = core.comments_for(_archived_siblings_client(), user_id=ME, link=LINK)
+    assert out["resolved"] is True and out["project_id"] == PROJ, "只剩一个在用的就是它, 不让写手在归档的里挑"
+
+
+def test_all_archived_still_asks_among_them():
+    out = core.comments_for(_archived_siblings_client(home_archived=True), user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ, FOURTH_PROJ}
+
+
+def test_a_live_direction_is_still_asked_even_with_archived_ones_around():
+    c = _archived_siblings_client()
+    next(p for p in c.rows["projects"] if p["id"] == THIRD_PROJ)["default_params"] = "{}"
+    out = core.comments_for(c, user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+
+
+def _borrowed_home_client(*, home_here=True):
+    """成人藻油的形状: BJS_phase2 的本家是成人项目; 儿童项目是 BJS_phase1 的本家, 挂在 BJS_phase2 只为对旧稿。"""
+    note = dict(NOTE, note_id="BJS_phase2_recB", project_id="BJS_phase2")
+    c = _tv_client(notes=[note], comments=[], maps=[
+        {"tv_project_id": "BJS_phase2", "project_id": PROJ, "ingest_target": home_here},
+        {"tv_project_id": "BJS_phase2", "project_id": THIRD_PROJ, "ingest_target": False},
+        {"tv_project_id": "BJS_phase1", "project_id": THIRD_PROJ, "ingest_target": True}])
+    c.rows["projects"].append({"id": THIRD_PROJ, "name": "儿童藻油", "brand": "百健士", "owner_id": ME,
+                               "calibration_notes": "", "tactics": "[]", "custom_roles": []})
+    return c
+
+
+def test_another_tables_home_gives_way_to_this_tables_home():
+    out = core.comments_for(_borrowed_home_client(), user_id=ME, link=LINK)
+    assert out["resolved"] is True and out["project_id"] == PROJ
+
+
+def test_without_a_home_here_nothing_is_dropped():
+    out = core.comments_for(_borrowed_home_client(home_here=False), user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+
+
+def test_a_failed_map_lookup_asks_instead_of_guessing(monkeypatch):
+    from deskcore import store as S
+
+    def boom(*a, **k):
+        raise RuntimeError("PostgREST down")
+    monkeypatch.setattr(S, "tv_projects_of", boom)
+    out = core.comments_for(_borrowed_home_client(), user_id=ME, link=LINK)
+    assert out["resolved"] is False and {ch["id"] for ch in out["choices"]} == {PROJ, THIRD_PROJ}
+
+
+def test_the_night_link_still_wins_over_the_narrowing():
+    c = _borrowed_home_client()
+    c.rows["tv_note_links"] = [{"note_id": "BJS_phase2_recB", "tv_project_id": "BJS_phase2",
+                                "project_id": THIRD_PROJ, "version_id": None, "match_kind": "fuzzy"}]
+    out = core.comments_for(c, user_id=ME, link=LINK)
+    assert out["project_id"] == THIRD_PROJ, "夜里对上了旧稿就是那个项目写的"
+
+
 # ── 挪表之后同一条链接两行: 已删的那行让位给活的那行(2026-10-26, I-22) ─────────────────────────────
 # 运营把成人藻油从 BJS_phase1 的飞书表挪去新表(TV 记为 BJS_phase2): 旧行进 truth_vault.v_notes_vanished, 新行同链接、
 # 同发布时间(两张表同一套列)。排序只剩 note_id, BJS_phase1_… 排在前面 —— 不让位的话写手给成人项目也会 403。

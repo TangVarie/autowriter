@@ -1089,6 +1089,21 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 
 **`_draw` 的预算。** 预算那条用例（`test_drawpolicy` 的夹具）标了贴型照样 ≤ 300 字。最坏情形本来就超过 300（点名四个维度、L1 放宽、旧先验的牌 359 字；带参考帖、重用、保底、旧先验的牌 333 字），贴型只多 11 字；没标贴型的牌一个字不多（金标钉着），所以没动已有的键。回归在 `tests/test_draw_layers.py`、`tests/test_layer_rules.py`。
 
+### 3.16 写评论：按链接找到帖子时，先去掉明摆着不是它的项目再问（2026-11-03）
+
+**为什么。** 一张飞书表（一个 TV 项目）可以对着好几个写作台项目。夜里没对上这条笔记写的是哪一个时，`comments_for` 原来把调用者名下的全列出来让写手挑（`choices`）。按团队身份数，近 60 天：途鸽 144 条链接里 126 条要在 8 个名字里挑，其中 7 个是早就归档的方向（途鸽D-1…D-7）；成人藻油的表 97 条里 79 条要在「百健士-藻油 / 百健士成人藻油」里挑。挑项目是写手不该做的操作。
+
+**怎么去（`core._narrow_note_projects`，只在候选不止一个时走）。**
+
+| 先后 | 去掉什么 | 为什么能去 |
+|---|---|---|
+| 1 | 归档的（`project_archived`） | 暂时不用的项目 `list_projects` 默认也不列（§3.13）。全是归档的就照旧全给，不替他挑 |
+| 2 | 别的表的本家：这张表自己的补录目标（`ingest_target`）在候选里时，去掉在**另一个** TV 项目当补录目标的 | 它挂在这张表上只是为了让夜里对得上挪表之前写的旧稿（I-22：百健士-藻油两张表都挂着），这张表里的帖子写的是这张表的品 |
+
+不动的：夜里真对上了（`tv_note_links` 的匹配档）就用对上的那个，归档的也用；方向项目（不在任何表当补录目标）照旧让用户选，猜错了评论规则和硬规则都是别的方向的（codex review on aw#107）；`tv_projects_of` 查不成就不去，宁可多问一句。去完只剩一个就直接用。
+
+协议没改（版本不变，写手不用重导 skill）。回归在 `tests/test_deskcore_score_and_comments.py`。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -1100,7 +1115,7 @@ env：
 | 变量 | 必需 | 说明 |
 |---|---|---|
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | ✅ | service_role，绕 RLS |
-| `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<uuid>", "name": "Ziao"}}`，一人一把 |
+| `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<团队身份的 uuid>", "name": "Ziao"}}`。钥匙一人一把，`user_id` 全填团队身份（2026-11-02 D-136）；加写手就加一行，见 runbook「加一个写手」 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN。馆员回 200 但 `status` 是 `degraded` / `error`（TV 侧选卡失败）记 `error` 不记 `empty` |
 | `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `15`（2026-10-30 起，原 10；最近冷借 14–18 秒），夹在 1–20。`open_project` 随简报借卡**最多等这么久**，而且不超过整次回包目标 `OPEN_PROJECT_RESPONSE_BUDGET_SEC`（20 秒，不开 env）扣掉借阅之前已用的时间和借阅之后几步的预留（`core.OPEN_PROJECT_TAIL_RESERVE_SEC`，2.5 秒）剩下的那段；到点先交简报（`lessons_status.status=timeout`，`detail` 里叫模型动笔之前用同样的参数调一次 `borrow_lessons`，命中缓存即回；只调一次，还没有就照常写）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60），2026-10-30 起也收 `extra_instructions`（它在馆员的缓存键里） |
