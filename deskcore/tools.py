@@ -712,6 +712,8 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
       · existing_comments —— 帖子下已有的评论(TV 里找到了才有): 别重复里面已经问过的事
       · comment_rules —— 本项目管评论的规则(「评论区：」开头的), 必须守
       · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守
+      · style —— 所有项目的评论都管的写法底线: 不用句号、不用方言语气词(伐、侬、阿拉)、不写 v / vx / 加微这类像要联系方式的字。
+        项目规则里说要混进这些也不行, 以这三句为准
       · slots —— 默认四个评论位: q1 / q2 提问、exp 补充经验、reply 贴主答疑(回 q1)。每位写一条, 位的要求在 note 里;
         不写背书、不编造用过某产品的亲历。用户另有要求(比如只要两条提问)就照用户的, 位的 id 照用
       · project_id —— 下一步 score_comments 要带的
@@ -741,6 +743,8 @@ def score_comments(comments: list[dict], link: str = "", project_id: str = "", p
       · 每条 ``passed=true`` 且 ``needs_review=false`` 才算这条过。``summary.passed`` 是这组过了几条 —— 这就是整组的分数,
         照实告诉用户。
       · ``fix`` 是必须改的(主要行为、点名品牌、接住帖子、细节四项); ``hints`` 只是参考, 不改不算没过, 别为了消掉提示反复重写。
+      · ``style_fix`` 是代码查出来的写法底线(句号、方言语气词、像要联系方式的 v / vx / 加微), 有它那条就算没过, 和 fix 一样
+        照着改、不用问用户。判定没判成(``judge_status`` 不是 ok)时它在 ``style_issues`` 里, 照样先改掉。
       · ``thread_fix`` 是整组层面的(点名太多、评论区没有摩擦), 按「位 xx」改那一位。
       · 没过的按 fix 改**一轮**, 再调一次本工具, 然后不管结果都交付并如实说明; 不要循环。
       · ``needs_review=true``(多半是像背书、或判得拿不准)交人工核实: 不能改成伪造的亲历, 也不要靠反复润色把风险抹掉。

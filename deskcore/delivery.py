@@ -22,6 +22,8 @@ import re
 
 import validator
 
+from . import commentstyle
+
 LAYOUTS = ("table", "blocks")
 FIELDS = ("direction", "post", "comments")
 ROLES = ("reader", "author")
@@ -527,6 +529,8 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
             for k, c in enumerate(comments):
                 if terms and not any(t.casefold() in c["text"].casefold() for t in terms):
                     problems.append({"index": i, "what": f"第 {k + 1} 条评论没提到「{'」「'.join(terms)}」里任何一个"})
+                # 评论的写法底线(commentstyle, 2026-11-03): 句号、方言语气词、像要联系方式的字。和单独写评论那条路同一套
+                problems += [{"index": i, "what": f"第 {k + 1} 条评论: {w}"} for w in commentstyle.issues(c["text"])]
                 label = ccfg["label_reader"] if c["role"] == "reader" else ccfg["label_author"]
                 lines.append(label + c["text"])
 
@@ -561,7 +565,7 @@ def requirements(template: dict) -> dict:
     if c is not None:
         want = f"{c['min']}" if c["min"] == c["max"] else f"{c['min']}~{c['max']}"
         asks.append(f"comments 给 {want} 条" + (f", 每条都要提到「{'」「'.join(c['must_mention_any'])}」里的一个"
-                                                if c["must_mention_any"] else ""))
+                                                if c["must_mention_any"] else "") + f"; {commentstyle.SHORT}")
     if need_direction:
         asks.append("direction 写一句这篇的切入角度(不是 产品向 / 流量向)")
     # 模板不管话题(wants_tags 为假)时 assemble 不读 tags 字段, 正文原样进交付稿: 这时叫写手「不放话题行」, 照项目规则要的
