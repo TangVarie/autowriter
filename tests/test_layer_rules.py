@@ -241,12 +241,10 @@ def test_score_drafts_without_layers_is_exactly_the_old_gate(monkeypatch):
     assert "layered" not in c.rows["batch_metrics"][0]["meta"]["rule_checks"]
 
 
-@pytest.mark.parametrize("broken,want", [
-    (("ledger_layers", "resolve_version_layers"), ["m-1", "m-3", "m-4"]),   # 台账两条路都读不到: 原来的方向闸
-    (("resolve_version_layers",), ["m-2", "m-4"]),                          # 只是按版本那条读不到: 按 angle_key 找(T)
-    (("ledger_layers",), ["m-2", "m-4"]),                                   # 按 key 那条读不到: 销了牌的按销的那一行找
-])
-def test_a_ledger_read_failure_falls_back_to_the_old_gate(monkeypatch, broken, want):
+@pytest.mark.parametrize("broken", [("ledger_layers",), ("resolve_version_layers",),
+                                    ("ledger_layers", "resolve_version_layers")])
+def test_a_ledger_read_failure_does_not_move_a_consumed_draft(monkeypatch, broken):
+    """销了牌的新稿, 贴型是销账时一并拿回来的那一行(review on aw#141): 之后台账哪条读不到都不碍它, 照那一行的 T 查。"""
     for name in broken:
         monkeypatch.setattr(store, name, lambda *a, **k: None)
     c, keys = _client("T")
@@ -254,7 +252,19 @@ def test_a_ledger_read_failure_falls_back_to_the_old_gate(monkeypatch, broken, w
     drafts[0]["angle_key"] = keys[0]
     out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
     assert out["written"] == 1 and out["consumed_angles"] == 1, "读不到贴型不影响存档"
-    assert _by_draft(out) == {0: want}
+    assert _by_draft(out) == {0: ["m-2", "m-4"]}
+
+
+def test_a_ledger_read_failure_falls_back_to_the_old_gate(monkeypatch):
+    """没销成牌的新稿按 angle_key 找; 那一条也读不到: 原来的方向闸。"""
+    monkeypatch.setattr(store, "consume_angle", lambda *a, **k: False)
+    monkeypatch.setattr(store, "ledger_layers", lambda *a, **k: None)
+    c, keys = _client("T")
+    drafts = distinct_drafts(1)
+    drafts[0]["angle_key"] = keys[0]
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert out["written"] == 1 and out["consumed_angles"] == 0, "读不到贴型不影响存档"
+    assert _by_draft(out) == {0: ["m-1", "m-3", "m-4"]}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -751,22 +761,105 @@ def test_a_new_draft_whose_consumption_missed_falls_back_to_the_key(monkeypatch)
     assert store.version_layers(c, PROJ, [vid]) == {vid: "T"}
 
 
-def test_draft_layers_reads_consumed_new_drafts_by_version(monkeypatch):
-    asked = []
+def test_draft_layers_takes_the_consumed_rows_layer_without_reading(monkeypatch):
+    """销了牌的新稿(``consumed``: 销的那一行卡上标的贴型, 没标是 None)直接用它: 不为它们读台账, 按版本那条读不到 / 抛了
+    也不退回按 key 找(review on aw#141); 改稿那几篇照旧按旧版那条线找, 读不到退回按 key 找(d2ae243)。"""
+    asked, keyed = [], []
     monkeypatch.setattr(store, "resolve_version_layers",
-                        lambda c, p, vids: asked.append(vids) or ({"new-1": "P", "old-1": "J"},
-                                                                  {"new-1", "new-2", "old-1"}))
-    monkeypatch.setattr(store, "ledger_layers", lambda c, p, keys: {"k": "T"})
+                        lambda c, p, vids: asked.append(vids) or ({"old-1": "J"}, {"old-1"}))
+    monkeypatch.setattr(store, "ledger_layers", lambda c, p, keys: keyed.append(keys) or {"k": "T"})
     drafts = [{"angle_key": "k"} for _ in range(5)]
     got = core._draft_layers(None, PROJ, drafts, [0, 1, 2, 3, 4], replaced={3: "old-1"},
-                             consumed={0: "new-1", 1: "new-2", 2: "new-3", 9: "new-9"})
+                             consumed={0: "P", 1: None, 9: "Q"})
     assert got == {0: "P", 2: "T", 3: "J", 4: "T"}, \
-        "销给 new-1 的那行是 P; new-2 定下来了、没标: 不按 key; new-3 没定下来、没销牌的第 4 篇: 按 key"
-    assert asked == [["new-1", "new-2", "new-3", "old-1"]], "改稿的旧版和销了牌的新版一次查, 只查这次存进去的几篇"
-    monkeypatch.setattr(store, "resolve_version_layers", lambda *a: None)       # 读不到: 都按 key
-    assert core._draft_layers(None, PROJ, drafts, [0, 1], consumed={0: "new-1", 1: "new-2"}) == {0: "T", 1: "T"}
+        "销的那行是 P; 销的那行没标: 不标、不按 key; 没销成的第 2、4 篇: 按 key; 改稿: 旧版那张 J"
+    assert asked == [["old-1"]], "只为改稿的旧版读一次, 销了牌的新稿不读"
 
     def boom(*a):
         raise RuntimeError("statement timeout")
-    monkeypatch.setattr(store, "resolve_version_layers", boom)                  # 抛了也不冒泡: 按 key
-    assert core._draft_layers(None, PROJ, drafts, [0], consumed={0: "new-1"}) == {0: "T"}
+    for broken in (lambda *a: None, boom):                                      # 按版本那条读不到 / 抛了: 改稿按 key
+        monkeypatch.setattr(store, "resolve_version_layers", broken)
+        assert core._draft_layers(None, PROJ, drafts, [0, 1, 3], replaced={3: "old-1"},
+                                  consumed={0: "P", 1: None}) == {0: "P", 3: "T"}, "新稿照销的那一行, 不跟着按 key"
+    monkeypatch.setattr(store, "ledger_layers", lambda *a: None)                # 按 key 那条也读不到: 改稿走方向闸
+    assert core._draft_layers(None, PROJ, drafts, [0, 1, 3], replaced={3: "old-1"},
+                              consumed={0: "P", 1: None}) == {0: "P"}
+
+    asked.clear()
+    keyed.clear()
+    monkeypatch.setattr(store, "resolve_version_layers", lambda c, p, vids: asked.append(vids) or ({}, set()))
+    monkeypatch.setattr(store, "ledger_layers", lambda c, p, keys: keyed.append(keys) or {"k": "T"})
+    assert core._draft_layers(None, PROJ, drafts, [0, 1], consumed={0: "P", 1: None}) == {0: "P"}
+    assert asked == [] and keyed == [], "这一批全是销了牌的新稿: 一次台账都不读"
+
+
+def test_consume_angle_hands_back_the_layer_of_the_row_it_consumed():
+    """consume_angle 销成了就把销的那一行(id + 卡上标的贴型)放进 ``row``; 没标贴型是 None; 没销成不动它。"""
+    c, _keys = _client("P")
+    k, p_row = _two_open_rows(c)
+    got: dict = {}
+    assert store.consume_angle(c, PROJ, k, "v-1", user_id=ME, row=got) is True
+    assert got == {"id": p_row, "layer": "P"}, "销的是最早那一行 P(不是按 key 找到的 T)"
+    again: dict = {}
+    assert store.consume_angle(c, PROJ, k, "v-2", user_id=ME, row=again) is True
+    assert again == {"id": "l0-again", "layer": "T"}
+    missed = {"keep": 1}
+    assert store.consume_angle(c, PROJ, k, "v-3", user_id=ME, row=missed) is False
+    assert missed == {"keep": 1}, "没销成: 不动"
+    c2, keys2 = _client(None)
+    plain: dict = {}
+    assert store.consume_angle(c2, PROJ, keys2[0], "v-4", user_id=ME, row=plain) is True
+    assert plain == {"id": "l0", "layer": None}, "没标贴型的牌: layer 是 None"
+    assert store.consume_angle(c2, PROJ, keys2[0], "v-5", user_id=ME) is False, "不给 row 照旧"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# K · 销了牌的新稿, 贴型是销账那一步一并拿回来的: 按版本那条读失败(改稿那条线出错之类)也不退回按 key 找(review on aw#141)
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("fail", ["none", "raise"])
+def test_a_consumed_new_draft_keeps_its_rows_layer_when_the_version_lookup_fails(monkeypatch, fail):
+    """Codex 那个场景(同一个 key 一行 P 早、一行 T 晚, 都没销), 只是存档时按版本查贴型那一步读不到(回 None / 抛)。销的是
+    P 那一行, 存档照产品贴查; 不按 key 拿到 T —— 之后对同一版调 check_rules 也是产品贴, 两边同一个方向。"""
+    def broken(*a, **k):
+        if fail == "raise":
+            raise RuntimeError("statement timeout")
+        return None
+    c, _keys = _client("P")
+    k, p_row = _two_open_rows(c)
+    monkeypatch.setattr(store, "resolve_version_layers", broken)
+    drafts = distinct_drafts(1, seed=14)
+    drafts[0]["angle_key"] = k
+    out = core.commit_drafts(c, PROJ, drafts, user_id=ME)
+    assert out["written"] == 1 and out["consumed_angles"] == 1
+    vid = out["version_ids"][0]
+    assert {r["id"]: r for r in c.rows["angle_ledger"]}[p_row]["consumed_version_id"] == vid
+    assert _by_draft(out) == {0: ["m-1", "m-3", "m-4"]}, "销的那一行是 P: 产品向 + 通用(不是按 key 找到的 T)"
+    monkeypatch.undo()
+    assert store.version_layers(c, PROJ, [vid]) == {vid: "P"}, "check_rules 那边按销的那一行找, 也是 P"
+
+
+def test_a_failing_revision_lineage_does_not_move_the_consumed_new_drafts_in_the_same_batch(monkeypatch):
+    """同一批里有一篇改稿、一篇销了牌的新稿; 改稿旧版那条线读失败(resolve_version_layers 整个回 None)。改稿照 d2ae243
+    退回按它带的 key 找; 新稿的贴型是销账时拿回来的那一行(P), 不跟着退回按 key 找(T)。"""
+    from tests.test_delivery_revision import _embed
+    c, keys = _client("P", "J")
+    k, p_row = _two_open_rows(c)
+    drafts = distinct_drafts(2, seed=15)
+    first = core.commit_drafts(c, PROJ, [{**drafts[0], "angle_key": keys[1]}], user_id=ME)
+    assert first["consumed_angles"] == 1
+    v1 = first["version_ids"][0]
+
+    def boom(*a, **kw):
+        raise RuntimeError("statement timeout")
+    monkeypatch.setattr(store, "_consumed_layers", boom)       # 旧版那条线一读就失败: resolve_version_layers 回 None
+    _embed(c)
+    revised = {**drafts[0], "body": drafts[0]["body"] + "后来补了一句。", "angle_key": keys[1], "replaces_version_id": v1}
+    out = core.commit_drafts(c, PROJ, [revised, {**drafts[1], "angle_key": k}], user_id=ME)
+    assert out["written"] == 2 and out["replaced"] and out["consumed_angles"] == 1
+    v_new = out["version_ids"][1]
+    assert {r["id"]: r for r in c.rows["angle_ledger"]}[p_row]["consumed_version_id"] == v_new
+    assert _by_draft(out) == {0: ["m-1", "m-3", "m-4"],        # 改稿: 按它带的 key 找(J, 产品贴那一族)
+                              1: ["m-1", "m-3", "m-4"]}        # 新稿: 销的那一行 P(不是按 key 找到的 T 的 m-2 / m-4)
+    monkeypatch.undo()
+    assert store.version_layers(c, PROJ, [v_new]) == {v_new: "P"}

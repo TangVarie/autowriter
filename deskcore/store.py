@@ -939,8 +939,12 @@ def relabel_draw_layer(sb, project_id: str, angle_key: str, batch_id: str, dims:
 
 
 def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
-                  *, user_id: str | None = None) -> bool:
+                  *, user_id: str | None = None, row: dict | None = None) -> bool:
     """把台账里这个角度标成已消耗。返回【是否真的改到了行】。
+
+    ``row``(给了的话, review on aw#141): 销成了就往里放销的那一行 ``{"id": 行 id, "layer": 卡上标的贴型代号}``(没标贴型
+    ``layer`` 是 None)。commit_drafts 拿它定这一篇的贴型, 不用销完再按版本读一次台账 —— 那一次读失败的话只能退回按 key
+    找(最近抽的那一行), 同一个 key 台账里有两行没销的时候和 check_rules(按销的那一行找)方向相反。没销成不动它。
 
     ⚠️ 必须看受影响行数, 不能只看"没抛异常"。没有匹配的未消耗行时(最典型:
     非原子降级路径里 record_draw 的插入失败了, 台账根本没这一行), PostgREST
@@ -956,7 +960,7 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
     找不到自己那条时才退回最早的未消耗行 —— 那是队友把坐标转交给你的情形。
     """
     try:
-        rows = (sb.table("angle_ledger").select("id, drawn_by")
+        rows = (sb.table("angle_ledger").select("id, drawn_by, dims")
                   .eq("project_id", project_id).eq("angle_key", angle_key)
                   .is_("consumed_version_id", "null")
                   .order("drawn_at", desc=False)
@@ -988,6 +992,8 @@ def consume_angle(sb, project_id: str, angle_key: str, version_id: str,
         logger.warning("angle %s (project=%s) 选中的台账行已被并发销账, 本次没销成",
                        angle_key, project_id)
         return False
+    if row is not None:
+        row.update(id=target.get("id"), layer=_draw_layer(target.get("dims")))
     return True
 
 
