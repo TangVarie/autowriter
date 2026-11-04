@@ -1273,7 +1273,7 @@ def _reference_line(ref: dict | None) -> str | None:
     draw_angles 也不给这张牌带 reference(batch_note 只数卡面上真有参考行的)。
 
     外部参考的尾巴是「不提那篇帖子里的品牌」, 不是「不提任何品牌」(复审): 外部卡的内容形式照项目配额发, 也会分到
-    场景植入这种产品向的形式, 那一篇本来就要点本项目的品牌名(协议 218 行)。"""
+    场景植入这种产品向的形式, 那一篇本来就要点本项目的品牌名(协议「为什么要分方向」那一段: 产品向正文直接点品牌名)。"""
     if not isinstance(ref, dict):
         return None
     kind = ref.get("kind")
@@ -2981,7 +2981,8 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
 # (审计 11-02 F07, 记过的取舍)。W-42 之后合规问题由 AI 自己改, 改稿会变多, 所以存完档在后台对这几版跑一次 check_rules,
 # 摘成只有数和规则 id 的一小块, 并进这次存档那一行 batch_metrics 的 meta.revision_rule_recheck, 只给复盘看:
 # 不进回包、不转给写手、不叫模型再改。和 check_rules 同一个函数, 照样写 Jev 的规则题账本(run_tag=shadow-rules)、缺编译
-# 结果照样触发后台补编。一个工作线程, 排队的超过 _REVISION_RECHECK_SLOTS 个就不跑这一次(记日志); 进程重启丢掉排着的,
+# 结果照样触发后台补编。一个工作线程, 名额 _REVISION_RECHECK_SLOTS 个、从投进去占到跑完: 同时最多 4 次(1 次在跑、3 次排着),
+# 第 5 次就不跑(记日志); 进程重启丢掉排着的,
 # 这一行就没有这个键 —— 复盘时没有这个键 = 没复查, 不是复查过了。
 # 测试里默认关掉(tests/conftest.py 把池子换成 None): 后台线程在用例跑完之后还往同一个假件上发请求, 数请求的断言会时红时绿;
 # 要测它的用例自己换成就地跑的池子。

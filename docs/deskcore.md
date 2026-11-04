@@ -1139,7 +1139,7 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 **W-42 合规问题自己改。** 换版后写手唯一还要开口的一步：AI 说出合规问题，写手回「第 N 篇按这条改」。现在 `score_drafts` 判出 `fixes` / `hard_fails` 的那几篇，模型不等写手开口：先把 `check_rules` 调完，把合规问题（Jev 拿不准的也改）和「必须改」放在同一轮改掉，改过的带 `replaces_version_id` 先过 `check_drafts` 再 `score_drafts`，交付改好的那一版，交付那条回复里一句话说清改了哪几篇的哪里。
 
 - 改一轮就够。服务端按这次带 `replaces_version_id` 的那几篇分开说（`_score_report_step` 的 `revised`）：改过重存之后还查出来的，只叫模型照实说一句、不再接着改，免得改、判、改地转下去。写手当场要求改的那篇改完又查出合规问题，也是这样只说一句，写手要改再说。
-- 拿不准的也改：影子期判出来的硬伤，`p` 大多在 0.54～0.69（§3.8），只改有把握的等于大部分照旧要写手开口；合规上宁严勿松，改一句话的代价小。
+- 拿不准的也改：10-19 线上实查，影子期判出的 7 条硬伤 `p` 全在 0.54～0.69，没有一条够得上「有把握」（`p ≥ 0.7`；出处是 `deskcore/core.py` 里 `SCORE_SURE_P` 上面那段注释）。只改有把握的，那一次就一条都不会自己改，照旧全要写手开口；合规上宁严勿松，改一句话的代价小。
 - 「建议改」照旧告诉写手、由写手定，不在这一条里。
 - 服务端同一个口径：`SCORE_NOTE`、`_score_report_step`、`score_drafts` / `check_rules` 的工具说明、`check_rules` 必须改那句 next_step。
 
@@ -1162,7 +1162,7 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 
 - 只留数和规则 id，不留稿子、规则原文和 Jev 指出的句子。不进回包、不转给写手、不叫模型再改。
 - 和 `check_rules` 是同一个函数：规则题照样发 Jev、写进规则题账本（`run_tag=shadow-rules`），缺编译结果照样触发后台补编。一版多一次 Jev 调用，11-02 审计时 30 天是 6 次改稿的量。
-- 一个工作线程，排着的超过 4 个就跳过这一次、记 WARN；进程重启丢掉还在排的。那一行就没有这个键：**没有这个键 = 没复查**，不是复查过了。`check_rules` 抛了记 `status: error`；写回失败只记日志。
+- 一个工作线程，名额 4 个、从投进去一直占到跑完：同时最多 4 次（1 次在跑、3 次排着），第 5 次就跳过、记 WARN；进程重启丢掉还在排的。那一行就没有这个键：**没有这个键 = 没复查**，不是复查过了。`check_rules` 抛了记 `status: error`；写回失败只记日志。
 - 测试里默认关掉（`tests/conftest.py` 把池子换成 None），要测它的用例换成就地跑的池子（`tests/test_revision_recheck.py`）。
 
 复盘时这样查：
@@ -1179,7 +1179,7 @@ select created_at,
  order by created_at desc limit 50;
 ```
 
-`revised_items` 大于 0 而 `recheck` 是空的，就是那一次没复查（排满了、重启了、指标那一行没插成）。
+`revised_items` 大于 0 而 `recheck` 是空的，就是那一行还没有复查结果：要么还在排、还在跑（`check_rules` 一页查 20 篇、整页共用 `JUDGE_DRAFT_TOOL_TIMEOUT_SEC` 的截止，默认 18 秒，多出来的接着查下一页），要么被跳过了（名额满了，或进程重启丢掉了排着的）。指标那一行没插成的不会在这里出现——没有那一行，也就不会排复查。
 
 回归：`tests/test_protocol_followups_1104.py`（协议和服务端同一个口径、aw#144 的评论口径原样在）、`tests/test_angle_block_score_report.py`（自己改一轮、改过的不再改）、`tests/test_project_now.py`、`tests/test_revision_recheck.py`。
 

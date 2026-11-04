@@ -253,7 +253,8 @@ TV 的正文补进指纹库，对照改成 `ingested`（2026-09-18 途鸽 `TUGE_
 两版同标题的稿子都是评论稿，真正的正文写作台里没有）。
 
 > ⚠️ 第 3.5 步（飞书建六列）**作废**。`export_drafts` 仍然带那六列，粘了不坏，但对照不再依赖它。
-> Hatherine 在 TV 里一条都没有——那张飞书表没接进 TV 同步，接进去之后加一行 `tv-map` 即可。
+> 09-17 写这段时 Hatherine 在 TV 里一条都没有（那张飞书表没接进 TV 同步，接进去之后加一行 `tv-map` 即可）。现在它已接进 TV，
+> 写作台的 Hatherine 项目 9 个里 8 个在 `tv_project_map` 里（2026-11-04 只读核过，同 §1.7 第 4 步）。
 
 ### 1.6 `010_tv_links_rls` —— 009 那三张表开 RLS（2026-09-18）
 
@@ -1261,9 +1262,9 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 7b | ~~**推 TV 那边读 `decision_source`**~~ | ✅ **TV 已接**（`scripts/sync_autowriter_decisions_to_prepublish.py` 按 human / rule_based / unverified 分流，只有 `decision_source` 恰好等于 `human` 才算人工）。⚠️ **但这条管子现在零流量**，见下面 7d |
 | ~~7d~~ | ~~**人工审稿这条管子一个月零流量**~~ ✅ **2026-09-20 已定案：legacy-only**（TV D-072，理由与重新点亮的条件见 §3）。下面是当时查到的事实，保留作背景 | 2026-09-20 实查生产库：`autowriter.items` **6,688 行里 `decision_source` 全是 NULL** —— `review_drafts`（2026-09-16 上线）**一次都没被调用过**。存量 598 条 approved/needs_revision 是 Streamlit 时代留下的，TV 那边已按新口径全部归成 `evaluator_type='unverified'`，`prepublish_evaluations` **最后一条停在 2026-08-20**（Streamlit 末次出稿 08-19）。两侧代码都通，**没人拧龙头** —— 与 D-063 通道 2 那次同一个形状。⚠️ 修法**不是**让模型主动多调：协议里「用户没表态就别调」那条守的正是「别替用户点通过」，松掉就是灌伪造正例。这是给人看的决策，不是给代码修的 bug。**已定案：不点亮** |
 | ~~7c~~ | ~~打通 lineage 回程~~ ✅ 不再靠六列 | 2026-09-17 起 `tv-sync` 按内容把发出去的笔记对回写作台（`009`，§1.5、`docs/deskcore.md` §3.7），飞书表不用加列，写手也没有导出这一步。2026-11-04 只读：`tv_note_links` 3,454 行，TV `notes.source_autowriter_version_id` 非空 528 条 |
-| 7e | 接上入库判定并攒样本（§1.7 ①） | 代码已合、env 没配。配上之后两周内从 `batch_metrics`（`meta.mode='deskcore_commit'`）取 `commit` / `delivery_rules` / `judge` / `total` 的 p95 重定 `JUDGE_TIMEOUT_SEC`（判定的截止要先扣掉前面几段，`delivery_rules` 是 10-20 起存档后拼交付稿 + 查规则那一段）——8 秒和「commit 约 1–2 秒」都还没有样本撑着（`docs/deskcore.md` §3.8 有 SQL）。`timeout` 占比高先看是不是并发不够（`JUDGE_MAX_WORKERS`），别先加截止 |
+| ~~7e~~ | ~~接上入库判定并攒样本（§1.7 ①）~~ ✅ 已接上，样本也取过 | env 早已配上：`batch_metrics`（`meta.mode='deskcore_commit'`）里第一批判出 `ok` 的在 2026-10-12，到 11-02 有 37 批（2026-11-04 只读）。10-16 J-08 拿 10-12～10-15 的样本（9 批 / 84 篇，判定段最长 4.3 秒）把判定的截止改成只拿整次回包剩下的时间，`JUDGE_TIMEOUT_SEC` 仍是默认 8（`docs/deskcore.md` §3.8）。之后照 §3.8 那几句 SQL 看 `commit` / `delivery_rules` / `judge` / `total` 的 p95 就行；`timeout` 占比高先看是不是并发不够（`JUDGE_MAX_WORKERS`），别先加截止 |
 | 7f | 覆盖面决定回写 truth-vault `DECISIONS.md` | 跨仓决策归 TV 记。本仓定的是「入库判定只挂 `commit_drafts`，补录的已发布笔记由 TV 事后抽取（docs/31 位置 ①）覆盖」（设计审查 2026-09-23 §4 #1 纠正了 D-071 的读法），写在 `docs/deskcore.md` §3.8；TV 那边要补一条引用它，并确认 ① 的抽取确实覆盖补录进来的那些项目 |
-| 7g | 跑 `011` 并给 `tv_project_map` 补齐映射 | `011` 只建视图，没人读它不坏；但入库判定按 TV 项目号走出境口径，没映射的项目（如 Hatherine）一篇都不发。补映射同时也让 tv-sync 覆盖到它们 |
+| ~~7g~~ | ~~跑 `011` 并给 `tv_project_map` 补齐映射~~ ✅ 已跑、已补 | 2026-11-04 只读：`011` 的视图 `v_angle_outcomes` 在生产库；Hatherine 已接进 TV，写作台的 Hatherine 项目 9 个里 8 个在 `tv_project_map` 里，没映射的那个照旧不判（§1.7 第 4 步）。入库判定按 TV 项目号走出境口径，以后新接的项目没映射照样一篇都不发，`tv-map add` 补上，tv-sync 也跟着覆盖到它 |
 | 7h | W-31 部署后看头几场存档（2026-10-27，纯代码、不用迁移） | `score_drafts` 现在把「带了 key、台账却对不上」单独数（`unknown_angle_keys` / `used_angle_keys`，`batch_metrics.counters` 同名），key 对不上的再按 `meta.angle_key_mismatch[].problem` 分 `unknown`（编的）/ `other_project`（别的项目的牌）/ `not_in_ledger`（台账没写进去）/ `used`，模型传回的臂对不上服务端发的时以服务端为准（`meta.flywheel_arm_reported` 记传回的那个；部署重启后核对不了的另标 `meta.flywheel_arm_unverified`，分析对照组时剔掉），被拒的按原因记进 `meta.rejected_by` / `rejected_signals` / `rejected_scope` / `empty_body_fields`。看：① 有 key 对不上的批次，之后同一场的批次 `unknown_angle_keys` 回到 0（写手那边的 AI 看到回包改了）；② TV 夜跑角度台账判据 A 不再因为 key 对不上点名整轮；③ 全拒（written 0）的批次 `rejected_by` 有值；④ `not_in_ledger` 多起来就去查发牌那一步 `record_draw` 的失败日志，不是写手的问题。SQL 在 `docs/deskcore.md` §3.12。`archive_pending.angle_key_mismatch` 记在进程内存里，部署重启后清空，属正常 |
 
 ### P2 · 攒够再做
