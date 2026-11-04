@@ -8,7 +8,9 @@ score_drafts 改稿(replaces_version_id)先摘掉旧 item 的全部指纹、查�
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import datetime
 import logging
 
 import pytest
@@ -141,3 +143,111 @@ def test_a_revision_that_did_not_attach_to_the_item_is_not_backfilled(monkeypatc
     assert not _rows(c, v1), "旧稿的文字不补回去"
     assert (gap["missing"], gap["rebuilt"], gap.get("skipped")) == (0, 0, 1)
     assert not any(r.levelno >= logging.WARNING and "没有指纹行" in r.getMessage() for r in caplog.records)
+
+
+# ── Codex review on #146 ────────────────────────────────────────────────────────────────────────
+
+def _fail_pointer(*a, **k):
+    raise RuntimeError("best 挪不过去")
+
+
+def test_a_revision_that_lands_while_the_heal_waits_for_the_lock_is_not_undone(monkeypatch):
+    # Codex P2: tv-sync 拿锁之前看到旧版没有指纹行(改稿正摘着), 等它拿到锁, 那次改稿已经把新版和新指纹写进库、只是 best 没挪
+    # 过去。锁外那次"同 item 别的版本有没有行"的判断已经过时了: 照它补, 旧稿的文字就回到查重里, 一篇帖的新旧两版都在。
+    # 该补哪几版要按锁里读到的为准。
+    c, v1 = _crashed(monkeypatch)
+    real_lock = core._project_write_lock
+    fired = []
+
+    @contextlib.contextmanager
+    def racing(client, pid, holder, *a, **k):
+        if holder.startswith("tv-sync-heal") and not fired:
+            fired.append(holder)
+            with monkeypatch.context() as m:              # 拿锁前那一瞬, 改稿落了地(新版 + 新指纹), best 没挪
+                m.setattr(store, "point_item_at_version", _fail_pointer)
+                out = core.commit_drafts(_embed(c), PROJ, [{"title": "秋招等回音", "body": BODY_A2,
+                                                            "replaces_version_id": v1}], user_id=ME)
+            assert "replace_warning" in out
+            _joinable(c)
+        with real_lock(client, pid, holder, *a, **k) as got:
+            yield got
+    monkeypatch.setattr(core, "_project_write_lock", racing)
+
+    gap = core.tv_sync(c, TV)["fingerprint_gap"]
+    assert fired, "前提: 自愈确实要去拿锁"
+    item = next(i for i in c.rows["items"] if i.get("best_version_id") == v1)
+    v2 = next(v["id"] for v in c.rows["versions"] if v.get("item_id") == item["id"] and v["id"] != v1)
+    assert _rows(c, v2) and not _rows(c, v1), "旧稿的文字不补回去"
+    assert (gap["missing"], gap["rebuilt"], gap["skipped"], gap["error"]) == (0, 0, 1, None)
+
+
+def _big_project(c, n: int, *, missing_at: int) -> str:
+    """n 个 item(越往后越老), 第 ``missing_at`` 个是写作台的定稿版本、没有指纹行; 其余是别的引擎的老稿。直接摆好嵌套形态
+    (假库没有真 join, _joinable 在这个量级上太慢)。回缺指纹的那个 version_id。"""
+    bid = "batch-big"
+    c.rows.setdefault("batches", []).append({"id": bid, "project_id": PROJ, "params": {}})
+    batch = {"project_id": PROJ, "params": {}}
+    missing, start = None, datetime.datetime(2026, 10, 28, tzinfo=datetime.timezone.utc)
+    for i in range(n):
+        iid, vid = f"item-big-{i:05d}", f"ver-big-{i:05d}"
+        created = (start - datetime.timedelta(minutes=i)).isoformat()
+        v = {"id": vid, "item_id": iid, "version_num": 1, "title": f"老稿{i}",
+             "body": f"第{i}篇老稿的正文, 写在{created}, 讲的是秋招等回音的那几个星期",
+             "created_at": created, "ai_engine": store.DESKCORE_AI_ENGINE if i == missing_at else "manual"}
+        if i == missing_at:
+            missing = vid
+        c.rows.setdefault("versions", []).append(v)
+        c.rows.setdefault("items", []).append({"id": iid, "batch_id": bid, "best_version_id": vid, "user_id": ME,
+                                               "created_at": created, "versions": [v], "batches": batch})
+    return missing
+
+
+def test_a_gap_older_than_the_backfill_cap_is_rebuilt():
+    # Codex P2: versions_for_linking 扫整个项目, 而 backfill 的默认翻页只到最新 5000 个 item —— 更老的那一版缺指纹, 每晚都报
+    # missing 1 / rebuilt 0、不报错。点名补的那几版要按 id 直接取。
+    c = _client()
+    c.rpc_impl["deskcore_tv_notes"] = lambda a: []
+    vid = _big_project(c, 5001, missing_at=5000)
+    assert vid not in {r["version_id"] for pg in store.legacy_version_pages(c, PROJ) for r in pg}, \
+        "前提: 它在默认上限之外"
+    gap = core.tv_sync(c, TV)["fingerprint_gap"]
+    assert (gap["missing"], gap["rebuilt"], gap.get("unrepaired"), gap["error"]) == (1, 1, 0, None)
+    (row,) = _rows(c, vid)
+    body = next(v["body"] for v in c.rows["versions"] if v["id"] == vid)
+    assert row["opening_hash"] == fp.opening_hash(body) and row["ngram_hashes"] == fp.ngram_hashes(body)
+
+
+def test_a_gap_that_stays_unrepaired_is_counted_and_fails_the_nightly_run(monkeypatch, capsys):
+    # 补了还是没有行的(写入静默没落地之类), 不能是 missing 1 / rebuilt 0 而不报错: 数出来, 夜报里亮红、退出码非零
+    import argparse
+    from deskcore import cli
+    c, v1 = _crashed(monkeypatch)
+    monkeypatch.setattr(store, "write_fingerprints", lambda *a, **k: 0)
+    gap = core.tv_sync(c, TV)["fingerprint_gap"]
+    assert (gap["missing"], gap["rebuilt"], gap.get("unrepaired")) == (1, 0, 1)
+    args = argparse.Namespace(tv_project=TV, all=False, dry_run=False, write_tv=False, since=None, rematch=False)
+    rc = cli._tv_sync(core, c, args)
+    printed = capsys.readouterr().out
+    assert rc == 1 and "还是没有指纹行" in printed and v1[:8] in printed
+
+
+def test_a_version_whose_item_moved_on_while_waiting_for_the_lock_is_not_refilled(monkeypatch):
+    # 锁里按 item 现在的定稿版本取: 等锁这会儿 best 挪到了新版(新版自己的行还没写), 旧版不补, 也不算补不上
+    c, v1 = _crashed(monkeypatch)
+    real_lock = core._project_write_lock
+    item = next(i for i in c.rows["items"] if i.get("best_version_id") == v1)
+
+    @contextlib.contextmanager
+    def racing(client, pid, holder, *a, **k):
+        if holder.startswith("tv-sync-heal") and item["best_version_id"] == v1:
+            c.rows["versions"].append({"id": "v-next", "item_id": item["id"], "version_num": 9,
+                                       "title": "秋招等回音", "body": BODY_A2})
+            item["best_version_id"] = "v-next"
+            _joinable(c)
+        with real_lock(client, pid, holder, *a, **k) as got:
+            yield got
+    monkeypatch.setattr(core, "_project_write_lock", racing)
+
+    gap = core.tv_sync(c, TV)["fingerprint_gap"]
+    assert item["best_version_id"] == "v-next" and not _rows(c, v1)
+    assert (gap["missing"], gap["rebuilt"], gap["skipped"], gap["unrepaired"], gap["samples"]) == (0, 0, 1, 0, [])

@@ -550,6 +550,12 @@ def _tv_sync(core, sb, args) -> int:
             print(f"  ⚠️ 写作台定稿版本没有指纹行的 {gp['missing']} 个: "
                   + ("预演, 没补" if out.get("dry_run") else f"已按 backfill 补回 {gp['rebuilt']} 行")
                   + "; " + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("samples") or []))
+        if gp.get("unrepaired"):
+            # codex review on #146: 补过之后还是没有行的, 不能只在 missing 里一闪而过
+            print(f"  ⚠️ 写作台定稿版本补过之后还是没有指纹行的 {gp['unrepaired']} 个: "
+                  + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("unrepaired_samples") or [])
+                  + " —— 查重看不见它们; 手动 `python -m deskcore.cli backfill --project <项目>` 后再看。")
+            rc = 1
         if gp.get("error"):
             print(f"  ⚠️ 补定稿版本的指纹失败: {gp['error']} —— 对照照常写了; 明晚再补, 急的话手动 "
                   "`python -m deskcore.cli backfill --project <项目>`。")

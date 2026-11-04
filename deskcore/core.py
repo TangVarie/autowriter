@@ -5473,6 +5473,8 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
     不受影响。
 
     ``only_version_ids``: 只补这几版(tv-sync 的指纹自愈, 外部评审 11-04 F05, 见 _heal_fingerprint_gaps); 不给就是整个项目。
+    点名的按 id 直接取(store.legacy_version_rows_for), 不走整个项目的翻页 —— 那条带 5000 上限, 更老的那版会一直补不上
+    (codex review on #146)。现在已经不是自己 item 定稿版本的那几版不补, 列在 ``not_final`` 里。
     """
     # 审计 ROB-011: 逐页消费, 不再把整个项目的历史成稿(全文 + 每条 768 个
     # Python float)同时留在内存。5000 条那一档原来是三四百 MB 峰值 —— 容器
@@ -5550,9 +5552,13 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
             })
         written += store.write_fingerprints(client, payload)
 
-    for page in store.legacy_version_pages(client, project_id):
-        if only_version_ids is not None:
-            page = [r for r in page if str(r.get("version_id")) in only_version_ids]
+    if only_version_ids is not None:
+        pages = [store.legacy_version_rows_for(client, project_id, only_version_ids)]
+        found = {str(r.get("version_id")) for r in pages[0]}
+        not_final = sorted(str(v) for v in only_version_ids if str(v) not in found)
+    else:
+        pages, not_final = store.legacy_version_pages(client, project_id), []
+    for page in pages:
         total += len(page)
         for r in page:
             if r.get("version_id") in done_ids:
@@ -5570,14 +5576,15 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
     if progress and todo_seen:
         progress(processed, todo_seen)
 
+    extra = {"not_final": not_final} if only_version_ids is not None else {}
     if not total:
         return {"total": 0, "already": 0, "written": 0, "embedded": 0,
-                "reused_embeddings": 0, "missing_embeddings": 0}
+                "reused_embeddings": 0, "missing_embeddings": 0, **extra}
     if not todo_seen:
         return {"total": total, "already": already, "written": 0, "embedded": 0,
-                "reused_embeddings": 0, "missing_embeddings": 0}
+                "reused_embeddings": 0, "missing_embeddings": 0, **extra}
 
-    out = {
+    out = {**extra, 
         "total": total, "already": already, "written": written,
         "embedded": reused + computed,
         "reused_embeddings": reused, "computed_embeddings": computed,
@@ -9782,12 +9789,37 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
 # 时, best 还指着旧版、旧版的行是故意撤掉的, 新的文字在同一个 item 的新版下 —— 再把旧稿的文字补回去, 一篇帖的新旧两版就都在
 # 查重里了。所以同一个 item 别的版本还有指纹行的不补(只数 skipped)。新版连 versions 行都没建成的那种从库里认不出来, 照补;
 # 日志也就不猜原因。
+# codex review on #146: (1) 锁外看到的缺口只是"可能缺" —— 改稿正摘着旧版的行时 tv-sync 看了一眼, 等它拿到锁, 那次改稿可能已经
+# 把新版和新指纹写进库(best 没挪)。补哪几版只按【锁里】重读的指纹行、同 item 的版本、item 的定稿版本来定。(2) 点名的那几版按 id
+# 直接取, 不受回填翻页的 5000 上限; 补完在锁里再读一遍, 还是没有行的数进 ``unrepaired``(夜报亮红), 不再是 missing 1 / rebuilt 0
+# 而一声不响。
+
+def _replaced_on_item(client, vids: dict[str, str | None], gap: list[str], have: set[str]) -> set[str]:
+    """``gap`` 里同一个 item 别的版本有指纹行的那几版(改稿落了地、只是 best 没挪过去)。"""
+    items = [vids[v] for v in gap if vids.get(v)]
+    siblings = store.version_ids_of_items(client, items) if items else {}
+    return {v for v in gap if any(s["id"] != v and s["id"] in have for s in siblings.get(str(vids.get(v)), ()))}
+
 
 def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, holder: str,
                            dry_run: bool = False) -> dict:
     """``best``: ``{项目: {写作台定稿版本的 version_id: item_id}}``。
-    回 ``{"checked", "missing", "rebuilt", "skipped", "error", "samples"}``。"""
-    out = {"checked": 0, "missing": 0, "rebuilt": 0, "skipped": 0, "error": None, "samples": []}
+    回 ``{"checked", "missing", "rebuilt", "skipped", "unrepaired", "error", "samples", "unrepaired_samples"}``。"""
+    out = {"checked": 0, "missing": 0, "rebuilt": 0, "skipped": 0, "unrepaired": 0, "error": None,
+           "samples": [], "unrepaired_samples": []}
+
+    def _skip(pid: str, vs, why: str) -> None:
+        if vs:
+            out["skipped"] += len(vs)
+            logger.info("tv_sync: %d 个定稿版本没有指纹行、但%s, 不补 (project=%s): %s",
+                        len(vs), why, pid, ", ".join(sorted(vs)[:5]))
+
+    def _missing(pid: str, gap: list[str]) -> None:
+        out["missing"] += len(gap)
+        out["samples"].extend({"project_id": pid, "version_id": v} for v in gap[:max(0, 5 - len(out["samples"]))])
+        logger.warning("tv_sync: %d 个写作台定稿版本没有指纹行, %s (project=%s): %s",
+                       len(gap), "预演不补" if dry_run else "按 backfill 补回", pid, ", ".join(gap[:5]))
+
     for pid, vids in best.items():
         if not vids:
             continue
@@ -9795,27 +9827,39 @@ def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, ho
             have = store.existing_fingerprint_version_ids(client, pid)
             gap = sorted(set(vids) - have)
             out["checked"] += len(vids)
-            if gap:
-                items = [vids[v] for v in gap if vids.get(v)]
-                siblings = store.version_ids_of_items(client, items) if items else {}
-                replaced = {v for v in gap
-                            if any(s["id"] != v and s["id"] in have for s in siblings.get(str(vids.get(v)), ()))}
-                if replaced:
-                    out["skipped"] += len(replaced)
-                    logger.info("tv_sync: %d 个定稿版本没有指纹行、但同一个 item 的别的版本有(改稿没挂上 item), 不补 "
-                                "(project=%s): %s", len(replaced), pid, ", ".join(sorted(replaced)[:5]))
-                    gap = [v for v in gap if v not in replaced]
             if not gap:
                 continue
-            out["missing"] += len(gap)
-            out["samples"].extend({"project_id": pid, "version_id": v} for v in gap[:max(0, 5 - len(out["samples"]))])
-            logger.warning("tv_sync: %d 个写作台定稿版本没有指纹行, %s (project=%s): %s",
-                           len(gap), "预演不补" if dry_run else "按 backfill 补回", pid, ", ".join(gap[:5]))
             if dry_run:
+                replaced = _replaced_on_item(client, vids, gap, have)
+                _skip(pid, replaced, "同一个 item 的别的版本有(改稿没挂上 item)")
+                if gap := [v for v in gap if v not in replaced]:
+                    _missing(pid, gap)
                 continue
             with _project_write_lock(client, pid, holder):
+                # 锁里重读: 改稿也持这把锁, 等锁这会儿它可能已经落地。锁外的那一眼只决定要不要来拿锁
+                have = store.existing_fingerprint_version_ids(client, pid)
+                gap = [v for v in gap if v not in have]
+                replaced = _replaced_on_item(client, vids, gap, have) if gap else set()
+                _skip(pid, replaced, "同一个 item 的别的版本有(改稿没挂上 item)")
+                gap = [v for v in gap if v not in replaced]
+                if not gap:
+                    continue
+                _missing(pid, gap)
                 res = backfill_fingerprints(client, pid, only_version_ids=set(gap))
-            out["rebuilt"] += int(res.get("written") or 0)
+                out["rebuilt"] += int(res.get("written") or 0)
+                not_final = set(res.get("not_final") or ())
+                _skip(pid, not_final, "已经不是自己 item 的定稿版本(best 挪走了)")
+                if not_final:                           # 那几版不算缺(换下来的旧版本来就该没有行)
+                    out["missing"] -= len(not_final)
+                    out["samples"] = [x for x in out["samples"] if x["version_id"] not in not_final]
+                have = store.existing_fingerprint_version_ids(client, pid)
+            left = [v for v in gap if v not in have and v not in not_final]
+            if left:
+                out["unrepaired"] += len(left)
+                out["unrepaired_samples"].extend(
+                    {"project_id": pid, "version_id": v} for v in left[:max(0, 5 - len(out["unrepaired_samples"]))])
+                logger.warning("tv_sync: %d 个定稿版本补过之后还是没有指纹行 (project=%s): %s",
+                               len(left), pid, ", ".join(left[:5]))
         except Exception as exc:                        # noqa: BLE001 — 对照已经写了; 明晚再补
             logger.exception("tv_sync: 补定稿版本的指纹失败 (project=%s)", pid)
             out["error"] = out["error"] or f"{type(exc).__name__}: {exc}"[:300]

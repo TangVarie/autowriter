@@ -1653,12 +1653,7 @@ def legacy_version_pages(sb, project_id: str, limit: int | None = 5000,
     """
     def _build(off, lim):
         return (sb.table("items")
-                  .select("id, best_version_id, user_id, created_at, "
-                          "versions(id, title, body, version_num, embedding), "
-                          # params 带上: 行里标出补录副本(TV 审计 B-19), 回填照常收它们
-                          # (副本也要指纹, 不然和它正文相同的 TV 笔记隔天又补一份), 只是
-                          # 核对 / 清单的数字要把"真写"和"副本"分开说。
-                          "batches!inner(project_id, params)")
+                  .select(_LEGACY_ITEM_COLS)
                   .eq("batches.project_id", project_id)
                   .order("created_at", desc=True)
                   .order("id", desc=True)
@@ -1666,31 +1661,64 @@ def legacy_version_pages(sb, project_id: str, limit: int | None = 5000,
 
     try:
         for raw in _paged_iter(_build, page=page, hard_cap=limit):
-            out: list[dict] = []
-            for item in raw:
-                versions = item.get("versions") or []
-                if not versions:
-                    continue
-                best = item.get("best_version_id")
-                chosen = next((v for v in versions if v.get("id") == best), None)
-                if chosen is None:
-                    chosen = max(versions, key=lambda v: v.get("version_num") or 0)
-                title = (chosen.get("title") or "").strip()
-                body = (chosen.get("body") or "").strip()
-                if not (title or body):
-                    continue
-                out.append({
-                    "version_id": chosen.get("id"),
-                    "user_id": item.get("user_id"),
-                    "title": title,
-                    "body": body,
-                    "embedding": db._parse_pgvector(chosen.get("embedding")),
-                    "ingest": is_ingest_batch(item.get("batches")),
-                })
-            yield out
+            yield [r for r in map(_legacy_row, raw) if r]
     except Exception:
         logger.exception("read legacy versions failed (project=%s)", project_id)
         raise
+
+
+_LEGACY_ITEM_COLS = ("id, best_version_id, user_id, created_at, "
+                     "versions(id, title, body, version_num, embedding), "
+                     # params 带上: 行里标出补录副本(TV 审计 B-19), 回填照常收它们
+                     # (副本也要指纹, 不然和它正文相同的 TV 笔记隔天又补一份), 只是
+                     # 核对 / 清单的数字要把"真写"和"副本"分开说。
+                     "batches!inner(project_id, params)")
+
+
+def _legacy_row(item: dict) -> dict | None:
+    """一个 item 的定稿版本(best; 没有 best 就取最新一版), 回填要的那一行。没版本、标题正文都空的回 None。"""
+    versions = item.get("versions") or []
+    if not versions:
+        return None
+    best = item.get("best_version_id")
+    chosen = next((v for v in versions if v.get("id") == best), None)
+    if chosen is None:
+        chosen = max(versions, key=lambda v: v.get("version_num") or 0)
+    title = (chosen.get("title") or "").strip()
+    body = (chosen.get("body") or "").strip()
+    if not (title or body):
+        return None
+    return {
+        "version_id": chosen.get("id"),
+        "user_id": item.get("user_id"),
+        "title": title,
+        "body": body,
+        "embedding": db._parse_pgvector(chosen.get("embedding")),
+        "ingest": is_ingest_batch(item.get("batches")),
+    }
+
+
+def legacy_version_rows_for(sb, project_id: str, version_ids) -> list[dict]:
+    """点名的那几版, 形态同 ``legacy_version_pages`` 的一行; 只回本项目的、而且【现在】仍是自己 item 定稿版本的那些。
+
+    tv-sync 的指纹自愈(core._heal_fingerprint_gaps)用: 它从 ``versions_for_linking`` 扫的是整个项目, 原来补的时候却走
+    ``legacy_version_pages`` 的默认 5000 上限再按 id 筛 —— 更老的那一版缺指纹, 每晚报 missing 1 / rebuilt 0、不报错
+    (codex review on #146)。这里按 id 直接取: 先查这几版的 item, 再按 item 取(和翻页那条同一个 select、同一个"定稿版本"
+    口径), 所以 best 已经挪走的那版不会回来。
+    """
+    wanted = {str(v) for v in version_ids}
+    if not wanted:
+        return []
+    item_ids: list[str] = []
+    for chunk in db._in_chunks(sorted(wanted), 100):
+        res = sb.table("versions").select("id, item_id").in_("id", chunk).execute()
+        item_ids += [str(r["item_id"]) for r in (res.data or []) if r.get("item_id")]
+    out: list[dict] = []
+    for chunk in db._in_chunks(list(dict.fromkeys(item_ids)), 100):
+        res = (sb.table("items").select(_LEGACY_ITEM_COLS)
+               .in_("id", chunk).eq("batches.project_id", project_id).execute())
+        out += [r for r in map(_legacy_row, res.data or []) if r and str(r["version_id"]) in wanted]
+    return out
 
 
 def existing_fingerprint_version_ids(sb, project_id: str) -> set[str]:
