@@ -4,7 +4,7 @@
 是 0 条。原设计让运营把 export_drafts 导出的六个 ID 列手抄进飞书, 三周零匹配。
 两边在同一个库里、内容都是写作台产的, 所以改成**在库里按内容对**:
 
-  1. 正文前 40 字(去标点)相同           → body_exact
+  1. 正文前 40 字(去标点)相同, 后面也沾边 → body_exact(F02: 开头之后是另一篇、标题也不同的不认)
   2. 标题(去标点)相同                    → title_exact
   3. 都对不上, 在时间窗内按四字串包含度  → fuzzy(发布稿是从这版改出来的)
   4. 包含度 0.30~0.60, 而且最像的那版比第二像的高出 0.15 以上 → edited(人改得多, 但还是这一篇)
@@ -284,9 +284,43 @@ def weak_title_only(m: Match) -> bool:
     return m.kind == "ambiguous" and bool(m.candidates) and all(c.get(WEAK_TITLE_KEY) for c in m.candidates)
 
 
+# ── 开头一样、后面是另一篇的不认开头(2026-11-04, 外部评审 11-04 F02) ─────────────────────────────────
+# 开头档原来只看正文前 PREFIX_CHARS 字: 一个候选就认 body_exact、分数写死 1.0, 不看后面、也不看时间窗。别的帖借用了一版的开头
+# (写作台外写的帖、或者人只留了开头整篇重写), 就被连到那一版上 —— TV 血缘回填、改动差异、W-40 都按它走, W-34 的 still_same
+# 又因为开头一样一直认它, 永远纠不回来(评审复现: 全文包含度 0.23 照样 body_exact 1.0)。
+# 所以: 开头之后的那段(从第 PREFIX_CHARS 个字起的四字串)两边都够 FUZZY_MIN_GRAMS 个、笔记那段只有不到 PREFIX_TAIL_FLOOR 在那一版
+# 里、标题也不一样的, 开头档不认它, 往下走标题 / 内容那几档(同 F04 的 _weak_title)。不拿全文包含度判: 帖短(生产中位 105 字)时
+# 光是开头 40 字就够 0.30 以上, 看不出后面换没换。标题一样的照旧认(人留了开头和标题、把后面重写的, 还是那一篇)。分数记真的包含度。
+# 生产库 11-04: 372 条 body_exact 里开头之后的包含度不到 0.10 的 1 条(标题也一样, 照旧认), 0.10~0.30 的 1 条(人删得很狠, 0.29)。
+PREFIX_TAIL_FLOOR = 0.15
+
+
+def _tail_grams(text: str, n: int = 4) -> set[str]:
+    """正文开头 PREFIX_CHARS 字之后那一段的四字串(去标点之后数)。"""
+    s = fp.normalize(text)
+    return {s[i:i + n] for i in range(PREFIX_CHARS, len(s) - n + 1)}
+
+
+def prefix_tail_differs(note: Note, v: Version, version_grams: set[str] | None = None) -> bool:
+    """开头一样的这一对, 开头之后其实是另一篇(见上面那段): 标题不一样(或没有能比的标题)、开头之后的四字串两边都够
+    FUZZY_MIN_GRAMS 个、笔记那段在这一版全文里的不到 PREFIX_TAIL_FLOOR。"""
+    tk = title_key(note.title)
+    if tk and tk == title_key(v.title):
+        return False
+    nt = _tail_grams(note.body)
+    if len(nt) < FUZZY_MIN_GRAMS or len(_tail_grams(v.body)) < FUZZY_MIN_GRAMS:
+        return False
+    vg = grams(v.body) if version_grams is None else version_grams
+    return len(nt & vg) / len(nt) < PREFIX_TAIL_FLOOR
+
+
 def match_note(note: Note, index: VersionIndex) -> Match:
     pk = prefix_key(note.body)
     exact = list(index.by_prefix.get(pk, ())) if pk else []
+    # F02: 时间窗外的、开头之后是另一篇的不进开头档(见上面那段)。后者也不让内容那一路再连回去: 帖短的时候光开头就够
+    # EDITED_FLOOR, 不拦的话换个名目(edited)又连上了 —— 已经认出来它只是借了开头
+    other = {v.version_id for v in exact if prefix_tail_differs(note, v, index.grams_of(v))}
+    exact = [v for v in exact if in_window(lag_days(note, v)) and v.version_id not in other]
     kind = "body_exact"
     ng = grams(note.body)
     weak: list[Version] = []
@@ -303,14 +337,14 @@ def match_note(note: Note, index: VersionIndex) -> Match:
     if exact:
         if len(exact) == 1:
             v = exact[0]
-            return Match(kind, v, 1.0 if kind == "body_exact" else
-                         index.containment(ng, v), lag_days(note, v))
+            # 分数记真的包含度(F02: 开头档原来写死 1.0, 看不出后面改了多少)
+            return Match(kind, v, index.containment(ng, v), lag_days(note, v))
         v, score, listed = _pick(note, exact, index)
         if v is not None:
             return Match(kind, v, score, lag_days(note, v), listed)
         return Match("ambiguous", None, score, None, listed)
 
-    m = _match_by_content(note, ng, index)
+    m = _match_by_content(note, ng, index, exclude=other)
     if weak and m.version is None:
         # 内容也对不上(或分不出): 标题一样的那几版列进候选、标 WEAK_TITLE_KEY, 记 ambiguous 等人看
         listed = {c["version_id"]: c for c in (m.candidates if m.kind == "ambiguous" else [])}
@@ -322,12 +356,13 @@ def match_note(note: Note, index: VersionIndex) -> Match:
     return m
 
 
-def _match_by_content(note: Note, ng: set[str], index: VersionIndex) -> Match:
-    """开头 / 标题都没对上(或标题档不认)时按四字串包含度对: fuzzy / edited / ambiguous / unmatched。"""
+def _match_by_content(note: Note, ng: set[str], index: VersionIndex, *, exclude: set[str] = frozenset()) -> Match:
+    """开头 / 标题都没对上(或标题档不认)时按四字串包含度对: fuzzy / edited / ambiguous / unmatched。``exclude``: 已经认出
+    只是借了开头的那几版(F02), 不参与。"""
     if len(ng) < FUZZY_MIN_GRAMS:
         return Match("unmatched")
     scored = sorted(((index.containment(ng, v), v) for v in index.versions
-                     if in_window(lag_days(note, v))), key=lambda t: -t[0])
+                     if v.version_id not in exclude and in_window(lag_days(note, v))), key=lambda t: -t[0])
     if not scored or scored[0][0] < EDITED_FLOOR:
         return Match("unmatched")
     best_s, best_v = scored[0]
@@ -481,14 +516,15 @@ def overlap(note: Note, v: Version) -> float:
 def still_same(note: Note, v: Version) -> bool:
     """改过字之后, 这条笔记还是当初对上 v 的那一篇吗? 只拦整篇换掉的, 改几句、删一段的都算还是。
 
-    · 开头 40 字(去标点)和 v 一样 → 是;
+    · 开头 40 字(去标点)和 v 一样 → 是; 但开头之后是另一篇的(prefix_tail_differs, F02)不是;
     · v 有正文(四字串够 FUZZY_MIN_GRAMS): 笔记的四字串至少 EDITED_FLOOR 在 v 里 → 是;
     · v 只有标题(HATHERINE 59 条 title_exact 连的是没正文的稿): 标题(去标点)一样, 或标题的四字串至少 TITLE_SAME_FLOOR
       在 v 的标题里(改了一两个字) → 是。
     笔记没正文的不判(调用方先挡掉): 飞书一时读空, 不能当成换了一篇。"""
     pk = prefix_key(note.body)
     if pk and pk == prefix_key(v.body):
-        return True
+        # F02: 开头一样不够 —— 运营留着开头把后面整篇换掉的, 原来在这里就认了, W-34 永远看不出来
+        return not prefix_tail_differs(note, v)
     vg = grams(v.body)
     if len(vg) >= FUZZY_MIN_GRAMS:
         ng = grams(note.body)
