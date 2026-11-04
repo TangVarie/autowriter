@@ -114,7 +114,12 @@ def test_only_the_drafts_with_fixes_are_named_and_the_rest_is_one_line():
                                _row(3, **_fix(p=0.55))], [])
     step = core._score_report_step(block)
     assert "index 是 1、3 的 2 篇有要改的地方" in step
-    assert "只把这几篇告诉用户" in step and "哪一句" in step and "犯了哪条" in step
+    # W-42(2026-11-04): 不再叫模型把要改的告诉用户、等用户说「按这条改」—— 自己照 fixes 改一轮, 交付时一句话说改了哪里
+    assert "只把这几篇告诉用户" not in step
+    for must in ("不用等用户说", "自己照各自的 fixes 改一轮", "拿不准的也改", "replaces_version_id", "check_drafts",
+                 "「必须改」放在同一轮改", "一句话说清改了哪篇的哪里"):
+        assert must in step, must
+    assert step.index("check_drafts") < step.index("score_drafts"), "改过的先过查重再存"
     # 有要改的那一批不叫模型说「合规检查都过了」(照念会把整批说成过了), 其余几篇只说没查出要改的
     assert "另外 2 篇没查出要改的地方" in step and "合规检查都过了" not in step
     assert "不用报分数" in step
@@ -123,12 +128,41 @@ def test_only_the_drafts_with_fixes_are_named_and_the_rest_is_one_line():
     assert block["results"][1]["fixes"][0]["instruction"].startswith("「功效承诺」")
 
 
+def test_a_revision_that_still_has_fixes_is_not_sent_round_again():
+    """W-42(2026-11-04): 合规问题模型自己改一轮。改过重存(这次带 replaces_version_id)之后还查出来的不再叫它接着改 ——
+    不然改 → 判 → 改地转下去; 只照实说一句。同一批里没改过的那篇照样叫它改。"""
+    block = core._judge_block([_row(0, **_fix()), _row(1, **_fix(p=0.55)), _row(2, passed=True)], [])
+    step = core._score_report_step(block, revised={1})
+    assert "index 是 0 的 1 篇有要改的地方" in step and "自己照各自的 fixes 改一轮" in step
+    assert "另外 index 是 1 的 1 篇是这次改过重存的" in step and "改一轮就够, 不再接着改" in step
+    assert "跟用户照实说一句" in step and "另外 1 篇没查出要改的地方" in step
+    only_revised = core._score_report_step(core._judge_block([_row(0, **_fix())], []), revised={0})
+    assert only_revised.startswith("参考分(不拦交付): judge.results 里 index 是 0 的 1 篇是这次改过重存的")
+    assert "自己照各自的 fixes 改一轮" not in only_revised and "合规检查都过了" not in only_revised
+    _writer_safe(step)
+
+
+def test_score_drafts_tells_the_model_not_to_rewrite_a_revision_again(judge_on):
+    """接在 commit_drafts 上: 改稿重存那次判出来还有 fixes, next_step 叫它照实说, 不再改。"""
+    from tests.test_deskcore_commit_judge import BODY_A2, _embed
+    c = _client()
+    first = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A}], user_id=ME)
+    judge_on["reply"] = lambda p: judge_client.result(judge_client.JUDGE_OK, passed=False, **_fix())
+    _embed(c)
+    out = core.commit_drafts(c, PROJ, [{"title": "甲", "body": BODY_A2,
+                                        "replaces_version_id": first["version_ids"][0]}], user_id=ME)
+    assert out["written"] == 1 and out["replaced"]
+    step = out["next_step"]
+    assert "是这次改过重存的, 还查出了合规问题: 改一轮就够, 不再接着改" in step, step
+    assert "自己照各自的 fixes 改一轮" not in step
+
+
 def test_hard_fails_without_a_plan_still_count_as_something_to_change():
     """修改单没回来(plan 空)也算要改: 依据句在修改单里, 这时说 hard_fails 里是哪一条没过。"""
     row = _row(0, hard_fails=[["platform_health_v0.1", "fear_sell", "是", 0.9]])
     assert row["fixes"] == [] and row["hard_fails"]
     step = core._score_report_step(core._judge_block([row], []))
-    assert "index 是 0 的 1 篇" in step and "hard_fails 里是哪一条没过" in step
+    assert "index 是 0 的 1 篇" in step and "照 hard_fails 里没过的那一条改" in step
     assert "合规检查都过了" not in step
 
 

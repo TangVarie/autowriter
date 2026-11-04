@@ -133,8 +133,11 @@ def test_brief_survives_project_now_blowing_up(monkeypatch):
 
 def test_open_project_doc_mentions_project_now():
     doc = T.open_project.__doc__ or ""
-    for must in ("project_now", "message", "warming", "unavailable", "不放进开场"):
+    for must in ("project_now", "message", "warming", "unavailable", "放进开场", "skill_update 之后、edit_digest 之前"):
         assert must in doc, must
+    # W-45(2026-11-04 协议升版): message 进开场, 不再是「不放进开场」
+    assert "不放进开场" not in doc and "不放进开场" not in project_now.PROJECT_NOW_TASK
+    assert "放进开场" in project_now.PROJECT_NOW_TASK
 
 
 # ══════════════════════════════════════════════════════════════════════

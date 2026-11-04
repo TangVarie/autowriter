@@ -203,6 +203,10 @@ UNGATED_WITH_REASON = {
                               "它本身是一道版本级的归属核对 —— 调用方自带的 version_id 经 "
                               "store.items_for_versions 按本项目查, 查不到的不发",
     "_record_commit_metrics": "私有辅助函数, 只被已过闸的 commit_drafts 调用; 写一行 batch_metrics",
+    "_schedule_revision_recheck": "AU-F07(11-04): 只被已过闸的 commit_drafts 在尾巴上调; 只把这次改过重存的版本投进后台池子, "
+                                  "不读写库",
+    "_revision_rule_recheck": "AU-F07(11-04): 后台线程本体, 只由 _schedule_revision_recheck 起; 调的 check_rules 开头自己过 "
+                              "assert_project_access(同一个调用者), 之后只更新这次存档刚插的那一行 batch_metrics 的 meta",
     "_delivery_and_rule_checks": "私有辅助函数, 只被已过闸的 commit_drafts 调用(10-20); 项目行是闸返回的那一行, "
                                  "规则走 shared_memories(本项目 + 调用者自己的 global)",
     "build_distillation_task": "私有辅助函数, 由已过闸的 record_edit / my_style 调用",

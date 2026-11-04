@@ -1273,7 +1273,7 @@ def _reference_line(ref: dict | None) -> str | None:
     draw_angles 也不给这张牌带 reference(batch_note 只数卡面上真有参考行的)。
 
     外部参考的尾巴是「不提那篇帖子里的品牌」, 不是「不提任何品牌」(复审): 外部卡的内容形式照项目配额发, 也会分到
-    场景植入这种产品向的形式, 那一篇本来就要点本项目的品牌名(协议 218 行)。"""
+    场景植入这种产品向的形式, 那一篇本来就要点本项目的品牌名(协议「为什么要分方向」那一段: 产品向正文直接点品牌名)。"""
     if not isinstance(ref, dict):
         return None
     kind = ref.get("kind")
@@ -2237,12 +2237,16 @@ def _restore_stash(client, stash: dict[int, list[dict]], indices) -> None:
 # score / fixes 照旧都在 judge.results 里(指标、改稿对照要用), 只是不念。具体是哪几篇由 _score_report_step 写进 next_step。
 # 2026-10-30 复审: 「合规检查都过了」只在每篇都打成了分、而且都没有 fixes / hard_fails / unjudged 时说。只有 unjudged 的
 # (有几道硬约束 Jev 这次没判出来)没有可改的地方, 但也不能说过了 —— 单独一句; 没打成分的(超时 / 跳过)从来不算过。
+# 2026-11-04(W-42, 协议升版): 查出合规问题不再等写手说「第 N 篇按这条改」—— 有 fixes / hard_fails 的那几篇模型自己照 fixes
+# 改一轮(拿不准的也改, 合规上宁严勿松), 和 check_rules 的「必须改」放在同一轮, 交付改好的那一版、一句话说清改了哪里。
+# 改过重存之后还查出来的不再接着改(_score_report_step 按这次带 replaces_version_id 的那几篇分开说), 免得改 → 判 → 改地转。
 SCORE_NOTE = ("参考分: 不拦交付, 也不改 written / rejected。score 满分 100, 只看篇级硬约束(平台合规题 + 特征题库里的"
               "合规题), 文笔好坏不在里面。分数不用逐篇报给用户: 这一批每篇都打成了分、而且都没有 fixes、hard_fails、unjudged, "
-              "才整批说一句「合规检查都过了」; 只把有 fixes 或 hard_fails 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条"
-              "(sure=false 的是 Jev 拿不准的, 看一眼就行, 不一定要改)。只有 unjudged 的那几篇是有几道硬约束这次没判出来, "
-              "不能说都过了, 跟用户提一句就行(不影响交付, 不用重试)。用户要改, 按 fixes 改完, 那篇带 replaces_version_id 先过 "
-              "check_drafts 再调 score_drafts, 改一轮就够, 不要为了分数反复重写。judge_status 不是 ok 就说这篇这次没打成分, 不能说过了, 不用重试。")
+              "才整批说一句「合规检查都过了」。有 fixes 或 hard_fails 的那几篇是查出了合规问题: 不用等用户说, 自己照 fixes 改一轮"
+              "(sure=false 是 Jev 拿不准的, 也改; 没有 fixes 的照 hard_fails 里没过的那一条改), 那几篇带 replaces_version_id 先过 "
+              "check_drafts 再调 score_drafts, 交付改好的那一版, 交付时一句话说清改了哪篇的哪里; 改过一轮还查出来的照实说一句, "
+              "不再接着改, 不要为了分数反复重写。只有 unjudged 的那几篇是有几道硬约束这次没判出来, 不能说都过了, 跟用户提一句就行"
+              "(不影响交付, 不用重试)。judge_status 不是 ok 就说这篇这次没打成分, 不能说过了, 不用重试。")
 JUDGE_SHADOW_NOTE = SCORE_NOTE          # 旧名, 老测试 / 老调用方还在 import
 
 # score_drafts 的 next_step 开头那句(存档成功才有)。判定在它之后才跑, 跑完由 _with_score_report 在它后面接上
@@ -2251,12 +2255,14 @@ JUDGE_SHADOW_NOTE = SCORE_NOTE          # 旧名, 老测试 / 老调用方还在
 ARCHIVED_STEP_HEAD = "这批已存档(下面是给你的指示, 不是要念给用户的原话; 别跟用户提「存档」)。"
 
 
-def _score_report_step(judge: dict | None) -> str:
+def _score_report_step(judge: dict | None, revised=frozenset()) -> str:
     """存档之后「参考分怎么跟用户说」那一句, 按这一批判出来的结果写(2026-10-30 发布收尾)。
 
     · 有 fixes 或 hard_fails 的(``more_fixes`` 也算: 修改单截掉了的那几条同样要改): 点出是 judge.results 里哪几个
-      index, 只说这几篇, 照 fixes 说清哪一句、犯了哪条; 没有 fixes 的说 hard_fails 里是哪一条没过(依据句在修改单里,
-      hard_fails 里不重复一份)。不报分数。
+      index。2026-11-04 起(W-42)不再叫模型告诉用户、等用户说「按这条改」: 模型自己照 fixes 改一轮(拿不准的也改; 没有
+      fixes 的照 hard_fails 里没过的那一条改), 和 check_rules 的「必须改」放在同一轮, 交付改好的那一版、一句话说清改了
+      哪里。``revised`` 是这次带 replaces_version_id 改过重存的那几篇的下标: 它们还查出来的不再叫模型接着改(改一轮就够),
+      只照实说一句。不报分数。
     · 只有 ``unjudged`` 的(有几道硬约束 Jev 这次没判出来, 2026-10-30 复审): 没有一处可改的地方, 但也不能说过了 —— 点出
       是哪几个 index, 单独一句「有几道硬约束这次没判出来, 不能说都过了; 不影响交付, 不用重试」。
     · 判了、什么都没查出来的: 只有在**这一批每篇都是这样**(没有要改的、没有没判出来的、没有没打成分的)时, 才叫模型整批
@@ -2275,12 +2281,21 @@ def _score_report_step(judge: dict | None) -> str:
     unjudged = [r for r in scored if not _to_fix(r) and r.get("unjudged")]
     clean = len(scored) - len(flagged) - len(unjudged)
     unscored = len(rows) - len(scored) + len(judge.get("skipped") or [])
+    revised = set(revised or ())
+    to_fix = [r for r in flagged if r.get("index") not in revised]
+    fixed_once = [r for r in flagged if r.get("index") in revised]
     parts: list[str] = []
-    if flagged:
-        idx = "、".join(str(r.get("index")) for r in flagged)
-        parts.append(f"参考分(不拦交付): judge.results 里 index 是 {idx} 的 {len(flagged)} 篇有要改的地方 —— 只把这几篇告诉"
-                     "用户, 照各自的 fixes 说清要改的是哪一句、犯了哪条(没有 fixes 的就说 hard_fails 里是哪一条没过; "
-                     "sure=false 的说是拿不准、看一眼就行), 不用报分数。")
+    if to_fix:
+        idx = "、".join(str(r.get("index")) for r in to_fix)
+        parts.append(f"参考分(不拦交付): judge.results 里 index 是 {idx} 的 {len(to_fix)} 篇有要改的地方(查出了合规问题) —— "
+                     "不用等用户说, 自己照各自的 fixes 改一轮(sure=false 拿不准的也改; 没有 fixes 的照 hard_fails 里没过的那一条改): "
+                     "这次要调 check_rules 的先调完, 和它的「必须改」放在同一轮改; 改过的那几篇带 replaces_version_id 先过 "
+                     "check_drafts、再调 score_drafts, 交给用户的是改好的那一版, 交付那条回复里一句话说清改了哪篇的哪里。不用报分数。")
+    if fixed_once:
+        idx = "、".join(str(r.get("index")) for r in fixed_once)
+        parts.append((f"另外 index 是 {idx} 的" if to_fix else f"参考分(不拦交付): judge.results 里 index 是 {idx} 的")
+                     + f" {len(fixed_once)} 篇是这次改过重存的, 还查出了合规问题: 改一轮就够, 不再接着改 —— 跟用户照实说一句"
+                     "还查出了哪一句、犯了哪条(sure=false 的说是拿不准), 不用报分数。")
     if unjudged:
         idx = "、".join(str(r.get("index")) for r in unjudged)
         parts.append((f"另外 index 是 {idx} 的" if flagged else f"judge.results 里 index 是 {idx} 的")
@@ -2304,12 +2319,13 @@ def _score_report_step(judge: dict | None) -> str:
     return "".join(parts)
 
 
-def _with_score_report(next_step: str | None, judge: dict | None) -> str | None:
-    """把 _score_report_step 那句接在 next_step 开头那句(ARCHIVED_STEP_HEAD)后面。没有 next_step(一篇都没存进去)就不加。"""
+def _with_score_report(next_step: str | None, judge: dict | None, revised=frozenset()) -> str | None:
+    """把 _score_report_step 那句接在 next_step 开头那句(ARCHIVED_STEP_HEAD)后面。没有 next_step(一篇都没存进去)就不加。
+    ``revised``: 这次改过重存的那几篇的下标(见 _score_report_step)。"""
     if not next_step or not next_step.startswith(ARCHIVED_STEP_HEAD):
         return next_step
     try:
-        step = _score_report_step(judge)
+        step = _score_report_step(judge, revised=revised) if revised else _score_report_step(judge)
     except Exception:                                   # noqa: BLE001 — 存档已经成功, 这一句写不出来也不能把回包弄坏
         logger.warning("score_drafts: 参考分那句没写出来, next_step 不带它", exc_info=True)
         return next_step
@@ -2875,8 +2891,10 @@ def _rejection_meta(drafts: list[dict], rejected: list[dict]) -> dict:
 
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                            out: dict, *, flywheel: dict | None = None, checks: dict | None = None,
-                           commit_parts: dict | None = None, judge_ops: str | None = None) -> None:
+                           commit_parts: dict | None = None, judge_ops: str | None = None) -> tuple[str | None, dict]:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
+
+    回 ``(插进去那一行的 id, meta)``(没插成 id 是 None): 改稿的后台规则复查(AU-F07)把结果并进这份 meta 写回同一行。
 
     ``judge_ops``: 判定块里摘下来的工程原因(JUDGE_OPS_DETAIL_KEY), 落进 meta.judge_detail —— 回包里的 judge.detail 是念给
     写手的话, 查「为什么这批没判」要的是这一句(2026-10-30 复审)。
@@ -2887,6 +2905,7 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
     被出境口径挡了多少", 答案要在库里。
     """
     j = out.get("judge") or {}
+    row_id, meta = None, {}
     try:
         counters = {"drafts": len(drafts), "written": int(out.get("written") or 0),
                     "rejected": len(out.get("rejected") or []),
@@ -2933,12 +2952,13 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
             # 哪几篇的 key 对不上、错在哪、多长 —— 不留 key 本身(模型编的长串可能是一句描述)
             meta["angle_key_mismatch"] = [{"index": p.get("index"), "problem": p.get("problem"),
                                            "length": p.get("length")} for p in out["angle_key_mismatch"]]
-        store.insert_commit_metrics(client, project_id=project_id, user_id=str(user_id),
-                                    phase_ms=out.get("phase_ms") or {},
-                                    counters=counters, meta=meta)
+        row_id = store.insert_commit_metrics(client, project_id=project_id, user_id=str(user_id),
+                                             phase_ms=out.get("phase_ms") or {},
+                                             counters=counters, meta=meta)
     except Exception:                                   # noqa: BLE001 — 埋点不能拖垮入库
         logger.exception("commit_drafts: 指标落库失败(project=%s) —— 入库不受影响",
                          project_id)
+        row_id = None
     try:
         import telemetry
         telemetry.log_event("deskcore_commit", project_id=project_id,
@@ -2952,6 +2972,106 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                             rule_check_hits=((checks or {}).get("rule_checks") or {}).get("hits"))
     except Exception:                                   # noqa: BLE001
         pass
+    return row_id, meta
+
+
+# ── 改稿的后台规则复查(AU-F07, 2026-11-04) ────────────────────────────────────────────────────────────
+# 带 replaces_version_id 改过重存的那几版不进 check_rules_version_ids(改一轮就够, 协议和 check_rules 都这么说), 编译好的
+# 语义规则(Jev 规则题 + 编出来的代码检查)就一直没查过它们 —— 改稿照样过查重、Jev 参考分和人手设的代码检查, 只缺这一样
+# (审计 11-02 F07, 记过的取舍)。W-42 之后合规问题由 AI 自己改, 改稿会变多, 所以存完档在后台对这几版跑一次 check_rules,
+# 摘成只有数和规则 id 的一小块, 并进这次存档那一行 batch_metrics 的 meta.revision_rule_recheck, 只给复盘看:
+# 不进回包、不转给写手、不叫模型再改。和 check_rules 同一个函数, 照样写 Jev 的规则题账本(run_tag=shadow-rules)、缺编译
+# 结果照样触发后台补编。一个工作线程, 名额 _REVISION_RECHECK_SLOTS 个、从投进去占到跑完: 同时最多 4 次(1 次在跑、3 次排着),
+# 第 5 次就不跑(记日志); 进程重启丢掉排着的,
+# 这一行就没有这个键 —— 复盘时没有这个键 = 没复查, 不是复查过了。
+# 测试里默认关掉(tests/conftest.py 把池子换成 None): 后台线程在用例跑完之后还往同一个假件上发请求, 数请求的断言会时红时绿;
+# 要测它的用例自己换成就地跑的池子。
+_REVISION_RECHECK_POOL: list = [cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="revision-recheck")]
+_REVISION_RECHECK_SLOTS = threading.BoundedSemaphore(4)
+_RECHECK_MAX_RULE_IDS = 12
+
+
+def _recheck_digest(results: list[dict]) -> dict:
+    """几次 check_rules 的回包 → meta 里那一小块。只留状态、条数、每版的计数和没守住的规则 id, 不留稿子、规则原文和
+    Jev 指出的句子(同 batch_metrics「只留数, 不留稿子」)。"""
+    keys = ("must_fix", "suggest", "unsure", "not_finished", "unjudged", "code_unchecked", "empty_body")
+    total = {k: 0 for k in keys}
+    statuses: list[str] = []
+    versions: list[dict] = []
+    uncompiled = 0
+    excluded = 0
+    for res in results:
+        statuses.append(str(res.get("status") or "unknown"))
+        uncompiled = max(uncompiled, int(res.get("uncompiled_rules") or 0))
+        excluded += len(res.get("excluded") or [])
+        for k in keys:
+            total[k] += int((res.get("summary") or {}).get(k) or 0)
+        for v in res.get("versions") or []:
+            counts = v.get("counts") or {}
+            row = {"version_id": v.get("version_id"), "judge_status": v.get("judge_status"),
+                   "must_fix": int(counts.get("must_fix") or 0), "suggest": int(counts.get("suggest") or 0),
+                   "unsure": int(counts.get("unsure") or 0)}
+            ids = [str(e.get("rule_id")) for e in v.get("violations") or [] if e.get("rule_id") is not None]
+            if ids:
+                row["rule_ids"] = ids[:_RECHECK_MAX_RULE_IDS]
+            versions.append(row)
+    status = ("error" if "error" in statuses else
+              "checked" if "checked" in statuses else (statuses[0] if statuses else "unknown"))
+    out = {"status": status, **{k: v for k, v in total.items() if v or k in ("must_fix", "suggest", "unsure")},
+           "uncompiled_rules": uncompiled, "versions": versions}
+    if excluded:
+        out["excluded"] = excluded
+    return out
+
+
+def _revision_rule_recheck(client, project_id: str, user_id, version_ids: list[str], tactic: str,
+                           row_id: str, meta: dict) -> dict:
+    """后台跑: 对改过重存的那几版 check_rules(一次 CHECK_RULES_MAX_VERSIONS 篇, 剩下的接着查), 结果并进 meta 写回那一行。
+    **不抛**; 回写进去的那一块(测试用)。"""
+    started = time.monotonic()
+    results: list[dict] = []
+    ids = list(version_ids)
+    try:
+        while ids:
+            res = check_rules(client, project_id, ids, user_id=user_id, tactic=tactic or "")
+            results.append(res)
+            rest = res.get("remaining_version_ids") or []
+            if len(rest) >= len(ids):                    # 防万一: 剩下的没变少就不再转
+                break
+            ids = list(rest)
+        block = _recheck_digest(results)
+    except Exception as exc:                            # noqa: BLE001 — 只给复盘的后台活, 绝不冒泡
+        logger.warning("改稿规则复查没跑成(project=%s, versions=%d)", project_id, len(version_ids), exc_info=True)
+        block = {"status": "error", "error": mask_secrets(f"{type(exc).__name__}: {exc}")[:_JUDGE_BLOCK_TEXT_MAX]}
+    block.update(revised=len(version_ids), elapsed_ms=_ms_since(started),
+                 at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    try:
+        store.update_commit_metrics_meta(client, row_id, {**(meta or {}), "revision_rule_recheck": block})
+    except Exception:                                   # noqa: BLE001
+        logger.warning("改稿规则复查的结果没写回 batch_metrics(project=%s, row=%s)", project_id, row_id, exc_info=True)
+    else:
+        logger.info("改稿规则复查(project=%s): %d 版, status=%s, 必须改 %s 条, 建议改 %s 条", project_id,
+                    len(version_ids), block.get("status"), block.get("must_fix", 0), block.get("suggest", 0))
+    return block
+
+
+def _schedule_revision_recheck(client, project_id: str, user_id, out: dict, tactic: str,
+                               row_id: str | None, meta: dict) -> bool:
+    """这次真改过重存了几版、指标那一行也插进去了, 才在后台复查。排不上 / 关着就跳过。不抛; 回排上了没有。"""
+    vids = [str(r["version_id"]) for r in out.get("replaced") or [] if r.get("version_id")]
+    pool = _REVISION_RECHECK_POOL[0]
+    if not vids or not row_id or pool is None:
+        return False
+    try:
+        fut = _bounded_submit(pool, _REVISION_RECHECK_SLOTS, _revision_rule_recheck,
+                              client, project_id, user_id, vids, tactic, row_id, dict(meta or {}))
+    except Exception:                                   # noqa: BLE001 — 池子关了(进程在退)之类, 不影响存档
+        logger.warning("改稿规则复查没排上(project=%s)", project_id, exc_info=True)
+        return False
+    if fut is None:
+        logger.warning("改稿规则复查排队已满, 这次不复查(project=%s, versions=%d)", project_id, len(vids))
+        return False
+    return True
 
 
 COMMENT_TOOL_NOTE = ("评论只做参考判定，不入稿件库。judge_status 不是 ok 时不能声称检查通过；"
@@ -4702,6 +4822,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 # check_rules(2026-10-20, D-121)是存档之后唯一还要调的一步: 按编译好的规则逐篇查, 只作建议。
                 # 只查新稿(2026-10-20 复审): 带 replaces_version_id 改过重存的, 协议 5a 和 check_rules 自己都说「改一轮就够,
                 # 不用再调」—— 这里再叫它调一次, 最新的那句话就成了「再查」, 多花一轮 Jev 的钱, 还会改 → 查 → 改地转下去。
+                # 改稿那几版由存档之后的后台复查补上(AU-F07, _revision_rule_recheck): 结果只进 batch_metrics, 不叫模型再查再改。
                 replaced_new = {r["version_id"] for r in out["replaced"]}
                 out["check_rules_version_ids"] = [v for v in out["version_ids"] if v not in replaced_new]
                 # 底稿没建成的新稿(identity_warning)没有版本行, check_rules 查不了(独立复审 on aw E: 原来 version_ids 一空就说
@@ -4799,7 +4920,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     # 工程原因只进 batch_metrics, 不进回包(念给写手的是 judge.detail 那一句)
     judge_ops = out["judge"].pop(JUDGE_OPS_DETAIL_KEY, None)
     if out.get("next_step"):
-        out["next_step"] = _with_score_report(out["next_step"], out["judge"])
+        out["next_step"] = _with_score_report(out["next_step"], out["judge"],
+                                              revised={r["index"] for r in out.get("replaced") or []})
     judge_ms = _ms_since(judge_started)
 
     # 「commit_drafts 现在约 1~2 秒」在仓库里没有依据(设计审查 §5)—— 先量, 攒样本再定
@@ -4811,8 +4933,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     out["elapsed_ms"] = _ms_since(started)
     out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms, "delivery_rules": delivery_rules_ms,
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
-    _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta, checks=post_meta,
-                           commit_parts=commit_parts, judge_ops=judge_ops)
+    row_id, metrics_meta = _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta,
+                                                  checks=post_meta, commit_parts=commit_parts, judge_ops=judge_ops)
+    # 改过重存的那几版在后台按编译好的规则复查一次, 结果只进这一行指标(AU-F07, 见 _revision_rule_recheck 上面那段)
+    _schedule_revision_recheck(client, project_id, user_id, out, tactic, row_id, metrics_meta)
     return out
 
 
@@ -7564,8 +7688,8 @@ def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str =
                            partial: int = 0, code_withdrawn: int = 0, questions_unchecked: int = 0) -> str:
     tips = []
     if summary.get("must_fix"):
-        tips.append("「必须改」的照 what / evidence 改完, 那几篇带 replaces_version_id 先过 check_drafts、再用 score_drafts "
-                    "存一次(会重新打分), 改一轮就够, 不用再调 check_rules。")
+        tips.append("「必须改」的照 what / evidence 改完(参考分查出合规问题的那几篇也在这一轮一起改), 那几篇带 replaces_version_id "
+                    "先过 check_drafts、再用 score_drafts 存一次(会重新打分), 交付时一句话说清改了哪里; 改一轮就够, 不用再调 check_rules。")
     if summary.get("suggest"):
         tips.append("「建议改」的告诉用户, 改不改由用户定。")
     if summary.get("unsure"):
