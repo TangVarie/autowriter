@@ -220,9 +220,16 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
         policy = None
     calls = payload.get("calls")
     written = payload.get("written")
+    # 账本没(全)写进去(外部评审 11-04 F04): Jev 的 _write_or_report 写账本失败照样回 200, 判出来的答案照样给, 只在
+    # write_error 里说一句。判定本身是成功的(judge_status 仍是 ok), 但原来这一句直接丢掉, written=0 也没人看 —— 账本悄悄
+    # 少一篇。带回去(先脱敏再截断, 同 result 的 detail), ledger_ok 给 core 计数报警; 口径同 core._ledger_write_failed。
+    raw_werr = payload.get("write_error")
+    write_error = (mask_secrets(raw_werr if isinstance(raw_werr, str) else str(raw_werr))[:_DETAIL_MAX] or None
+                   if raw_werr not in (None, "", [], {}) else None)
     out = {"passed": payload["passed"], "hard_fails": fails,
            "calls": calls if isinstance(calls, int) else None,
            "written": written if isinstance(written, int) else None,
+           "ledger_ok": write_error is None and isinstance(written, int) and not isinstance(written, bool),
            "policy": policy,
            "plan_size": len(raw_plan),
            "plan": plan,
@@ -234,6 +241,8 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
     role = profile.get("product_role") if isinstance(profile, dict) else None
     if isinstance(role, str) and role.strip():
         out["product_role"] = role.strip()[:20]
+    if write_error:
+        out["write_error"] = write_error
     return out
 
 

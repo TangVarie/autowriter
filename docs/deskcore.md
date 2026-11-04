@@ -552,6 +552,11 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 翻页读的），判定的截止要扣掉它花的时间——2026-10-20 起单记，各段加起来约等于 `total`），**同一份数落进
 `batch_metrics`**——它本来就是「每批一行的指标快照」（phase_ms / counters / meta 三个 jsonb），不需要新迁移。
 `batch_id` 留 NULL（本次的 batch 记在 `meta.batch_id`），免得历史页给写作台批次挂上一块全是 0 的「性能指标」。
+**判出来了、账本没写进去的**（外部评审 11-04 F04，2026-11-04）：Jev 写 TV 账本失败照样回 200（答案照给，`written` 是 0、
+`write_error` 里说一句），原来记成 `judge_status=ok`、不计数不报警。现在 `judge_status` 仍是 `ok`（判定本身成功了，写手看到
+的分数不受影响），但 `write_error`（脱敏、截到 300 字）或 `written` 不是整数的那几篇记进 `meta.judge[].ledger_error`、
+`counters.judge_ledger_errors`，打一条 WARNING 和一条 `deskcore_commit_judge_ledger` 埋点（同 `check_rules` 的
+`rules.ledger_write_errors`）；不进回包。AW 补不了账本（`/judge_draft` 不回账本行），要补只能重判那几篇。
 **2026-10-30（W-21）起 commit 段再按步拆开**，记在 `meta.commit_parts_ms`（不进 `phase_ms`，那里各段加起来要等于 `total`；也不进回包）：
 `access`（查项目）、`replace_prep`（改稿摘旧指纹）、`embed`（标题向量）、`gate`（查重闸）、`fingerprints`（原子写指纹）、
 `restore`（被拒的改稿放回旧指纹）、`replace_versions`（改稿挂旧 item）、`arm`（飞轮臂）、`mint`（建 batch / item / version，

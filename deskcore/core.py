@@ -2537,6 +2537,9 @@ _JUDGE_ROW_KEYS = ("judge_status", "passed", "hard_fails", "calls", "written",
 
 _JUDGE_BLOCK_TEXT_MAX = 300
 JUDGE_PRODUCT_ROLE_KEY = "_product_role"
+# 判是判出来了、账本没写进去的那一篇(外部评审 11-04 F04): judge_client 带回来的 write_error。私有键, 只给 batch_metrics,
+# commit_drafts 拿到判定块就摘下来(_pop_judge_ledger_errors), 不进回包 —— 写手看到的分数不受影响, 少的是账本那几行
+JUDGE_LEDGER_ERROR_KEY = "_ledger_error"
 
 
 def _is_sure(p) -> bool:
@@ -2586,7 +2589,32 @@ def _judge_row(target: dict, res: dict) -> dict:
     if res.get("product_role"):
         # 只给 commit_drafts 对贴型用(_add_layer_hints 一律摘掉, 不进回包和 batch_metrics)
         row[JUDGE_PRODUCT_ROLE_KEY] = res["product_role"]
+    if res.get("judge_status") == judge_client.JUDGE_OK and res.get("ledger_ok") is False:
+        # 存档的判定发的是 write=true: 回包带 write_error、或 written 不是整数, 答案就没(全)落进 TV 账本(同 check_rules 的
+        # _ledger_write_failed)。judge_status 仍是 ok —— 判定本身成功了
+        row[JUDGE_LEDGER_ERROR_KEY] = (res.get("write_error") or "回包里没有 written")[:_JUDGE_BLOCK_TEXT_MAX]
     return row
+
+
+def _pop_judge_ledger_errors(judge: dict | None, project_id: str) -> dict[str, str]:
+    """把判定块里每行的 JUDGE_LEDGER_ERROR_KEY 摘下来(不进回包), 回 ``{version_id: 原因}``; 有的话记一条 WARNING 和一条
+    ``deskcore_commit_judge_ledger`` 埋点(同 check_rules 的 deskcore_check_rules_ledger)。"""
+    out: dict[str, str] = {}
+    for row in (judge or {}).get("results") or []:
+        if isinstance(row, dict):
+            err = row.pop(JUDGE_LEDGER_ERROR_KEY, None)
+            if err:
+                out[str(row.get("version_id"))] = err
+    if out:
+        logger.warning("score_drafts: %d 篇判出来了、答案没落进 TV 账本(project=%s): %s", len(out), project_id,
+                       "; ".join(f"{vid}: {err}" for vid, err in list(out.items())[:5]))
+        try:
+            import telemetry
+            telemetry.log_event("deskcore_commit_judge_ledger", project_id=project_id,
+                                judge_ledger_errors=len(out), version_ids=list(out)[:20])
+        except Exception:                               # noqa: BLE001 — 埋点不能拖垮存档
+            pass
+    return out
 
 
 # 判定块里只给 batch_metrics 的那一项(2026-10-30 复审): 整批没发出去的工程原因(没配哪个变量、没接哪张表、查库卡在哪)。
@@ -2891,13 +2919,16 @@ def _rejection_meta(drafts: list[dict], rejected: list[dict]) -> dict:
 
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                            out: dict, *, flywheel: dict | None = None, checks: dict | None = None,
-                           commit_parts: dict | None = None, judge_ops: str | None = None) -> tuple[str | None, dict]:
+                           commit_parts: dict | None = None, judge_ops: str | None = None,
+                           judge_ledger: dict | None = None) -> tuple[str | None, dict]:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
 
     回 ``(插进去那一行的 id, meta)``(没插成 id 是 None): 改稿的后台规则复查(AU-F07)把结果并进这份 meta 写回同一行。
 
     ``judge_ops``: 判定块里摘下来的工程原因(JUDGE_OPS_DETAIL_KEY), 落进 meta.judge_detail —— 回包里的 judge.detail 是念给
     写手的话, 查「为什么这批没判」要的是这一句(2026-10-30 复审)。
+    ``judge_ledger``: 判出来了、答案没落进 TV 账本的那几篇(_pop_judge_ledger_errors), 记进 meta.judge[].ledger_error 和
+    counters.judge_ledger_errors(外部评审 11-04 F04)。
 
     为什么要落库而不只打日志: 「commit_drafts 约 1~2 秒」「一批 10 篇并行也是一两秒」
     都没有样本撑着, 8 秒的截止要拿分位数重定(docs/deskcore.md §3.8 有查法)。Railway
@@ -2916,6 +2947,9 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                     "used_angle_keys": int(out.get("used_angle_keys") or 0)}
         for k, v in (j.get("summary") or {}).items():
             counters[f"judge_{k}"] = v
+        judge_ledger = judge_ledger or {}
+        if judge_ledger:
+            counters["judge_ledger_errors"] = len(judge_ledger)
         meta = {
             "mode": "deskcore_commit",
             "batch_id": out.get("batch_id"),
@@ -2933,7 +2967,9 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                                       if isinstance(h, (list, tuple)) and len(h) > 1],
                        "calls": r.get("calls"), "written": r.get("written"),
                        "elapsed_ms": r.get("elapsed_ms"),
-                       "detail": (r.get("detail") or "")[:200] or None}
+                       "detail": (r.get("detail") or "")[:200] or None,
+                       **({"ledger_error": judge_ledger[str(r.get("version_id"))][:200]}
+                          if str(r.get("version_id")) in judge_ledger else {})}
                       for r in (j.get("results") or [])],
             "judge_skipped": [{"index": s.get("index"), "reason": s.get("reason")}
                               for s in (j.get("skipped") or [])],
@@ -4919,6 +4955,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         logger.warning("score_drafts: 贴型提示没加上(project=%s)", project_id, exc_info=True)
     # 工程原因只进 batch_metrics, 不进回包(念给写手的是 judge.detail 那一句)
     judge_ops = out["judge"].pop(JUDGE_OPS_DETAIL_KEY, None)
+    judge_ledger = _pop_judge_ledger_errors(out["judge"], project_id)
     if out.get("next_step"):
         out["next_step"] = _with_score_report(out["next_step"], out["judge"],
                                               revised={r["index"] for r in out.get("replaced") or []})
@@ -4934,7 +4971,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms, "delivery_rules": delivery_rules_ms,
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
     row_id, metrics_meta = _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta,
-                                                  checks=post_meta, commit_parts=commit_parts, judge_ops=judge_ops)
+                                                  checks=post_meta, commit_parts=commit_parts, judge_ops=judge_ops,
+                                                  judge_ledger=judge_ledger)
     # 改过重存的那几版在后台按编译好的规则复查一次, 结果只进这一行指标(AU-F07, 见 _revision_rule_recheck 上面那段)
     _schedule_revision_recheck(client, project_id, user_id, out, tactic, row_id, metrics_meta)
     return out
