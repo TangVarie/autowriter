@@ -2132,6 +2132,17 @@ def fingerprint_rows_for_versions(sb, project_id: str, version_ids: list[str]) -
     return rows
 
 
+def fingerprinted_version_ids(sb, project_id: str, version_ids) -> set[str]:
+    """``version_ids`` 里在本项目指纹库已经有行的那几版。只按 id 查, 不翻整个项目 —— tv-sync 的指纹自愈在项目写锁里
+    用它(review on #146): 锁里原来整项目翻三遍 version_id, 大项目上一页一千行要翻上百次, 这期间存稿都在等这把锁。"""
+    out: set[str] = set()
+    for chunk in db._in_chunks(sorted({str(v) for v in version_ids}), 100):
+        res = (sb.table("draft_fingerprints").select("version_id")
+               .eq("project_id", project_id).in_("version_id", chunk).execute())
+        out |= {str(r["version_id"]) for r in (res.data or []) if r.get("version_id")}
+    return out
+
+
 def delete_fingerprints_for_versions(sb, project_id: str, version_ids: list[str]) -> int:
     n = 0
     for chunk in db._in_chunks(list(dict.fromkeys(version_ids)), 100):

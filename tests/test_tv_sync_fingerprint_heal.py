@@ -251,3 +251,119 @@ def test_a_version_whose_item_moved_on_while_waiting_for_the_lock_is_not_refille
     gap = core.tv_sync(c, TV)["fingerprint_gap"]
     assert item["best_version_id"] == "v-next" and not _rows(c, v1)
     assert (gap["missing"], gap["rebuilt"], gap["skipped"], gap["unrepaired"], gap["samples"]) == (0, 0, 1, 0, [])
+
+
+# ── Review on #146, second round ─────────────────────────────────────────────────────────────────
+
+def _counting_lock(monkeypatch, *, busy: bool = False):
+    """记下自愈拿锁的次数和"锁里"这段时间; ``busy``: 像别的写操作一直占着锁那样抛 IngestBusy。"""
+    real_lock = core._project_write_lock
+    seen = {"taken": 0, "inside": False}
+
+    @contextlib.contextmanager
+    def lock(client, pid, holder, *a, **k):
+        if not holder.startswith("tv-sync-heal"):
+            with real_lock(client, pid, holder, *a, **k) as got:
+                yield got
+            return
+        seen["taken"] += 1
+        if busy:
+            raise core.IngestBusy(f"项目 {pid} 上另一个写操作正在跑")
+        with real_lock(client, pid, holder, *a, **k) as got:
+            seen["inside"] = True
+            try:
+                yield got
+            finally:
+                seen["inside"] = False
+    monkeypatch.setattr(core, "_project_write_lock", lock)
+    return seen
+
+
+def test_a_gap_the_heal_could_not_lock_is_still_named_in_the_report(monkeypatch, capsys):
+    # 锁一直被存稿 / 长补录占着(IngestBusy): 原来只剩 error, missing 0、没有样本 —— 哪几篇查重看不见, 夜报一个字不提
+    import argparse
+    from deskcore import cli
+    c, v1 = _crashed(monkeypatch)
+    seen = _counting_lock(monkeypatch, busy=True)
+    gap = core.tv_sync(c, TV)["fingerprint_gap"]
+    assert seen["taken"] == 1 and "IngestBusy" in gap["error"]
+    assert (gap["missing"], gap["rebuilt"], gap["unverified"]) == (0, 0, 1)
+    assert gap["unverified_samples"] == [{"project_id": PROJ, "version_id": v1}]
+    assert not _rows(c, v1)
+    args = argparse.Namespace(tv_project=TV, all=False, dry_run=False, write_tv=False, since=None, rematch=False)
+    rc = cli._tv_sync(core, c, args)
+    printed = capsys.readouterr().out
+    assert rc == 1 and "这晚没核成" in printed and v1[:8] in printed
+
+
+def test_a_revision_that_did_not_attach_is_skipped_without_taking_the_lock(monkeypatch):
+    # 改稿落了地、best 没挪的那种状态永远修不好; 锁外已经认出来就别每晚去拿项目写锁(存稿要等它, 等久了 IngestBusy)
+    c = _client()
+    v1 = core.commit_drafts(c, PROJ, [{"title": "秋招等回音", "body": BODY_A}], user_id=ME)["version_ids"][0]
+    _embed(c)
+    monkeypatch.setattr(store, "point_item_at_version", _fail_pointer)
+    assert "replace_warning" in core.commit_drafts(
+        c, PROJ, [{"title": "秋招等回音", "body": BODY_A2, "replaces_version_id": v1}], user_id=ME)
+    monkeypatch.undo()
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    monkeypatch.setattr(config, "JUDGE_URL", "")
+    seen = _counting_lock(monkeypatch)
+    gap = core.tv_sync(_joinable(c), TV)["fingerprint_gap"]
+    assert seen["taken"] == 0, "跳过不需要锁"
+    assert (gap["missing"], gap["rebuilt"], gap["skipped"], gap["error"]) == (0, 0, 1, None)
+    assert not _rows(c, v1)
+
+
+def test_the_heal_does_not_scan_the_whole_project_while_holding_the_lock(monkeypatch):
+    # 锁里原来整项目翻三遍 version_id(重读、backfill 自己的 done_ids、补完再核); 大项目上存稿全在等这把锁。锁里只按点名的几版查
+    c, v1 = _crashed(monkeypatch)
+    seen = _counting_lock(monkeypatch)
+    real_scan = store.existing_fingerprint_version_ids
+    scans_inside = []
+
+    def scan(*a, **k):
+        if seen["inside"]:
+            scans_inside.append(a[1:])
+        return real_scan(*a, **k)
+    monkeypatch.setattr(store, "existing_fingerprint_version_ids", scan)
+    gap = core.tv_sync(c, TV)["fingerprint_gap"]
+    assert seen["taken"] == 1 and not scans_inside
+    assert (gap["missing"], gap["rebuilt"], gap["unrepaired"], gap["error"]) == (1, 1, 0, None)
+    assert len(_rows(c, v1)) == 1
+
+
+def test_dry_run_does_not_report_a_version_whose_item_moved_on(monkeypatch):
+    # 预演和真跑同一个口径: versions_for_linking 读完之后 best 挪到了新版(新版的行还没写), 真跑 skipped 1 / missing 0, 预演也是
+    c, v1 = _crashed(monkeypatch)
+    item = next(i for i in c.rows["items"] if i.get("best_version_id") == v1)
+    stale = {PROJ: {v1: item["id"]}}
+    c.rows["versions"].append({"id": "v-next", "item_id": item["id"], "version_num": 9,
+                               "title": "秋招等回音", "body": BODY_A2})
+    item["best_version_id"] = "v-next"
+    _joinable(c)
+    dry = core._heal_fingerprint_gaps(c, stale, holder="tv-sync-heal:test", dry_run=True)
+    real = core._heal_fingerprint_gaps(c, stale, holder="tv-sync-heal:test")
+    for gap in (dry, real):
+        assert (gap["missing"], gap["skipped"], gap["samples"], gap["error"]) == (0, 1, [], None)
+    assert not _rows(c, v1)
+
+
+@pytest.mark.xfail(strict=True, reason="已知的洞(review on #146, 本轮不修): 改稿的新指纹入了库、给旧 item 加新版那一行"
+                                       "(add_version_to_item)没建成时, 新版在库里认不出是谁的, 自愈照补旧稿")
+def test_a_revision_whose_new_version_row_failed_is_not_backfilled(monkeypatch):
+    c = _client()
+    v1 = core.commit_drafts(c, PROJ, [{"title": "秋招等回音", "body": BODY_A}], user_id=ME)["version_ids"][0]
+    _embed(c)
+
+    def _fail(*a, **k):
+        raise RuntimeError("versions 插不进去")
+    monkeypatch.setattr(store, "add_version_to_item", _fail)
+    out = core.commit_drafts(c, PROJ, [{"title": "秋招等回音", "body": BODY_A2, "replaces_version_id": v1}], user_id=ME)
+    assert "replace_warning" in out
+    monkeypatch.undo()
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    monkeypatch.setattr(config, "JUDGE_URL", "")
+    assert not _rows(c, v1) and any(f.get("opening_hash") == fp.opening_hash(BODY_A2)
+                                    for f in c.rows["draft_fingerprints"]), "前提: 旧版的行撤了, 新的文字在库里"
+    core.tv_sync(_joinable(c), TV)
+    assert not _rows(c, v1), "旧稿的文字不该补回去"

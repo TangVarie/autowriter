@@ -556,6 +556,12 @@ def _tv_sync(core, sb, args) -> int:
                   + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("unrepaired_samples") or [])
                   + " —— 查重看不见它们; 手动 `python -m deskcore.cli backfill --project <项目>` 后再看。")
             rc = 1
+        if gp.get("unverified"):
+            # review on #146: 锁没等到(IngestBusy)或半途出错时, 看着缺的那几版也要点名, 不能只剩一句 error
+            print(f"  ⚠️ 写作台定稿版本看着没有指纹行、这晚没核成的 {gp['unverified']} 个: "
+                  + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("unverified_samples") or [])
+                  + " —— 查重可能看不见它们; 明晚再核。")
+            rc = 1
         if gp.get("error"):
             print(f"  ⚠️ 补定稿版本的指纹失败: {gp['error']} —— 对照照常写了; 明晚再补, 急的话手动 "
                   "`python -m deskcore.cli backfill --project <项目>`。")

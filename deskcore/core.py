@@ -5483,7 +5483,9 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
     # done_ids 仍然一次取全: 它只是一串 UUID(几 MB 顶天), 而它是【幂等性本身
     # 所依赖的那个集合】—— 分页判重会让跨页的重复漏过去(审计 COR-005 修的
     # 就是它被静默截断的那一版)。
-    done_ids = store.existing_fingerprint_version_ids(client, project_id)
+    # 点名补的只看那几版(review on #146): 整项目翻一遍只为判这几个 id, 在 tv-sync 自愈拿着的项目写锁里太重
+    done_ids = (store.fingerprinted_version_ids(client, project_id, only_version_ids) if only_version_ids is not None
+                else store.existing_fingerprint_version_ids(client, project_id))
     can_embed = with_embeddings and dedup.embeddings_available()
     total = already = written = reused = computed = missing = 0
     todo_seen = processed = 0
@@ -9793,20 +9795,29 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
 # 把新版和新指纹写进库(best 没挪)。补哪几版只按【锁里】重读的指纹行、同 item 的版本、item 的定稿版本来定。(2) 点名的那几版按 id
 # 直接取, 不受回填翻页的 5000 上限; 补完在锁里再读一遍, 还是没有行的数进 ``unrepaired``(夜报亮红), 不再是 missing 1 / rebuilt 0
 # 而一声不响。
+# 复审(review on #146, 第二轮): (a) 锁外已经认出"同 item 别的版本有行"的, 锁外就跳掉、不去拿锁 —— 跳过只会少补、不会把故意撤掉
+# 的行补回去, 锁外判是安全的方向; 不然这种永远修不好的状态每晚都要拿一次锁、让存稿等着。要补的决定仍只在锁里下。(b) 锁里只按
+# 点名的那几版(和它们同 item 的版本)查指纹行, 不再整项目翻三遍。(c) 锁没等到(IngestBusy)或锁里半途出错、还没定下来的那几版,
+# 记进 ``unverified`` 并点名, 夜报照样说出是哪几篇, 不只剩一句 error。(d) 预演也按 item 现在的定稿版本筛一遍, 和真跑报的一样。
 
-def _replaced_on_item(client, vids: dict[str, str | None], gap: list[str], have: set[str]) -> set[str]:
-    """``gap`` 里同一个 item 别的版本有指纹行的那几版(改稿落了地、只是 best 没挪过去)。"""
+def _replaced_on_item(client, pid: str, vids: dict[str, str | None], gap: list[str],
+                      have: set[str] | None = None) -> set[str]:
+    """``gap`` 里同一个 item 别的版本有指纹行的那几版(改稿落了地、只是 best 没挪过去)。``have`` 不给就按那些兄弟版本的 id 现查。"""
     items = [vids[v] for v in gap if vids.get(v)]
     siblings = store.version_ids_of_items(client, items) if items else {}
+    if have is None:
+        sib_ids = {s["id"] for v in gap for s in siblings.get(str(vids.get(v)), ()) if s["id"] != v}
+        have = store.fingerprinted_version_ids(client, pid, sib_ids) if sib_ids else set()
     return {v for v in gap if any(s["id"] != v and s["id"] in have for s in siblings.get(str(vids.get(v)), ()))}
 
 
 def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, holder: str,
                            dry_run: bool = False) -> dict:
     """``best``: ``{项目: {写作台定稿版本的 version_id: item_id}}``。
-    回 ``{"checked", "missing", "rebuilt", "skipped", "unrepaired", "error", "samples", "unrepaired_samples"}``。"""
-    out = {"checked": 0, "missing": 0, "rebuilt": 0, "skipped": 0, "unrepaired": 0, "error": None,
-           "samples": [], "unrepaired_samples": []}
+    回 ``{"checked", "missing", "rebuilt", "skipped", "unrepaired", "unverified", "error", "samples", "unrepaired_samples",
+    "unverified_samples"}``。``unverified``: 锁外看着缺、但出错(多半是锁没等到)没来得及在锁里核的。"""
+    out = {"checked": 0, "missing": 0, "rebuilt": 0, "skipped": 0, "unrepaired": 0, "unverified": 0, "error": None,
+           "samples": [], "unrepaired_samples": [], "unverified_samples": []}
 
     def _skip(pid: str, vs, why: str) -> None:
         if vs:
@@ -9823,25 +9834,36 @@ def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, ho
     for pid, vids in best.items():
         if not vids:
             continue
+        pending: list[str] = []                         # 锁外看着缺、还没定下来的; 半途出错就按它报 unverified
         try:
             have = store.existing_fingerprint_version_ids(client, pid)
             gap = sorted(set(vids) - have)
             out["checked"] += len(vids)
             if not gap:
                 continue
+            pending = gap
+            # 锁外就能跳的先跳: 跳过只会少补, 不会把改稿故意撤掉的行补回去(要补的仍只在锁里定)
+            replaced = _replaced_on_item(client, pid, vids, gap, have)
+            _skip(pid, replaced, "同一个 item 的别的版本有(改稿没挂上 item)")
+            gap = pending = [v for v in gap if v not in replaced]
+            if not gap:
+                continue
             if dry_run:
-                replaced = _replaced_on_item(client, vids, gap, have)
-                _skip(pid, replaced, "同一个 item 的别的版本有(改稿没挂上 item)")
-                if gap := [v for v in gap if v not in replaced]:
+                # 和真跑同一个口径: 已经不是自己 item 定稿版本的那几版不算缺(只读)
+                final = {str(r.get("version_id")) for r in store.legacy_version_rows_for(client, pid, gap)}
+                _skip(pid, [v for v in gap if v not in final], "已经不是自己 item 的定稿版本(best 挪走了)")
+                pending = []
+                if gap := [v for v in gap if v in final]:
                     _missing(pid, gap)
                 continue
             with _project_write_lock(client, pid, holder):
                 # 锁里重读: 改稿也持这把锁, 等锁这会儿它可能已经落地。锁外的那一眼只决定要不要来拿锁
-                have = store.existing_fingerprint_version_ids(client, pid)
-                gap = [v for v in gap if v not in have]
-                replaced = _replaced_on_item(client, vids, gap, have) if gap else set()
+                now = store.fingerprinted_version_ids(client, pid, gap)
+                gap = [v for v in gap if v not in now]
+                replaced = _replaced_on_item(client, pid, vids, gap) if gap else set()
                 _skip(pid, replaced, "同一个 item 的别的版本有(改稿没挂上 item)")
                 gap = [v for v in gap if v not in replaced]
+                pending = []
                 if not gap:
                     continue
                 _missing(pid, gap)
@@ -9852,7 +9874,7 @@ def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, ho
                 if not_final:                           # 那几版不算缺(换下来的旧版本来就该没有行)
                     out["missing"] -= len(not_final)
                     out["samples"] = [x for x in out["samples"] if x["version_id"] not in not_final]
-                have = store.existing_fingerprint_version_ids(client, pid)
+                have = store.fingerprinted_version_ids(client, pid, gap)
             left = [v for v in gap if v not in have and v not in not_final]
             if left:
                 out["unrepaired"] += len(left)
@@ -9863,6 +9885,12 @@ def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, ho
         except Exception as exc:                        # noqa: BLE001 — 对照已经写了; 明晚再补
             logger.exception("tv_sync: 补定稿版本的指纹失败 (project=%s)", pid)
             out["error"] = out["error"] or f"{type(exc).__name__}: {exc}"[:300]
+            if pending:
+                out["unverified"] += len(pending)
+                out["unverified_samples"].extend(
+                    {"project_id": pid, "version_id": v} for v in pending[:max(0, 5 - len(out["unverified_samples"]))])
+                logger.warning("tv_sync: %d 个写作台定稿版本看着没有指纹行, 但这晚没核成 (project=%s): %s",
+                               len(pending), pid, ", ".join(pending[:5]))
     return out
 
 
