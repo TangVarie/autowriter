@@ -3054,7 +3054,7 @@ def _maybe_eq(q, col: str, value):
 
 
 def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
-                          counters: dict, meta: dict) -> None:
+                          counters: dict, meta: dict) -> str | None:
     """一次 commit_drafts 的耗时与判定结局, 落一行 ``batch_metrics``。
 
     为什么是这张表、不新加迁移: 它本来就是「每批一行的指标快照」(phase_ms / counters /
@@ -3066,8 +3066,10 @@ def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
     的"性能指标", 那是误导。``batch_id`` 列本来就可空。
 
     异常原样上抛 —— 调用方(core)自己吞, 并保证它不影响入库结果。
+
+    回插进去那一行的 ``id``(回包里没有就是 None): 改稿的后台规则复查(AU-F07)拿它把结果写回同一行的 meta。
     """
-    sb.table("batch_metrics").insert({
+    res = sb.table("batch_metrics").insert({
         "batch_id": None,
         "project_id": project_id,
         "user_id": user_id,
@@ -3076,6 +3078,15 @@ def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
         "meta": meta or {},
         "injection": {},
     }).execute()
+    rows = getattr(res, "data", None) or []
+    row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+    return str(row["id"]) if row.get("id") else None
+
+
+def update_commit_metrics_meta(sb, row_id: str, meta: dict) -> None:
+    """把一行 ``batch_metrics`` 的 ``meta`` 整个换成传进来的这份(调用方先把原来那份并进来)。只给改稿的后台规则复查
+    (AU-F07)用: 这一行是同一次存档刚插的, 别处不会改它, 整列替换不会盖掉谁。异常原样上抛, 调用方自己吞。"""
+    sb.table("batch_metrics").update({"meta": meta or {}}).eq("id", row_id).execute()
 
 
 # ── 查重时记下的底稿(migrations/018, W-38) ─────────────────────────────────────

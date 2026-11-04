@@ -13,7 +13,7 @@
 
 ## 0. 一句话现状
 
-**整条链路已经跑通并验证过**：八个迁移全部落库、服务在 Railway 上线、指纹库
+**整条链路已经跑通并验证过**：八个迁移全部落库（08-26 当时一共八个；现在到 `018`，2026-11-04 只读核过生产库 `001`–`018` 都在，以 `doctor` 为准）、服务在 Railway 上线、指纹库
 回填完 **3,678 行 / 44 个项目**、四路查重信号全部到齐。剩下的只有一件是**你要做**
 的——把 deskcore 挂到客户端（见 §2 第 3 步），不挂上去这一整套没人用。
 
@@ -61,8 +61,8 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 
 | 部件 | 实测结果 |
 |---|---|
-| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + 八个迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
-| **schema** | ✅ 八个迁移**已全部跑进生产**（2026-08-26，见 §1.3 / §1.4） |
+| `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + `migrations/` 下全部迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
+| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4） |
 | **跑的是哪一份代码** | 打 `/health` 看 `build`：`commit`（12 位）和 `protocol_version`。**不需要 key。**<br>2026-09-20 加的，起因是同一天卡了两次：早上把「Railway 还没重新部署」当事实写进记录（其实没核实、它早就上线了），下午 Railway 一次部署真失败、服务停在 6 小时前的版本，而**从外面看不出来**（`/health` 不带版本、`/tools` 要 key）。<br>· `commit` 与 `main` 上的 SHA 不一致 → 部署没跟上，去 Railway 看那次 build 的日志。<br>· `protocol_version` 与 `skills/bywood-writing-desk/SKILL.md` 末尾那行不一致 → 运营手里那份 skill 该重新导入了。<br>· 显示 `unknown` → 只是这个诊断字段没取到值，**不代表服务不健康**（它刻意不参与 `ok`）。 |
 | **写手的 skill 是不是最新版** | `curl -H "X-Deskcore-Key: <你的 key>" https://autowriter-production.up.railway.app/skill-versions`（**要 key**，不放 `/health`：那里不鉴权，按 `app.py` 的规矩不许放业务数据）。`writers_24h` 是 24 小时内报上来的版本里最新 / 旧版 / 没报各几个——按「身份 × 版本」数，一个团队共用一个身份时读作「这 24 小时里有几种版本在用」，不是人数；`outdated_versions` 是旧版各是哪一版；只有计数，没有是谁。<br>2026-10-16 加的服务端探针（`deskcore/skillcheck.py`）：`open_project` / `comments_for` 带 `skill_version`、`get_protocol` 带 `local_version`。**2026-10-30 发布收尾起，提醒只看这一次调用报上来的版本**：最新不提醒；旧版（含认不出的值）在返回值里带 `skill_update`，`message` 末尾两行是升级入口（仓库里 skill 的地址 + `更新技能/bywood-writing-desk`），模型照抄给写手；没报（或报「无」这类占位）只记一笔计数、不提醒。其它工具不再捎提醒。不拦写稿。<br>原来按身份记版本、没报就沿用 12 小时内的记录或提醒「没核到版本」、其它工具 30 分钟抽查一次——一个团队共用一个身份时，一个人的旧 skill 让所有人收到提醒，重启后每场开头又报一句「没核到」，所以撤了。计数在进程内存里，重启清零。要找还在用旧版的人：看 `outdated_versions` 有没有值，在群里让大家各自看一眼 skill 里那一行。 |
 | **服务部署** | ✅ Railway，`https://autowriter-production.up.railway.app`。`/health` 全绿、工具清单与 `tools.py` 的 `TOOLS` 一致（陆续加过 `my_rules` / `set_rule_state` / `reembed_my_rules`（2026-08-28）与 `get_protocol`（2026-09-10）——**个数以 `/health` 为准，不在这里钉死**）、`DESKCORE_ALLOW_ANONYMOUS` **未设**（`anonymous_allowed: false`） |
@@ -264,7 +264,7 @@ TV 核对 `--write-tv` 时顺手从 Supabase advisor 转来的：`tv_project_map
 （`aw_010_tv_links_rls`）。`doctor` 报它 `unprobeable`，要核就在 SQL Editor 跑
 `core.MIGRATION_010_PROBE_SQL` 那句。
 
-### 1.7 `011_angle_outcomes_view` + 入库判定 judge（2026-09-24，**生产库尚未执行 / 尚未配置**）
+### 1.7 `011_angle_outcomes_view` + 入库判定 judge（2026-09-24；`011` 已在生产库，judge 已配上，2026-11-04 只读核过）
 
 两件事一起上，彼此不依赖：
 
@@ -277,8 +277,8 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
    `JUDGE_TIMEOUT_SEC` 先不设（默认 8）。改变量不用发版（config 在进程启动时读，Railway 改变量会自动重新部署）。
 3. `curl -s $DESKCORE_URL/health | jq .config.judge` → `configured: true`。
 4. 确认要判的项目都在 `tv_project_map` 里（`python -m deskcore.cli tv-map`）：**没接 tv-map 的项目一篇都不会
-   发**（出境口径要 TV 项目号，见 §3.8），返回里是 `not_configured` + 补救命令。Hatherine 目前不在 TV 里，
-   它的稿子因此不判。
+   发**（出境口径要 TV 项目号，见 §3.8），返回里是 `not_configured` + 补救命令。（09-24 写这段时 Hatherine 不在 TV 里、稿子不判；现在它已接进 TV，
+   写作台的 Hatherine 项目 9 个里 8 个映射上了，2026-11-04 只读核过；没映射的那个照旧不判。）
 5. 端到端：随手 commit 一篇，返回里 `judge.summary` 是 `{"ok": 1}`；TV 里
    `select count(*) from truth_vault.note_feature_answers where subject_type = 'aw_version'` 从 0 变非 0。
 6. 一两周后按 `docs/deskcore.md` §3.8 那两句 SQL 从 `batch_metrics` 取分位数，重定 `JUDGE_TIMEOUT_SEC`。
@@ -1260,7 +1260,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 7 | 让 `check_drafts` 的降级信号被人看见 | `semantic_degraded` / `empty_history_warning` 这两个字段没人盯的话，表现就是"查重跑了、全 pass、看着一切正常" |
 | 7b | ~~**推 TV 那边读 `decision_source`**~~ | ✅ **TV 已接**（`scripts/sync_autowriter_decisions_to_prepublish.py` 按 human / rule_based / unverified 分流，只有 `decision_source` 恰好等于 `human` 才算人工）。⚠️ **但这条管子现在零流量**，见下面 7d |
 | ~~7d~~ | ~~**人工审稿这条管子一个月零流量**~~ ✅ **2026-09-20 已定案：legacy-only**（TV D-072，理由与重新点亮的条件见 §3）。下面是当时查到的事实，保留作背景 | 2026-09-20 实查生产库：`autowriter.items` **6,688 行里 `decision_source` 全是 NULL** —— `review_drafts`（2026-09-16 上线）**一次都没被调用过**。存量 598 条 approved/needs_revision 是 Streamlit 时代留下的，TV 那边已按新口径全部归成 `evaluator_type='unverified'`，`prepublish_evaluations` **最后一条停在 2026-08-20**（Streamlit 末次出稿 08-19）。两侧代码都通，**没人拧龙头** —— 与 D-063 通道 2 那次同一个形状。⚠️ 修法**不是**让模型主动多调：协议里「用户没表态就别调」那条守的正是「别替用户点通过」，松掉就是灌伪造正例。这是给人看的决策，不是给代码修的 bug。**已定案：不点亮** |
-| 7c | 打通 lineage 回程 | 飞书表建好那六列 + 真导一次 + 在 TV 查 `notes.source_autowriter_version_id` 非空条数。这一列长期是 0，`v_model_comparison` 因此长期查出空集且不报错 |
+| ~~7c~~ | ~~打通 lineage 回程~~ ✅ 不再靠六列 | 2026-09-17 起 `tv-sync` 按内容把发出去的笔记对回写作台（`009`，§1.5、`docs/deskcore.md` §3.7），飞书表不用加列，写手也没有导出这一步。2026-11-04 只读：`tv_note_links` 3,454 行，TV `notes.source_autowriter_version_id` 非空 528 条 |
 | 7e | 接上入库判定并攒样本（§1.7 ①） | 代码已合、env 没配。配上之后两周内从 `batch_metrics`（`meta.mode='deskcore_commit'`）取 `commit` / `delivery_rules` / `judge` / `total` 的 p95 重定 `JUDGE_TIMEOUT_SEC`（判定的截止要先扣掉前面几段，`delivery_rules` 是 10-20 起存档后拼交付稿 + 查规则那一段）——8 秒和「commit 约 1–2 秒」都还没有样本撑着（`docs/deskcore.md` §3.8 有 SQL）。`timeout` 占比高先看是不是并发不够（`JUDGE_MAX_WORKERS`），别先加截止 |
 | 7f | 覆盖面决定回写 truth-vault `DECISIONS.md` | 跨仓决策归 TV 记。本仓定的是「入库判定只挂 `commit_drafts`，补录的已发布笔记由 TV 事后抽取（docs/31 位置 ①）覆盖」（设计审查 2026-09-23 §4 #1 纠正了 D-071 的读法），写在 `docs/deskcore.md` §3.8；TV 那边要补一条引用它，并确认 ① 的抽取确实覆盖补录进来的那些项目 |
 | 7g | 跑 `011` 并给 `tv_project_map` 补齐映射 | `011` 只建视图，没人读它不坏；但入库判定按 TV 项目号走出境口径，没映射的项目（如 Hatherine）一篇都不发。补映射同时也让 tv-sync 覆盖到它们 |
@@ -1270,7 +1270,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 
 | # | 事 | 触发条件 |
 |---|---|---|
-| 8 | 查重搬到 pgvector 服务端 | **单项目逼近 4,000 条指纹时**（不是十万）。`store.fingerprints` 的 `limit` 就是 4,000（`store.py:295`），超过就只比最近的这些、返回里带 `history_truncated_warning`——也就是说**第 4,001 条起，「比对全量历史」这个说法就不成立了**。`draft_fingerprints` 已建 ivfflat 索引，改起来不难；来不及就先把 cap 调高 |
+| ~~8~~ | ~~查重搬到 pgvector 服务端~~ ✅ 已经在库里比全量 | 查重下推（`004`，生产库已跑）在库里比全部历史，没有 4,000 条的上限。4,000 条（`store.fingerprints` 的 `limit`）只剩两处：`004` 不在时退回的 Python 逐对比对，和改稿那几篇去掉旧版之后的重比，超过就只比最近的这些、返回里带 `history_truncated_warning`。2026-11-04 只读：单项目指纹最多 937 条 |
 | 9 | commit 的原子重查覆盖语义信号 | 现在锁内只查确定性信号（开头精确 + 四字串 Jaccard），标题语义相似度没查——竞态窗口里"换个说法的同角度稿"仍可能两条都进。等 backfill 把历史向量补齐之后再做 |
 | 10 | "把我的调校笔记提升为项目基线" | 同一项目两人各自驯化会让风格分叉。指纹库共享、笔记不共享。跑一段时间看分叉严重程度 |
 | 11 | 拆 `db.py` / `memory.py` / `app.py` | TV R-020，触发式延后。真在这些文件里频繁改动时才做 |

@@ -387,8 +387,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
       · project_now —— 【有才出现】这个项目现在的情况: 近 60 天发了什么(mix)、发出三天以上的里面哪种写法起量多
         (working, 只是计数)、写作台近两周写的稿子发出去了几篇(desk)、同品类有没有外部参考(external)。照
         project_now.task 用: 默认贴着 mix 写(draw_angles 的卡已经按这个比例发了), working 只在两种写法之间拿主意;
-        用户问这个项目现在怎么样时用一句话说 message, 不放进开场。counts.project_now 是 ok / warming(这次还在准备,
-        下次打开就有) / unavailable(这次读不到) —— 后两种照常写, 不用跟用户提。
+        message 原样放进开场(skill_update 之后、edit_digest 之前), 用户问这个项目现在怎么样时也用它回答。
+        counts.project_now 是 ok / warming(这次还在准备, 下次打开就有) / unavailable(这次读不到) —— 后两种简报里没有
+        project_now, 开场就不放这一句, 照常写, 不用跟用户提。
       · recent_structure —— 【有才出现】本项目最近 window 篇打过分的稿子里, 扎堆写成同一个样子的几处
         (concentrated 每条 {question, answer, share, of}: 哪一处、扎堆的那种写法、占比、占比的分母 —— 这一题有答案的
         篇数, 可能比 window 少)。照 recent_structure.task 做:
@@ -775,14 +776,16 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     **分数怎么读、怎么说**(在 ``judge.results`` 里, 按 ``index`` 对上你传的第几篇):
       · ``score`` 满分 100, 只看篇级硬约束(平台合规 + 特征题库里的合规题), 文笔好坏不在里面。Jev 有把握的问题每条 -25,
         拿不准的每条 -8, 有硬约束没判出来的每条 -10; 正文太短判不了的 score 为空(``why`` 里写着)。
-      · ``fixes`` 是最该看的几条: ``sure=true`` 是 Jev 有把握的, ``sure=false`` 是拿不准、看一眼就行的。``more_fixes``
+      · ``fixes`` 是最该看的几条: ``sure=true`` 是 Jev 有把握的, ``sure=false`` 是拿不准的(也照改, 见下)。``more_fixes``
         是没列出的条数。``instruction`` 只说哪一句犯了哪条, 不给改法。
       · **分数不用逐篇报给用户。** 这一批每篇都打成了分、而且都没有 ``fixes``、``hard_fails``、``unjudged`` 时, 整批说一句
-        「合规检查都过了」就行; 只把有 ``fixes`` 或 ``hard_fails`` 的那几篇告诉用户, 照 fixes 说清要改的是哪一句、犯了哪条
-        (``next_step`` 会点出是哪几个 index)。只有 ``unjudged`` 的那几篇是有几道硬约束这次没判出来: 没有可改的地方, 但
+        「合规检查都过了」就行。只有 ``unjudged`` 的那几篇是有几道硬约束这次没判出来: 没有可改的地方, 但
         **不能说都过了**, 跟用户提一句就行, 不影响交付, 不用重试。``score`` / ``fixes`` 照旧都在返回里, 用户问起分数再说。
-        用户要改哪篇: 按 fixes 改完, 那篇带 ``replaces_version_id`` 先过 check_drafts, 再调一次本工具(会重新打分)。改一轮
-        就够, 不要为了分数反复重写。
+      · **有 ``fixes`` 或 ``hard_fails`` 的那几篇是查出了合规问题, 不用等用户说, 自己改**(``next_step`` 会点出是哪几个
+        index): 照 fixes 改一轮(sure=false 拿不准的也改; 没有 fixes 的照 hard_fails 里没过的那一条改), 这次要调 check_rules
+        的先调完、和它的「必须改」放在同一轮改; 那几篇带 ``replaces_version_id`` 先过 check_drafts, 再调一次本工具(会重新
+        打分), 交给用户的是改好的那一版, 交付那条回复里一句话说清改了哪篇的哪里。改过一轮还查出来的照实说一句, 不再接着改,
+        不要为了分数反复重写。
       · ``judge_status`` 不是 ok(超时、没配、被出境口径挡下)就说这篇这次没打成分, 不能说过了, 也不要重试, 存档照样成功了。
       · 带 ``layer_hint`` 的那篇: 卡上标的贴型和判出来的产品角色对不上(产品贴里产品没出场、流量贴里产品成了主角), 照那一句
         跟用户提一下; 只是参考, 不扣分, 用户觉得没问题就不用改。
@@ -881,7 +884,8 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
     怎么读返回值(``versions`` 一篇一项, 按 ``version_id`` 对上):
       · ``violations``: 没守住的规则, 每条 ``rule_id`` / ``severity`` / ``what`` / ``source``(jev 是 Jev 判的, code 是代码
         查的)/ ``p``(Jev 的把握)/ ``evidence``(Jev 指出的那一句, 有才带)。``what`` 以「必须改」开头的是硬约束:
-        照着改, 改完那几篇带 ``replaces_version_id`` 先过 check_drafts、再用 score_drafts 存一次, 改一轮就够, 不用再调本工具;
+        照着改(参考分查出合规问题的那几篇也在这一轮一起改), 改完那几篇带 ``replaces_version_id`` 先过 check_drafts、
+        再用 score_drafts 存一次, 交付时一句话说清改了哪里; 改一轮就够, 不用再调本工具;
         以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。
       · ``unsure``: Jev 拿不准的(``what`` 以「拿不准」开头), 不算没守住, 提一句就行, 不用改。
       · 每篇必须改全列, 建议改补到 ``violations`` 一共 12 条为止, ``unsure`` 最多列 5 条; ``more`` 是这篇没列出来的条数

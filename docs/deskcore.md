@@ -474,7 +474,7 @@ tv-sync 倒灌回来，不过 `commit_drafts`（sportsix 438 条 ingested 里 11
 在账本里记两份、挂两种主体；而它们本来就在 TV 的抽取队列里。**代价写明**：sportsix / Hatherine 这种
 在外面写的项目，**写前**的判定也在 deskcore 里：`judge_draft` / `repair_plan_for` / `list_banks` 三个工具（2026-10-09 从写手机器上的 `judge.mcp_server` 并进来）——同一个 `/judge_draft`，但 `write=false`、不回账本行，项目号与品类走 `_judge_project_context`，超时 `JUDGE_DRAFT_TOOL_TIMEOUT_SEC`（默认 18 秒，Jev 实测一篇 4.5 秒，留在 MCP 客户端 ~22 秒容忍之内）。judge 仓的 `judge.mcp_server` 只剩内部 / 运维机器用。
 `judge_draft` / `repair_plan_for`），不靠这里。⚠️ 「由 TV 覆盖」的前提是那条笔记**在 TV 里**：从飞书表
-`ingest --xlsx` 补进来、而那张表没接 TV 同步的（Hatherine 目前就是），事后抽取也够不着——两边都判不到。
+`ingest --xlsx` 补进来、而那张表没接 TV 同步的（写这段时 Hatherine 就是；现在它已接进 TV，写作台的 Hatherine 项目 9 个里 8 个映射上了，2026-11-04 核过），事后抽取也够不着——两边都判不到。
 补救是把那张表接进 TV（接进去之后再加一行 `tv-map`），不是在补录路径上补一刀判定。这条决定写进了 `_ingest_published_unlocked` 的 docstring，
 `tests/test_deskcore_commit_judge.py` 最后一条钉着「补录不调 judge」。（跨仓的决策记录归 truth-vault
 `DECISIONS.md`，本仓不越界去写，见 runbook 待办。）
@@ -1131,6 +1131,57 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 **不设默认配额。** `score_comments` 和 core 中保留的 `judge_thread` 默认 `max_named=None`，向 Jev 传 JSON `null`，整组不再固定最多一条点名。只有用户明确要限制时才传整数，`0` 仍表示整组不点名；自定义评论位的品牌要求和其他检查照旧。Jev 的「允许点名」表示可提可不提，不是必须出现品牌。
 
 三条写法底线、项目规则、不得重复已有问题、改一轮后交付、失败不能说通过，以及单独评论不入稿件库等流程保持原有要求。协议与 skill 同步更新；写手需要重新导入 skill，旧版本在 `get_protocol` / `comments_for` 的版本核对时会收到更新正文与提醒。**部署先 Jev 后 autowriter**：旧 Jev 的 `max_named` 不接收 `null`，先部署 autowriter 会导致评论检查请求报错。回归覆盖评论位、默认无配额、显式整数转发和写手侧说明。
+
+### 3.19 协议升版：合规问题 AI 自己改，发牌改版和贴型的协议跟进，改稿在后台按规则复查（2026-11-04，W-42 / W-45 / W-50 / AU-F07）
+
+**为什么现在动协议。** 换版（aw#137，11-02）之后原定两周不动协议，最早 11-16 之后。§3.18（aw#144，11-03）已经把协议改到 `30daa73b0535`，写手本来就要重导一次 skill，而那之后写作台还没有人用过。三处等着下一次协议窗口的跟进（W-42 / W-45 / W-50）放进同一版，写手只重导这一次：协议 `30daa73b0535` → `2d357c4b6075`（以 `python -m deskcore.cli sync-skill --check` 为准；部署后 `/health` 的 `build.protocol_version` 应是它）。§3.18 的评论口径一字不动。
+
+**W-42 合规问题自己改。** 换版后写手唯一还要开口的一步：AI 说出合规问题，写手回「第 N 篇按这条改」。现在 `score_drafts` 判出 `fixes` / `hard_fails` 的那几篇，模型不等写手开口：先把 `check_rules` 调完，把合规问题（Jev 拿不准的也改）和「必须改」放在同一轮改掉，改过的带 `replaces_version_id` 先过 `check_drafts` 再 `score_drafts`，交付改好的那一版，交付那条回复里一句话说清改了哪几篇的哪里。
+
+- 改一轮就够。服务端按这次带 `replaces_version_id` 的那几篇分开说（`_score_report_step` 的 `revised`）：改过重存之后还查出来的，只叫模型照实说一句、不再接着改，免得改、判、改地转下去。写手当场要求改的那篇改完又查出合规问题，也是这样只说一句，写手要改再说。
+- 拿不准的也改：影子期判出来的硬伤，`p` 大多在 0.54～0.69（§3.8），只改有把握的等于大部分照旧要写手开口；合规上宁严勿松，改一句话的代价小。
+- 「建议改」照旧告诉写手、由写手定，不在这一条里。
+- 服务端同一个口径：`SCORE_NOTE`、`_score_report_step`、`score_drafts` / `check_rules` 的工具说明、`check_rules` 必须改那句 next_step。
+
+**W-45 发牌改版的协议跟进（aw#140 冻结期只改了工具说明）。**
+
+- 开场多一项：有 `project_now` 就把它的 `message` 原样放进开场，排在 `skill_update` 之后、`edit_digest` 之前。`PROJECT_NOW_TASK` 和 `open_project` 的说明原来写的是「不放进开场」，一起改了。`warming` / `unavailable` 时简报里没有 `project_now`，开场就不放。
+- 借卡那一段原来对所有经验卡都说「数据验证过」。D-138 起每次借卡至少 1 张外部参考卡，现在分开说：`external: true` 的是别家同品类最近起量的帖，没经过我们的数据验证，不说成验证过的经验，也不提它里面的品牌。
+- 发牌那一段跟上新卡面：每个坐标后面跟着一句大白话，内容形式和标题句式照卡写，情绪杠杆和人性原型用自己的话写，卡上的分类名和判据说法不搬进标题正文（同 `ANGLES_FOOTER`）；「参考结构」那一行只借结构、不提参考帖里的品牌，本项目的品牌照写；`batch_note` 交付时原样说一次、不放进开场；`pin` / `repeat_of` 只在写手点名时用。
+- skill 头部：描述里加了「写产品贴或流量贴」，写手只说贴型、没报品牌时也能调起来。
+
+**W-50 贴型。** 协议加一句：写手说了要写哪种贴（或者各几篇）才带 `layer`，卡上「这篇是X贴」那一行照着写；没说就不带，也不问。怎么传、写错报什么照 `draw_angles` 的说明（§3.15）。
+
+**AU-F07 改稿在后台按规则复查一次，只给复盘看。** 改过重存的那几版不进 `check_rules_version_ids`（改一轮就够，协议和 `check_rules` 都这么说），编译好的语义规则就一直没查过它们（审计 11-02 F07）。W-42 之后改稿会变多，所以 `score_drafts` 存完档、指标那一行插进去之后，这次真有改过重存的版本，就在后台对这几版跑一次 `check_rules`（同一个调用者、同一个 `tactic`，一次查不完的接着查），结果摘成一小块并进那一行的 `batch_metrics.meta.revision_rule_recheck`：
+
+```
+{status, must_fix, suggest, unsure, [not_finished, unjudged, code_unchecked, empty_body],
+ uncompiled_rules, versions: [{version_id, judge_status, must_fix, suggest, unsure, rule_ids}],
+ revised, elapsed_ms, at}
+```
+
+- 只留数和规则 id，不留稿子、规则原文和 Jev 指出的句子。不进回包、不转给写手、不叫模型再改。
+- 和 `check_rules` 是同一个函数：规则题照样发 Jev、写进规则题账本（`run_tag=shadow-rules`），缺编译结果照样触发后台补编。一版多一次 Jev 调用，11-02 审计时 30 天是 6 次改稿的量。
+- 一个工作线程，排着的超过 4 个就跳过这一次、记 WARN；进程重启丢掉还在排的。那一行就没有这个键：**没有这个键 = 没复查**，不是复查过了。`check_rules` 抛了记 `status: error`；写回失败只记日志。
+- 测试里默认关掉（`tests/conftest.py` 把池子换成 None），要测它的用例换成就地跑的池子（`tests/test_revision_recheck.py`）。
+
+复盘时这样查：
+
+```sql
+select created_at,
+       jsonb_array_length(meta->'revised_item_ids')             as revised_items,
+       meta->'revision_rule_recheck'->>'status'                 as recheck,
+       (meta->'revision_rule_recheck'->>'must_fix')::int        as must_fix,
+       (meta->'revision_rule_recheck'->>'suggest')::int         as suggest
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'deskcore_commit'
+   and jsonb_array_length(coalesce(meta->'revised_item_ids', '[]'::jsonb)) > 0
+ order by created_at desc limit 50;
+```
+
+`revised_items` 大于 0 而 `recheck` 是空的，就是那一次没复查（排满了、重启了、指标那一行没插成）。
+
+回归：`tests/test_protocol_followups_1104.py`（协议和服务端同一个口径、aw#144 的评论口径原样在）、`tests/test_angle_block_score_report.py`（自己改一轮、改过的不再改）、`tests/test_project_now.py`、`tests/test_revision_recheck.py`。
 
 ## 4. 接入
 

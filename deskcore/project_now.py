@@ -41,10 +41,12 @@ DESK_KEY = "d:"                                 # priors 缓存里写作台计�
 STAGE_NAME = {"run": "running", "warm": "warm", "cold": "cold", "none": "none"}
 REF_LABEL = {"brand": "同品牌上一期", "category": "同品类项目", "global": "全部项目", "uniform": "通用配比"}
 
+# 开场念 message(W-45, 2026-11-04 协议升版): aw#140 时协议冻结、开场是定死的, 这一句只能写「不放进开场」; 这次协议
+# 把它排进开场(skill_update 之后、edit_digest 之前), 这里跟着改。
 PROJECT_NOW_TASK = (
     "这是这个项目现在的情况，给你定写法用。默认贴着 mix 写（draw_angles 的卡已经按这个比例发了）；"
     "working 只用来在两种写法之间拿主意，是计数不是结论；用户点名的写法优先于这里的一切。"
-    "用户问这个项目现在怎么样时，用一句话说 message；不放进开场。")
+    "message 原样放进开场（skill_update 之后、edit_digest 之前），只放一次；用户问这个项目现在怎么样时也用它回答。")
 WORKING_NOTE = "起量 = 发出三天以上、评论≥20 或标了爆；只是计数"
 NO_EXTERNAL_NOTE = "本品类还没有外部参考"
 EXTERNAL_UNREAD_NOTE = "同品类的外部参考这次没读到"
