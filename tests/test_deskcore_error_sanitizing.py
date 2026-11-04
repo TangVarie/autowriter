@@ -133,3 +133,61 @@ def test_root_handlers_get_the_masking_formatter():
         assert FAKE_KEY not in buf.getvalue() and "WARNING:deskcore.test:leaked" in buf.getvalue()
     finally:
         root.removeHandler(h)
+
+
+# ── 11-04 复审: 工具故意抛给模型看的参数提示 ──────────────────────────────────────────────────────────
+# core 里好几处用 ValueError 告诉调用方哪个参数不对(set_rule_state 的 action / 天数、save_my_style 的空笔记、
+# label_example 的 label、create_project 的空名字……)。X1a 之后只有 InvalidInput 这几类的消息回给调用方, 这几句要在
+# tools 那层收成 InvalidInput, 不然 MCP 那边只剩 "ValueError (ref …)", REST 是 500。
+
+@pytest.fixture()
+def no_db(monkeypatch):
+    monkeypatch.setattr(tools.core, "sb", lambda: None)
+
+
+def test_mcp_set_rule_state_bad_action_keeps_its_guidance(monkeypatch, no_db, caplog):
+    monkeypatch.setattr(tools, "TOOLS", {"set_rule_state": (tools.set_rule_state, True)})
+    mcp = A._register_mcp()
+    out = {}
+
+    async def run():
+        token = A._caller.set(Caller("11111111-1111-1111-1111-111111111111"))
+        try:
+            handler = mcp._mcp_server.request_handlers[types.CallToolRequest]
+            req = types.CallToolRequest(method="tools/call", params=types.CallToolRequestParams(
+                name="set_rule_state", arguments={"memory_id": "m-1", "action": "delete"}))
+            out["result"] = (await handler(req)).root
+        finally:
+            A._caller.reset(token)
+
+    with caplog.at_level(logging.INFO):
+        anyio.run(run)
+    res = out["result"]
+    assert res.isError is True
+    text = res.content[0].text
+    assert text.startswith("Error executing tool set_rule_state: action 必须是") and "'delete'" in text, text
+    assert "(ref " not in text
+    assert not [x for x in caplog.records if x.name == "deskcore" and x.levelno >= logging.ERROR], "参数不对不是故障"
+
+
+@pytest.mark.parametrize("tool, args, needle", [
+    ("set_rule_state", {"memory_id": "m-1", "action": "delete"}, "action 必须是"),
+    ("label_example", {"item_id": "i-1", "label": "great"}, "label must be"),
+    ("create_project", {"name": "  "}, "project name must not be empty"),
+])
+def test_rest_core_input_errors_are_400_with_their_message(client, no_db, tool, args, needle):
+    r = client.post(f"/tool/{tool}", json=args, headers=AUTH)
+    assert r.status_code == 400, r.text
+    assert needle in r.json()["detail"]
+
+
+def test_core_value_error_helper_leaves_not_found_and_isolation_alone():
+    from deskcore import core
+    for exc in (core.ProjectNotFound("project not found: p"), core.ProjectIsolationRejected("x")):
+        with pytest.raises(type(exc)) as got:
+            with tools._core_value_errors_as_input():
+                raise exc
+        assert type(got.value) is type(exc)
+    with pytest.raises(tools.InvalidInput, match="mute 的天数至少是 1"):
+        with tools._core_value_errors_as_input():
+            raise ValueError("mute 的天数至少是 1")
