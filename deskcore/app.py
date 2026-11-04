@@ -52,6 +52,7 @@ import os
 import threading
 import time
 import traceback
+import uuid
 
 import anyio
 import anyio.to_thread
@@ -60,10 +61,31 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from logger_utils import SecretMaskingFormatter
+
 from . import core, identity, skillcheck, tools, vocab
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deskcore")
+
+
+def _install_log_masking() -> int:
+    """根 logger 上的 handler 都换成 ``SecretMaskingFormatter``(格式串照旧), 回换了几个(外部评审 11-04 X1a)。
+
+    原来这个 formatter 在 logger_utils 里定义了却没人装: 异常消息、驱动的报错原文一路进 Railway 日志, key / JWT 形状的
+    串不打码。换的只是 ``logging.Formatter`` 本身(或还没有 formatter)的 handler —— 别的 formatter 是谁特意装的, 不动;
+    已经是 SecretMaskingFormatter 的跳过, 重复调安全。"""
+    n = 0
+    for h in logging.getLogger().handlers:
+        f = h.formatter
+        if isinstance(f, SecretMaskingFormatter) or (f is not None and type(f) is not logging.Formatter):
+            continue
+        h.setFormatter(SecretMaskingFormatter(f._fmt if f else None, f.datefmt if f else None))
+        n += 1
+    return n
+
+
+_install_log_masking()
 
 SERVICE = "deskcore"
 VERSION = "1"
@@ -180,14 +202,29 @@ def _call_tool(name: str, args: dict) -> object:
 # ── MCP 工具失败留痕(W-29, 2026-10-23) ─────────────────────────────────
 # MCP 的工具报错是 isError + HTTP 200: FastMCP 自己把异常收成错误结果, 服务端原来一行日志都没有。10-20~10-22 查
 # 「score_drafts 到底调了没有、是不是半路炸了」时, 能看的只有 edge 日志里那一串 200。_wrap 现在在异常上记一行再
-# **原样**抛出去(调用方看到的 isError 和原来一模一样): 工具名、project_id、调用者 user_id 前 8 位、异常类型
+# 抛出去(调用方看到的 isError: 正常拒绝那几类原样, 真故障只剩类型和 ref, 见下面 X1a): 工具名、project_id、调用者 user_id 前 8 位、异常类型
 # (+ PostgREST 的错误码)、耗时。
 # ⚠️ 不记异常消息、不记其它参数: 消息和参数里可能有稿子的标题 / 正文、规则原文; key 和请求头更不能进日志。
 #    堆栈只记帧(文件 / 行号 / 函数 / 源码行), 不带最后那行 "类型: 消息"。
 # REST 层映成 400/403/404/409 的那几类是正常拒绝, 记 warning、不带堆栈(同 rest_tool 的口径)。
+# 外部评审 11-04 X1a(2026-11-04): 不在这几类里的(真故障)也不再把异常原文回给调用方 —— PostgREST 的 "Failing row
+# contains (…)" 会把整行稿子带出去。REST 回 500 + ``<异常类型> (ref <8 位>)``, MCP 回同样一句的工具错误; 同一个 ref 记在
+# 服务端那行日志里, 拿它对日志。正常拒绝那几类的消息照旧原样回(那是说给调用方听的)。
 _EXPECTED_TOOL_ERRORS = (core.ProjectNotFound, core.IngestBusy, core.ProjectIsolationRejected,
                          tools.InvalidInput, PermissionError)
 _TOOL_LOG_STACK_FRAMES = 15
+
+
+class _ToolFailure(Exception):
+    """MCP 工具真故障时代替原异常抛给 FastMCP 的那一个: 消息只有类型和 ref(原异常挂在 __cause__, 不出进程)。"""
+
+
+def _error_ref() -> str:
+    return uuid.uuid4().hex[:8]
+
+
+def _sanitized_error(exc: BaseException, ref: str) -> str:
+    return f"{type(exc).__name__} (ref {ref})"
 
 
 def _tool_log_fields(kwargs: dict) -> tuple[str, str]:
@@ -208,25 +245,27 @@ def _exc_label(exc: BaseException) -> str:
     return label
 
 
-def _log_tool_failure(name: str, kwargs: dict, exc: BaseException, elapsed_ms: int) -> None:
-    """工具抛了异常: 记一行(见上)。自己绝不抛 —— 留痕不能改变工具的行为。"""
+def _log_tool_failure(name: str, kwargs: dict, exc: BaseException, elapsed_ms: int, *,
+                      ref: str | None = None, channel: str = "mcp") -> None:
+    """工具抛了异常: 记一行(见上)。自己绝不抛 —— 留痕不能改变工具的行为。``ref``: 回给调用方的那个编号(真故障才有),
+    ``channel``: mcp / rest。"""
     try:
         pid, uid = _tool_log_fields(kwargs)
         label = _exc_label(exc)
         if isinstance(exc, _EXPECTED_TOOL_ERRORS):
-            logger.warning("mcp tool %s refused: %s (project=%s user=%s %dms)",
-                           name, label, pid, uid, elapsed_ms)
+            logger.warning("%s tool %s refused: %s (project=%s user=%s %dms)",
+                           channel, name, label, pid, uid, elapsed_ms)
             return
         if not isinstance(exc, Exception):
             # 取消 / 进程退出: 多半是客户端断了或在重新部署, 工具线程可能还在跑。不是故障, 但要看得见调到了这里。
-            logger.warning("mcp tool %s interrupted: %s (project=%s user=%s %dms)",
-                           name, label, pid, uid, elapsed_ms)
+            logger.warning("%s tool %s interrupted: %s (project=%s user=%s %dms)",
+                           channel, name, label, pid, uid, elapsed_ms)
             return
         stack = "".join(traceback.format_tb(exc.__traceback__, limit=-_TOOL_LOG_STACK_FRAMES))
-        logger.error("mcp tool %s failed: %s (project=%s user=%s %dms); 堆栈(不含异常消息):\n%s",
-                     name, label, pid, uid, elapsed_ms, stack.rstrip())
+        logger.error("%s tool %s failed: %s (project=%s user=%s %dms%s); 堆栈(不含异常消息):\n%s",
+                     channel, name, label, pid, uid, elapsed_ms, f" ref={ref}" if ref else "", stack.rstrip())
     except Exception:  # noqa: BLE001
-        logger.warning("mcp tool %s failed and the failure could not be logged", name)
+        logger.warning("%s tool %s failed and the failure could not be logged", channel, name)
 
 
 def _log_bad_arguments(name: str, arguments, cause) -> None:
@@ -742,6 +781,7 @@ async def rest_tool(name: str, request: Request):
         args = {}
     if not isinstance(args, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
+    t0 = time.monotonic()
     try:
         # ⚠️ 必须过线程池。工具里全是【同步】调用(Supabase / embedding, record_edit
         # 还会打 Anthropic), 直接在 async 路由里跑会占住 uvicorn 唯一的事件循环 ——
@@ -780,9 +820,11 @@ async def rest_tool(name: str, request: Request):
         raise HTTPException(status_code=403, detail=str(exc)[:300])
     except Exception as exc:  # noqa: BLE001
         # check_drafts 走到这里 = 查重真的挂了, 必须 500 不能装作没事。
-        logger.exception("tool %s failed", name)
-        raise HTTPException(status_code=500,
-                            detail=f"{type(exc).__name__}: {exc}"[:300])
+        # X1a: 异常原文不回给调用方、也不进日志(PostgREST 的 "Failing row contains (…)" 就是整行稿子) —— 回类型 + ref,
+        # 日志记类型、错误码、堆栈帧和同一个 ref(同 MCP 那一路的 _log_tool_failure)。
+        ref = _error_ref()
+        _log_tool_failure(name, args, exc, int((time.monotonic() - t0) * 1000), ref=ref, channel="rest")
+        raise HTTPException(status_code=500, detail=_sanitized_error(exc, ref))
 
 
 # ── MCP ──────────────────────────────────────────────────────────────
@@ -875,9 +917,14 @@ def _register_mcp():
             try:
                 result = await run_in_threadpool(fn, *args, **kwargs)
             except BaseException as exc:
-                # W-29: 留一行痕再原样抛, FastMCP 照旧把它收成 isError(见 _log_tool_failure)。
-                _log_tool_failure(name, kwargs, exc, int((time.monotonic() - t0) * 1000))
-                raise
+                # W-29: 留一行痕, FastMCP 照旧把它收成 isError(见 _log_tool_failure)。正常拒绝那几类、取消 / 退出原样抛;
+                # 真故障换成只带类型和 ref 的 _ToolFailure(X1a: 原来 str(exc) 原样进 isError 的文本, 回给客户端)
+                expected = isinstance(exc, _EXPECTED_TOOL_ERRORS) or not isinstance(exc, Exception)
+                ref = None if expected else _error_ref()
+                _log_tool_failure(name, kwargs, exc, int((time.monotonic() - t0) * 1000), ref=ref)
+                if expected:
+                    raise
+                raise _ToolFailure(_sanitized_error(exc, ref)) from exc
             _log_error_result(name, kwargs, result)
             return result
 

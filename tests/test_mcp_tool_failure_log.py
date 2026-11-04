@@ -12,6 +12,7 @@ MCP 的工具报错是 isError + HTTP 200, FastMCP 自己把异常收成错误�
 from __future__ import annotations
 
 import logging
+import re
 
 import anyio
 import pytest
@@ -69,10 +70,10 @@ def test_failure_is_logged_without_text_and_reraised_unchanged(monkeypatch, capl
 
     with caplog.at_level(logging.INFO):
         out = _call(monkeypatch, tool, {"project_id": PID, "drafts": DRAFTS})
-    # 行为不变: FastMCP 照旧把它包成 ToolError, 原异常就是 cause, 消息原样
+    # FastMCP 照旧把它包成 ToolError; 外部评审 11-04 X1a 起真故障的文本只剩类型和 ref(原异常挂在 cause 的 cause 上, 不出进程)
     err = out["error"]
-    assert err.__cause__ is raised[0]
-    assert "SECRET-T" in str(err), "调用方看到的错误文本不该被留痕改掉"
+    assert isinstance(err.__cause__, A._ToolFailure) and err.__cause__.__cause__ is raised[0]
+    assert "SECRET" not in str(err) and "RuntimeError (ref " in str(err), "调用方看不到异常原文"
     recs = _mine(caplog)
     assert len(recs) == 1 and recs[0].levelno == logging.ERROR
     msg = recs[0].getMessage()
@@ -92,8 +93,11 @@ def test_server_still_answers_is_error_with_the_same_text(monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         res = _call(monkeypatch, tool, {"project_id": PID, "drafts": DRAFTS}, via_server=True)["result"]
     assert res.isError is True
-    assert res.content[0].text == "Error executing tool t: 查重挂了: " + DRAFTS[0]["title"]
+    # X1a: 真故障回类型 + ref, 不回 str(exc); 同一个 ref 在服务端那行日志里
+    m = re.fullmatch(r"Error executing tool t: RuntimeError \(ref ([0-9a-f]{8})\)", res.content[0].text)
+    assert m, res.content[0].text
     assert len(_mine(caplog)) == 1 and "SECRET" not in caplog.text
+    assert f"ref={m.group(1)}" in _mine(caplog)[0].getMessage()
 
 
 PG_TIMEOUT = "canceling statement due to statement timeout; detail: "

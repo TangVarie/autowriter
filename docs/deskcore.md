@@ -108,7 +108,7 @@ deskcore 持 service_role 绕 RLS，**由服务端自己执行口径**——`db.
 |---|---|
 | 全部 MCP 工具 | `TOOLS` 里 `needs_user` **全部为 True**；`core.assert_project_access` 是唯一实现，每个项目级入口以它开头。`create_project` 不打开已有项目，所以不过这道闸——它的等价保证是**签名里没有 owner 参数**，归属只能是调用者。`get_protocol` 也不过闸——它不碰项目，只下发一份对所有人一样的流程文本（`needs_user` 仍是 True，不给那条机械保险开例外） |
 | `label_example` | **按 `items.user_id` 校验**，比项目粒度更细——同一项目里 A 的正负例是 A 的个人资产 |
-| REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了 |
+| REST/MCP 层 | `PermissionError` → **403**（不是 401，也不是 500）。401 = key 那一层没过；403 = key 过了但项目不是你的；500 = 服务端真的坏了。**500 / MCP 的真故障只回 `<异常类型> (ref <8 位>)`**（外部评审 11-04 X1a，2026-11-04）：异常原文（PostgREST 的 `Failing row contains (…)` 就是整行稿子）不回给调用方、也不进日志，服务端那行日志记类型、错误码、堆栈帧和同一个 ref，拿 ref 对日志；400 / 403 / 404 / 409 那几类正常拒绝的消息照旧原样回。根 logger 的 handler 启动时装上 `logger_utils.SecretMaskingFormatter`（key / JWT 形状的串打码） |
 | CLI 的 `projects` / `open` / `draw` / `check` | 走同一个 `core` 函数，所以 `--user` 从可选变成**必填** |
 | CLI 的 `backfill` / `reembed` / `delivery-format`（2026-10-20）/ `project-archive`（2026-10-30） | **刻意不校验**——它们是运维命令，跑它们的人手里握着 service_role key（等价于直连库），加校验挡不住任何人，只会挡住"帮同事补一下指纹"，还会给人"运维路径也隔离了"的错觉 |
 
