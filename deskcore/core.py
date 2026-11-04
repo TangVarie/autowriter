@@ -9778,21 +9778,38 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
 # 自己产的(ai_engine = deskcore)定稿版本没有指纹行的, 拿项目写锁(改稿也持这把锁, 不会和正在跑的改稿撞), 用 backfill 那一套
 # 补上(锁里重读一遍, 幂等), 记 WARNING。没改 score_drafts 的顺序 —— 改成一个事务是另一件事(要改 RPC 和迁移)。
 # 补回的行没有 angle_key(原来那行的坐标跟着删了), 写手记 item 的 user_id。
+# 复审(同日): 定稿版本没有指纹行不一定是进程被杀。改稿的新指纹入了库、挂到旧 item 上那一步失败(commit_drafts 的 replace_error)
+# 时, best 还指着旧版、旧版的行是故意撤掉的, 新的文字在同一个 item 的新版下 —— 再把旧稿的文字补回去, 一篇帖的新旧两版就都在
+# 查重里了。所以同一个 item 别的版本还有指纹行的不补(只数 skipped)。新版连 versions 行都没建成的那种从库里认不出来, 照补;
+# 日志也就不猜原因。
 
-def _heal_fingerprint_gaps(client, best: dict[str, list[str]], *, holder: str, dry_run: bool = False) -> dict:
-    """``best``: ``{项目: [写作台定稿版本的 version_id]}``。回 ``{"checked", "missing", "rebuilt", "error", "samples"}``。"""
-    out = {"checked": 0, "missing": 0, "rebuilt": 0, "error": None, "samples": []}
+def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, holder: str,
+                           dry_run: bool = False) -> dict:
+    """``best``: ``{项目: {写作台定稿版本的 version_id: item_id}}``。
+    回 ``{"checked", "missing", "rebuilt", "skipped", "error", "samples"}``。"""
+    out = {"checked": 0, "missing": 0, "rebuilt": 0, "skipped": 0, "error": None, "samples": []}
     for pid, vids in best.items():
         if not vids:
             continue
         try:
-            gap = sorted(set(vids) - store.existing_fingerprint_version_ids(client, pid))
+            have = store.existing_fingerprint_version_ids(client, pid)
+            gap = sorted(set(vids) - have)
             out["checked"] += len(vids)
+            if gap:
+                items = [vids[v] for v in gap if vids.get(v)]
+                siblings = store.version_ids_of_items(client, items) if items else {}
+                replaced = {v for v in gap
+                            if any(s["id"] != v and s["id"] in have for s in siblings.get(str(vids.get(v)), ()))}
+                if replaced:
+                    out["skipped"] += len(replaced)
+                    logger.info("tv_sync: %d 个定稿版本没有指纹行、但同一个 item 的别的版本有(改稿没挂上 item), 不补 "
+                                "(project=%s): %s", len(replaced), pid, ", ".join(sorted(replaced)[:5]))
+                    gap = [v for v in gap if v not in replaced]
             if not gap:
                 continue
             out["missing"] += len(gap)
             out["samples"].extend({"project_id": pid, "version_id": v} for v in gap[:max(0, 5 - len(out["samples"]))])
-            logger.warning("tv_sync: %d 个写作台定稿版本没有指纹行(多半是改稿时进程被杀), %s (project=%s): %s",
+            logger.warning("tv_sync: %d 个写作台定稿版本没有指纹行, %s (project=%s): %s",
                            len(gap), "预演不补" if dry_run else "按 backfill 补回", pid, ", ".join(gap[:5]))
             if dry_run:
                 continue
@@ -10553,10 +10570,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             drift["fp_written"] += getattr(exc, "done", 0)
             drift["fp_error"] = drift["fp_error"] or f"{type(exc).__name__}: {exc}"[:200]
     # F05: 写作台定稿版本一行指纹都没有的(改稿时进程被杀), 补回来(见 _heal_fingerprint_gaps)
-    desk_best: dict[str, list[str]] = {}
+    desk_best: dict[str, dict[str, str | None]] = {}
     for pid, rows in raw_versions:
-        desk_best.setdefault(pid, []).extend(str(r["version_id"]) for r in rows
-                                             if r.get("ai_engine") == store.DESKCORE_AI_ENGINE and r.get("version_id"))
+        desk_best.setdefault(pid, {}).update(
+            (str(r["version_id"]), str(r["item_id"]) if r.get("item_id") else None) for r in rows
+            if r.get("ai_engine") == store.DESKCORE_AI_ENGINE and r.get("version_id"))
     fingerprint_gap = _heal_fingerprint_gaps(client, desk_best, dry_run=dry_run,
                                              holder=f"tv-sync-heal:{tv_project_id}:{uuid.uuid4().hex[:8]}")
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]

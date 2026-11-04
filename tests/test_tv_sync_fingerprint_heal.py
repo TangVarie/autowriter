@@ -114,3 +114,30 @@ def test_a_failure_is_reported_and_does_not_stop_the_sync(monkeypatch):
     monkeypatch.setattr(store, "write_fingerprints", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
     out = core.tv_sync(c, TV)
     assert out["fingerprint_gap"]["missing"] == 1 and "db down" in out["fingerprint_gap"]["error"]
+
+
+def test_a_revision_that_did_not_attach_to_the_item_is_not_backfilled(monkeypatch, caplog):
+    # 复审 11-04: 新指纹入了库、新版也建了, 只是 best 没挪过去(commit_drafts 的 replace_error)。旧版没有行是故意的, 新的
+    # 文字在同一个 item 的新版下 —— 补回旧稿的文字, 一篇帖的新旧两版就都在查重里了
+    c = _client()
+    v1 = core.commit_drafts(c, PROJ, [{"title": "秋招等回音", "body": BODY_A}], user_id=ME)["version_ids"][0]
+    _embed(c)
+
+    def _fail(*a, **k):
+        raise RuntimeError("best 挪不过去")
+    monkeypatch.setattr(store, "point_item_at_version", _fail)
+    out = core.commit_drafts(c, PROJ, [{"title": "秋招等回音", "body": BODY_A2, "replaces_version_id": v1}], user_id=ME)
+    assert "replace_warning" in out
+    monkeypatch.undo()
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    monkeypatch.setattr(config, "JUDGE_URL", "")
+    item = next(i for i in c.rows["items"] if i.get("best_version_id") == v1)
+    v2 = next(v["id"] for v in c.rows["versions"] if v.get("item_id") == item["id"] and v["id"] != v1)
+    assert not _rows(c, v1) and _rows(c, v2), "前提: best 还是旧版、旧版没有行, 新版在同一个 item 下、有行"
+
+    with caplog.at_level(logging.INFO, logger=core.logger.name):
+        res = core.tv_sync(_joinable(c), TV)
+    gap = res["fingerprint_gap"]
+    assert not _rows(c, v1), "旧稿的文字不补回去"
+    assert (gap["missing"], gap["rebuilt"], gap.get("skipped")) == (0, 0, 1)
+    assert not any(r.levelno >= logging.WARNING and "没有指纹行" in r.getMessage() for r in caplog.records)

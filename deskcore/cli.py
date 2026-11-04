@@ -546,8 +546,8 @@ def _tv_sync(core, sb, args) -> int:
             rc = 1
         gp = out.get("fingerprint_gap") or {}
         if gp.get("missing"):
-            # 外部评审 11-04 F05: 写作台定稿版本一行指纹都没有(多半是改稿时进程被杀), 查重看不见那篇旧稿
-            print(f"  ⚠️ 写作台定稿版本没有指纹行的 {gp['missing']} 个(多半是改稿时进程被杀): "
+            # 外部评审 11-04 F05: 写作台定稿版本一行指纹都没有(比如改稿时进程被杀), 查重看不见那篇旧稿
+            print(f"  ⚠️ 写作台定稿版本没有指纹行的 {gp['missing']} 个: "
                   + ("预演, 没补" if out.get("dry_run") else f"已按 backfill 补回 {gp['rebuilt']} 行")
                   + "; " + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("samples") or []))
         if gp.get("error"):
