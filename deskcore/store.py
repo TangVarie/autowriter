@@ -3688,7 +3688,7 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
     def _build(off, lim):
         return (sb.table("items")
                 .select("id, best_version_id, created_at, "
-                        "versions(id, title, body, version_num, created_at), "
+                        "versions(id, title, body, version_num, created_at, ai_engine), "
                         "batches!inner(project_id, params)")
                 .eq("batches.project_id", project_id)
                 .order("created_at", desc=True)
@@ -3709,9 +3709,11 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
         body = (chosen.get("body") or "").strip()
         if not (title or body):
             continue
+        # ai_engine: tv-sync 的指纹自愈只看写作台自己的版本(外部评审 11-04 F05, core._heal_fingerprint_gaps)
         out.append({"version_id": chosen.get("id"), "item_id": item.get("id"),
                     "project_id": project_id, "title": title, "body": body,
-                    "created_at": chosen.get("created_at") or item.get("created_at")})
+                    "created_at": chosen.get("created_at") or item.get("created_at"),
+                    "ai_engine": chosen.get("ai_engine")})
     return out
 
 

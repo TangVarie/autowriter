@@ -544,6 +544,16 @@ def _tv_sync(core, sb, args) -> int:
         if pf.get("error"):
             print(f"  ⚠️ 帖的文字没记进指纹库: {pf['error']} —— 对照照常写了; 下一晚按文字再补。")
             rc = 1
+        gp = out.get("fingerprint_gap") or {}
+        if gp.get("missing"):
+            # 外部评审 11-04 F05: 写作台定稿版本一行指纹都没有(多半是改稿时进程被杀), 查重看不见那篇旧稿
+            print(f"  ⚠️ 写作台定稿版本没有指纹行的 {gp['missing']} 个(多半是改稿时进程被杀): "
+                  + ("预演, 没补" if out.get("dry_run") else f"已按 backfill 补回 {gp['rebuilt']} 行")
+                  + "; " + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("samples") or []))
+        if gp.get("error"):
+            print(f"  ⚠️ 补定稿版本的指纹失败: {gp['error']} —— 对照照常写了; 明晚再补, 急的话手动 "
+                  "`python -m deskcore.cli backfill --project <项目>`。")
+            rc = 1
         ed = out.get("edit_diffs") or {}
         if ed:
             print(f"  改动差异: 算了 {ed.get('computed', 0)} 对(改过的 {ed.get('changed', 0)}, 补算以前的 "

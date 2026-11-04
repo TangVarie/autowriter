@@ -5452,7 +5452,7 @@ def recompute_fingerprints(client, project_id: str, *, progress=None) -> dict:
 
 
 def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = True,
-                          chunk: int = 50, progress=None) -> dict:
+                          chunk: int = 50, progress=None, only_version_ids: set[str] | None = None) -> dict:
     """把项目的历史成稿补进指纹库。**部署后每个项目必跑一次。**
 
     ⚠️ 【故意没有归属校验】—— 理由同 reembed_fingerprints, 见那边。
@@ -5471,6 +5471,8 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
     所以历史行有向量就【直接复用】, 不重新调 API —— 几千条重算既慢又费钱。
     只有缺向量的才补算, 且 embedding 不可用时照常写入(向量留空), 确定性信号
     不受影响。
+
+    ``only_version_ids``: 只补这几版(tv-sync 的指纹自愈, 外部评审 11-04 F05, 见 _heal_fingerprint_gaps); 不给就是整个项目。
     """
     # 审计 ROB-011: 逐页消费, 不再把整个项目的历史成稿(全文 + 每条 768 个
     # Python float)同时留在内存。5000 条那一档原来是三四百 MB 峰值 —— 容器
@@ -5549,6 +5551,8 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
         written += store.write_fingerprints(client, payload)
 
     for page in store.legacy_version_pages(client, project_id):
+        if only_version_ids is not None:
+            page = [r for r in page if str(r.get("version_id")) in only_version_ids]
         total += len(page)
         for r in page:
             if r.get("version_id") in done_ids:
@@ -9767,6 +9771,40 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
     return out
 
 
+# ── 定稿版本一行指纹都没有的, 夜里补回来(外部评审 11-04 F05, 2026-11-04) ─────────────────────────────────
+# 改稿(replaces_version_id)先把旧 item 的指纹整个摘掉、查重、再原子写新的; 普通异常有 _restore_stash 放回, 可进程在这几秒里
+# 被杀(SIGKILL / OOM / 部署重启)就放不回了: item 的 best 还是旧版(add_version_to_item 没跑到), 旧稿从查重里消失, 项目还有别的
+# 历史时一声不响。`cli backfill` / `doctor --gap` 能补, 但都是手动的。所以 tv-sync 每晚顺手看一眼: 接着的写作台项目里, 写作台
+# 自己产的(ai_engine = deskcore)定稿版本没有指纹行的, 拿项目写锁(改稿也持这把锁, 不会和正在跑的改稿撞), 用 backfill 那一套
+# 补上(锁里重读一遍, 幂等), 记 WARNING。没改 score_drafts 的顺序 —— 改成一个事务是另一件事(要改 RPC 和迁移)。
+# 补回的行没有 angle_key(原来那行的坐标跟着删了), 写手记 item 的 user_id。
+
+def _heal_fingerprint_gaps(client, best: dict[str, list[str]], *, holder: str, dry_run: bool = False) -> dict:
+    """``best``: ``{项目: [写作台定稿版本的 version_id]}``。回 ``{"checked", "missing", "rebuilt", "error", "samples"}``。"""
+    out = {"checked": 0, "missing": 0, "rebuilt": 0, "error": None, "samples": []}
+    for pid, vids in best.items():
+        if not vids:
+            continue
+        try:
+            gap = sorted(set(vids) - store.existing_fingerprint_version_ids(client, pid))
+            out["checked"] += len(vids)
+            if not gap:
+                continue
+            out["missing"] += len(gap)
+            out["samples"].extend({"project_id": pid, "version_id": v} for v in gap[:max(0, 5 - len(out["samples"]))])
+            logger.warning("tv_sync: %d 个写作台定稿版本没有指纹行(多半是改稿时进程被杀), %s (project=%s): %s",
+                           len(gap), "预演不补" if dry_run else "按 backfill 补回", pid, ", ".join(gap[:5]))
+            if dry_run:
+                continue
+            with _project_write_lock(client, pid, holder):
+                res = backfill_fingerprints(client, pid, only_version_ids=set(gap))
+            out["rebuilt"] += int(res.get("written") or 0)
+        except Exception as exc:                        # noqa: BLE001 — 对照已经写了; 明晚再补
+            logger.exception("tv_sync: 补定稿版本的指纹失败 (project=%s)", pid)
+            out["error"] = out["error"] or f"{type(exc).__name__}: {exc}"[:300]
+    return out
+
+
 def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             write_tv: bool = False, since: str | None = None,
             rematch: bool = False) -> dict:
@@ -9805,8 +9843,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     target = next((m for m in maps if m.get("ingest_target")), None)
     owners = {m["project_id"]: _tv_owner(client, m["project_id"]) for m in maps}
 
-    versions = [tvlink.Version.from_row(v) for m in maps
-                for v in store.versions_for_linking(client, m["project_id"])]
+    raw_versions = [(m["project_id"], store.versions_for_linking(client, m["project_id"])) for m in maps]
+    versions = [tvlink.Version.from_row(v) for _, rows in raw_versions for v in rows]
     index = tvlink.VersionIndex(versions)
     known = {v.version_id: v for v in versions}
     project_of = {m["project_id"]: m for m in maps}
@@ -10514,6 +10552,13 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             logger.exception("tv_sync: 记补录的帖的正文指纹失败 (tv=%s)", tv_project_id)
             drift["fp_written"] += getattr(exc, "done", 0)
             drift["fp_error"] = drift["fp_error"] or f"{type(exc).__name__}: {exc}"[:200]
+    # F05: 写作台定稿版本一行指纹都没有的(改稿时进程被杀), 补回来(见 _heal_fingerprint_gaps)
+    desk_best: dict[str, list[str]] = {}
+    for pid, rows in raw_versions:
+        desk_best.setdefault(pid, []).extend(str(r["version_id"]) for r in rows
+                                             if r.get("ai_engine") == store.DESKCORE_AI_ENGINE and r.get("version_id"))
+    fingerprint_gap = _heal_fingerprint_gaps(client, desk_best, dry_run=dry_run,
+                                             holder=f"tv-sync-heal:{tv_project_id}:{uuid.uuid4().hex[:8]}")
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
     return {
         "tv_project_id": tv_project_id,
@@ -10528,6 +10573,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "drift": drift,
         "snapshots": snap,
         "published_fp": published_fp,
+        "fingerprint_gap": fingerprint_gap,
         "weak_title": weak_title,
         "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
