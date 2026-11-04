@@ -2537,6 +2537,9 @@ _JUDGE_ROW_KEYS = ("judge_status", "passed", "hard_fails", "calls", "written",
 
 _JUDGE_BLOCK_TEXT_MAX = 300
 JUDGE_PRODUCT_ROLE_KEY = "_product_role"
+# 判是判出来了、账本没写进去的那一篇(外部评审 11-04 F04): judge_client 带回来的 write_error。私有键, 只给 batch_metrics,
+# commit_drafts 拿到判定块就摘下来(_pop_judge_ledger_errors), 不进回包 —— 写手看到的分数不受影响, 少的是账本那几行
+JUDGE_LEDGER_ERROR_KEY = "_ledger_error"
 
 
 def _is_sure(p) -> bool:
@@ -2586,7 +2589,32 @@ def _judge_row(target: dict, res: dict) -> dict:
     if res.get("product_role"):
         # 只给 commit_drafts 对贴型用(_add_layer_hints 一律摘掉, 不进回包和 batch_metrics)
         row[JUDGE_PRODUCT_ROLE_KEY] = res["product_role"]
+    if res.get("judge_status") == judge_client.JUDGE_OK and res.get("ledger_ok") is False:
+        # 存档的判定发的是 write=true: 回包带 write_error、或 written 不是整数, 答案就没(全)落进 TV 账本(同 check_rules 的
+        # _ledger_write_failed)。judge_status 仍是 ok —— 判定本身成功了
+        row[JUDGE_LEDGER_ERROR_KEY] = (res.get("write_error") or "回包里没有 written")[:_JUDGE_BLOCK_TEXT_MAX]
     return row
+
+
+def _pop_judge_ledger_errors(judge: dict | None, project_id: str) -> dict[str, str]:
+    """把判定块里每行的 JUDGE_LEDGER_ERROR_KEY 摘下来(不进回包), 回 ``{version_id: 原因}``; 有的话记一条 WARNING 和一条
+    ``deskcore_commit_judge_ledger`` 埋点(同 check_rules 的 deskcore_check_rules_ledger)。"""
+    out: dict[str, str] = {}
+    for row in (judge or {}).get("results") or []:
+        if isinstance(row, dict):
+            err = row.pop(JUDGE_LEDGER_ERROR_KEY, None)
+            if err:
+                out[str(row.get("version_id"))] = err
+    if out:
+        logger.warning("score_drafts: %d 篇判出来了、答案没落进 TV 账本(project=%s): %s", len(out), project_id,
+                       "; ".join(f"{vid}: {err}" for vid, err in list(out.items())[:5]))
+        try:
+            import telemetry
+            telemetry.log_event("deskcore_commit_judge_ledger", project_id=project_id,
+                                judge_ledger_errors=len(out), version_ids=list(out)[:20])
+        except Exception:                               # noqa: BLE001 — 埋点不能拖垮存档
+            pass
+    return out
 
 
 # 判定块里只给 batch_metrics 的那一项(2026-10-30 复审): 整批没发出去的工程原因(没配哪个变量、没接哪张表、查库卡在哪)。
@@ -2891,13 +2919,16 @@ def _rejection_meta(drafts: list[dict], rejected: list[dict]) -> dict:
 
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                            out: dict, *, flywheel: dict | None = None, checks: dict | None = None,
-                           commit_parts: dict | None = None, judge_ops: str | None = None) -> tuple[str | None, dict]:
+                           commit_parts: dict | None = None, judge_ops: str | None = None,
+                           judge_ledger: dict | None = None) -> tuple[str | None, dict]:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
 
     回 ``(插进去那一行的 id, meta)``(没插成 id 是 None): 改稿的后台规则复查(AU-F07)把结果并进这份 meta 写回同一行。
 
     ``judge_ops``: 判定块里摘下来的工程原因(JUDGE_OPS_DETAIL_KEY), 落进 meta.judge_detail —— 回包里的 judge.detail 是念给
     写手的话, 查「为什么这批没判」要的是这一句(2026-10-30 复审)。
+    ``judge_ledger``: 判出来了、答案没落进 TV 账本的那几篇(_pop_judge_ledger_errors), 记进 meta.judge[].ledger_error 和
+    counters.judge_ledger_errors(外部评审 11-04 F04)。
 
     为什么要落库而不只打日志: 「commit_drafts 约 1~2 秒」「一批 10 篇并行也是一两秒」
     都没有样本撑着, 8 秒的截止要拿分位数重定(docs/deskcore.md §3.8 有查法)。Railway
@@ -2916,6 +2947,9 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                     "used_angle_keys": int(out.get("used_angle_keys") or 0)}
         for k, v in (j.get("summary") or {}).items():
             counters[f"judge_{k}"] = v
+        judge_ledger = judge_ledger or {}
+        if judge_ledger:
+            counters["judge_ledger_errors"] = len(judge_ledger)
         meta = {
             "mode": "deskcore_commit",
             "batch_id": out.get("batch_id"),
@@ -2933,7 +2967,9 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                                       if isinstance(h, (list, tuple)) and len(h) > 1],
                        "calls": r.get("calls"), "written": r.get("written"),
                        "elapsed_ms": r.get("elapsed_ms"),
-                       "detail": (r.get("detail") or "")[:200] or None}
+                       "detail": (r.get("detail") or "")[:200] or None,
+                       **({"ledger_error": judge_ledger[str(r.get("version_id"))][:200]}
+                          if str(r.get("version_id")) in judge_ledger else {})}
                       for r in (j.get("results") or [])],
             "judge_skipped": [{"index": s.get("index"), "reason": s.get("reason")}
                               for s in (j.get("skipped") or [])],
@@ -4919,6 +4955,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
         logger.warning("score_drafts: 贴型提示没加上(project=%s)", project_id, exc_info=True)
     # 工程原因只进 batch_metrics, 不进回包(念给写手的是 judge.detail 那一句)
     judge_ops = out["judge"].pop(JUDGE_OPS_DETAIL_KEY, None)
+    judge_ledger = _pop_judge_ledger_errors(out["judge"], project_id)
     if out.get("next_step"):
         out["next_step"] = _with_score_report(out["next_step"], out["judge"],
                                               revised={r["index"] for r in out.get("replaced") or []})
@@ -4934,7 +4971,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     out["phase_ms"] = {"lock_wait": lock_wait_ms, "commit": commit_ms, "delivery_rules": delivery_rules_ms,
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
     row_id, metrics_meta = _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta,
-                                                  checks=post_meta, commit_parts=commit_parts, judge_ops=judge_ops)
+                                                  checks=post_meta, commit_parts=commit_parts, judge_ops=judge_ops,
+                                                  judge_ledger=judge_ledger)
     # 改过重存的那几版在后台按编译好的规则复查一次, 结果只进这一行指标(AU-F07, 见 _revision_rule_recheck 上面那段)
     _schedule_revision_recheck(client, project_id, user_id, out, tactic, row_id, metrics_meta)
     return out
@@ -5414,7 +5452,7 @@ def recompute_fingerprints(client, project_id: str, *, progress=None) -> dict:
 
 
 def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = True,
-                          chunk: int = 50, progress=None) -> dict:
+                          chunk: int = 50, progress=None, only_version_ids: set[str] | None = None) -> dict:
     """把项目的历史成稿补进指纹库。**部署后每个项目必跑一次。**
 
     ⚠️ 【故意没有归属校验】—— 理由同 reembed_fingerprints, 见那边。
@@ -5433,6 +5471,10 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
     所以历史行有向量就【直接复用】, 不重新调 API —— 几千条重算既慢又费钱。
     只有缺向量的才补算, 且 embedding 不可用时照常写入(向量留空), 确定性信号
     不受影响。
+
+    ``only_version_ids``: 只补这几版(tv-sync 的指纹自愈, 外部评审 11-04 F05, 见 _heal_fingerprint_gaps); 不给就是整个项目。
+    点名的按 id 直接取(store.legacy_version_rows_for), 不走整个项目的翻页 —— 那条带 5000 上限, 更老的那版会一直补不上
+    (codex review on #146)。现在已经不是自己 item 定稿版本的那几版不补, 列在 ``not_final`` 里。
     """
     # 审计 ROB-011: 逐页消费, 不再把整个项目的历史成稿(全文 + 每条 768 个
     # Python float)同时留在内存。5000 条那一档原来是三四百 MB 峰值 —— 容器
@@ -5441,7 +5483,9 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
     # done_ids 仍然一次取全: 它只是一串 UUID(几 MB 顶天), 而它是【幂等性本身
     # 所依赖的那个集合】—— 分页判重会让跨页的重复漏过去(审计 COR-005 修的
     # 就是它被静默截断的那一版)。
-    done_ids = store.existing_fingerprint_version_ids(client, project_id)
+    # 点名补的只看那几版(review on #146): 整项目翻一遍只为判这几个 id, 在 tv-sync 自愈拿着的项目写锁里太重
+    done_ids = (store.fingerprinted_version_ids(client, project_id, only_version_ids) if only_version_ids is not None
+                else store.existing_fingerprint_version_ids(client, project_id))
     can_embed = with_embeddings and dedup.embeddings_available()
     total = already = written = reused = computed = missing = 0
     todo_seen = processed = 0
@@ -5510,7 +5554,13 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
             })
         written += store.write_fingerprints(client, payload)
 
-    for page in store.legacy_version_pages(client, project_id):
+    if only_version_ids is not None:
+        pages = [store.legacy_version_rows_for(client, project_id, only_version_ids)]
+        found = {str(r.get("version_id")) for r in pages[0]}
+        not_final = sorted(str(v) for v in only_version_ids if str(v) not in found)
+    else:
+        pages, not_final = store.legacy_version_pages(client, project_id), []
+    for page in pages:
         total += len(page)
         for r in page:
             if r.get("version_id") in done_ids:
@@ -5528,14 +5578,15 @@ def backfill_fingerprints(client, project_id: str, *, with_embeddings: bool = Tr
     if progress and todo_seen:
         progress(processed, todo_seen)
 
+    extra = {"not_final": not_final} if only_version_ids is not None else {}
     if not total:
         return {"total": 0, "already": 0, "written": 0, "embedded": 0,
-                "reused_embeddings": 0, "missing_embeddings": 0}
+                "reused_embeddings": 0, "missing_embeddings": 0, **extra}
     if not todo_seen:
         return {"total": total, "already": already, "written": 0, "embedded": 0,
-                "reused_embeddings": 0, "missing_embeddings": 0}
+                "reused_embeddings": 0, "missing_embeddings": 0, **extra}
 
-    out = {
+    out = {**extra, 
         "total": total, "already": already, "written": written,
         "embedded": reused + computed,
         "reused_embeddings": reused, "computed_embeddings": computed,
@@ -9265,6 +9316,28 @@ def _linked_versions_outside_index(client, existing: dict, notes: list, fp_now: 
     return out
 
 
+def _ingested_versions_to_check(client, existing: dict, notes: list, fp_now: dict) -> dict:
+    """补录(``ingested``)的对照, TV 正文的指纹和记着的不一样(或 017 之前没记过)的, 按项目去库里取那一版的标题和正文
+    (外部评审 11-04 F07)。补录副本不在对照索引里, 只能这样取; 取不到的就没有, 那条这晚不核。之后每晚只有改过字的那几条。"""
+    want: dict[str, set] = {}
+    for n in notes:
+        l = existing.get(n.note_id)
+        if (l and l.get("match_kind") == "ingested" and l.get("version_id") and l.get("project_id") and n.body
+                and l.get("tv_text_fp") != fp_now[n.note_id]):
+            want.setdefault(str(l["project_id"]), set()).add(str(l["version_id"]))
+    out: dict[str, tvlink.Version] = {}
+    for pid, ids in want.items():
+        try:
+            got = store.versions_in_project(client, pid, sorted(ids))
+        except Exception:                               # noqa: BLE001
+            logger.exception("tv_sync: 取补录的版本失败 (project=%s), 这几条明晚再核", pid)
+            continue
+        for vid, r in got.items():
+            out[vid] = tvlink.Version(version_id=vid, project_id=pid, title=(r.get("title") or "").strip(),
+                                      body=(r.get("body") or "").strip(), created_at=None)
+    return out
+
+
 def _diff_stamp(link: dict, diffed: dict[str, dict]) -> dict:
     """差异行的 computed_at: 新算的、或者换了一版的, 记现在(进下一份摘要); 同一版重算(--rematch / 口径过时)不带这一列,
     upsert 就留着原来的时间 —— 不然一次 rematch 会把早就看过的整批差异推过水位、每周 200 篇地重放。
@@ -9504,7 +9577,8 @@ def _fp_key(body: str) -> tuple:
     return (fp.opening_hash(body) or "", tuple(sorted(fp.ngram_hashes(body))))
 
 
-# W-40(10-30): 哪几种对照的帖, 发出去的文字要记在连着的那一版下。ingested 不用(版本就是从这篇帖抄进来的, 文字本来就在库里)。
+# W-40(10-30): 哪几种对照的帖, 发出去的文字要记在连着的那一版下。ingested 不用(版本就是从这篇帖抄进来的, 文字本来就在库里)
+# —— 帖后来在飞书里改过的除外(外部评审 11-04 F07): tv_sync 的 _ingested_text_check 认出来, 单独把它加进这一步。
 # body_exact 也要: 它只是正文前 40 字一样, 后面改过的照样有。
 _PUBLISHED_FP_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", "tv_lineage"})
 
@@ -9706,6 +9780,120 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
     return out
 
 
+# ── 定稿版本一行指纹都没有的, 夜里补回来(外部评审 11-04 F05, 2026-11-04) ─────────────────────────────────
+# 改稿(replaces_version_id)先把旧 item 的指纹整个摘掉、查重、再原子写新的; 普通异常有 _restore_stash 放回, 可进程在这几秒里
+# 被杀(SIGKILL / OOM / 部署重启)就放不回了: item 的 best 还是旧版(add_version_to_item 没跑到), 旧稿从查重里消失, 项目还有别的
+# 历史时一声不响。`cli backfill` / `doctor --gap` 能补, 但都是手动的。所以 tv-sync 每晚顺手看一眼: 接着的写作台项目里, 写作台
+# 自己产的(ai_engine = deskcore)定稿版本没有指纹行的, 拿项目写锁(改稿也持这把锁, 不会和正在跑的改稿撞), 用 backfill 那一套
+# 补上(锁里重读一遍, 幂等), 记 WARNING。没改 score_drafts 的顺序 —— 改成一个事务是另一件事(要改 RPC 和迁移)。
+# 补回的行没有 angle_key(原来那行的坐标跟着删了), 写手记 item 的 user_id。
+# 复审(同日): 定稿版本没有指纹行不一定是进程被杀。改稿的新指纹入了库、挂到旧 item 上那一步失败(commit_drafts 的 replace_error)
+# 时, best 还指着旧版、旧版的行是故意撤掉的, 新的文字在同一个 item 的新版下 —— 再把旧稿的文字补回去, 一篇帖的新旧两版就都在
+# 查重里了。所以同一个 item 别的版本还有指纹行的不补(只数 skipped)。新版连 versions 行都没建成的那种从库里认不出来, 照补;
+# 日志也就不猜原因。
+# codex review on #146: (1) 锁外看到的缺口只是"可能缺" —— 改稿正摘着旧版的行时 tv-sync 看了一眼, 等它拿到锁, 那次改稿可能已经
+# 把新版和新指纹写进库(best 没挪)。补哪几版只按【锁里】重读的指纹行、同 item 的版本、item 的定稿版本来定。(2) 点名的那几版按 id
+# 直接取, 不受回填翻页的 5000 上限; 补完在锁里再读一遍, 还是没有行的数进 ``unrepaired``(夜报亮红), 不再是 missing 1 / rebuilt 0
+# 而一声不响。
+# 复审(review on #146, 第二轮): (a) 锁外已经认出"同 item 别的版本有行"的, 锁外就跳掉、不去拿锁 —— 跳过只会少补、不会把故意撤掉
+# 的行补回去, 锁外判是安全的方向; 不然这种永远修不好的状态每晚都要拿一次锁、让存稿等着。要补的决定仍只在锁里下。(b) 锁里只按
+# 点名的那几版(和它们同 item 的版本)查指纹行, 不再整项目翻三遍。(c) 锁没等到(IngestBusy)或锁里半途出错、还没定下来的那几版,
+# 记进 ``unverified`` 并点名, 夜报照样说出是哪几篇, 不只剩一句 error。(d) 预演也按 item 现在的定稿版本筛一遍, 和真跑报的一样。
+
+def _replaced_on_item(client, pid: str, vids: dict[str, str | None], gap: list[str],
+                      have: set[str] | None = None) -> set[str]:
+    """``gap`` 里同一个 item 别的版本有指纹行的那几版(改稿落了地、只是 best 没挪过去)。``have`` 不给就按那些兄弟版本的 id 现查。"""
+    items = [vids[v] for v in gap if vids.get(v)]
+    siblings = store.version_ids_of_items(client, items) if items else {}
+    if have is None:
+        sib_ids = {s["id"] for v in gap for s in siblings.get(str(vids.get(v)), ()) if s["id"] != v}
+        have = store.fingerprinted_version_ids(client, pid, sib_ids) if sib_ids else set()
+    return {v for v in gap if any(s["id"] != v and s["id"] in have for s in siblings.get(str(vids.get(v)), ()))}
+
+
+def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, holder: str,
+                           dry_run: bool = False) -> dict:
+    """``best``: ``{项目: {写作台定稿版本的 version_id: item_id}}``。
+    回 ``{"checked", "missing", "rebuilt", "skipped", "unrepaired", "unverified", "error", "samples", "unrepaired_samples",
+    "unverified_samples"}``。``unverified``: 锁外看着缺、但出错(多半是锁没等到)没来得及在锁里核的。"""
+    out = {"checked": 0, "missing": 0, "rebuilt": 0, "skipped": 0, "unrepaired": 0, "unverified": 0, "error": None,
+           "samples": [], "unrepaired_samples": [], "unverified_samples": []}
+
+    def _skip(pid: str, vs, why: str) -> None:
+        if vs:
+            out["skipped"] += len(vs)
+            logger.info("tv_sync: %d 个定稿版本没有指纹行、但%s, 不补 (project=%s): %s",
+                        len(vs), why, pid, ", ".join(sorted(vs)[:5]))
+
+    def _missing(pid: str, gap: list[str]) -> None:
+        out["missing"] += len(gap)
+        out["samples"].extend({"project_id": pid, "version_id": v} for v in gap[:max(0, 5 - len(out["samples"]))])
+        logger.warning("tv_sync: %d 个写作台定稿版本没有指纹行, %s (project=%s): %s",
+                       len(gap), "预演不补" if dry_run else "按 backfill 补回", pid, ", ".join(gap[:5]))
+
+    for pid, vids in best.items():
+        if not vids:
+            continue
+        pending: list[str] = []                         # 锁外看着缺、还没定下来的; 半途出错就按它报 unverified
+        try:
+            have = store.existing_fingerprint_version_ids(client, pid)
+            gap = sorted(set(vids) - have)
+            out["checked"] += len(vids)
+            if not gap:
+                continue
+            pending = gap
+            # 锁外就能跳的先跳: 跳过只会少补, 不会把改稿故意撤掉的行补回去(要补的仍只在锁里定)
+            replaced = _replaced_on_item(client, pid, vids, gap, have)
+            _skip(pid, replaced, "同一个 item 的别的版本有(改稿没挂上 item)")
+            gap = pending = [v for v in gap if v not in replaced]
+            if not gap:
+                continue
+            if dry_run:
+                # 和真跑同一个口径: 已经不是自己 item 定稿版本的那几版不算缺(只读)
+                final = {str(r.get("version_id")) for r in store.legacy_version_rows_for(client, pid, gap)}
+                _skip(pid, [v for v in gap if v not in final], "已经不是自己 item 的定稿版本(best 挪走了)")
+                pending = []
+                if gap := [v for v in gap if v in final]:
+                    _missing(pid, gap)
+                continue
+            with _project_write_lock(client, pid, holder):
+                # 锁里重读: 改稿也持这把锁, 等锁这会儿它可能已经落地。锁外的那一眼只决定要不要来拿锁
+                now = store.fingerprinted_version_ids(client, pid, gap)
+                gap = [v for v in gap if v not in now]
+                replaced = _replaced_on_item(client, pid, vids, gap) if gap else set()
+                _skip(pid, replaced, "同一个 item 的别的版本有(改稿没挂上 item)")
+                gap = [v for v in gap if v not in replaced]
+                pending = []
+                if not gap:
+                    continue
+                _missing(pid, gap)
+                res = backfill_fingerprints(client, pid, only_version_ids=set(gap))
+                out["rebuilt"] += int(res.get("written") or 0)
+                not_final = set(res.get("not_final") or ())
+                _skip(pid, not_final, "已经不是自己 item 的定稿版本(best 挪走了)")
+                if not_final:                           # 那几版不算缺(换下来的旧版本来就该没有行)
+                    out["missing"] -= len(not_final)
+                    out["samples"] = [x for x in out["samples"] if x["version_id"] not in not_final]
+                have = store.fingerprinted_version_ids(client, pid, gap)
+            left = [v for v in gap if v not in have and v not in not_final]
+            if left:
+                out["unrepaired"] += len(left)
+                out["unrepaired_samples"].extend(
+                    {"project_id": pid, "version_id": v} for v in left[:max(0, 5 - len(out["unrepaired_samples"]))])
+                logger.warning("tv_sync: %d 个定稿版本补过之后还是没有指纹行 (project=%s): %s",
+                               len(left), pid, ", ".join(left[:5]))
+        except Exception as exc:                        # noqa: BLE001 — 对照已经写了; 明晚再补
+            logger.exception("tv_sync: 补定稿版本的指纹失败 (project=%s)", pid)
+            out["error"] = out["error"] or f"{type(exc).__name__}: {exc}"[:300]
+            if pending:
+                out["unverified"] += len(pending)
+                out["unverified_samples"].extend(
+                    {"project_id": pid, "version_id": v} for v in pending[:max(0, 5 - len(out["unverified_samples"]))])
+                logger.warning("tv_sync: %d 个写作台定稿版本看着没有指纹行, 但这晚没核成 (project=%s): %s",
+                               len(pending), pid, ", ".join(pending[:5]))
+    return out
+
+
 def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             write_tv: bool = False, since: str | None = None,
             rematch: bool = False) -> dict:
@@ -9744,8 +9932,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     target = next((m for m in maps if m.get("ingest_target")), None)
     owners = {m["project_id"]: _tv_owner(client, m["project_id"]) for m in maps}
 
-    versions = [tvlink.Version.from_row(v) for m in maps
-                for v in store.versions_for_linking(client, m["project_id"])]
+    raw_versions = [(m["project_id"], store.versions_for_linking(client, m["project_id"])) for m in maps]
+    versions = [tvlink.Version.from_row(v) for _, rows in raw_versions for v in rows]
     index = tvlink.VersionIndex(versions)
     known = {v.version_id: v for v in versions}
     project_of = {m["project_id"]: m for m in maps}
@@ -9754,6 +9942,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     notes_by_id = {n.note_id: n for n in notes}
     fp_now = {n.note_id: tvlink.text_fp(n) for n in notes}
     linked_text = _linked_versions_outside_index(client, existing, notes, fp_now, known, rematch=rematch)
+    ingested_text = _ingested_versions_to_check(client, existing, notes, fp_now)
     relink_max = _relink_max()
 
     now = store.iso_now()
@@ -9767,6 +9956,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     drift: dict = {"seeded": 0, "text_changed": 0, "kept_after_rematch": 0, "replaced": 0, "weak_title": 0, "relinked": 0,
                    "deferred": 0, "blocked": 0, "unverifiable": 0, "no_body_kept": 0, "tv_cleared": 0,
                    "clear_missed": 0, "fp_written": 0, "fp_held": 0, "over_cap": 0, "relink_max": relink_max,
+                   "ingested_text_changed": 0, "ingested_seeded": 0,
                    "clear_error": None, "fp_error": None, "samples": []}
     fp_set: dict[str, str] = {}          # 对照不重写、只记指纹的
     text_changed: set[str] = set()       # 改过字、还是那一篇: 差异按现在的正文重算
@@ -9775,6 +9965,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     moved: list[tuple] = []              # (笔记, 新判定, 旧对照, 旧版本是不是我们自己写回 TV 的)
     weak_ids: set[str] = set()           # 以前按标题连上、正文其实不像的(外部审计 11-02 F04), 这晚按内容重对
     weak_amb: dict[str, tvlink.Match] = {}  # 只因为标题一样才分不出的(F04 复审): 先进补录名单对底稿, 补录之前再分
+    ingested_drift: dict[str, tuple] = {}  # 补录的帖正文改过了(F07): note_id → (笔记, 项目, 版本), 文字记进指纹库之后才记指纹
+    ingested_seed: dict[str, str] = {}     # 017 之前补录的、正文和那一版一样: 只记指纹(F07)
 
     def _link(n: tvlink.Note, kind: str, *, project_id=None, version_id=None,
               item_id=None, score=None, lag=None, candidates=None) -> dict:
@@ -9847,13 +10039,37 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         # 挪的(和超上限没挪的)一条不漏: 放行之前人要看全清单(review on aw#128); 其余只是提示, 最多 20 条
         if not move and len(drift["samples"]) >= 20:
             return
-        old_v = known.get(str(prev["version_id"])) or linked_text.get(str(prev["version_id"]))
+        old_v = (known.get(str(prev["version_id"])) or linked_text.get(str(prev["version_id"]))
+                 or ingested_text.get(str(prev["version_id"])))
         drift["samples"].append({
             "note_id": n.note_id, "old_kind": prev.get("match_kind"), "old_version": str(prev["version_id"]),
             "overlap": round(tvlink.overlap(n, old_v), 3) if old_v is not None else None,
             "new_kind": m.kind if m is not None else None,
             "new_version": str(m.version.version_id) if m is not None and m.version is not None else None,
             "why": why})
+
+    def _ingested_text_check(n: tvlink.Note, prev: dict) -> None:
+        """补录的帖, TV 正文后来改了没有(外部评审 11-04 F07)。身份那条线不动: 不重对、不回填血缘、对照和版本都不改 ——
+        只是改过之后发出去的文字要进指纹库(W-40 原来不收 ingested: 以为版本就是这篇帖, 文字本来就在库里, 帖整篇换过之后
+        就不是了)。指纹变了才看; 017 之前没记过指纹的, 拿那一版的正文比一次: 正文一样就只记指纹, 不一样算改过。"""
+        nid, fp_n = n.note_id, fp_now[n.note_id]
+        if not n.body or prev.get("tv_text_fp") == fp_n or not prev.get("project_id"):
+            return
+        vid = str(prev["version_id"])
+        if prev.get("tv_text_fp") is None:
+            v = ingested_text.get(vid)
+            if v is None:
+                drift["unverifiable"] += 1              # 取不到那一版: 不判、不记指纹, 明晚再核
+                return
+            if tvlink.body_unchanged(tvlink.text_fp(tvlink.Note(note_id=nid, title=v.title,
+                                                                 body=tvlink.strip_hashtags(v.body),
+                                                                 publish_time=None)), fp_n):
+                drift["ingested_seeded"] += 1
+                ingested_seed[nid] = fp_n
+                return
+        drift["ingested_text_changed"] += 1
+        ingested_drift[nid] = (n, str(prev["project_id"]), vid)
+        _sample(n, prev, None, "ingested_drift: 补录的帖正文改过了, 改后的文字记进指纹库; 对照、版本、血缘都不动")
 
     for n in notes:
         prev = existing.get(n.note_id)
@@ -9866,6 +10082,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         # 人定过的(candidates 里有 D-xxx / 人工判定)同样不动。
         if _pinned(prev):
             counts["already_linked"] += 1
+            if prev.get("match_kind") == "ingested":
+                _ingested_text_check(n, prev)
             continue
         old = str(prev["version_id"])
         old_v = known.get(old) or linked_text.get(old)
@@ -10407,8 +10625,30 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             continue
         if l.get("tv_text_fp") == fp_now[nid] or nid in fp_ok:
             pairs.append((n, str(l["project_id"]), str(l["version_id"])))
+    # F07: 补录的帖正文改过了, 改后的文字记在补录的那一版下(按文字幂等, 只改了标点 / 话题的不多记)
+    pairs += [t for nid, t in ingested_drift.items() if t[1] in owners]
     published_fp = _fingerprint_published(client, pairs, known=known, owners=owners, dry_run=dry_run,
                                           holder=f"tv-sync-published:{tv_project_id}:{uuid.uuid4().hex[:8]}")
+    if not dry_run and (ingested_seed or ingested_drift):
+        # 改过的那几条, 文字记上了才记指纹(记了明晚就不再看); 这晚没记成的留着, 明晚按文字再补
+        todo = dict(ingested_seed)
+        if published_fp.get("error") is None:
+            todo.update({nid: fp_now[nid] for nid, t in ingested_drift.items() if t[1] in owners})
+        drift["fp_held"] += len(ingested_seed) + len(ingested_drift) - len(todo)
+        try:
+            drift["fp_written"] += store.tv_links_set_fp(client, todo)
+        except Exception as exc:                        # noqa: BLE001 — 明晚再核一遍, 结论一样
+            logger.exception("tv_sync: 记补录的帖的正文指纹失败 (tv=%s)", tv_project_id)
+            drift["fp_written"] += getattr(exc, "done", 0)
+            drift["fp_error"] = drift["fp_error"] or f"{type(exc).__name__}: {exc}"[:200]
+    # F05: 写作台定稿版本一行指纹都没有的(改稿时进程被杀), 补回来(见 _heal_fingerprint_gaps)
+    desk_best: dict[str, dict[str, str | None]] = {}
+    for pid, rows in raw_versions:
+        desk_best.setdefault(pid, {}).update(
+            (str(r["version_id"]), str(r["item_id"]) if r.get("item_id") else None) for r in rows
+            if r.get("ai_engine") == store.DESKCORE_AI_ENGINE and r.get("version_id"))
+    fingerprint_gap = _heal_fingerprint_gaps(client, desk_best, dry_run=dry_run,
+                                             holder=f"tv-sync-heal:{tv_project_id}:{uuid.uuid4().hex[:8]}")
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
     return {
         "tv_project_id": tv_project_id,
@@ -10423,6 +10663,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "drift": drift,
         "snapshots": snap,
         "published_fp": published_fp,
+        "fingerprint_gap": fingerprint_gap,
         "weak_title": weak_title,
         "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "

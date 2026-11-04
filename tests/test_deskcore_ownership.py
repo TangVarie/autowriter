@@ -165,6 +165,8 @@ UNGATED_WITH_REASON = {
     "_daily_rotation_seed": "纯函数: 同 flywheel_arm, 对 (用途, project_id, user_id, 北京日期) 取哈希当正例 / 规律轮换的种子, 不读写库",
     "_patterns_usage_for": "纯函数: 用 _daily_rotation_seed 定规律轮换的起点、拼用法说明, 不读写库; 调用方 build_writing_brief / borrow_lessons 已过归属闸",
     "select_positive_examples": "纯函数: 候选是已过归属闸的 build_writing_brief 读好传进来的, project_id 只当轮换种子的输入(10-20)",
+    "_pop_judge_ledger_errors": "外部评审 11-04 F04: 只从已经判完的判定块里摘私有键、记日志和埋点, 不读写库; "
+                                "project_id 只当日志标签, 只被已过归属闸的 commit_drafts 调",
     "_comment_tool_call": "只被已过归属闸的 comment_repair_plan_for / judge_thread / score_comments 调用；项目和品类由服务端查询",
     "comments_for": "归属闸在 _resolve_post 里(两条路都过 assert_project_access: 按链接反查到的项目、或调用方给的 project_id), "
                     "过闸之前不读规则、不读评论",

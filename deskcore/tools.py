@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import hashlib
 import re
@@ -288,7 +289,8 @@ def create_project(name: str, brand: str = "",
     """
     # 故意不包 _safe: 这是【写】操作。建失败若降级成带 error 的"成功", 调用方
     # 会拿着一个不存在的 project_id 往下走, 后面每个工具都 404 而根因看不见。
-    return core.create_project(core.sb(), name, brand=brand, user_id=_user_id)
+    with _core_value_errors_as_input():
+        return core.create_project(core.sb(), name, brand=brand, user_id=_user_id)
 
 
 def list_projects(include_archived: bool = False, _user_id: str | None = None) -> dict:
@@ -941,6 +943,21 @@ class InvalidInput(ValueError):
     超大载荷一直重试, 400 才说得清是"改参数"。"""
 
 
+@contextlib.contextmanager
+def _core_value_errors_as_input():
+    """core 里给调用方看的参数提示(``raise ValueError("mute 的天数至少是 1")`` 这类)收成 InvalidInput。
+
+    app 层只把 InvalidInput 等几类拒绝的消息原样回给调用方, 别的异常只回类型和 ref(外部评审 11-04 X1a)。不收的话这几句
+    提示到了 MCP 那边就只剩 "ValueError (ref …)", 模型看不出该改哪个参数, 日志里还多一条当成故障的 ERROR; REST 那一路也该是
+    400(改参数), 不是 500。ProjectNotFound / ProjectIsolationRejected 也是 ValueError 的子类, 原样放走, 免得丢了 404。"""
+    try:
+        yield
+    except (core.ProjectNotFound, core.ProjectIsolationRejected, InvalidInput):
+        raise
+    except ValueError as exc:
+        raise InvalidInput(str(exc)) from exc
+
+
 # 头一个是本名, 后面是别名。ingest_published 按顺序取第一个有字的; check_drafts / score_drafts 只在本名空着、别名里恰好
 # 一个有字时才拿别名(_draft_fields)。content / text 是模型把正文放错字段时最常用的英文键(W-30 记下的字段名里就有 content)。
 _TITLE_KEYS = ("title", "标题")
@@ -1191,10 +1208,11 @@ def record_edit(project_id: str, ai_title: str, ai_body: str,
     """
     _require_caller(_user_id, "record_edit", "调校笔记记不了")
     # 故意不包 _safe: 写。这是"裂变"的唯一入口, 静默失败 = 文风永远长不出来。
-    return core.record_edit(core.sb(), project_id, user_id=_user_id,
-                            ai_title=ai_title, ai_body=ai_body,
-                            my_title=my_title, my_body=my_body,
-                            note=note or None)
+    with _core_value_errors_as_input():
+        return core.record_edit(core.sb(), project_id, user_id=_user_id,
+                                ai_title=ai_title, ai_body=ai_body,
+                                my_title=my_title, my_body=my_body,
+                                note=note or None)
 
 
 def label_example(item_id: str, label: str, _user_id: str | None = None) -> dict:
@@ -1213,9 +1231,10 @@ def label_example(item_id: str, label: str, _user_id: str | None = None) -> dict
     """
     _require_caller(_user_id, "label_example", "不能标正负例")
     # 故意不包 _safe: 写。标记没落库却报成功, 用户不会再标第二次。
-    return core.label_example(core.sb(), item_id,
-                              None if label in ("none", "", None) else label,
-                              user_id=_user_id)
+    with _core_value_errors_as_input():
+        return core.label_example(core.sb(), item_id,
+                                  None if label in ("none", "", None) else label,
+                                  user_id=_user_id)
 
 
 def my_style(project_id: str, _user_id: str | None = None) -> dict:
@@ -1256,8 +1275,9 @@ def save_my_style(project_id: str, notes: str,
     """
     _require_caller(_user_id, "save_my_style", "调校笔记存不了")
     # 故意不包 _safe: 写。这是"裂变"闭环的最后一步, 静默失败 = 前面白做。
-    return core.save_my_style(core.sb(), project_id, notes,
-                              user_id=_user_id, edit_ids=edit_ids)
+    with _core_value_errors_as_input():
+        return core.save_my_style(core.sb(), project_id, notes,
+                                  user_id=_user_id, edit_ids=edit_ids)
 
 
 def my_rules(project_id: str, _user_id: str | None = None) -> dict:
@@ -1325,8 +1345,9 @@ def set_rule_state(memory_id: str, action: str, days: int = 90,
     _require_caller(_user_id, "set_rule_state", "拒绝改动规则")
     # 故意不包 _safe: 写。静默失败 = 用户以为关掉了的规则还在每一份简报里,
     # 或者以为留下的规则其实没生效 —— 两个方向都是无声的。
-    return core.set_rule_state(core.sb(), memory_id, action,
-                               user_id=_user_id, days=days, direction=direction)
+    with _core_value_errors_as_input():
+        return core.set_rule_state(core.sb(), memory_id, action,
+                                   user_id=_user_id, days=days, direction=direction)
 
 
 # 工具注册表 —— app.py 和 cli.py 共用。

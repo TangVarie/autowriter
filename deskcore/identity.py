@@ -83,6 +83,20 @@ def _key_map() -> dict[str, dict]:
     return parsed
 
 
+def _unusable_key_positions(keys: dict) -> list[int]:
+    """第几条(从 1 数)的 key 不可能被客户端原样发上来: 带省略号、空白或非 ASCII 可见字符。
+
+    2026-11-03~11-04: 一份把钥匙截成 ``k-xxx-…`` 的示例被原样贴进了 Railway, 三个写稿写手的 key 全部对不上,
+    写作台一天多没人连得上, 而 /health 一直报 "4 key(s)"。只报位置, 不报 key 和名字 —— /health 不带鉴权。
+    """
+    out = []
+    for i, k in enumerate(keys, 1):
+        if (not k or k.endswith("...")
+                or any(not (33 <= ord(ch) <= 126) for ch in k)):
+            out.append(i)
+    return out
+
+
 def auth_configured() -> bool:
     """鉴权是否已配置。配了但坏掉也算"已配"(会 401), 不算未配。"""
     if (os.environ.get("DESKCORE_KEYS") or "").strip():
@@ -106,6 +120,12 @@ def auth_health() -> tuple[bool, str]:
                    if not (v or {}).get("user_id", "").strip()]
         if missing:
             return False, f"DESKCORE_KEYS 有条目缺 user_id: {missing}"
+        unusable = _unusable_key_positions(keys)
+        if unusable:
+            return False, (
+                f"DESKCORE_KEYS 第 {unusable} 条的钥匙看着是截短或占位的(带「…」/「...」、"
+                "空白或非 ASCII 字符)—— 客户端发不出这样的请求头, 这几个人会一直 401。"
+                "换成完整钥匙")
         return True, f"{len(keys)} key(s)"
     if os.environ.get("DESKCORE_API_KEY"):
         if not (os.environ.get("DESKCORE_DEFAULT_USER_ID") or "").strip():

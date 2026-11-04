@@ -544,6 +544,28 @@ def _tv_sync(core, sb, args) -> int:
         if pf.get("error"):
             print(f"  ⚠️ 帖的文字没记进指纹库: {pf['error']} —— 对照照常写了; 下一晚按文字再补。")
             rc = 1
+        gp = out.get("fingerprint_gap") or {}
+        if gp.get("missing"):
+            # 外部评审 11-04 F05: 写作台定稿版本一行指纹都没有(比如改稿时进程被杀), 查重看不见那篇旧稿
+            print(f"  ⚠️ 写作台定稿版本没有指纹行的 {gp['missing']} 个: "
+                  + ("预演, 没补" if out.get("dry_run") else f"已按 backfill 补回 {gp['rebuilt']} 行")
+                  + "; " + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("samples") or []))
+        if gp.get("unrepaired"):
+            # codex review on #146: 补过之后还是没有行的, 不能只在 missing 里一闪而过
+            print(f"  ⚠️ 写作台定稿版本补过之后还是没有指纹行的 {gp['unrepaired']} 个: "
+                  + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("unrepaired_samples") or [])
+                  + " —— 查重看不见它们; 手动 `python -m deskcore.cli backfill --project <项目>` 后再看。")
+            rc = 1
+        if gp.get("unverified"):
+            # review on #146: 锁没等到(IngestBusy)或半途出错时, 看着缺的那几版也要点名, 不能只剩一句 error
+            print(f"  ⚠️ 写作台定稿版本看着没有指纹行、这晚没核成的 {gp['unverified']} 个: "
+                  + ", ".join(f"{s['version_id'][:8]}" for s in gp.get("unverified_samples") or [])
+                  + " —— 查重可能看不见它们; 明晚再核。")
+            rc = 1
+        if gp.get("error"):
+            print(f"  ⚠️ 补定稿版本的指纹失败: {gp['error']} —— 对照照常写了; 明晚再补, 急的话手动 "
+                  "`python -m deskcore.cli backfill --project <项目>`。")
+            rc = 1
         ed = out.get("edit_diffs") or {}
         if ed:
             print(f"  改动差异: 算了 {ed.get('computed', 0)} 对(改过的 {ed.get('changed', 0)}, 补算以前的 "
@@ -616,7 +638,7 @@ def _print_tv_drift(out: dict, tv: str) -> int:
     """已对上的对照 TV 正文变了没有(W-34)。回这一段该给的退出码。"""
     dr = out.get("drift") or {}
     keys = ("seeded", "text_changed", "replaced", "weak_title", "kept_after_rematch", "relinked", "deferred", "blocked",
-            "clear_missed", "unverifiable", "no_body_kept", "over_cap", "fp_held")
+            "clear_missed", "unverifiable", "no_body_kept", "over_cap", "fp_held", "ingested_text_changed", "ingested_seeded")
     if not any(dr.get(k) for k in keys) and not dr.get("clear_error") and not dr.get("fp_error"):
         return 0
     print(f"  正文核对: 第一次记指纹 {dr.get('seeded', 0)}, 改过字还是那一篇 {dr.get('text_changed', 0)}, "
@@ -628,6 +650,10 @@ def _print_tv_drift(out: dict, tv: str) -> int:
           + (f", 重对还是原来那版 {dr['kept_after_rematch']}" if dr.get("kept_after_rematch") else "")
           + (f", 原来那版取不到、明晚再核 {dr['unverifiable']}" if dr.get("unverifiable") else "")
           + (f", TV 正文是空的、没动 {dr['no_body_kept']}" if dr.get("no_body_kept") else "")
+          # 外部评审 11-04 F07: 补录的帖正文后来改了(对照不动, 改后的文字记进指纹库); 017 之前补录的第一次记指纹
+          + (f"; 补录的帖正文改过 {dr['ingested_text_changed']}(文字记进指纹库, 对照不动)"
+             if dr.get("ingested_text_changed") else "")
+          + (f"; 补录的帖第一次记指纹 {dr['ingested_seeded']}" if dr.get("ingested_seeded") else "")
           + (f"; 记指纹 {dr['fp_written']} 行" if dr.get("fp_written") else ""))
     samples = dr.get("samples") or []
     # 预演和超上限时一条不漏: 放行之前人要看全清单(review on aw#128); 平时最多 10 条
