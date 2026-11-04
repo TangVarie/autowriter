@@ -2,7 +2,7 @@
 
 match_note 的开头档原来只看正文前 40 字: 一个候选就认 body_exact、分数写死 1.0, 不看时间窗; still_same(W-34)也是开头一样就
 认 —— 借了一版开头的另一篇帖被连上之后永远纠不回来。这里钉住: 长帖、短帖(光开头就够 0.30 的)都不再按开头连; 标题一样、
-后面重写的照旧认(人留了开头和标题把后面改了, 还是那一篇); 分数记真的包含度; 时间窗外的开头不认; 连上之后 TV 把后面整篇
+后面重写的照旧认(人留了开头和标题把后面改了, 还是那一篇); 分数记真的包含度; 开头和后面都对得上的晚发也认; 连上之后 TV 把后面整篇
 换掉, W-34 认得出来; 主索引的开头候选被拒之后, 查重底稿(W-38)能接住。
 """
 
@@ -75,11 +75,17 @@ def test_identical_text_still_scores_one():
     assert m.kind == "body_exact" and m.score == 1.0
 
 
-def test_an_opening_outside_the_time_window_is_not_body_exact():
-    # 发布比那一版晚 60 天: 开头档也按时间窗(原来只有分歧义时才看窗口); 内容档本来就看窗口
-    m = L.match_note(_n("别的标题", BODY_A, days=60), _idx())
+@pytest.mark.parametrize("days", [29, 31, 60])
+def test_a_late_publication_with_the_same_opening_and_tail_is_still_body_exact(days):
+    # 复审 11-04: 开头和后面都对得上的就是那一篇, 晚发 31 / 60 天、改了标题也是 —— 开头档不按时间窗筛
+    # (筛掉的话内容那一路也看窗口, 它会变成 unmatched 被补录成副本)。时间窗只在几版分不出时用
+    m = L.match_note(_n("改了标题的发布稿", BODY_A, days=days), _idx())
+    assert m.kind == "body_exact" and m.version.version_id == "v1" and m.score == 1.0
+
+
+def test_a_borrowed_opening_stays_rejected_outside_the_window_too():
+    m = L.match_note(_n("狗狗绝育之后", LONG, days=60), _idx())
     assert m.kind == "unmatched" and m.version is None
-    assert L.match_note(_n("别的标题", BODY_A, days=29), _idx()).kind == "body_exact", "窗口里照旧认"
 
 
 def test_tail_check_needs_enough_text_on_both_sides():

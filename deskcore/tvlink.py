@@ -285,7 +285,7 @@ def weak_title_only(m: Match) -> bool:
 
 
 # ── 开头一样、后面是另一篇的不认开头(2026-11-04, 外部评审 11-04 F02) ─────────────────────────────────
-# 开头档原来只看正文前 PREFIX_CHARS 字: 一个候选就认 body_exact、分数写死 1.0, 不看后面、也不看时间窗。别的帖借用了一版的开头
+# 开头档原来只看正文前 PREFIX_CHARS 字: 一个候选就认 body_exact、分数写死 1.0, 不看后面。别的帖借用了一版的开头
 # (写作台外写的帖、或者人只留了开头整篇重写), 就被连到那一版上 —— TV 血缘回填、改动差异、W-40 都按它走, W-34 的 still_same
 # 又因为开头一样一直认它, 永远纠不回来(评审复现: 全文包含度 0.23 照样 body_exact 1.0)。
 # 所以: 开头之后的那段(从第 PREFIX_CHARS 个字起的四字串)两边都够 FUZZY_MIN_GRAMS 个、笔记那段只有不到 PREFIX_TAIL_FLOOR 在那一版
@@ -317,10 +317,11 @@ def prefix_tail_differs(note: Note, v: Version, version_grams: set[str] | None =
 def match_note(note: Note, index: VersionIndex) -> Match:
     pk = prefix_key(note.body)
     exact = list(index.by_prefix.get(pk, ())) if pk else []
-    # F02: 时间窗外的、开头之后是另一篇的不进开头档(见上面那段)。后者也不让内容那一路再连回去: 帖短的时候光开头就够
-    # EDITED_FLOOR, 不拦的话换个名目(edited)又连上了 —— 已经认出来它只是借了开头
+    # F02: 开头之后是另一篇的不进开头档(见上面那段), 也不让内容那一路再连回去: 帖短的时候光开头就够 EDITED_FLOOR, 不拦的话
+    # 换个名目(edited)又连上了 —— 已经认出来它只是借了开头。开头档【不】按时间窗筛(复审 11-04): 开头和后面都对得上的就是
+    # 那一篇, 晚发 31 天也是; 筛掉的话内容那一路也看窗口, 它会变成 unmatched 被补录成副本。时间窗只在几版分不出时用(_pick)
     other = {v.version_id for v in exact if prefix_tail_differs(note, v, index.grams_of(v))}
-    exact = [v for v in exact if in_window(lag_days(note, v)) and v.version_id not in other]
+    exact = [v for v in exact if v.version_id not in other]
     kind = "body_exact"
     ng = grams(note.body)
     weak: list[Version] = []
