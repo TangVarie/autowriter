@@ -9303,6 +9303,28 @@ def _linked_versions_outside_index(client, existing: dict, notes: list, fp_now: 
     return out
 
 
+def _ingested_versions_to_check(client, existing: dict, notes: list, fp_now: dict) -> dict:
+    """补录(``ingested``)的对照, TV 正文的指纹和记着的不一样(或 017 之前没记过)的, 按项目去库里取那一版的标题和正文
+    (外部评审 11-04 F07)。补录副本不在对照索引里, 只能这样取; 取不到的就没有, 那条这晚不核。之后每晚只有改过字的那几条。"""
+    want: dict[str, set] = {}
+    for n in notes:
+        l = existing.get(n.note_id)
+        if (l and l.get("match_kind") == "ingested" and l.get("version_id") and l.get("project_id") and n.body
+                and l.get("tv_text_fp") != fp_now[n.note_id]):
+            want.setdefault(str(l["project_id"]), set()).add(str(l["version_id"]))
+    out: dict[str, tvlink.Version] = {}
+    for pid, ids in want.items():
+        try:
+            got = store.versions_in_project(client, pid, sorted(ids))
+        except Exception:                               # noqa: BLE001
+            logger.exception("tv_sync: 取补录的版本失败 (project=%s), 这几条明晚再核", pid)
+            continue
+        for vid, r in got.items():
+            out[vid] = tvlink.Version(version_id=vid, project_id=pid, title=(r.get("title") or "").strip(),
+                                      body=(r.get("body") or "").strip(), created_at=None)
+    return out
+
+
 def _diff_stamp(link: dict, diffed: dict[str, dict]) -> dict:
     """差异行的 computed_at: 新算的、或者换了一版的, 记现在(进下一份摘要); 同一版重算(--rematch / 口径过时)不带这一列,
     upsert 就留着原来的时间 —— 不然一次 rematch 会把早就看过的整批差异推过水位、每周 200 篇地重放。
@@ -9542,7 +9564,8 @@ def _fp_key(body: str) -> tuple:
     return (fp.opening_hash(body) or "", tuple(sorted(fp.ngram_hashes(body))))
 
 
-# W-40(10-30): 哪几种对照的帖, 发出去的文字要记在连着的那一版下。ingested 不用(版本就是从这篇帖抄进来的, 文字本来就在库里)。
+# W-40(10-30): 哪几种对照的帖, 发出去的文字要记在连着的那一版下。ingested 不用(版本就是从这篇帖抄进来的, 文字本来就在库里)
+# —— 帖后来在飞书里改过的除外(外部评审 11-04 F07): tv_sync 的 _ingested_text_check 认出来, 单独把它加进这一步。
 # body_exact 也要: 它只是正文前 40 字一样, 后面改过的照样有。
 _PUBLISHED_FP_KINDS = frozenset({"body_exact", "title_exact", "fuzzy", "edited", "tv_lineage"})
 
@@ -9792,6 +9815,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     notes_by_id = {n.note_id: n for n in notes}
     fp_now = {n.note_id: tvlink.text_fp(n) for n in notes}
     linked_text = _linked_versions_outside_index(client, existing, notes, fp_now, known, rematch=rematch)
+    ingested_text = _ingested_versions_to_check(client, existing, notes, fp_now)
     relink_max = _relink_max()
 
     now = store.iso_now()
@@ -9805,6 +9829,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     drift: dict = {"seeded": 0, "text_changed": 0, "kept_after_rematch": 0, "replaced": 0, "weak_title": 0, "relinked": 0,
                    "deferred": 0, "blocked": 0, "unverifiable": 0, "no_body_kept": 0, "tv_cleared": 0,
                    "clear_missed": 0, "fp_written": 0, "fp_held": 0, "over_cap": 0, "relink_max": relink_max,
+                   "ingested_text_changed": 0, "ingested_seeded": 0,
                    "clear_error": None, "fp_error": None, "samples": []}
     fp_set: dict[str, str] = {}          # 对照不重写、只记指纹的
     text_changed: set[str] = set()       # 改过字、还是那一篇: 差异按现在的正文重算
@@ -9813,6 +9838,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     moved: list[tuple] = []              # (笔记, 新判定, 旧对照, 旧版本是不是我们自己写回 TV 的)
     weak_ids: set[str] = set()           # 以前按标题连上、正文其实不像的(外部审计 11-02 F04), 这晚按内容重对
     weak_amb: dict[str, tvlink.Match] = {}  # 只因为标题一样才分不出的(F04 复审): 先进补录名单对底稿, 补录之前再分
+    ingested_drift: dict[str, tuple] = {}  # 补录的帖正文改过了(F07): note_id → (笔记, 项目, 版本), 文字记进指纹库之后才记指纹
+    ingested_seed: dict[str, str] = {}     # 017 之前补录的、正文和那一版一样: 只记指纹(F07)
 
     def _link(n: tvlink.Note, kind: str, *, project_id=None, version_id=None,
               item_id=None, score=None, lag=None, candidates=None) -> dict:
@@ -9885,13 +9912,37 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         # 挪的(和超上限没挪的)一条不漏: 放行之前人要看全清单(review on aw#128); 其余只是提示, 最多 20 条
         if not move and len(drift["samples"]) >= 20:
             return
-        old_v = known.get(str(prev["version_id"])) or linked_text.get(str(prev["version_id"]))
+        old_v = (known.get(str(prev["version_id"])) or linked_text.get(str(prev["version_id"]))
+                 or ingested_text.get(str(prev["version_id"])))
         drift["samples"].append({
             "note_id": n.note_id, "old_kind": prev.get("match_kind"), "old_version": str(prev["version_id"]),
             "overlap": round(tvlink.overlap(n, old_v), 3) if old_v is not None else None,
             "new_kind": m.kind if m is not None else None,
             "new_version": str(m.version.version_id) if m is not None and m.version is not None else None,
             "why": why})
+
+    def _ingested_text_check(n: tvlink.Note, prev: dict) -> None:
+        """补录的帖, TV 正文后来改了没有(外部评审 11-04 F07)。身份那条线不动: 不重对、不回填血缘、对照和版本都不改 ——
+        只是改过之后发出去的文字要进指纹库(W-40 原来不收 ingested: 以为版本就是这篇帖, 文字本来就在库里, 帖整篇换过之后
+        就不是了)。指纹变了才看; 017 之前没记过指纹的, 拿那一版的正文比一次: 正文一样就只记指纹, 不一样算改过。"""
+        nid, fp_n = n.note_id, fp_now[n.note_id]
+        if not n.body or prev.get("tv_text_fp") == fp_n or not prev.get("project_id"):
+            return
+        vid = str(prev["version_id"])
+        if prev.get("tv_text_fp") is None:
+            v = ingested_text.get(vid)
+            if v is None:
+                drift["unverifiable"] += 1              # 取不到那一版: 不判、不记指纹, 明晚再核
+                return
+            if tvlink.body_unchanged(tvlink.text_fp(tvlink.Note(note_id=nid, title=v.title,
+                                                                 body=tvlink.strip_hashtags(v.body),
+                                                                 publish_time=None)), fp_n):
+                drift["ingested_seeded"] += 1
+                ingested_seed[nid] = fp_n
+                return
+        drift["ingested_text_changed"] += 1
+        ingested_drift[nid] = (n, str(prev["project_id"]), vid)
+        _sample(n, prev, None, "ingested_drift: 补录的帖正文改过了, 改后的文字记进指纹库; 对照、版本、血缘都不动")
 
     for n in notes:
         prev = existing.get(n.note_id)
@@ -9904,6 +9955,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         # 人定过的(candidates 里有 D-xxx / 人工判定)同样不动。
         if _pinned(prev):
             counts["already_linked"] += 1
+            if prev.get("match_kind") == "ingested":
+                _ingested_text_check(n, prev)
             continue
         old = str(prev["version_id"])
         old_v = known.get(old) or linked_text.get(old)
@@ -10445,8 +10498,22 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             continue
         if l.get("tv_text_fp") == fp_now[nid] or nid in fp_ok:
             pairs.append((n, str(l["project_id"]), str(l["version_id"])))
+    # F07: 补录的帖正文改过了, 改后的文字记在补录的那一版下(按文字幂等, 只改了标点 / 话题的不多记)
+    pairs += [t for nid, t in ingested_drift.items() if t[1] in owners]
     published_fp = _fingerprint_published(client, pairs, known=known, owners=owners, dry_run=dry_run,
                                           holder=f"tv-sync-published:{tv_project_id}:{uuid.uuid4().hex[:8]}")
+    if not dry_run and (ingested_seed or ingested_drift):
+        # 改过的那几条, 文字记上了才记指纹(记了明晚就不再看); 这晚没记成的留着, 明晚按文字再补
+        todo = dict(ingested_seed)
+        if published_fp.get("error") is None:
+            todo.update({nid: fp_now[nid] for nid, t in ingested_drift.items() if t[1] in owners})
+        drift["fp_held"] += len(ingested_seed) + len(ingested_drift) - len(todo)
+        try:
+            drift["fp_written"] += store.tv_links_set_fp(client, todo)
+        except Exception as exc:                        # noqa: BLE001 — 明晚再核一遍, 结论一样
+            logger.exception("tv_sync: 记补录的帖的正文指纹失败 (tv=%s)", tv_project_id)
+            drift["fp_written"] += getattr(exc, "done", 0)
+            drift["fp_error"] = drift["fp_error"] or f"{type(exc).__name__}: {exc}"[:200]
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
     return {
         "tv_project_id": tv_project_id,
