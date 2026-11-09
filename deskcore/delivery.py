@@ -474,10 +474,12 @@ def _cell(text: str) -> str:
     return text.replace("\n", "<br>")
 
 
-def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = None) -> dict:
+def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = None, aliases=()) -> dict:
     """按模板把一批稿子拼成交付稿。返回 ``{"format", "text", "problems": [{"index", "what"}]}``。
 
     ``indices``: 每篇在调用方那一批里的下标(score_drafts 只拼存进去的那几篇, problems 要按写手传的位置报)。
+    ``aliases``: 项目的品牌叫法(core._brand_aliases)。给了就数每篇的评论里以品牌评价收尾的条数(commentstyle.brand_endings,
+    按一篇算: 4 条以内最多 1 条), 超出的进 problems; 模板的 must_mention_any 不给也会用上。
     """
     tpl = validate(template)
     markers, ccfg = tpl["markers"], tpl["comments"]
@@ -533,6 +535,11 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
                 problems += [{"index": i, "what": f"第 {k + 1} 条评论: {w}"} for w in commentstyle.issues(c["text"])]
                 label = ccfg["label_reader"] if c["role"] == "reader" else ccfg["label_author"]
                 lines.append(label + c["text"])
+            # 一篇的评论里以品牌评价收尾的最多四分之一(2026-11-09, 和单独写评论那条路同一个数法)
+            names = [*(aliases or ()), *terms]
+            if names and len(comments) > 1:
+                ends = commentstyle.brand_endings([c["text"] for c in comments], commentstyle.brand_aliases("", "", names))
+                problems += [{"index": i, "what": f"第 {k + 1} 条评论: {w}"} for k, w in sorted(ends["fix"].items())]
 
         direction = str(d.get("direction") or "").strip()
         rows.append({"post": "\n".join(post), "comments": "\n".join(lines), "direction": direction})
@@ -565,7 +572,7 @@ def requirements(template: dict) -> dict:
     if c is not None:
         want = f"{c['min']}" if c["min"] == c["max"] else f"{c['min']}~{c['max']}"
         asks.append(f"comments 给 {want} 条" + (f", 每条都要提到「{'」「'.join(c['must_mention_any'])}」里的一个"
-                                                if c["must_mention_any"] else "") + f"; {commentstyle.SHORT}")
+                                                if c["must_mention_any"] else "") + f"; {commentstyle.SHORT}; {commentstyle.BRAND_ENDING_SHORT}")
     if need_direction:
         asks.append("direction 写一句这篇的切入角度(不是 产品向 / 流量向)")
     # 模板不管话题(wants_tags 为假)时 assemble 不读 tags 字段, 正文原样进交付稿: 这时叫写手「不放话题行」, 照项目规则要的
