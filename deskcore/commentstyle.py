@@ -112,11 +112,6 @@ def brand_ending_allowed(n: int) -> int:
     return max(1, -(-n * int(BRAND_ENDING_SHARE * 100) // 100))
 
 
-def brand_ending_allowed(n: int) -> int:
-    """一组 n 条里最多几条以品牌评价收尾: ceil(25%·n), 至少 1。"""
-    return max(1, -(-n * int(BRAND_ENDING_SHARE * 100) // 100))
-
-
 def _alias_re(aliases) -> re.Pattern | None:
     parts = []
     for a in aliases or ():

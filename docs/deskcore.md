@@ -1135,7 +1135,7 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 - **单独写评论。** `comments_for` 的 `style` 多第四句（`commentstyle.BRAND_ENDING_LINE`）；`score_comments` 拿到项目之后数，超出的那几条 `style_fix` 加一句改法、`passed=false`，`thread_fix` **第一句**点名留哪几条、改哪几条（`thread_fix` 只留 3 条，代码这一句放最前面不会被判定服务的几条挤掉）。品牌收尾的句式重复（末三个字一样，或「<品牌>这…」起头一样；不落在品牌上的收尾不数）够 3 条时进 `thread_hints`，只提示、不算没过。判定服务没判成时照样在 `style_issues` / `thread_fix` 里回；线程占满、查帖子超时那两种还没拿到项目，没有这一项。上限按每次送来的那一组算，所以 `style_next_step` 和 `score_comments` 的工具说明都写明：改完再判时整组全部送、顺序不变（只送改过的几条，上限会重算）。
 - **跟着笔记交付的评论。** 不数，不进 `delivery.problems`：一篇只有 2~3 条，11-09 量过本来就合规（18 组里 4 组有品牌收尾，每组最多 1 条）；有 `must_mention_any` 的模板每条都要点名品牌，数了只会误报，而「先改 problems 再重存」那条路没有一轮的上限。`delivery.requirements` 的 task 接上 `commentstyle.BRAND_ENDING_SHORT`，只是写法提示。
 - **笔记正文不管。** 11-09 量过桌面稿（近 30 天 1,068 版，去掉话题行和表情）：最后一句提到品牌的 0~6.9%、最后一小句 ≤1.7%；发出去的笔记最后一句 0~4.1%。问题只在多条一组的评论上。
-- **根子在项目数据。** 途鸽两条已确认的硬规则要求约九成维护评论「带品牌＋夸」，代码这条上限每一轮都会和它们顶着；要不要改那两条规则由 owner 定，工程不擅自改。
+- **根子在项目数据。** 有的项目已确认的硬规则要求大部分维护评论带品牌并夸，代码这条上限每一轮都会和它顶着；要不要改项目规则由 owner 定，工程不擅自改。
 
 协议没改（`2d357c4b6075`，写手不用重导 skill）：只改了工具回包和 `comments_for` / `score_comments` 的工具说明。回归在 `tests/test_comment_brand_endings.py`。
 
