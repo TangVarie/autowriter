@@ -3341,7 +3341,8 @@ COMMENT_SCORE_NOTE = ("评论检查: 只判不写库。passed=true 且 needs_rev
 COMMENT_STYLE_LINES = commentstyle.LINES + (commentstyle.BRAND_ENDING_LINE,)
 comment_style_issues = commentstyle.issues
 COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字; 一组里以品牌评价收尾的超过四分之一时, "
-                           "超出的那几条), 和 fix 一样算没过: 照着改, 不用问用户。")
+                           "超出的那几条), 和 fix 一样算没过: 照着改, 不用问用户。改完再判时整组全部送, 顺序和这次一样"
+                           "(上限按整组算, 只送改过的几条就不准)。")
 
 
 def _brand_aliases(project: dict) -> list[str]:

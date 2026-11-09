@@ -290,6 +290,13 @@ def test_template_aliases_count_for_score_comments(wired):
     assert [r["slot"] for r in out["comments"] if not r["passed"]] == ["exp"]
 
 
+def test_round_two_is_told_to_resend_the_whole_set_in_order():
+    """上限按每次送来的那一组算: 第二轮只送改过的几条, 上限就重算了; 回包和工具说明都要说整组照原顺序再送。"""
+    from deskcore import tools
+    assert "整组全部送, 顺序和这次一样" in core.COMMENT_STYLE_NEXT_STEP
+    assert "整组全部送, 顺序和第一次一样" in tools.score_comments.__doc__
+
+
 def test_comments_for_hands_out_the_brand_ending_line():
     out = core.comments_for(_client_with_brand(), user_id=ME, link=LINK)
     assert out["style"][-1] == cs.BRAND_ENDING_LINE and out["style"][:3] == list(cs.LINES)
