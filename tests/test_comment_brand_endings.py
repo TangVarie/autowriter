@@ -324,3 +324,18 @@ def test_delivery_does_not_count_brand_endings():
 def test_delivery_requirements_mention_the_brand_ending_cap():
     task = delivery.requirements(TPL)["task"]
     assert cs.BRAND_ENDING_SHORT in task
+
+
+@pytest.mark.parametrize("unit", ["[👍]", "[赞R]", "[[👍]]", "[", "👍]", "[👍"])
+def test_a_run_of_stickers_before_the_text_does_not_stall(unit):
+    # 收尾那两个正则的两支曾经都能吃「[」: 一串贴纸后面接正文时指数回溯, 20 个就要近 2 秒、再多就卡住判评论(codex on aw#147)
+    import time
+    t = time.perf_counter()
+    cs.brand_endings([unit * 40 + "示例牌真好", "示例牌真好" + unit * 40], ["示例牌"])
+    assert time.perf_counter() - t < 1
+
+
+def test_trailing_stickers_are_still_stripped_before_the_ending_is_read():
+    out = cs.brand_endings(["后来选了示例牌，真的稳[赞R][赞R]", "示例牌这波挺懂行👍👍",
+                            "示例牌帮我改了简历，三天就过了[笑哭R]", "最后选了示例牌？[赞R]"], ["示例牌"])
+    assert out["hits"] == [0, 1]
