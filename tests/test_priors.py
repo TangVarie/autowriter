@@ -18,7 +18,9 @@ import pytest
 
 from deskcore import priors, priors_backtest as bt, vocab
 
-NOW = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+# 有几条走的是真实时钟(读缓存时按今天往回数 mix_window_days 天), 所以 NOW 跟着今天走: 写死成 11-02 的话, 过了 60 天这几条就变成 cold
+_NOW_DATE = datetime.now(timezone.utc).date() - timedelta(days=7)
+NOW = datetime(_NOW_DATE.year, _NOW_DATE.month, _NOW_DATE.day, 12, 0, tzinfo=timezone.utc)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -847,6 +849,9 @@ def test_tv_down_with_a_readable_mapping_keeps_formats_inside_the_snapshot_quota
     """重启后缓存是空的、TV 读不到: 对照表已经读到了, 就不能把项目当成「没对上」按 8 种形式平均发 —— 配比从快照里
     本项目那一条拼, 形式只在它的配额里; 没有近 60 天的原始数, 卡上不给括号, 简报的 project_now 照旧只认项目块。"""
     _tv_down(monkeypatch)
+    # 快照是提交进库的, 日子按它的 built_at 算: 跟着真时钟走的话, 快照满 60 天(mix_window_days)这条就变成 cold
+    built = datetime.fromisoformat(priors.load_snapshot()["built_at"])
+    monkeypatch.setattr(priors, "_utcnow", lambda: built + timedelta(days=3))
     for _ in range(2):                                   # 第二次: 项目块 60 秒内不重试, 对照表照样认得
         prof = priors.get_profile(object(), "desk-x", budget_s=2.5)
         assert prof["ps"] == "snap" and prof["pp"] == "table" and prof["stage"] in ("warm", "run")

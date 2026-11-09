@@ -23,7 +23,9 @@ ME = "11111111-1111-1111-1111-111111111111"
 WRITER = "33333333-3333-3333-3333-333333333333"
 P1 = "aaaaaaaa-0000-0000-0000-000000000001"
 TV = "TUGE_phase1"
-T0 = datetime(2026, 10, 20, 4, 0, tzinfo=timezone.utc)
+# 底稿按真实的今天往回数 45 天筛(core.SNAPSHOT_MAX_AGE_DAYS), 所以 T0 跟着今天走: 写死成 10-20 的话, 过了 45 天各条底稿就陆续掉出窗口
+_T0_DATE = datetime.now(timezone.utc).date() - timedelta(days=10)
+T0 = datetime(_T0_DATE.year, _T0_DATE.month, _T0_DATE.day, 4, 0, tzinfo=timezone.utc)
 KEY = "0123456789abcdef0123"
 KEY2 = "fedcba9876543210fedc"
 BODY_A = ("投到第六十份的时候我开始怀疑是不是邮箱坏了, 后来发现坏的是简历第一行。"
