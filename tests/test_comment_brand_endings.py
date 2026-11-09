@@ -2,9 +2,10 @@
 
 钉住:
   1. 上限 ceil(25%·n): 4 → 1, 7 → 2, 20 → 5; 按给的顺序留前面几条, 后面的才要改;
-  2. 只看收尾那一段: 品牌在句中提到不算; 问句收尾不算; 最后一小句很短时连上前一小句(「…<品牌>，真的稳」);
+  2. 只看收尾: 品牌在最后一小句里才算; 最后一小句很短时, 品牌在前一小句末尾的也算(「…<品牌>，真的稳」); 品牌在开头、
+     后面接一段事实的不算(含空格切开的); 整条只有一小句时提到品牌就算; 问句收尾不算(「挺好的呢」「挺靠谱的嘛」不是问句);
   3. 品牌叫法: projects.brand + 交付模板 must_mention_any + 品牌里的英文段, 不分大小写; 都没有退回项目名;
-  4. 收尾句式重复(3 条起)只提示, 不算没过;
+  4. 品牌收尾的句式重复(3 条起)只提示, 不算没过; 不落在品牌上的收尾不数;
   5. score_comments: 超出的那几条 style_fix、passed=false, thread_fix 第一句点名; 判定服务没判成也照样回;
   6. 跟着笔记交付的评论按一篇数, 超出的进 delivery.problems。
 全部是合成文字和合成品牌, 不引用真实评论。
@@ -68,7 +69,7 @@ def test_over_the_cap_the_later_ones_are_flagged(n, n_brand):
     assert res["excess"] == list(range(allowed, n_brand)), "按给的顺序留前面几条, 后面的才要改"
     assert sorted(res["fix"]) == res["excess"]
     for line in res["fix"].values():
-        assert f"最多 {allowed} 条" in line and "事实、感受、细节或提问" in line and "品牌可以留在前文" in line
+        assert f"最多 {allowed} 条" in line and "事实、感受、细节或提问" in line and "把品牌挪到前面的句子里" in line
 
 
 def test_order_decides_which_ones_stay():
@@ -123,6 +124,48 @@ def test_a_long_last_clause_does_not_reach_back():
     assert cs.brand_endings(["选的示例牌，后来第三周拿到了第一个面试"] * 2, ALIASES)["hits"] == []
 
 
+@pytest.mark.parametrize("text", [
+    "示例牌帮我改了简历，三天就过了",                   # 品牌在开头, 后面一小句短但是事实
+    "示例牌贴了两晚，红肿退了点",
+    "示例牌的贴用了一周，闭口少了",
+    "去年在示例牌报的班 简历改了三版",                  # 空格切开的也一样
+    "示例牌老师帮我改了第3版，2天就过了",
+])
+def test_brand_at_the_start_with_a_short_factual_tail_is_not_a_brand_ending(text):
+    assert cs.brand_endings([text] * 20, ALIASES)["hits"] == []
+
+
+@pytest.mark.parametrize("text", ["示例牌的课我上过", "示例牌这波挺懂行"])
+def test_a_one_clause_comment_naming_the_brand_counts(text):
+    """整条只有一小句时那一句就是收尾: 光看字分不出事实和评价, 都算(上限留了四分之一的余地)。"""
+    assert cs.brand_endings([text] * 2, ALIASES)["hits"] == [0, 1]
+
+
+def test_fix_line_names_the_clause_that_matched():
+    res = cs.brand_endings(["去年也是这么过来的，示例牌，真的稳"] * 2 + ["改了三版，示例牌这波挺懂行"] * 2, ALIASES)
+    assert res["excess"] == [1, 2, 3]
+    assert "收尾「示例牌，真的稳」落在「示例牌」上" in res["fix"][1]
+    assert "收尾「示例牌这波挺懂行」落在「示例牌」上" in res["fix"][2]
+    assert "最后一句" not in res["fix"][1]
+
+
+@pytest.mark.parametrize("text", ["示例牌还是挺靠谱的嘛", "示例牌真的挺好的呢", "示例牌这种服务真的没有", "选示例牌就对了嘛"])
+def test_declarative_ne_ma_meiyou_are_not_questions(text):
+    assert cs.brand_endings([text] * 2, ALIASES)["hits"] == [0, 1]
+
+
+@pytest.mark.parametrize("text", [
+    "示例牌能退款嘛", "示例牌你们觉得呢", "其他家呢，示例牌怎么收费呢", "示例牌有没有", "示例牌用过没有", "那示例牌呢",
+])
+def test_real_questions_without_a_question_mark_stay_exempt(text):
+    assert cs.brand_endings([text] * 2, ALIASES)["hits"] == []
+
+
+def test_two_char_brand_can_match_across_words():
+    """已知的小毛病: 两个字的中文品牌按字面找, 会跨词撞上(合成品牌「天好」撞「今天好累」)。少见, 不另做排除; 钉住现状。"""
+    assert cs.brand_endings(["跑了一整天，今天好累"] * 2, cs.brand_aliases("天好"))["hits"] == [0, 1]
+
+
 # ── 3. 品牌叫法 ─────────────────────────────────────────────────────────────────────────────────
 
 def test_aliases_from_brand_template_terms_and_english_part():
@@ -156,14 +199,24 @@ def test_three_same_template_endings_get_a_hint_even_under_the_cap():
 
 
 def test_same_last_three_chars_is_a_template_too():
-    texts = ["第一周就约到了，太省心了", "材料一次过，太省心了", "换了方法以后真是太省心了", "看到第六十份那里我笑出声了"]
+    texts = ["第一周就约到了，示例牌太省心了", "材料一次过，选示例牌真省心了", "换了方法以后，示例牌是真省心了",
+             "看到第六十份那里我笑出声了"] + _set(0, 8)
     res = cs.brand_endings(texts, ALIASES)
-    assert res["hits"] == [] and "「…太省心了」" not in (res["thread_hint"] or "") and "…省心了" in res["thread_hint"]
+    assert res["hits"] == [0, 1, 2] and res["excess"] == []
+    assert "「…省心了」" in res["thread_hint"]
 
 
 def test_two_alike_endings_are_not_a_template():
-    res = cs.brand_endings(["材料一次过，太省心了", "第一周就约到了，太省心了", "简历第一行写的是什么呀"], ALIASES)
+    res = cs.brand_endings(["材料一次过，示例牌太省心了", "第一周就约到了，示例牌太省心了", "简历第一行写的是什么呀"], ALIASES)
     assert res["thread_hint"] is None
+
+
+@pytest.mark.parametrize("texts", [
+    ["这个班怎么样", "那个老师怎么样", "线上课怎么样", "示例牌这波挺懂行"],        # 问句收尾, 不劝「换成提问」
+    ["第一周就约到了，太省心了", "材料一次过，太省心了", "换了方法以后真是太省心了"],  # 没落在品牌上
+])
+def test_only_brand_endings_are_grouped_into_templates(texts):
+    assert cs.brand_endings(texts, ALIASES)["thread_hint"] is None
 
 
 # ── 5. score_comments ───────────────────────────────────────────────────────────────────────────
