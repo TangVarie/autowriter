@@ -478,6 +478,8 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
     """按模板把一批稿子拼成交付稿。返回 ``{"format", "text", "problems": [{"index", "what"}]}``。
 
     ``indices``: 每篇在调用方那一批里的下标(score_drafts 只拼存进去的那几篇, problems 要按写手传的位置报)。
+    一篇的评论里以品牌评价收尾的条数这里不数(2026-11-09): 一篇只有 2~3 条, 量过本来就合规, 有 must_mention_any 的模板
+    每条都要点名品牌, 数了只会误报; requirements 的 task 里那句 ``commentstyle.BRAND_ENDING_SHORT`` 只是写法提示。
     """
     tpl = validate(template)
     markers, ccfg = tpl["markers"], tpl["comments"]
@@ -565,7 +567,7 @@ def requirements(template: dict) -> dict:
     if c is not None:
         want = f"{c['min']}" if c["min"] == c["max"] else f"{c['min']}~{c['max']}"
         asks.append(f"comments 给 {want} 条" + (f", 每条都要提到「{'」「'.join(c['must_mention_any'])}」里的一个"
-                                                if c["must_mention_any"] else "") + f"; {commentstyle.SHORT}")
+                                                if c["must_mention_any"] else "") + f"; {commentstyle.SHORT}; {commentstyle.BRAND_ENDING_SHORT}")
     if need_direction:
         asks.append("direction 写一句这篇的切入角度(不是 产品向 / 流量向)")
     # 模板不管话题(wants_tags 为假)时 assemble 不读 tags 字段, 正文原样进交付稿: 这时叫写手「不放话题行」, 照项目规则要的

@@ -3337,17 +3337,51 @@ COMMENT_SCORE_NOTE = ("评论检查: 只判不写库。passed=true 且 needs_rev
 
 # ── 评论的写法底线, 所有项目都管(2026-11-03, 见 deskcore/commentstyle.py) ──────────────────────────────
 # 单独写评论这条路: comments_for 回包带 style, score_comments 判之前先查(style_fix)。跟着笔记交付的评论在 delivery 里查。
-COMMENT_STYLE_LINES = commentstyle.LINES
+# 2026-11-09 加第四句: 一组里以品牌评价收尾的最多四分之一(commentstyle.brand_endings), score_comments 拿到项目之后数
+COMMENT_STYLE_LINES = commentstyle.LINES + (commentstyle.BRAND_ENDING_LINE,)
 comment_style_issues = commentstyle.issues
-COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字), 和 fix 一样算没过: 照着改, "
-                           "不用问用户。")
+COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字; 一组里以品牌评价收尾的超过四分之一时, "
+                           "超出的那几条), 和 fix 一样算没过: 照着改, 不用问用户。改完再判时整组全部送, 顺序和这次一样"
+                           "(上限按整组算, 只送改过的几条就不准)。")
 
 
-def _style_block(cands: list[dict], style: list[list[str]]) -> dict:
-    """没判成 / 判不全的回包也带上代码查出的写法问题: 那几样不用等判定服务, 照样能改。"""
+def _brand_aliases(project: dict) -> list[str]:
+    """项目的品牌叫法(projects.brand + 交付模板评论栏的 must_mention_any; 都没有退回项目名)。模板读不了就不用它, 不报错。"""
+    extra: list[str] = []
+    try:
+        tpl = delivery.template_of(project)
+        extra = list(((tpl or {}).get("comments") or {}).get("must_mention_any") or [])
+    except Exception:                                   # noqa: BLE001 — 只是多几个叫法
+        extra = []
+    return commentstyle.brand_aliases(project.get("brand"), project.get("name"), extra)
+
+
+def _comment_label(c: dict, i: int) -> str:
+    sid = (c.get("slot") or {}).get("id")
+    return f"位 {sid}" if sid else f"第 {i + 1} 条"
+
+
+def _brand_ending_check(cands: list[dict], style: list[list[str]], project: dict) -> dict:
+    """一组里以品牌评价收尾的超过 ceil(25%·n) 时, 超出的那几条的改法并进它们的 style_fix(就地改 ``style``)。
+    回 brand_endings 的结果(thread_fix / thread_hint 由调用方放进回包)。"""
+    res = commentstyle.brand_endings([c["text"] for c in cands], _brand_aliases(project),
+                                     [_comment_label(c, i) for i, c in enumerate(cands)])
+    for i, line in res["fix"].items():
+        style[i] = [*style[i], line]
+    return res
+
+
+def _style_block(cands: list[dict], style: list[list[str]], ends: dict | None = None) -> dict:
+    """没判成 / 判不全的回包也带上代码查出的写法问题: 那几样不用等判定服务, 照样能改。品牌收尾那一项要先拿到项目, 查帖子
+    之前就没判成的(线程占满、查帖子超时)没有它。"""
     rows = [{"index": i, "slot": (c["slot"] or {}).get("id"), "style_fix": issues}
             for i, (c, issues) in enumerate(zip(cands, style)) if issues]
-    return {"style_issues": rows, "style_next_step": COMMENT_STYLE_NEXT_STEP} if rows else {}
+    out = {"style_issues": rows, "style_next_step": COMMENT_STYLE_NEXT_STEP} if rows else {}
+    if ends and ends.get("thread_fix"):
+        out["thread_fix"] = [ends["thread_fix"]]
+    if ends and ends.get("thread_hint"):
+        out["thread_hints"] = [ends["thread_hint"]]
+    return out
 
 
 def _tv_post_text(note: dict) -> tuple[str, str]:
@@ -3810,6 +3844,8 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
                 "detail": f"查帖子(链接 / 项目 / 归属)在 {budget:g}s 内没查完, 这次没判", **_style_block(cands, style)}
     if missing is not None:
         return missing
+    # 一组里以品牌评价收尾的条数(2026-11-09): 拿到项目才知道品牌叫法。只读文字, 不调模型; 判定服务没判成时照样回
+    ends = _brand_ending_check(cands, style, project)
     payload_comments = _comment_payload(cands)
     res = _comment_tool_call(client, project["id"], "/judge_thread",
                              {"post_title": title, "post_body": body[:_POST_BODY_CHARS], "comments": payload_comments,
@@ -3820,13 +3856,13 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         head["tv_note_vanished"] = True
         head["tv_note_vanished_note"] = TV_VANISHED_NOTE
     if res.get("judge_status") != judge_client.JUDGE_OK:
-        return {**head, "detail": res.get("detail"), **_style_block(cands, style)}
+        return {**head, "detail": res.get("detail"), **_style_block(cands, style, ends)}
     per_comment = res.get("comments") or []
     if len(per_comment) != len(cands):
         # 少回了几条: zip 会悄悄丢掉没回的那几条, 摘要就成了"这几条评论不存在"(codex review on aw#107)
         return {**head, "judge_status": judge_client.JUDGE_ERROR,
                 "detail": f"判定服务回了 {len(per_comment)} 条单条结果, 送去的是 {len(cands)} 条 —— 版本对不上?"
-                          "这次不算判过", **_style_block(cands, style)}
+                          "这次不算判过", **_style_block(cands, style, ends)}
     rows = []
     for i, (c, v) in enumerate(zip(cands, per_comment)):
         v = v if isinstance(v, dict) else {}
@@ -3843,8 +3879,9 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
             row["hints"] = hints
         rows.append(row)
     passed = sum(1 for r in rows if r["passed"])
-    thread_fix = _thread_lines(res.get("plan"))
-    thread_hints = _thread_lines(res.get("hints"))
+    # 代码数出来的整组那一句放最前面: thread_fix 只留 SCORE_MAX_FIXES 条, 判定服务的几条不能把它挤掉
+    thread_fix = ([ends["thread_fix"]] if ends["thread_fix"] else []) + _thread_lines(res.get("plan"))
+    thread_hints = ([ends["thread_hint"]] if ends["thread_hint"] else []) + _thread_lines(res.get("hints"))
     out = {**head, "passed": bool(res.get("passed")) and not any(style),
            "needs_review": bool(res.get("needs_review")),
            "summary": {"comments": len(rows), "passed": passed,
