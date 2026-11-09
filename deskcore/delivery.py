@@ -474,12 +474,12 @@ def _cell(text: str) -> str:
     return text.replace("\n", "<br>")
 
 
-def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = None, aliases=()) -> dict:
+def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = None) -> dict:
     """按模板把一批稿子拼成交付稿。返回 ``{"format", "text", "problems": [{"index", "what"}]}``。
 
     ``indices``: 每篇在调用方那一批里的下标(score_drafts 只拼存进去的那几篇, problems 要按写手传的位置报)。
-    ``aliases``: 项目的品牌叫法(core._brand_aliases)。给了就数每篇的评论里以品牌评价收尾的条数(commentstyle.brand_endings,
-    按一篇算: 4 条以内最多 1 条), 超出的进 problems; 模板的 must_mention_any 不给也会用上。
+    一篇的评论里以品牌评价收尾的条数这里不数(2026-11-09): 一篇只有 2~3 条, 量过本来就合规, 有 must_mention_any 的模板
+    每条都要点名品牌, 数了只会误报; requirements 的 task 里那句 ``commentstyle.BRAND_ENDING_SHORT`` 只是写法提示。
     """
     tpl = validate(template)
     markers, ccfg = tpl["markers"], tpl["comments"]
@@ -535,11 +535,6 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
                 problems += [{"index": i, "what": f"第 {k + 1} 条评论: {w}"} for w in commentstyle.issues(c["text"])]
                 label = ccfg["label_reader"] if c["role"] == "reader" else ccfg["label_author"]
                 lines.append(label + c["text"])
-            # 一篇的评论里以品牌评价收尾的最多四分之一(2026-11-09, 和单独写评论那条路同一个数法)
-            names = [*(aliases or ()), *terms]
-            if names and len(comments) > 1:
-                ends = commentstyle.brand_endings([c["text"] for c in comments], commentstyle.brand_aliases("", "", names))
-                problems += [{"index": i, "what": f"第 {k + 1} 条评论: {w}"} for k, w in sorted(ends["fix"].items())]
 
         direction = str(d.get("direction") or "").strip()
         rows.append({"post": "\n".join(post), "comments": "\n".join(lines), "direction": direction})

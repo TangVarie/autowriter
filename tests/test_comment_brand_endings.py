@@ -7,7 +7,7 @@
   3. 品牌叫法: projects.brand + 交付模板 must_mention_any + 品牌里的英文段, 不分大小写; 都没有退回项目名;
   4. 品牌收尾的句式重复(3 条起)只提示, 不算没过; 不落在品牌上的收尾不数;
   5. score_comments: 超出的那几条 style_fix、passed=false, thread_fix 第一句点名; 判定服务没判成也照样回;
-  6. 跟着笔记交付的评论按一篇数, 超出的进 delivery.problems。
+  6. 跟着笔记交付的评论不数(不进 delivery.problems), requirements 的 task 里只带一句写法提示。
 全部是合成文字和合成品牌, 不引用真实评论。
 """
 from __future__ import annotations
@@ -300,15 +300,18 @@ def test_comments_for_hands_out_the_brand_ending_line():
 TPL = {"layout": "blocks", "comments": {"min": 1, "max": 3, "label_reader": "读者", "label_author": "作者"}}
 
 
-def test_delivery_counts_brand_endings_per_post():
-    post = {"title": "甲", "body": "正文", "comments": [
-        {"role": "reader", "text": "改了三版简历才约到面试，示例牌这波挺懂行"},
-        {"role": "reader", "text": "简历第一行写的是什么呀"},
-        {"role": "author", "text": "老师每次都回得很快，示例牌确实让人安心"}]}
-    out = delivery.assemble(TPL, [post, dict(post, comments=post["comments"][:2])], aliases=ALIASES)
-    brand = [p for p in out["problems"] if "以品牌评价收尾" in p["what"]]
-    assert brand == [{"index": 0, "what": brand[0]["what"]}] and brand[0]["what"].startswith("第 3 条评论: ")
-    assert delivery.assemble(TPL, [post])["problems"] == [], "没给品牌叫法就不数"
+def test_delivery_does_not_count_brand_endings():
+    """交付那条路不数(一篇 2~3 条, 量过本来就合规; must_mention_any 的模板每条都要点名品牌, 数了只会误报)。"""
+    tpl = {"layout": "blocks", "comments": {"min": 1, "max": 3, "label_reader": "读者", "label_author": "作者",
+                                            "must_mention_any": [BRAND]}}
+    factual = {"title": "甲", "body": "正文", "comments": [
+        {"role": "reader", "text": "示例牌的贴用了一周，闭口少了"},
+        {"role": "reader", "text": "示例牌贴了两晚，红肿退了点"},
+        {"role": "author", "text": "示例牌这个贴片薄，出门也能贴"}]}
+    verdict = {"title": "乙", "body": "正文", "comments": [
+        {"role": "reader", "text": "用了一周，示例牌这波挺懂行"},
+        {"role": "author", "text": "贴了两晚，示例牌确实让人安心"}]}
+    assert delivery.assemble(tpl, [factual, verdict])["problems"] == []
 
 
 def test_delivery_requirements_mention_the_brand_ending_cap():

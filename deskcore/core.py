@@ -3966,7 +3966,7 @@ def _record_revised_parts(client, project_id: str, revised: dict[int, str], draf
 
 
 def _whole_batch_delivery(client, project_id: str, tpl: dict, drafts: list[dict], indices: list[int],
-                          revised: dict[int, str], aliases=()) -> tuple[dict | None, str | None, dict]:
+                          revised: dict[int, str]) -> tuple[dict | None, str | None, dict]:
     """改稿重存时拼原来那一整批。改稿挂的每个旧 batch 一段(按 batch 建的先后; 一个表格模板就是一张表), 段里按当初的顺序:
     没改的几篇用它们现在的那一版(标题正文从 versions 取, 话题 / 评论 / 方向从 batch 记的那一份取), 这次改过的换在原位。
     这次另有新稿的, 拼成最后一段(它们是新的一批)。``problems`` 只报这次传的那几篇(``index`` 是写手这次传的位置): 没改的
@@ -4027,7 +4027,7 @@ def _whole_batch_delivery(client, project_id: str, tpl: dict, drafts: list[dict]
     problems: list[dict] = []
     fmt, n = tpl.get("layout"), 0
     for g_drafts, g_idx in groups:
-        res = delivery.assemble(tpl, g_drafts, indices=g_idx, aliases=aliases)
+        res = delivery.assemble(tpl, g_drafts, indices=g_idx)
         fmt = res["format"]
         texts.append(res["text"])
         n += len(g_drafts)
@@ -4165,14 +4165,13 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             res, why, extra = None, None, {}
             if revised:
                 try:
-                    res, why, extra = _whole_batch_delivery(client, project_id, tpl, drafts, indices, revised,
-                                                           aliases=_brand_aliases(project))
+                    res, why, extra = _whole_batch_delivery(client, project_id, tpl, drafts, indices, revised)
                 except Exception:                       # noqa: BLE001 — 拼不回整批就只拼这次的, 存档不受影响
                     logger.warning("commit_drafts: 改稿重存时拼回原来那一批失败(project=%s), 这次只拼存进去的几篇",
                                    project_id, exc_info=True)
                     res, why, extra = None, "lookup_failed", {}
             if res is None:
-                res = delivery.assemble(tpl, picked, indices=indices, aliases=_brand_aliases(project))
+                res = delivery.assemble(tpl, picked, indices=indices)
                 extra = {"drafts": len(picked)}
                 if revised:
                     logger.warning("commit_drafts: 改稿重存时没拼回原来那一批(%s, project=%s), 这次只拼存进去的几篇",
