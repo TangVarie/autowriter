@@ -25,6 +25,12 @@ worker.py — DB-backed job 队列的后台 worker 进程 (R-018)。
     HEARTBEAT_INTERVAL_SECONDS   默认 15; 处理中心跳频率。
     HEARTBEAT_TIMEOUT_SECONDS    默认 90; 超过此时长无心跳 sweeper 回收。
     SWEEP_INTERVAL_SECONDS       默认 60; 主循环 idle 时多久扫一次死 job。
+    ANTHROPIC_API_KEY            generate_batch / quick_gen 必填(主中转站的 key)。
+    ANTHROPIC_BASE_URL           可选; 主中转站地址, 留空 = 官方端点。
+    ANTHROPIC_BASE_URL_BACKUP    可选(D-148); 备用中转站地址。和下一个【都配了】才启用,
+    ANTHROPIC_API_KEY_BACKUP     可选(D-148); 备用中转站 key。缺一个 = 没配, 行为不变。
+    RELAY_FORCE                  可选; backup = 只走备用站, primary = 只走主站、不切换,
+                                 空 = 自动(主站慢 / 挂时切备用)。详见 README「备用中转站」。
 
 部署
 ────

@@ -33,6 +33,13 @@ os.environ.setdefault("SUPABASE_URL", "https://placeholder.supabase.co")
 os.environ.setdefault("SUPABASE_ANON_KEY", "placeholder-anon-key")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "placeholder-service-key")
 
+# 备用中转站(D-148)的开关一律清掉: 开发机 env 里配了备用站的话, config 会在 import 期读到,
+# 所有走 clients.get_anthropic_client 的老用例就悄悄换成了"自动切换"那条路。
+# 要测它的用例(tests/test_anthropic_relay_failover.py)自己在 config 上设。
+for _relay_var in ("ANTHROPIC_BASE_URL_BACKUP", "ANTHROPIC_API_KEY_BACKUP", "RELAY_FORCE",
+                   "RELAY_PRIMARY_TIMEOUT_S", "RELAY_SLOW_S", "RELAY_BREAKER_FAILS", "RELAY_BREAKER_COOLDOWN_S"):
+    os.environ.pop(_relay_var, None)
+
 
 def pytest_configure(config):
     # 慢用例(几秒级的模拟闸, angle cards v2 §5.6): 默认照跑, `-m "not slow"` 可以跳过

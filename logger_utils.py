@@ -58,6 +58,7 @@ def _load_value_secrets() -> tuple[str, ...]:
             "JUDGE_API_KEY",
             "SUPABASE_SERVICE_ROLE_KEY",
             "ANTHROPIC_API_KEY",
+            "ANTHROPIC_API_KEY_BACKUP",     # D-148 备用中转站 key
             "GOOGLE_API_KEY",
         ):
             v = getattr(_cfg, name, "") or ""
