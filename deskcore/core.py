@@ -3332,17 +3332,135 @@ _POST_BODY_CHARS = 6000            # judge 那边只看前 600 字; 给模型看
 
 COMMENT_SCORE_NOTE = ("评论检查: 只判不写库。passed=true 且 needs_review=false 才算这条过; fix 是必须改的(主要行为、点名品牌、"
                       "接住帖子、细节四项), hints 只是参考, 不改不算没过。没过的按 fix 改一轮再调一次 score_comments, 不要循环。"
-                      "needs_review=true 交人工核实, 不能改成伪造的亲历。judge_status 不是 ok 就说这次没判成, 不能说通过。")
+                      "needs_review=true 交人工核实, 不能改成伪造的亲历: 那几条在 review_list 里, 跟用户说时逐条照 text 写全文"
+                      "(不缩写、不省略、不用「…」代替), 后面跟上 why 里的疑点。judge_status 不是 ok 就说这次没判成, 不能说通过。")
+REVIEW_NEXT_STEP = ("review_list 里的几条要交人工核实: 跟用户说的时候每条照 text 原样写全文(不缩写、不省略、不用「…」或「同上」"
+                    "代替), 标上 label, 后面跟上 why 里的疑点(why 是空的就说判定拿不准、要人看一眼); 不要为了消掉疑点反复改写, "
+                    "具体经历、效果和数字依提供素材, 不编造。")
+_REVIEW_GATE_NAMES = {"speech_act": "主要行为", "names_brand": "点名品牌", "echoes_post": "接住帖子", "detail_level": "细节"}
 
 
 # ── 评论的写法底线, 所有项目都管(2026-11-03, 见 deskcore/commentstyle.py) ──────────────────────────────
 # 单独写评论这条路: comments_for 回包带 style, score_comments 判之前先查(style_fix)。跟着笔记交付的评论在 delivery 里查。
 # 2026-11-09 加第四句: 一组里以品牌评价收尾的最多四分之一(commentstyle.brand_endings), score_comments 拿到项目之后数
-COMMENT_STYLE_LINES = commentstyle.LINES + (commentstyle.BRAND_ENDING_LINE,)
+# 2026-11-10: 每条再查「帖子里」和含糊指代(在 LINES 里); 整组再查重复的说法和开头(REPEAT_LINE); 长评论多用短句只提示
+COMMENT_STYLE_LINES = commentstyle.LINES + (commentstyle.BRAND_ENDING_LINE, commentstyle.REPEAT_LINE,
+                                            commentstyle.SENTENCE_LINE)
 comment_style_issues = commentstyle.issues
-COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字; 一组里以品牌评价收尾的超过四分之一时, "
-                           "超出的那几条), 和 fix 一样算没过: 照着改, 不用问用户。改完再判时整组全部送, 顺序和这次一样"
-                           "(上限按整组算, 只送改过的几条就不准)。")
+COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字、「帖子里」、「X那次」「X那栏」这类"
+                           "含糊指代; 整组里重复的说法和开头; 一组里以品牌评价收尾的超过四分之一、项目定了提品牌的上限时超出的那几条), "
+                           "和 fix 一样算没过: 照着改, 不用问用户。改完再判时整组全部送, 顺序和这次一样"
+                           "(上限按整组算, 只送改过的几条就不准); 一批分几次判时, 前面几次判过的放进 earlier_comments, "
+                           "后面的就不会和它们重复。")
+
+
+# ── 项目定的一组评论配比(2026-11-10) ─────────────────────────────────────────────────────────────
+# projects.default_params 里的 ``comment_set``(和 delivery / archived 同一个 JSON 字符串, 不加迁移), owner 用 SQL 配:
+#   {"brand_max": 0.5, "neutral_min": 0.3, "short_min": 0.2, "short_chars": 15, "column": "<飞书里那一列的列名>"}
+# 每一项都可以不配, 不配的那一项不数。份额在 [0, 1], brand_max + neutral_min ≤ 1; short_chars 是 6~40 的整数(配了
+# short_min 没配它时按 15); column 是飞书那一列的列名(1~20 字, 不带 | 和换行), 列名只在库里, 代码和测试里不写。
+# 配错了不报错: 记日志, 回包里一句「配置不对, 这次按没配处理」, 别的照常。
+COMMENT_SET_KEY = "comment_set"
+_COMMENT_SET_KEYS = ("brand_max", "neutral_min", "short_min", "short_chars", "column")
+_SHORT_CHARS_DEFAULT, _SHORT_CHARS_RANGE = 15, (6, 40)
+_COLUMN_MAX = 20
+MAX_EARLIER_COMMENTS = 60                           # 同一批前几次判过的, 只拿来查重复, 不送 Jev
+_EARLIER_CHARS = 500
+CELL_LINES_MAX, CELL_LINE_CHARS = 50, 200           # 帖子那一格里已有的维护评论, 最多读这么多
+# 行首的编号(「1.」「2、」「(3)」); 「10:30 那场」「3.5 分」这种后面紧跟数字的不是编号
+_CELL_NUMBERING = re.compile(r"^\s*(?:[0-9０-９]{1,3}\s*[.、．:：)）](?![0-9０-９])|[（(][0-9０-９]{1,3}[)）])\s*")
+EXISTING_UNREAD_HINT = "这次没读到帖子下已有评论, 只查了组内重复"
+MAX_NAMED_SKIPPED_NOTE = ("这个项目配了一组里提品牌的上限(comment_set), 由代码按品牌叫法数、按顺序留前面的; 这次传的 max_named "
+                          "没有转给判定服务(那边按模型判的点名数、从前往后删, 两份修改单会打架)。")
+DELIVERY_COLUMN_NEXT_STEP = ("delivery_column.text 是这组评论按「{column}」那一格的样子拼好的(一行一条, 不编号、不加标签): 交给用户时"
+                             "原样整段给, 并说清贴进这条帖子那一行的「{column}」那一格; 那一格里已经有内容的, 接在最后另起一行贴, 不要"
+                             "覆盖; 列名不要贴进格子里。贴几行就算发了几条: 只交真要发的那几条, 不加空行、标题或说明行。改过再判时用"
+                             "最后一次回的那一份; 一批分几次判的(带 earlier_comments), 每一段用它最后一次判回的 text, 按判的顺序一段"
+                             "接一段交(段和段之间也不加空行), 合起来贴进同一格。")
+
+
+class _CommentSetError(ValueError):
+    pass
+
+
+def _share(raw: dict, key: str) -> float | None:
+    v = raw.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+        raise _CommentSetError(f"{key} 要是 0 到 1 之间的数, 现在是 {v!r}")
+    return float(v)
+
+
+def _validate_comment_set(raw) -> dict:
+    if not isinstance(raw, dict) or not raw:
+        raise _CommentSetError("comment_set 要是一个非空的 JSON 对象")
+    bad = [k for k in raw if k not in _COMMENT_SET_KEYS]
+    if bad:
+        raise _CommentSetError(f"不认识的键 {bad}; 只认 {' / '.join(_COMMENT_SET_KEYS)}")
+    cfg = {k: _share(raw, k) for k in ("brand_max", "neutral_min", "short_min")}
+    if cfg["brand_max"] is not None and cfg["neutral_min"] is not None and \
+            commentstyle._pct(cfg["brand_max"]) + commentstyle._pct(cfg["neutral_min"]) > 100:
+        raise _CommentSetError("brand_max + neutral_min 不能超过 1")
+    chars = raw.get("short_chars", _SHORT_CHARS_DEFAULT)
+    lo, hi = _SHORT_CHARS_RANGE
+    if isinstance(chars, bool) or not isinstance(chars, int) or not lo <= chars <= hi:
+        raise _CommentSetError(f"short_chars 要是 {lo}~{hi} 的整数, 现在是 {chars!r}")
+    cfg["short_chars"] = chars
+    col = raw.get("column")
+    if col is not None:
+        if not isinstance(col, str) or not col.strip() or len(col.strip()) > _COLUMN_MAX \
+                or any(ch in col for ch in "|\n\r"):
+            raise _CommentSetError(f"column 要是 1~{_COLUMN_MAX} 个字的列名, 不带 | 和换行")
+        col = col.strip()
+    cfg["column"] = col
+    return cfg
+
+
+def _comment_set(project: dict) -> tuple[dict | None, str | None]:
+    """项目行 → ``(校验过的 comment_set 或 None, 配错了时给回包的一句或 None)``。不抛。"""
+    try:
+        raw = delivery.parse_params((project or {}).get("default_params")).get(COMMENT_SET_KEY)
+    except Exception:                                   # noqa: BLE001 — default_params 坏了: 别的路径各自记日志
+        return None, None
+    if raw is None:
+        return None, None
+    try:
+        return _validate_comment_set(raw), None
+    except _CommentSetError as exc:
+        logger.warning("项目 %s 的 comment_set 配置不对, 按没配处理: %s", (project or {}).get("id"), exc)
+        return None, f"这个项目的 comment_set 配置不对({exc}), 这次按没配处理: 一组里提品牌、中性、短评的条数没数, 请负责人改一下。"
+
+
+def _comment_set_lines(cfg: dict) -> list[str]:
+    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。"""
+    out = []
+    if cfg.get("brand_max") is not None:
+        out.append(f"一组里提到品牌的最多 {commentstyle._pct(cfg['brand_max'])}%(20 条最多 "
+                   f"{commentstyle.share_floor(20, cfg['brand_max'])} 条, 按顺序数), 不提品牌时也不用代称(这家、它家、缩写); "
+                   "项目规则里要每条都带品牌的, 以这一句为准")
+    if cfg.get("neutral_min") is not None:
+        out.append(f"至少 {commentstyle._pct(cfg['neutral_min'])}% 是中性评论: 不提品牌、不夸也不劝(提问、观望、自己的经历), "
+                   f"20 条至少 {commentstyle.share_ceil(20, cfg['neutral_min'])} 条")
+    if cfg.get("short_min") is not None:
+        out.append(f"至少 {commentstyle._pct(cfg['short_min'])}% 是 {cfg['short_chars']} 字以内的一句话短评(20 条至少 "
+                   f"{commentstyle.share_ceil(20, cfg['short_min'])} 条); 短评放在提问位或不带评论位, 经验位要接住帖子、太短过不了")
+    if cfg.get("column"):
+        out.append(f"这组评论是这条帖子「{cfg['column']}」那一格的内容: 一行一条, 不编号、不加标签; "
+                   "score_comments 回的 delivery_column.text 原样交")
+    return out
+
+
+def _cell_lines(text: str) -> list[str]:
+    """飞书那一格 → 一条一条的评论: 按行切, 去掉开头的编号, 空行不要, 最多 CELL_LINES_MAX 行、每行 CELL_LINE_CHARS 字。"""
+    out = []
+    for line in (text or "").splitlines():
+        line = _CELL_NUMBERING.sub("", line).strip()
+        if line:
+            out.append(line[:CELL_LINE_CHARS])
+        if len(out) >= CELL_LINES_MAX:
+            break
+    return out
 
 
 def _brand_aliases(project: dict) -> list[str]:
@@ -3361,27 +3479,110 @@ def _comment_label(c: dict, i: int) -> str:
     return f"位 {sid}" if sid else f"第 {i + 1} 条"
 
 
-def _brand_ending_check(cands: list[dict], style: list[list[str]], project: dict) -> dict:
-    """一组里以品牌评价收尾的超过 ceil(25%·n) 时, 超出的那几条的改法并进它们的 style_fix(就地改 ``style``)。
-    回 brand_endings 的结果(thread_fix / thread_hint 由调用方放进回包)。"""
-    res = commentstyle.brand_endings([c["text"] for c in cands], _brand_aliases(project),
-                                     [_comment_label(c, i) for i, c in enumerate(cands)])
-    for i, line in res["fix"].items():
+def _set_checks(cands: list[dict], style: list[list[str]], project: dict, cfg: dict | None,
+                earlier=(), existing=()) -> dict:
+    """拿到项目之后、判之前, 代码数整组(2026-11-09 品牌收尾, 2026-11-10 配比和重复)。只读文字, 不调模型。
+
+    按这个顺序, 「太多」的(提品牌超出的、重复的、品牌收尾超出的)按给的顺序留前面的, 后面那几条的改法并进它们的 style_fix
+    (就地改 ``style``); 「太少」的(中性、短评)是整组的, 判完再定(``_set_line``)。
+      1. 提品牌超出(配了 brand_max): 超出的那几条要去掉品牌;
+      2. 重复的说法和开头(所有项目): ``existing``(帖子下已有的)、``earlier``(同一批前几次判过的)只当参照;
+      3. 以品牌评价收尾超过四分之一: 第 1 步要去掉品牌的那几条按空的算(条数不变), 免得同一条既叫它删品牌又叫它把品牌往前挪;
+      4. 短评条数(配了 short_min)。
+    中性条数要 Jev 判的主要行为, 判完由 ``_neutral_check`` 补上。"""
+    texts = [c["text"] for c in cands]
+    labels = [_comment_label(c, i) for i, c in enumerate(cands)]
+    aliases = _brand_aliases(project)
+    cfg = cfg or {}
+    brand = None
+    masked = list(texts)
+    if cfg.get("brand_max") is not None:
+        brand = commentstyle.brand_share(texts, aliases, labels, brand_max=cfg["brand_max"])
+        for i, line in brand["fix"].items():
+            style[i] = [*style[i], line]
+            masked[i] = ""
+    rep = commentstyle.repeated_clauses(texts, aliases, labels, earlier=earlier, existing=existing)
+    for i, lines in rep["fix"].items():
+        style[i] = [*style[i], *lines]
+    ends = commentstyle.brand_endings(masked, aliases, labels)
+    for i, line in ends["fix"].items():
         style[i] = [*style[i], line]
-    return res
+    short = None
+    if cfg.get("short_min") is not None:
+        short = commentstyle.short_share(texts, labels, short_chars=cfg["short_chars"], short_min=cfg["short_min"])
+    return {"texts": texts, "labels": labels, "aliases": aliases, "cfg": cfg, "brand": brand, "repeats": rep,
+            "ends": ends, "short": short, "neutral": None}
 
 
-def _style_block(cands: list[dict], style: list[list[str]], ends: dict | None = None) -> dict:
-    """没判成 / 判不全的回包也带上代码查出的写法问题: 那几样不用等判定服务, 照样能改。品牌收尾那一项要先拿到项目, 查帖子
-    之前就没判成的(线程占满、查帖子超时)没有它。"""
+def _neutral_check(checks: dict, per_comment: list | None) -> None:
+    """判完补上中性条数(配了 neutral_min): 不提品牌、Jev 判的主要行为不夸不劝。``per_comment`` 是 None(没判成)时记一句没数。"""
+    cfg = checks["cfg"]
+    if cfg.get("neutral_min") is None:
+        return
+    acts = None
+    if per_comment is not None:
+        acts = [((v if isinstance(v, dict) else {}).get("profile") or {}).get("speech_act") for v in per_comment]
+    prefer = (checks["brand"] or {}).get("excess") or []
+    checks["neutral"] = commentstyle.neutral_share(checks["texts"], checks["aliases"], checks["labels"],
+                                                   neutral_min=cfg["neutral_min"], speech_acts=acts, prefer=prefer)
+
+
+def _set_line(checks: dict) -> tuple[str | None, bool]:
+    """代码数出来的整组那一句(放 thread_fix 第一句, 判定服务的几条挤不掉它)和整组过没过: ``(那一句或 None, 整组没过)``。
+
+    「太少」的(中性、短评不够)只能整组改, 算整组没过; 「太多」的已经在那几条的 style_fix 里, 这里只总说一句。"""
+    parts, fail = [], False
+    for key in ("brand", "neutral", "short", "repeats"):
+        res = checks.get(key)
+        if res and res.get("segment"):
+            parts.append(res["segment"])
+            if key in ("neutral", "short") and res.get("short_by"):
+                fail = True
+    if checks["ends"].get("thread_fix"):
+        parts.append(checks["ends"]["thread_fix"])
+    return (("整组代码查: " + "; ".join(parts)) if parts else None), fail
+
+
+def _style_block(cands: list[dict], style: list[list[str]], checks: dict | None = None) -> dict:
+    """没判成 / 判不全的回包也带上代码查出的写法问题: 那几样不用等判定服务, 照样能改。整组那几样(品牌、重复、收尾、短评)
+    要先拿到项目, 查帖子之前就没判成的(线程占满、查帖子超时)没有它们; 中性条数要判定结果, 没判成时那一句说这次没数。"""
     rows = [{"index": i, "slot": (c["slot"] or {}).get("id"), "style_fix": issues}
             for i, (c, issues) in enumerate(zip(cands, style)) if issues]
     out = {"style_issues": rows, "style_next_step": COMMENT_STYLE_NEXT_STEP} if rows else {}
-    if ends and ends.get("thread_fix"):
-        out["thread_fix"] = [ends["thread_fix"]]
-    if ends and ends.get("thread_hint"):
-        out["thread_hints"] = [ends["thread_hint"]]
+    if checks:
+        _neutral_check(checks, None)
+        line, _fail = _set_line(checks)
+        if line:
+            out["thread_fix"] = [line]
+        if checks["ends"].get("thread_hint"):
+            out["thread_hints"] = [checks["ends"]["thread_hint"]]
     return out
+
+
+def _delivery_column(cfg: dict | None, cands: list[dict]) -> dict:
+    """配了 column 的项目: 这组评论按飞书那一格的样子拼好(一行一条, 条内换行换成空格, 不编号不加标签)。没配回 {}。"""
+    col = (cfg or {}).get("column")
+    if not col:
+        return {}
+    lines = [" ".join(c["text"].split()) for c in cands]
+    return {"delivery_column": {"column": col, "text": "\n".join(lines), "lines": len(lines)},
+            "delivery_column_next_step": DELIVERY_COLUMN_NEXT_STEP.format(column=col)}
+
+
+def _review_why(v: dict) -> str:
+    """Jev 说要人核实的那条, 疑点在哪: 拿不准的门槛题(带现在判成什么)、有题没判出来。Jev 没给就是空的。"""
+    advisory = set(v.get("advisory") or [])
+    profile = v.get("profile") or {}
+    parts = []
+    for q in v.get("ambiguous") or []:
+        if q in advisory:
+            continue
+        now = profile.get(q)
+        parts.append(f"{_REVIEW_GATE_NAMES.get(q, q)}" + (f"(现在判「{now}」)" if now else ""))
+    why = ("判定拿不准: " + "、".join(parts)) if parts else ""
+    if "漏答" in (v.get("flags") or []):
+        why = (why + "; " if why else "") + "有门槛题判定没答出来"
+    return why
 
 
 def _tv_post_text(note: dict) -> tuple[str, str]:
@@ -3701,6 +3902,8 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
     ``tv_by_text``、已有评论照样带回; 对不上或查不成就是 ``pasted``, 和原来一样。
     找不到帖子又没贴正文时**不报错**, 回 ``resolved=false`` + 一句该让用户补什么 —— 那是正常的下一步, 不是故障。
     帖子所在的项目不归调用者时报 PermissionError, 不回帖子内容。归属闸在 ``_resolve_post`` 里, 两条路都过。
+    项目配了 ``comment_set``(2026-11-10): 回包多一个 ``comment_set``(按配的数写的几句 + 列名); 配了列名时, 帖子那一格里
+    已有的维护评论也放进 ``existing_comments``(``source`` 是列名), 读不到只记日志、回一句。
     """
     project, title, body, note, missing = _resolve_post(
         client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body,
@@ -3708,6 +3911,7 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
     if missing is not None:
         return missing
     comment_rules, hard_rules = _comment_rules(client, project["id"], user_id)
+    cfg, cfg_note = _comment_set(project)
     existing = []
     rows: list[dict] = []
     if note is not None:
@@ -3726,6 +3930,19 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
                      "is_reply": bool(r.get("parent_comment_id")),
                      "text": (r.get("content") or "").strip()[:_EXISTING_COMMENT_CHARS]}
                     for r in rows if (r.get("content") or "").strip()]
+    tv_existing = len(existing)
+    cell_unread = False
+    column = (cfg or {}).get("column")
+    if note is not None and column:
+        try:
+            cell = _cell_lines(store.tv_note_extra_text(client, str(note["note_id"]), column))
+        except Exception:                               # noqa: BLE001 — 只是少一份参照, 不拦写评论
+            logger.exception("comments_for: 读帖子那一格已有的维护评论失败 (note=%s)", note.get("note_id"))
+            cell, cell_unread = [], True
+        existing += [{"order": None, "role": None, "is_reply": False, "text": line, "source": column} for line in cell]
+    next_step = ("按 slots 每位写一条(贴主答疑那条回 q1), 守 hard_rules、comment_rules 和 style(所有项目都管), 别和 existing_comments "
+                 "里已经有的问题重复; 写完把整组交给 score_comments(帖子参数和这次一样: link, 或 post_title / post_body + "
+                 "project_id; 每条评论带 slot 的 id)。")
     out = {"resolved": True, "source": source, "project_id": project["id"],
            "project_name": project.get("name"),
            "post": {"title": title, "body": body[:_POST_BODY_CHARS]},
@@ -3733,9 +3950,17 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
            "comment_rules": comment_rules, "hard_rules": hard_rules,
            "slots": [dict(s) for s in DEFAULT_COMMENT_SLOTS],
            "style": list(COMMENT_STYLE_LINES),
-           "next_step": ("按 slots 每位写一条(贴主答疑那条回 q1), 守 hard_rules、comment_rules 和 style(所有项目都管), 别和 existing_comments "
-                         "里已经有的问题重复; 写完把整组交给 score_comments(帖子参数和这次一样: link, 或 post_title / post_body + "
-                         "project_id; 每条评论带 slot 的 id)。")}
+           "next_step": next_step}
+    if cfg:
+        out["comment_set"] = {"lines": _comment_set_lines(cfg), "column": column}
+        out["next_step"] = next_step + "这个项目定了一组的配比(comment_set.lines), 和 style 一样要守, 项目规则里说法不一样的以它为准。"
+        if column and len(existing) > tv_existing:
+            out["next_step"] += (f"existing_comments 里 source 是「{column}」的, 是这条帖子那一格里已经有的维护评论: "
+                                 "里面用过的说法也别再用。")
+    if cfg_note:
+        out["comment_set_note"] = cfg_note
+    if cell_unread:
+        out["existing_comments_unread_note"] = f"这次没读到这条帖子「{column}」那一格里已有的评论, 只能对着上面这些避开重复。"
     if note is not None:
         out["note_id"] = note.get("note_id")
         out["tier"] = note.get("tier")
@@ -3745,11 +3970,11 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
             out["tv_note_vanished"] = True
             out["tv_note_vanished_note"] = TV_VANISHED_BY_TEXT_NOTE if note.get(TV_BY_TEXT_FLAG) else TV_VANISHED_NOTE
         total = note.get("comments_count")
-        if len(rows) >= store.TV_COMMENTS_MAX or (isinstance(total, int) and total > len(existing)):
+        if len(rows) >= store.TV_COMMENTS_MAX or (isinstance(total, int) and total > tv_existing):
             # 只取了前 TV_COMMENTS_MAX 条(codex review on aw#107): 说出来, 别让模型以为这就是全部
             out["existing_comments_note"] = (
                 f"这条帖子有 {total if isinstance(total, int) else '更多'} 条评论, 这里只列了按顺序的前 "
-                f"{len(existing)} 条; 避开重复时以这些为准, 后面的没看到。")
+                f"{tv_existing} 条; 避开重复时以这些为准, 后面的没看到。")
     return out
 
 
@@ -3771,6 +3996,7 @@ def _thread_lines(entries) -> list[str]:
             continue
         why = e.get("why") or e.get("instruction")
         if isinstance(why, str) and why.strip():
+            why = _no_post_ref(why)
             out.append(f"位 {e['slot']}: {why}" if e.get("slot") else why)
     return out
 
@@ -3778,8 +4004,14 @@ def _thread_lines(entries) -> list[str]:
 _COMMENT_FIX_CHARS = 400            # judge 的单条修改单带整段题干, 一条能上千字; 一组 4 条 × 3 条修改单会把协议挤出注意力
 
 
+def _no_post_ref(text: str) -> str:
+    """Jev 的题干(冻结的题库原文)里写着「可见帖子里具体说到的事」, 修改单原样引它, 等于叫模型往评论里写「帖子里」
+    (2026-11-10 owner: 评论不写帖子里)。转给写手之前换掉这三个字, 意思不变。"""
+    return text.replace("帖子里", "帖子")
+
+
 def _instructions(entries, limit: int) -> list[str]:
-    return [e["instruction"][:_COMMENT_FIX_CHARS] for e in (entries or [])
+    return [_no_post_ref(e["instruction"][:_COMMENT_FIX_CHARS]) for e in (entries or [])
             if isinstance(e, dict) and isinstance(e.get("instruction"), str)][:limit]
 
 
@@ -3797,14 +4029,65 @@ def _comment_payload(cands: list[dict]) -> list[dict]:
     return out
 
 
+def _earlier_texts(earlier_comments) -> list[str]:
+    """``earlier_comments``: 同一批前几次判过的评论(文字, 或带 text 的对象), 只拿来查重复, 不送 Jev。最多 60 条。"""
+    if earlier_comments is None:
+        return []
+    if not isinstance(earlier_comments, list):
+        raise CommentInputError("earlier_comments 要是一组评论文字(同一批前几次判过的)")
+    if len(earlier_comments) > MAX_EARLIER_COMMENTS:
+        raise CommentInputError(f"earlier_comments 最多 {MAX_EARLIER_COMMENTS} 条, 这次给了 {len(earlier_comments)} 条")
+    out = []
+    for k, e in enumerate(earlier_comments):
+        t = e.get("text") if isinstance(e, dict) else e
+        if not isinstance(t, str):
+            raise CommentInputError(f"earlier_comments 第 {k + 1} 条要是一段文字")
+        if t.strip():
+            out.append(t.strip()[:_EARLIER_CHARS])
+    return out
+
+
+def _existing_texts(client, note: dict, cfg: dict | None) -> list[str]:
+    """帖子下已有的评论(TV 的评论 + 配了列名时那一格里的维护评论), 给重复检查当参照。查库异常上抛。"""
+    rows = store.tv_note_comments(client, str(note["note_id"]))
+    out = [(r.get("content") or "").strip()[:_EXISTING_COMMENT_CHARS] for r in rows if (r.get("content") or "").strip()]
+    column = (cfg or {}).get("column")
+    if column:
+        out += _cell_lines(store.tv_note_extra_text(client, str(note["note_id"]), column))
+    return out
+
+
+def _score_context(client, *, user_id, link, project_id, post_title, post_body) -> dict:
+    """score_comments 判之前要的: 帖子和项目(``_resolve_post``)、项目的 comment_set、帖子下已有的评论。整个在同一个截止里跑。
+    已有评论读不到不抛: ``existing_unread`` 记一笔, 只查组内重复。"""
+    project, title, body, note, missing = _resolve_post(
+        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body)
+    ctx = {"project": project, "title": title, "body": body, "note": note, "missing": missing,
+           "cfg": None, "cfg_note": None, "existing": [], "existing_unread": False}
+    if missing is not None:
+        return ctx
+    ctx["cfg"], ctx["cfg_note"] = _comment_set(project)
+    if note is not None:
+        try:
+            ctx["existing"] = _existing_texts(client, note, ctx["cfg"])
+        except Exception:                               # noqa: BLE001 — 只是少一份参照
+            logger.exception("score_comments: 读帖子下已有的评论失败, 只查组内重复 (note=%s)", note.get("note_id"))
+            ctx["existing_unread"] = True
+    return ctx
+
+
 def score_comments(client, *, user_id: str | None, comments: list, link: str = "", project_id: str = "",
                    post_title: str = "", post_body: str = "", kind: str = "product",
-                   max_named: int | None = None) -> dict:
+                   max_named: int | None = None, earlier_comments: list | None = None) -> dict:
     """一组候选评论整体判一次(judge /judge_thread), 回每条过没过和修改建议。只判, 不写任何库。
 
     ``comments`` 每条 ``{"slot": "q1" | {评论位}, "text": "...", "reply_to_text"?}``: slot 写 comments_for 给的 id 就行;
     贴主答疑那条不带 reply_to_text 时, 自动用它 reply_to 的那一位的文字。帖子同 comments_for: 给 link 从 TV 取,
-    或给 post_body + project_id。
+    或给 post_body + project_id。``earlier_comments``: 同一批前几次判过的(一批超过 20 条要分几次判), 只拿来查重复。
+
+    2026-11-10: 判之前代码数整组(``_set_checks``: 项目定的提品牌上限、重复的说法和开头、品牌收尾、短评条数), 判完数中性
+    (``_neutral_check``); 「太少」的那几样整组没过。配了列名的项目回 ``delivery_column``(那一格要贴的样子)。
+    要人核实的那几条带全文和疑点, 并列进 ``review_list``。
     """
     if not isinstance(comments, list) or not comments:
         raise CommentInputError("comments 不能为空: 每条 {slot, text}")
@@ -3812,6 +4095,7 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         raise CommentInputError(f"kind 只能是 {' / '.join(COMMENT_KINDS)}")
     if len(comments) > MAX_SCORED_COMMENTS:
         raise CommentInputError(f"一次最多判 {MAX_SCORED_COMMENTS} 条评论, 这次给了 {len(comments)} 条")
+    earlier = _earlier_texts(earlier_comments)
     by_id = {s["id"]: s for s in DEFAULT_COMMENT_SLOTS}
     cands = []
     for i, c in enumerate(comments):
@@ -3830,45 +4114,71 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     style = [comment_style_issues(c["text"]) for c in cands]
     # 查帖子(链接 → TV → 项目 → 归属)也算进同一个截止: PostgREST 默认等 120 秒, 库一卡就远超 MCP 客户端 ~22 秒的
     # 容忍(codex review on aw#107; 同 _judge_tool_call / codex #95 的做法)。参数检查在这之前, 不碰库。
+    # 2026-11-10: 帖子下已有的评论(TV 的评论 + 项目配的那一格)也在这里一起读, 一样算进截止。
     started, budget = time.monotonic(), judge_client.tool_timeout_sec()
-    fut = _bounded_submit(_COMMENT_POOL, _COMMENT_SLOTS, lambda: _resolve_post(
+    fut = _bounded_submit(_COMMENT_POOL, _COMMENT_SLOTS, lambda: _score_context(
         client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body))
     if fut is None:
         return {"judge_status": judge_client.JUDGE_TIMEOUT, "note": COMMENT_SCORE_NOTE,
                 "detail": "评论判定线程占满, 这次没判", **_style_block(cands, style)}
     try:
-        project, title, body, _note, missing = fut.result(timeout=budget)
+        ctx = fut.result(timeout=budget)
     except cf.TimeoutError:
         fut.cancel()
         return {"judge_status": judge_client.JUDGE_TIMEOUT, "note": COMMENT_SCORE_NOTE,
                 "detail": f"查帖子(链接 / 项目 / 归属)在 {budget:g}s 内没查完, 这次没判", **_style_block(cands, style)}
-    if missing is not None:
-        return missing
-    # 一组里以品牌评价收尾的条数(2026-11-09): 拿到项目才知道品牌叫法。只读文字, 不调模型; 判定服务没判成时照样回
-    ends = _brand_ending_check(cands, style, project)
+    if ctx["missing"] is not None:
+        return ctx["missing"]
+    project, title, body, _note, cfg = ctx["project"], ctx["title"], ctx["body"], ctx["note"], ctx["cfg"]
+    # 整组那几样(2026-11-09 品牌收尾, 11-10 配比和重复): 拿到项目才知道品牌叫法和配比。只读文字, 不调模型; 判定服务没判成时照样回
+    checks = _set_checks(cands, style, project, cfg, earlier, ctx["existing"])
+    send_max = max_named
+    extra: dict = {}
+    if ctx["cfg_note"]:
+        extra["comment_set_note"] = ctx["cfg_note"]
+    if cfg and cfg.get("brand_max") is not None and max_named is not None:
+        # 配了提品牌上限时由代码数: Jev 的 names_brand 是模型判的(雇主、平台名也算), 修改单从前往后删, 和代码按顺序留前面的反着
+        send_max = None
+        extra["max_named_note"] = MAX_NAMED_SKIPPED_NOTE
+    extra.update(_delivery_column(cfg, cands))
+    hints_extra = [EXISTING_UNREAD_HINT] if ctx["existing_unread"] else []
     payload_comments = _comment_payload(cands)
     res = _comment_tool_call(client, project["id"], "/judge_thread",
                              {"post_title": title, "post_body": body[:_POST_BODY_CHARS], "comments": payload_comments,
-                              "kind": kind, "points": None, "max_named": max_named}, started=started)
+                              "kind": kind, "points": None, "max_named": send_max}, started=started)
     head = {"judge_status": res.get("judge_status"), "project_id": project["id"],
             "note": COMMENT_SCORE_NOTE}
     if _note is not None and _note.get(TV_VANISHED_FLAG):
         head["tv_note_vanished"] = True
         head["tv_note_vanished_note"] = TV_VANISHED_NOTE
     if res.get("judge_status") != judge_client.JUDGE_OK:
-        return {**head, "detail": res.get("detail"), **_style_block(cands, style, ends)}
+        out = {**head, "detail": res.get("detail"), **_style_block(cands, style, checks), **extra}
+        if hints_extra:
+            out["thread_hints"] = (out.get("thread_hints") or []) + hints_extra
+        return out
     per_comment = res.get("comments") or []
     if len(per_comment) != len(cands):
         # 少回了几条: zip 会悄悄丢掉没回的那几条, 摘要就成了"这几条评论不存在"(codex review on aw#107)
-        return {**head, "judge_status": judge_client.JUDGE_ERROR,
-                "detail": f"判定服务回了 {len(per_comment)} 条单条结果, 送去的是 {len(cands)} 条 —— 版本对不上?"
-                          "这次不算判过", **_style_block(cands, style, ends)}
-    rows = []
+        out = {**head, "judge_status": judge_client.JUDGE_ERROR,
+               "detail": f"判定服务回了 {len(per_comment)} 条单条结果, 送去的是 {len(cands)} 条 —— 版本对不上?"
+                         "这次不算判过", **_style_block(cands, style, checks), **extra}
+        if hints_extra:
+            out["thread_hints"] = (out.get("thread_hints") or []) + hints_extra
+        return out
+    _neutral_check(checks, per_comment)
+    set_line, set_fail = _set_line(checks)
+    rows, review = [], []
     for i, (c, v) in enumerate(zip(cands, per_comment)):
         v = v if isinstance(v, dict) else {}
         row = {"index": i, "slot": (c["slot"] or {}).get("id"),
                "passed": bool(v.get("passed")) and not style[i],
                "needs_review": bool(v.get("needs_review"))}
+        if row["needs_review"]:
+            # 要人核实的那几条带全文(2026-11-10): 只回下标时写手那边的模型会把评论缩写成半句给用户看
+            why = _review_why(v)
+            row["text"] = c["text"]
+            row["review_why"] = why
+            review.append({"label": checks["labels"][i], "text": c["text"], "why": why})
         if style[i]:
             row["style_fix"] = style[i]
         fix = _instructions(v.get("plan"), SCORE_MAX_FIXES)
@@ -3880,13 +4190,17 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         rows.append(row)
     passed = sum(1 for r in rows if r["passed"])
     # 代码数出来的整组那一句放最前面: thread_fix 只留 SCORE_MAX_FIXES 条, 判定服务的几条不能把它挤掉
-    thread_fix = ([ends["thread_fix"]] if ends["thread_fix"] else []) + _thread_lines(res.get("plan"))
-    thread_hints = ([ends["thread_hint"]] if ends["thread_hint"] else []) + _thread_lines(res.get("hints"))
-    out = {**head, "passed": bool(res.get("passed")) and not any(style),
+    thread_fix = ([set_line] if set_line else []) + _thread_lines(res.get("plan"))
+    ends = checks["ends"]
+    thread_hints = ([ends["thread_hint"]] if ends["thread_hint"] else []) + hints_extra + _thread_lines(res.get("hints"))
+    out = {**head, "passed": bool(res.get("passed")) and not any(style) and not set_fail,
            "needs_review": bool(res.get("needs_review")),
            "summary": {"comments": len(rows), "passed": passed,
                        "needs_review": sum(1 for r in rows if r["needs_review"])},
-           "comments": rows}
+           "comments": rows, **extra}
+    if review:
+        out["review_list"] = review
+        out["review_next_step"] = REVIEW_NEXT_STEP
     if thread_fix:
         out["thread_fix"] = thread_fix[:SCORE_MAX_FIXES]
     if thread_hints:

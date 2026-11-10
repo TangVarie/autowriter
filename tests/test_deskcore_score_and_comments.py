@@ -271,7 +271,8 @@ def test_slots_by_id_and_the_reply_picks_up_the_question(wired):
     assert rep["slot"]["id"] == "reply" and rep["role"] == "贴主"
     assert rep["reply_to_text"] == "简历第一行写的什么呀", "贴主答疑自动接上它回的那一位"
     assert out["judge_status"] == "ok" and out["summary"] == {"comments": 2, "passed": 1, "needs_review": 0}
-    assert out["comments"][0]["fix"] == ["要接住帖子里的事"] and out["comments"][0]["hints"] == ["口语一点"]
+    assert out["comments"][0]["fix"] == ["要接住帖子的事"] and out["comments"][0]["hints"] == ["口语一点"], \
+        "Jev 题干里的「帖子里」转给写手之前换掉(2026-11-10)"
     assert "fix" not in out["comments"][1]
     assert out["thread_fix"] == ["位 q1: 评论区没有摩擦：这一位改成审慎的追问"]
     assert out["thread_hints"] == ["评论区参考题（未验收）不理想：praise_share"]

@@ -171,6 +171,8 @@ UNGATED_WITH_REASON = {
     "comments_for": "归属闸在 _resolve_post 里(两条路都过 assert_project_access: 按链接反查到的项目、或调用方给的 project_id), "
                     "过闸之前不读规则、不读评论",
     "score_comments": "同 comments_for: 先经 _resolve_post 过归属闸, 之后才发判定",
+    "_score_context": "私有辅助函数, 只被 score_comments 调: 第一步就是 _resolve_post(归属闸在那里), 过了闸才读项目的 "
+                      "comment_set 和这条帖子下已有的评论(2026-11-10)",
     "_comment_rules": "私有辅助函数, 只被已过闸(_resolve_post)的 comments_for 调用; 只读本项目规则",
     "_note_from_text": "私有辅助函数, 只在 _resolve_post 贴正文那条路 assert_project_access 之后调, 传的是闸回来的项目 id; "
                        "只查 tv_project_map 里这个项目对着的 TV 项目, 回来的行再核一遍项目号(2026-11-02)",
