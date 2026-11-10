@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -3570,6 +3571,29 @@ def tv_note_comments(sb, note_id: str, limit: int = TV_COMMENTS_MAX) -> list[dic
                  .eq("note_id", note_id)
                  .order("comment_order")
                  .limit(limit).execute()).data or [])
+
+
+def tv_note_extra_text(sb, note_id: str, key: str) -> str:
+    """这条笔记 ``raw_extra`` 里 ``key`` 那一格的原文; 没有这一格回 ``""``(2026-11-10)。
+
+    飞书里声明过的列在 raw_extra 顶层, 没声明的在 ``_undeclared`` 下 —— 两处都看, 同 TV 同步脚本读维护评论那一格的办法。
+    列名由调用方从项目配置里给, 这里不写死。不吞异常: 读不到时调用方自己决定怎么退。"""
+    rows = (sb.schema("truth_vault").table("notes").select("raw_extra")
+            .eq("note_id", note_id).limit(1).execute()).data or []
+    extra = (rows[0] or {}).get("raw_extra") if rows else None
+    if isinstance(extra, str):
+        try:
+            extra = json.loads(extra)
+        except (TypeError, ValueError):
+            return ""
+    if not isinstance(extra, dict) or not key:
+        return ""
+    val = extra.get(key)
+    if val in (None, "") and isinstance(extra.get("_undeclared"), dict):
+        val = extra["_undeclared"].get(key)
+    if isinstance(val, list):                       # 飞书富文本: 一段段的 {"text": ...}
+        val = "".join(v.get("text", "") if isinstance(v, dict) else str(v) for v in val)
+    return val if isinstance(val, str) else ""
 
 
 def tv_targets_of(sb, tv_project_id: str) -> list[dict]:

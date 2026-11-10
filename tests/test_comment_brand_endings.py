@@ -6,7 +6,8 @@
      后面接一段事实的不算(含空格切开的); 整条只有一小句时提到品牌就算; 问句收尾不算(「挺好的呢」「挺靠谱的嘛」不是问句);
   3. 品牌叫法: projects.brand + 交付模板 must_mention_any + 品牌里的英文段, 不分大小写; 都没有退回项目名;
   4. 品牌收尾的句式重复(3 条起)只提示, 不算没过; 不落在品牌上的收尾不数;
-  5. score_comments: 超出的那几条 style_fix、passed=false, thread_fix 第一句点名; 判定服务没判成也照样回;
+  5. score_comments: 超出的那几条 style_fix、passed=false, thread_fix 第一句(「整组代码查」, 2026-11-10 起和别的几样并成一句)
+     点名; 判定服务没判成也照样回;
   6. 跟着笔记交付的评论不数(不进 delivery.problems), requirements 的 task 里只带一句写法提示。
 全部是合成文字和合成品牌, 不引用真实评论。
 """
@@ -253,7 +254,8 @@ def test_score_comments_fails_the_excess_brand_endings(wired):
     assert rows["q2"]["passed"] is True and "style_fix" not in rows["q2"], "前 1 条留着"
     assert rows["exp"]["passed"] is False and "以品牌评价收尾" in rows["exp"]["style_fix"][0]
     assert out["passed"] is False and out["summary"]["passed"] == 3
-    assert out["thread_fix"][0].startswith("整组 4 条里 2 条以品牌评价收尾") and "位 exp 改成" in out["thread_fix"][0]
+    assert out["thread_fix"][0].startswith("整组代码查: ") and "整组 4 条里 2 条以品牌评价收尾" in out["thread_fix"][0]
+    assert "位 exp 改成" in out["thread_fix"][0], "代码数出来的几样并成一句(2026-11-10)"
     assert len(out["thread_fix"]) == core.SCORE_MAX_FIXES, "代码那一句在最前面, 判定服务的几条挤不掉它"
     assert out["style_next_step"] == core.COMMENT_STYLE_NEXT_STEP
     (_m, _u, _h, body, _t), = calls
@@ -299,7 +301,7 @@ def test_round_two_is_told_to_resend_the_whole_set_in_order():
 
 def test_comments_for_hands_out_the_brand_ending_line():
     out = core.comments_for(_client_with_brand(), user_id=ME, link=LINK)
-    assert out["style"][-1] == cs.BRAND_ENDING_LINE and out["style"][:3] == list(cs.LINES)
+    assert cs.BRAND_ENDING_LINE in out["style"] and out["style"][:len(cs.LINES)] == list(cs.LINES)
 
 
 # ── 6. 跟着笔记交付的评论 ───────────────────────────────────────────────────────────────────────
