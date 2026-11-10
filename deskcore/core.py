@@ -3714,8 +3714,9 @@ def _project_for_note(client, note: dict, project_id: str | None, user_id) -> tu
 # 链接(挪表留下的旧行等, 活的那行优先), 69 对链接不同(同一段文案发了两次)分不出是哪一篇。几条都过线时先按帖子(发布链接)
 # 比谁更像; 活的优先只在同一条链接的几行之间(同 _note_from_link) —— 别的帖子活着不该压过这篇只剩已删那行的原文(复审 on
 # a3d12e6); 一样像的再看活不活、再取发布最近的。回包里说清楚是按正文对上的。
-# 尽力而为: 查库出错只记日志, 照原来走贴正文那条路, 不抛、不拦写评论。score_comments 不走这一步: 它只用标题正文判,
-# 而且查帖子算在 ~22 秒的判定截止里, 多两次查询换不来什么。
+# 尽力而为: 查库出错只记日志, 照原来走贴正文那条路, 不抛、不拦写评论。score_comments 11-10 起也走这一步(Codex on aw#149):
+# 判的标题正文照旧用贴来的, 对上的笔记只用来取已有评论查重复 —— 不然 comments_for 给写手看过的已有评论, 判的时候
+# 一条都不比。多的两次查询(各约 10 ms)算在同一个判定截止里; 对上的笔记评论读不到时当没对上, 不提示。
 TV_BY_TEXT_FLAG = "_by_text"
 TEXT_MATCH_SIM = 0.90
 TEXT_MATCH_MIN_CHARS = 20          # 去标点后不到这么多字不查(同 tvlink.MIN_PREFIX: 太短的到处撞)
@@ -3836,7 +3837,7 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
     有链接先按链接找 TV(找到了按笔记反查项目、过归属闸); 找不到、或没给链接, 就用贴过来的正文 + project_id
     (同样过闸)。两样都没有时回一份 ``resolved=false`` 的回包, 不报错 —— 那是正常的下一步。
     用户贴了正文时以贴的为准(发布后可能改过), 链接只用来定项目和取已有评论。
-    ``by_text``(只有 comments_for 开): 走贴正文那条路时, 过了闸再按正文在这个项目的 TV 笔记里找一次
+    ``by_text``(comments_for 和 score_comments 开): 走贴正文那条路时, 过了闸再按正文在这个项目的 TV 笔记里找一次
     (``_note_from_text``), 找到的笔记只用来取已有评论, 标题正文照旧用贴来的。
     """
     link, project_id = (link or "").strip(), (project_id or "").strip()
@@ -4058,10 +4059,12 @@ def _existing_texts(client, note: dict, cfg: dict | None) -> list[str]:
 
 
 def _score_context(client, *, user_id, link, project_id, post_title, post_body) -> dict:
-    """score_comments 判之前要的: 帖子和项目(``_resolve_post``)、项目的 comment_set、帖子下已有的评论。整个在同一个截止里跑。
-    已有评论读不到不抛: ``existing_unread`` 记一笔, 只查组内重复。"""
+    """score_comments 判之前要的: 帖子和项目(``_resolve_post``; 只贴正文时也按正文在 TV 里找一次, 对上的笔记只用来取
+    已有评论)、项目的 comment_set、帖子下已有的评论。整个在同一个截止里跑。已有评论读不到不抛: 按链接找到的 ``existing_unread``
+    记一笔、只查组内重复; 按正文对上的当没对上。"""
     project, title, body, note, missing = _resolve_post(
-        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body)
+        client, user_id=user_id, link=link, project_id=project_id, post_title=post_title, post_body=post_body,
+        by_text=True)
     ctx = {"project": project, "title": title, "body": body, "note": note, "missing": missing,
            "cfg": None, "cfg_note": None, "existing": [], "existing_unread": False}
     if missing is not None:
@@ -4072,7 +4075,8 @@ def _score_context(client, *, user_id, link, project_id, post_title, post_body) 
             ctx["existing"] = _existing_texts(client, note, ctx["cfg"])
         except Exception:                               # noqa: BLE001 — 只是少一份参照
             logger.exception("score_comments: 读帖子下已有的评论失败, 只查组内重复 (note=%s)", note.get("note_id"))
-            ctx["existing_unread"] = True
+            # 按正文对上的是尽力而为(同 comments_for): 读不到就当没对上, 不提示; 按链接找到的才说一句
+            ctx["existing_unread"] = not note.get(TV_BY_TEXT_FLAG)
     return ctx
 
 
@@ -4148,7 +4152,8 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
                               "kind": kind, "points": None, "max_named": send_max}, started=started)
     head = {"judge_status": res.get("judge_status"), "project_id": project["id"],
             "note": COMMENT_SCORE_NOTE}
-    if _note is not None and _note.get(TV_VANISHED_FLAG):
+    if _note is not None and _note.get(TV_VANISHED_FLAG) and not _note.get(TV_BY_TEXT_FLAG):
+        # 按正文对上的笔记只拿来查重复, 回包不变(已删那句是说链接的)
         head["tv_note_vanished"] = True
         head["tv_note_vanished_note"] = TV_VANISHED_NOTE
     if res.get("judge_status") != judge_client.JUDGE_OK:

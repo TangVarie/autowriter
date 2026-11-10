@@ -382,18 +382,41 @@ def test_the_link_path_does_not_look_the_text_up():
     assert not any(f[1] == "raw_content" for x in _notes_calls(c) for f in x["filters"])
 
 
-def test_score_comments_does_not_look_the_text_up(wired):
+def test_score_comments_looks_the_text_up_only_for_existing_comments(wired):
+    # 11-10 起(Codex on aw#149): 只贴正文时也按正文找一次, 对上的笔记的已有评论拿来查重复 —— comments_for 给写手看过的那几条,
+    # 判的时候也要比。判的标题正文照旧是贴来的; 对上的那行已删也不在回包里说(那句是说链接的)
     calls, reply = wired
     reply["fn"] = lambda m, u, kw: _Resp(200, dict(THREAD_OK))
     c = _tv_client(notes=[_note("A")], comments=[_comment("A")])
     c._tv.rows["v_notes_vanished"] = [{"note_id": "A", "project_id": TV}]
     out = core.score_comments(c, user_id=ME, project_id=PROJ, post_title=TITLE_A, post_body=BODY_A,
-                              comments=[{"slot": "q1", "text": "录语音用的什么呀"}, {"slot": "reply", "text": "手机自带的"}])
+                              comments=[{"slot": "q1", "text": "自己录语音用的什么软件"}, {"slot": "reply", "text": "手机自带的"}])
     (_m, _u, _h, body, _t), = calls
     assert body["post_title"] == TITLE_A and body["post_body"] == BODY_A
     assert out["judge_status"] == "ok" and "tv_note_vanished" not in out
-    # 判定那一步本来就读 TV 项目的品类(_judge_project_context); 笔记和已删视图一次都不查
-    assert not [x for x in c._tv.calls if x["table"] in ("notes", "v_notes_vanished", "comments")]
+    assert "和帖子下已有的评论重复" in out["comments"][0]["style_fix"][0], out["comments"][0]
+    assert out["passed"] is False and "style_fix" not in out["comments"][1]
+    assert len([x for x in c._tv.calls if x["table"] == "notes"]) <= core.TEXT_MATCH_TRIES
+
+
+def test_score_comments_without_a_text_match_checks_only_the_set(wired):
+    _calls, reply = wired
+    reply["fn"] = lambda m, u, kw: _Resp(200, dict(THREAD_OK))
+    c = _tv_client(notes=[_note("A", body="完全不相干的另一篇帖子正文，讲的是周末去哪里露营，带什么装备，晚上冷不冷。")],
+                   comments=[_comment("A")])
+    out = core.score_comments(c, user_id=ME, project_id=PROJ, post_title=TITLE_A, post_body=BODY_A,
+                              comments=[{"slot": "q1", "text": "自己录语音用的什么软件"}, {"slot": "reply", "text": "手机自带的"}])
+    assert out["judge_status"] == "ok" and "style_fix" not in out["comments"][0]
+
+
+def test_a_text_matched_note_whose_comments_cannot_be_read_is_dropped_quietly(wired, monkeypatch):
+    _calls, reply = wired
+    reply["fn"] = lambda m, u, kw: _Resp(200, dict(THREAD_OK))
+    c = _tv_client(notes=[_note("A")], comments=[_comment("A")])
+    monkeypatch.setattr(store, "tv_note_comments", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    out = core.score_comments(c, user_id=ME, project_id=PROJ, post_title=TITLE_A, post_body=BODY_A,
+                              comments=[{"slot": "q1", "text": "自己录语音用的什么软件"}, {"slot": "reply", "text": "手机自带的"}])
+    assert out["judge_status"] == "ok" and core.EXISTING_UNREAD_HINT not in (out.get("thread_hints") or [])
 
 
 def test_the_tool_says_pasted_text_is_looked_up_too():
