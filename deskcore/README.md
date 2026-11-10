@@ -10,7 +10,7 @@
 > `python -m deskcore.cli doctor [--project <uuid>]` 查库。上线 / 回填 / 对接步骤看 runbook §2。
 
 > **2026-10-19 · D-120 写手侧改版**（写作台工具面以这一段为准，下面表格里的旧行保留作历史）：
-> - 写完过 `check_drafts` 就调 **`score_drafts`**：存档（指纹、销角度、底稿）+ Jev 参考分（满分 100，每篇最多 3 条修改建议），**不拦交付**。`commit_drafts` 是它的旧名，过渡期保留。
+> - 写完过 `check_drafts` 就调 **`score_drafts`**：存档（指纹、销角度、底稿）+ Jev 参考分（满分 100，每篇最多 3 条修改建议），**不拦交付**。`commit_drafts` 是它的旧名，过渡期保留。2026-11-10 起同一批里的重复说法和正文里混进来的版式残留带 `draft_checks`（先改再交）、开头一样的带 `batch_hints`（只提示），见 `docs/deskcore.md` §3.21。
 > - **`review_drafts` / `export_drafts` 两个工具撤了**：定稿由写手贴进飞书，发布后 `tv-sync` 按内容对回来（core 里的函数保留，不再暴露给模型）。
 > - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
 

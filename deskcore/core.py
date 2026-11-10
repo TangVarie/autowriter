@@ -56,7 +56,7 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
-from . import commentstyle, delivery, rulecheck, rulecompile
+from . import commentstyle, delivery, poststyle, rulecheck, rulecompile
 from . import drawpolicy as dp
 from . import fingerprint as fp
 from . import priors, project_now, store, structure, tvlink, vocab
@@ -4235,6 +4235,19 @@ RULE_CHECKS_UNCHECKED_NEXT_STEP = ("rule_checks_unchecked 里的规则这次代�
                                    "或者存的 check 用不了; 存档不受影响): 从 from_index 那篇起算没查 —— 不是查出了违规, 也不能跟用户说这几条守住了; "
                                    "它之前查出来、列在 rule_checks 里的命中照常算。severity 是 hard 的(「硬约束·没查完」)照规则原文"
                                    "(rule)把 from_index 起的那几篇自己逐篇核一遍。")
+# 一批笔记的写法检查(2026-11-10, deskcore/poststyle.py, docs/deskcore.md §3.21): 同一批里的重复说法、正文里混进来的版式残留
+# 进 draft_checks(要改), 开头一样的进 batch_hints(只提示)。和合规检查、参考分分开算, 不拦存档。这次改过重存还查出来的
+# (重复说法或版式残留)只照实说一句(改一轮就够, W-42): 不然几篇照同一个新说法改, 下一次又撞上; 本来就要那样写的字面
+# \n / <br>(讲代码的笔记)、写手那边每次都转义坏了的换行, 也会一直被叫改, 来回改不完
+DRAFT_CHECKS_NEXT_STEP = ("draft_checks 里 index 是 {idx} 的 {n} 篇有代码查出来的写法问题(同一批几篇用了同一个说法, 或者正文里混进了"
+                          "评论、标记、字面的 <br> / \\n): 和合规检查、参考分分开算, 不用等用户说, 先改再交 —— 和 delivery.problems、"
+                          "「必须改」放在同一轮改, 改过的那几篇带 replaces_version_id 先过 check_drafts、再调 score_drafts, "
+                          "交给用户的是改好的那一版。")
+DRAFT_CHECKS_ONCE_NEXT_STEP = ("draft_checks 里 index 是 {idx} 的 {n} 篇是这次改过重存的, 还查出了写法问题(和别的篇用了同一个"
+                               "说法, 或者正文里混进了评论、标记、字面的 <br> / \\n): 改一轮就够, 这几篇不再接着改, 跟用户照实说一句"
+                               "哪篇还有哪一条。")
+BATCH_HINTS_NEXT_STEP = ("batch_hints 是这一批整体的写法提示(比如一半以上的篇开头一样): 照那一句跟用户提一下, 只是参考, "
+                         "不算要改的地方, 用户觉得没问题就不用改。")
 
 
 # ── 改稿重存时把原来那一整批拼回来(2026-10-30 发布收尾) ─────────────────────────────────────
@@ -4451,11 +4464,100 @@ def _add_layer_hints(judge: dict | None, layers: dict[int, str] | None) -> int:
     return n
 
 
+def _rule_texts(client, project_id: str, user_id) -> list[str]:
+    """项目规则的原文(hard + soft, 本项目 + 通用, 静音的不算; 不过方向闸): 重复说法那一项拿来豁免规则里要求照原样写的话术。
+    存了「必须带的话术」检查(required_phrase)的, 检查里列的每一句也算一份原文 —— 规则原文常常只说「结尾带上售后那一句」,
+    话术本身只在检查里; 不算的话这边叫第 3 篇起换个说法, 改完 rule_checks 又报「必须改: 没有那一句」, 两头打架。检查怎么读
+    (老形状、坏了跳过)同 rulecheck.spec_of, rule_checks 查的就是这一份。
+    只在头一遍查出重复说法时才读(大多数批次一句都不重复, 不为它多查一次库)。读失败上抛, 调用方这一次不报重复说法。"""
+    hard, soft = store.shared_memories(client, project_id, user_id, vectors=False)
+    out: list[str] = []
+    for r in hard + soft:
+        if isinstance(r.get("content"), str) and r["content"].strip():
+            out.append(r["content"])
+        if (r.get("rule_kind") or "").strip() == "required_phrase":
+            out += [t for t in (rulecheck.spec_of(r) or {}).get("any") or () if isinstance(t, str) and t.strip()]
+    return out
+
+
+def _draft_checks(client, project: dict, project_id: str, user_id, picked: list[dict], indices: list[int],
+                  out: dict, *, tpl: dict | None, revised: set[int]) -> dict:
+    """一批笔记的写法检查(2026-11-10, deskcore/poststyle.py): 只看存进去了的那几篇(``picked``, 调用方的位置是 ``indices``)。
+
+    · ``out["draft_checks"]``(有才带): 每条 ``{index, kind, what}``。``kind`` 是 ``repeat``(同一批里重复的说法, 第 need 篇起)
+      或版式残留(poststyle.DEBRIS_KINDS)。有交付模板、拼成了 delivery 的, 【标题】【正文】不再报(delivery.problems 报过了),
+      评论段、【话题】的说法跟着模板拼不拼评论、管不管话题走;
+    · ``out["batch_hints"]``(有才带): 一半以上、至少 5 篇开头一样 —— 只提示, 不进 draft_checks。
+    重复说法: 这次改过重存的那几篇(``revised``)先算进前面不算的那几篇, 要改的落到新稿上。查出来了才读项目规则原文做豁免;
+    读失败这一次不报重复说法(把规则要求的话术当重复叫人改, 比漏报一句更糟), 原因进 meta。回给 batch_metrics.meta 的那一块:
+    只有数, 没有稿子里的字(format 是每样几篇, once 是改过重存还查出来的几篇)。"""
+    t0 = time.monotonic()
+    aliases = _brand_aliases(project)
+    labels = [str(i) for i in indices]
+    has_tpl = "delivery" in out and tpl is not None
+    skip = set((tpl or {}).get("markers", {}).values()) if has_tpl else set()
+    # 模板拼不拼评论、管不管话题: 不拼评论的不能叫写手把评论挪进 comments(挪过去就从交付稿里没了); 不管话题的, 话题行
+    # 本来就照项目规则写在正文里, 【话题】不报
+    form = ({"takes_comments": tpl.get("comments") is not None, "takes_tags": delivery.wants_tags(tpl)} if has_tpl else {})
+    rows: list[dict] = []
+    fmt: dict[str, set[int]] = {}                       # 每样几篇(一篇标题、正文里都有标记是两条, 算一篇)
+    for pos, d in enumerate(picked):
+        d = d if isinstance(d, dict) else {}
+        for r in poststyle.format_debris(str(d.get("title") or ""), str(d.get("body") or ""),
+                                         skip_labels=skip, has_template=has_tpl, **form):
+            rows.append({"index": indices[pos], "kind": r["kind"], "what": r["what"]})
+            fmt.setdefault(r["kind"], set()).add(pos)
+    bodies = [str((d if isinstance(d, dict) else {}).get("body") or "") for d in picked]
+    # 这次改过重存的那几篇先算进「不算」的那几篇: 要改的落到没改过的新稿上(改一轮就够, 改过的不再叫改)
+    prefer = {pos for pos, i in enumerate(indices) if i in revised}
+    rep = poststyle.batch_repeats(bodies, aliases, labels, prefer=prefer)
+    rep_meta: dict = {"need": rep["need"], "grams": rep["grams"]}
+    if rep["grams"]:
+        try:
+            exempt = _rule_texts(client, project_id, user_id)
+        except Exception as exc:                        # noqa: BLE001 — 读不到规则原文: 这一次不报重复说法
+            logger.warning("score_drafts: 读规则原文失败(project=%s), 这一次不报重复说法", project_id, exc_info=True)
+            rep_meta["error"] = f"{type(exc).__name__}: {exc}"[:200]
+            rep = None
+        else:
+            rep = poststyle.batch_repeats(bodies, aliases, labels, exempt=exempt, prefer=prefer)
+    if rep is not None:
+        for pos in rep["flagged"]:
+            rows += [{"index": indices[pos], "kind": "repeat", "what": w} for w in rep["fix"][pos]]
+        rep_meta = {"need": rep["need"], "grams": rep["grams"], "exempted": rep["exempted"],
+                    "carriers": len(rep["carriers"]), "flagged": len(rep["flagged"]),
+                    "once": sum(1 for pos in rep["flagged"] if indices[pos] in revised)}
+    rows.sort(key=lambda r: r["index"])                 # 稳定排序: 同一篇的版式残留在前、重复说法在后
+    if rows:
+        out["draft_checks"] = rows
+    op = poststyle.shared_openers(bodies, aliases, labels)
+    if op["hint"]:
+        out["batch_hints"] = [op["hint"]]
+    return {"drafts": len(picked), "repeat": rep_meta, "format": {k: len(v) for k, v in fmt.items()},
+            "once": len({r["index"] for r in rows if r["index"] in revised}),
+            "opener": {"need": op["need"], "top": op["top"], "hinted": bool(op["hint"])},
+            "elapsed_ms": _ms_since(t0)}
+
+
+def _draft_checks_steps(out: dict, revised: set[int]) -> list[str]:
+    """draft_checks 的 next_step。这次改过重存的那几篇还查出来的(哪一条都算), 不再叫改(改一轮就够, 同 _score_report_step 的
+    fixed_once), 只照实说一句; 同一篇不会既叫改、又叫别改。"""
+    rows = [r for r in out.get("draft_checks") or [] if isinstance(r, dict)]
+    once = sorted({r["index"] for r in rows if r["index"] in revised})
+    todo = sorted({r["index"] for r in rows if r["index"] not in revised})
+    steps = []
+    if todo:
+        steps.append(DRAFT_CHECKS_NEXT_STEP.format(idx="、".join(map(str, todo)), n=len(todo)))
+    if once:
+        steps.append(DRAFT_CHECKS_ONCE_NEXT_STEP.format(idx="、".join(map(str, once)), n=len(once)))
+    return steps
+
+
 def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, drafts: list[dict],
                               indices: list[int], out: dict, *, tactic: str = "",
                               revised: dict[int, str] | None = None,
                               layers: dict[int, str] | None = None) -> dict:
-    """存完档之后的两样纯代码活(2026-10-20), 结果挂进 ``out``, 返回给 batch_metrics 的那一小块。**不抛**。
+    """存完档之后的几样纯代码活(2026-10-20; 第 3 样 2026-11-10), 结果挂进 ``out``, 返回给 batch_metrics 的那一小块。**不抛**。
 
     1. 交付版式: 项目配了 ``default_params.delivery`` 就按模板把存进去的那几篇拼好(``out["delivery"]``)。
        模板坏了只记日志、不带这一块 —— 打分照常(运维用 CLI 设模板时已经校验过, 走到这里多半是有人手改了库)。
@@ -4469,8 +4571,10 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
        ``layers``(2026-11-03 贴型): {第几篇: 卡上标的贴型代号}(_draft_layers 从台账查的)。有一篇标了, 带方向的规则就逐篇
        跟着贴型走(rule_applies_to_layer: 流量向只管流量贴 / 提问贴, 产品向只管产品贴 / 精品贴; 没标的那几篇照原来的方向闸),
        这一批哪一篇都不管的规则不查、不报、不数; 一篇都没标就和原来一字不差。
+    3. 写法检查(2026-11-10, _draft_checks): 同一批里的重复说法和正文里混进来的版式残留(``out["draft_checks"]``)、开头一样的
+       提示(``out["batch_hints"]``), 都是有才带。和合规检查、参考分分开算。
 
-    两样都只是参考: 入库到这里已经成功了, 这一步任何失败都不许把它变成失败(同判定那一段的纪律)。
+    几样都只是参考: 入库到这里已经成功了, 这一步任何失败都不许把它变成失败(同判定那一段的纪律)。
     """
     meta: dict = {}
     picked = [drafts[i] for i in indices]
@@ -4577,12 +4681,30 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             meta["rule_checks"] = {"error": f"{type(exc).__name__}: {exc}"[:200], "elapsed_ms": _ms_since(t0)}
             out["rule_checks_status"] = "error"
 
+    # 3. 一批笔记的写法检查(2026-11-10, _draft_checks): 同一批里的重复说法、正文里混进来的版式残留、开头一样的提示。
+    #    同样不抛: 出了错两个键都不带(写了一半的也摘掉), 原因只进 batch_metrics
+    draft_tips: list[str] = []
+    if picked:
+        t0 = time.monotonic()
+        try:
+            meta["draft_checks"] = _draft_checks(client, project, project_id, user_id, picked, indices, out,
+                                                 tpl=tpl, revised=set(revised or ()))
+            draft_tips = (_draft_checks_steps(out, set(revised or ()))
+                          + ([BATCH_HINTS_NEXT_STEP] if "batch_hints" in out else []))
+        except Exception as exc:                        # noqa: BLE001
+            logger.exception("commit_drafts: 写法检查失败(project=%s) —— 存档不受影响", project_id)
+            out.pop("draft_checks", None)
+            out.pop("batch_hints", None)
+            draft_tips = []
+            meta["draft_checks"] = {"error": f"{type(exc).__name__}: {exc}"[:200], "elapsed_ms": _ms_since(t0)}
+
     tips = (([DELIVERY_NEXT_STEP] if "delivery" in out else [])
             + ([DELIVERY_PARTIAL_NEXT_STEP] if (out.get("delivery") or {}).get("scope") == DELIVERY_SCOPE_THIS_CALL else [])
             + ([RULE_CHECKS_NEXT_STEP] if "rule_checks" in out else [])
             + ([RULE_CHECKS_MORE_NEXT_STEP] if "rule_checks_more" in out else [])
             + ([RULE_CHECKS_UNCHECKED_NEXT_STEP] if "rule_checks_unchecked" in out else [])
-            + ([RULE_CHECKS_ERROR_NEXT_STEP] if out.get("rule_checks_status") == "error" else []))
+            + ([RULE_CHECKS_ERROR_NEXT_STEP] if out.get("rule_checks_status") == "error" else [])
+            + draft_tips)
     if tips and out.get("next_step"):
         out["next_step"] = out["next_step"] + " " + " ".join(tips)
     return meta

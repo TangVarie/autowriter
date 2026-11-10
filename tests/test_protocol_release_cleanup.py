@@ -309,7 +309,7 @@ def _server_texts() -> dict[str, str]:
     for const in ("EDIT_DIGEST_TASK", "EDIT_DIGEST_MESSAGE", "ARCHIVE_PENDING_NEXT_STEP", "SCORE_NOTE",
                   "ARCHIVED_STEP_HEAD", "IDENTITY_REFUSED", "PROJECT_REFUSED_NEXT",
                   "DELIVERY_NEXT_STEP", "RULE_CHECKS_NEXT_STEP", "CHECK_RULES_NOTE", "ACK_THROUGH_UNKNOWN",
-                  "_CALIB_SYSTEM"):
+                  "_CALIB_SYSTEM", "DRAFT_CHECKS_NEXT_STEP", "DRAFT_CHECKS_ONCE_NEXT_STEP", "BATCH_HINTS_NEXT_STEP"):
         texts[f"core.{const}"] = getattr(core, const)
     texts["core._check_rules_next_step(must_fix)"] = core._check_rules_next_step({"must_fix": 1}, 0)
     texts["core.PROJECT_NOT_FOUND_NEXT"] = core.PROJECT_NOT_FOUND_NEXT
@@ -367,7 +367,7 @@ def test_server_revision_path_goes_through_check_drafts_first():
         assert "先过 check_drafts" in text
     # 复审(on aw#137): 离动作最近的那几句(score_drafts 的 next_step 后缀、check_rules 的 note / next_step)也一样
     for text in (core.DELIVERY_NEXT_STEP, core.RULE_CHECKS_NEXT_STEP, core.CHECK_RULES_NOTE,
-                 core._check_rules_next_step({"must_fix": 1}, 0)):
+                 core._check_rules_next_step({"must_fix": 1}, 0), core.DRAFT_CHECKS_NEXT_STEP.format(idx="2", n=1)):
         assert "replaces_version_id 先过 check_drafts" in text, text
         assert text.index("check_drafts") < text.index("score_drafts"), text
 

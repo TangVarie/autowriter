@@ -291,6 +291,9 @@ def test_score_drafts_doc_matches():
     assert "分数不用逐篇报给用户" in doc and "「合规检查都过了」" in doc
     assert "``unjudged``" in doc and "不能说都过了" in doc
     assert "next_step" in doc and "index" in doc
+    # 写法检查(2026-11-10, §3.21): draft_checks 先改再交、改稿先过 check_drafts; batch_hints 只是提示
+    assert "``draft_checks``" in doc and "``batch_hints``" in doc
+    assert "先过 check_drafts、再调本工具" in doc
 
 
 # ══════════════════════════════════════════════════════════════════════

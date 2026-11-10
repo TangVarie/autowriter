@@ -864,6 +864,13 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     ``replaces_version_id`` 改过重存的不再查(改一轮就够), 全是重存时它是空的, 不用调, ``next_step`` 也不会再让你调。
     篇数多也整串传: check_rules 一次查 20 篇, 没查到的放在它返回的 ``remaining_version_ids`` 里, 照它的 ``next_step`` 接着调。
 
+    **写法检查**(2026-11-10): ``draft_checks`` 是代码逐篇查出来的写法问题(有才带), 每条 ``index`` / ``kind`` / ``what``:
+    ``repeat`` 是同一批好几篇用了同一个说法(连着 8 个字以上一样; 话题标签不算, 品牌名算一个字, 项目规则里的原话不算; 一批
+    最多 2 篇用, 16 篇以上按两成算), 第 3 篇起要改; ``comment_block`` / ``label`` / ``br`` / ``literal_newline`` / ``empty``
+    是正文里混进了评论段、【正文】这类标记、字面的 <br> 或 \\n, 或者去掉话题之后没有正文。和 ``delivery.problems`` 一样先改
+    再交(那几篇带 ``replaces_version_id`` 先过 check_drafts、再调本工具), 不拦存档、不影响参考分; 改过重存还查出来的
+    照实说一句, 不再接着改。``batch_hints`` 是整批的提示(一半以上、至少 5 篇开头一样): 只是参考, 跟用户提一句, 不用改。
+
     ``project_isolation`` 是串项目的提示: 有可疑标记要说明并核对; 没发现或检查超时都不能声称已完整排除串项目。
 
     这个工具出错会直接报错。存档失败必须让你知道 —— 稿子没进指纹库的话, 下次 check_drafts 会把同样的内容再放行
