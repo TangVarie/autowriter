@@ -71,6 +71,23 @@ CLAUDE_MODELS: dict[str, str] = {
 # ⚠️ 部署的 secrets 里若显式设了 CLAUDE_MODEL=claude-sonnet-4-6 之类旧名, 这个默认值不生效, 要改或删。
 CLAUDE_MODEL: str = _get_secret("CLAUDE_MODEL") or "claude-sonnet-5-5"
 
+# ── 备用中转站 (D-148, 可选) ─────────────────────────────────────────────────
+# 主中转站(ANTHROPIC_BASE_URL)慢 / 挂 / 欠费时自动改打备用站, 不至于一直卡着。
+# 和 truth-vault、Jev 同名同语义, 机制在 relay_failover.py, 运维说明见 README「备用中转站」。
+# 两个都填了才算启用; 缺一个 = 没配, 行为和现在完全一样(同一个 client、同样的重试和超时)。
+# 备用站必须认同样的模型名(CLAUDE_MODELS 里那些), 不改模型名。
+# 地址和 key 都按 secret 管, 别写进代码或文档。validate_config() 不变: 主站 key 仍然必填。
+ANTHROPIC_BASE_URL_BACKUP: str = _get_secret("ANTHROPIC_BASE_URL_BACKUP")
+ANTHROPIC_API_KEY_BACKUP: str = _get_secret("ANTHROPIC_API_KEY_BACKUP")
+# 手动开关: "backup" = 只走备用站; "primary" = 只走主站、不切换(= 没配备用站); 空 / "auto" = 自动。
+RELAY_FORCE: str = _get_secret("RELAY_FORCE")
+# 可调项(一般不用动, 留空 = 用默认): 主站单次限时秒数(本仓默认 60), 主站慢成功按失败计的阈值
+# (本仓默认 30, 流式调用不按慢判, 0 = 关), 连续几次失败熔断(默认 2), 熔断多久(默认 1200 秒)。
+RELAY_PRIMARY_TIMEOUT_S: str = _get_secret("RELAY_PRIMARY_TIMEOUT_S")
+RELAY_SLOW_S: str = _get_secret("RELAY_SLOW_S")
+RELAY_BREAKER_FAILS: str = _get_secret("RELAY_BREAKER_FAILS")
+RELAY_BREAKER_COOLDOWN_S: str = _get_secret("RELAY_BREAKER_COOLDOWN_S")
+
 # ── Google Gemini ──────────────────────────────────────────────────────────
 GOOGLE_API_KEY: str = _get_secret("GOOGLE_API_KEY")
 GOOGLE_BASE_URL: str = _get_secret("GOOGLE_BASE_URL")  # optional proxy, e.g. https://your-relay.com
