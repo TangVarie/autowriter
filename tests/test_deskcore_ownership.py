@@ -256,6 +256,10 @@ UNGATED_WITH_REASON = {
                               "话题 / 评论 / 方向, 失败只记 WARN",
     "_whole_batch_delivery":  "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 读改稿挂的旧 batch, "
                               "store.batch_drafts 按 project_id 过滤, 别的项目的 batch 查不出来",
+    # 一批笔记的写法检查(2026-11-10, docs/deskcore.md §3.21)
+    "_draft_checks":          "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 查这次存进去的几篇, 项目行是闸返回的"
+                              "那一行; 只在查出重复说法时经 _rule_texts 读规则原文, 不写",
+    "_rule_texts":            "只被 _draft_checks 调: 规则走 shared_memories(本项目 + 调用者自己的 global, 同简报), 只读",
     # 外部审计 11-02(2026-11-02)
     "_caller_version_problems": "F05: 只被已过闸的 commit_drafts 调, 只读; 本身就是一道版本级的归属核对 —— 调用方自带的 "
                                 "version_id 经 store.items_for_versions(inner join 钉死项目)核, 别的项目的查不出来、按拒处理",
