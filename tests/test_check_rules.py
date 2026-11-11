@@ -28,8 +28,9 @@ import pytest
 import config
 from deskcore import core, delivery, rulecheck, rulecompile, tools
 # jev / _fresh_compile_state 是那边的夹具(后者 autouse: 清后台补编的进程内状态、默认关掉后台补编), 引进来才生效
-from tests.test_rule_compile import (ME, OTHER_PROJ, PROJ, _fresh_compile_state, code_result, jev,  # noqa: F401
-                                     jev_sha, make_client, mem, question_result, stored)
+from tests.test_rule_compile import (ME, OTHER_PROJ, PROJ, Q_BODY, Q_COMMENT, Q_COMMENT_2, _fresh_compile_state,  # noqa: F401
+                                     _questions_result, code_result, jev, jev_sha, make_client, mem, question_result,
+                                     stored)
 
 V1 = "cccccccc-0000-4000-8000-0000000000c1"
 V2 = "cccccccc-0000-4000-8000-0000000000c2"
@@ -182,9 +183,10 @@ def test_ambiguous_and_low_confidence_are_unsure_not_violations(wired):
                            PROJ, [V1], user_id=ME)
     (v1,) = out["versions"]
     assert v1["violations"] == []
-    assert [(e["rule_id"], e["what"][:4]) for e in v1["unsure"]] == [(R_HARD["id"], "拿不准:"), (R_SOFT["id"], "拿不准:")]
-    assert v1["unsure"][0]["p"] == 0.58 and "把握 0.58" in v1["unsure"][0]["what"]
-    assert out["summary"]["unsure"] == 2 and "拿不准" in out["next_step"]
+    # 2026-11-11: 拿不准的每篇只留条数; 偏向没守住的那条规则列在最外层的 unsure_rules, 偏向守住的只计数
+    assert "unsure" not in v1 and v1["counts"]["unsure"] == 2
+    assert out["unsure_rules"] == [{"rule_id": R_HARD["id"], "severity": "hard", "what": "拿不准: 不能写疗效", "drafts": 1}]
+    assert out["summary"]["unsure"] == 2 and "有 2 处「拿不准」(涉及 2 条规则), 提一句就行, 不用改。" in out["next_step"]
 
 
 def test_evidence_not_found_is_unjudged_not_a_violation(wired):
@@ -200,12 +202,13 @@ def test_evidence_not_found_is_unjudged_not_a_violation(wired):
                                        compiles=[stored(R_HARD, q_hard()), stored(R_SOFT, q_soft())]),
                            PROJ, [V1], user_id=ME)
     (v1,) = out["versions"]
-    assert v1["violations"] == [] and v1["unsure"] == [], "无效的答案不报必须改"
+    assert v1["violations"] == [] and v1["counts"]["unsure"] == 0, "无效的答案不报必须改"
     assert v1["counts"]["must_fix"] == 0 and out["summary"]["must_fix"] == 0
-    assert v1["counts"]["unjudged"] == 2 and v1["unjudged"] == [
-        {"rule_id": R_HARD["id"], "reason": "evidence_not_found"}, {"rule_id": R_SOFT["id"], "reason": "no_title"}], \
-        "evidence_not_found / no_title 之类: 没判出来, 不报违反也不报守住"
+    assert v1["counts"]["unjudged"] == 2 and "unjudged" not in v1, \
+        "evidence_not_found / no_title 之类: 没判出来, 不报违反也不报守住; 每篇只留题数(2026-11-11)"
+    assert out["summary"]["unjudged"] == 2 and out["summary"]["evidence_not_found"] == 1
     assert v1["judge_status"] == "not_judged", "两道题都没判出来, 和没判完一样"
+    assert "evidence_not_found" in v1["judge_note"] and "no_title" in v1["judge_note"]
     assert "必须改" not in out["next_step"] and "都守住了" not in out["next_step"]
 
 
@@ -487,9 +490,10 @@ def test_partly_unjudged_versions_say_how_many_questions_were_not_judged(wired):
                                        compiles=[stored(R_HARD, q_hard()), stored(R_SOFT, q_soft())]),
                            PROJ, [V1], user_id=ME)
     (v1,) = out["versions"]
-    assert v1["judge_status"] == "ok" and v1["violations"] == [] and v1["unsure"] == []
-    assert v1["counts"]["unjudged"] == 1 and v1["unjudged"] == [{"rule_id": R_SOFT["id"], "reason": "missing"}]
+    assert v1["judge_status"] == "ok" and v1["violations"] == [] and v1["counts"]["unsure"] == 0
+    assert v1["counts"]["unjudged"] == 1 and "unjudged" not in v1
     assert out["summary"]["unjudged"] == 1 and out["summary"]["not_finished"] == 0
+    assert "evidence_not_found" not in out["summary"] and "指不出是哪一句" not in out["next_step"]
     assert "另有 1 道规则题这次没判出来" in out["next_step"] and "都守住了" not in out["next_step"]
 
 
@@ -641,8 +645,10 @@ def test_long_lists_are_capped_but_counts_stay_whole(wired):
     (v1,) = out["versions"]
     assert len(v1["violations"]) == core.CHECK_RULES_MAX_LISTED
     assert [e["severity"] for e in v1["violations"]] == ["hard"] * 10 + ["soft"] * 2, "必须改的先保"
-    assert len(v1["unsure"]) == core.CHECK_RULES_MAX_UNSURE
-    assert v1["more"] == (20 - core.CHECK_RULES_MAX_LISTED) + (7 - core.CHECK_RULES_MAX_UNSURE)
+    # 2026-11-11: 拿不准的不逐篇列、也不算进 more(more 只数没列出来的建议改); 最外层最多列 3 条偏向没守住的
+    assert "unsure" not in v1 and "unjudged" not in v1
+    assert v1["more"] == 20 - core.CHECK_RULES_MAX_LISTED
+    assert len(out["unsure_rules"]) == core.CHECK_RULES_MAX_UNSURE_RULES == 3
     assert v1["counts"] == {"must_fix": 10, "suggest": 10, "unsure": 7, "unjudged": 0}
     assert {k: out["summary"][k] for k in ("must_fix", "suggest", "unsure")} == {"must_fix": 10, "suggest": 10, "unsure": 7}
 
@@ -1220,8 +1226,9 @@ def test_an_empty_body_is_not_said_to_have_kept_the_rule_questions(wired):
 
 
 def test_items_past_the_per_version_cap_are_counted_in_next_step(wired):
-    """每篇建议改补到 12 条、拿不准最多 5 条, 多的只剩每篇的 more。原来 next_step 和工具说明都不提 more, 写手照列出来的说完
-    就算了, 用户不知道还有几条软规则没守住(score_drafts 那边有 RULE_CHECKS_MORE_NEXT_STEP)。"""
+    """每篇建议改补到 12 条, 多的只剩每篇的 more。原来 next_step 和工具说明都不提 more, 写手照列出来的说完
+    就算了, 用户不知道还有几条软规则没守住(score_drafts 那边有 RULE_CHECKS_MORE_NEXT_STEP)。
+    2026-11-11: 拿不准的不算进 more(它们不用改, 原来一篇平均 5 条、上限 5 条, 「还有 N 条没列」几乎次次都说)。"""
     soft = [mem(140 + i, f"示例软规则第 {i} 条") for i in range(core.CHECK_RULES_MAX_LISTED + 2)]
     shaky = [mem(170 + i, f"示例软规则(拿不准)第 {i} 条") for i in range(core.CHECK_RULES_MAX_UNSURE + 1)]
 
@@ -1232,7 +1239,182 @@ def test_items_past_the_per_version_cap_are_counted_in_next_step(wired):
     wired.judge = answers(**by_qid)
     out = core.check_rules(full_client(memories=soft + shaky, compiles=[stored(r, q(r)) for r in soft + shaky],
                                        versions=[version(V1), version(V2)]), PROJ, [V1, V2], user_id=ME)
-    assert [v["more"] for v in out["versions"]] == [3, 3]
-    assert "还有 6 条建议改 / 拿不准没列出来" in out["next_step"] and "如实告诉用户" in out["next_step"]
-    assert out["summary"]["more"] == 6
+    assert [v["more"] for v in out["versions"]] == [2, 2]
+    assert "还有 4 条建议改没列出来" in out["next_step"] and "如实告诉用户" in out["next_step"]
+    assert out["summary"]["more"] == 4 and out["summary"]["unsure"] == 2 * (core.CHECK_RULES_MAX_UNSURE + 1)
     assert "more" in tools.check_rules.__doc__ and "12 条" in tools.check_rules.__doc__
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 11 · 只问评论 / 话题的规则题不发; 回包只逐条列要动手的(2026-11-11, 审计 S2 / JP-1 / F1 / JP-6 / S5 / JP-4)
+# ══════════════════════════════════════════════════════════════════════
+
+R_CMT = mem(201, "示例硬规则: 评论里要带上示例品牌名, 只发一条", severity="hard")
+R_MIXED = mem(202, "示例硬规则: 正文不写示例宣称, 评论里也要带示例品牌名", severity="hard")
+
+
+def _multi(rule, *qs, code=None):
+    res = _questions_result(rule["id"], jev_sha(rule["content"], rule.get("applicability")), *qs)
+    res["code"] = code
+    return res
+
+
+def _sent_qids(jev_fake) -> list[list[str]]:
+    return [[q["id"] for q in c["json"]["project_bank"]["questions"]]
+            for c in jev_fake.calls if c["url"].endswith("/judge_draft")]
+
+
+def test_comment_only_questions_are_not_sent_and_the_rule_is_not_called_kept(wired, caplog):
+    """硬规则的三道题全在问评论: 发给 Jev 的只有标题和正文, 「评论里有没有带上…」(pass_if 是)篇篇答「否」。原来照发,
+    每篇一条「必须改」, 怎么改正文都消不掉(11-11 线上一个项目 15 篇里 15 篇)。现在不发, 这条算查不了, 不说它守住了。"""
+    cmt = _multi(R_CMT, Q_COMMENT, Q_COMMENT_2)
+    qids = [q["qid"] for q in cmt["questions"]]
+    wired.judge = answers(**{qid_of(q_soft()): {"answer": "是", "p": 0.9, "ambiguous": False},
+                             qids[0]: {"answer": "否", "p": 0.96, "ambiguous": False},     # 假 Jev 照旧会这么答
+                             qids[1]: {"answer": "否", "p": 0.9, "ambiguous": False}})
+    with caplog.at_level("INFO", logger="deskcore.core"):
+        out = core.check_rules(full_client(memories=[R_CMT, R_SOFT], compiles=[stored(R_CMT, cmt), stored(R_SOFT, q_soft())],
+                                           versions=[version(V1), version(V2)]), PROJ, [V1, V2], user_id=ME)
+    assert _sent_qids(wired) == [[qid_of(q_soft())]] * 2, "只问评论的题不进题库"
+    assert all(v["violations"] == [] and v["counts"]["must_fix"] == 0 for v in out["versions"])
+    assert out["summary"]["must_fix"] == 0 and out["summary"]["unjudged"] == 0
+    assert out["rules"]["by_jev"] == 1 and out["rules"]["code_unavailable"] == 1 and "partial" not in out["rules"]
+    assert "questions_unchecked" not in out["rules"], "不是缓存坏了, 不进「题目形状不对」那一桶"
+    assert "有 1 条规则要看话题 / 评论" in out["next_step"] and "都守住了" not in out["next_step"]
+    assert "必须改" not in out["next_step"]
+    (line,) = [r.getMessage() for r in caplog.records if "只问评论 / 话题" in r.getMessage()]
+    assert all(q in line for q in qids) and "示例品牌名" not in line, "日志只记题号, 不记题面"
+
+
+def test_a_rule_already_unavailable_for_its_code_is_counted_once(wired):
+    """题全在问评论、编出来的 code 也只看评论的那条(线上就是这个形状): code_unavailable 是集合, 只数一次。"""
+    cmt = _multi(R_CMT, Q_COMMENT, code={"kind": "forbidden_regex", "pattern": "示例词", "where": ["comments"]})
+    out = core.check_rules(full_client(memories=[R_CMT], compiles=[stored(R_CMT, cmt)], versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    assert out["status"] == "nothing_to_check" and out["rules"]["code_unavailable"] == 1 and out["versions"] == []
+    assert "有 1 条规则要看话题 / 评论" in out["next_step"] and "流程、交付、写作方向" not in out["next_step"]
+    assert wired.calls == [], "一道题都不剩: 什么都不发"
+
+
+def test_a_mixed_rule_asks_the_body_question_and_is_reported_as_partly_checked(wired):
+    mixed = _multi(R_MIXED, Q_COMMENT, Q_BODY)
+    cmt_qid, body_qid = [q["qid"] for q in mixed["questions"]]
+    wired.judge = answers(**{body_qid: {"answer": "否", "p": 0.93, "ambiguous": False}})
+    out = core.check_rules(full_client(memories=[R_MIXED], compiles=[stored(R_MIXED, mixed)], versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    assert _sent_qids(wired) == [[body_qid]]
+    (v1,) = out["versions"]
+    assert v1["judge_status"] == "ok" and v1["violations"] == [] and v1["counts"]["unjudged"] == 0
+    assert out["rules"]["by_jev"] == 1 and "code_unavailable" not in out["rules"]
+    assert out["rules"]["partial"] == 1
+    assert out["rules"]["partial_rules"] == [{"rule_id": R_MIXED["id"], "uncovered": "只问评论 / 话题的规则题没问(不随稿子存)"}]
+    assert "有 1 条规则只查了一部分" in out["next_step"] and "都守住了" not in out["next_step"]
+
+
+def test_a_rule_whose_comment_questions_are_dropped_but_whose_code_ran_is_partly_checked(wired):
+    """题全拿掉了, 编出来的 code 照查了标题: 这条查了一半, 进 partial, 不说成「查不了」。代码的命中照报。"""
+    cmt = _multi(R_CMT, Q_COMMENT, code={"kind": "forbidden_word", "words": ["示例禁词"], "where": ["title"]})
+    out = core.check_rules(full_client(memories=[R_CMT], compiles=[stored(R_CMT, cmt)],
+                                       versions=[version(V2, title="示例禁词也在这个标题里")]), PROJ, [V2], user_id=ME)
+    (v2,) = out["versions"]
+    assert [(e["rule_id"], e["source"]) for e in v2["violations"]] == [(R_CMT["id"], "code")]
+    assert out["rules"]["by_code"] == 1 and out["rules"]["partial"] == 1 and "code_unavailable" not in out["rules"]
+    assert wired.calls == []
+
+
+def test_unsure_and_unjudged_rows_are_counted_not_listed(wired):
+    """11-11 线上一篇平均 5.0 条拿不准(四分之三偏向守住)、2.9 道没判出来, 都不用改, 回包大半是它们。每篇只留条数;
+    偏向没守住的按规则汇到最外层 unsure_rules(硬约束在前, 再按篇数), 偏向守住的只计数。"""
+    lean = [mem(210 + i, f"示例软规则(偏向没守住)第 {i} 条") for i in range(4)]
+    kept = [mem(220 + i, f"示例软规则(偏向守住)第 {i} 条") for i in range(3)]
+    r_hard = mem(230, "示例硬规则(偏向没守住)", severity="hard")
+
+    def q(r):
+        return question_result(r["id"], jev_sha(r["content"]), ask=f"正文有没有违反{r['content']}？", pass_if="否",
+                               note=f"要点 {r['content']}")
+    rules = lean + kept + [r_hard]
+    by_qid = {qid_of(q(r)): {"answer": "是", "p": 0.6, "ambiguous": False} for r in lean + [r_hard]}
+    by_qid.update({qid_of(q(r)): {"answer": "否", "p": 0.62, "ambiguous": False} for r in kept})
+
+    def judge(payload):
+        got = dict(by_qid)
+        if payload["subject_id"] == V2:             # 第二篇上只有 lean[3] 和硬约束那条拿不准, 别的守住了
+            got.update({qid_of(q(r)): {"answer": "否", "p": 0.95, "ambiguous": False} for r in lean[:3] + kept})
+        return {"subject_id": payload["subject_id"], "passed": True, "plan": [],
+                "detail": {"desk_rules": got}, "written": len(got), "write_error": None}
+    wired.judge = judge
+    out = core.check_rules(full_client(memories=rules, compiles=[stored(r, q(r)) for r in rules],
+                                       versions=[version(V1), version(V2)]), PROJ, [V1, V2], user_id=ME)
+    v1, v2 = out["versions"]
+    for v in (v1, v2):
+        assert "unsure" not in v and "unjudged" not in v and "more" not in v and v["violations"] == []
+    assert v1["counts"] == {"must_fix": 0, "suggest": 0, "unsure": 8, "unjudged": 0}
+    assert v2["counts"]["unsure"] == 2 and out["summary"]["unsure"] == 10 and "more" not in out["summary"]
+    assert out["unsure_rules"] == [
+        {"rule_id": r_hard["id"], "severity": "hard", "what": f"拿不准: 要点 {r_hard['content']}", "drafts": 2},
+        {"rule_id": lean[3]["id"], "severity": "soft", "what": f"拿不准: 要点 {lean[3]['content']}", "drafts": 2},
+        {"rule_id": lean[0]["id"], "severity": "soft", "what": f"拿不准: 要点 {lean[0]['content']}", "drafts": 1}]
+    assert "把握" not in json.dumps(out["unsure_rules"], ensure_ascii=False), "汇总的那条不带每篇各自的答案和把握"
+    assert "有 10 处「拿不准」(涉及 8 条规则), 提一句就行, 不用改。" in out["next_step"]
+    assert "没列出来" not in out["next_step"] and "都守住了" not in out["next_step"]
+    # 后台的改稿复查只读计数和 violations[].rule_id: 照样摘得出来
+    digest = core._recheck_digest([out])
+    assert digest["unsure"] == 10 and [v["unsure"] for v in digest["versions"]] == [8, 2]
+
+
+def test_unsure_answers_that_all_lean_kept_list_nothing(wired):
+    wired.judge = answers(**{qid_of(q_hard()): {"answer": "否", "p": 0.6, "ambiguous": False},
+                             qid_of(q_soft()): {"answer": "是", "p": 0.66, "ambiguous": False}})
+    out = core.check_rules(full_client(memories=[R_HARD, R_SOFT],
+                                       compiles=[stored(R_HARD, q_hard()), stored(R_SOFT, q_soft())]),
+                           PROJ, [V1], user_id=ME)
+    assert "unsure_rules" not in out and out["summary"]["unsure"] == 2
+    assert "有 2 处「拿不准」" in out["next_step"] and "都守住了" not in out["next_step"], "偏向守住也不算守住"
+
+
+def test_two_questions_of_one_rule_give_one_flag_per_draft(wired):
+    """一条规则编成两道相近的题, 两道都没守住: 一篇上只报一条(留带依据句的), 条数也只数一条。"""
+    r = mem(240, "示例软规则: 要写出持续了多久, 不要写得含糊")
+    two = _multi(r, {"ask": "正文有没有写出持续了多久？", "pass_if": "是", "scope": "body"},
+                 {"ask": "正文有没有把持续时间写得含糊？", "pass_if": "否", "scope": "body"})
+    q1, q2 = [q["qid"] for q in two["questions"]]
+    wired.judge = answers(**{q1: {"answer": "否", "p": 0.9, "ambiguous": False},
+                             q2: {"answer": "是", "p": 0.8, "ambiguous": False, "evidence": "第二句讲当时的感受。"}})
+    out = core.check_rules(full_client(memories=[r], compiles=[stored(r, two)], versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    (v1,) = out["versions"]
+    assert [(e["rule_id"], e.get("evidence")) for e in v1["violations"]] == [(r["id"], "第二句讲当时的感受。")]
+    assert v1["counts"]["suggest"] == 1 and out["summary"]["suggest"] == 1 and "more" not in v1
+
+
+def test_evidence_not_found_gets_its_own_sentence(wired):
+    """Jev 答了「有问题」却指不出是哪一句(线上没判出来的全是这一种): 没有一句可改, 也不是回包缺了题。原来和缺题混成
+    「另有 N 道规则题这次没判出来…不用重试」。数照旧都在 counts.unjudged / summary.unjudged 里(协议 5a 认的是它)。"""
+    r3 = mem(250, "示例软规则: 不要写成说明书")
+    q3 = question_result(r3["id"], jev_sha(r3["content"]), ask="正文有没有写成说明书？", pass_if="否")
+    wired.judge = answers(**{
+        qid_of(q_hard()): {"answer": "是", "p": 0.88, "ambiguous": False, "evidence": None,
+                           "invalid_reason": "evidence_not_found"},
+        qid_of(q3): {"answer": "否", "p": 0.9, "ambiguous": False}})             # 软规则 R_SOFT 那题回包里缺了
+    out = core.check_rules(full_client(memories=[R_HARD, R_SOFT, r3],
+                                       compiles=[stored(R_HARD, q_hard()), stored(R_SOFT, q_soft()), stored(r3, q3)]),
+                           PROJ, [V1], user_id=ME)
+    (v1,) = out["versions"]
+    assert v1["judge_status"] == "ok" and v1["violations"] == [] and v1["counts"]["unjudged"] == 2
+    assert out["summary"]["unjudged"] == 2 and out["summary"]["evidence_not_found"] == 1
+    step = out["next_step"]
+    assert "另有 1 道规则题 Jev 怀疑有问题、但指不出是哪一句: 不算没守住(也不说成守住了), 不用改。" in step
+    assert "另有 1 道规则题这次没判出来(Jev 回包缺题或判不了), 那几条不能说守住了; 不用重试。" in step
+    assert "必须改" not in step and "都守住了" not in step
+    only = core._check_rules_next_step({"unjudged": 3, "evidence_not_found": 3}, 0)
+    assert "指不出是哪一句" in only and "这次没判出来" not in only and "都守住了" not in only
+
+
+def test_tool_doc_and_note_describe_the_slimmer_reply():
+    doc = tools.check_rules.__doc__
+    for must in ("unsure_rules", "最多 3 条", "counts.unsure", "summary.evidence_not_found", "只问评论 / 话题的规则题也不问",
+                 "同一条规则在一篇里只列一条"):
+        assert must in doc, must
+    assert "``unsure``:" not in doc and "``unjudged`` 列着" not in doc and "最多列 5 条" not in doc
+    assert "unsure_rules" in core.CHECK_RULES_NOTE and "counts.unjudged" in core.CHECK_RULES_NOTE
+    assert f"最多 {core.CHECK_RULES_MAX_UNSURE_RULES} 条" in core.CHECK_RULES_NOTE

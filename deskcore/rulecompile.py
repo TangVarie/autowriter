@@ -6,6 +6,7 @@
 
   questions      编出来的 1–3 道是非题 → 拼成内联项目题库, 单独发一次 ``/judge_draft``(只判这份题库, 不判段);
                  每题对照 ``pass_if`` 读 ``detail.desk_rules[qid]``: 答案和 pass_if 不一样就是没守住。
+                 只问评论 / 话题的题不发(这两样不随稿子存, 见 unseen_questions)。
   code           能用代码查的(形状同 rulecheck: forbidden_word / forbidden_regex / required_phrase / max_len) →
                  交给 rulecheck 跑, 只跑**没有人手设过能跑的 check** 的规则(人设的那份 score_drafts 已经查过, 不查第二遍);
                  只看话题 / 评论的不跑(这两样不随稿子存, 见 UNSTORED_PARTS)。
@@ -166,6 +167,32 @@ def question_index(pairs: list[tuple[dict, dict]], bank: dict | None) -> dict[st
     return out
 
 
+# 只问评论 / 话题的规则题(2026-11-11, 审计 S2 / JP-1): check_rules 发给 Jev 的只有标题和正文(版本行里没存评论和写手传的
+# 话题, 见下面 UNSTORED_PARTS), 这种题照发的话 Jev 是对着一篇没有评论的稿子答的 —— 「评论里有没有带上…」(pass_if 是)
+# 篇篇答「否」, 硬规则篇篇报「必须改」, 怎么改正文都消不掉; 「评论里有没有…」(pass_if 否)篇篇算守住, 其实没看。
+# 编出来的 code 早就按 where 拦了(code_rules), 题这边原来没有同样的一道。只看题面的字: 提到 评论 / 话题 / 标签、又一处没提
+# 正文 / 标题 / 全文的才算(「正文或评论里有没有…」是正文的题, 照问); scope 标了 title / body 的不算 —— 那是编译时就指明
+# 只看标题 / 正文的题(「标题有没有话题钩子」这种「话题」不是话题行)。按字认会漏掉不带这几个词的问法(比如只说「楼中楼」),
+# 漏掉的和原来一样照发。
+_UNSEEN_ASK_RE = re.compile("评论|话题|标签")
+_SEEN_ASK_RE = re.compile("正文|标题|全文")
+
+
+def unseen_questions(result) -> list[dict]:
+    """一条编译结果里只问评论 / 话题的那几道题(原样的题 dict, 按原来的顺序); 没有回空列表。
+
+    纯函数, 不改 ``result``。调用方(core.check_rules)在拼题库(``project_bank``)**之前**把它们拿掉: project_bank 是 Jev
+    那边的移植、逐字节钉着, 不能在里面筛。一条规则的题全被拿掉 = 这条 check_rules 查不了; 拿掉一部分 = 只查了一部分。"""
+    if not usable(result) or result.get("verdict") != "questions":
+        return []
+    raw = result.get("questions")
+    if not isinstance(raw, list):
+        return []
+    return [q for q in raw
+            if isinstance(q, dict) and isinstance(q.get("ask"), str) and q.get("scope") not in ("title", "body")
+            and _UNSEEN_ASK_RE.search(q["ask"]) and not _SEEN_ASK_RE.search(q["ask"])]
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 编出来的 code → rulecheck
 # ══════════════════════════════════════════════════════════════════════
@@ -278,7 +305,8 @@ def _what(label: str, q: dict, answer: str, p=None) -> str:
 
 
 def read_answers(questions: dict[str, dict], detail) -> dict:
-    """``/judge_draft`` 回的 ``detail.desk_rules`` → {"violations", "unsure", "unjudged"}。
+    """``/judge_draft`` 回的 ``detail.desk_rules`` → {"violations", "unsure", "unjudged"}。``violations`` 一条规则只留
+    一条(见 one_per_rule); ``unsure`` 一道题一条, 带 ``violated``(这个答案偏向没守住)和 ``point``(要点)。
 
     每题对照 pass_if: 答案和 pass_if 不一样 = 没守住。
       · 歧义(Jev 的 ambiguous)或 p < SURE_P: 不管偏向哪边都记「拿不准」, 不算违反也不算守住 —— 0.6 的「守住」和
@@ -300,8 +328,9 @@ def read_answers(questions: dict[str, dict], detail) -> dict:
             continue
         violated = ans != q["pass_if"]
         if it.get("ambiguous") or not _num(p) or p < SURE_P:
+            # violated / point 给 check_rules 汇成 unsure_rules 用: 偏向没守住的才列, 列的时候不带每篇各自的答案和把握
             entry = {"rule_id": q["rule_id"], "severity": q["severity"], "what": _what(UNSURE_LABEL, q, ans, p),
-                     "source": "jev"}
+                     "source": "jev", "violated": violated, "point": q["note"] or q["ask"]}
             if _num(p):
                 entry["p"] = round(float(p), 3)
             unsure.append(entry)
@@ -315,7 +344,19 @@ def read_answers(questions: dict[str, dict], detail) -> dict:
         if isinstance(ev, str) and ev.strip():
             entry["evidence"] = ev.strip()
         violations.append(entry)
-    return {"violations": violations, "unsure": unsure, "unjudged": unjudged}
+    return {"violations": one_per_rule(violations), "unsure": unsure, "unjudged": unjudged}
+
+
+def one_per_rule(flags: list[dict]) -> list[dict]:
+    """同一条规则在同一篇上只留一条(2026-11-11, 审计 JP-6): 一条规则编成两三道意思相近的题, 两道都没守住时原来报两条,
+    写手听到的是同一件事说两遍。留带依据句(``evidence``)的那条 —— 有一句可改的比没有的有用; 都带或都不带留先出现的。
+    顺序按每条规则第一次出现的位置。"""
+    best: dict = {}
+    for e in flags:
+        cur = best.get(e["rule_id"])
+        if cur is None or ("evidence" in e and "evidence" not in cur):
+            best[e["rule_id"]] = e
+    return list(best.values())
 
 
 def code_violations(hits: list[dict]) -> list[dict]:

@@ -556,6 +556,8 @@ select count(*), count(distinct memory_id), count(*) - count(distinct memory_id)
 结果」，各结论那几列也可能数到旧版本（同一条规则新旧两版结论不同时两列各算一次）。session 规则和静音的规则不在池子里，没算。
 权威的数是 `compile-rules --dry-run` 的「已编过 / 要编」（它按当前原文算 sha）。查 `check_rules` 判出来的答案：TV 账本 `note_feature_answers` 里
 `subject_type = 'aw_version' and run_tag = 'shadow-rules'` 的行（和存档那次的 `primary` 分开）。
+2026-11-11 起只问评论 / 话题的规则题不发（`docs/deskcore.md` §3.11 步骤 3），这些题不再写账本；在那之前写进去的答案是对着一篇没有评论的
+稿子判的（11-11 一个项目 15 版里 15 版的硬规则违反都是这种），校准时要排除。哪些题被拿掉看服务日志里「只问评论 / 话题」那一行（只有题号）。
 
 ### 1.10 `014_tv_edit_diff_rev` —— 改动差异的口径版本（2026-10-20）
 

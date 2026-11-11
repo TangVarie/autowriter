@@ -172,7 +172,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
 | | `score_drafts`（旧名 `commit_drafts`，同一个函数） | 存档 + 参考分：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。进程在这几秒里被杀（SIGKILL / OOM / 重启）放不回：item 的 best 还是旧版、旧版一行指纹都没有——每晚的 `tv-sync` 顺手查一遍接着的写作台项目里写作台自己的（`ai_engine = deskcore`）定稿版本有没有指纹行，没有的拿项目写锁按 `backfill` 那一套补回、打 WARNING、报 `fingerprint_gap`（外部评审 11-04 F05，2026-11-04；补回的行没有 `angle_key`）。同一个 item 别的版本还有指纹行的不补、只数 `skipped`：那是改稿的新指纹入了库、挂到旧 item 上失败（`replace_warning`），旧版的行是故意撤的，补回去新旧两版就都在查重里（复审 11-04）；新版连 versions 行都没建成的认不出来，照补。改成一个事务（RPC 里删旧写新）是后续项，这次没动 `score_drafts` 的顺序。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8）。2026-10-20 起项目有交付模板时带拼好的 `delivery`（§3.9），带 check 的规则有命中时带 `rule_checks`（§3.10）。2026-10-27 起带了 key 却对不上台账的另数（`unknown_angle_keys` / `used_angle_keys`，按形状分编的、别的项目的牌、台账没写进去），传回的飞轮臂对不上服务端发的时以服务端为准、重启过核对不了的另标（§3.12）。2026-11-10 起同一批里的重复说法和正文里混进来的版式残留带 `draft_checks`、开头一样的提示带 `batch_hints`（§3.21） |
-| | `check_rules` | **存档之后按规则逐篇查，只作建议**（2026-10-20，D-121）：规则事先由 Jev 编成是非题 / 代码检查、缓存在 `rule_compiles`；hard 没守住报「必须改」，soft 报「建议改」，Jev 拿不准的单列「拿不准」，到点没判完的报「没判完」。不拦存档、不改稿（见 §3.11） |
+| | `check_rules` | **存档之后按规则逐篇查，只作建议**（2026-10-20，D-121）：规则事先由 Jev 编成是非题 / 代码检查、缓存在 `rule_compiles`；hard 没守住报「必须改」，soft 报「建议改」，Jev 拿不准的每篇只报条数、偏向没守住的最多列 3 条规则（`unsure_rules`），到点没判完的报「没判完」。只问评论 / 话题的规则题不发。不拦存档、不改稿（见 §3.11） |
 | （已撤） | `review_drafts` / `export_drafts` | 2026-10-19 撤掉（D-120）：写手没有人审、导出、存档这几步，定稿贴进飞书，`tv-sync` 按内容对回来。§3.4 / §3.6 留作历史 |
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
 | 写评论 | `comments_for` / `score_comments` | 按链接（或贴来的正文）一次拿齐帖子、规则、评论位和项目定的配比 → 整组判一次、不存库（§3.14 起的各节，配比见 §3.20） |
@@ -847,6 +847,19 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
    `JUDGE_DRAFT_TOOL_TIMEOUT_SEC`（默认 18 秒）的截止，发之前查 tv-map 的那两次库也算在里面；到点没回来的那篇报 `judge_status = timeout` +
    `judge_note`「没判完」，**绝不算守住**。正文是空的那篇不发（`judge_status: empty_body`），不算没判完，数进 `summary.empty_body`，
    `next_step` 说这几篇规则题没判、不能说守住了（独立复审 on aw E：原来什么都不数，标题上的题、「正文要带…」的题都没问，照说「都守住了」）。
+   **只问评论 / 话题的题不发**（2026-11-11，审计 S2 / JP-1；`rulecompile.unseen_questions`）：发给 Jev 的只有标题和正文，这种题是对着一篇
+   没有评论的稿子答的——「评论里有没有带上…」（`pass_if` 是）篇篇答「否」，硬规则篇篇报「必须改」，怎么改正文都消不掉；
+   「评论里有没有…」（`pass_if` 否）篇篇算守住，其实没看。11-11 线上一个项目的一道题让 15 篇里 15 篇报了「必须改」，改过重存的 5 篇照报，
+   历史上记下的 19 条硬规则违反里 15 条是它。编出来的 `code` 早就按 `where` 拦了（步骤 4），题这边原来没有同样的一道。
+   只看题面的字：`ask` 提到 评论 / 话题 / 标签、又一处没提 正文 / 标题 / 全文 的才算（「正文或评论里有没有…」是正文的题，照问）；
+   `scope` 标了 `title` / `body` 的不算（编译时就指明只看标题 / 正文的题，「标题有没有话题钩子」里的「话题」不是话题行；线上这种题的
+   `scope` 都是 `full`）。在拼题库**之前**拿掉——`project_bank` 是 Jev 那边的移植、逐字节钉着，不在里面筛。一条规则的题全被拿掉、
+   别的也没查它的，和步骤 4 里只看话题 / 评论的 `code` 并成一个集合数进 `rules.code_unavailable`（两边都沾的只数一次）；拿掉一部分、
+   或者题全拿掉但编出来的 `code` 照查了标题 / 正文的，数进 `rules.partial`（`partial_rules[].uncovered` 写「只问评论 / 话题的规则题没问」）。
+   两种 `next_step` 都不说它（整条）守住了。拿掉的题号记一行 INFO 日志（只有题号）。11-11 当天的编译结果里这一刀拿掉 12 道题
+   （三个项目 8 + 2 + 2，五条规则的题全在里面），没有一道提到标题或正文的题被拿掉。按字认会漏掉不带这几个词的问法（比如只说「楼中楼」，
+   当天没有），漏掉的照旧发。**复盘注意**：拿掉之前那 15 条假的硬规则违反已经在规则题账本里（`run_tag=shadow-rules`），校准时要排除这
+   几条规则的题；拿掉之后这些题不再写账本。真要按评论查这些规则得把评论交给 Jev，是另一件事，这次没做。
 4. 代码查：编出来的 `code` 交给 `rulecheck.check`（查词、数字数和 §3.10 同一份 `validator.contains_term` / `count_chars`），只跑没有
    人设能跑的 check 的规则（见上表 `code` 那行）。`where` 里的 `tags` / `comments` 先拿掉（版本行里没有），拿完一处不剩的不跑
    （`required_phrase` 沾了就不跑），数进 `rules.code_unavailable`，`next_step` 说这几条查不了、不能说守住了。
@@ -881,20 +894,37 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
 `p` < 0.7（同参考分的「有把握」线）的，不管偏向哪边都记「拿不准」——0.6 的守住和 0.6 的没守住一样不可信。`invalid_reason` 不为空的
 记「没判出来」，不报违反也不报守住，**没有例外**——同 Jev README「规则编译 → 送回 /judge_draft」的契约。`evidence_not_found`
 （答了「是」却指不出依据句，TV 账本里那一行 answer 为 NULL）也是没判出来（10-20 第二轮复审：原来它落在 `pass_if`「否」的题上时照算违反，
-硬规则报「必须改」，写手照着一个账本里记成无效的答案去改稿，还不知道改哪一句）。没判出来的题数进那篇的 `counts.unjudged`（`unjudged` 列出规则 id
-和原因，最多 5 条）、全部篇加起来进 `summary.unjudged`（整篇所有题都未判出来的也计入），`next_step` 说「另有 N 道规则题这次没判出来，不能说守住了」；一道都没判出来的
+硬规则报「必须改」，写手照着一个账本里记成无效的答案去改稿，还不知道改哪一句）。没判出来的题数进那篇的 `counts.unjudged`（只有题数，
+11-11 起不逐条列）、全部篇加起来进 `summary.unjudged`（整篇所有题都未判出来的也计入），`next_step` 说「另有 N 道规则题这次没判出来，不能说守住了」；
+其中 `evidence_not_found` 的另数进 `summary.evidence_not_found`（有才带），`next_step` 单说一句「Jev 怀疑有问题、但指不出是哪一句：不算没守住
+（也不说成守住了），不用改」（2026-11-11，审计 S5 / JP-4：线上没判出来的全是这一种，没有一句可改，也不是回包缺了题，原来和缺题混成
+一句「没判出来…不用重试」；数照旧都在 `counts.unjudged` 里，协议 5a 认的是它）。一道都没判出来的
 那篇（回包里没有 `desk_rules`，或每题都带 `invalid_reason`）记 `judge_status: not_judged`，和没判完一样算进 `summary.not_finished`。
 10-20 复审：原来这里只在那篇上记个数，`summary` 不看它，`next_step` 照说「这次查的规则都守住了」——现在这句只在必须改 / 建议改 /
 拿不准 / 没判完 / 没判出来 / 没编译结果 / 话题评论查不了 / 编不了 / 编出来的检查没跑 / 只查了一部分 / 代码没查完 / 撤掉了代码检查又没有题 /
 正文是空的全是 0 时才说。
 
 **返回值**（一篇一项 `versions[]`）：`violations`（每条 `rule_id` / `severity` / `what`（以「必须改」或「建议改」开头）/ `source`（jev | code）/
-`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`）、`unsure`（「拿不准」，最多 5 条）、`more`（这篇没列出来的条数）、`counts`、`judge_status` / `judge_note`、`code_unchecked`；
-外加 `summary`（必须改 / 建议改 / 拿不准 / 没判完各几处、没判出来几道题；有才带：`more` 没列出来几条、`empty_body` 几篇正文是空的、`code_unchecked` 几处没查完）、`rules`（池子几条、Jev 查几条、代码查几条、查不了几条、
+`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`；同一条规则在一篇里只留一条，见下）、`more`（这篇没列出来的建议改条数）、`counts`（`must_fix` / `suggest` / `unsure` / `unjudged`）、`judge_status` / `judge_note`、`code_unchecked`；
+外加 `summary`（必须改 / 建议改 / 拿不准 / 没判完各几处、没判出来几道题；有才带：`more` 没列出来几条、`evidence_not_found` 几道题指不出依据句、`empty_body` 几篇正文是空的、`code_unchecked` 几处没查完）、`unsure_rules`（有才带，见下）、`rules`（池子几条、Jev 查几条、代码查几条、查不了几条、
 还没编几条和为什么、话题评论查不了几条、编不了几条、编出来没跑几条、只查了一部分几条、人设过 check 由 `score_drafts` 查的几条、撤掉了代码检查又没有题的几条、正则没查完几条）、`uncompiled_rules`、这次没查到的 `remaining_version_ids`（有才带）
-和一句 `next_step`。`summary.more` 不是 0 时 `next_step` 说还有这么多条建议改 / 拿不准没列出来、如实告诉用户（独立复审 on aw E：原来
+和一句 `next_step`。`summary.more` 不是 0 时 `next_step` 说还有这么多条建议改没列出来、如实告诉用户（独立复审 on aw E：原来
 只在每篇的 `more` 里，`next_step` 和工具说明一字不提，写手照列出来的说完就算了；同 §3.10 的 `rule_checks_more`）。没有可查的规则时回
 `status: nothing_to_check` 和一句话，什么都不发。
+
+**只逐条列要动手的**（2026-11-11，审计 F1 / JP-6）。11-11 线上判过规则题的 43 版，一篇平均 5.0 条拿不准（上限就是 5，所以 `more`
+几乎次次不是 0）、2.9 道没判出来，都是工具说明和 `next_step` 说「不用改」的；拿不准的答案里 76% 偏向守住。10 篇的回包一万两三千字，
+大半是这些行。现在：
+- 每篇不再带 `unsure` / `unjudged` 两个列表，只留 `counts` 里的条数；`more` 只数没列出来的建议改。
+- 最外层多一个 `unsure_rules`（最多 3 条，`CHECK_RULES_MAX_UNSURE_RULES`）：只收**偏向没守住**的拿不准（答案和 `pass_if` 不一样、
+  把握不到 0.7 或 Jev 标了歧义），一条规则一行 `{rule_id, severity, what, drafts}`——`what` 是「拿不准: 要点」，不带每篇各自的答案和把握，
+  `drafts` 是这次有几篇在它上面拿不准、偏向没守住；硬约束的排前面，再按篇数。偏向守住的只计数（照旧不算守住）。
+- `next_step` 的拿不准那句带上数：「有 N 处「拿不准」(涉及 M 条规则), 提一句就行, 不用改」。
+- 同一条规则在一篇上只报一条（`rulecompile.one_per_rule`）：一条规则编成两三道相近的题、几道都没守住时原来各报一条（线上 128 条
+  里只有 114 个不同的「规则 × 篇」），现在留带依据句的那条，都带或都不带留先出现的；`counts` / `summary` 按留下的数。只并 Jev 判的；
+  代码查的命中照旧另列。
+- 代价：回包里看不出是**哪一篇**拿不准、哪条规则没判出来（数都在）；一条规则的两道题问的是两件事、又都没守住时，只报其中一件。
+  后台的改稿复查（§3.19 的 AU-F07，`_recheck_digest`）只读 `counts`、`summary` 和 `violations[].rule_id`，不受影响。
 
 **只查新稿。** `score_drafts` 的返回多了 `check_rules_version_ids`：这批里的新稿，不含带 `replaces_version_id` 改过重存的；全是重存时
 它是空的，`next_step` 说「不用再调 check_rules」。10-20 复审：原来每次存档的 `next_step` 都说「然后调一次 check_rules」，照

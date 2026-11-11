@@ -57,7 +57,7 @@ CANNED = {"status": "checked", "uncompiled_rules": 1,
                                         "what": "必须改: 示例", "evidence": "示例产品能治好所有问题"},
                                        {"rule_id": "r-soft", "severity": "soft", "source": "code",
                                         "what": "建议改: 示例"}],
-                        "unsure": [], "counts": {"must_fix": 1, "suggest": 1, "unsure": 0, "unjudged": 0}}],
+                        "counts": {"must_fix": 1, "suggest": 1, "unsure": 0, "unjudged": 0}}],
           "next_step": "「必须改」的照 what / evidence 改完"}
 
 

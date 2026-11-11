@@ -1042,3 +1042,80 @@ def test_global_activation_without_an_owned_mapped_project_starts_nothing(monkey
     rule = mem(19, status='candidate', scope='global')
     core.set_rule_state(make_client([rule], maps=False), rule['id'], 'promote', user_id=ME)
     assert kicks == []
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 只问评论 / 话题的规则题(2026-11-11, 审计 S2 / JP-1): check_rules 手里只有标题和正文, 这种题不发
+# ══════════════════════════════════════════════════════════════════════
+
+def _questions_result(rule_id: str, sha: str, *qs: dict) -> dict:
+    """一条规则编成几道题(question_result 只给一道)。qs: {"ask", "pass_if", "scope", "note"?}。"""
+    full = [{"note": "示例要点", **q} for q in qs]
+    return {"id": rule_id, "sha": sha, "verdict": "questions", "code": None,
+            "questions": [{"qid": jev_qid(rule_id, sha, n, q), **q} for n, q in enumerate(full, 1)],
+            "coverage": "full", "uncovered": "", "why": "要读懂内容"}
+
+
+Q_COMMENT = {"ask": "评论里有没有带上示例品牌名？", "pass_if": "是", "scope": "full"}
+Q_COMMENT_2 = {"ask": "评论区是不是只有一条示例评论？", "pass_if": "否", "scope": "full"}
+Q_TAGS = {"ask": "话题里有没有带上示例话题？", "pass_if": "是", "scope": "full"}
+Q_BODY = {"ask": "正文有没有出现虚构的示例宣称？", "pass_if": "否", "scope": "body"}
+Q_BODY_OR_COMMENT = {"ask": "正文或评论里有没有替示例机构背书？", "pass_if": "否", "scope": "full"}
+Q_TITLE_HOOK = {"ask": "有没有借热门话题引起好奇？", "pass_if": "是", "scope": "title"}
+
+
+def test_a_comment_only_rule_loses_every_question():
+    res = _questions_result(mid(1), "0" * 12, Q_COMMENT, Q_COMMENT_2, Q_TAGS)
+    assert rulecompile.unseen_questions(res) == res["questions"], "题面只提评论 / 话题的三道都不发"
+
+
+def test_a_mixed_rule_loses_only_the_comment_question():
+    res = _questions_result(mid(1), "0" * 12, Q_COMMENT, Q_BODY)
+    before = json.loads(json.dumps(res, ensure_ascii=False))
+    assert rulecompile.unseen_questions(res) == [res["questions"][0]]
+    assert res == before, "纯函数: 不改编译结果(缓存行别的地方还要用)"
+
+
+def test_a_body_question_that_mentions_comments_is_still_asked():
+    """「正文或评论里有没有…」是正文的题: 提到了 正文 / 标题 / 全文 的不算只问评论。scope 标了 title / body 的也不算 ——
+    那是编译时就指明只看标题 / 正文的题, 题面里的「话题」「标签」不是话题行。"""
+    res = _questions_result(mid(1), "0" * 12, Q_BODY_OR_COMMENT, Q_BODY, Q_TITLE_HOOK,
+                            {"ask": "标题有没有话题钩子？", "pass_if": "是", "scope": "full"},
+                            {"ask": "全文(含评论)有没有出现示例禁词？", "pass_if": "否", "scope": "full"})
+    assert rulecompile.unseen_questions(res) == []
+
+
+def test_unseen_questions_ignores_results_it_cannot_read():
+    code = code_result(mid(1), "0" * 12, {"kind": "forbidden_word", "words": ["示例词"], "where": "comments"})
+    assert rulecompile.unseen_questions(code) == [], "code 那边由 code_rules 按 where 拦"
+    assert rulecompile.unseen_questions(None) == [] and rulecompile.unseen_questions({"verdict": "questions"}) == []
+    bad = _questions_result(mid(1), "0" * 12, Q_COMMENT)
+    bad["questions"] += ["不是题", {"qid": "x", "ask": None}]
+    assert rulecompile.unseen_questions(bad) == [bad["questions"][0]], "形状不对的题不归这里管(project_bank 会跳过并记下)"
+    assert rulecompile.unseen_questions(dict(bad, error="模型输出不合格")) == []
+
+
+def test_read_answers_keeps_one_flag_per_rule_and_prefers_the_one_with_evidence():
+    """一条规则编成两道意思相近的题, 两道都没守住: 只报一条, 留带依据句的那条(2026-11-11, 审计 JP-6)。"""
+    qs = {"a_1": {"rule_id": "r1", "severity": "soft", "ask": "有没有写出时长？", "pass_if": "是", "note": ""},
+          "a_2": {"rule_id": "r1", "severity": "soft", "ask": "有没有把时长写得含糊？", "pass_if": "否", "note": ""},
+          "b_1": {"rule_id": "r2", "severity": "hard", "ask": "有没有写示例宣称？", "pass_if": "否", "note": ""}}
+    got = rulecompile.read_answers(qs, {
+        "a_1": {"answer": "否", "p": 0.9, "ambiguous": False},
+        "a_2": {"answer": "是", "p": 0.8, "ambiguous": False, "evidence": "过了一阵子就好了。"},
+        "b_1": {"answer": "是", "p": 0.95, "ambiguous": False, "evidence": "这是一句示例宣称。"}})
+    assert [(e["rule_id"], e.get("evidence")) for e in got["violations"]] == [
+        ("r1", "过了一阵子就好了。"), ("r2", "这是一句示例宣称。")]
+    # 都不带依据句: 留先出现的那条
+    got = rulecompile.read_answers(qs, {"a_1": {"answer": "否", "p": 0.9, "ambiguous": False},
+                                        "a_2": {"answer": "是", "p": 0.8, "ambiguous": False}})
+    assert [e["what"] for e in got["violations"]] == ["建议改: 有没有写出时长？(判了「否」)"]
+
+
+def test_read_answers_marks_which_way_an_unsure_answer_leans():
+    qs = {"a_1": {"rule_id": "r1", "severity": "soft", "ask": "有没有写出时长？", "pass_if": "是", "note": "写出时长"},
+          "b_1": {"rule_id": "r2", "severity": "hard", "ask": "有没有写示例宣称？", "pass_if": "否", "note": ""}}
+    got = rulecompile.read_answers(qs, {"a_1": {"answer": "是", "p": 0.6, "ambiguous": False},
+                                        "b_1": {"answer": "是", "p": 0.55, "ambiguous": True}})
+    assert [(e["rule_id"], e["violated"], e["point"]) for e in got["unsure"]] == [
+        ("r1", False, "写出时长"), ("r2", True, "有没有写示例宣称？")]

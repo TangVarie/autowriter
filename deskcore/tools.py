@@ -915,8 +915,9 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
     有它就照 ``next_step`` 接着再调一次、传它(``tactic`` 照样带), 直到返回里没有它; 不是这个项目的稿子不查(列在
     ``excluded`` 里)。规则由 Jev 事先编成「是非题」和「代码检查」两种, 这里只用编好的; 还没有编译结果的规则这次查不了,
     数在 ``uncompiled_rules`` 里(``next_step`` 说为什么: 后台在编 / 这个项目编不了 / Jev 最近编译超时 / 上次编失败)
-    —— 不用等, 也不用重试。要看话题 / 评论的规则这里查不了(这两样不随稿子存), 数在 ``rules.code_unavailable``; 编不了
-    (原文超过 Jev 的上限之类)的数在 ``rules.not_compilable``, 编出来的检查不安全没跑的数在 ``rules.code_refused``,
+    —— 不用等, 也不用重试。要看话题 / 评论的规则这里查不了(这两样不随稿子存; 只问评论 / 话题的规则题也不问), 数在
+    ``rules.code_unavailable``; 编不了(原文超过 Jev 的上限之类)的数在 ``rules.not_compilable``, 编出来的检查不安全
+    没跑的数在 ``rules.code_refused``,
     只查了一部分的(编译时就没全装进去, 或者只有一部分要看话题 / 评论、只查了标题正文那一半)数在 ``rules.partial``,
     用 record_rule 撤掉了代码检查、Jev 又只编成了代码检查(没有规则题)的数在 ``rules.code_withdrawn`` —— 这几种都
     **不能说(整条)守住了**。人手设过 check 的数在 ``rules.by_score_drafts``: score_drafts 存档时已经按它查过(那边
@@ -928,16 +929,18 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
         查的)/ ``p``(Jev 的把握)/ ``evidence``(Jev 指出的那一句, 有才带)。``what`` 以「必须改」开头的是硬约束:
         照着改(参考分查出合规问题的那几篇也在这一轮一起改), 改完那几篇带 ``replaces_version_id`` 先过 check_drafts、
         再用 score_drafts 存一次, 交付时一句话说清改了哪里; 改一轮就够, 不用再调本工具;
-        以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。
-      · ``unsure``: Jev 拿不准的(``what`` 以「拿不准」开头), 不算没守住, 提一句就行, 不用改。
-      · 每篇必须改全列, 建议改补到 ``violations`` 一共 12 条为止, ``unsure`` 最多列 5 条; ``more`` 是这篇没列出来的条数
+        以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。同一条规则在一篇里只列一条。
+      · 每篇必须改全列, 建议改补到 ``violations`` 一共 12 条为止; ``more`` 是这篇没列出来的建议改条数
         (``summary.more`` 是全部篇加起来的), 有就如实告诉用户还有这么多条没列。
+      · 拿不准(Jev 判不准, 不算没守住): 每篇只有条数 ``counts.unsure``, 不逐条列; ``summary.unsure`` 是全部篇加起来的。
+        最外层的 ``unsure_rules``(有才带, 最多 3 条)是其中偏向没守住的那几条规则, 每条 ``rule_id`` / ``severity`` /
+        ``what``(以「拿不准」开头)/ ``drafts``(这次有几篇在它上面偏向没守住)。整批提一句就行, 不用改, 也不用逐篇说。
       · ``judge_status`` 不是 ok 的那篇(``judge_note`` 说原因, 比如「没判完」「一道都没判出来」「正文是空的」)规则题这次
         没判成, **不能说它守住了规则**; 不用重试。代码查出来的 ``violations`` 照样有效。正文是空的那几篇另数在
         ``summary.empty_body``。
-      · ``judge_status`` 是 ok、但 ``counts.unjudged`` 不是 0 的: 那几道题 Jev 没判出来(``unjudged`` 列着规则 id 和原因,
-        比如 evidence_not_found = 判了「是」却指不出是哪一句, 不算没守住), 那几条**也不能说守住了**。``summary.unjudged``
-        是全部篇加起来的题数。
+      · ``judge_status`` 是 ok、但 ``counts.unjudged`` 不是 0 的: 那几道题 Jev 没判出来(只有题数, 不逐条列), 那几条
+        **也不能说守住了**。``summary.unjudged`` 是全部篇加起来的题数; 其中 ``summary.evidence_not_found``(有才带)那几道是
+        Jev 怀疑有问题、却指不出是哪一句: 不算没守住, 不用改。
       · ``code_unchecked``: 代码查的正则这次没在时限内查完(或者限时的引擎跑不了它)的规则, 每条 ``rule_id`` / ``severity`` /
         ``rule``(规则原文)。没查完的那部分不是违规, 也**不能说那几条守住了**; 同一篇里同一条已经列在 ``violations`` 的
         (先查到了命中、后面才没查完)照改; hard 的照原文自己核一遍, 不用重试。``summary.code_unchecked``

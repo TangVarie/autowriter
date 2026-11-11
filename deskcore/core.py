@@ -8499,12 +8499,17 @@ CHECK_RULES_WORKERS = 4
 # 每篇列几条: 必须改全列, 建议改补到一共这么多条为止, 其余报条数(返回值太长会把协议挤出注意力)。必须改不截, 同
 # rulecheck.top_hits(codex review on aw#115): 截掉的只剩个数, 写手不知道是哪条, 会当没问题交出去
 CHECK_RULES_MAX_LISTED = 12
-CHECK_RULES_MAX_UNSURE = 5
+CHECK_RULES_MAX_UNSURE = 5                  # rules.partial_rules 最多列几条
+# 拿不准 / 没判出来的不再逐篇列(2026-11-11, 审计 F1 / JP-6): 11-11 线上一篇平均 5.0 条拿不准(四分之三偏向守住)、2.9 道
+# 没判出来, 都是不用改的, 10 篇的回包一万两三千字里大半是它们。每篇只留条数(counts), 整次在最外层的 unsure_rules 里列
+# 偏向没守住的那几条规则, 最多这么多条。代价: 回包里看不出是哪一篇拿不准。
+CHECK_RULES_MAX_UNSURE_RULES = 3
 _CHECK_RULES_TITLE_CHARS = 40
 _CHECK_RULES_UNCOVERED_CHARS = 80
 CHECK_RULES_NOTE = ("规则检查只是建议, 不拦交付, 存档已经成功了。必须改 = 硬约束没守住(照着改, 改完那几篇带 "
                     "replaces_version_id 先过 check_drafts、再用 score_drafts 存一次); 建议改 = 软规则, 告诉用户, 改不改"
-                    "由用户定; 拿不准 = Jev 判不准, 提一句就行, 不用改。judge_status 不是 ok 的那几篇是没判完, 不能说它们"
+                    "由用户定; 拿不准 = Jev 判不准, 每篇只报条数(counts.unsure), 偏向没守住的那几条规则列在最外层的 unsure_rules "
+                    "(最多 3 条), 提一句就行, 不用改。judge_status 不是 ok 的那几篇是没判完, 不能说它们"
                     "守住了规则; judge_status 是 ok 的篇里, counts.unjudged 数到的那几道规则题也没判出来, 同样不能说守住了。")
 
 
@@ -8624,7 +8629,8 @@ def _questions_unchecked_tip(n: int) -> str:
 
 def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str = "",
                            code_unavailable: int = 0, not_compilable: int = 0, code_refused: int = 0,
-                           partial: int = 0, code_withdrawn: int = 0, questions_unchecked: int = 0) -> str:
+                           partial: int = 0, code_withdrawn: int = 0, questions_unchecked: int = 0,
+                           unsure_rules: int = 0) -> str:
     tips = []
     if summary.get("must_fix"):
         tips.append("「必须改」的照 what / evidence 改完(参考分查出合规问题的那几篇也在这一轮一起改), 那几篇带 replaces_version_id "
@@ -8632,19 +8638,28 @@ def _check_rules_next_step(summary: dict, uncompiled: int, uncompiled_why: str =
     if summary.get("suggest"):
         tips.append("「建议改」的告诉用户, 改不改由用户定。")
     if summary.get("unsure"):
-        tips.append("「拿不准」的提一句就行, 不用改。")
+        # 一句话带上数(2026-11-11): 拿不准的不逐篇列了, 模型只要知道有多少处、提一句
+        across = f"(涉及 {unsure_rules} 条规则)" if unsure_rules else ""
+        tips.append(f"有 {summary['unsure']} 处「拿不准」{across}, 提一句就行, 不用改。")
     if summary.get("more"):
-        # 每篇只列一部分(必须改全列, 建议改补到 12 条, 拿不准最多 5 条), 原来截掉的只剩每篇的 more, next_step 一字不提,
-        # 写手照列出来的说完就算了(同 score_drafts 的 RULE_CHECKS_MORE_NEXT_STEP; 独立复审 on aw E)
-        tips.append(f"还有 {summary['more']} 条建议改 / 拿不准没列出来(必须改的全列了; 每篇没列的条数在 more 里): "
+        # 每篇只列一部分(必须改全列, 建议改补到 12 条), 原来截掉的只剩每篇的 more, next_step 一字不提,
+        # 写手照列出来的说完就算了(同 score_drafts 的 RULE_CHECKS_MORE_NEXT_STEP; 独立复审 on aw E)。
+        # 2026-11-11: 拿不准的不列也不算进 more(原来一篇平均 5 条、上限 5 条, more 几乎次次不是 0)
+        tips.append(f"还有 {summary['more']} 条建议改没列出来(必须改的全列了; 每篇没列的条数在 more 里): "
                     "如实告诉用户还有这么多条没列。")
     if summary.get("not_finished"):
         tips.append(f"有 {summary['not_finished']} 篇的规则题这次没判完, 不能说它们守住了规则; 不用重试。")
     if summary.get("empty_body"):
         # 空正文那篇不发 Jev, 标题上的题、「正文要带…」的题都没判: 不算没判完, 但也不能算守住了(独立复审 on aw E)
         tips.append(f"有 {summary['empty_body']} 篇正文是空的, 规则题没判, 不能说它们守住了规则。")
-    if summary.get("unjudged"):
-        tips.append(f"另有 {summary['unjudged']} 道规则题这次没判出来(Jev 回包缺题或判不了), 那几条不能说守住了; 不用重试。")
+    # 没判出来的分两种说(2026-11-11, 审计 S5 / JP-4): evidence_not_found 是 Jev 答了「有问题」却指不出是哪一句(线上
+    # 没判出来的全是这一种), 没有一句可改, 也不是回包缺了什么; 原来和缺题混成一句「没判出来…不用重试」。数还是都在
+    # summary.unjudged / counts.unjudged 里(协议 5a 认的是它), 两种都不说成守住了。
+    unlocated = int(summary.get("evidence_not_found") or 0)
+    if unlocated:
+        tips.append(f"另有 {unlocated} 道规则题 Jev 怀疑有问题、但指不出是哪一句: 不算没守住(也不说成守住了), 不用改。")
+    if int(summary.get("unjudged") or 0) - unlocated > 0:
+        tips.append(f"另有 {summary['unjudged'] - unlocated} 道规则题这次没判出来(Jev 回包缺题或判不了), 那几条不能说守住了; 不用重试。")
     if uncompiled:
         tips.append(f"还有 {uncompiled} 条规则还没有编译结果({uncompiled_why}), 这次没查; 不用等, 下一批再说。")
     if code_unavailable:
@@ -8724,7 +8739,9 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     3. 规则题: 编出来的 questions 拼成内联项目题库, 每篇单独发一次 /judge_draft(banks=[]、不判段、write=true、
        run_tag=shadow-rules), 最多 4 路并行, 整次共用 JUDGE_DRAFT_TOOL_TIMEOUT_SEC(默认 18 秒)的截止 —— 到点没回来的
        记「没判完」, 绝不算守住; 回来了但一道题都没判出来的(回包没有 desk_rules / 每题都带 invalid_reason)同样记没判完,
-       判出了一部分的, 没判出来的题数进 ``counts.unjudged`` / ``summary.unjudged``(2026-10-20 复审);
+       判出了一部分的, 没判出来的题数进 ``counts.unjudged`` / ``summary.unjudged``(2026-10-20 复审)。只问评论 / 话题的题
+       不发(rulecompile.unseen_questions; 版本行里没存这两样): 题全是这种的规则数进 ``rules.code_unavailable``, 有一部分是的
+       数进 ``rules.partial``(2026-11-11);
     4. 代码查: 编出来的 code 交给 rulecheck, 只跑没有人手设过 check 的规则(人设的 score_drafts 已经查过); 只看话题 /
        评论的不跑(版本行里没存这两样), 数进 ``rules.code_unavailable``; 不安全 / 形状不对没跑的数进 ``rules.code_refused``,
        不算进 ``rules.by_code``。编不了的(原文超过 Jev 的字段上限之类)数进 ``rules.not_compilable``。这三种和没编译结果的
@@ -8734,6 +8751,10 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
 
     ``version_ids`` 一次查前 CHECK_RULES_MAX_VERSIONS 个(去重之后), 多出来的原样放进 ``remaining_version_ids``、next_step
     让再调一次(2026-10-20 第二轮复审: score_drafts 一批不限篇数, 原来超过上限整次报错, 写手照协议说规则没查成)。
+
+    回包只逐条列要动手的(2026-11-11): 每篇 ``violations``(同一条规则一篇只留一条, rulecompile.one_per_rule)和 ``counts``;
+    拿不准 / 没判出来的每篇只有条数, 偏向没守住的拿不准按规则汇成最外层的 ``unsure_rules``(最多
+    CHECK_RULES_MAX_UNSURE_RULES 条)。_recheck_digest 读的 ``counts`` / ``summary`` / ``violations[].rule_id`` 都还在。
     """
     started = time.monotonic()
     project = assert_project_access(client, project_id, user_id=user_id)
@@ -8810,12 +8831,36 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
             missing.append((mid, sha))
     uncompiled = len(missing)
 
+    # 只问评论 / 话题的规则题不发(2026-11-11, 审计 S2 / JP-1; rulecompile.unseen_questions): 发给 Jev 的只有标题和正文,
+    # 这种题是对着一篇没有评论的稿子答的 —— 11-11 一个项目的一道题让 15 篇里 15 篇报了「必须改」, 改过重存的 5 篇照报。
+    # 在拼题库之前拿掉(project_bank 是 Jev 那边的移植, 不能在里面筛)。题全被拿掉的那条和「编出来的 code 只看话题 / 评论」
+    # 一样算查不了(rules.code_unavailable), 拿掉一部分的算只查了一部分(rules.partial), 都不说它(整条)守住了。
+    q_pairs: list[tuple[dict, dict]] = []
+    lost_all: set[str] = set()
+    lost_some: set[str] = set()
+    unseen_qids: list[str] = []
+    for r, res in pairs:
+        unseen = rulecompile.unseen_questions(res)
+        if not unseen:
+            q_pairs.append((r, res))
+            continue
+        unseen_qids += [str(q.get("qid")) for q in unseen]
+        kept = [q for q in res["questions"] if not any(q is u for u in unseen)]
+        if kept:
+            lost_some.add(str(r.get("id")))
+            q_pairs.append((r, {**res, "questions": kept}))
+        else:
+            lost_all.add(str(r.get("id")))
+    if unseen_qids:
+        logger.info("check_rules: 项目 %s 有 %d 道规则题只问评论 / 话题(不随稿子存), 这次不发: %s",
+                    project_id, len(unseen_qids), unseen_qids)
+
     skipped_questions: set[str] = set()
     # 每组(没标贴型 / 产品向那一族 / 流量向那一族)一份题库: 这一组的稿子只问管它的规则。没标贴型时只有一组, 就是原来那一份
     banks: dict = {}
     q_by_group: dict = {}
     for g in (dict.fromkeys(t_groups) if targets else (None,)):
-        pairs_g = [(r, res) for r, res in pairs if rule_applies_to_layer(r, _GROUP_LAYER.get(g), direction)]
+        pairs_g = [(r, res) for r, res in q_pairs if rule_applies_to_layer(r, _GROUP_LAYER.get(g), direction)]
         banks[g] = rulecompile.project_bank([res for _, res in pairs_g], skipped=skipped_questions)
         q_by_group[g] = rulecompile.question_index(pairs_g, banks[g])
     questions = {qid: q for qs in q_by_group.values() for qid, q in qs.items()}
@@ -8853,11 +8898,19 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     # 编出来的 where 里混着话题 / 评论、只跑了标题 / 正文那一半的(code_rules 的 stripped)也算(独立复审 on aw E)
     used = judged | {str(r.get("id")) for r in runnable}
     stripped = {str(r.get("id")): r["stripped"] for r in runnable if r.get("stripped")}
+    # 拿掉了只问评论 / 话题的题、这次还是查了一部分的(剩下的题发了, 或者题全拿掉了但编出来的 code 照跑了标题 / 正文): 只查了
+    # 一部分。题全拿掉、别的也没查它的: 查不了, 和 code 只看话题 / 评论的并成一个集合(两边都沾的那条只数一次)
+    q_dropped = (lost_some | lost_all) & used
+    code_unavailable = set(code_unavailable) | (lost_all - used)
     partial = [(str(r.get("id")), res) for r, res in pairs
-               if str(r.get("id")) in used and (res.get("coverage") == "partial" or str(r.get("id")) in stripped)]
+               if str(r.get("id")) in used and (res.get("coverage") == "partial" or str(r.get("id")) in stripped
+                                                or str(r.get("id")) in q_dropped)]
     if partial:
         def _uncovered(rid: str, res: dict) -> str:
-            bits = [str(res.get("uncovered") or "").strip()] if res.get("coverage") == "partial" else []
+            # 没问的题放最前: uncovered 是 Jev 写的一段话, 长了会把后面的挤出 _CHECK_RULES_UNCOVERED_CHARS
+            bits = ["只问评论 / 话题的规则题没问(不随稿子存)"] if rid in q_dropped else []
+            if res.get("coverage") == "partial":
+                bits.append(str(res.get("uncovered") or "").strip())
             if rid in stripped:
                 bits.append("、".join(rulecheck.PART_CN.get(w, w) for w in stripped[rid]) + "那部分没查(不随稿子存)")
             return "; ".join(b for b in bits if b)[:_CHECK_RULES_UNCOVERED_CHARS]
@@ -9014,6 +9067,8 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     versions = []
     ledger_errors: list[str] = []
     summary = {"versions": len(targets), "must_fix": 0, "suggest": 0, "unsure": 0, "not_finished": 0, "unjudged": 0}
+    unsure_seen: set[str] = set()           # 有拿不准答案的规则(不管偏向哪边): next_step 那句「涉及 M 条规则」
+    unsure_lean: dict[str, dict] = {}       # 其中偏向没守住的: 规则 id → 列进 unsure_rules 的那一条
     for i, (vid, v) in enumerate(targets):
         row: dict = {"version_id": vid, "title": (v["title"] or "")[:_CHECK_RULES_TITLE_CHARS]}
         if vlayers.get(vid) and any(t_groups):
@@ -9044,6 +9099,10 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                 unsure = got["unsure"]
                 unjudged = got["unjudged"]
                 summary["unjudged"] += len(unjudged)
+                unlocated = sum(1 for u in unjudged if u["reason"] == "evidence_not_found")
+                if unlocated:
+                    # Jev 答了「有问题」却指不出是哪一句的: 仍在 unjudged 里, 另记一个数, next_step 分开说(见那边)
+                    summary["evidence_not_found"] = summary.get("evidence_not_found", 0) + unlocated
                 if unjudged and len(unjudged) == len(q_row):
                     # 回来了, 却一道题都没判出来(回包里没有 desk_rules / 每题都带 invalid_reason): 和没判完一样, 不能当
                     # 守住了(2026-10-20 复审: 原来这里只记个数, summary 不看它, next_step 照说「都守住了」)
@@ -9053,8 +9112,6 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
                         "Jev 标了判不了: " + "、".join(sorted({u["reason"] for u in unjudged}))
                     ) + "), 不能当作守住了规则")
                     summary["not_finished"] += 1
-                if unjudged:
-                    row["unjudged"] = unjudged[:CHECK_RULES_MAX_UNSURE]
             else:
                 row["judge_note"] = ("没判完: 这一篇的规则题这次没在时限内判完, 不能当作守住了规则"
                                      if status == judge_client.JUDGE_TIMEOUT else
@@ -9077,8 +9134,15 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
         found_v.sort(key=lambda e: e["severity"] != "hard")
         must = sum(1 for e in found_v if e["severity"] == "hard")
         row["violations"] = found_v[:max(must, CHECK_RULES_MAX_LISTED)]      # 必须改在前, 全列
-        row["unsure"] = unsure[:CHECK_RULES_MAX_UNSURE]
-        more = len(found_v) - len(row["violations"]) + len(unsure) - len(row["unsure"])
+        # 拿不准 / 没判出来的每篇只留条数(counts), 不逐条列(见 CHECK_RULES_MAX_UNSURE_RULES 上面那段); more 只数没列出来的
+        # 建议改。偏向没守住的拿不准按规则汇到最外层的 unsure_rules: 一条规则一行, drafts 是这次有几篇在它上面拿不准、偏向没守住
+        unsure_seen.update(e["rule_id"] for e in unsure)
+        for rid in dict.fromkeys(e["rule_id"] for e in unsure if e["violated"]):
+            first = next(e for e in unsure if e["violated"] and e["rule_id"] == rid)
+            agg = unsure_lean.setdefault(rid, {"rule_id": rid, "severity": first["severity"],
+                                               "what": f"{rulecompile.UNSURE_LABEL}: {first['point']}", "drafts": 0})
+            agg["drafts"] += 1
+        more = len(found_v) - len(row["violations"])
         if more:
             row["more"] = more
             summary["more"] = summary.get("more", 0) + more             # next_step 要说还有这么多条没列(独立复审 on aw E)
@@ -9100,11 +9164,15 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     out["status"] = "checked"
     out["versions"] = versions
     out["summary"] = summary
+    if unsure_lean:
+        # 硬约束的排前面, 再按篇数多的; 只列这几条, 其余的拿不准只在 counts / summary 里有数
+        out["unsure_rules"] = sorted(unsure_lean.values(), key=lambda e: (e["severity"] != "hard", -e["drafts"])
+                                     )[:CHECK_RULES_MAX_UNSURE_RULES]
     if jev_detail:
         out["judge_detail"] = mask_secrets(str(jev_detail))[:_JUDGE_BLOCK_TEXT_MAX]
     out["next_step"] = _check_rules_next_step(summary, uncompiled, uncompiled_why, len(code_unavailable),
                                               not_compilable, rules_info.get("code_refused", 0), len(partial),
-                                              code_withdrawn, len(skipped_questions))
+                                              code_withdrawn, len(skipped_questions), len(unsure_seen))
     if rest:
         out["next_step"] += _check_rules_remaining_step(rest)
     out["elapsed_ms"] = _ms_since(started)
