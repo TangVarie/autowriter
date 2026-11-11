@@ -216,8 +216,8 @@ JUDGE_DRAFT_TOOL_TIMEOUT_SEC: float = _bounded_number("JUDGE_DRAFT_TOOL_TIMEOUT_
 # TV 侧 flywheel_librarian_cache.select_ms 实测: 09-22 冷借 13 次里 12 次 >22 秒、6 次 >60 秒;
 # 那之后写作台周产量 175 → 16 → 0。所以 open_project 里的借阅只等这么久: 到点就把简报先
 # 交出去(lessons_status.status=timeout), 借阅线程继续跑完、TV 那边照样写缓存, 模型想要卡
-# 时调 borrow_lessons 同参数命中缓存即回。borrow_lessons 工具本身仍等满 LIBRARIAN_TIMEOUT_SEC
-# (那是写手明确要卡时的等待, 不在必经路径上)。上限 20: 必须留在 ~22 秒客户端容忍之内。
+# 时调 borrow_lessons 同参数命中缓存即回。borrow_lessons 工具自己的等待上限见下面 BORROW_LESSONS_WAIT_SEC
+# (2026-11-11 之前它等满 LIBRARIAN_TIMEOUT_SEC)。上限 20: 必须留在 ~22 秒客户端容忍之内。
 # 2026-10-30 发布收尾: 默认 10 → 15 秒。最近几次冷借 14~18 秒, 10 秒的预算让简报常常不带卡、叫模型"稍后再调"。
 # 15 秒放得下, 是因为借阅实际等的不是这个数本身, 而是 min(本值, 下面的回包目标 − 借阅之前已用 − 借阅之后的预留)
 # (core._brief_borrow_budget, 同 commit_drafts 给判定算截止的办法)。账这样算(open_project 里借阅之外的几步):
@@ -231,6 +231,13 @@ OPEN_PROJECT_BORROW_SEC: float = _bounded_number("OPEN_PROJECT_BORROW_SEC", 15.0
 # open_project 整次的回包目标, 同 COMMIT_RESPONSE_BUDGET_SEC(20 = 客户端 ~22 秒留 2 秒余量; 不开 env, 要改先看实测)。
 # 借阅只拿它扣掉"借阅之前已用"和"借阅之后的预留"剩下的那段, 不够 0 就一秒都不等(借阅线程照样起, TV 那边照样写缓存)。
 OPEN_PROJECT_RESPONSE_BUDGET_SEC: float = 20.0
+# ── borrow_lessons 自己等多久(2026-11-11, 审计 A3; HANDOFF F-04 剩下的那一半)──────────────
+# 它原来等满 LIBRARIAN_TIMEOUT_SEC(60 秒), 客户端约 22 秒就断: 冷选卡慢的那几场(11-05 起 5 次超过 22 秒, 最长 60 秒),
+# 模型照简报里那句话来补借, 等到的是一次被掐断的调用, 不是「卡还没好」。现在最多等这么久, 到点回 status=timeout 和一句
+# 「卡还在选, 这次照常写, 不用再调」(core.BORROW_STILL_SELECTING_NOTE); 选卡那一头不取消, 选完照样进 TV 的缓存。
+# 18 = 22 留出进门的归属校验(1 次库往返)和回包; 同 JUDGE_DRAFT_TOOL_TIMEOUT_SEC 的取法, 上限夹 20。
+# 馆员那次请求自己的超时还是 LIBRARIAN_TIMEOUT_SEC —— 后台那次选卡要跑得完, 那个数不能跟着改小。
+BORROW_LESSONS_WAIT_SEC: float = _bounded_number("BORROW_LESSONS_WAIT_SEC", 18.0, 1.0, 20.0)
 # 一次 commit 里最多同时发几篇。judge 那边 /judge_draft 一篇一请求、由 uvicorn 线程池并发;
 # Jev 限流 1,200 次/分。一篇 2~4 次 Jev 调用, 8 路并发 ≈ 每秒十来次, 离限流很远。
 JUDGE_MAX_WORKERS: int = int(_bounded_number("JUDGE_MAX_WORKERS", 8, 1, 16))

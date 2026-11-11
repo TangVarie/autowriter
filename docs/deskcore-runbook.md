@@ -924,6 +924,10 @@ curl -sS -X POST "$DESKCORE_URL/tool/borrow_lessons" \
 # embedding 真的取得到 —— 看 backfill 的返回, 见第 2 步
 ```
 
+> 2026-11-11 起 `borrow_lessons` 最多等 `BORROW_LESSONS_WAIT_SEC`（默认 18 秒，`docs/deskcore.md` §3.24）。馆员冷的时候这一探
+> 可能回 `status: timeout`、`detail` 是「卡还在选…」：那不是不通，选卡还在后台跑。隔半分钟原样再发一次，回的就是选好的卡
+> （馆员的缓存）；`error` / `not_configured` 才是要查的。
+
 ### 第 2 步 · 回填历史指纹 ✅ **已完成（2026-08-26，见 §1.5）**
 
 > 当前生产库这一步已经做完了。下面这段留着是给**下一套库**用的——口径、坑和验证方式都在这儿。

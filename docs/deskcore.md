@@ -167,7 +167,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1）。2026-10-30 起归档的项目默认不列，`include_archived=true` 才列（见 §3.13） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`，以及最近的稿子在哪几处都写成一个样子 `recent_structure`（都是 2026-10-20，见 §3.1） |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block`（2026-10-30 起每篇那行带完整的 `angle_key`：「第1篇 [angle_key=…]」，模型照着贴进 `check_drafts` / `score_drafts`，不再自己编） |
-| | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
+| | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`）。最多等 `BORROW_LESSONS_WAIT_SEC`（默认 18 秒），`open_project` 起的那次选卡还在跑就等它，不再发第二次（§3.24） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比。改的是已经存过的那篇时带 `replaces_version_id`（2026-10-30，同 `score_drafts` 的字段、同一套核对 `_lookup_replacements`）：旧 item 全部版本的指纹不算它的对手，别的稿子照常比；**仍然只读**，不摘指纹。库里那一路（`deskcore_check_drafts`）每路只回最像的一条的标题、排除不了哪几行，不加迁移的做法是在 Python 里补（`_without_own_versions`）：先拿旧版那几行逐路比，库里回的命中比得过它们就是别的稿子、照用；比不过的那一路在去掉旧版之后的历史上重比——开头按哈希点查，标题语义 / 四字串把项目指纹拉回来再比（只拉要比的列，只给改稿那几篇）。被旧版挡在后面的别的稿子照样拦。id 对不上判 reject、`gate="replace_lookup"`。原来不认这个字段，改稿一查就被自己的旧版拦下（「正文开头与历史稿完全一致」），`archive_pending` 那句才叫模型改稿时跳过查重 |
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
@@ -665,9 +665,11 @@ select dims->>'emotional_lever' as lever, count(*) as published,
 **存档那一行多三小块（同日，审计 A3 / A8 / A5）。** 都只有数和固定的词，只进 `meta`、不进回包，哪一块算不出来就不带哪一块：
 
 - `flywheel_lessons`：这个（项目，身份）近 12 小时借卡的情况。`borrows` 借了几次（0 = 没借过或进程重启过，不知道）；
-  `shown` / `status` 是最近一次带出去几张经验卡、什么结局（`borrowed` / `empty` / `timeout` / `error` / `not_configured`）；
+  `shown` / `status` 是最近一次带出去几张经验卡、什么结局（`borrowed` / `empty` / `timeout` / `error` / `not_configured`，
+  另有只在这一行出现的 `followup_timeout`：`borrow_lessons` 自己等到点卡还没选完，§3.24；回包里那次的 `status` 还是 `timeout`）；
   `shown_max` 是最多的一次几张；`statuses` 是各种结局各几次。记的是简报实际带出去的那一份（超时 = 0，后台之后选完的不算）。
-  团队共用一个身份时分不出是哪一场借的：`shown_max = 0` 才能确定这一批没参照过卡。
+  团队共用一个身份时分不出是哪一场借的：`shown_max = 0` 才能确定这一批没参照过卡。`statuses` 里同时有 `timeout` 和
+  `followup_timeout` = 简报没等到、补借也没等到。
 - `skill_versions`：近 24 小时报上来的 skill 版本构成（`skillcheck.health`，同 `/skill-versions`）：`current`、
   `up_to_date` / `outdated` / `unknown` 各几个、`outdated_versions`（旧版各是哪一版；认不出 12 位十六进制的并进 `other`）。
   数的是「身份 × 版本」，读作有几种版本在用，不是人数。原来只在进程内存里、要带 key 读、重新部署就清零。
@@ -742,6 +744,7 @@ select (created_at at time zone 'Asia/Shanghai')::date as day, meta->>'tool' as 
 select count(*) as commits,
        count(*) filter (where (meta->'flywheel_lessons'->>'borrows')::int > 0) as borrow_known,
        count(*) filter (where (meta->'flywheel_lessons'->>'shown_max')::int = 0) as no_cards,
+       count(*) filter (where (meta->'flywheel_lessons'->'statuses'->>'followup_timeout')::int > 0) as followup_timed_out,
        count(*) filter (where (meta->'skill_versions'->>'outdated')::int > 0) as with_outdated_skill,
        count(*) filter (where (meta->'rule_compile'->>'uncompiled')::int > 0) as with_uncompiled_rules
   from autowriter.batch_metrics
@@ -1113,7 +1116,8 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
 失败时规律照样回来，`librarian_client` 原来在看 `patterns` 之前就按降级返回了。现在降级 / `error` 时卡照旧是空的、结局照旧
 `error`，规律照样交给模型。另外借卡交出去之后把**实际给出去几条规律**记在发出去的那个臂旁边（进程内存 `_patterns_shown`，
 同 `_borrowed_arms` 的取舍）：`open_project` 记简报里带的条数（超时 / 借阅线程起不来 = 0，后台线程之后选完了也不算），
-`borrow_lessons` 记这次给的条数，原样传回简报里的臂（同一场接着借）就和前面那次取大的。入库时 `batch_arm` 第四项取出来，
+`borrow_lessons` 记这次给的条数（2026-11-11 起它也限时，到点没等到 = 这次 0 条，§3.24），原样传回简报里的臂（同一场接着借）
+就和前面那次取大的。入库时 `batch_arm` 第四项取出来，
 写进 `batches.params.flywheel_patterns_shown` 和 `batch_metrics.meta.flywheel_patterns_shown`：整数 = 给出去几条（explore 臂
 是 0）；`null` = 服务端不知道（重启过、按入库时重算的臂、记下的那次借卡和最近一次发臂对不上）；没有这个键 = F13 之前的批次。
 臂怎么分一点没变。分析 L-07 / G-05 时 patterns 臂只算 `flywheel_patterns_shown > 0` 的，0 和 `null` 单列一组。W-38 查重底稿
@@ -1537,6 +1541,54 @@ auth rejected: reason=invalid_ellipsis path=/mcp/ via=header len=9 flags=ellipsi
 
 回归：`tests/test_auth_rejection_diagnostics.py`（每一项怎么判、那一句原文、只看发来的那一串、去首尾空白和不替对方改的几样、原因和计数、日志那一行；复审 11-11：配置里带「…」的钥匙哪种写法都对不上、配置写坏时固定的一句和只报位置）、`tests/test_auth_rejection_http.py`（REST 和 MCP 两条路同一份、`/health` 的计数里没有钥匙、日志；复审 11-11 的两条也各走了一遍 HTTP）。运维怎么用见 runbook「连不上时按这个顺序查」。
 
+### 3.24 借卡：`borrow_lessons` 也限时，并到 `open_project` 起的那次选卡上（2026-11-11，审计 A3；F-04 / AU-F09 写作台这一半）
+
+**为什么。** `open_project` 随简报借卡最多等 15 秒，到点先交简报，叫模型动笔之前用同样的参数调一次 `borrow_lessons`。
+可是 `borrow_lessons` 原来直接调借阅体，等满 `LIBRARIAN_TIMEOUT_SEC`（60 秒），客户端约 22 秒就断；它也不知道
+`open_project` 那次选卡还在后台跑，又向馆员发一次，馆员那头第一次还没写缓存，第二次就再跑一遍模型选卡。
+`truth_vault.flywheel_librarian_cache.select_ms`：10-20 以来 31 次冷选卡，14 次超过 15 秒；11-05 以来 5 次超过 22 秒
+（28.7 / 60.4 / 46.1 / 45.2 / 22.7 秒）。F-04 / AU-F09 写的触发条件是「两周内第二次冷借超过 22 秒」，早就到了。
+能确认没拿到卡的只有 11-09 一批（3 篇）；更常见的是补借那一次被客户端掐断，或者白跑第二次选卡。
+
+**现在。** 协议没动（`timeout` 时「只调这一次，还没有就照常写」原来就写着），写手和 owner 都不用做事。
+
+1. **`borrow_lessons` 最多等 `BORROW_LESSONS_WAIT_SEC`**（默认 18 秒，夹在 1–20，§4.1 的表）。走的是 `open_project` 用的那一层
+   `core._borrow_for_brief_bounded`，多了三个参数：`arm=`（`borrow_lessons` 已经定好的臂，沿用模型传回的那个；这一层不再发
+   一次臂）、`carry=`（同一场接着借，记规律条数时和前面那次取大的，§3.12）、`followup=`（到点时回哪一句、指标里记哪个名字）。
+   分臂和规律条数那套账还是原来那两笔、原来的顺序；只多一种情形：到点没等到 = 这次交出去 0 条 / 0 张（后台之后选完的不算，
+   模型没看到）。原来等满 60 秒时，客户端早断了，选完的规律条数却照样记成「给出去了」。
+2. **到点回一句新的话**（`core.BORROW_STILL_SELECTING_NOTE`）：`status` 还是 `timeout`，`detail` 是「卡还在选，这次没等到。
+   照常写就行，不用再调 borrow_lessons，也别跟用户说没有可借的经验。」简报超时那句（`BORROW_TIMEOUT_NOTE`）是叫模型去调
+   `borrow_lessons` 的，放在 `borrow_lessons` 自己的回包里模型会再调一轮，所以不能原样用。
+3. **正在跑的选卡记在进程里**（`core._borrows_running`）：键是（项目，发给馆员那份 brief 的 sha256，臂），值是那次选卡的
+   future。同一个键再来的（`borrow_lessons` 跟在 `open_project` 后面、同一份简报开了两次）不新起，等同一个 future，
+   各拿一份拷贝。
+   - 键里有臂：探索臂那次选卡不带规律，两个臂不能并到一起。键里没有身份：同一个项目、同一份 brief、同一个臂选出来的是同
+     一批卡（TV 的缓存键也不分人）；谁并上去，账都记在他自己的（项目，身份）下，不动别人的。
+   - 选卡跑完（成了、抛了都算）在它自己线程的 `finally` 里摘掉，先摘、后交结果。等的人到点只是不等了，不取消、不摘：
+     选卡照样跑完，TV 照样写缓存，这期间再来的人还并得上。线程起不来的不登记；brief 拼不出来的不合并。
+   - 借阅体承诺不抛；真抛了，等它的每个人各自按 `error` 回，不往外抛。
+   - 起跑超过 `LIBRARIAN_TIMEOUT_SEC` 再加 10 秒还没回来的那一条当成卡死的线程，不再往上并，另起一次、把表里那条换掉。
+4. **存档那一行指标**（§3.8 的 `flywheel_lessons`）：`borrow_lessons` 到点没等到的那次记成 `followup_timeout`（只在这一行；
+   回包里是 `timeout`）。`statuses` 里同时有 `timeout` 和 `followup_timeout` 的批次 = 简报没等到、补借也没等到。
+
+**没做的、要知道的。**
+- 合并只在这一个进程里有效（deskcore 单进程）。重启就没了，退回原来的样子：再发一次，多半命中 TV 的缓存。TV 那头的同款合并、
+  重试和超时是 AU-F09 的另一半，在 TV 仓库做。
+- 并上去的那次不向馆员发请求，TV 的 `flywheel_librarian_cache.last_hit_at` 也就不动。拿那一列等于 `created_at` 来推
+  「卡没被再读过」会更不准；看卡到没到模型手里，用 `flywheel_lessons`。
+- 选卡要 45 秒以上的那几场，补借照样等不到（18 秒）。区别是模型拿到一句正常的「照常写」，不是一次被掐断的调用，也不再多跑
+  一次选卡。没卡的场数不会因此变少，§3.8 那条查询的 `no_cards` / `followup_timed_out` 看得出有多少。
+- 预热（夜里或定时按项目先选一遍）没做：预热的行要带 `consumer = deskcore` 才命中，通道 2 那盏灯就再也看不出
+  `open_project` 的借卡断没断；走现成的借阅体还会往发臂记录里写一条没人写稿的臂。
+
+回归：`tests/test_borrow_lessons_deadline.py`（到点回那句话、选卡不取消；上限的默认值和夹子；并到 `open_project` 那次上只发
+一次请求；两个人同时等各拿各的拷贝；臂 / brief / 项目不同的不并；等的人走了之后选完会摘、不改任何记录；选卡抛了每个人按
+`error` 回并且摘掉；线程起不来不登记；晚到的收尾只摘自己那条；卡死的不并；显式的臂不再发一次；到点的补借和前面取大的；
+并到别人那次上不动别人的账；存档那一行的 `followup_timeout`）。`tests/test_open_project_borrow_budget.py` 里原来钉
+「`borrow_lessons` 等满 `LIBRARIAN_TIMEOUT_SEC`」的那条改成了「不被 `open_project` 的预算截断」。`tests/conftest.py`
+每条用例从一张空表开始。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -1551,7 +1603,8 @@ env：
 | `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<团队身份的 uuid>", "name": "Ziao"}}`。钥匙一人一把，`user_id` 全填团队身份（2026-11-02 D-136）；加写手就加一行，见 runbook「加一个写手」 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN。馆员回 200 但 `status` 是 `degraded` / `error`（TV 侧选卡失败）记 `error` 不记 `empty` |
-| `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `15`（2026-10-30 起，原 10；最近冷借 14–18 秒），夹在 1–20。`open_project` 随简报借卡**最多等这么久**，而且不超过整次回包目标 `OPEN_PROJECT_RESPONSE_BUDGET_SEC`（20 秒，不开 env）扣掉借阅之前已用的时间和借阅之后几步的预留（`core.OPEN_PROJECT_TAIL_RESERVE_SEC`，2.5 秒）剩下的那段；到点先交简报（`lessons_status.status=timeout`，`detail` 里叫模型动笔之前用同样的参数调一次 `borrow_lessons`，命中缓存即回；只调一次，还没有就照常写）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60），2026-10-30 起也收 `extra_instructions`（它在馆员的缓存键里） |
+| `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `15`（2026-10-30 起，原 10；最近冷借 14–18 秒），夹在 1–20。`open_project` 随简报借卡**最多等这么久**，而且不超过整次回包目标 `OPEN_PROJECT_RESPONSE_BUDGET_SEC`（20 秒，不开 env）扣掉借阅之前已用的时间和借阅之后几步的预留（`core.OPEN_PROJECT_TAIL_RESERVE_SEC`，2.5 秒）剩下的那段；到点先交简报（`lessons_status.status=timeout`，`detail` 里叫模型动笔之前用同样的参数调一次 `borrow_lessons`，命中缓存即回；只调一次，还没有就照常写）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具有自己的等待上限（下一行；2026-11-11 之前等满 `LIBRARIAN_TIMEOUT_SEC`），2026-10-30 起也收 `extra_instructions`（它在馆员的缓存键里） |
+| `BORROW_LESSONS_WAIT_SEC` | 可选 | 默认 `18`（2026-11-11），夹在 1–20。`borrow_lessons` **最多等这么久**：同一个（项目、brief、臂）的选卡还在跑（多半是 `open_project` 起的那次）就等它，不向馆员发第二次；到点回 `status=timeout`，`detail` 是「卡还在选，照常写，不用再调」，选卡不取消、选完照样进 TV 的缓存。馆员那次请求自己的超时还是 `LIBRARIAN_TIMEOUT_SEC`（默认 60），不跟着改（§3.24） |
 | `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里；它是自定义格式，登记在 `logger_utils` 的值级脱敏名单里（judge 的错误体会被抄进 detail / 遥测 / `batch_metrics`）。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
 | `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了、`nan` / `inf` 都退回默认）。**整批判定的共同截止**，不是每篇各 8 秒；入库慢时实际截止更短（整次 commit 回包目标 20 秒，见 §3.8，J-08） |
 | `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16（同上，写坏了退回默认）。一次 commit 同时发几篇 |

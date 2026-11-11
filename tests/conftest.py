@@ -97,3 +97,14 @@ def _revision_recheck_off():
     core._REVISION_RECHECK_POOL[0] = None
     yield
     core._REVISION_RECHECK_POOL[0] = saved
+
+
+# ── 正在跑的选卡(deskcore/core.py 的 _borrows_running, 2026-11-11) ──────────────────────────────────────────
+# 同一个 (项目, brief, 臂) 的选卡还在跑时, 后来的借卡等它、不向馆员发第二次。用例里借卡超时之后那条后台线程常常还没跑完
+# 用例就结束了: 下一条用例同一个项目、同一份 brief 就会并到上一条的选卡上, 自己换上的假馆员一次都没被调到。所以每条用例
+# 从一张空表开始(上一条留下的线程跑完时只摘它自己那一条, 碰不到新表里的)。
+@pytest.fixture(autouse=True)
+def _no_borrow_left_running(monkeypatch):
+    from deskcore import core
+    monkeypatch.setattr(core, "_borrows_running", {})
+    yield

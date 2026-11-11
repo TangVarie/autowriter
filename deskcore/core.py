@@ -29,6 +29,7 @@ import hashlib
 import json
 import concurrent.futures as cf
 import contextlib
+import copy
 import dataclasses
 import logging
 import os
@@ -9663,14 +9664,19 @@ def _note_patterns_shown(project_id, user_id, arm: str, shown: int, *, carry: bo
 # 只进这一行指标: 不进 batches.params、不进回包、不碰分臂和规律条数那套账。进程内存, 重启就没(那时 borrows 是 0 = 不知道)。
 # 团队共用一个身份时分不出是哪一场借的, 所以最近一次和最多的一次都记: max 是 0 才能确定这一批没参照过卡。
 _lessons_shown: dict[tuple[str, str], list[tuple[datetime, int, str]]] = {}
+# 这一行指标里多出来的一种结局(2026-11-11, 审计 A3): borrow_lessons 等了 BORROW_LESSONS_WAIT_SEC 卡还没选完。回包里的
+# status 还是 timeout(协议里列的那五种不变), 只有这一行记成另一个名字 —— 简报超时(timeout)之后补借也没等到的场,
+# statuses 里是 {timeout: 1, followup_timeout: 1}, 数得出来。
+LESSONS_FOLLOWUP_TIMEOUT = "followup_timeout"
 
 
-def _note_lessons_shown(project_id, user_id, out: dict) -> None:
-    """借卡交出去之后记一条: 这一次带出去几张卡、什么结局(librarian_client 的 BORROW_*)。只写进程内存。**不抛**。"""
+def _note_lessons_shown(project_id, user_id, out: dict, *, status: str | None = None) -> None:
+    """借卡交出去之后记一条: 这一次带出去几张卡、什么结局(librarian_client 的 BORROW_*; ``status`` 另给了就记它 ——
+    borrow_lessons 自己等到点的那种记 LESSONS_FOLLOWUP_TIMEOUT, 和简报那次的 timeout 分得开)。只写进程内存。**不抛**。"""
     try:
         now = _utcnow()
         key = (str(project_id), str(user_id or ""))
-        rec = (now, len(out.get("lessons") or []), str(out.get("status") or ""))
+        rec = (now, len(out.get("lessons") or []), str(status or out.get("status") or ""))
         with _borrowed_arms_lock:
             kept = [r for r in _lessons_shown.get(key, ()) if now - r[0] <= _ARM_REPORT_TTL]
             _lessons_shown[key] = kept + [rec]
@@ -9773,11 +9779,13 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     """
     project = assert_project_access(client, project_id, user_id=user_id)
     arm = _borrow_arm(project.get("id"), user_id, reuse=flywheel_arm)   # 这场已经有臂就沿用
-    out = _borrow_for_brief(project, delta, user_id=user_id, arm=arm)
-    # F13: 这次实际交出去几条规律, 记在这个臂旁边; 沿用了简报里的臂 = 同一场接着借, 和前面那次取大的
-    _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []),
-                         carry=flywheel_arm == arm)
-    _note_lessons_shown(project.get("id"), user_id, out)     # 这次带出去几张卡, 给存档那一行指标(A3)
+    # 2026-11-11(审计 A3 / F-04): 原来直接调 _borrow_for_brief, 等满 LIBRARIAN_TIMEOUT_SEC(60 秒), 客户端约 22 秒就断。
+    # 现在走限时的那一层: 最多等 BORROW_LESSONS_WAIT_SEC, open_project 起的那次选卡还在跑就等它(不再发第二次)。
+    # 臂在上面定好了传进去(那一层自己定的话会重新分, 不认传回的臂); 记账还是原来那两笔、原来的顺序 ——
+    # F13: 这次实际交出去几条规律, 记在这个臂旁边; 沿用了简报里的臂 = 同一场接着借(carry), 和前面那次取大的;
+    # A3: 这次带出去几张卡, 给存档那一行指标。到点没等到 = 这次交出去 0 条 / 0 张(后台之后选完的不算, 模型没看到)。
+    out = _borrow_for_brief_bounded(project, delta, float(config.BORROW_LESSONS_WAIT_SEC), user_id=user_id,
+                                    arm=arm, carry=flywheel_arm == arm, followup=True)
     if out.get("validated_patterns"):       # 用法同简报那份(10-20): 每篇最多一条、轮换、有几篇不用
         out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
                                                               len(out["validated_patterns"]))
@@ -9797,6 +9805,20 @@ _BORROW_NEEDS_ATTENTION = frozenset({
 })
 
 
+_BORROW_DELTA_KEYS = ("tactic", "draft_topic", "key_messages", "target_audience", "tone", "extra_instructions")
+
+
+def _borrow_request(project: dict, delta: dict | None, arm: str) -> dict:
+    """发给馆员的那份 brief: 项目行 + 本次 delta(多余的键丢掉, librarian_client.build_brief 只认契约里那几个)+ 臂。
+    _borrow_for_brief 发的、_borrow_running_key 取摘要的是同一份。会抛(build_brief 的意外), 调用方各自兜。"""
+    delta = delta or {}
+    brief = librarian_client.build_brief(project, **{k: (delta.get(k) or "") for k in _BORROW_DELTA_KEYS if delta.get(k)})
+    brief["consumer"] = "deskcore"
+    # 显式带 explore 才参与分臂 (TV 那边不带这个键的老消费方不下发规律)
+    brief["explore"] = arm == "explore"
+    return brief
+
+
 def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None = None,
                       arm: str | None = None) -> dict:
     """borrow_lessons 与 build_writing_brief 共用的借阅体。**绝不抛**。
@@ -9811,18 +9833,10 @@ def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None 
     所以 status 永远带, 且三种"要人管"的结局各记一条 WARN —— 这是 TV docs/27
     要求的"fail-open 要留痕": 服务日志里 grep 得到通道 2 到底为什么黑。
     """
-    delta = delta or {}
-    allowed = ("tactic", "draft_topic", "key_messages",
-               "target_audience", "tone", "extra_instructions")
-    kwargs = {k: (delta.get(k) or "") for k in allowed if delta.get(k)}
     st: dict = {}
     arm = arm or _borrow_arm(project.get("id"), user_id)
     try:
-        brief = librarian_client.build_brief(project, **kwargs)
-        brief["consumer"] = "deskcore"
-        # 显式带 explore 才参与分臂 (TV 那边不带这个键的老消费方不下发规律)
-        brief["explore"] = arm == "explore"
-        selected = librarian_client.fetch_flywheel_lessons(brief, status=st)
+        selected = librarian_client.fetch_flywheel_lessons(_borrow_request(project, delta, arm), status=st)
     except Exception as exc:  # noqa: BLE001 — 增强项, 失败不能拖垮简报
         logger.exception("flywheel borrow crashed (project_id=%s)", project.get("id"))
         st = {"state": librarian_client.BORROW_ERROR, "count": 0,
@@ -9869,61 +9883,145 @@ BORROW_TIMEOUT_NOTE = ("这次随简报借卡没来得及选完(选卡要跑一�
                        "只调这一次, 还是没有卡就照常写, 不用再调, 也别跟用户说没有可借的经验。")
 
 
+# borrow_lessons 自己等到点时 detail 里那句(念给模型的; 2026-11-11, 审计 A3)。上面那句是叫模型去调 borrow_lessons 的,
+# 放在 borrow_lessons 自己的回包里, 模型会照着再调一次、再等一轮 —— 所以另写一句: 照常写, 不用再调。
+BORROW_STILL_SELECTING_NOTE = "卡还在选, 这次没等到。照常写就行, 不用再调 borrow_lessons, 也别跟用户说没有可借的经验。"
+
+
+# 正在跑的选卡(2026-11-11, 审计 A3; TV 那头的同款合并是 AU-F09, 另做)。open_project 到点交了简报, 那次选卡还在后台跑;
+# 模型照提示调 borrow_lessons, 原来是再向馆员发一次 —— TV 那头第一次还没写缓存, 第二次就又跑一遍模型选卡(多花一次,
+# 还得从头等)。现在进程里记着正在跑的那几次: (项目, 发给馆员那份 brief 的摘要, 臂) → 那次选卡的 future。同一个键再来的
+# 不新起, 等同一个 future。
+#   · 键里有臂: 探索臂那次选卡不带规律, 规律臂的会话不能并上去(反过来也一样);
+#   · 键里没有身份: 同一个项目、同一份 brief、同一个臂, 选出来的是同一批卡(TV 的缓存键也不分人)。分臂和「给出去几条
+#     规律 / 几张卡」那几笔账不在选卡线程里记, 等的人各自在自己那头记(_borrow_for_brief_bounded 的 _shown), 并上去
+#     不动别人的账; 每个等的人拿到的是自己那份拷贝;
+#   · 选卡跑完(成了、抛了都算)在它自己线程的 finally 里摘掉。等的人到点只是不等了, 不取消、不摘 —— 选卡照样跑完,
+#     TV 照样写缓存, 这期间再来的人还并得上;
+#   · 只在这一个进程里有效(deskcore 单进程)。重启就没了, 那时退回原来的样子: 再发一次, 多半命中 TV 的缓存;
+#   · brief 拼不出来(摘要算不了)就不登记、不合并, 照原来各跑各的;
+#   · 只并到还在正常时限里的那一次(_borrow_joinable): 馆员那次请求最多 LIBRARIAN_TIMEOUT_SEC, 过了这个数还多十秒都没
+#     回来的是卡死的线程 —— 接着往上并, 这个键之后每次借卡都只能等到点。那种不并, 另起一次、把表里那一条换成新的。
+_borrows_running: dict[tuple[str, str, str], tuple[cf.Future, float]] = {}      # 键 → (future, 起跑时的 time.monotonic())
+_borrows_running_lock = threading.Lock()
+_BORROW_JOIN_GRACE_SEC = 10.0
+
+
+def _borrow_joinable(running: tuple[cf.Future, float] | None) -> cf.Future | None:
+    """表里那一条还能不能并上去: 起跑不超过 LIBRARIAN_TIMEOUT_SEC + _BORROW_JOIN_GRACE_SEC 的回它的 future, 否则 None。"""
+    if running and time.monotonic() - running[1] <= float(config.LIBRARIAN_TIMEOUT_SEC) + _BORROW_JOIN_GRACE_SEC:
+        return running[0]
+    return None
+
+
+def _borrow_running_key(project: dict, delta: dict | None, arm: str) -> tuple[str, str, str] | None:
+    """这次选卡在 _borrows_running 里的键: (项目, 发给馆员那份 brief 的 sha256, 臂)。算不出来回 None(不合并)。"""
+    try:
+        text = json.dumps(_borrow_request(project, delta, arm), sort_keys=True, ensure_ascii=False, default=str)
+        return str(project.get("id")), hashlib.sha256(text.encode("utf-8")).hexdigest(), arm
+    except Exception:  # noqa: BLE001 — 同样的意外 _borrow_for_brief 里会再碰到一次, 在那里留痕
+        return None
+
+
+def _run_borrow(fut: cf.Future, key, project: dict, delta: dict | None, user_id, arm: str) -> None:
+    """选卡线程里跑的那一段: 不管怎么结束, 先把自己从 _borrows_running 里摘掉, 再把结果(或者异常)交给 ``fut``。
+    只摘自己那一条(同一个键后来又登记了别的一次, 不动它)。先摘后交: 等的人一拿到结果, 表里就已经没有这一条 ——
+    反过来的话, 紧跟着的下一次调用会并到一个已经跑完的 future 上, 拿到的是上一次的结果, 不是新选的。"""
+    try:
+        try:
+            out = _borrow_for_brief(project, delta, user_id=user_id, arm=arm)
+        finally:
+            if key is not None:
+                with _borrows_running_lock:
+                    if (_borrows_running.get(key) or (None,))[0] is fut:
+                        del _borrows_running[key]
+    except BaseException as exc:  # noqa: BLE001 — _borrow_for_brief 承诺不抛; 真抛了也要让等的人醒过来, 不是等到点
+        fut.set_exception(exc)
+    else:
+        fut.set_result(out)
+
+
 def _borrow_for_brief_bounded(project: dict, delta: dict | None,
                               budget: float | None = None, *, user_id: str | None = None,
-                              started: float | None = None) -> dict:
-    """``open_project`` 用的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但**只等
-    ``OPEN_PROJECT_BORROW_SEC``**(默认 15 秒), 而且不超过整次回包目标里剩下的(``started`` 是 open_project 开始的
-    时刻, 见 _brief_borrow_budget), 到点先把简报交出去。
+                              started: float | None = None, arm: str | None = None,
+                              carry: bool = False, followup: bool = False) -> dict:
+    """限时的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但只等 ``budget`` 秒, 到点先回。两个调用方:
+
+    · ``open_project``(build_writing_brief): 不传 ``budget`` / ``arm``。**只等 ``OPEN_PROJECT_BORROW_SEC``**(默认 15 秒),
+      而且不超过整次回包目标里剩下的(``started`` 是 open_project 开始的时刻, 见 _brief_borrow_budget), 到点先把简报
+      交出去; 臂在这里新定, 这一场的规律条数新记一条。
+    · ``borrow_lessons``(2026-11-11, 审计 A3): ``budget`` = ``BORROW_LESSONS_WAIT_SEC``, ``arm`` = 它已经定好的臂(沿用
+      模型传回的那个; 这里不再发一次臂), ``carry`` = 这次是不是同一场接着借(记规律条数时和前面那次取大的, 见
+      _note_patterns_shown), ``followup=True`` = 到点那句话换成 BORROW_STILL_SELECTING_NOTE, 存档那一行指标里记
+      LESSONS_FOLLOWUP_TIMEOUT。
 
     为什么要有这一层(TV 2026-10-08 审计 A-04): 借阅原来直接在 open_project 的同步路径上
     等满 ``LIBRARIAN_TIMEOUT_SEC``(60 秒), 而 MCP 客户端只容忍 ~22 秒 —— 超过的不是"少几张
     卡", 是**整份简报连 P0 硬约束一起丢**, 协议让模型停笔。TV 侧实测 09-22 冷借 13 次里
     12 次超过 22 秒。馆员选卡要跑一次 LLM, 把 60 秒改小不行(test_librarian_timeout 钉着);
-    把等待从必经路径上拆出来才行。
+    把等待从必经路径上拆出来才行。borrow_lessons 同理: 等 60 秒等来的是一次被客户端掐断的调用。
 
-    到点之后借阅线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型动笔之前调一次 borrow_lessons
-    (同参数命中缓存即回)就拿得到。``detail`` 里写清这一点(BORROW_TIMEOUT_NOTE), 模型读得到。
+    到点之后选卡线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型动笔之前调一次 borrow_lessons 就拿得到 ——
+    那次选卡还在跑的话, borrow_lessons 等的就是它(_borrows_running), 不向馆员发第二次; 已经跑完了就是同参数命中缓存。
+    ``detail`` 里写清该怎么办(BORROW_TIMEOUT_NOTE / BORROW_STILL_SELECTING_NOTE), 模型读得到。
     """
     budget = _brief_borrow_budget(started) if budget is None else float(budget)
-    # 臂在这里先定: 借阅超时 / 线程起不来, 简报也要带着臂交出去 (入库时原样传回)
-    arm = _borrow_arm(project.get("id"), user_id)
+    # 臂在这里先定: 借阅超时 / 线程起不来, 简报也要带着臂交出去 (入库时原样传回)。调用方定好了的原样用
+    arm = arm or _borrow_arm(project.get("id"), user_id)
 
-    def _shown(out: dict) -> dict:
-        # 外部审计 11-02 F13: 简报实际带出去几条规律(超时 / 线程起不来 = 0 —— 后台线程之后选完了也不算, 这一份简报里
-        # 没有), 记在这个臂旁边。open_project 是新开的一场, 不和上一场取大
-        _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []))
-        _note_lessons_shown(project.get("id"), user_id, out)     # 简报实际带出去几张卡(超时 = 0), 给存档那一行指标(A3)
+    def _shown(out: dict, *, status: str | None = None) -> dict:
+        # 外部审计 11-02 F13: 这一次实际带出去几条规律(超时 / 线程起不来 = 0 —— 后台线程之后选完了也不算, 这一份回包里
+        # 没有), 记在这个臂旁边。open_project 是新开的一场, 不和上一场取大(carry=False); borrow_lessons 的 carry 照它传的
+        _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []), carry=carry)
+        # 这一次实际带出去几张卡(超时 = 0), 给存档那一行指标(A3)
+        _note_lessons_shown(project.get("id"), user_id, out, status=status)
         return out
 
-    try:
-        ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
-        fut = ex.submit(_borrow_for_brief, project, delta, user_id=user_id, arm=arm)
-    except Exception as exc:  # noqa: BLE001
-        # 线程池建不起来 / submit 失败 (RuntimeError: can't start new thread, 解释器关闭中…): 这一层的
-        # 承诺和 _borrow_for_brief 一样是"绝不抛" —— 抛出去 open_project 整份简报连 P0 硬约束一起丢
-        # (codex review on #93)。按借阅出错回, 简报照交。
-        logger.warning("flywheel borrow could not start (project_id=%s): %s: %s",
-                       project.get("id"), type(exc).__name__, exc)
+    def _failed(detail: str) -> dict:
         return _shown({"lessons": [], "count": 0,
                        "status": librarian_client.BORROW_ERROR,
-                       "elapsed_ms": 0,
-                       "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300],
+                       "elapsed_ms": 0, "detail": detail[:300],
                        "validated_patterns": [], "flywheel_arm": arm})
+
+    ex = None
     try:
         try:
-            return _shown(fut.result(timeout=budget))
+            key = _borrow_running_key(project, delta, arm)
+            with _borrows_running_lock:
+                fut = _borrow_joinable(_borrows_running.get(key)) if key is not None else None
+                if fut is None:                         # 没有正在跑的同一次选卡: 起一次, 登记上
+                    fut = cf.Future()
+                    ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
+                    ex.submit(_run_borrow, fut, key, project, delta, user_id, arm)
+                    if key is not None:
+                        _borrows_running[key] = (fut, time.monotonic())
+        except Exception as exc:  # noqa: BLE001
+            # 线程池建不起来 / submit 失败 (RuntimeError: can't start new thread, 解释器关闭中…): 这一层的
+            # 承诺和 _borrow_for_brief 一样是"绝不抛" —— 抛出去 open_project 整份简报连 P0 硬约束一起丢
+            # (codex review on #93)。按借阅出错回, 简报照交。没起来的那次不登记。
+            logger.warning("flywheel borrow could not start (project_id=%s): %s: %s",
+                           project.get("id"), type(exc).__name__, exc)
+            return _failed(f"借阅线程起不来: {type(exc).__name__}: {exc}")
+        try:
+            # 拷一份: 同一个 future 可能有几个人在等, 各拿各的(调用方会往里加键)
+            return _shown(copy.deepcopy(fut.result(timeout=budget)))
         except cf.TimeoutError:
-            logger.warning("flywheel borrow exceeded open_project budget %.1fs (project_id=%s); "
-                           "brief returned without cards, borrow thread left running",
-                           budget, project.get("id"))
+            logger.warning("flywheel borrow exceeded %s budget %.1fs (project_id=%s); "
+                           "replied without cards, borrow thread left running",
+                           "borrow_lessons" if followup else "open_project", budget, project.get("id"))
             return _shown({"lessons": [], "count": 0,
                            "status": librarian_client.BORROW_TIMEOUT,
                            "elapsed_ms": int(budget * 1000),
                            "validated_patterns": [], "flywheel_arm": arm,
-                           "detail": BORROW_TIMEOUT_NOTE})
+                           "detail": BORROW_STILL_SELECTING_NOTE if followup else BORROW_TIMEOUT_NOTE},
+                          status=LESSONS_FOLLOWUP_TIMEOUT if followup else None)
+        except Exception as exc:  # noqa: BLE001 — 选卡那一头抛了(不该发生): 等它的每个人都按借阅出错回, 不往外抛
+            logger.warning("flywheel borrow thread failed (project_id=%s): %s: %s",
+                           project.get("id"), type(exc).__name__, exc)
+            return _failed(f"{type(exc).__name__}: {exc}")
     finally:
-        ex.shutdown(wait=False)
+        if ex is not None:
+            ex.shutdown(wait=False)
 
 
 def create_project(client, name: str, *, brand: str = "",
