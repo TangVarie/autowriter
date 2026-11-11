@@ -715,7 +715,8 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
         就别用它的 ``existing_comments``, 照贴来的正文写)/ ``pasted``
       · existing_comments —— 帖子下已有的评论(TV 里找到了才有): 别重复里面已经问过的事、用过的说法。项目配了飞书那一列时,
         这条帖子那一格里已有的维护评论也在里面(``source`` 是列名)
-      · comment_rules —— 本项目管评论的规则(「评论区：」开头的), 必须守; 和 style、comment_set 说法不一样的以那两样为准
+      · comment_rules —— 本项目管评论的规则, 必须守; 和 style、comment_set 说法不一样的以那两样为准。「评论区：」开头的、
+        开头那一句说的是评论的、存的 check 查评论的都在这里(硬约束也是: 在这里的不再重复列进 hard_rules)
       · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守; 说每篇都要带品牌的, 评论里几条提品牌照 comment_set
       · 规则以这次回的为准: 前面对话里见过的规则原文说法不一样的不算(可能已经停掉了)。``rules_note``: 用户说哪条项目规则
         过时了, 当场用 set_rule_state 停掉(memory_id 在 my_rules 里), 不用等负责人; 要换成新说法用 record_rule
@@ -731,7 +732,9 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
         就照用户的写, 交付时一句话说明和项目定的配比不一样, 项目的数不动; 用户明说这个项目以后都按新的配比, 调
         set_comment_mix 改项目的数, 不用找负责人。只有用户明说才改, 不为了让这一组通过自己去改配比。``column`` 是这组评论
         要贴进的飞书那一列(set_comment_mix 改不了它)
-      · slots —— 默认四个评论位: q1 / q2 提问、exp 经验或推荐、reply 贴主回复(回 q1)。每位写一条, 位的要求在 note 里;
+      · slots —— 默认四个评论位: q1 / q2 提问、exp 经验或推荐、reply 贴主回复(回 q1)。每位写一条, 位的要求在 note 里。
+        它们是四种评论, 不是只能写四条: 一组不止四条时(项目定了配比的一组是 20 条上下), 每个 id 整组最多用一次,
+        其余的评论不带 slot, 整组一次交给 score_comments;
         每位都可自然点名品牌, 不要求每条点名。可写感受、比较、推荐、答疑, 亲历和旁观推荐也可用;
         具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写提问或一般讨论。用户另有要求(比如只要两条提问)就照用户的, 位的 id 照用
       · project_id —— 下一步 score_comments 要带的
@@ -753,7 +756,8 @@ def score_comments(comments: list[dict], link: str = "", project_id: str = "", p
     """一组评论写完后调(自动调, 不用等用户说): Jev 整组判一次, 回每条过没过和修改建议。只判, 不存库, 不发布。
 
     ``comments`` 传 ``[{"slot": "q1", "text": "..."}, {"slot": "reply", "text": "..."}, ...]``: slot 写 comments_for 给的
-    评论位 id(自定义的评论位传整个对象); 同一个 id 只能有一条; 贴主答疑那条会自动接上它回的那一位。帖子参数和
+    评论位 id(自定义的评论位传整个对象); 同一个 id 只能有一条, 一组不止四条时其余的不带 slot(报 slot id 重复或不认识时,
+    去掉那几条的 slot、整组再送一次, 不用分几次判); 贴主答疑那条会自动接上它回的那一位。帖子参数和
     comments_for 那次一样: ``link``, 或 ``post_title`` / ``post_body`` + ``project_id``。一次最多 20 条。
     ``kind``: product(默认, 卖货的品)/ agency(机构服务)/ shop(门店)。``max_named``: 默认 None, 不设固定品牌点名配额;
     品牌可自然提及, 不要求每条点名。用户明确要限制时才传整数(整组最多几条点名品牌, 0 表示不点名)。项目定了提品牌的上限
@@ -1207,6 +1211,9 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
       (所以「TV信号」里也不算有 "V信") —— 两种写法都要拦就都列上。
       check 写错会报错且这条规则不落库: 照报错改了再调一次。返回里的 ``check`` 是库里存下的那份。
+      规则开头那一句只说评论时, check 只查评论(where 存成 ["comments"], 返回里带 ``check_where_note``)。
+
+    返回里的 ``given_when_writing_comments``: 这条规则写评论时(comments_for)给不给。管评论的规矩 content 开头写「评论区：」就给。
 
     记下之后服务端会在后台把这条规则交给 Jev 编成写后检查(几分钟内好), 之后 ``check_rules`` 就会查它。不用等、不用管。
     """
@@ -1342,6 +1349,7 @@ def my_rules(project_id: str, _user_id: str | None = None) -> dict:
       · 已停用   —— 用户自己 mute 掉的, muted_until 到期自动恢复
 
     试用、已停用的和生效中的规则或 comment_set 说法不一样, 不算冲突(``state_note`` 也这么说)。
+    带 ``check`` 的是存档时代码会查的: 给的是查的时候真用的那一份(开头那一句只说评论的规则只查评论, 带一句 ``check_note``)。
     改档位用 set_rule_state: 用户说哪条过时了, 当场改, 不用等负责人。
     一组评论的配比(comment_set 里提品牌、中性、短评的几个数)不在这份台账里: 用户明说要改这个项目的配比时用 set_comment_mix。
     """

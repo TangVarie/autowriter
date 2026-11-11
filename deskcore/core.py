@@ -360,10 +360,9 @@ _LENGTH_RULE = re.compile(rf"{_LENGTH_NUM}\s*(?:[-~～到至]\s*(?:[0-9０-９]+
 
 def _mentions_length(rules: list[dict]) -> bool:
     """这几条规则里有没有说到字数的: 原文写了「N 字」「字数」「篇幅」, 或者存了字数检查(rule_kind = max_len)。管评论的
-    (「评论区」开头的)不算: 这一句是说笔记的。"""
-    return any(not (r.get("content") or "").lstrip().startswith(COMMENT_RULE_PREFIX)
-               and (_LENGTH_RULE.search(r.get("content") or "") or (r.get("rule_kind") or "").strip() == "max_len")
-               for r in rules)
+    (_is_comment_rule: 「评论区」开头、开头那一句说的是评论、或者存的检查查评论)不算: 这一句是说笔记的。"""
+    return any((_LENGTH_RULE.search(r.get("content") or "") or (r.get("rule_kind") or "").strip() == "max_len")
+               and not _is_comment_rule(r) for r in rules)
 
 # 这场方向闸挡掉的那些 soft 规则(另一个方向的; 复审 2026-11-03): 卡上标了那一族贴型的稿, score_drafts / check_rules 照它们查
 # (rule_applies_to_layer), 简报里就得让模型看得见 —— 不然模型被报「建议改」的是一条它从没见过的规则。单独一截接在 P1 最后,
@@ -3482,6 +3481,77 @@ class CommentInputError(ValueError):
 
 
 COMMENT_RULE_PREFIX = "评论区"
+# 哪些规则算管评论的(2026-11-11, 审计 C1): 协议叫模型把管评论的规则写成「评论区：」开头, 可写手在写评论那场对话里说的
+# 规矩, 模型记下来时常常不带这个开头(11-11 记的三条都没带) —— 四分钟后的 comments_for 一条也没给回去, 写手说过的话
+# 下一组评论照样犯。现在三样有一样就算(_is_comment_rule):
+#   · 去掉开头的空白和一个开括号之后以「评论区」开头(原来就认的那一种, 多认了「【评论区…】」);
+#   · 开头那一句(到第一个标点为止, 空格不算标点)的前 12 个字里有「评论」: 「评论别带链接」「示例牌的评论不提价格」;
+#     说交付版式、过了开头那一句才提到评论的不算(那是管整份交付稿的);
+#   · 存的代码检查(rule_kind / rule_payload)的 where 里有 comments。
+# 认出来的在 comments_for 里放进 comment_rules(硬约束本来在 hard_rules 里, 现在换到 comment_rules, 两个列表合起来一条
+# 不少、也不重复); 笔记那一侧的简报不动, 这些规则照旧在 P0 / P1 里(只是不算「说到字数」, 见 _mentions_length)。
+_COMMENT_WORD = "评论"
+_COMMENT_HEAD_CHARS = 12
+_OPEN_BRACKETS = "【[［（(「『《〔"
+# 开头那一句里点到这些的, 说的不只是评论(「正文和评论里都不写…」「结尾不要引导评论」): 存的检查不收窄到只查评论
+_POST_WORDS = ("正文", "标题", "笔记", "文案", "帖", "贴文", "话题", "标签", "全文", "开头", "结尾", "文末", "封面", "配图", "引导")
+
+
+def _rule_head(text) -> str:
+    """规则原文开头那一句: 去掉开头的空白和一个开括号, 到第一个标点(或换行)为止。空格不算标点。"""
+    t = (text if isinstance(text, str) else "").lstrip()
+    if t[:1] in _OPEN_BRACKETS:
+        t = t[1:].lstrip()
+    for k, ch in enumerate(t):
+        if ch in "\r\n" or unicodedata.category(ch).startswith("P"):
+            return t[:k]
+    return t
+
+
+def _head_names_comments(text) -> bool:
+    head = _rule_head(text)
+    return head.startswith(COMMENT_RULE_PREFIX) or _COMMENT_WORD in head[:_COMMENT_HEAD_CHARS]
+
+
+def _check_covers_comments(rule: dict) -> bool:
+    where = (rulecheck.spec_of(rule) or {}).get("where")
+    return isinstance(where, list) and "comments" in where        # max_len 的 where 是一个词(title / body), 不算
+
+
+def _is_comment_rule(rule: dict) -> bool:
+    """这条规则是不是管评论的: 写评论时(comments_for 的 comment_rules)给不给。判据见上面那段。"""
+    return _head_names_comments(rule.get("content")) or _check_covers_comments(rule)
+
+
+# 开头那一句只说评论的规则, 存的代码检查只查评论(2026-11-11, 审计 C1): 模型在写评论那场对话里记规则, check 的 where 常常
+# 写成 ["body", "comments"] 或者干脆不写(默认标题 + 正文) —— 一条说评论的规矩就这样每次存档都拿去查笔记正文, 写笔记的人
+# 收到一条和笔记无关的「建议改」。record_rule 记的时候就存成 ["comments"], 回包里说一句(COMMENT_CHECK_NOTE); 库里已经
+# 存着的那一条读的时候按同一个判据算(score_drafts 的 rule_checks、my_rules 的 check 都过 _comment_check_rule), 不改库。
+# 开头那一句里也点到正文 / 标题 / 笔记 / 话题、或者说的是笔记里引导评论的(_POST_WORDS)不收窄: 那是两边都管、或者管笔记的
+# 规则, 收窄会悄悄少查正文。
+# max_len 的检查只认标题 / 正文, 不动。
+COMMENT_CHECK_NOTE = ("这条规则开头说的是评论, 所以它的 check 只查评论(where 存成 [\"comments\"]), 存档时不拿它查标题和正文。"
+                      "标题、正文也要这样守的话, 另记一条说正文的规则。")
+MY_RULES_COMMENT_CHECK_NOTE = "这条规则开头说的是评论, 它的 check 只查评论(where 按 [\"comments\"] 算)"
+
+
+def _comment_only_where(content, kind: str, payload: dict | None) -> bool:
+    """这份检查该不该收窄到只查评论: 开头那一句说的是评论、没点到笔记的哪一部分, 而 where 还带着别的部位。"""
+    where = (payload or {}).get("where")
+    return (kind in ("forbidden_word", "forbidden_regex", "required_phrase") and isinstance(where, list)
+            and where != ["comments"] and _head_names_comments(content)
+            and not any(w in _rule_head(content) for w in _POST_WORDS))
+
+
+def _comment_check_rule(rule: dict) -> dict:
+    """库里一条带检查的规则 → 查的时候用的那一行: 该收窄的(_comment_only_where)回一份 where 只有 comments 的拷贝,
+    别的原样回。不改传进来的那一行, 也不写库。"""
+    spec = rulecheck.spec_of(rule)
+    if spec is None or not _comment_only_where(rule.get("content"), spec["kind"], spec):
+        return rule
+    return {**rule, "rule_payload": {**{k: v for k, v in spec.items() if k != "kind"}, "where": ["comments"]}}
+
+
 COMMENT_KINDS = ("product", "agency", "shop")      # judge 那边的 Literal, 写错会 422
 MAX_SCORED_COMMENTS = 20                            # judge ThreadRequest.comments 的上限
 _EXISTING_COMMENT_CHARS = 200
@@ -4385,17 +4455,27 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
 # 每次 comments_for 现取规则(2026-11-11): 同一场对话里早先拿到的规则原文(包括已经停掉的)不算数。只说规则原文, 不压用户这次
 # 在对话里明说的要求(复审 11-11, 见 SET_LINE_HEAD 上面那段)
 COMMENTS_FOR_RULES_NOW = "规则以这次回的为准, 前面对话里见过的规则原文和这次不一样的不算(可能已经停掉了)。"
+# 定了配比的项目一组是 20 到 50 条, 评论位只有四个(2026-11-11, 审计 F5 / C7): 原来不管哪个项目都说「按 slots 每位写一条
+# …每条评论带 slot 的 id」, 模型给 20 条各挂一个 id → 同一个 id 重复, 整个调用被拒(那一步在读库之前, 日志里看不见);
+# 自己编一个 id(q3、q5)也被拒。能用的那条路(多出来的不带 slot)原来只在短评那一句里带了半句。只改给模型看的这几句:
+# 四个位是四种评论, 一个 id 最多用一次, 其余的不带 slot, 整组一次交。没定配比的项目那一句一个字不动。
+COMMENTS_FOR_SET_SLOTS = ("slots 是四种评论(q1 / q2 提问、exp 经验或推荐、reply 贴主回 q1), 不是只写四条: 一组不止四条时, "
+                          "每个 slot 的 id 整组最多用一次, 其余的评论不带 slot; ")
+COMMENTS_FOR_SET_SCORE = (f"写完把整组放在一次 score_comments 里交(不按 slot 拆成几次; 一次最多 {MAX_SCORED_COMMENTS} 条, "
+                          "超过的按顺序分段判、前面判过的放进 earlier_comments; 帖子参数和这次一样: link, 或 post_title / "
+                          "post_body + project_id)。")
 COMMENT_SET_NEXT_STEP = ("这个项目定了一组的配比(comment_set.lines), 和 style 一样要守; 项目规则里说法不一样的"
                          "以它为准, 不算冲突, 不用问用户; 用户这次明说要别的配比, 这一组就照用户的写, 交付时一句话说明; "
                          "用户明说这个项目以后都按新的配比, 调 set_comment_mix 改, 不用找负责人。")
 
 
 def _comment_rules(client, project_id: str, user_id) -> tuple[list[str], list[str]]:
-    """``(评论规则, 硬约束)``: content 以「评论区」开头的(任何 severity)+ 全部 hard。合规硬约束对评论一样管用。"""
+    """``(评论规则, 硬约束)``: 管评论的规则(_is_comment_rule, 任何 severity)+ 其余的 hard。合规硬约束对评论一样管用。
+    一条 hard 的评论规则只在第一个列表里: 两个列表合起来, 生效的 hard 和管评论的 soft 一条不少、也不重复。"""
     hard, soft = store.shared_memories(client, project_id, user_id)
     text = lambda m: (m.get("content") or "").strip()
-    comment = [text(m) for m in hard + soft if text(m).startswith(COMMENT_RULE_PREFIX)]
-    hard_only = [text(m) for m in hard if not text(m).startswith(COMMENT_RULE_PREFIX)]
+    comment = [text(m) for m in hard + soft if _is_comment_rule(m)]
+    hard_only = [text(m) for m in hard if not _is_comment_rule(m)]
     return comment, hard_only
 
 
@@ -4445,9 +4525,12 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
             logger.exception("comments_for: 读帖子那一格已有的维护评论失败 (note=%s)", note.get("note_id"))
             cell, cell_unread = [], True
         existing += [{"order": None, "role": None, "is_reply": False, "text": line, "source": column} for line in cell]
-    next_step = ("按 slots 每位写一条(贴主答疑那条回 q1), 守 hard_rules、comment_rules 和 style(所有项目都管), 别和 existing_comments "
-                 "里已经有的问题重复; 写完把整组交给 score_comments(帖子参数和这次一样: link, 或 post_title / post_body + "
-                 "project_id; 每条评论带 slot 的 id)。" + COMMENTS_FOR_RULES_NOW)
+    counted = _comment_set_counts(cfg)
+    next_step = ((COMMENTS_FOR_SET_SLOTS if counted else "按 slots 每位写一条(贴主答疑那条回 q1), ")
+                 + "守 hard_rules、comment_rules 和 style(所有项目都管), 别和 existing_comments 里已经有的问题重复; "
+                 + (COMMENTS_FOR_SET_SCORE if counted else
+                    "写完把整组交给 score_comments(帖子参数和这次一样: link, 或 post_title / post_body + "
+                    "project_id; 每条评论带 slot 的 id)。") + COMMENTS_FOR_RULES_NOW)
     out = {"resolved": True, "source": source, "project_id": project["id"],
            "project_name": project.get("name"),
            "post": {"title": title, "body": body[:_POST_BODY_CHARS]},
@@ -4459,7 +4542,7 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
     cfg_lines = _comment_set_lines(cfg) if cfg else []
     if cfg_lines:                                       # 有在数的数或配了列(复审 11-11: 都没有就不带一个空的 comment_set)
         out["comment_set"] = {"lines": cfg_lines, "column": column}
-        if _comment_set_counts(cfg):
+        if counted:
             out["next_step"] = next_step + COMMENT_SET_NEXT_STEP
         if column and len(existing) > tv_existing:
             out["next_step"] += (f"existing_comments 里 source 是「{column}」的, 是这条帖子那一格里已经有的维护评论: "
@@ -4498,15 +4581,33 @@ def _slot_of(value, by_id: dict) -> dict | None:
     return None
 
 
+# 整组里有评论不带 slot 时(一组不止四条就一定有), Jev 的整组参考是一句固定的话后面跟题目的 id(judge/comment_api.py):
+# 「评论区参考题（未验收）不理想：praise_share、has_friction」。id 模型看不懂、也没法照着做(2026-11-11, 审计 C7): 转给写手
+# 之前换成一句人话, 开头标明只是参考。四道题都没验收过(Jev 那边只提示、不判不过), 所以只说看到了什么, 不说该怎么改 ——
+# 说成改法的话模型会照着重写, 多出几轮。不认识的 id(Jev 以后加了新题)原样留着。
+THREAD_HINT_PREFIX = "评论区参考题（未验收）不理想："
+THREAD_HINT_NAMES = {"praise_share": "夸品牌的评论占了多数", "same_template": "夸品牌的几条是同一个句式",
+                     "has_friction": "没有质疑、追问价格或效果这类审慎的声音", "thread_arranged": "整体读着像安排出来的"}
+THREAD_HINT_HEAD = "整组参考(只是参考, 不用为它重写): "
+
+
+def _plain_thread_hint(why: str) -> str:
+    if not why.startswith(THREAD_HINT_PREFIX):
+        return why
+    ids = [x.strip() for x in why[len(THREAD_HINT_PREFIX):].split("、") if x.strip()]
+    return THREAD_HINT_HEAD + "、".join(THREAD_HINT_NAMES.get(x, x) for x in ids) if ids else why
+
+
 def _thread_lines(entries) -> list[str]:
-    """整组的修改单条目是 ``{"slot", "why"}``(judge/comments.py::thread_repair_plan): 折成「位 q1: …」一句。"""
+    """整组的修改单条目是 ``{"slot", "why"}``(judge/comments.py::thread_repair_plan): 折成「位 q1: …」一句。
+    不带 slot 的整组参考里题目的 id 换成人话(``_plain_thread_hint``)。"""
     out = []
     for e in entries or []:
         if not isinstance(e, dict):
             continue
         why = e.get("why") or e.get("instruction")
         if isinstance(why, str) and why.strip():
-            why = _no_post_ref(why)
+            why = _no_post_ref(why) if e.get("slot") else _plain_thread_hint(_no_post_ref(why))
             out.append(f"位 {e['slot']}: {why}" if e.get("slot") else why)
     return _note_post_ref(out)
 
@@ -4634,11 +4735,16 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         slot = _slot_of(c.get("slot"), by_id)
         if c.get("slot") not in (None, "") and slot is None:
             raise CommentInputError(f"第 {i + 1} 条评论的 slot {c.get('slot')!r} 不是 comments_for 给的评论位 id"
-                                    f"({' / '.join(by_id)}); 自定义评论位要传整个对象, 而且要带 id")
+                                    f"({' / '.join(by_id)}); 不属于这几种的评论不带 slot 就行, 去掉它的 slot、整组再送一次"
+                                    "(自定义评论位要传整个对象, 而且要带 id)")
         cands.append({"text": c["text"].strip(), "slot": slot, "reply_to_text": (c.get("reply_to_text") or "").strip()})
     ids = [c["slot"]["id"] for c in cands if c["slot"] and c["slot"].get("id")]
     if len(ids) != len(set(ids)):
-        raise CommentInputError("同一个评论位只能有一条(slot id 重复了): 想多写几条同类的, 分几次判, 或者给它们不同的 id")
+        # 2026-11-11(审计 F5 / C7): 原来说「分几次判, 或者给它们不同的 id」—— 分几次判整组的条数就数不准, 换一个 id 又被
+        # 上面那一道拒掉。能用的只有一条路: 多出来的不带 slot
+        dup = sorted({x for x in ids if ids.count(x) > 1}, key=ids.index)
+        raise CommentInputError(f"同一个 slot id 一次只能用在一条评论上({' / '.join(dup)} 重复了): 每个 id 留一条, "
+                                "其余几条去掉 slot, 整组再送一次(不用分几次判, 也不用另编 id)")
     style = [comment_style_issues(c["text"]) for c in cands]
     # 查帖子(链接 → TV → 项目 → 归属)也算进同一个截止: PostgREST 默认等 120 秒, 库一卡就远超 MCP 客户端 ~22 秒的
     # 容忍(codex review on aw#107; 同 _judge_tool_call / codex #95 的做法)。参数检查在这之前, 不碰库。
@@ -5141,6 +5247,8 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
         t0 = time.monotonic()
         try:
             hard, soft = store.shared_memories(client, project_id, user_id, rule_kinds=rulecheck.CHECK_KINDS)
+            # 开头那一句只说评论的规则, 检查只查评论(2026-11-11, 见 COMMENT_CHECK_NOTE 上面那段): 不拿它查标题和正文
+            hard, soft = [_comment_check_rule(r) for r in hard], [_comment_check_rule(r) for r in soft]
             # 方向闸: 同简报(build_writing_brief)和 my_rules 的「方向不符」。标了另一个方向的 soft 规则简报里没有, 这里
             # 再报「建议改」就是在叫模型写它没被要求、甚至相反的东西(产品向的"带上产品名"报到流量向项目上)。
             # hard 不过这道闸, 同简报。判据也同简报: 项目名 + 这场 open_project 传的 tactic(写手原样传回来, codex review
@@ -7863,6 +7971,9 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     ``check``(2026-10-20): 词表 / 某个词能不能出现在哪 / 字数范围这类规则, 再带一份代码能执行的形状, 存进
     ``rule_kind`` / ``rule_payload``, score_drafts 存档时逐篇查(deskcore/rulecheck.py)。**先校验再写**: check 写错
     整条不落库、报 CheckError(工具层映成 400), 免得规则记上了而检查是坏的、谁也不知道。
+
+    2026-11-11: 回包带 ``given_when_writing_comments``(这条规则写评论时给不给, 判据同 comments_for 的 ``_is_comment_rule``);
+    开头那一句只说评论的规则, check 的 where 存成只查评论(回包带 ``check_where_note``)。
     """
     # 审计 COR-015。scope='global' 时 project_id 其实不参与写入, 但照样校验 ——
     # 规则是"每个项目级入口都以这一行开头", 留例外就等于留一个以后会被忘掉的
@@ -7880,6 +7991,10 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     if scope not in ("project", "global"):
         raise RuleInputError("scope 只能是 'project' 或 'global'")
     rule_check = rulecheck.normalize_check(check) if check is not None else None
+    # 开头那一句只说评论的规则, check 只查评论(2026-11-11, 见 COMMENT_CHECK_NOTE 上面那段): 存下去的就是收窄之后的那一份
+    narrowed = rule_check is not None and _comment_only_where(content, rule_check[0], rule_check[1])
+    if narrowed:
+        rule_check = (rule_check[0], {**rule_check[1], "where": ["comments"]})
     applicability = (applicability or "").strip()
     if applicability not in DIRECTION_TAGS and [t for t in DIRECTION_TAGS if t in applicability]:
         raise RuleInputError(
@@ -7949,6 +8064,15 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
         if stored_kind != kind:
             out["check_warning"] = (f"请求 check.kind={kind}, 但库里这条现在是 {stored_kind!r} —— "
                                     "以库里的为准, 请把这个差异告诉用户")
+        elif narrowed:
+            out["check_where_note"] = COMMENT_CHECK_NOTE
+
+    # 这条规则写评论时给不给(2026-11-11, 审计 C1): 模型在写评论那场对话里记的规矩, 当场就知道下一组评论拿不拿得到它。
+    # 按库里实际的那一行算(原文 + 存下的 check), 和 comments_for 取规则是同一个判据(_is_comment_rule)
+    stored_row = {**(row or {}), "content": content}
+    if rule_check is not None and out["memory_id"]:
+        stored_row.update(rule_kind=(saved or {}).get("rule_kind"), rule_payload=(saved or {}).get("rule_payload"))
+    out["given_when_writing_comments"] = _is_comment_rule(stored_row)
 
     # 新记的(或改了原文 / 方向的)规则在后台编译(D-121), 不等冷却; 这个调用不等它。
     _kick_rule_compile(client, project_id, reason="record_rule", bypass_cooldown=True)
@@ -8006,10 +8130,15 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
             "muted_until": r.get("muted_until"),
             "created_at": r.get("created_at"),
         })
-        # 存档时会被代码逐篇查的那几条带上它的 check(10-20): 写手问"这条怎么没拦住"时看得见查的是什么
-        spec = rulecheck.spec_of(r)
+        # 存档时会被代码逐篇查的那几条带上它的 check(10-20): 写手问"这条怎么没拦住"时看得见查的是什么。
+        # 给的是查的时候真用的那一份(2026-11-11): 开头那一句只说评论的规则, where 按只查评论算(_comment_check_rule),
+        # 和库里存的不一样时带一句 check_note
+        effective = _comment_check_rule(r)
+        spec = rulecheck.spec_of(effective)
         if spec is not None:
             out[-1]["check"] = spec
+            if effective is not r:
+                out[-1]["check_note"] = MY_RULES_COMMENT_CHECK_NOTE
     order = {"生效中": 0, "方向不符": 1, "试用": 2, "已停用": 3}
     out.sort(key=lambda x: (order.get(x["state"], 9), -int(x["votes"] or 1)))
     counts: dict = {}

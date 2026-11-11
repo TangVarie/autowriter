@@ -12,7 +12,7 @@
 > **2026-10-19 · D-120 写手侧改版**（写作台工具面以这一段为准，下面表格里的旧行保留作历史）：
 > - 写完过 `check_drafts` 就调 **`score_drafts`**：存档（指纹、销角度、底稿）+ Jev 参考分（满分 100，每篇最多 3 条修改建议），**不拦交付**。`commit_drafts` 是它的旧名，过渡期保留。2026-11-10 起同一批里的重复说法和正文里混进来的版式残留带 `draft_checks`（先改再交）、开头一样的带 `batch_hints`（只提示），见 `docs/deskcore.md` §3.21。
 > - **`review_drafts` / `export_drafts` 两个工具撤了**：定稿由写手贴进飞书，发布后 `tv-sync` 按内容对回来（core 里的函数保留，不再暴露给模型）。
-> - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
+> - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。评论规则不只认「评论区：」开头：开头那一句说的是评论、或存的检查查评论的也算（2026-11-11，`docs/deskcore.md` §3.24）；评论位是四种评论，一组不止四条时其余的不带 slot。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
 
 > **2026-11-11**：项目定的评论配比写手可以在对话里改（**`set_comment_mix`**，只在用户明说时调；列改不了；留最近 20 次的记录）。钥匙对不上时 401 自己说收到的那一串长什么样，`/health` 多一块 `auth_rejections`（按固定的几个原因数被拒的请求，没有钥匙的任何一部分）。见 `docs/deskcore.md` §3.23。
 
