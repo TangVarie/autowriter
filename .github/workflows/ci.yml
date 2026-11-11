@@ -1738,8 +1738,12 @@ jobs:
                   # 跟 search_path 无关。以前不排也没事, 是因为带 CTE 的那个函数
                   # 正好把 autowriter 写进了 path; 现在有函数改用全限定写法(path 里
                   # 不再有 autowriter), 不排就会把 CTE 误报成够不着的裸表。
-                  ctes = set(re.findall(r"(?:WITH|,)\s*([a-z_][a-z0-9_]*)\s+AS\s*\(",
-                                        stmt, re.I))
+                  # 2026-11-11: `WITH cand AS MATERIALIZED (` 也是 CTE(019 的两个查重函数;
+                  # MATERIALIZED 是那次修法的一半, 去不得)。只认 `AS (` 的话 cand 被当成
+                  # 够不着的裸表, 这一步对着一份没毛病的基线报红。
+                  ctes = set(re.findall(
+                      r"(?:WITH|,)\s*([a-z_][a-z0-9_]*)\s+AS\s*(?:(?:NOT\s+)?MATERIALIZED\s*)?\(",
+                      stmt, re.I))
                   bare = refs - qualified - ctes
                   if bare:
                       # 裸用表 → 只有 search_path 里有 autowriter 才够得着。
