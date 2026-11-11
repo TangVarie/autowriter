@@ -1318,7 +1318,7 @@ select created_at,
 - 协议里写规则的例句有一句「…占八成」（说的是品牌叫法的比例），容易被读成「八成评论要带品牌」；协议冻结，只在 `comment_set` 第一句里说「品牌怎么称呼照项目规则」。
 - Jev 的 `reader_value` 提示把品牌名算作可行动信息，会把模型往加品牌上推；那是只提示的题，没动。
 
-回归：`tests/test_comment_rules_1111.py`（复审 11-11：没配 `comment_set` 时那一句的开头和不带 `set_next_step`、`set_next_step` 按报了的几样拼、新加的几句里没有「最新」「前面对话里的说法」、用户明说的配比照用户的、P0 用 `LENGTH_RULE_TAIL_HARD`、「一个字都不能错」这类不算字数、管评论的规则不补那一句；Q1 两条路、Jev 那几句只补一次、补的那句在截断之后；Q2 / Q3 两句在 `style` 里紧跟代码查的那几句、只给细节那道题补；整组那一句的原文、`set_next_step` 判成 / 没判成 / 没有那一句三种、`comment_set` 第一句和 next_step、`rules_note` 只在有规则时、停掉的规则下一次不给、`my_rules.state_note`、工具说明、新加的话里没有工程指令和「归档」；笔记那一侧：字数规则的认法、P0 / P1 只接一次、存了 `max_len` 也算、没有就不接、在贴型那句前面、下限那句的原文）；`tests/test_commentstyle_set_checks.py`（Q1 正反例各二十多条，复审加了这篇 / 笔记里、字帖子、去掉后不剩半截的引法，和帖当药、当字帖讲的反例、一条里几处都引出来、两句只给模型看）；跟着改的：`tests/test_comment_set_score.py`、`tests/test_comment_brand_endings.py`、`tests/test_deskcore_score_and_comments.py`、`tests/test_rulecheck.py`。
+回归：`tests/test_comment_rules_1111.py`（复审 11-11：没配 `comment_set` 时那一句的开头和不带 `set_next_step`、`set_next_step` 按报了的几样拼、新加的几句里没有「最新」「前面对话里的说法」、用户明说的配比照用户的、P0 用 `LENGTH_RULE_TAIL_HARD`、「一个字都不能错」这类不算字数、管评论的规则不补那一句；Q1 两条路、Jev 那几句只补一次、补的那句在截断之后；Q2 / Q3 两句在 `style` 里紧跟代码查的那几句、只给细节那道题补；整组那一句的原文、`set_next_step` 判成 / 没判成 / 没有那一句三种、`comment_set` 第一句和 next_step、`rules_note` 只在有规则时、停掉的规则下一次不给、`my_rules.state_note`、工具说明、新加的话里没有工程指令和「归档」；笔记那一侧：字数规则的认法、P0 / P1 只接一次、存了 `max_len` 也算、没有就不接、在贴型那句前面、下限那句的原文）；`tests/test_commentstyle_set_checks.py`（Q1 正反例各几十条，11-11 变异测试后每个前缀、中间字和排除字都有单独一条；复审加了这篇 / 笔记里、字帖子、去掉后不剩半截的引法，和帖当药、当字帖讲的反例、一条里几处都引出来、两句只给模型看）；跟着改的：`tests/test_comment_set_score.py`、`tests/test_comment_brand_endings.py`、`tests/test_deskcore_score_and_comments.py`、`tests/test_rulecheck.py`。
 
 ## 4. 接入
 
