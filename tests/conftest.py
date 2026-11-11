@@ -77,6 +77,16 @@ def _angle_priors_cache():
     priors.reset_cache()
 
 
+# ── 每次工具调用留一行只有数的记录(deskcore/calllog.py, 2026-11-11) ──────────────────────────────────────────
+# 生产里默认开: REST / MCP 每次工具调用之后, 后台线程往 batch_metrics 写一行。用例里默认关掉, 理由同下面那个后台复查:
+# 后台线程会在用例跑完之后还往同一个假件上写(数写入次数的断言时红时绿), 假件换回去之后又会去连占位的 Supabase 地址。
+# 要测它的用例自己把开关打开、把队列换成新的(tests/test_tool_call_log.py)。
+@pytest.fixture(autouse=True)
+def _tool_call_log_off(monkeypatch):
+    monkeypatch.setenv("DESKCORE_TOOL_CALL_LOG", "0")
+    yield
+
+
 # ── 改稿的后台规则复查(AU-F07, deskcore/core.py 的 _revision_rule_recheck) ──────────────────────────────────
 # 生产里存完档在一个后台线程里跑 check_rules。用例里默认关掉: 后台线程会在用例跑完之后还往同一个假件上发请求(数请求的
 # 断言时红时绿), 还会去碰别的用例换掉的 store / judge_client。要测它的用例自己把池子换成就地跑的(tests/test_revision_recheck.py)。

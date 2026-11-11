@@ -175,7 +175,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | | `check_rules` | **存档之后按规则逐篇查，只作建议**（2026-10-20，D-121）：规则事先由 Jev 编成是非题 / 代码检查、缓存在 `rule_compiles`；hard 没守住报「必须改」，soft 报「建议改」，Jev 拿不准的单列「拿不准」，到点没判完的报「没判完」。不拦存档、不改稿（见 §3.11） |
 | （已撤） | `review_drafts` / `export_drafts` | 2026-10-19 撤掉（D-120）：写手没有人审、导出、存档这几步，定稿贴进飞书，`tv-sync` 按内容对回来。§3.4 / §3.6 留作历史 |
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
-| 写评论 | `comments_for` / `score_comments` | 按链接（或贴来的正文）一次拿齐帖子、规则、评论位和项目定的配比 → 整组判一次、不存库（§3.14 起的各节，配比见 §3.20） |
+| 写评论 | `comments_for` / `score_comments` | 按链接（或贴来的正文）一次拿齐帖子、规则、评论位和项目定的配比 → 整组判一次、不存库（§3.14 起的各节，配比见 §3.20；每次调用只留一行计数，见 §3.8 末尾） |
 | | `set_comment_mix` | **用户明说要改项目的评论配比时**改 `comment_set` 里的四个数（提品牌上限、中性下限、短评下限、短评字数），回改之前 → 改之后；列改不了；留最近 20 次的记录（2026-11-11，§3.23） |
 | 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0；2026-10-20 起可带 `check`，存档时用代码逐篇查（§3.10） |
 | | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
@@ -625,6 +625,132 @@ select dims->>'emotional_lever' as lever, count(*) as published,
        count(*) filter (where tier in ('爆', '大爆')) as bao
   from autowriter.v_angle_outcomes where note_id is not null
  group by 1 order by bao desc;
+```
+
+**每次工具调用留一行，只有数（2026-11-11，`deskcore/calllog.py`）。** 原来只有 `score_drafts` 在 `batch_metrics` 里留一行。
+开项目、查重、查规则各用了多久、怎么收场的，写评论那一路判了几条、哪一样检查打回了几条，库里一个数都没有，只能翻只留
+一周左右的网关日志（W-33 / W-38 / W-41 / W-42 / W-51 的周检都靠它）。现在 REST 和 MCP 给工具计时的那两处
+（`app.py` 的 `rest_tool` 和 `_wrap`），回包定下来之后把这一次交给后台，写一行 `autowriter.batch_metrics`：
+`meta.mode = 'tool_call'`，`batch_id` 空着，**不加迁移**（`batch_id` / `project_id` 可空、`user_id` 非空，
+`migrations/000_baseline.sql`，2026-11-11 在生产库 `information_schema` 核过）。
+
+- **不改、不拖慢、不弄坏回包。** 交接只是往一个有上限的队列里放一下（最多等 200 项，满了新的直接丢）；摘数和写库都在后台
+  一个线程里。写不进去只记一行 WARNING（`deskcore.calllog`，5 分钟最多一行，只带异常类型和错误码），队列满了同样。
+  进程退出时最多等 2 秒把剩下的写完，写不完就算了：这是给复盘攒数的，丢几行不影响任何人。
+- **只留数、固定的词和 8 位代号。** 稿子、评论、帖子、规则、回包里的任何一段文字都不进这一行（`calllog.build` 只从固定
+  的位置取条数、布尔和固定的词，最后 `_clean` 再筛一遍，不是整数 / 布尔 / 认得的词的一律丢掉；
+  `tests/test_tool_call_log.py` 拿现编的标记串逐行查）。评论照旧不存库，存的只是这一行计数。
+- **不记的**：`get_protocol`、`/health` 这类不是工具的端点、认不出调用者的调用（`user_id` 是非空列，不编一个填进去）、
+  参数没过 MCP 校验的调用（到不了计时的那一处，服务日志里有一行）、开关关着时的全部调用。
+- **开关**：`DESKCORE_TOOL_CALL_LOG=0` 关掉，默认开。
+- **读这张表的地方都要按 `meta.mode` 或 `batch_id` 筛。** 历史页的 `db.list_batch_metrics` 改成只读 `batch_id` 不为空的行
+  （不筛的话一天几十上百行的调用记录会把批次指标挤出最近 N 条）；本文档里的查询和 TV `verify_supabase_state.sql` #104 都带
+  `meta->>'mode' = 'deskcore_commit'`，不受影响。以后新写的查询照这个来。
+
+`project_id` 那一列只在调用成了的时候填（评论工具填服务端对上的那个项目）；没成的调用带来的 project_id 可能是抄错的、别人的，
+只在 `meta.project8` 留前 8 位。`phase_ms = {"total": 毫秒}`，其余都在 `meta` 里：
+
+| 键 | 哪些调用有 | 是什么 |
+|---|---|---|
+| `tool` / `channel` / `elapsed_ms` | 全部 | 工具名、`rest` / `mcp`、服务端这一次用了多久 |
+| `outcome` / `error_class` | 全部 / 没成的 | `ok`；`error_result`（没抛、但回的是带 `error` 的降级结果）；`refused`（400 / 403 / 404 / 409 那几类正常拒绝）；`failed`（真故障）；`interrupted`（客户端断了）。后三种带异常类型（同服务日志那一行） |
+| `items` / `reply_chars` | 有才带 | 这次带了几篇稿 / 几条评论 / 几个版本（发牌是要几张）；回包的字符数（紧凑 JSON，中文一个字算一个） |
+| `skill` | `open_project` / `comments_for` | 这次报上来的 skill 版本：`up_to_date` / `outdated` / `unknown`（没报） |
+| `check` | `check_drafts` | `total` / `pass` / `warn` / `reject`；`decided_by` 是可疑和拒的各由哪个信号定的（`opening` / `title` / `ngram` / `contain`，一篇可以有几个）；`gates` 是不是撞车的拒（`replace_lookup` 这类）；`semantic_degraded` |
+| `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks` |
+| `comments.checks` | `score_comments` | `style` 是写法底线每样打回几条（`period` 句号 / `dialect` 方言语气词 / `contact` 像要联系方式 / `post_ref` 提了帖子 / `vague` 含糊指代）；`brand_over`（提品牌超出几条）、`repeats`（说法或开头重复的几条）、`endings_over`（品牌收尾超出几条）、`short_by` / `neutral_by`（短评、中性还差几条；项目没定这一项、或中性没判成时没有这个键）；`fix` / `style_fix`（带这两样的各几条）、`thread_fix` / `thread_hints`（整组的各几句） |
+
+它说得出一场走到了哪一步、每一步多久、评论判了几轮，说不出一场为什么停、是谁在打字。
+
+**存档那一行多三小块（同日，审计 A3 / A8 / A5）。** 都只有数和固定的词，只进 `meta`、不进回包，哪一块算不出来就不带哪一块：
+
+- `flywheel_lessons`：这个（项目，身份）近 12 小时借卡的情况。`borrows` 借了几次（0 = 没借过或进程重启过，不知道）；
+  `shown` / `status` 是最近一次带出去几张经验卡、什么结局（`borrowed` / `empty` / `timeout` / `error` / `not_configured`）；
+  `shown_max` 是最多的一次几张；`statuses` 是各种结局各几次。记的是简报实际带出去的那一份（超时 = 0，后台之后选完的不算）。
+  团队共用一个身份时分不出是哪一场借的：`shown_max = 0` 才能确定这一批没参照过卡。
+- `skill_versions`：近 24 小时报上来的 skill 版本构成（`skillcheck.health`，同 `/skill-versions`）：`current`、
+  `up_to_date` / `outdated` / `unknown` 各几个、`outdated_versions`（旧版各是哪一版；认不出 12 位十六进制的并进 `other`）。
+  数的是「身份 × 版本」，读作有几种版本在用，不是人数。原来只在进程内存里、要带 key 读、重新部署就清零。
+- `rule_compile`：这个项目最近一次规则编译（后台补编 / CLI）的收场：`status`、`uncompiled`（还有几条没编出来；规则池读不出来时
+  没有这个键）、`not_compilable`、`error_kinds`（没编出来的按种类各几条：`refusal` 拒答 / `truncated` 截断 /
+  `generator_http_529` 这类生成端状态码 / `generator_timeout` / `bad_output` / `batch_timeout` 这类整批的结局 …）、
+  `age_s`（这是多久之前的数）。这一轮没发、沿用上一轮种类的另带 `error_kinds_age_s`。本进程还没编过这个项目（刚重启）就不带。
+
+```sql
+-- 每个工具调了几次、多久、多长(近 7 天)
+select meta->>'tool' as tool, meta->>'channel' as channel, count(*),
+       round(avg((meta->>'elapsed_ms')::int)) as avg_ms,
+       percentile_cont(0.95) within group (order by (meta->>'elapsed_ms')::int) as p95_ms,
+       round(avg((meta->>'reply_chars')::int)) as avg_reply_chars
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and created_at > now() - interval '7 days'
+ group by 1, 2 order by 3 desc;
+
+-- 没成的调用: 哪个工具、哪种结局、哪类异常
+select meta->>'tool' as tool, meta->>'outcome' as outcome, meta->>'error_class' as error_class, count(*)
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and meta->>'outcome' <> 'ok' and created_at > now() - interval '7 days'
+ group by 1, 2, 3 order by 4 desc;
+
+-- 一场走到了哪一步: 每个项目每天各工具调了几次(发了牌、查了重却没有 score_drafts 的那几天一眼看得出)
+select day, p, jsonb_object_agg(tool, n order by tool) as calls
+  from (select (created_at at time zone 'Asia/Shanghai')::date as day,
+               coalesce(left(project_id::text, 8), meta->>'project8') as p,
+               meta->>'tool' as tool, count(*) as n
+          from autowriter.batch_metrics
+         where meta->>'mode' = 'tool_call' and created_at > now() - interval '7 days'
+         group by 1, 2, 3) t
+ group by 1, 2 order by 1 desc, 2;
+
+-- 查重: 可疑和拒的是哪个信号定的
+select s.status, sig.key as signal, sum(sig.value::int) as drafts
+  from autowriter.batch_metrics m,
+       jsonb_each(coalesce(m.meta->'check'->'decided_by', '{}'::jsonb)) as s(status, signals),
+       jsonb_each_text(s.signals) as sig
+ where m.meta->>'mode' = 'tool_call' and m.meta->>'tool' = 'check_drafts'
+   and m.created_at > now() - interval '14 days'
+ group by 1, 2 order by 3 desc;
+
+-- 评论(W-51): 判了几次、几篇帖子、一篇帖子判几轮、整组过了几次、被拒的调用几次
+select count(*) as score_calls,
+       count(distinct meta->'comments'->>'post8') as posts,
+       round(count(*) filter (where meta->>'outcome' = 'ok')::numeric
+             / nullif(count(distinct meta->'comments'->>'post8'), 0), 1) as calls_per_post,
+       count(*) filter (where meta->'comments'->>'passed' = 'true') as sets_passed,
+       count(*) filter (where meta->>'outcome' = 'refused') as refused,
+       sum((meta->'comments'->>'n')::int) as comments_judged,
+       sum((meta->'comments'->>'no_slot')::int) as without_slot
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and meta->>'tool' = 'score_comments'
+   and created_at > now() - interval '7 days';
+
+-- 评论: 每样检查打回了几条(配比 / 重复 / 短评 / 品牌收尾 / 写法底线各样)
+select k.key as check_name, sum(k.value::int) as comments, count(*) filter (where k.value::int > 0) as calls
+  from autowriter.batch_metrics m,
+       jsonb_each_text((m.meta->'comments'->'checks') - 'style' || coalesce(m.meta->'comments'->'checks'->'style', '{}'::jsonb)) as k
+ where m.meta->>'mode' = 'tool_call' and m.meta->>'tool' = 'score_comments'
+   and m.created_at > now() - interval '7 days'
+ group by 1 order by 2 desc;
+
+-- 写手手上的 skill: 入口工具每次报上来的版本(按天)
+select (created_at at time zone 'Asia/Shanghai')::date as day, meta->>'tool' as tool, meta->>'skill' as skill, count(*)
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and meta ? 'skill' and created_at > now() - interval '14 days'
+ group by 1, 2, 3 order by 1 desc, 4 desc;
+
+-- 存档那一行的三小块: 没参照过卡的批次占多少、skill 版本构成、规则还有几条没编出来
+select count(*) as commits,
+       count(*) filter (where (meta->'flywheel_lessons'->>'borrows')::int > 0) as borrow_known,
+       count(*) filter (where (meta->'flywheel_lessons'->>'shown_max')::int = 0) as no_cards,
+       count(*) filter (where (meta->'skill_versions'->>'outdated')::int > 0) as with_outdated_skill,
+       count(*) filter (where (meta->'rule_compile'->>'uncompiled')::int > 0) as with_uncompiled_rules
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'deskcore_commit' and created_at > now() - interval '14 days';
+
+select created_at, left(project_id::text, 8) p, meta->'rule_compile' as rule_compile
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'deskcore_commit' and (meta->'rule_compile'->>'uncompiled')::int > 0
+ order by created_at desc limit 20;
 ```
 
 ### 3.9 交付版式由代码拼（2026-10-20）
@@ -1432,6 +1558,7 @@ env：
 | `RULE_COMPILE_TIMEOUT_SEC` | 可选 | 默认 `420`，夹在 60–900。规则编译（§3.11）一次请求的读超时；Jev 最坏约 361 秒，所以至少 400。只有后台线程和 CLI 用它 |
 | `RULE_COMPILE_BATCH` | 可选 | 默认 `60`，夹在 1–60（Jev 的上限）。一次编几条 |
 | `RULE_COMPILE_AUTO` | 可选 | 默认开。`0` 关掉 `open_project` / `record_rule` / `check_rules` 触发的后台补编，只剩 `cli compile-rules`。上线补编（`compile-rules --all`）那一阵要先设 `0`，跑完再去掉：CLI 和服务进程的后台补编不共用锁，同时编会付两遍钱（§3.11） |
+| `DESKCORE_TOOL_CALL_LOG` | 可选 | 默认开。`0` 关掉「每次工具调用留一行只有数的记录」（§3.8 末尾）：一行不写，别的都不变 |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
 

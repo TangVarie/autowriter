@@ -3124,6 +3124,31 @@ def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
     return str(row["id"]) if row.get("id") else None
 
 
+TOOL_CALL_MODE = "tool_call"
+
+
+def insert_tool_call_metrics(sb, *, project_id: str | None, user_id: str, phase_ms: dict, counters: dict,
+                             meta: dict) -> None:
+    """一次工具调用的留痕(deskcore/calllog.py, 2026-11-11), 落一行 ``batch_metrics``, ``meta.mode = 'tool_call'``。
+
+    同 ``insert_commit_metrics``: 不加迁移, ``batch_id`` 留 NULL。和存档那一行(``deskcore_commit``)、Streamlit 生成的那两种
+    靠 ``meta.mode`` 分开 —— mode 在这里写死, 调用方漏传也不会落一行分不出来的。读这张表的地方都要按 mode 或 batch_id 筛
+    (历史页 ``db.list_batch_metrics`` 只读有 batch_id 的行)。
+    列的约束(migrations/000_baseline.sql; 2026-11-11 在生产库 information_schema 核过): ``batch_id`` / ``project_id`` 可空,
+    ``project_id`` 有外键(调用没成时调用方传 None), ``user_id`` 是非空的 uuid —— 认不出调用者的调用 calllog 不记。
+    ``meta`` 里只有数、固定的词和 8 位代号, 没有任何稿子 / 评论 / 规则的文字(calllog.build 保证)。异常原样上抛, calllog 自己吞。
+    """
+    sb.table("batch_metrics").insert({
+        "batch_id": None,
+        "project_id": project_id,
+        "user_id": user_id,
+        "phase_ms": phase_ms or {},
+        "counters": counters or {},
+        "meta": {**(meta or {}), "mode": TOOL_CALL_MODE},
+        "injection": {},
+    }).execute()
+
+
 def update_commit_metrics_meta(sb, row_id: str, meta: dict) -> None:
     """把一行 ``batch_metrics`` 的 ``meta`` 整个换成传进来的这份(调用方先把原来那份并进来)。只给改稿的后台规则复查
     (AU-F07)用: 这一行是同一次存档刚插的, 别处不会改它, 整列替换不会盖掉谁。异常原样上抛, 调用方自己吞。"""

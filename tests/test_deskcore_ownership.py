@@ -265,6 +265,16 @@ UNGATED_WITH_REASON = {
                                 "version_id 经 store.items_for_versions(inner join 钉死项目)核, 别的项目的查不出来、按拒处理",
     "_note_patterns_shown":   "F13: 借卡交出去之后把给了几条规律记进进程内存(不读写库), 只被已过闸的 borrow_lessons / "
                               "build_writing_brief(经 _borrow_for_brief_bounded)调",
+    # 存档那一行指标里另外三小块(2026-11-11, docs/deskcore.md §3.8): 都只读写进程内存里的几个数, 不碰库
+    "_note_lessons_shown":    "同 _note_patterns_shown: 借卡交出去之后把带出去几张卡、什么结局记进进程内存(不读写库), "
+                              "只被已过闸的 borrow_lessons / build_writing_brief(经 _borrow_for_brief_bounded)调",
+    "_lessons_meta":          "只被 _commit_side_meta(已过闸的 commit_drafts 经 _record_commit_metrics 调)用: 读进程内存里"
+                              "这个 (项目, 身份) 的借卡记录, 只回几个数, 不读写库",
+    "_note_compile_outcome":  "只被 compile_rules 收场时调(它自己过闸, 或是运维 / 后台路径): 把这次编译的结局、没编出来的条数"
+                              "和错误种类记进进程内存, 不读写库, 不留规则原文",
+    "_rule_compile_meta":     "只被 _commit_side_meta 调: 读进程内存里这个项目最近一次编译的收场, 只回数和固定的词, 不读写库",
+    "_commit_side_meta":      "只被 _record_commit_metrics(已过闸的 commit_drafts 调)用: 把上面两块和 tools 层传进来的 skill "
+                              "版本计数拼进这一行指标, 自己不读写库",
 }
 
 

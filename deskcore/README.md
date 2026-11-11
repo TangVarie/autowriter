@@ -42,6 +42,7 @@
 | 已经发出去、没走 commit 的稿子永远补不回指纹库 | 工具 `ingest_published`（运营在 WorkBuddy 里把表粘给模型，≤ 50 条一次，重复调安全）或 `python -m deskcore.cli ingest --xlsx 飞书表` 从导出格式或「标题/正文」两列读回来，建身份（出处记在 `batches.params`，**不碰** `items.external_source`——那列是 TV 同步的标记）+ 写指纹，**不过闸**——已发生的事实拦它没有意义 |
 | 交付的稿子入库时没有任何「像不像、踩没踩线」的判定，写作台的稿和已发布笔记也没法用同一把尺子比 | `commit_drafts` 入库、放锁之后把稿子发给 JevforCoentent 的 judge（`judge_client.py`，HTTP，deskcore 仍零 LLM），答案进 TV 账本 `aw_version`；**不拦**，结局在返回值的 `judge` 与 `batch_metrics` 里（2026-10-19 起 D-120：每篇带参考分 `score` 与 `fixes` 给写手看，不再是影子）。只判走写作台交付的稿，补录进来的已发布笔记归 TV 事后抽取。见 `docs/deskcore.md` §3.8 |
 | TV 里 5966 条已发笔记一条都认不回写作台（lineage 全 NULL）；让运营手抄六个 ID 列进飞书三周零匹配 | `tv-sync`（`migrations/009`）在库里按内容对：正文前 40 字 / 标题 / 时间窗内四字串包含度；对不上的直接从 TV 的全文补录进指纹库；`--write-tv` 才回填 TV 的两列。**运营不做任何事，飞书表不加列**。见 `docs/deskcore.md` §3.7 |
+| 只有 `score_drafts` 在库里留一行；开项目、查重、查规则多久、怎么收场，写评论那一路判了几条、哪一样检查打回几条，只能翻留一周左右的网关日志 | 每次工具调用（REST 和 MCP 都算）回包之后，后台往 `batch_metrics` 写一行只有数的记录（`meta.mode = 'tool_call'`，`deskcore/calllog.py`）：工具、通道、耗时、结局、条数、回包多长，查重的过 / 拒和定的信号，评论每样检查的条数。稿子、评论、规则的字一个都不存；写不进去不影响回包；`DESKCORE_TOOL_CALL_LOG=0` 关掉。存档那一行另记借卡带出去几张卡、skill 版本构成、规则还有几条没编出来。见 `docs/deskcore.md` §3.8 末尾 |
 
 > 另有两条改在**常规生成那条路**（根目录的 `memory.py` / `generation_service.py`），
 > 不经过 deskcore，列在这里只是免得两边打架：未验证的经验卡现在会在提示词里

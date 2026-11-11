@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import core, skillcheck, vocab
+from . import calllog, core, skillcheck, vocab
 
 logger = logging.getLogger("deskcore.tools")
 
@@ -98,6 +98,9 @@ def _attach_skill_update(out: Any, tool: str, user_id: str | None, raw_version,
         return out
     if update:
         out["skill_update"] = update
+    # 调用留痕(calllog): 这次报上来的版本是最新 / 旧版 / 没报, 只记这一个词
+    calllog.note(skill=skillcheck.OUTDATED if update else
+                 skillcheck.UNKNOWN if skillcheck.normalize(raw_version) is None else skillcheck.UP_TO_DATE)
     return out
 
 
@@ -581,6 +584,16 @@ def _add_check_next_step(out: dict) -> None:
         out["next_step"] = CHECK_NEXT_STEP.format(n=n, warn=CHECK_NEXT_STEP_WARN.format(m=warn) if warn else "")
 
 
+def _skill_versions_now() -> dict | None:
+    """近 24 小时报上来的 skill 版本构成(skillcheck.health), 交给 core 写进存档那一行指标(meta.skill_versions; 审计 A8:
+    计数原来只在进程内存里, 要带 key 读 /skill-versions, 重新部署就清零)。只有计数。读不出协议版本就不带; **不抛**。"""
+    try:
+        return skillcheck.health(protocol_text()[1])
+    except Exception:  # noqa: BLE001
+        logger.warning("score_drafts: 这次没取到 skill 版本计数, 指标里不带这一块", exc_info=True)
+        return None
+
+
 def check_drafts(project_id: str, drafts: list[dict],
                  _user_id: str | None = None) -> dict:
     """查重硬闸。成稿后【必须】调这个才能交付。
@@ -903,7 +916,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     # 正文 / 标题放错了字段的先对上(_draft_fields): 存进 versions 的正文就是对上的那份, 之后 check_rules 查的也是它。
     drafts = _draft_fields(drafts, "score_drafts", project_id)
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "",
+                              skill_versions=_skill_versions_now())
 
 
 def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user_id: str | None = None) -> dict:
@@ -971,7 +985,8 @@ def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", t
     # 同 score_drafts: 写操作, 不包 _safe; 放错字段的一样先对上。
     drafts = _draft_fields(drafts, "commit_drafts", project_id)
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "",
+                              skill_versions=_skill_versions_now())
 
 
 INGEST_MAX_PER_CALL = 50
