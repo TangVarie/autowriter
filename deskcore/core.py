@@ -3625,7 +3625,7 @@ def _mix_chars(v) -> int:
     shown = v
     if isinstance(v, str):
         t = v.strip()
-        if t.isascii() and t.isdigit():
+        if t.isdigit():
             v = int(t)
     elif isinstance(v, float) and v == v and abs(v) != float("inf") and v == int(v):   # 先挡 nan / inf, 再 int()
         v = int(v)
