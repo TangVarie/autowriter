@@ -5,9 +5,11 @@
      补一句「评论里不提帖子」, 细节没过的那一句补一句「点到就够, 不加长」;
   2. 不为凑字数加话、常识不写成新发现: 只给模型看(comments_for.style、交付模板的 task), 代码不查;
      score_comments 的 note 说照 fix / hints 改不是要加长;
-  3. 整组代码查那一句: 里面有配比的数时说清条数是负责人给这个项目定的、项目规则(和之前见过的规则原文)说法不一样的以它为准,
-     直接改, 不问用户、不报负责人; 用户这次明说要别的配比就照用户的(不压用户, 不说「最新」); 只有所有项目都管的几样时
-     不说是负责人定的、不带 set_next_step; set_next_step 按报了的几样拼(判成和没判成两条路都带);
+  3. 整组代码查那一句: 里面有配比的数时说清条数是这个项目定的配比、项目规则(和之前见过的规则原文)说法不一样的以它为准,
+     直接改, 不问用户、不报负责人; 用户这次明说要别的配比就照用户的(不压用户, 不说「最新」), 明说这个项目以后都按新的就调
+     set_comment_mix(11-11 晚 owner 开放了配比, 见 tests/test_set_comment_mix.py; 「是负责人给这个项目定的」跟着改成
+     「这个项目定的配比」: 数可能是写手照用户说的改过的); 只有所有项目都管的几样时
+     不说是项目定的配比、不带 set_next_step; set_next_step 按报了的几样拼(判成和没判成两条路都带);
      comments_for 的 comment_set 第一句、next_step 同一个口径;
   4. 规则过时了写手自己停: comments_for 有规则时带 rules_note, my_rules 带 state_note(试用、已停用的不用守、不算冲突);
   5. 笔记那一侧: 简报里有规则说到字数时补一句(硬约束在 P0: 字数照守、只拿具体内容补; 只有软规则在 P1: 不是要凑够的数,
@@ -119,7 +121,7 @@ SHORT_FAIL = [BRANDED[0], BRANDED[1], "我自己是先投小公司练手的，�
 
 
 def test_set_line_head_says_whose_numbers_and_what_to_do():
-    assert core.SET_LINE_HEAD == "整组代码查(条数是负责人给这个项目定的, 项目规则里说法不一样时以这里为准; 直接改, 不用问用户): "
+    assert core.SET_LINE_HEAD == "整组代码查(条数是这个项目定的配比, 项目规则里说法不一样时以这里为准; 直接改, 不用问用户): "
     assert core.SET_LINE_HEAD_ALL == "整组代码查(所有项目都管; 直接改, 不用问用户): "
     for head in (core.SET_LINE_HEAD, core.SET_LINE_HEAD_ALL):
         assert head.startswith("整组代码查"), "工具说明和回包都按这四个字认那一句"
@@ -138,13 +140,14 @@ def test_short_floor_failure_carries_the_head_and_the_set_next_step(wired):
 
 
 def test_set_next_step_text():
-    assert core.SET_NEXT_STEP == ("thread_fix 第一句里提品牌、中性、短评的条数是负责人给这个项目定的: 照它点名的几条直接改, "
+    assert core.SET_NEXT_STEP == ("thread_fix 第一句里提品牌、中性、短评的条数是这个项目定的配比: 照它点名的几条直接改, "
                                   "改完整组再判一次; 不用问用户, 也不用报给负责人。")
     assert core.SET_BRAND_STEP == ("项目规则里或之前见过的规则原文说要每条带品牌、要几条夸或背书的, 以这里的条数为准, "
                                    "不算冲突。")
     assert core.SET_SHORT_STEP == "短评不够: 把点名的几条压短, 或换成一句话短评(比如「蹲一个」「同问」), 这不算改口气。"
     assert core.USER_MIX_NOTE == ("用户这次明说要别的配比(比如每条都带品牌), 这一组就照用户的写, 交付时一句话说明和项目定的"
-                                  "配比不一样; 项目定的配比在对话里改不了。")
+                                  "配比不一样; 用户明说这个项目以后都按新的配比, 就调 set_comment_mix 把项目的数改掉, "
+                                  "不用找负责人。只有用户明说才改: 不为了让这一组通过自己去改配比。")
     assert core.RULE_SELF_SERVICE == ("用户说哪条项目规则过时了: 当场用 set_rule_state 停掉(以后都不要用 retire, 先停一阵用 "
                                       "mute; memory_id 在 my_rules 里), 不用等负责人; 要换成新说法用 record_rule。")
 
@@ -179,14 +182,14 @@ def test_judge_down_still_carries_the_set_next_step(wired):
 
 
 def test_without_a_comment_set_the_line_is_not_called_the_owners_numbers(wired):
-    """复审 11-11: 没配 comment_set 的项目, 整组那一句只有重复、品牌收尾(所有项目都管): 不说是负责人给这个项目定的,
+    """复审 11-11: 没配 comment_set 的项目, 整组那一句只有重复、品牌收尾(所有项目都管): 不说是这个项目定的配比,
     不带 set_next_step(不叫模型拿它压过「每条都带品牌」的规则; 那几条的 style_fix 有 style_next_step)。"""
     _, reply = wired
     texts = ["示例牌的老师很耐心", "示例牌的课排得紧", "示例牌的顾问回得快", "同问价格"]
     reply["fn"] = _judge(_acts(texts))
     out = _score(_client(cfg=None), texts)
     assert out["thread_fix"][0].startswith(core.SET_LINE_HEAD_ALL + "重复的说法")
-    assert "负责人" not in out["thread_fix"][0]
+    assert "负责人" not in out["thread_fix"][0] and "项目定的" not in out["thread_fix"][0]
     assert "set_next_step" not in out and out["style_next_step"] == core.COMMENT_STYLE_NEXT_STEP
 
 
@@ -222,7 +225,7 @@ def test_comments_for_comment_set_block_says_whose_numbers_they_are():
     out = core.comments_for(_client(), user_id=ME, link=LINK)
     lines = out["comment_set"]["lines"]
     assert lines[0] == core.COMMENT_SET_HEAD
-    assert core.COMMENT_SET_HEAD == ("下面几个数是负责人给这个项目定的配比: 项目规则里或之前见过的规则原文要每条带品牌、"
+    assert core.COMMENT_SET_HEAD == ("下面几个数是这个项目定的配比: 项目规则里或之前见过的规则原文要每条带品牌、"
                                      "要几条夸或背书的, 照这里写, 不算冲突; 品牌怎么称呼(全称、简称)照项目规则; "
                                      "不用问用户, 也不用报给负责人。" + core.USER_MIX_NOTE)
     assert lines[1].endswith("不提品牌时也不用代称(这家、它家、缩写)"), "「以这一句为准」并进第一句了"
@@ -230,6 +233,10 @@ def test_comments_for_comment_set_block_says_whose_numbers_they_are():
     assert not any("太短过不了" in x for x in lines)
     assert out["next_step"].count(core.COMMENTS_FOR_RULES_NOW) == 1
     assert core.COMMENT_SET_NEXT_STEP in out["next_step"] and "不算冲突, 不用问用户" in core.COMMENT_SET_NEXT_STEP
+    assert core.COMMENT_SET_NEXT_STEP == (
+        "这个项目定了一组的配比(comment_set.lines), 和 style 一样要守; 项目规则里说法不一样的以它为准, 不算冲突, 不用问用户; "
+        "用户这次明说要别的配比, 这一组就照用户的写, 交付时一句话说明; 用户明说这个项目以后都按新的配比, 调 set_comment_mix 改, "
+        "不用找负责人。")
     assert "只拿来避开重复, 配比照 comment_set" not in out["next_step"], "那一格是空的, 不说"
 
 
@@ -287,9 +294,13 @@ def test_tool_docs_carry_the_same_wording():
     assert "不提帖子(帖子、这帖、本帖、原帖、帖里都不写, 直接说那件事)" in cf and "不写「帖子里」" not in cf
     assert "不为凑字数加话" in cf and "常识别用「原来」「才知道」「没想到」去接" in cf
     assert "不算冲突, 不用问用户, 也不用报给负责人" in cf
-    assert "``set_next_step``" in sc and "不用问用户, 也不用报给负责人" in sc and "是负责人给这个项目定的" in sc
+    assert "``set_next_step``" in sc and "不用问用户, 也不用报给负责人" in sc and "是这个项目定的配比" in sc
     assert "用户这次明说要别的配比, 这一组就照用户的写" in sc and "前面对话里见过的规则原文" in sc
-    assert "用户这次明说要别的配比(比如每条都带品牌)" in cf and "配比本身对话里改不了" in cf
+    assert "用户这次明说要别的配比(比如每条都带品牌)" in cf and "项目的数不动" in cf
+    for doc in (cf, sc):                                  # 11-11 晚: 配比开放了, 两条路分开说; 原来那句「改不了」不留
+        assert "改不了。" not in doc and "对话里改不了" not in doc
+        assert "用户明说这个项目以后都按新的配比, 调" in doc and "set_comment_mix" in doc
+        assert "只有用户明说才改" in doc
     assert "整组 ``passed=false``(中性、短评不够)时这组还没过" in sc and "这就是整组的分数" not in sc
     assert "不为凑字数加话" in sc and "「帖子里」" not in sc
     assert "写评论也不给" in tools.my_rules.__doc__ and "不用等负责人" in tools.my_rules.__doc__

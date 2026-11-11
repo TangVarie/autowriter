@@ -57,10 +57,32 @@ def test_empty_protocol_raises_instead_of_returning_success(tmp_path, monkeypatc
         T.get_protocol()
 
 
+# 协议冻结期间加的工具(协议版本不动, 写手不用重导 skill): 协议里没有它的名字, 落点在别的工具的回包和它自己的说明里。
+# 加进这张表的条件钉在 test_tools_outside_the_protocol_have_a_landing_point 里, 不是「懒得写协议」的口子。
+#   set_comment_mix(2026-11-11): comments_for 的 comment_set 第一句、next_step 和 score_comments 的 set_next_step 都点它的名。
+OUTSIDE_PROTOCOL = {"set_comment_mix"}
+
+
 def test_protocol_mentions_every_tool():
     text = T.get_protocol()["protocol"]
-    missing = [n for n in T.TOOLS if f"`{n}`" not in text]
+    missing = [n for n in T.TOOLS if f"`{n}`" not in text and n not in OUTSIDE_PROTOCOL]
     assert not missing, f"这些工具在协议里没有落点, 模型不会知道何时调它: {missing}"
+    stale = sorted(n for n in OUTSIDE_PROTOCOL if n not in T.TOOLS or f"`{n}`" in text)
+    assert not stale, f"这几个已经进了协议或不在 TOOLS 里了, 从 OUTSIDE_PROTOCOL 里拿掉: {stale}"
+
+
+def test_tools_outside_the_protocol_have_a_landing_point():
+    """协议里没写的工具, 模型得从别处知道什么时候调: 说明里自己写清「什么时候调 / 什么时候不调」, 而且每次写评论都会
+    拿到的那几句(comments_for 的 comment_set 第一句和 next_step、score_comments 的 set_next_step)里点了它的名。"""
+    from deskcore import core
+    handed_out = {"set_comment_mix": (core.COMMENT_SET_HEAD, core.COMMENT_SET_NEXT_STEP, core.USER_MIX_NOTE,
+                                      T.comments_for.__doc__, T.score_comments.__doc__)}
+    assert set(handed_out) == OUTSIDE_PROTOCOL
+    for name, texts in handed_out.items():
+        doc = T.TOOLS[name][0].__doc__
+        assert "什么时候调" in doc and "什么时候不调" in doc and "返回" in doc, name
+        for t in texts:
+            assert name in t, (name, t[:40])
 
 
 def test_get_protocol_is_the_same_for_everyone():

@@ -47,6 +47,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import contextvars
+import inspect
 import logging
 import os
 import threading
@@ -165,24 +166,47 @@ def key_transport_counts() -> dict:
         return {k: _KEY_TRANSPORT.get(k, 0) for k in ("header", "bearer", "query", "none")}
 
 
-def _extract_key(request: Request) -> str | None:
-    key = request.headers.get("x-deskcore-key")
-    if key:
-        _count_transport("header")
-        return key
-    auth = request.headers.get("authorization") or ""
-    if auth.lower().startswith("bearer "):
-        _count_transport("bearer")
-        return auth[7:].strip()
+def _key_transport_of(request: Request) -> str:
+    """这次请求的钥匙是从哪儿传的: header / bearer / query / none。只看有没有, 不碰值。"""
+    if request.headers.get("x-deskcore-key"):
+        return "header"
+    if (request.headers.get("authorization") or "").lower().startswith("bearer "):
+        return "bearer"
     if request.query_params.get("key"):
+        return "query"
+    return "none"
+
+
+def _extract_key(request: Request) -> str | None:
+    how = _key_transport_of(request)
+    _count_transport(how)
+    if how == "header":
+        return request.headers.get("x-deskcore-key")
+    if how == "bearer":
+        return (request.headers.get("authorization") or "")[7:].strip()
+    if how == "query":
         # 已停收 (W-09)。不退回成"没带 key": 那样报的是 missing, 看不出原因;
         # 也不在日志里打 key。
-        _count_transport("query")
         raise identity.AuthError(
             "?key= is no longer accepted; send the key in the X-Deskcore-Key header "
-            "(or Authorization: Bearer)")
-    _count_transport("none")
+            "(or Authorization: Bearer)", reason="query_param")
     return None
+
+
+# 服务端注入、调用方不许自己传的参数。_caller_name(2026-11-11): 钥匙在 DESKCORE_KEYS 里的备注名, 只给签名里要它的工具
+# (set_comment_mix 留痕用); 它不是身份 —— 归属校验只认 _user_id。
+_INJECTED_PARAMS = ("_user_id", "_caller_name")
+
+
+def _inject_caller(fn, kwargs: dict, needs_user: bool) -> dict:
+    for k in _INJECTED_PARAMS:
+        kwargs.pop(k, None)               # 不允许调用方伪造身份 / 署名
+    caller = _caller.get()
+    if needs_user:
+        kwargs["_user_id"] = caller.user_id
+    if "_caller_name" in inspect.signature(fn).parameters:
+        kwargs["_caller_name"] = caller.name
+    return kwargs
 
 
 def _call_tool(name: str, args: dict) -> object:
@@ -190,10 +214,7 @@ def _call_tool(name: str, args: dict) -> object:
     if entry is None:
         raise KeyError(name)
     fn, needs_user = entry
-    kwargs = dict(args or {})
-    kwargs.pop("_user_id", None)          # 不允许调用方伪造身份
-    if needs_user:
-        kwargs["_user_id"] = _caller.get().user_id
+    kwargs = _inject_caller(fn, dict(args or {}), needs_user)
     # 2026-10-30 发布收尾: 非入口工具不再按身份抽查 skill 版本、捎升级提醒 —— 一个团队共用一个身份, 一个人手上的旧版
     # 会让所有人都收到。提醒只看入口工具这一次报上来的版本(deskcore/skillcheck.py), REST 和 MCP 都原样回工具结果。
     return fn(**kwargs)
@@ -357,7 +378,15 @@ async def auth_middleware(request: Request, call_next):
     try:
         caller = identity.resolve(_extract_key(request))
     except identity.AuthError as exc:
-        return JSONResponse({"detail": str(exc)}, status_code=401)
+        # 2026-11-11: 401 自己说清为什么(identity.key_shape 那一段)。这个中间件包着整个 app, 挂在 /mcp 下面的 MCP
+        # 子应用也在里面(_NormalizeMcpPath 在更外层, /mcp 和 /mcp/ 到这里是同一条路) —— REST 和 MCP 拿到的是同一份
+        # JSON: ``detail`` 是给人看的那一句, ``reason`` 是固定的原因名, ``key_shape`` 只在「带了钥匙但对不上」时有,
+        # 说的只是对方发来的那一串(长度、最后 4 位、几个是 / 否)。每拒一次记一个数、一行 WARNING(日志里没有最后 4 位)。
+        identity.record_rejection(exc, path=request.url.path, via=_key_transport_of(request))
+        body = {"detail": str(exc), "reason": exc.reason}
+        if exc.shape:
+            body["key_shape"] = exc.shape
+        return JSONResponse(body, status_code=401)
     token = _caller.set(caller)
     try:
         return await call_next(request)
@@ -665,6 +694,9 @@ async def _collect_health() -> dict:
         "build": {"commit": BUILD_COMMIT, "protocol_version": _protocol_version()},
         # W-09: 进程启动以来各种 key 传法的请求数(只有传法, 没有 key、没有身份)
         "key_transport": key_transport_counts(),
+        # 2026-11-11: 进程启动以来被拒的鉴权请求, 按固定的几个原因数, 外加最后一次的时间(UTC)。只有个数和时间:
+        # 没有钥匙的任何一部分(连最后 4 位也没有)、没有路径、没有是谁。写手说连不上时先看这里是哪一种在涨。
+        "auth_rejections": identity.auth_rejections(),
         "tools": sorted(tools.TOOLS),
         "config": {
             # deskcore 【不调 LLM】。蒸馏搬给调用方模型之后, 服务端一次
@@ -910,9 +942,7 @@ def _register_mcp():
 
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
-            kwargs.pop("_user_id", None)
-            if needs_user:
-                kwargs["_user_id"] = _caller.get().user_id
+            kwargs = _inject_caller(fn, kwargs, needs_user)
             t0 = time.monotonic()
             try:
                 result = await run_in_threadpool(fn, *args, **kwargs)

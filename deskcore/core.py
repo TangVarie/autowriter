@@ -3395,7 +3395,8 @@ COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、�
 
 
 # ── 项目定的一组评论配比(2026-11-10) ─────────────────────────────────────────────────────────────
-# projects.default_params 里的 ``comment_set``(和 delivery / archived 同一个 JSON 字符串, 不加迁移), owner 用 SQL 配:
+# projects.default_params 里的 ``comment_set``(和 delivery / archived 同一个 JSON 字符串, 不加迁移), owner 用 SQL 配;
+# 2026-11-11 起四个数(不含 column)写手也能在对话里改(set_comment_mix, 见 MIX_ 那一段):
 #   {"brand_max": 0.5, "neutral_min": 0.3, "short_min": 0.2, "short_chars": 15, "column": "<飞书里那一列的列名>"}
 # 每一项都可以不配, 不配的那一项不数。份额在 [0, 1], brand_max + neutral_min ≤ 1; short_chars 是 6~40 的整数(配了
 # short_min 没配它时按 15); column 是飞书那一列的列名(1~20 字, 不带 | 和换行), 列名只在库里, 代码和测试里不写。
@@ -3422,20 +3423,25 @@ DELIVERY_COLUMN_NEXT_STEP = ("delivery_column.text 是这组评论按「{column}
 # owner: 为什么每次都要回来找她才能改。所以那一句要自己说清: 条数是负责人给这个项目定的, 项目规则(和之前见过的旧规则原文)
 # 说法不一样的以它为准, 直接改, 不问用户、不报负责人; 规则过时了写手当场能停掉(RULE_SELF_SERVICE)。
 # 复审(11-11): 只压规则原文, 不压用户这次在对话里明说的(协议: 用户另有要求就照用户的; owner 也问「她自己就能在对话中更改吗」)。
-# 用户明说要别的配比, 这一组照用户的写、交付时说一句(USER_MIX_NOTE); 配比本身是项目配置, 对话里改不了, 也照实说。
+# 用户明说要别的配比, 这一组照用户的写、交付时说一句(USER_MIX_NOTE)。
+# 11-11 晚 owner: 「配比也开放吧」。配比本身也能在对话里改了(set_comment_mix, 见下面 MIX_ 那一段): 只是这一组想要别的配比 →
+# 照用户的写, 不改项目的数; 用户明说这个项目以后都按新的 → 调 set_comment_mix, 不用找负责人。只有用户明说才改, 模型不为了让
+# 检查通过自己去改。这几句里原来的「是负责人给这个项目定的」跟着改成「这个项目定的配比」: 数可能是写手照用户说的改过的,
+# 再说是负责人定的就不对了; 「项目规则里说法不一样时以这里为准、直接改、不用问用户、不用报给负责人」一个字没动。
 # 不写「最新」「比…都新」: 配比没有日期, 比不了谁新。整组那一句里没有配比的数(没配 comment_set, 只有重复、品牌收尾这些
 # 所有项目都管的)时不说是负责人给这个项目定的, 也不带 set_next_step(那几条的 style_fix 有 style_next_step)。
-SET_LINE_HEAD = "整组代码查(条数是负责人给这个项目定的, 项目规则里说法不一样时以这里为准; 直接改, 不用问用户): "
+SET_LINE_HEAD = "整组代码查(条数是这个项目定的配比, 项目规则里说法不一样时以这里为准; 直接改, 不用问用户): "
 SET_LINE_HEAD_ALL = "整组代码查(所有项目都管; 直接改, 不用问用户): "
 RULE_SELF_SERVICE = ("用户说哪条项目规则过时了: 当场用 set_rule_state 停掉(以后都不要用 retire, 先停一阵用 mute; memory_id "
                      "在 my_rules 里), 不用等负责人; 要换成新说法用 record_rule。")
 USER_MIX_NOTE = ("用户这次明说要别的配比(比如每条都带品牌), 这一组就照用户的写, 交付时一句话说明和项目定的配比不一样; "
-                 "项目定的配比在对话里改不了。")
-SET_NEXT_STEP = ("thread_fix 第一句里提品牌、中性、短评的条数是负责人给这个项目定的: 照它点名的几条直接改, 改完整组再判一次; "
+                 "用户明说这个项目以后都按新的配比, 就调 set_comment_mix 把项目的数改掉, 不用找负责人。"
+                 "只有用户明说才改: 不为了让这一组通过自己去改配比。")
+SET_NEXT_STEP = ("thread_fix 第一句里提品牌、中性、短评的条数是这个项目定的配比: 照它点名的几条直接改, 改完整组再判一次; "
                  "不用问用户, 也不用报给负责人。")
 SET_BRAND_STEP = "项目规则里或之前见过的规则原文说要每条带品牌、要几条夸或背书的, 以这里的条数为准, 不算冲突。"
 SET_SHORT_STEP = "短评不够: 把点名的几条压短, 或换成一句话短评(比如「蹲一个」「同问」), 这不算改口气。"
-COMMENT_SET_HEAD = ("下面几个数是负责人给这个项目定的配比: 项目规则里或之前见过的规则原文要每条带品牌、要几条夸或背书的, "
+COMMENT_SET_HEAD = ("下面几个数是这个项目定的配比: 项目规则里或之前见过的规则原文要每条带品牌、要几条夸或背书的, "
                     "照这里写, 不算冲突; 品牌怎么称呼(全称、简称)照项目规则; 不用问用户, 也不用报给负责人。" + USER_MIX_NOTE)
 
 
@@ -3493,8 +3499,9 @@ def _comment_set(project: dict) -> tuple[dict | None, str | None]:
 
 
 def _comment_set_lines(cfg: dict) -> list[str]:
-    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。第一句说这些数是负责人给这个项目定的、规则原文说法
-    不一样的照这里写、用户这次明说要别的配比就照用户的(2026-11-11, 见 ``SET_LINE_HEAD`` 上面那段)。"""
+    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。第一句说这些数是这个项目定的配比、规则原文说法
+    不一样的照这里写、用户这次明说要别的配比就照用户的、明说以后都按新的就调 set_comment_mix(2026-11-11, 见
+    ``SET_LINE_HEAD`` 上面那段)。set_comment_mix 改完回的也是这几句。"""
     out = [COMMENT_SET_HEAD]
     if cfg.get("brand_max") is not None:
         out.append(f"一组里提到品牌的最多 {commentstyle._pct(cfg['brand_max'])}%(20 条最多 "
@@ -3509,6 +3516,196 @@ def _comment_set_lines(cfg: dict) -> list[str]:
     if cfg.get("column"):
         out.append(f"这组评论是这条帖子「{cfg['column']}」那一格的内容: 一行一条, 不编号、不加标签; "
                    "score_comments 回的 delivery_column.text 原样交")
+    return out
+
+
+# ── 在对话里改项目的配比(2026-11-11, owner: 「配比也开放吧」) ───────────────────────────────────────
+# 写手的工具 set_comment_mix 改的是 ``default_params.comment_set`` 里的四个数; 贴进飞书哪一列(column)不在里面: 它和 TV 数
+# 「预埋评论」的那一列是同一列, 换了那边就数不到了, 仍由负责人配。
+#   · 能存进去的一定是 ``_validate_comment_set`` 认的: 合并完整个过一遍校验, 不过就不写 —— 工具收下的数不会事后被当成
+#     「配置不对, 按没配处理」。
+#   · ``default_params`` 仍存成 JSON **字符串**, 别的键(delivery / archived / isolation_terms …)原样带回去; 解析不了就不写
+#     (同 delivery_format: 拿 {} 去合并会把别的键抹掉)。
+#   · 留痕在同一个 JSON 里: ``comment_set_log``, 新的在前, 最多 20 条, 每条 {at(UTC), by(钥匙的备注名, 不是钥匙), before,
+#     after}。时间和是谁由工具那一层传进来, 这里不看钟、不认人。
+#   · 读、改、写不在一个事务里(同 delivery_format / project_archive): 两个人同一秒改同一个项目, 后写的盖掉先写的。写完再读
+#     一次, 以库里实际的值回报; 对不上就照实说没改成。
+COMMENT_SET_LOG_KEY = "comment_set_log"
+COMMENT_SET_LOG_MAX = 20
+MIX_KEYS = ("brand_max", "neutral_min", "short_min", "short_chars")
+_MIX_SHARE_KEYS = ("brand_max", "neutral_min", "short_min")
+_MIX_NAMES = {"brand_max": "提品牌的上限", "neutral_min": "中性评论的下限", "short_min": "一句话短评的下限",
+              "short_chars": "一句话短评的字数"}
+MIX_KEYS_HELP = ("能改的是 brand_max(提品牌的最多几成)、neutral_min(中性的至少几成)、short_min(一句话短评至少几成)、"
+                 "short_chars(多少字以内算短评)。")
+MIX_EMPTY = "mix 里没有要改的: 放要改的那几项, 比如 {\"brand_max\": 0.6}。" + MIX_KEYS_HELP
+MIX_COLUMN_REFUSED = ("评论贴进飞书哪一列在这里改不了: 它和发布记录里数评论的那一列是绑着的, 换了那边就数不到了。"
+                      "这次什么都没改; 用户要换列, 请用户找负责人。配比的四个数可以改, 去掉 column 再调一次。")
+MIX_UNREADABLE = "这个项目的设置现在读不出来, 配比没有改。请用户找负责人看一下, 不用重试。"
+MIX_EXISTING_BAD = ("这个项目现有的评论设置里有一项不是这里能改的, 配比没有改。请用户找负责人看一下, 不用重试; "
+                    "这一组评论照 comments_for 这次回的写。")
+MIX_SUM = ("{brand}加{neutral}超过了 100%, 一组评论没法同时满足(中性评论是不提品牌的): 把其中一个调低, 或把中性的下限"
+           "去掉(值写 null), 再调一次。")
+MIX_UNCHANGED = "「{name}」的配比和现在的一样, 没有改。"
+MIX_SUMMARY = "「{name}」一组评论的配比改了: {changes}。"
+MIX_NOT_STORED = "这次没有改成: 存进去的和要改的不一样(可能刚好有人也在改这个项目的设置)。请再调一次。"
+MIX_CLEARED_NOTE = ("这个项目现在没有定配比: 一组评论里提品牌、中性、短评的条数不再数, 所有项目都管的写法底线照旧。")
+MIX_NEXT_STEP = ("把 summary 原样告诉用户。这个项目以后的评论都按新的配比(comment_set.lines)写; 这一组还没交的也照新的写, "
+                 "再判时用的就是新的数。以后也只在用户明说要改这个项目的配比时调这个工具。")
+MIX_UNCHANGED_NEXT_STEP = "跟用户说一句配比和现在的一样、没有改, 评论照现在的配比写。"
+
+
+class CommentMixError(ValueError):
+    """set_comment_mix 的入参不对, 或这个项目的设置现在改不了。消息是念给调用方的一句; 工具层收成 InvalidInput(400)。"""
+
+
+def _mix_share(key: str, v) -> float:
+    """一个几成的数 → 0~1 的小数(整数百分比)。认小数(0.5)、百分数(50)、带百分号的字(「50%」); 1 是 100%。"""
+    name, shown, pct = _MIX_NAMES[key], v, False
+    if isinstance(v, str):
+        t = v.strip().replace("％", "%")
+        pct = t.endswith("%")
+        try:
+            v = float(t[:-1] if pct else t)
+        except ValueError:
+            v = None
+        if pct and v is not None:
+            v = v / 100
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+        raise CommentMixError(f"{name}({key})要是一个数: 小数(0.5)或百分数(50、\"50%\")都行, 现在是 {shown!r}。")
+    if not pct and 1 < v <= 100:
+        v = v / 100
+    if not 0 <= v <= 1:
+        raise CommentMixError(f"{name}({key})要在 0 到 100% 之间: 小数(0.5)或百分数(50、\"50%\")都行, 现在是 {shown!r}。")
+    return commentstyle._pct(v) / 100                  # 代码按整数百分比数, 存的就是数的那个值
+
+
+def _mix_chars(v) -> int:
+    lo, hi = _SHORT_CHARS_RANGE
+    shown = v
+    if isinstance(v, str) and v.strip().isdigit():
+        v = int(v.strip())
+    if isinstance(v, float) and v == int(v):
+        v = int(v)
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        raise CommentMixError(f"{_MIX_NAMES['short_chars']}(short_chars)要是 {lo}~{hi} 的整数, 现在是 {shown!r}。")
+    return v
+
+
+def _mix_numbers(raw) -> dict:
+    """库里那份 comment_set → 四个数(没定的是 None)。给回包的 before / after, 原样的值, 不带 column。"""
+    raw = raw if isinstance(raw, dict) else {}
+    return {k: raw.get(k) for k in MIX_KEYS}
+
+
+def _mix_shown(key: str, raw: dict) -> str:
+    """一个数说给人听的样子: 「50%」「15 字」「没定」; 提品牌 100%、下限 0% 标一句等于不限 / 不要求。"""
+    v = raw.get(key)
+    if key == "short_chars":
+        if v is None:
+            return f"{_SHORT_CHARS_DEFAULT} 字(默认)" if raw.get("short_min") is not None else "没定"
+        return f"{v} 字"
+    if v is None:
+        return "没定(不数)"
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+        return "读不出来"                               # 库里原来的数不对(读的时候按没配处理): 不硬算一个百分比出来
+    pct = commentstyle._pct(v)
+    if key == "brand_max" and pct >= 100:
+        return "100%(等于不限)"
+    if key != "brand_max" and pct <= 0:
+        return "0%(等于不要求)"
+    return f"{pct}%"
+
+
+def set_comment_mix(client, project_id: str, *, user_id: str | None, mix, by: str, at: str) -> dict:
+    """改一个项目一组评论的配比(``default_params.comment_set`` 里的四个数), 回改之前 → 改之后和新的那几句。
+
+    ``mix``: 只放要改的键; 值是 None 的去掉那一项(不再数)。``by`` / ``at``: 留痕用的是谁、什么时候(UTC ISO), 工具层传进来。
+    入参不对、项目的设置读不出来或有这里改不了的毛病 → ``CommentMixError``, 一个字不写。和现在一样 → 不写, ``changed`` false。
+    """
+    project = assert_project_access(client, project_id, user_id=user_id)
+    pid = str(project["id"])
+    name = project.get("name") or ""
+    if not isinstance(mix, dict) or not mix:
+        raise CommentMixError(MIX_EMPTY)
+    if "column" in mix:
+        raise CommentMixError(MIX_COLUMN_REFUSED)
+    unknown = [str(k)[:30] for k in mix if k not in MIX_KEYS]
+    if unknown:
+        raise CommentMixError(f"mix 里不认识 {'、'.join(unknown)}, 什么都没改。{MIX_KEYS_HELP}")
+    try:
+        params = delivery.parse_params(project.get("default_params"))
+    except delivery.TemplateError as exc:
+        logger.warning("set_comment_mix: 项目 %s 的 default_params 解析不了, 没有写: %s", pid, exc)
+        raise CommentMixError(MIX_UNREADABLE) from exc
+    old_raw = params.get(COMMENT_SET_KEY)
+    if old_raw is not None and not isinstance(old_raw, dict):
+        logger.warning("set_comment_mix: 项目 %s 的 comment_set 不是 JSON 对象, 没有写", pid)
+        raise CommentMixError(MIX_EXISTING_BAD)
+    old_raw = old_raw or {}
+    new_raw = dict(old_raw)
+    for key, value in mix.items():
+        if value is None:
+            new_raw.pop(key, None)
+            continue
+        value = _mix_chars(value) if key == "short_chars" else _mix_share(key, value)
+        same = key in old_raw and _mix_shown(key, {**old_raw, key: value}) == _mix_shown(key, old_raw)
+        if not same:                                    # 数没变(0.333 和 33%)就留着库里原来的写法
+            new_raw[key] = value
+    cfg = None
+    if new_raw:
+        both = [new_raw.get(k) for k in ("brand_max", "neutral_min")]
+        try:
+            too_much = None not in both and sum(commentstyle._pct(v) for v in both) > 100
+        except (TypeError, ValueError):
+            too_much = False                            # 没动的那一项本来就读不出来: 交给下面的校验
+        if too_much:
+            raise CommentMixError(MIX_SUM.format(
+                brand=f"{_MIX_NAMES['brand_max']}({commentstyle._pct(both[0])}%)",
+                neutral=f"{_MIX_NAMES['neutral_min']}({commentstyle._pct(both[1])}%)"))
+        try:
+            cfg = _validate_comment_set(new_raw)       # 和读的时候同一个校验: 存进去的不会事后被当成配置不对
+        except _CommentSetError as exc:
+            # 这次给的四个数上面都查过了: 走到这里是库里原来就有、这里又不改的那一项不对(column、别的键、没动的数)
+            logger.warning("set_comment_mix: 项目 %s 现有的 comment_set 过不了校验, 没有写: %s", pid, exc)
+            raise CommentMixError(MIX_EXISTING_BAD) from exc
+    before, after = _mix_numbers(old_raw), _mix_numbers(new_raw)
+    out = {"project_id": pid, "project_name": name, "changed": False, "before": before, "after": after}
+    if new_raw == old_raw:
+        out["summary"] = MIX_UNCHANGED.format(name=name)
+        out["comment_set"] = ({"lines": _comment_set_lines(cfg), "column": cfg.get("column")} if cfg else None)
+        out["next_step"] = MIX_UNCHANGED_NEXT_STEP
+        return out
+    log = params.get(COMMENT_SET_LOG_KEY)
+    entry = {"at": at, "by": by or f"user {str(user_id)[:8]}", "before": dict(old_raw) or None,
+             "after": dict(new_raw) or None}
+    new_params = dict(params)                           # 别的键原样、原来的顺序
+    if new_raw:
+        new_params[COMMENT_SET_KEY] = new_raw
+    else:
+        new_params.pop(COMMENT_SET_KEY, None)           # 四个数都去掉、也没配列: 不留一个空壳(空对象过不了校验)
+    new_params[COMMENT_SET_LOG_KEY] = [entry, *(log if isinstance(log, list) else [])][:COMMENT_SET_LOG_MAX]
+    store.set_project_default_params(client, pid, json.dumps(new_params, ensure_ascii=False))
+    # 以库里实际的值回报(同 record_rule / project_archive 的纪律), 不回报入参
+    stored = store.project_row(client, pid) or {}
+    try:
+        stored_raw = delivery.parse_params(stored.get("default_params")).get(COMMENT_SET_KEY) or {}
+    except delivery.TemplateError:
+        stored_raw = None
+    if stored_raw != new_raw:
+        logger.warning("set_comment_mix: 项目 %s 写完再读, 和要改的不一样 (user=%s)", pid, str(user_id)[:8])
+        out.update(after=_mix_numbers(stored_raw), summary=MIX_NOT_STORED, warning=MIX_NOT_STORED)
+        return out
+    logger.info("set_comment_mix: 项目 %s 的配比改了 (user=%s, 改了 %s)", pid, str(user_id)[:8],
+                ",".join(k for k in MIX_KEYS if before[k] != after[k]))
+    changes = [f"{_MIX_NAMES[k]} {_mix_shown(k, old_raw)} → {_mix_shown(k, new_raw)}"
+               for k in MIX_KEYS if _mix_shown(k, old_raw) != _mix_shown(k, new_raw)]
+    out["changed"] = True
+    out["summary"] = MIX_SUMMARY.format(name=name, changes="; ".join(changes))
+    out["comment_set"] = {"lines": _comment_set_lines(cfg), "column": cfg.get("column")} if cfg else None
+    if not any(new_raw.get(k) is not None for k in _MIX_SHARE_KEYS):
+        out["comment_set_note"] = MIX_CLEARED_NOTE     # 三个几成都没定: 说清这个项目现在不数配比了(配了列的, 列照旧)
+    out["next_step"] = MIX_NEXT_STEP
     return out
 
 
@@ -3973,8 +4170,9 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
 # 每次 comments_for 现取规则(2026-11-11): 同一场对话里早先拿到的规则原文(包括已经停掉的)不算数。只说规则原文, 不压用户这次
 # 在对话里明说的要求(复审 11-11, 见 SET_LINE_HEAD 上面那段)
 COMMENTS_FOR_RULES_NOW = "规则以这次回的为准, 前面对话里见过的规则原文和这次不一样的不算(可能已经停掉了)。"
-COMMENT_SET_NEXT_STEP = ("这个项目定了一组的配比(comment_set.lines), 是负责人定的, 和 style 一样要守; 项目规则里说法不一样的"
-                         "以它为准, 不算冲突, 不用问用户; 用户这次明说要别的配比, 这一组就照用户的写, 交付时一句话说明。")
+COMMENT_SET_NEXT_STEP = ("这个项目定了一组的配比(comment_set.lines), 和 style 一样要守; 项目规则里说法不一样的"
+                         "以它为准, 不算冲突, 不用问用户; 用户这次明说要别的配比, 这一组就照用户的写, 交付时一句话说明; "
+                         "用户明说这个项目以后都按新的配比, 调 set_comment_mix 改, 不用找负责人。")
 
 
 def _comment_rules(client, project_id: str, user_id) -> tuple[list[str], list[str]]:
