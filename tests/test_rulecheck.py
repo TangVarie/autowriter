@@ -369,7 +369,8 @@ def test_length_is_counted_without_whitespace_and_tags():
     ok = {"title": "", "body": "一二三四五 六七八九十\n#话题一 #话题二"}
     assert rulecheck.check([rule], [ok])[0] == []
     short = rulecheck.check([rule], [{"title": "", "body": "一二三 #很长很长的话题"}])[0]
-    assert [h["what"] for h in short] == ["建议改: 正文 3 字(不算空白和话题), 下限 10"]
+    assert [h["what"] for h in short] == ["建议改: 正文 3 字(不算空白和话题), 下限 10: "
+                                          "能补的是具体内容(经过、细节、数字), 不加空话凑字; 没有素材就照实告诉用户差多少"]
     long = rulecheck.check([rule], [{"title": "", "body": "一" * 13}])[0]
     assert long[0]["what"].endswith("上限 12")
 

@@ -97,7 +97,8 @@ def test_twelve_of_twenty_branded_fails_the_last_two(wired):
         assert rows[i]["passed"] is False and "去掉品牌" in rows[i]["style_fix"][0]
         assert len(rows[i]["style_fix"]) == 1, "要去掉品牌的那条不再叫它把品牌往前挪"
     assert out["passed"] is False and out["summary"]["passed"] == 18
-    assert out["thread_fix"][0].startswith("整组代码查: 提品牌的 12 条, 最多 10 条") and "第 11 条、第 12 条" in out["thread_fix"][0]
+    assert out["thread_fix"][0].startswith(core.SET_LINE_HEAD + "提品牌的 12 条, 最多 10 条")
+    assert "第 11 条、第 12 条" in out["thread_fix"][0]
     assert _sent(calls)["comments"][0]["text"] == texts[0] and len(_sent(calls)["comments"]) == 20
 
 
@@ -119,7 +120,7 @@ def test_too_few_neutral_fails_the_set_and_the_code_line_comes_first(wired):
     out = _score(_client(), texts)
     assert all(r["passed"] for r in out["comments"]), "每条都过了, 是整组不够"
     assert out["passed"] is False
-    assert out["thread_fix"][0].startswith("整组代码查: 中性的") and "3 条, 至少 6 条" in out["thread_fix"][0]
+    assert out["thread_fix"][0].startswith(core.SET_LINE_HEAD + "中性的") and "3 条, 至少 6 条" in out["thread_fix"][0]
     assert "第 17 条、第 16 条、第 15 条" in out["thread_fix"][0], "从后往前挑不中性的"
     assert len(out["thread_fix"]) == core.SCORE_MAX_FIXES, "代码那一句挤不掉"
 
@@ -228,9 +229,10 @@ def test_comments_for_reads_the_cell_as_existing_comments():
     cell = [x for x in out["existing_comments"] if x.get("source") == COL]
     assert [x["text"] for x in cell] == ["上周三晚上八点开的直播我也蹲了", "同问价格", "第三条在这里"], "编号、空行去掉"
     assert [x["text"] for x in out["existing_comments"] if "source" not in x] == ["那后来怎么改的", "可以看看简历第一行"]
-    assert out["comment_set"]["column"] == COL and len(out["comment_set"]["lines"]) == 4
-    assert "20 条最多 10 条" in out["comment_set"]["lines"][0] and "20 条至少 6 条" in out["comment_set"]["lines"][1]
-    assert "20 条至少 4 条" in out["comment_set"]["lines"][2]
+    assert out["comment_set"]["column"] == COL and len(out["comment_set"]["lines"]) == 5
+    assert out["comment_set"]["lines"][0] == core.COMMENT_SET_HEAD, "第一句说这些数是负责人最新定的"
+    assert "20 条最多 10 条" in out["comment_set"]["lines"][1] and "20 条至少 6 条" in out["comment_set"]["lines"][2]
+    assert "20 条至少 4 条" in out["comment_set"]["lines"][3]
     assert f"source 是「{COL}」" in out["next_step"] and "comment_set.lines" in out["next_step"]
     assert out["style"] == list(core.COMMENT_STYLE_LINES)
     assert "existing_comments_note" not in out, "那一格的行不算进 TV 评论数的比较"
@@ -346,14 +348,14 @@ def test_the_tool_docs_ask_for_full_text():
     assert "review_list" in doc and "全文" in doc and "不缩写" in doc and "delivery_column" in doc
     assert "earlier_comments" in doc and "整组代码查" in doc
     assert "全文" in core.COMMENT_SCORE_NOTE and "不缩写" in core.COMMENT_SCORE_NOTE
-    assert "comment_set" in tools.comments_for.__doc__ and "帖子里" in tools.comments_for.__doc__
+    assert "comment_set" in tools.comments_for.__doc__ and "不提帖子" in tools.comments_for.__doc__
 
 
 def test_jev_thread_lines_drop_the_post_ref(wired):
     _, reply = wired
     reply["fn"] = _judge([_view("提问"), _view("提问")], plan=[{"slot": "q1", "why": "要接住帖子里具体说到的事"}])
     out = _score(_client(cfg=None), PLAIN[:2])
-    assert out["thread_fix"] == ["位 q1: 要接住帖子具体说到的事"]
+    assert out["thread_fix"] == ["位 q1: 要接住帖子具体说到的事" + core.POST_REF_NOTE]
 
 
 # ── 7. 跟着笔记交付的评论 ───────────────────────────────────────────────────────────────────────

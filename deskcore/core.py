@@ -335,6 +335,23 @@ def rule_applies_to_layer(rule: dict, layer: str | None, direction: str) -> bool
 DIRECTION_RULE_TAIL = ("（标了【只管产品贴/精品贴的稿】【只管流量贴/提问贴的稿】的规则, 只管发牌卡上写着那种贴的稿; "
                        "卡上没写是哪种贴的稿, 照常守。）")
 
+# 规则里的字数(2026-11-11, owner:「不要为了凑字数凑废话, 可以支持字数不够」): 简报里有规则说到字数时, 那一层末尾补一句
+# 字数不是要凑够的数(有硬约束说到字数就接在 P0, 只有软规则说到就接在 P1, 只接一次; 接在 DIRECTION_RULE_TAIL 前面)。上限照守:
+# 「标题不超过二十字」这种最常见, 这句不能读成上限也可以松。只改给模型看的这一份; 存档时代码照旧按 check 查, 下限没到的那句
+# 也说补具体内容、不加空话(rulecheck.BELOW_MIN_HOW)。
+LENGTH_RULE_TAIL = ("（规则里说到的字数, 上限照守; 但字数不是要凑够的数: 不为凑字数加空话、重复的解释或总结句, 素材不够就写短一点, "
+                    "交付时跟用户说一句差多少。）")
+# 「N 字」: 阿拉伯数字, 或两个字以上的中文数(三百、五十), 或「两个字」这种; 「十字路口」「一字不改」「八字」不算
+_LENGTH_NUM = r"(?:[0-9０-９]+|[一二两三四五六七八九十百千]{2,}|[一二两三四五六七八九十]个)"
+_LENGTH_RULE = re.compile(rf"{_LENGTH_NUM}\s*(?:[-~～到至]\s*(?:[0-9０-９]+|[一二两三四五六七八九十百千]+)\s*)?个?字"
+                          r"(?![母幕体号典迹])|字数|篇幅")
+
+
+def _mentions_length(rules: list[dict]) -> bool:
+    """这几条规则里有没有说到字数的: 原文写了「N 字」「字数」「篇幅」, 或者存了字数检查(rule_kind = max_len)。"""
+    return any(_LENGTH_RULE.search(r.get("content") or "") or (r.get("rule_kind") or "").strip() == "max_len"
+               for r in rules)
+
 # 这场方向闸挡掉的那些 soft 规则(另一个方向的; 复审 2026-11-03): 卡上标了那一族贴型的稿, score_drafts / check_rules 照它们查
 # (rule_applies_to_layer), 简报里就得让模型看得见 —— 不然模型被报「建议改」的是一条它从没见过的规则。单独一截接在 P1 最后,
 # 说清没标贴型的稿不用管(同方向闸); P1 原来那一截一个字不变, counts.soft_dropped_by_direction 照旧数它们。
@@ -597,6 +614,10 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         positive_examples=positives,
         negative_examples=negatives,
     )
+    if _mentions_length(hard_shown) and layers.get("p0"):
+        layers["p0"] = layers["p0"] + "\n" + LENGTH_RULE_TAIL
+    elif _mentions_length(soft_shown) and layers.get("p1"):
+        layers["p1"] = layers["p1"] + "\n\n" + LENGTH_RULE_TAIL
     if hard_noted and layers.get("p0"):
         layers["p0"] = layers["p0"] + "\n" + DIRECTION_RULE_TAIL
     if soft_noted and layers.get("p1"):
@@ -3313,7 +3334,8 @@ DEFAULT_COMMENT_SLOTS = (
      "note": "问另一件帖子没写清的事, 别和 q1 问同一件; 品牌可自然提及, 不必每条点名"},
     {"id": "exp", "speech_act": ["补充经验", "亲历背书", "旁观推荐"], "role": "读者位", "may_name_brand": True, "must_echo": True,
      "value_ok": ["可行动信息", "判断依据"], "min_detail": "模糊", "intent": "补充信息",
-     "note": "接着帖子补充经验、感受、比较或推荐, 品牌可自然提及, 不必点名; 具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写一般讨论"},
+     "note": "接着帖子补充经验、感受、比较或推荐, 品牌可自然提及, 不必点名; 具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写一般讨论; "
+             "一两句就够, 不凑字数"},
     {"id": "reply", "speech_act": ["回复答疑", "亲历背书", "旁观推荐"], "role": "贴主", "reply_to": "q1", "may_name_brand": True,
      "must_echo": False, "value_ok": ["可行动信息"], "min_detail": "无", "intent": "补充信息",
      "note": "贴主接着 q1 答疑, 可结合素材表达感受、比较或推荐, 品牌可自然提及, 不必点名; 具体经历、效果和数字依提供素材, 不编造事实"},
@@ -3331,7 +3353,10 @@ _EXISTING_COMMENT_CHARS = 200
 _POST_BODY_CHARS = 6000            # judge 那边只看前 600 字; 给模型看的留长一些, 但别把超长帖整篇灌进对话
 
 COMMENT_SCORE_NOTE = ("评论检查: 只判不写库。passed=true 且 needs_review=false 才算这条过; fix 是必须改的(主要行为、点名品牌、"
-                      "接住帖子、细节四项), hints 只是参考, 不改不算没过。没过的按 fix 改一轮再调一次 score_comments, 不要循环。"
+                      "接住帖子、细节四项), style_fix 和 thread_fix 第一句(整组代码查)也是必须改的, 直接改, 不用问用户; "
+                      "hints 只是参考, 不改不算没过。summary.passed 只数每条, 整组 passed=false 时照 thread_fix 第一句改。"
+                      "照 fix、hints 改都不是要加长: 补一件具体的事就够, 不为凑字数加话。"
+                      "没过的按这些改一轮再调一次 score_comments, 不要循环。"
                       "needs_review=true 交人工核实, 不能改成伪造的亲历: 那几条在 review_list 里, 跟用户说时逐条照 text 写全文"
                       "(不缩写、不省略、不用「…」代替), 后面跟上 why 里的疑点。judge_status 不是 ok 就说这次没判成, 不能说通过。")
 REVIEW_NEXT_STEP = ("review_list 里的几条要交人工核实: 跟用户说的时候每条照 text 原样写全文(不缩写、不省略、不用「…」或「同上」"
@@ -3344,10 +3369,12 @@ _REVIEW_GATE_NAMES = {"speech_act": "主要行为", "names_brand": "点名品牌
 # 单独写评论这条路: comments_for 回包带 style, score_comments 判之前先查(style_fix)。跟着笔记交付的评论在 delivery 里查。
 # 2026-11-09 加第四句: 一组里以品牌评价收尾的最多四分之一(commentstyle.brand_endings), score_comments 拿到项目之后数
 # 2026-11-10: 每条再查「帖子里」和含糊指代(在 LINES 里); 整组再查重复的说法和开头(REPEAT_LINE); 长评论多用短句只提示
-COMMENT_STYLE_LINES = commentstyle.LINES + (commentstyle.BRAND_ENDING_LINE, commentstyle.REPEAT_LINE,
+# 2026-11-11: 「帖子里」放宽成一提帖子就算(LINES 那一句跟着改); 加两句代码不查的: 不为凑字数加话、常识不写成新发现
+COMMENT_STYLE_LINES = commentstyle.LINES + (commentstyle.PAD_LINE, commentstyle.COMMON_LINE,
+                                            commentstyle.BRAND_ENDING_LINE, commentstyle.REPEAT_LINE,
                                             commentstyle.SENTENCE_LINE)
 comment_style_issues = commentstyle.issues
-COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字、「帖子里」、「X那次」「X那栏」这类"
+COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字、提到帖子、「X那次」「X那栏」这类"
                            "含糊指代; 整组里重复的说法和开头; 一组里以品牌评价收尾的超过四分之一、项目定了提品牌的上限时超出的那几条), "
                            "和 fix 一样算没过: 照着改, 不用问用户。改完再判时整组全部送, 顺序和这次一样"
                            "(上限按整组算, 只送改过的几条就不准); 一批分几次判时, 前面几次判过的放进 earlier_comments, "
@@ -3377,6 +3404,19 @@ DELIVERY_COLUMN_NEXT_STEP = ("delivery_column.text 是这组评论按「{column}
                              "覆盖; 列名不要贴进格子里。贴几行就算发了几条: 只交真要发的那几条, 不加空行、标题或说明行。改过再判时用"
                              "最后一次回的那一份; 一批分几次判的(带 earlier_comments), 每一段用它最后一次判回的 text, 按判的顺序一段"
                              "接一段交(段和段之间也不加空行), 合起来贴进同一格。")
+# 整组那一句和它的下一步(2026-11-11): 11-10 晚上一位写手的模型把「提品牌最多 10 条」读成「代码检查认为」, 和它记得的一条旧规则
+# 「每条必带品牌词」(已经不生效)对着放, 按「硬约束优先」留了品牌; 短评一条没加(「会改变整批的口气, 没有擅自加」), 还问用户
+# 要不要报给负责人。owner:「为什么每次都要给我反馈才能改」。所以那一句要自己说清: 这是负责人最新定的、比别的说法都新, 直接改,
+# 不问用户、不报负责人; 规则过时了写手当场能停掉。
+SET_LINE_HEAD = ("整组代码查(负责人最新定的, 和项目规则或前面对话里的说法不一样时以这里为准; 直接改, 不用问用户, "
+                 "也不用报给负责人): ")
+RULE_SELF_SERVICE = ("用户说哪条项目规则过时了: 当场用 set_rule_state 停掉(以后都不要用 retire, 先停一阵用 mute; memory_id "
+                     "在 my_rules 里), 不用等负责人; 要换成新说法用 record_rule。")
+SET_NEXT_STEP = ("thread_fix 第一句(整组代码查)是负责人给这个项目最新定的: 项目规则里或前面对话里说要每条带品牌、要几条夸或"
+                 "背书的, 都以它为准, 不算冲突。照它点名的几条直接改, 改完整组再判一次; 不用问用户, 也不用报给负责人。"
+                 "短评不够: 把点名的几条压短, 或换成一句话短评(比如「蹲一个」「同问」), 这不算改口气。" + RULE_SELF_SERVICE)
+COMMENT_SET_HEAD = ("下面几个数是负责人给这个项目最新定的, 比项目规则和前面对话里的说法都新: 规则里要每条带品牌、要几条夸或"
+                    "背书的, 照这里写, 不算冲突; 品牌怎么称呼(全称、简称)照项目规则; 不用问用户, 也不用报给负责人")
 
 
 class _CommentSetError(ValueError):
@@ -3433,18 +3473,19 @@ def _comment_set(project: dict) -> tuple[dict | None, str | None]:
 
 
 def _comment_set_lines(cfg: dict) -> list[str]:
-    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。"""
-    out = []
+    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。第一句说这些数是负责人最新定的、比别的说法都新
+    (2026-11-11, 见 ``SET_LINE_HEAD`` 上面那段)。"""
+    out = [COMMENT_SET_HEAD]
     if cfg.get("brand_max") is not None:
         out.append(f"一组里提到品牌的最多 {commentstyle._pct(cfg['brand_max'])}%(20 条最多 "
-                   f"{commentstyle.share_floor(20, cfg['brand_max'])} 条, 按顺序数), 不提品牌时也不用代称(这家、它家、缩写); "
-                   "项目规则里要每条都带品牌的, 以这一句为准")
+                   f"{commentstyle.share_floor(20, cfg['brand_max'])} 条, 按顺序数), 不提品牌时也不用代称(这家、它家、缩写)")
     if cfg.get("neutral_min") is not None:
         out.append(f"至少 {commentstyle._pct(cfg['neutral_min'])}% 是中性评论: 不提品牌、不夸也不劝(提问、观望、自己的经历), "
                    f"20 条至少 {commentstyle.share_ceil(20, cfg['neutral_min'])} 条")
     if cfg.get("short_min") is not None:
         out.append(f"至少 {commentstyle._pct(cfg['short_min'])}% 是 {cfg['short_chars']} 字以内的一句话短评(20 条至少 "
-                   f"{commentstyle.share_ceil(20, cfg['short_min'])} 条); 短评放在提问位或不带评论位, 经验位要接住帖子、太短过不了")
+                   f"{commentstyle.share_ceil(20, cfg['short_min'])} 条); 短评放在提问位或不带评论位; "
+                   "经验位那条接住帖子说的事, 一两句就够")
     if cfg.get("column"):
         out.append(f"这组评论是这条帖子「{cfg['column']}」那一格的内容: 一行一条, 不编号、不加标签; "
                    "score_comments 回的 delivery_column.text 原样交")
@@ -3540,7 +3581,7 @@ def _set_line(checks: dict) -> tuple[str | None, bool]:
                 fail = True
     if checks["ends"].get("thread_fix"):
         parts.append(checks["ends"]["thread_fix"])
-    return (("整组代码查: " + "; ".join(parts)) if parts else None), fail
+    return ((SET_LINE_HEAD + "; ".join(parts)) if parts else None), fail
 
 
 def _style_block(cands: list[dict], style: list[list[str]], checks: dict | None = None) -> dict:
@@ -3554,6 +3595,7 @@ def _style_block(cands: list[dict], style: list[list[str]], checks: dict | None 
         line, _fail = _set_line(checks)
         if line:
             out["thread_fix"] = [line]
+            out["set_next_step"] = SET_NEXT_STEP
         if checks["ends"].get("thread_hint"):
             out["thread_hints"] = [checks["ends"]["thread_hint"]]
     return out
@@ -3886,6 +3928,12 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
         "note": (why + "。" if why else "") + "请用户补上: " + "、".join(need) + "。补齐后再调一次。"}
 
 
+# 每次 comments_for 现取规则(2026-11-11): 同一场对话里早先拿到的规则原文(包括已经停掉的)不算数
+COMMENTS_FOR_RULES_NOW = "规则以这次回的为准, 前面对话里见过的说法不一样的不算。"
+COMMENT_SET_NEXT_STEP = ("这个项目定了一组的配比(comment_set.lines), 是负责人最新定的, 和 style 一样要守; 项目规则里说法不一样的"
+                         "以它为准, 不算冲突, 不用问用户。")
+
+
 def _comment_rules(client, project_id: str, user_id) -> tuple[list[str], list[str]]:
     """``(评论规则, 硬约束)``: content 以「评论区」开头的(任何 severity)+ 全部 hard。合规硬约束对评论一样管用。"""
     hard, soft = store.shared_memories(client, project_id, user_id)
@@ -3943,7 +3991,7 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
         existing += [{"order": None, "role": None, "is_reply": False, "text": line, "source": column} for line in cell]
     next_step = ("按 slots 每位写一条(贴主答疑那条回 q1), 守 hard_rules、comment_rules 和 style(所有项目都管), 别和 existing_comments "
                  "里已经有的问题重复; 写完把整组交给 score_comments(帖子参数和这次一样: link, 或 post_title / post_body + "
-                 "project_id; 每条评论带 slot 的 id)。")
+                 "project_id; 每条评论带 slot 的 id)。" + COMMENTS_FOR_RULES_NOW)
     out = {"resolved": True, "source": source, "project_id": project["id"],
            "project_name": project.get("name"),
            "post": {"title": title, "body": body[:_POST_BODY_CHARS]},
@@ -3954,10 +4002,13 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
            "next_step": next_step}
     if cfg:
         out["comment_set"] = {"lines": _comment_set_lines(cfg), "column": column}
-        out["next_step"] = next_step + "这个项目定了一组的配比(comment_set.lines), 和 style 一样要守, 项目规则里说法不一样的以它为准。"
+        out["next_step"] = next_step + COMMENT_SET_NEXT_STEP
         if column and len(existing) > tv_existing:
             out["next_step"] += (f"existing_comments 里 source 是「{column}」的, 是这条帖子那一格里已经有的维护评论: "
-                                 "里面用过的说法也别再用。")
+                                 "里面用过的说法也别再用; 它们是按以前的规矩写的(提品牌多、短评少), 只拿来避开重复, "
+                                 "配比照 comment_set。")
+    if comment_rules or hard_rules:
+        out["rules_note"] = RULE_SELF_SERVICE
     if cfg_note:
         out["comment_set_note"] = cfg_note
     if cell_unread:
@@ -3999,7 +4050,7 @@ def _thread_lines(entries) -> list[str]:
         if isinstance(why, str) and why.strip():
             why = _no_post_ref(why)
             out.append(f"位 {e['slot']}: {why}" if e.get("slot") else why)
-    return out
+    return _note_post_ref(out)
 
 
 _COMMENT_FIX_CHARS = 400            # judge 的单条修改单带整段题干, 一条能上千字; 一组 4 条 × 3 条修改单会把协议挤出注意力
@@ -4011,9 +4062,24 @@ def _no_post_ref(text: str) -> str:
     return text.replace("帖子里", "帖子")
 
 
+# 2026-11-11 owner: 评论里一提帖子就不行。Jev 的话是在说评论(「接住帖子说到的事」「不要从帖子借品牌」), 本身可以提帖子, 可模型
+# 照着改时容易写成「帖子说的 X」: 这几句里第一句提到帖子的, 后面补一句。细节那道题没过时叫加细节, 模型会把评论越写越长
+# (「可以支持字数不够」): 补一句点到就够。都只在转给写手的这一份上加, Jev 的题库不动。
+POST_REF_NOTE = "(评论里不提帖子, 直接说那件事)"
+DETAIL_NOTE = "(点到一个情境或做法就够, 不为这个加长)"
+
+
+def _note_post_ref(lines: list[str]) -> list[str]:
+    for k, line in enumerate(lines):
+        if "帖子" in line:
+            return [*lines[:k], line + POST_REF_NOTE, *lines[k + 1:]]
+    return lines
+
+
 def _instructions(entries, limit: int) -> list[str]:
-    return [_no_post_ref(e["instruction"][:_COMMENT_FIX_CHARS]) for e in (entries or [])
-            if isinstance(e, dict) and isinstance(e.get("instruction"), str)][:limit]
+    out = [_no_post_ref(e["instruction"][:_COMMENT_FIX_CHARS]) + (DETAIL_NOTE if e.get("qid") == "detail_level" else "")
+           for e in (entries or []) if isinstance(e, dict) and isinstance(e.get("instruction"), str)][:limit]
+    return _note_post_ref(out)
 
 
 def _comment_payload(cands: list[dict]) -> list[dict]:
@@ -4212,6 +4278,8 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         out["thread_hints"] = thread_hints[:2]
     if any(style):
         out["style_next_step"] = COMMENT_STYLE_NEXT_STEP
+    if set_line:
+        out["set_next_step"] = SET_NEXT_STEP
     return out
 
 
@@ -7435,6 +7503,10 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
 # 天天写的那个人。把控制权交到工具层, 这套东西才谈得上自己长。
 
 _RULE_ACTIONS = ("mute", "unmute", "retire", "promote", "set_direction")
+# 台账里试用档的规则原文照列(写手要看得见库里有什么), 可它们不进简报、也不给写评论 —— 11-10 一位写手的模型把一条试用档的旧评论
+# 规则当成了项目要求, 和负责人新定的配比对着放(2026-11-11)。回包里说清: 不生效的不用守, 和别的说法不一样不算冲突
+MY_RULES_STATE_NOTE = ("state 是「试用」「已停用」的现在不生效: 写稿、写评论都不用守, 和生效中的规则或 comment_set 说法不一样"
+                       "也不算冲突。用户说哪条过时了, 当场用 set_rule_state 停掉, 不用等负责人。")
 
 
 def my_rules(client, project_id: str, *, user_id: str) -> dict:
@@ -7501,8 +7573,9 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
         "rules": out,
         "counts": counts,
         "actions": ("改这些用 set_rule_state: mute(停用一段时间) / unmute(恢复) / "
-                    "retire(降回试用档, 不再进简报) / promote(试用→生效) / "
+                    "retire(降回试用档, 不再进简报、写评论也不再给) / promote(试用→生效) / "
                     "set_direction(设成 产品向 / 流量向 / 通用)"),
+        "state_note": MY_RULES_STATE_NOTE,
     }
     if missing:
         res["note_missing_embedding"] = (
