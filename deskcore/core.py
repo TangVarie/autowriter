@@ -339,17 +339,30 @@ DIRECTION_RULE_TAIL = ("（标了【只管产品贴/精品贴的稿】【只管�
 # 字数不是要凑够的数(有硬约束说到字数就接在 P0, 只有软规则说到就接在 P1, 只接一次; 接在 DIRECTION_RULE_TAIL 前面)。上限照守:
 # 「标题不超过二十字」这种最常见, 这句不能读成上限也可以松。只改给模型看的这一份; 存档时代码照旧按 check 查, 下限没到的那句
 # 也说补具体内容、不加空话(rulecheck.BELOW_MIN_HOW)。
+# 复审(11-11): P0 是硬约束、每一条都要守(协议), 硬约束的字数下限 check_rules 照旧报「必须改」; P0 那一句不能说「素材不够就写短
+# 一点」, 只说差字数时拿具体内容补、不加空话(LENGTH_RULE_TAIL_HARD)。「可以写短」那一句只接在 P1(只有软规则说到字数时)。
+# owner 那句是对评论说的, 笔记要不要也许字数不够, 留给 owner 定(docs §3.22)。
 LENGTH_RULE_TAIL = ("（规则里说到的字数, 上限照守; 但字数不是要凑够的数: 不为凑字数加空话、重复的解释或总结句, 素材不够就写短一点, "
                     "交付时跟用户说一句差多少。）")
-# 「N 字」: 阿拉伯数字, 或两个字以上的中文数(三百、五十), 或「两个字」这种; 「十字路口」「一字不改」「八字」不算
-_LENGTH_NUM = r"(?:[0-9０-９]+|[一二两三四五六七八九十百千]{2,}|[一二两三四五六七八九十]个)"
+LENGTH_RULE_TAIL_HARD = "（规则里说到的字数照守; 差字数时只拿具体内容(经过、细节、数字)补, 不加空话、重复的解释或总结句。）"
+# 「N 字」: 阿拉伯数字, 或两个字以上的中文数(三百、五十); 「十字路口」「一字不改」「八字」不算。一个中文数字(「十个字」「两个字」)
+# 要挨着说长短的词才算(复审 11-11: 「一个字都不能错」「品牌名四个字不拆开」「slogan 八个字原样用」是在说原样用, 不是字数):
+# 「不超过八个字」「十字以内」算
+_LENGTH_NUM = r"(?:[0-9０-９]+|[一二两三四五六七八九十百千]{2,})"
+_LENGTH_CUE_BEFORE = r"(?:不超过|不多于|不少于|最多|最少|至少|控制在|少于|多于|超过)"
+_LENGTH_CUE_AFTER = r"(?:以内|以上|以下|之内|左右|上下|内(?!容))"
 _LENGTH_RULE = re.compile(rf"{_LENGTH_NUM}\s*(?:[-~～到至]\s*(?:[0-9０-９]+|[一二两三四五六七八九十百千]+)\s*)?个?字"
-                          r"(?![母幕体号典迹])|字数|篇幅")
+                          r"(?![母幕体号典迹])"
+                          rf"|{_LENGTH_CUE_BEFORE}\s*[一二两三四五六七八九十]个?字"
+                          rf"|[一二两三四五六七八九十]个?字{_LENGTH_CUE_AFTER}"
+                          r"|字数|篇幅")
 
 
 def _mentions_length(rules: list[dict]) -> bool:
-    """这几条规则里有没有说到字数的: 原文写了「N 字」「字数」「篇幅」, 或者存了字数检查(rule_kind = max_len)。"""
-    return any(_LENGTH_RULE.search(r.get("content") or "") or (r.get("rule_kind") or "").strip() == "max_len"
+    """这几条规则里有没有说到字数的: 原文写了「N 字」「字数」「篇幅」, 或者存了字数检查(rule_kind = max_len)。管评论的
+    (「评论区」开头的)不算: 这一句是说笔记的。"""
+    return any(not (r.get("content") or "").lstrip().startswith(COMMENT_RULE_PREFIX)
+               and (_LENGTH_RULE.search(r.get("content") or "") or (r.get("rule_kind") or "").strip() == "max_len")
                for r in rules)
 
 # 这场方向闸挡掉的那些 soft 规则(另一个方向的; 复审 2026-11-03): 卡上标了那一族贴型的稿, score_drafts / check_rules 照它们查
@@ -615,7 +628,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         negative_examples=negatives,
     )
     if _mentions_length(hard_shown) and layers.get("p0"):
-        layers["p0"] = layers["p0"] + "\n" + LENGTH_RULE_TAIL
+        layers["p0"] = layers["p0"] + "\n" + LENGTH_RULE_TAIL_HARD
     elif _mentions_length(soft_shown) and layers.get("p1"):
         layers["p1"] = layers["p1"] + "\n\n" + LENGTH_RULE_TAIL
     if hard_noted and layers.get("p0"):
@@ -3404,19 +3417,26 @@ DELIVERY_COLUMN_NEXT_STEP = ("delivery_column.text 是这组评论按「{column}
                              "覆盖; 列名不要贴进格子里。贴几行就算发了几条: 只交真要发的那几条, 不加空行、标题或说明行。改过再判时用"
                              "最后一次回的那一份; 一批分几次判的(带 earlier_comments), 每一段用它最后一次判回的 text, 按判的顺序一段"
                              "接一段交(段和段之间也不加空行), 合起来贴进同一格。")
-# 整组那一句和它的下一步(2026-11-11): 11-10 晚上一位写手的模型把「提品牌最多 10 条」读成「代码检查认为」, 和它记得的一条旧规则
-# 「每条必带品牌词」(已经不生效)对着放, 按「硬约束优先」留了品牌; 短评一条没加(「会改变整批的口气, 没有擅自加」), 还问用户
-# 要不要报给负责人。owner:「为什么每次都要给我反馈才能改」。所以那一句要自己说清: 这是负责人最新定的、比别的说法都新, 直接改,
-# 不问用户、不报负责人; 规则过时了写手当场能停掉。
-SET_LINE_HEAD = ("整组代码查(负责人最新定的, 和项目规则或前面对话里的说法不一样时以这里为准; 直接改, 不用问用户, "
-                 "也不用报给负责人): ")
+# 整组那一句和它的下一步(2026-11-11): 11-10 晚上一位写手的模型把提品牌的上限读成「代码检查的看法」, 和它记得的一条要每条都带
+# 品牌的旧规则(已经不生效)对着放, 按「硬约束优先」留了品牌; 短评一条没加(说会改变整批的口气), 还问用户要不要报给负责人。
+# owner: 为什么每次都要回来找她才能改。所以那一句要自己说清: 条数是负责人给这个项目定的, 项目规则(和之前见过的旧规则原文)
+# 说法不一样的以它为准, 直接改, 不问用户、不报负责人; 规则过时了写手当场能停掉(RULE_SELF_SERVICE)。
+# 复审(11-11): 只压规则原文, 不压用户这次在对话里明说的(协议: 用户另有要求就照用户的; owner 也问「她自己就能在对话中更改吗」)。
+# 用户明说要别的配比, 这一组照用户的写、交付时说一句(USER_MIX_NOTE); 配比本身是项目配置, 对话里改不了, 也照实说。
+# 不写「最新」「比…都新」: 配比没有日期, 比不了谁新。整组那一句里没有配比的数(没配 comment_set, 只有重复、品牌收尾这些
+# 所有项目都管的)时不说是负责人给这个项目定的, 也不带 set_next_step(那几条的 style_fix 有 style_next_step)。
+SET_LINE_HEAD = "整组代码查(条数是负责人给这个项目定的, 项目规则里说法不一样时以这里为准; 直接改, 不用问用户): "
+SET_LINE_HEAD_ALL = "整组代码查(所有项目都管; 直接改, 不用问用户): "
 RULE_SELF_SERVICE = ("用户说哪条项目规则过时了: 当场用 set_rule_state 停掉(以后都不要用 retire, 先停一阵用 mute; memory_id "
                      "在 my_rules 里), 不用等负责人; 要换成新说法用 record_rule。")
-SET_NEXT_STEP = ("thread_fix 第一句(整组代码查)是负责人给这个项目最新定的: 项目规则里或前面对话里说要每条带品牌、要几条夸或"
-                 "背书的, 都以它为准, 不算冲突。照它点名的几条直接改, 改完整组再判一次; 不用问用户, 也不用报给负责人。"
-                 "短评不够: 把点名的几条压短, 或换成一句话短评(比如「蹲一个」「同问」), 这不算改口气。" + RULE_SELF_SERVICE)
-COMMENT_SET_HEAD = ("下面几个数是负责人给这个项目最新定的, 比项目规则和前面对话里的说法都新: 规则里要每条带品牌、要几条夸或"
-                    "背书的, 照这里写, 不算冲突; 品牌怎么称呼(全称、简称)照项目规则; 不用问用户, 也不用报给负责人")
+USER_MIX_NOTE = ("用户这次明说要别的配比(比如每条都带品牌), 这一组就照用户的写, 交付时一句话说明和项目定的配比不一样; "
+                 "项目定的配比在对话里改不了。")
+SET_NEXT_STEP = ("thread_fix 第一句里提品牌、中性、短评的条数是负责人给这个项目定的: 照它点名的几条直接改, 改完整组再判一次; "
+                 "不用问用户, 也不用报给负责人。")
+SET_BRAND_STEP = "项目规则里或之前见过的规则原文说要每条带品牌、要几条夸或背书的, 以这里的条数为准, 不算冲突。"
+SET_SHORT_STEP = "短评不够: 把点名的几条压短, 或换成一句话短评(比如「蹲一个」「同问」), 这不算改口气。"
+COMMENT_SET_HEAD = ("下面几个数是负责人给这个项目定的配比: 项目规则里或之前见过的规则原文要每条带品牌、要几条夸或背书的, "
+                    "照这里写, 不算冲突; 品牌怎么称呼(全称、简称)照项目规则; 不用问用户, 也不用报给负责人。" + USER_MIX_NOTE)
 
 
 class _CommentSetError(ValueError):
@@ -3473,8 +3493,8 @@ def _comment_set(project: dict) -> tuple[dict | None, str | None]:
 
 
 def _comment_set_lines(cfg: dict) -> list[str]:
-    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。第一句说这些数是负责人最新定的、比别的说法都新
-    (2026-11-11, 见 ``SET_LINE_HEAD`` 上面那段)。"""
+    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。第一句说这些数是负责人给这个项目定的、规则原文说法
+    不一样的照这里写、用户这次明说要别的配比就照用户的(2026-11-11, 见 ``SET_LINE_HEAD`` 上面那段)。"""
     out = [COMMENT_SET_HEAD]
     if cfg.get("brand_max") is not None:
         out.append(f"一组里提到品牌的最多 {commentstyle._pct(cfg['brand_max'])}%(20 条最多 "
@@ -3581,7 +3601,27 @@ def _set_line(checks: dict) -> tuple[str | None, bool]:
                 fail = True
     if checks["ends"].get("thread_fix"):
         parts.append(checks["ends"]["thread_fix"])
-    return ((SET_LINE_HEAD + "; ".join(parts)) if parts else None), fail
+    head = SET_LINE_HEAD if _set_fired(checks) else SET_LINE_HEAD_ALL
+    return ((head + "; ".join(parts)) if parts else None), fail
+
+
+def _set_fired(checks: dict) -> set[str]:
+    """整组那一句里有项目配比的哪几样(提品牌、中性、短评; 只有配了 comment_set 的项目才会有)。"""
+    return {k for k in ("brand", "neutral", "short") if (checks.get(k) or {}).get("segment")}
+
+
+def _set_next_step(checks: dict) -> str | None:
+    """整组那一句的下一步(复审 11-11): 只在那一句里有配比的数时给, 按这次真报了的几样拼: 提品牌、中性报了才说规则里要每条带
+    品牌的以条数为准, 短评真不够才说怎么补短评。没有配比的数(只有重复、品牌收尾)回 None。"""
+    fired = _set_fired(checks)
+    if not fired:
+        return None
+    out = SET_NEXT_STEP
+    if fired & {"brand", "neutral"}:
+        out += SET_BRAND_STEP
+    if (checks.get("short") or {}).get("short_by"):
+        out += SET_SHORT_STEP
+    return out + USER_MIX_NOTE + RULE_SELF_SERVICE
 
 
 def _style_block(cands: list[dict], style: list[list[str]], checks: dict | None = None) -> dict:
@@ -3595,7 +3635,9 @@ def _style_block(cands: list[dict], style: list[list[str]], checks: dict | None 
         line, _fail = _set_line(checks)
         if line:
             out["thread_fix"] = [line]
-            out["set_next_step"] = SET_NEXT_STEP
+        step = _set_next_step(checks)
+        if step:
+            out["set_next_step"] = step
         if checks["ends"].get("thread_hint"):
             out["thread_hints"] = [checks["ends"]["thread_hint"]]
     return out
@@ -3928,10 +3970,11 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
         "note": (why + "。" if why else "") + "请用户补上: " + "、".join(need) + "。补齐后再调一次。"}
 
 
-# 每次 comments_for 现取规则(2026-11-11): 同一场对话里早先拿到的规则原文(包括已经停掉的)不算数
-COMMENTS_FOR_RULES_NOW = "规则以这次回的为准, 前面对话里见过的说法不一样的不算。"
-COMMENT_SET_NEXT_STEP = ("这个项目定了一组的配比(comment_set.lines), 是负责人最新定的, 和 style 一样要守; 项目规则里说法不一样的"
-                         "以它为准, 不算冲突, 不用问用户。")
+# 每次 comments_for 现取规则(2026-11-11): 同一场对话里早先拿到的规则原文(包括已经停掉的)不算数。只说规则原文, 不压用户这次
+# 在对话里明说的要求(复审 11-11, 见 SET_LINE_HEAD 上面那段)
+COMMENTS_FOR_RULES_NOW = "规则以这次回的为准, 前面对话里见过的规则原文和这次不一样的不算(可能已经停掉了)。"
+COMMENT_SET_NEXT_STEP = ("这个项目定了一组的配比(comment_set.lines), 是负责人定的, 和 style 一样要守; 项目规则里说法不一样的"
+                         "以它为准, 不算冲突, 不用问用户; 用户这次明说要别的配比, 这一组就照用户的写, 交付时一句话说明。")
 
 
 def _comment_rules(client, project_id: str, user_id) -> tuple[list[str], list[str]]:
@@ -4278,8 +4321,9 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         out["thread_hints"] = thread_hints[:2]
     if any(style):
         out["style_next_step"] = COMMENT_STYLE_NEXT_STEP
-    if set_line:
-        out["set_next_step"] = SET_NEXT_STEP
+    step = _set_next_step(checks)
+    if step:
+        out["set_next_step"] = step
     return out
 
 

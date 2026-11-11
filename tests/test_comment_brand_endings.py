@@ -254,7 +254,7 @@ def test_score_comments_fails_the_excess_brand_endings(wired):
     assert rows["q2"]["passed"] is True and "style_fix" not in rows["q2"], "前 1 条留着"
     assert rows["exp"]["passed"] is False and "以品牌评价收尾" in rows["exp"]["style_fix"][0]
     assert out["passed"] is False and out["summary"]["passed"] == 3
-    assert out["thread_fix"][0].startswith(core.SET_LINE_HEAD) and "整组 4 条里 2 条以品牌评价收尾" in out["thread_fix"][0]
+    assert out["thread_fix"][0].startswith(core.SET_LINE_HEAD_ALL) and "整组 4 条里 2 条以品牌评价收尾" in out["thread_fix"][0]
     assert "位 exp 改成" in out["thread_fix"][0], "代码数出来的几样并成一句(2026-11-10)"
     assert len(out["thread_fix"]) == core.SCORE_MAX_FIXES, "代码那一句在最前面, 判定服务的几条挤不掉它"
     assert out["style_next_step"] == core.COMMENT_STYLE_NEXT_STEP

@@ -230,7 +230,7 @@ def test_comments_for_reads_the_cell_as_existing_comments():
     assert [x["text"] for x in cell] == ["上周三晚上八点开的直播我也蹲了", "同问价格", "第三条在这里"], "编号、空行去掉"
     assert [x["text"] for x in out["existing_comments"] if "source" not in x] == ["那后来怎么改的", "可以看看简历第一行"]
     assert out["comment_set"]["column"] == COL and len(out["comment_set"]["lines"]) == 5
-    assert out["comment_set"]["lines"][0] == core.COMMENT_SET_HEAD, "第一句说这些数是负责人最新定的"
+    assert out["comment_set"]["lines"][0] == core.COMMENT_SET_HEAD, "第一句说这些数是负责人给这个项目定的"
     assert "20 条最多 10 条" in out["comment_set"]["lines"][1] and "20 条至少 6 条" in out["comment_set"]["lines"][2]
     assert "20 条至少 4 条" in out["comment_set"]["lines"][3]
     assert f"source 是「{COL}」" in out["next_step"] and "comment_set.lines" in out["next_step"]
