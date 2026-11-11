@@ -482,6 +482,31 @@ RECENT_TITLES_TASK = (
     "draw_angles 分到的坐标和切入角度、用户点名要写的题目或要改的稿，都在这一栏之上；这一栏只管新写的稿，改稿不受它约束。"
     "不用念给用户听。")
 
+# 标题字数(2026-11-11, 审计 A2 / A4): 写作台稿标题超过 20 字的, 发出去之前三篇里有两篇标题被改, 改完几乎都落在 20 字以内;
+# 20 字以内的只有两成被改。这件事原来只在存档之后才说得出来(存了 max_len 标题检查的项目由 check_rules 报), 写之前没人说。
+# 所以这一栏里发出去的标题够 TITLE_LEN_MIN_TITLES 条、其中至少 TITLE_LEN_SHARE_PCT% 不超过 TITLE_LEN_CAP 字时, task 末尾
+# 接一句「新写的标题也写在 20 字以内」。固定 20, 不按项目算分位数(分位数会把 21-22 字那一档放过去, 被改得最多的正是那一档)。
+#  · 只看这一栏已经拿到的 published(最近发出去的 12-20 条, 模型自己也看得见这几条), 不另查库。
+#  · 条数不够、或者这个项目发出去的标题本来就常超过 20 字: 不接, 一个字不多。
+#  · 数法和 max_len 标题检查同一个(rulecheck._count: 去掉空白和 #话题 再数), 两边不会一个说超了一个说没超。
+#  · 只是写之前的一句参照, 不是检查: 不进 draft_checks / check_rules, 不多一轮改稿重存。规则里对标题另有要求的照规则
+#    (和 LENGTH_RULE_TAIL 的「上限照守」同一个方向); 只说标题, 不碰正文篇幅(10-20 撤过「写短一点」的规则)。
+TITLE_LEN_CAP = 20
+TITLE_LEN_MIN_TITLES = 10
+TITLE_LEN_SHARE_PCT = 80
+TITLE_LEN_TAIL = (
+    f"published 里的标题大多不超过 {TITLE_LEN_CAP} 字（不算空白和话题）：新写的稿子标题也写在 {TITLE_LEN_CAP} 字以内。"
+    "这一句只管标题，正文篇幅不受它影响；规则或用户对标题另有要求的，照规则和用户的。")
+
+
+def _titles_run_short(published: list[str]) -> bool:
+    """这几条发出去的标题够不够条数、是不是大多不超过 TITLE_LEN_CAP 字(见上面那段)。"""
+    titles = [t for t in published or [] if isinstance(t, str) and t.strip()]
+    if len(titles) < TITLE_LEN_MIN_TITLES:
+        return False
+    short = sum(1 for t in titles if rulecheck._count(t) <= TITLE_LEN_CAP)
+    return short * 100 >= len(titles) * TITLE_LEN_SHARE_PCT
+
 
 # ── 已验证规律怎么用(2026-10-20) ──────────────────────────────────────────────
 # 10-20 生产诊断: 85% 的写手日简报里都带着同样 4 条已验证规律, 其中一条是"整篇围绕一个求助问题来组织"。模型把
@@ -748,6 +773,9 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         if recent.get("working"):
             out["recent_titles"]["working"] = recent["working"]
         out["recent_titles"]["task"] = RECENT_TITLES_TASK
+        # 发出去的标题大多不超过 20 字的项目, 多说一句新标题也写在 20 字以内(见 TITLE_LEN_TAIL 上面那段); 不另查库
+        if _titles_run_short(out["recent_titles"]["published"]):
+            out["recent_titles"]["task"] += TITLE_LEN_TAIL
 
     # ── 这个项目现在什么情况(angle cards v2 §3.4) ──────────────────────────────────────────────
     # 只读缓存, 一个请求都不发: 发牌的先验(priors)和写作台近两周的计数都在进程缓存里, 缓存是冷的就在下面投递一次

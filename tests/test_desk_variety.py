@@ -10,6 +10,7 @@
      · 每条 ≤40 字、合计 ≤20 条, 写过的留 8 条份额(活跃项目发出去的远超 20 条, 不留的话昨天写的永远进不来),
        哪栏不够空位给另一栏; 不带正文; 查不到就不带这一栏, 简报照给
      · task 不要求"标题句式不一样"(那是发牌的硬坐标), 只管说法 / 人设 / 场景, 并写明谁优先
+     · 发出去的标题够 10 条、八成不超过 20 字时, task 末尾多一句「新写的标题也写在 20 字以内」(2026-11-11)
   2. draw_angles 一批之内错开(angle cards v2 之后): 不再硬把 8 种内容形式轮一遍 —— 形式照项目的配额发(84/16 的项目
      n=10 平均 8.4 篇提问求助、配额外 0 篇), 没有数据(均匀先验)时 8 张牌照旧 8 种形式; 一批之内不重复「形式 + 标题 +
      原型」, 也不重复「杠杆 + 原型」, 杠杆 / 原型各有封顶; 避重照旧, 同 seed 同候选表(两种发法都钉)
@@ -29,8 +30,10 @@ import math
 import pytest
 
 import librarian_client as lib
-from deskcore import core, priors, store, tools, vocab
+from deskcore import core, priors, rulecheck, store, tools, vocab
 from tests.fakes import FakeClient
+from tests.test_rulecheck import _rule
+from tests.test_writer_facing_text import FORBIDDEN
 
 ME = "11111111-1111-1111-1111-111111111111"
 MATE = "22222222-2222-2222-2222-222222222222"
@@ -272,6 +275,112 @@ def test_recent_titles_task_does_not_fight_the_drawn_title_structure():
         assert word in task, word
     doc = tools.open_project.__doc__ or ""
     assert "标题句式照" in doc and "优先于它" in doc
+
+
+# ── 标题字数那一句(2026-11-11, 审计 A2 / A4) ──────────────────────────────────────────────
+# 发出去的标题够 10 条、其中至少八成不超过 20 字: task 末尾多一句「新写的标题也写在 20 字以内」。只看这一栏已经拿到的
+# published, 不另查库; 条数不够或者长标题多就一个字不多; 数法和 max_len 标题检查同一个; 只是一句参照, 不是检查。
+
+def _short(i) -> str:
+    return f"第{i}篇的短标题写到这里为止"            # 13-14 字
+
+
+def _long(i) -> str:
+    return f"第{i}篇的标题故意写得很长很长一直写到超过二十个字为止"      # 27-28 字
+
+
+def _with_published(titles) -> _World:
+    w = _World()
+    for i, t in enumerate(titles):
+        w.published(f"n{i}", t, kind="ingested", days=1 + i * 0.1)
+    return w
+
+
+def test_brief_says_keep_titles_within_20_when_published_titles_run_short():
+    out = _brief(_with_published([_short(i) for i in range(10)]).client())
+    task = out["recent_titles"]["task"]
+    assert task == core.RECENT_TITLES_TASK + core.TITLE_LEN_TAIL
+    assert "20 字以内" in core.TITLE_LEN_TAIL and core.TITLE_LEN_CAP == 20
+    assert set(out["recent_titles"]) == {"published", "drafted", "task"}, "只多一句话, 不多一个键"
+
+
+@pytest.mark.parametrize("n_short, n_long, says", [
+    (9, 0, False),        # 不够 10 条
+    (10, 0, True),
+    (8, 2, True),         # 正好八成
+    (7, 3, False),        # 七成: 这个项目发出去的标题本来就常超过 20 字
+    (15, 4, False),       # 19 条里 15 条 = 78.9%: 不四舍五入
+    (16, 4, True),
+    (0, 12, False),
+])
+def test_title_length_line_needs_ten_titles_and_four_in_five_short(n_short, n_long, says):
+    titles = [_short(i) for i in range(n_short)] + [_long(i) for i in range(n_long)]
+    task = _brief(_with_published(titles).client())["recent_titles"]["task"]
+    assert task == core.RECENT_TITLES_TASK + (core.TITLE_LEN_TAIL if says else ""), (n_short, n_long)
+
+
+def test_title_length_line_counts_published_titles_only():
+    """写过的标题不算: 那是写作台自己写的, 拿它来定「发出去的大多不超过 20 字」是自己证明自己。"""
+    w = _with_published([_short(i) for i in range(5)])
+    w.drafted("b1", [f"写过的第{i}个短标题" for i in range(8)])
+    rt = _brief(w.client())["recent_titles"]
+    assert len(rt["published"]) == 5 and len(rt["drafted"]) == 8
+    assert rt["task"] == core.RECENT_TITLES_TASK
+
+
+@pytest.mark.parametrize("title", [
+    "标" * 20, "标" * 21,
+    "二十 个 字 的 标题 中间 带着 空格 也 只 数 字",                  # 连空格 28 个字符, 去掉空白 17 字
+    "标题后面带一个话题也不算进字数里去 #示例话题",                  # 话题不算: 17 字
+    "C#入门和网址里的#片段都算字不能扣掉a",                         # 不是话题的 # 照样算字
+    "标" * 19 + "ab", "标" * 18 + "ab",
+])
+def test_title_length_line_counts_like_the_max_len_title_check(title):
+    """同一条标题, 简报这一句认它超没超 20 字, 和存了「标题最多 20 字」检查的项目里 check_rules 报不报, 是同一个答案。"""
+    rule = _rule(1, "max_len", {"max": core.TITLE_LEN_CAP, "where": "title"}, project_id=PID)
+    hits, _stats = rulecheck.check([rule], [{"title": title, "body": "正文"}])
+    assert core._titles_run_short([title] * core.TITLE_LEN_MIN_TITLES) is (not hits), title
+
+
+def test_title_length_helper_ignores_blanks_and_bad_input():
+    assert core._titles_run_short(None) is False and core._titles_run_short([]) is False
+    assert core._titles_run_short([_short(i) for i in range(9)] + ["", "  ", None]) is False, "空标题不凑数"
+
+
+def test_title_length_line_costs_no_extra_query(monkeypatch):
+    """说这一句和不说这一句, 发给库的请求一条不差: 用的是这一栏已经拿到的标题。"""
+    # 后台预热(发牌先验 / 项目近况)只在进程里头一回开项目时跑, 和这一句无关: 关掉, 只比简报自己发的请求
+    monkeypatch.setattr(core.priors, "warm", lambda *a, **k: None)
+    monkeypatch.setattr(core.project_now, "warm_desk", lambda *a, **k: None)
+    said, silent = _with_published([_short(i) for i in range(12)]).client(), \
+        _with_published([_long(i) for i in range(12)]).client()
+    assert _brief(said)["recent_titles"]["task"].endswith(core.TITLE_LEN_TAIL)
+    assert _brief(silent)["recent_titles"]["task"] == core.RECENT_TITLES_TASK
+    shape = lambda c: [(q["table"], q["op"], q["cols"]) for q in c.calls]      # noqa: E731
+    assert shape(said) == shape(silent)
+
+
+def test_title_length_line_is_advice_that_yields_to_rules_and_the_user():
+    """只是写之前的一句参照: 规则和用户对标题另有要求的照规则和用户的(不和「上限照守」、不和存了检查的标题规则打架),
+    只说标题不碰正文篇幅, 不叫模型去查、去改已经存过的稿、去问用户或跟用户说什么。"""
+    tail = core.TITLE_LEN_TAIL
+    for word in ("照规则和用户的", "只管标题", "正文篇幅不受它影响", "新写的稿子"):
+        assert word in tail, word
+    for word in ("必须", "检查", "check_", "score_drafts", "重存", "告诉用户", "问用户", "跟用户说", "写短", "平台"):
+        assert word not in tail, word
+    assert not [f for f in FORBIDDEN if f in tail]
+    assert "上限照守" in core.LENGTH_RULE_TAIL, "字数那一句照旧说上限要守: 两句同一个方向"
+
+
+def test_title_length_line_sits_beside_a_stored_title_length_rule():
+    """项目里已经有「标题不超过二十字」的硬规则(存了 max_len 检查): P0 照旧带规则和字数那一句, 这一栏照旧多一句, 各说各的。"""
+    c = _with_published([_short(i) for i in range(10)]).client()
+    c.rows["memories"] = [_rule(1, "max_len", {"max": 20, "where": "title"}, content="标题不超过二十字",
+                                project_id=PID, user_id=ME)]
+    out = _brief(c)
+    assert "标题不超过二十字" in out["p0"] and core.LENGTH_RULE_TAIL_HARD in out["p0"]
+    assert out["recent_titles"]["task"] == core.RECENT_TITLES_TASK + core.TITLE_LEN_TAIL
+    assert core.TITLE_LEN_TAIL not in out["p0"] + out["p1"], "不进规则那几层: 它不是规则"
 
 
 def test_brief_omits_recent_titles_when_there_are_none():

@@ -319,7 +319,7 @@ def _server_texts() -> dict[str, str]:
         {store.ANGLE_KEY_UNKNOWN: 1, store.ANGLE_KEY_USED: 1, store.ANGLE_KEY_OTHER_PROJECT: 1,
          store.ANGLE_KEY_NOT_IN_LEDGER: 1})
     # angle cards v2(§3): 发牌回包 / 卡面 / 简报里新加的话, 同样不许说回旧口径
-    for const in ("RECENT_TITLES_TASK", "ANGLES_HEADER", "ANGLES_FOOTER", "ANGLES_KEY_LINE", "REPEAT_LINE"):
+    for const in ("RECENT_TITLES_TASK", "TITLE_LEN_TAIL", "ANGLES_HEADER", "ANGLES_FOOTER", "ANGLES_KEY_LINE", "REPEAT_LINE"):
         texts[f"core.{const}"] = getattr(core, const)
     texts["core.DRAW_CLAMPED_NOTE"] = core.DRAW_CLAMPED_NOTE.format(max=core.DRAW_N_MAX)
     for const in ("PROJECT_NOW_TASK", "WORKING_NOTE", "NO_EXTERNAL_NOTE", "EXTERNAL_UNREAD_NOTE", "STATUS_DEGRADED",
