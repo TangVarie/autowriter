@@ -986,7 +986,9 @@ _MIX_TOOL = "set_comment_mix"
 
 def _spell_out_non_finite(body: bytes) -> bytes:
     """``tools/call set_comment_mix`` 的请求体里不是有限的数 → 它原来的字面(字符串); 别的请求体原样(同一个对象)回去。"""
-    if _MIX_TOOL.encode() not in body:
+    # 先用字节粗筛, 省掉绝大多数请求的一次解析。带反斜杠的不能筛掉(Codex 11-11): 工具名可以写成转义的
+    # ("\\u0073et_comment_mix"), 字节里找不到名字, 解出来却是它 —— 所以判断「是不是这个工具」一律看解出来的名字。
+    if _MIX_TOOL.encode() not in body and b"\\" not in body:
         return body
     hits: list[str] = []
 

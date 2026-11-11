@@ -205,6 +205,29 @@ def test_only_a_set_comment_mix_call_with_a_non_finite_number_is_rewritten(http)
     assert fixed["id"] == 1 and fixed["params"]["arguments"]["project_id"] == _pid(c)
 
 
+@pytest.mark.parametrize("name", ["\\u0073et_comment_mix", "set_comment_mi\\u0078", "set\\u005fcomment\\u005Fmix"])
+def test_mcp_a_tool_name_written_with_json_escapes_is_still_guarded(live, name):
+    """Codex 11-11: 工具名写成转义的, 字节里找不到 ``set_comment_mix``, 解出来却是它 —— 原来粗筛直接放过, 1e400 又变回 null。"""
+    client, c = live
+    before = c.rows["projects"][0]["default_params"]
+    body = _mcp_body(c, '{"short_min": 1e400}', tool=name)
+    assert b"set_comment_mix" not in body
+    assert json.loads(A._spell_out_non_finite(body))["params"]["arguments"]["mix"] == {"short_min": "1e400"}
+    r = client.post("/", headers=MCP_H, content=body)
+    assert r.status_code == 200, r.text
+    result = r.json()["result"]
+    assert result.get("isError") is True and "现在是 '1e400'" in result["content"][0]["text"], result
+    assert _writes(c) == [] and c.rows["projects"][0]["default_params"] == before
+
+
+def test_a_body_with_backslashes_for_another_tool_is_still_untouched(http):
+    _client_, c = http
+    for body in (_mcp_body(c, '{"brand_max": 1e400, "note": "a\\nb"}', tool="score_comments"),
+                 _mcp_body(c, '{"brand_max": 0.6, "note": "\\u4e2d"}'),            # 这个工具, 但没有坏的数
+                 b'{"x": "\\u0073et_comment_mix", not json'):
+        assert A._spell_out_non_finite(body) is body, body[:80]
+
+
 def test_the_body_guard_hands_the_body_on_whole_and_passes_everything_else_through():
     anyio = pytest.importorskip("anyio")
     seen = []
