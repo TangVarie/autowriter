@@ -679,7 +679,8 @@ def test_a_bare_seven_is_seven_percent_and_the_summary_shows_it():
 
 MIX_TEXTS = {name: getattr(core, name) for name in (
     "MIX_KEYS_HELP", "MIX_EMPTY", "MIX_COLUMN_REFUSED", "MIX_UNREADABLE", "MIX_EXISTING_BAD", "MIX_SUM", "MIX_UNCHANGED",
-    "MIX_SUMMARY", "MIX_NOT_STORED", "MIX_CLEARED_NOTE", "MIX_NEXT_STEP", "MIX_UNCHANGED_NEXT_STEP")}
+    "MIX_SUMMARY", "MIX_NOT_STORED", "MIX_CLEARED_NOTE", "MIX_NEXT_STEP", "MIX_UNCHANGED_NEXT_STEP",
+    "MIX_EXISTING_NUMBER_BAD", "MIX_CLEARED_NEXT_STEP")}
 MIX_TEXTS["tools.set_comment_mix"] = tools.set_comment_mix.__doc__
 
 

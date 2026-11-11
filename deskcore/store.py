@@ -128,7 +128,8 @@ def project_row(sb, project_id: str) -> dict | None:
 
 
 def set_project_default_params(sb, project_id: str, params_json: str) -> dict | None:
-    """整列写回 ``projects.default_params``(调用方先读、合并、校验; 只有 cli delivery-format 用, 2026-10-20)。
+    """整列写回 ``projects.default_params``(调用方先读、合并、校验; 2026-10-20 起 cli delivery-format / project-archive 用,
+    2026-11-11 起写手的 set_comment_mix 也用)。
 
     传进来的是 **JSON 字符串**: 生产库这一列 80 行全是字符串形状(db.create_project 用 json.dumps 写), 同一列混两种
     形状的话, 读它的地方(isolation.markers、delivery.parse_params)都得一直两头兼容下去。

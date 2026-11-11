@@ -85,6 +85,8 @@ def _refused(provided) -> identity.AuthError:
     ("k-xxx", 5, None, ["placeholder"], "invalid"),
     ("k-XXX-0000", 10, "0000", ["placeholder"], "invalid"),
     ("<your-key>", 10, "key>", ["placeholder"], "invalid"),
+    ("<key-goes-here>", 15, "ere>", ["placeholder"], "invalid"),          # 只有尖括号, 没有 your / xxx
+    ("k-shili-0123>", 13, "123>", ["placeholder"], "invalid"),
     ("YOUR_KEY_HERE", 13, "HERE", ["placeholder"], "invalid"),
     ("<你的 key>", 8, "key>", ["whitespace_inside", "non_ascii", "placeholder"], "invalid_whitespace"),
 ])
@@ -368,6 +370,28 @@ def test_rejections_are_counted_by_reason_with_the_time_of_the_last_one(one_key,
     text = json.dumps(out, ensure_ascii=False)
     for leaked in (GOOD, "FAKE", "0000", "示例写手", "/tool/"):
         assert leaked not in text, leaked
+
+
+def test_the_counter_only_ever_holds_the_fixed_reasons(one_key, fresh_counts):
+    """/health 不带鉴权, 谁都能反复打: 计数的键只能是那固定的九个, 不随路径、不随对方发来的东西长。
+
+    ``AuthError`` 自己会把不认识的原因收成 other; ``record_rejection`` 再收一次 —— 拿到的不一定是它造出来的那个样子
+    (原因事后被改了, 或根本不是 AuthError)。"""
+    fixed = set(identity.AUTH_REJECT_REASONS)
+    for i in range(50):
+        identity.record_rejection(_refused(f"k-cuode-{i:016d}"), path=f"/tool/xianbian-{i}", via=f"via-{i}")
+    changed = identity.AuthError("x", reason="invalid")
+    changed.reason = "k-cuode-0000000000000000"            # 事后改成了对方发来的那一串
+    identity.record_rejection(changed, path="/tools", via="header")
+
+    class _Lookalike(Exception):
+        reason, shape = "/tool/xianbian", None
+    identity.record_rejection(_Lookalike("x"), path="/tools", via="header")
+    assert set(identity._REJECTIONS) <= fixed, sorted(set(identity._REJECTIONS) - fixed)
+    assert len(identity._REJECTIONS) <= len(fixed)
+    assert set(identity._LAST_REJECTION) == {"at"}
+    out = identity.auth_rejections()["since_start"]
+    assert out == {**dict.fromkeys(identity.AUTH_REJECT_REASONS, 0), "invalid": 50, "other": 2}
 
 
 def test_one_warning_line_per_rejection_with_length_and_flags_but_no_key_material(one_key, fresh_counts, caplog):
