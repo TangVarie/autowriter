@@ -14,6 +14,8 @@
 > - **`review_drafts` / `export_drafts` 两个工具撤了**：定稿由写手贴进飞书，发布后 `tv-sync` 按内容对回来（core 里的函数保留，不再暴露给模型）。
 > - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
 
+> **2026-11-11**：项目定的评论配比写手可以在对话里改（**`set_comment_mix`**，只在用户明说时调；列改不了；留最近 20 次的记录）。钥匙对不上时 401 自己说收到的那一串长什么样，`/health` 多一块 `auth_rejections`（按固定的几个原因数被拒的请求，没有钥匙的任何一部分）。见 `docs/deskcore.md` §3.23。
+
 > **2026-10-20 · D-121 写完按规则逐篇查**：规则由 Jev（`POST /compile_rules`）编成是非题 / 代码检查，按（规则 id, sha）缓存进
 > `rule_compiles`（`migrations/015`）；`score_drafts` 之后调 **`check_rules(version_ids)`**（传 `score_drafts` 返回的
 > `check_rules_version_ids`：只有新稿，改稿重存的不再查），hard 没守住报「必须改」、soft 报「建议改」、

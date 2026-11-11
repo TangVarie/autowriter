@@ -15,6 +15,9 @@
   到 10-23 header 2,904、bearer 0), 没有客户端在用, 而查询串会进访问日志和
   代理日志、事后删不掉。带 ?key= 而没有 header 的请求
   现在直接 401 并说明要改用 header, 计数仍记一次 query, 好看出还有没有人在试。
+  钥匙对不上时的 401 自己说清为什么(2026-11-11, identity.key_shape): 只说对方发来的那一串长什么样(长度、
+  最后 4 位、有没有空格 / 引号 / 省略号 / 多出来的 Bearer), 不碰服务端配的钥匙; /health 的 auth_rejections
+  按固定的几个原因计数, 每拒一次一行 WARNING。REST 和 /mcp 是同一个中间件、同一份 JSON。见 docs/deskcore.md §3.23。
 
 降级:
   读类工具出错 → 返回带 error 的可用结构 + 服务端 logger.exception 留痕。
@@ -47,6 +50,8 @@ from __future__ import annotations
 import collections
 import contextlib
 import contextvars
+import inspect
+import json
 import logging
 import os
 import threading
@@ -165,24 +170,47 @@ def key_transport_counts() -> dict:
         return {k: _KEY_TRANSPORT.get(k, 0) for k in ("header", "bearer", "query", "none")}
 
 
-def _extract_key(request: Request) -> str | None:
-    key = request.headers.get("x-deskcore-key")
-    if key:
-        _count_transport("header")
-        return key
-    auth = request.headers.get("authorization") or ""
-    if auth.lower().startswith("bearer "):
-        _count_transport("bearer")
-        return auth[7:].strip()
+def _key_transport_of(request: Request) -> str:
+    """这次请求的钥匙是从哪儿传的: header / bearer / query / none。只看有没有, 不碰值。"""
+    if request.headers.get("x-deskcore-key"):
+        return "header"
+    if (request.headers.get("authorization") or "").lower().startswith("bearer "):
+        return "bearer"
     if request.query_params.get("key"):
+        return "query"
+    return "none"
+
+
+def _extract_key(request: Request) -> str | None:
+    how = _key_transport_of(request)
+    _count_transport(how)
+    if how == "header":
+        return request.headers.get("x-deskcore-key")
+    if how == "bearer":
+        return (request.headers.get("authorization") or "")[7:].strip()
+    if how == "query":
         # 已停收 (W-09)。不退回成"没带 key": 那样报的是 missing, 看不出原因;
         # 也不在日志里打 key。
-        _count_transport("query")
         raise identity.AuthError(
             "?key= is no longer accepted; send the key in the X-Deskcore-Key header "
-            "(or Authorization: Bearer)")
-    _count_transport("none")
+            "(or Authorization: Bearer)", reason="query_param")
     return None
+
+
+# 服务端注入、调用方不许自己传的参数。_caller_name(2026-11-11): 钥匙在 DESKCORE_KEYS 里的备注名, 只给签名里要它的工具
+# (set_comment_mix 留痕用); 它不是身份 —— 归属校验只认 _user_id。
+_INJECTED_PARAMS = ("_user_id", "_caller_name")
+
+
+def _inject_caller(fn, kwargs: dict, needs_user: bool) -> dict:
+    for k in _INJECTED_PARAMS:
+        kwargs.pop(k, None)               # 不允许调用方伪造身份 / 署名
+    caller = _caller.get()
+    if needs_user:
+        kwargs["_user_id"] = caller.user_id
+    if "_caller_name" in inspect.signature(fn).parameters:
+        kwargs["_caller_name"] = caller.name
+    return kwargs
 
 
 def _call_tool(name: str, args: dict) -> object:
@@ -190,10 +218,7 @@ def _call_tool(name: str, args: dict) -> object:
     if entry is None:
         raise KeyError(name)
     fn, needs_user = entry
-    kwargs = dict(args or {})
-    kwargs.pop("_user_id", None)          # 不允许调用方伪造身份
-    if needs_user:
-        kwargs["_user_id"] = _caller.get().user_id
+    kwargs = _inject_caller(fn, dict(args or {}), needs_user)
     # 2026-10-30 发布收尾: 非入口工具不再按身份抽查 skill 版本、捎升级提醒 —— 一个团队共用一个身份, 一个人手上的旧版
     # 会让所有人都收到。提醒只看入口工具这一次报上来的版本(deskcore/skillcheck.py), REST 和 MCP 都原样回工具结果。
     return fn(**kwargs)
@@ -357,7 +382,15 @@ async def auth_middleware(request: Request, call_next):
     try:
         caller = identity.resolve(_extract_key(request))
     except identity.AuthError as exc:
-        return JSONResponse({"detail": str(exc)}, status_code=401)
+        # 2026-11-11: 401 自己说清为什么(identity.key_shape 那一段)。这个中间件包着整个 app, 挂在 /mcp 下面的 MCP
+        # 子应用也在里面(_NormalizeMcpPath 在更外层, /mcp 和 /mcp/ 到这里是同一条路) —— REST 和 MCP 拿到的是同一份
+        # JSON: ``detail`` 是给人看的那一句, ``reason`` 是固定的原因名, ``key_shape`` 只在「带了钥匙但对不上」时有,
+        # 说的只是对方发来的那一串(长度、最后 4 位、几个是 / 否)。每拒一次记一个数、一行 WARNING(日志里没有最后 4 位)。
+        identity.record_rejection(exc, path=request.url.path, via=_key_transport_of(request))
+        body = {"detail": str(exc), "reason": exc.reason}
+        if exc.shape:
+            body["key_shape"] = exc.shape
+        return JSONResponse(body, status_code=401)
     token = _caller.set(caller)
     try:
         return await call_next(request)
@@ -665,6 +698,9 @@ async def _collect_health() -> dict:
         "build": {"commit": BUILD_COMMIT, "protocol_version": _protocol_version()},
         # W-09: 进程启动以来各种 key 传法的请求数(只有传法, 没有 key、没有身份)
         "key_transport": key_transport_counts(),
+        # 2026-11-11: 进程启动以来被拒的鉴权请求, 按固定的几个原因数, 外加最后一次的时间(UTC)。只有个数和时间:
+        # 没有钥匙的任何一部分(连最后 4 位也没有)、没有路径、没有是谁。写手说连不上时先看这里是哪一种在涨。
+        "auth_rejections": identity.auth_rejections(),
         "tools": sorted(tools.TOOLS),
         "config": {
             # deskcore 【不调 LLM】。蒸馏搬给调用方模型之后, 服务端一次
@@ -910,9 +946,7 @@ def _register_mcp():
 
         @functools.wraps(fn)
         async def wrapper(*args, **kwargs):
-            kwargs.pop("_user_id", None)
-            if needs_user:
-                kwargs["_user_id"] = _caller.get().user_id
+            kwargs = _inject_caller(fn, kwargs, needs_user)
             t0 = time.monotonic()
             try:
                 result = await run_in_threadpool(fn, *args, **kwargs)
@@ -937,7 +971,84 @@ def _register_mcp():
     return mcp
 
 
+# ══════════════════════════════════════════════════════════════════════
+# MCP 那条路上「不是有限的数」不许悄悄变成 null (2026-11-11 复审)
+# ══════════════════════════════════════════════════════════════════════
+# mcp SDK 收到请求后会按 JSON 模式把它再过一遍: NaN / Infinity / 1e400 这类(Python 的 json 都收, 解成 nan / inf)在那一步
+# 变成 null, 工具拿到的是 None。对别的工具无所谓; 在 set_comment_mix 里 null 的意思是「去掉这一项、不再数」—— 一个写坏的
+# 数会变成把一项检查关掉, 而 REST 那条路上同一个请求是 400。到了工具那一层已经分不出「本来就是 null」和「被换成了 null」,
+# 所以在 SDK 之前接住: **只对 tools/call set_comment_mix**, 把请求体里不是有限的数换成它原来的字面(一个字符串),
+# 工具照「要是一个数, 现在是 '1e400'」那一句拒掉, 什么都不写。别的请求一个字节不动。
+# 纯 ASGI(理由同 _NormalizeMcpPath): 只把请求体读完再原样放回去, 不碰响应。SDK 自己也是把整个请求体读进内存再解析的,
+# 这里没有多占; 鉴权在更外层, 没过鉴权的请求到不了这里。
+_MIX_TOOL = "set_comment_mix"
+
+
+def _spell_out_non_finite(body: bytes) -> bytes:
+    """``tools/call set_comment_mix`` 的请求体里不是有限的数 → 它原来的字面(字符串); 别的请求体原样(同一个对象)回去。"""
+    # 先用字节粗筛, 省掉绝大多数请求的一次解析。带反斜杠的不能筛掉(Codex 11-11): 工具名可以写成转义的
+    # ("\\u0073et_comment_mix"), 字节里找不到名字, 解出来却是它 —— 所以判断「是不是这个工具」一律看解出来的名字。
+    if _MIX_TOOL.encode() not in body and b"\\" not in body:
+        return body
+    hits: list[str] = []
+
+    def _constant(token: str):                    # NaN / Infinity / -Infinity
+        hits.append(token)
+        return token
+
+    def _float(token: str):
+        value = float(token)
+        if value != value or abs(value) == float("inf"):
+            hits.append(token)
+            return token
+        return value
+    try:
+        message = json.loads(body, parse_constant=_constant, parse_float=_float)
+    except (ValueError, RecursionError):
+        return body                               # 不是 JSON: 让 SDK 照它自己的方式拒
+    params = message.get("params") if isinstance(message, dict) else None
+    if not hits or not isinstance(params, dict) or message.get("method") != "tools/call" \
+            or params.get("name") != _MIX_TOOL:
+        return body
+    return json.dumps(message, ensure_ascii=False).encode("utf-8")
+
+
+class _McpFiniteNumbers:
+    """包在 MCP 子应用外面: POST 的请求体读完, 过一遍 ``_spell_out_non_finite``, 再交给 SDK。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        chunks, cut = [], None
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                cut = message                     # 请求体还没收完客户端就断了: 原样交下去, 由 SDK 照常处理
+                break
+            chunks.append(message.get("body") or b"")
+            if not message.get("more_body"):
+                break
+        body = b"".join(chunks)
+        fixed = _spell_out_non_finite(body) if cut is None else body
+        if fixed is not body:
+            scope = dict(scope)
+            scope["headers"] = [(k, str(len(fixed)).encode("ascii") if k.lower() == b"content-length" else v)
+                                for k, v in scope.get("headers") or []]
+        queue = [{"type": "http.request", "body": fixed, "more_body": cut is not None}]
+        if cut is not None:
+            queue.append(cut)
+
+        async def replay():
+            return queue.pop(0) if queue else await receive()
+
+        await self.app(scope, replay, send)
+
+
 _mcp = _register_mcp()
 if _mcp is not None:
     # 子应用请求同样先过外层 auth_middleware, 所以 _caller 在工具里取得到。
-    app.mount("/mcp", _mcp.streamable_http_app())
+    app.mount("/mcp", _McpFiniteNumbers(_mcp.streamable_http_app()))

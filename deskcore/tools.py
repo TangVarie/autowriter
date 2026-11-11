@@ -1,7 +1,7 @@
 """deskcore/tools.py — MCP 工具面。
 
 按写稿的流程分组: 取协议 → 开项目 → 写稿前 → 写稿后(查重 → 存档 + 参考分 → 规则检查) → 收反馈,
-外加三个规则台账工具(my_rules / set_rule_state / reembed_my_rules)。
+外加三个规则台账工具(my_rules / set_rule_state / reembed_my_rules)和改项目评论配比的 set_comment_mix。
 设计原则是【一次调用拿全】—— 治员工反馈里那条「一个项目一般有 5 个提示词
 要重复操作 5 次, 我的工作台至少有几十个提示词」。
 
@@ -27,6 +27,7 @@ import threading
 import hashlib
 import re
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -714,15 +715,22 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
         就别用它的 ``existing_comments``, 照贴来的正文写)/ ``pasted``
       · existing_comments —— 帖子下已有的评论(TV 里找到了才有): 别重复里面已经问过的事、用过的说法。项目配了飞书那一列时,
         这条帖子那一格里已有的维护评论也在里面(``source`` 是列名)
-      · comment_rules —— 本项目管评论的规则(「评论区：」开头的), 必须守
-      · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守
+      · comment_rules —— 本项目管评论的规则(「评论区：」开头的), 必须守; 和 style、comment_set 说法不一样的以那两样为准
+      · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守; 说每篇都要带品牌的, 评论里几条提品牌照 comment_set
+      · 规则以这次回的为准: 前面对话里见过的规则原文说法不一样的不算(可能已经停掉了)。``rules_note``: 用户说哪条项目规则
+        过时了, 当场用 set_rule_state 停掉(memory_id 在 my_rules 里), 不用等负责人; 要换成新说法用 record_rule
       · style —— 所有项目的评论都管的写法底线: 不用句号、不用方言语气词(伐、侬、阿拉)、不写 v / vx / 加微这类像要联系方式的字、
-        不写「帖子里」(帖里、帖子中也一样, 接帖子就直接说那件事)、不用「X那栏」「X那次」「X那阵」这类含糊指代(直接说是哪件事)。
-        项目规则里说要混进这些也不行, 以这几句为准。管整组的: 以品牌评价收尾(最后一两小句落在品牌上)的最多四分之一
+        不提帖子(帖子、这帖、本帖、原帖、帖里都不写, 直接说那件事)、不用「X那栏」「X那次」「X那阵」这类含糊指代(直接说是哪件事)。
+        项目规则里说要混进这些也不行, 以这几句为准。不为凑字数加话(短也行, 不复述、不加总结句撑长度); 大家都知道的事不写成
+        新发现(常识别用「原来」「才知道」「没想到」去接)。管整组的: 以品牌评价收尾(最后一两小句落在品牌上)的最多四分之一
         (20 条最多 5 条), 其余以事实、感受、细节或提问收尾, 收尾别都用同一个句式, 品牌放在前面的句子里自然提不受限;
         同一个说法(日期、活动名、合同条款这类)整组只用一次, 开头别几条一样。还有一句只是提示: 长评论也多用短句
-      · comment_set —— 只有项目定了一组评论的配比才有: ``lines`` 是按项目的数写好的几句(提品牌的最多几成、至少几成中性、
-        至少几成一句话短评), 和 style 一样要守, 项目规则里说法不一样的以它为准; ``column`` 是这组评论要贴进的飞书那一列
+      · comment_set —— 只有项目定了一组评论的配比才有: ``lines`` 是按项目的数写好的几句(第一句说明这些数是这个项目定的
+        配比; 提品牌的最多几成、至少几成中性、至少几成一句话短评), 和 style 一样要守: 项目规则里或前面对话里见过的规则
+        原文说法不一样的以它为准, 不算冲突, 不用问用户, 也不用报给负责人。用户这次明说要别的配比(比如每条都带品牌), 这一组
+        就照用户的写, 交付时一句话说明和项目定的配比不一样, 项目的数不动; 用户明说这个项目以后都按新的配比, 调
+        set_comment_mix 改项目的数, 不用找负责人。只有用户明说才改, 不为了让这一组通过自己去改配比。``column`` 是这组评论
+        要贴进的飞书那一列(set_comment_mix 改不了它)
       · slots —— 默认四个评论位: q1 / q2 提问、exp 经验或推荐、reply 贴主回复(回 q1)。每位写一条, 位的要求在 note 里;
         每位都可自然点名品牌, 不要求每条点名。可写感受、比较、推荐、答疑, 亲历和旁观推荐也可用;
         具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写提问或一般讨论。用户另有要求(比如只要两条提问)就照用户的, 位的 id 照用
@@ -754,19 +762,24 @@ def score_comments(comments: list[dict], link: str = "", project_id: str = "", p
     说法和开头, 不送去判。
 
     怎么读返回值:
-      · 每条 ``passed=true`` 且 ``needs_review=false`` 才算这条过。``summary.passed`` 是这组过了几条 —— 这就是整组的分数,
-        照实告诉用户。
+      · 每条 ``passed=true`` 且 ``needs_review=false`` 才算这条过。``summary.passed`` 是这组过了几条, 照实告诉用户; 它只数每条,
+        整组 ``passed=false``(中性、短评不够)时这组还没过。
       · ``fix`` 是必须改的(主要行为、点名品牌、接住帖子、细节四项); ``hints`` 只是参考, 不改不算没过, 别为了消掉提示反复重写。
-      · ``style_fix`` 是代码查出来的写法底线(句号、方言语气词、像要联系方式的 v / vx / 加微、「帖子里」、「X那次」「X那栏」这类
+        照 fix、hints 改都不是要加长: 细节没过点到一个情境或做法就够, 不为凑字数加话。
+      · ``style_fix`` 是代码查出来的写法底线(句号、方言语气词、像要联系方式的 v / vx / 加微、提到帖子、「X那次」「X那栏」这类
         含糊指代; 整组里和前面重复的说法、第 3 条起一样的开头; 以品牌评价收尾的超过四分之一时超出的那几条; 项目定了提品牌的
         上限时超出的那几条, 都按顺序留前面的), 有它那条就算没过, 和 fix 一样照着改、不用问用户。判定没判成(``judge_status``
         不是 ok)时它在 ``style_issues`` 里, 照样先改掉。
       · ``thread_fix`` 是整组必须改的, 按「位 xx」「第 k 条」改那一条。代码数出来的整组那一句在**第一句**, 以「整组代码查」开头:
-        提品牌超了几条、中性的或一句话短评不够几条(项目定了配比时)、重复的说法、品牌收尾超了几条。中性、短评不够是整组没过
-        (``passed=false``), 照那一句点名的几条改。其余几句是判定服务的(如违反用户显式设置的品牌点名配额)。
+        提品牌超了几条、中性的或一句话短评不够几条(项目定了配比时)、重复的说法、品牌收尾超了几条。提品牌、中性、短评的条数
+        是这个项目定的配比: 项目规则里或前面对话里见过的规则原文说法不一样的(比如每条都带品牌)以它为准, 不算冲突;
+        用户这次明说要别的配比, 这一组就照用户的写, 交付时一句话说明; 用户明说这个项目以后都按新的配比, 调 set_comment_mix
+        改项目的数(只有用户明说才改, 不为了让这一组通过去改)。中性、短评不够是整组没过(``passed=false``),
+        照那一句点名的几条直接改(短评不够就把那几条压短或换成一句话短评), 不用问用户, 也不用报给负责人; 那一句里有这几个
+        条数时回包带 ``set_next_step``, 也这么说。其余几句是判定服务的(如违反用户显式设置的品牌点名配额)。
         ``thread_hints`` 是整组参考(如同句式、摩擦等), 不用为消提示重写。
-      · 没过的按 fix 改**一轮**, 再调一次本工具(整组全部送, 顺序和第一次一样, 不要只送改过的那几条: 品牌收尾、提品牌、
-        中性、短评的条数都按整组算), 然后不管结果都交付并如实说明; 不要循环。交付时每条评论写全文, 不缩写、不省略。
+      · 没过的按 fix、style_fix、thread_fix 改**一轮**, 再调一次本工具(整组全部送, 顺序和第一次一样, 不要只送改过的那几条:
+        品牌收尾、提品牌、中性、短评的条数都按整组算), 然后不管结果都交付并如实说明; 不要循环。交付时每条评论写全文, 不缩写、不省略。
       · ``delivery_column``(项目配了飞书那一列才有): ``text`` 是这组评论按那一格的样子拼好的(一行一条, 不编号、不加标签),
         交给用户时原样整段给, 说清贴进这条帖子那一行的 ``column`` 那一格: 格子里已经有内容就接在最后另起一行贴, 不要覆盖;
         列名不贴进格子。贴几行就算发了几条, 只交真要发的那几条。改过再判时用最后一次回的那一份; 一批分几次判的,
@@ -1156,6 +1169,8 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
     """把一条规则永久记住。团队共享 —— 队友写这个项目时也会守。
 
     什么时候调: 用户说的是「以后都这样」而不是「这次这样」。分不清就问一句。
+    例外: 一组评论里提品牌、中性、一句话短评各占几成(comments_for 回的 comment_set 那几个数)不记成规则 —— 记成规则不生效,
+    说法不一样时以 comment_set 为准。用户明说这个项目以后都按新的, 调 set_comment_mix 改那几个数。
 
     severity:
       · "hard" —— 不可违反的硬约束, 以后每次生成都会顶在最前面要求 100% 满足。
@@ -1320,10 +1335,12 @@ def my_rules(project_id: str, _user_id: str | None = None) -> dict:
     每条的 state:
       · 生效中   —— 这次写稿会注入
       · 方向不符 —— 它是另一个方向(产品向/流量向)的规则, 本项目不注入
-      · 试用     —— 还在候选档, 不进简报, 等攒够票或用户手动 promote
+      · 试用     —— 还在候选档, 不进简报、写评论也不给, 现在不用守; 等攒够票或用户手动 promote
       · 已停用   —— 用户自己 mute 掉的, muted_until 到期自动恢复
 
-    改档位用 set_rule_state。
+    试用、已停用的和生效中的规则或 comment_set 说法不一样, 不算冲突(``state_note`` 也这么说)。
+    改档位用 set_rule_state: 用户说哪条过时了, 当场改, 不用等负责人。
+    一组评论的配比(comment_set 里提品牌、中性、短评的几个数)不在这份台账里: 用户明说要改这个项目的配比时用 set_comment_mix。
     """
     _require_caller(_user_id, "my_rules", "规则台账不可用")
     # 读, 可降级: 看不到台账不影响写稿。认不出人不是"看不到台账", 上面那行已经拒了(同项目归属的口径)。
@@ -1368,6 +1385,8 @@ def set_rule_state(memory_id: str, action: str, days: int = 90,
 
     ⚠️ 用户说"别用这条了"时先问一句是**暂时**还是**以后都不要**: 前者 mute,
     后者 retire。分不清就用 mute —— 它会自己到期, 猜错的代价小。
+    写评论时用户说哪条项目规则过时了(比如和 comment_set 说法不一样), 也是这样当场改, 不用等负责人; 停掉的规则下一次
+    comments_for 就不给了。
     """
     _require_caller(_user_id, "set_rule_state", "拒绝改动规则")
     # 故意不包 _safe: 写。静默失败 = 用户以为关掉了的规则还在每一份简报里,
@@ -1375,6 +1394,52 @@ def set_rule_state(memory_id: str, action: str, days: int = 90,
     with _core_value_errors_as_input():
         return core.set_rule_state(core.sb(), memory_id, action,
                                    user_id=_user_id, days=days, direction=direction)
+
+
+def set_comment_mix(project_id: str, mix: dict, _user_id: str | None = None,
+                    _caller_name: str | None = None) -> dict:
+    """改这个项目一组评论的配比(comments_for 回的 comment_set 里那几个数)。**只在用户明说要改这个项目的配比时调。**
+
+    什么时候调: 用户明说这个项目以后的评论都按新的配比写(「以后提品牌的放到七成」「这个项目不用数短评了」)。改完之后写这个
+    项目的人都按新的数, 不用找负责人。这一类不用 record_rule 记: 记成规则不生效, 说法不一样时以 comment_set 为准。
+    什么时候不调:
+      · 用户只是这一组想要别的配比(「这次每条都带品牌」): 不调。这一组照用户说的写, 交付时一句话说明和项目定的配比不一样,
+        项目的数不动;
+      · 用户没说要改: 不调。score_comments 说提品牌超了、中性或短评不够时, 照它点名的几条改评论; **不为了让检查通过去改配比**,
+        也不替用户决定要改。拿不准用户说的是只这一组还是以后都这样, 先问一句。
+
+    ``mix`` 里只放要改的那几项, 没放的不动:
+      · brand_max   —— 一组里提到品牌的最多几成
+      · neutral_min —— 至少几成是中性评论(不提品牌、不夸也不劝)
+      · short_min   —— 至少几成是一句话短评
+      · short_chars —— 多少字以内算一句话短评(6~40 的整数)
+    几成可以写小数(0.5)也可以写百分数(50 或 "50%"), 都是五成; 写 1 是全部(100%), 要 1% 写 0.01 或 "1%"。
+    七成写 0.7 或 70, 不要写 7(7 是 7%)。
+    brand_max 写 1、下限写 0 就是这一样不限了; 值写 null 是把这一项去掉(不再数)。brand_max 加 neutral_min 不能超过 100%
+    (中性评论是不提品牌的): 要把提品牌的上限放到 100%, 同一次把 neutral_min 写 0 或 null。
+    例: ``{"brand_max": 0.7}``、``{"short_min": null}``、``{"brand_max": 60, "neutral_min": 20}``。
+    评论贴进飞书哪一列(comment_set 的 column)这里改不了: 它和发布记录里数评论的那一列是绑着的。mix 里带 column 会报错、
+    什么都不改; 用户要换列请找负责人。
+
+    返回:
+      · changed —— 改了没有。和现在一样就是 false, 什么都没写
+      · before / after —— 改之前、改之后的四个数(没定的是 null)
+      · summary —— 一句话: 哪几项从多少改成了多少。**原样告诉用户**
+      · comment_set —— 改完之后的 ``lines`` 和 ``column``, 和 comments_for 回的同一个样子(等于不限的那一项不出句子);
+        一个在数的数都没有了就带一句 ``comment_set_note``(这个项目不数配比了), 项目也没配列时 comment_set 是 null
+    这一组还没交的评论照新的配比写, 再判时 score_comments 用的就是新的数。谁在什么时候把什么改成了什么, 写作台留着最近
+    20 次的记录。
+    报错里说哪个数不对的, 照着改参数再调; 说这个项目的设置现在改不了的, 照实告诉用户、请用户找负责人看一下, 不重试。
+    """
+    _require_caller(_user_id, "set_comment_mix", "配比改不了")
+    # 故意不包 _safe: 写。包成带 error 的"成功", 模型会以为配比改了, 接着按新的数写、按旧的数被判。
+    # 时间和是谁在这一层取(留痕用): core 不看钟; 名字是服务端那把钥匙的备注名(app 注入, 调用方传不进来), 不是钥匙本身。
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        return core.set_comment_mix(core.sb(), project_id, user_id=_user_id, mix=mix,
+                                    by=(_caller_name or "").strip()[:40], at=at)
+    except core.CommentMixError as exc:
+        raise InvalidInput(str(exc)) from exc
 
 
 # 工具注册表 —— app.py 和 cli.py 共用。
@@ -1404,6 +1469,7 @@ TOOLS = {
     "ack_edit_digest": (ack_edit_digest, True),
     "comments_for":   (comments_for,   True),
     "score_comments": (score_comments, True),
+    "set_comment_mix": (set_comment_mix, True),  # 用户明说要改项目的评论配比时才调(2026-11-11); 协议冻结, 说明全在 docstring
     "ingest_published": (ingest_published, True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),

@@ -884,7 +884,7 @@ EOF
 1. 按第一步的脚本只生成一行（`WHO` 只写她的名字，名字只进 `name`），`user_id` 填团队身份。
 2. 加进 Railway 上的 `DESKCORE_KEYS`（原有几行不动），等服务重启。
 3. `/health` 的 `auth.note` 多一条、`auth.ok` 是 true。
-4. 拿新钥匙调一次 `list_projects`，回来的应该就是团队在用的那几个项目；随便编一把钥匙应该是 401。
+4. 拿新钥匙调一次 `list_projects`，回来的应该就是团队在用的那几个项目；随便编一把钥匙应该是 401（那一句会说收到的那一串多长、最后 4 位是什么，见「连不上时按这个顺序查」）。
    回空列表不报错 = `user_id` 填错了（见上面「格式」那段）。
 5. 钥匙单独私发给她本人。上手步骤给她《写作台评论写手入门指南》（不含钥匙值）。
 
@@ -1025,15 +1025,31 @@ WorkBuddy 支持从 GitHub 装 skill，用这条。手工复制那份**会悄悄
 |---|---|---|
 | `401 missing X-Deskcore-Key` | 请求到了服务器，只是没带 key | header 没生效 → 换 `Authorization: Bearer k-xxx`（`?key=` 10-23 起不收，W-09） |
 | `401 ?key= is no longer accepted` | 客户端还把 key 放在地址里 | 改成 `X-Deskcore-Key` 头或 `Authorization: Bearer`；这把 key 进过访问日志，当它半公开、换一把 |
-| `401 invalid X-Deskcore-Key` | key 抄错，或不在 `DESKCORE_KEYS` 里 | 对着 `/health` 的 `auth.note` 数一下几把 key |
+| `401 invalid X-Deskcore-Key: …` | 带了钥匙但服务器不认识：贴了截短的示例、多了引号、把 `Bearer` 填进了 `X-Deskcore-Key`，或不在 `DESKCORE_KEYS` 里 | 那一句自己说了收到的那一串长什么样和怎么办（2026-11-11，见下面「写手说连不上」）；`auth.ok` 是 false 时先修服务端的配置 |
 | 返回空列表（不报错） | key 通了但 `user_id` 配错 | 必须是库里已有的 `projects.owner_id`，编的 UUID **不报错只返空** |
 | `fetch failed` / `TypeError` | **请求根本没到服务器**，或到了但浏览器不让读 | 见下 |
 | `421 Misdirected Request` | `DESKCORE_ALLOWED_HOSTS` 配了但没包含线上域名 | 对着 `/health` 的 `mcp_allowed_hosts` 改 |
 
+**写手说连不上（401），而你看不到她的屏幕（2026-11-11）。** 三处能看，都不用她把钥匙发给你（别让她发）：
+
+1. **她那边的报错**。钥匙对不上时 401 的那一句只说**她发来的那一串**长什么样：长度、最后 4 位、有没有首尾空格 / 中间空格 / 引号 / 省略号 / 开头多出来的 Bearer / 非英文字符 / 像示例里的占位，后面跟一句怎么办（对照发给她的那把，在客户端的写作台连接设置（`mcp.json`）里把整把钥匙重新粘贴一遍，不带空格、不带省略号，钥匙外面只留一对引号；然后重启客户端、开一个新对话；钥匙不要发到对话里）。让她把这一句念给你：长度和最后 4 位跟你发给她的那把对一下，就知道是贴错了还是拿了旧的。服务端配了哪几把、配了几把，这一句里没有。
+2. **她的客户端不显示响应体时**（带 OAuth 的客户端收到 401 会先去走登录流程），让她在自己机器上跑一条，钥匙从她的配置里原样拷：
+
+   ```bash
+   curl -s https://<你的>/tools -H "X-Deskcore-Key: <她配置里那一串, 原样>"
+   ```
+
+   回的 JSON 里 `detail` 是那一句，`reason` 是下面计数里的原因名，`key_shape` 是那几个是 / 否。只发这段 JSON 给你就够，里面最多有她那一串的最后 4 位。
+3. **你这边**：`curl -s <服务地址>/health` 看 `auth_rejections`——进程启动以来被拒的请求按原因数（`missing` 没带、`invalid` 对不上但形状没毛病、`invalid_whitespace` / `invalid_quotes` / `invalid_ellipsis` / `invalid_bearer_prefix` 对不上而且有这一样、`query_param` 钥匙放在地址里、`misconfigured` 服务端配置有问题、`other`），外加最后一次的时间 `last_at`（UTC）。让她重连一次，看哪一个数涨了。Railway 日志里搜 `auth rejected`，每拒一次一行：原因、路径、从哪儿传的、长度、那几个是 / 否（没有钥匙，也没有最后 4 位）。`invalid_ellipsis` 在涨，多半又是谁把带「…」的示例原样贴了（11-03 那次）；`invalid` 在涨而长度和你发的那把一样，多半是旧钥匙；`missing` 在涨，是 header 没带上（客户端没重启，或配置写错了位置）。
+
+`misconfigured` 在涨是服务端的 `DESKCORE_KEYS` 写坏了，所有人都 401：她那边只有固定的一句，哪里不对看 `/health` 的 `auth.note`（只报第几条，不带钥匙）和 Railway 日志。
+
+首尾多出来的空白不用管：服务端查之前会去掉（钥匙走 HTTP 头，首尾的空白不算钥匙的一部分；去掉之后整把对上才放行，而且只对得上整串是普通英文字符的钥匙——配置里带「…」的那种怎么发都对不上）。引号、省略号、多出来的 Bearer 不会替她改，要她自己重贴。详见 `docs/deskcore.md` §3.23。
+
 `fetch failed` 这一类要先把「机器出不去」和「CORS」分开，一条命令就够：
 
 ```bash
-curl -i https://<你的>/mcp        # 期望: 401 + {"detail":"missing X-Deskcore-Key"}
+curl -i https://<你的>/mcp        # 期望: 401 + {"detail":"missing X-Deskcore-Key","reason":"missing"}
 ```
 
 - **拿到 401** → 机器到服务器是通的，问题在 CORS 或客户端配置

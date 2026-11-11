@@ -335,6 +335,36 @@ def rule_applies_to_layer(rule: dict, layer: str | None, direction: str) -> bool
 DIRECTION_RULE_TAIL = ("（标了【只管产品贴/精品贴的稿】【只管流量贴/提问贴的稿】的规则, 只管发牌卡上写着那种贴的稿; "
                        "卡上没写是哪种贴的稿, 照常守。）")
 
+# 规则里的字数(2026-11-11, owner:「不要为了凑字数凑废话, 可以支持字数不够」): 简报里有规则说到字数时, 那一层末尾补一句
+# 字数不是要凑够的数(有硬约束说到字数就接在 P0, 只有软规则说到就接在 P1, 只接一次; 接在 DIRECTION_RULE_TAIL 前面)。上限照守:
+# 「标题不超过二十字」这种最常见, 这句不能读成上限也可以松。只改给模型看的这一份; 存档时代码照旧按 check 查, 下限没到的那句
+# 也说补具体内容、不加空话(rulecheck.BELOW_MIN_HOW)。
+# 复审(11-11): P0 是硬约束、每一条都要守(协议), 硬约束的字数下限 check_rules 照旧报「必须改」; P0 那一句不能说「素材不够就写短
+# 一点」, 只说差字数时拿具体内容补、不加空话(LENGTH_RULE_TAIL_HARD)。「可以写短」那一句只接在 P1(只有软规则说到字数时)。
+# owner 那句是对评论说的, 笔记要不要也许字数不够, 留给 owner 定(docs §3.22)。
+LENGTH_RULE_TAIL = ("（规则里说到的字数, 上限照守; 但字数不是要凑够的数: 不为凑字数加空话、重复的解释或总结句, 素材不够就写短一点, "
+                    "交付时跟用户说一句差多少。）")
+LENGTH_RULE_TAIL_HARD = "（规则里说到的字数照守; 差字数时只拿具体内容(经过、细节、数字)补, 不加空话、重复的解释或总结句。）"
+# 「N 字」: 阿拉伯数字, 或两个字以上的中文数(三百、五十); 「十字路口」「一字不改」「八字」不算。一个中文数字(「十个字」「两个字」)
+# 要挨着说长短的词才算(复审 11-11: 「一个字都不能错」「品牌名四个字不拆开」「slogan 八个字原样用」是在说原样用, 不是字数):
+# 「不超过八个字」「十字以内」算
+_LENGTH_NUM = r"(?:[0-9０-９]+|[一二两三四五六七八九十百千]{2,})"
+_LENGTH_CUE_BEFORE = r"(?:不超过|不多于|不少于|最多|最少|至少|控制在|少于|多于|超过)"
+_LENGTH_CUE_AFTER = r"(?:以内|以上|以下|之内|左右|上下|内(?!容))"
+_LENGTH_RULE = re.compile(rf"{_LENGTH_NUM}\s*(?:[-~～到至]\s*(?:[0-9０-９]+|[一二两三四五六七八九十百千]+)\s*)?个?字"
+                          r"(?![母幕体号典迹])"
+                          rf"|{_LENGTH_CUE_BEFORE}\s*[一二两三四五六七八九十]个?字"
+                          rf"|[一二两三四五六七八九十]个?字{_LENGTH_CUE_AFTER}"
+                          r"|字数|篇幅")
+
+
+def _mentions_length(rules: list[dict]) -> bool:
+    """这几条规则里有没有说到字数的: 原文写了「N 字」「字数」「篇幅」, 或者存了字数检查(rule_kind = max_len)。管评论的
+    (「评论区」开头的)不算: 这一句是说笔记的。"""
+    return any(not (r.get("content") or "").lstrip().startswith(COMMENT_RULE_PREFIX)
+               and (_LENGTH_RULE.search(r.get("content") or "") or (r.get("rule_kind") or "").strip() == "max_len")
+               for r in rules)
+
 # 这场方向闸挡掉的那些 soft 规则(另一个方向的; 复审 2026-11-03): 卡上标了那一族贴型的稿, score_drafts / check_rules 照它们查
 # (rule_applies_to_layer), 简报里就得让模型看得见 —— 不然模型被报「建议改」的是一条它从没见过的规则。单独一截接在 P1 最后,
 # 说清没标贴型的稿不用管(同方向闸); P1 原来那一截一个字不变, counts.soft_dropped_by_direction 照旧数它们。
@@ -597,6 +627,10 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         positive_examples=positives,
         negative_examples=negatives,
     )
+    if _mentions_length(hard_shown) and layers.get("p0"):
+        layers["p0"] = layers["p0"] + "\n" + LENGTH_RULE_TAIL_HARD
+    elif _mentions_length(soft_shown) and layers.get("p1"):
+        layers["p1"] = layers["p1"] + "\n\n" + LENGTH_RULE_TAIL
     if hard_noted and layers.get("p0"):
         layers["p0"] = layers["p0"] + "\n" + DIRECTION_RULE_TAIL
     if soft_noted and layers.get("p1"):
@@ -3313,7 +3347,8 @@ DEFAULT_COMMENT_SLOTS = (
      "note": "问另一件帖子没写清的事, 别和 q1 问同一件; 品牌可自然提及, 不必每条点名"},
     {"id": "exp", "speech_act": ["补充经验", "亲历背书", "旁观推荐"], "role": "读者位", "may_name_brand": True, "must_echo": True,
      "value_ok": ["可行动信息", "判断依据"], "min_detail": "模糊", "intent": "补充信息",
-     "note": "接着帖子补充经验、感受、比较或推荐, 品牌可自然提及, 不必点名; 具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写一般讨论"},
+     "note": "接着帖子补充经验、感受、比较或推荐, 品牌可自然提及, 不必点名; 具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写一般讨论; "
+             "一两句就够, 不凑字数"},
     {"id": "reply", "speech_act": ["回复答疑", "亲历背书", "旁观推荐"], "role": "贴主", "reply_to": "q1", "may_name_brand": True,
      "must_echo": False, "value_ok": ["可行动信息"], "min_detail": "无", "intent": "补充信息",
      "note": "贴主接着 q1 答疑, 可结合素材表达感受、比较或推荐, 品牌可自然提及, 不必点名; 具体经历、效果和数字依提供素材, 不编造事实"},
@@ -3331,7 +3366,10 @@ _EXISTING_COMMENT_CHARS = 200
 _POST_BODY_CHARS = 6000            # judge 那边只看前 600 字; 给模型看的留长一些, 但别把超长帖整篇灌进对话
 
 COMMENT_SCORE_NOTE = ("评论检查: 只判不写库。passed=true 且 needs_review=false 才算这条过; fix 是必须改的(主要行为、点名品牌、"
-                      "接住帖子、细节四项), hints 只是参考, 不改不算没过。没过的按 fix 改一轮再调一次 score_comments, 不要循环。"
+                      "接住帖子、细节四项), style_fix 和 thread_fix 第一句(整组代码查)也是必须改的, 直接改, 不用问用户; "
+                      "hints 只是参考, 不改不算没过。summary.passed 只数每条, 整组 passed=false 时照 thread_fix 第一句改。"
+                      "照 fix、hints 改都不是要加长: 补一件具体的事就够, 不为凑字数加话。"
+                      "没过的按这些改一轮再调一次 score_comments, 不要循环。"
                       "needs_review=true 交人工核实, 不能改成伪造的亲历: 那几条在 review_list 里, 跟用户说时逐条照 text 写全文"
                       "(不缩写、不省略、不用「…」代替), 后面跟上 why 里的疑点。judge_status 不是 ok 就说这次没判成, 不能说通过。")
 REVIEW_NEXT_STEP = ("review_list 里的几条要交人工核实: 跟用户说的时候每条照 text 原样写全文(不缩写、不省略、不用「…」或「同上」"
@@ -3344,10 +3382,12 @@ _REVIEW_GATE_NAMES = {"speech_act": "主要行为", "names_brand": "点名品牌
 # 单独写评论这条路: comments_for 回包带 style, score_comments 判之前先查(style_fix)。跟着笔记交付的评论在 delivery 里查。
 # 2026-11-09 加第四句: 一组里以品牌评价收尾的最多四分之一(commentstyle.brand_endings), score_comments 拿到项目之后数
 # 2026-11-10: 每条再查「帖子里」和含糊指代(在 LINES 里); 整组再查重复的说法和开头(REPEAT_LINE); 长评论多用短句只提示
-COMMENT_STYLE_LINES = commentstyle.LINES + (commentstyle.BRAND_ENDING_LINE, commentstyle.REPEAT_LINE,
+# 2026-11-11: 「帖子里」放宽成一提帖子就算(LINES 那一句跟着改); 加两句代码不查的: 不为凑字数加话、常识不写成新发现
+COMMENT_STYLE_LINES = commentstyle.LINES + (commentstyle.PAD_LINE, commentstyle.COMMON_LINE,
+                                            commentstyle.BRAND_ENDING_LINE, commentstyle.REPEAT_LINE,
                                             commentstyle.SENTENCE_LINE)
 comment_style_issues = commentstyle.issues
-COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字、「帖子里」、「X那次」「X那栏」这类"
+COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、方言语气词、像要联系方式的字、提到帖子、「X那次」「X那栏」这类"
                            "含糊指代; 整组里重复的说法和开头; 一组里以品牌评价收尾的超过四分之一、项目定了提品牌的上限时超出的那几条), "
                            "和 fix 一样算没过: 照着改, 不用问用户。改完再判时整组全部送, 顺序和这次一样"
                            "(上限按整组算, 只送改过的几条就不准); 一批分几次判时, 前面几次判过的放进 earlier_comments, "
@@ -3355,7 +3395,8 @@ COMMENT_STYLE_NEXT_STEP = ("style_fix 是代码查出的写法底线(句号、�
 
 
 # ── 项目定的一组评论配比(2026-11-10) ─────────────────────────────────────────────────────────────
-# projects.default_params 里的 ``comment_set``(和 delivery / archived 同一个 JSON 字符串, 不加迁移), owner 用 SQL 配:
+# projects.default_params 里的 ``comment_set``(和 delivery / archived 同一个 JSON 字符串, 不加迁移), owner 用 SQL 配;
+# 2026-11-11 起四个数(不含 column)写手也能在对话里改(set_comment_mix, 见 MIX_ 那一段):
 #   {"brand_max": 0.5, "neutral_min": 0.3, "short_min": 0.2, "short_chars": 15, "column": "<飞书里那一列的列名>"}
 # 每一项都可以不配, 不配的那一项不数。份额在 [0, 1], brand_max + neutral_min ≤ 1; short_chars 是 6~40 的整数(配了
 # short_min 没配它时按 15); column 是飞书那一列的列名(1~20 字, 不带 | 和换行), 列名只在库里, 代码和测试里不写。
@@ -3377,6 +3418,33 @@ DELIVERY_COLUMN_NEXT_STEP = ("delivery_column.text 是这组评论按「{column}
                              "覆盖; 列名不要贴进格子里。贴几行就算发了几条: 只交真要发的那几条, 不加空行、标题或说明行。改过再判时用"
                              "最后一次回的那一份; 一批分几次判的(带 earlier_comments), 每一段用它最后一次判回的 text, 按判的顺序一段"
                              "接一段交(段和段之间也不加空行), 合起来贴进同一格。")
+# 整组那一句和它的下一步(2026-11-11): 11-10 晚上一位写手的模型把提品牌的上限读成「代码检查的看法」, 和它记得的一条要每条都带
+# 品牌的旧规则(已经不生效)对着放, 按「硬约束优先」留了品牌; 短评一条没加(说会改变整批的口气), 还问用户要不要报给负责人。
+# owner: 为什么每次都要回来找她才能改。所以那一句要自己说清: 条数是负责人给这个项目定的, 项目规则(和之前见过的旧规则原文)
+# 说法不一样的以它为准, 直接改, 不问用户、不报负责人; 规则过时了写手当场能停掉(RULE_SELF_SERVICE)。
+# 复审(11-11): 只压规则原文, 不压用户这次在对话里明说的(协议: 用户另有要求就照用户的; owner 也问「她自己就能在对话中更改吗」)。
+# 用户明说要别的配比, 这一组照用户的写、交付时说一句(USER_MIX_NOTE)。
+# 11-11 晚 owner: 「配比也开放吧」。配比本身也能在对话里改了(set_comment_mix, 见下面 MIX_ 那一段): 只是这一组想要别的配比 →
+# 照用户的写, 不改项目的数; 用户明说这个项目以后都按新的 → 调 set_comment_mix, 不用找负责人。只有用户明说才改, 模型不为了让
+# 检查通过自己去改。这几句里原来的「是负责人给这个项目定的」跟着改成「这个项目定的配比」: 数可能是写手照用户说的改过的,
+# 再说是负责人定的就不对了; 「项目规则里说法不一样时以这里为准、直接改、不用问用户、不用报给负责人」一个字没动。
+# 不写「最新」「比…都新」: 配比没有日期, 比不了谁新。整组那一句里没有配比的数(没配 comment_set, 只有重复、品牌收尾这些
+# 所有项目都管的)时不说是负责人给这个项目定的, 也不带 set_next_step(那几条的 style_fix 有 style_next_step)。
+# 复审 11-11: 「直接改」带上宾语。前面的名词现在是「配比」, 又有了一个改配比的工具: 光说「直接改, 不用问用户」会被读成
+# 可以直接改配比 —— 和「只有用户明说才改」正好相反。这是整组没过时模型看到的那一句, 不能靠另一个字段把它读对。
+SET_LINE_HEAD = "整组代码查(条数是这个项目定的配比, 项目规则里说法不一样时以这里为准; 照点名的几条直接改评论, 不用问用户): "
+SET_LINE_HEAD_ALL = "整组代码查(所有项目都管; 直接改, 不用问用户): "
+RULE_SELF_SERVICE = ("用户说哪条项目规则过时了: 当场用 set_rule_state 停掉(以后都不要用 retire, 先停一阵用 mute; memory_id "
+                     "在 my_rules 里), 不用等负责人; 要换成新说法用 record_rule。")
+USER_MIX_NOTE = ("用户这次明说要别的配比(比如每条都带品牌), 这一组就照用户的写, 交付时一句话说明和项目定的配比不一样; "
+                 "用户明说这个项目以后都按新的配比, 就调 set_comment_mix 把项目的数改掉, 不用找负责人。"
+                 "只有用户明说才改: 不为了让这一组通过自己去改配比。")
+SET_NEXT_STEP = ("thread_fix 第一句里提品牌、中性、短评的条数是这个项目定的配比: 照它点名的几条直接改, 改完整组再判一次; "
+                 "不用问用户, 也不用报给负责人。")
+SET_BRAND_STEP = "项目规则里或之前见过的规则原文说要每条带品牌、要几条夸或背书的, 以这里的条数为准, 不算冲突。"
+SET_SHORT_STEP = "短评不够: 把点名的几条压短, 或换成一句话短评(比如「蹲一个」「同问」), 这不算改口气。"
+COMMENT_SET_HEAD = ("下面几个数是这个项目定的配比: 项目规则里或之前见过的规则原文要每条带品牌、要几条夸或背书的, "
+                    "照这里写, 不算冲突; 品牌怎么称呼(全称、简称)照项目规则; 不用问用户, 也不用报给负责人。" + USER_MIX_NOTE)
 
 
 class _CommentSetError(ValueError):
@@ -3432,23 +3500,306 @@ def _comment_set(project: dict) -> tuple[dict | None, str | None]:
         return None, f"这个项目的 comment_set 配置不对({exc}), 这次按没配处理: 一组里提品牌、中性、短评的条数没数, 请负责人改一下。"
 
 
+def _comment_set_counts(cfg: dict | None) -> bool:
+    """这份配比里有没有真在数的: 提品牌的上限不到 100%, 或中性、短评的下限大于 0(都按整数百分比, 和数的时候一样)。"""
+    cfg = cfg or {}
+    brand = cfg.get("brand_max")
+    return (brand is not None and commentstyle._pct(brand) < 100) or any(
+        cfg.get(k) is not None and commentstyle._pct(cfg[k]) > 0 for k in ("neutral_min", "short_min"))
+
+
 def _comment_set_lines(cfg: dict) -> list[str]:
-    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。"""
-    out = []
-    if cfg.get("brand_max") is not None:
-        out.append(f"一组里提到品牌的最多 {commentstyle._pct(cfg['brand_max'])}%(20 条最多 "
-                   f"{commentstyle.share_floor(20, cfg['brand_max'])} 条, 按顺序数), 不提品牌时也不用代称(这家、它家、缩写); "
-                   "项目规则里要每条都带品牌的, 以这一句为准")
-    if cfg.get("neutral_min") is not None:
-        out.append(f"至少 {commentstyle._pct(cfg['neutral_min'])}% 是中性评论: 不提品牌、不夸也不劝(提问、观望、自己的经历), "
-                   f"20 条至少 {commentstyle.share_ceil(20, cfg['neutral_min'])} 条")
-    if cfg.get("short_min") is not None:
-        out.append(f"至少 {commentstyle._pct(cfg['short_min'])}% 是 {cfg['short_chars']} 字以内的一句话短评(20 条至少 "
-                   f"{commentstyle.share_ceil(20, cfg['short_min'])} 条); 短评放在提问位或不带评论位, 经验位要接住帖子、太短过不了")
+    """comments_for 回包里给模型的几句(按项目配的数, 拿 20 条举例)。第一句说这些数是这个项目定的配比、规则原文说法
+    不一样的照这里写、用户这次明说要别的配比就照用户的、明说以后都按新的就调 set_comment_mix(2026-11-11, 见
+    ``SET_LINE_HEAD`` 上面那段)。set_comment_mix 改完回的也是这几句。
+
+    复审 11-11: 等于不数的那一项不出句子(提品牌的上限 100%、下限 0% —— 写手现在能把一项调成这样); 一个在数的数都
+    没有时不带第一句(它说的是「下面几个数」), 只剩列那一句, 列也没配就是空的。"""
+    nums = []
+    if cfg.get("brand_max") is not None and commentstyle._pct(cfg["brand_max"]) < 100:
+        nums.append(f"一组里提到品牌的最多 {commentstyle._pct(cfg['brand_max'])}%(20 条最多 "
+                    f"{commentstyle.share_floor(20, cfg['brand_max'])} 条, 按顺序数), 不提品牌时也不用代称(这家、它家、缩写)")
+    if cfg.get("neutral_min") is not None and commentstyle._pct(cfg["neutral_min"]) > 0:
+        nums.append(f"至少 {commentstyle._pct(cfg['neutral_min'])}% 是中性评论: 不提品牌、不夸也不劝(提问、观望、自己的经历), "
+                    f"20 条至少 {commentstyle.share_ceil(20, cfg['neutral_min'])} 条")
+    if cfg.get("short_min") is not None and commentstyle._pct(cfg["short_min"]) > 0:
+        nums.append(f"至少 {commentstyle._pct(cfg['short_min'])}% 是 {cfg['short_chars']} 字以内的一句话短评(20 条至少 "
+                    f"{commentstyle.share_ceil(20, cfg['short_min'])} 条); 短评放在提问位或不带评论位; "
+                    "经验位那条接住帖子说的事, 一两句就够")
+    out = [COMMENT_SET_HEAD, *nums] if nums else []
     if cfg.get("column"):
         out.append(f"这组评论是这条帖子「{cfg['column']}」那一格的内容: 一行一条, 不编号、不加标签; "
                    "score_comments 回的 delivery_column.text 原样交")
     return out
+
+
+# ── 在对话里改项目的配比(2026-11-11, owner: 「配比也开放吧」) ───────────────────────────────────────
+# 写手的工具 set_comment_mix 改的是 ``default_params.comment_set`` 里的四个数; 贴进飞书哪一列(column)不在里面: 它和 TV 数
+# 「预埋评论」的那一列是同一列, 换了那边就数不到了, 仍由负责人配。
+#   · 能存进去的一定是 ``_validate_comment_set`` 认的: 合并完整个过一遍校验, 不过就不写 —— 工具收下的数不会事后被当成
+#     「配置不对, 按没配处理」。
+#   · ``default_params`` 仍存成 JSON **字符串**, 别的键(delivery / archived / isolation_terms …)原样带回去; 解析不了就不写
+#     (同 delivery_format: 拿 {} 去合并会把别的键抹掉)。
+#   · 留痕在同一个 JSON 里: ``comment_set_log``, 新的在前, 最多 20 条, 每条 {at(UTC), by(钥匙的备注名, 不是钥匙), before,
+#     after}。时间和是谁由工具那一层传进来, 这里不看钟、不认人。
+#   · 读、改、写不在一个事务里(同 delivery_format / project_archive)。复审 11-11: 这一列现在是写手的模型在对话里写, 不只是
+#     负责人手敲的命令, 所以这里多做三件事: ① 同一个项目的 set_comment_mix 在进程里排队(``_mix_lock``; 线上是单进程,
+#     railway.json 的 uvicorn 没开 --workers), ② 排到了再读一次项目行, 在最新的那份上合并(不拿排队之前读的那份),
+#     ③ 写完再读一次, 配比或这次的留痕有一样对不上就照实说没改成。
+#     还剩的一个口子: 这次读和写之间(一次库往返)另一个进程写了这一列(负责人正好在跑 delivery-format / project-archive),
+#     那一次会被这次盖掉, 两边都看不出来 —— 要关上得让库按「读到的值没变才写」来写, 这一版没做。
+COMMENT_SET_LOG_KEY = "comment_set_log"
+COMMENT_SET_LOG_MAX = 20
+MIX_KEYS = ("brand_max", "neutral_min", "short_min", "short_chars")
+_MIX_SHARE_KEYS = ("brand_max", "neutral_min", "short_min")
+_MIX_NAMES = {"brand_max": "提品牌的上限", "neutral_min": "中性评论的下限", "short_min": "一句话短评的下限",
+              "short_chars": "一句话短评的字数"}
+MIX_KEYS_HELP = ("能改的是 brand_max(提品牌的最多几成)、neutral_min(中性的至少几成)、short_min(一句话短评至少几成)、"
+                 "short_chars(多少字以内算短评)。几成写小数或百分数: 七成是 0.7 或 70, 单写 7 是 7%。")
+MIX_EMPTY = "mix 里没有要改的: 放要改的那几项, 比如 {\"brand_max\": 0.6}。" + MIX_KEYS_HELP
+MIX_COLUMN_REFUSED = ("评论贴进飞书哪一列在这里改不了: 它和发布记录里数评论的那一列是绑着的, 换了那边就数不到了。"
+                      "这次什么都没改; 用户要换列, 请用户找负责人。配比的四个数可以改, 去掉 column 再调一次。")
+MIX_UNREADABLE = "这个项目的设置现在读不出来, 配比没有改。请用户找负责人看一下, 不用重试。"
+MIX_EXISTING_BAD = ("这个项目现有的评论设置里有一项不是这里能改的, 配比没有改。请用户找负责人看一下, 不用重试; "
+                    "这一组评论照 comments_for 这次回的写。")
+# 复审 11-11: 库里原来就不对的是四个数里的一个(这次没带它)时, 不说「不是这里能改的」—— 它正是这里能改的。点出是哪一个、
+# 要什么样的数; 改不改仍由用户定(只有用户明说才改), 所以两条路都给: 一起改掉, 或找负责人。
+MIX_EXISTING_NUMBER_BAD = ("这个项目现有的{name}({key})读的时候不认(现在是 {shown}, {want}), 配比没有改。这个数这里能改: "
+                           "用户同意的话, 把 {key} 也放进 mix 一起改掉再调一次; 不然请用户找负责人看一下。")
+_MIX_WANT_SHARE = "要 0 到 100% 之间的数"
+MIX_SUM = ("{brand}加{neutral}超过了 100%, 一组评论没法同时满足(中性评论是不提品牌的): 把其中一个调低, 或把中性的下限"
+           "去掉(值写 null), 再调一次。")
+MIX_UNCHANGED = "「{name}」的配比和现在的一样, 没有改。"
+MIX_SUMMARY = "「{name}」一组评论的配比改了: {changes}。"
+MIX_NOT_STORED = "这次没有改成: 存进去的和要改的不一样(可能刚好有人也在改这个项目的设置)。请再调一次。"
+MIX_CLEARED_NOTE = ("这个项目现在没有定配比: 一组评论里提品牌、中性、短评的条数不再数, 所有项目都管的写法底线照旧。")
+MIX_NEXT_STEP = ("把 summary 原样告诉用户。这个项目以后的评论都按新的配比(comment_set.lines)写; 这一组还没交的也照新的写, "
+                 "再判时用的就是新的数。以后也只在用户明说要改这个项目的配比时调这个工具。")
+# 改完之后一个在数的数都没有了(都去掉了, 或提品牌的上限 100%、下限 0%): comment_set.lines 里没有配比的句子, 不往那儿指
+MIX_CLEARED_NEXT_STEP = ("把 summary 原样告诉用户。这个项目以后的评论不再数提品牌、中性、短评的条数, 别的写法底线照旧; "
+                         "这一组还没交的也一样。以后也只在用户明说要改这个项目的配比时调这个工具。")
+MIX_UNCHANGED_NEXT_STEP = "跟用户说一句配比和现在的一样、没有改, 评论照现在的配比写。"
+
+
+class CommentMixError(ValueError):
+    """set_comment_mix 的入参不对, 或这个项目的设置现在改不了。消息是念给调用方的一句; 工具层收成 InvalidInput(400)。"""
+
+
+_MIX_LOCKS: dict[str, threading.Lock] = {}
+_MIX_LOCKS_GUARD = threading.Lock()
+
+
+def _mix_lock(pid: str) -> threading.Lock:
+    """一个项目一把锁(进程内)。只在过了归属校验之后按真的项目 id 取, 所以锁的个数不超过项目数。"""
+    with _MIX_LOCKS_GUARD:
+        return _MIX_LOCKS.setdefault(pid, threading.Lock())
+
+
+def _mix_share(key: str, v) -> float:
+    """一个几成的数 → 0~1 的小数(整数百分比)。认小数(0.5)、百分数(50)、带百分号的字(「50%」); 1 是 100%。"""
+    name, shown, pct = _MIX_NAMES[key], v, False
+    if isinstance(v, str):
+        t = v.strip().replace("％", "%")
+        pct = t.endswith("%")
+        try:
+            v = float(t[:-1] if pct else t)
+        except ValueError:
+            v = None
+        if pct and v is not None:
+            v = v / 100
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
+        raise CommentMixError(f"{name}({key})要是一个数: 小数(0.5)或百分数(50、\"50%\")都行, 现在是 {shown!r:.40}。")
+    if not pct and 1 < v <= 100:
+        v = v / 100
+    if not 0 <= v <= 1:
+        raise CommentMixError(f"{name}({key})要在 0 到 100% 之间: 小数(0.5)或百分数(50、\"50%\")都行, 现在是 {shown!r:.40}。")
+    return commentstyle._pct(v) / 100                  # 代码按整数百分比数, 存的就是数的那个值
+
+
+def _mix_chars(v) -> int:
+    """一句话短评的字数 → 整数。认整数、整数样子的小数(15.0)、ASCII 数字写的字(「15」); 别的一律是那一句, 不抛别的错。
+
+    复审 11-11: ``str.isdigit()`` 对「²」「①」也是真, ``int()`` 却不认; ``int(inf)`` / ``int(nan)`` 直接抛 —— 这几种原来漏成
+    500(模型读到的是「服务坏了, 重试」, 不是哪个数不对)。"""
+    lo, hi = _SHORT_CHARS_RANGE
+    shown = v
+    if isinstance(v, str):
+        t = v.strip()
+        if t.isascii() and t.isdigit():
+            v = int(t)
+    elif isinstance(v, float) and v == v and abs(v) != float("inf") and v == int(v):   # 先挡 nan / inf, 再 int()
+        v = int(v)
+    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+        raise CommentMixError(f"{_MIX_NAMES['short_chars']}(short_chars)要是 {lo}~{hi} 的整数, 现在是 {shown!r:.40}。")
+    return v
+
+
+def _mix_stored_ok(key: str, v) -> bool:
+    """库里现有的这一个数, 读的时候认不认: 就是拿它单独过一遍读的时候那个校验(几成的 None 是没定, 认)。"""
+    try:
+        _validate_comment_set({key: v})
+    except _CommentSetError:
+        return False
+    return True
+
+
+def _mix_numbers(raw) -> dict:
+    """库里那份 comment_set → 四个数(没定的是 None)。给回包的 before / after, 原样的值, 不带 column。"""
+    raw = raw if isinstance(raw, dict) else {}
+    return {k: raw.get(k) for k in MIX_KEYS}
+
+
+def _mix_effective(raw: dict) -> dict:
+    """比「改了没有」用的那一份: 几成那三项写着 null 和没有这一项是一回事(读的时候都当没定)。"""
+    return {k: v for k, v in raw.items() if not (k in _MIX_SHARE_KEYS and v is None)}
+
+
+def _mix_shown(key: str, raw: dict) -> str:
+    """一个数说给人听的样子: 「50%」「15 字」「没定」; 提品牌 100%、下限 0% 标一句等于不限 / 不要求。"""
+    v = raw.get(key)
+    if key == "short_chars":
+        if key not in raw:
+            return f"{_SHORT_CHARS_DEFAULT} 字(默认)" if raw.get("short_min") is not None else "没定"
+        if isinstance(v, bool) or not isinstance(v, int):
+            return "读不出来"                           # 库里写的是 null、"12"、15.0: 读的时候不认, 不照着念成「12 字」
+        return f"{v} 字"
+    if v is None:
+        return "没定(不数)"
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 1:
+        return "读不出来"                               # 库里原来的数不对(读的时候按没配处理): 不硬算一个百分比出来
+    pct = commentstyle._pct(v)
+    if key == "brand_max" and pct >= 100:
+        return "100%(等于不限)"
+    if key != "brand_max" and pct <= 0:
+        return "0%(等于不要求)"
+    return f"{pct}%"
+
+
+def _mix_comment_set(cfg: dict | None) -> dict | None:
+    """回包里的 comment_set: 和 comments_for 回的同一个样子; 没有配比的句子、也没配列时是 None。"""
+    lines = _comment_set_lines(cfg) if cfg else []
+    return {"lines": lines, "column": cfg.get("column")} if lines else None
+
+
+def set_comment_mix(client, project_id: str, *, user_id: str | None, mix, by: str, at: str) -> dict:
+    """改一个项目一组评论的配比(``default_params.comment_set`` 里的四个数), 回改之前 → 改之后和新的那几句。
+
+    ``mix``: 只放要改的键; 值是 None 的去掉那一项(不再数)。``by`` / ``at``: 留痕用的是谁、什么时候(UTC ISO), 工具层传进来。
+    入参不对、项目的设置读不出来或有这里改不了的毛病 → ``CommentMixError``, 一个字不写。和现在一样 → 不写, ``changed`` false。
+    """
+    project = assert_project_access(client, project_id, user_id=user_id)
+    pid = str(project["id"])
+    if not isinstance(mix, dict) or not mix:
+        raise CommentMixError(MIX_EMPTY)
+    if "column" in mix:
+        raise CommentMixError(MIX_COLUMN_REFUSED)
+    unknown = [str(k)[:30] for k in mix if k not in MIX_KEYS]
+    if unknown:
+        raise CommentMixError(f"mix 里不认识 {'、'.join(unknown)}, 什么都没改。{MIX_KEYS_HELP}")
+    wanted = {key: None if value is None else _mix_chars(value) if key == "short_chars" else _mix_share(key, value)
+              for key, value in mix.items()}
+    with _mix_lock(pid):                                # 同一个项目排队: 排到了再读, 在最新的那份上改(见上面那段)
+        project = store.project_row(client, pid) or project
+        return _set_comment_mix_locked(client, project, pid, user_id=user_id, wanted=wanted, by=by, at=at)
+
+
+def _set_comment_mix_locked(client, project: dict, pid: str, *, user_id, wanted: dict, by: str, at: str) -> dict:
+    """``set_comment_mix`` 拿到锁之后的那一段: ``project`` 是锁里刚读的项目行, ``wanted`` 是查过的数(None 是去掉)。"""
+    name = project.get("name") or ""
+    try:
+        params = delivery.parse_params(project.get("default_params"))
+    except delivery.TemplateError as exc:
+        logger.warning("set_comment_mix: 项目 %s 的 default_params 解析不了, 没有写: %s", pid, exc)
+        raise CommentMixError(MIX_UNREADABLE) from exc
+    old_raw = params.get(COMMENT_SET_KEY)
+    if old_raw is not None and not isinstance(old_raw, dict):
+        logger.warning("set_comment_mix: 项目 %s 的 comment_set 不是 JSON 对象, 没有写", pid)
+        raise CommentMixError(MIX_EXISTING_BAD)
+    old_raw = old_raw or {}
+    new_raw = dict(old_raw)
+    for key, value in wanted.items():
+        if value is None:
+            new_raw.pop(key, None)
+            continue
+        # 数没变(0.333 和 33%)就留着库里原来的写法。按**数**比, 不按念出来的样子比(复审 11-11): 库里写的是 "12" 时念出来
+        # 也是「12 字」, 但读的时候不认 —— 那就不是「一样」, 这次写进去的是认的那个。
+        stored = old_raw.get(key)
+        same = stored is not None and _mix_stored_ok(key, stored) and (
+            stored == value if key == "short_chars" else commentstyle._pct(stored) == commentstyle._pct(value))
+        if not same:
+            new_raw[key] = value
+    for key in MIX_KEYS:                                # 这次没带的那几个数里, 库里原来就不认的: 点出来(它这里能改)
+        if key in wanted or key not in new_raw or _mix_stored_ok(key, new_raw[key]):
+            continue
+        lo, hi = _SHORT_CHARS_RANGE
+        logger.warning("set_comment_mix: 项目 %s 现有的 %s 读的时候不认, 没有写", pid, key)
+        raise CommentMixError(MIX_EXISTING_NUMBER_BAD.format(
+            name=_MIX_NAMES[key], key=key, shown=f"{new_raw[key]!r:.30}",
+            want=f"要 {lo}~{hi} 的整数" if key == "short_chars" else _MIX_WANT_SHARE))
+    cfg = None
+    if new_raw:
+        both = [new_raw.get(k) for k in ("brand_max", "neutral_min")]
+        if None not in both and sum(commentstyle._pct(v) for v in both) > 100:
+            raise CommentMixError(MIX_SUM.format(
+                brand=f"{_MIX_NAMES['brand_max']}({commentstyle._pct(both[0])}%)",
+                neutral=f"{_MIX_NAMES['neutral_min']}({commentstyle._pct(both[1])}%)"))
+        try:
+            cfg = _validate_comment_set(new_raw)       # 和读的时候同一个校验: 存进去的不会事后被当成配置不对
+        except _CommentSetError as exc:
+            # 四个数上面都查过了(这次给的, 和库里没动的): 走到这里是 column 或别的键不对, 那不是这里能改的
+            logger.warning("set_comment_mix: 项目 %s 现有的 comment_set 过不了校验, 没有写: %s", pid, exc)
+            raise CommentMixError(MIX_EXISTING_BAD) from exc
+    before, after = _mix_numbers(old_raw), _mix_numbers(new_raw)
+    out = {"project_id": pid, "project_name": name, "changed": False, "before": before, "after": after}
+    # 一样, 或只是少了一个写着 null 的键: 没有改, 不写、不留痕。按写进库的样子比(15 和 15.0 在 Python 里相等, 读的时候不是)
+    if _canonical(_mix_effective(new_raw)) == _canonical(_mix_effective(old_raw)):
+        out["summary"] = MIX_UNCHANGED.format(name=name)
+        out["comment_set"] = _mix_comment_set(cfg)
+        out["next_step"] = MIX_UNCHANGED_NEXT_STEP
+        return out
+    log = params.get(COMMENT_SET_LOG_KEY)
+    entry = {"at": at, "by": by or f"user {str(user_id)[:8]}", "before": dict(old_raw) or None,
+             "after": dict(new_raw) or None}
+    new_params = dict(params)                           # 别的键原样、原来的顺序
+    if new_raw:
+        new_params[COMMENT_SET_KEY] = new_raw
+    else:
+        new_params.pop(COMMENT_SET_KEY, None)           # 四个数都去掉、也没配列: 不留一个空壳(空对象过不了校验)
+    new_params[COMMENT_SET_LOG_KEY] = [entry, *(log if isinstance(log, list) else [])][:COMMENT_SET_LOG_MAX]
+    store.set_project_default_params(client, pid, json.dumps(new_params, ensure_ascii=False))
+    # 以库里实际的值回报(同 record_rule / project_archive 的纪律), 不回报入参。配比要对得上, 留痕最前面那条也要是这次的
+    # (复审 11-11): 配比碰巧一样、留痕却没了, 是另一个写拿旧的一份盖过来了 —— 照实说没改成, 请再调一次(再调时在最新的
+    # 那份上合并)。别的键不比: 这次写完之后别人接着改了别的键, 这次的改动还在, 不该说成没改成。
+    stored = store.project_row(client, pid) or {}
+    try:
+        stored_params = delivery.parse_params(stored.get("default_params"))
+    except delivery.TemplateError:
+        stored_params = None
+    stored_log = (stored_params or {}).get(COMMENT_SET_LOG_KEY)
+    landed = (stored_params is not None
+              and _canonical(stored_params.get(COMMENT_SET_KEY) or {}) == _canonical(new_raw)
+              and isinstance(stored_log, list) and bool(stored_log) and _canonical(stored_log[0]) == _canonical(entry))
+    if not landed:
+        logger.warning("set_comment_mix: 项目 %s 写完再读, 和要写的不一样 (user=%s)", pid, str(user_id)[:8])
+        out.update(after=_mix_numbers((stored_params or {}).get(COMMENT_SET_KEY)), summary=MIX_NOT_STORED,
+                   warning=MIX_NOT_STORED)
+        return out
+    logger.info("set_comment_mix: 项目 %s 的配比改了 (user=%s, 改了 %s)", pid, str(user_id)[:8],
+                ",".join(k for k in MIX_KEYS if before[k] != after[k]))
+    changes = [f"{_MIX_NAMES[k]} {_mix_shown(k, old_raw)} → {_mix_shown(k, new_raw)}"
+               for k in MIX_KEYS if _mix_shown(k, old_raw) != _mix_shown(k, new_raw)]
+    out["changed"] = True
+    out["summary"] = MIX_SUMMARY.format(name=name, changes="; ".join(changes))
+    out["comment_set"] = _mix_comment_set(cfg)
+    counted = _comment_set_counts(cfg)
+    if not counted:
+        out["comment_set_note"] = MIX_CLEARED_NOTE     # 一个在数的数都没有了: 说清这个项目现在不数配比了(配了列的, 列照旧)
+    out["next_step"] = MIX_NEXT_STEP if counted else MIX_CLEARED_NEXT_STEP
+    return out
+
+
+def _canonical(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True)
 
 
 def _cell_lines(text: str) -> list[str]:
@@ -3540,7 +3891,27 @@ def _set_line(checks: dict) -> tuple[str | None, bool]:
                 fail = True
     if checks["ends"].get("thread_fix"):
         parts.append(checks["ends"]["thread_fix"])
-    return (("整组代码查: " + "; ".join(parts)) if parts else None), fail
+    head = SET_LINE_HEAD if _set_fired(checks) else SET_LINE_HEAD_ALL
+    return ((head + "; ".join(parts)) if parts else None), fail
+
+
+def _set_fired(checks: dict) -> set[str]:
+    """整组那一句里有项目配比的哪几样(提品牌、中性、短评; 只有配了 comment_set 的项目才会有)。"""
+    return {k for k in ("brand", "neutral", "short") if (checks.get(k) or {}).get("segment")}
+
+
+def _set_next_step(checks: dict) -> str | None:
+    """整组那一句的下一步(复审 11-11): 只在那一句里有配比的数时给, 按这次真报了的几样拼: 提品牌、中性报了才说规则里要每条带
+    品牌的以条数为准, 短评真不够才说怎么补短评。没有配比的数(只有重复、品牌收尾)回 None。"""
+    fired = _set_fired(checks)
+    if not fired:
+        return None
+    out = SET_NEXT_STEP
+    if fired & {"brand", "neutral"}:
+        out += SET_BRAND_STEP
+    if (checks.get("short") or {}).get("short_by"):
+        out += SET_SHORT_STEP
+    return out + USER_MIX_NOTE + RULE_SELF_SERVICE
 
 
 def _style_block(cands: list[dict], style: list[list[str]], checks: dict | None = None) -> dict:
@@ -3554,6 +3925,9 @@ def _style_block(cands: list[dict], style: list[list[str]], checks: dict | None 
         line, _fail = _set_line(checks)
         if line:
             out["thread_fix"] = [line]
+        step = _set_next_step(checks)
+        if step:
+            out["set_next_step"] = step
         if checks["ends"].get("thread_hint"):
             out["thread_hints"] = [checks["ends"]["thread_hint"]]
     return out
@@ -3886,6 +4260,14 @@ def _resolve_post(client, *, user_id, link: str, project_id: str, post_title: st
         "note": (why + "。" if why else "") + "请用户补上: " + "、".join(need) + "。补齐后再调一次。"}
 
 
+# 每次 comments_for 现取规则(2026-11-11): 同一场对话里早先拿到的规则原文(包括已经停掉的)不算数。只说规则原文, 不压用户这次
+# 在对话里明说的要求(复审 11-11, 见 SET_LINE_HEAD 上面那段)
+COMMENTS_FOR_RULES_NOW = "规则以这次回的为准, 前面对话里见过的规则原文和这次不一样的不算(可能已经停掉了)。"
+COMMENT_SET_NEXT_STEP = ("这个项目定了一组的配比(comment_set.lines), 和 style 一样要守; 项目规则里说法不一样的"
+                         "以它为准, 不算冲突, 不用问用户; 用户这次明说要别的配比, 这一组就照用户的写, 交付时一句话说明; "
+                         "用户明说这个项目以后都按新的配比, 调 set_comment_mix 改, 不用找负责人。")
+
+
 def _comment_rules(client, project_id: str, user_id) -> tuple[list[str], list[str]]:
     """``(评论规则, 硬约束)``: content 以「评论区」开头的(任何 severity)+ 全部 hard。合规硬约束对评论一样管用。"""
     hard, soft = store.shared_memories(client, project_id, user_id)
@@ -3943,7 +4325,7 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
         existing += [{"order": None, "role": None, "is_reply": False, "text": line, "source": column} for line in cell]
     next_step = ("按 slots 每位写一条(贴主答疑那条回 q1), 守 hard_rules、comment_rules 和 style(所有项目都管), 别和 existing_comments "
                  "里已经有的问题重复; 写完把整组交给 score_comments(帖子参数和这次一样: link, 或 post_title / post_body + "
-                 "project_id; 每条评论带 slot 的 id)。")
+                 "project_id; 每条评论带 slot 的 id)。" + COMMENTS_FOR_RULES_NOW)
     out = {"resolved": True, "source": source, "project_id": project["id"],
            "project_name": project.get("name"),
            "post": {"title": title, "body": body[:_POST_BODY_CHARS]},
@@ -3952,12 +4334,17 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
            "slots": [dict(s) for s in DEFAULT_COMMENT_SLOTS],
            "style": list(COMMENT_STYLE_LINES),
            "next_step": next_step}
-    if cfg:
-        out["comment_set"] = {"lines": _comment_set_lines(cfg), "column": column}
-        out["next_step"] = next_step + "这个项目定了一组的配比(comment_set.lines), 和 style 一样要守, 项目规则里说法不一样的以它为准。"
+    cfg_lines = _comment_set_lines(cfg) if cfg else []
+    if cfg_lines:                                       # 有在数的数或配了列(复审 11-11: 都没有就不带一个空的 comment_set)
+        out["comment_set"] = {"lines": cfg_lines, "column": column}
+        if _comment_set_counts(cfg):
+            out["next_step"] = next_step + COMMENT_SET_NEXT_STEP
         if column and len(existing) > tv_existing:
             out["next_step"] += (f"existing_comments 里 source 是「{column}」的, 是这条帖子那一格里已经有的维护评论: "
-                                 "里面用过的说法也别再用。")
+                                 "里面用过的说法也别再用; 它们是按以前的规矩写的(提品牌多、短评少), 只拿来避开重复, "
+                                 "配比照 comment_set。")
+    if comment_rules or hard_rules:
+        out["rules_note"] = RULE_SELF_SERVICE
     if cfg_note:
         out["comment_set_note"] = cfg_note
     if cell_unread:
@@ -3999,7 +4386,7 @@ def _thread_lines(entries) -> list[str]:
         if isinstance(why, str) and why.strip():
             why = _no_post_ref(why)
             out.append(f"位 {e['slot']}: {why}" if e.get("slot") else why)
-    return out
+    return _note_post_ref(out)
 
 
 _COMMENT_FIX_CHARS = 400            # judge 的单条修改单带整段题干, 一条能上千字; 一组 4 条 × 3 条修改单会把协议挤出注意力
@@ -4011,9 +4398,24 @@ def _no_post_ref(text: str) -> str:
     return text.replace("帖子里", "帖子")
 
 
+# 2026-11-11 owner: 评论里一提帖子就不行。Jev 的话是在说评论(「接住帖子说到的事」「不要从帖子借品牌」), 本身可以提帖子, 可模型
+# 照着改时容易写成「帖子说的 X」: 这几句里第一句提到帖子的, 后面补一句。细节那道题没过时叫加细节, 模型会把评论越写越长
+# (「可以支持字数不够」): 补一句点到就够。都只在转给写手的这一份上加, Jev 的题库不动。
+POST_REF_NOTE = "(评论里不提帖子, 直接说那件事)"
+DETAIL_NOTE = "(点到一个情境或做法就够, 不为这个加长)"
+
+
+def _note_post_ref(lines: list[str]) -> list[str]:
+    for k, line in enumerate(lines):
+        if "帖子" in line:
+            return [*lines[:k], line + POST_REF_NOTE, *lines[k + 1:]]
+    return lines
+
+
 def _instructions(entries, limit: int) -> list[str]:
-    return [_no_post_ref(e["instruction"][:_COMMENT_FIX_CHARS]) for e in (entries or [])
-            if isinstance(e, dict) and isinstance(e.get("instruction"), str)][:limit]
+    out = [_no_post_ref(e["instruction"][:_COMMENT_FIX_CHARS]) + (DETAIL_NOTE if e.get("qid") == "detail_level" else "")
+           for e in (entries or []) if isinstance(e, dict) and isinstance(e.get("instruction"), str)][:limit]
+    return _note_post_ref(out)
 
 
 def _comment_payload(cands: list[dict]) -> list[dict]:
@@ -4212,6 +4614,9 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         out["thread_hints"] = thread_hints[:2]
     if any(style):
         out["style_next_step"] = COMMENT_STYLE_NEXT_STEP
+    step = _set_next_step(checks)
+    if step:
+        out["set_next_step"] = step
     return out
 
 
@@ -7435,6 +7840,10 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
 # 天天写的那个人。把控制权交到工具层, 这套东西才谈得上自己长。
 
 _RULE_ACTIONS = ("mute", "unmute", "retire", "promote", "set_direction")
+# 台账里试用档的规则原文照列(写手要看得见库里有什么), 可它们不进简报、也不给写评论 —— 11-10 一位写手的模型把一条试用档的旧评论
+# 规则当成了项目要求, 和负责人新定的配比对着放(2026-11-11)。回包里说清: 不生效的不用守, 和别的说法不一样不算冲突
+MY_RULES_STATE_NOTE = ("state 是「试用」「已停用」的现在不生效: 写稿、写评论都不用守, 和生效中的规则或 comment_set 说法不一样"
+                       "也不算冲突。用户说哪条过时了, 当场用 set_rule_state 停掉, 不用等负责人。")
 
 
 def my_rules(client, project_id: str, *, user_id: str) -> dict:
@@ -7501,8 +7910,9 @@ def my_rules(client, project_id: str, *, user_id: str) -> dict:
         "rules": out,
         "counts": counts,
         "actions": ("改这些用 set_rule_state: mute(停用一段时间) / unmute(恢复) / "
-                    "retire(降回试用档, 不再进简报) / promote(试用→生效) / "
+                    "retire(降回试用档, 不再进简报、写评论也不再给) / promote(试用→生效) / "
                     "set_direction(设成 产品向 / 流量向 / 通用)"),
+        "state_note": MY_RULES_STATE_NOTE,
     }
     if missing:
         res["note_missing_embedding"] = (

@@ -44,6 +44,7 @@ PARTS = ("title", "body", "tags", "comments")
 DEFAULT_WHERE = ("title", "body")
 PART_CN = {"title": "标题", "body": "正文", "tags": "话题标签", "comments": "评论"}
 SEVERITY_LABEL = {"hard": "必须改", "soft": "建议改"}
+BELOW_MIN_HOW = "能补的是具体内容(经过、细节、数字), 不加空话凑字; 没有素材就照实告诉用户差多少"
 MAX_TERMS = 50
 MAX_TERM_CHARS = 40
 MAX_HITS = 40                 # 一批 20 篇 × 几条规则, 建议改最多补到这么多(必须改全列); 返回值太长会把协议挤出模型的注意力
@@ -312,7 +313,8 @@ def _run(spec: dict, parts: dict[str, list[str]], *, expects=(),
         if "max" in spec and n > spec["max"]:
             out.append((w, f"{PART_CN[w]} {n} 字(不算空白和话题), 上限 {spec['max']}"))
         if "min" in spec and n < spec["min"]:
-            out.append((w, f"{PART_CN[w]} {n} 字(不算空白和话题), 下限 {spec['min']}"))
+            # 2026-11-11 owner:「不要为了凑字数凑废话」: 差的字数只拿具体内容补, 没有素材就照实说, 不加空话
+            out.append((w, f"{PART_CN[w]} {n} 字(不算空白和话题), 下限 {spec['min']}: {BELOW_MIN_HOW}"))
     return out
 
 

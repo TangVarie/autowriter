@@ -99,7 +99,7 @@ jobs:
           print(f"  ✓ _safe 只包这几个可降级的读: {sorted(SAFE_OK)}")
           for name in ("open_project", "record_rule", "record_edit", "label_example",
                        "draw_angles", "check_drafts", "score_drafts", "commit_drafts", "ack_edit_digest",
-                       "set_rule_state", "reembed_my_rules"):
+                       "set_rule_state", "reembed_my_rules", "set_comment_mix"):
               assert name not in wrapped, f"{name} 不能包 _safe(合规读/写, 失败必须冒泡)"
           print("  ✓ 合规读与全部写操作都不吞异常")
 
