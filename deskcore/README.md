@@ -110,8 +110,9 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 | `reembed-rules --user <uuid>` | 给**规则**补向量——soft 规则的相关性过滤靠它才有意义 |
 | `ingest --project <uuid> --user <uuid> --xlsx 表.xlsx [--dry-run]` | 把**已经发出去、没走 commit** 的稿子从飞书表补进库（身份 + 指纹，不过闸）。认 `export_drafts` 的导出格式（带 `version_id` 的行跳过）或「标题」「正文」两列（`--title-col/--body-col` 可指定）。先 `--dry-run` 看它认出几条 |
 | `tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target` / `tv-map list` | TV 项目 ↔ 写作台项目的对照表；每个 TV 项目只能有一个补录目标 |
-| `tv-sync --all [--dry-run] [--write-tv] [--since …] [--rematch]` | 把 TV 的笔记按内容对到写作台的版本，对不上的补进指纹库（不过闸、按全文幂等）。先 `--dry-run` 看数；`--write-tv` 才回填 TV 的 `source_autowriter_*`。**每天跑一次** |
+| `tv-sync --all [--dry-run] [--write-tv] [--since …] [--rematch]` | 把 TV 的笔记按内容对到写作台的版本，对不上的补进指纹库（不过闸、按全文幂等）。先 `--dry-run` 看数；`--write-tv` 才回填 TV 的 `source_autowriter_*`。**每天跑一次**。对不上的那一行（`unmatched` / `ingested`）的 `score` 记这篇帖和写作台的稿子最像到什么程度，用来分开「在别处写的」和「拿写作台的稿子改的」（只是读数，`docs/deskcore.md` §3.26） |
 | `tv-resolve --note <note_id> --ingest` | `tv-sync` 报「分不出」的那几条，人看过之后落判定：目前只有一种，「对不上，按 TV 的正文补录」。对照改成 `ingested`，原候选保留。**不硬猜**、也**不提供「指定某一版」**（`match_kind` 没有 manual 一档，硬记成 `body_exact` 是撒谎） |
+| `draw-report --days 28 [--project <uuid>] [--json]` | **只读。** 发牌的读数：来源 × 项目 × 周的写了 / 发了 / 留着 / 撞车、试新牌对比和健康度；2026-11-11 起多三项「牌面对不对得上」（牌面的内容形式、情绪杠杆对发出去那篇的 TV 标签，牌面的标题句式对 Jev 答的「标题是不是问句」），每个比例旁边带碰巧一样的比例（`docs/deskcore.md` §3.26）。只有计数和比率，不取标题和正文 |
 | `compile-rules (--project <uuid> \| --all) [--force] [--dry-run]` | 把规则池里还没编的规则交给 Jev 编成写后检查（`check_rules` 用），结果缓存进 `rule_compiles`；已编过的（规则 id + 原文 sha 都没变）不再发；`--all` 一次运行里 owner 的 global 规则只发一次（`--force` 也是）。先 `--dry-run` 看要编几条（和真编同一个结局：没接 tv-map / 没配 `JUDGE_*` 照样报 ✗）。后台也会自己补编，这个命令是上线时补一遍（先关 `RULE_COMPILE_AUTO`，见 runbook §1.11）、或 Jev 改了编译之后 `--force` 用。一个项目一行计数，有项目没编成退出码 1；一批读超时就不再发后面几批，`--all` 也不再试后面的项目（列出来），Jev 恢复后再跑（2026-10-20，D-121） |
 | `sync-skill [--check]` | **不连库。** 改了 `protocol.md` 之后跑，把正文接进 `skills/…/SKILL.md`；`--check` 只比对，给 CI 用。两边不一致时 `test_protocol_tool.py` 会红 |
 

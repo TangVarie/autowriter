@@ -3037,7 +3037,8 @@ def desk_adoption(sb, version_ids) -> dict | None:
 
 # ── draw-report(angle cards v2 §5.3, 运维 CLI, 只读) ───────────────────────────────────────────────
 # 三样都只取 id / 时间 / 结论列: 台账带 dims(含 _draw 记账块); 底稿只取 angle_key 和查重结论(不取标题、正文);
-# TV 笔记只取评论数、tier、发布时间。读挂了回 None, 由 CLI 说读不到。
+# TV 笔记只取评论数、tier、发布时间和两个标签(内容形式、情绪杠杆)。读挂了回 None, 由 CLI 说读不到。
+# 2026-11-11(审计 F1)加了第四样: 销账那一版在「标题是不是问句」上的答案(report_title_answers), 只取答案列。
 REPORT_LEDGER_CAP = 20000
 REPORT_SNAPSHOT_CAP = 20000
 
@@ -3073,19 +3074,42 @@ def report_snapshot_verdicts(sb, days: int, project_id: str | None = None,
 
 
 def report_note_outcomes(sb, note_ids) -> dict[str, dict] | None:
-    """这几篇 TV 笔记的评论数、tier、发布时间(M5 / M6): ``{note_id: {...}}``。读挂了回 None。"""
+    """这几篇 TV 笔记的评论数、tier、发布时间(M5 / M6), 和 TV 给它打的内容形式、情绪杠杆标签(牌面对不对得上,
+    drawreport 的 a_form / a_lever): ``{note_id: {...}}``。读挂了回 None。"""
     ids = sorted({str(i) for i in (note_ids or ()) if i})
     out: dict[str, dict] = {}
     try:
         for i in range(0, len(ids), NOTE_ANSWERS_CHUNK):
             chunk = ids[i:i + NOTE_ANSWERS_CHUNK]
             for r in (sb.schema("truth_vault").table("notes")
-                        .select("note_id, project_id, content_format, publish_time, comments_count, tier")
+                        .select("note_id, project_id, content_format, emotional_lever, publish_time, "
+                                "comments_count, tier")
                         .in_("note_id", chunk).limit(PAGE).execute()).data or []:
                 if r.get("note_id"):
                     out[str(r["note_id"])] = r
     except Exception as exc:                            # noqa: BLE001
         _tv_warn("draw report notes", exc)
+        return None
+    return out
+
+
+def report_title_answers(sb, version_ids) -> dict[str, str] | None:
+    """这几版写作台稿子在「标题是不是问句」上答了什么(drawreport 的 a_title): ``{版本 id: "是" / "否"}``, 没答的不在里面。
+
+    和简报的 recent_structure 同一个读法(``_feature_answers``: 只认 Jev 的行、题目版本要对得上、同一题几行取最后抽的),
+    只取答案列, 不取 evidence(那是稿子原文片段)。读挂了回 None。"""
+    from . import structure
+    qid = "title_is_question"
+    ver, _label, allowed = structure.QUESTIONS[qid]
+    vids = sorted({str(v) for v in (version_ids or ()) if v})
+    out: dict[str, str] = {}
+    try:
+        for i in range(0, len(vids), STRUCTURE_VERSIONS_MAX):
+            got = _feature_answers(sb, vids[i:i + STRUCTURE_VERSIONS_MAX], {qid: (ver, allowed)},
+                                   structure.BANK_VERSION)
+            out.update({vid: a[qid] for vid, a in got.items() if a.get(qid)})
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("draw report title answers", exc)
         return None
     return out
 

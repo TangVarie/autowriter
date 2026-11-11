@@ -220,6 +220,22 @@ Variable Reference 引 deskcore 主服务的三个：`SUPABASE_URL` / `SUPABASE_
 `unmatched`（没版本、没备注）的不再每晚重写一遍（W-10，2026-10-23；RIO 782 行原来每晚只刷一次
 `updated_at`），报表里记成「其中 N 条上次就是 unmatched，没重写」。每晚照样重新对一次，写作台后来存了
 对得上的版本照样会写。所以 `tv_note_links` 的 `max(updated_at)` 不能当 tv-sync 跑没跑的证据，看 cron 日志。
+**对不上的帖也有分数（2026-11-11，`docs/deskcore.md` §3.26）**：`unmatched` / `ingested` 行的 `score` 记这篇帖的
+四字串有多少在写作台最像的那一稿里（存过档的版本和只查过重的底稿都算），只是读数，判定和补录不变，不用跑迁移。
+不到 0.15 是在别处写的，0.30 以上是拿写作台的稿子改的，NULL 是没算过（这次上线之前补录的行不回头补）或没得比
+（没正文、帖太短）。上线后第一晚，没有补录目标的项目里以前记的 `unmatched` 各重写一次把分数补上（「没重写」那个数
+这一晚是 0），之后照旧。只数不取文字的查法：
+
+```sql
+select tv_project_id, match_kind,
+       count(*) filter (where score < 0.15)  as elsewhere,
+       count(*) filter (where score >= 0.15 and score < 0.30) as in_between,
+       count(*) filter (where score >= 0.30) as rewritten,
+       count(*) filter (where score is null) as not_scored
+  from autowriter.tv_note_links
+ where match_kind in ('unmatched', 'ingested') and updated_at > now() - interval '30 days'
+ group by 1, 2 order by 1, 2;
+```
 对这类项目跑 `tv-resolve` 会说明「只判不入库」、退出码 1，对照不动。
 **飞书里已删的篇**（TV 的 `v_notes_vanished`）`016` 起 tv-sync 读不到：不重对、不补录，已有的对照一行不动；对它跑 `tv-resolve` 报「TV 里没有」。见 §1.12。
 

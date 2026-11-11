@@ -13,6 +13,13 @@
   M5 评论    发出去三天以上、评论 ≥ 20 的比例(样本小, 只给计数)                      D+10
   M6 爆      tier 爆 / 大爆 的篇数                                                  按月
 
+牌面对不对得上(2026-11-11, 审计 F1; 发牌靠牌面的坐标改变写出来的东西, 以前没有一个数看它到没到稿子和帖子里):
+  a_form   牌面的内容形式 = TV 给发出去那一篇打的内容形式标签          发出去、打了标签才读得到
+  a_lever  牌面的情绪杠杆 = TV 给发出去那一篇打的情绪杠杆标签          同上
+  a_title  牌面的标题句式是不是「疑问句」= 销账那一版 Jev 答的「标题是不是问句」   稿子这一层, 不用等发出去
+  每个比例旁边带一个 chance(碰巧一样的比例, 算法见 _adherence): 标签和答案都是模型跑一遍给的, 单看比例没有意义,
+  看它比 chance 高多少、几周的走向。杠杆本来就只是个松的引子(W-45), 比 chance 高一截就算到了; 内容形式和标题句式是硬坐标。
+
 比较(§5.2): w 对 x(盲、批内随机)是主比较, Mantel–Haenszel 按项目分层的风险差和风险比; e / h 对 w 是次要比较(参考行
 本身就是处理的一部分, 不盲)。配额内均匀乱抽(ipw_uniform): 只用试新牌估它会写出 / 发出多少 —— 试新牌就是这个策略的
 直接样本; w 牌不并进来(w 抽不到的格子试新抽得到, 并进来会偏, 见 ipw_uniform)。x-only 杠杆提升: 只用试新牌(不受策略
@@ -48,10 +55,21 @@ def _week(t: datetime) -> str:
     return f"{y}-W{w:02d}"
 
 
+def _same(card, seen) -> tuple[int | None, tuple | None]:
+    """牌面的值和结果的值都有才比: (一样不一样, (牌面, 结果)); 缺一样就是 (None, None) —— 读不到, 不进分母。"""
+    if card is None or seen is None:
+        return None, None
+    return int(card == seen), (card, seen)
+
+
 def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, notes: dict | None = None,
-              now: datetime | None = None) -> list[dict]:
-    """台账行 → 每张牌一行: {project, key, src, week, drawn_at, fit, sp, p, pu, lever, fmt, pv, m1, m2, m3, d1, m5, m6}。
-    结果是 None 表示「还读不到 / 没有数据」, 不是 0。"""
+              title_answers: dict | None = None, now: datetime | None = None) -> list[dict]:
+    """台账行 → 每张牌一行: {project, key, src, week, drawn_at, fit, sp, p, pu, lever, fmt, pv, m1, m2, m3, d1, m5, m6,
+    a_form, a_lever, a_title, adh}。结果是 None 表示「还读不到 / 没有数据」, 不是 0。
+
+    ``title_answers``: {销账的版本 id: "是" / "否"}(store.report_title_answers)。a_form / a_lever / a_title 见模块说明;
+    ``adh`` 是读得到的那几项各自的 (牌面, 结果), 算 chance 用。这三项不等 D+8: 发出去才有标签、销了账才有答案,
+    没有的本来就不进分母, 不会被当成 0。"""
     now = now or datetime.now(timezone.utc)
     by_version = ((adoption or {}).get("by_version") or {}) if adoption is not None else None
     snaps: dict[tuple[str, str], list[tuple[datetime, str]]] = defaultdict(list)
@@ -80,8 +98,8 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
         if age >= M1_DAYS:
             m1 = int(consumed is not None and (consumed - drawn).total_seconds() <= M1_DAYS * 86400)
         m2 = m3 = m5 = m6 = None
+        link = by_version.get(vid) if by_version is not None and vid else None
         if age >= M2_DAYS and by_version is not None:
-            link = by_version.get(vid) if vid else None
             m2 = int(link is not None)
             if link is None:
                 m3 = 0
@@ -102,6 +120,15 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
         nxt = min((t for t in issued.get(pk, ()) if t > drawn), default=None)
         verdicts = [st for t, st in snaps.get(pk, ()) if t >= drawn and (nxt is None or t < nxt)]
         d1 = int(any(v in ("reject", "warn") for v in verdicts)) if verdicts else None
+        # 牌面对不对得上: 词表外的值(老牌、TV 还没打标签)当没有
+        note = (notes or {}).get(str(link.get("note_id"))) if link is not None else None
+        a_form, p_form = _same(priors._valid(dp.F, dims.get(dp.F)),
+                               priors._valid(dp.F, note.get(dp.F)) if note else None)
+        a_lever, p_lever = _same(priors._valid(dp.L, dims.get(dp.L)),
+                                 priors._valid(dp.L, note.get(dp.L)) if note else None)
+        ttl = priors._valid(dp.T, dims.get(dp.T))
+        a_title, p_title = _same(None if ttl is None else ttl == priors.QUESTION,
+                                 priors.answer_bool((title_answers or {}).get(vid)) if vid else None)
         pv = d.get("pv")
         out.append({
             "project": str(r.get("project_id") or ""), "key": str(r.get("angle_key") or ""),
@@ -112,6 +139,8 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
             "lever": dims.get(dp.L), "fmt": dims.get(dp.F), "arc": dims.get(dp.A), "ttl": dims.get(dp.T),
             "dd": d.get("dd"), "ps": d.get("ps"), "b": d.get("b"), "pn": d.get("pn"), "pl": d.get("pl"), "pk": d.get("pk"),
             "m1": m1, "m2": m2, "m3": m3, "d1": d1, "m5": m5, "m6": m6,
+            "a_form": a_form, "a_lever": a_lever, "a_title": a_title,
+            "adh": {k: v for k, v in (("a_form", p_form), ("a_lever", p_lever), ("a_title", p_title)) if v is not None},
         })
     return out
 
@@ -122,10 +151,44 @@ def _rate(cards, m: str) -> dict:
 
 
 METRICS = ("m1", "m2", "m3", "d1", "m5", "m6")
+ADHERENCE = ("a_form", "a_lever", "a_title")
+CHANCE_NOTE = ("牌面对不对得上的 chance(碰巧): 同一组牌里, 假如牌面和结果互不相干, 两边碰巧一样的比例 —— 每个取值的"
+               "「牌面是它的占比 × 结果是它的占比」加起来, 只用这一组里两边都读得到的牌算(结果 = TV 给发出去那篇打的标签, "
+               "或 Jev 对销账那一版答的「标题是不是问句」)。标签和答案都是模型跑一遍给的: 看比例比 chance 高多少、"
+               "看几周的走向, 别看单周; 一组只有几张牌时 chance 自己也不稳")
+
+
+def _adherence(cards, m: str) -> dict:
+    """这一组牌在 m(a_form / a_lever / a_title)上: 读得到的张数 n、对上的张数 y、比例 rate, 和碰巧一样的比例 chance。
+
+    chance 的算法: 只看这一组里 m 读得到的牌, 数出牌面各取值的占比 p(v) 和结果各取值的占比 q(v), chance = Σ_v p(v)·q(v)
+    —— 牌面和结果互不相干时两边一样的概率。比如牌面六种内容形式各占 1/6, 不管结果怎么分布 chance 都是 1/6; 结果九成是
+    同一种、牌面三成是那一种, chance 就接近三成。rate 比 chance 高出来的那一截才是牌面起的作用。"""
+    pairs = [c["adh"][m] for c in cards if c.get(m) is not None]
+    n = len(pairs)
+    if not n:
+        return {"n": 0, "y": 0, "rate": None, "chance": None}
+    y = sum(1 for a, b in pairs if a == b)
+    pa, pb = Counter(a for a, _b in pairs), Counter(b for _a, b in pairs)
+    return {"n": n, "y": y, "rate": round(y / n, 3),
+            "chance": round(sum(k * pb.get(v, 0) for v, k in pa.items()) / (n * n), 3)}
+
+
+def adherence_by_source_week(cards) -> list[dict]:
+    """来源 × 周(各项目并在一起): 三项各自的 n / y / rate / chance。三项都读不到的组不列。"""
+    groups: dict[tuple, list] = defaultdict(list)
+    for c in cards:
+        groups[(c["src"], c["week"])].append(c)
+    rows = []
+    for (src, week), cs in sorted(groups.items()):
+        row = {"src": src, "week": week, "cards": len(cs), **{m: _adherence(cs, m) for m in ADHERENCE}}
+        if any(row[m]["n"] for m in ADHERENCE):
+            rows.append(row)
+    return rows
 
 
 def table(cards) -> list[dict]:
-    """来源 × 项目 × 周: 张数和每个指标的 n / y / rate。"""
+    """来源 × 项目 × 周: 张数和每个指标的 n / y / rate; 牌面对不对得上的三项多一个 chance(_adherence)。"""
     groups: dict[tuple, list] = defaultdict(list)
     for c in cards:
         groups[(c["src"], c["project"], c["week"])].append(c)
@@ -134,6 +197,8 @@ def table(cards) -> list[dict]:
         row = {"src": src, "project": proj, "week": week, "cards": len(cs)}
         for m in METRICS:
             row[m] = _rate(cs, m)
+        for m in ADHERENCE:
+            row[m] = _adherence(cs, m)
         rows.append(row)
     return rows
 
@@ -262,17 +327,20 @@ def health(cards, *, now: datetime | None = None) -> dict:
 
 
 def report(ledger_rows, *, adoption: dict | None = None, snapshots=None, notes: dict | None = None,
-           now: datetime | None = None, days: int = 28) -> dict:
-    cards = card_rows(ledger_rows, adoption=adoption, snapshots=snapshots, notes=notes, now=now)
+           title_answers: dict | None = None, now: datetime | None = None, days: int = 28) -> dict:
+    cards = card_rows(ledger_rows, adoption=adoption, snapshots=snapshots, notes=notes,
+                      title_answers=title_answers, now=now)
     comp = []
     for treat, ctrl in (("w", "x"), ("e", "w"), ("h", "w")):
         for m in ("m1", "m2", "m3", "d1"):
             comp.append(mantel_haenszel(cards, treat, ctrl, m))
     return {
         "days": days, "cards": len(cards),
-        "by_source": {s: {"cards": n, **{m: _rate([c for c in cards if c["src"] == s], m) for m in METRICS}}
+        "by_source": {s: {"cards": n, **{m: _rate([c for c in cards if c["src"] == s], m) for m in METRICS},
+                          **{m: _adherence([c for c in cards if c["src"] == s], m) for m in ADHERENCE}}
                       for s, n in sorted(Counter(c["src"] for c in cards).items())},
         "table": table(cards),
+        "adherence": {"by_source_week": adherence_by_source_week(cards), "chance": CHANCE_NOTE},
         "compare": comp,
         "ipw_uniform": [ipw_uniform(cards, m) for m in ("m1", "m2")],
         "x_only_lever_lift": [x_only_lever_lift(cards, m) for m in ("m1", "m2")],
@@ -291,6 +359,19 @@ def format_report(rep: dict) -> str:
             r = row[m]
             cells.append(f"{r['y']}/{r['n']}" + (f" ({r['rate']:.0%})" if r["rate"] is not None else ""))
         lines.append(f"  {s:<8} {row['cards']:>5}   " + "   ".join(f"{c:<12}" for c in cells))
+    by_week = (rep.get("adherence") or {}).get("by_source_week") or []
+    if by_week:
+        def _adh(r: dict) -> str:
+            return f"{r['y']}/{r['n']}" + (f" ({r['rate']:.0%}, 碰巧 {r['chance']:.0%})" if r["rate"] is not None else "")
+        lines.append("牌面对不对得上(对上 / 读得到的; 内容形式和杠杆看发出去那篇的标签, 标题问句看销账那一版):")
+        lines.append("  来源     周          内容形式                 情绪杠杆                 标题问句")
+        for s, row in rep["by_source"].items():
+            if any(row[m]["n"] for m in ADHERENCE):
+                lines.append(f"  {s:<8} {'全部':<9} " + "   ".join(f"{_adh(row[m]):<22}" for m in ADHERENCE))
+            for r in by_week:
+                if r["src"] == s:
+                    lines.append(f"  {s:<8} {r['week']:<11} " + "   ".join(f"{_adh(r[m]):<22}" for m in ADHERENCE))
+        lines.append(f"  注: {rep['adherence']['chance']}")
     lines.append("比较(Mantel–Haenszel, 按项目分层):")
     for c in rep["compare"]:
         if c["strata"]:

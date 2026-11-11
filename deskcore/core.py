@@ -11116,6 +11116,16 @@ def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, ho
     return out
 
 
+def _same_miss_score(stored, now_score: float | None) -> bool:
+    """对照里存着的 score(REAL, 读回来带单精度的尾巴)和这晚算的是不是同一个数: 都没有算一样, 保留三位小数之后相等算一样。"""
+    if stored is None or now_score is None:
+        return stored is None and now_score is None
+    try:
+        return abs(float(stored) - round(float(now_score), 3)) < 5e-4
+    except (TypeError, ValueError):
+        return False
+
+
 def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             write_tv: bool = False, since: str | None = None,
             rematch: bool = False) -> dict:
@@ -11133,7 +11143,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
       3. tvlink.match_note 逐条判: body_exact / title_exact / fuzzy / ambiguous /
          unmatched。TV 自己已经带 source_autowriter_version_id 的直接记 tv_lineage。
       4. unmatched → ingest_published(剥掉话题标签, source="tv:<项目>", 不过闸,
-         按全文幂等), 建成的 version_id 记回对照。
+         按全文幂等), 建成的 version_id 记回对照。对不上的(unmatched / ingested)那一行
+         的 score 记这篇帖和写作台的稿子最像到什么程度(见下面 miss_score), 只是读数。
       5. 对照写进 tv_note_links(upsert, 按 note_id)。已经对上、TV 正文指纹没变的
          笔记跳过 —— 每天跑一次, 增量。指纹变了的(W-34, 10-27)核一下还是不是
          那一篇: 是就只记指纹、差异按现在的正文重算; 整篇换了就按内容重对, 挪之前
@@ -11189,11 +11200,21 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     weak_amb: dict[str, tvlink.Match] = {}  # 只因为标题一样才分不出的(F04 复审): 先进补录名单对底稿, 补录之前再分
     ingested_drift: dict[str, tuple] = {}  # 补录的帖正文改过了(F07): note_id → (笔记, 项目, 版本), 文字记进指纹库之后才记指纹
     ingested_seed: dict[str, str] = {}     # 017 之前补录的、正文和那一版一样: 只记指纹(F07)
+    # 对不上的帖和写作台的稿子最像到什么程度(2026-11-11, 审计 F4): note_id → 这晚看过的最高包含度(存过档的版本、只查过重的
+    # 底稿都算)。记进 unmatched / ingested 那一行的 score —— 以前这两种一律是 NULL, 看不出帖是在别处写的(接近 0)还是拿写作台
+    # 的稿子改的。只是个读数: 不参与判定, 不改哪一条走补录。没正文 / 帖太短没得比的不在里面(score 照旧 NULL)。
+    miss_score: dict[str, float] = {}
+
+    def _seen(n: tvlink.Note, m: tvlink.Match) -> None:
+        if m.score is not None:
+            miss_score[n.note_id] = max(miss_score.get(n.note_id, 0.0), float(m.score))
 
     def _link(n: tvlink.Note, kind: str, *, project_id=None, version_id=None,
               item_id=None, score=None, lag=None, candidates=None) -> dict:
         # tv_text_fp: 这一行是按现在的正文判的(W-34)。synced_to_tv_at 清空: 这一版还没写回过 TV(挪到新版本之后要再回填)。
         # 每行都带同样的键 —— PostgREST 批量写按键的并集、没带的补 NULL(假件 tests/fakes.py 同样如此)。
+        if score is None and kind in ("unmatched", "ingested") and n.note_id in miss_score:
+            score = round(miss_score[n.note_id], 3)
         return {"note_id": n.note_id, "tv_project_id": tv_project_id,
                 "project_id": project_id, "version_id": version_id, "item_id": item_id,
                 "match_kind": kind, "score": score, "lag_days": lag,
@@ -11242,6 +11263,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             # 没存档时, 底稿才是它的来源; 底稿也没认领的, 补录之前再分: 等人看(ambiguous)还是照常补录(见 weak_amb 那一段)
             counts["unmatched"] += 1
             weak_amb[n.note_id] = m
+            _seen(n, m)
             to_ingest.append(n)
             return
         counts[m.kind] += 1
@@ -11255,6 +11277,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 ambiguous_samples.append({"note_id": n.note_id, "title": n.title[:40],
                                           "candidates": m.candidates[:3]})
         else:
+            _seen(n, m)
             to_ingest.append(n)                         # 补录 / W-10 那里再带上 w34_note
 
     def _sample(n: tvlink.Note, prev: dict, m: tvlink.Match | None, why: str, *, move: bool = False) -> None:
@@ -11516,6 +11539,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 # 的照旧补录。等的上限同分不出的: 底稿过了 SNAPSHOT_MAX_AGE_DAYS 就不再参与(复审 on aw#132)
                 probe = tvlink.match_snapshot(dataclasses.replace(n, publish_time=tvlink._as_dt(now)), svers, sindex, index,
                                               max_lag=None)
+                _seen(n, probe)
                 if probe.kind != "unmatched":
                     snap["undated"] += 1
                     held.update([probe.version.version_id] if probe.version is not None else
@@ -11526,6 +11550,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                     rest.append(n)
                 continue
             m = tvlink.match_snapshot(n, svers, sindex, index)
+            _seen(n, m)
             if m.kind == "ambiguous":
                 # 分不出是哪一份底稿(或和存过档的版本分不出): 不补录(补成副本就再也认不回), 记 ambiguous 每晚重判,
                 # 同主索引的分不出一样等人看(tv-resolve); 底稿过了 SNAPSHOT_MAX_AGE_DAYS 就不再参与, 那时照常补录
@@ -11790,10 +11815,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         # 同样的 unmatched(没版本、没备注)的不再每晚重写一遍 —— RIO 782 行每晚只是刷一次 updated_at。
         # 照样重新对一次(写作台存了新版本还能对上); 上次带备注的(比如"没正文")照写, 把旧备注换掉。
         # W-34 挪过来的(上次是有版本的对照)不会走捷径: 它的旧对照有 version_id。
+        # 2026-11-11: 分数也要一样才算「同样的」—— 以前记的 unmatched 没有分数, 头一晚各重写一次把分数补上, 之后照旧不写。
         for n in to_ingest:
             prev = existing.get(n.note_id)
             if (prev and prev.get("match_kind") == "unmatched" and not prev.get("version_id")
-                    and not prev.get("candidates")):
+                    and not prev.get("candidates") and _same_miss_score(prev.get("score"), miss_score.get(n.note_id))):
                 unmatched_kept += 1
                 continue
             links.append(_link(n, "unmatched", candidates=w34_note.get(n.note_id)))
