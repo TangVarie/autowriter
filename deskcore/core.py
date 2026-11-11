@@ -29,6 +29,7 @@ import hashlib
 import json
 import concurrent.futures as cf
 import contextlib
+import copy
 import dataclasses
 import logging
 import os
@@ -56,7 +57,7 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
-from . import commentstyle, delivery, poststyle, rulecheck, rulecompile
+from . import calllog, commentstyle, delivery, poststyle, rulecheck, rulecompile
 from . import drawpolicy as dp
 from . import fingerprint as fp
 from . import priors, project_now, store, structure, tvlink, vocab
@@ -2978,11 +2979,56 @@ def _rejection_meta(drafts: list[dict], rejected: list[dict]) -> dict:
     return meta
 
 
+_SKILL_VERSION = re.compile(r"[0-9a-f]{12}")
+
+
+def _skill_versions_meta(health) -> dict | None:
+    """``skillcheck.health`` 的那份计数 → 存档那一行指标里的 ``skill_versions``: 近 24 小时报上来的 skill 版本里最新 / 旧版 /
+    没报各几个, 旧版各是哪一版。数的是「身份 × 版本」, 团队共用一个身份时读作有几种版本在用, 不是人数(同 /skill-versions)。
+    版本号只留认得出的 12 位十六进制: 认不出的那种是模型乱填的原文前 12 个字, 并进 ``other``, 原文不进指标。"""
+    if not isinstance(health, dict):
+        return None
+    counts = health.get("writers_24h") if isinstance(health.get("writers_24h"), dict) else {}
+    old: dict[str, int] = {}
+    for version, n in (health.get("outdated_versions") or {}).items():
+        key = version if isinstance(version, str) and _SKILL_VERSION.fullmatch(version) else "other"
+        old[key] = old.get(key, 0) + int(n or 0)
+    current = health.get("current")
+    block = {"current": current if isinstance(current, str) and _SKILL_VERSION.fullmatch(current) else None,
+             **{k: int(counts.get(k) or 0) for k in ("up_to_date", "outdated", "unknown")}}
+    if old:
+        block["outdated_versions"] = old
+    return block
+
+
+def _commit_side_meta(project_id, user_id, skill_versions) -> dict:
+    """存档那一行指标里另外三小块(2026-11-11, 审计 A3 / A8 / A5), 都只有数和固定的词, 哪一块出错就不带哪一块。**不抛**。
+
+      · ``flywheel_lessons``: 这一场借卡实际带出去几张经验卡、什么结局(_lessons_meta);
+      · ``skill_versions``: 近 24 小时报上来的 skill 版本构成(tools 层把 skillcheck.health 的结果传进来; 没传就不带);
+      · ``rule_compile``: 这个项目最近一次规则编译还有几条没编出来、是哪几种错(_rule_compile_meta; 本进程还没编过就不带)。
+    """
+    blocks: dict = {}
+    for key, make in (("flywheel_lessons", lambda: _lessons_meta(project_id, user_id)),
+                      ("skill_versions", lambda: _skill_versions_meta(skill_versions)),
+                      ("rule_compile", lambda: _rule_compile_meta(project_id))):
+        try:
+            block = make()
+        except Exception:                               # noqa: BLE001 — 少一小块, 不能连累这一行
+            logger.warning("commit_drafts: 指标里的 %s 没算出来(project=%s)", key, project_id, exc_info=True)
+            continue
+        if block is not None:
+            blocks[key] = block
+    return blocks
+
+
 def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
                            out: dict, *, flywheel: dict | None = None, checks: dict | None = None,
                            commit_parts: dict | None = None, judge_ops: str | None = None,
-                           judge_ledger: dict | None = None) -> tuple[str | None, dict]:
+                           judge_ledger: dict | None = None, skill_versions: dict | None = None) -> tuple[str | None, dict]:
     """耗时与判定结局落一行 ``batch_metrics`` + 一行结构化日志。**不抛**。
+
+    ``skill_versions``: tools 层传进来的 ``skillcheck.health`` 结果(见 _commit_side_meta), 只进 meta, 不进回包。
 
     回 ``(插进去那一行的 id, meta)``(没插成 id 是 None): 改稿的后台规则复查(AU-F07)把结果并进这份 meta 写回同一行。
 
@@ -3044,6 +3090,8 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
             **(checks or {}),
             # 被拒的按原因计数(W-31: 10-26 08:09 sportsix 20 篇全拒、written 0, 事后查不出为什么)
             **_rejection_meta(drafts, out.get("rejected") or []),
+            # 2026-11-11: 借卡带出去几张卡、skill 版本构成、规则还有几条没编出来 —— 只留数(见 _commit_side_meta)
+            **_commit_side_meta(project_id, user_id, skill_versions),
         }
         if out.get("angle_key_mismatch"):
             # 哪几篇的 key 对不上、错在哪、多长 —— 不留 key 本身(模型编的长串可能是一句描述)
@@ -4050,6 +4098,48 @@ def _comment_label(c: dict, i: int) -> str:
     return f"位 {sid}" if sid else f"第 {i + 1} 条"
 
 
+# ── 调用留痕里评论那一块的数(2026-11-11, deskcore/calllog.py, docs/deskcore.md §3.8) ─────────────────────────────
+# 回包里只有要改的那几句话, 数不出「哪一样检查打回了几条」「帖子是怎么对上的」。这几个函数把数记给这一次调用的那一行
+# (calllog.note): 只有条数、固定的词和 8 位代号, 评论、帖子、规则的字一个都不记; 不改回包。没人在收(CLI、用例直接调 core)
+# 时 note 什么都不做。
+def _post_source(note: dict | None) -> str:
+    """帖子是怎么对上的: ``tv``(按链接)/ ``tv_by_text``(按贴来的正文)/ ``pasted``(没对上 TV 的笔记)。"""
+    return "pasted" if note is None else "tv_by_text" if note.get(TV_BY_TEXT_FLAG) else "tv"
+
+
+def _post8(note: dict | None, body: str) -> str:
+    """这篇帖子的 8 位代号, 只给调用留痕按帖子归并用(同一篇帖子的评论判了几次): 对上 TV 笔记的按笔记号算, 没对上的按贴来的
+    正文(去掉空白)算。是 sha256 的前 8 位, 还原不出笔记号和正文; 这两样本身都不记。"""
+    key = (f"note:{note.get('note_id')}" if note is not None and note.get("note_id")
+           else "body:" + "".join((body or "").split()))
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+
+
+def _note_comment_counts(cands: list[dict], earlier: list[str]) -> None:
+    """这一组几条、带了几条前面判过的、几条没带评论位、写法底线每样打回几条(只看每条自己的那五样, 不含整组的)。"""
+    if not calllog.active():
+        return
+    kinds: dict[str, int] = {}
+    for c in cands:
+        for kind in commentstyle.issue_kinds(c["text"]):
+            kinds[kind] = kinds.get(kind, 0) + 1
+    calllog.note(n=len(cands), earlier=len(earlier), no_slot=sum(1 for c in cands if not c["slot"]), style=kinds)
+
+
+def _note_comment_checks(checks: dict) -> None:
+    """整组那几样各打回几条: 提品牌超出、重复的说法或开头、品牌收尾超出(都是条数), 短评、中性还差几条。没数的那一样不记
+    (项目没定这一项; 中性要判定结果, 没判成就没数)。"""
+    fields = {"repeats": len((checks.get("repeats") or {}).get("flagged") or ()),
+              "endings_over": len((checks.get("ends") or {}).get("excess") or ())}
+    if checks.get("brand") is not None:
+        fields["brand_over"] = len(checks["brand"].get("excess") or ())
+    if checks.get("short") is not None:
+        fields["short_by"] = int(checks["short"].get("short_by") or 0)
+    if (checks.get("neutral") or {}).get("checked"):
+        fields["neutral_by"] = int(checks["neutral"].get("short_by") or 0)
+    calllog.note(**fields)
+
+
 def _set_checks(cands: list[dict], style: list[list[str]], project: dict, cfg: dict | None,
                 earlier=(), existing=()) -> dict:
     """拿到项目之后、判之前, 代码数整组(2026-11-09 品牌收尾, 2026-11-10 配比和重复)。只读文字, 不调模型。
@@ -4536,7 +4626,8 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
             # 按正文对上的是尽力而为: 评论读不到就当没对上, 照贴来的正文写(和原来一样), 不让写评论报错
             logger.exception("comments_for: 按正文对上的笔记读评论失败, 照贴来的正文写 (note=%s)", note.get("note_id"))
             note = None
-    source = "pasted" if note is None else "tv_by_text" if note.get(TV_BY_TEXT_FLAG) else "tv"
+    source = _post_source(note)
+    calllog.note(source=source, post8=_post8(note, body))
     if note is not None:
         rows.sort(key=lambda r: (r.get("comment_order") is None, r.get("comment_order") or 0))
         existing = [{"order": r.get("comment_order"), "role": r.get("comment_role"),
@@ -4774,6 +4865,7 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         raise CommentInputError(f"同一个 slot id 一次只能用在一条评论上({' / '.join(dup)} 重复了): 每个 id 留一条, "
                                 "其余几条去掉 slot, 整组再送一次(不用分几次判, 也不用另编 id)")
     style = [comment_style_issues(c["text"]) for c in cands]
+    _note_comment_counts(cands, earlier)
     # 查帖子(链接 → TV → 项目 → 归属)也算进同一个截止: PostgREST 默认等 120 秒, 库一卡就远超 MCP 客户端 ~22 秒的
     # 容忍(codex review on aw#107; 同 _judge_tool_call / codex #95 的做法)。参数检查在这之前, 不碰库。
     # 2026-11-10: 帖子下已有的评论(TV 的评论 + 项目配的那一格)也在这里一起读, 一样算进截止。
@@ -4792,8 +4884,10 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
     if ctx["missing"] is not None:
         return ctx["missing"]
     project, title, body, _note, cfg = ctx["project"], ctx["title"], ctx["body"], ctx["note"], ctx["cfg"]
+    calllog.note(source=_post_source(_note), post8=_post8(_note, body), existing=len(ctx["existing"]))
     # 整组那几样(2026-11-09 品牌收尾, 11-10 配比和重复): 拿到项目才知道品牌叫法和配比。只读文字, 不调模型; 判定服务没判成时照样回
     checks = _set_checks(cands, style, project, cfg, earlier, ctx["existing"])
+    _note_comment_checks(checks)
     send_max = max_named
     extra: dict = {}
     if ctx["cfg_note"]:
@@ -4829,6 +4923,7 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
             out["thread_hints"] = (out.get("thread_hints") or []) + hints_extra
         return out
     _neutral_check(checks, per_comment)
+    _note_comment_checks(checks)                        # 中性判完才数得出来, 补记一次
     set_line, set_fail = _set_line(checks)
     rows, review = [], []
     for i, (c, v) in enumerate(zip(cands, per_comment)):
@@ -5374,7 +5469,8 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
 
 
 def commit_drafts(client, project_id: str, drafts: list[dict],
-                  *, user_id: str | None = None, flywheel_arm: str | None = None, tactic: str = "") -> dict:
+                  *, user_id: str | None = None, flywheel_arm: str | None = None, tactic: str = "",
+                  skill_versions: dict | None = None) -> dict:
     """定稿入库: 写指纹(同一事务内重查) + 给坐标销账。
 
     只收真正定稿的 —— 指纹库脏了(把废稿也记进去)会让后续正常选题被误杀。
@@ -6113,7 +6209,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                        "judge": judge_ms, "project_isolation": _ms_since(isolation_started), "total": out["elapsed_ms"]}
     row_id, metrics_meta = _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta,
                                                   checks=post_meta, commit_parts=commit_parts, judge_ops=judge_ops,
-                                                  judge_ledger=judge_ledger)
+                                                  judge_ledger=judge_ledger, skill_versions=skill_versions)
     # 改过重存的那几版在后台按编译好的规则复查一次, 结果只进这一行指标(AU-F07, 见 _revision_rule_recheck 上面那段)
     _schedule_revision_recheck(client, project_id, user_id, out, tactic, row_id, metrics_meta)
     # 排在它后面: 这个项目还没有规则题答案的旧稿补查一轮(见 _rule_sweep 上面那段)。不进回包, 不写这一行指标
@@ -6855,6 +6951,17 @@ MIGRATION_TV_NOTES_VANISHED = "016_tv_notes_skip_vanished.sql"
 MIGRATION_TV_TEXT_FP = "017_tv_link_text_fp.sql"
 # 018 建 draft_snapshots(W-38: 查重时记下的底稿, tv-sync 拿飞书的帖来对)。表探得到。
 MIGRATION_DRAFT_SNAPSHOTS = "018_draft_snapshots.sql"
+# 019 换 deskcore_check_drafts / deskcore_commit_fingerprints 取候选的那一步(先走四字串的 GIN 索引、再筛项目, W-21),
+# 签名和返回列没动 —— 同 008 / 016, 探不到。两个记号缺一个就退回慢路(MATERIALIZED 挡项目条件下推, (SELECT ng) 对计划器
+# 藏起数组的值), 所以两列都查; 先剥注释(注释里也写着这两个词)。
+MIGRATION_DEDUP_GIN_FIRST = "019_dedup_gin_first.sql"
+MIGRATION_019_PROBE_SQL = (
+    "select p.proname, "
+    r"regexp_replace(p.prosrc, '--[^\n]*', '', 'g') like '%cand AS MATERIALIZED (%' as gin_first, "
+    r"regexp_replace(p.prosrc, '--[^\n]*', '', 'g') like '%f.ngram_hashes && (SELECT ng)%' as array_hidden "
+    "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
+    "where n.nspname='autowriter' and p.proname in ('deskcore_check_drafts','deskcore_commit_fingerprints');"
+)
 MIGRATION_016_PROBE_SQL = (
     "select p.prosrc like '%v_notes_vanished%' as skips_vanished, "
     "to_regclass('truth_vault.v_notes_vanished') is not null as view_present "
@@ -7252,6 +7359,15 @@ def migration_state(client) -> dict:
     _add(MIGRATION_DRAFT_SNAPSHOTS, "表 draft_snapshots", state, note,
          "可降级(但该先跑 018 再部署): check_drafts 照常判, 只是不记底稿(记 WARN); tv-sync 跳过底稿那一遍、照旧补录 —— "
          "模型没调 score_drafts 的稿子发出去以后认不回写作台(当外面写的补录成副本, 牌不销、没有改稿差异)")
+
+    # ── 019: 查重取候选先走 GIN(W-21)。只换了两条函数的函数体, 调用侧看跑没跑过完全一样 —— 与 008 / 016 同类,
+    #    如实报 unprobeable 并交出 SQL。缺席不影响结论, 只是慢, 所以不让报告变红。
+    _add(MIGRATION_DEDUP_GIN_FIRST,
+         "deskcore_check_drafts / deskcore_commit_fingerprints 取候选先走 GIN(函数体)",
+         "unprobeable",
+         "PostgREST 读不到函数体; 用 SQL Editor 跑(两行、四个 true): " + MIGRATION_019_PROBE_SQL,
+         "缺席→查重的结论不变, 只是慢: 取候选按项目把历史指纹逐行比一遍, 耗时跟项目的历史条数涨(千行的项目每篇约 0.4 秒, "
+         "10 篇一组在查重、入库前重查、入库写指纹三处各等 3~5 秒)")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -8421,9 +8537,82 @@ RULE_COMPILE_RESEND_CHUNK = 3
 # 自己超时, 60 条全失败就是 20 个请求, 后台别的项目一直排在这一个后面
 RULE_COMPILE_RESEND_BUDGET_SEC = 600.0
 _RULE_COMPILE_LOG_IDS = 20                                    # 那行 WARNING 最多列几条规则
-_COMPILE_ERROR_KINDS = (("模型输出不合格", "bad_output"), ("没有编出结果", "no_result"), ("没编出结果", "no_result"),
-                        ("回包里没有这条", "missing"), ("对不上", "sha_mismatch"))
-_GENERATOR_FAILURE = re.compile(r"生成端调用失败：([A-Za-z_][A-Za-z0-9_]{0,39})(?:.*?\bHTTP (\d{3}))?")
+
+
+# 2026-11-11(审计 A5): 每个项目最近一次编译的收场, 只留数和固定的错误种类, 给存档那一行指标(batch_metrics.meta.rule_compile)。
+# 原来「这个项目还有几条规则没编出来、是拒答还是超时」只在 Railway 日志里。project_id → {at(monotonic), status, uncompiled,
+# not_compilable, error_kinds, kinds_at}; 改它要握着 _RULE_COMPILE_LOCK。进程内存, 重启就没(那时指标里没有这一块)。
+_RULE_COMPILE_LAST: dict[str, dict] = {}
+# Jev 回的每条规则的 error(judge/rules.py 的 compile_batch)和这边自己记的几句 → 固定的种类。按顺序认, 先认到的算。
+# 拆小重发之后那一行 WARNING 和存档指标里的 error_kinds 用的是同一套词(_compile_error_kind)
+_COMPILE_ERROR_KINDS = (
+    (re.compile(r"stop_reason=refusal"), "refusal"),
+    (re.compile(r"stop_reason=max_tokens"), "truncated"),
+    (re.compile(r"生成端调用失败.*?HTTP (\d{3})"), "generator_http"),
+    (re.compile(r"生成端调用失败.*?(?:[Tt]imed? ?out|超时)"), "generator_timeout"),
+    (re.compile(r"生成端调用失败"), "generator_failed"),
+    (re.compile(r"模型输出不合格"), "bad_output"),
+    (re.compile(r"对不上"), "sha_mismatch"),
+    (re.compile(r"回包里没有这条"), "missing_in_response"),
+    (re.compile(r"编译期间被删"), "rule_deleted"),
+    (re.compile(r"没有?编出结果"), "no_result"),
+)
+
+
+def _compile_error_kind(error, status: str | None = None) -> str:
+    """一条规则没编出来的原因 → 固定的种类(``refusal`` / ``truncated`` / ``generator_http_529`` / ``generator_timeout`` /
+    ``bad_output`` …), 给日志和指标用。**只回种类, 不带 Jev 的原文**: 「模型输出不合格」后面跟着的是模型那段输出的毛病,
+    里面可能有规则的字。认不出来的回 ``status``(调用方给的这一批的结局: jev_failed / error …), 再没有就是 ``other``。"""
+    text = str(error or "")
+    for rx, kind in _COMPILE_ERROR_KINDS:
+        m = rx.search(text)
+        if m:
+            return f"{kind}_{m.group(1)}" if m.groups() else kind
+    return str(status or "other")
+
+
+def _note_compile_outcome(project_id: str, out: dict, kinds: dict[str, int], *, counted: bool) -> None:
+    """compile_rules 收场时记一笔(见 _RULE_COMPILE_LAST)。``kinds`` 是这一轮没编出来的按种类各几条, compile_rules 自己数的:
+    **拆小重发之后**还没编出来的才算(重发编出来的不算, 第一次整批没成而重发了的按重发的结局算, 不按第一次那一批再数一遍);
+    整批被挡 / 读超时没重发的那一批按 ``batch_<结局>`` 记条数。``counted`` = 规则池和缓存都读出来了, 「还有几条没编出来」
+    数得出; 读不出来的那两种收场只记结局。这一轮没发(都在「编失败 6 小时内不重编」里)而上一轮记过错误种类的, 种类沿用
+    上一轮的(``kinds_at`` 是它们记下的时刻)。**不抛**。"""
+    try:
+        kinds = dict(kinds or {})
+        uncompiled = None
+        if counted:
+            uncompiled = max(0, int(out.get("held_after_failure") or 0) + int(out.get("to_compile") or 0)
+                             - int(out.get("compiled") or 0))
+        now = time.monotonic()
+        with _RULE_COMPILE_LOCK:
+            prev = _RULE_COMPILE_LAST.get(str(project_id)) or {}
+            kinds_at = now
+            if not kinds and uncompiled and prev.get("error_kinds"):
+                kinds, kinds_at = prev["error_kinds"], prev.get("kinds_at", now)
+            _RULE_COMPILE_LAST[str(project_id)] = {
+                "at": now, "status": str(out.get("status") or ""), "uncompiled": uncompiled,
+                "not_compilable": len(out.get("not_compilable") or []), "error_kinds": kinds, "kinds_at": kinds_at}
+    except Exception:                                        # noqa: BLE001 — 只是给指标攒数, 不能碰编译
+        logger.debug("没记下这次编译的收场(project=%s)", project_id, exc_info=True)
+
+
+def _rule_compile_meta(project_id) -> dict | None:
+    """存档那一行指标里的 ``rule_compile``: 这个项目最近一次编译(后台补编 / CLI)的结局、还有几条规则没编出来
+    (``uncompiled``; 读不出规则池时没有这个键)、编不了的几条(``not_compilable``: 原文超过 Jev 的上限之类)、没编出来的按
+    错误种类各几条(``error_kinds``)、这是多久之前的数(``age_s``)。本进程还没编过这个项目(刚重启)回 None, 不带这一块。"""
+    now = time.monotonic()
+    with _RULE_COMPILE_LOCK:
+        last = dict(_RULE_COMPILE_LAST.get(str(project_id)) or {})
+    if not last:
+        return None
+    block = {"status": last["status"], "not_compilable": last["not_compilable"], "age_s": int(now - last["at"])}
+    if last["uncompiled"] is not None:
+        block["uncompiled"] = last["uncompiled"]
+    if last["error_kinds"]:
+        block["error_kinds"] = dict(last["error_kinds"])
+        if last["kinds_at"] != last["at"]:
+            block["error_kinds_age_s"] = int(now - last["kinds_at"])
+    return block
 
 
 def _jev_slow_now() -> bool:
@@ -8434,20 +8623,6 @@ def _jev_slow_now() -> bool:
 
 def _compile_error(text) -> str:
     return mask_secrets(str(text or ""))[:_RULE_COMPILE_ERROR_MAX]
-
-
-def _compile_error_kind(error, status: str | None = None) -> str:
-    """一条规则没编出来的原因归成一个短词, 给日志用。**不带 Jev 的原文**: 「模型输出不合格」后面跟着的是模型那段输出的
-    毛病, 里面可能有规则的内容。生成端没调通的带异常类名和 HTTP 状态码(generator_GeneratorHTTPError_529), 认不出来的
-    回这一批的结局(``status``: jev_failed / error …), 再没有就是 other。"""
-    text = str(error or "")
-    m = _GENERATOR_FAILURE.search(text)
-    if m:
-        return "generator_" + m.group(1) + (f"_{m.group(2)}" if m.group(2) else "")
-    for mark, kind in _COMPILE_ERROR_KINDS:
-        if mark in text:
-            return kind
-    return str(status or "other")
 
 
 def _mock_model(model) -> bool:
@@ -8522,12 +8697,19 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
     t0 = time.monotonic()
     out: dict = {"project_id": project_id, "status": None, "pool": 0, "cached": 0, "to_compile": 0, "compiled": 0,
                  "verdicts": {}, "errors": [], "not_compilable": [], "batches": 0, "calls": 0, "elapsed_ms": 0}
+    # 这一轮没编出来的按种类各几条, 给存档指标(_note_compile_outcome): 拆小重发之后的结局。不进报告
+    kinds: dict[str, int] = {}
 
-    def _done(status: str, detail: str | None = None) -> dict:
+    def _kind(kind: str, n: int = 1) -> None:
+        kinds[kind] = kinds.get(kind, 0) + n
+
+    def _done(status: str, detail: str | None = None, *, counted: bool = True) -> dict:
         out["status"] = status
         if detail:
             out["detail"] = _compile_error(detail)
         out["elapsed_ms"] = _ms_since(t0)
+        if status != "dry_run":                              # 只数不发的那一趟不算一次编译的收场
+            _note_compile_outcome(project_id, out, kinds, counted=counted)
         return out
 
     if user_id:
@@ -8542,7 +8724,7 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
         hard, soft = store.shared_memories(client, project_id, owner, vectors=False)
     except Exception as exc:                                 # noqa: BLE001 — 报告里说清, 不抛
         logger.exception("compile_rules: 读规则池失败(project=%s)", project_id)
-        return _done("error", f"读规则池失败: {type(exc).__name__}: {exc}")
+        return _done("error", f"读规则池失败: {type(exc).__name__}: {exc}", counted=False)
     items: dict[str, tuple[dict, str]] = {}
     for r in hard + soft:
         item, sha = rulecompile.compile_input(r)
@@ -8555,7 +8737,8 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
         cached = store.rule_compiles_for(client, list(items))
     except Exception as exc:                                 # noqa: BLE001
         logger.exception("compile_rules: 读 rule_compiles 失败(project=%s)", project_id)
-        return _done("error", f"读 rule_compiles 失败(migrations/015 跑了吗?): {type(exc).__name__}: {exc}")
+        return _done("error", f"读 rule_compiles 失败(migrations/015 跑了吗?): {type(exc).__name__}: {exc}",
+                     counted=False)
     todo = [(it, sha) for mid, (it, sha) in items.items() if force or (mid, sha) not in cached]
     if seen:
         same_run = sum(1 for it, sha in todo if (it["id"], sha) in seen)
@@ -8587,8 +8770,13 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
             seen.update((it["id"], sha) for it, sha in todo)
         return _done("dry_run")
 
-    def _failed(mid: str, sha: str, error: str) -> None:
+    def _why(error, status: str | None = None) -> str:
+        """这条规则没编出来的种类。``status`` 是它所在的那次请求整批没成的结局(有的话): 原因认不出来就记 batch_<结局>。"""
+        return _compile_error_kind(error, f"batch_{status}" if status else None)
+
+    def _failed(mid: str, sha: str, error: str, status: str | None = None) -> None:
         out["errors"].append({"memory_id": mid, "error": _compile_error(error)})
+        _kind(_why(error, status))
         with _RULE_COMPILE_LOCK:
             _RULE_COMPILE_FAILED[(mid, sha)] = _failed_at(error)
 
@@ -8658,6 +8846,7 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
                                len(gone), len(rows) - len(gone), project_id, exc)
                 for r in gone:                               # 规则没了, 不记 _RULE_COMPILE_FAILED
                     out["errors"].append({"memory_id": r["memory_id"], "error": "规则编译期间被删, 结果没存"})
+                    _kind("rule_deleted")
                 rows = [r for r in rows if r["memory_id"] in alive]
                 store.rule_compiles_upsert(client, rows)
         except Exception as exc:                             # noqa: BLE001
@@ -8695,9 +8884,10 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
 
     resend_started: list[float] = []
 
-    def _resend(bad: list[tuple[dict, str, str]], unsent: int) -> bool:
+    def _resend(bad: list[tuple[dict, str, str]], unsent: int, first: str | None = None) -> bool:
         """没编出来的这几条拆成每次最多 RULE_COMPILE_RESEND_CHUNK 条, 马上各重发一次(见 RULE_COMPILE_RESEND_CHUNK 上面那段)。
-        重发还失败的才记失败。回 False = 整次运行该停了(重发时整批被挡 / 读超时, 或者写不进库)。"""
+        重发还失败的才记失败。``first`` = 第一次是整批没成的话那一批的结局(没轮到重发的几条按它归类)。
+        回 False = 整次运行该停了(重发时整批被挡 / 读超时, 或者写不进库)。"""
         nonlocal batch_status
         if not resend_started:
             resend_started.append(time.monotonic())
@@ -8711,8 +8901,8 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
             rest = bad[j:]
             if time.monotonic() - resend_started[0] > RULE_COMPILE_RESEND_BUDGET_SEC:
                 for it, sha, err in rest:                     # 到点了: 剩下的照第一次的失败记, 下次再来
-                    _failed(it["id"], sha, err)
-                    still.append((it["id"], _compile_error_kind(err), "not_resent"))
+                    _failed(it["id"], sha, err, first)
+                    still.append((it["id"], _why(err, first), "not_resent"))
                 break
             res = _send([(it, sha) for it, sha, _ in chunk], resend=True)
             status = res["judge_status"]
@@ -8721,8 +8911,8 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
                 batch_status = status
                 _batch_failed(status, len(chunk), res.get("detail"))
                 for it, sha, err in rest:
-                    _failed(it["id"], sha, err)
-                    still.append((it["id"], _compile_error_kind(err), status))
+                    _failed(it["id"], sha, err, first)
+                    still.append((it["id"], _why(err, first), status))
                 _stop(status, [(it, sha) for it, sha, _ in chunk], unsent)
                 carry_on = False
                 break
@@ -8733,12 +8923,12 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
                 rows, again = _read([(it, sha) for it, sha, _ in chunk], res["response"])
                 status = None
             for it, sha, err in again:
-                _failed(it["id"], sha, err)
-                still.append((it["id"], _compile_error_kind(err, status), None))
+                _failed(it["id"], sha, err, status)
+                still.append((it["id"], _why(err, status), None))
             if not _store(rows):
                 for it, sha, err in bad[j + step:]:           # 库写不进去: 后面的不再发(再编也是白花钱), 照第一次的失败记
-                    _failed(it["id"], sha, err)
-                    still.append((it["id"], _compile_error_kind(err), "not_resent"))
+                    _failed(it["id"], sha, err, first)
+                    still.append((it["id"], _why(err, first), "not_resent"))
                 carry_on = False
                 break
         recovered = out["compiled"] - compiled_before
@@ -8774,18 +8964,20 @@ def compile_rules(client, project_id: str, *, user_id: str | None = None, force:
                     with _RULE_COMPILE_LOCK:
                         for it, sha in part:
                             _RULE_COMPILE_FAILED[(it["id"], sha)] = now
+                _kind(f"batch_{batch_status}", len(part))     # 这一批不重发: 按整批的结局记条数
                 _stop(batch_status, part, unsent)
                 break
             # Jev 失败 / 出错(答了、一条都没编出来): 可能是这批里某一条的事, 拆小重发一次, 重发还失败的才按规则记失败。
             # 502 是 Jev 生成端过载(没计费)的只扣 RULE_COMPILE_TRANSIENT_RETRY_SEC(见 _failed_at; 独立复审 on aw E)
-            bad = [(it, sha, res.get("detail")) for it, sha in part]
+            bad, first = [(it, sha, res.get("detail")) for it, sha in part], batch_status
         else:
             rows, bad = _read(part, res["response"])
+            first = None
             if not _store(rows):
                 for it, sha, err in bad:                     # 库写不进去就停, 这几条不重发, 照这一次的失败记
                     _failed(it["id"], sha, err)
                 break
-        if bad and not _resend(bad, unsent):
+        if bad and not _resend(bad, unsent, first):
             break
     if out.get("write_error"):
         return _done("error", "编出来了但写不进 rule_compiles(migrations/015 跑了吗?): " + out["write_error"])
@@ -9955,6 +10147,49 @@ def _note_patterns_shown(project_id, user_id, arm: str, shown: int, *, carry: bo
         _patterns_shown[key + (arm,)] = recs + [(at, n)]
 
 
+# 2026-11-11(审计 A3): 这一场到底带出去几张经验卡, 库里原来没有(batch_metrics 只有规律条数 flywheel_patterns_shown)。
+# open_project 借卡常常等不到(冷的时候十几秒到几十秒), 「没拿到卡的场」有多少一直量不出来。借卡把结果交出去的那一刻
+# (和 _note_patterns_shown 同一个位置: 简报实际带出去的那一份, 后台线程之后选完的不算)记一条 (时刻, 卡数, 结局),
+# 存档时把近 _ARM_REPORT_TTL 的几条摘成一小块写进 batch_metrics.meta.flywheel_lessons(_lessons_meta)。
+# 只进这一行指标: 不进 batches.params、不进回包、不碰分臂和规律条数那套账。进程内存, 重启就没(那时 borrows 是 0 = 不知道)。
+# 团队共用一个身份时分不出是哪一场借的, 所以最近一次和最多的一次都记: max 是 0 才能确定这一批没参照过卡。
+_lessons_shown: dict[tuple[str, str], list[tuple[datetime, int, str]]] = {}
+# 这一行指标里多出来的一种结局(2026-11-11, 审计 A3): borrow_lessons 等了 BORROW_LESSONS_WAIT_SEC 卡还没选完。回包里的
+# status 还是 timeout(协议里列的那五种不变), 只有这一行记成另一个名字 —— 简报超时(timeout)之后补借也没等到的场,
+# statuses 里是 {timeout: 1, followup_timeout: 1}, 数得出来。
+LESSONS_FOLLOWUP_TIMEOUT = "followup_timeout"
+
+
+def _note_lessons_shown(project_id, user_id, out: dict, *, status: str | None = None) -> None:
+    """借卡交出去之后记一条: 这一次带出去几张卡、什么结局(librarian_client 的 BORROW_*; ``status`` 另给了就记它 ——
+    borrow_lessons 自己等到点的那种记 LESSONS_FOLLOWUP_TIMEOUT, 和简报那次的 timeout 分得开)。只写进程内存。**不抛**。"""
+    try:
+        now = _utcnow()
+        key = (str(project_id), str(user_id or ""))
+        rec = (now, len(out.get("lessons") or []), str(status or out.get("status") or ""))
+        with _borrowed_arms_lock:
+            kept = [r for r in _lessons_shown.get(key, ()) if now - r[0] <= _ARM_REPORT_TTL]
+            _lessons_shown[key] = kept + [rec]
+    except Exception:                                   # noqa: BLE001 — 只是给指标攒数, 不能碰借卡
+        logger.debug("没记下这次借卡带出去几张卡(project=%s)", project_id, exc_info=True)
+
+
+def _lessons_meta(project_id, user_id) -> dict:
+    """存档那一行指标里的 ``flywheel_lessons``: 这个 (项目, 身份) 近 12 小时借过几次卡(``borrows``; 0 = 没借过或进程重启过,
+    不知道)、最近一次带出去几张和它的结局(``shown`` / ``status``)、最多的一次几张(``shown_max``)、各种结局各几次
+    (``statuses``)。只有数和固定的结局名。"""
+    now = _utcnow()
+    with _borrowed_arms_lock:
+        recs = [r for r in _lessons_shown.get((str(project_id), str(user_id or "")), ()) if now - r[0] <= _ARM_REPORT_TTL]
+    if not recs:
+        return {"borrows": 0}
+    statuses: dict[str, int] = {}
+    for _at, _n, status in recs:
+        statuses[status] = statuses.get(status, 0) + 1
+    return {"borrows": len(recs), "shown": recs[-1][1], "status": recs[-1][2],
+            "shown_max": max(n for _at, n, _status in recs), "statuses": statuses}
+
+
 def _shown_for(key: tuple[str, str], arm: str, issued: dict[str, datetime]) -> int | None:
     """这个臂发出去时实际给了几条规律。最近一次发臂还没记上(时刻和 issued 里的对不上 / 没记)就是不知道, 回 None;
     _ARM_REPORT_TTL 之内记过几次、条数不一样也是不知道(复审: 共用身份的几场叠在一起, 分不出这一批是哪一场的), 回 None。
@@ -10034,10 +10269,13 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     """
     project = assert_project_access(client, project_id, user_id=user_id)
     arm = _borrow_arm(project.get("id"), user_id, reuse=flywheel_arm)   # 这场已经有臂就沿用
-    out = _borrow_for_brief(project, delta, user_id=user_id, arm=arm)
-    # F13: 这次实际交出去几条规律, 记在这个臂旁边; 沿用了简报里的臂 = 同一场接着借, 和前面那次取大的
-    _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []),
-                         carry=flywheel_arm == arm)
+    # 2026-11-11(审计 A3 / F-04): 原来直接调 _borrow_for_brief, 等满 LIBRARIAN_TIMEOUT_SEC(60 秒), 客户端约 22 秒就断。
+    # 现在走限时的那一层: 最多等 BORROW_LESSONS_WAIT_SEC, open_project 起的那次选卡还在跑就等它(不再发第二次)。
+    # 臂在上面定好了传进去(那一层自己定的话会重新分, 不认传回的臂); 记账还是原来那两笔、原来的顺序 ——
+    # F13: 这次实际交出去几条规律, 记在这个臂旁边; 沿用了简报里的臂 = 同一场接着借(carry), 和前面那次取大的;
+    # A3: 这次带出去几张卡, 给存档那一行指标。到点没等到 = 这次交出去 0 条 / 0 张(后台之后选完的不算, 模型没看到)。
+    out = _borrow_for_brief_bounded(project, delta, float(config.BORROW_LESSONS_WAIT_SEC), user_id=user_id,
+                                    arm=arm, carry=flywheel_arm == arm, followup=True)
     if out.get("validated_patterns"):       # 用法同简报那份(10-20): 每篇最多一条、轮换、有几篇不用
         out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
                                                               len(out["validated_patterns"]))
@@ -10057,6 +10295,20 @@ _BORROW_NEEDS_ATTENTION = frozenset({
 })
 
 
+_BORROW_DELTA_KEYS = ("tactic", "draft_topic", "key_messages", "target_audience", "tone", "extra_instructions")
+
+
+def _borrow_request(project: dict, delta: dict | None, arm: str) -> dict:
+    """发给馆员的那份 brief: 项目行 + 本次 delta(多余的键丢掉, librarian_client.build_brief 只认契约里那几个)+ 臂。
+    _borrow_for_brief 发的、_borrow_running_key 取摘要的是同一份。会抛(build_brief 的意外), 调用方各自兜。"""
+    delta = delta or {}
+    brief = librarian_client.build_brief(project, **{k: (delta.get(k) or "") for k in _BORROW_DELTA_KEYS if delta.get(k)})
+    brief["consumer"] = "deskcore"
+    # 显式带 explore 才参与分臂 (TV 那边不带这个键的老消费方不下发规律)
+    brief["explore"] = arm == "explore"
+    return brief
+
+
 def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None = None,
                       arm: str | None = None) -> dict:
     """borrow_lessons 与 build_writing_brief 共用的借阅体。**绝不抛**。
@@ -10071,18 +10323,10 @@ def _borrow_for_brief(project: dict, delta: dict | None, *, user_id: str | None 
     所以 status 永远带, 且三种"要人管"的结局各记一条 WARN —— 这是 TV docs/27
     要求的"fail-open 要留痕": 服务日志里 grep 得到通道 2 到底为什么黑。
     """
-    delta = delta or {}
-    allowed = ("tactic", "draft_topic", "key_messages",
-               "target_audience", "tone", "extra_instructions")
-    kwargs = {k: (delta.get(k) or "") for k in allowed if delta.get(k)}
     st: dict = {}
     arm = arm or _borrow_arm(project.get("id"), user_id)
     try:
-        brief = librarian_client.build_brief(project, **kwargs)
-        brief["consumer"] = "deskcore"
-        # 显式带 explore 才参与分臂 (TV 那边不带这个键的老消费方不下发规律)
-        brief["explore"] = arm == "explore"
-        selected = librarian_client.fetch_flywheel_lessons(brief, status=st)
+        selected = librarian_client.fetch_flywheel_lessons(_borrow_request(project, delta, arm), status=st)
     except Exception as exc:  # noqa: BLE001 — 增强项, 失败不能拖垮简报
         logger.exception("flywheel borrow crashed (project_id=%s)", project.get("id"))
         st = {"state": librarian_client.BORROW_ERROR, "count": 0,
@@ -10129,60 +10373,145 @@ BORROW_TIMEOUT_NOTE = ("这次随简报借卡没来得及选完(选卡要跑一�
                        "只调这一次, 还是没有卡就照常写, 不用再调, 也别跟用户说没有可借的经验。")
 
 
+# borrow_lessons 自己等到点时 detail 里那句(念给模型的; 2026-11-11, 审计 A3)。上面那句是叫模型去调 borrow_lessons 的,
+# 放在 borrow_lessons 自己的回包里, 模型会照着再调一次、再等一轮 —— 所以另写一句: 照常写, 不用再调。
+BORROW_STILL_SELECTING_NOTE = "卡还在选, 这次没等到。照常写就行, 不用再调 borrow_lessons, 也别跟用户说没有可借的经验。"
+
+
+# 正在跑的选卡(2026-11-11, 审计 A3; TV 那头的同款合并是 AU-F09, 另做)。open_project 到点交了简报, 那次选卡还在后台跑;
+# 模型照提示调 borrow_lessons, 原来是再向馆员发一次 —— TV 那头第一次还没写缓存, 第二次就又跑一遍模型选卡(多花一次,
+# 还得从头等)。现在进程里记着正在跑的那几次: (项目, 发给馆员那份 brief 的摘要, 臂) → 那次选卡的 future。同一个键再来的
+# 不新起, 等同一个 future。
+#   · 键里有臂: 探索臂那次选卡不带规律, 规律臂的会话不能并上去(反过来也一样);
+#   · 键里没有身份: 同一个项目、同一份 brief、同一个臂, 选出来的是同一批卡(TV 的缓存键也不分人)。分臂和「给出去几条
+#     规律 / 几张卡」那几笔账不在选卡线程里记, 等的人各自在自己那头记(_borrow_for_brief_bounded 的 _shown), 并上去
+#     不动别人的账; 每个等的人拿到的是自己那份拷贝;
+#   · 选卡跑完(成了、抛了都算)在它自己线程的 finally 里摘掉。等的人到点只是不等了, 不取消、不摘 —— 选卡照样跑完,
+#     TV 照样写缓存, 这期间再来的人还并得上;
+#   · 只在这一个进程里有效(deskcore 单进程)。重启就没了, 那时退回原来的样子: 再发一次, 多半命中 TV 的缓存;
+#   · brief 拼不出来(摘要算不了)就不登记、不合并, 照原来各跑各的;
+#   · 只并到还在正常时限里的那一次(_borrow_joinable): 馆员那次请求最多 LIBRARIAN_TIMEOUT_SEC, 过了这个数还多十秒都没
+#     回来的是卡死的线程 —— 接着往上并, 这个键之后每次借卡都只能等到点。那种不并, 另起一次、把表里那一条换成新的。
+_borrows_running: dict[tuple[str, str, str], tuple[cf.Future, float]] = {}      # 键 → (future, 起跑时的 time.monotonic())
+_borrows_running_lock = threading.Lock()
+_BORROW_JOIN_GRACE_SEC = 10.0
+
+
+def _borrow_joinable(running: tuple[cf.Future, float] | None) -> cf.Future | None:
+    """表里那一条还能不能并上去: 起跑不超过 LIBRARIAN_TIMEOUT_SEC + _BORROW_JOIN_GRACE_SEC 的回它的 future, 否则 None。"""
+    if running and time.monotonic() - running[1] <= float(config.LIBRARIAN_TIMEOUT_SEC) + _BORROW_JOIN_GRACE_SEC:
+        return running[0]
+    return None
+
+
+def _borrow_running_key(project: dict, delta: dict | None, arm: str) -> tuple[str, str, str] | None:
+    """这次选卡在 _borrows_running 里的键: (项目, 发给馆员那份 brief 的 sha256, 臂)。算不出来回 None(不合并)。"""
+    try:
+        text = json.dumps(_borrow_request(project, delta, arm), sort_keys=True, ensure_ascii=False, default=str)
+        return str(project.get("id")), hashlib.sha256(text.encode("utf-8")).hexdigest(), arm
+    except Exception:  # noqa: BLE001 — 同样的意外 _borrow_for_brief 里会再碰到一次, 在那里留痕
+        return None
+
+
+def _run_borrow(fut: cf.Future, key, project: dict, delta: dict | None, user_id, arm: str) -> None:
+    """选卡线程里跑的那一段: 不管怎么结束, 先把自己从 _borrows_running 里摘掉, 再把结果(或者异常)交给 ``fut``。
+    只摘自己那一条(同一个键后来又登记了别的一次, 不动它)。先摘后交: 等的人一拿到结果, 表里就已经没有这一条 ——
+    反过来的话, 紧跟着的下一次调用会并到一个已经跑完的 future 上, 拿到的是上一次的结果, 不是新选的。"""
+    try:
+        try:
+            out = _borrow_for_brief(project, delta, user_id=user_id, arm=arm)
+        finally:
+            if key is not None:
+                with _borrows_running_lock:
+                    if (_borrows_running.get(key) or (None,))[0] is fut:
+                        del _borrows_running[key]
+    except BaseException as exc:  # noqa: BLE001 — _borrow_for_brief 承诺不抛; 真抛了也要让等的人醒过来, 不是等到点
+        fut.set_exception(exc)
+    else:
+        fut.set_result(out)
+
+
 def _borrow_for_brief_bounded(project: dict, delta: dict | None,
                               budget: float | None = None, *, user_id: str | None = None,
-                              started: float | None = None) -> dict:
-    """``open_project`` 用的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但**只等
-    ``OPEN_PROJECT_BORROW_SEC``**(默认 15 秒), 而且不超过整次回包目标里剩下的(``started`` 是 open_project 开始的
-    时刻, 见 _brief_borrow_budget), 到点先把简报交出去。
+                              started: float | None = None, arm: str | None = None,
+                              carry: bool = False, followup: bool = False) -> dict:
+    """限时的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但只等 ``budget`` 秒, 到点先回。两个调用方:
+
+    · ``open_project``(build_writing_brief): 不传 ``budget`` / ``arm``。**只等 ``OPEN_PROJECT_BORROW_SEC``**(默认 15 秒),
+      而且不超过整次回包目标里剩下的(``started`` 是 open_project 开始的时刻, 见 _brief_borrow_budget), 到点先把简报
+      交出去; 臂在这里新定, 这一场的规律条数新记一条。
+    · ``borrow_lessons``(2026-11-11, 审计 A3): ``budget`` = ``BORROW_LESSONS_WAIT_SEC``, ``arm`` = 它已经定好的臂(沿用
+      模型传回的那个; 这里不再发一次臂), ``carry`` = 这次是不是同一场接着借(记规律条数时和前面那次取大的, 见
+      _note_patterns_shown), ``followup=True`` = 到点那句话换成 BORROW_STILL_SELECTING_NOTE, 存档那一行指标里记
+      LESSONS_FOLLOWUP_TIMEOUT。
 
     为什么要有这一层(TV 2026-10-08 审计 A-04): 借阅原来直接在 open_project 的同步路径上
     等满 ``LIBRARIAN_TIMEOUT_SEC``(60 秒), 而 MCP 客户端只容忍 ~22 秒 —— 超过的不是"少几张
     卡", 是**整份简报连 P0 硬约束一起丢**, 协议让模型停笔。TV 侧实测 09-22 冷借 13 次里
     12 次超过 22 秒。馆员选卡要跑一次 LLM, 把 60 秒改小不行(test_librarian_timeout 钉着);
-    把等待从必经路径上拆出来才行。
+    把等待从必经路径上拆出来才行。borrow_lessons 同理: 等 60 秒等来的是一次被客户端掐断的调用。
 
-    到点之后借阅线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型动笔之前调一次 borrow_lessons
-    (同参数命中缓存即回)就拿得到。``detail`` 里写清这一点(BORROW_TIMEOUT_NOTE), 模型读得到。
+    到点之后选卡线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型动笔之前调一次 borrow_lessons 就拿得到 ——
+    那次选卡还在跑的话, borrow_lessons 等的就是它(_borrows_running), 不向馆员发第二次; 已经跑完了就是同参数命中缓存。
+    ``detail`` 里写清该怎么办(BORROW_TIMEOUT_NOTE / BORROW_STILL_SELECTING_NOTE), 模型读得到。
     """
     budget = _brief_borrow_budget(started) if budget is None else float(budget)
-    # 臂在这里先定: 借阅超时 / 线程起不来, 简报也要带着臂交出去 (入库时原样传回)
-    arm = _borrow_arm(project.get("id"), user_id)
+    # 臂在这里先定: 借阅超时 / 线程起不来, 简报也要带着臂交出去 (入库时原样传回)。调用方定好了的原样用
+    arm = arm or _borrow_arm(project.get("id"), user_id)
 
-    def _shown(out: dict) -> dict:
-        # 外部审计 11-02 F13: 简报实际带出去几条规律(超时 / 线程起不来 = 0 —— 后台线程之后选完了也不算, 这一份简报里
-        # 没有), 记在这个臂旁边。open_project 是新开的一场, 不和上一场取大
-        _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []))
+    def _shown(out: dict, *, status: str | None = None) -> dict:
+        # 外部审计 11-02 F13: 这一次实际带出去几条规律(超时 / 线程起不来 = 0 —— 后台线程之后选完了也不算, 这一份回包里
+        # 没有), 记在这个臂旁边。open_project 是新开的一场, 不和上一场取大(carry=False); borrow_lessons 的 carry 照它传的
+        _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []), carry=carry)
+        # 这一次实际带出去几张卡(超时 = 0), 给存档那一行指标(A3)
+        _note_lessons_shown(project.get("id"), user_id, out, status=status)
         return out
 
-    try:
-        ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
-        fut = ex.submit(_borrow_for_brief, project, delta, user_id=user_id, arm=arm)
-    except Exception as exc:  # noqa: BLE001
-        # 线程池建不起来 / submit 失败 (RuntimeError: can't start new thread, 解释器关闭中…): 这一层的
-        # 承诺和 _borrow_for_brief 一样是"绝不抛" —— 抛出去 open_project 整份简报连 P0 硬约束一起丢
-        # (codex review on #93)。按借阅出错回, 简报照交。
-        logger.warning("flywheel borrow could not start (project_id=%s): %s: %s",
-                       project.get("id"), type(exc).__name__, exc)
+    def _failed(detail: str) -> dict:
         return _shown({"lessons": [], "count": 0,
                        "status": librarian_client.BORROW_ERROR,
-                       "elapsed_ms": 0,
-                       "detail": f"借阅线程起不来: {type(exc).__name__}: {exc}"[:300],
+                       "elapsed_ms": 0, "detail": detail[:300],
                        "validated_patterns": [], "flywheel_arm": arm})
+
+    ex = None
     try:
         try:
-            return _shown(fut.result(timeout=budget))
+            key = _borrow_running_key(project, delta, arm)
+            with _borrows_running_lock:
+                fut = _borrow_joinable(_borrows_running.get(key)) if key is not None else None
+                if fut is None:                         # 没有正在跑的同一次选卡: 起一次, 登记上
+                    fut = cf.Future()
+                    ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="borrow")
+                    ex.submit(_run_borrow, fut, key, project, delta, user_id, arm)
+                    if key is not None:
+                        _borrows_running[key] = (fut, time.monotonic())
+        except Exception as exc:  # noqa: BLE001
+            # 线程池建不起来 / submit 失败 (RuntimeError: can't start new thread, 解释器关闭中…): 这一层的
+            # 承诺和 _borrow_for_brief 一样是"绝不抛" —— 抛出去 open_project 整份简报连 P0 硬约束一起丢
+            # (codex review on #93)。按借阅出错回, 简报照交。没起来的那次不登记。
+            logger.warning("flywheel borrow could not start (project_id=%s): %s: %s",
+                           project.get("id"), type(exc).__name__, exc)
+            return _failed(f"借阅线程起不来: {type(exc).__name__}: {exc}")
+        try:
+            # 拷一份: 同一个 future 可能有几个人在等, 各拿各的(调用方会往里加键)
+            return _shown(copy.deepcopy(fut.result(timeout=budget)))
         except cf.TimeoutError:
-            logger.warning("flywheel borrow exceeded open_project budget %.1fs (project_id=%s); "
-                           "brief returned without cards, borrow thread left running",
-                           budget, project.get("id"))
+            logger.warning("flywheel borrow exceeded %s budget %.1fs (project_id=%s); "
+                           "replied without cards, borrow thread left running",
+                           "borrow_lessons" if followup else "open_project", budget, project.get("id"))
             return _shown({"lessons": [], "count": 0,
                            "status": librarian_client.BORROW_TIMEOUT,
                            "elapsed_ms": int(budget * 1000),
                            "validated_patterns": [], "flywheel_arm": arm,
-                           "detail": BORROW_TIMEOUT_NOTE})
+                           "detail": BORROW_STILL_SELECTING_NOTE if followup else BORROW_TIMEOUT_NOTE},
+                          status=LESSONS_FOLLOWUP_TIMEOUT if followup else None)
+        except Exception as exc:  # noqa: BLE001 — 选卡那一头抛了(不该发生): 等它的每个人都按借阅出错回, 不往外抛
+            logger.warning("flywheel borrow thread failed (project_id=%s): %s: %s",
+                           project.get("id"), type(exc).__name__, exc)
+            return _failed(f"{type(exc).__name__}: {exc}")
     finally:
-        ex.shutdown(wait=False)
+        if ex is not None:
+            ex.shutdown(wait=False)
 
 
 def create_project(client, name: str, *, brand: str = "",
@@ -11257,6 +11586,16 @@ def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, ho
     return out
 
 
+def _same_miss_score(stored, now_score: float | None) -> bool:
+    """对照里存着的 score(REAL, 读回来带单精度的尾巴)和这晚算的是不是同一个数: 都没有算一样, 保留三位小数之后相等算一样。"""
+    if stored is None or now_score is None:
+        return stored is None and now_score is None
+    try:
+        return abs(float(stored) - round(float(now_score), 3)) < 5e-4
+    except (TypeError, ValueError):
+        return False
+
+
 def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             write_tv: bool = False, since: str | None = None,
             rematch: bool = False) -> dict:
@@ -11274,7 +11613,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
       3. tvlink.match_note 逐条判: body_exact / title_exact / fuzzy / ambiguous /
          unmatched。TV 自己已经带 source_autowriter_version_id 的直接记 tv_lineage。
       4. unmatched → ingest_published(剥掉话题标签, source="tv:<项目>", 不过闸,
-         按全文幂等), 建成的 version_id 记回对照。
+         按全文幂等), 建成的 version_id 记回对照。对不上的(unmatched / ingested)那一行
+         的 score 记这篇帖和写作台的稿子最像到什么程度(见下面 miss_score), 只是读数。
       5. 对照写进 tv_note_links(upsert, 按 note_id)。已经对上、TV 正文指纹没变的
          笔记跳过 —— 每天跑一次, 增量。指纹变了的(W-34, 10-27)核一下还是不是
          那一篇: 是就只记指纹、差异按现在的正文重算; 整篇换了就按内容重对, 挪之前
@@ -11330,11 +11670,21 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     weak_amb: dict[str, tvlink.Match] = {}  # 只因为标题一样才分不出的(F04 复审): 先进补录名单对底稿, 补录之前再分
     ingested_drift: dict[str, tuple] = {}  # 补录的帖正文改过了(F07): note_id → (笔记, 项目, 版本), 文字记进指纹库之后才记指纹
     ingested_seed: dict[str, str] = {}     # 017 之前补录的、正文和那一版一样: 只记指纹(F07)
+    # 对不上的帖和写作台的稿子最像到什么程度(2026-11-11, 审计 F4): note_id → 这晚看过的最高包含度(存过档的版本、只查过重的
+    # 底稿都算)。记进 unmatched / ingested 那一行的 score —— 以前这两种一律是 NULL, 看不出帖是在别处写的(接近 0)还是拿写作台
+    # 的稿子改的。只是个读数: 不参与判定, 不改哪一条走补录。没正文 / 帖太短没得比的不在里面(score 照旧 NULL)。
+    miss_score: dict[str, float] = {}
+
+    def _seen(n: tvlink.Note, m: tvlink.Match) -> None:
+        if m.score is not None:
+            miss_score[n.note_id] = max(miss_score.get(n.note_id, 0.0), float(m.score))
 
     def _link(n: tvlink.Note, kind: str, *, project_id=None, version_id=None,
               item_id=None, score=None, lag=None, candidates=None) -> dict:
         # tv_text_fp: 这一行是按现在的正文判的(W-34)。synced_to_tv_at 清空: 这一版还没写回过 TV(挪到新版本之后要再回填)。
         # 每行都带同样的键 —— PostgREST 批量写按键的并集、没带的补 NULL(假件 tests/fakes.py 同样如此)。
+        if score is None and kind in ("unmatched", "ingested") and n.note_id in miss_score:
+            score = round(miss_score[n.note_id], 3)
         return {"note_id": n.note_id, "tv_project_id": tv_project_id,
                 "project_id": project_id, "version_id": version_id, "item_id": item_id,
                 "match_kind": kind, "score": score, "lag_days": lag,
@@ -11383,6 +11733,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             # 没存档时, 底稿才是它的来源; 底稿也没认领的, 补录之前再分: 等人看(ambiguous)还是照常补录(见 weak_amb 那一段)
             counts["unmatched"] += 1
             weak_amb[n.note_id] = m
+            _seen(n, m)
             to_ingest.append(n)
             return
         counts[m.kind] += 1
@@ -11396,6 +11747,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 ambiguous_samples.append({"note_id": n.note_id, "title": n.title[:40],
                                           "candidates": m.candidates[:3]})
         else:
+            _seen(n, m)
             to_ingest.append(n)                         # 补录 / W-10 那里再带上 w34_note
 
     def _sample(n: tvlink.Note, prev: dict, m: tvlink.Match | None, why: str, *, move: bool = False) -> None:
@@ -11657,6 +12009,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 # 的照旧补录。等的上限同分不出的: 底稿过了 SNAPSHOT_MAX_AGE_DAYS 就不再参与(复审 on aw#132)
                 probe = tvlink.match_snapshot(dataclasses.replace(n, publish_time=tvlink._as_dt(now)), svers, sindex, index,
                                               max_lag=None)
+                _seen(n, probe)
                 if probe.kind != "unmatched":
                     snap["undated"] += 1
                     held.update([probe.version.version_id] if probe.version is not None else
@@ -11667,6 +12020,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                     rest.append(n)
                 continue
             m = tvlink.match_snapshot(n, svers, sindex, index)
+            _seen(n, m)
             if m.kind == "ambiguous":
                 # 分不出是哪一份底稿(或和存过档的版本分不出): 不补录(补成副本就再也认不回), 记 ambiguous 每晚重判,
                 # 同主索引的分不出一样等人看(tv-resolve); 底稿过了 SNAPSHOT_MAX_AGE_DAYS 就不再参与, 那时照常补录
@@ -11931,10 +12285,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         # 同样的 unmatched(没版本、没备注)的不再每晚重写一遍 —— RIO 782 行每晚只是刷一次 updated_at。
         # 照样重新对一次(写作台存了新版本还能对上); 上次带备注的(比如"没正文")照写, 把旧备注换掉。
         # W-34 挪过来的(上次是有版本的对照)不会走捷径: 它的旧对照有 version_id。
+        # 2026-11-11: 分数也要一样才算「同样的」—— 以前记的 unmatched 没有分数, 头一晚各重写一次把分数补上, 之后照旧不写。
         for n in to_ingest:
             prev = existing.get(n.note_id)
             if (prev and prev.get("match_kind") == "unmatched" and not prev.get("version_id")
-                    and not prev.get("candidates")):
+                    and not prev.get("candidates") and _same_miss_score(prev.get("score"), miss_score.get(n.note_id))):
                 unmatched_kept += 1
                 continue
             links.append(_link(n, "unmatched", candidates=w34_note.get(n.note_id)))

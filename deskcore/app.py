@@ -68,7 +68,7 @@ from fastapi.responses import JSONResponse
 
 from logger_utils import SecretMaskingFormatter
 
-from . import core, identity, skillcheck, tools, vocab
+from . import calllog, core, identity, skillcheck, tools, vocab
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deskcore")
@@ -322,6 +322,22 @@ def _log_error_result(name: str, kwargs: dict, result) -> None:
         pass
 
 
+# ── 每次工具调用留一行只有数的记录(2026-11-11, deskcore/calllog.py, docs/deskcore.md §3.8) ────────────────
+# REST 和 MCP 给工具计时的那两处, 回包定下来之后调 _record_call: 只是往后台的队列里放一下(满了就丢), 摘数和写库都在后台线程里。
+# 它自己绝不抛、不等: 留痕不能改变、拖慢或弄坏任何一次回包。抛了异常的调用也记(结局 + 异常类型, 同 _log_tool_failure 的分法)。
+def _record_call(name: str, channel: str, args, t0: float, sink, *, result=None, exc: BaseException | None = None) -> None:
+    try:
+        outcome = label = None
+        if exc is not None:
+            outcome = ("refused" if isinstance(exc, _EXPECTED_TOOL_ERRORS)
+                       else "failed" if isinstance(exc, Exception) else "interrupted")
+            label = _exc_label(exc)
+        calllog.submit(tool=name, channel=channel, user_id=_caller.get().user_id, args=args, sink=sink,
+                       elapsed_ms=int((time.monotonic() - t0) * 1000), result=result, outcome=outcome, error_class=label)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ⚠️ _mcp 必须在 app 之前建好: FastAPI 的 lifespan 要在构造时传进去, 而
 # lifespan 里要用 _mcp.session_manager。_register_mcp 定义在文件更下面, 靠
 # 模块末尾的赋值太晚 —— 所以这里前置声明, 末尾再真正注册路由。
@@ -360,6 +376,7 @@ async def _lifespan(_app: FastAPI):
             yield
     finally:
         core.log_rule_compiles_cut_off()       # 自己不抛
+        calllog.flush()                        # 工具调用的留痕: 尽力把队列里剩下的写完(最多等 2 秒), 写不完就算了; 自己不抛
 
 
 app = FastAPI(title="deskcore · 写作台内核", version=VERSION,
@@ -818,14 +835,21 @@ async def rest_tool(name: str, request: Request):
     if not isinstance(args, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
     t0 = time.monotonic()
+    sink: dict = {}                             # core 记给调用留痕的数(calllog.note), 见 _record_call
     try:
         # ⚠️ 必须过线程池。工具里全是【同步】调用(Supabase / embedding, record_edit
         # 还会打 Anthropic), 直接在 async 路由里跑会占住 uvicorn 唯一的事件循环 ——
         # 一个慢请求把不相干的 REST / MCP / health 全部拖住。
         # 本仓的 worker 服务踩过同一类坑(subprocess.run 堵死 asyncio → /health 失联
         # → 平台健康检查超时重启容器 → 杀掉正在跑的任务)。
-        result = await run_in_threadpool(_call_tool, name, args)
-        return {"result": result}
+        try:
+            result = await run_in_threadpool(calllog.collecting, sink, _call_tool, name, args)
+        except BaseException as exc:
+            _record_call(name, "rest", args, t0, sink, exc=exc)     # 留一行(结局 + 异常类型), 原样抛给下面那几类去映状态码
+            raise
+        reply = {"result": result}
+        _record_call(name, "rest", args, t0, sink, result=result)
+        return reply
     except HTTPException:
         raise
     except core.ProjectNotFound as exc:
@@ -948,18 +972,21 @@ def _register_mcp():
         async def wrapper(*args, **kwargs):
             kwargs = _inject_caller(fn, kwargs, needs_user)
             t0 = time.monotonic()
+            sink: dict = {}                     # core 记给调用留痕的数(calllog.note), 见 _record_call
             try:
-                result = await run_in_threadpool(fn, *args, **kwargs)
+                result = await run_in_threadpool(calllog.collecting, sink, fn, *args, **kwargs)
             except BaseException as exc:
                 # W-29: 留一行痕, FastMCP 照旧把它收成 isError(见 _log_tool_failure)。正常拒绝那几类、取消 / 退出原样抛;
                 # 真故障换成只带类型和 ref 的 _ToolFailure(X1a: 原来 str(exc) 原样进 isError 的文本, 回给客户端)
                 expected = isinstance(exc, _EXPECTED_TOOL_ERRORS) or not isinstance(exc, Exception)
                 ref = None if expected else _error_ref()
                 _log_tool_failure(name, kwargs, exc, int((time.monotonic() - t0) * 1000), ref=ref)
+                _record_call(name, "mcp", kwargs, t0, sink, exc=exc)
                 if expected:
                     raise
                 raise _ToolFailure(_sanitized_error(exc, ref)) from exc
             _log_error_result(name, kwargs, result)
+            _record_call(name, "mcp", kwargs, t0, sink, result=result)
             return result
 
         wrapper.__signature__ = sig.replace(parameters=params)

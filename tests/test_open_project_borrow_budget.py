@@ -9,7 +9,8 @@
   · open_project 等馆员超过预算;
   · 预算的代码默认值 / 上限超出客户端容忍;
   · 到点之后把借阅线程取消(TV 那边选完会写缓存, 稍后 borrow_lessons 才拿得到);
-  · borrow_lessons 工具也被这个预算截断(写手明确要卡时该等满 LIBRARIAN_TIMEOUT_SEC)。
+  · borrow_lessons 工具也被这个预算截断(它有自己的等待上限 BORROW_LESSONS_WAIT_SEC, 比这个预算长;
+    2026-11-11 之前它等满 LIBRARIAN_TIMEOUT_SEC, 见 tests/test_borrow_lessons_deadline.py)。
 
 2026-10-30 发布收尾: 默认 10 → 15 秒(最近冷借 14~18 秒)。放得下是因为借阅实际等的是
 min(OPEN_PROJECT_BORROW_SEC, 回包目标 20 秒 − 借阅之前已用 − 借阅之后的预留), 前面慢了借阅就少等;
@@ -78,12 +79,13 @@ def test_a_fast_borrow_is_unaffected_by_the_budget(monkeypatch):
     assert b["counts"]["lessons"] == 2
 
 
-def test_borrow_lessons_tool_still_waits_the_full_librarian_timeout(monkeypatch):
-    """预算只管 open_project 这条必经路径。写手明确调 borrow_lessons 要卡时, 等满
-    LIBRARIAN_TIMEOUT_SEC 是对的 —— 那是一次有意的等待, 不会把简报一起丢。"""
+def test_borrow_lessons_tool_is_not_cut_short_by_the_open_project_budget(monkeypatch):
+    """这个预算只管 open_project 这条必经路径。borrow_lessons 等的是它自己的上限(BORROW_LESSONS_WAIT_SEC, 默认 18 秒;
+    2026-11-11 之前是等满 LIBRARIAN_TIMEOUT_SEC —— 客户端约 22 秒就断, 等不到), 比简报那次的预算长的选卡照样拿得到。"""
     fake = _SlowLibrarian(delay=0.5)
     monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
     monkeypatch.setattr(config, "OPEN_PROJECT_BORROW_SEC", 0.1)
+    monkeypatch.setattr(config, "BORROW_LESSONS_WAIT_SEC", 5.0)
     out = core.borrow_lessons(_client(), PID, user_id=ME, draft_topic="早八通勤")
     assert out["status"] == lib.BORROW_BORROWED and out["count"] == 1
 

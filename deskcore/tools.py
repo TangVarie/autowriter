@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import core, skillcheck, vocab
+from . import calllog, core, skillcheck, vocab
 
 logger = logging.getLogger("deskcore.tools")
 
@@ -98,6 +98,9 @@ def _attach_skill_update(out: Any, tool: str, user_id: str | None, raw_version,
         return out
     if update:
         out["skill_update"] = update
+    # 调用留痕(calllog): 这次报上来的版本是最新 / 旧版 / 没报, 只记这一个词
+    calllog.note(skill=skillcheck.OUTDATED if update else
+                 skillcheck.UNKNOWN if skillcheck.normalize(raw_version) is None else skillcheck.UP_TO_DATE)
     return out
 
 
@@ -523,6 +526,7 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
     **例外: open_project 返回的 lessons_status.status 是 timeout 时**, 卡还在后台接着选 —— 动笔之前用和那次
     open_project 一样的参数(tactic / draft_topic / key_messages / target_audience / tone / extra_instructions 照传,
     flywheel_arm 传简报里的)调一次, 选好了就能拿到; 只调这一次, 还是没有卡就照常写。
+    本工具最多等十几秒: 到点卡还没选完, 回的 status 也是 timeout —— 那就照常写, 不用再调, 也别跟用户说没有可借的经验。
 
     这些卡来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
     结构骨架 / 为什么有效 / 可迁移手法」。写稿时可以借它的钩子或结构。
@@ -579,6 +583,16 @@ def _add_check_next_step(out: dict) -> None:
     n = int(s.get("pass") or 0) + warn
     if n > 0:
         out["next_step"] = CHECK_NEXT_STEP.format(n=n, warn=CHECK_NEXT_STEP_WARN.format(m=warn) if warn else "")
+
+
+def _skill_versions_now() -> dict | None:
+    """近 24 小时报上来的 skill 版本构成(skillcheck.health), 交给 core 写进存档那一行指标(meta.skill_versions; 审计 A8:
+    计数原来只在进程内存里, 要带 key 读 /skill-versions, 重新部署就清零)。只有计数。读不出协议版本就不带; **不抛**。"""
+    try:
+        return skillcheck.health(protocol_text()[1])
+    except Exception:  # noqa: BLE001
+        logger.warning("score_drafts: 这次没取到 skill 版本计数, 指标里不带这一块", exc_info=True)
+        return None
 
 
 def check_drafts(project_id: str, drafts: list[dict],
@@ -907,7 +921,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     # 正文 / 标题放错了字段的先对上(_draft_fields): 存进 versions 的正文就是对上的那份, 之后 check_rules 查的也是它。
     drafts = _draft_fields(drafts, "score_drafts", project_id)
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "",
+                              skill_versions=_skill_versions_now())
 
 
 def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user_id: str | None = None) -> dict:
@@ -978,7 +993,8 @@ def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", t
     # 同 score_drafts: 写操作, 不包 _safe; 放错字段的一样先对上。
     drafts = _draft_fields(drafts, "commit_drafts", project_id)
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "",
+                              skill_versions=_skill_versions_now())
 
 
 INGEST_MAX_PER_CALL = 50

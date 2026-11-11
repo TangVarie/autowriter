@@ -890,10 +890,11 @@ GRANT EXECUTE ON FUNCTION deskcore_reserve_angles(UUID, JSONB, UUID, INT, INT) T
 --    这句在全新库上是干净 no-op。
 DROP FUNCTION IF EXISTS autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC);
 
--- ⚠️ 下面这一整块与 migrations/005_deskcore_containment.sql 里的**字节级相同**, 是原样复制过来的。
+-- ⚠️ 下面这一整块与 migrations/019_dedup_gin_first.sql 里的**字节级相同**, 是原样复制过来的
+--    (005 那一版, 019 只换了取候选的那一步)。
 --    改那边就把整块重新复制过来, 不要只补差异 —— tests/test_baseline_parity.py
 --    用字符串相等来守这件事, 漏一处它会红。(2026-09-16: 基线曾停在旧形态,
---    而完整链条上 005 会把它盖掉, 所以 sql_parity_check 发现不了。)
+--    而完整链条上后面的增量会把它盖掉, 所以 sql_parity_check 发现不了。)
 CREATE OR REPLACE FUNCTION autowriter.deskcore_commit_fingerprints(
     _project_id         UUID,
     _rows               JSONB,
@@ -958,18 +959,19 @@ BEGIN
         best_c := 0; best_ct := NULL; best_cs := 0;
         IF ng_max IS NOT NULL THEN
             FOR hit IN
+                -- ⚠️ 候选先走 GIN、再筛项目(migrations/019): MATERIALIZED 和
+                --    (SELECT ng) 缺一不可, 理由见 deskcore_check_drafts 的 cand。
+                WITH cand AS MATERIALIZED (
+                    SELECT f.title, f.ngram_hashes AS hs, f.project_id AS pid
+                      FROM autowriter.draft_fingerprints f
+                     WHERE f.ngram_hashes && (SELECT ng)
+                )
                 SELECT c.title,
                        m.inter::numeric / NULLIF(m.uni, 0)     AS j,
                        m.inter::numeric / NULLIF(m.smaller, 0) AS c,
                        m.smaller::int                          AS smaller,
                        m.uni::int                              AS uni
-                  FROM (
-                      SELECT f.title, f.ngram_hashes AS hs
-                        FROM autowriter.draft_fingerprints f
-                       WHERE f.project_id = _project_id
-                         AND f.ngram_hashes && ng
-                         AND array_length(f.ngram_hashes, 1) IS NOT NULL
-                  ) c
+                  FROM cand c
                   CROSS JOIN LATERAL (
                       SELECT LEAST(ng_max, (SELECT max(x) FROM unnest(c.hs) x)) AS t
                   ) tt
@@ -989,6 +991,8 @@ BEGIN
                              GROUP BY z.h
                         ) g
                   ) m
+                 WHERE c.pid = _project_id
+                   AND array_length(c.hs, 1) IS NOT NULL
             LOOP
                 -- Jaccard 看并集样本量, 包含度看 min —— 两个下限用同一个数,
                 -- 但量的是不同的东西。见 check 侧 jbest 上面那段注释。
@@ -1078,10 +1082,11 @@ GRANT EXECUTE ON FUNCTION autowriter.deskcore_commit_fingerprints(UUID, JSONB, U
 --    链条上 005:63 删的就是它, 但那条只有跑到 005 才生效。这句在全新库上是干净 no-op。
 DROP FUNCTION IF EXISTS autowriter.deskcore_check_drafts(UUID, JSONB);
 
--- ⚠️ 下面这一整块与 migrations/008_embedding_model_isolation.sql 里的**字节级相同**, 是原样复制过来的。
+-- ⚠️ 下面这一整块与 migrations/019_dedup_gin_first.sql 里的**字节级相同**, 是原样复制过来的
+--    (008 那一版, 019 只换了取候选的那一步)。
 --    改那边就把整块重新复制过来, 不要只补差异 —— tests/test_baseline_parity.py
 --    用字符串相等来守这件事, 漏一处它会红。(2026-09-16: 基线曾停在旧形态,
---    而完整链条上 008 会把它盖掉, 所以 sql_parity_check 发现不了。)
+--    而完整链条上后面的增量会把它盖掉, 所以 sql_parity_check 发现不了。)
 CREATE OR REPLACE FUNCTION autowriter.deskcore_check_drafts(
     _project_id UUID,
     -- [{opening_hash, ngram_hashes, title_embedding}, ...]
@@ -1154,12 +1159,18 @@ BEGIN
             -- ⚠️ 逐行用 LATERAL 往下传, **不要**把中间结果拆成两个 CTE 再按
             --    title join 回去 —— title 不唯一(同一个项目里重名的历史稿很
             --    常见), 那样会扇出成笛卡尔积, 指标全错而且不报错。
-            WITH cand AS (
-                SELECT f.title, f.ngram_hashes AS hs
+            -- ⚠️ 候选先走 GIN(draft_fp_ngram_gin_idx)、再筛项目(migrations/019)。
+            --    下面两样缺一不可, 别"简化"回去:
+            --    · MATERIALIZED —— 不让项目条件推回这一层。推回去的话计划器按
+            --      项目索引取出整个项目的行、再逐行比 &&(千行的项目一篇 0.4 秒)。
+            --    · (SELECT ng) —— 把数组的值对计划器藏起来。直接写 ng 的话, 每条
+            --      连接头几次执行按实际数组估行数、选全表顺序扫描(一篇要几秒);
+            --      用 OFFSET 0 当栅栏同样会走到顺序扫描。
+            --    候选集不变: 还是同一个 && 条件、同一个项目条件, 只是先后换了。
+            WITH cand AS MATERIALIZED (
+                SELECT f.title, f.ngram_hashes AS hs, f.project_id AS pid
                   FROM autowriter.draft_fingerprints f
-                 WHERE f.project_id = _project_id
-                   AND f.ngram_hashes && ng
-                   AND array_length(f.ngram_hashes, 1) IS NOT NULL
+                 WHERE f.ngram_hashes && (SELECT ng)
             ),
             metrics AS (
                 SELECT c.title,
@@ -1190,6 +1201,8 @@ BEGIN
                              GROUP BY z.h
                         ) g
                   ) m
+                 WHERE c.pid = _project_id
+                   AND array_length(c.hs, 1) IS NOT NULL
             ),
             -- ⚠️ 两路的最佳命中必须在【同一条语句】里取完。WITH 的作用域只有
             --    一条语句 —— 拆成两条 SELECT 的话第二条会报 relation "metrics"

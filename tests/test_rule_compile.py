@@ -384,7 +384,7 @@ def test_a_whole_batch_failure_that_fails_again_keeps_the_batch_status_and_names
     assert rep["status"] == "jev_failed" and rep["compiled"] == 0 and len(jev.compile_calls()) == 2
     assert {k[0] for k in core._RULE_COMPILE_FAILED} == {mid(1), mid(2)}
     (line,) = [r.getMessage() for r in caplog.records if "拆小重发" in r.getMessage()]
-    assert "generator_GeneratorHTTPError_529" in line and mid(1)[:8] in line and "overloaded" not in line
+    assert "generator_http_529" in line and mid(1)[:8] in line and "overloaded" not in line
 
 
 @pytest.mark.parametrize("how, status", [("timeout", "timeout"), ("blocked", "policy_blocked")])
@@ -452,11 +452,12 @@ def test_cli_says_how_many_were_resent_and_recovered(jev, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("error, status, kind", [
-    ("生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded", None, "generator_GeneratorHTTPError_529"),
-    ("生成端调用失败：GeneratorStopped: 模型拒答（stop_reason=refusal）", None, "generator_GeneratorStopped"),
+    # 和存档指标里的 error_kinds 是同一套词(tests/test_commit_side_meta.py 钉着另外几种)
+    ("生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded", None, "generator_http_529"),
+    ("生成端调用失败：GeneratorStopped: 模型拒答（stop_reason=refusal）", None, "refusal"),
     ("HTTP 502: 规则一条都没编出来：模型输出不合格（已重试一次）：示例", "jev_failed", "bad_output"),
     ("没有编出结果", None, "no_result"),
-    ("Jev 的回包里没有这条", None, "missing"),
+    ("Jev 的回包里没有这条", None, "missing_in_response"),
     ("HTTP 502: 失败", "jev_failed", "jev_failed"),
     ("说不上来的示例错误", None, "other"),
     (None, None, "other"),
