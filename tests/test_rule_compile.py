@@ -5,6 +5,7 @@
   · sha 与 Jev ``rules.rule_sha`` 逐字节一致, 拼题库与 Jev ``rules.to_project_bank`` 逐字节一致(期望值是 Jev 那边对
     合成样例算出来、抄在这里的 —— 两边一漂, 缓存永远命中不了、每次都重编白花钱);
   · 已经有 (id, sha) 一行的不再发; 原文改了 sha 变、重编; ``force`` 全部重编; 带 error 的不存、报出来; 一批 ≤ 60 条;
+  · 没编出来的拆成每次 ≤ 3 条马上重发一次(2026-11-11), 重发还失败的才记失败; 整批被挡 / 读超时不重发;
   · Jev 那边怎么失败都不抛(超时 / 出境口径 / 没接 tv-map / 没配), 回报告; 被挡下的后面几批不发;
   · 后台补编: 每个项目同时一个线程、冷却之内不重复起, open_project / record_rule 不等它; record_rule 不等冷却;
   · CLI compile-rules 一个项目一行计数, 没编成退出码 1; --all 里 owner 的 global 规则一次运行只发一次(--force、--dry-run
@@ -288,11 +289,13 @@ def test_error_rows_are_reported_not_stored(jev):
     assert rep["status"] == "partial" and rep["compiled"] == 1
     assert [e["memory_id"] for e in rep["errors"]] == [r2["id"]] and "示例原因" in rep["errors"][0]["error"]
     assert [r["memory_id"] for r in c.rows["rule_compiles"]] == [r1["id"]], "带 error 的不存, 下次再编"
+    # 2026-11-11: 带 error 的那条马上单独重发了一次(第 2 个请求), 还是失败才记失败
+    assert len(jev.compile_calls()) == 2 and (rep["resent"], rep["recovered"]) == (1, 0)
     # 后台路径: 刚失败过的同一版本这次不再发(每编一次都花钱); CLI 路径照常重发
     rep = core.compile_rules(c, PROJ, skip_recent_failures=True)
-    assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 1
+    assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 2
     core.compile_rules(c, PROJ)
-    assert len(jev.compile_calls()) == 2 and [r["id"] for r in jev.compile_calls()[-1]["json"]["rules"]] == [r2["id"]]
+    assert len(jev.compile_calls()) == 4 and [r["id"] for r in jev.compile_calls()[-1]["json"]["rules"]] == [r2["id"]]
 
 
 def test_sha_mismatch_is_not_stored(jev):
@@ -301,6 +304,165 @@ def test_sha_mismatch_is_not_stored(jev):
     rep = core.compile_rules(c, PROJ)
     assert rep["status"] == "error" and "对不上" in rep["errors"][0]["error"]
     assert c.rows["rule_compiles"] == []
+    assert len(jev.compile_calls()) == 1 and "resent" not in rep, "两边算法漂了, 重发也一样: 不重发"
+
+
+# ── 没编出来的拆小重发(2026-11-11, 审计 A5 / JP-5) ─────────────────────────────────
+
+def _error_result(r: dict, error: str) -> dict:
+    return {"id": r["id"], "sha": jev_sha(r["text"], r.get("applicability")), "verdict": None, "code": None,
+            "questions": [], "coverage": None, "uncovered": "", "why": "", "error": error}
+
+
+def _batch_of_ten_fails_on(jev, monkeypatch, poison: set[str],
+                           error: str = "模型输出不合格（已重试一次）：示例原因, 带一句示例规则原文") -> None:
+    """假 Jev 学真 Jev 的一点: 一次请求里只要有 ``poison`` 里的规则, 这次请求的每一条都带 error(一批一次模型调用)。"""
+    plain = FakeJev().compile_one
+    real_post = jev.post
+
+    def post(url, *, headers=None, json=None, timeout=None, **kw):
+        if url.endswith("/compile_rules"):
+            hit = any(r["id"] in poison for r in json["rules"])
+            jev.compile_one = (lambda r: _error_result(r, error)) if hit else plain
+        return real_post(url, headers=headers, json=json, timeout=timeout, **kw)
+    monkeypatch.setattr(requests, "post", post)
+
+
+def test_a_failed_batch_is_resent_in_chunks_of_three_and_only_the_bad_rule_is_held(jev, monkeypatch, caplog):
+    """10 条里 1 条让模型输出不合格, Jev 把这一批 10 条都带 error 回来。原来 10 条一起记失败, 6 小时后原样再发、再一起失败。"""
+    rules = [mem(i, severity="hard") for i in range(1, 11)]
+    c = make_client(rules)
+    bad = rules[4]["id"]
+    _batch_of_ten_fails_on(jev, monkeypatch, {bad})
+    with caplog.at_level("WARNING", logger="deskcore.core"):
+        rep = core.compile_rules(c, PROJ)
+    sizes = [len(x["json"]["rules"]) for x in jev.compile_calls()]
+    assert sizes == [10, 3, 3, 3, 1], "一批 10 条最多多发 4 次请求, 每次 ≤ 3 条"
+    resent = [r["id"] for x in jev.compile_calls()[1:] for r in x["json"]["rules"]]
+    assert resent == [r["id"] for r in rules], "每条只重发一次, 顺序不变"
+    in_bad_chunk = {r["id"] for r in rules[3:6]}                # 和那一条同一小批的两条这次也没编出来
+    assert rep["status"] == "partial" and rep["compiled"] == 7
+    assert (rep["resent"], rep["recovered"]) == (10, 7)
+    assert {e["memory_id"] for e in rep["errors"]} == in_bad_chunk
+    assert {r["memory_id"] for r in c.rows["rule_compiles"]} == {r["id"] for r in rules} - in_bad_chunk
+    assert {k[0] for k in core._RULE_COMPILE_FAILED} == in_bad_chunk, "只有重发还失败的才记失败"
+    # 一行 WARNING: 规则 id 前 8 位 + 失败的归类, 不带规则原文, 也不带 Jev 的错误原文
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "WARNING" and "拆小重发" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "bad_output" in lines[0] and all(i[:8] in lines[0] for i in in_bad_chunk)
+    assert not any(i in lines[0] for i in in_bad_chunk), "只有前 8 位"
+    for leak in ("示例规则", "示例原因", "模型输出不合格"):
+        assert leak not in lines[0], leak
+    # 后台下一轮: 只扣这 3 条, 别的 7 条已经在缓存里
+    rep = core.compile_rules(c, PROJ, skip_recent_failures=True)
+    assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 3 and rep["cached"] == 7
+    assert len(jev.compile_calls()) == 5
+
+
+def test_a_whole_batch_failure_is_resent_and_a_full_recovery_is_ok(jev, caplog):
+    """Jev 一条都没编出来回 502(不是被挡、不是读超时): 同样拆小重发; 重发都编出来了, 这次就是 ok, 谁也不记失败。"""
+    rules = [mem(i) for i in range(1, 6)]
+    c = make_client(rules)
+    jev.compile_detail = "规则一条都没编出来：生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded"
+    jev.compile_status_fn = lambda body: 502 if len(body["rules"]) > 3 else 200      # 那一下没通, 重发就过了
+    with caplog.at_level("INFO", logger="deskcore.core"):
+        rep = core.compile_rules(c, PROJ)
+    assert [len(x["json"]["rules"]) for x in jev.compile_calls()] == [5, 3, 2]
+    assert rep["status"] == "ok" and rep["compiled"] == 5 and rep["errors"] == []
+    assert (rep["resent"], rep["recovered"]) == (5, 5)
+    assert rep["batch_errors"][0]["status"] == "jev_failed", "第一次整批没成留在报告里"
+    assert core._RULE_COMPILE_FAILED == {}
+    assert not [r for r in caplog.records if r.levelname == "WARNING" and "拆小重发" in r.getMessage()]
+
+
+def test_a_whole_batch_failure_that_fails_again_keeps_the_batch_status_and_names_the_kind(jev, caplog):
+    c = make_client([mem(1), mem(2)])
+    jev.compile_status = 502
+    jev.compile_detail = "规则一条都没编出来：生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded"
+    with caplog.at_level("WARNING", logger="deskcore.core"):
+        rep = core.compile_rules(c, PROJ)
+    assert rep["status"] == "jev_failed" and rep["compiled"] == 0 and len(jev.compile_calls()) == 2
+    assert {k[0] for k in core._RULE_COMPILE_FAILED} == {mid(1), mid(2)}
+    (line,) = [r.getMessage() for r in caplog.records if "拆小重发" in r.getMessage()]
+    assert "generator_GeneratorHTTPError_529" in line and mid(1)[:8] in line and "overloaded" not in line
+
+
+@pytest.mark.parametrize("how, status", [("timeout", "timeout"), ("blocked", "policy_blocked")])
+def test_a_resend_that_hits_a_timeout_or_a_block_stops_the_run(jev, monkeypatch, how, status):
+    """重发的小请求撞上读超时 / 整批被挡: 同主循环, 整次运行停, 后面的小批和后面几批都不发; 没重发成的照第一次的失败记。"""
+    rules = [mem(i) for i in range(1, 8)]
+    c = make_client(rules)
+    monkeypatch.setattr(config, "RULE_COMPILE_BATCH", 5)
+    jev.compile_one = lambda r: _error_result(r, "模型输出不合格（已重试一次）：示例原因")
+    real_post = requests.post
+
+    def post(url, **kw):
+        if url.endswith("/compile_rules") and len(jev.compile_calls()) == 1:         # 第 2 个请求 = 第一小批重发
+            if how == "timeout":
+                jev.calls.append({"url": url, "headers": kw.get("headers"), "json": kw.get("json"),
+                                  "timeout": kw.get("timeout")})
+                raise requests.Timeout("read timed out (synthetic)")
+            jev.compile_status, jev.compile_detail = 403, "policy: 示例项目没清出境"
+        return real_post(url, **kw)
+    monkeypatch.setattr(requests, "post", post)
+    seen: set = set()
+    rep = core.compile_rules(c, PROJ, seen=seen)
+    assert [len(x["json"]["rules"]) for x in jev.compile_calls()] == [5, 3], "后面那一小批和第二批都没发"
+    assert rep["status"] == status and rep["stopped_by"] == status and rep["not_sent"] == 2 and rep["compiled"] == 0
+    assert {k[0] for k in core._RULE_COMPILE_FAILED} == {r["id"] for r in rules[:5]}, "第一批 5 条照第一次的失败记"
+    assert (core._RULE_COMPILE_JEV["slow_until"] > time.monotonic()) is (how == "timeout")
+    assert len(seen) == (3 if how == "timeout" else 0), "读超时的那一小批算发过了(Jev 多半还在编)"
+
+
+def test_the_resend_stops_when_its_time_budget_is_used_up(jev, monkeypatch):
+    """Jev 的生成端慢的时候每个小请求都要等到它自己超时: 一次 compile_rules 里重发只花 RULE_COMPILE_RESEND_BUDGET_SEC,
+    到点剩下的照第一次的失败记, 不再发。"""
+    rules = [mem(i) for i in range(1, 8)]
+    c = make_client(rules)
+    jev.compile_one = lambda r: _error_result(r, "生成端调用失败：TimeoutError: 示例")
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def monotonic(self) -> float:
+            return clock["t"]
+    monkeypatch.setattr(core, "time", _Clock())
+    real_post = requests.post
+
+    def post(url, **kw):
+        clock["t"] += core.RULE_COMPILE_RESEND_BUDGET_SEC * 0.6          # 每个请求都很慢
+        return real_post(url, **kw)
+    monkeypatch.setattr(requests, "post", post)
+    rep = core.compile_rules(c, PROJ)
+    assert [len(x["json"]["rules"]) for x in jev.compile_calls()] == [7, 3, 3], "第三小批没发: 预算用完了"
+    assert rep["status"] == "error" and len(rep["errors"]) == 7
+    assert {k[0] for k in core._RULE_COMPILE_FAILED} == {r["id"] for r in rules}
+
+
+def test_cli_says_how_many_were_resent_and_recovered(jev, monkeypatch, capsys):
+    rules = [mem(i) for i in range(1, 6)]
+    c = make_client(rules)
+    monkeypatch.setattr(core, "sb", lambda: c)
+    _batch_of_ten_fails_on(jev, monkeypatch, {rules[0]["id"]})
+    assert cli.main(["compile-rules", "--project", PROJ]) == 1, "还有没编出来的: 退出码照旧是 1"
+    out = capsys.readouterr().out
+    assert "没编出来的 5 条拆成每次 ≤ 3 条重发了一次, 又编出 2 条" in out and "[partial]" in out
+
+
+@pytest.mark.parametrize("error, status, kind", [
+    ("生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded", None, "generator_GeneratorHTTPError_529"),
+    ("生成端调用失败：GeneratorStopped: 模型拒答（stop_reason=refusal）", None, "generator_GeneratorStopped"),
+    ("HTTP 502: 规则一条都没编出来：模型输出不合格（已重试一次）：示例", "jev_failed", "bad_output"),
+    ("没有编出结果", None, "no_result"),
+    ("Jev 的回包里没有这条", None, "missing"),
+    ("HTTP 502: 失败", "jev_failed", "jev_failed"),
+    ("说不上来的示例错误", None, "other"),
+    (None, None, "other"),
+])
+def test_compile_error_kind_is_a_short_word_never_the_text(error, status, kind):
+    assert core._compile_error_kind(error, status) == kind
 
 
 def test_batches_hold_at_most_60_rules(jev):
@@ -335,7 +497,10 @@ def test_jev_failure_never_raises(jev, make_fail, status):
         # 2026-10-20 复审: 读超时过了 Jev 最坏的 ~361 秒, 超时那批多半还在 Jev 那边编、照样计费; 再发后面几批只是多付钱
         assert len(jev.compile_calls()) == 1 and rep["not_sent"] == 10 and rep["stopped_by"] == "timeout"
     else:
-        assert len(jev.compile_calls()) == 2, "Jev 回了 502(答了、几乎没花钱)只算这一批, 下一批照发"
+        # Jev 回了 502(答了、几乎没花钱)只算这一批, 下一批照发; 2026-11-11 起每批没编出来的再拆成 ≤ 3 条各重发一次
+        sizes = [len(x["json"]["rules"]) for x in jev.compile_calls()]
+        assert sizes == [60] + [3] * 20 + [10] + [3, 3, 3, 1], "被挡 / 读超时的那两种上面钉了: 不重发"
+        assert rep["resent"] == 70 and rep["recovered"] == 0 and len(rep["errors"]) == 70
 
 
 def test_not_configured_and_no_tv_map_send_nothing(jev, monkeypatch):
@@ -1020,10 +1185,11 @@ def test_a_free_generator_overload_is_retried_after_half_an_hour_not_six(jev, mo
     jev.compile_status, jev.compile_one = 200, FakeJev().compile_one             # Jev 好了
     monkeypatch.setattr(core, "time", _Later(31 * 60))                          # 半小时多一点之后
     rep = core.compile_rules(c, PROJ, skip_recent_failures=True)
+    # 第一次: 1 个请求 + 马上单独重发的 1 个(2026-11-11), 记的是重发那次的失败
     if retried:
-        assert rep["status"] == "ok" and rep["compiled"] == 1 and len(jev.compile_calls()) == 2
+        assert rep["status"] == "ok" and rep["compiled"] == 1 and len(jev.compile_calls()) == 3
     else:
-        assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 1
+        assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 2
 
 
 def test_global_activation_uses_an_owned_mapped_project(monkeypatch):

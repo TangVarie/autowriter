@@ -600,6 +600,63 @@ def versions_in_project(sb, project_id: str, version_ids: list[str]) -> dict[str
     return out
 
 
+# ── 后台规则补查要的两次读(core._rule_sweep, 2026-11-11) ───────────────────────────────────────────────
+RULE_ANSWERS_CHUNK = 20        # 一次 .in_() 问几版: 一版三四十道规则题, 20 版一页(PAGE)基本装得下, 装不下 _paged 会接着翻
+
+
+def delivered_versions_between(sb, project_id: str, since: datetime, before: datetime) -> list[dict]:
+    """这个项目 ``since`` 到 ``before`` 之间建的稿子, 每篇只回交出去的那一版(``items.best_version_id`` 指的; 没指就这段
+    时间里最新那一版, 同 ``versions_for_linking`` 的挑法), **旧的在前**: ``[{"id", "created_at"}]``。
+
+    补录副本(``batches.params.source == 'ingest'``, 从 TV 笔记复制来的)不回 —— 那不是写作台写的稿子。只取 id、时间和
+    归属字段, 不取标题正文。归属同 ``versions_in_project``: ``items!inner → batches!inner`` 再 ``.eq`` 上 project_id。"""
+    rows = _paged(lambda off, lim: (
+        sb.table("versions")
+        .select("id, item_id, version_num, created_at, "
+                "items!inner(best_version_id, batches!inner(project_id, params))")
+        .eq("items.batches.project_id", project_id)
+        .gte("created_at", since.isoformat()).lte("created_at", before.isoformat())
+        .or_("params->>source.is.null,params->>source.neq.ingest", reference_table="items.batches")
+        .order("created_at").order("id").range(off, off + lim - 1)))
+    by_item: dict[str, list[dict]] = {}
+    for v in rows:
+        item = v.get("items") or {}
+        if is_ingest_batch(item.get("batches")):                 # 老行的 params 还可能是 JSON 字符串
+            continue
+        t = _ts(v.get("created_at"))
+        if v.get("id") and v.get("item_id") and t is not None and since <= t <= before:
+            by_item.setdefault(str(v["item_id"]), []).append(v)
+    out: list[tuple[datetime, str, dict]] = []
+    for vs in by_item.values():
+        best = (vs[0].get("items") or {}).get("best_version_id")
+        if best:
+            chosen = next((v for v in vs if str(v["id"]) == str(best)), None)   # 交出去的那版不在这段时间里: 这篇不回
+        else:
+            chosen = max(vs, key=lambda v: (v.get("version_num") or 0, str(v.get("created_at") or "")))
+        if chosen is not None:
+            out.append((_ts(chosen["created_at"]), str(chosen["id"]),
+                        {"id": str(chosen["id"]), "created_at": chosen["created_at"]}))
+    return [row for _t, _id, row in sorted(out, key=lambda x: (x[0], x[1]))]
+
+
+def versions_with_answers(sb, version_ids: list[str], *, run_tag: str) -> set[str]:
+    """这几版里, TV 账本(``truth_vault.note_feature_answers``, ``subject_type = 'aw_version'``)在 ``run_tag`` 下已经有答案
+    的那些版本 id。check_rules 的规则题按 ``run_tag = 'shadow-rules'`` 落在这里(judge_client.build_rules_request), 有一行
+    就是查过了。只取 subject_id 一列; 一次问 RULE_ANSWERS_CHUNK 版, 批里再翻页。**读挂了上抛**(调用方是后台, 自己兜)。"""
+    have: set[str] = set()
+    ids = list(dict.fromkeys(str(i) for i in (version_ids or ()) if i))
+    for chunk in db._in_chunks(ids, RULE_ANSWERS_CHUNK):
+        rows = _paged(lambda off, lim, chunk=chunk: (
+            sb.schema("truth_vault").table("note_feature_answers")
+            .select("subject_id")
+            .eq("subject_type", "aw_version").eq("run_tag", run_tag).in_("subject_id", chunk)
+            # subject_type / run_tag 钉死了, 剩下这四列就是主键: 排序唯一, 翻页不漏不重
+            .order("subject_id").order("question_id").order("question_version").order("extractor")
+            .range(off, off + lim - 1)))
+        have.update(str(r.get("subject_id")) for r in rows if r.get("subject_id"))
+    return have
+
+
 def update_memory_fields(sb, memory_id: str, fields: dict) -> dict | None:
     """就地改一条规则的状态字段。返回改完之后**库里的**那一行。
 

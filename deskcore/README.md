@@ -110,7 +110,7 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 | `tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target` / `tv-map list` | TV 项目 ↔ 写作台项目的对照表；每个 TV 项目只能有一个补录目标 |
 | `tv-sync --all [--dry-run] [--write-tv] [--since …] [--rematch]` | 把 TV 的笔记按内容对到写作台的版本，对不上的补进指纹库（不过闸、按全文幂等）。先 `--dry-run` 看数；`--write-tv` 才回填 TV 的 `source_autowriter_*`。**每天跑一次** |
 | `tv-resolve --note <note_id> --ingest` | `tv-sync` 报「分不出」的那几条，人看过之后落判定：目前只有一种，「对不上，按 TV 的正文补录」。对照改成 `ingested`，原候选保留。**不硬猜**、也**不提供「指定某一版」**（`match_kind` 没有 manual 一档，硬记成 `body_exact` 是撒谎） |
-| `compile-rules (--project <uuid> \| --all) [--force] [--dry-run]` | 把规则池里还没编的规则交给 Jev 编成写后检查（`check_rules` 用），结果缓存进 `rule_compiles`；已编过的（规则 id + 原文 sha 都没变）不再发；`--all` 一次运行里 owner 的 global 规则只发一次（`--force` 也是）。先 `--dry-run` 看要编几条（和真编同一个结局：没接 tv-map / 没配 `JUDGE_*` 照样报 ✗）。后台也会自己补编，这个命令是上线时补一遍（先关 `RULE_COMPILE_AUTO`，见 runbook §1.11）、或 Jev 改了编译之后 `--force` 用。一个项目一行计数，有项目没编成退出码 1；一批读超时就不再发后面几批，`--all` 也不再试后面的项目（列出来），Jev 恢复后再跑（2026-10-20，D-121） |
+| `compile-rules (--project <uuid> \| --all) [--force] [--dry-run]` | 把规则池里还没编的规则交给 Jev 编成写后检查（`check_rules` 用），结果缓存进 `rule_compiles`；已编过的（规则 id + 原文 sha 都没变）不再发；`--all` 一次运行里 owner 的 global 规则只发一次（`--force` 也是）。先 `--dry-run` 看要编几条（和真编同一个结局：没接 tv-map / 没配 `JUDGE_*` 照样报 ✗）。后台也会自己补编，这个命令是上线时补一遍（先关 `RULE_COMPILE_AUTO`，见 runbook §1.11）、或 Jev 改了编译之后 `--force` 用。一个项目一行计数，有项目没编成退出码 1；一批读超时就不再发后面几批，`--all` 也不再试后面的项目（列出来），Jev 恢复后再跑（2026-10-20，D-121）。没编出来的规则当场拆成每次 ≤ 3 条各重发一次，重发还失败的才算失败（2026-11-11） |
 | `sync-skill [--check]` | **不连库。** 改了 `protocol.md` 之后跑，把正文接进 `skills/…/SKILL.md`；`--check` 只比对，给 CI 用。两边不一致时 `test_protocol_tool.py` 会红 |
 
 另有 `health` / `projects` / `open` / `draw` / `check` 几个只读的手动验证入口。完整参数与验收判据见 runbook §2。

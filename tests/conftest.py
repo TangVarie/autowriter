@@ -80,6 +80,7 @@ def _angle_priors_cache():
 # ── 改稿的后台规则复查(AU-F07, deskcore/core.py 的 _revision_rule_recheck) ──────────────────────────────────
 # 生产里存完档在一个后台线程里跑 check_rules。用例里默认关掉: 后台线程会在用例跑完之后还往同一个假件上发请求(数请求的
 # 断言时红时绿), 还会去碰别的用例换掉的 store / judge_client。要测它的用例自己把池子换成就地跑的(tests/test_revision_recheck.py)。
+# 存档之后的规则补查(core._rule_sweep, 2026-11-11)排在同一个池子上, 池子是 None 时一样不排(tests/test_rule_sweep.py)。
 @pytest.fixture(autouse=True)
 def _revision_recheck_off():
     from deskcore import core

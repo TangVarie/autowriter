@@ -876,6 +876,9 @@ def _compile_rules(core, sb, args) -> int:
             print(f"    · …还有 {len(rep['errors']) - 5} 条")
         for b in rep.get("batch_errors") or []:
             print(f"    · 整批 {b.get('rules')} 条没编成 [{b.get('status')}]: {b.get('detail')}")
+        if rep.get("resent"):
+            print(f"    · 没编出来的 {rep['resent']} 条拆成每次 ≤ {core.RULE_COMPILE_RESEND_CHUNK} 条重发了一次, "
+                  f"又编出 {rep.get('recovered') or 0} 条")
         if rep.get("not_sent"):
             why = ("Jev 读超时, 那一批多半还在编、照样计费; Jev 恢复之后再跑一次"
                    if rep.get("stopped_by") == "timeout" else "同一个原因会把它们一样挡下")

@@ -245,6 +245,9 @@ RULE_COMPILE_BATCH: int = int(_bounded_number("RULE_COMPILE_BATCH", 60, 1, 60))
 # open_project / record_rule / check_rules 发现有规则没编时, 后台起一个线程去编(写手的请求不等它)。0 = 关掉后台补编,
 # 只剩 CLI 的 compile-rules(比如 Jev 那边编译出了问题、要先停掉花钱的时候)。
 RULE_COMPILE_AUTO: bool = (_get_secret("RULE_COMPILE_AUTO") or "1").strip() not in ("0", "false", "False", "off")
+# 存完档之后在后台给这个项目还没有规则题答案的旧稿补查(deskcore/core.py 的 _rule_sweep, 2026-11-11): 每次存档最多查 20 版,
+# 只花 Jev 规则题的钱, 写手和模型都看不到。0 = 关掉(比如要先停掉这笔 Jev 开销的时候); 改稿的后台复查不受它管。
+RULE_SWEEP_AUTO: bool = (_get_secret("RULE_SWEEP_AUTO") or "1").strip() not in ("0", "false", "False", "off")
 
 # ── Auth cookie (R-040) ─────────────────────────────────────────────────────
 # refresh token 走 stx CookieManager(JS 写入, 无法 HttpOnly —— 架构限制)。

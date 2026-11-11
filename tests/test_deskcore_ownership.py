@@ -211,6 +211,9 @@ UNGATED_WITH_REASON = {
                                   "不读写库",
     "_revision_rule_recheck": "AU-F07(11-04): 后台线程本体, 只由 _schedule_revision_recheck 起; 调的 check_rules 开头自己过 "
                               "assert_project_access(同一个调用者), 之后只更新这次存档刚插的那一行 batch_metrics 的 meta",
+    "_schedule_rule_sweep":   "规则补查(11-11): 只被已过闸的 commit_drafts 在尾巴上调; 只把项目号和调用者投进后台池子, 不读写库",
+    "_rule_sweep_job":        "规则补查(11-11): 池子里跑的那一层, 只由 _schedule_rule_sweep 投; 只调 _rule_sweep(它开头自己过 "
+                              "assert_project_access), 跑完把项目从进程内的在跑名单里拿掉",
     "_delivery_and_rule_checks": "私有辅助函数, 只被已过闸的 commit_drafts 调用(10-20); 项目行是闸返回的那一行, "
                                  "规则走 shared_memories(本项目 + 调用者自己的 global)",
     "build_distillation_task": "私有辅助函数, 由已过闸的 record_edit / my_style 调用",

@@ -780,7 +780,19 @@ Jev 回 200、但 `model` 是 `mock`（`JUDGE_MOCK=1` 的测试 / 本地 Jev，�
 - 线程跑 `core.compile_rules`：池子和简报、§3.10 同一个（`store.shared_memories`：confirmed、没静音、本项目 + owner 自己的 global，
   hard 和 soft 都编、不过方向闸——global 规则跨项目共用，方向是查的时候按项目定的），已经有 (id, sha) 那一行的跳过，一批 ≤ 60 条
   （`RULE_COMPILE_BATCH`），读超时 `RULE_COMPILE_TIMEOUT_SEC`（默认 420 秒，Jev 最坏约 361 秒）。Jev 那边怎么失败都不抛，回一份报告。
-- 不让失败变成花钱的循环：同一条规则的同一版编失败之后，后台 6 小时之内不再编它（进程内记账，重启清零；CLI 不受这条限制）；
+- 没编出来的拆小重发一次（2026-11-11，审计 A5 / JP-5）。Jev 把一次请求按 10 条一批交给模型，一批里有一条让模型拒答 / 输出不合格、
+  或者那一次调用没通，这 10 条就一起带 error 回来。原来整批记失败，6 小时后（还得有人开这个项目）原样 10 条再发、再一起失败——11-11
+  一个项目最早的 10 条硬规则就这样一条都没编出来。现在一次请求回来之后，带 error 的（和回包里漏掉的）马上拆成每次最多 3 条
+  （`RULE_COMPILE_RESEND_CHUNK`）各重发一次：是某一条的事，别的几条这次就编出来了；是那一下没通，重发多半也过了。Jev 一条都没编出来
+  回 502（`jev_failed`）或回包不成形（`error`）的那一批同样重发。**不重发的**：整批被挡的那几种和读超时（照旧停整次运行）、sha 对不上的
+  （两边算法漂了，再发也一样）。重发的小请求自己撞上被挡 / 读超时，同主循环一样停，没重发成的照第一次的失败记。一次 `compile_rules` 里
+  重发最多花 10 分钟（`RULE_COMPILE_RESEND_BUDGET_SEC`），到点剩下的照第一次的失败记、下次再来（Jev 生成端慢的时候每个小请求都要等到它
+  自己超时）。重发就在这一次 `compile_rules` 里，后台路径照旧握着那一个编译槽位：一批 10 条最多多发 4 次请求，别的项目多等这一会儿。
+  报告里多两个数：`resent`（重发了几条）、`recovered`（其中又编出几条）；重发都编出来了这次就是 `ok`（`batch_errors` 留着第一次那笔）。
+  重发之后还没编出来的记一行 WARNING `compile_rules: 拆小重发 N 条, 编出 M 条, 还有 K 条没编出来(project=…): <归类>: <规则 id 前 8 位>, …`
+  ——归类是一个短词（`bad_output` / `no_result` / `missing` / `generator_<异常类名>[_<HTTP 状态码>]` / 这一小批的结局），不带规则原文，
+  也不带 Jev 的错误原文（「输出不合格」后面跟的是模型那段输出的毛病，里面可能有规则的内容）。CLI 的 `compile-rules` 同样重发，多打一行。
+- 不让失败变成花钱的循环：同一条规则的同一版**重发之后还是**编失败的，后台 6 小时之内不再编它（进程内记账，重启清零；CLI 不受这条限制）；
   Jev 生成端的 HTTP 429 / 5xx（Jev 回「生成端调用失败：GeneratorHTTPError: HTTP 529 …」，整批失败时是 502）只停 30 分钟
   （`RULE_COMPILE_TRANSIENT_RETRY_SEC`）：上游没出输出、没计费，多半是部署后一阵过载（独立复审 on aw E：原来也扣 6 小时，一次几秒的过载让整个池子
   半天没检查）；504 / 524 网关超时、拒答、截断、输出不合格、读超时照旧 6 小时（可能已经计费）。
@@ -1212,7 +1224,31 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 - 一个工作线程，名额 4 个、从投进去一直占到跑完：同时最多 4 次（1 次在跑、3 次排着），第 5 次就跳过、记 WARN；进程重启丢掉还在排的。那一行就没有这个键：**没有这个键 = 没复查**，不是复查过了。`check_rules` 抛了记 `status: error`；写回失败只记日志。
 - 测试里默认关掉（`tests/conftest.py` 把池子换成 None），要测它的用例换成就地跑的池子（`tests/test_revision_recheck.py`）。
 
-复盘时这样查：
+**规则检查的后台补查（2026-11-11，审计 S3 / JP-3）。** 新稿的规则检查靠模型在 `score_drafts` 之后多调一次 `check_rules`。10-23 上线到 11-11，136 版新稿里只有 36 版在账本里有规则题的答案，有五个写稿日是 0 版；「人在发布前改了什么」那 326 对里一对都没有规则题的答案，而 11-20 要拿这两样对着校准规则题。所以每次存完档（真存进去了才排），在改稿复查的同一个工作线程上、排在它后面，再排**一个**补查（`core._rule_sweep`）：
+
+- 列这个项目近 21 天（`RULE_SWEEP_DAYS`）、建了超过 3 分钟（`RULE_SWEEP_MIN_AGE_SEC`）的稿子——每篇只看交出去的那一版（`items.best_version_id`；改动对只挂在这一版上），补录副本不算——去掉账本里已经有规则题答案的（`truth_vault.note_feature_answers`，`subject_type = 'aw_version'`、`run_tag = 'shadow-rules'`，就是 `check_rules` 自己写的那些行；读法 `store.versions_with_answers`，只取 `subject_id`），剩下的一次最多查 20 版（`RULE_SWEEP_MAX_VERSIONS`），多的留给下一次存档。
+- 刚存的这一批不到 3 分钟，不在里面：模型自己那次 `check_rules` 通常二十来秒就到，等它先查。它查了的账本里有行，这里一次 Jev 都不多花；它没查的，下一次存档补上。
+- **旧的在前。** 改动对只有发出去的稿子才有，发布比存档晚好几天，越早的稿子越可能已经有了那一对；最早的那几版也最先滑出 21 天的窗口。新的在前的话每次的名额都先给刚写的（模型多半会自己查），等着校准的旧稿一直轮不到、过期。
+- 用的就是 `check_rules`：同一个调用者、同一个 client（和改稿复查一样是存档那次的），答案由 Jev 照常落账本，缺编译结果照样触发后台补编。`tactic` 传空——旧稿那一场的 `tactic` 哪儿都没存（批次行上的一直是空的），拿这一场的去判旧稿的方向会把该问的软规则挡掉；传空就是只按项目名判方向，判不出来全放行，卡上标了贴型的稿子本来就逐篇跟着贴型走。查的是**现在**的规则池，不是写那篇时的。
+- **不写 `batch_metrics`、不进回包、`next_step` 和 `check_rules_version_ids` 一字不动**：写手和模型都看不到它。只有一行 INFO：`规则补查(project=…): 近 21 天 N 版, 已有答案 A 版, 这次查了 C 版(判回来 J 版), 跳过 S 版, …ms`（跳过 = 还没有答案、这次没查的）。没跑完记一行 WARNING，绝不冒泡到存档。
+- 账本就是记录，进程重启不丢进度。进程里另记两样省读数的：已经知道有答案的版本不再问账本；查过一次的版本 6 小时内（`RULE_SWEEP_RETRY_AFTER_SEC`）不再查——正文是空的、这一组没有规则题、Jev 没判完的那些查了也没有行，不记的话「旧的在前」会一直卡在它们上面。
+- 同一个项目同时只有一个在排 / 在跑（只管本进程）。没配判定服务、`RULE_SWEEP_AUTO=0`、池子关着（测试里默认，`tests/conftest.py`）时什么都不做。不占改稿复查那 4 个名额。
+
+看补到哪儿了（近 21 天写作台的稿子里，交出去的那版有规则题答案的占多少）：
+
+```sql
+select b.project_id, count(*) as delivered,
+       count(*) filter (where exists (
+           select 1 from truth_vault.note_feature_answers a
+            where a.subject_type = 'aw_version' and a.run_tag = 'shadow-rules' and a.subject_id = v.id::text)) as with_rule_answers
+  from autowriter.versions v
+  join autowriter.items i on i.id = v.item_id and i.best_version_id = v.id
+  join autowriter.batches b on b.id = i.batch_id
+ where v.created_at > now() - interval '21 days' and b.params->>'source' = 'deskcore'
+ group by 1 order by 2 desc;
+```
+
+改稿复查复盘时这样查：
 
 ```sql
 select created_at,
@@ -1462,6 +1498,7 @@ env：
 | `RULE_COMPILE_TIMEOUT_SEC` | 可选 | 默认 `420`，夹在 60–900。规则编译（§3.11）一次请求的读超时；Jev 最坏约 361 秒，所以至少 400。只有后台线程和 CLI 用它 |
 | `RULE_COMPILE_BATCH` | 可选 | 默认 `60`，夹在 1–60（Jev 的上限）。一次编几条 |
 | `RULE_COMPILE_AUTO` | 可选 | 默认开。`0` 关掉 `open_project` / `record_rule` / `check_rules` 触发的后台补编，只剩 `cli compile-rules`。上线补编（`compile-rules --all`）那一阵要先设 `0`，跑完再去掉：CLI 和服务进程的后台补编不共用锁，同时编会付两遍钱（§3.11） |
+| `RULE_SWEEP_AUTO` | 可选 | 默认开。`0` 关掉存档之后的规则补查（给这个项目还没有规则题答案的旧稿在后台补一轮 `check_rules`，每次存档最多 20 版，只花 Jev 规则题的钱，写手看不到；见「规则检查的后台补查」）。改稿的后台复查不受它管 |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
 
