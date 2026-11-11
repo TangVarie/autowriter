@@ -72,6 +72,10 @@ class AuthError(Exception):
         self.shape = shape
 
 
+MISCONFIGURED_KEY_MAP = ("server auth misconfigured: 服务端的钥匙配置(DESKCORE_KEYS)解析不了, 所有请求都会 401; "
+                         "哪里不对看 /health 的 auth.note 或服务端日志。")
+
+
 class _MalformedKeyMap(Exception):
     """DESKCORE_KEYS 配了但解析不了。【绝不能】退化成"没配"。"""
 
@@ -99,11 +103,11 @@ def _key_map() -> dict[str, dict]:
     # 的配置错误。/health 是 Railway 的健康检查路径, 它 500 = 部署起不来。
     # 配置错误必须在【解析这一步】就变成可读的 401, 不能漏到运行期。
     # (codex review)
-    bad = [k for k, v in parsed.items() if not isinstance(v, dict)]
+    # 2026-11-11: 只报第几条(从 1 数), 不带钥匙的前几位 —— 这句话会原样进 401 和不带鉴权的 /health。
+    bad = [i for i, v in enumerate(parsed.values(), 1) if not isinstance(v, dict)]
     if bad:
-        preview = ", ".join(f"{k[:6]}…" for k in bad[:5])
         raise _MalformedKeyMap(
-            f"DESKCORE_KEYS 有 {len(bad)} 个条目的值不是对象({preview}) —— "
+            f"DESKCORE_KEYS 第 {bad[:5]} 条的值不是对象 —— "
             '每个 key 要写成 {"<key>": {"user_id": "<uuid>", "name": "..."}}')
     return parsed
 
@@ -141,10 +145,11 @@ def auth_health() -> tuple[bool, str]:
     except _MalformedKeyMap as exc:
         return False, f"{exc} —— 所有请求都会 401, 服务实际不可用"
     if keys:
-        missing = [k[:6] + "…" for k, v in keys.items()
-                   if not (v or {}).get("user_id", "").strip()]
+        # 只报第几条(从 1 数), 不带钥匙的前几位: /health 不带鉴权(2026-11-11)
+        missing = [i for i, v in enumerate(keys.values(), 1)
+                   if not str((v or {}).get("user_id") or "").strip()]
         if missing:
-            return False, f"DESKCORE_KEYS 有条目缺 user_id: {missing}"
+            return False, f"DESKCORE_KEYS 第 {missing} 条缺 user_id"
         unusable = _unusable_key_positions(keys)
         if unusable:
             return False, (
@@ -188,8 +193,9 @@ _FLAG_WORDS = {"whitespace_around": "首尾带空格", "whitespace_inside": "中
                "ellipsis": "带省略号", "bearer_prefix": "开头多了 Bearer(这一栏只放钥匙本身)",
                "non_ascii": "有非英文字符",
                "placeholder": "像示例里的占位"}
-INVALID_KEY_HOW = ("请对照发给你的那把钥匙, 把整把钥匙重新粘贴一遍: 不带空格、不带省略号, mcp.json 里钥匙外面只留一对引号; "
-                   "然后重启客户端、开一个新对话。")
+# 先说贴在哪儿、再说怎么贴(复审 11-11): 这一句也会被对话里的模型转述, 光说「重新粘贴一遍」容易变成把钥匙贴进对话。
+INVALID_KEY_HOW = ("请对照发给你的那把钥匙, 在客户端的写作台连接设置(mcp.json)里把整把钥匙重新粘贴一遍: 不带空格、不带省略号, "
+                   "钥匙外面只留一对引号; 然后重启客户端、开一个新对话。钥匙不要发到对话里。")
 
 
 def _as_typed(provided: str) -> str:
@@ -258,19 +264,28 @@ def _invalid_key(provided: str) -> AuthError:
     return AuthError(invalid_key_detail(shape), reason=_invalid_reason(shape), shape=shape)
 
 
+def _sendable(key: str) -> bool:
+    """整串都是可见 ASCII(33~126): 客户端能原样放进请求头的钥匙就是这个样子(``_unusable_key_positions`` 同一条线)。"""
+    return bool(key) and all(33 <= ord(ch) <= 126 for ch in key)
+
+
 def _lookup_forms(provided: str) -> list[str]:
-    """拿去查的写法: 原样, 再加去掉首尾空白的(和原样不一样时)。
+    """拿去查的写法: 原样, 再加去掉首尾空白的(和原样不一样、而且去完整串是可见 ASCII 时)。
 
     为什么可以去首尾空白: 钥匙走的是 HTTP 头, 头的值首尾的空白按规范不算值的一部分(多数服务器在到这里之前就去掉了
     空格和 tab; 不间断空格、全角空格这类它们不管, 复制粘贴时又最容易带上)。去掉之后**整把**对上了配的钥匙, 说明对方手里
     就是这把, 放行不多给任何人东西。原样那一份先查, 所以原来能过的一个不少。
     空白有两种到法: 直接是那个字符, 或客户端按 UTF-8 发、到这里按 latin-1 解成了两三个怪字符(``_as_typed`` 还原的那种)
     —— 所以去空白的有两份: 原样去的, 还原之后去的。
+    ⚠️ 去完之后**整串是可见 ASCII** 才拿去查(复审 11-11)。还原那一步本身不能多放行任何东西: 不加这一条, 配置里一把
+    带「…」的钥匙(11-03 那种把截短的示例 ``k-xxx-…`` 原样贴进 DESKCORE_KEYS 的)就从「客户端发不出来、一直 401」变成
+    「谁照着示例发谁就过」—— 那一串不是秘密。UTF-8 里 0x80 以上的字节还原不出 ASCII, 所以加了这一条之后, 多出来的两份
+    和原样相比只可能少了首尾的空白。
     只去首尾: 中间的空格、引号、省略号、多出来的 Bearer 都不动 —— 那些改了就是在替对方猜钥匙, 照实 401 并说出来。
     去完是空的不查: 空串不是钥匙。"""
     forms = [provided]
     for cand in (provided.strip(), _as_typed(provided).strip()):
-        if cand and cand not in forms:
+        if _sendable(cand) and cand not in forms:
             forms.append(cand)
     return forms
 
@@ -316,8 +331,10 @@ def resolve(provided: str | None) -> Caller:
         keys = _key_map()
     except _MalformedKeyMap as exc:
         # 配坏了 → 401, 【不是】dev 模式。见 _key_map 的说明。
+        # 2026-11-11: 回给调用方的是固定的一句 —— 哪里不对(第几条、JSON 错在第几个字符)只进日志和 /health 的 auth.note,
+        # 401 里不说服务端的钥匙配置长什么样(和钥匙对不上那一句同一条线)。
         logger.error("%s", exc)
-        raise AuthError(f"server auth misconfigured: {exc}", reason="misconfigured") from exc
+        raise AuthError(MISCONFIGURED_KEY_MAP, reason="misconfigured") from exc
 
     single = os.environ.get("DESKCORE_API_KEY")
 

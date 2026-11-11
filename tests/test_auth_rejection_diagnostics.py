@@ -26,8 +26,8 @@ UID = "00000000-0000-4000-8000-000000000001"
 GOOD = "k-shili-0123456789abcdefFAKE"                      # 现编的
 OTHER = "k-lingyi-zyxwvutsrq9876543210"                    # 现编的
 
-HOW = ("请对照发给你的那把钥匙, 把整把钥匙重新粘贴一遍: 不带空格、不带省略号, mcp.json 里钥匙外面只留一对引号; "
-       "然后重启客户端、开一个新对话。")
+HOW = ("请对照发给你的那把钥匙, 在客户端的写作台连接设置(mcp.json)里把整把钥匙重新粘贴一遍: 不带空格、不带省略号, "
+       "钥匙外面只留一对引号; 然后重启客户端、开一个新对话。钥匙不要发到对话里。")
 NO_FLAGS = dict.fromkeys(("whitespace_around", "whitespace_inside", "quotes", "ellipsis", "bearer_prefix", "non_ascii",
                           "placeholder"), False)
 
@@ -150,6 +150,9 @@ def test_the_how_to_fix_sentence():
     for must in ("对照发给你的那把钥匙", "整把钥匙重新粘贴一遍", "不带空格", "不带省略号", "只留一对引号", "重启客户端",
                  "开一个新对话"):
         assert must in HOW
+    # 复审 11-11: 先说贴在哪儿(连接设置), 再说怎么贴; 最后一句拦住「把钥匙贴进对话」(这一句也会被对话里的模型转述)
+    assert HOW.index("客户端的写作台连接设置(mcp.json)里") < HOW.index("整把钥匙重新粘贴一遍")
+    assert HOW.endswith("钥匙不要发到对话里。")
     for bad in ("你写错", "你的错", "归档", "DESKCORE_KEYS", "Railway", "运维"):
         assert bad not in HOW and bad not in "".join(identity._FLAG_WORDS.values())
 
@@ -232,6 +235,45 @@ def test_whitespace_that_arrived_as_utf8_bytes_is_stripped_too(one_key, wrap):
     assert _refused(garbled).reason == "invalid"
 
 
+# 复审 11-11: 还原 UTF-8 那一步只为去掉首尾的空白, 不能让配置里一把带「…」的钥匙变得发得上来。11-03 那次贴进
+# DESKCORE_KEYS 的就是截短的示例 ``k-xxx-…``: 那一串谁都看得到, 它一直 401 才对(/health 也是这么说的)。
+ELIDED = "k-shili-…"                                       # 现编的, 截短的示例那个样子
+LATIN1 = "k-shili-é0123456789abcdef"                       # 现编的, 带一个 latin-1 字符
+
+
+@pytest.mark.parametrize("sent", [
+    ELIDED.encode("utf-8").decode("latin-1"),                              # 客户端按 UTF-8 发、到这里按 latin-1 解的
+    (ELIDED + "\u00a0").encode("utf-8").decode("latin-1"),
+    ("\u3000" + ELIDED + " ").encode("utf-8").decode("latin-1"),
+    ELIDED + "\u00a0", " " + ELIDED, ELIDED + "\u3000",                    # 去首尾空白也不能对上它
+])
+def test_an_elided_entry_in_the_key_map_is_never_matched_by_a_repaired_form(monkeypatch, sent):
+    _keys(monkeypatch, {ELIDED: {"user_id": UID, "name": "示例写手"}})
+    exc = _refused(sent)
+    assert exc.reason == "invalid_ellipsis" and exc.shape["ellipsis"] is True
+    assert identity._lookup_forms(sent) == [sent], "去完不是可见 ASCII 的不拿去查"
+    ok, note = identity.auth_health()
+    assert not ok and "[1]" in note and "会一直 401" in note, "/health 说的那句还是真的"
+
+
+def test_a_non_ascii_single_key_is_not_matched_by_a_repaired_form_either(monkeypatch):
+    for var in ("DESKCORE_KEYS", "DESKCORE_ALLOW_ANONYMOUS"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DESKCORE_API_KEY", ELIDED)
+    monkeypatch.setenv("DESKCORE_DEFAULT_USER_ID", UID)
+    assert _refused(ELIDED.encode("utf-8").decode("latin-1")).reason == "invalid_ellipsis"
+    assert _refused(ELIDED + "\u00a0").reason == "invalid_ellipsis"
+
+
+def test_only_printable_ascii_forms_are_added_and_the_exact_form_behaves_as_before(monkeypatch):
+    _keys(monkeypatch, {LATIN1: {"user_id": UID, "name": "示例写手"}})
+    assert identity.resolve(LATIN1).user_id == UID, "原样对得上的照旧(改之前也是这样)"
+    assert _refused(LATIN1.encode("utf-8").decode("latin-1")).reason == "invalid", "按 UTF-8 发的: 改之前对不上, 现在也对不上"
+    assert _refused(LATIN1 + " ").reason == "invalid_whitespace"
+    assert identity._sendable(GOOD) and not identity._sendable("") and not identity._sendable(GOOD + " ")
+    assert not identity._sendable(ELIDED) and not identity._sendable(LATIN1) and not identity._sendable(GOOD + "\x7f")
+
+
 @pytest.mark.parametrize("wrap, reason", [
     ('"{}"', "invalid_quotes"), ("'{}'", "invalid_quotes"), ("“{}”", "invalid_quotes"),
     ("Bearer {}", "invalid_bearer_prefix"), ("bearer {}", "invalid_bearer_prefix"),
@@ -285,6 +327,26 @@ def test_every_other_refusal_has_its_reason_and_no_shape(monkeypatch, setup, pro
         monkeypatch.setenv(k, v)
     exc = _refused(provided)
     assert exc.reason == reason and exc.shape is None and str(exc).startswith(starts)
+
+
+def test_a_broken_key_map_says_a_fixed_sentence_and_nothing_about_the_configured_keys(monkeypatch):
+    """复审 11-11: 配置写坏时的 401 是固定的一句; /health 的说明只报第几条, 不带钥匙的前几位。"""
+    for var in ("DESKCORE_API_KEY", "DESKCORE_DEFAULT_USER_ID", "DESKCORE_ALLOW_ANONYMOUS"):
+        monkeypatch.delenv(var, raising=False)
+    fixed = ("server auth misconfigured: 服务端的钥匙配置(DESKCORE_KEYS)解析不了, 所有请求都会 401; "
+             "哪里不对看 /health 的 auth.note 或服务端日志。")
+    for raw in ("{not json", "[1]", json.dumps({GOOD: {"user_id": UID}, OTHER: UID, "k-disan-00000000FAKE": "x"})):
+        monkeypatch.setenv("DESKCORE_KEYS", raw)
+        assert str(_refused("k-suibian-00000000")) == fixed == identity.MISCONFIGURED_KEY_MAP
+        ok, note = identity.auth_health()
+        assert not ok
+        for leaked in (GOOD, OTHER, GOOD[:6], OTHER[:6], "k-disa", "k-shi", "k-lin"):
+            assert leaked not in note, leaked
+    assert "第 [2, 3] 条的值不是对象" in note
+    monkeypatch.setenv("DESKCORE_KEYS", json.dumps({GOOD: {"user_id": UID}, OTHER: {"user_id": " "},
+                                                     "k-disan-00000000FAKE": {"name": "n"}, "k-disi-0000FAKE": {"user_id": None}}))
+    ok, note = identity.auth_health()
+    assert not ok and note == "DESKCORE_KEYS 第 [2, 3, 4] 条缺 user_id"
 
 
 def test_rejections_are_counted_by_reason_with_the_time_of_the_last_one(one_key, fresh_counts):

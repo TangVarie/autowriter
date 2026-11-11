@@ -12,6 +12,8 @@
   7. 留痕 ``comment_set_log``: 新的在前、最多 20 条、{at, by, before, after}; by 是钥匙的备注名(app 注入, 调用方传不进来),
      不是钥匙; 和现在一样的不写、不留痕;
   8. 注册在 TOOLS 里, 说明里写清只在用户明说时调、不为了让检查通过去改; 写手看得到的话里没有工程指令。
+  9. 复审 11-11: 字数那一项什么输入都只回那一句(不漏成 500); 「一样不一样」按数比, 不按念出来的样子; 库里原来不认的
+     那个数点出来(它这里能改); 同一个项目的调用排队、排到了再读、写完核对配比和留痕; 等于不数的那一项不出句子。
 REST / MCP / /tools / /health 那一层在 tests/test_set_comment_mix_http.py(要 fastapi)。
 全部是合成项目、合成品牌和假列名。
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import threading
 
 import pytest
 
@@ -134,13 +137,23 @@ def test_short_chars_bounds_are_accepted(given, stored):
     assert _params(c)["comment_set"]["short_chars"] == stored and type(_params(c)["comment_set"]["short_chars"]) is int
 
 
-@pytest.mark.parametrize("bad", [5, 41, 0, -15, 15.5, "15.0", "十五", True, [15]])
+@pytest.mark.parametrize("bad", [5, 41, 0, -15, 15.5, "15.0", "十五", True, [15],
+                                 # 复审 11-11: 这几个原来不是那一句, 是漏出去的 ValueError / OverflowError(REST 上是 500)
+                                 "²", "①", "１５", "٣٠", float("inf"), float("-inf"), float("nan"), 1e300, "1e400", ""])
 def test_short_chars_out_of_bounds_are_refused(bad):
     c = _client()
     with pytest.raises(core.CommentMixError) as exc:
         _set(c, {"short_chars": bad})
     assert str(exc.value) == f"一句话短评的字数(short_chars)要是 6~40 的整数, 现在是 {bad!r}。"
     assert _writes(c) == []
+
+
+def test_a_very_long_bad_value_is_not_echoed_back_whole():
+    c = _client()
+    for mix in ({"short_chars": "9" * 500}, {"brand_max": "x" * 500}):
+        with pytest.raises(core.CommentMixError) as exc:
+            _set(c, mix)
+        assert len(str(exc.value)) < 120
 
 
 def test_brand_max_plus_neutral_min_cannot_exceed_the_whole_set():
@@ -251,9 +264,28 @@ def test_the_tool_goes_through_the_validator_the_readers_use(monkeypatch):
     def _refuse(raw):
         raise core._CommentSetError("示例: 校验不过")
     monkeypatch.setattr(core, "_validate_comment_set", _refuse)
-    with pytest.raises(core.CommentMixError) as exc:
+    with pytest.raises(core.CommentMixError):
         _set(c, {"brand_max": 0.6})
+    assert _writes(c) == []
+    with pytest.raises(core.CommentMixError) as exc:
+        _set(c, {k: 0.2 if k != "short_chars" else 12 for k in core.MIX_KEYS})   # 四个数都给了, 合并完那一遍还是它
     assert str(exc.value) == core.MIX_EXISTING_BAD and _writes(c) == []
+
+
+@pytest.mark.parametrize("key, values", [
+    ("brand_max", [0, 0.5, 1, 1.0, None, 7, -0.1, "0.3", True, [0.5], float("nan")]),
+    ("neutral_min", [0.3, None, "三成", 1.01]),
+    ("short_chars", [6, 15, 40, None, 5, 41, 99, "12", 15.0, True]),
+])
+def test_one_stored_number_is_judged_by_the_readers_validator(key, values):
+    """「库里这个数读的时候认不认」不另写一套判法: 就是拿它单独过 ``_validate_comment_set``。"""
+    for v in values:
+        try:
+            core._validate_comment_set({key: v})
+            ok = True
+        except core._CommentSetError:
+            ok = False
+        assert core._mix_stored_ok(key, v) is ok, (key, v)
 
 
 @pytest.mark.parametrize("mix", [{"brand_max": 0.6}, {"brand_max": 1, "neutral_min": 0}, {"neutral_min": 0},
@@ -269,7 +301,7 @@ def test_whatever_the_tool_stores_is_never_later_treated_as_bad_config(mix):
 
 
 @pytest.mark.parametrize("existing", [dict(CFG, column="甲|乙"), dict(CFG, column=""), dict(CFG, extra=1),
-                                      dict(CFG, short_chars=99), dict(CFG, neutral_min="三成"), "不是对象", [1]])
+                                      "不是对象", [1]])
 def test_an_existing_problem_this_tool_cannot_fix_is_not_written_over(existing):
     c = _client(cfg=existing)
     before = c.rows["projects"][0]["default_params"]
@@ -287,6 +319,87 @@ def test_an_existing_bad_number_can_be_fixed_by_setting_it():
     out = _set(c, {"brand_max": 0.5})
     assert out["changed"] is True and out["summary"].endswith("提品牌的上限 读不出来 → 50%。")
     assert core._comment_set(c.rows["projects"][0])[1] is None
+
+
+@pytest.mark.parametrize("existing, key, sentence", [
+    (dict(CFG, short_chars=99), "short_chars",
+     "这个项目现有的一句话短评的字数(short_chars)读的时候不认(现在是 99, 要 6~40 的整数), 配比没有改。这个数这里能改: "
+     "用户同意的话, 把 short_chars 也放进 mix 一起改掉再调一次; 不然请用户找负责人看一下。"),
+    (dict(CFG, neutral_min="三成"), "neutral_min",
+     "这个项目现有的中性评论的下限(neutral_min)读的时候不认(现在是 '三成', 要 0 到 100% 之间的数), 配比没有改。这个数这里能改: "
+     "用户同意的话, 把 neutral_min 也放进 mix 一起改掉再调一次; 不然请用户找负责人看一下。"),
+    (dict(CFG, short_chars=None), "short_chars", None), (dict(CFG, short_min="x" * 200), "short_min", None),
+])
+def test_an_existing_bad_number_that_was_not_given_is_named_because_this_tool_can_fix_it(existing, key, sentence):
+    """复审 11-11: 原来回的是「有一项不是这里能改的…请用户找负责人」—— 可那一项正是四个数里的一个。"""
+    c = _client(cfg=existing)
+    before = c.rows["projects"][0]["default_params"]
+    with pytest.raises(core.CommentMixError) as exc:
+        _set(c, {"brand_max": 0.6})
+    said = str(exc.value)
+    assert said != core.MIX_EXISTING_BAD and f"({key})读的时候不认" in said and "这个数这里能改" in said
+    assert said.endswith(f"把 {key} 也放进 mix 一起改掉再调一次; 不然请用户找负责人看一下。") and len(said) < 200
+    if sentence:
+        assert said == sentence
+    assert _writes(c) == [] and c.rows["projects"][0]["default_params"] == before
+    fix = {"brand_max": 0.6, key: 12 if key == "short_chars" else 0.2}
+    assert _set(c, fix)["changed"] is True, "照那一句把它一起放进来就改成了"
+    assert core._comment_set(c.rows["projects"][0])[1] is None
+
+
+# 复审 11-11: 「和现在一样」按数比, 不按念出来的样子比
+def test_a_stored_value_that_only_looks_the_same_is_replaced_by_one_the_readers_accept():
+    """库里写的是 "12"(读的时候不认), 念出来也是「12 字」: 用户把它设成 12 就该修好, 不是「有一项不是这里能改的」。"""
+    c = _client(cfg={"short_min": 0.2, "short_chars": "12"})
+    assert core._comment_set(c.rows["projects"][0])[0] is None
+    out = _set(c, {"short_chars": 12})
+    assert out["changed"] is True
+    assert out["summary"] == "「示例项目」一组评论的配比改了: 一句话短评的字数 读不出来 → 12 字。"
+    assert _params(c)["comment_set"] == {"short_min": 0.2, "short_chars": 12}
+    assert core._comment_set(c.rows["projects"][0])[1] is None
+    c = _client(cfg={"short_min": 0.2, "short_chars": 15.0})
+    assert _set(c, {"short_chars": 15})["summary"].endswith("一句话短评的字数 读不出来 → 15 字。")
+    assert type(_params(c)["comment_set"]["short_chars"]) is int
+
+
+def test_removing_a_share_that_is_stored_as_null_is_not_a_change():
+    """库里 "brand_max": null 和没有这一项是一回事: 去掉它不写、不留痕, 不回一句空的「改了: 。」。"""
+    c = _client(cfg={"brand_max": None, "short_min": 0.2})
+    before = c.rows["projects"][0]["default_params"]
+    out = _set(c, {"brand_max": None})
+    assert out["changed"] is False and out["summary"] == "「示例项目」的配比和现在的一样, 没有改。"
+    assert out["before"] == out["after"] and _writes(c) == [] and c.rows["projects"][0]["default_params"] == before
+    out = _set(c, {"short_min": 0.3})                    # 改别的那一项照常, 那个 null 原样留着
+    assert out["summary"] == "「示例项目」一组评论的配比改了: 一句话短评的下限 20% → 30%。"
+    assert _params(c)["comment_set"] == {"brand_max": None, "short_min": 0.3}
+
+
+def test_removing_a_stored_null_short_chars_is_a_repair_and_says_so():
+    c = _client(cfg={"short_min": 0.2, "short_chars": None})          # 读的时候: 配置不对
+    assert core._comment_set(c.rows["projects"][0])[0] is None
+    out = _set(c, {"short_chars": None})
+    assert out["changed"] is True
+    assert out["summary"] == "「示例项目」一组评论的配比改了: 一句话短评的字数 读不出来 → 15 字(默认)。"
+    assert core._comment_set(c.rows["projects"][0])[1] is None
+
+
+def test_a_summary_is_never_an_empty_list_of_changes():
+    seeds = [{"brand_max": None}, {"short_chars": None}, {"short_chars": "12"}, {"brand_max": 0.333}, {"neutral_min": 0},
+             {"brand_max": 1}, {"short_min": 0.2, "short_chars": 15.0}, {"column": COL}, CFG]
+    mixes = [{"brand_max": None}, {"short_chars": None}, {"short_chars": 12}, {"brand_max": 33}, {"neutral_min": None},
+             {"neutral_min": 0}, {"brand_max": 1}, {"short_min": 0.2}, {"short_chars": 15}, {k: None for k in core.MIX_KEYS}]
+    for seed in seeds:
+        for mix in mixes:
+            c = _client(cfg=dict(seed))
+            try:
+                out = _set(c, mix)
+            except core.CommentMixError:
+                continue
+            if out["changed"]:
+                assert not out["summary"].endswith("改了: 。") and " → " in out["summary"], (seed, mix, out["summary"])
+                assert len(_writes(c)) == 1
+            else:
+                assert _writes(c) == [], (seed, mix)
 
 
 # ── 6. default_params 的形状 ─────────────────────────────────────────────────────────────────────
@@ -330,6 +443,138 @@ def test_a_write_that_did_not_land_is_reported_as_not_changed(monkeypatch):
     assert out["changed"] is False and out["warning"] == out["summary"] == core.MIX_NOT_STORED
     assert out["after"] == out["before"], "回的是库里实际的数, 不是要改成的"
     assert "comment_set" not in out and "next_step" not in out
+
+
+# 复审 11-11: 这一列现在是写手的模型在对话里写 —— 同一个项目的调用排队, 排到了再读, 写完核对配比和留痕
+def test_two_calls_on_one_project_queue_and_the_second_builds_on_the_first(monkeypatch):
+    """甲读完、还没写, 乙也来改同一个项目: 乙等甲写完再读。原来乙先写完, 甲拿旧的一份盖回去 —— 乙的改动和留痕都没了,
+    两边还都报改成了。"""
+    c = _client()
+    real = store.set_project_default_params
+    in_write, release = threading.Event(), threading.Event()
+
+    def slow(client, pid, params_json):
+        if not in_write.is_set():                        # 只卡住第一次写
+            in_write.set()
+            assert release.wait(10)
+        return real(client, pid, params_json)
+    monkeypatch.setattr(store, "set_project_default_params", slow)
+    outs = {}
+    a = threading.Thread(target=lambda: outs.update(a=_set(c, {"brand_max": 0.6}, by="示例写手甲")))
+    b = threading.Thread(target=lambda: outs.update(b=_set(c, {"short_min": 0.4}, by="示例写手乙")))
+    a.start()
+    assert in_write.wait(10)
+    b.start()
+    b.join(0.5)
+    assert b.is_alive(), "乙要等甲写完(同一个项目排队)"
+    release.set()
+    a.join(10)
+    b.join(10)
+    assert outs["a"]["changed"] is True and outs["b"]["changed"] is True
+    assert outs["b"]["before"]["brand_max"] == 0.6, "乙是在甲改完的那份上改的"
+    assert _params(c)["comment_set"] == dict(CFG, brand_max=0.6, short_min=0.4), "两个人的改动都在"
+    assert [e["by"] for e in _params(c)[core.COMMENT_SET_LOG_KEY]] == ["示例写手乙", "示例写手甲"], "两条留痕都在"
+
+
+def test_the_lock_is_per_project():
+    assert core._mix_lock("示例-a") is core._mix_lock("示例-a") and core._mix_lock("示例-a") is not core._mix_lock("示例-b")
+    c = _client()
+    with core._mix_lock("另一个项目"):                   # 别的项目占着锁, 不挡这个项目
+        assert _set(c, {"brand_max": 0.6})["changed"] is True
+    with pytest.raises(core.CommentMixError):
+        core.set_comment_mix(c, _pid(c), user_id=ME, mix={"column": "另一列"}, by=BY, at=AT)
+    before = len(core._MIX_LOCKS)
+    with pytest.raises(core.ProjectNotFound):
+        core.set_comment_mix(c, "no-such-project", user_id=ME, mix={"brand_max": 0.6}, by=BY, at=AT)
+    assert len(core._MIX_LOCKS) == before, "没过归属校验的 id 不占一把锁"
+
+
+def test_the_row_is_read_again_once_the_lock_is_held(monkeypatch):
+    """归属校验读到的那一行可能已经旧了(排队的时候别人写过): 合并用的是拿到锁之后再读的那一行。"""
+    c = _client()
+    real = core.assert_project_access
+
+    def stale(client, project_id, *, user_id):
+        row = dict(real(client, project_id, user_id=user_id))           # 校验时读到的那一份
+        c.rows["projects"][0]["default_params"] = json.dumps(            # 之后别人写了: 改了短评的下限, 加了别的键
+            {"comment_set": dict(CFG, short_min=0.4), "archived": True, "delivery": {"layout": "blocks"}})
+        return row
+    monkeypatch.setattr(core, "assert_project_access", stale)
+    out = _set(c, {"brand_max": 0.6})
+    assert out["changed"] is True and out["before"]["short_min"] == 0.4
+    after = _params(c)
+    assert after["comment_set"] == dict(CFG, brand_max=0.6, short_min=0.4)
+    assert after["archived"] is True and after["delivery"] == {"layout": "blocks"}, "别人刚写的键没有被旧的一份盖掉"
+
+
+def test_a_write_that_was_overwritten_with_the_same_mix_but_without_this_log_entry_is_not_reported_as_done(monkeypatch):
+    """写完再读: 配比碰巧对得上、这次的留痕却不在 —— 是另一个写拿旧的一份盖过来了, 照实说没改成。"""
+    c = _client()
+    real = store.set_project_default_params
+
+    def overwritten(client, pid, params_json):
+        real(client, pid, params_json)
+        params = json.loads(params_json)
+        params[core.COMMENT_SET_LOG_KEY] = [{"at": AT, "by": "另一位", "before": None, "after": None}]
+        return real(client, pid, json.dumps(params, ensure_ascii=False))
+    monkeypatch.setattr(store, "set_project_default_params", overwritten)
+    out = _set(c, {"brand_max": 0.6})
+    assert out["changed"] is False and out["summary"] == out["warning"] == core.MIX_NOT_STORED
+
+
+def test_a_later_write_to_another_key_does_not_turn_a_landed_change_into_not_stored(monkeypatch):
+    c = _client()
+    real = store.set_project_default_params
+
+    def then_archived(client, pid, params_json):
+        return real(client, pid, json.dumps(dict(json.loads(params_json), archived=True), ensure_ascii=False))
+    monkeypatch.setattr(store, "set_project_default_params", then_archived)
+    out = _set(c, {"brand_max": 0.6})
+    assert out["changed"] is True and "warning" not in out, "这次的配比和留痕都在: 改成了"
+
+
+# 复审 11-11: 等于不数的那一项不出句子
+@pytest.mark.parametrize("mix, gone, kept", [
+    ({"brand_max": 1, "neutral_min": 0}, "一组里提到品牌的最多", 1),
+    ({"neutral_min": 0}, "是中性评论", 2),
+    ({"short_min": 0}, "一句话短评", 2),
+])
+def test_a_check_that_is_turned_off_has_no_line(mix, gone, kept):
+    c = _client()
+    out = _set(c, mix)
+    lines = out["comment_set"]["lines"]
+    assert not any(gone in x for x in lines) and not any("100%" in x or "至少 0%" in x or "至少 0 条" in x for x in lines)
+    assert lines[0] == core.COMMENT_SET_HEAD and len(lines) == 1 + kept + 1, "第一句、还在数的几句、列那一句"
+    assert out["next_step"] == core.MIX_NEXT_STEP and "comment_set_note" not in out
+    assert core.comments_for(c, user_id=ME, link=LINK)["comment_set"]["lines"] == lines
+
+
+@pytest.mark.parametrize("mix", [{"brand_max": 1, "neutral_min": 0, "short_min": 0},
+                                 {"brand_max": 100, "neutral_min": None, "short_min": "0%"},
+                                 {k: None for k in core.MIX_KEYS}])
+def test_when_nothing_is_counted_any_more_the_head_goes_and_the_reply_says_so(mix):
+    c = _client()
+    out = _set(c, mix)
+    assert len(out["comment_set"]["lines"]) == 1 and COL in out["comment_set"]["lines"][0], "只剩列那一句, 没有「下面几个数」"
+    assert out["comment_set_note"] == core.MIX_CLEARED_NOTE
+    assert out["next_step"] == core.MIX_CLEARED_NEXT_STEP == (
+        "把 summary 原样告诉用户。这个项目以后的评论不再数提品牌、中性、短评的条数, 别的写法底线照旧; "
+        "这一组还没交的也一样。以后也只在用户明说要改这个项目的配比时调这个工具。")
+    assert "comment_set.lines" not in out["next_step"]
+    again = core.comments_for(c, user_id=ME, link=LINK)
+    assert again["comment_set"] == out["comment_set"]
+    assert core.COMMENT_SET_NEXT_STEP not in again["next_step"], "没有在数的数: 不说「这个项目定了一组的配比」"
+
+
+def test_when_nothing_is_counted_and_there_is_no_column_there_is_no_comment_set_at_all():
+    c = _client(cfg={"brand_max": 0.5, "short_min": 0.2})
+    out = _set(c, {"brand_max": 1, "short_min": 0})
+    assert out["comment_set"] is None and out["comment_set_note"] == core.MIX_CLEARED_NOTE
+    assert _params(c)["comment_set"] == {"brand_max": 1.0, "short_min": 0.0}, "数照存, 只是不出句子"
+    again = core.comments_for(c, user_id=ME, link=LINK)
+    assert "comment_set" not in again and core.COMMENT_SET_NEXT_STEP not in again["next_step"]
+    assert core._comment_set_counts({"brand_max": 0.99}) and core._comment_set_counts({"short_min": 0.01})
+    assert not core._comment_set_counts({"brand_max": 0.996, "neutral_min": 0.004}) and not core._comment_set_counts(None)
 
 
 # ── 7. 留痕 ──────────────────────────────────────────────────────────────────────────────────────
@@ -382,6 +627,9 @@ def test_the_tool_layer_turns_refusals_into_invalid_input_and_does_not_swallow(m
         tools.set_comment_mix(_pid(c), {"brand_max": 0.6}, _user_id="22222222-2222-2222-2222-222222222222")
     with pytest.raises(core.ProjectNotFound):
         tools.set_comment_mix("no-such-project", {"brand_max": 0.6}, _user_id=ME)
+    with pytest.raises(PermissionError) as who:
+        tools.set_comment_mix(_pid(c), {"brand_max": 0.6}, _user_id=None)
+    assert str(who.value) == "无法识别调用者身份, 配比改不了。这次没做成; 请用户找负责人看一下, 不用重试。"
     assert "_safe(" not in inspect.getsource(tools.set_comment_mix).split('"""')[2], "写: 失败要冒泡"
     assert _writes(c) == []
 
@@ -407,6 +655,26 @@ def test_the_docstring_says_only_when_the_user_asks_and_never_to_pass_a_check():
         assert must in doc, must
     for name in core.MIX_KEYS:
         assert f"· {name} " in doc
+    # 复审 11-11: 七成不是 7; 「以后都按新的」这一类不走 record_rule(协议正文冻着, 两个工具的说明各说一句)
+    assert "七成写 0.7 或 70, 不要写 7(7 是 7%)" in doc
+    assert "这一类不用 record_rule 记: 记成规则不生效, 说法不一样时以 comment_set 为准。" in doc
+    assert "七成是 0.7 或 70, 单写 7 是 7%" in core.MIX_KEYS_HELP
+
+
+def test_record_rule_sends_the_mix_to_set_comment_mix():
+    """协议正文(冻着)说「以后…」必须 record_rule; 配比是例外, 记成规则不生效(说法不一样时以 comment_set 为准)。
+    没调过 comments_for 的对话里, 模型只有 record_rule 的说明可看 —— 例外写在那里, 紧跟在「什么时候调」后面。"""
+    doc = tools.record_rule.__doc__
+    assert ("例外: 一组评论里提品牌、中性、一句话短评各占几成(comments_for 回的 comment_set 那几个数)不记成规则 —— "
+            "记成规则不生效,") in doc
+    assert "用户明说这个项目以后都按新的, 调 set_comment_mix 改那几个数。" in doc
+    assert doc.index("什么时候调:") < doc.index("例外:") < doc.index("severity:")
+
+
+def test_a_bare_seven_is_seven_percent_and_the_summary_shows_it():
+    c = _client()
+    out = _set(c, {"brand_max": 7})
+    assert out["summary"] == "「示例项目」一组评论的配比改了: 提品牌的上限 50% → 7%。"
 
 
 MIX_TEXTS = {name: getattr(core, name) for name in (

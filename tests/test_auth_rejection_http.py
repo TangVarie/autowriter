@@ -29,8 +29,8 @@ KEYS = json.dumps({GOOD: {"user_id": UID, "name": "示例写手"}, OTHER: {"user
                   ensure_ascii=False)
 WRONG = "k-cuode-0000000000000000"
 WRONG_DETAIL = ("invalid X-Deskcore-Key: 服务器不认识收到的这把钥匙(长度 24, 最后 4 位「0000」; 没看出空格、引号、省略号这类问题)。"
-                "请对照发给你的那把钥匙, 把整把钥匙重新粘贴一遍: 不带空格、不带省略号, mcp.json 里钥匙外面只留一对引号; "
-                "然后重启客户端、开一个新对话。")
+                "请对照发给你的那把钥匙, 在客户端的写作台连接设置(mcp.json)里把整把钥匙重新粘贴一遍: 不带空格、不带省略号, "
+                "钥匙外面只留一对引号; 然后重启客户端、开一个新对话。钥匙不要发到对话里。")
 MCP_INIT = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2025-03-26", "capabilities": {},
                        "clientInfo": {"name": "test", "version": "0"}}}
@@ -84,10 +84,12 @@ def test_mcp_401_is_the_same_json_on_both_spellings_of_the_path(client, path):
     assert client.get(path, headers={"X-Deskcore-Key": WRONG}, follow_redirects=False).json()["detail"] == WRONG_DETAIL
 
 
-def test_mcp_with_the_right_key_is_not_401(client):
-    with client:                                           # 进上下文: MCP 的 session manager 要 lifespan
-        r = client.post("/mcp", json=MCP_INIT, headers={**MCP_HEADERS, "X-Deskcore-Key": GOOD})
-    assert r.status_code == 200, (r.status_code, r.text[:200])
+def test_mcp_with_the_right_key_gets_past_the_auth_layer(client):
+    """这里不进 lifespan(MCP 的 session manager 每个进程只能起一次, 握手成不成由 test_deskcore_cors 的 live_client 和 CI
+    那一步看): 只看带对了钥匙就不是 401、也不记成被拒。"""
+    r = client.post("/mcp", json=MCP_INIT, headers={**MCP_HEADERS, "X-Deskcore-Key": GOOD})
+    assert r.status_code != 401, (r.status_code, r.text[:200])
+    assert identity.auth_rejections()["since_start"] == dict.fromkeys(identity.AUTH_REJECT_REASONS, 0)
 
 
 def test_bearer_transport_gets_the_same_diagnosis(client):
@@ -117,6 +119,34 @@ def test_misconfigured_server_says_so(client, monkeypatch):
     r = client.get("/tools", headers={"X-Deskcore-Key": GOOD})
     assert r.status_code == 401 and r.json()["reason"] == "misconfigured" and "key_shape" not in r.json()
     assert GOOD not in r.text
+
+
+def test_a_broken_key_map_tells_an_unauthenticated_caller_nothing_about_the_keys(client, monkeypatch):
+    """复审 11-11: 少写一层的条目(合法 JSON)—— 401 是固定的一句, /health 只报第几条; 两处都没有钥匙的前几位。"""
+    monkeypatch.setenv("DESKCORE_KEYS", json.dumps({GOOD: {"user_id": UID}, OTHER: UID}))
+    r = client.get("/tools", headers={"X-Deskcore-Key": "k-suibian-00000000"})
+    assert r.status_code == 401 and r.json() == {"detail": identity.MISCONFIGURED_KEY_MAP, "reason": "misconfigured"}
+    health = client.get("/health")
+    assert "第 [2] 条的值不是对象" in health.json()["config"]["auth"]["note"]
+    for text in (r.text, health.text):
+        for leaked in (GOOD, OTHER, GOOD[:6], OTHER[:6], "k-shi", "k-lin"):
+            assert leaked not in text, leaked
+
+
+def test_an_elided_entry_in_the_key_map_cannot_be_sent_over_http(client, monkeypatch):
+    """复审 11-11: DESKCORE_KEYS 里一把截短的示例(带「…」)—— 照着它发的请求一直 401, REST 和 MCP 都是。"""
+    elided = "k-shili-…"
+    monkeypatch.setenv("DESKCORE_KEYS", json.dumps({elided: {"user_id": UID, "name": "示例写手"}}, ensure_ascii=False))
+    for sent in (elided.encode("utf-8"), (elided + "\u00a0").encode("utf-8"), ("\u3000" + elided).encode("utf-8")):
+        r = client.get("/tools", headers={"X-Deskcore-Key": sent})
+        assert r.status_code == 401 and r.json()["reason"].startswith("invalid"), r.text
+        r = client.get("/tools", headers={"Authorization": b"Bearer " + sent})
+        assert r.status_code == 401 and r.json()["reason"].startswith("invalid"), r.text
+        r = client.post("/mcp", json=MCP_INIT, headers={**MCP_HEADERS, "X-Deskcore-Key": sent})
+        assert r.status_code == 401 and r.json()["reason"].startswith("invalid"), r.text
+    r = client.get("/tools", headers={"X-Deskcore-Key": elided.encode("utf-8")})
+    assert r.json()["reason"] == "invalid_ellipsis" and r.json()["key_shape"]["length"] == len(elided)
+    assert "会一直 401" in client.get("/health").json()["config"]["auth"]["note"]
 
 
 # ── 2 / 3. 不替对方改, 只去首尾空白 ──────────────────────────────────────────────────────────────

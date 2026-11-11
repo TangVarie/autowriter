@@ -121,7 +121,10 @@ SHORT_FAIL = [BRANDED[0], BRANDED[1], "我自己是先投小公司练手的，�
 
 
 def test_set_line_head_says_whose_numbers_and_what_to_do():
-    assert core.SET_LINE_HEAD == "整组代码查(条数是这个项目定的配比, 项目规则里说法不一样时以这里为准; 直接改, 不用问用户): "
+    # 复审 11-11: 「直接改」带上宾语(改的是点名的那几条评论) —— 前面的名词是「配比」, 又有了改配比的工具
+    assert core.SET_LINE_HEAD == ("整组代码查(条数是这个项目定的配比, 项目规则里说法不一样时以这里为准; "
+                                  "照点名的几条直接改评论, 不用问用户): ")
+    assert "; 直接改," not in core.SET_LINE_HEAD and "改配比" not in core.SET_LINE_HEAD
     assert core.SET_LINE_HEAD_ALL == "整组代码查(所有项目都管; 直接改, 不用问用户): "
     for head in (core.SET_LINE_HEAD, core.SET_LINE_HEAD_ALL):
         assert head.startswith("整组代码查"), "工具说明和回包都按这四个字认那一句"

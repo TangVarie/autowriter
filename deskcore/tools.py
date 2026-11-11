@@ -1169,6 +1169,8 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
     """把一条规则永久记住。团队共享 —— 队友写这个项目时也会守。
 
     什么时候调: 用户说的是「以后都这样」而不是「这次这样」。分不清就问一句。
+    例外: 一组评论里提品牌、中性、一句话短评各占几成(comments_for 回的 comment_set 那几个数)不记成规则 —— 记成规则不生效,
+    说法不一样时以 comment_set 为准。用户明说这个项目以后都按新的, 调 set_comment_mix 改那几个数。
 
     severity:
       · "hard" —— 不可违反的硬约束, 以后每次生成都会顶在最前面要求 100% 满足。
@@ -1399,7 +1401,7 @@ def set_comment_mix(project_id: str, mix: dict, _user_id: str | None = None,
     """改这个项目一组评论的配比(comments_for 回的 comment_set 里那几个数)。**只在用户明说要改这个项目的配比时调。**
 
     什么时候调: 用户明说这个项目以后的评论都按新的配比写(「以后提品牌的放到七成」「这个项目不用数短评了」)。改完之后写这个
-    项目的人都按新的数, 不用找负责人。
+    项目的人都按新的数, 不用找负责人。这一类不用 record_rule 记: 记成规则不生效, 说法不一样时以 comment_set 为准。
     什么时候不调:
       · 用户只是这一组想要别的配比(「这次每条都带品牌」): 不调。这一组照用户说的写, 交付时一句话说明和项目定的配比不一样,
         项目的数不动;
@@ -1412,6 +1414,7 @@ def set_comment_mix(project_id: str, mix: dict, _user_id: str | None = None,
       · short_min   —— 至少几成是一句话短评
       · short_chars —— 多少字以内算一句话短评(6~40 的整数)
     几成可以写小数(0.5)也可以写百分数(50 或 "50%"), 都是五成; 写 1 是全部(100%), 要 1% 写 0.01 或 "1%"。
+    七成写 0.7 或 70, 不要写 7(7 是 7%)。
     brand_max 写 1、下限写 0 就是这一样不限了; 值写 null 是把这一项去掉(不再数)。brand_max 加 neutral_min 不能超过 100%
     (中性评论是不提品牌的): 要把提品牌的上限放到 100%, 同一次把 neutral_min 写 0 或 null。
     例: ``{"brand_max": 0.7}``、``{"short_min": null}``、``{"brand_max": 60, "neutral_min": 20}``。
@@ -1422,8 +1425,8 @@ def set_comment_mix(project_id: str, mix: dict, _user_id: str | None = None,
       · changed —— 改了没有。和现在一样就是 false, 什么都没写
       · before / after —— 改之前、改之后的四个数(没定的是 null)
       · summary —— 一句话: 哪几项从多少改成了多少。**原样告诉用户**
-      · comment_set —— 改完之后的 ``lines`` 和 ``column``, 和 comments_for 回的同一个样子; 四个数都去掉、项目也没配列时是
-        null(带一句 ``comment_set_note``), 这个项目就不数配比了
+      · comment_set —— 改完之后的 ``lines`` 和 ``column``, 和 comments_for 回的同一个样子(等于不限的那一项不出句子);
+        一个在数的数都没有了就带一句 ``comment_set_note``(这个项目不数配比了), 项目也没配列时 comment_set 是 null
     这一组还没交的评论照新的配比写, 再判时 score_comments 用的就是新的数。谁在什么时候把什么改成了什么, 写作台留着最近
     20 次的记录。
     报错里说哪个数不对的, 照着改参数再调; 说这个项目的设置现在改不了的, 照实告诉用户、请用户找负责人看一下, 不重试。
