@@ -643,7 +643,9 @@ select dims->>'emotional_lever' as lever, count(*) as published,
   的位置取条数、布尔和固定的词，最后 `_clean` 再筛一遍，不是整数 / 布尔 / 认得的词的一律丢掉；
   `tests/test_tool_call_log.py` 拿现编的标记串逐行查）。评论照旧不存库，存的只是这一行计数。
 - **不记的**：`get_protocol`、`/health` 这类不是工具的端点、认不出调用者的调用（`user_id` 是非空列，不编一个填进去）、
-  参数没过 MCP 校验的调用（到不了计时的那一处，服务日志里有一行）、开关关着时的全部调用。
+  参数没过 MCP 校验的调用（到不了计时的那一处，服务日志里有一行）、开关关着时的全部调用。存档之后在后台跑的那两样
+  `check_rules`（改稿复查、规则补查，都在 §3.19）不是工具调用，也不留这一行：`tool = 'check_rules'` 的行数就是模型自己
+  调了几次。
 - **开关**：`DESKCORE_TOOL_CALL_LOG=0` 关掉，默认开。
 - **读这张表的地方都要按 `meta.mode` 或 `batch_id` 筛。** 历史页的 `db.list_batch_metrics` 改成只读 `batch_id` 不为空的行
   （不筛的话一天几十上百行的调用记录会把批次指标挤出最近 N 条）；本文档里的查询和 TV `verify_supabase_state.sql` #104 都带
@@ -659,6 +661,7 @@ select dims->>'emotional_lever' as lever, count(*) as published,
 | `items` / `reply_chars` | 有才带 | 这次带了几篇稿 / 几条评论 / 几个版本（发牌是要几张）；回包的字符数（紧凑 JSON，中文一个字算一个） |
 | `skill` | `open_project` / `comments_for` | 这次报上来的 skill 版本：`up_to_date` / `outdated` / `unknown`（没报） |
 | `check` | `check_drafts` | `total` / `pass` / `warn` / `reject`；`decided_by` 是可疑和拒的各由哪个信号定的（`opening` / `title` / `ngram` / `contain`，一篇可以有几个）；`gates` 是不是撞车的拒（`replace_lookup` 这类）；`semantic_degraded` |
+| `rules` | `check_rules` | 回包里的数（§3.11 的 2026-11-11 那一版回包）：`status`（`checked` / `nothing_to_check` / `no_versions` / `error`）；`versions`、`must_fix`、`suggest`、`unsure`、`unjudged`、`evidence_not_found`（Jev 怀疑有问题、指不出是哪一句的，算在 `unjudged` 里）、`not_finished`、`empty_body`、`code_unchecked`、`more`，都是整次的合计（同回包的 `summary`，有才带）；`flagged`（有要动手的那几篇）、`judged`（规则题判回来了的那几篇）；`unsure_rules` / `unsure_rules_hard`（最外层列出来的偏向没守住的规则几条、其中硬约束几条，最多 3）；`excluded` / `remaining`（不是这个项目的、留到下一次的各几版）；`pool` 是规则池里各几条（同回包的 `rules`，只取数：`pool` / `by_jev` / `by_code` / `uncompiled` / `partial` / `code_unavailable` / `code_withdrawn` / `not_compilable` …）。规则 id、版本 id、题面和 Jev 指出的句子都不取 |
 | `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks` |
 | `comments.checks` | `score_comments` | `style` 是写法底线每样打回几条（`period` 句号 / `dialect` 方言语气词 / `contact` 像要联系方式 / `post_ref` 提了帖子 / `vague` 含糊指代）；`brand_over`（提品牌超出几条）、`repeats`（说法或开头重复的几条）、`endings_over`（品牌收尾超出几条）、`short_by` / `neutral_by`（短评、中性还差几条；项目没定这一项、或中性没判成时没有这个键）；`fix` / `style_fix`（带这两样的各几条）、`thread_fix` / `thread_hints`（整组的各几句） |
 
@@ -715,6 +718,19 @@ select s.status, sig.key as signal, sum(sig.value::int) as drafts
  where m.meta->>'mode' = 'tool_call' and m.meta->>'tool' = 'check_drafts'
    and m.created_at > now() - interval '14 days'
  group by 1, 2 order by 3 desc;
+
+-- 查规则: 模型调了几次、查了几版、必须改 / 建议改 / 拿不准各几条、几次带了 unsure_rules、几次有规则查不了
+select count(*) as calls, meta->'rules'->>'status' as status,
+       sum((meta->'rules'->>'versions')::int) as versions,
+       sum((meta->'rules'->>'must_fix')::int) as must_fix, sum((meta->'rules'->>'suggest')::int) as suggest,
+       sum((meta->'rules'->>'unsure')::int) as unsure, sum((meta->'rules'->>'evidence_not_found')::int) as unlocated,
+       count(*) filter (where (meta->'rules'->>'unsure_rules')::int > 0) as with_unsure_rules,
+       count(*) filter (where (meta->'rules'->'pool'->>'code_unavailable')::int > 0) as with_comment_only_rules,
+       round(avg((meta->>'reply_chars')::int)) as avg_reply_chars
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and meta->>'tool' = 'check_rules'
+   and created_at > now() - interval '7 days'
+ group by 2 order by 1 desc;
 
 -- 评论(W-51): 判了几次、几篇帖子、一篇帖子判几轮、整组过了几次、被拒的调用几次
 select count(*) as score_calls,
@@ -1365,7 +1381,7 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 - 刚存的这一批不到 3 分钟，不在里面：模型自己那次 `check_rules` 通常二十来秒就到，等它先查。它查了的账本里有行，这里一次 Jev 都不多花；它没查的，下一次存档补上。
 - **旧的在前。** 改动对只有发出去的稿子才有，发布比存档晚好几天，越早的稿子越可能已经有了那一对；最早的那几版也最先滑出 21 天的窗口。新的在前的话每次的名额都先给刚写的（模型多半会自己查），等着校准的旧稿一直轮不到、过期。
 - 用的就是 `check_rules`：同一个调用者、同一个 client（和改稿复查一样是存档那次的），答案由 Jev 照常落账本，缺编译结果照样触发后台补编。`tactic` 传空——旧稿那一场的 `tactic` 哪儿都没存（批次行上的一直是空的），拿这一场的去判旧稿的方向会把该问的软规则挡掉；传空就是只按项目名判方向，判不出来全放行，卡上标了贴型的稿子本来就逐篇跟着贴型走。查的是**现在**的规则池，不是写那篇时的。
-- **不写 `batch_metrics`、不进回包、`next_step` 和 `check_rules_version_ids` 一字不动**：写手和模型都看不到它。只有一行 INFO：`规则补查(project=…): 近 21 天 N 版, 已有答案 A 版, 这次查了 C 版(判回来 J 版), 跳过 S 版, …ms`（跳过 = 还没有答案、这次没查的）。没跑完记一行 WARNING，绝不冒泡到存档。
+- **不写 `batch_metrics`（存档那一行不多一块，也不留「每次工具调用一行」，§3.8 末尾）、不进回包、`next_step` 和 `check_rules_version_ids` 一字不动**：写手和模型都看不到它。只有一行 INFO：`规则补查(project=…): 近 21 天 N 版, 已有答案 A 版, 这次查了 C 版(判回来 J 版), 跳过 S 版, …ms`（跳过 = 还没有答案、这次没查的）。没跑完记一行 WARNING，绝不冒泡到存档。
 - 账本就是记录，进程重启不丢进度。进程里另记两样省读数的：已经知道有答案的版本不再问账本；查过一次的版本 6 小时内（`RULE_SWEEP_RETRY_AFTER_SEC`）不再查——正文是空的、这一组没有规则题、Jev 没判完的那些查了也没有行，不记的话「旧的在前」会一直卡在它们上面。
 - 同一个项目同时只有一个在排 / 在跑（只管本进程）。没配判定服务、`RULE_SWEEP_AUTO=0`、池子关着（测试里默认，`tests/conftest.py`）时什么都不做。不占改稿复查那 4 个名额。
 

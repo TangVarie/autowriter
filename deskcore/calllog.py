@@ -12,6 +12,8 @@
 ``build`` 只从固定的位置取数(长度、布尔、固定的词), 最后 ``_clean`` 再筛一遍 —— 不是整数 / 布尔 / 认得的词的一律丢掉。
 队列里等着的那一项握着这次调用的参数和回包(只在进程内存里, 写完就放), 进库的只有摘出来的那一行。
 
+存档之后在后台跑的 check_rules(改稿复查、规则补查)不是工具调用: 它们直接调 core, 不经过 app 的那两处, 不留这一行。
+
 core 里知道、回包里没有的数(一组评论每样检查打回几条、帖子是按链接还是按正文对上的)用 ``note`` 记一笔: app 在工具跑的
 那个线程里装了一个收数的字典(``collecting``), 没装(CLI、用例直接调 core)时 ``note`` 什么都不做。
 
@@ -138,6 +140,43 @@ def _check_block(res: dict) -> dict:
     return block
 
 
+# check_rules 回包里的数(2026-11-11 那版回包: 拿不准 / 没判出来的每篇只有条数, 偏向没守住的按规则汇成 unsure_rules)
+_RULES_SUMMARY = ("versions", "must_fix", "suggest", "unsure", "unjudged", "evidence_not_found", "not_finished",
+                  "empty_body", "code_unchecked", "more")
+_RULES_POOL = ("pool", "by_jev", "by_code", "uncompiled", "not_checkable", "not_compilable", "partial",
+               "code_unavailable", "code_withdrawn", "code_refused", "code_timed_out", "by_score_drafts",
+               "questions_unchecked", "ledger_write_errors")
+_RULES_STATUSES = frozenset({"checked", "nothing_to_check", "no_versions", "error"})
+
+
+def _rules_block(res: dict) -> dict:
+    """check_rules: 这次怎么收场的、查了几版、必须改 / 建议改 / 拿不准 / 没判出来各几条(整次的合计, 同回包的 ``summary``),
+    列出来的 ``unsure_rules`` 几条、其中硬约束几条, 规则池里各有几条是怎么查的 / 为什么没查(同回包的 ``rules``, 只取数)。
+    规则 id、规则原文、Jev 指出的句子一样不取。"""
+    status = res.get("status")
+    block: dict = {"status": status if status in _RULES_STATUSES else "other"}
+    summary = res.get("summary") if isinstance(res.get("summary"), dict) else {}
+    for key in _RULES_SUMMARY:
+        if _int(summary.get(key)) is not None:
+            block[key] = _int(summary[key])
+    rows = [v for v in res.get("versions") if isinstance(v, dict)] if isinstance(res.get("versions"), list) else []
+    if rows:
+        block["flagged"] = sum(1 for v in rows if v.get("violations"))          # 有要动手的那几篇
+        block["judged"] = sum(1 for v in rows if v.get("judge_status") == "ok")  # 规则题判回来了的那几篇
+    lean = [e for e in res.get("unsure_rules") if isinstance(e, dict)] if isinstance(res.get("unsure_rules"), list) else []
+    if lean:
+        block["unsure_rules"] = len(lean)
+        block["unsure_rules_hard"] = sum(1 for e in lean if e.get("severity") == "hard")
+    for key, value in (("excluded", res.get("excluded")), ("remaining", res.get("remaining_version_ids"))):
+        if _count(value):
+            block[key] = _count(value)
+    pool = res.get("rules") if isinstance(res.get("rules"), dict) else {}
+    pool = {key: _int(pool[key]) for key in _RULES_POOL if _int(pool.get(key)) is not None}
+    if pool:
+        block["pool"] = pool
+    return block
+
+
 _COMMENT_NOTES = ("source", "post8")                                            # core 记的词
 _SCORE_NOTES = ("earlier", "no_slot", "existing")                               # core 记的数
 _SCORE_CHECKS = ("brand_over", "repeats", "endings_over", "short_by", "neutral_by")
@@ -232,6 +271,8 @@ def build(job: dict) -> dict:
     if result is not None:
         if tool == "check_drafts":
             meta["check"] = _check_block(res)
+        elif tool == "check_rules":
+            meta["rules"] = _rules_block(res)
         elif tool in COMMENT_TOOLS:
             meta["comments"] = _comment_block(tool, res, notes)
     if notes.get("skill") is not None:

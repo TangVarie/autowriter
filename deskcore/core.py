@@ -3309,9 +3309,13 @@ def _rule_sweep(client, project_id: str, user_id) -> dict:
 
 
 def _rule_sweep_job(client, project_id: str, user_id) -> dict:
-    """池子里跑的那一层: 跑完(不管怎么完的)把这个项目从 _RULE_SWEEP_ACTIVE 里拿掉。"""
+    """池子里跑的那一层: 跑完(不管怎么完的)把这个项目从 _RULE_SWEEP_ACTIVE 里拿掉。
+
+    补查不是哪一次工具调用: 它调的 check_rules 不经过 app 的那两处计时, 所以不留「每次工具调用一行」(calllog), 也不写
+    batch_metrics。这里另把收数的字典摘掉再跑(calllog.collecting(None, …)): 池子就地跑(用例)或者线程带着排它的那次
+    score_drafts 的上下文时, 补查里记的数也进不了那一次调用的那一行。"""
     try:
-        return _rule_sweep(client, project_id, user_id)
+        return calllog.collecting(None, _rule_sweep, client, project_id, user_id)
     finally:
         with _RULE_SWEEP_LOCK:
             _RULE_SWEEP_ACTIVE.discard(str(project_id))

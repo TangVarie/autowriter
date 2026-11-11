@@ -20,7 +20,8 @@ import librarian_client as lib
 from deskcore import core, skillcheck, tools
 from tests.fakes import FakeClient
 from tests.test_flywheel_arm import ME, PATTERNS, PID, _Librarian, _client, _commit_meta, _commit_out
-from tests.test_rule_compile import PROJ, FakeJev, jev_sha, make_client, mem, question_result
+from tests.test_rule_compile import (PROJ, FakeJev, _batch_of_ten_fails_on, _error_result, jev_sha, make_client, mem,
+                                     question_result)
 
 RULE_MARK = "规则原文标记丙RQ3"
 RAW_VERSION = "乱填的版本串标记丁"
@@ -225,6 +226,82 @@ def test_a_whole_batch_failure_is_counted_by_its_status(monkeypatch, jev):
     block = core._rule_compile_meta(PROJ)
     assert block["uncompiled"] == 2 and block["error_kinds"] == {f"batch_{rep['status']}": 2}
     assert RULE_MARK not in json.dumps(block, ensure_ascii=False)
+
+
+# ── rule_compile × 拆小重发: 种类按重发之后的结局数 ──────────────────────────────────────────────
+
+def test_a_whole_batch_failure_that_the_resend_recovers_leaves_no_error_kinds(monkeypatch, jev):
+    """第一次整批 502(那一下没通), 拆成 ≤ 3 条重发都编出来了: 这一块说 0 条没编出来, 不带错误种类 —— 报告里留着的那笔
+    batch_errors(第一次的)不算。"""
+    jev.compile_detail = "规则一条都没编出来：生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded"
+    jev.compile_status_fn = lambda body: 502 if len(body["rules"]) > 3 else 200
+    rep = core.compile_rules(make_client([mem(i) for i in range(1, 6)]), PROJ)
+    assert rep["status"] == "ok" and rep["batch_errors"][0]["status"] == "jev_failed"
+    assert (rep["resent"], rep["recovered"]) == (5, 5)
+    block = core._rule_compile_meta(PROJ)
+    assert (block["status"], block["uncompiled"]) == ("ok", 0) and "error_kinds" not in block
+
+
+def test_only_the_rules_that_fail_again_after_the_resend_are_counted_by_kind(monkeypatch, jev):
+    """一批 10 条里 1 条让模型输出不合格, 这一批 10 条都带 error 回来; 重发之后只有和它同一小批的 3 条还没编出来。
+    原来(没有重发)是 10 条 bad_output。日志那一行和这一块是同一套词、同一个数。"""
+    import logging
+    rules = [mem(i, severity="hard") for i in range(1, 11)]
+    _batch_of_ten_fails_on(jev, monkeypatch, {rules[4]["id"]}, error=f"模型输出不合格（已重试一次）：{RULE_MARK}")
+    records: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda rec: records.append(rec.getMessage())
+    logging.getLogger("deskcore.core").addHandler(handler)
+    try:
+        rep = core.compile_rules(make_client(rules), PROJ)
+    finally:
+        logging.getLogger("deskcore.core").removeHandler(handler)
+    assert rep["status"] == "partial" and (rep["resent"], rep["recovered"], len(rep["errors"])) == (10, 7, 3)
+    block = core._rule_compile_meta(PROJ)
+    assert block["uncompiled"] == 3 and block["error_kinds"] == {"bad_output": 3}
+    assert RULE_MARK not in json.dumps(block, ensure_ascii=False)
+    (line,) = [m for m in records if "拆小重发" in m and "没编出来" in m]
+    assert "还有 3 条没编出来" in line and "bad_output: " in line
+
+
+def test_a_resend_that_fails_again_as_a_whole_is_counted_once_per_rule(monkeypatch, jev):
+    """第一次整批 502、重发的小请求又是 502: 每条按重发那次的结局记一次(生成端 529), 不再按第一次那一批多数一遍。"""
+    jev.compile_status = 502
+    jev.compile_detail = "规则一条都没编出来：生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded"
+    rep = core.compile_rules(make_client([mem(1), mem(2)]), PROJ)
+    assert rep["status"] == "jev_failed" and len(rep["batch_errors"]) == 1 and len(rep["errors"]) == 2
+    block = core._rule_compile_meta(PROJ)
+    assert block["uncompiled"] == 2 and block["error_kinds"] == {"generator_http_529": 2}
+
+
+def test_a_batch_that_is_not_resent_is_counted_by_its_status_and_its_size(monkeypatch, jev):
+    """读超时不重发(照旧停整次运行): 那一批按 batch_timeout 记条数; 后面没发的几条只在 uncompiled 里。"""
+    import requests
+    monkeypatch.setattr(config, "RULE_COMPILE_BATCH", 3)
+    jev.raise_exc = requests.Timeout("read timed out (synthetic)")
+    rep = core.compile_rules(make_client([mem(i) for i in range(1, 6)]), PROJ)
+    assert rep["status"] == "timeout" and rep["not_sent"] == 2 and "resent" not in rep
+    block = core._rule_compile_meta(PROJ)
+    assert block["uncompiled"] == 5 and block["error_kinds"] == {"batch_timeout": 3}
+
+
+def test_rules_left_unsent_when_a_resend_is_stopped_keep_their_first_failure_kind(monkeypatch, jev):
+    """重发的第一个小请求被挡下(整次运行停): 这一批 5 条照第一次的失败各记一次, 被挡的那个小请求不再另数 3 条。"""
+    import requests
+    monkeypatch.setattr(config, "RULE_COMPILE_BATCH", 5)
+    jev.compile_one = lambda r: _error_result(r, "生成端调用失败：GeneratorStopped: 模型拒答（stop_reason=refusal）")
+    real_post = requests.post
+
+    def post(url, **kw):
+        if url.endswith("/compile_rules") and len(jev.compile_calls()) == 1:         # 第 2 个请求 = 第一小批重发
+            jev.compile_status, jev.compile_detail = 403, "policy: 示例项目没清出境"
+        return real_post(url, **kw)
+    monkeypatch.setattr(requests, "post", post)
+    rep = core.compile_rules(make_client([mem(i) for i in range(1, 8)]), PROJ)
+    assert rep["status"] == "policy_blocked" and rep["not_sent"] == 2 and len(rep["errors"]) == 5
+    assert [b["status"] for b in rep["batch_errors"]] == ["policy_blocked"]
+    block = core._rule_compile_meta(PROJ)
+    assert block["uncompiled"] == 7 and block["error_kinds"] == {"refusal": 5}
 
 
 def test_an_unreadable_pool_records_the_status_without_a_count(monkeypatch, jev):
