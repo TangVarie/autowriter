@@ -13,7 +13,7 @@
 
 ## 0. 一句话现状
 
-**整条链路已经跑通并验证过**：八个迁移全部落库（08-26 当时一共八个；现在到 `018`，2026-11-04 只读核过生产库 `001`–`018` 都在，以 `doctor` 为准）、服务在 Railway 上线、指纹库
+**整条链路已经跑通并验证过**：八个迁移全部落库（08-26 当时一共八个；现在到 `019`，2026-11-04 只读核过生产库 `001`–`018` 都在，`019` 只提速、等 owner 跑一次，见 §1.15；以 `doctor` 为准）、服务在 Railway 上线、指纹库
 回填完 **3,678 行 / 44 个项目**、四路查重信号全部到齐。剩下的只有一件是**你要做**
 的——把 deskcore 挂到客户端（见 §2 第 3 步），不挂上去这一整套没人用。
 
@@ -62,7 +62,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 | 部件 | 实测结果 |
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + `migrations/` 下全部迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
-| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4） |
+| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15 |
 | **跑的是哪一份代码** | 打 `/health` 看 `build`：`commit`（12 位）和 `protocol_version`。**不需要 key。**<br>2026-09-20 加的，起因是同一天卡了两次：早上把「Railway 还没重新部署」当事实写进记录（其实没核实、它早就上线了），下午 Railway 一次部署真失败、服务停在 6 小时前的版本，而**从外面看不出来**（`/health` 不带版本、`/tools` 要 key）。<br>· `commit` 与 `main` 上的 SHA 不一致 → 部署没跟上，去 Railway 看那次 build 的日志。<br>· `protocol_version` 与 `skills/bywood-writing-desk/SKILL.md` 末尾那行不一致 → 运营手里那份 skill 该重新导入了。<br>· 显示 `unknown` → 只是这个诊断字段没取到值，**不代表服务不健康**（它刻意不参与 `ok`）。 |
 | **写手的 skill 是不是最新版** | `curl -H "X-Deskcore-Key: <你的 key>" https://autowriter-production.up.railway.app/skill-versions`（**要 key**，不放 `/health`：那里不鉴权，按 `app.py` 的规矩不许放业务数据）。`writers_24h` 是 24 小时内报上来的版本里最新 / 旧版 / 没报各几个——按「身份 × 版本」数，一个团队共用一个身份时读作「这 24 小时里有几种版本在用」，不是人数；`outdated_versions` 是旧版各是哪一版；只有计数，没有是谁。<br>2026-10-16 加的服务端探针（`deskcore/skillcheck.py`）：`open_project` / `comments_for` 带 `skill_version`、`get_protocol` 带 `local_version`。**2026-10-30 发布收尾起，提醒只看这一次调用报上来的版本**：最新不提醒；旧版（含认不出的值）在返回值里带 `skill_update`，`message` 末尾两行是升级入口（仓库里 skill 的地址 + `更新技能/bywood-writing-desk`），模型照抄给写手；没报（或报「无」这类占位）只记一笔计数、不提醒。其它工具不再捎提醒。不拦写稿。<br>原来按身份记版本、没报就沿用 12 小时内的记录或提醒「没核到版本」、其它工具 30 分钟抽查一次——一个团队共用一个身份时，一个人的旧 skill 让所有人收到提醒，重启后每场开头又报一句「没核到」，所以撤了。计数在进程内存里，重启清零。要找还在用旧版的人：看 `outdated_versions` 有没有值，在群里让大家各自看一眼 skill 里那一行。<br>**2026-11-11 起不带 key、重启之后也查得到**：每次存档那一行指标带 `meta.skill_versions`（就是这份计数），`open_project` / `comments_for` 的调用记录带 `meta.skill`（这一次报上来的是最新 / 旧版 / 没报），只读 SQL 见 `docs/deskcore.md` §3.8 末尾。 |
 | **每个工具调了几次、多久、怎么收场** | 只读 SQL 查 `autowriter.batch_metrics` 里 `meta->>'mode' = 'tool_call'` 的行（2026-11-11 起每次工具调用一行，只有数；查询在 `docs/deskcore.md` §3.8 末尾）。评论那一路判了几条、哪一样检查打回了几条也在这里（W-51 不用再翻网关日志）。写不进去不影响任何调用，只在服务日志里留一行 `工具调用留痕: 没写进库`（5 分钟最多一行）；要停就设 `DESKCORE_TOOL_CALL_LOG=0`。 |
@@ -297,6 +297,52 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `dashboard_views_v1.sql`），理由写在迁移文件头。验收：`doctor` 里「视图 v_angle_outcomes」applied；
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
+
+### 1.15 `019_dedup_gin_first` —— 查重取候选先走四字串的索引（2026-11-11，W-21 / AU-F08，**生产库还没跑**）
+
+历史多的项目里查重慢：两条查重函数取候选时按项目把历史指纹逐行比一遍，四字串的 GIN 索引轮不上。11-11 生产库最大的
+项目（1,163 条指纹）10 篇一组 3,677 毫秒，而一组稿子在查重、入库前重查、入库写指纹三处各付一次。019 只换
+`deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 里取候选的那一步（先按四字串从全库取、再筛项目），候选集和结论
+不变，**不碰数据**。为什么非得是 `MATERIALIZED` 加 `(SELECT ng)`、量过的数，见 `docs/deskcore.md` §3.25 和迁移文件头。
+
+**顺序。** 代码不依赖它（Python 没改，签名和返回列没动），先于或后于部署都行；没跑之前一切照旧。
+① SQL Editor（`postgres`，函数属主）跑 `019`。② 验收（SQL Editor，只读）：
+
+```sql
+-- 两行, 四个 true(先剥注释再查: 注释里也写着这两个词)
+select p.proname,
+       regexp_replace(p.prosrc, '--[^\n]*', '', 'g') like '%cand AS MATERIALIZED (%'        as gin_first,
+       regexp_replace(p.prosrc, '--[^\n]*', '', 'g') like '%f.ngram_hashes && (SELECT ng)%' as array_hidden
+  from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+ where n.nspname = 'autowriter' and p.proname in ('deskcore_check_drafts', 'deskcore_commit_fingerprints');
+
+-- 拿最大的项目最近 10 篇的 sketch 调一次线上函数(STABLE, 一行都不写), 看最后一行 Execution Time:
+-- 11-11 跑 019 之前是 3,677 毫秒; 跑完应在 1 秒以内(同一组稿子照新写法跑是 341 毫秒)
+explain (analyze, costs off, timing off)
+select r.idx, r.best_j
+  from (select project_id from autowriter.draft_fingerprints
+         group by project_id order by count(*) desc limit 1) p
+ cross join lateral (
+       select jsonb_agg(jsonb_build_object('opening_hash', '',
+                                           'ngram_hashes', to_jsonb(t.ngram_hashes))) as j
+         from (select f.ngram_hashes from autowriter.draft_fingerprints f
+                where f.project_id = p.project_id and array_length(f.ngram_hashes, 1) is not null
+                order by f.created_at desc limit 10) t
+       ) d
+ cross join lateral autowriter.deskcore_check_drafts(p.project_id, d.j, 15) r;
+```
+
+③ `doctor` 里 019 那一行是 `unprobeable`（PostgREST 读不到函数体，同 `008` / `016`），不算红；它给的就是上面第一句。
+④ 下一批存档之后看 `commit_parts_ms` 的 `gate` 和 `fingerprints`（`docs/deskcore.md` §3.8 第二条查询）：历史多的项目应从
+每篇约 0.4 秒降到 0.1 秒以内。
+
+**第二句还在 3 秒以上**，说明计划器没走 GIN。结论不受影响，只是没变快；退回原来的写法：SQL Editor 里整个重跑
+`008_embedding_model_isolation.sql`（`deskcore_check_drafts` 回到 008 那一版），再只跑 `005_deskcore_containment.sql` 里
+`CREATE OR REPLACE FUNCTION autowriter.deskcore_commit_fingerprints(` 到它的 `$$;` 那一块。别整个重跑 `005`：它会先 DROP
+`deskcore_check_drafts`、建回没有按模型过滤的那一版，跑完还得再跑一遍 `008`。
+
+**要知道的。** 二三十条指纹以下的小项目每篇多 10~20 毫秒（GIN 的钱跟全库命中的行数走，不跟项目走）；全库涨到几万行
+时再看一次这一步。生产库的函数体和仓库里的只差注释（11-11 剥掉注释、压掉空白之后 md5 相同），跑完 019 连注释也一致了。
 
 ### 1.14 `018_draft_snapshots` —— 查重时记下底稿，tv-sync 拿飞书的帖来对（2026-10-29，W-38）
 

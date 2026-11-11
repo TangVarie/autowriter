@@ -49,6 +49,7 @@ PSQL = ["psql", "-h", PGHOST, "-p", PGPORT, "-U", "postgres", "-v", "ON_ERROR_ST
 
 PID = "11111111-1111-1111-1111-111111111111"
 UID = "22222222-2222-2222-2222-222222222222"
+PID_OTHER = "33333333-3333-3333-3333-333333333333"     # 019: 别的项目里的稿子不许算进来
 
 POOL = ("的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会"
         "可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部"
@@ -412,6 +413,22 @@ def main() -> int:
         print("  ✓ deskcore_check_drafts 的最终函数体带着按模型过滤"
               "(008 生效, 且没被后面的迁移覆盖)")
 
+    # ── ②‴ 019 的两个记号落在【最终】的函数体里 ───────────────────────
+    # 同 008: 019 是 CREATE OR REPLACE, 签名和返回列没动, 结论也不变 —— 记号丢了(或者被后面的迁移盖回
+    # 旧写法)从调用侧完全看不出来, 只是悄悄慢回去。这里只验写法在不在; **不断言计划**: 本 harness 的表只有
+    # 几行, 计划器对小表本来就选顺序扫描, 写法对不对都一样。计划在生产库上用 019 文件末尾那句 EXPLAIN 核。
+    for fn in ("deskcore_check_drafts", "deskcore_commit_fingerprints"):
+        code = re.sub(r"--[^\n]*", "", sql(
+            "SELECT prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            f"WHERE n.nspname='autowriter' AND p.proname='{fn}';"))
+        lost = [t for t in ("cand AS MATERIALIZED (", "f.ngram_hashes && (SELECT ng)") if t not in code]
+        if lost:
+            print(f"  [FAIL] {fn} 的函数体里没有 {lost} —— migrations/019 没生效, 或者被后面的迁移"
+                  "覆盖回去了。后果: 结论不变, 但取候选退回按项目逐行比(或全表顺序扫描), 查重悄悄慢回去")
+            bad += 1
+        else:
+            print(f"  ✓ {fn} 的最终函数体取候选先走 GIN(019 的两个记号都在)")
+
     # ── ③ SQL 与 Python 算出来的数一样 ─────────────────────────────────
     # 跑完整套 schema 之后 draft_fingerprints 上是有 FK 的, 先把 project 建出来。
     # (这本身也是个信号: 之前那个手搭的最小骨架没有 FK, 也就测不到这一层。)
@@ -549,6 +566,41 @@ def main() -> int:
         bad += 1
     else:
         print("  [ok  ] commit 侧同样跳过诱饵, 拦住并归因到被照搬的那篇")
+
+    # ── 019: 项目条件挪到了读 cand 的那一层 —— 别的项目里的稿子不许算进来 ──
+    # 019 之前项目条件和 && 写在同一层。019 先按 && 取全库的命中、再筛项目: 哪天谁改那一步时把
+    # `c.pid = _project_id` 弄丢, 上面每一例照样全绿(夹具只有一个项目), 而查重会开始拿别的项目的稿子拦人。
+    sql(f"DELETE FROM autowriter.draft_fingerprints WHERE project_id='{PID}';")
+    sql(f"INSERT INTO autowriter.projects (id, name, owner_id) "
+        f"VALUES ('{PID_OTHER}', 'parity-check-other', '{UID}') ON CONFLICT (id) DO NOTHING;")
+    sql(f"DELETE FROM autowriter.draft_fingerprints WHERE project_id='{PID_OTHER}';")
+    o_hs = sorted(fp.ngram_hashes(doc(rng, 60)))
+    sql("INSERT INTO autowriter.draft_fingerprints"
+        "(project_id,title,opening_hash,ngram_hashes) VALUES"
+        f"('{PID_OTHER}','别的项目里的同一篇','ohO','{pg_array(o_hs)}');")
+    out = sql("SELECT best_j, best_c, coalesce(j_title,'-'), coalesce(c_title,'-') FROM "
+              f"autowriter.deskcore_check_drafts('{PID}'::uuid, '{payload(o_hs)}'::jsonb);").split("|")
+    own = sql("SELECT best_j, coalesce(j_title,'-') FROM "
+              f"autowriter.deskcore_check_drafts('{PID_OTHER}'::uuid, '{payload(o_hs)}'::jsonb);").split("|")
+    rows = json.dumps([{"title": "和别的项目一样的那篇", "opening": "w", "opening_hash": "ohw",
+                        "ngram_hashes": o_hs, "title_embedding": None,
+                        "version_id": "", "angle_key": ""}], ensure_ascii=False)
+    res = sql("SELECT status, coalesce(collided_with,'-') FROM "
+              f"autowriter.deskcore_commit_fingerprints('{PID}'::uuid, '{rows}'::jsonb, "
+              f"'{UID}'::uuid, {fp.NGRAM_JACCARD_HARD}, "
+              f"{fp.NGRAM_CONTAIN_HARD}, {fp.CONTAIN_MIN_SAMPLE});")
+    if float(out[0]) != 0 or float(out[1]) != 0 or out[2:] != ["-", "-"]:
+        print(f"  [FAIL] check 侧把别的项目里的稿子算进来了: {out}")
+        bad += 1
+    elif abs(float(own[0]) - 1.0) > 1e-6 or own[1] != "别的项目里的同一篇":
+        # 上面的 0 得是项目条件筛出来的, 不是 && 那一步什么都没取到
+        print(f"  [FAIL] 同一篇在它自己的项目里没被认出来: {own}")
+        bad += 1
+    elif res != f"{core.COMMIT_STATUS_INSERTED}|-":
+        print(f"  [FAIL] commit 侧被别的项目里的稿子拦住了: {res}")
+        bad += 1
+    else:
+        print("  [ok  ] 别的项目里的同一篇: check 不算、commit 不拦; 在它自己的项目里照样认得出")
 
     # ── 迁移必须幂等: 整套再跑一遍不能报错 ──────────────────────────────
     for f in files:

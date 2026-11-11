@@ -97,11 +97,12 @@ def test_fully_migrated_db_reports_ok():
     # 检查。两条探不到的理由不同: 003 建的是索引(PostgREST 看不见 pg_indexes),
     # 008 换的是函数体(签名一个字没动, 从调用侧看跑没跑过完全一样)。
     # 010 开的是 RLS: service_role 绕 RLS, 开没开从 PostgREST 读起来一模一样。
-    # 016 同 008: 换的是 deskcore_tv_notes 的函数体, 签名没动。
+    # 016 同 008: 换的是 deskcore_tv_notes 的函数体, 签名没动。019 也是(查重两条函数取候选的那一步)。
     assert report["unprobeable"] == ["003_versions_unique_num.sql",
                                      "008_embedding_model_isolation.sql",
                                      "010_tv_links_rls.sql",
-                                     "016_tv_notes_skip_vanished.sql"]
+                                     "016_tv_notes_skip_vanished.sql",
+                                     "019_dedup_gin_first.sql"]
     assert all(s in ("applied", "unprobeable") for s in _states(report).values())
 
 
@@ -795,3 +796,26 @@ def test_016_is_reported_unprobeable_with_the_sql_that_checks_it():
     assert report["ok"] is True and "016_tv_notes_skip_vanished.sql" not in report["missing"]
     # 016 不多调一次 RPC: deskcore_tv_notes 只有 009 那一次(不存在的 TV 项目, 返回空)
     assert [n for n, _ in sb.rpc_calls].count("deskcore_tv_notes") == 1
+
+
+def test_019_is_reported_unprobeable_with_the_sql_that_checks_both_tokens():
+    """019 只换了 deskcore_check_drafts / deskcore_commit_fingerprints 取候选的那一步, 签名一个字没动 —— 004 / 005 那几条
+    RPC 探测报 applied 说明不了 019 跑过。被禁止的形态: 拿「RPC 在」冒充 019 applied; 以及为了探它去调一次这两条函数
+    (commit 那条会写库)。所以它必须是 unprobeable、交出查函数体的那句 SQL(两个记号都查、先剥注释), 且不让报告变红:
+    缺席只是慢, 结论不变。"""
+    sb = FakeClient(rows=_TABLES, rpc_impl=_ALL_RPCS)
+    report = core.migration_state(sb)
+    rows = [c for c in report["checks"] if c["migration"] == "019_dedup_gin_first.sql"]
+    assert len(rows) == 1 and rows[0]["state"] == "unprobeable", rows
+    assert core.MIGRATION_DEDUP_GIN_FIRST == "019_dedup_gin_first.sql"
+    probe = core.MIGRATION_019_PROBE_SQL
+    assert probe in rows[0]["note"]
+    # 两个记号缺一个就退回慢路, 所以两列都要查; 注释里也写着这两个词, 不剥注释会报假的 true
+    assert "cand AS MATERIALIZED (" in probe and "f.ngram_hashes && (SELECT ng)" in probe
+    assert probe.count(r"regexp_replace(p.prosrc, '--[^\n]*', '', 'g')") == 2
+    assert "deskcore_check_drafts" in probe and "deskcore_commit_fingerprints" in probe
+    assert "结论不变" in rows[0]["impact"] and "慢" in rows[0]["impact"]
+    assert report["ok"] is True and "019_dedup_gin_first.sql" not in report["missing"]
+    # 019 不为自己多调一次这两条函数: 各只有 004 / 005 探签名的那一次
+    calls = [n for n, _ in sb.rpc_calls]
+    assert calls.count("deskcore_check_drafts") == 1 and calls.count("deskcore_commit_fingerprints") == 1

@@ -564,7 +564,9 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 `restore`（被拒的改稿放回旧指纹）、`replace_versions`（改稿挂旧 item）、`arm`（飞轮臂）、`mint`（建 batch / item / version，
 每篇三次写）、`consume`（角度销账，每篇一查一写）、`snapshots`（查重底稿转正，W-38）、`key_check`（key 对不上台账时多查一次）、
 `angle_debt`（存档后查欠账，只在有没带 key / key 对不上时）、`other`（拼回包、提示语、放锁）。按这个顺序一段接一段量，
-加起来等于 `phase_ms.commit`（存进 jsonb 后键会按名字重排，要按执行顺序看就按 `core.COMMIT_PARTS` 排）。攒够样本之后这样查：
+加起来等于 `phase_ms.commit`（存进 jsonb 后键会按名字重排，要按执行顺序看就按 `core.COMMIT_PARTS` 排）。
+**2026-11-11 读了**：`gate` + `fingerprints` 占 commit 的六到七成，都花在查重 RPC 取候选的那一步上，`019` 换了那一步的写法（§3.25）；
+owner 跑完 `019` 之后拿下面第二条查询再看一次这两步。攒够样本之后这样查：
 
 ```sql
 select count(*),
@@ -1589,6 +1591,66 @@ auth rejected: reason=invalid_ellipsis path=/mcp/ via=header len=9 flags=ellipsi
 「`borrow_lessons` 等满 `LIBRARIAN_TIMEOUT_SEC`」的那条改成了「不被 `open_project` 的预算截断」。`tests/conftest.py`
 每条用例从一张空表开始。
 
+### 3.25 查重取候选先走四字串的索引（2026-11-11，W-21 / AU-F08，`019`）
+
+**为什么。** 一组 10 篇在历史多的项目里存档要等十秒上下，其中六到七成花在两条查重 RPC 上（§3.8 的 `commit_parts_ms`：
+`gate` 和 `fingerprints`），而同一条 RPC 在 `check_drafts` 里还要先跑一遍。慢在取候选的那一步：
+`WHERE f.project_id = _project_id AND f.ngram_hashes && ng`，计划器按项目索引取出整个项目的行，再逐行比 `&&`，
+四字串的 GIN 索引（`draft_fp_ngram_gin_idx`，`001` 起就在）从来轮不上。耗时跟项目的历史条数和稿子的 hash 数一起涨。
+
+**现在。** `migrations/019_dedup_gin_first.sql` 只换 `deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 里的这一步：
+
+```sql
+WITH cand AS MATERIALIZED (
+    SELECT f.title, f.ngram_hashes AS hs, f.project_id AS pid
+      FROM autowriter.draft_fingerprints f
+     WHERE f.ngram_hashes && (SELECT ng)
+)
+...  FROM cand c ...  WHERE c.pid = _project_id AND array_length(c.hs, 1) IS NOT NULL
+```
+
+还是那三个条件，只是先按四字串从全库取命中的行、再筛项目，所以候选集不变，查重的结论不变。判定公式、阈值、签名、
+返回列、授权都没动，Python 一行没改；跑之前和跑之后写作台都照常用，写手和模型看不出区别，只是等得短。两个记号缺一不可：
+
+- `MATERIALIZED`：不让项目条件推回 CTE 里。推回去就又是按项目索引取全项目、逐行比。
+- `(SELECT ng)`：把数组的值对计划器藏起来。plpgsql 里每条连接头 5 次执行用定制计划，直接写 `ng` 的话计划器按实际数组
+  估行数（估成三分之一以上的行会命中），选全表顺序扫描，一篇要 3 秒以上。拿 `OFFSET 0` 当栅栏的写法同样走到顺序扫描，不能用。
+
+**量过的（11-11，生产库只读；新写法是把这一步照抄成普通 SQL 跑的）。** 全库 7,782 条指纹，最大的项目 1,163 条。
+
+| | 原来 | 新写法 |
+|---|---|---|
+| 89 个 hash 的一篇，取候选这一步（最大的项目） | 366 毫秒，读 1,163 行留 11 行 | 8 毫秒，同样 11 行 |
+| 400 个 hash 的一篇（最大的项目） | 整条函数 1,560 毫秒 | 取候选 33 毫秒 |
+| 最大的项目最近 10 篇一起查 | 3,677 毫秒 | 341 毫秒 |
+| 只有 2 条指纹的项目，217 个 hash 的一篇 | 整条函数 6 毫秒 | 取候选 21 毫秒 |
+| 数组直接写 `ng`（没有 `(SELECT …)`），89 个 hash | — | 顺序扫描，3,225 毫秒 |
+
+10 组（一篇的 sketch × 一个项目）逐行比过候选集，也比过线上函数的输出和新写法的输出（`best_j` / `j_title` / `best_c` /
+`c_title` / `c_sample`），全部相同：大项目、有一百多行空数组的项目、只有两三行的项目、整个项目都是空数组的、sketch 自己
+是空数组的、拿别的项目的稿子来查的。本地 PostgreSQL 16 上另用 9,162 行合成指纹把新旧两版函数各调了 200 篇
+（check 全列、commit 的 status / collided_with / detail），逐行相同；同一条连接里连调 8 次（头 5 次是定制计划，之后是
+通用计划）取候选都走 GIN，新连接的第 1 次调用和后面一样快。
+
+**没做的、要知道的。**
+- **要 owner 在 SQL Editor 跑一次 `019`**（两条 `CREATE OR REPLACE FUNCTION`，不碰数据）。没跑之前一切照旧，只是没变快。
+  跑完怎么核、怎么退都写在迁移文件末尾，runbook §1.15 也有。
+- **小项目会慢一点。** GIN 的钱跟全库命中的行数走，不跟项目走：二三十条指纹以下的项目这一步原来是 1 毫秒级，现在每篇
+  10~20 毫秒（10 篇一组三次 RPC 合计多不到 1 秒）。全库涨到几万行时要再看一次这一步。
+- **计划不在 CI 里断言。** 计划器走不走 GIN 还看表的大小：CI 的夹具只有几行，它对小表本来就选顺序扫描，写法对不对都
+  一样。CI 钉的是写法（两个记号都在代码里、019 相对 `008` / `005` 只换了这一步）和结果（逐例对 Python，外加「别的
+  项目里的同一篇不算」）；计划在生产库上跑完之后核一次。生产库今天的成本是 GIN 206 对顺序扫描 627。
+- 入库那条 RPC 里逐条循环取最大值时，分数完全相同的两条历史稿报哪一条的标题取决于行的读出顺序，原来也没有排序；
+  判拦不拦不受影响。`check_drafts` 那条有明确的排序，不受影响。
+- commit 段里每篇六次串行读写（`mint` / `consume` / `snapshots`）没动，那是另一件事。
+
+回归：`tests/test_dedup_gin_first.py`（两个记号在 `019` 和基线的两条函数里各出现一次、在同一个 CTE 里、项目条件在读
+`cand` 的那一层；没有 `OFFSET 0`、没有直接写 `ng` 的 `&&`；`CREATE` 到 `AS $$` 与 `008` / `005` 逐字节相同；把 `019` 的
+那一步换回去等于上一版的代码；文件里除了两条函数和它们的授权没有别的语句；校验和回滚都在文件里）。
+`tests/test_baseline_parity.py` 的登记改成 `019`。`tests/test_migration_doctor.py`：`019` 报 `unprobeable`、交出查两个
+记号的 SQL、不让报告变红、不为它多调一次 RPC。`tests/sql_parity_check.py`（CI 的真 PostgreSQL）：两个记号在最终的
+函数体里；别的项目里的同一篇 check 不算、commit 不拦。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -1628,8 +1690,8 @@ env：
 `008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql` /
 `011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql` / `014_tv_edit_diff_rev.sql` /
 `015_rule_compiles.sql` / `016_tv_notes_skip_vanished.sql` / `017_tv_link_text_fp.sql` /
-`018_draft_snapshots.sql`
-**十八个，按编号顺序跑，别跳号**（建议先在
+`018_draft_snapshots.sql` / `019_dedup_gin_first.sql`
+**十九个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -1663,6 +1725,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
 - `016_tv_notes_skip_vanished.sql`（2026-10-26，I-22）：`deskcore_tv_notes` 不再返回飞书里已删的篇（TV 的 `truth_vault.v_notes_vanished`，D-103），§3.7 表里「飞书已删」那一行。只换函数体，签名不变；视图不在就照旧全给。**静默错答**，和 `008` 同类：不跑不报错，已删的篇每晚照样被读回来重对，项目有补录目标时对不上的会被补录成副本。所以**先跑 016，再打开有已删篇的 TV 项目的补录目标**（10-26：BJS_phase1 挪走了 79 篇成人藻油，其中 14 篇是 unmatched）。`doctor` 报 `unprobeable` 并给出查函数体和视图的 SQL。
+- `019_dedup_gin_first.sql`（2026-11-11，W-21 / AU-F08）：`deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 取候选先走四字串的 GIN 索引、再筛项目（§3.25）。只换函数体里这一步，签名、返回列、结论都不变，不碰数据。**不跑不坏，只是慢**（千行的项目每篇约 0.4 秒，10 篇一组三处各等 3~5 秒）；代码不依赖它，先于或后于部署都行。`doctor` 探不到函数体，报 `unprobeable` 并给出查两个记号的 SQL；跑完用文件末尾那句 `EXPLAIN` 核一次。
 - `018_draft_snapshots.sql`（2026-10-29，W-38）：`draft_snapshots`，`check_drafts` 查过的每篇稿子（标题、正文、`angle_key`、查重结论、飞轮臂），§3.7 表里「查重底稿」那一行。只授 `service_role`、开 RLS、不建 policy（存的是稿子全文），留 60 天。**可降级，但先跑 018 再部署**：代码先上线时 `check_drafts` 照常判（记底稿那一步失败只记 WARN），tv-sync 跳过底稿那一步、照旧补录；可同一次部署已经不再催模型存档，那段时间只查了重的稿子发出去会被补录成副本（终态）。`doctor` 探这张表。
 - `017_tv_link_text_fp.sql`（2026-10-27，W-34）：`tv_note_links.tv_text_fp`（TV 正文的指纹）+ `deskcore_tv_clear_lineage`（撤回写作台自己写进 TV 的血缘：两列都还等于传进来那一对才清，返回清了的 `note_id`），§3.7 表里「正文换了」那一行。**硬失败、不写错数据**：代码先上线的话 tv-sync 读对照选不到新列，每个 TV 项目都失败、退出码 1、一行不写——所以**先跑 017 再部署**。`doctor` 探列和 RPC。
 - `015_rule_compiles.sql`（2026-10-20，D-121）：`rule_compiles`，规则编译结果的缓存，键 (`memory_id`, `sha`)（§3.11）。只授 `service_role`、开 RLS。**可降级**：不跑的话 `compile-rules` 和后台补编在读缓存这一步就报 error（记 WARN，一条都不发给 Jev，不花编译的钱），`check_rules` 回 `status: error`、记 ERROR 日志（写手那边是这次规则没查成、不能说守住了，存档已成功、交付不受影响；不是 500，10-20 第三轮复审：原来直接抛，REST 是 500、MCP 是工具错误，服务端一行日志都没有），简报和存档不受影响。`doctor` 探这张表。

@@ -6691,6 +6691,17 @@ MIGRATION_TV_NOTES_VANISHED = "016_tv_notes_skip_vanished.sql"
 MIGRATION_TV_TEXT_FP = "017_tv_link_text_fp.sql"
 # 018 建 draft_snapshots(W-38: 查重时记下的底稿, tv-sync 拿飞书的帖来对)。表探得到。
 MIGRATION_DRAFT_SNAPSHOTS = "018_draft_snapshots.sql"
+# 019 换 deskcore_check_drafts / deskcore_commit_fingerprints 取候选的那一步(先走四字串的 GIN 索引、再筛项目, W-21),
+# 签名和返回列没动 —— 同 008 / 016, 探不到。两个记号缺一个就退回慢路(MATERIALIZED 挡项目条件下推, (SELECT ng) 对计划器
+# 藏起数组的值), 所以两列都查; 先剥注释(注释里也写着这两个词)。
+MIGRATION_DEDUP_GIN_FIRST = "019_dedup_gin_first.sql"
+MIGRATION_019_PROBE_SQL = (
+    "select p.proname, "
+    r"regexp_replace(p.prosrc, '--[^\n]*', '', 'g') like '%cand AS MATERIALIZED (%' as gin_first, "
+    r"regexp_replace(p.prosrc, '--[^\n]*', '', 'g') like '%f.ngram_hashes && (SELECT ng)%' as array_hidden "
+    "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
+    "where n.nspname='autowriter' and p.proname in ('deskcore_check_drafts','deskcore_commit_fingerprints');"
+)
 MIGRATION_016_PROBE_SQL = (
     "select p.prosrc like '%v_notes_vanished%' as skips_vanished, "
     "to_regclass('truth_vault.v_notes_vanished') is not null as view_present "
@@ -7088,6 +7099,15 @@ def migration_state(client) -> dict:
     _add(MIGRATION_DRAFT_SNAPSHOTS, "表 draft_snapshots", state, note,
          "可降级(但该先跑 018 再部署): check_drafts 照常判, 只是不记底稿(记 WARN); tv-sync 跳过底稿那一遍、照旧补录 —— "
          "模型没调 score_drafts 的稿子发出去以后认不回写作台(当外面写的补录成副本, 牌不销、没有改稿差异)")
+
+    # ── 019: 查重取候选先走 GIN(W-21)。只换了两条函数的函数体, 调用侧看跑没跑过完全一样 —— 与 008 / 016 同类,
+    #    如实报 unprobeable 并交出 SQL。缺席不影响结论, 只是慢, 所以不让报告变红。
+    _add(MIGRATION_DEDUP_GIN_FIRST,
+         "deskcore_check_drafts / deskcore_commit_fingerprints 取候选先走 GIN(函数体)",
+         "unprobeable",
+         "PostgREST 读不到函数体; 用 SQL Editor 跑(两行、四个 true): " + MIGRATION_019_PROBE_SQL,
+         "缺席→查重的结论不变, 只是慢: 取候选按项目把历史指纹逐行比一遍, 耗时跟项目的历史条数涨(千行的项目每篇约 0.4 秒, "
+         "10 篇一组在查重、入库前重查、入库写指纹三处各等 3~5 秒)")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
