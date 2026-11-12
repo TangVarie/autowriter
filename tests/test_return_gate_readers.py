@@ -524,8 +524,8 @@ def test_a_store_without_the_gate_reader_builds_the_block_as_before(gate_on):
 def _sibling_world():
     w = _World()
     w.post("n-own", "本项目的稿发出去的", days=2, comments=30)
-    w.post("n-copy", "别处写的、补录在另一个项目上", days=4, comments=45, kind="ingested", pid=SIB)
-    w.post("n-sib", "另一个方向的稿发出去的", days=6, comments=25, pid=SIB, published_title="人改过的标题")
+    w.post("n-copy", "别处写的、补录在另一个项目上", days=4, comments=45, kind="ingested", pid=SIB, verdict=PASS)
+    w.post("n-sib", "另一个方向的稿发出去的", days=6, comments=25, pid=SIB, published_title="人改过的标题", verdict=PASS)
     w.post("n-old", "窗口外的", days=40, comments=99, kind="ingested", pid=SIB)
     w.post("n-amb", "判不出的", days=3, kind="ambiguous", pid=SIB)
     w.post("n-foreign", "别的 TV 项目的帖", days=3, comments=88, kind="ingested", pid=OTHER, tv=TV_OTHER)
@@ -592,8 +592,9 @@ def test_a_project_without_a_mapping_sees_what_it_sees_today(gate_on, monkeypatc
 def test_a_title_already_shown_is_not_listed_twice(gate_on):
     w = _World()
     w.post("n-own", "同一个标题发了两遍", days=2, comments=30)
-    w.post("n-dup", "同一个标题 发了两遍！", days=3, comments=40, kind="ingested", pid=SIB)   # 交叉发: 只差空白和标点
-    w.post("n-third", "另一篇", days=4, comments=50, kind="ingested", pid=SIB)
+    w.post("n-dup", "同一个标题 发了两遍！", days=3, comments=40, kind="ingested", pid=SIB,   # 交叉发: 只差空白和标点
+           verdict=PASS)
+    w.post("n-third", "另一篇", days=4, comments=50, kind="ingested", pid=SIB, verdict=PASS)
     w.drafted("b1", ["另一篇", "还没发的新稿"])
     c = w.client()
     got = store.recent_titles(c, PID, working=5)
@@ -623,6 +624,27 @@ def test_sibling_titles_follow_the_gate_in_the_working_column(gate_on):
     sib = _tv_link_reads(c)
     assert len(sib) == 1 and sib[0]["cols"] == "note_id, version_id, match_kind, tv_project_id, gate, gate_reasons"
     assert not _gate_reads(c)
+
+
+def test_a_sibling_row_without_a_verdict_is_a_title_to_avoid_but_not_a_model(gate_on):
+    """并进来的别的项目的行, 结论那一格是空的(闸那一步连着几晚没跑成、或者开关开在第一晚判之前)或者是不认识的值:
+    算发出去的标题(要避开), 不进 working —— 这个项目以前从没见过它, 「没有结论 = 同以前」对它就是不摆出来。
+    本项目自己的行照旧: 没有结论 = 没有闸时的口径, 照样进 working。"""
+    w = _World()
+    w.post("n-own", "本项目的、还没判过", days=5, comments=30)
+    w.post("n-sib-null", "别处写的、还没判过", days=5, comments=90, kind="ingested", pid=SIB)
+    w.post("n-sib-odd", "别处写的、结论不认识", days=5, comments=80, kind="ingested", pid=SIB,
+           verdict={"gate": "later", "gate_reasons": {"reasons": []}})
+    w.post("n-sib-ok", "别处写的、放行了", days=5, comments=60, kind="ingested", pid=SIB, verdict=PASS)
+    c = w.client()
+    got = store.recent_titles(c, PID, working=5)
+    assert got["working"] == ["别处写的、放行了", "本项目的、还没判过"], got["working"]
+    assert {"别处写的、还没判过", "别处写的、结论不认识"} <= set(got["published"]), "发出去的那一栏照旧有它们"
+    assert len(_tv_link_reads(c)) == 1 and not _gate_reads(c), "不为这个多发请求"
+    # 那一行在哪个项目名下, 哪个项目就照旧看得到它(那边它是自己的行)
+    back = store.recent_titles(w.client(), SIB, working=5)
+    assert back["working"] == ["别处写的、还没判过", "别处写的、结论不认识", "别处写的、放行了"], back["working"]
+    assert "本项目的、还没判过" in back["published"]
 
 
 def test_own_rows_the_tv_project_read_did_not_cover_are_asked_about_separately(gate_on, monkeypatch):

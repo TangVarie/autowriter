@@ -4156,9 +4156,10 @@ def _sibling_links(sb, project_id: str, have: set[str]) -> tuple[list[dict], fro
     对上别的方向的稿子的帖挂在那个方向上 —— 写手真在写的那个项目要是不是补录目标, 它的简报就看不到团队这个月发了什么。
     开关开着时 _recent_published 把这些行并进来(published / working 两栏、标题字数那一句都跟着), 一行不抄、指纹不动。
 
-    回 ``(并进来的行, 这次读到的行里回流闸挡着的 note_id, 这次读到了结论的 note_id)``; 行同本项目那次查询的形状
+    回 ``(并进来的行, 这次读到的行里不进 working 的 note_id, 这次读到了结论的 note_id)``; 行同本项目那次查询的形状
     (note_id / version_id / match_kind)。后两项把本项目自己的行也算在内(它们本来就在这个 TV 项目里, 同一次读回来了,
-    调用方就不用为它们再问一遍)。
+    调用方就不用为它们再问一遍)。第二项 = 回流闸挡着的(本项目的、别的项目的都按 postgate.blocked) + 别的项目的行里
+    结论那一格是空的 / 不认识的(见下)。
 
     跨项目的边界只有一条, 钉在两处: 只取 ``tv_project_map`` 里【这个写作台项目】对着的 TV 项目的对照(查询的过滤),
     回来的行再核一遍 TV 项目号(同 core._note_from_link 的纪律) —— 没映射到的 TV 项目的帖一篇都进不来。
@@ -4166,7 +4167,9 @@ def _sibling_links(sb, project_id: str, have: set[str]) -> tuple[list[dict], fro
 
     回流闸那两格和对照【同一次】读回来: 并进来的行都带着自己的结论, working 一栏不会因为后面哪次读挂了而摆出一篇没看过
     结论的别处的帖。也因此 020 没跑(读不到那两格)或者这次读挂了 → 一行不并, 两栏同今天 —— 开关开着但闸读不到时简报
-    不变, 这条对 A8 一样成立。**不抛**。"""
+    不变, 这条对 A8 一样成立。那两格读到了、但这一行还没判过(闸那一步连着几晚没跑成, 或者开关开在第一晚判之前; gate 是空的
+    或者不认识的值)也一样: 并进来的行算发出去的标题(要避开), **不进 working** —— 这个项目以前从没见过这篇帖, 「没有结论 =
+    同以前」对它就是不摆出来当参照。本项目自己的行照旧(没有结论 = 没有闸时的口径, 照样能进 working)。**不抛**。"""
     from . import postgate                        # 晚 import, 同 tv_gate_blocked_note_ids
     try:
         tv_ids = sorted({str(m["tv_project_id"]) for m in tv_projects_of(sb, project_id) if m.get("tv_project_id")})
@@ -4193,7 +4196,8 @@ def _sibling_links(sb, project_id: str, have: set[str]) -> tuple[list[dict], fro
         if not nid or str(r.get("tv_project_id")) not in allowed:
             continue
         judged.add(nid)
-        if postgate.blocked(r, postgate.BLOCKS_DESK):
+        # ``have`` 之外的 = 别的项目的行(两次读同一个排序、同一个上限, 本项目的行落在这次里的都在 have 里): 没判过的不当参照
+        if postgate.blocked(r, postgate.BLOCKS_DESK) or (nid not in have and r.get("gate") not in postgate.GATES):
             blocked.add(nid)
         if not r.get("version_id") or nid in seen:
             continue
