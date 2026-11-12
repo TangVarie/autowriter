@@ -12067,7 +12067,8 @@ def _gate_snapshots(groups: dict, indexed: set) -> list:
 
 
 def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dict, index: tvlink.VersionIndex,
-             snaps: list, snap_index, *, gate_all: bool = False, now: datetime | None = None, stop=None) -> dict:
+             snaps: list, snap_index, *, gate_all: bool = False, now: datetime | None = None, stop=None,
+             measure: bool = True) -> dict:
     """判这个 TV 项目范围里的每一行对照, 写回流闸那四列(上面那段是纪律)。``rows`` = store.tv_links_gate 读回来的。
     回这一晚的计数(只有数): 范围、判了几行、改了几行、只刷新时间的几行、按来源 × 结论的分布。读不到要用的东西就抛,
     由 _tv_gate_step 兜住。"""
@@ -12162,8 +12163,8 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         n = notes_by_id.get(nid)
         if n is None:
             continue
-        if time.monotonic() > ov_deadline or stop():
-            out["overlap_left"] += 1
+        if not measure or time.monotonic() > ov_deadline or stop():
+            out["overlap_left"] += 1                    # 时间用完, 或者这晚底稿没读出来(measure=False): 欠着, 明晚量
             ov_left.add(nid)
             continue
         p = tvlink.prior_overlap(n, index, snaps, snap_index)
@@ -12185,7 +12186,9 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
             continue
         verdict = postgate.classify(note_row(nid), vanished=long_gone, boosted=boosted, efficacy=efficacy, now=now)
         ov = overlap.get(nid)
-        origin = postgate.origin_of(row, ov)
+        # 重合还欠着没量的行来源先记 unclear: 手里只有对照上的 score 时不拿它单独定「别处写的」(这晚底稿没读出来的话,
+        # score 也是拿缺了底稿的索引算的)
+        origin = postgate.ORIGIN_UNCLEAR if nid in ov_left else postgate.origin_of(row, ov)
         reasons = postgate.pack_reasons(verdict, overlap=ov, overlap_pending=nid in ov_left)
         out["judged"] += 1
         counts.setdefault(origin, {}).setdefault(verdict.gate, 0)
@@ -12218,10 +12221,14 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
 
 
 def _tv_gate_step(client, tv_project_id: str, notes_by_id: dict, index: tvlink.VersionIndex, groups: dict, *,
-                  dry_run: bool = False, gate_all: bool = False, now: datetime | None = None) -> dict:
+                  dry_run: bool = False, gate_all: bool = False, now: datetime | None = None,
+                  snapshots_ok: bool = True) -> dict:
     """tv_sync 的最后一步: 判回流闸。**不抛** —— 出什么错都只记在回的那个 dict 里(``error``), tv_sync
     已经写进库的对照、补录和它要回的结果一样不动。dry-run 不跑; 020 没跑回 ``{"applied": False}``。
-    ``groups`` 是这晚读到的查重底稿(_snapshot_groups 归好的), ``index`` 是这晚的对照索引 —— 都是 tv_sync 手里现成的。"""
+    ``groups`` 是这晚读到的查重底稿(_snapshot_groups 归好的), ``index`` 是这晚的对照索引 —— 都是 tv_sync 手里现成的。
+    ``snapshots_ok=False``: 这晚查重底稿没读出来(``groups`` 是空的, 不是真没有)。结论照判, 重合这晚不量、记成欠着的
+    (codex review on aw#155: 拿缺了底稿的索引量出来的 0 会被记下来一直沿用, 本该是「拿写作台的稿改的」的帖永远成了
+    「别处写的」)。018 没跑(根本没有底稿这回事)不算没读出来, 照量。"""
     if dry_run:
         return {"applied": None, "skipped": "dry_run"}
     started = time.monotonic()
@@ -12235,7 +12242,7 @@ def _tv_gate_step(client, tv_project_id: str, notes_by_id: dict, index: tvlink.V
             return {"applied": False, "skipped": "020"}
         snaps = _gate_snapshots(groups, {v.version_id for v in index.versions})
         out = _tv_gate(client, tv_project_id, rows, notes_by_id, index, snaps, tvlink.VersionIndex(snaps),
-                       gate_all=gate_all, now=now, stop=stop)
+                       gate_all=gate_all, now=now, stop=stop, measure=snapshots_ok)
     except Exception as exc:                            # noqa: BLE001 — 附加的一步, 绝不让 tv-sync 因它失败
         logger.exception("tv_sync: 回流闸这一步失败 (tv=%s) —— 对照照常写了, 各行留着上一晚的结论", tv_project_id)
         return {"applied": True, "error": f"{type(exc).__name__}: {exc}"[:200],
@@ -12621,12 +12628,14 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                   "waiting_post": 0, "superseded": 0, "undated": 0, "same_night": 0, "held_rival": 0,
                   "applied": True, "error": None, "samples": []}
     pids = [m["project_id"] for m in maps]
+    snap_read_ok = True                                 # 回流闸量重合要用底稿: 这晚没读出来就不量(见 _tv_gate_step)
     try:
         snap_rows = store.pending_draft_snapshots(client, pids, since=store.iso_ago(SNAPSHOT_MAX_AGE_DAYS))
     except Exception as exc:                            # noqa: BLE001
         logger.exception("tv_sync: 读查重底稿失败 (tv=%s)", tv_project_id)
         snap["error"] = f"读底稿: {type(exc).__name__}: {exc}"[:300]
         snap_rows = []
+        snap_read_ok = False
         if not store.snapshots_misconfigured(exc):
             # 一时的故障: 这晚一条都不补录(补录是终态, 本该对上底稿的帖补成副本就再也认不回来), 记 unmatched 明晚再对。
             # 库的配置问题(缺权限 / 缺列)不扣 —— 扣了会每晚都扣、补录一直停着; 照旧补录, 退出码 1 让人去修。
@@ -13053,7 +13062,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                                              holder=f"tv-sync-heal:{tv_project_id}:{uuid.uuid4().hex[:8]}")
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
     # 回流闸 v1: 放在最后, 前面的对照 / 补录 / 指纹都已经落库。不抛(见 _tv_gate_step)
-    gate = _tv_gate_step(client, tv_project_id, notes_by_id, index, groups, dry_run=dry_run, gate_all=gate_all)
+    gate = _tv_gate_step(client, tv_project_id, notes_by_id, index, groups, dry_run=dry_run, gate_all=gate_all,
+                         snapshots_ok=snap_read_ok)
     return {
         "tv_project_id": tv_project_id,
         "desk_projects": [m["project_id"] for m in maps],

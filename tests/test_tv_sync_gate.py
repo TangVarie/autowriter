@@ -583,6 +583,37 @@ def test_a_snapshot_checked_before_publication_counts_as_desk_text():
     assert postgate.ELSEWHERE_MAX <= row["gate_reasons"]["overlap"] < tvlink.SNAPSHOT_EDITED_FLOOR
 
 
+def test_a_night_the_snapshots_could_not_be_read_leaves_the_overlap_pending(monkeypatch):
+    """codex review on aw#155: 这晚查重底稿没读出来(一时的故障), tv_sync 手里的底稿是空的, 不是真没有。原来照量 ——
+    约四成来自底稿的帖量出 0、记成「别处写的」, 这个 0 一直沿用, 底稿读得出来之后也不再量。现在这晚不量、记成欠着的,
+    读得出来的那晚量上。"""
+    from tests import test_draft_snapshots as S
+    body = S.BODY_S.split("。")[0] + "。" + S.BODY_OTHER
+    notes = [S._note("n1", "换了标题", body)]
+    c = S._client(notes, [S._snap("s1", "骑了一百公里", S.BODY_S)])
+    c.rows["truth_vault.notes"] = [{"note_id": "n1", "project_id": S.TV, "publish_time": notes[0]["publish_time"],
+                                    "tier": "趴", "data_quality_flags": None}]
+    c.rows["truth_vault.note_feature_answers"] = [_answer("n1")]
+    NIGHT[0] = S.T0 + timedelta(days=5)
+    real = store.pending_draft_snapshots
+
+    def boom(*a, **k):
+        raise RuntimeError("connection reset")
+    monkeypatch.setattr(store, "pending_draft_snapshots", boom)
+    out = core.tv_sync(c, S.TV)
+    row = _links(c)["n1"]
+    assert out["snapshots"]["error"] and out["gate"]["overlap_left"] == 1 and out["gate"]["overlap_measured"] == 0
+    assert row["origin"] == "unclear" and "overlap" not in row["gate_reasons"]
+    assert row["gate_reasons"]["overlap_pending"] is True
+
+    monkeypatch.setattr(store, "pending_draft_snapshots", real)
+    _next_night()
+    out = core.tv_sync(c, S.TV)
+    row = _links(c)["n1"]
+    assert out["gate"]["overlap_measured"] == 1 and "overlap_pending" not in row["gate_reasons"]
+    assert row["gate_reasons"]["overlap"] >= postgate.ELSEWHERE_MAX and row["origin"] == "unclear", "不是「别处写的」"
+
+
 # ── 跳过 / 出错: tv-sync 的结果不动 ──────────────────────────────────────────────────────
 
 def _comparable(out: dict) -> str:
