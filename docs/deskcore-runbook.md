@@ -62,7 +62,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 | 部件 | 实测结果 |
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + `migrations/` 下全部迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
-| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15 |
+| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15；`020_tv_link_gate`（回流闸的四列，不跑不坏）2026-11-12 还没跑，见 §1.16 |
 | **跑的是哪一份代码** | 打 `/health` 看 `build`：`commit`（12 位）和 `protocol_version`。**不需要 key。**<br>2026-09-20 加的，起因是同一天卡了两次：早上把「Railway 还没重新部署」当事实写进记录（其实没核实、它早就上线了），下午 Railway 一次部署真失败、服务停在 6 小时前的版本，而**从外面看不出来**（`/health` 不带版本、`/tools` 要 key）。<br>· `commit` 与 `main` 上的 SHA 不一致 → 部署没跟上，去 Railway 看那次 build 的日志。<br>· `protocol_version` 与 `skills/bywood-writing-desk/SKILL.md` 末尾那行不一致 → 运营手里那份 skill 该重新导入了。<br>· 显示 `unknown` → 只是这个诊断字段没取到值，**不代表服务不健康**（它刻意不参与 `ok`）。 |
 | **写手的 skill 是不是最新版** | `curl -H "X-Deskcore-Key: <你的 key>" https://autowriter-production.up.railway.app/skill-versions`（**要 key**，不放 `/health`：那里不鉴权，按 `app.py` 的规矩不许放业务数据）。`writers_24h` 是 24 小时内报上来的版本里最新 / 旧版 / 没报各几个——按「身份 × 版本」数，一个团队共用一个身份时读作「这 24 小时里有几种版本在用」，不是人数；`outdated_versions` 是旧版各是哪一版；只有计数，没有是谁。<br>2026-10-16 加的服务端探针（`deskcore/skillcheck.py`）：`open_project` / `comments_for` 带 `skill_version`、`get_protocol` 带 `local_version`。**2026-10-30 发布收尾起，提醒只看这一次调用报上来的版本**：最新不提醒；旧版（含认不出的值）在返回值里带 `skill_update`，`message` 末尾两行是升级入口（仓库里 skill 的地址 + `更新技能/bywood-writing-desk`），模型照抄给写手；没报（或报「无」这类占位）只记一笔计数、不提醒。其它工具不再捎提醒。不拦写稿。<br>原来按身份记版本、没报就沿用 12 小时内的记录或提醒「没核到版本」、其它工具 30 分钟抽查一次——一个团队共用一个身份时，一个人的旧 skill 让所有人收到提醒，重启后每场开头又报一句「没核到」，所以撤了。计数在进程内存里，重启清零。要找还在用旧版的人：看 `outdated_versions` 有没有值，在群里让大家各自看一眼 skill 里那一行。<br>**2026-11-11 起不带 key、重启之后也查得到**：每次存档那一行指标带 `meta.skill_versions`（就是这份计数），`open_project` / `comments_for` 的调用记录带 `meta.skill`（这一次报上来的是最新 / 旧版 / 没报），只读 SQL 见 `docs/deskcore.md` §3.8 末尾。 |
 | **每个工具调了几次、多久、怎么收场** | 只读 SQL 查 `autowriter.batch_metrics` 里 `meta->>'mode' = 'tool_call'` 的行（2026-11-11 起每次工具调用一行，只有数；查询在 `docs/deskcore.md` §3.8 末尾）。评论那一路判了几条、哪一样检查打回了几条也在这里（W-51 不用再翻网关日志）。写不进去不影响任何调用，只在服务日志里留一行 `工具调用留痕: 没写进库`（5 分钟最多一行）；要停就设 `DESKCORE_TOOL_CALL_LOG=0`。 |
@@ -314,6 +314,124 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `dashboard_views_v1.sql`），理由写在迁移文件头。验收：`doctor` 里「视图 v_angle_outcomes」applied；
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
+
+### 1.16 `020_tv_link_gate` —— 每篇已发的帖记来源和「能不能拿来学」的结论（2026-11-12，回流闸 v1，**生产库还没跑**）
+
+发出去的帖大多不是在写作台里写的（11-12 只读实测：近 45 天对照表里的 TV 项目发了 912 篇，775 篇是别处写的）。它们当晚被抄进
+指纹库，这没问题；可同一批帖也会被当成「可以学」的样子摆给模型，而承诺功效的、后来在飞书里删掉的、特征题还没答完的没有
+哪一处筛。020 只给 `autowriter.tv_note_links` 加四个可空的列（`origin` / `gate` / `gate_reasons` / `gate_at`），**不碰数据**，
+不建表、不建函数、不发 GRANT。取值、判的先后、哪个原因挡哪一路都在 `deskcore/postgate.py` 一处。
+
+**顺序。** 代码不依赖它：没跑时 tv-sync 的最后一步读不到这四列就整步跳过（日志里一行「回流闸: 020 没跑, 这一步跳过」，
+退出码不变），别的一切照旧。先于或后于部署都行，可以随时跑、重复跑。
+① SQL Editor 跑 `020`。② 不用手动验收：当晚 14:00 UTC 的 tv-sync 起每个 TV 项目的日志里多一行
+「回流闸: 范围 … 行, 判了 …: pass … / fail … / unsure … / hold … / withdrawn …」，`doctor` 里
+「tv_note_links 的回流闸四列」applied。想看就跑（只读）：
+
+```sql
+select tv_project_id, origin, gate, count(*), max(gate_at)
+  from autowriter.tv_note_links group by 1, 2, 3 order by 1, 2, 3;
+```
+
+**这一步做什么、不做什么**（`core._tv_gate`）。
+- 排在 tv-sync 的最后：对照、补录、指纹都已经写进库了才开始；它出什么错都不改 tv-sync 的结果（只多一行 ⚠️、退出码 1，
+  各行留着上一晚的结论）。dry-run 不跑。每个 TV 项目最多 120 秒，用完就停，没判完的明晚排最前。
+- 范围：发布时间在近 60 天里的、从没判过的（所以跑完 020 的第一晚会把全部对照判一遍，不用带参数）、还在等的（上一晚是
+  `hold` / `unsure`，或者是 `fail` 而原因里还带着 `unsure`——功效题的答案到了得把它摘掉，教训卡才借得了）、判过
+  `withdrawn` 而这晚又读到了的、有定论而这晚没读到的（不管多老：每晚的同步读的是整个项目，没读到的只有飞书里删了的，
+  老帖删了也要记 `withdrawn`；记过的不再问）。带 `--since` 手动跑时没读到的行都在范围里，「范围」和「没读到」的数会大
+  一些，一行不写。`tv-sync --tv-project <项目> --gate-all` 把一个项目的对照全部重判。
+- 只 `UPDATE` 那四列，值一样的行一次写，结论没变的只刷新 `gate_at`。对照本身的列（`match_kind` / `version_id` / `score` /
+  `candidates` / `updated_at`）一个不碰，补录的、人定过的对照照旧钉着。
+- 飞书里删了的：缺席满 36 小时才记 `withdrawn`（同改稿差异那一步的宽限），不满的留着上一晚的结论。
+- 来源（`origin`，只是标签，不参与结论）：对上了写作台版本的是 `desk`（标题对上的要包含度到 0.30，不到的记 `unclear`），
+  `edited` 是 `desk_edited`，那一版晚于发布的（`lag_days < 0`）是 `copied_back`。对不上的（`ingested` / `unmatched`）看它和
+  **发布那天及之前**就在写作台里的文字的四字串重合（`tvlink.prior_overlap`：存过档的版本加没被查重打回的底稿，按北京日历日，
+  往前 30 天）：不到 0.15 是 `elsewhere`，其余 `unclear`。对照上存着的 `score` 不能直接拿来定——它把发布之后才存进写作台的
+  那版也算上（把发出去的帖抄回来存一版，`score` 就接近 1）；两个数都有时取小的。重合量过一次就记在 `gate_reasons.overlap`
+  里、之后沿用，不每晚重量：发布之前有什么不会再变，而对照索引会变。⚠️ 老对照第一次量的时候，45 天以前的底稿已经不读、
+  改过稿的 item 索引里只剩最新那版，量出来偏低——老帖里的 `elsewhere` 会比实际多一点；020 之后新发的帖没有这个问题。这晚量重合的时间用完、还没量的行，
+  结论照存、来源先记 `unclear`，`gate_reasons` 里带 `"overlap_pending": true`：带着它的行不管帖多老、结论定没定，第二晚都还在
+  范围里，量上了这个键就没了（没有它的话，60 天以前的帖第一晚没量上，之后永远不进范围）。这晚查重底稿没读出来
+  （一时的故障，`snapshots.error` 有值）也一样：结论照判，重合整晚不量、都记成欠着的——拿缺了底稿的索引量出来的数会被
+  记下来一直沿用。欠着的行来源一律 `unclear`，不拿对照上的 `score` 单独定「别处写的」。量的时候把帖那一刻的文字指纹一起记下
+  （`gate_reasons.overlap_fp`，`tvlink.text_fp` 的 16 位，不是文字）：补录的帖正文后来在飞书里改了（对照是钉住的、不重对），
+  这晚读到它、正文那一半指纹对不上，就进范围重量；只改了标题、标点、话题的，或者只是写作台这边的索引变了，不重量。
+  正文变过的行同时记 `"score_stale": true`、一直带着：对照上的 `score` 是对着旧文字算的（钉住的对照不改它），之后定来源
+  不再拿它和重合取小的，只看发布前的重合。
+  代价：量过重合的对不上的行各带各的指纹，第一次判的时候一行一次 UPDATE（最大的项目约 800 行，在这一步的 120 秒里；
+  时间用完没写的留到第二晚、排在最前）；之后结论没变的行照旧合成几次只刷新 `gate_at` 的 UPDATE。
+- 结论（`gate`）按先后：`withdrawn` → `hold`（没有发布时间 / 排期在后面 / 正文还是空的 / 合成数据——都是「还没到齐」；
+  发出去的短帖有字就照走后面几步。正文有没有看 tv-sync 从 `raw_content` 拆出来的那段，不看 `truth_vault.notes.body`）→ `fail`（`not_clean` 就是 `priors.is_clean` 说不干净；
+  `risk` = tier 风控；`efficacy` = TV 存的 `efficacy_promise` 答案是「是」）→ `unsure`（那一题还没有答案）→ `pass`。
+  `gate_reasons.reasons` 把成立的原因都列上，各处按原因决定挡不挡：写作台的两处六个原因都挡（`postgate.BLOCKS_DESK`），
+  教训卡不看 `not_clean`（`postgate.BLOCKS_CARDS`，D-133 第 1 条）。
+- 笔记的状态列、`efficacy_promise` 的答案、投流事件三样任何一样读不到，这个项目这晚整步报错、一行不写。投流事件平时
+  用进程里缓存的那一份（`priors.paid_boosted`）；缓存里拿不到（读挂之后 5 分钟的退避里）时这一步自己直接再读一次，
+  所以一次读挂不会让同一晚后面的 TV 项目都不判。
+- 结论写到一半挂了：打出来的「改了 N」是真写进去的行数；结论没变的行这晚不刷新 `gate_at`（TV 的灯靠它看出这一晚没判全）。
+- 这一步只记、不拦：结论写在对照上，读不读它由各处自己的开关定（写作台的 working 标题和起量帖参照、TV 馆员的筛选，
+  开关都默认关，等看过三晚的分布再开）。开关没开、或者这一行还没有结论时，各处的行为和没有闸时一样。
+
+**第一晚和重判。** 跑完 020 的第一晚不用带任何参数：从没判过的行本来就都在范围里，所以全部对照（11-12 是 3,711 行）当晚
+判一遍，之后每晚只判近 60 天的和还在等的。预期第一晚（11-12 按同一套判法在库里数的，差几行算对得上）：`pass` 约 3,013 /
+`fail` 约 445 / `hold` 约 172（144 没有发布时间、14 排期在后面、11 合成、3 正文是空的）/ `unsure` 12 / `withdrawn` 69。
+`hold` 要是多出一截（最初「正文不到 50 个字」的口径下是 388），就是有一批已发的帖被放着了，先查再开读的一方的开关；
+开 TV 馆员那个开关之前另看它 `/health` 的 `select.return_gate.would_drop`。改了判法、或者想把老帖按新口径重来一遍：
+`python -m deskcore.cli tv-sync --tv-project <项目> --gate-all`（或 `--all --gate-all`），照常同步、最后一步把这个项目的
+对照全部重判。`--dry-run` 不跑这一步。
+
+**读的一方：一个开关，现在关着**（`config.RETURN_GATE_ENFORCE`，详见 `docs/deskcore.md` §3.30）。
+
+| | 关着（现在） | 开着 |
+|---|---|---|
+| 简报的 working 标题 | 同今天（只按 `priors.is_clean` 筛） | 再去掉闸判过、没放行的（承诺功效 / 删了 / 功效题没答 / 暂缓 / 风控） |
+| 发牌卡上的起量帖参照 | 同今天 | 同上；被挡的帖照旧算进「前一成」的门槛，别的帖不会因此补进来 |
+| 简报的「最近发出去」标题、标题字数那一句 | 只有挂在本项目名下的对照 | 这个写作台项目对着的 TV 项目的全部对照（兄弟项目发出去的也看得到）；**不过闸** |
+| 查重、指纹库、配比、起量标签和计数、`project_now`、`draw-report` | 不变 | 不变 |
+| 正负例 | 补录副本不回（不看开关，11-12 起） | 同左 |
+
+- **不用配环境变量。** 默认值写在代码里（`config.py` 的 `RETURN_GATE_ENFORCE_DEFAULT = "0"`）。关着、或者开着但 020 没跑、
+  或者开着但那几列这次读不出来，简报和发牌同今天一字不差（`tests/test_return_gate_readers.py` 整块比）。
+- **怎么开**：020 跑过、tv-sync 的「回流闸:」那一行连着三晚都在、分布和预期差不出几个点（近 45 天的帖：`fail` 8–13%、
+  `withdrawn` 4–9%、发出三天以上的帖里 `unsure` 不到 3%；11-12 排练是 10% / 7% / 1%），就提一行的 PR 把 `"0"` 改成 `"1"`，
+  合并、部署。TV 馆员那边是它自己的开关，同一时间开。三晚的数用下面这句看（只读）：
+
+  ```sql
+  select gate, count(*), round(100.0 * count(*) / sum(count(*)) over (), 1) as pct, max(gate_at)
+    from autowriter.tv_note_links l join truth_vault.notes n using (note_id)
+   where n.publish_time >= now() - interval '45 days' and n.publish_time <= now()
+   group by 1 order by 2 desc;
+  ```
+
+- **开了之后要临时关**：服务上设 `RETURN_GATE_ENFORCE=0`、重启；不用回滚代码。tv-sync 那一步不看这个开关，照常每晚记。
+- **开了之后怎么验**（只读）：working 里不该有被挡的帖。下面这句列的是「够格进 working、却被闸挡着」的篇数，开着时这些帖
+  不会出现在任何简报的 working 一栏里；发牌那边看 `angle_ledger` 里 `dims->'_draw'->>'ref'` 指到的帖有没有被挡的（应为 0，
+  项目块两小时一建，刚开的两小时里可能还有旧的）：
+
+  ```sql
+  select l.tv_project_id, count(*)
+    from autowriter.tv_note_links l join truth_vault.notes n using (note_id)
+   where l.gate in ('fail', 'unsure', 'hold', 'withdrawn')
+     and n.publish_time between now() - interval '30 days' and now() - interval '3 days'
+     and (n.tier in ('爆', '大爆') or n.comments_count >= 20)
+   group by 1 order by 1;
+
+  select count(*) from autowriter.angle_ledger a
+    join autowriter.tv_note_links l on 'note:' || l.note_id = a.dims->'_draw'->>'ref'
+   where a.drawn_at >= now() - interval '7 days' and l.gate in ('fail', 'unsure', 'hold', 'withdrawn');
+  ```
+
+- **兄弟项目能多看到多少**（11-12 只读，近 30 天，简报的窗口）：BJS_phase2 里写手在写的那个项目 24 → 136 个发过的标题
+  （working 候选 0 → 3），它的补录目标 112 → 136；HATHERINE_phase1 的 7 个、TUGE_phase1 的 9 个非补录目标项目 0 → 43 / 0 → 71
+  （这 16 个近 45 天没人写）。SPX_phase1、XIWU_phase2 只对着一个写作台项目，不变。45 天的数和量法在 §3.30。
+  一个写作台项目只看得到 `tv_project_map` 里它对着的 TV 项目的帖；想让某个项目不并（比如它其实不该对着那张表），
+  改的是对照表（`tv-map`），不是开关。
+
+**对不上的旧对照补分数（一次性，可选）。** `tv-sync --all --rescore-misses [--rescore-days 60] [--dry-run]`：给
+`ingested` / `unmatched`、`score` 还空着的对照补上「和写作台的稿子最像到什么程度」（11-11 之前补录的三千多行都是空的），
+只写 `score` 一列，不同步、不依赖 020。回流闸定来源**不等它**：那一步自己量「和发布前写作台里的文字的重合」
+（`tvlink.prior_overlap`，发了之后才抄回写作台的那版不算），记在 `gate_reasons.overlap` 里。
 
 ### 1.15 `019_dedup_gin_first` —— 查重取候选先走四字串的索引（2026-11-11，W-21 / AU-F08，**生产库还没跑**）
 
@@ -1365,6 +1483,7 @@ TV 自己那份建库脚本 `autowriter-migrations/007_fresh_install_autowriter_
 | 7f | 覆盖面决定回写 truth-vault `DECISIONS.md` | 跨仓决策归 TV 记。本仓定的是「入库判定只挂 `commit_drafts`，补录的已发布笔记由 TV 事后抽取（docs/31 位置 ①）覆盖」（设计审查 2026-09-23 §4 #1 纠正了 D-071 的读法），写在 `docs/deskcore.md` §3.8；TV 那边要补一条引用它，并确认 ① 的抽取确实覆盖补录进来的那些项目 |
 | ~~7g~~ | ~~跑 `011` 并给 `tv_project_map` 补齐映射~~ ✅ 已跑、已补 | 2026-11-04 只读：`011` 的视图 `v_angle_outcomes` 在生产库；Hatherine 已接进 TV，写作台的 Hatherine 项目 9 个里 8 个在 `tv_project_map` 里，没映射的那个照旧不判（§1.7 第 4 步）。入库判定按 TV 项目号走出境口径，以后新接的项目没映射照样一篇都不发，`tv-map add` 补上，tv-sync 也跟着覆盖到它 |
 | 7h | W-31 部署后看头几场存档（2026-10-27，纯代码、不用迁移） | `score_drafts` 现在把「带了 key、台账却对不上」单独数（`unknown_angle_keys` / `used_angle_keys`，`batch_metrics.counters` 同名），key 对不上的再按 `meta.angle_key_mismatch[].problem` 分 `unknown`（编的）/ `other_project`（别的项目的牌）/ `not_in_ledger`（台账没写进去）/ `used`，模型传回的臂对不上服务端发的时以服务端为准（`meta.flywheel_arm_reported` 记传回的那个；部署重启后核对不了的另标 `meta.flywheel_arm_unverified`，分析对照组时剔掉），被拒的按原因记进 `meta.rejected_by` / `rejected_signals` / `rejected_scope` / `empty_body_fields`。看：① 有 key 对不上的批次，之后同一场的批次 `unknown_angle_keys` 回到 0（写手那边的 AI 看到回包改了）；② TV 夜跑角度台账判据 A 不再因为 key 对不上点名整轮；③ 全拒（written 0）的批次 `rejected_by` 有值；④ `not_in_ledger` 多起来就去查发牌那一步 `record_draw` 的失败日志，不是写手的问题。SQL 在 `docs/deskcore.md` §3.12。`archive_pending.angle_key_mismatch` 记在进程内存里，部署重启后清空，属正常 |
+| 7i | 回流闸 v1：负责人跑 `020`，看三晚的结论分布，再打开读的一方（2026-11-12） | 结论从跑完 `020` 的当晚起每晚记；读的一方（working 标题、起量帖参照、兄弟项目的标题）在 `config.RETURN_GATE_ENFORCE` 后面，代码默认关。三晚的分布和预期对得上（§1.16 里那句 SQL 和范围）就提一行 PR 把 `RETURN_GATE_ENFORCE_DEFAULT` 改成 `"1"`，TV 馆员的开关同时开。没跑 `020` 之前、开关没开之前，简报和发牌同今天一字不差 |
 
 ### P2 · 攒够再做
 

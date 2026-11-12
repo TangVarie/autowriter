@@ -408,6 +408,30 @@ def _match_by_content(note: Note, ng: set[str], index: VersionIndex, *, exclude:
     return Match("fuzzy", best_v, best_s, lag_days(note, best_v))
 
 
+def prior_overlap(note: Note, index: VersionIndex, snaps: Iterable[Version] = (),
+                  snap_index: VersionIndex | None = None) -> float | None:
+    """帖的四字串有多少出自【发布那天及之前】就在写作台里的文字(2026-11-12, 回流闸 v1 定来源用, 见 postgate.origin_of)。
+
+    和对不上时记的 score(_match_by_content)两处不同: 那个数把时间窗里发布之后才存的版本也算上 —— 发了之后把帖抄回
+    写作台存一版, 它就接近 1, 读起来像「拿写作台的稿改的」; 这里只算发布那天 − 那一版那天在 0..WINDOW_AFTER_DAYS 天的
+    (北京日历日, 同 lag_days: 同一天写、同一天发的算在内, 这就是匹配器对两边时钟的全部宽限)。存过档的版本(``index``)
+    和只查过重的底稿(``snaps``, 四字串缓存在 ``snap_index``)都算; 没有时间的版本不算(说不清它在不在发布之前)。
+    帖没有发布时间、或者太短没得比(四字串不到 FUZZY_MIN_GRAMS)回 None; 一版都没有是 0.0。只是读数, 不参与对照。"""
+    if note.publish_time is None:
+        return None
+    ng = grams(note.body)
+    if len(ng) < FUZZY_MIN_GRAMS:
+        return None
+    best = 0.0
+    snaps = list(snaps)
+    for ix, versions in ((index, index.versions), (snap_index or VersionIndex(snaps), snaps)):
+        for v in versions:
+            lag = lag_days(note, v)
+            if lag is not None and 0 <= lag <= WINDOW_AFTER_DAYS:
+                best = max(best, ix.containment(ng, v))
+    return best
+
+
 def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
     return {n.note_id: match_note(n, index) for n in notes}
 

@@ -953,12 +953,14 @@ def _top_decile_floor(values: list[int], frac: float) -> int | None:
 
 
 def project_aggregate(rows, answers, *, tv_ids, brand_ids=(), now: datetime | None = None,
-                      params: dict = PARAMS, boosted=frozenset(), layers=None) -> dict:
+                      params: dict = PARAMS, boosted=frozenset(), layers=None, blocked=frozenset()) -> dict:
     """本项目(对照表里的 TV 项目)近 60 天的笔记 + 特征题答案 → 项目块(聚合数 + 起量帖池)。纯函数。
 
     rows 里同品牌其他期(brand_ids, 没对照到本项目的)的帖只用来找起量帖(45 天内), 不进本项目的配比和计数。
     boosted: 投流事件里的帖(is_clean), 不进标签、不当起量帖。layers: {note_id: 贴型代号}(TV 的 content_layer, 读得到才有),
-    起量帖带上 ly, 发牌按卡的贴型优先同一族; 不给就和原来一样。"""
+    起量帖带上 ly, 发牌按卡的贴型优先同一族; 不给就和原来一样。
+    blocked(回流闸 v1, 2026-11-12): 回流闸判过、没放行的帖(store.desk_gate_blocked)。【只】不当起量帖(_hit_pool);
+    配比、篇数、起量标签、杠杆 / 标题的计数、已发特征题比例一个数都不变 —— 发了就是发了, 计数那一路不过闸。不给就和原来一样。"""
     now = now or _utcnow()
     tv = set(tv_ids or ())
     brand = set(brand_ids or ()) - tv
@@ -1041,7 +1043,8 @@ def project_aggregate(rows, answers, *, tv_ids, brand_ids=(), now: datetime | No
             fq_shares[q] = {k: v / tot for k, v in counts.items()}
         else:
             fq_shares[q] = counts.get("是", 0) / tot
-    hits = _hit_pool(own, brows, ans, tv=tv, brand=brand, now=now, params=params, boosted=boosted, layers=layers)
+    hits = _hit_pool(own, brows, ans, tv=tv, brand=brand, now=now, params=params, boosted=boosted, layers=layers,
+                     blocked=blocked)
     return {
         "tv_ids": sorted(tv), "brand_ids": sorted(brand), "last_by_id": last_by_id,
         "posts": posts, "window_days": win,
@@ -1051,9 +1054,15 @@ def project_aggregate(rows, answers, *, tv_ids, brand_ids=(), now: datetime | No
     }
 
 
-def _hit_pool(own, brows, ans, *, tv, brand, now, params, boosted=frozenset(), layers=None) -> list[dict]:
+def _hit_pool(own, brows, ans, *, tv, brand, now, params, boosted=frozenset(), layers=None,
+              blocked=frozenset()) -> list[dict]:
     """起量帖: 干净、评论 ≥ 10、在(TV 项目, 内容形式)里评论数排前一成。本项目 2–21 天权重 ×3, 同品牌其他期 2–45 天 ×1。
-    不跨品牌。卡上只拿它的 杠杆 / 第一个人性原型 / 标题句式 和 开头、结尾、求助、转折 四个结构答案。"""
+    不跨品牌。卡上只拿它的 杠杆 / 第一个人性原型 / 标题句式 和 开头、结尾、求助、转折 四个结构答案。
+
+    blocked(回流闸 v1): 判过、没放行的帖不当起量帖 —— 但【照旧算进前一成的门槛】(下面 groups 那一遍不看它)。门槛量的是
+    「这个项目这种形式里, 评论排到前一成要多少条」, 那是帖发出去之后的事实, 和这篇帖能不能拿来学没关系; 要是把被挡的帖
+    从分母里拿掉, 门槛会跟着降, 原来排不进前一成的帖就因为闸顶了上来 —— 闸只该让参照变少, 不该让它换成更差的。
+    (投流的帖一直不进分母是另一回事: 它的评论数是买来的, 本来就不该拿来定门槛。)"""
     groups: dict[tuple, list[int]] = {}
     for r in own + brows:
         if not is_clean(r, boosted) or r.get("comments_count") is None:
@@ -1072,6 +1081,8 @@ def _hit_pool(own, brows, ans, *, tv, brand, now, params, boosted=frozenset(), l
         t = _ts(r.get("publish_time"))
         if t is None or not is_clean(r, boosted) or r.get("comments_count") is None:
             continue
+        if blocked and str(r.get("note_id") or "") in blocked:
+            continue                          # 回流闸没放行: 不当参照(门槛上面已经按含它的那一组算好了)
         age = _days(now, t)
         if not (lo <= age <= hi):
             continue
@@ -1385,6 +1396,20 @@ def _paid_boosted(st, sb) -> frozenset:
     return got
 
 
+def _gate_blocked(st, sb, note_ids, project_id: str) -> frozenset:
+    """起量帖候选里回流闸没放行的(store.desk_gate_blocked: 开关关着 / 020 没跑 / 读不到都回空, 一个请求都不多发)。
+    建项目块时用; 出什么错都当没有(照原来的口径), 不让整块建不成。"""
+    fn = getattr(st, "desk_gate_blocked", None)
+    if fn is None or not note_ids:
+        return frozenset()
+    try:
+        return frozenset(fn(sb, note_ids, what=f"priors hit pool ({project_id})"))
+    except Exception as exc:                            # noqa: BLE001 — 读数本不抛, 再兜一层
+        logger.warning("priors: return gate verdicts unreadable (%s): %s", project_id,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return frozenset()
+
+
 def fetch_global(sb, *, now: datetime | None = None, params: dict = PARAMS) -> dict | None:
     st = _store()
     notes = st.tv_notes_outcomes(sb)
@@ -1459,8 +1484,17 @@ def fetch_project(sb, project_id: str, row: dict | None = None, *, now: datetime
     except Exception as exc:                            # noqa: BLE001 — 读数本不抛, 再兜一层
         layers = None
         logger.warning("priors: tv note layers unreadable (%s): %s", project_id, f"{type(exc).__name__}: {exc}"[:200])
+    boosted = _paid_boosted(st, sb)
     agg = project_aggregate(rows, answers, tv_ids=tv_ids, brand_ids=brand_ids, now=now, params=params,
-                            boosted=_paid_boosted(st, sb), layers=layers or None)
+                            boosted=boosted, layers=layers or None)
+    # 回流闸(A4, 2026-11-12): 判过、没放行的帖不当起量帖。只问【选出来的那几篇】(本项目和同品牌其他期的都在里面, 一般
+    # 一次请求): 被挡的帖照旧算进前一成的门槛(_hit_pool), 所以挡掉谁都不会让别的帖补进来 —— 先按原样选、再问、有被挡的
+    # 才带着 blocked 重算一遍, 和一开始就带着它算是同一个结果。开关关着时不发请求、不重算, 项目块和原来一字不差。
+    # 项目块 2 小时一建(ttl_project_s), 所以夜里新判的结论最晚两小时后到发牌这边。
+    blocked = _gate_blocked(st, sb, [h["ref"][len("note:"):] for h in agg["hits"]], project_id)
+    if blocked:
+        agg = project_aggregate(rows, answers, tv_ids=tv_ids, brand_ids=brand_ids, now=now, params=params,
+                                boosted=boosted, layers=layers or None, blocked=blocked)
     agg["categories"] = {p: (meta.get(p) or {}).get("category") for p in tv_ids if (meta.get(p) or {}).get("category")}
     base.update(agg)
     return base

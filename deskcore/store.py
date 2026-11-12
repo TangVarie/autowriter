@@ -690,11 +690,16 @@ def labeled_examples(sb, project_id: str, label: str,
     (TV 同步进来的 special batch 一滚出窗口就读不到, 飞轮中断)。
 
     user_id 非空时只取本人的: 正负例是个人风格资产, 属私有层。
+
+    补录副本(``batches.params.source == 'ingest'``, tv-sync / ingest_published 从已发的帖抄进来的)**永远不回**(回流闸 v1 的
+    A5, 2026-11-12): 那是没过任何一道检查的帖的原文, 被标成正例就会整篇进简报。今天库里一条这样的标注都没有(11-12 核过),
+    这里把这条路堵上。在 Python 里认(同 versions_for_linking: params 在老行 / 假件里可能是字符串), 所以是先取 ``limit``
+    条再筛 —— 真有人标了副本, 这一次回的会少几条, 不会多出一条副本。
     """
     q = (sb.table("items")
            .select("id, best_version_id, created_at, user_id, "
                    "versions(id, title, body, version_num, embedding), "
-                   "batches!inner(project_id)")
+                   "batches!inner(project_id, params)")
            .eq("batches.project_id", project_id)
            .eq("example_label", label)
            .order("created_at", desc=True)
@@ -709,6 +714,8 @@ def labeled_examples(sb, project_id: str, label: str,
 
     out: list[dict] = []
     for item in (res.data or []):
+        if is_ingest_batch(item.get("batches")):        # A5: 补录副本不当正负例(见 docstring)
+            continue
         versions = item.get("versions") or []
         if not versions:
             continue
@@ -3007,7 +3014,9 @@ def external_slice(sb, category: str, *, days: int = EXTERNAL_SLICE_DAYS) -> lis
 
 # 投了薯条、却没标 paid_promoted 的帖(2026-11-03): TV 的 v_paid_boost_events 认出来的投流事件(service_role 读得到, 有
 # note_id 列)。这些帖不算干净(priors.is_clean), 不进起量标签、不当起量帖、不进简报的 working 一栏。视图每读一次都要算一遍
-# (生产 ~0.5 秒), 所以只经 priors.paid_boosted 那份进程缓存读(复审), 别在别处直接调。
+# (生产 ~0.5 秒), 所以只经 priors.paid_boosted 那份进程缓存读(复审), 别在别处直接调。唯一的例外是回流闸
+# (core._tv_gate): 缓存里拿不到(读挂之后的退避里)时它自己直接再读一次 —— 每晚一个进程连着判所有 TV 项目, 不能因为
+# 一次读挂整晚都不判。
 PAID_BOOST_MAX_PAGES = 10
 
 
@@ -3534,6 +3543,178 @@ def tv_links_set_fp(sb, fps: dict[str, str]) -> int:
     return n
 
 
+# ── 回流闸 v1(migrations/020, 2026-11-12): 每篇已发帖的来源和结论, 记在对照的四列上 ───────────────────────────
+# 取值、判法、哪个原因挡哪一路都在 deskcore/postgate.py; 写的是 core._tv_gate(tv-sync 每晚最后一步)。这里只有读写的形状。
+# 四列是后加的: 020 没跑时读不到, 所以【不】并进 tv_links() 的列清单(并进去的话 tv-sync 每个项目都读挂, 同 017 那次),
+# 单独一次可选的读, 读不到这四列回 None。
+TV_GATE_COLS = ("origin", "gate", "gate_reasons", "gate_at")
+TV_GATE_CHUNK = 200
+TV_GATE_FLAG_COLS = "note_id, publish_time, tier, data_quality_flags"
+TV_GATE_FLAG_MAX_PAGES = 20          # 一个 TV 项目的笔记, 一页 PAGE 行; 最大的项目一千来篇
+_TV_MISS_KINDS = ("ingested", "unmatched")
+
+
+def tv_gate_columns_missing(exc: Exception) -> bool:
+    """020 没跑: 读(``42703 column … does not exist``)或写(``PGRST204``)时点名的是回流闸那四列之一。只认这四列 ——
+    别的缺列 / 缺表 / 权限 / 连接错误照旧当故障(同 snapshots_table_missing 的纪律)。"""
+    msg = str(exc).lower()
+    if not ("does not exist" in msg or "42703" in msg or "pgrst204" in msg):
+        return False
+    return "column" in msg and any(re.search(rf"(?<![a-z_]){c}(?![a-z_])", msg) for c in TV_GATE_COLS)
+
+
+def tv_links_gate(sb, tv_project_id: str) -> dict[str, dict] | None:
+    """这个 TV 项目每一行对照的来源和回流闸结论, 按 note_id: ``{note_id: {match_kind, version_id, score, lag_days,
+    origin, gate, gate_reasons, gate_at}}``。前四个是定来源要看的对照列(postgate.origin_of), 后四个是 020 加的。
+    020 没跑(读不到那四列)回 None —— 调用方当「没有结论」, 照没有闸时的口径; 别的错误原样上抛。"""
+    def _build(off, lim):
+        return (sb.table("tv_note_links")
+                .select("note_id, match_kind, version_id, score, lag_days, origin, gate, gate_reasons, gate_at")
+                .eq("tv_project_id", tv_project_id)
+                .order("note_id").range(off, off + lim - 1))
+    try:
+        return {r["note_id"]: r for r in _paged(_build)}
+    except Exception as exc:                            # noqa: BLE001
+        if tv_gate_columns_missing(exc):
+            return None
+        raise
+
+
+def tv_note_gate_flags(sb, tv_project_id: str) -> list[dict] | None:
+    """这个 TV 项目每篇笔记的发布时间、tier、数据质量标记(``TV_GATE_FLAG_COLS``) —— 回流闸判结论用, 不取标题和正文。
+    按 note_id 游标翻; 读挂了回 None(同这一组读 truth_vault 的纪律: 不抛, 调用方这晚不判)。"""
+    def fetch(after):
+        try:
+            q = (sb.schema("truth_vault").table("notes").select(TV_GATE_FLAG_COLS).eq("project_id", tv_project_id))
+            if after:
+                q = q.gt("note_id", after)
+            return list(q.order("note_id").limit(PAGE).execute().data or [])
+        except Exception as exc:                        # noqa: BLE001
+            _tv_warn("tv note gate flags", exc)
+            return None
+    return _keyset(fetch, max_pages=TV_GATE_FLAG_MAX_PAGES, what="tv note gate flags")
+
+
+def tv_links_set_gate(sb, groups: list[tuple[str, str, dict, list[str]]], *, at: str, stop=None) -> int:
+    """把结论写到对照上, 回实际改到的行数。``groups`` 每组 ``(origin, gate, gate_reasons, [note_id…])``: 值一样的行
+    一次 update(同 tv_links_set_lag 的形状), 一次最多 TV_GATE_CHUNK 行。
+
+    只带回流闸那四列(负载在这里拼, 调用方递不进别的列): 对照本身的列 —— match_kind / version_id / score / candidates /
+    updated_at —— 一个不碰, 补录的、人定过的对照照旧钉着。不走 upsert: 只带几列的 upsert 会先按插入校验整行的非空约束,
+    而且一条刚被人删掉的对照会被它插回一个残行。``stop()`` 回真就不再发下一块(时间用完了, 剩下的明晚再判)。"""
+    n = 0
+    for origin, gate, reasons, ids in groups:
+        payload = {"origin": origin, "gate": gate, "gate_reasons": reasons, "gate_at": at}
+        for i in range(0, len(ids), TV_GATE_CHUNK):
+            if stop is not None and stop():
+                return n
+            try:
+                res = sb.table("tv_note_links").update(payload).in_("note_id", ids[i:i + TV_GATE_CHUNK]).execute()
+            except Exception as exc:                    # noqa: BLE001
+                if not n:
+                    raise
+                raise PartialWriteError(n, exc) from exc
+            n += len(res.data or [])
+    return n
+
+
+def tv_links_touch_gate(sb, note_ids: list[str], *, at: str, stop=None) -> int:
+    """结论没变的行只刷新 gate_at(「这一晚判过它」), 回实际改到的行数。只带这一列; 分块、``stop`` 同 tv_links_set_gate。"""
+    n = 0
+    for i in range(0, len(note_ids), TV_GATE_CHUNK):
+        if stop is not None and stop():
+            return n
+        try:
+            res = (sb.table("tv_note_links").update({"gate_at": at})
+                   .in_("note_id", note_ids[i:i + TV_GATE_CHUNK]).execute())
+        except Exception as exc:                        # noqa: BLE001
+            if not n:
+                raise
+            raise PartialWriteError(n, exc) from exc
+        n += len(res.data or [])
+    return n
+
+
+def tv_links_set_score(sb, scores: dict[str, float]) -> int:
+    """给对不上的对照(ingested / unmatched)补上 score(``{note_id: 包含度}``), 回实际改到的行数。
+
+    只带 score 一列, 按值分组 update(绝大多数是 0.0, 一组)。过滤里再钉两条, 调用方算错了也写不坏:
+    只改 match_kind 是对不上的那两种、而且 score 还是空的行 —— 对上了的对照的分数、已经记过的分数都改不到。
+    不碰 updated_at / match_kind / version_id: 补录的对照是终态, 这里只是补一个读数。"""
+    by_score: dict[float, list[str]] = {}
+    for nid, s in scores.items():
+        by_score.setdefault(round(float(s), 3), []).append(nid)
+    n = 0
+    for score, ids in by_score.items():
+        for i in range(0, len(ids), TV_GATE_CHUNK):
+            try:
+                res = (sb.table("tv_note_links").update({"score": score})
+                       .in_("note_id", ids[i:i + TV_GATE_CHUNK])
+                       .in_("match_kind", list(_TV_MISS_KINDS)).is_("score", "null").execute())
+            except Exception as exc:                    # noqa: BLE001
+                if not n:
+                    raise
+                raise PartialWriteError(n, exc) from exc
+            n += len(res.data or [])
+    return n
+
+
+# ── 回流闸读的一方: 写作台「学」的那一路(A4, 2026-11-12; docs/deskcore.md §3.30) ────────────────────────────────
+# 两处读: 简报的 working 标题(_recent_published)、发牌的起量帖参照(priors.fetch_project → _hit_pool)。都只问「这几篇里
+# 哪些被挡着」, 按 note_id 读 gate / gate_reasons 两格, 判法是 postgate.blocked(..., BLOCKS_DESK) —— 按原因判, 不按结论判。
+# 开关 config.RETURN_GATE_ENFORCE(默认关)在调用的那一刻读。三种情形一律「不筛」, 和没有闸时一字不差:
+#   · 开关关着: 一个请求都不发;
+#   · 020 没跑(读不到那几列);
+#   · 读挂了(记 WARN)。
+# 没有对照行的帖、判过之前的帖也不在「挡着」里: 没有结论 = 照没有闸时的口径。
+TV_GATE_READ_CHUNK = 100
+
+
+def return_gate_on() -> bool:
+    """回流闸读的一方开没开(config.RETURN_GATE_ENFORCE; 每次现读, 测试 monkeypatch 得到)。"""
+    import config
+    return bool(getattr(config, "RETURN_GATE_ENFORCE", False))
+
+
+def tv_gate_blocked_note_ids(sb, note_ids, *, blocking=None) -> set[str] | None:
+    """这几篇里回流闸判过、没放行、原因挡着这一路的 note_id(``blocking`` 默认写作台那一路 postgate.BLOCKS_DESK)。
+    只取 note_id / gate / gate_reasons 三列, 一次问 TV_GATE_READ_CHUNK 篇。020 没跑(读不到那几列)回 None;
+    别的错误原样上抛。不看开关 —— 要「关着就不读、读不到就不筛」的用 desk_gate_blocked。"""
+    from . import postgate                              # 晚 import: postgate 带着 priors, 同 _is_working
+    blocking = postgate.BLOCKS_DESK if blocking is None else blocking
+    ids = sorted({str(i) for i in note_ids or () if i})
+    out: set[str] = set()
+    for i in range(0, len(ids), TV_GATE_READ_CHUNK):
+        try:
+            rows = (sb.table("tv_note_links").select("note_id, gate, gate_reasons")
+                    .in_("note_id", ids[i:i + TV_GATE_READ_CHUNK]).execute()).data or []
+        except Exception as exc:                        # noqa: BLE001
+            if tv_gate_columns_missing(exc):
+                return None
+            raise
+        out.update(str(r["note_id"]) for r in rows if r.get("note_id") and postgate.blocked(r, blocking))
+    return out
+
+
+def desk_gate_blocked(sb, note_ids, *, what: str = "desk") -> frozenset:
+    """写作台「学」的那一路在这几篇里不能用的(见上面那段)。**不抛**; 开关关着、020 没跑、读挂了都回空(= 不筛)。"""
+    try:
+        if not return_gate_on():
+            return frozenset()
+        ids = [i for i in note_ids or () if i]
+        if not ids:
+            return frozenset()
+        got = tv_gate_blocked_note_ids(sb, ids)
+    except Exception as exc:                            # noqa: BLE001 — 增强项, 读不到就照没有闸时的口径
+        logger.warning("%s: return gate verdicts unreadable (%s); nothing is filtered this time", what,
+                       f"{type(exc).__name__}: {exc}"[:200])
+        return frozenset()
+    if got is None:
+        logger.info("%s: migration 020 not applied (no gate columns on tv_note_links); nothing is filtered", what)
+        return frozenset()
+    return frozenset(got)
+
+
 def tv_edit_diffs_demote(sb, note_ids: list[str]) -> int:
     """这些笔记的差异行降回 diff_rev 0, 回实际改到的行数: 对照现在不该算差异了(重对到抄回的那版 / 补上的 lag < 0),
     摘要不再读它。"""
@@ -3970,9 +4151,65 @@ def _working_boosted(sb) -> frozenset:
     return got
 
 
+def _sibling_links(sb, project_id: str, have: set[str]) -> tuple[list[dict], frozenset, frozenset]:
+    """同一个 TV 项目对着的【别的】写作台项目上的对照(A8, 2026-11-12): 别处写的帖只补录进一个写作台项目(补录目标),
+    对上别的方向的稿子的帖挂在那个方向上 —— 写手真在写的那个项目要是不是补录目标, 它的简报就看不到团队这个月发了什么。
+    开关开着时 _recent_published 把这些行并进来(published / working 两栏、标题字数那一句都跟着), 一行不抄、指纹不动。
+
+    回 ``(并进来的行, 这次读到的行里不进 working 的 note_id, 这次读到了结论的 note_id)``; 行同本项目那次查询的形状
+    (note_id / version_id / match_kind)。后两项把本项目自己的行也算在内(它们本来就在这个 TV 项目里, 同一次读回来了,
+    调用方就不用为它们再问一遍)。第二项 = 回流闸挡着的(本项目的、别的项目的都按 postgate.blocked) + 别的项目的行里
+    结论那一格是空的 / 不认识的(见下)。
+
+    跨项目的边界只有一条, 钉在两处: 只取 ``tv_project_map`` 里【这个写作台项目】对着的 TV 项目的对照(查询的过滤),
+    回来的行再核一遍 TV 项目号(同 core._note_from_link 的纪律) —— 没映射到的 TV 项目的帖一篇都进不来。
+    ``have``: 本项目自己那次查询已经有的 note_id(一篇帖只有一行对照, 不会重, 这里再挡一道)。
+
+    回流闸那两格和对照【同一次】读回来: 并进来的行都带着自己的结论, working 一栏不会因为后面哪次读挂了而摆出一篇没看过
+    结论的别处的帖。也因此 020 没跑(读不到那两格)或者这次读挂了 → 一行不并, 两栏同今天 —— 开关开着但闸读不到时简报
+    不变, 这条对 A8 一样成立。那两格读到了、但这一行还没判过(闸那一步连着几晚没跑成, 或者开关开在第一晚判之前; gate 是空的
+    或者不认识的值)也一样: 并进来的行算发出去的标题(要避开), **不进 working** —— 这个项目以前从没见过这篇帖, 「没有结论 =
+    同以前」对它就是不摆出来当参照。本项目自己的行照旧(没有结论 = 没有闸时的口径, 照样能进 working)。**不抛**。"""
+    from . import postgate                        # 晚 import, 同 tv_gate_blocked_note_ids
+    try:
+        tv_ids = sorted({str(m["tv_project_id"]) for m in tv_projects_of(sb, project_id) if m.get("tv_project_id")})
+        if not tv_ids:
+            return [], frozenset(), frozenset()
+        rows = (sb.table("tv_note_links").select("note_id, version_id, match_kind, tv_project_id, gate, gate_reasons")
+                .in_("tv_project_id", tv_ids).in_("match_kind", sorted(_RECENT_LINK_KINDS))
+                .order("matched_at", desc=True).order("note_id")
+                .limit(RECENT_LINKS_SCAN).execute()).data or []
+    except Exception as exc:                      # noqa: BLE001 — 增强项: 少了它就是今天的样子
+        if tv_gate_columns_missing(exc):
+            logger.info("recent titles: migration 020 not applied; sibling projects' titles are not added")
+        else:
+            logger.warning("recent titles: sibling links unreadable (project=%s): %s", project_id,
+                           f"{type(exc).__name__}: {exc}"[:200])
+        return [], frozenset(), frozenset()
+    allowed = set(tv_ids)
+    out: list[dict] = []
+    blocked: set[str] = set()
+    judged: set[str] = set()
+    seen = set(have)
+    for r in rows:
+        nid = r.get("note_id")
+        if not nid or str(r.get("tv_project_id")) not in allowed:
+            continue
+        judged.add(nid)
+        # ``have`` 之外的 = 别的项目的行(两次读同一个排序、同一个上限, 本项目的行落在这次里的都在 have 里): 没判过的不当参照
+        if postgate.blocked(r, postgate.BLOCKS_DESK) or (nid not in have and r.get("gate") not in postgate.GATES):
+            blocked.add(nid)
+        if not r.get("version_id") or nid in seen:
+            continue
+        seen.add(nid)
+        out.append({"note_id": nid, "version_id": r["version_id"], "match_kind": r.get("match_kind")})
+    return out, frozenset(blocked), frozenset(judged)
+
+
 def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int = 20,
                             now: datetime | None = None) -> list[str]:
-    """这个写作台项目近 ``days`` 天发出去的标题(tv-sync 对到本项目上的那些), 新发的在前。异常原样上抛。
+    """这个写作台项目近 ``days`` 天发出去的标题(tv-sync 对到本项目上的那些; config.RETURN_GATE_ENFORCE 开着时还有同一个
+    TV 项目对着的别的写作台项目上的, 见 _sibling_links), 新发的在前。异常原样上抛。
 
     标题取哪一份: ``ingested`` 的版本就是从这条笔记复制来的, ``versions.title`` 就是发出去的标题; 其余几种对上的是
     写作台那版, 人可能改过标题, 优先 ``tv_edit_diffs.published_title``(013), 没有再退回写作台那版。"""
@@ -3982,7 +4219,12 @@ def recent_published_titles(sb, project_id: str, *, days: int = 30, limit: int =
 def _recent_published(sb, project_id: str, *, days: int, limit: int, now: datetime | None,
                       working: int = 0) -> tuple[list[str], list[str]]:
     """``(发出去的标题 新的在前, working 候选标题)``。working 候选按 爆 > 评论数 > 新 排, 最多取 ``working`` 的两倍
-    (有的标题为空、有的去重后重复, 由 recent_titles 截到 ``working`` 条); ``working=0`` 时第二项恒为空, 和原来一样。"""
+    (有的标题为空、有的去重后重复, 由 recent_titles 截到 ``working`` 条); ``working=0`` 时第二项恒为空, 和原来一样。
+
+    回流闸 v1(2026-11-12, 开关 config.RETURN_GATE_ENFORCE, 默认关; 关着时这里发的请求和回的东西同原来一字不差):
+      · A8 两栏都多读同一个 TV 项目对着的别的写作台项目上的对照(_sibling_links; 回流闸那两格读不到时不并);
+      · A4 working 一栏不要回流闸判过、没放行的帖(desk_gate_blocked)。发出去那一栏【不筛】: 那是要避开的标题,
+        承诺功效的、后来删了的也是发过的标题。"""
     now = now or datetime.now(timezone.utc)
     since = now - timedelta(days=days)
     want = max(limit, 1) * 2                      # 留余量: 有的标题为空、有的去重后重复
@@ -3991,6 +4233,11 @@ def _recent_published(sb, project_id: str, *, days: int, limit: int, now: dateti
                          .order("matched_at", desc=True).order("note_id")
                          .limit(RECENT_LINKS_SCAN).execute()).data or []
              if r.get("note_id") and r.get("version_id")]
+    gate_blocked: frozenset = frozenset()         # 下面这次读顺手带回来的结论(挡着的 / 读到了的), working 一栏用
+    gate_seen: frozenset = frozenset()
+    if return_gate_on():                          # A8: 同一个 TV 项目对着的别的写作台项目发出去的也算(见 _sibling_links)
+        sib, gate_blocked, gate_seen = _sibling_links(sb, project_id, {r["note_id"] for r in links})
+        links = links + sib
     if not links:
         return [], []
     ids = [r["note_id"] for r in links]
@@ -4025,6 +4272,16 @@ def _recent_published(sb, project_id: str, *, days: int, limit: int, now: dateti
             boosted = _working_boosted(sb)
             if boosted:
                 cands = [r for r in cands if _is_working(stats.get(r["note_id"]) or {}, when[r["note_id"]], now, boosted)]
+        if cands:
+            # 回流闸(A4): 判过、没放行的帖不进 working(承诺功效的、飞书里删了的、功效题还没答的 …; 原因在 postgate)。
+            # published 那一栏不筛 —— 发过的标题照样要避开。开关关着 / 020 没跑 / 读不到 → 回空, 和原来一样。
+            # 在截到 working 的两倍之前筛: 挡掉一篇, 后面够格的补上来
+            # 上面并别的项目的行时, 这个 TV 项目的对照连着结论一起读回来了(gate_seen); 这里只再问那次没读到的
+            # (本项目没接对照表、那次读挂了、排在那次的上限之外的) —— 平时一个请求都不多发
+            gated = gate_blocked | desk_gate_blocked(
+                sb, [r["note_id"] for r in cands if r["note_id"] not in gate_seen], what="recent titles")
+            if gated:
+                cands = [r for r in cands if r["note_id"] not in gated]
         cc = (lambda r: stats[r["note_id"]].get("comments_count")
               if isinstance(stats[r["note_id"]].get("comments_count"), (int, float)) else -1)
         work = sorted(cands, key=lambda r: (stats[r["note_id"]].get("tier") in HIT_TIERS, cc(r),

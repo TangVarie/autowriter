@@ -207,6 +207,15 @@ def main() -> int:
         if n != "1":
             print(f"  [FAIL] items.{col} 没建出来 —— 000 与 006/012 只改了一边?")
             bad += 1
+    # 020: 回流闸的四列。基线和增量都要有、类型一样、都可空(没有默认值: 没判过的行就是 NULL, 读的一方当「没有结论」)。
+    for col, typ in (("origin", "text"), ("gate", "text"), ("gate_reasons", "jsonb"),
+                     ("gate_at", "timestamp with time zone")):
+        got = sql("SELECT data_type || '/' || is_nullable || '/' || coalesce(column_default, '-') "
+                  "FROM information_schema.columns WHERE table_schema='autowriter' "
+                  f"AND table_name='tv_note_links' AND column_name='{col}';")
+        if got != f"{typ}/YES/-":
+            print(f"  [FAIL] tv_note_links.{col} 该是 {typ}、可空、没有默认值, 得到 {got!r} —— 000 与 020 只改了一边?")
+            bad += 1
     # CHECK 的取值集合必须和 db.DecisionSource 对得上。两边各写一份迟早漂,
     # 而漂了的表现是"写进去被数据库拒", 出现在离现场很远的地方。
     for src in sorted(_awdb._DECISION_SOURCES):

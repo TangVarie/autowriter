@@ -6,6 +6,8 @@ match_note / match_snapshot 对不上时把算过的最高包含度带出来, tv
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from deskcore import core, store, tvlink as L
@@ -157,3 +159,143 @@ def test_a_note_held_for_a_snapshot_keeps_the_snapshot_score(monkeypatch):
     core.tv_sync(c, S.TV)
     l = _links(c)["n1"]
     assert l["match_kind"] == "unmatched" and l["version_id"] is None and l["score"] == 1.0
+
+
+# ── 一次性给对不上的旧对照补分数(2026-11-12, `tv-sync --rescore-misses`) ─────────────────────────────
+# 11-11 之前补录的对照 score 都是空的, 而补录的对照是钉住的 —— 每晚的同步不碰它们(tests/test_tv_sync_drift.py 守着)。
+# 所以另有一个手动跑的命令: 按同一个口径算, 只写 score 一列。
+
+OLD_TS = "2026-09-01T00:00:00+00:00"
+
+
+def _old(nid, kind="ingested", *, score=None, version="vcopy", **extra):
+    return {"note_id": nid, "tv_project_id": T.TV, "project_id": T.P1, "version_id": version, "item_id": None,
+            "match_kind": kind, "score": score, "lag_days": None, "candidates": [{"note": "D-129: 人定过的"}],
+            "updated_at": OLD_TS, "matched_at": OLD_TS, "synced_to_tv_at": None, "tv_text_fp": "0" * 16, **extra}
+
+
+def _rescore_fixture():
+    borrowed = FILLER + T.BODY_A.split("。")[0] + "。"
+    notes = [T.NOTES[0],                                                    # n1: 对上了写作台的稿
+             T._note("n2", "上周发的那篇", T.BODY_NEW),                       # 别处写的
+             T._note("n4", "借了一句", borrowed),                             # 借了写作台一句话
+             {"note_id": "n5", "raw_content": "【标题】只有标题", "publish_time": T._iso(1), "tier": "趴",
+              "created_at": T._iso(1)},                                     # 没正文
+             T._note("n6", "太短", "太短了"),                                 # 太短没得比
+             T._note("n7", "已经有分数的", borrowed + "又多写了一句别的。")]     # 11-11 之后记过分数的
+    links = [_old("n1", "body_exact", score=1.0, version="v1", lag_days=2), _old("n2"), _old("n4", version="vcopy4"),
+             _old("n5", "unmatched", version=None), _old("n6", version="vcopy6"),
+             _old("n7", "unmatched", score=0.2, version=None)]
+    return T._client(notes, links=[dict(l) for l in links]), links
+
+
+def test_rescore_gives_a_pinned_ingested_row_a_score_and_changes_nothing_else():
+    c, links = _rescore_fixture()
+    out = core.tv_rescore_misses(c, T.TV)
+    got = _links(c)
+    assert got["n2"]["score"] == 0.0 and 0 < got["n4"]["score"] < L.EDITED_FLOOR
+    assert got["n4"]["score"] == round(got["n4"]["score"], 3)
+    assert got["n5"]["score"] is None, "没正文: 没得比, 照旧是空"
+    assert got["n6"]["score"] is None, "太短没得比: 照旧是空"
+    assert got["n1"]["score"] == 1.0 and got["n7"]["score"] == 0.2, "对上了的、已经记过的不动"
+    for was in links:                                       # 别的列一个不动: match_kind / version_id / candidates / updated_at …
+        assert {k: v for k, v in got[was["note_id"]].items() if k != "score"} == {k: v for k, v in was.items() if k != "score"}
+    assert (out["candidates"], out["scored"], out["written"], out["error"]) == (4, 2, 2, None)
+    writes = [call for call in c.calls if call["op"] != "select"]
+    assert writes and all(call["table"] == "tv_note_links" and call["op"] == "update" and set(call["payload"]) == {"score"}
+                          for call in writes), "只 UPDATE score 一列; 不 upsert, 不补录, 不写指纹"
+    for call in writes:
+        assert ("in", "match_kind", ("ingested", "unmatched")) in call["filters"]
+        assert ("is", "score", "null") in call["filters"]
+    assert [name for name, _ in c.rpc_calls] == ["deskcore_tv_notes"], "不回填 TV, 不拿补录锁"
+    again = core.tv_rescore_misses(c, T.TV)
+    assert (again["candidates"], again["scored"], again["written"]) == (2, 0, 0), "再跑一次: 只剩没得比的两条, 不重写"
+
+
+def test_rescore_dry_run_and_days():
+    c, links = _rescore_fixture()
+    out = core.tv_rescore_misses(c, T.TV, dry_run=True)
+    assert (out["scored"], out["written"], out["dry_run"]) == (2, 0, True)
+    assert not [call for call in c.calls if call["op"] != "select"] and _links(c)["n2"]["score"] is None
+    out = core.tv_rescore_misses(c, T.TV, 1)                  # 夹具里的帖是 2026-09 发的: 近 1 天里一条都没有
+    assert (out["candidates"], out["written"]) == (0, 0) and _links(c)["n2"]["score"] is None
+    out = core.tv_rescore_misses(c, T.TV, 36500)
+    assert out["written"] == 2 and _links(c)["n2"]["score"] == 0.0
+    with pytest.raises(ValueError):
+        core.tv_rescore_misses(c, "NOPE_phase1")
+
+
+def test_set_score_cannot_touch_a_matched_row_or_overwrite_a_score_even_when_asked():
+    c, links = _rescore_fixture()
+    n = store.tv_links_set_score(c, {"n1": 0.5, "n7": 0.9, "n2": 0.123456, "n4": 0.123449})
+    got = _links(c)
+    assert n == 2 and got["n1"]["score"] == 1.0 and got["n7"]["score"] == 0.2
+    assert got["n2"]["score"] == got["n4"]["score"] == 0.123
+    updates = [call for call in c.calls if call["op"] == "update"]
+    assert len(updates) == 3, "按值分组, 一个值一次: 0.5 和 0.9 那两次被过滤挡住、一行没改; 0.123 那次改了两行"
+    assert store.tv_links_set_score(c, {}) == 0
+
+
+def test_rescore_counts_an_unarchived_snapshot_like_the_nightly_score_does():
+    note_body = S.BODY_S.split("。")[0] + "。" + S.BODY_OTHER
+    link = {"note_id": "n1", "tv_project_id": S.TV, "project_id": S.P1, "version_id": "vcopy", "item_id": None,
+            "match_kind": "ingested", "score": None, "lag_days": None, "candidates": None, "tv_text_fp": None}
+    c = S._client([S._note("n1", "换了标题", note_body)], [S._snap("s1", "骑了一百公里", S.BODY_S)], links=[link])
+    core.tv_rescore_misses(c, S.TV)
+    assert _links(c)["n1"]["score"] == pytest.approx(S._contain(note_body, S.BODY_S), abs=1e-3)
+    assert _links(c)["n1"]["match_kind"] == "ingested" and _links(c)["n1"]["version_id"] == "vcopy"
+
+
+def test_rescore_writes_nothing_when_the_snapshots_cannot_be_read(monkeypatch):
+    """codex review on aw#155: 底稿这次没读出来还照补的话, 约四成来自底稿的帖被记成 0 —— 这条命令只补还空着的行, 再跑
+    也改不回来, 回流闸定来源又在 score 和发布前的重合里取小的, 这篇就一直是「别处写的」。读不出来的这次一行都不补。"""
+    note_body = S.BODY_S.split("。")[0] + "。" + S.BODY_OTHER
+    link = {"note_id": "n1", "tv_project_id": S.TV, "project_id": S.P1, "version_id": "vcopy", "item_id": None,
+            "match_kind": "ingested", "score": None, "lag_days": None, "candidates": None, "tv_text_fp": None}
+    c = S._client([S._note("n1", "换了标题", note_body)], [S._snap("s1", "骑了一百公里", S.BODY_S)], links=[link])
+    real = store.pending_draft_snapshots
+
+    def boom(*a, **k):
+        raise RuntimeError("connection reset")
+    monkeypatch.setattr(store, "pending_draft_snapshots", boom)
+    out = core.tv_rescore_misses(c, S.TV)
+    assert out["error"] and (out["scored"], out["written"]) == (0, 0)
+    assert _links(c)["n1"]["score"] is None
+    assert not [call for call in c.calls if call["op"] != "select"], "一行都没写"
+    monkeypatch.setattr(store, "pending_draft_snapshots", real)
+    out = core.tv_rescore_misses(c, S.TV)
+    assert out["error"] is None and out["written"] == 1
+    assert _links(c)["n1"]["score"] == pytest.approx(S._contain(note_body, S.BODY_S), abs=1e-3)
+
+
+def test_the_nightly_sync_never_rescores_a_pinned_row():
+    c, links = _rescore_fixture()
+    core.tv_sync(c, T.TV)
+    assert _links(c)["n2"]["score"] is None and _links(c)["n4"]["score"] is None
+
+
+def test_a_copy_back_raises_the_score_but_not_the_origin(monkeypatch):
+    """score 说的是「帖的字有多少在写作台里」, 发了之后抄回来的那版也算(这里是 1.0); 来源只认发布前就在的文字
+    (回流闸自己量, tests/test_tv_sync_gate.py), 所以还是「别处写的」。"""
+    from tests import test_tv_sync_gate as GT
+    monkeypatch.setattr(core, "_gate_now", lambda: T.T0 + timedelta(days=10))
+    c = GT._tv([T._note("n2", "上周发的那篇", T.BODY_NEW)], links=[GT._copy_link()])
+    GT._add_desk_version(c, "vback", T.BODY_NEW, days=5)      # 9-12 发的帖, 9-15 才存进写作台
+    core.tv_rescore_misses(c, T.TV)
+    assert _links(c)["n2"]["score"] == 1.0
+    core.tv_sync(c, T.TV)
+    row = _links(c)["n2"]
+    assert row["match_kind"] == "ingested" and row["origin"] == "elsewhere" and row["gate_reasons"]["overlap"] == 0.0
+
+
+def test_cli_rescore_misses_does_not_sync(monkeypatch, capsys):
+    from deskcore import cli
+    c, links = _rescore_fixture()
+    monkeypatch.setattr(core, "sb", lambda: c)
+    monkeypatch.setattr(core, "tv_sync", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该同步")))
+    assert cli.main(["tv-sync", "--tv-project", T.TV, "--rescore-misses", "--dry-run"]) == 0
+    assert "[dry-run]" in capsys.readouterr().out and _links(c)["n2"]["score"] is None
+    assert cli.main(["tv-sync", "--all", "--rescore-misses"]) == 0
+    out = capsys.readouterr().out
+    assert "对不上、还没有分数的对照 4 条" in out and "算出分数 2" in out and "写入 2" in out
+    assert _links(c)["n2"]["score"] == 0.0 and len(c.rows["tv_note_links"]) == len(links)
