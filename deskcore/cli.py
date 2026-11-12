@@ -32,12 +32,15 @@
   python -m deskcore.cli draw-report --days 28 [--project <uuid>] [--json]
                                                     ← 发牌 v2 的读数(只读): 来源 × 项目 × 周的 M1/M2/M3/D1/M5/M6、
                                                       MH 比较、配额内均匀乱抽和杠杆提升(都只用试新牌)、健康指标
-  python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv]
+  python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv] [--gate-all]
                                                     ← TV 的笔记按内容对到写作台的版本,
                                                       对不上的补进指纹库(每天跑一次); --all 跑完
-                                                      顺手补缺的标题向量(每晚最多 200 行)
+                                                      顺手补缺的标题向量(每晚最多 200 行)。最后一步是
+                                                      回流闸(每篇已发的帖记来源和结论, 要 migrations/020)
                                                     ← 把已发出去、没走 commit 的稿子
                                                       从飞书表补进指纹库(不过闸)
+  python -m deskcore.cli tv-sync --all --rescore-misses [--rescore-days 60] [--dry-run]
+                                                    ← 一次性: 给对不上的旧对照补 score(只写这一列, 不同步)
 
 ⚠️ ``--user`` 从可选变成必填(审计 COR-015): 归属校验在 core 层, CLI 与 MCP 走
 同一个函数, 不带身份的调用现在一律被拒。传的是 ``projects.owner_id`` 里【已有的】
@@ -461,11 +464,13 @@ def _tv_sync(core, sb, args) -> int:
     if not targets:
         print("tv_project_map 是空的, 没有可同步的 TV 项目。")
         return 1
+    if getattr(args, "rescore_misses", False):
+        return _tv_rescore_misses(core, sb, args, targets)
     rc = 0
     for tv in targets:
         try:
             out = core.tv_sync(sb, tv, dry_run=args.dry_run, write_tv=args.write_tv,
-                               since=args.since, rematch=args.rematch)
+                               since=args.since, rematch=args.rematch, gate_all=getattr(args, "gate_all", False))
         except Exception as exc:                        # noqa: BLE001
             # 一个 TV 项目炸了(锁 / 库 / 映射), 别让 --all 把后面的项目一起跳掉: 这是
             # 每天只跑一次的 cron, 一个项目的错不该让其它项目当天一行对照都没有
@@ -589,6 +594,7 @@ def _tv_sync(core, sb, args) -> int:
                   "还会进每周摘要; 下一晚会再查。")
             rc = 1
         rc = max(rc, _print_tv_drift(out, tv))
+        rc = max(rc, _print_tv_gate(out))
         for smp in out["ambiguous_samples"]:
             print(f"  ? 分不出 {smp['note_id']} 「{smp['title']}」: "
                   + "; ".join(f"{c['version_id'][:8]}({c['score']}, {c['lag_days']}d)"
@@ -604,6 +610,62 @@ def _tv_sync(core, sb, args) -> int:
             if pruned:
                 print(f"\n查重底稿: 删了 {pruned} 行超过 {core.SNAPSHOT_RETAIN_DAYS} 天的")
         rc = max(rc, _tv_sync_reembed(core, sb))
+    return rc
+
+
+def _print_tv_gate(out: dict) -> int:
+    """回流闸那一步(tv_sync 的最后一步)的一行。回这一段该给的退出码: 这一步自己出错才非零(同别的附加步骤: 对照照常
+    写了, 但不该让 cron 日志看着像一次健康的同步); 020 没跑、dry-run、时间用完没判完都不算错。"""
+    g = out.get("gate") or {}
+    if g.get("applied") is None:
+        return 0                                        # dry-run: 不跑, 不提
+    if g.get("applied") is False:
+        print("  · 回流闸: 020 没跑, 这一步跳过(每篇已发的帖没有结论, 读的各处照没有闸时的口径)")
+        return 0
+    if g.get("error") and "scope" not in g:
+        print(f"  ⚠️ 回流闸这一步没跑成: {g['error']} —— 对照照常写了; 各行留着上一晚的结论, 明晚再判。")
+        return 1
+    by_gate: dict[str, int] = {}
+    by_origin: dict[str, int] = {}
+    for origin, per in (g.get("counts") or {}).items():
+        for gate, n in per.items():
+            by_gate[gate] = by_gate.get(gate, 0) + n
+            by_origin[origin] = by_origin.get(origin, 0) + n
+    print(f"  回流闸: 范围 {g.get('scope', 0)} 行, 判了 {g.get('judged', 0)}(改了 {g.get('changed', 0)}, 只刷新时间 "
+          f"{g.get('touched', 0)}): "
+          + " / ".join(f"{k} {by_gate.get(k, 0)}" for k in ("pass", "fail", "unsure", "hold", "withdrawn"))
+          + "; 来源 " + " / ".join(f"{k} {v}" for k, v in sorted(by_origin.items()))
+          + (f"; 飞书里刚不见、留着上一晚结论的 {g['kept_in_grace']}" if g.get("kept_in_grace") else "")
+          + (f"; 这晚没读到、没动的 {g['unread']}" if g.get("unread") else "")
+          + (f"; 重合没量完的 {g['overlap_left']}(明晚接着量)" if g.get("overlap_left") else "")
+          + ("; 时间用完, 没写完的明晚先判" if g.get("partial") else "")
+          + f"; {g.get('elapsed_s', 0)} 秒")
+    rc = 0
+    if g.get("vanished_error"):
+        print(f"  ⚠️ 回流闸查不了飞书里删了哪些篇(v_notes_vanished): {g['vanished_error']} —— 这晚没读到的帖没判, 明晚再查。")
+        rc = 1
+    if g.get("error"):
+        print(f"  ⚠️ 回流闸的结论没写全: {g['error']} —— 写进去的是对的, 没写的留着上一晚的, 明晚再判。")
+        rc = 1
+    return rc
+
+
+def _tv_rescore_misses(core, sb, args, targets: list[str]) -> int:
+    """`tv-sync --rescore-misses`: 只给对不上的旧对照补分数(core.tv_rescore_misses), 不同步。"""
+    rc = 0
+    for tv in targets:
+        try:
+            out = core.tv_rescore_misses(sb, tv, getattr(args, "rescore_days", None), dry_run=args.dry_run)
+        except Exception as exc:                        # noqa: BLE001 — 一个项目炸了不拖住后面的
+            print(f"\n{tv}: ❌ 补分数失败: {type(exc).__name__}: {exc}")
+            rc = 1
+            continue
+        head = "[dry-run] " if args.dry_run else ""
+        print(f"\n{head}{tv}: 对不上、还没有分数的对照 {out['candidates']} 条(这晚读得到的), 算出分数 {out['scored']}"
+              f"(其余没正文 / 太短没得比), " + ("没写" if args.dry_run else f"写入 {out['written']}"))
+        if out.get("error"):
+            print(f"  ⚠️ 没写全: {out['error']} —— 再跑一次即可(只补还空着的)。")
+            rc = 1
     return rc
 
 
@@ -1051,6 +1113,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--write-tv", action="store_true",
                    help="把对照写回 TV 的 source_autowriter_* 列(只填空的; 先跟 TV 打招呼)")
     p.add_argument("--dry-run", action="store_true", help="全部算、一行不写")
+    p.add_argument("--gate-all", action="store_true",
+                   help="回流闸(最后一步)不看发布时间, 把这个 TV 项目的对照全部重判一遍(平时只判近 60 天的、没判过的、"
+                        "上一晚是 hold / unsure 的; 没判过的本来就都会判, 所以第一晚不用带它)")
+    p.add_argument("--rescore-misses", action="store_true",
+                   help="不同步: 只给对不上的旧对照(ingested / unmatched, score 为空)补上分数, 只写 score 一列"
+                        "(一次性; --dry-run 只算不写)")
+    p.add_argument("--rescore-days", type=int, default=None,
+                   help="配 --rescore-misses: 只补发布时间在近这么多天里的(不给就是全部)")
     # 交付版式(2026-10-20): 模板存在 projects.default_params.delivery, score_drafts 存完档按它拼整批交付稿。
     # 运维命令, 同 backfill 不要 --user; 写手那边没有对应的工具 —— 版式是项目定的, 不该在对话里被模型改掉。
     # 字段说明见 deskcore/delivery.py 与 docs/deskcore.md §3.9。

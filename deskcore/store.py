@@ -3534,6 +3534,122 @@ def tv_links_set_fp(sb, fps: dict[str, str]) -> int:
     return n
 
 
+# ── 回流闸 v1(migrations/020, 2026-11-12): 每篇已发帖的来源和结论, 记在对照的四列上 ───────────────────────────
+# 取值、判法、哪个原因挡哪一路都在 deskcore/postgate.py; 写的是 core._tv_gate(tv-sync 每晚最后一步)。这里只有读写的形状。
+# 四列是后加的: 020 没跑时读不到, 所以【不】并进 tv_links() 的列清单(并进去的话 tv-sync 每个项目都读挂, 同 017 那次),
+# 单独一次可选的读, 读不到这四列回 None。
+TV_GATE_COLS = ("origin", "gate", "gate_reasons", "gate_at")
+TV_GATE_CHUNK = 200
+TV_GATE_FLAG_COLS = "note_id, publish_time, tier, data_quality_flags"
+TV_GATE_FLAG_MAX_PAGES = 20          # 一个 TV 项目的笔记, 一页 PAGE 行; 最大的项目一千来篇
+_TV_MISS_KINDS = ("ingested", "unmatched")
+
+
+def tv_gate_columns_missing(exc: Exception) -> bool:
+    """020 没跑: 读(``42703 column … does not exist``)或写(``PGRST204``)时点名的是回流闸那四列之一。只认这四列 ——
+    别的缺列 / 缺表 / 权限 / 连接错误照旧当故障(同 snapshots_table_missing 的纪律)。"""
+    msg = str(exc).lower()
+    if not ("does not exist" in msg or "42703" in msg or "pgrst204" in msg):
+        return False
+    return "column" in msg and any(re.search(rf"(?<![a-z_]){c}(?![a-z_])", msg) for c in TV_GATE_COLS)
+
+
+def tv_links_gate(sb, tv_project_id: str) -> dict[str, dict] | None:
+    """这个 TV 项目每一行对照的来源和回流闸结论, 按 note_id: ``{note_id: {match_kind, version_id, score, lag_days,
+    origin, gate, gate_reasons, gate_at}}``。前四个是定来源要看的对照列(postgate.origin_of), 后四个是 020 加的。
+    020 没跑(读不到那四列)回 None —— 调用方当「没有结论」, 照没有闸时的口径; 别的错误原样上抛。"""
+    def _build(off, lim):
+        return (sb.table("tv_note_links")
+                .select("note_id, match_kind, version_id, score, lag_days, origin, gate, gate_reasons, gate_at")
+                .eq("tv_project_id", tv_project_id)
+                .order("note_id").range(off, off + lim - 1))
+    try:
+        return {r["note_id"]: r for r in _paged(_build)}
+    except Exception as exc:                            # noqa: BLE001
+        if tv_gate_columns_missing(exc):
+            return None
+        raise
+
+
+def tv_note_gate_flags(sb, tv_project_id: str) -> list[dict] | None:
+    """这个 TV 项目每篇笔记的发布时间、tier、数据质量标记(``TV_GATE_FLAG_COLS``) —— 回流闸判结论用, 不取标题和正文。
+    按 note_id 游标翻; 读挂了回 None(同这一组读 truth_vault 的纪律: 不抛, 调用方这晚不判)。"""
+    def fetch(after):
+        try:
+            q = (sb.schema("truth_vault").table("notes").select(TV_GATE_FLAG_COLS).eq("project_id", tv_project_id))
+            if after:
+                q = q.gt("note_id", after)
+            return list(q.order("note_id").limit(PAGE).execute().data or [])
+        except Exception as exc:                        # noqa: BLE001
+            _tv_warn("tv note gate flags", exc)
+            return None
+    return _keyset(fetch, max_pages=TV_GATE_FLAG_MAX_PAGES, what="tv note gate flags")
+
+
+def tv_links_set_gate(sb, groups: list[tuple[str, str, dict, list[str]]], *, at: str, stop=None) -> int:
+    """把结论写到对照上, 回实际改到的行数。``groups`` 每组 ``(origin, gate, gate_reasons, [note_id…])``: 值一样的行
+    一次 update(同 tv_links_set_lag 的形状), 一次最多 TV_GATE_CHUNK 行。
+
+    只带回流闸那四列(负载在这里拼, 调用方递不进别的列): 对照本身的列 —— match_kind / version_id / score / candidates /
+    updated_at —— 一个不碰, 补录的、人定过的对照照旧钉着。不走 upsert: 只带几列的 upsert 会先按插入校验整行的非空约束,
+    而且一条刚被人删掉的对照会被它插回一个残行。``stop()`` 回真就不再发下一块(时间用完了, 剩下的明晚再判)。"""
+    n = 0
+    for origin, gate, reasons, ids in groups:
+        payload = {"origin": origin, "gate": gate, "gate_reasons": reasons, "gate_at": at}
+        for i in range(0, len(ids), TV_GATE_CHUNK):
+            if stop is not None and stop():
+                return n
+            try:
+                res = sb.table("tv_note_links").update(payload).in_("note_id", ids[i:i + TV_GATE_CHUNK]).execute()
+            except Exception as exc:                    # noqa: BLE001
+                if not n:
+                    raise
+                raise PartialWriteError(n, exc) from exc
+            n += len(res.data or [])
+    return n
+
+
+def tv_links_touch_gate(sb, note_ids: list[str], *, at: str, stop=None) -> int:
+    """结论没变的行只刷新 gate_at(「这一晚判过它」), 回实际改到的行数。只带这一列; 分块、``stop`` 同 tv_links_set_gate。"""
+    n = 0
+    for i in range(0, len(note_ids), TV_GATE_CHUNK):
+        if stop is not None and stop():
+            return n
+        try:
+            res = (sb.table("tv_note_links").update({"gate_at": at})
+                   .in_("note_id", note_ids[i:i + TV_GATE_CHUNK]).execute())
+        except Exception as exc:                        # noqa: BLE001
+            if not n:
+                raise
+            raise PartialWriteError(n, exc) from exc
+        n += len(res.data or [])
+    return n
+
+
+def tv_links_set_score(sb, scores: dict[str, float]) -> int:
+    """给对不上的对照(ingested / unmatched)补上 score(``{note_id: 包含度}``), 回实际改到的行数。
+
+    只带 score 一列, 按值分组 update(绝大多数是 0.0, 一组)。过滤里再钉两条, 调用方算错了也写不坏:
+    只改 match_kind 是对不上的那两种、而且 score 还是空的行 —— 对上了的对照的分数、已经记过的分数都改不到。
+    不碰 updated_at / match_kind / version_id: 补录的对照是终态, 这里只是补一个读数。"""
+    by_score: dict[float, list[str]] = {}
+    for nid, s in scores.items():
+        by_score.setdefault(round(float(s), 3), []).append(nid)
+    n = 0
+    for score, ids in by_score.items():
+        for i in range(0, len(ids), TV_GATE_CHUNK):
+            try:
+                res = (sb.table("tv_note_links").update({"score": score})
+                       .in_("note_id", ids[i:i + TV_GATE_CHUNK])
+                       .in_("match_kind", list(_TV_MISS_KINDS)).is_("score", "null").execute())
+            except Exception as exc:                    # noqa: BLE001
+                if not n:
+                    raise
+                raise PartialWriteError(n, exc) from exc
+            n += len(res.data or [])
+    return n
+
+
 def tv_edit_diffs_demote(sb, note_ids: list[str]) -> int:
     """这些笔记的差异行降回 diff_rev 0, 回实际改到的行数: 对照现在不该算差异了(重对到抄回的那版 / 补上的 lag < 0),
     摘要不再读它。"""

@@ -1393,6 +1393,20 @@ ALTER TABLE autowriter.tv_note_links
     ADD COLUMN IF NOT EXISTS tv_text_fp TEXT;
 COMMENT ON COLUMN autowriter.tv_note_links.tv_text_fp IS
     'W-34: 最近一次核对时 TV 正文的指纹(tvlink.text_fp: 标题 + 剥话题正文, fp.normalize 后 sha1 前 16 位)。NULL = 017 之前的对照, 或还没核过';
+-- 020: 每篇已发帖的来源和回流闸结论(回流闸 v1; tv-sync 每晚最后一步只 UPDATE 这四列, 取值在 deskcore/postgate.py)
+ALTER TABLE autowriter.tv_note_links
+    ADD COLUMN IF NOT EXISTS origin       TEXT,
+    ADD COLUMN IF NOT EXISTS gate         TEXT,
+    ADD COLUMN IF NOT EXISTS gate_reasons JSONB,
+    ADD COLUMN IF NOT EXISTS gate_at      TIMESTAMPTZ;
+COMMENT ON COLUMN autowriter.tv_note_links.origin IS
+    '回流闸 v1: 帖的来源(deskcore/postgate.py)。desk = 写作台的稿发出去的; desk_edited = 写作台的稿改得多; copied_back = 发了之后才存进写作台的那版; elsewhere = 别处写的(和发布前写作台里的文字重合不到 0.15); unclear = 判不出。只是标签, 不参与 gate。NULL = 还没判过';
+COMMENT ON COLUMN autowriter.tv_note_links.gate IS
+    '回流闸 v1: 这篇已发的帖能不能拿来学(deskcore/postgate.py)。pass / fail / unsure / hold / withdrawn。NULL = 还没判过, 读的一方照没有闸时的口径';
+COMMENT ON COLUMN autowriter.tv_note_links.gate_reasons IS
+    '回流闸 v1: {"reasons": [原因名], "hold": [暂缓的细项名], "overlap": 和发布前写作台里的文字的重合(只在对不上的行)}。原因名: withdrawn / hold / not_clean / risk / efficacy / unsure。只有名字和数字, 没有帖的文字';
+COMMENT ON COLUMN autowriter.tv_note_links.gate_at IS
+    '回流闸 v1: 最近一次判这一行的时刻(tv-sync 每晚; 结论没变也刷新)';
 
 -- ── 补录锁: 按项目一行, 到期可被接管 ──
 CREATE TABLE IF NOT EXISTS autowriter.ingest_locks (

@@ -57,7 +57,7 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
-from . import calllog, commentstyle, delivery, poststyle, rulecheck, rulecompile
+from . import calllog, commentstyle, delivery, postgate, poststyle, rulecheck, rulecompile
 from . import drawpolicy as dp
 from . import fingerprint as fp
 from . import priors, project_now, store, structure, tvlink, viewpage, vocab
@@ -7312,6 +7312,8 @@ MIGRATION_019_PROBE_SQL = (
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
     "where n.nspname='autowriter' and p.proname in ('deskcore_check_drafts','deskcore_commit_fingerprints');"
 )
+# 020 给 tv_note_links 加回流闸的四列(origin / gate / gate_reasons / gate_at)。列探得到。
+MIGRATION_TV_LINK_GATE = "020_tv_link_gate.sql"
 MIGRATION_016_PROBE_SQL = (
     "select p.prosrc like '%v_notes_vanished%' as skips_vanished, "
     "to_regclass('truth_vault.v_notes_vanished') is not null as view_present "
@@ -7718,6 +7720,14 @@ def migration_state(client) -> dict:
          "PostgREST 读不到函数体; 用 SQL Editor 跑(两行、四个 true): " + MIGRATION_019_PROBE_SQL,
          "缺席→查重的结论不变, 只是慢: 取候选按项目把历史指纹逐行比一遍, 耗时跟项目的历史条数涨(千行的项目每篇约 0.4 秒, "
          "10 篇一组在查重、入库前重查、入库写指纹三处各等 3~5 秒)")
+
+    # ── 020: 回流闸 v1 的四列(每篇已发帖的来源和「能不能拿来学」的结论) ──
+    state, note = _probe_ok(lambda: client.table("tv_note_links")
+                            .select("note_id, origin, gate, gate_reasons, gate_at").limit(1).execute(),
+                            predicate=store.schema_object_missing)
+    _add(MIGRATION_TV_LINK_GATE, "tv_note_links 的回流闸四列(origin / gate / gate_reasons / gate_at)", state, note,
+         "可降级: tv-sync 的最后一步读不到这四列就整步跳过(对照、补录照常, 退出码不变), 每篇已发的帖没有结论; 读结论的"
+         "各处当作「没判过」, 行为和没有闸时一样。跑了之后当晚的 tv-sync 起开始记, 不用别的操作")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -11970,9 +11980,285 @@ def _same_miss_score(stored, now_score: float | None) -> bool:
         return False
 
 
+# ── 回流闸 v1(2026-11-12): tv-sync 每晚最后一步, 给每篇已发的帖记来源和「能不能拿来学」的结论 ─────────────────
+# 判法、名字、哪个原因挡哪一路都在 postgate(纯函数); 这里只管把它要的东西凑齐、把结论写到对照的四列上(migrations/020)。
+# 这一步是附加的, 四条纪律:
+#   · 排在最后: 对照、补录、指纹这晚都已经写进库了才开始; 出什么错都不改 tv_sync 已经算好的结果(_tv_gate_step 整个兜住)。
+#   · 020 没跑(读不到那四列)整步跳过; dry-run 不跑。那时读结论的各处拿到的是「没判过」, 行为和以前一样。
+#   · 有上限: 每个 TV 项目最多 TV_GATE_BUDGET_S 秒。读答案的每一批、写的每一块之前看一眼: 读的时候就用完了这晚一行不写
+#     (不拿半份答案去判), 写到一半用完了就停、剩下的明晚先判(没判过的排最前, 其余按上次判的时刻从旧到新); 量重合另有
+#     TV_GATE_OVERLAP_BUDGET_S。看的是两次请求之间, 一次请求自己卡住由客户端的超时管。
+#   · 只 UPDATE 回流闸那四列, 值一样的行一次写(store.tv_links_set_gate), 结论没变的只刷新 gate_at —— 每晚范围里的每一行
+#     都刷新, TV 的灯按 max(gate_at) 看这一步还在不在跑。不 upsert, 不碰对照本身的列。
+# 范围: 发布时间在近 TV_GATE_WINDOW_DAYS 天里的(含排期在后面的)、从没判过的、上一晚是 hold / unsure 的(等发布时间、正文、
+# 特征题答案, 不管多老都重判)、判过 withdrawn 而这晚又读到了的(回来了)。--gate-all 是这个项目的全部对照。
+# 读不到就不判、留着上一晚的: 笔记的状态列、efficacy_promise 的答案、投流事件三样任何一样读不到, 这个项目这晚整步报错、
+# 一行不写(少了哪一样都会把一批帖判错档: 答案读不到会全进 unsure, 投流事件读不到会把 fail 放成 pass)。
+# 飞书里删了的: 这晚没读到(016 之后 deskcore_tv_notes 不返回它们)而且缺席满 TV_VANISHED_GRACE 的记 withdrawn; 还在宽限
+# 里的不判, 留着上一晚的结论(只刷新 gate_at) —— TV 一次同步写坏, 不能让一个项目一晚上全变成 withdrawn(decisions 第 1 条)。
+# 查不了 v_notes_vanished 的那晚, 没读到的行一律不动。没读到、又不在视图里的(--since 窗口外的)也不动。
+TV_GATE_WINDOW_DAYS = 60
+TV_GATE_BUDGET_S = 120.0
+TV_GATE_OVERLAP_BUDGET_S = 30.0
+TV_GATE_ANSWER_BATCH = 500           # 功效题的答案一次问这么多篇(store.note_answers 里再按 100 个一批), 两次之间看一眼时间
+
+
+def _gate_now() -> datetime:
+    """回流闸这一晚的「现在」(测试换这个, 不碰真时钟)。"""
+    return datetime.now(timezone.utc)
+
+
+def _miss_score_now(n: tvlink.Note, index: tvlink.VersionIndex, snaps: list, snap_index) -> float | None:
+    """一篇对不上的帖和写作台的稿子最像到什么程度 —— 和 tv_sync 当晚记进对不上那一行的 score 同一个口径(那里的
+    miss_score): 存过档的版本按 match_note 看时间窗里的, 只查过重的底稿按 match_snapshot 看发布之前的, 取高的。
+    没正文 / 太短没得比回 None。"""
+    if not n.body:
+        return None
+    best = tvlink.match_note(n, index).score
+    if snaps and n.publish_time is not None:
+        s = tvlink.match_snapshot(n, snaps, snap_index, index).score
+        if s is not None:
+            best = s if best is None else max(best, s)
+    return best
+
+
+def _rescore_misses(client, rows: dict[str, dict], notes_by_id: dict, index: tvlink.VersionIndex, snaps: list,
+                    snap_index, *, only: set | None = None, dry_run: bool = False) -> dict:
+    """给对不上的旧对照(ingested / unmatched, score 还是空的)补上分数(2026-11-12; tv_rescore_misses 用)。
+
+    11-11 起 tv-sync 给当晚对不上的帖记 score; 可补录的对照是终态, 之后每晚跳过, 11-11 之前补录的三千多行一直是空的 ——
+    看不出那篇帖是别处写的还是拿写作台的稿改的。这里按同一个口径(_miss_score_now)补: 只写 score 一列
+    (store.tv_links_set_score 的过滤还钉着「对不上的两种、score 为空」), match_kind / version_id 一个不动。
+    ``rows`` 是对照行(要 match_kind / score), 算出来的分数顺手记回 ``rows``。
+    没读到的笔记、没正文的、太短没得比的不动(score 照旧是空)。``only`` 限定只看这些 note_id。"""
+    todo = [notes_by_id[nid] for nid, r in sorted(rows.items())
+            if r.get("match_kind") in postgate.MISS_KINDS and r.get("score") is None
+            and nid in notes_by_id and (only is None or nid in only)]
+    out = {"candidates": len(todo), "scored": 0, "written": 0, "error": None}
+    scores: dict[str, float] = {}
+    for n in todo:
+        s = _miss_score_now(n, index, snaps, snap_index)
+        if s is not None:
+            scores[n.note_id] = round(float(s), 3)
+    out["scored"] = len(scores)
+    if scores and not dry_run:
+        try:
+            out["written"] = store.tv_links_set_score(client, scores)
+        except Exception as exc:                        # noqa: BLE001 — 只是读数: 报出来, 再跑一次只补还空着的
+            logger.exception("tv_rescore_misses: 给对不上的对照补分数失败")
+            out["written"] = getattr(exc, "done", 0)
+            out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+            return out
+    for nid, s in scores.items():
+        rows[nid]["score"] = s
+    return out
+
+
+def _gate_snapshots(groups: dict, indexed: set) -> list:
+    """查重底稿里还没成为版本的那几篇(没被查重打回过的), 给回流闸量「发布前写作台里的文字」用。"""
+    return [tvlink.Version(version_id=vid, project_id=g["project_id"], title=(g.get("title") or "").strip(),
+                           body=tvlink.strip_hashtags(g.get("body") or ""),
+                           created_at=tvlink._as_dt(g.get("first_checked_at")))
+            for vid, g in groups.items() if g.get("ok") and vid not in indexed]
+
+
+def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dict, index: tvlink.VersionIndex,
+             snaps: list, snap_index, *, gate_all: bool = False, now: datetime | None = None, stop=None) -> dict:
+    """判这个 TV 项目范围里的每一行对照, 写回流闸那四列(上面那段是纪律)。``rows`` = store.tv_links_gate 读回来的。
+    回这一晚的计数(只有数): 范围、判了几行、改了几行、只刷新时间的几行、按来源 × 结论的分布。读不到要用的东西就抛,
+    由 _tv_gate_step 兜住。"""
+    now = now or _gate_now()
+    stop = stop or (lambda: False)
+    out: dict = {"applied": True, "scope": 0, "judged": 0, "changed": 0, "touched": 0, "kept_in_grace": 0,
+                 "unread": 0, "no_note": 0, "overlap_measured": 0, "overlap_left": 0, "counts": {},
+                 "partial": False, "vanished_error": None, "error": None}
+    flags = store.tv_note_gate_flags(client, tv_project_id)
+    if flags is None:
+        raise RuntimeError("读不到 truth_vault.notes 的发布时间 / tier / 数据质量标记")
+    flag_of = {str(r["note_id"]): r for r in flags if r.get("note_id")}
+    since = now - timedelta(days=TV_GATE_WINDOW_DAYS)
+    scope: list[str] = []
+    for nid, row in rows.items():
+        f = flag_of.get(nid)
+        if f is None:
+            out["no_note"] += 1                         # TV 里没有这一篇了(整行删了): 没东西可判, 不动
+            continue
+        t = priors._ts(f.get("publish_time"))
+        g = row.get("gate")
+        if (gate_all or g not in postgate.GATES or g in postgate.PENDING_GATES or (t is not None and t >= since)
+                or (g == postgate.GATE_WITHDRAWN and nid in notes_by_id)):
+            scope.append(nid)
+    scope.sort(key=lambda nid: (rows[nid].get("gate_at") is not None, str(rows[nid].get("gate_at") or ""), nid))
+    out["scope"] = len(scope)
+    if not scope:
+        return out
+
+    # 飞书里删了的(这晚没读到的才查): 缺席满宽限的 → withdrawn; 还在宽限里的留着上一晚的
+    unread = [nid for nid in scope if nid not in notes_by_id]
+    long_gone: set[str] = set()
+    in_grace: set[str] = set()
+    if unread:
+        try:
+            long_gone = store.tv_long_vanished_note_ids(client, unread, min_gap=TV_VANISHED_GRACE)
+            try:
+                in_grace = store.tv_vanished_note_ids(client, unread) - long_gone
+            except Exception as exc:                    # noqa: BLE001
+                # 视图不在(新库 / TV 还没有 D-103): 没有「飞书里删了」这回事, 同 tv_long_vanished_note_ids 回空的那一支
+                if not ("pgrst205" in str(exc).lower() and "v_notes_vanished" in str(exc)):
+                    raise
+        except Exception as exc:                        # noqa: BLE001 — 这晚没读到的行一律不动
+            logger.exception("tv_sync: 回流闸查 v_notes_vanished 失败 (tv=%s) —— 这晚没读到的帖不判", tv_project_id)
+            out["vanished_error"] = f"{type(exc).__name__}: {exc}"[:200]
+            long_gone, in_grace = set(), set()
+
+    def note_row(nid: str) -> dict:
+        n = notes_by_id.get(nid)                        # 正文长短看 tv-sync 这晚从 raw_content 拆出来的那段(decisions 第 2 条)
+        return dict(flag_of[nid], note_id=nid, body_chars=len(n.body) if n is not None else None)
+
+    # 前两步就定了的(hold)用不着功效题的答案, 不为它们去读(全库三百多行 hold 每晚都在范围里)
+    readable = [nid for nid in scope if nid in notes_by_id
+                and postgate.classify(note_row(nid), now=now).gate != postgate.GATE_HOLD]
+    efficacy: dict[str, str] = {}
+    boosted: frozenset = frozenset()
+    if readable:
+        for i in range(0, len(readable), TV_GATE_ANSWER_BATCH):
+            if stop():                                  # 读得慢(库在抖): 不拿半份答案去判, 这晚不写, 明晚再来
+                raise TimeoutError(f"读 efficacy_promise 的答案时超过了这一步的时间上限({TV_GATE_BUDGET_S:.0f} 秒)")
+            answers = store.note_answers(client, readable[i:i + TV_GATE_ANSWER_BATCH], [postgate.EFFICACY_QID])
+            if answers is None:
+                raise RuntimeError("读不到 efficacy_promise 的答案(truth_vault.note_feature_answers)")
+            efficacy.update({nid: a[postgate.EFFICACY_QID] for nid, a in answers.items()
+                             if a.get(postgate.EFFICACY_QID)})
+        got = priors.paid_boosted(client)
+        if got is None:
+            raise RuntimeError("读不到投流事件(truth_vault.v_paid_boost_events)")
+        boosted = got
+
+    # 对不上的行: 和发布前写作台里的文字的重合。量过一次就记在 gate_reasons.overlap 里、之后沿用 —— 发布之前有什么
+    # 不会再变, 而对照索引会变(稿子改了一版, 发布前的那版就不在索引里了; 底稿过了 45 天不再读), 每晚重量只会越量越低。
+    overlap: dict[str, float] = {}
+    ov_deadline = time.monotonic() + TV_GATE_OVERLAP_BUDGET_S
+    for nid in scope:
+        if rows[nid].get("match_kind") not in postgate.MISS_KINDS:
+            continue
+        kept = postgate.stored_overlap(rows[nid].get("gate_reasons"))
+        if kept is not None:
+            overlap[nid] = kept
+            continue
+        n = notes_by_id.get(nid)
+        if n is None:
+            continue
+        if time.monotonic() > ov_deadline or stop():
+            out["overlap_left"] += 1
+            continue
+        p = tvlink.prior_overlap(n, index, snaps, snap_index)
+        if p is not None:
+            overlap[nid] = round(p, 3)
+            out["overlap_measured"] += 1
+
+    changed: dict[tuple, list[str]] = {}
+    touch: list[str] = []
+    counts: dict[str, dict[str, int]] = {}
+    for nid in scope:
+        row, n = rows[nid], notes_by_id.get(nid)
+        if n is None and nid not in long_gone:
+            if nid in in_grace and row.get("gate") in postgate.GATES:
+                out["kept_in_grace"] += 1
+                touch.append(nid)                       # 这晚看过它, 结论留着上一晚的
+            else:
+                out["unread"] += 1
+            continue
+        verdict = postgate.classify(note_row(nid), vanished=long_gone, boosted=boosted, efficacy=efficacy, now=now)
+        ov = overlap.get(nid)
+        origin = postgate.origin_of(row, ov)
+        reasons = postgate.pack_reasons(verdict, overlap=ov)
+        out["judged"] += 1
+        counts.setdefault(origin, {}).setdefault(verdict.gate, 0)
+        counts[origin][verdict.gate] += 1
+        if (row.get("origin") == origin and row.get("gate") == verdict.gate
+                and postgate._as_obj(row.get("gate_reasons")) == reasons):
+            touch.append(nid)
+        else:
+            changed.setdefault((origin, verdict.gate, json.dumps(reasons, sort_keys=True, ensure_ascii=False)),
+                               []).append(nid)
+    out["counts"] = counts
+
+    at = now.isoformat()
+    try:
+        out["changed"] = store.tv_links_set_gate(
+            client, [(o, g, json.loads(r), ids) for (o, g, r), ids in sorted(changed.items())], at=at, stop=stop)
+        out["touched"] = store.tv_links_touch_gate(client, touch, at=at, stop=stop)
+    except Exception as exc:                            # noqa: BLE001 — 写了一半: 写进去的是对的, 没写的留着上一晚的
+        logger.exception("tv_sync: 回流闸写结论失败 (tv=%s)", tv_project_id)
+        out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+    # 时间用完了、还有没写完的: 没写的留着上一晚的结论和 gate_at, 明晚排在最前
+    out["partial"] = bool(stop()) and (out["changed"] < sum(len(ids) for ids in changed.values())
+                                       or out["touched"] < len(touch))
+    return out
+
+
+def _tv_gate_step(client, tv_project_id: str, notes_by_id: dict, index: tvlink.VersionIndex, groups: dict, *,
+                  dry_run: bool = False, gate_all: bool = False, now: datetime | None = None) -> dict:
+    """tv_sync 的最后一步: 判回流闸。**不抛** —— 出什么错都只记在回的那个 dict 里(``error``), tv_sync
+    已经写进库的对照、补录和它要回的结果一样不动。dry-run 不跑; 020 没跑回 ``{"applied": False}``。
+    ``groups`` 是这晚读到的查重底稿(_snapshot_groups 归好的), ``index`` 是这晚的对照索引 —— 都是 tv_sync 手里现成的。"""
+    if dry_run:
+        return {"applied": None, "skipped": "dry_run"}
+    started = time.monotonic()
+
+    def stop() -> bool:
+        return time.monotonic() - started > TV_GATE_BUDGET_S
+
+    try:
+        rows = store.tv_links_gate(client, tv_project_id)
+        if rows is None:
+            return {"applied": False, "skipped": "020"}
+        snaps = _gate_snapshots(groups, {v.version_id for v in index.versions})
+        out = _tv_gate(client, tv_project_id, rows, notes_by_id, index, snaps, tvlink.VersionIndex(snaps),
+                       gate_all=gate_all, now=now, stop=stop)
+    except Exception as exc:                            # noqa: BLE001 — 附加的一步, 绝不让 tv-sync 因它失败
+        logger.exception("tv_sync: 回流闸这一步失败 (tv=%s) —— 对照照常写了, 各行留着上一晚的结论", tv_project_id)
+        return {"applied": True, "error": f"{type(exc).__name__}: {exc}"[:200],
+                "elapsed_s": round(time.monotonic() - started, 1)}
+    out["elapsed_s"] = round(time.monotonic() - started, 1)
+    return out
+
+
+def tv_rescore_misses(client, tv_project_id: str, days: int | None = None, *, dry_run: bool = False) -> dict:
+    """一次性把一个 TV 项目里对不上的旧对照(ingested / unmatched, score 为空)的分数补上(`tv-sync --rescore-misses`)。
+
+    每晚的 tv-sync 【不】做这件事: 补录的、人定过的对照是钉住的, 每晚的同步一个字不碰它们(tests/test_tv_sync_drift.py 守着)。
+    所以这是人手动跑的一次性命令, 不依赖 020。回流闸定来源不等它: 那里自己量「和发布前写作台里的文字的重合」
+    (tvlink.prior_overlap), 记在 gate_reasons.overlap 里; 这里补的 score 是给人读的那个数(时间窗里的版本都算, 抄回来的也在内)。
+    读的东西和 tv_sync 一样(对照表、各写作台项目的定稿版本、TV 的笔记、还没转正的查重底稿), 只写 score 一列。
+    ``days``: 只补发布时间在近这么多天里的; 不给就是全部。``dry_run`` 只算不写。"""
+    maps = [m for m in store.tv_project_map(client) if m["tv_project_id"] == tv_project_id]
+    if not maps:
+        raise ValueError(f"tv_project_map 里没有 {tv_project_id!r}")
+    versions = [tvlink.Version.from_row(v) for m in maps for v in store.versions_for_linking(client, m["project_id"])]
+    index = tvlink.VersionIndex(versions)
+    notes_by_id = {n.note_id: n for n in (tvlink.Note.from_row(r) for r in store.tv_notes(client, tv_project_id))}
+    rows = store.tv_links(client, tv_project_id)
+    try:
+        snap_rows = store.pending_draft_snapshots(client, [m["project_id"] for m in maps],
+                                                  since=store.iso_ago(SNAPSHOT_MAX_AGE_DAYS)) or []
+    except Exception:                                   # noqa: BLE001 — 没有底稿就只和存过档的版本比
+        logger.exception("tv_rescore_misses: 读查重底稿失败 (tv=%s), 只和存过档的版本比", tv_project_id)
+        snap_rows = []
+    snaps = _gate_snapshots(_snapshot_groups(snap_rows), {v.version_id for v in versions})
+    only = None
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=max(int(days), 0))
+        only = {nid for nid, n in notes_by_id.items() if n.publish_time is not None and n.publish_time >= since}
+    out = _rescore_misses(client, rows, notes_by_id, index, snaps, tvlink.VersionIndex(snaps), only=only,
+                          dry_run=dry_run)
+    return {"tv_project_id": tv_project_id, "links": len(rows), "notes": len(notes_by_id), "days": days,
+            "dry_run": dry_run, **out}
+
+
 def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             write_tv: bool = False, since: str | None = None,
-            rematch: bool = False) -> dict:
+            rematch: bool = False, gate_all: bool = False) -> dict:
     """把一个 TV 项目的笔记对到写作台的版本; 对不上的补录进指纹库。
 
     ── 为什么是它, 不是让运营抄 ID ──────────────────────────────────
@@ -11998,6 +12284,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
          行; 那是 TV 的列, 默认不碰)。**只回写真对上的**(body_exact / title_exact
          / fuzzy / tv_lineage); ``ingested`` 的不写 —— 那些版本是从这条笔记复制
          来的, 写回去因果倒置(见 _backfillable)。
+
+      7. 最后一步(回流闸 v1, 2026-11-12): 给范围里的每篇已发的帖记来源和「能不能拿来学」的结论(_tv_gate_step,
+         结果在返回值的 ``gate`` 里)。附加的一步: 前面几步都已经写进库了才开始, 出什么错都不改这里要回的结果;
+         migrations/020 没跑就整步跳过。``gate_all``: 不看发布时间, 这个 TV 项目的对照全部重判一遍。
 
     ``dry_run``: 全部算、一行不写(对照不写、指纹不写、TV 不写), 报表照出。
     """
@@ -12742,6 +13032,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     fingerprint_gap = _heal_fingerprint_gaps(client, desk_best, dry_run=dry_run,
                                              holder=f"tv-sync-heal:{tv_project_id}:{uuid.uuid4().hex[:8]}")
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
+    # 回流闸 v1: 放在最后, 前面的对照 / 补录 / 指纹都已经落库。不抛(见 _tv_gate_step)
+    gate = _tv_gate_step(client, tv_project_id, notes_by_id, index, groups, dry_run=dry_run, gate_all=gate_all)
     return {
         "tv_project_id": tv_project_id,
         "desk_projects": [m["project_id"] for m in maps],
@@ -12757,6 +13049,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "published_fp": published_fp,
         "fingerprint_gap": fingerprint_gap,
         "weak_title": weak_title,
+        "gate": gate,
         "note": (f"{len(notes)} 条笔记: 已对上 {counts['already_linked']}, 本次对上 {matched}"
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
                  f"{counts['fuzzy']} / 改过 {counts['edited']}"
