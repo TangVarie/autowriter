@@ -204,15 +204,18 @@ def classify(note: Mapping, *, vanished: Iterable[str] = frozenset(), boosted: I
 
 # ── 存进库的样子, 和读它的办法 ─────────────────────────────────────────────
 
-def pack_reasons(verdict: Verdict, *, overlap=None) -> dict:
+def pack_reasons(verdict: Verdict, *, overlap=None, overlap_pending: bool = False) -> dict:
     """结论 → gate_reasons 那一格: ``{"reasons": [...]}``; hold 的带 ``"hold": [细项]``; 对不上的行量过重合的带
-    ``"overlap"``(三位小数)。只有登记过的名字和一个数, 没有帖的文字。"""
+    ``"overlap"``(三位小数); 这晚时间用完、重合还没量的带 ``"overlap_pending": true``(量上之后这个键就没了)。
+    只有登记过的名字、一个数和一个记号, 没有帖的文字。"""
     out: dict = {"reasons": [r for r in REASONS if r in verdict.reasons]}
     if verdict.hold:
         out["hold"] = [h for h in HOLD_DETAILS if h in verdict.hold]
     ov = _num(overlap)
     if ov is not None:
         out["overlap"] = round(ov, 3)
+    elif overlap_pending:
+        out[OVERLAP_PENDING] = True
     return out
 
 
@@ -239,6 +242,17 @@ def stored_overlap(stored) -> float | None:
     """gate_reasons 那一格里记着的重合(没有回 None)。"""
     obj = _as_obj(stored)
     return _num(obj.get("overlap")) if isinstance(obj, Mapping) else None
+
+
+# 这晚量重合的时间用完了、这一行还没量(codex review on aw#155): 结论照判照存, 来源先记 unclear; 带着这个记号的行
+# 不管帖多老、结论定没定, 第二晚都还在范围里 —— 不然 60 天以前的帖第一晚没量上, 之后永远不在范围里, 来源一直是 unclear。
+OVERLAP_PENDING = "overlap_pending"
+
+
+def overlap_pending(stored) -> bool:
+    """这一行的重合是不是还欠着没量(gate_reasons 里带着 OVERLAP_PENDING)。"""
+    obj = _as_obj(stored)
+    return isinstance(obj, Mapping) and obj.get(OVERLAP_PENDING) is True
 
 
 def learnable(gate, gate_reasons=None, *, blocking: frozenset = BLOCKS_DESK) -> bool:

@@ -12091,6 +12091,7 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         g = row.get("gate")
         if (gate_all or g not in postgate.GATES or g in postgate.PENDING_GATES or (t is not None and t >= since)
                 or postgate.REASON_UNSURE in postgate.reasons_of(row.get("gate_reasons"))
+                or postgate.overlap_pending(row.get("gate_reasons"))
                 or (g == postgate.GATE_WITHDRAWN and nid in notes_by_id)
                 or (g != postgate.GATE_WITHDRAWN and nid not in notes_by_id)):
             scope.append(nid)
@@ -12149,6 +12150,7 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
     # 对不上的行: 和发布前写作台里的文字的重合。量过一次就记在 gate_reasons.overlap 里、之后沿用 —— 发布之前有什么
     # 不会再变, 而对照索引会变(稿子改了一版, 发布前的那版就不在索引里了; 底稿过了 45 天不再读), 每晚重量只会越量越低。
     overlap: dict[str, float] = {}
+    ov_left: set[str] = set()                           # 时间用完没量上的: 存的时候带记号, 明晚还在范围里
     ov_deadline = time.monotonic() + TV_GATE_OVERLAP_BUDGET_S
     for nid in scope:
         if rows[nid].get("match_kind") not in postgate.MISS_KINDS:
@@ -12162,6 +12164,7 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
             continue
         if time.monotonic() > ov_deadline or stop():
             out["overlap_left"] += 1
+            ov_left.add(nid)
             continue
         p = tvlink.prior_overlap(n, index, snaps, snap_index)
         if p is not None:
@@ -12183,7 +12186,7 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         verdict = postgate.classify(note_row(nid), vanished=long_gone, boosted=boosted, efficacy=efficacy, now=now)
         ov = overlap.get(nid)
         origin = postgate.origin_of(row, ov)
-        reasons = postgate.pack_reasons(verdict, overlap=ov)
+        reasons = postgate.pack_reasons(verdict, overlap=ov, overlap_pending=nid in ov_left)
         out["judged"] += 1
         counts.setdefault(origin, {}).setdefault(verdict.gate, 0)
         counts[origin][verdict.gate] += 1

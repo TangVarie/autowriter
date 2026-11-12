@@ -774,10 +774,30 @@ def test_an_unmeasured_overlap_is_unclear_tonight_and_measured_the_next_night(mo
     out = core.tv_sync(c, TV)
     assert out["gate"]["overlap_left"] == 1 and _gate(c)["n2"] == ("unclear", "pass", ())
     assert "overlap" not in _links(c)["n2"]["gate_reasons"]
+    assert _links(c)["n2"]["gate_reasons"]["overlap_pending"] is True
     monkeypatch.setattr(core, "TV_GATE_OVERLAP_BUDGET_S", 30.0)
     _next_night()
     out = core.tv_sync(c, TV)
     assert out["gate"]["overlap_measured"] == 1 and _gate(c)["n2"] == ("elsewhere", "pass", ())
+
+
+def test_an_old_post_whose_overlap_was_not_measured_stays_in_scope_until_it_is(monkeypatch):
+    """codex review on aw#155: 60 天以前的帖第一晚(第一次全量)量重合的时间用完了, 结论照存、来源记 unclear —— 原来它
+    结论定了、又过了窗口, 第二晚就不在范围里, 来源永远是 unclear(除非有人手跑 --gate-all)。欠着没量的行带一个记号,
+    不管多老都留在范围里, 量上了记号就没了、也不再进范围。"""
+    c = _tv([T._note("n2", "很久以前发的那篇", T.BODY_NEW, days=-80)], links=[_copy_link()])
+    monkeypatch.setattr(core, "TV_GATE_OVERLAP_BUDGET_S", -1.0)
+    out = core.tv_sync(c, TV)
+    assert out["gate"]["overlap_left"] == 1 and _gate(c)["n2"] == ("unclear", "pass", ())
+    assert _links(c)["n2"]["gate_reasons"].get("overlap_pending") is True
+    monkeypatch.setattr(core, "TV_GATE_OVERLAP_BUDGET_S", 30.0)
+    _next_night()
+    out = core.tv_sync(c, TV)
+    assert out["gate"]["scope"] == 1 and out["gate"]["overlap_measured"] == 1
+    assert _gate(c)["n2"] == ("elsewhere", "pass", ())
+    assert "overlap_pending" not in _links(c)["n2"]["gate_reasons"]
+    _next_night()
+    assert core.tv_sync(c, TV)["gate"]["scope"] == 0, "量上了、结论定了、过了窗口: 不再进范围"
 
 
 # ── store: 读写的形状 ───────────────────────────────────────────────────────────────────
