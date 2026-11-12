@@ -14,6 +14,8 @@
 > - **`review_drafts` / `export_drafts` 两个工具撤了**：定稿由写手贴进飞书，发布后 `tv-sync` 按内容对回来（core 里的函数保留，不再暴露给模型）。
 > - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。评论规则不只认「评论区：」开头：开头那一句说的是评论、或存的检查查评论的也算（2026-11-11，`docs/deskcore.md` §3.24）；评论位是四种评论，一组不止四条时其余的不带 slot。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
 
+> **2026-11-12 · 回流闸 v1**：发出去的帖大多不是在写作台里写的。tv-sync 每晚最后一步给每篇已发的帖记来源和「能不能拿来学」的结论（`postgate.py`，`tv_note_links` 的四列，`migrations/020`；只分拣、不拦，不调 Jev）。查重和「最近发出去」的标题照旧全收，配比和起量计数照旧按 `priors.is_clean`；只有学的那一路（简报的 working 标题、发牌卡上的起量帖参照、TV 馆员的教训卡）看结论。写作台读的一方在开关 `config.RETURN_GATE_ENFORCE` 后面，**代码默认关**：关着、020 没跑、或者那几列读不出来，简报和发牌同今天一字不差。同一个开关还让同一个 TV 项目对着的几个写作台项目看得到彼此发出去的标题。补录副本不再当正负例（不看开关）。写手那边什么都不用做，协议没动。见 `docs/deskcore.md` §3.30、runbook §1.16。
+
 > **2026-11-12**：`score_drafts` 的回包带 **`view`** —— 这批稿子排好版的页面的链接（一篇一行、左边笔记右边评论、逐篇可复制；改稿重存后刷新就是最新一版）。页面由服务端拿存下的稿子拼（`viewpage.py`，`GET /v/{令牌}`：令牌带签名、14 天过期，这是健康检查之外唯一不带钥匙的路径），写手那边的模型不用写 HTML。有交付模板的项目那一句接在 `delivery.text` 最后一行；没有模板的项目 `next_step` 里另给一份默认的排法。不用配任何东西；`DESKCORE_VIEW_PAGE=0` 关掉。链接和令牌不进日志、不进库。见 `docs/deskcore.md` §3.29。
 
 > **2026-11-11**：项目定的评论配比写手可以在对话里改（**`set_comment_mix`**，只在用户明说时调；列改不了；留最近 20 次的记录）。钥匙对不上时 401 自己说收到的那一串长什么样，`/health` 多一块 `auth_rejections`（按固定的几个原因数被拒的请求，没有钥匙的任何一部分）。见 `docs/deskcore.md` §3.23。
@@ -63,6 +65,7 @@ deskcore/
 ├── store.py        db.py 里【没有的】查询形状(共享层规则/带向量的正负例/四张新表)
 ├── fingerprint.py  指纹与判定, 【只用标准库】
 ├── delivery.py     交付版式模板的校验与拼装(纯函数, 2026-10-20, 见 docs/deskcore.md §3.9)
+├── postgate.py     回流闸 v1: 已发帖的来源 / 结论 / 原因的名字, 判的先后, 哪个原因挡哪一路(纯函数, 2026-11-12, 见 docs/deskcore.md §3.30)
 ├── viewpage.py     一批稿子排好版的页面: 令牌、签名的钥匙、对外地址、HTML(纯函数, 2026-11-12, 见 docs/deskcore.md §3.29)
 ├── rulecheck.py    带 check 的规则逐篇代码查(纯函数, 2026-10-20, 见 docs/deskcore.md §3.10)
 ├── rulecompile.py  Jev 编译规则的结果: sha / 发给 Jev 的形状 / 拼题库 / 读答案(纯函数, 2026-10-20, D-121, 见 docs/deskcore.md §3.11)

@@ -255,6 +255,15 @@ RULE_COMPILE_AUTO: bool = (_get_secret("RULE_COMPILE_AUTO") or "1").strip() not 
 # 存完档之后在后台给这个项目还没有规则题答案的旧稿补查(deskcore/core.py 的 _rule_sweep, 2026-11-11): 每次存档最多查 20 版,
 # 只花 Jev 规则题的钱, 写手和模型都看不到。0 = 关掉(比如要先停掉这笔 Jev 开销的时候); 改稿的后台复查不受它管。
 RULE_SWEEP_AUTO: bool = (_get_secret("RULE_SWEEP_AUTO") or "1").strip() not in ("0", "false", "False", "off")
+# ── 回流闸 v1(2026-11-12, docs/deskcore.md §3.30): 写作台「学」的那一路要不要按结论筛 ────────────────────
+# tv-sync 每晚给每篇已发的帖记结论(tv_note_links.gate, migrations/020; 判法在 deskcore/postgate.py), 这个开关管的是
+# 【读】的一方: 开了之后简报的 working 标题、发牌的起量帖参照不再用判过、没放行的帖, 同一个 TV 项目对着的几个写作台项目
+# 也看得到彼此发出去的标题(A8)。默认【关】: 关着、或者 020 还没跑、或者那几列读不出来, 简报和发牌同今天一字不差。
+# 打开的办法是把下面这一行的 "0" 改成 "1"(看过三晚的结论分布之后的一行 PR), 不用谁去改服务的环境变量;
+# 环境变量只是应急的覆盖(开了之后要临时关: RETURN_GATE_ENFORCE=0)。
+RETURN_GATE_ENFORCE_DEFAULT = "0"
+RETURN_GATE_ENFORCE: bool = ((_get_secret("RETURN_GATE_ENFORCE") or RETURN_GATE_ENFORCE_DEFAULT).strip().lower()
+                             in ("1", "true", "on"))
 
 # ── Auth cookie (R-040) ─────────────────────────────────────────────────────
 # refresh token 走 stx CookieManager(JS 写入, 无法 HttpOnly —— 架构限制)。
