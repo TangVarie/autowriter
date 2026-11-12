@@ -354,7 +354,11 @@ select tv_project_id, origin, gate, count(*), max(gate_at)
   结论照存、来源先记 `unclear`，`gate_reasons` 里带 `"overlap_pending": true`：带着它的行不管帖多老、结论定没定，第二晚都还在
   范围里，量上了这个键就没了（没有它的话，60 天以前的帖第一晚没量上，之后永远不进范围）。这晚查重底稿没读出来
   （一时的故障，`snapshots.error` 有值）也一样：结论照判，重合整晚不量、都记成欠着的——拿缺了底稿的索引量出来的数会被
-  记下来一直沿用。欠着的行来源一律 `unclear`，不拿对照上的 `score` 单独定「别处写的」。
+  记下来一直沿用。欠着的行来源一律 `unclear`，不拿对照上的 `score` 单独定「别处写的」。量的时候把帖那一刻的文字指纹一起记下
+  （`gate_reasons.overlap_fp`，`tvlink.text_fp` 的 16 位，不是文字）：补录的帖正文后来在飞书里改了（对照是钉住的、不重对），
+  这晚读到它、正文那一半指纹对不上，就进范围重量；只改了标题、标点、话题的，或者只是写作台这边的索引变了，不重量。
+  代价：量过重合的对不上的行各带各的指纹，第一次判的时候一行一次 UPDATE（最大的项目约 800 行，在这一步的 120 秒里；
+  时间用完没写的留到第二晚、排在最前）；之后结论没变的行照旧合成几次只刷新 `gate_at` 的 UPDATE。
 - 结论（`gate`）按先后：`withdrawn` → `hold`（没有发布时间 / 排期在后面 / 正文还是空的 / 合成数据——都是「还没到齐」；
   发出去的短帖有字就照走后面几步。正文有没有看 tv-sync 从 `raw_content` 拆出来的那段，不看 `truth_vault.notes.body`）→ `fail`（`not_clean` 就是 `priors.is_clean` 说不干净；
   `risk` = tier 风控；`efficacy` = TV 存的 `efficacy_promise` 答案是「是」）→ `unsure`（那一题还没有答案）→ `pass`。

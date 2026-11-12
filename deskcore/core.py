@@ -12066,6 +12066,19 @@ def _gate_snapshots(groups: dict, indexed: set) -> list:
             for vid, g in groups.items() if g.get("ok") and vid not in indexed]
 
 
+def _gate_overlap_stale(row: dict, note) -> bool:
+    """这一行记着的重合是不是对着帖的旧文字量的: 对不上的行、记着重合和量的那一刻的文字指纹、这晚读到了这篇帖、
+    帖的正文指纹和记着的不一样(codex review on aw#155)。只改了标题、标点、话题的不算(tvlink.body_unchanged); 没记指纹
+    的(没有这回事之前量的)不算 —— 不知道是对着哪一份量的, 不凭空重量。"""
+    if note is None or row.get("match_kind") not in postgate.MISS_KINDS:
+        return False
+    reasons = row.get("gate_reasons")
+    fp_then = postgate.stored_overlap_fp(reasons)
+    if fp_then is None or postgate.stored_overlap(reasons) is None:
+        return False
+    return not tvlink.body_unchanged(fp_then, tvlink.text_fp(note))
+
+
 def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dict, index: tvlink.VersionIndex,
              snaps: list, snap_index, *, gate_all: bool = False, now: datetime | None = None, stop=None,
              measure: bool = True) -> dict:
@@ -12093,6 +12106,7 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         if (gate_all or g not in postgate.GATES or g in postgate.PENDING_GATES or (t is not None and t >= since)
                 or postgate.REASON_UNSURE in postgate.reasons_of(row.get("gate_reasons"))
                 or postgate.overlap_pending(row.get("gate_reasons"))
+                or _gate_overlap_stale(row, notes_by_id.get(nid))
                 or (g == postgate.GATE_WITHDRAWN and nid in notes_by_id)
                 or (g != postgate.GATE_WITHDRAWN and nid not in notes_by_id)):
             scope.append(nid)
@@ -12151,16 +12165,18 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
     # 对不上的行: 和发布前写作台里的文字的重合。量过一次就记在 gate_reasons.overlap 里、之后沿用 —— 发布之前有什么
     # 不会再变, 而对照索引会变(稿子改了一版, 发布前的那版就不在索引里了; 底稿过了 45 天不再读), 每晚重量只会越量越低。
     overlap: dict[str, float] = {}
+    overlap_fp: dict[str, str | None] = {}              # 量的那一刻帖的文字指纹(沿用的照旧带着)
     ov_left: set[str] = set()                           # 时间用完没量上的: 存的时候带记号, 明晚还在范围里
     ov_deadline = time.monotonic() + TV_GATE_OVERLAP_BUDGET_S
     for nid in scope:
         if rows[nid].get("match_kind") not in postgate.MISS_KINDS:
             continue
-        kept = postgate.stored_overlap(rows[nid].get("gate_reasons"))
-        if kept is not None:
-            overlap[nid] = kept
-            continue
         n = notes_by_id.get(nid)
+        kept = postgate.stored_overlap(rows[nid].get("gate_reasons"))
+        if kept is not None and not _gate_overlap_stale(rows[nid], n):
+            overlap[nid] = kept
+            overlap_fp[nid] = postgate.stored_overlap_fp(rows[nid].get("gate_reasons"))
+            continue
         if n is None:
             continue
         if not measure or time.monotonic() > ov_deadline or stop():
@@ -12170,6 +12186,7 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         p = tvlink.prior_overlap(n, index, snaps, snap_index)
         if p is not None:
             overlap[nid] = round(p, 3)
+            overlap_fp[nid] = tvlink.text_fp(n)
             out["overlap_measured"] += 1
 
     changed: dict[tuple, list[str]] = {}
@@ -12189,7 +12206,8 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         # 重合还欠着没量的行来源先记 unclear: 手里只有对照上的 score 时不拿它单独定「别处写的」(这晚底稿没读出来的话,
         # score 也是拿缺了底稿的索引算的)
         origin = postgate.ORIGIN_UNCLEAR if nid in ov_left else postgate.origin_of(row, ov)
-        reasons = postgate.pack_reasons(verdict, overlap=ov, overlap_pending=nid in ov_left)
+        reasons = postgate.pack_reasons(verdict, overlap=ov, overlap_pending=nid in ov_left,
+                                        overlap_fp=overlap_fp.get(nid))
         out["judged"] += 1
         counts.setdefault(origin, {}).setdefault(verdict.gate, 0)
         counts[origin][verdict.gate] += 1

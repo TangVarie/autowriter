@@ -42,6 +42,11 @@ def _fixed(monkeypatch):
     monkeypatch.setattr(core, "_gate_now", lambda: NIGHT[0])
 
 
+def _fp(note_row: dict) -> str:
+    """这篇帖现在的文字指纹(量重合时记在 gate_reasons.overlap_fp 里的那个)。"""
+    return tvlink.text_fp(tvlink.Note.from_row(note_row))
+
+
 def _next_night(days: float = 1.0) -> None:
     NIGHT[0] = NIGHT[0] + timedelta(days=days)
 
@@ -109,7 +114,7 @@ def test_the_first_night_judges_every_link_and_the_result_carries_counts_only():
     assert _gate(c) == {"n1": ("desk", "pass", ()),          # 开头对上写作台的稿, 写在发布之前
                         "n2": ("elsewhere", "pass", ()),     # 对不上, 补录的: 和发布前写作台里的文字没有重合
                         "n3": ("unclear", "pass", ())}       # TV 带的血缘指到认不出的版本
-    assert _links(c)["n2"]["gate_reasons"] == {"reasons": [], "overlap": 0.0}
+    assert _links(c)["n2"]["gate_reasons"] == {"reasons": [], "overlap": 0.0, "overlap_fp": _fp(NOTES[1])}
     assert _links(c)["n1"]["gate_reasons"] == {"reasons": []}, "对上了的行不记重合"
     at = {l["gate_at"] for l in _links(c).values()}
     assert at == {NIGHT[0].isoformat()}
@@ -161,15 +166,23 @@ def test_only_the_rows_whose_verdict_changed_are_rewritten():
     assert set(touch[0]["filters"][0][2]) == {"n2", "n3"}
 
 
-def test_rows_with_the_same_verdict_go_in_one_update():
+def test_unchanged_rows_are_refreshed_in_one_update_and_measured_rows_carry_their_own_fingerprint():
     notes = [T._note(f"m{i}", f"别处写的第 {i} 篇", BODY_D + f"第 {i} 篇多写的一句话, 各不相同的第 {i * 7} 个细节。")
              for i in range(5)]
     c = _tv(notes, with_target=False)
     core.tv_sync(c, TV)
     writes = _gate_writes(c)
-    assert len(writes) == 1 and len(writes[0]["filters"][0][2]) == 5, "五行同一个结论: 一次 update"
-    assert writes[0]["payload"] == {"origin": "elsewhere", "gate": "pass",
-                                    "gate_reasons": {"reasons": [], "overlap": 0.0}, "gate_at": NIGHT[0].isoformat()}
+    # 对不上的行各带着量重合那一刻的文字指纹(codex review on aw#155), 第一晚一行一次; 之后结论没变的只刷新时间, 合成一次
+    assert len(writes) == 5 and sorted(w["filters"][0][2][0] for w in writes) == [f"m{i}" for i in range(5)]
+    mark = len(c.calls)
+    _next_night()
+    core.tv_sync(c, TV)
+    again = _gate_writes(c, mark)
+    assert len(again) == 1 and set(again[0]["payload"]) == {"gate_at"} and len(again[0]["filters"][0][2]) == 5
+    first_at = (NIGHT[0] - timedelta(days=1)).isoformat()
+    by_note = {w["filters"][0][2][0]: w["payload"] for w in writes}
+    assert by_note["m0"] == {"origin": "elsewhere", "gate": "pass", "gate_at": first_at,
+                             "gate_reasons": {"reasons": [], "overlap": 0.0, "overlap_fp": _fp(notes[0])}}
 
 
 # ── 只写那四列 ──────────────────────────────────────────────────────────────────────────
@@ -270,7 +283,8 @@ def test_reasons_are_stored_as_names_only():
     names = set(postgate.REASONS) | set(postgate.HOLD_DETAILS)
     for nid, l in _links(c).items():
         stored = l["gate_reasons"]
-        assert set(stored) <= {"reasons", "hold", "overlap"}, stored
+        assert set(stored) <= {"reasons", "hold", "overlap", "overlap_fp", "overlap_pending"}, stored
+        assert "overlap_fp" not in stored or re.fullmatch(r"[0-9a-f]{16}", stored["overlap_fp"]), "指纹, 不是文字"
         assert all(isinstance(r, str) and r in names for r in stored["reasons"] + stored.get("hold", []))
         assert "overlap" not in stored or isinstance(stored["overlap"], float)
         assert l["origin"] in postgate.ORIGINS and l["gate"] in postgate.GATES
@@ -303,7 +317,7 @@ def test_a_note_deleted_from_the_sheet_becomes_withdrawn_after_the_grace():
     _vanish(c, notes, "n2", hours=48)
     out = core.tv_sync(c, TV)
     assert _gate(c)["n2"] == ("elsewhere", "withdrawn", ("withdrawn",)), "来源留着, 结论改成 withdrawn"
-    assert _links(c)["n2"]["gate_reasons"] == {"reasons": ["withdrawn"], "overlap": 0.0}
+    assert _links(c)["n2"]["gate_reasons"] == {"reasons": ["withdrawn"], "overlap": 0.0, "overlap_fp": _fp(NOTES[1])}
     assert _links(c)["n2"]["match_kind"] == "ingested" and _links(c)["n2"]["version_id"], "对照(和查重里的副本)不动"
     assert out["gate"]["counts"]["elsewhere"] == {"withdrawn": 1} and out["gate"]["kept_in_grace"] == 0
 
@@ -829,6 +843,32 @@ def test_an_old_post_whose_overlap_was_not_measured_stays_in_scope_until_it_is(m
     assert "overlap_pending" not in _links(c)["n2"]["gate_reasons"]
     _next_night()
     assert core.tv_sync(c, TV)["gate"]["scope"] == 0, "量上了、结论定了、过了窗口: 不再进范围"
+
+
+def test_a_copy_whose_published_body_was_replaced_later_is_measured_again():
+    """codex review on aw#155: 补录的帖后来在飞书里整篇换了(对照是钉住的, 不重对)。原来记着的重合是对着旧文字量的,
+    一直沿用 —— 旧文字和发布前的稿子一模一样(1.0), 换成不相干的文字之后还是 1.0。量的时候把帖的文字指纹一起记下, 正文
+    变了就重量; 只是写作台这边的索引变了、或者只改了标题, 不重量。"""
+    notes = [T._note("n2", "上周发的那篇", T.BODY_NEW)]
+    c = _tv(notes, links=[_copy_link()])
+    _add_desk_version(c, "vprior", T.BODY_NEW, days=-3)                      # 发布之前写作台里就有一模一样的
+    core.tv_sync(c, TV)
+    first = _links(c)["n2"]["gate_reasons"]
+    assert first["overlap"] == 1.0 and _links(c)["n2"]["origin"] == "unclear"
+
+    _next_night()
+    notes[0] = T._note("n2", "只改了标题", T.BODY_NEW)
+    out = core.tv_sync(c, TV)
+    assert out["gate"]["overlap_measured"] == 0 and _links(c)["n2"]["gate_reasons"]["overlap"] == 1.0, "只改标题不重量"
+
+    _next_night()
+    notes[0] = T._note("n2", "只改了标题", BODY_E)                            # 整篇换成不相干的
+    out = core.tv_sync(c, TV)
+    row = _links(c)["n2"]
+    assert out["gate"]["overlap_measured"] == 1
+    assert row["gate_reasons"]["overlap"] == 0.0 and row["origin"] == "elsewhere"
+    assert row["gate_reasons"]["overlap_fp"] != first["overlap_fp"]
+    assert row["match_kind"] == "ingested" and row["version_id"] == "vcopy", "对照照旧钉着"
 
 
 # ── store: 读写的形状 ───────────────────────────────────────────────────────────────────

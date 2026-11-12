@@ -204,16 +204,19 @@ def classify(note: Mapping, *, vanished: Iterable[str] = frozenset(), boosted: I
 
 # ── 存进库的样子, 和读它的办法 ─────────────────────────────────────────────
 
-def pack_reasons(verdict: Verdict, *, overlap=None, overlap_pending: bool = False) -> dict:
+def pack_reasons(verdict: Verdict, *, overlap=None, overlap_pending: bool = False, overlap_fp: str | None = None) -> dict:
     """结论 → gate_reasons 那一格: ``{"reasons": [...]}``; hold 的带 ``"hold": [细项]``; 对不上的行量过重合的带
-    ``"overlap"``(三位小数); 这晚时间用完、重合还没量的带 ``"overlap_pending": true``(量上之后这个键就没了)。
-    只有登记过的名字、一个数和一个记号, 没有帖的文字。"""
+    ``"overlap"``(三位小数)和 ``"overlap_fp"``(量的那一刻帖的文字指纹, tvlink.text_fp 的 16 位: 帖的正文后来改了就认得
+    出来, 这个数该重量); 这晚时间用完、重合还没量的带 ``"overlap_pending": true``(量上之后这个键就没了)。
+    只有登记过的名字、一个数、一个指纹和一个记号, 没有帖的文字。"""
     out: dict = {"reasons": [r for r in REASONS if r in verdict.reasons]}
     if verdict.hold:
         out["hold"] = [h for h in HOLD_DETAILS if h in verdict.hold]
     ov = _num(overlap)
     if ov is not None:
         out["overlap"] = round(ov, 3)
+        if isinstance(overlap_fp, str) and overlap_fp:
+            out[OVERLAP_FP] = overlap_fp
     elif overlap_pending:
         out[OVERLAP_PENDING] = True
     return out
@@ -247,6 +250,18 @@ def stored_overlap(stored) -> float | None:
 # 这晚量重合的时间用完了、这一行还没量(codex review on aw#155): 结论照判照存, 来源先记 unclear; 带着这个记号的行
 # 不管帖多老、结论定没定, 第二晚都还在范围里 —— 不然 60 天以前的帖第一晚没量上, 之后永远不在范围里, 来源一直是 unclear。
 OVERLAP_PENDING = "overlap_pending"
+
+
+# 记下的重合是对着帖的哪一份文字量的(codex review on aw#155): 补录的帖正文后来在飞书里改了(对照是钉住的, 不重对),
+# 沿用旧文字量出来的数就不对了 —— 记着量的那一刻的文字指纹, 正文变了就重量; 只是写作台这边的索引变了不重量。
+OVERLAP_FP = "overlap_fp"
+
+
+def stored_overlap_fp(stored) -> str | None:
+    """gate_reasons 里记着的「量重合时帖的文字指纹」(没有回 None)。"""
+    obj = _as_obj(stored)
+    fp = obj.get(OVERLAP_FP) if isinstance(obj, Mapping) else None
+    return fp if isinstance(fp, str) and fp else None
 
 
 def overlap_pending(stored) -> bool:
