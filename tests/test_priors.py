@@ -648,7 +648,11 @@ def test_single_flight_builds_each_piece_once(fake_store):
     assert fake_store["calls"]["outcomes"] == 1 and fake_store["calls"]["map"] == 1
 
 
-def test_warm_is_fire_and_forget_and_fills_the_cache(fake_store):
+def test_warm_is_fire_and_forget_and_fills_the_cache(fake_store, monkeypatch):
+    # 这条走真实时钟算配比的窗口(近 60 天): 合成数据里最早的那篇正好发在「今天往回 60 天的 12:00 UTC」, UTC 过了中午它就
+    # 滑出窗口, P(疑问句) 从 0.591 掉到 0.589, 下面那条 0.60 ± 0.01 下午跑就红、上午跑就绿(2026-11-11 下午撞上)。把构建用的
+    # 「现在」钉在今天 06:00 UTC: 还是跟着今天走(见 NOW 上面那句), 只是不再看几点跑。缓存的时钟(_NOW)不动。
+    monkeypatch.setattr(priors, "_utcnow", lambda: NOW + timedelta(days=7) - timedelta(hours=6))
     fake_store["delay"] = 0.2
     t0 = time.monotonic()
     priors.warm(object(), "desk-x")

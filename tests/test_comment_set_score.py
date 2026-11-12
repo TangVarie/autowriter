@@ -368,3 +368,37 @@ def test_delivery_flags_post_ref_and_vague_pointers():
     assert any(p.startswith("第 1 条评论: 去掉「帖子里」") for p in problems)
     assert any(p.startswith("第 2 条评论: 「社团那栏」") for p in problems)
     assert cs.SHORT in delivery.requirements(tpl)["task"]
+
+
+# ── 没定提品牌上限的项目传了 max_named、整组里有不带 slot 的评论(2026-11-12 复审 C4) ──────────────────
+
+NO_SLOT_PLAN = "请提供每条评论的 slot 目标画像，再定位需要调整的评论位"           # 判定服务那句固定的话
+
+
+def _named(view, yes):
+    return {**view, "profile": {**view["profile"], "names_brand": "是" if yes else "否"}}
+
+
+def test_an_over_the_limit_brand_count_is_said_in_plain_words_not_as_add_slots(wired):
+    """一组不止四条时其余的不带 slot(报错和工具说明都这么教)。这时点名数超了 max_named, 判定服务回的整组修改单是一句
+    「请提供每条评论的 slot…」: 原样转出去等于叫模型把刚去掉的 slot 加回来(加回来又被拒), 超了几条一个字没说。"""
+    calls, reply = wired
+    texts = BRANDED[:4] + PLAIN[:4]
+    reply["fn"] = _judge([_named(v, BRAND in t) for v, t in zip(_acts(texts), texts)], passed=False,
+                         hard_fails=[["named_count", "4", "≤2", None]], plan=[{"slot": None, "why": NO_SLOT_PLAN}])
+    ids = ["q1", "q2", "exp", "reply"]
+    out = core.score_comments(_client(cfg=None), user_id=ME, link=LINK, max_named=2,
+                              comments=[{"slot": ids[i], "text": t} if i < 2 else {"text": t} for i, t in enumerate(texts)])
+    assert _sent(calls)["max_named"] == 2 and out["passed"] is False
+    assert out["thread_fix"] == [
+        "判定服务判出 4 条点名了品牌(位 q1、位 q2、第 3 条、第 4 条), 这次传的 max_named 是最多 2 条: 去掉多出来那几条里的品牌叫法, "
+        "整组再判一次(不用给评论加 slot)"]
+    assert "slot 目标画像" not in json.dumps(out, ensure_ascii=False)
+    assert core.THREAD_NO_SLOT_PLAN == NO_SLOT_PLAN
+
+
+def test_the_judge_line_passes_through_when_no_brand_count_failed(wired):
+    _, reply = wired
+    reply["fn"] = _judge(_acts(PLAIN[:2]), passed=False, plan=[{"slot": None, "why": NO_SLOT_PLAN}])
+    out = _score(_client(cfg=None), PLAIN[:2])
+    assert out["thread_fix"] == [NO_SLOT_PLAN]

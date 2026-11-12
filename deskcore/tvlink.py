@@ -164,7 +164,7 @@ class Note:
 class Match:
     kind: str                       # body_exact / title_exact / fuzzy / edited / ambiguous / unmatched
     version: Version | None = None
-    score: float | None = None
+    score: float | None = None      # 包含度。unmatched 也带: 时间窗里最像的那一版有多像(帖太短没得比时 None)
     lag_days: int | None = None
     candidates: list[dict] = field(default_factory=list)
 
@@ -352,7 +352,9 @@ def match_note(note: Note, index: VersionIndex) -> Match:
         scored = sorted(((index.containment(ng, v), v) for v in weak), key=lambda t: -t[0])
         for s, v in scored:
             listed[v.version_id] = {**_cand(note, v, s), WEAK_TITLE_KEY: True}
-        score = m.score if m.kind == "ambiguous" else scored[0][0]
+        # 分数记窗口里最高的那个(2026-11-12 复审): 内容那一路没对上时 m.score 就是全窗口的最高重合, 只取同标题那几版的
+        # 话, 另一篇不同标题的稿子占了它四分之一的字也会被记成 0
+        score = max(m.score or 0.0, scored[0][0])
         return Match("ambiguous", None, score, None, list(listed.values()))
     return m
 
@@ -361,11 +363,14 @@ def _match_by_content(note: Note, ng: set[str], index: VersionIndex, *, exclude:
     """开头 / 标题都没对上(或标题档不认)时按四字串包含度对: fuzzy / edited / ambiguous / unmatched。``exclude``: 已经认出
     只是借了开头的那几版(F02), 不参与。"""
     if len(ng) < FUZZY_MIN_GRAMS:
-        return Match("unmatched")
-    scored = sorted(((index.containment(ng, v), v) for v in index.versions
-                     if v.version_id not in exclude and in_window(lag_days(note, v))), key=lambda t: -t[0])
+        return Match("unmatched")                       # 帖太短, 没得比: 分数留空
+    inside = [(index.containment(ng, v), v) for v in index.versions if in_window(lag_days(note, v))]
+    scored = sorted((t for t in inside if t[1].version_id not in exclude), key=lambda t: -t[0])
     if not scored or scored[0][0] < EDITED_FLOOR:
-        return Match("unmatched")
+        # 对不上的也带上最高的包含度(2026-11-11, 审计 F4): tv-sync 把它记进 tv_note_links.score, 分得开「帖是在别处写的」
+        # (接近 0)和「拿写作台的稿子改的」。只是借了开头的那几版(exclude, F02)也算 —— 这个数说的是帖的文字有多少出自
+        # 写作台, 不是能不能连上, 所以它可以高过 EDITED_FLOOR; 时间窗里一版都没有就是 0.0
+        return Match("unmatched", score=max((s for s, _v in inside), default=0.0))
     best_s, best_v = scored[0]
     if best_s < FUZZY_CONTAIN:
         second = scored[1][0] if len(scored) > 1 else 0.0
@@ -437,7 +442,8 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
     # 分数打平的, 精确的排前面(复审 on aw#132): 不然走不走精确档要看哪份先查的重
     scored = sorted(((index.containment(ng, v), v) for v in eligible), key=lambda t: (-t[0], not exact(t[1])))
     if not scored or scored[0][0] < EDITED_FLOOR:
-        return Match("unmatched")
+        # 对不上的也带上最高的包含度(同 _match_by_content): 只查过重、没存档的稿子也是写作台的稿子
+        return Match("unmatched", score=scored[0][0] if scored else 0.0)
 
     def back(v: Version) -> float:                      # 稿在帖里: 一稿比另一稿多出来的那段, 帖里没有就分得开
         g = index.grams_of(v)
@@ -463,7 +469,7 @@ def match_snapshot(note: Note, snaps: list[Version], index: VersionIndex,
         group = [(e_s, e_v)] + close
     else:
         if best_s < FUZZY_CONTAIN and best_s < SNAPSHOT_EDITED_FLOOR:
-            return Match("unmatched")
+            return Match("unmatched", score=best_s)
         margin = FUZZY_MARGIN if best_s >= FUZZY_CONTAIN else EDITED_MARGIN
         close = [(s, v) for s, v in scored[1:] if best_s - s < margin]
         rivals = []

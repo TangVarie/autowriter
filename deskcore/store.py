@@ -600,6 +600,63 @@ def versions_in_project(sb, project_id: str, version_ids: list[str]) -> dict[str
     return out
 
 
+# ── 后台规则补查要的两次读(core._rule_sweep, 2026-11-11) ───────────────────────────────────────────────
+RULE_ANSWERS_CHUNK = 20        # 一次 .in_() 问几版: 一版三四十道规则题, 20 版一页(PAGE)基本装得下, 装不下 _paged 会接着翻
+
+
+def delivered_versions_between(sb, project_id: str, since: datetime, before: datetime) -> list[dict]:
+    """这个项目 ``since`` 到 ``before`` 之间建的稿子, 每篇只回交出去的那一版(``items.best_version_id`` 指的; 没指就这段
+    时间里最新那一版, 同 ``versions_for_linking`` 的挑法), **旧的在前**: ``[{"id", "created_at"}]``。
+
+    补录副本(``batches.params.source == 'ingest'``, 从 TV 笔记复制来的)不回 —— 那不是写作台写的稿子。只取 id、时间和
+    归属字段, 不取标题正文。归属同 ``versions_in_project``: ``items!inner → batches!inner`` 再 ``.eq`` 上 project_id。"""
+    rows = _paged(lambda off, lim: (
+        sb.table("versions")
+        .select("id, item_id, version_num, created_at, "
+                "items!inner(best_version_id, batches!inner(project_id, params))")
+        .eq("items.batches.project_id", project_id)
+        .gte("created_at", since.isoformat()).lte("created_at", before.isoformat())
+        .or_("params->>source.is.null,params->>source.neq.ingest", reference_table="items.batches")
+        .order("created_at").order("id").range(off, off + lim - 1)))
+    by_item: dict[str, list[dict]] = {}
+    for v in rows:
+        item = v.get("items") or {}
+        if is_ingest_batch(item.get("batches")):                 # 老行的 params 还可能是 JSON 字符串
+            continue
+        t = _ts(v.get("created_at"))
+        if v.get("id") and v.get("item_id") and t is not None and since <= t <= before:
+            by_item.setdefault(str(v["item_id"]), []).append(v)
+    out: list[tuple[datetime, str, dict]] = []
+    for vs in by_item.values():
+        best = (vs[0].get("items") or {}).get("best_version_id")
+        if best:
+            chosen = next((v for v in vs if str(v["id"]) == str(best)), None)   # 交出去的那版不在这段时间里: 这篇不回
+        else:
+            chosen = max(vs, key=lambda v: (v.get("version_num") or 0, str(v.get("created_at") or "")))
+        if chosen is not None:
+            out.append((_ts(chosen["created_at"]), str(chosen["id"]),
+                        {"id": str(chosen["id"]), "created_at": chosen["created_at"]}))
+    return [row for _t, _id, row in sorted(out, key=lambda x: (x[0], x[1]))]
+
+
+def versions_with_answers(sb, version_ids: list[str], *, run_tag: str) -> set[str]:
+    """这几版里, TV 账本(``truth_vault.note_feature_answers``, ``subject_type = 'aw_version'``)在 ``run_tag`` 下已经有答案
+    的那些版本 id。check_rules 的规则题按 ``run_tag = 'shadow-rules'`` 落在这里(judge_client.build_rules_request), 有一行
+    就是查过了。只取 subject_id 一列; 一次问 RULE_ANSWERS_CHUNK 版, 批里再翻页。**读挂了上抛**(调用方是后台, 自己兜)。"""
+    have: set[str] = set()
+    ids = list(dict.fromkeys(str(i) for i in (version_ids or ()) if i))
+    for chunk in db._in_chunks(ids, RULE_ANSWERS_CHUNK):
+        rows = _paged(lambda off, lim, chunk=chunk: (
+            sb.schema("truth_vault").table("note_feature_answers")
+            .select("subject_id")
+            .eq("subject_type", "aw_version").eq("run_tag", run_tag).in_("subject_id", chunk)
+            # subject_type / run_tag 钉死了, 剩下这四列就是主键: 排序唯一, 翻页不漏不重
+            .order("subject_id").order("question_id").order("question_version").order("extractor")
+            .range(off, off + lim - 1)))
+        have.update(str(r.get("subject_id")) for r in rows if r.get("subject_id"))
+    return have
+
+
 def update_memory_fields(sb, memory_id: str, fields: dict) -> dict | None:
     """就地改一条规则的状态字段。返回改完之后**库里的**那一行。
 
@@ -3037,7 +3094,8 @@ def desk_adoption(sb, version_ids) -> dict | None:
 
 # ── draw-report(angle cards v2 §5.3, 运维 CLI, 只读) ───────────────────────────────────────────────
 # 三样都只取 id / 时间 / 结论列: 台账带 dims(含 _draw 记账块); 底稿只取 angle_key 和查重结论(不取标题、正文);
-# TV 笔记只取评论数、tier、发布时间。读挂了回 None, 由 CLI 说读不到。
+# TV 笔记只取评论数、tier、发布时间和两个标签(内容形式、情绪杠杆)。读挂了回 None, 由 CLI 说读不到。
+# 2026-11-11(审计 F1)加了第四样: 销账那一版在「标题是不是问句」上的答案(report_title_answers), 只取答案列。
 REPORT_LEDGER_CAP = 20000
 REPORT_SNAPSHOT_CAP = 20000
 
@@ -3073,19 +3131,42 @@ def report_snapshot_verdicts(sb, days: int, project_id: str | None = None,
 
 
 def report_note_outcomes(sb, note_ids) -> dict[str, dict] | None:
-    """这几篇 TV 笔记的评论数、tier、发布时间(M5 / M6): ``{note_id: {...}}``。读挂了回 None。"""
+    """这几篇 TV 笔记的评论数、tier、发布时间(M5 / M6), 和 TV 给它打的内容形式、情绪杠杆标签(牌面对不对得上,
+    drawreport 的 a_form / a_lever): ``{note_id: {...}}``。读挂了回 None。"""
     ids = sorted({str(i) for i in (note_ids or ()) if i})
     out: dict[str, dict] = {}
     try:
         for i in range(0, len(ids), NOTE_ANSWERS_CHUNK):
             chunk = ids[i:i + NOTE_ANSWERS_CHUNK]
             for r in (sb.schema("truth_vault").table("notes")
-                        .select("note_id, project_id, content_format, publish_time, comments_count, tier")
+                        .select("note_id, project_id, content_format, emotional_lever, publish_time, "
+                                "comments_count, tier")
                         .in_("note_id", chunk).limit(PAGE).execute()).data or []:
                 if r.get("note_id"):
                     out[str(r["note_id"])] = r
     except Exception as exc:                            # noqa: BLE001
         _tv_warn("draw report notes", exc)
+        return None
+    return out
+
+
+def report_title_answers(sb, version_ids) -> dict[str, str] | None:
+    """这几版写作台稿子在「标题是不是问句」上答了什么(drawreport 的 a_title): ``{版本 id: "是" / "否"}``, 没答的不在里面。
+
+    和简报的 recent_structure 同一个读法(``_feature_answers``: 只认 Jev 的行、题目版本要对得上、同一题几行取最后抽的),
+    只取答案列, 不取 evidence(那是稿子原文片段)。读挂了回 None。"""
+    from . import structure
+    qid = "title_is_question"
+    ver, _label, allowed = structure.QUESTIONS[qid]
+    vids = sorted({str(v) for v in (version_ids or ()) if v})
+    out: dict[str, str] = {}
+    try:
+        for i in range(0, len(vids), STRUCTURE_VERSIONS_MAX):
+            got = _feature_answers(sb, vids[i:i + STRUCTURE_VERSIONS_MAX], {qid: (ver, allowed)},
+                                   structure.BANK_VERSION)
+            out.update({vid: a[qid] for vid, a in got.items() if a.get(qid)})
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("draw report title answers", exc)
         return None
     return out
 
@@ -3122,6 +3203,31 @@ def insert_commit_metrics(sb, *, project_id: str, user_id: str, phase_ms: dict,
     rows = getattr(res, "data", None) or []
     row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
     return str(row["id"]) if row.get("id") else None
+
+
+TOOL_CALL_MODE = "tool_call"
+
+
+def insert_tool_call_metrics(sb, *, project_id: str | None, user_id: str, phase_ms: dict, counters: dict,
+                             meta: dict) -> None:
+    """一次工具调用的留痕(deskcore/calllog.py, 2026-11-11), 落一行 ``batch_metrics``, ``meta.mode = 'tool_call'``。
+
+    同 ``insert_commit_metrics``: 不加迁移, ``batch_id`` 留 NULL。和存档那一行(``deskcore_commit``)、Streamlit 生成的那两种
+    靠 ``meta.mode`` 分开 —— mode 在这里写死, 调用方漏传也不会落一行分不出来的。读这张表的地方都要按 mode 或 batch_id 筛
+    (历史页 ``db.list_batch_metrics`` 只读有 batch_id 的行)。
+    列的约束(migrations/000_baseline.sql; 2026-11-11 在生产库 information_schema 核过): ``batch_id`` / ``project_id`` 可空,
+    ``project_id`` 有外键(调用没成时调用方传 None), ``user_id`` 是非空的 uuid —— 认不出调用者的调用 calllog 不记。
+    ``meta`` 里只有数、固定的词和 8 位代号, 没有任何稿子 / 评论 / 规则的文字(calllog.build 保证)。异常原样上抛, calllog 自己吞。
+    """
+    sb.table("batch_metrics").insert({
+        "batch_id": None,
+        "project_id": project_id,
+        "user_id": user_id,
+        "phase_ms": phase_ms or {},
+        "counters": counters or {},
+        "meta": {**(meta or {}), "mode": TOOL_CALL_MODE},
+        "injection": {},
+    }).execute()
 
 
 def update_commit_metrics_meta(sb, row_id: str, meta: dict) -> None:

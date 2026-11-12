@@ -876,6 +876,9 @@ def _compile_rules(core, sb, args) -> int:
             print(f"    · …还有 {len(rep['errors']) - 5} 条")
         for b in rep.get("batch_errors") or []:
             print(f"    · 整批 {b.get('rules')} 条没编成 [{b.get('status')}]: {b.get('detail')}")
+        if rep.get("resent"):
+            print(f"    · 没编出来的 {rep['resent']} 条拆成每次 ≤ {core.RULE_COMPILE_RESEND_CHUNK} 条重发了一次, "
+                  f"又编出 {rep.get('recovered') or 0} 条")
         if rep.get("not_sent"):
             why = ("Jev 读超时, 那一批多半还在编、照样计费; Jev 恢复之后再跑一次"
                    if rep.get("stopped_by") == "timeout" else "同一个原因会把它们一样挡下")
@@ -896,7 +899,8 @@ def _compile_rules(core, sb, args) -> int:
 
 
 def _draw_report(sb, args) -> int:
-    """draw-report(§5.3): 只读。台账 → 销账版本对上 TV 的情况 → 查重底稿的结论 → 发出去那几篇的评论数, 然后算表。"""
+    """draw-report(§5.3): 只读。台账 → 销账版本对上 TV 的情况 → 查重底稿的结论 → 发出去那几篇的评论数和标签 →
+    销账那一版「标题是不是问句」的答案, 然后算表。"""
     from . import drawreport, store
     rows = store.report_ledger_rows(sb, args.days, args.project)
     if rows is None:
@@ -911,7 +915,13 @@ def _draw_report(sb, args) -> int:
         print("draw-report: draft_snapshots 读不到, D1 这次不算")
     note_ids = [v["note_id"] for v in ((adoption or {}).get("by_version") or {}).values() if v.get("note_id")]
     notes = store.report_note_outcomes(sb, note_ids) if note_ids else {}
-    rep = drawreport.report(rows, adoption=adoption, snapshots=snaps, notes=notes, days=args.days)
+    if notes is None:
+        print("draw-report: TV 笔记读不到, M5 / M6 和牌面的内容形式 / 情绪杠杆两列这次不算")
+    titles = store.report_title_answers(sb, vids) if vids else {}
+    if titles is None:
+        print("draw-report: Jev 对稿子标题的答案读不到, 牌面的标题问句那一列这次不算")
+    rep = drawreport.report(rows, adoption=adoption, snapshots=snaps, notes=notes, title_answers=titles,
+                            days=args.days)
     if args.json:
         _print(rep)
     else:

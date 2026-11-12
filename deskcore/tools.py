@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import core, skillcheck, vocab
+from . import calllog, core, skillcheck, vocab
 
 logger = logging.getLogger("deskcore.tools")
 
@@ -98,6 +98,9 @@ def _attach_skill_update(out: Any, tool: str, user_id: str | None, raw_version,
         return out
     if update:
         out["skill_update"] = update
+    # 调用留痕(calllog): 这次报上来的版本是最新 / 旧版 / 没报, 只记这一个词
+    calllog.note(skill=skillcheck.OUTDATED if update else
+                 skillcheck.UNKNOWN if skillcheck.normalize(raw_version) is None else skillcheck.UP_TO_DATE)
     return out
 
 
@@ -523,6 +526,7 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
     **例外: open_project 返回的 lessons_status.status 是 timeout 时**, 卡还在后台接着选 —— 动笔之前用和那次
     open_project 一样的参数(tactic / draft_topic / key_messages / target_audience / tone / extra_instructions 照传,
     flywheel_arm 传简报里的)调一次, 选好了就能拿到; 只调这一次, 还是没有卡就照常写。
+    本工具最多等十几秒: 到点卡还没选完, 回的 status 也是 timeout —— 那就照常写, 不用再调, 也别跟用户说没有可借的经验。
 
     这些卡来自公司自己投放过、数据验证过的笔记, 由策展员提炼成「钩子类型 /
     结构骨架 / 为什么有效 / 可迁移手法」。写稿时可以借它的钩子或结构。
@@ -579,6 +583,16 @@ def _add_check_next_step(out: dict) -> None:
     n = int(s.get("pass") or 0) + warn
     if n > 0:
         out["next_step"] = CHECK_NEXT_STEP.format(n=n, warn=CHECK_NEXT_STEP_WARN.format(m=warn) if warn else "")
+
+
+def _skill_versions_now() -> dict | None:
+    """近 24 小时报上来的 skill 版本构成(skillcheck.health), 交给 core 写进存档那一行指标(meta.skill_versions; 审计 A8:
+    计数原来只在进程内存里, 要带 key 读 /skill-versions, 重新部署就清零)。只有计数。读不出协议版本就不带; **不抛**。"""
+    try:
+        return skillcheck.health(protocol_text()[1])
+    except Exception:  # noqa: BLE001
+        logger.warning("score_drafts: 这次没取到 skill 版本计数, 指标里不带这一块", exc_info=True)
+        return None
 
 
 def check_drafts(project_id: str, drafts: list[dict],
@@ -715,7 +729,8 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
         就别用它的 ``existing_comments``, 照贴来的正文写)/ ``pasted``
       · existing_comments —— 帖子下已有的评论(TV 里找到了才有): 别重复里面已经问过的事、用过的说法。项目配了飞书那一列时,
         这条帖子那一格里已有的维护评论也在里面(``source`` 是列名)
-      · comment_rules —— 本项目管评论的规则(「评论区：」开头的), 必须守; 和 style、comment_set 说法不一样的以那两样为准
+      · comment_rules —— 本项目管评论的规则, 必须守; 和 style、comment_set 说法不一样的以那两样为准。「评论区：」开头的、
+        开头那一句说的是评论的、存的 check 查评论的都在这里(硬约束也是: 在这里的不再重复列进 hard_rules)
       · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守; 说每篇都要带品牌的, 评论里几条提品牌照 comment_set
       · 规则以这次回的为准: 前面对话里见过的规则原文说法不一样的不算(可能已经停掉了)。``rules_note``: 用户说哪条项目规则
         过时了, 当场用 set_rule_state 停掉(memory_id 在 my_rules 里), 不用等负责人; 要换成新说法用 record_rule
@@ -731,7 +746,9 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
         就照用户的写, 交付时一句话说明和项目定的配比不一样, 项目的数不动; 用户明说这个项目以后都按新的配比, 调
         set_comment_mix 改项目的数, 不用找负责人。只有用户明说才改, 不为了让这一组通过自己去改配比。``column`` 是这组评论
         要贴进的飞书那一列(set_comment_mix 改不了它)
-      · slots —— 默认四个评论位: q1 / q2 提问、exp 经验或推荐、reply 贴主回复(回 q1)。每位写一条, 位的要求在 note 里;
+      · slots —— 默认四个评论位: q1 / q2 提问、exp 经验或推荐、reply 贴主回复(回 q1)。每位写一条, 位的要求在 note 里。
+        它们是四种评论, 不是只能写四条: 一组不止四条时(项目定了配比的一组是 20 条上下), 每个 id 整组最多用一次,
+        其余的评论不带 slot, 整组一次交给 score_comments;
         每位都可自然点名品牌, 不要求每条点名。可写感受、比较、推荐、答疑, 亲历和旁观推荐也可用;
         具体经历、效果和数字依提供素材, 不编造事实; 没有素材时写提问或一般讨论。用户另有要求(比如只要两条提问)就照用户的, 位的 id 照用
       · project_id —— 下一步 score_comments 要带的
@@ -753,7 +770,8 @@ def score_comments(comments: list[dict], link: str = "", project_id: str = "", p
     """一组评论写完后调(自动调, 不用等用户说): Jev 整组判一次, 回每条过没过和修改建议。只判, 不存库, 不发布。
 
     ``comments`` 传 ``[{"slot": "q1", "text": "..."}, {"slot": "reply", "text": "..."}, ...]``: slot 写 comments_for 给的
-    评论位 id(自定义的评论位传整个对象); 同一个 id 只能有一条; 贴主答疑那条会自动接上它回的那一位。帖子参数和
+    评论位 id(自定义的评论位传整个对象); 同一个 id 只能有一条, 一组不止四条时其余的不带 slot(报 slot id 重复或不认识时,
+    去掉那几条的 slot、整组再送一次, 不用分几次判); 贴主答疑那条会自动接上它回的那一位。帖子参数和
     comments_for 那次一样: ``link``, 或 ``post_title`` / ``post_body`` + ``project_id``。一次最多 20 条。
     ``kind``: product(默认, 卖货的品)/ agency(机构服务)/ shop(门店)。``max_named``: 默认 None, 不设固定品牌点名配额;
     品牌可自然提及, 不要求每条点名。用户明确要限制时才传整数(整组最多几条点名品牌, 0 表示不点名)。项目定了提品牌的上限
@@ -903,7 +921,8 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     # 正文 / 标题放错了字段的先对上(_draft_fields): 存进 versions 的正文就是对上的那份, 之后 check_rules 查的也是它。
     drafts = _draft_fields(drafts, "score_drafts", project_id)
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "",
+                              skill_versions=_skill_versions_now())
 
 
 def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user_id: str | None = None) -> dict:
@@ -915,8 +934,9 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
     有它就照 ``next_step`` 接着再调一次、传它(``tactic`` 照样带), 直到返回里没有它; 不是这个项目的稿子不查(列在
     ``excluded`` 里)。规则由 Jev 事先编成「是非题」和「代码检查」两种, 这里只用编好的; 还没有编译结果的规则这次查不了,
     数在 ``uncompiled_rules`` 里(``next_step`` 说为什么: 后台在编 / 这个项目编不了 / Jev 最近编译超时 / 上次编失败)
-    —— 不用等, 也不用重试。要看话题 / 评论的规则这里查不了(这两样不随稿子存), 数在 ``rules.code_unavailable``; 编不了
-    (原文超过 Jev 的上限之类)的数在 ``rules.not_compilable``, 编出来的检查不安全没跑的数在 ``rules.code_refused``,
+    —— 不用等, 也不用重试。要看话题 / 评论的规则这里查不了(这两样不随稿子存; 只问评论 / 话题的规则题也不问), 数在
+    ``rules.code_unavailable``; 编不了(原文超过 Jev 的上限之类)的数在 ``rules.not_compilable``, 编出来的检查不安全
+    没跑的数在 ``rules.code_refused``,
     只查了一部分的(编译时就没全装进去, 或者只有一部分要看话题 / 评论、只查了标题正文那一半)数在 ``rules.partial``,
     用 record_rule 撤掉了代码检查、Jev 又只编成了代码检查(没有规则题)的数在 ``rules.code_withdrawn`` —— 这几种都
     **不能说(整条)守住了**。人手设过 check 的数在 ``rules.by_score_drafts``: score_drafts 存档时已经按它查过(那边
@@ -928,16 +948,19 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
         查的)/ ``p``(Jev 的把握)/ ``evidence``(Jev 指出的那一句, 有才带)。``what`` 以「必须改」开头的是硬约束:
         照着改(参考分查出合规问题的那几篇也在这一轮一起改), 改完那几篇带 ``replaces_version_id`` 先过 check_drafts、
         再用 score_drafts 存一次, 交付时一句话说清改了哪里; 改一轮就够, 不用再调本工具;
-        以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。
-      · ``unsure``: Jev 拿不准的(``what`` 以「拿不准」开头), 不算没守住, 提一句就行, 不用改。
-      · 每篇必须改全列, 建议改补到 ``violations`` 一共 12 条为止, ``unsure`` 最多列 5 条; ``more`` 是这篇没列出来的条数
+        以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。Jev 判的同一条规则在一篇里只列一条
+        (硬约束的几道题指着不同的句子时各列各的, 每一句都要改; 代码查的命中另列, 看 ``source``)。
+      · 每篇必须改全列, 建议改补到 ``violations`` 一共 12 条为止; ``more`` 是这篇没列出来的建议改条数
         (``summary.more`` 是全部篇加起来的), 有就如实告诉用户还有这么多条没列。
+      · 拿不准(Jev 判不准, 不算没守住): 每篇只有条数 ``counts.unsure``, 不逐条列; ``summary.unsure`` 是全部篇加起来的。
+        最外层的 ``unsure_rules``(有才带, 最多 3 条)是其中偏向没守住的那几条规则, 每条 ``rule_id`` / ``severity`` /
+        ``what``(以「拿不准」开头)/ ``drafts``(这次有几篇在它上面偏向没守住)。整批提一句就行, 不用改, 也不用逐篇说。
       · ``judge_status`` 不是 ok 的那篇(``judge_note`` 说原因, 比如「没判完」「一道都没判出来」「正文是空的」)规则题这次
         没判成, **不能说它守住了规则**; 不用重试。代码查出来的 ``violations`` 照样有效。正文是空的那几篇另数在
         ``summary.empty_body``。
-      · ``judge_status`` 是 ok、但 ``counts.unjudged`` 不是 0 的: 那几道题 Jev 没判出来(``unjudged`` 列着规则 id 和原因,
-        比如 evidence_not_found = 判了「是」却指不出是哪一句, 不算没守住), 那几条**也不能说守住了**。``summary.unjudged``
-        是全部篇加起来的题数。
+      · ``judge_status`` 是 ok、但 ``counts.unjudged`` 不是 0 的: 那几道题 Jev 没判出来(只有题数, 不逐条列), 那几条
+        **也不能说守住了**。``summary.unjudged`` 是全部篇加起来的题数; 其中 ``summary.evidence_not_found``(有才带)那几道是
+        Jev 怀疑有问题、却指不出是哪一句: 不算没守住, 不用改。
       · ``code_unchecked``: 代码查的正则这次没在时限内查完(或者限时的引擎跑不了它)的规则, 每条 ``rule_id`` / ``severity`` /
         ``rule``(规则原文)。没查完的那部分不是违规, 也**不能说那几条守住了**; 同一篇里同一条已经列在 ``violations`` 的
         (先查到了命中、后面才没查完)照改; hard 的照原文自己核一遍, 不用重试。``summary.code_unchecked``
@@ -971,7 +994,8 @@ def commit_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", t
     # 同 score_drafts: 写操作, 不包 _safe; 放错字段的一样先对上。
     drafts = _draft_fields(drafts, "commit_drafts", project_id)
     return core.commit_drafts(core.sb(), project_id, drafts, user_id=_user_id,
-                              flywheel_arm=flywheel_arm or None, tactic=tactic or "")
+                              flywheel_arm=flywheel_arm or None, tactic=tactic or "",
+                              skill_versions=_skill_versions_now())
 
 
 INGEST_MAX_PER_CALL = 50
@@ -1204,6 +1228,12 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
       (所以「TV信号」里也不算有 "V信") —— 两种写法都要拦就都列上。
       check 写错会报错且这条规则不落库: 照报错改了再调一次。返回里的 ``check`` 是库里存下的那份。
+      规则开头那一句只说评论时, check 只查评论(where 存成 ["comments"], 返回里带 ``check_where_note``); 这条其实是说
+      笔记的(比如不让正文写求评论的话), 就带着 where(如 ["title", "body"])再调一次, 明说的 where 照存。
+      只说评论的规则带 max_len 时不存 check(字数检查只数标题 / 正文), 规则原文照记, 返回里同样带 ``check_where_note``。
+
+    返回里的 ``given_when_writing_comments``: 这条规则写评论时(comments_for)给不给。管评论的规矩 content 开头写「评论区：」就给。
+    带 ``muted_note`` 的是这条规则正停用着(写稿、写评论都不给), 里面说了怎么恢复。
 
     记下之后服务端会在后台把这条规则交给 Jev 编成写后检查(几分钟内好), 之后 ``check_rules`` 就会查它。不用等、不用管。
     """
@@ -1339,6 +1369,7 @@ def my_rules(project_id: str, _user_id: str | None = None) -> dict:
       · 已停用   —— 用户自己 mute 掉的, muted_until 到期自动恢复
 
     试用、已停用的和生效中的规则或 comment_set 说法不一样, 不算冲突(``state_note`` 也这么说)。
+    带 ``check`` 的是存档时代码会查的: 给的是查的时候真用的那一份(开头那一句只说评论的规则只查评论, 带一句 ``check_note``)。
     改档位用 set_rule_state: 用户说哪条过时了, 当场改, 不用等负责人。
     一组评论的配比(comment_set 里提品牌、中性、短评的几个数)不在这份台账里: 用户明说要改这个项目的配比时用 set_comment_mix。
     """

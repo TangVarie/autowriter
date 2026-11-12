@@ -167,22 +167,22 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1）。2026-10-30 起归档的项目默认不列，`include_archived=true` 才列（见 §3.13） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`，以及最近的稿子在哪几处都写成一个样子 `recent_structure`（都是 2026-10-20，见 §3.1） |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block`（2026-10-30 起每篇那行带完整的 `angle_key`：「第1篇 [angle_key=…]」，模型照着贴进 `check_drafts` / `score_drafts`，不再自己编） |
-| | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`） |
+| | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`）。最多等 `BORROW_LESSONS_WAIT_SEC`（默认 18 秒），`open_project` 起的那次选卡还在跑就等它，不再发第二次（§3.26） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比。改的是已经存过的那篇时带 `replaces_version_id`（2026-10-30，同 `score_drafts` 的字段、同一套核对 `_lookup_replacements`）：旧 item 全部版本的指纹不算它的对手，别的稿子照常比；**仍然只读**，不摘指纹。库里那一路（`deskcore_check_drafts`）每路只回最像的一条的标题、排除不了哪几行，不加迁移的做法是在 Python 里补（`_without_own_versions`）：先拿旧版那几行逐路比，库里回的命中比得过它们就是别的稿子、照用；比不过的那一路在去掉旧版之后的历史上重比——开头按哈希点查，标题语义 / 四字串把项目指纹拉回来再比（只拉要比的列，只给改稿那几篇）。被旧版挡在后面的别的稿子照样拦。id 对不上判 reject、`gate="replace_lookup"`。原来不认这个字段，改稿一查就被自己的旧版拦下（「正文开头与历史稿完全一致」），`archive_pending` 那句才叫模型改稿时跳过查重 |
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
 | | `score_drafts`（旧名 `commit_drafts`，同一个函数） | 存档 + 参考分：写指纹 + 建身份（batch/item/version）+ 给坐标销账。**交付的同一轮里调，不等用户说定稿**（2026-09-18 起；此前等人开口那道门漏掉了 91%）。入库是「待审」，不代表定稿；哪些真的发了由飞书 → TV 的 `tv-sync` 按内容对照回来。改稿带 `replaces_version_id`：先摘旧版指纹再过闸，成功后同一个 item 升一版（`replaced`），被拒或异常把指纹原样放回。进程在这几秒里被杀（SIGKILL / OOM / 重启）放不回：item 的 best 还是旧版、旧版一行指纹都没有——每晚的 `tv-sync` 顺手查一遍接着的写作台项目里写作台自己的（`ai_engine = deskcore`）定稿版本有没有指纹行，没有的拿项目写锁按 `backfill` 那一套补回、打 WARNING、报 `fingerprint_gap`（外部评审 11-04 F05，2026-11-04；补回的行没有 `angle_key`）。同一个 item 别的版本还有指纹行的不补、只数 `skipped`：那是改稿的新指纹入了库、挂到旧 item 上失败（`replace_warning`），旧版的行是故意撤的，补回去新旧两版就都在查重里（复审 11-04）；新版连 versions 行都没建成的认不出来，照补。改成一个事务（RPC 里删旧写新）是后续项，这次没动 `score_drafts` 的顺序。摘指纹与原子写入不在一个事务里，所以 commit 全程持项目写锁（与 `ingest_published` 同一把，`009` 的 `ingest_locks`）：同一项目的入库与补录排队，等超时报 409 重试即可。锁放掉之后把真的建成了 versions 行的稿子发给 judge（影子期只记不拦，返回里的 `judge`，另带 `elapsed_ms` / `phase_ms`，见 §3.8）。2026-10-20 起项目有交付模板时带拼好的 `delivery`（§3.9），带 check 的规则有命中时带 `rule_checks`（§3.10）。2026-10-27 起带了 key 却对不上台账的另数（`unknown_angle_keys` / `used_angle_keys`，按形状分编的、别的项目的牌、台账没写进去），传回的飞轮臂对不上服务端发的时以服务端为准、重启过核对不了的另标（§3.12）。2026-11-10 起同一批里的重复说法和正文里混进来的版式残留带 `draft_checks`、开头一样的提示带 `batch_hints`（§3.21） |
-| | `check_rules` | **存档之后按规则逐篇查，只作建议**（2026-10-20，D-121）：规则事先由 Jev 编成是非题 / 代码检查、缓存在 `rule_compiles`；hard 没守住报「必须改」，soft 报「建议改」，Jev 拿不准的单列「拿不准」，到点没判完的报「没判完」。不拦存档、不改稿（见 §3.11） |
+| | `check_rules` | **存档之后按规则逐篇查，只作建议**（2026-10-20，D-121）：规则事先由 Jev 编成是非题 / 代码检查、缓存在 `rule_compiles`；hard 没守住报「必须改」，soft 报「建议改」，Jev 拿不准的每篇只报条数、偏向没守住的最多列 3 条规则（`unsure_rules`），到点没判完的报「没判完」。只问评论 / 话题的规则题不发。不拦存档、不改稿（见 §3.11） |
 | （已撤） | `review_drafts` / `export_drafts` | 2026-10-19 撤掉（D-120）：写手没有人审、导出、存档这几步，定稿贴进飞书，`tv-sync` 按内容对回来。§3.4 / §3.6 留作历史 |
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
-| 写评论 | `comments_for` / `score_comments` | 按链接（或贴来的正文）一次拿齐帖子、规则、评论位和项目定的配比 → 整组判一次、不存库（§3.14 起的各节，配比见 §3.20） |
+| 写评论 | `comments_for` / `score_comments` | 按链接（或贴来的正文）一次拿齐帖子、规则、评论位和项目定的配比 → 整组判一次、不存库（§3.14 起的各节，配比见 §3.20；哪些规则算管评论的、评论位怎么用见 §3.24；每次调用只留一行计数，见 §3.8 末尾） |
 | | `set_comment_mix` | **用户明说要改项目的评论配比时**改 `comment_set` 里的四个数（提品牌上限、中性下限、短评下限、短评字数），回改之前 → 改之后；列改不了；留最近 20 次的记录（2026-11-11，§3.23） |
-| 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0；2026-10-20 起可带 `check`，存档时用代码逐篇查（§3.10） |
+| 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0；2026-10-20 起可带 `check`，存档时用代码逐篇查（§3.10）；2026-11-11 起回包带 `given_when_writing_comments`（这条写评论时给不给），开头只说评论的规则 `check` 只查评论（§3.24） |
 | | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
 | | `save_my_style` | 把模型蒸馏好的笔记写回 + 按 `edit_ids` 销账（`record_edit` 的第二步） |
 | | `label_example` | 标正/负例 |
 | | `my_style` | 查看个人风格资产；有积压时**直接带回可续做的蒸馏任务** |
-| 规则台账 | `my_rules` | 列出这个项目上我能管的**全部**规则，含试用档与已停用的，每条带 `state`（见 §3.5） |
+| 规则台账 | `my_rules` | 列出这个项目上我能管的**全部**规则，含试用档与已停用的，每条带 `state`（见 §3.5）；带检查的那几条给的是查的时候真用的那一份（§3.24） |
 | | `set_rule_state` | 停用 / 恢复 / 升降档 / 设方向。**不改内容** |
 | | `reembed_my_rules` | 给自己名下缺向量的规则补向量——没向量的规则照常注入但不参与相关性筛选（2026-08-28） |
 
@@ -305,7 +305,7 @@ cap 后面会让注入数少于 12，而池子里还有相关的排在第 13 位
 > **一批之内也错开（2026-10-20）。** 10-20 生产诊断：稿子篇幅短、批批长得像，飞书里大半被人重写。台账只管跨批次不重复，同一批之内原来什么都不管——洗牌后直接取前 n 个，5 篇的内容形式全不撞只有约 1/5。现在 `_spread_order` 把洗好的候选贪心重排：优先内容形式和标题句式都还没用过的，其次有一个没用过的，再次随便；同档里情绪杠杆没用过的优先；某一维 8 个值用满一轮就清空重来。所以 n=8 时 8 种内容形式、8 种标题句式各一，n=10 时同一种最多两篇。仍是随机（先后来自洗牌，同 seed 结果不变）；选择仍在 RPC 的事务里做，这里只是排序——近期用得多的项目，被避重跳过的那一位由后面的补上，偶尔会多撞一个；降级路径先去掉避重的再排，不打折。
 >
 > 同一天的另外两处，都在 `open_project` 的简报里：
-> - **`recent_titles`**（有才出现）：本项目近 30 天发出去的标题（`tv-sync` 对到本项目上的笔记，窗口按 `truth_vault.notes.publish_time`，只取 `note_id` / `publish_time` 两列；`ingested` 取版本标题，其余优先 `tv_edit_diffs.published_title`，人可能改过）和近 14 天在写作台写过的标题（补录副本不算），每条 ≤40 字、合计 ≤20 条，不带正文。两栏各有份额：写过的留 8 条、发出去的占其余，哪栏不够空位给另一栏——不能"发出去的先占满"，活跃项目 30 天对上的笔记远超 20 条，那样昨天写了还没发的几篇（下一批最容易撞的）永远进不来。`task` 让模型新写的稿子标题别和它们撞主干词和具体说法、开头别复述它们、人设和核心场景尽量错开；**标题句式照发牌坐标写**（句式只有 8 种，近 20 条标题几乎总把它们占全，"句式也要不一样"和发牌的硬坐标没法同时做到），并写明优先级：p0 / stable 定的人设、发牌分到的坐标和切入角度、用户点名的题目和改稿都在这一栏之上，改稿不受它约束。查不到就不带这一栏（两栏各自兜底），简报照给。
+> - **`recent_titles`**（有才出现）：本项目近 30 天发出去的标题（`tv-sync` 对到本项目上的笔记，窗口按 `truth_vault.notes.publish_time`，只取 `note_id` / `publish_time` 两列；`ingested` 取版本标题，其余优先 `tv_edit_diffs.published_title`，人可能改过）和近 14 天在写作台写过的标题（补录副本不算），每条 ≤40 字、合计 ≤20 条，不带正文。两栏各有份额：写过的留 8 条、发出去的占其余，哪栏不够空位给另一栏——不能"发出去的先占满"，活跃项目 30 天对上的笔记远超 20 条，那样昨天写了还没发的几篇（下一批最容易撞的）永远进不来。`task` 让模型新写的稿子标题别和它们撞主干词和具体说法、开头别复述它们、人设和核心场景尽量错开；**标题句式照发牌坐标写**（句式只有 8 种，近 20 条标题几乎总把它们占全，"句式也要不一样"和发牌的硬坐标没法同时做到），并写明优先级：p0 / stable 定的人设、发牌分到的坐标和切入角度、用户点名的题目和改稿都在这一栏之上，改稿不受它约束。查不到就不带这一栏（两栏各自兜底），简报照给。2026-11-11 起，发出去的标题大多不超过 20 字的项目，`task` 末尾多一句「新写的标题也写在 20 字以内」（§3.25）。
 > - **`validated_patterns_usage`**（有规律才出现，`borrow_lessons` 同样带）：85% 的写手日简报都带着同样 4 条已验证规律，其中一条是"整篇围绕一个求助问题来组织"，模型把 4 条全用在每一篇上，批批同一副骨架。规律清单原样转交（馆员给的，写作台不改），旁边说清楚：每篇最多用一条、一批里按篇号轮换、有几篇一条都不用；它们是表现好过的选项，不是模板；和发牌坐标或 p0 冲突时以它们为准。轮换是 k 条规律加一个"不用"排成一圈，起点按 (项目, 写手, 北京日期) 的哈希定（`open_project` 和 `borrow_lessons` 同一天给同一句），两篇以上的批次没轮到"不用"的、最后一篇不用——固定从第 1 条起的话，每批第 1 篇都是同一条规律，3 篇一批、4 条规律时也轮不到"不用"。`draw_angles` 拿不到规律清单（不借卡），所以按篇号的轮换写在用法里，不在发牌回包里。
 >
 > **再加一处：`recent_structure`（有才出现，2026-10-20 第二批）。** `recent_titles` 管不到骨架。Jev 给每篇打分的稿子答过 TV 特征题库（fq-v0.1），答案在 `truth_vault.note_feature_answers`（`aw_version` × `versions.id` × `primary` × `jev:*`），回包里的 profile 原来是扔掉的。开项目时读回本项目最近 ≤30 篇打过分的稿子（近 60 天按版本自己的时间算，批次年龄和批次数量不截断候选、补录不算、一个 item 一票，版本 id 按篇摊名额；没判出答案的不占名额：最近 60 篇里有答案的凑不够 30 篇、更早的稿子或没问过的旧版本还有，就把还没找到答案的接着往下问一轮，最多 3 轮。judge 停过一阵是这样，judge 不覆盖的项目——没配 judge、`tv_project_map` 没映射（一篇都不判）、只判了一部分——也是这样，后者每次开项目都问满几轮、多几趟空请求，有界；补问那几轮失败只记 warning，第一轮找到的照用），某一处扎堆的那种答案占比 ≥ 0.6 就摆出来：`{window, concentrated: [{question, answer, share, of}], task}`（`of` 是这一题有有效答案的篇数、即 share 的分母，可能比 window 少，也要 ≥ 12 才报），让这一批每一处至少一半换个写法；p0 / stable、发牌坐标、用户点名的写法优先，改稿不受约束。少于 12 篇、不扎堆、账本读不到就不带。三步往返（批次 → 版本 → 答案；答案按主键排序翻页，Jev 换模型重判过几代、行数过了 1000 也不截；一轮是一页加一次空页，最近 60 篇凑够 30 篇有答案的就只问一轮，往下补问的每一轮再来一趟），只取答案列（不取 evidence、不取正文）。
@@ -419,7 +419,7 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 | 模糊 | 时间窗内（发布 −30 ～ +30 天）四字串**包含度** ≥ 0.6 且与次佳差 ≥ 0.1 → `fuzzy` | 途鸽发之前改得很狠（305 字 vs 527 字），精确对不上，靠这一路 |
 | 分不出 | `ambiguous`：候选写进 `tv_note_links.candidates`，**不硬猜**，报表里列给人看；人看完说「对不上」就 `tv-resolve --note … --ingest`，正文补录、对照改成 `ingested`。**只因为标题一样**才分不出的（候选全标 `weak_title`，内容那一路什么都没对上，F04 复审）不一直挂着：先当 `unmatched` 拿查重底稿对一遍（下一行），底稿认领就转正；没认领的记 `ambiguous` 等人看 `TV_WEAK_TITLE_GRACE_DAYS`（7）天——从头一次这样判出来那晚算，记在 `candidates` 里一条带 `weak_title_since` 的备注、每晚带过去——满了没人判就照常补录（没有补录目标的记 `unmatched`，同样带着日期）。等的这几天它的文字不在指纹库里（认了的代价：记在那一版名下是说它来自那一版，补录又是终态）；内容那一路分不出、另有一版只是标题一样的，照普通的分不出处理 | 两版同标题的评论稿都不是笔记正文（途鸽 2026-09-18）；不提供「指定某一版」，`match_kind` 没有 manual 一档。F04 复审：`ambiguous` 不进补录、W-40 也不记它的文字（它没有版本），W-38 只给补录名单里的帖找底稿——拿旧标题写了一篇新的、只查了重没存档的帖，真正的来源认不回来，发出去的文字查重永远看不见；而人看完能做的也只有补录 |
 | 查重底稿 | 对不上写作台版本的帖，补录之前先拿 `draft_snapshots`（`018`：写手那边的 AI 走工具调 `check_drafts` 时每查一篇记一行——标题、正文、带来的 `angle_key`、查重结论、当时的飞轮臂；运维 `cli check` 试跑不记；**不进指纹库**，不挡后面的稿子；`score_drafts` 存成版本的同样文字的底稿当场记成已转正；留 60 天）再对一次（`tvlink.match_snapshot`，近 45 天、还没转正、至少有一次查重没被打回的）。比上面几步严：帖要有发布日期（还没填日期、按内容对得上底稿的先不补录，记 `unmatched` 等日期，等到底稿过了 45 天为止；同一晚它的改写版也一起等），底稿要早于帖（发布那天 − 第一次查重那天，**北京日历日**，0～30 天）；开头 / 标题和帖一样的底稿是一档（有就走这一档，分数打平时它排前面），四字串包含度 ≥ 0.30 就行，只跟同样开头 / 标题一样的底稿（和存档版本）比，分数更高、开头标题不一样的得是它的前后几稿，否则 `ambiguous`；都不一样的那一档（`fuzzy` / `edited`）要 ≥ 0.45（W-34 判「整篇换了」的线是 0.30，擦线转正的对照运营再改几句就会被挪走）；分不出时只在打平的几份是同一篇的前后几稿（互相重合 ≥ 0.6）才挑一份——帖在稿里 + 稿在帖里加起来最像的那一稿，一样像取标题 / 开头和帖一样的，再一样取最晚查的；打平的里有别的稿子、或时间窗里有存过档的版本离得差不多近，记 `ambiguous`、**不补录**，每晚重判（底稿过了 45 天就照常补录）。帖的文字已经在指纹库里（以前补录的副本）的不转正。同一晚剩下对不上的帖，再按主索引的规矩对一次今晚要转正的几版（对手里带上存过档的版本；同一篇改写给另一个号发的，明晚主索引本来也会连上）：对上的跟着这一版一起转正、帖的文字一起记指纹，分不出的不补录、明晚重判。对上了就把底稿**转成真的版本**，和存过档的一样：建 batch / item / version（`params.via = "snapshot"`，同一晚同一次查重的几篇一个 batch——一轮的帖分几晚发就分几个，`params.check_id` 一样；版本时刻 = 第一次查重，不是转正那一刻）、写指纹（不过闸，带 `angle_key`；发出去的帖和底稿不一样的，帖的文字也记一行，同一个版本）、销牌（只销写这篇的人自己在查重之前抽的那张，找不到就不销——不像存档那样退到别人的牌）、底稿行记 `promoted_at` / `version_id` / `note_id`；对照记 `body_exact` / `title_exact` / `fuzzy` / `edited`（候选里一句 W-38 备注，不钉死），同一晚算改稿差异、`--write-tv` 回填 TV。版本 id 由（项目，正文指纹）定出来（uuid5），半途断了之后只补没做完的、不再建一份：指纹按文字补（底稿那一行写了、帖那一行没写的照样补），补的那晚这个 TV 项目里没有连着它的帖（帖在接同一个写作台项目的另一个 TV 项目里）就只补底稿那一行、销牌，不记转正，等连着帖的那个 TV 项目补上帖的文字再记。转正拿项目写锁之后再看一眼底稿：`score_drafts` 刚把同样文字的稿子存了档（底稿已经记到那一版）的，这晚不转、不补录，明晚主索引对存了档的那一版。一时读不出底稿、或这晚没转成的，**不补录**（补录是终态）：记 `unmatched` + 原因、明晚再对，退出码 1；底稿表缺权限 / 缺列（配置问题）照旧补录、退出码 1；`018` 没跑：跳过这一步、照旧补录 | W-38（2026-10-29，owner）：写手没有「存档」这一步，写作台的稿只在模型调了 `score_drafts` 时才进库。10-28 途鸽一轮 10 张牌，查重查了、`score_drafts` 没调，发出去的帖只能被补录成副本（牌不销、没有改稿差异）。`check_drafts` 是每篇必过的硬闸，在那里留底稿；记底稿失败只记 WARN，不碰查重的判定。同一次把 `lag_days` 改成按北京日历日算：TV 的 `publish_time` 是北京那天的 0 点（存成前一天 16:00 UTC），按 UTC 日期减，北京当天写、当天发的记成 −1（10-29 生产库 264 条里 26 条）；存着 −1、按北京日是 0 的对照 tv-sync 当晚改回来（改稿差异的 `lag_fill`） |
-| 对不上 | `unmatched` → `ingest_published`（剥话题标签、不过闸、按全文幂等）补录进目标项目，建成的 `version_id` 记回 `tv_note_links` | 同项目稿子都以同一串标签结尾，不剥会互相误撞 |
+| 对不上 | `unmatched` → `ingest_published`（剥话题标签、不过闸、按全文幂等）补录进目标项目，建成的 `version_id` 记回 `tv_note_links`。对不上的那一行（`unmatched` / `ingested`）的 `score` 记这篇帖和写作台的稿子最像到什么程度（2026-11-11，§3.28），只是读数，不参与判定 | 同项目稿子都以同一串标签结尾，不剥会互相误撞 |
 | 帖的文字进指纹库 | 对上了写作台某一版的帖（`body_exact` / `title_exact` / `fuzzy` / `edited` / `tv_lineage`，以及补录之后正文又改过的 `ingested`（F07，见「正文换了」），按现在的正文核过的：今晚写的对照、今晚记上正文指纹的、之前核过且字没变的），发出去的文字记一行指纹在那一版下：按文字幂等，正文和标题一起算（那一版下已经有正文、标题都一样的行就不记；帖和那一版只差话题标签的算一样；**只改了标题的照样记**——查重单看标题也会判死，运营改过的标题不在库里就拦不住照着它起的标题；帖没标题的只比正文）；行的时刻、写手、`angle_key` 跟那一版最早那行走；那一版一行指纹都没有的（改稿 `replaces_version_id` 把整个 item 的指纹撤了重写、老的没指纹的版本、W-38 转了一半的），时刻取那一版自己建的时刻、写手记项目 owner，照样记——帖还在外面。拿项目写锁、锁里重读再写，按 100 行一批插（同补录）。每晚把所有这样的对照核一遍，所以第一晚会把以前对上的一起补上，之后只有新对上和改过字的。写失败不挡对照，退出码 1、下一晚再补 | W-40（2026-10-30，owner 让我定）：查重比的是写过的稿，写手拿去改过再发的那一版原来不在库里——补录的帖、W-38 转正的帖早就把发出去的文字记进来了，只有对上存档版本的漏了。10-30 生产：`title_exact` 124 条、`fuzzy` 28 条、`edited` 1 条对照，那一版下都只有一行（底稿 / 存档那行）。时刻跟着那一版走，不记成今晚：TV 的发帖对账按时间窗数稿子，记成今晚会把老稿当成新写的 |
 | 回填 TV | `--write-tv` 才把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL 的行**，且**只写真对上的**（`body_exact` / `title_exact` / `fuzzy` / `tv_lineage`）；`ingested` 不写 | 那是 TV 的列；补录的版本是从笔记复制来的，写回去因果倒置（TV 2026-09-18 核对时定的口径，见 runbook §1.4） |
 | 飞书已删 | TV 的 `v_notes_vanished` 里的篇（飞书里删掉或挪去别的表、TV 那一行还留着）`deskcore_tv_notes` 不返回（`016`）：不重对、不补录、不计数，已有的对照一行不动。缺席满一天半的（视图里本项目最近一次完整同步比这篇最后被看到晚 ≥ 36 小时，`TV_VANISHED_GRACE`），按当前口径算过的改动差异降回旧口径（W-37，10-28），摘要不再读。只查这晚没读到的那几条：`--since` 窗口外、视图里没有的不降；TV 两次完整同步重叠、或某次写库写一半，活着的篇也会短暂进视图（不到一天），不降。降了之后那篇又读到了，按「口径过时」重算（那一版还在对照索引里才算得了），`computed_at` 留旧值（同一版不推），中间若确认过摘要，它不会再进摘要。视图查不了这晚不降、退出码 1；视图不在（新库，`PGRST205`）不降、不报。评论按链接找帖（`comments_for` / `score_comments`）不走这个 RPC，由 `core._note_from_link` 自己查视图：同一条链接有活的一行就不用已删那行，只剩已删那行时回包带 `tv_note_vanished`、给的项目对不上时走贴正文那条路（代码，不依赖 016） | 2026-10-26：79 篇成人藻油从 BJS_phase1 挪去新表（TV 记为 BJS_phase2），其中 14 篇是 unmatched，补录目标一打开就会被补录进儿童藻油的项目；视图不在（新库）时照旧全给 |
@@ -564,7 +564,9 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 `restore`（被拒的改稿放回旧指纹）、`replace_versions`（改稿挂旧 item）、`arm`（飞轮臂）、`mint`（建 batch / item / version，
 每篇三次写）、`consume`（角度销账，每篇一查一写）、`snapshots`（查重底稿转正，W-38）、`key_check`（key 对不上台账时多查一次）、
 `angle_debt`（存档后查欠账，只在有没带 key / key 对不上时）、`other`（拼回包、提示语、放锁）。按这个顺序一段接一段量，
-加起来等于 `phase_ms.commit`（存进 jsonb 后键会按名字重排，要按执行顺序看就按 `core.COMMIT_PARTS` 排）。攒够样本之后这样查：
+加起来等于 `phase_ms.commit`（存进 jsonb 后键会按名字重排，要按执行顺序看就按 `core.COMMIT_PARTS` 排）。
+**2026-11-11 读了**：`gate` + `fingerprints` 占 commit 的六到七成，都花在查重 RPC 取候选的那一步上，`019` 换了那一步的写法（§3.27）；
+owner 跑完 `019` 之后拿下面第二条查询再看一次这两步。攒够样本之后这样查：
 
 ```sql
 select count(*),
@@ -625,6 +627,159 @@ select dims->>'emotional_lever' as lever, count(*) as published,
        count(*) filter (where tier in ('爆', '大爆')) as bao
   from autowriter.v_angle_outcomes where note_id is not null
  group by 1 order by bao desc;
+```
+
+**每次工具调用留一行，只有数（2026-11-11，`deskcore/calllog.py`）。** 原来只有 `score_drafts` 在 `batch_metrics` 里留一行。
+开项目、查重、查规则各用了多久、怎么收场的，写评论那一路判了几条、哪一样检查打回了几条，库里一个数都没有，只能翻只留
+一周左右的网关日志（W-33 / W-38 / W-41 / W-42 / W-51 的周检都靠它）。现在 REST 和 MCP 给工具计时的那两处
+（`app.py` 的 `rest_tool` 和 `_wrap`），回包定下来之后把这一次交给后台，写一行 `autowriter.batch_metrics`：
+`meta.mode = 'tool_call'`，`batch_id` 空着，**不加迁移**（`batch_id` / `project_id` 可空、`user_id` 非空，
+`migrations/000_baseline.sql`，2026-11-11 在生产库 `information_schema` 核过）。
+
+- **不改、不拖慢、不弄坏回包。** 交接只是往一个有上限的队列里放一下（最多等 200 项，满了新的直接丢）；摘数和写库都在后台
+  一个线程里。写不进去只记一行 WARNING（`deskcore.calllog`，5 分钟最多一行，只带异常类型和错误码），队列满了同样。
+  进程退出时最多等 2 秒把剩下的写完，写不完就算了：这是给复盘攒数的，丢几行不影响任何人。
+- **只留数、固定的词和 8 位代号。** 稿子、评论、帖子、规则、回包里的任何一段文字都不进这一行（`calllog.build` 只从固定
+  的位置取条数、布尔和固定的词，最后 `_clean` 再筛一遍，不是整数 / 布尔 / 认得的词的一律丢掉；
+  `tests/test_tool_call_log.py` 拿现编的标记串逐行查）。评论照旧不存库，存的只是这一行计数。
+- **不记的**：`get_protocol`、`/health` 这类不是工具的端点、认不出调用者的调用（`user_id` 是非空列，不编一个填进去）、
+  参数没过 MCP 校验的调用（到不了计时的那一处，服务日志里有一行）、开关关着时的全部调用。存档之后在后台跑的那两样
+  `check_rules`（改稿复查、规则补查，都在 §3.19）不是工具调用，也不留这一行：`tool = 'check_rules'` 的行数就是模型自己
+  调了几次。
+- **开关**：`DESKCORE_TOOL_CALL_LOG=0` 关掉，默认开。
+- **读这张表的地方都要按 `meta.mode` 或 `batch_id` 筛。** 历史页的 `db.list_batch_metrics` 改成只读 `batch_id` 不为空的行
+  （不筛的话一天几十上百行的调用记录会把批次指标挤出最近 N 条）；本文档里的查询和 TV `verify_supabase_state.sql` #104 都带
+  `meta->>'mode' = 'deskcore_commit'`，不受影响。以后新写的查询照这个来。
+
+`project_id` 那一列只在调用成了的时候填（评论工具填服务端对上的那个项目）；没成的调用带来的 project_id 可能是抄错的、别人的，
+只在 `meta.project8` 留前 8 位。评论工具的帖子没对上、或者根本没查成（评论线程占满 / 查帖子超时）时回的也是一个普通的 200，带来的
+project_id 同样没过归属校验：那一列只认回包里的 `project_id`，没有就空着、照样只留 `project8`（2026-11-12 复审 TC-1：原来照填，
+抄错的 id 撞 `batch_metrics.project_id` 的外键、整行写不进去，别人的 id 则记到了调用方打不开的项目下）。`phase_ms = {"total": 毫秒}`，其余都在 `meta` 里：
+
+| 键 | 哪些调用有 | 是什么 |
+|---|---|---|
+| `v` / `tool` / `channel` / `elapsed_ms` | 全部 | 这一行的形状版本（现在是 1，形状改了就加一）、工具名、`rest` / `mcp`、服务端这一次用了多久 |
+| `outcome` / `error_class` | 全部 / 没成的 | `ok`；`error_result`（没抛、但回的是带 `error` 的降级结果）；`refused`（400 / 403 / 404 / 409 那几类正常拒绝）；`failed`（真故障）；`interrupted`（客户端断了）。后三种带异常类型（同服务日志那一行） |
+| `items` / `reply_chars` | 有才带 | 这次带了几篇稿 / 几条评论 / 几个版本（发牌是要几张）；回包的字符数（紧凑 JSON，中文一个字算一个） |
+| `skill` | `open_project` / `comments_for` | 这次报上来的 skill 版本：`up_to_date` / `outdated` / `unknown`（没报） |
+| `check` | `check_drafts` | `total` / `pass` / `warn` / `reject`；`decided_by` 是可疑和拒的各由哪个信号定的（`opening` / `title` / `ngram` / `contain`，一篇可以有几个）；`gates` 是不是撞车的拒（`replace_lookup` 这类）；`semantic_degraded` |
+| `rules` | `check_rules` | 回包里的数（§3.11 的 2026-11-11 那一版回包）：`status`（`checked` / `nothing_to_check` / `no_versions` / `error`）；`versions`、`must_fix`、`suggest`、`unsure`、`unjudged`、`evidence_not_found`（Jev 怀疑有问题、指不出是哪一句的，算在 `unjudged` 里）、`not_finished`、`empty_body`、`code_unchecked`、`more`，都是整次的合计（同回包的 `summary`，有才带）；`flagged`（有要动手的那几篇）、`judged`（规则题判回来了的那几篇）；`unsure_rules` / `unsure_rules_hard`（最外层列出来的偏向没守住的规则几条、其中硬约束几条，最多 3）；`excluded` / `remaining`（不是这个项目的、留到下一次的各几版）；`pool` 是规则池里各几条（同回包的 `rules`，只取数：`pool` / `by_jev` / `by_code` / `uncompiled` / `partial` / `code_unavailable` / `code_withdrawn` / `not_compilable` …）。规则 id、版本 id、题面和 Jev 指出的句子都不取 |
+| `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样；帖子根本没查成的那两种超时没有这个键，看 `judge_status = timeout`）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks` |
+| `comments.checks` | `score_comments` | `style` 是写法底线每样打回几条（`period` 句号 / `dialect` 方言语气词 / `contact` 像要联系方式 / `post_ref` 提了帖子 / `vague` 含糊指代）；`brand_over`（提品牌超出几条）、`repeats`（说法或开头重复的几条）、`endings_over`（品牌收尾超出几条）、`short_by` / `neutral_by`（短评、中性还差几条；项目没定这一项、或中性没判成时没有这个键）；`fix` / `style_fix`（带这两样的各几条）、`thread_fix` / `thread_hints`（整组的各几句） |
+
+它说得出一场走到了哪一步、每一步多久、评论判了几轮，说不出一场为什么停、是谁在打字。
+
+**存档那一行多三小块（同日，审计 A3 / A8 / A5）。** 都只有数和固定的词，只进 `meta`、不进回包，哪一块算不出来就不带哪一块：
+
+- `flywheel_lessons`：这个（项目，身份）近 12 小时借卡的情况。`borrows` 借了几次（0 = 没借过或进程重启过，不知道）；
+  `shown` / `status` 是最近一次带出去几张经验卡、什么结局（`borrowed` / `empty` / `timeout` / `error` / `not_configured`，
+  另有只在这一行出现的 `followup_timeout`：`borrow_lessons` 自己等到点卡还没选完，§3.26；回包里那次的 `status` 还是 `timeout`）；
+  `shown_max` 是最多的一次几张；`statuses` 是各种结局各几次。记的是简报实际带出去的那一份（超时 = 0，后台之后选完的不算）。
+  团队共用一个身份时分不出是哪一场借的：`shown_max = 0` 才能确定这一批没参照过卡。`shown_max = 0` 而且 `statuses` 里有 `followup_timeout`
+  = 这一批没参照过卡、补借也没等到。`statuses` 是这 12 小时里所有借卡的合计，不是这一场的：上午那一场简报和补借都超时、两小时后
+  另一场随简报拿到了卡，后一场那一行的 `statuses` 里照样有 `timeout` 和 `followup_timeout`——光看 `statuses` 会把拿到卡的批次数成
+  没卡的（2026-11-12 复审 borrow-1），要和 `shown_max = 0` 一起看。
+- `skill_versions`：近 24 小时报上来的 skill 版本构成（`skillcheck.health`，同 `/skill-versions`）：`current`、
+  `up_to_date` / `outdated` / `unknown` 各几个、`outdated_versions`（旧版各是哪一版；认不出 12 位十六进制的并进 `other`）。
+  数的是「身份 × 版本」，读作有几种版本在用，不是人数。原来只在进程内存里、要带 key 读、重新部署就清零。
+- `rule_compile`：这个项目最近一次规则编译（后台补编 / CLI）的收场：`status`、`uncompiled`（还有几条没编出来；规则池读不出来时
+  没有这个键）、`not_compilable`、`error_kinds`（没编出来的按种类各几条：`refusal` 拒答 / `truncated` 截断 /
+  `generator_http_529` 这类生成端状态码 / `generator_timeout` / `bad_output` / `batch_timeout` 这类整批的结局 …）、
+  `age_s`（这是多久之前的数）。种类按**拆小重发之后**的结局数（§3.11）：重发编出来的不算，第一次整批没成、重发了的按重发那次
+  每条的结局算（原因认不出来的记 `batch_jev_failed` 这类），只有整批被挡 / 读超时没重发的那一批按 `batch_<结局>` 记条数。这一轮没发、沿用上一轮种类的另带 `error_kinds_age_s`。本进程还没编过这个项目（刚重启）就不带。
+
+```sql
+-- 每个工具调了几次、多久、多长(近 7 天)
+select meta->>'tool' as tool, meta->>'channel' as channel, count(*),
+       round(avg((meta->>'elapsed_ms')::int)) as avg_ms,
+       percentile_cont(0.95) within group (order by (meta->>'elapsed_ms')::int) as p95_ms,
+       round(avg((meta->>'reply_chars')::int)) as avg_reply_chars
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and created_at > now() - interval '7 days'
+ group by 1, 2 order by 3 desc;
+
+-- 没成的调用: 哪个工具、哪种结局、哪类异常
+select meta->>'tool' as tool, meta->>'outcome' as outcome, meta->>'error_class' as error_class, count(*)
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and meta->>'outcome' <> 'ok' and created_at > now() - interval '7 days'
+ group by 1, 2, 3 order by 4 desc;
+
+-- 一场走到了哪一步: 每个项目每天各工具调了几次(发了牌、查了重却没有 score_drafts 的那几天一眼看得出)
+select day, p, jsonb_object_agg(tool, n order by tool) as calls
+  from (select (created_at at time zone 'Asia/Shanghai')::date as day,
+               coalesce(left(project_id::text, 8), meta->>'project8') as p,
+               meta->>'tool' as tool, count(*) as n
+          from autowriter.batch_metrics
+         where meta->>'mode' = 'tool_call' and created_at > now() - interval '7 days'
+         group by 1, 2, 3) t
+ group by 1, 2 order by 1 desc, 2;
+
+-- 查重: 可疑和拒的是哪个信号定的
+select s.status, sig.key as signal, sum(sig.value::int) as drafts
+  from autowriter.batch_metrics m,
+       jsonb_each(coalesce(m.meta->'check'->'decided_by', '{}'::jsonb)) as s(status, signals),
+       jsonb_each_text(s.signals) as sig
+ where m.meta->>'mode' = 'tool_call' and m.meta->>'tool' = 'check_drafts'
+   and m.created_at > now() - interval '14 days'
+ group by 1, 2 order by 3 desc;
+
+-- 查规则: 模型调了几次、查了几版、必须改 / 建议改 / 拿不准各几条、几次带了 unsure_rules、几次有规则查不了
+select count(*) as calls, meta->'rules'->>'status' as status,
+       sum((meta->'rules'->>'versions')::int) as versions,
+       sum((meta->'rules'->>'must_fix')::int) as must_fix, sum((meta->'rules'->>'suggest')::int) as suggest,
+       sum((meta->'rules'->>'unsure')::int) as unsure, sum((meta->'rules'->>'evidence_not_found')::int) as unlocated,
+       count(*) filter (where (meta->'rules'->>'unsure_rules')::int > 0) as with_unsure_rules,
+       count(*) filter (where (meta->'rules'->'pool'->>'code_unavailable')::int > 0) as with_comment_only_rules,
+       round(avg((meta->>'reply_chars')::int)) as avg_reply_chars
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and meta->>'tool' = 'check_rules'
+   and created_at > now() - interval '7 days'
+ group by 2 order by 1 desc;
+
+-- 评论(W-51): 判了几次、几篇帖子、一篇帖子判几轮、整组过了几次、被拒的调用几次
+-- 一篇帖子判几轮只数带 post8 的调用: 帖子没对上 / 没查成的也是 outcome = ok、却没有 post8, 另列在 no_post(2026-11-12 复审 TC-2)
+select count(*) as score_calls,
+       count(distinct meta->'comments'->>'post8') as posts,
+       round(count(*) filter (where meta->>'outcome' = 'ok' and meta->'comments' ? 'post8')::numeric
+             / nullif(count(distinct meta->'comments'->>'post8'), 0), 1) as calls_per_post,
+       count(*) filter (where meta->>'outcome' = 'ok' and not coalesce(meta->'comments' ? 'post8', false)) as no_post,
+       count(*) filter (where meta->'comments'->>'passed' = 'true') as sets_passed,
+       count(*) filter (where meta->>'outcome' = 'refused') as refused,
+       sum((meta->'comments'->>'n')::int) as comments_judged,
+       sum((meta->'comments'->>'no_slot')::int) as without_slot
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and meta->>'tool' = 'score_comments'
+   and created_at > now() - interval '7 days';
+
+-- 评论: 每样检查打回了几条(配比 / 重复 / 短评 / 品牌收尾 / 写法底线各样)
+select k.key as check_name, sum(k.value::int) as comments, count(*) filter (where k.value::int > 0) as calls
+  from autowriter.batch_metrics m,
+       jsonb_each_text((m.meta->'comments'->'checks') - 'style' || coalesce(m.meta->'comments'->'checks'->'style', '{}'::jsonb)) as k
+ where m.meta->>'mode' = 'tool_call' and m.meta->>'tool' = 'score_comments'
+   and m.created_at > now() - interval '7 days'
+ group by 1 order by 2 desc;
+
+-- 写手手上的 skill: 入口工具每次报上来的版本(按天)
+select (created_at at time zone 'Asia/Shanghai')::date as day, meta->>'tool' as tool, meta->>'skill' as skill, count(*)
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and meta ? 'skill' and created_at > now() - interval '14 days'
+ group by 1, 2, 3 order by 1 desc, 4 desc;
+
+-- 存档那一行的三小块: 没参照过卡的批次占多少、skill 版本构成、规则还有几条没编出来
+select count(*) as commits,
+       count(*) filter (where (meta->'flywheel_lessons'->>'borrows')::int > 0) as borrow_known,
+       count(*) filter (where (meta->'flywheel_lessons'->>'shown_max')::int = 0) as no_cards,
+       count(*) filter (where (meta->'flywheel_lessons'->>'shown_max')::int = 0
+                          and (meta->'flywheel_lessons'->'statuses'->>'followup_timeout')::int > 0) as followup_timed_out,
+       count(*) filter (where (meta->'skill_versions'->>'outdated')::int > 0) as with_outdated_skill,
+       count(*) filter (where (meta->'rule_compile'->>'uncompiled')::int > 0) as with_uncompiled_rules
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'deskcore_commit' and created_at > now() - interval '14 days';
+
+select created_at, left(project_id::text, 8) p, meta->'rule_compile' as rule_compile
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'deskcore_commit' and (meta->'rule_compile'->>'uncompiled')::int > 0
+ order by created_at desc limit 20;
 ```
 
 ### 3.9 交付版式由代码拼（2026-10-20）
@@ -780,7 +935,21 @@ Jev 回 200、但 `model` 是 `mock`（`JUDGE_MOCK=1` 的测试 / 本地 Jev，�
 - 线程跑 `core.compile_rules`：池子和简报、§3.10 同一个（`store.shared_memories`：confirmed、没静音、本项目 + owner 自己的 global，
   hard 和 soft 都编、不过方向闸——global 规则跨项目共用，方向是查的时候按项目定的），已经有 (id, sha) 那一行的跳过，一批 ≤ 60 条
   （`RULE_COMPILE_BATCH`），读超时 `RULE_COMPILE_TIMEOUT_SEC`（默认 420 秒，Jev 最坏约 361 秒）。Jev 那边怎么失败都不抛，回一份报告。
-- 不让失败变成花钱的循环：同一条规则的同一版编失败之后，后台 6 小时之内不再编它（进程内记账，重启清零；CLI 不受这条限制）；
+- 没编出来的拆小重发一次（2026-11-11，审计 A5 / JP-5）。Jev 把一次请求按 10 条一批交给模型，一批里有一条让模型拒答 / 输出不合格、
+  或者那一次调用没通，这 10 条就一起带 error 回来。原来整批记失败，6 小时后（还得有人开这个项目）原样 10 条再发、再一起失败——11-11
+  一个项目最早的 10 条硬规则就这样一条都没编出来。现在一次请求回来之后，带 error 的（和回包里漏掉的）马上拆成每次最多 3 条
+  （`RULE_COMPILE_RESEND_CHUNK`）各重发一次：是某一条的事，别的几条这次就编出来了；是那一下没通，重发多半也过了。Jev 一条都没编出来
+  回 502（`jev_failed`）或回包不成形（`error`）的那一批同样重发。**不重发的**：整批被挡的那几种和读超时（照旧停整次运行）、sha 对不上的
+  （两边算法漂了，再发也一样）。重发的小请求自己撞上被挡 / 读超时，同主循环一样停，没重发成的照第一次的失败记。一次 `compile_rules` 里
+  重发最多花 10 分钟（`RULE_COMPILE_RESEND_BUDGET_SEC`），到点剩下的照第一次的失败记、下次再来（Jev 生成端慢的时候每个小请求都要等到它
+  自己超时）。重发就在这一次 `compile_rules` 里，后台路径照旧握着那一个编译槽位：一批 10 条最多多发 4 次请求，别的项目多等这一会儿。
+  报告里多两个数：`resent`（重发了几条）、`recovered`（其中又编出几条）；重发都编出来了这次就是 `ok`（`batch_errors` 留着第一次那笔）。
+  重发之后还没编出来的记一行 WARNING `compile_rules: 拆小重发 N 条, 编出 M 条, 还有 K 条没编出来(project=…): <归类>: <规则 id 前 8 位>, …`
+  ——归类是一个固定的短词（`refusal` / `truncated` / `generator_http_<状态码>` / `generator_timeout` / `bad_output` / `no_result` /
+  `missing_in_response` …，认不出来的记这一小批的结局 `batch_<结局>`；同一套词也进存档指标的 `rule_compile.error_kinds`，§3.8 末尾），
+  不带规则原文，也不带 Jev 的错误原文（「输出不合格」后面跟的是模型那段输出的毛病，里面可能有规则的内容）。CLI 的 `compile-rules`
+  同样重发，多打一行。
+- 不让失败变成花钱的循环：同一条规则的同一版**重发之后还是**编失败的，后台 6 小时之内不再编它（进程内记账，重启清零；CLI 不受这条限制）；
   Jev 生成端的 HTTP 429 / 5xx（Jev 回「生成端调用失败：GeneratorHTTPError: HTTP 529 …」，整批失败时是 502）只停 30 分钟
   （`RULE_COMPILE_TRANSIENT_RETRY_SEC`）：上游没出输出、没计费，多半是部署后一阵过载（独立复审 on aw E：原来也扣 6 小时，一次几秒的过载让整个池子
   半天没检查）；504 / 524 网关超时、拒答、截断、输出不合格、读超时照旧 6 小时（可能已经计费）。
@@ -847,6 +1016,26 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
    `JUDGE_DRAFT_TOOL_TIMEOUT_SEC`（默认 18 秒）的截止，发之前查 tv-map 的那两次库也算在里面；到点没回来的那篇报 `judge_status = timeout` +
    `judge_note`「没判完」，**绝不算守住**。正文是空的那篇不发（`judge_status: empty_body`），不算没判完，数进 `summary.empty_body`，
    `next_step` 说这几篇规则题没判、不能说守住了（独立复审 on aw E：原来什么都不数，标题上的题、「正文要带…」的题都没问，照说「都守住了」）。
+   **只问评论 / 话题的题不发**（2026-11-11，审计 S2 / JP-1；`rulecompile.unseen_questions`）：发给 Jev 的只有标题和正文，这种题是对着一篇
+   没有评论的稿子答的——「评论里有没有带上…」（`pass_if` 是）篇篇答「否」，硬规则篇篇报「必须改」，怎么改正文都消不掉；
+   「评论里有没有…」（`pass_if` 否）篇篇算守住，其实没看。11-11 线上一个项目的一道题让 15 篇里 15 篇报了「必须改」，改过重存的 5 篇照报，
+   历史上记下的 19 条硬规则违反里 15 条是它。编出来的 `code` 早就按 `where` 拦了（步骤 4），题这边原来没有同样的一道。
+   只看题面的字：`ask` 提到 评论 / 话题 / 标签、又一处没提 正文 / 标题 / 全文 的才算（「正文或评论里有没有…」是正文的题，照问）；
+   2026-11-12 复审（R3 / R4）两头各收了一下：「评论区」是正文把读者往那儿引的去处（评论前面紧挨着 去 / 到 / 来 / 往，或后面是
+   「区见」「区告诉」：「结尾有没有引导读者去评论区留言」）、「话题」「标签」是平常的意思（敏感话题、贴标签；只有 话题里 / 话题行 /
+   标签里 / 标签行 / 话题标签 才算说话题行）时是正文的题，照问——原来不发，这条规则报成「要看话题 / 评论，查不了」；
+   题面以评论开头（问的就是评论）、后面顺带提到正文 / 标题的（「评论里有没有呼应正文提到的场景」）不分 `pass_if` 都不发——
+   原来因为带了「正文」照发，又是篇篇「必须改」。线上最新的编译结果 147 道题里拿掉的还是原来那 15 道，一道不多一道不少。
+   「在评论区留言」这种还是算问评论的（「在评论区有没有…」多半真是），报成查不了。开头的评论和正文 / 标题是并列着问的
+   （「评论或正文里有没有…」「评论区和标题有没有…」）照问：正文那一半看得见，和「正文或评论里…」是同一道题。
+   `scope` 标了 `title` / `body` 的不算（编译时就指明只看标题 / 正文的题，「标题有没有话题钩子」里的「话题」不是话题行；线上这种题的
+   `scope` 都是 `full`）。在拼题库**之前**拿掉——`project_bank` 是 Jev 那边的移植、逐字节钉着，不在里面筛。一条规则的题全被拿掉、
+   别的也没查它的，和步骤 4 里只看话题 / 评论的 `code` 并成一个集合数进 `rules.code_unavailable`（两边都沾的只数一次）；拿掉一部分、
+   或者题全拿掉但编出来的 `code` 照查了标题 / 正文的，数进 `rules.partial`（`partial_rules[].uncovered` 写「只问评论 / 话题的规则题没问」）。
+   两种 `next_step` 都不说它（整条）守住了。拿掉的题号记一行 INFO 日志（只有题号）。11-11 当天的编译结果里这一刀拿掉 12 道题
+   （三个项目 8 + 2 + 2，五条规则的题全在里面），没有一道提到标题或正文的题被拿掉。按字认会漏掉不带这几个词的问法（比如只说「楼中楼」，
+   当天没有），漏掉的照旧发。**复盘注意**：拿掉之前那 15 条假的硬规则违反已经在规则题账本里（`run_tag=shadow-rules`），校准时要排除这
+   几条规则的题；拿掉之后这些题不再写账本。真要按评论查这些规则得把评论交给 Jev，是另一件事，这次没做。
 4. 代码查：编出来的 `code` 交给 `rulecheck.check`（查词、数字数和 §3.10 同一份 `validator.contains_term` / `count_chars`），只跑没有
    人设能跑的 check 的规则（见上表 `code` 那行）。`where` 里的 `tags` / `comments` 先拿掉（版本行里没有），拿完一处不剩的不跑
    （`required_phrase` 沾了就不跑），数进 `rules.code_unavailable`，`next_step` 说这几条查不了、不能说守住了。
@@ -881,20 +1070,41 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
 `p` < 0.7（同参考分的「有把握」线）的，不管偏向哪边都记「拿不准」——0.6 的守住和 0.6 的没守住一样不可信。`invalid_reason` 不为空的
 记「没判出来」，不报违反也不报守住，**没有例外**——同 Jev README「规则编译 → 送回 /judge_draft」的契约。`evidence_not_found`
 （答了「是」却指不出依据句，TV 账本里那一行 answer 为 NULL）也是没判出来（10-20 第二轮复审：原来它落在 `pass_if`「否」的题上时照算违反，
-硬规则报「必须改」，写手照着一个账本里记成无效的答案去改稿，还不知道改哪一句）。没判出来的题数进那篇的 `counts.unjudged`（`unjudged` 列出规则 id
-和原因，最多 5 条）、全部篇加起来进 `summary.unjudged`（整篇所有题都未判出来的也计入），`next_step` 说「另有 N 道规则题这次没判出来，不能说守住了」；一道都没判出来的
+硬规则报「必须改」，写手照着一个账本里记成无效的答案去改稿，还不知道改哪一句）。没判出来的题数进那篇的 `counts.unjudged`（只有题数，
+11-11 起不逐条列）、全部篇加起来进 `summary.unjudged`（整篇所有题都未判出来的也计入），`next_step` 说「另有 N 道规则题这次没判出来，不能说守住了」；
+其中 `evidence_not_found` 的另数进 `summary.evidence_not_found`（有才带），`next_step` 单说一句「Jev 怀疑有问题、但指不出是哪一句：不算没守住
+（也不说成守住了），不用改」（2026-11-11，审计 S5 / JP-4：线上没判出来的全是这一种，没有一句可改，也不是回包缺了题，原来和缺题混成
+一句「没判出来…不用重试」；数照旧都在 `counts.unjudged` 里，协议 5a 认的是它）。一道都没判出来的
 那篇（回包里没有 `desk_rules`，或每题都带 `invalid_reason`）记 `judge_status: not_judged`，和没判完一样算进 `summary.not_finished`。
 10-20 复审：原来这里只在那篇上记个数，`summary` 不看它，`next_step` 照说「这次查的规则都守住了」——现在这句只在必须改 / 建议改 /
 拿不准 / 没判完 / 没判出来 / 没编译结果 / 话题评论查不了 / 编不了 / 编出来的检查没跑 / 只查了一部分 / 代码没查完 / 撤掉了代码检查又没有题 /
 正文是空的全是 0 时才说。
 
 **返回值**（一篇一项 `versions[]`）：`violations`（每条 `rule_id` / `severity` / `what`（以「必须改」或「建议改」开头）/ `source`（jev | code）/
-`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`）、`unsure`（「拿不准」，最多 5 条）、`more`（这篇没列出来的条数）、`counts`、`judge_status` / `judge_note`、`code_unchecked`；
-外加 `summary`（必须改 / 建议改 / 拿不准 / 没判完各几处、没判出来几道题；有才带：`more` 没列出来几条、`empty_body` 几篇正文是空的、`code_unchecked` 几处没查完）、`rules`（池子几条、Jev 查几条、代码查几条、查不了几条、
+`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`；Jev 判的同一条软规则在一篇里只留一条、硬约束只并指着同一句的，见下）、`more`（这篇没列出来的建议改条数）、`counts`（`must_fix` / `suggest` / `unsure` / `unjudged`）、`judge_status` / `judge_note`、`code_unchecked`；
+外加 `summary`（必须改 / 建议改 / 拿不准 / 没判完各几处、没判出来几道题；有才带：`more` 没列出来几条、`evidence_not_found` 几道题指不出依据句、`empty_body` 几篇正文是空的、`code_unchecked` 几处没查完）、`unsure_rules`（有才带，见下）、`rules`（池子几条、Jev 查几条、代码查几条、查不了几条、
 还没编几条和为什么、话题评论查不了几条、编不了几条、编出来没跑几条、只查了一部分几条、人设过 check 由 `score_drafts` 查的几条、撤掉了代码检查又没有题的几条、正则没查完几条）、`uncompiled_rules`、这次没查到的 `remaining_version_ids`（有才带）
-和一句 `next_step`。`summary.more` 不是 0 时 `next_step` 说还有这么多条建议改 / 拿不准没列出来、如实告诉用户（独立复审 on aw E：原来
+和一句 `next_step`。`summary.more` 不是 0 时 `next_step` 说还有这么多条建议改没列出来、如实告诉用户（独立复审 on aw E：原来
 只在每篇的 `more` 里，`next_step` 和工具说明一字不提，写手照列出来的说完就算了；同 §3.10 的 `rule_checks_more`）。没有可查的规则时回
 `status: nothing_to_check` 和一句话，什么都不发。
+
+**只逐条列要动手的**（2026-11-11，审计 F1 / JP-6）。11-11 线上判过规则题的 43 版，一篇平均 5.0 条拿不准（上限就是 5，所以 `more`
+几乎次次不是 0）、2.9 道没判出来，都是工具说明和 `next_step` 说「不用改」的；拿不准的答案里 76% 偏向守住。10 篇的回包一万两三千字，
+大半是这些行。现在：
+- 每篇不再带 `unsure` / `unjudged` 两个列表，只留 `counts` 里的条数；`more` 只数没列出来的建议改。
+- 最外层多一个 `unsure_rules`（最多 3 条，`CHECK_RULES_MAX_UNSURE_RULES`）：只收**偏向没守住**的拿不准（答案和 `pass_if` 不一样、
+  把握不到 0.7 或 Jev 标了歧义），一条规则一行 `{rule_id, severity, what, drafts}`——`what` 是「拿不准: 要点」，不带每篇各自的答案和把握，
+  `drafts` 是这次有几篇在它上面拿不准、偏向没守住；硬约束的排前面，再按篇数。偏向守住的只计数（照旧不算守住）。
+- `next_step` 的拿不准那句带上数：「有 N 处「拿不准」(涉及 M 条规则), 提一句就行, 不用改」。
+- 同一条规则在一篇上只报一条（`rulecompile.one_per_rule`）：一条规则编成两三道相近的题、几道都没守住时原来各报一条（线上 128 条
+  里只有 114 个不同的「规则 × 篇」），现在留带依据句的那条，都带或都不带留先出现的；`counts` / `summary` 按留下的数。只并 Jev 判的；
+  代码查的命中照旧另列（一条规则编出来既有 `code` 又有题时两边查的常常是两件事，各列各的，看 `source`）。
+  **硬约束只并指着同一句依据的**（2026-11-12 复审 R1）：线上 27 条已确认的硬约束里 15 条有两道题以上，多半一道题管一件事；
+  两道题各指一句、或者有一道指不出句子（该写的没写）时是两件要改的事，原来并成一条，另一句回包里哪儿都没有、`must_fix` 也不算它，
+  `next_step` 还说照着改完、改一轮就够，重存的稿子又不再查。现在各列各的；线上重复的那 14 篇都在一条软规则上，不受影响。
+- 代价：回包里看不出是**哪一篇**拿不准、哪条规则没判出来（数都在）；一条**软**规则的两道题问的是两件事、又都没守住时，只报其中一件；
+  一条硬约束的两道近义题都没守住、指的又不是同一句时，会各报一条。
+  后台的改稿复查（§3.19 的 AU-F07，`_recheck_digest`）只读 `counts`、`summary` 和 `violations[].rule_id`，不受影响。
 
 **只查新稿。** `score_drafts` 的返回多了 `check_rules_version_ids`：这批里的新稿，不含带 `replaces_version_id` 改过重存的；全是重存时
 它是空的，`next_step` 说「不用再调 check_rules」。10-20 复审：原来每次存档的 `next_step` 都说「然后调一次 check_rules」，照
@@ -987,7 +1197,8 @@ CLI 和服务进程不共用锁（见上），补编那一阵写手一 `open_pro
 失败时规律照样回来，`librarian_client` 原来在看 `patterns` 之前就按降级返回了。现在降级 / `error` 时卡照旧是空的、结局照旧
 `error`，规律照样交给模型。另外借卡交出去之后把**实际给出去几条规律**记在发出去的那个臂旁边（进程内存 `_patterns_shown`，
 同 `_borrowed_arms` 的取舍）：`open_project` 记简报里带的条数（超时 / 借阅线程起不来 = 0，后台线程之后选完了也不算），
-`borrow_lessons` 记这次给的条数，原样传回简报里的臂（同一场接着借）就和前面那次取大的。入库时 `batch_arm` 第四项取出来，
+`borrow_lessons` 记这次给的条数（2026-11-11 起它也限时，到点没等到 = 这次 0 条，§3.26），原样传回简报里的臂（同一场接着借）
+就和前面那次取大的。入库时 `batch_arm` 第四项取出来，
 写进 `batches.params.flywheel_patterns_shown` 和 `batch_metrics.meta.flywheel_patterns_shown`：整数 = 给出去几条（explore 臂
 是 0）；`null` = 服务端不知道（重启过、按入库时重算的臂、记下的那次借卡和最近一次发臂对不上）；没有这个键 = F13 之前的批次。
 臂怎么分一点没变。分析 L-07 / G-05 时 patterns 臂只算 `flywheel_patterns_shown > 0` 的，0 和 `null` 单列一组。W-38 查重底稿
@@ -1182,7 +1393,31 @@ python -m deskcore.cli projects --user <uuid> --include-archived      # 全列�
 - 一个工作线程，名额 4 个、从投进去一直占到跑完：同时最多 4 次（1 次在跑、3 次排着），第 5 次就跳过、记 WARN；进程重启丢掉还在排的。那一行就没有这个键：**没有这个键 = 没复查**，不是复查过了。`check_rules` 抛了记 `status: error`；写回失败只记日志。
 - 测试里默认关掉（`tests/conftest.py` 把池子换成 None），要测它的用例换成就地跑的池子（`tests/test_revision_recheck.py`）。
 
-复盘时这样查：
+**规则检查的后台补查（2026-11-11，审计 S3 / JP-3）。** 新稿的规则检查靠模型在 `score_drafts` 之后多调一次 `check_rules`。10-23 上线到 11-11，136 版新稿里只有 36 版在账本里有规则题的答案，有五个写稿日是 0 版；「人在发布前改了什么」那 326 对里一对都没有规则题的答案，而 11-20 要拿这两样对着校准规则题。所以每次存完档（真存进去了才排），在改稿复查的同一个工作线程上、排在它后面，再排**一个**补查（`core._rule_sweep`）：
+
+- 列这个项目近 21 天（`RULE_SWEEP_DAYS`）、建了超过 3 分钟（`RULE_SWEEP_MIN_AGE_SEC`）的稿子——每篇只看交出去的那一版（`items.best_version_id`；改动对只挂在这一版上），补录副本不算——去掉账本里已经有规则题答案的（`truth_vault.note_feature_answers`，`subject_type = 'aw_version'`、`run_tag = 'shadow-rules'`，就是 `check_rules` 自己写的那些行；读法 `store.versions_with_answers`，只取 `subject_id`），剩下的一次最多查 20 版（`RULE_SWEEP_MAX_VERSIONS`），多的留给下一次存档。
+- 刚存的这一批不到 3 分钟，不在里面：模型自己那次 `check_rules` 通常二十来秒就到，等它先查。它查了的账本里有行，这里一次 Jev 都不多花；它没查的，下一次存档补上。
+- **旧的在前。** 改动对只有发出去的稿子才有，发布比存档晚好几天，越早的稿子越可能已经有了那一对；最早的那几版也最先滑出 21 天的窗口。新的在前的话每次的名额都先给刚写的（模型多半会自己查），等着校准的旧稿一直轮不到、过期。
+- 用的就是 `check_rules`：同一个调用者、同一个 client（和改稿复查一样是存档那次的），答案由 Jev 照常落账本，缺编译结果照样触发后台补编。`tactic` 传空——旧稿那一场的 `tactic` 哪儿都没存（批次行上的一直是空的），拿这一场的去判旧稿的方向会把该问的软规则挡掉；传空就是只按项目名判方向，判不出来全放行，卡上标了贴型的稿子本来就逐篇跟着贴型走。查的是**现在**的规则池，不是写那篇时的。
+- **不写 `batch_metrics`（存档那一行不多一块，也不留「每次工具调用一行」，§3.8 末尾）、不进回包、`next_step` 和 `check_rules_version_ids` 一字不动**：写手和模型都看不到它。只有一行 INFO：`规则补查(project=…): 近 21 天 N 版, 已有答案 A 版, 这次查了 C 版(判回来 J 版), 跳过 S 版, …ms`（跳过 = 还没有答案、这次没查的）。没跑完记一行 WARNING，绝不冒泡到存档。
+- 账本就是记录，进程重启不丢进度。进程里另记两样省读数的：已经知道有答案的版本不再问账本；查过一次的版本 6 小时内（`RULE_SWEEP_RETRY_AFTER_SEC`）不再查——正文是空的、这一组没有规则题、Jev 没判完的那些查了也没有行，不记的话「旧的在前」会一直卡在它们上面。
+- 同一个项目同时只有一个在排 / 在跑（只管本进程）。没配判定服务、`RULE_SWEEP_AUTO=0`、池子关着（测试里默认，`tests/conftest.py`）时什么都不做。不占改稿复查那 4 个名额。
+
+看补到哪儿了（近 21 天写作台的稿子里，交出去的那版有规则题答案的占多少）：
+
+```sql
+select b.project_id, count(*) as delivered,
+       count(*) filter (where exists (
+           select 1 from truth_vault.note_feature_answers a
+            where a.subject_type = 'aw_version' and a.run_tag = 'shadow-rules' and a.subject_id = v.id::text)) as with_rule_answers
+  from autowriter.versions v
+  join autowriter.items i on i.id = v.item_id and i.best_version_id = v.id
+  join autowriter.batches b on b.id = i.batch_id
+ where v.created_at > now() - interval '21 days' and b.params->>'source' = 'deskcore'
+ group by 1 order by 2 desc;
+```
+
+改稿复查复盘时这样查：
 
 ```sql
 select created_at,
@@ -1304,7 +1539,7 @@ select created_at,
 
 **笔记那一侧的字数（同一句「不为凑字数凑废话」）。** 两处服务端的话，不在协议里：
 
-- 简报：显示出来的规则里有说到字数的（原文有「N 字」「字数」「篇幅」——阿拉伯数字或两个字以上的中文数；一个中文数字（「十个字」「两个字」）要挨着说长短的词才算（不超过 / 最多 / 至少 / 控制在…，以内 / 以上 / 左右 / 内…），「一个字都不能错」「品牌名四个字不拆开」「slogan 八个字原样用」是在说原样用，不算；「十字路口」「一字不改」「八字」不算——或者存了 `max_len` 检查；「评论区」开头的管评论，不算），那一层末尾补一句。硬约束说到就接在 P0：`LENGTH_RULE_TAIL_HARD`「规则里说到的字数照守; 差字数时只拿具体内容(经过、细节、数字)补, 不加空话、重复的解释或总结句」——P0 每一条都要守（协议），硬约束的下限 `check_rules` 照旧报「必须改」，不能在 P0 里说可以写短（复审 11-11）。只有软规则说到就接在 P1：`LENGTH_RULE_TAIL`「规则里说到的字数, 上限照守; 但字数不是要凑够的数: 不为凑字数加空话、重复的解释或总结句, 素材不够就写短一点, 交付时跟用户说一句差多少」。只接一次，放在贴型那句（`DIRECTION_RULE_TAIL`）前面。「上限照守」是故意的：最常见的是「标题不超过二十字」，这句不能读成上限也能松。
+- 简报：显示出来的规则里有说到字数的（原文有「N 字」「字数」「篇幅」——阿拉伯数字或两个字以上的中文数；一个中文数字（「十个字」「两个字」）要挨着说长短的词才算（不超过 / 最多 / 至少 / 控制在…，以内 / 以上 / 左右 / 内…），「一个字都不能错」「品牌名四个字不拆开」「slogan 八个字原样用」是在说原样用，不算；「十字路口」「一字不改」「八字」不算——或者存了 `max_len` 检查；管评论的规则不算：原来只认「评论区」开头，2026-11-11 起按 `_is_comment_rule`，见 §3.24），那一层末尾补一句。硬约束说到就接在 P0：`LENGTH_RULE_TAIL_HARD`「规则里说到的字数照守; 差字数时只拿具体内容(经过、细节、数字)补, 不加空话、重复的解释或总结句」——P0 每一条都要守（协议），硬约束的下限 `check_rules` 照旧报「必须改」，不能在 P0 里说可以写短（复审 11-11）。只有软规则说到就接在 P1：`LENGTH_RULE_TAIL`「规则里说到的字数, 上限照守; 但字数不是要凑够的数: 不为凑字数加空话、重复的解释或总结句, 素材不够就写短一点, 交付时跟用户说一句差多少」。只接一次，放在贴型那句（`DIRECTION_RULE_TAIL`）前面。「上限照守」是故意的：最常见的是「标题不超过二十字」，这句不能读成上限也能松。
 - 规则检查：字数没到下限的那一句后面加 `rulecheck.BELOW_MIN_HOW`「能补的是具体内容(经过、细节、数字), 不加空话凑字; 没有素材就照实告诉用户差多少」。级别不变：硬约束的下限照旧标「必须改」。
 
 **量过（11-11，只读 SQL，只看数）。**
@@ -1411,6 +1646,328 @@ auth rejected: reason=invalid_ellipsis path=/mcp/ via=header len=9 flags=ellipsi
 
 回归：`tests/test_auth_rejection_diagnostics.py`（每一项怎么判、那一句原文、只看发来的那一串、去首尾空白和不替对方改的几样、原因和计数、日志那一行；复审 11-11：配置里带「…」的钥匙哪种写法都对不上、配置写坏时固定的一句和只报位置）、`tests/test_auth_rejection_http.py`（REST 和 MCP 两条路同一份、`/health` 的计数里没有钥匙、日志；复审 11-11 的两条也各走了一遍 HTTP）。运维怎么用见 runbook「连不上时按这个顺序查」。
 
+### 3.24 写手说过的评论规矩，下一组评论拿得到；评论位的说法不再招来被拒的调用（2026-11-11，审计 C1 / F5 / C7）
+
+不动协议（`2d357c4b6075`，写手不用重导 skill），不加迁移，不改库里任何一行。改的是 `core.py` 里几个判据和给模型看的几句话。
+
+#### (I) 哪些规则算管评论的
+
+**为什么。** 协议叫模型把管评论的规矩记成「评论区：」开头，`comments_for` 也只认这个开头。可 11-03 以来记下的 3 条规则全是 11-11
+在写评论的对话里记的，没有一条带这个开头：四分钟后的 `comments_for` 回的 `comment_rules` 是空的，写手刚说过的话下一组评论照样犯。
+另有一条以「【评论区…】」开头的建议级规则，因为多了一个括号，也一直没给过写评论的人。
+
+**现在的判据**（`core._is_comment_rule`，三样有一样就算）：
+
+1. 原文去掉开头的空白和**一个**开括号之后以「评论区」开头（原来就认的那一种）；
+2. 开头那一句——到第一个标点或换行为止，空格不算标点——的前 12 个字里有「评论」；
+3. 存的代码检查（`rule_kind` / `rule_payload`）的 `where` 里有 `comments`。
+
+说交付版式、过了开头那一句才提到评论的规则（「【交付格式…】…」这一类）不算，写评论时照旧不给。
+
+用在两处：
+
+- **`comments_for`**（`_comment_rules`）：认出来的进 `comment_rules`，其余的硬约束进 `hard_rules`。一条硬的评论规则原来在
+  `hard_rules`，现在在 `comment_rules`——两个列表都是「必须守」，合起来一条不少、也不重复，写评论的人拿到的东西只多不少。
+  `score_comments` 不读规则（整组那几样只看品牌叫法和 `comment_set`，判定服务也不收规则原文），不受影响。
+- **简报的字数那一句**（`_mentions_length`，§3.22）：管评论的规则说到字数，不给笔记补那一句——判据从「评论区」开头换成同一个
+  `_is_comment_rule`。
+
+**笔记那一侧不动。** 这些规则照旧在简报的 P0 / P1 里：硬约束不能因为「看起来是说评论的」就从写笔记的人眼前拿走（跟着笔记
+一起交付的评论也归它管）。
+
+**核对（11-11 对生产库只读查了一遍）。** 生效的规则 233 条，原来按开头认出 4 条。新判据多认出 10 条：
+
+| 项目（id 前 8 位） | 多给写评论的建议级规则 | 从 `hard_rules` 换到 `comment_rules` 的硬约束 |
+|---|---|---|
+| `64366f9a` | 3（11-11 记的那三条；其中一条是靠第 3 样认出来的） | 0 |
+| `a14f15a4` | 1（开头多一个括号的那条） | 2 |
+| `0d6f50df` | 0 | 3 |
+| `89d3e7aa` | 0 | 1 |
+
+多认出来的每一条说的都是评论（其中一条硬约束说的是评论文本交出去时的样子，一条是笔记和评论两边都管的）。原文里提到评论、
+没被认出来的 35 条里，33 条是过了第 13 个字才提到的，2 条是「评论」前面先有一个标点（先说了别的部位、后面才提到评论）：
+开头标着交付格式 / 交付排版的 8 条一条没进，其余是说笔记正文怎么写、顺带提到评论的。
+
+#### (II) `record_rule`：当场说这条写评论时给不给；说评论的检查只查评论
+
+- 回包多一个 **`given_when_writing_comments`**（true / false）：按库里实际那一行算，判据就是上面那一个。模型在写评论的对话里
+  记完规矩，当场就知道下一组评论拿不拿得到，不用等用户下次发现没生效。工具说明里一句：管评论的规矩 content 开头写「评论区：」就给。
+  **停用着的规则回 false**，另带一句 `muted_note`（`RULE_MUTED_NOTE`：现在是已停用、写稿写评论都不给，要恢复调 `set_rule_state`
+  的 unmute）。2026-11-12 复审 C6：原文一样再记一次命中的是同一行，`db.upsert_memory` 不清 `muted_until`，原来照回 true，
+  `comments_for` 其实不给（`store.shared_memories` 先筛掉停用的）。线上还没有停用过的规则。
+- **开头那一句只说评论的规则，`check` 的 `where` 存成 `["comments"]`**（`_comment_only_where`），回包带一句 `check_where_note`
+  （`COMMENT_CHECK_NOTE`：只查评论、不拿它查标题和正文；标题、正文也要这样守就另记一条说正文的规则）。11-11 那三条里有一条的
+  检查存的是 `["body", "comments"]`：一条说评论的规矩，每次存档都拿去查笔记正文，近 7 天那个项目 74 版笔记里 13 版会因为它
+  收到一条和笔记无关的「建议改」。没写 `where`（默认标题 + 正文）的也一样收窄。
+- **不收窄的**：开头那一句里也点到正文 / 标题 / 笔记 / 文案 / 帖 / 话题 / 标签 / 全文 / 开头 / 结尾 / 文末 / 封面 / 配图 / 引导的
+  （`_POST_WORDS`）——那是两边都管的规则，或者说的是笔记里怎么引导评论，收窄会悄悄少查正文；靠第 3 样才算评论规则的（原文开头没说评论）；撤掉检查的 `free_text`。
+  2026-11-12 复审 C1 又加两种（`_comment_only_text` / `_comment_only_where`）：
+  - **第一句（到句号 / 分号 / 换行，逗号不算完）里点到正文 / 标题 / 笔记 / 全文 / 文末 / 文中 / 通篇 / 文案 / 贴文的**。「示例牌只在评论区出现，正文和标题不写」是说笔记的规则，
+    原来只看第一个逗号之前那半句，`where` 被改成只查评论：正文里写了不报，评论里写了（规则要它在那儿）反而报「必须改」。这里只认
+    说的只能是笔记的这几个词（`_POST_TAIL_WORDS`），不拿整张 `_POST_WORDS`：线上那条说评论的规矩第一句的后半带着「话题」这个词，
+    拿整张表它又不收窄了；「帖 / 开头 / 结尾」说评论的规矩里也常用，同样不认。「示例牌只能出现在评论区」「评论区才能提示例牌」这种
+    说词该待在哪儿的规则也不收窄（`_ONLY_IN_COMMENTS_RE`）：它的检查查的是标题和正文。
+  - **`where` 里没有 `comments` 的**。记的时候是调用方明说的（「不写求评论求关注的句子」`where: ["body"]`），照存——原来带着
+    `where` 再记一次还是被改回只查评论，想存的检查存不进去；库里已经存着的是记的时候定下的，读的时候也不再改。没写 `where` 的
+    照旧收窄、回包里说一句，模型带着 `where` 再调一次就照存（工具说明里有这句）。线上带检查的两条规则 `where` 都是
+    `["body", "comments"]`，这两种都碰不到，11-11 那一条读的时候照旧按只查评论算。
+- **只说评论的规则带 `max_len` 时不存 check**（2026-11-12 复审 C3）。字数检查只数标题 / 正文，查不了评论：「评论每条不超过三十字」
+  带着它存下去，每篇笔记存档都报「正文 N 字, 上限 30」（硬约束就是「必须改」），评论反而一条不查。现在规则原文照记，`check` 不存，
+  回包的 `check_where_note` 是 `COMMENT_LEN_CHECK_NOTE`。这条规则库里已经带着 `max_len` 的（这次改动之前记下的），再记一次时
+  一并清掉；别的种类的 check 不动。第一句里也点到正文 / 标题 / 笔记的（「评论每条不超过三十字，正文不超过
+  三百字」）照存。线上没有 `max_len` 的规则，库里不用动。
+- **库里已经存着的那一条不改库**，读的时候按同一个判据算（`_comment_check_rule`）：`score_drafts` 的 `rule_checks` 不再拿它查正文，
+  跟着笔记一起交付的评论照查；`my_rules` 的 `check` 给的是查的时候真用的那一份，和库里存的不一样时多一句 `check_note`。
+  AW 生成链路的 `validator` 读的还是库里那一行（它只看硬约束，那一条是建议级，碰不到）。
+
+#### (III) 评论位：四种评论，不是四条
+
+**为什么。** 定了配比的项目一组是 20 到 50 条，评论位只有四个。`comments_for` 的 `next_step` 原来不管哪个项目都说「按 slots 每位
+写一条…每条评论带 slot 的 id」。模型给 20 条各挂一个 id → 同一个 id 重复，`score_comments` 整个调用 400，报错还叫它「分几次判，
+或者给它们不同的 id」：分几次判，整组的条数（提品牌、中性、短评）就数不准；另编一个 id 又是一个 400。能用的那条路（多出来的
+不带 slot）只在短评那一句里带了半句。这两种 400 都在读库之前，日志里看不见，所以次数没法数；改之前在测试里照真实的工具路径
+把两种都跑了出来（`tests/test_comment_rule_reach.py` 第 6 段）。
+
+**改了三处给模型看的话**（判定逻辑一行没动）：
+
+- `comments_for.next_step`，**只在项目有在数的配比时**（`_comment_set_counts`；审计时是 3 个项目）：开头换成 `COMMENTS_FOR_SET_SLOTS`
+  「slots 是四种评论…不是只写四条: 一组不止四条时, 每个 slot 的 id 整组最多用一次, 其余的评论不带 slot」，结尾换成
+  `COMMENTS_FOR_SET_SCORE`「写完把整组放在一次 score_comments 里交(不按 slot 拆成几次; 一次最多 20 条, 超过的按顺序分段判、
+  前面判过的放进 earlier_comments…)」。没定配比的项目那一句一个字不动。
+- 两种报错：slot id 重复的说「每个 id 留一条, 其余几条去掉 slot, 整组再送一次(不用分几次判, 也不用另编 id)」，并点出是哪几个
+  id 重复；id 不认识的在原来那句后面加「不属于这几种的评论不带 slot 就行: 整组里 slot 不是这几个 id 的都去掉 slot、再送一次」
+  （2026-11-12 复审 C5：原来说「去掉它的 slot」，只点第一条，照字面做的话二十条里编了十六个 id 要被拒十六次）。
+- 整组参考（`thread_hints`）：一组里有评论不带 slot 时，判定服务回的是一句固定的话后面跟题目的 id。转给写手之前换成人话
+  （`THREAD_HINT_NAMES`），开头标「整组参考(只是参考, 不用为它重写)」。只说看到了什么（夸品牌的占了多数、几条是同一个句式、
+  没有审慎的声音、整体像安排出来的），不说该怎么改：这四道题没验收过，说成改法模型会照着重写、多出几轮。不认识的 id 原样留着。
+  几样之间用分号连（2026-11-12 复审 C7：「没有质疑、追问价格或效果这类审慎的声音」自己带着顿号，用顿号连会读成另外几样）。
+- 整组修改单（`thread_fix`）里判定服务那句「请提供每条评论的 slot 目标画像…」（2026-11-12 复审 C4）：整组里有不带 slot 的评论、
+  又传了 `max_named`、点名条数超了的时候回的就是它。照转等于叫模型把刚去掉的 slot 加回来（加回来又被拒），超了几条一个字没说。
+  回包的 `hard_fails` 里有 `named_count` 时换成一句说数的话（`_named_over_line`）：判定服务判出几条点名了品牌、是哪几条、
+  这次传的上限是几条，去掉多出来那几条里的品牌叫法、整组再判一次，不用加 slot。没有 `named_count` 的原样转。配了 `brand_max`
+  的项目不受影响（`max_named` 本来就不转给判定服务）。
+
+工具说明（不进协议的哈希）跟着改了 `comments_for` 的 comment_rules / slots 两条、`score_comments` 的 `comments` 那一段、
+`record_rule` 和 `my_rules` 各一两句。
+
+**没做的。** 不给重复的 id 另造评论位（那样每条都带位，判定服务会按位出修改单，改的东西更多）；不改 `COMMENT_SCORE_NOTE`、
+每条一行的回包和配比那几句提醒（11-11 白天刚按 owner 的话定下来）。
+
+回归：`tests/test_comment_rule_reach.py`（判据的正反例——照生产里见过的开头形状造的合成规则，交付版式的几种都是反例；
+`comments_for` 两个列表不少不重；简报里规则还在、字数那一句不补；`record_rule` 的字段和收窄、不收窄的几种；库里存着的那种
+`score_drafts` 不查正文、`my_rules` 给真用的那一份；`next_step` 两种项目；两种 slot 报错和照着做一次判成；整组参考换成人话；
+2026-11-12 复审加的：第一句后半点到正文的和明说 `where` 的不收窄、带着 `where` 再记一次照存、读的时候只收窄带 `comments` 的、
+只说评论的规则带 `max_len` 不存、停用着的回 false）。`tests/test_comment_set_score.py` 最后一段钉着点名超了那一句。
+`tests/test_deskcore_score_and_comments.py` 里钉着整组参考原话的那一条跟着改了。
+
+### 3.25 简报里的标题字数：发出去的标题大多不超过 20 字的项目，多说一句（2026-11-11，审计 A2 / A4 / 标题字数那一条）
+
+不动协议（`2d357c4b6075`，写手不用重导 skill），不加迁移，不多一次查库，不多一轮改稿。只是 `open_project` 简报里
+`recent_titles.task` 末尾在够条件时多一句话。
+
+**为什么。** `tv_edit_diffs`（`diff_rev ≥ 2`，326 对）里，写作台稿标题超过 20 字的 98 篇有 65 篇发出去之前标题被改，20 字以内的
+228 篇只有 48 篇。另一个口径（09-15 起发布的 142 对）里，超长标题被改的 55 篇有 52 篇改完落在 20 字以内，改过的 89 篇里
+24 篇只改了一个过长的标题。这件事原来只在存档之后才说得出来：存了 `max_len` 标题检查的规则由 `check_rules` 报（全局那条是软规则，协议叫模型转告用户、不自己改），
+写之前没人说。
+
+**怎么做。** `core.build_writing_brief` 挂 `recent_titles` 的地方：这一栏里 `published` 的标题够 10 条
+（`TITLE_LEN_MIN_TITLES`）、其中至少 80%（`TITLE_LEN_SHARE_PCT`，整数比较，不四舍五入）不超过 20 字（`TITLE_LEN_CAP`）时，
+`task` 后面接 `TITLE_LEN_TAIL`：「published 里的标题大多不超过 20 字（不算空白和话题）：新写的稿子标题也写在 20 字以内。
+这一句只管标题，正文篇幅不受它影响；规则或用户对标题另有要求的，照规则和用户的。」
+
+- **固定 20，不按项目算分位数。** 分位数（有的项目 p90 是 22）会把 21–22 字那一档放过去，被改得最多的正是那一档。
+- **按哪些标题算。** 就是这一栏已经拿到的 `published`：近 30 天发出去的里最近的 12–20 条（写过的那栏占掉几条，它就少几条），
+  去重、每条截到 40 字之后的那一份——模型自己也看得见这几条。不是近 30 天的全部，所以卡在八成上下的项目，这一句可能这一场有、
+  下一场没有；它只是一句参照，有没有都不拦任何东西。`drafted`、`working` 不算。
+- **数法**和 `max_len` 标题检查同一个（`rulecheck._count`，即 `validator.count_chars`：去掉空白和 #话题 再数），同一条标题两边
+  不会一个说超了一个说没超。平台自己怎么数（英文、数字、表情）没核实过，先跟现有的检查一致。
+- **不说的时候一个字不多**：发出去的标题不够 10 条（新项目、`tv-sync` 还没对上、TV 读不到），或者这个项目发出去的标题本来就
+  常超过 20 字。
+- **只是参照，不是检查。** 不进 `draft_checks`、不进 `check_rules`，不会为它多一轮改稿重存；`recent_titles.task` 原有的优先级
+  照旧（p0 / stable、发牌坐标、用户点名的都在这一栏之上，改稿不受它约束）。和简报里字数那一句（§3.22，`LENGTH_RULE_TAIL`
+  「上限照守」）同一个方向；项目规则对标题另有上限的（不管是不是 20），这一句自己写明照规则。只说标题：10-20 撤过几条
+  「写短一点」的全局规则（正文被写得太短），这一句写明正文篇幅不受它影响。
+
+**没做的。** 不在 `score_drafts` 的 `draft_checks` 里加「标题超长」一行：那条路每篇被点到的稿都要多走一轮改稿重存，而且
+同一轮里 `check_rules` 会把同一个标题按软规则报成「转告用户、别自己改」，两句话打架。也不动改稿摘要（`edit_digest`）。
+
+**怎么看有没有用（两周后，只读）。** 两个数：写作台稿每周标题超过 20 字的占比（上线前约 15%）；`tv_edit_diffs` 里按稿子标题
+长度分的标题被改率。超过 20 字的占比还在 15% 上下的话，再考虑加检查，那时要和已有的 `max_len` 标题规则去重。注意 §3.22 的
+字数那一句同一天上线，前后对比不干净。
+
+回归：`tests/test_desk_variety.py`（够 10 条且八成才说、正好八成算、19 条里 15 条不算；写过的标题不凑数；数法和 `max_len`
+标题检查逐条对得上；说和不说发给库的请求一条不差；措辞不叫模型去查、去改存过的稿、去问用户；和存了标题字数检查的硬规则并存）。
+`tests/test_protocol_release_cleanup.py` 把 `TITLE_LEN_TAIL` 收进「服务端的话不说回旧口径」那一组。
+
+### 3.26 借卡：`borrow_lessons` 也限时，并到 `open_project` 起的那次选卡上（2026-11-11，审计 A3；F-04 / AU-F09 写作台这一半）
+
+**为什么。** `open_project` 随简报借卡最多等 15 秒，到点先交简报，叫模型动笔之前用同样的参数调一次 `borrow_lessons`。
+可是 `borrow_lessons` 原来直接调借阅体，等满 `LIBRARIAN_TIMEOUT_SEC`（60 秒），客户端约 22 秒就断；它也不知道
+`open_project` 那次选卡还在后台跑，又向馆员发一次，馆员那头第一次还没写缓存，第二次就再跑一遍模型选卡。
+`truth_vault.flywheel_librarian_cache.select_ms`：10-20 以来 31 次冷选卡，14 次超过 15 秒；11-05 以来 5 次超过 22 秒
+（28.7 / 60.4 / 46.1 / 45.2 / 22.7 秒）。F-04 / AU-F09 写的触发条件是「两周内第二次冷借超过 22 秒」，早就到了。
+能确认没拿到卡的只有 11-09 一批（3 篇）；更常见的是补借那一次被客户端掐断，或者白跑第二次选卡。
+
+**现在。** 协议没动（`timeout` 时「只调这一次，还没有就照常写」原来就写着），写手和 owner 都不用做事。
+
+1. **`borrow_lessons` 最多等 `BORROW_LESSONS_WAIT_SEC`**（默认 18 秒，夹在 1–20，§4.1 的表）。走的是 `open_project` 用的那一层
+   `core._borrow_for_brief_bounded`，多了三个参数：`arm=`（`borrow_lessons` 已经定好的臂，沿用模型传回的那个；这一层不再发
+   一次臂）、`carry=`（同一场接着借，记规律条数时和前面那次取大的，§3.12）、`followup=`（到点时回哪一句、指标里记哪个名字）。
+   分臂和规律条数那套账还是原来那两笔、原来的顺序；只多一种情形：到点没等到 = 这次交出去 0 条 / 0 张（后台之后选完的不算，
+   模型没看到）。原来等满 60 秒时，客户端早断了，选完的规律条数却照样记成「给出去了」。
+2. **到点回一句新的话**（`core.BORROW_STILL_SELECTING_NOTE`）：`status` 还是 `timeout`，`detail` 是「卡还在选，这次没等到。
+   照常写就行，不用再调 borrow_lessons，也别跟用户说没有可借的经验。」简报超时那句（`BORROW_TIMEOUT_NOTE`）是叫模型去调
+   `borrow_lessons` 的，放在 `borrow_lessons` 自己的回包里模型会再调一轮，所以不能原样用。
+3. **正在跑的选卡记在进程里**（`core._borrows_running`）：键是（项目，发给馆员那份 brief 的 sha256，臂），值是那次选卡的
+   future。同一个键再来的（`borrow_lessons` 跟在 `open_project` 后面、同一份简报开了两次）不新起，等同一个 future，
+   各拿一份拷贝。
+   - 键里有臂：探索臂那次选卡不带规律，两个臂不能并到一起。键里没有身份：同一个项目、同一份 brief、同一个臂选出来的是同
+     一批卡（TV 的缓存键也不分人）；谁并上去，账都记在他自己的（项目，身份）下，不动别人的。
+   - 选卡跑完（成了、抛了都算）在它自己线程的 `finally` 里摘掉，先摘、后交结果。等的人到点只是不等了，不取消、不摘：
+     选卡照样跑完，TV 照样写缓存，这期间再来的人还并得上。线程起不来的不登记；brief 拼不出来的不合并。
+   - 借阅体承诺不抛；真抛了，等它的每个人各自按 `error` 回，不往外抛。
+   - 起跑超过 `LIBRARIAN_TIMEOUT_SEC` 再加 10 秒还没回来的那一条当成卡死的线程，不再往上并，另起一次、把表里那条换掉。
+4. **存档那一行指标**（§3.8 的 `flywheel_lessons`）：`borrow_lessons` 到点没等到的那次记成 `followup_timeout`（只在这一行；
+   回包里是 `timeout`）。`shown_max = 0` 而且 `statuses` 里有 `followup_timeout` 的批次 = 没参照过卡、补借也没等到（`statuses` 是近 12 小时
+   这个项目、这个身份所有借卡的合计，光看它会把同一天后来拿到卡的批次也数进去，§3.8）。
+
+**没做的、要知道的。**
+- 合并只在这一个进程里有效（deskcore 单进程）。重启就没了，退回原来的样子：再发一次，多半命中 TV 的缓存。TV 那头的同款合并、
+  重试和超时是 AU-F09 的另一半，在 TV 仓库做。
+- 并上去的那次不向馆员发请求，TV 的 `flywheel_librarian_cache.last_hit_at` 也就不动。拿那一列等于 `created_at` 来推
+  「卡没被再读过」会更不准；看卡到没到模型手里，用 `flywheel_lessons`。
+- 选卡要 45 秒以上的那几场，补借照样等不到（18 秒）。区别是模型拿到一句正常的「照常写」，不是一次被掐断的调用，也不再多跑
+  一次选卡。没卡的场数不会因此变少，§3.8 那条查询的 `no_cards` / `followup_timed_out` 看得出有多少。
+- 预热（夜里或定时按项目先选一遍）没做：预热的行要带 `consumer = deskcore` 才命中，通道 2 那盏灯就再也看不出
+  `open_project` 的借卡断没断；走现成的借阅体还会往发臂记录里写一条没人写稿的臂。
+
+回归：`tests/test_borrow_lessons_deadline.py`（到点回那句话、选卡不取消；上限的默认值和夹子；并到 `open_project` 那次上只发
+一次请求；两个人同时等各拿各的拷贝；臂 / brief / 项目不同的不并；等的人走了之后选完会摘、不改任何记录；选卡抛了每个人按
+`error` 回并且摘掉；线程起不来不登记；晚到的收尾只摘自己那条；卡死的不并；显式的臂不再发一次；到点的补借和前面取大的；
+并到别人那次上不动别人的账；存档那一行的 `followup_timeout`）。`tests/test_open_project_borrow_budget.py` 里原来钉
+「`borrow_lessons` 等满 `LIBRARIAN_TIMEOUT_SEC`」的那条改成了「不被 `open_project` 的预算截断」。`tests/conftest.py`
+每条用例从一张空表开始。
+
+### 3.27 查重取候选先走四字串的索引（2026-11-11，W-21 / AU-F08，`019`）
+
+**为什么。** 一组 10 篇在历史多的项目里存档要等十秒上下，其中六到七成花在两条查重 RPC 上（§3.8 的 `commit_parts_ms`：
+`gate` 和 `fingerprints`），而同一条 RPC 在 `check_drafts` 里还要先跑一遍。慢在取候选的那一步：
+`WHERE f.project_id = _project_id AND f.ngram_hashes && ng`，计划器按项目索引取出整个项目的行，再逐行比 `&&`，
+四字串的 GIN 索引（`draft_fp_ngram_gin_idx`，`001` 起就在）从来轮不上。耗时跟项目的历史条数和稿子的 hash 数一起涨。
+
+**现在。** `migrations/019_dedup_gin_first.sql` 只换 `deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 里的这一步：
+
+```sql
+WITH cand AS MATERIALIZED (
+    SELECT f.title, f.ngram_hashes AS hs, f.project_id AS pid
+      FROM autowriter.draft_fingerprints f
+     WHERE f.ngram_hashes && (SELECT ng)
+)
+...  FROM cand c ...  WHERE c.pid = _project_id AND array_length(c.hs, 1) IS NOT NULL
+```
+
+还是那三个条件，只是先按四字串从全库取命中的行、再筛项目，所以候选集不变，查重的结论不变。判定公式、阈值、签名、
+返回列、授权都没动，Python 一行没改；跑之前和跑之后写作台都照常用，写手和模型看不出区别，只是等得短。两个记号缺一不可：
+
+- `MATERIALIZED`：不让项目条件推回 CTE 里。推回去就又是按项目索引取全项目、逐行比。
+- `(SELECT ng)`：把数组的值对计划器藏起来。plpgsql 里每条连接头 5 次执行用定制计划，直接写 `ng` 的话计划器按实际数组
+  估行数（估成三分之一以上的行会命中），选全表顺序扫描，一篇要 3 秒以上。拿 `OFFSET 0` 当栅栏的写法同样走到顺序扫描，不能用。
+
+**量过的（11-11，生产库只读；新写法是把这一步照抄成普通 SQL 跑的）。** 全库 7,782 条指纹，最大的项目 1,163 条。
+
+| | 原来 | 新写法 |
+|---|---|---|
+| 89 个 hash 的一篇，取候选这一步（最大的项目） | 366 毫秒，读 1,163 行留 11 行 | 8 毫秒，同样 11 行 |
+| 400 个 hash 的一篇（最大的项目） | 整条函数 1,560 毫秒 | 取候选 33 毫秒 |
+| 最大的项目最近 10 篇一起查 | 3,677 毫秒 | 341 毫秒 |
+| 只有 2 条指纹的项目，217 个 hash 的一篇 | 整条函数 6 毫秒 | 取候选 21 毫秒 |
+| 数组直接写 `ng`（没有 `(SELECT …)`），89 个 hash | — | 顺序扫描，3,225 毫秒 |
+
+10 组（一篇的 sketch × 一个项目）逐行比过候选集，也比过线上函数的输出和新写法的输出（`best_j` / `j_title` / `best_c` /
+`c_title` / `c_sample`），全部相同：大项目、有一百多行空数组的项目、只有两三行的项目、整个项目都是空数组的、sketch 自己
+是空数组的、拿别的项目的稿子来查的。本地 PostgreSQL 16 上另用 9,162 行合成指纹把新旧两版函数各调了 200 篇
+（check 全列、commit 的 status / collided_with / detail），逐行相同；同一条连接里连调 8 次（头 5 次是定制计划，之后是
+通用计划）取候选都走 GIN，新连接的第 1 次调用和后面一样快。
+
+**没做的、要知道的。**
+- **要 owner 在 SQL Editor 跑一次 `019`**（两条 `CREATE OR REPLACE FUNCTION`，不碰数据）。没跑之前一切照旧，只是没变快。
+  跑完怎么核、怎么退都写在迁移文件末尾，runbook §1.15 也有。
+- **小项目会慢一点。** GIN 的钱跟全库命中的行数走，不跟项目走：二三十条指纹以下的项目这一步原来是 1 毫秒级，现在每篇
+  10~20 毫秒（10 篇一组三次 RPC 合计多不到 1 秒）。全库涨到几万行时要再看一次这一步。
+- **计划不在 CI 里断言。** 计划器走不走 GIN 还看表的大小：CI 的夹具只有几行，它对小表本来就选顺序扫描，写法对不对都
+  一样。CI 钉的是写法（两个记号都在代码里、019 相对 `008` / `005` 只换了这一步）和结果（逐例对 Python，外加「别的
+  项目里的同一篇不算」）；计划在生产库上跑完之后核一次。生产库今天的成本是 GIN 206 对顺序扫描 627。
+- 入库那条 RPC 里逐条循环取最大值时，分数完全相同的两条历史稿报哪一条的标题取决于行的读出顺序，原来也没有排序；
+  判拦不拦不受影响。`check_drafts` 那条有明确的排序，不受影响。
+- commit 段里每篇六次串行读写（`mint` / `consume` / `snapshots`）没动，那是另一件事。
+
+回归：`tests/test_dedup_gin_first.py`（两个记号在 `019` 和基线的两条函数里各出现一次、在同一个 CTE 里、项目条件在读
+`cand` 的那一层；没有 `OFFSET 0`、没有直接写 `ng` 的 `&&`；`CREATE` 到 `AS $$` 与 `008` / `005` 逐字节相同；把 `019` 的
+那一步换回去等于上一版的代码；文件里除了两条函数和它们的授权没有别的语句；校验和回滚都在文件里）。
+`tests/test_baseline_parity.py` 的登记改成 `019`。`tests/test_migration_doctor.py`：`019` 报 `unprobeable`、交出查两个
+记号的 SQL、不让报告变红、不为它多调一次 RPC。`tests/sql_parity_check.py`（CI 的真 PostgreSQL）：两个记号在最终的
+函数体里；别的项目里的同一篇 check 不算、commit 不拦。
+
+### 3.28 两个读数：牌面到没到稿子和帖子里，对不上的帖是不是在别处写的（2026-11-11，审计 F1 / F4）
+
+都是给负责人和工程看的读数。写手那边一个字没变：工具回包、`next_step`、协议都没动，判定、补录、发牌也都没动。
+
+**一、`draw-report` 多三项：牌面对不对得上。** 发牌靠牌面的坐标（内容形式、情绪杠杆、标题句式）改变写出来的东西，
+效果数据也是通过抽牌的权重回到写作里的。可原来的报表只有写了 / 发了 / 留着 / 撞车，没有一个数说牌面的坐标到没到
+稿子和帖子里。11-11 手工连了一次（牌 → 销账的版本 → 对上的 TV 笔记 → TV 的标签）：112 篇发出去的帖里，牌面的内容
+形式和标签一样的 16 篇（14%，碰巧一样是 17%），杠杆一样的 24 篇（21%，碰巧 8%）。这个数以后报表自己出。
+
+| 项 | 比的是什么 | 什么时候读得到 |
+|---|---|---|
+| `a_form` | 牌面的内容形式 = TV 给发出去那一篇打的 `content_format` | 销账的那一版对上了 TV 的笔记（同 M2 的对照），标签在词表里 |
+| `a_lever` | 牌面的情绪杠杆 = TV 给发出去那一篇打的 `emotional_lever` | 同上 |
+| `a_title` | 牌面的标题句式是不是「疑问句」= Jev 对销账那一版答的「标题是不是问句」 | 销了账、Jev 答过就有，**不用等发出去** |
+
+- 读不到的记 `None`、不进分母（词表外的值、TV 还没打标签、Jev 没答、没销账），不是 0。这三项不等 D+8：发出去才有标签、
+  销了账才有答案，没有的本来就不在分母里。
+- **chance（碰巧）怎么算。** 每个比例旁边带一个 chance：同一组牌里，假如牌面和结果互不相干，两边碰巧一样的比例。
+  只看这一组里这一项读得到的牌，数出牌面各取值的占比 p(v) 和结果各取值的占比 q(v)，chance = Σ p(v)·q(v)。
+  牌面六种形式各占 1/6 时，不管结果怎么分布都是 1/6；结果九成是同一种、牌面三成是那一种时接近三成。比例比 chance
+  高出来的那一截才是牌面起的作用。报表末尾有一句同样的说明（`drawreport.CHANCE_NOTE`）。
+- **怎么读。** 标签和答案都是模型跑一遍给的，重跑一致不一致没测过：看比例比 chance 高多少、看几周的走向，别看单周；
+  一组只有几张牌时 chance 自己也不稳。杠杆本来就只是个松的引子（W-45），高出一截就算到了；内容形式和标题句式是硬坐标。
+  发牌 v2 发出去的样本今天只有 6 篇，`a_form` / `a_lever` 还要几周才读得出；`a_title` 现在就能用（v2 销了账的 81 张）。
+- **在哪儿。** `table`（来源 × 项目 × 周）每行多这三项；`by_source` 每个来源多这三项；新的
+  `adherence.by_source_week` 是来源 × 周（各项目并在一起，三项都读不到的组不列）。文字版在来源那张表下面多一块，
+  每个来源一行「全部」、下面每周一行，格子是「对上 / 读得到的（比例，碰巧 chance）」；一项都读不到就不印这一块。
+- **多读了什么。** `store.report_note_outcomes` 多取 `emotional_lever`（`content_format` 本来就取了）；
+  `store.report_title_answers` 读销账版本在 `title_is_question` 上的答案，和简报的 `recent_structure` 同一个读法
+  （只认 Jev 的行、题目版本要对得上、同一题几行取最后抽的），只取答案列、不取 `evidence`。两样读挂了报表照出，
+  CLI 说一句是哪几列这次不算。
+- 没做的：审计里提过「标题句式和牌面不一样时在 `score_drafts` 里提一句」。那会让稿子多改一轮，等这个读数出来再说。
+
+**二、对不上的帖也记一个分数（`tv_note_links.score`）。** 接住率低有两种原因，以前分不出：帖是拿写作台的稿子改的
+（改的地方值得看），还是根本在别处写的（版式、规则怎么调都动不了它）。11-11 的只读核对：三个项目 545 篇没接住的帖里
+542 篇和写作台任何一稿的四字串重合不到 15%，是后一种。可 `unmatched` / `ingested` 行的 `score` 一律是 NULL（生产库
+3129 行），每次要回答这个问题都得手工重算。
+
+- `tvlink.match_note` 对不上时把它本来就算过的最高包含度带出来（`Match.score`）：帖的四字串有多少在时间窗里最像的
+  那一版里。时间窗里一版都没有是 0.0；帖太短（不到 15 个四字串）没得比，留 `None`。只是借了开头的那一版（F02）
+  照样不连，但算进这个分数——它说的是帖的文字有多少出自写作台，不是能不能连上，所以可以高过 0.30。
+- 只查过重、没存档的稿子也是写作台的稿子：`tvlink.match_snapshot` 对不上时同样带上最高包含度，`tv-sync` 取两边
+  看过的最大值（`miss_score`）。对上了底稿、这晚没转成版本而记 `unmatched` 的，分数是和那份底稿的包含度。
+- `tv-sync` 把它记进这晚写的 `unmatched` / `ingested` 行的 `score`（保留三位小数）。没正文的行照旧 NULL。
+  对上了的几档、`ambiguous` 的 `score` 不变；`tv-resolve --ingest` 人工补录的那一行照旧 NULL。
+- **只是读数。** 哪一条走补录、连到哪一版、报表里的计数都不变；没有任何地方按这个分数做判断（读 `score` 的只有
+  F04 那一处，它只看 `title_exact`）。
+- **没有迁移。** `score` 列 `009` 就有，`REAL`、可空（11-11 在生产库的 `information_schema` 核过）。
+- **老行。** `ingested` 是终态、不重对，以前补录的行不会回头补分数，NULL 读作「没算过」。没有补录目标的项目
+  （W-10）以前记的 `unmatched` 没有分数：头一晚各重写一次把分数补上，之后分数没变的照旧不重写（`_same_miss_score`
+  按三位小数比，库里读回来的单精度尾巴不算变了）。有补录目标的项目里还挂着的 `unmatched` 本来就每晚重写。
+- **怎么读**（TV 那边的灯按这个口径读，写作台不读它）：不到 0.15 是在别处写的，0.30 以上是拿写作台的稿子改的，
+  NULL 是没算过或没得比。查数见 runbook §1.5。
+
+回归：`tests/test_draw_report.py`（三项各自什么时候是 `None`；chance 等于两边占比的乘积之和、只用读得到的牌；
+`table` / `by_source` / `adherence.by_source_week` 和文字版都带比例和 chance；CLI 多读的两样不取正文和 `evidence`、
+读挂了说哪几列不算；`report_title_answers` 的读法）。`tests/test_tv_link_miss_score.py`（对不上带最高包含度、太短是
+`None`、空窗口是 0.0、借了开头的也算；底稿那一路同样；`ingested` / `unmatched` 行记分数而判定和补录不变；W-10 的老行
+重写一次之后不再写；从没存档的底稿改出来的帖按底稿记分）。原有用例一条没改期望。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -1425,13 +1982,16 @@ env：
 | `DESKCORE_KEYS` | 生产必需 | `{"k-xxx": {"user_id": "<团队身份的 uuid>", "name": "Ziao"}}`。钥匙一人一把，`user_id` 全填团队身份（2026-11-02 D-136）；加写手就加一行，见 runbook「加一个写手」 |
 | `GOOGLE_API_KEY` | 强烈建议 | embedding。不设则查重降级为纯确定性 |
 | `LIBRARIAN_URL` / `LIBRARIAN_API_KEY` | 可选 | 借爆款经验卡；不设则 `open_project` 的 `lessons` 与 `borrow_lessons` 都返回空，`status` 为 `not_configured`，服务日志记 WARN。馆员回 200 但 `status` 是 `degraded` / `error`（TV 侧选卡失败）记 `error` 不记 `empty` |
-| `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `15`（2026-10-30 起，原 10；最近冷借 14–18 秒），夹在 1–20。`open_project` 随简报借卡**最多等这么久**，而且不超过整次回包目标 `OPEN_PROJECT_RESPONSE_BUDGET_SEC`（20 秒，不开 env）扣掉借阅之前已用的时间和借阅之后几步的预留（`core.OPEN_PROJECT_TAIL_RESERVE_SEC`，2.5 秒）剩下的那段；到点先交简报（`lessons_status.status=timeout`，`detail` 里叫模型动笔之前用同样的参数调一次 `borrow_lessons`，命中缓存即回；只调一次，还没有就照常写）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具本身仍等满 `LIBRARIAN_TIMEOUT_SEC`（默认 60），2026-10-30 起也收 `extra_instructions`（它在馆员的缓存键里） |
+| `OPEN_PROJECT_BORROW_SEC` | 可选 | 默认 `15`（2026-10-30 起，原 10；最近冷借 14–18 秒），夹在 1–20。`open_project` 随简报借卡**最多等这么久**，而且不超过整次回包目标 `OPEN_PROJECT_RESPONSE_BUDGET_SEC`（20 秒，不开 env）扣掉借阅之前已用的时间和借阅之后几步的预留（`core.OPEN_PROJECT_TAIL_RESERVE_SEC`，2.5 秒）剩下的那段；到点先交简报（`lessons_status.status=timeout`，`detail` 里叫模型动笔之前用同样的参数调一次 `borrow_lessons`，命中缓存即回；只调一次，还没有就照常写）；借阅线程继续跑完，TV 那边照样写缓存。MCP 客户端只容忍 ~22 秒，超过的是整份简报连 P0 一起丢。`borrow_lessons` 工具有自己的等待上限（下一行；2026-11-11 之前等满 `LIBRARIAN_TIMEOUT_SEC`），2026-10-30 起也收 `extra_instructions`（它在馆员的缓存键里） |
+| `BORROW_LESSONS_WAIT_SEC` | 可选 | 默认 `18`（2026-11-11），夹在 1–20。`borrow_lessons` **最多等这么久**：同一个（项目、brief、臂）的选卡还在跑（多半是 `open_project` 起的那次）就等它，不向馆员发第二次；到点回 `status=timeout`，`detail` 是「卡还在选，照常写，不用再调」，选卡不取消、选完照样进 TV 的缓存。馆员那次请求自己的超时还是 `LIBRARIAN_TIMEOUT_SEC`（默认 60），不跟着改（§3.26） |
 | `JUDGE_URL` / `JUDGE_API_KEY` | 可选 | 入库判定（§3.8，影子期）。key 发在 `X-Judge-Key` 头里；它是自定义格式，登记在 `logger_utils` 的值级脱敏名单里（judge 的错误体会被抄进 detail / 遥测 / `batch_metrics`）。不设则 `commit_drafts` 照常，返回里每篇 `judge_status=not_configured`，一个请求都不发、一次库都不多查。⚠️ 设了也要项目接上 `tv_project_map` 才会发（出境口径要 TV 项目号） |
 | `JUDGE_TIMEOUT_SEC` | 可选 | 默认 `8`，夹在 1–15（写坏了、`nan` / `inf` 都退回默认）。**整批判定的共同截止**，不是每篇各 8 秒；入库慢时实际截止更短（整次 commit 回包目标 20 秒，见 §3.8，J-08） |
 | `JUDGE_MAX_WORKERS` | 可选 | 默认 `8`，夹在 1–16（同上，写坏了退回默认）。一次 commit 同时发几篇 |
 | `RULE_COMPILE_TIMEOUT_SEC` | 可选 | 默认 `420`，夹在 60–900。规则编译（§3.11）一次请求的读超时；Jev 最坏约 361 秒，所以至少 400。只有后台线程和 CLI 用它 |
 | `RULE_COMPILE_BATCH` | 可选 | 默认 `60`，夹在 1–60（Jev 的上限）。一次编几条 |
 | `RULE_COMPILE_AUTO` | 可选 | 默认开。`0` 关掉 `open_project` / `record_rule` / `check_rules` 触发的后台补编，只剩 `cli compile-rules`。上线补编（`compile-rules --all`）那一阵要先设 `0`，跑完再去掉：CLI 和服务进程的后台补编不共用锁，同时编会付两遍钱（§3.11） |
+| `RULE_SWEEP_AUTO` | 可选 | 默认开。`0` 关掉存档之后的规则补查（给这个项目还没有规则题答案的旧稿在后台补一轮 `check_rules`，每次存档最多 20 版，只花 Jev 规则题的钱，写手看不到；见「规则检查的后台补查」）。改稿的后台复查不受它管 |
+| `DESKCORE_TOOL_CALL_LOG` | 可选 | 默认开。`0` 关掉「每次工具调用留一行只有数的记录」（§3.8 末尾）：一行不写，别的都不变 |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔。设了才开 MCP 的 Host 校验；不设=不校验（见 §5） |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。不设=允许全部——**这是安全的**，身份靠显式传的 key 而非 cookie，浏览器不会自动附上（见 §5.5） |
 
@@ -1448,8 +2008,8 @@ env：
 `008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql` /
 `011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql` / `014_tv_edit_diff_rev.sql` /
 `015_rule_compiles.sql` / `016_tv_notes_skip_vanished.sql` / `017_tv_link_text_fp.sql` /
-`018_draft_snapshots.sql`
-**十八个，按编号顺序跑，别跳号**（建议先在
+`018_draft_snapshots.sql` / `019_dedup_gin_first.sql`
+**十九个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -1483,6 +2043,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
 - `016_tv_notes_skip_vanished.sql`（2026-10-26，I-22）：`deskcore_tv_notes` 不再返回飞书里已删的篇（TV 的 `truth_vault.v_notes_vanished`，D-103），§3.7 表里「飞书已删」那一行。只换函数体，签名不变；视图不在就照旧全给。**静默错答**，和 `008` 同类：不跑不报错，已删的篇每晚照样被读回来重对，项目有补录目标时对不上的会被补录成副本。所以**先跑 016，再打开有已删篇的 TV 项目的补录目标**（10-26：BJS_phase1 挪走了 79 篇成人藻油，其中 14 篇是 unmatched）。`doctor` 报 `unprobeable` 并给出查函数体和视图的 SQL。
+- `019_dedup_gin_first.sql`（2026-11-11，W-21 / AU-F08）：`deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 取候选先走四字串的 GIN 索引、再筛项目（§3.27）。只换函数体里这一步，签名、返回列、结论都不变，不碰数据。**不跑不坏，只是慢**（千行的项目每篇约 0.4 秒，10 篇一组三处各等 3~5 秒）；代码不依赖它，先于或后于部署都行。`doctor` 探不到函数体，报 `unprobeable` 并给出查两个记号的 SQL；跑完用文件末尾那句 `EXPLAIN` 核一次。
 - `018_draft_snapshots.sql`（2026-10-29，W-38）：`draft_snapshots`，`check_drafts` 查过的每篇稿子（标题、正文、`angle_key`、查重结论、飞轮臂），§3.7 表里「查重底稿」那一行。只授 `service_role`、开 RLS、不建 policy（存的是稿子全文），留 60 天。**可降级，但先跑 018 再部署**：代码先上线时 `check_drafts` 照常判（记底稿那一步失败只记 WARN），tv-sync 跳过底稿那一步、照旧补录；可同一次部署已经不再催模型存档，那段时间只查了重的稿子发出去会被补录成副本（终态）。`doctor` 探这张表。
 - `017_tv_link_text_fp.sql`（2026-10-27，W-34）：`tv_note_links.tv_text_fp`（TV 正文的指纹）+ `deskcore_tv_clear_lineage`（撤回写作台自己写进 TV 的血缘：两列都还等于传进来那一对才清，返回清了的 `note_id`），§3.7 表里「正文换了」那一行。**硬失败、不写错数据**：代码先上线的话 tv-sync 读对照选不到新列，每个 TV 项目都失败、退出码 1、一行不写——所以**先跑 017 再部署**。`doctor` 探列和 RPC。
 - `015_rule_compiles.sql`（2026-10-20，D-121）：`rule_compiles`，规则编译结果的缓存，键 (`memory_id`, `sha`)（§3.11）。只授 `service_role`、开 RLS。**可降级**：不跑的话 `compile-rules` 和后台补编在读缓存这一步就报 error（记 WARN，一条都不发给 Jev，不花编译的钱），`check_rules` 回 `status: error`、记 ERROR 日志（写手那边是这次规则没查成、不能说守住了，存档已成功、交付不受影响；不是 500，10-20 第三轮复审：原来直接抛，REST 是 500、MCP 是工具错误，服务端一行日志都没有），简报和存档不受影响。`doctor` 探这张表。

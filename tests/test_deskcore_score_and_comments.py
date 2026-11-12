@@ -275,7 +275,8 @@ def test_slots_by_id_and_the_reply_picks_up_the_question(wired):
         "Jev 题干里的「帖子里」转给写手之前换掉(2026-11-10), 提到帖子的那句补一句评论里不提帖子(2026-11-11)"
     assert "fix" not in out["comments"][1]
     assert out["thread_fix"] == ["位 q1: 评论区没有摩擦：这一位改成审慎的追问"]
-    assert out["thread_hints"] == ["评论区参考题（未验收）不理想：praise_share"]
+    assert out["thread_hints"] == ["整组参考(只是参考, 不用为它重写): 夸品牌的评论占了多数"], \
+        "题目的 id 换成人话, 标明只是参考(2026-11-11, tests/test_comment_rule_reach.py)"
     assert "ledger_rows" not in out and "profile" not in out, "回包压过, 不把整份判定原样灌给模型"
 
 

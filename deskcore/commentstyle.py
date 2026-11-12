@@ -122,25 +122,39 @@ def _vague_refs(t: str) -> list[str]:
     return out
 
 
-def issues(text: str) -> list[str]:
-    """一条评论 → 写法底线上要改的地方(空表 = 没问题)。只看文字, 不调模型。"""
+ISSUE_KINDS = ("period", "dialect", "contact", "post_ref", "vague")
+
+
+def _keyed_issues(text: str) -> list[tuple[str, str]]:
+    """``issues`` 的那几句, 每句带上是哪一样(``ISSUE_KINDS`` 里的词): ``[(哪一样, 要改的那一句), ...]``。"""
     t = text or ""
     out = []
     if _PERIOD.search(t):
-        out.append("去掉句号: 句末不加, 句中要停顿用逗号或空格")
+        out.append(("period", "去掉句号: 句末不加, 句中要停顿用逗号或空格"))
     dialect = "".join(f"「{w}」" for w in dict.fromkeys(m.group(0) for m in _DIALECT.finditer(t)))
     if dialect:
-        out.append(f"{dialect}是方言语气词, 换成普通话口语(比如「吗」「呀」), 或者不要")
+        out.append(("dialect", f"{dialect}是方言语气词, 换成普通话口语(比如「吗」「呀」), 或者不要"))
     contact = "".join(f"「{w}」" for w in dict.fromkeys(m.group(0).strip() for m in _CONTACT.finditer(t)))
     if contact:
-        out.append(f"去掉{contact}: 像在要联系方式, 平台会判引流")
+        out.append(("contact", f"去掉{contact}: 像在要联系方式, 平台会判引流"))
     post = "".join(f"「{w}」" for w in dict.fromkeys(m.group(0) for m in _POST_REF.finditer(t)))
     if post:
-        out.append(f"去掉{post}: 评论里不提帖子, 直接说那件事(「帖子说的 X」「这帖的 X」→ 直接说 X)")
+        out.append(("post_ref", f"去掉{post}: 评论里不提帖子, 直接说那件事(「帖子说的 X」「这帖的 X」→ 直接说 X)"))
     vague = "".join(f"「{w}」" for w in dict.fromkeys(_vague_refs(t)))
     if vague:
-        out.append(f"{vague}是含糊的指代, 读者不知道指的是哪一栏、哪一次、哪件事: 直接把那件事说出来")
+        out.append(("vague", f"{vague}是含糊的指代, 读者不知道指的是哪一栏、哪一次、哪件事: 直接把那件事说出来"))
     return out
+
+
+def issues(text: str) -> list[str]:
+    """一条评论 → 写法底线上要改的地方(空表 = 没问题)。只看文字, 不调模型。"""
+    return [line for _kind, line in _keyed_issues(text)]
+
+
+def issue_kinds(text: str) -> list[str]:
+    """一条评论踩了写法底线的哪几样(``ISSUE_KINDS`` 里的词, 顺序同 ``issues``)。只给调用留痕按样数条数用(calllog),
+    不带评论里的任何字。"""
+    return [kind for kind, _line in _keyed_issues(text)]
 
 
 # ── 一组评论里以品牌评价收尾的条数(2026-11-09) ──────────────────────────────────────────────────────────────

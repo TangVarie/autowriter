@@ -210,20 +210,32 @@ def test_legacy_rows_without_draw_are_their_own_source():
     assert dr.card_rows([row], now=NOW)[0]["src"] == "legacy"
 
 
-def test_cli_reads_only_and_reports(monkeypatch, capsys):
-    rows = [_card(i, src="w" if i % 2 else "x", consumed_after=1) for i in range(1, 7)]
+def _jev(vid, answer, *, q="title_is_question", qv=1, extractor="jev:a", at="2026-11-10T00:00:00+00:00",
+         st="aw_version", bank="fq-v0.1"):
+    return {"subject_type": st, "subject_id": vid, "run_tag": "primary", "bank_version": bank, "question_id": q,
+            "question_version": qv, "answer": answer, "extractor": extractor, "extracted_at": at,
+            "evidence": "不该被取"}
+
+
+def _cli_client(rows):
     for r in rows:
         r["drawn_at"] = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
         r["consumed_at"] = (datetime.now(timezone.utc) - timedelta(days=9)).isoformat()
-    c = FakeClient(rows={
+    return FakeClient(rows={
         "angle_ledger": rows,
         "tv_note_links": [{"note_id": "n1", "version_id": "v1", "match_kind": "body_exact"}],
         "tv_edit_diffs": [{"note_id": "n1", "title_changed": False, "draft_chars": 400, "published_chars": 400}],
         "draft_snapshots": [{"id": "s1", "project_id": P1, "angle_key": rows[0]["angle_key"], "status": "warn",
                              "checked_at": datetime.now(timezone.utc).isoformat(), "title": "不该被取", "body": "不该被取"}],
         "truth_vault.notes": [{"note_id": "n1", "publish_time": _iso(20), "comments_count": 22, "tier": None,
-                               "raw_content": "不该被取"}],
+                               "content_format": "情感叙事", "emotional_lever": "愤怒撬动", "raw_content": "不该被取"}],
+        "truth_vault.note_feature_answers": [_jev("v1", "是"), _jev("v2", "否"), _jev("v3", "是")],
     })
+
+
+def test_cli_reads_only_and_reports(monkeypatch, capsys):
+    rows = [_card(i, src="w" if i % 2 else "x", consumed_after=1) for i in range(1, 7)]
+    c = _cli_client(rows)
 
     class Args:
         days, project, json = 28, None, True
@@ -235,6 +247,149 @@ def test_cli_reads_only_and_reports(monkeypatch, capsys):
     assert "title" not in snap["cols"] and "body" not in snap["cols"]
     notes = next(x for x in c.calls if x["table"] == "truth_vault.notes")
     assert "raw_content" not in notes["cols"] and "title" not in notes["cols"]
+    # 2026-11-11(审计 F1): 多读两样 —— 发出去那篇的两个标签, 销账那一版「标题是不是问句」的答案(不取 evidence)
+    assert "emotional_lever" in notes["cols"] and "content_format" in notes["cols"]
+    ans = next(x for x in c.calls if x["table"] == "truth_vault.note_feature_answers")
+    assert "evidence" not in ans["cols"] and ("eq", "subject_type", "aw_version") in set(ans["filters"])
+    import json as _json
+    rep = _json.loads(out[out.index("{"):])
+    w = rep["by_source"]["w"]
+    # v1 发出去了: 牌面「提问求助」对标签「情感叙事」不一样, 杠杆一样; 标题: 牌面都是疑问句, v1 / v3 答「是」, v5 没答
+    assert w["a_form"] == {"n": 1, "y": 0, "rate": 0.0, "chance": 0.0}
+    assert w["a_lever"] == {"n": 1, "y": 1, "rate": 1.0, "chance": 1.0}
+    assert w["a_title"] == {"n": 2, "y": 2, "rate": 1.0, "chance": 1.0}
+    assert rep["by_source"]["x"]["a_title"] == {"n": 1, "y": 0, "rate": 0.0, "chance": 0.0}
+    assert "碰巧" in rep["adherence"]["chance"]
+
+
+def test_cli_says_which_columns_are_missing_when_a_reader_fails(monkeypatch, capsys):
+    """发出去那篇的标签、稿子标题的答案读不到: 报表照出, 那几列空着(None, 不是 0), 并且说一句是哪几列。"""
+    from deskcore import store
+    c = _cli_client([_card(i, consumed_after=1) for i in range(1, 4)])
+    monkeypatch.setattr(store, "report_note_outcomes", lambda *a, **k: None)
+    monkeypatch.setattr(store, "report_title_answers", lambda *a, **k: None)
+
+    class Args:
+        days, project, json = 28, None, False
+    assert cli._draw_report(c, Args) == 0
+    out = capsys.readouterr().out
+    assert "内容形式 / 情绪杠杆两列这次不算" in out and "标题问句那一列这次不算" in out
+    assert "牌面对不对得上" not in out, "三项都读不到就不印那一块"
+
+
+# ── 牌面对不对得上(2026-11-11, 审计 F1): a_form / a_lever / a_title 和 chance ─────────────────────────────
+
+def test_card_adherence_fields_and_when_they_are_unreadable():
+    rows = [_card(i, consumed_after=1, days=2) for i in range(1, 8)]         # 才 2 天: M2 还读不到, 这三项不等
+    rows[1]["dims"]["content_format"] = "情感叙事"
+    rows[2]["dims"]["title_structure"] = "场景直述"
+    rows[3]["dims"]["title_structure"] = "不在词表里的句式"
+    rows.append(_card(8, days=2))                                           # 没销账
+    adoption = {"by_version": {f"v{i}": {"note_id": f"n{i}"} for i in (1, 2, 3, 4, 5)}}
+    notes = {"n1": {"content_format": "提问求助", "emotional_lever": "愤怒撬动"},
+             "n2": {"content_format": "提问求助", "emotional_lever": "共鸣释放"},
+             "n3": {"content_format": None, "emotional_lever": "愤怒撬动"},          # TV 还没打内容形式
+             "n4": {"content_format": "乱写的", "emotional_lever": ""}}             # 词表外 / 空: 当没有; n5 没读到
+    titles = {"v1": "是", "v2": "否", "v3": "否", "v4": "是", "v6": "是", "v7": "不是答案"}
+    cards = {c["key"][-1]: c for c in dr.card_rows(rows, adoption=adoption, notes=notes, title_answers=titles, now=NOW)}
+    assert all(c["m2"] is None for c in cards.values())
+    assert [cards[k]["a_form"] for k in "12345678"] == [1, 0, None, None, None, None, None, None]
+    assert [cards[k]["a_lever"] for k in "12345678"] == [1, 0, 1, None, None, None, None, None]
+    # 标题是稿子这一层: 没发出去的 v6 也有; 牌面非问句 + 答「否」算对上; 牌面句式不在词表、答案不是 是 / 否、没销账 → None
+    assert [cards[k]["a_title"] for k in "12345678"] == [1, 0, 1, None, None, 1, None, None]
+    assert cards["2"]["adh"] == {"a_form": ("情感叙事", "提问求助"), "a_lever": ("愤怒撬动", "共鸣释放"),
+                                 "a_title": (True, False)}
+    # 不给 notes / title_answers(读挂了): 三项都是 None, 不是 0
+    bare = dr.card_rows(rows, adoption=adoption, now=NOW)
+    assert all(c[m] is None for c in bare for m in dr.ADHERENCE)
+
+
+def _adh_rows():
+    """10 张发出去的 w 牌(同一周): 牌面 6 张提问求助 + 4 张情感叙事, 标签 9 张提问求助 + 1 张情感叙事; 牌面标题 5 问 5 不问,
+    答案 8 张「是」。"""
+    rows, notes, titles = [], {}, {}
+    for i in range(1, 11):
+        r = _card(i, consumed_after=1)
+        r["dims"]["content_format"] = "提问求助" if i <= 6 else "情感叙事"
+        r["dims"]["title_structure"] = "疑问句" if i <= 5 else "数字清单"
+        rows.append(r)
+        notes[f"n{i}"] = {"content_format": "情感叙事" if i == 7 else "提问求助", "emotional_lever": "共鸣释放"}
+        titles[f"v{i}"] = "是" if i <= 8 else "否"
+    return rows, {"by_version": {f"v{i}": {"note_id": f"n{i}"} for i in range(1, 11)}}, notes, titles
+
+
+def test_chance_is_the_product_of_the_two_marginals_within_the_group():
+    rows, adoption, notes, titles = _adh_rows()
+    cards = dr.card_rows(rows, adoption=adoption, notes=notes, title_answers=titles, now=NOW)
+    # 内容形式: 对上 6 + 1 = 7; chance = 0.6·0.9 + 0.4·0.1 = 0.58
+    assert dr._adherence(cards, "a_form") == {"n": 10, "y": 7, "rate": 0.7, "chance": 0.58}
+    # 杠杆: 牌面全是愤怒撬动, 标签全是共鸣释放 → 一张都对不上, chance 也是 0
+    assert dr._adherence(cards, "a_lever") == {"n": 10, "y": 0, "rate": 0.0, "chance": 0.0}
+    # 标题: 牌面问 5 张都答是, 牌面不问的 5 张里 2 张答否 → 7; chance = 0.5·0.8 + 0.5·0.2 = 0.5
+    assert dr._adherence(cards, "a_title") == {"n": 10, "y": 7, "rate": 0.7, "chance": 0.5}
+    assert dr._adherence([], "a_form") == {"n": 0, "y": 0, "rate": None, "chance": None}
+    # 只用两边都读得到的牌: 去掉一半的标签, 分母和 chance 都只按剩下的 5 张(牌面全是提问求助, 标签也全是)
+    half = dr.card_rows(rows, adoption=adoption, notes={k: v for k, v in notes.items() if k in ("n1", "n2", "n3", "n4", "n5")},
+                        title_answers=titles, now=NOW)
+    assert dr._adherence(half, "a_form") == {"n": 5, "y": 5, "rate": 1.0, "chance": 1.0}
+
+
+def test_table_and_report_print_the_three_rates_beside_chance_per_source_and_week():
+    rows, adoption, notes, titles = _adh_rows()
+    for r in rows[5:]:                                    # 后 5 张是上一周抽的
+        r["drawn_at"], r["consumed_at"] = _iso(17), _iso(16)
+    x = _card(11, src="x", project=P2, consumed_after=1)
+    x["dims"]["title_structure"] = "数字清单"
+    titles["v11"] = "否"
+    rep = dr.report(rows + [x, _card(12, src="pin")], adoption=adoption, notes=notes, title_answers=titles, now=NOW)
+    tab = {(r["src"], r["project"], r["week"]): r for r in rep["table"]}
+    wk_new, wk_old = dr._week(dr._ts(_iso(10))), dr._week(dr._ts(_iso(17)))
+    assert tab[("w", P1, wk_new)]["a_form"] == {"n": 5, "y": 5, "rate": 1.0, "chance": 1.0}
+    assert tab[("w", P1, wk_old)]["a_form"] == {"n": 5, "y": 2, "rate": 0.4, "chance": 0.32}    # .2·.8 + .8·.2
+    assert tab[("w", P1, wk_old)]["a_title"] == {"n": 5, "y": 2, "rate": 0.4, "chance": 0.4}
+    assert rep["by_source"]["w"]["a_form"] == {"n": 10, "y": 7, "rate": 0.7, "chance": 0.58}
+    by_week = {(r["src"], r["week"]): r for r in rep["adherence"]["by_source_week"]}
+    assert set(by_week) == {("w", wk_new), ("w", wk_old), ("x", wk_new)}, "三项都读不到的组(pin)不列"
+    assert by_week[("x", wk_new)]["a_title"] == {"n": 1, "y": 1, "rate": 1.0, "chance": 1.0}
+    assert by_week[("x", wk_new)]["a_form"]["n"] == 0
+    text = dr.format_report(rep)
+    block = text[text.index("牌面对不对得上"):text.index("比较(Mantel")]
+    assert "7/10 (70%, 碰巧 58%)" in block and "7/10 (70%, 碰巧 50%)" in block      # w 全部: 内容形式、标题问句
+    assert f"{wk_old}" in block and "2/5 (40%, 碰巧 32%)" in block                 # w 上一周
+    assert "1/1 (100%, 碰巧 100%)" in block and "0/0" in block                     # x: 只有标题读得到
+    assert "pin" not in block
+    assert dr.CHANCE_NOTE in text and "牌面是它的占比 × 结果是它的占比" in dr.CHANCE_NOTE, "报表里说清 chance 怎么算的"
+    # 一项都读不到(没有对照、没有答案): 不印这一块, 原来的几行照旧
+    plain = dr.format_report(dr.report(rows, now=NOW))
+    assert "牌面对不对得上" not in plain and "比较(Mantel" in plain
+
+
+def test_report_title_answers_reads_like_recent_structure():
+    """store.report_title_answers: 只认 Jev 对写作台版本的行、题目版本对得上、同一版几行取最后抽的; 一次 .in_() 的 id 封顶;
+    读挂了回 None。"""
+    from deskcore import store
+    vids = [f"v{i:03d}" for i in range(200)]
+    rows = [_jev(v, "是") for v in vids]
+    rows += [_jev("v000", "否", extractor="jev:b", at="2026-11-11T00:00:00+00:00"),     # 后抽的赢
+             _jev("v001", "否", extractor="tv:x", at="2026-11-11T00:00:00+00:00"),      # 不是 Jev 的行
+             _jev("v002", "否", qv=2, at="2026-11-11T00:00:00+00:00"),                  # 题目版本不对
+             _jev("v003", "否", st="note", at="2026-11-11T00:00:00+00:00"),             # TV 笔记的答案
+             _jev("v004", "否", q="turning_point", qv=2, at="2026-11-11T00:00:00+00:00"),
+             _jev("zzz", "是")]                                                          # 没问的版本
+    c = FakeClient(rows={"truth_vault.note_feature_answers": rows})
+    got = store.report_title_answers(c, vids + ["v000", None])
+    assert set(got) == set(vids) and got["v000"] == "否"
+    assert all(got[v] == "是" for v in vids[1:])
+    sel = [x for x in c.calls if x["table"] == "truth_vault.note_feature_answers"]
+    for q in sel:
+        assert len(next(f[2] for f in q["filters"] if f[:2] == ("in", "subject_id"))) <= store.STRUCTURE_VERSIONS_MAX
+        assert "evidence" not in q["cols"]
+    assert store.report_title_answers(c, []) == {}
+
+    class Broken(FakeClient):
+        def schema(self, name):
+            raise RuntimeError("connection reset")
+    assert store.report_title_answers(Broken(rows={}), ["v1"]) is None
 
 
 

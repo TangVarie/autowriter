@@ -5,6 +5,7 @@
   · sha 与 Jev ``rules.rule_sha`` 逐字节一致, 拼题库与 Jev ``rules.to_project_bank`` 逐字节一致(期望值是 Jev 那边对
     合成样例算出来、抄在这里的 —— 两边一漂, 缓存永远命中不了、每次都重编白花钱);
   · 已经有 (id, sha) 一行的不再发; 原文改了 sha 变、重编; ``force`` 全部重编; 带 error 的不存、报出来; 一批 ≤ 60 条;
+  · 没编出来的拆成每次 ≤ 3 条马上重发一次(2026-11-11), 重发还失败的才记失败; 整批被挡 / 读超时不重发;
   · Jev 那边怎么失败都不抛(超时 / 出境口径 / 没接 tv-map / 没配), 回报告; 被挡下的后面几批不发;
   · 后台补编: 每个项目同时一个线程、冷却之内不重复起, open_project / record_rule 不等它; record_rule 不等冷却;
   · CLI compile-rules 一个项目一行计数, 没编成退出码 1; --all 里 owner 的 global 规则一次运行只发一次(--force、--dry-run
@@ -288,11 +289,13 @@ def test_error_rows_are_reported_not_stored(jev):
     assert rep["status"] == "partial" and rep["compiled"] == 1
     assert [e["memory_id"] for e in rep["errors"]] == [r2["id"]] and "示例原因" in rep["errors"][0]["error"]
     assert [r["memory_id"] for r in c.rows["rule_compiles"]] == [r1["id"]], "带 error 的不存, 下次再编"
+    # 2026-11-11: 带 error 的那条马上单独重发了一次(第 2 个请求), 还是失败才记失败
+    assert len(jev.compile_calls()) == 2 and (rep["resent"], rep["recovered"]) == (1, 0)
     # 后台路径: 刚失败过的同一版本这次不再发(每编一次都花钱); CLI 路径照常重发
     rep = core.compile_rules(c, PROJ, skip_recent_failures=True)
-    assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 1
+    assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 2
     core.compile_rules(c, PROJ)
-    assert len(jev.compile_calls()) == 2 and [r["id"] for r in jev.compile_calls()[-1]["json"]["rules"]] == [r2["id"]]
+    assert len(jev.compile_calls()) == 4 and [r["id"] for r in jev.compile_calls()[-1]["json"]["rules"]] == [r2["id"]]
 
 
 def test_sha_mismatch_is_not_stored(jev):
@@ -301,6 +304,166 @@ def test_sha_mismatch_is_not_stored(jev):
     rep = core.compile_rules(c, PROJ)
     assert rep["status"] == "error" and "对不上" in rep["errors"][0]["error"]
     assert c.rows["rule_compiles"] == []
+    assert len(jev.compile_calls()) == 1 and "resent" not in rep, "两边算法漂了, 重发也一样: 不重发"
+
+
+# ── 没编出来的拆小重发(2026-11-11, 审计 A5 / JP-5) ─────────────────────────────────
+
+def _error_result(r: dict, error: str) -> dict:
+    return {"id": r["id"], "sha": jev_sha(r["text"], r.get("applicability")), "verdict": None, "code": None,
+            "questions": [], "coverage": None, "uncovered": "", "why": "", "error": error}
+
+
+def _batch_of_ten_fails_on(jev, monkeypatch, poison: set[str],
+                           error: str = "模型输出不合格（已重试一次）：示例原因, 带一句示例规则原文") -> None:
+    """假 Jev 学真 Jev 的一点: 一次请求里只要有 ``poison`` 里的规则, 这次请求的每一条都带 error(一批一次模型调用)。"""
+    plain = FakeJev().compile_one
+    real_post = jev.post
+
+    def post(url, *, headers=None, json=None, timeout=None, **kw):
+        if url.endswith("/compile_rules"):
+            hit = any(r["id"] in poison for r in json["rules"])
+            jev.compile_one = (lambda r: _error_result(r, error)) if hit else plain
+        return real_post(url, headers=headers, json=json, timeout=timeout, **kw)
+    monkeypatch.setattr(requests, "post", post)
+
+
+def test_a_failed_batch_is_resent_in_chunks_of_three_and_only_the_bad_rule_is_held(jev, monkeypatch, caplog):
+    """10 条里 1 条让模型输出不合格, Jev 把这一批 10 条都带 error 回来。原来 10 条一起记失败, 6 小时后原样再发、再一起失败。"""
+    rules = [mem(i, severity="hard") for i in range(1, 11)]
+    c = make_client(rules)
+    bad = rules[4]["id"]
+    _batch_of_ten_fails_on(jev, monkeypatch, {bad})
+    with caplog.at_level("WARNING", logger="deskcore.core"):
+        rep = core.compile_rules(c, PROJ)
+    sizes = [len(x["json"]["rules"]) for x in jev.compile_calls()]
+    assert sizes == [10, 3, 3, 3, 1], "一批 10 条最多多发 4 次请求, 每次 ≤ 3 条"
+    resent = [r["id"] for x in jev.compile_calls()[1:] for r in x["json"]["rules"]]
+    assert resent == [r["id"] for r in rules], "每条只重发一次, 顺序不变"
+    in_bad_chunk = {r["id"] for r in rules[3:6]}                # 和那一条同一小批的两条这次也没编出来
+    assert rep["status"] == "partial" and rep["compiled"] == 7
+    assert (rep["resent"], rep["recovered"]) == (10, 7)
+    assert {e["memory_id"] for e in rep["errors"]} == in_bad_chunk
+    assert {r["memory_id"] for r in c.rows["rule_compiles"]} == {r["id"] for r in rules} - in_bad_chunk
+    assert {k[0] for k in core._RULE_COMPILE_FAILED} == in_bad_chunk, "只有重发还失败的才记失败"
+    # 一行 WARNING: 规则 id 前 8 位 + 失败的归类, 不带规则原文, 也不带 Jev 的错误原文
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "WARNING" and "拆小重发" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "bad_output" in lines[0] and all(i[:8] in lines[0] for i in in_bad_chunk)
+    assert not any(i in lines[0] for i in in_bad_chunk), "只有前 8 位"
+    for leak in ("示例规则", "示例原因", "模型输出不合格"):
+        assert leak not in lines[0], leak
+    # 后台下一轮: 只扣这 3 条, 别的 7 条已经在缓存里
+    rep = core.compile_rules(c, PROJ, skip_recent_failures=True)
+    assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 3 and rep["cached"] == 7
+    assert len(jev.compile_calls()) == 5
+
+
+def test_a_whole_batch_failure_is_resent_and_a_full_recovery_is_ok(jev, caplog):
+    """Jev 一条都没编出来回 502(不是被挡、不是读超时): 同样拆小重发; 重发都编出来了, 这次就是 ok, 谁也不记失败。"""
+    rules = [mem(i) for i in range(1, 6)]
+    c = make_client(rules)
+    jev.compile_detail = "规则一条都没编出来：生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded"
+    jev.compile_status_fn = lambda body: 502 if len(body["rules"]) > 3 else 200      # 那一下没通, 重发就过了
+    with caplog.at_level("INFO", logger="deskcore.core"):
+        rep = core.compile_rules(c, PROJ)
+    assert [len(x["json"]["rules"]) for x in jev.compile_calls()] == [5, 3, 2]
+    assert rep["status"] == "ok" and rep["compiled"] == 5 and rep["errors"] == []
+    assert (rep["resent"], rep["recovered"]) == (5, 5)
+    assert rep["batch_errors"][0]["status"] == "jev_failed", "第一次整批没成留在报告里"
+    assert core._RULE_COMPILE_FAILED == {}
+    assert not [r for r in caplog.records if r.levelname == "WARNING" and "拆小重发" in r.getMessage()]
+
+
+def test_a_whole_batch_failure_that_fails_again_keeps_the_batch_status_and_names_the_kind(jev, caplog):
+    c = make_client([mem(1), mem(2)])
+    jev.compile_status = 502
+    jev.compile_detail = "规则一条都没编出来：生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded"
+    with caplog.at_level("WARNING", logger="deskcore.core"):
+        rep = core.compile_rules(c, PROJ)
+    assert rep["status"] == "jev_failed" and rep["compiled"] == 0 and len(jev.compile_calls()) == 2
+    assert {k[0] for k in core._RULE_COMPILE_FAILED} == {mid(1), mid(2)}
+    (line,) = [r.getMessage() for r in caplog.records if "拆小重发" in r.getMessage()]
+    assert "generator_http_529" in line and mid(1)[:8] in line and "overloaded" not in line
+
+
+@pytest.mark.parametrize("how, status", [("timeout", "timeout"), ("blocked", "policy_blocked")])
+def test_a_resend_that_hits_a_timeout_or_a_block_stops_the_run(jev, monkeypatch, how, status):
+    """重发的小请求撞上读超时 / 整批被挡: 同主循环, 整次运行停, 后面的小批和后面几批都不发; 没重发成的照第一次的失败记。"""
+    rules = [mem(i) for i in range(1, 8)]
+    c = make_client(rules)
+    monkeypatch.setattr(config, "RULE_COMPILE_BATCH", 5)
+    jev.compile_one = lambda r: _error_result(r, "模型输出不合格（已重试一次）：示例原因")
+    real_post = requests.post
+
+    def post(url, **kw):
+        if url.endswith("/compile_rules") and len(jev.compile_calls()) == 1:         # 第 2 个请求 = 第一小批重发
+            if how == "timeout":
+                jev.calls.append({"url": url, "headers": kw.get("headers"), "json": kw.get("json"),
+                                  "timeout": kw.get("timeout")})
+                raise requests.Timeout("read timed out (synthetic)")
+            jev.compile_status, jev.compile_detail = 403, "policy: 示例项目没清出境"
+        return real_post(url, **kw)
+    monkeypatch.setattr(requests, "post", post)
+    seen: set = set()
+    rep = core.compile_rules(c, PROJ, seen=seen)
+    assert [len(x["json"]["rules"]) for x in jev.compile_calls()] == [5, 3], "后面那一小批和第二批都没发"
+    assert rep["status"] == status and rep["stopped_by"] == status and rep["not_sent"] == 2 and rep["compiled"] == 0
+    assert {k[0] for k in core._RULE_COMPILE_FAILED} == {r["id"] for r in rules[:5]}, "第一批 5 条照第一次的失败记"
+    assert (core._RULE_COMPILE_JEV["slow_until"] > time.monotonic()) is (how == "timeout")
+    assert len(seen) == (3 if how == "timeout" else 0), "读超时的那一小批算发过了(Jev 多半还在编)"
+
+
+def test_the_resend_stops_when_its_time_budget_is_used_up(jev, monkeypatch):
+    """Jev 的生成端慢的时候每个小请求都要等到它自己超时: 一次 compile_rules 里重发只花 RULE_COMPILE_RESEND_BUDGET_SEC,
+    到点剩下的照第一次的失败记, 不再发。"""
+    rules = [mem(i) for i in range(1, 8)]
+    c = make_client(rules)
+    jev.compile_one = lambda r: _error_result(r, "生成端调用失败：TimeoutError: 示例")
+    clock = {"t": 1000.0}
+
+    class _Clock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def monotonic(self) -> float:
+            return clock["t"]
+    monkeypatch.setattr(core, "time", _Clock())
+    real_post = requests.post
+
+    def post(url, **kw):
+        clock["t"] += core.RULE_COMPILE_RESEND_BUDGET_SEC * 0.6          # 每个请求都很慢
+        return real_post(url, **kw)
+    monkeypatch.setattr(requests, "post", post)
+    rep = core.compile_rules(c, PROJ)
+    assert [len(x["json"]["rules"]) for x in jev.compile_calls()] == [7, 3, 3], "第三小批没发: 预算用完了"
+    assert rep["status"] == "error" and len(rep["errors"]) == 7
+    assert {k[0] for k in core._RULE_COMPILE_FAILED} == {r["id"] for r in rules}
+
+
+def test_cli_says_how_many_were_resent_and_recovered(jev, monkeypatch, capsys):
+    rules = [mem(i) for i in range(1, 6)]
+    c = make_client(rules)
+    monkeypatch.setattr(core, "sb", lambda: c)
+    _batch_of_ten_fails_on(jev, monkeypatch, {rules[0]["id"]})
+    assert cli.main(["compile-rules", "--project", PROJ]) == 1, "还有没编出来的: 退出码照旧是 1"
+    out = capsys.readouterr().out
+    assert "没编出来的 5 条拆成每次 ≤ 3 条重发了一次, 又编出 2 条" in out and "[partial]" in out
+
+
+@pytest.mark.parametrize("error, status, kind", [
+    # 和存档指标里的 error_kinds 是同一套词(tests/test_commit_side_meta.py 钉着另外几种)
+    ("生成端调用失败：GeneratorHTTPError: HTTP 529 overloaded", None, "generator_http_529"),
+    ("生成端调用失败：GeneratorStopped: 模型拒答（stop_reason=refusal）", None, "refusal"),
+    ("HTTP 502: 规则一条都没编出来：模型输出不合格（已重试一次）：示例", "jev_failed", "bad_output"),
+    ("没有编出结果", None, "no_result"),
+    ("Jev 的回包里没有这条", None, "missing_in_response"),
+    ("HTTP 502: 失败", "jev_failed", "jev_failed"),
+    ("说不上来的示例错误", None, "other"),
+    (None, None, "other"),
+])
+def test_compile_error_kind_is_a_short_word_never_the_text(error, status, kind):
+    assert core._compile_error_kind(error, status) == kind
 
 
 def test_batches_hold_at_most_60_rules(jev):
@@ -335,7 +498,10 @@ def test_jev_failure_never_raises(jev, make_fail, status):
         # 2026-10-20 复审: 读超时过了 Jev 最坏的 ~361 秒, 超时那批多半还在 Jev 那边编、照样计费; 再发后面几批只是多付钱
         assert len(jev.compile_calls()) == 1 and rep["not_sent"] == 10 and rep["stopped_by"] == "timeout"
     else:
-        assert len(jev.compile_calls()) == 2, "Jev 回了 502(答了、几乎没花钱)只算这一批, 下一批照发"
+        # Jev 回了 502(答了、几乎没花钱)只算这一批, 下一批照发; 2026-11-11 起每批没编出来的再拆成 ≤ 3 条各重发一次
+        sizes = [len(x["json"]["rules"]) for x in jev.compile_calls()]
+        assert sizes == [60] + [3] * 20 + [10] + [3, 3, 3, 1], "被挡 / 读超时的那两种上面钉了: 不重发"
+        assert rep["resent"] == 70 and rep["recovered"] == 0 and len(rep["errors"]) == 70
 
 
 def test_not_configured_and_no_tv_map_send_nothing(jev, monkeypatch):
@@ -1020,10 +1186,11 @@ def test_a_free_generator_overload_is_retried_after_half_an_hour_not_six(jev, mo
     jev.compile_status, jev.compile_one = 200, FakeJev().compile_one             # Jev 好了
     monkeypatch.setattr(core, "time", _Later(31 * 60))                          # 半小时多一点之后
     rep = core.compile_rules(c, PROJ, skip_recent_failures=True)
+    # 第一次: 1 个请求 + 马上单独重发的 1 个(2026-11-11), 记的是重发那次的失败
     if retried:
-        assert rep["status"] == "ok" and rep["compiled"] == 1 and len(jev.compile_calls()) == 2
+        assert rep["status"] == "ok" and rep["compiled"] == 1 and len(jev.compile_calls()) == 3
     else:
-        assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 1
+        assert rep["status"] == "up_to_date" and rep["held_after_failure"] == 1 and len(jev.compile_calls()) == 2
 
 
 def test_global_activation_uses_an_owned_mapped_project(monkeypatch):
@@ -1042,3 +1209,138 @@ def test_global_activation_without_an_owned_mapped_project_starts_nothing(monkey
     rule = mem(19, status='candidate', scope='global')
     core.set_rule_state(make_client([rule], maps=False), rule['id'], 'promote', user_id=ME)
     assert kicks == []
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 只问评论 / 话题的规则题(2026-11-11, 审计 S2 / JP-1): check_rules 手里只有标题和正文, 这种题不发
+# ══════════════════════════════════════════════════════════════════════
+
+def _questions_result(rule_id: str, sha: str, *qs: dict) -> dict:
+    """一条规则编成几道题(question_result 只给一道)。qs: {"ask", "pass_if", "scope", "note"?}。"""
+    full = [{"note": "示例要点", **q} for q in qs]
+    return {"id": rule_id, "sha": sha, "verdict": "questions", "code": None,
+            "questions": [{"qid": jev_qid(rule_id, sha, n, q), **q} for n, q in enumerate(full, 1)],
+            "coverage": "full", "uncovered": "", "why": "要读懂内容"}
+
+
+Q_COMMENT = {"ask": "评论里有没有带上示例品牌名？", "pass_if": "是", "scope": "full"}
+Q_COMMENT_2 = {"ask": "评论区是不是只有一条示例评论？", "pass_if": "否", "scope": "full"}
+Q_TAGS = {"ask": "话题里有没有带上示例话题？", "pass_if": "是", "scope": "full"}
+Q_BODY = {"ask": "正文有没有出现虚构的示例宣称？", "pass_if": "否", "scope": "body"}
+Q_BODY_OR_COMMENT = {"ask": "正文或评论里有没有替示例机构背书？", "pass_if": "否", "scope": "full"}
+Q_TITLE_HOOK = {"ask": "有没有借热门话题引起好奇？", "pass_if": "是", "scope": "title"}
+
+
+def test_a_comment_only_rule_loses_every_question():
+    res = _questions_result(mid(1), "0" * 12, Q_COMMENT, Q_COMMENT_2, Q_TAGS)
+    assert rulecompile.unseen_questions(res) == res["questions"], "题面只提评论 / 话题的三道都不发"
+
+
+def test_a_mixed_rule_loses_only_the_comment_question():
+    res = _questions_result(mid(1), "0" * 12, Q_COMMENT, Q_BODY)
+    before = json.loads(json.dumps(res, ensure_ascii=False))
+    assert rulecompile.unseen_questions(res) == [res["questions"][0]]
+    assert res == before, "纯函数: 不改编译结果(缓存行别的地方还要用)"
+
+
+def test_a_body_question_that_mentions_comments_is_still_asked():
+    """「正文或评论里有没有…」是正文的题: 提到了 正文 / 标题 / 全文 的不算只问评论。scope 标了 title / body 的也不算 ——
+    那是编译时就指明只看标题 / 正文的题, 题面里的「话题」「标签」不是话题行。"""
+    res = _questions_result(mid(1), "0" * 12, Q_BODY_OR_COMMENT, Q_BODY, Q_TITLE_HOOK,
+                            {"ask": "标题有没有话题钩子？", "pass_if": "是", "scope": "full"},
+                            {"ask": "全文(含评论)有没有出现示例禁词？", "pass_if": "否", "scope": "full"})
+    assert rulecompile.unseen_questions(res) == []
+
+
+@pytest.mark.parametrize("ask", [
+    "结尾有没有引导读者去评论区留言或互动？",
+    "有没有叫读者到评论区找示例链接？",
+    "有没有写「评论区见」「评论区告诉我」这类求互动的话？",
+    "有没有涉及示例类的敏感话题？",
+    "这篇稿子里有没有蹭当下的热门话题？",
+    "有没有给某类人群贴标签、搞对立？",
+    "有没有给自己立示例人设标签？",
+    # codex review on aw#153 ── 开头的评论和正文 / 标题并列着问: 正文那一半看得见, 照问(和「正文或评论里…」一样)
+    "评论或正文里有没有替示例机构背书？",
+    "评论区和标题有没有出现示例禁词？",
+    "评论、正文里有没有报示例价格？",
+])
+def test_a_body_question_that_only_uses_the_words_in_passing_is_still_asked(ask):
+    """2026-11-12 复审 R3: 「评论区」是正文把读者往那儿引的去处(去 / 到 / 来 / 往评论区…, 评论区见 / 评论区告诉我)、「话题」
+    「标签」是平常的意思(敏感话题、贴标签)时, 这是正文的题。原来按字认成只问评论的, 不发, 这条硬规则报成「查不了」。"""
+    res = _questions_result(mid(1), "0" * 12, {"ask": ask, "pass_if": "否", "scope": "full"})
+    assert rulecompile.unseen_questions(res) == []
+
+
+@pytest.mark.parametrize("ask", ["话题行有没有带上示例话题？", "标签里有没有示例词？", "有没有带上示例话题标签？",
+                                 "每条评论是不是都带了示例品牌名？", "有没有哪条评论报了示例价格？"])
+def test_questions_about_the_topic_line_or_the_comments_are_still_dropped(ask):
+    res = _questions_result(mid(1), "0" * 12, {"ask": ask, "pass_if": "是", "scope": "full"})
+    assert rulecompile.unseen_questions(res) == res["questions"]
+
+
+@pytest.mark.parametrize("ask, pass_if", [("评论里有没有呼应正文提到的场景？", "是"),
+                                          ("评论区是不是完全没有接住正文里的求助？", "否"),
+                                          ("  那条评论有没有重复标题里的示例词？", "否")])
+def test_a_question_whose_subject_is_the_comments_is_dropped_even_if_it_names_the_body(ask, pass_if):
+    """2026-11-12 复审 R4: 题面以评论开头(问的是评论)、后面又提到正文 / 标题的, 原来因为带了「正文」照发 —— Jev 对着没有
+    评论的稿子答, 硬规则篇篇「必须改」, 和 11-11 那 15 篇里 15 篇是同一种。「正文或评论里有没有…」开头是正文, 照问。"""
+    res = _questions_result(mid(1), "0" * 12, {"ask": ask, "pass_if": pass_if, "scope": "full"}, Q_BODY_OR_COMMENT)
+    assert rulecompile.unseen_questions(res) == [res["questions"][0]]
+
+
+def test_unseen_questions_ignores_results_it_cannot_read():
+    code = code_result(mid(1), "0" * 12, {"kind": "forbidden_word", "words": ["示例词"], "where": "comments"})
+    assert rulecompile.unseen_questions(code) == [], "code 那边由 code_rules 按 where 拦"
+    assert rulecompile.unseen_questions(None) == [] and rulecompile.unseen_questions({"verdict": "questions"}) == []
+    bad = _questions_result(mid(1), "0" * 12, Q_COMMENT)
+    bad["questions"] += ["不是题", {"qid": "x", "ask": None}]
+    assert rulecompile.unseen_questions(bad) == [bad["questions"][0]], "形状不对的题不归这里管(project_bank 会跳过并记下)"
+    assert rulecompile.unseen_questions(dict(bad, error="模型输出不合格")) == []
+
+
+def test_read_answers_keeps_one_flag_per_rule_and_prefers_the_one_with_evidence():
+    """一条规则编成两道意思相近的题, 两道都没守住: 只报一条, 留带依据句的那条(2026-11-11, 审计 JP-6)。"""
+    qs = {"a_1": {"rule_id": "r1", "severity": "soft", "ask": "有没有写出时长？", "pass_if": "是", "note": ""},
+          "a_2": {"rule_id": "r1", "severity": "soft", "ask": "有没有把时长写得含糊？", "pass_if": "否", "note": ""},
+          "b_1": {"rule_id": "r2", "severity": "hard", "ask": "有没有写示例宣称？", "pass_if": "否", "note": ""}}
+    got = rulecompile.read_answers(qs, {
+        "a_1": {"answer": "否", "p": 0.9, "ambiguous": False},
+        "a_2": {"answer": "是", "p": 0.8, "ambiguous": False, "evidence": "过了一阵子就好了。"},
+        "b_1": {"answer": "是", "p": 0.95, "ambiguous": False, "evidence": "这是一句示例宣称。"}})
+    assert [(e["rule_id"], e.get("evidence")) for e in got["violations"]] == [
+        ("r1", "过了一阵子就好了。"), ("r2", "这是一句示例宣称。")]
+    # 都不带依据句: 留先出现的那条
+    got = rulecompile.read_answers(qs, {"a_1": {"answer": "否", "p": 0.9, "ambiguous": False},
+                                        "a_2": {"answer": "是", "p": 0.8, "ambiguous": False}})
+    assert [e["what"] for e in got["violations"]] == ["建议改: 有没有写出时长？(判了「否」)"]
+
+
+def test_read_answers_keeps_every_distinct_flag_of_a_hard_rule():
+    """2026-11-12 复审 R1: 硬约束的两道题问的是两件事、都没守住时, 原来只报一件, 另一句要改的话回包里哪儿都没有, 条数也
+    不算它 —— 「必须改」全列就成了假话。硬约束只并指着同一句依据的; 软规则照旧一条规则一条。"""
+    qs = {"h_1": {"rule_id": "r1", "severity": "hard", "ask": "有没有把示例甲款说成小号？", "pass_if": "否", "note": ""},
+          "h_2": {"rule_id": "r1", "severity": "hard", "ask": "有没有把示例乙款说成大号？", "pass_if": "否", "note": ""},
+          "h_3": {"rule_id": "r1", "severity": "hard", "ask": "有没有写明示例甲款是大号？", "pass_if": "是", "note": ""},
+          "s_1": {"rule_id": "r2", "severity": "soft", "ask": "有没有写出时长？", "pass_if": "是", "note": ""},
+          "s_2": {"rule_id": "r2", "severity": "soft", "ask": "有没有把时长写得含糊？", "pass_if": "否", "note": ""}}
+    yes = {"answer": "是", "p": 0.9, "ambiguous": False}
+    got = rulecompile.read_answers(qs, {
+        "h_1": {**yes, "evidence": "甲款是小号的那个。"}, "h_2": {**yes, "evidence": "乙款是大号的那个。"},
+        "h_3": {"answer": "否", "p": 0.9, "ambiguous": False},
+        "s_1": {"answer": "否", "p": 0.9, "ambiguous": False}, "s_2": {**yes, "evidence": "过了一阵子就好了。"}})
+    assert [(e["rule_id"], e.get("evidence")) for e in got["violations"]] == [
+        ("r1", "甲款是小号的那个。"), ("r1", "乙款是大号的那个。"), ("r1", None), ("r2", "过了一阵子就好了。")]
+    # 两道题指着同一句: 是同一件事, 只报一条
+    got = rulecompile.read_answers(qs, {"h_1": {**yes, "evidence": "甲款小乙款大。"},
+                                        "h_2": {**yes, "evidence": "甲款小乙款大。"}})
+    assert [e["what"] for e in got["violations"]] == ["必须改: 有没有把示例甲款说成小号？(判了「是」)"]
+
+
+def test_read_answers_marks_which_way_an_unsure_answer_leans():
+    qs = {"a_1": {"rule_id": "r1", "severity": "soft", "ask": "有没有写出时长？", "pass_if": "是", "note": "写出时长"},
+          "b_1": {"rule_id": "r2", "severity": "hard", "ask": "有没有写示例宣称？", "pass_if": "否", "note": ""}}
+    got = rulecompile.read_answers(qs, {"a_1": {"answer": "是", "p": 0.6, "ambiguous": False},
+                                        "b_1": {"answer": "是", "p": 0.55, "ambiguous": True}})
+    assert [(e["rule_id"], e["violated"], e["point"]) for e in got["unsure"]] == [
+        ("r1", False, "写出时长"), ("r2", True, "有没有写示例宣称？")]

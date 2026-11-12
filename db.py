@@ -1951,6 +1951,10 @@ def list_batch_metrics(
 
     ``user_id`` 仅作为缓存 key 用（RLS 已经按行过滤）。不传也能用，但同
     一会话内多账户切换时可能拿到上一个账户缓存的结果——所以建议传。
+
+    只读 ``batch_id`` 不为空的行（2026-11-11）：这张表里还有写作台的两种行，``batch_id`` 都是 NULL ——
+    每次存档一行（``meta.mode = 'deskcore_commit'``）、每次工具调用一行（``meta.mode = 'tool_call'``，一天几十到几百行）。
+    历史页按 batch_id 把指标挂到批次上，本来就用不到它们；不在库里筛掉的话，最近 N 条会被它们占满，真正的批次指标排不进来。
     """
     if not project_id:
         return []
@@ -1959,6 +1963,7 @@ def list_batch_metrics(
             _client.table("batch_metrics")
             .select("*")
             .eq("project_id", project_id)
+            .not_.is_("batch_id", "null")
             .order("created_at", desc=True)
             .limit(limit)
             .execute()

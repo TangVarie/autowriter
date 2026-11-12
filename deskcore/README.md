@@ -12,14 +12,14 @@
 > **2026-10-19 · D-120 写手侧改版**（写作台工具面以这一段为准，下面表格里的旧行保留作历史）：
 > - 写完过 `check_drafts` 就调 **`score_drafts`**：存档（指纹、销角度、底稿）+ Jev 参考分（满分 100，每篇最多 3 条修改建议），**不拦交付**。`commit_drafts` 是它的旧名，过渡期保留。2026-11-10 起同一批里的重复说法和正文里混进来的版式残留带 `draft_checks`（先改再交）、开头一样的带 `batch_hints`（只提示），见 `docs/deskcore.md` §3.21。
 > - **`review_drafts` / `export_drafts` 两个工具撤了**：定稿由写手贴进飞书，发布后 `tv-sync` 按内容对回来（core 里的函数保留，不再暴露给模型）。
-> - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
+> - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。评论规则不只认「评论区：」开头：开头那一句说的是评论、或存的检查查评论的也算（2026-11-11，`docs/deskcore.md` §3.24）；评论位是四种评论，一组不止四条时其余的不带 slot。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
 
 > **2026-11-11**：项目定的评论配比写手可以在对话里改（**`set_comment_mix`**，只在用户明说时调；列改不了；留最近 20 次的记录）。钥匙对不上时 401 自己说收到的那一串长什么样，`/health` 多一块 `auth_rejections`（按固定的几个原因数被拒的请求，没有钥匙的任何一部分）。见 `docs/deskcore.md` §3.23。
 
 > **2026-10-20 · D-121 写完按规则逐篇查**：规则由 Jev（`POST /compile_rules`）编成是非题 / 代码检查，按（规则 id, sha）缓存进
 > `rule_compiles`（`migrations/015`）；`score_drafts` 之后调 **`check_rules(version_ids)`**（传 `score_drafts` 返回的
 > `check_rules_version_ids`：只有新稿，改稿重存的不再查），hard 没守住报「必须改」、soft 报「建议改」、
-> Jev 拿不准的单列，**只作建议、不拦存档**；没判出来的题、只看话题 / 评论的规则、只查了一部分的规则（Jev 编译时标了 partial，或者只有一部分要看话题 / 评论）、撤掉了代码检查又没有规则题的规则、还没有编译结果的规则都单独报数，不算守住。编译最坏 6 分钟，只在后台线程（`open_project` / `record_rule` / `check_rules` 触发）和
+> Jev 拿不准的每篇只报条数（偏向没守住的最多列 3 条规则），**只作建议、不拦存档**；没判出来的题、只看话题 / 评论的规则（只问评论 / 话题的规则题也不发）、只查了一部分的规则（Jev 编译时标了 partial，或者只有一部分要看话题 / 评论）、撤掉了代码检查又没有规则题的规则、还没有编译结果的规则都单独报数，不算守住。编译最坏 6 分钟，只在后台线程（`open_project` / `record_rule` / `check_rules` 触发）和
 > `cli compile-rules` 里跑，写手的请求不等它；简报不动。见 `docs/deskcore.md` §3.11。
 
 ## 它解决什么
@@ -36,12 +36,14 @@
 | 稿子发出去就断线了，TV 那边 `v_model_comparison` 长期查出空集还不报错 | `export_drafts` 导的 xlsx 带六列 `_source_autowriter_*`，是笔记回到写作台的唯一线索；列名写错会让 TV 整行 quarantine，判据见 `tests/test_lineage_contract.py`（六个名字手抄在用例里，**不**从 `exporter` 读） |
 | 经验卡是可选工具，模型 95% 的对话不调（2026-09-01~16：71 批成稿、3 次借阅），通道 2 一直黑着 | `open_project` 随简报自动借（`lessons` / `lessons_status`），借阅不再取决于模型想不想多调一个工具；三种失败结局各记一条 WARN |
 | 借阅失败和"这次没匹配"长得一模一样，用不上经验也没人知道 | `borrow_lessons` 回 `status`：`borrowed` / `empty` / `not_configured` / `timeout` / `error` 五种结局分开，带耗时 |
+| `open_project` 等 15 秒先交简报、叫模型补借一次；补借却等满 60 秒（客户端约 22 秒就断），还向馆员再发一次选卡 | `borrow_lessons` 最多等 18 秒（`BORROW_LESSONS_WAIT_SEC`），`open_project` 起的那次选卡还在跑就等它、不发第二次；到点回一句「卡还在选，照常写，不用再调」（`docs/deskcore.md` §3.26） |
 | 模型跳过 `check_drafts` 直接 `commit_drafts`，同题重写的稿子整批进库（途鸽 09-10 四个标题各入库两次，两两 Jaccard 只有 0.33） | **入库自带闸**：`commit_drafts` 先跑和 `check_drafts` 同一套判定（标题语义、开头、四字串、本批内互比），判 reject 的不进 RPC；没带 `angle_key` 的数出来（`unattributed`），台账销不了账的角度下一批会再被抽到 |
 | 协议让 `commit_drafts` 等「用户确认定稿」再调，运营拿了稿子就走，近一周 214 个角度只有 20 条走到入库；改稿时新稿又撞上自己旧版的指纹 | 协议改成**交付即入库**（待审，不代表定稿；定稿与否由飞书 → TV 的 `tv-sync` 对照回来），改稿用 `replaces_version_id` 原地升版：先摘旧指纹再过闸，成功同一个 item 加一版，被拒或异常把指纹放回（2026-09-18） |
 | 09-11 起 78% 的角度发出去了、稿子没入库，指纹库不知道它们，下一批查重看不见——而 `/health` 一直 ok | `doctor` 和 `/health` 的 `config.pipeline` 报近 7 天「发了角度没入库」的比例，超过 50% 标红（不进顶层 `ok`：那是流程在漏，不是服务坏了） |
 | 已经发出去、没走 commit 的稿子永远补不回指纹库 | 工具 `ingest_published`（运营在 WorkBuddy 里把表粘给模型，≤ 50 条一次，重复调安全）或 `python -m deskcore.cli ingest --xlsx 飞书表` 从导出格式或「标题/正文」两列读回来，建身份（出处记在 `batches.params`，**不碰** `items.external_source`——那列是 TV 同步的标记）+ 写指纹，**不过闸**——已发生的事实拦它没有意义 |
 | 交付的稿子入库时没有任何「像不像、踩没踩线」的判定，写作台的稿和已发布笔记也没法用同一把尺子比 | `commit_drafts` 入库、放锁之后把稿子发给 JevforCoentent 的 judge（`judge_client.py`，HTTP，deskcore 仍零 LLM），答案进 TV 账本 `aw_version`；**不拦**，结局在返回值的 `judge` 与 `batch_metrics` 里（2026-10-19 起 D-120：每篇带参考分 `score` 与 `fixes` 给写手看，不再是影子）。只判走写作台交付的稿，补录进来的已发布笔记归 TV 事后抽取。见 `docs/deskcore.md` §3.8 |
 | TV 里 5966 条已发笔记一条都认不回写作台（lineage 全 NULL）；让运营手抄六个 ID 列进飞书三周零匹配 | `tv-sync`（`migrations/009`）在库里按内容对：正文前 40 字 / 标题 / 时间窗内四字串包含度；对不上的直接从 TV 的全文补录进指纹库；`--write-tv` 才回填 TV 的两列。**运营不做任何事，飞书表不加列**。见 `docs/deskcore.md` §3.7 |
+| 只有 `score_drafts` 在库里留一行；开项目、查重、查规则多久、怎么收场，写评论那一路判了几条、哪一样检查打回几条，只能翻留一周左右的网关日志 | 每次工具调用（REST 和 MCP 都算）回包之后，后台往 `batch_metrics` 写一行只有数的记录（`meta.mode = 'tool_call'`，`deskcore/calllog.py`）：工具、通道、耗时、结局、条数、回包多长，查重的过 / 拒和定的信号，评论每样检查的条数。稿子、评论、规则的字一个都不存；写不进去不影响回包；`DESKCORE_TOOL_CALL_LOG=0` 关掉。存档那一行另记借卡带出去几张卡、skill 版本构成、规则还有几条没编出来。见 `docs/deskcore.md` §3.8 末尾 |
 
 > 另有两条改在**常规生成那条路**（根目录的 `memory.py` / `generation_service.py`），
 > 不经过 deskcore，列在这里只是免得两边打架：未验证的经验卡现在会在提示词里
@@ -108,9 +110,10 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 | `reembed-rules --user <uuid>` | 给**规则**补向量——soft 规则的相关性过滤靠它才有意义 |
 | `ingest --project <uuid> --user <uuid> --xlsx 表.xlsx [--dry-run]` | 把**已经发出去、没走 commit** 的稿子从飞书表补进库（身份 + 指纹，不过闸）。认 `export_drafts` 的导出格式（带 `version_id` 的行跳过）或「标题」「正文」两列（`--title-col/--body-col` 可指定）。先 `--dry-run` 看它认出几条 |
 | `tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target` / `tv-map list` | TV 项目 ↔ 写作台项目的对照表；每个 TV 项目只能有一个补录目标 |
-| `tv-sync --all [--dry-run] [--write-tv] [--since …] [--rematch]` | 把 TV 的笔记按内容对到写作台的版本，对不上的补进指纹库（不过闸、按全文幂等）。先 `--dry-run` 看数；`--write-tv` 才回填 TV 的 `source_autowriter_*`。**每天跑一次** |
+| `tv-sync --all [--dry-run] [--write-tv] [--since …] [--rematch]` | 把 TV 的笔记按内容对到写作台的版本，对不上的补进指纹库（不过闸、按全文幂等）。先 `--dry-run` 看数；`--write-tv` 才回填 TV 的 `source_autowriter_*`。**每天跑一次**。对不上的那一行（`unmatched` / `ingested`）的 `score` 记这篇帖和写作台的稿子最像到什么程度，用来分开「在别处写的」和「拿写作台的稿子改的」（只是读数，`docs/deskcore.md` §3.28） |
 | `tv-resolve --note <note_id> --ingest` | `tv-sync` 报「分不出」的那几条，人看过之后落判定：目前只有一种，「对不上，按 TV 的正文补录」。对照改成 `ingested`，原候选保留。**不硬猜**、也**不提供「指定某一版」**（`match_kind` 没有 manual 一档，硬记成 `body_exact` 是撒谎） |
-| `compile-rules (--project <uuid> \| --all) [--force] [--dry-run]` | 把规则池里还没编的规则交给 Jev 编成写后检查（`check_rules` 用），结果缓存进 `rule_compiles`；已编过的（规则 id + 原文 sha 都没变）不再发；`--all` 一次运行里 owner 的 global 规则只发一次（`--force` 也是）。先 `--dry-run` 看要编几条（和真编同一个结局：没接 tv-map / 没配 `JUDGE_*` 照样报 ✗）。后台也会自己补编，这个命令是上线时补一遍（先关 `RULE_COMPILE_AUTO`，见 runbook §1.11）、或 Jev 改了编译之后 `--force` 用。一个项目一行计数，有项目没编成退出码 1；一批读超时就不再发后面几批，`--all` 也不再试后面的项目（列出来），Jev 恢复后再跑（2026-10-20，D-121） |
+| `draw-report --days 28 [--project <uuid>] [--json]` | **只读。** 发牌的读数：来源 × 项目 × 周的写了 / 发了 / 留着 / 撞车、试新牌对比和健康度；2026-11-11 起多三项「牌面对不对得上」（牌面的内容形式、情绪杠杆对发出去那篇的 TV 标签，牌面的标题句式对 Jev 答的「标题是不是问句」），每个比例旁边带碰巧一样的比例（`docs/deskcore.md` §3.28）。只有计数和比率，不取标题和正文 |
+| `compile-rules (--project <uuid> \| --all) [--force] [--dry-run]` | 把规则池里还没编的规则交给 Jev 编成写后检查（`check_rules` 用），结果缓存进 `rule_compiles`；已编过的（规则 id + 原文 sha 都没变）不再发；`--all` 一次运行里 owner 的 global 规则只发一次（`--force` 也是）。先 `--dry-run` 看要编几条（和真编同一个结局：没接 tv-map / 没配 `JUDGE_*` 照样报 ✗）。后台也会自己补编，这个命令是上线时补一遍（先关 `RULE_COMPILE_AUTO`，见 runbook §1.11）、或 Jev 改了编译之后 `--force` 用。一个项目一行计数，有项目没编成退出码 1；一批读超时就不再发后面几批，`--all` 也不再试后面的项目（列出来），Jev 恢复后再跑（2026-10-20，D-121）。没编出来的规则当场拆成每次 ≤ 3 条各重发一次，重发还失败的才算失败（2026-11-11） |
 | `sync-skill [--check]` | **不连库。** 改了 `protocol.md` 之后跑，把正文接进 `skills/…/SKILL.md`；`--check` 只比对，给 CI 用。两边不一致时 `test_protocol_tool.py` 会红 |
 
 另有 `health` / `projects` / `open` / `draw` / `check` 几个只读的手动验证入口。完整参数与验收判据见 runbook §2。

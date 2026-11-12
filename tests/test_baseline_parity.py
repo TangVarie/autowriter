@@ -38,12 +38,12 @@ MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 # 一个函数被多个增量改过时, 写**最后**改它的那个。
 FINAL_SOURCE = {
     "deskcore_check_drafts": (
-        "008_embedding_model_isolation.sql",
-        "005 换 3 参 + 包含度, 008 再加 embedding_model 过滤",
+        "019_dedup_gin_first.sql",
+        "005 换 3 参 + 包含度, 008 再加 embedding_model 过滤, 019 取候选先走 GIN(签名不变)",
     ),
     "deskcore_commit_fingerprints": (
-        "005_deskcore_containment.sql",
-        "005 换 6 参 + 包含度重查",
+        "019_dedup_gin_first.sql",
+        "005 换 6 参 + 包含度重查, 019 取候选先走 GIN(签名不变)",
     ),
     "deskcore_tv_notes": (
         "016_tv_notes_skip_vanished.sql",
