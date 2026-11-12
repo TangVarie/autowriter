@@ -1387,6 +1387,69 @@ def test_two_questions_of_one_rule_give_one_flag_per_draft(wired):
     assert v1["counts"]["suggest"] == 1 and out["summary"]["suggest"] == 1 and "more" not in v1
 
 
+def test_two_clauses_of_one_hard_rule_are_both_listed(wired):
+    """2026-11-12 复审 R1: 硬约束编成两道题、各问一件事, 一篇稿子两件都没守住。原来只列第一句, counts.must_fix 是 1, next_step
+    还说「必须改」照着改完、改一轮就够 —— 模型改了一句重存(重存的不再查), 另一句带着硬伤交出去。"""
+    r = mem(260, "示例硬规则: 甲款是大号, 乙款是小号, 不能说反", severity="hard")
+    two = _multi(r, {"ask": "正文有没有把示例甲款说成小号？", "pass_if": "否", "scope": "body"},
+                 {"ask": "正文有没有把示例乙款说成大号？", "pass_if": "否", "scope": "body"})
+    q1, q2 = [q["qid"] for q in two["questions"]]
+    wired.judge = answers(**{q1: {"answer": "是", "p": 0.95, "ambiguous": False, "evidence": "甲款是小号的那个。"},
+                             q2: {"answer": "是", "p": 0.93, "ambiguous": False, "evidence": "乙款是大号的那个。"}})
+    out = core.check_rules(full_client(memories=[r], compiles=[stored(r, two)], versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    (v1,) = out["versions"]
+    assert [(e["rule_id"], e["evidence"]) for e in v1["violations"]] == [(r["id"], "甲款是小号的那个。"),
+                                                                        (r["id"], "乙款是大号的那个。")]
+    assert v1["counts"]["must_fix"] == 2 and out["summary"]["must_fix"] == 2 and "more" not in v1
+    assert core._recheck_digest([out])["must_fix"] == 2
+
+
+def test_a_code_hit_and_a_judge_flag_of_one_rule_are_listed_separately(wired):
+    """2026-11-12 复审 R2: 一条规则编出来既有 code 又有题, 两边查的常常是两件事(词表 / 不带那个词也算的暗示): 各列各的, 看
+    ``source``。工具说明原来不加限定地说「同一条规则在一篇里只列一条」。"""
+    r = mem(261, "示例硬规则: 正文不要出现示例禁词, 也不要暗示示例功效", severity="hard")
+    both = _multi(r, {"ask": "正文有没有暗示示例功效？", "pass_if": "否", "scope": "body"},
+                  code={"kind": "forbidden_word", "words": ["示例禁词"], "where": ["body"]})
+    wired.judge = answers(**{both["questions"][0]["qid"]: {"answer": "是", "p": 0.9, "ambiguous": False,
+                                                           "evidence": "用了一周就好了。"}})
+    out = core.check_rules(full_client(memories=[r], compiles=[stored(r, both)],
+                                       versions=[version(V1, body="这是一段合成的正文, 里面有示例禁词。用了一周就好了。")]),
+                           PROJ, [V1], user_id=ME)
+    (v1,) = out["versions"]
+    assert [(e["rule_id"], e["source"]) for e in v1["violations"]] == [(r["id"], "code"), (r["id"], "jev")]
+    assert v1["counts"]["must_fix"] == 2
+    doc = tools.check_rules.__doc__
+    assert "Jev 判的同一条规则在一篇里只列一条" in doc and "代码查的命中另列" in doc
+    assert "Jev 判的同一条规则一篇只留一条" in core.check_rules.__doc__ and "代码查的另列" in core.check_rules.__doc__
+
+
+def test_a_body_question_that_sends_readers_to_the_comment_area_is_asked(wired):
+    """2026-11-12 复审 R3: 「结尾不要引导读者去评论区留言」是正文的规则, 题面里的「评论区」是去处。原来不发, 回「这条要看
+    话题 / 评论, 查不了」, 正文结尾明明就是那一句。"""
+    r = mem(262, "示例硬规则: 结尾不要引导读者去评论区留言", severity="hard")
+    one = _multi(r, {"ask": "结尾有没有引导读者去评论区留言或互动？", "pass_if": "否", "scope": "full"})
+    qid = one["questions"][0]["qid"]
+    wired.judge = answers(**{qid: {"answer": "是", "p": 0.95, "ambiguous": False, "evidence": "欢迎去评论区告诉我。"}})
+    out = core.check_rules(full_client(memories=[r], compiles=[stored(r, one)], versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    assert _sent_qids(wired) == [[qid]]
+    assert out["versions"][0]["counts"]["must_fix"] == 1 and "code_unavailable" not in out["rules"]
+
+
+@pytest.mark.parametrize("ask, pass_if, answer", [("评论里有没有呼应正文提到的场景？", "是", "否"),
+                                                  ("评论区是不是完全没有接住正文里的求助？", "否", "是")])
+def test_a_comment_question_that_names_the_body_is_not_sent(wired, ask, pass_if, answer):
+    """2026-11-12 复审 R4: 问的是评论、题面里顺带提到正文。Jev 手里没有评论, 照发就是篇篇「必须改」、改正文消不掉。"""
+    r = mem(263, "示例硬规则: 评论要接住正文里的场景", severity="hard")
+    one = _multi(r, {"ask": ask, "pass_if": pass_if, "scope": "full"})
+    wired.judge = answers(**{one["questions"][0]["qid"]: {"answer": answer, "p": 0.95, "ambiguous": False}})
+    out = core.check_rules(full_client(memories=[r], compiles=[stored(r, one)], versions=[version(V1)]),
+                           PROJ, [V1], user_id=ME)
+    assert wired.calls == [] and out["status"] == "nothing_to_check" and out["rules"]["code_unavailable"] == 1
+    assert "必须改" not in out["next_step"]
+
+
 def test_evidence_not_found_gets_its_own_sentence(wired):
     """Jev 答了「有问题」却指不出是哪一句(线上没判出来的全是这一种): 没有一句可改, 也不是回包缺了题。原来和缺题混成
     「另有 N 道规则题这次没判出来…不用重试」。数照旧都在 counts.unjudged / summary.unjudged 里(协议 5a 认的是它)。"""
@@ -1413,7 +1476,7 @@ def test_evidence_not_found_gets_its_own_sentence(wired):
 def test_tool_doc_and_note_describe_the_slimmer_reply():
     doc = tools.check_rules.__doc__
     for must in ("unsure_rules", "最多 3 条", "counts.unsure", "summary.evidence_not_found", "只问评论 / 话题的规则题也不问",
-                 "同一条规则在一篇里只列一条"):
+                 "同一条规则在一篇里只列一条", "硬约束的几道题指着不同的句子时各列各的"):
         assert must in doc, must
     assert "``unsure``:" not in doc and "``unjudged`` 列着" not in doc and "最多列 5 条" not in doc
     assert "unsure_rules" in core.CHECK_RULES_NOTE and "counts.unjudged" in core.CHECK_RULES_NOTE

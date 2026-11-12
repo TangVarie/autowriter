@@ -3609,18 +3609,36 @@ def _is_comment_rule(rule: dict) -> bool:
 # 存着的那一条读的时候按同一个判据算(score_drafts 的 rule_checks、my_rules 的 check 都过 _comment_check_rule), 不改库。
 # 开头那一句里也点到正文 / 标题 / 笔记 / 话题、或者说的是笔记里引导评论的(_POST_WORDS)不收窄: 那是两边都管、或者管笔记的
 # 规则, 收窄会悄悄少查正文。
-# max_len 的检查只认标题 / 正文, 不动。
+# 2026-11-12 复审(C1), 还有两种不收窄 —— 原来「示例牌只在评论区出现，正文和标题不写」这种说笔记的规则, 因为第一个逗号之前
+# 那半句说的是评论, where 被改成只查评论: 正文里写了不报, 评论里写了(规则要它在那儿)反而报; 带着 where 再记一次还是被改回去。
+#   · 第一句(到句号 / 分号 / 换行为止, 逗号不算完)里点到正文 / 标题 / 笔记的(_POST_TAIL_WORDS; 只认这三个词 —— 拿整张
+#     _POST_WORDS 来认的话, 线上那条说评论的规矩第一句的后半带着「话题」这个词, 又不收窄了);
+#   · where 里没有 comments 的: 记的时候是调用方明说的(「不写求评论的句子」where = body), 照存; 库里已经存着的是记的时候
+#     定下的, 读的时候不再改。没写 where 的(默认标题 + 正文)记的时候照旧收窄, 回包里说一句; 模型带着 where 再记一次就照存。
+# max_len 的检查只数标题 / 正文, 查不了评论(2026-11-12 复审 C3): 开头那一句只说评论的规则带着它存下去, 每篇笔记存档都报
+# 「正文 N 字, 上限 30」, 评论反而一条不查 —— 这种 check 不存(规则原文照记), 回包里说一句(COMMENT_LEN_CHECK_NOTE)。
 COMMENT_CHECK_NOTE = ("这条规则开头说的是评论, 所以它的 check 只查评论(where 存成 [\"comments\"]), 存档时不拿它查标题和正文。"
                       "标题、正文也要这样守的话, 另记一条说正文的规则。")
+COMMENT_LEN_CHECK_NOTE = "这条规则开头说的是评论, 字数检查(max_len)只数标题 / 正文, 所以没存 check; 规则原文记下了, 写评论时照给。"
 MY_RULES_COMMENT_CHECK_NOTE = "这条规则开头说的是评论, 它的 check 只查评论(where 按 [\"comments\"] 算)"
+_POST_TAIL_WORDS = ("正文", "标题", "笔记")
 
 
-def _comment_only_where(content, kind: str, payload: dict | None) -> bool:
-    """这份检查该不该收窄到只查评论: 开头那一句说的是评论、没点到笔记的哪一部分, 而 where 还带着别的部位。"""
+def _comment_only_text(content) -> bool:
+    """这条规则说的只是评论: 开头那一句说的是评论、没点到笔记的哪一部分(_POST_WORDS), 第一句(到句号 / 分号 / 换行)里
+    也没点到正文 / 标题 / 笔记。"""
+    if not _head_names_comments(content) or any(w in _rule_head(content) for w in _POST_WORDS):
+        return False
+    sentence = re.split("[。；;\r\n]", content, maxsplit=1)[0]
+    return not any(w in sentence for w in _POST_TAIL_WORDS)
+
+
+def _comment_only_where(content, kind: str, payload: dict | None, *, where_given: bool = True) -> bool:
+    """这份检查该不该收窄到只查评论: 规则说的只是评论(_comment_only_text), 而 where 里除了评论还带着别的部位。where 里
+    没有 comments 的不动, 除非是调用方没写 where 得来的默认值(``where_given=False``, 只有 record_rule 传)。"""
     where = (payload or {}).get("where")
     return (kind in ("forbidden_word", "forbidden_regex", "required_phrase") and isinstance(where, list)
-            and where != ["comments"] and _head_names_comments(content)
-            and not any(w in _rule_head(content) for w in _POST_WORDS))
+            and where != ["comments"] and ("comments" in where or not where_given) and _comment_only_text(content))
 
 
 def _comment_check_rule(rule: dict) -> dict:
@@ -4718,7 +4736,27 @@ def _plain_thread_hint(why: str) -> str:
     if not why.startswith(THREAD_HINT_PREFIX):
         return why
     ids = [x.strip() for x in why[len(THREAD_HINT_PREFIX):].split("、") if x.strip()]
-    return THREAD_HINT_HEAD + "、".join(THREAD_HINT_NAMES.get(x, x) for x in ids) if ids else why
+    # 几样之间用分号连(2026-11-12 复审 C7): has_friction 那一句自己带着顿号, 用顿号连会读成另外几样
+    return THREAD_HINT_HEAD + "；".join(THREAD_HINT_NAMES.get(x, x) for x in ids) if ids else why
+
+
+# 同一个分支里判定服务的整组修改单也是一句固定的话(整组里有不带 slot 的评论、又有整组没过的那一样时)。整组没过的眼下
+# 只有一样: 传了 max_named、点名的条数超了。那句话叫模型给每条评论补 slot —— 可一组不止四条时其余的不带 slot 正是这边教的
+# (补上又被拒), 超了几条它一个字没说(2026-11-12 复审 C4)。换成一句说数的话, 数和哪几条都在判定服务的回包里。
+THREAD_NO_SLOT_PLAN = "请提供每条评论的 slot 目标画像，再定位需要调整的评论位"
+
+
+def _named_over_line(res: dict, per_comment: list, labels: list[str]) -> str | None:
+    """点名条数超了 max_named 时的那一句(判定服务回包的 hard_fails 里有 named_count 才有), 没有回 None。"""
+    fail = next((f for f in res.get("hard_fails") or []
+                 if isinstance(f, (list, tuple)) and len(f) >= 3 and f[0] == "named_count"), None)
+    if fail is None:
+        return None
+    named = [labels[i] for i, v in enumerate(per_comment)
+             if isinstance(v, dict) and isinstance(v.get("profile"), dict) and v["profile"].get("names_brand") == "是"]
+    return (f"判定服务判出 {fail[1]} 条点名了品牌" + (f"({'、'.join(named)})" if named else "")
+            + f", 这次传的 max_named 是最多 {str(fail[2]).lstrip('≤')} 条: 去掉多出来那几条里的品牌叫法, 整组再判一次"
+              "(不用给评论加 slot)")
 
 
 def _thread_lines(entries) -> list[str]:
@@ -4858,8 +4896,8 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         slot = _slot_of(c.get("slot"), by_id)
         if c.get("slot") not in (None, "") and slot is None:
             raise CommentInputError(f"第 {i + 1} 条评论的 slot {c.get('slot')!r} 不是 comments_for 给的评论位 id"
-                                    f"({' / '.join(by_id)}); 不属于这几种的评论不带 slot 就行, 去掉它的 slot、整组再送一次"
-                                    "(自定义评论位要传整个对象, 而且要带 id)")
+                                    f"({' / '.join(by_id)}); 不属于这几种的评论不带 slot 就行: 整组里 slot 不是这几个 id 的"
+                                    "都去掉 slot、再送一次(自定义评论位要传整个对象, 而且要带 id)")
         cands.append({"text": c["text"].strip(), "slot": slot, "reply_to_text": (c.get("reply_to_text") or "").strip()})
     ids = [c["slot"]["id"] for c in cands if c["slot"] and c["slot"].get("id")]
     if len(ids) != len(set(ids)):
@@ -4952,7 +4990,11 @@ def score_comments(client, *, user_id: str | None, comments: list, link: str = "
         rows.append(row)
     passed = sum(1 for r in rows if r["passed"])
     # 代码数出来的整组那一句放最前面: thread_fix 只留 SCORE_MAX_FIXES 条, 判定服务的几条不能把它挤掉
-    thread_fix = ([set_line] if set_line else []) + _thread_lines(res.get("plan"))
+    plan_lines = _thread_lines(res.get("plan"))
+    over = _named_over_line(res, per_comment, checks["labels"])
+    if over:
+        plan_lines = [over if line == THREAD_NO_SLOT_PLAN else line for line in plan_lines]
+    thread_fix = ([set_line] if set_line else []) + plan_lines
     ends = checks["ends"]
     thread_hints = ([ends["thread_hint"]] if ends["thread_hint"] else []) + hints_extra + _thread_lines(res.get("hints"))
     out = {**head, "passed": bool(res.get("passed")) and not any(style) and not set_fail,
@@ -8120,8 +8162,9 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     ``rule_kind`` / ``rule_payload``, score_drafts 存档时逐篇查(deskcore/rulecheck.py)。**先校验再写**: check 写错
     整条不落库、报 CheckError(工具层映成 400), 免得规则记上了而检查是坏的、谁也不知道。
 
-    2026-11-11: 回包带 ``given_when_writing_comments``(这条规则写评论时给不给, 判据同 comments_for 的 ``_is_comment_rule``);
-    开头那一句只说评论的规则, check 的 where 存成只查评论(回包带 ``check_where_note``)。
+    2026-11-11: 回包带 ``given_when_writing_comments``(这条规则写评论时给不给, 判据同 comments_for 的 ``_is_comment_rule``;
+    停用着的不给, 另带 ``muted_note``); 开头那一句只说评论的规则, check 的 where 存成只查评论, max_len 的不存
+    (回包带 ``check_where_note``)。明说了 where、里面没有 comments 的照存(2026-11-12)。
     """
     # 审计 COR-015。scope='global' 时 project_id 其实不参与写入, 但照样校验 ——
     # 规则是"每个项目级入口都以这一行开头", 留例外就等于留一个以后会被忘掉的
@@ -8140,9 +8183,15 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
         raise RuleInputError("scope 只能是 'project' 或 'global'")
     rule_check = rulecheck.normalize_check(check) if check is not None else None
     # 开头那一句只说评论的规则, check 只查评论(2026-11-11, 见 COMMENT_CHECK_NOTE 上面那段): 存下去的就是收窄之后的那一份
-    narrowed = rule_check is not None and _comment_only_where(content, rule_check[0], rule_check[1])
+    # (没写 where 的也收窄; 明说了 where、里面没有 comments 的照存, 2026-11-12 复审 C1)
+    narrowed = rule_check is not None and _comment_only_where(
+        content, rule_check[0], rule_check[1], where_given=isinstance(check, dict) and check.get("where") is not None)
     if narrowed:
         rule_check = (rule_check[0], {**rule_check[1], "where": ["comments"]})
+    # 只说评论的规则带 max_len: 字数检查查不了评论, 存下去只会拿去数笔记正文 —— 不存(2026-11-12 复审 C3)
+    len_dropped = rule_check is not None and rule_check[0] == "max_len" and _comment_only_text(content)
+    if len_dropped:
+        rule_check = None
     applicability = (applicability or "").strip()
     if applicability not in DIRECTION_TAGS and [t for t in DIRECTION_TAGS if t in applicability]:
         raise RuleInputError(
@@ -8220,7 +8269,14 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
     stored_row = {**(row or {}), "content": content}
     if rule_check is not None and out["memory_id"]:
         stored_row.update(rule_kind=(saved or {}).get("rule_kind"), rule_payload=(saved or {}).get("rule_payload"))
-    out["given_when_writing_comments"] = _is_comment_rule(stored_row)
+    if len_dropped:
+        out["check_where_note"] = COMMENT_LEN_CHECK_NOTE
+    # 停用着的规则 comments_for 不给(store.shared_memories 先筛掉): 原文一样再记一次命中的是同一行, 停用不会被清掉
+    # (2026-11-12 复审 C6: 原来照说写评论时会给)
+    muted = db.is_memory_muted_now((row or {}).get("muted_until"))
+    out["given_when_writing_comments"] = _is_comment_rule(stored_row) and not muted
+    if muted:
+        out["muted_note"] = RULE_MUTED_NOTE
 
     # 新记的(或改了原文 / 方向的)规则在后台编译(D-121), 不等冷却; 这个调用不等它。
     _kick_rule_compile(client, project_id, reason="record_rule", bypass_cooldown=True)
@@ -8238,6 +8294,7 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
 _RULE_ACTIONS = ("mute", "unmute", "retire", "promote", "set_direction")
 # 台账里试用档的规则原文照列(写手要看得见库里有什么), 可它们不进简报、也不给写评论 —— 11-10 一位写手的模型把一条试用档的旧评论
 # 规则当成了项目要求, 和负责人新定的配比对着放(2026-11-11)。回包里说清: 不生效的不用守, 和别的说法不一样不算冲突
+RULE_MUTED_NOTE = "这条规则现在是「已停用」状态, 写稿、写评论都不会给; 要它重新生效, 调 set_rule_state 的 unmute。"
 MY_RULES_STATE_NOTE = ("state 是「试用」「已停用」的现在不生效: 写稿、写评论都不用守, 和生效中的规则或 comment_set 说法不一样"
                        "也不算冲突。用户说哪条过时了, 当场用 set_rule_state 停掉, 不用等负责人。")
 
@@ -9355,7 +9412,8 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     ``version_ids`` 一次查前 CHECK_RULES_MAX_VERSIONS 个(去重之后), 多出来的原样放进 ``remaining_version_ids``、next_step
     让再调一次(2026-10-20 第二轮复审: score_drafts 一批不限篇数, 原来超过上限整次报错, 写手照协议说规则没查成)。
 
-    回包只逐条列要动手的(2026-11-11): 每篇 ``violations``(同一条规则一篇只留一条, rulecompile.one_per_rule)和 ``counts``;
+    回包只逐条列要动手的(2026-11-11): 每篇 ``violations``(Jev 判的同一条规则一篇只留一条、硬约束只并指着同一句依据的,
+    rulecompile.one_per_rule; 代码查的另列)和 ``counts``;
     拿不准 / 没判出来的每篇只有条数, 偏向没守住的拿不准按规则汇成最外层的 ``unsure_rules``(最多
     CHECK_RULES_MAX_UNSURE_RULES 条)。_recheck_digest 读的 ``counts`` / ``summary`` / ``violations[].rule_id`` 都还在。
     """
@@ -10160,7 +10218,8 @@ def _note_patterns_shown(project_id, user_id, arm: str, shown: int, *, carry: bo
 _lessons_shown: dict[tuple[str, str], list[tuple[datetime, int, str]]] = {}
 # 这一行指标里多出来的一种结局(2026-11-11, 审计 A3): borrow_lessons 等了 BORROW_LESSONS_WAIT_SEC 卡还没选完。回包里的
 # status 还是 timeout(协议里列的那五种不变), 只有这一行记成另一个名字 —— 简报超时(timeout)之后补借也没等到的场,
-# statuses 里是 {timeout: 1, followup_timeout: 1}, 数得出来。
+# statuses 里是 {timeout: 1, followup_timeout: 1}, 数得出来。statuses 是这 12 小时里所有借卡的合计(共用身份的别的场也在
+# 里面): 数「没卡、补借也没等到」的批次要和 shown_max = 0 一起看(2026-11-12 复审 borrow-1, docs/deskcore.md §3.8)。
 LESSONS_FOLLOWUP_TIMEOUT = "followup_timeout"
 
 

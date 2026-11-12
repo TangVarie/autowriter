@@ -174,8 +174,16 @@ def question_index(pairs: list[tuple[dict, dict]], bank: dict | None) -> dict[st
 # 正文 / 标题 / 全文的才算(「正文或评论里有没有…」是正文的题, 照问); scope 标了 title / body 的不算 —— 那是编译时就指明
 # 只看标题 / 正文的题(「标题有没有话题钩子」这种「话题」不是话题行)。按字认会漏掉不带这几个词的问法(比如只说「楼中楼」),
 # 漏掉的和原来一样照发。
-_UNSEEN_ASK_RE = re.compile("评论|话题|标签")
+# 2026-11-12 复审(R3 / R4), 按字认的两头各收一下:
+#   · 「评论区」是正文把读者往那儿引的去处(「结尾有没有引导读者去评论区留言」「有没有写评论区见 / 评论区告诉我」)、「话题」
+#     「标签」是平常的意思(敏感话题、热门话题、贴标签、人设标签)时, 问的是正文: 原来不发, 这条规则报成「要看话题 / 评论,
+#     查不了」。评论前面紧挨着 去 / 到 / 来 / 往、或者后面是「区见」「区告诉」的不算; 话题 / 标签只认说话题行的那几种写法
+#     (话题里 / 话题行 / 标签里 / 标签行 / 话题标签)。「在评论区留言」还是算问评论的(「在评论区有没有…」多半真是), 报成查不了。
+#   · 题面以评论开头(问的就是评论)、后面顺带提到正文 / 标题的(「评论里有没有呼应正文提到的场景」), 原来因为带了「正文」
+#     照发, 又是篇篇「必须改」: 这种也不发, 不分 pass_if。「正文或评论里有没有…」开头是正文, 照问。
+_UNSEEN_ASK_RE = re.compile(r"(?<![去到来往])评论(?!区(?:见|告诉))|(?:话题|标签)[里行]|话题标签")
 _SEEN_ASK_RE = re.compile("正文|标题|全文")
+_COMMENT_HEAD_RE = re.compile(r"\s*(?:那条|每条|这条)?评论")
 
 
 def unseen_questions(result) -> list[dict]:
@@ -190,7 +198,8 @@ def unseen_questions(result) -> list[dict]:
         return []
     return [q for q in raw
             if isinstance(q, dict) and isinstance(q.get("ask"), str) and q.get("scope") not in ("title", "body")
-            and _UNSEEN_ASK_RE.search(q["ask"]) and not _SEEN_ASK_RE.search(q["ask"])]
+            and _UNSEEN_ASK_RE.search(q["ask"])
+            and (_COMMENT_HEAD_RE.match(q["ask"]) or not _SEEN_ASK_RE.search(q["ask"]))]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -305,8 +314,9 @@ def _what(label: str, q: dict, answer: str, p=None) -> str:
 
 
 def read_answers(questions: dict[str, dict], detail) -> dict:
-    """``/judge_draft`` 回的 ``detail.desk_rules`` → {"violations", "unsure", "unjudged"}。``violations`` 一条规则只留
-    一条(见 one_per_rule); ``unsure`` 一道题一条, 带 ``violated``(这个答案偏向没守住)和 ``point``(要点)。
+    """``/judge_draft`` 回的 ``detail.desk_rules`` → {"violations", "unsure", "unjudged"}。``violations`` 一条软规则只留
+    一条, 硬约束只并指着同一句依据的(见 one_per_rule); ``unsure`` 一道题一条, 带 ``violated``(这个答案偏向没守住)和
+    ``point``(要点)。
 
     每题对照 pass_if: 答案和 pass_if 不一样 = 没守住。
       · 歧义(Jev 的 ambiguous)或 p < SURE_P: 不管偏向哪边都记「拿不准」, 不算违反也不算守住 —— 0.6 的「守住」和
@@ -350,12 +360,17 @@ def read_answers(questions: dict[str, dict], detail) -> dict:
 def one_per_rule(flags: list[dict]) -> list[dict]:
     """同一条规则在同一篇上只留一条(2026-11-11, 审计 JP-6): 一条规则编成两三道意思相近的题, 两道都没守住时原来报两条,
     写手听到的是同一件事说两遍。留带依据句(``evidence``)的那条 —— 有一句可改的比没有的有用; 都带或都不带留先出现的。
-    顺序按每条规则第一次出现的位置。"""
+    顺序按每条规则第一次出现的位置。
+
+    硬约束只并指着**同一句依据**的(2026-11-12 复审 R1): 硬约束常常一道题管一件事(线上 27 条硬约束里 15 条有两道题以上),
+    两道题各指一句、或者有一道指不出句子(该写的没写)时是两件要改的事 —— 并成一条的话另一件回包里哪儿都没有, 「必须改」
+    全列、改一轮就够就成了假话, 重存的稿子又不再查。两道近义的题各报一条只是多一行; 线上重复的那些都在软规则上。"""
     best: dict = {}
-    for e in flags:
-        cur = best.get(e["rule_id"])
+    for n, e in enumerate(flags):
+        key = (e["rule_id"], e.get("evidence", n)) if e["severity"] == "hard" else e["rule_id"]
+        cur = best.get(key)
         if cur is None or ("evidence" in e and "evidence" not in cur):
-            best[e["rule_id"]] = e
+            best[key] = e
     return list(best.values())
 
 

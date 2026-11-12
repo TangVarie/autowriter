@@ -1252,6 +1252,39 @@ def test_a_body_question_that_mentions_comments_is_still_asked():
     assert rulecompile.unseen_questions(res) == []
 
 
+@pytest.mark.parametrize("ask", [
+    "结尾有没有引导读者去评论区留言或互动？",
+    "有没有叫读者到评论区找示例链接？",
+    "有没有写「评论区见」「评论区告诉我」这类求互动的话？",
+    "有没有涉及示例类的敏感话题？",
+    "这篇稿子里有没有蹭当下的热门话题？",
+    "有没有给某类人群贴标签、搞对立？",
+    "有没有给自己立示例人设标签？",
+])
+def test_a_body_question_that_only_uses_the_words_in_passing_is_still_asked(ask):
+    """2026-11-12 复审 R3: 「评论区」是正文把读者往那儿引的去处(去 / 到 / 来 / 往评论区…, 评论区见 / 评论区告诉我)、「话题」
+    「标签」是平常的意思(敏感话题、贴标签)时, 这是正文的题。原来按字认成只问评论的, 不发, 这条硬规则报成「查不了」。"""
+    res = _questions_result(mid(1), "0" * 12, {"ask": ask, "pass_if": "否", "scope": "full"})
+    assert rulecompile.unseen_questions(res) == []
+
+
+@pytest.mark.parametrize("ask", ["话题行有没有带上示例话题？", "标签里有没有示例词？", "有没有带上示例话题标签？",
+                                 "每条评论是不是都带了示例品牌名？", "有没有哪条评论报了示例价格？"])
+def test_questions_about_the_topic_line_or_the_comments_are_still_dropped(ask):
+    res = _questions_result(mid(1), "0" * 12, {"ask": ask, "pass_if": "是", "scope": "full"})
+    assert rulecompile.unseen_questions(res) == res["questions"]
+
+
+@pytest.mark.parametrize("ask, pass_if", [("评论里有没有呼应正文提到的场景？", "是"),
+                                          ("评论区是不是完全没有接住正文里的求助？", "否"),
+                                          ("  那条评论有没有重复标题里的示例词？", "否")])
+def test_a_question_whose_subject_is_the_comments_is_dropped_even_if_it_names_the_body(ask, pass_if):
+    """2026-11-12 复审 R4: 题面以评论开头(问的是评论)、后面又提到正文 / 标题的, 原来因为带了「正文」照发 —— Jev 对着没有
+    评论的稿子答, 硬规则篇篇「必须改」, 和 11-11 那 15 篇里 15 篇是同一种。「正文或评论里有没有…」开头是正文, 照问。"""
+    res = _questions_result(mid(1), "0" * 12, {"ask": ask, "pass_if": pass_if, "scope": "full"}, Q_BODY_OR_COMMENT)
+    assert rulecompile.unseen_questions(res) == [res["questions"][0]]
+
+
 def test_unseen_questions_ignores_results_it_cannot_read():
     code = code_result(mid(1), "0" * 12, {"kind": "forbidden_word", "words": ["示例词"], "where": "comments"})
     assert rulecompile.unseen_questions(code) == [], "code 那边由 code_rules 按 where 拦"
@@ -1277,6 +1310,27 @@ def test_read_answers_keeps_one_flag_per_rule_and_prefers_the_one_with_evidence(
     got = rulecompile.read_answers(qs, {"a_1": {"answer": "否", "p": 0.9, "ambiguous": False},
                                         "a_2": {"answer": "是", "p": 0.8, "ambiguous": False}})
     assert [e["what"] for e in got["violations"]] == ["建议改: 有没有写出时长？(判了「否」)"]
+
+
+def test_read_answers_keeps_every_distinct_flag_of_a_hard_rule():
+    """2026-11-12 复审 R1: 硬约束的两道题问的是两件事、都没守住时, 原来只报一件, 另一句要改的话回包里哪儿都没有, 条数也
+    不算它 —— 「必须改」全列就成了假话。硬约束只并指着同一句依据的; 软规则照旧一条规则一条。"""
+    qs = {"h_1": {"rule_id": "r1", "severity": "hard", "ask": "有没有把示例甲款说成小号？", "pass_if": "否", "note": ""},
+          "h_2": {"rule_id": "r1", "severity": "hard", "ask": "有没有把示例乙款说成大号？", "pass_if": "否", "note": ""},
+          "h_3": {"rule_id": "r1", "severity": "hard", "ask": "有没有写明示例甲款是大号？", "pass_if": "是", "note": ""},
+          "s_1": {"rule_id": "r2", "severity": "soft", "ask": "有没有写出时长？", "pass_if": "是", "note": ""},
+          "s_2": {"rule_id": "r2", "severity": "soft", "ask": "有没有把时长写得含糊？", "pass_if": "否", "note": ""}}
+    yes = {"answer": "是", "p": 0.9, "ambiguous": False}
+    got = rulecompile.read_answers(qs, {
+        "h_1": {**yes, "evidence": "甲款是小号的那个。"}, "h_2": {**yes, "evidence": "乙款是大号的那个。"},
+        "h_3": {"answer": "否", "p": 0.9, "ambiguous": False},
+        "s_1": {"answer": "否", "p": 0.9, "ambiguous": False}, "s_2": {**yes, "evidence": "过了一阵子就好了。"}})
+    assert [(e["rule_id"], e.get("evidence")) for e in got["violations"]] == [
+        ("r1", "甲款是小号的那个。"), ("r1", "乙款是大号的那个。"), ("r1", None), ("r2", "过了一阵子就好了。")]
+    # 两道题指着同一句: 是同一件事, 只报一条
+    got = rulecompile.read_answers(qs, {"h_1": {**yes, "evidence": "甲款小乙款大。"},
+                                        "h_2": {**yes, "evidence": "甲款小乙款大。"}})
+    assert [e["what"] for e in got["violations"]] == ["必须改: 有没有把示例甲款说成小号？(判了「是」)"]
 
 
 def test_read_answers_marks_which_way_an_unsure_answer_leans():

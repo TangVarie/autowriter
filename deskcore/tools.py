@@ -948,7 +948,8 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
         查的)/ ``p``(Jev 的把握)/ ``evidence``(Jev 指出的那一句, 有才带)。``what`` 以「必须改」开头的是硬约束:
         照着改(参考分查出合规问题的那几篇也在这一轮一起改), 改完那几篇带 ``replaces_version_id`` 先过 check_drafts、
         再用 score_drafts 存一次, 交付时一句话说清改了哪里; 改一轮就够, 不用再调本工具;
-        以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。同一条规则在一篇里只列一条。
+        以「建议改」开头的是软规则: 告诉用户, 改不改由用户定。Jev 判的同一条规则在一篇里只列一条
+        (硬约束的几道题指着不同的句子时各列各的, 每一句都要改; 代码查的命中另列, 看 ``source``)。
       · 每篇必须改全列, 建议改补到 ``violations`` 一共 12 条为止; ``more`` 是这篇没列出来的建议改条数
         (``summary.more`` 是全部篇加起来的), 有就如实告诉用户还有这么多条没列。
       · 拿不准(Jev 判不准, 不算没守住): 每篇只有条数 ``counts.unsure``, 不逐条列; ``summary.unsure`` 是全部篇加起来的。
@@ -1227,9 +1228,12 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
       词的开头 / 结尾是英文字母数字的, 那一头按词边界认: "Q群" 不算出现在「QQ群」里、"A货" 不算出现在「AA货」「1:1A货」里
       (所以「TV信号」里也不算有 "V信") —— 两种写法都要拦就都列上。
       check 写错会报错且这条规则不落库: 照报错改了再调一次。返回里的 ``check`` 是库里存下的那份。
-      规则开头那一句只说评论时, check 只查评论(where 存成 ["comments"], 返回里带 ``check_where_note``)。
+      规则开头那一句只说评论时, check 只查评论(where 存成 ["comments"], 返回里带 ``check_where_note``); 这条其实是说
+      笔记的(比如不让正文写求评论的话), 就带着 where(如 ["title", "body"])再调一次, 明说的 where 照存。
+      只说评论的规则带 max_len 时不存 check(字数检查只数标题 / 正文), 规则原文照记, 返回里同样带 ``check_where_note``。
 
     返回里的 ``given_when_writing_comments``: 这条规则写评论时(comments_for)给不给。管评论的规矩 content 开头写「评论区：」就给。
+    带 ``muted_note`` 的是这条规则正停用着(写稿、写评论都不给), 里面说了怎么恢复。
 
     记下之后服务端会在后台把这条规则交给 Jev 编成写后检查(几分钟内好), 之后 ``check_rules`` 就会查它。不用等、不用管。
     """

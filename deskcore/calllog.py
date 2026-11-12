@@ -185,7 +185,11 @@ _SCORE_CHECKS = ("brand_over", "repeats", "endings_over", "short_by", "neutral_b
 def _comment_block(tool: str, res: dict, notes: dict) -> dict:
     """写评论那两个工具: 帖子对上没有、怎么对上的; score_comments 另记这一组几条、每样检查打回几条、过了几条、要人核实
     几条、判定的结局、那一格拼了几行。"""
-    block: dict = {"resolved": res.get("resolved") is not False}
+    # 帖子根本没查成的(评论线程占满 / 查帖子超时: 回包里没有 resolved, core 也没记 source)不记成对上了 —— 那一行
+    # 没有 resolved 这个键, 靠 judge_status = timeout 认(2026-11-12 复审 TC-1)
+    block: dict = {}
+    if "resolved" in res or notes.get("source") is not None:
+        block["resolved"] = res.get("resolved") is not False
     for key in _COMMENT_NOTES:
         if notes.get(key) is not None:
             block[key] = notes[key]
@@ -245,7 +249,8 @@ def build(job: dict) -> dict:
     """一次调用 → 要写进 ``batch_metrics`` 的那一行(``project_id / user_id / phase_ms / counters / meta``)。
 
     ``project_id`` 那一列只在调用成了的时候填(评论工具用服务端对上的那个项目): 没成的调用带来的 project_id 可能是抄错的、
-    别人的, 填进去外键会让整行写不进去 —— 那种只在 ``meta.project8`` 里留前 8 位。"""
+    别人的, 填进去外键会让整行写不进去 —— 那种只在 ``meta.project8`` 里留前 8 位。评论工具的帖子没对上 / 没查成时回的也是
+    一个普通的 200, 带来的 project_id 同样没过归属校验: 那一列只认回包里的 project_id(2026-11-12 复审 TC-1)。"""
     args = job.get("args") if isinstance(job.get("args"), dict) else {}
     result = job.get("result")
     res = result if isinstance(result, dict) else {}
@@ -264,8 +269,9 @@ def build(job: dict) -> dict:
         meta["items"] = items
     if result is not None:
         meta["reply_chars"] = _reply_chars(result)
-    project_id = _uuid(res.get("project_id")) or _uuid(args.get("project_id"))
-    column = project_id if outcome == "ok" else None
+    matched = _uuid(res.get("project_id"))
+    project_id = matched or _uuid(args.get("project_id"))
+    column = project_id if outcome == "ok" and (matched or tool not in COMMENT_TOOLS) else None
     if project_id and column is None:
         meta["project8"] = project_id[:8]
     if result is not None:

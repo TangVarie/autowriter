@@ -652,7 +652,9 @@ select dims->>'emotional_lever' as lever, count(*) as published,
   `meta->>'mode' = 'deskcore_commit'`，不受影响。以后新写的查询照这个来。
 
 `project_id` 那一列只在调用成了的时候填（评论工具填服务端对上的那个项目）；没成的调用带来的 project_id 可能是抄错的、别人的，
-只在 `meta.project8` 留前 8 位。`phase_ms = {"total": 毫秒}`，其余都在 `meta` 里：
+只在 `meta.project8` 留前 8 位。评论工具的帖子没对上、或者根本没查成（评论线程占满 / 查帖子超时）时回的也是一个普通的 200，带来的
+project_id 同样没过归属校验：那一列只认回包里的 `project_id`，没有就空着、照样只留 `project8`（2026-11-12 复审 TC-1：原来照填，
+抄错的 id 撞 `batch_metrics.project_id` 的外键、整行写不进去，别人的 id 则记到了调用方打不开的项目下）。`phase_ms = {"total": 毫秒}`，其余都在 `meta` 里：
 
 | 键 | 哪些调用有 | 是什么 |
 |---|---|---|
@@ -662,7 +664,7 @@ select dims->>'emotional_lever' as lever, count(*) as published,
 | `skill` | `open_project` / `comments_for` | 这次报上来的 skill 版本：`up_to_date` / `outdated` / `unknown`（没报） |
 | `check` | `check_drafts` | `total` / `pass` / `warn` / `reject`；`decided_by` 是可疑和拒的各由哪个信号定的（`opening` / `title` / `ngram` / `contain`，一篇可以有几个）；`gates` 是不是撞车的拒（`replace_lookup` 这类）；`semantic_degraded` |
 | `rules` | `check_rules` | 回包里的数（§3.11 的 2026-11-11 那一版回包）：`status`（`checked` / `nothing_to_check` / `no_versions` / `error`）；`versions`、`must_fix`、`suggest`、`unsure`、`unjudged`、`evidence_not_found`（Jev 怀疑有问题、指不出是哪一句的，算在 `unjudged` 里）、`not_finished`、`empty_body`、`code_unchecked`、`more`，都是整次的合计（同回包的 `summary`，有才带）；`flagged`（有要动手的那几篇）、`judged`（规则题判回来了的那几篇）；`unsure_rules` / `unsure_rules_hard`（最外层列出来的偏向没守住的规则几条、其中硬约束几条，最多 3）；`excluded` / `remaining`（不是这个项目的、留到下一次的各几版）；`pool` 是规则池里各几条（同回包的 `rules`，只取数：`pool` / `by_jev` / `by_code` / `uncompiled` / `partial` / `code_unavailable` / `code_withdrawn` / `not_compilable` …）。规则 id、版本 id、题面和 Jev 指出的句子都不取 |
-| `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks` |
+| `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样；帖子根本没查成的那两种超时没有这个键，看 `judge_status = timeout`）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks` |
 | `comments.checks` | `score_comments` | `style` 是写法底线每样打回几条（`period` 句号 / `dialect` 方言语气词 / `contact` 像要联系方式 / `post_ref` 提了帖子 / `vague` 含糊指代）；`brand_over`（提品牌超出几条）、`repeats`（说法或开头重复的几条）、`endings_over`（品牌收尾超出几条）、`short_by` / `neutral_by`（短评、中性还差几条；项目没定这一项、或中性没判成时没有这个键）；`fix` / `style_fix`（带这两样的各几条）、`thread_fix` / `thread_hints`（整组的各几句） |
 
 它说得出一场走到了哪一步、每一步多久、评论判了几轮，说不出一场为什么停、是谁在打字。
@@ -673,8 +675,10 @@ select dims->>'emotional_lever' as lever, count(*) as published,
   `shown` / `status` 是最近一次带出去几张经验卡、什么结局（`borrowed` / `empty` / `timeout` / `error` / `not_configured`，
   另有只在这一行出现的 `followup_timeout`：`borrow_lessons` 自己等到点卡还没选完，§3.26；回包里那次的 `status` 还是 `timeout`）；
   `shown_max` 是最多的一次几张；`statuses` 是各种结局各几次。记的是简报实际带出去的那一份（超时 = 0，后台之后选完的不算）。
-  团队共用一个身份时分不出是哪一场借的：`shown_max = 0` 才能确定这一批没参照过卡。`statuses` 里同时有 `timeout` 和
-  `followup_timeout` = 简报没等到、补借也没等到。
+  团队共用一个身份时分不出是哪一场借的：`shown_max = 0` 才能确定这一批没参照过卡。`shown_max = 0` 而且 `statuses` 里有 `followup_timeout`
+  = 这一批没参照过卡、补借也没等到。`statuses` 是这 12 小时里所有借卡的合计，不是这一场的：上午那一场简报和补借都超时、两小时后
+  另一场随简报拿到了卡，后一场那一行的 `statuses` 里照样有 `timeout` 和 `followup_timeout`——光看 `statuses` 会把拿到卡的批次数成
+  没卡的（2026-11-12 复审 borrow-1），要和 `shown_max = 0` 一起看。
 - `skill_versions`：近 24 小时报上来的 skill 版本构成（`skillcheck.health`，同 `/skill-versions`）：`current`、
   `up_to_date` / `outdated` / `unknown` 各几个、`outdated_versions`（旧版各是哪一版；认不出 12 位十六进制的并进 `other`）。
   数的是「身份 × 版本」，读作有几种版本在用，不是人数。原来只在进程内存里、要带 key 读、重新部署就清零。
@@ -733,10 +737,12 @@ select count(*) as calls, meta->'rules'->>'status' as status,
  group by 2 order by 1 desc;
 
 -- 评论(W-51): 判了几次、几篇帖子、一篇帖子判几轮、整组过了几次、被拒的调用几次
+-- 一篇帖子判几轮只数带 post8 的调用: 帖子没对上 / 没查成的也是 outcome = ok、却没有 post8, 另列在 no_post(2026-11-12 复审 TC-2)
 select count(*) as score_calls,
        count(distinct meta->'comments'->>'post8') as posts,
-       round(count(*) filter (where meta->>'outcome' = 'ok')::numeric
+       round(count(*) filter (where meta->>'outcome' = 'ok' and meta->'comments' ? 'post8')::numeric
              / nullif(count(distinct meta->'comments'->>'post8'), 0), 1) as calls_per_post,
+       count(*) filter (where meta->>'outcome' = 'ok' and not coalesce(meta->'comments' ? 'post8', false)) as no_post,
        count(*) filter (where meta->'comments'->>'passed' = 'true') as sets_passed,
        count(*) filter (where meta->>'outcome' = 'refused') as refused,
        sum((meta->'comments'->>'n')::int) as comments_judged,
@@ -763,7 +769,8 @@ select (created_at at time zone 'Asia/Shanghai')::date as day, meta->>'tool' as 
 select count(*) as commits,
        count(*) filter (where (meta->'flywheel_lessons'->>'borrows')::int > 0) as borrow_known,
        count(*) filter (where (meta->'flywheel_lessons'->>'shown_max')::int = 0) as no_cards,
-       count(*) filter (where (meta->'flywheel_lessons'->'statuses'->>'followup_timeout')::int > 0) as followup_timed_out,
+       count(*) filter (where (meta->'flywheel_lessons'->>'shown_max')::int = 0
+                          and (meta->'flywheel_lessons'->'statuses'->>'followup_timeout')::int > 0) as followup_timed_out,
        count(*) filter (where (meta->'skill_versions'->>'outdated')::int > 0) as with_outdated_skill,
        count(*) filter (where (meta->'rule_compile'->>'uncompiled')::int > 0) as with_uncompiled_rules
   from autowriter.batch_metrics
@@ -1014,6 +1021,12 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
    「评论里有没有…」（`pass_if` 否）篇篇算守住，其实没看。11-11 线上一个项目的一道题让 15 篇里 15 篇报了「必须改」，改过重存的 5 篇照报，
    历史上记下的 19 条硬规则违反里 15 条是它。编出来的 `code` 早就按 `where` 拦了（步骤 4），题这边原来没有同样的一道。
    只看题面的字：`ask` 提到 评论 / 话题 / 标签、又一处没提 正文 / 标题 / 全文 的才算（「正文或评论里有没有…」是正文的题，照问）；
+   2026-11-12 复审（R3 / R4）两头各收了一下：「评论区」是正文把读者往那儿引的去处（评论前面紧挨着 去 / 到 / 来 / 往，或后面是
+   「区见」「区告诉」：「结尾有没有引导读者去评论区留言」）、「话题」「标签」是平常的意思（敏感话题、贴标签；只有 话题里 / 话题行 /
+   标签里 / 标签行 / 话题标签 才算说话题行）时是正文的题，照问——原来不发，这条规则报成「要看话题 / 评论，查不了」；
+   题面以评论开头（问的就是评论）、后面顺带提到正文 / 标题的（「评论里有没有呼应正文提到的场景」）不分 `pass_if` 都不发——
+   原来因为带了「正文」照发，又是篇篇「必须改」。线上最新的编译结果 147 道题里拿掉的还是原来那 15 道，一道不多一道不少。
+   「在评论区留言」这种还是算问评论的（「在评论区有没有…」多半真是），报成查不了。
    `scope` 标了 `title` / `body` 的不算（编译时就指明只看标题 / 正文的题，「标题有没有话题钩子」里的「话题」不是话题行；线上这种题的
    `scope` 都是 `full`）。在拼题库**之前**拿掉——`project_bank` 是 Jev 那边的移植、逐字节钉着，不在里面筛。一条规则的题全被拿掉、
    别的也没查它的，和步骤 4 里只看话题 / 评论的 `code` 并成一个集合数进 `rules.code_unavailable`（两边都沾的只数一次）；拿掉一部分、
@@ -1067,7 +1080,7 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
 正文是空的全是 0 时才说。
 
 **返回值**（一篇一项 `versions[]`）：`violations`（每条 `rule_id` / `severity` / `what`（以「必须改」或「建议改」开头）/ `source`（jev | code）/
-`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`；同一条规则在一篇里只留一条，见下）、`more`（这篇没列出来的建议改条数）、`counts`（`must_fix` / `suggest` / `unsure` / `unjudged`）、`judge_status` / `judge_note`、`code_unchecked`；
+`p` / `evidence`，必须改的排前面、全列，建议改补到每篇一共 12 条为止，同 §3.10 的 `rule_checks`；Jev 判的同一条软规则在一篇里只留一条、硬约束只并指着同一句的，见下）、`more`（这篇没列出来的建议改条数）、`counts`（`must_fix` / `suggest` / `unsure` / `unjudged`）、`judge_status` / `judge_note`、`code_unchecked`；
 外加 `summary`（必须改 / 建议改 / 拿不准 / 没判完各几处、没判出来几道题；有才带：`more` 没列出来几条、`evidence_not_found` 几道题指不出依据句、`empty_body` 几篇正文是空的、`code_unchecked` 几处没查完）、`unsure_rules`（有才带，见下）、`rules`（池子几条、Jev 查几条、代码查几条、查不了几条、
 还没编几条和为什么、话题评论查不了几条、编不了几条、编出来没跑几条、只查了一部分几条、人设过 check 由 `score_drafts` 查的几条、撤掉了代码检查又没有题的几条、正则没查完几条）、`uncompiled_rules`、这次没查到的 `remaining_version_ids`（有才带）
 和一句 `next_step`。`summary.more` 不是 0 时 `next_step` 说还有这么多条建议改没列出来、如实告诉用户（独立复审 on aw E：原来
@@ -1084,8 +1097,12 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
 - `next_step` 的拿不准那句带上数：「有 N 处「拿不准」(涉及 M 条规则), 提一句就行, 不用改」。
 - 同一条规则在一篇上只报一条（`rulecompile.one_per_rule`）：一条规则编成两三道相近的题、几道都没守住时原来各报一条（线上 128 条
   里只有 114 个不同的「规则 × 篇」），现在留带依据句的那条，都带或都不带留先出现的；`counts` / `summary` 按留下的数。只并 Jev 判的；
-  代码查的命中照旧另列。
-- 代价：回包里看不出是**哪一篇**拿不准、哪条规则没判出来（数都在）；一条规则的两道题问的是两件事、又都没守住时，只报其中一件。
+  代码查的命中照旧另列（一条规则编出来既有 `code` 又有题时两边查的常常是两件事，各列各的，看 `source`）。
+  **硬约束只并指着同一句依据的**（2026-11-12 复审 R1）：线上 27 条已确认的硬约束里 15 条有两道题以上，多半一道题管一件事；
+  两道题各指一句、或者有一道指不出句子（该写的没写）时是两件要改的事，原来并成一条，另一句回包里哪儿都没有、`must_fix` 也不算它，
+  `next_step` 还说照着改完、改一轮就够，重存的稿子又不再查。现在各列各的；线上重复的那 14 篇都在一条软规则上，不受影响。
+- 代价：回包里看不出是**哪一篇**拿不准、哪条规则没判出来（数都在）；一条**软**规则的两道题问的是两件事、又都没守住时，只报其中一件；
+  一条硬约束的两道近义题都没守住、指的又不是同一句时，会各报一条。
   后台的改稿复查（§3.19 的 AU-F07，`_recheck_digest`）只读 `counts`、`summary` 和 `violations[].rule_id`，不受影响。
 
 **只查新稿。** `score_drafts` 的返回多了 `check_rules_version_ids`：这批里的新稿，不含带 `replaces_version_id` 改过重存的；全是重存时
@@ -1674,12 +1691,27 @@ auth rejected: reason=invalid_ellipsis path=/mcp/ via=header len=9 flags=ellipsi
 
 - 回包多一个 **`given_when_writing_comments`**（true / false）：按库里实际那一行算，判据就是上面那一个。模型在写评论的对话里
   记完规矩，当场就知道下一组评论拿不拿得到，不用等用户下次发现没生效。工具说明里一句：管评论的规矩 content 开头写「评论区：」就给。
+  **停用着的规则回 false**，另带一句 `muted_note`（`RULE_MUTED_NOTE`：现在是已停用、写稿写评论都不给，要恢复调 `set_rule_state`
+  的 unmute）。2026-11-12 复审 C6：原文一样再记一次命中的是同一行，`db.upsert_memory` 不清 `muted_until`，原来照回 true，
+  `comments_for` 其实不给（`store.shared_memories` 先筛掉停用的）。线上还没有停用过的规则。
 - **开头那一句只说评论的规则，`check` 的 `where` 存成 `["comments"]`**（`_comment_only_where`），回包带一句 `check_where_note`
   （`COMMENT_CHECK_NOTE`：只查评论、不拿它查标题和正文；标题、正文也要这样守就另记一条说正文的规则）。11-11 那三条里有一条的
   检查存的是 `["body", "comments"]`：一条说评论的规矩，每次存档都拿去查笔记正文，近 7 天那个项目 74 版笔记里 13 版会因为它
   收到一条和笔记无关的「建议改」。没写 `where`（默认标题 + 正文）的也一样收窄。
 - **不收窄的**：开头那一句里也点到正文 / 标题 / 笔记 / 文案 / 帖 / 话题 / 标签 / 全文 / 开头 / 结尾 / 文末 / 封面 / 配图 / 引导的
-  （`_POST_WORDS`）——那是两边都管的规则，或者说的是笔记里怎么引导评论，收窄会悄悄少查正文；靠第 3 样才算评论规则的（原文开头没说评论）；`max_len`（只认标题 / 正文）；撤掉检查的 `free_text`。
+  （`_POST_WORDS`）——那是两边都管的规则，或者说的是笔记里怎么引导评论，收窄会悄悄少查正文；靠第 3 样才算评论规则的（原文开头没说评论）；撤掉检查的 `free_text`。
+  2026-11-12 复审 C1 又加两种（`_comment_only_text` / `_comment_only_where`）：
+  - **第一句（到句号 / 分号 / 换行，逗号不算完）里点到正文 / 标题 / 笔记的**。「示例牌只在评论区出现，正文和标题不写」是说笔记的规则，
+    原来只看第一个逗号之前那半句，`where` 被改成只查评论：正文里写了不报，评论里写了（规则要它在那儿）反而报「必须改」。这里只认这
+    三个词，不拿整张 `_POST_WORDS`：线上那条说评论的规矩第一句的后半带着「话题」这个词，拿整张表它又不收窄了。
+  - **`where` 里没有 `comments` 的**。记的时候是调用方明说的（「不写求评论求关注的句子」`where: ["body"]`），照存——原来带着
+    `where` 再记一次还是被改回只查评论，想存的检查存不进去；库里已经存着的是记的时候定下的，读的时候也不再改。没写 `where` 的
+    照旧收窄、回包里说一句，模型带着 `where` 再调一次就照存（工具说明里有这句）。线上带检查的两条规则 `where` 都是
+    `["body", "comments"]`，这两种都碰不到，11-11 那一条读的时候照旧按只查评论算。
+- **只说评论的规则带 `max_len` 时不存 check**（2026-11-12 复审 C3）。字数检查只数标题 / 正文，查不了评论：「评论每条不超过三十字」
+  带着它存下去，每篇笔记存档都报「正文 N 字, 上限 30」（硬约束就是「必须改」），评论反而一条不查。现在规则原文照记，`check` 不存，
+  回包的 `check_where_note` 是 `COMMENT_LEN_CHECK_NOTE`。第一句里也点到正文 / 标题 / 笔记的（「评论每条不超过三十字，正文不超过
+  三百字」）照存。线上没有 `max_len` 的规则，库里不用动。
 - **库里已经存着的那一条不改库**，读的时候按同一个判据算（`_comment_check_rule`）：`score_drafts` 的 `rule_checks` 不再拿它查正文，
   跟着笔记一起交付的评论照查；`my_rules` 的 `check` 给的是查的时候真用的那一份，和库里存的不一样时多一句 `check_note`。
   AW 生成链路的 `validator` 读的还是库里那一行（它只看硬约束，那一条是建议级，碰不到）。
@@ -1699,10 +1731,17 @@ auth rejected: reason=invalid_ellipsis path=/mcp/ via=header len=9 flags=ellipsi
   `COMMENTS_FOR_SET_SCORE`「写完把整组放在一次 score_comments 里交(不按 slot 拆成几次; 一次最多 20 条, 超过的按顺序分段判、
   前面判过的放进 earlier_comments…)」。没定配比的项目那一句一个字不动。
 - 两种报错：slot id 重复的说「每个 id 留一条, 其余几条去掉 slot, 整组再送一次(不用分几次判, 也不用另编 id)」，并点出是哪几个
-  id 重复；id 不认识的在原来那句后面加「不属于这几种的评论不带 slot 就行, 去掉它的 slot、整组再送一次」。
+  id 重复；id 不认识的在原来那句后面加「不属于这几种的评论不带 slot 就行: 整组里 slot 不是这几个 id 的都去掉 slot、再送一次」
+  （2026-11-12 复审 C5：原来说「去掉它的 slot」，只点第一条，照字面做的话二十条里编了十六个 id 要被拒十六次）。
 - 整组参考（`thread_hints`）：一组里有评论不带 slot 时，判定服务回的是一句固定的话后面跟题目的 id。转给写手之前换成人话
   （`THREAD_HINT_NAMES`），开头标「整组参考(只是参考, 不用为它重写)」。只说看到了什么（夸品牌的占了多数、几条是同一个句式、
   没有审慎的声音、整体像安排出来的），不说该怎么改：这四道题没验收过，说成改法模型会照着重写、多出几轮。不认识的 id 原样留着。
+  几样之间用分号连（2026-11-12 复审 C7：「没有质疑、追问价格或效果这类审慎的声音」自己带着顿号，用顿号连会读成另外几样）。
+- 整组修改单（`thread_fix`）里判定服务那句「请提供每条评论的 slot 目标画像…」（2026-11-12 复审 C4）：整组里有不带 slot 的评论、
+  又传了 `max_named`、点名条数超了的时候回的就是它。照转等于叫模型把刚去掉的 slot 加回来（加回来又被拒），超了几条一个字没说。
+  回包的 `hard_fails` 里有 `named_count` 时换成一句说数的话（`_named_over_line`）：判定服务判出几条点名了品牌、是哪几条、
+  这次传的上限是几条，去掉多出来那几条里的品牌叫法、整组再判一次，不用加 slot。没有 `named_count` 的原样转。配了 `brand_max`
+  的项目不受影响（`max_named` 本来就不转给判定服务）。
 
 工具说明（不进协议的哈希）跟着改了 `comments_for` 的 comment_rules / slots 两条、`score_comments` 的 `comments` 那一段、
 `record_rule` 和 `my_rules` 各一两句。
@@ -1712,7 +1751,9 @@ auth rejected: reason=invalid_ellipsis path=/mcp/ via=header len=9 flags=ellipsi
 
 回归：`tests/test_comment_rule_reach.py`（判据的正反例——照生产里见过的开头形状造的合成规则，交付版式的几种都是反例；
 `comments_for` 两个列表不少不重；简报里规则还在、字数那一句不补；`record_rule` 的字段和收窄、不收窄的几种；库里存着的那种
-`score_drafts` 不查正文、`my_rules` 给真用的那一份；`next_step` 两种项目；两种 slot 报错和照着做一次判成；整组参考换成人话）。
+`score_drafts` 不查正文、`my_rules` 给真用的那一份；`next_step` 两种项目；两种 slot 报错和照着做一次判成；整组参考换成人话；
+2026-11-12 复审加的：第一句后半点到正文的和明说 `where` 的不收窄、带着 `where` 再记一次照存、读的时候只收窄带 `comments` 的、
+只说评论的规则带 `max_len` 不存、停用着的回 false）。`tests/test_comment_set_score.py` 最后一段钉着点名超了那一句。
 `tests/test_deskcore_score_and_comments.py` 里钉着整组参考原话的那一条跟着改了。
 
 ### 3.25 简报里的标题字数：发出去的标题大多不超过 20 字的项目，多说一句（2026-11-11，审计 A2 / A4 / 标题字数那一条）
@@ -1783,7 +1824,8 @@ auth rejected: reason=invalid_ellipsis path=/mcp/ via=header len=9 flags=ellipsi
    - 借阅体承诺不抛；真抛了，等它的每个人各自按 `error` 回，不往外抛。
    - 起跑超过 `LIBRARIAN_TIMEOUT_SEC` 再加 10 秒还没回来的那一条当成卡死的线程，不再往上并，另起一次、把表里那条换掉。
 4. **存档那一行指标**（§3.8 的 `flywheel_lessons`）：`borrow_lessons` 到点没等到的那次记成 `followup_timeout`（只在这一行；
-   回包里是 `timeout`）。`statuses` 里同时有 `timeout` 和 `followup_timeout` 的批次 = 简报没等到、补借也没等到。
+   回包里是 `timeout`）。`shown_max = 0` 而且 `statuses` 里有 `followup_timeout` 的批次 = 没参照过卡、补借也没等到（`statuses` 是近 12 小时
+   这个项目、这个身份所有借卡的合计，光看它会把同一天后来拿到卡的批次也数进去，§3.8）。
 
 **没做的、要知道的。**
 - 合并只在这一个进程里有效（deskcore 单进程）。重启就没了，退回原来的样子：再发一次，多半命中 TV 的缓存。TV 那头的同款合并、

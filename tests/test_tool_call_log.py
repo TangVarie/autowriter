@@ -209,6 +209,50 @@ def test_an_unresolved_post_is_recorded_as_such(log, monkeypatch):
     _no_text(row, "xiaohongshu")
 
 
+BOGUS = "deadbeef-dead-beef-dead-beefdeadbeef"             # 不是哪个项目的 id(抄错的、别人的)
+
+
+@pytest.mark.parametrize("tool, extra", [("comments_for", {}), ("score_comments", {"comments": [{"text": "这个怎么买"}]})])
+def test_an_unresolved_post_never_puts_the_callers_project_id_in_the_column(log, monkeypatch, wired, tool, extra):
+    """2026-11-12 复审 TC-1: 帖子没对上时回的是一个普通的 200(resolved=false), 带来的 project_id 没过归属校验。原来照填进
+    项目那一列: 抄错的 id 撞外键、整行写不进去(正是要数的那种调用), 别人的 id 则把这次调用记到了调用方打不开的项目下。"""
+    c = _comment_client()
+    c._tv.rows["notes"] = []
+    monkeypatch.setattr(core, "sb", lambda: c)
+    r = _rest().post(f"/tool/{tool}", headers=H, json={"link": LINK, "project_id": BOGUS, **extra})
+    assert r.status_code == 200 and r.json()["result"]["resolved"] is False
+    (row,) = _rows(c)
+    assert row["project_id"] is None and row["meta"]["project8"] == BOGUS[:8]
+    assert row["meta"]["outcome"] == "ok" and row["meta"]["comments"]["resolved"] is False
+
+
+def test_a_post_lookup_that_never_ran_is_not_recorded_as_resolved(log, monkeypatch, wired):
+    """评论线程占满(查帖子超时同一个形状): 帖子根本没查, 回包里没有 project_id、也没有 resolved。原来记成
+    resolved=true、项目那一列填调用方带来的 id。"""
+    c = _comment_client()
+    monkeypatch.setattr(core, "sb", lambda: c)
+    monkeypatch.setattr(core, "_bounded_submit", lambda *a, **k: None)
+    r = _rest().post("/tool/score_comments", headers=H,
+                     json={"link": LINK, "project_id": BOGUS, "comments": [{"text": "这个怎么买"}]})
+    assert r.status_code == 200 and r.json()["result"]["judge_status"] == "timeout"
+    (row,) = _rows(c)
+    assert row["project_id"] is None and row["meta"]["project8"] == BOGUS[:8]
+    block = row["meta"]["comments"]
+    assert "resolved" not in block and "post8" not in block and block["judge_status"] == "timeout" and block["n"] == 1
+
+
+def test_the_rounds_per_post_query_only_divides_calls_that_carry_a_post():
+    """2026-11-12 复审 TC-2: 帖子没对上 / 没查成的 score_comments 也是 outcome = ok, 却没有 post8: 原来算进分子、不进分母,
+    「一篇帖子判几轮」读高了。docs §3.8 那条查询的分子只数带 post8 的, 没带的另列一栏。"""
+    from pathlib import Path
+    doc = (Path(__file__).resolve().parent.parent / "docs" / "deskcore.md").read_text(encoding="utf-8")
+    query = doc[doc.index("-- 评论(W-51)"):]
+    query = query[:query.index(";")]
+    assert "filter (where meta->>'outcome' = 'ok' and meta->'comments' ? 'post8')::numeric" in query
+    assert "as no_post" in query
+    assert "count(*) filter (where meta->>'outcome' = 'ok')::numeric" not in query
+
+
 # ── 3. 被拒的、真故障的调用也留一行, 回包不变 ────────────────────────────────────────────────────
 
 def test_a_refused_call_is_recorded_and_still_a_400(log, monkeypatch, wired):

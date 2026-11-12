@@ -627,9 +627,11 @@ select count(*), count(distinct memory_id), count(*) - count(distinct memory_id)
 
 **哪些规则写评论时会给（2026-11-11，`docs/deskcore.md` §3.24）。** 不只认「评论区：」开头：开头那一句（到第一个标点）的前 12 个字里有
 「评论」、或者存的检查 `rule_payload.where` 里有 `comments` 的也算。写手问「这条怎么写评论时没给」：看 `record_rule` 当时回的
-`given_when_writing_comments`，或者对那个项目调一次 `comments_for` 看 `comment_rules`；没给的把原文改成「评论区：」开头再记一次。
+`given_when_writing_comments`，或者对那个项目调一次 `comments_for` 看 `comment_rules`；没给的把原文改成「评论区：」开头再记一次
+（回包带 `muted_note` 的是这条正停用着，`set_rule_state` 的 unmute 恢复）。
 开头只说评论的规则，存的检查按只查评论算：`memories.rule_payload.where` 里可能还存着 `body`（11-11 之前记的那一条），库里不改，
 `score_drafts` 的 `rule_checks` 和 `my_rules` 的 `check` 都按 `["comments"]` 算——对账时以 `my_rules` 回的为准，不以库里那一列为准。
+`where` 里没有 `comments` 的那种（2026-11-12 起）读的时候不改，库里是什么就是什么。
 
 ### 1.10 `014_tv_edit_diff_rev` —— 改动差异的口径版本（2026-10-20）
 

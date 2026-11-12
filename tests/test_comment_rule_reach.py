@@ -177,7 +177,7 @@ def test_the_field_agrees_with_what_comments_for_hands_out(rule_client):
     dict(WORDS),                                    # 没写 where: 默认是标题 + 正文, 一条评论规矩查的全是笔记
     {**WORDS, "where": ["title", "body", "tags", "comments"]},
     {"kind": "required_phrase", "any": ["示例话术"], "where": ["body", "comments"]},
-    {"kind": "forbidden_regex", "pattern": "示例{2,}", "where": ["body"]},
+    {"kind": "forbidden_regex", "pattern": "示例{2,}"},
 ])
 def test_a_comment_only_head_stores_the_check_on_comments_only(rule_client, check):
     out = core.record_rule(rule_client, PROJ, "示例牌X9 的评论不聊价格：不写几折", user_id=ME, check=check)
@@ -198,6 +198,15 @@ def test_a_comment_only_head_stores_the_check_on_comments_only(rule_client, chec
     ("结尾不要引导评论，不写「示例禁词」", {**WORDS, "where": ["body"]}, ["body"]),
     ("引导评论的那一句放文末，别放开头", dict(WORDS), ["title", "body"]),
     ("评论区：示例牌不用代称", {**WORDS, "where": ["comments"]}, ["comments"]),
+    # 2026-11-12 复审 C1 ── 第一句(到句号 / 分号)里过了第一个逗号才点到正文 / 标题 / 笔记的: 说的是笔记, 不收窄
+    ("示例禁词只在评论区出现，正文和标题不写", {**WORDS, "where": ["title", "body"]}, ["title", "body"]),
+    ("示例禁词只放评论，正文不提", dict(WORDS), ["title", "body"]),
+    ("示例禁词只放评论，笔记里不提", {**WORDS, "where": ["body", "comments"]}, ["body", "comments"]),
+    # 明说了 where、里面没有 comments 的: 调用方定的, 照存(说的是笔记里求评论的那种句子)
+    ("不写求评论求关注的句子", {**WORDS, "where": ["body"]}, ["body"]),
+    ("别说评论区告诉你", {**WORDS, "where": ["body"]}, ["body"]),
+    ("不要让读者去评论区找链接", {**WORDS, "where": ["title", "body"]}, ["title", "body"]),
+    ("示例牌X9 的评论不聊价格：不写几折", {"kind": "forbidden_regex", "pattern": "示例{2,}", "where": ["body"]}, ["body"]),
 ])
 def test_heads_that_also_name_the_post_keep_the_where_they_were_given(rule_client, content, check, where):
     """两边都管的规则收窄了就悄悄少查正文: 开头那一句点到正文 / 标题 / 笔记 / 话题、或者说的是笔记里引导评论的,
@@ -207,9 +216,69 @@ def test_heads_that_also_name_the_post_keep_the_where_they_were_given(rule_clien
     assert "check_where_note" not in out
 
 
-def test_a_length_check_is_left_alone(rule_client):
-    out = core.record_rule(rule_client, PROJ, "评论每条不超过三十字", user_id=ME, check={"kind": "max_len", "max": 30})
-    assert out["check"] == {"kind": "max_len", "where": "body", "max": 30} and "check_where_note" not in out
+def test_a_post_rule_whose_first_clause_names_comments_checks_the_post(rule_client):
+    """2026-11-12 复审 C1: 「只在评论区出现, 正文和标题不写」原来只看第一个逗号之前那半句, where 被改成只查评论 —— 正文
+    里写了不报, 评论里写了(规则要它在那儿)反而报「必须改」; 带着 where 再记一次还是被改回去, 想存的检查存不进去。"""
+    content, check = "示例禁词只在评论区出现，正文和标题不写", {**WORDS, "where": ["title", "body"]}
+    core.record_rule(rule_client, PROJ, content, user_id=ME, severity="hard", check=check)
+    row = rule_client.rows["memories"][0]
+    drafts = [{"title": "甲", "body": "正文里写了示例禁词", "comments": ["评论里也有示例禁词"]}]
+    assert [h["where"] for h in rulecheck.check([core._comment_check_rule(row)], drafts)[0]] == ["body"]
+    # 没写 where 被收窄的(回包里说了), 带着 where 再记一次就照存
+    first = core.record_rule(rule_client, PROJ, "不写求评论的句子", user_id=ME, check=dict(WORDS))
+    assert first["check"]["where"] == ["comments"] and first["check_where_note"] == core.COMMENT_CHECK_NOTE
+    again = core.record_rule(rule_client, PROJ, "不写求评论的句子", user_id=ME, check={**WORDS, "where": ["title", "body"]})
+    assert again["check"]["where"] == ["title", "body"] and "check_where_note" not in again
+
+
+def test_reading_narrows_only_stored_checks_that_include_comments():
+    """库里已经存着的: where 里带 comments、第一句又只说评论的才按只查评论算(11-11 线上那一条的形状, 冒号后面带着
+    「话题」也照收窄); where 里没有 comments 的是记的时候定下的, 读的时候不再改。"""
+    stored = _rule(1, "forbidden_word", {"words": ["几折"], "where": ["body", "comments"]},
+                   content="示例牌X9 的评论不聊价格：不写几折，回避优惠力度这个话题")
+    assert core._comment_check_rule(stored)["rule_payload"]["where"] == ["comments"]
+    post_only = _rule(2, "forbidden_word", {"words": ["几折"], "where": ["title", "body"]}, **STORED)
+    assert core._comment_check_rule(post_only) is post_only
+    tail = _rule(3, "forbidden_word", {"words": ["几折"], "where": ["body", "comments"]}, content="几折只放评论，正文不提")
+    assert core._comment_check_rule(tail) is tail
+
+
+def test_a_length_check_on_a_comment_only_rule_is_not_stored(rule_client):
+    """2026-11-12 复审 C3: max_len 只数标题 / 正文。「评论每条不超过三十字」带着它存下去, 每篇笔记存档都报
+    「正文 N 字, 上限 30」(硬约束就是「必须改」), 评论反而一条不查。规则原文照记, check 不存, 回一句。"""
+    out = core.record_rule(rule_client, PROJ, "评论每条不超过三十字", user_id=ME, severity="hard",
+                           check={"kind": "max_len", "max": 30})
+    row = rule_client.rows["memories"][0]
+    assert row["content"] == "评论每条不超过三十字" and row.get("rule_kind") is None and row.get("rule_payload") is None
+    assert "check" not in out and out["given_when_writing_comments"] is True
+    assert out["check_where_note"] == core.COMMENT_LEN_CHECK_NOTE == (
+        "这条规则开头说的是评论, 字数检查(max_len)只数标题 / 正文, 所以没存 check; 规则原文记下了, 写评论时照给。")
+    c = desk_client(memories=[_rule(1, row.get("rule_kind"), row.get("rule_payload"), content=row["content"])])
+    assert "rule_checks" not in core.commit_drafts(c, PROJ, distinct_drafts(2), user_id=ME)
+    assert "max_len" in tools.record_rule.__doc__ and "只说评论的规则带 max_len 时不存 check" in tools.record_rule.__doc__
+
+
+@pytest.mark.parametrize("content, where", [("正文不超过三百字，评论另算", "body"), ("评论和正文都不超过三百字", "body"),
+                                            ("评论每条不超过三十字，正文不超过三百字", "body"), ("标题不超过二十字", "title")])
+def test_length_checks_on_post_rules_are_stored_as_before(rule_client, content, where):
+    out = core.record_rule(rule_client, PROJ, content, user_id=ME, check={"kind": "max_len", "max": 300, "where": where})
+    assert out["check"] == {"kind": "max_len", "where": where, "max": 300} and "check_where_note" not in out
+
+
+def test_a_muted_rule_is_not_said_to_reach_comment_writing(rule_client):
+    """2026-11-12 复审 C6: 停用着的规则再记一次(原文一样, 命中同一行, 停用不会被清掉), 回包原来说写评论时会给 —— 其实
+    comments_for 不给。按库里那一行算, 停用着就回 false, 并说一句怎么恢复。"""
+    first = core.record_rule(rule_client, PROJ, "评论区：不带链接", user_id=ME)
+    assert first["given_when_writing_comments"] is True and "muted_note" not in first
+    core.set_rule_state(rule_client, first["memory_id"], "mute", user_id=ME)
+    again = core.record_rule(rule_client, PROJ, "评论区：不带链接", user_id=ME)
+    assert again["memory_id"] == first["memory_id"] and core._comment_rules(rule_client, PROJ, ME) == ([], [])
+    assert again["given_when_writing_comments"] is False
+    assert again["muted_note"] == core.RULE_MUTED_NOTE and "unmute" in core.RULE_MUTED_NOTE
+    core.set_rule_state(rule_client, first["memory_id"], "unmute", user_id=ME)
+    back = core.record_rule(rule_client, PROJ, "评论区：不带链接", user_id=ME)
+    assert back["given_when_writing_comments"] is True and "muted_note" not in back
+    assert "``muted_note``" in tools.record_rule.__doc__
 
 
 # ── 4. 库里已经存着的那种 ───────────────────────────────────────────────────────────────────────
@@ -340,7 +409,9 @@ def test_a_made_up_slot_id_is_refused_with_the_way_out(wired, monkeypatch):
         tools.score_comments([{"slot": IDS[i] if i < 4 else f"q{i + 1}", "text": t} for i, t in enumerate(TWENTY)],
                              link=LINK, _user_id=ME)
     assert str(e.value) == ("第 5 条评论的 slot 'q5' 不是 comments_for 给的评论位 id(q1 / q2 / exp / reply); 不属于这几种的"
-                            "评论不带 slot 就行, 去掉它的 slot、整组再送一次(自定义评论位要传整个对象, 而且要带 id)")
+                            "评论不带 slot 就行: 整组里 slot 不是这几个 id 的都去掉 slot、再送一次(自定义评论位要传整个对象, "
+                            "而且要带 id)")
+    assert "去掉它的 slot" not in str(e.value), "2026-11-12 复审 C5: 只说「它」的话照字面做, 二十条里编了十六个 id 要被拒十六次"
     assert calls == []
 
 
@@ -360,10 +431,13 @@ def test_doing_what_the_errors_say_goes_through_in_one_call(wired, monkeypatch):
 def test_whole_set_question_ids_become_plain_names_marked_as_reference():
     line = core.THREAD_HINT_PREFIX + "praise_share、same_template、has_friction、thread_arranged"
     assert core._thread_lines([{"slot": None, "why": line}]) == [
-        "整组参考(只是参考, 不用为它重写): 夸品牌的评论占了多数、夸品牌的几条是同一个句式、"
-        "没有质疑、追问价格或效果这类审慎的声音、整体读着像安排出来的"]
+        "整组参考(只是参考, 不用为它重写): 夸品牌的评论占了多数；夸品牌的几条是同一个句式；"
+        "没有质疑、追问价格或效果这类审慎的声音；整体读着像安排出来的"]
+    # 2026-11-12 复审 C7: 原来用顿号连, 「没有质疑、追问价格或效果…」自己带着顿号, 读成三样、第三样成了「有人在追问价格」
+    assert core._thread_lines([{"slot": None, "why": core.THREAD_HINT_PREFIX + "praise_share、has_friction"}]) == [
+        core.THREAD_HINT_HEAD + "夸品牌的评论占了多数；没有质疑、追问价格或效果这类审慎的声音"]
     assert core._thread_lines([{"slot": None, "why": core.THREAD_HINT_PREFIX + "praise_share、new_question"}]) == [
-        core.THREAD_HINT_HEAD + "夸品牌的评论占了多数、new_question"], "不认识的 id 原样留着"
+        core.THREAD_HINT_HEAD + "夸品牌的评论占了多数；new_question"], "不认识的 id 原样留着"
     for name in core.THREAD_HINT_NAMES.values():
         assert "帖子" not in name and not any(w in name for w in ("改成", "要", "必须", "应该")), "只说看到了什么, 不说怎么改"
 

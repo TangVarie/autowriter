@@ -95,6 +95,24 @@ def test_a_timed_out_brief_counts_zero_cards_even_if_the_selection_finishes_late
                                         "statuses": {"timeout": 1}}
 
 
+def test_an_earlier_sessions_timeouts_do_not_make_a_later_batch_a_no_cards_batch(monkeypatch):
+    """2026-11-12 复审 borrow-1: ``statuses`` 是这个(项目, 身份)近 12 小时所有借卡的合计, 团队共用一个身份 —— 上午那一场
+    简报和补借都超时, 两小时后另一场随简报拿到了卡, 它那一行的 statuses 里照样有 timeout 和 followup_timeout。docs 原来说
+    「同时有这两样 = 简报没等到、补借也没等到」, §3.8 的查询也这么数, 把拿到卡的批次数成了没卡的。要和 shown_max = 0 一起看。"""
+    core._note_lessons_shown(PID, ME, {"lessons": [], "status": "timeout"})
+    core._note_lessons_shown(PID, ME, {"lessons": []}, status=core.LESSONS_FOLLOWUP_TIMEOUT)
+    core._note_lessons_shown(PID, ME, {"lessons": [{}, {}], "status": "borrowed"})
+    assert core._lessons_meta(PID, ME) == {"borrows": 3, "shown": 2, "status": "borrowed", "shown_max": 2,
+                                           "statuses": {"timeout": 1, "followup_timeout": 1, "borrowed": 1}}
+    from pathlib import Path
+    doc = (Path(__file__).resolve().parent.parent / "docs" / "deskcore.md").read_text(encoding="utf-8")
+    assert ("(meta->'flywheel_lessons'->>'shown_max')::int = 0\n"
+            "                          and (meta->'flywheel_lessons'->'statuses'->>'followup_timeout')::int > 0) "
+            "as followup_timed_out") in doc
+    assert "`statuses` 里同时有 `timeout` 和" not in doc, "不带 shown_max = 0 的那句读法"
+    assert doc.count("`shown_max = 0` 而且 `statuses` 里有 `followup_timeout`") == 2
+
+
 def test_another_projects_borrow_is_not_counted(monkeypatch):
     monkeypatch.setattr(lib, "fetch_flywheel_lessons", _Librarian(PATTERNS))
     core._note_lessons_shown("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", ME, {"lessons": [{}, {}], "status": "borrowed"})
