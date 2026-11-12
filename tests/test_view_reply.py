@@ -896,3 +896,28 @@ def test_the_fallback_part_is_the_one_of_the_highest_numbered_recorded_version(v
     post = core.view_page_data(c, [batch], int(time.time()) + 3600)["posts"][0]
     assert post["title"] == "第4版的标题" and post["direction"] == "第3版的方向"
     assert [x["text"] for x in post["comments"]] == ["第3版记的评论"]
+
+
+def test_a_revision_of_a_version_another_entry_made_keeps_what_was_recorded_earlier(view_on):
+    """codex review on aw#154: 没有模板的项目, 被替换的那一版是别的入口改出来的(没记过话题 / 评论 / 方向), 改稿只传标题正文时
+    沿用不到东西, 记下的是一份空的 —— 原来页面只看现在那一版记的那一份, 空的那份挡住了「用别的版本记的」那条退路, 评论和
+    小标签就没了。现在按版一版一版叠上来: 没传的沿用更早记的, 传了的(包括传空列表清空)照这次的。"""
+    batch, item = "aaaaaaaa-0000-0000-0000-0000000000e1", "aaaaaaaa-0000-0000-0000-0000000000e2"
+    v1, v2, v3 = (f"aaaaaaaa-0000-0000-0000-0000000000e{k}" for k in (3, 4, 5))
+    c = desk_client()
+    first = {"tags": ["话题甲"], "comments": [{"role": "reader", "text": "第1版记的评论"}], "direction": "第1版的方向"}
+
+    def page(last_part):
+        c.rows["batches"] = [{"id": batch, "project_id": PROJ, "created_at": "2026-11-12T02:00:00+00:00",
+                              "params": {"source": "deskcore",
+                                         core.DELIVERY_PARTS_KEY: {"order": [v1], "parts": {v1: first, v3: last_part}}}}]
+        c.rows["items"] = [{"id": item, "batch_id": batch, "best_version_id": None}]
+        c.rows["versions"] = [{"id": v, "item_id": item, "version_num": n, "title": f"第{n}版的标题", "body": f"第{n}版的正文"}
+                              for n, v in ((1, v1), (2, v2), (3, v3))]                 # v2: 别的入口改出来的, 没记过
+        return core.view_page_data(c, [batch], int(time.time()) + 3600)["posts"][0]
+
+    post = page({})
+    assert post["title"] == "第3版的标题" and post["direction"] == "第1版的方向"
+    assert [x["text"] for x in post["comments"]] == ["第1版记的评论"] and post["copy_post"].endswith("#话题甲")
+    cleared = page({"comments": []})
+    assert cleared["comments"] == [] and cleared["direction"] == "第1版的方向", "传了空列表是清空, 没传的照旧沿用"

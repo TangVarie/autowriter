@@ -5389,7 +5389,8 @@ def view_page_data(client, batch_ids: list[str], expires_at: int) -> dict:
     (``DELIVERY_PARTS_KEY`` 的 order), 没记顺序的、记的顺序里没有的排在后面(按每篇建的先后 items.created_at: 一批里的 item
     是照写手传的顺序一篇一篇建的, 生产上和记下的顺序对得上; 时间一样或者没有的再按 item id, 每次打开都一样)。话题 / 评论 /
     方向取现在那一版记的那一份; 现在那一版没记(别的入口改出来的一版)就用这一篇别的版本里版本号最大的那一份
-    (``version_ids`` 是按版本号从旧到新排的) —— 页面只是给人看的, 评论旧一点比整块没有强。项目的交付模板坏了当没有模板排, 不拦。"""
+    (``version_ids`` 是按版本号从旧到新排的) —— 页面只是给人看的, 评论旧一点比整块没有强。没有模板的项目按样叠: 现在那一版
+    没传的那几样沿用更早的版本记的。项目的交付模板坏了当没有模板排, 不拦。"""
     ids = list(dict.fromkeys(str(b) for b in batch_ids))
     owner = store.batch_projects(client, ids)
     projects = {owner.get(b) for b in ids}
@@ -5427,9 +5428,21 @@ def view_page_data(client, batch_ids: list[str], expires_at: int) -> dict:
             cur = it.get("current")
             if not cur:
                 continue
-            part = parts.get(cur["id"])
-            if not isinstance(part, dict):
-                part = next((parts[v] for v in reversed(it["version_ids"]) if isinstance(parts.get(v), dict)), {})
+            if tpl is None:
+                # 没有模板的项目: 现在那一版没传的那几样沿用这一篇更早的版本记的(一版一版叠上来, 到现在那一版为止; 传了
+                # ``tags: []`` 这种算传了, 照清空)。只看现在那一版记的那一份不够(codex review on aw#154): 被替换的那一版要是
+                # 别的入口改出来的、没记过, 改稿时沿用不到东西, 记下的是一份空的 —— 它又挡住了下面「用别的版本记的」那条
+                # 退路, 话题、评论、小标签就从页面上没了。
+                part = {}
+                for v in it["version_ids"]:
+                    if isinstance(parts.get(v), dict):
+                        part.update(parts[v])
+                    if v == cur["id"]:
+                        break
+            else:
+                part = parts.get(cur["id"])
+                if not isinstance(part, dict):
+                    part = next((parts[v] for v in reversed(it["version_ids"]) if isinstance(parts.get(v), dict)), {})
             drafts.append({**part, "title": cur["title"], "body": cur["body"]})
         batches.append({"created_at": info[bid].get("created_at"), "drafts": drafts})
     return viewpage.build_page(project.get("name") or "", tpl, batches, expires_at=expires_at)
