@@ -721,6 +721,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # 兜住之后照样留痕(status.state=error + WARN 日志), 不吞成看似成功。
     borrowed = _borrow_for_brief_bounded(project, brief, user_id=user_id, started=started)
     out["lessons"] = borrowed["lessons"]
+    if borrowed.get("paid_boost_note"):
+        out["lessons_paid_boost_note"] = borrowed["paid_boost_note"]
     if borrowed.get("validated_patterns"):
         out["validated_patterns"] = borrowed["validated_patterns"]
         out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
@@ -10671,6 +10673,24 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
 # 给模型看的卡数一致", 免得哪天馆员放宽了, 简报被十几张卡撑爆。
 LESSON_CAP = int(getattr(memory, "FLYWHEEL_CARD_CAP", 5) or 5)
 
+# 经验卡的源帖投过流(2026-11-12, owner 定: 这种卡照借, 明说是投流起量的, 让运营自己判断; TV D-151 第 13 条)。
+# 馆员在卡上标 ``paid_boost: true``, ``why_it_worked`` 开头带一句「注意: 这篇是投流起量的…」/「注意: 这篇投过流…」。
+# 那一句到了模型手里, 可协议和工具说明里没有一处叫它转告用户 —— 「让运营自己判断」就落空了。所以回包里再带一句
+# 说给模型听的话(不动协议): 有几张这样的卡, 借鉴或者提到它们时把卡上那一句原样告诉用户一次。
+PAID_BOOST_LESSON_NOTE = ("这次的经验卡里有 {n} 张来自投过流的帖(卡上 paid_boost 是 true, why_it_worked 开头那句「注意: …」说的就是它): "
+                          "它的数据不全是内容带来的。借鉴这{n_word}卡的写法、或者跟用户提到{it}时, 把卡上那一句原样告诉用户一次, "
+                          "借不借由用户判断; 不要把{it}的数据说成内容验证过的效果。")
+
+
+def _paid_boost_note(lessons) -> str | None:
+    """这批经验卡里有投过流的帖的(``paid_boost`` 是 True)就回那句说给模型听的话, 没有回 None。只认布尔的 True:
+    馆员读不到投流标记时给的是 null, 不当成投过流。"""
+    n = sum(1 for c in lessons or [] if isinstance(c, dict) and c.get("paid_boost") is True)
+    if not n:
+        return None
+    return PAID_BOOST_LESSON_NOTE.format(n=n, n_word="张" if n == 1 else "几张", it="它" if n == 1 else "它们")
+
+
 # 借阅结局里"要人管"的那三种 —— 留痕用。empty 是正常结局, 不记 WARN。
 _BORROW_NEEDS_ATTENTION = frozenset({
     librarian_client.BORROW_NOT_CONFIGURED,
@@ -10849,6 +10869,9 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
         _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []), carry=carry)
         # 这一次实际带出去几张卡(超时 = 0), 给存档那一行指标(A3)
         _note_lessons_shown(project.get("id"), user_id, out, status=status)
+        note = _paid_boost_note(out.get("lessons"))
+        if note:
+            out["paid_boost_note"] = note               # 有投过流的帖的卡: 叫模型把卡上那一句转告用户(见常量)
         return out
 
     def _failed(detail: str) -> dict:

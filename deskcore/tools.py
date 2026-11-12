@@ -376,6 +376,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         target_audience / tone / extra_instructions 照传, flywheel_arm 传这份简报里的); 只调这一次, 还是没有卡就照常写。
         只借钩子、结构、手法,
         严禁照抄标题主干或具体句子; synthetic=true 的卡指标未经验证。
+        paid_boost=true 的卡来自投过流的帖(why_it_worked 开头有一句「注意: …」): 照常可以借, 数据不全是内容带来的 ——
+        返回里带 lessons_paid_boost_note 时照它说的, 把卡上那一句原样告诉用户一次, 借不借由用户判断。
         卡上的 validated_hits 是这张卡命中了哪几条已验证规律。
         external=true 的是【外部参考卡】(最多 2 张): 别家同品类的帖, 不是公司投的, 没有经过我们的数据验证;
         只借结构 / 钩子, 不抄内容, 也不要提它里面的任何品牌。
@@ -536,6 +538,8 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
     ⚠️ 严禁照抄卡里的标题主干或具体句子 —— 只借手法。
     ⚠️ 标了 synthetic=true 的卡表示【指标未经验证】(疑似人工刷量), 只能凭内容
        判断借鉴, 不要把它的数据当依据。
+    ⚠️ 标了 paid_boost=true 的卡来自投过流的帖(why_it_worked 开头有一句「注意: …」): 照常可以借, 数据不全是内容
+       带来的。返回里带 paid_boost_note 时照它说的, 把卡上那一句原样告诉用户一次, 借不借由用户判断。
 
     库里没有合适的卡时返回空列表, 这不是错误, 照常写就行。
 
