@@ -207,6 +207,10 @@ def test_a_comment_only_head_stores_the_check_on_comments_only(rule_client, chec
     ("别说评论区告诉你", {**WORDS, "where": ["body"]}, ["body"]),
     ("不要让读者去评论区找链接", {**WORDS, "where": ["title", "body"]}, ["title", "body"]),
     ("示例牌X9 的评论不聊价格：不写几折", {"kind": "forbidden_regex", "pattern": "示例{2,}", "where": ["body"]}, ["body"]),
+    # codex review on aw#153 ── 逗号后面用「全文 / 文末 / 通篇」点到笔记的, 和写「正文」的一样不收窄
+    ("评论不写示例禁词，全文也不写", {**WORDS, "where": ["body", "comments"]}, ["body", "comments"]),
+    ("评论里不出现示例禁词，文末同样不出现", {**WORDS, "where": ["body", "comments"]}, ["body", "comments"]),
+    ("评论不带示例禁词，通篇都不带", dict(WORDS), ["title", "body"]),
     # 2026-11-12 复审 X-1 ── 说的是这个词该待在哪儿(只能在评论区), 不是评论该怎么写: 没写 where 也不收窄, 检查照旧查标题和正文
     ("示例禁词只能出现在评论区", dict(WORDS), ["title", "body"]),
     ("示例禁词仅限评论区出现", dict(WORDS), ["title", "body"]),
