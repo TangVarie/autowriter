@@ -37,6 +37,7 @@
           DESKCORE_VIEW_PAGE / DESKCORE_VIEW_SECRET / DESKCORE_PUBLIC_URL   都可选, 管「排好版的页面」
              (GET /v/{令牌}, 见 viewpage.py): 都不配也能用 —— 签名的钥匙从 service_role 派生, 地址用
              Railway 给的公网域名; DESKCORE_VIEW_PAGE=0 整个关掉。
+             DESKCORE_PLAIN_LAYOUT=0 不给没有交付模板的项目那句默认的排法(core.PLAIN_LAYOUT_NEXT_STEP, 默认给)。
           DESKCORE_ALLOWED_ORIGINS  可选, 逗号分隔的完整 origin; 不设 = 允许全部。
              放开是安全的: 身份靠显式传的 key, 从不靠 cookie, 浏览器不会自动
              附上 —— 没有 CSRF 面。见 CORS 那段。
@@ -967,7 +968,7 @@ async def view_page(token: str):
 
 
 # uvicorn 的访问日志每个请求一行, 带路径 —— /v/ 后面那一串是令牌, 换掉再写。uvicorn 先配好日志再 import 这个模块, 所以
-# 过滤器挂得上; 别的日志器不动。(平台自己的边缘日志照样记路径, 那一层管不到, 见 docs/deskcore.md。)
+# 过滤器挂得上; 别的日志器不动。(平台自己的边缘日志照样记路径, 那一层管不到, 见 docs/deskcore.md §3.29。)
 class _HideViewToken(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:

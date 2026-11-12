@@ -419,7 +419,8 @@ def test_a_broken_template_falls_back_to_the_plain_layout(db):
     batch = db.add_batch(PROJ_T, [_draft(0)], created_at="2026-11-12T06:30:00+00:00")
     db.rows["projects"][0]["default_params"] = json.dumps({"delivery": {"layout": "不认识的版式"}}, ensure_ascii=False)
     post = core.view_page_data(db, [batch["id"]], 1_900_000_000)["posts"][0]
-    assert post["copy_post"] == "【标题】合成标题第0篇\n【正文】第0篇的第一段。\n第0篇的第二段。"
+    # 按没有模板排: 写手单独传的话题照样接在正文后面(模板加的固定话题没有了)
+    assert post["copy_post"] == "【标题】合成标题第0篇\n【正文】第0篇的第一段。\n第0篇的第二段。\n#话题0甲 #话题0乙"
 
 
 def test_injection_through_stored_rows_stays_text_end_to_end(client, db):

@@ -61,12 +61,22 @@ _TITLE_ONLY_RE = re.compile(r"【标题】\s*(.*)$", re.S)
 _TAG_RE = re.compile(r"#[^\s#\[\]]+(?:\[话题\]#?)?")
 
 
+# 排好版页面的那一句(viewpage.NOTE, 2026-11-12): score_drafts 把它接在 delivery.text 的最后一行, 写手把交付稿整段贴进
+# 飞书时它可能跟着最后一篇进了同一格。那一行不是稿子: 留着的话最后一篇的正文末尾多一行字和一个链接, 改稿差异里会多出一句
+# 「加了一句」, 链接(拿到就能看那一批稿子)也跟着进了后面每一步。拆标题正文之前整行拿掉。只认「排好版的页面」开头、
+# 以 ``/v/令牌`` 结尾的一整行; 这里不 import viewpage(本模块只做匹配), 两边的写法由 tests/test_view_reply.py 钉在一起。
+_VIEW_NOTE_RE = re.compile(r"^[^\S\n]*排好版的页面[^\n]*https?://[^\s]+/v/[A-Za-z0-9_-]+[^\S\n]*$\n?", re.M)
+
+
 def parse_raw(raw: str | None) -> tuple[str, str]:
     """TV 的 raw_content(「【标题】… 【正文】…」)→ (标题, 正文)。
 
     没有标记的整段当正文、标题留空 —— 指纹主要靠正文, 丢正文等于白对。
+    交付稿末尾那一行页面链接(_VIEW_NOTE_RE)不算稿子, 先拿掉。
     """
     text = (raw or "").replace("\r\n", "\n")
+    if "/v/" in text:
+        text = _VIEW_NOTE_RE.sub("", text)
     mb = _BODY_RE.search(text)
     if mb:
         mt = _TITLE_RE.search(text)

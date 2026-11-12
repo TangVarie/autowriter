@@ -449,20 +449,37 @@ def test_table_template_copies_the_same_text_the_table_cells_hold():
 
 
 def test_project_without_a_template_copies_title_newline_body_and_tvlink_reads_it_back():
-    drafts = [{"title": " 没有模板的标题 ", "body": "第一段。\n第二段。\n#话题甲 #话题乙\n", "tags": ["不会拼进去"],
+    drafts = [{"title": " 没有模板的标题 ", "body": "第一段。\n第二段。\n#话题甲 #话题乙\n", "tags": ["#话题甲"],
                "comments": [{"role": "reader", "text": "写手传了的评论"}], "direction": "一个方向"}]
     page = viewpage.build_page("示例项目", None, [{"created_at": None, "drafts": drafts}], expires_at=EXP)
     post = page["posts"][0]
-    assert post["copy_post"] == "【标题】没有模板的标题\n【正文】第一段。\n第二段。\n#话题甲 #话题乙"
+    assert post["copy_post"] == "【标题】没有模板的标题\n【正文】第一段。\n第二段。\n#话题甲 #话题乙", "正文里已有的话题不再拼一遍"
     assert tvlink.parse_raw(post["copy_post"]) == ("没有模板的标题", "第一段。\n第二段。\n#话题甲 #话题乙")
     assert post["paragraphs"] == ["第一段。", "第二段。"] and post["tags"] == ["话题甲", "话题乙"], "显示时话题单独一行"
     assert post["copy_comments"] == "读者：写手传了的评论" and post["direction"] == "一个方向"
     assert post["comments"] == [{"role": "reader", "label": "读者：", "text": "写手传了的评论"}]
 
 
+def test_project_without_a_template_keeps_the_tags_the_writer_passed_separately():
+    """工具说明叫模型把话题放在 tags 字段里、不塞进正文; 没有模板时模型交稿自己会排上去 —— 页面和复制出去的字不能少这一行。
+    正文末尾另有话题的, 两处的都显示, 不重复。"""
+    drafts = [{"title": "话题单独传的一篇", "body": "第一段。\n第二段。", "tags": ["#话题甲", "话题乙[话题]#", "话题甲"]},
+              {"title": "两处都有话题的一篇", "body": "只有一段。\n#话题丙", "tags": ["话题丁", "话题丙"]},
+              {"title": "没带话题的一篇", "body": "只有一段。", "tags": []}]
+    page = viewpage.build_page("示例项目", None, [{"created_at": None, "drafts": drafts}], expires_at=EXP)
+    one, two, three = page["posts"]
+    assert one["copy_post"] == "【标题】话题单独传的一篇\n【正文】第一段。\n第二段。\n#话题甲 #话题乙"
+    assert one["tags"] == ["话题甲", "话题乙"] and one["paragraphs"] == ["第一段。", "第二段。"]
+    assert two["copy_post"] == "【标题】两处都有话题的一篇\n【正文】只有一段。\n#话题丙\n#话题丁"
+    assert two["tags"] == ["话题丙", "话题丁"] and two["paragraphs"] == ["只有一段。"]
+    assert three["copy_post"] == "【标题】没带话题的一篇\n【正文】只有一段。" and three["tags"] == []
+    html_text = viewpage.render(page)
+    assert "#话题甲 #话题乙" in html_text and "#话题丙 #话题丁" in html_text
+
+
 def test_a_label_line_above_the_title_marker_is_ignored_by_tvlink():
-    """没有模板的项目默认的交付写法(part 2)在【标题】上面多一行「第N篇 · 场景」: tv-sync 拆的时候不认那一行。"""
-    raw = "第1篇 · 早上照镜子\n【标题】没有模板的标题\n【正文】第一段。\n第二段。"
+    """没有模板的项目默认的交付写法(core.PLAIN_LAYOUT_NEXT_STEP)在【标题】上面多一行「第N篇 · 场景」: tv-sync 拆的时候不认那一行。"""
+    raw = "第1篇 · 合成的场景甲\n【标题】没有模板的标题\n【正文】第一段。\n第二段。"
     assert tvlink.parse_raw(raw) == ("没有模板的标题", "第一段。\n第二段。")
 
 

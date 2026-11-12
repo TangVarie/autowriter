@@ -93,7 +93,8 @@ def _commit(monkeypatch):
     real = store.mint_draft_identity
 
     def spy(sb, project_id, user_id, tactic, entries, *, batch_params=None):
-        captured["params"] = batch_params
+        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比
+        captured["params"] = {k: v for k, v in (batch_params or {}).items() if k != core.DELIVERY_PARTS_KEY}
         return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
     monkeypatch.setattr(store, "mint_draft_identity", spy)
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
@@ -105,7 +106,9 @@ def _commit(monkeypatch):
         for i in range(len(args.get("_rows") or []))]
     out = core.commit_drafts(c, PID, [{"title": "标题一", "body": "正文一二三四五六七八", "keywords": ["a"]}], user_id=ME)
     assert out["batch_id"]
-    assert c.rows["batches"][0]["params"] == captured["params"]
+    stored = dict(c.rows["batches"][0]["params"])
+    assert set(stored.pop(core.DELIVERY_PARTS_KEY)) == {"order", "parts"}
+    assert stored == captured["params"]
     return captured["params"]
 
 
@@ -226,7 +229,8 @@ def _commit_with(monkeypatch, **kw):
     real = store.mint_draft_identity
 
     def spy(sb, project_id, user_id, tactic, entries, *, batch_params=None):
-        captured["params"] = batch_params
+        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比
+        captured["params"] = {k: v for k, v in (batch_params or {}).items() if k != core.DELIVERY_PARTS_KEY}
         return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
     monkeypatch.setattr(store, "mint_draft_identity", spy)
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
@@ -395,7 +399,8 @@ def _commit_out(monkeypatch, **kw):
     real = store.mint_draft_identity
 
     def spy(sb, project_id, user_id, tactic, entries, *, batch_params=None):
-        captured["params"] = batch_params
+        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比
+        captured["params"] = {k: v for k, v in (batch_params or {}).items() if k != core.DELIVERY_PARTS_KEY}
         return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
     monkeypatch.setattr(store, "mint_draft_identity", spy)
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)

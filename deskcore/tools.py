@@ -881,7 +881,13 @@ def score_drafts(project_id: str, drafts: list[dict], flywheel_arm: str = "", ta
     同一次另有新稿的排在最后)。有 problems 就先改那几篇(带 ``replaces_version_id`` 先过 check_drafts、再调一次本工具,
     新返回的 ``delivery.text`` 就是改好之后的整批)。**不管哪种, 都把 ``delivery.text`` 原样整段交给用户** ——
     不要自己拼接、替换其中几行或几段, 不要重排, 不要再加标记(用户坚持要用、被拒没存进去的那篇不在里面: 放在 ``delivery.text`` 后面单独给)。``delivery.scope`` 是 ``this_call`` 时(原来那一批这次没能一起拼出来, ``scope_fallback`` 是
-    原因)它只有这次存进去的几篇: 照样原样交, 跟用户说明这是改过的那几篇。没有 ``delivery`` 就照项目规则自己排。
+    原因)它只有这次存进去的几篇: 照样原样交, 跟用户说明这是改过的那几篇。没有 ``delivery`` 就照项目规则自己排
+    (项目没有自己的交付格式时, ``next_step`` 里有一份默认的排法)。
+
+    **排好版的页面**(2026-11-12): 存进去了的那次返回里可能带 ``view`` —— 写作台拿存下的稿子排好的一个页面(一篇一行、
+    逐篇可复制; 改稿重存后刷新就是最新的一版): ``url`` 是链接, ``expires`` 是到期时间, ``note`` 是带着链接、给用户的那一句。
+    有 ``delivery`` 时那一句已经是 ``delivery.text`` 的最后一行, 不用另贴; 没有 ``delivery`` 时把 ``view.note`` 原样放在交给
+    用户的内容的最后一行。没有 ``view`` 就不提页面。不用自己另排一份网页。
 
     **规则检查**: ``rule_checks`` 是代码按项目里带 check 的规则逐篇查出来的命中(有命中才带), 每条 ``index`` /
     ``rule_id`` / ``severity`` / ``where`` / ``what``。``what`` 以「必须改」开头的是硬约束, 改完再交; 「建议改」的

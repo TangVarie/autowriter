@@ -8,7 +8,8 @@
   · 没改的几篇照它们现在的样子、改过的换在原位, 顺序不变, 一张表一个表头; 上一轮改过的那篇用它改过的样子;
   · 改的稿子分属几批的, 一批一段按建的先后排, 同一次另有新稿的排在最后; problems 只报这次传的那几篇、下标照写手传的;
   · 拼不回来(这之前存的 batch、批里的稿子对不上)就照旧只拼改过的几篇, delivery.scope / scope_fallback 说清, next_step 多一句;
-  · 没模板的项目 batch 上一样不记、回包一个字不变; next_step 只说「原样整段交」, 不再叫模型替换其中几行。
+  · 没模板的项目 batch 上也记(2026-11-12 起: 排好版的页面要靠它排先后), 回包照旧没有 delivery; next_step 只说
+    「原样整段交」, 不再叫模型替换其中几行。
 
 所有示例文本都是合成的。
 """
@@ -185,7 +186,9 @@ def test_a_failed_lookup_falls_back_without_touching_the_archive(table_batch, mo
 # 4 · 记下的那一份
 # ══════════════════════════════════════════════════════════════════════
 
-def test_the_batch_records_order_and_parts_only_when_the_project_has_a_template():
+def test_the_batch_records_order_and_parts_with_or_without_a_template():
+    """2026-11-12 起每个项目都记(原来只在有模板时记): 排好版的页面按这一份排先后、取每篇的评论。没模板的项目回包里
+    照旧没有 delivery —— 拼交付稿只看模板, 不看这一份。"""
     c = desk_client(default_params=_params_with(BLOCKS))
     drafts = distinct_drafts(2, seed=21)
     drafts[0]["tags"] = []                                  # 传了空列表 ≠ 没传: 原样记
@@ -195,8 +198,14 @@ def test_the_batch_records_order_and_parts_only_when_the_project_has_a_template(
     assert rec["parts"] == {out["version_ids"][0]: {"tags": []}, out["version_ids"][1]: {}}
 
     plain = desk_client()
-    core.commit_drafts(plain, PROJ, distinct_drafts(2, seed=21), user_id=ME)
-    assert core.DELIVERY_PARTS_KEY not in plain.rows["batches"][0]["params"], "没模板就不记"
+    loose = distinct_drafts(2, seed=21)
+    loose[1]["comments"] = [{"role": "reader", "text": "合成的一条评论"}]
+    got = core.commit_drafts(plain, PROJ, loose, user_id=ME)
+    rec = plain.rows["batches"][0]["params"][core.DELIVERY_PARTS_KEY]
+    assert rec["order"] == got["version_ids"], "没模板也记顺序"
+    assert rec["parts"] == {got["version_ids"][0]: {},
+                            got["version_ids"][1]: {"comments": [{"role": "reader", "text": "合成的一条评论"}]}}
+    assert "delivery" not in got, "没模板的项目回包里照旧没有 delivery"
 
 
 def test_a_revision_adds_its_parts_to_the_original_batch_record(table_batch):

@@ -556,19 +556,27 @@ PLAIN_LABELS = {"reader": "读者：", "author": "作者回复："}
 def plain_rows(drafts: list[dict]) -> list[dict]:
     """没有交付模板的项目里每篇的那几格(排好版的页面用, 2026-11-12), 形状同 ``rows`` 的一行。``post`` 是【标题】标题、
     换行、【正文】正文: 正文原样(末尾那行话题留在正文里, 和写手交出去的一样), tv-sync 照这两个标记拆得回来。
-    ``tags`` 字段不拼(没有模板就没有话题行, 话题照项目规则写在正文末尾); 评论是写手传在 ``comments`` 里的那几条, 标签用
-    ``PLAIN_LABELS``。不报 problems: 没有模板就没有可对照的要求。"""
+
+    写手单独传在 ``tags`` 里、正文里没有的话题, 接在正文后面单独一行(``tags`` 就是这几个): 工具说明叫模型把话题放在
+    ``tags`` 字段里、不塞进正文, 没有模板时模型交稿自己会把它们排上去 —— 页面不拼的话, 页面和复制出去的字就比交出去的
+    少一行话题。正文里已经有的不重复拼。评论是写手传在 ``comments`` 里的那几条, 标签用 ``PLAIN_LABELS``。
+    不报 problems: 没有模板就没有可对照的要求。"""
     out: list[dict] = []
     for d in drafts:
         d = d if isinstance(d, dict) else {}
         title = str(d.get("title") or "").strip()
         body = str(d.get("body") or "").replace("\r\n", "\n").strip()
+        in_body = {t.casefold() for t in body_tags(body)}
+        tags = [t for t in _dedupe([norm_tag(t) for t in split_tags(d.get("tags"))]) if t.casefold() not in in_body]
         comments, _bad = comment_list(d.get("comments"))
         items = [{"role": c["role"], "label": PLAIN_LABELS[c["role"]], "text": c["text"]} for c in comments]
-        out.append({"post": DEFAULT_MARKERS["title"] + title + "\n" + DEFAULT_MARKERS["body"] + body,
+        post = [DEFAULT_MARKERS["title"] + title, DEFAULT_MARKERS["body"] + body]
+        if tags:
+            post.append(" ".join("#" + t for t in tags))
+        out.append({"post": "\n".join(post),
                     "comments": "\n".join(it["label"] + it["text"] for it in items),
                     "direction": str(d.get("direction") or "").strip(),
-                    "title": title, "body": body, "tags": [], "comment_items": items})
+                    "title": title, "body": body, "tags": tags, "comment_items": items})
     return out
 
 

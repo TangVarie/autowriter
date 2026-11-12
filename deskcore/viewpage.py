@@ -17,7 +17,7 @@
     不向任何外部地址发请求; 不开 JavaScript 也能看(只是没有复制按钮)。
 
 ⚠️ 令牌和整条链接**不进日志、不进任何一张表**: 拿到链接就能看那一批稿子, 它和钥匙是一类东西。要留痕只留「发没发」和
-batch id 的前 8 位。平台自己的访问日志会记请求路径, 那一层这里管不到(见 docs/deskcore.md 里这一节)。
+batch id 的前 8 位。平台自己的访问日志会记请求路径, 那一层这里管不到(见 docs/deskcore.md §3.29)。
 """
 
 from __future__ import annotations
@@ -67,7 +67,8 @@ _TOKEN_MAX_CHARS = (max(_TOKEN_SIZES) * 4 + 2) // 3
 # 请求里是 None。工具在线程池里跑, starlette 会把 contextvars 一并带过去(同 app._caller)。
 REQUEST_BASE: contextvars.ContextVar[str | None] = contextvars.ContextVar("deskcore_view_request_base", default=None)
 
-# 回包里那一句(写手那边原样带给用户)。part 2 把它接进 score_drafts 的回包。
+# 回包里那一句(写手那边原样带给用户): score_drafts 把它放进 view.note, 有交付稿时接在 delivery.text 的最后一行
+# (core._attach_view)。⚠️ 改写法要连 tvlink._VIEW_NOTE_RE 一起改: tv-sync 靠它认出这一行不是稿子(tests/test_view_reply.py 钉着)。
 NOTE = "排好版的页面(逐篇可复制, 改稿后刷新就是最新): {url}"
 
 _BEIJING = timezone(timedelta(hours=8))
@@ -240,15 +241,16 @@ def build_page(project_name: str, template: dict | None, batches: list[dict], *,
 
     每篇复制出去的两段字不在这里另拼: 模板项目拿 ``delivery.rows``(和 delivery.text 里那一格同一段代码), 没模板的拿
     ``delivery.plain_rows``。页面上分开显示的正文 / 话题也从那一行来; 模板不管话题、或者没有模板时, 正文末尾那行话题只是
-    显示上单独拎成一行(复制出去的还是原样留在正文里)。"""
+    显示上单独拎成一行(复制出去的还是原样留在正文里), 那一行给的话题(没模板时是写手单独传在 tags 里的)排在它后面。"""
     posts: list[dict] = []
     for b in batches:
         drafts = [d if isinstance(d, dict) else {} for d in (b.get("drafts") or [])]
         got = delivery.rows(template, drafts)[0] if template is not None else delivery.plain_rows(drafts)
         for d, r in zip(drafts, got):
-            body, tags = r["body"], list(r["tags"])
-            if not tags:
-                body, tags = delivery.lift_trailing_tags(body)
+            # 模板管话题的那一行: 正文已经摘过末尾的话题, 这里再摘是空的, 话题就是那一行给的
+            body, lifted = delivery.lift_trailing_tags(r["body"])
+            seen = {t.casefold() for t in lifted}
+            tags = lifted + [t for t in r["tags"] if t.casefold() not in seen]
             kind = d.get("kind")
             posts.append({
                 "n": len(posts) + 1,
