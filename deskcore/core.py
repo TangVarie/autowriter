@@ -12166,6 +12166,7 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
     # 不会再变, 而对照索引会变(稿子改了一版, 发布前的那版就不在索引里了; 底稿过了 45 天不再读), 每晚重量只会越量越低。
     overlap: dict[str, float] = {}
     overlap_fp: dict[str, str | None] = {}              # 量的那一刻帖的文字指纹(沿用的照旧带着)
+    score_dead: set[str] = set()                        # 帖的正文改过: 对照上的 score 是旧文字的, 定来源不看它
     ov_left: set[str] = set()                           # 时间用完没量上的: 存的时候带记号, 明晚还在范围里
     ov_deadline = time.monotonic() + TV_GATE_OVERLAP_BUDGET_S
     for nid in scope:
@@ -12173,7 +12174,10 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
             continue
         n = notes_by_id.get(nid)
         kept = postgate.stored_overlap(rows[nid].get("gate_reasons"))
-        if kept is not None and not _gate_overlap_stale(rows[nid], n):
+        stale = _gate_overlap_stale(rows[nid], n)
+        if stale or postgate.score_stale(rows[nid].get("gate_reasons")):
+            score_dead.add(nid)
+        if kept is not None and not stale:
             overlap[nid] = kept
             overlap_fp[nid] = postgate.stored_overlap_fp(rows[nid].get("gate_reasons"))
             continue
@@ -12205,9 +12209,10 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         ov = overlap.get(nid)
         # 重合还欠着没量的行来源先记 unclear: 手里只有对照上的 score 时不拿它单独定「别处写的」(这晚底稿没读出来的话,
         # score 也是拿缺了底稿的索引算的)
-        origin = postgate.ORIGIN_UNCLEAR if nid in ov_left else postgate.origin_of(row, ov)
+        origin = (postgate.ORIGIN_UNCLEAR if nid in ov_left
+                  else postgate.origin_of(row, ov, ignore_score=nid in score_dead))
         reasons = postgate.pack_reasons(verdict, overlap=ov, overlap_pending=nid in ov_left,
-                                        overlap_fp=overlap_fp.get(nid))
+                                        overlap_fp=overlap_fp.get(nid), score_stale=nid in score_dead)
         out["judged"] += 1
         counts.setdefault(origin, {}).setdefault(verdict.gate, 0)
         counts[origin][verdict.gate] += 1

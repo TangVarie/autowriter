@@ -129,7 +129,7 @@ def origin_overlap(score, prior) -> float | None:
     return min(s, p)
 
 
-def origin_of(link: Mapping, prior=None) -> str:
+def origin_of(link: Mapping, prior=None, *, ignore_score: bool = False) -> str:
     """一行对照 → 来源。``link`` 要 match_kind / version_id / score / lag_days 四个键(tv_note_links 的行);
     ``prior`` 是这篇帖和发布前写作台里的文字的重合(见 origin_overlap), 没有就只看存着的 score。
 
@@ -151,7 +151,8 @@ def origin_of(link: Mapping, prior=None) -> str:
             return ORIGIN_DESK if s is not None and s >= DESK_TITLE_MIN else ORIGIN_UNCLEAR
         return ORIGIN_DESK
     if kind in MISS_KINDS:
-        ov = origin_overlap(link.get("score"), prior)
+        # ignore_score: 对照上的 score 是对着帖的旧文字算的(帖的正文后来改过, 见 SCORE_STALE) —— 只看发布前的重合
+        ov = origin_overlap(None if ignore_score else link.get("score"), prior)
         return ORIGIN_ELSEWHERE if ov is not None and ov < ELSEWHERE_MAX else ORIGIN_UNCLEAR
     return ORIGIN_UNCLEAR
 
@@ -204,7 +205,8 @@ def classify(note: Mapping, *, vanished: Iterable[str] = frozenset(), boosted: I
 
 # ── 存进库的样子, 和读它的办法 ─────────────────────────────────────────────
 
-def pack_reasons(verdict: Verdict, *, overlap=None, overlap_pending: bool = False, overlap_fp: str | None = None) -> dict:
+def pack_reasons(verdict: Verdict, *, overlap=None, overlap_pending: bool = False, overlap_fp: str | None = None,
+                 score_stale: bool = False) -> dict:
     """结论 → gate_reasons 那一格: ``{"reasons": [...]}``; hold 的带 ``"hold": [细项]``; 对不上的行量过重合的带
     ``"overlap"``(三位小数)和 ``"overlap_fp"``(量的那一刻帖的文字指纹, tvlink.text_fp 的 16 位: 帖的正文后来改了就认得
     出来, 这个数该重量); 这晚时间用完、重合还没量的带 ``"overlap_pending": true``(量上之后这个键就没了)。
@@ -219,6 +221,8 @@ def pack_reasons(verdict: Verdict, *, overlap=None, overlap_pending: bool = Fals
             out[OVERLAP_FP] = overlap_fp
     elif overlap_pending:
         out[OVERLAP_PENDING] = True
+    if score_stale:
+        out[SCORE_STALE] = True
     return out
 
 
@@ -262,6 +266,18 @@ def stored_overlap_fp(stored) -> str | None:
     obj = _as_obj(stored)
     fp = obj.get(OVERLAP_FP) if isinstance(obj, Mapping) else None
     return fp if isinstance(fp, str) and fp else None
+
+
+# 对照上的 score 是对着帖的旧文字算的(codex review on aw#155): 补录的对照是钉住的, score 一个字不改; 帖的正文后来换了,
+# 重合重量了, 可来源在 score 和重合里取小的 —— 旧文字的 0 还在压着新量的数。正文变过一次就记下这个记号, 之后定来源
+# 不再看这一行的 score(记号一直带着; 对照本身不动)。
+SCORE_STALE = "score_stale"
+
+
+def score_stale(stored) -> bool:
+    """这一行的 score 是不是已经对不上帖现在的文字(gate_reasons 里带着 SCORE_STALE)。"""
+    obj = _as_obj(stored)
+    return isinstance(obj, Mapping) and obj.get(SCORE_STALE) is True
 
 
 def overlap_pending(stored) -> bool:

@@ -283,7 +283,7 @@ def test_reasons_are_stored_as_names_only():
     names = set(postgate.REASONS) | set(postgate.HOLD_DETAILS)
     for nid, l in _links(c).items():
         stored = l["gate_reasons"]
-        assert set(stored) <= {"reasons", "hold", "overlap", "overlap_fp", "overlap_pending"}, stored
+        assert set(stored) <= {"reasons", "hold", "overlap", "overlap_fp", "overlap_pending", "score_stale"}, stored
         assert "overlap_fp" not in stored or re.fullmatch(r"[0-9a-f]{16}", stored["overlap_fp"]), "指纹, 不是文字"
         assert all(isinstance(r, str) and r in names for r in stored["reasons"] + stored.get("hold", []))
         assert "overlap" not in stored or isinstance(stored["overlap"], float)
@@ -869,6 +869,30 @@ def test_a_copy_whose_published_body_was_replaced_later_is_measured_again():
     assert row["gate_reasons"]["overlap"] == 0.0 and row["origin"] == "elsewhere"
     assert row["gate_reasons"]["overlap_fp"] != first["overlap_fp"]
     assert row["match_kind"] == "ingested" and row["version_id"] == "vcopy", "对照照旧钉着"
+
+
+def test_a_score_computed_for_the_old_body_no_longer_decides_the_origin_once_the_body_changed():
+    """codex review on aw#155: 补录的对照是钉住的, score(0.0, 对着当初那篇不相干的文字算的)一个字不改。帖的正文后来换成了
+    发布前写作台里就有的那篇: 重合重量成 1.0, 可来源在 score 和重合里取小的 —— 旧文字的 0 压着, 还是「别处写的」。
+    正文变过就记下 score 已经对不上, 之后定来源只看发布前的重合; 对照上的 score 不动。"""
+    notes = [T._note("n2", "上周发的那篇", BODY_E)]
+    link = {**_copy_link(), "score": 0.0}
+    c = _tv(notes, links=[link])
+    _add_desk_version(c, "vprior", T.BODY_NEW, days=-3)                      # 发布之前写作台里就有的另一篇
+    core.tv_sync(c, TV)
+    assert _gate(c)["n2"][0] == "elsewhere" and "score_stale" not in _links(c)["n2"]["gate_reasons"]
+
+    _next_night()
+    notes[0] = T._note("n2", "上周发的那篇", T.BODY_NEW)                      # 正文换成了那篇
+    core.tv_sync(c, TV)
+    row = _links(c)["n2"]
+    assert row["gate_reasons"]["overlap"] == 1.0 and row["gate_reasons"]["score_stale"] is True
+    assert row["origin"] == "unclear", "不再是「别处写的」"
+    assert row["score"] == 0.0 and row["match_kind"] == "ingested", "对照上的 score 和 kind 不动"
+
+    _next_night()
+    core.tv_sync(c, TV)                                                      # 记号一直带着: 第三晚照旧不看 score
+    assert _links(c)["n2"]["origin"] == "unclear" and _links(c)["n2"]["gate_reasons"]["score_stale"] is True
 
 
 # ── store: 读写的形状 ───────────────────────────────────────────────────────────────────
