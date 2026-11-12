@@ -184,6 +184,10 @@ def question_index(pairs: list[tuple[dict, dict]], bank: dict | None) -> dict[st
 _UNSEEN_ASK_RE = re.compile(r"(?<![去到来往])评论(?!区(?:见|告诉))|(?:话题|标签)[里行]|话题标签")
 _SEEN_ASK_RE = re.compile("正文|标题|全文")
 _COMMENT_HEAD_RE = re.compile(r"\s*(?:那条|每条|这条)?评论")
+# 「评论或正文里有没有…」「评论区和标题有没有…」(codex review on aw#153): 开头的评论和正文 / 标题是并列着问的, 正文那一半
+# 看得见, 照问 —— 原来按「以评论开头」整道题不发, 「正文或评论里…」同一个意思的写法却照发。
+_JOINT_HEAD_RE = re.compile(r"\s*(?:那条|每条|这条)?评论[区里中内]{0,2}\s*(?:或者?|和|及|与|以及|跟|还是|、|/|／)\s*"
+                            r"(?:正文|标题|全文|笔记)")
 
 
 def unseen_questions(result) -> list[dict]:
@@ -199,7 +203,8 @@ def unseen_questions(result) -> list[dict]:
     return [q for q in raw
             if isinstance(q, dict) and isinstance(q.get("ask"), str) and q.get("scope") not in ("title", "body")
             and _UNSEEN_ASK_RE.search(q["ask"])
-            and (_COMMENT_HEAD_RE.match(q["ask"]) or not _SEEN_ASK_RE.search(q["ask"]))]
+            and ((_COMMENT_HEAD_RE.match(q["ask"]) and not _JOINT_HEAD_RE.match(q["ask"]))
+                 or not _SEEN_ASK_RE.search(q["ask"]))]
 
 
 # ══════════════════════════════════════════════════════════════════════

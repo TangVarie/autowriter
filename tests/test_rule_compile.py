@@ -1260,6 +1260,10 @@ def test_a_body_question_that_mentions_comments_is_still_asked():
     "这篇稿子里有没有蹭当下的热门话题？",
     "有没有给某类人群贴标签、搞对立？",
     "有没有给自己立示例人设标签？",
+    # codex review on aw#153 ── 开头的评论和正文 / 标题并列着问: 正文那一半看得见, 照问(和「正文或评论里…」一样)
+    "评论或正文里有没有替示例机构背书？",
+    "评论区和标题有没有出现示例禁词？",
+    "评论、正文里有没有报示例价格？",
 ])
 def test_a_body_question_that_only_uses_the_words_in_passing_is_still_asked(ask):
     """2026-11-12 复审 R3: 「评论区」是正文把读者往那儿引的去处(去 / 到 / 来 / 往评论区…, 评论区见 / 评论区告诉我)、「话题」
