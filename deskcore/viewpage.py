@@ -3,6 +3,7 @@
 写手那边要的是一张排好版的页面: 一篇一行, 左边笔记(小标签、【标题】、分好段的正文、话题单独一行), 右边这篇的评论。
 让写手的模型每次自己写 HTML 太慢; 版式又是每批都一样的东西 —— 所以页面由服务端拿已经存下的稿子拼, 回包里带一个链接
 (``GET /v/{令牌}``, deskcore/app.py), 写手那边的模型一个字不用多写。改稿重存之后刷新页面, 看到的就是现在那一版。
+一次交付分几组存的(一次最多存 10 篇), 后一组拿到的链接把前面几组一起带上, 一页上连着编号(core._view_session_batches)。
 
 这个模块是纯函数, 不连库、不联网(同 delivery.py / isolation.py):
 
@@ -42,8 +43,8 @@ from . import delivery
 # ══════════════════════════════════════════════════════════════════════
 
 VALID_DAYS = 14                 # 链接的有效期(只这一处)
-MAX_BATCHES = 4                 # 一个链接最多带几个 batch(改稿挂的旧 batch + 这次新建的)
-MAX_POSTS = 200                 # 一页最多排几篇: 正常一批十几二十篇, 这只是不让一页无限长
+MAX_BATCHES = 4                 # 一个链接最多带几个 batch(改稿挂的旧 batch + 这次新建的 + 同一次交付里前面几组存的)
+MAX_POSTS = 200                 # 一页最多排几篇: 一次存最多 10 篇, 一次交付两三组二三十篇, 这只是不让一页无限长
 TOKEN_VERSION = 1
 SIG_BYTES = 16
 MIN_SECRET_CHARS = 16
@@ -328,12 +329,13 @@ h2{margin:0 0 12px;font-size:19px;line-height:1.5;font-weight:700}
 .body p{margin:0 0 14px}
 .tags{margin:2px 0 0;color:var(--tag);font-size:15px}
 .count{margin:12px 0 0;color:var(--faint);font-size:13px}
+.count::before,.side-head span::before,.none::before{content:attr(data-t)}
 .side-head{align-items:center;color:var(--sub);font-size:13px}
 .cmt{margin:0 0 12px;padding:11px 14px;background:var(--cmt-bg);border-left:3px solid var(--reader);border-radius:0 8px 8px 0;font-size:15px}
 .cmt.author{border-left-color:var(--author)}
 .cmt b{margin-right:4px}
 .none{margin:0;color:var(--faint);font-size:14px}
-.copy{display:none;flex:none;align-items:center;padding:3px 12px;border:1px solid var(--btn-line);border-radius:6px;background:var(--btn);color:var(--btn-text);font:inherit;font-size:13px;line-height:1.6;white-space:nowrap;cursor:pointer}
+.copy{display:none;flex:none;align-items:center;-webkit-user-select:none;user-select:none;padding:3px 12px;border:1px solid var(--btn-line);border-radius:6px;background:var(--btn);color:var(--btn-text);font:inherit;font-size:13px;line-height:1.6;white-space:nowrap;cursor:pointer}
 .js .copy{display:inline-flex}
 .copy:hover{border-color:var(--pill);color:var(--pill)}
 .copy.done{border-color:var(--ok);color:var(--ok)}
@@ -383,8 +385,18 @@ def _button(label: str, kind: str, text: str | None = None) -> str:
             f"{_e(label)}</button>")
 
 
+def _chrome(tag: str, cls: str, text: str) -> str:
+    """页面自己的小字(字数那一行、「评论 N 条」、「这篇没有评论」): 字放在属性里, 由样式画出来(``content:attr(data-t)``)。
+    看得见, 但用鼠标拖选、全选复制时带不走 —— 写手习惯拖选一篇直接贴进飞书, 这几行不是稿子, 跟着进了格子会被 tv-sync 当成
+    正文。不用 ``user-select:none``: 那样从这几个字上起手拖就什么都选不中(Chromium 实测)。按钮才用它。"""
+    cls = f" class=\"{_e(cls)}\"" if cls else ""
+    return f"<{tag}{cls} data-t=\"{_e(text)}\"></{tag}>"
+
+
 def _post_html(p: dict, two_columns: bool) -> str:
-    badge = " · ".join(x for x in (f"第 {int(p.get('n') or 0)} 篇", str(p.get("direction") or "").strip(),
+    # 小标签写成「第N篇」, 中间不空格: 和没有模板的项目默认排法(core.PLAIN_LAYOUT_NEXT_STEP)里那一行是同一个写法,
+    # 写手拿对话里看到的「第37篇」在页面上查找能查到
+    badge = " · ".join(x for x in (f"第{int(p.get('n') or 0)}篇", str(p.get("direction") or "").strip(),
                                    str(p.get("kind") or "").strip()) if x)
     out = [f"<article class=\"row\" id=\"p{int(p.get('n') or 0)}\"><div class=\"post\">",
            f"<div class=\"meta\"><span class=\"badge\">{_e(badge)}</span>"
@@ -394,20 +406,21 @@ def _post_html(p: dict, two_columns: bool) -> str:
     tags = [str(t) for t in p.get("tags") or [] if str(t).strip()]
     if tags:
         out.append("<p class=\"tags\">" + _e(" ".join("#" + t for t in tags)) + "</p>")
-    out.append(f"<p class=\"count\">标题 {int(p.get('title_chars') or 0)} 字 · 正文 {int(p.get('body_chars') or 0)} 字</p></div>")
+    out.append(_chrome("p", "count", f"标题 {int(p.get('title_chars') or 0)} 字 · 正文 {int(p.get('body_chars') or 0)} 字")
+               + "</div>")
     if two_columns:
         comments = [c for c in p.get("comments") or [] if isinstance(c, dict)]
         out.append("<div class=\"side\">")
         if comments:
-            out.append(f"<div class=\"side-head\"><span>评论 {len(comments)} 条</span>"
-                       f"{_button('复制评论', 'comments', str(p.get('copy_comments') or ''))}</div>")
+            out.append("<div class=\"side-head\">" + _chrome("span", "", f"评论 {len(comments)} 条")
+                       + f"{_button('复制评论', 'comments', str(p.get('copy_comments') or ''))}</div>")
             for c in comments:
                 role = "author" if c.get("role") == "author" else "reader"
                 label = str(c.get("label") or "")
                 out.append(f"<div class=\"cmt {role}\">" + (f"<b>{_e(label)}</b>" if label else "")
                            + f"{_e(c.get('text'))}</div>")
         else:
-            out.append("<p class=\"none\">这篇没有评论</p>")
+            out.append(_chrome("p", "none", "这篇没有评论"))
         out.append("</div>")
     out.append("</article>")
     return "".join(out)
@@ -421,7 +434,8 @@ def render(page: dict, nonce: str | None = None) -> str:
     two = any(p.get("comments") for p in posts)
     project = str(page.get("project") or "").strip() or "写作台"
     made, until = _beijing(page.get("created_at")), _beijing(page.get("expires_at"))
-    sub = [f"{made.year} 年 {made.month} 月 {made.day} 日 {made:%H:%M} 存档(北京时间)"] if made else []
+    # 页面是直接给写手看的, 中间没有模型: 不说「存档」「重存」(协议叫模型别跟用户提这两个词, 她没有这一步)
+    sub = [f"{made.year} 年 {made.month} 月 {made.day} 日 {made:%H:%M} 写好(北京时间)"] if made else []
     if until:
         sub.append(f"链接到 {until.month} 月 {until.day} 日前有效")
     more = int(page.get("more") or 0)
@@ -434,7 +448,7 @@ def render(page: dict, nonce: str | None = None) -> str:
         body.append("<div class=\"cols\"><div>笔记</div><div>评论</div></div>")
     body += [_post_html(p, two) for p in posts]
     body.append("</section>")
-    notes = ["改稿重存之后刷新这个页面, 看到的就是最新的一版。"]
+    notes = ["改过稿子之后刷新这个页面, 看到的就是最新的一版。"]
     if more:
         notes.insert(0, f"这一页只排了前 {len(posts)} 篇, 还有 {more} 篇没排上。")
     body.append(f"<p class=\"foot\">{_e(''.join(notes))}</p></main>")
@@ -446,16 +460,20 @@ BUSY_STATUS = 503
 
 
 def error_page(nonce: str | None = None) -> str:
-    """链接不对 / 过期 / 找不到那一批: 都是这一页、同一个状态码(``ERROR_STATUS``), 不说是哪一种。"""
+    """链接不对 / 过期 / 找不到那一批: 都是这一页、同一个状态码(``ERROR_STATUS``), 不说是哪一种。
+
+    页面上叫写手做的两件事都是做得到的: 链接没贴全的, 对话里原来那一行还在, 重新复制; 过期了的, 写作台没有「给旧稿子
+    补发一个链接」这一步(链接只在存稿的回包里发), 改任意一篇之后的回包里有新的。"""
     return _doc("链接打不开", "<main class=\"msg\"><h1>这个链接打不开了</h1>"
-                "<p>链接可能不完整, 或者已经过期。回到写作台, 让它重新给一个页面链接。</p></main>",
+                "<p>链接可能不完整, 或者已经过期。先回到写作台, 把原来那一行链接完整地再复制一次; 还是打不开, 多半是"
+                "过期了: 稿子都还在, 让写作台改其中任意一篇, 改好的那次会带一个新的链接。</p></main>",
                 nonce or secrets.token_urlsafe(16), script=False)
 
 
 def busy_page(nonce: str | None = None) -> str:
     """读库慢了 / 读不出来(``BUSY_STATUS``): 链接本身没问题, 过一会儿再开。"""
     return _doc("页面暂时打不开", "<main class=\"msg\"><h1>页面暂时打不开</h1>"
-                "<p>稿子都还在, 只是这会儿没读出来。过一会儿刷新一下; 一直不行就回到写作台, 让它重新给一个页面链接。</p></main>",
+                "<p>稿子都还在, 只是这会儿没读出来。过一会儿刷新一下。</p></main>",
                 nonce or secrets.token_urlsafe(16), script=False)
 
 

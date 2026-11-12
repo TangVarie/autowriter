@@ -2284,9 +2284,11 @@ def batch_drafts(sb, project_id: str, batch_ids: list[str]) -> dict[str, dict]:
     别的项目的查不出来)的 ``params`` / ``created_at``, 和每个 item 的全部版本 id 与它现在的那一版(代表版本, 同
     ``_representative_version``: best_version_id 指的那一版, 没指就最新那一版)的标题正文。
 
-    回 ``{batch_id: {"params", "created_at", "items": [{"item_id", "version_ids": [...],
-    "current": {"id", "title", "body"} | None}]}}``。三次查询(batches / items / versions), 都按 id 分块、翻页拉全。
-    出错上抛: 调用方退回只拼这次的几篇, 说清原因, 不会拼出半批。"""
+    回 ``{batch_id: {"params", "created_at", "items": [{"item_id", "created_at", "version_ids": [...],
+    "current": {"id", "title", "body"} | None}]}}``。``version_ids`` 按版本号从旧到新排(2026-11-12: 原来是按 version 的 id,
+    而 id 是随机的 UUID —— 排好版的页面要找「最近记过话题 / 评论的那一版」, 按 id 倒着找到的是随便哪一版); item 的
+    ``created_at`` 给页面排没记顺序的 batch 用(一批里的 item 是照写手传的顺序一篇一篇建的)。三次查询(batches / items /
+    versions), 都按 id 分块、翻页拉全。出错上抛: 调用方退回只拼这次的几篇, 说清原因, 不会拼出半批。"""
     out: dict[str, dict] = {}
     for chunk in db._in_chunks(list(dict.fromkeys(batch_ids)), 100):
         res = (sb.table("batches").select("id, params, created_at")
@@ -2299,7 +2301,7 @@ def batch_drafts(sb, project_id: str, batch_ids: list[str]) -> dict[str, dict]:
     items: list[dict] = []
     for chunk in db._in_chunks(list(out), 100):
         items += _paged(lambda off, lim, _c=chunk: (
-            sb.table("items").select("id, batch_id, best_version_id")
+            sb.table("items").select("id, batch_id, best_version_id, created_at")
               .in_("batch_id", _c).order("id").range(off, off + lim - 1)))
     versions: dict[str, list[dict]] = {}
     for chunk in db._in_chunks([str(it["id"]) for it in items], 100):
@@ -2308,13 +2310,23 @@ def batch_drafts(sb, project_id: str, batch_ids: list[str]) -> dict[str, dict]:
                   .in_("item_id", _c).order("id").range(off, off + lim - 1))):
             versions.setdefault(str(v["item_id"]), []).append(v)
     for it in items:
-        vs = versions.get(str(it["id"])) or []
+        vs = sorted(versions.get(str(it["id"])) or [], key=lambda v: v.get("version_num") or 0)
         cur = _representative_version({"versions": vs, "best_version_id": it.get("best_version_id")})
         out[str(it["batch_id"])]["items"].append({
-            "item_id": str(it["id"]), "version_ids": [str(v["id"]) for v in vs],
+            "item_id": str(it["id"]), "created_at": it.get("created_at"), "version_ids": [str(v["id"]) for v in vs],
             "current": ({"id": str(cur["id"]), "title": cur.get("title") or "", "body": cur.get("body") or ""}
                         if cur else None)})
     return out
+
+
+def desk_batches_since(sb, project_id: str, since: str, *, limit: int = 40) -> list[dict]:
+    """这个项目里写作台自己存的 batch(``params.source = deskcore``; 补录的、界面生成的不算)里 ``since`` 之后建的, 新的在前,
+    至多 ``limit`` 个: ``[{"id", "created_at"}]``。一次查询, 只取这两列(``batches_project_idx`` 管着 project_id)。
+    排好版的页面认「同一次交付分几组存」用(core._view_session_batches, 2026-11-12)。出错上抛。"""
+    res = (sb.table("batches").select("id, created_at").eq("project_id", project_id)
+             .eq("params->>source", "deskcore").gte("created_at", since)
+             .order("created_at", desc=True).limit(limit).execute())
+    return [{"id": str(r["id"]), "created_at": r.get("created_at")} for r in res.data or [] if r.get("id")]
 
 
 def merge_batch_params(sb, batch_id: str, patch: dict) -> None:

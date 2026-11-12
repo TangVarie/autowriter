@@ -197,7 +197,7 @@ def test_every_failure_is_the_same_page_and_status(client, db, monkeypatch):
     for name, path in cases.items():
         r = client.get(path)
         assert r.status_code == 404, (name, r.status_code)
-        assert "这个链接打不开了" in r.text and "重新给一个页面链接" in r.text, name
+        assert "这个链接打不开了" in r.text and "完整地再复制一次" in r.text, name
         assert "合成标题" not in r.text and "示例项目" not in r.text, name
         assert "default-src 'none'" in r.headers["content-security-policy"], name
         seen.add(_strip_nonce(r.text))

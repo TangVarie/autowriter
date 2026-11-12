@@ -84,6 +84,10 @@ class _Doc(HTMLParser):
     def buttons(self, kind: str) -> list[dict]:
         return [a for a in self.named("button") if a.get("data-kind") == kind]
 
+    def drawn(self) -> list[str]:
+        """页面自己的小字(字数、「评论 N 条」、「这篇没有评论」): 放在 data-t 里由样式画出来, 不是元素里的字。"""
+        return [a["data-t"] for _t, a in self.tags if "data-t" in a]
+
 
 # ── 1. 令牌 ──────────────────────────────────────────────────────────────────────────────────────
 
@@ -360,7 +364,8 @@ def test_two_columns_when_any_post_has_comments():
     assert len(doc.buttons("post")) == 3 and len(doc.buttons("comments")) == 2 and len(doc.buttons("all")) == 1
     assert "data-copy" not in doc.buttons("all")[0], "「复制全部」不另存一份: 由每篇那一份连起来"
     texts = [text for _tag, text in doc.text]
-    assert "这篇没有评论" in texts and "评论 2 条" in texts
+    assert doc.drawn().count("这篇没有评论") == 1 and doc.drawn().count("评论 2 条") == 2
+    assert "这篇没有评论" not in texts and "评论 2 条" not in texts, "页面自己的小字拖选 / 全选时带不走"
     assert [a["class"] for a in doc.named("div") if (a.get("class") or "").startswith("cmt")] == ["cmt reader", "cmt author"] * 2
 
 
@@ -378,12 +383,12 @@ def test_header_badge_title_tags_and_counts():
     doc = _Doc(out)
     texts = [text for _tag, text in doc.text]
     assert "示例项目" in texts and "共 2 篇笔记" in texts
-    assert "2026 年 11 月 12 日 14:30 存档(北京时间)" in texts, "库里是 UTC 06:30, 页面上是北京时间"
+    assert "2026 年 11 月 12 日 14:30 写好(北京时间)" in texts, "库里是 UTC 06:30, 页面上是北京时间"
     assert "链接到 11 月 18 日前有效" in texts, "1795000000 是北京时间 2026-11-18 19:06: 说得保守一点, 那天之前都打得开"
-    assert "第 1 篇 · 第0篇的方向" in texts and "第 2 篇 · 第1篇的方向 · 产品贴" in texts
+    assert "第1篇 · 第0篇的方向" in texts and "第2篇 · 第1篇的方向 · 产品贴" in texts
     assert texts.count("【标题】") == 2 and "【正文】" not in texts, "页面上只显示【标题】; 【正文】只在复制出去的那一份里"
     assert "#话题0甲 #话题0乙 #固定话题" in texts
-    assert "标题 7 字 · 正文 21 字" in texts
+    assert "标题 7 字 · 正文 21 字" in doc.drawn() and not any("字 · 正文" in t for t in texts)
     paragraphs = [text for tag, text in doc.text if tag == "p"]
     assert "第0篇的第一段。" in paragraphs and "第0篇的第二段。[捂脸R]" in paragraphs, "按换行分段, 空行不出空段"
     assert out.count("<p></p>") == 0
@@ -394,7 +399,7 @@ def test_no_direction_gives_a_plain_badge_and_missing_dates_are_left_out():
     page = _page(None, [{"title": "标题", "body": "正文"}])
     page["created_at"] = "不是时间"
     texts = [text for _tag, text in _Doc(viewpage.render(page)).text]
-    assert "第 1 篇" in texts and not any("存档" in t for t in texts)
+    assert "第1篇" in texts and not any("写好" in t or "北京时间" in t or " 年 " in t for t in texts)
 
 
 def test_error_pages_are_static_and_scriptless():
@@ -402,7 +407,51 @@ def test_error_pages_are_static_and_scriptless():
         doc = _Doc(fn("n0nce"))
         assert not doc.named("script") and doc.named("style") == [{"nonce": "n0nce"}]
         assert fn("n0nce") == fn("n0nce")
-    assert "重新给一个页面链接" in viewpage.error_page() and viewpage.ERROR_STATUS == 404 and viewpage.BUSY_STATUS == 503
+    assert viewpage.ERROR_STATUS == 404 and viewpage.BUSY_STATUS == 503
+    # 页面上叫写手做的事得是做得到的(WF-4): 写作台没有「给旧稿子补发一个链接」这一步, 链接只跟着存稿的回包发
+    error, busy = viewpage.error_page("n"), viewpage.busy_page("n")
+    assert "重新给一个页面链接" not in error + busy
+    assert "完整地再复制一次" in error and "改其中任意一篇" in error and "新的链接" in error
+    assert "过一会儿刷新一下" in busy and "链接" not in busy.split("<main", 1)[1], "读不出来时换一个链接没有用"
+
+
+def test_the_page_does_not_use_the_words_the_desk_never_says_to_a_writer():
+    """页面直接到写手手里, 中间没有模型: 协议叫模型别跟用户提「存档」, 页面自己也不说(WF-8)。"""
+    pages = [viewpage.render(_page()), viewpage.render(_page(None, _drafts(2, comments=False))),
+             viewpage.error_page("n"), viewpage.busy_page("n")]
+    for out in pages:
+        visible = " ".join(text for _tag, text in _Doc(out).text if _tag not in ("style", "script"))
+        visible += " ".join(_Doc(out).drawn())
+        assert "存档" not in visible and "重存" not in visible, visible[:200]
+    assert "改过稿子之后刷新这个页面" in pages[0]
+
+
+def test_a_hand_selection_takes_only_the_post():
+    """写手习惯拖选一篇直接贴进飞书(参考页没有按钮; 复制失败时页面也叫她手动选)。按钮上的字、字数那一行、「评论 N 条」跟着
+    进了格子, tv-sync 会把它们当成正文(PAGE-3)。按钮不许选中; 那几行小字是样式画出来的, 不在元素的文字里。"""
+    out = viewpage.render(_page(BLOCKS, _drafts(2)))
+    css = out.split("<style", 1)[1].split("</style>", 1)[0]
+    copy_rule = next(r for r in css.split("}") if r.strip().startswith(".copy{"))
+    assert "user-select:none" in copy_rule and "-webkit-user-select:none" in copy_rule
+    assert ".count::before" in css and "content:attr(data-t)" in css
+    for rule in css.split("}"):
+        if "user-select:none" in rule:
+            assert rule.strip().startswith(".copy{"), "小标签和那几行小字不用 user-select:none: 从它们上面起手拖会什么都选不中"
+    doc = _Doc(out)
+    words = [text for tag, text in doc.text if tag not in ("style", "script", "button", "title")]
+    assert not any("字 · 正文" in w or "评论 2 条" in w or "复制" in w for w in words), words
+    assert sorted(set(doc.drawn())) == ["标题 7 字 · 正文 21 字", "评论 2 条"]
+    count = next(a for t, a in doc.tags if t == "p" and a.get("class") == "count")
+    assert count["data-t"] == "标题 7 字 · 正文 21 字"
+
+
+def test_the_badge_is_spelled_like_the_default_layout_line():
+    """对话里那一行是「第N篇 · 场景」(core.PLAIN_LAYOUT_NEXT_STEP), 页面的小标签写法一样: 拿「第2篇」在页面上查找查得到(PAGE-4)。"""
+    from deskcore import core
+    assert "「第N篇 · 这篇的场景" in core.PLAIN_LAYOUT_NEXT_STEP
+    texts = [text for _tag, text in _Doc(viewpage.render(_page(None, _drafts(12, comments=False)))).text]
+    assert "第2篇 · 第1篇的方向" in texts and "第12篇 · 第11篇的方向" in texts
+    assert not any(t.startswith("第 ") for t in texts)
 
 
 def test_headers_lock_the_page_down():
@@ -509,7 +558,7 @@ def test_odd_draft_shapes_do_not_break_the_page():
     for tpl in (None, delivery.validate(BLOCKS)):
         page = viewpage.build_page(None, tpl, [{"created_at": 12345, "drafts": drafts}, {"drafts": None}], expires_at=EXP)
         assert len(page["posts"]) == 3
-        assert "第 3 篇" in viewpage.render(page)
+        assert "第3篇" in viewpage.render(page)
 
 
 def test_delivery_rows_is_what_assemble_lays_out():

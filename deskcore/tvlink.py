@@ -63,20 +63,34 @@ _TAG_RE = re.compile(r"#[^\s#\[\]]+(?:\[话题\]#?)?")
 
 # 排好版页面的那一句(viewpage.NOTE, 2026-11-12): score_drafts 把它接在 delivery.text 的最后一行, 写手把交付稿整段贴进
 # 飞书时它可能跟着最后一篇进了同一格。那一行不是稿子: 留着的话最后一篇的正文末尾多一行字和一个链接, 改稿差异里会多出一句
-# 「加了一句」, 链接(拿到就能看那一批稿子)也跟着进了后面每一步。拆标题正文之前整行拿掉。只认「排好版的页面」开头、
-# 以 ``/v/令牌`` 结尾的一整行; 这里不 import viewpage(本模块只做匹配), 两边的写法由 tests/test_view_reply.py 钉在一起。
-_VIEW_NOTE_RE = re.compile(r"^[^\S\n]*排好版的页面[^\n]*https?://[^\s]+/v/[A-Za-z0-9_-]+[^\S\n]*$\n?", re.M)
+# 「加了一句」, 链接(拿到就能看那一批稿子)也跟着进了后面每一步。拆标题正文之前整行拿掉(strip_view_note); 存档 / 补录 /
+# 记底稿收正文时也先过它(core._no_view_note), 链接不进 versions。这里不 import viewpage(本模块只做匹配), 两边的写法由
+# tests/test_view_reply.py 钉在一起。
+#   · 认的是含「排好版的页面」、以 ``/v/令牌`` 收尾的一整行。没有模板的项目那一行是模型自己打的, 两头可能多几个字的装饰
+#     (「> 」「- 」「**…**」、句号、括号、markdown 链接), 所以行首许 8 个别的字, 令牌后面许 8 个不是令牌的字。
+#   · ⚠️ 每一段都有上限, 不许写成不封顶的 ``*`` / ``+``: 这段正则跑在写手传来的整段文字上(comments_for / score_comments 的
+#     post_body、tv-sync 读的飞书格子), 不封顶时一行「排好版的页面http://a/v/ahttp://a/v/a…」是平方级的 —— 60KB 三秒半,
+#     期间整个进程(持着 GIL)别的请求和 /health 都得等。封了顶是线性的(600KB 最坏约 0.1 秒)。令牌那段的上限不能小于
+#     viewpage._TOKEN_MAX_CHARS。
+VIEW_NOTE_HEAD = "排好版的页面"
+_VIEW_NOTE_RE = re.compile(r"^[^\n]{0,8}排好版的页面[^\n]{0,60}https?://\S{1,300}/v/[A-Za-z0-9_-]{1,160}"
+                           r"[^\nA-Za-z0-9_-]{0,8}$\n?", re.M)
+
+
+def strip_view_note(text: str) -> str:
+    """把文字里那一行页面链接(_VIEW_NOTE_RE)整行拿掉; 没有那一行的原样回。线性时间。"""
+    if "/v/" not in text or VIEW_NOTE_HEAD not in text:
+        return text
+    return _VIEW_NOTE_RE.sub("", text)
 
 
 def parse_raw(raw: str | None) -> tuple[str, str]:
     """TV 的 raw_content(「【标题】… 【正文】…」)→ (标题, 正文)。
 
     没有标记的整段当正文、标题留空 —— 指纹主要靠正文, 丢正文等于白对。
-    交付稿末尾那一行页面链接(_VIEW_NOTE_RE)不算稿子, 先拿掉。
+    交付稿末尾那一行页面链接(strip_view_note)不算稿子, 先拿掉。
     """
-    text = (raw or "").replace("\r\n", "\n")
-    if "/v/" in text:
-        text = _VIEW_NOTE_RE.sub("", text)
+    text = strip_view_note((raw or "").replace("\r\n", "\n"))
     mb = _BODY_RE.search(text)
     if mb:
         mt = _TITLE_RE.search(text)

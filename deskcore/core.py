@@ -1862,7 +1862,7 @@ def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list
         rows = []
         for i, d in enumerate(drafts):
             title = (d.get("title") or "").strip()
-            body = (d.get("body") or "").strip()
+            body = _no_view_note(d.get("body") or "").strip()      # 那一行页面链接不进底稿(见 _no_view_note)
             if not tvlink.strip_hashtags(body):
                 continue                                # 没正文的对不上任何帖(W-30 / W-36), 不记
             key = d.get("angle_key")
@@ -5066,7 +5066,7 @@ BATCH_HINTS_NEXT_STEP = ("batch_hints 是这一批整体的写法提示(比如�
 # 2026-11-12 起**每个项目都记**(原来只在配了交付模板时记): 排好版的页面(viewpage)要靠这一份知道一批里的先后和每篇的评论。
 # 没模板的项目回包照旧没有 delivery(拼交付稿那一步只看模板, 不看这一份), 多的只是 batch 的 params 里这一个键。
 # 这之前存的 batch、补录的、底稿转正的都没有这一份: 改它们的稿子时照旧只拼改过的几篇, 回包里 delivery.scope = this_call、
-# scope_fallback 说为什么; 页面上它们按 item id 排。
+# scope_fallback 说为什么; 页面上它们按每篇建的先后排(items.created_at: 一批里的 item 是照写手传的顺序一篇一篇建的)。
 DELIVERY_PARTS_KEY = "delivery_parts"
 DELIVERY_FIELDS = ("tags", "comments", "direction")
 DELIVERY_SCOPE_WHOLE = "whole_batch"
@@ -5081,27 +5081,45 @@ def _delivery_fields(d: dict) -> dict:
 
 
 def _record_revised_parts(client, project_id: str, revised: dict[int, str], drafts: list[dict],
-                          minted_ids: dict[int, str]) -> dict[str, str]:
+                          minted_ids: dict[int, str], *, inherit_from: dict[int, str] | None = None) -> dict[str, str]:
     """改稿挂上旧 item 的那几篇: 新的那一版的话题 / 评论 / 方向并进旧 batch 记的那一份(调用方持项目写锁, 同一 batch 不会
     并发改)。旧 batch 没记过的不补: 没有当初的顺序, 补了也拼不回整批。**不抛**: 记不上只是下次改同一批时退回只拼改过的几篇。
+
+    ``inherit_from``(2026-11-12, 只在项目没有交付模板时给): ``{第几篇: 它替换的旧 version_id}``。没有模板的项目没有
+    delivery.problems 提醒模型把三样再传一遍, 改稿常常只传标题正文; 照「传了哪样记哪样」记下来的是一份空的, 页面上这一篇的
+    话题、评论、小标签就全没了, 「复制笔记」也少了话题那一行。所以这次没传的那几样沿用被替换的那一版记的; 传了的(包括传
+    ``tags: []`` 清空)照这次的。有模板的项目不给: 那边页面要和 delivery.text 一字不差, 少传了由 delivery.problems 报。
 
     回 ``{旧 item: 它所在的 batch}``(查到多少回多少; 这一步本来就要查, 排好版的页面的链接跟着用, 不再多查一次)。"""
     of_item: dict[str, str] = {}
     try:
         of_item = store.batch_ids_of_items(client, sorted(set(revised.values())))
-        by_batch: dict[str, dict] = {}
+        by_batch: dict[str, list[int]] = {}
         for i, item_id in revised.items():
             if of_item.get(item_id):
-                by_batch.setdefault(of_item[item_id], {})[minted_ids[i]] = _delivery_fields(drafts[i])
+                by_batch.setdefault(of_item[item_id], []).append(i)
         params = store.batch_params(client, list(by_batch))
-        for bid, parts in by_batch.items():
+        for bid, idxs in by_batch.items():
             rec = (params.get(bid) or {}).get(DELIVERY_PARTS_KEY)
-            if isinstance(rec, dict) and isinstance(rec.get("parts"), dict):
-                store.merge_batch_params(client, bid, {DELIVERY_PARTS_KEY: {**rec, "parts": {**rec["parts"], **parts}}})
+            if not (isinstance(rec, dict) and isinstance(rec.get("parts"), dict)):
+                continue
+            parts = {}
+            for i in idxs:
+                prev = rec["parts"].get((inherit_from or {}).get(i))
+                parts[minted_ids[i]] = {**(prev if isinstance(prev, dict) else {}), **_delivery_fields(drafts[i])}
+            store.merge_batch_params(client, bid, {DELIVERY_PARTS_KEY: {**rec, "parts": {**rec["parts"], **parts}}})
     except Exception:                                   # noqa: BLE001 — 增强项, 存档已经成了
         logger.warning("commit_drafts: 改稿的话题 / 评论 / 方向没记进原来那一批(project=%s), 下次改这一批时只拼改过的几篇",
                        project_id, exc_info=True)
     return of_item
+
+
+def _has_delivery_template(project: dict) -> bool:
+    """项目有没有能用的交付模板。坏了的算没有: 排好版的页面那边坏模板也是按没有模板排的(view_page_data)。"""
+    try:
+        return delivery.template_of(project) is not None
+    except Exception:                                   # noqa: BLE001
+        return False
 
 
 def _whole_batch_delivery(client, project_id: str, tpl: dict, drafts: list[dict], indices: list[int],
@@ -5181,6 +5199,33 @@ def _whole_batch_delivery(client, project_id: str, tpl: dict, drafts: list[dict]
 # 写手要一张排好版的页面(一篇一行, 左边笔记右边评论, 逐篇可复制)。让写手那边的模型每次写 HTML 太慢, 所以页面由服务端拿已经
 # 存下的稿子拼: ``view_link`` 给这几个 batch 发一个带签名、会过期的链接, ``view_page_data`` 是 ``GET /v/{令牌}`` 读库的那一步。
 # 页面上的字从库里现读: 改稿重存之后刷新, 看到的就是每篇现在的那一版。
+def _no_view_note(text):
+    """写手那边传来的标题 / 正文里要是带着那一行页面链接(viewpage.NOTE; 模型把交付稿最后一篇连着那一句一起摘了回来, 或者
+    从飞书格子里读回来的), 整行拿掉、去掉末尾的空白再往下走: 链接拿到就能看那一批稿子, 不进 versions、指纹、底稿, 也不会
+    被页面当成正文的一段再排出来。认法和 tv-sync 同一个(tvlink.strip_view_note, 线性时间)。没有那一行的原样回(同一个对象)。
+    **不抛**: 出错按原样往下走, 日志里只有异常类型, 没有那段字。"""
+    if not isinstance(text, str):
+        return text
+    try:
+        out = tvlink.strip_view_note(text)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("页面链接那一行没摘成(%s), 这段字原样往下走", type(exc).__name__)
+        return text
+    return text if out == text else out.rstrip()
+
+
+def _drafts_without_view_note(drafts: list[dict]) -> list[dict]:
+    """存档前把每篇标题 / 正文里的那一行页面链接拿掉(_no_view_note)。一篇都没带时回的就是传进来的那个列表, 一个字不动。"""
+    out, changed = [], False
+    for d in drafts:
+        if isinstance(d, dict):
+            fixed = {k: v for k in ("title", "body") for v in [_no_view_note(d.get(k))] if v is not d.get(k)}
+            if fixed:
+                d, changed = {**d, **fixed}, True
+        out.append(d)
+    return out if changed else drafts
+
+
 class ViewNotFound(LookupError):
     """链接里的 batch 找不到、不在同一个项目里、或者项目没了。对外和「链接不对 / 过期」是同一张出错页, 不分原因。"""
 
@@ -5202,12 +5247,19 @@ def view_link(batch_ids) -> dict | None:
 # 回包里说页面的那几句(2026-11-12)。协议和 skill 一个字没动: 写手那边的模型是从 next_step 里读到这几句的。
 #   · 有交付模板的项目: 那一句(view.note)已经接在 delivery.text 的最后一行(空一行之后), 跟着交付稿原样到写手手里, 不靠模型记得。
 #   · 没有交付模板的项目: 模型自己排版, 所以叫它把 view.note 原样放在最后一行; 另给一份默认的排法(PLAIN_LAYOUT_NEXT_STEP)。
-# 默认排法借的是写手给的那张参考页: 一篇一块, 先一行「第N篇 · 场景」, 再【标题】【正文】, 话题单独一行。只是没有要求时的默认:
-# 项目规则 / 简报里自己写了交付格式的照项目的(2026-11-12 只读核过生产库, 见 docs/deskcore.md §3.29)。那一行小标签在【标题】
-# 上面, tv-sync 拆标题正文时不认它(tvlink.parse_raw 只从【标题】起算)。
+# 默认排法借的是写手给的那张参考页: 一篇一块, 先一行「第N篇 · 场景」, 再【标题】【正文】, 话题单独一行, 评论排在这篇的最后。
+# 只是没有要求时的默认: 项目规则 / 简报里自己写了交付格式的照项目的(2026-11-12 只读核过生产库, 见 docs/deskcore.md §3.29)。
+# 那一行小标签在【标题】上面, tv-sync 拆标题正文时不认它(tvlink.parse_raw 只从【标题】起算)。
+#   · 话题: 传在 tags 里的和写在正文末尾的都算(工具说明叫模型把话题放进 tags、不塞进正文, 只说「正文末尾带话题的」管不到多数)。
+#   · 评论: 近 30 天在用的没模板的项目都有管评论的规则(一个项目的硬规则要求每篇正好一条评论、放在它自己的方括号标签下面),
+#     所以排法里给评论留了位置, 标签照项目规则的叫法; 结尾那句只说「标题和正文不加别的标记」, 不挡规则定的评论标签。
+#     评论和话题之间空一行: 写手把一篇连评论贴进飞书同一格时, 【正文】后面的字 tv-sync 都算正文(一篇一段的交付模板也是
+#     这样), 空一行至少让她一眼看得出哪里是评论。
 PLAIN_LAYOUT_NEXT_STEP = ("这个项目没有交付模板。项目规则或简报里对交付格式另有要求的, 照项目的; 没有的话每篇这样排: 第一行"
-                          "「第N篇 · 这篇的场景(12 字以内)」, 下一行【标题】接标题, 再下一行【正文】接正文(正文照它自己的分段), "
-                          "正文末尾带话题的, 话题单独占一行, 篇与篇之间空一行; 不用表格, 不加别的标记。")
+                          "「第N篇 · 这篇的场景(12 字以内)」, 下一行【标题】接标题, 再下一行【正文】接正文(正文照它自己的分段); "
+                          "这篇有话题的(传在 tags 里的和写在正文末尾的都算), 话题接在正文后面单独占一行; 这篇带评论的, 评论排在"
+                          "这篇的最后, 和上面空一行, 一条一行, 每条前面的标签照项目规则的叫法(规则没说的用「读者：」「作者回复：」); "
+                          "篇与篇之间空一行。不用表格, 标题和正文不加别的标记。")
 PLAIN_LAYOUT_ENV = "DESKCORE_PLAIN_LAYOUT"              # 设成 0 不给那句默认排法(默认给); 和页面的总开关各管各的
 
 
@@ -5216,7 +5268,8 @@ def _plain_layout_on() -> bool:
 
 
 VIEW_NOTE_NEXT_STEP = ("view.note 是这批稿子排好版的页面(写作台拿存下的稿子排的, 逐篇可复制, 改稿重存后刷新就是最新的一版): "
-                       "把 view.note 那一行原样放在交给用户的内容的最后一行, 链接一个字不改; 不用自己另排一份网页。")
+                       "把 view.note 那一行原样放在交给用户的内容的最后一行, 链接一个字不改; 不用自己另排一份网页。页面上每篇的"
+                       "评论、话题和小标签取自这篇 draft 的 comments / tags / direction, 之后存稿时写了的照样放进这几个字段。")
 VIEW_IN_DELIVERY_NEXT_STEP = ("delivery.text 的最后一行是这批稿子排好版的页面的链接(和 view.note 是同一句): 跟着 delivery.text "
                               "原样交, 不用另贴一遍。")
 
@@ -5228,6 +5281,69 @@ def _view_batches(replaced_ok: dict[int, str], revised_batch_of: dict[str, str],
     if new_batch:
         ids.append(str(new_batch))
     return list(dict.fromkeys(ids))
+
+
+# 一次交付分几组存(2026-11-12 复审 WF-2): 协议叫模型一次最多存 10 篇、一组一组存, 每组各建一个 batch。链接只带这次的 batch
+# 的话, 20 篇的一次交付拿到两个页面, 各自从「第1篇」数起 —— 写手要的那张页面是 20 篇在一页上。所以发链接之前看一眼这个
+# 项目里紧挨着的写作台 batch: 和这次的 batch 前后相隔不到 VIEW_SESSION_GAP_MIN 分钟、一个接一个连着的, 算同一次交付, 一起
+# 带上(页面本来就跨 batch 连着编号、按建的先后排)。生产上同一次交付的两组之间最长隔过 25 分钟。
+#   · 不按「同一次抽的牌」认: 近 10 天分两组存的 5 次里只有 1 次两组是同一次抽的牌, 更早的 batch 连这个标记都没有。
+#   · ⚠️ 团队共用一个身份, 认不出是谁存的: 同一个项目里同事在这半小时里存的 batch 也会被带进同一页。窗口所以留得短。
+#   · 一个链接最多 viewpage.MAX_BATCHES 个 batch: 这次的 batch 一定带, 剩下的位置给离得最近(最新)的那几个。
+#   · 一次很小的读(按项目、只取 id 和时间, 至多 VIEW_SESSION_SCAN 行), 只在发得出链接时做; 读不出来就只带这次的, 记一行
+#     日志, 存档不受影响。只看近 VIEW_SESSION_LOOKBACK_HOURS 小时: 改更早的稿子时拿到的链接只带它自己那一批。
+#   · 这一次读有墙钟上限(VIEW_SESSION_TIMEOUT_SEC): PostgREST 默认等 120 秒, 库一卡不能让整次存档的回包跟着等。放在自己的
+#     小池子里跑(同 _ISOLATION_POOL 的做法: 跑着的 I/O 取消不了, 所以没收场的读最多 2 个, 占满了这次就不读)。
+VIEW_SESSION_GAP_MIN = 30
+VIEW_SESSION_LOOKBACK_HOURS = 36
+VIEW_SESSION_SCAN = 40
+VIEW_SESSION_TIMEOUT_SEC = 2.0
+_VIEW_SESSION_POOL = cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="view-session")
+_VIEW_SESSION_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _view_session_batches(client, project_id: str, own: list[str]) -> list[str]:
+    """这次的 batch(_view_batches 给的)加上同一次交付里紧挨着的那几个(见上面那段), 至多 ``viewpage.MAX_BATCHES`` 个。
+    查到了时间的按建的先后排。这次的已经占满(或超过)一个链接、发不出链接、没有挨着的、查不出来、``VIEW_SESSION_TIMEOUT_SEC``
+    秒里没查完: 原样回 ``own``。**不抛**。"""
+    own = list(dict.fromkeys(str(b) for b in own if b))
+    if not own or len(own) >= viewpage.MAX_BATCHES:
+        return own
+    try:
+        if not viewpage.status().get("enabled"):
+            return own
+        since = (datetime.now(timezone.utc) - timedelta(hours=VIEW_SESSION_LOOKBACK_HOURS)).isoformat(timespec="seconds")
+        fut = _bounded_submit(_VIEW_SESSION_POOL, _VIEW_SESSION_SLOTS,
+                              lambda: store.desk_batches_since(client, project_id, since, limit=VIEW_SESSION_SCAN))
+        if fut is None:
+            raise RuntimeError("busy")
+        try:
+            rows = fut.result(timeout=VIEW_SESSION_TIMEOUT_SEC)
+        except cf.TimeoutError:
+            fut.cancel()                                # 已经在跑的取消不了: 它占着的那个位置等它自己收场才放
+            raise
+        stamped = sorted((t, r["id"]) for r in rows for t in [store._ts(r.get("created_at"))] if t is not None)
+        at = {bid: k for k, (_t, bid) in enumerate(stamped)}
+        gap = timedelta(minutes=VIEW_SESSION_GAP_MIN)
+        near: set[tuple[datetime, str]] = set()
+        for b in own:
+            if b not in at:
+                continue
+            lo = hi = at[b]
+            while lo > 0 and stamped[lo][0] - stamped[lo - 1][0] <= gap:
+                lo -= 1
+            while hi + 1 < len(stamped) and stamped[hi + 1][0] - stamped[hi][0] <= gap:
+                hi += 1
+            near.update(stamped[lo:hi + 1])
+        extra = [bid for _t, bid in sorted(near, reverse=True) if bid not in own][:viewpage.MAX_BATCHES - len(own)]
+        if not extra:
+            return own
+        picked = set(own) | set(extra)
+        return [b for b in own if b not in at] + [bid for _t, bid in stamped if bid in picked]
+    except Exception as exc:                            # noqa: BLE001 — 增强项, 绝不冒泡
+        logger.warning("score_drafts: 没查出同一次交付的前几批(%s, project=%s, batches=%s), 页面链接只带这次的",
+                       type(exc).__name__, project_id, ",".join(b[:8] for b in own))
+        return own
 
 
 def _attach_view(out: dict, project_id: str, batch_ids: list[str]) -> dict:
@@ -5270,9 +5386,10 @@ def view_page_data(client, batch_ids: list[str], expires_at: int) -> dict:
     batch 属于哪个项目、项目行, 再加 ``store.batch_drafts`` 的 batches 一次、items / versions 翻页各两次。
 
     每篇用它现在的那一版(同导出、同改稿重存时拼整批的口径)。顺序: batch 按建的先后; batch 里按存档时记的顺序
-    (``DELIVERY_PARTS_KEY`` 的 order), 没记顺序的、记的顺序里没有的排在后面(按 item id, 至少每次打开都一样)。话题 / 评论 /
-    方向取现在那一版记的那一份; 现在那一版没记(别的入口改出来的一版)就用这一篇别的版本最近记的那一份 —— 页面只是给人看的,
-    评论旧一点比整块没有强。项目的交付模板坏了当没有模板排, 不拦。"""
+    (``DELIVERY_PARTS_KEY`` 的 order), 没记顺序的、记的顺序里没有的排在后面(按每篇建的先后 items.created_at: 一批里的 item
+    是照写手传的顺序一篇一篇建的, 生产上和记下的顺序对得上; 时间一样或者没有的再按 item id, 每次打开都一样)。话题 / 评论 /
+    方向取现在那一版记的那一份; 现在那一版没记(别的入口改出来的一版)就用这一篇别的版本里版本号最大的那一份
+    (``version_ids`` 是按版本号从旧到新排的) —— 页面只是给人看的, 评论旧一点比整块没有强。项目的交付模板坏了当没有模板排, 不拦。"""
     ids = list(dict.fromkeys(str(b) for b in batch_ids))
     owner = store.batch_projects(client, ids)
     projects = {owner.get(b) for b in ids}
@@ -5303,7 +5420,8 @@ def view_page_data(client, batch_ids: list[str], expires_at: int) -> dict:
             if it is not None and it["item_id"] not in seen:
                 seen.add(it["item_id"])
                 placed.append(it)
-        placed += sorted((it for it in info[bid]["items"] if it["item_id"] not in seen), key=lambda it: it["item_id"])
+        placed += sorted((it for it in info[bid]["items"] if it["item_id"] not in seen),
+                         key=lambda it: (str(it.get("created_at") or ""), it["item_id"]))
         drafts = []
         for it in placed:
             cur = it.get("current")
@@ -5512,7 +5630,7 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
        (_whole_batch_delivery, ``delivery.scope = "whole_batch"``); 拼不回来就照旧只拼这次的几篇, ``scope = "this_call"``,
        ``scope_fallback`` 说为什么。没有改稿的批次回包一个字不变(不带 scope)。
        ``view_batches``(2026-11-12): 这次的稿子在哪几个 batch(_view_batches)。有就发一个排好版的页面的链接
-       (``out["view"]``, _attach_view), 有交付稿时那一句接在 ``delivery.text`` 的最后一行 —— 两条拼法(只拼这次的 / 拼回
+       (``out["view"]``, _attach_view; 同一次交付里前面几组存的 batch 一起带上, _view_session_batches), 有交付稿时那一句接在 ``delivery.text`` 的最后一行 —— 两条拼法(只拼这次的 / 拼回
        整批)都在这之后才接, 所以只接一次。没有模板的项目另给一句默认的排法(PLAIN_LAYOUT_NEXT_STEP)。
     2. 代码查规则: 和简报同一个池子里带 check 的那几条, soft 的过同一道方向闸, 逐篇查(``out["rule_checks"]``,
        有命中才带)。查不成就带 ``rule_checks_status = "error"``: 不带的话和"查过了、没命中"长得一模一样。正则规则限时
@@ -5560,9 +5678,10 @@ def _delivery_and_rule_checks(client, project: dict, project_id: str, user_id, d
             logger.exception("commit_drafts: 拼交付稿失败(project=%s) —— 存档不受影响", project_id)
             meta["delivery"] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
 
-    # 排好版的页面(2026-11-12): 纯计算(一次 HMAC), 不读库。放在拼交付稿之后: 那一句要接在拼好的 delivery.text 后面
+    # 排好版的页面(2026-11-12)。放在拼交付稿之后: 那一句要接在拼好的 delivery.text 后面。发链接本身是纯计算(一次 HMAC);
+    # 之前多一次很小的读, 把同一次交付里前面几组存的 batch 一起带上(_view_session_batches, 读不出来就只带这次的)
     if view_batches:
-        meta["view"] = _attach_view(out, project_id, list(view_batches))
+        meta["view"] = _attach_view(out, project_id, _view_session_batches(client, project_id, list(view_batches)))
     # 没有交付模板(不是模板坏了)的项目: 模型自己排版, 给一份默认的排法
     plain_layout = tpl is None and "delivery" not in meta and bool(picked) and _plain_layout_on()
 
@@ -5741,6 +5860,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     project = assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
         return {"written": 0, "consumed_angles": 0, "rejected": []}
+    # 2026-11-12: 标题 / 正文里带着那一行页面链接的先整行拿掉(在核 id、判空正文、算指纹之前: 后面每一步看见的都是同一份字;
+    # 只有那一行的正文按空正文拒)
+    drafts = _drafts_without_view_note(drafts)
     # 外部审计 11-02 F05: 自带的 version_id 先按本项目核, 核不上的这几篇进 rejected(gate=version_lookup), 不写指纹、不销牌。
     # 在拿锁之前: 只读; 查库失败就上抛, 这时什么都没写
     bad_vid = _caller_version_problems(client, project_id, drafts)
@@ -5964,7 +6086,10 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             # batch: 排好版的页面的链接要带上它们(_view_batches)
             revised_batch_of: dict[str, str] = {}
             if replaced_ok:
-                revised_batch_of = _record_revised_parts(client, project_id, replaced_ok, drafts, minted_ids)
+                revised_batch_of = _record_revised_parts(
+                    client, project_id, replaced_ok, drafts, minted_ids,
+                    inherit_from=(None if _has_delivery_template(project)
+                                  else {i: replace[i]["old_version_id"] for i in replaced_ok}))
             lap = _lap(commit_parts, "replace_versions", lap)
 
             minted = {"batch_id": None, "versions": {}, "error": None}
@@ -7738,8 +7863,9 @@ def _ingest_published_unlocked(client, project_id: str, entries: list[dict], *,
     ``dry_run`` 只数不写(但会查已有指纹, 所以 dry-run 的数字就是真跑会写的数)。
     """
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
-    cleaned = [{"title": (e.get("title") or "").strip(),
-                "body": (e.get("body") or "").strip(), "index": i}
+    # 那一行页面链接不算稿子(2026-11-12, _no_view_note): 写手把交付稿整段贴进飞书时它可能跟着最后一篇进了同一格
+    cleaned = [{"title": _no_view_note(e.get("title") or "").strip(),
+                "body": _no_view_note(e.get("body") or "").strip(), "index": i}
                for i, e in enumerate(entries)]
     cleaned = [e for e in cleaned if e["title"] or e["body"]]
     # 表内去重 + 库内去重, 都按【开头哈希 + 整篇四字串 sketch】—— 只按开头会把
