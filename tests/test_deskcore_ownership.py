@@ -259,6 +259,11 @@ UNGATED_WITH_REASON = {
                               "话题 / 评论 / 方向, 失败只记 WARN",
     "_whole_batch_delivery":  "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 读改稿挂的旧 batch, "
                               "store.batch_drafts 按 project_id 过滤, 别的项目的 batch 查不出来",
+    # 排好版的页面(2026-11-12, docs/deskcore.md §3.29)
+    "_attach_view":           "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 给这次存档建的 / 改稿挂的 batch 签一个"
+                              "页面链接挂进回包, 不读写库; project_id 只当日志标签",
+    "_view_session_batches":  "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 读本项目近 36 小时里写作台自己存的 batch 的"
+                              " id 和时间(store.desk_batches_since 按 project_id 过滤, 别的项目的查不出来), 认同一次交付的前几组; 不写库",
     # 一批笔记的写法检查(2026-11-10, docs/deskcore.md §3.21)
     "_draft_checks":          "只被 _delivery_and_rule_checks(已过闸的 commit_drafts 调)用: 查这次存进去的几篇, 项目行是闸返回的"
                               "那一行; 只在查出重复说法时经 _rule_texts 读规则原文, 不写",

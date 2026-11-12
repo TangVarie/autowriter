@@ -14,6 +14,8 @@
 > - **`review_drafts` / `export_drafts` 两个工具撤了**：定稿由写手贴进飞书，发布后 `tv-sync` 按内容对回来（core 里的函数保留，不再暴露给模型）。
 > - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。评论规则不只认「评论区：」开头：开头那一句说的是评论、或存的检查查评论的也算（2026-11-11，`docs/deskcore.md` §3.24）；评论位是四种评论，一组不止四条时其余的不带 slot。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
 
+> **2026-11-12**：`score_drafts` 的回包带 **`view`** —— 这批稿子排好版的页面的链接（一篇一行、左边笔记右边评论、逐篇可复制；改稿重存后刷新就是最新一版）。页面由服务端拿存下的稿子拼（`viewpage.py`，`GET /v/{令牌}`：令牌带签名、14 天过期，这是健康检查之外唯一不带钥匙的路径），写手那边的模型不用写 HTML。有交付模板的项目那一句接在 `delivery.text` 最后一行；没有模板的项目 `next_step` 里另给一份默认的排法。不用配任何东西；`DESKCORE_VIEW_PAGE=0` 关掉。链接和令牌不进日志、不进库。见 `docs/deskcore.md` §3.29。
+
 > **2026-11-11**：项目定的评论配比写手可以在对话里改（**`set_comment_mix`**，只在用户明说时调；列改不了；留最近 20 次的记录）。钥匙对不上时 401 自己说收到的那一串长什么样，`/health` 多一块 `auth_rejections`（按固定的几个原因数被拒的请求，没有钥匙的任何一部分）。见 `docs/deskcore.md` §3.23。
 
 > **2026-10-20 · D-121 写完按规则逐篇查**：规则由 Jev（`POST /compile_rules`）编成是非题 / 代码检查，按（规则 id, sha）缓存进
@@ -44,6 +46,7 @@
 | 交付的稿子入库时没有任何「像不像、踩没踩线」的判定，写作台的稿和已发布笔记也没法用同一把尺子比 | `commit_drafts` 入库、放锁之后把稿子发给 JevforCoentent 的 judge（`judge_client.py`，HTTP，deskcore 仍零 LLM），答案进 TV 账本 `aw_version`；**不拦**，结局在返回值的 `judge` 与 `batch_metrics` 里（2026-10-19 起 D-120：每篇带参考分 `score` 与 `fixes` 给写手看，不再是影子）。只判走写作台交付的稿，补录进来的已发布笔记归 TV 事后抽取。见 `docs/deskcore.md` §3.8 |
 | TV 里 5966 条已发笔记一条都认不回写作台（lineage 全 NULL）；让运营手抄六个 ID 列进飞书三周零匹配 | `tv-sync`（`migrations/009`）在库里按内容对：正文前 40 字 / 标题 / 时间窗内四字串包含度；对不上的直接从 TV 的全文补录进指纹库；`--write-tv` 才回填 TV 的两列。**运营不做任何事，飞书表不加列**。见 `docs/deskcore.md` §3.7 |
 | 只有 `score_drafts` 在库里留一行；开项目、查重、查规则多久、怎么收场，写评论那一路判了几条、哪一样检查打回几条，只能翻留一周左右的网关日志 | 每次工具调用（REST 和 MCP 都算）回包之后，后台往 `batch_metrics` 写一行只有数的记录（`meta.mode = 'tool_call'`，`deskcore/calllog.py`）：工具、通道、耗时、结局、条数、回包多长，查重的过 / 拒和定的信号，评论每样检查的条数。稿子、评论、规则的字一个都不存；写不进去不影响回包；`DESKCORE_TOOL_CALL_LOG=0` 关掉。存档那一行另记借卡带出去几张卡、skill 版本构成、规则还有几条没编出来。见 `docs/deskcore.md` §3.8 末尾 |
+| 写手要交出来的稿子像一张排好版的页面（一篇一行、评论在旁边），让她的模型每次写 HTML 又太慢 | 页面由服务端拿已经存下的稿子拼（`viewpage.py`），`score_drafts` 的回包带一个签了名、14 天过期的链接 `view.url`；改稿重存后刷新就是最新一版，逐篇可复制成贴进飞书的那一段。模型一个字不用多写；没有交付模板的项目另给一份默认的排法。见 `docs/deskcore.md` §3.29 |
 
 > 另有两条改在**常规生成那条路**（根目录的 `memory.py` / `generation_service.py`），
 > 不经过 deskcore，列在这里只是免得两边打架：未验证的经验卡现在会在提示词里
@@ -60,6 +63,7 @@ deskcore/
 ├── store.py        db.py 里【没有的】查询形状(共享层规则/带向量的正负例/四张新表)
 ├── fingerprint.py  指纹与判定, 【只用标准库】
 ├── delivery.py     交付版式模板的校验与拼装(纯函数, 2026-10-20, 见 docs/deskcore.md §3.9)
+├── viewpage.py     一批稿子排好版的页面: 令牌、签名的钥匙、对外地址、HTML(纯函数, 2026-11-12, 见 docs/deskcore.md §3.29)
 ├── rulecheck.py    带 check 的规则逐篇代码查(纯函数, 2026-10-20, 见 docs/deskcore.md §3.10)
 ├── rulecompile.py  Jev 编译规则的结果: sha / 发给 Jev 的形状 / 拼题库 / 读答案(纯函数, 2026-10-20, D-121, 见 docs/deskcore.md §3.11)
 ├── structure.py    简报里的 recent_structure: 问哪几题、怎么算扎堆(纯函数, 2026-10-20, 见 docs/deskcore.md §3.1)
@@ -67,7 +71,7 @@ deskcore/
 ├── identity.py     API key → user_id, 「个人风格私有」的前提
 ├── tools.py        MCP 工具面, docstring 是给模型看的
 ├── protocol.md     写作台协议正文的【源文件】; skills/…/SKILL.md 里那份由 cli sync-skill 生成, 测试盯着两边一致
-├── app.py          FastAPI + MCP(streamable HTTP) + REST 兜底 + /health 配置回显
+├── app.py          FastAPI + MCP(streamable HTTP) + REST 兜底 + /health 配置回显 + 排好版的页面 GET /v/{令牌}
 ├── cli.py          本地 adapter, 含【不连库不联网】的 selftest
 ├── vendor/         从 truth-vault 原样复制的词表 + sha256(见 vendor/README.md)
 ├── requirements.txt 相对主 lockfile 的增量依赖: fastapi / uvicorn / mcp

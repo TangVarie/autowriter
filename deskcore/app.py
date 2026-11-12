@@ -34,6 +34,10 @@
              要免 key 跑, 显式设 DESKCORE_ALLOW_ANONYMOUS=1。
           LIBRARIAN_URL / LIBRARIAN_API_KEY          借爆款经验卡; 不设则跳过
           DESKCORE_ALLOWED_HOSTS    可选, 逗号分隔; 设了才开 MCP 的 Host 校验
+          DESKCORE_VIEW_PAGE / DESKCORE_VIEW_SECRET / DESKCORE_PUBLIC_URL   都可选, 管「排好版的页面」
+             (GET /v/{令牌}, 见 viewpage.py): 都不配也能用 —— 签名的钥匙从 service_role 派生, 地址用
+             Railway 给的公网域名; DESKCORE_VIEW_PAGE=0 整个关掉。
+             DESKCORE_PLAIN_LAYOUT=0 不给没有交付模板的项目那句默认的排法(core.PLAIN_LAYOUT_NEXT_STEP, 默认给)。
           DESKCORE_ALLOWED_ORIGINS  可选, 逗号分隔的完整 origin; 不设 = 允许全部。
              放开是安全的: 身份靠显式传的 key, 从不靠 cookie, 浏览器不会自动
              附上 —— 没有 CSRF 面。见 CORS 那段。
@@ -54,6 +58,8 @@ import inspect
 import json
 import logging
 import os
+import re
+import secrets
 import threading
 import time
 import traceback
@@ -64,11 +70,11 @@ import anyio.to_thread
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from logger_utils import SecretMaskingFormatter
 
-from . import calllog, core, identity, skillcheck, tools, vocab
+from . import calllog, core, identity, skillcheck, tools, viewpage, vocab
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deskcore")
@@ -391,11 +397,52 @@ app = FastAPI(title="deskcore · 写作台内核", version=VERSION,
 # 路径没有调用者身份, 加什么就等于对全世界公开什么。
 _UNAUTHENTICATED_PATHS = frozenset({"/health", "/ready", ""})
 
+# 排好版的页面(2026-11-12, viewpage.py): 写手在浏览器里点开链接, 带不了钥匙 —— 链接里那一串令牌自己就是凭据(签了名、会过期、
+# 只认得那 1~4 个 batch)。免鉴权的**只有** ``GET /v/<一段>`` 这一种形状: 别的动词、``/v``、``/v/``、``/v/a/b`` 照旧要钥匙。
+# 判的是路由匹配用的同一个 scope["path"]。令牌对不对由路由自己验(验过才碰库)。
+_VIEW_PATH = re.compile(r"/v/[^/]+")
+
+
+def _is_view_request(request: Request) -> bool:
+    return request.method == "GET" and _VIEW_PATH.fullmatch(request.scope.get("path") or "") is not None
+
+
+def _log_path(path: str) -> str:
+    """进日志的路径: ``/v/…`` 后面那一串是令牌, 不记(别的动词打到 /v/ 上被拒时, 拒绝的那行日志会带路径)。"""
+    return "/v/-" if str(path).startswith("/v/") else path
+
+
+def _host_allowed(host: str) -> bool:
+    """Host 头在不在 ``DESKCORE_ALLOWED_HOSTS`` 里(没配 = 不校验, 同 MCP 那一层; 写法也同它: 整个相等, 或者 ``host:*``)。"""
+    if not _ALLOWED_HOSTS:
+        return True
+    return any(host == a or (a.endswith(":*") and host.startswith(a[:-2] + ":")) for a in _ALLOWED_HOSTS)
+
+
+def _request_base(request: Request) -> str | None:
+    """这次请求自己的地址能不能拿来拼页面链接(viewpage.request_base: https 或本机, Host 过了白名单); 不能是 None。
+    只在没配 DESKCORE_PUBLIC_URL、也没有 Railway 的公网域名时才用得上。"""
+    try:
+        host = request.headers.get("host") or ""
+        if not _host_allowed(host):
+            return None
+        return viewpage.request_base(request.url.scheme, host, request.headers.get("x-forwarded-proto") or "")
+    except Exception:  # noqa: BLE001 — 拼不出地址只是不发链接
+        return None
+
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    if request.url.path.rstrip("/") in _UNAUTHENTICATED_PATHS:
-        return await call_next(request)     # 健康检查/就绪探测不带 key
+    base_token = viewpage.REQUEST_BASE.set(_request_base(request))
+    try:
+        return await _authenticated(request, call_next)
+    finally:
+        viewpage.REQUEST_BASE.reset(base_token)
+
+
+async def _authenticated(request: Request, call_next):
+    if request.url.path.rstrip("/") in _UNAUTHENTICATED_PATHS or _is_view_request(request):
+        return await call_next(request)     # 健康检查/就绪探测不带 key; 排好版的页面凭链接里的令牌
     try:
         caller = identity.resolve(_extract_key(request))
     except identity.AuthError as exc:
@@ -403,7 +450,7 @@ async def auth_middleware(request: Request, call_next):
         # 子应用也在里面(_NormalizeMcpPath 在更外层, /mcp 和 /mcp/ 到这里是同一条路) —— REST 和 MCP 拿到的是同一份
         # JSON: ``detail`` 是给人看的那一句, ``reason`` 是固定的原因名, ``key_shape`` 只在「带了钥匙但对不上」时有,
         # 说的只是对方发来的那一串(长度、最后 4 位、几个是 / 否)。每拒一次记一个数、一行 WARNING(日志里没有最后 4 位)。
-        identity.record_rejection(exc, path=request.url.path, via=_key_transport_of(request))
+        identity.record_rejection(exc, path=_log_path(request.url.path), via=_key_transport_of(request))
         body = {"detail": str(exc), "reason": exc.reason}
         if exc.shape:
             body["key_shape"] = exc.shape
@@ -718,6 +765,8 @@ async def _collect_health() -> dict:
         # 2026-11-11: 进程启动以来被拒的鉴权请求, 按固定的几个原因数, 外加最后一次的时间(UTC)。只有个数和时间:
         # 没有钥匙的任何一部分(连最后 4 位也没有)、没有路径、没有是谁。写手说连不上时先看这里是哪一种在涨。
         "auth_rejections": identity.auth_rejections(),
+        # 排好版的页面(viewpage.py)现在发不发得出链接; 发不出时一个固定的原因名。没有钥匙、没有地址、没有任何一批稿子。
+        "view_page": viewpage.status(),
         "tools": sorted(tools.TOOLS),
         "config": {
             # deskcore 【不调 LLM】。蒸馏搬给调用方模型之后, 服务端一次
@@ -801,6 +850,137 @@ async def ready():
     if payload.get("ok"):
         return payload
     return JSONResponse(payload, status_code=503)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 排好版的页面  GET /v/{令牌}  (2026-11-12, deskcore/viewpage.py)
+# ══════════════════════════════════════════════════════════════════════
+# 不带钥匙(见 _is_view_request): 链接里的令牌就是凭据。顺序是死的 —— **先验令牌, 验过才碰库**: 没有有效令牌的请求
+# 只花一次 HMAC, 谁都能打也打不到库上。
+#
+# 读库和 /health 是同一套做法(_probe 那段注释): 私有的线程额度 + 墙钟上限 + 带网络层超时的专用 client。这条路由不带钥匙,
+# 所以更不能和工具抢 starlette 默认的那 40 个额度, 也不能排在 /health 前面 —— 页面被人反复刷、库又慢的时候, 排队的只有页面
+# 自己, 等过了墙钟上限就回 503, 工具调用和健康检查不受影响。
+#
+# 超时放弃的那个线程还在后台跑到网络层超时才收场(_probe 那段说的代价), 而额度在放弃的那一刻就还回去了 —— 库卡住时有人
+# 一直刷, 后台的线程会越攒越多。所以另数一个「还没收场的读」: 到了 _VIEW_MAX_INFLIGHT 就直接回 503, 不再开新的。
+_VIEW_LIMITER = anyio.CapacityLimiter(3)
+_VIEW_TIMEOUT = 8.0             # 一次打开页面读库 + 拼页面的墙钟上限(秒)
+_VIEW_MAX_INFLIGHT = 12         # 同一时刻最多几个页面的读还没收场(含已经超时放弃、线程还没退的)
+_VIEW_CLIENT = None
+_view_inflight = 0
+_view_inflight_lock = threading.Lock()
+
+
+def _view_client():
+    """页面专用的 Supabase client: 带网络层超时(同 _health_probe_client: 被放弃的线程才收得了场), 模块级单例。"""
+    global _VIEW_CLIENT
+    if _VIEW_CLIENT is None:
+        import config
+        import db
+        from supabase import create_client
+        from supabase.client import ClientOptions
+        key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", "")
+        if not key:
+            return db.get_service_client()      # 没配 service_role: 照常抛那条错, 页面回 503
+        _VIEW_CLIENT = create_client(
+            config.SUPABASE_URL, key,
+            options=ClientOptions(schema="autowriter", postgrest_client_timeout=max(1.0, _VIEW_TIMEOUT - 2.0)))
+    return _VIEW_CLIENT
+
+
+class _ViewSlot:
+    """一个「还没收场的读」的名额。``claim`` 占不到(满了)回 None; ``release`` 只还一次, 多调无妨。"""
+
+    def __init__(self):
+        self.started = False                    # 读库的线程真的跑起来了没有(跑起来了就由它自己在退出时还)
+        self._done = False
+
+    @classmethod
+    def claim(cls) -> "_ViewSlot | None":
+        global _view_inflight
+        with _view_inflight_lock:
+            if _view_inflight >= _VIEW_MAX_INFLIGHT:
+                return None
+            _view_inflight += 1
+        return cls()
+
+    def release(self) -> None:
+        global _view_inflight
+        with _view_inflight_lock:
+            if not self._done:
+                self._done = True
+                _view_inflight = max(0, _view_inflight - 1)
+
+
+def _view_html(batch_ids: list[str], expires_at: int, nonce: str) -> str:
+    """在线程里跑: 读库 + 拼页面。"""
+    return viewpage.render(core.view_page_data(_view_client(), batch_ids, expires_at), nonce)
+
+
+def _view_log_ids(batch_ids) -> str:
+    return ",".join(str(b)[:8] for b in batch_ids)
+
+
+@app.get("/v/{token}")
+async def view_page(token: str):
+    """一批稿子排好版的页面。令牌不对 / 过期 / 那一批找不到 → 同一张出错页、同一个状态码(不分原因); 读库慢了或者出错 → 503
+    那一页。日志里只有 batch id 的前 8 位, 没有令牌。"""
+    nonce = secrets.token_urlsafe(16)
+    heads = viewpage.headers(nonce)
+
+    def page(html_text: str, status: int = 200) -> HTMLResponse:
+        return HTMLResponse(html_text, status_code=status, headers=heads)
+
+    opened = viewpage.open_token(token, viewpage.signing_key(), time.time())
+    if opened is None:
+        return page(viewpage.error_page(nonce), viewpage.ERROR_STATUS)
+    batch_ids, expires_at = opened
+    slot = _ViewSlot.claim()
+    if slot is None:
+        logger.warning("view page: %d reads still running, not starting another (batches=%s)",
+                       _VIEW_MAX_INFLIGHT, _view_log_ids(batch_ids))
+        return page(viewpage.busy_page(nonce), viewpage.BUSY_STATUS)
+
+    def _run() -> str:
+        slot.started = True
+        try:
+            return _view_html(batch_ids, expires_at, nonce)
+        finally:
+            slot.release()                      # 名额在线程真的退出时才还, 不是在请求超时的那一刻
+
+    try:
+        with anyio.fail_after(_VIEW_TIMEOUT):
+            html_text = await anyio.to_thread.run_sync(_run, limiter=_VIEW_LIMITER, abandon_on_cancel=True)
+    except core.ViewNotFound:
+        logger.info("view page: batch not found (batches=%s)", _view_log_ids(batch_ids))
+        return page(viewpage.error_page(nonce), viewpage.ERROR_STATUS)
+    except TimeoutError:
+        logger.warning("view page: read timed out >%gs (batches=%s)", _VIEW_TIMEOUT, _view_log_ids(batch_ids))
+        return page(viewpage.busy_page(nonce), viewpage.BUSY_STATUS)
+    except Exception as exc:  # noqa: BLE001 — 异常原文不进日志(驱动的报错里可能带整行稿子, 同 X1a)
+        logger.warning("view page: read failed: %s (batches=%s)", _exc_label(exc), _view_log_ids(batch_ids))
+        return page(viewpage.busy_page(nonce), viewpage.BUSY_STATUS)
+    finally:
+        if not slot.started:
+            slot.release()                      # 一直在等额度(或者客户端先断了), 线程根本没起: 这里还
+    return page(html_text)
+
+
+# uvicorn 的访问日志每个请求一行, 带路径 —— /v/ 后面那一串是令牌, 换掉再写。uvicorn 先配好日志再 import 这个模块, 所以
+# 过滤器挂得上; 别的日志器不动。(平台自己的边缘日志照样记路径, 那一层管不到, 见 docs/deskcore.md §3.29。)
+class _HideViewToken(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            args = record.args
+            if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str) and args[2].startswith("/v/"):
+                record.args = args[:2] + ("/v/-",) + args[3:]
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_HideViewToken())
 
 
 @app.get("/skill-versions")

@@ -283,6 +283,8 @@ def build(job: dict) -> dict:
             meta["comments"] = _comment_block(tool, res, notes)
     if notes.get("skill") is not None:
         meta["skill"] = notes["skill"]                  # 入口工具这次报上来的 skill 版本: up_to_date / outdated / unknown
+    if isinstance(notes.get("view"), bool):
+        meta["view"] = notes["view"]                    # 存档时发没发排好版页面的链接(2026-11-12); 只这一个布尔, 链接不进来
     return {"project_id": column, "user_id": job.get("user_id"), "phase_ms": {"total": elapsed}, "counters": {},
             "meta": _clean(meta)}
 
