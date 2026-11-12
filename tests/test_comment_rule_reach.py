@@ -279,6 +279,25 @@ def test_a_length_check_on_a_comment_only_rule_is_not_stored(rule_client):
     assert "max_len" in tools.record_rule.__doc__ and "只说评论的规则带 max_len 时不存 check" in tools.record_rule.__doc__
 
 
+def test_recording_it_again_clears_a_length_check_stored_earlier(rule_client):
+    """codex review on aw#153: 这条规则库里已经带着 max_len(这次改动之前记下的), 再记一次时回包说没存 check, 库里的上限
+    却还在 —— 40 字的正文照报「必须改」。再记一次就把旧的那份清掉; 别的种类的 check 不动。"""
+    content = "评论每条不超过三十字"
+    core.record_rule(rule_client, PROJ, content, user_id=ME, severity="hard")
+    row = rule_client.rows["memories"][0]
+    row.update(rule_kind="max_len", rule_payload={"max": 30, "where": "body"})       # 改动之前存下的样子
+    out = core.record_rule(rule_client, PROJ, content, user_id=ME, severity="hard", check={"kind": "max_len", "max": 30})
+    assert len(rule_client.rows["memories"]) == 1
+    assert row.get("rule_kind") is None and row.get("rule_payload") is None
+    assert "check" not in out and out["check_where_note"] == core.COMMENT_LEN_CHECK_NOTE
+    # 库里带的是别的种类的 check: 不动
+    core.record_rule(rule_client, PROJ, "评论每条不超过四十字", user_id=ME)
+    other = rule_client.rows["memories"][1]
+    other.update(rule_kind="forbidden_word", rule_payload={"words": ["示例禁词"], "where": ["comments"]})
+    core.record_rule(rule_client, PROJ, "评论每条不超过四十字", user_id=ME, check={"kind": "max_len", "max": 40})
+    assert other["rule_kind"] == "forbidden_word"
+
+
 @pytest.mark.parametrize("content, where", [("正文不超过三百字，评论另算", "body"), ("评论和正文都不超过三百字", "body"),
                                             ("评论每条不超过三十字，正文不超过三百字", "body"), ("标题不超过二十字", "title")])
 def test_length_checks_on_post_rules_are_stored_as_before(rule_client, content, where):

@@ -8277,6 +8277,12 @@ def record_rule(client, project_id: str, content: str, *, severity: str = "soft"
         stored_row.update(rule_kind=(saved or {}).get("rule_kind"), rule_payload=(saved or {}).get("rule_payload"))
     if len_dropped:
         out["check_where_note"] = COMMENT_LEN_CHECK_NOTE
+        # 这条规则库里已经带着 max_len 的(这次改动之前记下的): 光不存新的不够, 旧的那份还在拿去数笔记正文 —— 清掉
+        # (codex review on aw#153: 回包说没存 check, 库里的上限还在, 40 字的正文照报「必须改」)。别的种类的 check 不动。
+        # 写失败上抛, 同上面写 check 的那一次: 吞掉的话回包说没有 check, 其实还在查
+        if out["memory_id"] and (row or {}).get("rule_kind") == "max_len":
+            store.set_memory_check(client, out["memory_id"], None, None)
+            stored_row.update(rule_kind=None, rule_payload=None)
     # 停用着的规则 comments_for 不给(store.shared_memories 先筛掉): 原文一样再记一次命中的是同一行, 停用不会被清掉
     # (2026-11-12 复审 C6: 原来照说写评论时会给)
     muted = db.is_memory_muted_now((row or {}).get("muted_until"))

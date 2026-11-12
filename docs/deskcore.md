@@ -1713,7 +1713,8 @@ auth rejected: reason=invalid_ellipsis path=/mcp/ via=header len=9 flags=ellipsi
     `["body", "comments"]`，这两种都碰不到，11-11 那一条读的时候照旧按只查评论算。
 - **只说评论的规则带 `max_len` 时不存 check**（2026-11-12 复审 C3）。字数检查只数标题 / 正文，查不了评论：「评论每条不超过三十字」
   带着它存下去，每篇笔记存档都报「正文 N 字, 上限 30」（硬约束就是「必须改」），评论反而一条不查。现在规则原文照记，`check` 不存，
-  回包的 `check_where_note` 是 `COMMENT_LEN_CHECK_NOTE`。第一句里也点到正文 / 标题 / 笔记的（「评论每条不超过三十字，正文不超过
+  回包的 `check_where_note` 是 `COMMENT_LEN_CHECK_NOTE`。这条规则库里已经带着 `max_len` 的（这次改动之前记下的），再记一次时
+  一并清掉；别的种类的 check 不动。第一句里也点到正文 / 标题 / 笔记的（「评论每条不超过三十字，正文不超过
   三百字」）照存。线上没有 `max_len` 的规则，库里不用动。
 - **库里已经存着的那一条不改库**，读的时候按同一个判据算（`_comment_check_rule`）：`score_drafts` 的 `rule_checks` 不再拿它查正文，
   跟着笔记一起交付的评论照查；`my_rules` 的 `check` 给的是查的时候真用的那一份，和库里存的不一样时多一句 `check_note`。
