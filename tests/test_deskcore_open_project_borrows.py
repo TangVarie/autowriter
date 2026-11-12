@@ -196,6 +196,43 @@ def test_borrow_lessons_tool_shares_the_same_borrow_body(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 源帖投过流的卡: 照借, 回包里叫模型把卡上那一句转告用户(2026-11-12, owner 定)
+# ══════════════════════════════════════════════════════════════════════
+
+BOOST_LINE = "注意: 这篇是投流起量的, 数据不全是内容带来的, 借不借由你判断"
+
+
+def test_a_paid_boosted_card_is_lent_and_the_reply_tells_the_model_to_pass_the_line_on(monkeypatch):
+    """馆员照借投过流的帖的卡, 卡上标 paid_boost、why_it_worked 开头带那一句。那一句到了模型手里, 可协议里没有一处叫它
+    转告用户 —— 「让运营自己判断」就落空。回包里带一句说给模型听的话; 卡本身原样透传。"""
+    boosted = _card(2, paid_boost=True, why_it_worked=BOOST_LINE + "。评论区问的人多")
+    fake = _Librarian(cards=[_card(1, paid_boost=False), boosted, _card(3, paid_boost=None)])
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+
+    b = core.build_writing_brief(_client(), PID, user_id=ME, brief={"draft_topic": "早八通勤"})
+    assert [c.get("paid_boost") for c in b["lessons"]] == [False, True, None]
+    assert b["lessons"][1]["why_it_worked"].startswith(BOOST_LINE), "卡原样透传"
+    note = b["lessons_paid_boost_note"]
+    assert "有 1 张" in note and "原样告诉用户一次" in note and "由用户判断" in note
+    assert "这张卡" in note and "这几张卡" not in note
+
+    out = core.borrow_lessons(_client(), PID, user_id=ME, draft_topic="早八通勤")
+    assert out["paid_boost_note"] == note
+
+    fake.cards = [boosted, _card(4, paid_boost=True)]
+    assert "有 2 张" in core.borrow_lessons(_client(), PID, user_id=ME, draft_topic="换个选题")["paid_boost_note"]
+
+
+def test_no_note_when_no_card_is_known_to_be_paid_boosted(monkeypatch):
+    """没有这种卡就没有这句话: 馆员没标(老版本)、标的是 false、读不到投流标记给的 null, 都不算。"""
+    fake = _Librarian(cards=[_card(1), _card(2, paid_boost=False), _card(3, paid_boost=None), _card(4, paid_boost="true")])
+    monkeypatch.setattr(lib, "fetch_flywheel_lessons", fake)
+    b = core.build_writing_brief(_client(), PID, user_id=ME, brief={"draft_topic": "早八通勤"})
+    assert "lessons_paid_boost_note" not in b and b["counts"]["lessons"] == 4
+    assert "paid_boost_note" not in core.borrow_lessons(_client(), PID, user_id=ME, draft_topic="早八通勤")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 协议正文必须告诉模型这件事 —— 否则它会照旧再去调 borrow_lessons, 或者
 # 拿到 lessons 也不知道能用
 # ══════════════════════════════════════════════════════════════════════
