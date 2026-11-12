@@ -41,6 +41,19 @@ def test_an_unmatched_note_carries_its_best_containment():
     assert m.score == pytest.approx(L.overlap(note, _v("v2", "群面被刷三次", BODY_B))) and 0 < m.score < L.EDITED_FLOOR
 
 
+def test_a_same_title_hold_keeps_the_highest_containment_in_the_window():
+    """2026-11-12 复审: 标题和某一版一样、正文却对不上的帖(同标题候选, 等人看), 分数原来只取同标题那几版里最高的 —— 它的字
+    有一截出自另一篇不同标题的稿子时被记成接近 0, 读数上就成了「在别处写的」。记窗口里最高的那个。"""
+    v1, v2 = _v("v1", "秋招投了六十份", BODY_A), _v("v2", "群面被刷三次", BODY_B)
+    idx = L.VersionIndex([v1, v2])
+    sent = BODY_B.split("。")[0] + "。"
+    note = _n("n1", "秋招投了六十份", FILLER + sent)
+    m = L.match_note(note, idx)
+    assert m.kind == "ambiguous" and m.version is None
+    assert L.overlap(note, v1) < L.overlap(note, v2) < L.EDITED_FLOOR
+    assert m.score == pytest.approx(L.overlap(note, v2))
+
+
 def test_too_short_to_compare_has_no_score_and_an_empty_window_scores_zero():
     idx = L.VersionIndex([_v("v1", "秋招投了六十份", BODY_A)])
     assert L.match_note(_n("n1", "短", "太短了"), idx).score is None, "没得比, 不是 0"

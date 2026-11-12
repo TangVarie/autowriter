@@ -352,7 +352,9 @@ def match_note(note: Note, index: VersionIndex) -> Match:
         scored = sorted(((index.containment(ng, v), v) for v in weak), key=lambda t: -t[0])
         for s, v in scored:
             listed[v.version_id] = {**_cand(note, v, s), WEAK_TITLE_KEY: True}
-        score = m.score if m.kind == "ambiguous" else scored[0][0]
+        # 分数记窗口里最高的那个(2026-11-12 复审): 内容那一路没对上时 m.score 就是全窗口的最高重合, 只取同标题那几版的
+        # 话, 另一篇不同标题的稿子占了它四分之一的字也会被记成 0
+        score = max(m.score or 0.0, scored[0][0])
         return Match("ambiguous", None, score, None, list(listed.values()))
     return m
 

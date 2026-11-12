@@ -207,6 +207,10 @@ def test_a_comment_only_head_stores_the_check_on_comments_only(rule_client, chec
     ("别说评论区告诉你", {**WORDS, "where": ["body"]}, ["body"]),
     ("不要让读者去评论区找链接", {**WORDS, "where": ["title", "body"]}, ["title", "body"]),
     ("示例牌X9 的评论不聊价格：不写几折", {"kind": "forbidden_regex", "pattern": "示例{2,}", "where": ["body"]}, ["body"]),
+    # 2026-11-12 复审 X-1 ── 说的是这个词该待在哪儿(只能在评论区), 不是评论该怎么写: 没写 where 也不收窄, 检查照旧查标题和正文
+    ("示例禁词只能出现在评论区", dict(WORDS), ["title", "body"]),
+    ("示例禁词仅限评论区出现", dict(WORDS), ["title", "body"]),
+    ("评论区才能提示例禁词", dict(WORDS), ["title", "body"]),
 ])
 def test_heads_that_also_name_the_post_keep_the_where_they_were_given(rule_client, content, check, where):
     """两边都管的规则收窄了就悄悄少查正文: 开头那一句点到正文 / 标题 / 笔记 / 话题、或者说的是笔记里引导评论的,
@@ -229,6 +233,19 @@ def test_a_post_rule_whose_first_clause_names_comments_checks_the_post(rule_clie
     assert first["check"]["where"] == ["comments"] and first["check_where_note"] == core.COMMENT_CHECK_NOTE
     again = core.record_rule(rule_client, PROJ, "不写求评论的句子", user_id=ME, check={**WORDS, "where": ["title", "body"]})
     assert again["check"]["where"] == ["title", "body"] and "check_where_note" not in again
+
+
+def test_a_word_that_may_only_appear_in_comments_is_still_checked_in_the_post(rule_client):
+    """2026-11-12 复审 X-1: 「示例禁词只能出现在评论区」不带 where 记下来, 原来被当成只说评论的规则、where 存成只查评论 ——
+    正文里写了不报, 评论里写了(规则要它在那儿)反而报「必须改」。"""
+    core.record_rule(rule_client, PROJ, "示例禁词只能出现在评论区", user_id=ME, severity="hard", check=dict(WORDS))
+    row = rule_client.rows["memories"][0]
+    drafts = [{"title": "甲", "body": "正文里写了示例禁词", "comments": ["评论里也有示例禁词"]}]
+    assert [h["where"] for h in rulecheck.check([core._comment_check_rule(row)], drafts)[0]] == ["body"]
+    # 库里已经存着、where 带着 comments 的同一种说法: 读的时候也不收窄
+    stored = {"content": "示例禁词只能出现在评论区", "rule_kind": "forbidden_word",
+              "rule_payload": {"words": ["示例禁词"], "where": ["body", "comments"]}}
+    assert core._comment_check_rule(stored) is stored
 
 
 def test_reading_narrows_only_stored_checks_that_include_comments():

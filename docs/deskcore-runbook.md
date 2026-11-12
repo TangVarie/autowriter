@@ -333,7 +333,8 @@ select p.proname,
  where n.nspname = 'autowriter' and p.proname in ('deskcore_check_drafts', 'deskcore_commit_fingerprints');
 
 -- 拿最大的项目最近 10 篇的 sketch 调一次线上函数(STABLE, 一行都不写), 看最后一行 Execution Time:
--- 11-11 跑 019 之前是 3,677 毫秒; 跑完应在 1 秒以内(同一组稿子照新写法跑是 341 毫秒)
+-- 这个数跟着最近 10 篇的长短走: 11-11 那一组跑 019 之前 3,677 毫秒、照新写法 341 毫秒; 11-12 最近 10 篇里有 5 篇长稿,
+-- 之前约 7 秒、照新写法约 1.3 秒。跑完在 3 秒以内就是走上了 GIN
 explain (analyze, costs off, timing off)
 select r.idx, r.best_j
   from (select project_id from autowriter.draft_fingerprints
@@ -350,7 +351,7 @@ select r.idx, r.best_j
 
 ③ `doctor` 里 019 那一行是 `unprobeable`（PostgREST 读不到函数体，同 `008` / `016`），不算红；它给的就是上面第一句。
 ④ 下一批存档之后看 `commit_parts_ms` 的 `gate` 和 `fingerprints`（`docs/deskcore.md` §3.8 第二条查询）：历史多的项目应从
-每篇约 0.4 秒降到 0.1 秒以内。
+每篇约 0.4 秒降到 0.1 秒上下（长稿候选多，每篇 0.2～0.3 秒也正常：剩下的时间花在逐条算重合上，019 不动这一步）。
 
 **第二句还在 3 秒以上**，说明计划器没走 GIN。结论不受影响，只是没变快；退回原来的写法：SQL Editor 里整个重跑
 `008_embedding_model_isolation.sql`（`deskcore_check_drafts` 回到 008 那一版），再只跑 `005_deskcore_containment.sql` 里

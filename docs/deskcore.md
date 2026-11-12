@@ -658,7 +658,7 @@ project_id 同样没过归属校验：那一列只认回包里的 `project_id`�
 
 | 键 | 哪些调用有 | 是什么 |
 |---|---|---|
-| `tool` / `channel` / `elapsed_ms` | 全部 | 工具名、`rest` / `mcp`、服务端这一次用了多久 |
+| `v` / `tool` / `channel` / `elapsed_ms` | 全部 | 这一行的形状版本（现在是 1，形状改了就加一）、工具名、`rest` / `mcp`、服务端这一次用了多久 |
 | `outcome` / `error_class` | 全部 / 没成的 | `ok`；`error_result`（没抛、但回的是带 `error` 的降级结果）；`refused`（400 / 403 / 404 / 409 那几类正常拒绝）；`failed`（真故障）；`interrupted`（客户端断了）。后三种带异常类型（同服务日志那一行） |
 | `items` / `reply_chars` | 有才带 | 这次带了几篇稿 / 几条评论 / 几个版本（发牌是要几张）；回包的字符数（紧凑 JSON，中文一个字算一个） |
 | `skill` | `open_project` / `comments_for` | 这次报上来的 skill 版本：`up_to_date` / `outdated` / `unknown`（没报） |

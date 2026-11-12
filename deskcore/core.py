@@ -3622,15 +3622,18 @@ COMMENT_CHECK_NOTE = ("这条规则开头说的是评论, 所以它的 check 只
 COMMENT_LEN_CHECK_NOTE = "这条规则开头说的是评论, 字数检查(max_len)只数标题 / 正文, 所以没存 check; 规则原文记下了, 写评论时照给。"
 MY_RULES_COMMENT_CHECK_NOTE = "这条规则开头说的是评论, 它的 check 只查评论(where 按 [\"comments\"] 算)"
 _POST_TAIL_WORDS = ("正文", "标题", "笔记")
+# 「示例牌只能出现在评论区」「评论区才能提品牌」说的是这个词该待在哪儿, 不是评论该怎么写(2026-11-12 复审 X-1): 它的检查查的是
+# 标题 / 正文。没写 where 的时候照「只说评论」收窄, 就成了正文里写了不报、评论里写了(规则要它在那儿)反而报。这种说法不收窄。
+_ONLY_IN_COMMENTS_RE = re.compile(r"(?:只|仅|才)[^，,。；;]{0,8}评论|评论[^，,。；;]{0,8}才")
 
 
 def _comment_only_text(content) -> bool:
     """这条规则说的只是评论: 开头那一句说的是评论、没点到笔记的哪一部分(_POST_WORDS), 第一句(到句号 / 分号 / 换行)里
-    也没点到正文 / 标题 / 笔记。"""
+    也没点到正文 / 标题 / 笔记, 说的也不是「某样东西只能待在评论区」(_ONLY_IN_COMMENTS_RE)。"""
     if not _head_names_comments(content) or any(w in _rule_head(content) for w in _POST_WORDS):
         return False
     sentence = re.split("[。；;\r\n]", content, maxsplit=1)[0]
-    return not any(w in sentence for w in _POST_TAIL_WORDS)
+    return not any(w in sentence for w in _POST_TAIL_WORDS) and not _ONLY_IN_COMMENTS_RE.search(sentence)
 
 
 def _comment_only_where(content, kind: str, payload: dict | None, *, where_given: bool = True) -> bool:
