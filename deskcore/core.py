@@ -11990,13 +11990,17 @@ def _same_miss_score(stored, now_score: float | None) -> bool:
 #     TV_GATE_OVERLAP_BUDGET_S。看的是两次请求之间, 一次请求自己卡住由客户端的超时管。
 #   · 只 UPDATE 回流闸那四列, 值一样的行一次写(store.tv_links_set_gate), 结论没变的只刷新 gate_at —— 每晚范围里的每一行
 #     都刷新, TV 的灯按 max(gate_at) 看这一步还在不在跑。不 upsert, 不碰对照本身的列。
-# 范围: 发布时间在近 TV_GATE_WINDOW_DAYS 天里的(含排期在后面的)、从没判过的、上一晚是 hold / unsure 的(等发布时间、正文、
-# 特征题答案, 不管多老都重判)、判过 withdrawn 而这晚又读到了的(回来了)。--gate-all 是这个项目的全部对照。
+# 范围: 发布时间在近 TV_GATE_WINDOW_DAYS 天里的(含排期在后面的)、从没判过的、还在等的(上一晚是 hold / unsure, 或者是
+# fail 而原因里还带着 unsure: 等发布时间、正文、特征题答案, 不管多老都重判 —— 教训卡不看 not_clean, 靠那个 unsure 在
+# 答案到之前不借它, 答案到了得摘掉)、判过 withdrawn 而这晚又读到了的(回来了)、有定论而这晚没读到的(不管多老: 每晚的
+# 同步读的是整个项目, 没读到的只有飞书里删了的, 得去问 v_notes_vanished —— 教训卡不看帖龄, 老帖删了也要记 withdrawn;
+# 记过 withdrawn 的不再问)。--gate-all 是这个项目的全部对照。
 # 读不到就不判、留着上一晚的: 笔记的状态列、efficacy_promise 的答案、投流事件三样任何一样读不到, 这个项目这晚整步报错、
 # 一行不写(少了哪一样都会把一批帖判错档: 答案读不到会全进 unsure, 投流事件读不到会把 fail 放成 pass)。
 # 飞书里删了的: 这晚没读到(016 之后 deskcore_tv_notes 不返回它们)而且缺席满 TV_VANISHED_GRACE 的记 withdrawn; 还在宽限
 # 里的不判, 留着上一晚的结论(只刷新 gate_at) —— TV 一次同步写坏, 不能让一个项目一晚上全变成 withdrawn(decisions 第 1 条)。
-# 查不了 v_notes_vanished 的那晚, 没读到的行一律不动。没读到、又不在视图里的(--since 窗口外的)也不动。
+# 查不了 v_notes_vanished 的那晚, 没读到的行一律不动。没读到、又不在视图里的(--since 窗口外的)也不动 —— 带 --since
+# 手动跑的那次它们都在范围里(多问几批视图、「范围」和「没读到」的数大一些), 一行不写。
 TV_GATE_WINDOW_DAYS = 60
 TV_GATE_BUDGET_S = 120.0
 TV_GATE_OVERLAP_BUDGET_S = 30.0
@@ -12086,7 +12090,9 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         t = priors._ts(f.get("publish_time"))
         g = row.get("gate")
         if (gate_all or g not in postgate.GATES or g in postgate.PENDING_GATES or (t is not None and t >= since)
-                or (g == postgate.GATE_WITHDRAWN and nid in notes_by_id)):
+                or postgate.REASON_UNSURE in postgate.reasons_of(row.get("gate_reasons"))
+                or (g == postgate.GATE_WITHDRAWN and nid in notes_by_id)
+                or (g != postgate.GATE_WITHDRAWN and nid not in notes_by_id)):
             scope.append(nid)
     scope.sort(key=lambda nid: (rows[nid].get("gate_at") is not None, str(rows[nid].get("gate_at") or ""), nid))
     out["scope"] = len(scope)
@@ -12115,7 +12121,7 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
         n = notes_by_id.get(nid)                        # 正文长短看 tv-sync 这晚从 raw_content 拆出来的那段(decisions 第 2 条)
         return dict(flag_of[nid], note_id=nid, body_chars=len(n.body) if n is not None else None)
 
-    # 前两步就定了的(hold)用不着功效题的答案, 不为它们去读(全库三百多行 hold 每晚都在范围里)
+    # 前两步就定了的(hold)用不着功效题的答案, 不为它们去读(全库一百七十来行 hold 每晚都在范围里)
     readable = [nid for nid in scope if nid in notes_by_id
                 and postgate.classify(note_row(nid), now=now).gate != postgate.GATE_HOLD]
     efficacy: dict[str, str] = {}
@@ -12130,6 +12136,12 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
             efficacy.update({nid: a[postgate.EFFICACY_QID] for nid, a in answers.items()
                              if a.get(postgate.EFFICACY_QID)})
         got = priors.paid_boosted(client)
+        if got is None:
+            # 缓存读挂之后 PAID_BOOST_RETRY_S 之内不再读 —— 那是给请求路径的退避。每晚的同步在一个新起的进程里几秒钟
+            # 一个项目地跑, 手里没有旧的: 只靠缓存的话, 第一个项目碰上一次读挂, 后面每个项目的闸这一晚都不判。所以这里
+            # 自己直接再读一次, 还读不到才算读不到。
+            ids = store.tv_paid_boost_note_ids(client)
+            got = frozenset(ids) if ids is not None else None
         if got is None:
             raise RuntimeError("读不到投流事件(truth_vault.v_paid_boost_events)")
         boosted = got
@@ -12184,12 +12196,17 @@ def _tv_gate(client, tv_project_id: str, rows: dict[str, dict], notes_by_id: dic
     out["counts"] = counts
 
     at = now.isoformat()
+    writing = "changed"
     try:
         out["changed"] = store.tv_links_set_gate(
             client, [(o, g, json.loads(r), ids) for (o, g, r), ids in sorted(changed.items())], at=at, stop=stop)
+        writing = "touched"
         out["touched"] = store.tv_links_touch_gate(client, touch, at=at, stop=stop)
     except Exception as exc:                            # noqa: BLE001 — 写了一半: 写进去的是对的, 没写的留着上一晚的
         logger.exception("tv_sync: 回流闸写结论失败 (tv=%s)", tv_project_id)
+        # 分块写到一半: 照实报已经写进去的行数(同 _rescore_misses)。结论没写全的这晚不再去刷新没变的行的 gate_at ——
+        # TV 的灯靠它看出这一晚没判全。
+        out[writing] = getattr(exc, "done", 0)
         out["error"] = f"{type(exc).__name__}: {exc}"[:200]
     # 时间用完了、还有没写完的: 没写的留着上一晚的结论和 gate_at, 明晚排在最前
     out["partial"] = bool(stop()) and (out["changed"] < sum(len(ids) for ids in changed.values())

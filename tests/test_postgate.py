@@ -33,7 +33,7 @@ def test_the_names_other_readers_depend_on():
     assert G.GATES == ("pass", "fail", "unsure", "hold", "withdrawn")
     assert G.REASONS == ("withdrawn", "hold", "not_clean", "risk", "efficacy", "unsure")
     assert G.NOT_LEARNABLE == {"fail", "unsure", "hold", "withdrawn"} and G.PENDING_GATES == {"hold", "unsure"}
-    assert (G.ELSEWHERE_MAX, G.DESK_TITLE_MIN, G.MIN_BODY_CHARS) == (0.15, 0.30, 50)
+    assert (G.ELSEWHERE_MAX, G.DESK_TITLE_MIN, G.MIN_BODY_CHARS) == (0.15, 0.30, 1)
     # 两条线就是匹配器里已经在用的那两条
     assert G.DESK_TITLE_MIN == L.EDITED_FLOOR and G.ELSEWHERE_MAX == pytest.approx(L.EDITED_FLOOR - L.EDITED_MARGIN)
     assert G.MATCHED_KINDS | G.MISS_KINDS | {"ambiguous"} == {
@@ -86,8 +86,7 @@ def test_a_missing_efficacy_answer_is_unsure_and_is_listed_next_to_a_fail_reason
 @pytest.mark.parametrize("note, detail", [
     (_note(days_ago=None), "no_publish_time"),
     (_note(days_ago=-0.5), "scheduled"),                # 发布时间在未来: 排了期还没发
-    (_note(chars=49), "short_body"),
-    (_note(chars=0), "short_body"),
+    (_note(chars=0), "short_body"),                     # 正文是空的: 文字还没到
     (_note(flags={"synthetic": True}), "synthetic"),
 ])
 def test_hold(note, detail):
@@ -95,19 +94,34 @@ def test_hold(note, detail):
 
 
 def test_hold_edges():
-    assert _judge(_note(chars=50)).gate == "pass", "正好 50 个字不算短"
+    assert _judge(_note(chars=1)).gate == "pass", "有字就不是「文字还没到」"
     assert _judge(_note(chars=None)).gate == "pass", "没给正文长度(这晚读不到正文)不因此判 hold"
     assert _judge(_note(days_ago=0)).gate == "pass", "发布时间就是现在: 算发了(同 priors.published_at 的上界)"
-    v = _judge(_note(days_ago=None, chars=3, flags={"synthetic": True}))
+    v = _judge(_note(days_ago=None, chars=0, flags={"synthetic": True}))
     assert v == G.Verdict("hold", ("hold",), ("no_publish_time", "short_body", "synthetic"))
+
+
+def test_a_short_finished_post_is_judged_by_the_other_checks():
+    """hold 是「还没到齐」: 没有发布时间、排了期、正文是空的。发出去的短帖(一句问话加话题)正文不会再变长 —— 按字数
+    放着等于永远放着, 而 hold 每晚重判、两路都挡, 一批起量的短帖和它们的教训卡就这么没了。有字的走后面三步。"""
+    old_short = _note(days_ago=90, tier="大爆", chars=40)
+    assert _judge(old_short) == G.Verdict("pass", (), ())
+    assert G.learnable("pass", G.pack_reasons(_judge(old_short)), blocking=G.BLOCKS_CARDS)
+    assert _judge(_note(days_ago=2, chars=1)).gate == "pass", "刚发的也一样: 值不值得学(发出三天以上)各处自己有线"
+    # 短不是豁免: 后面三步照查
+    assert _judge(_note(chars=40, tier="风控")) == G.Verdict("fail", ("risk",))
+    assert _judge(_note(chars=40), efficacy={"n1": "是"}) == G.Verdict("fail", ("efficacy",))
+    assert _judge(_note(chars=40, flags={"paid_promoted": True})) == G.Verdict("fail", ("not_clean",))
+    assert _judge(_note(chars=40), efficacy={}) == G.Verdict("unsure", ("unsure",))
+    assert _judge(_note(days_ago=90, chars=0)) == G.Verdict("hold", ("hold",), ("short_body",)), "空的还是等"
 
 
 def test_the_order_of_checks():
     """withdrawn 先于 hold 先于 fail 先于 unsure 先于 pass —— 每一步拿一篇后面几步也都成立的帖来问。"""
-    everything = _note(days_ago=None, chars=3, tier="风控", flags={"paid_promoted": True, "synthetic": True})
+    everything = _note(days_ago=None, chars=0, tier="风控", flags={"paid_promoted": True, "synthetic": True})
     assert _judge(everything, vanished=("n1",), efficacy={}) == G.Verdict("withdrawn", ("withdrawn",))
     assert _judge(everything, efficacy={}).gate == "hold"
-    assert _judge(_note(chars=3, tier="风控"), efficacy={"n1": "是"}) == G.Verdict("hold", ("hold",), ("short_body",)), \
+    assert _judge(_note(chars=0, tier="风控"), efficacy={"n1": "是"}) == G.Verdict("hold", ("hold",), ("short_body",)), \
         "hold 的不往下查: 原因里没有 risk / efficacy"
     assert _judge(_note(tier="风控"), efficacy={}).gate == "fail"
     assert _judge(_note(), efficacy={}).gate == "unsure"

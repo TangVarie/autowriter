@@ -3014,7 +3014,9 @@ def external_slice(sb, category: str, *, days: int = EXTERNAL_SLICE_DAYS) -> lis
 
 # 投了薯条、却没标 paid_promoted 的帖(2026-11-03): TV 的 v_paid_boost_events 认出来的投流事件(service_role 读得到, 有
 # note_id 列)。这些帖不算干净(priors.is_clean), 不进起量标签、不当起量帖、不进简报的 working 一栏。视图每读一次都要算一遍
-# (生产 ~0.5 秒), 所以只经 priors.paid_boosted 那份进程缓存读(复审), 别在别处直接调。
+# (生产 ~0.5 秒), 所以只经 priors.paid_boosted 那份进程缓存读(复审), 别在别处直接调。唯一的例外是回流闸
+# (core._tv_gate): 缓存里拿不到(读挂之后的退避里)时它自己直接再读一次 —— 每晚一个进程连着判所有 TV 项目, 不能因为
+# 一次读挂整晚都不判。
 PAID_BOOST_MAX_PAGES = 10
 
 

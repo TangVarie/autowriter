@@ -27,7 +27,7 @@ BODY_C = ("第二篇稿子讲的是另一件事: 面试前一晚把自我介绍�
           "第二天我把前三句删了, 面试官第一次在我说完之前就开始点头。")
 BODY_D = ("周末第一次去打网球, 教练让我先对着墙打两百个正手, 打到一半手腕就酸得抬不起来。"
           "回家查了才知道握拍太紧, 第二周换了松一点的握法, 墙打到三百个也不累。")
-# 同 tests/test_tv_sync.py 的三条(对上写作台的稿 / 库里没有 → 补录 / TV 自己带了认不出的血缘), 第三条的正文加长到过 50 个字
+# 同 tests/test_tv_sync.py 的三条(对上写作台的稿 / 库里没有 → 补录 / TV 自己带了认不出的血缘), 第三条的正文长一些
 NOTES = [T.NOTES[0], T.NOTES[1],
          T._note("n3", "TV 自己带了 lineage", "随便什么正文, 反正 TV 已经知道它是哪一版。" * 3,
                  source_autowriter_version_id="vvvvvvvv-0000-0000-0000-00000000000v")]
@@ -221,26 +221,28 @@ def test_every_class_from_the_inputs_the_step_reads():
         T._note("d_risk", "风控的一篇", BODY_C + "多一句让它和上面那篇不一样的话, 这样指纹不会撞。", tier="风控"),
         T._note("e_promise", "承诺功效的一篇", BODY_D + "多一句让它和上面那篇不一样的话, 这样指纹不会撞。"),
         T._note("f_unanswered", "还没答题的一篇", BODY_E + "多一句让它和上面那篇不一样的话, 这样指纹不会撞。"),
-        T._note("g_short", "正文太短的一篇", "就这么一句。"),
+        T._note("g_empty", "正文还是空的一篇", ""),
         T._note("h_future", "排期在后面的一篇", BODY_C + "这一篇排在十天以后才发, 现在只是先填进了表里。", days=20),
         T._note("i_undated", "还没填发布日期的一篇", BODY_D + "这一篇还没有填发布日期, 表里那一格是空的。", publish_time=None),
         T._note("j_synthetic", "合成的一篇", BODY_E + "这一篇是合成的测试数据, 不是真发出去的帖。", flags={"synthetic": True}),
+        T._note("k_short", "正文只有一句的一篇", "就这么一句。"),          # 发出去的短帖: 有字, 走后面三步
     ]
     c = _tv(notes, with_target=False, unanswered={"f_unanswered"}, promise={"e_promise"}, boosted={"c_boost"})
     out = core.tv_sync(c, TV)
     got = {nid: v[1:] for nid, v in _gate(c).items()}
     assert got == {"a_pass": ("pass", ()), "b_paid": ("fail", ("not_clean",)), "c_boost": ("fail", ("not_clean",)),
                    "d_risk": ("fail", ("risk",)), "e_promise": ("fail", ("efficacy",)),
-                   "f_unanswered": ("unsure", ("unsure",)), "g_short": ("hold", ("hold",)),
-                   "h_future": ("hold", ("hold",)), "i_undated": ("hold", ("hold",)), "j_synthetic": ("hold", ("hold",))}
+                   "f_unanswered": ("unsure", ("unsure",)), "g_empty": ("hold", ("hold",)),
+                   "h_future": ("hold", ("hold",)), "i_undated": ("hold", ("hold",)), "j_synthetic": ("hold", ("hold",)),
+                   "k_short": ("pass", ())}
     hold = {nid: l["gate_reasons"].get("hold") for nid, l in _links(c).items() if l["gate"] == "hold"}
-    assert hold == {"g_short": ["short_body"], "h_future": ["scheduled"], "i_undated": ["no_publish_time"],
+    assert hold == {"g_empty": ["short_body"], "h_future": ["scheduled"], "i_undated": ["no_publish_time"],
                     "j_synthetic": ["synthetic"]}
-    assert sum(n for per in out["gate"]["counts"].values() for n in per.values()) == 10
+    assert sum(n for per in out["gate"]["counts"].values() for n in per.values()) == 11
     # 前两步就定了的(hold)不去读功效题的答案
     asked = {nid for call in c.calls if call["table"] == "truth_vault.note_feature_answers"
              for f in call["filters"] if f[:2] == ("in", "subject_id") for nid in f[2]}
-    assert asked == {"a_pass", "b_paid", "c_boost", "d_risk", "e_promise", "f_unanswered"}
+    assert asked == {"a_pass", "b_paid", "c_boost", "d_risk", "e_promise", "f_unanswered", "k_short"}
     # 干不干净和 priors.is_clean 是同一把尺(同一行、同一个投流事件集合)
     boosted = priors.paid_boosted(c)
     for row in c.rows["truth_vault.notes"]:
@@ -262,7 +264,7 @@ def test_body_length_comes_from_the_text_tv_sync_parsed_and_the_gate_reads_no_te
 
 def test_reasons_are_stored_as_names_only():
     notes = [T._note("n1", "承诺功效还投了流的一篇", BODY_C, flags={"paid_promoted": True}),
-             T._note("n2", "正文太短的一篇", "就这么一句。"), T._note("n3", "普通的一篇", BODY_D)]
+             T._note("n2", "正文还是空的一篇", ""), T._note("n3", "普通的一篇", BODY_D)]
     c = _tv(notes, with_target=False, promise={"n1"})
     core.tv_sync(c, TV)
     names = set(postgate.REASONS) | set(postgate.HOLD_DETAILS)
@@ -277,6 +279,7 @@ def test_reasons_are_stored_as_names_only():
             title = re.search(r"【标题】(.*?) 【正文】", n["raw_content"]).group(1)
             assert title not in text and n["raw_content"][-30:] not in text
     assert _gate(c)["n1"][1:] == ("fail", ("not_clean", "efficacy"))
+    assert _links(c)["n2"]["gate_reasons"]["hold"] == ["short_body"]
 
 
 def test_duplicate_texts_are_judged_row_by_row():
@@ -431,6 +434,87 @@ def test_scope_is_recent_posts_plus_never_judged_plus_pending_ones():
     assert _links(c)["old_pass"]["gate_at"] == NIGHT[0].isoformat()
 
 
+def test_an_old_settled_post_deleted_from_the_sheet_still_becomes_withdrawn():
+    """删了的帖不管多老都要记 withdrawn: 教训卡不看帖龄(书架上多数卡的帖早过了 60 天), 一篇有定论的老帖哪天从飞书里
+    删了, 这晚没读到它 —— 没读到的行不看发布时间, 一律进范围去问 v_notes_vanished。"""
+    notes = [T._note("old", "很久以前的一篇", BODY_C, days=-80), T._note("new", "刚发的一篇", BODY_E, days=8),
+             T._note("old_kept", "很久以前、一直在的一篇", BODY_D, days=-80)]
+    c = _tv(notes, with_target=False)
+    core.tv_sync(c, TV)
+    assert {nid: v[1] for nid, v in _gate(c).items()} == {"old": "pass", "new": "pass", "old_kept": "pass"}
+    first = {nid: l["gate_at"] for nid, l in _links(c).items()}
+
+    # 刚不见(还在宽限里): 留着上一晚的结论, 只刷新时间
+    _next_night()
+    _vanish(c, notes, "old", hours=10)
+    out = core.tv_sync(c, TV)
+    assert out["gate"]["scope"] == 2 and out["gate"]["kept_in_grace"] == 1
+    assert _gate(c)["old"][1] == "pass" and _links(c)["old"]["gate_at"] == NIGHT[0].isoformat()
+
+    # 缺席满了宽限: withdrawn, 和刚发的帖删了一样
+    _next_night(3)
+    _vanish(c, notes, "old", hours=72)
+    _vanish(c, notes, "new", hours=72)
+    out = core.tv_sync(c, TV)
+    assert _gate(c)["old"] == ("elsewhere", "withdrawn", ("withdrawn",))
+    assert _gate(c)["new"] == ("elsewhere", "withdrawn", ("withdrawn",))
+    assert postgate.blocked(_links(c)["old"], postgate.BLOCKS_CARDS)
+    assert out["gate"]["scope"] == 2 and out["gate"]["changed"] == 2
+    assert _links(c)["old_kept"]["gate_at"] == first["old_kept"], "这晚读到了的老帖、有定论的照旧不看"
+
+    # 记过 withdrawn 的老帖之后不再每晚去问
+    _next_night()
+    mark = len(c.calls)
+    out = core.tv_sync(c, TV)
+    assert out["gate"]["scope"] == 1, "只剩那篇近 60 天里发的(withdrawn 了也还在窗口里)"
+    asked = {nid for call in c.calls[mark:] if call["table"] == "truth_vault.v_notes_vanished"
+             for f in call["filters"] if f[:2] == ("in", "note_id") for nid in f[2]}
+    assert "old" not in asked
+
+
+def test_an_old_settled_post_that_was_not_read_and_is_not_deleted_is_left_alone():
+    """--since 只读新进来的笔记: 没读到的老帖也进范围去问删没删, 不在已删视图里的一行不动(只是数进「没读到」)。"""
+    notes = [T._note("old", "很久以前的一篇", BODY_C, days=-80)]
+    c = _tv(notes, with_target=False)
+    core.tv_sync(c, TV)
+    before = dict(_links(c)["old"])
+    mark = len(c.calls)
+    _next_night()
+    c.rpc_impl["deskcore_tv_notes"] = lambda a: []
+    out = core.tv_sync(c, TV, since="2026-09-20T00:00:00+00:00")
+    assert _links(c)["old"] == before and not _gate_writes(c, mark)
+    assert (out["gate"]["scope"], out["gate"]["unread"], out["gate"]["judged"]) == (1, 1, 0)
+
+
+def test_a_fail_row_still_waiting_for_the_efficacy_answer_is_rejudged_at_any_age():
+    """投了流、功效题又还没答的帖是 fail, 原因 not_clean + unsure。教训卡不看 not_clean, 靠 unsure 在答案到之前不借它 ——
+    所以这一行也是「还在等」的: 不管帖多老, 每晚重判, 答案到了 unsure 就摘掉。只按结论(fail)看的话, 过了 60 天的
+    这种帖 unsure 永远摘不掉, 教训卡永远借不了它。"""
+    notes = [T._note("old_paid", "很久以前、投了流、还没答题的一篇", BODY_C, days=-100, flags={"paid_promoted": True}),
+             T._note("old_pass", "很久以前的一篇", BODY_D, days=-100)]
+    c = _tv(notes, with_target=False, unanswered={"old_paid"})
+    core.tv_sync(c, TV)
+    assert _gate(c)["old_paid"][1:] == ("fail", ("not_clean", "unsure"))
+    assert postgate.blocked(_links(c)["old_paid"], postgate.BLOCKS_CARDS)
+
+    _next_night()
+    out = core.tv_sync(c, TV)
+    assert out["gate"]["scope"] == 1 and out["gate"]["touched"] == 1, "答案还没到: 每晚都看它一眼"
+
+    _next_night()
+    c.rows["truth_vault.note_feature_answers"].append(_answer("old_paid"))
+    out = core.tv_sync(c, TV)
+    assert out["gate"]["scope"] == 1 and out["gate"]["changed"] == 1
+    assert _gate(c)["old_paid"][1:] == ("fail", ("not_clean",))
+    assert not postgate.blocked(_links(c)["old_paid"], postgate.BLOCKS_CARDS), "教训卡不看 not_clean(D-133 第 1 条)"
+    assert postgate.blocked(_links(c)["old_paid"], postgate.BLOCKS_DESK)
+    settled = _links(c)["old_paid"]["gate_at"]
+
+    _next_night()
+    out = core.tv_sync(c, TV)
+    assert out["gate"]["scope"] == 0 and _links(c)["old_paid"]["gate_at"] == settled, "定了以后出了范围"
+
+
 def test_a_link_whose_note_is_gone_from_tv_is_counted_and_left_alone():
     c = _tv(list(NOTES))
     c.rows["truth_vault.notes"] = [r for r in c.rows["truth_vault.notes"] if r["note_id"] != "n3"]
@@ -550,8 +634,9 @@ def _break(monkeypatch, what: str) -> None:
         real = store.note_answers
         monkeypatch.setattr(store, "note_answers", lambda sb, ids, qids, **k: (
             None if list(qids) == [postgate.EFFICACY_QID] else real(sb, ids, qids, **k)))
-    elif what == "boost":
+    elif what == "boost":                               # 视图整晚读不到: 缓存那一份没有, 这一步自己再读一次也没有
         monkeypatch.setattr(priors, "paid_boosted", lambda *a, **k: None)
+        monkeypatch.setattr(store, "tv_paid_boost_note_ids", lambda *a, **k: None)
     elif what == "classify":
         monkeypatch.setattr(postgate, "classify", boom)
     elif what == "write":
@@ -587,6 +672,55 @@ def test_a_failing_night_keeps_yesterdays_verdicts(monkeypatch, what):
     out = core.tv_sync(c, TV)
     assert out["gate"]["error"]
     assert {nid: {k: l[k] for k in GATE_COLS} for nid, l in _links(c).items()} == before, "连 gate_at 都留着上一晚的"
+
+
+def test_one_failed_read_of_the_boost_view_does_not_cancel_the_projects_after_it(monkeypatch):
+    """`tv-sync --all` 在一个进程里几秒钟一个项目地跑。投流事件那份缓存(priors.paid_boosted)读挂一次之后 5 分钟不再读,
+    新起的 cron 进程里又没有旧的可用 —— 只靠它的话, 第一个项目碰上一次读挂, 这一晚后面每个项目的闸都跟着不判。
+    闸这一步缓存里拿不到时自己直接再读一次: 一次读挂最多赔上它碰上的那一次读。"""
+    real = store.tv_paid_boost_note_ids
+    reads = []
+
+    def flaky(sb):
+        reads.append(1)
+        return None if len(reads) == 1 else real(sb)
+    monkeypatch.setattr(store, "tv_paid_boost_note_ids", flaky)
+    c = _tv(list(NOTES), boosted={"n2"})
+    for night in range(3):                              # 同一个进程里连着三次(相当于三个 TV 项目), 都在那 5 分钟里
+        out = core.tv_sync(c, TV)
+        assert out["gate"]["error"] is None and out["gate"]["judged"] == 3, night
+        assert _gate(c)["n2"][1:] == ("fail", ("not_clean",)), "判的时候手里是真的投流事件集合"
+        assert _links(c)["n1"]["gate_at"] == NIGHT[0].isoformat()
+        _next_night()
+    assert len(reads) == 4, "缓存读挂的那一次 + 三个项目各自直接读的一次; 缓存的退避没有动"
+    assert priors.paid_boosted(c) is None and len(reads) == 4
+
+
+def test_a_write_that_fails_part_way_reports_the_rows_that_did_land():
+    """值不一样的两组结论, 第二组的 UPDATE 挂了: 第一组已经提交。这一晚的计数是这一步唯一的记录(decisions 第 3 条:
+    不另记一行), 「改了几行」得是真写进去的行数; 没变的行这晚不刷新 gate_at(灯靠它看出这一晚没判全)。"""
+    c = _tv(list(NOTES))
+    core.tv_sync(c, TV)
+    first = {nid: l["gate_at"] for nid, l in _links(c).items()}
+    _next_night()
+    c.rows["truth_vault.notes"][0]["tier"] = "风控"                                   # n1 → fail [risk]
+    c.rows["truth_vault.note_feature_answers"].append(_answer("n2", "是", at="2026-09-21T20:00:00+00:00"))  # n2 → fail [efficacy]
+    real, seen = c._execute, []
+
+    def execute(q):
+        if q.table_name == "tv_note_links" and q.op == "update" and set(q.payload) == GATE_COLS:
+            seen.append(1)
+            if len(seen) == 2:
+                raise RuntimeError("timeout")
+        return real(q)
+    c._execute = execute
+    out = core.tv_sync(c, TV)
+    g = out["gate"]
+    assert g["changed"] == 1 and g["touched"] == 0
+    assert "PartialWriteError" in g["error"] and "写了 1 行之后失败" in g["error"]
+    got = _gate(c)
+    assert sorted(v[1] for v in (got["n1"], got["n2"])) == ["fail", "pass"], "第一组写进去了, 第二组留着上一晚的"
+    assert got["n3"][1] == "pass" and _links(c)["n3"]["gate_at"] == first["n3"], "没变的那一行这晚没刷新时间"
 
 
 def test_a_partial_write_reports_what_landed(monkeypatch):

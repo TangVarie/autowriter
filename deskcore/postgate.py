@@ -18,7 +18,8 @@ core._tv_gate(tv-sync 每晚最后一步); 存在 tv_note_links 的 origin / gat
 
 检查的先后(第一个成立的定结论):
   1. withdrawn  飞书里删了 / 挪走了, 而且缺席满 36 小时(core.TV_VANISHED_GRACE; 不满的这晚不判, 留着上一晚的结论)
-  2. hold       没有发布时间 / 发布时间在未来 / 正文不到 MIN_BODY_CHARS 个字 / 合成数据
+  2. hold       没有发布时间 / 发布时间在未来 / 正文还是空的(不到 MIN_BODY_CHARS 个字) / 合成数据。都是「还没到齐」;
+                发出去的短帖有字就不在此列, 照走下面三步
   3. fail       not_clean(priors.is_clean 说不干净: 投流、铺评工单、投流事件) / risk(tier 风控) / efficacy(TV 存的
                 efficacy_promise 答案是「是」)
   4. unsure     efficacy_promise 还没有答案(每晚重判, 答案到了就定)
@@ -62,7 +63,8 @@ GATE_WITHDRAWN = "withdrawn"
 GATES = (GATE_PASS, GATE_FAIL, GATE_UNSURE, GATE_HOLD, GATE_WITHDRAWN)
 # 判过、没放行的四档(只按结论看; 各路该用下面按原因的 learnable, 这个集合留给只要数个数的地方)
 NOT_LEARNABLE = frozenset({GATE_FAIL, GATE_UNSURE, GATE_HOLD, GATE_WITHDRAWN})
-# 还会变的两档: 等发布时间 / 正文 / 特征题答案。不管帖多老, 每晚都重判。
+# 还会变的两档: 等发布时间 / 正文 / 特征题答案。不管帖多老, 每晚都重判。fail 而原因里还带着 unsure 的也在等答案 ——
+# 那是按原因看的, 在 core._tv_gate 定范围的地方。
 PENDING_GATES = frozenset({GATE_HOLD, GATE_UNSURE})
 
 # ── 原因(存进 gate_reasons.reasons 的名字) ─────────────────────────────────
@@ -76,7 +78,7 @@ REASONS = (REASON_WITHDRAWN, REASON_HOLD, REASON_NOT_CLEAN, REASON_RISK, REASON_
 # hold 的细项(存进 gate_reasons.hold; 只给人看, 各路不按它分)
 HOLD_NO_PUBLISH_TIME = "no_publish_time"
 HOLD_SCHEDULED = "scheduled"
-HOLD_SHORT_BODY = "short_body"
+HOLD_SHORT_BODY = "short_body"        # 正文还是空的(名字是最初按「不到 50 个字」起的, 存进库了, 不改)
 HOLD_SYNTHETIC = "synthetic"
 HOLD_DETAILS = (HOLD_NO_PUBLISH_TIME, HOLD_SCHEDULED, HOLD_SHORT_BODY, HOLD_SYNTHETIC)
 
@@ -88,7 +90,11 @@ BLOCKS_DESK = frozenset(REASONS)
 # 帖是老板的事, 还没定。哪天定了「也不借」, 把 REASON_NOT_CLEAN 加进来就是全部改动。
 BLOCKS_CARDS = frozenset(REASONS) - {REASON_NOT_CLEAN}
 
-MIN_BODY_CHARS = 50          # 正文(tv-sync 从 raw_content 拆出来、剥了话题的那段)不到这么多字的先放着
+# 正文(tv-sync 从 raw_content 拆出来、剥了话题的那段)不到这么多字的先放着。1 = 只有空的才放着: hold 是「文字还没到」,
+# 每晚重判, 等它到。发出去的短帖(一句问话加话题)正文不会再变长, 按字数放着等于永远放着, 而 hold 两路都挡 —— 最初定的
+# 是 50, 生产上两百多篇有字的短帖(几乎都答了「否」, 起量的比例不比长帖低)和它们的十来张教训卡会因此一直学不了
+# (2026-11-12 复审)。值不值得学不归这里管: pass 不是质量线, 各处自己有线。
+MIN_BODY_CHARS = 1
 RISK_TIER = "风控"
 EFFICACY_QID = "efficacy_promise"
 
