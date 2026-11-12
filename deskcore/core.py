@@ -60,7 +60,7 @@ from logger_utils import mask_secrets
 from . import calllog, commentstyle, delivery, poststyle, rulecheck, rulecompile
 from . import drawpolicy as dp
 from . import fingerprint as fp
-from . import priors, project_now, store, structure, tvlink, vocab
+from . import priors, project_now, store, structure, tvlink, viewpage, vocab
 
 logger = logging.getLogger("deskcore.core")
 
@@ -5177,6 +5177,82 @@ def _whole_batch_delivery(client, project_id: str, tpl: dict, drafts: list[dict]
     return ({"format": fmt, "text": "\n\n".join(texts), "problems": problems, "scope": DELIVERY_SCOPE_WHOLE,
              "batches": batches, "untouched": untouched},
             None, {"drafts": n, "batches": batches, "untouched": untouched})
+
+
+# ── 一批稿子排好版的页面(2026-11-12, deskcore/viewpage.py, docs/deskcore.md) ─────────────────────────────
+# 写手要一张排好版的页面(一篇一行, 左边笔记右边评论, 逐篇可复制)。让写手那边的模型每次写 HTML 太慢, 所以页面由服务端拿已经
+# 存下的稿子拼: ``view_link`` 给这几个 batch 发一个带签名、会过期的链接, ``view_page_data`` 是 ``GET /v/{令牌}`` 读库的那一步。
+# 页面上的字从库里现读: 改稿重存之后刷新, 看到的就是每篇现在的那一版。
+class ViewNotFound(LookupError):
+    """链接里的 batch 找不到、不在同一个项目里、或者项目没了。对外和「链接不对 / 过期」是同一张出错页, 不分原因。"""
+
+
+def view_link(batch_ids) -> dict | None:
+    """给这几个 batch(1~``viewpage.MAX_BATCHES`` 个)发一个页面链接: ``{"url", "expires", "note"}``。功能关着(总开关、
+    没有能用的秘密、对外地址定不下来)、一个 batch 都没有、太多、id 不对都回 None。**不抛**: 发不出链接不许连累存档。
+
+    ⚠️ 回来的 ``url`` / ``note`` 只放进回包: 不记日志、不进 batch_metrics、不进工具调用的留痕 —— 那几处只记「发没发」。"""
+    ids = [str(b) for b in (batch_ids or []) if b]
+    try:
+        return viewpage.mint(ids)
+    except Exception as exc:                            # noqa: BLE001 — 增强项, 绝不冒泡; 日志里没有链接
+        logger.warning("view_link: 页面链接没发出来(%s, batches=%s)", type(exc).__name__,
+                       ",".join(b[:8] for b in ids[:viewpage.MAX_BATCHES]) or "-")
+        return None
+
+
+def view_page_data(client, batch_ids: list[str], expires_at: int) -> dict:
+    """``GET /v/{令牌}`` 读库的那一步: 这几个 batch → ``viewpage.render`` 吃的那份数据。调用方已经验过令牌。
+
+    这几个 batch 要都在、都属于同一个项目, 不然抛 ``ViewNotFound``; 查库出错原样上抛(页面回 503)。一批十几篇时七次读:
+    batch 属于哪个项目、项目行, 再加 ``store.batch_drafts`` 的 batches 一次、items / versions 翻页各两次。
+
+    每篇用它现在的那一版(同导出、同改稿重存时拼整批的口径)。顺序: batch 按建的先后; batch 里按存档时记的顺序
+    (``DELIVERY_PARTS_KEY`` 的 order), 没记顺序的、记的顺序里没有的排在后面(按 item id, 至少每次打开都一样)。话题 / 评论 /
+    方向取现在那一版记的那一份; 现在那一版没记(别的入口改出来的一版)就用这一篇别的版本最近记的那一份 —— 页面只是给人看的,
+    评论旧一点比整块没有强。项目的交付模板坏了当没有模板排, 不拦。"""
+    ids = list(dict.fromkeys(str(b) for b in batch_ids))
+    owner = store.batch_projects(client, ids)
+    projects = {owner.get(b) for b in ids}
+    if None in projects or len(projects) != 1:
+        raise ViewNotFound("batch missing or not in one project")
+    project_id = projects.pop()
+    project = store.project_row(client, project_id)
+    if project is None:
+        raise ViewNotFound("project missing")
+    info = store.batch_drafts(client, project_id, ids)
+    if set(info) != set(ids):
+        raise ViewNotFound("batch missing")
+    try:
+        tpl = delivery.template_of(project)
+    except Exception:                                   # noqa: BLE001 — 模板坏了页面照样出, 按没有模板排
+        logger.warning("view_page_data: 项目 %s 的交付模板用不了, 页面按没有模板排", project_id)
+        tpl = None
+    batches: list[dict] = []
+    for bid in sorted(ids, key=lambda b: (str(info[b].get("created_at") or ""), ids.index(b))):
+        rec = info[bid]["params"].get(DELIVERY_PARTS_KEY)
+        rec = rec if isinstance(rec, dict) else {}
+        order = rec.get("order") if isinstance(rec.get("order"), list) else []
+        parts = rec.get("parts") if isinstance(rec.get("parts"), dict) else {}
+        by_version = {v: it for it in info[bid]["items"] for v in it["version_ids"]}
+        placed, seen = [], set()
+        for vid in order:
+            it = by_version.get(str(vid))
+            if it is not None and it["item_id"] not in seen:
+                seen.add(it["item_id"])
+                placed.append(it)
+        placed += sorted((it for it in info[bid]["items"] if it["item_id"] not in seen), key=lambda it: it["item_id"])
+        drafts = []
+        for it in placed:
+            cur = it.get("current")
+            if not cur:
+                continue
+            part = parts.get(cur["id"])
+            if not isinstance(part, dict):
+                part = next((parts[v] for v in reversed(it["version_ids"]) if isinstance(parts.get(v), dict)), {})
+            drafts.append({**part, "title": cur["title"], "body": cur["body"]})
+        batches.append({"created_at": info[bid].get("created_at"), "drafts": drafts})
+    return viewpage.build_page(project.get("name") or "", tpl, batches, expires_at=expires_at)
 
 
 def _as_delivered(tpl: dict | None, drafts: list[dict]) -> tuple[list[dict], list[list[str]] | None]:

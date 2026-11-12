@@ -474,19 +474,20 @@ def _cell(text: str) -> str:
     return text.replace("\n", "<br>")
 
 
-def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = None) -> dict:
-    """按模板把一批稿子拼成交付稿。返回 ``{"format", "text", "problems": [{"index", "what"}]}``。
+def rows(template: dict, drafts: list[dict], *, indices: list[int] | None = None) -> tuple[list[dict], list[dict]]:
+    """按模板把每篇拼成交付用的几格: ``([每篇一行], problems)``。assemble 拿它排成表格 / 段落; 排好版的页面
+    (viewpage, 2026-11-12)也拿它 —— 页面上「复制笔记」「复制评论」复制出去的就是这里的 ``post`` / ``comments``, 和
+    delivery.text 里那一格一字不差。
 
-    ``indices``: 每篇在调用方那一批里的下标(score_drafts 只拼存进去的那几篇, problems 要按写手传的位置报)。
-    一篇的评论里以品牌评价收尾的条数这里不数(2026-11-09): 一篇只有 2~3 条, 量过本来就合规, 有 must_mention_any 的模板
-    每条都要点名品牌, 数了只会误报; requirements 的 task 里那句 ``commentstyle.BRAND_ENDING_SHORT`` 只是写法提示。
-    """
+    一行: ``post``(【标题】… / 【正文】… / 话题行)、``comments``(一条一行, 带模板的标签)、``direction``, 外加给页面
+    分开显示用的 ``title``、``body``(模板管话题时是摘掉末尾话题之后的)、``tags``(话题行里的那几个, 没有话题行是 [])、
+    ``comment_items``([{role, label, text}], 和 ``comments`` 的行一一对应)。"""
     tpl = validate(template)
     markers, ccfg = tpl["markers"], tpl["comments"]
     use_tags = wants_tags(tpl)
     idx = list(indices) if indices is not None else list(range(len(drafts)))
     problems: list[dict] = []
-    rows: list[dict] = []
+    out: list[dict] = []
     for pos, d in enumerate(drafts):
         i = idx[pos]
         d = d if isinstance(d, dict) else {}
@@ -500,6 +501,7 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
                                                      f"稿子里删掉"})
 
         post = [markers["title"] + title]
+        tags: list[str] = []
         if use_tags:
             body, tags, n_mine = post_tags(tpl, title, body, d.get("tags"))
             post.append(markers["body"] + body)
@@ -520,6 +522,7 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
                                                      "要带话题就写在正文末尾那一行, tags 留空"})
 
         lines: list[str] = []
+        items: list[dict] = []
         if ccfg is not None:
             comments, bad = comment_list(d.get("comments"))
             problems += [{"index": i, "what": w} for w in bad]
@@ -535,20 +538,57 @@ def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = 
                 problems += [{"index": i, "what": f"第 {k + 1} 条评论: {w}"} for w in commentstyle.issues(c["text"])]
                 label = ccfg["label_reader"] if c["role"] == "reader" else ccfg["label_author"]
                 lines.append(label + c["text"])
+                items.append({"role": c["role"], "label": label, "text": c["text"]})
 
         direction = str(d.get("direction") or "").strip()
-        rows.append({"post": "\n".join(post), "comments": "\n".join(lines), "direction": direction})
+        out.append({"post": "\n".join(post), "comments": "\n".join(lines), "direction": direction,
+                    "title": title, "body": body, "tags": tags, "comment_items": items})
         for col in tpl["columns"]:
             if col["field"] == "direction" and not direction:
                 problems.append({"index": i, "what": f"表格有「{col['name']}」列, 这篇没带 direction"})
+    return out, problems
 
+
+# 没有交付模板的项目, 排好版的页面上评论前面的标签(同 validate 里举的那两个例子)。模板项目用模板自己配的。
+PLAIN_LABELS = {"reader": "读者：", "author": "作者回复："}
+
+
+def plain_rows(drafts: list[dict]) -> list[dict]:
+    """没有交付模板的项目里每篇的那几格(排好版的页面用, 2026-11-12), 形状同 ``rows`` 的一行。``post`` 是【标题】标题、
+    换行、【正文】正文: 正文原样(末尾那行话题留在正文里, 和写手交出去的一样), tv-sync 照这两个标记拆得回来。
+    ``tags`` 字段不拼(没有模板就没有话题行, 话题照项目规则写在正文末尾); 评论是写手传在 ``comments`` 里的那几条, 标签用
+    ``PLAIN_LABELS``。不报 problems: 没有模板就没有可对照的要求。"""
+    out: list[dict] = []
+    for d in drafts:
+        d = d if isinstance(d, dict) else {}
+        title = str(d.get("title") or "").strip()
+        body = str(d.get("body") or "").replace("\r\n", "\n").strip()
+        comments, _bad = comment_list(d.get("comments"))
+        items = [{"role": c["role"], "label": PLAIN_LABELS[c["role"]], "text": c["text"]} for c in comments]
+        out.append({"post": DEFAULT_MARKERS["title"] + title + "\n" + DEFAULT_MARKERS["body"] + body,
+                    "comments": "\n".join(it["label"] + it["text"] for it in items),
+                    "direction": str(d.get("direction") or "").strip(),
+                    "title": title, "body": body, "tags": [], "comment_items": items})
+    return out
+
+
+def assemble(template: dict, drafts: list[dict], *, indices: list[int] | None = None) -> dict:
+    """按模板把一批稿子拼成交付稿。返回 ``{"format", "text", "problems": [{"index", "what"}]}``。
+
+    ``indices``: 每篇在调用方那一批里的下标(score_drafts 只拼存进去的那几篇, problems 要按写手传的位置报)。
+    一篇的评论里以品牌评价收尾的条数这里不数(2026-11-09): 一篇只有 2~3 条, 量过本来就合规, 有 must_mention_any 的模板
+    每条都要点名品牌, 数了只会误报; requirements 的 task 里那句 ``commentstyle.BRAND_ENDING_SHORT`` 只是写法提示。
+    每篇的那几格由 ``rows`` 拼, 这里只管排成表格 / 段落。
+    """
+    tpl = validate(template)
+    got, problems = rows(tpl, drafts, indices=indices)
     if tpl["layout"] == "table":
         head = "| " + " | ".join(c["name"] for c in tpl["columns"]) + " |"
         sep = "| " + " | ".join("---" for _ in tpl["columns"]) + " |"
-        body_rows = ["| " + " | ".join(_cell(r[c["field"]]) for c in tpl["columns"]) + " |" for r in rows]
+        body_rows = ["| " + " | ".join(_cell(r[c["field"]]) for c in tpl["columns"]) + " |" for r in got]
         text = "\n".join([head, sep] + body_rows)
     else:
-        text = "\n\n".join("\n".join(filter(None, [r["post"], r["comments"]])) for r in rows)
+        text = "\n\n".join("\n".join(filter(None, [r["post"], r["comments"]])) for r in got)
     return {"format": tpl["layout"], "text": text, "problems": problems}
 
 

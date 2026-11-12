@@ -2267,6 +2267,18 @@ def batch_params(sb, batch_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+def batch_projects(sb, batch_ids: list[str]) -> dict[str, str]:
+    """``batch_id`` → 它所在的 ``project_id``(排好版的页面用, 2026-11-12: 令牌里只有 batch id, 先查出是哪个项目, 再走
+    ``batch_drafts`` 那条只认本项目的路)。查不到的不在里面。出错上抛。"""
+    out: dict[str, str] = {}
+    for chunk in db._in_chunks(list(dict.fromkeys(batch_ids)), 100):
+        res = sb.table("batches").select("id, project_id").in_("id", chunk).execute()
+        for r in res.data or []:
+            if r.get("project_id"):
+                out[str(r["id"])] = str(r["project_id"])
+    return out
+
+
 def batch_drafts(sb, project_id: str, batch_ids: list[str]) -> dict[str, dict]:
     """改稿重存时把原来那一整批交付稿拼回来用(2026-10-30, core._whole_batch_delivery): 这几个 batch(只认本项目的,
     别的项目的查不出来)的 ``params`` / ``created_at``, 和每个 item 的全部版本 id 与它现在的那一版(代表版本, 同
