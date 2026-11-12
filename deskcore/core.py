@@ -12269,9 +12269,14 @@ def tv_rescore_misses(client, tv_project_id: str, days: int | None = None, *, dr
     try:
         snap_rows = store.pending_draft_snapshots(client, [m["project_id"] for m in maps],
                                                   since=store.iso_ago(SNAPSHOT_MAX_AGE_DAYS)) or []
-    except Exception:                                   # noqa: BLE001 — 没有底稿就只和存过档的版本比
-        logger.exception("tv_rescore_misses: 读查重底稿失败 (tv=%s), 只和存过档的版本比", tv_project_id)
-        snap_rows = []
+    except Exception as exc:                            # noqa: BLE001
+        # 底稿这次没读出来: 一行都不补(codex review on aw#155)。拿缺了底稿的索引算出来的分数写进去就改不回来了 ——
+        # 这条命令只补还空着的行, 回流闸定来源又在 score 和发布前的重合里取小的。等读得出来再跑一次。
+        # (018 没跑时 pending_draft_snapshots 回 None, 不走这里: 根本没有底稿这回事, 只和存过档的版本比。)
+        logger.exception("tv_rescore_misses: 读查重底稿失败 (tv=%s), 这次不补分数", tv_project_id)
+        return {"tv_project_id": tv_project_id, "links": len(rows), "notes": len(notes_by_id), "days": days,
+                "dry_run": dry_run, "candidates": 0, "scored": 0, "written": 0,
+                "error": f"读底稿: {type(exc).__name__}: {exc}"[:200]}
     snaps = _gate_snapshots(_snapshot_groups(snap_rows), {v.version_id for v in versions})
     only = None
     if days is not None:

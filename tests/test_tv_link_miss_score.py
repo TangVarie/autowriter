@@ -246,6 +246,28 @@ def test_rescore_counts_an_unarchived_snapshot_like_the_nightly_score_does():
     assert _links(c)["n1"]["match_kind"] == "ingested" and _links(c)["n1"]["version_id"] == "vcopy"
 
 
+def test_rescore_writes_nothing_when_the_snapshots_cannot_be_read(monkeypatch):
+    """codex review on aw#155: 底稿这次没读出来还照补的话, 约四成来自底稿的帖被记成 0 —— 这条命令只补还空着的行, 再跑
+    也改不回来, 回流闸定来源又在 score 和发布前的重合里取小的, 这篇就一直是「别处写的」。读不出来的这次一行都不补。"""
+    note_body = S.BODY_S.split("。")[0] + "。" + S.BODY_OTHER
+    link = {"note_id": "n1", "tv_project_id": S.TV, "project_id": S.P1, "version_id": "vcopy", "item_id": None,
+            "match_kind": "ingested", "score": None, "lag_days": None, "candidates": None, "tv_text_fp": None}
+    c = S._client([S._note("n1", "换了标题", note_body)], [S._snap("s1", "骑了一百公里", S.BODY_S)], links=[link])
+    real = store.pending_draft_snapshots
+
+    def boom(*a, **k):
+        raise RuntimeError("connection reset")
+    monkeypatch.setattr(store, "pending_draft_snapshots", boom)
+    out = core.tv_rescore_misses(c, S.TV)
+    assert out["error"] and (out["scored"], out["written"]) == (0, 0)
+    assert _links(c)["n1"]["score"] is None
+    assert not [call for call in c.calls if call["op"] != "select"], "一行都没写"
+    monkeypatch.setattr(store, "pending_draft_snapshots", real)
+    out = core.tv_rescore_misses(c, S.TV)
+    assert out["error"] is None and out["written"] == 1
+    assert _links(c)["n1"]["score"] == pytest.approx(S._contain(note_body, S.BODY_S), abs=1e-3)
+
+
 def test_the_nightly_sync_never_rescores_a_pinned_row():
     c, links = _rescore_fixture()
     core.tv_sync(c, T.TV)
