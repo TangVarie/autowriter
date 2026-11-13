@@ -1020,13 +1020,14 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
         (``summary.more`` 是全部篇加起来的), 有就如实告诉用户还有这么多条没列。
       · 拿不准(Jev 判不准, 不算没守住): 每篇只有条数 ``counts.unsure``, 不逐条列; ``summary.unsure`` 是全部篇加起来的。
         最外层的 ``unsure_rules``(有才带, 最多 3 条)是其中偏向没守住的那几条规则, 每条 ``rule_id`` / ``severity`` /
-        ``what``(以「拿不准」开头)/ ``drafts``(这次有几篇在它上面偏向没守住)。整批提一句就行, 不用改, 也不用逐篇说。
+        ``what``(以「拿不准」开头)/ ``drafts``(这次有几篇在它上面偏向没守住)。不用改, 也不用跟用户报数; 其中是硬约束的
+        才提一句(照 ``next_step``)。
       · ``judge_status`` 不是 ok 的那篇(``judge_note`` 说原因, 比如「没判完」「一道都没判出来」「正文是空的」)规则题这次
         没判成, **不能说它守住了规则**; 不用重试。代码查出来的 ``violations`` 照样有效。正文是空的那几篇另数在
         ``summary.empty_body``。
       · ``judge_status`` 是 ok、但 ``counts.unjudged`` 不是 0 的: 那几道题 Jev 没判出来(只有题数, 不逐条列), 那几条
         **也不能说守住了**。``summary.unjudged`` 是全部篇加起来的题数; 其中 ``summary.evidence_not_found``(有才带)那几道是
-        Jev 怀疑有问题、却指不出是哪一句: 不算没守住, 不用改。
+        Jev 怀疑有问题、却指不出是哪一句: 不算没守住, 不用改, 也不用跟用户说。
       · ``code_unchecked``: 代码查的正则这次没在时限内查完(或者限时的引擎跑不了它)的规则, 每条 ``rule_id`` / ``severity`` /
         ``rule``(规则原文)。没查完的那部分不是违规, 也**不能说那几条守住了**; 同一篇里同一条已经列在 ``violations`` 的
         (先查到了命中、后面才没查完)照改; hard 的照原文自己核一遍, 不用重试。``summary.code_unchecked``
