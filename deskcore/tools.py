@@ -1019,7 +1019,7 @@ def check_rules(project_id: str, version_ids: list[str], tactic: str = "", _user
       · 每篇必须改全列, 建议改补到 ``violations`` 一共 12 条为止; ``more`` 是这篇没列出来的建议改条数
         (``summary.more`` 是全部篇加起来的), 有就如实告诉用户还有这么多条没列。
       · 拿不准(Jev 判不准, 不算没守住): 每篇只有条数 ``counts.unsure``, 不逐条列; ``summary.unsure`` 是全部篇加起来的。
-        最外层的 ``unsure_rules``(有才带, 最多 3 条)是其中偏向没守住的那几条规则, 每条 ``rule_id`` / ``severity`` /
+        最外层的 ``unsure_rules``(有才带, 最多 3 条; 硬约束的全列, 不受这个数管)是其中偏向没守住的那几条规则, 每条 ``rule_id`` / ``severity`` /
         ``what``(以「拿不准」开头)/ ``drafts``(这次有几篇在它上面偏向没守住)。不用改, 也不用跟用户报数; 其中是硬约束的
         才提一句(照 ``next_step``)。
       · ``judge_status`` 不是 ok 的那篇(``judge_note`` 说原因, 比如「没判完」「一道都没判出来」「正文是空的」)规则题这次

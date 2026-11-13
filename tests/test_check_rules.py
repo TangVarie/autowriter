@@ -1364,6 +1364,25 @@ def test_unsure_and_unjudged_rows_are_counted_not_listed(wired):
     assert digest["unsure"] == 10 and [v["unsure"] for v in digest["versions"]] == [8, 2]
 
 
+def test_every_hard_rule_leaning_broken_is_listed_even_past_the_cap(wired):
+    """Codex on aw#158: next_step 叫模型把硬约束偏向没守住的那几条跟用户提一句(见 unsure_rules), 所以硬约束的要全列,
+    不能被「最多 3 条」截掉; 软规则只补到上限。"""
+    hard = [mem(240 + i, f"示例硬规则(偏向没守住)第 {i} 条", severity="hard") for i in range(5)]
+    soft = mem(250, "示例软规则(偏向没守住)")
+
+    def q(r):
+        return question_result(r["id"], jev_sha(r["content"]), ask=f"正文有没有违反{r['content']}？", pass_if="否",
+                               note=f"要点 {r['content']}")
+    rules = hard + [soft]
+    wired.judge = answers(**{qid_of(q(r)): {"answer": "是", "p": 0.6, "ambiguous": False} for r in rules})
+    out = core.check_rules(full_client(memories=rules, compiles=[stored(r, q(r)) for r in rules]),
+                           PROJ, [V1], user_id=ME)
+    listed = out["unsure_rules"]
+    assert len(listed) == 5 and {e["rule_id"] for e in listed} == {r["id"] for r in hard}
+    assert all(e["severity"] == "hard" for e in listed), "硬约束已经过了上限, 软规则不再补"
+    assert "其中 5 条硬约束偏向没守住(见 unsure_rules)" in out["next_step"]
+
+
 def test_unsure_answers_that_all_lean_kept_list_nothing(wired):
     wired.judge = answers(**{qid_of(q_hard()): {"answer": "否", "p": 0.6, "ambiguous": False},
                              qid_of(q_soft()): {"answer": "是", "p": 0.66, "ambiguous": False}})

@@ -1092,7 +1092,7 @@ python -m deskcore.cli compile-rules --project <uuid> --force   # 全部重编�
 几乎次次不是 0）、2.9 道没判出来，都是工具说明和 `next_step` 说「不用改」的；拿不准的答案里 76% 偏向守住。10 篇的回包一万两三千字，
 大半是这些行。现在：
 - 每篇不再带 `unsure` / `unjudged` 两个列表，只留 `counts` 里的条数；`more` 只数没列出来的建议改。
-- 最外层多一个 `unsure_rules`（最多 3 条，`CHECK_RULES_MAX_UNSURE_RULES`）：只收**偏向没守住**的拿不准（答案和 `pass_if` 不一样、
+- 最外层多一个 `unsure_rules`（最多 3 条，`CHECK_RULES_MAX_UNSURE_RULES`；2026-11-13 起硬约束的全列、不受这个数管）：只收**偏向没守住**的拿不准（答案和 `pass_if` 不一样、
   把握不到 0.7 或 Jev 标了歧义），一条规则一行 `{rule_id, severity, what, drafts}`——`what` 是「拿不准: 要点」，不带每篇各自的答案和把握，
   `drafts` 是这次有几篇在它上面拿不准、偏向没守住；硬约束的排前面，再按篇数。偏向守住的只计数（照旧不算守住）。
 - `next_step` 的拿不准那句带上数：「有 N 处「拿不准」(涉及 M 条规则), 提一句就行, 不用改」。

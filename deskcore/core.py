@@ -9492,7 +9492,7 @@ _CHECK_RULES_UNCOVERED_CHARS = 80
 CHECK_RULES_NOTE = ("规则检查只是建议, 不拦交付, 存档已经成功了。必须改 = 硬约束没守住(照着改, 改完那几篇带 "
                     "replaces_version_id 先过 check_drafts、再用 score_drafts 存一次); 建议改 = 软规则, 告诉用户, 改不改"
                     "由用户定; 拿不准 = Jev 判不准, 每篇只报条数(counts.unsure), 偏向没守住的那几条规则列在最外层的 unsure_rules "
-                    "(最多 3 条), 不用改, 也不用跟用户报数(其中硬约束偏向没守住的才提一句), 只是不能说规则全守住。judge_status 不是 ok 的那几篇是没判完, 不能说它们"
+                    "(最多 3 条, 硬约束的全列), 不用改, 也不用跟用户报数(其中硬约束偏向没守住的才提一句), 只是不能说规则全守住。judge_status 不是 ok 的那几篇是没判完, 不能说它们"
                     "守住了规则; judge_status 是 ok 的篇里, counts.unjudged 数到的那几道规则题也没判出来, 同样不能说守住了。")
 
 
@@ -10157,8 +10157,11 @@ def check_rules(client, project_id: str, version_ids: list[str], *, user_id: str
     out["summary"] = summary
     if unsure_lean:
         # 硬约束的排前面, 再按篇数多的; 只列这几条, 其余的拿不准只在 counts / summary 里有数
-        out["unsure_rules"] = sorted(unsure_lean.values(), key=lambda e: (e["severity"] != "hard", -e["drafts"])
-                                     )[:CHECK_RULES_MAX_UNSURE_RULES]
+        # 2026-11-13(Codex on aw#158): 硬约束的全列, 不受这个上限管 —— next_step 叫模型「这几条跟用户提一句(见 unsure_rules)」,
+        # 列不全就没法照做; 软规则只补到上限为止
+        ranked = sorted(unsure_lean.values(), key=lambda e: (e["severity"] != "hard", -e["drafts"]))
+        n_hard = sum(1 for e in ranked if e["severity"] == "hard")
+        out["unsure_rules"] = ranked[:max(CHECK_RULES_MAX_UNSURE_RULES, n_hard)]
     if jev_detail:
         out["judge_detail"] = mask_secrets(str(jev_detail))[:_JUDGE_BLOCK_TEXT_MAX]
     out["next_step"] = _check_rules_next_step(summary, uncompiled, uncompiled_why, len(code_unavailable),
