@@ -33,6 +33,9 @@ from typing import Optional
 UPDATE_URL = ("https://github.com/TangVarie/autowriter/tree/claude/xhs-content-workstation-BSEuH/"
               "skills/bywood-writing-desk")
 UPDATE_COMMAND = "更新技能/bywood-writing-desk"
+# 这一版对写手来说变了什么: 一句大白话, 放在升级提醒的第一行里。每次协议升版时改成那一版的一句(没有值得说的就留空串)。
+# 2026-11-13 (§3.32): 写作台和别的 skill 一起用时排第一。
+WHATS_NEW = "和别的 skill 一起用时，写作台现在排第一"
 
 UP_TO_DATE, OUTDATED, UNKNOWN = "up_to_date", "outdated", "unknown"
 HEALTH_WINDOW_S = 24 * 3600
@@ -86,7 +89,8 @@ def notice(local: Optional[str], current: str) -> dict:
         "status": OUTDATED,
         "local": local,
         "current": current,
-        "message": (f"写作台 skill 不是最新版（你手上的是 {local}，最新是 {current}），请先升级：\n"
+        # 三行: 变了什么 + 重新导入一次; 仓库里 skill 的地址; WorkBuddy 的那句。不说谁没升级, 只说有新版(2026-11-13)。
+        "message": (f"写作台 skill 有新版{("：" + WHATS_NEW) if WHATS_NEW else ""}（你手上的是 {local}，最新是 {current}）。重新导入一次就行：\n"
                     f"{UPDATE_URL}\n{UPDATE_COMMAND}"),
         # 2026-10-30 复审: 开场顺序是 项目名 → 这条 → 改稿摘要(protocol.md 第 1 条); 原来说「放在最前面」, 会顶到项目名前面去
         "action": ("把 message 原样（三行都要）放进开场、复述项目名之后（写评论没有项目名，放在开场就行），同一条只放一次；"

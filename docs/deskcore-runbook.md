@@ -1838,6 +1838,36 @@ deskcore 落地后，`seeding-prompt-refiner/references/cross-batch-diversity.md
 **用户手动维护**的补偿机制（角度编号库 / 历史回避清单 / 跨批次分布档案 / 账号差异化种子）
 可以全部退役——它自己就标注了那是"过渡方案，不是长期方案"。
 
+### 6.5 协议升版怎么发（以 2026-11-13「写作台排第一」这一版为例，`2d357c4b6075` → `4a800b32a197`）
+
+协议正文或 skill 头改了一个字，版本号就变，写手要重新导入一次 skill。顺序不能换：
+
+**合并前（改的人做）**
+
+1. 改 `deskcore/protocol.md` 和 / 或 `skills/bywood-writing-desk/SKILL.md` 标记行以上的头。
+2. `python -m deskcore.cli sync-skill`，再 `python -m deskcore.cli sync-skill --check`：两边要是同一个新版本号。
+3. `deskcore/skillcheck.py` 的 `WHATS_NEW` 换成这一版对写手来说变了什么的一句大白话（它在升级提醒的第一行里）。
+4. `docs/deskcore.md` 加一节写为什么改、新旧版本号。全量 pytest、`python -m deskcore.cli selftest`。
+
+**合并后（owner 做，按这个顺序）**
+
+1. 合并到默认分支。升级提醒里的地址指的就是默认分支上的 `skills/bywood-writing-desk`，合并了那里才是新版。
+2. 等 Railway 部署完，打 `/health`（不用 key）：`build.commit` 是合并的那个提交，`build.protocol_version` 是新版本号（这一版是 `4a800b32a197`）。不是，就去 Railway 看那次 build，**先不要通知写手**：服务端还是旧版时重导，她们拿到的新 skill 反而会被判成版本不一致。
+3. 部署好之后才跟写手说一声（这一版的原话，三行，可以直接发群里）：
+
+   > 写作台更新了：和别的 skill 一起用时，写作台现在排第一，别的 skill 只当参考。
+   > 麻烦每人重新导入一次 skill：在 WorkBuddy 里说「更新技能/bywood-writing-desk」。
+   > 导完开一个新对话再写，别的都不用改。
+
+   不发也行：谁手上是旧版，下一次开项目时开场就会出现那三行升级提醒（`skill_update.message`）。
+4. 过一两天看还有没有旧版在用：`curl -H "X-Deskcore-Key: <你的 key>" <服务地址>/skill-versions`，`writers_24h.outdated` 是 0 就都换完了；`outdated_versions` 里是还在用的旧版本号（只有计数，没有是谁）。
+
+**写手做的只有一件**：在 WorkBuddy 里说「更新技能/bywood-writing-desk」（或者从升级提醒里那个地址重新导入），然后开一个新对话。已经开着的对话里 skill 还是旧的那份。
+
+**没重导之前不会坏。** 旧版 skill 对新服务端：所有工具照常，入口工具多回一个 `skill_update`（升级提醒）；开场核版本时 `get_protocol` 把新正文发下去，模型照新正文执行。这一版另外两处不靠 skill：MCP `instructions` 和入口工具回包的 `desk_first`，部署完就生效。只有 skill 的 `description`（平台据它决定加载哪个 skill）和「整场都在系统提示里」这两样要等重导。
+
+**要撤回**：revert 那个提交再部署，版本号回到 `2d357c4b6075`；已经重导的写手会收到一次升级提醒（指回旧版），再导一次。能不撤就不撤，往前修一版。
+
 ---
 
 ## 7. 相关文档

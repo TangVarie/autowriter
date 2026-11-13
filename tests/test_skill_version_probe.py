@@ -26,6 +26,8 @@ CURRENT = tools.protocol_text()[1]
 OLD = "0123456789ab"
 ME = "11111111-1111-1111-1111-111111111111"
 LINK_LINES = [skillcheck.UPDATE_URL, skillcheck.UPDATE_COMMAND]
+# 2026-11-13 (§3.32): 入口工具的回包每次都带 desk_first(写作台排第一那一句), 和探针无关; 探针出错时回包只有它和简报。
+BRIEF_ONLY = {"desk_first": tools.DESK_FIRST_POSTS, "project_name": "测试"}
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +85,7 @@ def test_open_project_survives_a_broken_protocol_file(monkeypatch):
     def boom():
         raise FileNotFoundError("protocol.md")
     monkeypatch.setattr(tools, "protocol_text", boom)
-    assert tools.open_project("p", skill_version=OLD, _user_id=ME) == {"project_name": "测试"}, \
+    assert tools.open_project("p", skill_version=OLD, _user_id=ME) == BRIEF_ONLY, \
         "探针读不了协议就跳过, 不能把合规读弄坏"
 
 
@@ -91,7 +93,7 @@ def test_a_failing_probe_never_changes_the_entry_tool_result(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("probe bug")
     monkeypatch.setattr(skillcheck, "probe", boom)
-    assert tools.open_project("p", skill_version=OLD, _user_id=ME) == {"project_name": "测试"}
+    assert tools.open_project("p", skill_version=OLD, _user_id=ME) == BRIEF_ONLY
     gp = tools.get_protocol(local_version=OLD, _user_id=ME)
     assert gp["up_to_date"] is False and "skill_update" not in gp, "版本照核, 只是这次没带提醒"
 
