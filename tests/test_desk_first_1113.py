@@ -115,6 +115,7 @@ def test_the_skill_head_points_to_the_section_instead_of_repeating_it():
 # ── C. MCP instructions ──────────────────────────────────────────────
 
 def test_mcp_instructions_carry_the_priority_rule():
+    pytest.importorskip("fastapi")
     import deskcore.app as A_
     if A_._mcp is None:
         pytest.skip("mcp SDK 没装")
