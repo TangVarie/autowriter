@@ -186,7 +186,8 @@ def test_ambiguous_and_low_confidence_are_unsure_not_violations(wired):
     # 2026-11-11: 拿不准的每篇只留条数; 偏向没守住的那条规则列在最外层的 unsure_rules, 偏向守住的只计数
     assert "unsure" not in v1 and v1["counts"]["unsure"] == 2
     assert out["unsure_rules"] == [{"rule_id": R_HARD["id"], "severity": "hard", "what": "拿不准: 不能写疗效", "drafts": 1}]
-    assert out["summary"]["unsure"] == 2 and "有 2 处「拿不准」(涉及 2 条规则), 提一句就行, 不用改。" in out["next_step"]
+    assert out["summary"]["unsure"] == 2 and ("有 2 处「拿不准」(涉及 2 条规则), 其中 1 条硬约束偏向没守住(见 unsure_rules): 这几条跟用户提一句, "
+                                             "其余的不用报数, 都不用改。") in out["next_step"]
 
 
 def test_evidence_not_found_is_unjudged_not_a_violation(wired):
@@ -1355,11 +1356,31 @@ def test_unsure_and_unjudged_rows_are_counted_not_listed(wired):
         {"rule_id": lean[3]["id"], "severity": "soft", "what": f"拿不准: 要点 {lean[3]['content']}", "drafts": 2},
         {"rule_id": lean[0]["id"], "severity": "soft", "what": f"拿不准: 要点 {lean[0]['content']}", "drafts": 1}]
     assert "把握" not in json.dumps(out["unsure_rules"], ensure_ascii=False), "汇总的那条不带每篇各自的答案和把握"
-    assert "有 10 处「拿不准」(涉及 8 条规则), 提一句就行, 不用改。" in out["next_step"]
+    assert ("有 10 处「拿不准」(涉及 8 条规则), 其中 1 条硬约束偏向没守住(见 unsure_rules): 这几条跟用户提一句, "
+            "其余的不用报数, 都不用改。") in out["next_step"]
     assert "没列出来" not in out["next_step"] and "都守住了" not in out["next_step"]
     # 后台的改稿复查只读计数和 violations[].rule_id: 照样摘得出来
     digest = core._recheck_digest([out])
     assert digest["unsure"] == 10 and [v["unsure"] for v in digest["versions"]] == [8, 2]
+
+
+def test_every_hard_rule_leaning_broken_is_listed_even_past_the_cap(wired):
+    """Codex on aw#158: next_step 叫模型把硬约束偏向没守住的那几条跟用户提一句(见 unsure_rules), 所以硬约束的要全列,
+    不能被「最多 3 条」截掉; 软规则只补到上限。"""
+    hard = [mem(240 + i, f"示例硬规则(偏向没守住)第 {i} 条", severity="hard") for i in range(5)]
+    soft = mem(250, "示例软规则(偏向没守住)")
+
+    def q(r):
+        return question_result(r["id"], jev_sha(r["content"]), ask=f"正文有没有违反{r['content']}？", pass_if="否",
+                               note=f"要点 {r['content']}")
+    rules = hard + [soft]
+    wired.judge = answers(**{qid_of(q(r)): {"answer": "是", "p": 0.6, "ambiguous": False} for r in rules})
+    out = core.check_rules(full_client(memories=rules, compiles=[stored(r, q(r)) for r in rules]),
+                           PROJ, [V1], user_id=ME)
+    listed = out["unsure_rules"]
+    assert len(listed) == 5 and {e["rule_id"] for e in listed} == {r["id"] for r in hard}
+    assert all(e["severity"] == "hard" for e in listed), "硬约束已经过了上限, 软规则不再补"
+    assert "其中 5 条硬约束偏向没守住(见 unsure_rules)" in out["next_step"]
 
 
 def test_unsure_answers_that_all_lean_kept_list_nothing(wired):
@@ -1370,6 +1391,9 @@ def test_unsure_answers_that_all_lean_kept_list_nothing(wired):
                            PROJ, [V1], user_id=ME)
     assert "unsure_rules" not in out and out["summary"]["unsure"] == 2
     assert "有 2 处「拿不准」" in out["next_step"] and "都守住了" not in out["next_step"], "偏向守住也不算守住"
+    # 2026-11-13(owner): 没有硬约束偏向没守住的, 不叫模型把这个数念给写手
+    assert "不用改, 也不用跟用户报这个数, 用户问起再说; 只是不能说规则全守住。" in out["next_step"]
+    assert "提一句" not in out["next_step"]
 
 
 def test_two_questions_of_one_rule_give_one_flag_per_draft(wired):
@@ -1466,7 +1490,7 @@ def test_evidence_not_found_gets_its_own_sentence(wired):
     assert v1["judge_status"] == "ok" and v1["violations"] == [] and v1["counts"]["unjudged"] == 2
     assert out["summary"]["unjudged"] == 2 and out["summary"]["evidence_not_found"] == 1
     step = out["next_step"]
-    assert "另有 1 道规则题 Jev 怀疑有问题、但指不出是哪一句: 不算没守住(也不说成守住了), 不用改。" in step
+    assert "另有 1 道规则题 Jev 怀疑有问题、但指不出是哪一句: 不算没守住(也不说成守住了), 不用改, 也不用跟用户说。" in step
     assert "另有 1 道规则题这次没判出来(Jev 回包缺题或判不了), 那几条不能说守住了; 不用重试。" in step
     assert "必须改" not in step and "都守住了" not in step
     only = core._check_rules_next_step({"unjudged": 3, "evidence_not_found": 3}, 0)
