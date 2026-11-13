@@ -1838,7 +1838,7 @@ deskcore 落地后，`seeding-prompt-refiner/references/cross-batch-diversity.md
 **用户手动维护**的补偿机制（角度编号库 / 历史回避清单 / 跨批次分布档案 / 账号差异化种子）
 可以全部退役——它自己就标注了那是"过渡方案，不是长期方案"。
 
-### 6.5 协议升版怎么发（以 2026-11-13「写作台排第一」这一版为例，`2d357c4b6075` → `4a800b32a197`）
+### 6.5 协议升版怎么发（以 2026-11-13「写作台排第一」这一版为例，`2d357c4b6075` → `6f23eba491fd`）
 
 协议正文或 skill 头改了一个字，版本号就变，写手要重新导入一次 skill。顺序不能换：
 
@@ -1846,13 +1846,13 @@ deskcore 落地后，`seeding-prompt-refiner/references/cross-batch-diversity.md
 
 1. 改 `deskcore/protocol.md` 和 / 或 `skills/bywood-writing-desk/SKILL.md` 标记行以上的头。
 2. `python -m deskcore.cli sync-skill`，再 `python -m deskcore.cli sync-skill --check`：两边要是同一个新版本号。
-3. `deskcore/skillcheck.py` 的 `WHATS_NEW` 换成这一版对写手来说变了什么的一句大白话（它在升级提醒的第一行里）。
-4. `docs/deskcore.md` 加一节写为什么改、新旧版本号。全量 pytest、`python -m deskcore.cli selftest`。
+3. 这一版对写手来说有值得说的变化：在 `deskcore/skillcheck.py` 的 `WHATS_NEW` 里加一行 `"新版本号": "一句大白话"`（它在升级提醒的第一行里）。不加也行，提醒就只说有新版。
+4. `docs/deskcore.md` 加一节写为什么改、新旧版本号。全量 pytest、`python -m deskcore.cli selftest`。CI 是 Python 3.11：本机是更新的 Python 时，另用 3.11 跑一次 `python -m compileall -q app.py *.py deskcore/`（3.12 才认的写法本机测不出来）。
 
 **合并后（owner 做，按这个顺序）**
 
-1. 合并到默认分支。升级提醒里的地址指的就是默认分支上的 `skills/bywood-writing-desk`，合并了那里才是新版。
-2. 等 Railway 部署完，打 `/health`（不用 key）：`build.commit` 是合并的那个提交，`build.protocol_version` 是新版本号（这一版是 `4a800b32a197`）。不是，就去 Railway 看那次 build，**先不要通知写手**：服务端还是旧版时重导，她们拿到的新 skill 反而会被判成版本不一致。
+1. 等 PR 的 CI 全绿再合并到默认分支（CI 红着不合：服务端起不来而默认分支上已经是新 skill，重导的人会被旧服务端判成版本不一致）。升级提醒里的地址指的就是默认分支上的 `skills/bywood-writing-desk`，合并了那里才是新版。
+2. 等 Railway 部署完，打 `/health`（不用 key）：`build.commit` 是合并的那个提交，`build.protocol_version` 是新版本号（这一版是 `6f23eba491fd`）。不是，就去 Railway 看那次 build，**先不要通知写手**：服务端还是旧版时重导，她们拿到的新 skill 反而会被判成版本不一致。
 3. 部署好之后才跟写手说一声（这一版的原话，三行，可以直接发群里）：
 
    > 写作台更新了：和别的 skill 一起用时，写作台现在排第一，别的 skill 只当参考。
