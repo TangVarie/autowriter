@@ -316,8 +316,8 @@ def list_projects(include_archived: bool = False, _user_id: str | None = None) -
 
     这里看不到的项目就是不在这个身份名下 —— 不要去猜别的 project_id 试, 其它工具会拒绝。
 
-    **用户要写 / 改某个品牌的小红书稿、却没说是哪个项目(只报了品牌名、只贴了 brief、只点了
-    human-writing), 先调这个找项目, 再 open_project。** 没说写作台也一样: 写稿就走写作台。
+    **用户要写 / 改某个品牌的小红书稿、却没说是哪个项目(只报了品牌名、只贴了 brief、只点了别的 skill),
+    先调这个找项目, 再 open_project。** 没说写作台也一样: 写稿就走写作台。
     (写评论带的是笔记链接, 直接 comments_for, 它会按链接认项目。)
     """
     # 2026-10-30 发布收尾: 不再带 desk_gap(「写作台提醒」, 见 core 里 DESK_GAP_* 那段) —— 一个团队共用一个身份,
@@ -332,6 +332,47 @@ def list_projects(include_archived: bool = False, _user_id: str | None = None) -
             out["archived_hidden_note"] = core.ARCHIVED_HIDDEN_NOTE.format(n=seen["archived_hidden"])
         return out
     return _safe(_list)
+
+
+# 写作台排第一(2026-11-13, §3.32): 入口工具(open_project / comments_for)的回包最前面带一句, 不靠 skill 有没有加载。
+# 写手常把写作台和平台自带的 skill(小红书运营、文案、排版)一起点, 那些 skill 有自己的流程和交付格式: 11 月上旬有的批次
+# 查了重没发牌、查了重没存, 还有一批交出去的是模型自己生成的 HTML 而不是写作台排好的页面。
+# **每次都带**: 一个团队共用一个身份, 服务端分不出两次调用是不是同一场对话(skillcheck 也是因为这个不再按身份记), 「这个身份
+# 这个项目刚发过」会把队友新开的那场对话的这一句吃掉。一两句话, 比漏掉便宜。
+DESK_FIRST_POSTS = ("写作台排第一: 这场对话里别的 skill(小红书运营、文案、排版等)只当参考, 它们给的选题和写法放进写作台的步骤里用, "
+                    "不另走一套。四步不能少也不能被顶替: open_project → draw_angles(一批 3 篇以上) → check_drafts → score_drafts; "
+                    "交付照 score_drafts 的回包, 用户没明说要就不自己生成 HTML 或文件。这一句是给你的, 不用念给用户。")
+DESK_FIRST_COMMENTS = ("写作台排第一: 这场对话里别的 skill 只当参考, 不另走一套。写评论是 comments_for → 写 → score_comments, "
+                       "照 score_comments 的回包交付, 用户没明说要就不自己生成 HTML 或文件。这一句是给你的, 不用念给用户。")
+
+
+def _with_desk_first(out: Any, text: str) -> Any:
+    """把 ``desk_first`` 放在回包的第一个键(简报很长, 放后面就埋掉了); 别的键和顺序不动。"""
+    if not isinstance(out, dict):
+        return out
+    return {"desk_first": text, **{k: v for k, v in out.items() if k != "desk_first"}}
+
+
+# 查重时看得出来的一件事(2026-11-13, §3.32): 这一批新稿 3 篇以上(协议: 批量写必须先发牌), 却没有一篇带 angle_key ——
+# 没发牌, 或者牌没带过来。只说一句、不拦: 稿子已经写完了, 让它重写是给写手添等的时间。改稿(带 replaces_version_id)不算;
+# 不到 3 篇的不说(用户点题的单篇本来就没有牌)。服务端分不出「这一场」(共用身份、无状态), 所以只看这次传进来的稿子。
+# 复审(同日): 这一句还会落在两种本来就不带牌的批次上 —— 用户逐篇点了题目的, 改的是别的对话交付的稿子(拿不到 version_id,
+# check_drafts 的说明叫它照改好的交、不存)。所以先说事实不先猜, 不说「照常 score_drafts」(往下怎么走归 results / next_step
+# 和工具说明), 「不用重写」只管「因为没发牌」这一件(reject 照旧要重写)。
+ANGLES_NOT_DRAWN_MIN = 3
+ANGLES_NOT_DRAWN_NOTE = ("这一批 {n} 篇新稿都没带 angle_key。这一句不拦、不改判定: 查重结果照 results 办, 往下照 next_step 和工具说明走, "
+                         "不用因为没发牌重写, 也不用跟用户提。用户逐篇点了题目的、改的是别的对话交付的稿子, 本来就不带, 不用管这一句; "
+                         "牌发了只是没带上的, score_drafts 时补上; 没发牌的, 这场下一批(3 篇以上)先调 draw_angles"
+                         "(别的 skill 给的选题不顶替发牌)。")
+
+
+def _angles_not_drawn(drafts: Any) -> str | None:
+    if not isinstance(drafts, list):
+        return None
+    fresh = [d for d in drafts if isinstance(d, dict) and not str(d.get("replaces_version_id") or "").strip()]
+    if len(fresh) < ANGLES_NOT_DRAWN_MIN or any(str(d.get("angle_key") or "").strip() for d in fresh):
+        return None
+    return ANGLES_NOT_DRAWN_NOTE.format(n=len(fresh))
 
 
 def _archive_pending(user_id: str | None, project_id: str) -> dict | None:
@@ -364,7 +405,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     """打开一个项目, 一次拿到写这个项目需要的【全部】上下文。
 
     动笔前必须先调这个: 给任何品牌写或改小红书稿之前都要先开项目, 用户没提写作台、只报了品牌名、
-    只贴了 brief、只点了 human-writing 也一样(不知道是哪个项目就先 list_projects)。写评论不走这里, 走 comments_for。返回:
+    只贴了 brief、只点了别的 skill 也一样(不知道是哪个项目就先 list_projects)。写评论不走这里, 走 comments_for。返回:
+      · desk_first —— 给你的一句(不用念给用户): 写作台排第一, 这场对话里别的 skill 只当参考, 四步(open_project →
+        draw_angles → check_drafts → score_drafts)不能少, 交付照 score_drafts 的回包、用户没明说要就不自己生成文件。
       · stable —— 项目人格/定位, 照抄进你的写作上下文
       · p0 —— 【不可违反的硬约束】, 必须 100% 满足, 与任何偏好冲突时以它为准
       · p1 —— 项目调性偏好 + 调校笔记 + 正反案例, 理解意图后按适用性应用
@@ -458,7 +501,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         out["edit_digest"] = digest
     # 2026-10-30 发布收尾: 不再带 desk_gap(同 list_projects)。
     # 服务端版本探针 (skillcheck): 只看这次传的 skill_version —— 一个团队共用一个身份, 别人的旧版、重启后没核到都不算到这一场头上。
-    return _attach_skill_update(out, "open_project", _user_id, skill_version)
+    out = _attach_skill_update(out, "open_project", _user_id, skill_version)
+    return _with_desk_first(out, DESK_FIRST_POSTS)
 
 
 def draw_angles(project_id: str, n: int, avoid_days: int = 30,
@@ -643,12 +687,18 @@ def check_drafts(project_id: str, drafts: list[dict],
     把 summary.degraded_note 那一句照原样告诉用户就行: 交付照常, 用户不用做什么,
     也不用重试。
 
+    返回里有 ``angles_note`` 时(这一批 3 篇以上的新稿没有一篇带 angle_key): 它不拦、不改判定, 照它说的办 —— 这一批照
+    results / next_step 往下走、不跟用户提, 这场下一批先 draw_angles。
+
     这个工具出错会直接报错而不是放行 —— 查重挂了必须停下来, 不能当作通过。
     """
     # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。正文 / 标题放错了字段的先对上(_draft_fields), 不然这一篇只按标题查。
     drafts = _draft_fields(drafts, "check_drafts", project_id)
     out = core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id, record_snapshot=True)
     _add_check_next_step(out)
+    note = _angles_not_drawn(drafts)
+    if note and isinstance(out, dict):
+        out["angles_note"] = note
     # W-29: 判定之后才查; 查不到就不带, 判定结果原样回去。2026-10-30 复审: 只在这批稿子带了 angle_key 时查 —— 团队共用一个
     # 身份, 没带牌的查重(改一篇别的对话交付的稿、用户点题的单篇)查到的全是队友手上的牌, 那句「都存完再给用户看」只会添乱。
     if isinstance(drafts, list) and any(isinstance(d, dict) and str(d.get("angle_key") or "").strip() for d in drafts):
@@ -728,6 +778,8 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
     ``existing_comments`` 是空的, 照常写, 不用再问用户要链接。
 
     返回:
+      · desk_first —— 给你的一句(不用念给用户): 写作台排第一, 别的 skill 只当参考; 评论照 comments_for → 写 →
+        score_comments 走, 用户没明说要就不自己生成文件
       · post —— 要接的帖子(标题 + 正文)
       · source —— ``tv``(按链接找到)/ ``tv_by_text``(按贴来的正文对上, 带一句 ``tv_by_text_note``; 用户说不是这一篇
         就别用它的 ``existing_comments``, 照贴来的正文写)/ ``pasted``
@@ -765,7 +817,8 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
     """
     out = core.comments_for(core.sb(), user_id=_user_id, link=link, project_id=project_id,
                             post_title=post_title, post_body=post_body)
-    return _attach_skill_update(out, "comments_for", _user_id, skill_version)
+    out = _attach_skill_update(out, "comments_for", _user_id, skill_version)
+    return _with_desk_first(out, DESK_FIRST_COMMENTS)
 
 
 def score_comments(comments: list[dict], link: str = "", project_id: str = "", post_title: str = "",

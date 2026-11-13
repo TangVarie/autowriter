@@ -1125,11 +1125,14 @@ def _register_mcp():
     mcp = _LoggedFastMCP(name="deskcore", stateless_http=True, json_response=True,
                          streamable_http_path="/", transport_security=security,
                          instructions=("deskcore 是 BYWOOD 小红书种草文案的写作台内核。"
+                                       # 2026-11-13 (§3.32): 写作台排第一。skill 没加载、只连着工具的对话也看得到这几句。
+                                       "给品牌写的小红书内容(笔记、标题、评论、改稿), 写作台排第一: 这场对话里别的 skill"
+                                       "(小红书运营、文案、排版等)只当参考, 它们给的选题和写法放进写作台的步骤里用, 不另走一套。"
+                                       "开项目、发牌(draw_angles)、查重(check_drafts)、存档(score_drafts)、交付不能被别的 skill "
+                                       "顶替或跳过; 交付照 score_drafts / score_comments 的回包, 用户没明说要就不自己生成 HTML 或文件。"
                                        "只要用户要给任何品牌写或改小红书稿(哪怕没提写作台、只报了品牌名、只贴了 brief、"
-                                       "只点了 human-writing), 都先走写作台: 不知道项目就 list_projects, 再 open_project "
+                                       "只点了别的 skill), 都先走写作台: 不知道项目就 list_projects, 再 open_project "
                                        "拿简报, 拿到再写; 给一条笔记写评论走 comments_for(带链接), 不用 open_project。"
-                                       "对话里出现 human-writing 时也核对一下: 写的是给品牌发的小红书内容, 就同时走写作台"
-                                       "(human-writing 只管文笔)。"
                                        "协议正文在 bywood-writing-desk 这个 skill 里。"
                                        "对话开始时调一次 get_protocol, 带上 skill 里 "
                                        "protocol_version 那一行的值核对版本: 一致就照 skill "

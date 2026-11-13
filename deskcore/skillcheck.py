@@ -33,6 +33,11 @@ from typing import Optional
 UPDATE_URL = ("https://github.com/TangVarie/autowriter/tree/claude/xhs-content-workstation-BSEuH/"
               "skills/bywood-writing-desk")
 UPDATE_COMMAND = "更新技能/bywood-writing-desk"
+# 某一版对写手来说变了什么: 一句大白话, 放在升级提醒的第一行里。**按版本号记**(复审 2026-11-13): 协议下一次改一个字版本号
+# 就变, 那一版没在这里写就只说「有新版」, 不会把上一版的这句话再说一遍。值得说的那一版, 发版时加一行(runbook §6.5)。
+WHATS_NEW: dict[str, str] = {
+    "6f23eba491fd": "和别的 skill 一起用时，写作台现在排第一",   # 2026-11-13 (§3.32)
+}
 
 UP_TO_DATE, OUTDATED, UNKNOWN = "up_to_date", "outdated", "unknown"
 HEALTH_WINDOW_S = 24 * 3600
@@ -82,11 +87,14 @@ def report(user_id, raw_version, current: str, *, now: Optional[float] = None) -
 
 def notice(local: Optional[str], current: str) -> dict:
     """旧版的升级提醒。只在这次报上来的是旧版时给 (见 probe)。"""
+    whats_new = WHATS_NEW.get(current, "")
+    whats_new = f"：{whats_new}" if whats_new else ""   # 不写进 f-string 的花括号里: 那种写法 3.12 才认, CI 是 3.11
     return {
         "status": OUTDATED,
         "local": local,
         "current": current,
-        "message": (f"写作台 skill 不是最新版（你手上的是 {local}，最新是 {current}），请先升级：\n"
+        # 三行: 变了什么 + 重新导入一次; 仓库里 skill 的地址; WorkBuddy 的那句。不说谁没升级, 只说有新版(2026-11-13)。
+        "message": (f"写作台 skill 有新版{whats_new}（你手上的是 {local}，最新是 {current}）。重新导入一次就行：\n"
                     f"{UPDATE_URL}\n{UPDATE_COMMAND}"),
         # 2026-10-30 复审: 开场顺序是 项目名 → 这条 → 改稿摘要(protocol.md 第 1 条); 原来说「放在最前面」, 会顶到项目名前面去
         "action": ("把 message 原样（三行都要）放进开场、复述项目名之后（写评论没有项目名，放在开场就行），同一条只放一次；"
