@@ -1,6 +1,6 @@
 # deskcore · 写作台内核外置为 MCP
 
-> **2026-11-14 审查修复**：先执行 `migrations/021_style_distillation_cas.sql`，再部署新版写作台。旧笔记读取失败不发空历史的学习任务；写回按任务版本比较，完整笔记和精修销账同事务。部署顺序及兼容说明见 [审查修复说明](audit-fixes-2026-11-14.md)。本次未执行生产迁移。
+> **2026-11-14 审查修复**：调校笔记的写回改成按任务版本比较，完整笔记和精修销账在同一个事务里；旧笔记读不到时不发空历史的学习任务。负责人在 SQL Editor 跑一次 `migrations/021_style_distillation_cas.sql`，先于或后于部署都行（没跑时照 021 之前的写法保存，服务日志里响一次警告），写手不用做什么。同一分支里的「硬约束拿不准」改动已撤回。细节见 [审查修复说明](audit-fixes-2026-11-14.md)。生产库还没跑 021。
 
 > 本文讲**为什么这么设计**。要看**现在是什么状态、还差什么、下一步做什么**，
 > 去 [`deskcore-runbook.md`](deskcore-runbook.md)——上线手册、对接矩阵、待办清单，
@@ -289,6 +289,12 @@ cap 后面会让注入数少于 12，而池子里还有相关的排在第 13 位
 | **会话没了，任务也丢了** | `pending > 0` 时 `my_style` 直接带回完整的 `pending_distillation_task`——材料、口径、`edit_ids` 都在，换个会话也能接着做，不必让用户重喂稿子 |
 
 ⚠️ **销账必须按 `edit_ids` 精确销，不能按 user+project 全量销。** 蒸馏任务是一份快照（一次最多 8 条），笔记只覆盖快照里那些。全量销账会吃掉两类不在快照里的行——第 9 条往后的、以及拿到任务之后新 `record_edit` 进来的。它们会从 `pending_distillation` 里消失却从没影响过笔记：用户喂了稿子，计数归零看着正常，那几条等于白喂。同理，`save_my_style` 不传 `edit_ids`（手动改笔记）时**一条都不销**。
+
+**写回按任务的版本比较（2026-11-14，`021`）。** 蒸馏任务带 `expected_revision`（取任务那一刻笔记的 `updated_at`，还没有笔记时是 `new`），和 `edit_ids` 一起原样传回 `save_my_style`。服务端用 `deskcore_save_style_cas` 在一个事务里比较版本、整份替换笔记、销这一批精修：版本对不上（另一份任务先写回了）就什么都不改，回一句话叫模型调 `my_style` 重取、基于新的 `existing_notes` 重新合并；服务端不替模型合并文字。带了 `edit_ids` 没带 `expected_revision` 也拒，那句话写明下一步。不带 `edit_ids` 的手动改笔记同样比较版本（服务端自己先读一次当前版本），不销账。
+
+读旧笔记失败和「还没有笔记」是两回事：失败时 `build_distillation_task` 抛 `store.CalibrationReadError`，不发 `existing_notes` 为空的任务（照着空历史提炼出来的笔记写回去，旧笔记就整份没了）。`record_edit` 这时照样把精修存下来，回 `distillation_status=pending`，叫模型稍后调 `my_style`。写作简报里这份笔记只是参考，`build_writing_brief` 读不到就记日志、不带它接着出简报。
+
+`021` 没跑时（函数不存在，只认 PGRST202 / 42883）`save_my_style` 退回 021 之前的写法：整份覆盖、按 id 销账、不比较版本，服务日志里响一次警告；跑过之后自动改用新函数。别的 RPC 错误照旧报错，不退回（报错带错误码的只看错误码；42883 还要报错里点了这个函数的名字）。写库之前的两道检查跑没跑 `021` 都在：带 `edit_ids` 没带 `expected_revision` 的拒掉；手动改笔记先读一次当前版本，读失败就不保存。读旧笔记失败时三条路（简报、蒸馏、保存）都会在服务日志里记一条带栈的 `read user calibration failed`。
 
 工具的 docstring 就是模型看到的说明。
 

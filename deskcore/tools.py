@@ -741,7 +741,6 @@ def judge_draft(project_id: str, title: str, body: str, judge_paras: str = "on_f
     什么时候调: score_drafts 已经给每篇自动打过参考分; 这个工具是**深一层**的(还判段落、人感), 只在用户问「这篇
     哪里有问题」、或者想在 score_drafts 之外再细查一篇时调。一篇一调。
     怎么用返回值: hard_fails / plan 只说哪一句犯了哪条, 不给改法 —— 照着改稿, 改完最多再判一轮, 不要循环。
-    hard_ambiguous / needs_review 是硬约束拿不准, 需人工复核, 不能说通过; 不据此编造改法或循环重判。
     judge_status 不是 ok(not_configured / timeout / policy_blocked / unavailable …)时: 如实告诉用户这次没拿到判定,
     查重和存档照常走, 不要把它当成"通过"也不要重试超过一次。它不是闸: 判定不过也能交付, 但要把硬伤告诉用户。
     project 必须是你有权限的项目, 且接了 tv_project_map(没接会回 not_configured 并写明补救)。
@@ -756,7 +755,6 @@ def repair_plan_for(project_id: str, title: str, body: str, banks: list[str] | N
     """判一篇稿子并只拿修改单(同 judge_draft 的一次调用, 返回更短): plan 每条 = 题号 + 现在的答案与概率 + 依据句 +
     该题定义, 只说哪一句犯了哪条, 不给改法; recorded 是没过闸二、只记录不下发的目标题(给了 target 才有)。
     用法和限制同 judge_draft: 写后可选、不落账本、不拦交付, judge_status 不是 ok 就如实告诉用户。
-    即使 plan 为空, hard_ambiguous / needs_review 仍表示需人工复核, 不能说通过。
     """
     return core.repair_plan_for(core.sb(), project_id, title, body, user_id=_user_id, banks=banks, brief=brief,
                                 hard_rules=hard_rules, target=target, validated=validated)

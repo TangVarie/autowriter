@@ -2592,32 +2592,95 @@ def _rpc_missing_telemetry_commit_narrow() -> None:
 
 # ── 个人调校笔记 / 精修 diff(私有层) ──────────────────────────────────────
 
-class CalibrationReadError(RuntimeError):
-    """读取失败不能冒充首次使用: 后续保存会整份替换旧笔记。"""
+class CalibrationReadError(ValueError):
+    """读取失败不能冒充首次使用: 后续保存会整份替换旧笔记。
+
+    是 ValueError 的子类: 工具层把它收成 InvalidInput, 这句话原样回到调用方模型手里(不然只剩一个异常类型和 ref)。
+    """
 
 
-def get_user_calibration(sb, project_id: str, user_id: str) -> tuple[str, str | None]:
+def get_user_calibration(sb, project_id: str, user_id: str, *, strict: bool = True) -> tuple[str, str | None]:
+    """读调校笔记, 回 (笔记, 版本)。
+
+    strict=True(蒸馏 / 写回那几条路): 读不到就抛 CalibrationReadError —— 读失败当成「还没有笔记」的话,
+    后面那次保存会拿一份空历史把旧笔记整份替换掉。
+    strict=False(写作简报): 只是拿来当参考, 不会写回去。读不到就记一条日志、当作没有调校笔记接着走,
+    和 021 之前一样 —— 一次读超时不该让 open_project 整个失败。
+    """
     try:
         r = (sb.table("user_calibration_notes").select("notes, updated_at")
                .eq("project_id", project_id).eq("user_id", user_id)
                .limit(1).execute())
-        if r.data:
-            if not r.data[0].get("updated_at"):
-                raise CalibrationReadError("已有调校笔记缺少版本, 未生成可写回的蒸馏任务")
-            return (r.data[0].get("notes") or "").strip(), r.data[0].get("updated_at")
     except Exception as exc:
-        raise CalibrationReadError("这次没读到已有调校笔记, 未生成可写回的蒸馏任务") from exc
+        # 两条路都记原因(异常类型、PostgREST 的 code、栈): strict 那条路到了工具层只剩一句 InvalidInput,
+        # 不在这里记的话, 持续性的故障(权限被收、表结构不对)在日志里就只有一串「稍后再试」, 没法查。
+        logger.exception("read user calibration failed")
+        if not strict:
+            return "", None
+        raise CalibrationReadError("这次没读到已有的调校笔记, 所以没有生成可写回的蒸馏任务; 稍后再调 my_style") from exc
+    if r.data:
+        if strict and not r.data[0].get("updated_at"):
+            raise CalibrationReadError("已有的调校笔记缺少版本, 所以没有生成可写回的蒸馏任务; 请用户找负责人看一下")
+        return (r.data[0].get("notes") or "").strip(), r.data[0].get("updated_at")
     return "", None
+
+
+STYLE_CAS_RPC = "deskcore_save_style_cas"
+_style_cas_missing_warned = False
+
+
+def style_cas_missing(exc: Exception) -> bool:
+    """021 的函数是不是还没建。只认「这个函数不存在」这一种: PostgREST 的 PGRST202、Postgres 的 42883。
+
+    故意比 rpc_missing 窄(那边连 "does not exist" 都认): 函数在、但里面报了别的错(权限、参数、库故障), 必须原样
+    上抛, 不能当成「没跑 021」然后退回覆盖写法。
+
+    · 异常带 code 的(PostgREST 的 APIError): 只看 code, 不看正文 —— 正文里会印出项目 / 用户的 UUID、请求号,
+      里面碰巧有 42883 这五个数字的话, 一个外键错、权限错就会被认成「没跑 021」。
+    · 42883 还要求报错里点了这个函数的名字: 函数在、函数体里调的别的函数或运算符不存在, 也是 42883, 那不是没跑 021。
+    · 不带 code 的: 才看正文, 也只认 pgrst202、带引号的 "42883"、或 PostgREST 那句 could not find the function。
+    """
+    msg = str(exc).lower()
+    named = STYLE_CAS_RPC in msg
+    code = str(getattr(exc, "code", "") or "").upper()
+    if code:
+        return code == "PGRST202" or (code == "42883" and named)
+    if "pgrst202" in msg:
+        return True
+    return named and ("could not find the function" in msg or '"42883"' in msg or "'42883'" in msg)
+
+
+def save_user_calibration(sb, project_id: str, user_id: str, notes: str) -> None:
+    """021 之前的写法(整份 upsert, 不比较版本)。只在 021 的函数还没建时由 save_user_calibration_cas 退回来用。"""
+    (sb.table("user_calibration_notes")
+       .upsert({"project_id": project_id, "user_id": user_id, "notes": notes.strip()},
+               on_conflict="project_id,user_id").execute())
 
 
 def save_user_calibration_cas(sb, project_id: str, user_id: str, notes: str, *,
                               expected_revision: str, edit_ids: list[str]) -> dict | None:
-    """021: 比较旧版本、替换完整笔记、销指定精修, 同一事务。冲突回 None; RPC 缺失不盲写。"""
-    data = sb.rpc("deskcore_save_style_cas", {
-        "_project_id": project_id, "_user_id": user_id, "_notes": notes,
-        "_expected_updated_at": None if expected_revision == "new" else expected_revision,
-        "_edit_ids": edit_ids,
-    }).execute().data
+    """021: 比较旧版本、替换完整笔记、销指定精修, 同一事务。冲突回 None。
+
+    021 的函数还没建(负责人还没跑那份 SQL)时, 退回 021 之前的写法: 整份 upsert 笔记, 再按 id 销精修, 回包里
+    ``revision`` 是 None、``fallback`` 是 True, 进程里只响一次警告。别的 RPC 错误照旧上抛, 不退回。
+    """
+    global _style_cas_missing_warned
+    try:
+        data = sb.rpc(STYLE_CAS_RPC, {
+            "_project_id": project_id, "_user_id": user_id, "_notes": notes,
+            "_expected_updated_at": None if expected_revision == "new" else expected_revision,
+            "_edit_ids": edit_ids,
+        }).execute().data
+    except Exception as exc:
+        if not style_cas_missing(exc):
+            raise
+        if not _style_cas_missing_warned:
+            _style_cas_missing_warned = True
+            logger.warning("deskcore_save_style_cas 还没建(migrations/021_style_distillation_cas.sql 没跑): "
+                           "调校笔记这次按 021 之前的写法保存(不比较版本), 跑过 021 之后自动改用新写法")
+        save_user_calibration(sb, project_id, user_id, notes)
+        return {"revision": None, "fallback": True,
+                "edits_absorbed": mark_edits_distilled(sb, project_id, user_id, edit_ids)}
     if not isinstance(data, list):
         raise RuntimeError("调校笔记保存回执无法识别, 请调 my_style 核对当前笔记后再试")
     if not data:
@@ -2636,8 +2699,8 @@ def add_style_edit(sb, project_id: str, user_id: str, **fields) -> None:
 
 
 def recent_style_edits(sb, project_id: str, user_id: str, limit: int = 8) -> list[dict]:
-    """取最近的未吸收精修。**必须带 id** —— 销账要按这批的确切 id 来, 见
-    save_user_calibration_cas 的事务只销这批 id, 不会吞掉快照外的精修。
+    """取最近的未吸收精修。**必须带 id** —— 销账要按这批的确切 id 来:
+    save_user_calibration_cas 的事务只销这批 id, 不会吞掉快照外的精修(说明见 mark_edits_distilled)。
     """
     try:
         res = (sb.table("style_edits")
@@ -2649,6 +2712,31 @@ def recent_style_edits(sb, project_id: str, user_id: str, limit: int = 8) -> lis
     except Exception:
         logger.exception("read style_edits failed")
         return []
+
+
+def mark_edits_distilled(sb, project_id: str, user_id: str,
+                         edit_ids: list[str]) -> int:
+    """把【指定的这几条】精修标记为已吸收。返回真的改到了几行。021 之前的写法, 只在 021 的函数还没建时用。
+
+    ⚠️ edit_ids 是必需的, 不能退回"把这个人所有未吸收的都标掉"。
+    蒸馏任务是一份【快照】(默认只取最近 8 条), 而笔记只覆盖了快照里那几条。
+    按 user+project 全量销账会吃掉两类不在快照里的行:
+      · 待吸收超过 8 条时, 第 9 条往后的从没进过任何一份笔记
+      · 从"拿到任务"到"写回笔记"之间新 record_edit 进来的那些
+    它们会从 pending_distillation 里消失, 却从来没影响过笔记 —— 用户喂了稿子,
+    计数归零看着正常, 而那几条精修等于白喂。(codex review #56 P1)
+    """
+    if not edit_ids:
+        return 0
+    try:
+        res = (sb.table("style_edits").update({"distilled": True})
+                 .eq("project_id", project_id).eq("user_id", user_id)
+                 .in_("id", list(edit_ids))
+                 .eq("distilled", False).execute())
+        return len(res.data or [])
+    except Exception:
+        logger.exception("mark style_edits distilled failed (notes are saved)")
+        return 0
 
 
 def count_pending_distillation(sb, project_id: str, user_id: str) -> int:

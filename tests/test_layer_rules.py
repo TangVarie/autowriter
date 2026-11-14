@@ -414,7 +414,7 @@ def test_version_layers_reads_the_consumed_row_then_the_fingerprint_key():
 # ══════════════════════════════════════════════════════════════════════
 
 def test_judge_client_keeps_only_product_role_from_the_profile():
-    body = {"passed": True, "hard_ambiguous": [], "hard_fails": [], "plan": [], "unjudged": [],
+    body = {"passed": True, "hard_fails": [], "plan": [], "unjudged": [],
             "profile": {"product_role": "未出现", "opening_type": "具体事件"}}
     assert judge_client._normalize_ok(body)["product_role"] == "未出现"
     assert "product_role" not in judge_client._normalize_ok({**body, "profile": {"opening_type": "具体事件"}})

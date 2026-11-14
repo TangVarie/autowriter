@@ -563,7 +563,9 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     negatives = store.labeled_examples(client, project_id, "negative", user_id)[:MAX_NEGATIVE]
 
     shared_calib = (project.get("calibration_notes") or "").strip()
-    my_calib, _ = store.get_user_calibration(client, project_id, user_id) if user_id else ("", None)
+    # strict=False: 简报里这份笔记只是参考, 读不到就不带它接着出简报(和 021 之前一样), 不让一次读超时挡住开写
+    my_calib, _ = (store.get_user_calibration(client, project_id, user_id, strict=False)
+                   if user_id else ("", None))
     calib_parts = []
     if shared_calib:
         calib_parts.append(f"[项目共享基线]\n{shared_calib}")
@@ -2305,14 +2307,12 @@ def _restore_stash(client, stash: dict[int, list[dict]], indices) -> None:
 # 改一轮(拿不准的也改, 合规上宁严勿松), 和 check_rules 的「必须改」放在同一轮, 交付改好的那一版、一句话说清改了哪里。
 # 改过重存之后还查出来的不再接着改(_score_report_step 按这次带 replaces_version_id 的那几篇分开说), 免得改 → 判 → 改地转。
 SCORE_NOTE = ("参考分: 不拦交付, 也不改 written / rejected。score 满分 100, 只看篇级硬约束(平台合规题 + 特征题库里的"
-              "合规题), 文笔好坏不在里面。分数不用逐篇报给用户: 这一批每篇都打成了分、而且都没有 fixes、hard_fails、unjudged、"
-              "hard_ambiguous / needs_review, "
+              "合规题), 文笔好坏不在里面。分数不用逐篇报给用户: 这一批每篇都打成了分、而且都没有 fixes、hard_fails、unjudged, "
               "才整批说一句「合规检查都过了」。有 fixes 或 hard_fails 的那几篇是查出了合规问题: 不用等用户说, 自己照 fixes 改一轮"
               "(sure=false 是 Jev 拿不准的, 也改; 没有 fixes 的照 hard_fails 里没过的那一条改), 那几篇带 replaces_version_id 先过 "
               "check_drafts 再调 score_drafts, 交付改好的那一版, 交付时一句话说清改了哪篇的哪里; 改过一轮还查出来的照实说一句, "
               "不再接着改, 不要为了分数反复重写。只有 unjudged 的那几篇是有几道硬约束这次没判出来, 不能说都过了, 跟用户提一句就行"
-              "(不影响交付, 不用重试)。hard_ambiguous / needs_review 表示硬约束拿不准, 需人工复核, 不能说通过; "
-              "歧义本身不是确定违规, 不据此编造改法或反复重判。judge_status 不是 ok 就说这篇这次没打成分, 不能说过了, 不用重试。")
+              "(不影响交付, 不用重试)。judge_status 不是 ok 就说这篇这次没打成分, 不能说过了, 不用重试。")
 JUDGE_SHADOW_NOTE = SCORE_NOTE          # 旧名, 老测试 / 老调用方还在 import
 
 # score_drafts 的 next_step 开头那句(存档成功才有)。判定在它之后才跑, 跑完由 _with_score_report 在它后面接上
@@ -2345,9 +2345,7 @@ def _score_report_step(judge: dict | None, revised=frozenset()) -> str:
         return bool(r.get("fixes") or r.get("hard_fails") or r.get("more_fixes"))
     flagged = [r for r in scored if _to_fix(r)]
     unjudged = [r for r in scored if not _to_fix(r) and r.get("unjudged")]
-    review = [r for r in scored if r.get("hard_ambiguous") or r.get("needs_review")]
-    clean = sum(1 for r in scored if not _to_fix(r) and not r.get("unjudged")
-                and not r.get("hard_ambiguous") and not r.get("needs_review"))
+    clean = len(scored) - len(flagged) - len(unjudged)
     unscored = len(rows) - len(scored) + len(judge.get("skipped") or [])
     revised = set(revised or ())
     to_fix = [r for r in flagged if r.get("index") not in revised]
@@ -2369,18 +2367,13 @@ def _score_report_step(judge: dict | None, revised=frozenset()) -> str:
         parts.append((f"另外 index 是 {idx} 的" if flagged else f"judge.results 里 index 是 {idx} 的")
                      + f" {len(unjudged)} 篇有几道硬约束这次没判出来, 不能说都过了; 不影响交付, 不用重试: "
                      "跟用户提一句就行, 不用报分数。")
-    if review:
-        idx = "、".join(str(r.get("index")) for r in review)
-        parts.append(f"judge.results 里 index 是 {idx} 的 {len(review)} 篇有硬约束拿不准, 需要人工复核, "
-                     "不能说合规检查都过了。歧义本身不是确定违规, 不要据此编造改法、不要反复重写或重判; "
-                     "交付时跟用户提一句需复核, 不用报分数。")
     if clean:
-        if flagged or unjudged or review or unscored:
-            parts.append((f"另外 {clean} 篇" if flagged or unjudged or review else f"这 {clean} 篇")
+        if flagged or unjudged or unscored:
+            parts.append((f"另外 {clean} 篇" if flagged or unjudged else f"这 {clean} 篇")
                          + "没查出要改的地方, 不用逐篇说, 也不用报分数。")
         else:
             parts.append(f"这 {clean} 篇合规检查都过了: 整批跟用户说一句「合规检查都过了」就行, 不用报分数, 也不用逐篇说。")
-    if unscored or not (flagged or unjudged or review or clean):
+    if unscored or not (flagged or unjudged or clean):
         parts.append((f"{unscored} 篇" if unscored else "这批") + "这次没打成参考分(不影响存档和交付): "
                      "跟用户提一句就行, 不用重试。")
     hinted = [r for r in rows if r.get("layer_hint")]
@@ -2605,7 +2598,7 @@ def _judge_project_context(client, project_id: str) -> dict:
     return {"project": project, "category": category, "status": None, "detail": ""}
 
 
-_JUDGE_ROW_KEYS = ("judge_status", "passed", "hard_fails", "hard_ambiguous", "needs_review", "calls", "written",
+_JUDGE_ROW_KEYS = ("judge_status", "passed", "hard_fails", "calls", "written",
                    "policy", "elapsed_ms", "http_status", "detail")
 
 _JUDGE_BLOCK_TEXT_MAX = 300
@@ -2632,9 +2625,6 @@ def draft_score(res: dict) -> dict:
     fails = [h for h in (res.get("hard_fails") or []) if isinstance(h, (list, tuple)) and len(h) >= 4]
     sure = sum(1 for h in fails if _is_sure(h[3]))
     unsure = len(fails) - sure
-    failed = {(h[0], h[1]) for h in fails}
-    unsure += len({tuple(p) for p in res.get("hard_ambiguous") or []
-                   if isinstance(p, (list, tuple)) and len(p) == 2} - failed)
     unjudged = int(res.get("unjudged") or 0)
     score = max(0, 100 - _SCORE_PENALTY_SURE * sure - _SCORE_PENALTY_UNSURE * unsure
                 - _SCORE_PENALTY_UNJUDGED * unjudged)
@@ -2661,7 +2651,6 @@ def _judge_row(target: dict, res: dict) -> dict:
     row.update(draft_score(res))
     row.update({k: res[k] for k in _JUDGE_ROW_KEYS
                 if k != "judge_status" and res.get(k) not in (None, "", [], {})
-                and not (k == "needs_review" and not res.get(k))
                 and not (k == "elapsed_ms" and not res.get(k))})   # 0 = 根本没发, 不是"很快"
     if res.get("product_role"):
         # 只给 commit_drafts 对贴型用(_add_layer_hints 一律摘掉, 不进回包和 batch_metrics)
@@ -2843,7 +2832,6 @@ def _judge_committed(client, project_id: str, targets: list[dict],
 # 写手手里; 项目号 / 品类按 tv_project_map 定(与存档时的判定同一条路 _judge_project_context, 数据出境口径
 # docs/00 #7 由 judge 执行并回显在 policy)。仍然一次 LLM 调用都没有。
 JUDGE_TOOL_NOTE = ("这是写后的深一层参考判定(score_drafts 存档时已经自动打过分), 不拦交付、不落账本。hard_fails / plan 拿去改稿, 改完最多再判一轮; "
-                   "hard_ambiguous / needs_review 表示硬约束拿不准, 需人工复核, 不能说通过, 不据此编造改法或循环重判; "
                    "judge_status 不是 ok 时如实告诉用户判定这次没拿到, 查重和入库照常走。")
 
 
@@ -2936,7 +2924,6 @@ def repair_plan_for(client, project_id: str, title: str, body: str, *, user_id: 
                    detail="判定服务这次没给出改稿方案, 已记下; 不用重试, 不用你做什么。")
         return out
     out.update(plan=resp["plan"], recorded=resp.get("recorded", []), passed=resp.get("passed"),
-               hard_ambiguous=resp.get("hard_ambiguous", []), needs_review=resp.get("needs_review", False),
                invalid_reason=resp.get("invalid_reason"), policy=resp.get("policy"), calls=resp.get("calls"))
     return out
 
@@ -7760,7 +7747,8 @@ def migration_state(client) -> dict:
             raise
     state, note = _probe_ok(_style_cas)
     _add(MIGRATION_STYLE_CAS, "deskcore_save_style_cas(空笔记探测, 不写行)", state, note,
-         "硬失败: 调校笔记拒绝写回、不销精修; 先跑 021 再部署, 不会退回覆盖写法")
+         "可降级: 函数不在时 save_my_style 退回 021 之前的写法(整份覆盖、不比较版本, 两份任务前后脚写回时后写的盖掉先写的), "
+         "服务日志里响一次警告; 跑过 021 之后自动改用比较版本的写法, 不用重新部署, 写手不用做什么")
     _add(MIGRATION_STYLE_CAS, "调校笔记的单调版本触发器", "unprobeable",
          "PostgREST 读不到触发器; SQL Editor 核验: SELECT pg_get_triggerdef(oid) "
          "FROM pg_trigger WHERE tgrelid='autowriter.user_calibration_notes'::regclass "
@@ -10242,7 +10230,7 @@ def record_edit(client, project_id: str, *, user_id: str,
     口径照 memory.generate_calibration_notes(:1154-1210): 只收人真的动手改了的
     对子。没改就通过的稿子【不算教学材料】—— memory.py:1191-1194 明确拒绝从
     那里学, 理由是模型会从偶然选择里编造风格规则。
-"""
+    """
     assert_project_access(client, project_id, user_id=user_id)   # 审计 COR-015
     if not (my_title or my_body):
         raise ValueError("my_title/my_body must not both be empty")
@@ -10357,12 +10345,16 @@ def save_my_style(client, project_id: str, notes: str, *, user_id: str,
         raise ValueError("edit_ids 必须是任务里的版本ID列表; 调 my_style 重取后原样传回")
     ids = list(dict.fromkeys(edit_ids or []))
     if ids and expected_revision is None:
-        raise ValueError("这次没带蒸馏任务的 expected_revision, 笔记和精修都没改。"
-                         "调 my_style 重取 pending_distillation_task, 基于 existing_notes 重新合并, "
-                         "再把 expected_revision、edit_ids 原样带回 save_my_style。")
+        raise ValueError("带了 edit_ids 就要同时带 expected_revision(这次笔记和精修都没改): 调 my_style, 用它回的 "
+                         "pending_distillation_task 里的 existing_notes 重新合并一遍, 再把那份任务的 "
+                         "expected_revision 和 edit_ids 原样带上重调 save_my_style。")
     if expected_revision is None:
         # 不销精修的手动改笔记仍要 CAS; 读取失败就拒写, 两次写并发时不覆盖另一笔。
-        _, revision = store.get_user_calibration(client, project_id, user_id)
+        try:
+            _, revision = store.get_user_calibration(client, project_id, user_id)
+        except store.CalibrationReadError as exc:
+            raise store.CalibrationReadError(
+                "这次没读到已有的调校笔记, 所以没有保存(笔记和精修都没改); 稍后原样再调一次 save_my_style") from exc
         expected_revision = revision or "new"
     if not isinstance(expected_revision, str) or (expected_revision != "new" and store._ts(expected_revision) is None):
         raise ValueError("expected_revision 不是任务给的版本; 调 my_style 重取后原样传回")
@@ -10373,13 +10365,14 @@ def save_my_style(client, project_id: str, notes: str, *, user_id: str,
                          "调 my_style 重取 pending_distillation_task, 基于新的 existing_notes 重新合并后再存。")
     marked = saved["edits_absorbed"]
     out = {"saved": True, "notes": notes, "lines": len(notes.splitlines()),
-           "revision": saved["revision"],
            "edits_absorbed": marked,
            "pending_distillation": store.count_pending_distillation(
                client, project_id, user_id)}
-    if edit_ids and marked < len(edit_ids):
+    if saved.get("revision"):               # 021 的函数还没建、退回旧写法的那次没有版本可回
+        out["revision"] = saved["revision"]
+    if ids and marked < len(ids):
         out["warning"] = (
-            f"传了 {len(edit_ids)} 个 edit_id 但只销掉 {marked} 条 —— "
+            f"传了 {len(ids)} 个 edit_id 但只销掉 {marked} 条 —— "
             "多半是其中几条已经被别处吸收过了。笔记已保存。")
     if not edit_ids:
         out["note"] = ("没传 edit_ids, 所以只更新了笔记、没有销账。"

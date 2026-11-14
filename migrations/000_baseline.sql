@@ -1800,8 +1800,9 @@ $v013$;
 
 -- 2026-11-14 external audit F01: old-note reads must succeed before distillation.
 -- Compare the task's revision, replace notes and mark only its edits in one transaction.
--- Deploy this migration before the new deskcore service. Missing RPC must not fall back
--- to the old blind upsert. Rerunning is safe; no existing notes/edits are rewritten.
+-- Run once, any time (before or after the deskcore deploy). Until it is applied the service
+-- saves notes the way it did before 021 and logs one warning; afterwards it uses this function
+-- without a redeploy. Rerunning is safe; no existing notes/edits are rewritten.
 
 -- A revision must change even for two updates in one transaction, or after clock rollback.
 CREATE OR REPLACE FUNCTION autowriter.deskcore_style_revision()

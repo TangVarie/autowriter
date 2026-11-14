@@ -129,7 +129,7 @@ def test_personal_notes_are_added_not_substituted():
     笔记的那天悄悄消失。
     """
     sb = _client(notes_rows=[{"project_id": PID, "user_id": ME,
-                              "notes": MY_NOTE, "updated_at": "2026-11-14T00:00:00Z"}])
+                              "notes": MY_NOTE, "updated_at": None}])
     b = _brief(sb)
     assert MY_NOTE in b["p1"], "个人叠加没进去"
     for line in SHARED_NOTE.splitlines():
@@ -149,7 +149,7 @@ def test_the_two_layers_are_separated_so_the_model_can_tell_them_apart():
     一次文案调整时假报警, 而这里真正要守的是【两段没有糊在一起、顺序没颠倒】。
     """
     sb = _client(notes_rows=[{"project_id": PID, "user_id": ME,
-                              "notes": MY_NOTE, "updated_at": "2026-11-14T00:00:00Z"}])
+                              "notes": MY_NOTE, "updated_at": None}])
     p1 = _brief(sb)["p1"]
 
     first_shared = p1.index(SHARED_NOTE.splitlines()[0])
