@@ -563,7 +563,9 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     negatives = store.labeled_examples(client, project_id, "negative", user_id)[:MAX_NEGATIVE]
 
     shared_calib = (project.get("calibration_notes") or "").strip()
-    my_calib, _ = store.get_user_calibration(client, project_id, user_id) if user_id else ("", None)
+    # strict=False: 简报里这份笔记只是参考, 读不到就不带它接着出简报(和 021 之前一样), 不让一次读超时挡住开写
+    my_calib, _ = (store.get_user_calibration(client, project_id, user_id, strict=False)
+                   if user_id else ("", None))
     calib_parts = []
     if shared_calib:
         calib_parts.append(f"[项目共享基线]\n{shared_calib}")
@@ -7316,6 +7318,7 @@ MIGRATION_019_PROBE_SQL = (
 )
 # 020 给 tv_note_links 加回流闸的四列(origin / gate / gate_reasons / gate_at)。列探得到。
 MIGRATION_TV_LINK_GATE = "020_tv_link_gate.sql"
+MIGRATION_STYLE_CAS = "021_style_distillation_cas.sql"
 MIGRATION_016_PROBE_SQL = (
     "select p.prosrc like '%v_notes_vanished%' as skips_vanished, "
     "to_regclass('truth_vault.v_notes_vanished') is not null as view_present "
@@ -7730,6 +7733,27 @@ def migration_state(client) -> dict:
     _add(MIGRATION_TV_LINK_GATE, "tv_note_links 的回流闸四列(origin / gate / gate_reasons / gate_at)", state, note,
          "可降级: tv-sync 的最后一步读不到这四列就整步跳过(对照、补录照常, 退出码不变), 每篇已发的帖没有结论; 读结论的"
          "各处当作「没判过」, 行为和没有闸时一样。跑了之后当晚的 tv-sync 起开始记, 不用别的操作")
+
+    # 021's empty-note guard runs before any lock or write. Only its exact validation error is success.
+    def _style_cas():
+        try:
+            client.rpc("deskcore_save_style_cas", {
+                "_project_id": None, "_user_id": None, "_notes": "",
+                "_expected_updated_at": None, "_edit_ids": [],
+            }).execute()
+        except Exception as exc:
+            if getattr(exc, "code", None) == "22023" and "notes must not be empty" in str(exc):
+                return
+            raise
+    state, note = _probe_ok(_style_cas)
+    _add(MIGRATION_STYLE_CAS, "deskcore_save_style_cas(空笔记探测, 不写行)", state, note,
+         "可降级: 函数不在时 save_my_style 退回 021 之前的写法(整份覆盖、不比较版本, 两份任务前后脚写回时后写的盖掉先写的), "
+         "服务日志里响一次警告; 跑过 021 之后自动改用比较版本的写法, 不用重新部署, 写手不用做什么")
+    _add(MIGRATION_STYLE_CAS, "调校笔记的单调版本触发器", "unprobeable",
+         "PostgREST 读不到触发器; SQL Editor 核验: SELECT pg_get_triggerdef(oid) "
+         "FROM pg_trigger WHERE tgrelid='autowriter.user_calibration_notes'::regclass "
+         "AND tgname='deskcore_user_calib_updated_at'; 应调用 deskcore_style_revision()",
+         "触发器必须来自 021, 每次更新都前进; 缺席会使同事务内的旧版本仍可能被接受")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -10192,7 +10216,9 @@ _CALIB_SYSTEM = """\
 5. 与已有笔记冲突时以新观察为准（越新的改稿越代表这个项目现在要怎么写）。
 6. 总长度控制在 20 行以内。超了就合并最弱的几条。
 
-只输出笔记正文，不要解释，不要 markdown 标题。"""
+只输出笔记正文，不要解释，不要 markdown 标题。
+写回 save_my_style 时，除 notes、edit_ids 外，必须把本任务的 expected_revision 原样传回；\
+若保存提示快照已变，调 my_style 重取材料，基于新的 existing_notes 重新合并后再存，不要覆盖别人的更新。"""
 
 
 def record_edit(client, project_id: str, *, user_id: str,
@@ -10222,7 +10248,16 @@ def record_edit(client, project_id: str, *, user_id: str,
                             "下次蒸馏时会连它一起算。")
         return out
 
-    task = build_distillation_task(client, project_id, user_id=user_id)
+    try:
+        task = build_distillation_task(client, project_id, user_id=user_id)
+    except store.CalibrationReadError:
+        # 精修已经落库, 不把整次报成"没写"让模型重传同一条; 不发空历史的任务。
+        logger.warning("record_edit: 精修已保存, 旧调校笔记未读成, 学习仍待处理(project=%s)", project_id)
+        out["distillation_status"] = "pending"
+        out["next_step"] = ("精修已保存, 这次没读到已有调校笔记, 尚未吸收。"
+                            "不要重调 record_edit、不要生成新笔记去覆盖旧的; "
+                            "稍后调 my_style 取 pending_distillation_task 接着做。")
+        return out
     if task is None:                      # 理论上不会 —— 上面刚存了一条
         out["next_step"] = "没有可蒸馏的材料。"
         return out
@@ -10230,7 +10265,7 @@ def record_edit(client, project_id: str, *, user_id: str,
     out["next_step"] = (
         "⚠️ 这一步【还没做完】。请按 distillation_task.instruction 的口径, "
         "拿 existing_notes 和 edits 提炼出【更新后的完整笔记】, 然后调用 "
-        "save_my_style 写回去, 并把 distillation_task.edit_ids 原样传回。"
+        "save_my_style 写回去, 并把 distillation_task.edit_ids 和 expected_revision 原样传回。"
         "不写回去的话这次精修等于白喂 —— diff 存下来了, 但文风不会变。")
     return out
 
@@ -10253,7 +10288,7 @@ def build_distillation_task(client, project_id: str, *, user_id: str,
     edits = store.recent_style_edits(client, project_id, user_id, max_edits)
     if not edits:
         return None
-    existing, _ = store.get_user_calibration(client, project_id, user_id)
+    existing, revision = store.get_user_calibration(client, project_id, user_id)
 
     blocks = []
     for e in edits:
@@ -10271,10 +10306,11 @@ def build_distillation_task(client, project_id: str, *, user_id: str,
     out = {
         "instruction": _CALIB_SYSTEM,
         "existing_notes": existing,
+        "expected_revision": revision or "new",
         "edits": "\n\n---\n".join(blocks),
         "edit_count": len(edits),
         # ⚠️ 这批的确切 id。save_my_style 只销这几条的账 —— 见
-        # store.mark_edits_distilled 的说明(全量销账会吃掉快照外的行)。
+        # 021 的 CAS 事务只销这批 id(全量销账会吃掉快照外的行)。
         "edit_ids": [e["id"] for e in edits if e.get("id")],
     }
     if total_pending > len(edits):
@@ -10287,7 +10323,7 @@ def build_distillation_task(client, project_id: str, *, user_id: str,
 
 
 def save_my_style(client, project_id: str, notes: str, *, user_id: str,
-                  edit_ids: list[str] | None = None) -> dict:
+                  edit_ids: list[str] | None = None, expected_revision: str | None = None) -> dict:
     """把调用方模型蒸馏好的笔记写回, 并把【这一批】diff 标记为已吸收。
 
     ⚠️ 只有【真的写回来】才算完成一次学习。record_edit 只是把 diff 存下来 +
@@ -10304,15 +10340,39 @@ def save_my_style(client, project_id: str, notes: str, *, user_id: str,
     notes = (notes or "").strip()
     if not notes:
         raise ValueError("notes 不能为空 —— 空笔记会把这个项目已有的调校笔记清掉")
-    store.save_user_calibration(client, project_id, user_id, notes)
-    marked = store.mark_edits_distilled(client, project_id, user_id, edit_ids or [])
+    if edit_ids is not None and (not isinstance(edit_ids, list)
+                                or any(not isinstance(e, str) or not _is_uuid(e) for e in edit_ids)):
+        raise ValueError("edit_ids 必须是任务里的版本ID列表; 调 my_style 重取后原样传回")
+    ids = list(dict.fromkeys(edit_ids or []))
+    if ids and expected_revision is None:
+        raise ValueError("带了 edit_ids 就要同时带 expected_revision(这次笔记和精修都没改): 调 my_style, 用它回的 "
+                         "pending_distillation_task 里的 existing_notes 重新合并一遍, 再把那份任务的 "
+                         "expected_revision 和 edit_ids 原样带上重调 save_my_style。")
+    if expected_revision is None:
+        # 不销精修的手动改笔记仍要 CAS; 读取失败就拒写, 两次写并发时不覆盖另一笔。
+        try:
+            _, revision = store.get_user_calibration(client, project_id, user_id)
+        except store.CalibrationReadError as exc:
+            raise store.CalibrationReadError(
+                "这次没读到已有的调校笔记, 所以没有保存(笔记和精修都没改); 稍后原样再调一次 save_my_style") from exc
+        expected_revision = revision or "new"
+    if not isinstance(expected_revision, str) or (expected_revision != "new" and store._ts(expected_revision) is None):
+        raise ValueError("expected_revision 不是任务给的版本; 调 my_style 重取后原样传回")
+    saved = store.save_user_calibration_cas(client, project_id, user_id, notes,
+                                           expected_revision=expected_revision, edit_ids=ids)
+    if saved is None:
+        raise ValueError("调校笔记或精修快照已变化, 这次笔记和精修都没改。"
+                         "调 my_style 重取 pending_distillation_task, 基于新的 existing_notes 重新合并后再存。")
+    marked = saved["edits_absorbed"]
     out = {"saved": True, "notes": notes, "lines": len(notes.splitlines()),
            "edits_absorbed": marked,
            "pending_distillation": store.count_pending_distillation(
                client, project_id, user_id)}
-    if edit_ids and marked < len(edit_ids):
+    if saved.get("revision"):               # 021 的函数还没建、退回旧写法的那次没有版本可回
+        out["revision"] = saved["revision"]
+    if ids and marked < len(ids):
         out["warning"] = (
-            f"传了 {len(edit_ids)} 个 edit_id 但只销掉 {marked} 条 —— "
+            f"传了 {len(ids)} 个 edit_id 但只销掉 {marked} 条 —— "
             "多半是其中几条已经被别处吸收过了。笔记已保存。")
     if not edit_ids:
         out["note"] = ("没传 edit_ids, 所以只更新了笔记、没有销账。"
@@ -10390,7 +10450,7 @@ def my_style(client, project_id: str, *, user_id: str) -> dict:
             out["next_step"] = (
                 "有精修还没被吸收进笔记。按 pending_distillation_task.instruction "
                 "提炼出更新后的完整笔记, 调 save_my_style 写回, "
-                "并把 task 里的 edit_ids 原样传回去。")
+                "并把 task 里的 edit_ids 和 expected_revision 原样传回去。")
     return out
 
 

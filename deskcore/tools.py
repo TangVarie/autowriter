@@ -1393,6 +1393,7 @@ def my_style(project_id: str, _user_id: str | None = None) -> dict:
 
 def save_my_style(project_id: str, notes: str,
                   edit_ids: list[str] | None = None,
+                  expected_revision: str | None = None,
                   _user_id: str | None = None) -> dict:
     """把提炼好的调校笔记写回去 —— record_edit 的【第二步】。这是这个项目上大家共用的那一份(团队共用一个身份)。
 
@@ -1402,6 +1403,8 @@ def save_my_style(project_id: str, notes: str,
 
     edit_ids **原样传** distillation_task 里给你的那一份。它决定哪几条精修被
     标记为"已吸收"。
+    expected_revision 也必须从同一份任务原样传回。漏了版本或任务过期会拒写, 笔记和精修都不改:
+    调 my_style 重取 pending_distillation_task, 基于最新 existing_notes 重新合并后再存。
     ⚠️ 不传的话只更新笔记、不销任何账 —— 这正是「用户说这条笔记不对, 直接
     改一下」应有的行为: 手动改写笔记不等于吸收了那些待处理的精修, 顺手把它们
     标掉会让它们静默消失。所以两种用法泾渭分明:
@@ -1416,7 +1419,7 @@ def save_my_style(project_id: str, notes: str,
     # 故意不包 _safe: 写。这是"裂变"闭环的最后一步, 静默失败 = 前面白做。
     with _core_value_errors_as_input():
         return core.save_my_style(core.sb(), project_id, notes,
-                                  user_id=_user_id, edit_ids=edit_ids)
+                                  user_id=_user_id, edit_ids=edit_ids, expected_revision=expected_revision)
 
 
 def my_rules(project_id: str, _user_id: str | None = None) -> dict:

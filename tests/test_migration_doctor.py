@@ -62,6 +62,7 @@ _TABLES = {
 
 # 全部迁移都跑过的库: 五个 RPC 都在, 且 check/commit 都是新签名。
 _ALL_RPCS = {
+    "deskcore_save_style_cas": lambda a: [],
     # 001 装的。漏了它 doctor 会把 001 报成没跑 —— 这个夹具本身就是那条断言的
     # 反面教材: 加探测时忘了同步夹具, 别的用例会先红, 而那正是我们要的。
     "deskcore_reserve_angles": lambda a: [],
@@ -102,7 +103,8 @@ def test_fully_migrated_db_reports_ok():
                                      "008_embedding_model_isolation.sql",
                                      "010_tv_links_rls.sql",
                                      "016_tv_notes_skip_vanished.sql",
-                                     "019_dedup_gin_first.sql"]
+                                     "019_dedup_gin_first.sql",
+                                     "021_style_distillation_cas.sql"]
     assert all(s in ("applied", "unprobeable") for s in _states(report).values())
 
 
@@ -134,6 +136,7 @@ def test_bare_001_db_reports_every_later_migration_missing():
         "009_tv_links.sql",           # 读 TV 的 RPC 不在 → 009 没跑
         "012_review_via_agent_provenance.sql",
         "017_tv_link_text_fp.sql",    # 撤回 TV 血缘的 RPC 不在 → 017 没跑
+        "021_style_distillation_cas.sql",
     ]
     st = _states(report)
     assert st["表 draft_fingerprints"] == "applied"      # 001 在

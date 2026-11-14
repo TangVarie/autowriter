@@ -1,5 +1,7 @@
 # deskcore 上线手册 · 对接 · 待办
 
+> **2026-11-14 审查修复**：调校笔记的写回改成按任务版本比较，完整笔记和精修销账在同一个事务里；旧笔记读不到时不发空历史的学习任务。负责人在 SQL Editor 跑一次 `migrations/021_style_distillation_cas.sql`，先于或后于部署都行（没跑时照 021 之前的写法保存，服务日志里响一次警告），写手不用做什么。同一分支里的「硬约束拿不准」改动已撤回。细节见 [审查修复说明](audit-fixes-2026-11-14.md)。生产库还没跑 021。
+
 > **2026-10-15当前交接见 [HANDOFF.md](../HANDOFF.md)**：PR96已部署、现场隔离词已配置，评论仍关闭；借卡真实客户端截止与角度漏账仍待验。下面08-26快照及更早“未配/未迁移”字样是历史，不可替代当前核验。
 
 > **这份文档的定位**：`docs/deskcore.md` 讲的是**为什么这么设计**，这份讲的是
@@ -62,7 +64,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 | 部件 | 实测结果 |
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + `migrations/` 下全部迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
-| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15；`020_tv_link_gate`（回流闸的四列，不跑不坏）2026-11-12 还没跑，见 §1.16 |
+| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15；`020_tv_link_gate`（回流闸的四列，不跑不坏）2026-11-12 还没跑，见 §1.16；`021_style_distillation_cas`（调校笔记按版本写回，不跑不坏）2026-11-14 还没跑，见 §1.17 |
 | **跑的是哪一份代码** | 打 `/health` 看 `build`：`commit`（12 位）和 `protocol_version`。**不需要 key。**<br>2026-09-20 加的，起因是同一天卡了两次：早上把「Railway 还没重新部署」当事实写进记录（其实没核实、它早就上线了），下午 Railway 一次部署真失败、服务停在 6 小时前的版本，而**从外面看不出来**（`/health` 不带版本、`/tools` 要 key）。<br>· `commit` 与 `main` 上的 SHA 不一致 → 部署没跟上，去 Railway 看那次 build 的日志。<br>· `protocol_version` 与 `skills/bywood-writing-desk/SKILL.md` 末尾那行不一致 → 运营手里那份 skill 该重新导入了。<br>· 显示 `unknown` → 只是这个诊断字段没取到值，**不代表服务不健康**（它刻意不参与 `ok`）。 |
 | **写手的 skill 是不是最新版** | `curl -H "X-Deskcore-Key: <你的 key>" https://autowriter-production.up.railway.app/skill-versions`（**要 key**，不放 `/health`：那里不鉴权，按 `app.py` 的规矩不许放业务数据）。`writers_24h` 是 24 小时内报上来的版本里最新 / 旧版 / 没报各几个——按「身份 × 版本」数，一个团队共用一个身份时读作「这 24 小时里有几种版本在用」，不是人数；`outdated_versions` 是旧版各是哪一版；只有计数，没有是谁。<br>2026-10-16 加的服务端探针（`deskcore/skillcheck.py`）：`open_project` / `comments_for` 带 `skill_version`、`get_protocol` 带 `local_version`。**2026-10-30 发布收尾起，提醒只看这一次调用报上来的版本**：最新不提醒；旧版（含认不出的值）在返回值里带 `skill_update`，`message` 末尾两行是升级入口（仓库里 skill 的地址 + `更新技能/bywood-writing-desk`），模型照抄给写手；没报（或报「无」这类占位）只记一笔计数、不提醒。其它工具不再捎提醒。不拦写稿。<br>原来按身份记版本、没报就沿用 12 小时内的记录或提醒「没核到版本」、其它工具 30 分钟抽查一次——一个团队共用一个身份时，一个人的旧 skill 让所有人收到提醒，重启后每场开头又报一句「没核到」，所以撤了。计数在进程内存里，重启清零。要找还在用旧版的人：看 `outdated_versions` 有没有值，在群里让大家各自看一眼 skill 里那一行。<br>**2026-11-11 起不带 key、重启之后也查得到**：每次存档那一行指标带 `meta.skill_versions`（就是这份计数），`open_project` / `comments_for` 的调用记录带 `meta.skill`（这一次报上来的是最新 / 旧版 / 没报），只读 SQL 见 `docs/deskcore.md` §3.8 末尾。 |
 | **每个工具调了几次、多久、怎么收场** | 只读 SQL 查 `autowriter.batch_metrics` 里 `meta->>'mode' = 'tool_call'` 的行（2026-11-11 起每次工具调用一行，只有数；查询在 `docs/deskcore.md` §3.8 末尾）。评论那一路判了几条、哪一样检查打回了几条也在这里（W-51 不用再翻网关日志）。写不进去不影响任何调用，只在服务日志里留一行 `工具调用留痕: 没写进库`（5 分钟最多一行）；要停就设 `DESKCORE_TOOL_CALL_LOG=0`。 |
@@ -314,6 +316,28 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `dashboard_views_v1.sql`），理由写在迁移文件头。验收：`doctor` 里「视图 v_angle_outcomes」applied；
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
+
+### 1.17 `021_style_distillation_cas` —— 调校笔记按任务版本写回（2026-11-14，外部审查 F01，**生产库还没跑**）
+
+原来的写回是两步：整份覆盖笔记，再按 `edit_ids` 销精修。两份蒸馏任务前后脚写回时，后写的会盖掉先写的；读旧笔记失败时，
+任务里的 `existing_notes` 是空的，模型照着它提炼出来的笔记写回去，旧笔记就整份没了。021 加一个函数
+`deskcore_save_style_cas`，在一个事务里比较版本、替换笔记、销这一批精修，并把 `updated_at` 的触发器换成每次更新都往前走的版本。
+**不碰数据**：不重写任何现有笔记或精修。
+
+**顺序。** 代码不依赖它：没跑时 `save_my_style` 照 021 之前的写法保存（整份覆盖、按 id 销账），服务日志里响一次
+「deskcore_save_style_cas 还没建」的警告。和这个分支之前比有两处不一样（都在写库之前，跑没跑 021 都一样）：带了 `edit_ids`
+没带 `expected_revision` 的调用会被拒，模型按那句话多走一个来回；不带 `edit_ids` 的手动改笔记会先读一次当前笔记，这次读失败
+就不保存、叫模型稍后再调（以前不读、直接写）。先于或后于部署都行，可以随时跑、重复跑；跑过之后服务自动改用新函数，
+不用重新部署。只有「函数不存在」（PGRST202 / 42883）才退回旧写法，别的错误照旧报错。
+① SQL Editor 跑 `021`。② 不用手动验收：`doctor` 里「deskcore_save_style_cas（空笔记探测，不写行）」applied。写手不用做什么，
+skill 也不用重新导入（协议正文没变）。
+
+**跑没跑都生效的部分**（只在代码里）：
+- 读旧笔记失败时不发任务。`record_edit` 照样把精修存下来，回 `stored=true, distillation_status=pending`，叫模型稍后调
+  `my_style` 接着做；`save_my_style`、`my_style` 读不到时如实说没读到，不当成「还没有笔记」。
+- 写作简报（`open_project`）里这份笔记只是参考：读不到就记一条日志、不带它接着出简报，和以前一样。
+- 蒸馏任务多一个 `expected_revision`，和 `edit_ids` 一起原样传回 `save_my_style`。带了 `edit_ids` 没带它会被拒，拒绝的那句话
+  写明了下一步怎么做。版本对不上（别人先写回了）也拒，笔记和精修都不改，模型调 `my_style` 重取后重新合并。
 
 ### 1.16 `020_tv_link_gate` —— 每篇已发的帖记来源和「能不能拿来学」的结论（2026-11-12，回流闸 v1，**生产库还没跑**）
 
