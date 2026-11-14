@@ -136,7 +136,8 @@ def result(status: str, *, detail: str = "", http_status: Optional[int] = None,
     """一次判定的结局, 固定形状。调用方(core)也用它造"没发出去"的那几种。"""
     out = {"judge_status": status, "http_status": http_status,
            "elapsed_ms": int(elapsed_ms), "detail": mask_secrets(detail or "")[:_DETAIL_MAX],
-           "passed": None, "hard_fails": [], "calls": None, "written": None,
+           "passed": None, "hard_fails": [], "hard_ambiguous": [], "needs_review": False,
+           "calls": None, "written": None,
            "policy": None, "plan_size": 0, "plan": [], "unjudged": 0, "invalid_reason": None}
     out.update(extra)
     return out
@@ -174,6 +175,48 @@ def _status_for_http_error(code: int, detail: str) -> str:
     return JUDGE_ERROR
 
 
+def _with_hard_ambiguity(payload: Any) -> Optional[dict]:
+    """Shared by score responses and full writer tools; retain the rest of the redacted view."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("passed"), bool):
+        return None
+    def _pairs(raw):
+        if not isinstance(raw, list):
+            return None
+        if any(not isinstance(p, (list, tuple)) or len(p) != 2
+               or not all(isinstance(s, str) and s for s in p) for p in raw):
+            return None
+        return list(dict.fromkeys(tuple(p) for p in raw))
+
+    if "hard_ambiguous" in payload:
+        hard_ambiguous = _pairs(payload["hard_ambiguous"])
+    else:
+        # 滚动部署: 旧 judge 已有全题歧义列表和本次硬约束, 只取交集。缺少证据时不猜成没有歧义。
+        ambiguous = _pairs(payload.get("ambiguous"))
+        hard_rules = payload.get("hard_rules")
+        if ambiguous is None or not isinstance(hard_rules, dict):
+            return None
+        hard_ambiguous = [(bank, qid) for bank, qid in ambiguous if f"{bank}:{qid}" in hard_rules]
+    if hard_ambiguous is None:
+        return None
+    review = set(hard_ambiguous)
+    if "needs_review" in payload and (not isinstance(payload["needs_review"], bool)
+                                       or (payload["needs_review"] and not review)):
+        return None                       # 上游明确说要复核, 不能因空列表而翻译成全过
+    out = dict(payload)
+    out.update(hard_ambiguous=[list(p) for p in hard_ambiguous], needs_review=bool(review),
+               passed=payload["passed"] and not review)
+    if isinstance(payload.get("hard_fails"), list):
+        out["hard_fails"] = [h for h in payload["hard_fails"]
+                             if not (isinstance(h, (list, tuple)) and len(h) >= 2
+                                     and isinstance(h[0], str) and isinstance(h[1], str)
+                                     and (h[0], h[1]) in review)]
+    if isinstance(payload.get("plan"), list):
+        out["plan"] = [e for e in payload["plan"] if not isinstance(e, dict)
+                       or not (isinstance(e.get("bank"), str) and isinstance(e.get("qid"), str)
+                               and (e["bank"], e["qid"]) in review)]
+    return out
+
+
 def _normalize_ok(payload: Any) -> Optional[dict]:
     """200 的响应体 → 结局里要留的那几个字段。结构不对回 None(算 error, 不算 ok)。
 
@@ -186,21 +229,29 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
     # 没有修改建议(codex review on aw#107)。算分要用的三样必须是列表, 否则整篇算 error。
     if not all(isinstance(payload.get(k), list) for k in _SCORE_FIELDS):
         return None
+    payload = _with_hard_ambiguity(payload)
+    if payload is None:
+        return None
+    hard_ambiguous = payload["hard_ambiguous"]
+    review = {tuple(p) for p in hard_ambiguous}
     fails = []
     for h in payload["hard_fails"]:
         # [bank, qid, answer, p, evidence] —— 证据句不放在这里(它进下面的 plan, 一句话只带一份)。
         # 形状不对的一行也算整篇 error: 悄悄丢掉它, 这篇就少扣了分(codex review on aw#107)。
-        if not (isinstance(h, (list, tuple)) and len(h) >= 4 and isinstance(h[1], str)
+        if not (isinstance(h, (list, tuple)) and len(h) >= 4 and isinstance(h[0], str) and isinstance(h[1], str)
                 and (h[3] is None or (isinstance(h[3], (int, float)) and not isinstance(h[3], bool)))):
             return None
-        fails.append([h[0], h[1], h[2], h[3]])
+        if (h[0], h[1]) not in review:
+            fails.append([h[0], h[1], h[2], h[3]])
     # 2026-10-19 起分数给写手看(D-120): 修改单留下来, 由 core 挑最有把握的几条给写手。只留看得懂的那几个字段,
     # 暗题的条目 judge 那边已经抹成「有一项不公开的检查没过」。
     plan = []
     raw_plan = payload.get("plan")
     # 先按把握排(高的在前、没给概率的最后)再截: 截在前面的话, 第 13 条以后有把握的修改会被前面拿不准的挤掉
     # (codex review on aw#107)。core 的 sure 判据是 p ≥ 阈值, 按 p 降序排就是"有把握的在前"。
-    ranked = sorted((e for e in raw_plan if isinstance(e, dict)),
+    actionable = [e for e in raw_plan if not isinstance(e, dict)
+                  or (e.get("bank"), e.get("qid")) not in review]
+    ranked = sorted((e for e in actionable if isinstance(e, dict)),
                     key=lambda e: -(e["p"] if isinstance(e.get("p"), (int, float))
                                     and not isinstance(e.get("p"), bool) else -1.0))
     for e in ranked[:_PLAN_MAX]:
@@ -226,12 +277,13 @@ def _normalize_ok(payload: Any) -> Optional[dict]:
     raw_werr = payload.get("write_error")
     write_error = (mask_secrets(raw_werr if isinstance(raw_werr, str) else str(raw_werr))[:_DETAIL_MAX] or None
                    if raw_werr not in (None, "", [], {}) else None)
-    out = {"passed": payload["passed"], "hard_fails": fails,
+    out = {"passed": payload["passed"] and not review, "hard_fails": fails,
+           "hard_ambiguous": [list(p) for p in hard_ambiguous], "needs_review": bool(review),
            "calls": calls if isinstance(calls, int) else None,
            "written": written if isinstance(written, int) else None,
            "ledger_ok": write_error is None and isinstance(written, int) and not isinstance(written, bool),
            "policy": policy,
-           "plan_size": len(raw_plan),
+           "plan_size": len(actionable),
            "plan": plan,
            "unjudged": len(unjudged),
            "invalid_reason": invalid if isinstance(invalid, str) and invalid else None}
@@ -292,7 +344,7 @@ def judge_draft(payload: dict, *, timeout: Optional[float] = None) -> dict:
             norm = _normalize_ok(resp.json())
             if norm is None:
                 out = result(JUDGE_ERROR, http_status=code, elapsed_ms=_ms(),
-                             detail="judge 回了 200 但响应体不是约定的形状(缺 passed)")
+                             detail="judge 回了 200 但响应体不是约定的形状(缺字段或硬约束歧义信息格式不符)")
             else:
                 out = result(JUDGE_OK, http_status=code, elapsed_ms=_ms(), **norm)
     except Exception as exc:                           # noqa: BLE001 — 解析失败也不抛
@@ -346,7 +398,7 @@ def build_tool_request(*, title: str, body: str, project: str, category: Optiona
     return payload
 
 
-def _draft_shape_problem(body: Any) -> Optional[str]:
+def _draft_shape_problem(body: Any, *, hard_ambiguity: bool = False) -> Optional[str]:
     """/judge_draft 的 200 契约: 对象, passed 是 bool, plan 是 list。不对就不是成功 (codex review on #95, P2:
     版本不兼容的 judge 或会说 JSON 的代理回 {"detail": …} 也是 200, 当成 ok 等于把故障报成判完了)。"""
     if not isinstance(body, dict):
@@ -355,6 +407,8 @@ def _draft_shape_problem(body: Any) -> Optional[str]:
         return "缺 passed(bool)"
     if not isinstance(body.get("plan"), list):
         return "缺 plan(list)"
+    if hard_ambiguity and _with_hard_ambiguity(body) is None:
+        return "缺有效的硬约束歧义信息"
     return None
 
 
@@ -425,7 +479,15 @@ def _tool_call(method: str, path: str, *, json_body: Optional[dict] = None,
 
 def judge_draft_full(payload: dict, *, timeout: Optional[float] = None) -> dict:
     """写手侧: 判一篇, 回抹掉暗题的整个响应(见 _tool_call)。"""
-    return _tool_call("POST", "/judge_draft", json_body=payload, timeout=timeout, shape=_draft_shape_problem)
+    result = _tool_call("POST", "/judge_draft", json_body=payload, timeout=timeout,
+                        shape=lambda body: _draft_shape_problem(body, hard_ambiguity=True))
+    if result["judge_status"] == JUDGE_OK:
+        body = _with_hard_ambiguity(result.get("response"))
+        if body is None:
+            return {**result, "judge_status": JUDGE_ERROR, "response": None,
+                    "detail": "判定回包缺有效的硬约束歧义信息"}
+        result["response"] = body
+    return result
 
 
 def list_banks(*, timeout: Optional[float] = None) -> dict:

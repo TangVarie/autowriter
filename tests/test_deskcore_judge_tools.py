@@ -24,6 +24,7 @@ from tests.test_deskcore_commit_judge import ME, PROJ, _client
 
 TITLE, BODY = "标题：戒烟第三天", "上周办了张健身卡，第一段讲事。\n第二段讲感受，挺累的但开心。\n大家怎么看，是先戒烟还是边练边戒？"
 SERVICE = {"subject_id": "draft", "passed": False, "invalid_reason": None,
+           "hard_ambiguous": [],
            "profile": {"speech_act": "分享"}, "hard_fails": [["platform_health_v0.1", "efficacy_claim", "是", 0.68, "立马就压住了"]],
            "unjudged": [], "para_stats": {"n": 3}, "plan": [{"bank": "platform_health_v0.1", "qid": "efficacy_claim", "evidence": "立马就压住了"}],
            "recorded": [], "calls": 11, "usage": {"input": 1}, "banks": {"feature_questions_v0_1": {"version": "fq-v0.1", "sha256": "ba0f"}},
@@ -208,3 +209,52 @@ def test_project_context_lookup_runs_inside_the_deadline(wired, monkeypatch):
     assert out["judge_status"] == "ok"
     (_m, _u, _h, _b, timeout), = calls
     assert timeout[0] == 3.0 and 15.0 < timeout[1] <= 18.0, timeout
+
+
+@pytest.mark.parametrize('name', ['judge_draft', 'repair_plan_for'])
+@pytest.mark.parametrize('legacy', [False, True])
+def test_writer_tools_preserve_hard_review_when_no_rewrite_is_supported(wired, monkeypatch, name, legacy):
+    _, reply = wired
+    body = dict(SERVICE, passed=True, hard_fails=[], plan=[],
+                hard_ambiguous=[['platform_health_v0.1', 'efficacy_claim']], needs_review=True)
+    if legacy:
+        body.pop('hard_ambiguous')
+        body.pop('needs_review')
+        body.update(ambiguous=[['platform_health_v0.1', 'efficacy_claim'], ['fq', 'description']],
+                    hard_rules={'platform_health_v0.1:efficacy_claim': '否'})
+    reply['fn'] = lambda *args: _Resp(200, body)
+    monkeypatch.setattr(core, 'sb', _client)
+    out = getattr(tools, name)(PROJ, TITLE, BODY, _user_id=ME)
+    assert out['judge_status'] == 'ok' and out['passed'] is False and out['needs_review'] is True
+    assert out['hard_ambiguous'] == [['platform_health_v0.1', 'efficacy_claim']]
+    assert out['plan'] == [] and '需人工复核' in out['note']
+    assert 'ledger_rows' not in out
+    if name == 'judge_draft':
+        assert out['profile'] == SERVICE['profile'], 'full tools retain other fields rather than reducing to score rows'
+
+
+def test_writer_tools_filter_an_unsupported_legacy_rewrite_without_losing_sure_failures(wired, monkeypatch):
+    _, reply = wired
+    body = dict(SERVICE, ambiguous=[['platform_health_v0.1', 'efficacy_claim']],
+                hard_rules={'platform_health_v0.1:efficacy_claim': '否'},
+                hard_fails=[['platform_health_v0.1', 'efficacy_claim', '是', .51], ['platform', 'certain', '是', .99]],
+                plan=[{'bank': 'platform_health_v0.1', 'qid': 'efficacy_claim', 'instruction': 'uncertain'},
+                      {'bank': 'platform', 'qid': 'certain', 'instruction': 'supported'}])
+    body.pop('hard_ambiguous')
+    reply['fn'] = lambda *args: _Resp(200, body)
+    monkeypatch.setattr(core, 'sb', _client)
+    out = tools.judge_draft(PROJ, TITLE, BODY, _user_id=ME)
+    assert out['hard_fails'] == [['platform', 'certain', '是', .99]]
+    assert out['plan'] == [{'bank': 'platform', 'qid': 'certain', 'instruction': 'supported'}]
+    assert out['needs_review'] is True
+
+
+@pytest.mark.parametrize('name', ['judge_draft', 'repair_plan_for'])
+def test_writer_tools_do_not_treat_missing_ambiguity_contract_as_a_pass(wired, monkeypatch, name):
+    _, reply = wired
+    body = dict(SERVICE, passed=True, hard_fails=[], plan=[])
+    body.pop('hard_ambiguous')
+    reply['fn'] = lambda *args: _Resp(200, body)
+    monkeypatch.setattr(core, 'sb', _client)
+    out = getattr(tools, name)(PROJ, TITLE, BODY, _user_id=ME)
+    assert out['judge_status'] == 'error' and not out.get('passed')

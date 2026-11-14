@@ -2592,22 +2592,41 @@ def _rpc_missing_telemetry_commit_narrow() -> None:
 
 # ── 个人调校笔记 / 精修 diff(私有层) ──────────────────────────────────────
 
+class CalibrationReadError(RuntimeError):
+    """读取失败不能冒充首次使用: 后续保存会整份替换旧笔记。"""
+
+
 def get_user_calibration(sb, project_id: str, user_id: str) -> tuple[str, str | None]:
     try:
         r = (sb.table("user_calibration_notes").select("notes, updated_at")
                .eq("project_id", project_id).eq("user_id", user_id)
                .limit(1).execute())
         if r.data:
+            if not r.data[0].get("updated_at"):
+                raise CalibrationReadError("已有调校笔记缺少版本, 未生成可写回的蒸馏任务")
             return (r.data[0].get("notes") or "").strip(), r.data[0].get("updated_at")
-    except Exception:
-        logger.exception("read user calibration failed")
+    except Exception as exc:
+        raise CalibrationReadError("这次没读到已有调校笔记, 未生成可写回的蒸馏任务") from exc
     return "", None
 
 
-def save_user_calibration(sb, project_id: str, user_id: str, notes: str) -> None:
-    (sb.table("user_calibration_notes")
-       .upsert({"project_id": project_id, "user_id": user_id, "notes": notes.strip()},
-               on_conflict="project_id,user_id").execute())
+def save_user_calibration_cas(sb, project_id: str, user_id: str, notes: str, *,
+                              expected_revision: str, edit_ids: list[str]) -> dict | None:
+    """021: 比较旧版本、替换完整笔记、销指定精修, 同一事务。冲突回 None; RPC 缺失不盲写。"""
+    data = sb.rpc("deskcore_save_style_cas", {
+        "_project_id": project_id, "_user_id": user_id, "_notes": notes,
+        "_expected_updated_at": None if expected_revision == "new" else expected_revision,
+        "_edit_ids": edit_ids,
+    }).execute().data
+    if not isinstance(data, list):
+        raise RuntimeError("调校笔记保存回执无法识别, 请调 my_style 核对当前笔记后再试")
+    if not data:
+        return None
+    row = data[0]
+    if (not isinstance(row, dict) or not row.get("revision")
+            or not isinstance(row.get("edits_absorbed"), int) or isinstance(row["edits_absorbed"], bool)):
+        raise RuntimeError("调校笔记保存回执无法识别, 请调 my_style 核对当前笔记后再试")
+    return row
 
 
 def add_style_edit(sb, project_id: str, user_id: str, **fields) -> None:
@@ -2618,7 +2637,7 @@ def add_style_edit(sb, project_id: str, user_id: str, **fields) -> None:
 
 def recent_style_edits(sb, project_id: str, user_id: str, limit: int = 8) -> list[dict]:
     """取最近的未吸收精修。**必须带 id** —— 销账要按这批的确切 id 来, 见
-    mark_edits_distilled 的说明。
+    save_user_calibration_cas 的事务只销这批 id, 不会吞掉快照外的精修。
     """
     try:
         res = (sb.table("style_edits")
@@ -2630,31 +2649,6 @@ def recent_style_edits(sb, project_id: str, user_id: str, limit: int = 8) -> lis
     except Exception:
         logger.exception("read style_edits failed")
         return []
-
-
-def mark_edits_distilled(sb, project_id: str, user_id: str,
-                         edit_ids: list[str]) -> int:
-    """把【指定的这几条】精修标记为已吸收。返回真的改到了几行。
-
-    ⚠️ edit_ids 是必需的, 不能退回"把这个人所有未吸收的都标掉"。
-    蒸馏任务是一份【快照】(默认只取最近 8 条), 而笔记只覆盖了快照里那几条。
-    按 user+project 全量销账会吃掉两类不在快照里的行:
-      · 待吸收超过 8 条时, 第 9 条往后的从没进过任何一份笔记
-      · 从"拿到任务"到"写回笔记"之间新 record_edit 进来的那些
-    它们会从 pending_distillation 里消失, 却从来没影响过笔记 —— 用户喂了稿子,
-    计数归零看着正常, 而那几条精修等于白喂。(codex review #56 P1)
-    """
-    if not edit_ids:
-        return 0
-    try:
-        res = (sb.table("style_edits").update({"distilled": True})
-                 .eq("project_id", project_id).eq("user_id", user_id)
-                 .in_("id", list(edit_ids))
-                 .eq("distilled", False).execute())
-        return len(res.data or [])
-    except Exception:
-        logger.exception("mark style_edits distilled failed (notes are saved)")
-        return 0
 
 
 def count_pending_distillation(sb, project_id: str, user_id: str) -> int:

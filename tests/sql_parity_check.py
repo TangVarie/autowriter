@@ -616,6 +616,7 @@ def main() -> int:
         run_sql_text(_shim(f.read_text(encoding="utf-8")), f"{f.name}(第二遍)")
     print("  ✓ 整套迁移重复执行是干净 no-op(幂等)")
 
+    bad += _check_style_distillation_cas()
     bad += _check_no_stale_overloads(files[0])
 
     print(f"\nschema + SQL/Python 一致性: {'全部通过' if not bad else f'{bad} 项不通过'}")
@@ -903,6 +904,95 @@ def _check_tv_clear_lineage() -> int:
         print("  ✓ 017: 两列都对上才清(item 按 IS NOT DISTINCT FROM 比), 回清了的 note_id, 重跑不清; 清完回填写得进新的一对; "
               "service_role 调得通、anon/authenticated 调不了")
     return bad
+
+
+def _check_style_distillation_cas() -> int:
+    """021: exercise concurrent tasks and atomic rollback on a real PostgreSQL server."""
+    from concurrent.futures import ThreadPoolExecutor
+    pid = "f1111111-1111-1111-1111-111111111111"
+    e1, e2, e3 = [f"f2222222-2222-2222-2222-{n:012d}" for n in range(1, 4)]
+    sql(f"INSERT INTO autowriter.projects(id, owner_id, name) VALUES ('{pid}', '{UID}', 'style-cas-test');")
+    sql(f"INSERT INTO autowriter.user_calibration_notes(project_id,user_id,notes) "
+        f"VALUES ('{pid}','{UID}','old rule');")
+    sql("INSERT INTO autowriter.style_edits(id,project_id,user_id) VALUES "
+        + ",".join(f"('{e}','{pid}','{UID}')" for e in (e1,e2,e3)) + ";")
+    revision = sql(f"SELECT updated_at FROM autowriter.user_calibration_notes WHERE project_id='{pid}';")
+
+    def call(note, rev, ids):
+        expected = "NULL" if rev is None else "'" + rev + "'::timestamptz"
+        edits = "ARRAY[" + ",".join("'" + e + "'::uuid" for e in ids) + "]::uuid[]"
+        return (f"SELECT count(*) FROM autowriter.deskcore_save_style_cas('{pid}','{UID}',"
+                f"'{note}',{expected},{edits});")
+
+    # Both tasks read the same revision. Exactly one can save, and only its edits are absorbed.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda pair: sql(call(pair[0],revision,[pair[1]])),
+                                [("winner A",e1),("winner B",e2)]))
+    assert sorted(results) == ["0","1"], results
+    assert sql(f"SELECT count(*) FROM autowriter.style_edits WHERE project_id='{pid}' AND distilled;") == "1"
+    current = sql(f"SELECT notes FROM autowriter.user_calibration_notes WHERE project_id='{pid}';")
+    current_rev = sql(f"SELECT updated_at FROM autowriter.user_calibration_notes WHERE project_id='{pid}';")
+    assert sql(call("replayed stale task",revision,[e1])) == "0"
+    assert sql(f"SELECT notes FROM autowriter.user_calibration_notes WHERE project_id='{pid}';") == current
+
+    # A missing/foreign/already absorbed edit makes the entire request a conflict, not a partial save.
+    for ids in (["ffffffff-ffff-ffff-ffff-ffffffffffff"], [e1,e2]):
+        assert sql(call("must not replace notes",current_rev,ids)) == "0"
+    foreign_pid = "f3333333-3333-3333-3333-333333333333"
+    sql(f"INSERT INTO autowriter.projects(id,owner_id,name) VALUES ('{foreign_pid}','{UID}','foreign style'); "
+        f"UPDATE autowriter.style_edits SET project_id='{foreign_pid}' WHERE id='{e3}';")
+    assert sql(call("foreign project edit",current_rev,[e3])) == "0"
+    sql(f"UPDATE autowriter.style_edits SET project_id='{pid}' WHERE id='{e3}'; "
+        f"DELETE FROM autowriter.projects WHERE id='{foreign_pid}';")
+    sql(f"UPDATE autowriter.style_edits SET user_id='ffffffff-ffff-ffff-ffff-ffffffffffff' WHERE id='{e3}';")
+    assert sql(call("foreign edit",current_rev,[e3])) == "0"
+    sql(f"UPDATE autowriter.style_edits SET user_id='{UID}' WHERE id='{e3}';")
+
+    # Inject a failure after the note UPDATE. PostgreSQL must roll back the note and edit together.
+    sql("CREATE FUNCTION autowriter.audit_style_write_failure() RETURNS trigger LANGUAGE plpgsql AS $$ "
+        "BEGIN RAISE EXCEPTION 'synthetic edit failure'; END; $$; "
+        "CREATE TRIGGER audit_style_write_failure BEFORE UPDATE ON autowriter.style_edits "
+        "FOR EACH ROW EXECUTE FUNCTION autowriter.audit_style_write_failure();")
+    failed = subprocess.run(_psql() + ["-tAc",call("must roll back",current_rev,[e3])],capture_output=True,text=True)
+    assert failed.returncode != 0 and "synthetic edit failure" in failed.stderr
+    assert sql(f"SELECT notes FROM autowriter.user_calibration_notes WHERE project_id='{pid}';") == current
+    assert sql(f"SELECT distilled FROM autowriter.style_edits WHERE id='{e3}';") == "f"
+    sql("DROP TRIGGER audit_style_write_failure ON autowriter.style_edits; "
+        "DROP FUNCTION autowriter.audit_style_write_failure();")
+
+    # A no-edit manual save does not absorb pending edits; first-save races also have one winner.
+    assert sql(call("manual notes",current_rev,[])) == "1"
+    assert sql(f"SELECT distilled FROM autowriter.style_edits WHERE id='{e3}';") == "f"
+    sql(f"DELETE FROM autowriter.user_calibration_notes WHERE project_id='{pid}';")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = list(pool.map(lambda note: sql(call(note,None,[])), ["first A","first B"]))
+    assert sorted(first) == ["0","1"], first
+    # NOW() is constant within one transaction. A stale revision must still fail after the first call.
+    sql(f"""DO $test$ DECLARE oldrev timestamptz; newrev timestamptz; n int; BEGIN
+        SELECT updated_at INTO oldrev FROM autowriter.user_calibration_notes WHERE project_id='{pid}';
+        PERFORM * FROM autowriter.deskcore_save_style_cas('{pid}','{UID}','same transaction A',oldrev,ARRAY[]::uuid[]);
+        SELECT updated_at INTO newrev FROM autowriter.user_calibration_notes WHERE project_id='{pid}';
+        IF newrev <= oldrev THEN RAISE EXCEPTION 'revision did not advance'; END IF;
+        SELECT count(*) INTO n FROM autowriter.deskcore_save_style_cas('{pid}','{UID}','stale replay',oldrev,ARRAY[]::uuid[]);
+        IF n <> 0 THEN RAISE EXCEPTION 'same-transaction stale revision accepted'; END IF;
+        PERFORM * FROM autowriter.deskcore_save_style_cas('{pid}','{UID}','same transaction B',newrev,ARRAY[]::uuid[]);
+        IF (SELECT updated_at <= newrev FROM autowriter.user_calibration_notes WHERE project_id='{pid}')
+          THEN RAISE EXCEPTION 'second revision did not advance'; END IF;
+        END; $test$;""")
+    # Simulate a stored revision ahead of the wall clock: a later update still moves forward.
+    sql(f"DELETE FROM autowriter.user_calibration_notes WHERE project_id='{pid}'; "
+        f"INSERT INTO autowriter.user_calibration_notes(project_id,user_id,notes,updated_at) "
+        f"VALUES ('{pid}','{UID}','future revision','2099-01-01T00:00:00Z');")
+    assert sql(call("clock rollback safe","2099-01-01T00:00:00Z",[])) == "1"
+    assert sql(f"SELECT updated_at > '2099-01-01T00:00:00Z'::timestamptz "
+               f"FROM autowriter.user_calibration_notes WHERE project_id='{pid}';") == "t"
+    sig = "autowriter.deskcore_save_style_cas(uuid,uuid,text,timestamptz,uuid[])"
+    for role, expected in [("anon","f"),("authenticated","f"),("service_role","t")]:
+        assert sql(f"SELECT has_function_privilege('{role}','{sig}','EXECUTE');") == expected
+    sql(f"DELETE FROM autowriter.projects WHERE id='{pid}';")
+    print("  ✓ 021: concurrent/stale tasks cannot overwrite notes; only owned pending edits are absorbed; "
+          "note and edits roll back together; first save is atomic; service_role-only RPC")
+    return 0
 
 
 # 历史上出现过、又不在当前基线里的函数签名。基线必须能把它们清干净。

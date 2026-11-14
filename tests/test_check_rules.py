@@ -100,7 +100,7 @@ def full_client(*, memories=None, compiles=None, versions=None):
 
 def answers(**by_qid):
     """{qid: item} → 一个 /judge_draft 的回包工厂(每篇同样的答案)。"""
-    return lambda payload: {"subject_id": payload["subject_id"], "passed": True, "plan": [],
+    return lambda payload: {"subject_id": payload["subject_id"], "passed": True, "hard_ambiguous": [], "plan": [],
                             "detail": {"desk_rules": dict(by_qid)}, "written": len(by_qid), "write_error": None}
 
 
@@ -419,7 +419,7 @@ def test_a_version_whose_rule_questions_all_came_back_unjudged_is_not_kept(wired
     """Jev 回了 200, 但唯一那道硬规则题没判出来: 原来只记个 row["unjudged"], summary 不看它, next_step 照说
     「这次查的规则都守住了」。"""
     qid = qid_of(q_hard())
-    wired.judge = lambda payload: {"subject_id": payload["subject_id"], "passed": True, "plan": [],
+    wired.judge = lambda payload: {"subject_id": payload["subject_id"], "passed": True, "hard_ambiguous": [], "plan": [],
                                    **({"detail": reply(qid)} if reply(qid) is not None else {})}
     out = core.check_rules(full_client(memories=[R_HARD], compiles=[stored(R_HARD, q_hard())]), PROJ, [V1], user_id=ME)
     (v1,) = out["versions"]
@@ -672,7 +672,7 @@ def test_must_fix_is_never_cut_even_past_the_cap(wired):
 
 
 def test_a_reply_with_a_top_level_invalid_reason_is_not_judged(wired):
-    wired.judge = lambda payload: {"subject_id": payload["subject_id"], "passed": True, "plan": [],
+    wired.judge = lambda payload: {"subject_id": payload["subject_id"], "passed": True, "hard_ambiguous": [], "plan": [],
                                    "invalid_reason": "too_short"}
     out = core.check_rules(full_client(memories=[R_HARD], compiles=[stored(R_HARD, q_hard())]), PROJ, [V1], user_id=ME)
     (v1,) = out["versions"]
@@ -995,7 +995,7 @@ def test_a_failed_ledger_write_is_logged_and_counted_but_not_told_to_the_writer(
     events: list[tuple] = []
     monkeypatch.setattr(telemetry, "log_event", lambda event, **kw: events.append((event, kw)))
     qid = qid_of(q_soft())
-    wired.judge = lambda p: {"subject_id": p["subject_id"], "passed": True, "plan": [], **reply,
+    wired.judge = lambda p: {"subject_id": p["subject_id"], "passed": True, "hard_ambiguous": [], "plan": [], **reply,
                              "detail": {"desk_rules": {qid: {"answer": "是", "p": 0.9, "ambiguous": False}}}}
     c = full_client(memories=[R_SOFT], compiles=[stored(R_SOFT, q_soft())], versions=[version(V1), version(V2)])
     with caplog.at_level("WARNING", logger="deskcore"):
@@ -1341,7 +1341,7 @@ def test_unsure_and_unjudged_rows_are_counted_not_listed(wired):
         got = dict(by_qid)
         if payload["subject_id"] == V2:             # 第二篇上只有 lean[3] 和硬约束那条拿不准, 别的守住了
             got.update({qid_of(q(r)): {"answer": "否", "p": 0.95, "ambiguous": False} for r in lean[:3] + kept})
-        return {"subject_id": payload["subject_id"], "passed": True, "plan": [],
+        return {"subject_id": payload["subject_id"], "passed": True, "hard_ambiguous": [], "plan": [],
                 "detail": {"desk_rules": got}, "written": len(got), "write_error": None}
     wired.judge = judge
     out = core.check_rules(full_client(memories=rules, compiles=[stored(r, q(r)) for r in rules],

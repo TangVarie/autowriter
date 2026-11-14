@@ -37,6 +37,12 @@ MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 # 函数名 → (最终形态由哪个文件定义, 说明)
 # 一个函数被多个增量改过时, 写**最后**改它的那个。
 FINAL_SOURCE = {
+    "deskcore_style_revision": (
+        "021_style_distillation_cas.sql", "021: per-update monotonic revision, including same-transaction updates",
+    ),
+    "deskcore_save_style_cas": (
+        "021_style_distillation_cas.sql", "021: atomic calibration revision check and edit acknowledgement",
+    ),
     "deskcore_check_drafts": (
         "019_dedup_gin_first.sql",
         "005 换 3 参 + 包含度, 008 再加 embedding_model 过滤, 019 取候选先走 GIN(签名不变)",

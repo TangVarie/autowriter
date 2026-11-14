@@ -91,7 +91,7 @@ def test_the_block_is_visible_and_says_how_to_use_it():
 
 def test_normalize_keeps_a_trimmed_plan_and_the_counts():
     norm = judge_client._normalize_ok({
-        "passed": False, "hard_fails": [["b", "q", "是", 0.6, "依据句"]],
+        "passed": False, "hard_ambiguous": [], "hard_fails": [["b", "q", "是", 0.6, "依据句"]],
         "plan": [{"kind": "hard", "qid": "q", "p": 0.6, "evidence": "依据句", "definition": "长定义",
                   "instruction": "「题」现在判「是」。依据句：依据句"},
                  {"kind": "hard", "qid": "q2", "instruction": "   "}, "not a dict"],
@@ -351,7 +351,7 @@ def test_a_malformed_ok_body_is_an_error_not_a_perfect_score():
 def test_confident_fixes_past_the_cap_are_not_crowded_out():
     plan = ([{"kind": "hard", "qid": f"u{i}", "p": 0.55, "instruction": f"拿不准 {i}"} for i in range(15)]
             + [{"kind": "hard", "qid": "s", "p": 0.95, "instruction": "有把握的那条"}])
-    norm = judge_client._normalize_ok({"passed": False, "hard_fails": [], "plan": plan, "unjudged": []})
+    norm = judge_client._normalize_ok({"passed": False, "hard_ambiguous": [], "hard_fails": [], "plan": plan, "unjudged": []})
     assert norm["plan"][0]["instruction"] == "有把握的那条" and norm["plan_size"] == 16
     out = core.draft_score(_ok(**norm))
     assert out["fixes"][0] == {"sure": True, "instruction": "有把握的那条"}
@@ -394,9 +394,9 @@ def test_hostnames_are_case_insensitive_but_ids_keep_their_case():
 def test_a_malformed_hard_fail_row_is_an_error_not_a_dropped_fail():
     for row in ({"qid": "x", "p": 0.9}, ["b", "q", "是"], ["b", 1, "是", 0.9], ["b", "q", "是", "0.9"],
                 ["b", "q", "是", True]):
-        body = {"passed": False, "hard_fails": [row], "plan": [], "unjudged": []}
+        body = {"passed": False, "hard_ambiguous": [], "hard_fails": [row], "plan": [], "unjudged": []}
         assert judge_client._normalize_ok(body) is None, row
-    assert judge_client._normalize_ok({"passed": False, "hard_fails": [["b", "q", "是", None]],
+    assert judge_client._normalize_ok({"passed": False, "hard_ambiguous": [], "hard_fails": [["b", "q", "是", None]],
                                        "plan": [], "unjudged": []}) is not None, "没给概率的行是合法的"
 
 
