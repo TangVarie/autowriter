@@ -100,6 +100,28 @@ def _revision_recheck_off():
     core._REVISION_RECHECK_POOL[0] = saved
 
 
+# ── 人感题与暗题的影子判定(deskcore/core.py 的 _shadow_human, 2026-11-15) ──────────────────────────────────────
+# 生产里默认开: 存完档在自己的后台线程里对每一版多发一次 /judge_draft。用例里默认关掉, 理由同上面那个后台复查(用例跑完
+# 之后线程还在往换掉的 judge_client / 假件上发请求)。要测它的用例自己把池子换成就地跑的(tests/test_shadow_human.py)。
+@pytest.fixture(autouse=True)
+def _shadow_human_off():
+    from deskcore import core
+    saved = core._SHADOW_HUMAN_POOL[0]
+    core._SHADOW_HUMAN_POOL[0] = None
+    yield
+    core._SHADOW_HUMAN_POOL[0] = saved
+
+
+# ── 这一场看到了哪几张经验卡(deskcore/core.py 的 _lesson_exposure) / 022 那一列在不在(store) ─────────────────────
+# 都是进程内存: 每条用例从空的开始, 上一条借过的卡、上一条记下的「那一列不在」不串进来。
+@pytest.fixture(autouse=True)
+def _lesson_exposure_clean(monkeypatch):
+    from deskcore import core, store
+    monkeypatch.setattr(core, "_lesson_exposure", {})
+    monkeypatch.setattr(store, "_snapshot_exposure_state", {"missing_until": 0.0, "warned": False})
+    yield
+
+
 # ── 正在跑的选卡(deskcore/core.py 的 _borrows_running, 2026-11-11) ──────────────────────────────────────────
 # 同一个 (项目, brief, 臂) 的选卡还在跑时, 后来的借卡等它、不向馆员发第二次。用例里借卡超时之后那条后台线程常常还没跑完
 # 用例就结束了: 下一条用例同一个项目、同一份 brief 就会并到上一条的选卡上, 自己换上的假馆员一次都没被调到。所以每条用例

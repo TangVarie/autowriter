@@ -486,6 +486,42 @@ def build_rules_request(*, version_id: str, title: str, body: str, project: str,
     return payload
 
 
+# ── 人感题与暗题的影子判定(2026-11-15, 十三项第 7 项)──────────────────────────────────
+# 存档那次(build_draft_request)为了放进 8 秒发的是 judge_paras=never: 人感题库只在段级判, 所以写作台的稿子在账本里
+# 一行人感题、一行暗题的答案都没有。存完档在后台对每一版另发一次: 只带人感题库、逐段全判、答案落账本、run_tag 分开。
+# 用的全是 Jev 现成的参数(banks / judge_paras / write / run_tag), Jev 那边不用改。
+# 账本里这些行的 subject_id 是 ``<versions.id>:p<段号>``(Jev 的老约定), subject_type 还是 aw_version。
+# Jev 的 DEFAULT_DRAFT_BANKS 里的人感题库。Jev 升版本时这里要【手工】跟着改, 没有报错可等: Jev 加新版本时旧文件照例留着
+# (今天 banks/ 里 v0.1 和 v0.2 都在), 这里的请求照样回 200、照样写账本, 只是答的还是旧题库。只有旧文件被删了才看得出来:
+# Jev 回 404, 归成 unavailable(不是 bad_request)。
+HUMAN_BANK_NAME = "human_feel_para_v0.2"
+HUMAN_RUN_TAG = "shadow-human"
+
+
+def build_human_request(*, version_id: str, title: str, body: str, project: str,
+                        category: Optional[str] = None) -> dict:
+    """影子判定的 /judge_draft 请求体: 只判人感题库(暗题在里面), ``judge_paras = "always"`` 逐段全判, 答案按这一版落账本。
+
+    · ``banks`` 只有人感题库: 篇级的 fq / 平台题存档那次已经判过, 这里不重复花钱; 没有篇级题库, 所以没有硬伤可言,
+      回包里的 passed 没有意义, 调用方不读;
+    · ``return_rows = false``, 而且调用方走 ``_tool_call``(回包里的 ledger_rows 一律摘掉): 暗题的行不回写作台。
+    """
+    payload: dict[str, Any] = {
+        "subject_id": str(version_id), "subject_type": SUBJECT_TYPE, "project": project,
+        "title": title or "", "body": body or "", "banks": [HUMAN_BANK_NAME],
+        "judge_paras": "always", "write": True, "run_tag": HUMAN_RUN_TAG, "return_rows": False,
+    }
+    if category:
+        payload["category"] = category
+    return payload
+
+
+def judge_human_shadow(payload: dict, *, timeout: Optional[float] = None) -> dict:
+    """发一次影子判定, **永不抛**; 形状同 ``_tool_call``。只许后台线程调(读超时 ``config.SHADOW_HUMAN_TIMEOUT_SEC``)。"""
+    t = float(timeout if timeout is not None else config.SHADOW_HUMAN_TIMEOUT_SEC)
+    return _tool_call("POST", "/judge_draft", json_body=payload, timeout=t, shape=_draft_shape_problem)
+
+
 def judge_comment_tool(path: str, payload: dict, *, timeout: Optional[float] = None) -> dict:
     """Read-only comment tooling; candidate comments never become published ledger rows."""
     if path not in ("/comment_repair_plan_for", "/judge_thread"):

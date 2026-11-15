@@ -1863,6 +1863,9 @@ def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list
         except Exception:                               # noqa: BLE001 — 臂只是附带记一下
             arm, arm_source = None, None
         check_id = str(uuid.uuid4())
+        # 这一场看到了哪几张卡、哪几条规律(2026-11-15, 见 _lesson_exposure 那段)。不知道(None)就不带这一列: 行和原来
+        # 一模一样; 022 没跑时 store 那边去掉这一列再写一次(只警告一次)。
+        exposure = lesson_exposure(project_id, user_id)
         rows = []
         for i, d in enumerate(drafts):
             title = (d.get("title") or "").strip()
@@ -1874,7 +1877,8 @@ def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list
             rows.append({"project_id": project_id, "user_id": user_id, "check_id": check_id,
                          "title": title, "body": body, "angle_key": key,
                          "text_fp": _draft_text_fp(title, body),
-                         "status": status.get(i), "flywheel_arm": arm, "flywheel_arm_source": arm_source})
+                         "status": status.get(i), "flywheel_arm": arm, "flywheel_arm_source": arm_source,
+                         **({LESSON_EXPOSURE_KEY: exposure} if exposure is not None else {})})
         return store.insert_draft_snapshots(client, rows)
     except Exception:                                   # noqa: BLE001 — 查重的判定已经算好了, 记不上只少一份底稿
         logger.warning("check_drafts: 记底稿失败 (project=%s), 判定照常返回; 这一批发出去以后认不回写作台, 除非存了档",
@@ -3140,6 +3144,18 @@ _REVISION_RECHECK_SLOTS = threading.BoundedSemaphore(4)
 _RECHECK_MAX_RULE_IDS = 12
 
 
+# 存档那一行指标的 meta 现在有两个后台活往回写(改稿复查、人感题影子判定, 各在各的线程上)。两边拿的是同一个 meta 对象,
+# 写的时候握着这把锁、把自己那一块放进去再整份写回: 谁后写都带着先写的那一块, 不会互相盖掉。
+_METRICS_META_LOCK = threading.Lock()
+
+
+def _merge_metrics_block(client, row_id: str, meta: dict, key: str, block: dict) -> None:
+    """把 ``block`` 放进 ``meta[key]``(就地改), 整份写回 batch_metrics 那一行。异常原样上抛, 调用方自己吞。"""
+    with _METRICS_META_LOCK:
+        meta[key] = block
+        store.update_commit_metrics_meta(client, row_id, dict(meta))
+
+
 def _recheck_digest(results: list[dict]) -> dict:
     """几次 check_rules 的回包 → meta 里那一小块。只留状态、条数、每版的计数和没守住的规则 id, 不留稿子、规则原文和
     Jev 指出的句子(同 batch_metrics「只留数, 不留稿子」)。"""
@@ -3195,7 +3211,7 @@ def _revision_rule_recheck(client, project_id: str, user_id, version_ids: list[s
     block.update(revised=len(version_ids), elapsed_ms=_ms_since(started),
                  at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     try:
-        store.update_commit_metrics_meta(client, row_id, {**(meta or {}), "revision_rule_recheck": block})
+        _merge_metrics_block(client, row_id, meta if isinstance(meta, dict) else {}, "revision_rule_recheck", block)
     except Exception:                                   # noqa: BLE001
         logger.warning("改稿规则复查的结果没写回 batch_metrics(project=%s, row=%s)", project_id, row_id, exc_info=True)
     else:
@@ -3213,7 +3229,8 @@ def _schedule_revision_recheck(client, project_id: str, user_id, out: dict, tact
         return False
     try:
         fut = _bounded_submit(pool, _REVISION_RECHECK_SLOTS, _revision_rule_recheck,
-                              client, project_id, user_id, vids, tactic, row_id, dict(meta or {}))
+                              client, project_id, user_id, vids, tactic, row_id,
+                              meta if isinstance(meta, dict) else {})
     except Exception:                                   # noqa: BLE001 — 池子关了(进程在退)之类, 不影响存档
         logger.warning("改稿规则复查没排上(project=%s)", project_id, exc_info=True)
         return False
@@ -3347,6 +3364,137 @@ def _schedule_rule_sweep(client, project_id: str, user_id, out: dict) -> bool:
     except Exception:                                   # noqa: BLE001 — 池子关了(进程在退)之类, 不影响存档
         logger.warning("规则补查没排上(project=%s)", project_id, exc_info=True)
         return False
+
+
+# ── 人感题与暗题的影子判定(2026-11-15, 十三项第 7 项) ─────────────────────────────────────────────────
+# 存档那次判定发的是 judge_paras=never(要放进 8 秒): 人感题库只在段级判, 暗题只在人感题库里, 所以写作台的稿子在账本里
+# 一行人感题、一行暗题的答案都没有 —— 「人感和结果有没有关系」拿写作台的数据永远答不了。
+# 现在每次存完档(真存进去了版本才排), 在后台对这一批存进去的每一版(新稿和改过重存的; 被拒的、没建成版本的、正文是空的
+# 不发)另发一次 /judge_draft: 只带人感题库、逐段全判、答案由 Jev 写账本, run_tag=shadow-human(judge_client.build_human_request)。
+#   · 写手和模型都看不到: 不进回包、不改 next_step、不影响参考分和任何一句话。回来的东西只摘成一小块计数, 并进这次存档
+#     那一行 batch_metrics 的 meta.shadow_human(几版、各种结局各几版、Jev 调了几次、账本写了几行、几版账本没写进去);
+#     Jev 的回包本身(修改单、分段答案)用完就丢, 不留、不记日志。
+#   · 发之前和存档那次同一套口径: 项目号 / 品类从 tv_project_map 来(没接的项目不发 —— 数据出境口径下认不出项目就不发),
+#     调用方自带的 version_id 先按本项目核过(_judge_owned_only)。处方药没清关的项目 Jev 回 403, 记 policy_blocked。
+#   · 自己一个工作线程(不占改稿复查 / 规则补查那一个: 一批十篇逐段判要几分钟), 名额 SHADOW_HUMAN_QUEUE 个、从投进去
+#     占到跑完: 1 批在跑、其余排着, 排满了那一批不跑(记日志)。名额不能照抄改稿复查的 4 个: 那边一件活几秒, 这边一批
+#     几分钟, 几个写手存了稿又重存几版就超过 4 批了, 而排不上的没有补判(账本里就缺忙的那几个小时)。排着的一批只是
+#     最多 20 篇稿子的文字, 64 批占不了多少内存。一批最多 SHADOW_HUMAN_MAX_VERSIONS 版, 多的记进 skipped。
+#     进程重启丢掉排着的: 那一行就没有 shadow_human 这个键 = 没判, 不是判过了。
+#   · Jev 慢的时候不追着发: 一版读超时了, 这一批剩下的不发(记进 skipped, stopped_early=true); 连着两版 unavailable
+#     (key 不对 / 服务没起 / 题库名对不上, 换一版也是同一个结果)也停。超时的那一次 Jev 那边多半还在逐段跑, 接着发
+#     只会在一个已经慢的 Jev 上叠出最多 20 个段级循环, 跟写手等着的那次 8 秒判定抢, 这个线程还要被占住近一个小时。
+#   · 花费: 一版多一次请求, Jev 那边每段至少一次模型调用(正文每个非空行算一段, # 开头的不算), 实数在这一块的 calls 里。
+#   · 默认开(config.SHADOW_HUMAN), DESKCORE_SHADOW_HUMAN=0 关; 没配判定服务、测试里池子是 None(tests/conftest.py)时
+#     什么都不做。任何异常只记日志, 绝不冒泡到存档。
+SHADOW_HUMAN_MAX_VERSIONS = 20
+_SHADOW_HUMAN_POOL: list = [cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="shadow-human")]
+SHADOW_HUMAN_QUEUE = 64
+_SHADOW_HUMAN_SLOTS = threading.BoundedSemaphore(SHADOW_HUMAN_QUEUE)
+
+
+def _shadow_human_on() -> bool:
+    return bool(config.SHADOW_HUMAN) and judge_client.configured()
+
+
+def _shadow_human(client, project_id: str, user_id, targets: list[dict], row_id: str | None, meta: dict) -> dict:
+    """后台跑(见上面那段): 这一批的每一版发一次人感题的影子判定, 计数并进 meta 写回那一行。**不抛**; 回那一块(测试用)。
+
+    ``status``: ``judged`` 至少一版判回来了 | ``none_judged`` 发了、一版都没判回来 | 没发的原因(``not_configured`` 项目没接
+    tv_project_map、``error`` 查项目对照失败 / 这一步自己出错) | ``nothing_to_judge``。"""
+    started = time.monotonic()
+    block: dict = {"status": "nothing_to_judge", "versions": len(targets), "sent": 0, "ok": 0, "statuses": {},
+                   "calls": 0, "written": 0, "ledger_errors": 0, "skipped": 0}
+    try:
+        # 排它的 commit_drafts 过过闸了; 这里是另一个线程、晚一会儿才跑, 发之前自己再过一次(同一个调用者, 同 _rule_sweep)
+        assert_project_access(client, project_id, user_id=user_id)
+        ctx = _judge_project_context(client, project_id)
+        if ctx["project"] is None:
+            block["status"] = str(ctx.get("status") or judge_client.JUDGE_ERROR)
+        else:
+            send, not_ours, failed = _judge_owned_only(client, project_id, targets)
+            block["skipped"] = len(not_ours) + len(failed) + max(0, len(send) - SHADOW_HUMAN_MAX_VERSIONS)
+            todo = send[:SHADOW_HUMAN_MAX_VERSIONS]
+            unavailable_run = 0
+            for i, t in enumerate(todo):
+                res = judge_client.judge_human_shadow(judge_client.build_human_request(
+                    version_id=t["version_id"], title=t["title"], body=t["body"],
+                    project=ctx["project"], category=ctx["category"]))
+                status = str(res.get("judge_status") or judge_client.JUDGE_ERROR)
+                block["sent"] += 1
+                block["statuses"][status] = block["statuses"].get(status, 0) + 1
+                resp = res.get("response") if status == judge_client.JUDGE_OK else None
+                if not isinstance(resp, dict):
+                    # Jev 慢 / 不在的时候不追着发(见上面那段): 剩下的记进 skipped
+                    unavailable_run = unavailable_run + 1 if status == judge_client.JUDGE_UNAVAILABLE else 0
+                    if status == judge_client.JUDGE_TIMEOUT or unavailable_run >= 2:
+                        left = len(todo) - i - 1
+                        if left:
+                            block["skipped"] += left
+                            block["stopped_early"] = True
+                        break
+                    continue
+                unavailable_run = 0
+                block["ok"] += 1
+                calls, written = resp.get("calls"), resp.get("written")
+                if isinstance(calls, int) and not isinstance(calls, bool):
+                    block["calls"] += calls
+                if isinstance(written, int) and not isinstance(written, bool):
+                    block["written"] += written
+                # 判是判出来了、账本没(全)写进去: 同存档那次的口径(judge_client._normalize_ok 的 ledger_ok)
+                if resp.get("write_error") not in (None, "", [], {}) or not isinstance(written, int) \
+                        or isinstance(written, bool):
+                    block["ledger_errors"] += 1
+            if block["sent"]:
+                block["status"] = "judged" if block["ok"] else "none_judged"
+    except Exception as exc:                            # noqa: BLE001 — 只给账本攒数的后台活, 绝不冒泡
+        logger.warning("人感题影子判定没跑完(project=%s, versions=%d)", project_id, len(targets), exc_info=True)
+        block.update(status="error", error=mask_secrets(f"{type(exc).__name__}: {exc}")[:_JUDGE_BLOCK_TEXT_MAX])
+    block.update(elapsed_ms=_ms_since(started), at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    if block["ledger_errors"] or (block["sent"] and not block["ok"]):
+        logger.warning("人感题影子判定(project=%s): 发了 %d 版, 判回来 %d 版, %d 版账本没写进去, 结局 %s", project_id,
+                       block["sent"], block["ok"], block["ledger_errors"], block["statuses"])
+    else:
+        logger.info("人感题影子判定(project=%s): %d 版, status=%s, 判回来 %d 版, Jev 调用 %d 次, 账本 %d 行, %dms",
+                    project_id, len(targets), block["status"], block["ok"], block["calls"], block["written"],
+                    block["elapsed_ms"])
+    if row_id:
+        try:
+            _merge_metrics_block(client, row_id, meta if isinstance(meta, dict) else {}, "shadow_human", block)
+        except Exception:                               # noqa: BLE001
+            logger.warning("人感题影子判定的计数没写回 batch_metrics(project=%s, row=%s)", project_id, row_id,
+                           exc_info=True)
+    return block
+
+
+def _shadow_human_job(client, project_id: str, user_id, targets: list[dict], row_id, meta: dict) -> dict:
+    """池子里跑的那一层: 把收数的字典摘掉再跑(同 _rule_sweep_job): 影子判定不是哪一次工具调用, 它记的数不进排它的
+    那次 score_drafts 的那一行。"""
+    return calllog.collecting(None, _shadow_human, client, project_id, user_id, targets, row_id, meta)
+
+
+def _schedule_shadow_human(client, project_id: str, user_id, targets: list[dict], row_id: str | None,
+                           meta: dict) -> bool:
+    """这次真存进去了版本(``targets`` = 存档那次判定要判的那几版: 有 versions 行、正文不空)才在后台排一次。关着 / 没配判定
+    服务 / 排不上就跳过。指标那一行没插成也照跑(账本才是目的, 那一行只是计数)。不抛; 回排上了没有。"""
+    try:
+        pool = _SHADOW_HUMAN_POOL[0]
+        if not targets or pool is None or not _shadow_human_on():
+            return False
+        work = [{"index": t.get("index"), "version_id": str(t["version_id"]),
+                 "caller_supplied": bool(t.get("caller_supplied")),
+                 "title": t.get("title") or "", "body": t.get("body") or ""} for t in targets if t.get("version_id")]
+        if not work:
+            return False
+        fut = _bounded_submit(pool, _SHADOW_HUMAN_SLOTS, _shadow_human_job, client, project_id, user_id, work, row_id,
+                              meta if isinstance(meta, dict) else {})
+    except Exception:                                   # noqa: BLE001 — 池子关了(进程在退)之类, 不影响存档
+        logger.warning("人感题影子判定没排上(project=%s)", project_id, exc_info=True)
+        return False
+    if fut is None:
+        logger.warning("人感题影子判定排队已满, 这一批不判(project=%s, versions=%d)", project_id, len(targets))
+        return False
+    return True
 
 
 COMMENT_TOOL_NOTE = ("评论只做参考判定，不入稿件库。judge_status 不是 ok 时不能声称检查通过；"
@@ -6118,6 +6266,9 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
             ]
             # 这批落在哪个飞轮臂 (docs/28 §7.4): 这场写作借卡时定下的那个, 对照组靠它圈出来
             arm, arm_source, arm_check, patterns_shown = batch_arm(project_id, user_id, from_brief=flywheel_arm)
+            # 这一场看到了哪几张卡、哪几条规律(2026-11-15, 见 _lesson_exposure 那段): 只进新建的 batch 的 params
+            # (null = 不知道; 改稿挂的旧 batch 不动, 那一批记的还是它自己那一场的)。不进 batch_metrics(那里只有数)。
+            exposure = lesson_exposure(project_id, user_id)
             # 模型传回的臂认得出、却没被采用 = 服务端没给过这场这个臂 (corrected), 或者重启过核对不了 (unverified):
             # 都记服务端最近一次借卡的臂 (W-31, 见 batch_arm)。传回的那个留一份(batch.params + batch_metrics.meta),
             # 核对不了的另标 flywheel_arm_unverified, 分析对照组时剔掉; 回包里也说一句。改稿挂的旧 batch 同样标上
@@ -6153,7 +6304,8 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
                 minted = store.mint_draft_identity(
                     client, project_id, str(user_id), "", to_mint,
                     batch_params={"source": "deskcore", "flywheel_arm": arm, "flywheel_arm_source": arm_source,
-                                  "flywheel_patterns_shown": patterns_shown, **arm_flags, **parts})
+                                  "flywheel_patterns_shown": patterns_shown,
+                                  LESSON_EXPOSURE_KEY: exposure, **arm_flags, **parts})
             identity_error = minted.get("error")
             lap = _lap(commit_parts, "mint", lap)
 
@@ -6530,6 +6682,7 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     judge_budget = min(judge_client.timeout_sec(),
                        config.COMMIT_RESPONSE_BUDGET_SEC - (judge_started - started)
                        - _ISOLATION_TIMEOUT_SEC)
+    targets: list[dict] = []
     try:
         targets, skipped = _judge_targets(drafts, titles, bodies, inserted_idx, replace,
                                           replaced_ok, minted_ids, minted_ok)
@@ -6564,8 +6717,12 @@ def commit_drafts(client, project_id: str, drafts: list[dict],
     row_id, metrics_meta = _record_commit_metrics(client, project_id, user_id, drafts, out, flywheel=arm_meta,
                                                   checks=post_meta, commit_parts=commit_parts, judge_ops=judge_ops,
                                                   judge_ledger=judge_ledger, skill_versions=skill_versions)
+    # 下面两个后台活各往这一行的 meta 里并一小块: 给它们同一个对象(见 _merge_metrics_block)
+    metrics_meta = dict(metrics_meta or {})
     # 改过重存的那几版在后台按编译好的规则复查一次, 结果只进这一行指标(AU-F07, 见 _revision_rule_recheck 上面那段)
     _schedule_revision_recheck(client, project_id, user_id, out, tactic, row_id, metrics_meta)
+    # 这一批存进去的每一版在后台判一次人感题和暗题, 答案只落账本(见 _shadow_human 上面那段)。不进回包
+    _schedule_shadow_human(client, project_id, user_id, targets, row_id, metrics_meta)
     # 排在它后面: 这个项目还没有规则题答案的旧稿补查一轮(见 _rule_sweep 上面那段)。不进回包, 不写这一行指标
     _schedule_rule_sweep(client, project_id, user_id, out)
     return out
@@ -7319,6 +7476,8 @@ MIGRATION_019_PROBE_SQL = (
 # 020 给 tv_note_links 加回流闸的四列(origin / gate / gate_reasons / gate_at)。列探得到。
 MIGRATION_TV_LINK_GATE = "020_tv_link_gate.sql"
 MIGRATION_STYLE_CAS = "021_style_distillation_cas.sql"
+# 022 给 draft_snapshots 加 lesson_exposure(这次查重的那一场看到了哪几张经验卡、哪几条规律)。列探得到。
+MIGRATION_LESSON_EXPOSURE = "022_lesson_exposure.sql"
 MIGRATION_016_PROBE_SQL = (
     "select p.prosrc like '%v_notes_vanished%' as skips_vanished, "
     "to_regclass('truth_vault.v_notes_vanished') is not null as view_present "
@@ -7754,6 +7913,15 @@ def migration_state(client) -> dict:
          "FROM pg_trigger WHERE tgrelid='autowriter.user_calibration_notes'::regclass "
          "AND tgname='deskcore_user_calib_updated_at'; 应调用 deskcore_style_revision()",
          "触发器必须来自 021, 每次更新都前进; 缺席会使同事务内的旧版本仍可能被接受")
+
+    # ── 022: 查重底稿上的曝光记录(这一场看到了哪几张经验卡、哪几条规律) ──
+    state, note = _probe_ok(lambda: client.table("draft_snapshots")
+                            .select("id, lesson_exposure").limit(1).execute(),
+                            predicate=store.schema_object_missing)
+    _add(MIGRATION_LESSON_EXPOSURE, "draft_snapshots 的 lesson_exposure 列", state, note,
+         "可降级: check_drafts 记底稿时发现没有这一列就去掉它再写一次(服务日志里警告一次), 底稿和 022 之前一模一样; "
+         "tv-sync 读底稿退回原来那几列。存档的批次照样在 batches.params 里记, 只有「只查了重、没存档就发出去」的稿子"
+         "转正时带不上这一场看到了哪几张卡。跑了之后最多十分钟自动用上, 不用重新部署")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑
@@ -10647,6 +10815,85 @@ def _lessons_meta(project_id, user_id) -> dict:
             "shown_max": max(n for _at, n, _status in recs), "statuses": statuses}
 
 
+# 2026-11-15(十三项第 3 项): 这一场【看到了哪几张卡、哪几条规律】。上面那两笔只有条数, 「哪张卡跟哪批稿子有关」答不了,
+# 事后也补不回来(哪一场拿到了哪几张, 只有借卡那一刻知道)。同一个位置(_borrow_for_brief_bounded 的 _shown: 简报 / 补借
+# 实际带出去的那一份)再记一条 (时刻, 卡的 source_note_id, 规律的标识), 留 _ARM_REPORT_TTL 之内的。全在服务端: 模型不用
+# 传回任何东西, 协议、skill、工具参数都没动。
+#   · 查重时(_record_snapshots)写到这次的每行底稿上(draft_snapshots.lesson_exposure, migrations/022; 没跑 022 就不带
+#     这一列, 底稿和原来一样写);
+#   · 存档时(commit_drafts)写进新建的 batch 的 params.lesson_exposure(JSONB, 不用迁移); 底稿转正的 batch 从底稿那一列带过去。
+#   · 存档那一行指标(batch_metrics.meta.flywheel_lessons)照旧只有数, 不放 id。
+# 它是什么、不是什么(docs/deskcore.md §3.33):
+#   · 是【曝光】: 这个 (项目, 身份) 在这一批之前 12 小时里拿到过的卡和规律的并集。不是「这篇稿子用了这张卡」的证明 ——
+#     模型拿到卡之后用没用、用了哪张, 服务端不知道;
+#   · 团队共用一个身份、12 小时里同一个项目开了几场时, 几场拿到的卡并在一起, 分不出这一批是哪一场的(同 flywheel_lessons);
+#   · 进程内存: 借卡之后进程重启过, 这一批记 null(不知道), 不是「没看到卡」。空列表才是「借过、一张都没拿到」。
+LESSON_EXPOSURE_KEY = "lesson_exposure"
+_EXPOSURE_MAX_CARDS = 40
+_EXPOSURE_MAX_PATTERNS = 20
+_EXPOSURE_ID_MAX = 80
+_lesson_exposure: dict[tuple[str, str], list[tuple[datetime, tuple[str, ...], tuple[str, ...]]]] = {}
+
+
+def _pattern_key(p) -> str | None:
+    """一条规律的标识: 馆员给了 ``id`` 就用它; 没给就用规律文字(label + instruction)的短哈希, 前面带 ``h:``。"""
+    if not isinstance(p, dict):
+        return None
+    pid = p.get("id")
+    if isinstance(pid, (str, int)) and not isinstance(pid, bool) and str(pid).strip():
+        return str(pid).strip()[:_EXPOSURE_ID_MAX]
+    text = "\x1f".join(str(p.get(k) or "").strip() for k in ("label", "instruction"))
+    if not text.strip("\x1f"):
+        return None
+    return "h:" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _note_lesson_exposure(project_id, user_id, out: dict) -> None:
+    """借卡交出去之后记一条: 这一次带出去的卡的 source_note_id 和规律的标识(去重、保持顺序)。只写进程内存。**不抛**。"""
+    try:
+        now = _utcnow()
+        key = (str(project_id), str(user_id or ""))
+        cards = tuple(dict.fromkeys(
+            str(c["source_note_id"]).strip()[:_EXPOSURE_ID_MAX] for c in out.get("lessons") or []
+            if isinstance(c, dict) and c.get("source_note_id") not in (None, "") and str(c["source_note_id"]).strip()))
+        patterns = tuple(dict.fromkeys(k for k in map(_pattern_key, out.get("validated_patterns") or []) if k))
+        with _borrowed_arms_lock:
+            kept = [r for r in _lesson_exposure.get(key, ()) if now - r[0] <= _ARM_REPORT_TTL]
+            _lesson_exposure[key] = kept + [(now, cards, patterns)]
+    except Exception:                                   # noqa: BLE001 — 只是攒一份记录, 不能碰借卡
+        logger.debug("没记下这次借卡带出去的是哪几张卡(project=%s)", project_id, exc_info=True)
+
+
+def lesson_exposure(project_id, user_id) -> dict | None:
+    """这个 (项目, 身份) 近 12 小时拿到过的卡和规律(见上面那段)。没有记录(没借过 / 进程重启过)回 None = 不知道。
+
+    ``{"cards": [source_note_id…], "patterns": [规律标识…], "borrows": 几次借卡, "latest": {"cards": k, "patterns": m},
+    "first_at", "last_at"}``: 两个列表是几次借卡的并集, 最近一次的排前面(去过重), 所以 ``cards`` 的前 k 个、``patterns``
+    的前 m 个正好是【最近一次借卡】带出去的 —— 共用一个身份的几场并在一起之后, 这是唯一还分得出来的一层, 只有这一刻
+    知道。超过上限截掉的带 ``truncated: true``。只有 id 和数, 没有卡的文字。**不抛**。"""
+    try:
+        now = _utcnow()
+        with _borrowed_arms_lock:
+            recs = [r for r in _lesson_exposure.get((str(project_id), str(user_id or "")), ())
+                    if now - r[0] <= _ARM_REPORT_TTL]
+        if not recs:
+            return None
+        cards = list(dict.fromkeys(c for _at, cs, _ps in reversed(recs) for c in cs))
+        patterns = list(dict.fromkeys(k for _at, _cs, ps in reversed(recs) for k in ps))
+        out = {"cards": cards[:_EXPOSURE_MAX_CARDS], "patterns": patterns[:_EXPOSURE_MAX_PATTERNS],
+               "borrows": len(recs),
+               "latest": {"cards": min(len(recs[-1][1]), _EXPOSURE_MAX_CARDS),
+                          "patterns": min(len(recs[-1][2]), _EXPOSURE_MAX_PATTERNS)},
+               "first_at": recs[0][0].isoformat(timespec="seconds"),
+               "last_at": recs[-1][0].isoformat(timespec="seconds")}
+        if len(cards) > _EXPOSURE_MAX_CARDS or len(patterns) > _EXPOSURE_MAX_PATTERNS:
+            out["truncated"] = True
+        return out
+    except Exception:                                   # noqa: BLE001 — 附带的记录, 出错就是不知道
+        logger.debug("这一场看到了哪几张卡没读出来(project=%s)", project_id, exc_info=True)
+        return None
+
+
 def _shown_for(key: tuple[str, str], arm: str, issued: dict[str, datetime]) -> int | None:
     """这个臂发出去时实际给了几条规律。最近一次发臂还没记上(时刻和 issued 里的对不上 / 没记)就是不知道, 回 None;
     _ARM_REPORT_TTL 之内记过几次、条数不一样也是不知道(复审: 共用身份的几场叠在一起, 分不出这一批是哪一场的), 回 None。
@@ -10940,6 +11187,8 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
         _note_patterns_shown(project.get("id"), user_id, arm, len(out.get("validated_patterns") or []), carry=carry)
         # 这一次实际带出去几张卡(超时 = 0), 给存档那一行指标(A3)
         _note_lessons_shown(project.get("id"), user_id, out, status=status)
+        # 是哪几张卡、哪几条规律(2026-11-15): 查重 / 存档时写到底稿和 batch 上(见 _lesson_exposure 那段)
+        _note_lesson_exposure(project.get("id"), user_id, out)
         note = _paid_boost_note(out.get("lessons"))
         if note:
             out["paid_boost_note"] = note               # 有投过流的帖的卡: 叫模型把卡上那一句转告用户(见常量)
@@ -11711,6 +11960,9 @@ def _snapshot_groups(rows: list[dict]) -> dict[str, dict]:
                                "angle_key": None, "key_user": None, "key_checked_at": None, "user_id": None,
                                "ok": False, "notes": []}
         g["ids"].append(str(r["id"]))
+        # 看到了哪几张卡(022 的那一列): 读得到这一列才带这个键; 取最早一次有记录的(同臂: 那时这篇就写出来了)
+        if LESSON_EXPOSURE_KEY in r and not isinstance(g.get(LESSON_EXPOSURE_KEY), dict):
+            g[LESSON_EXPOSURE_KEY] = r[LESSON_EXPOSURE_KEY] if isinstance(r[LESSON_EXPOSURE_KEY], dict) else None
         g["title"], g["body"] = r.get("title") or "", r.get("body") or ""
         g["user_id"] = r.get("user_id") or g["user_id"]
         g["ok"] = g["ok"] or r.get("status") in ("pass", "warn", None)
@@ -11901,6 +12153,11 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
             if first.get("flywheel_arm") in FLYWHEEL_ARMS:
                 params.update(flywheel_arm=first["flywheel_arm"],
                               flywheel_arm_source=first.get("flywheel_arm_source") or "recomputed")
+            # 这一轮查重时看到了哪几张卡(2026-11-15): 底稿那一列读得到就带过来(null = 那次查重时不知道); 022 没跑、
+            # 读不到那一列就没有这个键
+            seen = [g[LESSON_EXPOSURE_KEY] for g in gs if LESSON_EXPOSURE_KEY in g]
+            if seen:
+                params[LESSON_EXPOSURE_KEY] = next((e for e in seen if isinstance(e, dict)), None)
             minted = store.mint_draft_identity(
                 client, project_id, str(first.get("writer") or owner), "",
                 [{"version_id": g["version_id"], "title": g["title"], "body": g["body"], "keywords": [],

@@ -14,6 +14,8 @@
 > - **`review_drafts` / `export_drafts` 两个工具撤了**：定稿由写手贴进飞书，发布后 `tv-sync` 按内容对回来（core 里的函数保留，不再暴露给模型）。
 > - 写评论按链接：**`comments_for(link)`** 从 TV 取帖子、已有评论、本项目评论规则和默认评论位，写完 **`score_comments`** 整组判一次。评论规则不只认「评论区：」开头：开头那一句说的是评论、或存的检查查评论的也算（2026-11-11，`docs/deskcore.md` §3.24）；评论位是四种评论，一组不止四条时其余的不带 slot。`comment_repair_plan_for` / `judge_thread` 不再是 MCP 工具。
 
+> **2026-11-15 · 十三项里写作台的两项**：① 每批稿子写之前看到了哪几张经验卡、哪几条规律，服务端记在 `batches.params.lesson_exposure` 和查重底稿上（`migrations/022_lesson_exposure.sql`，先后都行；`cli lesson-exposure` 读数）。它是曝光记录，不是归因。② 存完档在后台给每一版判一次人感题和暗题，答案只落 TV 账本（`run_tag=shadow-human`），写手看不到；默认开，每版多一次 `/judge_draft`、每段至少一次 Jev 调用，`DESKCORE_SHADOW_HUMAN=0` 关。见 `docs/deskcore.md` §3.33 / §3.34。协议和 skill 没变。
+
 > **2026-11-12 · 回流闸 v1**：发出去的帖大多不是在写作台里写的。tv-sync 每晚最后一步给每篇已发的帖记来源和「能不能拿来学」的结论（`postgate.py`，`tv_note_links` 的四列，`migrations/020`；只分拣、不拦，不调 Jev）。查重和「最近发出去」的标题照旧全收，配比和起量计数照旧按 `priors.is_clean`；只有学的那一路（简报的 working 标题、发牌卡上的起量帖参照、TV 馆员的教训卡）看结论。写作台读的一方在开关 `config.RETURN_GATE_ENFORCE` 后面，**代码默认关**：关着、020 没跑、或者那几列读不出来，简报和发牌同今天一字不差。同一个开关还让同一个 TV 项目对着的几个写作台项目看得到彼此发出去的标题。补录副本不再当正负例（不看开关）。写手那边什么都不用做，协议没动。见 `docs/deskcore.md` §3.30、runbook §1.16。
 
 > **2026-11-12**：`score_drafts` 的回包带 **`view`** —— 这批稿子排好版的页面的链接（一篇一行、左边笔记右边评论、逐篇可复制；改稿重存后刷新就是最新一版）。页面由服务端拿存下的稿子拼（`viewpage.py`，`GET /v/{令牌}`：令牌带签名、14 天过期，这是健康检查之外唯一不带钥匙的路径），写手那边的模型不用写 HTML。有交付模板的项目那一句接在 `delivery.text` 最后一行；没有模板的项目 `next_step` 里另给一份默认的排法。不用配任何东西；`DESKCORE_VIEW_PAGE=0` 关掉。链接和令牌不进日志、不进库。见 `docs/deskcore.md` §3.29。
@@ -65,6 +67,7 @@ deskcore/
 ├── store.py        db.py 里【没有的】查询形状(共享层规则/带向量的正负例/四张新表)
 ├── fingerprint.py  指纹与判定, 【只用标准库】
 ├── delivery.py     交付版式模板的校验与拼装(纯函数, 2026-10-20, 见 docs/deskcore.md §3.9)
+├── exposurereport.py  经验卡的曝光读数: 每张卡 / 每条规律被几批稿子看到过、那几批发出去几篇、几篇起量(纯函数, 只有计数, 2026-11-15, §3.33)
 ├── postgate.py     回流闸 v1: 已发帖的来源 / 结论 / 原因的名字, 判的先后, 哪个原因挡哪一路(纯函数, 2026-11-12, 见 docs/deskcore.md §3.30)
 ├── viewpage.py     一批稿子排好版的页面: 令牌、签名的钥匙、对外地址、HTML(纯函数, 2026-11-12, 见 docs/deskcore.md §3.29)
 ├── rulecheck.py    带 check 的规则逐篇代码查(纯函数, 2026-10-20, 见 docs/deskcore.md §3.10)
@@ -119,6 +122,7 @@ n-gram bottom-k 截断的内容稳定性、正例多样性上限、`angle_key` �
 | `tv-map add --tv-project SPX_phase1 --project <uuid> --ingest-target` / `tv-map list` | TV 项目 ↔ 写作台项目的对照表；每个 TV 项目只能有一个补录目标 |
 | `tv-sync --all [--dry-run] [--write-tv] [--since …] [--rematch]` | 把 TV 的笔记按内容对到写作台的版本，对不上的补进指纹库（不过闸、按全文幂等）。先 `--dry-run` 看数；`--write-tv` 才回填 TV 的 `source_autowriter_*`。**每天跑一次**。对不上的那一行（`unmatched` / `ingested`）的 `score` 记这篇帖和写作台的稿子最像到什么程度，用来分开「在别处写的」和「拿写作台的稿子改的」（只是读数，`docs/deskcore.md` §3.28） |
 | `tv-resolve --note <note_id> --ingest` | `tv-sync` 报「分不出」的那几条，人看过之后落判定：目前只有一种，「对不上，按 TV 的正文补录」。对照改成 `ingested`，原候选保留。**不硬猜**、也**不提供「指定某一版」**（`match_kind` 没有 manual 一档，硬记成 `body_exact` 是撒谎） |
+| `lesson-exposure --days 90 [--project <uuid>] [--json]` | **只读。** 经验卡的曝光读数（2026-11-15）：每张卡、每条已验证规律被几批稿子看到过，那几批里发出去几篇、几篇起量；只有 id 和计数。是曝光不是归因，各行不能相加（`docs/deskcore.md` §3.33） |
 | `draw-report --days 28 [--project <uuid>] [--json]` | **只读。** 发牌的读数：来源 × 项目 × 周的写了 / 发了 / 留着 / 撞车、试新牌对比和健康度；2026-11-11 起多三项「牌面对不对得上」（牌面的内容形式、情绪杠杆对发出去那篇的 TV 标签，牌面的标题句式对 Jev 答的「标题是不是问句」），每个比例旁边带碰巧一样的比例（`docs/deskcore.md` §3.28）。只有计数和比率，不取标题和正文 |
 | `compile-rules (--project <uuid> \| --all) [--force] [--dry-run]` | 把规则池里还没编的规则交给 Jev 编成写后检查（`check_rules` 用），结果缓存进 `rule_compiles`；已编过的（规则 id + 原文 sha 都没变）不再发；`--all` 一次运行里 owner 的 global 规则只发一次（`--force` 也是）。先 `--dry-run` 看要编几条（和真编同一个结局：没接 tv-map / 没配 `JUDGE_*` 照样报 ✗）。后台也会自己补编，这个命令是上线时补一遍（先关 `RULE_COMPILE_AUTO`，见 runbook §1.11）、或 Jev 改了编译之后 `--force` 用。一个项目一行计数，有项目没编成退出码 1；一批读超时就不再发后面几批，`--all` 也不再试后面的项目（列出来），Jev 恢复后再跑（2026-10-20，D-121）。没编出来的规则当场拆成每次 ≤ 3 条各重发一次，重发还失败的才算失败（2026-11-11） |
 | `sync-skill [--check]` | **不连库。** 改了 `protocol.md` 之后跑，把正文接进 `skills/…/SKILL.md`；`--check` 只比对，给 CI 用。两边不一致时 `test_protocol_tool.py` 会红 |
