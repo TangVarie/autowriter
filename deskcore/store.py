@@ -4067,13 +4067,40 @@ def tv_long_vanished_note_ids(sb, note_ids: list[str], *, min_gap: timedelta) ->
     return out
 
 
+_TV_COMMENT_SOURCE_MISSING_AT = 0.0     # 上次发现 TV v1.27 没跑(comments 还没有 source 列)的时刻; 10 分钟内不再试
+_TV_COMMENT_SOURCE_RETRY_S = 600.0      # 过了再试一次: v1.27 跑完之后不用重启就自己切过去
+
+
+def _tv_comment_source_missing(exc: Exception) -> bool:
+    """TV v1.27 没跑: 读 ``truth_vault.comments`` 时点名的是 ``source`` 这一列不存在。只认这一列, 别的错照常抛。"""
+    msg = str(exc).lower()
+    return "source" in msg and ("does not exist" in msg or "42703" in msg)
+
+
 def tv_note_comments(sb, note_id: str, limit: int = TV_COMMENTS_MAX) -> list[dict]:
-    """这条笔记在 TV 里的评论, 按评论顺序。"""
-    return list((sb.schema("truth_vault").table("comments")
-                 .select("comment_id, parent_comment_id, comment_order, comment_role, content, is_pinned")
-                 .eq("note_id", note_id)
-                 .order("comment_order")
-                 .limit(limit).execute()).data or [])
+    """这条笔记在 TV 里**运营写的**评论, 按评论顺序。
+
+    TV v1.27 起 ``comments`` 里多了巡检工具抓的读者评论(``source`` 非空); 那些不是我们布的评论,
+    不该进「已有评论」和查重(W-59)。所以只读 ``source`` 为空的行; v1.27 没跑(没有这一列)时照旧全读 ——
+    那时表里本来也只有运营写的。"""
+    global _TV_COMMENT_SOURCE_MISSING_AT
+
+    def _q(only_operator: bool):
+        q = (sb.schema("truth_vault").table("comments")
+             .select("comment_id, parent_comment_id, comment_order, comment_role, content, is_pinned")
+             .eq("note_id", note_id))
+        if only_operator:
+            q = q.is_("source", "null")
+        return q.order("comment_order").limit(limit)
+
+    if time.monotonic() - _TV_COMMENT_SOURCE_MISSING_AT >= _TV_COMMENT_SOURCE_RETRY_S or not _TV_COMMENT_SOURCE_MISSING_AT:
+        try:
+            return list(_q(True).execute().data or [])
+        except Exception as exc:  # noqa: BLE001 —— 只吞「没有 source 列」, 别的照抛
+            if not _tv_comment_source_missing(exc):
+                raise
+            _TV_COMMENT_SOURCE_MISSING_AT = time.monotonic()
+    return list(_q(False).execute().data or [])
 
 
 def tv_note_extra_text(sb, note_id: str, key: str) -> str:
