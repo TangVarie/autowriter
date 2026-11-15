@@ -2,6 +2,8 @@
 
 > **2026-11-14 审查修复**：调校笔记的写回改成按任务版本比较，完整笔记和精修销账在同一个事务里；旧笔记读不到时不发空历史的学习任务。负责人在 SQL Editor 跑一次 `migrations/021_style_distillation_cas.sql`，先于或后于部署都行（没跑时照 021 之前的写法保存，服务日志里响一次警告），写手不用做什么。同一分支里的「硬约束拿不准」改动已撤回。细节见 [审查修复说明](audit-fixes-2026-11-14.md)。生产库还没跑 021。
 
+> **2026-11-15 十三项里写作台的两项**：① 每批稿子写之前看到了哪几张经验卡、哪几条规律，记在 `batches.params.lesson_exposure` 和查重底稿上（§3.33；是曝光记录，不是归因）。负责人在 SQL Editor 跑一次 `migrations/022_lesson_exposure.sql`，先于或后于部署都行。② 存完档在后台给每一版判一次人感题和暗题，答案只落账本（§3.34；默认开，每版多一次 `/judge_draft`、每段至少一次 Jev 调用，`DESKCORE_SHADOW_HUMAN=0` 关）。写手不用做什么，协议和 skill 没变。
+
 > 本文讲**为什么这么设计**。要看**现在是什么状态、还差什么、下一步做什么**，
 > 去 [`deskcore-runbook.md`](deskcore-runbook.md)——上线手册、对接矩阵、待办清单，
 > 以及一份「文档与实际不一致」的登记表。
@@ -531,6 +533,7 @@ try 里面 `return out`；现在改成落到 `with` 块外面，再判：
 不带 `brief`：写作台的规则是自由文本，编不成闭集题（那要模型）；未清关项目的项目层本来也会被 judge 按
 出境口径丢掉。请求体其余几项：`judge_paras = "never"`（不判段，一篇的调用次数压到最少才放得进 8 秒）、
 `write = true`（账本由 judge 写）、`run_tag = "primary"`、`return_rows = false`。
+人感题和暗题因此不在这一次里判；2026-11-15 起存完档在后台另发一次只判它们的（§3.34），写手看不到。
 
 **结局（`judge_status`）。**
 
@@ -687,6 +690,7 @@ project_id 同样没过归属校验：那一列只认回包里的 `project_id`�
   = 这一批没参照过卡、补借也没等到。`statuses` 是这 12 小时里所有借卡的合计，不是这一场的：上午那一场简报和补借都超时、两小时后
   另一场随简报拿到了卡，后一场那一行的 `statuses` 里照样有 `timeout` 和 `followup_timeout`——光看 `statuses` 会把拿到卡的批次数成
   没卡的（2026-11-12 复审 borrow-1），要和 `shown_max = 0` 一起看。
+  这一块只有数；**是哪几张卡**记在 `batches.params.lesson_exposure` 和底稿上（2026-11-15，§3.33），不在这一行。
 - `skill_versions`：近 24 小时报上来的 skill 版本构成（`skillcheck.health`，同 `/skill-versions`）：`current`、
   `up_to_date` / `outdated` / `unknown` 各几个、`outdated_versions`（旧版各是哪一版；认不出 12 位十六进制的并进 `other`）。
   数的是「身份 × 版本」，读作有几种版本在用，不是人数。原来只在进程内存里、要带 key 读、重新部署就清零。
@@ -2229,6 +2233,109 @@ owner 11-12 定的：投流起量的帖，它的经验卡照旧借给写作台�
 
 **回归**：`tests/test_desk_first_1113.py`（新一节在流程前面、4 条、不超过 580 字符；P0 不在先后顺序里；点了别的 skill 不算用户说的；交付照工具回包、用户明说要文件时照交付稿原样做；分工不另立一节；描述开头有「排第一」和头几个触发说法、不超长；skill 头不比改之前长；`instructions` 带这条规矩；两个入口工具的回包第一个键是 `desk_first`（直接调和走 REST 路由各一条）、别的键不动、每次都带；`angles_note` 只在 3 篇以上新稿全没带牌时出现、不改判定、不叫人去存；升级提醒三行、后两行不变，没写「变了什么」的版本只说有新版；旧版 skill 对新服务端照常工作）；`tests/test_skill_version_probe.py`（探针出错时回包只多 `desk_first`）。
 
+### 3.33 这一批稿子写之前看到了哪几张经验卡、哪几条规律（2026-11-15，十三项第 3 项，`022`）
+
+**原来缺什么。** 借来的经验卡和已验证规律，写作台只记「带出去几张 / 几条」（`batch_metrics.meta.flywheel_lessons`、
+`batches.params.flywheel_patterns_shown`），不记是哪几张。「看到过这张卡的那几批稿子，发出去以后怎么样」答不了，而且事后补不
+回来：哪一场拿到了哪几张，只有借卡那一刻知道。
+
+**现在记什么。** 全在服务端，模型不用传回任何东西，协议、skill、工具参数都没动。
+
+- **借卡时**（`open_project` 随简报借、`borrow_lessons` 补借，同一个出口 `_borrow_for_brief_bounded`）：进程里按（项目，身份）
+  记一条——这一次带出去的卡的 `source_note_id`、规律的标识（馆员给的 `id`；没给就是规律文字的短哈希，前面带 `h:`）、时刻。
+  留 12 小时。发牌（`draw_angles`）不带经验卡和规律，不在里面。
+- **查重时**（`check_drafts`）：这一场近 12 小时拿到过的卡和规律写到这次的每行底稿上，`draft_snapshots.lesson_exposure`
+  （`022` 加的那一列）。
+- **存档时**（`score_drafts`）：写进新建的 batch 的 `params.lesson_exposure`（`params` 是 JSONB，不用迁移）。底稿转正的 batch
+  （`params.via = snapshot`）从底稿那一列带过去。
+- 形状：`{"cards": [source_note_id…], "patterns": [规律标识…], "borrows": 几次借卡, "latest": {"cards": k, "patterns": m}, "first_at", "last_at"}`，
+  两个列表是这 12 小时里几次借卡的并集，最近一次的在前；卡最多 40 张、规律最多 20 条，截过的带 `truncated: true`。只有 id、
+  条数和时刻，没有卡的文字。
+- `latest`：`cards` 的前 k 张、`patterns` 的前 m 条正好是**最近一次借卡**带出去的。几场共用一个身份并在一起之后，这是
+  还分得出来的一层（比如上午一场拿了五张、下午一场拿了另外五张再存档：十张都在，`latest.cards = 5` 说明前五张是下午那场的）。
+  它只说「最近一次借的是哪几张」，不说这一批就是那一场写的。
+- `null` = 服务端不知道（这 12 小时里没借过卡，或者借卡之后进程重启过）；空列表 = 借过、一张都没拿到；没有这个键 = 这个功能
+  之前的批次（底稿转正的 batch 还有一种：`022` 没跑，读不到那一列）。
+- `batch_metrics.meta.flywheel_lessons` 照旧只有数，不放 id。
+
+**它是什么、不是什么。** 这三条读数的时候都要记着：
+
+1. 它是**曝光**，不是起作用的证明。记的是「这批稿子写之前，这个身份在这个项目里拿到过这张卡」；模型拿到卡之后用没用、
+   用了哪张，服务端不知道。
+2. 团队共用一个身份、12 小时里同一个项目开了几场时，几场拿到的卡并在一起，分不出这一批是哪一场的（同 `flywheel_lessons`）。
+3. 借卡的记录在进程内存里。借卡之后服务重启过（部署、崩溃），这一批记的是 `null`，那一场看到的卡就丢了。
+
+另外两处没记：改稿重存（`replaces_version_id`）不建新 batch，挂的旧 batch 记的还是它自己那一场的；界面生成的稿子和补录
+副本不经过借卡，没有这个键。
+
+**`022` 没跑时。** `check_drafts` 记底稿那一步发现库里没有这一列（PostgREST `PGRST204` 点名 `lesson_exposure`），去掉这一列
+再写一次，写进去的行和以前一模一样，服务日志里警告一次；tv-sync 读底稿退回原来那几列（`42703` 点名这一列才退，别的错误
+照旧）。查重的判定、转正、补录都不受影响，`batches.params` 照样记。「这一列不在」只记十分钟：跑了 `022` 之后最多十分钟
+自动用上，不用重新部署。所以合并和跑 SQL 谁先谁后都行。
+
+**读数**：`python -m deskcore.cli lesson-exposure --days 90 [--project <uuid>] [--json]`，只读。每张卡、每条规律一行：看到它的
+批次数、其中至少发出去一篇的批次数、发出去的篇数（按内容对上了 TV 笔记的，同 `draw-report` 的 M2）、其中 tier 是爆 / 大爆
+的篇数；另有一行「一张卡都没拿到的批次」。只有 id 和计数，不给比率（11-12 全库才 38 次借卡）。一批的结果同时记在它看到的
+每张卡名下，各行不能相加，也不能拿两行相减当成「这张卡的效果」。
+
+**回归**：`tests/test_lesson_exposure.py`。
+
+### 3.34 人感题和暗题的影子判定：存完档在后台判，答案只落账本（2026-11-15，十三项第 7 项）
+
+**原来缺什么。** 存档那次判定为了放进 8 秒，发的是 `judge_paras = "never"`（§3.8）：人感题库只在段级判，暗题只在人感题库
+里，所以写作台的稿子在 TV 账本里一行人感题、一行暗题的答案都没有。「人感和发出去以后的结果有没有关系」拿写作台的数据
+答不了。
+
+**现在。** 每次 `score_drafts` 真存进去了版本，在后台对这一批存进去的每一版（新稿和改过重存的；被拒的、没建成版本的、
+正文是空的不发）另发一次 `/judge_draft`：
+
+- 请求体（`judge_client.build_human_request`）：`banks = ["human_feel_para_v0.2"]`（只判人感题库，暗题在里面；篇级的特征题
+  和平台题存档那次已经判过，不重复花钱）、`judge_paras = "always"`（逐段全判）、`write = true`、`run_tag = "shadow-human"`、
+  `return_rows = false`。用的全是 Jev 现成的参数，Jev 那边没有改动。
+- 账本里这些行：`subject_type = aw_version`，`subject_id = <versions.id>:p<段号>`（Jev 段级行的老约定），`run_tag =
+  shadow-human`，和存档那次的 `primary`、规则题的 `shadow-rules` 分开。
+- **写手和模型都看不到**：不进回包、不改 `next_step`、不影响参考分和任何一句话。Jev 的回包（修改单、分段答案）用完就丢，
+  不留、不记日志；暗题的账本行本来就不回写作台。只有一小块计数并进这次存档那一行 `batch_metrics` 的 `meta.shadow_human`：
+  `status`（`judged` 至少一版判回来了 / `none_judged` 发了一版都没回来 / `not_configured` 项目没接 `tv_project_map` /
+  `policy_blocked` 等没发的原因 / `error`）、`versions`、`sent`、`ok`、`statuses`（各种结局各几版）、`calls`（Jev 调了几次）、
+  `written`（账本写了几行）、`ledger_errors`（判出来了、账本没写进去的版数）、`skipped`、`elapsed_ms`、`at`。
+  没有这个键 = 没判（关着、排队满了、进程重启丢了排着的），不是判过了。
+- 发之前和存档那次同一套口径：项目号和品类从 `tv_project_map` 来，没接的项目不发；自带的 `version_id` 先按本项目核过。
+  处方药没清出境的项目 Jev 回 403，记 `policy_blocked`，不重试。
+- 自己一个后台线程（不占改稿复查和规则补查那一个），1 批在跑、其余排着，最多排 64 批（`core.SHADOW_HUMAN_QUEUE`；一批
+  要跑几分钟，名额给少了忙的时候就排不上，排不上的没有补判），排满了那一批不判、记日志；一批最多 20 版。
+- Jev 慢的时候不追着发：有一版读超时，这一批剩下的就不发了；连着两版 `unavailable` 也停。没发的记在 `skipped` 里，
+  那一块带 `stopped_early: true`。超时的那一次 Jev 那边多半还在跑，接着发只会让它更慢，还跟写手等着的那次判定抢。
+- 那一次请求的读超时 `DESKCORE_SHADOW_HUMAN_TIMEOUT_SEC`（默认 180 秒）；写作台这边等不到不代表 Jev 没判完、没写账本。
+- 两个后台活（改稿复查、影子判定）往同一行 `meta` 里各并一小块，写的时候握同一把锁、整份写回，不会互相盖掉。
+
+**多花多少。** 每存一版多一次 `/judge_draft` 请求；Jev 那边人感题按段判，**正文每个非空行算一段（`#` 开头的不算），每段至少
+一次模型调用**。一篇十五行的稿子就是十五次起，一批十篇约一百五十次，串着跑要几分钟。实数在 `meta.shadow_human.calls` 里：
+
+```sql
+select date_trunc('day', created_at) as day, count(*) as batches,
+       sum((meta->'shadow_human'->>'sent')::int) as versions, sum((meta->'shadow_human'->>'calls')::int) as jev_calls,
+       sum((meta->'shadow_human'->>'ledger_errors')::int) as ledger_errors
+from autowriter.batch_metrics
+where meta->>'mode' = 'deskcore_commit' and meta ? 'shadow_human'
+group by 1 order by 1 desc;
+```
+
+**开关。** 默认开，写在代码里（`config.SHADOW_HUMAN`），不用配任何环境变量。要停掉这笔 Jev 开销：`DESKCORE_SHADOW_HUMAN=0`。
+没配判定服务（`JUDGE_URL` / `JUDGE_API_KEY`）时什么都不做。
+
+**两件要知道的事。**
+
+- 题库名写死在 `judge_client.HUMAN_BANK_NAME`（和 Jev 的默认三层里那一份同名）。Jev 给人感题库升版本时这里要**手工**跟着改，
+  **没有报错可等**：Jev 加新版本时旧文件照例留着，这里的请求照样回 200、照样写账本，只是答的还是旧题库。只有旧文件被删了
+  才看得出来：Jev 回 404，`statuses` 里是 `unavailable`（不是 `bad_request`），那一批第二版之后就不发了。存档都不受影响。
+  所以 Jev 那边升人感题库的时候，把改这个常量写进那次改动的清单。
+- TV 的 `scripts/verify_supabase_state.sql` 第 84 项数的是「`aw_version` 的答案指向不存在的 `autowriter.versions`」，按
+  `subject_id` 整串去对。段级行的 `subject_id` 带 `:p<段号>`，对不上，会被数成孤儿。那一项要改成先去掉 `:p<段号>` 再对
+  （TV 那边的事，记在这次交接里）；没改之前那个数会随着影子判定涨，不代表有版本被删。
+
+**回归**：`tests/test_shadow_human.py`。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -2252,6 +2359,8 @@ env：
 | `RULE_COMPILE_BATCH` | 可选 | 默认 `60`，夹在 1–60（Jev 的上限）。一次编几条 |
 | `RULE_COMPILE_AUTO` | 可选 | 默认开。`0` 关掉 `open_project` / `record_rule` / `check_rules` 触发的后台补编，只剩 `cli compile-rules`。上线补编（`compile-rules --all`）那一阵要先设 `0`，跑完再去掉：CLI 和服务进程的后台补编不共用锁，同时编会付两遍钱（§3.11） |
 | `RULE_SWEEP_AUTO` | 可选 | 默认开。`0` 关掉存档之后的规则补查（给这个项目还没有规则题答案的旧稿在后台补一轮 `check_rules`，每次存档最多 20 版，只花 Jev 规则题的钱，写手看不到；见「规则检查的后台补查」）。改稿的后台复查不受它管 |
+| `DESKCORE_SHADOW_HUMAN` | 可选，**平时不用设** | 默认开（写在代码里）。`0` 关掉存档之后的人感题 / 暗题影子判定（§3.34）：每存一版多一次 `/judge_draft`，Jev 那边每段至少一次模型调用，答案只落账本（`run_tag=shadow-human`），写手看不到 |
+| `DESKCORE_SHADOW_HUMAN_TIMEOUT_SEC` | 可选 | 默认 `180`，夹在 10–600。影子判定那一次请求的读超时，只有后台线程用它 |
 | `RETURN_GATE_ENFORCE` | 可选，**平时不用设** | 回流闸读的一方（§3.30）。默认值写在代码里（`config.py` 的 `RETURN_GATE_ENFORCE_DEFAULT`，现在是 `"0"` = 关），打开是改那一行的 PR，不是改环境变量。这个变量只是覆盖：`0` / `false` / `off` 关，`1` / `true` / `on` 开，别的值当关。开了之后要临时关就设 `0`、重启 |
 | `DESKCORE_TOOL_CALL_LOG` | 可选 | 默认开。`0` 关掉「每次工具调用留一行只有数的记录」（§3.8 末尾）：一行不写，别的都不变 |
 | `DESKCORE_VIEW_PAGE` | 可选 | 默认开。`0` 关掉「排好版的页面」（§3.29）：`score_drafts` 不再发链接，已经发出去的链接也打不开 |
@@ -2274,8 +2383,9 @@ env：
 `008_embedding_model_isolation.sql` / `009_tv_links.sql` / `010_tv_links_rls.sql` /
 `011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql` / `014_tv_edit_diff_rev.sql` /
 `015_rule_compiles.sql` / `016_tv_notes_skip_vanished.sql` / `017_tv_link_text_fp.sql` /
-`018_draft_snapshots.sql` / `019_dedup_gin_first.sql` / `020_tv_link_gate.sql`
-**二十个，按编号顺序跑，别跳号**（建议先在
+`018_draft_snapshots.sql` / `019_dedup_gin_first.sql` / `020_tv_link_gate.sql` /
+`021_style_distillation_cas.sql` / `022_lesson_exposure.sql`
+**二十二个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -2309,6 +2419,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
 - `016_tv_notes_skip_vanished.sql`（2026-10-26，I-22）：`deskcore_tv_notes` 不再返回飞书里已删的篇（TV 的 `truth_vault.v_notes_vanished`，D-103），§3.7 表里「飞书已删」那一行。只换函数体，签名不变；视图不在就照旧全给。**静默错答**，和 `008` 同类：不跑不报错，已删的篇每晚照样被读回来重对，项目有补录目标时对不上的会被补录成副本。所以**先跑 016，再打开有已删篇的 TV 项目的补录目标**（10-26：BJS_phase1 挪走了 79 篇成人藻油，其中 14 篇是 unmatched）。`doctor` 报 `unprobeable` 并给出查函数体和视图的 SQL。
+- `022_lesson_exposure.sql`（2026-11-15，十三项第 3 项）：`draft_snapshots` 加一个可空的列 `lesson_exposure`（JSONB）——这次查重的那一场看到了哪几张经验卡、哪几条规律（§3.33）。不建表、不建函数、不发 GRANT、不碰数据。**可降级，先后都行**：没跑时记底稿那一步去掉这一列再写一次（警告一次）、tv-sync 读底稿退回原来那几列，行为和以前一样，`batches.params.lesson_exposure` 照样记；跑了之后最多十分钟自动用上，不用重新部署。`doctor` 探得到这一列。
 - `020_tv_link_gate.sql`（2026-11-12，回流闸 v1）：`tv_note_links` 加四个可空的列 `origin` / `gate` / `gate_reasons` / `gate_at`——每篇已发的帖是哪来的、能不能拿来学（`pass` / `fail` / `unsure` / `hold` / `withdrawn`）、原因名、最近一次判的时刻。取值、判的先后、哪个原因挡哪一路都在 `deskcore/postgate.py`；tv-sync 每晚最后一步（`core._tv_gate`）只 `UPDATE` 这四列，不碰对照本身的列。不建表、不建函数、不发 GRANT、不碰数据。**可降级，先于或后于部署都行**：没跑时那一步整步跳过，读结论的各处当作「没判过」，行为和以前一样。`doctor` 探这四列。
 - `019_dedup_gin_first.sql`（2026-11-11，W-21 / AU-F08）：`deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 取候选先走四字串的 GIN 索引、再筛项目（§3.27）。只换函数体里这一步，签名、返回列、结论都不变，不碰数据。**不跑不坏，只是慢**（千行的项目每篇约 0.4 秒，10 篇一组三处各等 3~5 秒）；代码不依赖它，先于或后于部署都行。`doctor` 探不到函数体，报 `unprobeable` 并给出查两个记号的 SQL；跑完用文件末尾那句 `EXPLAIN` 核一次。
 - `018_draft_snapshots.sql`（2026-10-29，W-38）：`draft_snapshots`，`check_drafts` 查过的每篇稿子（标题、正文、`angle_key`、查重结论、飞轮臂），§3.7 表里「查重底稿」那一行。只授 `service_role`、开 RLS、不建 policy（存的是稿子全文），留 60 天。**可降级，但先跑 018 再部署**：代码先上线时 `check_drafts` 照常判（记底稿那一步失败只记 WARN），tv-sync 跳过底稿那一步、照旧补录；可同一次部署已经不再催模型存档，那段时间只查了重的稿子发出去会被补录成副本（终态）。`doctor` 探这张表。

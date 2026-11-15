@@ -216,6 +216,13 @@ def main() -> int:
         if got != f"{typ}/YES/-":
             print(f"  [FAIL] tv_note_links.{col} 该是 {typ}、可空、没有默认值, 得到 {got!r} —— 000 与 020 只改了一边?")
             bad += 1
+    # 022: 底稿上的曝光记录那一列。基线和增量都要有、jsonb、可空、没有默认值(NULL = 那次查重时不知道)。
+    got = sql("SELECT data_type || '/' || is_nullable || '/' || coalesce(column_default, '-') "
+              "FROM information_schema.columns WHERE table_schema='autowriter' "
+              "AND table_name='draft_snapshots' AND column_name='lesson_exposure';")
+    if got != "jsonb/YES/-":
+        print(f"  [FAIL] draft_snapshots.lesson_exposure 该是 jsonb、可空、没有默认值, 得到 {got!r} —— 000 与 022 只改了一边?")
+        bad += 1
     # CHECK 的取值集合必须和 db.DecisionSource 对得上。两边各写一份迟早漂,
     # 而漂了的表现是"写进去被数据库拒", 出现在离现场很远的地方。
     for src in sorted(_awdb._DECISION_SOURCES):

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 import db
@@ -3286,6 +3287,58 @@ def report_title_answers(sb, version_ids) -> dict[str, str] | None:
     return out
 
 
+# ── lesson-exposure(2026-11-15, 运维 CLI, 只读): 哪张经验卡被几批稿子看到过、那几批发出去的帖里有几篇起量 ──────────
+REPORT_EXPOSURE_BATCH_CAP = 5000
+
+
+def report_exposure_batches(sb, days: int, project_id: str | None = None,
+                            cap: int = REPORT_EXPOSURE_BATCH_CAP) -> list[dict] | None:
+    """近 ``days`` 天写作台自己建的 batch(存档的和底稿转正的; 补录副本不算): ``[{"id", "project_id", "created_at",
+    "exposure"}]``, 旧的在前。``exposure`` 是 ``params.lesson_exposure``: dict = 记下了; None = 那一批不知道(进程重启过 /
+    没借过卡); 没有这个键的(这个功能之前的批次)记 ``"absent"``。读挂了回 None。"""
+    since = iso_ago(max(int(days), 1))
+    try:
+        rows = _paged(lambda off, lim: _maybe_eq(
+            sb.table("batches").select("id, project_id, created_at, params"), "project_id", project_id)
+            .eq("params->>source", "deskcore")          # 在库里就筛(同 desk_batches_since): 补录、界面生成的批次不占上限(Codex on #161)
+            .gte("created_at", since).order("created_at").order("id").range(off, off + lim - 1), hard_cap=cap)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("lesson exposure report: batches unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    out = []
+    for r in rows:
+        params = _as_params(r.get("params"))
+        if not r.get("id") or params.get("source") != "deskcore":
+            continue
+        exposure = params.get(SNAPSHOT_EXPOSURE_COL, "absent")
+        out.append({"id": str(r["id"]), "project_id": str(r.get("project_id") or ""), "created_at": r.get("created_at"),
+                    "exposure": exposure if isinstance(exposure, dict) or exposure == "absent" else None})
+    return out
+
+
+def report_batch_versions(sb, batch_ids) -> dict[str, list[str]] | None:
+    """这几个 batch 各有哪些版本(每个 item 的全部版本): ``{batch_id: [version_id…]}``。只取 id。读挂了回 None。"""
+    ids = list(dict.fromkeys(str(b) for b in (batch_ids or ()) if b))
+    out: dict[str, list[str]] = {b: [] for b in ids}
+    try:
+        items: list[dict] = []
+        for chunk in db._in_chunks(ids, 100):
+            items += _paged(lambda off, lim, _c=chunk: (
+                sb.table("items").select("id, batch_id").in_("batch_id", _c).order("id").range(off, off + lim - 1)))
+        batch_of = {str(it["id"]): str(it["batch_id"]) for it in items if it.get("id") and it.get("batch_id")}
+        for chunk in db._in_chunks(list(batch_of), 100):
+            for v in _paged(lambda off, lim, _c=chunk: (
+                    sb.table("versions").select("id, item_id").in_("item_id", _c).order("id")
+                    .range(off, off + lim - 1))):
+                bid = batch_of.get(str(v.get("item_id")))
+                if bid in out and v.get("id"):
+                    out[bid].append(str(v["id"]))
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("lesson exposure report: items / versions unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    return out
+
+
 def _maybe_eq(q, col: str, value):
     return q.eq(col, value) if value else q
 
@@ -3362,11 +3415,53 @@ def snapshots_table_missing(exc: Exception) -> bool:
     return "pgrst205" in str(exc).lower() and "draft_snapshots" in str(exc)
 
 
+# 022 给 draft_snapshots 加的那一列(2026-11-15): 这次查重的那一场看到了哪几张经验卡、哪几条规律(core.lesson_exposure)。
+# 没跑 022 时库里没有它: 写的一方去掉这一列再写一次, 读的一方退回原来那几列 —— 底稿和 tv-sync 都和 022 之前一样。
+# 记住「这一列不在」只记 SNAPSHOT_EXPOSURE_RETRY_SEC: 负责人什么时候跑了 022, 最多过这么久就自己用上, 不用重新部署。
+SNAPSHOT_EXPOSURE_COL = "lesson_exposure"
+SNAPSHOT_EXPOSURE_RETRY_SEC = 600.0
+_snapshot_exposure_state = {"missing_until": 0.0, "warned": False}
+
+
+def snapshot_exposure_column_missing(exc: Exception) -> bool:
+    """022 没跑: 写(``PGRST204``)或读(``42703 column … does not exist``)时点名的是 ``lesson_exposure`` 这一列。只认这一列 ——
+    别的缺列 / 缺表 / 权限 / 连接错误照旧当故障(同 tv_gate_columns_missing 的纪律)。"""
+    msg = str(exc).lower()
+    if not ("does not exist" in msg or "42703" in msg or "pgrst204" in msg):
+        return False
+    return "column" in msg and re.search(rf"(?<![a-z_]){SNAPSHOT_EXPOSURE_COL}(?![a-z_])", msg) is not None
+
+
+def _snapshot_exposure_known_missing() -> bool:
+    return time.monotonic() < _snapshot_exposure_state["missing_until"]
+
+
+def _note_snapshot_exposure_missing(what: str) -> None:
+    _snapshot_exposure_state["missing_until"] = time.monotonic() + SNAPSHOT_EXPOSURE_RETRY_SEC
+    if not _snapshot_exposure_state["warned"]:
+        _snapshot_exposure_state["warned"] = True
+        logger.warning("draft_snapshots 还没有 lesson_exposure 这一列(migrations/022_lesson_exposure.sql 没跑): %s 照 022 "
+                       "之前的样子做, 底稿上不记这一场看到了哪几张经验卡。跑了 022 之后自动用上, 不用重新部署。", what)
+
+
 def insert_draft_snapshots(sb, rows: list[dict]) -> int:
-    """一次查重的几篇底稿, 一次 insert。每行带同样的键(PostgREST 批量写按键的并集补 NULL)。异常原样上抛, 调用方吞。"""
+    """一次查重的几篇底稿, 一次 insert。每行带同样的键(PostgREST 批量写按键的并集补 NULL)。异常原样上抛, 调用方吞。
+
+    行里带着 ``lesson_exposure``(022 的那一列)而库里还没有它: 去掉这一列再写一次, 写进去的行和 022 之前一模一样
+    (只警告一次)。别的错误照旧上抛。"""
     if not rows:
         return 0
-    sb.table("draft_snapshots").insert(rows).execute()
+    has = any(SNAPSHOT_EXPOSURE_COL in r for r in rows)
+    bare = [{k: v for k, v in r.items() if k != SNAPSHOT_EXPOSURE_COL} for r in rows] if has else rows
+    if has and _snapshot_exposure_known_missing():
+        rows, has = bare, False
+    try:
+        sb.table("draft_snapshots").insert(rows).execute()
+    except Exception as exc:                            # noqa: BLE001
+        if not (has and snapshot_exposure_column_missing(exc)):
+            raise
+        _note_snapshot_exposure_missing("查重时记底稿")
+        sb.table("draft_snapshots").insert(bare).execute()
     return len(rows)
 
 
@@ -3382,17 +3477,31 @@ def pending_draft_snapshots(sb, project_ids: list[str], *, since: str) -> list[d
     """这几个写作台项目近来还没转正的底稿(``checked_at >= since``, ``promoted_at`` 为空), 全文。
     018 没跑回 None(调用方跳过底稿那一遍、照旧补录); 别的错误原样上抛, 调用方按 snapshots_misconfigured 分: 配置问题照旧
     补录、退出码 1; 一时的故障那晚不补录(补录是终态, 一次读失败不能把本该对上底稿的帖变成永远的副本)。"""
+    def _read(pid: str, cols: str) -> list[dict]:
+        return _paged(lambda off, lim: (
+            sb.table("draft_snapshots").select(cols)
+            .eq("project_id", pid).is_("promoted_at", "null").gte("checked_at", since)
+            .order("checked_at").order("id").range(off, off + lim - 1)))
+
     out: list[dict] = []
+    # 022 的那一列(这一场看到了哪几张卡)读得到就一起读, 转正的 batch 把它带过去; 读不到(022 没跑)退回原来那几列
+    wide = not _snapshot_exposure_known_missing()
     for pid in sorted({str(p) for p in project_ids if p}):
         try:
-            out += _paged(lambda off, lim, pid=pid: (
-                sb.table("draft_snapshots").select(SNAPSHOT_COLS)
-                .eq("project_id", pid).is_("promoted_at", "null").gte("checked_at", since)
-                .order("checked_at").order("id").range(off, off + lim - 1)))
+            try:
+                out += _read(pid, f"{SNAPSHOT_COLS}, {SNAPSHOT_EXPOSURE_COL}" if wide else SNAPSHOT_COLS)
+            except Exception as exc:                    # noqa: BLE001
+                if not (wide and snapshot_exposure_column_missing(exc)):
+                    raise
+                _note_snapshot_exposure_missing("tv-sync 读底稿")
+                wide = False
+                out += _read(pid, SNAPSHOT_COLS)
         except Exception as exc:                        # noqa: BLE001
             if snapshots_table_missing(exc):
                 return None
             raise
+    if not wide:                                        # 前面几个项目带着那一列读的: 一律去掉, 这一晚按「读不到」算
+        out = [{k: v for k, v in r.items() if k != SNAPSHOT_EXPOSURE_COL} for r in out]
     return out
 
 

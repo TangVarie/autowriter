@@ -1675,6 +1675,11 @@ CREATE TABLE IF NOT EXISTS autowriter.draft_snapshots (
     promoted_at          TIMESTAMPTZ,
     note_id              TEXT
 );
+-- migrations/022_lesson_exposure.sql (2026-11-15): 这次查重的那一场看到了哪几张经验卡、哪几条规律(曝光记录, 可空)
+ALTER TABLE autowriter.draft_snapshots
+    ADD COLUMN IF NOT EXISTS lesson_exposure JSONB;
+COMMENT ON COLUMN autowriter.draft_snapshots.lesson_exposure IS
+    '这次查重的那一场(项目, 身份)近 12 小时拿到过的经验卡和已验证规律: {"cards": [source_note_id], "patterns": [规律标识], "borrows", "first_at", "last_at"}。NULL = 不知道。是曝光记录, 不是用了这张卡的证明(deskcore/core.py lesson_exposure)';
 CREATE INDEX IF NOT EXISTS draft_snapshots_pending_idx
     ON autowriter.draft_snapshots (project_id, checked_at DESC) WHERE promoted_at IS NULL;
 CREATE INDEX IF NOT EXISTS draft_snapshots_user_key_idx

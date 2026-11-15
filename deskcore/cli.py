@@ -30,6 +30,7 @@
                                                     ← 发牌 v2 的模拟(假台账, 不写库): 5 张/天判上线闸, 10 张/天只报数;
                                                       TV 项目号 / --profile 不连库(用 vendored 快照 / 给的 Profile)
   python -m deskcore.cli draw-report --days 28 [--project <uuid>] [--json]
+  python -m deskcore.cli lesson-exposure --days 90 [--project <uuid>] [--json]
                                                     ← 发牌 v2 的读数(只读): 来源 × 项目 × 周的 M1/M2/M3/D1/M5/M6、
                                                       MH 比较、配额内均匀乱抽和杠杆提升(都只用试新牌)、健康指标
   python -m deskcore.cli tv-sync --all [--dry-run] [--write-tv] [--gate-all]
@@ -991,6 +992,34 @@ def _draw_report(sb, args) -> int:
     return 0
 
 
+def _lesson_exposure(sb, args) -> int:
+    """lesson-exposure(2026-11-15): 只读。带着曝光记录的 batch → 各自的版本 → 版本对上 TV 的情况 → 那几篇的 tier,
+    然后按卡 / 按规律数。只有 id 和计数。"""
+    from . import exposurereport, store
+    batches = store.report_exposure_batches(sb, args.days, args.project)
+    if batches is None:
+        print("lesson-exposure: batches 读不到, 什么都没算")
+        return 1
+    known = [b["id"] for b in batches if isinstance(b.get("exposure"), dict)]
+    versions = store.report_batch_versions(sb, known) if known else {}
+    if versions is None:
+        print("lesson-exposure: 批次的版本读不到, 发出去 / 起量这次不算")
+    vids = sorted({v for vs in (versions or {}).values() for v in vs})
+    adoption = store.desk_adoption(sb, vids) if versions is not None else None
+    if versions is not None and adoption is None:
+        print("lesson-exposure: tv_note_links 读不到, 发出去 / 起量这次不算")
+    note_ids = [v["note_id"] for v in ((adoption or {}).get("by_version") or {}).values() if v.get("note_id")]
+    notes = store.report_note_outcomes(sb, note_ids) if note_ids else {}
+    if notes is None:
+        print("lesson-exposure: TV 笔记读不到, 起量这次不算")
+    rep = exposurereport.report(batches, versions=versions, adoption=adoption, notes=notes, days=args.days)
+    if args.json:
+        _print(rep)
+    else:
+        print(exposurereport.format_report(rep))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="deskcore", description="写作台内核 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1180,6 +1209,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--project", default=None, help="只看这一个写作台项目(uuid); 不给就全部")
     p.add_argument("--json", action="store_true")
 
+    # 经验卡的曝光读数(2026-11-15): 运维命令, 只读, 同 draw-report 不要 --user。
+    p = sub.add_parser("lesson-exposure",
+                       help="每张经验卡 / 每条规律被几批稿子看到过、那几批发出去几篇、几篇起量(只读, 只有计数; 是曝光不是归因)")
+    p.add_argument("--days", type=int, default=90)
+    p.add_argument("--project", default=None, help="只看这一个写作台项目(uuid); 不给就全部")
+    p.add_argument("--json", action="store_true")
+
     args = ap.parse_args(argv)
     if args.cmd == "selftest":
         return selftest()
@@ -1236,6 +1272,8 @@ def main(argv: list[str] | None = None) -> int:
         return _angle_sim(args, live=True)
     if args.cmd == "draw-report":
         return _draw_report(sb, args)
+    if args.cmd == "lesson-exposure":
+        return _lesson_exposure(sb, args)
     if args.cmd == "projects":
         _print(core.list_projects(sb, user_id=args.user, include_archived=args.include_archived))
     elif args.cmd == "open":

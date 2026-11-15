@@ -274,6 +274,13 @@ UNGATED_WITH_REASON = {
     "_note_patterns_shown":   "F13: 借卡交出去之后把给了几条规律记进进程内存(不读写库), 只被已过闸的 borrow_lessons / "
                               "build_writing_brief(经 _borrow_for_brief_bounded)调",
     # 存档那一行指标里另外三小块(2026-11-11, docs/deskcore.md §3.8): 都只读写进程内存里的几个数, 不碰库
+    "_note_lesson_exposure":  "同 _note_lessons_shown(11-15): 借卡交出去之后把带出去的卡的 id、规律的标识记进进程内存(不读写库), "
+                              "只被 _borrow_for_brief_bounded 调, 其调用方 borrow_lessons / build_writing_brief 已过归属闸",
+    "lesson_exposure":        "读进程内存里这个 (项目, 身份) 近 12 小时拿到过的卡和规律的 id(不读写库); 只被已过闸的 commit_drafts "
+                              "和 _record_snapshots(check_drafts 过了闸之后)调",
+    "_schedule_shadow_human": "人感题影子判定(11-15): 只被已过闸的 commit_drafts 在尾巴上调; 只把刚存进去的那几版投进后台池子, 不读写库",
+    "_shadow_human_job":      "人感题影子判定(11-15): 池子里跑的那一层, 只由 _schedule_shadow_human 投; 只调 _shadow_human(它开头自己过 "
+                              "assert_project_access)",
     "_note_lessons_shown":    "同 _note_patterns_shown: 借卡交出去之后把带出去几张卡、什么结局记进进程内存(不读写库), "
                               "只被已过闸的 borrow_lessons / build_writing_brief(经 _borrow_for_brief_bounded)调",
     "_lessons_meta":          "只被 _commit_side_meta(已过闸的 commit_drafts 经 _record_commit_metrics 调)用: 读进程内存里"

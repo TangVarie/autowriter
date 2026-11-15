@@ -255,6 +255,14 @@ RULE_COMPILE_AUTO: bool = (_get_secret("RULE_COMPILE_AUTO") or "1").strip() not 
 # 存完档之后在后台给这个项目还没有规则题答案的旧稿补查(deskcore/core.py 的 _rule_sweep, 2026-11-11): 每次存档最多查 20 版,
 # 只花 Jev 规则题的钱, 写手和模型都看不到。0 = 关掉(比如要先停掉这笔 Jev 开销的时候); 改稿的后台复查不受它管。
 RULE_SWEEP_AUTO: bool = (_get_secret("RULE_SWEEP_AUTO") or "1").strip() not in ("0", "false", "False", "off")
+# 存完档之后在后台把这一批存进去的每一版交给 Jev 判一次人感题(含暗题), 答案只落 TV 账本(run_tag=shadow-human),
+# 写手和模型都看不到、不影响参考分和任何一句话(deskcore/core.py 的 _shadow_human, 2026-11-15, 十三项第 7 项)。
+# 默认【开】, 不用配任何环境变量; DESKCORE_SHADOW_HUMAN=0 关掉(比如要先停掉这笔 Jev 开销的时候)。
+# 花费: 人感题是按段判的, 一篇多发一次 /judge_draft, Jev 那边每段至少一次模型调用(正文每个非空行算一段)。
+SHADOW_HUMAN: bool = (_get_secret("DESKCORE_SHADOW_HUMAN") or "1").strip() not in ("0", "false", "False", "off")
+# 那一次请求的读超时。逐段判, 一篇十几到几十次 Jev 调用是串着跑的, 比写手侧的 18 秒长得多; 只在后台线程里等。
+# 写作台这边等不到不代表 Jev 没判完、没写账本(同存档那次判定的 timeout)。
+SHADOW_HUMAN_TIMEOUT_SEC: float = _bounded_number("DESKCORE_SHADOW_HUMAN_TIMEOUT_SEC", 180.0, 10.0, 600.0)
 # ── 回流闸 v1(2026-11-12, docs/deskcore.md §3.30): 写作台「学」的那一路要不要按结论筛 ────────────────────
 # tv-sync 每晚给每篇已发的帖记结论(tv_note_links.gate, migrations/020; 判法在 deskcore/postgate.py), 这个开关管的是
 # 【读】的一方: 开了之后简报的 working 标题、发牌的起量帖参照不再用判过、没放行的帖, 同一个 TV 项目对着的几个写作台项目

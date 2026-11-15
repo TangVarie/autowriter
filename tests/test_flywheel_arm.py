@@ -93,8 +93,10 @@ def _commit(monkeypatch):
     real = store.mint_draft_identity
 
     def spy(sb, project_id, user_id, tactic, entries, *, batch_params=None):
-        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比
-        captured["params"] = {k: v for k, v in (batch_params or {}).items() if k != core.DELIVERY_PARTS_KEY}
+        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比;
+        # 这一场看到了哪几张卡(2026-11-15, core.LESSON_EXPOSURE_KEY)同理, tests/test_lesson_exposure.py 钉它
+        captured["params"] = {k: v for k, v in (batch_params or {}).items()
+                              if k not in (core.DELIVERY_PARTS_KEY, core.LESSON_EXPOSURE_KEY)}
         return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
     monkeypatch.setattr(store, "mint_draft_identity", spy)
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
@@ -108,6 +110,8 @@ def _commit(monkeypatch):
     assert out["batch_id"]
     stored = dict(c.rows["batches"][0]["params"])
     assert set(stored.pop(core.DELIVERY_PARTS_KEY)) == {"order", "parts"}
+    assert core.LESSON_EXPOSURE_KEY in stored, "每个新 batch 都带这个键(null = 不知道)"
+    stored.pop(core.LESSON_EXPOSURE_KEY)
     assert stored == captured["params"]
     return captured["params"]
 
@@ -229,8 +233,10 @@ def _commit_with(monkeypatch, **kw):
     real = store.mint_draft_identity
 
     def spy(sb, project_id, user_id, tactic, entries, *, batch_params=None):
-        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比
-        captured["params"] = {k: v for k, v in (batch_params or {}).items() if k != core.DELIVERY_PARTS_KEY}
+        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比;
+        # 这一场看到了哪几张卡(2026-11-15, core.LESSON_EXPOSURE_KEY)同理, tests/test_lesson_exposure.py 钉它
+        captured["params"] = {k: v for k, v in (batch_params or {}).items()
+                              if k not in (core.DELIVERY_PARTS_KEY, core.LESSON_EXPOSURE_KEY)}
         return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
     monkeypatch.setattr(store, "mint_draft_identity", spy)
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
@@ -399,8 +405,10 @@ def _commit_out(monkeypatch, **kw):
     real = store.mint_draft_identity
 
     def spy(sb, project_id, user_id, tactic, entries, *, batch_params=None):
-        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比
-        captured["params"] = {k: v for k, v in (batch_params or {}).items() if k != core.DELIVERY_PARTS_KEY}
+        # 这一批的顺序和话题 / 评论 / 方向(2026-11-12 起每个项目都记, core.DELIVERY_PARTS_KEY)不是臂的事, 这里不比;
+        # 这一场看到了哪几张卡(2026-11-15, core.LESSON_EXPOSURE_KEY)同理, tests/test_lesson_exposure.py 钉它
+        captured["params"] = {k: v for k, v in (batch_params or {}).items()
+                              if k not in (core.DELIVERY_PARTS_KEY, core.LESSON_EXPOSURE_KEY)}
         return real(sb, project_id, user_id, tactic, entries, batch_params=batch_params)
     monkeypatch.setattr(store, "mint_draft_identity", spy)
     monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)

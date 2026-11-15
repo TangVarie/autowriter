@@ -64,7 +64,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 | 部件 | 实测结果 |
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + `migrations/` 下全部迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
-| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15；`020_tv_link_gate`（回流闸的四列，不跑不坏）2026-11-12 还没跑，见 §1.16；`021_style_distillation_cas`（调校笔记按版本写回，不跑不坏）2026-11-14 还没跑，见 §1.17 |
+| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15；`020_tv_link_gate`（回流闸的四列，不跑不坏）2026-11-12 还没跑，见 §1.16；`021_style_distillation_cas`（调校笔记按版本写回，不跑不坏）2026-11-14 还没跑，见 §1.17；`022_lesson_exposure`（查重底稿上记这一场看到了哪几张经验卡，不跑不坏）2026-11-15 还没跑，见 §1.18 |
 | **跑的是哪一份代码** | 打 `/health` 看 `build`：`commit`（12 位）和 `protocol_version`。**不需要 key。**<br>2026-09-20 加的，起因是同一天卡了两次：早上把「Railway 还没重新部署」当事实写进记录（其实没核实、它早就上线了），下午 Railway 一次部署真失败、服务停在 6 小时前的版本，而**从外面看不出来**（`/health` 不带版本、`/tools` 要 key）。<br>· `commit` 与 `main` 上的 SHA 不一致 → 部署没跟上，去 Railway 看那次 build 的日志。<br>· `protocol_version` 与 `skills/bywood-writing-desk/SKILL.md` 末尾那行不一致 → 运营手里那份 skill 该重新导入了。<br>· 显示 `unknown` → 只是这个诊断字段没取到值，**不代表服务不健康**（它刻意不参与 `ok`）。 |
 | **写手的 skill 是不是最新版** | `curl -H "X-Deskcore-Key: <你的 key>" https://autowriter-production.up.railway.app/skill-versions`（**要 key**，不放 `/health`：那里不鉴权，按 `app.py` 的规矩不许放业务数据）。`writers_24h` 是 24 小时内报上来的版本里最新 / 旧版 / 没报各几个——按「身份 × 版本」数，一个团队共用一个身份时读作「这 24 小时里有几种版本在用」，不是人数；`outdated_versions` 是旧版各是哪一版；只有计数，没有是谁。<br>2026-10-16 加的服务端探针（`deskcore/skillcheck.py`）：`open_project` / `comments_for` 带 `skill_version`、`get_protocol` 带 `local_version`。**2026-10-30 发布收尾起，提醒只看这一次调用报上来的版本**：最新不提醒；旧版（含认不出的值）在返回值里带 `skill_update`，`message` 末尾两行是升级入口（仓库里 skill 的地址 + `更新技能/bywood-writing-desk`），模型照抄给写手；没报（或报「无」这类占位）只记一笔计数、不提醒。其它工具不再捎提醒。不拦写稿。<br>原来按身份记版本、没报就沿用 12 小时内的记录或提醒「没核到版本」、其它工具 30 分钟抽查一次——一个团队共用一个身份时，一个人的旧 skill 让所有人收到提醒，重启后每场开头又报一句「没核到」，所以撤了。计数在进程内存里，重启清零。要找还在用旧版的人：看 `outdated_versions` 有没有值，在群里让大家各自看一眼 skill 里那一行。<br>**2026-11-11 起不带 key、重启之后也查得到**：每次存档那一行指标带 `meta.skill_versions`（就是这份计数），`open_project` / `comments_for` 的调用记录带 `meta.skill`（这一次报上来的是最新 / 旧版 / 没报），只读 SQL 见 `docs/deskcore.md` §3.8 末尾。 |
 | **每个工具调了几次、多久、怎么收场** | 只读 SQL 查 `autowriter.batch_metrics` 里 `meta->>'mode' = 'tool_call'` 的行（2026-11-11 起每次工具调用一行，只有数；查询在 `docs/deskcore.md` §3.8 末尾）。评论那一路判了几条、哪一样检查打回了几条也在这里（W-51 不用再翻网关日志）。写不进去不影响任何调用，只在服务日志里留一行 `工具调用留痕: 没写进库`（5 分钟最多一行）；要停就设 `DESKCORE_TOOL_CALL_LOG=0`。 |
@@ -316,6 +316,38 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `dashboard_views_v1.sql`），理由写在迁移文件头。验收：`doctor` 里「视图 v_angle_outcomes」applied；
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
+
+### 1.18 `022_lesson_exposure` —— 查重底稿上记这一场看到了哪几张经验卡；存完档在后台判人感题（2026-11-15，十三项第 3 / 7 项，**生产库还没跑**）
+
+这一节是 11-15 那次部署的两件事，只有第一件带迁移。设计和读法在 `docs/deskcore.md` §3.33 / §3.34。
+
+**① 经验卡的曝光记录（`022`）。** 借卡时服务端记下带出去的是哪几张卡、哪几条规律；存档时写进 `batches.params.lesson_exposure`
+（不用迁移），查重时写到底稿上（`draft_snapshots.lesson_exposure`，022 加的这一列）。022 只加一个可空的 JSONB 列，
+**不碰数据**，不建表、不建函数、不发 GRANT。
+
+**顺序。** 代码不依赖它，先于或后于部署都行，可以重复跑。没跑时：记底稿那一步去掉这一列再写一次，服务日志里响一次
+「draft_snapshots 还没有 lesson_exposure 这一列」的警告，底稿和以前一模一样；tv-sync 读底稿退回原来那几列；存档的批次照样记。
+少的只是「只查了重、没存档就发出去」的稿子转正时带不上这一场看到的卡。跑了之后最多十分钟自动用上，不用重新部署。
+① SQL Editor 跑 `022`。② 不用手动验收：`doctor` 里「draft_snapshots 的 lesson_exposure 列」applied。写手不用做什么，
+skill 不用重新导入（协议正文没变，`sync-skill --check` 还是 `6f23eba491fd`）。
+
+**读数**（只读，想看的时候跑）：`python -m deskcore.cli lesson-exposure --days 90`。每张卡被几批稿子看到过、那几批发出去
+几篇、几篇起量，只有 id 和计数。它是曝光，不是「这张卡起了作用」的证明；共用身份的几场会并在一起；借卡之后服务重启过的
+批次记的是「不知道」。
+
+**② 人感题和暗题的影子判定（不带迁移）。** 部署之后默认就开：每次存档真存进去了版本，后台对每一版多发一次 `/judge_draft`
+（只判人感题库、逐段判、`run_tag=shadow-human`），答案只落 TV 账本，写手和模型看不到，不影响参考分。**这是一笔新的
+Jev 开销**：每版一次请求，Jev 那边每段至少一次模型调用（正文每个非空行算一段），一批十篇约一百五十次。实数查
+`batch_metrics.meta.shadow_human`（SQL 在 §3.34）。要停：Railway 上设 `DESKCORE_SHADOW_HUMAN=0`，重启后生效；不设就是开。
+
+部署后看一眼：存一批稿子，几分钟后那一行 `batch_metrics` 的 `meta.shadow_human.status` 是 `judged`、`ledger_errors` 是 0；
+账本里 `run_tag = 'shadow-human'` 有了行。`status` 是 `not_configured` = 这个项目没接 `tv_project_map`（和存档那次判定同一个
+原因）；`statuses` 里有 `timeout`、带 `stopped_early` = Jev 慢，那一批剩下的没发（下一批照常）；`statuses` 里是 `unavailable` = key 不对、
+服务没起，或者 `judge_client.HUMAN_BANK_NAME` 那个题库文件在 Jev 那边被删了。**Jev 给人感题库升版本不会报错**（旧文件留着，
+照样回 200，答的是旧题库）：Jev 升的时候要手工改这个常量。
+
+**要 TV 那边跟着改的一处**：`scripts/verify_supabase_state.sql` 第 84 项按 `subject_id` 整串对 `autowriter.versions`，段级行的
+`subject_id` 是 `<版本 id>:p<段号>`，会被数成孤儿。那一项要先去掉 `:p<段号>` 再对；没改之前那个数会涨，不代表有版本被删。
 
 ### 1.17 `021_style_distillation_cas` —— 调校笔记按任务版本写回（2026-11-14，外部审查 F01，**生产库还没跑**）
 
