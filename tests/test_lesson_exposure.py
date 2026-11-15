@@ -381,3 +381,49 @@ def test_cli_says_so_when_batches_cannot_be_read(monkeypatch, capsys):
         days, project, json = 90, None, False
     assert cli._lesson_exposure(FakeClient(rows={}), Args) == 1
     assert "什么都没算" in capsys.readouterr().out
+
+
+# ── Codex on #161: 报表的批次查询在库里就按 source 筛, 补录 / 界面生成的批次不占那 5000 行的上限 ─────────────
+
+class _RecordingBatches:
+    """只认 report_exposure_batches 用到的那几个链式调用: 记下筛选条件, 按条件回行。"""
+
+    def __init__(self, rows, log):
+        self._rows, self._log, self._filters, self._range = rows, log, [], (0, 10 ** 9)
+
+    def select(self, *_a, **_k):
+        return self
+
+    def eq(self, col, value):
+        self._filters.append((col, value))
+        return self
+
+    def gte(self, *_a, **_k):
+        return self
+
+    def order(self, *_a, **_k):
+        return self
+
+    def range(self, lo, hi):
+        self._range = (lo, hi)
+        return self
+
+    def execute(self):
+        self._log.append(list(self._filters))
+        rows = self._rows
+        if ("params->>source", "deskcore") in self._filters:
+            rows = [r for r in rows if (r.get("params") or {}).get("source") == "deskcore"]
+        lo, hi = self._range
+        return type("R", (), {"data": rows[lo:hi + 1]})()
+
+
+def test_exposure_report_filters_desk_batches_in_the_query_before_the_cap():
+    noise = [{"id": f"n{i}", "project_id": "p", "created_at": f"2026-11-01T00:00:{i:02d}", "params": {"source": "ingest"}}
+             for i in range(6)]
+    desk = {"id": "d1", "project_id": "p", "created_at": "2026-11-02T00:00:00",
+            "params": {"source": "deskcore", store.SNAPSHOT_EXPOSURE_COL: {"cards": ["c1"]}}}
+    log: list = []
+    sb = type("SB", (), {"table": lambda self, name: _RecordingBatches(noise + [desk], log)})()
+    out = store.report_exposure_batches(sb, 30, cap=3)       # 上限比前面那些不相干的批次少
+    assert [b["id"] for b in out] == ["d1"], "不相干的批次不能把上限占满"
+    assert all(("params->>source", "deskcore") in f for f in log)

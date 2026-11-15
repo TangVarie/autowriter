@@ -3300,6 +3300,7 @@ def report_exposure_batches(sb, days: int, project_id: str | None = None,
     try:
         rows = _paged(lambda off, lim: _maybe_eq(
             sb.table("batches").select("id, project_id, created_at, params"), "project_id", project_id)
+            .eq("params->>source", "deskcore")          # 在库里就筛(同 desk_batches_since): 补录、界面生成的批次不占上限(Codex on #161)
             .gte("created_at", since).order("created_at").order("id").range(off, off + lim - 1), hard_cap=cap)
     except Exception as exc:                            # noqa: BLE001
         logger.warning("lesson exposure report: batches unreadable: %s", f"{type(exc).__name__}: {exc}"[:200])
