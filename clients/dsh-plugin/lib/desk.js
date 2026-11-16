@@ -13,6 +13,9 @@ export const KEY_REF = 'BYWOOD_DESK_KEY'
 /** 没开项目不许调的三个工具：发牌、查重、存档。 */
 export const GATED_TOOLS = new Set(['draw_angles', 'check_drafts', 'score_drafts'])
 
+/** 服务端还留着的旧工具名。拦截和记账都按新名字算，不然换个名字就绕过去了。 */
+const ALIASES = { commit_drafts: 'score_drafts' }
+
 const PROTOCOL_TIMEOUT_MS = 15_000
 
 /**
@@ -142,17 +145,21 @@ ${protocol.trim()}`
 
 /**
  * 当前该放进系统提示的那一段。
- * @param {{ configured: boolean, protocol?: { version: string, protocol: string, header: string }, lastError?: string }} status
+ * `serverError` 是 MCP 服务没挂上：协议取得到也没用，工具不在，照「没连上」说。
+ * @param {{ configured: boolean, protocol?: { version: string, protocol: string, header: string }, lastError?: string, serverError?: string }} status
  */
 export function buildSection(status) {
   if (!status.configured) return NOT_SET_UP
+  if (status.serverError) return notConnected(status.serverError)
   if (!status.protocol) return notConnected(status.lastError ?? '还在连接')
   return connected(status.protocol)
 }
 
-/** 去掉前缀后的写作台工具名；不是写作台的工具返回 undefined。 */
+/** 去掉前缀、旧名换成新名之后的写作台工具名；不是写作台的工具返回 undefined。 */
 export function deskTool(name) {
-  return typeof name === 'string' && name.startsWith(TOOL_PREFIX) ? name.slice(TOOL_PREFIX.length) : undefined
+  if (typeof name !== 'string' || !name.startsWith(TOOL_PREFIX)) return undefined
+  const tool = name.slice(TOOL_PREFIX.length)
+  return Object.hasOwn(ALIASES, tool) ? ALIASES[tool] : tool
 }
 
 /**

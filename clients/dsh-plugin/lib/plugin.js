@@ -17,12 +17,14 @@ const SOURCE_KIND = 'bywood-writing-desk'
  * @param {{ createUserMessage: Function, fetchImpl?: typeof fetch, refreshMs?: number }} deps
  */
 export function install(ctx, { createUserMessage, fetchImpl, refreshMs = REFRESH_MS }) {
-  const status = { configured: false, base: undefined, protocol: undefined, lastError: undefined, fetchedAt: undefined }
+  // lastError 是取协议的错，serverError 是 MCP 服务没挂上的错。两件事分开记：REST 通了不等于工具挂上了。
+  const status = { configured: false, base: undefined, protocol: undefined, lastError: undefined, serverError: undefined, fetchedAt: undefined }
   const states = new WeakMap()
   let unregisterServer
   let registeredBase
   let disposed = false
-  let generation = 0
+  let active
+  let pending
 
   const stateOf = (session) => {
     let state = states.get(session)
@@ -71,28 +73,29 @@ export function install(ctx, { createUserMessage, fetchImpl, refreshMs = REFRESH
         headers: { 'X-Deskcore-Key': `\${credential:${KEY_REF}}` },
       })
       registeredBase = base
+      status.serverError = undefined
     } catch (error) {
-      status.lastError = `MCP 服务挂不上（${error?.message ?? error}）`
-      warn(status.lastError)
+      status.serverError = `写作台的工具没挂上（${error?.message ?? error}）`
+      warn(status.serverError)
     }
   }
 
-  /** 读凭据、挂 MCP、取协议。并发调用时只有最后一次的结果生效。 */
-  const reload = async () => {
-    const mine = ++generation
+  /** 读凭据、挂 MCP、取协议。一次跑完整的一遍，不会抛错。 */
+  const run = async () => {
     const [base, key] = await Promise.all([resolveRef(URL_REF), resolveRef(KEY_REF)])
-    if (disposed || mine !== generation) return
+    if (disposed) return
     status.configured = Boolean(base && key)
     status.base = base
     if (!status.configured) {
       dropServer()
       status.protocol = undefined
       status.lastError = undefined
+      status.serverError = undefined
       return
     }
     ensureServer(base)
     const fetched = await fetchProtocol({ base, key, ...(fetchImpl ? { fetchImpl } : {}) })
-    if (disposed || mine !== generation) return
+    if (disposed) return
     if (fetched.ok) {
       status.protocol = { version: fetched.version, protocol: fetched.protocol, header: fetched.header }
       status.lastError = undefined
@@ -104,7 +107,28 @@ export function install(ctx, { createUserMessage, fetchImpl, refreshMs = REFRESH
     }
   }
 
-  const reloadQuietly = () => { void reload().catch(error => warn(`刷新失败：${error?.message ?? error}`)) }
+  const start = () => {
+    active = run()
+      .catch(error => warn(`刷新失败：${error?.message ?? error}`))
+      .finally(() => { active = undefined })
+    return active
+  }
+
+  /**
+   * 一次只跑一遍。正在跑的时候再叫，就排一遍在后面，后来的人都等这同一遍：
+   * 它读到的一定是他们叫的时候已经存好的凭据，等它回来 status 也一定是跑完的样子。
+   */
+  const reload = () => {
+    if (pending) return pending
+    if (!active) return start()
+    pending = active.then(() => {
+      pending = undefined
+      return start()
+    })
+    return pending
+  }
+
+  const reloadQuietly = () => { void reload() }
 
   ctx.effect(() => {
     const timer = setInterval(reloadQuietly, refreshMs)
@@ -155,10 +179,12 @@ export function install(ctx, { createUserMessage, fetchImpl, refreshMs = REFRESH
     handler: async () => {
       await reload()
       if (!status.configured) return { kind: 'success', text: '写作台还没配置。输入 /desk-setup 地址 钥匙。' }
+      if (status.serverError) return { kind: 'error', text: `写作台没连上：${status.serverError}。重启桌面端再试，还不行找负责人。` }
       if (status.lastError) {
         const stale = status.protocol ? '（手上还有上一次取到的协议，能继续用）' : ''
         return { kind: 'error', text: `写作台没连上：${status.lastError}${stale}。` }
       }
+      if (!status.protocol) return { kind: 'error', text: '写作台还在连接，过几秒再输入一次 /desk-status。' }
       return { kind: 'success', text: `写作台连着。协议版本 ${status.protocol.version}。` }
     },
   }), 'bywood-writing-desk /desk-status')

@@ -156,3 +156,22 @@ test('压缩之后：要重新开项目，并补一句提醒，提醒只发一�
   assert.equal(takeReopenNotice(state), undefined) // 模型自己先重开了，就不用再提醒
   assert.equal(gate(state, t('score_drafts'), { project_id: 'p1' }).kind, 'allow')
 })
+
+test('旧名 commit_drafts 按 score_drafts 算：一样被拦，存了档一样不催', () => {
+  const state = newState()
+  assert.equal(gate(state, t('commit_drafts'), { project_id: 'p1' }).kind, 'deny')
+  observe(state, t('open_project'), { project_id: 'p1' }, ok({}))
+  assert.equal(gate(state, t('commit_drafts'), { project_id: 'p1' }).kind, 'allow')
+  observe(state, t('check_drafts'), { project_id: 'p1' }, ok({}))
+  observe(state, t('commit_drafts'), { project_id: 'p1' }, ok({ delivery: {} }))
+  assert.equal(stopping(state), undefined)
+  compacted(state)
+  assert.equal(gate(state, t('commit_drafts'), { project_id: 'p1' }).kind, 'deny')
+})
+
+test('MCP 没挂上时，协议取到了也照「没连上」说', () => {
+  const text = buildSection({ configured: true, serverError: '写作台的工具没挂上（name taken）', protocol: { version: 'v1', protocol: '正文', header: '' } })
+  assert.match(text, /不要写稿/)
+  assert.match(text, /没挂上/)
+  assert.doesNotMatch(text, /protocol_version/)
+})

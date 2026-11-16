@@ -9,7 +9,7 @@ const ok = payload => ({ isError: false, value: { structuredContent: payload } }
 const t = name => `${TOOL_PREFIX}${name}`
 
 /** 一个够用的假 ctx：记下插件注册了什么，能手动触发事件。 */
-function fakeCtx({ creds = {}, protocol = { version: 'v1', protocol: '# 协议正文', skill_header: '头' }, status = 200 } = {}) {
+function fakeCtx({ creds = {}, protocol = { version: 'v1', protocol: '# 协议正文', skill_header: '头' }, status = 200, registerError, gateFetch } = {}) {
   const store = new Map(Object.entries(creds))
   const listeners = new Map()
   const disposers = []
@@ -28,6 +28,7 @@ function fakeCtx({ creds = {}, protocol = { version: 'v1', protocol: '# 协议�
     },
     mcpManager: {
       register(name, entry) {
+        if (registerError) throw new Error(registerError)
         record.servers.push({ name, entry })
         return () => { record.unregistered += 1 }
       },
@@ -42,6 +43,7 @@ function fakeCtx({ creds = {}, protocol = { version: 'v1', protocol: '# 协议�
   }
   const fetchImpl = async (url, init) => {
     record.fetches.push({ url, key: init.headers['X-Deskcore-Key'] })
+    if (gateFetch) await gateFetch
     return { status, ok: status === 200, json: async () => ({ result: protocol }) }
   }
   const createUserMessage = input => ({ ...input, role: 'user', id: 'm' })
@@ -194,5 +196,36 @@ test('事件接线：拦截、放行、催存档、压缩后提醒', async () =>
   f.emit('session/event', other.session, { type: 'compaction/end', data: { error: 'no model' } })
   assert.equal((await f.emit('tools/pre-execute', { name: t('draw_angles'), arguments: { project_id: 'p9' }, agent: other }, allow)).kind, 'allow')
   assert.deepEqual(await f.emit('agent/pre-step', { agent, messages: [] }, async () => ({ kind: 'reject' })), { kind: 'reject' })
+  f.dispose()
+})
+
+test('MCP 挂不上：协议取到了，/desk-status 也不说连着，系统提示说不写稿', async () => {
+  const f = fakeCtx({ creds: { [URL_REF]: 'https://d.example.com', [KEY_REF]: 'k-secret-123456' }, registerError: 'server "deskcore" is already configured or registered' })
+  install(f.ctx, f.deps)
+  await settle()
+  const result = await f.record.commands.get('desk-status').handler({})
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /没挂上/)
+  assert.match(sectionText(f.record), /不要写稿/)
+  f.dispose()
+})
+
+test('第一次取协议还没回来时连着问两次 /desk-status：都等到结果，不报错', async () => {
+  let release
+  const gateFetch = new Promise((resolve) => { release = resolve })
+  const f = fakeCtx({ creds: { [URL_REF]: 'https://d.example.com', [KEY_REF]: 'k-secret-123456' }, gateFetch })
+  install(f.ctx, f.deps)
+  await tick()
+  const status = f.record.commands.get('desk-status')
+  const first = status.handler({})
+  const second = status.handler({})
+  await tick()
+  release()
+  const results = await Promise.all([first, second])
+  for (const result of results) {
+    assert.equal(result.kind, 'success')
+    assert.match(result.text, /连着.*v1/)
+  }
+  assert.equal(f.record.fetches.length, 2) // 开机那一遍 + 两次询问合成的一遍
   f.dispose()
 })
