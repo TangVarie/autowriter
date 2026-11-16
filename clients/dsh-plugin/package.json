@@ -1,0 +1,13 @@
+{
+  "name": "bywood-writing-desk-dsh",
+  "version": "0.1.0",
+  "description": "写作台：给品牌写小红书内容时自动接上项目规则、查重和存档。",
+  "type": "module",
+  "main": "index.js",
+  "files": ["index.js", "lib", "cordis.patch.yml", "README.md"],
+  "license": "UNLICENSED",
+  "engines": { "dsh": ">=0.2.2-rc.1 <0.3.0" },
+  "peerDependencies": { "@deepseek-ai/dsh-llm": "*" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": { "test": "node --test test/*.test.js" }
+}
