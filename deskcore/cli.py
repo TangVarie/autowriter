@@ -438,11 +438,28 @@ def _tv_map(core, sb, args) -> int:
     if not rows:
         print("tv_project_map 是空的 —— 用 `tv-map add --tv-project SPX_phase1 "
               "--project <uuid> --ingest-target` 加。")
-        return 0
     for r in rows:
         mark = "← 补录目标" if r.get("ingest_target") else ""
         print(f"  {r['tv_project_id']:16s} → {r['project_id']}  {mark} {r.get('note') or ''}")
+    _print_missing_judge(core, sb)
     return 0
+
+
+def _print_missing_judge(core, sb) -> None:
+    """对照表后面跟一段: 还在写、却没接上的项目。查不出来只说一句, 不影响上面那张表。"""
+    try:
+        missing = core.projects_missing_judge(sb)
+    except Exception as e:                              # noqa: BLE001 — 清点失败不该让 tv-map 整条命令报错
+        print(f"\n(没查出「在写但没接」的项目: {type(e).__name__}: {e})")
+        return
+    if not missing:
+        print(f"\n近 {core.MISSING_JUDGE_DAYS} 天存过稿子的项目都接上了。")
+        return
+    print(f"\n近 {core.MISSING_JUDGE_DAYS} 天存过稿子、但没接判定服务的项目({len(missing)} 个) —— "
+          "打分、合规检查、规则检查、评论整组判定在它们上面都不跑:")
+    for m in missing:
+        print(f"  {m['name']}({m['brand'] or '没填品牌'})  {m['batches']} 批  {m['project_id']}")
+    print("  接上: python -m deskcore.cli tv-map add --tv-project <TV项目号> --project <上面的 id>")
 
 
 def _tv_resolve(core, sb, args) -> int:

@@ -117,6 +117,11 @@ SUPABASE_SERVICE_ROLE_KEY: str = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
 # ── Feishu (Lark) Webhook ──────────────────────────────────────────────────
 FEISHU_WEBHOOK_URL: str = _get_secret("FEISHU_WEBHOOK_URL")
 
+# 写作台(deskcore): 写手新建了项目时提醒负责人去接判定服务(deskcore/ownernotice.py, 2026-11-16)。
+# 填一个飞书群机器人的 webhook 地址; 不配就不发, 建项目的返回里会改成请写手转告负责人。
+# 故意不复用上面那个: 那是稿件推送的群。机器人开了关键词校验的话, 关键词填「写作台」。
+DESKCORE_OWNER_WEBHOOK_URL: str = _get_secret("DESKCORE_OWNER_WEBHOOK_URL")
+
 # ── Flywheel librarian (TV pull 馆员, R-032) ─────────────────────────────────
 # 写稿时向 TV 的 LLM 馆员服务借阅匹配的"真实爆款经验"注入 P2(见 docs/15 +
 # librarian_client.py)。URL/KEY 由 TV 侧给(部署在 Railway)。

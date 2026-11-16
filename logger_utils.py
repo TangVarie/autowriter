@@ -65,12 +65,13 @@ def _load_value_secrets() -> tuple[str, ...]:
             # ≥8 字符才入表: 避免把过短占位值(如 "1"/"test")当 secret 误伤正文
             if isinstance(v, str) and len(v) >= 8:
                 vals.append(v)
-        wh = getattr(_cfg, "FEISHU_WEBHOOK_URL", "") or ""
         # 飞书 webhook 的鉴权就在 URL 路径里 —— 只脱 token 段, 保留域名便于排障
-        if "/hook/" in wh:
-            token = wh.split("/hook/", 1)[1].strip("/")
-            if len(token) >= 8:
-                vals.append(token)
+        for wh_name in ("FEISHU_WEBHOOK_URL", "DESKCORE_OWNER_WEBHOOK_URL"):
+            wh = getattr(_cfg, wh_name, "") or ""
+            if "/hook/" in wh:
+                token = wh.split("/hook/", 1)[1].strip("/")
+                if len(token) >= 8:
+                    vals.append(token)
     except Exception:
         pass
     # 长值优先替换, 防止短值是长值子串时把长值劈成两半留尾巴

@@ -2781,6 +2781,28 @@ def tv_project_map(sb) -> list[dict]:
                  .order("tv_project_id").execute()).data or [])
 
 
+def projects_written_since(sb, since: str) -> list[dict]:
+    """``since`` 之后存过稿子的项目(``batches.created_at``), 每个带这段时间的批次数(core.projects_missing_judge 用)。
+
+    只取 batches 的两列翻页, 再按 id 分块取项目行: 这是 CLI 才跑的清点, 不在写手的调用路径上。按 id 翻页(唯一)。
+    回 ``[{"id", "name", "brand", "default_params", "batches"}]``, 批次多的在前。"""
+    counts: dict[str, int] = {}
+    for r in _paged(lambda off, lim: (
+            sb.table("batches").select("id, project_id").gte("created_at", since)
+              .order("id").range(off, off + lim - 1))):
+        if r.get("project_id"):
+            counts[r["project_id"]] = counts.get(r["project_id"], 0) + 1
+    ids = sorted(counts)
+    rows: list[dict] = []
+    for i in range(0, len(ids), 100):
+        rows.extend((sb.table("projects").select("id, name, brand, default_params")
+                       .in_("id", ids[i:i + 100]).execute()).data or [])
+    for row in rows:
+        row["batches"] = counts.get(row["id"], 0)
+    rows.sort(key=lambda row: (-row["batches"], str(row.get("name") or "")))
+    return rows
+
+
 def tv_published_note_ids(sb, tv_project_ids: list[str], since: str, until: str) -> list[str]:
     """这几个 TV 项目里 publish_time 落在 [since, until] 的笔记 id(core.desk_gaps 用)。
 
