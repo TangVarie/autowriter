@@ -1,13 +1,49 @@
 {
   "name": "bywood-writing-desk-dsh",
-  "version": "0.1.0",
-  "description": "写作台：给品牌写小红书内容时自动接上项目规则、查重和存档。",
+  "version": "1.0.0",
+  "description": "写作台：左侧栏的一个入口，只在从它开的对话里接上项目规则、查重和存档。",
   "type": "module",
-  "main": "index.js",
-  "files": ["index.js", "lib", "cordis.patch.yml", "README.md"],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "client.js",
+    "cordis.patch.yml",
+    "presets",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md"
+  ],
   "license": "UNLICENSED",
-  "engines": { "dsh": ">=0.2.2-rc.1 <0.3.0" },
-  "peerDependencies": { "@deepseek-ai/dsh-llm": "*" },
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
-  "scripts": { "test": "node --test test/*.test.js" }
+  "engines": {
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.patch.yml",
+        "./presets/writing-desk.patch.yml"
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
 }
