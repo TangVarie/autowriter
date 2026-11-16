@@ -54,7 +54,10 @@ test('系统提示三种状态：没配置 / 没连上 / 连着', () => {
   assert.match(up, /# 协议正文/)
   assert.match(up, new RegExp(TOOL_PREFIX + 'open_project'))
   // 服务端说明里的老说法（skill / 核版本 / WorkBuddy / mcp.json）在这一段里被覆盖。
-  assert.match(up, /四点/)
+  assert.match(up, /五点/)
+  // 交付前逐字自查：错字和对不上的数字、标注，流程里没有别的环节查得出来。
+  assert.match(up, /逐字读一遍/)
+  assert.match(up, /数字、金额、时间前后要对得上/)
   assert.match(up, /不适用/)
   assert.match(up, /WorkBuddy/)
   assert.match(up, /\/desk-status/)

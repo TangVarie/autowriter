@@ -307,11 +307,16 @@ def test_prose_after_an_inline_topic_stays_in_the_delivered_body():
                          ids=["ascii", "cjk", "prose"])
 def test_lifting_tags_is_linear(body):
     """摘末尾话题不用会回溯的正则(codex review on aw#115): 原来 "#a#a…#a[" 两万字要几秒, 一直握着 GIL。"""
-    t0 = time.monotonic()
-    delivery.lift_trailing_tags(body)
-    delivery.body_tags(body)
-    validator.count_chars(body)
-    assert time.monotonic() - t0 < 0.3
+    # 取三遍里最快的一遍: 共用的 CI 机器偶尔整段卡一下(2026-11-16 那次同一份代码跑了 0.301 秒, 平时 0.03 秒),
+    # 卡顿只会让某一遍变慢; 回溯的正则每一遍都要几秒, 最快的那遍照样过不了。
+    best = float("inf")
+    for _ in range(3):
+        t0 = time.monotonic()
+        delivery.lift_trailing_tags(body)
+        delivery.body_tags(body)
+        validator.count_chars(body)
+        best = min(best, time.monotonic() - t0)
+    assert best < 0.3
 
 
 def test_a_template_without_tags_leaves_the_body_alone():
