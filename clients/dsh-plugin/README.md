@@ -20,6 +20,7 @@
 
 ## 负责人要准备什么
 
+- **发新版**：改完插件要记得加版本号，合并后再去登记索引，步骤见 `clients/dsh-plugin-index/README.md`。
 - **安装地址**：`git+https://github.com/TangVarie/autowriter.git#<提交号>&path:/clients/dsh-plugin`，提交号用默认分支上的完整 40 位。
 - **每人一把钥匙**：照 `docs/deskcore-runbook.md`「加一个写手」加。
 - **写作台地址**：deskcore 的网址，带不带 `/mcp` 都行。
@@ -53,7 +54,7 @@
 - **评论**（`comments_for` / `score_comments`）没有加拦截，只靠协议。
 - **改版之前开的对话**不带规则，不做兼容：要接着写就从入口重新开一个。
 - **别的插件**：DeepSeek Harness 的插件之间没有隔离，同一台机器上的其他插件能读到钥匙、也能在同样的事件上做相反的事。
-- **升级插件本身**：从 Git 地址装的插件，换新版要用新的提交号重新添加一次。协议更新不走这条路。
+- **升级插件本身**：只用 Git 地址装的话，换新版要用新的提交号重新添加一次。订阅了插件索引（见 `clients/dsh-plugin-index/README.md`）的机器，插件页上会出现「有可用更新」，点一下即可。协议更新两条路都不用走，自动生效。
 
 ## 维护时要记得
 
