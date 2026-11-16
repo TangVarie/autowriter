@@ -245,6 +245,8 @@ def _clean(value, depth: int = 0):
     return None
 
 
+_COVER_KEYS = ("lessons_cover_note", "cover_note")     # 同 covernote.KEYS(open_project / borrow_lessons 各自的键)
+
 def build(job: dict) -> dict:
     """一次调用 → 要写进 ``batch_metrics`` 的那一行(``project_id / user_id / phase_ms / counters / meta``)。
 
@@ -285,6 +287,10 @@ def build(job: dict) -> dict:
         meta["skill"] = notes["skill"]                  # 入口工具这次报上来的 skill 版本: up_to_date / outdated / unknown
     if isinstance(notes.get("view"), bool):
         meta["view"] = notes["view"]                    # 存档时发没发排好版页面的链接(2026-11-12); 只这一个布尔, 链接不进来
+    if notes.get("cover_note") is True and any(isinstance(res.get(k), dict) for k in _COVER_KEYS):
+        # 借卡那两个工具这次的回包里带了封面那一句(2026-11-16); 没带就没有这个键。core 是在借卡那一步记的, 之后调用还可能
+        # 抛、或者降级成不带这一栏的错误回包 —— 所以这里再看一眼回包: 回包里真有这一栏才记
+        meta["cover_note"] = True
     return {"project_id": column, "user_id": job.get("user_id"), "phase_ms": {"total": elapsed}, "counters": {},
             "meta": _clean(meta)}
 

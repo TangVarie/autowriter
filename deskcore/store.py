@@ -3145,6 +3145,31 @@ def tv_paid_boost_note_ids(sb) -> set[str] | None:
     return out
 
 
+# 首图特征(2026-11-16): TV 的 v_first_image_features, 每篇做过首图那一步的帖一行(契约在 TV docs/34 第 6 节)。写作台只在
+# 借卡时拿它拼一句封面参考(covernote.build_note)。只取三列: 封面上抄下来的字不在这面视图里, 项目名、模型名这里也不取。
+TV_FIRST_IMAGE_VIEW = "v_first_image_features"
+FIRST_IMAGE_CHUNK = 200             # in 列表走 URL, 一批不超过 200 个(TV D-080)
+
+
+def tv_first_image_features(sb, note_ids) -> list[dict] | None:
+    """这几篇帖的首图特征: ``[{note_id, usable, answers}]``, 只要 ``usable`` 为真的行。没有行 = 这篇没有封面信息。
+    视图不在(TV 的 SQL 没跑)/ 没权限 / 读挂了回 None, 记一行 WARN(不写 note_id); 不抛。没有 id 回 [], 不发请求。"""
+    ids = list(dict.fromkeys(str(i) for i in (note_ids or ()) if i))
+    if not ids:
+        return []
+    out: list[dict] = []
+    try:
+        for i in range(0, len(ids), FIRST_IMAGE_CHUNK):
+            chunk = ids[i:i + FIRST_IMAGE_CHUNK]
+            rows = (sb.schema("truth_vault").table(TV_FIRST_IMAGE_VIEW).select("note_id, usable, answers")
+                      .eq("usable", True).in_("note_id", chunk).execute()).data or []
+            out.extend(r for r in rows if isinstance(r, dict))
+    except Exception as exc:                            # noqa: BLE001
+        _tv_warn("tv first image features", exc)
+        return None
+    return out
+
+
 TV_LAYER_CHUNK = 100
 
 

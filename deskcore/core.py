@@ -57,7 +57,7 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
-from . import calllog, commentstyle, delivery, ownernotice, postgate, poststyle, rulecheck, rulecompile
+from . import calllog, commentstyle, covernote, delivery, ownernotice, postgate, poststyle, rulecheck, rulecompile
 from . import drawpolicy as dp
 from . import fingerprint as fp
 from . import priors, project_now, store, structure, tvlink, viewpage, vocab
@@ -721,10 +721,12 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     # ⚠️ 这一段的失败**不能**影响简报: P0 已经拿到了, 卡借不到只是少点参考。
     # fetch_flywheel_lessons 本身绝不抛, 但 build_brief / 其它意外仍兜一层 ——
     # 兜住之后照样留痕(status.state=error + WARN 日志), 不吞成看似成功。
-    borrowed = _borrow_for_brief_bounded(project, brief, user_id=user_id, started=started)
+    borrowed = _borrow_for_brief_bounded(project, brief, user_id=user_id, started=started, client=client)
     out["lessons"] = borrowed["lessons"]
     if borrowed.get("paid_boost_note"):
         out["lessons_paid_boost_note"] = borrowed["paid_boost_note"]
+    if borrowed.get("cover_note"):
+        out["lessons_cover_note"] = borrowed["cover_note"]     # 借到的几篇帖封面的计数 {text, task}; 返回前挪到最后
     if borrowed.get("validated_patterns"):
         out["validated_patterns"] = borrowed["validated_patterns"]
         out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
@@ -842,7 +844,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         project_now.warm_desk(client, pid_now)
     except Exception:                                   # noqa: BLE001 — warm 本身不抛, 这里再兜一层
         logger.exception("angle priors warm failed (project=%s)", project_id)
-    return out
+    # 封面那一栏放在回包的最后(客户端裁大结果时留的是头和尾, 见 covernote.move_last); 没有这一栏时什么都不动
+    return covernote.move_last(out, "lessons_cover_note")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -10979,11 +10982,11 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     # F13: 这次实际交出去几条规律, 记在这个臂旁边; 沿用了简报里的臂 = 同一场接着借(carry), 和前面那次取大的;
     # A3: 这次带出去几张卡, 给存档那一行指标。到点没等到 = 这次交出去 0 条 / 0 张(后台之后选完的不算, 模型没看到)。
     out = _borrow_for_brief_bounded(project, delta, float(config.BORROW_LESSONS_WAIT_SEC), user_id=user_id,
-                                    arm=arm, carry=flywheel_arm == arm, followup=True)
+                                    arm=arm, carry=flywheel_arm == arm, followup=True, client=client)
     if out.get("validated_patterns"):       # 用法同简报那份(10-20): 每篇最多一条、轮换、有几篇不用
         out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
                                                               len(out["validated_patterns"]))
-    return out
+    return covernote.move_last(out, "cover_note")     # 封面那一栏放最后(同 open_project)
 
 
 # open_project 随简报带卡时的上限, 与常规生成路径 render_flywheel_block 同一
@@ -11007,6 +11010,42 @@ def _paid_boost_note(lessons) -> str | None:
     if not n:
         return None
     return PAID_BOOST_LESSON_NOTE.format(n=n, n_word="张" if n == 1 else "几张", it="它" if n == 1 else "它们")
+
+
+# 借卡时多带一句封面参考(2026-11-16): 这次借到的卡, 源帖的封面长什么样, 只报数(句子在 covernote.build_note)。
+# 数据是 TV 的 v_first_image_features(TV docs/34 第 6 节), 用写作台自己的 service_role 客户端读(store.tv_first_image_features)。
+# 这一步只能让回包多一句话, 不能让它少东西、变慢、出错: 视图不在 / 读挂 / 超时 / 没有够数的卡, 回包和没有这一步时一样。
+# 等多久是常量不是环境变量; 实际等的还要再夹一道 —— 不超过借卡预算里剩下的(见 _borrow_for_brief_bounded)。
+COVER_NOTE_WAIT_SEC = 1.5
+_COVER_NOTE_MIN_WAIT = 0.1          # 剩下的时间比这还少就不读了
+
+
+def _cover_note(client, lessons, wait: float) -> str | None:
+    """这批卡的那一句封面参考, 没有就回 None。**绝不抛**, 最多等 ``wait`` 秒(到点不等了, 读库那个线程由它自己结束)。
+    有源帖 id 的卡不到 ``covernote.MIN_USABLE`` 张、没有客户端、时间不够: 不发请求。"""
+    ex = None
+    try:
+        if client is None or wait is None or wait < _COVER_NOTE_MIN_WAIT:
+            return None
+        ids = covernote.source_ids(lessons)
+        if len(ids) < covernote.MIN_USABLE:
+            return None
+        ex = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cover-note")
+        fut = ex.submit(store.tv_first_image_features, client, ids)
+        try:
+            rows = fut.result(timeout=wait)
+        except cf.TimeoutError:
+            logger.warning("cover note: first-image read exceeded %.1fs; replied without it", wait)
+            return None
+        if not rows:
+            return None
+        return covernote.build_note(lessons, rows)
+    except Exception as exc:                            # noqa: BLE001 — 只是多一句参考, 不能碰借卡
+        logger.warning("cover note skipped: %s", f"{type(exc).__name__}: {exc}"[:200])
+        return None
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=False)
 
 
 # 借阅结局里"要人管"的那三种 —— 留痕用。empty 是正常结局, 不记 WARN。
@@ -11156,7 +11195,7 @@ def _run_borrow(fut: cf.Future, key, project: dict, delta: dict | None, user_id,
 def _borrow_for_brief_bounded(project: dict, delta: dict | None,
                               budget: float | None = None, *, user_id: str | None = None,
                               started: float | None = None, arm: str | None = None,
-                              carry: bool = False, followup: bool = False) -> dict:
+                              carry: bool = False, followup: bool = False, client=None) -> dict:
     """限时的借阅体: 和 ``_borrow_for_brief`` 一样绝不抛, 但只等 ``budget`` 秒, 到点先回。两个调用方:
 
     · ``open_project``(build_writing_brief): 不传 ``budget`` / ``arm``。**只等 ``OPEN_PROJECT_BORROW_SEC``**(默认 15 秒),
@@ -11176,8 +11215,12 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
     到点之后选卡线程不取消: TV 那边会把这次选卡跑完并写缓存, 模型动笔之前调一次 borrow_lessons 就拿得到 ——
     那次选卡还在跑的话, borrow_lessons 等的就是它(_borrows_running), 不向馆员发第二次; 已经跑完了就是同参数命中缓存。
     ``detail`` 里写清该怎么办(BORROW_TIMEOUT_NOTE / BORROW_STILL_SELECTING_NOTE), 模型读得到。
+
+    ``client``(2026-11-16): 调用方的库客户端, 只用来读那一句封面参考(_cover_note); 不传就没有那一句。那一步只用
+    ``budget`` 里剩下的时间, 所以这一层最坏等多久和原来一样。
     """
     budget = _brief_borrow_budget(started) if budget is None else float(budget)
+    deadline = time.monotonic() + budget
     # 臂在这里先定: 借阅超时 / 线程起不来, 简报也要带着臂交出去 (入库时原样传回)。调用方定好了的原样用
     arm = arm or _borrow_arm(project.get("id"), user_id)
 
@@ -11192,6 +11235,11 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
         note = _paid_boost_note(out.get("lessons"))
         if note:
             out["paid_boost_note"] = note               # 有投过流的帖的卡: 叫模型把卡上那一句转告用户(见常量)
+        cover = _cover_note(client, out.get("lessons"), min(COVER_NOTE_WAIT_SEC, deadline - time.monotonic()))
+        if cover:
+            # 借到的几篇帖封面的计数; 没有就没有这个键。值是 {text, task}: 拿它做什么跟着值走(见 covernote.TASK)
+            out["cover_note"] = covernote.wrap(cover)
+            calllog.note(cover_note=True)               # 这一次调用的留痕行里记一个布尔: 这句话发出去了(只在发了的时候记)
         return out
 
     def _failed(detail: str) -> dict:

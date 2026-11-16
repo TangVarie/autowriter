@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import calllog, core, skillcheck, vocab
+from . import calllog, core, covernote, skillcheck, vocab
 
 logger = logging.getLogger("deskcore.tools")
 
@@ -425,6 +425,9 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
         严禁照抄标题主干或具体句子; synthetic=true 的卡指标未经验证。
         paid_boost=true 的卡来自投过流的帖(why_it_worked 开头有一句「注意: …」): 照常可以借, 数据不全是内容带来的 ——
         返回里带 lessons_paid_boost_note 时照它说的, 把卡上那一句原样告诉用户一次, 借不借由用户判断。
+        返回里带 lessons_cover_note 时(在回包最后, 是 {text, task}): text 是这次借到的几篇帖封面的计数, 是给定封面的人看的,
+        没有人对着图核过, 只当参考、不是要求; 照 task 办: 交稿时把 text 原样告诉用户一次(用户问封面时也是它),
+        不改写、不加自己的建议; 没有这个键就是没有, 不要自己编。
         卡上的 validated_hits 是这张卡命中了哪几条已验证规律。
         external=true 的是【外部参考卡】(最多 2 张): 别家同品类的帖, 不是公司投的, 没有经过我们的数据验证;
         只借结构 / 钩子, 不抄内容, 也不要提它里面的任何品牌。
@@ -506,7 +509,8 @@ def open_project(project_id: str, tactic: str = "", draft_topic: str = "",
     # 2026-10-30 发布收尾: 不再带 desk_gap(同 list_projects)。
     # 服务端版本探针 (skillcheck): 只看这次传的 skill_version —— 一个团队共用一个身份, 别人的旧版、重启后没核到都不算到这一场头上。
     out = _attach_skill_update(out, "open_project", _user_id, skill_version)
-    return _with_desk_first(out, DESK_FIRST_POSTS)
+    # 封面那一栏(有才有)排在整个回包的最后: 上面几步还会往后加键(edit_digest / skill_update), 所以在这里再挪一次
+    return covernote.move_last(_with_desk_first(out, DESK_FIRST_POSTS), "lessons_cover_note")
 
 
 def draw_angles(project_id: str, n: int, avoid_days: int = 30,
@@ -588,6 +592,9 @@ def borrow_lessons(project_id: str, tactic: str = "", draft_topic: str = "",
        判断借鉴, 不要把它的数据当依据。
     ⚠️ 标了 paid_boost=true 的卡来自投过流的帖(why_it_worked 开头有一句「注意: …」): 照常可以借, 数据不全是内容
        带来的。返回里带 paid_boost_note 时照它说的, 把卡上那一句原样告诉用户一次, 借不借由用户判断。
+    返回里带 cover_note 时(在回包最后, 是 {text, task}): text 是这次借到的几篇帖封面的计数, 是给定封面的人看的,
+    没有人对着图核过, 只当参考、不是要求; 照 task 办: 交稿时把 text 原样告诉用户一次(用户问封面时也是它),
+    不改写、不加自己的建议; 没有这个键就是没有, 不要自己编。
 
     库里没有合适的卡时返回空列表, 这不是错误, 照常写就行。
 
