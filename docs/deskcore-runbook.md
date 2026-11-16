@@ -1040,6 +1040,7 @@ key 支持两种传法（`X-Deskcore-Key` 头、`Authorization: Bearer`），见
 | `LIBRARIAN_API_KEY` | 建议 | = TV librarian 那把 key |
 | `DESKCORE_ALLOWED_HOSTS` | 可选 | 逗号分隔；设了才开 MCP 的 Host 校验。配错的表现是 **421**，看着像客户端的问题 |
 | `DESKCORE_VIEW_PAGE` / `DESKCORE_VIEW_SECRET` / `DESKCORE_PUBLIC_URL` | 可选 | 管「排好版的页面」（`GET /v/{令牌}`，2026-11-12，`docs/deskcore.md` §3.29）。**都不配也能用**：签名的钥匙从 service_role 派生，地址用 Railway 给的公网域名（没有就用写手那次请求自己的 https 地址）。`DESKCORE_VIEW_PAGE=0` 整个关掉；`DESKCORE_VIEW_SECRET`（≥16 个字符）让链接不跟着 service_role 的轮换失效；`DESKCORE_PUBLIC_URL`（`https://主机`）只在换了自定义域名时需要。配了但用不了的不会退回默认，功能直接关着，`/health` 的 `view_page.reason` 说是哪一个。另有 `DESKCORE_PLAIN_LAYOUT=0`：不给没有交付模板的项目那句默认的排法（默认给） |
+| `DESKCORE_OWNER_WEBHOOK_URL` | 可选 | 写手新建项目时提醒负责人接判定服务（2026-11-16，`docs/deskcore.md` §3.35）。在要收提醒的飞书群里加一个「自定义机器人」，安全设置选「自定义关键词」填 `写作台`（不要选签名校验），把它给的 webhook 地址配到这里，重新部署。不配不发，写手会被请去转告负责人。收到提醒后照消息里的命令 `tv-map add`；想看还有哪些在写的项目没接，跑 `python -m deskcore.cli tv-map list`，对照表后面那一段就是 |
 | `DESKCORE_ALLOWED_ORIGINS` | 可选 | 逗号分隔的完整 origin。**不设 = 允许全部，这是安全的**：身份靠显式传的 key、从不靠 cookie，浏览器不会自动附上，所以没有 CSRF 面。配错的表现是客户端 **`fetch failed`**，服务端零痕迹 |
 | `DESKCORE_ALLOW_ANONYMOUS` | ⛔ 仅本地 | 设 `1` 才允许免 key 访问。**生产绝不能设** —— service_role 绕 RLS，匿名 = 全租户数据开放 |
 

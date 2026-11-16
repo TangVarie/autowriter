@@ -57,7 +57,7 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
-from . import calllog, commentstyle, delivery, postgate, poststyle, rulecheck, rulecompile
+from . import calllog, commentstyle, delivery, ownernotice, postgate, poststyle, rulecheck, rulecompile
 from . import drawpolicy as dp
 from . import fingerprint as fp
 from . import priors, project_now, store, structure, tvlink, viewpage, vocab
@@ -11338,7 +11338,26 @@ def create_project(client, name: str, *, brand: str = "",
             f"品牌「{brand}」名下已经有 {len(siblings)} 个项目。新建的这个是"
             "独立的一套历史库, 跟它们【不互相查重】。如果本意是在已有方向下"
             "继续写, 应该用那个项目而不是这个新的 —— 告诉用户, 让他确认。")
+    # 新项目没有 tv_project_map 那一行, 判定那几步不跑(_judge_project_context)。接上它要 TV 的项目号, 只有负责人给得出来:
+    # 推一条给负责人(配了才推), 再把后果和该找谁写进回包让模型告诉写手(ownernotice, 2026-11-16)。
+    out["judge_setup"] = ownernotice.writer_note(name, ownernotice.notify_new_project(name, brand, pid))
     return out
+
+
+MISSING_JUDGE_DAYS = 30
+
+
+def projects_missing_judge(client, *, days: int = MISSING_JUDGE_DAYS, now: datetime | None = None) -> list[dict]:
+    """近 ``days`` 天存过稿子、却没接判定服务的项目(``tv_project_map`` 里没有它), 标成暂时不用的不算。
+
+    给 ``tv-map list`` 用的清点(2026-11-16): 新项目的提醒(ownernotice)可能没配、没发成、或者发了没人处理, 这里是
+    事后能查到的那一份。只列还在写的 —— 早就不写的旧项目没接是常态, 列出来只会把真要处理的那一两个埋掉。
+    回 ``[{"project_id", "name", "brand", "batches"}]``, 批次多的在前。"""
+    since = ((now or datetime.now(timezone.utc)) - timedelta(days=days)).isoformat()
+    mapped = {m["project_id"] for m in store.tv_project_map(client) if m.get("project_id")}
+    return [{"project_id": p["id"], "name": p.get("name") or "", "brand": p.get("brand") or "", "batches": p["batches"]}
+            for p in store.projects_written_since(client, since)
+            if p["id"] not in mapped and not project_archived(p)]
 
 
 # 项目名里只当分隔用的符号: 去掉它们之后「途鸽-D8」「途鸽 D8」「途鸽·D8」是一个名字。不用 fingerprint.normalize(复审
