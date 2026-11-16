@@ -63,11 +63,32 @@ export function validateIndex(index) {
   return index
 }
 
-const parts = version => version.split(/[.+-]/).slice(0, 3).map(Number)
-const newer = (a, b) => {
-  const [x, y] = [parts(a), parts(b)]
-  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]
-  return false
+/**
+ * 按 SemVer 的先后比两个版本号：负数是 a 旧，正数是 a 新，0 是一样。
+ * 预发布版排在同号正式版之前（1.1.0-rc.1 < 1.1.0-rc.2 < 1.1.0）；`+构建号` 不参与比较。
+ */
+export function compareVersions(a, b) {
+  const split = (version) => {
+    const [core, ...pre] = version.split('+')[0].split('-')
+    return { core: core.split('.').map(Number), pre: pre.length ? pre.join('-').split('.') : [] }
+  }
+  const [x, y] = [split(a), split(b)]
+  for (let i = 0; i < 3; i++) if (x.core[i] !== y.core[i]) return x.core[i] - y.core[i]
+  if (!x.pre.length || !y.pre.length) return (x.pre.length ? 0 : 1) - (y.pre.length ? 0 : 1)
+  for (let i = 0; i < Math.max(x.pre.length, y.pre.length); i++) {
+    const [p, q] = [x.pre[i], y.pre[i]]
+    if (p === undefined) return -1
+    if (q === undefined) return 1
+    const [pn, qn] = [/^\d+$/.test(p), /^\d+$/.test(q)]
+    if (pn && qn) {
+      if (Number(p) !== Number(q)) return Number(p) - Number(q)
+    } else if (pn !== qn) {
+      return pn ? -1 : 1 // 纯数字的标识排在带字母的前面
+    } else if (p !== q) {
+      return p < q ? -1 : 1
+    }
+  }
+  return 0
 }
 
 /**
@@ -78,8 +99,8 @@ export function addVersion(index, { name, version, commit, path, repository, eng
   const plugin = index.plugins.find(entry => entry.name === name)
   if (!plugin) throw new Error(`索引里没有 ${name} 这个插件`)
   if (plugin.versions.some(entry => entry.version === version)) throw new Error(`${name} 的 ${version} 已经在索引里了；要发新版先改 package.json 的版本号`)
-  const highest = plugin.versions.map(entry => entry.version).sort((a, b) => (newer(a, b) ? -1 : 1))[0]
-  if (highest && !newer(version, highest)) throw new Error(`${version} 不比索引里最高的 ${highest} 新`)
+  const highest = plugin.versions.map(entry => entry.version).sort((a, b) => compareVersions(b, a))[0]
+  if (highest && compareVersions(version, highest) <= 0) throw new Error(`${version} 不比索引里最高的 ${highest} 新`)
   plugin.versions.unshift({
     version,
     publishTimestamp,
