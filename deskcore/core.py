@@ -726,7 +726,7 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
     if borrowed.get("paid_boost_note"):
         out["lessons_paid_boost_note"] = borrowed["paid_boost_note"]
     if borrowed.get("cover_note"):
-        out["lessons_cover_note"] = borrowed["cover_note"]     # 借到的几篇帖封面的计数(见 _cover_note)
+        out["lessons_cover_note"] = borrowed["cover_note"]     # 借到的几篇帖封面的计数 {text, task}; 返回前挪到最后
     if borrowed.get("validated_patterns"):
         out["validated_patterns"] = borrowed["validated_patterns"]
         out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
@@ -844,7 +844,8 @@ def build_writing_brief(client, project_id: str, *, user_id: str | None = None,
         project_now.warm_desk(client, pid_now)
     except Exception:                                   # noqa: BLE001 — warm 本身不抛, 这里再兜一层
         logger.exception("angle priors warm failed (project=%s)", project_id)
-    return out
+    # 封面那一栏放在回包的最后(客户端裁大结果时留的是头和尾, 见 covernote.move_last); 没有这一栏时什么都不动
+    return covernote.move_last(out, "lessons_cover_note")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -10985,7 +10986,7 @@ def borrow_lessons(client, project_id: str, *, user_id: str | None = None,
     if out.get("validated_patterns"):       # 用法同简报那份(10-20): 每篇最多一条、轮换、有几篇不用
         out["validated_patterns_usage"] = _patterns_usage_for(project.get("id") or project_id, user_id,
                                                               len(out["validated_patterns"]))
-    return out
+    return covernote.move_last(out, "cover_note")     # 封面那一栏放最后(同 open_project)
 
 
 # open_project 随简报带卡时的上限, 与常规生成路径 render_flywheel_block 同一
@@ -11236,7 +11237,9 @@ def _borrow_for_brief_bounded(project: dict, delta: dict | None,
             out["paid_boost_note"] = note               # 有投过流的帖的卡: 叫模型把卡上那一句转告用户(见常量)
         cover = _cover_note(client, out.get("lessons"), min(COVER_NOTE_WAIT_SEC, deadline - time.monotonic()))
         if cover:
-            out["cover_note"] = cover                   # 借到的几篇帖封面的计数; 没有就没有这个键
+            # 借到的几篇帖封面的计数; 没有就没有这个键。值是 {text, task}: 拿它做什么跟着值走(见 covernote.TASK)
+            out["cover_note"] = covernote.wrap(cover)
+            calllog.note(cover_note=True)               # 这一次调用的留痕行里记一个布尔: 这句话发出去了(只在发了的时候记)
         return out
 
     def _failed(detail: str) -> dict:

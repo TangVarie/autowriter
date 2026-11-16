@@ -171,7 +171,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | 写稿前 | `list_projects` | **我名下的**项目清单 + 各自的规则数/指纹数（按 `owner_id` 过滤，见 §2.2.1）。2026-10-30 起归档的项目默认不列，`include_archived=true` 才列（见 §3.13） |
 | | `open_project` | **一次拿全**写作简报：stable / p0 / p1 / tactics；另带最近发出去 / 写过的标题 `recent_titles`，以及最近的稿子在哪几处都写成一个样子 `recent_structure`（都是 2026-10-20，见 §3.1） |
 | | `draw_angles` | 发牌：n 组互不重复、避开台账的坐标，带可直接贴的 `prompt_block`（2026-10-30 起每篇那行带完整的 `angle_key`：「第1篇 [angle_key=…]」，模型照着贴进 `check_drafts` / `score_drafts`，不再自己编） |
-| | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`）。最多等 `BORROW_LESSONS_WAIT_SEC`（默认 18 秒），`open_project` 起的那次选卡还在跑就等它，不再发第二次（§3.26）。借到的卡里有三篇以上有封面记录、而且有哪一项至少两篇一样时多带一句 `cover_note`（`open_project` 是 `lessons_cover_note`，§3.36） |
+| | `borrow_lessons` | 转调 TV 馆员，**再**借一批真实爆款经验卡（`open_project` 已随简报借过一次，见 `lessons` / `lessons_status`）。最多等 `BORROW_LESSONS_WAIT_SEC`（默认 18 秒），`open_project` 起的那次选卡还在跑就等它，不再发第二次（§3.26）。借到的卡里有三篇以上有封面记录、而且有哪一项至少两篇一样时回包最后多带一栏 `cover_note`（`open_project` 是 `lessons_cover_note`；值是 `{text, task}`，§3.36） |
 | 写稿后 | `check_drafts` | **硬闸**：全量历史 + 本批内互比。改的是已经存过的那篇时带 `replaces_version_id`（2026-10-30，同 `score_drafts` 的字段、同一套核对 `_lookup_replacements`）：旧 item 全部版本的指纹不算它的对手，别的稿子照常比；**仍然只读**，不摘指纹。库里那一路（`deskcore_check_drafts`）每路只回最像的一条的标题、排除不了哪几行，不加迁移的做法是在 Python 里补（`_without_own_versions`）：先拿旧版那几行逐路比，库里回的命中比得过它们就是别的稿子、照用；比不过的那一路在去掉旧版之后的历史上重比——开头按哈希点查，标题语义 / 四字串把项目指纹拉回来再比（只拉要比的列，只给改稿那几篇）。被旧版挡在后面的别的稿子照样拦。id 对不上判 reject、`gate="replace_lookup"`。原来不认这个字段，改稿一查就被自己的旧版拦下（「正文开头与历史稿完全一致」），`archive_pending` 那句才叫模型改稿时跳过查重 |
 | | `judge_draft` / `repair_plan_for` | **写后参考判定（可选，影子期不拦）**：deskcore 用服务端的管理 key 转发到 judge 的 `/judge_draft`，`write` / `return_rows` 钉死 false；项目号、品类按 `tv_project_map` 定（与 §3.8 的影子判定同一条路）。写手只有 deskcore 这一个 MCP，不再在自己机器上起 judge 仓的 `judge.mcp_server`（2026-10-09） |
 | | `list_banks` | judge 上的题库清单（每家族最新版；暗题只报个数） |
@@ -673,6 +673,7 @@ project_id 同样没过归属校验：那一列只认回包里的 `project_id`�
 | `outcome` / `error_class` | 全部 / 没成的 | `ok`；`error_result`（没抛、但回的是带 `error` 的降级结果）；`refused`（400 / 403 / 404 / 409 那几类正常拒绝）；`failed`（真故障）；`interrupted`（客户端断了）。后三种带异常类型（同服务日志那一行） |
 | `items` / `reply_chars` | 有才带 | 这次带了几篇稿 / 几条评论 / 几个版本（发牌是要几张）；回包的字符数（紧凑 JSON，中文一个字算一个） |
 | `skill` | `open_project` / `comments_for` | 这次报上来的 skill 版本：`up_to_date` / `outdated` / `unknown`（没报） |
+| `cover_note` | `open_project` / `borrow_lessons`，发了才有 | `true` = 这次的回包里带了封面那一句（§3.36）。没发就没有这个键；借卡那一步记下了、但调用后来抛了或降级成不带这一栏的错误回包，也没有（写行时看回包里有没有这一栏） |
 | `check` | `check_drafts` | `total` / `pass` / `warn` / `reject`；`decided_by` 是可疑和拒的各由哪个信号定的（`opening` / `title` / `ngram` / `contain`，一篇可以有几个）；`gates` 是不是撞车的拒（`replace_lookup` 这类）；`semantic_degraded` |
 | `rules` | `check_rules` | 回包里的数（§3.11 的 2026-11-11 那一版回包）：`status`（`checked` / `nothing_to_check` / `no_versions` / `error`）；`versions`、`must_fix`、`suggest`、`unsure`、`unjudged`、`evidence_not_found`（Jev 怀疑有问题、指不出是哪一句的，算在 `unjudged` 里）、`not_finished`、`empty_body`、`code_unchecked`、`more`，都是整次的合计（同回包的 `summary`，有才带）；`flagged`（有要动手的那几篇）、`judged`（规则题判回来了的那几篇）；`unsure_rules` / `unsure_rules_hard`（最外层列出来的偏向没守住的规则几条、其中硬约束几条，最多 3）；`excluded` / `remaining`（不是这个项目的、留到下一次的各几版）；`pool` 是规则池里各几条（同回包的 `rules`，只取数：`pool` / `by_jev` / `by_code` / `uncompiled` / `partial` / `code_unavailable` / `code_withdrawn` / `not_compilable` …）。规则 id、版本 id、题面和 Jev 指出的句子都不取 |
 | `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样；帖子根本没查成的那两种超时没有这个键，看 `judge_status = timeout`）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks` |
@@ -2365,7 +2366,28 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 `docs/34-first-image-pass.md` 第 6 节）。写作台借到卡之后，拿卡上的 `source_note_id` 去那面视图里查，凑得出就在回包里多带
 一句话：这次借到的几篇帖，封面长什么样。只报数。
 
-- **键**：`open_project` 的 `lessons_cover_note`、`borrow_lessons` 的 `cover_note`。没有这句话时没有这个键，不放占位。
+- **键**：`open_project` 的 `lessons_cover_note`、`borrow_lessons` 的 `cover_note`。没有这句话时没有这个键，不放占位，
+  回包和原来逐键相同、先后也相同。
+- **值是 `{text, task}`**（同日第二版）：`text` 是那一句，`task` 是固定的一句话（`covernote.TASK`），告诉模型拿它做什么：
+  交稿时把 `text` 原样告诉用户一次，不改写、不加自己的建议，不是写稿要求，这场对话里已经说过就不用再主动说，用户再问封面时照样可以说。
+  原来值只有那一句，「原样转告」只写在工具说明里；该怎么办现在跟着值走，和 `recent_titles.task`、投流那一句是同一个做法。
+  工具说明里那几行留着当备份，说的是同一件事。
+- **排在回包的最后一个键**（`covernote.move_last`）：桌面那边的客户端会把大的工具结果裁成头 4096 + 尾 1024 个字符，
+  简报的头被 stable 和战术占着，中间的最先丢。这一栏最长三百来个字符，放在最后就整个落在留下来的尾巴里。
+  前提是中文在线上不被转义成 `\uXXXX`（转义之后最长的那种有一千二百来个字符，尾巴装不下）：REST 用的是
+  `ensure_ascii=False`，MCP 文本块那条路拿装着的 MCP 包走真的 `tools/call` 钉了一条用例，两条都不转义。
+  `open_project` 在 core 和工具两层各挪一次（工具那层后面还会加 `edit_digest`、`skill_update`），`borrow_lessons` 在加完
+  `validated_patterns_usage` 之后挪。
+- **发没发记一个布尔**：这一次调用的留痕行（§3.8，`batch_metrics.meta`，`mode = tool_call`）里多一个 `cover_note: true`，
+  只在发了的时候有（写行时再看一眼回包：调用后来抛了、或降级成不带这一栏的错误回包，就不记）；那句话的字和卡的 id 不进这一行。那一列是 JSONB，不用迁移。它记的是「服务端把这句话放进了回包」，
+  不是「写手看到了」。
+- **再打开一次会再来一遍**：服务端不记「这一场说过没有」（一个团队共用一个身份，分不出哪一场），同一个项目再打开一次、
+  再借一次，够条件就再带一次。桌面插件在压缩之后会强制重开项目，所以一场里可能拿到两次；靠 `task` 里那半句
+  「已经说过就不用再主动说」，模型不记得了就会再说一遍。接受这一点，不为它加状态。
+- **桌面插件那条路上没验证过**：那条路上这句话到不到写手，全看模型转告不转告：模型照的是系统提示里的协议，协议里没有这一栏
+  （没动协议），靠的就是值里的 `task`。服务端的用例只钉到「回包里有、在最后、裁完还在」；模型有没有照做、裁剪到底在什么时候
+  发生，都没有在真的桌面上验证过。上线前要在一台真的桌面上、拿测试项目看一遍：回包里有这个键，交稿时那一句原样出现，
+  压缩一次之后再看一遍。
 - **从哪读**：`store.tv_first_image_features`，用写作台自己的 service_role 客户端直读（和 `v_paid_boost_events` 同一条路），
   只取 `note_id, usable, answers` 三列，一批不超过 200 个 id。不取图，封面上抄下来的字那面视图里本来就没有。
   馆员不回这些，要它回得改 TV，这一步没动 TV。
@@ -2383,13 +2405,16 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 - **读不到就和原来一样**：视图不在（TV 的 SQL 没跑）、没授权、读挂、超时、一行都没有，回包和没有这一步时逐键相同，
   不报错。读不了和超时在服务端记一行 WARN；读通了但一行都没有不记（那是正常情况）。最多等 `core.COVER_NOTE_WAIT_SEC`（1.5 秒，常量），而且不超过借卡预算里剩下的时间，
   所以 `open_project` / `borrow_lessons` 最坏等多久没变。借卡超时、出错、没借到卡时不读。
-- 不加环境变量，不加迁移，不动协议和 skill（写手不用重导）。两个工具说明里各加了一句：有这个键时只当参考，交稿时原样告诉用户一次（定封面的是人，模型不转告这句话就到不了），没有就不要自己编。
+- 不加环境变量，不加迁移，不动协议和 skill（写手不用重导），桌面插件也不用发版。两个工具说明里各有一句：这个键在回包最后、是 `{text, task}`，照 `task` 办，把 `text` 原样告诉用户一次（定封面的是人，模型不转告这句话就到不了），没有就不要自己编。
 - 网页工作台那条生成路径（`memory.render_flywheel_block`）没动。
 
-样子：
+样子（`open_project` 回包的最后一个键）：
 
-```
-封面参考(只是计数): 这次借到的卡里有 4 篇的封面有记录, 其中 3 篇是一张照片, 2 篇封面上没有人(这一项 3 篇有答案)。这些是模型看图答的, 没有人对着图核过; 只说明这几篇帖的封面长这样, 不是规律, 不用照着做。
+```json
+"lessons_cover_note": {
+  "text": "封面参考(只是计数): 这次借到的卡里有 4 篇的封面有记录, 其中 3 篇是一张照片, 2 篇封面上没有人(这一项 3 篇有答案)。这些是模型看图答的, 没有人对着图核过; 只说明这几篇帖的封面长这样, 不是规律, 不用照着做。",
+  "task": "text 是这次借到的几篇帖封面的计数, 是给定封面的人看的, 不是写稿要求。交稿时把 text 原样告诉用户一次(用户问封面时也是它), 不改写、不加自己的建议; 这场对话里已经说过就不用再主动说, 用户再问时照样可以说。"
+}
 ```
 
 眼下能凑够三篇的时候不多：TV 那边多图的帖在有人确认「第一张就是封面」之前都不算 `usable`。长时间看不到这句话是
@@ -2397,7 +2422,8 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 
 **回归**：`tests/test_cover_note.py`（`usable` 不是布尔真的行不算、不到三篇不说、缺键不当否、不认识的键和取值忽略、
 最多两项、告诫在、开头写明只是计数、话里没有「爆帖」、「没有字」只说一遍且不漏掉多数、工具说明里叫模型原样转告、只取三列分批 200、视图不在 / 读抛 / 卡住时回包不变且不拖慢、不够三张卡或没借到卡时不发请求、
-协议和 skill 里没有这个键）。
+协议和 skill 里没有这个键；第二版：值是 `{text, task}`、整个值比留下来的尾巴短、两个工具的回包里它都是最后一个键而且照头 4096 + 尾 1024 裁完还在、
+没有这句话时键的先后也不变、调用留痕里只在发了的时候有那个布尔（调用抛了 / 降级了不记）、MCP 文本块里中文不转义、再开一次照样带、工具说明和回包的样子对得上）。
 
 ## 4. 接入
 

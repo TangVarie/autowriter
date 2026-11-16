@@ -71,6 +71,32 @@ _PHRASES: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
 CAVEAT = "这些是模型看图答的, 没有人对着图核过; 只说明这几篇帖的封面长这样, 不是规律, 不用照着做。"
 NOTE = "封面参考(只是计数): 这次借到的卡里有 {n} 篇的封面有记录, 其中 {clauses}。" + CAVEAT
 
+# 回包里这一栏的样子(2026-11-16 第二版): ``{"text": 那一句, "task": 拿它做什么}``。原来只有那一句, 「交稿时原样告诉用户」只写在
+# 工具说明里 —— 桌面插件那条路上模型照的是系统提示里的协议, 工具说明不一定重读, 这句话就到不了定封面的人那里。所以和
+# recent_titles.task、投流那一句一样, 该怎么办跟着值走(工具说明里那几行留着当备份)。task 是固定的一句, 里面没有数、没有 id。
+# 再打开一次项目(压缩之后插件会强制重开)这一栏会再来一遍, 所以 task 里说了: 这场对话里说过就不用再主动说(用户再问封面时照样可以说)。
+KEYS = ("lessons_cover_note", "cover_note")     # open_project / borrow_lessons 各自的键
+TASK = ("text 是这次借到的几篇帖封面的计数, 是给定封面的人看的, 不是写稿要求。交稿时把 text 原样告诉用户一次"
+        "(用户问封面时也是它), 不改写、不加自己的建议; 这场对话里已经说过就不用再主动说, 用户再问时照样可以说。")
+
+
+def wrap(text: str) -> dict:
+    """那一句 → 回包里的那一栏。text 在前、task 在后。"""
+    return {"text": text, "task": TASK}
+
+
+def move_last(out, key: str):
+    """把 ``key`` 挪到回包的最后一个键(原地改, 回同一个对象); 没有这个键、不是字典就原样回。**不抛**。
+
+    为什么要在最后: 桌面那边的客户端会把大的工具结果裁成头 4096 + 尾 1024 个字符, 简报的头被 stable / 战术占着,
+    中间的最先丢。这一栏很短, 放在最后就落在留下来的那一段尾巴里。"""
+    try:
+        if isinstance(out, dict) and key in out:
+            out[key] = out.pop(key)
+    except Exception:                                   # noqa: BLE001 — 只是换个位置
+        pass
+    return out
+
 
 def source_ids(lessons) -> list[str]:
     """这批卡的源帖 id(去重、保持顺序)。外部参考卡(``external`` 是 True)不是公司的帖, 不算; 没有 id、id 形状不对的不算。"""
