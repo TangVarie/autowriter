@@ -1,0 +1,58 @@
+{
+  "format": 1,
+  "title": {
+    "en": "BYWOOD writing desk",
+    "zh": "BYWOOD 写作台"
+  },
+  "description": {
+    "en": "Plugins for the BYWOOD writing desk.",
+    "zh": "BYWOOD 写作台用的插件。"
+  },
+  "plugins": [
+    {
+      "name": "bywood-writing-desk-dsh",
+      "title": {
+        "en": "Writing desk",
+        "zh": "写作台"
+      },
+      "description": {
+        "en": "A left-sidebar entry: clicking it opens a writing-desk conversation in the current workspace (agent preset “Writing desk”). The desk's project rules, angle draw, dedup and archiving follow only conversations started from it; ordinary conversations get a single signpost pointing at the tab and carry neither the protocol nor the deskcore tools. Configure the address and key with /desk-setup, then just talk.",
+        "zh": "左侧栏的一个入口：点一下就在当前工作区开一个写作台对话（智能体预设「写作台」）。写作台的项目规则、发文坐标、查重和存档只跟着从它开的对话走；普通对话里只有一句「写品牌小红书内容请走写作台」的指路，没有协议也没有 deskcore 的工具。地址和钥匙用 /desk-setup 配置，对话里照常说话就行。"
+      },
+      "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzNiIgaGVpZ2h0PSIzNiIgdmlld0JveD0iMCAwIDM2IDM2IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IldyaXRpbmcgZGVzayI+CiAgPCEtLSBBIHNoZWV0IHdpdGggYSBmb2xkZWQgY29ybmVyOyB0aGUgcGVuIGNyb3NzZXMgaXQuIFR3byByZXN0cmFpbmVkIHRvbmVzIHNvIGl0IHJlYWRzIG9uIGxpZ2h0IGFuZCBkYXJrIHRpbGVzLiAtLT4KICA8cGF0aCBkPSJNOSA1LjVoMTIuNkwyNyAxMC45VjMwYTIuMiAyLjIgMCAwIDEtMi4yIDIuMkg5QTIuMiAyLjIgMCAwIDEgNi44IDMwVjcuN0EyLjIgMi4yIDAgMCAxIDkgNS41WiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMkI2RjZBIiBzdHJva2Utd2lkdGg9IjIuMyIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgogIDxwYXRoIGQ9Ik0yMS40IDUuN3Y0LjNhMS40IDEuNCAwIDAgMCAxLjQgMS40aDQuMSIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMkI2RjZBIiBzdHJva2Utd2lkdGg9IjIuMyIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgogIDxwYXRoIGQ9Ik0xMC42IDE1LjRoMTEuMk0xMC42IDIwLjJoOC40IiBzdHJva2U9IiMyQjZGNkEiIHN0cm9rZS13aWR0aD0iMi4zIiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KICA8cGF0aCBkPSJtMTYuNCAyOS4yLjktMy41IDUuOS01LjkgMi42IDIuNi01LjkgNS45LTMuNS45WiIgZmlsbD0iI0Q5NzcwNiIvPgogIDxwYXRoIGQ9Im0yMy4yIDE5LjggMi42IDIuNiIgc3Ryb2tlPSIjQjQ1MzA5IiBzdHJva2Utd2lkdGg9IjEuNCIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+Cjwvc3ZnPgo=",
+      "author": "BYWOOD",
+      "repository": {
+        "url": "https://github.com/TangVarie/autowriter",
+        "directory": "clients/dsh-plugin"
+      },
+      "versions": [
+        {
+          "version": "1.0.1",
+          "publishTimestamp": 1794817070,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/TangVarie/autowriter",
+            "commit": "d37c10399eefe1081f95c80a497ae71fd05d27aa",
+            "path": "clients/dsh-plugin"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.1 <0.3.0"
+          }
+        },
+        {
+          "version": "1.0.0",
+          "publishTimestamp": 1794813140,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/TangVarie/autowriter",
+            "commit": "cfc4e81a67df99d8fad292f7744fc4b335ab1bdd",
+            "path": "clients/dsh-plugin"
+          },
+          "engines": {
+            "dsh": ">=0.2.2-rc.1 <0.3.0"
+          }
+        }
+      ]
+    }
+  ]
+}
