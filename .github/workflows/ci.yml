@@ -58,6 +58,12 @@ jobs:
           # 摘要里必须能一眼看到是哪条, 否则下一个人只看到"红了"。
           python -m pytest tests/ -q -ra
 
+      - name: 写作台 DSH 插件的单元测试 (纯 node, 不装依赖)
+        run: |
+          # clients/dsh-plugin 是 DeepSeek Harness 那边的客户端插件, 不被任何 Python 代码引用。
+          # 它的逻辑不 import DSH 的包, 所以这里不用装任何东西。
+          node --test clients/dsh-plugin/test/*.test.js
+
       - name: 迁移在真 PostgreSQL 上跑得起来, 且与 Python 算得一样 (审计 COR-014)
         run: |
           # ⚠️ 这一步存在的理由很具体: 写 COR-014 那个迁移时, "读代码 + 肉眼

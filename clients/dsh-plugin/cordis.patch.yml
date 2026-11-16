@@ -1,0 +1,4 @@
+# 写作台插件的配置层：只加一行，不改别的插件。
+- insert:
+    - id: bywood-writing-desk
+      name: bywood-writing-desk-dsh
