@@ -124,14 +124,18 @@ def test_the_legacy_feishu_success_shape_counts(monkeypatch, posts):
     assert _create()["judge_setup"]["owner_notified"] is True
 
 
-def test_a_webhook_error_never_leaks_the_token_into_the_log(monkeypatch, posts, caplog):
+@pytest.mark.parametrize("configured", [HOOK, f"  {HOOK}  ", f"{HOOK}\n", f"{HOOK}/ \t"],
+                         ids=["plain", "padded", "trailing-newline", "slash-then-space"])
+def test_a_webhook_error_never_leaks_the_token_into_the_log(monkeypatch, posts, caplog, configured):
+    """环境变量首尾带空白时也一样: 请求用的是 strip 过的地址, 脱敏表里存的也得是(codex review on #170)。"""
     _, state = posts
-    monkeypatch.setattr(config, "DESKCORE_OWNER_WEBHOOK_URL", HOOK, raising=False)
+    monkeypatch.setattr(config, "DESKCORE_OWNER_WEBHOOK_URL", configured, raising=False)
     import logger_utils
     monkeypatch.setattr(logger_utils, "_VALUE_SECRETS", None, raising=False)
     state["exc"] = requests.ConnectionError(f"HTTPSConnectionPool: Max retries exceeded with url: {HOOK}")
     with caplog.at_level("WARNING"):
         _create()
+    assert "没发出去" in caplog.text, "这条用例要真的走到打日志那一步"
     assert "abcdef12-3456-7890-abcd-ef1234567890" not in caplog.text
 
 

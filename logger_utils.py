@@ -67,9 +67,11 @@ def _load_value_secrets() -> tuple[str, ...]:
                 vals.append(v)
         # 飞书 webhook 的鉴权就在 URL 路径里 —— 只脱 token 段, 保留域名便于排障
         for wh_name in ("FEISHU_WEBHOOK_URL", "DESKCORE_OWNER_WEBHOOK_URL"):
-            wh = getattr(_cfg, wh_name, "") or ""
+            # 先去首尾空白: 环境变量里多一个空格或换行很常见, 发请求的那一侧是 strip 过的(ownernotice.webhook_url),
+            # 这里带着空白存进脱敏表就对不上日志里的那一串, token 会原样打出去(codex review on #170)。
+            wh = (getattr(_cfg, wh_name, "") or "").strip()
             if "/hook/" in wh:
-                token = wh.split("/hook/", 1)[1].strip("/")
+                token = wh.split("/hook/", 1)[1].strip("/").strip()
                 if len(token) >= 8:
                     vals.append(token)
     except Exception:
