@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" role="img" aria-label="Writing desk">
+  <!-- A sheet with a folded corner; the pen crosses it. Two restrained tones so it reads on light and dark tiles. -->
+  <path d="M9 5.5h12.6L27 10.9V30a2.2 2.2 0 0 1-2.2 2.2H9A2.2 2.2 0 0 1 6.8 30V7.7A2.2 2.2 0 0 1 9 5.5Z" fill="none" stroke="#2B6F6A" stroke-width="2.3" stroke-linejoin="round"/>
+  <path d="M21.4 5.7v4.3a1.4 1.4 0 0 0 1.4 1.4h4.1" fill="none" stroke="#2B6F6A" stroke-width="2.3" stroke-linejoin="round"/>
+  <path d="M10.6 15.4h11.2M10.6 20.2h8.4" stroke="#2B6F6A" stroke-width="2.3" stroke-linecap="round"/>
+  <path d="m16.4 29.2.9-3.5 5.9-5.9 2.6 2.6-5.9 5.9-3.5.9Z" fill="#D97706"/>
+  <path d="m23.2 19.8 2.6 2.6" stroke="#B45309" stroke-width="1.4" stroke-linecap="round"/>
+</svg>

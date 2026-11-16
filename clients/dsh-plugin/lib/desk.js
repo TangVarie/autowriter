@@ -1,6 +1,6 @@
-// 写作台插件的纯逻辑：地址和钥匙的解析、协议的拉取、系统提示怎么拼、
+// 写作台的纯逻辑：地址和钥匙的解析、协议的拉取、系统提示怎么拼、
 // 每个会话的流程状态。这里不 import 任何 DeepSeek Harness 的包，
-// 所以 `node --test` 在没装 DSH 的机器上（CI）也能跑。
+// 所以 `node --test` 在没装 DSH 的机器上也能跑。
 
 /** MCP 服务在 DSH 里的名字；工具名前缀由它定。 */
 export const SERVER_NAME = 'deskcore'
@@ -49,16 +49,26 @@ export function normalizeBase(raw) {
  */
 export function parseSetup(rawInput) {
   const parts = String(rawInput ?? '')
-    .replace(/[ 　]/g, ' ')
+    .replace(/[\u00a0\u3000]/g, ' ')
     .trim()
     .split(/\s+/)
     .filter(Boolean)
-  if (parts.length !== 2) {
+  let basePart
+  let keyPart
+  if (parts.length === 2) {
+    [basePart, keyPart] = parts
+  } else if (parts.length === 3 && /^bearer$/i.test(parts[1])) {
+    // 「地址 Bearer 钥匙」也收：负责人给的地址常写成一行，复制过来就多一段。
+    [basePart, keyPart] = [parts[0], parts[2]]
+  } else {
     return { ok: false, reason: '格式是：/desk-setup 地址 钥匙（中间一个空格，一共两段）。' }
   }
-  const base = normalizeBase(parts[0])
+  const base = normalizeBase(basePart)
   if (!base.ok) return base
-  const key = parts[1].replace(/^["'“”‘’]+|["'“”‘’]+$/g, '')
+  // 粘贴时最容易带上的是 Bearer 前缀和两边的引号；两种写法都收，只留钥匙本身。
+  const key = keyPart
+    .replace(/^bearer\s+/i, '')
+    .replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, '')
   if (/^bearer$/i.test(key) || key.length < 8) {
     return { ok: false, reason: '钥匙看起来不完整。要贴整把，不带 Bearer。' }
   }
@@ -107,7 +117,7 @@ export async function fetchProtocol({ base, key, fetchImpl = fetch, timeoutMs = 
 
 const NOT_SET_UP = `# 写作台（还没配置）
 
-这台电脑装了写作台插件，但还没填地址和钥匙，写作台现在用不了。
+这个对话是从写作台开的，但这台电脑上的写作台还没填地址和钥匙，现在用不了。
 
 用户要你写、改给任何品牌发的小红书内容（笔记、标题、评论）时：**不要写稿**。原话告诉他：
 「写作台还没配置。请在输入框里输入 /desk-setup，后面跟上负责人给你的地址和钥匙，中间用空格隔开，然后新开一个对话。」
@@ -117,10 +127,10 @@ const NOT_SET_UP = `# 写作台（还没配置）
 function notConnected(reason) {
   return `# 写作台（没连上）
 
-写作台插件配置过了，但现在取不到协议：${reason}。
+写作台这个对话该带着规则跑，但现在连不上：${reason}。
 
 用户要你写、改给任何品牌发的小红书内容（笔记、标题、评论）时：**不要写稿**——现在写出来的稿子不会查重，写作台也记不下来。原话告诉他：
-「这个对话没连上写作台（${reason}）。请在输入框里输入 /desk-status 看一下状态，还不行就找负责人。」
+「这个对话没连上写作台（${reason}）。先用 /desk-status 看一下状态；要重配就 /desk-setup 地址 钥匙，配完新开一个对话。」
 
 不要说「服务中断了」「掉线了」「网络波动」。别的事情照常做。`
 }
@@ -130,11 +140,12 @@ function connected({ version, protocol, header }) {
 
 下面是写作台协议，由写作台插件从服务端取来、放在系统提示里，整场对话都在。只要这场对话要产出或修改给任何品牌发的小红书内容（笔记、标题、评论），就照它做；用户没提写作台、只报了品牌名、只贴了 brief、同时点了别的 skill，都一样。
 
-在这个客户端里有三点和正文写的不一样，以这三点为准：
+在这个客户端里有四点和正文写的不一样，以这四点为准：
 
 1. **工具名带前缀。** 正文里写的 \`open_project\`、\`check_drafts\` 这些，在这里的名字是 \`${TOOL_PREFIX}open_project\`、\`${TOOL_PREFIX}check_drafts\`，其余工具同理。工具列表里找不到它们，才算没连上写作台。
 2. **开场不用核版本。** 这份正文已经是服务端的最新版，不用调 \`get_protocol\`，也不用提「重新导入 skill」「更新技能」。\`open_project\` 和 \`comments_for\` 的 \`skill_version\` 填下面这一行的值。
 3. **没开项目，发牌、查重、存档会被插件拦下。** 被拦时照提示先调 \`open_project\`，不要换别的办法绕。对话被压缩之后也要重新开一次项目。
+4. **服务端说明里的老说法在这里不适用。** 服务端的 MCP 服务说明和下面正文里可能提到「对话开始时先调 get_protocol 核版本」「协议在 bywood-writing-desk 这个 skill 里」「WorkBuddy 里 mcp.json 的地址和 key」——在这个客户端都不适用：协议就在这一段里，没有 skill 要导入，连接状态用 \`/desk-status\` 看。
 
 protocol_version: ${version}
 
@@ -144,14 +155,33 @@ ${protocol.trim()}`
 }
 
 /**
- * 当前该放进系统提示的那一段。
- * `serverError` 是 MCP 服务没挂上：协议取得到也没用，工具不在，照「没连上」说。
- * @param {{ configured: boolean, protocol?: { version: string, protocol: string, header: string }, lastError?: string, serverError?: string }} status
+ * 普通对话里的一句指路。
+ *
+ * 10-19 那次事故的形状是：写手没走到写作台，模型在普通对话里把稿子写了，没有查重、
+ * 没有存档，也没有任何提示。所以非写作台对话的系统提示里放这一句，让模型把用户
+ * 领到左侧栏的入口，而不是自己开写。
  */
-export function buildSection(status) {
-  if (!status.configured) return NOT_SET_UP
-  if (status.serverError) return notConnected(status.serverError)
-  if (!status.protocol) return notConnected(status.lastError ?? '还在连接')
+export const SIGNPOST = '写品牌小红书内容（笔记、标题、评论、改稿）请走左侧栏的「写作台」：'
+  + '项目规则、查重和存档只在那边带上；这里不要直接写稿。'
+
+/**
+ * 当前该放进系统提示的那一段。
+ *
+ * 三条判据，任何一条不满足都不写稿：
+ *  - configured：凭据库里地址和钥匙都在（插件自己去读，读不到就是还没配置）；
+ *  - toolsPresent：deskcore 的工具真的挂在这个对话上了（页签预设里的 MCP 客户端连上了）；
+ *  - protocol：协议正文取到了。
+ *
+ * 只配好凭据、工具还没挂上时不能算连上——协议取得到也没用，工具不在。
+ * @param {{ configured: boolean, protocol?: { version: string, protocol: string, header: string }, lastError?: string }} status
+ * @param {boolean} toolsPresent
+ */
+export function buildSection(status, toolsPresent) {
+  if (!status.configured) {
+    return toolsPresent ? notConnected('配置刚写好，工具正在连接') : NOT_SET_UP
+  }
+  if (!toolsPresent) return notConnected(status.lastError ?? '写作台的工具还没挂上')
+  if (!status.protocol) return notConnected(status.lastError ?? '正在取协议')
   return connected(status.protocol)
 }
 
