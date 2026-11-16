@@ -29,6 +29,7 @@ import math
 
 import pytest
 
+import config
 import librarian_client as lib
 from deskcore import core, priors, rulecheck, store, tools, vocab
 from tests.fakes import FakeClient
@@ -99,7 +100,9 @@ class _World:
         }, **kw)
 
 
-def test_published_titles_come_from_links_to_this_project_newest_first():
+def test_published_titles_come_from_links_to_this_project_newest_first(monkeypatch):
+    # 这一条钉的是回流闸【关着】时的读法(只取本项目的); 开着时兄弟方向的标题也进来, 在 test_return_gate_readers.py 里测
+    monkeypatch.setattr(config, "RETURN_GATE_ENFORCE", False)
     w = _World()
     w.published("n-old", "一个月前发的", days=31)                           # 窗口外
     w.published("n-ing", "补录的那篇就是发出去的标题", kind="ingested", days=5)
@@ -178,9 +181,11 @@ def test_an_active_project_still_shows_yesterdays_drafts():
     assert got["published"] == ["就发了这一篇"] and len(got["drafted"]) == 19
 
 
-def test_a_page_of_notes_for_other_directions_does_not_hide_this_projects_titles():
+def test_a_page_of_notes_for_other_directions_does_not_hide_this_projects_titles(monkeypatch):
     """同一个 TV 项目对着好几个方向(WTG 15 个): 最新的几百篇都是别的方向的, 本项目的也要找得到, 而且往返次数
     固定 —— 不能一页页翻 TV 的笔记(codex review on aw#112: 那样稀疏的方向要十几次往返, 全压在 open_project 上)。"""
+    # 钉的是回流闸【关着】时的读法; 开着时兄弟方向的标题也进来(test_return_gate_readers.py)
+    monkeypatch.setattr(config, "RETURN_GATE_ENFORCE", False)
     w = _World()
     for i in range(1200):
         w.published(f"s{i:04d}", f"方向二的第{i}篇", days=0.5, pid=SIB)

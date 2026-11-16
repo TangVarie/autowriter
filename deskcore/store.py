@@ -3853,7 +3853,7 @@ def tv_links_set_score(sb, scores: dict[str, float]) -> int:
 # ── 回流闸读的一方: 写作台「学」的那一路(A4, 2026-11-12; docs/deskcore.md §3.30) ────────────────────────────────
 # 两处读: 简报的 working 标题(_recent_published)、发牌的起量帖参照(priors.fetch_project → _hit_pool)。都只问「这几篇里
 # 哪些被挡着」, 按 note_id 读 gate / gate_reasons 两格, 判法是 postgate.blocked(..., BLOCKS_DESK) —— 按原因判, 不按结论判。
-# 开关 config.RETURN_GATE_ENFORCE(默认关)在调用的那一刻读。三种情形一律「不筛」, 和没有闸时一字不差:
+# 开关 config.RETURN_GATE_ENFORCE(2026-11-16 起默认开)在调用的那一刻读。三种情形一律「不筛」, 和没有闸时一字不差:
 #   · 开关关着: 一个请求都不发;
 #   · 020 没跑(读不到那几列);
 #   · 读挂了(记 WARN)。
@@ -4439,7 +4439,7 @@ def _recent_published(sb, project_id: str, *, days: int, limit: int, now: dateti
     """``(发出去的标题 新的在前, working 候选标题)``。working 候选按 爆 > 评论数 > 新 排, 最多取 ``working`` 的两倍
     (有的标题为空、有的去重后重复, 由 recent_titles 截到 ``working`` 条); ``working=0`` 时第二项恒为空, 和原来一样。
 
-    回流闸 v1(2026-11-12, 开关 config.RETURN_GATE_ENFORCE, 默认关; 关着时这里发的请求和回的东西同原来一字不差):
+    回流闸 v1(2026-11-12, 开关 config.RETURN_GATE_ENFORCE, 2026-11-16 起默认开; 关着时这里发的请求和回的东西同原来一字不差):
       · A8 两栏都多读同一个 TV 项目对着的别的写作台项目上的对照(_sibling_links; 回流闸那两格读不到时不并);
       · A4 working 一栏不要回流闸判过、没放行的帖(desk_gate_blocked)。发出去那一栏【不筛】: 那是要避开的标题,
         承诺功效的、后来删了的也是发过的标题。"""
