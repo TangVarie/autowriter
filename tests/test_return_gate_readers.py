@@ -193,16 +193,19 @@ def _config_with(env: dict) -> dict:
         os.environ.update(saved)
 
 
-def test_the_flag_is_a_code_default_and_it_is_off():
-    assert config.RETURN_GATE_ENFORCE_DEFAULT == "0"
-    assert _config_with({})["RETURN_GATE_ENFORCE"] is False, "不设环境变量 = 关"
+def test_the_flag_is_a_code_default_and_it_is_on():
+    """2026-11-16 owner 看过三晚的结论分布之后打开; 应急关 = 环境变量 RETURN_GATE_ENFORCE=0, 不用改代码。"""
+    assert config.RETURN_GATE_ENFORCE_DEFAULT == "1"
+    assert _config_with({})["RETURN_GATE_ENFORCE"] is True, "不设环境变量 = 开"
+    assert _config_with({"RETURN_GATE_ENFORCE": "0"})["RETURN_GATE_ENFORCE"] is False, "环境变量 0 = 应急关"
     src = (ROOT / "config.py").read_text(encoding="utf-8")
-    assert src.count('RETURN_GATE_ENFORCE_DEFAULT = "0"') == 1, "打开是把这一行的 0 改成 1"
+    assert src.count('RETURN_GATE_ENFORCE_DEFAULT = "1"') == 1, "开关就是这一行"
 
 
 @pytest.mark.parametrize("value, on", [("1", True), ("true", True), ("on", True), ("TRUE", True),
-                                       ("0", False), ("false", False), ("off", False), ("", False), ("yes", False)])
+                                       ("0", False), ("false", False), ("off", False), ("", True), ("yes", False)])
 def test_an_environment_variable_can_override_the_default(value, on):
+    """空串 = 没设 → 听代码默认(2026-11-16 起是开); 认不出的值(yes)按关算, 同以前。"""
     assert _config_with({"RETURN_GATE_ENFORCE": value})["RETURN_GATE_ENFORCE"] is on
 
 

@@ -266,10 +266,10 @@ SHADOW_HUMAN_TIMEOUT_SEC: float = _bounded_number("DESKCORE_SHADOW_HUMAN_TIMEOUT
 # ── 回流闸 v1(2026-11-12, docs/deskcore.md §3.30): 写作台「学」的那一路要不要按结论筛 ────────────────────
 # tv-sync 每晚给每篇已发的帖记结论(tv_note_links.gate, migrations/020; 判法在 deskcore/postgate.py), 这个开关管的是
 # 【读】的一方: 开了之后简报的 working 标题、发牌的起量帖参照不再用判过、没放行的帖, 同一个 TV 项目对着的几个写作台项目
-# 也看得到彼此发出去的标题(A8)。默认【关】: 关着、或者 020 还没跑、或者那几列读不出来, 简报和发牌同今天一字不差。
-# 打开的办法是把下面这一行的 "0" 改成 "1"(看过三晚的结论分布之后的一行 PR), 不用谁去改服务的环境变量;
-# 环境变量只是应急的覆盖(开了之后要临时关: RETURN_GATE_ENFORCE=0)。
-RETURN_GATE_ENFORCE_DEFAULT = "0"
+# 也看得到彼此发出去的标题(A8)。默认【开】(2026-11-16, owner 看过三晚的结论分布之后定的: 11-13 / 11-14 / 11-15 三晚
+# 没放行的都是 446 篇, 每晚只有「暂缓 → 放行」十几篇)。关着、或者 020 还没跑、或者那几列读不出来, 简报和发牌同没有闸时
+# 一字不差。开关在代码里, 不用谁去改服务的环境变量; 环境变量只是应急的覆盖(要临时关: RETURN_GATE_ENFORCE=0)。
+RETURN_GATE_ENFORCE_DEFAULT = "1"
 RETURN_GATE_ENFORCE: bool = ((_get_secret("RETURN_GATE_ENFORCE") or RETURN_GATE_ENFORCE_DEFAULT).strip().lower()
                              in ("1", "true", "on"))
 

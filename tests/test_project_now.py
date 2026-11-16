@@ -18,6 +18,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import config
+
 from deskcore import core, priors, project_now, store, tools as T
 from tests.fakes import FakeClient
 from tests.test_writer_facing_text import _assert_writer_safe
@@ -103,6 +105,9 @@ def test_a_raising_store_gives_unavailable(monkeypatch):
 def test_open_project_does_not_wait_for_a_slow_tv(monkeypatch):
     """真的线程池 + 一个 5 秒才回的 TV: 简报照样马上回, 说 warming; 后台那次构建不拖着简报。"""
     priors.reset_cache()                                     # 换回真的线程池
+    # 回流闸开着时简报自己也读一次 tv_project_map(找兄弟方向, 是写作台自己库里的小表, 不是 TV); 这一条测的是
+    # 「先验那一路慢不拖简报」, 下面把 tv_projects_of 整个换成慢的是为了拖住先验, 所以这里把闸关掉。
+    monkeypatch.setattr(config, "RETURN_GATE_ENFORCE", False)
     gate = threading.Event()
 
     def slow(*a, **k):
