@@ -74,7 +74,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from logger_utils import SecretMaskingFormatter
 
-from . import calllog, core, identity, skillcheck, tools, viewpage, vocab
+from . import calllog, clientmark, core, identity, skillcheck, tools, viewpage, vocab
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deskcore")
@@ -331,6 +331,7 @@ def _log_error_result(name: str, kwargs: dict, result) -> None:
 # ── 每次工具调用留一行只有数的记录(2026-11-11, deskcore/calllog.py, docs/deskcore.md §3.8) ────────────────
 # REST 和 MCP 给工具计时的那两处, 回包定下来之后调 _record_call: 只是往后台的队列里放一下(满了就丢), 摘数和写库都在后台线程里。
 # 它自己绝不抛、不等: 留痕不能改变、拖慢或弄坏任何一次回包。抛了异常的调用也记(结局 + 异常类型, 同 _log_tool_failure 的分法)。
+# 2026-11-17: 这一次是哪个客户端(clientmark, docs/deskcore.md §3.37)一并交过去, 进那一行的 meta.client_mark。
 def _record_call(name: str, channel: str, args, t0: float, sink, *, result=None, exc: BaseException | None = None) -> None:
     try:
         outcome = label = None
@@ -339,7 +340,41 @@ def _record_call(name: str, channel: str, args, t0: float, sink, *, result=None,
                        else "failed" if isinstance(exc, Exception) else "interrupted")
             label = _exc_label(exc)
         calllog.submit(tool=name, channel=channel, user_id=_caller.get().user_id, args=args, sink=sink,
-                       elapsed_ms=int((time.monotonic() - t0) * 1000), result=result, outcome=outcome, error_class=label)
+                       elapsed_ms=int((time.monotonic() - t0) * 1000), result=result, outcome=outcome, error_class=label,
+                       client=clientmark.current().as_dict())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ── 这一次是哪个客户端(2026-11-17, deskcore/clientmark.py, docs/deskcore.md §3.37) ──────────────────────────────
+# 每个请求在这里定一次(REST 在 rest_tool 里, MCP 在 _McpClientMark 里), 绑在 contextvar 上: 线程池、SDK 的处理任务都带得过去,
+# core / store 建 batch、记存档那一行时用 clientmark.current() 取。只看服务端本来就收得到的东西(UA、有没有 Origin、走哪条路、
+# MCP initialize 报的 clientInfo); 原始请求头不存不记。认不出就是 unknown, 绝不抛、不拖慢回包。
+def _client_mark(channel: str, headers) -> "clientmark.Mark":
+    try:
+        return clientmark.classify_headers(channel, headers, _caller.get())
+    except Exception:  # noqa: BLE001
+        return clientmark.UNKNOWN
+
+
+def _mcp_protocol_versions() -> tuple:
+    """服务端支持的 MCP 协议版本和最新的那一版(从 mcp 取; 没装 mcp 是 ``((), None)``)。initialize 记小表时按它算谈定的那一版:
+    客户端要的不在列表里, SDK 回最新的, 客户端之后每个请求头上带的也是最新的(clientmark.negotiated_version)。"""
+    try:
+        from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
+        from mcp.types import LATEST_PROTOCOL_VERSION
+        return tuple(SUPPORTED_PROTOCOL_VERSIONS), LATEST_PROTOCOL_VERSION
+    except Exception:  # noqa: BLE001
+        return (), None
+
+
+_MCP_PROTOCOL_VERSIONS = _mcp_protocol_versions()
+
+
+def _note_hello(body: bytes, headers) -> None:
+    try:
+        supported, latest = _MCP_PROTOCOL_VERSIONS
+        clientmark.note_hello_headers(body, headers, _caller.get(), supported=supported, latest=latest)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1016,6 +1051,8 @@ async def rest_tool(name: str, request: Request):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
     t0 = time.monotonic()
     sink: dict = {}                             # core 记给调用留痕的数(calllog.note), 见 _record_call
+    # 这一次是哪个客户端(clientmark, §3.37): 绑到工具跑完、两处 _record_call 都记完为止; 线程池会把它带进工具线程
+    mark_token = clientmark.bind(_client_mark("rest", request.scope.get("headers")))
     try:
         # ⚠️ 必须过线程池。工具里全是【同步】调用(Supabase / embedding, record_edit
         # 还会打 Anthropic), 直接在 async 路由里跑会占住 uvicorn 唯一的事件循环 ——
@@ -1065,6 +1102,8 @@ async def rest_tool(name: str, request: Request):
         ref = _error_ref()
         _log_tool_failure(name, args, exc, int((time.monotonic() - t0) * 1000), ref=ref, channel="rest")
         raise HTTPException(status_code=500, detail=_sanitized_error(exc, ref))
+    finally:
+        clientmark.unbind(mark_token)
 
 
 # ── MCP ──────────────────────────────────────────────────────────────
@@ -1243,6 +1282,8 @@ class _McpFiniteNumbers:
             if not message.get("more_body"):
                 break
         body = b"".join(chunks)
+        if cut is None:
+            _note_hello(body, scope.get("headers"))   # initialize 的 clientInfo 记一下(clientmark, §3.37); 不改请求体, 绝不抛
         fixed = _spell_out_non_finite(body) if cut is None else body
         if fixed is not body:
             scope = dict(scope)
@@ -1258,7 +1299,26 @@ class _McpFiniteNumbers:
         await self.app(scope, replay, send)
 
 
+class _McpClientMark:
+    """包在 MCP 子应用外面(``_McpFiniteNumbers`` 里面): 这一次请求是哪个客户端(clientmark, docs/deskcore.md §3.37),
+    绑到这次请求处理完为止。SDK 起的处理任务会把 contextvar 带过去(同 _caller), 工具、留痕、建 batch 都取得到。
+    纯 ASGI(理由同 _NormalizeMcpPath): 只读 ``scope["headers"]``, 不碰 receive / send。认不出就是 unknown, 绝不抛。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        token = clientmark.bind(_client_mark("mcp", scope.get("headers")))
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            clientmark.unbind(token)
+
+
 _mcp = _register_mcp()
 if _mcp is not None:
     # 子应用请求同样先过外层 auth_middleware, 所以 _caller 在工具里取得到。
-    app.mount("/mcp", _McpFiniteNumbers(_mcp.streamable_http_app()))
+    app.mount("/mcp", _McpFiniteNumbers(_McpClientMark(_mcp.streamable_http_app())))

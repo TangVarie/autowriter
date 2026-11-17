@@ -57,7 +57,7 @@ import librarian_client
 import memory
 from logger_utils import mask_secrets
 
-from . import calllog, commentstyle, covernote, delivery, ownernotice, postgate, poststyle, rulecheck, rulecompile
+from . import calllog, clientmark, commentstyle, covernote, delivery, ownernotice, postgate, poststyle, rulecheck, rulecompile
 from . import drawpolicy as dp
 from . import fingerprint as fp
 from . import priors, project_now, store, structure, tvlink, viewpage, vocab
@@ -1882,7 +1882,12 @@ def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list
                          "text_fp": _draft_text_fp(title, body),
                          "status": status.get(i), "flywheel_arm": arm, "flywheel_arm_source": arm_source,
                          **({LESSON_EXPOSURE_KEY: exposure} if exposure is not None else {})})
-        return store.insert_draft_snapshots(client, rows)
+        n = store.insert_draft_snapshots(client, rows)
+        if n:
+            # 这次查重的调用留痕那一行记下 check_id 的前 8 位(2026-11-17, §3.37): 底稿转正建的 batch 不知道当初是哪个客户端查的重
+            # (底稿上没有这一列), 拿 params.check_id 的前 8 位对回这一行的 meta.client_mark。不是工具调用(cli check)时什么都不做
+            calllog.note(check8=check_id[:8])
+        return n
     except Exception:                                   # noqa: BLE001 — 查重的判定已经算好了, 记不上只少一份底稿
         logger.warning("check_drafts: 记底稿失败 (project=%s), 判定照常返回; 这一批发出去以后认不回写作台, 除非存了档",
                        project_id, exc_info=True)
@@ -3103,6 +3108,9 @@ def _record_commit_metrics(client, project_id: str, user_id, drafts: list[dict],
             **_rejection_meta(drafts, out.get("rejected") or []),
             # 2026-11-11: 借卡带出去几张卡、skill 版本构成、规则还有几条没编出来 —— 只留数(见 _commit_side_meta)
             **_commit_side_meta(project_id, user_id, skill_versions),
+            # 2026-11-17: 这次存档是哪个客户端(clientmark, §3.37)。改稿加的版本落在原来那个 batch 里, 那个 batch 的
+            # params.client_mark 说的是当初写它的客户端; 改稿是谁改的看这一行
+            clientmark.KEY: clientmark.current().as_dict(),
         }
         if out.get("angle_key_mismatch"):
             # 哪几篇的 key 对不上、错在哪、多长 —— 不留 key 本身(模型编的长串可能是一句描述)
@@ -12216,7 +12224,10 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
                 by_check.setdefault(str(g.get("check_id") or g["version_id"]), []).append(g)
         for check_id, gs in by_check.items():
             first = gs[0]
-            params = {"source": "deskcore", "via": "snapshot", "check_id": check_id}
+            # client_mark 明写 unknown(2026-11-17, §3.37): 转正是 tv-sync 在做, 稿子是哪个客户端查的重它不知道 —— 不写的话会
+            # 被 CLI 的进程默认记成 server_job。要知道就拿 check_id 的前 8 位对查重那一行调用留痕的 meta.check8
+            params = {"source": "deskcore", "via": "snapshot", "check_id": check_id,
+                      clientmark.KEY: clientmark.UNKNOWN.as_dict()}
             if first.get("flywheel_arm") in FLYWHEEL_ARMS:
                 params.update(flywheel_arm=first["flywheel_arm"],
                               flywheel_arm_source=first.get("flywheel_arm_source") or "recomputed")

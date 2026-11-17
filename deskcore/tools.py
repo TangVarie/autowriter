@@ -1227,6 +1227,8 @@ def ingest_published(project_id: str, drafts: list[dict], source: str = "",
             "embedded": False, "dry_run": dry_run}
     if not entries:
         return {**zero, "note": f"这 {committed} 行都是走过 commit 的, 库里已有, 没有要补的。"}
+    # 没给出处时 file 记 "workbuddy" —— 2026-11-17 起照旧(读 params.file 的 SQL 可能按它筛): 它的意思是「ingest_published 没带
+    # 出处」, 不是「从 WorkBuddy 来的」。实际是哪个客户端在 params.client_mark 里(store.mint_draft_identity 带上, §3.37)
     out = core.ingest_published(core.sb(), project_id, entries, user_id=_user_id,
                                 source=source or "workbuddy", dry_run=dry_run)
     out["skipped_already_committed"] = committed

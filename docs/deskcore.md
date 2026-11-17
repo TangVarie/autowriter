@@ -672,9 +672,11 @@ project_id 同样没过归属校验：那一列只认回包里的 `project_id`�
 | `v` / `tool` / `channel` / `elapsed_ms` | 全部 | 这一行的形状版本（现在是 1，形状改了就加一）、工具名、`rest` / `mcp`、服务端这一次用了多久 |
 | `outcome` / `error_class` | 全部 / 没成的 | `ok`；`error_result`（没抛、但回的是带 `error` 的降级结果）；`refused`（400 / 403 / 404 / 409 那几类正常拒绝）；`failed`（真故障）；`interrupted`（客户端断了）。后三种带异常类型（同服务日志那一行） |
 | `items` / `reply_chars` | 有才带 | 这次带了几篇稿 / 几条评论 / 几个版本（发牌是要几张）；回包的字符数（紧凑 JSON，中文一个字算一个） |
+| `client_mark` | 全部 | 这一次是哪个客户端（2026-11-17，§3.37）：`app` 是固定的 7 个词之一（`dsh_plugin` / `workbuddy_skill` / `claude_code` / `other_mcp` / `rest` / `server_job` / `unknown`），`basis` 是凭什么这么定（`user_agent` / `hello` / `transport` / `process` / `none`）；另带洗过的证据：`ua`（UA 里第一个像样的产品名 + 版本，只含 `[a-z0-9_.]`，至多 52 个字符）、`origin`（有没有 Origin 头）、`hello`（这个指纹最近一次 MCP initialize 报的 clientInfo，洗法同 `ua`，没撞车才有；指纹管不到的那一种见 §3.37）。原始请求头不进来。证据只在 `batch_metrics.meta`（这一行和存档那一行），batch 的 `params.client_mark` 只有 `app` / `basis` |
 | `skill` | `open_project` / `comments_for` | 这次报上来的 skill 版本：`up_to_date` / `outdated` / `unknown`（没报） |
 | `cover_note` | `open_project` / `borrow_lessons`，发了才有 | `true` = 这次的回包里带了封面那一句（§3.36）。没发就没有这个键；借卡那一步记下了、但调用后来抛了或降级成不带这一栏的错误回包，也没有（写行时看回包里有没有这一栏） |
 | `check` | `check_drafts` | `total` / `pass` / `warn` / `reject`；`decided_by` 是可疑和拒的各由哪个信号定的（`opening` / `title` / `ngram` / `contain`，一篇可以有几个）；`gates` 是不是撞车的拒（`replace_lookup` 这类）；`semantic_degraded` |
+| `check8` | `check_drafts`，记了底稿才有 | 这次查重记的底稿的 `check_id` 前 8 位（2026-11-17，§3.37）：底稿转正建的 batch（`params.via = 'snapshot'`）拿 `params.check_id` 的前 8 位对回这一行，就知道当初是哪个客户端查的重 |
 | `rules` | `check_rules` | 回包里的数（§3.11 的 2026-11-11 那一版回包）：`status`（`checked` / `nothing_to_check` / `no_versions` / `error`）；`versions`、`must_fix`、`suggest`、`unsure`、`unjudged`、`evidence_not_found`（Jev 怀疑有问题、指不出是哪一句的，算在 `unjudged` 里）、`not_finished`、`empty_body`、`code_unchecked`、`more`，都是整次的合计（同回包的 `summary`，有才带）；`flagged`（有要动手的那几篇）、`judged`（规则题判回来了的那几篇）；`unsure_rules` / `unsure_rules_hard`（最外层列出来的偏向没守住的规则几条、其中硬约束几条，最多 3）；`excluded` / `remaining`（不是这个项目的、留到下一次的各几版）；`pool` 是规则池里各几条（同回包的 `rules`，只取数：`pool` / `by_jev` / `by_code` / `uncompiled` / `partial` / `code_unavailable` / `code_withdrawn` / `not_compilable` …）。规则 id、版本 id、题面和 Jev 指出的句子都不取 |
 | `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样；帖子根本没查成的那两种超时没有这个键，看 `judge_status = timeout`）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks` |
 | `comments.checks` | `score_comments` | `style` 是写法底线每样打回几条（`period` 句号 / `dialect` 方言语气词 / `contact` 像要联系方式 / `post_ref` 提了帖子 / `vague` 含糊指代）；`brand_over`（提品牌超出几条）、`repeats`（说法或开头重复的几条）、`endings_over`（品牌收尾超出几条）、`short_by` / `neutral_by`（短评、中性还差几条；项目没定这一项、或中性没判成时没有这个键）；`fix` / `style_fix`（带这两样的各几条）、`thread_fix` / `thread_hints`（整组的各几句） |
@@ -700,6 +702,10 @@ project_id 同样没过归属校验：那一列只认回包里的 `project_id`�
   `generator_http_529` 这类生成端状态码 / `generator_timeout` / `bad_output` / `batch_timeout` 这类整批的结局 …）、
   `age_s`（这是多久之前的数）。种类按**拆小重发之后**的结局数（§3.11）：重发编出来的不算，第一次整批没成、重发了的按重发那次
   每条的结局算（原因认不出来的记 `batch_jev_failed` 这类），只有整批被挡 / 读超时没重发的那一批按 `batch_<结局>` 记条数。这一轮没发、沿用上一轮种类的另带 `error_kinds_age_s`。本进程还没编过这个项目（刚重启）就不带。
+
+**2026-11-17 起存档那一行另有 `client_mark`（§3.37）。** 这次存档是哪个客户端，形状同调用那一行的 `meta.client_mark`（带证据；
+batch 的 `params.client_mark` 只有两个词，要证据从 `batch_metrics.batch_id` 对到这一行）。改稿（`replaces_version_id`）加的版本落在
+原来那个 batch 里，那个 batch 的 `params.client_mark` 说的是当初写它的客户端；改稿是谁改的看这一行。
 
 ```sql
 -- 每个工具调了几次、多久、多长(近 7 天)
@@ -2424,6 +2430,159 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 最多两项、告诫在、开头写明只是计数、话里没有「爆帖」、「没有字」只说一遍且不漏掉多数、工具说明里叫模型原样转告、只取三列分批 200、视图不在 / 读抛 / 卡住时回包不变且不拖慢、不够三张卡或没借到卡时不发请求、
 协议和 skill 里没有这个键；第二版：值是 `{text, task}`、整个值比留下来的尾巴短、两个工具的回包里它都是最后一个键而且照头 4096 + 尾 1024 裁完还在、
 没有这句话时键的先后也不变、调用留痕里只在发了的时候有那个布尔（调用抛了 / 降级了不记）、MCP 文本块里中文不转义、再开一次照样带、工具说明和回包的样子对得上）。
+
+### 3.37 每次工具调用、每个新 batch 记下是从哪个客户端来的（2026-11-17）
+
+**为什么。** 写手现在从两条路进写作台：WorkBuddy 里的 bywood-writing-desk skill，和 DeepSeek Harness 桌面的写作台插件
+（`clients/dsh-plugin`，经 MCP 挂写作台，协议走 REST 取）。原来哪儿都没记一次调用、一批稿子是从哪条路来的：`ai_engine` 恒为
+`deskcore`，`params.source` 只分 `deskcore` / `ingest`，调用留痕那一行只有工具、`rest` / `mcp`、耗时、结局和共用的那个身份。
+校准、存档率、借卡次数、曝光、改稿率、人感这些读数里两边的稿子混在一起。负责人同意加一个客户端标记（`deskcore/clientmark.py`）。
+
+**存的词（固定词表，服务端只写这几个）：**
+
+| `app` | 是什么 | 什么时候 |
+|---|---|---|
+| `dsh_plugin` | DeepSeek Harness 桌面 + 写作台插件 | UA 的产品名或 clientInfo 的名字里有完整的一段 `dsh`（`dsh`、`dsh_mcp_client`），或含 `deepseek_harness` / `deepseekharness`（UA 的产品 token 常连写：`DeepSeekHarness/0.2`）。`dashboard`、`fdsh_tool` 不算；光是 `deepseek` 也不算（那也是模型和 API 客户端的名字） |
+| `workbuddy_skill` | WorkBuddy / CodeBuddy（都装 bywood-writing-desk skill） | 名字里有 `workbuddy` / `codebuddy` |
+| `claude_code` | Claude Code（负责人自测） | 名字里有 `claude_code` / `claudecode` |
+| `other_mcp` | 走 MCP、哪条规则都没认出来的 | |
+| `rest` | 走 REST、哪条规则都没认出来的（curl、脚本、CI） | |
+| `server_job` | 没有 HTTP 调用方：`python -m deskcore.cli` 的命令，含每晚的 `tv-sync` 和手动的 `ingest --xlsx` | |
+| `unknown` | 认不出：出了意外、请求和 CLI 之外的服务端调用、底稿转正的 batch | |
+
+`basis` 是凭什么这么定：`user_agent`（UA 的产品名认得）、`hello`（这个指纹最近一次 initialize 报的 clientInfo 认得，见下面「指纹管不到的那一种」）、`transport`（只知道
+走的是哪条路）、`process`（CLI 的进程默认）、`none`。先后：UA 认得 → clientInfo 认得（只对 MCP）→ 按走的路。没有 `web` 这个词：
+Streamlit 工作台和 worker 建 batch 不经过写作台（`generation_service.py`），那些 batch 本来就分得开（没有 `params.source`，
+`ai_engines` 不是 `["deskcore"]`），工作台 10-16 也停了。
+
+**证据只进 `batch_metrics.meta`**（调用留痕那一行和存档那一行，只有负责人的 SQL 读；规则要改时、历史要重读时用，不用回写库）。
+batch 的 `params.client_mark` 只有 `app` / `basis` 两个词：batches 是很多地方读的长命行，客户端报上来的串（哪怕洗过，名字里也可能是
+机器名、人名）不放那里；要 batch 的证据，从 `batch_metrics.batch_id` 对到存档那一行（补录没有存档那一行，看 `ingest_published`
+那一次调用留痕）。`ua` 是 UA 里第一个不是浏览器常见词（`mozilla`、`chrome`、
+`safari` 这类）的产品 token，洗成 `名字` 或 `名字_v版本`（小写，只含 `[a-z0-9_.]`，名字至多 32、版本至多 16 个字符；没有 UA 是
+`none`，只有浏览器常见词是 `browser`，一个像样的 token 都没有是 `other`）；`origin` 是有没有 Origin 头；`hello` 是 clientInfo 的名字和
+版本，同一种洗法。用 `_` 不用 `-`：调用留痕那一道筛（`calllog._WORD`）不认连字符，没放宽它。
+
+**哪些信号是核过的、哪些是猜的。** 核过的（读本仓代码或本机实测）：所有客户端都用 `X-Deskcore-Key` 传钥匙（bearer 0），钥匙分不出
+客户端；插件的 REST 那一路只有 `get_protocol`，它不留调用留痕、不建 batch（`clients/dsh-plugin/lib/desk.js`）；插件预设里给 MCP 配的
+只有 `X-Deskcore-Key` 一个头，没有任何东西报自己是插件；Node 22 自带的 fetch 发 `user-agent: node`、不带 Origin（本机回环实测，
+DSH 自己的运行时没测）。中等把握：WorkBuddy 是浏览器 / Electron 窗口里发的请求，带 Origin（它第一次连不上、加了 CORS 才通，runbook
+那一段）。**猜的**：DSH 的 MCP 客户端、WorkBuddy、CodeBuddy、Claude Code 实际发的 UA 和 clientInfo。所以上面那张表在核对之前是假设：
+核对之前 `other_mcp` 不能读成「不是 DSH」。
+
+**MCP 是无状态挂的，clientInfo 只在 initialize 那一次有。** `stateless_http=True`：每个请求一个新会话，`tools/call` 上没有
+clientInfo，也没有会话 id 可对。所以 `_McpFiniteNumbers`（本来就把 MCP 的请求体读完再交给 SDK）读完之后顺手看一眼：是 initialize 就把
+`clientInfo` 记进进程内存里的一个小表，键（指纹）是「调用者 + 钥匙的备注名 + UA 那个词 + 有没有 Origin + 协议版本」（只在内存里，
+不存不记），24 小时、最多 512 项，满了先丢最早的。协议版本那一格：initialize 时谈定的那一版（客户端要的在 SDK 的支持列表里就是它，
+不在就是最新的那一版）↔ 之后每个请求的 `MCP-Protocol-Version` 头；2025-06-18 起的版本客户端每个请求都要带这个头，两边要一样；更早的
+版本不要求带，和没带头的请求归成一格。同一个指纹上先后来了两个名字不一样的 clientInfo（认得不认得都算）就记成说不清，到期之前
+哪个都不用、`hello` 也不报；同一个名字换了版本就换成新的。多副本部署时每个副本各有一张表。
+
+**指纹管不到的那一种（`basis = hello` 要这样读）。** 服务端只看得见 initialize 的那个客户端。同一个指纹上另一个客户端要是**一直不
+initialize**（部署之后接着调、开着一整天不重连的；无状态挂的 MCP 允许这样），服务端看不见它，它的调用、它建的 batch 都会算到这个
+指纹最近一次 initialize 的那个客户端头上，`hello` 也是那个客户端的。所以 `basis = hello` 读作「这个指纹最近一次 initialize 报的是它」，
+不是「这一次一定是它」，只和指纹一样纯。撞上要五样都一样：同一个身份、同一把钥匙（备注名）、UA 那个词一样（Node 自带的 fetch 都是
+`node`）、都带或都不带 Origin、谈定的协议版本一样。说不清只在两边都 initialize 过时才看得出来。要分干净就给另一个客户端**单发一把
+钥匙**（备注名在指纹里，不用改代码）。**每次部署小表就清空**：之后到某个客户端 initialize 之前，同一个指纹上的调用只靠 UA 认（认不出
+就是 `other_mcp`）；有一个客户端 initialize 了，这个指纹上不重连的那些就按上面说的跟着它算。DSH / WorkBuddy 多久 initialize 一次（每场
+对话、每次开应用、每次重连）不知道；每一行都有 `ua` / `origin`，看下面的核对。
+
+**在哪儿。** 都是同一个键 `client_mark`，只多 JSONB 里的一个键，不加列、不加迁移、不加环境变量：
+
+- 每行调用留痕：`batch_metrics.meta.client_mark`（`mode = 'tool_call'`，§3.8）；
+- 写作台建的每个 batch：`batches.params.client_mark`，只有 `app` / `basis`，在 `store.mint_draft_identity` 一处带上（存档、补录、
+  底稿转正都经过它，以后新加的也是）。`ai_engines`、`versions.ai_engine`、`params.source` / `via` / `check_id` / `file` 的意思都不变；
+- 存档那一行：`batch_metrics.meta.client_mark`（`mode = 'deskcore_commit'`）。改稿加的版本落在原来那个 batch 里，那个 batch 的
+  `params.client_mark` 说的是当初写它的客户端，改稿是谁改的看这一行。不回头改老 batch。
+
+请求里定一次（REST 在 `rest_tool`，MCP 在包着 SDK 的 `_McpClientMark`），绑在 contextvar 上，线程池和 SDK 的处理任务都带得过去；CLI
+在 `main` 里设进程级的默认 `server_job`，退出时还原（tv-sync 起的线程池拿不到 contextvar）。
+
+**底稿转正的 batch 是 `unknown`。** 转正是 tv-sync 在做，稿子当初是哪个客户端查的重它不知道（`draft_snapshots` 没有这一列，不加列），
+所以明写 `unknown`，不让 CLI 的默认记成 `server_job`。要知道就对回去：查重那一行调用留痕多一个 `check8`（这次底稿的 `check_id` 前
+8 位），和 batch 的 `params.check_id` 前 8 位对上（下面第三条 SQL；调用留痕丢了行的对不上，是 null）。
+
+**`ingest_published` 没给出处时 `file` 照旧是 `workbuddy`。** 读 `params.file` 的代码本仓和 TV 都没有，但负责人手写的 SQL 可能按它筛，
+所以不改。它的意思是「`ingest_published` 没带出处」，不是「从 WorkBuddy 来的」；实际是哪个客户端看 `params.client_mark.app`。工具说明没动。
+
+**不进日志、不上 /health、绝不拖慢。** 原始的请求头、钥匙、clientInfo 原串一律不存不记；出门前 `Mark.as_dict` 自己再核一遍（词不在
+词表里整块当 `unknown`，串不合规矩就丢掉那个键）。UA 的前 512 个字符里带着这次请求的钥匙（不分大小写），或输出里有钥匙洗过之后的连续 8 个字符时 `ua` 记成
+`other`、不套规则；clientInfo 里带着就整条不记。跑在事件循环上，所以只做小事、没有 I/O：请求头过一遍，每种头只取第一个（钥匙也只认第一个 `X-Deskcore-Key` / 第一个
+`Authorization`，同鉴权；一千个重复的钥匙头不会多干一千遍活），UA 只看前 512 个字符（找钥匙也只在这一段里找：输出只从这一段来），
+一次字典查找；MCP 请求体里有 `"initialize"`（带引号的那个 JSON 串）、不超过 64 KiB 的才解析一次 JSON（SDK 自己也要解析一遍）。任何一步出了意外都是 `unknown` / `none`，只记一行 WARNING
+（`client mark: classification failed (<异常类型>)`，5 分钟最多一行），回包不变。/health、/ready、/tools、/skill-versions 都没动。
+
+**读不出来的。** `flywheel_lessons` 的借卡次数和 `lesson_exposure` 是按（项目，身份）记的，同一个 12 小时里两个客户端都在写时照样混在
+一起；改稿看存档那一行；多副本各有一张小表。
+
+**上线之后核一次映射（负责人，十分钟，只读）。** ① `/health` 的 `build.commit` 是合进去的那个提交，协议还是 `6f23eba491fd`。
+② 拿测试项目：DSH 里**新开**一场写作台对话、调 `open_project`；WorkBuddy 里新开一场、调 `open_project`；愿意的话 Claude Code 也来一次。
+③ 跑下面第四条 SQL。④ 应该是 DSH 那几行 `dsh_plugin`、WorkBuddy 那几行 `workbuddy_skill`。是的话也先问清：同一把钥匙上还有没有
+别的 MCP 客户端（Node 写的脚本、别的桌面应用），它的 `ua` / `origin` 和 DSH 的是不是一样——一样的话 `basis = hello` 的行里可能有它的
+调用（上面「指纹管不到的那一种」），给 DSH 单发一把钥匙再读。不是的话看 `ua` / `origin` / `hello`：
+`hello` 认得、`ua` 是通用的 → 规则没问题，只是靠小表；两个都是通用的 → 在「`(ua, origin)` 定死一条规则（比如 MCP 上 `node`、没有
+Origin 的算 DSH，前提是没有别的客户端也这样）」和「拿插件每 30 分钟那次 REST 取协议对上同一把钥匙」两个办法里挑一个，都是改一行加一条
+用例。⑤ 历史不回写，用第五条 SQL 的 `CASE` 重读。⑥ 顺便看 DSH 新开的那场有没有 `hello`：有就说明新对话会重新 initialize、之后的请求带着同一版 `MCP-Protocol-Version`，小表热得快；
+没有的话，要么新对话不重新 initialize，要么它谈的是 2025-06-18 起的版本、之后的请求却不带这个头（两边对不上，按规矩不认）。
+
+```sql
+-- 每个客户端调了哪些工具(近 7 天)
+select meta->'client_mark'->>'app' as app, meta->'client_mark'->>'basis' as basis,
+       meta->>'tool' as tool, count(*)
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and created_at > now() - interval '7 days'
+ group by 1, 2, 3 order by 1, 4 desc;
+
+-- 新 batch 按客户端(近 14 天; 底稿转正的 via = snapshot 另列)。只数写作台建的: TV 每晚同步建的
+-- source = truth_vault_sync 那种不经过写作台, 永远没有 client_mark; 写作台 11-17 之前建的也没有, 记成 (no mark)
+select coalesce(params->'client_mark'->>'app', '(no mark)') as app, params->>'source' as source,
+       coalesce(params->>'via', '-') as via, count(*)
+  from autowriter.batches
+ where created_at > now() - interval '14 days' and params->>'source' in ('deskcore', 'ingest')
+ group by 1, 2, 3 order by 4 desc;
+
+-- 底稿转正的 batch 找回当初查重的那个客户端(留痕会丢行: 对不上的是 null)
+select b.id, b.project_id, m.meta->'client_mark'->>'app' as checked_by
+  from autowriter.batches b
+  left join autowriter.batch_metrics m
+    on m.meta->>'mode' = 'tool_call' and m.meta->>'tool' = 'check_drafts'
+   and m.project_id = b.project_id and m.meta->>'check8' = left(b.params->>'check_id', 8)
+ where b.params->>'via' = 'snapshot' and b.created_at > now() - interval '14 days';
+
+-- 上线核对: 最近一小时的调用各是哪个客户端、凭什么、证据是什么
+select created_at, meta->>'tool' as tool, meta->>'channel' as channel,
+       meta->'client_mark'->>'app' as app, meta->'client_mark'->>'basis' as basis,
+       meta->'client_mark'->>'ua' as ua, meta->'client_mark'->>'origin' as origin,
+       meta->'client_mark'->>'hello' as hello
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and created_at > now() - interval '1 hour'
+ order by created_at desc limit 50;
+
+-- 规则改之前重读历史(示例: 核对发现 DSH 发的是 node、不带 Origin; <seen> 换成看到的那个 ua)。batch 上没有证据:
+-- 存档的 batch 用 batch_metrics.batch_id 对到 mode = 'deskcore_commit' 那一行, 拿那一行的 meta.client_mark 套同一个 CASE
+select case when meta->'client_mark'->>'app' in ('other_mcp', 'unknown')
+             and meta->'client_mark'->>'ua' = '<seen>' and meta->'client_mark'->>'origin' = 'false'
+            then 'dsh_plugin' else meta->'client_mark'->>'app' end as app, count(*)
+  from autowriter.batch_metrics
+ where meta->>'mode' = 'tool_call' and created_at > now() - interval '14 days'
+ group by 1 order by 2 desc;
+```
+
+协议、skill、`clients/dsh-plugin` 都没动（协议摘要还是 `6f23eba491fd`），插件不用发版、skill 不用重导，写手不用做什么。
+
+**回归**：`tests/test_client_mark.py`（UA 洗法那张表（含产品 token 写在 `Electron/…` 后面）、三条规则和反例（含连写的
+`DeepSeekHarness`）、500 组乱七八糟的请求头出来的永远是词表里的词和合规矩的短串、钥匙不出门（含大小写混着的钥匙的一段）、出了意外是
+`unknown` 且 5 分钟只一行 WARNING、小表按指纹用 / 到期 / 撞车说不清（两个认不得的名字也算）/ 换版本 / 上限 512 / REST 不查、协议版本在
+指纹里（谈定的那一版、2025-06-18 之前的和没带头的归一格、没有 protocolVersion 的 initialize 不记）、指纹管不到的那一种照文档说的那样、
+先后、initialize 单条和一批都认而别的请求体不认（稿子里有 initialize 这个词不解析）、名字里的中文洗掉、钥匙头只取第一个、UA 只在前 512
+个字符里找钥匙、一千个钥匙头 + 30 KB 的 UA 分类不到 10 ms、batch 只拿两个词、绑定先于进程默认且退出时还原、CLI 的命令是
+`server_job`、模块不 import web 框架）；`tests/test_client_mark_http.py`（真 REST 那一行按 UA 定 / `rest` / 带 Origin、真 MCP initialize
+之后同一个指纹的 `tools/call` 是 `hello`、换了 Origin 或请求头上的协议版本不一样不算、要了服务端不支持的版本时按谈定的那一版记、
+没 initialize 时按 UA、/mcp 外两层的顺序、存档的 batch（只有两个词）和存档那一行（带证据）都有而 `source` /
+`ai_engines` / `versions.ai_engine` 照旧、按 `params->>source` 找 batch 照样找得到、补录 `file` 照旧是 `workbuddy`、`check8` 对得回转正的
+batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和钥匙不进库 / 日志 / stdout 埋点 / /health、分类出了意外回包一个字节
+不变、只多 JSONB 的键不加列）。另外四条原有断言因为 batch 的 `params` 多了这个键跟着改：`tests/test_flywheel_arm.py` 的 `_commit`、
+`tests/test_deskcore_cli_ingest.py`、`tests/test_deskcore_ingest.py`、`tests/test_tv_sync.py`。
 
 ## 4. 接入
 

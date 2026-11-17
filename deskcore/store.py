@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 
 import db
 
-from . import vocab
+from . import clientmark, vocab
 
 logger = logging.getLogger("deskcore.store")
 
@@ -2090,6 +2090,11 @@ def mint_draft_identity(sb, project_id: str, user_id: str, tactic: str,
 
     minted: dict[str, str] = {}
     batch_id = None
+    # 这批是从哪个客户端来的(2026-11-17, clientmark, docs/deskcore.md §3.37): 每个写作台的 batch 都在这里带上, 调用方自己给了
+    # 就用调用方的(底稿转正给的是 unknown)。只多一个 JSONB 键, 只有 app / basis 两个词(洗过的证据只进 batch_metrics.meta);
+    # source / file / ai_engines 的意思都不变。for_batch 绝不抛。
+    params = dict(batch_params or {"source": "deskcore"})
+    params.setdefault(clientmark.KEY, clientmark.for_batch())
     try:
         batch = db.create_batch(
             sb, user_id=user_id, project_id=project_id, tactic=tactic or "",
@@ -2097,7 +2102,7 @@ def mint_draft_identity(sb, project_id: str, user_id: str, tactic: str,
             # "从 TV 同步进来的 item"(migrations/000 §items, 值恒为 'truth_vault',
             # 还挂着 items_external_source_per_user_uniq), TV 那边按它认自己的行。
             # 补进来的稿子(core.ingest_published)用 {"source": "ingest", "file": …}。
-            params=batch_params or {"source": "deskcore"},
+            params=params,
             ai_engines=[DESKCORE_AI_ENGINE])
         batch_id = batch["id"]
         _mint_entries(sb, batch_id, user_id, entries, minted)

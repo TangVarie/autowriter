@@ -1234,6 +1234,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
 
     args = ap.parse_args(argv)
+    # 命令行起的都没有 HTTP 调用方: 这期间建的 batch(ingest、每晚 tv-sync 的补录)记成 server_job(clientmark, docs/deskcore.md
+    # §3.37)。进程级的默认、退出时还原 —— tv-sync 起的线程池拿不到 contextvar; 用例里连着调几次 main 也串不了
+    from . import clientmark
+    with clientmark.process_default(clientmark.SERVER_JOB):
+        return _dispatch(ap, args)
+
+
+def _dispatch(ap: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.cmd == "selftest":
         return selftest()
     if args.cmd == "sync-skill":

@@ -111,7 +111,8 @@ def test_real_run_links_matches_ingests_the_rest_and_is_incremental():
     minted = next(v for v in c.rows["versions"] if v["id"] == links["n2"]["version_id"])
     assert "#跑步" not in minted["body"] and minted["title"] == "上周发的那篇"
     prov = next(b for b in c.rows["batches"] if b["id"] == out["ingest"]["batch_id"])["params"]
-    assert prov == {"source": "ingest", "file": f"tv:{TV}"}
+    # client_mark(2026-11-17, deskcore/clientmark.py): 直接调 core.tv_sync(不经 CLI)→ unknown
+    assert prov == {"source": "ingest", "file": f"tv:{TV}", "client_mark": {"app": "unknown", "basis": "none"}}
     assert out["links_written"] == 3 and out["tv_backfilled"] == 0, "没 --write-tv 不碰 TV"
     assert not c.tv_calls["backfill"]
 

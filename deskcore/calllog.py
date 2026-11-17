@@ -46,6 +46,7 @@ FAIL_LOG_EVERY_SEC = 300.0                # 写不进去 / 队列满: 这么久�
 OUTCOMES = ("ok", "error_result", "refused", "failed", "interrupted")
 _SIGNALS = frozenset({"opening", "title", "ngram", "contain"})
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_HEX8 = re.compile(r"[0-9a-f]{8}")
 # 认得的词: 只有 ASCII 的字母、数字、下划线、点(异常类型名带模块), 后面可以跟一个错误码。中文、空格、标点一律不是
 _WORD = re.compile(r"[A-Za-z0-9_.]{1,80}(?: code=[A-Za-z0-9_]{1,16})?")
 _MAX_KEYS = 40
@@ -291,6 +292,10 @@ def build(job: dict) -> dict:
         # 借卡那两个工具这次的回包里带了封面那一句(2026-11-16); 没带就没有这个键。core 是在借卡那一步记的, 之后调用还可能
         # 抛、或者降级成不带这一栏的错误回包 —— 所以这里再看一眼回包: 回包里真有这一栏才记
         meta["cover_note"] = True
+    if isinstance(notes.get("check8"), str) and _HEX8.fullmatch(notes["check8"]):
+        meta["check8"] = notes["check8"]                # 这次查重记的底稿的 check_id 前 8 位(2026-11-17): 底稿转正的 batch 靠它对回这一行
+    if isinstance(job.get("client"), dict):
+        meta["client_mark"] = job["client"]             # 这一次是哪个客户端(clientmark, §3.37): 固定的词 + 洗过的短串, _clean 再筛一遍
     return {"project_id": column, "user_id": job.get("user_id"), "phase_ms": {"total": elapsed}, "counters": {},
             "meta": _clean(meta)}
 
@@ -368,8 +373,9 @@ _writer = _Writer()
 
 
 def submit(*, tool: str, channel: str, user_id, args, sink, elapsed_ms: int, result=None,
-           outcome: str | None = None, error_class: str | None = None) -> bool:
+           outcome: str | None = None, error_class: str | None = None, client: dict | None = None) -> bool:
     """app 在回包定下来之后调: 把这一次调用交给后台去记。**不等、不抛**; 回有没有放进队列。
+    ``client``: 这一次是哪个客户端(``clientmark.Mark.as_dict()``), 进 ``meta.client_mark``。
 
     不记的: 开关关着、``SKIP_TOOLS`` 里的工具、认不出调用者的(``batch_metrics.user_id`` 是非空的 uuid 列, 不编一个填进去)。"""
     try:
@@ -377,7 +383,8 @@ def submit(*, tool: str, channel: str, user_id, args, sink, elapsed_ms: int, res
         if tool in SKIP_TOOLS or user is None or not enabled():
             return False
         return _writer.put({"tool": tool, "channel": channel, "user_id": user, "args": args, "sink": sink,
-                            "elapsed_ms": elapsed_ms, "result": result, "outcome": outcome, "error_class": error_class})
+                            "elapsed_ms": elapsed_ms, "result": result, "outcome": outcome, "error_class": error_class,
+                            "client": client})
     except Exception:                                   # noqa: BLE001 — 留痕绝不能改变工具的行为
         return False
 

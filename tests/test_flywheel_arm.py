@@ -18,7 +18,7 @@ import pytest
 
 import config
 import librarian_client as lib
-from deskcore import core, store
+from deskcore import clientmark, core, store
 from tests.fakes import FakeClient
 
 ME = "11111111-1111-1111-1111-111111111111"
@@ -112,6 +112,8 @@ def _commit(monkeypatch):
     assert set(stored.pop(core.DELIVERY_PARTS_KEY)) == {"order", "parts"}
     assert core.LESSON_EXPOSURE_KEY in stored, "每个新 batch 都带这个键(null = 不知道)"
     stored.pop(core.LESSON_EXPOSURE_KEY)
+    # 这批从哪个客户端来(2026-11-17, deskcore/clientmark.py)是 store 建 batch 时加的, 不是臂的事; tests/test_client_mark*.py 钉它
+    assert stored.pop(clientmark.KEY) == {"app": "unknown", "basis": "none"}, "每个新 batch 都带这个键"
     assert stored == captured["params"]
     return captured["params"]
 
