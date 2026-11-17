@@ -56,7 +56,9 @@ def test_ingest_writes_identity_and_fingerprints_with_the_file_as_source(fake, t
     out = capsys.readouterr().out
     assert rc == 0, out
     assert "建身份 2/2" in out and "写指纹 2" in out
-    assert fake.rows["batches"][0]["params"] == {"source": "ingest", "file": "途鸽-9月.xlsx"}
+    # client_mark(2026-11-17, deskcore/clientmark.py): 命令行起的 → server_job
+    assert fake.rows["batches"][0]["params"] == {"source": "ingest", "file": "途鸽-9月.xlsx",
+                                                 "client_mark": {"app": "server_job", "basis": "process"}}
     assert all("external_source" not in i for i in fake.rows["items"])
     assert len(fake.rows["draft_fingerprints"]) == 2
 

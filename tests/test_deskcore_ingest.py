@@ -149,7 +149,9 @@ def test_ingest_mints_identity_with_provenance_and_writes_fingerprints():
     assert {f["version_id"] for f in fps} == set(versions), "指纹指向真建出来的 version"
     assert all(f["angle_key"] is None for f in fps)
     assert all(f["opening_hash"] and f["ngram_hashes"] for f in fps)
-    assert c.rows["batches"][0]["params"] == {"source": "ingest", "file": "途鸽-9月.xlsx"}, \
+    # client_mark(2026-11-17, deskcore/clientmark.py): 直接调 core, 没有 HTTP 调用方也不是 CLI → unknown
+    assert c.rows["batches"][0]["params"] == {"source": "ingest", "file": "途鸽-9月.xlsx",
+                                              "client_mark": {"app": "unknown", "basis": "none"}}, \
         "出处记在 batch 上, 以后分得清这批不是写作台当场写的"
 
 
