@@ -2568,6 +2568,8 @@ select case when meta->'client_mark'->>'app' in ('other_mcp', 'unknown')
  group by 1 order by 2 desc;
 ```
 
+**11-17 部署后读到的（只读，按 `app` / `basis` / `ua` / `origin` / `hello` 分组，只看个数）。** 部署（`b8d6514`）后到 10:08 UTC 共 110 次调用，全是同一组值：`workbuddy_skill` / `user_agent`，`ua = workbuddy_v5.11.3`，`origin = false`，`hello = deskcore_v1.0.0`。一个写手，调的主要是评论那一路（`score_comments`、`comments_for`）；这段时间没有新 batch。读出来三件事：① WorkBuddy 靠 UA 就认得，规则不用改；② WorkBuddy **不带** Origin，上面「中等把握」那条不对；③ WorkBuddy 在 clientInfo 里报的名字是 `deskcore`，和这个服务的名字一样，所以 `hello` 认不出 WorkBuddy。DSH 的插件预设给这个服务起的名字也是 `deskcore`，要是 DSH 的 MCP 客户端也这样报，`hello` 就分不出 DSH，DSH 那边只剩 UA 能认。DSH 还没有调用，等负责人下次在 DSH 里用写作台再读第四条 SQL。
+
 协议、skill、`clients/dsh-plugin` 都没动（协议摘要还是 `6f23eba491fd`），插件不用发版、skill 不用重导，写手不用做什么。
 
 **回归**：`tests/test_client_mark.py`（UA 洗法那张表（含产品 token 写在 `Electron/…` 后面）、三条规则和反例（含连写的
