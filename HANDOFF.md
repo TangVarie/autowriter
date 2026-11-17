@@ -138,7 +138,7 @@ MCP并发修复、评论转发和跨项目防护已经合并部署；现场5个�
 | W-06 | 查超线项目的发牌、会话中断、`commit_drafts`和`export_drafts`链路 | 本轮只读发现51%漏账，不自动补消费、删角度或改审核结果；先辨清真实流程断点 |
 | J-08 / J-12 | 写手恢复后用`batch_metrics(meta.mode=deskcore_commit)`重估judge预算；核活跃项目tv-map | judge保持shadow；新超时值需真实样本，不凭旧runbook的“env未配”重复配置 |
 | W-04 / W-05 / W-18 | 保留发牌结果加权、recent_angle_keys分页、旧文档逐段追平待办 | 加权未实施；当前交接补入口不表示全部旧文字已重写 |
-| 客户端标记（2026-11-17） | 部署后按`docs/deskcore.md` §3.37各开一场DSH写作台对话和WorkBuddy对话（测试项目），跑那一节的核对SQL | 映射核过之前`other_mcp`不能读成「不是DSH」；`basis=hello`只和指纹一样纯（同一把钥匙上不重新initialize的别的客户端会跟着算），同钥匙上还有别的MCP客户端就给DSH单发一把钥匙；不对就改`deskcore/clientmark.py`的规则，历史按`ua`/`hello`（只在`batch_metrics.meta`，batch上只有两个词）用CASE重读，不回写库 |
+| 客户端标记（2026-11-17） | WorkBuddy 11-17 核过：110次调用都是`workbuddy_skill`/`user_agent`（UA认得；不带Origin；clientInfo报的名字是`deskcore`，`hello`认不出它）。还差DSH：负责人下次在DSH里用写作台后跑§3.37第四条SQL | 映射核过之前`other_mcp`不能读成「不是DSH」；`basis=hello`只和指纹一样纯（同一把钥匙上不重新initialize的别的客户端会跟着算），同钥匙上还有别的MCP客户端就给DSH单发一把钥匙；不对就改`deskcore/clientmark.py`的规则，历史按`ua`/`hello`（只在`batch_metrics.meta`，batch上只有两个词）用CASE重读，不回写库 |
 
 Streamlit工作台2026-10-16已停服（owner在Railway停掉，按D-072不删仓、Supabase不动）；迁移011/012等更早状态不能从旧runbook“八个迁移/未执行”的段落推断，必要时用`doctor`只读核对。重新导skill由owner/运营在J-01就绪后统一安排，本轮不向写手发送消息。
 

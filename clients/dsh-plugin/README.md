@@ -66,6 +66,7 @@
 
 - **「写作台」预设的工具清单是从 DSH 的 `standard` 预设抄的**（shell、读写文件、搜索、子智能体、office、网页、待办、压缩等）。DSH 升级后 `standard` 变了，这份不会跟着变，要人工对照 `@deepseek-ai/dsh-web-app` 的 `presets/standard.patch.yml` 同步一次。
 - **`skill-filesystem` 那一行不要加回 `customSkillDirs`**：`standard` 里那行靠 `createRequire` 去解析 DSH 自己的包，从这个包的位置解析不到，会抛错连累整行。
+- **服务端那几样是写死在插件里的**：被拦的三个工具名和旧名 `commit_drafts`、按 `project_id` 认项目、`/tool/get_protocol` 回包里的 `protocol` / `version` / `skill_header`、钥匙走 `X-Deskcore-Key` 头。服务端改这些之前先改插件、发一版插件。服务端仓的 `tests/test_dsh_plugin_contract.py` 直接读 `lib/desk.js` 逐样对服务端，对不上就红。
 - **不要加构建步骤，也不要加运行时依赖**。从 Git 装的包不会跑构建脚本；`client.js` 是手写的 `window.__ModuleLoader__.load(...)`，它的 `id` 必须和 `package.json` 的包名一致。
 
 ## 结构
