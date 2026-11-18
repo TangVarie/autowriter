@@ -1,0 +1,10 @@
+# 写作台 bundle 的 profile 层入口。
+#
+# 这个包里有两层：
+#   1. 这一行（根）：拉协议、按对话挂写作台那一段系统提示、拦发牌/查重/存档、
+#      /desk-setup 与 /desk-status 两个命令。
+#   2. presets/writing-desk.patch.yml：「写作台」智能体预设。左侧栏页签开的对话
+#      用这个预设，deskcore 的工具只挂在这个预设的 scope 里。
+- insert:
+    - id: writing-desk
+      name: bywood-writing-desk-dsh

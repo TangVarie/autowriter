@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Writing desk (0.2.1 compatibility)",
+    "description": "A left-sidebar entry: clicking it opens a writing-desk conversation in the current workspace (agent preset “Writing desk”). The desk's project rules, angle draw, dedup and archiving follow only conversations started from it; ordinary conversations get a single signpost pointing at the tab and carry neither the protocol nor the deskcore tools. Configure the address and key with /desk-setup, then just talk. (Compatibility build for DSH 0.2.1 on Intel Macs. On DSH 0.2.2 or later, install the regular build.)",
+    "detail": "docs/DETAIL.md"
+  }
+}
