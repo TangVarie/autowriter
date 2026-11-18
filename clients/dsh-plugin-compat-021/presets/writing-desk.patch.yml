@@ -1,0 +1,172 @@
+# 「写作台」智能体预设：左侧栏「写作台」页签开的对话用这个。
+#
+# 为什么是一个预设，而不是把写作台挂在每个对话上：
+#   - 写作台那一大段协议、deskcore 的十几个工具、拦发牌/查重/存档的闸，
+#     只在写品牌小红书稿的时候才该出现。普通对话里带着它，模型会把每一场
+#     对话都当成写作台来办。
+#   - 所以工具挂在这个预设的 scope 里（dsh-mcp-client 一行），协议由根上的
+#     插件按对话注册。预设外的对话两样都没有。
+#
+# 工具面照 standard 预设抄一份，写作台写稿要用的都在（读写文件、搜索、shell、
+# 子智能体、office、网页、待办、压缩），免得换个页签就少一半能力。
+- insert:
+    - id: preset-writing-desk
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: writing-desk
+        name: 写作台
+        description: 给品牌写小红书笔记、标题、评论，接项目规则、查重和存档
+        order: 2
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                你是 BYWOOD「写作台」里的写手助手：给品牌写小红书笔记、标题、评论，按项目规则改稿。
+                这个对话是从写作台的页签开的，写作台协议在系统提示的「写作台」一节——写、改任何东西之前先照它走。
+                用户说到品牌、项目，或者贴来一段 brief，就是写作台的项目：先拿简报再动笔，不要凭空写。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          # deskcore：写作台自己的 MCP 服务。地址和钥匙从凭据库里读（桌面端自己的
+          # 凭据文件，不进配置、不进会话日志）；没配就停在 waiting-credentials，
+          # 不报错、也不挂工具——系统提示里会说「还没配置，不要写稿」。
+          # 地址和钥匙由宿主插件现读桌面端自己的凭据文件（lib/credfile.js 挂在 globalThis 上的那个读取函数）。
+          # 不用 ${credential:…} 模板：Intel Mac 上的桌面版停在 0.2.1，它的 MCP 客户端不认模板。
+          # 这几个 !!js 在预设为对话激活时才求值，所以配完 /desk-setup 要完全退出再打开一次。
+          # 没配就整行不加载（disabled），不白白一遍遍去连。
+          - id: desk-mcp
+            name: '@deepseek-ai/dsh-mcp-client'
+            disabled: !!js "!globalThis.__bywoodWritingDesk?.configured()"
+            config:
+              serverName: deskcore
+              transport: streamable-http
+              url: !!js "globalThis.__bywoodWritingDesk?.url() ?? ''"
+              headers:
+                X-Deskcore-Key: !!js "globalThis.__bywoodWritingDesk?.key() ?? ''"
+              startupTimeoutMs: 20000
+              # 桌面端一开就是一天：写作台重启、网络抖一段，都别让它「试满 10 次
+              # 就放弃、直到重启宿主」。连着 30 秒就重置计数，所以正常使用时它一直在。
+              reconnect:
+                enabled: true
+                initialDelayMs: 500
+                maxDelayMs: 30000
+                maxAttempts: 1000
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          # 没有 customSkillDirs：standard 预设里那一行用 !!js + createRequire(baseUrl)
+          # 去解析 dsh-agent-preset 包里的 skills，本包是工作区里的链接包，从它解析
+          # 不到那个包（会抛错、连累整行）。写作台不需要那份 dsh-doc，用默认技能源。
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+                config:
+                  interrupt: false
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          # 没有 tool-office：0.2.1 里没有这个包（Intel Mac 上的桌面版停在 0.2.1），列上会让整个预设起不来。
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true

@@ -11,19 +11,35 @@
   4. 插件发钥匙用的头, 服务端认
 
 改这几样之前先改插件、发一版插件; 这个测试红了就是提醒这件事。
+
+两个包都对一遍: 正常版 ``clients/dsh-plugin``, 和给停在 DSH 0.2.1 的 Intel Mac 用的兼容版
+``clients/dsh-plugin-compat-021``(2026-11-18)。兼容版是单独维护的一份, 服务端改了这几样, 两份都要跟。
 """
 
 from __future__ import annotations
 
 import inspect
 import re
+import sys
 from pathlib import Path
+
+import pytest
 
 import deskcore.tools as T
 
 REPO = Path(__file__).resolve().parent.parent
-DESK_JS = REPO / "clients" / "dsh-plugin" / "lib" / "desk.js"
+PACKAGES = ("dsh-plugin", "dsh-plugin-compat-021")
 APP_PY = REPO / "deskcore" / "app.py"
+
+
+@pytest.fixture(params=PACKAGES, autouse=True)
+def _package(request, monkeypatch):
+    """每条用例对两个包各跑一遍。"""
+    monkeypatch.setattr(sys.modules[__name__], "DESK_JS", REPO / "clients" / request.param / "lib" / "desk.js")
+    return request.param
+
+
+DESK_JS = REPO / "clients" / PACKAGES[0] / "lib" / "desk.js"
 
 
 def _js() -> str:
@@ -84,3 +100,7 @@ def test_key_header_the_plugin_sends_is_accepted():
     m = re.search(r"'(X-[A-Za-z-]+-Key)'\s*:\s*key", _js())
     assert m, "desk.js 里找不到发钥匙的头"
     assert f'request.headers.get("{m.group(1).lower()}")' in APP_PY.read_text(encoding="utf-8")
+
+
+def test_each_run_reads_its_own_package(_package):
+    assert DESK_JS.parent.parent.name == _package
