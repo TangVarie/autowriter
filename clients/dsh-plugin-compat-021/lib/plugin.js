@@ -90,6 +90,19 @@ export function install(ctx, { fetchImpl, refreshMs = REFRESH_MS, presetId = PRE
 
   const warn = message => { ctx.logger?.warn?.(`bywood-writing-desk: ${message}`) }
 
+  /**
+   * 读一个没在 inject 里声明的服务（agentPresets、agents）。只能用 ctx.get：DSH 0.2.1 直接读
+   * ctx.agentPresets 会抛「cannot get property "agentPresets" without inject」，抛在 agent/created
+   * 里就是整场对话建不起来（2026-11-18 Intel Mac 实测）。0.2.2 不抛，所以正常版里没撞上。
+   */
+  const service = (name) => {
+    try {
+      return ctx.get?.(name) ?? undefined
+    } catch {
+      return undefined
+    }
+  }
+
   const resolveRef = async (ref) => {
     try {
       return (await ctx.credentials.resolve(ref))?.value
@@ -106,7 +119,7 @@ export function install(ctx, { fetchImpl, refreshMs = REFRESH_MS, presetId = PRE
    * 但有 composedPreset(agent.ctx)：「这个 agent 正在用哪个预设」。两个都试。
    */
   const presetOf = (agent) => {
-    const presets = ctx.agentPresets
+    const presets = service('agentPresets')
     try {
       const bySession = presets?.presetForSession?.(agent.session)
       if (bySession != null) return bySession
@@ -146,7 +159,7 @@ export function install(ctx, { fetchImpl, refreshMs = REFRESH_MS, presetId = PRE
   const anyDeskAgent = () => {
     let agents = []
     try {
-      agents = ctx.agents?.list?.() ?? []
+      agents = service('agents')?.list?.() ?? []
     } catch {
       agents = []
     }
@@ -287,9 +300,14 @@ export function install(ctx, { fetchImpl, refreshMs = REFRESH_MS, presetId = PRE
 
   // 对话一建好就挂上它该有的那一段：写作台对话挂协议，别的对话挂一句指路。
   // 写作台对话还要把协议准备好，否则第一个模型步骤会显示「还在连接」。
+  // 这里抛出去会让整场对话建不起来（agent/created 是串行等的）：插件自己出什么错都只记一行，不往外抛。
   ctx.on('agent/created', async ({ agent }) => {
-    attachSection(agent)
-    if (isDeskAgent(agent) && status.configured && !status.protocol) await settled()
+    try {
+      attachSection(agent)
+      if (isDeskAgent(agent) && status.configured && !status.protocol) await settled()
+    } catch (error) {
+      warn(`新对话挂写作台那一段失败：${error?.message ?? error}`)
+    }
   })
 
   // agent 走了，它那份段落由 agent.ctx 自己收；这里把「谁挂着」记掉，
@@ -362,7 +380,11 @@ export function install(ctx, { fetchImpl, refreshMs = REFRESH_MS, presetId = PRE
 
   ctx.on('agent/pre-step', async ({ agent }, next) => {
     // 从别处切到写作台预设（或切出去）的对话：下一个模型步骤起就换成对应的那一段。
-    attachSection(agent)
+    try {
+      attachSection(agent)
+    } catch (error) {
+      warn(`换写作台那一段失败：${error?.message ?? error}`)
+    }
     const decision = await next()
     if (decision.kind !== 'enter') return decision
     const text = takeReopenNotice(stateOf(agent.session))

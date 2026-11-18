@@ -9,6 +9,22 @@ const ok = payload => ({ isError: false, value: { structuredContent: payload } }
 const t = name => `${TOOL_PREFIX}${name}`
 
 /**
+ * DSH 0.2.1 的规矩：没在 inject 里声明的服务，直接读 ctx.xxx 就抛；只能 ctx.get('xxx')。
+ * 2026-11-18 Intel Mac 实测就是撞在这上面：读 ctx.agentPresets 抛在 agent/created 里，整场对话建不起来。
+ * 假 ctx 照这个规矩来，往里塞东西（测试里换 agentPresets、tools）照常能塞。
+ */
+const UNDECLARED = new Set(['agentPresets', 'agents', 'dshHomePath'])
+function strictCtx(raw) {
+  raw.get ??= name => raw[name]
+  return new Proxy(raw, {
+    get(target, prop, receiver) {
+      if (UNDECLARED.has(prop)) throw new Error(`cannot get property "${String(prop)}" without inject`)
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+}
+
+/**
  * 一个够用的假 ctx：
  *  - `record.sections` 记下按对话注册的系统提示段落；
  *  - `preset` 写在会话上，决定哪个对话是写作台对话；
@@ -98,7 +114,7 @@ function fakeCtx({
 
   const dispose = () => { for (const d of disposers.reverse()) { try { d?.() } catch { /* ignore */ } } }
 
-  return { ctx, record, store, emit, dispose, fakeAgent, toolUsers, deps: { fetchImpl, refreshMs: 3_600_000 } }
+  return { ctx: strictCtx(ctx), record, store, emit, dispose, fakeAgent, toolUsers, deps: { fetchImpl, refreshMs: 3_600_000 } }
 }
 
 test('普通对话不挂写作台：只挂一句指路，拦的规则也不触发', async () => {
@@ -183,7 +199,7 @@ test('工具可见的写作台对话：文本是完整协议', async () => {
 
 test('预设读不到时，靠「看得见 deskcore 的工具」认出写作台对话', async () => {
   const f = fakeCtx({ creds: { [URL_REF]: 'https://d.example.com', [KEY_REF]: 'k-secret-123456' } })
-  f.ctx.agentPresets.presetForSession = () => null
+  f.ctx.get('agentPresets').presetForSession = () => null
   const desk = f.fakeAgent('s-desk')
   f.toolUsers.add(desk)
   install(f.ctx, f.deps)
@@ -447,5 +463,35 @@ test('/desk-setup 成功后说要完全退出再打开', async () => {
   const done = await f.record.commands.get('desk-setup').handler({ rawInput: ' https://d.example.com k-secret-123456' })
   assert.equal(done.kind, 'success')
   assert.match(done.text, /完全退出/)
+  f.dispose()
+})
+
+test('0.2.1 不许直接读没声明的服务：新对话照样建得起来，写作台对话照样认得出', async () => {
+  const f = fakeCtx({ creds: CREDS })
+  assert.throws(() => f.ctx.agentPresets, /without inject/, '假 ctx 要和 0.2.1 一样严')
+  const deskCtxs = new WeakSet()
+  f.ctx.agentPresets = { composedPreset: agentCtx => (deskCtxs.has(agentCtx) ? PRESET_ID : undefined) }
+  install(f.ctx, f.deps)
+  await settle()
+  const desk = f.fakeAgent('strict')
+  deskCtxs.add(desk.ctx)
+  await f.emit('agent/created', { agent: desk })
+  assert.equal(f.record.sections.find(e => e.session === 'strict').section.name, 'bywood-writing-desk')
+  f.toolUsers.add(desk)
+  const status = await f.record.commands.get('desk-status').handler({ agent: f.fakeAgent('plain') })
+  assert.match(status.text, /写作台连着/, '在普通对话里问，也认得出开着的写作台对话（agents 走 ctx.get）')
+  f.dispose()
+})
+
+test('挂那一段时出什么错，都不能让新对话建不起来', async () => {
+  const f = fakeCtx({ creds: CREDS })
+  f.ctx.agentPresets = { composedPreset: () => { throw new Error('boom') } }
+  install(f.ctx, f.deps)
+  await settle()
+  const agent = f.fakeAgent('broken', { preset: PRESET_ID })
+  agent.ctx.systemPrompt.section = () => { throw new Error('section exploded') }
+  await f.emit('agent/created', { agent })
+  const decision = await f.emit('agent/pre-step', { agent, messages: [] }, async () => ({ kind: 'enter', messages: [] }))
+  assert.equal(decision.kind, 'enter', '下一步照常进行')
   f.dispose()
 })
