@@ -18,10 +18,10 @@ import {
   buildSection, compacted, fetchProtocol, gate, newState, observe, parseSetup,
   stopping, takeReopenNotice, turnStarted,
 } from './desk.js'
-import { installGlobal } from './credfile.js'
 
 const REFRESH_MS = 30 * 60 * 1000
-// 预设里那一行 MCP 客户端是在预设激活时读地址和钥匙的（见 credfile.js），配完要重开一次才连得上。
+// 0.2.1 在桌面端启动时就装好预设，那一行 MCP 客户端这时读一次地址和钥匙（见 presets/writing-desk.patch.yml），
+// 配完要重开一次才连得上。
 const RESTART_AFTER_SETUP = '写作台配好了。请完全退出 DeepSeek Harness 再重新打开（Mac 按 ⌘Q，不是只关窗口），'
   + '然后点左侧栏的「写作台」开一个对话，输入 /desk-status 看一下是不是「写作台连着」。'
 const SECTION_NAME = 'bywood-writing-desk'
@@ -49,15 +49,6 @@ function userMessage(text, summary) {
  * @param {object} ctx - profile 根上的 Cordis 上下文。
  * @param {{ fetchImpl?: typeof fetch, refreshMs?: number, presetId?: string }} deps
  */
-/** 桌面端在根上提供的 dshHomePath（0.2.1 和 0.2.2 都有）；拿不到就让 credfile 自己按 $DSH_HOME / ~/.dsh 算。 */
-function dshHomePathOf(ctx) {
-  try {
-    return ctx.get?.('dshHomePath') ?? undefined
-  } catch {
-    return undefined
-  }
-}
-
 export function install(ctx, { fetchImpl, refreshMs = REFRESH_MS, presetId = PRESET_ID } = {}) {
   const status = {
     configured: false,
@@ -275,9 +266,6 @@ export function install(ctx, { fetchImpl, refreshMs = REFRESH_MS, presetId = PRE
       warn(`准备协议失败：${error?.message ?? error}`)
     }
   }
-
-  // 给预设里那一行 MCP 客户端读地址和钥匙用（credfile.js）。插件卸载时摘掉。
-  ctx.effect(() => installGlobal({ homePath: dshHomePathOf(ctx) }), 'bywood-writing-desk credential reader')
 
   ctx.effect(() => {
     const timer = setInterval(reloadQuietly, refreshMs)
