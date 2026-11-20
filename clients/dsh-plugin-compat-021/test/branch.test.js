@@ -15,7 +15,7 @@ test('正常版没被兼容改动带歪', () => {
   assert.match(preset, /\$\{credential:BYWOOD_DESK_KEY\}/, '正常版照旧用凭据模板')
   assert.match(preset, /name: '@deepseek-ai\/dsh-tool-office'/, '正常版照旧有 Office 工具')
   assert.doesNotMatch(preset, /__bywoodWritingDesk/)
-  assert.throws(() => read(main, 'lib/credfile.js'), /ENOENT/, '读凭据文件那一套只在兼容版里')
+  assert.doesNotMatch(preset, /getBuiltinModule|\.credentials\.yaml/, '预设自己读凭据文件那一套只在兼容版里')
 })
 
 test('兼容版自己标明是兼容版', () => {

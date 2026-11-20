@@ -31,22 +31,79 @@
               maxBytes: 65536
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
-          # deskcore：写作台自己的 MCP 服务。地址和钥匙从凭据库里读（桌面端自己的
-          # 凭据文件，不进配置、不进会话日志）；没配就停在 waiting-credentials，
-          # 不报错、也不挂工具——系统提示里会说「还没配置，不要写稿」。
-          # 地址和钥匙由宿主插件现读桌面端自己的凭据文件（lib/credfile.js 挂在 globalThis 上的那个读取函数）。
-          # 不用 ${credential:…} 模板：Intel Mac 上的桌面版停在 0.2.1，它的 MCP 客户端不认模板。
-          # 这几个 !!js 在预设为对话激活时才求值，所以配完 /desk-setup 要完全退出再打开一次。
-          # 没配就整行不加载（disabled），不白白一遍遍去连。
+          # deskcore：写作台自己的 MCP 服务。地址和钥匙是 /desk-setup 存进桌面端凭据库的那两项
+          # （<DSH 主目录>/.credentials.yaml 的 refs 下面），钥匙不进配置、不进会话日志。
+          #
+          # 0.2.1 的写法和正常版不一样，原因有两条：
+          #   1. 0.2.1 的 MCP 客户端不认 ${credential:…} 模板，所以这里用 !!js 自己读凭据文件。
+          #   2. 0.2.1 在桌面端启动时就把整个预设装好（不是等开对话），之后每次进对话再按
+          #      disabled 复查一遍。disabled 两次算出来不一样（装的时候「没配、跳过」，复查时
+          #      「配好了、该在」），就报「desk-mcp … never started」，整个对话起不来。
+          # 所以 disabled 这个表达式第一次求值时读一次文件，把结果记在 globalThis 上，这个进程里
+          # 之后都用这一份；url 和钥匙也从这一份里取。它不靠宿主插件（宿主插件可能比预设晚加载）。
+          # 代价：配完 /desk-setup 要完全退出桌面端再打开（Mac 按 ⌘Q）才连得上。
+          # 读不到、认不出就当没配：整行不加载，不报错、也不挂工具，系统提示里会说「还没连上」。
+          # 这里的解析和 lib/desk.js 的 normalizeBase 是同一套规则，test/preset-connection.test.js 逐条对过。
           - id: desk-mcp
             name: '@deepseek-ai/dsh-mcp-client'
-            disabled: !!js "!globalThis.__bywoodWritingDesk?.configured()"
+            disabled: !!js |-
+              !(globalThis.__bywoodWritingDeskConnection ??= (() => {
+                const none = Object.freeze({ configured: false, url: '', key: '' })
+                try {
+                  const { readFileSync } = process.getBuiltinModule('node:fs')
+                  const { join, resolve } = process.getBuiltinModule('node:path')
+                  const { homedir } = process.getBuiltinModule('node:os')
+                  let file
+                  try { file = ctx.get('dshHomePath')?.('.credentials.yaml') } catch {}
+                  if (typeof file !== 'string' || !file) {
+                    file = resolve(String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh'), '.credentials.yaml')
+                  }
+                  const scalar = raw => {
+                    const text = raw.trim()
+                    if (text.startsWith('"')) {
+                      const end = text.lastIndexOf('"')
+                      if (end <= 0) return ''
+                      try { return JSON.parse(text.slice(0, end + 1)) } catch { return text.slice(1, end) }
+                    }
+                    if (text.startsWith("'")) {
+                      const end = text.lastIndexOf("'")
+                      return end <= 0 ? '' : text.slice(1, end).replaceAll("''", "'")
+                    }
+                    const comment = text.search(/\s#/)
+                    return (comment === -1 ? text : text.slice(0, comment)).trim()
+                  }
+                  const refs = new Map()
+                  let inRefs = false
+                  let indent
+                  for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
+                    if (!line.trim() || line.trimStart().startsWith('#')) continue
+                    if (!/^\s/.test(line)) {
+                      inRefs = /^refs\s*:\s*(#.*)?$/.test(line)
+                      indent = undefined
+                      continue
+                    }
+                    const match = inRefs ? /^(\s+)([A-Za-z_][A-Za-z0-9_]*)\s*:(?:\s+(.*))?$/.exec(line) : null
+                    if (!match) continue
+                    indent ??= match[1]
+                    if (match[1] === indent) refs.set(match[2], scalar(match[3] ?? ''))
+                  }
+                  const key = String(refs.get('BYWOOD_DESK_KEY') ?? '').trim()
+                  const url = new URL(String(refs.get('BYWOOD_DESK_URL') ?? '').trim())
+                  const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1'
+                  if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) return none
+                  if (url.username || url.password || url.search || url.hash || !key) return none
+                  const path = url.pathname.replace(/\/+$/, '').replace(/\/mcp$/, '')
+                  return Object.freeze({ configured: true, url: url.origin + path + '/mcp', key })
+                } catch {
+                  return none
+                }
+              })()).configured
             config:
               serverName: deskcore
               transport: streamable-http
-              url: !!js "globalThis.__bywoodWritingDesk?.url() ?? ''"
+              url: !!js "globalThis.__bywoodWritingDeskConnection?.url ?? ''"
               headers:
-                X-Deskcore-Key: !!js "globalThis.__bywoodWritingDesk?.key() ?? ''"
+                X-Deskcore-Key: !!js "globalThis.__bywoodWritingDeskConnection?.key ?? ''"
               startupTimeoutMs: 20000
               # 桌面端一开就是一天：写作台重启、网络抖一段，都别让它「试满 10 次
               # 就放弃、直到重启宿主」。连着 30 秒就重置计数，所以正常使用时它一直在。

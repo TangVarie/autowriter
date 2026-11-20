@@ -445,17 +445,6 @@ test('0.2.2 的 presetForSession 认得出就不再问 composedPreset；认不�
   f.dispose()
 })
 
-test('装上插件就挂读凭据的函数，卸载时摘掉', async () => {
-  const { GLOBAL_NAME } = await import('../lib/credfile.js')
-  const f = fakeCtx()
-  f.ctx.get = name => (name === 'dshHomePath' ? (...segments) => ['/nowhere', ...segments].join('/') : undefined)
-  install(f.ctx, f.deps)
-  assert.equal(typeof globalThis[GLOBAL_NAME]?.configured, 'function')
-  assert.equal(globalThis[GLOBAL_NAME].configured(), false, '/nowhere 下没有凭据文件')
-  f.dispose()
-  assert.equal(globalThis[GLOBAL_NAME], undefined)
-})
-
 test('/desk-setup 成功后说要完全退出再打开', async () => {
   const f = fakeCtx()
   install(f.ctx, f.deps)

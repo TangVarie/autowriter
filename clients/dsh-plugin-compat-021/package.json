@@ -1,6 +1,6 @@
 {
   "name": "bywood-writing-desk-dsh",
-  "version": "1.0.1-compat021.2",
+  "version": "1.0.1-compat021.3",
   "description": "写作台（DeepSeek Harness 0.2.1 兼容版，给 Intel Mac 用）：左侧栏的一个入口，只在从它开的对话里接上项目规则、查重和存档。",
   "type": "module",
   "exports": {
