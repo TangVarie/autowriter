@@ -94,6 +94,14 @@ BORROW_TIMEOUT = "timeout"              # 超时
 BORROW_ERROR = "error"                  # 网络 / 4xx / 5xx / 解析失败
 
 
+_CONNECT_TIMEOUT_CAP_SEC = 3.0
+
+
+def configured() -> bool:
+    """URL 和 key 都配了才算接上。/health 的回显也走这个函数(同源, 与 judge_client.configured 一致)。"""
+    return bool(config.LIBRARIAN_URL and config.LIBRARIAN_API_KEY)
+
+
 def fetch_flywheel_lessons(brief: dict, *,
                            status: dict | None = None) -> list[dict]:
     """向 TV 馆员借阅经验卡。
@@ -115,7 +123,7 @@ def fetch_flywheel_lessons(brief: dict, *,
                "elapsed_ms": 0, "detail": "", "patterns": []})
     pid = str(brief.get("project_id") or "")
 
-    if not config.LIBRARIAN_URL or not config.LIBRARIAN_API_KEY:
+    if not configured():
         st["state"] = BORROW_NOT_CONFIGURED
         st["detail"] = "LIBRARIAN_URL / LIBRARIAN_API_KEY 未配置"
         # ⚠️ 这条以前是**完全静默**的 return —— 于是"这个部署根本没接飞轮"和
@@ -124,12 +132,13 @@ def fetch_flywheel_lessons(brief: dict, *,
         return []
 
     started = time.monotonic()
+    read_t = float(config.LIBRARIAN_TIMEOUT_SEC)
     try:
         resp = requests.post(
             f"{config.LIBRARIAN_URL.rstrip('/')}/librarian",
             headers={"X-Librarian-Key": config.LIBRARIAN_API_KEY},
             json=brief,
-            timeout=config.LIBRARIAN_TIMEOUT_SEC,
+            timeout=(min(_CONNECT_TIMEOUT_CAP_SEC, read_t), read_t),
         )
         resp.raise_for_status()
         payload = resp.json()
