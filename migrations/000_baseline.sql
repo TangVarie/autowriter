@@ -895,6 +895,7 @@ DROP FUNCTION IF EXISTS autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUI
 --    改那边就把整块重新复制过来, 不要只补差异 —— tests/test_baseline_parity.py
 --    用字符串相等来守这件事, 漏一处它会红。(2026-09-16: 基线曾停在旧形态,
 --    而完整链条上后面的增量会把它盖掉, 所以 sql_parity_check 发现不了。)
+-- ⚠️ 重建这个函数会冲掉 023 的 enable_seqscan = off: 本文件在 deskcore_check_drafts 的授权后面再加一次(见那里)。
 CREATE OR REPLACE FUNCTION autowriter.deskcore_commit_fingerprints(
     _project_id         UUID,
     _rows               JSONB,
@@ -1087,6 +1088,7 @@ DROP FUNCTION IF EXISTS autowriter.deskcore_check_drafts(UUID, JSONB);
 --    改那边就把整块重新复制过来, 不要只补差异 —— tests/test_baseline_parity.py
 --    用字符串相等来守这件事, 漏一处它会红。(2026-09-16: 基线曾停在旧形态,
 --    而完整链条上后面的增量会把它盖掉, 所以 sql_parity_check 发现不了。)
+-- ⚠️ 重建这个函数会冲掉 023 的 enable_seqscan = off: 本文件在 deskcore_check_drafts 的授权后面再加一次(见那里)。
 CREATE OR REPLACE FUNCTION autowriter.deskcore_check_drafts(
     _project_id UUID,
     -- [{opening_hash, ngram_hashes, title_embedding}, ...]

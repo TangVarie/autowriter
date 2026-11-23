@@ -461,7 +461,13 @@ COMMIT;
 --   → 看 CTE cand 那一段: 是 Bitmap Index Scan on draft_fp_ngram_gin_idx, 不是 Seq Scan
 --     (CTE s 那一段里的 Seq Scan 只是取一行样本, 不用管)。11-11 生产库: 成本 206, 同一句走顺序扫描是 627。
 
+-- ⚠️ 2026-11-23 起（migrations/023）：②③ 要在函数的那个开关下看。函数自带 enable_seqscan = off，SQL Editor 的会话
+--    没有，③ 那样单独 EXPLAIN 会看到 Seq Scan、不代表函数里也是；要看计划就在
+--    begin read only; set local enable_seqscan = off; … rollback; 里看。以② 调真函数的用时为准。
+
 -- ── 回滚 ─────────────────────────────────────────────────────────────
+-- ⚠️ 2026-11-23 起：下面两步重建函数会把 023 加的 enable_seqscan = off 一起冲掉，查重又会超时。
+--    回滚之后（或任何时候重跑本文件之后）要再跑一次 migrations/023_dedup_no_seqscan.sql。
 -- 两条函数换回原来的写法(同样不碰数据, 查重的结论不变, 只是退回原来的速度), SQL Editor 里:
 --   1. 整个重跑 migrations/008_embedding_model_isolation.sql —— deskcore_check_drafts 回到 008 那一版;
 --   2. 只跑 migrations/005_deskcore_containment.sql 里从

@@ -329,7 +329,7 @@ from pg_proc p join pg_namespace n on n.oid = p.pronamespace
 where n.nspname = 'autowriter' and p.proname in ('deskcore_check_drafts', 'deskcore_commit_fingerprints');
 ```
 
-是 false 就跑一次 `migrations/023_dedup_no_seqscan.sql`（可重跑，用 `postgres`），跑完马上生效，不用重新部署，写手在原来那场对话里再查一次重就行。2026-11-23 跑完的读数：一个项目最近 5 条指纹当稿子 19.3 秒 → 0.26 秒；最大的项目 10 篇一组 2.9 秒。以后要是又慢到 8 秒附近，先看 `pg_stat_statements` 里 `deskcore_check_drafts` 的最长用时，再看计划（`EXPLAIN` 取候选那一步是不是 `Bitmap Index Scan on draft_fp_ngram_gin_idx`）。
+是 false 就跑一次 `migrations/023_dedup_no_seqscan.sql`（可重跑，用 `postgres`），跑完马上生效，不用重新部署，写手在原来那场对话里再查一次重就行。2026-11-23 跑完的读数：一个项目最近 5 条指纹当稿子 19.3 秒 → 0.26 秒；最大的项目 10 篇一组 2.9 秒。以后要是又慢到 8 秒附近，先看 `pg_stat_statements` 里 `deskcore_check_drafts` 的最长用时，再看上面那条核对是不是还两个 true：**谁照 019 的回滚或整块复制重建过这两个函数，开关就被冲掉了**，再跑一次 023。要看计划，得在 `begin read only; set local enable_seqscan = off; … rollback;` 里 `EXPLAIN` 取候选那一步（SQL Editor 自己的会话顺序扫描是开着的，单拿出来看会是 Seq Scan，不代表函数里也是），该是 `Bitmap Index Scan on draft_fp_ngram_gin_idx`；最准的还是拿真稿子调一次函数看用时（019 文件末尾的 ②）。
 
 ### 1.18 `022_lesson_exposure` —— 查重底稿上记这一场看到了哪几张经验卡；存完档在后台判人感题（2026-11-15，十三项第 3 / 7 项，**生产库还没跑**）
 

@@ -20,6 +20,15 @@
 --
 -- 用函数属主跑（SQL Editor 的 postgres）。可重跑。部署前后什么时候跑都行，Python 不改。
 --
+-- ⚠️ 以后谁再 CREATE OR REPLACE 这两个函数（照 019 / 基线整块复制、或照 019 文件末尾的回滚重跑 005 / 008），
+--   PostgreSQL 会把函数的配置换成新语句里写的那几项，这个开关就悄悄没了：结论不变，查重又会超时。
+--   重建之后要再跑一次本文件；新迁移里重建它们的，同一个文件里要再加这个开关
+--   （tests/test_dedup_no_seqscan.py 和 tests/sql_parity_check.py 都会查）。
+--
+-- 核计划时注意：SQL Editor 自己的会话里顺序扫描是开着的，把取候选那一步单独拿出来 EXPLAIN 会看到
+--   Seq Scan，那不代表函数里也是。要看就在 begin read only; set local enable_seqscan = off; … rollback; 里看，
+--   或者直接拿真的稿子调一次函数看用时（019 文件末尾的 ②）。
+--
 -- 跑完核（应当两行都带 enable_seqscan=off）：
 --   select p.proname, p.proconfig from pg_proc p join pg_namespace n on n.oid = p.pronamespace
 --    where n.nspname = 'autowriter'
@@ -29,8 +38,12 @@
 --   alter function autowriter.deskcore_check_drafts(uuid, jsonb, integer) reset enable_seqscan;
 --   alter function autowriter.deskcore_commit_fingerprints(uuid, jsonb, uuid, numeric, numeric, integer) reset enable_seqscan;
 
+begin;
+
 alter function autowriter.deskcore_check_drafts(uuid, jsonb, integer)
     set enable_seqscan = off;
 
 alter function autowriter.deskcore_commit_fingerprints(uuid, jsonb, uuid, numeric, numeric, integer)
     set enable_seqscan = off;
+
+commit;

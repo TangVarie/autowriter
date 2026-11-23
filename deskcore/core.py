@@ -7488,7 +7488,7 @@ MIGRATION_019_PROBE_SQL = (
 # 绕开 GIN、走全表顺序扫描, 一批 5 篇超过 PostgREST 的 8 秒上限)。函数体、签名都没动, PostgREST 读不到 proconfig —— 探不到。
 MIGRATION_DEDUP_NO_SEQSCAN = "023_dedup_no_seqscan.sql"
 MIGRATION_023_PROBE_SQL = (
-    "select p.proname, coalesce('enable_seqscan=off' = any(p.proconfig), false) as no_seqscan "
+    "select p.proname, coalesce(p.proconfig && array['enable_seqscan=off','enable_seqscan=false'], false) as no_seqscan "
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
     "where n.nspname='autowriter' and p.proname in ('deskcore_check_drafts','deskcore_commit_fingerprints');"
 )

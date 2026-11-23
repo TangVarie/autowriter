@@ -624,6 +624,7 @@ def main() -> int:
     print("  ✓ 整套迁移重复执行是干净 no-op(幂等)")
 
     bad += _check_style_distillation_cas()
+    bad += _check_dedup_no_seqscan(None, "完整链条(含第二遍)")
     bad += _check_no_stale_overloads(files[0])
 
     print(f"\nschema + SQL/Python 一致性: {'全部通过' if not bad else f'{bad} 项不通过'}")
@@ -1012,6 +1013,31 @@ LEGACY_SIGNATURES = [
 ]
 
 
+DEDUP_NO_SEQSCAN_FUNCS = ("deskcore_check_drafts", "deskcore_commit_fingerprints")
+
+
+def _check_dedup_no_seqscan(db, label: str) -> int:
+    """migrations/023: 两个查重函数的 proconfig 里必须带 enable_seqscan=off。
+
+    `CREATE OR REPLACE FUNCTION` 会把 proconfig 换成新语句里写的 SET —— 以后谁照 019 / 基线的
+    写法重建这两个函数、又没再加这个开关, 它就悄悄没了: 查重结论不变, 只是大一点的批又会超过
+    PostgREST 的 8 秒上限(2026-11-23 的 57014)。纯文本的测试看不出「重建之后又丢了」, 所以在
+    真库上问终态: 完整链条(跑两遍之后)和只跑基线的库都要有。
+    """
+    bad = 0
+    for fn in DEDUP_NO_SEQSCAN_FUNCS:
+        got = sql("SELECT coalesce(array_to_string(p.proconfig, ','), '') FROM pg_proc p "
+                  "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                  f"WHERE n.nspname = 'autowriter' AND p.proname = '{fn}';", db=db)
+        if "enable_seqscan=off" not in got.split(","):
+            print(f"  [FAIL] {label}: {fn} 的 proconfig 里没有 enable_seqscan=off({got!r}) —— "
+                  "重建这个函数的迁移要再加一次开关(见 migrations/023)")
+            bad += 1
+    if not bad:
+        print(f"  ✓ {label}: 两个查重函数都带 enable_seqscan=off(migrations/023)")
+    return bad
+
+
 def _check_no_stale_overloads(baseline) -> int:
     """在一个**先有历史签名**的库上跑基线, 跑完必须只剩一个重载。
 
@@ -1057,6 +1083,7 @@ def _check_no_stale_overloads(baseline) -> int:
                   f"旧签名 ({args}) 来自 {why} —— 基线里缺一句 "
                   f"DROP FUNCTION IF EXISTS autowriter.{fn}({args});")
             bad += 1
+    bad += _check_dedup_no_seqscan(db, "只跑基线的库")
     if not bad:
         print("  ✓ 基线落在历史签名之上仍然只剩一个重载"
               "(CREATE OR REPLACE 换参数表不报错、只加重载, 所以必须自己 DROP)")

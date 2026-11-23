@@ -2598,6 +2598,10 @@ batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和�
 
 **以后看**：`pg_stat_statements` 里 `deskcore_check_drafts` 的平均和最长用时（2026-11-23 改之前：成功的 585 次平均 1.4 秒、最长 7.5 秒；超时的不进这张表）；服务日志里搜 `code=57014`。
 
+**容易丢**：`CREATE OR REPLACE FUNCTION` 会把函数的配置换成新语句里写的那几项。以后谁照 019 / 基线整块复制重建这两个函数，或者照 019 文件末尾的回滚重跑 005 / 008，开关就悄悄没了，结论不变、查重又会超时。所以：新迁移重建它们的，同一个文件里要再加这个开关（`tests/test_dedup_no_seqscan.py` 查文本，`tests/sql_parity_check.py` 在真库上查完整链条和只跑基线两条路的终态）；生产库上重建过，就再跑一次 `023`。核计划要在 `set local enable_seqscan = off` 下看（SQL Editor 的会话里顺序扫描是开着的，单拿取候选那一步 `EXPLAIN` 会看到 Seq Scan）。
+
+**还没做的一件**（不急）：四字串的 GIN 索引大概攒满了待合并的那一段（11-23 只读看：查一个不存在的值也要读约 500 个缓冲页；这张表上次自动 vacuum 是 09-18，新增的行没到自动触发的线）。现在每次查重都走它，每篇都要把这一段扫一遍；写指纹时偶尔还会在持锁的那一下同步合并。11-23 最大的项目 10 篇一组 2.9～3.6 秒，约是 8 秒上限的四成。要再快：`gin_clean_pending_list('autowriter.draft_fp_ngram_gin_idx')` 或对这张表 `VACUUM`，或者把这个索引改成 `fastupdate = off`。要动生产库，先看用时有没有往 8 秒走。
+
 ## 4. 接入
 
 ### 4.1 部署
