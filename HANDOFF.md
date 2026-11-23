@@ -1,4 +1,8 @@
-# autowriter / deskcore 移交下一位 · 2026-10-22
+# autowriter / deskcore 交接
+
+> **2026-11-23 补**：现在的接手入口是四个库共用的那一份：TangVarie/truth-vault 的 [docs/handoff-2026-11-22-four-repos.md](https://github.com/TangVarie/truth-vault/blob/main/docs/handoff-2026-11-22-four-repos.md)；待办和决定只看 truth-vault 的 OPEN-ITEMS.md、DECISIONS.md。本文件下面都是历史快照。生产库的迁移 11-23 只读核过：001～023 都在（023 是 11-23 查重超时那一次，见 docs/deskcore.md §3.38）。
+
+## 移交下一位 · 2026-10-22（历史快照）
 
 用户本轮要求移交同事；先读 [aw接手卡](docs/handoff-2026-10-22-next-owner.md) 与 [三仓执行书PR TV#215](https://github.com/TangVarie/truth-vault/pull/215)。#121已合并7042cebc，生产仍旧build；#117已改base且最终head fdeaa9f过审/CI，未合并，015/运行配置先行。已有上线授权有效；本轮只交接，没有继续部署或生产写入。以下10-21及更早各段保留为历史快照，与本节/执行书冲突时按新入口，并在操作前重新核线上。
 
