@@ -608,6 +608,7 @@ _HEALTH_PROBE_TIMEOUT = float(os.environ.get("DESKCORE_HEALTH_PROBE_TIMEOUT", "5
 
 
 _HEALTH_PROBE_CLIENT = None
+_HEALTH_PROBE_LOCK = threading.Lock()
 
 
 def _health_probe_client():
@@ -622,24 +623,27 @@ def _health_probe_client():
     ROB-013 那个 FD 泄漏的翻版。
     """
     global _HEALTH_PROBE_CLIENT
-    if _HEALTH_PROBE_CLIENT is None:
-        import config
-        import db
-        from supabase import create_client
-        from supabase.client import ClientOptions
-        key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", "")
-        if not key:
-            # 没配 service_role 时退回原路径, 让 _db_probe 照常报出那条错。
-            return db.get_service_client()
-        _HEALTH_PROBE_CLIENT = create_client(
-            config.SUPABASE_URL, key,
-            options=ClientOptions(
-                schema="autowriter",
-                # 略小于墙钟预算: 让网络层先于 fail_after 收手, 这样常见情况下
-                # 我们拿到的是一条**有信息的**超时错误, 而不是被取消掉的空壳。
-                postgrest_client_timeout=max(1.0, _HEALTH_PROBE_TIMEOUT - 1.0),
-            ),
-        )
+    if _HEALTH_PROBE_CLIENT is not None:
+        return _HEALTH_PROBE_CLIENT
+    with _HEALTH_PROBE_LOCK:
+        if _HEALTH_PROBE_CLIENT is None:
+            import config
+            import db
+            from supabase import create_client
+            from supabase.client import ClientOptions
+            key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", "")
+            if not key:
+                # 没配 service_role 时退回原路径, 让 _db_probe 照常报出那条错。
+                return db.get_service_client()
+            _HEALTH_PROBE_CLIENT = create_client(
+                config.SUPABASE_URL, key,
+                options=ClientOptions(
+                    schema="autowriter",
+                    # 略小于墙钟预算: 让网络层先于 fail_after 收手, 这样常见情况下
+                    # 我们拿到的是一条**有信息的**超时错误, 而不是被取消掉的空壳。
+                    postgrest_client_timeout=max(1.0, _HEALTH_PROBE_TIMEOUT - 1.0),
+                ),
+            )
     return _HEALTH_PROBE_CLIENT
 
 
@@ -751,6 +755,7 @@ async def _collect_health() -> dict:
     import db
     import dedup
     import judge_client
+    import librarian_client
 
     def _db_probe() -> tuple[bool, str]:
         try:
@@ -823,8 +828,7 @@ async def _collect_health() -> dict:
                 "version": vocab.VOCAB_VERSION, "authority": vocab.VOCAB_AUTHORITY,
                 "combination_space": vocab.combination_space(),
             },
-            "librarian": {"configured": bool(os.environ.get("LIBRARIAN_URL")
-                                             or getattr(config, "LIBRARIAN_URL", ""))},
+            "librarian": {"configured": librarian_client.configured()},
             # 存档时的判定(score_drafts / commit_drafts 之后发给 judge; D-120 起分数给写手看, 仍不拦)。取值走
             # judge_client 自己那两个函数 —— 与真正发请求的地方同源(docs/deskcore.md §4.2
             # 那条教训: 回显另读一遍 env, 配错时就当场看不见)。只回"接没接"和截止秒数, 不探活:
@@ -903,6 +907,7 @@ _VIEW_LIMITER = anyio.CapacityLimiter(3)
 _VIEW_TIMEOUT = 8.0             # 一次打开页面读库 + 拼页面的墙钟上限(秒)
 _VIEW_MAX_INFLIGHT = 12         # 同一时刻最多几个页面的读还没收场(含已经超时放弃、线程还没退的)
 _VIEW_CLIENT = None
+_VIEW_CLIENT_LOCK = threading.Lock()
 _view_inflight = 0
 _view_inflight_lock = threading.Lock()
 
@@ -910,17 +915,20 @@ _view_inflight_lock = threading.Lock()
 def _view_client():
     """页面专用的 Supabase client: 带网络层超时(同 _health_probe_client: 被放弃的线程才收得了场), 模块级单例。"""
     global _VIEW_CLIENT
-    if _VIEW_CLIENT is None:
-        import config
-        import db
-        from supabase import create_client
-        from supabase.client import ClientOptions
-        key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", "")
-        if not key:
-            return db.get_service_client()      # 没配 service_role: 照常抛那条错, 页面回 503
-        _VIEW_CLIENT = create_client(
-            config.SUPABASE_URL, key,
-            options=ClientOptions(schema="autowriter", postgrest_client_timeout=max(1.0, _VIEW_TIMEOUT - 2.0)))
+    if _VIEW_CLIENT is not None:
+        return _VIEW_CLIENT
+    with _VIEW_CLIENT_LOCK:
+        if _VIEW_CLIENT is None:
+            import config
+            import db
+            from supabase import create_client
+            from supabase.client import ClientOptions
+            key = getattr(config, "SUPABASE_SERVICE_ROLE_KEY", "")
+            if not key:
+                return db.get_service_client()      # 没配 service_role: 照常抛那条错, 页面回 503
+            _VIEW_CLIENT = create_client(
+                config.SUPABASE_URL, key,
+                options=ClientOptions(schema="autowriter", postgrest_client_timeout=max(1.0, _VIEW_TIMEOUT - 2.0)))
     return _VIEW_CLIENT
 
 
@@ -1110,6 +1118,26 @@ async def rest_tool(name: str, request: Request):
 # SDK 缺失时服务照常起(REST 可用), 只是 /mcp 不挂 —— 免得一个可选依赖把整个
 # 服务拖 down。
 
+def _mcp_allowed_origins(allowed_hosts: list[str], allowed_origins: list[str]) -> list[str]:
+    """为 FastMCP TransportSecuritySettings 生成带协议的 Origin 白名单。
+
+    浏览器 / Electron 的 Origin 头总带 scheme (如 https://...), 把裸主机名直接塞进
+    allowed_origins 会导致所有带 Origin 的 /mcp 请求被 403 拒绝。
+    显式配了 DESKCORE_ALLOWED_ORIGINS 时直接沿用; 未配时由 DESKCORE_ALLOWED_HOSTS
+    派生 https:// 与 http:// (保留 :* 通配)。
+    """
+    if allowed_origins and allowed_origins != ["*"]:
+        return list(allowed_origins)
+    out: list[str] = []
+    for h in allowed_hosts:
+        if "://" in h:
+            out.append(h)
+        else:
+            out.append(f"https://{h}")
+            out.append(f"http://{h}")
+    return out
+
+
 def _register_mcp():
     try:
         from mcp.server.fastmcp import FastMCP
@@ -1140,7 +1168,7 @@ def _register_mcp():
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=bool(allowed),
         allowed_hosts=allowed,
-        allowed_origins=allowed,
+        allowed_origins=_mcp_allowed_origins(allowed, _ALLOWED_ORIGINS),
     )
     # instructions 会在 MCP initialize 时交给客户端, 认它的平台会注入系统提示。
     # 它说两件事: 写稿就先开项目(2026-10-19: skill 没被调起来的对话里, 只要连着写作台, 这句也在模型眼前),

@@ -32,15 +32,12 @@ from tests.test_rule_compile import _fresh_compile_state, jev  # noqa: F401 — 
 
 OTHER_PROJ = "bbbbbbbb-0000-4000-8000-0000000000b2"
 NFA = "truth_vault.note_feature_answers"
-NOW = datetime.now(timezone.utc)
-
-
 def vid(n: int) -> str:
     return f"cccccccc-0000-4000-8000-{n:012x}"
 
 
 def _ago(**kw) -> str:
-    return (NOW - timedelta(**kw)).isoformat()
+    return (datetime.now(timezone.utc) - timedelta(**kw)).isoformat()
 
 
 def ver(n: int, *, days: float = 2, minutes: float = 0, project_id: str = PROJ, item: str | None = None,
@@ -87,6 +84,7 @@ def checks(jev, monkeypatch):                          # noqa: F811 — jev: 判
 # ══════════════════════════════════════════════════════════════════════
 
 def test_listing_keeps_one_delivered_version_per_draft_oldest_first():
+    now = datetime.now(timezone.utc)
     c = world([
         ver(1, days=5),
         ver(2, days=9),
@@ -101,7 +99,7 @@ def test_listing_keeps_one_delivered_version_per_draft_oldest_first():
         ver(11, days=6, item="item-z", best=12),                 # 交出去的那版刚改完, 还不到 3 分钟
         ver(12, days=0, minutes=1, item="item-z", best=12, num=2),
     ])
-    rows = store.delivered_versions_between(c, PROJ, NOW - timedelta(days=21), NOW - timedelta(minutes=3))
+    rows = store.delivered_versions_between(c, PROJ, now - timedelta(days=21), now - timedelta(minutes=3))
     assert [r["id"] for r in rows] == [vid(2), vid(1), vid(6), vid(4)], "旧的在前"
     assert set(rows[0]) == {"id", "created_at"}
     (call,) = [x for x in c.calls if x["table"] == "versions"][:1]

@@ -4798,7 +4798,7 @@ def _feature_answers(sb, vids: list[str], questions: dict[str, tuple[int, frozen
         # subject_type / run_tag 上面钉死了, 剩下这四列就是主键: 排序唯一, 翻页不漏不重
         .order("subject_id").order("question_id").order("question_version").order("extractor")
         .range(off, off + lim - 1)))
-    best: dict[tuple[str, str], tuple[str, str]] = {}      # (版本 id, 题) → (抽取时间, 答案)
+    best: dict[tuple[str, str], tuple[datetime, str]] = {}      # (版本 id, 题) → (抽取时间, 答案)
     for r in rows:
         qid, ans = r.get("question_id"), str(r.get("answer") or "").strip()
         ver, allowed = questions.get(qid, (None, ()))
@@ -4807,7 +4807,7 @@ def _feature_answers(sb, vids: list[str], questions: dict[str, tuple[int, frozen
                 or not str(r.get("extractor") or "").startswith("jev:")):
             continue
         key = (str(r.get("subject_id")), qid)
-        at = str(r.get("extracted_at") or "")
+        at = _ts(r.get("extracted_at")) or datetime.min.replace(tzinfo=timezone.utc)
         if key not in best or at > best[key][0]:
             best[key] = (at, ans)
     by_version: dict[str, dict[str, str]] = {}

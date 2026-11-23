@@ -39,9 +39,11 @@ def vendor_checksum_ok() -> tuple[bool, str]:
     所以宁可在启动/CI 阶段吵一声。
     """
     try:
-        raw = open(_VOCAB_PATH, "rb").read()
+        with open(_VOCAB_PATH, "rb") as fh:
+            raw = fh.read()
         actual = hashlib.sha256(raw).hexdigest()
-        expected = open(_SHA_PATH, encoding="utf-8").read().split()[0].strip()
+        with open(_SHA_PATH, encoding="utf-8") as fh:
+            expected = fh.read().split()[0].strip()
     except OSError as exc:
         return False, f"cannot read vendored vocab: {exc}"
     if actual != expected:
