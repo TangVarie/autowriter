@@ -126,13 +126,27 @@ def test_an_mcp_call_uses_the_client_info_its_connection_sent_on_initialize(mcp)
 
 def test_a_call_whose_protocol_header_differs_from_the_initialize_is_another_fingerprint(mcp):
     # 部署之后一直在调、没重新 initialize 的另一个客户端(谈定的是 2025-11-25): DSH initialize 之后它的调用也不算 DSH 的
+    # 用中性的 UA: 2026-11-23 起 MCP 上 node、不带 Origin、没自报名字的按 UA 算 DSH(见下面 test_node_without_origin_*),
+    # 再用 node 就测不到「另一个指纹、没认出来」那一支了
     client, c = mcp
-    _post(client, INIT, **{"User-Agent": "node"})
-    _post(client, _call("check_drafts", _check_args()), **{"User-Agent": "node", "MCP-Protocol-Version": "2025-11-25"})
-    _post(client, _call("check_drafts", _check_args(), 3), **{"User-Agent": "node"})
+    _post(client, INIT, **{"User-Agent": "undici"})
+    _post(client, _call("check_drafts", _check_args()), **{"User-Agent": "undici", "MCP-Protocol-Version": "2025-11-25"})
+    _post(client, _call("check_drafts", _check_args(), 3), **{"User-Agent": "undici"})
     other, dsh = _rows(c)
-    assert other["meta"]["client_mark"] == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False}
+    assert other["meta"]["client_mark"] == {"app": "other_mcp", "basis": "transport", "ua": "undici", "origin": False}
     assert dsh["meta"]["client_mark"]["basis"] == "hello"
+
+
+def test_node_without_origin_and_without_initialize_is_dsh(mcp):
+    # 2026-11-23 核对(docs/deskcore.md §3.37): 写手在 DSH 里用写作台, 请求只有 UA node、不带 Origin、没有 initialize 记录
+    client, c = mcp
+    out = _post(client, _call("check_drafts", _check_args()), **{"User-Agent": "node"})
+    assert out["result"]["isError"] is False
+    out = _post(client, _call("check_drafts", _check_args(), 3), **{"User-Agent": "node", "Origin": "https://example.invalid"})
+    assert out["result"]["isError"] is False
+    first, second = _rows(c)
+    assert first["meta"]["client_mark"] == {"app": "dsh_plugin", "basis": "user_agent", "ua": "node", "origin": False}
+    assert second["meta"]["client_mark"] == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": True}
 
 
 def test_the_fingerprint_uses_the_version_the_server_negotiated(mcp):
@@ -312,16 +326,17 @@ def test_a_classification_failure_never_changes_a_rest_reply(log, monkeypatch):
 @pytest.mark.parametrize("broken", ["classify", "note_hello"])
 def test_a_classification_failure_never_changes_an_mcp_reply(mcp, monkeypatch, broken):
     client, c = mcp
-    want_init = _post(client, INIT, **{"User-Agent": "node"})
-    want_call = _post(client, _call("check_drafts", _check_args()), **{"User-Agent": "node"})
+    ua = {"User-Agent": "undici"}               # 中性的 UA(node 在 MCP 上会按 UA 认成 DSH, 测不到小表坏掉那一支)
+    want_init = _post(client, INIT, **ua)
+    want_call = _post(client, _call("check_drafts", _check_args()), **ua)
     clientmark.reset()
     monkeypatch.setattr(clientmark, broken, _boom)
-    assert _post(client, INIT, **{"User-Agent": "node"}) == want_init
-    assert _post(client, _call("check_drafts", _check_args()), **{"User-Agent": "node"}) == want_call
+    assert _post(client, INIT, **ua) == want_init
+    assert _post(client, _call("check_drafts", _check_args()), **ua) == want_call
     before, after = _rows(c)
     assert before["meta"]["client_mark"]["app"] == "dsh_plugin"
     assert after["meta"]["client_mark"] == ({"app": "unknown", "basis": "none"} if broken == "classify" else
-                                            {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False})
+                                            {"app": "other_mcp", "basis": "transport", "ua": "undici", "origin": False})
 
 
 # ── 5. 不加列 ───────────────────────────────────────────────────────────────────────────────────────

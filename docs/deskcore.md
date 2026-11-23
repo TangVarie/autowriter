@@ -2442,7 +2442,7 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 
 | `app` | 是什么 | 什么时候 |
 |---|---|---|
-| `dsh_plugin` | DeepSeek Harness 桌面 + 写作台插件 | UA 的产品名或 clientInfo 的名字里有完整的一段 `dsh`（`dsh`、`dsh_mcp_client`），或含 `deepseek_harness` / `deepseekharness`（UA 的产品 token 常连写：`DeepSeekHarness/0.2`）。`dashboard`、`fdsh_tool` 不算；光是 `deepseek` 也不算（那也是模型和 API 客户端的名字） |
+| `dsh_plugin` | DeepSeek Harness 桌面 + 写作台插件 | UA 的产品名或 clientInfo 的名字里有完整的一段 `dsh`（`dsh`、`dsh_mcp_client`），或含 `deepseek_harness` / `deepseekharness`（UA 的产品 token 常连写：`DeepSeekHarness/0.2`）。`dashboard`、`fdsh_tool` 不算；光是 `deepseek` 也不算（那也是模型和 API 客户端的名字）；**2026-11-23 起**另加一条：走 MCP、UA 正好是 `node`、不带 Origin、这个指纹上没人自报过名字（或只报了和本服务同名的 `deskcore`）也算（`basis = user_agent`；见本节末尾「11-23 核对」） |
 | `workbuddy_skill` | WorkBuddy / CodeBuddy（都装 bywood-writing-desk skill） | 名字里有 `workbuddy` / `codebuddy` |
 | `claude_code` | Claude Code（负责人自测） | 名字里有 `claude_code` / `claudecode` |
 | `other_mcp` | 走 MCP、哪条规则都没认出来的 | |
@@ -2450,7 +2450,7 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 | `server_job` | 没有 HTTP 调用方：`python -m deskcore.cli` 的命令，含每晚的 `tv-sync` 和手动的 `ingest --xlsx` | |
 | `unknown` | 认不出：出了意外、请求和 CLI 之外的服务端调用、底稿转正的 batch | |
 
-`basis` 是凭什么这么定：`user_agent`（UA 的产品名认得）、`hello`（这个指纹最近一次 initialize 报的 clientInfo 认得，见下面「指纹管不到的那一种」）、`transport`（只知道
+`basis` 是凭什么这么定：`user_agent`（UA 的产品名认得；11-23 起也包括「MCP 上 `node`、不带 Origin」那一条）、`hello`（这个指纹最近一次 initialize 报的 clientInfo 认得，见下面「指纹管不到的那一种」）、`transport`（只知道
 走的是哪条路）、`process`（CLI 的进程默认）、`none`。先后：UA 认得 → clientInfo 认得（只对 MCP）→ 按走的路。没有 `web` 这个词：
 Streamlit 工作台和 worker 建 batch 不经过写作台（`generation_service.py`），那些 batch 本来就分得开（没有 `params.source`，
 `ai_engines` 不是 `["deskcore"]`），工作台 10-16 也停了。
@@ -2567,6 +2567,18 @@ select case when meta->'client_mark'->>'app' in ('other_mcp', 'unknown')
  where meta->>'mode' = 'tool_call' and created_at > now() - interval '14 days'
  group by 1 order by 2 desc;
 ```
+
+**11-23 核对（负责人确认 + 只读）：DSH 发的是 `node`、不带 Origin，没有 `hello`；规则改了一条。** 11-23 05:41–07:53 UTC 在
+sportsix、Hatherine痘痘贴上有一场走 MCP 的调用（`check_drafts`、`score_drafts`、`open_project`、`draw_angles` 等，存了 5 批），全记成
+`other_mcp` / `transport`，证据是 `ua = node`、`origin = false`、没有 `hello`；负责人 11-23 说那是写手在 DSH 里用写作台（写手已经开始用
+DSH）。11-17 起到这一场之前，`other_mcp` 一次都没有，也没有别的 `ua = node` 的调用，所以「MCP 上 `node`、没有 Origin 的算 DSH」那一条
+没有误认别人的前例。改法照上面第 ④ 步：`classify` 在「clientInfo 认得」之后、「按走的路」之前加一条——走 MCP、UA 正好是 `node`（带版本
+的 `node/22…` 不算）、不带 Origin、这个指纹上没人自报过名字，或者只报了和本服务同名的 `deskcore`（WorkBuddy 和插件预设都这样报，认不出
+是谁）→ `dsh_plugin` / `user_agent`。报了别的名字（认不得也算：是别的客户端）、同一个指纹上撞了车的，都不套这一条，照旧 `other_mcp`。
+以后同一把钥匙上要是有别的 Node 写的 MCP 客户端，给它单发一把钥匙（备注名在指纹里）。**历史不回写**：读 11-23 之前的数时，用上面第五条
+SQL 的 `CASE`，`<seen>` 换成 `node`（`origin = 'false'`）。DSH 新开对话会不会 initialize、`hello` 报的是什么，这一场里看不出（小表没有它的
+记录），以后有 `hello` 了再看。回归在 `tests/test_client_mark.py` 第 10 节；原来拿 `node` 测小表的那几节改用一个中性的 UA，测的东西不变。
+协议、skill、插件都没动，写手不用做什么。
 
 **11-17 部署后读到的（只读，按 `app` / `basis` / `ua` / `origin` / `hello` 分组，只看个数）。** 部署（`b8d6514`）后到 10:08 UTC 共 110 次调用，全是同一组值：`workbuddy_skill` / `user_agent`，`ua = workbuddy_v5.11.3`，`origin = false`，`hello = deskcore_v1.0.0`。一个写手，调的主要是评论那一路（`score_comments`、`comments_for`）；这段时间没有新 batch。读出来三件事：① WorkBuddy 靠 UA 就认得，规则不用改；② WorkBuddy **不带** Origin，上面「中等把握」那条不对；③ WorkBuddy 在 clientInfo 里报的名字是 `deskcore`，和这个服务的名字一样，所以 `hello` 认不出 WorkBuddy。DSH 的插件预设给这个服务起的名字也是 `deskcore`，要是 DSH 的 MCP 客户端也这样报，`hello` 就分不出 DSH，DSH 那边只剩 UA 能认。DSH 还没有调用，等负责人下次在 DSH 里用写作台再读第四条 SQL。
 
