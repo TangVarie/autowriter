@@ -74,6 +74,23 @@ def _load_value_secrets() -> tuple[str, ...]:
                 token = wh.split("/hook/", 1)[1].strip("/").strip()
                 if len(token) >= 8:
                     vals.append(token)
+        # deskcore 服务端鉴权钥匙与视图签名密钥 (直接读环境变量, 不拖入 deskcore 模块避免循环依赖)
+        import json as _json
+        import os as _os
+        for env_name in ("DESKCORE_API_KEY", "DESKCORE_VIEW_SECRET"):
+            ev = (_os.environ.get(env_name) or "").strip()
+            if len(ev) >= 8:
+                vals.append(ev)
+        raw_keys = (_os.environ.get("DESKCORE_KEYS") or "").strip()
+        if raw_keys:
+            try:
+                parsed_keys = _json.loads(raw_keys)
+                if isinstance(parsed_keys, dict):
+                    for k in parsed_keys:
+                        if isinstance(k, str) and len(k) >= 8:
+                            vals.append(k)
+            except Exception:
+                pass
     except Exception:
         pass
     # 长值优先替换, 防止短值是长值子串时把长值劈成两半留尾巴
