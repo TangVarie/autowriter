@@ -2451,7 +2451,7 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 | `unknown` | 认不出：出了意外、请求和 CLI 之外的服务端调用、底稿转正的 batch | |
 
 `basis` 是凭什么这么定：`user_agent`（UA 的产品名认得；11-23 起也包括「MCP 上 `node`、不带 Origin」那一条）、`hello`（这个指纹最近一次 initialize 报的 clientInfo 认得，见下面「指纹管不到的那一种」）、`transport`（只知道
-走的是哪条路）、`process`（CLI 的进程默认）、`none`。先后：UA 认得 → clientInfo 认得（只对 MCP）→ 按走的路。没有 `web` 这个词：
+走的是哪条路）、`process`（CLI 的进程默认）、`none`。先后：UA 认得 → clientInfo 认得（只对 MCP）→（11-23 起）MCP 上 UA 整个就是 `node`、不带 Origin、没人自报名字的算 DSH → 按走的路。没有 `web` 这个词：
 Streamlit 工作台和 worker 建 batch 不经过写作台（`generation_service.py`），那些 batch 本来就分得开（没有 `params.source`，
 `ai_engines` 不是 `["deskcore"]`），工作台 10-16 也停了。
 
@@ -2483,7 +2483,8 @@ initialize**（部署之后接着调、开着一整天不重连的；无状态�
 指纹最近一次 initialize 的那个客户端头上，`hello` 也是那个客户端的。所以 `basis = hello` 读作「这个指纹最近一次 initialize 报的是它」，
 不是「这一次一定是它」，只和指纹一样纯。撞上要五样都一样：同一个身份、同一把钥匙（备注名）、UA 那个词一样（Node 自带的 fetch 都是
 `node`）、都带或都不带 Origin、谈定的协议版本一样。说不清只在两边都 initialize 过时才看得出来。要分干净就给另一个客户端**单发一把
-钥匙**（备注名在指纹里，不用改代码）。**每次部署小表就清空**：之后到某个客户端 initialize 之前，同一个指纹上的调用只靠 UA 认（认不出
+钥匙**（备注名在指纹里，不用改代码）——只对报了自己名字的客户端管用：11-23 起 MCP 上 UA 整个就是 `node`、不带 Origin、指纹上没人
+自报名字的一律算 DSH，不看钥匙（见本节末尾「11-23 核对」），用 Node 默认 UA 的别的客户端要自己带一个 UA（产品名）或 Origin 才分得开。**每次部署小表就清空**：之后到某个客户端 initialize 之前，同一个指纹上的调用只靠 UA 认（认不出
 就是 `other_mcp`）；有一个客户端 initialize 了，这个指纹上不重连的那些就按上面说的跟着它算。DSH / WorkBuddy 多久 initialize 一次（每场
 对话、每次开应用、每次重连）不知道；每一行都有 `ua` / `origin`，看下面的核对。
 
@@ -2519,7 +2520,7 @@ initialize**（部署之后接着调、开着一整天不重连的；无状态�
 ② 拿测试项目：DSH 里**新开**一场写作台对话、调 `open_project`；WorkBuddy 里新开一场、调 `open_project`；愿意的话 Claude Code 也来一次。
 ③ 跑下面第四条 SQL。④ 应该是 DSH 那几行 `dsh_plugin`、WorkBuddy 那几行 `workbuddy_skill`。是的话也先问清：同一把钥匙上还有没有
 别的 MCP 客户端（Node 写的脚本、别的桌面应用），它的 `ua` / `origin` 和 DSH 的是不是一样——一样的话 `basis = hello` 的行里可能有它的
-调用（上面「指纹管不到的那一种」），给 DSH 单发一把钥匙再读。不是的话看 `ua` / `origin` / `hello`：
+调用（上面「指纹管不到的那一种」），给 DSH 单发一把钥匙再读（11-23 定了 `node` 那一条之后，没报名字的 Node 客户端单发钥匙也分不开，见「11-23 核对」）。不是的话看 `ua` / `origin` / `hello`：
 `hello` 认得、`ua` 是通用的 → 规则没问题，只是靠小表；两个都是通用的 → 在「`(ua, origin)` 定死一条规则（比如 MCP 上 `node`、没有
 Origin 的算 DSH，前提是没有别的客户端也这样）」和「拿插件每 30 分钟那次 REST 取协议对上同一把钥匙」两个办法里挑一个，都是改一行加一条
 用例。⑤ 历史不回写，用第五条 SQL 的 `CASE` 重读。⑥ 顺便看 DSH 新开的那场有没有 `hello`：有就说明新对话会重新 initialize、之后的请求带着同一版 `MCP-Protocol-Version`，小表热得快；
@@ -2572,11 +2573,16 @@ select case when meta->'client_mark'->>'app' in ('other_mcp', 'unknown')
 sportsix、Hatherine痘痘贴上有一场走 MCP 的调用（`check_drafts`、`score_drafts`、`open_project`、`draw_angles` 等，存了 5 批），全记成
 `other_mcp` / `transport`，证据是 `ua = node`、`origin = false`、没有 `hello`；负责人 11-23 说那是写手在 DSH 里用写作台（写手已经开始用
 DSH）。11-17 起到这一场之前，`other_mcp` 一次都没有，也没有别的 `ua = node` 的调用，所以「MCP 上 `node`、没有 Origin 的算 DSH」那一条
-没有误认别人的前例。改法照上面第 ④ 步：`classify` 在「clientInfo 认得」之后、「按走的路」之前加一条——走 MCP、UA 正好是 `node`（带版本
-的 `node/22…` 不算）、不带 Origin、这个指纹上没人自报过名字，或者只报了和本服务同名的 `deskcore`（WorkBuddy 和插件预设都这样报，认不出
-是谁）→ `dsh_plugin` / `user_agent`。报了别的名字（认不得也算：是别的客户端）、同一个指纹上撞了车的，都不套这一条，照旧 `other_mcp`。
-以后同一把钥匙上要是有别的 Node 写的 MCP 客户端，给它单发一把钥匙（备注名在指纹里）。**历史不回写**：读 11-23 之前的数时，用上面第五条
-SQL 的 `CASE`，`<seen>` 换成 `node`（`origin = 'false'`）。DSH 新开对话会不会 initialize、`hello` 报的是什么，这一场里看不出（小表没有它的
+没有误认别人的前例。改法照上面第 ④ 步：`classify` 在「clientInfo 认得」之后、「按走的路」之前加一条——走 MCP、UA 整个就是 `node`（原始的头去掉两头空白
+之后正好是它：带版本的 `node/22…`、`node WorkBuddy/1`、`node (x)` 都不算）、不带 Origin、这个指纹上的小表里没人自报过名字，或者只报了和
+本服务同名的 `deskcore`（WorkBuddy 这样报；插件预设里给服务起的名字也是它，DSH 报不报没核过）→ `dsh_plugin` / `user_agent`。报了别的
+名字（认不得也算：是别的客户端）、同一个指纹上撞了车的，不套这一条，照旧 `other_mcp`——**只在它那一条还在小表里的时候**：过了 24 小时、
+部署清了小表、被挤掉、或者协议版本那一格对不上，它的调用也会按这一条算 DSH。**这一条不看钥匙**：前面说的「单发一把钥匙」对没报名字的
+Node 客户端分不开；同一把或别的钥匙上要是有别的 Node 写的 MCP 客户端，它要自己带一个 UA（产品名）或 Origin。前提是现在没有这样的客户端
+（11-17 起到 11-23 一个都没有）；CodeBuddy 发什么 UA、报什么名字没核过，是这个前提的例外，有它的流量了再看。**历史不回写**：读 11-23
+之前的数时，用上面第五条 SQL 的 `CASE`，`<seen>` 换成 `node`（`origin = 'false'`），再加一句只认没报名字或只报了 `deskcore` 的行
+（`and coalesce(meta->'client_mark'->>'hello', 'deskcore') ~ '^deskcore(_v|$)'`）。存下的 `ua` 是洗过的第一个词，分不出 `node` 和
+`node WorkBuddy/1`，历史上这样的行要是有，会被一起算进去（11-23 之前没有 `ua = node` 的行，读出来没差别）。DSH 新开对话会不会 initialize、`hello` 报的是什么，这一场里看不出（小表没有它的
 记录），以后有 `hello` 了再看。回归在 `tests/test_client_mark.py` 第 10 节；原来拿 `node` 测小表的那几节改用一个中性的 UA，测的东西不变。
 协议、skill、插件都没动，写手不用做什么。
 

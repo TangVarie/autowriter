@@ -14,7 +14,9 @@
     指纹的工具调用拿来用。同一个指纹上先后来了两个名字不一样的 clientInfo(认得不认得都算)就记成说不清, 哪个都不用。
     ⚠️ 指纹只是「像同一个连接」: 同一个指纹上一个**从不 initialize** 的客户端(部署之后一直在调、没重连的)服务端看不见,
        它的调用会算到这个指纹最近一次 initialize 的那个客户端头上。``basis = hello`` 读作「这个指纹最近一次 initialize 报的是它」,
-       不是「这一次一定是它」; 要分干净就给另一个客户端单发一把钥匙(备注名在指纹里)。见 docs/deskcore.md §3.37。
+       不是「这一次一定是它」; 要分干净就给另一个客户端单发一把钥匙(备注名在指纹里)—— 只对报了自己名字的客户端管用:
+       2026-11-23 起 MCP 上 UA 正好是 ``node``、不带 Origin、指纹上没人自报名字的一律算 DSH, 不看钥匙(见 ``NODE_UA``)。
+       见 docs/deskcore.md §3.37。
 算出来的是一个固定词表里的词(``APPS``)加一个「凭什么这么定」(``BASES``)。调用留痕那一行和存档那一行(都是 ``batch_metrics.meta``,
 只有负责人的 SQL 读)的 ``meta.client_mark`` 另带洗过的证据(``ua`` / ``origin`` / ``hello``); 新 batch 的 ``params.client_mark`` 只有
 ``app`` / ``basis`` 两个词(``for_batch``)—— batches 是很多地方读的长命行, 证据不进那里。
@@ -75,9 +77,12 @@ _VER_BAD = re.compile(r"[^0-9a-z._]+")
 _SAFE = re.compile(r"[a-z0-9_.]{1,52}")                  # 出门的串只许这样(calllog._WORD 的子集: 不带连字符)
 _DSH = re.compile(r"(^|_)dsh(_|$)")
 # 2026-11-23 核对(§3.37): 写手在 DSH 里用写作台, 请求只有 UA ``node``(Node 自带的 fetch)、不带 Origin、小表里没有它的
-# clientInfo, 原来落到 other_mcp。按 §3.37 留的办法定死一条: 走 MCP、UA 正好是 ``node``、不带 Origin、这个指纹上没有别的
-# 客户端自报过名字(或者报的就是和本服务同名的 ``deskcore``: WorkBuddy 和 DSH 插件预设都这样报, 认不出是谁) → DSH。
-# 前提: 同一把钥匙上没有别的 Node 写的 MCP 客户端(11-17 起到 11-23 一个都没有); 以后有了, 给它单发一把钥匙(备注名在指纹里)。
+# clientInfo, 原来落到 other_mcp。按 §3.37 留的办法定死一条: 走 MCP、UA 整个就是 ``node``(原始的头去掉两头空白之后正好是它,
+# 不是洗过的第一个词: ``node WorkBuddy/1``、``node (x)`` 都不算)、不带 Origin、这个指纹上的小表里没有别的客户端自报过名字(或者
+# 报的就是和本服务同名的 ``deskcore``: WorkBuddy 这样报; 插件预设里给服务起的名字也是它, DSH 报不报这个没核过) → DSH。
+# 前提: 没有别的 Node 写的 MCP 客户端用 Node 默认的 UA、不带 Origin 来调(11-17 起到 11-23 一个都没有; CodeBuddy 发什么没核过,
+# 是例外)。这一条**不看钥匙**: 单发一把钥匙分不开; 别的 Node 客户端要自己带一个 UA(产品名)或 Origin。报了别的名字的客户端
+# 只在它那一条还在小表里(24 小时内、同一个指纹、没被部署清掉、没被挤掉)时照旧 other_mcp, 过了这段也会按这一条算 DSH。
 NODE_UA = "node"
 _GENERIC_HELLO_NAMES = frozenset({"deskcore"})
 # 协议版本: 2025-06-18 起客户端在 initialize 之后的每个请求上都要带 MCP-Protocol-Version 头; 更早的版本不要求, 不带时
@@ -374,7 +379,7 @@ def classify(*, channel: str, ua=None, origin=False, key=None, caller=None, pv=N
       1. UA 的产品名认得 → 那个客户端(``user_agent``);
       2. 走 MCP, 这个指纹(``pv`` 是这次请求的 ``MCP-Protocol-Version`` 头)最近一次 initialize 报过、没撞车、认得 → 那个客户端
          (``hello``);
-      3. 走 MCP、UA 正好是 ``node``、不带 Origin、这个指纹上没人自报过名字(或只报了同名的 ``deskcore``)→ ``dsh_plugin``
+      3. 走 MCP、UA 整个就是 ``node``、不带 Origin、这个指纹上没人自报过名字(或只报了同名的 ``deskcore``)→ ``dsh_plugin``
          (``user_agent``; 2026-11-23 核对, 见 ``NODE_UA`` 上面的说明)。报过别的名字(认不得也算)、撞了车的都不套这条;
       4. 走 MCP → ``other_mcp``; 走 REST → ``rest``(``transport``);
     出了意外 → ``unknown`` / ``none``。``ua`` / ``origin`` 总是带上; ``hello`` 只要小表里有(没撞车)就带上, UA 定的也带。
@@ -393,7 +398,7 @@ def classify(*, channel: str, ua=None, origin=False, key=None, caller=None, pv=N
             return Mark(app, "user_agent", ua_desc, origin, hello)
         if entry is not None and entry.app:
             return Mark(entry.app, "hello", ua_desc, origin, hello)
-        if (channel == "mcp" and ua_desc == NODE_UA and not origin
+        if (channel == "mcp" and ua_desc == NODE_UA and isinstance(ua, str) and ua.strip() == NODE_UA and not origin
                 and (raw_entry is None or (not raw_entry.ambiguous and raw_entry.name in _GENERIC_HELLO_NAMES))):
             return Mark(DSH_PLUGIN, "user_agent", ua_desc, origin, hello)
         if channel == "mcp":

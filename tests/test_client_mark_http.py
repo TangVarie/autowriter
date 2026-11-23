@@ -135,6 +135,9 @@ def test_a_call_whose_protocol_header_differs_from_the_initialize_is_another_fin
     other, dsh = _rows(c)
     assert other["meta"]["client_mark"] == {"app": "other_mcp", "basis": "transport", "ua": "undici", "origin": False}
     assert dsh["meta"]["client_mark"]["basis"] == "hello"
+    # 同样的场景用 Node 默认的 UA(node)、不带 Origin: 2026-11-23 起 X 的调用按 UA 算 DSH(§3.37「11-23 核对」的前提: 没有这样的别的客户端)
+    _post(client, _call("check_drafts", _check_args(), 4), **{"User-Agent": "node", "MCP-Protocol-Version": "2025-11-25"})
+    assert _rows(c)[-1]["meta"]["client_mark"] == {"app": "dsh_plugin", "basis": "user_agent", "ua": "node", "origin": False}
 
 
 def test_node_without_origin_and_without_initialize_is_dsh(mcp):

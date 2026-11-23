@@ -315,6 +315,9 @@ def test_the_protocol_version_is_part_of_the_fingerprint():
     assert _mcp(pv="2025-06-18")["app"] == "dsh_plugin", "DSH 自己的调用照常"
     # 2025-06-18 起的客户端每个请求都带头: 没带头的调用对不上它的 initialize
     assert _mcp(pv=None)["app"] == "other_mcp"
+    # 同样的场景要是 X 用的是 Node 默认的 UA(node)、不带 Origin: 2026-11-23 起它的调用按 UA 算 DSH(§3.37「11-23 核对」的前提:
+    # 没有这样的别的客户端)。这里写明, 免得以为协议版本那一格还能把它分开
+    assert _mcp(ua="node", pv="2025-11-25")["app"] == "dsh_plugin"
     assert _mcp(pv="not-a-date")["app"] == "other_mcp"
 
 
@@ -349,6 +352,10 @@ def test_the_documented_limit_a_client_that_never_initializes_inherits_the_label
     _hello("dsh-mcp-client")
     assert before["basis"] == "transport" and _mcp()["basis"] == "hello"
     assert _mcp(caller=WRITER_B)["basis"] == "transport", "单发一把钥匙(备注名在指纹里)就分开了"
+    # 2026-11-23 起: 单发钥匙只对报了自己名字、或者 UA 不是 Node 默认值的客户端管用。MCP 上 UA 整个就是 node、不带 Origin、
+    # 指纹上没人自报名字的一律算 DSH, 不看钥匙(文档 §3.37「11-23 核对」那一段也这么写)
+    assert _mcp(ua="node", caller=WRITER_B) == {"app": "dsh_plugin", "basis": "user_agent", "ua": "node", "origin": False}, \
+        "没报名字的 Node 客户端, 单发钥匙也分不开"
 
 
 # ── 7. 先后 ─────────────────────────────────────────────────────────────────────────────────────────
@@ -545,3 +552,24 @@ def test_the_node_rule_only_applies_on_the_same_fingerprint_as_a_generic_hello()
     _hello("some-generic-mcp-client", ua="node", caller=WRITER_B)
     assert _mcp(ua="node", caller=WRITER_A)["app"] == "dsh_plugin", "别的钥匙上的自报名字不影响这一把"
     assert _mcp(ua="node", caller=WRITER_B)["app"] == "other_mcp"
+
+
+def test_the_node_rule_compares_the_whole_raw_header_not_the_first_token():
+    # 洗过的 UA 词只是第一个像样的 token: 这几种洗出来都是 node, 可都不是 Node 默认的那一个
+    for ua in ("node WorkBuddy/1", "node (linux)", "node/", "Mozilla/5.0 node", "Node"):
+        out = _mcp(ua=ua)
+        assert out["app"] != "dsh_plugin", (ua, out)
+    assert _mcp(ua=" node ")["app"] == "dsh_plugin", "两头空白不算"
+
+
+def test_an_unrecognised_name_only_shields_while_its_entry_lives(monkeypatch):
+    # 报了认不得的名字的 Node 客户端: 那一条在小表里时 other_mcp; 过了 24 小时(或部署清了小表)就按 node 那条算 DSH
+    now = [1000.0]
+    monkeypatch.setattr(cm, "_clock", lambda: now[0])
+    _hello("some-generic-mcp-client", ua="node")
+    assert _mcp(ua="node")["app"] == "other_mcp"
+    now[0] += cm.HELLO_TTL_SEC + 1
+    assert _mcp(ua="node")["app"] == "dsh_plugin", "文档 §3.37「11-23 核对」写明了: 只在那一条还在的时候"
+    _hello("some-generic-mcp-client", ua="node")
+    cm.reset()                                  # 部署: 小表清空
+    assert _mcp(ua="node")["app"] == "dsh_plugin"
