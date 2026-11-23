@@ -1,8 +1,8 @@
 # deskcore · 写作台内核外置为 MCP
 
-> **2026-11-14 审查修复**：调校笔记的写回改成按任务版本比较，完整笔记和精修销账在同一个事务里；旧笔记读不到时不发空历史的学习任务。负责人在 SQL Editor 跑一次 `migrations/021_style_distillation_cas.sql`，先于或后于部署都行（没跑时照 021 之前的写法保存，服务日志里响一次警告），写手不用做什么。同一分支里的「硬约束拿不准」改动已撤回。细节见 [审查修复说明](audit-fixes-2026-11-14.md)。生产库还没跑 021。
+> **2026-11-14 审查修复**：调校笔记的写回改成按任务版本比较，完整笔记和精修销账在同一个事务里；旧笔记读不到时不发空历史的学习任务。负责人在 SQL Editor 跑一次 `migrations/021_style_distillation_cas.sql`，先于或后于部署都行（没跑时照 021 之前的写法保存，服务日志里响一次警告），写手不用做什么。同一分支里的「硬约束拿不准」改动已撤回。细节见 [审查修复说明](audit-fixes-2026-11-14.md)。11-14 写这段时 021 还没进生产库；**2026-11-23 只读核过已经在了**（函数 `deskcore_save_style_cas` 和触发器 `deskcore_user_calib_updated_at` 都在，哪天跑的没记下），见 runbook §1.17。
 
-> **2026-11-15 十三项里写作台的两项**：① 每批稿子写之前看到了哪几张经验卡、哪几条规律，记在 `batches.params.lesson_exposure` 和查重底稿上（§3.33；是曝光记录，不是归因）。负责人在 SQL Editor 跑一次 `migrations/022_lesson_exposure.sql`，先于或后于部署都行。② 存完档在后台给每一版判一次人感题和暗题，答案只落账本（§3.34；默认开，每版多一次 `/judge_draft`、每段至少一次 Jev 调用，`DESKCORE_SHADOW_HUMAN=0` 关）。写手不用做什么，协议和 skill 没变。
+> **2026-11-15 十三项里写作台的两项**：① 每批稿子写之前看到了哪几张经验卡、哪几条规律，记在 `batches.params.lesson_exposure` 和查重底稿上（§3.33；是曝光记录，不是归因）。负责人在 SQL Editor 跑一次 `migrations/022_lesson_exposure.sql`，先于或后于部署都行（**2026-11-23 只读核过已在生产库**：最早一条带这一列的底稿是 11-16）。② 存完档在后台给每一版判一次人感题和暗题，答案只落账本（§3.34；默认开，每版多一次 `/judge_draft`、每段至少一次 Jev 调用，`DESKCORE_SHADOW_HUMAN=0` 关）。写手不用做什么，协议和 skill 没变。
 
 > 本文讲**为什么这么设计**。要看**现在是什么状态、还差什么、下一步做什么**，
 > 去 [`deskcore-runbook.md`](deskcore-runbook.md)——上线手册、对接矩阵、待办清单，
@@ -1910,8 +1910,9 @@ WITH cand AS MATERIALIZED (
 通用计划）取候选都走 GIN，新连接的第 1 次调用和后面一样快。
 
 **没做的、要知道的。**
-- **要 owner 在 SQL Editor 跑一次 `019`**（两条 `CREATE OR REPLACE FUNCTION`，不碰数据）。没跑之前一切照旧，只是没变快。
-  跑完怎么核、怎么退都写在迁移文件末尾，runbook §1.15 也有。
+- **`019` 生产库已执行**（两条 `CREATE OR REPLACE FUNCTION`，不碰数据）：负责人 11-12 跑的（W-21），2026-11-23 只读核过
+  两个函数体里两个记号都在。新库照编号跑，没跑之前一切照旧，只是没变快。跑完怎么核、怎么退都写在迁移文件末尾，
+  runbook §1.15 也有。
 - **小项目会慢一点。** GIN 的钱跟全库命中的行数走，不跟项目走：二三十条指纹以下的项目这一步原来是 1 毫秒级，现在每篇
   10~20 毫秒（10 篇一组三次 RPC 合计多不到 1 秒）。全库涨到几万行时要再看一次这一步。
 - **计划不在 CI 里断言。** 计划器走不走 GIN 还看表的大小：CI 的夹具只有几行，它对小表本来就选顺序扫描，写法对不对都
@@ -2144,7 +2145,8 @@ WITH cand AS MATERIALIZED (
 - 关着：这一节说的读的一方（A4、A8）一个请求都不多发，简报、项目块、发牌的回包同今天一字不差。tv-sync 那一步照常每晚记
   结论（它不看这个开关，只看 `020` 跑没跑）。
 - 开着但 `020` 没跑、或者那几列这次读不出来：同关着（读挂了记一行 WARN；`020` 没跑是预期之内的，只记 INFO）。
-- **怎么开**：看过三晚 tv-sync 日志里的结论分布，和下面的预期差不出几个点，就把 `config.py` 里
+- **怎么开（历史：11-16 已照这一条开了，aw#163；现在的默认是开，紧急关是 `RETURN_GATE_ENFORCE=0`，下面留着备查）**：
+  看过三晚 tv-sync 日志里的结论分布，和下面的预期差不出几个点，就把 `config.py` 里
   `RETURN_GATE_ENFORCE_DEFAULT = "0"` 改成 `"1"`，一行的 PR。TV 馆员那边是它自己的开关，同一时间开。
   预期（近 45 天 912 篇，11-12 排练，短帖的口径改过之后按同一套判法在库里重数）：`fail` 约 10%（92 篇：67 篇不干净、
   30 篇承诺功效、2 篇风控，有重叠）、`withdrawn` 约 7%（60 篇）、`unsure` 约 1%（11 篇）、`hold` 3 篇（正文是空的）。
@@ -2442,7 +2444,7 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 
 | `app` | 是什么 | 什么时候 |
 |---|---|---|
-| `dsh_plugin` | DeepSeek Harness 桌面 + 写作台插件 | UA 的产品名或 clientInfo 的名字里有完整的一段 `dsh`（`dsh`、`dsh_mcp_client`），或含 `deepseek_harness` / `deepseekharness`（UA 的产品 token 常连写：`DeepSeekHarness/0.2`）。`dashboard`、`fdsh_tool` 不算；光是 `deepseek` 也不算（那也是模型和 API 客户端的名字） |
+| `dsh_plugin` | DeepSeek Harness 桌面 + 写作台插件 | UA 的产品名或 clientInfo 的名字里有完整的一段 `dsh`（`dsh`、`dsh_mcp_client`），或含 `deepseek_harness` / `deepseekharness`（UA 的产品 token 常连写：`DeepSeekHarness/0.2`）。`dashboard`、`fdsh_tool` 不算；光是 `deepseek` 也不算（那也是模型和 API 客户端的名字）；**2026-11-23 起**另加一条：走 MCP、UA 正好是 `node`、不带 Origin、这个指纹上没人自报过名字（或只报了和本服务同名的 `deskcore`）也算（`basis = user_agent`；见本节末尾「11-23 核对」） |
 | `workbuddy_skill` | WorkBuddy / CodeBuddy（都装 bywood-writing-desk skill） | 名字里有 `workbuddy` / `codebuddy` |
 | `claude_code` | Claude Code（负责人自测） | 名字里有 `claude_code` / `claudecode` |
 | `other_mcp` | 走 MCP、哪条规则都没认出来的 | |
@@ -2450,8 +2452,8 @@ TV 给每篇做过首图那一步的帖记了几道封面题的答案（`truth_v
 | `server_job` | 没有 HTTP 调用方：`python -m deskcore.cli` 的命令，含每晚的 `tv-sync` 和手动的 `ingest --xlsx` | |
 | `unknown` | 认不出：出了意外、请求和 CLI 之外的服务端调用、底稿转正的 batch | |
 
-`basis` 是凭什么这么定：`user_agent`（UA 的产品名认得）、`hello`（这个指纹最近一次 initialize 报的 clientInfo 认得，见下面「指纹管不到的那一种」）、`transport`（只知道
-走的是哪条路）、`process`（CLI 的进程默认）、`none`。先后：UA 认得 → clientInfo 认得（只对 MCP）→ 按走的路。没有 `web` 这个词：
+`basis` 是凭什么这么定：`user_agent`（UA 的产品名认得；11-23 起也包括「MCP 上 `node`、不带 Origin」那一条）、`hello`（这个指纹最近一次 initialize 报的 clientInfo 认得，见下面「指纹管不到的那一种」）、`transport`（只知道
+走的是哪条路）、`process`（CLI 的进程默认）、`none`。先后：UA 认得 → clientInfo 认得（只对 MCP）→（11-23 起）MCP 上 UA 整个就是 `node`、不带 Origin、没人自报名字的算 DSH → 按走的路。没有 `web` 这个词：
 Streamlit 工作台和 worker 建 batch 不经过写作台（`generation_service.py`），那些 batch 本来就分得开（没有 `params.source`，
 `ai_engines` 不是 `["deskcore"]`），工作台 10-16 也停了。
 
@@ -2483,7 +2485,8 @@ initialize**（部署之后接着调、开着一整天不重连的；无状态�
 指纹最近一次 initialize 的那个客户端头上，`hello` 也是那个客户端的。所以 `basis = hello` 读作「这个指纹最近一次 initialize 报的是它」，
 不是「这一次一定是它」，只和指纹一样纯。撞上要五样都一样：同一个身份、同一把钥匙（备注名）、UA 那个词一样（Node 自带的 fetch 都是
 `node`）、都带或都不带 Origin、谈定的协议版本一样。说不清只在两边都 initialize 过时才看得出来。要分干净就给另一个客户端**单发一把
-钥匙**（备注名在指纹里，不用改代码）。**每次部署小表就清空**：之后到某个客户端 initialize 之前，同一个指纹上的调用只靠 UA 认（认不出
+钥匙**（备注名在指纹里，不用改代码）——只对报了自己名字的客户端管用：11-23 起 MCP 上 UA 整个就是 `node`、不带 Origin、指纹上没人
+自报名字的一律算 DSH，不看钥匙（见本节末尾「11-23 核对」），用 Node 默认 UA 的别的客户端要自己带一个 UA（产品名）或 Origin 才分得开。**每次部署小表就清空**：之后到某个客户端 initialize 之前，同一个指纹上的调用只靠 UA 认（认不出
 就是 `other_mcp`）；有一个客户端 initialize 了，这个指纹上不重连的那些就按上面说的跟着它算。DSH / WorkBuddy 多久 initialize 一次（每场
 对话、每次开应用、每次重连）不知道；每一行都有 `ua` / `origin`，看下面的核对。
 
@@ -2519,7 +2522,7 @@ initialize**（部署之后接着调、开着一整天不重连的；无状态�
 ② 拿测试项目：DSH 里**新开**一场写作台对话、调 `open_project`；WorkBuddy 里新开一场、调 `open_project`；愿意的话 Claude Code 也来一次。
 ③ 跑下面第四条 SQL。④ 应该是 DSH 那几行 `dsh_plugin`、WorkBuddy 那几行 `workbuddy_skill`。是的话也先问清：同一把钥匙上还有没有
 别的 MCP 客户端（Node 写的脚本、别的桌面应用），它的 `ua` / `origin` 和 DSH 的是不是一样——一样的话 `basis = hello` 的行里可能有它的
-调用（上面「指纹管不到的那一种」），给 DSH 单发一把钥匙再读。不是的话看 `ua` / `origin` / `hello`：
+调用（上面「指纹管不到的那一种」），给 DSH 单发一把钥匙再读（11-23 定了 `node` 那一条之后，没报名字的 Node 客户端单发钥匙也分不开，见「11-23 核对」）。不是的话看 `ua` / `origin` / `hello`：
 `hello` 认得、`ua` 是通用的 → 规则没问题，只是靠小表；两个都是通用的 → 在「`(ua, origin)` 定死一条规则（比如 MCP 上 `node`、没有
 Origin 的算 DSH，前提是没有别的客户端也这样）」和「拿插件每 30 分钟那次 REST 取协议对上同一把钥匙」两个办法里挑一个，都是改一行加一条
 用例。⑤ 历史不回写，用第五条 SQL 的 `CASE` 重读。⑥ 顺便看 DSH 新开的那场有没有 `hello`：有就说明新对话会重新 initialize、之后的请求带着同一版 `MCP-Protocol-Version`，小表热得快；
@@ -2568,6 +2571,23 @@ select case when meta->'client_mark'->>'app' in ('other_mcp', 'unknown')
  group by 1 order by 2 desc;
 ```
 
+**11-23 核对（负责人确认 + 只读）：DSH 发的是 `node`、不带 Origin，没有 `hello`；规则改了一条。** 11-23 05:41–07:53 UTC 在
+sportsix、Hatherine痘痘贴上有一场走 MCP 的调用（`check_drafts`、`score_drafts`、`open_project`、`draw_angles` 等，存了 5 批），全记成
+`other_mcp` / `transport`，证据是 `ua = node`、`origin = false`、没有 `hello`；负责人 11-23 说那是写手在 DSH 里用写作台（写手已经开始用
+DSH）。11-17 起到这一场之前，`other_mcp` 一次都没有，也没有别的 `ua = node` 的调用，所以「MCP 上 `node`、没有 Origin 的算 DSH」那一条
+没有误认别人的前例。改法照上面第 ④ 步：`classify` 在「clientInfo 认得」之后、「按走的路」之前加一条——走 MCP、UA 整个就是 `node`（原始的头去掉两头空白
+之后正好是它：带版本的 `node/22…`、`node WorkBuddy/1`、`node (x)` 都不算）、不带 Origin、这个指纹上的小表里没人自报过名字，或者只报了和
+本服务同名的 `deskcore`（WorkBuddy 这样报；插件预设里给服务起的名字也是它，DSH 报不报没核过）→ `dsh_plugin` / `user_agent`。报了别的
+名字（认不得也算：是别的客户端）、同一个指纹上撞了车的，不套这一条，照旧 `other_mcp`——**只在它那一条还在小表里的时候**：过了 24 小时、
+部署清了小表、被挤掉、或者协议版本那一格对不上，它的调用也会按这一条算 DSH。**这一条不看钥匙**：前面说的「单发一把钥匙」对没报名字的
+Node 客户端分不开；同一把或别的钥匙上要是有别的 Node 写的 MCP 客户端，它要自己带一个 UA（产品名）或 Origin。前提是现在没有这样的客户端
+（11-17 起到 11-23 一个都没有）；CodeBuddy 发什么 UA、报什么名字没核过，是这个前提的例外，有它的流量了再看。**历史不回写**：读 11-23
+之前的数时，用上面第五条 SQL 的 `CASE`，`<seen>` 换成 `node`（`origin = 'false'`），再加一句只认没报名字或只报了 `deskcore` 的行
+（`and coalesce(meta->'client_mark'->>'hello', 'deskcore') ~ '^deskcore(_v|$)'`）。存下的 `ua` 是洗过的第一个词，分不出 `node` 和
+`node WorkBuddy/1`，历史上这样的行要是有，会被一起算进去（11-23 之前没有 `ua = node` 的行，读出来没差别）。DSH 新开对话会不会 initialize、`hello` 报的是什么，这一场里看不出（小表没有它的
+记录），以后有 `hello` 了再看。回归在 `tests/test_client_mark.py` 第 10 节；原来拿 `node` 测小表的那几节改用一个中性的 UA，测的东西不变。
+协议、skill、插件都没动，写手不用做什么。
+
 **11-17 部署后读到的（只读，按 `app` / `basis` / `ua` / `origin` / `hello` 分组，只看个数）。** 部署（`b8d6514`）后到 10:08 UTC 共 110 次调用，全是同一组值：`workbuddy_skill` / `user_agent`，`ua = workbuddy_v5.11.3`，`origin = false`，`hello = deskcore_v1.0.0`。一个写手，调的主要是评论那一路（`score_comments`、`comments_for`）；这段时间没有新 batch。读出来三件事：① WorkBuddy 靠 UA 就认得，规则不用改；② WorkBuddy **不带** Origin，上面「中等把握」那条不对；③ WorkBuddy 在 clientInfo 里报的名字是 `deskcore`，和这个服务的名字一样，所以 `hello` 认不出 WorkBuddy。DSH 的插件预设给这个服务起的名字也是 `deskcore`，要是 DSH 的 MCP 客户端也这样报，`hello` 就分不出 DSH，DSH 那边只剩 UA 能认。DSH 还没有调用，等负责人下次在 DSH 里用写作台再读第四条 SQL。
 
 协议、skill、`clients/dsh-plugin` 都没动（协议摘要还是 `6f23eba491fd`），插件不用发版、skill 不用重导，写手不用做什么。
@@ -2585,6 +2605,22 @@ select case when meta->'client_mark'->>'app' in ('other_mcp', 'unknown')
 batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和钥匙不进库 / 日志 / stdout 埋点 / /health、分类出了意外回包一个字节
 不变、只多 JSONB 的键不加列）。另外四条原有断言因为 batch 的 `params` 多了这个键跟着改：`tests/test_flywheel_arm.py` 的 `_commit`、
 `tests/test_deskcore_cli_ingest.py`、`tests/test_deskcore_ingest.py`、`tests/test_tv_sync.py`。
+
+### 3.38 查重的两个函数不许走全表顺序扫描（2026-11-23，`023`）
+
+**现象**：写作台 `check_drafts`、`score_drafts` 报 `APIError (ref …)`，服务日志是 `postgrest.exceptions.APIError code=57014`（语句超时），每次约 8.6 秒。写手那边的模型照协议「查重报错就停下、不当作通过」，交付不了。2026-11-18、11-22、11-23 都出现过，涉及三个项目；11-23 07:14–07:36 UTC 一个项目连着失败（`score_drafts` 也失败两次，它入库前会再查一次重）。
+
+**原因**：PostgREST 每条请求的上限是 8 秒（`authenticator` 角色的 `statement_timeout`，`service_role` 没有自己的设置，跟着它）。`019` 把取候选写成「先走四字串的 GIN 索引、再筛项目」（§3.27），可指纹表长到约 8,000 行（160 MB，四字串数组多存在 TOAST 里）之后，计划器估全表顺序扫描的成本（约 647）比走 `draft_fp_ngram_gin_idx`（约 741）低，因为它不算逐行解压数组的开销。实际顺序扫描一篇约 3.5 秒、走索引约 0.16 秒。2026-11-23 用生产库同一项目最近 5 条指纹当稿子只读复现：19.3 秒；同一事务里关掉顺序扫描后 0.54 秒，四路结果逐项相同。
+
+**做法**：`023` 给这两个函数各加 `SET enable_seqscan = off`，只在函数执行期间生效。函数体、签名、返回列、判定、阈值、授权、数据都不动；函数里另外几步（开头精确撞车、标题语义）本来就走索引；真没有索引可用的地方计划器照样能顺序扫描（只是估价变高），不会报错。基线 `000` 里同样两句。负责人 2026-11-23 让工程直接在生产库跑了：跑完只读核过两个函数的 `proconfig` 都带 `enable_seqscan=off`，同样 5 篇 0.26 秒；最大的项目（约 1,250 条指纹）10 篇一组 2.9 秒。
+
+**没做的**：调高 8 秒上限（掩盖慢、对所有服务都放宽）；把一批拆成一篇一次调用（每篇各给 8 秒，但慢的根子还在）。协议「查重报错就停下」不改：查重是硬闸，修的是它别报错。
+
+**以后看**：`pg_stat_statements` 里 `deskcore_check_drafts` 的平均和最长用时（2026-11-23 改之前：成功的 585 次平均 1.4 秒、最长 7.5 秒；超时的不进这张表）；服务日志里搜 `code=57014`。
+
+**容易丢**：`CREATE OR REPLACE FUNCTION` 会把函数的配置换成新语句里写的那几项。以后谁照 019 / 基线整块复制重建这两个函数，或者照 019 文件末尾的回滚重跑 005 / 008，开关就悄悄没了，结论不变、查重又会超时。所以：新迁移重建它们的，同一个文件里要再加这个开关（`tests/test_dedup_no_seqscan.py` 查文本，`tests/sql_parity_check.py` 在真库上查完整链条和只跑基线两条路的终态）；生产库上重建过，就再跑一次 `023`。核计划要在 `set local enable_seqscan = off` 下看（SQL Editor 的会话里顺序扫描是开着的，单拿取候选那一步 `EXPLAIN` 会看到 Seq Scan）。
+
+**还没做的一件**（不急）：四字串的 GIN 索引大概攒满了待合并的那一段（11-23 只读看：查一个不存在的值也要读约 500 个缓冲页；这张表上次自动 vacuum 是 09-18，新增的行没到自动触发的线）。现在每次查重都走它，每篇都要把这一段扫一遍；写指纹时偶尔还会在持锁的那一下同步合并。11-23 最大的项目 10 篇一组 2.9～3.6 秒，约是 8 秒上限的四成。要再快：`gin_clean_pending_list('autowriter.draft_fp_ngram_gin_idx')` 或对这张表 `VACUUM`，或者把这个索引改成 `fastupdate = off`。要动生产库，先看用时有没有往 8 秒走。
 
 ## 4. 接入
 
@@ -2635,8 +2671,9 @@ env：
 `011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql` / `014_tv_edit_diff_rev.sql` /
 `015_rule_compiles.sql` / `016_tv_notes_skip_vanished.sql` / `017_tv_link_text_fp.sql` /
 `018_draft_snapshots.sql` / `019_dedup_gin_first.sql` / `020_tv_link_gate.sql` /
-`021_style_distillation_cas.sql` / `022_lesson_exposure.sql`
-**二十二个，按编号顺序跑，别跳号**（建议先在
+`021_style_distillation_cas.sql` / `022_lesson_exposure.sql` /
+`023_dedup_no_seqscan.sql`
+**二十三个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -2670,6 +2707,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
 - `016_tv_notes_skip_vanished.sql`（2026-10-26，I-22）：`deskcore_tv_notes` 不再返回飞书里已删的篇（TV 的 `truth_vault.v_notes_vanished`，D-103），§3.7 表里「飞书已删」那一行。只换函数体，签名不变；视图不在就照旧全给。**静默错答**，和 `008` 同类：不跑不报错，已删的篇每晚照样被读回来重对，项目有补录目标时对不上的会被补录成副本。所以**先跑 016，再打开有已删篇的 TV 项目的补录目标**（10-26：BJS_phase1 挪走了 79 篇成人藻油，其中 14 篇是 unmatched）。`doctor` 报 `unprobeable` 并给出查函数体和视图的 SQL。
+- `023_dedup_no_seqscan.sql`（2026-11-23）：`deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 各加一个计划器开关 `enable_seqscan = off`（§3.38）。函数体、签名、授权、数据都不动。指纹表长到约 8,000 行之后，计划器绕开 GIN 索引改走全表顺序扫描，一批 5 篇十几秒，超过 PostgREST 的 8 秒上限，`check_drafts` / `score_drafts` 报 `APIError code=57014`、写手交付不了；2026-11-23 负责人让工程直接在生产库跑了，跑完 5 篇 19.3 秒 → 0.26 秒。`doctor` 探不到函数配置，报 `unprobeable` 并给出查的 SQL。
 - `022_lesson_exposure.sql`（2026-11-15，十三项第 3 项）：`draft_snapshots` 加一个可空的列 `lesson_exposure`（JSONB）——这次查重的那一场看到了哪几张经验卡、哪几条规律（§3.33）。不建表、不建函数、不发 GRANT、不碰数据。**可降级，先后都行**：没跑时记底稿那一步去掉这一列再写一次（警告一次）、tv-sync 读底稿退回原来那几列，行为和以前一样，`batches.params.lesson_exposure` 照样记；跑了之后最多十分钟自动用上，不用重新部署。`doctor` 探得到这一列。
 - `020_tv_link_gate.sql`（2026-11-12，回流闸 v1）：`tv_note_links` 加四个可空的列 `origin` / `gate` / `gate_reasons` / `gate_at`——每篇已发的帖是哪来的、能不能拿来学（`pass` / `fail` / `unsure` / `hold` / `withdrawn`）、原因名、最近一次判的时刻。取值、判的先后、哪个原因挡哪一路都在 `deskcore/postgate.py`；tv-sync 每晚最后一步（`core._tv_gate`）只 `UPDATE` 这四列，不碰对照本身的列。不建表、不建函数、不发 GRANT、不碰数据。**可降级，先于或后于部署都行**：没跑时那一步整步跳过，读结论的各处当作「没判过」，行为和以前一样。`doctor` 探这四列。
 - `019_dedup_gin_first.sql`（2026-11-11，W-21 / AU-F08）：`deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 取候选先走四字串的 GIN 索引、再筛项目（§3.27）。只换函数体里这一步，签名、返回列、结论都不变，不碰数据。**不跑不坏，只是慢**（千行的项目每篇约 0.4 秒，10 篇一组三处各等 3~5 秒）；代码不依赖它，先于或后于部署都行。`doctor` 探不到函数体，报 `unprobeable` 并给出查两个记号的 SQL；跑完用文件末尾那句 `EXPLAIN` 核一次。

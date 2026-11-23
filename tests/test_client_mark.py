@@ -37,6 +37,11 @@ ELECTRON_WB_AFTER = ("Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, l
                      "Electron/32.2.5 Safari/537.36 WorkBuddy/4.7.3")
 
 
+# 小表(clientInfo)那几节用的中性 UA。原来用的是 ``node``; 2026-11-23 起 MCP 上 ``node``、不带 Origin、没自报名字的算 DSH
+# (第 10 节), 再拿它测小表就测不到「没认出来」那一支了。
+GENERIC_UA = "undici"
+
+
 @pytest.fixture(autouse=True)
 def _fresh():
     cm.reset()
@@ -51,11 +56,11 @@ def _init(name, version="1.0.0", *, batch=False) -> bytes:
     return json.dumps([msg, {"jsonrpc": "2.0", "method": "notifications/initialized"}] if batch else msg).encode()
 
 
-def _mcp(ua="node", origin=False, caller=WRITER_A, key=FAKE_KEY, pv=PV) -> dict:
+def _mcp(ua=GENERIC_UA, origin=False, caller=WRITER_A, key=FAKE_KEY, pv=PV) -> dict:
     return cm.classify(channel="mcp", ua=ua, origin=origin, key=key, caller=caller, pv=pv).as_dict()
 
 
-def _hello(name, version="1.0.0", ua="node", origin=False, caller=WRITER_A, key=FAKE_KEY, pv=PV, **kw) -> None:
+def _hello(name, version="1.0.0", ua=GENERIC_UA, origin=False, caller=WRITER_A, key=FAKE_KEY, pv=PV, **kw) -> None:
     body = json.loads(_init(name, version))
     body["params"]["protocolVersion"] = pv
     cm.note_hello(json.dumps(body).encode(), ua=ua, origin=origin, key=key, caller=caller, **kw)
@@ -113,7 +118,7 @@ def test_the_run_together_deepseekharness_token_is_dsh():
     assert _mcp(ua=ELECTRON.replace("Electron/", "DeepSeekHarness/0.2.2 Electron/")) == {
         "app": "dsh_plugin", "basis": "user_agent", "ua": "deepseekharness_v0.2.2", "origin": False}
     _hello("DeepSeekHarness", "0.2.2")
-    assert _mcp() == {"app": "dsh_plugin", "basis": "hello", "ua": "node", "origin": False,
+    assert _mcp() == {"app": "dsh_plugin", "basis": "hello", "ua": GENERIC_UA, "origin": False,
                       "hello": "deepseekharness_v0.2.2"}
 
 
@@ -183,8 +188,8 @@ def test_a_key_inside_the_user_agent_or_client_info_is_never_returned():
     assert keys == [FAKE_KEY] and cm.ua_descriptor(ua, key=keys) == "other" and pv is None
     assert cm.hello_descriptor(f"dsh {FAKE_KEY}", "1", key=FAKE_KEY) is None
     assert cm.hello_descriptor("dsh", FAKE_KEY, key=FAKE_KEY) is None
-    cm.note_hello(_init(f"dsh-mcp-client {FAKE_KEY}"), ua="node", key=FAKE_KEY, caller=WRITER_A)
-    assert _mcp() == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False}, "带钥匙的 clientInfo 不记"
+    cm.note_hello(_init(f"dsh-mcp-client {FAKE_KEY}"), ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A)
+    assert _mcp() == {"app": "other_mcp", "basis": "transport", "ua": GENERIC_UA, "origin": False}, "带钥匙的 clientInfo 不记"
 
 
 @pytest.mark.parametrize("frag", [MIXED_KEY[2:14], MIXED_KEY[2:14].upper(), MIXED_KEY[10:22].lower()])
@@ -207,7 +212,7 @@ def test_a_failure_gives_unknown_and_one_rate_limited_warning(monkeypatch, caplo
     for _ in range(3):
         mark = cm.classify(channel="mcp", ua="node WorkBuddy/1", origin=True, key=FAKE_KEY, caller=WRITER_A)
         assert mark is cm.UNKNOWN and mark.as_dict() == {"app": "unknown", "basis": "none"}
-        cm.note_hello(_init("dsh"), ua="node", key=FAKE_KEY, caller=WRITER_A)         # 同样吞掉
+        cm.note_hello(_init("dsh"), ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A)         # 同样吞掉
     recs = [r for r in caplog.records if r.name == "deskcore.clientmark"]
     assert len(recs) == 1 and recs[0].levelno == logging.WARNING, "5 分钟里只记一行"
     assert recs[0].getMessage() == "client mark: classification failed (RuntimeError)"
@@ -226,19 +231,19 @@ def test_the_asgi_entry_points_never_raise(monkeypatch):
 
 def test_hello_applies_to_the_same_connection_fingerprint_only():
     _hello("dsh-mcp-client", "0.2.2")
-    assert _mcp() == {"app": "dsh_plugin", "basis": "hello", "ua": "node", "origin": False,
+    assert _mcp() == {"app": "dsh_plugin", "basis": "hello", "ua": GENERIC_UA, "origin": False,
                       "hello": "dsh_mcp_client_v0.2.2"}
     other = {"app": "other_mcp", "basis": "transport"}
-    assert _mcp(caller=WRITER_B) == {**other, "ua": "node", "origin": False}, "另一把钥匙"
-    assert _mcp(origin=True) == {**other, "ua": "node", "origin": True}, "带 Origin 的是另一个客户端"
-    assert _mcp(ua="undici") == {**other, "ua": "undici", "origin": False}, "另一个 UA"
+    assert _mcp(caller=WRITER_B) == {**other, "ua": GENERIC_UA, "origin": False}, "另一把钥匙"
+    assert _mcp(origin=True) == {**other, "ua": GENERIC_UA, "origin": True}, "带 Origin 的是另一个客户端"
+    assert _mcp(ua="other-client") == {**other, "ua": "other_client", "origin": False}, "另一个 UA"
     assert _mcp(caller=Caller("22222222-2222-2222-2222-222222222222", "示例写手甲", True))["app"] == "other_mcp"
 
 
 def test_rest_never_reads_the_hello_table():
     _hello("dsh-mcp-client", "0.2.2")
-    out = cm.classify(channel="rest", ua="node", key=FAKE_KEY, caller=WRITER_A).as_dict()
-    assert out == {"app": "rest", "basis": "transport", "ua": "node", "origin": False}
+    out = cm.classify(channel="rest", ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A).as_dict()
+    assert out == {"app": "rest", "basis": "transport", "ua": GENERIC_UA, "origin": False}
 
 
 def test_hello_expires_after_a_day(monkeypatch):
@@ -248,7 +253,7 @@ def test_hello_expires_after_a_day(monkeypatch):
     now[0] += cm.HELLO_TTL_SEC - 1
     assert _mcp()["app"] == "dsh_plugin"
     now[0] += 2
-    assert _mcp() == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False}
+    assert _mcp() == {"app": "other_mcp", "basis": "transport", "ua": GENERIC_UA, "origin": False}
     assert not cm._HELLO, "过期的那一项读到时就删掉"
 
 
@@ -257,7 +262,7 @@ def test_two_different_clients_on_one_fingerprint_are_ambiguous_until_it_expires
     monkeypatch.setattr(cm, "_clock", lambda: now[0])
     _hello("dsh-mcp-client")
     _hello("WorkBuddy")
-    want = {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False}
+    want = {"app": "other_mcp", "basis": "transport", "ua": GENERIC_UA, "origin": False}
     assert _mcp() == want, "说不清: 哪个都不用, hello 也不报"
     now[0] += cm.HELLO_TTL_SEC / 2
     _hello("dsh-mcp-client")
@@ -275,11 +280,11 @@ def test_two_different_clients_on_one_fingerprint_are_ambiguous_until_it_expires
 def test_the_same_client_with_a_new_version_updates_the_entry():
     _hello("dsh-mcp-client", "0.2.2")
     _hello("dsh-mcp-client", "0.3.0")
-    assert _mcp() == {"app": "dsh_plugin", "basis": "hello", "ua": "node", "origin": False,
+    assert _mcp() == {"app": "dsh_plugin", "basis": "hello", "ua": GENERIC_UA, "origin": False,
                       "hello": "dsh_mcp_client_v0.3.0"}
     _hello("generic-client", "1", caller=WRITER_B)
     _hello("generic-client", "2", caller=WRITER_B)
-    assert _mcp(caller=WRITER_B) == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False,
+    assert _mcp(caller=WRITER_B) == {"app": "other_mcp", "basis": "transport", "ua": GENERIC_UA, "origin": False,
                                      "hello": "generic_client_v2"}, "认不得的 clientInfo 也当证据带上"
 
 
@@ -295,21 +300,24 @@ def test_two_unrecognised_clients_on_one_fingerprint_are_ambiguous_too():
     # 两个认不得的、名字不一样: 原来后 initialize 的那个顶掉前一个, a 的调用带着 b 的 hello。现在说不清, hello 不报
     _hello("client-a", "1")
     _hello("client-b", "1")
-    assert _mcp() == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False}
+    assert _mcp() == {"app": "other_mcp", "basis": "transport", "ua": GENERIC_UA, "origin": False}
     _hello("client-a", "2")
     assert "hello" not in _mcp(), "说不清的到期之前一直说不清"
 
 
 def test_the_protocol_version_is_part_of_the_fingerprint():
     # 部署之后(小表是空的)另一个客户端 X 一直在调、没重新 initialize; 它谈定的协议版本和 DSH 的不一样
-    x = dict(ua="node", pv="2025-11-25")
-    assert _mcp(**x) == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False}
+    x = dict(ua=GENERIC_UA, pv="2025-11-25")
+    assert _mcp(**x) == {"app": "other_mcp", "basis": "transport", "ua": GENERIC_UA, "origin": False}
     _hello("dsh-mcp-client", "0.2.2", pv="2025-06-18")                # DSH 新开一场对话
-    assert _mcp(**x) == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False}, \
+    assert _mcp(**x) == {"app": "other_mcp", "basis": "transport", "ua": GENERIC_UA, "origin": False}, \
         "X 的调用不会算到 DSH 头上"
     assert _mcp(pv="2025-06-18")["app"] == "dsh_plugin", "DSH 自己的调用照常"
     # 2025-06-18 起的客户端每个请求都带头: 没带头的调用对不上它的 initialize
     assert _mcp(pv=None)["app"] == "other_mcp"
+    # 同样的场景要是 X 用的是 Node 默认的 UA(node)、不带 Origin: 2026-11-23 起它的调用按 UA 算 DSH(§3.37「11-23 核对」的前提:
+    # 没有这样的别的客户端)。这里写明, 免得以为协议版本那一格还能把它分开
+    assert _mcp(ua="node", pv="2025-11-25")["app"] == "dsh_plugin"
     assert _mcp(pv="not-a-date")["app"] == "other_mcp"
 
 
@@ -344,6 +352,10 @@ def test_the_documented_limit_a_client_that_never_initializes_inherits_the_label
     _hello("dsh-mcp-client")
     assert before["basis"] == "transport" and _mcp()["basis"] == "hello"
     assert _mcp(caller=WRITER_B)["basis"] == "transport", "单发一把钥匙(备注名在指纹里)就分开了"
+    # 2026-11-23 起: 单发钥匙只对报了自己名字、或者 UA 不是 Node 默认值的客户端管用。MCP 上 UA 整个就是 node、不带 Origin、
+    # 指纹上没人自报名字的一律算 DSH, 不看钥匙(文档 §3.37「11-23 核对」那一段也这么写)
+    assert _mcp(ua="node", caller=WRITER_B) == {"app": "dsh_plugin", "basis": "user_agent", "ua": "node", "origin": False}, \
+        "没报名字的 Node 客户端, 单发钥匙也分不开"
 
 
 # ── 7. 先后 ─────────────────────────────────────────────────────────────────────────────────────────
@@ -353,8 +365,8 @@ def test_a_specific_user_agent_beats_hello_and_hello_beats_transport():
     out = _mcp(ua="WorkBuddy/4.7.3")
     assert out == {"app": "workbuddy_skill", "basis": "user_agent", "ua": "workbuddy_v4.7.3", "origin": False,
                    "hello": "dsh_mcp_client_v1.0.0"}, "UA 定的; 小表里那一条照样当证据带上"
-    _hello("dsh-mcp-client", ua="node")
-    assert _mcp(ua="node")["basis"] == "hello"
+    _hello("dsh-mcp-client", ua=GENERIC_UA)
+    assert _mcp(ua=GENERIC_UA)["basis"] == "hello"
     assert _mcp(ua="curl/8")["basis"] == "transport"
     assert cm.classify(channel="mystery", ua="node", caller=WRITER_A).as_dict() == {
         "app": "unknown", "basis": "none", "ua": "node", "origin": False}
@@ -363,7 +375,7 @@ def test_a_specific_user_agent_beats_hello_and_hello_beats_transport():
 # ── 8. 解析请求体 ───────────────────────────────────────────────────────────────────────────────────
 
 def test_note_hello_reads_single_and_batched_initialize():
-    cm.note_hello(_init("dsh-mcp-client", batch=True), ua="node", key=FAKE_KEY, caller=WRITER_A)
+    cm.note_hello(_init("dsh-mcp-client", batch=True), ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A)
     assert _mcp()["app"] == "dsh_plugin"
 
 
@@ -383,7 +395,7 @@ def test_note_hello_reads_single_and_batched_initialize():
 ])
 def test_note_hello_ignores_everything_else(body, caplog):
     caplog.set_level(logging.DEBUG)
-    cm.note_hello(body, ua="node", key=FAKE_KEY, caller=WRITER_A)
+    cm.note_hello(body, ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A)
     assert not cm._HELLO
     assert not [r for r in caplog.records if r.name == "deskcore.clientmark"], "解不出来是正常情况, 不记日志"
 
@@ -391,7 +403,7 @@ def test_note_hello_ignores_everything_else(body, caplog):
 def test_an_initialize_without_a_protocol_version_is_ignored():
     body = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"capabilities": {},
                                                                           "clientInfo": {"name": "dsh", "version": "1"}}}
-    cm.note_hello(json.dumps(body).encode(), ua="node", key=FAKE_KEY, caller=WRITER_A)
+    cm.note_hello(json.dumps(body).encode(), ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A)
     assert not cm._HELLO
 
 
@@ -402,18 +414,18 @@ def test_only_bodies_with_the_quoted_method_name_are_parsed(monkeypatch):
     monkeypatch.setattr(cm.json, "loads", lambda b, *a, **k: seen.append(len(b)) or real(b, *a, **k))
     call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "check_drafts", "arguments": {"drafts": [{"body": "how to initialize a habit"}]}}}
-    cm.note_hello(json.dumps(call).encode(), ua="node", key=FAKE_KEY, caller=WRITER_A)
+    cm.note_hello(json.dumps(call).encode(), ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A)
     cm.note_hello_headers(json.dumps(call).encode(), [(b"user-agent", b"node")], WRITER_A)
     assert seen == []
-    cm.note_hello(_init("dsh"), ua="node", key=FAKE_KEY, caller=WRITER_A)
+    cm.note_hello(_init("dsh"), ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A)
     assert len(seen) == 1
 
 
 def test_note_hello_sanitizes_the_client_name():
-    cm.note_hello(_init("示例 DSH 客户端 (测试)", "v1.0-测试"), ua="node", key=FAKE_KEY, caller=WRITER_A)
+    cm.note_hello(_init("示例 DSH 客户端 (测试)", "v1.0-测试"), ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_A)
     out = _mcp()
     assert out["app"] == "dsh_plugin" and out["hello"] == "dsh_vv1.0"
-    cm.note_hello(_init("示例客户端", "1"), ua="node", key=FAKE_KEY, caller=WRITER_B)
+    cm.note_hello(_init("示例客户端", "1"), ua=GENERIC_UA, key=FAKE_KEY, caller=WRITER_B)
     assert _mcp(caller=WRITER_B)["hello"] == "other", "名字洗完是空的: other"
 
 
@@ -496,3 +508,68 @@ def test_the_module_imports_no_web_framework():
     src = open(cm.__file__, encoding="utf-8").read()
     for mod in ("fastapi", "starlette", "mcp", "anyio"):
         assert not re.search(rf"^\s*(import|from)\s+{mod}\b", src, re.M), mod
+
+
+# ── 10. MCP 上 UA 是 node、不带 Origin、没自报名字的算 DSH(2026-11-23 核对, docs/deskcore.md §3.37) ─────────────
+
+def test_node_without_origin_on_mcp_is_dsh():
+    # 11-23 写手在 DSH 里用写作台: UA 只有 node(Node 自带的 fetch)、不带 Origin、小表里没有它的 clientInfo
+    assert _mcp(ua="node") == {"app": "dsh_plugin", "basis": "user_agent", "ua": "node", "origin": False}
+    hdr = [(b"user-agent", b"node"), (b"x-deskcore-key", FAKE_KEY.encode())]
+    assert cm.classify_headers("mcp", hdr, WRITER_A).as_dict()["app"] == "dsh_plugin"
+
+
+def test_node_rule_needs_mcp_exact_node_and_no_origin():
+    assert _mcp(ua="node", origin=True)["app"] == "other_mcp", "带 Origin 的不是 DSH 插件"
+    assert cm.classify(channel="rest", ua="node", key=FAKE_KEY, caller=WRITER_A).app == "rest", "REST 不套"
+    assert _mcp(ua="node/22.11.0")["app"] == "other_mcp", "只认正好是 node(Node 自带的 fetch 不带版本)"
+    assert _mcp(ua="undici")["app"] == "other_mcp"
+    assert _mcp(ua=None)["app"] == "other_mcp"
+
+
+def test_a_self_reported_name_beats_the_node_rule():
+    _hello("WorkBuddy", ua="node")
+    assert _mcp(ua="node")["app"] == "workbuddy_skill", "认得的名字听它的"
+    cm.reset()
+    _hello("some-generic-mcp-client", ua="node")
+    out = _mcp(ua="node")
+    assert out["app"] == "other_mcp" and out["hello"] == "some_generic_mcp_client_v1.0.0", \
+        "报了一个认不得的名字: 是别的客户端, 不套 node 那条"
+    cm.reset()
+    _hello("deskcore", ua="node")
+    assert _mcp(ua="node") == {"app": "dsh_plugin", "basis": "user_agent", "ua": "node", "origin": False,
+                               "hello": "deskcore_v1.0.0"}, "报的是和本服务同名的 deskcore(认不出是谁): 照 node 那条"
+
+
+def test_an_ambiguous_fingerprint_is_not_claimed_by_the_node_rule():
+    _hello("deskcore", ua="node")
+    _hello("some-generic-mcp-client", ua="node")
+    assert _mcp(ua="node") == {"app": "other_mcp", "basis": "transport", "ua": "node", "origin": False}, \
+        "同一个指纹上撞了车(说不清): 不认成 DSH"
+
+
+def test_the_node_rule_only_applies_on_the_same_fingerprint_as_a_generic_hello():
+    _hello("some-generic-mcp-client", ua="node", caller=WRITER_B)
+    assert _mcp(ua="node", caller=WRITER_A)["app"] == "dsh_plugin", "别的钥匙上的自报名字不影响这一把"
+    assert _mcp(ua="node", caller=WRITER_B)["app"] == "other_mcp"
+
+
+def test_the_node_rule_compares_the_whole_raw_header_not_the_first_token():
+    # 洗过的 UA 词只是第一个像样的 token: 这几种洗出来都是 node, 可都不是 Node 默认的那一个
+    for ua in ("node WorkBuddy/1", "node (linux)", "node/", "Mozilla/5.0 node", "Node"):
+        out = _mcp(ua=ua)
+        assert out["app"] != "dsh_plugin", (ua, out)
+    assert _mcp(ua=" node ")["app"] == "dsh_plugin", "两头空白不算"
+
+
+def test_an_unrecognised_name_only_shields_while_its_entry_lives(monkeypatch):
+    # 报了认不得的名字的 Node 客户端: 那一条在小表里时 other_mcp; 过了 24 小时(或部署清了小表)就按 node 那条算 DSH
+    now = [1000.0]
+    monkeypatch.setattr(cm, "_clock", lambda: now[0])
+    _hello("some-generic-mcp-client", ua="node")
+    assert _mcp(ua="node")["app"] == "other_mcp"
+    now[0] += cm.HELLO_TTL_SEC + 1
+    assert _mcp(ua="node")["app"] == "dsh_plugin", "文档 §3.37「11-23 核对」写明了: 只在那一条还在的时候"
+    _hello("some-generic-mcp-client", ua="node")
+    cm.reset()                                  # 部署: 小表清空
+    assert _mcp(ua="node")["app"] == "dsh_plugin"

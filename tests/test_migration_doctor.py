@@ -99,12 +99,14 @@ def test_fully_migrated_db_reports_ok():
     # 008 换的是函数体(签名一个字没动, 从调用侧看跑没跑过完全一样)。
     # 010 开的是 RLS: service_role 绕 RLS, 开没开从 PostgREST 读起来一模一样。
     # 016 同 008: 换的是 deskcore_tv_notes 的函数体, 签名没动。019 也是(查重两条函数取候选的那一步)。
+    # 023 只给那两条函数加了计划器开关(proconfig), PostgREST 同样读不到。
     assert report["unprobeable"] == ["003_versions_unique_num.sql",
                                      "008_embedding_model_isolation.sql",
                                      "010_tv_links_rls.sql",
                                      "016_tv_notes_skip_vanished.sql",
                                      "019_dedup_gin_first.sql",
-                                     "021_style_distillation_cas.sql"]
+                                     "021_style_distillation_cas.sql",
+                                     "023_dedup_no_seqscan.sql"]
     assert all(s in ("applied", "unprobeable") for s in _states(report).values())
 
 
