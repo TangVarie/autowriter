@@ -7484,6 +7484,14 @@ MIGRATION_019_PROBE_SQL = (
     "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
     "where n.nspname='autowriter' and p.proname in ('deskcore_check_drafts','deskcore_commit_fingerprints');"
 )
+# 023 给 deskcore_check_drafts / deskcore_commit_fingerprints 加计划器开关 enable_seqscan = off(指纹表大了以后计划器
+# 绕开 GIN、走全表顺序扫描, 一批 5 篇超过 PostgREST 的 8 秒上限)。函数体、签名都没动, PostgREST 读不到 proconfig —— 探不到。
+MIGRATION_DEDUP_NO_SEQSCAN = "023_dedup_no_seqscan.sql"
+MIGRATION_023_PROBE_SQL = (
+    "select p.proname, coalesce('enable_seqscan=off' = any(p.proconfig), false) as no_seqscan "
+    "from pg_proc p join pg_namespace n on n.oid=p.pronamespace "
+    "where n.nspname='autowriter' and p.proname in ('deskcore_check_drafts','deskcore_commit_fingerprints');"
+)
 # 020 给 tv_note_links 加回流闸的四列(origin / gate / gate_reasons / gate_at)。列探得到。
 MIGRATION_TV_LINK_GATE = "020_tv_link_gate.sql"
 MIGRATION_STYLE_CAS = "021_style_distillation_cas.sql"
@@ -7933,6 +7941,15 @@ def migration_state(client) -> dict:
          "可降级: check_drafts 记底稿时发现没有这一列就去掉它再写一次(服务日志里警告一次), 底稿和 022 之前一模一样; "
          "tv-sync 读底稿退回原来那几列。存档的批次照样在 batches.params 里记, 只有「只查了重、没存档就发出去」的稿子"
          "转正时带不上这一场看到了哪几张卡。跑了之后最多十分钟自动用上, 不用重新部署")
+
+    # ── 023: 查重的两个函数不许走全表顺序扫描。只加了函数的计划器开关, 调用侧看跑没跑过完全一样 —— 与 019 同类,
+    #    如实报 unprobeable 并交出 SQL。缺席时结论不变, 但大一点的批会超时、查重报错(写手那边照协议停下)。
+    _add(MIGRATION_DEDUP_NO_SEQSCAN,
+         "deskcore_check_drafts / deskcore_commit_fingerprints 不走全表顺序扫描(函数的计划器开关)",
+         "unprobeable",
+         "PostgREST 读不到函数配置; 用 SQL Editor 跑(两行、两个 true): " + MIGRATION_023_PROBE_SQL,
+         "缺席→查重的结论不变, 但指纹表大了以后计划器会绕开 GIN 索引、逐行比全表(一篇约 3.5 秒), "
+         "一批几篇就超过 PostgREST 的 8 秒上限: check_drafts / score_drafts 报 APIError code=57014, 写手交付不了")
 
     # ⚠️ ``error`` 不进 ``missing``(codex review · #63)。原来它进 —— 于是一次
     # 权限/连通性故障会让 doctor 打印"还缺这些迁移, 按编号顺序跑", 把人指去跑

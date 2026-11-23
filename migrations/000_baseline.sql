@@ -1279,6 +1279,15 @@ REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) FROM a
 REVOKE ALL ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) FROM authenticated;
 GRANT EXECUTE ON FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT) TO service_role;
 
+-- ── 023: 查重的两个函数不许走全表顺序扫描(2026-11-23) ─────────────────────
+-- 指纹表长到约 8,000 行之后, 计划器估全表顺序扫描比走 draft_fp_ngram_gin_idx 便宜(没算逐行
+-- 解压大数组的开销), 实际一篇 3.5 秒、走索引 0.16 秒, 5 篇一批超过 PostgREST 的 8 秒上限。
+-- 只加计划器开关, 函数体不动; 与 migrations/023_dedup_no_seqscan.sql 相同。
+ALTER FUNCTION autowriter.deskcore_check_drafts(UUID, JSONB, INT)
+    SET enable_seqscan = off;
+ALTER FUNCTION autowriter.deskcore_commit_fingerprints(UUID, JSONB, UUID, NUMERIC, NUMERIC, INT)
+    SET enable_seqscan = off;
+
 -- ── list_projects 的指纹批量计数(审计 SUP-004) ──────────────────────────
 -- PostgREST 不会 GROUP BY, 没有这个函数就只能每个项目发一次 count=exact:
 -- 40 个项目 41 次往返, 而 list_projects 是模型最常调的第一个工具。

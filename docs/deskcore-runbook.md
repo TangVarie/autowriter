@@ -64,7 +64,7 @@ TV 每天自己干的事：飞书 → `truth_vault.notes` → LLM 标 essence �
 | 部件 | 实测结果 |
 |---|---|
 | `deskcore/` 代码 | 齐。`selftest` → **PASS**；`pytest tests/` → **全绿**（条数每次提交都在涨，以实跑为准）；`tests/sql_parity_check.py` 在真 PostgreSQL 上 → 基线 + `migrations/` 下全部迁移叠起来、重跑幂等、SQL 与 Python 逐例一致，**全绿** |
-| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15；`020_tv_link_gate`（回流闸的四列，不跑不坏）2026-11-12 还没跑，见 §1.16；`021_style_distillation_cas`（调校笔记按版本写回，不跑不坏）2026-11-14 还没跑，见 §1.17；`022_lesson_exposure`（查重底稿上记这一场看到了哪几张经验卡，不跑不坏）2026-11-15 还没跑，见 §1.18 |
+| **schema** | ✅ 迁移 `001`–`018` **都已跑进生产**（2026-11-04 只读核对；08-26 那时是八个，见 §1.3 / §1.4）。`019_dedup_gin_first`（查重提速，不跑不坏）2026-11-11 还没跑，见 §1.15；`020_tv_link_gate`（回流闸的四列，不跑不坏）2026-11-12 还没跑，见 §1.16；`021_style_distillation_cas`（调校笔记按版本写回，不跑不坏）2026-11-14 还没跑，见 §1.17；`022_lesson_exposure`（查重底稿上记这一场看到了哪几张经验卡，不跑不坏）2026-11-15 还没跑，见 §1.18。**2026-11-23**：`019` 已在生产（函数体里两个记号都在，只读核过）；`023_dedup_no_seqscan`（查重的两个函数不许走全表顺序扫描，**不跑就会超时、写手交付不了**）负责人让工程直接跑了、已核，见 §1.19 |
 | **跑的是哪一份代码** | 打 `/health` 看 `build`：`commit`（12 位）和 `protocol_version`。**不需要 key。**<br>2026-09-20 加的，起因是同一天卡了两次：早上把「Railway 还没重新部署」当事实写进记录（其实没核实、它早就上线了），下午 Railway 一次部署真失败、服务停在 6 小时前的版本，而**从外面看不出来**（`/health` 不带版本、`/tools` 要 key）。<br>· `commit` 与 `main` 上的 SHA 不一致 → 部署没跟上，去 Railway 看那次 build 的日志。<br>· `protocol_version` 与 `skills/bywood-writing-desk/SKILL.md` 末尾那行不一致 → 运营手里那份 skill 该重新导入了。<br>· 显示 `unknown` → 只是这个诊断字段没取到值，**不代表服务不健康**（它刻意不参与 `ok`）。 |
 | **写手的 skill 是不是最新版** | `curl -H "X-Deskcore-Key: <你的 key>" https://autowriter-production.up.railway.app/skill-versions`（**要 key**，不放 `/health`：那里不鉴权，按 `app.py` 的规矩不许放业务数据）。`writers_24h` 是 24 小时内报上来的版本里最新 / 旧版 / 没报各几个——按「身份 × 版本」数，一个团队共用一个身份时读作「这 24 小时里有几种版本在用」，不是人数；`outdated_versions` 是旧版各是哪一版；只有计数，没有是谁。<br>2026-10-16 加的服务端探针（`deskcore/skillcheck.py`）：`open_project` / `comments_for` 带 `skill_version`、`get_protocol` 带 `local_version`。**2026-10-30 发布收尾起，提醒只看这一次调用报上来的版本**：最新不提醒；旧版（含认不出的值）在返回值里带 `skill_update`，`message` 末尾两行是升级入口（仓库里 skill 的地址 + `更新技能/bywood-writing-desk`），模型照抄给写手；没报（或报「无」这类占位）只记一笔计数、不提醒。其它工具不再捎提醒。不拦写稿。<br>原来按身份记版本、没报就沿用 12 小时内的记录或提醒「没核到版本」、其它工具 30 分钟抽查一次——一个团队共用一个身份时，一个人的旧 skill 让所有人收到提醒，重启后每场开头又报一句「没核到」，所以撤了。计数在进程内存里，重启清零。要找还在用旧版的人：看 `outdated_versions` 有没有值，在群里让大家各自看一眼 skill 里那一行。<br>**2026-11-11 起不带 key、重启之后也查得到**：每次存档那一行指标带 `meta.skill_versions`（就是这份计数），`open_project` / `comments_for` 的调用记录带 `meta.skill`（这一次报上来的是最新 / 旧版 / 没报），只读 SQL 见 `docs/deskcore.md` §3.8 末尾。 |
 | **每个工具调了几次、多久、怎么收场** | 只读 SQL 查 `autowriter.batch_metrics` 里 `meta->>'mode' = 'tool_call'` 的行（2026-11-11 起每次工具调用一行，只有数；查询在 `docs/deskcore.md` §3.8 末尾）。评论那一路判了几条、哪一样检查打回了几条也在这里（W-51 不用再翻网关日志）。写不进去不影响任何调用，只在服务日志里留一行 `工具调用留痕: 没写进库`（5 分钟最多一行）；要停就设 `DESKCORE_TOOL_CALL_LOG=0`。 |
@@ -316,6 +316,20 @@ JevforCoentent 仓的 judge 服务（`POST /judge_draft`），影子期只记不
 `dashboard_views_v1.sql`），理由写在迁移文件头。验收：`doctor` 里「视图 v_angle_outcomes」applied；
 `select count(*), count(note_id), count(*) filter (where tier in ('爆','大爆')) from autowriter.v_angle_outcomes`
 三个数说得通（第二个 ≤ 第一个）。
+
+### 1.19 `023_dedup_no_seqscan` —— 查重的两个函数不许走全表顺序扫描（2026-11-23，**生产库已执行，当天只读核过**）
+
+写手报「查重 `check_drafts` 连续报错（`APIError`）、交付不了」时先看这一条。服务日志搜 `code=57014`（语句超时，约 8.6 秒一次）：PostgREST 每条请求上限 8 秒，查重函数超时。原因和做法见 `docs/deskcore.md` §3.38。
+
+核（SQL Editor，两行、两个 true）：
+
+```sql
+select p.proname, coalesce('enable_seqscan=off' = any(p.proconfig), false) as no_seqscan
+from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'autowriter' and p.proname in ('deskcore_check_drafts', 'deskcore_commit_fingerprints');
+```
+
+是 false 就跑一次 `migrations/023_dedup_no_seqscan.sql`（可重跑，用 `postgres`），跑完马上生效，不用重新部署，写手在原来那场对话里再查一次重就行。2026-11-23 跑完的读数：一个项目最近 5 条指纹当稿子 19.3 秒 → 0.26 秒；最大的项目 10 篇一组 2.9 秒。以后要是又慢到 8 秒附近，先看 `pg_stat_statements` 里 `deskcore_check_drafts` 的最长用时，再看计划（`EXPLAIN` 取候选那一步是不是 `Bitmap Index Scan on draft_fp_ngram_gin_idx`）。
 
 ### 1.18 `022_lesson_exposure` —— 查重底稿上记这一场看到了哪几张经验卡；存完档在后台判人感题（2026-11-15，十三项第 3 / 7 项，**生产库还没跑**）
 

@@ -2586,6 +2586,18 @@ batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和�
 不变、只多 JSONB 的键不加列）。另外四条原有断言因为 batch 的 `params` 多了这个键跟着改：`tests/test_flywheel_arm.py` 的 `_commit`、
 `tests/test_deskcore_cli_ingest.py`、`tests/test_deskcore_ingest.py`、`tests/test_tv_sync.py`。
 
+### 3.38 查重的两个函数不许走全表顺序扫描（2026-11-23，`023`）
+
+**现象**：写作台 `check_drafts`、`score_drafts` 报 `APIError (ref …)`，服务日志是 `postgrest.exceptions.APIError code=57014`（语句超时），每次约 8.6 秒。写手那边的模型照协议「查重报错就停下、不当作通过」，交付不了。2026-11-18、11-22、11-23 都出现过，涉及三个项目；11-23 07:14–07:36 UTC 一个项目连着失败（`score_drafts` 也失败两次，它入库前会再查一次重）。
+
+**原因**：PostgREST 每条请求的上限是 8 秒（`authenticator` 角色的 `statement_timeout`，`service_role` 没有自己的设置，跟着它）。`019` 把取候选写成「先走四字串的 GIN 索引、再筛项目」（§3.27），可指纹表长到约 8,000 行（160 MB，四字串数组多存在 TOAST 里）之后，计划器估全表顺序扫描的成本（约 647）比走 `draft_fp_ngram_gin_idx`（约 741）低，因为它不算逐行解压数组的开销。实际顺序扫描一篇约 3.5 秒、走索引约 0.16 秒。2026-11-23 用生产库同一项目最近 5 条指纹当稿子只读复现：19.3 秒；同一事务里关掉顺序扫描后 0.54 秒，四路结果逐项相同。
+
+**做法**：`023` 给这两个函数各加 `SET enable_seqscan = off`，只在函数执行期间生效。函数体、签名、返回列、判定、阈值、授权、数据都不动；函数里另外几步（开头精确撞车、标题语义）本来就走索引；真没有索引可用的地方计划器照样能顺序扫描（只是估价变高），不会报错。基线 `000` 里同样两句。负责人 2026-11-23 让工程直接在生产库跑了：跑完只读核过两个函数的 `proconfig` 都带 `enable_seqscan=off`，同样 5 篇 0.26 秒；最大的项目（约 1,250 条指纹）10 篇一组 2.9 秒。
+
+**没做的**：调高 8 秒上限（掩盖慢、对所有服务都放宽）；把一批拆成一篇一次调用（每篇各给 8 秒，但慢的根子还在）。协议「查重报错就停下」不改：查重是硬闸，修的是它别报错。
+
+**以后看**：`pg_stat_statements` 里 `deskcore_check_drafts` 的平均和最长用时（2026-11-23 改之前：成功的 585 次平均 1.4 秒、最长 7.5 秒；超时的不进这张表）；服务日志里搜 `code=57014`。
+
 ## 4. 接入
 
 ### 4.1 部署
@@ -2635,8 +2647,9 @@ env：
 `011_angle_outcomes_view.sql` / `012_review_via_agent_provenance.sql` / `013_tv_edits.sql` / `014_tv_edit_diff_rev.sql` /
 `015_rule_compiles.sql` / `016_tv_notes_skip_vanished.sql` / `017_tv_link_text_fp.sql` /
 `018_draft_snapshots.sql` / `019_dedup_gin_first.sql` / `020_tv_link_gate.sql` /
-`021_style_distillation_cas.sql` / `022_lesson_exposure.sql`
-**二十二个，按编号顺序跑，别跳号**（建议先在
+`021_style_distillation_cas.sql` / `022_lesson_exposure.sql` /
+`023_dedup_no_seqscan.sql`
+**二十三个，按编号顺序跑，别跳号**（建议先在
 Supabase branch 库跑 + `get_advisors` 核验再进 prod）。每个各自不跑会怎样，看
 `migrations/README.md` 的清单表，那份是唯一真源。
 
@@ -2670,6 +2683,7 @@ runbook §0 当时写的是"schema 也上了生产"——这条命令就是为�
 - `011_angle_outcomes_view.sql`：视图 `v_angle_outcomes`，发牌台账用掉的坐标 → 那一版 → TV 笔记 → `tier`（§3.8 末尾）。**要用底表属主（Supabase 上就是 SQL Editor / `apply_migration` 的默认身份 `postgres`）跑**：视图以属主身份读三张 RLS-on 无 policy 的底表，换个普通角色建出来会永远 0 行且不报错，所以迁移先验当前角色、不够格当场报错。只 GRANT 给 `service_role`。库里没有 `truth_vault.notes` 时它只打 NOTICE 跳过，TV 落库后重跑。今天没有代码读它，缺了不坏任何功能；`doctor` 探得到。
 
 - `016_tv_notes_skip_vanished.sql`（2026-10-26，I-22）：`deskcore_tv_notes` 不再返回飞书里已删的篇（TV 的 `truth_vault.v_notes_vanished`，D-103），§3.7 表里「飞书已删」那一行。只换函数体，签名不变；视图不在就照旧全给。**静默错答**，和 `008` 同类：不跑不报错，已删的篇每晚照样被读回来重对，项目有补录目标时对不上的会被补录成副本。所以**先跑 016，再打开有已删篇的 TV 项目的补录目标**（10-26：BJS_phase1 挪走了 79 篇成人藻油，其中 14 篇是 unmatched）。`doctor` 报 `unprobeable` 并给出查函数体和视图的 SQL。
+- `023_dedup_no_seqscan.sql`（2026-11-23）：`deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 各加一个计划器开关 `enable_seqscan = off`（§3.38）。函数体、签名、授权、数据都不动。指纹表长到约 8,000 行之后，计划器绕开 GIN 索引改走全表顺序扫描，一批 5 篇十几秒，超过 PostgREST 的 8 秒上限，`check_drafts` / `score_drafts` 报 `APIError code=57014`、写手交付不了；2026-11-23 负责人让工程直接在生产库跑了，跑完 5 篇 19.3 秒 → 0.26 秒。`doctor` 探不到函数配置，报 `unprobeable` 并给出查的 SQL。
 - `022_lesson_exposure.sql`（2026-11-15，十三项第 3 项）：`draft_snapshots` 加一个可空的列 `lesson_exposure`（JSONB）——这次查重的那一场看到了哪几张经验卡、哪几条规律（§3.33）。不建表、不建函数、不发 GRANT、不碰数据。**可降级，先后都行**：没跑时记底稿那一步去掉这一列再写一次（警告一次）、tv-sync 读底稿退回原来那几列，行为和以前一样，`batches.params.lesson_exposure` 照样记；跑了之后最多十分钟自动用上，不用重新部署。`doctor` 探得到这一列。
 - `020_tv_link_gate.sql`（2026-11-12，回流闸 v1）：`tv_note_links` 加四个可空的列 `origin` / `gate` / `gate_reasons` / `gate_at`——每篇已发的帖是哪来的、能不能拿来学（`pass` / `fail` / `unsure` / `hold` / `withdrawn`）、原因名、最近一次判的时刻。取值、判的先后、哪个原因挡哪一路都在 `deskcore/postgate.py`；tv-sync 每晚最后一步（`core._tv_gate`）只 `UPDATE` 这四列，不碰对照本身的列。不建表、不建函数、不发 GRANT、不碰数据。**可降级，先于或后于部署都行**：没跑时那一步整步跳过，读结论的各处当作「没判过」，行为和以前一样。`doctor` 探这四列。
 - `019_dedup_gin_first.sql`（2026-11-11，W-21 / AU-F08）：`deskcore_check_drafts` 和 `deskcore_commit_fingerprints` 取候选先走四字串的 GIN 索引、再筛项目（§3.27）。只换函数体里这一步，签名、返回列、结论都不变，不碰数据。**不跑不坏，只是慢**（千行的项目每篇约 0.4 秒，10 篇一组三处各等 3~5 秒）；代码不依赖它，先于或后于部署都行。`doctor` 探不到函数体，报 `unprobeable` 并给出查两个记号的 SQL；跑完用文件末尾那句 `EXPLAIN` 核一次。
