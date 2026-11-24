@@ -156,6 +156,134 @@ def test_negative_lag_days_pairs_are_skipped():
     assert res["total_phrase_hits"] == 0
 
 
+def test_split_published_sentences_keep_phrase_without_false_removal():
+    """标点拆句保留候选词（含多句拆分与短片段拆分）不记词级删除；真删了才记。"""
+    # Split into two sentences where longest-overlapping fragment omits the opener
+    kept_split = [
+        {
+            "category": "CAT_SPLIT",
+            "draft_body": "老实讲今天下班我先去了菜市场然后买了苹果香蕉西瓜回家做饭。尾句普通收束。",
+            "published_body": "老实讲今天下班。记得我先去了菜市场然后买了苹果香蕉西瓜回家做饭。尾句普通收束。",
+        },
+        # Short (<4 chars) opener split off by exclamation mark
+        {
+            "category": "CAT_SPLIT",
+            "draft_body": "老实讲今天下班我先去了菜市场然后买了苹果香蕉西瓜回家做饭。尾句普通收束。",
+            "published_body": "老实讲！今天下班我先去了菜市场然后买了苹果香蕉西瓜回家做饭。尾句普通收束。",
+        },
+    ]
+    res_kept = pd.evaluate_phrase_edits(kept_split, ["老实讲"])
+    cat_kept = res_kept["categories"]["CAT_SPLIT"]
+    assert cat_kept["phrase_hits"] == 2
+    assert cat_kept["phrase_sentence_changed"] == 2
+    assert cat_kept["phrase_word_kept_on_edit"] == 2
+    assert cat_kept["phrase_word_removed"] == 0
+
+    # Split AND actually removed the candidate phrase -> must still count as removed
+    dropped_split = [
+        {
+            "category": "CAT_DROP",
+            "draft_body": "老实讲今天下班我先去了菜市场然后买了苹果香蕉西瓜回家做饭。尾句普通收束。",
+            "published_body": "今天下班我先去了菜市场。然后买了苹果香蕉西瓜回家做饭。尾句普通收束。",
+        }
+    ]
+    res_drop = pd.evaluate_phrase_edits(dropped_split, ["老实讲"])
+    assert res_drop["categories"]["CAT_DROP"]["phrase_word_removed"] == 1
+
+
+def test_unmatched_strata_cannot_pass_gate_via_raw_baseline():
+    """缺失同层对照（例如所有开头句都含候选词、没有不含词的开头对照）不得退回总体基线放行。"""
+    pairs = []
+    for cat in ("CAT_1", "CAT_2"):
+        for i in range(6):
+            pairs.append(
+                {
+                    "category": cat,
+                    "draft_body": f"其实说白了这段开场句第{i}版。中段写一句常规日常观察记录。结尾写一句常规日常收束。",
+                    "published_body": f"完全重写的开场表达版本{i}。中段写一句常规日常观察记录。结尾写一句常规日常收束。",
+                }
+            )
+    res = pd.evaluate_phrase_edits(pairs, ["其实说白了"], min_hits=5, min_lift=0.10, min_categories_for_go=2)
+    assert res["gate_passed"] is False
+    assert res["passing_categories"] == 0
+    for cat in ("CAT_1", "CAT_2"):
+        c = res["categories"][cat]
+        assert c["phrase_hits"] == 6
+        assert c["matched_phrase_hits"] == 0
+        assert c["unmatched_stratum_hits"] == 6
+        assert c["matched_coverage"] == 0.0
+        assert c["stratum_baseline_changed_rate"] is None
+        assert c["word_removal_lift"] is None
+        assert c["passed_category_gate"] is False
+
+
+def test_sparse_matched_controls_and_low_coverage_fail_gate():
+    """同层对照不足 min_hits 或匹配覆盖率不足时，品类照样不放行。"""
+    pairs = []
+    # 5 phrase-bearing openings + only 1 non-phrase opening (matched_controls = 1 < 5),
+    # despite many unchanged middle/closing sentences in OTHER strata.
+    for i in range(5):
+        pairs.append(
+            {
+                "category": "CAT_SPARSE",
+                "draft_body": f"其实说白了这段开场句第{i}版。中段写一句常规日常观察记录。结尾写一句常规日常收束。",
+                "published_body": f"完全重写的开场表达版本{i}。中段写一句常规日常观察记录。结尾写一句常规日常收束。",
+            }
+        )
+    pairs.append(
+        {
+            "category": "CAT_SPARSE",
+            "draft_body": "不含候选词的同等长度开场句。中段写一句常规日常观察记录。结尾写一句常规日常收束。",
+            "published_body": "不含候选词的同等长度开场句。中段写一句常规日常观察记录。结尾写一句常规日常收束。",
+        }
+    )
+    res = pd.evaluate_phrase_edits(pairs, ["其实说白了"], min_hits=5, min_lift=0.10, min_categories_for_go=1)
+    c = res["categories"]["CAT_SPARSE"]
+    assert c["matched_phrase_hits"] == 5
+    assert c["matched_non_phrase_sentences"] == 1
+    assert c["passed_category_gate"] is False
+    assert res["gate_passed"] is False
+
+    # Low coverage: 5 matched middle hits (+ 5 matched middle controls) + 5 unmatched opening hits -> coverage 0.5 < 0.8
+    mixed_pairs = []
+    for i in range(5):
+        mixed_pairs.append(
+            {
+                "category": "CAT_LOWCOV",
+                "draft_body": (
+                    f"其实说白了开场白版本{i}号。"
+                    f"其实说白了中段这一句也被删版本{i}号。"
+                    f"另外一段同样长度不含词中段句{i}号。"
+                    "结尾普通收束记录。"
+                ),
+                "published_body": (
+                    f"完全重写的新开场句子版本{i}号。"
+                    f"完全重写的新中段句子版本{i}号。"
+                    f"另外一段同样长度不含词中段句{i}号。"
+                    "结尾普通收束记录。"
+                ),
+            }
+        )
+    res_cov = pd.evaluate_phrase_edits(
+        mixed_pairs, ["其实说白了"], min_hits=5, min_lift=0.10, min_categories_for_go=1, min_matched_coverage=0.80
+    )
+    cc = res_cov["categories"]["CAT_LOWCOV"]
+    assert cc["phrase_hits"] == 10
+    assert cc["matched_phrase_hits"] == 5
+    assert cc["unmatched_stratum_hits"] == 5
+    assert cc["matched_coverage"] == 0.5
+    assert cc["passed_category_gate"] is False
+    assert res_cov["gate_passed"] is False
+
+
+def test_extract_candidate_phrases_respects_sentence_boundaries():
+    """跨句拼接不能造出假候选词：仅仅调换句序时候选清单必须为空。"""
+    drafts = ["今天下班去买菜。然后回家做晚饭。"] * 5
+    published = ["然后回家做晚饭。今天下班去买菜。"] * 5
+    cands = pd.extract_candidate_phrases(drafts, published, min_draft_docs=3, min_len=2, max_len=6, min_ratio=2.0)
+    assert cands == []
+
+
 def test_phrase_dryrun_has_no_llm_or_db_imports():
     """deskcore 铁律：纯计算模块不引入 LLM SDK 或数据库依赖。"""
     src = Path(__file__).resolve().parent.parent / "deskcore" / "phrase_dryrun.py"
@@ -167,3 +295,4 @@ def test_phrase_dryrun_has_no_llm_or_db_imports():
                 assert alias.name.split(".")[0] not in forbidden
         elif isinstance(node, ast.ImportFrom) and node.module:
             assert node.module.split(".")[0] not in forbidden
+
