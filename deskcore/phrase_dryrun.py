@@ -506,6 +506,7 @@ def _normalize_with_cuts(text: str) -> tuple[str, set[int]]:
 
 def _punct_only_flags(d_norms: list[str], clean_pub: str) -> list[bool]:
     """每一句是不是「只动了标点」: 把稿里各句(去标点)按序接起来, 和去标点的发布帖整篇对齐(SequenceMatcher)。
+    ``d_norms`` 要是整篇稿的全部片段(含不算句子的短片段), 调用方再挑出算句子的那几句。
 
     - 一句里有字被删或被换 → 不是。同一个说法在合句处只留了一份时, 对齐把删掉的那几个字记到哪一句, 哪一句就算改过。
     - 发布帖多出来的字落在一句中间 → 这一句不是。落在两句交界处时看发布帖的标点: 后面紧跟标点(「…放风筝呢。」)
@@ -582,7 +583,18 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
     d_grams = [tvlink.grams(s) for s in dsents]
     exact_draft = set(d_norms)
     exact_pub = {fp.normalize(p) for p in psents}
-    punct_only = _punct_only_flags(d_norms, clean_pub)
+    # 对齐要用整篇稿: tvlink.sentences 丢掉的 <SENT_MIN_CHARS 字短片段(「真好啊」)也接进去, 不然合句时它们的字
+    # 会被当成发布帖多出来的字。短片段只参与对齐, 不进返回、不进句子统计。
+    align_norms: list[str] = []
+    kept_at: list[int] = []
+    for raw in tvlink._SENT_SPLIT.split(clean_draft):
+        if not (n := fp.normalize(raw)):
+            continue
+        if len(n) >= tvlink.SENT_MIN_CHARS:
+            kept_at.append(len(align_norms))
+        align_norms.append(n)
+    align_flags = _punct_only_flags(align_norms, clean_pub)
+    punct_only = [align_flags[k] for k in kept_at]
     # Retain all punctuation-delimited published fragments (including short <6-char splits
     # such as a standalone 3-char opener) so split-sentence retention is detected accurately.
     pub_frags = [
@@ -868,11 +880,13 @@ def evaluate_phrase_edits(
         else:
             rows.append(pair)
 
+    # 两种角色合起来比: 核验那批的稿用了挑词那批的帖(或者反过来)也算重叠。
+    selection_keys = candidates.draft_keys | candidates.published_keys
     reused = sum(
         1
         for p in rows
-        if _text_key(p.get("draft_body")) in candidates.draft_keys
-        or _text_key(p.get("published_body")) in candidates.published_keys
+        if _text_key(p.get("draft_body")) in selection_keys
+        or _text_key(p.get("published_body")) in selection_keys
     )
     if reused:
         raise SplitViolation(

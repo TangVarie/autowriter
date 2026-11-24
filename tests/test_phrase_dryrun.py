@@ -412,6 +412,25 @@ def test_tiny_fragment_split_is_punct_only_and_fast():
     assert {x["outcome"] for x in out} == {"punct_only"}
 
 
+def test_short_draft_fragments_join_punct_only_alignment():
+    """tvlink.sentences 丢掉 <6 字的短片段(「真好啊」): 合句时这几个字不能被当成发布帖多出来的字。
+    两句字一个没变 → 都是 punct_only; 短片段本身不进句子统计。旁边真改了字的句子照样算改过。"""
+    draft = "今天下班我先去菜市场买水果。真好啊。然后回家做一顿普通晚饭。"
+    merged = "今天下班我先去菜市场买水果真好啊然后回家做一顿普通晚饭。"
+    assert [x["outcome"] for x in pd.classify_draft_sentences(draft, merged)] == ["punct_only", "punct_only"]
+
+    edited = "今天下班我先去菜市场买水果真好啊然后回家做一顿丰盛晚饭。"
+    assert [x["outcome"] for x in pd.classify_draft_sentences(draft, edited)] == ["punct_only", "edited"]
+
+    res = pd.evaluate_phrase_edits(
+        [{"category": "CAT_A", "draft_body": draft, "published_body": merged}], _manual("说句实话")
+    )
+    c = res["categories"]["CAT_A"]
+    assert c["total_sentences"] == 2
+    assert c["non_phrase_punct_only"] == 2
+    assert c["non_phrase_changed"] == 0
+
+
 # ── 句子分类: 拆句 / 合句 / 共用说法 ────────────────────────────────────────────────────────
 
 def test_split_published_sentences_keep_phrase_without_false_removal():
@@ -620,6 +639,34 @@ def test_reuse_check_alone_refuses_selection_rows_without_publish_times():
     assert cands.selected_through is None
     with pytest.raises(pd.SplitViolation):
         pd.evaluate_phrase_edits(rows, cands)
+
+
+def test_reuse_check_crosses_document_roles():
+    """核验那批的稿用了挑词那批的帖、或者核验那批的帖用了挑词那批的稿, 发布时间再晚也要拒绝。"""
+    select = [
+        {
+            "draft_body": f"挑词批的合成稿子第{i}篇写了一段日常记录。",
+            "published_body": f"挑词批的合成帖子第{i}篇发了一段日常记录。",
+            "publish_time": T0 + timedelta(days=i),
+        }
+        for i in range(3)
+    ]
+    cands = pd.select_candidate_phrases(select, min_draft_docs=1)
+    later = T0 + timedelta(days=30)
+    fresh = {
+        "category": "CAT_A",
+        "draft_body": "核验批的合成稿子写了一段全新的日常记录。",
+        "published_body": "核验批的合成帖子发了一段全新的日常记录。",
+        "publish_time": later,
+    }
+    pd.evaluate_phrase_edits([fresh], cands)          # 不重叠、时间也晚: 不拦
+
+    draft_reuses_pub = dict(fresh, draft_body=select[1]["published_body"])
+    with pytest.raises(pd.SplitViolation):
+        pd.evaluate_phrase_edits([draft_reuses_pub], cands)
+    pub_reuses_draft = dict(fresh, published_body=select[2]["draft_body"])
+    with pytest.raises(pd.SplitViolation):
+        pd.evaluate_phrase_edits([pub_reuses_draft], cands)
 
 
 def test_null_effect_does_not_pass_when_selection_and_verification_are_disjoint():
