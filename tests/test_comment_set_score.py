@@ -238,6 +238,28 @@ def test_comments_for_reads_the_cell_as_existing_comments():
     assert "existing_comments_note" not in out, "那一格的行不算进 TV 评论数的比较"
 
 
+def test_an_empty_cell_says_so_instead_of_staying_silent():
+    """11-24 写手反馈: 那一格在库里是空的时回包什么都不说, 模型就猜成「写作台没有读这一格的接口」。"""
+    out = core.comments_for(_client(cell=None), user_id=ME, link=LINK)
+    note = out["existing_comments_cell_note"]
+    assert f"「{COL}」那一格在库里是空的" in note and "每天同步一次" in note and "直接贴进对话" in note
+    assert "existing_comments_unread_note" not in out
+    out = core.comments_for(_client(cell="  \n\n "), user_id=ME, link=LINK)
+    assert "existing_comments_cell_note" in out, "只有空白的格子也算空"
+    out = core.comments_for(_client(cell=CELL), user_id=ME, link=LINK)
+    assert "existing_comments_cell_note" not in out, "格子里有内容就不说"
+    out = core.comments_for(_client(cfg=None, cell=None), user_id=ME, link=LINK)
+    assert "existing_comments_cell_note" not in out, "没配列的项目不说"
+
+
+def test_an_unreadable_cell_is_not_reported_as_empty(monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(store, "tv_note_extra_text", boom)
+    out = core.comments_for(_client(cell=None), user_id=ME, link=LINK)
+    assert "existing_comments_unread_note" in out and "existing_comments_cell_note" not in out
+
+
 def test_cell_lines_are_capped_and_only_real_numbering_is_stripped():
     lines = core._cell_lines("\n".join(f"第{k}条随便写写" for k in range(60)))
     assert len(lines) == core.CELL_LINES_MAX == 50 and lines[0] == "第0条随便写写"

@@ -416,6 +416,25 @@ def test_truncated_existing_comments_are_flagged():
     assert "existing_comments_note" not in out
 
 
+def test_reader_comments_in_the_count_are_explained_not_called_truncation():
+    """11-24 写手反馈: 平台 8 条评论、库里我们自己铺的 0 条时, 原来说「只列了按顺序的前 0 条」, 读着像截断或出错。"""
+    out = core.comments_for(_tv_client(notes=[dict(NOTE, comments_count=8)], comments=[]), user_id=ME, link=LINK)
+    note = out["existing_comments_note"]
+    assert "平台上有 8 条评论" in note and "读者评论按规矩不列" in note and "没有库里我们自己铺的评论" in note
+    assert "前 0 条" not in note and out["existing_comments"] == []
+    out = core.comments_for(_tv_client(notes=[dict(NOTE, comments_count=8)]), user_id=ME, link=LINK)
+    assert "我们自己铺的 2 条" in out["existing_comments_note"]
+
+
+def test_the_cap_still_says_only_the_first_rows_were_read(monkeypatch):
+    from deskcore import store as S
+    rows = [{"comment_id": f"c{k}", "note_id": NOTE["note_id"], "comment_order": k, "comment_role": "素人",
+             "content": f"第{k}条", "parent_comment_id": None, "is_pinned": False} for k in range(3)]
+    monkeypatch.setattr(S, "TV_COMMENTS_MAX", 3)
+    out = core.comments_for(_tv_client(notes=[dict(NOTE, comments_count=500)], comments=rows), user_id=ME, link=LINK)
+    assert "按顺序的前 3 条" in out["existing_comments_note"] and "500" in out["existing_comments_note"]
+
+
 def test_the_exact_link_is_found_past_the_first_page_and_underscore_is_literal():
     from deskcore import store as S
     noise = [dict(NOTE, note_id=f"x{i:03d}", publish_url=f"http://xhslink.com/o/ab_cd{i:03d}",
