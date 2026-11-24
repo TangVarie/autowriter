@@ -22,7 +22,7 @@ brief 向 TV 馆员服务 `POST /librarian` 借阅匹配的"真实爆款经验",
 |---|---|---|
 | `LIBRARIAN_URL` | 是(接飞轮时) | TV 馆员服务地址,例 `https://truth-vault-production.up.railway.app`。**TV 侧提供** |
 | `LIBRARIAN_API_KEY` | 是(接飞轮时) | 内部鉴权 key,作为 `X-Librarian-Key` 头发出。**TV 侧提供** |
-| `LIBRARIAN_TIMEOUT_SEC` | 否 | 借阅超时秒数，默认 `60`（D-074：8→30→60，前两次都不够；60 仍是 2 个样本的外推，按 TV `flywheel_librarian_cache.select_ms` 的 p95 重定）|
+| `LIBRARIAN_TIMEOUT_SEC` | 否 | 借阅的读超时秒数，默认 `60`（D-074：8→30→60，前两次都不够；60 仍是 2 个样本的外推，按 TV `flywheel_librarian_cache.select_ms` 的 p95 重定）；连接超时封顶 `min(3, read_t)` 秒（#177）|
 
 **两个值留空 = 不接飞轮**(写稿照常,只是少了"真实爆款参照"这一节)。
 
