@@ -130,11 +130,50 @@ def extract_candidate_phrases(
     return candidates[:top_k]
 
 
+def _anchor_span(ns: str, frag_grams: set[str]) -> tuple[int, int] | None:
+    """Return the (start, end) character span of shared 4-grams of a fragment inside ``ns``."""
+    lo_vals: list[int] = []
+    hi_vals: list[int] = []
+    for gm in frag_grams:
+        lo = ns.find(gm)
+        if lo != -1:
+            lo_vals.append(lo)
+            hi_vals.append(ns.rfind(gm) + 4)
+    if not lo_vals:
+        return None
+    return min(lo_vals), max(hi_vals)
+
+
+def _join_contiguous_runs(
+    indices: set[int], pub_frags: list[tuple[str, set[str]]]
+) -> tuple[str, ...]:
+    """Join only contiguous published fragment indices into runs so phrases spanning a
+    punctuation split boundary stay matchable without concatenating non-adjacent fragments."""
+    if not indices:
+        return ()
+    ordered = sorted(indices)
+    runs: list[str] = []
+    buf = [pub_frags[ordered[0]][0]]
+    prev = ordered[0]
+    for idx in ordered[1:]:
+        if idx == prev + 1:
+            buf.append(pub_frags[idx][0])
+        else:
+            runs.append("".join(buf))
+            buf = [pub_frags[idx][0]]
+        prev = idx
+    runs.append("".join(buf))
+    return tuple(runs)
+
+
 def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[str, Any]]:
     """把一篇稿子的每一句按 tvlink (DIFF_REV=2) 口径判成 unchanged / removed / edited。
 
     返回列表保留句序、分层键 ``(position, length_bucket)``，以及改写句在发布稿里对应的
-    全部重合片段 ``target_norms``（长句拆成多句时保留所有相关片段，避免把标点拆句误判成删词）。
+    全部重合片段 ``target_norms``：
+      - 按 ``tvlink.SENT_ALIGN`` 做排他性归属，防止两句共用同一短语时互相借词掩盖删除；
+      - 紧邻且方向一致的短片段（≤4 字、无法构成多个四字串）归回原句；
+      - 相邻归属片段按原序合并为连续片段，避免标点正好拆在候选词中间时误判为删词。
     """
     clean_draft = tvlink.strip_hashtags(draft_body)
     clean_pub = tvlink.strip_hashtags(published_body)
@@ -143,9 +182,10 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
         return []
     psents = tvlink.sentences(clean_pub)
     pg = tvlink.grams(clean_pub)
-    exact_draft = {fp.normalize(s) for s in dsents}
+    d_norms = [fp.normalize(s) for s in dsents]
+    d_grams = [tvlink.grams(s) for s in dsents]
+    exact_draft = set(d_norms)
     exact_pub = {fp.normalize(p) for p in psents}
-    pub_norm_full = fp.normalize(clean_pub)
     # Retain all punctuation-delimited published fragments (including short <6-char splits
     # such as a standalone 3-char opener) so split-sentence retention is detected accurately.
     pub_frags = [
@@ -154,11 +194,41 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
         if (pn := fp.normalize(raw))
     ]
 
-    total = len(dsents)
+    # Precompute exclusive fragment ownership across all draft sentences so an unrelated
+    # published sentence sharing only a 4-char candidate phrase cannot be borrowed.
+    n_draft = len(dsents)
+    n_pub = len(pub_frags)
+    ov_by_frag: list[dict[int, int]] = []
+    best_owners: list[set[int]] = []
+    strong_owners: list[set[int]] = [set() for _ in range(n_pub)]
+
+    for j, (pn, q) in enumerate(pub_frags):
+        ov: dict[int, int] = {}
+        if q:
+            for k in range(n_draft):
+                cnt = len(d_grams[k] & q)
+                if cnt:
+                    ov[k] = cnt
+        ov_by_frag.append(ov)
+        max_ov = max(ov.values(), default=0)
+        owners = {k for k, v in ov.items() if v == max_ov} if max_ov > 0 else set()
+        best_owners.append(owners)
+        distinct_owner_norms = {d_norms[k] for k in owners}
+        # Split / 1-to-1 fragment ownership: fragment has >=2 4-grams (>=5 chars), at least
+        # SENT_ALIGN of its 4-grams come from its unambiguous strongest draft owner.
+        if len(q) >= 2 and len(distinct_owner_norms) == 1 and max_ov / len(q) >= tvlink.SENT_ALIGN:
+            for k in owners:
+                strong_owners[j].add(k)
+        # Merge / 1-to-1 with additions: at least SENT_ALIGN of draft sentence k lives in frag j.
+        for k, cnt in ov.items():
+            if d_grams[k] and cnt / len(d_grams[k]) >= tvlink.SENT_ALIGN:
+                strong_owners[j].add(k)
+
     out: list[dict[str, Any]] = []
     for idx, sent in enumerate(dsents):
-        ns = fp.normalize(sent)
-        stratum = (sentence_position(idx, total), length_bucket(len(ns)))
+        ns = d_norms[idx]
+        g = d_grams[idx]
+        stratum = (sentence_position(idx, n_draft), length_bucket(len(ns)))
         if not tvlink._kept(sent, pg):
             outcome = "removed"
             target_norms: tuple[str, ...] = ()
@@ -168,34 +238,81 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
         else:
             outcome = "edited"
             if pub_frags:
-                g = tvlink.grams(sent)
-                raw_overlap = {i for i, (_, q) in enumerate(pub_frags) if g & q}
-                # Prefer fragments not already verbatim-owned by a different draft sentence.
-                overlap_indices = {
-                    i
-                    for i in raw_overlap
-                    if not (pub_frags[i][0] in exact_draft and pub_frags[i][0] != ns)
-                } or raw_overlap
-                if overlap_indices:
-                    selected = set(overlap_indices)
-                    # Fragments shorter than 4 chars cannot form 4-grams; include contiguous
-                    # short neighbors that appear verbatim inside this draft sentence.
+                matched: set[int] = set()
+                spans: dict[int, tuple[int, int]] = {}
+                for j in range(n_pub):
+                    if idx not in strong_owners[j]:
+                        continue
+                    pn, q = pub_frags[j]
+                    # Skip a fragment that is a verbatim copy of another draft sentence unless
+                    # this sentence itself has >= SENT_ALIGN of its 4-grams inside it.
+                    if pn in exact_draft and pn != ns:
+                        if not (g and ov_by_frag[j].get(idx, 0) / len(g) >= tvlink.SENT_ALIGN):
+                            continue
+                    matched.add(j)
+                    sp = _anchor_span(ns, g & q)
+                    if sp is not None:
+                        spans[j] = sp
+
+                selected = set(matched)
+                if selected:
+                    # Expand directionally across contiguous short (<=4 chars) or tied/expanded
+                    # split fragments not strongly owned by a different draft sentence.
                     frontier = list(selected)
                     while frontier:
                         cur = frontier.pop()
-                        for nb in (cur - 1, cur + 1):
-                            if 0 <= nb < len(pub_frags) and nb not in selected:
-                                nb_norm = pub_frags[nb][0]
-                                if len(nb_norm) < 4 and nb_norm in ns:
+                        cur_span = spans.get(cur)
+                        if cur_span is None:
+                            continue
+                        cur_lo, cur_hi = cur_span
+                        for direction, nb in ((-1, cur - 1), (1, cur + 1)):
+                            if not (0 <= nb < n_pub) or nb in selected:
+                                continue
+                            if any(d_norms[o] != ns for o in strong_owners[nb]):
+                                continue
+                            nb_norm, nb_q = pub_frags[nb]
+                            if len(nb_norm) <= 4:
+                                if direction < 0:
+                                    pos = ns.rfind(nb_norm, 0, cur_lo)
+                                else:
+                                    pos = ns.find(nb_norm, cur_hi)
+                                if pos != -1:
                                     selected.add(nb)
+                                    spans[nb] = (pos, pos + len(nb_norm))
                                     frontier.append(nb)
-                    target_norms = tuple(pub_frags[i][0] for i in sorted(selected))
+                            elif idx in best_owners[nb] and ov_by_frag[nb].get(idx, 0) >= 2:
+                                nb_span = _anchor_span(ns, g & nb_q)
+                                if nb_span is not None and (
+                                    (direction < 0 and nb_span[1] <= cur_lo + 3)
+                                    or (direction > 0 and nb_span[0] >= cur_hi - 3)
+                                ):
+                                    selected.add(nb)
+                                    spans[nb] = nb_span
+                                    frontier.append(nb)
+                    target_norms = _join_contiguous_runs(selected, pub_frags)
                 else:
-                    # Sentence was split/merged so no single fragment kept a 4-gram even though
-                    # _kept(sent, pg) was True; fall back to full normalized published body.
-                    target_norms = (pub_norm_full,) if pub_norm_full else ()
+                    # Fallback when a sentence was split into tiny (<=4-char) pieces so no
+                    # individual fragment met SENT_ALIGN: search shortest contiguous window
+                    # of fragments not strongly owned by a different draft sentence.
+                    found_window: tuple[str, ...] = ()
+                    max_win = min(n_pub, 12)
+                    for win_len in range(2, max_win + 1):
+                        for start in range(n_pub - win_len + 1):
+                            if any(
+                                d_norms[o] != ns
+                                for j in range(start, start + win_len)
+                                for o in strong_owners[j]
+                            ):
+                                continue
+                            joined = "".join(pub_frags[j][0] for j in range(start, start + win_len))
+                            if tvlink._kept(sent, tvlink.grams(joined)):
+                                found_window = (joined,)
+                                break
+                        if found_window:
+                            break
+                    target_norms = found_window
             else:
-                target_norms = (pub_norm_full,) if pub_norm_full else ()
+                target_norms = ()
         out.append(
             {
                 "index": idx,

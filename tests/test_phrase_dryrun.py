@@ -190,6 +190,56 @@ def test_split_published_sentences_keep_phrase_without_false_removal():
     res_drop = pd.evaluate_phrase_edits(dropped_split, ["老实讲"])
     assert res_drop["categories"]["CAT_DROP"]["phrase_word_removed"] == 1
 
+    # Candidate phrase itself split by punctuation -> adjacent corresponding fragments keep it
+    boundary_split = [
+        {
+            "category": "CAT_BOUNDARY",
+            "draft_body": "老实讲今天下班我先去了菜市场然后买了苹果香蕉西瓜回家做饭。尾句普通收束。",
+            "published_body": "老实讲！今天下班我先去了菜市场然后买了苹果香蕉西瓜回家做饭。尾句普通收束。",
+        }
+    ]
+    res_b = pd.evaluate_phrase_edits(boundary_split, ["老实讲今天"])
+    cb = res_b["categories"]["CAT_BOUNDARY"]
+    assert cb["phrase_hits"] == 1
+    assert cb["phrase_word_kept_on_edit"] == 1
+    assert cb["phrase_word_removed"] == 0
+
+
+def test_unrelated_sentence_sharing_four_char_phrase_cannot_mask_removal():
+    """两句共用同一 ≥4 字候选短语时，前句删词不得借后句（即便后句微调）掩盖删除。"""
+    # Second sentence has minor edit ("呢") so it is not verbatim in exact_draft
+    pairs = [
+        {
+            "category": "CAT_SHARED",
+            "draft_body": (
+                "说句实话今天下班我先去了菜市场买了苹果然后回家做饭。"
+                "说句实话昨天周末我在公园跑步看见小朋友一起开心放风筝。"
+            ),
+            "published_body": (
+                "今天下班我先去了菜市场买了苹果然后回家做饭。"
+                "说句实话昨天周末我在公园跑步看见小朋友一起开心放风筝呢。"
+            ),
+        },
+        # Second sentence splits off its own leading "说句实话！" right after first sentence:
+        # directional check must keep it on the second sentence, not borrow onto the first.
+        {
+            "category": "CAT_SHARED",
+            "draft_body": (
+                "说句实话今天下班我先去了菜市场买了苹果然后回家做饭。"
+                "说句实话昨天周末我在公园跑步看见小朋友一起开心放风筝。"
+            ),
+            "published_body": (
+                "今天下班我先去了菜市场买了苹果然后回家做饭。"
+                "说句实话！昨天周末我在公园跑步看见小朋友一起开心放风筝。"
+            ),
+        },
+    ]
+    res = pd.evaluate_phrase_edits(pairs, ["说句实话"])
+    c = res["categories"]["CAT_SHARED"]
+    assert c["phrase_hits"] == 4
+    assert c["phrase_word_removed"] == 2
+    assert c["phrase_word_kept_on_edit"] == 2
+
 
 def test_unmatched_strata_cannot_pass_gate_via_raw_baseline():
     """缺失同层对照（例如所有开头句都含候选词、没有不含词的开头对照）不得退回总体基线放行。"""
