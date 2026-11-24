@@ -22,6 +22,9 @@
   4. **两边同一个口径。** 带说法的句子和对照句都看「被删, 或者内容被改」(D-166 原话「带这些说法的句子被删改的比例」)。
      只动了标点的(合句、拆句、换标点, 字一个没变)两边都不算改(``punct_only``)。「说法本身不见了」只作诊断输出, 不放行。
      切句和 tvlink 同一套(``tvlink.sentences``, DIFF_REV=2); tvlink.edit_diff 那边合句照旧算改过, 这里不动它。
+     它丢掉的 <6 字短片段不算句子、不进句子统计, 但挑词的文档频率和「只动标点」的对齐都把它们算上(按标点切, 不跨片段)。
+     所以说法只落在稿里一个 <6 字短片段里时, 挑词会数到它, 核验却不把它算命中句(短片段不是计数单位): 有意如此,
+     结果只会是命中更少、更难过闸, 不会把读数抬高; 要改成算, 得连句子统计口径和分层一起改。
   5. **候选说法。** 只算整段都是「稿里多出来的」那几个字(跨到发布帖里还留着的字上的碎片不算); 同一处删改的重叠碎片
      只留排在最前的一个; 跟调用方给的品牌 / 产品叫法(``exclude_terms``)连着重合两个字以上的不要。
 """
@@ -179,13 +182,15 @@ def split_pairs_by_time(
     )
 
 
-def _doc_sentences(texts: Iterable[str], min_len: int) -> list[list[str]]:
+def _doc_fragments(texts: Iterable[str]) -> list[list[str]]:
+    """每篇按 tvlink 的标点切开、去标点后的全部片段。不像 ``tvlink.sentences`` 那样丢掉不到 ``SENT_MIN_CHARS`` 字的
+    短片段: 「说白了！」单独成段时稿和帖两边的文档频率都要算上它, 不然只动了标点就像删了说法(帖那边), 真删了又
+    看不见(稿那边)。n-gram 只在一个片段里取, 不跨片段。"""
     docs: list[list[str]] = []
     for raw in texts:
-        clean = tvlink.strip_hashtags(raw)
-        sents = [ns for s in tvlink.sentences(clean) if len(ns := fp.normalize(s)) >= min_len]
-        if sents:
-            docs.append(sents)
+        frags = [ns for s in tvlink._SENT_SPLIT.split(tvlink.strip_hashtags(raw)) if (ns := fp.normalize(s))]
+        if frags:
+            docs.append(frags)
     return docs
 
 
@@ -233,7 +238,8 @@ def extract_candidate_phrases(
 ) -> list[dict[str, Any]]:
     """从写作台稿 vs 发布帖里按文档频率筛出「稿子常用、发布少用」的候选说法。
 
-    - n-gram 严格在 ``tvlink.sentences`` 句边界内抽取(绝不跨句拼接), 与 ``evaluate_phrase_edits`` 的句内检索同口径。
+    - n-gram 严格在 tvlink 的标点片段内抽取(绝不跨片段拼接), 与 ``evaluate_phrase_edits`` 的句内检索一样不跨标点;
+      不到 ``tvlink.SENT_MIN_CHARS`` 字的短片段也算(见 ``_doc_fragments``)。
     - 只认整段都是「稿里多出来的」那几个字: 一处出现里只要碰到一个在发布帖里还留着的四字串(``CONTEXT_GRAM``,
       稿和帖里出现得差不多多), 这一处就不算。删掉「说白了」时, 跨到后面正文上的「白了这款…」这种碎片因此不会进来。
     - 同一处删改的重叠碎片只留一个: 按过度使用比、篇数、长度排好, 超过 ``DEDUP_OVERLAP_SHARE`` 的稿里和排在前面的
@@ -247,8 +253,8 @@ def extract_candidate_phrases(
     if min_len < 2 or max_len < min_len or top_k <= 0:
         return []
 
-    draft_docs = _doc_sentences(draft_texts, min_len)
-    pub_docs = _doc_sentences(published_texts, min_len)
+    draft_docs = _doc_fragments(draft_texts)
+    pub_docs = _doc_fragments(published_texts)
     if not draft_docs or not pub_docs:
         return []
 

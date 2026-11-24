@@ -704,11 +704,34 @@ def test_extract_candidate_phrases_finds_overused_draft_phrases():
     assert pd.extract_candidate_phrases(drafts, [], min_draft_docs=3) == []
 
 
+def test_short_published_fragment_counts_toward_published_docs():
+    """发布帖用标点把说法单独隔成 <6 字的一段(「说白了！」), 说法其实都还在: 不能当成删了说法挑出来。"""
+    drafts = [f"说白了今天记录第{i}条合成观察样本内容。" for i in range(5)]
+    published = [f"说白了！今天记录第{i}条合成观察样本内容。" for i in range(5)]
+    assert pd.extract_candidate_phrases(drafts, published, min_draft_docs=3) == []
+    # 对照: 帖里真删了说法, 照样挑出来
+    removed = [f"今天记录第{i}条合成观察样本内容。" for i in range(5)]
+    assert [c["phrase"] for c in pd.extract_candidate_phrases(drafts, removed, min_draft_docs=3)] == ["说白了"]
+
+
+def test_short_draft_fragment_counts_toward_draft_docs():
+    """稿里说法单独成 <6 字的一段(「说白了！」)、发布时真删了: 稿那边也要数到它; 只把它并回下一句(只动标点)不算。"""
+    drafts = [f"说白了！今天记录第{i}条合成观察样本内容。" for i in range(5)]
+    removed = [f"今天记录第{i}条合成观察样本内容。" for i in range(5)]
+    cands = pd.extract_candidate_phrases(drafts, removed, min_draft_docs=3)
+    assert [(c["phrase"], c["draft_docs"], c["published_docs"]) for c in cands] == [("说白了", 5, 0)]
+    merged = [f"说白了今天记录第{i}条合成观察样本内容。" for i in range(5)]
+    assert pd.extract_candidate_phrases(drafts, merged, min_draft_docs=3) == []
+
+
 def test_extract_candidate_phrases_respects_sentence_boundaries():
     """跨句拼接不能造出假候选词：仅仅调换句序时候选清单必须为空。"""
     drafts = ["今天下班去买菜。然后回家做晚饭。"] * 5
     published = ["然后回家做晚饭。今天下班去买菜。"] * 5
     assert pd.extract_candidate_phrases(drafts, published, min_draft_docs=3) == []
+    # 短片段也一样不跨段拼接
+    assert pd.extract_candidate_phrases(["说白了！今天下班去买菜。"] * 5, ["今天下班去买菜。说白了！"] * 5,
+                                        min_draft_docs=3) == []
 
 
 def test_extract_candidate_phrases_collapses_fragments_of_one_edit():
