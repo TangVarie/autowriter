@@ -204,6 +204,34 @@ def test_split_published_sentences_keep_phrase_without_false_removal():
     assert cb["phrase_word_kept_on_edit"] == 1
     assert cb["phrase_word_removed"] == 0
 
+    # Sentence split entirely into <=4-char fragments must retain the full run (not truncate early)
+    tiny_split = [
+        {
+            "category": "CAT_TINY",
+            "draft_body": "今天下班记得早点回家做饭。",
+            "published_body": "今天下班。记得早点。回家做饭。",
+        }
+    ]
+    res_tiny = pd.evaluate_phrase_edits(tiny_split, ["回家做饭"])
+    ct = res_tiny["categories"]["CAT_TINY"]
+    assert ct["phrase_hits"] == 1
+    assert ct["phrase_word_kept_on_edit"] == 1
+    assert ct["phrase_word_removed"] == 0
+
+    # Adjacent tiny-split sentences sharing a 4-char opener: removal in first is not masked by second
+    tiny_shared = [
+        {
+            "category": "CAT_TINY_SHARED",
+            "draft_body": "说句实话今天下班记得早点回家做饭。说句实话昨天周末去公园放风筝。",
+            "published_body": "今天下班。记得早点。回家做饭。说句实话。昨天周末。去公园。放风筝。",
+        }
+    ]
+    res_ts = pd.evaluate_phrase_edits(tiny_shared, ["说句实话"])
+    cts = res_ts["categories"]["CAT_TINY_SHARED"]
+    assert cts["phrase_hits"] == 2
+    assert cts["phrase_word_removed"] == 1
+    assert cts["phrase_word_kept_on_edit"] == 1
+
 
 def test_unrelated_sentence_sharing_four_char_phrase_cannot_mask_removal():
     """两句共用同一 ≥4 字候选短语时，前句删词不得借后句（即便后句微调）掩盖删除。"""

@@ -397,25 +397,38 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
                     target_norms = _join_contiguous_runs(selected, owner_texts)
                 else:
                     # Fallback when a sentence was split into tiny (<=4-char) pieces so no
-                    # individual fragment met SENT_ALIGN: search shortest contiguous window
-                    # of fragments not strongly owned by a different draft sentence.
-                    found_window: tuple[str, ...] = ()
-                    max_win = min(n_pub, 12)
-                    for win_len in range(2, max_win + 1):
-                        for start in range(n_pub - win_len + 1):
-                            if any(
-                                d_norms[o] != ns
-                                for j in range(start, start + win_len)
-                                for o in strong_owners[j]
-                            ):
-                                continue
-                            joined = "".join(pub_frags[j][0] for j in range(start, start + win_len))
-                            if tvlink._kept(sent, tvlink.grams(joined)):
-                                found_window = (joined,)
+                    # individual fragment met SENT_ALIGN: among contiguous runs of fragments not
+                    # strongly owned by a different draft sentence, pick the qualifying window
+                    # maximizing order-preserving matched characters (>=2-char blocks) and
+                    # breaking ties by shortest length so trailing unrelated fragments are not
+                    # pulled in.
+                    best_window: tuple[str, ...] = ()
+                    best_score: tuple[int, int] = (-1, 0)
+                    max_win = min(n_pub, max(12, len(ns)))
+                    for start in range(n_pub):
+                        if any(d_norms[o] != ns for o in strong_owners[start]):
+                            continue
+                        parts: list[str] = []
+                        for end in range(start, min(n_pub, start + max_win)):
+                            if any(d_norms[o] != ns for o in strong_owners[end]):
                                 break
-                        if found_window:
-                            break
-                    target_norms = found_window
+                            parts.append(pub_frags[end][0])
+                            win_len = end - start + 1
+                            if win_len < 2:
+                                continue
+                            joined = "".join(parts)
+                            if not tvlink._kept(sent, tvlink.grams(joined)):
+                                continue
+                            matched_len = sum(
+                                blk.size
+                                for blk in SequenceMatcher(None, ns, joined, autojunk=False).get_matching_blocks()
+                                if blk.size >= 2
+                            )
+                            score = (matched_len, -win_len)
+                            if score > best_score:
+                                best_score = score
+                                best_window = (joined,)
+                    target_norms = best_window
             else:
                 target_norms = ()
         out.append(
