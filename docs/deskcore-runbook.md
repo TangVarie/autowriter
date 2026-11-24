@@ -1184,7 +1184,7 @@ curl -sS "$DESKCORE_URL/health" | jq
 | 字段 | 它真正说明的 | 它**不**说明的 |
 |---|---|---|
 | `config.embeddings.ok` | google-genai SDK 装了、client **构造得起来**（`clients.py:107` `get_genai_client() is not None`） | key 有没有效、有没有欠费、配额用没用尽。**这三种情况它照样 `true`** |
-| `config.librarian.configured` | `LIBRARIAN_URL` 这个环境变量非空 | 地址对不对、key 对不对、服务活没活 |
+| `config.librarian.configured` | `LIBRARIAN_URL` 与 `LIBRARIAN_API_KEY` 两个环境变量都非空 | 地址对不对、key 有没有效、服务活没活 |
 
 也就是说：跟着 `/health` 全绿走下去，`borrow_lessons` 可能一直静默返回空列表，
 `backfill` 可能一条向量都没取到。所以这两项要**各自实打实探一次**：

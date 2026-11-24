@@ -795,7 +795,9 @@ def comments_for(link: str = "", project_id: str = "", post_title: str = "", pos
       · source —— ``tv``(按链接找到)/ ``tv_by_text``(按贴来的正文对上, 带一句 ``tv_by_text_note``; 用户说不是这一篇
         就别用它的 ``existing_comments``, 照贴来的正文写)/ ``pasted``
       · existing_comments —— 帖子下已有的评论(TV 里找到了才有): 别重复里面已经问过的事、用过的说法。项目配了飞书那一列时,
-        这条帖子那一格里已有的维护评论也在里面(``source`` 是列名)
+        这条帖子那一格里已有的维护评论也在里面(``source`` 是列名)。那一格在库里是空的时带 ``existing_comments_cell_note``
+        (库里的飞书数据每天同步一次, 当天才填的还没进来; 用户手边有就贴进对话, 别说成读不了这一格);
+        ``existing_comments_note`` 说平台上的评论数和这里列的为什么对不上(读者评论不列, 或只取了前面一部分)
       · comment_rules —— 本项目管评论的规则, 必须守; 和 style、comment_set 说法不一样的以那两样为准。「评论区：」开头的、
         开头那一句说的是评论的、存的 check 查评论的都在这里(硬约束也是: 在这里的不再重复列进 hard_rules)
       · hard_rules —— 本项目的硬约束(合规话术、禁词), 评论一样要守; 说每篇都要带品牌的, 评论里几条提品牌照 comment_set

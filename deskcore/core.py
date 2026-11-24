@@ -4827,6 +4827,7 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
                     for r in rows if (r.get("content") or "").strip()]
     tv_existing = len(existing)
     cell_unread = False
+    cell_empty = False
     column = (cfg or {}).get("column")
     if note is not None and column:
         try:
@@ -4834,6 +4835,7 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
         except Exception:                               # noqa: BLE001 — 只是少一份参照, 不拦写评论
             logger.exception("comments_for: 读帖子那一格已有的维护评论失败 (note=%s)", note.get("note_id"))
             cell, cell_unread = [], True
+        cell_empty = not cell and not cell_unread
         existing += [{"order": None, "role": None, "is_reply": False, "text": line, "source": column} for line in cell]
     counted = _comment_set_counts(cfg)
     next_step = ((COMMENTS_FOR_SET_SLOTS if counted else "按 slots 每位写一条(贴主答疑那条回 q1), ")
@@ -4864,6 +4866,10 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
         out["comment_set_note"] = cfg_note
     if cell_unread:
         out["existing_comments_unread_note"] = f"这次没读到这条帖子「{column}」那一格里已有的评论, 只能对着上面这些避开重复。"
+    if cell_empty:
+        # 11-24 写手反馈: 那一格在库里是空的时回包什么都不说, 模型就猜成「写作台没有读这一格的接口」, 叫用户去截图。
+        # 其实是库里的飞书数据每天同步一次, 当天才填的还没进来。说清楚, 也说清楚用户手边有就直接贴。
+        out["existing_comments_cell_note"] = CELL_EMPTY_NOTE.format(column=column)
     if note is not None:
         out["note_id"] = note.get("note_id")
         out["tier"] = note.get("tier")
@@ -4873,12 +4879,24 @@ def comments_for(client, *, user_id: str | None, link: str = "", project_id: str
             out["tv_note_vanished"] = True
             out["tv_note_vanished_note"] = TV_VANISHED_BY_TEXT_NOTE if note.get(TV_BY_TEXT_FLAG) else TV_VANISHED_NOTE
         total = note.get("comments_count")
-        if len(rows) >= store.TV_COMMENTS_MAX or (isinstance(total, int) and total > tv_existing):
+        if len(rows) >= store.TV_COMMENTS_MAX:
             # 只取了前 TV_COMMENTS_MAX 条(codex review on aw#107): 说出来, 别让模型以为这就是全部
             out["existing_comments_note"] = (
                 f"这条帖子有 {total if isinstance(total, int) else '更多'} 条评论, 这里只列了按顺序的前 "
                 f"{tv_existing} 条; 避开重复时以这些为准, 后面的没看到。")
+        elif isinstance(total, int) and total > tv_existing:
+            # 平台上的评论数里有读者评论和回复; 读者评论按规矩不列(W-59)。11-24 写手反馈: 原来那句「只列了按顺序的前
+            # 0 条」读着像截断了、或者工具出错, 模型就叫用户把评论贴过来。说成数的是什么、列的是什么。
+            out["existing_comments_note"] = (
+                f"这条帖子在平台上有 {total} 条评论(读者的评论和回复都算在里面); 读者评论按规矩不列, existing_comments "
+                + (f"里只列了库里我们自己铺的 {tv_existing} 条" if tv_existing else "里没有库里我们自己铺的评论")
+                + "; 避开重复时以列出来的为准, 不用叫用户去截读者评论。")
     return out
+
+
+# comments_for: 项目配了维护评论那一列、这条帖子那一格在库里是空的时给模型的一句(2026-11-24)。
+CELL_EMPTY_NOTE = ("这条帖子「{column}」那一格在库里是空的。库里的飞书数据每天同步一次, 当天才填进去的要等下一次同步才看得到; "
+                   "用户手边有这一格的内容, 可以直接贴进对话, 照着避开重复。不要说成写作台读不了这一格。")
 
 
 def _slot_of(value, by_id: dict) -> dict | None:
