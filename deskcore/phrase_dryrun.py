@@ -515,9 +515,13 @@ def _punct_only_flags(d_norms: list[str], clean_pub: str) -> list[bool]:
     ``d_norms`` 要是整篇稿的全部片段(含不算句子的短片段), 调用方再挑出算句子的那几句。
 
     - 一句里有字被删或被换 → 不是。同一个说法在合句处只留了一份时, 对齐把删掉的那几个字记到哪一句, 哪一句就算改过。
-    - 发布帖多出来的字落在一句中间 → 这一句不是。落在两句交界处时看发布帖的标点: 后面紧跟标点(「…放风筝呢。」)
-      算前一句加的; 前面紧跟标点算后一句加的; 前后都有标点是单独加的一句, 两边都不算; 前后都没有, 两边都算改过。
-    只调了句序的句子(不是原样一句、又被合 / 拆过)会被算成改过 —— 宁可多算改, 不少算。
+    - 发布帖多出来的字(纯插入, 也包括替换时换进来的字)落在一句中间 → 这一句不是。落在两句交界处时看发布帖的标点:
+      前面没标点、贴着前一句 → 前一句改过; 后面没标点、贴着后一句 → 后一句改过; 前后都有标点是单独加的一句, 两边
+      都不算。前后都没有标点时分不清是谁的, 两边都算改过(替换在合句处也一样: 「买水果。回家」→「买香蕉接着回家」
+      后一句也算改过)。
+    - 纯删 / 纯插两头挨着的字一样时, 同样短的对齐有好几种摆法; 挑最合句界和标点的那种, 一样合的几种都算上。
+    拿不准就算改过, 宁可多算改, 不少算: 只调了句序的句子(不是原样一句、又被合 / 拆过)也会被算成改过。判的是
+    最省改动的那种对齐: 合句处删掉的字恰好又在别处加了回来(「…新很。天夏去春花」→「…新很春花」)时, 认不出来。
     """
     n = len(d_norms)
     flags = [True] * n
@@ -541,25 +545,65 @@ def _punct_only_flags(d_norms: list[str], clean_pub: str) -> list[bool]:
                 hi = mid - 1
         return lo
 
-    for tag, i1, i2, j1, j2 in SequenceMatcher(None, joined, norm_pub, autojunk=False).get_opcodes():
+    bounds = set(starts) | {len(joined)}
+
+    def _draft_side(i1: int, i2: int) -> set[int]:
+        # 稿这边被删 / 被换掉的字: 落在哪几句, 哪几句改过。
+        return set(range(_owner(i1), _owner(i2 - 1) + 1)) if i2 > i1 else set()
+
+    def _pub_side(i1: int, i2: int, j1: int, j2: int) -> set[int]:
+        # 帖这边多出来的字(insert, 以及 replace 换进来的那一侧): 前一句 / 后一句是稿里紧挨着这段字前后的那两句。
+        # replace 也要看这一侧: 「买水果。回家」→「买香蕉。接着回家」是一个 replace, 换进来的「接着」贴在后一句开头。
+        if j2 == j1:
+            return set()
+        prev = _owner(i1 - 1) if i1 > 0 else None
+        nxt = _owner(i2) if i2 < len(joined) else None
+        if prev is not None and prev == nxt:
+            return {prev}   # 落在一句中间
+        hit = set()
+        if prev is not None and j1 not in cuts:
+            hit.add(prev)
+        if nxt is not None and j2 not in cuts:
+            hit.add(nxt)
+        return hit
+
+    ops = SequenceMatcher(None, joined, norm_pub, autojunk=False).get_opcodes()
+    taken = 0   # 上一处删 / 插往右挪时用掉了后面那段相同字里的几个字
+    for k, (tag, i1, i2, j1, j2) in enumerate(ops):
         if tag == "equal":
             continue
-        if i2 > i1:
-            for k in range(_owner(i1), _owner(i2 - 1) + 1):
-                flags[k] = False
-            continue
-        nxt = _owner(i1) if i1 < len(joined) else None
-        if nxt is not None and starts[nxt] != i1:
-            flags[nxt] = False
-            continue
-        prev = (nxt - 1 if nxt is not None else n - 1) if i1 > 0 else None
-        left_cut, right_cut = j1 in cuts, j2 in cuts
-        if left_cut and right_cut:
-            continue
-        if prev is not None and not left_cut:
-            flags[prev] = False
-        if nxt is not None and not right_cut:
-            flags[nxt] = False
+        if tag == "replace":
+            hit = _draft_side(i1, i2) | _pub_side(i1, i2, j1, j2)
+            taken = 0
+        else:
+            # 纯删 / 纯插两头挨着的字一样时可以整段左右挪(「去买了，真是累坏了。」加进来那句末尾的「了」既能对稿里前一句
+            # 末尾的「了」, 也能对它自己), 对齐只给其中一种。把每种挪法都列出来, 挑最合标点和句界的: 插入点在稿的句界、
+            # 两头落在帖的标点上(删: 删掉的那段两头在稿的句界、帖里那个位置有标点)。一样合的几种都算上 —— 拿不准就算改过。
+            left = ops[k - 1][2] - ops[k - 1][1] - taken if k and ops[k - 1][0] == "equal" else 0
+            right = ops[k + 1][2] - ops[k + 1][1] if k + 1 < len(ops) and ops[k + 1][0] == "equal" else 0
+            seq, lo, hi = (norm_pub, j1, j2) if tag == "insert" else (joined, i1, i2)
+            shifts = [0]
+            while -shifts[-1] < left and seq[lo + shifts[-1] - 1] == seq[hi + shifts[-1] - 1]:
+                shifts.append(shifts[-1] - 1)
+            s = 0
+            while s < right and seq[lo + s] == seq[hi + s]:
+                s += 1
+                shifts.append(s)
+            scored = []
+            for s in shifts:
+                if tag == "insert":
+                    i, ja, jb = i1 + s, j1 + s, j2 + s
+                    fit = (i in bounds) + (ja in cuts) + (jb in cuts)
+                    scored.append((fit, s, _pub_side(i, i, ja, jb)))
+                else:
+                    ia, ib = i1 + s, i2 + s
+                    fit = (ia in bounds) + (ib in bounds) + (j1 + s in cuts)
+                    scored.append((fit, s, _draft_side(ia, ib)))
+            best = max(fit for fit, _, _ in scored)
+            hit = set().union(*(h for fit, _, h in scored if fit == best))
+            taken = max((s for fit, s, _ in scored if fit == best and s > 0), default=0)
+        for idx in hit:
+            flags[idx] = False
     return flags
 
 

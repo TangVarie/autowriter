@@ -402,6 +402,49 @@ def test_punctuation_only_merges_do_not_inflate_the_baseline():
         assert c["passed_category_gate"] is True
 
 
+_A = "今天下班我先去菜市场买水果"
+_B = "回家做一顿普通晚饭"
+# (说明, 稿, 帖, 每一句的判法)。标「修」的两组是 Codex 第四轮那次修的(修之前判错), 其余几行把各种交界情况钉住。
+_BOUNDARY_CASES = [
+    # 修: replace 换进来的那一侧也要归属。稿那边只换了前一句的字, 帖那边多出来的字贴在后一句开头 / 前一句末尾。
+    ("替换前句末尾+后句开头加字", f"{_A}。{_B}。", "今天下班我先去菜市场买香蕉。接着回家做一顿普通晚饭。",
+     ["edited", "edited"]),
+    ("替换后句开头+前句末尾加字", f"{_A}。{_B}。", f"{_A}啦。到家做一顿普通晚饭。", ["edited", "edited"]),
+    ("短片段换了字贴到前句", f"{_A}。哈哈。{_B}。", f"{_A}嘿嘿。{_B}。", ["edited", "unchanged"]),
+    ("短片段换了字贴到后句", f"{_A}。哈哈。{_B}。", f"{_A}。嘿嘿{_B}。", ["unchanged", "edited"]),
+    ("合句处替换, 没标点, 两边都算", f"{_A}。{_B}。", "今天下班我先去菜市场买香蕉接着回家做一顿普通晚饭。",
+     ["edited", "edited"]),
+    ("合句处替换后句开头, 没标点, 两边都算", f"{_A}。{_B}。", f"{_A}到家做一顿普通晚饭。", ["edited", "edited"]),
+    # 修: 纯插 / 纯删两头的字一样时对齐可以左右挪, 要挑合标点和句界的摆法。
+    ("单独加的一句末字和前句末字一样", "今天下班去买了。回家做一顿普通的家常晚饭吧。",
+     "今天下班去买了，真是累坏了。回家做一顿普通的家常晚饭吧。", ["punct_only", "unchanged"]),
+    ("后句开头加的字末字和前句末字一样", "今天下班去买了。回家做一顿普通的家常晚饭。",
+     "今天下班去买了。累了回家做一顿普通的家常晚饭。", ["unchanged", "edited"]),
+    ("删掉和前句结尾一样的短片段再合句", "今天真开心哈哈。哈哈。明天继续努力工作吧。", "今天真开心哈哈明天继续努力工作吧。",
+     ["punct_only", "punct_only"]),
+    ("合句处同一个说法只留一份, 看逗号算前句删的", "今天下班我先去菜市场买水果说句实话。说句实话回家做一顿普通晚饭。",
+     "今天下班我先去菜市场买水果，说句实话回家做一顿普通晚饭。", ["edited", "punct_only"]),
+    # 其余交界情况(之前就对)
+    ("前句末尾加字", f"{_A}。{_B}。", f"{_A}呢。{_B}。", ["edited", "unchanged"]),
+    ("后句开头加字", f"{_A}。{_B}。", f"{_A}。接着{_B}。", ["unchanged", "edited"]),
+    ("两句之间单独加一句", f"{_A}。{_B}。", f"{_A}。真开心。{_B}。", ["unchanged", "unchanged"]),
+    ("一句中间插进单独一句", f"{_A}。{_B}。", f"今天下班我先去。真开心。菜市场买水果。{_B}。", ["edited", "unchanged"]),
+    ("合句处加字, 没标点, 两边都算", f"{_A}。{_B}。", f"{_A}真开心{_B}。", ["edited", "edited"]),
+    ("只合句", f"{_A}。{_B}。", f"{_A}{_B}。", ["punct_only", "punct_only"]),
+    ("只拆句", f"{_A}。{_B}。", "今天下班我先去。菜市场买水果。回家做一顿。普通晚饭。", ["punct_only", "punct_only"]),
+    ("删掉整个短片段再合句", f"{_A}。哈哈。{_B}。", f"{_A}，{_B}。", ["punct_only", "punct_only"]),
+    ("删掉整个短片段, 后句改了", f"{_A}。哈哈。{_B}。", f"{_A}。回家做一顿普通的晚饭。", ["unchanged", "edited"]),
+    ("一处替换跨两句", f"{_A}。{_B}。", "今天下班我先去菜市场买香蕉。到家做一顿普通晚饭。", ["edited", "edited"]),
+]
+
+
+@pytest.mark.parametrize("label,draft,pub,want", _BOUNDARY_CASES, ids=[c[0] for c in _BOUNDARY_CASES])
+def test_punct_only_alignment_at_fragment_boundaries(label, draft, pub, want):
+    """交界处的每种对齐(删 / 插 / 替换, 跨句、贴着句头句尾、整段短片段): 真改了字的不能判成 punct_only,
+    只动了标点的不能判成改过; 合句处没标点分不清的两边都算改过。"""
+    assert [x["outcome"] for x in pd.classify_draft_sentences(draft, pub)] == want
+
+
 def test_tiny_fragment_split_is_punct_only_and_fast():
     """发布版每 3 个字切一刀、字没改(review F6 的慢例): 整篇都判成 punct_only, 不走兜底窗口枚举。"""
     body = "。".join(f"这是第{i}句合成的日常记录内容用来测试切分速度的样本文字" for i in range(80)) + "。"
