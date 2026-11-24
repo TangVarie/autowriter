@@ -241,6 +241,53 @@ def test_unrelated_sentence_sharing_four_char_phrase_cannot_mask_removal():
     assert c["phrase_word_kept_on_edit"] == 2
 
 
+def test_merged_fragment_checks_each_owner_slice_separately():
+    """两句合并成一句时，只从第一句删掉候选词不得被第二句保留的词掩盖。"""
+    pairs = [
+        # Standard order: s0 removes phrase, s1 keeps phrase, merged with comma
+        {
+            "category": "CAT_MERGE",
+            "draft_body": (
+                "说句实话今天下班我先去了菜市场买了苹果然后回家做饭。"
+                "说句实话昨天周末我在公园跑步看见小朋友一起开心放风筝。"
+            ),
+            "published_body": (
+                "今天下班我先去了菜市场买了苹果然后回家做饭，"
+                "说句实话昨天周末我在公园跑步看见小朋友一起开心放风筝。"
+            ),
+        },
+        # Reversed order merge: s1 (kept) moved before s0 (removed)
+        {
+            "category": "CAT_MERGE",
+            "draft_body": (
+                "说句实话今天下班我先去了菜市场买了苹果然后回家做饭。"
+                "说句实话昨天周末我在公园跑步看见小朋友一起开心放风筝。"
+            ),
+            "published_body": (
+                "说句实话昨天周末我在公园跑步看见小朋友一起开心放风筝，"
+                "今天下班我先去了菜市场买了苹果然后回家做饭。"
+            ),
+        },
+        # Shared phrase at s0 tail & s1 head collapsed into a single occurrence: 1 kept + 1 removed
+        {
+            "category": "CAT_MERGE",
+            "draft_body": (
+                "今天下班我先去了菜市场买了苹果回家做饭说句实话。"
+                "说句实话昨天周末我在公园跑步看见小朋友一起放风筝。"
+            ),
+            "published_body": (
+                "今天下班我先去了菜市场买了苹果回家做饭，"
+                "说句实话昨天周末我在公园跑步看见小朋友一起放风筝。"
+            ),
+        },
+    ]
+    res = pd.evaluate_phrase_edits(pairs, ["说句实话"])
+    c = res["categories"]["CAT_MERGE"]
+    assert c["phrase_hits"] == 6
+    assert c["phrase_word_removed"] == 3
+    assert c["phrase_word_kept_on_edit"] == 3
+
+
 def test_unmatched_strata_cannot_pass_gate_via_raw_baseline():
     """缺失同层对照（例如所有开头句都含候选词、没有不含词的开头对照）不得退回总体基线放行。"""
     pairs = []

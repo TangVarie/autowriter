@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from difflib import SequenceMatcher
 from typing import Any, Iterable, Mapping
 
 from . import fingerprint as fp
@@ -144,8 +145,91 @@ def _anchor_span(ns: str, frag_grams: set[str]) -> tuple[int, int] | None:
     return min(lo_vals), max(hi_vals)
 
 
+def _matched_chars(a: str, b: str) -> int:
+    if not a or not b:
+        return 0
+    return sum(blk.size for blk in SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks())
+
+
+def _partition_merged_fragment(
+    pn: str,
+    q: set[str],
+    owners: set[int],
+    d_norms: list[str],
+    d_grams: list[set[str]],
+) -> dict[int, tuple[str, bool, bool]]:
+    """Slice a merged published fragment across its distinct draft-sentence owners so
+    a phrase retained in one merged sentence cannot mask its removal from another.
+    Returns ``{owner_idx: (slice_text, at_left_edge, at_right_edge)}``."""
+    # Group by distinct normalized draft sentence (duplicate draft sentences share a rep).
+    by_norm: dict[str, list[int]] = {}
+    for k in sorted(owners):
+        by_norm.setdefault(d_norms[k], []).append(k)
+    if len(by_norm) <= 1:
+        return {k: (pn, True, True) for k in owners}
+
+    reps = [idxs[0] for idxs in by_norm.values()]
+    positioned: list[tuple[int, int, int, int, int]] = []
+    unpositioned: list[int] = []
+    for k in reps:
+        other_grams = set().union(*(d_grams[o] for o in reps if o != k))
+        shared = d_grams[k] & q
+        anchor_g = (shared - other_grams) or shared
+        c_span = _anchor_span(pn, anchor_g)
+        d_span = _anchor_span(d_norms[k], anchor_g)
+        if c_span is None or d_span is None:
+            unpositioned.append(k)
+        else:
+            positioned.append((c_span[0], c_span[1], d_span[0], d_span[1], k))
+
+    if len(positioned) <= 1:
+        return {k: (pn, True, True) for k in owners}
+
+    positioned.sort(key=lambda t: (t[0], t[1]))
+    cuts: list[int] = [0]
+    for i in range(len(positioned) - 1):
+        p_clo, p_chi, _p_dlo, p_dhi, p_k = positioned[i]
+        n_clo, n_chi, n_dlo, _n_dhi, n_k = positioned[i + 1]
+        if p_chi <= n_clo:
+            prev_tail = d_norms[p_k][p_dhi:]
+            nxt_head = d_norms[n_k][:n_dlo]
+            best_cut = p_chi
+            best_score = -1
+            for cand in range(p_chi, n_clo + 1):
+                score = _matched_chars(prev_tail, pn[p_chi:cand]) + _matched_chars(
+                    nxt_head, pn[cand:n_clo]
+                )
+                if score > best_score:
+                    best_score = score
+                    best_cut = cand
+            cut = best_cut
+        else:
+            # Overlapping unique cores (e.g., shared phrase collapsed once at merge boundary):
+            # cut at an owner's full match edge rather than chopping the shared phrase in half.
+            prev_full_end = min(len(pn), p_chi + max(0, len(d_norms[p_k]) - p_dhi))
+            nxt_full_start = max(0, n_clo - n_dlo)
+            if prev_full_end <= n_chi:
+                cut = prev_full_end
+            else:
+                cut = max(p_clo, nxt_full_start)
+        cuts.append(max(cuts[-1], min(len(pn), cut)))
+    cuts.append(len(pn))
+
+    out: dict[int, tuple[str, bool, bool]] = {}
+    last_pos = len(positioned) - 1
+    for pos_idx, (_, _, _, _, rep_k) in enumerate(positioned):
+        piece = pn[cuts[pos_idx] : cuts[pos_idx + 1]]
+        entry = (piece, pos_idx == 0, pos_idx == last_pos)
+        for k in by_norm[d_norms[rep_k]]:
+            out[k] = entry
+    for rep_k in unpositioned:
+        for k in by_norm[d_norms[rep_k]]:
+            out[k] = (pn, True, True)
+    return out
+
+
 def _join_contiguous_runs(
-    indices: set[int], pub_frags: list[tuple[str, set[str]]]
+    indices: set[int], frag_texts: list[str]
 ) -> tuple[str, ...]:
     """Join only contiguous published fragment indices into runs so phrases spanning a
     punctuation split boundary stay matchable without concatenating non-adjacent fragments."""
@@ -153,14 +237,14 @@ def _join_contiguous_runs(
         return ()
     ordered = sorted(indices)
     runs: list[str] = []
-    buf = [pub_frags[ordered[0]][0]]
+    buf = [frag_texts[ordered[0]]]
     prev = ordered[0]
     for idx in ordered[1:]:
         if idx == prev + 1:
-            buf.append(pub_frags[idx][0])
+            buf.append(frag_texts[idx])
         else:
             runs.append("".join(buf))
-            buf = [pub_frags[idx][0]]
+            buf = [frag_texts[idx]]
         prev = idx
     runs.append("".join(buf))
     return tuple(runs)
@@ -172,6 +256,7 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
     返回列表保留句序、分层键 ``(position, length_bucket)``，以及改写句在发布稿里对应的
     全部重合片段 ``target_norms``：
       - 按 ``tvlink.SENT_ALIGN`` 做排他性归属，防止两句共用同一短语时互相借词掩盖删除；
+      - 多句合并成一句时按各原句在发布句里的位置切分归属区段，防止合并后另一句保留的词掩盖本句删词；
       - 紧邻且方向一致的短片段（≤4 字、无法构成多个四字串）归回原句；
       - 相邻归属片段按原序合并为连续片段，避免标点正好拆在候选词中间时误判为删词。
     """
@@ -224,6 +309,13 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
             if d_grams[k] and cnt / len(d_grams[k]) >= tvlink.SENT_ALIGN:
                 strong_owners[j].add(k)
 
+    # For any published fragment owned by multiple distinct draft sentences (a merged sentence),
+    # partition the fragment text so each owner only checks its own corresponding slice.
+    merged_slices: dict[int, dict[int, tuple[str, bool, bool]]] = {}
+    for j, (pn, q) in enumerate(pub_frags):
+        if len({d_norms[k] for k in strong_owners[j]}) > 1:
+            merged_slices[j] = _partition_merged_fragment(pn, q, strong_owners[j], d_norms, d_grams)
+
     out: list[dict[str, Any]] = []
     for idx, sent in enumerate(dsents):
         ns = d_norms[idx]
@@ -250,7 +342,9 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
                         if not (g and ov_by_frag[j].get(idx, 0) / len(g) >= tvlink.SENT_ALIGN):
                             continue
                     matched.add(j)
-                    sp = _anchor_span(ns, g & q)
+                    slice_text = merged_slices[j][idx][0] if j in merged_slices else pn
+                    slice_q = tvlink.grams(slice_text) if j in merged_slices else q
+                    sp = _anchor_span(ns, g & slice_q)
                     if sp is not None:
                         spans[j] = sp
 
@@ -265,7 +359,14 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
                         if cur_span is None:
                             continue
                         cur_lo, cur_hi = cur_span
+                        at_left, at_right = (
+                            (merged_slices[cur][idx][1], merged_slices[cur][idx][2])
+                            if cur in merged_slices and idx in merged_slices[cur]
+                            else (True, True)
+                        )
                         for direction, nb in ((-1, cur - 1), (1, cur + 1)):
+                            if (direction < 0 and not at_left) or (direction > 0 and not at_right):
+                                continue
                             if not (0 <= nb < n_pub) or nb in selected:
                                 continue
                             if any(d_norms[o] != ns for o in strong_owners[nb]):
@@ -289,7 +390,11 @@ def classify_draft_sentences(draft_body: str, published_body: str) -> list[dict[
                                     selected.add(nb)
                                     spans[nb] = nb_span
                                     frontier.append(nb)
-                    target_norms = _join_contiguous_runs(selected, pub_frags)
+                    owner_texts = [
+                        merged_slices[j][idx][0] if j in merged_slices and idx in merged_slices[j] else pub_frags[j][0]
+                        for j in range(n_pub)
+                    ]
+                    target_norms = _join_contiguous_runs(selected, owner_texts)
                 else:
                     # Fallback when a sentence was split into tiny (<=4-char) pieces so no
                     # individual fragment met SENT_ALIGN: search shortest contiguous window
