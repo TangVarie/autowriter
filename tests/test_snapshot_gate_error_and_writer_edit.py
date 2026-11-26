@@ -401,3 +401,163 @@ def test_versions_for_linking_carries_the_batch_via_as_its_last_key():
     assert all(list(r)[-1] == "via" for r in got.values())
     assert tvlink.Version.from_row(got["v1"]).via == "record_edit"
     assert tvlink.Version.from_row({"version_id": "x", "title": "t", "body": "b"}).via is None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 复审(2026-11-26): 写手手改版只兜底; 混着的组; 空白; 日志; 对照上的说明; 报表; 改稿版不沿用 via
+# ══════════════════════════════════════════════════════════════════════
+
+# 写手改了两句的正文(和 BODY_S 大半一样): 帖贴的是这一版
+EDITED_S = BODY_S.replace("补给站的香蕉早就吃完了", "补给站的香蕉早被前面的人拿光了").replace("撑到终点", "一路咬牙撑到终点")
+# AI 那一版被写手整篇换掉了: 和帖几乎没有一样的字
+AI_FAR = ("这一版是模型最早给的稿子, 讲的是城市夜跑的装备清单和配速表, 和最后发出去的那篇骑行几乎没有一个四字串一样。"
+          "写手看完觉得不对味, 自己从头写了一篇骑行的, 再用 record_edit 报给写作台。") * 2
+
+
+def _ai_snap(title, body):
+    return _snap("s1", title, body, days=0, check="c1")           # 查重通过、带 KEY、臂 patterns
+
+
+def _we_snap(title, body, days=0.5):
+    return _snap("s2", title, body, days=days, key=None, status="writer_edit", check="e1",
+                 flywheel_arm=None, flywheel_arm_source=None)
+
+
+def _outcome(c, out):
+    l1 = _links(c)["n1"]
+    _, batch = _batch_of(c, l1)
+    led = c.rows["angle_ledger"][0]["consumed_version_id"]
+    diffs = _diff_rows(c)
+    return {"kind": l1["match_kind"], "version": l1["version_id"], "via": batch["params"]["via"],
+            "arm": batch["params"].get("flywheel_arm"), "consumed": out["snapshots"]["angles_consumed"],
+            "ledger": led, "diff": [(d["changed"], d["diff_rev"]) for d in diffs],
+            "note": [e["note"] for e in l1["candidates"] or () if str(e.get("note", "")).startswith("W-38: ")]}
+
+
+@pytest.mark.parametrize("ai_title, ai_body, my_title, my_body", [
+    ("AI 写的标题", BODY_S, "我改的标题", BODY_S),          # 只改了标题: record_edit 记 (my_title, ai_body)
+    ("AI 写的标题", BODY_S, "AI 写的标题", EDITED_S)],      # 正文改了两句
+    ids=["title_only", "light_body_edit"])
+def test_a_writer_edit_never_steals_the_post_from_the_keyed_ai_snapshot(ai_title, ai_body, my_title, my_body):
+    """AI 那一版查过重(带 KEY)、写手改完 record_edit、帖贴的是手改版: 和 B 之前一模一样 —— 连 AI 那份底稿、销牌、记臂、
+    算 AI → 发出去的改稿差异; 写手手改版那一行留着不转正(复审 11-26: 以前它离帖最近, 总是它赢)。"""
+    ai, we = _ai_snap(ai_title, ai_body), _we_snap(my_title, my_body)
+    post = [_note("n1", my_title, my_body)]
+    c0 = _client(post, [dict(ai)])
+    before = _outcome(c0, core.tv_sync(c0, TV))
+    c = _client(post, [dict(ai), dict(we)])
+    out = core.tv_sync(c, TV)
+    after = _outcome(c, out)
+    assert after == before, "多了一行写手手改版, 结果不变"
+    assert after["version"] == _vid(ai) and after["via"] == "snapshot" and after["arm"] == "patterns"
+    assert after["consumed"] == 1 and after["ledger"] == _vid(ai), "牌照销: 连的是带 KEY 的 AI 底稿"
+    assert after["diff"] and after["diff"][0][1] == tvlink.DIFF_REV, "AI → 发出去的改稿差异照算"
+    assert after["note"] == [core.SNAPSHOT_NOTE]
+    state = {r["id"]: r["promoted_at"] for r in c.rows["draft_snapshots"]}
+    assert state["s1"] and state["s2"] is None, "手改版那一行留着(过 45 天不再参与、60 天删)"
+    assert out["snapshots"]["writer_edit"] == 0
+
+
+def test_a_post_only_the_writer_edit_matches_still_falls_back_to_it():
+    """AI 那一版被写手整篇换掉(对不上帖), 只有手改版对得上: 照旧兜底转正, via = record_edit, 不销牌、不算改稿差异;
+    对照上的说明写的是 record_edit, 不是「查重时记下的」。"""
+    ai, we = _ai_snap("AI 写的标题", AI_FAR), _we_snap("骑了一百公里", BODY_S)
+    c = _client([_note("n1", "骑了一百公里", BODY_S)], [ai, we])
+    out = core.tv_sync(c, TV)
+    got = _outcome(c, out)
+    assert got["version"] == _vid(we) and got["via"] == "record_edit" and got["arm"] is None
+    assert got["consumed"] == 0 and got["ledger"] is None and got["diff"] == []
+    assert got["note"] == [core.SNAPSHOT_NOTE_WRITER_EDIT] and core.SNAPSHOT_NOTE not in got["note"]
+    assert out["snapshots"]["writer_edit"] == 1 and out["snapshots"]["matched_notes"] == 1
+    state = {r["id"]: r["promoted_at"] for r in c.rows["draft_snapshots"]}
+    assert state["s1"] is None and state["s2"]
+
+
+def test_an_undated_post_that_only_a_writer_edit_matches_is_held_not_ingested():
+    we = _we_snap("骑了一百公里", BODY_S)
+    c = _client([_note("n1", "骑了一百公里", BODY_S, publish_time=None)], [_ai_snap("AI 写的标题", AI_FAR), we])
+    out = core.tv_sync(c, TV)
+    assert out["snapshots"]["undated"] == 1 and _links(c)["n1"]["match_kind"] == "unmatched"
+    assert len(c.rows["versions"]) == 1, "没补录成副本: 填了日期还认得回手改版"
+
+
+def test_the_cli_says_how_many_posts_matched_a_writer_edit(capsys):
+    c = _client([_note("n1", "骑了一百公里", BODY_S)], [_writer_edit_snap()])
+    args = type("A", (), {"tv_project": TV, "all": False, "dry_run": False, "write_tv": False,
+                          "since": None, "rematch": False})()
+    from deskcore import cli
+    assert cli._tv_sync(core, c, args) == 0
+    assert "其中 1 篇对上的是 record_edit 记下的写手手改版" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("writer_edit_first", [True, False])
+def test_a_mixed_group_is_an_ordinary_snapshot_with_the_arm_of_its_first_checked_row(writer_edit_first):
+    """手改版和查重的行 text_fp 一样(模型查过的正是写手改后的字): 照普通底稿转正(via = snapshot, 销牌, 算改稿差异);
+    臂取第一次不是 writer_edit 的那一行, 先记了哪一行都一样(复审 11-26)。这是有意的口径, 钉在这里。"""
+    we = _we_snap("我改的标题", BODY_S, days=0 if writer_edit_first else 0.4)
+    chk = _snap("s3", "我改的标题", BODY_S, days=0.2, check="c3")
+    c = _client([_note("n1", "我改的标题", BODY_S)], [we, chk])
+    out = core.tv_sync(c, TV)
+    got = _outcome(c, out)
+    assert got["via"] == "snapshot" and got["arm"] == "patterns" and got["consumed"] == 1
+    assert got["diff"] and got["note"] == [core.SNAPSHOT_NOTE] and out["snapshots"]["writer_edit"] == 0
+    (g,) = core._snapshot_groups([we, chk]).values()
+    assert (g["flywheel_arm"], g["flywheel_arm_source"]) == ("patterns", "borrow")
+    (g,) = core._snapshot_groups([_writer_edit_snap()]).values()
+    assert g["flywheel_arm"] is None, "只有手改版的组没有臂(就算那一行带着)"
+
+
+def test_whitespace_only_my_fields_fall_back_to_the_ai_side():
+    c = _rec_client()
+    out = _edit(c, my_body="  \n")                         # 正文只给了空白: 当没给, 用 AI 那一版
+    assert out["stored"] is True
+    _edit(c, my_title="   ", my_body=BODY_S)               # 标题只给了空白
+    assert [(r["title"], r["body"]) for r in c.rows["draft_snapshots"]] == [
+        ("我改的标题", BODY_A), ("AI 写的标题", BODY_S)]
+
+
+def test_a_failed_gate_error_snapshot_logs_only_the_exception_type(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    c = _desk()
+    boom = RuntimeError(f"57014 canceling statement while scanning {SECRET}2")
+    monkeypatch.setattr(core, "_gate", lambda *a, **k: (_ for _ in ()).throw(boom))
+
+    def insert_fails(*a, **k):
+        raise RuntimeError(f'{{"code":"23502","details":"Failing row contains (x, {SECRET})."}}')
+    monkeypatch.setattr(store, "insert_draft_snapshots", insert_fails)
+    with pytest.raises(RuntimeError) as ei:
+        core.check_drafts(c, P1, [{"title": "t", "body": BODY_S + SECRET}], user_id=WRITER, record_snapshot=True)
+    assert ei.value is boom
+    assert "记底稿也失败" in caplog.text and "RuntimeError" in caplog.text
+    assert SECRET not in caplog.text and "Traceback" not in caplog.text, \
+        "只记异常的类型: 插入失败的那行字、查重原来那个异常都不进日志"
+
+
+def test_a_later_revision_on_a_record_edit_item_does_not_inherit_the_via():
+    """via 是 batch 的, 「这是写手自己的字」只对转正建的那一版(version_num 1)成立: 同一个 item 后来加的改稿版照常算差异。"""
+    params = {"source": "deskcore", "via": "record_edit"}
+    v1 = {"id": "v1", "title": "t", "body": BODY_S, "version_num": 1, "created_at": _iso(0)}
+    v2 = {"id": "v2", "title": "t2", "body": BODY_A, "version_num": 2, "created_at": _iso(1)}
+    c = FakeClient(rows={"items": [
+        {"id": "i1", "best_version_id": "v2", "created_at": _iso(0), "versions": [v1, v2],
+         "batches": {"project_id": P1, "params": params}},
+        {"id": "i2", "best_version_id": "v3", "created_at": _iso(0),
+         "versions": [{"id": "v3", "title": "t3", "body": BODY_OTHER, "version_num": 1, "created_at": _iso(0)}],
+         "batches": {"project_id": P1, "params": params}}]})
+    got = {r["version_id"]: r["via"] for r in store.versions_for_linking(c, P1)}
+    assert got == {"v2": None, "v3": "record_edit"}
+    assert store.version_via({"batches": {"params": params}}, {"id": "x"}) == "record_edit", "读不到 version_num 当 1"
+
+
+def test_the_exposure_report_skips_record_edit_batches():
+    from deskcore import exposurereport
+    from tests.test_lesson_exposure import _RecordingBatches
+    rows = [{"id": "old", "project_id": "p", "created_at": "2026-11-01T00:00:00", "params": {"source": "deskcore"}},
+            {"id": "snap", "project_id": "p", "created_at": "2026-11-02T00:00:00",
+             "params": {"source": "deskcore", "via": "snapshot", store.SNAPSHOT_EXPOSURE_COL: {"cards": ["c1"]}}},
+            {"id": "edit", "project_id": "p", "created_at": "2026-11-03T00:00:00",
+             "params": {"source": "deskcore", "via": "record_edit"}}]
+    sb = type("SB", (), {"table": lambda self, name: _RecordingBatches(rows, [])})()
+    out = store.report_exposure_batches(sb, 30)
+    assert [b["id"] for b in out] == ["old", "snap"], "写手手改版转正的 batch 故意没有 lesson_exposure, 不进这张表"
+    assert exposurereport.report(out)["batches"]["before_feature"] == 1, "「这个功能之前的批次」只剩真在之前的"

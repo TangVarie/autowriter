@@ -3345,7 +3345,7 @@ REPORT_EXPOSURE_BATCH_CAP = 5000
 
 def report_exposure_batches(sb, days: int, project_id: str | None = None,
                             cap: int = REPORT_EXPOSURE_BATCH_CAP) -> list[dict] | None:
-    """近 ``days`` 天写作台自己建的 batch(存档的和底稿转正的; 补录副本不算): ``[{"id", "project_id", "created_at",
+    """近 ``days`` 天写作台自己建的 batch(存档的和底稿转正的; 补录副本、只由写手手改版转正的不算): ``[{"id", "project_id", "created_at",
     "exposure"}]``, 旧的在前。``exposure`` 是 ``params.lesson_exposure``: dict = 记下了; None = 那一批不知道(进程重启过 /
     没借过卡); 没有这个键的(这个功能之前的批次)记 ``"absent"``。读挂了回 None。"""
     since = iso_ago(max(int(days), 1))
@@ -3361,6 +3361,10 @@ def report_exposure_batches(sb, days: int, project_id: str | None = None,
     for r in rows:
         params = _as_params(r.get("params"))
         if not r.get("id") or params.get("source") != "deskcore":
+            continue
+        if params.get("via") == "record_edit":
+            # 只由 record_edit 记下的写手手改版转正的(2026-11-26): 是人写的字, 故意不记 lesson_exposure —— 不跳过的话没有这个键,
+            # 会被当成「这个功能之前的批次」, 每晚越攒越多(复审 11-26)
             continue
         exposure = params.get(SNAPSHOT_EXPOSURE_COL, "absent")
         out.append({"id": str(r["id"]), "project_id": str(r.get("project_id") or ""), "created_at": r.get("created_at"),
@@ -4382,8 +4386,19 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
                     "created_at": chosen.get("created_at") or item.get("created_at"),
                     "ai_engine": chosen.get("ai_engine"),
                     # via: 写手手改版转正的那一版(record_edit), tv-sync 不给它算改稿差异(2026-11-26, core._tv_edit_diffs)
-                    "via": batch_via(item.get("batches"))})
+                    "via": version_via(item, chosen)})
     return out
+
+
+def version_via(item: dict, version: dict) -> str | None:
+    """这一版是不是它所在 batch 转正时建的那一版, 是就回那个 batch 的 ``params.via``(2026-11-26)。
+
+    via 是 batch 的, 「这段字是写手自己的」却是那一版的: 转正只建 version_num = 1 的那一版(_mint_entries); 以后同一个
+    item 上加的版本(replaces_version_id 改稿, version_num 2 起)是另一回事 —— 不能跟着 batch 记成 record_edit, 不然连着它
+    的帖一声不响地没了改稿差异(复审 11-26)。所以只有 version_num 1(读不到当 1)的那一版带 via, 别的回 None。"""
+    if (version.get("version_num") or 1) != 1:
+        return None
+    return batch_via(item.get("batches"))
 
 
 # ── 最近发出去 / 写过的标题: 简报里给模型"这批要避开什么"(2026-10-20) ─────────────────────────
