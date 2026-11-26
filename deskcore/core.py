@@ -13434,8 +13434,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         def _snap_beats_older(n: tvlink.Note, ms: tvlink.Match) -> bool:
             """第二遍对上了另一版的帖(older_wait): 底稿认得出一份(对手里不算那个 item 自己的几版), 而且帖和那份底稿比和那一版
             更像 —— 帖在稿里多, 一样多看稿在帖里多(同 match_snapshot / tvlink._collapse 的挑法); 打平算那一版(存过档的先,
-            同底稿存了档就让给存的那一版)。两轮之间 AI 改了一两句的, 帖是查过重的那一轮时归底稿(复审 11-26)。"""
-            if ms.version is None:
+            同底稿存了档就让给存的那一版)。两轮之间 AI 改了一两句的, 帖是查过重的那一轮时归底稿(复审 11-26)。
+            只由 record_edit 来的写手手改版(writer_edit_only)不参加: 它只兜底, 第二遍已经连上存过的 AI 那一版了就归那一版
+            (帖就是写手的字, 放进来比它总赢, 帖就丢了 AI → 帖的改稿差异、同一篇成了两个 item; 和那一版还是 best 时一样,
+            合并后复审 11-26)。"""
+            if ms.version is None or by_vid.get(ms.version.version_id, {}).get("writer_edit_only"):
                 return False
             ov = older_wait[n.note_id][0].version
             ng = tvlink.grams(n.body)

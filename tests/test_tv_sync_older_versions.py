@@ -474,3 +474,27 @@ def test_heal_still_rebuilds_the_best_when_only_an_older_version_has_rows(monkey
     assert _rows(c, v1), "第二晚 W-40 先把 v1 那一行记回来了"
     assert (gap["missing"], gap["rebuilt"], gap["skipped"]) == (1, 1, 0), gap
     assert _rows(c, v2), "定稿 v2 的文字补回来了"
+
+
+def _writer_edit(title: str, body: str, days: float = 0.5) -> dict:
+    return S._snap("swe", title, body, days=days, key=None, status=core.SNAPSHOT_WRITER_EDIT, check="e1",
+                   flywheel_arm=None, flywheel_arm_source=None)
+
+
+@pytest.mark.parametrize("dated", [True, False])
+def test_a_writer_edit_row_never_takes_a_post_from_an_older_saved_version(dated):
+    """合并后复审(11-26): 写手手改了存过档的 AI 稿、record_edit 了、发出去, 后来模型又存了一版改稿(那一版就成了另一版)。
+    帖要连回存过的 AI 那一版、记 AI → 帖的改稿差异, 和那一版还是 best 时一样; record_edit 记下的手改版只兜底, 不能在
+    第二遍和底稿的比较里把它抢走(抢走的话: 新建一个 item、via = record_edit、没有差异)。没发布日期的帖同样直接连, 不等日期。"""
+    from tests.test_snapshot_gate_error_and_writer_edit import EDITED_S
+    note = {} if dated else {"publish_time": None}
+    c = _snap_case(EDITED_S, [_writer_edit("骑了一百公里", EDITED_S)], [("v9old", S.BODY_S, 0)], **note)
+    assert _second_pass(c) == "v9old", "前提: 不看底稿的话第二遍连的是存过的那一版"
+    items_before = len(c.rows["items"])
+    out = core.tv_sync(c, S.TV)
+    l = _links(c)["n1"]
+    assert l["version_id"] == "v9old" and l["match_kind"] in ("body_exact", "title_exact", "fuzzy", "edited")
+    assert (out["older_version"], out["snapshots"]["writer_edit"], out["snapshots"]["promoted"]) == (1, 0, 0)
+    assert len(c.rows["items"]) == items_before, "不另建一个 item"
+    assert [d[0] for d in _diffs(c)] == ["v9old"], "AI → 帖的改稿差异照记"
+    assert c.rows["draft_snapshots"][0].get("promoted_at") is None, "手改版那一行照旧挂着(同它输给 AI 底稿的时候)"
