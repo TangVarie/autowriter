@@ -498,8 +498,10 @@ def _tv_sync(core, sb, args) -> int:
             continue
         head = "[dry-run] " if args.dry_run else ""
         print(f"\n{head}{tv}: {out['note']}")
-        print(f"  写作台版本 {out['versions']} 条(项目 {len(out['desk_projects'])} 个), "
-              f"对照写入 {out['links_written']}, 回填 TV {out['tv_backfilled']}")
+        print(f"  写作台版本 {out['versions']} 条(项目 {len(out['desk_projects'])} 个"
+              # 2026-11-26: item 存过的旧版, 定稿那一版对不上时才拿来对(core._match_with_older); 对上几篇在上面那行的「其中」里
+              + (f"; 另有存过的旧版 {out['versions_older']} 条, 定稿对不上时才对" if out.get("versions_older") else "")
+              + f"), 对照写入 {out['links_written']}, 回填 TV {out['tv_backfilled']}")
         ing = out.get("ingest")
         if ing:
             print(f"  补录: 收到 {ing['received']}, 要写 {ing['to_write']}, 指纹库已有 "

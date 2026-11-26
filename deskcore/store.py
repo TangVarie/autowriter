@@ -4315,7 +4315,49 @@ def is_ingest_batch(batch: dict | None) -> bool:
     return isinstance(params, dict) and params.get("source") == "ingest"
 
 
-def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[dict]:
+# TV 的爆款同步(truth-vault scripts/sync_truth_vault_baokuan_to_autowriter_items.py)建的 item: batches.params.source 是这个,
+# 文字是从 TV 的笔记复制进来的, 不是写作台写的稿。它们留在定稿那份对照索引里(那是改这里之前就有的样子, 不在这次动);
+# 旧版那份(versions_for_linking 的 ``older``)不收: 同一个 item 偶尔会有两版(那个脚本没有 (item_id, version_num) 唯一约束可靠),
+# 两版都是 TV 的文字, 拿它们当「写作台写过的旧版」去接帖, 是又一条把 TV 的文字认成写作台产出的路(同补录副本, A-02)。
+TV_COPY_SOURCE = "truth_vault_sync"
+
+
+def batch_source(batch: dict | None) -> str | None:
+    """``batches.params.source``; 没有 / 读不出回 None。``params`` 的两种形态(dict / 字符串)同 is_ingest_batch。"""
+    params = (batch or {}).get("params")
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except ValueError:
+            return None
+    src = params.get("source") if isinstance(params, dict) else None
+    return str(src) if src else None
+
+
+def _older_linking_rows(item: dict, chosen: dict, versions: list[dict], project_id: str) -> list[dict]:
+    """versions_for_linking 的 ``older``(2026-11-26): 这个 item 除了定稿那一版之外的各版, 行的样子和定稿那一版的一样,
+    created_at 是那一版自己的(没有就用 item 的)。标题正文都空的不要。
+
+    为什么要它: 写手在对话里改好几轮, 中间存过的那几版不是 best, 可发出去的常常正是其中一版 —— 对照索引只有 best,
+    这种帖就对不上、被记成「别处写的」。tv-sync 拿这些行做第二遍(core._match_with_older, tvlink.match_note_by_item):
+    只在定稿那一版对不上时才看, 同一个 item 的几版先并成一版再比, 不让兄弟版本互相变成分不出。"""
+    out: list[dict] = []
+    for v in versions:
+        if v is chosen or not v.get("id") or v.get("id") == chosen.get("id"):
+            continue
+        title = (v.get("title") or "").strip()
+        body = (v.get("body") or "").strip()
+        if not (title or body):
+            continue
+        out.append({"version_id": v.get("id"), "item_id": item.get("id"),
+                    "project_id": project_id, "title": title, "body": body,
+                    "created_at": v.get("created_at") or item.get("created_at"),
+                    "ai_engine": v.get("ai_engine")})
+    return out
+
+
+def versions_for_linking(sb, project_id: str, limit: int | None = None, *,
+                         older: list | None = None) -> list[dict]:
     """项目里每个 item 的定稿版本, 带 created_at / item_id —— 对照要按时间窗判。
 
     与 ``legacy_version_pages`` 同样只取 best / 最新那一版: 发出去的是它。
@@ -4350,6 +4392,9 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
         chosen = next((v for v in versions if v.get("id") == best), None)
         if chosen is None:
             chosen = max(versions, key=lambda v: v.get("version_num") or 0)
+        # ``older``(2026-11-26): 给了就把这个 item 别的版本也收进去(_older_linking_rows), 回的这份照旧只有定稿那一版
+        if older is not None and batch_source(item.get("batches")) != TV_COPY_SOURCE:
+            older.extend(_older_linking_rows(item, chosen, versions, project_id))
         title = (chosen.get("title") or "").strip()
         body = (chosen.get("body") or "").strip()
         if not (title or body):
