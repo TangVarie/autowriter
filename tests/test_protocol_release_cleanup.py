@@ -315,6 +315,12 @@ def _server_texts() -> dict[str, str]:
     texts["core.PROJECT_NOT_FOUND_NEXT"] = core.PROJECT_NOT_FOUND_NEXT
     texts["tools.CHECK_NEXT_STEP"] = T.CHECK_NEXT_STEP
     texts["tools.CHECK_NEXT_STEP_WARN"] = T.CHECK_NEXT_STEP_WARN
+    # 2026-11-26 (§3.39): 每一轮都先查重; 仿写比参考原文的那几句
+    for const in ("REFERENCE_REASON", "REFERENCE_REASON_STRONG", "REFERENCE_NOTE", "REFERENCE_NOTE_STRONG",
+                  "REFERENCE_SKIPPED_NOTE", "CHECK_NEXT_STEP_WARN_REFERENCE",
+                  "DESK_FIRST_POSTS", "DESK_FIRST_COMMENTS", "ANGLES_NOT_DRAWN_NOTE"):
+        texts[f"tools.{const}"] = getattr(T, const)
+    texts["core.JUDGE_TOOL_NOTE"] = core.JUDGE_TOOL_NOTE
     texts["core._angle_key_mismatch_note(all)"] = core._angle_key_mismatch_note(
         {store.ANGLE_KEY_UNKNOWN: 1, store.ANGLE_KEY_USED: 1, store.ANGLE_KEY_OTHER_PROJECT: 1,
          store.ANGLE_KEY_NOT_IN_LEDGER: 1})
@@ -370,6 +376,49 @@ def test_server_revision_path_goes_through_check_drafts_first():
                  core._check_rules_next_step({"must_fix": 1}, 0), core.DRAFT_CHECKS_NEXT_STEP.format(idx="2", n=1)):
         assert "replaces_version_id 先过 check_drafts" in text, text
         assert text.index("check_drafts") < text.index("score_drafts"), text
+
+
+def test_the_protocol_says_every_round_goes_through_check_drafts():
+    """2026-11-26 (§3.39): 协议多了一节, 紧跟「一个对话只写一个项目」; 原来那句「一次性的 → 直接改」读起来像不用查重。"""
+    sec = _between(BODY, "## 给用户看的每一版稿子都先过查重", "## 为什么必须走工具")
+    assert BODY.index("## 一个对话只写一个项目") < BODY.index("## 给用户看的每一版稿子都先过查重")
+    for must in ("哪一轮都一样", "前面几轮查过的不算数", "「按这几篇再出几篇」是新稿", "`replaces_version_id`", "`human-writing`",
+                 "`reference_text`", "不当稿子传", "不提那篇里的品牌", "选定的那个连同正文一起查", "`record_edit`",
+                 "不用查重", "认得回来"):
+        assert must in sec, must
+    assert "哪一轮都要过" in SEC_CHECK and "「给用户看的每一版稿子都先过查重」" in SEC_CHECK
+    assert "直接改，不用记" not in BODY and "改好的那版照第 4 条先查重再给" in BODY
+    assert "改出来的那版照第 4、5 条先查重、再存" in BODY, "5b 判稿之后照着改的也查重"
+    assert "**不要只在第一轮查重。**" in _between(BODY, "## 几条不要犯的错", "**规则和调校笔记")
+    assert "reference_overlap" not in BODY, "字段级的口径在 check_drafts 的说明里"
+    # 复审: 仿写自家爆款时本项目的品牌照写; 要改的稿子不是参考稿; 改判出来的 warn 的信号名在 decided_by 那一句里;
+    # reference_text 格式不对的报错不是查重挂了(超了上限不报错, 查重照常)
+    assert "不提那篇里的品牌（本项目的品牌照项目规则写）" in sec
+    assert "用户贴来要你改、去 AI 味的稿子不是参考稿" in sec
+    assert "`contain` / `reference`）" in SEC_CHECK and "`reference` 是照抄了参考原文，没有这一条" in SEC_CHECK
+    assert "报错说 `reference_text` 格式不对的除外：改好或不带它再查" in SEC_CHECK
+
+
+def test_server_texts_say_every_round_goes_through_check_drafts():
+    """2026-11-26 (§3.39): 11-09 以来四个项目 255 篇发出去的帖和写作台见过的文字都对不上 —— 写手在对话里一轮轮改、
+    续写、仿写、去 AI 味, 最后那一轮从没过查重。服务端的话也说成「每一版都先过 check_drafts」, 和协议那一节一样;
+    改稿(判稿之后照着改的、用户自己改过又要接着改的)也都先过 check_drafts。"""
+    doc = T.check_drafts.__doc__
+    for must in ("每一版要给用户看的笔记稿都先过这里", "哪一轮都一样", "接着写", "仿写", "去 AI 味", "前面几轮查过的不算数",
+                 "reference_text", "不存、不记、不回显", "只会多出 warn, 不会多出 reject"):
+        assert must in doc, must
+    app = _app_instructions()
+    assert "每一版要给用户看的笔记稿都先过 check_drafts" in app and "reference_text" in app
+    assert "改稿、续写、仿写的每一版也先过 check_drafts" in T.DESK_FIRST_POSTS
+    for where, text in (("judge_draft", T.judge_draft.__doc__), ("JUDGE_TOOL_NOTE", core.JUDGE_TOOL_NOTE)):
+        assert "先过 check_drafts 再 score_drafts" in text.replace("、", " "), where
+    edit = T.record_edit.__doc__
+    assert "写作台也会记下来" in edit and "对回来" in edit and "不用先过 check_drafts" in edit
+    assert "照常先过 check_drafts" in edit, "在他那版上接着改的, 改出来的照常查重"
+    assert "都传整篇(标题和全文)" in edit, "复审: 只传改了的那一段, 发出去的帖对不回来"
+    # 复审: 要改的稿子不是参考稿; 超了上限不拦查重; 只有 reference_text 格式不对的报错不是查重挂了
+    assert "不是参考稿" in doc and "reference_skipped_note" in doc and "skipped" in doc
+    assert "报错说的是 reference_text 的格式" in " ".join(doc.split()), "折行的地方按一个空格比"
 
 
 @pytest.mark.parametrize("problems", [

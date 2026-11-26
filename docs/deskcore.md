@@ -2637,6 +2637,38 @@ batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和�
 
 **还没做的一件**（不急）：四字串的 GIN 索引大概攒满了待合并的那一段（11-23 只读看：查一个不存在的值也要读约 500 个缓冲页；这张表上次自动 vacuum 是 09-18，新增的行没到自动触发的线）。现在每次查重都走它，每篇都要把这一段扫一遍；写指纹时偶尔还会在持锁的那一下同步合并。11-23 最大的项目 10 篇一组 2.9～3.6 秒，约是 8 秒上限的四成。要再快：`gin_clean_pending_list('autowriter.draft_fp_ngram_gin_idx')` 或对这张表 `VACUUM`，或者把这个索引改成 `fastupdate = off`。要动生产库，先看用时有没有往 8 秒走。
 
+### 3.39 协议升版：给用户看的每一版稿子都先过查重，仿写带参考原文（2026-11-26）
+
+**为什么。** 2026-11-26 只读查生产库：11-09 以来四个在写的项目里，有 255 篇发出去的帖对不回写作台。它们和写作台见过的**任何**文字（存档的版本、查重时记下的底稿）四字串重合都不到 15%，平均 2%～5%；对上了的帖是 84%～96%，中间一篇都没有。写作台存过档的稿子大多也没发（sportsix 128 篇里发了 32 篇）。问写手：她们在 AI 对话里一轮轮改（改几句、「照这几篇再出几篇」、仿一篇别家的帖、去 AI 味重写），把最后那一轮贴进飞书。只有第一轮走过查重，后面几轮写作台从没见过，所以 TV 把这些帖记成「别处写的」（同一次发版里 TV 的显示改叫「写作台没见过的文字」，库里的值还是 `elsewhere`）。缺的不是写手做了什么，是模型只在第一轮查重：协议原来说「交付前必做」，第二轮给用户「看看」的那版算不算交付说不清；「一次性的 → 直接改，不用记」读起来像不用走工具；判稿（5b）之后照着改的、`human-writing` 去 AI 味的、仿写的，都没写回到查重。
+
+这次还是不给写手加活：她们照旧只做「说要写什么、说要改哪里、把定稿贴进飞书」，要做的只有重导一次 skill。
+
+**协议 `6f23eba491fd` → `00ff79b30fcc`**（以 `python -m deskcore.cli sync-skill --check` 为准；部署后 `/health` 的 `build.protocol_version` 应是它）。改了这几处：
+
+- 新一节「给用户看的每一版稿子都先过查重」，紧跟「一个对话只写一个项目」，在流程前面（不放进「写作台排第一」那一节，那一节有 580 字符的上限）。五条：哪一轮都一样（前面几轮查过的不算数，改过就是新的一版）；最容易漏的几种（「按这几篇再出几篇」是新稿、3 篇以上先发牌；改交付过的稿子哪怕只改一句、用 `human-writing` 去 AI 味的，带 `replaces_version_id`）；仿写别家的帖或用户贴来的参考稿，参考原文放进 `reference_text`（不提那篇里的品牌，本项目的品牌照项目规则写：写手常拿自家发过的爆款当参考；用户贴来要你改、去 AI 味的稿子不是参考稿，不放进去，不然改出来的稿和它当然像，会被白白改判 warn）；不算稿子的（选题、提纲、标题备选、评论）；用户自己改了贴回来的那一版是他写的，不查重，走 `record_edit`（同一次发版里 `record_edit` 会把他改成的那一版记成底稿，发出去以后认得回来；他要你在他那版上接着改，改出来的照常查重）。
+- 第 4 条开头「交付前必做」→「给用户看之前必做 … 哪一轮都要过」；`decided_by` 那一句的信号多一个 `reference`（照抄了参考原文，没有 `collided_with` 那一条）；「这个工具报错就是查重真的挂了」后面加了一个例外：报错说 `reference_text` 格式不对的，改好或不带它再查。5b 判稿之后「改出来的那版照第 4、5 条先查重、再存」；第 6 条「一次性的 → 直接改」→「改好的那版照第 4 条先查重再给」；「入库」那一行里手改过、贴回来的定稿走 `record_edit`（仍是「不再查重」）；「几条不要犯的错」加一条「不要只在第一轮查重」。
+- skill 头一字没动（「四条在任何时候都生效的规矩」还是四条）。`reference_overlap` / `reference_index` / `reference_note` 这些字段级的口径只在 `check_drafts` 的说明里（skills/README.md 那条约定：协议只管流程）。
+
+**服务端同一次上线**（不用重导 skill，部署即生效）：
+
+- `check_drafts` 的说明（MCP 的工具描述）开头说每一版、哪一轮都先过这里，后面一段讲 `reference_text`。MCP `instructions`、`open_project` 回包的 `desk_first`（209 → 239 字，上限 260）、`judge_draft` 的说明和回包里的 `note`（`core.JUDGE_TOOL_NOTE`）各补了一句：改稿、续写、仿写的每一版也先过 `check_drafts`（各处措辞不一样，不是同一句）。`record_edit` 的说明多一段：用户改成的那一版写作台也记下，发出去以后对得回来，所以 `ai_*` / `my_*` 都传整篇（他只贴回改过的那一段，就换进 AI 原版拼成整篇再传；只传一段，学得到改法，帖对不回来——底稿只有一段，帖的四字串落不到 tvlink 的 0.30 下限）；那一版不用查重。
+- **`check_drafts` 多一个可选的顶层参数 `reference_text`**（一段字符串，或最多 3 段的列表，每段去掉首尾空白后最多 6000 字）。不叫 `reference`：发牌卡上的「参考结构」已经用了这个名字。
+  - **只在工具层用。** 不传进 `core.check_drafts` / `_gate`：存档（`score_drafts`）重跑同一套判定时手上没有参考原文，两边要判得一样；`cli check`、库里那一路、SQL 对照都不用动。core 先判完、先记底稿，`tools._apply_reference` 再叠一层，然后才写 `next_step`（warn 的篇数要算进去）。
+  - **怎么比。** `tvlink.reference_overlap`：稿子正文（剥了话题标签）的四字串有多少比例出现在几段参考原文（同样剥了标签）的并集里，完整集合、不是 sketch；四字串不到 15 个（同 `CONTAIN_MIN_SAMPLE`）不判。用并集是为了抓「两篇各抄一半」。纯本地计算，参考原文不送 embedding。
+  - **判成什么。** 每条带 `reference_overlap`（3 位小数，算不出是 null；判线和换说法也用这个数，不然回出去 0.4 却没到线）；到 `fingerprint.REFERENCE_CONTAIN_WARN`（= `NGRAM_CONTAIN_WARN`，0.40）再带 `reference_index`：调用方传的列表里的位置，从 0 数（空白的段不比、但占位置，reason 里的「第 k 段」和报错里的段号都是同一套数）。本来 pass 的到线改判 warn，`decided_by=["reference"]`，`collided_with` / `collided_scope` 清空，`collided_note` 去掉（改判之后「判定为通过」那句就是假话了，同 `_mark_replacements`），`reason` 是一句改法；到 `REFERENCE_CONTAIN_STRONG`（= `NGRAM_CONTAIN_HARD`，0.60）换重一点的说法。本来就是 warn / reject 的，status、reason、decided_by、collided_* 一个不动，只多一句 `reference_note`。summary 的 pass / warn / reject 重算，多一个 `summary.reference = {count, checked, flagged}`（只有整数；count 是比了几段，空白的不算）。有这种改判出来的 warn 时，`next_step` 里 warn 那半句换成 `CHECK_NEXT_STEP_WARN_REFERENCE`（照 reason 重写：结构和角度留着，换成自己的话和例子），不说「换个切入」——仿写的结构和角度本来就该照参考稿；没有的照旧是原来那句。
+  - **为什么最多 warn。** 存档时重跑查重没有参考原文，拦不住的 reject 和存档的判定对不上；协议里 reject 的三种例外是为历史撞车写的；同题文字之间的包含度还没校准过。0.40 比 tvlink 实测「共用产品话术的不同稿子」那一档（0.30 以下，`EDITED_FLOOR`）高出一个 `FUZZY_MARGIN`，同题的正常仿写到不了；0.60 是 tv-sync 认「帖是从这一版改出来的」那条线。合成样例：几乎逐字照搬 0.84，开头两句照搬 0.44，换了人和事的仿写 0。上线后看调用留痕里的 `max_decile` 再定要不要动。
+  - **它永远不拦查重。** 段数或字数超了不报错：查重照常判、底稿照记，只是这次没比参考原文——回包顶层多一句 `reference_skipped_note`（只有段数和字数：减到 3 段以内、每段 6000 字以内，一篇太长就拆成两三段，连同稿子再查一次），`summary.reference` 是 `{count, checked: 0, flagged: 0, skipped: true}`，其余和不传参考原文时一个字节都不差。第一版是在任何库操作之前 `InvalidInput`：那一轮查重没判、底稿没记，协议又说「工具报错就是查重挂了，停下来」——一个可选参数让这一版成了写作台没见过的那一版，正是这次要补的洞（复审）。超长是这次不比、不是截：截掉会漏掉后半篇的照抄。只有形状不对的（不是文字、列表里有数字或 null）才报错：工具层在任何库操作之前 `InvalidInput`（REST 400），消息只有第几段和类型名，说清「这是参数传错了，不是查重挂了」；MCP 那一路在 SDK 校验参数时就拦下了，SDK 原来的消息带一截截断的输入（参考原文的开头），`app._reference_text_refusal` 把 `reference_text` 的这种错误换成只有字段路径和 pydantic 错误说明、同样说清是参数错的一句（别的参数、别的工具照旧回 SDK 的原话）。
+  - **参考原文哪儿都不去。** 不进库（不进 `draft_snapshots`：存了的话 tv-sync 会把原作者的帖、转发它的帖认成写作台写的，接住率虚高；更不进指纹库，不然以后照同一篇仿写的都会被当成历史撞车拦下）、不进日志、不回显、不送 embedding；底稿的 status 还是查重自己的判定（选题报告 D1 的判定统计不受影响）。
+  - **调用留痕**（§3.8）：带了参考原文的那一行 `meta.check` 多一块 `reference = {refs, checked, flagged, max_decile}`（`max_decile` 是最像的那篇落在第几成，0～10，取整：`_clean` 不收小数；超了上限没比的再多一个 `skipped: true`）；`decided_by` 的信号名多一个 `reference`。没带参考原文的那一行一字不变；`VERSION` 不升（只是多了一个键）。
+
+**上线顺序：服务端和协议同一次发版、一起部署。** 协议叫模型传 `reference_text`，旧服务端上 MCP 会悄悄丢掉这个参数、REST 会回 500，所以不能先发协议。部署之后写手重导一次 skill；没重导之前，旧版 skill 的对话开场调 `get_protocol` 就拿到新正文、照它执行，入口回包的升级提醒第一行是「给你看的每一版稿子都先查重，仿写时还会查有没有照抄参考稿」（`skillcheck.WHATS_NEW` 按新版本号加了一行，旧的那行留着）。`record_edit` 记底稿（同一天另一处改动）要和这一版一起上：协议里「用户自己改了贴回来 … 发出去以后也认得回来」靠它。
+
+**上线后会变的数。** 每一轮都查重以后，同一篇稿在 `draft_snapshots` 里会多几行（每改一轮一行；查重超时照记的 `gate_error`、模型重试也各一行；同样的字 tv-sync 按 `text_fp` 归成一篇，转正不受影响）。TV ANGLE_LEDGER 灯的「查过 N 篇稿」数的是行（只去掉了 `writer_edit`），上线后会跳高，不代表多写了稿；要数篇得按 `(project_id, text_fp)` 去重，那是 TV 那边的事。
+
+**长度。** 协议正文（strip 后）20724 → 21615 字符（+891；新一节 661，其余是就地改的几句），46319 → 48416 字节；`SKILL.md` 52182 → 54279 字节；skill 头 2540 不变；「写作台排第一」那一节不变。没删别处的字来抵：这次要补的正是原来没写的几种情形。
+
+**回归**：`tests/test_check_drafts_reference.py`（纯函数：照搬过 STRONG、仿写不到 WARN、太短不判、只撞话题标签不算、几段取并集和最像的那段；不传 / 空串 / 空列表 / 全空白时回包逐字节不变；pass 改判 warn、collided_* 清空、summary 重算、`next_step` 跟着说 warn、不说「换个切入」；判线用回出去的那个 3 位小数；本来就 warn / reject 的不动只多一句；真走 core 时本批内的 reject 照旧、底稿是查重自己的判定；`reference_index` 和「第 k 段」是调用方列表里的位置；超了上限的照常判、底稿照记、只多一句和 `skipped`，REST 200、MCP 不是错误结果；参考原文不进假库的任何表和调用、不进回包和日志；正文放在别名键里的照样比；形状不对的在碰库之前拒，工具层、REST 400、MCP 错误结果各一条，MCP 那条的消息里没有参考原文、`drafts` 传错照旧是 SDK 的原话）；`tests/test_tool_call_log.py`（带参考原文那一行只多几个数，超了上限的多一个 `skipped`）；`tests/test_writer_facing_text.py`（改判的 reason、多的那一句、没比时那一句、`next_step` 换的那半句没有工程指令）；`tests/test_e2e_protocol_flow.py`（schema 里有 `reference_text`、不是必填、没有叫 `reference` 的参数）；`tests/test_protocol_release_cleanup.py`（新一节和就地改的几句；`decided_by` 的 `reference`、报错的例外、品牌和要改的稿子那两句；服务端几处话说成每一版都先过查重，`record_edit` 说传整篇，新加的几句也不许说回旧口径）；`tests/test_desk_first_1113.py`（升级提醒第一行带的是当前版本的那半句，不再钉「排第一」）。
+
 ## 4. 接入
 
 ### 4.1 部署

@@ -156,3 +156,9 @@ def test_mcp_tool_surface_matches_the_protocol():
     assert "review_drafts" not in by and "export_drafts" not in by
     cf = by["comments_for"].inputSchema["properties"]
     assert "link" in cf and "skill_version" in cf and "_user_id" not in cf
+    # 2026-11-26 (§3.39): 仿写的参考原文是 check_drafts 可选的顶层参数, 在 schema 里看得见; 不叫 reference(发牌卡上的
+    # 「参考结构」已经用了这个名字), 也不是必填 —— 不传的调用和以前一模一样
+    cd = by["check_drafts"].inputSchema
+    assert "reference_text" in cd["properties"] and "reference_text" not in cd.get("required", [])
+    assert "reference" not in cd["properties"] and set(cd["required"]) == {"project_id", "drafts"}
+    assert "reference_text" in by["check_drafts"].description and "哪一轮都一样" in by["check_drafts"].description
