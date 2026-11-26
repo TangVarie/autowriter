@@ -4341,7 +4341,38 @@ def batch_via(batch: dict | None) -> str | None:
     return via if isinstance(via, str) else None
 
 
-def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[dict]:
+# TV 的爆款同步(truth-vault scripts/sync_truth_vault_baokuan_to_autowriter_items.py)建的 item: batches.params.source 是这个,
+# 文字是从 TV 的笔记复制进来的, 不是写作台写的稿。它们留在对照用的那份索引里(那是改这里之前就有的样子, 不在这次动);
+# 另一版那份(versions_for_linking 的 ``older``)不收: 这种 item 上不是对照用的那一版, 要么也是 TV 的文字, 要么是写作台在 TV 的
+# 文字上改的一版 —— 拿它去接帖, 就是把 TV 的文字认成写作台的产出(同补录副本, A-02)。
+TV_COPY_SOURCE = "truth_vault_sync"
+
+
+def _older_linking_rows(item: dict, chosen: dict, versions: list[dict], project_id: str) -> list[dict]:
+    """versions_for_linking 的 ``older``(2026-11-26): 这个 item 除了对照用的那一版之外的各版, 行的样子和对照用的那一版的
+    一样, created_at 是那一版自己的(没有就用 item 的)。标题正文都空的不要。
+
+    这些是什么: 改稿(replaces_version_id)之前存的那几版; 老的多引擎 item(db.bulk_create_initial_versions)里一个引擎一版,
+    是并列的几稿, 不一定更早。对照索引只有 best(没设 best 就是 version_num 最大的), 帖的文字正好是另一版时就对不上。
+    tv-sync 拿这些行做第二遍(core._match_with_older, tvlink.match_note_by_item): 只在对照用的那一版对不上时才看, 同一个
+    item 的几版先并成一版再比, 不让兄弟版本互相变成分不出。"""
+    out: list[dict] = []
+    for v in versions:
+        if v is chosen or not v.get("id") or v.get("id") == chosen.get("id"):
+            continue
+        title = (v.get("title") or "").strip()
+        body = (v.get("body") or "").strip()
+        if not (title or body):
+            continue
+        out.append({"version_id": v.get("id"), "item_id": item.get("id"),
+                    "project_id": project_id, "title": title, "body": body,
+                    "created_at": v.get("created_at") or item.get("created_at"),
+                    "ai_engine": v.get("ai_engine"), "via": version_via(item, v)})
+    return out
+
+
+def versions_for_linking(sb, project_id: str, limit: int | None = None, *,
+                         older: list | None = None) -> list[dict]:
     """项目里每个 item 的定稿版本, 带 created_at / item_id —— 对照要按时间窗判。
 
     与 ``legacy_version_pages`` 同样只取 best / 最新那一版: 发出去的是它。
@@ -4355,6 +4386,9 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
     docstring 说要排除的因果倒置, 只是绕了一条路。生产库 10-08 查到 31 篇这样的
     血缘(SPX 23 · HATHERINE 7 · LNKT 1), TV 的模型对比视图把它们算成写作台产出。
     ``ingested`` 对照本身仍靠 ``existing`` 跳过, 不依赖这里。
+
+    ``older``(2026-11-26): 给一个 list 就顺手把各 item 别的版本(_older_linking_rows, 补录副本和 TV_COPY_SOURCE 的 item 不收)
+    追加进去, 不多查一次库; 回的这份不变。tv-sync 的第二遍用(core._match_with_older)。
     """
     def _build(off, lim):
         return (sb.table("items")
@@ -4376,6 +4410,9 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
         chosen = next((v for v in versions if v.get("id") == best), None)
         if chosen is None:
             chosen = max(versions, key=lambda v: v.get("version_num") or 0)
+        # ``older``(2026-11-26): 给了就把这个 item 别的版本也收进去(_older_linking_rows), 回的这份照旧每个 item 一版
+        if older is not None and _as_params((item.get("batches") or {}).get("params")).get("source") != TV_COPY_SOURCE:
+            older.extend(_older_linking_rows(item, chosen, versions, project_id))
         title = (chosen.get("title") or "").strip()
         body = (chosen.get("body") or "").strip()
         if not (title or body):
