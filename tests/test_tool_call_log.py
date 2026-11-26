@@ -160,6 +160,23 @@ def test_a_reference_leaves_only_numbers(log, monkeypatch):
     _no_text(row, REF_MARK, "带爸妈出国", "四十分钟")
 
 
+def test_an_over_limit_reference_leaves_numbers_and_skipped(log, monkeypatch):
+    """复审: 超了上限的参考原文不拦查重, 这一行照常记判定, reference 那一块多一个 skipped, 还是只有数。"""
+    from tests.test_check_drafts_reference import COPY, IMIT, REF, REF_MARK
+    c = _drafts_client()
+    monkeypatch.setattr(core, "sb", lambda: c)
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    r = _rest().post("/tool/check_drafts", headers=H, json={
+        "project_id": PID, "drafts": [{"title": "带爸妈出国没网", "body": COPY}, {"title": "东京那段路", "body": IMIT}],
+        "reference_text": [REF] * 4})
+    assert r.status_code == 200, r.text
+    (row,) = _rows(c)
+    assert row["meta"]["outcome"] == "ok"
+    assert row["meta"]["check"]["reference"] == {"refs": 4, "checked": 0, "flagged": 0, "skipped": True}
+    assert (row["meta"]["check"]["pass"], row["meta"]["check"]["warn"]) == (2, 0), "判定是查重自己的"
+    _no_text(row, REF_MARK, "带爸妈出国", "四十分钟")
+
+
 # ── 2. 评论: comments_for(MCP) + score_comments(REST), 每样检查的条数 ────────────────────────────
 
 def _comment_texts() -> list[str]:

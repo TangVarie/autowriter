@@ -12,7 +12,11 @@ check_drafts 现在收一个可选的 ``reference_text``(一段或几段), 只�
     参考原文永远不出 reject;
   · 底稿(draft_snapshots)的 status 还是查重自己的判定;
   · 参考原文不进库(假库的每一张表、每一次调用)、不进回包、不进日志;
-  · 形状不对 / 超了的在任何库操作之前拒: 工具层 InvalidInput、REST 400、MCP 的错误结果, 消息里只有段数和字数;
+  · 段数 / 字数超了的不拦查重(复审): 判定照常、底稿照记(这一轮没丢), 只是这次没比, 回一句怎么办;
+  · 形状不对(不是文字)的在任何库操作之前拒: 工具层 InvalidInput、REST 400、MCP 的错误结果(SDK 那一步拦下的也换成
+    不带原文、说清是参数错的一句), 消息里只有第几段和类型名;
+  · reference_index / 「第 k 段」是调用方列表里的位置(空白的段不比, 但占位置), 和报错里的段号同一套数;
+  · 有照抄参考原文的 warn 时, next_step 不叫模型「换个切入」(仿写的结构和角度本来就该照参考稿);
   · 正文放在别名键里(content)的也照样比。
 所有标题、正文、参考稿都是合成的示例。
 """
@@ -177,14 +181,25 @@ def test_a_partly_copied_draft_gets_the_milder_reason(monkeypatch):
     assert "仿写成了照抄" in mid["reason"] and "基本是照着" not in mid["reason"]
 
 
-def test_a_list_of_references_names_the_segment(monkeypatch):
+@pytest.mark.parametrize("refs, index, which, count", [
+    ([REF_B, "  ", REF], 2, "(第 3 段)", 2),
+    (["", REF], 1, "(第 2 段)", 1),
+    ([REF, "\n"], 0, "", 1),
+    ([REF], 0, "", 1),
+], ids=["blank-in-the-middle", "blank-first", "blank-last", "one"])
+def test_the_segment_is_named_by_its_place_in_the_callers_list(monkeypatch, refs, index, which, count):
+    """复审: 空白的段不比, 但不挪位置 —— reference_index 和「第 k 段」指的是调用方传的那个列表里的那一个, 和报错里的段号
+    (也是调用方的位置)同一套数。只有一段、而且就在第一个位置时不说「第几段」。"""
     _desk(monkeypatch)
-    out = tools.check_drafts(PROJ, [{"title": "带爸妈出国没网", "body": COPY}],
-                             reference_text=[REF_B, "  ", REF], _user_id=ME)
+    out = tools.check_drafts(PROJ, [{"title": "带爸妈出国没网", "body": COPY}], reference_text=refs, _user_id=ME)
     (row,) = out["results"]
-    assert row["status"] == "warn" and row["reference_index"] == 1, "空白的那段不算, 从 0 数"
-    assert "(第 2 段)" in row["reason"]
-    assert out["summary"]["reference"]["count"] == 2
+    assert row["status"] == "warn" and row["reference_index"] == index
+    assert refs[row["reference_index"]] == REF, "指的就是调用方列表里照抄的那一段"
+    assert row["reason"] == tools.REFERENCE_REASON_STRONG.format(pct=f"{_ov(COPY, REF)[0]:.0%}", which=which)
+    assert out["summary"]["reference"]["count"] == count, "count 是比了几段(空白的不算)"
+    with pytest.raises(tools.InvalidInput) as exc:
+        tools._reference_texts(list(refs) + [7])
+    assert f"第 {len(refs) + 1} 段不是文字" in str(exc.value), "报错的段号也是调用方的位置"
 
 
 def test_a_draft_too_short_to_judge_is_left_alone(monkeypatch):
@@ -244,6 +259,26 @@ def test_a_milder_history_warn_gets_the_milder_note(monkeypatch):
     assert row["reference_note"] == tools.REFERENCE_NOTE.format(pct=f"{_ov(MID, REF)[0]:.0%}", which="")
 
 
+@pytest.mark.parametrize("raw, shown, status, reason", [
+    (0.3995, 0.4, "warn", "REFERENCE_REASON"),
+    (0.3994, 0.399, "pass", None),
+    (0.5995, 0.6, "warn", "REFERENCE_REASON_STRONG"),
+    (0.5994, 0.599, "warn", "REFERENCE_REASON"),
+])
+def test_the_line_is_judged_on_the_number_that_is_reported(monkeypatch, raw, shown, status, reason):
+    """回出去的 reference_overlap 是 3 位小数; 判线和换说法也用这个数, 不然模型看到 0.4 却没改判、看到「60%」却是轻的那句。"""
+    _fixed_verdict(monkeypatch, [{"index": 0, "title": "甲", "status": "pass", "reason": "", "collided_with": "",
+                                  "collided_scope": "", "decided_by": []}])
+    monkeypatch.setattr(tvlink, "reference_overlap", lambda body, sets: (raw, 0))
+    out = tools.check_drafts(PROJ, [{"title": "甲", "body": COPY}], reference_text=REF, _user_id=ME)
+    (row,) = out["results"]
+    assert row["reference_overlap"] == shown and row["status"] == status
+    if reason:
+        assert row["reason"] == getattr(tools, reason).format(pct=f"{shown:.0%}", which="")
+    else:
+        assert "reference_index" not in row
+
+
 def test_a_real_in_batch_reject_stays_a_reject_and_snapshots_keep_the_gates_verdict(monkeypatch):
     """走真的 core: 同一批两篇开头一样, 第二篇被本批内的第一篇拦下。第一篇照抄参考原文 → 回包里 warn, 底稿里还是 pass。"""
     c = _desk(monkeypatch)
@@ -291,20 +326,59 @@ def test_a_body_under_an_alias_is_compared_too(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 5 · 形状不对的: 在任何库操作之前拒, 消息里没有原文
+# 5 · 超了上限的不拦查重; 形状不对的在任何库操作之前拒, 消息里没有原文
 # ══════════════════════════════════════════════════════════════════════
 
+OVER = [
+    ([REF, REF_B, REF, REF_B], 4, len(REF)),                       # 写手贴了四篇「照这几篇写」
+    (REF + "后面补的字" * 1200, 1, len(REF) + 6000),                # 一篇公众号那么长的
+    (["", REF_B, REF + "长" * 6000], 2, len(REF) + 6000),
+]
+
+
+@pytest.mark.parametrize("over, n, longest", OVER, ids=["too-many", "too-long", "too-long-third"])
+def test_an_over_limit_reference_does_not_cost_the_round(monkeypatch, caplog, over, n, longest):
+    """复审(major): 原来超了上限是整次 InvalidInput —— 查重没判、底稿没记, 协议又说「工具报错就是查重挂了, 停下来」,
+    这一轮就又成了写作台没见过的那一版。现在: 查重照常判、底稿照记, 回包和不传参考原文时一样, 只多一句怎么办和
+    summary.reference.skipped; 参考原文照样一个字都不出去。"""
+    caplog.set_level(logging.DEBUG)
+    drafts = [{"title": "带爸妈出国没网", "body": COPY}, {"title": "东京那段路", "body": IMIT}]
+    plain_db = _desk(monkeypatch)
+    plain = tools.check_drafts(PROJ, drafts, _user_id=ME)
+    c = _desk(monkeypatch)
+    out = tools.check_drafts(PROJ, drafts, reference_text=over, _user_id=ME)
+
+    assert [(r["title"], r["status"]) for r in c.rows["draft_snapshots"]] == \
+        [(r["title"], r["status"]) for r in plain_db.rows["draft_snapshots"]] == \
+        [("带爸妈出国没网", "pass"), ("东京那段路", "pass")], "这一轮的底稿照记"
+    note = out.pop("reference_skipped_note")
+    assert note == tools.REFERENCE_SKIPPED_NOTE.format(max_n=3, max_chars=6000, n=n, longest=longest)
+    assert out["summary"].pop("reference") == {"count": n, "checked": 0, "flagged": 0, "skipped": True}
+    assert _dump(out) == _dump(plain), "判定、next_step 和不传参考原文时一个字节都不差"
+    assert "再调一次 check_drafts" in note and "拆成两三段" in note
+    for text in (REF_MARK, "四十分钟", "札幌"):
+        assert text not in _dump(c.rows) and text not in note and text not in caplog.text
+
+
+def test_the_limits_are_exact():
+    edge = ["甲" * tools.REFERENCE_MAX_CHARS] * tools.REFERENCE_MAX
+    assert tools._reference_texts(edge) == (list(enumerate(edge)), None)
+    assert tools._reference_texts(f"  {'乙' * tools.REFERENCE_MAX_CHARS}  \n") == \
+        ([(0, "乙" * tools.REFERENCE_MAX_CHARS)], None), "按去掉首尾空白之后的字数算"
+    assert tools._reference_texts("丙" * (tools.REFERENCE_MAX_CHARS + 1))[1] is not None
+    assert tools._reference_texts(edge + ["丁"])[1] is not None
+    assert tools._reference_texts(edge + ["  "])[1] is None, "空白的段不算数"
+
+
 BAD = [
-    ([REF, REF_B, REF, REF_B], ("最多 3 段", "收到 4 段")),
-    (REF + "后面补的字" * 1200, ("最多 6000 字", "第 1 段")),
-    (["", REF_B, REF + "长" * 6000], ("最多 6000 字", "第 3 段")),
     ([REF, 5], ("第 2 段不是文字",)),
+    (["", REF_B, None], ("第 3 段不是文字",)),
     ({"text": REF}, ("收到的是 dict",)),
 ]
 
 
-@pytest.mark.parametrize("bad, says", BAD, ids=["too-many", "too-long", "too-long-third", "not-a-string", "a-dict"])
-def test_bad_references_are_refused_before_anything_runs(monkeypatch, bad, says):
+@pytest.mark.parametrize("bad, says", BAD, ids=["not-a-string", "none-in-the-list", "a-dict"])
+def test_a_reference_of_the_wrong_shape_is_refused_before_anything_runs(monkeypatch, bad, says):
     touched = []
     monkeypatch.setattr(core, "sb", lambda: touched.append("sb"))
     monkeypatch.setattr(core, "check_drafts", lambda *a, **k: touched.append("check_drafts"))
@@ -313,18 +387,27 @@ def test_bad_references_are_refused_before_anything_runs(monkeypatch, bad, says)
     msg = str(exc.value)
     for s in says:
         assert s in msg, (s, msg)
-    assert "这次没查重" in msg
+    assert "不是查重挂了" in msg and "不带 reference_text" in msg, "协议: 只有这种报错不是查重挂了"
     assert REF_MARK not in msg and "四十分钟" not in msg and "札幌" not in msg, "报错里不带原文"
     assert touched == [], "参数不对就不碰库、不查重"
 
 
-def test_the_limits_are_exact():
-    assert tools._reference_texts(["甲" * tools.REFERENCE_MAX_CHARS] * tools.REFERENCE_MAX) == \
-        ["甲" * tools.REFERENCE_MAX_CHARS] * tools.REFERENCE_MAX
-    assert tools._reference_texts(f"  {'乙' * tools.REFERENCE_MAX_CHARS}  \n") == ["乙" * tools.REFERENCE_MAX_CHARS], \
-        "按去掉首尾空白之后的字数算"
-    with pytest.raises(tools.InvalidInput):
-        tools._reference_texts("丙" * (tools.REFERENCE_MAX_CHARS + 1))
+# ══════════════════════════════════════════════════════════════════════
+# 6 · next_step: 照抄参考原文的 warn 不叫模型「换个切入」
+# ══════════════════════════════════════════════════════════════════════
+
+def test_next_step_does_not_tell_a_copied_imitation_to_change_its_angle(monkeypatch):
+    """复审: 改判出来的 warn 的 reason 说「只借它的结构和角度」, next_step 原来那句却说「先换个切入重写」—— 两个方向。"""
+    _desk(monkeypatch)
+    out = tools.check_drafts(PROJ, [{"title": "带爸妈出国没网", "body": COPY}], reference_text=REF, _user_id=ME)
+    step = out["next_step"]
+    assert tools.CHECK_NEXT_STEP_WARN_REFERENCE.format(m=1) in step and "结构和角度留着" in step
+    assert tools.CHECK_NEXT_STEP_WARN.format(m=1) not in step
+    # 查重自己判的 warn(没有照抄参考原文的那种)照旧是原来那句: 不传参考原文时回包一个字节都不差
+    history = {"results": [{"index": 0, "status": "warn", "decided_by": ["contain"]}],
+               "summary": {"total": 1, "pass": 0, "warn": 1, "reject": 0}}
+    tools._add_check_next_step(history)
+    assert tools.CHECK_NEXT_STEP_WARN.format(m=1) in history["next_step"]
 
 
 FAKE_KEY = "k-reference-0123456789FAKE"            # 测试里现编的钥匙
@@ -348,10 +431,15 @@ def test_rest_takes_the_reference_and_answers_400_on_a_bad_one(monkeypatch, capl
     assert ok.json()["result"]["results"][0]["decided_by"] == ["reference"]
     assert REF_MARK not in ok.text
 
+    over = client.post("/tool/check_drafts", headers={"X-Deskcore-Key": FAKE_KEY},
+                       json={"project_id": PROJ, "drafts": drafts, "reference_text": [REF] * 4})
+    assert over.status_code == 200, over.text[:300]
+    assert over.json()["result"]["summary"]["reference"]["skipped"] is True and REF_MARK not in over.text
+
     bad = client.post("/tool/check_drafts", headers={"X-Deskcore-Key": FAKE_KEY},
-                      json={"project_id": PROJ, "drafts": drafts, "reference_text": [REF] * 4})
+                      json={"project_id": PROJ, "drafts": drafts, "reference_text": [REF, 5]})
     assert bad.status_code == 400, bad.text[:300]
-    assert "最多 3 段" in bad.json()["detail"] and REF_MARK not in bad.text
+    assert "第 2 段不是文字" in bad.json()["detail"] and REF_MARK not in bad.text
     assert REF_MARK not in caplog.text
 
 
@@ -387,12 +475,24 @@ def test_mcp_takes_the_reference_and_reports_a_bad_one_as_an_error(monkeypatch, 
     assert json.loads(ok.content[0].text)["results"][0]["decided_by"] == ["reference"]
     assert REF_MARK not in ok.content[0].text
 
-    for bad, says in (([REF] * 4, "最多 3 段"), (REF + "长" * 6000, "最多 6000 字")):
-        res = _mcp_call("check_drafts", {"project_id": PROJ, "drafts": drafts, "reference_text": bad})
-        assert res.isError is True and says in res.content[0].text, res.content[0].text[:200]
+    for over in ([REF] * 4, REF + "长" * 6000):
+        res = _mcp_call("check_drafts", {"project_id": PROJ, "drafts": drafts, "reference_text": over})
+        assert res.isError is False, res.content[0].text[:200]
+        got = json.loads(res.content[0].text)
+        assert got["summary"]["reference"]["skipped"] is True and "reference_skipped_note" in got
         assert REF_MARK not in res.content[0].text
-    # 类型不对的在 SDK 那一步就被 pydantic 拦下(到不了工具): 错误结果里是 SDK 自己的消息(带一小截截断的输入, 只回给传它的
-    # 那个调用方, 和 drafts 传错类型时一样); 服务端那行日志只有字段路径和错误类型(app._log_bad_arguments)
-    wrong_type = _mcp_call("check_drafts", {"project_id": PROJ, "drafts": drafts, "reference_text": [REF, 5]})
-    assert wrong_type.isError is True
+    # 类型不对的在 SDK 那一步就被 pydantic 拦下(到不了工具)。SDK 原来的消息带一截截断的输入(参考原文的开头); 复审之后
+    # 换成只有字段路径和错误说明、说清是参数错的一句(app._reference_text_refusal)。服务端那行日志只有字段路径和错误类型。
+    for wrong in ([REF, 5], {"text": REF}, [REF_MARK + "参考原文开头" * 20, None]):
+        res = _mcp_call("check_drafts", {"project_id": PROJ, "drafts": drafts, "reference_text": wrong})
+        text = res.content[0].text
+        assert res.isError is True and "不是查重挂了" in text and "reference_text" in text, text[:300]
+        assert REF_MARK not in text and "四十分钟" not in text and "input_value" not in text, text[:300]
     assert REF_MARK not in caplog.text and "reference_text" in caplog.text
+
+
+def test_other_bad_arguments_keep_the_sdks_own_message(monkeypatch):
+    """换消息只换 reference_text 的那种; drafts 传错类型照旧是 SDK 的原话(不在这次改动里)。"""
+    _desk(monkeypatch)
+    res = _mcp_call("check_drafts", {"project_id": PROJ, "drafts": "不是列表"})
+    assert res.isError is True and "不是查重挂了" not in res.content[0].text

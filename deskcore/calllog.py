@@ -148,6 +148,8 @@ def _check_block(res: dict) -> dict:
         block["reference"] = {"refs": _int(ref.get("count")), "checked": _int(ref.get("checked")),
                               "flagged": _int(ref.get("flagged")),
                               "max_decile": min(10, int(max(overlaps) * 10)) if overlaps else None}
+        if ref.get("skipped") is True:                  # 超了上限、这次没比(查重照常)
+            block["reference"]["skipped"] = True
     return block
 
 

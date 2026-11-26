@@ -317,6 +317,7 @@ def _server_texts() -> dict[str, str]:
     texts["tools.CHECK_NEXT_STEP_WARN"] = T.CHECK_NEXT_STEP_WARN
     # 2026-11-26 (§3.39): 每一轮都先查重; 仿写比参考原文的那几句
     for const in ("REFERENCE_REASON", "REFERENCE_REASON_STRONG", "REFERENCE_NOTE", "REFERENCE_NOTE_STRONG",
+                  "REFERENCE_SKIPPED_NOTE", "CHECK_NEXT_STEP_WARN_REFERENCE",
                   "DESK_FIRST_POSTS", "DESK_FIRST_COMMENTS", "ANGLES_NOT_DRAWN_NOTE"):
         texts[f"tools.{const}"] = getattr(T, const)
     texts["core.JUDGE_TOOL_NOTE"] = core.JUDGE_TOOL_NOTE
@@ -390,6 +391,12 @@ def test_the_protocol_says_every_round_goes_through_check_drafts():
     assert "改出来的那版照第 4、5 条先查重、再存" in BODY, "5b 判稿之后照着改的也查重"
     assert "**不要只在第一轮查重。**" in _between(BODY, "## 几条不要犯的错", "**规则和调校笔记")
     assert "reference_overlap" not in BODY, "字段级的口径在 check_drafts 的说明里"
+    # 复审: 仿写自家爆款时本项目的品牌照写; 要改的稿子不是参考稿; 改判出来的 warn 的信号名在 decided_by 那一句里;
+    # reference_text 格式不对的报错不是查重挂了(超了上限不报错, 查重照常)
+    assert "不提那篇里的品牌（本项目的品牌照项目规则写）" in sec
+    assert "用户贴来要你改、去 AI 味的稿子不是参考稿" in sec
+    assert "`contain` / `reference`）" in SEC_CHECK and "`reference` 是照抄了参考原文，没有这一条" in SEC_CHECK
+    assert "报错说 `reference_text` 格式不对的除外：改好或不带它再查" in SEC_CHECK
 
 
 def test_server_texts_say_every_round_goes_through_check_drafts():
@@ -408,6 +415,10 @@ def test_server_texts_say_every_round_goes_through_check_drafts():
     edit = T.record_edit.__doc__
     assert "写作台也会记下来" in edit and "对回来" in edit and "不用先过 check_drafts" in edit
     assert "照常先过 check_drafts" in edit, "在他那版上接着改的, 改出来的照常查重"
+    assert "都传整篇(标题和全文)" in edit, "复审: 只传改了的那一段, 发出去的帖对不回来"
+    # 复审: 要改的稿子不是参考稿; 超了上限不拦查重; 只有 reference_text 格式不对的报错不是查重挂了
+    assert "不是参考稿" in doc and "reference_skipped_note" in doc and "skipped" in doc
+    assert "报错说的是 reference_text 的格式" in " ".join(doc.split()), "折行的地方按一个空格比"
 
 
 @pytest.mark.parametrize("problems", [

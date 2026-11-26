@@ -251,5 +251,9 @@ def test_reference_escalations_are_writer_safe(monkeypatch):
     mild = T.check_drafts(PROJ, [{"title": "机场那一夜", "body": MID}], reference_text=REF, _user_id=ME)
     assert mild["results"][0]["decided_by"] == ["reference"]
     _assert_writer_safe(mild, "check_drafts[reference, mild]")
-    for text in (T.REFERENCE_REASON, T.REFERENCE_REASON_STRONG, T.REFERENCE_NOTE, T.REFERENCE_NOTE_STRONG):
-        _assert_writer_safe({"text": text}, "tools.REFERENCE_*")
+    over = T.check_drafts(PROJ, [{"title": "机场那一夜", "body": MID}], reference_text=[REF] * 4, _user_id=ME)
+    assert over["summary"]["reference"]["skipped"] is True and "reference_skipped_note" in over
+    _assert_writer_safe(over, "check_drafts[reference, over the limit]")
+    for text in (T.REFERENCE_REASON, T.REFERENCE_REASON_STRONG, T.REFERENCE_NOTE, T.REFERENCE_NOTE_STRONG,
+                 T.REFERENCE_SKIPPED_NOTE, T.CHECK_NEXT_STEP_WARN_REFERENCE):
+        _assert_writer_safe({"text": text}, "tools.REFERENCE_* / CHECK_NEXT_STEP_WARN_REFERENCE")

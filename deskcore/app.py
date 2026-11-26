@@ -315,6 +315,22 @@ def _log_bad_arguments(name: str, arguments, cause) -> None:
         logger.warning("mcp tool %s rejected bad arguments (details could not be logged)", name)
 
 
+def _reference_text_refusal(name: str, cause) -> str | None:
+    """check_drafts 的 ``reference_text`` 类型不对(列表里有数字、传了个对象)时, SDK 的 isError 文本换成这一句(2026-11-26,
+    §3.39 复审)。SDK 原来那句是 pydantic 的消息, 带一截截断的 ``input_value`` —— 就是参考原文的开头, 而参考原文一个字都
+    不回显; 而且「工具报错」在协议里是查重挂了, 这句要说清楚是参数传错了。只有字段路径和 pydantic 的错误说明(不带输入)。
+    别的参数、别的工具照旧回 SDK 的原话(回 None)。"""
+    try:
+        errs = cause.errors(include_input=False, include_url=False, include_context=False)
+        if not any((e.get("loc") or ("",))[0] == "reference_text" for e in errs):
+            return None
+        where = "; ".join(f"{'.'.join(map(str, e.get('loc') or ()))}: {e.get('msg')}" for e in errs[:6])
+    except Exception:  # noqa: BLE001
+        where = "reference_text"
+    return (f"Error executing tool {name}: 参数格式不对({where})。reference_text 要是一段文字或几段文字的列表; "
+            "这是参数传错了, 不是查重挂了 —— 改好或者不带 reference_text, 再查一次。")
+
+
 def _log_error_result(name: str, kwargs: dict, result) -> None:
     """工具没抛、但回的是现有的那两种"出错了"的形状: 顶层带非空 ``error``(_safe 的降级; 认不出调用者现在是抛
     PermissionError, 走 _log_tool_failure)或
@@ -1180,13 +1196,16 @@ def _register_mcp():
 
     class _LoggedFastMCP(FastMCP):
         # 参数校验不过的那条路不经过 _wrap(见 _log_bad_arguments)。FastMCP 的 _setup_handlers 绑的是
-        # self.call_tool, 在这里覆盖就能接住; 只记一行再原样抛, isError 的文本不变。
+        # self.call_tool, 在这里覆盖就能接住; 只记一行再原样抛, isError 的文本不变 —— 只有一种例外(_reference_text_refusal)。
         async def call_tool(self, name, arguments):
             try:
                 return await super().call_tool(name, arguments)
             except ToolError as exc:
                 if isinstance(exc.__cause__, pydantic.ValidationError):
                     _log_bad_arguments(name, arguments, exc.__cause__)
+                    plain = _reference_text_refusal(name, exc.__cause__)
+                    if plain:
+                        raise ToolError(plain) from exc.__cause__
                 raise
 
     mcp = _LoggedFastMCP(name="deskcore", stateless_http=True, json_response=True,
