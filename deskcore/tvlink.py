@@ -222,6 +222,7 @@ class VersionIndex:
         self.by_prefix: dict[str, list[Version]] = {}
         self.by_title: dict[str, list[Version]] = {}
         self._grams: dict[str, set[str]] = {}
+        self._keys: dict[str, tuple[str, str]] = {}     # version_id → (开头键, 标题键), 建表时顺手记下(keys_of)
         for v in self.versions:
             pk = prefix_key(v.body)
             if pk:
@@ -229,6 +230,7 @@ class VersionIndex:
             tk = title_key(v.title)
             if tk:
                 self.by_title.setdefault(tk, []).append(v)
+            self._keys[v.version_id] = (pk, tk)
 
     @classmethod
     def merged(cls, *indexes: "VersionIndex") -> "VersionIndex":
@@ -237,6 +239,11 @@ class VersionIndex:
         for ix in indexes:
             out._grams.update(ix._grams)
         return out
+
+    def keys_of(self, v: Version) -> tuple[str, str]:
+        """这一版的 (prefix_key(正文), title_key(标题)): 建索引时算过的, 不再把全文归一化一遍(不在索引里的现算)。"""
+        k = self._keys.get(v.version_id)
+        return k if k is not None else (prefix_key(v.body), title_key(v.title))
 
     def grams_of(self, v: Version) -> set[str]:
         g = self._grams.get(v.version_id)
@@ -408,16 +415,23 @@ def _match_by_content(note: Note, ng: set[str], index: VersionIndex, *, exclude:
     return Match("fuzzy", best_v, best_s, lag_days(note, best_v))
 
 
-# ── 按 item 并起来再比(2026-11-26, 旧版也对) ─────────────────────────────────────────────────────────
-# 11-26 生产库: 11-09 以来四个在用的项目 255 篇对不上的帖, 和写作台里任何一段文字的四字串重合都不到 15%; 写手说他们在对话里
-# 改好几轮、只把最后一轮贴进飞书。改的那几轮里存过档的, 对照索引也只认 item 的 best(versions_for_linking) —— 发出去的是中间
-# 那一版时就对不上。可旧版不能直接塞进主索引: 同一个 item 的几版几乎一样, 开头 / 标题 / 内容三档都要领先一个差距才认, 兄弟
-# 版本永远领先不了 —— 本来对得上 best 的帖会变成 ambiguous(map_index 实测: v1 的文字在 {v1, v2} 里 0.908 对 0.908)。
+# ── 按 item 并起来再比(2026-11-26, item 存过的另一版也对) ─────────────────────────────────────────────
+# 对照索引每个 item 只有一版(store.versions_for_linking 挑的 best, 没有 best 就是 version_num 最大的); 帖的文字要是正好是这个
+# item 存过的另一版(对话里中间存过的一轮; 老的多引擎 item 一个引擎一版, 也是兄弟版本), 主索引看不见它, 回流闸量「发布前写作台里
+# 的文字」也不算它。这是个结构上的缺口, 不是 11-26 那 255 篇对不上的帖的解释: 那些帖和写作台里任何文字的四字串重合都不到
+# 15%(平均 2-5%), 从存过的哪一版发出去的帖和那一版的重合会很高(对上的帖是 84-96%) —— 它们要靠每一轮都先查重、record_edit
+# 记下写手手改的那一版才看得见。按现在的数据这一遍几乎对不上什么; 改稿多存几版(replaces_version_id)之后才会多起来。
+# 可这些版本不能直接塞进主索引: 同一个 item 的几版几乎一样, 开头 / 标题 / 内容三档都要领先一个差距才认, 兄弟版本永远领先
+# 不了 —— 本来对得上 best 的帖会变成 ambiguous(tests/test_tvlink_by_item.py 钉着: 同一段字在两个兄弟版本里一样像, 不并就分不出)。
 # 所以另走一遍: 档和线和 match_note 完全一样, 只是每次比差距之前, 同一个 item 的候选先并成一版(item_id 没有的按 version_id,
 # 各算各的) —— 比的是「哪一篇稿」, 不是「哪一版」。并的时候留: 帖在稿里最多的那版, 一样多看稿在帖里(同 match_snapshot 的
 # back: 多出来的那段帖里没有就分得开), 再一样看标题和帖一样的、开头和帖一样的(同 match_snapshot 的挑法), 再一样看发布之前存的、
-# 存得最晚的; 还一样就留排在前面的(tv-sync 合索引时定稿那一版排前面 —— 分不出时留定稿, 第二遍就不认, 是保守的那一边)。
-# 每个 item 只有一版的索引(只有 best 的那种)上它和 match_note 一模一样(tests/test_tvlink_by_item.py 钉着)。
+# 存得最晚的; 还一样就留排在前面的(tv-sync 合索引时 best 排前面 —— 分不出时留 best, 第二遍就不认, 是保守的那一边)。
+# 前两样先比, 打平了才看标题 / 开头, 用建索引时记下的键(VersionIndex.keys_of; 复审 11-26: 每个候选现算开头要把全文归一化
+# 一遍, 第二遍慢了二三十倍)。
+# ``skip``: 这篇帖不该当来源的那几版, 当它们不在(tv-sync 给的是发布之后才存的另一版: 它当不了来源, 留着只会在并的时候
+# 挡住同一个 item 发布之前存的那版, 或者让别的稿分不出)。
+# 每个 item 只有一版、skip 为空的索引(只有 best 的那种)上它和 match_note 一模一样(tests/test_tvlink_by_item.py 钉着)。
 # match_note / _pick / _match_by_content 和它们的线一个字不动: 只在 tv-sync 主索引对不上时才用它(core._match_with_older)。
 
 def _item_key(v: Version) -> str:
@@ -434,37 +448,64 @@ def _collapse(note: Note, ng: set[str], cands: list[Version], index: VersionInde
         groups.setdefault(_item_key(v), []).append(v)
     if all(len(g) == 1 for g in groups.values()):
         return list(cands)
-    pk, tk = prefix_key(note.body), title_key(note.title)
+    keys: list[str] = []                                # 帖的开头 / 标题: 打平了才算
+
+    def contain(v: Version) -> tuple[float, float]:
+        # (帖在稿里, 稿在帖里) —— 同 VersionIndex.containment 和 match_snapshot 的 back, 交集只求一次
+        g = index.grams_of(v)
+        k = len(ng & g)
+        return (k / len(ng) if ng else 0.0), (k / len(g) if g else 0.0)
 
     def rank(v: Version) -> tuple:
-        g = index.grams_of(v)
+        if not keys:
+            keys[:] = [prefix_key(note.body), title_key(note.title)]
+        pk, tk = keys
+        vpk, vtk = index.keys_of(v)
         lag = lag_days(note, v)
-        return (index.containment(ng, v), len(g & ng) / len(g) if g else 0.0,
-                bool(tk and tk == title_key(v.title)), bool(pk and pk == prefix_key(v.body)),
-                lag is None or lag >= 0, v.created_at or _NO_TIME)
+        return (bool(tk and tk == vtk), bool(pk and pk == vpk), lag is None or lag >= 0, v.created_at or _NO_TIME)
 
-    # max 遇到一样的留前面那个
-    return [g[0] if len(g) == 1 else max(g, key=rank) for g in groups.values()]
+    def pick(g: list[Version]) -> Version:
+        if len(g) == 1:
+            return g[0]
+        first = [contain(v) for v in g]
+        top = max(first)
+        tied = [v for v, f in zip(g, first) if f == top]
+        # max 遇到一样的留前面那个
+        return tied[0] if len(tied) == 1 else max(tied, key=rank)
+
+    return [pick(g) for g in groups.values()]
 
 
-class _ItemView:
-    """给 _match_by_content 的一份名单: 时间窗里每个 item 一版(_collapse), 外加只是借了开头的那几版(``exclude``, F02 ——
-    它们不参与对, 只让对不上时的分数照旧算上)。_match_by_content 只用 ``versions`` 和 ``containment``, 四字串用原索引的缓存。"""
+class IndexSubset:
+    """VersionIndex 里挑出来的几版(只读): ``versions`` 是挑出来的那几版, 四字串用原索引的缓存, 不建开头 / 标题表。
+    只给只看 versions / containment / grams_of 的地方用: _match_by_content(match_note_by_item 的内容档)、match_snapshot 的
+    ``main``(tv-sync 每篇帖去掉发布之后才存的另一版, core._OlderVersions.rivals)。"""
 
-    def __init__(self, note: Note, ng: set[str], index: VersionIndex, exclude: set[str]):
-        inside = [v for v in index.versions if v.version_id not in exclude and in_window(lag_days(note, v))]
-        keep = {v.version_id for v in _collapse(note, ng, inside, index)} | set(exclude)
-        self.versions = [v for v in index.versions if v.version_id in keep]
+    def __init__(self, index: VersionIndex, versions: Iterable[Version]):
+        self.versions: list[Version] = list(versions)
         self._index = index
+
+    def grams_of(self, v: Version) -> set[str]:
+        return self._index.grams_of(v)
 
     def containment(self, note_grams: set[str], v: Version) -> float:
         return self._index.containment(note_grams, v)
 
 
-def match_note_by_item(note: Note, index: VersionIndex) -> Match:
-    """同 match_note 的档和线, 只是同一个 item 的候选先并成一版再比差距(见上面那段)。逐行对着 match_note 写, 改那边要一起改。"""
+def _item_view(note: Note, ng: set[str], index: VersionIndex, exclude: set[str], skip) -> IndexSubset:
+    """给 _match_by_content 的名单: 时间窗里每个 item 一版(_collapse), 外加只是借了开头的那几版(``exclude``, F02 —— 它们不参与
+    对, 只让对不上时的分数照旧算上); ``skip`` 里的当不在。"""
+    inside = [v for v in index.versions if v.version_id not in exclude and v.version_id not in skip
+              and in_window(lag_days(note, v))]
+    keep = {v.version_id for v in _collapse(note, ng, inside, index)} | set(exclude)
+    return IndexSubset(index, (v for v in index.versions if v.version_id in keep))
+
+
+def match_note_by_item(note: Note, index: VersionIndex, *, skip=frozenset()) -> Match:
+    """同 match_note 的档和线, 只是同一个 item 的候选先并成一版再比差距; ``skip``(version_id)里的当不在(见上面那段)。
+    逐行对着 match_note 写, 改那边要一起改。"""
     pk = prefix_key(note.body)
-    exact = list(index.by_prefix.get(pk, ())) if pk else []
+    exact = [v for v in index.by_prefix.get(pk, ()) if v.version_id not in skip] if pk else []
     other = {v.version_id for v in exact if prefix_tail_differs(note, v, index.grams_of(v))}
     exact = [v for v in exact if v.version_id not in other]
     kind = "body_exact"
@@ -472,7 +513,7 @@ def match_note_by_item(note: Note, index: VersionIndex) -> Match:
     weak: list[Version] = []
     if not exact:
         tk = title_key(note.title)
-        exact = list(index.by_title.get(tk, ())) if tk else []
+        exact = [v for v in index.by_title.get(tk, ()) if v.version_id not in skip] if tk else []
         kind = "title_exact"
         weak = [v for v in exact if _weak_title(ng, index.grams_of(v))]
         exact = [v for v in exact if not any(v is w for w in weak)]
@@ -488,7 +529,7 @@ def match_note_by_item(note: Note, index: VersionIndex) -> Match:
             return Match(kind, v, score, lag_days(note, v), listed)
         return Match("ambiguous", None, score, None, listed)
 
-    m = _match_by_content(note, ng, _ItemView(note, ng, index, other), exclude=other)
+    m = _match_by_content(note, ng, _item_view(note, ng, index, other, skip), exclude=other)
     if weak and m.version is None:
         listed = {c["version_id"]: c for c in (m.candidates if m.kind == "ambiguous" else [])}
         scored = sorted(((index.containment(ng, v), v) for v in weak), key=lambda t: -t[0])

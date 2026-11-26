@@ -1,25 +1,30 @@
-"""tv-sync: 定稿那一版对不上的帖, 再按 item 对存过的旧版(2026-11-26)。
+"""tv-sync: 对照用的那一版(best)对不上的帖, 再按 item 对存过的另一版(2026-11-26)。
 
-11-26 生产库(只读): 11-09 以来四个在用的项目 255 篇对不上的帖和写作台里任何文字的四字串重合都不到 15%; 写手在对话里改好几轮、
-把最后一轮贴进飞书。存过档的那几轮是同一个 item 的几版, 对照索引只有 best —— 发出去的是中间那一版时就对不上, 被记成「别处写的」。
+对照索引每个 item 只有一版; 帖的文字正好是这个 item 存过的另一版(改稿之前存的一轮)时, 主索引对不上它, 回流闸量「发布前
+写作台里的文字」也不算它 —— 结构上的缺口。不是 11-26 那 255 篇对不上的帖的解释(它们和写作台里任何文字的重合都不到 15%)。
 这里钉住接线(匹配本身在 tests/test_tvlink_by_item.py):
-  1. 主索引照旧先对; 只有对不上 / 只是标题一样的才对旧版; 对上的照旧记 body_exact / title_exact / fuzzy / edited, 带 item_id,
+  1. 主索引照旧先对; 只有对不上 / 只是标题一样的才对另一版; 对上的照旧记 body_exact / title_exact / fuzzy / edited, 带 item_id,
      candidates 前面一句(不钉死对照), 单独报 older_version, counts 的键不变;
   2. 之后各步照常认它: W-40 把帖的文字记在那一版下、改稿差异按那一版算、--write-tv 写回那一版;
-  3. 不认的: 发了之后才存的旧版、和别的 item 的旧版分不出的(照旧补录, 分数取两遍里高的)、补录副本 / TV 同步来的 item 的旧版;
-  4. 回流闸量「发布前写作台里的文字」、--rescore-misses 补分数, 旧版都算, 和每晚记的同一个口径;
-  5. 指纹自愈: 旧版下有 W-40 记的帖的文字, 定稿那一版没有行时照样补。
+  3. 查重底稿先看(复审 11-26): 帖是只查过重的那一轮、比存过的那一版更像的, 按底稿转正, 不连那一版(不然两轮之间 AI 改的字
+     会被记成人改的); 底稿认不出 / 分不出 / 不比它像的才连那一版; 底稿这晚读不出、帖没日期而底稿更像的, 先不连;
+  4. 不认的: 发了之后才存的那版(也不当底稿的对手、不挡同 item 发布前存的那版)、和别的 item 的另一版分不出的(照旧补录, 分数取
+     两遍里高的)、补录副本 / TV 同步来的 item 的另一版;
+  5. 回流闸量「发布前写作台里的文字」、--rescore-misses 补分数, 另一版都算, 和每晚记的同一个口径;
+  6. 指纹自愈: 另一版下有 W-40 记的帖的文字, best 没有行时照样补。
 文字全是编的。
 """
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 import config
 from deskcore import core, store, tvlink
+from tests import test_draft_snapshots as S
 from tests import test_tv_sync as T
 from tests.test_tv_link_miss_score import FILLER
 
@@ -80,7 +85,7 @@ def _links(c) -> dict[str, dict]:
     return {l["note_id"]: l for l in c.rows["tv_note_links"]}
 
 
-# ── 1. 对上旧版 ─────────────────────────────────────────────────────────────────────────────────
+# ── 1. 对上存过的另一版 ─────────────────────────────────────────────────────────────────────────────────
 
 def test_a_post_published_from_an_older_version_links_to_it():
     c = _older_client()
@@ -90,13 +95,13 @@ def test_a_post_published_from_an_older_version_links_to_it():
     out = core.tv_sync(c, TV, write_tv=True)
     assert out["counts"] == {"already_linked": 0, "tv_lineage": 1, "body_exact": 1, "title_exact": 0, "fuzzy": 0,
                              "edited": 0, "ambiguous": 0, "unmatched": 1, "no_body": 0}, "counts 的键不变"
-    assert (out["older_version"], out["versions"], out["versions_older"], out["matched"]) == (1, 1, 1, 1)
-    assert "其中对上的是稿子存过的旧版 1" in out["note"]
+    assert (out["older_version"], out["versions"], out["older_versions_indexed"], out["matched"]) == (1, 1, 1, 1)
+    assert "其中对上的是稿子存过的另一版 1" in out["note"]
     l = _links(c)["n1"]
     assert (l["match_kind"], l["version_id"], l["item_id"], l["project_id"], l["lag_days"]) == \
         ("body_exact", "v1", "i1", P1, 2)
     head = l["candidates"][0]
-    assert head[core.TV_OLDER_KEY] is True and "旧版" in head["note"] and "定稿是 v2" in head["note"]
+    assert head[core.TV_OLDER_KEY] is True and "另一版" in head["note"] and "对照用的是 v2" in head["note"]
     assert not core._pinned(l) and not core._PIN_RE.search(head["note"]), "那一句不钉死对照"
     # W-40: 发出去的文字记在 v1 下; 改稿差异按 v1 算; --write-tv 把 v1 / i1 写回 TV
     assert [r["title"] for r in c.rows["draft_fingerprints"] if r["version_id"] == "v1"] == ["秋招投了六十份简历没回音"]
@@ -116,7 +121,7 @@ def test_the_cli_reports_older_versions(monkeypatch, capsys):
     monkeypatch.setattr(core, "sb", lambda: c)
     assert cli.main(["tv-sync", "--tv-project", TV, "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "其中对上的是稿子存过的旧版 1" in out and "另有存过的旧版 1 条" in out
+    assert "其中对上的是稿子存过的另一版 1" in out and "另有存过的另一版 1 条" in out
     assert c.rows["tv_note_links"] == []
 
 
@@ -218,26 +223,193 @@ def test_versions_for_linking_keeps_its_rows_and_the_older_rows_have_the_same_sh
     assert (v1["title"], v1["body"], v1["created_at"], v1["project_id"]) == ("秋招投了六十份", T.BODY_A, T._iso(0), P1)
 
 
-def test_an_older_version_is_a_rival_for_a_snapshot_like_any_saved_version():
-    """查重底稿(W-38)转正之前要看存过档的版本里有没有一样像的(对手): 旧版也是存过档的。这里那一版是发了之后才存的 ——
-    第二遍不连它(连上也算不了差异和「接住」), 可它和底稿分不出, 底稿也不转正, 记 ambiguous 等人看(同 best 当对手时)。"""
-    from tests import test_draft_snapshots as S
-    c = S._client([S._note("n1", "骑了一百公里", S.BODY_S)], [S._snap("s1", "骑了一百公里", S.BODY_S)])
-    c.rows["items"].append({"id": "i9", "batch_id": "b1", "best_version_id": "v9", "created_at": S._iso(5),
-                            "user_id": ME, "status": "pending"})
-    c.rows["versions"] += [
-        {"id": "v9old", "item_id": "i9", "title": "存档的标题", "body": S.BODY_S + "存档那一版末尾多了一句。",
-         "version_num": 1, "created_at": S._iso(5)},
-        {"id": "v9", "item_id": "i9", "title": NEW_TITLE, "body": REWRITE, "version_num": 2, "created_at": S._iso(6)}]
+def test_a_copy_back_sibling_does_not_hide_the_version_saved_before_publication():
+    """同一个 item: v1 发布前存的, v1cb 是发了以后把帖抄回来存的(比 v1 更像帖), best 又整篇重写了。抄回来的那版当不了来源,
+    第二遍当它不在 —— 不然并成一版时它把 v1 挡住, 自己又因为晚于发布不认, 整个 item 就对不上了(复审 11-26)。"""
+    pub = T.BODY_A + "发出去之前运营在末尾补了一句, 说第一行要写最硬的那段经历。"
+    c = _older_client([T._note("n1", "秋招投了六十份简历没回音", pub)])
+    c.rows["versions"].append({"id": "v1cb", "item_id": "i1", "title": "抄回来存的", "body": pub, "version_num": 3,
+                               "created_at": T._iso(3)})
     _join(c)
+    out = core.tv_sync(c, TV)
+    l = _links(c)["n1"]
+    assert (l["match_kind"], l["version_id"], l["lag_days"], out["older_version"]) == ("body_exact", "v1", 2, 1)
+
+
+# ── 2b. 查重底稿先看(复审 11-26) ───────────────────────────────────────────────────────────────
+# 帖是哪一轮只查过重(check_drafts 记了底稿)的字, 而这个 item 早些时候存过另一轮: 第二遍对得上存的那一轮, 可底稿是一模一样的
+# 那一轮 —— 按底稿转正, 不连存的那一轮(连了的话两轮之间 AI 自己改的字进改稿差异, 当成「人改了什么」进每周摘要)。
+
+_S = ("周末骑了一百公里, 第六十公里的时候腿开始发抖, 补给站的香蕉早就吃完了。",
+      "后来在路边小卖部买了两根能量胶, 撑到终点才发现袋子里还剩一根没开。",
+      "回家量了一下, 心率最高到了一百八十五, 第二天腿疼得下不了楼梯。",
+      "下次出门前我一定先把补给清单写在手机备忘录里, 别再靠路边小卖部救命。",
+      "这一次我把水壶也换成了大号的, 七百五十毫升, 两壶够骑六十公里。",
+      "教练说骑长途前一天要多吃碳水, 我晚饭吃了两大碗米饭。",
+      "第二天早上五点出门, 路上几乎没有车, 风也不大。",
+      "骑到第三十公里的时候太阳出来了, 我停下来抹了一层防晒。")
+ROUND1 = "".join(_S[:3])                       # 存过的那一轮
+ROUND2 = "".join(_S[:2]) + _S[3]               # 只查过重的下一轮: 最后一句换了
+ROUND_K = "".join(_S)                          # 查过重的那一轮
+ROUND_K2 = "".join(_S[:7]) + "骑到第三十公里时太阳出来, 我停在树荫下补了防晒和水。"   # AI 又改了一句, 存了
+
+
+def _snap_case(post, snaps, versions, **note):
+    """S 的项目再放一个 item i9: ``versions`` = [(vid, body, days)], 按顺序编 version_num, 最后一版是 best(整篇重写)。"""
+    c = S._client([S._note("n1", "骑了一百公里", post, **note)], snaps)
+    c.rows["items"].append({"id": "i9", "batch_id": "b1", "best_version_id": "v9", "created_at": S._iso(versions[0][2]),
+                            "user_id": ME, "status": "pending"})
+    for k, (vid, body, days) in enumerate(list(versions) + [("v9", REWRITE, versions[-1][2] + 1)], 1):
+        c.rows["versions"].append({"id": vid, "item_id": "i9", "title": "骑了一百公里" if vid != "v9" else NEW_TITLE,
+                                   "body": body, "version_num": k, "created_at": S._iso(days)})
+    return _join(c)
+
+
+def _diffs(c, nid="n1"):
+    return [(r["version_id"], r["changed"], r["removed_count"], r["added_count"])
+            for r in c.rows.get("tv_edit_diffs", []) if r["note_id"] == nid]
+
+
+def _second_pass(c, nid="n1"):
+    """只看主索引 + 第二遍(不看底稿)会连到哪一版。"""
+    older: list = []
+    best = [tvlink.Version.from_row(r) for r in store.versions_for_linking(c, S.P1, older=older)]
+    index = tvlink.VersionIndex(best)
+    ov = core._OlderVersions.build(index, best, [tvlink.Version.from_row(r) for r in older])
+    note = next(tvlink.Note.from_row(r) for r in c.rpc_impl["deskcore_tv_notes"]({"_limit": 99}) if r["note_id"] == nid)
+    m = core._match_with_older(note, index, ov)
+    return m.version.version_id if m.version is not None else None
+
+
+def test_a_checked_round_beats_an_earlier_saved_round():
+    c = _snap_case(ROUND2, [S._snap("s2", "骑了一百公里", ROUND2)], [("v9old", ROUND1, 0)])
+    assert _second_pass(c) == "v9old", "前提: 不看底稿的话第二遍连的是存过的那一轮"
     out = core.tv_sync(c, S.TV)
     l = _links(c)["n1"]
-    assert l["match_kind"] == "ambiguous" and l["version_id"] is None and out["older_version"] == 0
-    assert out["snapshots"]["ambiguous"] == 1 and out["snapshots"]["promoted"] == 0
-    assert "v9old" in {x.get("version_id") for x in l["candidates"]}
+    assert l["match_kind"] == "body_exact" and l["version_id"] not in ("v9old", "v9") and l["score"] == 1.0
+    assert (out["snapshots"]["promoted"], out["older_version"]) == (1, 0)
+    assert c.rows["draft_snapshots"][0]["version_id"] == l["version_id"]
+    assert _diffs(c) == [(l["version_id"], False, 0, 0)], "两轮之间 AI 改的那句不算人改的"
 
 
-# ── 3. 量重合 / 补分数, 旧版都算 ────────────────────────────────────────────────────────────────
+def test_a_checked_round_that_grew_from_a_saved_round_is_promoted():
+    grown = S.BODY_S + "到家以后才发现手机里存了一路的照片, 一张都没发。"
+    c = _snap_case(grown, [S._snap("s1", "骑了一百公里", grown, days=1)], [("v9old", S.BODY_S, 0)])
+    assert _second_pass(c) == "v9old"
+    out = core.tv_sync(c, S.TV)
+    l = _links(c)["n1"]
+    assert l["version_id"] not in ("v9old", "v9") and out["snapshots"]["promoted"] == 1 and out["older_version"] == 0
+    assert _diffs(c) == [(l["version_id"], False, 0, 0)]
+
+
+@pytest.mark.parametrize("post,want", [(ROUND_K, "snapshot"), (ROUND_K2, "v9old")],
+                         ids=["post_is_the_checked_round", "post_is_the_saved_round"])
+def test_one_ai_edit_apart_the_post_goes_to_whichever_round_it_is(post, want):
+    """查过重的那一轮和存过的那一轮只差一句(包含度差不到 FUZZY_MARGIN, match_snapshot 本来会说分不出): 帖是哪一轮的字就归
+    哪一轮。帖是存过的那一轮时连那一版, 底稿留着不转正。"""
+    c = _snap_case(post, [S._snap("s1", "骑了一百公里", ROUND_K)], [("v9old", ROUND_K2, 1)])
+    out = core.tv_sync(c, S.TV)
+    l = _links(c)["n1"]
+    if want == "snapshot":
+        assert l["version_id"] == c.rows["draft_snapshots"][0]["version_id"] and out["older_version"] == 0
+    else:
+        assert l["version_id"] == "v9old" and out["older_version"] == 1 and out["snapshots"]["promoted"] == 0
+        assert out["snapshots"]["ambiguous"] == 0 and c.rows["draft_snapshots"][0]["promoted_at"] is None
+    assert _diffs(c) == [(l["version_id"], False, 0, 0)]
+
+
+def test_a_copy_back_version_is_not_a_rival_for_the_snapshot():
+    """发了以后才把帖抄回写作台存的另一版(第 5 天; 帖第 2 天发): 它当不了来源, 也不当发布前查过重的那份底稿的对手 —— 当了的话
+    底稿一直分不出, 挂到 SNAPSHOT_MAX_AGE_DAYS 过了再被补录(复审 11-26)。best 当对手的样子不变。"""
+    c = _snap_case(S.BODY_S, [S._snap("s1", "骑了一百公里", S.BODY_S)],
+                   [("v9old", S.BODY_S + "存档那一版末尾多了一句。", 5)])
+    out = core.tv_sync(c, S.TV)
+    l = _links(c)["n1"]
+    assert l["match_kind"] == "body_exact" and l["version_id"] == c.rows["draft_snapshots"][0]["version_id"]
+    assert (out["snapshots"]["promoted"], out["snapshots"]["ambiguous"], out["older_version"]) == (1, 0, 0)
+
+
+def test_an_undated_post_waits_when_a_snapshot_is_closer_than_the_saved_round():
+    c = _snap_case(ROUND_K, [S._snap("s1", "骑了一百公里", ROUND_K)], [("v9old", ROUND_K2, 1)])
+    note = c.rpc_impl["deskcore_tv_notes"]({"_limit": 9})[0]
+    note["publish_time"] = None
+    out = core.tv_sync(c, S.TV)
+    l = _links(c)["n1"]
+    assert l["match_kind"] == "unmatched" and l["version_id"] is None and "填了日期再对" in l["candidates"][-1]["note"]
+    assert (out["snapshots"]["undated"], out["older_version"]) == (1, 0)
+    note["publish_time"] = S._pub(2)
+    out = core.tv_sync(c, S.TV)
+    assert _links(c)["n1"]["version_id"] == c.rows["draft_snapshots"][0]["version_id"] and out["older_version"] == 0
+
+
+def test_an_undated_post_with_no_snapshot_links_the_saved_round():
+    row = T._note("n1", "秋招投了六十份简历没回音", T.BODY_A)
+    row["publish_time"] = None
+    c = _older_client([row])
+    out = core.tv_sync(c, TV)
+    l = _links(c)["n1"]
+    assert (l["match_kind"], l["version_id"], l["lag_days"], out["older_version"]) == ("body_exact", "v1", None, 1)
+
+
+def test_unreadable_snapshots_hold_the_older_match_for_the_night(monkeypatch):
+    """底稿这晚读不出: 不知道有没有更像的那一轮, 先不连(连了就是终态: 有版本的对照每晚不重对), 记 unmatched 明晚再对。"""
+    c = _older_client([T._note("n1", "秋招投了六十份简历没回音", T.BODY_A)])
+
+    def boom(*a, **k):
+        raise RuntimeError("connection reset")
+    monkeypatch.setattr(store, "pending_draft_snapshots", boom)
+    out = core.tv_sync(c, TV)
+    l = _links(c)["n1"]
+    assert l["match_kind"] == "unmatched" and l["version_id"] is None and out["older_version"] == 0
+    assert "读不出查重底稿" in l["candidates"][-1]["note"] and out["ingest"] is None
+    monkeypatch.undo()
+    out = core.tv_sync(c, TV)
+    assert (_links(c)["n1"]["version_id"], out["older_version"]) == ("v1", 1)
+
+
+def test_a_replaced_post_moves_to_another_saved_version_with_its_w34_note():
+    """TV 里整篇换了(W-34), 重对对上的是 item 存过的另一版: 照样先过底稿那一步, 连上时 candidates 前面先是 W-34 那句。"""
+    prev = {"note_id": "n1", "tv_project_id": TV, "project_id": P1, "version_id": "v7", "item_id": "i7",
+            "match_kind": "body_exact", "score": 1.0, "lag_days": 0, "candidates": None, "tv_text_fp": "旧的指纹"}
+    c = _older_client([T._note("n1", "秋招投了六十份简历没回音", T.BODY_A)], links=[prev])
+    _item(c, "i7", [("v7", "原来连的那篇", T.BODY_NEW, 0)])
+    out = core.tv_sync(c, TV)
+    l = _links(c)["n1"]
+    assert (l["match_kind"], l["version_id"], out["drift"]["relinked"], out["older_version"]) == ("body_exact", "v1", 1, 1)
+    assert l["candidates"][0]["note"].startswith("W-34") and l["candidates"][1][core.TV_OLDER_KEY]
+
+
+def test_a_relink_back_to_the_same_saved_version_is_written_at_once(monkeypatch):
+    """重对还对回原来那一版(这里那一版是第二遍连上的另一版): 对照本来就在那一版上, 照旧马上写(不再绕一遍底稿) ——
+    tv_sync 接着要改刚写的那一行(links[-1])的指纹。"""
+    c = _older_client([T._note("n1", "秋招投了六十份简历没回音", T.BODY_A)])
+    core.tv_sync(c, TV)
+    notes = [T._note("n1", "秋招投了六十份简历没回音", T.BODY_A + "最后补一句。")]
+    c.rpc_impl["deskcore_tv_notes"] = lambda a: notes if a.get("_after") is None else []
+    monkeypatch.setattr(core.tvlink, "still_same", lambda *a, **k: False)     # 当成整篇换了, 逼它重对
+    out = core.tv_sync(c, TV)
+    l = _links(c)["n1"]
+    assert out["drift"]["kept_after_rematch"] == 1 and out["counts"]["body_exact"] == 1
+    assert (l["version_id"], out["older_version"], out["counts"]["unmatched"]) == ("v1", 1, 0)
+    assert l["tv_text_fp"] == tvlink.text_fp(tvlink.Note.from_row(notes[0])), "指纹照常在差异算好之后记上"
+
+
+@pytest.mark.skipif("via" not in {f.name for f in dataclasses.fields(tvlink.Version)},
+                    reason="和 record_edit 的写手手改版(Version.via)合并之后才有")
+def test_a_writer_edit_version_that_became_another_version_gets_no_diff():
+    """record_edit 记下的写手手改版转正之后(batch 的 params.via = record_edit)又改了稿, 它成了另一版: 第二遍连上它、TV 自己
+    指着它, 都不算改稿差异 —— 那是写手自己的字(AI → 人的差异在 style_edits 里)。另一版的行要和 best 的行一样带 via。"""
+    notes = [T._note("n1", "秋招投了六十份简历没回音", T.BODY_A),
+             T._note("n8", "TV 指向那一版", T.BODY_A, source_autowriter_version_id="v1")]
+    c = _older_client(notes)
+    c.rows["batches"][0]["params"] = {"source": "deskcore", "via": "record_edit"}
+    _join(c)
+    out = core.tv_sync(c, TV)
+    assert _links(c)["n1"]["version_id"] == "v1" and _links(c)["n8"]["version_id"] == "v1" and out["older_version"] == 1
+    assert _diffs(c, "n1") == [] and _diffs(c, "n8") == []
+
+
+# ── 3. 量重合 / 补分数, 另一版都算 ────────────────────────────────────────────────────────────────
 
 def _copy_link(score=None):
     return {"note_id": "n2", "tv_project_id": TV, "project_id": P1, "version_id": "vcopy", "item_id": None,

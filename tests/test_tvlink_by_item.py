@@ -4,7 +4,8 @@ tv-sync 主索引只有 item 的 best; 写手在对话里改几轮、发出去�
 几乎一样, 每一档都要领先一个差距才认, 它们互相领先不了 —— 本来对得上的会变成 ambiguous。这里钉住:
   1. 每个 item 只有一版的索引上, 它和 match_note 一模一样(随机生成的几百个索引逐个比整个 Match; 现有的匹配用例换成它也照过);
   2. 兄弟版本不再互相分不出, 挑的是和帖最像的那一版; 不同 item 的稿分不出照样 ambiguous;
-  3. 并的时候的先后: 帖在稿里 → 稿在帖里 → 标题和帖一样 → 开头和帖一样 → 发布之前存的 → 存得晚的 → 排在前面的。
+  3. 并的时候的先后: 帖在稿里 → 稿在帖里 → 标题和帖一样 → 开头和帖一样 → 发布之前存的 → 存得晚的 → 排在前面的;
+  4. ``skip`` 里的版本和不在索引里一模一样(tv-sync 拿它去掉发布之后才存的另一版); 并的时候不再把每个候选的全文归一化一遍。
 文字全是编的(test_tv_edits 的线性同余句子: 句子之间没有共同的四字串)。
 """
 
@@ -213,3 +214,61 @@ def test_a_full_tie_keeps_the_one_listed_first():
     a, b = _iv("best", "i1", X), _iv("old", "i1", X)
     assert L.match_note_by_item(_n(X), L.VersionIndex([a, b])).version.version_id == "best"
     assert L.match_note_by_item(_n(X), L.VersionIndex([b, a])).version.version_id == "old"
+
+
+# ── 4. skip: 当那几版不在 ─────────────────────────────────────────────────────────────────────────
+
+def _with_siblings(rng: random.Random, idx: L.VersionIndex) -> list[L.Version]:
+    """给一部分 item 加兄弟版本: 末尾多一句 / 少一句 / 换一句, 存的日子前后错开。"""
+    out = list(idx.versions)
+    for v in idx.versions:
+        if v.item_id is None or rng.random() < 0.5:
+            continue
+        sents = [x for x in v.body.split("。") if x]
+        for k in range(rng.randint(1, 2)):
+            alt = rng.choice((sents + [rng.choice(_POOL)], sents[:-1] or sents, sents[:-1] + [rng.choice(_POOL)]))
+            out.append(L.Version(version_id=f"{v.version_id}s{k}", project_id="p1",
+                                 title=v.title if rng.random() < 0.7 else "兄弟版本的标题", body=_b(*alt),
+                                 created_at=v.created_at + timedelta(days=rng.randint(-4, 4)), item_id=v.item_id))
+    rng.shuffle(out)
+    return out
+
+
+def test_skipped_versions_behave_exactly_as_if_they_were_not_in_the_index():
+    rng = random.Random(20261127)
+    hit = 0
+    for _ in range(500):
+        idx, note = _random_case(rng)
+        versions = _with_siblings(rng, idx)
+        skip = frozenset(v.version_id for v in versions if rng.random() < 0.3)
+        want = L.match_note_by_item(note, L.VersionIndex([v for v in versions if v.version_id not in skip]))
+        assert L.match_note_by_item(note, L.VersionIndex(versions), skip=skip) == want, (note, sorted(skip))
+        hit += want.version is not None
+    assert hit >= 100, hit
+
+
+def test_a_copy_back_sibling_hides_the_version_saved_before_publication_unless_skipped():
+    """i1: v1 发布前存的, v1cb 是发了以后把帖(多一句)抄回来存的, v2 定稿重写了。不去掉 v1cb, 并的时候它更像帖, 挑的是它
+    (lag < 0, tv-sync 不认, 整个 item 就对不上); 去掉之后挑 v1。"""
+    pub = X_MORE
+    fam = [_iv("v2", "i1", REWRITE, title="重写之后的标题", days=5), _iv("v1", "i1", X, days=0),
+           _iv("v1cb", "i1", pub, days=3)]
+    m = L.match_note_by_item(_n(pub), L.VersionIndex(fam))
+    assert (m.version.version_id, m.lag_days) == ("v1cb", -1)
+    m = L.match_note_by_item(_n(pub), L.VersionIndex(fam), skip=frozenset({"v1cb"}))
+    assert (m.kind, m.version.version_id, m.lag_days) == ("body_exact", "v1", 2)
+
+
+def test_collapsing_reads_the_keys_the_index_already_has(monkeypatch):
+    """打平的几版比标题 / 开头时用建索引时记下的键(VersionIndex.keys_of), 不再把每一版的全文归一化一遍(复审 11-26: 第二遍
+    原来慢了二三十倍, 几乎都花在这里)。帖自己的开头 / 标题算一次。"""
+    fam = [_iv(f"v{k}", "i1", X, days=k) for k in range(4)]            # 一模一样的四版: 全靠后面几样定
+    idx = L.VersionIndex(fam)
+    calls = []
+    real = L.prefix_key
+    monkeypatch.setattr(L, "prefix_key", lambda text: calls.append(text) or real(text))
+    note = _n(X, days=5)
+    (kept,) = L._collapse(note, L.grams(note.body), fam, idx)
+    assert kept.version_id == "v3" and calls == [note.body]
+    assert idx.keys_of(fam[0]) == (real(X), L.title_key("存档的标题"))
+
