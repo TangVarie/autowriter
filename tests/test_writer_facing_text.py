@@ -232,3 +232,24 @@ def test_judge_draft_not_configured_is_writer_safe():
     out = core.judge_draft(_rules_client(), PROJ, BODIES[0][0], BODIES[0][1], user_id=ME)
     assert out["judge_status"] == "not_configured"
     _assert_writer_safe(out, "judge_draft")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 仿写比参考原文(2026-11-26, §3.39): 改判 warn 的 reason、本来就拦下的那篇多的那一句
+# ══════════════════════════════════════════════════════════════════════
+
+def test_reference_escalations_are_writer_safe(monkeypatch):
+    from tests.test_check_drafts_reference import COPY, IMIT, MID, REF, REF_B
+    c = _desk()
+    monkeypatch.setattr(core, "sb", lambda: c)
+    drafts = [{"title": "带爸妈出国没网", "body": COPY}, {"title": "换了个标题", "body": COPY},
+              {"title": "东京那段路", "body": IMIT}]
+    out = T.check_drafts(PROJ, drafts, reference_text=[REF_B, REF], _user_id=ME)
+    assert [r["status"] for r in out["results"]] == ["warn", "reject", "pass"], "用例的前提: 改判、本批内拦下、没到线"
+    assert "reference_note" in out["results"][1]
+    _assert_writer_safe(out, "check_drafts[reference]")
+    mild = T.check_drafts(PROJ, [{"title": "机场那一夜", "body": MID}], reference_text=REF, _user_id=ME)
+    assert mild["results"][0]["decided_by"] == ["reference"]
+    _assert_writer_safe(mild, "check_drafts[reference, mild]")
+    for text in (T.REFERENCE_REASON, T.REFERENCE_REASON_STRONG, T.REFERENCE_NOTE, T.REFERENCE_NOTE_STRONG):
+        _assert_writer_safe({"text": text}, "tools.REFERENCE_*")

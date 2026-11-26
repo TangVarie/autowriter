@@ -44,7 +44,7 @@ FLUSH_SEC = 2.0                           # 进程退出时最多等这么久把
 FAIL_LOG_EVERY_SEC = 300.0                # 写不进去 / 队列满: 这么久最多记一行日志
 
 OUTCOMES = ("ok", "error_result", "refused", "failed", "interrupted")
-_SIGNALS = frozenset({"opening", "title", "ngram", "contain"})
+_SIGNALS = frozenset({"opening", "title", "ngram", "contain", "reference"})   # reference: 仿写比参考原文那一路(2026-11-26, §3.39)
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _HEX8 = re.compile(r"[0-9a-f]{8}")
 # 认得的词: 只有 ASCII 的字母、数字、下划线、点(异常类型名带模块), 后面可以跟一个错误码。中文、空格、标点一律不是
@@ -138,6 +138,16 @@ def _check_block(res: dict) -> dict:
         block["gates"] = gates
     if summary.get("semantic_degraded"):
         block["semantic_degraded"] = True
+    ref = summary.get("reference")
+    if isinstance(ref, dict):
+        # 这次带了参考原文(2026-11-26, docs/deskcore.md §3.39): 只留几个数 —— 传了几段、算了几篇、几篇到线, 最像的那篇落在
+        # 第几成(0~10, 取整: _clean 不收小数)。没带参考原文就没有这个键, 和原来那一行一模一样。参考原文、第几段都不记。
+        rows = res.get("results") if isinstance(res.get("results"), list) else []
+        overlaps = [row.get("reference_overlap") for row in rows if isinstance(row, dict)]
+        overlaps = [v for v in overlaps if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1]
+        block["reference"] = {"refs": _int(ref.get("count")), "checked": _int(ref.get("checked")),
+                              "flagged": _int(ref.get("flagged")),
+                              "max_decile": min(10, int(max(overlaps) * 10)) if overlaps else None}
     return block
 
 

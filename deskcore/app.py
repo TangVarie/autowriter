@@ -1207,6 +1207,9 @@ def _register_mcp():
                                        "open_project / comments_for 每次带上 "
                                        "skill_version (同一个值)。稿子写完过了 check_drafts 就调 score_drafts "
                                        "(存档 + 参考分, 不拦), 不用等用户定稿。"
+                                       # 2026-11-26 (§3.39): 后面几轮的稿子从没过查重, 发出去写作台认不回来
+                                       "每一版要给用户看的笔记稿都先过 check_drafts, 哪一轮都一样: 改稿、接着写、仿写、"
+                                       "去 AI 味重写的都算; 仿写一篇参考稿时把参考原文放进 check_drafts 的 reference_text。"
                                        "任何工具的返回里出现 skill_update, 就把它的 message 原样放进开场、"
                                        "复述项目名之后(同一条只放一次), 这就是升级提醒, 不另说别的。"))
 

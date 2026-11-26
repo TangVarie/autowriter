@@ -2844,6 +2844,7 @@ def _judge_committed(client, project_id: str, targets: list[dict],
 # 写手手里; 项目号 / 品类按 tv_project_map 定(与存档时的判定同一条路 _judge_project_context, 数据出境口径
 # docs/00 #7 由 judge 执行并回显在 policy)。仍然一次 LLM 调用都没有。
 JUDGE_TOOL_NOTE = ("这是写后的深一层参考判定(score_drafts 存档时已经自动打过分), 不拦交付、不落账本。hard_fails / plan 拿去改稿, 改完最多再判一轮; "
+                   "改出来要给用户的那一版照常先过 check_drafts 再 score_drafts(改的是存过的那篇就带 replaces_version_id)。"
                    "judge_status 不是 ok 时如实告诉用户判定这次没拿到, 查重和入库照常走。")
 
 

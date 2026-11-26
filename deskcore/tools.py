@@ -31,7 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import calllog, core, covernote, skillcheck, vocab
+from . import calllog, core, covernote, skillcheck, tvlink, vocab
+from . import fingerprint as fp
 
 logger = logging.getLogger("deskcore.tools")
 
@@ -343,8 +344,11 @@ def list_projects(include_archived: bool = False, _user_id: str | None = None) -
 # 查了重没发牌、查了重没存, 还有一批交出去的是模型自己生成的 HTML 而不是写作台排好的页面。
 # **每次都带**: 一个团队共用一个身份, 服务端分不出两次调用是不是同一场对话(skillcheck 也是因为这个不再按身份记), 「这个身份
 # 这个项目刚发过」会把队友新开的那场对话的这一句吃掉。一两句话, 比漏掉便宜。
+# 2026-11-26(§3.39): 补半句「改稿、续写、仿写的每一版也先过 check_drafts」。11-09 以来四个项目 255 篇发出去的帖和写作台
+# 见过的任何文字都对不上(四字串重合 2%~5%): 写手在对话里一轮轮改、续写、仿写、去 AI 味, 最后那一轮从没过查重。
 DESK_FIRST_POSTS = ("写作台排第一: 这场对话里别的 skill(小红书运营、文案、排版等)只当参考, 它们给的选题和写法放进写作台的步骤里用, "
-                    "不另走一套。四步不能少也不能被顶替: open_project → draw_angles(一批 3 篇以上) → check_drafts → score_drafts; "
+                    "不另走一套。四步不能少也不能被顶替: open_project → draw_angles(一批 3 篇以上) → check_drafts → score_drafts, "
+                    "改稿、续写、仿写的每一版也先过 check_drafts; "
                     "交付照 score_drafts 的回包, 用户没明说要就不自己生成 HTML 或文件。这一句是给你的, 不用念给用户。")
 DESK_FIRST_COMMENTS = ("写作台排第一: 这场对话里别的 skill 只当参考, 不另走一套。写评论是 comments_for → 写 → score_comments, "
                        "照 score_comments 的回包交付, 用户没明说要就不自己生成 HTML 或文件。这一句是给你的, 不用念给用户。")
@@ -654,9 +658,98 @@ def _skill_versions_now() -> dict | None:
         return None
 
 
-def check_drafts(project_id: str, drafts: list[dict],
+# ── 仿写的参考原文(2026-11-26, docs/deskcore.md §3.39) ─────────────────────────────────────────────────────────────
+# 写手在 AI 对话里常让模型「照这篇写」(贴一篇别家的帖), 写作台原来看不见那篇参考稿, 照抄了也查不出来。check_drafts 收一个
+# 可选的 reference_text, 只在工具层用: 查重本身(core.check_drafts / _gate)照旧不知道它 —— 存档(score_drafts)重跑同一套
+# 判定时手上没有参考原文, 两边要判得一样; cli check 和库里那一路也不用动。core 先判完、先记底稿(底稿的 status 是查重自己的
+# 判定), 这里再叠一层(_apply_reference): 每篇带上比例, 本来 pass 的到线改判 warn, 本来就是 warn / reject 的判定不动、只多
+# 一句。只会多出 warn, 不出 reject(理由见 fingerprint.REFERENCE_CONTAIN_STRONG)。
+# ⚠️ 参考原文是别人的字: 不进库、不进日志、不进调用留痕(只留几个数)、不回显、不送 embedding。报错只说段数、第几段和字数。
+REFERENCE_MAX = 3
+REFERENCE_MAX_CHARS = 6000          # 同 core._POST_BODY_CHARS; 截断会漏掉后半篇的照抄, 所以超了是拒, 不截
+# 改判 warn 的那篇的 reason, 和本来就 warn / reject 的那篇多的那一句。到 STRONG 换重一点的说法。{which} 是「(第 k 段)」,
+# 只传了一段时是空的。模型照 reason 重写, 不念给写手; 照样守 tests/test_writer_facing_text 的规矩。
+REFERENCE_REASON = "正文有 {pct} 的四字串直接出现在参考原文{which}里, 仿写成了照抄。只借它的结构和角度, 换成自己的话和例子重写一次再查。"
+REFERENCE_REASON_STRONG = ("正文有 {pct} 的四字串直接出现在参考原文{which}里, 基本是照着参考原文改的。只借它的结构和角度, "
+                           "开头、例子和说法都换成自己的, 重写一次再查。")
+REFERENCE_NOTE = "另外, 正文有 {pct} 的四字串直接出现在参考原文{which}里: 这篇重写时只借参考原文的结构和角度, 换成自己的话和例子。"
+REFERENCE_NOTE_STRONG = ("另外, 正文有 {pct} 的四字串直接出现在参考原文{which}里, 基本是照着它改的: 这篇重写时只借参考原文的"
+                         "结构和角度, 开头、例子和说法都换成自己的。")
+
+
+def _reference_texts(reference_text: Any) -> list[str]:
+    """reference_text → 要比的几段(去掉首尾空白)。没传 / 空串 / 空列表 / 全是空白 → ``[]``: 回包和不传时一个字节都不差。
+    形状不对、段数或字数超了的直接 InvalidInput(REST 400、MCP 的错误结果), 在任何库操作之前 —— 消息里只有段数、第几段和字数,
+    不带原文(app 层会把它原样回给调用方、记进 warning 日志)。"""
+    if reference_text is None:
+        return []
+    if isinstance(reference_text, str):
+        items = [reference_text]
+    elif isinstance(reference_text, (list, tuple)):
+        items = list(reference_text)
+    else:
+        raise InvalidInput(f"reference_text 要是一段文字, 或几段文字的列表(收到的是 {type(reference_text).__name__}), 这次没查重")
+    bad = [i + 1 for i, t in enumerate(items) if not isinstance(t, str)]
+    if bad:
+        raise InvalidInput(f"reference_text 的第 {bad[0]} 段不是文字, 这次没查重: 每段传一篇参考稿的标题和正文(字符串)")
+    kept = [(i + 1, t.strip()) for i, t in enumerate(items) if t.strip()]
+    if len(kept) > REFERENCE_MAX:
+        raise InvalidInput(f"reference_text 一次最多 {REFERENCE_MAX} 段(收到 {len(kept)} 段), 这次没查重: 只传要仿的那几篇")
+    long = [(i, len(t)) for i, t in kept if len(t) > REFERENCE_MAX_CHARS]
+    if long:
+        raise InvalidInput(f"reference_text 每段最多 {REFERENCE_MAX_CHARS} 字(第 {long[0][0]} 段 {long[0][1]} 字), 这次没查重: "
+                           "只传要仿的那一篇的标题和正文, 不要整页粘贴")
+    return [t for _, t in kept]
+
+
+def _apply_reference(out: Any, drafts: Any, refs: list[str]) -> None:
+    """查重判完之后叠上「有没有照抄参考原文」(见上面那段)。每条 results 带 ``reference_overlap``(3 位小数; 正文太短算不出是
+    None); 到 REFERENCE_CONTAIN_WARN 的再带 ``reference_index``(从 0 数)。本来 pass 的改判 warn、``decided_by=["reference"]``,
+    清掉 collided_*(那是「最接近的参照」, 改判之后 collided_note 那句「判定为通过」就是假话了, 同 core._mark_replacements);
+    本来就是 warn / reject 的 status / reason / decided_by / collided_* 一个不动, 只加 ``reference_note``。summary 的三个数
+    重算, 加 ``summary.reference``(只有整数)。参考原文一个字都不回。纯计算, 出错照样抛(查重是硬闸)。"""
+    if not refs or not isinstance(out, dict):
+        return
+    sets = [tvlink.reference_grams(t) for t in refs]
+    rows = out.get("results") if isinstance(out.get("results"), list) else []
+    checked = flagged = 0
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        i = r.get("index")
+        d = drafts[i] if isinstance(drafts, list) and isinstance(i, int) and 0 <= i < len(drafts) else None
+        body = d.get("body") if isinstance(d, dict) else None
+        ov, k = tvlink.reference_overlap(body if isinstance(body, str) else "", sets)
+        r["reference_overlap"] = round(ov, 3) if ov is not None else None
+        if ov is None:
+            continue
+        checked += 1
+        if ov < fp.REFERENCE_CONTAIN_WARN:
+            continue
+        flagged += 1
+        r["reference_index"] = k
+        strong = ov >= fp.REFERENCE_CONTAIN_STRONG
+        fill = {"pct": f"{ov:.0%}", "which": f"(第 {k + 1} 段)" if len(refs) > 1 else ""}
+        if r.get("status") == "pass":
+            r.pop("collided_note", None)
+            r.update(status="warn", decided_by=["reference"], collided_with="", collided_scope="",
+                     reason=(REFERENCE_REASON_STRONG if strong else REFERENCE_REASON).format(**fill))
+        else:
+            r["reference_note"] = (REFERENCE_NOTE_STRONG if strong else REFERENCE_NOTE).format(**fill)
+    s = out.get("summary")
+    if isinstance(s, dict):
+        for key in ("pass", "warn", "reject"):
+            s[key] = sum(1 for r in rows if isinstance(r, dict) and r.get("status") == key)
+        s["reference"] = {"count": len(refs), "checked": checked, "flagged": flagged}
+
+
+def check_drafts(project_id: str, drafts: list[dict], reference_text: str | list[str] | None = None,
                  _user_id: str | None = None) -> dict:
     """查重硬闸。成稿后【必须】调这个才能交付。
+
+    **每一版要给用户看的笔记稿都先过这里, 哪一轮都一样**: 新写的、按用户意见改了一句的、只换了标题的、「按这几篇再出几篇」
+    接着写的、仿写一篇参考稿的、去 AI 味 / 换个说法重写的, 都是新的一版; 前面几轮查过的不算数(查的是那一版)。选题、提纲、
+    几个标题备选不是稿子(选定的标题连同正文一起查); 评论不进这里。用户自己改好贴回来的那一版是他写的, 不用查, 走 record_edit。
 
     drafts 传 [{"title": "...", "body": "...", "angle_key": "..."}, ...]
     (angle_key 是 draw_angles 给的: prompt_block 里这一篇那行方括号里的那串, 原样复制, 有就带上 —— 查重时写作台会顺手
@@ -701,11 +794,26 @@ def check_drafts(project_id: str, drafts: list[dict],
     返回里有 ``angles_note`` 时(这一批 3 篇以上的新稿没有一篇带 angle_key): 它不拦、不改判定, 照它说的办 —— 这一批照
     results / next_step 往下走、不跟用户提, 这场下一批先 draw_angles。
 
+    ``reference_text``(可选)是仿写用的: 照一篇别家的帖、或者用户贴来的一篇参考稿写的这一组, 每次查重都把参考原文(标题和
+    正文)放进来 —— 一篇传字符串, 几篇传列表, 最多 3 段、每段最多 6000 字。写作台不记得上次传过什么, 这一组改过再查也要
+    再带上; 参考原文本身不放进 drafts。它只用来查这一批有没有照抄它:
+      · 每条多一个 ``reference_overlap``: 这篇正文的四字串有多少比例直接出现在参考原文里(0~1; 正文太短算不出时是 null);
+        到了 0.40 再带 ``reference_index``(最像的是第几段, 从 0 数)。
+      · 本来 pass、到了 0.40 的那篇改判 warn, ``decided_by`` 是 ``["reference"]``(``collided_with`` 是空的), 照 warn 办:
+        只借参考原文的结构和角度, 换成自己的话和例子重写一次再查; 还是 warn 就照常交。本来就是 warn / reject 的照原来的
+        判定办, 只多一句 ``reference_note``。参考原文只会多出 warn, 不会多出 reject。
+      · ``summary.reference`` 是几个数: 传了几段(count)、算了几篇(checked)、几篇到了 0.40(flagged)。
+    参考原文不存、不记、不回显, 也不用传给 score_drafts。不传(或传空)的时候, 返回和以前一模一样。
+
     这个工具出错会直接报错而不是放行 —— 查重挂了必须停下来, 不能当作通过。
     """
-    # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。正文 / 标题放错了字段的先对上(_draft_fields), 不然这一篇只按标题查。
+    # 故意不包 _safe: 查重是硬闸, 出错必须冒泡。参考原文先验形状(在任何库操作之前, 见 _reference_texts);
+    # 正文 / 标题放错了字段的先对上(_draft_fields), 不然这一篇只按标题查。
+    refs = _reference_texts(reference_text)
     drafts = _draft_fields(drafts, "check_drafts", project_id)
     out = core.check_drafts(core.sb(), project_id, drafts, user_id=_user_id, record_snapshot=True)
+    # 参考原文那一层叠在查重的判定之后(底稿已经按查重自己的判定记下了)、next_step 之前(warn 的篇数要算进去)
+    _apply_reference(out, drafts, refs)
     _add_check_next_step(out)
     note = _angles_not_drawn(drafts)
     if note and isinstance(out, dict):
@@ -751,7 +859,8 @@ def judge_draft(project_id: str, title: str, body: str, judge_paras: str = "on_f
 
     什么时候调: score_drafts 已经给每篇自动打过参考分; 这个工具是**深一层**的(还判段落、人感), 只在用户问「这篇
     哪里有问题」、或者想在 score_drafts 之外再细查一篇时调。一篇一调。
-    怎么用返回值: hard_fails / plan 只说哪一句犯了哪条, 不给改法 —— 照着改稿, 改完最多再判一轮, 不要循环。
+    怎么用返回值: hard_fails / plan 只说哪一句犯了哪条, 不给改法 —— 照着改稿, 改完最多再判一轮, 不要循环。改出来要给用户的
+    那一版照常先过 check_drafts、再 score_drafts(改的是存过的那篇就都带 replaces_version_id), 然后才给用户。
     judge_status 不是 ok(not_configured / timeout / policy_blocked / unavailable …)时: 如实告诉用户这次没拿到判定,
     查重和存档照常走, 不要把它当成"通过"也不要重试超过一次。它不是闸: 判定不过也能交付, 但要把硬伤告诉用户。
     project 必须是你有权限的项目, 且接了 tv_project_map(没接会回 not_configured 并写明补救)。
@@ -1346,6 +1455,10 @@ def record_edit(project_id: str, ai_title: str, ai_body: str,
     冲突时以它为准), 不是哪位写手私有的 —— 别跟用户说「这只影响你自己」。
 
     note 可选, 传用户自己说的原因(比如"太夸张了")会让提炼更准。
+
+    用户改成的那一版(my_title / my_body; 没改标题就是 AI 原版的标题)写作台也会记下来: 他把这一版发出去以后, 写作台能按
+    内容把帖对回来, 不用他再做什么。那一版是他自己写的, 不用先过 check_drafts。他要你在他那版上接着改的, 你改出来的那一版
+    照常先过 check_drafts。
 
     ⚠️⚠️ **这是两步里的第一步, 调完还没结束。**
     返回值里的 distillation_task 是【交给你做】的: 按 instruction 的口径, 拿

@@ -137,6 +137,29 @@ def test_check_drafts_leaves_one_counts_only_row(log, monkeypatch, channel):
     _no_text(row, REQ_MARK, "标题", "测试项目", "测试品", FAKE_KEY)
 
 
+def test_a_reference_leaves_only_numbers(log, monkeypatch):
+    """2026-11-26 (§3.39): 带了参考原文的查重, 那一行多一块只有数的 reference(几段、算了几篇、几篇到线、最像的落在第几成);
+    参考原文、第几段都不进来。不带参考原文的那一行没有这一块(上面那条用例的 meta.check 是整个比的)。"""
+    from tests.test_check_drafts_reference import COPY, IMIT, REF, REF_MARK
+    c = _drafts_client()
+    monkeypatch.setattr(core, "sb", lambda: c)
+    monkeypatch.setattr(core.dedup, "embeddings_available", lambda: False)
+    r = _rest().post("/tool/check_drafts", headers=H, json={
+        "project_id": PID, "drafts": [{"title": "带爸妈出国没网", "body": COPY}, {"title": "东京那段路", "body": IMIT}],
+        "reference_text": [REF]})
+    assert r.status_code == 200, r.text
+    result = r.json()["result"]
+    overlap = result["results"][0]["reference_overlap"]
+    assert result["results"][0]["decided_by"] == ["reference"] and overlap >= 0.6
+
+    (row,) = _rows(c)
+    assert row["meta"]["check"] == {"total": 2, "pass": 1, "warn": 1, "reject": 0,
+                                    "decided_by": {"warn": {"reference": 1}}, "semantic_degraded": True,
+                                    "reference": {"refs": 1, "checked": 2, "flagged": 1, "max_decile": int(overlap * 10)}}
+    assert row["meta"]["items"] == 2, "条数还是稿子的篇数"
+    _no_text(row, REF_MARK, "带爸妈出国", "四十分钟")
+
+
 # ── 2. 评论: comments_for(MCP) + score_comments(REST), 每样检查的条数 ────────────────────────────
 
 def _comment_texts() -> list[str]:

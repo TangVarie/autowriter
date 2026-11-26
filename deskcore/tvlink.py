@@ -568,6 +568,28 @@ def overlap(note: Note, v: Version) -> float:
     return len(ng & grams(v.body)) / len(ng) if ng else 0.0
 
 
+# ── 仿写的稿子有没有照抄参考原文(2026-11-26, check_drafts 的 reference_text, docs/deskcore.md §3.39) ─────────────
+# 和上面 overlap 同一个方向、同一把尺子: 稿子的四字串有多少比例出现在参考原文里。两边都先剥话题标签(同题的稿子常带同一串
+# 标签, 不剥会互相抬高)。纯函数, 不碰库, 不调 embedding: 参考原文是别人的字, 不往任何外部服务送。
+
+def reference_grams(text: str | None) -> set[str]:
+    """一段参考原文的四字串(剥了话题标签)。"""
+    return grams(strip_hashtags(text))
+
+
+def reference_overlap(body: str | None, ref_gram_sets: list[set[str]]) -> tuple[float | None, int | None]:
+    """(稿子正文的四字串有多少比例出现在这几段参考原文的并集里, 和它交集最大的是第几段 —— 从 0 数, 一样大取前面那段)。
+
+    用并集: 从两段参考稿各抄一半拼起来的, 单看哪一段都不到线。正文太短(四字串不到 FUZZY_MIN_GRAMS, 同查重的
+    CONTAIN_MIN_SAMPLE)或者没有参考原文时回 (None, None): 样本太小, 比例没有意义, 不判。"""
+    ng = grams(strip_hashtags(body))
+    if len(ng) < FUZZY_MIN_GRAMS or not ref_gram_sets:
+        return None, None
+    union = set().union(*ref_gram_sets)
+    best = max(range(len(ref_gram_sets)), key=lambda k: (len(ng & ref_gram_sets[k]), -k))
+    return len(ng & union) / len(ng), best
+
+
 def still_same(note: Note, v: Version) -> bool:
     """改过字之后, 这条笔记还是当初对上 v 的那一篇吗? 只拦整篇换掉的, 改几句、删一段的都算还是。
 
