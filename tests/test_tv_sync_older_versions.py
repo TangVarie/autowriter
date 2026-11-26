@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -394,8 +393,6 @@ def test_a_relink_back_to_the_same_saved_version_is_written_at_once(monkeypatch)
     assert l["tv_text_fp"] == tvlink.text_fp(tvlink.Note.from_row(notes[0])), "指纹照常在差异算好之后记上"
 
 
-@pytest.mark.skipif("via" not in {f.name for f in dataclasses.fields(tvlink.Version)},
-                    reason="和 record_edit 的写手手改版(Version.via)合并之后才有")
 def test_a_writer_edit_version_that_became_another_version_gets_no_diff():
     """record_edit 记下的写手手改版转正之后(batch 的 params.via = record_edit)又改了稿, 它成了另一版: 第二遍连上它、TV 自己
     指着它, 都不算改稿差异 —— 那是写手自己的字(AI → 人的差异在 style_edits 里)。另一版的行要和 best 的行一样带 via。"""

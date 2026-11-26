@@ -344,7 +344,7 @@ def test_a_failed_snapshot_write_never_changes_the_verdict(monkeypatch, caplog):
 
 def test_check_drafts_still_raises_when_the_gate_itself_fails(monkeypatch):
     # 记底稿 fail-open 不能把查重本身也变成 fail-open。2026-11-26: 查重抛了也先把稿子记下(status = gate_error), 再原样上抛
-    # 同一个异常 —— 以前这一批一行不留(11-18..11-23 生产库 57014 超时 22 次, 那几批发出去都成了「别处写的」)
+    # 同一个异常 —— 以前这一批一行不留(11-18..11-23 生产库 57014 超时 22 次, 那几批发出去 TV 都认不回写作台)
     c = _desk()
     boom = RuntimeError("history down")
     monkeypatch.setattr(core, "_gate", lambda *a, **k: (_ for _ in ()).throw(boom))

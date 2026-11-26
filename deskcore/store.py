@@ -4330,14 +4330,7 @@ def is_ingest_batch(batch: dict | None) -> bool:
 def batch_via(batch: dict | None) -> str | None:
     """这个 batch 的 ``params.via``(2026-11-26): "snapshot" = 查重底稿转正的, "record_edit" = 只由 record_edit 记下的写手
     手改版转正的; 存档建的没有这个键。读不出回 None。"""
-    params = (batch or {}).get("params")
-    if isinstance(params, str):
-        import json
-        try:
-            params = json.loads(params)
-        except ValueError:
-            return None
-    via = params.get("via") if isinstance(params, dict) else None
+    via = _as_params((batch or {}).get("params")).get("via")
     return via if isinstance(via, str) else None
 
 

@@ -1819,7 +1819,7 @@ def check_drafts(client, project_id: str, drafts: list[dict],
             _mark_replacements(out, replace, bad_ref)
     except Exception:
         # 查重本身抛了(2026-11-26): 11-18..11-23 生产库 57014 语句超时 22 次, 那几批稿子以前只在判定算完之后才记底稿,
-        # 一抛就一行没留, 发出去以后 TV 只能标成「别处写的」。现在先把稿子记下(status = gate_error, 没有判定), 再原样上抛 ——
+        # 一抛就一行没留, 发出去以后 TV 认不回写作台(记成 elsewhere, 11-26 起印「写作台没见过的文字」)。现在先把稿子记下(status = gate_error, 没有判定), 再原样上抛 ——
         # 查重照旧不 fail-open(上面 ⚠️), 模型照旧看到报错、重查。记底稿自己再出错也只记 WARN, 绝不顶掉原来那个异常。
         # 只接 Exception: 调用被取消(CancelledError / KeyboardInterrupt)的不记。
         if record_snapshot:
@@ -10499,7 +10499,7 @@ def record_edit(client, project_id: str, *, user_id: str,
                 "reason": "AI 版与手改版完全一致, 不是有效信号, 未入库"}
 
     # 写手手改后的那一版也记一行底稿(2026-11-26, status = writer_edit): 写手在对话里改完直接贴进飞书, 这一版以前从没
-    # 到过服务端, 发出去以后 TV 只能标成「别处写的」。只改了一边的(另一边没给, 或只给了空白), 另一边用 AI 那一版(发出去的
+    # 到过服务端, 发出去以后 TV 认不回写作台(记成 elsewhere)。只改了一边的(另一边没给, 或只给了空白), 另一边用 AI 那一版(发出去的
     # 就是它; 先 strip 再判, 同上面「完全一致」那一关)。不带 angle_key(这里不知道是哪张牌, 不销牌)、不记飞轮臂 / 看到了
     # 哪几张卡。tv-sync 只拿它兜底: 帖对得上 AI 那一版查重时记下的底稿就照旧连那一份(销牌、记臂、算 AI → 发出去的改稿差异);
     # 别的底稿都对不上、只对得上它的, 转正的 batch 记 via = record_edit, 不算改稿差异(那是写手自己的字, AI → 人的差异已经在
