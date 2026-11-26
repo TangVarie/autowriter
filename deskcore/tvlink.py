@@ -156,12 +156,15 @@ class Version:
     body: str
     created_at: datetime | None
     item_id: str | None = None
+    # 这一版所在 batch 的 params.via(2026-11-26): "record_edit" = record_edit 记下的写手手改版转正来的, tv-sync 不给连着它的帖
+    # 算改稿差异(core._tv_edit_diffs)。别的(存档的、"snapshot"、读不到)对照一律照旧, 只是带着。
+    via: str | None = None
 
     @classmethod
     def from_row(cls, r: dict) -> "Version":
         return cls(version_id=str(r["version_id"]), project_id=str(r.get("project_id") or ""),
                    title=(r.get("title") or "").strip(), body=(r.get("body") or "").strip(),
-                   created_at=_as_dt(r.get("created_at")), item_id=r.get("item_id"))
+                   created_at=_as_dt(r.get("created_at")), item_id=r.get("item_id"), via=r.get("via"))
 
 
 @dataclass
@@ -438,6 +441,8 @@ def match_all(notes: Iterable[Note], index: VersionIndex) -> dict[str, Match]:
 
 # ── 查重时记下的底稿(2026-10-29, W-38) ─────────────────────────────────────────────────────────
 # 写手没有「存档」这一步(D-120): 模型没调 score_drafts 的稿子, 写作台只在 check_drafts 那一刻见过它(draft_snapshots)。
+# 2026-11-26 起底稿还有查重出错时记下的(gate_error)和 record_edit 记下的写手手改版(writer_edit), 这里一视同仁 —— 转不转正、
+# 算不算写作台见过的字由 core._snapshot_groups 按 status 定好了才交过来。
 # 对不上写作台版本的帖, tv-sync 再拿这些底稿对一次, 对上了就把底稿转成真的版本(建 item / version、写指纹、销牌)——
 # 那是实打实写进库的, 所以比 match_note 严:
 #   · 帖要有发布日期, 底稿要早于帖: 发布那天 − 第一次查重那天(北京日历日)在 0..WINDOW_AFTER_DAYS 天; 晚于发布的不认

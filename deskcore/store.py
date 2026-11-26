@@ -3457,6 +3457,8 @@ def update_commit_metrics_meta(sb, row_id: str, meta: dict) -> None:
 
 
 # ── 查重时记下的底稿(migrations/018, W-38) ─────────────────────────────────────
+# status 里查重真下过的判定(同 core.SNAPSHOT_VERDICTS); 另有 gate_error / writer_edit 两种不是判定(2026-11-26, 见 core 那段)
+SNAPSHOT_VERDICT_STATUSES = frozenset({"pass", "warn", "reject"})
 SNAPSHOT_COLS = ("id, project_id, user_id, check_id, title, body, angle_key, text_fp, status, "
                  "flywheel_arm, flywheel_arm_source, checked_at")
 
@@ -3573,7 +3575,11 @@ def snapshotted_angle_keys(sb, project_id: str, user_id: str | None, days: int) 
     (W-38): 这些牌的稿子已经写出来、查过重了, 发出去以后 tv-sync 会从飞书对回来销账 —— 那次查重之前抽的不算"抽了没写"
     (之后又抽到的照旧算, 见 angle_debt)。最近一次是 reject 的(查重打回、可能没再写)照旧算欠着。读不到(018 没跑 / 任何
     错误)回空: 只是少排除几张, 不能把简报弄坏。只收能安全放进 in_() 查询的形状(_LEDGER_LOOKUP_KEY); 调用方再按发牌的
-    形状筛。"""
+    形状筛。
+
+    挑「最近一次」只看真下过判定的行(pass / warn / reject, 2026-11-26): 查重出错时记下的(gate_error)、record_edit 的写手
+    手改版(writer_edit, 本来就不带 angle_key)不是判定 —— 先通过、重查时查重超时了, 那张牌照旧算写过了, 不因为一次出错
+    回到「抽了没写」。只有出错的行、没有判定的那张照旧算欠着。"""
     if not user_id:
         return {}
     try:
@@ -3589,6 +3595,8 @@ def snapshotted_angle_keys(sb, project_id: str, user_id: str | None, days: int) 
     for r in rows:
         k = str(r.get("angle_key") or "")
         at = str(r.get("checked_at") or "")
+        if r.get("status") not in SNAPSHOT_VERDICT_STATUSES:
+            continue
         if _LEDGER_LOOKUP_KEY.fullmatch(k) and (k not in latest or at >= latest[k][0]):
             latest[k] = (at, r.get("status"))
     return {k: at for k, (at, status) in latest.items() if status in ("pass", "warn")}
@@ -4315,6 +4323,20 @@ def is_ingest_batch(batch: dict | None) -> bool:
     return isinstance(params, dict) and params.get("source") == "ingest"
 
 
+def batch_via(batch: dict | None) -> str | None:
+    """这个 batch 的 ``params.via``(2026-11-26): "snapshot" = 查重底稿转正的, "record_edit" = 只由 record_edit 记下的写手
+    手改版转正的; 存档建的没有这个键。读不出回 None。"""
+    params = (batch or {}).get("params")
+    if isinstance(params, str):
+        import json
+        try:
+            params = json.loads(params)
+        except ValueError:
+            return None
+    via = params.get("via") if isinstance(params, dict) else None
+    return via if isinstance(via, str) else None
+
+
 def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[dict]:
     """项目里每个 item 的定稿版本, 带 created_at / item_id —— 对照要按时间窗判。
 
@@ -4358,7 +4380,9 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
         out.append({"version_id": chosen.get("id"), "item_id": item.get("id"),
                     "project_id": project_id, "title": title, "body": body,
                     "created_at": chosen.get("created_at") or item.get("created_at"),
-                    "ai_engine": chosen.get("ai_engine")})
+                    "ai_engine": chosen.get("ai_engine"),
+                    # via: 写手手改版转正的那一版(record_edit), tv-sync 不给它算改稿差异(2026-11-26, core._tv_edit_diffs)
+                    "via": batch_via(item.get("batches"))})
     return out
 
 

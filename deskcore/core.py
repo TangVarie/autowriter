@@ -127,7 +127,8 @@ PROJECT_NOT_FOUND_NEXT = ("写作台里没有这个 project_id, 多半是没抄�
 
 
 def _supersede_snapshots(client, project_id: str, drafts: list[dict], vids: dict[int, str]) -> None:
-    """commit_drafts 存成版本的那几篇, 同样文字的查重底稿记成已转正(W-38 复审)。附带的一步, 失败只记 WARN。"""
+    """commit_drafts 存成版本的那几篇, 同样文字的查重底稿记成已转正(W-38 复审)。附带的一步, 失败只记 WARN。
+    不看 status(2026-11-26): 查重出错时记的(gate_error)、写手手改版(writer_edit)和存档的文字一样的, 也已经有版本了, 一起记走。"""
     try:
         by_fp = {_draft_text_fp(drafts[i].get("title") or "", drafts[i].get("body") or ""): vid
                  for i, vid in vids.items() if tvlink.strip_hashtags((drafts[i].get("body") or "").strip())}
@@ -1799,21 +1800,34 @@ def check_drafts(client, project_id: str, drafts: list[dict],
     ``replaces_version_id``。核对不过的(不是 UUID / 不是本项目的版本 / 和 version_id 同时带 / 同一篇替换两次)判 reject,
     ``gate="replace_lookup"``, 和 score_drafts 那边拒的是同一种。**仍然只读**: 不摘指纹, 摘指纹是 score_drafts 存档时的事。
     """
+    # 归属闸和空批次在 try 外面: 没权限 / 项目不存在的那一次一行底稿都不记
     assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
         return {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
 
-    titles = [(d.get("title") or "").strip() for d in drafts]
-    bodies = [d.get("body") or "" for d in drafts]
-    new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
-    # 没有改稿的批次一次多余的查询都不加(下推路径的 CI 守着"不拉指纹行")
-    replace, bad_ref = ({}, {})
-    if any(isinstance(d, dict) and d.get("replaces_version_id") for d in drafts):
-        replace, bad_ref = _lookup_replacements(client, project_id, drafts)
-    out = _gate(client, project_id, titles, bodies, new_vecs,
-                own=_own_fingerprints(client, project_id, replace))
-    if replace or bad_ref:
-        _mark_replacements(out, replace, bad_ref)
+    try:
+        titles = [(d.get("title") or "").strip() for d in drafts]
+        bodies = [d.get("body") or "" for d in drafts]
+        new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
+        # 没有改稿的批次一次多余的查询都不加(下推路径的 CI 守着"不拉指纹行")
+        replace, bad_ref = ({}, {})
+        if any(isinstance(d, dict) and d.get("replaces_version_id") for d in drafts):
+            replace, bad_ref = _lookup_replacements(client, project_id, drafts)
+        out = _gate(client, project_id, titles, bodies, new_vecs,
+                    own=_own_fingerprints(client, project_id, replace))
+        if replace or bad_ref:
+            _mark_replacements(out, replace, bad_ref)
+    except Exception:
+        # 查重本身抛了(2026-11-26): 11-18..11-23 生产库 57014 语句超时 22 次, 那几批稿子以前只在判定算完之后才记底稿,
+        # 一抛就一行没留, 发出去以后 TV 只能标成「别处写的」。现在先把稿子记下(status = gate_error, 没有判定), 再原样上抛 ——
+        # 查重照旧不 fail-open(上面 ⚠️), 模型照旧看到报错、重查。记底稿自己再出错也只记 WARN, 绝不顶掉原来那个异常。
+        # 只接 Exception: 调用被取消(CancelledError / KeyboardInterrupt)的不记。
+        if record_snapshot:
+            try:
+                _record_snapshots(client, project_id, user_id, drafts, None, status=SNAPSHOT_GATE_ERROR)
+            except Exception:                           # noqa: BLE001 — _record_snapshots 自己不抛; 再兜一层
+                pass
+        raise
     if record_snapshot:
         # 只有写手那边的 AI 走工具查重才记(tools.check_drafts); 运维的 `cli check` 试跑不记 —— 不然试跑的稿子挂在写手名下,
         # 发出去以后会被当成写作台写的转正(W-38 复审)。
@@ -1847,8 +1861,19 @@ def _mark_replacements(out: dict, replace: dict, bad_ref: dict) -> None:
 # 没有改稿差异)。check_drafts 是每篇必过的硬闸, 在这里把稿子记下来(draft_snapshots, 不进指纹库 —— 不挡后面的稿子),
 # tv-sync 对不上写作台版本的帖再拿它对一次(_promote_snapshots)。
 # ⚠️ 记底稿绝不能影响查重的判定: 任何错都只记 WARN(018 没跑也是)。
+# 2026-11-26 起底稿不只来自查重通过的那一刻(生产库 11-09 以来四个项目 255 篇对不上的帖, 和写作台任何文字的四字串重合
+# 都不到 15%: 写手在对话里一轮轮改、仿写、去 AI 味, 最后那一轮从没到过服务端)。status 除了查重的三种判定, 还有两种不是判定的:
+#   · gate_error —— 查重本身抛了(57014 超时等), 稿子先记下、异常照旧上抛(check_drafts);
+#   · writer_edit —— record_edit 时写手手改后的那一版(标题 = my_title or ai_title, 正文 = my_body or ai_body), 不带 angle_key、
+#     不记飞轮臂 / 看到了哪几张卡(是人写的字, 不能记到臂和卡的账上)。
+# 读底稿的几处都按「有判定的行说了算」: _snapshot_groups、store.snapshotted_angle_keys、drawreport.card_rows。
 SNAPSHOT_MAX_AGE_DAYS = 45          # tv-sync 只拿近 45 天的底稿对(发布晚于查重最多 tvlink.WINDOW_AFTER_DAYS 天, 留余量)
 SNAPSHOT_ANGLE_KEY_MAX = 64         # 模型带来的 angle_key 原样存, 只截断(销牌时再按台账核)
+SNAPSHOT_GATE_ERROR = "gate_error"
+SNAPSHOT_WRITER_EDIT = "writer_edit"
+SNAPSHOT_VERDICTS = store.SNAPSHOT_VERDICT_STATUSES                          # 查重真下过的判定: pass / warn / reject
+SNAPSHOT_NO_VERDICT = frozenset({None, SNAPSHOT_GATE_ERROR, SNAPSHOT_WRITER_EDIT})   # 没判定、但写作台见过这段字
+SNAPSHOT_VIA_RECORD_EDIT = "record_edit"   # 只由 writer_edit 底稿转正的 batch: params.via(普通底稿转正是 "snapshot")
 
 
 def _draft_text_fp(title: str, body: str) -> str:
@@ -1857,18 +1882,26 @@ def _draft_text_fp(title: str, body: str) -> str:
                                       body=tvlink.strip_hashtags((body or "").strip()), publish_time=None))
 
 
-def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list[dict], gate: dict) -> int:
-    """这次查重的每篇(有正文的)记一行底稿, 一次 insert。回记了几行; 失败回 0、只记 WARN。"""
+def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list[dict], gate: dict | None, *,
+                      status: str | None = None, what: str = "check_drafts", record_arm: bool = True) -> int:
+    """这次的每篇(有正文的)记一行底稿, 一次 insert。回记了几行; 失败回 0、只记 WARN, 绝不抛。
+
+    ``gate``: 查重的回执, 每篇的 status 按 index 取它的判定; ``None``(查重抛了 / 不是查重)就没有判定。``status`` 给了就
+    一律记它, 盖过回执里的判定(gate_error / writer_edit, 见上)。``what``: 谁记的, 只用在日志里。``record_arm=False``:
+    不取飞轮臂、不取这一场看到了哪几张卡(record_edit: 写手手改的字不记到臂和卡的账上), 两列留空。
+    check_drafts 以外(record_edit)出错只记异常的类型: PostgREST 的 "Failing row contains (…)" 会把整篇稿子带进日志。"""
     try:
-        status = {r.get("index"): r.get("status") for r in (gate.get("results") or [])}
-        try:
-            arm, arm_source, _, _ = batch_arm(project_id, user_id)
-        except Exception:                               # noqa: BLE001 — 臂只是附带记一下
-            arm, arm_source = None, None
+        verdicts = {} if gate is None else {r.get("index"): r.get("status") for r in (gate.get("results") or [])}
+        arm, arm_source, exposure = None, None, None
+        if record_arm:
+            try:
+                arm, arm_source, _, _ = batch_arm(project_id, user_id)
+            except Exception:                           # noqa: BLE001 — 臂只是附带记一下
+                arm, arm_source = None, None
+            # 这一场看到了哪几张卡、哪几条规律(2026-11-15, 见 _lesson_exposure 那段)。不知道(None)就不带这一列: 行和原来
+            # 一模一样; 022 没跑时 store 那边去掉这一列再写一次(只警告一次)。
+            exposure = lesson_exposure(project_id, user_id)
         check_id = str(uuid.uuid4())
-        # 这一场看到了哪几张卡、哪几条规律(2026-11-15, 见 _lesson_exposure 那段)。不知道(None)就不带这一列: 行和原来
-        # 一模一样; 022 没跑时 store 那边去掉这一列再写一次(只警告一次)。
-        exposure = lesson_exposure(project_id, user_id)
         rows = []
         for i, d in enumerate(drafts):
             title = (d.get("title") or "").strip()
@@ -1880,17 +1913,26 @@ def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list
             rows.append({"project_id": project_id, "user_id": user_id, "check_id": check_id,
                          "title": title, "body": body, "angle_key": key,
                          "text_fp": _draft_text_fp(title, body),
-                         "status": status.get(i), "flywheel_arm": arm, "flywheel_arm_source": arm_source,
+                         "status": status if status is not None else verdicts.get(i),
+                         "flywheel_arm": arm, "flywheel_arm_source": arm_source,
                          **({LESSON_EXPOSURE_KEY: exposure} if exposure is not None else {})})
         n = store.insert_draft_snapshots(client, rows)
         if n:
             # 这次查重的调用留痕那一行记下 check_id 的前 8 位(2026-11-17, §3.37): 底稿转正建的 batch 不知道当初是哪个客户端查的重
-            # (底稿上没有这一列), 拿 params.check_id 的前 8 位对回这一行的 meta.client_mark。不是工具调用(cli check)时什么都不做
+            # (底稿上没有这一列), 拿 params.check_id 的前 8 位对回这一行的 meta.client_mark。不是工具调用(cli check)时什么都不做。
+            # record_edit 记的那一行同样记在 record_edit 那次调用上
             calllog.note(check8=check_id[:8])
         return n
-    except Exception:                                   # noqa: BLE001 — 查重的判定已经算好了, 记不上只少一份底稿
-        logger.warning("check_drafts: 记底稿失败 (project=%s), 判定照常返回; 这一批发出去以后认不回写作台, 除非存了档",
-                       project_id, exc_info=True)
+    except Exception as exc:                            # noqa: BLE001 — 判定已经算好了(或原来的错照旧上抛), 记不上只少一份底稿
+        if what != "check_drafts":
+            logger.warning("%s: 记底稿失败 (project=%s): %s; 照常返回, 这一篇发出去以后可能认不回写作台",
+                           what, project_id, type(exc).__name__)
+        elif status == SNAPSHOT_GATE_ERROR:
+            logger.warning("check_drafts: 查重出错, 记底稿也失败 (project=%s); 查重原来的错照旧上抛", project_id,
+                           exc_info=True)
+        else:
+            logger.warning("check_drafts: 记底稿失败 (project=%s), 判定照常返回; 这一批发出去以后认不回写作台, 除非存了档",
+                           project_id, exc_info=True)
         return 0
 
 
@@ -10453,6 +10495,18 @@ def record_edit(client, project_id: str, *, user_id: str,
         return {"stored": False,
                 "reason": "AI 版与手改版完全一致, 不是有效信号, 未入库"}
 
+    # 写手手改后的那一版也记一行底稿(2026-11-26, status = writer_edit): 写手在对话里改完直接贴进飞书, 这一版以前从没
+    # 到过服务端, 发出去以后 TV 只能标成「别处写的」。只改了一边的, 另一边用 AI 那一版(发出去的就是它)。不带 angle_key
+    # (这里不知道是哪张牌, 不销牌)、不记飞轮臂 / 看到了哪几张卡; 转正的 batch 记 via = record_edit, 不算改稿差异
+    # (那是写手自己的字, AI → 人的差异已经在 style_edits 里)。放在 add_style_edit 之前: 那一步抛了, 字也留下了(模型重试时
+    # 同样的字归进同一篇)。记不上只少一份底稿, 绝不影响 record_edit 本身(这是写路径, 抛了模型会重喂、重复入库)。
+    try:
+        _record_snapshots(client, project_id, user_id,
+                          [{"title": my_title or ai_title, "body": my_body or ai_body}], None,
+                          status=SNAPSHOT_WRITER_EDIT, what="record_edit", record_arm=False)
+    except Exception:                                   # noqa: BLE001 — _record_snapshots 自己不抛; 再兜一层
+        pass
+
     store.add_style_edit(client, project_id, user_id,
                          ai_title=ai_title or "", ai_body=ai_body or "",
                          my_title=my_title or "", my_body=my_body or "", note=note)
@@ -11928,7 +11982,15 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
     stale |= set(text_changed) & set(diffed)            # TV 改过字(W-34): 同一版也按现在的正文重算
 
     def _ok(nid: str) -> bool:
-        return _diffable(current[nid]) and nid not in blocked and _draft_has_body(current[nid])
+        return (_diffable(current[nid]) and nid not in blocked and _draft_has_body(current[nid])
+                and not _writer_text(current[nid]))
+
+    def _writer_text(link: dict) -> bool:
+        # 那一版是 record_edit 记下的写手手改版转正的(batch 的 params.via = record_edit, 2026-11-26): 那就是写手自己的字,
+        # 算出来几乎都是「没改」, 会把 TV 的未改动率抬上去; AI → 人改了什么已经在 style_edits 里, 不再算一遍。不写差异行
+        # (TV 的未改动只数有差异行的, 分母里就没有它), 万一已有的降回旧口径(下面 demote)。
+        v = known.get(str(link.get("version_id") or ""))
+        return v is not None and v.via == SNAPSHOT_VIA_RECORD_EDIT
 
     def _draft_has_body(link: dict) -> bool:
         # 写作台那版只有标题(W-36, 10-27): 没有正文可比, 算出来是"整篇都是新加的" —— HATHERINE 59 条 title_exact 连的就是
@@ -12055,7 +12117,13 @@ def _snapshot_groups(rows: list[dict]) -> dict[str, dict]:
     (那时这篇就已经写出来了); 原文取最晚那次的(text_fp 一样, 只差标点空白 / 话题); angle_key 取最晚带了的那次, 写手跟着
     它走(销牌按发牌的人), 销牌只认那一次查重之前抽的(``key_checked_at``: 先没带 key 查过一次、抽了牌再带着 key 查的,
     按第一次的时刻就销不到那张牌, codex on aw#132), 都没带就取最晚那次的写手。``ok``: 至少有一次查重没被打回(pass / warn) —— 只被打回过的(撞了
-    库里的稿, 多半是照抄发出去的帖)不转正(W-38 复审)。"""
+    库里的稿, 多半是照抄发出去的帖)不转正(W-38 复审)。
+
+    2026-11-26: 底稿还有两种没判定的行(gate_error / writer_edit, 见 SNAPSHOT_GATE_ERROR 那段)。真下过判定的行(pass / warn /
+    reject)有的话由它们说了算: ok = 其中有 pass / warn —— 查重出错、重查被打回的, 写手手改、同样的字查重被打回的, 都不转正;
+    一行判定都没有的, 行全是没判定的那几种(SNAPSHOT_NO_VERDICT)才 ok(认不出的 status 不转正)。``writer_edit_only``: 行全是
+    writer_edit(转正的 batch 记 via = record_edit, 不记飞轮臂 / 看到的卡, 不算改稿差异)。同一个 ok 管着转正、补齐路径的
+    mark_only、回流闸量「发布前写作台里的文字」(_gate_snapshots), 口径一致。"""
     groups: dict[str, dict] = {}
     for r in sorted(rows, key=lambda r: (str(r.get("checked_at") or ""), str(r.get("id") or ""))):
         if not (r.get("project_id") and r.get("text_fp")):
@@ -12068,20 +12136,36 @@ def _snapshot_groups(rows: list[dict]) -> dict[str, dict]:
                                "flywheel_arm": r.get("flywheel_arm"),
                                "flywheel_arm_source": r.get("flywheel_arm_source"),
                                "angle_key": None, "key_user": None, "key_checked_at": None, "user_id": None,
-                               "ok": False, "notes": []}
+                               "ok": False, "notes": [], "_verdict": False, "_passed": False, "_bare_ok": True,
+                               "writer_edit_only": True}
         g["ids"].append(str(r["id"]))
         # 看到了哪几张卡(022 的那一列): 读得到这一列才带这个键; 取最早一次有记录的(同臂: 那时这篇就写出来了)
         if LESSON_EXPOSURE_KEY in r and not isinstance(g.get(LESSON_EXPOSURE_KEY), dict):
             g[LESSON_EXPOSURE_KEY] = r[LESSON_EXPOSURE_KEY] if isinstance(r[LESSON_EXPOSURE_KEY], dict) else None
         g["title"], g["body"] = r.get("title") or "", r.get("body") or ""
         g["user_id"] = r.get("user_id") or g["user_id"]
-        g["ok"] = g["ok"] or r.get("status") in ("pass", "warn", None)
+        st = r.get("status")
+        if st in SNAPSHOT_VERDICTS:
+            g["_verdict"] = True
+            g["_passed"] = g["_passed"] or st in ("pass", "warn")
+        else:
+            g["_bare_ok"] = g["_bare_ok"] and st in SNAPSHOT_NO_VERDICT
+        g["writer_edit_only"] = g["writer_edit_only"] and st == SNAPSHOT_WRITER_EDIT
+        g["ok"] = g["_passed"] if g["_verdict"] else g["_bare_ok"]
         if r.get("angle_key"):
             g["angle_key"], g["key_user"] = str(r["angle_key"]), r.get("user_id") or g["key_user"]
             g["key_checked_at"] = r.get("checked_at")
     for g in groups.values():
         g["writer"] = g.pop("key_user") or g["user_id"]
+        for k in ("_verdict", "_passed", "_bare_ok"):
+            g.pop(k)
     return groups
+
+
+def _snapshot_batch_via(groups: list[dict]) -> str:
+    """转正建的 batch 的 params.via: 这几篇全是只由 writer_edit 底稿来的(record_edit 记的写手手改版)记 record_edit, 别的照旧
+    snapshot(2026-11-26)。tv-sync 据它不给连着这一版的帖算改稿差异(_tv_edit_diffs): 那一版就是写手自己的字。"""
+    return SNAPSHOT_VIA_RECORD_EDIT if groups and all(g.get("writer_edit_only") for g in groups) else "snapshot"
 
 
 def _snapshot_fp_payload(project_id: str, user_id: str, rows: list[dict]) -> list[dict]:
@@ -12261,15 +12345,18 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
             first = gs[0]
             # client_mark 明写 unknown(2026-11-17, §3.37): 转正是 tv-sync 在做, 稿子是哪个客户端查的重它不知道 —— 不写的话会
             # 被 CLI 的进程默认记成 server_job。要知道就拿 check_id 的前 8 位对查重那一行调用留痕的 meta.check8
-            params = {"source": "deskcore", "via": "snapshot", "check_id": check_id,
+            # 全是写手手改版(writer_edit)的: via = record_edit, 不记飞轮臂、不记看到了哪几张卡 —— 是人写的字(2026-11-26);
+            # 它们没有 angle_key, 下面也不销牌
+            via = _snapshot_batch_via(gs)
+            params = {"source": "deskcore", "via": via, "check_id": check_id,
                       clientmark.KEY: clientmark.UNKNOWN.as_dict()}
-            if first.get("flywheel_arm") in FLYWHEEL_ARMS:
+            if via != SNAPSHOT_VIA_RECORD_EDIT and first.get("flywheel_arm") in FLYWHEEL_ARMS:
                 params.update(flywheel_arm=first["flywheel_arm"],
                               flywheel_arm_source=first.get("flywheel_arm_source") or "recomputed")
             # 这一轮查重时看到了哪几张卡(2026-11-15): 底稿那一列读得到就带过来(null = 那次查重时不知道); 022 没跑、
             # 读不到那一列就没有这个键
             seen = [g[LESSON_EXPOSURE_KEY] for g in gs if LESSON_EXPOSURE_KEY in g]
-            if seen:
+            if seen and via != SNAPSHOT_VIA_RECORD_EDIT:
                 params[LESSON_EXPOSURE_KEY] = next((e for e in seen if isinstance(e, dict)), None)
             minted = store.mint_draft_identity(
                 client, project_id, str(first.get("writer") or owner), "",
@@ -12523,7 +12610,9 @@ def _rescore_misses(client, rows: dict[str, dict], notes_by_id: dict, index: tvl
 
 
 def _gate_snapshots(groups: dict, indexed: set) -> list:
-    """查重底稿里还没成为版本的那几篇(没被查重打回过的), 给回流闸量「发布前写作台里的文字」用。"""
+    """查重底稿里还没成为版本的那几篇(没被查重打回过的), 给回流闸量「发布前写作台里的文字」用。
+    2026-11-26: 按 _snapshot_groups 的 ok —— 查重出错时记下的(gate_error)、写手手改版(writer_edit)没被判定打回的也算
+    (写作台见过这段字); 有判定、全被打回的照旧不算。"""
     return [tvlink.Version(version_id=vid, project_id=g["project_id"], title=(g.get("title") or "").strip(),
                            body=tvlink.strip_hashtags(g.get("body") or ""),
                            created_at=tvlink._as_dt(g.get("first_checked_at")))
@@ -13321,9 +13410,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             g = by_vid[vid]
             if vid in made:
                 snap["promoted"] += 1
+                # via 跟着转正的 batch 走(_snapshot_batch_via): 写手手改版转正的那一版, 这晚就不算改稿差异
                 known[vid] = tvlink.Version(version_id=vid, project_id=g["project_id"], title=g["title"].strip(),
                                             body=g["body"].strip(), created_at=tvlink._as_dt(g["first_checked_at"]),
-                                            item_id=made[vid])
+                                            item_id=made[vid], via=_snapshot_batch_via([g]))
             for n, m in pairs:
                 if vid not in made:
                     # 没建成: 记 unmatched 不补录(补成副本就再也认不回这份底稿), 明晚再对
