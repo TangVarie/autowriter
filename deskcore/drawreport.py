@@ -44,6 +44,7 @@ HIT_TIERS = priors.HIT_TIERS
 COMPARE_SOURCES = ("w", "x", "e", "h")
 WRITER_SOURCES = ("pin", "rep")
 LIFT_PSEUDO = 2.0
+SNAPSHOT_VERDICTS = frozenset({"pass", "warn", "reject"})   # 底稿里查重真下过的判定(同 store.SNAPSHOT_VERDICT_STATUSES)
 
 
 def _ts(v) -> datetime | None:
@@ -75,6 +76,10 @@ def card_rows(ledger_rows, *, adoption: dict | None = None, snapshots=None, note
     snaps: dict[tuple[str, str], list[tuple[datetime, str]]] = defaultdict(list)
     for s in snapshots or ():
         t = _ts(s.get("checked_at"))
+        # D1 只数查重真下过的判定(2026-11-26): 查重出错时记下的(gate_error)、record_edit 的写手手改版(writer_edit)不是
+        # 「查过、没撞」, 进了分母会把撞车率压低
+        if s.get("status") not in SNAPSHOT_VERDICTS:
+            continue
         if s.get("angle_key") and t is not None:
             snaps[(str(s.get("project_id")), str(s["angle_key"]))].append((t, str(s.get("status") or "")))
     # 同一个 key 在同一个项目里每次发出去的时刻(repeat_of 重发、过了避重窗口又抽到): 一次查重只归它之前最近的那一次发牌,

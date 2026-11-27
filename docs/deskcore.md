@@ -426,9 +426,9 @@ vendor 的副本带 sha256，CI 和 `/health` 都校验——手改会被抓出�
 |---|---|---|
 | 对照表 | `tv_project_map`：TV 的 `project_id`（`SPX_phase1`）↔ 写作台项目。一个 TV 项目可对多个写作台项目（WTG 15 个方向），**只有一行**是补录目标 | `tv-map add` 维护，`migrations/009` |
 | 精确 | 正文前 40 字（去标点）相同 → `body_exact`；否则标题相同 → `title_exact`。**开头一样、后面是另一篇的不算**（外部评审 11-04 F02，2026-11-04）：开头之后那段（第 40 个字起的四字串）两边都 ≥ 15 个、笔记那段只有不到 0.15 在那一版里、标题也不一样的，那一版不进开头档，内容那一路也不再连它（帖短时光开头就够 0.30）；标题一样的照旧认（人留了开头和标题、把后面重写，还是那一篇）。开头档**不**按时间窗筛（复审 11-04）：开头和后面都对得上的就是那一篇，晚发 31 天、改了标题也是（筛掉的话内容那一路也看窗口，它会被补录成副本；11-04 生产库 372 条 `body_exact` 里 4 条在窗口外：晚发 38 天的 1 条，另 3 条发布早于那一版）；时间窗只在几版分不出时用。分数记真的包含度（原来写死 1.0）。**标题一样、正文不像的不算**（外部审计 11-02 F04，2026-11-02）：笔记和那一版的正文都有 ≥ 15 个四字串、包含度却不到 0.30 的，那一版不进标题档，走下面的模糊 / 改过；内容也对不上 → `ambiguous`，那一版列进候选、标 `weak_title`。时间窗（−30 ～ +30 天）外的同标题连候选都不算（半年后拿旧标题写的另一篇 → `unmatched`）。只有标题的稿、正文太短的笔记照旧认标题 | 同标题多版按四字串包含度分，分不出再按时间窗内离发布最近的那版。F04：同一个标题、正文毫不相干的两篇以前被连上（包含度 0.0），TV 血缘、发布原文指纹、改动差异、接住率一路都认它；生产库 124 条 `title_exact` 里 2 条是这种（SPX 0.063、途鸽 0.076，写作台那版都有完整正文） |
-| 模糊 | 时间窗内（发布 −30 ～ +30 天）四字串**包含度** ≥ 0.6 且与次佳差 ≥ 0.1 → `fuzzy` | 途鸽发之前改得很狠（305 字 vs 527 字），精确对不上，靠这一路 |
+| 模糊 | 时间窗内（发布 −30 ～ +30 天）四字串**包含度** ≥ 0.6 且与次佳差 ≥ 0.1 → `fuzzy`。以上几档只比每篇稿对照用的那一版（best，没设 best 时最新的一版）；**2026-11-26 起（§3.40）** 对不上的、只有标题一样的，再拿同一篇稿存过的另一版按同样几档对一遍（同一篇的几版先合成一个候选，不互相算「分不出」） | 途鸽发之前改得很狠（305 字 vs 527 字），精确对不上，靠这一路 |
 | 分不出 | `ambiguous`：候选写进 `tv_note_links.candidates`，**不硬猜**，报表里列给人看；人看完说「对不上」就 `tv-resolve --note … --ingest`，正文补录、对照改成 `ingested`。**只因为标题一样**才分不出的（候选全标 `weak_title`，内容那一路什么都没对上，F04 复审）不一直挂着：先当 `unmatched` 拿查重底稿对一遍（下一行），底稿认领就转正；没认领的记 `ambiguous` 等人看 `TV_WEAK_TITLE_GRACE_DAYS`（7）天——从头一次这样判出来那晚算，记在 `candidates` 里一条带 `weak_title_since` 的备注、每晚带过去——满了没人判就照常补录（没有补录目标的记 `unmatched`，同样带着日期）。等的这几天它的文字不在指纹库里（认了的代价：记在那一版名下是说它来自那一版，补录又是终态）；内容那一路分不出、另有一版只是标题一样的，照普通的分不出处理 | 两版同标题的评论稿都不是笔记正文（途鸽 2026-09-18）；不提供「指定某一版」，`match_kind` 没有 manual 一档。F04 复审：`ambiguous` 不进补录、W-40 也不记它的文字（它没有版本），W-38 只给补录名单里的帖找底稿——拿旧标题写了一篇新的、只查了重没存档的帖，真正的来源认不回来，发出去的文字查重永远看不见；而人看完能做的也只有补录 |
-| 查重底稿 | 对不上写作台版本的帖，补录之前先拿 `draft_snapshots`（`018`：写手那边的 AI 走工具调 `check_drafts` 时每查一篇记一行——标题、正文、带来的 `angle_key`、查重结论、当时的飞轮臂；运维 `cli check` 试跑不记；**不进指纹库**，不挡后面的稿子；`score_drafts` 存成版本的同样文字的底稿当场记成已转正；留 60 天）再对一次（`tvlink.match_snapshot`，近 45 天、还没转正、至少有一次查重没被打回的）。比上面几步严：帖要有发布日期（还没填日期、按内容对得上底稿的先不补录，记 `unmatched` 等日期，等到底稿过了 45 天为止；同一晚它的改写版也一起等），底稿要早于帖（发布那天 − 第一次查重那天，**北京日历日**，0～30 天）；开头 / 标题和帖一样的底稿是一档（有就走这一档，分数打平时它排前面），四字串包含度 ≥ 0.30 就行，只跟同样开头 / 标题一样的底稿（和存档版本）比，分数更高、开头标题不一样的得是它的前后几稿，否则 `ambiguous`；都不一样的那一档（`fuzzy` / `edited`）要 ≥ 0.45（W-34 判「整篇换了」的线是 0.30，擦线转正的对照运营再改几句就会被挪走）；分不出时只在打平的几份是同一篇的前后几稿（互相重合 ≥ 0.6）才挑一份——帖在稿里 + 稿在帖里加起来最像的那一稿，一样像取标题 / 开头和帖一样的，再一样取最晚查的；打平的里有别的稿子、或时间窗里有存过档的版本离得差不多近，记 `ambiguous`、**不补录**，每晚重判（底稿过了 45 天就照常补录）。帖的文字已经在指纹库里（以前补录的副本）的不转正。同一晚剩下对不上的帖，再按主索引的规矩对一次今晚要转正的几版（对手里带上存过档的版本；同一篇改写给另一个号发的，明晚主索引本来也会连上）：对上的跟着这一版一起转正、帖的文字一起记指纹，分不出的不补录、明晚重判。对上了就把底稿**转成真的版本**，和存过档的一样：建 batch / item / version（`params.via = "snapshot"`，同一晚同一次查重的几篇一个 batch——一轮的帖分几晚发就分几个，`params.check_id` 一样；版本时刻 = 第一次查重，不是转正那一刻）、写指纹（不过闸，带 `angle_key`；发出去的帖和底稿不一样的，帖的文字也记一行，同一个版本）、销牌（只销写这篇的人自己在查重之前抽的那张，找不到就不销——不像存档那样退到别人的牌）、底稿行记 `promoted_at` / `version_id` / `note_id`；对照记 `body_exact` / `title_exact` / `fuzzy` / `edited`（候选里一句 W-38 备注，不钉死），同一晚算改稿差异、`--write-tv` 回填 TV。版本 id 由（项目，正文指纹）定出来（uuid5），半途断了之后只补没做完的、不再建一份：指纹按文字补（底稿那一行写了、帖那一行没写的照样补），补的那晚这个 TV 项目里没有连着它的帖（帖在接同一个写作台项目的另一个 TV 项目里）就只补底稿那一行、销牌，不记转正，等连着帖的那个 TV 项目补上帖的文字再记。转正拿项目写锁之后再看一眼底稿：`score_drafts` 刚把同样文字的稿子存了档（底稿已经记到那一版）的，这晚不转、不补录，明晚主索引对存了档的那一版。一时读不出底稿、或这晚没转成的，**不补录**（补录是终态）：记 `unmatched` + 原因、明晚再对，退出码 1；底稿表缺权限 / 缺列（配置问题）照旧补录、退出码 1；`018` 没跑：跳过这一步、照旧补录 | W-38（2026-10-29，owner）：写手没有「存档」这一步，写作台的稿只在模型调了 `score_drafts` 时才进库。10-28 途鸽一轮 10 张牌，查重查了、`score_drafts` 没调，发出去的帖只能被补录成副本（牌不销、没有改稿差异）。`check_drafts` 是每篇必过的硬闸，在那里留底稿；记底稿失败只记 WARN，不碰查重的判定。同一次把 `lag_days` 改成按北京日历日算：TV 的 `publish_time` 是北京那天的 0 点（存成前一天 16:00 UTC），按 UTC 日期减，北京当天写、当天发的记成 −1（10-29 生产库 264 条里 26 条）；存着 −1、按北京日是 0 的对照 tv-sync 当晚改回来（改稿差异的 `lag_fill`） |
+| 查重底稿 | 对不上写作台版本的帖，补录之前先拿 `draft_snapshots`（`018`：写手那边的 AI 走工具调 `check_drafts` 时每查一篇记一行——标题、正文、带来的 `angle_key`、查重结论、当时的飞轮臂；运维 `cli check` 试跑不记；**不进指纹库**，不挡后面的稿子；`score_drafts` 存成版本的同样文字的底稿当场记成已转正；留 60 天）再对一次（`tvlink.match_snapshot`，近 45 天、还没转正、至少有一次查重没被打回的）。比上面几步严：帖要有发布日期（还没填日期、按内容对得上底稿的先不补录，记 `unmatched` 等日期，等到底稿过了 45 天为止；同一晚它的改写版也一起等），底稿要早于帖（发布那天 − 第一次查重那天，**北京日历日**，0～30 天）；开头 / 标题和帖一样的底稿是一档（有就走这一档，分数打平时它排前面），四字串包含度 ≥ 0.30 就行，只跟同样开头 / 标题一样的底稿（和存档版本）比，分数更高、开头标题不一样的得是它的前后几稿，否则 `ambiguous`；都不一样的那一档（`fuzzy` / `edited`）要 ≥ 0.45（W-34 判「整篇换了」的线是 0.30，擦线转正的对照运营再改几句就会被挪走）；分不出时只在打平的几份是同一篇的前后几稿（互相重合 ≥ 0.6）才挑一份——帖在稿里 + 稿在帖里加起来最像的那一稿，一样像取标题 / 开头和帖一样的，再一样取最晚查的；打平的里有别的稿子、或时间窗里有存过档的版本离得差不多近，记 `ambiguous`、**不补录**，每晚重判（底稿过了 45 天就照常补录）。帖的文字已经在指纹库里（以前补录的副本）的不转正。同一晚剩下对不上的帖，再按主索引的规矩对一次今晚要转正的几版（对手里带上存过档的版本；同一篇改写给另一个号发的，明晚主索引本来也会连上）：对上的跟着这一版一起转正、帖的文字一起记指纹，分不出的不补录、明晚重判。对上了就把底稿**转成真的版本**，和存过档的一样：建 batch / item / version（`params.via = "snapshot"`，同一晚同一次查重的几篇一个 batch——一轮的帖分几晚发就分几个，`params.check_id` 一样；版本时刻 = 第一次查重，不是转正那一刻）、写指纹（不过闸，带 `angle_key`；发出去的帖和底稿不一样的，帖的文字也记一行，同一个版本）、销牌（只销写这篇的人自己在查重之前抽的那张，找不到就不销——不像存档那样退到别人的牌）、底稿行记 `promoted_at` / `version_id` / `note_id`；对照记 `body_exact` / `title_exact` / `fuzzy` / `edited`（候选里一句 W-38 备注，不钉死），同一晚算改稿差异、`--write-tv` 回填 TV。版本 id 由（项目，正文指纹）定出来（uuid5），半途断了之后只补没做完的、不再建一份：指纹按文字补（底稿那一行写了、帖那一行没写的照样补），补的那晚这个 TV 项目里没有连着它的帖（帖在接同一个写作台项目的另一个 TV 项目里）就只补底稿那一行、销牌，不记转正，等连着帖的那个 TV 项目补上帖的文字再记。转正拿项目写锁之后再看一眼底稿：`score_drafts` 刚把同样文字的稿子存了档（底稿已经记到那一版）的，这晚不转、不补录，明晚主索引对存了档的那一版。一时读不出底稿、或这晚没转成的，**不补录**（补录是终态）：记 `unmatched` + 原因、明晚再对，退出码 1；底稿表缺权限 / 缺列（配置问题）照旧补录、退出码 1；`018` 没跑：跳过这一步、照旧补录。**2026-11-26 起（§3.40）**：查重报错（`gate_error`）、`record_edit`（`writer_edit`，写手改成的那一版）也记底稿；有判定的行由判定说了算，没有判定的才看这两种；只由 `writer_edit` 来的那一篇只兜底（别的底稿对不上才拿它对），转正的 batch 记 `params.via = "record_edit"`、不销牌、不记臂、不算改稿差异 | W-38（2026-10-29，owner）：写手没有「存档」这一步，写作台的稿只在模型调了 `score_drafts` 时才进库。10-28 途鸽一轮 10 张牌，查重查了、`score_drafts` 没调，发出去的帖只能被补录成副本（牌不销、没有改稿差异）。`check_drafts` 是每篇必过的硬闸，在那里留底稿；记底稿失败只记 WARN，不碰查重的判定。同一次把 `lag_days` 改成按北京日历日算：TV 的 `publish_time` 是北京那天的 0 点（存成前一天 16:00 UTC），按 UTC 日期减，北京当天写、当天发的记成 −1（10-29 生产库 264 条里 26 条）；存着 −1、按北京日是 0 的对照 tv-sync 当晚改回来（改稿差异的 `lag_fill`） |
 | 对不上 | `unmatched` → `ingest_published`（剥话题标签、不过闸、按全文幂等）补录进目标项目，建成的 `version_id` 记回 `tv_note_links`。对不上的那一行（`unmatched` / `ingested`）的 `score` 记这篇帖和写作台的稿子最像到什么程度（2026-11-11，§3.28），只是读数，不参与判定 | 同项目稿子都以同一串标签结尾，不剥会互相误撞 |
 | 帖的文字进指纹库 | 对上了写作台某一版的帖（`body_exact` / `title_exact` / `fuzzy` / `edited` / `tv_lineage`，以及补录之后正文又改过的 `ingested`（F07，见「正文换了」），按现在的正文核过的：今晚写的对照、今晚记上正文指纹的、之前核过且字没变的），发出去的文字记一行指纹在那一版下：按文字幂等，正文和标题一起算（那一版下已经有正文、标题都一样的行就不记；帖和那一版只差话题标签的算一样；**只改了标题的照样记**——查重单看标题也会判死，运营改过的标题不在库里就拦不住照着它起的标题；帖没标题的只比正文）；行的时刻、写手、`angle_key` 跟那一版最早那行走；那一版一行指纹都没有的（改稿 `replaces_version_id` 把整个 item 的指纹撤了重写、老的没指纹的版本、W-38 转了一半的），时刻取那一版自己建的时刻、写手记项目 owner，照样记——帖还在外面。拿项目写锁、锁里重读再写，按 100 行一批插（同补录）。每晚把所有这样的对照核一遍，所以第一晚会把以前对上的一起补上，之后只有新对上和改过字的。写失败不挡对照，退出码 1、下一晚再补 | W-40（2026-10-30，owner 让我定）：查重比的是写过的稿，写手拿去改过再发的那一版原来不在库里——补录的帖、W-38 转正的帖早就把发出去的文字记进来了，只有对上存档版本的漏了。10-30 生产：`title_exact` 124 条、`fuzzy` 28 条、`edited` 1 条对照，那一版下都只有一行（底稿 / 存档那行）。时刻跟着那一版走，不记成今晚：TV 的发帖对账按时间窗数稿子，记成今晚会把老稿当成新写的 |
 | 回填 TV | `--write-tv` 才把对照写回 TV 的 `source_autowriter_*` 两列，**只填 NULL 的行**，且**只写真对上的**（`body_exact` / `title_exact` / `fuzzy` / `tv_lineage`）；`ingested` 不写 | 那是 TV 的列；补录的版本是从笔记复制来的，写回去因果倒置（TV 2026-09-18 核对时定的口径，见 runbook §1.4） |
@@ -675,10 +675,10 @@ project_id 同样没过归属校验：那一列只认回包里的 `project_id`�
 | `client_mark` | 全部 | 这一次是哪个客户端（2026-11-17，§3.37）：`app` 是固定的 7 个词之一（`dsh_plugin` / `workbuddy_skill` / `claude_code` / `other_mcp` / `rest` / `server_job` / `unknown`），`basis` 是凭什么这么定（`user_agent` / `hello` / `transport` / `process` / `none`）；另带洗过的证据：`ua`（UA 里第一个像样的产品名 + 版本，只含 `[a-z0-9_.]`，至多 52 个字符）、`origin`（有没有 Origin 头）、`hello`（这个指纹最近一次 MCP initialize 报的 clientInfo，洗法同 `ua`，没撞车才有；指纹管不到的那一种见 §3.37）。原始请求头不进来。证据只在 `batch_metrics.meta`（这一行和存档那一行），batch 的 `params.client_mark` 只有 `app` / `basis` |
 | `skill` | `open_project` / `comments_for` | 这次报上来的 skill 版本：`up_to_date` / `outdated` / `unknown`（没报） |
 | `cover_note` | `open_project` / `borrow_lessons`，发了才有 | `true` = 这次的回包里带了封面那一句（§3.36）。没发就没有这个键；借卡那一步记下了、但调用后来抛了或降级成不带这一栏的错误回包，也没有（写行时看回包里有没有这一栏） |
-| `check` | `check_drafts` | `total` / `pass` / `warn` / `reject`；`decided_by` 是可疑和拒的各由哪个信号定的（`opening` / `title` / `ngram` / `contain`，一篇可以有几个）；`gates` 是不是撞车的拒（`replace_lookup` 这类）；`semantic_degraded` |
-| `check8` | `check_drafts`，记了底稿才有 | 这次查重记的底稿的 `check_id` 前 8 位（2026-11-17，§3.37）：底稿转正建的 batch（`params.via = 'snapshot'`）拿 `params.check_id` 的前 8 位对回这一行，就知道当初是哪个客户端查的重 |
+| `check` | `check_drafts` | `total` / `pass` / `warn` / `reject`；`decided_by` 是可疑和拒的各由哪个信号定的（`opening` / `title` / `ngram` / `contain`，2026-11-26 起多一个 `reference`，一篇可以有几个）；`gates` 是不是撞车的拒（`replace_lookup` 这类）；`semantic_degraded`；带了参考原文的多一块 `reference = {refs, checked, flagged, max_decile}`（超了上限没比的再多 `skipped: true`，§3.39） |
+| `check8` | `check_drafts` / `record_edit`，记了底稿才有 | 这次记的底稿的 `check_id` 前 8 位（2026-11-17，§3.37）：底稿转正建的 batch（`params.via = 'snapshot'` / `'record_edit'`）拿 `params.check_id` 的前 8 位对回这一行，就知道当初是哪个客户端查的重。2026-11-26 起（§3.40）查重报错、照样记了底稿的那一行（`outcome` 不是 `ok`）和 `record_edit` 那一行也带 |
 | `rules` | `check_rules` | 回包里的数（§3.11 的 2026-11-11 那一版回包）：`status`（`checked` / `nothing_to_check` / `no_versions` / `error`）；`versions`、`must_fix`、`suggest`、`unsure`、`unjudged`、`evidence_not_found`（Jev 怀疑有问题、指不出是哪一句的，算在 `unjudged` 里）、`not_finished`、`empty_body`、`code_unchecked`、`more`，都是整次的合计（同回包的 `summary`，有才带）；`flagged`（有要动手的那几篇）、`judged`（规则题判回来了的那几篇）；`unsure_rules` / `unsure_rules_hard`（最外层列出来的偏向没守住的规则几条、其中硬约束几条，最多 3）；`excluded` / `remaining`（不是这个项目的、留到下一次的各几版）；`pool` 是规则池里各几条（同回包的 `rules`，只取数：`pool` / `by_jev` / `by_code` / `uncompiled` / `partial` / `code_unavailable` / `code_withdrawn` / `not_compilable` …）。规则 id、版本 id、题面和 Jev 指出的句子都不取 |
-| `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样；帖子根本没查成的那两种超时没有这个键，看 `judge_status = timeout`）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks` |
+| `comments` | `comments_for` / `score_comments` | `resolved`（帖子对上没有；没对上带 `need` = 还缺几样；帖子根本没查成的那两种超时没有这个键，看 `judge_status = timeout`）、`source`（`tv` / `tv_by_text` / `pasted`）、`post8`（这篇帖子的 8 位代号：对上 TV 笔记的按笔记号、没对上的按贴来的正文算的 sha256 前 8 位，同一篇帖子的几次调用是同一个，还原不出原文）。`comments_for` 另有 `existing` / `comment_rules` / `hard_rules`（各几条）、`has_set`。`score_comments` 另有 `n`（这一组几条）、`earlier`（带了几条前面判过的）、`no_slot`（几条没带评论位）、`existing`、`judge_status`、`passed`（整组）、`passed_n`、`needs_review`、`delivery_lines`（那一格拼了几行）和 `checks`。**TV 在读**（2026-11-26，DESK_USE_RATE 灯「写作台判过的评论」那一行）：`score_comments` 行的 `v`、`outcome`、`project_id` 列和 `comments` 里的 `post8` / `source` / `resolved` / `n` / `earlier` / `judge_status`——改这几个键的意思，TV 那边要跟着改 |
 | `comments.checks` | `score_comments` | `style` 是写法底线每样打回几条（`period` 句号 / `dialect` 方言语气词 / `contact` 像要联系方式 / `post_ref` 提了帖子 / `vague` 含糊指代）；`brand_over`（提品牌超出几条）、`repeats`（说法或开头重复的几条）、`endings_over`（品牌收尾超出几条）、`short_by` / `neutral_by`（短评、中性还差几条；项目没定这一项、或中性没判成时没有这个键）；`fix` / `style_fix`（带这两样的各几条）、`thread_fix` / `thread_hints`（整组的各几句） |
 
 它说得出一场走到了哪一步、每一步多久、评论判了几轮，说不出一场为什么停、是谁在打字。
@@ -1980,8 +1980,8 @@ WITH cand AS MATERIALIZED (
 - **老行。** `ingested` 是终态、不重对，以前补录的行不会回头补分数，NULL 读作「没算过」。没有补录目标的项目
   （W-10）以前记的 `unmatched` 没有分数：头一晚各重写一次把分数补上，之后分数没变的照旧不重写（`_same_miss_score`
   按三位小数比，库里读回来的单精度尾巴不算变了）。有补录目标的项目里还挂着的 `unmatched` 本来就每晚重写。
-- **怎么读**（TV 那边的灯按这个口径读，写作台不读它）：不到 0.15 是在别处写的，0.30 以上是拿写作台的稿子改的，
-  NULL 是没算过或没得比。查数见 runbook §1.5。
+- **怎么读**（TV 那边的灯按这个口径读，写作台不读它）：不到 0.15 是写作台没见过和它像的文字（2026-11-26 之前这里写「在别处写的」，
+  那是推断，撤了：多半是 AI 对话里后几轮没过查重的稿，§3.39），0.30 以上是拿写作台的稿子改的，NULL 是没算过或没得比。查数见 runbook §1.5。
 
 回归：`tests/test_draw_report.py`（三项各自什么时候是 `None`；chance 等于两边占比的乘积之和、只用读得到的牌；
 `table` / `by_source` / `adherence.by_source_week` 和文字版都带比例和 chance；CLI 多读的两样不取正文和 `evidence`、
@@ -2076,7 +2076,7 @@ WITH cand AS MATERIALIZED (
 | TV 馆员：教训卡 | 除 `not_clean` 之外的五个。投过流的帖的卡借不借是负责人的事、还没定（D-133 第 1 条）；定了「也不借」就是往这个常数里加一个名字 | `postgate.BLOCKS_CARDS` |
 
 **来源**（`origin`，只是标签）：`desk` 写作台的稿发出去的、`desk_edited` 写作台的稿人改得多、`copied_back` 对上的那一版是
-发了之后才存进写作台的、`elsewhere` 别处写的（和**发布那天及之前**写作台里的文字重合不到 0.15）、`unclear` 判不出。
+发了之后才存进写作台的、`elsewhere` 写作台没见过（和**发布那天及之前**写作台里的文字重合不到 0.15；11-12 读成「别处写的」，11-26 撤了这个推断，见 §3.39，TV 现在印「写作台没见过的文字」）、`unclear` 判不出。
 怎么量、为什么不直接用对照上的 `score` 见 runbook §1.16。
 
 **没有结论时照没有闸时的口径。** 「没有结论」= 那几列还不在（`020` 没跑）、这一行还没判过（`gate` 是空的或者是不认识的
@@ -2551,7 +2551,7 @@ select meta->'client_mark'->>'app' as app, meta->'client_mark'->>'basis' as basi
  where meta->>'mode' = 'tool_call' and created_at > now() - interval '7 days'
  group by 1, 2, 3 order by 1, 4 desc;
 
--- 新 batch 按客户端(近 14 天; 底稿转正的 via = snapshot 另列)。只数写作台建的: TV 每晚同步建的
+-- 新 batch 按客户端(近 14 天; 底稿转正的 via = snapshot / record_edit 另列)。只数写作台建的: TV 每晚同步建的
 -- source = truth_vault_sync 那种不经过写作台, 永远没有 client_mark; 写作台 11-17 之前建的也没有, 记成 (no mark)
 select coalesce(params->'client_mark'->>'app', '(no mark)') as app, params->>'source' as source,
        coalesce(params->>'via', '-') as via, count(*)
@@ -2559,13 +2559,15 @@ select coalesce(params->'client_mark'->>'app', '(no mark)') as app, params->>'so
  where created_at > now() - interval '14 days' and params->>'source' in ('deskcore', 'ingest')
  group by 1, 2, 3 order by 4 desc;
 
--- 底稿转正的 batch 找回当初查重的那个客户端(留痕会丢行: 对不上的是 null)
+-- 底稿转正的 batch 找回当初查重的那个客户端。查重报错、照样记了底稿的那一次(outcome 不是 ok)project_id 那一列是空的,
+-- 只在 meta.project8 留前 8 位, 所以按它也对一次; 还对不上的是留痕丢了行(null)
 select b.id, b.project_id, m.meta->'client_mark'->>'app' as checked_by
   from autowriter.batches b
   left join autowriter.batch_metrics m
-    on m.meta->>'mode' = 'tool_call' and m.meta->>'tool' = 'check_drafts'
-   and m.project_id = b.project_id and m.meta->>'check8' = left(b.params->>'check_id', 8)
- where b.params->>'via' = 'snapshot' and b.created_at > now() - interval '14 days';
+    on m.meta->>'mode' = 'tool_call' and m.meta->>'tool' in ('check_drafts', 'record_edit')
+   and (m.project_id = b.project_id or (m.project_id is null and m.meta->>'project8' = left(b.project_id::text, 8)))
+   and m.meta->>'check8' = left(b.params->>'check_id', 8)
+ where b.params->>'via' in ('snapshot', 'record_edit') and b.created_at > now() - interval '14 days';
 
 -- 上线核对: 最近一小时的调用各是哪个客户端、凭什么、证据是什么
 select created_at, meta->>'tool' as tool, meta->>'channel' as channel,
@@ -2636,6 +2638,79 @@ batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和�
 **容易丢**：`CREATE OR REPLACE FUNCTION` 会把函数的配置换成新语句里写的那几项。以后谁照 019 / 基线整块复制重建这两个函数，或者照 019 文件末尾的回滚重跑 005 / 008，开关就悄悄没了，结论不变、查重又会超时。所以：新迁移重建它们的，同一个文件里要再加这个开关（`tests/test_dedup_no_seqscan.py` 查文本，`tests/sql_parity_check.py` 在真库上查完整链条和只跑基线两条路的终态）；生产库上重建过，就再跑一次 `023`。核计划要在 `set local enable_seqscan = off` 下看（SQL Editor 的会话里顺序扫描是开着的，单拿取候选那一步 `EXPLAIN` 会看到 Seq Scan）。
 
 **还没做的一件**（不急）：四字串的 GIN 索引大概攒满了待合并的那一段（11-23 只读看：查一个不存在的值也要读约 500 个缓冲页；这张表上次自动 vacuum 是 09-18，新增的行没到自动触发的线）。现在每次查重都走它，每篇都要把这一段扫一遍；写指纹时偶尔还会在持锁的那一下同步合并。11-23 最大的项目 10 篇一组 2.9～3.6 秒，约是 8 秒上限的四成。要再快：`gin_clean_pending_list('autowriter.draft_fp_ngram_gin_idx')` 或对这张表 `VACUUM`，或者把这个索引改成 `fastupdate = off`。要动生产库，先看用时有没有往 8 秒走。
+
+### 3.39 协议升版：给用户看的每一版稿子都先过查重，仿写带参考原文（2026-11-26）
+
+**为什么。** 2026-11-26 只读查生产库：11-09 以来四个在写的项目里，有 255 篇发出去的帖对不回写作台。它们和写作台见过的**任何**文字（存档的版本、查重时记下的底稿）四字串重合都不到 15%，平均 2%～5%；对上了的帖是 84%～96%，中间一篇都没有。写作台存过档的稿子大多也没发（sportsix 128 篇里发了 32 篇）。问写手：他们在 AI 对话里一轮轮改（改几句、「照这几篇再出几篇」、仿一篇别家的帖、去 AI 味重写），把最后那一轮贴进飞书。只有第一轮走过查重，后面几轮写作台从没见过，所以 TV 认不回这些帖，记成 `elsewhere`（11-26 之前印成「别处写的」，现在印「写作台没见过的文字」）。缺的不是写手做了什么，是模型只在第一轮查重：协议原来说「交付前必做」，第二轮给用户「看看」的那版算不算交付说不清；「一次性的 → 直接改，不用记」读起来像不用走工具；判稿（5b）之后照着改的、`human-writing` 去 AI 味的、仿写的，都没写回到查重。
+
+这次还是不给写手加活：写手照旧只做「说要写什么、说要改哪里、把定稿贴进飞书」，要做的只有重导一次 skill。
+
+**协议 `6f23eba491fd` → `00ff79b30fcc`**（以 `python -m deskcore.cli sync-skill --check` 为准；部署后 `/health` 的 `build.protocol_version` 应是它）。改了这几处：
+
+- 新一节「给用户看的每一版稿子都先过查重」，紧跟「一个对话只写一个项目」，在流程前面（不放进「写作台排第一」那一节，那一节有 580 字符的上限）。五条：哪一轮都一样（前面几轮查过的不算数，改过就是新的一版）；最容易漏的几种（「按这几篇再出几篇」是新稿、3 篇以上先发牌；改交付过的稿子哪怕只改一句、用 `human-writing` 去 AI 味的，带 `replaces_version_id`）；仿写别家的帖或用户贴来的参考稿，参考原文放进 `reference_text`（不提那篇里的品牌，本项目的品牌照项目规则写：写手常拿自家发过的爆款当参考；用户贴来要你改、去 AI 味的稿子不是参考稿，不放进去，不然改出来的稿和它当然像，会被白白改判 warn）；不算稿子的（选题、提纲、标题备选、评论）；用户自己改了贴回来的那一版是他写的，不查重，走 `record_edit`（同一次发版里 `record_edit` 会把他改成的那一版记成底稿，发出去以后认得回来；他要你在他那版上接着改，改出来的照常查重）。
+- 第 4 条开头「交付前必做」→「给用户看之前必做 … 哪一轮都要过」；`decided_by` 那一句的信号多一个 `reference`（照抄了参考原文，没有 `collided_with` 那一条）；「这个工具报错就是查重真的挂了」后面加了一个例外：报错说 `reference_text` 格式不对的，改好或不带它再查。5b 判稿之后「改出来的那版照第 4、5 条先查重、再存」；第 6 条「一次性的 → 直接改」→「改好的那版照第 4 条先查重再给」；「入库」那一行里手改过、贴回来的定稿走 `record_edit`（仍是「不再查重」）；「几条不要犯的错」加一条「不要只在第一轮查重」。
+- skill 头一字没动（「四条在任何时候都生效的规矩」还是四条）。`reference_overlap` / `reference_index` / `reference_note` 这些字段级的口径只在 `check_drafts` 的说明里（skills/README.md 那条约定：协议只管流程）。
+
+**服务端同一次上线**（不用重导 skill，部署即生效）：
+
+- `check_drafts` 的说明（MCP 的工具描述）开头说每一版、哪一轮都先过这里，后面一段讲 `reference_text`。MCP `instructions`、`open_project` 回包的 `desk_first`（209 → 239 字，上限 260）、`judge_draft` 的说明和回包里的 `note`（`core.JUDGE_TOOL_NOTE`）各补了一句：改稿、续写、仿写的每一版也先过 `check_drafts`（各处措辞不一样，不是同一句）。`record_edit` 的说明多一段：用户改成的那一版写作台也记下，发出去以后对得回来，所以 `ai_*` / `my_*` 都传整篇（他只贴回改过的那一段，就换进 AI 原版拼成整篇再传；只传一段，学得到改法，帖对不回来——底稿只有一段，帖的四字串落不到 tvlink 的 0.30 下限）；那一版不用查重。
+- **`check_drafts` 多一个可选的顶层参数 `reference_text`**（一段字符串，或最多 3 段的列表，每段去掉首尾空白后最多 6000 字）。不叫 `reference`：发牌卡上的「参考结构」已经用了这个名字。
+  - **只在工具层用。** 不传进 `core.check_drafts` / `_gate`：存档（`score_drafts`）重跑同一套判定时手上没有参考原文，两边要判得一样；`cli check`、库里那一路、SQL 对照都不用动。core 先判完、先记底稿，`tools._apply_reference` 再叠一层，然后才写 `next_step`（warn 的篇数要算进去）。
+  - **怎么比。** `tvlink.reference_overlap`：稿子正文（剥了话题标签）的四字串有多少比例出现在几段参考原文（同样剥了标签）的并集里，完整集合、不是 sketch；四字串不到 15 个（同 `CONTAIN_MIN_SAMPLE`）不判。用并集是为了抓「两篇各抄一半」。纯本地计算，参考原文不送 embedding。
+  - **判成什么。** 每条带 `reference_overlap`（3 位小数，算不出是 null；判线和换说法也用这个数，不然回出去 0.4 却没到线）；到 `fingerprint.REFERENCE_CONTAIN_WARN`（= `NGRAM_CONTAIN_WARN`，0.40）再带 `reference_index`：调用方传的列表里的位置，从 0 数（空白的段不比、但占位置，reason 里的「第 k 段」和报错里的段号都是同一套数）。本来 pass 的到线改判 warn，`decided_by=["reference"]`，`collided_with` / `collided_scope` 清空，`collided_note` 去掉（改判之后「判定为通过」那句就是假话了，同 `_mark_replacements`），`reason` 是一句改法；到 `REFERENCE_CONTAIN_STRONG`（= `NGRAM_CONTAIN_HARD`，0.60）换重一点的说法。本来就是 warn / reject 的，status、reason、decided_by、collided_* 一个不动，只多一句 `reference_note`。summary 的 pass / warn / reject 重算，多一个 `summary.reference = {count, checked, flagged}`（只有整数；count 是比了几段，空白的不算）。有这种改判出来的 warn 时，`next_step` 里 warn 那半句换成 `CHECK_NEXT_STEP_WARN_REFERENCE`（照 reason 重写：结构和角度留着，换成自己的话和例子），不说「换个切入」——仿写的结构和角度本来就该照参考稿；没有的照旧是原来那句。
+  - **为什么最多 warn。** 存档时重跑查重没有参考原文，拦不住的 reject 和存档的判定对不上；协议里 reject 的三种例外是为历史撞车写的；同题文字之间的包含度还没校准过。0.40 比 tvlink 实测「共用产品话术的不同稿子」那一档（0.30 以下，`EDITED_FLOOR`）高出一个 `FUZZY_MARGIN`，同题的正常仿写到不了；0.60 是 tv-sync 认「帖是从这一版改出来的」那条线。合成样例：几乎逐字照搬 0.84，开头两句照搬 0.44，换了人和事的仿写 0。上线后看调用留痕里的 `max_decile` 再定要不要动。
+  - **它永远不拦查重。** 段数或字数超了不报错：查重照常判、底稿照记，只是这次没比参考原文——回包顶层多一句 `reference_skipped_note`（只有段数和字数：减到 3 段以内、每段 6000 字以内，一篇太长就拆成两三段，连同稿子再查一次），`summary.reference` 是 `{count, checked: 0, flagged: 0, skipped: true}`，其余和不传参考原文时一个字节都不差。第一版是在任何库操作之前 `InvalidInput`：那一轮查重没判、底稿没记，协议又说「工具报错就是查重挂了，停下来」——一个可选参数让这一版成了写作台没见过的那一版，正是这次要补的洞（复审）。超长是这次不比、不是截：截掉会漏掉后半篇的照抄。只有形状不对的（不是文字、列表里有数字或 null）才报错：工具层在任何库操作之前 `InvalidInput`（REST 400），消息只有第几段和类型名，说清「这是参数传错了，不是查重挂了」；MCP 那一路在 SDK 校验参数时就拦下了，SDK 原来的消息带一截截断的输入（参考原文的开头），`app._reference_text_refusal` 把 `reference_text` 的这种错误换成只有字段路径和 pydantic 错误说明、同样说清是参数错的一句（别的参数、别的工具照旧回 SDK 的原话）。
+  - **参考原文哪儿都不去。** 不进库（不进 `draft_snapshots`：存了的话 tv-sync 会把原作者的帖、转发它的帖认成写作台写的，接住率虚高；更不进指纹库，不然以后照同一篇仿写的都会被当成历史撞车拦下）、不进日志、不回显、不送 embedding；底稿的 status 还是查重自己的判定（选题报告 D1 的判定统计不受影响）。
+  - **调用留痕**（§3.8）：带了参考原文的那一行 `meta.check` 多一块 `reference = {refs, checked, flagged, max_decile}`（`max_decile` 是最像的那篇落在第几成，0～10，取整：`_clean` 不收小数；超了上限没比的再多一个 `skipped: true`）；`decided_by` 的信号名多一个 `reference`。没带参考原文的那一行一字不变；`VERSION` 不升（只是多了一个键）。
+
+**上线顺序：服务端和协议同一次发版、一起部署。** 协议叫模型传 `reference_text`，旧服务端上 MCP 会悄悄丢掉这个参数、REST 会回 500，所以不能先发协议。部署之后写手重导一次 skill；没重导之前，旧版 skill 的对话开场调 `get_protocol` 就拿到新正文、照它执行，入口回包的升级提醒第一行是「给你看的每一版稿子都先查重，仿写时还会查有没有照抄参考稿」（`skillcheck.WHATS_NEW` 按新版本号加了一行，旧的那行留着）。`record_edit` 记底稿（同一天另一处改动）要和这一版一起上：协议里「用户自己改了贴回来 … 发出去以后也认得回来」靠它。
+
+**上线后会变的数。** 每一轮都查重以后，同一篇稿在 `draft_snapshots` 里会多几行（每改一轮一行；查重超时照记的 `gate_error`、模型重试也各一行；同样的字 tv-sync 按 `text_fp` 归成一篇，转正不受影响）。TV ANGLE_LEDGER 灯的「查过 N 篇稿」（TV D-182）不算 `writer_edit`、按 `(project_id, text_fp)` 去重：同样的字查几次（超时照记、重试）算一篇，可改过的每一版字不一样、各算一篇，所以上线后这个数还是会升，数的是查过几版稿，不是写了几篇。
+
+**多花的钱（持续的）。** 协议照第 5 条让每一版先查重、再 `score_drafts` 存，存一版就有存档那次的判定（§3.8，Jev 参考分）和存完档在后台的人感影子判定（§3.34：正文每个非空行至少一次 Jev 模型调用）；所以 Jev 的花费会跟着轮数涨——这次要做的正是把以前写作台没见过的后几轮也拉进来。规则补查（5a）只查新稿，改过重存的不在里面；查重本身只多几次标题 embedding。实数看存档那几行的 `meta.shadow_human.calls`；要先停影子判定那一笔，`DESKCORE_SHADOW_HUMAN=0`（只停后台那一笔，存档那次的判定照旧）。
+
+**长度。** 协议正文（strip 后）20724 → 21615 字符（+891；新一节 661，其余是就地改的几句），46319 → 48416 字节；`SKILL.md` 52182 → 54279 字节；skill 头 2540 不变；「写作台排第一」那一节不变。没删别处的字来抵：这次要补的正是原来没写的几种情形。
+
+**回归**：`tests/test_check_drafts_reference.py`（纯函数：照搬过 STRONG、仿写不到 WARN、太短不判、只撞话题标签不算、几段取并集和最像的那段；不传 / 空串 / 空列表 / 全空白时回包逐字节不变；pass 改判 warn、collided_* 清空、summary 重算、`next_step` 跟着说 warn、不说「换个切入」；判线用回出去的那个 3 位小数；本来就 warn / reject 的不动只多一句；真走 core 时本批内的 reject 照旧、底稿是查重自己的判定；`reference_index` 和「第 k 段」是调用方列表里的位置；超了上限的照常判、底稿照记、只多一句和 `skipped`，REST 200、MCP 不是错误结果；参考原文不进假库的任何表和调用、不进回包和日志；正文放在别名键里的照样比；形状不对的在碰库之前拒，工具层、REST 400、MCP 错误结果各一条，MCP 那条的消息里没有参考原文、`drafts` 传错照旧是 SDK 的原话）；`tests/test_tool_call_log.py`（带参考原文那一行只多几个数，超了上限的多一个 `skipped`）；`tests/test_writer_facing_text.py`（改判的 reason、多的那一句、没比时那一句、`next_step` 换的那半句没有工程指令）；`tests/test_e2e_protocol_flow.py`（schema 里有 `reference_text`、不是必填、没有叫 `reference` 的参数）；`tests/test_protocol_release_cleanup.py`（新一节和就地改的几句；`decided_by` 的 `reference`、报错的例外、品牌和要改的稿子那两句；服务端几处话说成每一版都先过查重，`record_edit` 说传整篇，新加的几句也不许说回旧口径）；`tests/test_desk_first_1113.py`（升级提醒第一行带的是当前版本的那半句，不再钉「排第一」）。
+
+### 3.40 对账的三个漏洞：查重报错也留底稿、`record_edit` 留写手改成的那一版、同一篇稿存过的另一版也对（2026-11-26）
+
+**为什么。** 同 §3.39 那次只读查库。协议是主因（后几轮稿子写作台根本没见过），服务端这一头另有三个漏洞，让写作台见过的文字也对不回来：
+
+1. **查重报错时一行底稿都不记。** `_record_snapshots` 在 `_gate` 之后，`_gate` 一抛（11-18～11-23 生产库 `57014` 超时 22 次，§3.38）这一批就没留底稿，发出去以后 TV 认不回写作台。
+2. **`record_edit` 收到的写手改成的那一版只拿去学写法（`style_edits`），不拿来对账。** 写手在飞书前最后改的那一版正是要发的，写作台手上有，却不在对照里。
+3. **对照只看每篇稿对照用的那一版**（`store.versions_for_linking`：best，没设 best 时最新的一版）。帖用的是前一版（改稿 `replaces_version_id` 之后，或多引擎的兄弟版）就对不上。
+
+这三处都补上，但**不说明那 255 篇**：它们和写作台见过的任何文字（包括这三处现在能多见到的）重合都不到 15%。补的是以后：协议让每一轮都查重以后，这三处决定查过的那几轮能不能对回来。
+
+**A. 查重报错也记底稿。** `core.check_drafts` 里从拼标题正文、embedding、`_lookup_replacements`、`_gate` 到 `_mark_replacements` 包一层：抛了就先按原样记底稿（`status = "gate_error"`，`core.SNAPSHOT_GATE_ERROR`，没有判定），再把**同一个异常**原样上抛——查重照旧是报错、协议照旧「停下来」，判定一个字不变。记底稿自己再失败也不盖掉原来的异常，日志只有异常类型名（不带 `exc_info`：插入失败的 23502 会把整行带出来）。项目权限没过、没有稿子、`cli check` 不记，同以前。
+
+**B. `record_edit` 也记一行底稿。** 文字一样（没改）的照旧什么都不记；改了的，在写 `style_edits` 之前记一行 `status = "writer_edit"`（`core.SNAPSHOT_WRITER_EDIT`）：标题取 `my_title`（去掉空白后是空的就取 `ai_title`），正文同理；没有 `angle_key`（这个调用不带）、不记飞轮臂、不记看到的卡、不进指纹库；`check8` 照记。记失败只记一行 WARN（异常类型名），`record_edit` 的回包一个字不变。只改了一段的要拼成整篇再传（§3.39，`record_edit` 的说明）：底稿只有一段，四字串落不到 tvlink 的下限。
+
+**底稿的规矩跟着改（`_snapshot_groups`）。** 同一篇（项目 + `text_fp`）有过真判定（pass / warn / reject）的，由判定说了算：有 pass / warn 才转正——查重出错之后重查被打回的、写手手改的字查重被打回的，都不转正，同以前「只被打回过的不转正」；一行判定都没有的，行全是 `NULL` / `gate_error` / `writer_edit` 才转正，认不出的 status 不转正。用同一个 `ok` 的还有补齐路径的 `mark_only`、回流闸量的「发布前写作台里的文字」（`_gate_snapshots`）。别处跟着改：`store.snapshotted_angle_keys`（算「发了牌没写」）只看有判定的行，查重重试时超时不会把先前的 pass 冲掉；选题报告 D1 只数有判定的行（以前把 `NULL` 当 0，现在也不算）。
+
+**只由 `writer_edit` 来的那一篇只兜底。** 写手改完 AI 那一版再 `record_edit`，发出去的帖总是和手改版最像（标题一样、查得最晚）；放在一起对，帖就从带 `angle_key` 的 AI 底稿那里被抢走——不销牌、不记臂、没有 AI → 帖的改稿差异。所以 tv-sync 先只拿别的底稿对（和改之前一模一样），`unmatched`（不是 `ambiguous`）的才拿只有 `writer_edit` 行的那几篇再对一次；没日期的帖同样两步。同一晚的改写版不分两步：拿今晚转正、等日期的那几版（只由 `writer_edit` 来的也在里面）连同主索引一起对一次，分不出的不补录、明晚再对（要两篇帖分别对上 AI 底稿和手改版才碰得上）。第二遍已经连上存过的另一版的帖（见 C），只由 `writer_edit` 来的那一篇也不和它比：归存过的 AI 那一版、照算改稿差异，和那一版还是 best 时一样（合并后复审）。这样转正的：batch 记 `params.via = "record_edit"`（`core.SNAPSHOT_VIA_RECORD_EDIT`），不记 `flywheel_arm` / `lesson_exposure`，不销牌（没有 `angle_key`），候选里一句 `SNAPSHOT_NOTE_WRITER_EDIT`，计数 `snapshots.writer_edit`，CLI 那行多「其中 N 篇对上的是 record_edit 记下的写手手改版(不销牌、不算改稿差异)」；**不算改稿差异**：那一版就是写手自己的字，AI → 人的差异在 `style_edits` 里。`via` 只记在转正建的那一版（`version_num` 1，`store.version_via`），以后同一个 item 上改稿加的版本照常算差异。混着的组（`writer_edit` 和查重的行同一个 `text_fp`：模型查的正是写手改过的字，或写手只动了标点 / 话题）照普通底稿转正（`via = "snapshot"`、算改稿差异），飞轮臂取第一行不是 `writer_edit` 的。`store.report_exposure_batches`（看到了哪几张卡的报表）不数 `via = record_edit` 的 batch。手改版输给了 AI 底稿的那一行一直挂着，45 天后不再对、60 天删。
+
+**C. 同一篇稿存过的另一版也对。** `store.versions_for_linking(..., older=[])` 把每个 item 除了对照用的那一版以外的几版放进传进去的列表（行的形状一样，时刻是那一版自己的；TV 同步建的 `truth_vault_sync` item 不放：它的另几版都是 TV 的字），返回值不变。tv-sync 的主索引不动；主索引对不上（`unmatched`）或只有标题一样（weak title）的，再拿「对照用的那一版 + 另几版」用 `tvlink.match_note_by_item` 对一遍：几档、几条线和 `match_note` 一样，只是同一个 item 的几版先合成一个候选（取最像的一版：包含度、反向包含度、标题一样、开头一样、早于发布、最晚建），所以兄弟版之间不算「分不出」。收下的条件：对上的是另一版（不是对照用的那一版）、`body_exact` / `title_exact` / `fuzzy` / `edited`、`lag` ≥ 0 或不知道；发布之后才存的版本这一遍当它不在。收下的先不连，**先让查重底稿认**：底稿认得出一份、帖和那份底稿比和那一版更像（打平算那一版），就按 W-38 转正底稿；否则连那一版（候选里一句带 `older_version: true` 的备注「另一版: 对照用的那一版对不上, 对上的是这篇稿子存过的另一版…」，不钉死）。底稿这晚读不出来的先记 `unmatched`、明晚再对。返回多两个键：`older_version`（今晚这样连上的几篇，已经算在四档计数和 `matched` 里）、`older_versions_indexed`（另几版有几条）；CLI 多「另有存过的另一版 N 条, 对不上时才对」「其中对上的是稿子存过的另一版 N」。另几版同时进了：W-38 的对手（去掉发布之后才存的、去掉对上的那个 item 自己的几版）、回流闸的「发布前写作台里的文字」、`--rescore-misses`（和每晚算的分数一致）、改稿差异和 W-40（`known_all`）、TV 血缘指到另一版时的 `lag`。`_replaced_on_item` 只看 `version_num` 更大的兄弟版（以前任何兄弟版都算）。
+
+**没做的。**
+
+- **查重打回过的文字照旧不算「写作台见过」。** 回流闸量「发布前写作台里的文字」只用转得正的底稿，只被打回过的不在里面：打回的多半是写手把已经发过的帖贴进来查（撞了库里的自己），算进去会把抄回来的帖从「写作台没见过」挪到「分不出」。代价：写手执意发了一篇被打回的稿，TV 会说写作台没见过它。TV 那边的脚注说的是「发布前写作台存过、查重没打回的文字里」，见 TV D-182。
+- 不加迁移、不加 `match_kind`；`match_note` / `_pick` / `_match_by_content` 和几条线不动；补录过的照旧是终态。
+- `writer_edit` 的底稿不带 AI 那一版的 `angle_key`：兜底才轮到它，它转正的帖以前是补录的副本、本来也不销牌。
+- 转正的 version 照旧 `ai_engine = 'deskcore'`：TV 的 `v_model_comparison` 会把 `via = record_edit` 的帖算成写作台的。要分开得按 `batches.params.via` 拆，TV 那边记成待办。
+
+**限制。**
+
+- B 只帮发布那天（北京日）及之前就 `record_edit` 了的：底稿要早于帖，发了之后才报的改稿对不回来。
+- 查重从头到尾没走过的那几轮（模型跳过了查重），这三处都帮不上，只能靠 §3.39 的协议。
+- `writer_edit` 对上的帖在 TV 算「接住」、来源是「写作台的稿」，但没有改稿差异，不进 TV 未改动率的分母；两盏灯现在都分不出这一类（TV D-182）。
+
+**上线后第一晚会多出来的。** 先跑一次 `tv-sync --dry-run`，看「其中对上的是稿子存过的另一版 N」。`_tv_edit_diffs` 现在看得到所有连着的版本已经不是对照用的那一版的对照：每晚最多 `TV_SYNC_DIFF_BACKFILL`（500）条补算差异，`computed_at` 是当晚，所以老帖会出现在下一份周报里；只有标题的版本照 W-36 降级，`lag` 顺手写回；TV 血缘指到另一版的也开始有差异。没有补录目标的项目（W-10）里，分数因为另几版变高的 `unmatched` 行会各重写一次（RIO 约 782 行）。回流闸的重合只量一次：以前量过、记成 `elsewhere` 的行不重量，没算上另几版。另几版的第二遍比主索引那一遍慢 3～5 倍（版本多了最多 3 倍），只对没对上和只有标题一样的帖跑：1500 个 item × 3 版每篇约 47 毫秒。
+
+**上线顺序。** 和 §3.39 同一次发版：协议里「用户自己改了贴回来 … 发出去以后也认得回来」靠 B。TV 的 ANGLE_LEDGER 灯要不数 `writer_edit`（TV D-182 那次改了），最好同一天或先上。
+
+**回归**：`tests/test_snapshot_gate_error_and_writer_edit.py`（A：同一个异常原样上抛、记了 `gate_error`、`check8` 带上、记底稿失败或抛了都不盖掉原异常、拒了的项目 / 空稿 / `cli check` 不记；B：一行 `writer_edit`、只改一边的取另一边、空白当没给、没正文不记、插入失败的几种只记类型名、别人的项目不记；转正规则的真值表、`snapshotted_angle_keys` 不被超时冲掉、D1 不数没判定的行；`writer_edit` 只兜底：只改标题或轻改正文时结果和没有 B 一样，AI 稿整篇换掉时才兜，`via = record_edit` 的不算差异、`version_num` 2 起照算、混着的组照普通底稿、臂取第一行不是 `writer_edit` 的；曝光报表不数 `record_edit` 的 batch）、`tests/test_draft_snapshots.py`、`tests/test_tvlink_by_item.py`（800 个随机的一版一个 item 的索引上和 `match_note` 逐项一样；`match_note` 原有的纯函数测试换成它照样过；兄弟版在开头、标题、内容三档都认得出、别的 item 照旧分不出；几条挑法；当它不在的版本和删掉一样）、`tests/test_tv_sync_older_versions.py`（连上另一版的备注、计数、W-40、`--write-tv`、第二晚 `already_linked`；best 对得上就是 best；早于发布才收、跨 item 打平不猜；补录的、`truth_vault_sync` 的 item 没有另几版；底稿比另一版近就归底稿、AI 改了一句的两头都对、底稿读不出就等；回流闸和 `--rescore-misses` 算上另几版；`record_edit` 的那一版成了另一版之后照样不算差异；第二遍连上另一版的帖，手改版不抢，有日期、没日期各一条）。
 
 ## 4. 接入
 

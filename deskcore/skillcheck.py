@@ -37,6 +37,7 @@ UPDATE_COMMAND = "更新技能/bywood-writing-desk"
 # 就变, 那一版没在这里写就只说「有新版」, 不会把上一版的这句话再说一遍。值得说的那一版, 发版时加一行(runbook §6.5)。
 WHATS_NEW: dict[str, str] = {
     "6f23eba491fd": "和别的 skill 一起用时，写作台现在排第一",   # 2026-11-13 (§3.32)
+    "00ff79b30fcc": "给你看的每一版稿子都先查重，仿写时还会查有没有照抄参考稿",   # 2026-11-26 (§3.39)
 }
 
 UP_TO_DATE, OUTDATED, UNKNOWN = "up_to_date", "outdated", "unknown"

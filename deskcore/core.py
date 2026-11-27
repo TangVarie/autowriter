@@ -127,7 +127,8 @@ PROJECT_NOT_FOUND_NEXT = ("写作台里没有这个 project_id, 多半是没抄�
 
 
 def _supersede_snapshots(client, project_id: str, drafts: list[dict], vids: dict[int, str]) -> None:
-    """commit_drafts 存成版本的那几篇, 同样文字的查重底稿记成已转正(W-38 复审)。附带的一步, 失败只记 WARN。"""
+    """commit_drafts 存成版本的那几篇, 同样文字的查重底稿记成已转正(W-38 复审)。附带的一步, 失败只记 WARN。
+    不看 status(2026-11-26): 查重出错时记的(gate_error)、写手手改版(writer_edit)和存档的文字一样的, 也已经有版本了, 一起记走。"""
     try:
         by_fp = {_draft_text_fp(drafts[i].get("title") or "", drafts[i].get("body") or ""): vid
                  for i, vid in vids.items() if tvlink.strip_hashtags((drafts[i].get("body") or "").strip())}
@@ -1799,21 +1800,34 @@ def check_drafts(client, project_id: str, drafts: list[dict],
     ``replaces_version_id``。核对不过的(不是 UUID / 不是本项目的版本 / 和 version_id 同时带 / 同一篇替换两次)判 reject,
     ``gate="replace_lookup"``, 和 score_drafts 那边拒的是同一种。**仍然只读**: 不摘指纹, 摘指纹是 score_drafts 存档时的事。
     """
+    # 归属闸和空批次在 try 外面: 没权限 / 项目不存在的那一次一行底稿都不记
     assert_project_access(client, project_id, user_id=user_id)
     if not drafts:
         return {"results": [], "summary": {"total": 0, "pass": 0, "warn": 0, "reject": 0}}
 
-    titles = [(d.get("title") or "").strip() for d in drafts]
-    bodies = [d.get("body") or "" for d in drafts]
-    new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
-    # 没有改稿的批次一次多余的查询都不加(下推路径的 CI 守着"不拉指纹行")
-    replace, bad_ref = ({}, {})
-    if any(isinstance(d, dict) and d.get("replaces_version_id") for d in drafts):
-        replace, bad_ref = _lookup_replacements(client, project_id, drafts)
-    out = _gate(client, project_id, titles, bodies, new_vecs,
-                own=_own_fingerprints(client, project_id, replace))
-    if replace or bad_ref:
-        _mark_replacements(out, replace, bad_ref)
+    try:
+        titles = [(d.get("title") or "").strip() for d in drafts]
+        bodies = [d.get("body") or "" for d in drafts]
+        new_vecs = dedup.embed_texts(titles) if dedup.embeddings_available() else None
+        # 没有改稿的批次一次多余的查询都不加(下推路径的 CI 守着"不拉指纹行")
+        replace, bad_ref = ({}, {})
+        if any(isinstance(d, dict) and d.get("replaces_version_id") for d in drafts):
+            replace, bad_ref = _lookup_replacements(client, project_id, drafts)
+        out = _gate(client, project_id, titles, bodies, new_vecs,
+                    own=_own_fingerprints(client, project_id, replace))
+        if replace or bad_ref:
+            _mark_replacements(out, replace, bad_ref)
+    except Exception:
+        # 查重本身抛了(2026-11-26): 11-18..11-23 生产库 57014 语句超时 22 次, 那几批稿子以前只在判定算完之后才记底稿,
+        # 一抛就一行没留, 发出去以后 TV 认不回写作台(记成 elsewhere, 11-26 起印「写作台没见过的文字」)。现在先把稿子记下(status = gate_error, 没有判定), 再原样上抛 ——
+        # 查重照旧不 fail-open(上面 ⚠️), 模型照旧看到报错、重查。记底稿自己再出错也只记 WARN, 绝不顶掉原来那个异常。
+        # 只接 Exception: 调用被取消(CancelledError / KeyboardInterrupt)的不记。
+        if record_snapshot:
+            try:
+                _record_snapshots(client, project_id, user_id, drafts, None, status=SNAPSHOT_GATE_ERROR)
+            except Exception:                           # noqa: BLE001 — _record_snapshots 自己不抛; 再兜一层
+                pass
+        raise
     if record_snapshot:
         # 只有写手那边的 AI 走工具查重才记(tools.check_drafts); 运维的 `cli check` 试跑不记 —— 不然试跑的稿子挂在写手名下,
         # 发出去以后会被当成写作台写的转正(W-38 复审)。
@@ -1847,8 +1861,19 @@ def _mark_replacements(out: dict, replace: dict, bad_ref: dict) -> None:
 # 没有改稿差异)。check_drafts 是每篇必过的硬闸, 在这里把稿子记下来(draft_snapshots, 不进指纹库 —— 不挡后面的稿子),
 # tv-sync 对不上写作台版本的帖再拿它对一次(_promote_snapshots)。
 # ⚠️ 记底稿绝不能影响查重的判定: 任何错都只记 WARN(018 没跑也是)。
+# 2026-11-26 起底稿不只来自查重通过的那一刻(生产库 11-09 以来四个项目 255 篇对不上的帖, 和写作台任何文字的四字串重合
+# 都不到 15%: 写手在对话里一轮轮改、仿写、去 AI 味, 最后那一轮从没到过服务端)。status 除了查重的三种判定, 还有两种不是判定的:
+#   · gate_error —— 查重本身抛了(57014 超时等), 稿子先记下、异常照旧上抛(check_drafts);
+#   · writer_edit —— record_edit 时写手手改后的那一版(标题 = my_title or ai_title, 正文 = my_body or ai_body, 空白当没给), 不带
+#     angle_key、不记飞轮臂 / 看到了哪几张卡(是人写的字, 不能记到臂和卡的账上)。tv-sync 只拿它兜底(别的底稿对不上的帖才拿它对)。
+# 读底稿的几处都按「有判定的行说了算」: _snapshot_groups、store.snapshotted_angle_keys、drawreport.card_rows。
 SNAPSHOT_MAX_AGE_DAYS = 45          # tv-sync 只拿近 45 天的底稿对(发布晚于查重最多 tvlink.WINDOW_AFTER_DAYS 天, 留余量)
 SNAPSHOT_ANGLE_KEY_MAX = 64         # 模型带来的 angle_key 原样存, 只截断(销牌时再按台账核)
+SNAPSHOT_GATE_ERROR = "gate_error"
+SNAPSHOT_WRITER_EDIT = "writer_edit"
+SNAPSHOT_VERDICTS = store.SNAPSHOT_VERDICT_STATUSES                          # 查重真下过的判定: pass / warn / reject
+SNAPSHOT_NO_VERDICT = frozenset({None, SNAPSHOT_GATE_ERROR, SNAPSHOT_WRITER_EDIT})   # 没判定、但写作台见过这段字
+SNAPSHOT_VIA_RECORD_EDIT = "record_edit"   # 只由 writer_edit 底稿转正的 batch: params.via(普通底稿转正是 "snapshot")
 
 
 def _draft_text_fp(title: str, body: str) -> str:
@@ -1857,18 +1882,28 @@ def _draft_text_fp(title: str, body: str) -> str:
                                       body=tvlink.strip_hashtags((body or "").strip()), publish_time=None))
 
 
-def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list[dict], gate: dict) -> int:
-    """这次查重的每篇(有正文的)记一行底稿, 一次 insert。回记了几行; 失败回 0、只记 WARN。"""
+def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list[dict], gate: dict | None, *,
+                      status: str | None = None, what: str = "check_drafts", record_arm: bool = True) -> int:
+    """这次的每篇(有正文的)记一行底稿, 一次 insert。回记了几行; 失败回 0、只记 WARN, 绝不抛。
+
+    ``gate``: 查重的回执, 每篇的 status 按 index 取它的判定; ``None``(查重抛了 / 不是查重)就没有判定。``status`` 给了就
+    一律记它, 盖过回执里的判定(gate_error / writer_edit, 见上)。``what``: 谁记的, 只用在日志里。``record_arm=False``:
+    不取飞轮臂、不取这一场看到了哪几张卡(record_edit: 写手手改的字不记到臂和卡的账上), 两列留空。
+    新加的两条路(record_edit、查重出错时的 gate_error)出错只记异常的类型, 不带 traceback: PostgREST 的
+    "Failing row contains (…)" 会把整篇稿子带进日志; gate_error 那条还在 check_drafts 的 except 里, traceback 会把查重
+    原来那个异常一起带出来(复审 11-26)。查重照常返回的那条(下面最后一支)照旧带 exc_info, 没动。"""
     try:
-        status = {r.get("index"): r.get("status") for r in (gate.get("results") or [])}
-        try:
-            arm, arm_source, _, _ = batch_arm(project_id, user_id)
-        except Exception:                               # noqa: BLE001 — 臂只是附带记一下
-            arm, arm_source = None, None
+        verdicts = {} if gate is None else {r.get("index"): r.get("status") for r in (gate.get("results") or [])}
+        arm, arm_source, exposure = None, None, None
+        if record_arm:
+            try:
+                arm, arm_source, _, _ = batch_arm(project_id, user_id)
+            except Exception:                           # noqa: BLE001 — 臂只是附带记一下
+                arm, arm_source = None, None
+            # 这一场看到了哪几张卡、哪几条规律(2026-11-15, 见 _lesson_exposure 那段)。不知道(None)就不带这一列: 行和原来
+            # 一模一样; 022 没跑时 store 那边去掉这一列再写一次(只警告一次)。
+            exposure = lesson_exposure(project_id, user_id)
         check_id = str(uuid.uuid4())
-        # 这一场看到了哪几张卡、哪几条规律(2026-11-15, 见 _lesson_exposure 那段)。不知道(None)就不带这一列: 行和原来
-        # 一模一样; 022 没跑时 store 那边去掉这一列再写一次(只警告一次)。
-        exposure = lesson_exposure(project_id, user_id)
         rows = []
         for i, d in enumerate(drafts):
             title = (d.get("title") or "").strip()
@@ -1880,17 +1915,26 @@ def _record_snapshots(client, project_id: str, user_id: str | None, drafts: list
             rows.append({"project_id": project_id, "user_id": user_id, "check_id": check_id,
                          "title": title, "body": body, "angle_key": key,
                          "text_fp": _draft_text_fp(title, body),
-                         "status": status.get(i), "flywheel_arm": arm, "flywheel_arm_source": arm_source,
+                         "status": status if status is not None else verdicts.get(i),
+                         "flywheel_arm": arm, "flywheel_arm_source": arm_source,
                          **({LESSON_EXPOSURE_KEY: exposure} if exposure is not None else {})})
         n = store.insert_draft_snapshots(client, rows)
         if n:
             # 这次查重的调用留痕那一行记下 check_id 的前 8 位(2026-11-17, §3.37): 底稿转正建的 batch 不知道当初是哪个客户端查的重
-            # (底稿上没有这一列), 拿 params.check_id 的前 8 位对回这一行的 meta.client_mark。不是工具调用(cli check)时什么都不做
+            # (底稿上没有这一列), 拿 params.check_id 的前 8 位对回这一行的 meta.client_mark。不是工具调用(cli check)时什么都不做。
+            # record_edit 记的那一行同样记在 record_edit 那次调用上
             calllog.note(check8=check_id[:8])
         return n
-    except Exception:                                   # noqa: BLE001 — 查重的判定已经算好了, 记不上只少一份底稿
-        logger.warning("check_drafts: 记底稿失败 (project=%s), 判定照常返回; 这一批发出去以后认不回写作台, 除非存了档",
-                       project_id, exc_info=True)
+    except Exception as exc:                            # noqa: BLE001 — 判定已经算好了(或原来的错照旧上抛), 记不上只少一份底稿
+        if what != "check_drafts":
+            logger.warning("%s: 记底稿失败 (project=%s): %s; 照常返回, 这一篇发出去以后可能认不回写作台",
+                           what, project_id, type(exc).__name__)
+        elif status == SNAPSHOT_GATE_ERROR:
+            logger.warning("check_drafts: 查重出错, 记底稿也失败 (project=%s): %s; 查重原来的错照旧上抛", project_id,
+                           type(exc).__name__)
+        else:
+            logger.warning("check_drafts: 记底稿失败 (project=%s), 判定照常返回; 这一批发出去以后认不回写作台, 除非存了档",
+                           project_id, exc_info=True)
         return 0
 
 
@@ -2844,6 +2888,7 @@ def _judge_committed(client, project_id: str, targets: list[dict],
 # 写手手里; 项目号 / 品类按 tv_project_map 定(与存档时的判定同一条路 _judge_project_context, 数据出境口径
 # docs/00 #7 由 judge 执行并回显在 policy)。仍然一次 LLM 调用都没有。
 JUDGE_TOOL_NOTE = ("这是写后的深一层参考判定(score_drafts 存档时已经自动打过分), 不拦交付、不落账本。hard_fails / plan 拿去改稿, 改完最多再判一轮; "
+                   "改出来要给用户的那一版照常先过 check_drafts 再 score_drafts(改的是存过的那篇就带 replaces_version_id)。"
                    "judge_status 不是 ok 时如实告诉用户判定这次没拿到, 查重和入库照常走。")
 
 
@@ -10453,6 +10498,21 @@ def record_edit(client, project_id: str, *, user_id: str,
         return {"stored": False,
                 "reason": "AI 版与手改版完全一致, 不是有效信号, 未入库"}
 
+    # 写手手改后的那一版也记一行底稿(2026-11-26, status = writer_edit): 写手在对话里改完直接贴进飞书, 这一版以前从没
+    # 到过服务端, 发出去以后 TV 认不回写作台(记成 elsewhere)。只改了一边的(另一边没给, 或只给了空白), 另一边用 AI 那一版(发出去的
+    # 就是它; 先 strip 再判, 同上面「完全一致」那一关)。不带 angle_key(这里不知道是哪张牌, 不销牌)、不记飞轮臂 / 看到了
+    # 哪几张卡。tv-sync 只拿它兜底: 帖对得上 AI 那一版查重时记下的底稿就照旧连那一份(销牌、记臂、算 AI → 发出去的改稿差异);
+    # 别的底稿都对不上、只对得上它的, 转正的 batch 记 via = record_edit, 不算改稿差异(那是写手自己的字, AI → 人的差异已经在
+    # style_edits 里)。只有它一种行的组才这样; 同样的字模型也查过重的(混着查重的行)照普通底稿转正。放在 add_style_edit
+    # 之前: 那一步抛了, 字也留下了(模型重试时同样的字归进同一篇)。记不上只少一份底稿, 绝不影响 record_edit 本身(这是
+    # 写路径, 抛了模型会重喂、重复入库)。
+    try:
+        _record_snapshots(client, project_id, user_id,
+                          [{"title": (my_title or "").strip() or ai_title, "body": (my_body or "").strip() or ai_body}],
+                          None, status=SNAPSHOT_WRITER_EDIT, what="record_edit", record_arm=False)
+    except Exception:                                   # noqa: BLE001 — _record_snapshots 自己不抛; 再兜一层
+        pass
+
     store.add_style_edit(client, project_id, user_id,
                          ai_title=ai_title or "", ai_body=ai_body or "",
                          my_title=my_title or "", my_body=my_body or "", note=note)
@@ -11804,6 +11864,102 @@ def _pinned(link: dict) -> bool:
         isinstance(e, dict) and _PIN_RE.search(str(e.get("note") or "")) for e in (link.get("candidates") or []))
 
 
+# ── 对照用的那一版对不上, 再对 item 存过的另一版(2026-11-26) ─────────────────────────────────────────
+# 对照索引每个 item 只有一版(store.versions_for_linking: best, 没设 best 就是 version_num 最大的)。帖的文字要是这个 item 存过的
+# 另一版 —— 对话里中间存过的一轮(改稿带 replaces_version_id 存的), 或者老的多引擎 item 里另一个引擎的那版 —— 主索引对不上它,
+# 回流闸量「发布前写作台里的文字」也不算它。这是结构上的缺口; 11-26 生产库那 255 篇对不上的帖不归它管(它们和写作台里任何文字的
+# 四字串重合都不到 15%, 见 tvlink.match_note_by_item 上面那段), 按现在的数据这一遍几乎对不上什么。
+# 另一版不进主索引(兄弟版本互相分不出, 本来对得上的会变成 ambiguous): 主索引照旧先对; 只有对不上(unmatched)或只是标题一样
+# (weak_title_only)的, 才拿「主索引 + 另一版」按 item 并起来再对一遍, 发布之后才存的另一版当不在(_OlderVersions.after)。
+# 认的条件: 对上的是另一版、是按内容的四种之一、那一版不晚于发布(lag ≥ 0 或不知道) —— 发了之后才存的那版连上了也算不了改稿差异
+# 和「接住」, 却会把一条倒着走的血缘写回 TV。不加新的 match_kind(要改 CHECK 约束和 TV 的 CAUGHT_KINDS): 照旧记
+# body_exact / title_exact / fuzzy / edited, candidates 前面记一句(TV_OLDER_KEY), 不带决策号, 不会钉死对照。没认的, 对不上那一行
+# 的分数取两遍里高的(miss_score 的口径: 帖的字有多少出自写作台, 另一版也是写作台的字, 发布之后才存的也算, 同主索引)。
+# 认了也不马上连(复审 11-26): 查重底稿(W-38)在后面, 帖要是正好是哪一轮只查过重的字, 那份底稿比早先存的那一版更像 —— 先连上
+# 那一版的话, 底稿永远转不了正, 两轮之间 AI 自己改的字还会被改稿差异记成「人改了什么」。所以 tv_sync 把它先放进补录名单走一遍
+# 底稿: 底稿认得出一份(对手里不算这个 item 自己的几版)、帖又和那份底稿比和这一版更像, 才按底稿转正; 不然连到这一版上,
+# 不补录(_apply 的 older_wait, tv_sync 的 _snap_beats_older)。底稿这晚读不出的先不连(连上就是终态), 明晚再对。
+# 主索引对上 best 的照旧不等底稿(那是改这里之前就有的样子)。
+TV_OLDER_KEY = "older_version"
+
+
+@dataclasses.dataclass
+class _OlderVersions:
+    merged: tvlink.VersionIndex         # 主索引 + 另一版(第二遍、底稿的对手、回流闸量重合都用它)
+    ids: frozenset                      # 另一版的 version_id
+    best_of: dict                       # item_id → 对照用的那一版的 version_id(备注里点名)
+    known: dict                         # 另一版的 version_id → Version
+    days: tuple = ()                    # (北京日历日, version_id), 晚的在前: 挑发布之后才存的(after)
+
+    @classmethod
+    def build(cls, index: tvlink.VersionIndex, best: list, older: list) -> "_OlderVersions":
+        merged = tvlink.VersionIndex.merged(index, tvlink.VersionIndex(older)) if older else index
+        days = sorted(((tvlink._cn_day(v.created_at), v.version_id) for v in older if v.created_at is not None),
+                      reverse=True)
+        return cls(merged=merged, ids=frozenset(v.version_id for v in older),
+                   best_of={str(v.item_id): v.version_id for v in best if v.item_id},
+                   known={v.version_id: v for v in older}, days=tuple(days))
+
+    def after(self, n: tvlink.Note) -> frozenset:
+        """这篇帖发布之后才存的另一版(北京日历日晚于发布那天, 同 tvlink.lag_days < 0)。它当不了帖的来源: 第二遍当它不在
+        (留着的话, 并成一版时它会挡住同一个 item 发布之前存的那版), 也不当底稿的对手(rivals)。帖没有发布时间回空。"""
+        if n.publish_time is None or not self.days:
+            return frozenset()
+        day = tvlink._cn_day(n.publish_time)
+        out = []
+        for d, vid in self.days:
+            if d <= day:
+                break
+            out.append(vid)
+        return frozenset(out)
+
+    def rivals(self, n: tvlink.Note, *, item: str | None = None):
+        """查重底稿(W-38)的对手: 存过档的各版(best + 另一版), 去掉这篇帖发布之后才存的另一版(复审 11-26: 帖发了以后把它抄回
+        写作台存的那一版, 不能让发布之前就查过重的那份底稿变成分不出、挂到底稿过期再被补录)。best 照旧都算(改这里之前的样子:
+        发布之后才存的 best 对得上的话, 主索引已经连上了, 轮不到底稿)。``item``: 这个 item 的各版也不算 —— 第二遍已经对上了
+        它的一版, 底稿是直接跟那一版比(tv_sync 的 _snap_beats_older), 不是拿它当对手。"""
+        skip = self.after(n)
+        if item is None and not skip:
+            return self.merged
+        return tvlink.IndexSubset(self.merged, (v for v in self.merged.versions if v.version_id not in skip
+                                                and (item is None or str(v.item_id) != str(item))))
+
+    def skipped_score(self, n: tvlink.Note, skip: frozenset) -> float | None:
+        """发布之后才存的那几版另一版里, 时间窗里最高的包含度 —— 第二遍当它们不在, 对不上那一行的分数照旧算上(同
+        tvlink._match_by_content: 时间窗里发布之后才存的也算)。帖太短没得比回 None。"""
+        if not skip:
+            return None
+        ng = tvlink.grams(n.body)
+        if len(ng) < tvlink.FUZZY_MIN_GRAMS:
+            return None
+        return max((self.merged.containment(ng, self.known[vid]) for vid in skip
+                    if tvlink.in_window(tvlink.lag_days(n, self.known[vid]))), default=None)
+
+
+def _match_with_older(n: tvlink.Note, index: tvlink.VersionIndex, older: _OlderVersions | None) -> tvlink.Match:
+    """tvlink.match_note, 对不上 / 只是标题一样时再按 item 对一遍存过的另一版(上面那段)。tv_sync 的 _decide 和
+    _miss_score_now 都走这里, 对不上时记的分数是同一个口径。认了的那一版 tv_sync 还要先让底稿(W-38)看一遍, 见 _apply。"""
+    m = tvlink.match_note(n, index)
+    if older is None or not older.ids or not (m.kind == "unmatched" or tvlink.weak_title_only(m)):
+        return m
+    skip = older.after(n)
+    m2 = tvlink.match_note_by_item(n, older.merged, skip=skip)
+    v = m2.version
+    if (v is not None and v.version_id in older.ids and m2.kind in _CONTENT_KINDS
+            and (m2.lag_days is None or m2.lag_days >= 0)):
+        best = older.best_of.get(str(v.item_id)) if v.item_id else None
+        note = ("另一版: 对照用的那一版对不上, 对上的是这篇稿子存过的另一版"
+                + (f"(对照用的是 {str(best)[:8]}, 即 best, 没设 best 时是最新的一版)" if best else ""))
+        return dataclasses.replace(m2, candidates=[{"note": note, TV_OLDER_KEY: True}] + list(m2.candidates or []))
+    scores = [s for s in (m.score, m2.score, older.skipped_score(n, skip)) if s is not None]
+    return dataclasses.replace(m, score=max(scores)) if scores else m
+
+
+def _older_matched(candidates) -> bool:
+    """这一行对照(的 candidates)是不是第二遍对上另一版的: 里面有 TV_OLDER_KEY 那一句。"""
+    return any(isinstance(c, dict) and c.get(TV_OLDER_KEY) for c in (candidates or ()))
+
+
 def _tv_text_state(prev: dict, n: tvlink.Note, fp_now: str, known: dict, linked_text: dict) -> str:
     """一条有版本的对照, TV 那边的正文现在怎样(W-34)。调用方已挡掉指纹没变的和没正文的。
     unverifiable: 连着的那一版取不到 —— 不判、不记指纹, 明晚再核(不能在取不到的那晚把"整篇换了"漏掉);
@@ -11892,8 +12048,9 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
 
     本次新对上的全算; 以前对上、还没有差异行或口径过时(diff_rev < tvlink.DIFF_REV)的补算(每晚最多
     TV_SYNC_DIFF_BACKFILL 条; 同一版重算不推 computed_at, 见 _diff_stamp)。只算真对上的
-    (_TV_BACKFILL_KINDS, 不含 ingested —— 那一版就是从这条笔记复制的, 没有改动可言); 那一版不在对照索引里
-    (tv_lineage 指到别处的版本)就跳过。**不抛**: 这是附加信息, 算不了也不能让对照本身失败。
+    (_TV_BACKFILL_KINDS, 不含 ingested —— 那一版就是从这条笔记复制的, 没有改动可言); 那一版不在 ``known`` 里
+    (这晚读到的版本: 对照用的那一版、item 存过的另一版、今晚转正的底稿; tv_lineage 指到别处的版本不在)就跳过。
+    **不抛**: 这是附加信息, 算不了也不能让对照本身失败。
 
     W-34(10-27): ``text_changed`` 是 TV 改过字、还是同一篇的 —— 差异按现在的正文重算(同一版, 不推 computed_at);
     ``blocked`` 是 TV 整篇换了、这晚没挪成的(超上限 / TV 的血缘没清掉 / tv_lineage) —— 差异隔离(降回旧口径),
@@ -11928,7 +12085,15 @@ def _tv_edit_diffs(client, tv_project_id: str, links: list[dict], existing: dict
     stale |= set(text_changed) & set(diffed)            # TV 改过字(W-34): 同一版也按现在的正文重算
 
     def _ok(nid: str) -> bool:
-        return _diffable(current[nid]) and nid not in blocked and _draft_has_body(current[nid])
+        return (_diffable(current[nid]) and nid not in blocked and _draft_has_body(current[nid])
+                and not _writer_text(current[nid]))
+
+    def _writer_text(link: dict) -> bool:
+        # 那一版是 record_edit 记下的写手手改版转正的(batch 的 params.via = record_edit, 2026-11-26): 那就是写手自己的字,
+        # 算出来几乎都是「没改」, 会把 TV 的未改动率抬上去; AI → 人改了什么已经在 style_edits 里, 不再算一遍。不写差异行
+        # (TV 的未改动只数有差异行的, 分母里就没有它), 万一已有的降回旧口径(下面 demote)。
+        v = known.get(str(link.get("version_id") or ""))
+        return v is not None and v.via == SNAPSHOT_VIA_RECORD_EDIT
 
     def _draft_has_body(link: dict) -> bool:
         # 写作台那版只有标题(W-36, 10-27): 没有正文可比, 算出来是"整篇都是新加的" —— HATHERINE 59 条 title_exact 连的就是
@@ -12032,6 +12197,8 @@ def _backfillable(link: dict) -> bool:
 # 一晚建了版本、写指纹 / 销牌半途断了, 第二晚认得出是它, 只补没做完的, 不再建一份。
 _SNAPSHOT_NS = uuid.UUID("5d0a2f6e-38c1-4b7a-9e2d-0c8f1a6b3e38")
 SNAPSHOT_NOTE = "W-38: 写作台查重时记下的底稿(没存过档), 按内容对上, 转成了版本"
+# 只由 record_edit 记下的写手手改版转正的(2026-11-26): 那段字不是查重时记的, 对照上别写成查重
+SNAPSHOT_NOTE_WRITER_EDIT = "W-38: record_edit 记下的写手手改版(没存过档、底稿里没有 AI 那一版对得上), 按内容对上, 转成了版本"
 SNAPSHOT_RETAIN_DAYS = 60           # 底稿留多久(存的是稿子全文; tv-sync 只用近 SNAPSHOT_MAX_AGE_DAYS 天的)
 
 
@@ -12055,7 +12222,16 @@ def _snapshot_groups(rows: list[dict]) -> dict[str, dict]:
     (那时这篇就已经写出来了); 原文取最晚那次的(text_fp 一样, 只差标点空白 / 话题); angle_key 取最晚带了的那次, 写手跟着
     它走(销牌按发牌的人), 销牌只认那一次查重之前抽的(``key_checked_at``: 先没带 key 查过一次、抽了牌再带着 key 查的,
     按第一次的时刻就销不到那张牌, codex on aw#132), 都没带就取最晚那次的写手。``ok``: 至少有一次查重没被打回(pass / warn) —— 只被打回过的(撞了
-    库里的稿, 多半是照抄发出去的帖)不转正(W-38 复审)。"""
+    库里的稿, 多半是照抄发出去的帖)不转正(W-38 复审)。
+
+    2026-11-26: 底稿还有两种没判定的行(gate_error / writer_edit, 见 SNAPSHOT_GATE_ERROR 那段)。真下过判定的行(pass / warn /
+    reject)有的话由它们说了算: ok = 其中有 pass / warn —— 查重出错、重查被打回的, 写手手改、同样的字查重被打回的, 都不转正;
+    一行判定都没有的, 行全是没判定的那几种(SNAPSHOT_NO_VERDICT)才 ok(认不出的 status 不转正)。``writer_edit_only``: 行全是
+    writer_edit(转正的 batch 记 via = record_edit, 不记飞轮臂 / 看到的卡, 不算改稿差异; tv-sync 只拿它兜底, 见 tv_sync 那段)。
+    同一个 ok 管着转正、补齐路径的 mark_only、回流闸量「发布前写作台里的文字」(_gate_snapshots), 口径一致。
+    混着的组(writer_edit 和查重的行 text_fp 一样: 模型查过的正是写手手改后的那段字, 或写手只动了标点 / 话题)照普通底稿
+    转正(via = snapshot, 算改稿差异) —— 有查重的行, 跟 B 之前一样; 飞轮臂取第一次不是 writer_edit 的那一行(复审 11-26:
+    取第一行的话, 先记了 writer_edit 的组就丢了臂), 没有这样的行就没有臂。"""
     groups: dict[str, dict] = {}
     for r in sorted(rows, key=lambda r: (str(r.get("checked_at") or ""), str(r.get("id") or ""))):
         if not (r.get("project_id") and r.get("text_fp")):
@@ -12065,23 +12241,42 @@ def _snapshot_groups(rows: list[dict]) -> dict[str, dict]:
         if g is None:
             g = groups[vid] = {"version_id": vid, "project_id": str(r["project_id"]), "ids": [],
                                "first_checked_at": r.get("checked_at"), "check_id": r.get("check_id"),
-                               "flywheel_arm": r.get("flywheel_arm"),
-                               "flywheel_arm_source": r.get("flywheel_arm_source"),
+                               "flywheel_arm": None, "flywheel_arm_source": None,
                                "angle_key": None, "key_user": None, "key_checked_at": None, "user_id": None,
-                               "ok": False, "notes": []}
+                               "ok": False, "notes": [], "_verdict": False, "_passed": False, "_bare_ok": True,
+                               "_armed": False, "writer_edit_only": True}
         g["ids"].append(str(r["id"]))
+        st = r.get("status")
+        if not g["_armed"] and st != SNAPSHOT_WRITER_EDIT:
+            # 臂取第一次不是写手手改版的那一行(没有 writer_edit 的组: 就是第一行, 同以前)
+            g["flywheel_arm"], g["flywheel_arm_source"], g["_armed"] = (r.get("flywheel_arm"),
+                                                                         r.get("flywheel_arm_source"), True)
         # 看到了哪几张卡(022 的那一列): 读得到这一列才带这个键; 取最早一次有记录的(同臂: 那时这篇就写出来了)
         if LESSON_EXPOSURE_KEY in r and not isinstance(g.get(LESSON_EXPOSURE_KEY), dict):
             g[LESSON_EXPOSURE_KEY] = r[LESSON_EXPOSURE_KEY] if isinstance(r[LESSON_EXPOSURE_KEY], dict) else None
         g["title"], g["body"] = r.get("title") or "", r.get("body") or ""
         g["user_id"] = r.get("user_id") or g["user_id"]
-        g["ok"] = g["ok"] or r.get("status") in ("pass", "warn", None)
+        if st in SNAPSHOT_VERDICTS:
+            g["_verdict"] = True
+            g["_passed"] = g["_passed"] or st in ("pass", "warn")
+        else:
+            g["_bare_ok"] = g["_bare_ok"] and st in SNAPSHOT_NO_VERDICT
+        g["writer_edit_only"] = g["writer_edit_only"] and st == SNAPSHOT_WRITER_EDIT
+        g["ok"] = g["_passed"] if g["_verdict"] else g["_bare_ok"]
         if r.get("angle_key"):
             g["angle_key"], g["key_user"] = str(r["angle_key"]), r.get("user_id") or g["key_user"]
             g["key_checked_at"] = r.get("checked_at")
     for g in groups.values():
         g["writer"] = g.pop("key_user") or g["user_id"]
+        for k in ("_verdict", "_passed", "_bare_ok", "_armed"):
+            g.pop(k)
     return groups
+
+
+def _snapshot_batch_via(groups: list[dict]) -> str:
+    """转正建的 batch 的 params.via: 这几篇全是只由 writer_edit 底稿来的(record_edit 记的写手手改版)记 record_edit, 别的照旧
+    snapshot(2026-11-26)。tv-sync 据它不给连着这一版的帖算改稿差异(_tv_edit_diffs): 那一版就是写手自己的字。"""
+    return SNAPSHOT_VIA_RECORD_EDIT if groups and all(g.get("writer_edit_only") for g in groups) else "snapshot"
 
 
 def _snapshot_fp_payload(project_id: str, user_id: str, rows: list[dict]) -> list[dict]:
@@ -12261,15 +12456,18 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
             first = gs[0]
             # client_mark 明写 unknown(2026-11-17, §3.37): 转正是 tv-sync 在做, 稿子是哪个客户端查的重它不知道 —— 不写的话会
             # 被 CLI 的进程默认记成 server_job。要知道就拿 check_id 的前 8 位对查重那一行调用留痕的 meta.check8
-            params = {"source": "deskcore", "via": "snapshot", "check_id": check_id,
+            # 全是写手手改版(writer_edit)的: via = record_edit, 不记飞轮臂、不记看到了哪几张卡 —— 是人写的字(2026-11-26);
+            # 它们没有 angle_key, 下面也不销牌
+            via = _snapshot_batch_via(gs)
+            params = {"source": "deskcore", "via": via, "check_id": check_id,
                       clientmark.KEY: clientmark.UNKNOWN.as_dict()}
-            if first.get("flywheel_arm") in FLYWHEEL_ARMS:
+            if via != SNAPSHOT_VIA_RECORD_EDIT and first.get("flywheel_arm") in FLYWHEEL_ARMS:
                 params.update(flywheel_arm=first["flywheel_arm"],
                               flywheel_arm_source=first.get("flywheel_arm_source") or "recomputed")
             # 这一轮查重时看到了哪几张卡(2026-11-15): 底稿那一列读得到就带过来(null = 那次查重时不知道); 022 没跑、
             # 读不到那一列就没有这个键
             seen = [g[LESSON_EXPOSURE_KEY] for g in gs if LESSON_EXPOSURE_KEY in g]
-            if seen:
+            if seen and via != SNAPSHOT_VIA_RECORD_EDIT:
                 params[LESSON_EXPOSURE_KEY] = next((e for e in seen if isinstance(e, dict)), None)
             minted = store.mint_draft_identity(
                 client, project_id, str(first.get("writer") or owner), "",
@@ -12342,13 +12540,26 @@ def _promote_snapshot_groups(client, project_id: str, groups: list[dict], *, own
 
 def _replaced_on_item(client, pid: str, vids: dict[str, str | None], gap: list[str],
                       have: set[str] | None = None) -> set[str]:
-    """``gap`` 里同一个 item 别的版本有指纹行的那几版(改稿落了地、只是 best 没挪过去)。``have`` 不给就按那些兄弟版本的 id 现查。"""
+    """``gap`` 里同一个 item 更新的版本(version_num 比它大)有指纹行的那几版(改稿落了地、只是 best 没挪过去)。``have`` 不给就
+    按那些兄弟版本的 id 现查。
+
+    只认更新的那几版(2026-11-26): tv-sync 开始把帖连到 item 存过的另一版上(_match_with_older), W-40 把发出去的文字记在那一版下。
+    之后这个 item 再改稿、进程在撤光整个 item 的行之后被杀, best 就没有行了; 第二晚 W-40 先把那一版的行记回来, 自愈再看时
+    「同 item 别的版本有行」—— 原来会当成改稿没挂上 item、跳过, best 的文字就再也补不回来。改稿没挂上 item 时有行的是新建的
+    那一版, 它的 version_num 总比 best 大; version_num 比 best 小的那版有行, 是帖的文字, 不说明改稿落了地。"""
     items = [vids[v] for v in gap if vids.get(v)]
     siblings = store.version_ids_of_items(client, items) if items else {}
+
+    def newer(v: str) -> list[str]:
+        sibs = siblings.get(str(vids.get(v)), ())
+        own = next((s["version_num"] for s in sibs if s["id"] == v), None)
+        # 自己那一版没取到(不该有): 照原来的口径, 兄弟版本都算
+        return [s["id"] for s in sibs if s["id"] != v and (own is None or s["version_num"] > own)]
+
     if have is None:
-        sib_ids = {s["id"] for v in gap for s in siblings.get(str(vids.get(v)), ()) if s["id"] != v}
+        sib_ids = {s for v in gap for s in newer(v)}
         have = store.fingerprinted_version_ids(client, pid, sib_ids) if sib_ids else set()
-    return {v for v in gap if any(s["id"] != v and s["id"] in have for s in siblings.get(str(vids.get(v)), ()))}
+    return {v for v in gap if any(s in have for s in newer(v))}
 
 
 def _heal_fingerprint_gaps(client, best: dict[str, dict[str, str | None]], *, holder: str,
@@ -12476,22 +12687,24 @@ def _gate_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _miss_score_now(n: tvlink.Note, index: tvlink.VersionIndex, snaps: list, snap_index) -> float | None:
+def _miss_score_now(n: tvlink.Note, index: tvlink.VersionIndex, snaps: list, snap_index,
+                    older: _OlderVersions | None = None) -> float | None:
     """一篇对不上的帖和写作台的稿子最像到什么程度 —— 和 tv_sync 当晚记进对不上那一行的 score 同一个口径(那里的
-    miss_score): 存过档的版本按 match_note 看时间窗里的, 只查过重的底稿按 match_snapshot 看发布之前的, 取高的。
-    没正文 / 太短没得比回 None。"""
+    miss_score): 存过档的版本按 match_note 看时间窗里的(对照用的那一版对不上时再按 item 看存过的另一版, _match_with_older),
+    只查过重的底稿按 match_snapshot 看发布之前的(另一版也当对手, 同 _OlderVersions.rivals), 取高的。没正文 / 太短没得比回 None。"""
     if not n.body:
         return None
-    best = tvlink.match_note(n, index).score
+    best = _match_with_older(n, index, older).score
     if snaps and n.publish_time is not None:
-        s = tvlink.match_snapshot(n, snaps, snap_index, index).score
+        s = tvlink.match_snapshot(n, snaps, snap_index, older.rivals(n) if older is not None else index).score
         if s is not None:
             best = s if best is None else max(best, s)
     return best
 
 
 def _rescore_misses(client, rows: dict[str, dict], notes_by_id: dict, index: tvlink.VersionIndex, snaps: list,
-                    snap_index, *, only: set | None = None, dry_run: bool = False) -> dict:
+                    snap_index, *, only: set | None = None, dry_run: bool = False,
+                    older: _OlderVersions | None = None) -> dict:
     """给对不上的旧对照(ingested / unmatched, score 还是空的)补上分数(2026-11-12; tv_rescore_misses 用)。
 
     11-11 起 tv-sync 给当晚对不上的帖记 score; 可补录的对照是终态, 之后每晚跳过, 11-11 之前补录的三千多行一直是空的 ——
@@ -12505,7 +12718,7 @@ def _rescore_misses(client, rows: dict[str, dict], notes_by_id: dict, index: tvl
     out = {"candidates": len(todo), "scored": 0, "written": 0, "error": None}
     scores: dict[str, float] = {}
     for n in todo:
-        s = _miss_score_now(n, index, snaps, snap_index)
+        s = _miss_score_now(n, index, snaps, snap_index, older)
         if s is not None:
             scores[n.note_id] = round(float(s), 3)
     out["scored"] = len(scores)
@@ -12523,7 +12736,9 @@ def _rescore_misses(client, rows: dict[str, dict], notes_by_id: dict, index: tvl
 
 
 def _gate_snapshots(groups: dict, indexed: set) -> list:
-    """查重底稿里还没成为版本的那几篇(没被查重打回过的), 给回流闸量「发布前写作台里的文字」用。"""
+    """查重底稿里还没成为版本的那几篇(没被查重打回过的), 给回流闸量「发布前写作台里的文字」用。
+    2026-11-26: 按 _snapshot_groups 的 ok —— 查重出错时记下的(gate_error)、写手手改版(writer_edit)没被判定打回的也算
+    (写作台见过这段字); 有判定、全被打回的照旧不算。"""
     return [tvlink.Version(version_id=vid, project_id=g["project_id"], title=(g.get("title") or "").strip(),
                            body=tvlink.strip_hashtags(g.get("body") or ""),
                            created_at=tvlink._as_dt(g.get("first_checked_at")))
@@ -12744,13 +12959,16 @@ def tv_rescore_misses(client, tv_project_id: str, days: int | None = None, *, dr
     每晚的 tv-sync 【不】做这件事: 补录的、人定过的对照是钉住的, 每晚的同步一个字不碰它们(tests/test_tv_sync_drift.py 守着)。
     所以这是人手动跑的一次性命令, 不依赖 020。回流闸定来源不等它: 那里自己量「和发布前写作台里的文字的重合」
     (tvlink.prior_overlap), 记在 gate_reasons.overlap 里; 这里补的 score 是给人读的那个数(时间窗里的版本都算, 抄回来的也在内)。
-    读的东西和 tv_sync 一样(对照表、各写作台项目的定稿版本、TV 的笔记、还没转正的查重底稿), 只写 score 一列。
+    读的东西和 tv_sync 一样(对照表、各写作台项目对照用的版本和 item 存过的另一版、TV 的笔记、还没转正的查重底稿), 只写 score 一列。
     ``days``: 只补发布时间在近这么多天里的; 不给就是全部。``dry_run`` 只算不写。"""
     maps = [m for m in store.tv_project_map(client) if m["tv_project_id"] == tv_project_id]
     if not maps:
         raise ValueError(f"tv_project_map 里没有 {tv_project_id!r}")
-    versions = [tvlink.Version.from_row(v) for m in maps for v in store.versions_for_linking(client, m["project_id"])]
+    older_rows: list[dict] = []
+    versions = [tvlink.Version.from_row(v) for m in maps
+                for v in store.versions_for_linking(client, m["project_id"], older=older_rows)]
     index = tvlink.VersionIndex(versions)
+    older = _OlderVersions.build(index, versions, [tvlink.Version.from_row(v) for v in older_rows])
     notes_by_id = {n.note_id: n for n in (tvlink.Note.from_row(r) for r in store.tv_notes(client, tv_project_id))}
     rows = store.tv_links(client, tv_project_id)
     try:
@@ -12770,7 +12988,7 @@ def tv_rescore_misses(client, tv_project_id: str, days: int | None = None, *, dr
         since = datetime.now(timezone.utc) - timedelta(days=max(int(days), 0))
         only = {nid for nid, n in notes_by_id.items() if n.publish_time is not None and n.publish_time >= since}
     out = _rescore_misses(client, rows, notes_by_id, index, snaps, tvlink.VersionIndex(snaps), only=only,
-                          dry_run=dry_run)
+                          dry_run=dry_run, older=older)
     return {"tv_project_id": tv_project_id, "links": len(rows), "notes": len(notes_by_id), "days": days,
             "dry_run": dry_run, **out}
 
@@ -12791,6 +13009,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
       2. 拉 TV 的笔记(RPC 跨 schema) + 各写作台项目的定稿版本。
       3. tvlink.match_note 逐条判: body_exact / title_exact / fuzzy / ambiguous /
          unmatched。TV 自己已经带 source_autowriter_version_id 的直接记 tv_lineage。
+         对不上 / 只是标题一样的, 再按 item 对一遍存过的另一版(_match_with_older, 2026-11-26), 认了的先让底稿看一遍。
       4. unmatched → ingest_published(剥掉话题标签, source="tv:<项目>", 不过闸,
          按全文幂等), 建成的 version_id 记回对照。对不上的(unmatched / ingested)那一行
          的 score 记这篇帖和写作台的稿子最像到什么程度(见下面 miss_score), 只是读数。
@@ -12818,10 +13037,13 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     target = next((m for m in maps if m.get("ingest_target")), None)
     owners = {m["project_id"]: _tv_owner(client, m["project_id"]) for m in maps}
 
-    raw_versions = [(m["project_id"], store.versions_for_linking(client, m["project_id"])) for m in maps]
+    older_rows: list[dict] = []          # item 存过的另一版(不是对照用的那一版): 对不上时的第二遍(_match_with_older)
+    raw_versions = [(m["project_id"], store.versions_for_linking(client, m["project_id"], older=older_rows))
+                    for m in maps]
     versions = [tvlink.Version.from_row(v) for _, rows in raw_versions for v in rows]
     index = tvlink.VersionIndex(versions)
     known = {v.version_id: v for v in versions}
+    older = _OlderVersions.build(index, versions, [tvlink.Version.from_row(v) for v in older_rows])
     project_of = {m["project_id"]: m for m in maps}
     notes = [tvlink.Note.from_row(r) for r in store.tv_notes(client, tv_project_id, since=since)]
     existing = store.tv_links(client, tv_project_id)
@@ -12857,6 +13079,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     # 底稿都算)。记进 unmatched / ingested 那一行的 score —— 以前这两种一律是 NULL, 看不出帖是在别处写的(接近 0)还是拿写作台
     # 的稿子改的。只是个读数: 不参与判定, 不改哪一条走补录。没正文 / 帖太短没得比的不在里面(score 照旧 NULL)。
     miss_score: dict[str, float] = {}
+    older_linked: set[str] = set()       # 这晚连到 item 存过的另一版的帖(_match_with_older), 单独报 older_version
+    older_wait: dict[str, tuple] = {}    # 第二遍对上另一版、先让底稿看一遍的: note_id → (判定, 前面那句), 见 _apply
 
     def _seen(n: tvlink.Note, m: tvlink.Match) -> None:
         if m.score is not None:
@@ -12881,10 +13105,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             return tvlink.Match("tv_lineage")
         if not n.body:
             return tvlink.Match("no_body")
-        return tvlink.match_note(n, index)
+        return _match_with_older(n, index, older)
 
-    def _apply(n: tvlink.Note, m: tvlink.Match, extra: list[dict] | None = None) -> None:
-        """判定的副作用(计数、对照、补录名单)。``extra``: 挪走的对照前面记的那句(W-34)。"""
+    def _apply(n: tvlink.Note, m: tvlink.Match, extra: list[dict] | None = None, *, hold_older: bool = True) -> None:
+        """判定的副作用(计数、对照、补录名单)。``extra``: 挪走的对照前面记的那句(W-34)。``hold_older=False``: 第二遍对上
+        另一版的也马上连(重对还对回原来那一版的, 对照本来就在那一版上)。"""
         extra = list(extra or [])
         if m.kind == "tv_lineage":
             # TV 自己带的 lineage。只在那个 version 真在我们库里时才写 version_id ——
@@ -12892,7 +13117,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             # 分块失败; 认不出的记在 candidates 里给人看, 不写外键列。
             counts["tv_lineage"] += 1
             tvid = str(n.tv_version_id)
-            v = known.get(tvid)
+            # TV 指的是 item 存过的另一版(2026-11-26): 这晚已经读到了它, 不用再去库里反查, lag 也算得出(差异按它排除抄回的那版)
+            v = known.get(tvid) or older.known.get(tvid)
             hit = ((v.project_id, v.item_id) if v else _resolve_any_version(client, project_of, tvid))
             links.append(_link(n, "tv_lineage",
                                project_id=hit[0] if hit else None,
@@ -12919,8 +13145,18 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             _seen(n, m)
             to_ingest.append(n)
             return
+        if hold_older and m.version is not None and _older_matched(m.candidates):
+            # 第二遍对上 item 存过的另一版(_match_with_older): 先当对不上进补录名单, 让查重底稿(W-38)看一遍 —— 帖要是正好是
+            # 哪一轮只查过重的字, 按底稿转正(复审 11-26); 底稿认不出 / 不比这一版更像的, 补录之前再连到这一版上(older_wait 那一段)
+            counts["unmatched"] += 1
+            older_wait[n.note_id] = (m, extra)
+            _seen(n, m)
+            to_ingest.append(n)
+            return
         counts[m.kind] += 1
         if m.version is not None:
+            if _older_matched(m.candidates):
+                older_linked.add(n.note_id)             # 连的是另一版(不另开 counts 的键: counts 加起来仍等于笔记数)
             links.append(_link(n, m.kind, project_id=m.version.project_id,
                                version_id=m.version.version_id, item_id=m.version.item_id,
                                score=m.score, lag=m.lag_days, candidates=extra + list(m.candidates or [])))
@@ -13062,7 +13298,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             drift["kept_after_rematch"] += 1
             w34_note.pop(n.note_id, None)
             if mv == old:
-                _apply(n, m)
+                _apply(n, m, hold_older=False)
                 links[-1]["tv_text_fp"] = prev.get("tv_text_fp")     # 指纹等差异算好了再记(见下面 fp_set)
             else:
                 counts["already_linked"] += 1
@@ -13118,7 +13354,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
     snap: dict = {"pending": 0, "matched_notes": 0, "promoted": 0, "minted": 0, "repaired": 0, "fingerprinted": 0,
                   "angles_consumed": 0, "ambiguous": 0, "already_fingerprinted": 0, "held": 0, "failed_notes": 0,
                   "waiting_post": 0, "superseded": 0, "undated": 0, "same_night": 0, "held_rival": 0,
-                  "applied": True, "error": None, "samples": []}
+                  "writer_edit": 0, "applied": True, "error": None, "samples": []}
     pids = [m["project_id"] for m in maps]
     snap_read_ok = True                                 # 回流闸量重合要用底稿: 这晚没读出来就不量(见 _tv_gate_step)
     try:
@@ -13179,11 +13415,45 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             snap["error"] = snap["error"] or rep["error"]
     live = [g for vid, g in groups.items() if vid not in known and g["ok"]]
     if to_ingest and live:
-        svers = [tvlink.Version(version_id=g["version_id"], project_id=g["project_id"], title=g["title"].strip(),
-                                body=tvlink.strip_hashtags(g["body"]), created_at=tvlink._as_dt(g["first_checked_at"]))
-                 for g in live]
-        sindex = tvlink.VersionIndex(svers)
+        def _sv(g: dict) -> tvlink.Version:
+            return tvlink.Version(version_id=g["version_id"], project_id=g["project_id"], title=g["title"].strip(),
+                                  body=tvlink.strip_hashtags(g["body"]), created_at=tvlink._as_dt(g["first_checked_at"]))
+        # 只由 record_edit 记下的写手手改版(writer_edit_only)只兜底(复审 2026-11-26): 写手改完 AI 那一版、再 record_edit 的,
+        # 发出去的帖和手改版最像(标题一样、查得最晚), 放在一起对就总是它赢 —— 那篇帖就从带 angle_key 的 AI 底稿那里被抢走:
+        # 不销牌、不记臂、没有 AI → 发出去的改稿差异(TV 的未改动分母恰好丢掉改过的那几篇), AI 那份底稿一直挂着。所以先只拿
+        # 别的底稿对(和 B 之前一模一样), 对不上(unmatched, 不是 ambiguous)的才拿写手手改版再对一次。
+        svers = [_sv(g) for g in live if not g["writer_edit_only"]]
+        wvers = [_sv(g) for g in live if g["writer_edit_only"]]
+        sindex, windex = tvlink.VersionIndex(svers), tvlink.VersionIndex(wvers)
         by_vid = {g["version_id"]: g for g in live}
+
+        def _older_item(n: tvlink.Note) -> str | None:
+            w = older_wait.get(n.note_id)
+            return str(w[0].version.item_id) if w and w[0].version.item_id else None
+
+        def _snap_beats_older(n: tvlink.Note, ms: tvlink.Match) -> bool:
+            """第二遍对上了另一版的帖(older_wait): 底稿认得出一份(对手里不算那个 item 自己的几版), 而且帖和那份底稿比和那一版
+            更像 —— 帖在稿里多, 一样多看稿在帖里多(同 match_snapshot / tvlink._collapse 的挑法); 打平算那一版(存过档的先,
+            同底稿存了档就让给存的那一版)。两轮之间 AI 改了一两句的, 帖是查过重的那一轮时归底稿(复审 11-26)。
+            只由 record_edit 来的写手手改版(writer_edit_only)不参加: 它只兜底, 第二遍已经连上存过的 AI 那一版了就归那一版
+            (帖就是写手的字, 放进来比它总赢, 帖就丢了 AI → 帖的改稿差异、同一篇成了两个 item; 和那一版还是 best 时一样,
+            合并后复审 11-26)。"""
+            if ms.version is None or by_vid.get(ms.version.version_id, {}).get("writer_edit_only"):
+                return False
+            ov = older_wait[n.note_id][0].version
+            ng = tvlink.grams(n.body)
+
+            def rank(ix, v) -> tuple:
+                g = ix.grams_of(v)
+                return ix.containment(ng, v), (len(g & ng) / len(g) if g else 0.0)
+            return rank(sindex, ms.version) > rank(older.merged, ov)
+        def _snap_match(n: tvlink.Note, main, **kw) -> tvlink.Match:
+            m = tvlink.match_snapshot(n, svers, sindex, main, **kw)
+            if m.kind != "unmatched" or not wvers:
+                return m
+            w = tvlink.match_snapshot(n, wvers, windex, main, **kw)
+            # 两边都对不上: 回分数高的那个(miss_score 记的是离写作台见过的字最近有多近, 手改版也算)
+            return w if w.kind != "unmatched" or (w.score or 0.0) > (m.score or 0.0) else m
         hits: dict[str, list[tuple]] = {}
         held: set[str] = set()                          # 帖还没有发布日期、这晚等着的底稿
         rest: list[tvlink.Note] = []
@@ -13192,10 +13462,11 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 # 飞书里还没填发布日期就被 TV 读进来了(10-29 生产库近 14 天 413 篇里 17 篇): 底稿要按发布日期定先后, 这晚
                 # 定不了 —— 按内容对得上底稿的先不补录(补录是终态, 日期填上以后就再也认不回), 记 unmatched 等日期; 对不上
                 # 的照旧补录。等的上限同分不出的: 底稿过了 SNAPSHOT_MAX_AGE_DAYS 就不再参与(复审 on aw#132)
-                probe = tvlink.match_snapshot(dataclasses.replace(n, publish_time=tvlink._as_dt(now)), svers, sindex, index,
-                                              max_lag=None)
+                dated = dataclasses.replace(n, publish_time=tvlink._as_dt(now))
+                probe = _snap_match(dated, older.rivals(dated, item=_older_item(n)), max_lag=None)
                 _seen(n, probe)
-                if probe.kind != "unmatched":
+                # 第二遍对上了另一版的(older_wait): 底稿比那一版更像才等日期, 不然照样连那一版(同下面有日期的)
+                if probe.kind != "unmatched" and (n.note_id not in older_wait or _snap_beats_older(n, probe)):
                     snap["undated"] += 1
                     held.update([probe.version.version_id] if probe.version is not None else
                                 [str(c.get("version_id")) for c in probe.candidates or () if c.get("version_id") in by_vid])
@@ -13204,8 +13475,13 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                 else:
                     rest.append(n)
                 continue
-            m = tvlink.match_snapshot(n, svers, sindex, index)
+            # 存过档的版本当对手时 item 存过的另一版也算(2026-11-26), 帖发布之后才存的那几版不算(_OlderVersions.rivals)
+            m = _snap_match(n, older.rivals(n, item=_older_item(n)))
             _seen(n, m)
+            if n.note_id in older_wait and not _snap_beats_older(n, m):
+                # 第二遍对上了另一版, 底稿认不出 / 分不出 / 不比那一版更像: 照样连那一版, 不等人看(见下面 older_wait)
+                rest.append(n)
+                continue
             if m.kind == "ambiguous":
                 # 分不出是哪一份底稿(或和存过档的版本分不出): 不补录(补成副本就再也认不回), 记 ambiguous 每晚重判,
                 # 同主索引的分不出一样等人看(tv-resolve); 底稿过了 SNAPSHOT_MAX_AGE_DAYS 就不再参与, 那时照常补录
@@ -13229,10 +13505,13 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         # 底稿转正了也连不回来(复审 on aw#132)
         extra: set[str] = set()
         if (hits or held) and rest:
-            tindex = tvlink.VersionIndex([sv for sv in svers if sv.version_id in hits or sv.version_id in held])
+            tindex = tvlink.VersionIndex([sv for sv in svers + wvers if sv.version_id in hits or sv.version_id in held])
             full: tvlink.VersionIndex | None = None
             still: list[tvlink.Note] = []
             for n in rest:
+                if n.note_id in older_wait:
+                    still.append(n)                     # 已经对上了另一版(older_wait): 不再拿今晚转正的底稿重对
+                    continue
                 m = tvlink.match_note(n, tindex) if n.body else tvlink.Match("unmatched")
                 if m.version is None and m.kind != "ambiguous":
                     still.append(n)
@@ -13321,9 +13600,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             g = by_vid[vid]
             if vid in made:
                 snap["promoted"] += 1
+                # via 跟着转正的 batch 走(_snapshot_batch_via): 写手手改版转正的那一版, 这晚就不算改稿差异
                 known[vid] = tvlink.Version(version_id=vid, project_id=g["project_id"], title=g["title"].strip(),
                                             body=g["body"].strip(), created_at=tvlink._as_dt(g["first_checked_at"]),
-                                            item_id=made[vid])
+                                            item_id=made[vid], via=_snapshot_batch_via([g]))
             for n, m in pairs:
                 if vid not in made:
                     # 没建成: 记 unmatched 不补录(补成副本就再也认不回这份底稿), 明晚再对
@@ -13333,17 +13613,36 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                     continue
                 snap["matched_notes"] += 1
                 snap["same_night"] += n.note_id in extra
+                snap["writer_edit"] += bool(g["writer_edit_only"])
                 counts["unmatched"] -= 1                # _apply 记过一次 unmatched; counts 加起来仍等于笔记数
                 counts[m.kind] += 1
                 links.append(_link(n, m.kind, project_id=g["project_id"], version_id=vid, item_id=made[vid],
                                    score=m.score, lag=m.lag_days,
-                                   candidates=w34_note.get(n.note_id, []) + [{"note": SNAPSHOT_NOTE}]
+                                   candidates=w34_note.get(n.note_id, [])
+                                   + [{"note": SNAPSHOT_NOTE_WRITER_EDIT if g["writer_edit_only"] else SNAPSHOT_NOTE}]
                                    + list(m.candidates or [])))
                 if len(snap["samples"]) < 10:
                     snap["samples"].append({"note_id": n.note_id, "kind": m.kind, "score": round(m.score or 0, 3),
                                             "lag_days": m.lag_days, "version_id": vid,
                                             "angle_key": bool(g.get("angle_key"))})
         to_ingest = rest
+
+    # ── 第二遍对上 item 存过的另一版、底稿没认走的(2026-11-26, older_wait, 见 _apply): 连到那一版上, 不补录 ──
+    # 底稿认走的已经按底稿连了; 等日期的、转正没成的、这晚读不出底稿的记了 unmatched, 明晚再对(那时再走一遍第二遍)
+    if older_wait:
+        waiting: list[tvlink.Note] = []
+        for n in to_ingest:
+            if n.note_id not in older_wait:
+                waiting.append(n)
+                continue
+            m, extra = older_wait[n.note_id]
+            counts["unmatched"] -= 1                    # _apply 按 unmatched 记的; counts 加起来仍等于笔记数
+            counts[m.kind] += 1
+            older_linked.add(n.note_id)
+            links.append(_link(n, m.kind, project_id=m.version.project_id, version_id=m.version.version_id,
+                               item_id=m.version.item_id, score=m.score, lag=m.lag_days,
+                               candidates=extra + list(m.candidates or [])))
+        to_ingest = waiting
 
     # ── 只因为标题一样才分不出、查重底稿也没认领的(外部审计 11-02 F04 复审, 2026-11-02) ──
     # 头一次这样判出来之后 TV_WEAK_TITLE_GRACE_DAYS 天内记 ambiguous 等人看(不补录: 补录是终态); 满了没人判就照常补录, 发出去的
@@ -13499,7 +13798,10 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             if pending:
                 store.tv_mark_synced(client, [l["note_id"] for l in pending])
 
-    edit_diffs = _tv_edit_diffs(client, tv_project_id, links, existing, notes_by_id, known, dry_run=dry_run,
+    # 连着 item 另一版的对照(第二遍对上的、TV 自己指着另一版的)也算差异(2026-11-26): 差异只认手里有那一版的文字的, 另一版这晚
+    # 已经读到了。在底稿那一步之后合: 今晚转正的底稿(known[vid] = …)也要在里面
+    known_all = {**older.known, **known}
+    edit_diffs = _tv_edit_diffs(client, tv_project_id, links, existing, notes_by_id, known_all, dry_run=dry_run,
                                 text_changed=text_changed, blocked=blocked)
     fp_ok: set = set(fp_set) if dry_run else set()   # 正文指纹记上了的(W-40 只认这些改过字的)
     if fp_set and not dry_run:
@@ -13530,7 +13832,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
             pairs.append((n, str(l["project_id"]), str(l["version_id"])))
     # F07: 补录的帖正文改过了, 改后的文字记在补录的那一版下(按文字幂等, 只改了标点 / 话题的不多记)
     pairs += [t for nid, t in ingested_drift.items() if t[1] in owners]
-    published_fp = _fingerprint_published(client, pairs, known=known, owners=owners, dry_run=dry_run,
+    # 连着 item 另一版的(2026-11-26): 那一版的文字和时刻这晚已经读到了(known_all), 不用再去库里取
+    published_fp = _fingerprint_published(client, pairs, known=known_all, owners=owners, dry_run=dry_run,
                                           holder=f"tv-sync-published:{tv_project_id}:{uuid.uuid4().hex[:8]}")
     if not dry_run and (ingested_seed or ingested_drift):
         # 改过的那几条, 文字记上了才记指纹(记了明晚就不再看); 这晚没记成的留着, 明晚按文字再补
@@ -13554,7 +13857,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                                              holder=f"tv-sync-heal:{tv_project_id}:{uuid.uuid4().hex[:8]}")
     matched = counts["body_exact"] + counts["title_exact"] + counts["fuzzy"] + counts["edited"]
     # 回流闸 v1: 放在最后, 前面的对照 / 补录 / 指纹都已经落库。不抛(见 _tv_gate_step)
-    gate = _tv_gate_step(client, tv_project_id, notes_by_id, index, groups, dry_run=dry_run, gate_all=gate_all,
+    # 量「发布前写作台里的文字」时 item 存过的另一版也算(2026-11-26): 发布前存过的就是发布前写作台里的文字
+    gate = _tv_gate_step(client, tv_project_id, notes_by_id, older.merged, groups, dry_run=dry_run, gate_all=gate_all,
                          snapshots_ok=snap_read_ok)
     return {
         "tv_project_id": tv_project_id,
@@ -13562,6 +13866,8 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
         "ingest_target": target["project_id"] if target else None,
         "versions": len(versions), "notes": len(notes),
         "counts": counts, "matched": matched,
+        # 2026-11-26: 读到的 item 另一版几条; 这晚连到另一版的帖几篇(已经算在 counts 那四种和 matched 里, 不另开 counts 的键)
+        "older_versions_indexed": len(older.ids), "older_version": len(older_linked),
         "ingest": ingest, "links_written": written_links, "unmatched_kept": unmatched_kept,
         "tv_backfilled": backfilled, "write_tv": write_tv, "dry_run": dry_run,
         "ambiguous_samples": ambiguous_samples,
@@ -13576,6 +13882,7 @@ def tv_sync(client, tv_project_id: str, *, dry_run: bool = False,
                  f"(开头 {counts['body_exact']} / 标题 {counts['title_exact']} / 模糊 "
                  f"{counts['fuzzy']} / 改过 {counts['edited']}"
                  + (f"; 其中对上查重底稿 {snap['matched_notes']}" if snap["matched_notes"] else "")
+                 + (f"; 其中对上的是稿子存过的另一版 {len(older_linked)}" if older_linked else "")
                  + f"), 分不出 {counts['ambiguous']}"
                  + (f"(其中只有标题一样、等人看的 {weak_title['held']}, 满 {TV_WEAK_TITLE_GRACE_DAYS} 天没人判就补录)"
                     if weak_title["held"] else "")

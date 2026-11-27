@@ -498,8 +498,11 @@ def _tv_sync(core, sb, args) -> int:
             continue
         head = "[dry-run] " if args.dry_run else ""
         print(f"\n{head}{tv}: {out['note']}")
-        print(f"  写作台版本 {out['versions']} 条(项目 {len(out['desk_projects'])} 个), "
-              f"对照写入 {out['links_written']}, 回填 TV {out['tv_backfilled']}")
+        print(f"  写作台版本 {out['versions']} 条(项目 {len(out['desk_projects'])} 个"
+              # 2026-11-26: item 存过的另一版, 对照用的那一版对不上时才拿来对(core._match_with_older); 对上几篇在上面那行的「其中」里
+              + (f"; 另有存过的另一版 {out['older_versions_indexed']} 条, 对不上时才对"
+                 if out.get("older_versions_indexed") else "")
+              + f"), 对照写入 {out['links_written']}, 回填 TV {out['tv_backfilled']}")
         ing = out.get("ingest")
         if ing:
             print(f"  补录: 收到 {ing['received']}, 要写 {ing['to_write']}, 指纹库已有 "
@@ -546,6 +549,8 @@ def _tv_sync(core, sb, args) -> int:
             print(f"  查重底稿(W-38): {sn['matched_notes']} 篇帖对上了没存档的底稿, 转成版本 {sn['promoted']}"
                   f"(新建 {sn['minted']}), 销牌 {sn['angles_consumed']}, 写指纹 {sn['fingerprinted']}"
                   + (f"(其中 {sn['same_night']} 篇是改写过的, 按主索引的规矩连上今晚转正的版本)" if sn.get("same_night") else "")
+                  + (f"; 其中 {sn['writer_edit']} 篇对上的是 record_edit 记下的写手手改版(不销牌、不算改稿差异)"
+                     if sn.get("writer_edit") else "")
                   + (f"; {sn['held_rival']} 篇和今晚转正的、存过档的分不出, 没补录, 明晚再对" if sn.get("held_rival") else "")
                   + (f"; {sn['undated']} 篇对得上底稿、还没填发布日期, 没补录, 填了再对" if sn.get("undated") else "")
                   + (f"; 补齐前一晚转了一半的 {sn['repaired']}" if sn.get("repaired") else "")

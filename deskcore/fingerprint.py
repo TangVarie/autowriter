@@ -280,6 +280,20 @@ NGRAM_CONTAIN_WARN = 0.40
 # m 大约是 20。第一版就是 30, 于是"修好了但最该抓的那档抓不到"。
 CONTAIN_MIN_SAMPLE = 15
 
+# ── 仿写时比参考原文(2026-11-26, check_drafts 的 reference_text, docs/deskcore.md §3.39) ─────────────────────────
+# 量的是稿子正文的四字串有多少直接出现在参考原文里(tvlink.reference_overlap, 完整集合, 不是 sketch)。两条线都借上面那两条
+# 包含度线, 不另定一套:
+#   · WARN = 0.40: 查重自己的「正文有 40% 与历史稿重合」那条弱线。仿写和参考稿同题, 共用产品话术、话题词是正常的 ——
+#     tvlink 那边(模块说明、EDITED_FLOOR=0.30)实测过: 共用产品话术的不同稿子落在 0.30 以下。0.40 比那一档高出整整一个
+#     FUZZY_MARGIN(0.10), 不会把同题的正常仿写当成照抄。
+#   · STRONG = 0.60: 查重的硬线, 也就是 tv-sync 认「发出去的帖是从这一版改出来的」那条线(tvlink.FUZZY_CONTAIN)。到这里
+#     基本是照着参考原文改的 —— 只换说法更重, **不改判 reject**: 存档(score_drafts)重跑查重时手上没有参考原文, 拦不住的
+#     reject 只会和存档的判定对不上; 同题文字之间也还没有校准过的数。所以参考原文那一路最多是 warn。
+# 合成样例(tests/test_check_drafts_reference.py): 几乎逐字照搬 0.84, 开头两句照搬 0.44, 换了人和事的仿写 0。那是自测,
+# 不是校准; 上线后看调用留痕里的 meta.check.reference.max_decile 再定要不要动。
+REFERENCE_CONTAIN_WARN = NGRAM_CONTAIN_WARN
+REFERENCE_CONTAIN_STRONG = NGRAM_CONTAIN_HARD
+
 
 def deciding_signals(title_sim: float, opening_exact: bool, ngram_j: float,
                      ngram_contain: float = 0.0,

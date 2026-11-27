@@ -343,12 +343,18 @@ def test_a_failed_snapshot_write_never_changes_the_verdict(monkeypatch, caplog):
 
 
 def test_check_drafts_still_raises_when_the_gate_itself_fails(monkeypatch):
-    # 记底稿 fail-open 不能把查重本身也变成 fail-open
+    # 记底稿 fail-open 不能把查重本身也变成 fail-open。2026-11-26: 查重抛了也先把稿子记下(status = gate_error), 再原样上抛
+    # 同一个异常 —— 以前这一批一行不留(11-18..11-23 生产库 57014 超时 22 次, 那几批发出去 TV 都认不回写作台)
     c = _desk()
-    monkeypatch.setattr(core, "_gate", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("history down")))
-    with pytest.raises(RuntimeError):
-        core.check_drafts(c, P1, [{"title": "t", "body": BODY_S}], user_id=WRITER, record_snapshot=True)
-    assert c.rows["draft_snapshots"] == []
+    boom = RuntimeError("history down")
+    monkeypatch.setattr(core, "_gate", lambda *a, **k: (_ for _ in ()).throw(boom))
+    with pytest.raises(RuntimeError) as ei:
+        core.check_drafts(c, P1, [{"title": "t", "body": BODY_S, "angle_key": KEY}], user_id=WRITER,
+                          record_snapshot=True)
+    assert ei.value is boom, "上抛的是查重原来那个异常, 不是记底稿时的"
+    (row,) = c.rows["draft_snapshots"]
+    assert row["status"] == core.SNAPSHOT_GATE_ERROR == "gate_error"
+    assert row["angle_key"] == KEY and row["user_id"] == WRITER and row["body"] == BODY_S
 
 
 # ══════════════════════════════════════════════════════════════════════

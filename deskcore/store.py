@@ -3345,7 +3345,7 @@ REPORT_EXPOSURE_BATCH_CAP = 5000
 
 def report_exposure_batches(sb, days: int, project_id: str | None = None,
                             cap: int = REPORT_EXPOSURE_BATCH_CAP) -> list[dict] | None:
-    """近 ``days`` 天写作台自己建的 batch(存档的和底稿转正的; 补录副本不算): ``[{"id", "project_id", "created_at",
+    """近 ``days`` 天写作台自己建的 batch(存档的和底稿转正的; 补录副本、只由写手手改版转正的不算): ``[{"id", "project_id", "created_at",
     "exposure"}]``, 旧的在前。``exposure`` 是 ``params.lesson_exposure``: dict = 记下了; None = 那一批不知道(进程重启过 /
     没借过卡); 没有这个键的(这个功能之前的批次)记 ``"absent"``。读挂了回 None。"""
     since = iso_ago(max(int(days), 1))
@@ -3361,6 +3361,10 @@ def report_exposure_batches(sb, days: int, project_id: str | None = None,
     for r in rows:
         params = _as_params(r.get("params"))
         if not r.get("id") or params.get("source") != "deskcore":
+            continue
+        if params.get("via") == "record_edit":
+            # 只由 record_edit 记下的写手手改版转正的(2026-11-26): 是人写的字, 故意不记 lesson_exposure —— 不跳过的话没有这个键,
+            # 会被当成「这个功能之前的批次」, 每晚越攒越多(复审 11-26)
             continue
         exposure = params.get(SNAPSHOT_EXPOSURE_COL, "absent")
         out.append({"id": str(r["id"]), "project_id": str(r.get("project_id") or ""), "created_at": r.get("created_at"),
@@ -3457,6 +3461,8 @@ def update_commit_metrics_meta(sb, row_id: str, meta: dict) -> None:
 
 
 # ── 查重时记下的底稿(migrations/018, W-38) ─────────────────────────────────────
+# status 里查重真下过的判定(同 core.SNAPSHOT_VERDICTS); 另有 gate_error / writer_edit 两种不是判定(2026-11-26, 见 core 那段)
+SNAPSHOT_VERDICT_STATUSES = frozenset({"pass", "warn", "reject"})
 SNAPSHOT_COLS = ("id, project_id, user_id, check_id, title, body, angle_key, text_fp, status, "
                  "flywheel_arm, flywheel_arm_source, checked_at")
 
@@ -3573,7 +3579,11 @@ def snapshotted_angle_keys(sb, project_id: str, user_id: str | None, days: int) 
     (W-38): 这些牌的稿子已经写出来、查过重了, 发出去以后 tv-sync 会从飞书对回来销账 —— 那次查重之前抽的不算"抽了没写"
     (之后又抽到的照旧算, 见 angle_debt)。最近一次是 reject 的(查重打回、可能没再写)照旧算欠着。读不到(018 没跑 / 任何
     错误)回空: 只是少排除几张, 不能把简报弄坏。只收能安全放进 in_() 查询的形状(_LEDGER_LOOKUP_KEY); 调用方再按发牌的
-    形状筛。"""
+    形状筛。
+
+    挑「最近一次」只看真下过判定的行(pass / warn / reject, 2026-11-26): 查重出错时记下的(gate_error)、record_edit 的写手
+    手改版(writer_edit, 本来就不带 angle_key)不是判定 —— 先通过、重查时查重超时了, 那张牌照旧算写过了, 不因为一次出错
+    回到「抽了没写」。只有出错的行、没有判定的那张照旧算欠着。"""
     if not user_id:
         return {}
     try:
@@ -3589,6 +3599,8 @@ def snapshotted_angle_keys(sb, project_id: str, user_id: str | None, days: int) 
     for r in rows:
         k = str(r.get("angle_key") or "")
         at = str(r.get("checked_at") or "")
+        if r.get("status") not in SNAPSHOT_VERDICT_STATUSES:
+            continue
         if _LEDGER_LOOKUP_KEY.fullmatch(k) and (k not in latest or at >= latest[k][0]):
             latest[k] = (at, r.get("status"))
     return {k: at for k, (at, status) in latest.items() if status in ("pass", "warn")}
@@ -4315,7 +4327,45 @@ def is_ingest_batch(batch: dict | None) -> bool:
     return isinstance(params, dict) and params.get("source") == "ingest"
 
 
-def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[dict]:
+def batch_via(batch: dict | None) -> str | None:
+    """这个 batch 的 ``params.via``(2026-11-26): "snapshot" = 查重底稿转正的, "record_edit" = 只由 record_edit 记下的写手
+    手改版转正的; 存档建的没有这个键。读不出回 None。"""
+    via = _as_params((batch or {}).get("params")).get("via")
+    return via if isinstance(via, str) else None
+
+
+# TV 的爆款同步(truth-vault scripts/sync_truth_vault_baokuan_to_autowriter_items.py)建的 item: batches.params.source 是这个,
+# 文字是从 TV 的笔记复制进来的, 不是写作台写的稿。它们留在对照用的那份索引里(那是改这里之前就有的样子, 不在这次动);
+# 另一版那份(versions_for_linking 的 ``older``)不收: 这种 item 上不是对照用的那一版, 要么也是 TV 的文字, 要么是写作台在 TV 的
+# 文字上改的一版 —— 拿它去接帖, 就是把 TV 的文字认成写作台的产出(同补录副本, A-02)。
+TV_COPY_SOURCE = "truth_vault_sync"
+
+
+def _older_linking_rows(item: dict, chosen: dict, versions: list[dict], project_id: str) -> list[dict]:
+    """versions_for_linking 的 ``older``(2026-11-26): 这个 item 除了对照用的那一版之外的各版, 行的样子和对照用的那一版的
+    一样, created_at 是那一版自己的(没有就用 item 的)。标题正文都空的不要。
+
+    这些是什么: 改稿(replaces_version_id)之前存的那几版; 老的多引擎 item(db.bulk_create_initial_versions)里一个引擎一版,
+    是并列的几稿, 不一定更早。对照索引只有 best(没设 best 就是 version_num 最大的), 帖的文字正好是另一版时就对不上。
+    tv-sync 拿这些行做第二遍(core._match_with_older, tvlink.match_note_by_item): 只在对照用的那一版对不上时才看, 同一个
+    item 的几版先并成一版再比, 不让兄弟版本互相变成分不出。"""
+    out: list[dict] = []
+    for v in versions:
+        if v is chosen or not v.get("id") or v.get("id") == chosen.get("id"):
+            continue
+        title = (v.get("title") or "").strip()
+        body = (v.get("body") or "").strip()
+        if not (title or body):
+            continue
+        out.append({"version_id": v.get("id"), "item_id": item.get("id"),
+                    "project_id": project_id, "title": title, "body": body,
+                    "created_at": v.get("created_at") or item.get("created_at"),
+                    "ai_engine": v.get("ai_engine"), "via": version_via(item, v)})
+    return out
+
+
+def versions_for_linking(sb, project_id: str, limit: int | None = None, *,
+                         older: list | None = None) -> list[dict]:
     """项目里每个 item 的定稿版本, 带 created_at / item_id —— 对照要按时间窗判。
 
     与 ``legacy_version_pages`` 同样只取 best / 最新那一版: 发出去的是它。
@@ -4329,6 +4379,9 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
     docstring 说要排除的因果倒置, 只是绕了一条路。生产库 10-08 查到 31 篇这样的
     血缘(SPX 23 · HATHERINE 7 · LNKT 1), TV 的模型对比视图把它们算成写作台产出。
     ``ingested`` 对照本身仍靠 ``existing`` 跳过, 不依赖这里。
+
+    ``older``(2026-11-26): 给一个 list 就顺手把各 item 别的版本(_older_linking_rows, 补录副本和 TV_COPY_SOURCE 的 item 不收)
+    追加进去, 不多查一次库; 回的这份不变。tv-sync 的第二遍用(core._match_with_older)。
     """
     def _build(off, lim):
         return (sb.table("items")
@@ -4350,6 +4403,9 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
         chosen = next((v for v in versions if v.get("id") == best), None)
         if chosen is None:
             chosen = max(versions, key=lambda v: v.get("version_num") or 0)
+        # ``older``(2026-11-26): 给了就把这个 item 别的版本也收进去(_older_linking_rows), 回的这份照旧每个 item 一版
+        if older is not None and _as_params((item.get("batches") or {}).get("params")).get("source") != TV_COPY_SOURCE:
+            older.extend(_older_linking_rows(item, chosen, versions, project_id))
         title = (chosen.get("title") or "").strip()
         body = (chosen.get("body") or "").strip()
         if not (title or body):
@@ -4358,8 +4414,21 @@ def versions_for_linking(sb, project_id: str, limit: int | None = None) -> list[
         out.append({"version_id": chosen.get("id"), "item_id": item.get("id"),
                     "project_id": project_id, "title": title, "body": body,
                     "created_at": chosen.get("created_at") or item.get("created_at"),
-                    "ai_engine": chosen.get("ai_engine")})
+                    "ai_engine": chosen.get("ai_engine"),
+                    # via: 写手手改版转正的那一版(record_edit), tv-sync 不给它算改稿差异(2026-11-26, core._tv_edit_diffs)
+                    "via": version_via(item, chosen)})
     return out
+
+
+def version_via(item: dict, version: dict) -> str | None:
+    """这一版是不是它所在 batch 转正时建的那一版, 是就回那个 batch 的 ``params.via``(2026-11-26)。
+
+    via 是 batch 的, 「这段字是写手自己的」却是那一版的: 转正只建 version_num = 1 的那一版(_mint_entries); 以后同一个
+    item 上加的版本(replaces_version_id 改稿, version_num 2 起)是另一回事 —— 不能跟着 batch 记成 record_edit, 不然连着它
+    的帖一声不响地没了改稿差异(复审 11-26)。所以只有 version_num 1(读不到当 1)的那一版带 via, 别的回 None。"""
+    if (version.get("version_num") or 1) != 1:
+        return None
+    return batch_via(item.get("batches"))
 
 
 # ── 最近发出去 / 写过的标题: 简报里给模型"这批要避开什么"(2026-10-20) ─────────────────────────

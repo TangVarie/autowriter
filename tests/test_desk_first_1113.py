@@ -231,7 +231,8 @@ def test_the_update_notice_is_three_plain_lines_and_blames_nobody():
     msg = skillcheck.notice("0123456789ab", _VERSION)["message"]
     lines = msg.splitlines()
     assert len(lines) == 3 and lines[1:] == [skillcheck.UPDATE_URL, skillcheck.UPDATE_COMMAND]
-    assert "排第一" in lines[0] and "重新导入一次" in lines[0], "这一版的那半句按版本号挂着"
+    # 2026-11-26: 不钉哪一版的那半句(协议一升版这里就红), 只钉「当前版本的那半句在第一行里」
+    assert skillcheck.WHATS_NEW[_VERSION] in lines[0] and "重新导入一次" in lines[0], "这一版的那半句按版本号挂着"
     assert "0123456789ab" in lines[0] and _VERSION in lines[0]
     for blame in ("不是最新版", "请先升级", "你没", "忘了"):
         assert blame not in msg

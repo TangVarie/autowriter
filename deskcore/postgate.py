@@ -42,7 +42,7 @@ from . import priors
 ORIGIN_DESK = "desk"                  # 写作台的稿发出去的(开头 / 内容 / TV 血缘对上; 标题对上的要正文也像)
 ORIGIN_DESK_EDITED = "desk_edited"    # 写作台的稿, 人改得多(对照是 edited)
 ORIGIN_COPIED_BACK = "copied_back"    # 对上的那一版是发了之后才存进写作台的(lag_days < 0)
-ORIGIN_ELSEWHERE = "elsewhere"        # 别处写的: 对不上, 和发布前写作台里的文字重合不到 ELSEWHERE_MAX
+ORIGIN_ELSEWHERE = "elsewhere"        # 对不上, 和发布前写作台里的文字重合不到 ELSEWHERE_MAX(写作台没见过; 不等于在别处写的, TV D-182)
 ORIGIN_UNCLEAR = "unclear"            # 判不出: 重合 ≥ ELSEWHERE_MAX 的对不上、还没有重合数的、分不出的、只有标题对上的
 ORIGINS = (ORIGIN_DESK, ORIGIN_DESK_EDITED, ORIGIN_COPIED_BACK, ORIGIN_ELSEWHERE, ORIGIN_UNCLEAR)
 
@@ -136,7 +136,8 @@ def origin_of(link: Mapping, prior=None, *, ignore_score: bool = False) -> str:
     对上了的: 那一版晚于发布(lag_days < 0)是抄回来的; edited 是改得多; 标题对上的要包含度到 DESK_TITLE_MIN 才算
     (只有标题一样、正文不像或没得比的记 unclear); TV 带的血缘指到认不出的版本(没有 version_id)记 unclear。lag 没有的
     (那一版不在对照索引里 / 帖没有发布时间)按没晚于发布算, 同 core._diffable 和 TV 判「接住」的口径。
-    对不上的(ingested / unmatched): 重合不到 ELSEWHERE_MAX 是别处写的, 其余(包括还没有重合数的)unclear。"""
+    对不上的(ingested / unmatched): 重合不到 ELSEWHERE_MAX 记 elsewhere(写作台没见过和它像的文字, 多半是对话里后几轮没过查重的稿,
+    不等于在别处写的: 2026-11-26), 其余(包括还没有重合数的)unclear。"""
     kind = (link or {}).get("match_kind")
     if kind in MATCHED_KINDS:
         if not link.get("version_id"):
