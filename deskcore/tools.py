@@ -1,7 +1,8 @@
 """deskcore/tools.py — MCP 工具面。
 
 按写稿的流程分组: 取协议 → 开项目 → 写稿前 → 写稿后(查重 → 存档 + 参考分 → 规则检查) → 收反馈,
-外加三个规则台账工具(my_rules / set_rule_state / reembed_my_rules)和改项目评论配比的 set_comment_mix。
+外加三个规则台账工具(my_rules / set_rule_state / reembed_my_rules)、改项目评论配比的 set_comment_mix 和改交付稿话题的
+set_delivery_tags。
 设计原则是【一次调用拿全】—— 治员工反馈里那条「一个项目一般有 5 个提示词
 要重复操作 5 次, 我的工作台至少有几十个提示词」。
 
@@ -1430,6 +1431,8 @@ def record_rule(project_id: str, content: str, severity: str = "soft",
     什么时候调: 用户说的是「以后都这样」而不是「这次这样」。分不清就问一句。
     例外: 一组评论里提品牌、中性、一句话短评各占几成(comments_for 回的 comment_set 那几个数)不记成规则 —— 记成规则不生效,
     说法不一样时以 comment_set 为准。用户明说这个项目以后都按新的, 调 set_comment_mix 改那几个数。
+    有交付模板的项目, 每篇几个话题、带哪几个固定话题也是模板管的, 记成规则不生效: 用户明说以后要换, 调 set_delivery_tags 改;
+    话题该写什么(跟正文、跟产品)照样记成规则。
 
     severity:
       · "hard" —— 不可违反的硬约束, 以后每次生成都会顶在最前面要求 100% 满足。
@@ -1615,6 +1618,7 @@ def my_rules(project_id: str, _user_id: str | None = None) -> dict:
     带 ``check`` 的是存档时代码会查的: 给的是查的时候真用的那一份(开头那一句只说评论的规则只查评论, 带一句 ``check_note``)。
     改档位用 set_rule_state: 用户说哪条过时了, 当场改, 不用等负责人。
     一组评论的配比(comment_set 里提品牌、中性、短评的几个数)不在这份台账里: 用户明说要改这个项目的配比时用 set_comment_mix。
+    交付稿每篇几个话题、带哪几个固定话题(有交付模板的项目)也不在这里: 用户明说要改时用 set_delivery_tags。
     """
     _require_caller(_user_id, "my_rules", "规则台账不可用")
     # 读, 可降级: 看不到台账不影响写稿。认不出人不是"看不到台账", 上面那行已经拒了(同项目归属的口径)。
@@ -1716,6 +1720,54 @@ def set_comment_mix(project_id: str, mix: dict, _user_id: str | None = None,
         raise InvalidInput(str(exc)) from exc
 
 
+def set_delivery_tags(project_id: str, content: int | None = None, fixed: list[str] | None = None,
+                      _user_id: str | None = None, _caller_name: str | None = None) -> dict:
+    """改这个项目交付稿的话题: 每篇写几个话题、固定加哪几个话题(open_project 的 delivery_requirements 里 tags 和 fixed_tags
+    那两样)。**只在用户明说这个项目以后都这样时调。**
+
+    什么时候调: 用户明说这个项目以后的话题个数或固定话题换了(「以后标签前4个跟正文、后5个跟痘痘, 不要那5个品牌标签」
+    「这个项目以后不加固定话题了」)。改完之后写这个项目的人交付稿都按新的拼, 不用找负责人。这类话里说话题该写什么
+    (跟正文、跟痘痘)的那一半照旧用 record_rule 记成规则; 个数和固定话题是交付模板管的, 记成规则不生效, 用这个工具改。
+    上面第一句是每篇 9 个、不要固定话题: content=9, fixed=[]。
+    什么时候不调:
+      · 用户只是这一批想要别的话题(「这次多加两个」「这批先不带品牌话题」): 不调。交付稿的话题行是按项目的设置拼的, 一批
+        单独改不了: 这一批照 delivery_requirements 写, 交付时一句话告诉用户这批的话题还是照项目的设置、和他这次要的哪里
+        不一样, 要的话交付后他自己在稿子里改; 用户说以后都这样, 再调这个工具;
+      · 用户没说要改: 不调。score_drafts 说话题不够时照它补齐; **不为了让检查通过去改话题个数或固定话题**, 也不替用户决定
+        要改。拿不准用户说的是只这一批还是以后都这样, 先问一句。
+
+    参数(至少给一个, 不给的那一样不动):
+      · content —— 每篇写几个话题(0~10 的整数), 不算固定话题和按条件加的
+      · fixed —— 固定话题的完整列表: 新给的一份整个换掉现在的(不是往里加), 每篇交付稿的话题行都带, 带不带 # 都行;
+        不要固定话题写 []。最多 10 个(负责人锁定的另算), 新加的一个最多 20 个字
+    有的固定话题是负责人锁定的(客户要求必带): fixed 里没写它也会留着, 回包的 kept_locked 列出这几个, summary 里也说了;
+    跟用户说清这几个是负责人锁定的、这里去不掉。按条件加的话题(标题或正文提到某个词才加)这里改不了, 改了固定话题时
+    summary 会顺带说一句它们照旧。
+
+    返回:
+      · changed —— 改了没有。和现在一样就是 false, 什么都没写
+      · before / after —— 改之前、改之后的 {content, fixed}
+      · kept_locked —— 【有才出现】fixed 里没写、因为锁定留下来的那几个
+      · summary —— 一句话: 哪一样从什么改成了什么。**原样告诉用户**
+      · delivery_requirements —— 改完之后每篇 draft 要带什么, 和 open_project 回的同一个样子: 这一批接下来照它写
+      · next_step —— 接下来怎么做
+    这一批还没存档的稿子照新的写; 已经交付的不用重存(之前交付过的那几批, 页面上和改其中某篇重存时也按新的设置拼, 用户要
+    之前的样子用当时交给他的那一份)。谁在什么时候把什么改成了什么, 写作台留着最近 20 次的记录。
+    报错里说哪个参数写得不对(不是整数、不是一组话题、有一项不是话题)的, 照着改参数再调; 超出上限的(个数 0~10、固定话题
+    最多 10 个、新加的一个最多 20 个字)是用户要的, 不自己改小、删掉几个或改短了再调: 告诉用户上限, 问他要哪样。说这个项目
+    改不了、请用户找负责人的, 照实告诉用户, 不重试。
+    """
+    _require_caller(_user_id, "set_delivery_tags", "话题设置改不了")
+    # 故意不包 _safe: 写。包成带 error 的"成功", 模型会以为改了, 接着按新的个数写、交付稿却照旧的拼。
+    # 时间和是谁在这一层取(留痕用, 同 set_comment_mix): core 不看钟; 名字是 app 注入的钥匙备注名, 不是钥匙本身。
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        return core.set_delivery_tags(core.sb(), project_id, user_id=_user_id, content=content, fixed=fixed,
+                                      by=(_caller_name or "").strip()[:40], at=at)
+    except core.DeliveryTagsError as exc:
+        raise InvalidInput(str(exc)) from exc
+
+
 # 工具注册表 —— app.py 和 cli.py 共用。
 # 值 = (函数, 是否需要服务端注入调用者身份)
 #
@@ -1744,6 +1796,7 @@ TOOLS = {
     "comments_for":   (comments_for,   True),
     "score_comments": (score_comments, True),
     "set_comment_mix": (set_comment_mix, True),  # 用户明说要改项目的评论配比时才调(2026-11-11); 协议冻结, 说明全在 docstring
+    "set_delivery_tags": (set_delivery_tags, True),  # 用户明说要改项目以后的话题个数或固定话题时才调(2026-11-28); 协议冻结, 说明全在 docstring
     "ingest_published": (ingest_published, True),
     "record_rule":    (record_rule,    True),
     "record_edit":    (record_edit,    True),

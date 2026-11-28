@@ -4094,7 +4094,8 @@ _MIX_LOCKS_GUARD = threading.Lock()
 
 
 def _mix_lock(pid: str) -> threading.Lock:
-    """一个项目一把锁(进程内)。只在过了归属校验之后按真的项目 id 取, 所以锁的个数不超过项目数。"""
+    """一个项目一把锁(进程内)。只在过了归属校验之后按真的项目 id 取, 所以锁的个数不超过项目数。
+    2026-11-28 起 set_delivery_tags 也用这一把: 两个都是读、改、写整列 default_params, 得排在同一个队里。"""
     with _MIX_LOCKS_GUARD:
         return _MIX_LOCKS.setdefault(pid, threading.Lock())
 
@@ -4304,6 +4305,216 @@ def _set_comment_mix_locked(client, project: dict, pid: str, *, user_id, wanted:
 
 def _canonical(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True)
+
+
+# ── 写手在对话里改交付稿的话题(2026-11-28, owner: 模板一个项目一份, 话题那一块写手自己改) ──────────────────────────
+# 11-27 Hatherine痘痘贴: 写手停了旧的话题规则, 记了一条「标签前 4 个跟正文、后 5 个跟痘痘, 不要那 5 个品牌标签」, 交付模板
+# 却照旧每篇拼那 5 个固定话题 —— 规则库和模板互不相通, 10-20 起模板又只有负责人能改, 模型只能叫写手去找负责人。owner 11-28:
+# 模板还是一个项目一份, 话题那一块(每篇写几个 content、固定加哪几个 fixed)写手在对话里改, 同 set_comment_mix 改配比。
+#   · 只换 delivery.tags 的 content / fixed; conditional(按条件加的)和 locked(负责人锁住的固定话题)只有负责人用
+#     delivery-format 改, 工具没有这两样的参数。default_params 别的键、delivery 别的键原样, 顺序不变。
+#   · 锁住的写手去不掉: 新的 fixed 里没写的, 按它们现在在 fixed 里的先后接在后面留着(kept_locked), summary 说清是负责人锁的;
+#     写了的(不分大小写)用模板里那个写法 —— 客户点名的话题怎么写不由这里改。最多 10 个只数写手自己的, 锁住的另算: 模型照说明
+#     把锁住的也写进完整列表、和没写它们, 要的是同一个结果, 不能一个收一个拒。
+#   · 合并完拿整份过 delivery.template_of(读的时候同一道闸), 不过就不写: 收下的设置不会事后被当成「模板坏了」。
+#   · 和 set_comment_mix 同一把锁(_mix_lock): 两个都是读、改、写整列 default_params, 各用各的锁的话, 进程里一个照样会拿
+#     旧的一份把另一个盖掉。锁里再读一次项目行、写完再读一次核对; 读、改、写不是一个库事务, 跨进程的那个口子同 set_comment_mix。
+#   · 留痕 delivery_tags_log 在 default_params 顶层(delivery 里的键校验是严的, 多一个不认识的键整个模板就坏了), 新的在前,
+#     最多 20 条, 每条 {at, by, before: {content, fixed}, after: {content, fixed}}; at / by 由工具那一层传进来。
+DELIVERY_TAGS_LOG_KEY = "delivery_tags_log"
+DELIVERY_TAGS_LOG_MAX = 20
+DTAGS_FIXED_MAX = 10                                # 写手这里给的固定话题最多几个(锁住的另算, 照留; 写没写进列表都不数)
+DTAGS_TAG_CHARS = 20                                # 写手新加的一个话题最多几个字; 模板里已经有的(负责人收下过的)照收
+DTAGS_EMPTY = ("content 和 fixed 至少给一个, 什么都没改: content 是每篇写几个话题(0~{hi} 的整数), fixed 是固定话题的完整列表"
+               "(不要固定话题写 [])。")
+DTAGS_CONTENT_BAD = "每篇写的话题个数(content)要是 0~{hi} 的整数, 现在是 {shown}。什么都没改。"
+DTAGS_FIXED_NOT_LIST = "固定话题(fixed)要是一组话题, 比如 [\"示例话题\"], 不要固定话题写 []; 现在是 {shown}。什么都没改。"
+DTAGS_FIXED_BAD = "固定话题第 {k} 个({shown})不是一个话题: 要是一个词, 不能是空的, 中间不能有空格或 #。什么都没改。"
+DTAGS_FIXED_LONG = "固定话题第 {k} 个「{shown}」太长了: 一个话题最多 {n} 个字。什么都没改。"
+DTAGS_FIXED_MANY = "固定话题最多 {n} 个(负责人锁定的另算), 这次去掉重复的还有 {got} 个。什么都没改。"
+DTAGS_NO_TEMPLATE = "这个项目没有交付模板, 话题照项目规则写(记规则用 record_rule); 要模板找负责人。"
+DTAGS_BROKEN = "这个项目的交付设置现在改不了, 请用户找负责人看一下, 不用重试。"
+DTAGS_UNCHANGED = "「{name}」交付稿的话题和现在的一样, 没有改。"
+DTAGS_SUMMARY = "「{name}」交付稿的话题改了: {changes}。"
+DTAGS_LOCKED_KEPT = "{tags} 是负责人锁定的固定话题, 留着了(这里去不掉, 要去掉请找负责人)。"
+DTAGS_CONDITIONAL = "按条件加的话题照旧(负责人定的, 这里改不了): {conds}。"
+DTAGS_NOT_STORED = "这次没有改成: 存进去的和要改的不一样(可能刚好有人也在改这个项目的设置)。请再调一次。"
+# 之前交付过的那几批没有记当时的话题设置: 页面(view_page_data)和改其中某篇重存时拼的整批(_whole_batch_delivery)都按现在的
+# 模板拼, 没改的几篇用的是当时写的话题 —— 既不是当时交付的那一行, 也不是新设置要的个数(也不报)。先照实说, 见 §3.41。
+DTAGS_NEXT_STEP = ("把 summary 原样告诉用户。这个项目以后的交付稿都按新的话题设置拼; 这一批还没存档的稿子照新的话题个数写"
+                   "(delivery_requirements 是改完之后的要求, 和 open_project 回的同一个样子)。已经交付的不用重存; 不过之前交付过的"
+                   "那几批, 打开页面或者以后改其中某篇重存时, 也按新的话题设置拼(没改的那几篇只有当时写的话题), 用户要之前的样子, "
+                   "用当时交给他的那一份。以后也只在用户明说要改这个项目的话题个数或固定话题时调这个工具。")
+DTAGS_UNCHANGED_NEXT_STEP = "把 summary 原样告诉用户; 这一批照 delivery_requirements 写。"
+
+
+class DeliveryTagsError(ValueError):
+    """set_delivery_tags 的入参不对, 或这个项目的交付设置现在改不了。消息是念给调用方的一句; 工具层收成 InvalidInput(400)。"""
+
+
+def _dtags_repr(v, n: int) -> str:
+    """念回给调用方的那个值, 最多 n 个字符。超过 4300 位的整数 repr() 本身就抛(3.11 起), 不能让报错那一句变成 500。"""
+    try:
+        return f"{v!r:.{n}}"
+    except ValueError:
+        return "一个太长的值"
+
+
+def _dtags_content(v) -> int:
+    """每篇写几个话题 → 整数。认整数、整数样子的小数(9.0)、ASCII 数字写的字(「9」); 别的一律是那一句(同 _mix_chars:
+    bool 不算数, 先挡 nan / inf 再 int(), 「²」「①」这种 isdigit 是真、int() 不认的也只回那一句, 不漏成 500)。
+    一长串数字不拿去 int(): 3.11 起超过 4300 位直接抛 ValueError(那就是 500), 而且怎么都不在范围里。"""
+    hi, shown = delivery.MAX_CONTENT_TAGS, v
+    if isinstance(v, str):
+        t = v.strip()
+        if t.isascii() and t.isdigit() and len(t) <= 6:
+            v = int(t)
+    elif isinstance(v, float) and v == v and abs(v) != float("inf") and v == int(v):
+        v = int(v)
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= hi:
+        raise DeliveryTagsError(DTAGS_CONTENT_BAD.format(hi=hi, shown=_dtags_repr(shown, 40)))
+    return v
+
+
+def _dtags_fixed(raw) -> list[str]:
+    """写手给的固定话题 → 本体的列表。一个一个按模板的认法(delivery.clean_tag: 去 #、去 [话题], 空的、中间有空格或 # 的
+    不是话题); 不分大小写去重、留第一个(交付稿的话题行也是这么去重的, 留着第二个只会让 summary 多念一个拼不出来的)。
+    个数的上限不在这里查: 锁住的不数, 得拿到模板(锁里)才知道哪几个是锁住的。"""
+    if not isinstance(raw, (list, tuple)):
+        raise DeliveryTagsError(DTAGS_FIXED_NOT_LIST.format(shown=_dtags_repr(raw, 40)))
+    out, seen = [], set()
+    for k, item in enumerate(raw, 1):
+        t = delivery.clean_tag(item)
+        if t is None:
+            raise DeliveryTagsError(DTAGS_FIXED_BAD.format(k=k, shown=_dtags_repr(item, 30)))
+        if t.casefold() not in seen:
+            seen.add(t.casefold())
+            out.append(t)
+    return out
+
+
+def _dtags_shown(fixed: list[str]) -> str:
+    return "、".join("#" + t for t in fixed) if fixed else "没有"
+
+
+def _dtags_pair(tags: dict) -> dict:
+    """模板(校验过的)的话题设置 → 回包和留痕里的 {content, fixed}。"""
+    return {"content": tags.get("content"), "fixed": list(tags.get("fixed") or [])}
+
+
+def set_delivery_tags(client, project_id: str, *, user_id: str | None, content=None, fixed=None, by: str, at: str) -> dict:
+    """改一个项目交付模板里的话题设置(``delivery.tags`` 的 content / fixed), 回改之前 → 改之后和改完之后的
+    ``delivery_requirements``。
+
+    ``content`` / ``fixed`` 是 None 的不动(至少给一个); ``fixed=[]`` 是不要固定话题(锁住的照留)。``by`` / ``at``: 留痕用的
+    是谁、什么时候(UTC ISO), 工具层传进来。入参不对、项目没有交付模板、模板或设置读不了 → ``DeliveryTagsError``, 一个字不写。
+    和现在一样 → 不写、不留痕, ``changed`` false。
+    """
+    project = assert_project_access(client, project_id, user_id=user_id)
+    pid = str(project["id"])
+    if content is None and fixed is None:
+        raise DeliveryTagsError(DTAGS_EMPTY.format(hi=delivery.MAX_CONTENT_TAGS))
+    want_content = None if content is None else _dtags_content(content)
+    want_fixed = None if fixed is None else _dtags_fixed(fixed)
+    with _mix_lock(pid):                                # 和 set_comment_mix 同一把: 同一列 default_params(见上面那段)
+        project = store.project_row(client, pid) or project
+        return _set_delivery_tags_locked(client, project, pid, user_id=user_id, content=want_content, fixed=want_fixed,
+                                         by=by, at=at)
+
+
+def _set_delivery_tags_locked(client, project: dict, pid: str, *, user_id, content: int | None,
+                              fixed: list[str] | None, by: str, at: str) -> dict:
+    """``set_delivery_tags`` 拿到锁之后的那一段: ``project`` 是锁里刚读的项目行, ``content`` / ``fixed`` 是查过的(None 不动)。"""
+    name = project.get("name") or ""
+    try:
+        params = delivery.parse_params(project.get("default_params"))
+        tpl = delivery.template_of({"default_params": params})
+    except delivery.TemplateError as exc:
+        logger.warning("set_delivery_tags: 项目 %s 的交付模板读不了, 没有写: %s", pid, exc)
+        raise DeliveryTagsError(DTAGS_BROKEN) from exc
+    if tpl is None:
+        raise DeliveryTagsError(DTAGS_NO_TEMPLATE)
+    old = tpl["tags"]
+    new_fixed, kept = list(old["fixed"]), []
+    if fixed is not None:
+        known = {delivery.tag_key(t) for t in old["fixed"]} | {delivery.tag_key(c["add"]) for c in old["conditional"]}
+        for k, t in enumerate(fixed, 1):
+            if len(t) > DTAGS_TAG_CHARS and delivery.tag_key(t) not in known:
+                raise DeliveryTagsError(DTAGS_FIXED_LONG.format(k=k, shown=t[:DTAGS_TAG_CHARS] + "…", n=DTAGS_TAG_CHARS))
+        locked = {delivery.tag_key(t): t for t in old.get("locked", [])}    # 没配锁时规范形状里没这个键
+        own = sum(1 for t in fixed if delivery.tag_key(t) not in locked)
+        if own > DTAGS_FIXED_MAX:
+            raise DeliveryTagsError(DTAGS_FIXED_MANY.format(n=DTAGS_FIXED_MAX, got=own))
+        new_fixed = [locked.get(delivery.tag_key(t), t) for t in fixed]
+        have = {delivery.tag_key(t) for t in new_fixed}
+        # 没写的锁住的话题按它们现在在 fixed 里的先后接上(不按 locked 写的先后): 写手只是去掉别的话题时, 客户点名的那几个在
+        # 交付稿里的先后不变; 锁住的全在、写手又要全去掉的, 结果就是现在那一份, 不写。
+        for t in old["fixed"]:
+            key = delivery.tag_key(t)
+            if key in locked and key not in have:
+                have.add(key)
+                kept.append(locked[key])
+        new_fixed += kept
+    before = _dtags_pair(old)
+    after = {"content": old["content"] if content is None else content, "fixed": new_fixed}
+    out = {"project_id": pid, "project_name": name, "changed": False, "before": before, "after": after}
+    if kept:
+        out["kept_locked"] = kept
+    locked_note = DTAGS_LOCKED_KEPT.format(tags=_dtags_shown(kept)) if kept else ""
+    # 按写进库的样子比(本体、顺序、大小写都算): 顺序和写法都会改交付稿里的那一行
+    if _canonical(after) == _canonical(before):
+        out["summary"] = DTAGS_UNCHANGED.format(name=name) + locked_note
+        out["delivery_requirements"] = delivery.requirements(tpl)
+        out["next_step"] = DTAGS_UNCHANGED_NEXT_STEP
+        return out
+    raw_dlv = params["delivery"]                        # template_of 过了: 是个对象
+    new_tags = dict(raw_dlv["tags"]) if isinstance(raw_dlv.get("tags"), dict) else {}
+    if content is not None:
+        new_tags["content"] = content
+    if fixed is not None:
+        new_tags["fixed"] = new_fixed
+    new_params = dict(params)                           # 别的键原样、原来的顺序; delivery 里也是只换 tags 这一项
+    new_params["delivery"] = {**raw_dlv, "tags": new_tags}
+    try:
+        new_tpl = delivery.template_of({"default_params": new_params})   # 和读的时候同一道闸
+    except delivery.TemplateError as exc:
+        logger.warning("set_delivery_tags: 项目 %s 改完的模板过不了校验, 没有写: %s", pid, exc)
+        raise DeliveryTagsError(DTAGS_BROKEN) from exc
+    log = params.get(DELIVERY_TAGS_LOG_KEY)
+    entry = {"at": at, "by": by or f"user {str(user_id)[:8]}", "before": before, "after": after}
+    new_params[DELIVERY_TAGS_LOG_KEY] = [entry, *(log if isinstance(log, list) else [])][:DELIVERY_TAGS_LOG_MAX]
+    store.set_project_default_params(client, pid, json.dumps(new_params, ensure_ascii=False))
+    # 以库里实际的值回报(同 set_comment_mix): 话题设置要对得上, 留痕最前面那条也要是这次的; 别的键不比
+    stored = store.project_row(client, pid) or {}
+    try:
+        stored_params = delivery.parse_params(stored.get("default_params"))
+        stored_tpl = delivery.template_of({"default_params": stored_params})
+    except delivery.TemplateError:
+        stored_params, stored_tpl = None, None
+    stored_log = (stored_params or {}).get(DELIVERY_TAGS_LOG_KEY)
+    landed = (stored_tpl is not None and _canonical(_dtags_pair(stored_tpl["tags"])) == _canonical(after)
+              and isinstance(stored_log, list) and bool(stored_log) and _canonical(stored_log[0]) == _canonical(entry))
+    if not landed:
+        logger.warning("set_delivery_tags: 项目 %s 写完再读, 和要写的不一样 (user=%s)", pid, str(user_id)[:8])
+        out.pop("kept_locked", None)
+        out.update(after=_dtags_pair(stored_tpl["tags"]) if stored_tpl else None, summary=DTAGS_NOT_STORED,
+                   warning=DTAGS_NOT_STORED)
+        return out
+    logger.info("set_delivery_tags: 项目 %s 的话题设置改了 (user=%s, 改了 %s)", pid, str(user_id)[:8],
+                ",".join(k for k in ("content", "fixed") if before[k] != after[k]))
+    changes = []
+    if before["content"] != after["content"]:
+        changes.append(f"每篇写的话题 {before['content']} 个 → {after['content']} 个")
+    if before["fixed"] != after["fixed"]:
+        changes.append(f"固定话题 {_dtags_shown(before['fixed'])} → {_dtags_shown(after['fixed'])}")
+    summary = DTAGS_SUMMARY.format(name=name, changes="; ".join(changes)) + locked_note
+    conds = new_tpl["tags"]["conditional"]
+    if fixed is not None and conds:                     # 用户要的是「不要这些话题」时, 按条件加的那几个还会出现: 先说一句
+        summary += DTAGS_CONDITIONAL.format(conds="; ".join(
+            "标题或正文提到" + "".join(f"「{w}」" for w in c["when_any"][:5]) + f"时加 #{c['add']}" for c in conds[:5]))
+    out.update(changed=True, summary=summary, delivery_requirements=delivery.requirements(new_tpl),
+               next_step=DTAGS_NEXT_STEP)
+    return out
 
 
 def _cell_lines(text: str) -> list[str]:
@@ -8394,7 +8605,8 @@ def delivery_format(client, project_id: str, *, template=SHOW_ONLY, clear: bool 
     """运维命令 ``cli delivery-format``: 看 / 设 / 清一个项目的交付模板(``default_params.delivery``, 2026-10-20)。
 
     不收 user: 同 backfill, 跑它的人握着 service_role key(docs/deskcore.md §2.2.1)。写手那边没有这个工具 ——
-    版式是项目定的, 不该由写手的模型在对话里改。
+    版式是项目定的, 不该由写手的模型在对话里改; 只有话题那一块的 content / fixed 2026-11-28 起写手能在对话里改
+    (set_delivery_tags), conditional 和锁住的固定话题(tags.locked)仍只在这里设。``--show`` 带最近 5 条写手改话题的留痕。
     写之前先校验(delivery.validate), 存规范形状; 写回时保留 default_params 里别的键(isolation_terms 等), 仍存成
     JSON 字符串(生产库 80 行都是这个形状)。default_params 本身解析不了就拒绝写: 拿 {} 去合并会把别的键一起抹掉。
     ``template`` 不传(SHOW_ONLY)是只看; 传了什么都要过校验, 传 None 也一样(抛 TemplateError, 不写)。
@@ -8420,6 +8632,10 @@ def delivery_format(client, project_id: str, *, template=SHOW_ONLY, clear: bool 
     out["delivery"] = tpl
     if tpl is not None:
         out["preview"] = delivery.preview(tpl)["text"]
+    # 写手在对话里改过话题的话(set_delivery_tags), 负责人看模板时一并看到最近几次是谁、从什么改成了什么
+    log = delivery.parse_params(project.get("default_params")).get(DELIVERY_TAGS_LOG_KEY)
+    if isinstance(log, list) and log:
+        out["delivery_tags_log"] = log[:5]
     return out
 
 

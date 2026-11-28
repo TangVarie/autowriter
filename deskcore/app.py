@@ -204,7 +204,7 @@ def _extract_key(request: Request) -> str | None:
 
 
 # 服务端注入、调用方不许自己传的参数。_caller_name(2026-11-11): 钥匙在 DESKCORE_KEYS 里的备注名, 只给签名里要它的工具
-# (set_comment_mix 留痕用); 它不是身份 —— 归属校验只认 _user_id。
+# (set_comment_mix / set_delivery_tags 留痕用); 它不是身份 —— 归属校验只认 _user_id。
 _INJECTED_PARAMS = ("_user_id", "_caller_name")
 
 
@@ -1278,38 +1278,71 @@ def _register_mcp():
 # 数会变成把一项检查关掉, 而 REST 那条路上同一个请求是 400。到了工具那一层已经分不出「本来就是 null」和「被换成了 null」,
 # 所以在 SDK 之前接住: **只对 tools/call set_comment_mix**, 把请求体里不是有限的数换成它原来的字面(一个字符串),
 # 工具照「要是一个数, 现在是 '1e400'」那一句拒掉, 什么都不写。别的请求一个字节不动。
+# 2026-11-28 加上 set_delivery_tags: 它的 content / fixed 是 null 是「这一样不动」, 一个写坏的 content 变成 null, 同一次给的
+# fixed 照改、个数却悄悄没动, 回 changed=true。所以这两个顶层参数不是有限的数时同样换成字面(SDK 照「不是整数 / 不是列表」
+# 拒掉)。content 写成 true / false 也一样换成字面: SDK 按 int 收参数时会把它悄悄读成 1 / 0 —— 把项目改成每篇 1 个话题、
+# 回 changed=true, REST 那条路上同一个请求是 400。fixed 列表里面的不动: SDK 换成 null 之后「列表里有一项不是字」照样拒,
+# 换成字面反倒成了一个叫 NaN 的话题。
 # 纯 ASGI(理由同 _NormalizeMcpPath): 只把请求体读完再原样放回去, 不碰响应。SDK 自己也是把整个请求体读进内存再解析的,
 # 这里没有多占; 鉴权在更外层, 没过鉴权的请求到不了这里。
 _MIX_TOOL = "set_comment_mix"
+_TAGS_TOOL = "set_delivery_tags"
+_TAGS_SPELLED = ("content", "fixed")                # set_delivery_tags 里要换成字面的顶层参数
+
+
+class _Spelled(str):
+    """请求体里一个不是有限的数, 解成它原来的字面(``json.dumps`` 照字符串写出去)。"""
+
+
+def _unspell(obj):
+    """不该换成字面的那几处(set_delivery_tags 顶层参数以外的)还原成原来的数: ``json.dumps`` 照 NaN / Infinity 写回去。"""
+    if isinstance(obj, _Spelled):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _unspell(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_unspell(v) for v in obj]
+    return obj
 
 
 def _spell_out_non_finite(body: bytes) -> bytes:
-    """``tools/call set_comment_mix`` 的请求体里不是有限的数 → 它原来的字面(字符串); 别的请求体原样(同一个对象)回去。"""
+    """``tools/call set_comment_mix`` 的请求体里不是有限的数 → 它原来的字面(字符串); ``set_delivery_tags`` 只换顶层的
+    content / fixed(content 是 true / false 的也换); 别的请求体原样(同一个对象)回去。"""
     # 先用字节粗筛, 省掉绝大多数请求的一次解析。带反斜杠的不能筛掉(Codex 11-11): 工具名可以写成转义的
     # ("\\u0073et_comment_mix"), 字节里找不到名字, 解出来却是它 —— 所以判断「是不是这个工具」一律看解出来的名字。
-    if _MIX_TOOL.encode() not in body and b"\\" not in body:
+    if _MIX_TOOL.encode() not in body and _TAGS_TOOL.encode() not in body and b"\\" not in body:
         return body
     hits: list[str] = []
 
     def _constant(token: str):                    # NaN / Infinity / -Infinity
         hits.append(token)
-        return token
+        return _Spelled(token)
 
     def _float(token: str):
         value = float(token)
         if value != value or abs(value) == float("inf"):
             hits.append(token)
-            return token
+            return _Spelled(token)
         return value
     try:
         message = json.loads(body, parse_constant=_constant, parse_float=_float)
     except (ValueError, RecursionError):
         return body                               # 不是 JSON: 让 SDK 照它自己的方式拒
     params = message.get("params") if isinstance(message, dict) else None
-    if not hits or not isinstance(params, dict) or message.get("method") != "tools/call" \
-            or params.get("name") != _MIX_TOOL:
+    if not isinstance(params, dict) or message.get("method") != "tools/call":
         return body
-    return json.dumps(message, ensure_ascii=False).encode("utf-8")
+    if params.get("name") == _MIX_TOOL:
+        return json.dumps(message, ensure_ascii=False).encode("utf-8") if hits else body
+    args = params.get("arguments")
+    if params.get("name") != _TAGS_TOOL or not isinstance(args, dict):
+        return body
+    spelled = {k: str(v) if isinstance(v, _Spelled) else json.dumps(v)
+               for k, v in args.items()
+               if k in _TAGS_SPELLED and (isinstance(v, _Spelled) or (k == "content" and isinstance(v, bool)))}
+    if not spelled:
+        return body
+    params["arguments"] = {**args, **spelled}         # 换的是这两个顶层参数; 别处的照原样写回去(见上)
+    return json.dumps(_unspell(message), ensure_ascii=False).encode("utf-8")
 
 
 class _McpFiniteNumbers:

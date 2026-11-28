@@ -879,6 +879,9 @@ def _delivery_format(core, sb, args) -> int:
         return 1
     preview = out.pop("preview", None)
     _print(out)
+    locked = ((out.get("delivery") or {}).get("tags") or {}).get("locked")
+    if locked:
+        print("\n锁定的固定话题(写手在对话里去不掉): " + "、".join("#" + t for t in locked))
     if preview:
         print("\n── 一篇示例稿拼出来是这样 ──\n" + preview)
     return 1 if out.get("error") else 0
@@ -1173,7 +1176,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rescore-days", type=int, default=None,
                    help="配 --rescore-misses: 只补发布时间在近这么多天里的(不给就是全部)")
     # 交付版式(2026-10-20): 模板存在 projects.default_params.delivery, score_drafts 存完档按它拼整批交付稿。
-    # 运维命令, 同 backfill 不要 --user; 写手那边没有对应的工具 —— 版式是项目定的, 不该在对话里被模型改掉。
+    # 运维命令, 同 backfill 不要 --user; 写手那边没有对应的工具 —— 版式是项目定的, 不该在对话里被模型改掉。只有话题那一块的
+    # content / fixed 2026-11-28 起写手能在对话里改(set_delivery_tags, §3.41); tags.locked 锁住的固定话题写手去不掉, 只在这里设。
     # 字段说明见 deskcore/delivery.py 与 docs/deskcore.md §3.9。
     p = sub.add_parser("delivery-format", help="看 / 设 / 清项目的交付版式模板(写之前先校验)")
     p.add_argument("--project", required=True)

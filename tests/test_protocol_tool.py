@@ -60,7 +60,8 @@ def test_empty_protocol_raises_instead_of_returning_success(tmp_path, monkeypatc
 # 协议冻结期间加的工具(协议版本不动, 写手不用重导 skill): 协议里没有它的名字, 落点在别的工具的回包和它自己的说明里。
 # 加进这张表的条件钉在 test_tools_outside_the_protocol_have_a_landing_point 里, 不是「懒得写协议」的口子。
 #   set_comment_mix(2026-11-11): comments_for 的 comment_set 第一句、next_step 和 score_comments 的 set_next_step 都点它的名。
-OUTSIDE_PROTOCOL = {"set_comment_mix"}
+#   set_delivery_tags(2026-11-28): 用户说「以后话题…」时模型先想到的 record_rule, 和列规则台账的 my_rules, 两个说明都点它的名。
+OUTSIDE_PROTOCOL = {"set_comment_mix", "set_delivery_tags"}
 
 
 def test_protocol_mentions_every_tool():
@@ -72,11 +73,13 @@ def test_protocol_mentions_every_tool():
 
 
 def test_tools_outside_the_protocol_have_a_landing_point():
-    """协议里没写的工具, 模型得从别处知道什么时候调: 说明里自己写清「什么时候调 / 什么时候不调」, 而且每次写评论都会
-    拿到的那几句(comments_for 的 comment_set 第一句和 next_step、score_comments 的 set_next_step)里点了它的名。"""
+    """协议里没写的工具, 模型得从别处知道什么时候调: 说明里自己写清「什么时候调 / 什么时候不调」, 而且用到它的那一刻
+    模型看得到的话里点了它的名 —— 改配比: 每次写评论都会拿到的那几句(comments_for 的 comment_set 第一句和 next_step、
+    score_comments 的 set_next_step); 改话题: 用户说「以后…」时协议叫它调的 record_rule, 和列规则的 my_rules。"""
     from deskcore import core
     handed_out = {"set_comment_mix": (core.COMMENT_SET_HEAD, core.COMMENT_SET_NEXT_STEP, core.USER_MIX_NOTE,
-                                      T.comments_for.__doc__, T.score_comments.__doc__)}
+                                      T.comments_for.__doc__, T.score_comments.__doc__),
+                  "set_delivery_tags": (T.record_rule.__doc__, T.my_rules.__doc__)}
     assert set(handed_out) == OUTSIDE_PROTOCOL
     for name, texts in handed_out.items():
         doc = T.TOOLS[name][0].__doc__
