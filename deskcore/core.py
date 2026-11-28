@@ -4125,17 +4125,18 @@ def _mix_chars(v) -> int:
     """一句话短评的字数 → 整数。认整数、整数样子的小数(15.0)、ASCII 数字写的字(「15」); 别的一律是那一句, 不抛别的错。
 
     复审 11-11: ``str.isdigit()`` 对「²」「①」也是真, ``int()`` 却不认; ``int(inf)`` / ``int(nan)`` 直接抛 —— 这几种原来漏成
-    500(模型读到的是「服务坏了, 重试」, 不是哪个数不对)。"""
+    500(模型读到的是「服务坏了, 重试」, 不是哪个数不对)。11-28(set_delivery_tags 复审时发现): 一长串数字也不拿去 int() ——
+    3.11 起超过 4300 位的 int(字符串) 和 repr(整数) 都直接抛 ValueError, 同样漏成 500; 念回去的那个值走 _dtags_repr。"""
     lo, hi = _SHORT_CHARS_RANGE
     shown = v
     if isinstance(v, str):
         t = v.strip()
-        if t.isascii() and t.isdigit():
+        if t.isascii() and t.isdigit() and len(t) <= 6:
             v = int(t)
     elif isinstance(v, float) and v == v and abs(v) != float("inf") and v == int(v):   # 先挡 nan / inf, 再 int()
         v = int(v)
     if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
-        raise CommentMixError(f"{_MIX_NAMES['short_chars']}(short_chars)要是 {lo}~{hi} 的整数, 现在是 {shown!r:.40}。")
+        raise CommentMixError(f"{_MIX_NAMES['short_chars']}(short_chars)要是 {lo}~{hi} 的整数, 现在是 {_dtags_repr(shown, 40)}。")
     return v
 
 

@@ -2717,7 +2717,7 @@ batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和�
 
 **为什么。** 11-27 Hatherine痘痘贴的写手在对话里停了旧的话题规则（`set_rule_state`），又记了一条新的（`record_rule`）：「标签前 4 个跟正文、后 5 个跟痘痘，不要那 5 个固定的品牌标签」。可交付稿的话题行是交付模板拼的（§3.9），模板照旧是 `{content: 4, fixed: [OliveYoung必买, 韩国痘痘贴, 韩女同款, hatherine痘痘贴, hatherine], conditional: [提到 Olive Young / OliveYoung / OY 时加 OliveYoung]}`，每篇照样拼那 5 个；规则库和模板互不相通，10-20 起模板又只有负责人能改（`delivery-format`），模型只能叫写手「找负责人」。owner 11-28 定的：**模板还是一个项目一份**，话题那一块写手在对话里自己改，和 `set_comment_mix` 改配比（§3.23 (I)）一个做法；客户点名必带的固定话题，负责人可以锁住，写手去不掉。
 
-同一天 owner 批准先把 Hatherine痘痘贴 的模板手改成 `{content: 9, fixed: [], conditional: []}`：直接在库里用一条带保护条件的 `UPDATE` 改，只动了 `delivery.tags`，`default_params` 别的键和 `delivery` 别的键没碰。条件话题也一起清掉是负责人的决定——工具改不了 `conditional`。
+同一天 owner 批准先把 Hatherine痘痘贴 的模板手改成 `{content: 9, fixed: [], conditional: []}`：直接在库里用一条 `UPDATE` 改：只有 `delivery.tags` 还是原来那一份时才改（不是就一行不动），只换 `delivery.tags`，`default_params` 仍存成 JSON 字符串；改完核过 `delivery` 别的键和 `isolation_terms` 一字没变，库里那一份用 `delivery.template_of` 重新解析过、拼出来的话题行就是写手给的 9 个。条件话题也一起清掉是负责人的决定——工具改不了 `conditional`。
 
 **不动协议**（`00ff79b30fcc`，写手不用重导 skill）：用法全在工具自己的说明里，落点是 `record_rule` 和 `my_rules` 的说明（各加了一句：有交付模板的项目，话题个数和固定话题是模板管的，记成规则不生效，用户明说以后要换就调 `set_delivery_tags`；话题该写什么照样记成规则）。用户说「以后…」时协议叫模型调的是 `record_rule`，所以那一句放在它的说明里、紧跟在配比那条「例外」后面。`tests/test_protocol_tool.py` 的 `OUTSIDE_PROTOCOL` 加上了它。
 
@@ -2745,6 +2745,8 @@ batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和�
 **之前交付的批次。** batch 里记的只有每篇的话题 / 评论 / 方向（`DELIVERY_PARTS_KEY`，§3.9 改稿重存那段），没记当时的话题设置。所以改完之后，之前交付过的那几批打开页面（`view_page_data`）、以后改其中某篇重存时拼的整批（`_whole_batch_delivery`），都按**现在的**模板拼：没改的那几篇用的是当时写的那几个话题，固定话题换成新的。拿 11-28 那个项目说，改之前交付的一篇是「4 个写手的 + 5 个品牌话题」，现在页面上是那 4 个写手的、没有品牌话题，既不是当时交给用户的那一行，也不够新设置要的 9 个，而且不报（没改的几篇的 problems 本来就不报）。负责人用 `delivery-format` 改模板时一直是这样，只是现在写手自己就能触发。这次只照实说（`next_step`、说明里各一句：用户要之前的样子，用当时交给他的那一份）；真要修是在 batch 里连当时的话题设置一起记下、拼旧批次时用它，没做。
 
 **回滚。** 没配锁的模板存下来不带 `locked`（`delivery-format --set` 存的是 `validate` 的规范形状，`set_delivery_tags` 只换 `content` / `fixed`、原来没有的不添），11-28 之前那一版照常读；配了锁的项目回滚之前要先用 `delivery-format --set` 把锁拿掉，不然那一版把整个模板当坏的（不拼交付稿、简报不带要求）。
+
+**顺手修的。** `set_comment_mix` 的 `short_chars` 给一长串数字（几千位的字或整数）时，`int()` / `repr()` 在 3.11 起直接抛 `ValueError`，漏成 500；现在同 `_dtags_content` 一样不拿去 `int()`、念回去的值走 `_dtags_repr`，回「哪个数不对」那一句（`tests/test_set_comment_mix.py`）。
 
 **没做的。** 不加迁移；`conditional`、`locked`、版式别的部分照旧只有 `delivery-format`；不替负责人修坏了的模板（配比那边库里坏了的数这里能改，话题这边模板坏了一律找负责人，§3.9 的「模板坏了只记日志、这次不拼」不变）；`open_project` 简报和 `delivery.requirements()["task"]` 的话一个字没改。
 
