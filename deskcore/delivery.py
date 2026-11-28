@@ -5,7 +5,8 @@
 老的独立写作台是在代码里拼的(exporter.py / app.py 的复制块), 从没出过这个问题。所以版式回到代码:
 
   · 模板存在 ``projects.default_params`` 的 ``delivery`` 键里(生产库这一列存的是 JSON **字符串**, 也认 dict),
-    运维用 ``python -m deskcore.cli delivery-format`` 设, 写之前先过 ``validate``;
+    运维用 ``python -m deskcore.cli delivery-format`` 设, 写之前先过 ``validate``; 2026-11-28 起话题那一块的
+    content / fixed 写手也能在对话里改(core.set_delivery_tags), ``tags.locked`` 里的固定话题写手去不掉;
   · ``score_drafts`` 存完档, 用存进去的那几篇按模板拼整批, 写手把 ``delivery.text`` 原样交给用户。
 
 纯函数, 不连库不联网(同 isolation.py)。问题(problems)只报代码能确定判出来的: 话题不够、评论条数不对、评论没提到
@@ -34,7 +35,7 @@ _NAME_MAX = 20
 
 _TOP_KEYS = ("layout", "columns", "markers", "tags", "comments")
 _COLUMN_KEYS = ("name", "field")
-_TAG_KEYS = ("content", "fixed", "conditional")
+_TAG_KEYS = ("content", "fixed", "conditional", "locked")
 _COND_KEYS = ("when_any", "add")
 _COMMENT_KEYS = ("min", "max", "label_reader", "label_author", "must_mention_any")
 
@@ -101,11 +102,25 @@ def norm_tag(tag) -> str:
     return t.strip("#").strip()
 
 
+def tag_key(tag) -> str:
+    """比两个话题是不是同一个: 本体, 不分大小写(同 _dedupe, 交付稿的话题行就是这么去重的)。"""
+    return norm_tag(tag).casefold()
+
+
+def clean_tag(tag) -> str | None:
+    """一个话题 → 模板里存的那个样子(本体, 不带 #); 不是一个话题(不是字符串、空的、中间有空格 / # / 方括号)回 None。
+    模板的固定话题、条件话题和写手的 set_delivery_tags(2026-11-28)都按这一处认, 写手改进去的不会事后过不了模板的校验。"""
+    if not isinstance(tag, str):
+        return None
+    t = norm_tag(tag)
+    return t if t and not re.search(r"[\s#\[\]]", t) else None
+
+
 def _template_tag(tag, where: str) -> str:
     if not isinstance(tag, str):
         raise TemplateError(f"{where} 应该是字符串")
-    t = norm_tag(tag)
-    if not t or re.search(r"[\s#\[\]]", t):
+    t = clean_tag(tag)
+    if t is None:
         raise TemplateError(f"{where}「{tag}」不是一个话题: 不能为空, 中间不能有空格或 #")
     return t
 
@@ -164,6 +179,19 @@ def validate(raw) -> dict:
         _unknown(c, _COND_KEYS, where)
         conditional.append({"when_any": _str_list(c.get("when_any"), f"{where}.when_any", allow_empty=False),
                             "add": _template_tag(c.get("add"), f"{where}.add")})
+    # locked(2026-11-28): 固定话题里写手在对话里去不掉的那几个(客户点名必带的), 只有负责人用 delivery-format 设。
+    # 拼交付稿时不看它(它们本来就在 fixed 里), 只给 set_delivery_tags 用; 没配是 [], 有没有它拼出来的字一样。
+    # 写法要和 fixed 里的一字不差(本体比, 不只是不分大小写一样): 锁住的话题拼出来是什么样, 只看 fixed 这一处。
+    # 规范形状里**只在有锁时带这个键**(读它用 tags.get("locked", [])): delivery-format 存的就是这个形状, 上一版的校验
+    # 不认 locked, 没配锁的模板也带一个 "locked": [] 的话, 一回滚它们就全成了坏模板(不拼交付稿、简报不带要求)。
+    locked_raw = tags.get("locked", [])
+    if not isinstance(locked_raw, list):
+        raise TemplateError("delivery.tags.locked 应该是列表")
+    locked = _dedupe([_template_tag(t, "delivery.tags.locked 里的") for t in locked_raw])
+    for t in locked:
+        if t not in fixed:
+            raise TemplateError(f"delivery.tags.locked 里的「{t}」不在 delivery.tags.fixed 里: 锁住的是固定话题里写手去不掉的"
+                                "那几个, 先把它(同样的写法)放进 fixed")
 
     comments = raw.get("comments")
     if comments is not None:
@@ -221,9 +249,10 @@ def validate(raw) -> dict:
             raise TemplateError("配了 delivery.comments, 但表格里没有 field=comments 的列: 评论会被要求和检查, "
                                 "却拼不进交付稿。加一列 comments, 或者删掉 delivery.comments")
 
-    return {"layout": layout, "columns": columns, "markers": markers,
-            "tags": {"content": content, "fixed": fixed, "conditional": conditional},
-            "comments": comments}
+    out_tags = {"content": content, "fixed": fixed, "conditional": conditional}
+    if locked:
+        out_tags["locked"] = locked
+    return {"layout": layout, "columns": columns, "markers": markers, "tags": out_tags, "comments": comments}
 
 
 def wants_tags(template: dict) -> bool:

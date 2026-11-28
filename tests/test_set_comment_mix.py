@@ -156,6 +156,16 @@ def test_a_very_long_bad_value_is_not_echoed_back_whole():
         assert len(str(exc.value)) < 120
 
 
+@pytest.mark.parametrize("huge", ["9" * 5000, 10 ** 5000], ids=["digit-string", "huge-int"])
+def test_a_number_with_thousands_of_digits_gets_the_sentence_not_a_500(huge):
+    """11-28: 3.11 起超过 4300 位的 int(字符串) 和 repr(整数) 都抛 ValueError —— 原来漏成 500, 不是「哪个数不对」那一句。"""
+    c = _client()
+    with pytest.raises(core.CommentMixError) as exc:
+        _set(c, {"short_chars": huge})
+    assert str(exc.value).startswith("一句话短评的字数(short_chars)要是 6~40 的整数, 现在是 ") and len(str(exc.value)) < 120
+    assert _writes(c) == []
+
+
 def test_brand_max_plus_neutral_min_cannot_exceed_the_whole_set():
     c = _client()
     with pytest.raises(core.CommentMixError) as exc:
