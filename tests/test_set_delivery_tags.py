@@ -7,8 +7,9 @@
   2. 入参: 至少给一个; content 是 0~10 的整数(bool、带小数的、不是纯数字的字都拒); fixed 是列表, 每一个照模板的认法规整、
      不分大小写去重留第一个, 空的 / 中间有空格或 # 的拒, 最多 10 个, 新加的一个最多 20 字; 拒了什么都不写;
   3. 归属闸; 没有交付模板、模板或设置读不了 → 那一句, 不写;
-  4. 负责人锁住的固定话题(``delivery.tags.locked``, delivery.validate 新认的键): 写手的 fixed 里没写也留着、按锁的顺序接在
-     后面、回包 kept_locked 列出来、summary 说清; 锁的校验(得在 fixed 里, 写法一样); 没配锁时拼出来的字一个不变;
+  4. 负责人锁住的固定话题(``delivery.tags.locked``, delivery.validate 新认的键): 写手的 fixed 里没写也留着、按它们现在在
+     fixed 里的先后接在后面、回包 kept_locked 列出来、summary 说清; 锁的校验(得在 fixed 里, 写法一样); 没配锁时拼出来的字
+     一个不变, 规范形状里也没有这个键(上一版的校验不认它); 最多 10 个只数写手自己的;
   5. 和现在一样(规整之后比) → 不写、不留痕; 写的时候 default_params 别的键、delivery 别的键原样、顺序不变, 仍是 JSON 字符串;
   6. 留痕 ``delivery_tags_log``: 顶层、新的在前、最多 20 条、{at, by, before, after}; 写完再读核对, 没落库照实说;
   7. 和 set_comment_mix 同一把锁(两个都整列写 default_params): 交替着改, 两边的改动和留痕都在;
@@ -157,7 +158,7 @@ def test_the_1128_hand_edit_is_what_the_tool_would_have_written():
     assert _tags(c) == {"content": 9, "fixed": [], "conditional": BEFORE_1127["tags"]["conditional"]}
     hand = dict(_tags(c), conditional=[])
     assert delivery.validate({"layout": "blocks", "tags": hand})["tags"] == {
-        "content": 9, "fixed": [], "conditional": [], "locked": []}
+        "content": 9, "fixed": [], "conditional": []}
 
 
 def test_the_project_brief_after_the_change_asks_for_the_new_numbers():
@@ -165,6 +166,26 @@ def test_the_project_brief_after_the_change_asks_for_the_new_numbers():
     _set(c, content=7)
     brief_part = delivery.requirements(delivery.template_of(_row(c)))
     assert brief_part["tags"] == 7 and "tags 给 7 个话题" in brief_part["task"]
+
+
+def test_next_step_does_not_claim_earlier_batches_stay_as_delivered():
+    """之前交付过的那几批没记当时的话题设置: 页面和改其中某篇重存时拼的整批都按现在的模板拼, 没改的那几篇用当时写的话题
+    (既不是当时交付的那一行, 也不够新的个数)。next_step 不能只说「已经交付的不用重存」, 得说清这一点、和要原来那份去哪拿。"""
+    out = _set(_client(BEFORE_1127), content=9, fixed=[])
+    step = out["next_step"]
+    assert step == core.DTAGS_NEXT_STEP
+    for must in ("已经交付的不用重存", "之前交付过的那几批, 打开页面或者以后改其中某篇重存时, 也按新的话题设置拼",
+                 "没改的那几篇只有当时写的话题", "用户要之前的样子, 用当时交给他的那一份"):
+        assert must in step, must
+    # 说的是真的: 改之前交付的一篇(4 个写手的 + 5 个固定), 现在按新模板拼出来只剩那 4 个
+    old_tpl = delivery.validate(BEFORE_1127)
+    c = _client(BEFORE_1127)
+    _set(c, content=9, fixed=[])
+    new_tpl = delivery.template_of(_row(c))
+    then = delivery.assemble(old_tpl, [_draft(4)])["text"].splitlines()[2]
+    now = delivery.assemble(new_tpl, [_draft(4)], indices=[None])
+    assert then == " ".join(f"#写手话题{i}" for i in range(1, 5)) + " " + " ".join("#" + t for t in FIVE)
+    assert now["text"].splitlines()[2] == " ".join(f"#写手话题{i}" for i in range(1, 5))
 
 
 # ── 2. 入参 ──────────────────────────────────────────────────────────────────────────────────
@@ -258,7 +279,7 @@ def test_at_most_ten_after_removing_duplicates():
     assert _set(c, fixed=ten + ["#话题0"])["after"]["fixed"] == ten, "重复的不算"
     with pytest.raises(core.DeliveryTagsError) as exc:
         _set(c, fixed=ten + ["话题10"])
-    assert str(exc.value) == "固定话题最多 10 个, 这次去掉重复的还有 11 个。什么都没改。"
+    assert str(exc.value) == "固定话题最多 10 个(负责人锁定的另算), 这次去掉重复的还有 11 个。什么都没改。"
     assert _tags(c)["fixed"] == ten
 
 
@@ -364,7 +385,7 @@ LOCKED_TPL = dict(TPL, tags=dict(TPL["tags"], locked=["示例品牌", "#示例�
 
 
 def test_validate_reads_locked_and_defaults_to_empty():
-    assert delivery.validate(TPL)["tags"]["locked"] == []
+    assert delivery.validate(TPL)["tags"].get("locked", []) == []
     assert delivery.validate(LOCKED_TPL)["tags"]["locked"] == ["示例品牌", "示例必买"], "和 fixed 一样规整, 顺序照写的"
     assert delivery.validate(dict(TPL, tags=dict(TPL["tags"], locked=["示例品牌", "示例品牌"])))["tags"]["locked"] == ["示例品牌"]
     norm = delivery.validate(LOCKED_TPL)
@@ -414,12 +435,12 @@ def test_an_existing_template_delivers_exactly_the_same_text_as_before():
 def test_a_writer_cannot_remove_a_locked_tag_it_is_kept_and_reported():
     c = _client(LOCKED_TPL)
     out = _set(c, fixed=["新话题"])
-    assert out["after"]["fixed"] == ["新话题", "示例品牌", "示例必买"], "没写的锁住的按锁的顺序接在后面"
-    assert out["kept_locked"] == ["示例品牌", "示例必买"]
-    assert out["summary"] == ("「示例项目」交付稿的话题改了: 固定话题 #示例必买、#示例同款、#示例品牌 → #新话题、#示例品牌、#示例必买。"
-                              "#示例品牌、#示例必买 是负责人锁定的固定话题, 留着了(这里去不掉, 要去掉请找负责人)。"
+    assert out["after"]["fixed"] == ["新话题", "示例必买", "示例品牌"], "没写的锁住的按它们现在在 fixed 里的先后接在后面"
+    assert out["kept_locked"] == ["示例必买", "示例品牌"]
+    assert out["summary"] == ("「示例项目」交付稿的话题改了: 固定话题 #示例必买、#示例同款、#示例品牌 → #新话题、#示例必买、#示例品牌。"
+                              "#示例必买、#示例品牌 是负责人锁定的固定话题, 留着了(这里去不掉, 要去掉请找负责人)。"
                               "按条件加的话题照旧(负责人定的, 这里改不了): 标题或正文提到「Alpha」「阿尔法」时加 #Alpha好物。")
-    assert _tags(c)["fixed"] == ["新话题", "示例品牌", "示例必买"]
+    assert _tags(c)["fixed"] == ["新话题", "示例必买", "示例品牌"]
     assert _tags(c)["locked"] == ["示例品牌", "#示例必买"], "锁本身一个字不动"
     assert delivery.template_of(_row(c)) is not None
 
@@ -447,6 +468,65 @@ def test_reordering_locked_tags_is_a_change():
     c = _client(dict(TPL, tags={"content": 4, "fixed": ["示例品牌", "示例必买"], "locked": ["示例品牌", "示例必买"]}))
     out = _set(c, fixed=["示例必买", "示例品牌"])
     assert out["changed"] is True and out["after"]["fixed"] == ["示例必买", "示例品牌"] and "kept_locked" not in out
+
+
+def test_kept_locked_tags_keep_their_order_in_fixed_not_the_order_the_lock_was_written_in():
+    """负责人写锁的先后和 fixed 的先后不一样时: 写手只是去掉别的话题, 客户点名的那几个在交付稿里的先后不能跟着变;
+    全是锁住的、写手要全去掉的, 就是现在那一份 —— 不写、不留痕(原来按锁的先后接, 会把它们调个个儿写进去)。"""
+    tags = {"content": 4, "fixed": ["示例必买", "示例品牌"], "locked": ["示例品牌", "示例必买"]}
+    c = _client(dict(TPL, tags=tags))
+    before = _row(c)["default_params"]
+    out = _set(c, fixed=[])
+    assert out["changed"] is False and out["after"]["fixed"] == ["示例必买", "示例品牌"]
+    assert out["kept_locked"] == ["示例必买", "示例品牌"]
+    assert out["summary"] == ("「示例项目」交付稿的话题和现在的一样, 没有改。"
+                              "#示例必买、#示例品牌 是负责人锁定的固定话题, 留着了(这里去不掉, 要去掉请找负责人)。")
+    assert _writes(c) == [] and _row(c)["default_params"] == before
+
+    c = _client(dict(TPL, tags={"content": 4, "fixed": ["锁甲", "别的", "锁乙", "锁丙"], "locked": ["锁丙", "锁甲", "锁乙"]}))
+    out = _set(c, fixed=["新的", "锁乙"])
+    assert out["after"]["fixed"] == ["新的", "锁乙", "锁甲", "锁丙"], "写了的在写的位置, 没写的按 fixed 里的先后"
+    assert out["kept_locked"] == ["锁甲", "锁丙"]
+    line = delivery.assemble(delivery.template_of(_row(c)), [_draft(4)])["text"].splitlines()[2]
+    assert line.endswith("#新的 #锁乙 #锁甲 #锁丙")
+
+
+def test_the_ten_tag_cap_counts_only_the_writers_own_tags_whether_or_not_the_locked_ones_are_listed():
+    """说明叫模型传完整列表(锁住的写不写都行)。锁住的 5 个 + 新的 6 个: 写进列表和没写, 要的是同一个结果, 不能一个收
+    一个拒; 上限数的是写手自己的那几个。"""
+    five = [f"品牌{i}" for i in "一二三四五"]
+    tpl = dict(TPL, tags={"content": 4, "fixed": list(five), "locked": list(five)})
+    own6 = [f"新话题{i}" for i in range(6)]
+    listed, omitted = _set(_client(tpl), fixed=five + own6), _set(_client(tpl), fixed=own6)
+    assert listed["changed"] is omitted["changed"] is True
+    assert sorted(listed["after"]["fixed"]) == sorted(omitted["after"]["fixed"]) == sorted(five + own6)
+    assert len(omitted["after"]["fixed"]) == 11, "锁住的照留, 不算进那 10 个"
+    own11 = [f"新话题{i}" for i in range(11)]
+    for fixed in (five + own11, own11, ["#" + t.upper() for t in five] + own11):
+        c = _client(tpl)
+        with pytest.raises(core.DeliveryTagsError) as exc:
+            _set(c, fixed=fixed)
+        assert str(exc.value) == "固定话题最多 10 个(负责人锁定的另算), 这次去掉重复的还有 11 个。什么都没改。"
+        assert _writes(c) == []
+    own10 = [f"新话题{i}" for i in range(10)]
+    assert _set(_client(tpl), fixed=five + own10)["after"]["fixed"] == five + own10
+
+
+def test_a_template_without_locks_is_stored_without_a_locked_key_so_the_previous_release_still_reads_it():
+    """上一版(11-28 之前)的校验只认 tags 里的 content / fixed / conditional, 多一个键整个模板就是坏的(不拼交付稿、简报不带
+    要求)。没配锁的模板, 不管是负责人 delivery-format --set 的还是写手改过话题的, 存下来都不带 locked: 回滚时它们照常能用。"""
+    previous_tag_keys = {"content", "fixed", "conditional"}
+    assert "locked" not in delivery.validate(TPL)["tags"]
+    assert delivery.validate(dict(TPL, tags=dict(TPL["tags"], locked=[])))["tags"].keys() <= previous_tag_keys
+    c = _client(params=json.dumps({"isolation_terms": ["示例词"]}, ensure_ascii=False))
+    core.delivery_format(c, PROJ, template=TPL)
+    assert set(_params(c)["delivery"]["tags"]) <= previous_tag_keys
+    _set(c, content=9, fixed=["新话题"])
+    assert set(_params(c)["delivery"]["tags"]) <= previous_tag_keys
+    assert "locked" not in core.delivery_format(c, PROJ)["delivery"]["tags"], "--show 看到的也和 11-28 之前一样"
+    # 配了锁的照存(只有用锁的项目回滚时要先把锁拿掉, §3.41)
+    core.delivery_format(c, PROJ, template=LOCKED_TPL)
+    assert _params(c)["delivery"]["tags"]["locked"] == ["示例品牌", "示例必买"]
 
 
 # ── 5. 一样就不写; 别的键原样 ────────────────────────────────────────────────────────────────────
@@ -730,13 +810,42 @@ def test_the_docstring_says_only_when_the_user_asks_and_never_to_pass_a_check():
     assert doc.startswith("改这个项目交付稿的话题: 每篇写几个话题、固定加哪几个话题")
     assert "**只在用户明说这个项目以后都这样时调。**" in doc
     for must in ("什么时候调:", "什么时候不调:", "「以后标签前4个跟正文、后5个跟痘痘, 不要那5个品牌标签」",
-                 "content=9, fixed=[]", "用户只是这一批想要别的话题", "交付时一句话说明", "项目的设置不动",
+                 "content=9, fixed=[]", "用户只是这一批想要别的话题",
                  "**不为了让检查通过去改话题个数或固定话题**", "也不替用户决定", "先问一句", "不用找负责人",
                  "照旧用 record_rule 记成规则", "记成规则不生效", "0~10 的整数", "不要固定话题写 []", "整个换掉现在的",
                  "负责人锁定的", "kept_locked", "这里去不掉", "**原样告诉用户**", "delivery_requirements",
                  "和 open_project 回的同一个样子", "20 次的记录", "已经交付的不用重存", "照着改参数再调", "不重试"):
         assert must in doc, must
     assert doc.index("什么时候调:") < doc.index("什么时候不调:") < doc.index("返回:")
+
+
+def test_the_docstring_does_not_promise_a_one_batch_tag_line_the_template_cannot_deliver():
+    """交付稿的话题行永远按项目的设置拼(写手的截到 content 个, 固定话题一定接上), 协议又不许模型改 delivery.text: 「这批
+    先不带品牌话题」只这一批的, 交付稿里照样有品牌话题。说明里不能叫模型「照现在的写、再说明这批哪里不一样」——
+    照现在的写就没有不一样; 得照实告诉用户这批还是照项目的设置拼的, 要的话他交付后自己改。"""
+    flat = re.sub(r"\n\s*", "", tools.set_delivery_tags.__doc__)
+    bullet = flat[flat.index("用户只是这一批想要别的话题"):flat.index("用户没说要改")]
+    for must in ("不调。", "交付稿的话题行是按项目的设置拼的, 一批单独改不了", "这一批照 delivery_requirements 写",
+                 "交付时一句话告诉用户这批的话题还是照项目的设置、和他这次要的哪里不一样", "要的话交付后他自己在稿子里改",
+                 "用户说以后都这样, 再调这个工具"):
+        assert must in bullet, must
+    assert "说明这批和项目定的话题哪里不一样" not in flat
+    # 那一句说的是真的: 只这一批不要品牌话题, 照 delivery_requirements 写出来的交付稿里品牌话题照样在
+    line = delivery.assemble(delivery.validate(TPL), [_draft(4)])["text"].splitlines()[2]
+    assert all(f"#{t.lstrip('#')}" in line for t in FIXED)
+    assert len(delivery.assemble(delivery.validate(TPL), [_draft(6)])["text"].splitlines()[2].split()) == 4 + len(FIXED)
+
+
+def test_the_docstring_says_limits_the_user_asked_past_go_back_to_the_user():
+    """用户要的个数或话题超出上限(content 12、11 个固定话题、一个太长的): 报错只说上限。只有「照着改参数再调」的话, 模型会
+    自己改成 10、删掉两个、截短一个, 整个项目以后都按它替用户定的那一样拼。"""
+    flat = re.sub(r"\n\s*", "", tools.set_delivery_tags.__doc__)
+    assert ("超出上限的(个数 0~10、固定话题最多 10 个、新加的一个最多 20 个字)是用户要的, 不自己改小、删掉几个或改短了再调: "
+            "告诉用户上限, 问他要哪样。") in flat
+    assert flat.index("照着改参数再调") < flat.index("告诉用户上限") < flat.index("不重试")
+    assert "最多 10 个(负责人锁定的另算)" in flat
+    assert f"0~{delivery.MAX_CONTENT_TAGS}" in flat and f"最多 {core.DTAGS_FIXED_MAX} 个" in flat
+    assert f"最多 {core.DTAGS_TAG_CHARS} 个字" in flat
 
 
 def test_record_rule_and_my_rules_send_tag_counts_to_set_delivery_tags():
@@ -800,7 +909,7 @@ def test_delivery_format_sets_locked_tags_shows_them_and_the_last_writer_changes
     _set(c, fixed=["新话题"])
     assert cli.main(["delivery-format", "--project", PROJ, "--show"]) == 0
     shown = capsys.readouterr().out
-    assert "\"delivery_tags_log\"" in shown and "示例写手" in shown and "#新话题 #示例品牌 #示例必买" in shown
+    assert "\"delivery_tags_log\"" in shown and "示例写手" in shown and "#新话题 #示例必买 #示例品牌" in shown
     f.write_text(json.dumps(TPL, ensure_ascii=False), encoding="utf-8")
     assert cli.main(["delivery-format", "--project", PROJ, "--set", str(f)]) == 0
     assert "锁定的固定话题" not in capsys.readouterr().out, "没有锁就不多这一行"

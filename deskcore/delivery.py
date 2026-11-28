@@ -182,6 +182,8 @@ def validate(raw) -> dict:
     # locked(2026-11-28): 固定话题里写手在对话里去不掉的那几个(客户点名必带的), 只有负责人用 delivery-format 设。
     # 拼交付稿时不看它(它们本来就在 fixed 里), 只给 set_delivery_tags 用; 没配是 [], 有没有它拼出来的字一样。
     # 写法要和 fixed 里的一字不差(本体比, 不只是不分大小写一样): 锁住的话题拼出来是什么样, 只看 fixed 这一处。
+    # 规范形状里**只在有锁时带这个键**(读它用 tags.get("locked", [])): delivery-format 存的就是这个形状, 上一版的校验
+    # 不认 locked, 没配锁的模板也带一个 "locked": [] 的话, 一回滚它们就全成了坏模板(不拼交付稿、简报不带要求)。
     locked_raw = tags.get("locked", [])
     if not isinstance(locked_raw, list):
         raise TemplateError("delivery.tags.locked 应该是列表")
@@ -247,9 +249,10 @@ def validate(raw) -> dict:
             raise TemplateError("配了 delivery.comments, 但表格里没有 field=comments 的列: 评论会被要求和检查, "
                                 "却拼不进交付稿。加一列 comments, 或者删掉 delivery.comments")
 
-    return {"layout": layout, "columns": columns, "markers": markers,
-            "tags": {"content": content, "fixed": fixed, "conditional": conditional, "locked": locked},
-            "comments": comments}
+    out_tags = {"content": content, "fixed": fixed, "conditional": conditional}
+    if locked:
+        out_tags["locked"] = locked
+    return {"layout": layout, "columns": columns, "markers": markers, "tags": out_tags, "comments": comments}
 
 
 def wants_tags(template: dict) -> bool:

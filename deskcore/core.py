@@ -4313,8 +4313,9 @@ def _canonical(obj) -> str:
 # 模板还是一个项目一份, 话题那一块(每篇写几个 content、固定加哪几个 fixed)写手在对话里改, 同 set_comment_mix 改配比。
 #   · 只换 delivery.tags 的 content / fixed; conditional(按条件加的)和 locked(负责人锁住的固定话题)只有负责人用
 #     delivery-format 改, 工具没有这两样的参数。default_params 别的键、delivery 别的键原样, 顺序不变。
-#   · 锁住的写手去不掉: 新的 fixed 里没写的, 按 locked 的顺序接在后面留着(kept_locked), summary 说清是负责人锁的; 写了的
-#     (不分大小写)用模板里那个写法 —— 客户点名的话题怎么写不由这里改。
+#   · 锁住的写手去不掉: 新的 fixed 里没写的, 按它们现在在 fixed 里的先后接在后面留着(kept_locked), summary 说清是负责人锁的;
+#     写了的(不分大小写)用模板里那个写法 —— 客户点名的话题怎么写不由这里改。最多 10 个只数写手自己的, 锁住的另算: 模型照说明
+#     把锁住的也写进完整列表、和没写它们, 要的是同一个结果, 不能一个收一个拒。
 #   · 合并完拿整份过 delivery.template_of(读的时候同一道闸), 不过就不写: 收下的设置不会事后被当成「模板坏了」。
 #   · 和 set_comment_mix 同一把锁(_mix_lock): 两个都是读、改、写整列 default_params, 各用各的锁的话, 进程里一个照样会拿
 #     旧的一份把另一个盖掉。锁里再读一次项目行、写完再读一次核对; 读、改、写不是一个库事务, 跨进程的那个口子同 set_comment_mix。
@@ -4322,7 +4323,7 @@ def _canonical(obj) -> str:
 #     最多 20 条, 每条 {at, by, before: {content, fixed}, after: {content, fixed}}; at / by 由工具那一层传进来。
 DELIVERY_TAGS_LOG_KEY = "delivery_tags_log"
 DELIVERY_TAGS_LOG_MAX = 20
-DTAGS_FIXED_MAX = 10                                # 写手这里给的固定话题最多几个(锁住的另算, 照留)
+DTAGS_FIXED_MAX = 10                                # 写手这里给的固定话题最多几个(锁住的另算, 照留; 写没写进列表都不数)
 DTAGS_TAG_CHARS = 20                                # 写手新加的一个话题最多几个字; 模板里已经有的(负责人收下过的)照收
 DTAGS_EMPTY = ("content 和 fixed 至少给一个, 什么都没改: content 是每篇写几个话题(0~{hi} 的整数), fixed 是固定话题的完整列表"
                "(不要固定话题写 [])。")
@@ -4330,7 +4331,7 @@ DTAGS_CONTENT_BAD = "每篇写的话题个数(content)要是 0~{hi} 的整数, �
 DTAGS_FIXED_NOT_LIST = "固定话题(fixed)要是一组话题, 比如 [\"示例话题\"], 不要固定话题写 []; 现在是 {shown}。什么都没改。"
 DTAGS_FIXED_BAD = "固定话题第 {k} 个({shown})不是一个话题: 要是一个词, 不能是空的, 中间不能有空格或 #。什么都没改。"
 DTAGS_FIXED_LONG = "固定话题第 {k} 个「{shown}」太长了: 一个话题最多 {n} 个字。什么都没改。"
-DTAGS_FIXED_MANY = "固定话题最多 {n} 个, 这次去掉重复的还有 {got} 个。什么都没改。"
+DTAGS_FIXED_MANY = "固定话题最多 {n} 个(负责人锁定的另算), 这次去掉重复的还有 {got} 个。什么都没改。"
 DTAGS_NO_TEMPLATE = "这个项目没有交付模板, 话题照项目规则写(记规则用 record_rule); 要模板找负责人。"
 DTAGS_BROKEN = "这个项目的交付设置现在改不了, 请用户找负责人看一下, 不用重试。"
 DTAGS_UNCHANGED = "「{name}」交付稿的话题和现在的一样, 没有改。"
@@ -4338,9 +4339,12 @@ DTAGS_SUMMARY = "「{name}」交付稿的话题改了: {changes}。"
 DTAGS_LOCKED_KEPT = "{tags} 是负责人锁定的固定话题, 留着了(这里去不掉, 要去掉请找负责人)。"
 DTAGS_CONDITIONAL = "按条件加的话题照旧(负责人定的, 这里改不了): {conds}。"
 DTAGS_NOT_STORED = "这次没有改成: 存进去的和要改的不一样(可能刚好有人也在改这个项目的设置)。请再调一次。"
+# 之前交付过的那几批没有记当时的话题设置: 页面(view_page_data)和改其中某篇重存时拼的整批(_whole_batch_delivery)都按现在的
+# 模板拼, 没改的几篇用的是当时写的话题 —— 既不是当时交付的那一行, 也不是新设置要的个数(也不报)。先照实说, 见 §3.41。
 DTAGS_NEXT_STEP = ("把 summary 原样告诉用户。这个项目以后的交付稿都按新的话题设置拼; 这一批还没存档的稿子照新的话题个数写"
-                   "(delivery_requirements 是改完之后的要求, 和 open_project 回的同一个样子); 已经交付的不用重存, 用户要的话再改。"
-                   "以后也只在用户明说要改这个项目的话题个数或固定话题时调这个工具。")
+                   "(delivery_requirements 是改完之后的要求, 和 open_project 回的同一个样子)。已经交付的不用重存; 不过之前交付过的"
+                   "那几批, 打开页面或者以后改其中某篇重存时, 也按新的话题设置拼(没改的那几篇只有当时写的话题), 用户要之前的样子, "
+                   "用当时交给他的那一份。以后也只在用户明说要改这个项目的话题个数或固定话题时调这个工具。")
 DTAGS_UNCHANGED_NEXT_STEP = "把 summary 原样告诉用户; 这一批照 delivery_requirements 写。"
 
 
@@ -4374,7 +4378,8 @@ def _dtags_content(v) -> int:
 
 def _dtags_fixed(raw) -> list[str]:
     """写手给的固定话题 → 本体的列表。一个一个按模板的认法(delivery.clean_tag: 去 #、去 [话题], 空的、中间有空格或 # 的
-    不是话题); 不分大小写去重、留第一个(交付稿的话题行也是这么去重的, 留着第二个只会让 summary 多念一个拼不出来的)。"""
+    不是话题); 不分大小写去重、留第一个(交付稿的话题行也是这么去重的, 留着第二个只会让 summary 多念一个拼不出来的)。
+    个数的上限不在这里查: 锁住的不数, 得拿到模板(锁里)才知道哪几个是锁住的。"""
     if not isinstance(raw, (list, tuple)):
         raise DeliveryTagsError(DTAGS_FIXED_NOT_LIST.format(shown=_dtags_repr(raw, 40)))
     out, seen = [], set()
@@ -4385,8 +4390,6 @@ def _dtags_fixed(raw) -> list[str]:
         if t.casefold() not in seen:
             seen.add(t.casefold())
             out.append(t)
-    if len(out) > DTAGS_FIXED_MAX:
-        raise DeliveryTagsError(DTAGS_FIXED_MANY.format(n=DTAGS_FIXED_MAX, got=len(out)))
     return out
 
 
@@ -4438,10 +4441,19 @@ def _set_delivery_tags_locked(client, project: dict, pid: str, *, user_id, conte
         for k, t in enumerate(fixed, 1):
             if len(t) > DTAGS_TAG_CHARS and delivery.tag_key(t) not in known:
                 raise DeliveryTagsError(DTAGS_FIXED_LONG.format(k=k, shown=t[:DTAGS_TAG_CHARS] + "…", n=DTAGS_TAG_CHARS))
-        locked = {delivery.tag_key(t): t for t in old["locked"]}
+        locked = {delivery.tag_key(t): t for t in old.get("locked", [])}    # 没配锁时规范形状里没这个键
+        own = sum(1 for t in fixed if delivery.tag_key(t) not in locked)
+        if own > DTAGS_FIXED_MAX:
+            raise DeliveryTagsError(DTAGS_FIXED_MANY.format(n=DTAGS_FIXED_MAX, got=own))
         new_fixed = [locked.get(delivery.tag_key(t), t) for t in fixed]
         have = {delivery.tag_key(t) for t in new_fixed}
-        kept = [t for t in old["locked"] if delivery.tag_key(t) not in have]
+        # 没写的锁住的话题按它们现在在 fixed 里的先后接上(不按 locked 写的先后): 写手只是去掉别的话题时, 客户点名的那几个在
+        # 交付稿里的先后不变; 锁住的全在、写手又要全去掉的, 结果就是现在那一份, 不写。
+        for t in old["fixed"]:
+            key = delivery.tag_key(t)
+            if key in locked and key not in have:
+                have.add(key)
+                kept.append(locked[key])
         new_fixed += kept
     before = _dtags_pair(old)
     after = {"content": old["content"] if content is None else content, "fixed": new_fixed}
