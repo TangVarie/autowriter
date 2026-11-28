@@ -117,7 +117,7 @@ GATED_ENTRYPOINTS = [
     "build_writing_brief", "draw_angles", "check_drafts", "commit_drafts",
     "export_drafts",
     "record_rule", "record_edit", "save_my_style", "my_style", "borrow_lessons",
-    "check_rules", "set_comment_mix",
+    "check_rules", "set_comment_mix", "set_delivery_tags",
 ]
 
 
@@ -381,6 +381,8 @@ def test_create_project_takes_no_owner_from_the_caller():
     lambda sb, pid: core.check_rules(sb, pid, ["cccccccc-0000-0000-0000-00000000000c"], user_id=ME),
     lambda sb, pid: core.set_comment_mix(sb, pid, user_id=ME, mix={"brand_max": 0.6}, by="示例写手",
                                          at="2026-11-11T00:00:00+00:00"),
+    lambda sb, pid: core.set_delivery_tags(sb, pid, user_id=ME, content=9, fixed=[], by="示例写手",
+                                           at="2026-11-28T00:00:00+00:00"),
 ], ids=GATED_ENTRYPOINTS)
 def test_entrypoint_refuses_someone_elses_project(call):
     """上一条验"调了校验", 这一条验"调了之后真的拦得住"。
@@ -510,6 +512,7 @@ IDENTITY_FIRST_TOOLS = [
     ("reembed_my_rules", {}),
     ("set_rule_state", {"memory_id": "m-1", "action": "mute"}),
     ("set_comment_mix", {"project_id": MINE, "mix": {"brand_max": 0.6}}),
+    ("set_delivery_tags", {"project_id": MINE, "content": 9, "fixed": []}),
 ]
 
 

@@ -181,6 +181,7 @@ fail-open 的范围**只有四个工具**：`list_projects` / `borrow_lessons` /
 | 补历史 | `ingest_published` | 把**已经发出去、当时没入库**的稿子补进指纹库：建身份（出处记在 `batches.params`）+ 写指纹，**不过闸**、不销角度。运营在 WorkBuddy 里粘表即可，≤ 50 条一次；按全文幂等，重复调安全。CLI 的 `ingest --xlsx` 是同一个 core 函数的本地入口（2026-09-17） |
 | 写评论 | `comments_for` / `score_comments` | 按链接（或贴来的正文）一次拿齐帖子、规则、评论位和项目定的配比 → 整组判一次、不存库（§3.14 起的各节，配比见 §3.20；哪些规则算管评论的、评论位怎么用见 §3.24；每次调用只留一行计数，见 §3.8 末尾） |
 | | `set_comment_mix` | **用户明说要改项目的评论配比时**改 `comment_set` 里的四个数（提品牌上限、中性下限、短评下限、短评字数），回改之前 → 改之后；列改不了；留最近 20 次的记录（2026-11-11，§3.23） |
+| | `set_delivery_tags` | **用户明说这个项目以后的话题个数或固定话题换了时**改交付模板 `delivery.tags` 的 `content`（每篇写几个）/ `fixed`（固定加哪几个），回改之前 → 改之后和新的 `delivery_requirements`；负责人锁住的固定话题（`tags.locked`）去不掉、条件话题改不了；和 `set_comment_mix` 同一把锁，留最近 20 次的记录（2026-11-28，§3.41） |
 | 反馈 | `record_rule` | 沉淀规则（团队共享），hard 进 P0；2026-10-20 起可带 `check`，存档时用代码逐篇查（§3.10）；2026-11-11 起回包带 `given_when_writing_comments`（这条写评论时给不给），开头只说评论的规则 `check` 只查评论（§3.24） |
 | | `record_edit` | 喂手动精修 diff（信号 A），返回**交给调用方模型做**的蒸馏任务 |
 | | `save_my_style` | 把模型蒸馏好的笔记写回 + 按 `edit_ids` 销账（`record_edit` 的第二步） |
@@ -816,14 +817,14 @@ python -m deskcore.cli delivery-format --project <uuid> --set 模板.json   # �
 python -m deskcore.cli delivery-format --project <uuid> --clear
 ```
 
-写手那边没有对应的工具：版式是项目定的，不该在对话里被模型改掉。模板形状（`deskcore/delivery.py`，校验是严的，不认识的键直接拒）：
+写手那边没有对应的工具：版式是项目定的，不该在对话里被模型改掉。**例外是话题那一块**：2026-11-28 起 `tags.content` / `tags.fixed` 写手能在对话里改（`set_delivery_tags`，§3.41），`conditional` 和锁住的固定话题 `locked` 仍只有这条命令能设。模板形状（`deskcore/delivery.py`，校验是严的，不认识的键直接拒）：
 
 | 键 | 说明 |
 |---|---|
 | `layout` | `table`（GitHub 风格的 markdown 表格，一篇一行，格内换行写成 `<br>`、`\|` 转义）或 `blocks`（一篇一段，空行隔开） |
 | `columns` | 只给 `table`：`[{"name": 表头, "field": "direction" \| "post" \| "comments"}]`，顺序即列序，必须有一列 `post` |
 | `markers` | 只能是 `【标题】` / `【正文】`（默认值）。tv-sync 的 `tvlink.parse_raw` 只认这两个标记，09-15 以来 6 个在跑项目发出去的 450 篇也全是这个写法；冒号写法会让整段被当成正文、对不回底稿，所以校验直接拒 |
-| `tags` | `content`：写手给几个话题（0~10）；`fixed`：固定话题，接在后面；`conditional`：`[{"when_any": [词], "add": 话题}]`，标题或正文里出现任一词（不分大小写）就加 |
+| `tags` | `content`：写手给几个话题（0~10）；`fixed`：固定话题，接在后面；`conditional`：`[{"when_any": [词], "add": 话题}]`，标题或正文里出现任一词（不分大小写）就加；`locked`（2026-11-28，可不配，默认 `[]`）：`fixed` 里写手用 `set_delivery_tags` 去不掉的那几个（客户点名必带的），每一个都得在 `fixed` 里、写法一样，拼交付稿时不看它 |
 | `comments` | `null` 或 `{min, max, label_reader, label_author, must_mention_any}`；标签原样拼在每条评论前面。`table` 配了它就必须有一列 `comments`（反过来也是），不然评论被要求、被检查却拼不进交付稿；`blocks` 的两个标签都不能为空（评论紧跟在话题行后面，没标签分不出正文在哪结束），`table` 的可以为空 |
 
 **怎么拼。** `score_drafts` 存完档（锁外、恢复指纹的 try 外，判定之前），只拿**存进去了的**那几篇按模板拼成一份，挂在返回值的
@@ -2711,6 +2712,39 @@ batch 且转正是 `unknown`、CLI 下的补录是 `server_job`、标记串和�
 **上线顺序。** 和 §3.39 同一次发版：协议里「用户自己改了贴回来 … 发出去以后也认得回来」靠 B。TV 的 ANGLE_LEDGER 灯要不数 `writer_edit`（TV D-182 那次改了），最好同一天或先上。
 
 **回归**：`tests/test_snapshot_gate_error_and_writer_edit.py`（A：同一个异常原样上抛、记了 `gate_error`、`check8` 带上、记底稿失败或抛了都不盖掉原异常、拒了的项目 / 空稿 / `cli check` 不记；B：一行 `writer_edit`、只改一边的取另一边、空白当没给、没正文不记、插入失败的几种只记类型名、别人的项目不记；转正规则的真值表、`snapshotted_angle_keys` 不被超时冲掉、D1 不数没判定的行；`writer_edit` 只兜底：只改标题或轻改正文时结果和没有 B 一样，AI 稿整篇换掉时才兜，`via = record_edit` 的不算差异、`version_num` 2 起照算、混着的组照普通底稿、臂取第一行不是 `writer_edit` 的；曝光报表不数 `record_edit` 的 batch）、`tests/test_draft_snapshots.py`、`tests/test_tvlink_by_item.py`（800 个随机的一版一个 item 的索引上和 `match_note` 逐项一样；`match_note` 原有的纯函数测试换成它照样过；兄弟版在开头、标题、内容三档都认得出、别的 item 照旧分不出；几条挑法；当它不在的版本和删掉一样）、`tests/test_tv_sync_older_versions.py`（连上另一版的备注、计数、W-40、`--write-tv`、第二晚 `already_linked`；best 对得上就是 best；早于发布才收、跨 item 打平不猜；补录的、`truth_vault_sync` 的 item 没有另几版；底稿比另一版近就归底稿、AI 改了一句的两头都对、底稿读不出就等；回流闸和 `--rescore-misses` 算上另几版；`record_edit` 的那一版成了另一版之后照样不算差异；第二遍连上另一版的帖，手改版不抢，有日期、没日期各一条）。
+
+### 3.41 话题的个数和固定话题写手自己改：`set_delivery_tags`（2026-11-28）
+
+**为什么。** 11-27 Hatherine痘痘贴的写手在对话里停了旧的话题规则（`set_rule_state`），又记了一条新的（`record_rule`）：「标签前 4 个跟正文、后 5 个跟痘痘，不要那 5 个固定的品牌标签」。可交付稿的话题行是交付模板拼的（§3.9），模板照旧是 `{content: 4, fixed: [OliveYoung必买, 韩国痘痘贴, 韩女同款, hatherine痘痘贴, hatherine], conditional: [提到 Olive Young / OliveYoung / OY 时加 OliveYoung]}`，每篇照样拼那 5 个；规则库和模板互不相通，10-20 起模板又只有负责人能改（`delivery-format`），模型只能叫写手「找负责人」。owner 11-28 定的：**模板还是一个项目一份**，话题那一块写手在对话里自己改，和 `set_comment_mix` 改配比（§3.23 (I)）一个做法；客户点名必带的固定话题，负责人可以锁住，写手去不掉。
+
+同一天 owner 批准先把 Hatherine痘痘贴 的模板手改成 `{content: 9, fixed: [], conditional: []}`：直接在库里用一条带保护条件的 `UPDATE` 改，只动了 `delivery.tags`，`default_params` 别的键和 `delivery` 别的键没碰。条件话题也一起清掉是负责人的决定——工具改不了 `conditional`。
+
+**不动协议**（`00ff79b30fcc`，写手不用重导 skill）：用法全在工具自己的说明里，落点是 `record_rule` 和 `my_rules` 的说明（各加了一句：有交付模板的项目，话题个数和固定话题是模板管的，记成规则不生效，用户明说以后要换就调 `set_delivery_tags`；话题该写什么照样记成规则）。用户说「以后…」时协议叫模型调的是 `record_rule`，所以那一句放在它的说明里、紧跟在配比那条「例外」后面。`tests/test_protocol_tool.py` 的 `OUTSIDE_PROTOCOL` 加上了它。
+
+**工具。** `set_delivery_tags(project_id, content=None, fixed=None)`：
+
+- 至少给一个；`None` 是这一样不动。`content` 是每篇写几个话题，0～`delivery.MAX_CONTENT_TAGS`（10）的整数：整数样子的小数（`9.0`）、ASCII 数字写的字（`"9"`）照收，`true` / `false`、带小数的、`"4.0"`、`"²"` 这类、nan / inf 都回同一句（同 `_mix_chars` 的认法，不漏成 500）；一长串数字的字不拿去 `int()`，念回去的值 `repr()` 本身会抛（超过 4300 位的整数）时换成「一个太长的值」——3.11 起这两样都直接抛 `ValueError`，不拦就是 500。
+- `fixed` 是固定话题的**完整列表**，新给的一份整个换掉现在的；`[]` 是不要固定话题。每一个按模板固定话题同一种认法规整（`delivery.clean_tag`，`_template_tag` 也改成走它：去 `#`、去 `[话题]`，空的、中间有空格 / `#` / 方括号的不是话题），不分大小写去重留第一个（交付稿的话题行本来就这样去重，留着第二个只会让 summary 多念一个拼不出来的）。最多 10 个；新加的一个最多 20 个字——模板的校验本身不限字数，这一条只管写手这里新加的，模板里已经有的（负责人收下过的）原样带回来不拒。不是列表、有一项不是话题、太多、太长，都回一句点名是哪一个，什么都不写。
+- **只换 `delivery.tags` 的 `content` / `fixed`**。`conditional` 和 `locked` 只有负责人用 `delivery-format` 改，工具没有这两样的参数。没给的那一样库里原来的写法一个字不动（比如 `#示例同款` 照旧带着 `#`）；给了的写规整之后的。`delivery` 里原来没有 `tags` 的，新建一个接在最后；是 null 的在原位换掉。
+- 项目没有交付模板：回「这个项目没有交付模板, 话题照项目规则写(记规则用 record_rule); 要模板找负责人。」；`default_params` 读不了、模板本身就过不了校验：回「这个项目的交付设置现在改不了, 请用户找负责人看一下, 不用重试。」。都不写（不替负责人修模板）。
+- 合并完整份拿 `delivery.template_of` 过一遍（读的时候同一道闸），不过就不写：收下的设置不会事后被当成「模板坏了、这次不拼」。和现在一样（规整之后比，顺序和大小写都算——都会改交付稿那一行）就不写、不留痕，`changed` false。
+- 改成 `content: 0, fixed: []`、又没有条件话题时，模板就成了「不管话题」的那一种（§3.9 早就有的）：交付稿不拼话题行，`delivery_requirements.task` 说话题照项目规则写在正文末尾。
+
+**锁住的固定话题。** `delivery.tags.locked`（`delivery.validate` 新认的键，默认 `[]`）：一个列表，每一个照固定话题的规矩认，**必须在 `fixed` 里、写法一样**（规整之后逐字比；不分大小写一样也不算——锁住的话题拼出来什么样只看 `fixed` 那一处），不然 `TemplateError` 点名是哪一个。拼交付稿时不看它：它们本来就在 `fixed` 里，`assemble` / `rows` / `requirements` / `expected_parts` / `delivered_draft` / `preview` 拼出来的和没有这个键时一字不差（有回归钉着，也钉了一份老模板拼出来的原文）。`set_delivery_tags` 里：写手新的 `fixed` 没写的锁住的话题，按 `locked` 的顺序接在写手那一份后面留着，回包 `kept_locked` 列出来，`summary` 说「#… 是负责人锁定的固定话题, 留着了(这里去不掉, 要去掉请找负责人)」；写了的（不分大小写、带不带 `#`）留在写的位置、写法用模板里的。锁住的全在、写手又想全去掉的，结果和现在一样：不写，`summary` 照样说是锁住的。`delivery-format --show` 多一行「锁定的固定话题(写手在对话里去不掉): …」，另带最近 5 条 `delivery_tags_log`。
+
+**回包。** `changed`、`before` / `after`（`{content, fixed}`，规整之后的）、`kept_locked`（有才有）、`summary`（「「示例项目」交付稿的话题改了: 每篇写的话题 4 个 → 9 个; 固定话题 #示例必买、#示例同款、#示例品牌 → 没有。」；改了固定话题、模板又有条件话题时加一句它们照旧、这里改不了——用户要的是「不要这些品牌话题」时，按条件加的那个还会出现，先说清），叫模型原样告诉用户；`delivery_requirements`（`delivery.requirements` 拼的，和 `open_project` 简报里的同一个样子：这一批接下来照新的个数写，不用重开项目）；`next_step`（这一批还没存档的照新的写，已经交付的不用重存，用户要的话再改；以后也只在用户明说时调）。没落库时回 `changed` false、`after` 是库里实际的、`summary` = `warning` = 「这次没有改成…请再调一次」，不带 `delivery_requirements` / `next_step`。
+
+**什么时候调、什么时候不调**（说明的开头）：用户明说这个项目**以后**的话题个数或固定话题换了才调；只是这一批想要别的话题 → 这一批照现在的要求写、交付时一句话说明哪里不一样，项目的设置不动；用户没说 → 不调，`score_drafts` 说话题不够时照它补齐，**不为了让检查通过去改**；拿不准是只这一批还是以后都这样，先问一句。同一句话里说话题该写什么（跟正文、跟痘痘）的那一半照旧 `record_rule` 记成规则，个数和固定话题用这个工具——11-27 那句话两样都有。
+
+**留痕**：`default_params` 顶层的 `delivery_tags_log`（不放进 `delivery`：那里的键校验是严的，多一个不认识的键整个模板就坏了），新的在前，最多 20 条，每条 `{at, by, before: {content, fixed}, after: {content, fixed}}`。`at` 是 UTC，`by` 是钥匙在 `DESKCORE_KEYS` 里的备注名（`_caller_name`，app 注入，调用方传不进来；没有就是 `user <user_id 前 8 位>`），同 `comment_set_log`。负责人用 `delivery-format --set` 重设模板时这份留痕照留。
+
+**和 `set_comment_mix` 同一把锁**（`core._mix_lock`，名字没改：只有这两个调用方，改名不值得）。两个工具都是读、改、写**整列** `default_params`：各用各的锁的话，配比那次读完还没写、话题这次写完了，配比那次拿旧的一份盖回去，话题的改动和留痕都没了、两边还都报改成了（回归里两个方向都交替着跑了一遍）。其余同配比：锁里再读一次项目行、在最新的那份上改；写完再读，话题设置和留痕最前面那条都要对得上，不然照实说没改成；`default_params` 仍是 JSON 字符串，别的键原样、顺序不变。**还剩的口子也一样**：读、改、写不是一个库事务，这次读和写之间另一个**进程**（负责人正好在跑 `delivery-format` / `project-archive`）写了这一列，那一次会被盖掉；线上是单进程，开多个 worker 之前要先改成带条件的写。
+
+**MCP 那条路上 SDK 会悄悄改掉的值**（`app._McpFiniteNumbers`，§3.23 (I) 那一层）。这个工具里 `null` 是「这一样不动」：`content: NaN` / `1e400` 在 SDK 那一步变成 null，同一次给的 `fixed` 照改、个数悄悄没动，回 `changed: true`；`content: true` / `false` 被 SDK 按 `int` 收成 1 / 0，项目就成了每篇 1 个话题（REST 那条路上这几个都是 400）。所以 `tools/call set_delivery_tags` 的**顶层** `content` / `fixed` 不是有限的数、`content` 是 true / false 时换成原来的字面（字符串），SDK 照「不是整数 / 不是列表」拒掉，什么都不写。`fixed` 列表**里面**的不换：SDK 换成 null 之后「列表里有一项不是字」照样拒，换成字面反倒成了一个叫 `NaN` 的话题——请求体要改写时，那几处照原样写回 `NaN`。真的 `null` 照旧是「不动」；别的工具（`record_rule` 也有个 `content` 参数）一个字节不动。SDK 自己还会把一串 JSON 写的列表解开（`fixed: "[\"甲\"]"`），这一条 REST 不做，回「要是一组话题」。还剩一个没接：MCP 上 `content` 写成字符串 `"null"`，SDK 先把它解成 null（不动）——那多半就是想写 null，没为它多做一层。
+
+**没做的。** 不加迁移；`conditional`、`locked`、版式别的部分照旧只有 `delivery-format`；不替负责人修坏了的模板（配比那边库里坏了的数这里能改，话题这边模板坏了一律找负责人，§3.9 的「模板坏了只记日志、这次不拼」不变）；`open_project` 简报和 `delivery.requirements()["task"]` 的话一个字没改。
+
+回归：`tests/test_set_delivery_tags.py`（入参的边界和怪输入、只改个数 / 只改固定话题 / `fixed: []`、规整和去重、字数和个数的上限、别人的项目和不存在的项目、没有模板、`default_params` 和模板坏了、同一道校验、锁的校验和「有没有锁拼出来一字不差」、锁住的留着并报出来、一样的不写不留痕、别的键和 `delivery` 里键的顺序、仍是 JSON 字符串、留痕新的在前最多 20 条、没落库的三种、锁里再读、和 `set_comment_mix` 两个方向交替着改都不丢、同一把锁、11-27 那一句改完之后交付稿的话题行是 9 个写手的、回包里的 `delivery_requirements`、说明里的那几句和 `record_rule` / `my_rules` 的那一句、写手看得到的话里没有工程指令、协议版本没动、`delivery-format` 设锁 / 显示锁和留痕）、`tests/test_set_delivery_tags_http.py`（REST 署名是钥匙的备注名、400 / 403、`1e400` / NaN 是 400 和那一句；`/tools` / `/health` / MCP 的入参只有三个、后两个可选；MCP 上 NaN / Infinity / 1e400 / true / false 都拒、一个字不写，真的 null 照旧不动，列表里面的不改写，别的工具不动，转义写的工具名照样接住）、`tests/test_deskcore_ownership.py`、`tests/test_protocol_tool.py`。
 
 ## 4. 接入
 
